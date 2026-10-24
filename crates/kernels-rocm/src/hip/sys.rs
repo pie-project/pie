@@ -2,6 +2,7 @@
 //! time from `libamdhip64` and `libhiprtc`. Nothing links against ROCm at
 //! build time, so a build without a ROCm install still compiles; the first
 //! call into [`api`] is where a missing install shows up.
+#![allow(unsafe_code)]
 
 use core::ffi::{c_char, c_int, c_uint, c_void};
 use std::path::PathBuf;

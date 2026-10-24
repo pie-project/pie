@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use engine::fire::{LayerScores, Readout};
 
 use crate::error::{Fault, Result};

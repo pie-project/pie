@@ -11,6 +11,7 @@
 //! `PIE_XLA_SAMPLER_PENALTIES=0` drops the vocabulary-wide histogram.
 
 use crate::common;
+use tokenizer::Specials;
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -415,7 +416,7 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
         }
     }
     for (l, text) in texts.iter().enumerate().take(4) {
-        eprintln!("lane {l}: {:?}", tokenizer.decode(text, false));
+        eprintln!("lane {l}: {:?}", tokenizer.decode(text, Specials::Keep));
     }
     let per = |d: Duration| d.as_secs_f64() * 1e3 / steps as f64;
     eprintln!(

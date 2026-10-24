@@ -10,8 +10,8 @@ use dtype::Dtype;
 use crate::jit::{
     Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
 };
+use crate::linear::dequant::DECODED_WEIGHT;
 use crate::linear::gemm;
-use crate::linear::quant::DECODED_WEIGHT;
 use crate::tensor::Tensor;
 
 const FILE: &str = "linear/act_quant.hip";
@@ -859,7 +859,7 @@ pub(crate) fn fp8_partials(
     splits: u32,
     rows: u32,
     n: u32,
-) -> Result<ArgValue, Error> {
+) -> Result<ArgValue<'static>, Error> {
     if splits <= 1 {
         return Ok(ArgValue::ABSENT);
     }

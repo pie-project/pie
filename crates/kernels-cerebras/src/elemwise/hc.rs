@@ -10,9 +10,11 @@
 use dtype::Dtype;
 
 use crate::csl::Arg;
-use crate::cx::{Ctx, expect, tile_split};
+use crate::cx::{Ctx, expect};
 use crate::error::{Error, refuse};
-use crate::program::Shard;
+use crate::library::Kernel;
+use crate::phase::Shard;
+use crate::plan::Footprint;
 use crate::tensor::Tensor;
 
 const MAX_HC_MULT: u32 = 8;
@@ -53,7 +55,7 @@ fn tile(rows: u32, cols: u32, segments: u32) -> Shard {
 
 /// `y[n, s·H + h] = x[n, h]` for each of `streams` streams.
 pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_expand";
+    const OP: &str = "elemwise.hc_expand";
     expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, y, &[Dtype::Bf16, Dtype::F32])?;
     let m = stream_fan(OP, y.width, x.width, streams)?;
@@ -61,7 +63,18 @@ pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), E
         return Err(refuse(OP, "the expansion lands one wide row per row"));
     }
     let h = x.width;
-    let (rg, cg) = tile_split(OP, x.rows, h, u64::from(h + y.width), 0, 0, 1)?;
+    let (rg, cg) = ctx.plan().tile(
+        OP,
+        Footprint {
+            rows: x.rows,
+            width: h,
+            per_row: u64::from(h + y.width),
+            per_col: 0,
+            whole: 0,
+            merge: 0,
+            unit: 1,
+        },
+    )?;
     let pes = rg * cg;
     let (rows, h_local) = (x.rows / rg, h / cg);
     ctx.emit(&mut |cx| {
@@ -72,9 +85,8 @@ pub fn expand(ctx: &Ctx<'_>, x: Tensor, streams: u32, y: Tensor) -> Result<(), E
             cx.shard(&xb, tile(rg, cg, 1));
             cx.shard(&yb, tile(rg, cg, m));
         }
-        cx.library("k_hc_expand");
         cx.call(
-            "k_hc_expand",
+            Kernel::HcExpand,
             vec![
                 Arg::Ptr(xb),
                 Arg::Ptr(yb),
@@ -95,7 +107,7 @@ pub fn mix(
     streams: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_mix";
+    const OP: &str = "elemwise.hc_mix";
     expect(OP, gates, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, normed, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, y, &[Dtype::Bf16, Dtype::F32])?;
@@ -107,7 +119,18 @@ pub fn mix(
         ));
     }
     let h = y.width;
-    let (rg, cg) = tile_split(OP, y.rows, h, u64::from(2 * normed.width + h), 0, 0, 1)?;
+    let (rg, cg) = ctx.plan().tile(
+        OP,
+        Footprint {
+            rows: y.rows,
+            width: h,
+            per_row: u64::from(2 * normed.width + h),
+            per_col: 0,
+            whole: 0,
+            merge: 0,
+            unit: 1,
+        },
+    )?;
     let pes = rg * cg;
     let (rows, h_local) = (y.rows / rg, h / cg);
     ctx.emit(&mut |cx| {
@@ -120,9 +143,8 @@ pub fn mix(
             cx.shard(&vb, tile(rg, cg, m));
             cx.shard(&yb, tile(rg, cg, 1));
         }
-        cx.library("k_hc_mix");
         cx.call(
-            "k_hc_mix",
+            Kernel::HcMix,
             vec![
                 Arg::Ptr(gb),
                 Arg::Ptr(vb),
@@ -144,7 +166,7 @@ pub fn inject(
     streams: u32,
     hyper: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.hc_inject";
+    const OP: &str = "elemwise.hc_inject";
     expect(OP, o, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, gates, &[Dtype::Bf16, Dtype::F32])?;
     expect(OP, hyper, &[Dtype::Bf16, Dtype::F32])?;
@@ -159,7 +181,18 @@ pub fn inject(
     // The gates split by rows alone, every column group holding its row
     // group's; a gate plane taller than the rows rides whole on one PE.
     let (rg, cg) = if gates.rows == hyper.rows {
-        tile_split(OP, hyper.rows, h, u64::from(hyper.width + h), 0, 0, 1)?
+        ctx.plan().tile(
+            OP,
+            Footprint {
+                rows: hyper.rows,
+                width: h,
+                per_row: u64::from(hyper.width + h),
+                per_col: 0,
+                whole: 0,
+                merge: 0,
+                unit: 1,
+            },
+        )?
     } else {
         (1, 1)
     };
@@ -182,9 +215,8 @@ pub fn inject(
                 },
             );
         }
-        cx.library("k_hc_inject");
         cx.call(
-            "k_hc_inject",
+            Kernel::HcInject,
             vec![
                 Arg::Ptr(ob),
                 Arg::Ptr(gb),
@@ -208,7 +240,7 @@ pub fn ple_gate(
     streams: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.ple_gate";
+    const OP: &str = "elemwise.ple_gate";
     for t in [key, query, value, y] {
         expect(OP, t, &[Dtype::Bf16, Dtype::F32])?;
     }
@@ -228,7 +260,18 @@ pub fn ple_gate(
     // Rows past a PE split over row groups; a row past a PE over column
     // groups of every stream, the dot then gathered from the blocks'
     // partials in a second phase (like the wide rmsnorm).
-    let (rg, cg) = tile_split(OP, y.rows, h, u64::from(3 * y.width + h), 0, 0, 1)?;
+    let (rg, cg) = ctx.plan().tile(
+        OP,
+        Footprint {
+            rows: y.rows,
+            width: h,
+            per_row: u64::from(3 * y.width + h),
+            per_col: 0,
+            whole: 0,
+            merge: 0,
+            unit: 1,
+        },
+    )?;
     let pes = rg * cg;
     let (rows, h_local) = (y.rows / rg, h / cg);
     if cg == 1 {
@@ -243,9 +286,8 @@ pub fn ple_gate(
                     cx.shard(b, Shard::Rows(rg));
                 }
             }
-            cx.library("k_ple_gate");
             cx.call(
-                "k_ple_gate",
+                Kernel::PleGate,
                 vec![
                     Arg::Ptr(kb),
                     Arg::Ptr(qb),
@@ -265,16 +307,13 @@ pub fn ple_gate(
     ctx.emit(&mut |cx| {
         let kb = cx.read(key)?;
         let qb = cx.read(query)?;
-        let pd = cx
-            .program()
-            .declare(&pd_name, Dtype::F32, y.rows, m * cg, true)?;
+        let pd = cx.declare(&pd_name, Dtype::F32, y.rows, m * cg, true)?;
         cx.over(pes);
         cx.shard(&kb, tile(rg, cg, m));
         cx.shard(&qb, tile(rg, cg, m));
         cx.shard(&pd, tile(rg, cg, m));
-        cx.library("k_ple_dot");
         cx.call(
-            "k_ple_dot",
+            Kernel::PleDot,
             vec![
                 Arg::Ptr(kb),
                 Arg::Ptr(qb),
@@ -289,9 +328,7 @@ pub fn ple_gate(
     ctx.emit(&mut |cx| {
         let vb = cx.read(value)?;
         let yb = cx.write(y)?;
-        let pd = cx
-            .program()
-            .declare(&pd_name, Dtype::F32, y.rows, m * cg, true)?;
+        let pd = cx.declare(&pd_name, Dtype::F32, y.rows, m * cg, true)?;
         cx.over(pes);
         cx.shard(&vb, tile(rg, cg, 1));
         cx.shard(&yb, tile(rg, cg, m));
@@ -302,9 +339,8 @@ pub fn ple_gate(
                 period: cg,
             },
         );
-        cx.library("k_ple_gate_scaled");
         cx.call(
-            "k_ple_gate_scaled",
+            Kernel::PleGateScaled,
             vec![
                 Arg::Ptr(vb),
                 Arg::Ptr(pd),

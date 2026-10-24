@@ -1,9 +1,10 @@
+#![allow(unsafe_code)]
 pub mod kv;
 pub mod rs;
 
 use engine::transfer::KvRun;
 use kernels_cuda::{KvPool, RecurrentPool, Tensor};
-use poem_ir::{Attention, CacheRow, Def, Dtype, Operands, Operation, Trace};
+use poem_ir::{Attn, CacheRow, Def, Dtype, Operands, Operation, Trace};
 
 use crate::device::elastic::{self, Arena, Commit, PhysicalPool};
 use crate::error::{Fault, Result};
@@ -664,9 +665,9 @@ impl Pools {
                         let ds_row = *dtype == Dtype::U8
                             && heads == 512
                             && [
-                                kernels_cuda::attn::dsv4::Rows::Ds,
-                                kernels_cuda::attn::dsv4::Rows::Mx8,
-                                kernels_cuda::attn::dsv4::Rows::Nv4,
+                                kernels_cuda::attn::compressed::decode::Rows::Ds,
+                                kernels_cuda::attn::compressed::decode::Rows::Mx8,
+                                kernels_cuda::attn::compressed::decode::Rows::Nv4,
                             ]
                             .iter()
                             .any(|r| keys_width == u64::from(r.bytes()))
@@ -2445,11 +2446,11 @@ fn pooled_spaces(trace: &Trace) -> Vec<(u32, u64)> {
     for node in &trace.nodes {
         // A gather, or one the compressor's fused op holds.
         let gather = match &node.op {
-            Operation::Attention(a) => a,
+            Operation::Attn(a) => a,
             Operation::Fused(poem_ir::Fused::PoolCompress { gather, .. }) => &**gather,
             _ => continue,
         };
-        let Attention::PoolGather {
+        let Attn::PoolGather {
             pages,
             head_dim,
             ratio,

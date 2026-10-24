@@ -1,4 +1,5 @@
 #![allow(clippy::too_many_arguments)]
+#![allow(unsafe_code)]
 
 //! `y = act · wᵀ` for a bf16 projection: the skinny kernel for a decode's
 //! few rows (the gemv where it refuses), hipBLASLt's heuristic pick above

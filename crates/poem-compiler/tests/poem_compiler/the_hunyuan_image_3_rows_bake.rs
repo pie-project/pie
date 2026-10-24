@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
 use poem::{
-    Attention, Def, Elementwise, Linear, Operation, Platform, Request, RopeForm, RuntimeInput,
-    Stream, Trace, seam,
+    Attn, Def, Elemwise, Linear, Operation, Platform, Request, RopeForm, RuntimeInput, Stream,
+    Trace, seam,
 };
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
@@ -256,7 +256,7 @@ fn every_rope_turns_the_whole_head_as_two_equal_blocks_in_the_split_form() {
             .nodes
             .iter()
             .filter_map(|node| match &node.op {
-                Operation::Elementwise(Elementwise::RopeAxes {
+                Operation::Elemwise(Elemwise::RopeAxes {
                     dims,
                     thetas,
                     form,
@@ -295,8 +295,15 @@ fn every_rope_turns_the_whole_head_as_two_equal_blocks_in_the_split_form() {
         let neox = plan.nodes.iter().any(|node| {
             matches!(
                 &node.op,
-                Operation::Elementwise(Elementwise::RopeFull { .. })
-                    | Operation::Elementwise(Elementwise::RopePartial { .. })
+                Operation::Elemwise(Elemwise::Rope {
+                    k: Some(_),
+                    turn: poem_ir::Turn::Full { .. },
+                    ..
+                }) | Operation::Elemwise(Elemwise::Rope {
+                    k: Some(_),
+                    turn: poem_ir::Turn::Partial { .. },
+                    ..
+                })
             )
         });
         assert!(
@@ -317,10 +324,14 @@ fn the_canvas_reads_a_bidirectional_masked_attention_over_the_frozen_prefix() {
         let (mut masked, mut prefill, mut decode, mut appends) = (0usize, 0usize, 0usize, 0usize);
         for node in &plan.nodes {
             match &node.op {
-                Operation::Attention(Attention::Masked {
+                Operation::Attn(Attn::Prefill {
                     causal,
                     head_dim,
                     sm_scale,
+                    mask: Some(_),
+                    selection: None,
+                    bias: None,
+                    lse: None,
                     ..
                 }) => {
                     masked += 1;
@@ -331,9 +342,20 @@ fn the_canvas_reads_a_bidirectional_masked_attention_over_the_frozen_prefix() {
                     assert_eq!(*head_dim, d.head_dim);
                     assert!((sm_scale - d.sm_scale()).abs() < 1e-7);
                 }
-                Operation::Attention(Attention::Prefill { .. }) => prefill += 1,
-                Operation::Attention(Attention::Decode { .. }) => decode += 1,
-                Operation::Attention(Attention::KvAppend { .. }) => appends += 1,
+                Operation::Attn(Attn::Prefill {
+                    mask: None,
+                    selection: None,
+                    bias: None,
+                    lse: None,
+                    ..
+                }) => prefill += 1,
+                Operation::Attn(Attn::Decode {
+                    selection: None,
+                    bias: None,
+                    lse: None,
+                    ..
+                }) => decode += 1,
+                Operation::Attn(Attn::KvAppend { .. }) => appends += 1,
                 _ => {}
             }
         }
@@ -357,12 +379,28 @@ fn the_mixture_is_a_renormalised_top_k_over_the_whole_bank_beside_a_shared_exper
         let mut quant = 0usize;
         for node in &plan.nodes {
             match &node.op {
-                Operation::Linear(Linear::MoeTopkSoftmax { experts, top_k, .. }) => {
+                Operation::Linear(Linear::MoeRoute {
+                    experts,
+                    top_k,
+                    scale: None,
+                    score: poem_ir::RouteScore::Softmax,
+                    ..
+                }) => {
                     routers += 1;
                     assert_eq!((*experts, *top_k), (d.experts, d.top_k), "{deployment}");
                 }
-                Operation::Linear(Linear::MoeMatmulSelect { .. }) => selects += 1,
-                Operation::Linear(Linear::MoeMatmulSelectQuant { .. }) => {
+                Operation::Linear(Linear::MoeSelect {
+                    bias: None,
+                    quantized: false,
+                    quant: None,
+                    ..
+                }) => selects += 1,
+                Operation::Linear(Linear::MoeSelect {
+                    bias: None,
+                    quantized: true,
+                    quant: None,
+                    ..
+                }) => {
                     selects += 1;
                     quant += 1;
                 }
@@ -387,7 +425,19 @@ fn the_mixture_is_a_renormalised_top_k_over_the_whole_bank_beside_a_shared_exper
         let swiglus = plan
             .nodes
             .iter()
-            .filter(|node| matches!(&node.op, Operation::Linear(Linear::MlpSwiglu { .. })))
+            .filter(|node| {
+                matches!(
+                    &node.op,
+                    Operation::Linear(Linear::Glu {
+                        packed: Some(_),
+                        gate: None,
+                        weights: None,
+                        limit: None,
+                        act: poem_ir::GluAct::Swiglu,
+                        ..
+                    })
+                )
+            })
             .count();
         assert_eq!(
             swiglus,

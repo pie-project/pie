@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use kernels_cuda::Tensor;
 use kernels_cuda::attn::plan::{
     Device, Toggles, Workspace, prefill_graph_padding, prefill_partial_rows,
@@ -442,15 +443,15 @@ fn gather_injects(
     injects: &[TokenInject],
 ) -> Result<()> {
     let stream = device.stream();
-    let table: Vec<kernels_cuda::channel::WordRun> = injects
+    let table: Vec<kernels_cuda::runtime::channel::WordRun> = injects
         .iter()
-        .map(|inject| kernels_cuda::channel::WordRun {
+        .map(|inject| kernels_cuda::runtime::channel::WordRun {
             src: inject.src,
             dst_word: u32::try_from(inject.dst_off / 4).unwrap_or(u32::MAX),
             words: u32::try_from(inject.bytes / 4).unwrap_or(u32::MAX),
         })
         .collect();
-    let bytes = table.len() * size_of::<kernels_cuda::channel::WordRun>();
+    let bytes = table.len() * size_of::<kernels_cuda::runtime::channel::WordRun>();
     if runs.as_ref().is_none_or(|held| held.bytes() < bytes) {
         *runs = Some(Buffer::zeroed(bytes.next_power_of_two())?);
     }
@@ -458,7 +459,7 @@ fn gather_injects(
     // SAFETY: `WordRun` is plain `repr(C)` data, read as its bytes.
     let raw = unsafe { core::slice::from_raw_parts(table.as_ptr().cast::<u8>(), bytes) };
     held.stage(stream, 0, raw)?;
-    kernels_cuda::channel::gather_words(
+    kernels_cuda::runtime::channel::gather_words(
         device.ctx(),
         held.ptr(),
         tokens,

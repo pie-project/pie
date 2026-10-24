@@ -1,37 +1,50 @@
 use kernels_cerebras::elemwise;
-use poem_exec::{DispatchElementwise, KernelError};
-use poem_ir::{Elementwise, GateActivation, MropeForm, Operands};
+use poem_exec::{DispatchElemwise, KernelError};
+use poem_ir::{Elemwise, GateActivation, MropeForm, Operands};
+use poem_ir::{NormAxis, NormWeight};
 
 use crate::run::Run;
 
-impl DispatchElementwise for Run<'_> {
-    fn dispatch(&mut self, op: &Elementwise) -> Result<(), KernelError> {
+impl DispatchElemwise for Run<'_> {
+    fn dispatch(&mut self, op: &Elemwise) -> Result<(), KernelError> {
         self.ctx().scope(op.name());
-        self.elementwise(op).map_err(crate::error::kernel)
+        self.elemwise(op).map_err(crate::error::kernel)
     }
 }
 
 impl Run<'_> {
-    fn elementwise(&mut self, op: &Elementwise) -> Result<(), kernels_cerebras::Error> {
+    fn elemwise(&mut self, op: &Elemwise) -> Result<(), kernels_cerebras::Error> {
         match op {
-            Elementwise::Rmsnorm { x, weight, eps, y } => elemwise::norm::rmsnorm(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                *eps,
-                self.tensor(*y),
-            ),
-            Elementwise::RmsnormPlusOne { x, weight, eps, y } => elemwise::norm::rmsnorm_plus_one(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*weight),
-                *eps,
-                self.tensor(*y),
-            ),
-            Elementwise::RmsnormPerHeadPlusOne {
+            Elemwise::Rmsnorm {
                 x,
-                weight,
-                head_dim,
+                weight: NormWeight::Scale(weight),
+                eps,
+                y,
+                axis: NormAxis::Row,
+            } => elemwise::norm::rmsnorm(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*weight),
+                *eps,
+                self.tensor(*y),
+            ),
+            Elemwise::Rmsnorm {
+                x,
+                weight: NormWeight::PlusOne(weight),
+                eps,
+                y,
+                axis: NormAxis::Row,
+            } => elemwise::norm::rmsnorm_plus_one(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*weight),
+                *eps,
+                self.tensor(*y),
+            ),
+            Elemwise::Rmsnorm {
+                x,
+                weight: NormWeight::PlusOne(weight),
+                axis: NormAxis::Head(head_dim),
                 eps,
                 y,
             } => elemwise::norm::rmsnorm_per_head_plus_one(
@@ -42,7 +55,7 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            Elementwise::RmsnormGated {
+            Elemwise::RmsnormGated {
                 x,
                 gate,
                 weight: Some(weight),
@@ -60,7 +73,12 @@ impl Run<'_> {
                 matches!(act, GateActivation::Sigmoid),
                 self.tensor(*y),
             ),
-            Elementwise::ResidualAdd { x, y, y_out: _ } => {
+            Elemwise::ResidualAdd {
+                x,
+                gate: None,
+                y,
+                y_out: _,
+            } => {
                 // A readout-rowed `x` into a token-rowed `y`: the kernel adds
                 // row for row from the first.
                 let (x, y) = (self.tensor(*x), self.tensor(*y));
@@ -71,17 +89,20 @@ impl Run<'_> {
                 };
                 elemwise::norm::residual_add(self.ctx(), x, y)
             }
-            Elementwise::RopePartial {
+            Elemwise::Rope {
                 q,
-                k,
+                k: Some(k),
                 positions,
-                rotary_dim,
                 head_dim,
-                span,
                 theta,
                 freqs: None,
                 q_out: _,
                 k_out: _,
+                turn:
+                    poem_ir::Turn::Partial {
+                        rotary_dim, span, ..
+                    },
+                ..
             } if *span == rotary_dim / 2 => elemwise::rope::partial(
                 self.ctx(),
                 self.tensor(*q),
@@ -91,15 +112,19 @@ impl Run<'_> {
                 *head_dim,
                 *theta,
             ),
-            Elementwise::RopePartialQ {
+            Elemwise::Rope {
                 q,
                 positions,
-                rotary_dim,
                 head_dim,
-                span,
                 theta,
                 freqs: None,
                 q_out: _,
+                k: None,
+                turn:
+                    poem_ir::Turn::Partial {
+                        rotary_dim, span, ..
+                    },
+                ..
             } if *span == rotary_dim / 2 => elemwise::rope::partial_q(
                 self.ctx(),
                 self.tensor(*q),
@@ -108,18 +133,23 @@ impl Run<'_> {
                 *head_dim,
                 *theta,
             ),
-            Elementwise::RopeMrope {
+            Elemwise::Rope {
                 q,
-                k,
+                k: Some(k),
                 positions,
-                sections,
-                form,
-                rotary_dim,
                 head_dim,
                 theta,
                 freqs: None,
                 q_out: _,
                 k_out: _,
+                turn:
+                    poem_ir::Turn::Mrope {
+                        sections,
+                        form,
+                        rotary_dim,
+                        ..
+                    },
+                ..
             } => {
                 let rotate = match form {
                     MropeForm::Interleaved => elemwise::rope_mrope::interleaved,
@@ -137,15 +167,15 @@ impl Run<'_> {
                     *theta,
                 )
             }
-            Elementwise::AddBias {
+            Elemwise::AddBias {
                 bias,
                 out,
                 out_out: _,
             } => elemwise::norm::add_bias(self.ctx(), self.tensor(*bias), self.tensor(*out)),
-            Elementwise::Layernorm {
+            Elemwise::Layernorm {
                 x,
-                weight,
-                bias,
+                weight: Some(weight),
+                bias: Some(bias),
                 eps,
                 y,
             } => elemwise::norm::layernorm(
@@ -156,16 +186,24 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            Elementwise::GateSigmoidMul { x, gate, x_out: _ } => {
-                elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), self.tensor(*x))
-            }
-            Elementwise::SiluScaled { s, x, x_out: _ } => {
-                elemwise::gate::silu_scaled(self.ctx(), *s, self.tensor(*x))
-            }
-            Elementwise::RmsnormGroupedPlusOne {
+            Elemwise::GateSigmoidMul {
                 x,
-                weight,
-                group,
+                gate,
+                heads: None,
+                x_out: _,
+            } => elemwise::gate::sigmoid_mul(self.ctx(), self.tensor(*gate), self.tensor(*x)),
+            Elemwise::Act {
+                scale: Some(s),
+                x,
+                x_out: _,
+                s: None,
+                act: poem_ir::ActFn::Silu,
+                ..
+            } => elemwise::gate::silu_scaled(self.ctx(), *s, self.tensor(*x)),
+            Elemwise::Rmsnorm {
+                x,
+                weight: NormWeight::PlusOne(weight),
+                axis: NormAxis::Group(group),
                 eps,
                 y,
             } => elemwise::norm::rmsnorm_grouped_plus_one(
@@ -176,10 +214,10 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
-            Elementwise::HcExpand { x, streams, y } => {
+            Elemwise::HcExpand { x, streams, y } => {
                 elemwise::hc::expand(self.ctx(), self.tensor(*x), *streams, self.tensor(*y))
             }
-            Elementwise::HcMix {
+            Elemwise::HcMix {
                 gates,
                 normed,
                 streams,
@@ -191,7 +229,7 @@ impl Run<'_> {
                 *streams,
                 self.tensor(*y),
             ),
-            Elementwise::HcInject {
+            Elemwise::HcInject {
                 o,
                 gates,
                 streams,
@@ -204,7 +242,7 @@ impl Run<'_> {
                 *streams,
                 self.tensor(*hyper),
             ),
-            Elementwise::PleGate {
+            Elemwise::PleGate {
                 key,
                 query,
                 value,

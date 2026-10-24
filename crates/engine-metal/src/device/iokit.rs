@@ -1,6 +1,7 @@
 //! The GPU core count, read from the IORegistry. Metal does not publish it;
 //! the AGX accelerator's `gpu-core-count` property does, on every Apple
 //! Silicon GPU.
+#![allow(unsafe_code)]
 
 use std::ffi::{c_char, c_void};
 

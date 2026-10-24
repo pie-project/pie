@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -8,7 +9,7 @@ use poem_ir::{Def, Linear, Operation, Trace, ValueId};
 use crate::device::ctx::Frame;
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
-use kernels_wgpu::Tensor;
+use kernels_slang::Tensor;
 
 const RING: usize = 2;
 
@@ -146,6 +147,10 @@ impl HostPlane {
                 have: map.len() as u64,
             })?;
 
+            // SAFETY: `into` is this row's `per` bytes of a live staging view
+            // (`copy_row_at` seats row `seat` at `seat * per` of a stage sized
+            // `per * unique.len()`), and `at - start + take <= end - start = per`.
+            // `src` is `take` bytes of the mapping, which no view aliases.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     src.as_ptr(),
@@ -641,7 +646,17 @@ fn copy_plane(map: &Mapping, plane: &HostPlane, into: usize) -> Result<()> {
             need: file + len,
             have: map.len() as u64,
         })?;
+        if virt.saturating_add(len) > plane.bytes {
+            return Err(Fault::Ceiling {
+                what: "bytes of a host-tier plane a run writes",
+                need: virt.saturating_add(len),
+                have: plane.bytes,
+            });
+        }
 
+        // SAFETY: `into` is a live staging view of at least `plane.bytes`
+        // (`Pump::stage`), and the run `[virt, virt + len)` was just checked to
+        // lie inside it; `src` is `len` bytes of the mapping, which no view aliases.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 src.as_ptr(),
@@ -824,17 +839,23 @@ impl Plan {
         let mut gathered = BTreeMap::new();
         let mut rows_per_token = 0u32;
         for node in &trace.nodes {
-            if let Operation::Layout(poem_ir::Layout::EmbedConcat { ids, table, .. }) = &node.op
+            if let Operation::Gather(poem_ir::Gather::Embed {
+                ids,
+                table,
+                weights: None,
+                concat: true,
+                ..
+            }) = &node.op
                 && let Ok(at) = weight_of(trace, *table)
             {
                 gathered.insert(at, ids.0);
             }
 
-            if let Operation::Attention(
-                poem_ir::Attention::PleNgramIds {
+            if let Operation::Gather(
+                poem_ir::Gather::NgramIds {
                     heads_per_ngram, ..
                 }
-                | poem_ir::Attention::PleNgramIdsChunked {
+                | poem_ir::Gather::NgramIdsChunked {
                     heads_per_ngram, ..
                 },
             ) = &node.op
@@ -845,10 +866,29 @@ impl Plan {
                 continue;
             };
             let (routes, indexed): (ValueId, Vec<ValueId>) = match op {
-                Linear::MoeMatmulSelect { bank, routes, .. }
-                | Linear::MoeMatmulSelectQuant { bank, routes, .. } => (*routes, vec![*bank]),
-                Linear::MoeMatmulSelectBias {
-                    bank, bias, routes, ..
+                Linear::MoeSelect {
+                    bank,
+                    routes,
+                    bias: None,
+                    quantized: false,
+                    quant: None,
+                    ..
+                }
+                | Linear::MoeSelect {
+                    bank,
+                    routes,
+                    bias: None,
+                    quantized: true,
+                    quant: None,
+                    ..
+                } => (*routes, vec![*bank]),
+                Linear::MoeSelect {
+                    bank,
+                    bias: Some(bias),
+                    routes,
+                    quantized: false,
+                    quant: None,
+                    ..
                 } => (*routes, vec![*bank, *bias]),
                 Linear::MoeBiasSum { bias, routes, .. } => (*routes, vec![*bias]),
                 _ => continue,
@@ -1069,9 +1109,9 @@ impl Gathered {
         &self,
         handles: &Handles,
         host: &HostTier,
-        bank: kernels_wgpu::Bank,
+        bank: kernels_slang::Bank,
         ids: Tensor,
-    ) -> Result<Option<(kernels_wgpu::Bank, Tensor)>> {
+    ) -> Result<Option<(kernels_slang::Bank, Tensor)>> {
         if host.plane(bank.codes.buf).is_none() {
             return Ok(None);
         }

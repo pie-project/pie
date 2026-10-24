@@ -1,0 +1,13 @@
+// y[r][c] += bias[c] over rows of width.
+fn k_add_bias(y: [*]f32, bias: [*]f32, rows: i32, width: i32) void {
+  var db = @set_dsd_base_addr(k_base_f32, bias);
+  db = @set_dsd_length(db, @bitcast(u16, @as(i16, width)));
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var dy = @set_dsd_base_addr(k_base_f32, y);
+    dy = @set_dsd_length(dy, @bitcast(u16, @as(i16, width)));
+    dy = @increment_dsd_offset(dy, @as(i16, r * width), f32);
+    @fadds(dy, dy, db);
+  }
+}
+

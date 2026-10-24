@@ -1,0 +1,116 @@
+// k_attend over a pool packed two bf16 a word: a key row is widened before
+// its dot and a value row (into vrow) before its accumulate.
+fn k_attend_packed(q: [*]f32, keys: [*]u32, values: [*]u32, vrow: [*]f32, idx: [*]i32, ptr: [*]i32, pos: [*]i32, req: [*]i32, en: [*]u32, mask: [*]u32, o: [*]f32, lse: [*]f32, acc: [*]f32, mrow: [*]u32,
+            sel: [*]i32, sblk: [*]u32, top_k: i32, ratio: i32,
+            r0: i32, r1: i32, kp0: i32, kh0: i32, kh1: i32, pr0: i32, pr1: i32, group: i32, d: i32, ps: i32, span: i32, mask_w: i32, mask_width: i32, scale: f32, window: i32, causal: bool, lanes: i32, has_lse: bool) void {
+  // A block selection (ratio > 0): row r reads the keys of the `ratio`-wide
+  // blocks its sel[r, 0..top_k) names among the closed blocks
+  // [0, (qpos + 1) / ratio), and every key of the open block after them.
+  var nblk_max: i32 = 0;
+  if (ratio > 0) { nblk_max = span / ratio + 1; }
+  // Of each page this PE holds rows [pr0, pr1) (row groups): its local
+  // pages are (pr1 - pr0) rows tall and it attends just those positions.
+  var psl: i32 = pr1 - pr0;
+  // This PE's pages hold the lane's keys from position kp0 on (page groups)
+  // and kv heads [kh0, kh1) of them (head groups): its key rows are
+  // (kh1 - kh0) * d wide, and its q, o and lse rows hold just the query
+  // heads of those kv heads.
+  var kwl: i32 = (kh1 - kh0) * d;
+  var h0: i32 = kh0 * group;
+  var h1: i32 = kh1 * group;
+  var lw: i32 = h1 - h0;
+  var dacc = @set_dsd_base_addr(k_base_f32, acc);
+  dacc = @set_dsd_length(dacc, @bitcast(u16, @as(i16, d)));
+  var r: i32 = r0;
+  while (r < r1) : (r += 1) {
+    var lane: i32 = req[r];
+    if (lane < 0) { lane = 0; } else if (lane >= lanes) { lane = lanes - 1; }
+    var qpos: i32 = pos[r];
+    var first_page: i32 = ptr[lane];
+    var count: i32 = ptr[lane + 1] - first_page;
+    var cap: i32 = kp0 + count * ps;
+    if (cap > span) { cap = span; }
+    var flag: u32 = en[r];
+    var hi: i32 = cap;
+    var wide: bool = !causal or flag == 2;
+    if (!wide) { hi = qpos + 1; if (hi > cap) { hi = cap; } }
+    var lo: i32 = 0;
+    if (window > 0 and qpos >= window) { lo = qpos - window + 1; }
+    if (lo < kp0) { lo = kp0; }
+    if (hi < lo) { hi = lo; }
+    if (flag != 0 and mask_w > 0) {
+      k_copy_u32(mrow, 0, mask, r * mask_width, mask_w);
+    }
+    var nblocks: i32 = 0;
+    if (ratio > 0) {
+      if (qpos + 1 > 0) { nblocks = (qpos + 1) / ratio; }
+      if (nblocks > nblk_max) { nblocks = nblk_max; }
+      var bi: i32 = 0;
+      while (bi < nblocks) : (bi += 1) { sblk[bi] = 0; }
+      var si: i32 = 0;
+      while (si < top_k) : (si += 1) {
+        var sb: i32 = sel[r * top_k + si];
+        if (sb >= 0 and sb < nblocks) { sblk[sb] = 1; }
+      }
+    }
+    var h: i32 = h0;
+    while (h < h1) : (h += 1) {
+      var kh: i32 = h / group;
+      var head: i32 = r * lw + (h - h0);
+      var qoff: i32 = head * d;
+      var m: f32 = 0.0;
+      var l: f32 = 0.0;
+      var any: bool = false;
+      var kp: i32 = 0;
+      while (kp < hi) : (kp += 1) {
+        if (kp < lo) { continue; }
+        if (flag != 0) {
+          if (kp >= mask_w) { continue; }
+          if (mrow[kp] == 0) { continue; }
+        }
+        if (ratio > 0) {
+          var blk: i32 = kp / ratio;
+          if (blk < nblocks and sblk[blk] == 0) { continue; }
+        }
+        var prow: i32 = (kp - kp0) % ps;
+        if (prow < pr0 or prow >= pr1) { continue; }
+        var page: i32 = idx[first_page + (kp - kp0) / ps];
+        if (page < 0) { continue; }
+        var slot: i32 = page * psl + (prow - pr0);
+        var koff: i32 = slot * kwl + (kh - kh0) * d;
+        var s: f32 = k_dot_packed(q, qoff, keys, koff, d) * scale;
+        k_unpack_bf16(vrow, values, koff, d);
+        var dv = @set_dsd_base_addr(k_base_f32, vrow);
+        dv = @set_dsd_length(dv, @bitcast(u16, @as(i16, d)));
+        if (!any) {
+          any = true;
+          m = s;
+          l = 1.0;
+          @fmovs(dacc, dv);
+        } else if (s > m) {
+          var alpha: f32 = math.exp_f32(m - s);
+          l = l * alpha + 1.0;
+          @fmuls(dacc, dacc, alpha);
+          @fadds(dacc, dacc, dv);
+          m = s;
+        } else {
+          var p: f32 = math.exp_f32(s - m);
+          l = l + p;
+          @fmacs(dacc, dacc, dv, p);
+        }
+      }
+      var dout = @set_dsd_base_addr(k_base_f32, o);
+      dout = @set_dsd_length(dout, @bitcast(u16, @as(i16, d)));
+      dout = @increment_dsd_offset(dout, @as(i16, qoff), f32);
+      if (any) {
+        @fmuls(dout, dacc, 1.0 / l);
+        if (has_lse) { lse[head] = (m + math.log_f32(l)) * 1.4426950408889634; }
+      } else {
+        var i: i32 = 0;
+        while (i < d) : (i += 1) { o[qoff + i] = 0.0; }
+        if (has_lse) { lse[head] = @bitcast(f32, @as(u32, 0xFF800000)); }
+      }
+    }
+  }
+}
+

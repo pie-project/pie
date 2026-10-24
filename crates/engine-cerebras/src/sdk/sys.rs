@@ -7,6 +7,7 @@
 //!   caller owns and destroys them);
 //! - `Task` is a non-trivial return type, so it comes back through a hidden
 //!   pointer passed before `this`.
+#![allow(unsafe_code)]
 
 use super::abi::{CxxString, CxxVecU32, MemcpyOptions, Task};
 use libloading::Library;

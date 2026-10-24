@@ -51,6 +51,35 @@ const _: () = assert!(size_of::<OpParams>() == 64);
 const NO_CHANNEL: u32 = 0;
 
 impl OpParams {
+    /// The record as the kernels read it: its sixteen words in field order,
+    /// little-endian.
+    #[must_use]
+    pub fn to_le_bytes(&self) -> [u8; 64] {
+        let words = [
+            self.tag,
+            self.a0,
+            self.a1,
+            self.a2,
+            self.o0,
+            self.o1,
+            self.imm,
+            self.imm2,
+            self.imm3,
+            self.kind,
+            self.pred_tag,
+            self.lit_dtype,
+            self.lit_bits,
+            self.channel_slot,
+            self.intr,
+            self.sink_bytes,
+        ];
+        let mut bytes = [0u8; 64];
+        for (word, out) in words.iter().zip(bytes.as_chunks_mut::<4>().0) {
+            *out = word.to_le_bytes();
+        }
+        bytes
+    }
+
     #[must_use]
     pub fn of(op: &LaunchOp, result_base: u32, runtime: Runtime) -> OpParams {
         let tag = op.tag;

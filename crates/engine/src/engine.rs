@@ -53,7 +53,7 @@ pub type TapSink = std::sync::Arc<dyn Fn(Tapped) + Send + Sync>;
 /// bytes)` of a host kv slot.
 pub type TapGroups = Vec<Vec<(u64, u64)>>;
 
-pub trait Engine: Send + Sync {
+pub trait Engine: Send {
     fn kind(&self) -> &'static str;
 
     fn device_facts(&self) -> Option<&DeviceFacts> {

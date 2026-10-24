@@ -126,7 +126,7 @@ fn run(
     };
     // Whole-fire programs follow one model-wide shape: a dry shell traces
     // every class first and the real shell takes the union.
-    let unified = if kernels_cerebras::program::whole_fire() {
+    let unified = if engine_cerebras::fabric::whole_fire() {
         // `PIE_E2E_DRY=compile` also compiles what the dry shell traces.
         let compile = std::env::var("PIE_E2E_DRY").is_ok_and(|v| v == "compile");
         let mut dry = Shell::load_dry(boot(trace.clone()), voxels.clone(), compile)

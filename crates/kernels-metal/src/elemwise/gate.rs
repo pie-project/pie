@@ -1,7 +1,8 @@
 use crate::error::Error;
 
 use crate::encode::{
-    Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, nonzero, refuse, stated,
+    Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, head_grid, head_group, nonzero, refuse,
+    stated,
 };
 use crate::tensor::Tensor;
 
@@ -12,7 +13,7 @@ pub fn sigmoid_mul_heads(
     scale: f32,
     x: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.gate_sigmoid_mul_heads";
+    const OP: &str = "elemwise.gate_sigmoid_mul";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "gate_sigmoid_mul_heads_bfloat16" });
     let head_dim = nonzero(OP, "the head width", head_dim)?;
     if !x.width.is_multiple_of(head_dim) {
@@ -51,7 +52,7 @@ pub fn sigmoid_mul_heads(
 }
 
 pub fn sigmoid_mul(ctx: &Ctx<'_>, gate: Tensor, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.gate_sigmoid_mul";
+    const OP: &str = "elemwise.gate_sigmoid_mul";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "gate_bfloat16" });
     debug_assert!(
         gate.rows == x.rows && gate.width == x.width && gate.dtype == x.dtype,
@@ -68,7 +69,7 @@ pub fn sigmoid_mul(ctx: &Ctx<'_>, gate: Tensor, x: Tensor) -> Result<(), Error> 
 
 /// [`sigmoid_mul`] over at most eight rows that also lays the register tile's
 /// input table of the gated rows in `table`, with `counters` arrival counters
-/// zeroed: the table `linear::quant`'s register matmul lays over `x`, bit for
+/// zeroed: the table `linear::qmm::sg`'s register matmul lays over `x`, bit for
 /// bit, so the out projection runs no table pass.
 pub fn sigmoid_mul_table(
     ctx: &Ctx<'_>,
@@ -77,7 +78,7 @@ pub fn sigmoid_mul_table(
     table: Tensor,
     counters: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.gate_sigmoid_mul";
+    const OP: &str = "elemwise.gate_sigmoid_mul";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     debug_assert!(
         gate.rows == x.rows && gate.width == x.width && gate.dtype == x.dtype,
@@ -105,6 +106,39 @@ pub fn sigmoid_mul_table(
             table.arg_mut(),
             x.rows.arg(),
             counters.arg(),
+        ],
+    )
+}
+
+pub fn split_q_gate(
+    ctx: &Ctx<'_>,
+    packed: Tensor,
+    head_dim: u32,
+    q: Tensor,
+    gate: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "gather.split_q_gate";
+    let entry = dtype_dispatch!(OP, packed.dtype, { Bf16 => "q_gate_split_bfloat16" });
+    nonzero(OP, "the head width this cut walks", head_dim)?;
+    if q.width == 0 || !q.width.is_multiple_of(head_dim) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the {}-wide query half does not divide by the stated head width {head_dim}",
+                q.width
+            ),
+        ));
+    }
+    let lanes = head_grid(OP, head_dim, q.width / head_dim, packed.rows)?;
+    ctx.fire(
+        Fire::at("elemwise/gate.metal", entry).apply(Grid::of(lanes, head_group(lanes))),
+        &[
+            packed.arg(),
+            q.arg_mut(),
+            gate.arg_mut(),
+            stated(OP, head_dim)?.arg(),
+            stated(OP, packed.width)?.arg(),
+            stated(OP, q.width)?.arg(),
         ],
     )
 }

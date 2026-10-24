@@ -103,7 +103,7 @@ impl Qmm {
             Qmm::Register => {
                 at.bits == 4 && at.group == 64 && at.rows <= 8 && at.n % 64 == 0 && at.k % 256 == 0
             }
-            Qmm::Tiled { .. } => at.k % i64::from(crate::linear::quant::QMM_BK) == 0,
+            Qmm::Tiled { .. } => at.k % i64::from(crate::linear::qmm::tiled::QMM_BK) == 0,
             Qmm::Qmv { .. } => true,
         }
     }

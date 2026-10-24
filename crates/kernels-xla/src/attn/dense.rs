@@ -5,10 +5,10 @@
 use dtype::Dtype;
 
 use super::paged::{Heads, Planes, Rows, Rule, blocked, flat_i32, nonzero, row_heads, with_i};
-use crate::cx::{Ctx, expect};
+use crate::check::expect;
 use crate::error::{Error, refuse};
 use crate::hlo::{Built, Cmp, Elem, Fold, Func, Val};
-use crate::tensor::Tensor;
+use crate::tensor::{Landing, Operand, Stored};
 
 /// For each row, the segment `[lo, hi)` of `indptr` (`segments + 1` entries)
 /// holding it, `lo = hi = 0` for a row outside every segment, and the
@@ -54,17 +54,18 @@ pub(crate) fn segment_of(
 /// (`segments` is the `[images + 1]` i32 boundary vector over the shared row
 /// numbering); a row outside every segment answers zeros.
 pub fn bidirectional(
-    ctx: &Ctx<'_>,
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    segments: Tensor,
+    f: &mut Func,
+    q: Operand,
+    k: Operand,
+    v: Operand,
+    segments: Operand,
     head_dim: u32,
     sm_scale: f32,
-    o: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "attention.dense";
-    for t in [q, k, v, o] {
+    o: Landing,
+    tuning: crate::tuning::Tuning,
+) -> Result<Val, Error> {
+    const OP: &str = "attn.dense";
+    for t in [q.shape(), k.shape(), v.shape(), o] {
         expect(OP, t, &[Dtype::Bf16])?;
     }
     let qh = row_heads(OP, q.width, head_dim)?;
@@ -93,28 +94,26 @@ pub fn bidirectional(
     };
     let r = i64::from(q.rows);
     let images = segments.elements() as i64 - 1;
-    ctx.emit(&mut |cx| {
-        let seg = cx.read(segments)?;
-        let seg = flat_i32(cx, seg)?;
-        let qv = cx.read(q)?;
-        let kv = cx.read(k)?;
-        let vv = cx.read(v)?;
-        let ch = cx.tuning().chunks;
-        let f = cx.func();
-        let (lo, hi, _) = segment_of(f, seg, images, r)?;
-        let q4 = f.reshape(qv, &[r, heads.kvh, heads.g, heads.d])?;
-        let rows = Rows::new(q4, lo, hi);
-        let planes = Planes::Plain { k: kv, v: vv };
-        let fl = blocked(
-            f,
-            &planes,
-            &heads,
-            &Rule::default(),
-            &rows,
-            i64::from(k.rows),
-            f64::from(sm_scale),
-            ch,
-        )?;
-        cx.write(o, fl.o)
-    })
+    let seg = segments.val;
+    let seg = flat_i32(f, seg)?;
+    let qv = q.val;
+    let kv = k.val;
+    let vv = v.val;
+    let ch = tuning.chunks;
+    let fq = &mut *f;
+    let (lo, hi, _) = segment_of(fq, seg, images, r)?;
+    let q4 = fq.reshape(qv, &[r, heads.kvh, heads.g, heads.d])?;
+    let rows = Rows::new(q4, lo, hi);
+    let planes = Planes::Plain { k: kv, v: vv };
+    let fl = blocked(
+        fq,
+        &planes,
+        &heads,
+        &Rule::default(),
+        &rows,
+        i64::from(k.rows),
+        f64::from(sm_scale),
+        ch,
+    )?;
+    Ok(fl.o)
 }

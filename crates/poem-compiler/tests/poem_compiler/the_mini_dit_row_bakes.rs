@@ -5,8 +5,8 @@ use crate::mini_dit_dims;
 use mini_dit_dims as model;
 use poem::generative::{PortKind, ReadoutKind};
 use poem::{
-    Attention, Def, Dim, Dtype, Elementwise, GeomKind, Guard, Operands, Operation, Platform,
-    Request, RopeForm, RuntimeInput, Stream, Trace, Ty, ValueId, seam,
+    Attn, Def, Dim, Dtype, Elemwise, GeomKind, Guard, Operands, Operation, Platform, Request,
+    RopeForm, RuntimeInput, Stream, Trace, Ty, ValueId, seam,
 };
 
 const DEPLOYMENT: &str = "mini-dit-bf16-kv-bf16";
@@ -104,7 +104,7 @@ fn the_row_reads_exactly_the_five_ports_it_declares() {
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
-            Operation::Elementwise(Elementwise::Sinusoid {
+            Operation::Elemwise(Elemwise::Sinusoid {
                 dim,
                 max_period,
                 flip_sin_cos,
@@ -153,7 +153,7 @@ fn the_joint_attention_is_self_paired_and_the_cross_attention_is_not() {
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
-            Operation::Attention(Attention::Ragged {
+            Operation::Attn(Attn::Ragged {
                 q_indptr,
                 kv_indptr,
                 head_dim,
@@ -211,7 +211,7 @@ fn the_joint_attention_is_self_paired_and_the_cross_attention_is_not() {
         .find(|node| {
             matches!(
                 &node.op,
-                Operation::Attention(Attention::Ragged { q_indptr, kv_indptr, .. })
+                Operation::Attn(Attn::Ragged { q_indptr, kv_indptr, .. })
                     if q_indptr != kv_indptr
             )
         })
@@ -229,7 +229,7 @@ fn every_rope_turns_three_axes_of_the_whole_head_interleaved() {
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
-            Operation::Elementwise(Elementwise::RopeAxes {
+            Operation::Elemwise(Elemwise::RopeAxes {
                 dims,
                 form,
                 rotary_dim,
@@ -263,15 +263,14 @@ fn every_rope_turns_three_axes_of_the_whole_head_interleaved() {
         .skip_while(|node| {
             !matches!(
                 &node.op,
-                Operation::Elementwise(Elementwise::Layernorm { .. })
+                Operation::Elemwise(Elemwise::Layernorm {
+                    weight: Some(_),
+                    bias: Some(_),
+                    ..
+                })
             )
         })
-        .filter(|node| {
-            matches!(
-                &node.op,
-                Operation::Elementwise(Elementwise::RopeAxes { .. })
-            )
-        })
+        .filter(|node| matches!(&node.op, Operation::Elemwise(Elemwise::RopeAxes { .. })))
         .count();
     assert_eq!(
         ropes_after_cross, 0,
@@ -284,7 +283,7 @@ fn the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk() {
     let ty = |id: ValueId| plan.values[id.0 as usize].ty.clone();
     let mut seen = 0usize;
     for node in &plan.nodes {
-        let Operation::Elementwise(Elementwise::Modulate {
+        let Operation::Elemwise(Elemwise::Modulate {
             x, m, lane_of_row, ..
         }) = &node.op
         else {
@@ -320,7 +319,7 @@ fn the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk() {
     for node in &plan.nodes {
         if !matches!(
             &node.op,
-            Operation::Elementwise(Elementwise::GatedResidualAdd { .. })
+            Operation::Elemwise(Elemwise::ResidualAdd { gate: Some(_), .. })
         ) {
             continue;
         }

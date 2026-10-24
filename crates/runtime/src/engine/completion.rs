@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -45,9 +46,11 @@ impl TerminalCell {
 #[repr(transparent)]
 pub struct CellPtr(pub *mut TerminalCell);
 
-// SAFETY: see the type's doc — the pointee outlives every holder (the same
-// lifetime argument `settle` makes) and is only touched through its atomics.
+// SAFETY: a `CellPtr` is an address; reading through it takes `unsafe` at the
+// use site (`settle`), where the owning completion is held alive. The pointee
+// is a `TerminalCell`, a lone `AtomicU32`, so any thread may touch it.
 unsafe impl Send for CellPtr {}
+// SAFETY: as `Send` — sharing the address shares only access to an atomic.
 unsafe impl Sync for CellPtr {}
 
 impl CellPtr {

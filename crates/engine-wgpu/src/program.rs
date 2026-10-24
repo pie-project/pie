@@ -79,6 +79,7 @@ pub(crate) struct Pass<'a> {
     pub mtp_logits: Option<&'a [f32]>,
     pub mtp_width: u32,
     pub readout: Option<crate::guest::run::Readout<'a>>,
+    pub pixels: Option<crate::guest::run::Readout<'a>>,
 }
 
 #[cfg(feature = "wgpu")]
@@ -118,7 +119,8 @@ impl Half {
             attn_score: None,
         };
         let mut runner =
-            crate::guest::run::OnDevice::new(device, &mut self.session, widen, pass.readout);
+            crate::guest::run::OnDevice::new(device, &mut self.session, widen, pass.readout)
+                .with_pixels(pass.pixels);
         let outcome = eta_exec::step_with(&mut self.inst, &self.plan, &inputs, &mut runner);
         let ran = runner.ran().len();
         if self.inst.poisoned {
@@ -149,28 +151,19 @@ pub(crate) struct Gate {
 #[cfg(feature = "wgpu")]
 impl Gate {
     fn enter(self: &Arc<Self>) -> Held {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .0 += 1;
+        self.inner.lock().expect("lock poisoned").0 += 1;
         Held {
             gate: Arc::clone(self),
         }
     }
 
     fn airborne(&self) -> u32 {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .0
+        self.inner.lock().expect("lock poisoned").0
     }
 
     fn leave(&self) {
         let waker = {
-            let mut inner = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = self.inner.lock().expect("lock poisoned");
             inner.0 = inner.0.saturating_sub(1);
             if inner.0 == 0 { inner.1.take() } else { None }
         };
@@ -180,20 +173,13 @@ impl Gate {
     }
 
     fn settle(&self, instance: InstanceId) -> Result<(), Refusal> {
-        let airborne = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .0;
+        let airborne = self.inner.lock().expect("lock poisoned").0;
         if airborne == 0 {
             return Ok(());
         }
         tracing::debug!(instance, "fire parks until the instance's guest pass ran");
         crate::device::host::block_on_poll("guest gate", |cx| {
-            let mut inner = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = self.inner.lock().expect("lock poisoned");
             if inner.0 == 0 {
                 std::task::Poll::Ready(())
             } else {
@@ -245,6 +231,7 @@ pub(crate) type Job = Box<dyn FnOnce() -> Result<(), Refusal> + Send + 'static>;
 
 #[cfg(feature = "wgpu")]
 impl Guests {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn jobs(
         self,
         rows: &[Vec<f32>],
@@ -253,6 +240,7 @@ impl Guests {
         layout: &[(u32, u32)],
         out_width: u32,
         mtp_width: u32,
+        pixels: Option<&(crate::device::Buffer, u32)>,
     ) -> Vec<Job> {
         let Guests {
             device,
@@ -318,6 +306,7 @@ impl Guests {
                         })
                     };
                     let seat = seat.clone();
+                    let pixels = pixels.cloned();
                     let device = device.clone();
                     let widen = Arc::clone(&widen);
                     let tally = Arc::clone(&tally);
@@ -334,21 +323,26 @@ impl Guests {
                             at,
                             width,
                         });
-                        half.lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .fire(
-                                &device,
-                                &widen,
-                                &tally,
-                                Pass {
-                                    logits,
-                                    rows,
-                                    vocab,
-                                    mtp_logits: mtp.as_deref(),
-                                    mtp_width,
-                                    readout,
-                                },
-                            )
+                        half.lock().expect("half lock poisoned").fire(
+                            &device,
+                            &widen,
+                            &tally,
+                            Pass {
+                                logits,
+                                rows,
+                                vocab,
+                                mtp_logits: mtp.as_deref(),
+                                mtp_width,
+                                readout,
+                                pixels: pixels.as_ref().map(|(plane, count)| {
+                                    crate::guest::run::Readout {
+                                        seat: plane,
+                                        at: 0,
+                                        width: *count,
+                                    }
+                                }),
+                            },
+                        )
                     });
                     job
                 },

@@ -6,7 +6,7 @@ use crate::tensor::Tensor;
 
 const FILE: &str = "attn/ragged.metal";
 
-const OP: &str = "attention.ragged";
+const OP: &str = "attn.ragged";
 
 const MMA_THREADS: u32 = 128;
 

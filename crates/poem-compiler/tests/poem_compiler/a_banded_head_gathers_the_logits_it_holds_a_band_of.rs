@@ -36,7 +36,15 @@ fn a_banded_head_gathers_the_logits_it_holds_a_band_of() {
             .collect();
 
         for node in &trace.nodes {
-            let Operation::Linear(Linear::LmHead { act, w, y }) = &node.op else {
+            let Operation::Linear(Linear::Matmul {
+                act,
+                w,
+                y,
+                quant: None,
+                logits: true,
+                ..
+            }) = &node.op
+            else {
                 continue;
             };
             if !banded(&trace, *w) {

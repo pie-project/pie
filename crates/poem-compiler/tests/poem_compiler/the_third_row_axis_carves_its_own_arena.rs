@@ -1,4 +1,4 @@
-use poem::ops::spatial::{self, Conv};
+use poem::ops::conv::{self, ConvShape};
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, seam, trace_hybrid,
 };
@@ -28,8 +28,8 @@ impl ForwardHybrid for Encoder {
     fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
         let x = inputs.voxels(0, C, Dtype::Bf16);
-        let (h, g1) = spatial::conv3d(&x, &g, &conv("conv", C, C), None, Conv::same3(), None);
-        let h = spatial::group_norm(
+        let (h, g1) = conv::conv3d(&x, &g, &conv("conv", C, C), None, ConvShape::same3(), None);
+        let h = conv::group_norm(
             &h,
             &g1,
             2,
@@ -39,7 +39,7 @@ impl ForwardHybrid for Encoder {
             true,
         );
         let tg = inputs.token_grid([1, 2, 2]);
-        let tokens = spatial::patchify(&h, &g1, [1, 2, 2], &tg);
+        let tokens = conv::patchify(&h, &g1, [1, 2, 2], &tg);
         let w = Weight::sym("proj", [64, u64::from(C) * 4], Dtype::Bf16);
         ops::linear::matmul(&tokens, &w)
     }
@@ -57,11 +57,18 @@ impl ForwardHybrid for Decoder {
         let tokens = ops::linear::matmul(&latents, &w);
         let g = inputs.grid();
         let tg = inputs.token_grid([1, 2, 2]);
-        let x = spatial::unpatchify(&tokens, &tg, [1, 2, 2], &g);
-        let (h, g1) = spatial::conv3d(&x, &g, &conv("conv1", C, C), None, Conv::same3(), None);
-        let (h, g2) = spatial::upsample_nearest(&h, &g1, [1, 2, 2], false);
-        let (h, g3) = spatial::conv3d(&h, &g2, &conv("conv2", C, 12), None, Conv::same3(), None);
-        let (y, g4) = spatial::pixel_shuffle(&h, &g3, [1, 2, 2]);
+        let x = conv::unpatchify(&tokens, &tg, [1, 2, 2], &g);
+        let (h, g1) = conv::conv3d(&x, &g, &conv("conv1", C, C), None, ConvShape::same3(), None);
+        let (h, g2) = conv::upsample_nearest(&h, &g1, [1, 2, 2], false);
+        let (h, g3) = conv::conv3d(
+            &h,
+            &g2,
+            &conv("conv2", C, 12),
+            None,
+            ConvShape::same3(),
+            None,
+        );
+        let (y, g4) = conv::pixel_shuffle(&h, &g3, [1, 2, 2]);
         seam::at(seam::PIXELS, &[&y, &g4]);
         y
     }
@@ -113,7 +120,7 @@ fn an_encoder_runs_its_voxel_unit_first_and_the_patchify_opens_the_token_one() {
     let placed = unit_axes(&trace, &compiled);
     let boundary = placed
         .iter()
-        .position(|(name, _)| name == "spatial.patchify")
+        .position(|(name, _)| name == "conv.patchify")
         .expect("the patchify is a capture node");
     assert!(
         placed[..boundary]
@@ -138,7 +145,7 @@ fn a_decoder_carves_its_pixels_at_sixteen_voxel_ceilings_and_shares_no_column() 
     let placed = unit_axes(&trace, &compiled);
     let boundary = placed
         .iter()
-        .position(|(name, _)| name == "spatial.unpatchify")
+        .position(|(name, _)| name == "conv.unpatchify")
         .expect("the unpatchify is a capture node");
     assert!(
         placed[..boundary]

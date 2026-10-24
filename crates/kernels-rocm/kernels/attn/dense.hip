@@ -7,8 +7,9 @@
 // LDS (V transposed), each lane masking to its row's segment. The head is
 // zero-padded to the stamp D; scores in the log2 domain.
 
-#include "prelude/device.hip"
-#include "prelude/mfma.hip"
+#include "prim/device.hip"
+#include "prim/mfma.hip"
+#include "prim/voxels.hip"
 
 namespace pie::attn {
 
@@ -187,3 +188,155 @@ __global__ __launch_bounds__(WAVES * 64) void dense_bidirectional(
 }
 
 }  // namespace pie::attn
+
+// Attention over a voxel grid (a video VAE's mid-block): a voxel attends to
+// every voxel of its lane, or of its block of `seg_frames` frames; one head
+// the row's whole width C. A wavefront answers QPW consecutive query rows,
+// each lane holding C/64 of a row's channels; the score's dot product is a
+// wavefront sum, the softmax online in the log2 domain. Rows of different
+// segments in one wavefront walk their keys in turn. A row past every lane
+// lands zero.
+namespace pie::attn::voxel {
+
+using namespace ::pie::voxels;
+
+template <int C, int QPW>
+__global__ __launch_bounds__(128) void attention(const bf16* __restrict__ q, const bf16* __restrict__ k,
+                                                 const bf16* __restrict__ v, const int* __restrict__ grid,
+                                                 bf16* __restrict__ y, int lanes, int rows, int seg_frames,
+                                                 float scale_log2) {
+    constexpr int CPL = C / kWave;
+    constexpr bool VEC = (CPL % 8 == 0);
+    constexpr int PACKS = CPL / 8;
+    static_assert(C % kWave == 0, "every lane holds a whole slice of the row");
+
+    auto read_slice = [](const bf16* __restrict__ base, int row, int col, float (&out)[CPL]) {
+        const bf16* at = base + static_cast<long long>(row) * C + col;
+        if constexpr (VEC) {
+#pragma unroll
+            for (int p = 0; p < PACKS; ++p) {
+                const Pack8<bf16> pk = reinterpret_cast<const Pack8<bf16>*>(at)[p];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) out[p * 8 + e] = to_f32(pk.v[e]);
+            }
+        } else {
+#pragma unroll
+            for (int e = 0; e < CPL; ++e) out[e] = to_f32(at[e]);
+        }
+    };
+
+    constexpr int WAVES = 128 / kWave;
+    const int wave = static_cast<int>(threadIdx.x) / kWave;
+    const int ln = lane();
+    const int first = (static_cast<int>(blockIdx.x) * WAVES + wave) * QPW;
+    if (first >= rows) return;
+    const int col = ln * CPL;
+
+    int owner[QPW];
+    int seg_begin[QPW], seg_end[QPW];
+    Lane box[QPW];
+    float qreg[QPW][CPL];
+#pragma unroll
+    for (int i = 0; i < QPW; ++i) {
+        const int r = first + i;
+        owner[i] = r < rows ? lane_of(grid, lanes, r, box[i]) : -2;
+        seg_begin[i] = 0;
+        seg_end[i] = 0;
+        if (owner[i] >= 0) {
+            segment_of(box[i], r - box[i].off, seg_frames, seg_begin[i], seg_end[i]);
+            read_slice(q, r, col, qreg[i]);
+#pragma unroll
+            for (int e = 0; e < CPL; ++e) qreg[i][e] *= scale_log2;
+        } else {
+#pragma unroll
+            for (int e = 0; e < CPL; ++e) qreg[i][e] = 0.f;
+        }
+    }
+
+    float acc[QPW][CPL];
+    float m[QPW], l[QPW];
+#pragma unroll
+    for (int i = 0; i < QPW; ++i) {
+        m[i] = neg_inf();
+        l[i] = 0.f;
+#pragma unroll
+        for (int e = 0; e < CPL; ++e) acc[i][e] = 0.f;
+    }
+
+    // Each pass walks one segment's keys for the rows that share it.
+    bool done[QPW];
+#pragma unroll
+    for (int i = 0; i < QPW; ++i) done[i] = owner[i] < 0;
+    for (;;) {
+        int pick = -1;
+#pragma unroll
+        for (int i = 0; i < QPW; ++i)
+            if (pick < 0 && !done[i]) pick = i;
+        if (pick < 0) break;
+        const int begin = seg_begin[pick];
+        const int end = seg_end[pick];
+        bool active[QPW];
+#pragma unroll
+        for (int i = 0; i < QPW; ++i) {
+            active[i] = !done[i] && seg_begin[i] == begin;
+            if (active[i]) done[i] = true;
+        }
+        for (int j = begin; j < end; ++j) {
+            float kk[CPL];
+            read_slice(k, j, col, kk);
+            float s[QPW];
+#pragma unroll
+            for (int i = 0; i < QPW; ++i) s[i] = 0.f;
+#pragma unroll
+            for (int e = 0; e < CPL; ++e) {
+#pragma unroll
+                for (int i = 0; i < QPW; ++i) s[i] = fmaf(qreg[i][e], kk[e], s[i]);
+            }
+            float p[QPW];
+#pragma unroll
+            for (int i = 0; i < QPW; ++i) {
+                s[i] = wave_sum(s[i]);
+                if (active[i]) {
+                    const float m_new = fmaxf(m[i], s[i]);
+                    const float rescale = exp2f(m[i] - m_new);
+                    p[i] = exp2f(s[i] - m_new);
+                    l[i] = l[i] * rescale + p[i];
+                    m[i] = m_new;
+#pragma unroll
+                    for (int e = 0; e < CPL; ++e) acc[i][e] *= rescale;
+                } else {
+                    p[i] = 0.f;
+                }
+            }
+            float vv[CPL];
+            read_slice(v, j, col, vv);
+#pragma unroll
+            for (int e = 0; e < CPL; ++e) {
+#pragma unroll
+                for (int i = 0; i < QPW; ++i) acc[i][e] = fmaf(p[i], vv[e], acc[i][e]);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < QPW; ++i) {
+        const int r = first + i;
+        if (r >= rows) continue;
+        const float inv = owner[i] >= 0 && l[i] > 0.f ? 1.f / l[i] : 0.f;
+        bf16* at = y + static_cast<long long>(r) * C + col;
+        if constexpr (VEC) {
+#pragma unroll
+            for (int p = 0; p < PACKS; ++p) {
+                Pack8<bf16> pk;
+#pragma unroll
+                for (int e = 0; e < 8; ++e) pk.v[e] = from_f32<bf16>(acc[i][p * 8 + e] * inv);
+                reinterpret_cast<Pack8<bf16>*>(at)[p] = pk;
+            }
+        } else {
+#pragma unroll
+            for (int e = 0; e < CPL; ++e) at[e] = from_f32<bf16>(acc[i][e] * inv);
+        }
+    }
+}
+
+}  // namespace pie::attn::voxel

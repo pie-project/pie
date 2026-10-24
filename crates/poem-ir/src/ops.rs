@@ -5,43 +5,76 @@ use crate::value::ValueId;
 
 pub mod attn;
 pub mod collective;
+pub mod conv;
 pub mod elemwise;
 pub mod fused;
-pub mod layout;
+pub mod gather;
 pub mod linear;
-pub mod spatial;
+pub mod sampling;
+pub mod ssm;
 
-pub use attn::{Attention, IndexScore, RaggedMask};
+pub use attn::{Attn, Blocks, IndexScore, RaggedMask, Relative};
 pub use collective::Collective;
+pub use conv::{Conv, GridRule, TimePad, VoxelSegment};
 pub use elemwise::{
-    Elementwise, GateActivation, ModulateForm, MropeForm, NormNext, RopeForm, RopeFreqs,
+    ActFn, BinaryOp, Bounds, Elemwise, GateActivation, GateHeads, ModulateForm, MropeForm,
+    NormAxis, NormNext, NormWeight, ResidualGate, RopeForm, RopeFreqs, Turn, Yarn,
 };
 pub use fused::{Fused, NormKind};
-pub use layout::{Layout, PixelOrder, TapKind};
-pub use linear::{ActQuant, Linear};
-pub use spatial::{GridRule, Spatial, TimePad, VoxelSegment};
+pub use gather::{Gather, PixelOrder, TapKind};
+pub use linear::{ActQuant, GluAct, Linear, RouteScore};
+pub use sampling::Sampling;
+pub use ssm::Ssm;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
-    Attention(Attention),
+    Attn(Attn),
     Linear(Linear),
-    Elementwise(Elementwise),
-    Layout(Layout),
+    Elemwise(Elemwise),
+    Gather(Gather),
     Collective(Collective),
+    Sampling(Sampling),
+    Ssm(Ssm),
     Fused(Fused),
-    Spatial(Spatial),
+    Conv(Conv),
 }
 
 impl Operation {
+    /// Every op the IR has, by name: each group's, in group order.
+    pub fn vocabulary() -> impl Iterator<Item = &'static str> {
+        [
+            Attn::NAMES,
+            Linear::NAMES,
+            Elemwise::NAMES,
+            Gather::NAMES,
+            Collective::NAMES,
+            Sampling::NAMES,
+            Ssm::NAMES,
+            Fused::NAMES,
+            Conv::NAMES,
+        ]
+        .into_iter()
+        .flatten()
+        .copied()
+    }
+
+    /// Whether `name` is an op's name.
+    #[must_use]
+    pub fn names_an_op(name: &str) -> bool {
+        Self::vocabulary().any(|op| op == name)
+    }
+
     fn operands(&self) -> &dyn Operands {
         match self {
-            Self::Attention(op) => op,
+            Self::Attn(op) => op,
             Self::Linear(op) => op,
-            Self::Elementwise(op) => op,
-            Self::Layout(op) => op,
+            Self::Elemwise(op) => op,
+            Self::Gather(op) => op,
             Self::Collective(op) => op,
+            Self::Sampling(op) => op,
+            Self::Ssm(op) => op,
             Self::Fused(op) => op,
-            Self::Spatial(op) => op,
+            Self::Conv(op) => op,
         }
     }
 }
@@ -59,11 +92,14 @@ impl Operands for Operation {
     fn name(&self) -> &'static str {
         self.operands().name()
     }
+    fn ports(&self, sink: &mut Vec<(&'static str, ValueId, crate::check::Expect)>) {
+        self.operands().ports(sink);
+    }
 }
 
-impl From<Attention> for Operation {
-    fn from(op: Attention) -> Self {
-        Self::Attention(op)
+impl From<Attn> for Operation {
+    fn from(op: Attn) -> Self {
+        Self::Attn(op)
     }
 }
 impl From<Linear> for Operation {
@@ -71,14 +107,14 @@ impl From<Linear> for Operation {
         Self::Linear(op)
     }
 }
-impl From<Elementwise> for Operation {
-    fn from(op: Elementwise) -> Self {
-        Self::Elementwise(op)
+impl From<Elemwise> for Operation {
+    fn from(op: Elemwise) -> Self {
+        Self::Elemwise(op)
     }
 }
-impl From<Layout> for Operation {
-    fn from(op: Layout) -> Self {
-        Self::Layout(op)
+impl From<Gather> for Operation {
+    fn from(op: Gather) -> Self {
+        Self::Gather(op)
     }
 }
 impl From<Collective> for Operation {
@@ -86,13 +122,66 @@ impl From<Collective> for Operation {
         Self::Collective(op)
     }
 }
+impl From<Sampling> for Operation {
+    fn from(op: Sampling) -> Self {
+        Self::Sampling(op)
+    }
+}
+impl From<Ssm> for Operation {
+    fn from(op: Ssm) -> Self {
+        Self::Ssm(op)
+    }
+}
 impl From<Fused> for Operation {
     fn from(op: Fused) -> Self {
         Self::Fused(op)
     }
 }
-impl From<Spatial> for Operation {
-    fn from(op: Spatial) -> Self {
-        Self::Spatial(op)
+impl From<Conv> for Operation {
+    fn from(op: Conv) -> Self {
+        Self::Conv(op)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each op's name is its group's prefix and its variant in snake case,
+    /// and no two ops share one: a name keys every table that keys on ops.
+    #[test]
+    fn every_op_has_a_name_of_its_own() {
+        let groups = [
+            ("attn", Attn::NAMES),
+            ("linear", Linear::NAMES),
+            ("elemwise", Elemwise::NAMES),
+            ("gather", Gather::NAMES),
+            ("collective", Collective::NAMES),
+            ("sampling", Sampling::NAMES),
+            ("ssm", Ssm::NAMES),
+            ("fused", Fused::NAMES),
+            ("conv", Conv::NAMES),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        for (group, names) in groups {
+            assert!(!names.is_empty(), "`{group}` names no op");
+            for name in names {
+                let variant = name
+                    .strip_prefix(group)
+                    .and_then(|rest| rest.strip_prefix('.'))
+                    .unwrap_or_else(|| panic!("`{name}` is not under `{group}.`"));
+                assert!(
+                    !variant.is_empty()
+                        && variant
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                    "`{name}` is not snake case"
+                );
+                assert!(seen.insert(*name), "two ops are named `{name}`");
+            }
+        }
+        assert_eq!(seen.len(), Operation::vocabulary().count());
+        assert!(Operation::names_an_op("elemwise.residual_add"));
+        assert!(!Operation::names_an_op("elemwise.gated_residual_add"));
     }
 }

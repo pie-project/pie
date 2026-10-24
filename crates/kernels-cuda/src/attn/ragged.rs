@@ -1,8 +1,8 @@
-use crate::attn::fa2::{self, RaggedArm, RaggedPoint};
-use crate::attn::fa2_abi::{
+use crate::attn::fa2::abi::{
     PrefillRaggedBiasParams, PrefillRaggedClassParams, PrefillRaggedParams, PrefillRaggedRefParams,
     PrefillRaggedTagParams, UintFastdiv, sm_scale_or_default,
 };
+use crate::attn::fa2::{self, RaggedArm, RaggedPoint};
 use crate::attn::kv;
 use crate::attn::plan::Device;
 use crate::error::Error;
@@ -10,11 +10,11 @@ use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
-const OP: &str = "attention.ragged";
+const RAGGED: &str = "attn/ragged.cu";
 
-const SCHEDULE_FILE: &str = "attn/ragged.cuh";
+const OP: &str = "attn.ragged";
 
-const SCRATCH: &str = "attention.ragged.schedule";
+const SCRATCH: &str = "attn.ragged.schedule";
 
 const SCHEDULE_BLOCK: u32 = 1024;
 
@@ -183,7 +183,7 @@ pub fn ragged(
 
     ctx.fire(
         OP,
-        Fire::at(SCHEDULE_FILE, symbol("::pie::attn::ragged_schedule"))
+        Fire::at(RAGGED, symbol("::pie::attn::ragged_schedule"))
             .apply(Launch::grid([1, 1, 1], [SCHEDULE_BLOCK, 1, 1]).smem(SCHEDULE_BLOCK * 4)),
         &[
             q_indptr.arg(),

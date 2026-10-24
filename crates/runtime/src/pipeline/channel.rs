@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -472,6 +473,10 @@ impl ChannelCell {
         }
         let cap1 = u64::from(binding.capacity).saturating_add(1);
         let offset = (sequence % cap1) * cell_bytes as u64;
+        // SAFETY: the mirror spans `cap1` cells of `cell_bytes` and lives until
+        // channel close, as in `write_writer_ring`; the one caller (`set_ref`,
+        // holding `&mut self`) has checked the device has not reserved this
+        // cell (`device_reserved_head <= sequence`).
         let cell = unsafe {
             std::slice::from_raw_parts_mut((binding.mirror_base + offset) as *mut u8, cell_bytes)
         };
@@ -838,6 +843,8 @@ fn load_word(word_base: u64, index: usize) -> u64 {
 }
 
 fn store_word(word_base: u64, index: usize, value: u64) {
+    // SAFETY: as `load_word`; the store is atomic, so a concurrent device or
+    // host reader sees either value.
     unsafe { (&*((word_base as *const AtomicU64).add(index))).store(value, Ordering::Release) }
 }
 

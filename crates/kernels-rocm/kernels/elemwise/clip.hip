@@ -2,7 +2,7 @@
 
 // Clamps in place over the first `n` elements of a `width`-wide plane.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 #include "elemwise/pointwise.hip"
 
 namespace pie::elemwise {

@@ -3,7 +3,8 @@ name: Release npm Package
 # One package from the `packages/javascript/` workspace per run. `server` and
 # `server-web` depend on `client` by version range: publish `client` first when
 # it changed. `server`'s addon ships as one platform package per target
-# (`optionalDependencies`), each with every engine that platform supports.
+# (`optionalDependencies`, written in at release), each with every engine
+# that platform supports.
 
 on:
   workflow_dispatch:
@@ -153,16 +154,24 @@ jobs:
         run: |
           [[ "${{ inputs.package }}" != inferlet ]] || npm run build -w inferlet
           npm test --if-present -w ${{ inputs.package }}
-      - name: platform packages match the wrapper's version
+      # The checked-in wrapper names no platform package: an unpublished
+      # version cannot sit in package-lock.json, so `npm ci` would refuse it.
+      # They are written here, after `npm ci`, one per `npm/<target>`.
+      - name: the wrapper depends on its platform packages, at its version
         if: inputs.package == 'server'
         working-directory: packages/javascript/server
         run: |
           node -e '
+            const fs = require("fs");
             const w = require("./package.json");
-            for (const [name, want] of Object.entries(w.optionalDependencies)) {
-              const v = require(`./npm/${name.replace("@pie-project/server-", "")}/package.json`).version;
-              if (v !== w.version || want !== w.version) { console.error(`${name}: ${v}, wrapper ${w.version} wants ${want}`); process.exit(1); }
-            }'
+            w.optionalDependencies = {};
+            for (const d of fs.readdirSync("npm").sort()) {
+              const p = require(`./npm/${d}/package.json`);
+              if (p.version !== w.version) { console.error(`${p.name}: ${p.version}, wrapper ${w.version}`); process.exit(1); }
+              w.optionalDependencies[p.name] = p.version;
+            }
+            fs.writeFileSync("package.json", JSON.stringify(w, null, 2) + "\n");'
+          cat package.json
       - name: pack
         working-directory: packages/javascript
         run: |

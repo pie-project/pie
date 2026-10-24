@@ -1,0 +1,11 @@
+// y[r, s * h + i] = x[r, i] for each of m streams.
+fn k_hc_expand(x: [*]f32, y: [*]f32, rows: i32, h: i32, m: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var s: i32 = 0;
+    while (s < m) : (s += 1) {
+      k_copy(y, (r * m + s) * h, x, r * h, h);
+    }
+  }
+}
+

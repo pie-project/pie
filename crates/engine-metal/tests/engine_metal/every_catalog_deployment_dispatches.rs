@@ -17,27 +17,27 @@ struct Refusal {
 const REFUSED: &[Refusal] = &[
     Refusal {
         op: "collective.all_reduce",
-        why: "one device; kernels-vulkan refuses it too, kernels-cuda answers it through NCCL",
+        why: "one device; engine-vulkan refuses it too, kernels-cuda answers it through NCCL",
         file: "../kernels-metal/src/collective.rs",
         needle: "op: \"collective.all_reduce\"",
     },
     Refusal {
         op: "collective.all_gather",
-        why: "one device; kernels-vulkan refuses it too, kernels-cuda answers it through NCCL",
+        why: "one device; engine-vulkan refuses it too, kernels-cuda answers it through NCCL",
         file: "../kernels-metal/src/collective.rs",
         needle: "op: \"collective.all_gather\"",
     },
     Refusal {
         op: "collective.reduce_scatter",
-        why: "one device; kernels-vulkan refuses it too, kernels-cuda answers it through NCCL",
+        why: "one device; engine-vulkan refuses it too, kernels-cuda answers it through NCCL",
         file: "../kernels-metal/src/collective.rs",
         needle: "op: \"collective.reduce_scatter\"",
     },
     Refusal {
-        op: "spatial.patchify",
+        op: "conv.patchify",
         why: "voxels to patch tokens has no arm here; no catalog row reaches it",
         file: "src/dispatch/custom.rs",
-        needle: "Spatial::Patchify { .. } | Spatial::Unpatchify { .. }",
+        needle: "Conv::Patchify { .. } | Conv::Unpatchify { .. }",
     },
 ];
 

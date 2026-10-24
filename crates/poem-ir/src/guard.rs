@@ -9,6 +9,14 @@ pub enum Guard {
     Or(Box<Guard>, Box<Guard>),
 }
 
+impl std::ops::Not for Guard {
+    type Output = Guard;
+
+    fn not(self) -> Guard {
+        Guard::Not(Box::new(self))
+    }
+}
+
 impl Guard {
     #[must_use]
     pub fn and(a: Guard, b: Guard) -> Guard {
@@ -34,12 +42,6 @@ impl Guard {
         } else {
             joined
         }
-    }
-
-    #[must_use]
-    #[allow(clippy::should_implement_trait)]
-    pub fn not(a: Guard) -> Guard {
-        Guard::Not(Box::new(a))
     }
 
     #[must_use]

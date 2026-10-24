@@ -3,7 +3,7 @@ name = "engine-wgpu"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "The WebGPU engine's dispatch layer: a Run that resolves plan ids to device handles and answers every Dispatch* trait by calling kernels-wgpu entries through dyn Encode."
+description = "The WebGPU engine's dispatch layer: a Run that resolves plan ids to device handles and answers every Dispatch* trait by calling kernels-slang entries through dyn Encode."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -14,7 +14,7 @@ path = "src/lib.rs"
 [dependencies]
 toml = "1.1"
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
-kernels-wgpu = { path = "../kernels-wgpu" }
+kernels-slang = { path = "../kernels-slang" }
 engine = { path = "../engine" }
 poem-exec = { package = "pie-poem-exec", path = "../poem-exec" }
 poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
@@ -38,7 +38,6 @@ wgpu = { version = "30", default-features = false, features = [
     "dx12",
 ], optional = true }
 ash = { version = "0.38", default-features = false, optional = true }
-kernels-vulkan = { path = "../kernels-vulkan", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-std = { path = "../web-std" }
@@ -48,6 +47,19 @@ wgpu = { version = "30", default-features = false, features = [
     "fragile-send-sync-non-atomic-wasm",
 ], optional = true }
 
+[dev-dependencies]
+poem = { package = "pie-poem", path = "../poem" }
+ztensor = { workspace = true }
+
 [features]
 default = []
-wgpu = ["dep:wgpu", "dep:naga", "dep:ash", "dep:kernels-vulkan", "kernels-vulkan/probe"]
+wgpu = [
+    "dep:wgpu",
+    "dep:naga",
+    "dep:ash",
+    "kernels-slang/wgsl",
+    "kernels-slang/probe",
+]
+
+[lints]
+workspace = true

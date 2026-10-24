@@ -5,6 +5,7 @@ use kernels_metal::{
 };
 use poem_exec::fire::At;
 use poem_ir::{Def, Dim, GeomKind, Node, RuntimeInput, StructKind, Ty, ValueDecl, ValueId};
+use poem_ir::{NormAxis, NormWeight};
 
 use crate::device::Handles;
 use crate::dispatch::copy::CopyPlan;
@@ -129,7 +130,7 @@ pub struct FireBindings {
     pub rs: Option<std::sync::Arc<crate::rs::Seat>>,
 
     /// The fire's recurrent snapshot table, when a lane snapshots
-    /// (`kernels_metal::attn::ssm::Snapshots`).
+    /// (`kernels_metal::ssm::Snapshots`).
     pub rs_snaps: Option<Tensor>,
 }
 
@@ -393,12 +394,25 @@ impl<'c> Run<'c> {
         self.readers_of(value)
             .iter()
             .filter_map(|&at| match &self.nodes.get(at as usize)?.op {
-                Operation::Linear(Linear::Matmul { act, w, y } | Linear::LmHead { act, w, y })
-                    if *act == value =>
-                {
-                    self.register_counters(value, *w, self.tensor(*y).width)
-                }
-                Operation::Fused(Fused::MlpSwiglu {
+                Operation::Linear(
+                    Linear::Matmul {
+                        act,
+                        w,
+                        y,
+                        quant: None,
+                        logits: false,
+                        ..
+                    }
+                    | Linear::Matmul {
+                        act,
+                        w,
+                        y,
+                        quant: None,
+                        logits: true,
+                        ..
+                    },
+                ) if *act == value => self.register_counters(value, *w, self.tensor(*y).width),
+                Operation::Fused(Fused::MatmulSwigluMatmul {
                     act,
                     gate_up,
                     packed,
@@ -423,17 +437,17 @@ impl<'c> Run<'c> {
         head_dim: u32,
         eps: f32,
     ) -> Option<(ValueId, ValueId, ValueId)> {
-        use poem_ir::{Elementwise, Operation};
+        use poem_ir::{Elemwise, Operation};
         let (nodes, _) = self.region_nodes()?;
         let at = self.readers_of(x).iter().copied().find(|&at| {
             matches!(&self.nodes.get(at as usize).map(|n| &n.op),
-                Some(Operation::Elementwise(Elementwise::RmsnormPerHeadPlusOne { x: a, y: b, .. }))
+                Some(Operation::Elemwise(Elemwise::Rmsnorm { x: a, y: b, weight: NormWeight::PlusOne(_), axis: NormAxis::Head(_), .. }))
                     if *a == x && *b == y)
         })?;
-        let Some(Operation::Elementwise(Elementwise::RmsnormPerHeadPlusOne {
+        let Some(Operation::Elemwise(Elemwise::Rmsnorm {
             x: x2,
-            weight: w2,
-            head_dim: d2,
+            weight: NormWeight::PlusOne(w2),
+            axis: NormAxis::Head(d2),
             eps: e2,
             y: y2,
         })) = self.nodes.get(at as usize + 1).map(|n| &n.op)
@@ -505,7 +519,7 @@ impl<'c> Run<'c> {
             return None;
         }
         let (cols, k) = (i32::try_from(columns).ok()?, i32::try_from(x.width).ok()?);
-        let split = kernels_metal::linear::quant::register_split(cols, k, self.tuning.cores());
+        let split = kernels_metal::linear::qmm::sg::register_split(cols, k, self.tuning.cores());
         Some(if split > 1 { columns / 64 } else { 0 })
     }
 
@@ -546,29 +560,55 @@ impl<'c> Run<'c> {
         self.chain.set(None);
         let (packed, hidden) = match self.sole_reader(y).map(|n| &n.op) {
             Some(Operation::Linear(
-                Linear::MlpSwiglu {
-                    packed, y: hidden, ..
+                Linear::Glu {
+                    packed: Some(packed),
+                    y: hidden,
+                    gate: None,
+                    weights: None,
+                    limit: None,
+                    act: poem_ir::GluAct::Swiglu,
+                    ..
                 }
-                | Linear::MlpSwigluClampAlpha {
-                    packed, y: hidden, ..
+                | Linear::Glu {
+                    packed: Some(packed),
+                    y: hidden,
+                    gate: None,
+                    weights: None,
+                    limit: Some(_),
+                    act: poem_ir::GluAct::SwigluAlpha { .. },
+                    ..
                 }
-                | Linear::MlpGegluTanhPacked {
-                    packed, y: hidden, ..
+                | Linear::Glu {
+                    packed: Some(packed),
+                    y: hidden,
+                    gate: None,
+                    weights: None,
+                    limit: None,
+                    act: poem_ir::GluAct::GegluTanh,
+                    ..
                 },
             )) => (packed, hidden),
             _ => return Sorted::default(),
         };
-        let Some(Operation::Linear(Linear::MoeMatmulSelectQuant {
+        let Some(Operation::Linear(Linear::MoeSelect {
             x: down_x,
             bank: down_bank,
             routes: down_routes,
             y: routed,
+            bias: None,
+            quantized: true,
+            quant: None,
+            ..
         })) = self.sole_reader(*hidden).map(|n| &n.op)
         else {
             return Sorted::default();
         };
-        let Some(Operation::Linear(Linear::MoeWeightedSum { routed: folded, .. })) =
-            self.sole_reader(*routed).map(|n| &n.op)
+        let Some(Operation::Linear(Linear::MoeCombine {
+            routed: folded,
+            weights: Some(_),
+            shared: None,
+            ..
+        })) = self.sole_reader(*routed).map(|n| &n.op)
         else {
             return Sorted::default();
         };
@@ -719,19 +759,28 @@ impl<'c> Run<'c> {
         {
             return Ok(false);
         }
-        let Some(Operation::Linear(Linear::MlpSwiglu {
-            packed,
+        let Some(Operation::Linear(Linear::Glu {
+            packed: Some(packed),
             intermediate,
             y: hidden,
+            gate: None,
+            weights: None,
+            limit: None,
+            act: poem_ir::GluAct::Swiglu,
+            ..
         })) = self.sole_reader(y).map(|n| &n.op)
         else {
             return Ok(false);
         };
-        let Some(Operation::Linear(Linear::MoeMatmulSelectQuant {
+        let Some(Operation::Linear(Linear::MoeSelect {
             x: down_x,
             bank: down_bank,
             routes: down_routes,
             y: routed,
+            bias: None,
+            quantized: true,
+            quant: None,
+            ..
         })) = self.sole_reader(*hidden).map(|n| &n.op)
         else {
             return Ok(false);
@@ -742,10 +791,11 @@ impl<'c> Run<'c> {
         let Some(fold) = self.nodes.get(fold_at as usize) else {
             return Ok(false);
         };
-        let Operation::Linear(Linear::MoeWeightedSum {
+        let Operation::Linear(Linear::MoeCombine {
             routed: summed,
-            weights,
+            weights: Some(weights),
             y: folded,
+            shared: None,
         }) = &fold.op
         else {
             return Ok(false);
@@ -844,7 +894,7 @@ impl<'c> Run<'c> {
                 .get((fold_at + n) as usize)
                 .filter(|node| node.guard == fold.guard)
         };
-        let Operation::Fused(Fused::MlpSwiglu {
+        let Operation::Fused(Fused::MatmulSwigluMatmul {
             act,
             gate_up,
             down,
@@ -859,6 +909,10 @@ impl<'c> Run<'c> {
             act: gate_act,
             w: gate_w,
             y: gate,
+            input_scales: None,
+            scales: None,
+            quant: None,
+            logits: false,
         }) = &at(2)?.op
         else {
             return None;
@@ -1262,10 +1316,10 @@ impl<'c> Run<'c> {
 
     /// Where this window's prompt scans land the state as of rows inside a
     /// lane, when a lane of the fire snapshots.
-    pub(crate) fn rs_snapshots(&self) -> Option<kernels_metal::attn::ssm::Snapshots> {
+    pub(crate) fn rs_snapshots(&self) -> Option<kernels_metal::ssm::Snapshots> {
         self.fire
             .rs_snaps
-            .map(|table| kernels_metal::attn::ssm::Snapshots {
+            .map(|table| kernels_metal::ssm::Snapshots {
                 table,
                 lane0: self.window().span.lane_offset,
             })

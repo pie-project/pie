@@ -352,7 +352,11 @@ impl Tokenizer {
             byte_fallback_ids[byte] = (id != NO_TOKEN).then_some(id);
         }
 
-        let pipeline = rebuild_pipeline(descriptor.pipeline, &vocab, &objects.unigram_scores)?;
+        let pipeline = rebuild_pipeline(
+            descriptor.pipeline,
+            &vocab,
+            objects.unigram_scores.as_deref(),
+        )?;
         let bpe = BpeTable::from_canonical(vocab, &merges, byte_fallback_ids)?;
         let added_tokens = descriptor
             .added_tokens
@@ -372,7 +376,7 @@ impl Tokenizer {
 fn rebuild_pipeline(
     descriptor: PipelineDescriptor,
     vocab: &[Vec<u8>],
-    scores: &Option<Vec<u8>>,
+    scores: Option<&[u8]>,
 ) -> Result<Pipeline> {
     Ok(match descriptor {
         PipelineDescriptor::Unigram {
@@ -381,7 +385,7 @@ fn rebuild_pipeline(
             eos_id,
             unk_id,
         } => {
-            let raw = scores.as_deref().context(
+            let raw = scores.context(
                 "this artifact's tokenizer is a Unigram and carries no                  `tokenizer/unigram_scores` object; re-import it with                  `pie model import --force`",
             )?;
             ensure!(

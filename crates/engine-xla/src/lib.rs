@@ -7,11 +7,15 @@ pub mod chip;
 pub mod device;
 mod dispatch;
 pub mod dit;
+pub mod emit;
 mod error;
 pub mod exec;
 pub mod guest;
+pub mod handle;
 pub mod inputs;
+pub mod lower;
 pub mod mask;
+pub mod pack;
 pub mod pjrt;
 pub mod program;
 pub mod readout;
@@ -30,5 +34,6 @@ pub use boot::open;
 pub use error::{Fault, Result, kernel};
 pub use serve::{Boot, FireCost, Fired, Lane, Media, Seated, Shell};
 
-/// The fused kernels this backend ships; the compiler forms only these.
-pub const FUSED: [&str; 0] = [];
+/// The fusions this backend implements: none, so the compiler forms no
+/// fused op here.
+pub static FUSIONS: [poem_compiler::fuse::Rule; 0] = [];

@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -25,7 +26,16 @@ pub(crate) struct Raw {
     pub(crate) kind: Memory,
 }
 
+// SAFETY: `Raw` owns its buffer, memory and mapping outright; the device
+// it names lives in the shared `Core`, and Vulkan objects are not bound to
+// the thread that created them, so dropping it on another thread is fine.
 unsafe impl Send for Raw {}
+// SAFETY: needed because slabs travel as `Arc<Raw>` to completion and
+// staging threads. Through `&Raw` the handles and sizes are only read, and
+// every device-side copy is recorded and submitted under `core.transfer`'s
+// lock. The host copies through `mapped` (`write`, `read`, `zero`) are not
+// synchronized here: callers keep concurrent writes to one slab on disjoint
+// ranges (each tensor owns its span), which this type does not check.
 unsafe impl Sync for Raw {}
 
 pub(crate) type Slab = Arc<Raw>;
@@ -62,10 +72,14 @@ impl Raw {
                     | vk::BufferUsageFlags::TRANSFER_DST,
             )
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: `d` is the live device `core` owns, and `info` is a valid
+        // create info for a nonzero size.
         let buffer =
             unsafe { d.create_buffer(&info, None) }.map_err(|e| core.fault("vkCreateBuffer", e))?;
+        // SAFETY: `buffer` was just created on `d`.
         let need = unsafe { d.get_buffer_memory_requirements(buffer) };
         let Some(index) = Self::memory_type(core, &need, kind) else {
+            // SAFETY: `buffer` is ours, unbound and unused by any command.
             unsafe { d.destroy_buffer(buffer, None) };
             return Err(Fault::NoDevice {
                 detail: format!("no memory type serves a {kind:?} buffer"),
@@ -74,9 +88,12 @@ impl Raw {
         let alloc = vk::MemoryAllocateInfo::default()
             .allocation_size(need.size)
             .memory_type_index(index);
+        // SAFETY: `index` is a memory type of this device that `need` allows,
+        // and the size is the buffer's own requirement.
         let memory = match unsafe { d.allocate_memory(&alloc, None) } {
             Ok(m) => m,
             Err(e) => {
+                // SAFETY: `buffer` is ours, unbound and unused by any command.
                 unsafe { d.destroy_buffer(buffer, None) };
                 if e == vk::Result::ERROR_OUT_OF_DEVICE_MEMORY
                     || e == vk::Result::ERROR_OUT_OF_HOST_MEMORY
@@ -96,7 +113,10 @@ impl Raw {
                 return Err(core.fault("vkAllocateMemory", e));
             }
         };
+        // SAFETY: `memory` was sized and typed from `buffer`'s requirements,
+        // offset 0 meets any alignment, and neither is bound yet.
         if let Err(e) = unsafe { d.bind_buffer_memory(buffer, memory, 0) } {
+            // SAFETY: both objects are ours and no command has used them.
             unsafe {
                 d.free_memory(memory, None);
                 d.destroy_buffer(buffer, None);
@@ -106,9 +126,12 @@ impl Raw {
         let mapped = if kind == Memory::Device {
             None
         } else {
+            // SAFETY: `memory` is a host-visible allocation of ours (the
+            // non-device kinds only pick host-visible types), not yet mapped.
             match unsafe { d.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) } {
                 Ok(p) => NonNull::new(p.cast::<u8>()),
                 Err(e) => {
+                    // SAFETY: both objects are ours and no command has used them.
                     unsafe {
                         d.free_memory(memory, None);
                         d.destroy_buffer(buffer, None);
@@ -146,6 +169,9 @@ impl Raw {
             return Ok(());
         }
         if let Some(base) = self.mapped {
+            // SAFETY: `span` checked `offset + len <= size`, and the mapping
+            // covers the whole allocation, which is at least `size` bytes; a
+            // caller's slice cannot alias device-mapped memory.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
@@ -156,15 +182,16 @@ impl Raw {
             return Ok(());
         }
         let core = &self.core;
-        let mut transfer = core
-            .transfer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut transfer = core.transfer.lock().expect("transfer lock poisoned");
         let staging = Arc::clone(core.staging(&mut transfer)?);
         let base = staging.mapped.expect("staging is mapped");
         let mut at = 0usize;
         while at < bytes.len() {
             let len = (bytes.len() - at).min(STAGING_BYTES as usize);
+            // SAFETY: `len` fits both the rest of `bytes` and the mapped
+            // staging slab of `STAGING_BYTES`; the held transfer lock keeps
+            // every other user off the staging slab, and the previous
+            // `submit_once` waited for the copy that read it.
             unsafe {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr().add(at), base.as_ptr(), len);
             }
@@ -172,6 +199,9 @@ impl Raw {
                 .src_offset(0)
                 .dst_offset(offset + at as u64)
                 .size(len as u64);
+            // SAFETY: `cmd` is the transfer command buffer in recording state;
+            // both buffers are live slabs of this device and the region lies
+            // inside each (`span` bounds the destination).
             core.submit_once(&transfer, |d, cmd| unsafe {
                 d.cmd_copy_buffer(cmd, staging.buffer, self.buffer, &[region]);
             })?;
@@ -186,6 +216,8 @@ impl Raw {
             return Ok(());
         }
         if let Some(base) = self.mapped {
+            // SAFETY: `span` checked `offset + len <= size` inside the mapping,
+            // and `into` is a caller's exclusive slice of that length.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     base.as_ptr().add(offset as usize),
@@ -196,10 +228,7 @@ impl Raw {
             return Ok(());
         }
         let core = &self.core;
-        let mut transfer = core
-            .transfer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut transfer = core.transfer.lock().expect("transfer lock poisoned");
         let staging = Arc::clone(core.staging(&mut transfer)?);
         let base = staging.mapped.expect("staging is mapped");
         let mut at = 0usize;
@@ -209,9 +238,15 @@ impl Raw {
                 .src_offset(offset + at as u64)
                 .dst_offset(0)
                 .size(len as u64);
+            // SAFETY: `cmd` is the transfer command buffer in recording state;
+            // both buffers are live slabs of this device and the region lies
+            // inside each (`span` bounds the source, `len <= STAGING_BYTES`).
             core.submit_once(&transfer, |d, cmd| unsafe {
                 d.cmd_copy_buffer(cmd, self.buffer, staging.buffer, &[region]);
             })?;
+            // SAFETY: `submit_once` waited on the copy's fence, so the staging
+            // bytes are written; the transfer lock keeps others off them, and
+            // `len` fits both the staging slab and the rest of `into`.
             unsafe {
                 std::ptr::copy_nonoverlapping(base.as_ptr(), into.as_mut_ptr().add(at), len);
             }
@@ -226,6 +261,7 @@ impl Raw {
             return Ok(());
         }
         if let Some(base) = self.mapped {
+            // SAFETY: `span` checked `offset + len <= size` inside the mapping.
             unsafe {
                 std::ptr::write_bytes(base.as_ptr().add(offset as usize), 0, len as usize);
             }
@@ -233,12 +269,12 @@ impl Raw {
         }
 
         let core = &self.core;
-        let transfer = core
-            .transfer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let transfer = core.transfer.lock().expect("transfer lock poisoned");
         let start = offset & !3;
         let end = (offset + len).next_multiple_of(4).min(self.size);
+        // SAFETY: `cmd` is the transfer command buffer in recording state;
+        // `start` and `end` are 4-aligned (`size` is a multiple of 4) and
+        // inside this live buffer, as `vkCmdFillBuffer` requires.
         core.submit_once(&transfer, |d, cmd| unsafe {
             d.cmd_fill_buffer(cmd, self.buffer, start, end - start, 0);
         })
@@ -248,6 +284,9 @@ impl Raw {
 impl Drop for Raw {
     fn drop(&mut self) {
         let d = &self.core.device;
+        // SAFETY: this is the last `Arc` of the slab, and every frame that
+        // bound it retains its own `Arc` until its fence signals, so no
+        // pending command uses the buffer; `core` keeps the device alive.
         unsafe {
             if self.mapped.is_some() {
                 d.unmap_memory(self.memory);
@@ -399,10 +438,7 @@ impl FileWriter {
             return pread_jobs(file, &jobs, threads);
         }
         let core = &self.slab.core;
-        let mut transfer = core
-            .transfer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut transfer = core.transfer.lock().expect("transfer lock poisoned");
         let staging = Arc::clone(core.staging(&mut transfer)?);
         let base = staging.mapped.expect("staging is mapped").as_ptr() as usize;
 
@@ -437,6 +473,10 @@ impl FileWriter {
                 i += 1;
             }
             pread_jobs(file, &window, threads)?;
+            // SAFETY: `cmd` is the transfer command buffer in recording state;
+            // each region's source sits inside the staging slab (`slot + len
+            // <= STAGING_BYTES`) and its destination inside this slab (`span`
+            // checked every job above).
             core.submit_once(&transfer, |d, cmd| unsafe {
                 d.cmd_copy_buffer(cmd, staging.buffer, self.slab.buffer, &regions);
             })?;
@@ -454,20 +494,20 @@ fn pread_jobs(file: &std::fs::File, jobs: &[(usize, u64, u64)], threads: usize) 
             let failed = &failed;
             scope.spawn(move || {
                 for &(dst, from, len) in chunk {
+                    // SAFETY: both callers build `dst..dst + len` inside a
+                    // mapping they hold: the slab's own (bounded by `span`) or
+                    // the staging slab (bounded by `STAGING_BYTES`) under the
+                    // transfer lock. Staging windows are disjoint; slab jobs
+                    // are the caller's and are not checked for overlap.
                     if let Err(why) = unsafe { pread_all(file, dst as *mut u8, from, len) } {
-                        *failed
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(why);
+                        *failed.lock().expect("failed lock poisoned") = Some(why);
                         return;
                     }
                 }
             });
         }
     });
-    match failed
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-    {
+    match failed.into_inner().expect("failed lock poisoned") {
         Some(why) => Err(why),
         None => Ok(()),
     }

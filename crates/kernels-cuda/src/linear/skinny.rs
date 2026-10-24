@@ -1,6 +1,8 @@
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, refuse};
 
+const SKINNY: &str = "linear/skinny.cu";
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Epilogue {
     Store,
@@ -95,7 +97,7 @@ pub fn skinny_bf16(
     ];
     ctx.fire(
         "linear.skinny",
-        Fire::at("linear/skinny.cuh", entrypoint).apply(
+        Fire::at(SKINNY, entrypoint).apply(
             Launch::grid(
                 [(n / cols(epilogue) as i32) as u32, 1, 1],
                 [32 * WARPS, 1, 1],

@@ -1,7 +1,7 @@
 
 #pragma once
 
-#include "prelude/device.cuh"
+#include "prim/device.cuh"
 
 // Every target is sm_80 or newer, which has every fp16 instruction below.
 

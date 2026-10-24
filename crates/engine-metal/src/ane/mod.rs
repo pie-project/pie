@@ -106,10 +106,10 @@ impl Ane {
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 fn routes_experts(trace: &poem_ir::Trace) -> bool {
     use poem_ir::Operands as _;
-    trace
-        .nodes
-        .iter()
-        .any(|node| node.op.name().starts_with("linear.moe_"))
+    trace.nodes.iter().any(|node| {
+        let name = node.op.name();
+        name.starts_with("linear.moe_") || name.starts_with("fused.moe_")
+    })
 }
 
 /// Sets the Neural Engine up for the dense MLPs and the wide projections

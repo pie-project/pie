@@ -3,7 +3,7 @@ name = "engine-cerebras"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "The Cerebras engine: a pure-Rust host driver for the Cerebras SDK runtime (libsdkruntime, dlopened at runtime) that will answer every Dispatch* trait by compiling kernels-cerebras CSL programs with cslc and running them on the WSE simulator or a CS system."
+description = "The Cerebras engine: a pure-Rust host driver for the Cerebras SDK runtime (libsdkruntime, dlopened at runtime) that will answer every Dispatch* trait by assembling the device work kernels-cerebras entries emit into CSL programs, compiling them with cslc and running them on the WSE simulator or a CS system."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
@@ -34,3 +34,6 @@ blake3 = "1"
 poem = { package = "pie-poem", path = "../poem" }
 ztensor-compat = { workspace = true }
 ztensor = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,16 @@
+// y[r] = table[ids[r][0]] | ... | table[ids[r][heads - 1]] for the ids in
+// this PE's table rows (an id outside [0, limit) lands zeros), zeros for the
+// others.
+fn k_embed_concat_part(ids: [*]i32, table: [*]f32, y: [*]f32, rows: i32, heads: i32, width: i32, limit: i32, lo: i32, share: i32) void {
+  var s: i32 = 0;
+  while (s < rows * heads) : (s += 1) {
+    var id: i32 = ids[s];
+    if (id >= 0 and id < limit and id >= lo and id < lo + share) {
+      k_copy(y, s * width, table, (id - lo) * width, width);
+    } else {
+      var i: i32 = 0;
+      while (i < width) : (i += 1) { y[s * width + i] = 0.0; }
+    }
+  }
+}
+

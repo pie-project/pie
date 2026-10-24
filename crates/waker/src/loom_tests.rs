@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use super::*;
 use ::loom::sync::Arc;
 use ::loom::sync::atomic::{AtomicBool, AtomicU64 as LAtomicU64, Ordering as O};

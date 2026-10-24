@@ -15,7 +15,7 @@ use std::cell::RefCell;
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
-use kernels_metal::linear::quant;
+use kernels_metal::linear::qmm;
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
 
@@ -194,13 +194,13 @@ fn a_column_cut_of_a_bank_multiplies_as_its_copy() {
             );
             let frame = device.frame().expect("a frame");
             let sink = Sink::new(&device, &frame, &pipelines, &handles);
-            quant::matmul(
+            qmm::matmul(
                 &sink,
                 &engine_metal::chip::tuning("", false),
                 act,
                 w,
                 y,
-                quant::Scratch {
+                qmm::Scratch {
                     precast: &precast,
                     partials: &partials,
                     table: None,
@@ -304,13 +304,13 @@ fn the_leading_output_columns_land_in_place() {
             );
             let frame = device.frame().expect("a frame");
             let sink = Sink::new(&device, &frame, &pipelines, &handles);
-            let scratch = quant::Scratch {
+            let scratch = qmm::Scratch {
                 precast: &precast,
                 partials: &partials,
                 table: None,
             };
             match columns {
-                None => quant::matmul(
+                None => qmm::matmul(
                     &sink,
                     &engine_metal::chip::tuning("", false),
                     act,
@@ -319,7 +319,7 @@ fn the_leading_output_columns_land_in_place() {
                     scratch,
                     m.div_ceil(32) * 32,
                 ),
-                Some(c) => quant::matmul_columns(
+                Some(c) => qmm::matmul_columns(
                     &sink,
                     &engine_metal::chip::tuning("", false),
                     act,

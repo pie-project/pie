@@ -18,6 +18,7 @@
 //! Lanes are synthetic (zero tokens, as `dry.rs` builds them) in the plain
 //! text classes; they share pages, since what they write is never read. The
 //! slots they touch are opened again afterwards.
+#![allow(unsafe_code)]
 
 use poem_ir::Request;
 

@@ -3,7 +3,7 @@ use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, RaggedMask, Request, Selection,
     Stream, Trace, Value, Weight, ops, seam, trace_hybrid,
 };
-use poem_ir::{Attention, Def, GeomKind, Guard, Layout, Operation, RuntimeInput};
+use poem_ir::{Attn, Def, Gather, GeomKind, Guard, Operation, RuntimeInput};
 
 const AUDIO_WIDTH: u32 = 32;
 const VIDEO_WIDTH: u32 = 48;
@@ -43,9 +43,9 @@ impl ForwardHybrid for CrossAttention {
 
         let xa = audio.latents(0, AUDIO_WIDTH, Dtype::Bf16);
         let xv = video.latents(1, VIDEO_WIDTH, Dtype::Bf16);
-        let q = ops::layout::pack_rows(&ops::linear::matmul(&xa, &wq), &audio.row_permutation());
-        let k = ops::layout::pack_rows(&ops::linear::matmul(&xv, &wk), &video.row_permutation());
-        let v = ops::layout::pack_rows(&ops::linear::matmul(&xv, &wv), &video.row_permutation());
+        let q = ops::gather::pack_rows(&ops::linear::matmul(&xa, &wq), &audio.row_permutation());
+        let k = ops::gather::pack_rows(&ops::linear::matmul(&xv, &wk), &video.row_permutation());
+        let v = ops::gather::pack_rows(&ops::linear::matmul(&xv, &wv), &video.row_permutation());
         let o = ops::attn::ragged(
             &q,
             &k,
@@ -56,7 +56,7 @@ impl ForwardHybrid for CrossAttention {
             0.25,
             RaggedMask::None,
         );
-        let o = ops::layout::unpack_rows(&o, &audio.row_permutation());
+        let o = ops::gather::unpack_rows(&o, &audio.row_permutation());
         let out = ops::linear::matmul(&o, &wo);
         seam::at(seam::VELOCITY, &[&out]);
         out
@@ -80,18 +80,15 @@ fn queries_off_one_arm_and_keys_off_another_trace_under_the_or_of_both(trace: &T
     assert!(trace.caches.is_empty(), "a denoiser declares no kv space");
 
     let audio = cond_of(trace, &fact::stream(Stream::Audio));
-    let video = Guard::and(
-        Guard::not(audio.clone()),
-        cond_of(trace, &fact::stream(Stream::Video)),
-    );
+    let video = Guard::and(!audio.clone(), cond_of(trace, &fact::stream(Stream::Video)));
 
     let (at, ragged) = trace
         .nodes
         .iter()
         .enumerate()
-        .find(|(_, node)| matches!(node.op, Operation::Attention(Attention::Ragged { .. })))
+        .find(|(_, node)| matches!(node.op, Operation::Attn(Attn::Ragged { .. })))
         .expect("the text holds the one ragged attention it was written for");
-    let Operation::Attention(Attention::Ragged {
+    let Operation::Attn(Attn::Ragged {
         head_dim,
         kv_heads,
         q_indptr,
@@ -117,7 +114,7 @@ fn queries_off_one_arm_and_keys_off_another_trace_under_the_or_of_both(trace: &T
 
     let unpack = trace.nodes[at + 1..]
         .iter()
-        .find(|node| matches!(node.op, Operation::Layout(Layout::UnpackRows { .. })))
+        .find(|node| matches!(node.op, Operation::Gather(Gather::UnpackRows { .. })))
         .expect("the answer is unpacked onto the audio rows");
     assert!(
         unpack.guard.equivalent(&audio),
@@ -180,7 +177,7 @@ fn every_other_op_still_refuses_two_arms() {
             .unwrap_or_default(),
     };
     assert!(
-        message.contains("elementwise.add") && message.contains("different split arms"),
+        message.contains("elemwise.binary") && message.contains("different split arms"),
         "the refusal names the op and the rule: {message}"
     );
 }

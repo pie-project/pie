@@ -1,9 +1,16 @@
-use crate::error::Error;
+//! Host-only: the work plans the FlashAttention-2 decode, prefill and MLA
+//! arms launch from (`sched` the shared allocator and splitter).
+#![allow(unsafe_code)]
 
-use crate::attn::{sched_decode, sched_mla, sched_prefill};
+use crate::error::Error;
 
 use crate::jit::{Ctx, refuse};
 use crate::tensor::Tensor;
+
+pub(crate) mod decode;
+pub(crate) mod mla;
+pub(crate) mod prefill;
+pub(crate) mod sched;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Device {
@@ -135,7 +142,7 @@ impl DecodePlan {
     pub fn stage(&self, ctx: &Ctx) -> Result<(), Error> {
         upload(
             ctx,
-            "attention.plan_decode",
+            "attn.plan_decode",
             &self.int_upload,
             self.workspace.int_ptr,
         )
@@ -206,7 +213,7 @@ impl PrefillPlan {
     pub fn stage(&self, ctx: &Ctx) -> Result<(), Error> {
         upload(
             ctx,
-            "attention.plan_prefill",
+            "attn.plan_prefill",
             &self.int_upload,
             self.workspace.int_ptr,
         )
@@ -229,7 +236,7 @@ impl MlaPlan {
     pub fn stage(&self, ctx: &Ctx) -> Result<(), Error> {
         upload(
             ctx,
-            "attention.mla_plan",
+            "attn.mla_plan",
             &self.int_upload,
             self.workspace.int_ptr,
         )
@@ -255,7 +262,7 @@ pub struct Toggles {
 
     pub static_max_requests: u32,
 
-    pub xqa: crate::attn::xqa::Gate,
+    pub decode_gqa: crate::attn::decode_gqa::Gate,
 }
 
 impl Toggles {
@@ -267,7 +274,7 @@ impl Toggles {
             chunk_floor_128: tuning.decode_chunk_floor_128,
             prefill_ctas_per_sm: tuning.prefill_ctas_per_sm,
             static_max_requests: tuning.decode_static_max_requests,
-            xqa: crate::attn::xqa::Gate::of(tuning),
+            decode_gqa: crate::attn::decode_gqa::Gate::of(tuning),
         }
     }
 }
@@ -330,7 +337,7 @@ pub fn plan_decode(
     device: &Device,
     workspace: Workspace,
 ) -> Result<DecodePlan, Error> {
-    const OP: &str = "attention.plan_decode";
+    const OP: &str = "attn.plan_decode";
     let _ = kv_len;
     instantiated(OP, shape.head_dim)?;
     some_requests(OP, &shape)?;
@@ -338,10 +345,10 @@ pub fn plan_decode(
 
     // The tensor-core decode's block holds a whole stamp of key tiles; its
     // split fills the SMs once, not the FA2 kernel's occupancy.
-    let max_grid_size = match toggles.xqa.stamp(shape.head_dim, false) {
+    let max_grid_size = match toggles.decode_gqa.stamp(shape.head_dim, false) {
         Some(stamp)
             if toggles
-                .xqa
+                .decode_gqa
                 .takes(shape.head_dim, shape.group_size(), shape.num_requests) =>
         {
             stamp.grid(device)
@@ -350,8 +357,8 @@ pub fn plan_decode(
     };
     // A cluster folds through distributed shared memory, sm_90 on; it fills
     // the SMs once with the stamp's blocks.
-    let ranks = match toggles.xqa.stamp(shape.head_dim, false) {
-        Some(stamp) if device.cc_major >= 9 => toggles.xqa.ranks(
+    let ranks = match toggles.decode_gqa.stamp(shape.head_dim, false) {
+        Some(stamp) if device.cc_major >= 9 => toggles.decode_gqa.ranks(
             shape.head_dim,
             shape.group_size(),
             shape.num_requests,
@@ -363,9 +370,9 @@ pub fn plan_decode(
     };
     let windowed_split = toggles.window_split && window_left >= 0;
     let built = if !windowed_split
-        && sched_decode::can_use_static_nonsplit(shape.num_requests, enable_cuda_graph, toggles)
+        && decode::can_use_static_nonsplit(shape.num_requests, enable_cuda_graph, toggles)
     {
-        sched_decode::static_nonsplit(
+        decode::static_nonsplit(
             OP,
             shape.num_requests,
             live,
@@ -374,7 +381,7 @@ pub fn plan_decode(
             workspace.int_bytes,
         )?
     } else {
-        let req = sched_decode::Request {
+        let req = decode::Request {
             kv_indptr,
             batch_size: shape.num_requests,
             live,
@@ -387,10 +394,10 @@ pub fn plan_decode(
             window_left: u32::try_from(window_left).ok(),
             whole: ranks > 0
                 || toggles
-                    .xqa
+                    .decode_gqa
                     .whole(shape.head_dim, shape.group_size(), window_left),
         };
-        sched_decode::plan(
+        decode::plan(
             OP,
             &req,
             max_grid_size,
@@ -431,13 +438,13 @@ pub fn plan_prefill(
     toggles: Toggles,
     workspace: Workspace,
 ) -> Result<PrefillPlan, Error> {
-    const OP: &str = "attention.plan_prefill";
+    const OP: &str = "attn.plan_prefill";
     let _ = kv_len;
     instantiated(OP, shape.head_dim)?;
     some_requests(OP, &shape)?;
     window_left(OP, window)?;
 
-    let req = sched_prefill::Request {
+    let req = prefill::Request {
         qo_indptr,
         kv_indptr,
         total_num_rows: total_tokens,
@@ -454,20 +461,15 @@ pub fn plan_prefill(
     };
 
     let (built, capturable, graph_refusal) =
-        match sched_prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes) {
+        match prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes) {
             Ok(built) => (built, enable_cuda_graph, None),
             Err(declined) if enable_cuda_graph => {
-                let req = sched_prefill::Request {
+                let req = prefill::Request {
                     enable_cuda_graph: false,
                     ..req
                 };
-                let built = sched_prefill::plan(
-                    OP,
-                    &req,
-                    device,
-                    workspace.int_bytes,
-                    workspace.float_bytes,
-                )?;
+                let built =
+                    prefill::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
                 (built, false, Some(declined.to_string()))
             }
             Err(declined) => return Err(declined),
@@ -502,7 +504,7 @@ pub fn plan_prefill(
     })
 }
 
-pub use crate::attn::sched_prefill::{
+pub use crate::attn::plan::prefill::{
     graph_padding as prefill_graph_padding, partial_rows as prefill_partial_rows,
 };
 
@@ -520,8 +522,8 @@ pub fn plan_mla(
     device: &Device,
     workspace: Workspace,
 ) -> Result<MlaPlan, Error> {
-    const OP: &str = "attention.mla_plan";
-    let req = sched_mla::Request {
+    const OP: &str = "attn.mla_plan";
+    let req = mla::Request {
         qo_indptr,
         kv_indptr,
         kv_len_arr: kv_len,
@@ -532,7 +534,7 @@ pub fn plan_mla(
         head_dim_o,
         causal,
     };
-    let built = sched_mla::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
+    let built = mla::plan(OP, &req, device, workspace.int_bytes, workspace.float_bytes)?;
     Ok(MlaPlan {
         info: built.info,
         int_upload: built.int_upload,
@@ -561,6 +563,11 @@ pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result
         // stages ahead would wait out the card; a pinned slot leaves it
         // queued.
         let from = pinned::stage(op, bytes)?;
+        // SAFETY: `from` is a pinned slot holding a copy of `bytes`, which
+        // the ring does not reuse until an event recorded after this copy
+        // fires; the stream is `ctx`'s, live by `Ctx::on`'s contract. That
+        // `int_ptr` addresses `bytes.len()` writable device bytes is the
+        // caller's to vouch for.
         let code = unsafe {
             rt::cudaMemcpyAsync(
                 int_ptr as usize as *mut core::ffi::c_void,
@@ -601,10 +608,10 @@ pub struct DecodePlanInfo {
     pub enable_cuda_graph: bool,
     pub split_kv: bool,
     /// Each request one work item over its whole window, which the
-    /// tensor-core decode lands unsplit (`xqa::Gate::whole`).
+    /// tensor-core decode lands unsplit (`decode_gqa::Gate::whole`).
     pub whole: bool,
     /// The blocks a cluster reads each (request, kv head) of a whole plan
-    /// with, folding their slices itself (`xqa::Gate::ranks`); 0 for none.
+    /// with, folding their slices itself (`decode_gqa::Gate::ranks`); 0 for none.
     pub ranks: u32,
 }
 

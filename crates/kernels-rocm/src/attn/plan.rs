@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use crate::error::Error;
 
 use crate::attn::{sched_decode, sched_mla, sched_prefill};
@@ -135,7 +136,7 @@ impl DecodePlan {
     pub fn stage(&self, ctx: &Ctx) -> Result<(), Error> {
         upload(
             ctx,
-            "attention.plan_decode",
+            "attn.plan_decode",
             &self.int_upload,
             self.workspace.int_ptr,
         )
@@ -206,7 +207,7 @@ impl PrefillPlan {
     pub fn stage(&self, ctx: &Ctx) -> Result<(), Error> {
         upload(
             ctx,
-            "attention.plan_prefill",
+            "attn.plan_prefill",
             &self.int_upload,
             self.workspace.int_ptr,
         )
@@ -229,7 +230,7 @@ impl MlaPlan {
     pub fn stage(&self, ctx: &Ctx) -> Result<(), Error> {
         upload(
             ctx,
-            "attention.mla_plan",
+            "attn.mla_plan",
             &self.int_upload,
             self.workspace.int_ptr,
         )
@@ -322,7 +323,7 @@ pub fn plan_decode(
     device: &Device,
     workspace: Workspace,
 ) -> Result<DecodePlan, Error> {
-    const OP: &str = "attention.plan_decode";
+    const OP: &str = "attn.plan_decode";
     let _ = kv_len;
     instantiated(OP, shape.head_dim)?;
     some_requests(OP, &shape)?;
@@ -388,7 +389,7 @@ pub fn plan_prefill(
     toggles: Toggles,
     workspace: Workspace,
 ) -> Result<PrefillPlan, Error> {
-    const OP: &str = "attention.plan_prefill";
+    const OP: &str = "attn.plan_prefill";
     let _ = kv_len;
     instantiated(OP, shape.head_dim)?;
     some_requests(OP, &shape)?;
@@ -465,7 +466,7 @@ pub fn plan_mla(
     device: &Device,
     workspace: Workspace,
 ) -> Result<MlaPlan, Error> {
-    const OP: &str = "attention.mla_plan";
+    const OP: &str = "attn.mla_plan";
     let req = sched_mla::Request {
         qo_indptr,
         kv_indptr,

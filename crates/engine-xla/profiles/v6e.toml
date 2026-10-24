@@ -23,7 +23,7 @@ measured = [
   "kernel.moe.loop_unroll",
   "kernel.moe.path",
   "kernel.quant.decode",
-  "layout.embed_fold",
-  "layout.gemm_transpose",
+  "gather.embed_fold",
+  "gather.gemm_transpose",
   "layout.mxfp4_prescale",
 ]

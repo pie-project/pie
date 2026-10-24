@@ -3,7 +3,7 @@
 // Gated activations. A packed row is [gate | up], each `I` wide; a launch
 // over a window covers `fan` launch rows per stated row.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::linear {
 

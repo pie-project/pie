@@ -23,19 +23,14 @@ pub(crate) fn can_block() -> bool {
 static PARKED: Mutex<Vec<&'static str>> = Mutex::new(Vec::new());
 
 pub fn parked() -> Vec<&'static str> {
-    PARKED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
+    PARKED.lock().expect("parked lock poisoned").clone()
 }
 
 struct Parking(&'static str);
 
 impl Drop for Parking {
     fn drop(&mut self) {
-        let mut parked = PARKED
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut parked = PARKED.lock().expect("parked lock poisoned");
         if let Some(at) = parked.iter().rposition(|name| *name == self.0) {
             parked.remove(at);
         }
@@ -49,10 +44,7 @@ pub(crate) fn block_on_poll<T>(
     if !can_block() {
         return Err(Fault::Blocking { call });
     }
-    PARKED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(call);
+    PARKED.lock().expect("parked lock poisoned").push(call);
     let _parking = Parking(call);
     Ok(block_on_poll_here(f))
 }
@@ -109,10 +101,7 @@ impl<T> Signal<T> {
 
     pub(crate) fn notify(&self, value: T) {
         let waker = {
-            let mut slot = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut slot = self.inner.lock().expect("lock poisoned");
             slot.0 = Some(value);
             slot.1.take()
         };
@@ -124,9 +113,7 @@ impl<T> Signal<T> {
     pub(crate) fn park(&self, call: &'static str) -> Result<T> {
         let inner = Arc::clone(&self.inner);
         block_on_poll(call, |cx| {
-            let mut slot = inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut slot = inner.lock().expect("lock poisoned");
             match slot.0.take() {
                 Some(value) => Poll::Ready(value),
                 None => {
@@ -189,13 +176,9 @@ impl Poller {
                 let (lock, cv) = &*shared;
                 loop {
                     {
-                        let mut state = lock
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let mut state = lock.lock().expect("lock poisoned");
                         while !state.kicked && !state.stop {
-                            state = cv
-                                .wait(state)
-                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            state = cv.wait(state).expect("cv lock poisoned");
                         }
                         if state.stop {
                             return;
@@ -207,9 +190,7 @@ impl Poller {
                         timeout: Some(Self::WAIT),
                     });
                     if matches!(polled, Err(wgpu::PollError::Timeout)) {
-                        lock.lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .kicked = true;
+                        lock.lock().expect("lock poisoned").kicked = true;
                     }
                 }
             })
@@ -219,9 +200,7 @@ impl Poller {
 
     pub(crate) fn kick(&self) {
         let (lock, cv) = &*self.state;
-        lock.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .kicked = true;
+        lock.lock().expect("lock poisoned").kicked = true;
         cv.notify_one();
     }
 }
@@ -230,9 +209,7 @@ impl Poller {
 impl Drop for Poller {
     fn drop(&mut self) {
         let (lock, cv) = &*self.state;
-        lock.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .stop = true;
+        lock.lock().expect("lock poisoned").stop = true;
         cv.notify_one();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

@@ -1,0 +1,26 @@
+// Rotates each head of v (rows of width) by a table of pairs: lanes lo[i]
+// and hi[i] turn by angle pos[row * 3 + axis[i]] * freq[i].
+fn k_rope_table(v: [*]f32, pos: [*]i32, lo: [*]i32, hi: [*]i32, axis: [*]i32, freq: [*]f32, n: i32, rows: i32, width: i32, head_dim: i32) void {
+  var heads: i32 = width / head_dim;
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var h: i32 = 0;
+    while (h < heads) : (h += 1) {
+      var base: i32 = r * width + h * head_dim;
+      var i: i32 = 0;
+      while (i < n) : (i += 1) {
+        var p: f32 = @as(f32, pos[r * 3 + axis[i]]);
+        var ang: f32 = p * freq[i];
+        var c: f32 = math.cos_f32(ang);
+        var s: f32 = math.sin_f32(ang);
+        var a: i32 = base + lo[i];
+        var b: i32 = base + hi[i];
+        var x1: f32 = v[a];
+        var x2: f32 = v[b];
+        v[a] = x1 * c - x2 * s;
+        v[b] = x1 * s + x2 * c;
+      }
+    }
+  }
+}
+

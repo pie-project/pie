@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use engine::rs::{LanePlan, Run};
 use kernels_metal::Tensor;
-use poem_ir::{Attention, Def, Dim, Dtype, Operation, Trace, Ty, ValueId};
+use poem_ir::{Def, Dim, Dtype, Gather, Operation, Ssm, Trace, Ty, ValueId};
 
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
@@ -46,7 +46,7 @@ pub struct Layout {
 }
 
 /// The snapshot rows one lane lands in a fire (`Lane::rs_snapshots`):
-/// [`kernels_metal::attn::ssm::RS_SNAPSHOTS`] where every op that reads a
+/// [`kernels_metal::ssm::RS_SNAPSHOTS`] where every op that reads a
 /// state slot is a conv or gated-delta scan, whose prompt arms land them;
 /// else none, and a pass is cut at each.
 #[must_use]
@@ -70,16 +70,16 @@ pub fn snapshots(trace: &Trace) -> u32 {
         any = true;
         matches!(
             &node.op,
-            Operation::Attention(
-                Attention::SsmCausalConv1d { .. }
-                    | Attention::SsmCausalConv1dChunked { .. }
-                    | Attention::SsmGatedDelta { .. }
-                    | Attention::SsmGatedDeltaChunked { .. },
+            Operation::Ssm(
+                Ssm::CausalConv1d { .. }
+                    | Ssm::CausalConv1dChunked { .. }
+                    | Ssm::GatedDelta { .. }
+                    | Ssm::GatedDeltaChunked { .. },
             )
         )
     });
     if lands && any {
-        kernels_metal::attn::ssm::RS_SNAPSHOTS
+        kernels_metal::ssm::RS_SNAPSHOTS
     } else {
         0
     }
@@ -192,36 +192,37 @@ impl Layout {
             };
 
         for node in &trace.nodes {
-            let Operation::Attention(op) = &node.op else {
-                continue;
-            };
-            match op {
-                Attention::SsmCausalConv1d { x, state, y, .. }
-                | Attention::SsmCausalConv1dChunked { x, state, y, .. } => {
+            match &node.op {
+                Operation::Ssm(
+                    Ssm::CausalConv1d { x, state, y, .. }
+                    | Ssm::CausalConv1dChunked { x, state, y, .. },
+                ) => {
                     let cache = cache_of(trace, *state)?;
                     plane(&mut layout, cache, Role::ConvX, *x)?;
                     region(&mut layout, cache, "conv", *y)?;
                 }
-                Attention::SsmGatedDelta {
-                    gates,
-                    state,
-                    k_heads,
-                    v_heads,
-                    k_dim,
-                    v_dim,
-                    y,
-                    ..
-                }
-                | Attention::SsmGatedDeltaChunked {
-                    gates,
-                    state,
-                    k_heads,
-                    v_heads,
-                    k_dim,
-                    v_dim,
-                    y,
-                    ..
-                } => {
+                Operation::Ssm(
+                    Ssm::GatedDelta {
+                        gates,
+                        state,
+                        k_heads,
+                        v_heads,
+                        k_dim,
+                        v_dim,
+                        y,
+                        ..
+                    }
+                    | Ssm::GatedDeltaChunked {
+                        gates,
+                        state,
+                        k_heads,
+                        v_heads,
+                        k_dim,
+                        v_dim,
+                        y,
+                        ..
+                    },
+                ) => {
                     let cache = cache_of(trace, *state)?;
                     let _ = k_heads;
                     gates_cache.insert(gates.0, cache);
@@ -230,24 +231,26 @@ impl Layout {
                         .work_elems
                         .max(u64::from(*v_heads) * u64::from(*v_dim) * u64::from(*k_dim));
                 }
-                Attention::SsmKdaStep {
-                    f,
-                    b,
-                    state,
-                    heads,
-                    head_dim,
-                    y,
-                    ..
-                }
-                | Attention::SsmKdaChunked {
-                    f,
-                    b,
-                    state,
-                    heads,
-                    head_dim,
-                    y,
-                    ..
-                } => {
+                Operation::Ssm(
+                    Ssm::Kda {
+                        f,
+                        b,
+                        state,
+                        heads,
+                        head_dim,
+                        y,
+                        ..
+                    }
+                    | Ssm::KdaChunked {
+                        f,
+                        b,
+                        state,
+                        heads,
+                        head_dim,
+                        y,
+                        ..
+                    },
+                ) => {
                     let cache = cache_of(trace, *state)?;
                     plane(&mut layout, cache, Role::KdaF, *f)?;
                     plane(&mut layout, cache, Role::KdaB, *b)?;
@@ -256,18 +259,20 @@ impl Layout {
                         .work_elems
                         .max(u64::from(*heads) * u64::from(*head_dim) * u64::from(*head_dim));
                 }
-                Attention::PleNgramIds {
-                    ids,
-                    state,
-                    ngram_ids,
-                    ..
-                }
-                | Attention::PleNgramIdsChunked {
-                    ids,
-                    state,
-                    ngram_ids,
-                    ..
-                } => {
+                Operation::Gather(
+                    Gather::NgramIds {
+                        ids,
+                        state,
+                        ngram_ids,
+                        ..
+                    }
+                    | Gather::NgramIdsChunked {
+                        ids,
+                        state,
+                        ngram_ids,
+                        ..
+                    },
+                ) => {
                     let cache = cache_of(trace, *state)?;
                     plane(&mut layout, cache, Role::Ids, *ids)?;
                     region(&mut layout, cache, "ngram", *ngram_ids)?;
@@ -276,12 +281,12 @@ impl Layout {
             }
         }
         for node in &trace.nodes {
-            let Operation::Attention(Attention::SsmGdnPrep { ba, gates, .. }) = &node.op else {
+            let Operation::Ssm(Ssm::GdnGates { ba, gates, .. }) = &node.op else {
                 continue;
             };
             let cache = *gates_cache.get(&gates.0).ok_or_else(|| Fault::Unbound {
                 what: format!(
-                    "the gates value {} `attention.ssm_gdn_prep` lands, which no delta scan reads",
+                    "the gates value {} `ssm.gdn_gates` lands, which no delta scan reads",
                     gates.0
                 ),
             })?;
@@ -373,7 +378,7 @@ impl Buffers {
 /// buffer through: the in-page token of the lane's first extended row, or
 /// -1 for a lane that buffers nothing, then the slab slots of the pages its
 /// extended rows touch.
-pub const PAGE_INTS: u32 = kernels_metal::attn::ssm::RS_PAGE_INTS;
+pub const PAGE_INTS: u32 = kernels_metal::ssm::RS_PAGE_INTS;
 
 /// The page table of `lanes`, one [`PAGE_INTS`] row a lane, where every
 /// lane's replayed and own rows fit the row's pages; else `None`, and the
@@ -545,17 +550,13 @@ impl Seat {
 
     /// The buffer of the plane `value` is read into, as a verify arm reads
     /// it through the page table; `None` without a page table or a plane.
-    pub fn paged(
-        &self,
-        handles: &Handles,
-        value: ValueId,
-    ) -> Option<kernels_metal::attn::ssm::Paged> {
+    pub fn paged(&self, handles: &Handles, value: ValueId) -> Option<kernels_metal::ssm::Paged> {
         let pages = self.pages?;
         let plane = *self.layout.in_of.get(&value.0)?;
         let at = self.plane_at[plane];
         let slab = self.page_bytes.checked_mul(u64::from(self.pool_slots))?;
         let view = handles.cut(self.pool, at, slab.checked_sub(at)?).ok()?;
-        Some(kernels_metal::attn::ssm::Paged {
+        Some(kernels_metal::ssm::Paged {
             slab: Tensor::new(view, 1, 1, Dtype::U8),
             pages,
             page_tokens: self.page_tokens,

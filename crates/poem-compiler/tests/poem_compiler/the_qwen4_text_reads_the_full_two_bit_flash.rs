@@ -2,7 +2,7 @@ const DEPLOYMENT: &str = "qwen38-flash-next-u4g64-u2g128-kv-bf16";
 
 #[test]
 fn the_full_row_emits_the_gather_the_planner_keys_on() {
-    use poem::{Attention, Def, Layout, Operation, Platform};
+    use poem::{Def, Gather, Operation, Platform};
 
     let trace = poem_compiler::catalog::deployment(DEPLOYMENT)
         .expect("this build ships the full 2-bit row")
@@ -12,11 +12,15 @@ fn the_full_row_emits_the_gather_the_planner_keys_on() {
     let mut tables: Vec<(String, Vec<u64>)> = Vec::new();
     for node in &trace.nodes {
         match &node.op {
-            Operation::Attention(
-                Attention::PleNgramIds { primes, .. }
-                | Attention::PleNgramIdsChunked { primes, .. },
+            Operation::Gather(
+                Gather::NgramIds { primes, .. } | Gather::NgramIdsChunked { primes, .. },
             ) => heads.push(primes.len()),
-            Operation::Layout(Layout::EmbedConcat { table, .. }) => {
+            Operation::Gather(Gather::Embed {
+                table,
+                weights: None,
+                concat: true,
+                ..
+            }) => {
                 let Some(Def::Weight(w)) = trace.values.get(table.0 as usize).map(|d| &d.def)
                 else {
                     panic!("the gather's table operand is not a weight");

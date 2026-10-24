@@ -1,0 +1,14 @@
+// Files boundary row r's entry at its request's cell for its position; a
+// row closing no block (bpos < 0) writes nothing.
+fn k_index_pool_write(entries: [*]f32, bpos: [*]i32, breq: [*]i32, table: [*]f32, indices: [*]i32, indptr: [*]i32,
+                      nidx: i32, nptr: i32, rows: i32, width: i32, ps: i32, cells: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var bp: i32 = bpos[r];
+    if (bp >= 0) {
+      var cell: i32 = k_index_cell(indices, indptr, nidx, nptr, breq[r], bp, ps, cells);
+      if (cell >= 0) { k_copy(table, cell * width, entries, r * width, width); }
+    }
+  }
+}
+

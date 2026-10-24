@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -1410,11 +1411,12 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
     out
 }
 
-// SAFETY: `Shell` holds raw device handles inline, none of which is `Send`
-// to the compiler. Sound because every verb takes `&mut self`, so exactly
-// one thread touches a shell at a time.
+// SAFETY: `Shell` holds raw device handles and `Cell`s inline, none of
+// which the compiler lets cross threads. The handles name driver objects that
+// any thread may use once it binds the context, and every verb that touches
+// the device, the stream or a `Cell` takes `&mut self` (and `bind_thread`
+// binds the context first), so one thread drives a shell at a time.
 unsafe impl Send for Cuda {}
-unsafe impl Sync for Cuda {}
 
 #[cfg(test)]
 mod tests {

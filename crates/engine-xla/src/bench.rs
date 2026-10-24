@@ -13,9 +13,11 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Mutex, OnceLock};
 
+use crate::emit::{Cx, Emit, Env};
+use crate::handle::Tensor;
 use dtype::Dtype;
+use kernels_xla::elem_of;
 use kernels_xla::hlo::{Func, Ty, Val, bf16_bits};
-use kernels_xla::{Cx, Emit, Env, Tensor, elem_of};
 
 use crate::pjrt::{Arg, Client, ElementType};
 
@@ -52,9 +54,7 @@ pub fn client() -> Option<&'static Mutex<Client>> {
 /// and then opens a `Device` with `PIE_XLA_LOCK=1` takes it again instead of
 /// waiting on itself (`flock` on a second open file would).
 pub fn lock_device() -> DeviceLock {
-    let mut held = HELD
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut held = HELD.lock().expect("held lock poisoned");
     if held.0 == 0 {
         let path = std::env::temp_dir().join("pie-xla-device.lock");
         let file = std::fs::OpenOptions::new()
@@ -81,9 +81,7 @@ pub struct DeviceLock(());
 
 impl Drop for DeviceLock {
     fn drop(&mut self) {
-        let mut held = HELD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut held = HELD.lock().expect("held lock poisoned");
         held.0 -= 1;
         if held.0 == 0 {
             held.1 = None;
@@ -234,7 +232,7 @@ impl Bench {
     pub fn time(
         &mut self,
         iters: u32,
-        body: impl FnOnce(&kernels_xla::Ctx<'_>) -> Result<(), kernels_xla::Error>,
+        body: impl FnOnce(&crate::emit::Ctx<'_>) -> Result<(), kernels_xla::Error>,
     ) -> Result<Option<f64>, String> {
         self.time_with(iters, &[], false, body)
     }
@@ -248,7 +246,7 @@ impl Bench {
         &mut self,
         iters: u32,
         in_place: &[Tensor],
-        body: impl FnOnce(&kernels_xla::Ctx<'_>) -> Result<(), kernels_xla::Error>,
+        body: impl FnOnce(&crate::emit::Ctx<'_>) -> Result<(), kernels_xla::Error>,
     ) -> Result<Option<f64>, String> {
         self.time_with(iters, in_place, true, body)
     }
@@ -258,7 +256,7 @@ impl Bench {
         iters: u32,
         in_place: &[Tensor],
         pipelined: bool,
-        body: impl FnOnce(&kernels_xla::Ctx<'_>) -> Result<(), kernels_xla::Error>,
+        body: impl FnOnce(&crate::emit::Ctx<'_>) -> Result<(), kernels_xla::Error>,
     ) -> Result<Option<f64>, String> {
         let Some(client) = client() else {
             return Ok(None);
@@ -356,7 +354,7 @@ impl Bench {
     /// `Ok(false)` when no device is present (the test should return).
     pub fn run(
         &mut self,
-        body: impl FnOnce(&kernels_xla::Ctx<'_>) -> Result<(), kernels_xla::Error>,
+        body: impl FnOnce(&crate::emit::Ctx<'_>) -> Result<(), kernels_xla::Error>,
     ) -> Result<bool, String> {
         let Some(client) = client() else {
             return Ok(false);

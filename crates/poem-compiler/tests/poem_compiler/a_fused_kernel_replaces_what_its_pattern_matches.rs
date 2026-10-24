@@ -1,7 +1,14 @@
-use poem::ops::{attn, elemwise, layout, linear};
+use poem::Value;
+use poem::ops::{attn, elemwise, gather, linear, ssm};
 use poem::pattern::{Pattern, template};
-use poem_compiler::fuse::fuse;
+use poem_compiler::fuse::rules;
+use poem_ir::{GluAct, Turn};
 use poem_ir::{Operands, Trace};
+
+/// `trace` with every rule, in every form, that forms one of `kernels` run.
+fn fuse(trace: Trace, kernels: &[&str]) -> Trace {
+    poem_compiler::fuse::fuse(trace, &rules::forming(kernels))
+}
 
 fn trace(build: impl FnOnce(&Pattern)) -> Trace {
     template(build).trace
@@ -20,10 +27,7 @@ fn a_matmul_and_its_bias_fold_into_one_epilogue() {
     let t = trace(|p| {
         elemwise::add_bias(&p.weight("bias", [64]), &biased(p));
     });
-    assert_eq!(
-        ops(&fuse(t, &["linear.matmul_bias"])),
-        ["linear.matmul_bias"]
-    );
+    assert_eq!(ops(&fuse(t, &["fused.matmul_bias"])), ["fused.matmul_bias"]);
 }
 
 #[test]
@@ -32,8 +36,8 @@ fn a_backend_forms_only_the_kernels_it_lists() {
         elemwise::add_bias(&p.weight("bias", [64]), &biased(p));
     });
     assert_eq!(
-        ops(&fuse(t, &["elementwise.residual_add_rmsnorm"])),
-        ["linear.matmul", "elementwise.add_bias"]
+        ops(&fuse(t, &["fused.residual_add_rmsnorm"])),
+        ["linear.matmul", "elemwise.add_bias"]
     );
 }
 
@@ -45,8 +49,8 @@ fn a_value_read_past_the_match_keeps_the_pair_apart() {
         elemwise::silu(&y);
     });
     assert_eq!(
-        ops(&fuse(t, &["linear.matmul_bias"])),
-        ["linear.matmul", "elementwise.add_bias", "elementwise.silu"]
+        ops(&fuse(t, &["fused.matmul_bias"])),
+        ["linear.matmul", "elemwise.add_bias", "elemwise.act"]
     );
 }
 
@@ -58,8 +62,8 @@ fn an_op_between_the_pair_stays_ahead_of_the_fused_one() {
         elemwise::add_bias(&p.weight("bias", [64]), &y);
     });
     assert_eq!(
-        ops(&fuse(t, &["linear.matmul_bias"])),
-        ["elementwise.silu", "linear.matmul_bias"]
+        ops(&fuse(t, &["fused.matmul_bias"])),
+        ["elemwise.act", "fused.matmul_bias"]
     );
 }
 
@@ -72,28 +76,32 @@ fn an_op_that_overwrites_what_the_match_reads_keeps_it_in_place() {
         elemwise::add_bias(&p.weight("bias", [64]), &y);
     });
     assert_eq!(
-        ops(&fuse(t, &["linear.matmul_bias"])),
+        ops(&fuse(t, &["fused.matmul_bias"])),
         [
             "linear.matmul",
-            "elementwise.residual_add",
-            "elementwise.add_bias"
+            "elemwise.residual_add",
+            "elemwise.add_bias"
         ]
     );
 }
 
 fn dense_mlp(p: &Pattern) -> (poem::Value, poem::Value) {
     let packed = linear::matmul(&p.rows("x", 64), &p.weight("gate_up", [128, 64]));
-    let h = linear::mlp_swiglu(&packed, 64);
+    let h = linear::glu(&packed, GluAct::Swiglu, Some(64), None, None, None);
     let y = linear::matmul(&h, &p.weight("down", [64, 64]));
     (h, y)
 }
 
 #[test]
 fn a_dense_mlp_folds_into_one_op() {
-    let fused = fuse(trace(|p| drop(dense_mlp(p))), &["linear.mlp_swiglu"]);
-    assert_eq!(ops(&fused), ["linear.mlp_swiglu"]);
-    let Some(poem_ir::Operation::Fused(poem_ir::Fused::MlpSwiglu { intermediate, .. })) =
-        fused.nodes.first().map(|node| &node.op)
+    let fused = fuse(
+        trace(|p| drop(dense_mlp(p))),
+        &["fused.matmul_swiglu_matmul"],
+    );
+    assert_eq!(ops(&fused), ["fused.matmul_swiglu_matmul"]);
+    let Some(poem_ir::Operation::Fused(poem_ir::Fused::MatmulSwigluMatmul {
+        intermediate, ..
+    })) = fused.nodes.first().map(|node| &node.op)
     else {
         panic!("the op is the fused mlp");
     };
@@ -109,15 +117,15 @@ fn a_dense_mlp_whose_intermediate_is_read_elsewhere_stays_apart() {
             let (h, _) = dense_mlp(p);
             elemwise::silu(&h);
         }),
-        &["linear.mlp_swiglu"],
+        &["fused.matmul_swiglu_matmul"],
     );
     assert_eq!(
         ops(&fused),
         [
             "linear.matmul",
-            "linear.mlp_swiglu",
+            "linear.glu",
             "linear.matmul",
-            "elementwise.silu"
+            "elemwise.act"
         ]
     );
 }
@@ -128,14 +136,22 @@ fn qkv_write(p: &Pattern, q_eps: f32, k_eps: f32) {
 
 fn qkv_write_scaled(p: &Pattern, q_eps: f32, k_eps: f32, scaling: Option<poem::rope::RopeScaling>) {
     let positions = p.indices("positions");
-    let (q, k, v) = layout::split_qkv(&p.rows("packed", 512), 256, 128);
+    let (q, k, v) = gather::split_qkv(&p.rows("packed", 512), 256, 128);
     let v = elemwise::rmsnorm_no_scale(&v, 64, q_eps);
     let q = elemwise::rmsnorm_per_head(&q, &p.weight("q_norm", [64]), 64, q_eps);
     let k = elemwise::rmsnorm_per_head(&k, &p.weight("k_norm", [64]), 64, k_eps);
-    let (q, k) = elemwise::rope_full(&q, &k, &positions, 64, 10_000.0, false, scaling);
+    let (q, k) = both(elemwise::rope(
+        &q,
+        &positions,
+        64,
+        10_000.0,
+        Turn::Full { interleaved: false },
+        Some(&k),
+        scaling,
+    ));
     attn::kv_append(
         &k,
-        &v,
+        Some(&v),
         p.cache("kv"),
         &p.rows("write_page", 1),
         &p.rows("write_offset", 1),
@@ -147,14 +163,11 @@ fn qkv_write_scaled(p: &Pattern, q_eps: f32, k_eps: f32, scaling: Option<poem::r
 fn the_qkv_write_folds_when_its_norms_share_an_epsilon() {
     let fused = fuse(
         trace(|p| qkv_write(p, 1e-6, 1e-6)),
-        &["custom_cuda.qkv_fused_qknorm_rope_vnorm_write"],
+        &["fused.qkv_fused_qknorm_rope_vnorm_write"],
     );
     assert_eq!(
         ops(&fused),
-        [
-            "custom_cuda.qkv_fused_qknorm_rope_vnorm_write",
-            "elementwise.silu"
-        ]
+        ["fused.qkv_fused_qknorm_rope_vnorm_write", "elemwise.act"]
     );
     let Some(poem_ir::Operation::Fused(poem_ir::Fused::QkvFusedQknormRopeVnormWrite {
         kv_heads,
@@ -176,13 +189,9 @@ fn a_scaled_rotation_keeps_the_qkv_write_apart() {
     let scaling = poem::rope::RopeScaling::Linear { factor: 2.0 };
     let fused = fuse(
         trace(|p| qkv_write_scaled(p, 1e-6, 1e-6, Some(scaling))),
-        &["custom_cuda.qkv_fused_qknorm_rope_vnorm_write"],
+        &["fused.qkv_fused_qknorm_rope_vnorm_write"],
     );
-    assert!(
-        ops(&fused).contains(&"elementwise.rope_full"),
-        "{:?}",
-        ops(&fused)
-    );
+    assert!(ops(&fused).contains(&"elemwise.rope"), "{:?}", ops(&fused));
 }
 
 /// Muse Spark's form folds too: scaleless q and k norms, v as it is, and a
@@ -191,14 +200,14 @@ fn a_scaled_rotation_keeps_the_qkv_write_apart() {
 fn the_scaleless_unturned_qkv_write_folds() {
     let fused = fuse(
         trace(|p| {
-            let (q, k, v) = layout::split_qkv(&p.rows("packed", 512), 256, 128);
+            let (q, k, v) = gather::split_qkv(&p.rows("packed", 512), 256, 128);
             let q = elemwise::rmsnorm_no_scale(&q, 64, 1e-5);
             let k = elemwise::rmsnorm_no_scale(&k, 64, 1e-5);
             let (page, offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
-            attn::kv_append(&k, &v, p.cache("kv"), &page, &offset);
+            attn::kv_append(&k, Some(&v), p.cache("kv"), &page, &offset);
             elemwise::silu(&q);
         }),
-        &["custom_cuda.qkv_fused_qknorm_rope_vnorm_write"],
+        &["fused.qkv_fused_qknorm_rope_vnorm_write"],
     );
     let Some(poem_ir::Operation::Fused(poem_ir::Fused::QkvFusedQknormRopeVnormWrite {
         q_norm_weight: None,
@@ -222,18 +231,29 @@ fn the_unnormed_partly_turned_qkv_write_folds() {
             trace(|p| {
                 let packed = p.rows("packed", 1024);
                 let (q, k, v) = if padded {
-                    layout::split_qkv_padded(&packed, [2, 1], [192, 128], 256)
+                    gather::split_qkv_padded(&packed, [2, 1], [192, 128], 256)
                 } else {
-                    layout::split_qkv(&packed, 512, 256)
+                    gather::split_qkv(&packed, 512, 256)
                 };
                 let v = elemwise::mul_scalar(0.707, &v);
                 let positions = p.indices("positions");
-                let (q, k) = elemwise::rope_partial(&q, &k, &positions, 64, 256, 1e4, None, None);
+                let (q, k) = both(elemwise::rope(
+                    &q,
+                    &positions,
+                    256,
+                    1e4,
+                    Turn::Partial {
+                        rotary_dim: 64,
+                        span: 64 / 2,
+                    },
+                    Some(&k),
+                    None,
+                ));
                 let (page, offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
-                attn::kv_append(&k, &v, p.cache("kv"), &page, &offset);
+                attn::kv_append(&k, Some(&v), p.cache("kv"), &page, &offset);
                 elemwise::silu(&q);
             }),
-            &["custom_cuda.qkv_fused_qknorm_rope_vnorm_write"],
+            &["fused.qkv_fused_qknorm_rope_vnorm_write"],
         );
         let Some(poem_ir::Operation::Fused(poem_ir::Fused::QkvFusedQknormRopeVnormWrite {
             qk_norm: false,
@@ -255,32 +275,34 @@ fn the_unnormed_partly_turned_qkv_write_folds() {
 #[test]
 fn the_qkv_write_stays_apart_when_its_norms_do_not() {
     let apart = trace(|p| qkv_write(p, 1e-6, 1e-5));
-    let fused = fuse(
-        apart.clone(),
-        &["custom_cuda.qkv_fused_qknorm_rope_vnorm_write"],
-    );
+    let fused = fuse(apart.clone(), &["fused.qkv_fused_qknorm_rope_vnorm_write"]);
     assert_eq!(ops(&fused), ops(&apart), "no op folds");
 }
 
 fn yarn_write(p: &Pattern, interleaved: bool) {
     let positions = p.indices("positions");
     let (q, k, v) = (p.rows("q", 512), p.rows("k", 128), p.rows("v", 128));
-    let (q, k) = elemwise::rope_yarn(
+    let (q, k) = both(elemwise::rope(
         &q,
-        &k,
         &positions,
         64,
         150_000.0,
-        32.0,
-        32.0,
-        1.0,
-        1.3,
-        4096,
-        interleaved,
-    );
+        Turn::Yarn {
+            yarn: elemwise::Yarn {
+                factor: 32.0,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                original_max_position: 4096,
+            },
+            attention_factor: 1.3,
+            interleaved,
+        },
+        Some(&k),
+        None,
+    ));
     attn::kv_append(
         &k,
-        &v,
+        Some(&v),
         p.cache("kv"),
         &p.rows("write_page", 1),
         &p.rows("write_offset", 1),
@@ -295,12 +317,9 @@ fn a_yarn_rotation_and_its_cache_write_fold_into_one_op() {
     for interleaved in [false, true] {
         let fused = fuse(
             trace(|p| yarn_write(p, interleaved)),
-            &["elementwise.rope_yarn_append"],
+            &["fused.rope_yarn_append"],
         );
-        assert_eq!(
-            ops(&fused),
-            ["elementwise.rope_yarn_append", "elementwise.silu"]
-        );
+        assert_eq!(ops(&fused), ["fused.rope_yarn_append", "elemwise.act"]);
         let Some(poem_ir::Operation::Fused(poem_ir::Fused::RopeYarnAppend {
             head_dim,
             theta,
@@ -328,23 +347,28 @@ fn a_split_rotation_and_its_cache_write_fold_into_one_op() {
         trace(move |p| {
             let positions = p.indices("positions");
             let packed = p.rows("packed", 768);
-            let (q, k, v) = layout::split_qkv(&packed, 512, 128);
-            let (qr, kr) = elemwise::rope_yarn(
+            let (q, k, v) = gather::split_qkv(&packed, 512, 128);
+            let (qr, kr) = both(elemwise::rope(
                 &q,
-                &k,
                 &positions,
                 64,
                 150_000.0,
-                32.0,
-                32.0,
-                1.0,
-                1.3,
-                4096,
-                interleaved,
-            );
+                Turn::Yarn {
+                    yarn: elemwise::Yarn {
+                        factor: 32.0,
+                        beta_fast: 32.0,
+                        beta_slow: 1.0,
+                        original_max_position: 4096,
+                    },
+                    attention_factor: 1.3,
+                    interleaved,
+                },
+                Some(&k),
+                None,
+            ));
             attn::kv_append(
                 &kr,
-                &v,
+                Some(&v),
                 p.cache("kv"),
                 &p.rows("write_page", 1),
                 &p.rows("write_offset", 1),
@@ -355,15 +379,12 @@ fn a_split_rotation_and_its_cache_write_fold_into_one_op() {
             }
         })
     };
-    let kernels = [
-        "elementwise.split_rope_yarn_append",
-        "elementwise.rope_yarn_append",
-    ];
+    let kernels = ["fused.split_rope_yarn_append", "fused.rope_yarn_append"];
     for interleaved in [false, true] {
         let fused = fuse(packed_write(interleaved, false), &kernels);
         assert_eq!(
             ops(&fused),
-            ["elementwise.split_rope_yarn_append", "elementwise.silu"]
+            ["fused.split_rope_yarn_append", "elemwise.act"]
         );
         let Some(poem_ir::Operation::Fused(poem_ir::Fused::SplitRopeYarnAppend {
             q_width,
@@ -393,10 +414,10 @@ fn a_split_rotation_and_its_cache_write_fold_into_one_op() {
     assert_eq!(
         ops(&fused),
         [
-            "layout.split_qkv",
-            "elementwise.rope_yarn_append",
-            "elementwise.silu",
-            "elementwise.silu"
+            "gather.split_qkv",
+            "fused.rope_yarn_append",
+            "elemwise.act",
+            "elemwise.act"
         ],
         "a split read past the rotation stays a split"
     );
@@ -415,18 +436,47 @@ fn deepseeks_window_pool_merge_and_sinks_land_as_one_op() {
                 "plan",
                 poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
             );
-            let (o, lse) = attn::prefill_lse(&q, &plan, cache, Some(128), 512, 1, 0.04, None);
+            let (o, lse) = both(attn::prefill(
+                &q,
+                &plan,
+                cache,
+                Some(128),
+                512,
+                1,
+                0.04,
+                true,
+                None,
+                true,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                None,
+            ));
             let (o, lse) = if pooled {
                 let positions = p.indices("positions");
                 let requests = p.indices("requests");
                 let entries = p.cache("entries");
                 let (po, plse) = if selected {
                     let selection = p.rows("selection", 512);
-                    attn::pool_lse_selected(
-                        &q, &positions, &requests, &selection, entries, 4, 512, 64, 512, 0.04,
+                    attn::pool_lse(
+                        &q,
+                        &positions,
+                        &requests,
+                        entries,
+                        4,
+                        64,
+                        512,
+                        0.04,
+                        Some(&selection),
+                        Some(512),
                     )
                 } else {
-                    attn::pool_lse(&q, &positions, &requests, entries, 128, 64, 512, 0.04)
+                    attn::pool_lse(
+                        &q, &positions, &requests, entries, 128, 64, 512, 0.04, None, None,
+                    )
                 };
                 attn::merge_lse(&o, &lse, &po, &plse, 64, 512)
             } else {
@@ -436,40 +486,33 @@ fn deepseeks_window_pool_merge_and_sinks_land_as_one_op() {
             elemwise::silu(&out);
         })
     };
-    let kernels = ["attention.pool_attention", "attention.lse_sink"];
+    let kernels = ["fused.pool_attention", "fused.lse_sink"];
     for selected in [true, false] {
         let fused = fuse(layer(selected, true), &kernels);
-        assert_eq!(
-            ops(&fused),
-            ["attention.pool_attention", "elementwise.silu"]
-        );
+        assert_eq!(ops(&fused), ["fused.pool_attention", "elemwise.act"]);
         let Some(poem_ir::Operation::Fused(poem_ir::Fused::PoolAttention {
             window,
             pool,
             merge,
-            head_dim,
+            sink,
             ..
         })) = fused.nodes.first().map(|node| &node.op)
         else {
             panic!("the first op is the pool attention");
         };
-        assert_eq!(*head_dim, 512);
+        assert!(matches!(**sink, poem_ir::Attn::Sink { head_dim: 512, .. }));
         assert_eq!(
             (window.name(), pool.name(), merge.name()),
-            (
-                "attention.prefill_lse",
-                if selected {
-                    "attention.pool_lse_selected"
-                } else {
-                    "attention.pool_lse"
-                },
-                "attention.merge_lse"
-            )
+            ("attn.prefill", "attn.pool_lse", "attn.merge_lse")
+        );
+        assert!(
+            matches!(**pool, poem_ir::Attn::PoolLse { selection, .. } if selection.is_some() == selected),
+            "the pool reads a selection exactly when the layer selects"
         );
     }
     assert_eq!(
         ops(&fuse(layer(false, false), &kernels)),
-        ["attention.lse_sink", "elementwise.silu"]
+        ["fused.lse_sink", "elemwise.act"]
     );
 }
 
@@ -487,13 +530,30 @@ fn a_sink_folds_onto_the_attention_whose_log_sum_exp_it_reads() {
                     "plan",
                     poem_ir::Ty::Struct(poem_ir::StructKind::AttnDecodePlan),
                 );
-                attn::decode_lse(&q, &plan, cache, Some(128), 64, 0.125)
+                both(attn::decode(
+                    &q,
+                    &plan,
+                    cache,
+                    Some(128),
+                    64,
+                    0.125,
+                    true,
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                ))
             } else {
                 let plan = p.value(
                     "plan",
                     poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
                 );
-                attn::prefill_lse(&q, &plan, cache, None, 64, 8, 0.125, None)
+                both(attn::prefill(
+                    &q, &plan, cache, None, 64, 8, 0.125, true, None, true, None, None, None,
+                    false, None, None, None,
+                ))
             };
             let out = attn::sink(&o, &lse, &p.weight("sinks", [8]), 64);
             elemwise::silu(&out);
@@ -503,8 +563,8 @@ fn a_sink_folds_onto_the_attention_whose_log_sum_exp_it_reads() {
         })
     };
     for decode in [true, false] {
-        let fused = fuse(sinked(decode, false), &["attention.lse_sink"]);
-        assert_eq!(ops(&fused), ["attention.lse_sink", "elementwise.silu"]);
+        let fused = fuse(sinked(decode, false), &["fused.lse_sink"]);
+        assert_eq!(ops(&fused), ["fused.lse_sink", "elemwise.act"]);
         let Some(poem_ir::Operation::Fused(poem_ir::Fused::LseSink { attn, head_dim, .. })) =
             fused.nodes.first().map(|node| &node.op)
         else {
@@ -514,14 +574,14 @@ fn a_sink_folds_onto_the_attention_whose_log_sum_exp_it_reads() {
         assert_eq!(
             attn.name(),
             if decode {
-                "attention.decode_lse"
+                "attn.decode"
             } else {
-                "attention.prefill_lse"
+                "attn.prefill"
             }
         );
         let apart = sinked(decode, true);
         assert_eq!(
-            ops(&fuse(apart.clone(), &["attention.lse_sink"])),
+            ops(&fuse(apart.clone(), &["fused.lse_sink"])),
             ops(&apart),
             "a log-sum-exp read elsewhere keeps the pair apart"
         );
@@ -531,17 +591,13 @@ fn a_sink_folds_onto_the_attention_whose_log_sum_exp_it_reads() {
 #[test]
 fn a_projection_cut_into_two_halves_lands_as_one_fused_op() {
     let t = trace(|p| {
-        let (left, right) = layout::split_rows(&biased(p), 40);
+        let (left, right) = gather::split_rows(&biased(p), 40);
         elemwise::silu(&left);
         elemwise::silu(&right);
     });
     assert_eq!(
-        ops(&fuse(t, &["linear.matmul_split_rows"])),
-        [
-            "linear.matmul_split_rows",
-            "elementwise.silu",
-            "elementwise.silu"
-        ]
+        ops(&fuse(t, &["fused.matmul_split_rows"])),
+        ["fused.matmul_split_rows", "elemwise.act", "elemwise.act"]
     );
 }
 
@@ -549,7 +605,7 @@ fn a_projection_cut_into_two_halves_lands_as_one_fused_op() {
 fn qwens_attention_prologue_lands_as_one_fused_op() {
     let t = trace(|p| {
         let d = 64;
-        let (q, gate) = layout::split_q_gate(&p.rows("qg", 4 * 64), d);
+        let (q, gate) = gather::split_q_gate(&p.rows("qg", 4 * 64), d);
         let q = elemwise::rmsnorm_per_head_plus_one(&q, &p.weight("q_norm", [64]), d, 1e-6);
         let k = elemwise::rmsnorm_per_head_plus_one(
             &p.rows("k", 64),
@@ -558,11 +614,22 @@ fn qwens_attention_prologue_lands_as_one_fused_op() {
             1e-6,
         );
         let positions = p.indices("positions");
-        let (q, k) = elemwise::rope_partial(&q, &k, &positions, 16, d, 1e6, None, None);
+        let (q, k) = both(elemwise::rope(
+            &q,
+            &positions,
+            d,
+            1e6,
+            Turn::Partial {
+                rotary_dim: 16,
+                span: 16 / 2,
+            },
+            Some(&k),
+            None,
+        ));
         let cache = p.cache("cache");
         attn::kv_append(
             &k,
-            &p.rows("v", 64),
+            Some(&p.rows("v", 64)),
             cache,
             &p.rows("wp", 1),
             &p.rows("wo", 1),
@@ -571,11 +638,16 @@ fn qwens_attention_prologue_lands_as_one_fused_op() {
         elemwise::silu(&gate);
     });
     assert_eq!(
-        ops(&fuse(t, &["elementwise.qg_qknorm_rope_append"])),
+        ops(&poem_compiler::fuse::fuse(
+            t,
+            [&rules::q_gate_norm_rope_append(
+                poem_ir::ops::fused::Intermediates::Unwritten
+            )]
+        )),
         [
-            "elementwise.qg_qknorm_rope_append",
-            "elementwise.silu",
-            "elementwise.silu"
+            "fused.q_gate_norm_rope_append",
+            "elemwise.act",
+            "elemwise.act"
         ]
     );
 }
@@ -588,24 +660,38 @@ fn deepseeks_norm_and_tail_rotation_land_as_one_op() {
         beta_slow: 1.0,
         original_max_position: 65536,
     });
-    let kernels = ["elementwise.norm_rope_last"];
+    let kernels = ["fused.norm_rope"];
     // q: a scale-free norm a 512-wide head, its tail turned.
     let q = trace(|p| {
         let positions = p.indices("positions");
         let y = elemwise::rmsnorm_no_scale(&p.rows("q", 64 * 512), 512, 1e-6);
-        let q = elemwise::rope_partial_last_yarn(&y, &positions, 64, 512, 1e4, true, false, yarn);
+        let q = elemwise::rope(
+            &y,
+            &positions,
+            512,
+            1e4,
+            Turn::Last {
+                rotary_dim: 64,
+                interleaved: true,
+                inverse: false,
+                yarn,
+            },
+            None,
+            None,
+        )
+        .0;
         elemwise::silu(&q);
     });
     let fused = fuse(q, &kernels);
-    assert_eq!(
-        ops(&fused),
-        ["elementwise.norm_rope_last", "elementwise.silu"]
-    );
-    let Some(poem_ir::Operation::Fused(poem_ir::Fused::NormRopeLast {
+    assert_eq!(ops(&fused), ["fused.norm_rope", "elemwise.act"]);
+    let Some(poem_ir::Operation::Fused(poem_ir::Fused::NormRope {
         weight,
         head_dim,
-        interleaved,
-        yarn: got,
+        turn: Turn::Last {
+            interleaved,
+            yarn: got,
+            ..
+        },
         ..
     })) = fused.nodes.first().map(|node| &node.op)
     else {
@@ -619,27 +705,51 @@ fn deepseeks_norm_and_tail_rotation_land_as_one_op() {
     let plane = trace(|p| {
         let positions = p.indices("positions");
         let y = elemwise::rmsnorm(&p.rows("kv", 512), &p.weight("norm", [512]), 1e-6);
-        let k = elemwise::rope_partial_last_yarn(&y, &positions, 64, 512, 1e4, true, true, None);
+        let k = elemwise::rope(
+            &y,
+            &positions,
+            512,
+            1e4,
+            Turn::Last {
+                rotary_dim: 64,
+                interleaved: true,
+                inverse: true,
+                yarn: None,
+            },
+            None,
+            None,
+        )
+        .0;
         elemwise::silu(&k);
     });
     assert_eq!(
         ops(&fuse(plane, &kernels)),
-        ["elementwise.norm_rope_last", "elementwise.silu"]
+        ["fused.norm_rope", "elemwise.act"]
     );
     // A row of several heads normed whole is not a head's norm.
     let wide = trace(|p| {
         let positions = p.indices("positions");
         let y = elemwise::rmsnorm(&p.rows("kv", 1024), &p.weight("norm", [1024]), 1e-6);
-        let k = elemwise::rope_partial_last(&y, &positions, 64, 512, 1e4, true);
+        let k = elemwise::rope(
+            &y,
+            &positions,
+            512,
+            1e4,
+            Turn::Last {
+                rotary_dim: 64,
+                interleaved: true,
+                inverse: false,
+                yarn: None,
+            },
+            None,
+            None,
+        )
+        .0;
         elemwise::silu(&k);
     });
     assert_eq!(
         ops(&fuse(wide, &kernels)),
-        [
-            "elementwise.rmsnorm",
-            "elementwise.rope_partial_last",
-            "elementwise.silu"
-        ]
+        ["elemwise.rmsnorm", "elemwise.rope", "elemwise.act"]
     );
 }
 
@@ -648,10 +758,25 @@ fn deepseeks_kv_plane_norm_rotation_and_write_land_as_one_op() {
     let kv = trace(|p| {
         let positions = p.indices("positions");
         let y = elemwise::rmsnorm(&p.rows("kv", 512), &p.weight("norm", [512]), 1e-6);
-        let k = elemwise::rope_partial_last_yarn(&y, &positions, 64, 512, 1e4, true, false, None);
+        let k = elemwise::rope(
+            &y,
+            &positions,
+            512,
+            1e4,
+            Turn::Last {
+                rotary_dim: 64,
+                interleaved: true,
+                inverse: false,
+                yarn: None,
+            },
+            None,
+            None,
+        )
+        .0;
         let cache = p.cache("kv_cache");
-        attn::kv_append_shared(
+        attn::kv_append(
             &k,
+            None,
             cache,
             &p.rows("write_page", 1),
             &p.rows("write_offset", 1),
@@ -660,12 +785,9 @@ fn deepseeks_kv_plane_norm_rotation_and_write_land_as_one_op() {
     assert_eq!(
         ops(&fuse(
             kv,
-            &[
-                "elementwise.norm_rope_last_append",
-                "elementwise.norm_rope_last"
-            ]
+            &["fused.norm_rope_last_append", "fused.norm_rope"]
         )),
-        ["elementwise.norm_rope_last_append"]
+        ["fused.norm_rope_last_append"]
     );
 }
 
@@ -700,30 +822,26 @@ fn a_hyper_connection_pre_mix_lands_as_one_op() {
         })
     };
     let all = [
-        "elementwise.hc_pre",
-        "elementwise.hc_prenorm_project",
-        "elementwise.hc_gates_norm",
+        "fused.hc_pre",
+        "fused.hc_prenorm_project",
+        "fused.hc_gates_norm",
     ];
     assert_eq!(
         ops(&fuse(sublayer(false), &all)),
-        [
-            "elementwise.hc_pre",
-            "elementwise.silu",
-            "elementwise.hc_fold"
-        ]
+        ["fused.hc_pre", "elemwise.act", "elemwise.hc_fold"]
     );
     assert_eq!(
         ops(&fuse(sublayer(false), &all[1..])),
         [
-            "elementwise.hc_prenorm_project",
-            "elementwise.hc_gates_norm",
-            "elementwise.silu",
-            "elementwise.hc_fold"
+            "fused.hc_prenorm_project",
+            "fused.hc_gates_norm",
+            "elemwise.act",
+            "elemwise.hc_fold"
         ]
     );
     let kept = ops(&fuse(sublayer(true), &all));
     assert!(
-        kept.contains(&"elementwise.hc_rmsnorm_f32") && kept.contains(&"elementwise.hc_gates_norm"),
+        kept.contains(&"elemwise.hc_rmsnorm_f32") && kept.contains(&"fused.hc_gates_norm"),
         "{kept:?}"
     );
 }
@@ -748,19 +866,29 @@ fn deepseeks_compressor_lands_as_one_op() {
             if read_latent {
                 elemwise::silu(&latent);
             }
-            let k =
-                elemwise::rope_partial_last_yarn(&latent, &brope, 64, 512, 1e4, true, false, None);
+            let k = elemwise::rope(
+                &latent,
+                &brope,
+                512,
+                1e4,
+                Turn::Last {
+                    rotary_dim: 64,
+                    interleaved: true,
+                    inverse: false,
+                    yarn: None,
+                },
+                None,
+                None,
+            )
+            .0;
             let pool = p.cache("entries");
             attn::pool_kv_append(&k, &bpos, &breq, pool, &p.rows("wp", 1), &p.rows("wo", 1));
         })
     };
-    let kernels = ["attention.pool_compress", "elementwise.norm_rope_last"];
-    assert_eq!(
-        ops(&fuse(chain(false), &kernels)),
-        ["attention.pool_compress"]
-    );
+    let kernels = ["fused.pool_compress", "fused.norm_rope"];
+    assert_eq!(ops(&fuse(chain(false), &kernels)), ["fused.pool_compress"]);
     // A latent read past the match keeps the compressor apart.
-    assert!(!ops(&fuse(chain(true), &kernels)).contains(&"attention.pool_compress"));
+    assert!(!ops(&fuse(chain(true), &kernels)).contains(&"fused.pool_compress"));
 }
 
 #[test]
@@ -770,27 +898,54 @@ fn deepseeks_q_and_kv_plane_land_as_one_op() {
         let x = p.rows("x", 64);
         let q = linear::matmul(&x, &p.weight("q_up", [64 * 512, 64]));
         let q = elemwise::rmsnorm_no_scale(&q, 512, 1e-6);
-        let q = elemwise::rope_partial_last_yarn(&q, &positions, 64, 512, 1e4, true, false, None);
+        let q = elemwise::rope(
+            &q,
+            &positions,
+            512,
+            1e4,
+            Turn::Last {
+                rotary_dim: 64,
+                interleaved: true,
+                inverse: false,
+                yarn: None,
+            },
+            None,
+            None,
+        )
+        .0;
         let plane = linear::matmul(&x, &p.weight("kv_down", [512, 64]));
         let plane = elemwise::rmsnorm(&plane, &p.weight("kv_norm", [512]), 1e-6);
-        let plane =
-            elemwise::rope_partial_last_yarn(&plane, &positions, 64, 512, 1e4, true, false, None);
+        let plane = elemwise::rope(
+            &plane,
+            &positions,
+            512,
+            1e4,
+            Turn::Last {
+                rotary_dim: 64,
+                interleaved: true,
+                inverse: false,
+                yarn: None,
+            },
+            None,
+            None,
+        )
+        .0;
         let cache = p.cache("kv");
-        attn::kv_append_shared(&plane, cache, &p.rows("wp", 1), &p.rows("wo", 1));
+        attn::kv_append(&plane, None, cache, &p.rows("wp", 1), &p.rows("wo", 1));
         elemwise::silu(&q);
     });
     let kernels = [
-        "elementwise.norm_rope_pair",
-        "elementwise.norm_rope_last_append",
-        "elementwise.norm_rope_last",
+        "fused.norm_rope_pair",
+        "fused.norm_rope_last_append",
+        "fused.norm_rope",
     ];
     assert_eq!(
         ops(&fuse(layer, &kernels)),
         [
             "linear.matmul",
             "linear.matmul",
-            "elementwise.norm_rope_pair",
-            "elementwise.silu"
+            "fused.norm_rope_pair",
+            "elemwise.act"
         ]
     );
 }
@@ -804,22 +959,52 @@ fn deepseeks_attention_lands_its_output_turned_back() {
             "plan",
             poem_ir::Ty::Struct(poem_ir::StructKind::AttnPrefillPlan),
         );
-        let (o, lse) = attn::prefill_lse(&q, &plan, cache, Some(128), 512, 1, 0.04, None);
+        let (o, lse) = both(attn::prefill(
+            &q,
+            &plan,
+            cache,
+            Some(128),
+            512,
+            1,
+            0.04,
+            true,
+            None,
+            true,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        ));
         let positions = p.indices("positions");
         let requests = p.indices("requests");
         let entries = p.cache("entries");
-        let (po, plse) = attn::pool_lse(&q, &positions, &requests, entries, 128, 64, 512, 0.04);
+        let (po, plse) = attn::pool_lse(
+            &q, &positions, &requests, entries, 128, 64, 512, 0.04, None, None,
+        );
         let (o, lse) = attn::merge_lse(&o, &lse, &po, &plse, 64, 512);
         let out = attn::sink(&o, &lse, &p.weight("sinks", [64]), 512);
-        let turned =
-            elemwise::rope_partial_last_yarn(&out, &positions, 64, 512, 1e4, true, true, None);
+        let turned = elemwise::rope(
+            &out,
+            &positions,
+            512,
+            1e4,
+            Turn::Last {
+                rotary_dim: 64,
+                interleaved: true,
+                inverse: true,
+                yarn: None,
+            },
+            None,
+            None,
+        )
+        .0;
         elemwise::silu(&turned);
     });
-    let fused = fuse(layer, &["attention.pool_attention"]);
-    assert_eq!(
-        ops(&fused),
-        ["attention.pool_attention", "elementwise.silu"]
-    );
+    let fused = fuse(layer, &["fused.pool_attention"]);
+    assert_eq!(ops(&fused), ["fused.pool_attention", "elemwise.act"]);
     let Some(poem_ir::Operation::Fused(poem_ir::Fused::PoolAttention { rotate, .. })) =
         fused.nodes.first().map(|node| &node.op)
     else {
@@ -828,7 +1013,11 @@ fn deepseeks_attention_lands_its_output_turned_back() {
     assert!(
         matches!(
             rotate.as_deref(),
-            Some(poem_ir::Elementwise::RopePartialLast { inverse: true, .. })
+            Some(poem_ir::Elemwise::Rope {
+                k: None,
+                turn: poem_ir::Turn::Last { inverse: true, .. },
+                ..
+            })
         ),
         "the attention holds the turn"
     );
@@ -838,16 +1027,21 @@ fn deepseeks_attention_lands_its_output_turned_back() {
 fn an_index_ranking_lands_its_queries_turn() {
     let t = trace(|p| {
         let positions = p.indices("positions");
-        let q = elemwise::rope_partial_last_yarn(
+        let q = elemwise::rope(
             &p.rows("q", 64 * 128),
             &positions,
-            64,
             128,
             1e4,
-            true,
-            false,
+            Turn::Last {
+                rotary_dim: 64,
+                interleaved: true,
+                inverse: false,
+                yarn: None,
+            },
             None,
-        );
+            None,
+        )
+        .0;
         let w = p.rows("w", 64);
         let sel = attn::index_topk(
             &q,
@@ -862,8 +1056,8 @@ fn an_index_ranking_lands_its_queries_turn() {
         elemwise::silu(&sel);
     });
     assert_eq!(
-        ops(&fuse(t, &["attention.index_topk_rope"])),
-        ["attention.index_topk_rope", "elementwise.silu"]
+        ops(&fuse(t, &["fused.index_topk_rope"])),
+        ["fused.index_topk_rope", "elemwise.act"]
     );
 }
 
@@ -892,12 +1086,26 @@ fn deepseeks_compressor_lands_its_state_write_too() {
             poem_ir::Dtype::Bf16,
         );
         let latent = elemwise::rmsnorm(&g, &p.weight("norm", [512]), 1e-6);
-        let k = elemwise::rope_partial_last_yarn(&latent, &brope, 64, 512, 1e4, true, false, None);
+        let k = elemwise::rope(
+            &latent,
+            &brope,
+            512,
+            1e4,
+            Turn::Last {
+                rotary_dim: 64,
+                interleaved: true,
+                inverse: false,
+                yarn: None,
+            },
+            None,
+            None,
+        )
+        .0;
         let pool = p.cache("entries");
         attn::pool_kv_append(&k, &bpos, &breq, pool, &p.rows("wp", 1), &p.rows("wo", 1));
     });
-    let fused = fuse(t, &["attention.pool_compress"]);
-    assert_eq!(ops(&fused), ["attention.pool_compress"]);
+    let fused = fuse(t, &["fused.pool_compress"]);
+    assert_eq!(ops(&fused), ["fused.pool_compress"]);
     let Some(poem_ir::Operation::Fused(poem_ir::Fused::PoolCompress { state, .. })) =
         fused.nodes.first().map(|node| &node.op)
     else {
@@ -911,7 +1119,7 @@ fn every_rule_states_its_pattern_with_widths_it_can_hold() {
     // The patterns are recorded on first use; a split past its row (the
     // matmul-split rule's sentinel width once overflowed in debug builds and
     // wrapped in release) refuses here.
-    assert!(poem_compiler::fuse::kernels().count() > 0);
+    assert!(!rules::all().is_empty());
 }
 
 #[test]
@@ -919,26 +1127,22 @@ fn a_matmul_and_the_split_of_its_row_fold_into_one_op() {
     let fused = fuse(
         trace(|p| {
             let y = linear::matmul(&p.rows("act", 64), &p.weight("w", [96, 64]));
-            let (left, right) = layout::split_rows(&y, 32);
+            let (left, right) = gather::split_rows(&y, 32);
             elemwise::silu(&left);
             elemwise::silu(&right);
         }),
-        &["linear.matmul_split_rows"],
+        &["fused.matmul_split_rows"],
     );
     assert_eq!(
         ops(&fused),
-        [
-            "linear.matmul_split_rows",
-            "elementwise.silu",
-            "elementwise.silu"
-        ]
+        ["fused.matmul_split_rows", "elemwise.act", "elemwise.act"]
     );
 }
 
 #[test]
 #[should_panic(expected = "the split is past the row")]
 fn a_split_past_its_row_is_refused() {
-    trace(|p| drop(layout::split_rows(&p.rows("x", 64), 96)));
+    trace(|p| drop(gather::split_rows(&p.rows("x", 64), 96)));
 }
 
 fn mhc_mixes(p: &Pattern) -> (poem::Value, poem::Value) {
@@ -949,11 +1153,8 @@ fn mhc_mixes(p: &Pattern) -> (poem::Value, poem::Value) {
 
 #[test]
 fn an_mhc_norm_read_only_by_its_projection_folds_into_it() {
-    let fused = fuse(
-        trace(|p| drop(mhc_mixes(p))),
-        &["elementwise.hc_norm_project"],
-    );
-    assert_eq!(ops(&fused), ["elementwise.hc_norm_project"]);
+    let fused = fuse(trace(|p| drop(mhc_mixes(p))), &["fused.hc_norm_project"]);
+    assert_eq!(ops(&fused), ["fused.hc_norm_project"]);
     let Some(poem_ir::Operation::Fused(poem_ir::Fused::HcNormProject {
         eps, stream_count, ..
     })) = fused.nodes.first().map(|node| &node.op)
@@ -970,14 +1171,14 @@ fn an_mhc_norm_read_elsewhere_stays_written() {
             let (normed, _) = mhc_mixes(p);
             elemwise::silu(&normed);
         }),
-        &["elementwise.hc_norm_project"],
+        &["fused.hc_norm_project"],
     );
     assert_eq!(
         ops(&fused),
         [
-            "elementwise.hc_rmsnorm_f32",
-            "elementwise.hc_project",
-            "elementwise.silu"
+            "elemwise.hc_rmsnorm_f32",
+            "elemwise.hc_project",
+            "elemwise.act"
         ]
     );
 }
@@ -986,20 +1187,20 @@ fn an_mhc_norm_read_elsewhere_stays_written() {
 /// conv's output handed to `read` as well when it is given.
 fn gdn_step(p: &Pattern, read_conv: bool) -> poem::Value {
     let qkvz = p.rows("qkvz", 6 * 128);
-    let (qkv, z) = layout::split_rows(&qkvz, 4 * 128);
-    let conv = attn::ssm_causal_conv1d(
+    let (qkv, z) = gather::split_rows(&qkvz, 4 * 128);
+    let conv = ssm::causal_conv1d(
         &qkv,
         &p.weight("conv", [4 * 128, 4]),
         None,
         p.cache("conv_state"),
         4,
     );
-    let gates = attn::ssm_gdn_prep(
+    let gates = ssm::gdn_gates(
         &p.rows("ba", 4),
         &p.weight("dt_bias", [2]),
         &p.weight("a_log", [2]),
     );
-    let y = attn::ssm_gated_delta(&conv, &z, &gates, p.cache("state"), 1, 2, 128, 128);
+    let y = ssm::gated_delta(&conv, &z, &gates, p.cache("state"), 1, 2, 128, 128);
     if read_conv {
         elemwise::silu(&conv);
     }
@@ -1012,9 +1213,9 @@ fn a_gated_delta_step_folds_into_one_launch() {
         trace(|p| {
             elemwise::silu(&gdn_step(p, false));
         }),
-        &["attention.ssm_gdn_step"],
+        &["fused.gdn_step"],
     );
-    assert_eq!(ops(&fused), ["attention.ssm_gdn_step", "elementwise.silu"]);
+    assert_eq!(ops(&fused), ["fused.gdn_step", "elemwise.act"]);
     let Some(poem_ir::Operation::Fused(poem_ir::Fused::GdnStep {
         width,
         conv_width,
@@ -1030,18 +1231,21 @@ fn a_gated_delta_step_folds_into_one_launch() {
 
 #[test]
 fn a_gated_delta_step_whose_conv_is_read_elsewhere_stays_apart() {
-    let fused = fuse(
-        trace(|p| drop(gdn_step(p, true))),
-        &["attention.ssm_gdn_step"],
-    );
+    let fused = fuse(trace(|p| drop(gdn_step(p, true))), &["fused.gdn_step"]);
     assert_eq!(
         ops(&fused),
         [
-            "layout.split_rows",
-            "attention.ssm_causal_conv1d",
-            "attention.ssm_gdn_prep",
-            "attention.ssm_gated_delta",
-            "elementwise.silu"
+            "gather.split_rows",
+            "ssm.causal_conv1d",
+            "ssm.gdn_gates",
+            "ssm.gated_delta",
+            "elemwise.act"
         ]
     );
+}
+
+/// An op's two outputs, its second asked for: a rope's queries and the
+/// keys it was given, an attention's output and log-sum-exp.
+fn both((q, k): (Value, Option<Value>)) -> (Value, Value) {
+    (q, k.expect("an output asked for lands"))
 }

@@ -23,14 +23,13 @@ pub struct Atem {
 }
 
 impl Atem {
-    #[must_use]
-    pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
-        let stop_ids = specials(&tokenizer, STOP_TOKENS);
+    pub fn try_new(tokenizer: Arc<Tokenizer>) -> Result<Self, String> {
+        let stop_ids = specials(&tokenizer, STOP_TOKENS)?;
 
-        let start = special(&tokenizer, "<|start|>");
-        let message = special(&tokenizer, "<|message|>");
-        let eot = special(&tokenizer, "<|eot|>");
-        let eom = special(&tokenizer, "<|eom|>");
+        let start = special(&tokenizer, "<|start|>")?;
+        let message = special(&tokenizer, "<|message|>")?;
+        let eot = special(&tokenizer, "<|eot|>")?;
+        let eom = special(&tokenizer, "<|eom|>")?;
 
         let header = |role: &str| -> Vec<u32> {
             let mut tokens = vec![start];
@@ -45,8 +44,8 @@ impl Atem {
         let mut generation_prefix = vec![start];
         generation_prefix.extend(tokenizer.encode("assistant"));
 
-        Self {
-            bos: special(&tokenizer, "<|begin_of_text|>"),
+        Ok(Self {
+            bos: special(&tokenizer, "<|begin_of_text|>")?,
             system_prefix: header("system"),
             user_prefix: header("user"),
             assistant_prefix: header("assistant to=user"),
@@ -56,7 +55,7 @@ impl Atem {
             reasoning_open,
             generation_prefix,
             tokenizer,
-        }
+        })
     }
 
     fn turn(&self, prefix: &[u32], msg: &str) -> Vec<u32> {

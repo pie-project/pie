@@ -28,7 +28,7 @@ const ASSUME: &[&str] = &["vendor", "subgroup", "coopmat", "cores"];
 fn target(base: &Profile, facts: &Facts) -> profile::Target {
     let mut target = base.target().clone();
     for name in ASSUME {
-        let i = kernels_vulkan::tuning::FACTS
+        let i = crate::tuning::FACTS
             .iter()
             .position(|v| v.name == *name)
             .expect("a Vulkan fact");
@@ -176,7 +176,7 @@ fn plan_of(deployment: &str, text: &str, cores: u32) -> Option<u64> {
     let row = poem_compiler::catalog::deployment(deployment)?;
     let trace = poem_compiler::fuse::fuse(
         row.trace(poem::Platform::Vulkan),
-        &poem_compiler::fuse::flags::kernels(&chip),
+        poem_compiler::fuse::flags::on(&chip, &crate::FUSIONS),
     );
     let slots = *LANES.iter().max().expect("lanes") as u32;
     let mut budgets = poem_compiler::Budgets::of(poem_compiler::Budget::new(slots, CONTEXT));

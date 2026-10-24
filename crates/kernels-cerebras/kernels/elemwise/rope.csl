@@ -1,0 +1,25 @@
+// NeoX rotation of the first 2*half lanes of every head of v, in place.
+fn k_rope(v: [*]f32, pos: [*]i32, inv_freq: [*]f32, rows: i32, width: i32, head_dim: i32, half: i32) void {
+  var heads: i32 = width / head_dim;
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var p: f32 = @as(f32, pos[r]);
+    var h: i32 = 0;
+    while (h < heads) : (h += 1) {
+      var base: i32 = r * width + h * head_dim;
+      var i: i32 = 0;
+      while (i < half) : (i += 1) {
+        var ang: f32 = p * inv_freq[i];
+        var c: f32 = math.cos_f32(ang);
+        var s: f32 = math.sin_f32(ang);
+        var lo: i32 = base + i;
+        var hi: i32 = lo + half;
+        var x1: f32 = v[lo];
+        var x2: f32 = v[hi];
+        v[lo] = x1 * c - x2 * s;
+        v[hi] = x1 * s + x2 * c;
+      }
+    }
+  }
+}
+

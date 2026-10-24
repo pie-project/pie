@@ -4,7 +4,7 @@
 //! same on either backend. Constants carry HIP's values, which are CUDA's
 //! wherever both define them. Enumerators HIP writes stand whether or not
 //! the engine names them.
-
+#![allow(unsafe_code)]
 #![allow(
     dead_code,
     non_camel_case_types,
@@ -247,18 +247,26 @@ pub mod rt {
     };
 
     pub unsafe fn cudaGetLastError() -> cudaError {
+        // SAFETY: takes no arguments; it reads and clears this thread's last
+        // error.
         cudaError::of(unsafe { hip::hipGetLastError() })
     }
     pub unsafe fn cudaGetDeviceCount(count: *mut c_int) -> cudaError {
+        // SAFETY: `hipGetDeviceCount` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipGetDeviceCount(count) })
     }
     pub unsafe fn cudaSetDevice(device: c_int) -> cudaError {
+        // SAFETY: takes a device index by value; HIP checks it.
         cudaError::of(unsafe { hip::hipSetDevice(device) })
     }
     pub unsafe fn cudaGetDevice(device: *mut c_int) -> cudaError {
+        // SAFETY: `hipGetDevice` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipGetDevice(device) })
     }
     pub unsafe fn cudaDeviceSynchronize() -> cudaError {
+        // SAFETY: takes no arguments; it waits on the current device.
         cudaError::of(unsafe { hip::hipDeviceSynchronize() })
     }
     pub unsafe fn cudaDeviceGetAttribute(
@@ -266,6 +274,8 @@ pub mod rt {
         attr: cudaDeviceAttr,
         device: c_int,
     ) -> cudaError {
+        // SAFETY: the caller's `value` contract, forwarded; `attr` is one of
+        // the enum's ids, which are HIP's.
         cudaError::of(unsafe { hip::hipDeviceGetAttribute(value, attr as c_int, device) })
     }
     pub unsafe fn cudaDeviceCanAccessPeer(
@@ -273,6 +283,8 @@ pub mod rt {
         device: c_int,
         peer: c_int,
     ) -> cudaError {
+        // SAFETY: `hipDeviceCanAccessPeer` takes the same arguments with the
+        // same contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipDeviceCanAccessPeer(can, device, peer) })
     }
     pub unsafe fn cudaDeviceGetP2PAttribute(
@@ -281,18 +293,28 @@ pub mod rt {
         src: c_int,
         dst: c_int,
     ) -> cudaError {
+        // SAFETY: the caller's `value` contract, forwarded; `attr` is one of
+        // the enum's ids, which are HIP's.
         cudaError::of(unsafe { hip::hipDeviceGetP2PAttribute(value, attr as c_int, src, dst) })
     }
     pub unsafe fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> cudaError {
+        // SAFETY: `hipMemGetInfo` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipMemGetInfo(free, total) })
     }
     pub unsafe fn cudaMalloc(ptr: *mut *mut c_void, bytes: usize) -> cudaError {
+        // SAFETY: `hipMalloc` takes the same arguments with the same contract,
+        // which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipMalloc(ptr, bytes) })
     }
     pub unsafe fn cudaFree(ptr: *mut c_void) -> cudaError {
+        // SAFETY: `hipFree` takes the same arguments with the same contract,
+        // which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipFree(ptr) })
     }
     pub unsafe fn cudaMemset(dst: *mut c_void, value: c_int, bytes: usize) -> cudaError {
+        // SAFETY: `hipMemset` takes the same arguments with the same contract,
+        // which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipMemset(dst, value, bytes) })
     }
     pub unsafe fn cudaMemsetAsync(
@@ -301,6 +323,8 @@ pub mod rt {
         bytes: usize,
         stream: cudaStream_t,
     ) -> cudaError {
+        // SAFETY: `hipMemsetAsync` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipMemsetAsync(dst, value, bytes, stream) })
     }
     pub unsafe fn cudaMemcpy(
@@ -309,6 +333,8 @@ pub mod rt {
         bytes: usize,
         kind: cudaMemcpyKind,
     ) -> cudaError {
+        // SAFETY: the caller's span contract, forwarded; `kind` carries HIP's
+        // value for the direction.
         cudaError::of(unsafe { hip::hipMemcpy(dst, src, bytes, kind as c_int) })
     }
     pub unsafe fn cudaMemcpyAsync(
@@ -318,6 +344,8 @@ pub mod rt {
         kind: cudaMemcpyKind,
         stream: cudaStream_t,
     ) -> cudaError {
+        // SAFETY: the caller's span and stream contract, forwarded; `kind`
+        // carries HIP's value for the direction.
         cudaError::of(unsafe { hip::hipMemcpyAsync(dst, src, bytes, kind as c_int, stream) })
     }
     /// HIP takes the arrays mutably and reports the failing copy; neither
@@ -333,6 +361,9 @@ pub mod rt {
         stream: cudaStream_t,
     ) -> cudaError {
         let mut failed = 0usize;
+        // SAFETY: the caller's span and stream contract, forwarded; HIP reads
+        // the arrays though it types them `mut`, the layout assert above makes
+        // `attrs` HIP's struct, and `failed` is a live local it writes.
         cudaError::of(unsafe {
             hip::hipMemcpyBatchAsync(
                 dsts.cast_mut(),
@@ -348,15 +379,23 @@ pub mod rt {
         })
     }
     pub unsafe fn cudaHostAlloc(ptr: *mut *mut c_void, bytes: usize, flags: c_uint) -> cudaError {
+        // SAFETY: `hipHostMalloc` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipHostMalloc(ptr, bytes, flags) })
     }
     pub unsafe fn cudaFreeHost(ptr: *mut c_void) -> cudaError {
+        // SAFETY: `hipHostFree` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipHostFree(ptr) })
     }
     pub unsafe fn cudaHostRegister(ptr: *mut c_void, bytes: usize, flags: c_uint) -> cudaError {
+        // SAFETY: `hipHostRegister` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipHostRegister(ptr, bytes, flags) })
     }
     pub unsafe fn cudaHostUnregister(ptr: *mut c_void) -> cudaError {
+        // SAFETY: `hipHostUnregister` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipHostUnregister(ptr) })
     }
     pub unsafe fn cudaHostGetDevicePointer(
@@ -364,24 +403,37 @@ pub mod rt {
         host: *mut c_void,
         flags: c_uint,
     ) -> cudaError {
+        // SAFETY: `hipHostGetDevicePointer` takes the same arguments with the
+        // same contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipHostGetDevicePointer(device, host, flags) })
     }
     pub unsafe fn cudaPointerGetAttributes(
         attrs: *mut cudaPointerAttributes,
         ptr: *const c_void,
     ) -> cudaError {
+        // SAFETY: the caller's `attrs` contract, forwarded; the layout assert
+        // above makes the struct HIP's and `cudaMemoryType` names every value
+        // HIP writes into it.
         cudaError::of(unsafe { hip::hipPointerGetAttributes(attrs.cast(), ptr) })
     }
     pub unsafe fn cudaStreamCreate(stream: *mut cudaStream_t) -> cudaError {
+        // SAFETY: `hipStreamCreate` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipStreamCreate(stream) })
     }
     pub unsafe fn cudaStreamCreateWithFlags(stream: *mut cudaStream_t, flags: c_uint) -> cudaError {
+        // SAFETY: `hipStreamCreateWithFlags` takes the same arguments with the
+        // same contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipStreamCreateWithFlags(stream, flags) })
     }
     pub unsafe fn cudaStreamDestroy(stream: cudaStream_t) -> cudaError {
+        // SAFETY: `hipStreamDestroy` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipStreamDestroy(stream) })
     }
     pub unsafe fn cudaStreamSynchronize(stream: cudaStream_t) -> cudaError {
+        // SAFETY: `hipStreamSynchronize` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipStreamSynchronize(stream) })
     }
     pub unsafe fn cudaStreamWaitEvent(
@@ -389,6 +441,8 @@ pub mod rt {
         event: cudaEvent_t,
         flags: c_uint,
     ) -> cudaError {
+        // SAFETY: `hipStreamWaitEvent` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipStreamWaitEvent(stream, event, flags) })
     }
     pub unsafe fn cudaLaunchHostFunc(
@@ -397,6 +451,8 @@ pub mod rt {
         data: *mut c_void,
     ) -> cudaError {
         match func {
+            // SAFETY: the caller's stream, callback and `data` contract,
+            // forwarded; `func` is non-null here.
             Some(func) => cudaError::of(unsafe { hip::hipLaunchHostFunc(stream, func, data) }),
             None => cudaError::cudaErrorInvalidValue,
         }
@@ -405,33 +461,51 @@ pub mod rt {
         stream: cudaStream_t,
         mode: cudaStreamCaptureMode,
     ) -> cudaError {
+        // SAFETY: the caller's stream contract, forwarded; `mode` carries HIP's
+        // value.
         cudaError::of(unsafe { hip::hipStreamBeginCapture(stream, mode as c_int) })
     }
     pub unsafe fn cudaStreamEndCapture(stream: cudaStream_t, graph: *mut cudaGraph_t) -> cudaError {
+        // SAFETY: `hipStreamEndCapture` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipStreamEndCapture(stream, graph) })
     }
     pub unsafe fn cudaStreamIsCapturing(
         stream: cudaStream_t,
         status: *mut cudaStreamCaptureStatus,
     ) -> cudaError {
+        // SAFETY: the caller's `status` contract, forwarded; HIP writes one of
+        // the enum's three values.
         cudaError::of(unsafe { hip::hipStreamIsCapturing(stream, status.cast()) })
     }
     pub unsafe fn cudaEventCreate(event: *mut cudaEvent_t) -> cudaError {
+        // SAFETY: `hipEventCreate` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipEventCreate(event) })
     }
     pub unsafe fn cudaEventCreateWithFlags(event: *mut cudaEvent_t, flags: c_uint) -> cudaError {
+        // SAFETY: `hipEventCreateWithFlags` takes the same arguments with the
+        // same contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipEventCreateWithFlags(event, flags) })
     }
     pub unsafe fn cudaEventDestroy(event: cudaEvent_t) -> cudaError {
+        // SAFETY: `hipEventDestroy` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipEventDestroy(event) })
     }
     pub unsafe fn cudaEventRecord(event: cudaEvent_t, stream: cudaStream_t) -> cudaError {
+        // SAFETY: `hipEventRecord` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipEventRecord(event, stream) })
     }
     pub unsafe fn cudaEventSynchronize(event: cudaEvent_t) -> cudaError {
+        // SAFETY: `hipEventSynchronize` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipEventSynchronize(event) })
     }
     pub unsafe fn cudaEventQuery(event: cudaEvent_t) -> cudaError {
+        // SAFETY: `hipEventQuery` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipEventQuery(event) })
     }
     pub unsafe fn cudaGraphInstantiateWithFlags(
@@ -439,18 +513,28 @@ pub mod rt {
         graph: cudaGraph_t,
         flags: u64,
     ) -> cudaError {
+        // SAFETY: `hipGraphInstantiateWithFlags` takes the same arguments with
+        // the same contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipGraphInstantiateWithFlags(exec, graph, flags) })
     }
     pub unsafe fn cudaGraphUpload(exec: cudaGraphExec_t, stream: cudaStream_t) -> cudaError {
+        // SAFETY: `hipGraphUpload` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipGraphUpload(exec, stream) })
     }
     pub unsafe fn cudaGraphLaunch(exec: cudaGraphExec_t, stream: cudaStream_t) -> cudaError {
+        // SAFETY: `hipGraphLaunch` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipGraphLaunch(exec, stream) })
     }
     pub unsafe fn cudaGraphExecDestroy(exec: cudaGraphExec_t) -> cudaError {
+        // SAFETY: `hipGraphExecDestroy` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipGraphExecDestroy(exec) })
     }
     pub unsafe fn cudaGraphDestroy(graph: cudaGraph_t) -> cudaError {
+        // SAFETY: `hipGraphDestroy` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipGraphDestroy(graph) })
     }
     pub unsafe fn cudaGraphDebugDotPrint(
@@ -458,6 +542,8 @@ pub mod rt {
         path: *const c_char,
         flags: c_uint,
     ) -> cudaError {
+        // SAFETY: `hipGraphDebugDotPrint` takes the same arguments with the
+        // same contract, which the caller of this fn upholds.
         cudaError::of(unsafe { hip::hipGraphDebugDotPrint(graph, path, flags) })
     }
 }
@@ -558,6 +644,8 @@ pub mod dr {
     };
 
     pub unsafe fn cuCtxGetDevice(device: *mut CUdevice) -> CUresult {
+        // SAFETY: `hipGetDevice` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         CUresult::of(unsafe { hip::hipGetDevice(device) })
     }
     pub unsafe fn cuDeviceGetAttribute(
@@ -565,6 +653,8 @@ pub mod dr {
         attr: CUdevice_attribute,
         device: CUdevice,
     ) -> CUresult {
+        // SAFETY: the caller's `value` contract, forwarded; `attr` is one of
+        // the enum's ids, which are HIP's.
         CUresult::of(unsafe { hip::hipDeviceGetAttribute(value, attr as c_int, device) })
     }
     pub unsafe fn cuFuncGetAttribute(
@@ -572,9 +662,13 @@ pub mod dr {
         attr: CUfunction_attribute,
         function: CUfunction,
     ) -> CUresult {
+        // SAFETY: the caller's `value` and `function` contract, forwarded;
+        // `attr` is one of the enum's ids, which are HIP's.
         CUresult::of(unsafe { hip::hipFuncGetAttribute(value, attr as c_int, function) })
     }
     pub unsafe fn cuModuleLoadData(module: *mut CUmodule, image: *const c_void) -> CUresult {
+        // SAFETY: `hipModuleLoadData` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         CUresult::of(unsafe { hip::hipModuleLoadData(module, image) })
     }
     pub unsafe fn cuModuleGetFunction(
@@ -582,9 +676,13 @@ pub mod dr {
         module: CUmodule,
         name: *const core::ffi::c_char,
     ) -> CUresult {
+        // SAFETY: `hipModuleGetFunction` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         CUresult::of(unsafe { hip::hipModuleGetFunction(function, module, name) })
     }
     pub unsafe fn cuModuleUnload(module: CUmodule) -> CUresult {
+        // SAFETY: `hipModuleUnload` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         CUresult::of(unsafe { hip::hipModuleUnload(module) })
     }
     pub unsafe fn cuLaunchKernel(
@@ -600,6 +698,8 @@ pub mod dr {
         params: *mut *mut c_void,
         extra: *mut *mut c_void,
     ) -> CUresult {
+        // SAFETY: the caller's launch contract (a loaded function, a live
+        // stream, `params` matching its signature), forwarded unchanged.
         CUresult::of(unsafe {
             hip::hipModuleLaunchKernel(
                 function, grid_x, grid_y, grid_z, block_x, block_y, block_z, shared, stream,
@@ -621,6 +721,9 @@ pub mod dr {
         if value != byte * 0x0101_0101 {
             return CUresult::cudaErrorInvalidValue;
         }
+        // SAFETY: the caller's span contract for `height` rows of `width`
+        // 32-bit words at `pitch`, forwarded as the same bytes; `byte` repeated
+        // is the checked value.
         CUresult::of(unsafe {
             hip::hipMemset2DAsync(
                 dst as *mut c_void,
@@ -637,6 +740,8 @@ pub mod dr {
         nodes: *mut CUgraphNode,
         count: *mut usize,
     ) -> CUresult {
+        // SAFETY: `hipGraphGetNodes` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         CUresult::of(unsafe { hip::hipGraphGetNodes(graph, nodes, count) })
     }
     /// HIP keeps no edge data; `data` must be null.
@@ -650,6 +755,8 @@ pub mod dr {
         if !data.is_null() {
             return CUresult::cudaErrorNotSupported;
         }
+        // SAFETY: the caller's `from`/`to`/`count` contract, forwarded; `data`
+        // is null, so nothing of it is dropped.
         CUresult::of(unsafe { hip::hipGraphGetEdges(graph, from, to, count) })
     }
     pub unsafe fn cuMemCreate(
@@ -658,9 +765,13 @@ pub mod dr {
         prop: *const CUmemAllocationProp,
         flags: u64,
     ) -> CUresult {
+        // SAFETY: the caller's `handle` and `prop` contract, forwarded; the
+        // layout assert above makes `prop` HIP's struct.
         CUresult::of(unsafe { hip::hipMemCreate(handle, bytes, prop.cast(), flags) })
     }
     pub unsafe fn cuMemRelease(handle: CUmemGenericAllocationHandle) -> CUresult {
+        // SAFETY: `hipMemRelease` takes the same arguments with the same
+        // contract, which the caller of this fn upholds.
         CUresult::of(unsafe { hip::hipMemRelease(handle) })
     }
     pub unsafe fn cuMemAddressReserve(
@@ -670,11 +781,15 @@ pub mod dr {
         addr: CUdeviceptr,
         flags: u64,
     ) -> CUresult {
+        // SAFETY: the caller's `ptr` contract, forwarded; a device address is
+        // the same 64 bits as HIP's pointer.
         CUresult::of(unsafe {
             hip::hipMemAddressReserve(ptr.cast(), bytes, alignment, addr as *mut c_void, flags)
         })
     }
     pub unsafe fn cuMemAddressFree(ptr: CUdeviceptr, bytes: usize) -> CUresult {
+        // SAFETY: the caller's range contract, forwarded; a device address is
+        // the same 64 bits as HIP's pointer.
         CUresult::of(unsafe { hip::hipMemAddressFree(ptr as *mut c_void, bytes) })
     }
     pub unsafe fn cuMemMap(
@@ -684,9 +799,13 @@ pub mod dr {
         handle: CUmemGenericAllocationHandle,
         flags: u64,
     ) -> CUresult {
+        // SAFETY: the caller's range and handle contract, forwarded; a device
+        // address is the same 64 bits as HIP's pointer.
         CUresult::of(unsafe { hip::hipMemMap(ptr as *mut c_void, bytes, offset, handle, flags) })
     }
     pub unsafe fn cuMemUnmap(ptr: CUdeviceptr, bytes: usize) -> CUresult {
+        // SAFETY: the caller's range contract, forwarded; a device address is
+        // the same 64 bits as HIP's pointer.
         CUresult::of(unsafe { hip::hipMemUnmap(ptr as *mut c_void, bytes) })
     }
     pub unsafe fn cuMemSetAccess(
@@ -695,6 +814,8 @@ pub mod dr {
         desc: *const CUmemAccessDesc,
         count: usize,
     ) -> CUresult {
+        // SAFETY: the caller's range and `desc` contract, forwarded; the layout
+        // assert above makes `desc` HIP's struct.
         CUresult::of(unsafe { hip::hipMemSetAccess(ptr as *mut c_void, bytes, desc.cast(), count) })
     }
     pub unsafe fn cuMemGetAllocationGranularity(
@@ -702,6 +823,9 @@ pub mod dr {
         prop: *const CUmemAllocationProp,
         option: CUmemAllocationGranularity_flags,
     ) -> CUresult {
+        // SAFETY: the caller's `granularity` and `prop` contract, forwarded;
+        // the layout assert above makes `prop` HIP's struct and `option`
+        // carries HIP's value.
         CUresult::of(unsafe {
             hip::hipMemGetAllocationGranularity(granularity, prop.cast(), option as c_int)
         })
@@ -744,6 +868,8 @@ pub mod nccl {
 
     pub unsafe fn ncclGetUniqueId(id: *mut ncclUniqueId) -> ncclResult_t {
         match sys::rccl() {
+            // SAFETY: the caller's `id` contract, forwarded to RCCL's entry of
+            // the same signature.
             Ok(rccl) => ncclResult_t::of(unsafe { (rccl.ncclGetUniqueId)(id) }),
             Err(_) => ncclResult_t::ncclSystemError,
         }
@@ -755,12 +881,16 @@ pub mod nccl {
         rank: c_int,
     ) -> ncclResult_t {
         match sys::rccl() {
+            // SAFETY: the caller's `comm` contract, forwarded to RCCL's entry
+            // of the same signature.
             Ok(rccl) => ncclResult_t::of(unsafe { (rccl.ncclCommInitRank)(comm, ranks, id, rank) }),
             Err(_) => ncclResult_t::ncclSystemError,
         }
     }
     pub unsafe fn ncclCommAbort(comm: ncclComm_t) -> ncclResult_t {
         match sys::rccl() {
+            // SAFETY: the caller's live-communicator contract, forwarded to
+            // RCCL's entry of the same signature.
             Ok(rccl) => ncclResult_t::of(unsafe { (rccl.ncclCommAbort)(comm) }),
             Err(_) => ncclResult_t::ncclSystemError,
         }
@@ -802,6 +932,8 @@ pub mod blas {
 
     pub unsafe fn cublasCreate_v2(handle: *mut cublasHandle_t) -> cublasStatus_t {
         match sys::rocblas() {
+            // SAFETY: the caller's `handle` contract, forwarded to rocBLAS's
+            // entry of the same signature.
             Ok(blas) => cublasStatus_t::of(unsafe { (blas.rocblas_create_handle)(handle) }),
             Err(_) => cublasStatus_t::CUBLAS_STATUS_INTERNAL_ERROR,
         }
@@ -811,12 +943,16 @@ pub mod blas {
         stream: *mut c_void,
     ) -> cublasStatus_t {
         match sys::rocblas() {
+            // SAFETY: the caller's handle and stream contract, forwarded to
+            // rocBLAS's entry of the same signature.
             Ok(blas) => cublasStatus_t::of(unsafe { (blas.rocblas_set_stream)(handle, stream) }),
             Err(_) => cublasStatus_t::CUBLAS_STATUS_INTERNAL_ERROR,
         }
     }
     pub unsafe fn cublasDestroy_v2(handle: cublasHandle_t) -> cublasStatus_t {
         match sys::rocblas() {
+            // SAFETY: the caller's live-handle contract, forwarded to rocBLAS's
+            // entry of the same signature.
             Ok(blas) => cublasStatus_t::of(unsafe { (blas.rocblas_destroy_handle)(handle) }),
             Err(_) => cublasStatus_t::CUBLAS_STATUS_INTERNAL_ERROR,
         }

@@ -3,7 +3,7 @@ name = "kernels-cerebras"
 version.workspace = true
 edition = "2024"
 authors = ["In Gim <in.gim@icloud.com>"]
-description = "Pure Cerebras kernel definitions: every entry emits CSL source for its op into a program under construction. Mirrors kernels-wgpu's surface; an engine Run resolves plan ids to handles and calls these entry functions, then compiles what they emitted with cslc and runs it through the SDK runtime."
+description = "Cerebras kernels: the CSL kernel library, with a census naming every kernel and its argument formats, and per-op entries that emit device work (phases of kernel calls over placed buffers). The engine owns where data lives and when it runs."
 license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 

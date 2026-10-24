@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -77,11 +78,6 @@ impl Vulkan {
             programs,
             adapters: BTreeMap::new(),
         }
-    }
-
-    #[must_use]
-    pub fn shell(&self) -> Option<&Shell> {
-        self.shell.as_ref()
     }
 
     pub fn shell_mut(&mut self) -> Option<&mut Shell> {
@@ -1305,5 +1301,8 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
         .collect()
 }
 
+// SAFETY: the loaded `Shell` owns its `ash` device, pools and buffers
+// outright and its `Cell`/`RefCell` scratch is not shared with anything else,
+// so moving the whole engine to another thread moves every handle with it;
+// Vulkan handles are not tied to the thread that made them.
 unsafe impl Send for Vulkan {}
-unsafe impl Sync for Vulkan {}

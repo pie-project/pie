@@ -3,8 +3,8 @@
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
-use kernels_metal::attn::selector;
-use kernels_metal::layout;
+use kernels_metal::sampling;
+use kernels_metal::sampling::selector_walk;
 use kernels_metal::tensor::RaggedTensor;
 use poem_ir::Dtype;
 
@@ -123,7 +123,7 @@ fn topk_answers_the_host_sort_with_ties_low_and_nans_never() {
     let xt = Tensor::new(hx, rows, WIDE, Dtype::Bf16);
     let vt = Tensor::new(hv, rows, K, Dtype::F32);
     let it = Tensor::new(hi, rows, K, Dtype::I32);
-    dev.run(&|sink| layout::topk(sink, xt, K, vt, it).expect("the top-k launch"));
+    dev.run(&|sink| sampling::topk(sink, xt, K, vt, it).expect("the top-k launch"));
     let values = f32s(&dev.read(hv, u64::from(rows * K) * 4));
     let indices = i32s(&dev.read(hi, u64::from(rows * K) * 4));
 
@@ -210,7 +210,7 @@ fn the_walk_picks_what_the_reference_picks() {
     };
     let walk = |dev: &Dev, hp: Option<Tensor>, first: u32| {
         dev.run(&|sink| {
-            selector::walk(
+            selector_walk::walk(
                 sink,
                 candt,
                 Tensor::new(hu, rows, K, Dtype::F32),

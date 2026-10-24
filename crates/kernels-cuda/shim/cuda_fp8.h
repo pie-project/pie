@@ -1,3 +1,6 @@
+// `cuda_fp8.h` for NVRTC, which ships no device headers (see README.md).
+// e4m3/e5m2 storage and conversions: the sm_89 cvt instructions, integer
+// arithmetic below (sm_80).
 
 #pragma once
 
@@ -6,25 +9,11 @@
 architecture. There is no host half, because the host half of this crate is Rust."
 #endif
 
-// The E4M3/E5M2 conversions are sm_89 instructions (cvt.rn.satfinite.e4m3x2.f32
-// and cvt.rn.f16x2.e4m3x2). Below that -- an sm_80 A100 -- the same conversions
-// are done in integer arithmetic. Every unit that touches fp8 includes this
-// header, and most of them (attn/kv, the FlashInfer roots) also carry bf16
-// kernels, so an #error here refused every model on Ampere rather than the
-// fp8 ones; a portable path that lowers everywhere is the smaller failure
-// surface. The portable path answers the hardware bit for bit: it was held
-// against the cvt over every f32 bit pattern for both encodings and every
-// code for both decodings on an sm_120. The one place the two could have
-// parted is NaN, which the hardware lands as 0x7F with the sign dropped, for
-// both encodings; the portable path does the same. Defining
-// PIE_HALFTYPE_FORCE_PORTABLE selects the portable path on any architecture,
-// which is how it is gated against the hardware on a box that has it.
 #if defined(PIE_HALFTYPE_FORCE_PORTABLE)
 #define PIE_FP8_HAS_SM89 0
 #else
 #define PIE_FP8_HAS_SM89 (__CUDA_ARCH__ >= 890)
 #endif
-
 
 typedef unsigned char __nv_fp8_storage_t;
 
@@ -39,10 +28,6 @@ typedef enum __nv_fp8_interpretation_t {
 
 typedef enum __nv_saturation_t { __NV_SATFINITE = 1 } __nv_saturation_t;
 
-
-// f32 -> fp8, round to nearest even, saturating to the largest finite value
-// (cvt's .satfinite): E4M3 has no infinity and its 0x7F is NaN, E5M2 keeps
-// infinity out of reach the same way. Subnormals are kept, not flushed.
 __device__ __forceinline__ __nv_fp8_storage_t
 __pie_fp8_from_f32_portable(const float f, const __nv_fp8_interpretation_t interp) {
     const unsigned int x = __float_as_uint(f);
@@ -91,9 +76,6 @@ __pie_fp8_from_f32_portable(const float f, const __nv_fp8_interpretation_t inter
     return static_cast<__nv_fp8_storage_t>(res | sign);
 }
 
-// fp8 -> f16 bits. Every fp8 value is exactly representable in f16, so this
-// is a widening: E5M2 is the top byte of an f16 outright, E4M3 rebiases the
-// exponent and normalises its subnormals. NaN lands as the canonical 0x7FFF.
 __device__ __forceinline__ unsigned short
 __pie_fp8_to_halfbits_portable(const __nv_fp8_storage_t x,
                                const __nv_fp8_interpretation_t interp) {
@@ -121,8 +103,6 @@ __pie_fp8_to_halfbits_portable(const __nv_fp8_storage_t x,
     return static_cast<unsigned short>(sign | exponent | mantissa);
 }
 
-// The two primitives everything below is spelled with: a float2 to a packed
-// fp8 pair (x low, y high), and a packed fp8 pair to a packed f16 pair.
 __device__ __forceinline__ __nv_fp8x2_storage_t
 __pie_fp8x2_from_float2(const float2 x, const __nv_fp8_interpretation_t interp) {
 #if PIE_FP8_HAS_SM89
@@ -163,7 +143,6 @@ __pie_fp8x2_to_halfbits2(const __nv_fp8x2_storage_t x, const __nv_fp8_interpreta
 #endif
 }
 
-
 __device__ __forceinline__ __nv_fp8x2_storage_t __nv_cvt_float2_to_fp8x2(
     const float2 x, const __nv_saturation_t saturate,
     const __nv_fp8_interpretation_t fp8_interpretation) {
@@ -192,7 +171,6 @@ __nv_cvt_fp8_to_halfraw(const __nv_fp8_storage_t x,
 
 #endif
 
-
 __device__ __forceinline__ float __pie_fp8_halfbits_to_float(const unsigned short bits) {
     float f;
     asm("cvt.f32.f16 %0, %1;" : "=f"(f) : "h"(bits));
@@ -203,7 +181,6 @@ __device__ __forceinline__ __nv_fp8_storage_t
 __pie_fp8_from_float(const float f, const __nv_fp8_interpretation_t interp) {
     return __nv_cvt_float_to_fp8(f, __NV_SATFINITE, interp);
 }
-
 
 struct __nv_fp8_e4m3 {
     __nv_fp8_storage_t __x;
@@ -288,7 +265,6 @@ struct __nv_fp8_e5m2 {
         return __pie_fp8_halfbits_to_float((unsigned short)(pair & 0xFFFFu));
     }
 };
-
 
 struct __nv_fp8x2_e4m3 {
     __nv_fp8x2_storage_t __x;

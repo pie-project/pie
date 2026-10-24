@@ -26,3 +26,5 @@ miniz_oxide = { version = "0.8", optional = true }
 
 tracing = "0.1"
 
+[lints]
+workspace = true

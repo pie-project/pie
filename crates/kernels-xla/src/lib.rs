@@ -1,18 +1,21 @@
 pub mod attn;
+pub mod check;
 pub mod collective;
-pub mod cx;
+pub mod conv;
 pub mod elemwise;
 pub mod error;
+pub mod gather;
 pub mod hlo;
-pub mod layout;
+pub mod lanes;
 pub mod linear;
 pub mod mosaic;
 pub mod pack;
-pub mod spatial;
+pub mod sampling;
+pub mod ssm;
 pub mod tensor;
 pub mod tuning;
 
 pub use attn::{DecodePlan, PrefillPlan};
-pub use cx::{Ctx, Cx, Emit, Env, elem_of};
+pub use check::elem_of;
 pub use error::Error;
-pub use tensor::{Bank, KvPool, RaggedTensor, RecurrentPool, Tensor};
+pub use tensor::{Bank, KvPool, Landing, Operand, RaggedTensor, RecurrentPool, Stored};

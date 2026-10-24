@@ -3,6 +3,7 @@
 //! descriptors and the heuristic's first algorithm are built once per
 //! (device, shape, bias) and kept for the process: the planning is host
 //! work, so a captured step replays only the launch.
+#![allow(unsafe_code)]
 
 use core::ffi::{c_int, c_void};
 use std::collections::HashMap;
@@ -242,9 +243,7 @@ pub unsafe fn matmul(
         return Ok(false);
     };
     let device = current_device();
-    let mut devices = registry()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut devices = registry().lock().expect("lock poisoned");
     let dev = match devices.entry(device) {
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
         std::collections::hash_map::Entry::Vacant(e) => {

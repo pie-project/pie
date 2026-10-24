@@ -15,6 +15,7 @@
 //! * [`Handoff`]: the shared event the two engines order their work on.
 //! * [`mil`]: the text the programs are written in.
 //! * [`ffn`] and [`linear`]: the programs themselves, over those.
+#![allow(unsafe_code)]
 
 use std::ffi::c_int;
 use std::path::PathBuf;
@@ -36,6 +37,7 @@ pub use surface::{Element, Surface};
 /// makes. The first call resolves it; later calls answer at once.
 pub fn available() -> Result<(), String> {
     let mut err = sys::message();
+    // SAFETY: `err` is a `CAP`-byte buffer, the length the call is told.
     if unsafe { sys::pie_ane_available(err.as_mut_ptr(), sys::CAP as c_int) } == 1 {
         Ok(())
     } else {

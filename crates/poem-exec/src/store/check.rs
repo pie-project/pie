@@ -1,5 +1,5 @@
 use poem_compiler::CompiledModel;
-use poem_ir::{Attention, Def, Operation, Trace};
+use poem_ir::{Attn, Def, Operation, Trace};
 
 use crate::fire::MaskSpan;
 use crate::store::{Fault, Result};
@@ -17,21 +17,87 @@ pub fn no_schedule_straddles_its_readers(trace: &Trace, compiled: &CompiledModel
 
     for (at, node) in trace.nodes.iter().enumerate() {
         let op = match &node.op {
-            Operation::Attention(op) => op,
+            Operation::Attn(op) => op,
             Operation::Fused(poem_ir::Fused::LseSink { attn, .. }) => &**attn,
             _ => continue,
         };
         let consumed = match op {
-            Attention::Decode { plan, .. }
-            | Attention::DecodeLse { plan, .. }
-            | Attention::Prefill { plan, .. }
-            | Attention::PrefillLse { plan, .. }
-            | Attention::DecodeRel { plan, .. }
-            | Attention::PrefillRel { plan, .. }
-            | Attention::Masked { plan, .. }
-            | Attention::MaskedLse { plan, .. }
-            | Attention::DecodeSelected { plan, .. }
-            | Attention::PrefillSelected { plan, .. } => *plan,
+            Attn::Decode {
+                plan,
+                selection: None,
+                bias: None,
+                lse: None,
+                ..
+            }
+            | Attn::Decode {
+                plan,
+                selection: None,
+                bias: None,
+                lse: Some(_),
+                ..
+            }
+            | Attn::Prefill {
+                plan,
+                mask: None,
+                selection: None,
+                bias: None,
+                lse: None,
+                ..
+            }
+            | Attn::Prefill {
+                plan,
+                mask: None,
+                selection: None,
+                bias: None,
+                lse: Some(_),
+                ..
+            }
+            | Attn::Decode {
+                plan,
+                selection: None,
+                bias: Some(_),
+                lse: None,
+                ..
+            }
+            | Attn::Prefill {
+                plan,
+                mask: None,
+                selection: None,
+                bias: Some(_),
+                lse: None,
+                ..
+            }
+            | Attn::Prefill {
+                plan,
+                mask: Some(_),
+                selection: None,
+                bias: None,
+                lse: None,
+                ..
+            }
+            | Attn::Prefill {
+                plan,
+                mask: Some(_),
+                selection: None,
+                bias: None,
+                lse: Some(_),
+                ..
+            }
+            | Attn::Decode {
+                plan,
+                selection: Some(_),
+                bias: None,
+                lse: None,
+                ..
+            }
+            | Attn::Prefill {
+                plan,
+                mask: None,
+                selection: Some(_),
+                bias: None,
+                lse: None,
+                ..
+            } => *plan,
             _ => continue,
         };
         let Some(Def::Op(built_by)) = trace.values.get(consumed.0 as usize).map(|v| &v.def) else {

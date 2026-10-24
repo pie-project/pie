@@ -2,7 +2,7 @@
 //! with a rocBLAS handle, buffers in bf16 / f32, and the host rounding the
 //! device does. A test calls `Gpu::open()` and returns early on `None`, so
 //! a machine with no HIP device passes vacuously.
-
+#![allow(unsafe_code)]
 #![allow(dead_code)]
 
 use dtype::Dtype;
@@ -22,6 +22,9 @@ impl Gpu {
             return None;
         }
         hip::set_device(0).ok()?;
+        // An instantiation that will not compile fails its test instead of
+        // falling back unseen.
+        kernels_rocm::jit::strict_kernels();
         Some(Self {
             stream: hip::Stream::new().ok()?,
             blas: blas::Handle::new().ok()?,
@@ -141,7 +144,7 @@ impl Gpu {
             .find(|b| b.device_ptr() == t.ptr)
             .expect("a harness buffer");
         let mut all = held.read::<T>().unwrap();
-        all.truncate((t.elements() * u64::from(t.dtype.bytes_ceil())) as usize / size_of::<T>());
+        all.truncate((t.elements() * t.dtype.bytes_ceil()) as usize / size_of::<T>());
         all
     }
 

@@ -9,7 +9,7 @@ use poem_compiler::{
 use poem_exec::fire::{
     At, Composition, Cursor, Filter, FireDescriptor, Lane as FireLane, compose_axes, fallback, walk,
 };
-use poem_ir::{Dtype, Layout, Operation, RuntimeInput, Trace, Ty, ValueId};
+use poem_ir::{Dtype, Gather, Operation, RuntimeInput, Trace, Ty, ValueId};
 
 use crate::arena::Arena;
 use crate::device::ctx::Frame;
@@ -101,7 +101,7 @@ fn patch_fold(trace: &Trace) -> u32 {
         .nodes
         .iter()
         .filter_map(|node| match node.op {
-            Operation::Layout(Layout::PoolRows { side, .. } | Layout::MergeRows { side, .. }) => {
+            Operation::Gather(Gather::PoolRows { side, .. } | Gather::MergeRows { side, .. }) => {
                 Some(side.saturating_mul(side))
             }
             _ => None,
@@ -366,7 +366,7 @@ impl Shell {
         let boot = Boot {
             trace: poem_compiler::fuse::fuse(
                 boot.trace,
-                &poem_compiler::fuse::flags::kernels(&chip),
+                poem_compiler::fuse::flags::on(&chip, &crate::FUSIONS),
             ),
             ..boot
         };
@@ -459,8 +459,20 @@ impl PreparedLoad<'_> {
             let runs_masked = region.nodes.clone().any(|node| {
                 matches!(
                     boot.trace.nodes.get(node as usize).map(|node| &node.op),
-                    Some(poem_ir::Operation::Attention(
-                        poem_ir::Attention::Masked { .. } | poem_ir::Attention::MaskedLse { .. }
+                    Some(poem_ir::Operation::Attn(
+                        poem_ir::Attn::Prefill {
+                            mask: Some(_),
+                            selection: None,
+                            bias: None,
+                            lse: None,
+                            ..
+                        } | poem_ir::Attn::Prefill {
+                            mask: Some(_),
+                            selection: None,
+                            bias: None,
+                            lse: Some(_),
+                            ..
+                        }
                     ))
                 )
             });
@@ -769,7 +781,7 @@ impl PreparedLoad<'_> {
             .trace
             .nodes
             .iter()
-            .any(|node| matches!(node.op, Operation::Layout(Layout::ScatterLiveRows { .. })));
+            .any(|node| matches!(node.op, Operation::Gather(Gather::ScatterLiveRows { .. })));
         let feeds = crate::feeds::Feeds::of(&boot.trace, &compiled);
         if let Some(unlanded) = feeds.unlanded.first() {
             return Err(Fault::Program {
@@ -844,9 +856,7 @@ impl PreparedLoad<'_> {
                     return Some(rules);
                 }
                 let step = boot.trace.nodes.iter().find_map(|node| match &node.op {
-                    poem_ir::Operation::Spatial(poem_ir::Spatial::Grid { grid, rule, y })
-                        if *y == at =>
-                    {
+                    poem_ir::Operation::Conv(poem_ir::Conv::Grid { grid, rule, y }) if *y == at => {
                         Some((*grid, *rule))
                     }
                     _ => None,
@@ -1979,7 +1989,7 @@ impl Shell {
                 at: "serve::enqueue",
                 why: format!(
                     "lane {lane}'s pixels start past the plane's first row, and this load \
-                     could not walk the `spatial.grid` chain from the port grid to the \
+                     could not walk the `conv.grid` chain from the port grid to the \
                      plane's — so where they start is not a thing this fire can state"
                 ),
             });
@@ -2005,7 +2015,7 @@ impl Shell {
             return Err(Fault::Program {
                 at: "serve::enqueue",
                 why: format!(
-                    "replaying this plane's `spatial.grid` chain over the fire's own port \
+                    "replaying this plane's `conv.grid` chain over the fire's own port \
                      grid lands {out_voxels} voxels and the carve gave the plane {} rows; \
                      the chain walked at load is not the one this fire runs",
                     rect.rows
@@ -2793,7 +2803,7 @@ impl Shell {
         let mut rs_plans: Vec<engine::rs::LanePlan> = Vec::with_capacity(lanes.len());
         let mut rs_active = false;
         // Per fire lane, the rows inside it whose state lands in a slot of its
-        // own and then those slots (`kernels_metal::attn::ssm::Snapshots`).
+        // own and then those slots (`kernels_metal::ssm::Snapshots`).
         let mut rs_snaps: Vec<i32> = Vec::new();
         let mut snap_slots = 0u32;
         let mut request_of_token: Vec<i32> = Vec::with_capacity(rows as usize);
@@ -2929,7 +2939,7 @@ impl Shell {
             slot_ids.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
             let at_lane = slot_ids.len() as i32 - 1;
             {
-                const MAX: usize = kernels_metal::attn::ssm::RS_SNAPSHOTS as usize;
+                const MAX: usize = kernels_metal::ssm::RS_SNAPSHOTS as usize;
                 let snaps = seated.rs_snapshots;
                 if snaps.len() > MAX
                     || (!snaps.is_empty() && row.rows as usize != lane.tokens.len())

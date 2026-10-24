@@ -410,7 +410,8 @@ impl Tree {
             let dir = dir
                 .map_err(|why| io(&format!("read {root:?}"), why))?
                 .path();
-            if !dir.join("package.poem").is_file() {
+            // A package is a directory of `.poem` files, `lib/` excepted.
+            if !is_package(&dir) {
                 continue;
             }
             let name = dir
@@ -471,6 +472,7 @@ pub fn one_rank(w: Dtype, kv: Dtype) -> Deploy {
         parts: Vec::new(),
         drafter: None,
         yarn: None,
+        tap: None,
     }
 }
 
@@ -557,4 +559,15 @@ pub fn replacing(id: &str, file: &str, function: &str, source: &str) -> Result<P
 
 pub fn identify(src: &ztensor::Source, platform: Platform) -> Result<&'static str, Unmatched> {
     repository().identify(src, platform)
+}
+
+/// Whether `dir` is a package: a directory, not the libraries', holding a
+/// `.poem` file. What its files are named says nothing of what they hold.
+fn is_package(dir: &Path) -> bool {
+    dir.file_name().is_some_and(|name| name != "lib")
+        && std::fs::read_dir(dir).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "poem"))
+        })
 }

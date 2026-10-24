@@ -5,7 +5,7 @@
 //! and its Causal Encoder-Decoder's bounded replay, where a prompt's
 //! leading rows run the encoder alone.
 
-use poem_ir::{Attention, CacheRow, Fact, Operands, Operation, Platform};
+use poem_ir::{Attn, CacheRow, Fact, Operands, Operation, Platform, Sampling};
 
 #[test]
 fn the_dsv41_plan_is_the_published_one() {
@@ -92,9 +92,7 @@ fn the_dsv41_plan_is_the_published_one() {
         let runs_skipped = node.guard.holds(skipped);
         let sources = matches!(
             node.op,
-            Operation::Attention(
-                Attention::PoolKvAppend { .. } | Attention::PoolBoundaryPrefill { .. }
-            )
+            Operation::Attn(Attn::PoolKvAppend { .. } | Attn::PoolBoundary { decode: false, .. })
         );
         if layer > 20 || (layer == 20 && !sources && !runs_skipped) {
             assert!(
@@ -110,7 +108,15 @@ fn the_dsv41_plan_is_the_published_one() {
                 node.op.name()
             );
         }
-        if let Operation::Attention(Attention::PrefillLse { floor, .. }) = &node.op {
+        if let Operation::Attn(Attn::Prefill {
+            floor,
+            mask: None,
+            selection: None,
+            bias: None,
+            lse: Some(_),
+            ..
+        }) = &node.op
+        {
             assert_eq!(floor.is_some(), layer >= 20, "layer {layer}'s window floor");
             floored += usize::from(floor.is_some());
         }
@@ -151,17 +157,14 @@ fn the_dsv41_dspark_head_drafts_through_its_stages() {
     }
     let count = |want: fn(&Operation) -> bool| trace.nodes.iter().filter(|n| want(&n.op)).count();
     assert_eq!(
-        count(|op| matches!(
-            op,
-            Operation::Attention(Attention::WindowSink { window: 133, .. })
-        )),
+        count(|op| matches!(op, Operation::Attn(Attn::WindowSink { window: 133, .. }))),
         3,
         "a stage's window reads the trunk's 128 and the block's 5"
     );
     assert_eq!(
         count(|op| matches!(
             op,
-            Operation::Attention(Attention::MarkovWalk { block: 5, .. })
+            Operation::Sampling(Sampling::MarkovWalk { block: 5, .. })
         )),
         1
     );

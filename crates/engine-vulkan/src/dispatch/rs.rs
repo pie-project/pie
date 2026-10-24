@@ -1,5 +1,4 @@
-use kernels_vulkan::attn::ssm::Committed;
-use kernels_vulkan::{Error, Tensor, layout};
+use kernels_slang::{Error, Tensor};
 use poem_ir::ValueId;
 
 use crate::rs::Seat;
@@ -27,8 +26,8 @@ impl Run<'_> {
         }
     }
 
-    pub(crate) fn rs_committed(&self, seat: &Seat) -> Committed {
-        Committed {
+    pub(crate) fn rs_committed(&self, seat: &Seat) -> kernels_slang::ssm::Committed {
+        kernels_slang::ssm::Committed {
             replay: seat.replay,
             commit: seat.commit,
             slots: seat.slots,
@@ -54,8 +53,8 @@ impl Run<'_> {
             .handles()
             .cut(dst.0, dst.1, bytes)
             .map_err(|fault| Self::kernel(fault, op))?;
-        layout::copy_words(
-            self.ctx(),
+        kernels_slang::gather::rows::copy_words(
+            self.ctx,
             Tensor::new(src, 1, 1, poem_ir::Dtype::U32),
             Tensor::new(dst, 1, 1, poem_ir::Dtype::U32),
             bytes,

@@ -3,7 +3,8 @@ use poem_compiler::{
     Budget, Budgets, CompiledModel, DeviceProfile, PatchLadder, RowAxis, compile_axes,
 };
 use poem_exec::fire::{FireDescriptor, Lane, compose_axes};
-use poem_ir::ops::Elementwise;
+use poem_ir::ops::Elemwise;
+use poem_ir::{NormAxis, NormWeight};
 
 fn test_slots() -> engine_cuda::window::Slots {
     engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 4, 4096)
@@ -64,11 +65,12 @@ impl Build {
         let node = self.trace.nodes.len() as u32;
         let y = self.value(Def::Op(node), ty);
         self.trace.nodes.push(Node {
-            op: Elementwise::RmsnormNoScale {
+            op: Elemwise::Rmsnorm {
                 x,
-                head_dim: 1,
+                axis: NormAxis::Head(1),
                 eps: 1e-6,
                 y,
+                weight: NormWeight::None,
             }
             .into(),
             guard,
@@ -88,9 +90,9 @@ fn tower_and_trunk() -> Trace {
     let merged = b.op(deeper, act(), Guard::Always);
     let seeded = b.op(tokens, act(), Guard::Always);
     let d = b.op(merged, act(), Guard::Fact(0));
-    let p = b.op(seeded, act(), Guard::not(Guard::Fact(0)));
+    let p = b.op(seeded, act(), !Guard::Fact(0));
     let o = b.value(
-        Def::Merge(vec![(d, Guard::Fact(0)), (p, Guard::not(Guard::Fact(0)))]),
+        Def::Merge(vec![(d, Guard::Fact(0)), (p, !Guard::Fact(0))]),
         act(),
     );
     let y = b.op(o, act(), Guard::Always);

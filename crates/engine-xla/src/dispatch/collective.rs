@@ -16,15 +16,19 @@ impl DispatchCollective for Run<'_> {
 impl Run<'_> {
     fn collective(&mut self, op: &Collective) -> Result<(), kernels_xla::Error> {
         match op {
-            Collective::AllReduce { buf, buf_out: _ } => {
-                collective::all_reduce(self.ctx(), self.tensor(*buf))
-            }
-            Collective::AllGather { x, y } => {
-                collective::all_gather(self.ctx(), self.tensor(*x), self.tensor(*y))
-            }
-            Collective::ReduceScatter { x, y } => {
-                collective::reduce_scatter(self.ctx(), self.tensor(*x), self.tensor(*y))
-            }
+            Collective::AllReduce { buf, buf_out: _ } => collective::all_reduce(self.tensor(*buf)),
+            Collective::AllGather { x, y } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let o_y = self.tensor(*y);
+                let v = collective::all_gather(l.f(), x_v, o_y.landing())?;
+                l.land(o_y, v)
+            }),
+            Collective::ReduceScatter { x, y } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let o_y = self.tensor(*y);
+                let v = collective::reduce_scatter(l.f(), x_v, o_y.landing())?;
+                l.land(o_y, v)
+            }),
         }
     }
 }

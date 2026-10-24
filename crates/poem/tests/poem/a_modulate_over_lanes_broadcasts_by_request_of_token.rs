@@ -2,7 +2,7 @@ use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Value, Weight, ops, seam,
     trace_hybrid,
 };
-use poem_ir::{Def, Dim, Elementwise, GeomKind, Operation, RuntimeInput, Ty};
+use poem_ir::{Def, Dim, Elemwise, GeomKind, Operation, RuntimeInput, Ty};
 
 const WIDTH: u32 = 64;
 const FREQ: u32 = 32;
@@ -81,7 +81,7 @@ fn a_lane_vector_is_embedded_per_lane_and_broadcast_per_row() {
         .nodes
         .iter()
         .find_map(|node| match &node.op {
-            Operation::Elementwise(Elementwise::Sinusoid { t, y, dim, .. }) => Some((*t, *y, *dim)),
+            Operation::Elemwise(Elemwise::Sinusoid { t, y, dim, .. }) => Some((*t, *y, *dim)),
             _ => None,
         })
         .expect("the timestep is embedded");
@@ -96,7 +96,7 @@ fn a_lane_vector_is_embedded_per_lane_and_broadcast_per_row() {
         .nodes
         .iter()
         .find_map(|node| match &node.op {
-            Operation::Elementwise(Elementwise::Modulate {
+            Operation::Elemwise(Elemwise::Modulate {
                 x,
                 m,
                 lane_of_row,
@@ -137,13 +137,12 @@ fn a_lane_vector_is_embedded_per_lane_and_broadcast_per_row() {
         .nodes
         .iter()
         .find_map(|node| match &node.op {
-            Operation::Elementwise(Elementwise::GatedResidualAdd {
-                r,
-                g,
-                lane_of_row,
-                r_out,
+            Operation::Elemwise(Elemwise::ResidualAdd {
+                gate: Some(poem_ir::ResidualGate { g, lane_of_row }),
+                y,
+                y_out,
                 ..
-            }) => Some((*r, *g, *lane_of_row, *r_out)),
+            }) => Some((*y, *g, *lane_of_row, *y_out)),
             _ => None,
         })
         .expect("the gated fold is one node");
@@ -160,7 +159,7 @@ fn a_lane_vector_is_embedded_per_lane_and_broadcast_per_row() {
             .find(|n| {
                 matches!(
                     n.op,
-                    Operation::Elementwise(Elementwise::GatedResidualAdd { .. })
+                    Operation::Elemwise(Elemwise::ResidualAdd { gate: Some(_), .. })
                 )
             })
             .unwrap()
@@ -176,7 +175,7 @@ fn a_per_token_vector_names_no_lane_map() {
         .nodes
         .iter()
         .find_map(|node| match &node.op {
-            Operation::Elementwise(Elementwise::Modulate {
+            Operation::Elemwise(Elemwise::Modulate {
                 x, m, lane_of_row, ..
             }) => Some((*x, *m, *lane_of_row)),
             _ => None,

@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use core::ffi::c_void;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -28,9 +29,7 @@ fn arenas() -> &'static Mutex<HashMap<u32, Arena>> {
 }
 
 fn locked() -> std::sync::MutexGuard<'static, HashMap<u32, Arena>> {
-    arenas()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    arenas().lock().expect("lock poisoned")
 }
 
 pub(crate) fn attach(arena: u32, stream: *mut c_void) {
@@ -63,7 +62,11 @@ pub(crate) fn release(arena: u32) {
 pub(crate) fn capture_status(stream: *mut c_void) -> Option<i32> {
     let api = sys::api().ok()?;
     let mut status = sys::STREAM_CAPTURE_STATUS_NONE;
+    // SAFETY: `stream` is the live stream of the caller's `Ctx` (`Ctx::on`);
+    // `status` a live local.
     if unsafe { (api.hip.hipStreamIsCapturing)(stream, &raw mut status) } != sys::HIP_SUCCESS {
+        // SAFETY: `hipGetLastError` takes nothing; it clears the error the
+        // failed query left.
         let _ = unsafe { (api.hip.hipGetLastError)() };
         return None;
     }
@@ -180,6 +183,8 @@ fn grow(
     // is non-zero.
     let code = unsafe { (api.hip.hipMalloc)(&raw mut fresh, want) };
     if code == sys::ERROR_OUT_OF_MEMORY {
+        // SAFETY: `hipGetLastError` takes nothing; it clears the out-of-memory
+        // error so the next call does not see it.
         let _ = unsafe { (api.hip.hipGetLastError)() };
         let (mut free, mut total) = (0usize, 0usize);
         // SAFETY: two live locals; the call only writes them.
@@ -223,6 +228,7 @@ fn grow(
 fn current() -> Option<i32> {
     let api = sys::api().ok()?;
     let mut ordinal: i32 = 0;
+    // SAFETY: `ordinal` is a live local out-parameter.
     (unsafe { (api.hip.hipGetDevice)(&raw mut ordinal) } == sys::HIP_SUCCESS).then_some(ordinal)
 }
 
@@ -236,7 +242,7 @@ fn per_device(
     let mut map = cache
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .expect("lock poisoned");
     *map.entry(ordinal).or_insert_with(|| read(ordinal))
 }
 
@@ -292,6 +298,8 @@ fn attribute(which: i32, ordinal: i32) -> Option<u32> {
     let api = sys::api().ok()?;
     let mut value: i32 = 0;
 
+    // SAFETY: `value` is a live local out-parameter; HIP range-checks `which`
+    // and `ordinal`.
     let code = unsafe { (api.hip.hipDeviceGetAttribute)(&raw mut value, which, ordinal) };
     (code == sys::HIP_SUCCESS && value > 0).then(|| value.unsigned_abs())
 }

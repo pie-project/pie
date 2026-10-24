@@ -17,6 +17,7 @@
 //! scatter into its input pack); any other port that reads an in-flight
 //! cell waits for it to land. `PIE_CEREBRAS_SYNC=1` settles every frame inside
 //! `submit`, for an A/B.
+#![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -1399,10 +1400,3 @@ fn readouts_of(settle: &StepSettle) -> EngineResult<Vec<LaneReadout>> {
         })
         .collect()
 }
-
-// SAFETY: the runtime drives an engine from one thread at a time (it is
-// moved to the engine thread and stays there); the shell's interior cells
-// are never touched from two threads at once. engine-wgpu makes the same
-// promise for the same reason.
-unsafe impl Send for Cerebras {}
-unsafe impl Sync for Cerebras {}

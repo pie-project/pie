@@ -216,7 +216,7 @@ pub fn prefill(
     requests: u32,
     tuning: &Tuning,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill";
+    const OP: &str = "attn.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     arbitrate(
         ctx, OP, q.data, pool, plan, plan.mask, window, true, head_dim, sm_scale, o, None,
@@ -239,7 +239,7 @@ pub fn prefill_lse(
     requests: u32,
     tuning: &Tuning,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.prefill_lse";
+    const OP: &str = "attn.prefill";
     kv_heads_agree(OP, pool, head_dim, kv_heads)?;
     arbitrate(
         ctx,
@@ -274,7 +274,7 @@ pub fn masked(
     requests: u32,
     tuning: &Tuning,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.masked";
+    const OP: &str = "attn.prefill";
     if mask.dtype != dtype::Dtype::U8 {
         return Err(refuse(
             OP,
@@ -306,7 +306,7 @@ pub fn masked_lse(
     requests: u32,
     tuning: &Tuning,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.masked_lse";
+    const OP: &str = "attn.prefill";
     if mask.dtype != dtype::Dtype::U8 {
         return Err(refuse(
             OP,

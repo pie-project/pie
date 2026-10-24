@@ -1192,7 +1192,7 @@ fn the_routed_clamp_and_the_sum_add_answer_the_host() {
         .collect::<Vec<_>>();
     let w = values(rows, 3, 1.0);
     let mut y = gpu.zeros(rows as u32, width as u32, Dtype::Bf16);
-    kernels_rocm::linear::mlp::swiglu_clamp_split_routed(
+    kernels_rocm::linear::glu::swiglu_clamp_split_routed(
         &ctx,
         gpu.tensor(&g, rows as u32, width as u32, Dtype::Bf16),
         gpu.tensor(&u, rows as u32, width as u32, Dtype::Bf16),
@@ -1219,7 +1219,7 @@ fn the_routed_clamp_and_the_sum_add_answer_the_host() {
         .copied()
         .collect();
     let mut y = gpu.zeros(rows as u32, width as u32, Dtype::Bf16);
-    kernels_rocm::linear::mlp::swiglu_clamp_routed(
+    kernels_rocm::linear::glu::swiglu_clamp_routed(
         &ctx,
         gpu.tensor(&packed, rows as u32, 2 * width as u32, Dtype::Bf16),
         width as u32,

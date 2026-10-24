@@ -10,7 +10,7 @@ fn main() {
     let h: u32 = args.next().and_then(|v| v.parse().ok()).unwrap_or(1);
     let out = dir.join("out");
     let _ = std::fs::remove_dir_all(&out);
-    let compile = Compile::memcpy(Arch::Wse3, dir.join("layout.csl"), w, h, &out);
+    let compile = Compile::memcpy(Arch::Wse3, dir.join("gather.csl"), w, h, &out);
     match Cslc::find().and_then(|c| c.compile(&compile)) {
         Ok(()) => println!("linked"),
         Err(e) => {

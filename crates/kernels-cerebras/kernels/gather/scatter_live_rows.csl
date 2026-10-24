@@ -1,0 +1,11 @@
+// y[routes[i]] = src[i] for routes inside [0, yrows).
+fn k_scatter_live_rows(src: [*]f32, routes: [*]i32, y: [*]f32, rows: i32, width: i32, yrows: i32) void {
+  var i: i32 = 0;
+  while (i < rows) : (i += 1) {
+    var route: i32 = routes[i];
+    if (route >= 0 and route < yrows) {
+      k_copy(y, route * width, src, i * width, width);
+    }
+  }
+}
+

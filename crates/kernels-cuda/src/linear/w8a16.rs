@@ -10,6 +10,9 @@ use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, stated, symbol};
 use crate::linear::gemm;
 use crate::tensor::Tensor;
 
+const W8A16_SM80: &str = "linear/w8a16_sm80.cu";
+const W8A16_SM90: &str = "linear/w8a16_sm90.cu";
+
 const DECODED_WEIGHT: &str = "linear.quant.decoded_weight";
 const SPLIT_PARTIALS: &str = "linear.w8a16.split_partials";
 
@@ -19,8 +22,6 @@ const WGMMA_FROM: u32 = 17;
 
 /// The most ways the tiled GEMM splits K for a plane too narrow to fill the card.
 const MOST_SPLITS: u32 = 16;
-
-const FILE: &str = "linear/w8a16.cuh";
 
 /// The most rows the GEMV-shaped mma.sync kernel takes (K split across
 /// warps, the codes streamed once); wider fires take the tiled GEMM.
@@ -157,7 +158,7 @@ pub fn matmul(
         let fire = if wgmma {
             const WG_STAGES: u32 = 3;
             Fire::at(
-                "linear/moe_wgmma.cuh",
+                W8A16_SM90,
                 symbol(&format!(
                     "::pie::linear::fp8_w8a16_wgmma<{gran}, {WG_STAGES}>"
                 )),
@@ -168,7 +169,7 @@ pub fn matmul(
             )
         } else {
             Fire::at(
-                FILE,
+                W8A16_SM80,
                 symbol(&format!(
                     "::pie::linear::fp8_w8a16_gemm<{bm}, {stages}, {gran}>"
                 )),
@@ -180,7 +181,7 @@ pub fn matmul(
             let pairs = m * n / 2;
             ctx.fire(
                 op,
-                Fire::at(FILE, symbol("::pie::linear::fp8_w8a16_fold"))
+                Fire::at(W8A16_SM80, symbol("::pie::linear::fp8_w8a16_fold"))
                     .apply(Launch::grid([pairs.div_ceil(256), 1, 1], [256, 1, 1])),
                 &[
                     ArgValue::Ptr(part),
@@ -198,7 +199,7 @@ pub fn matmul(
     let fire = {
         let s = Shape::for_rows(m);
         Fire::at(
-            FILE,
+            W8A16_SM80,
             symbol(&format!(
                 "::pie::linear::fp8_w8a16_mma<{}, {}, {}, {}, {STAGES}, {gran}>",
                 s.mt, s.n_sub, s.warps_n, s.warps_k
@@ -240,7 +241,7 @@ pub fn widen(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            W8A16_SM80,
             symbol(&format!("::pie::linear::fp8_atoms_to_bf16<{gran}>")),
         )
         .apply(Launch::grid(
@@ -257,6 +258,59 @@ pub fn widen(
             ArgValue::Ptr(out),
             stated(op, n)?.arg(),
             stated(op, k)?.arg(),
+        ],
+    )
+}
+
+/// `y = act . W^T` for an affine 4-bit MLX plane (group 64, its bias after
+/// the scale) at a decode's rows, on mma.sync (`linear/w8a16.cuh`): 32
+/// columns a block, eight warps over K, the codes three steps ahead
+/// (Llama-3.1-8B's decode 117 tok/s against the per-row kernel's 52; 16
+/// columns 108, a deeper prefetch spills to 93).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn affine_w4a16_mma(
+    ctx: &Ctx,
+    op: &'static str,
+    act: Tensor,
+    codes: Tensor,
+    scales: Tensor,
+    biases: Tensor,
+    y: &mut Tensor,
+    n: u32,
+    k: u32,
+) -> Result<(), Error> {
+    const STAGES: u32 = 2;
+    const DEPTH: u32 = 3;
+    const N_SUB: u32 = 4;
+    const WARPS_K: u32 = 8;
+    const COLUMNS: u32 = 8 * N_SUB;
+    // Each K group's activation ring, or the fold of the groups' partials.
+    let smem = (WARPS_K * STAGES * 16 * 128).max(WARPS_K * 16 * COLUMNS * 4);
+    ctx.fire(
+        op,
+        Fire::at(
+            W8A16_SM80,
+            symbol(&format!(
+                "::pie::linear::affine_w4a16_mma<1, {N_SUB}, 1, {WARPS_K}, {STAGES}, {DEPTH}>"
+            )),
+        )
+        .apply(
+            Launch::grid(
+                [n.div_ceil(COLUMNS), y.rows.div_ceil(16), 1],
+                [32 * WARPS_K, 1, 1],
+            )
+            .smem(smem),
+        ),
+        &[
+            act.arg(),
+            codes.arg(),
+            scales.arg(),
+            biases.arg(),
+            y.arg(),
+            stated(op, y.rows)?.arg(),
+            stated(op, n)?.arg(),
+            stated(op, k)?.arg(),
+            ctx.stage(),
         ],
     )
 }
