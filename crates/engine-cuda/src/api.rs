@@ -283,6 +283,7 @@ fn fault(fault: Fault) -> Error {
         | Fault::Param { .. }
         | Fault::Unbound { .. }
         | Fault::Unlowered { .. }
+        | Fault::Region { .. }
         | Fault::Golden { .. } => Error::Load(fault.to_string()),
         Fault::Blob { .. } => Error::Load(fault.to_string()),
         Fault::OutOfMemory { need, have } => Error::Exhausted {

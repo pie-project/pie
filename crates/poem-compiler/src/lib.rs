@@ -53,25 +53,16 @@ pub fn compile(
     compile_axes(trace, &Budgets::of(budget.clone()), profile)
 }
 
-/// The plan of `trace` under `budgets` on `profile`'s device. Under
-/// `compiler.synth_regions` the plan is of `trace` with its chains folded
-/// into generated kernels ([`fuse::chain::fold`]), held as
-/// [`CompiledModel::trace`].
+/// The plan of `trace` under `budgets` on `profile`'s device. A trace whose
+/// chains are to run as generated kernels is folded first, once, as a
+/// trace pass ([`fuse::chain::fold`], under `compiler.synth_regions`), and
+/// planned as it stands.
 pub fn compile_axes(
     trace: &Trace,
     budgets: &Budgets,
     profile: &DeviceProfile,
 ) -> Result<CompiledModel, Error> {
-    if !profile.synth_regions {
-        return compile_over(trace, budgets, profile);
-    }
-    let (folded, bodies) = fuse::chain::fold(trace.clone());
-    let compiled = compile_over(&folded, budgets, profile)?;
-    Ok(CompiledModel {
-        trace: Some(folded),
-        bodies,
-        ..compiled
-    })
+    compile_over(trace, budgets, profile)
 }
 
 fn compile_over(
@@ -185,8 +176,6 @@ fn compile_over(
         streams,
         fold_refused: unit::fold_refused(&units),
         expert: expert::held(trace),
-        trace: None,
-        bodies: std::collections::BTreeMap::new(),
         units,
         units_of,
         patches,

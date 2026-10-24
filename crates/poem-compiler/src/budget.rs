@@ -243,9 +243,11 @@ impl FamilyCosts {
                 | poem_ir::Fused::MatmulSwigluMatmul { .. }
                 | poem_ir::Fused::MatmulSoftcap { .. }
                 | poem_ir::Fused::MatmulBias { .. }
+                | poem_ir::Fused::MatmulMoeRoute { .. }
                 | poem_ir::Fused::MatmulSplitRows { .. }
                 | poem_ir::Fused::MoeSelectGlu { .. }
-                | poem_ir::Fused::MoeExperts { .. } => self.linear,
+                | poem_ir::Fused::MoeExperts { .. }
+                | poem_ir::Fused::MoeMega { .. } => self.linear,
                 poem_ir::Fused::QkvFusedQknormRopeVnormWrite { .. }
                 | poem_ir::Fused::SplitQkvFused { .. } => self.custom,
                 poem_ir::Fused::GdnStep { .. } => self.attn,

@@ -1,6 +1,7 @@
 //! Expert-parallel load balancing: every `every` steps the group reads how
-//! many rows each rank's slots received, places each MoE layer's experts
-//! anew ([`engine::placement::Placement::rebalance`]) and carries out the
+//! many rows each rank's slots received, edits each MoE layer's placement
+//! where that lowers its busiest rank enough
+//! ([`engine::placement::Placement::rebalance`]) and carries out the
 //! moves: each moved expert's planes copied from the slot that held it to
 //! the slot that will, then every rank's table rewritten in place. The
 //! loads arming left (its warm launches dispatch real rows) are dropped at
@@ -12,19 +13,22 @@
 
 use std::collections::BTreeMap;
 
-use engine::placement::{Move, Placement, SPARE, Window};
+use engine::placement::{Limits, Move, Placement, SPARE, Window};
 
 use super::{EpRank, Plane};
 use crate::device::Buffer;
 use crate::error::{Fault, Result};
 
-/// How often the group rebalances, and over how many steps' loads.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// How often the group rebalances, over how many steps' loads, and how far
+/// each may go.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rebalance {
     /// Steps between rebalances.
     pub every: u32,
     /// Steps of loads a rebalance reads (at least `every`).
     pub window: u32,
+    /// The slots a rebalance may rewrite in a layer, and the gain it needs.
+    pub limits: Limits,
 }
 
 /// What the boundary before a step does with the group's loads.
@@ -95,6 +99,7 @@ impl Rebalancer {
         devices: &[i32],
         stream: *mut core::ffi::c_void,
     ) -> Result<usize> {
+        let began = std::time::Instant::now();
         let mut loads = Vec::with_capacity(ranks.len());
         for (rank, &device) in ranks.iter_mut().zip(devices) {
             crate::device::ctx::bind_thread(device)?;
@@ -108,6 +113,7 @@ impl Rebalancer {
         let shape: Vec<(u32, u32, u32, u32)> = ranks[0].layers().collect();
         let window = (self.knob.window / self.knob.every.max(1)).max(1) as usize;
         let mut moved = Vec::new();
+        let (mut was, mut now) = (0.0f64, 0.0f64);
         for (layer, experts, slots, stride) in shape {
             let balance = match self.layers.entry(layer) {
                 std::collections::btree_map::Entry::Occupied(at) => at.into_mut(),
@@ -127,10 +133,14 @@ impl Rebalancer {
                 }
             }
             balance.window.push(&logical);
-            let next = balance.placement.rebalance(balance.window.loads());
+            let next = balance
+                .placement
+                .rebalance(balance.window.loads(), self.knob.limits);
             if next == balance.placement {
                 continue;
             }
+            was = was.max(balance.placement.balance(balance.window.loads()));
+            now = now.max(next.balance(balance.window.loads()));
             let Ok(planes) = ranks
                 .iter()
                 .map(|rank| rank.planes(layer).map(<[Plane]>::to_vec))
@@ -146,7 +156,7 @@ impl Rebalancer {
             return Ok(0);
         }
         crate::device::ctx::sync(stream)?;
-        let mut count = 0;
+        let (layers, mut count) = (moved.len(), 0);
         for (layer, next, moves) in moved {
             let balance = self.layers.get_mut(&layer).expect("balanced above");
             let table = next.table(balance.stride);
@@ -158,7 +168,11 @@ impl Rebalancer {
             count += moves;
         }
         self.moved += count as u64;
-        eprintln!("engine-cuda: rebalanced the experts: {count} slot copies");
+        eprintln!(
+            "engine-cuda: rebalanced the experts: {count} slot copies over {layers} layers \
+             in {:.2} ms, their worst peak over mean {was:.3} to {now:.3}",
+            began.elapsed().as_secs_f64() * 1e3
+        );
         Ok(count)
     }
 
@@ -212,6 +226,7 @@ mod tests {
         let mut rebalancer = Rebalancer::new(Rebalance {
             every: 2,
             window: 2,
+            limits: Limits::DEFAULT,
         });
         let dues: Vec<_> = (0..6).map(|_| rebalancer.due()).collect();
         let rebalance = Some(Due::Rebalance);

@@ -21,9 +21,13 @@ pub struct CudaEngineOptions {
     pub nccl_transport: Option<String>,
     /// An expert-parallel group rebalances its experts across its ranks
     /// every this many steps (0: never), from the loads of the last
-    /// `expert_load_window` steps.
+    /// `expert_load_window` steps, each rewriting at most
+    /// `expert_rebalance_moves` slots a layer and only where that lowers its
+    /// busiest rank by `expert_rebalance_gain` of the mean.
     pub expert_rebalance_steps: Option<u32>,
     pub expert_load_window: Option<u32>,
+    pub expert_rebalance_moves: Option<u32>,
+    pub expert_rebalance_gain: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

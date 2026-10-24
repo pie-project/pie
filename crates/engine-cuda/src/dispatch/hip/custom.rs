@@ -53,9 +53,11 @@ impl DispatchFused for Run<'_> {
             // and run as the primitives they stand for where a trace states
             // them.
             Fused::MatmulGlu { .. }
+            | Fused::MatmulMoeRoute { .. }
             | Fused::MatmulSplitRows { .. }
             | Fused::MoeSelectGlu { .. }
             | Fused::MoeExperts { .. }
+            | Fused::MoeMega { .. }
             | Fused::LseSink { .. }
             | Fused::RopeYarnAppend { .. }
             | Fused::SplitRopeYarnAppend { .. } => return self.primitives(op),
@@ -413,9 +415,62 @@ impl Run<'_> {
                     },
                 )
             }
+            Fused::MatmulMoeRoute {
+                act,
+                w,
+                bias,
+                scale,
+                hint,
+                experts,
+                top_k,
+                score,
+                logits,
+                routes,
+                weights,
+            } => {
+                DispatchLinear::dispatch(
+                    self,
+                    &Linear::Matmul {
+                        act: *act,
+                        w: *w,
+                        y: *logits,
+                        input_scales: None,
+                        scales: None,
+                        quant: None,
+                        logits: false,
+                    },
+                )?;
+                DispatchLinear::dispatch(
+                    self,
+                    &Linear::MoeRoute {
+                        ids: None,
+                        table: None,
+                        logits: *logits,
+                        bias: *bias,
+                        scale: *scale,
+                        hint: *hint,
+                        experts: *experts,
+                        top_k: *top_k,
+                        score: *score,
+                        routes: *routes,
+                        weights: *weights,
+                    },
+                )
+            }
             Fused::MoeSelectGlu { select, glu } => {
                 DispatchLinear::dispatch(self, select)?;
                 DispatchLinear::dispatch(self, glu)
+            }
+            Fused::MoeMega {
+                select,
+                glu,
+                down,
+                sum,
+            } => {
+                for leg in [select, glu, down, sum] {
+                    DispatchLinear::dispatch(self, leg)?;
+                }
+                Ok(())
             }
             Fused::MoeExperts {
                 select,

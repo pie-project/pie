@@ -4,7 +4,7 @@ use crate::Op;
 use crate::operands::Part;
 use crate::ops::attn::Attn;
 use crate::ops::elemwise::{Elemwise, ModulateForm, Turn, Yarn};
-use crate::ops::linear::{GluAct, Linear};
+use crate::ops::linear::{GluAct, Linear, RouteScore};
 use crate::value::ValueId;
 
 /// The norm a [`Fused::RmsnormResidualAdd`] also lands over its last row:
@@ -406,6 +406,32 @@ pub enum Fused {
         #[output(alias = y)]
         y_out: ValueId,
     },
+    /// A router's product (a `Matmul` into `logits`) and the top-k it feeds
+    /// (a `MoeRoute` of `experts` under `score`, `bias`, `scale` and `hint`
+    /// as it states them): a backend may land the routes and weights
+    /// straight from the product's sums, or run the two. `logits` is still
+    /// an output, read by nothing else.
+    MatmulMoeRoute {
+        #[input]
+        act: ValueId,
+        #[input]
+        w: ValueId,
+        #[input]
+        bias: Option<ValueId>,
+        #[input]
+        scale: Option<ValueId>,
+        #[input]
+        hint: Option<ValueId>,
+        experts: u32,
+        top_k: u32,
+        score: RouteScore,
+        #[output]
+        logits: ValueId,
+        #[output(I32)]
+        routes: ValueId,
+        #[output(F32)]
+        weights: ValueId,
+    },
     /// A projection whose rows are cut at `width` straight after: a backend
     /// may land each side from its own slice of the weight, or run the
     /// matmul into `y` and cut it.
@@ -601,6 +627,24 @@ pub enum Fused {
         sum: Box<Linear>,
         #[part]
         gate_add: Option<Box<Linear>>,
+    },
+    /// A routed MLP a mega-MoE kernel lands in one launch: the gate-up
+    /// select (gate rows then up rows per expert), its packed SwiGLU, the
+    /// down select on the same routes and the fold (`MoeCombine`). The fold
+    /// is the route weights' first (`glu` takes them, the routes summed
+    /// plainly with `sum`'s shared row added where given) or the weighted
+    /// sum (`sum` takes them, no shared row). The rows between are still
+    /// outputs, read by nothing else, so a backend that declines a fire
+    /// runs it as the `MoeExperts` it also is.
+    MoeMega {
+        #[part]
+        select: Box<Linear>,
+        #[part]
+        glu: Box<Linear>,
+        #[part]
+        down: Box<Linear>,
+        #[part]
+        sum: Box<Linear>,
     },
     /// `qkv` (a `QkvFusedQknormRopeVnormWrite`) on the first columns of its
     /// `packed` rows, the rest of each row (`rest`'s width) landing in

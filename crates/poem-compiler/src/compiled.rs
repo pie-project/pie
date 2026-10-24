@@ -1,7 +1,6 @@
-use std::collections::BTreeMap;
 use std::ops::Range;
 
-use poem_ir::{ClassSet, ClassTable, RowAxis, Trace, ValueId};
+use poem_ir::{ClassSet, ClassTable, RowAxis, ValueId};
 
 use crate::arena::{ArenaMap, Concurrency};
 use crate::pq::PqTree;
@@ -31,14 +30,6 @@ pub struct CompiledModel {
     /// [`crate::expert::held`]: the values an expert region makes, by id,
     /// empty where nothing dispatches.
     pub expert: Vec<bool>,
-    /// The trace this plan is of, where it is not the one compiled: under
-    /// `compiler.synth_regions`, the one given with its chains folded into
-    /// `fused.region` ops ([`crate::fuse::chain::fold`]). An engine runs
-    /// this one.
-    pub trace: Option<Trace>,
-    /// The region and body each `fused.region` op names, by its `body`
-    /// hash; empty unless `compiler.synth_regions` is on.
-    pub bodies: BTreeMap<u64, crate::fuse::chain::Synth>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

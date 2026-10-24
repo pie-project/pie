@@ -1,33 +1,41 @@
 //! The row frame (`elemwise/frame.cuh`): one row a block, held whole in
 //! registers, around a body that computes it in hooks over the frame. The
-//! bodies here are written by hand (`elemwise/frame.cu`); each lands what the
-//! hand kernel of its op lands.
+//! bodies here are written by hand (`elemwise/frame.cu`), each landing what
+//! the hand kernel of its op lands; generated ones ([`crate::synth`]) fire
+//! through the same launch.
 
 use super::BLOCK;
 use crate::error::Error;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, aligned16, kernel, nonzero, refuse, stated};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Kernel, Launch, aligned16, kernel, nonzero, refuse};
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
 const FRAME: &str = "elemwise/frame.cu";
 
-const VEC_WIDTH: u32 = 8;
+/// The elements of one vector a thread loads: a row's width is whole
+/// vectors of it.
+pub const VEC_WIDTH: u32 = 8;
 
 /// The most vectors of 8 a thread holds of each plane: past it a row no
 /// longer fits the registers.
 const MAX_PER: u32 = 4;
 
-/// `pie::elemwise::Plane`, field for field.
+/// The widest row the frame holds.
+pub const MAX_WIDTH: u32 = BLOCK * VEC_WIDTH * MAX_PER;
+
+/// `pie::elemwise::Plane`, field for field: a bf16 plane's first element
+/// and how far apart its rows sit, in elements.
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
-struct Plane {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Plane {
     base: u64,
     row_stride: i64,
 }
 
 impl Plane {
     /// A plane whose every row is its own.
-    fn rows(t: &Tensor) -> Self {
+    #[must_use]
+    pub fn rows(t: &Tensor) -> Self {
         Self {
             base: t.ptr,
             row_stride: i64::from(t.width),
@@ -35,7 +43,8 @@ impl Plane {
     }
 
     /// One row every row reads (a norm's weight).
-    const fn shared(t: &Tensor) -> Self {
+    #[must_use]
+    pub const fn shared(t: &Tensor) -> Self {
         Self {
             base: t.ptr,
             row_stride: 0,
@@ -43,29 +52,9 @@ impl Plane {
     }
 }
 
-/// `pie::elemwise::Planes<IN, OUT>`, field for field.
-#[repr(C)]
-struct Planes<const IN: usize, const OUT: usize> {
-    ins: [Plane; IN],
-    outs: [Plane; OUT],
-    width: i32,
-}
-
-/// Fires `body` (a `pie::elemwise` type, `fields` its members by value)
-/// over `rows` rows of bf16 planes `width` wide: `ins[k]` is the body's
-/// parameter `k` and `outs[k]` its result `k`.
-#[allow(clippy::too_many_arguments)]
-fn fire<const IN: usize, const OUT: usize>(
-    ctx: &Ctx,
-    op: &'static str,
-    body: &str,
-    fields: ArgValue,
-    ins: [Plane; IN],
-    outs: [Plane; OUT],
-    rows: u32,
-    width: u32,
-) -> Result<(), Error> {
-    let rows = nonzero(op, "rows", rows)?;
+/// The vectors of 8 a thread holds of each plane of a `width`-wide row, or
+/// why the frame does not hold such a row.
+pub(crate) fn per(op: &'static str, width: u32) -> Result<u32, Error> {
     let width = nonzero(op, "the row's width", width)?;
     if !width.is_multiple_of(VEC_WIDTH) {
         return Err(refuse(
@@ -73,35 +62,56 @@ fn fire<const IN: usize, const OUT: usize>(
             format!("a {width}-wide row is not whole vectors of {VEC_WIDTH}"),
         ));
     }
-    let per = (width / VEC_WIDTH).div_ceil(BLOCK);
-    if per > MAX_PER {
+    if width > MAX_WIDTH {
         return Err(refuse(
             op,
-            format!(
-                "a {width}-wide row is wider than the frame holds ({})",
-                BLOCK * VEC_WIDTH * MAX_PER
-            ),
+            format!("a {width}-wide row is wider than the frame holds ({MAX_WIDTH})"),
         ));
     }
-    let planes = ins.iter().chain(&outs);
-    if !planes
-        .clone()
+    Ok((width / VEC_WIDTH).div_ceil(BLOCK))
+}
+
+/// The frame's kernel around `body` (a type the unit defines) for `ins`
+/// parameters and `outs` results, `per` vectors a thread.
+pub(crate) fn entrypoint(body: &str, per: u32, ins: usize, outs: usize) -> String {
+    format!("::pie::elemwise::row_frame<{body}, {BLOCK}, {per}, {ins}, {outs}>")
+}
+
+/// Fires `kernel`, a row frame of [`entrypoint`] (`fields` its body's
+/// members by value), over `rows` rows of bf16 planes `width` wide:
+/// `ins[k]` is the body's parameter `k` and `outs[k]` its result `k`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn fire(
+    ctx: &Ctx,
+    op: &'static str,
+    kernel: &'static Kernel,
+    fields: ArgValue,
+    ins: &[Plane],
+    outs: &[Plane],
+    rows: u32,
+    width: u32,
+) -> Result<(), Error> {
+    let rows = nonzero(op, "rows", rows)?;
+    if !ins
+        .iter()
+        .chain(outs)
         .all(|p| aligned16(p.base) && p.row_stride % i64::from(VEC_WIDTH) == 0)
     {
         return Err(refuse(op, "a plane is not 16-byte aligned at every row"));
     }
-    let planes = Planes {
-        ins,
-        outs,
-        width: stated(op, width)?,
-    };
-    let entrypoint = format!("::pie::elemwise::row_frame<{body}, {BLOCK}, {per}, {IN}, {OUT}>");
+    // `pie::elemwise::Planes<IN, OUT>`: the planes, then the width in the
+    // low half of the last 8-byte word (the struct's tail padding the rest).
+    let planes: Vec<u64> = ins
+        .iter()
+        .chain(outs)
+        .flat_map(|p| [p.base, p.row_stride.cast_unsigned()])
+        .chain([u64::from(width)])
+        .collect();
     ctx.fire(
         op,
         // The frame waits on its producer in-kernel (`kernel.pdl`).
-        Fire::at(kernel(FRAME, &entrypoint))
-            .apply(Launch::per_row(rows, BLOCK).programmatic(ctx.tuning().pdl)),
-        &[ArgValue::of(&planes), fields, ctx.stage()],
+        Fire::at(kernel).apply(Launch::per_row(rows, BLOCK).programmatic(ctx.tuning().pdl)),
+        &[ArgValue::of_slice(&planes), fields, ctx.stage()],
     )
 }
 
@@ -129,13 +139,15 @@ pub fn residual_add_rmsnorm(
         x.rows == y.rows && x.width == y.width && out.rows == y.rows && out.width == y.width,
         "the residual, the stream and the normed row share one shape"
     );
+    let per = per(OP, y.width)?;
+    let body = format!("::pie::elemwise::ResidualAddRmsnorm<{plus_one}>");
     fire(
         ctx,
         OP,
-        &format!("::pie::elemwise::ResidualAddRmsnorm<{plus_one}>"),
+        kernel(FRAME, &entrypoint(&body, per, 3, 2)),
         eps.arg(),
-        [Plane::rows(&x), Plane::rows(y), Plane::shared(&weight)],
-        [Plane::rows(out), Plane::rows(y)],
+        &[Plane::rows(&x), Plane::rows(y), Plane::shared(&weight)],
+        &[Plane::rows(out), Plane::rows(y)],
         y.rows,
         y.width,
     )

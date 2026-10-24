@@ -54,6 +54,8 @@ pub struct Shell {
     accounting: crate::store::Accounting,
     trace: Trace,
     compiled: CompiledModel,
+    /// The generated kernels the trace's `fused.region`s fire.
+    regions: crate::synth::Regions,
     /// This rank's part of an expert-parallel group, once the group wires
     /// it after every rank has loaded.
     ep: Option<crate::ep::EpRank>,
@@ -948,6 +950,12 @@ impl Shell {
     #[must_use]
     pub fn armed(&self) -> Option<&Armed> {
         self.armed.as_ref()
+    }
+
+    /// The generated kernels this load fires (`compiler.synth_regions`).
+    #[must_use]
+    pub fn regions(&self) -> &crate::synth::Regions {
+        &self.regions
     }
 
     /// The decoded-weight tile each stream was warmed with, main stream

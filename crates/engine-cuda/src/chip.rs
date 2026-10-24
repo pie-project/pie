@@ -575,6 +575,10 @@ mod tests {
                 assert_eq!(tuning.q_norm_rope_warp, b200, "{gpu}");
                 assert_eq!(tuning.skip_unread, b200, "{gpu}");
                 assert_eq!(tuning.norm_fold_block, if b200 { 128 } else { 0 }, "{gpu}");
+                // B200 alone lands a hyper-connection seam in one launch,
+                // from 64 to 1024 rows.
+                assert_eq!(tuning.hc_mega_from, if b200 { 64 } else { 0 }, "{gpu}");
+                assert_eq!(tuning.hc_mega_until, if b200 { 1024 } else { 0 }, "{gpu}");
                 assert_eq!(
                     kernels_cuda::tuning::Tuning {
                         gemv_narrow: false,
@@ -586,6 +590,8 @@ mod tests {
                         ssm_gdn_tc5: false,
                         rows_vec: false,
                         hc_tile: false,
+                        hc_mega_from: 0,
+                        hc_mega_until: 0,
                         ssm_conv_vec4: false,
                         ssm_gdn_out_bf16: false,
                         qg_prologue_until: 0,

@@ -642,9 +642,10 @@ fn routed(
     #[cfg(feature = "rocm")]
     let selects = trace.nodes.iter().flat_map(|node| match &node.op {
         Operation::Linear(op) => vec![op],
-        Operation::Fused(poem_ir::Fused::MoeExperts { select, down, .. }) => {
-            vec![&**select, &**down]
-        }
+        Operation::Fused(
+            poem_ir::Fused::MoeExperts { select, down, .. }
+            | poem_ir::Fused::MoeMega { select, down, .. },
+        ) => vec![&**select, &**down],
         Operation::Fused(poem_ir::Fused::MoeSelectGlu { select, .. }) => vec![&**select],
         _ => Vec::new(),
     });

@@ -1602,9 +1602,9 @@ fn act_quant_banks(trace: &Trace) -> BTreeMap<usize, u32> {
         // A fused routed MLP's selects read their banks as they would apart.
         let ws: Vec<_> = match &node.op {
             Operation::Linear(op) => lowp(op).into_iter().collect(),
-            Operation::Fused(Fused::MoeExperts { select, down, .. }) => {
-                [lowp(select), lowp(down)].into_iter().flatten().collect()
-            }
+            Operation::Fused(
+                Fused::MoeExperts { select, down, .. } | Fused::MoeMega { select, down, .. },
+            ) => [lowp(select), lowp(down)].into_iter().flatten().collect(),
             Operation::Fused(Fused::MoeSelectGlu { select, .. }) => {
                 lowp(select).into_iter().collect()
             }
@@ -1667,12 +1667,12 @@ fn share_input_scales(
     for node in &trace.nodes {
         let ss: Vec<_> = match &node.op {
             Operation::Linear(op) => scales_of(op).into_iter().collect(),
-            Operation::Fused(Fused::MoeExperts { select, down, .. }) => {
-                [scales_of(select), scales_of(down)]
-                    .into_iter()
-                    .flatten()
-                    .collect()
-            }
+            Operation::Fused(
+                Fused::MoeExperts { select, down, .. } | Fused::MoeMega { select, down, .. },
+            ) => [scales_of(select), scales_of(down)]
+                .into_iter()
+                .flatten()
+                .collect(),
             Operation::Fused(Fused::MoeSelectGlu { select, .. }) => {
                 scales_of(select).into_iter().collect()
             }

@@ -71,9 +71,14 @@ pub struct Knobs {
     pub chip: Option<profile::Profile>,
     /// An expert-parallel group's rebalance: every this many steps (none,
     /// the engine's default, which is never; 0, never), over the loads of
-    /// the last `expert_load_window` steps (none: as many as it waits).
+    /// the last `expert_load_window` steps (none: as many as it waits),
+    /// each rewriting at most `expert_rebalance_moves` slots a layer and
+    /// only for a peak lowered by `expert_rebalance_gain` of the mean (none:
+    /// [`engine::placement::Limits::DEFAULT`]'s).
     pub expert_rebalance_steps: Option<u32>,
     pub expert_load_window: Option<u32>,
+    pub expert_rebalance_moves: Option<u32>,
+    pub expert_rebalance_gain: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

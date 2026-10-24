@@ -38,6 +38,7 @@ pub mod settle;
 pub mod split_arm;
 pub mod staged_h2d;
 pub mod store;
+pub mod synth;
 pub mod tap;
 pub mod tune;
 pub mod voxels;
@@ -66,10 +67,12 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
             rules::embed_scale_add(),
             rules::residual_add_rmsnorm(),
             rules::matmul_glu(&[GluAct::GegluTanh, GluAct::Swiglu]),
+            rules::moe_mega(),
             rules::moe_experts(),
             rules::moe_select_glu(),
             rules::matmul_softcap(),
             rules::matmul_bias(),
+            rules::matmul_moe_route(),
             rules::matmul_split_rows(),
             rules::gated_residual_norm_modulate(),
             rules::norm_modulate(),
