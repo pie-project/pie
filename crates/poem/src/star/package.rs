@@ -59,7 +59,8 @@ pub struct Package {
 impl Package {
     /// The package `name` of `files` (file name, source).
     pub fn new(name: &str, files: &[(&str, &str)]) -> anyhow::Result<Package> {
-        let sources: BTreeMap<&str, &str> = files.iter().copied().collect();
+        let mut sources: BTreeMap<&str, &str> = files.iter().copied().collect();
+        sources.entry(CODEC.0).or_insert(CODEC.1);
         let mut modules = BTreeMap::new();
         let mut loaded = BTreeMap::new();
         for file in sources.keys() {
@@ -88,8 +89,13 @@ impl Package {
         })
     }
 
+    /// The package's own files: not the importer's (`//pie/…`), which every
+    /// package is built with and its digest still follows.
     pub fn files(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.sources.iter().map(|(f, s)| (f.as_str(), s.as_str()))
+        self.sources
+            .iter()
+            .filter(|(f, _)| *f != CODEC.0)
+            .map(|(f, s)| (f.as_str(), s.as_str()))
     }
 
     /// A digest of the name and files: what an artifact records of its package.
@@ -197,8 +203,12 @@ fn freeze(
 }
 
 /// The prefix of the libraries every package may load: helpers, whose names
-/// are never a package's entries.
-const LIBRARY: &str = "//lib/";
+/// are never a package's entries. The catalog's are `//lib/…`; the
+/// importer's own, which every package may load, `//pie/…`.
+const LIBRARY: &str = "//";
+
+/// The importer's codecs: how a release stores its quantized weights.
+const CODEC: (&str, &str) = ("//pie/codec.poem", include_str!("codec.poem"));
 
 /// The one file of the package's own (`modules` but its libraries) that
 /// defines `name`, or none; two that do are refused, for an entry is the

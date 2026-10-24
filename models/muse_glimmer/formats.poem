@@ -1,6 +1,8 @@
 # How a Muse Glimmer checkpoint is laid out: transformers' names, the text
 # model under `model.language_model.`, and mlx_lm's, under `language_model.model.`.
 
+load("//pie/codec.poem", "mapped")
+
 LAYOUTS = {
     "huggingface": struct(trunk = "model.language_model.", lm_head = "lm_head.weight"),
     "mlx_lm": struct(trunk = "language_model.model.", lm_head = "language_model.lm_head.weight"),
@@ -14,26 +16,25 @@ def safetensors_format(m, name):
     return format(
         name,
         recognizes = lambda checkpoint: has(layout.trunk + "embed_tokens.weight"),
-        read = lambda reads: safetensors(m, reads, layout),
+        read = lambda reads: mapped(reads, m, rows(layout), quantized = "read"),
     )
 
-def safetensors(m, reads, layout):
-    at = lambda leaf: layout.trunk + leaf
-    reads.read(m.embed, at("embed_tokens.weight"))
-    reads.read(m.final_norm, at("norm.weight"))
-    reads.read(m.lm_head, layout.lm_head)
-    for l, w in enumerate(m.layers):
-        n = lambda leaf: "{}layers.{}.{}".format(layout.trunk, l, leaf)
-        reads.read(w.attn_norm, n("input_layernorm.weight"))
-        reads.read(w.post_attn_norm, n("post_attention_layernorm.weight"))
-        reads.read(w.pre_ffw_norm, n("pre_feedforward_layernorm.weight"))
-        reads.read(w.post_ffw_norm, n("post_feedforward_layernorm.weight"))
-        reads.read_concat(w.qkv, [
-            n("self_attn.q_proj.weight"),
-            n("self_attn.k_proj.weight"),
-            n("self_attn.v_proj.weight"),
-        ])
-        reads.read(w.gate, n("self_attn.gate_proj.weight"))
-        reads.read(w.o_proj, n("self_attn.o_proj.weight"))
-        reads.read_concat(w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
-        reads.read(w.down, n("mlp.down_proj.weight"))
+def rows(layout):
+    """The checkpoint's names, under `layout`'s prefixes, mapped onto the
+    layout's."""
+    t = lambda leaf: layout.trunk + leaf
+    n = lambda leaf: t("layers.{l}." + leaf)
+    return [
+        (t("embed_tokens.weight"), "embed"),
+        (t("norm.weight"), "final_norm"),
+        (layout.lm_head, "lm_head"),
+        (n("input_layernorm.weight"), "layers.{l}.attn_norm"),
+        (n("post_attention_layernorm.weight"), "layers.{l}.post_attn_norm"),
+        (n("pre_feedforward_layernorm.weight"), "layers.{l}.pre_ffw_norm"),
+        (n("post_feedforward_layernorm.weight"), "layers.{l}.post_ffw_norm"),
+        ([n("self_attn.q_proj.weight"), n("self_attn.k_proj.weight"), n("self_attn.v_proj.weight")], "layers.{l}.qkv"),
+        (n("self_attn.gate_proj.weight"), "layers.{l}.gate"),
+        (n("self_attn.o_proj.weight"), "layers.{l}.o_proj"),
+        ([n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")], "layers.{l}.gate_up"),
+        (n("mlp.down_proj.weight"), "layers.{l}.down"),
+    ]

@@ -3,7 +3,7 @@
 # n-gram table e4m3 under one scale), or mlx_lm's, with the hyper-connections,
 # the n-gram embedding and the draft head beside the trunk.
 
-load("//lib/modelopt/formats.poem", "nvfp4_bank")
+load("//pie/codec.poem", "nvfp4_bank")
 
 def product(xs):
     out = 1

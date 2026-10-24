@@ -53,7 +53,6 @@ def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None):
     stored as `w` (its blocks' projections as `blocks_w`, when given) and its
     vectors as `dense`."""
     bw = blocks_w if blocks_w != None else w
-    n = lambda s: "{}.{}".format(prefix, s)
     dq, dkv, hd = head.q_heads, head.kv_heads, head.head_dim
     inter = head.inter
 
@@ -62,10 +61,8 @@ def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None):
         if c == None:
             return None
         return struct(
-            base = weight("{}.layers.{}.{}.base_kernel".format(prefix, l, which), [2 * c.taps, hidden], dense),
-            proj = weight(
-                "{}.layers.{}.{}.kernel_projection".format(prefix, l, which),
-                [2 * c.taps * (hidden // c.group), hidden],
+            base = weight([2 * c.taps, hidden]),
+            proj = weight([2 * c.taps * (hidden // c.group), hidden],
                 w,
             ).columns(),
             taps = c.taps,
@@ -73,10 +70,9 @@ def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None):
         )
 
     def block(l, window):
-        b = lambda s: "{}.layers.{}.{}".format(prefix, l, s)
-        bias = lambda s, width: weight(b(s), [width], dense) if head.attn_bias else None
+        bias = lambda s, width: weight([width]) if head.attn_bias else None
         return struct(
-            mixer_norm = weight(b("mixer_norm"), [hidden], dense),
+            mixer_norm = weight([hidden]),
             mixer_norm_eps = norm_eps,
             attn = struct(
                 q_heads = dq,
@@ -85,13 +81,13 @@ def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None):
                 rotary_dim = hd,
                 theta = head.theta,
                 sm_scale = f32(1.0 / f32(sqrt(hd))),
-                q_proj = weight(b("q_proj"), [dq * hd, hidden], bw).columns(),
-                k_proj = weight(b("k_proj"), [dkv * hd, hidden], bw).columns(heads = dkv),
-                v_proj = weight(b("v_proj"), [dkv * hd, hidden], bw).columns(heads = dkv),
-                o_proj = weight(b("o_proj"), [hidden, dq * hd], bw).rows(),
-                q_norm = weight(b("q_norm"), [hd], dense),
+                q_proj = weight([dq * hd, hidden], bw).columns(),
+                k_proj = weight([dkv * hd, hidden], bw).columns(heads = dkv),
+                v_proj = weight([dkv * hd, hidden], bw).columns(heads = dkv),
+                o_proj = weight([hidden, dq * hd], bw).rows(),
+                q_norm = weight([hd]),
                 q_norm_eps = norm_eps,
-                k_norm = weight(b("k_norm"), [hd], dense),
+                k_norm = weight([hd]),
                 k_norm_eps = norm_eps,
                 q_bias = bias("q_bias", dq * hd),
                 k_bias = bias("k_bias", dkv * hd),
@@ -99,11 +95,11 @@ def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None):
                 o_bias = bias("o_bias", hidden),
                 kv = "kv.dflash.{}".format(l),
             ),
-            mlp_norm = weight(b("mlp_norm"), [hidden], dense),
+            mlp_norm = weight([hidden]),
             mlp_norm_eps = norm_eps,
             mlp = struct(
-                gate_up = weight(b("gate_up"), [2 * inter, hidden], bw).packed([inter, inter]),
-                down = weight(b("down"), [hidden, inter], bw).rows(),
+                gate_up = weight([2 * inter, hidden], bw).packed([inter, inter]),
+                down = weight([hidden, inter], bw).rows(),
                 inter = inter,
             ),
             window = window,
@@ -111,16 +107,14 @@ def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None):
             mlp_conv = conv(l, "mlp_conv"),
         )
 
-    codebook = lambda s, rank: weight(n(s), [vocab, rank], dense)
+    codebook = lambda s, rank: weight([vocab, rank])
     readout = head.readout
     if readout == "argmax":
         chooser = None
     elif readout.kind == "selector":
         chooser = struct(
             kind = "selector",
-            hidden_projection = weight(
-                n("candidate_selector.hidden_projection"),
-                [readout.rank, hidden],
+            hidden_projection = weight([readout.rank, hidden],
                 w,
             ).columns(),
             pred = codebook("candidate_selector.predecessor_codebook", readout.rank),
@@ -137,11 +131,11 @@ def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None):
         )
     return struct(
         taps = head.taps,
-        fc = [weight(n("fc_tap{}".format(i)), [hidden, hidden], w) for i in range(len(head.taps))],
-        hidden_norm = weight(n("hidden_norm"), [hidden], dense),
+        fc = [weight([hidden, hidden], w) for i in range(len(head.taps))],
+        hidden_norm = weight([hidden]),
         hidden_norm_eps = norm_eps,
         blocks = [block(l, window) for l, window in enumerate(head.windows)],
-        norm = weight(n("norm"), [hidden], dense),
+        norm = weight([hidden]),
         norm_eps = norm_eps,
         block = head.block,
         mask_token = head.mask_token,

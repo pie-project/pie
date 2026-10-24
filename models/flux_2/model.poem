@@ -2,11 +2,11 @@
 # single-stream blocks over both; a Qwen3 4B text encoder whose three tapped
 # layers project into the context; and a VAE with a batch-normed latent.
 
-def linear(name, out, in_, banks, bias = True):
+def linear(out, in_, banks, bias = True):
     """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
     return struct(
-        w = weight(name, [out, in_], banks),
-        bias = weight(name + ".bias", [out], compute(banks)) if bias else None,
+        w = weight([out, in_], banks),
+        bias = weight([out]) if bias else None,
     )
 
 BLOCKS = [128, 256, 512, 512]
@@ -16,42 +16,42 @@ LAYERS_PER_BLOCK = 2
 
 TAPS3 = 9
 
-def vae_conv(name, c_out, c_in, taps):
+def vae_conv(c_out, c_in, taps):
     return struct(
-        w = weight(name, [c_out, c_in * taps], dtype.bf16).conv_taps_major(c_in, taps),
-        bias = weight(name + ".bias", [c_out], dtype.f32),
+        w = weight([c_out, c_in * taps], dtype.bf16).conv_taps_major(c_in, taps),
+        bias = weight([c_out], dtype.f32),
         c_in = c_in,
         c_out = c_out,
         taps = taps,
     )
 
-def group_norm(name, c):
+def group_norm(c):
     return struct(
-        weight = weight(name + ".weight", [c], dtype.f32),
-        bias = weight(name + ".bias", [c], dtype.f32),
+        weight = weight([c], dtype.f32),
+        bias = weight([c], dtype.f32),
     )
 
-def resnet(name, c_in, c_out):
+def resnet(c_in, c_out):
     return struct(
-        norm1 = group_norm(name + ".norm1", c_in),
-        conv1 = vae_conv(name + ".conv1", c_out, c_in, TAPS3),
-        norm2 = group_norm(name + ".norm2", c_out),
-        conv2 = vae_conv(name + ".conv2", c_out, c_out, TAPS3),
-        shortcut = vae_conv(name + ".shortcut", c_out, c_in, 1) if c_in != c_out else None,
+        norm1 = group_norm(c_in),
+        conv1 = vae_conv(c_out, c_in, TAPS3),
+        norm2 = group_norm(c_out),
+        conv2 = vae_conv(c_out, c_out, TAPS3),
+        shortcut = vae_conv(c_out, c_in, 1) if c_in != c_out else None,
     )
 
-def mid(name, c):
+def mid(c):
     return struct(
-        res0 = resnet(name + ".res0", c, c),
+        res0 = resnet(c, c),
         attn = struct(
-            norm = group_norm(name + ".attn.norm", c),
-            q = linear(name + ".attn.q", c, c, dtype.bf16),
-            k = linear(name + ".attn.k", c, c, dtype.bf16),
-            v = linear(name + ".attn.v", c, c, dtype.bf16),
-            out = linear(name + ".attn.out", c, c, dtype.bf16),
+            norm = group_norm(c),
+            q = linear(c, c, dtype.bf16),
+            k = linear(c, c, dtype.bf16),
+            v = linear(c, c, dtype.bf16),
+            out = linear(c, c, dtype.bf16),
             width = c,
         ),
-        res1 = resnet(name + ".res1", c, c),
+        res1 = resnet(c, c),
     )
 
 def flux_vae(channels, encoder_out, latent):
@@ -65,12 +65,12 @@ def flux_vae(channels, encoder_out, latent):
         name = "vae.dec.up{}".format(i)
         resnets = []
         for r in range(LAYERS_PER_BLOCK + 1):
-            resnets.append(resnet("{}.res{}".format(name, r), c_prev, c))
+            resnets.append(resnet(c_prev, c))
             c_prev = c
         last = i + 1 == len(BLOCKS)
         up.append(struct(
             resnets = resnets,
-            upsample = vae_conv(name + ".upsample", c, c, TAPS3) if not last else None,
+            upsample = vae_conv(c, c, TAPS3) if not last else None,
         ))
     down = []
     c_prev = BLOCKS[0]
@@ -78,28 +78,28 @@ def flux_vae(channels, encoder_out, latent):
         name = "vae.enc.down{}".format(i)
         resnets = []
         for r in range(LAYERS_PER_BLOCK):
-            resnets.append(resnet("{}.res{}".format(name, r), c_prev, c))
+            resnets.append(resnet(c_prev, c))
             c_prev = c
         last = i + 1 == len(BLOCKS)
         down.append(struct(
             resnets = resnets,
-            downsample = vae_conv(name + ".downsample", c, c, TAPS3) if not last else None,
+            downsample = vae_conv(c, c, TAPS3) if not last else None,
         ))
     return struct(
         latent = latent(),
         decoder = struct(
-            conv_in = vae_conv("vae.dec.conv_in", top, channels, TAPS3),
-            mid = mid("vae.dec.mid", top),
+            conv_in = vae_conv(top, channels, TAPS3),
+            mid = mid(top),
             up = up,
-            norm_out = group_norm("vae.dec.norm_out", BLOCKS[0]),
-            conv_out = vae_conv("vae.dec.conv_out", RGB, BLOCKS[0], TAPS3),
+            norm_out = group_norm(BLOCKS[0]),
+            conv_out = vae_conv(RGB, BLOCKS[0], TAPS3),
         ),
         encoder = struct(
-            conv_in = vae_conv("vae.enc.conv_in", BLOCKS[0], RGB, TAPS3),
+            conv_in = vae_conv(BLOCKS[0], RGB, TAPS3),
             down = down,
-            mid = mid("vae.enc.mid", top),
-            norm_out = group_norm("vae.enc.norm_out", top),
-            conv_out = vae_conv("vae.enc.conv_out", encoder_out, top, TAPS3),
+            mid = mid(top),
+            norm_out = group_norm(top),
+            conv_out = vae_conv(encoder_out, top, TAPS3),
         ),
     )
 
@@ -117,7 +117,6 @@ QWEN3_4B = struct(
 def encoder(c, layers, banks, sharded = False):
     """The encoder of config `c` through its first `layers` layers; with
     `sharded`, its attention and mlp split across ranks."""
-    dense = compute(banks)
     hidden, hd, inter = c.hidden, c.head_dim, c.inter
 
     def columns(w, heads = None):
@@ -131,16 +130,16 @@ def encoder(c, layers, banks, sharded = False):
     def layer(l):
         n = lambda s: "te.layer.{}.{}".format(l, s)
         return struct(
-            attn_norm = weight(n("attn_norm"), [hidden], dense),
-            q = columns(weight(n("q"), [c.q_heads * hd, hidden], banks)),
-            k = columns(weight(n("k"), [c.kv_heads * hd, hidden], banks), c.kv_heads),
-            v = columns(weight(n("v"), [c.kv_heads * hd, hidden], banks), c.kv_heads),
-            o = rows(weight(n("o"), [hidden, c.q_heads * hd], banks)),
-            q_norm = weight(n("q_norm"), [hd], dense),
-            k_norm = weight(n("k_norm"), [hd], dense),
-            mlp_norm = weight(n("mlp_norm"), [hidden], dense),
-            gate_up = weight(n("gate_up"), [2 * inter, hidden], banks).packed([inter, inter]),
-            down = rows(weight(n("down"), [hidden, inter], banks)),
+            attn_norm = weight([hidden]),
+            q = columns(weight([c.q_heads * hd, hidden], banks)),
+            k = columns(weight([c.kv_heads * hd, hidden], banks), c.kv_heads),
+            v = columns(weight([c.kv_heads * hd, hidden], banks), c.kv_heads),
+            o = rows(weight([hidden, c.q_heads * hd], banks)),
+            q_norm = weight([hd]),
+            k_norm = weight([hd]),
+            mlp_norm = weight([hidden]),
+            gate_up = weight([2 * inter, hidden], banks).packed([inter, inter]),
+            down = rows(weight([hidden, inter], banks)),
             kv = "te.kv.{}".format(l),
         )
 
@@ -154,7 +153,7 @@ def encoder(c, layers, banks, sharded = False):
         theta = c.theta,
         eps = c.eps,
         sm_scale = f32(1.0 / f32(sqrt(hd))),
-        embed = weight("te.embed", [c.vocab, hidden], banks),
+        embed = weight([c.vocab, hidden], banks),
         layers = [layer(l) for l in range(layers)],
     )
 
@@ -195,57 +194,53 @@ DIMS = {
     ),
 }
 
-def attn(prefix, d, banks):
-    dense = compute(banks)
+def attn(d, banks):
     dim = d.dim
     return struct(
-        qkv = weight(prefix + ".qkv", [3 * dim, dim], banks).packed([dim, dim, dim]),
-        q_norm = weight(prefix + ".q_norm", [HEAD_DIM], dense),
-        k_norm = weight(prefix + ".k_norm", [HEAD_DIM], dense),
-        out = weight(prefix + ".out", [dim, dim], banks),
+        qkv = weight([3 * dim, dim], banks).packed([dim, dim, dim]),
+        q_norm = weight([HEAD_DIM]),
+        k_norm = weight([HEAD_DIM]),
+        out = weight([dim, dim], banks),
     )
 
-def swiglu(prefix, d, banks):
+def swiglu(d, banks):
     return struct(
-        linear_in = weight(prefix + ".in", [2 * d.inter, d.dim], banks).packed([d.inter, d.inter]),
-        linear_out = weight(prefix + ".out", [d.dim, d.inter], banks),
+        linear_in = weight([2 * d.inter, d.dim], banks).packed([d.inter, d.inter]),
+        linear_out = weight([d.dim, d.inter], banks),
     )
 
-def side(prefix, d, banks):
-    return struct(attn = attn(prefix + ".attn", d, banks), ff = swiglu(prefix + ".ff", d, banks))
+def side(d, banks):
+    return struct(attn = attn(d, banks), ff = swiglu(d, banks))
 
 def single(prefix, d, banks):
-    dense = compute(banks)
     dim, inter = d.dim, d.inter
     return struct(
-        in_proj = weight(prefix + ".in", [3 * dim + 2 * inter, dim], banks).packed([dim, dim, dim, inter, inter]),
-        q_norm = weight(prefix + ".q_norm", [HEAD_DIM], dense),
-        k_norm = weight(prefix + ".k_norm", [HEAD_DIM], dense),
-        out_attn = weight(prefix + ".out_attn", [dim, dim], banks),
-        out_mlp = weight(prefix + ".out_mlp", [dim, inter], banks),
+        in_proj = weight([3 * dim + 2 * inter, dim], banks).packed([dim, dim, dim, inter, inter]),
+        q_norm = weight([HEAD_DIM]),
+        k_norm = weight([HEAD_DIM]),
+        out_attn = weight([dim, dim], banks),
+        out_mlp = weight([dim, inter], banks),
     )
 
-def embedder(prefix, d, banks):
+def embedder(d, banks):
     return struct(
-        linear_1 = weight(prefix + ".1", [d.dim, T_FREQ_DIM], banks),
-        linear_2 = weight(prefix + ".2", [d.dim, d.dim], banks),
+        linear_1 = weight([d.dim, T_FREQ_DIM], banks),
+        linear_2 = weight([d.dim, d.dim], banks),
     )
 
 def vae_latent():
-    bn = lambda tail: weight("vae.bn." + tail, [IN_CHANNELS], compute(dtype.bf16))
+    bn = lambda tail: weight([IN_CHANNELS])
     return struct(
         bn_zero = bn("zero"),
         bn_scale = bn("scale"),
         bn_rscale = bn("rscale"),
         bn_mean = bn("mean"),
-        quant_conv = vae_conv("vae.quant", VAE_CHANNELS, 2 * VAE_CHANNELS, 1),
-        post_quant_conv = vae_conv("vae.post_quant", VAE_CHANNELS, VAE_CHANNELS, 1),
+        quant_conv = vae_conv(VAE_CHANNELS, 2 * VAE_CHANNELS, 1),
+        post_quant_conv = vae_conv(VAE_CHANNELS, VAE_CHANNELS, 1),
     )
 
 def layout(id, deploy):
-    if len(deploy.weights) != 1:
-        fail("{} stores its weights at one dtype, not {}".format(id, deploy.weights))
-    banks = deploy.weights[0]
+    banks = roles(deploy, "banks", exact = True).banks
     d = DIMS[id]
     if d.heads * HEAD_DIM != d.dim:
         fail("plain MHA over 128-wide heads: heads × 128 is the width")
@@ -253,7 +248,7 @@ def layout(id, deploy):
     klein = id == "flux2-klein-4b"
     te = encoder(QWEN3_4B, TE_TAPS[-1], banks) if klein else None
     te_context = [
-        weight("dit.context_embed.{}".format(i), [dim, QWEN3_4B.hidden], banks)
+        weight([dim, QWEN3_4B.hidden], banks)
         for i in range(len(TE_TAPS))
     ] if klein else None
     return struct(
@@ -267,23 +262,23 @@ def layout(id, deploy):
         rope_axes = ROPE_AXES,
         t_freq_dim = T_FREQ_DIM,
         dit = struct(
-            x_embed = weight("dit.x_embed", [dim, IN_CHANNELS], banks),
-            context_embed = weight("dit.context_embed", [dim, d.context_in], banks) if te == None else None,
-            t_embed = embedder("dit.t_embed", d, banks),
-            g_embed = embedder("dit.g_embed", d, banks) if d.guidance_embeds else None,
-            mod_img = weight("dit.mod_img", [DOUBLE_MOD_SLICES * dim, dim], banks),
-            mod_txt = weight("dit.mod_txt", [DOUBLE_MOD_SLICES * dim, dim], banks),
-            mod_single = weight("dit.mod_single", [SINGLE_MOD_SLICES * dim, dim], banks),
+            x_embed = weight([dim, IN_CHANNELS], banks),
+            context_embed = weight([dim, d.context_in], banks) if te == None else None,
+            t_embed = embedder(d, banks),
+            g_embed = embedder(d, banks) if d.guidance_embeds else None,
+            mod_img = weight([DOUBLE_MOD_SLICES * dim, dim], banks),
+            mod_txt = weight([DOUBLE_MOD_SLICES * dim, dim], banks),
+            mod_single = weight([SINGLE_MOD_SLICES * dim, dim], banks),
             double = [
                 struct(
-                    img = side("dit.double.{}.img".format(i), d, banks),
-                    txt = side("dit.double.{}.txt".format(i), d, banks),
+                    img = side(d, banks),
+                    txt = side(d, banks),
                 )
                 for i in range(d.double_blocks)
             ],
             single = [single("dit.single.{}".format(i), d, banks) for i in range(d.single_blocks)],
-            norm_out = weight("dit.norm_out", [2 * dim, dim], banks),
-            proj_out = weight("dit.proj_out", [IN_CHANNELS, dim], banks),
+            norm_out = weight([2 * dim, dim], banks),
+            proj_out = weight([IN_CHANNELS, dim], banks),
         ),
         te = te,
         te_taps = TE_TAPS,

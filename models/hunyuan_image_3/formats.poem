@@ -52,19 +52,6 @@ def swap_halves(e, inter):
 def doubled(e):
     return concat(0, [e, e])
 
-def signs(reads, w, seed):
-    """The sign table `w`: a column of ones over one of minus ones, stored as
-    the raw dtype `seed` is stored in."""
-    held = stored(seed)
-    raw_dtype = held.raw
-    if raw_dtype == None:
-        fail("`{}`: `{}` is stored {}; a constant is stated in a raw dtype".format(w.name, seed, held))
-    half = w.shape[0] // 2
-    joined = constant(w.name, [1.0] * half + [-1.0] * half, [2 * half, 1], raw_dtype)
-    want = encoding(w.dtype)
-    expr = joined if want == held else joined.cast(want)
-    reads.push(tensor(w.name, expr, want, shape = w.shape))
-
 def embedder(reads, e, prefix):
     biased(reads, e.mlp_in, prefix + ".mlp.0")
     biased(reads, e.mlp_out, prefix + ".mlp.2")
@@ -87,7 +74,6 @@ def read(m, reads):
     reads.read(m.embed, "model.wte.weight")
     reads.read(m.head, "lm_head.weight")
     reads.read(m.final_norm, "model.ln_f.weight")
-    signs(reads, m.ones, "model.ln_f.weight")
 
     hd = d.head_dim
     groups = d.q_heads // d.kv_heads

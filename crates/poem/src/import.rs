@@ -2374,6 +2374,25 @@ pub fn encoding(dtype: Dtype) -> Encoding {
     }
 }
 
+/// The tensor the layout states `w` holds: its values at the dtype it
+/// computes in, cast to the encoding it is stored in.
+pub fn stated(w: &Weight) -> Result<TensorContract, Error> {
+    let values = w.values.as_deref().unwrap_or_default();
+    let Encoding::Raw(raw) = encoding(w.compute_dtype()) else {
+        return Err(Error::Illegible {
+            name: w.name.clone(),
+            detail: "a stated weight computes in no raw dtype".to_string(),
+        });
+    };
+    let shape: Vec<i64> = w.shape.iter().map(|&n| n as i64).collect();
+    let mut expr = constant(&w.name, values, shape.clone(), raw)?;
+    let want = encoding(w.dtype);
+    if want != Encoding::Raw(raw) {
+        expr = expr.cast_chunked(want.clone(), 0);
+    }
+    Ok(TensorContract::new(w.name.clone(), expr, shape, want))
+}
+
 /// The tensor of `values` in `shape`, stored as raw `dtype`: a table a model
 /// states rather than reads, carried by the contract itself. Each value is
 /// rounded to `dtype` as the plan's own float transforms round theirs.

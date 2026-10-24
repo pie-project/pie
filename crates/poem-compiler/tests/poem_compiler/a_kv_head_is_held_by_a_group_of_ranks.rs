@@ -35,7 +35,7 @@ fn a_kv_head_is_held_by_a_group_of_ranks() {
         }
     }
 
-    for name in ["layer.3.k_proj", "layer.3.v_proj"] {
+    for name in ["layers.3.attn.k_proj", "layers.3.attn.v_proj"] {
         let param = trace
             .params
             .iter()
@@ -46,7 +46,7 @@ fn a_kv_head_is_held_by_a_group_of_ranks() {
     let q = trace
         .params
         .iter()
-        .find(|p| p.name == "layer.3.qg_proj")
+        .find(|p| p.name == "layers.3.attn.qg_proj")
         .expect("the row reads its query projection");
     assert_eq!(
         q.shape,
@@ -90,12 +90,12 @@ fn the_contract_reads_a_kv_head_once_per_group() {
             .expr
             .clone()
     };
-    for name in ["layer.3.k_proj", "layer.3.v_proj"] {
+    for name in ["layers.3.attn.k_proj", "layers.3.attn.v_proj"] {
         assert_eq!(read(name), Expr::src(name).shard_among(0, 2), "`{name}`");
     }
     assert_eq!(
-        read("layer.3.qg_proj"),
-        Expr::src("layer.3.qg_proj").shard(0),
+        read("layers.3.attn.qg_proj"),
+        Expr::src("layers.3.attn.qg_proj").shard(0),
         "the query heads are cut once per rank",
     );
     drop(src);

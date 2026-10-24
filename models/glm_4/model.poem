@@ -73,7 +73,7 @@ def layout(id, deploy):
     q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
     heads = [d.q_heads, d.kv_heads, d.kv_heads]
 
-    def mlp(n, l):
+    def mlp(l):
         if l < d.dense_layers:
             iw = d.dense_inter
             # The Air's dense MLP is 10944 wide, not a whole number of 128s:
@@ -81,20 +81,20 @@ def layout(id, deploy):
             down_w = dtype.bf16 if mlp_w == dtype.e4m3g128a8 and iw % 128 != 0 else mlp_w
             return struct(
                 routed = False,
-                gate_up = weight(n("gate_up"), [2 * iw, hidden], mlp_w).packed([iw, iw]),
-                down = weight(n("down"), [hidden, iw], down_w).rows(),
+                gate_up = weight([2 * iw, hidden], mlp_w).packed([iw, iw]),
+                down = weight([hidden, iw], down_w).rows(),
                 inter = iw,
             )
         iw, sw = d.inter, d.shared_inter
         return struct(
             routed = True,
-            router = weight(n("router"), [d.experts, hidden], dense),
-            bias = weight(n("router_bias"), [d.experts], dtype.f32),
-            gate_up = weight(n("experts_gate_up"), [d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
-            down = weight(n("experts_down"), [d.experts, hidden, iw], experts).rows(),
+            router = weight([d.experts, hidden]),
+            bias = weight([d.experts], dtype.f32),
+            gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
+            down = weight([d.experts, hidden, iw], experts).rows(),
             shared = struct(
-                gate_up = weight(n("shared_gate_up"), [2 * sw, hidden], mlp_w).packed([sw, sw]),
-                down = weight(n("shared_down"), [hidden, sw], mlp_w).rows(),
+                gate_up = weight([2 * sw, hidden], mlp_w).packed([sw, sw]),
+                down = weight([hidden, sw], mlp_w).rows(),
                 inter = sw,
             ),
             experts = d.experts,
@@ -104,17 +104,16 @@ def layout(id, deploy):
         )
 
     def layer(l):
-        n = lambda s: "layer.{}.{}".format(l, s)
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
-            attn_norm = weight(n("attn_norm"), [hidden], dense),
-            qkv = weight(n("qkv"), [q_width + 2 * kv_width, hidden], proj).packed([q_width, kv_width, kv_width], heads = heads),
-            qkv_bias = weight(n("qkv_bias"), [q_width + 2 * kv_width], dense).packed([q_width, kv_width, kv_width], heads = heads),
-            o = weight(n("o"), [hidden, q_width], proj).rows(),
-            q_norm = weight(n("q_norm"), [hd], dense) if d.qk_norm else None,
-            k_norm = weight(n("k_norm"), [hd], dense) if d.qk_norm else None,
-            mlp_norm = weight(n("mlp_norm"), [hidden], dense),
-            mlp = mlp(n, l),
+            attn_norm = weight([hidden]),
+            qkv = weight([q_width + 2 * kv_width, hidden], proj).packed([q_width, kv_width, kv_width], heads = heads),
+            qkv_bias = weight([q_width + 2 * kv_width]).packed([q_width, kv_width, kv_width], heads = heads),
+            o = weight([hidden, q_width], proj).rows(),
+            q_norm = weight([hd]) if d.qk_norm else None,
+            k_norm = weight([hd]) if d.qk_norm else None,
+            mlp_norm = weight([hidden]),
+            mlp = mlp(l),
             kv = "kv.{}".format(l),
             lora_a = lora_a,
             lora_b = lora_b,
@@ -135,8 +134,8 @@ def layout(id, deploy):
         eps = d.norm_eps,
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         kv = deploy.kv,
-        embed = weight("embed", [d.vocab, hidden], table),
-        head = weight("lm_head", [d.vocab, hidden], table).columns(),
+        embed = weight([d.vocab, hidden], table),
+        head = weight([d.vocab, hidden], table).columns(),
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight("final_norm", [hidden], dense),
+        final_norm = weight([hidden]),
     )

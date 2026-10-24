@@ -8,8 +8,8 @@ use poem::{Dtype, Platform};
 const MODEL: &str = r#"
 def layout(id, deploy):
     return struct(
-        embed = weight("embed", [16, 8], deploy.weights[0]),
-        head = weight("head", [16, 8], deploy.weights[0]),
+        embed = weight([16, 8], deploy.weights[0]),
+        head = weight([16, 8], deploy.weights[0]),
     )
 "#;
 

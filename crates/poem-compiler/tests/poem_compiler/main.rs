@@ -18,6 +18,7 @@ mod a_kv_head_is_held_by_a_group_of_ranks;
 mod a_ptq1_0_trunk_traces_and_places;
 mod a_ragged_attention_over_two_arms_bakes_into_one_region;
 mod a_relative_bias_table_bakes_as_a_plan_constant;
+mod a_rewritten_format_keeps_its_contracts;
 mod a_rewritten_package_keeps_its_traces;
 mod a_routed_bank_is_the_rectangle_the_grouped_leg_reads;
 mod a_trace_is_the_same_whatever_order_it_was_recorded_in;

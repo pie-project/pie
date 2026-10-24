@@ -131,8 +131,14 @@ impl Package {
             .heap()
             .access_owned_frozen_value(&self.required("layout")?);
         let heap = module.heap();
-        eval.eval_function(layout, &[heap.alloc(id), deploy.alloc(heap)], &[])
-            .map_err(error)
+        let compute = deploy
+            .weights
+            .first()
+            .and_then(|stated| crate::compute_dtype(stated.dtype));
+        let before = crate::star::layout::COMPUTE.with(|c| c.replace(compute));
+        let m = eval.eval_function(layout, &[heap.alloc(id), deploy.alloc(heap)], &[]);
+        crate::star::layout::COMPUTE.with(|c| c.set(before));
+        Ok(crate::star::paths::named(heap, m.map_err(error)?))
     }
 
     /// What `id`'s deployment `deploy` states of itself as a generative
@@ -416,6 +422,10 @@ impl Package {
             let m = self
                 .layout(id, deploy, &module, &mut eval)
                 .map_err(|e| illegible(format!("{e:#}")))?;
+            let stated = crate::star::paths::stated(m)
+                .iter()
+                .map(crate::import::stated)
+                .collect::<Result<Vec<_>, _>>()?;
             let formats = self
                 .required("formats")
                 .map_err(|e| illegible(format!("{e:#}")))?;
@@ -459,6 +469,7 @@ impl Package {
                     })
                     .collect::<Result<_, _>>()?;
                 let eval = &eval;
+                let stated = &stated;
                 let said = name.clone();
                 let reads =
                     move || -> Result<checkpoint::contract::ModelContract, crate::import::Error> {
@@ -480,6 +491,9 @@ impl Package {
                         let reads = crate::star::formats::READS
                             .with(|r| std::mem::take(&mut *r.borrow_mut()));
                         let mut b = crate::import::Builder::new(src, 1, platform);
+                        for t in stated {
+                            crate::star::formats::Read::Push(t.clone()).onto(&mut b)?;
+                        }
                         for read in reads {
                             read.onto(&mut b)?;
                         }

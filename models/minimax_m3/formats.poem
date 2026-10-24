@@ -3,9 +3,7 @@
 # vision tower beside it unread. The MXFP8 release stores every projection
 # e4m3 beside `*.weight_scale_inv` (one e8m0 a 1x32 block of each row).
 
-load("//lib/mxfp8/formats.poem", "mx_bank", "mx_proj", "mx_read")
-
-load("//lib/compressed/formats.poem", "nvfp4_packed_bank")
+load("//pie/codec.poem", "bank", "kept", "nvfp4_packed_bank", "weight")
 
 def lifted(w):
     """`w`'s shape, its cut axis left for the stack to fill."""
@@ -17,16 +15,6 @@ def expert_bank(reads, w, names):
     """The planes `names`, stacked on the leading axis, read as the bank `w`."""
     read = logical(stored(names[0]))
     reads.read_expr(w, concat(0, [src(n) for n in names]).transmute(lifted(w), raw(read)))
-
-def proj(reads, w, names):
-    """`w` from `names`, joined along its rows: as the release stores it
-    where `w` keeps its MXFP8."""
-    if mx_proj(w):
-        mx_read(reads, w, names)
-    elif len(names) == 1:
-        reads.read(w, names[0])
-    else:
-        reads.read_concat(w, names)
 
 def at(l, leaf):
     return "language_model.model.layers.{}.{}".format(l, leaf)
@@ -55,7 +43,7 @@ def read(m, reads):
             (a.q_norm, "q_norm"),
             (a.k_norm, "k_norm"),
         ]:
-            proj(reads, p, [n("self_attn.{}.weight".format(name))])
+            weight(reads, p, [n("self_attn.{}.weight".format(name))], quantized = "read")
         ix = w.indexer
         if ix != None:
             for p, name in [
@@ -64,7 +52,7 @@ def read(m, reads):
                 (ix.q_norm, "index_q_norm"),
                 (ix.k_norm, "index_k_norm"),
             ]:
-                proj(reads, p, [n("self_attn.{}.weight".format(name))])
+                weight(reads, p, [n("self_attn.{}.weight".format(name))], quantized = "read")
         if w.dense != None:
             read_mlp(reads, w.dense, lambda leaf: n("mlp." + leaf))
             continue
@@ -77,9 +65,9 @@ def read(m, reads):
             # MiniMax-M3.1-Flash: its experts compressed-tensors NVFP4 beside MXFP8 projections
             nvfp4_packed_bank(reads, f.gate_up, [[moe("experts.{}.w1".format(e)), moe("experts.{}.w3".format(e))] for e in range(f.experts)])
             nvfp4_packed_bank(reads, f.down, [[moe("experts.{}.w2".format(e))] for e in range(f.experts)])
-        elif mx_proj(f.gate_up):
-            mx_bank(reads, f.gate_up, [[leg(e, "w1"), leg(e, "w3")] for e in range(f.experts)])
-            mx_bank(reads, f.down, [[leg(e, "w2")] for e in range(f.experts)])
+        elif kept(f.gate_up):
+            bank(reads, f.gate_up, [[leg(e, "w1"), leg(e, "w3")] for e in range(f.experts)])
+            bank(reads, f.down, [[leg(e, "w2")] for e in range(f.experts)])
         else:
             gate_up = []
             for e in range(f.experts):
@@ -89,5 +77,5 @@ def read(m, reads):
         read_mlp(reads, f.shared, lambda leaf: moe("shared_experts." + leaf))
 
 def read_mlp(reads, f, n):
-    proj(reads, f.gate_up, [n("gate_proj.weight"), n("up_proj.weight")])
-    proj(reads, f.down, [n("down_proj.weight")])
+    weight(reads, f.gate_up, [n("gate_proj.weight"), n("up_proj.weight")], quantized = "read")
+    weight(reads, f.down, [n("down_proj.weight")], quantized = "read")

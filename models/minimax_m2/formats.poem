@@ -5,8 +5,7 @@
 # recognized by its routed `block_sparse_moe` and checked against its config.
 # The draft modules are not read.
 
-load("//lib/blockfp8/formats.poem", "fp8_bank", "fp8_proj", "fp8_read", "released_fp8")
-load("//lib/modelopt/formats.poem", "nvfp4_bank")
+load("//pie/codec.poem", "kept", "mapped")
 
 def configured(m):
     return [
@@ -31,48 +30,31 @@ def formats(m):
         states = configured(m),
     )]
 
-def unscaled(w, name):
-    """Refuses to read `name`'s e4m3 codes as `w`'s dtype: without their
-    scales the codes are not the weight."""
-    if stored(name) == raw(dtype.e4m3):
-        fail("`{}`: `{}` is stored FP8 and this deployment reads it as {}; import the deployment that keeps the release's FP8".format(w.name, name, w.dtype))
-
-def proj(reads, w, names):
-    """`w` from its legs `names`: the release's FP8 kept, or read as stored."""
-    if fp8_proj(w):
-        fp8_read(reads, w, names)
-        return
-    for name in names:
-        unscaled(w, name)
-    if len(names) == 1:
-        reads.read(w, names[0])
-    else:
-        reads.read_concat(w, names)
+TRANSFORMERS = [
+    ("model.embed_tokens.weight", "embed"),
+    ("model.norm.weight", "final_norm"),
+    ("lm_head.weight", "head"),
+    ("model.layers.{l}.input_layernorm.weight", "layers.{l}.attn_norm"),
+    ([
+        "model.layers.{l}.self_attn.q_proj.weight",
+        "model.layers.{l}.self_attn.k_proj.weight",
+        "model.layers.{l}.self_attn.v_proj.weight",
+    ], "layers.{l}.qkv"),
+    ("model.layers.{l}.self_attn.o_proj.weight", "layers.{l}.o"),
+    ("model.layers.{l}.self_attn.q_norm.weight", "layers.{l}.q_norm"),
+    ("model.layers.{l}.self_attn.k_norm.weight", "layers.{l}.k_norm"),
+    ("model.layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
+    ("model.layers.{l}.block_sparse_moe.gate.weight", "layers.{l}.router"),
+    ("model.layers.{l}.block_sparse_moe.e_score_correction_bias", "layers.{l}.bias"),
+    ([
+        "model.layers.{l}.block_sparse_moe.experts.{e}.w1.weight",
+        "model.layers.{l}.block_sparse_moe.experts.{e}.w3.weight",
+    ], "layers.{l}.gate_up"),
+    ("model.layers.{l}.block_sparse_moe.experts.{e}.w2.weight", "layers.{l}.down"),
+]
 
 def read(m, reads):
-    reads.read(m.embed, "model.embed_tokens.weight")
-    reads.read(m.final_norm, "model.norm.weight")
-    reads.read(m.head, "lm_head.weight")
-    for l, w in enumerate(m.layers):
-        n = lambda s: "model.layers.{}.{}".format(l, s)
-        a = lambda s: n("self_attn.{}".format(s))
-        reads.read(w.attn_norm, n("input_layernorm.weight"))
-        proj(reads, w.qkv, [a("q_proj.weight"), a("k_proj.weight"), a("v_proj.weight")])
-        proj(reads, w.o, [a("o_proj.weight")])
-        reads.read(w.q_norm, a("q_norm.weight"))
-        reads.read(w.k_norm, a("k_norm.weight"))
-        reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
-        reads.read(w.router, n("block_sparse_moe.gate.weight"))
-        reads.read(w.bias, n("block_sparse_moe.e_score_correction_bias"))
-        stem = lambda e, leg: n("block_sparse_moe.experts.{}.{}".format(e, leg))
-        gate_up = [[stem(e, "w1"), stem(e, "w3")] for e in range(m.experts)]
-        down = [[stem(e, "w2")] for e in range(m.experts)]
-        weights = lambda legs: [[leg + ".weight" for leg in expert] for expert in legs]
-        if w.gate_up.dtype in [dtype.nvfp4, dtype.nvfp4a4]:
-            nvfp4_bank(reads, w.gate_up, gate_up)
-            nvfp4_bank(reads, w.down, down)
-        elif released_fp8(w.gate_up):
-            fp8_bank(reads, w.gate_up, weights(gate_up))
-            fp8_bank(reads, w.down, weights(down))
-        else:
+    for w in m.layers:
+        if not kept(w.gate_up):
             fail("`{}`: MiniMax-M2 is released FP8 and exported NVFP4; this deployment reads its experts as {}".format(w.gate_up.name, w.gate_up.dtype))
+    mapped(reads, m, TRANSFORMERS)

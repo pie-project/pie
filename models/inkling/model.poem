@@ -59,10 +59,8 @@ LOCAL = 0
 GLOBAL = 1
 
 def layout(id, deploy):
-    if len(deploy.weights) != 1:
-        fail("{} stores its weights at one dtype, not {}".format(id, deploy.weights))
     d = DIMS[id]
-    w = deploy.weights[0]
+    w = roles(deploy, "w", exact = True).w
     dense = compute(w)
     hidden = d.hidden
     hd = d.head_dim
@@ -71,22 +69,21 @@ def layout(id, deploy):
     kw = d.conv_width
 
     def layer(l):
-        n = lambda s: "layer.{}.{}".format(l, s)
-        vec = lambda s, length: weight(n(s), [length], dense)
+        vec = lambda s, length: weight([length])
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         if (l + 1) % d.global_every == 0:
             reading, kv_heads, extent = GLOBAL, d.global_kv_heads, d.global_extent
         else:
             reading, kv_heads, extent = LOCAL, d.local_kv_heads, d.window
         kv_w = kv_heads * hd
-        conv = lambda s, channels: weight(n(s), [channels, kw], dense).columns()
+        conv = lambda s, channels: weight([channels, kw]).columns()
         if l < d.dense_layers:
             iw = d.dense_inter
             mlp = struct(
                 routed = False,
-                gate_up = weight(n("gate_up"), [2 * iw, hidden], w).packed([iw, iw]),
+                gate_up = weight([2 * iw, hidden], w).packed([iw, iw]),
                 inter = iw,
-                down = weight(n("down"), [hidden, iw], w).rows(),
+                down = weight([hidden, iw], w).rows(),
                 scale = vec("mlp_scale", 1),
             )
         else:
@@ -94,11 +91,11 @@ def layout(id, deploy):
             mi = d.moe_inter
             mlp = struct(
                 routed = True,
-                router = weight(n("router"), [bank, hidden], w),
-                bias = weight(n("router_bias"), [d.experts], dtype.f32),
-                scale = weight(n("router_scale"), [1], dtype.f32),
-                gate_up = weight(n("experts_gate_up"), [bank, 2 * mi, hidden], w).bank([mi, mi]),
-                down = weight(n("experts_down"), [bank, hidden, mi], w).rows(),
+                router = weight([bank, hidden], w),
+                bias = weight([d.experts], dtype.f32),
+                scale = weight([1], dtype.f32),
+                gate_up = weight([bank, 2 * mi, hidden], w).bank([mi, mi]),
+                down = weight([bank, hidden, mi], w).rows(),
                 experts = d.experts,
                 top_k = d.top_k,
                 sink = d.sink,
@@ -110,18 +107,18 @@ def layout(id, deploy):
             kv_heads = kv_heads,
             extent = extent,
             attn_norm = vec("attn_norm", hidden),
-            q_proj = weight(n("q_proj"), [q_w, hidden], w).columns(),
-            k_proj = weight(n("k_proj"), [kv_w, hidden], w).columns(heads = kv_heads),
-            v_proj = weight(n("v_proj"), [kv_w, hidden], w).columns(heads = kv_heads),
-            r_proj = weight(n("r_proj"), [r_w, hidden], w).columns(),
-            o_proj = weight(n("o_proj"), [hidden, q_w], w).rows(),
+            q_proj = weight([q_w, hidden], w).columns(),
+            k_proj = weight([kv_w, hidden], w).columns(heads = kv_heads),
+            v_proj = weight([kv_w, hidden], w).columns(heads = kv_heads),
+            r_proj = weight([r_w, hidden], w).columns(),
+            o_proj = weight([hidden, q_w], w).rows(),
             q_norm = vec("q_norm", hd),
             k_norm = vec("k_norm", hd),
-            rel_proj = weight(n("rel_proj"), [d.d_rel, extent], dense),
+            rel_proj = weight([d.d_rel, extent]),
             k_conv = conv("k_conv", kv_w),
             v_conv = conv("v_conv", kv_w),
-            attn_conv = weight(n("attn_conv"), [hidden, kw], dense),
-            mlp_conv = weight(n("mlp_conv"), [hidden, kw], dense),
+            attn_conv = weight([hidden, kw]),
+            mlp_conv = weight([hidden, kw]),
             kv = "kv.{}".format(l),
             k_state = "conv.{}.k".format(l),
             v_state = "conv.{}.v".format(l),
@@ -147,9 +144,9 @@ def layout(id, deploy):
         head_scale = f32(1.0 / f32(d.mup)),
         log_scaling = (d.log_floor, d.log_alpha),
         kv = deploy.kv,
-        embed = weight("embed", [d.vocab, hidden], w),
-        embed_norm = weight("embed_norm", [hidden], dense),
+        embed = weight([d.vocab, hidden], w),
+        embed_norm = weight([hidden]),
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight("final_norm", [hidden], dense),
-        unembed = weight("unembed", [d.head_rows, hidden], w),
+        final_norm = weight([hidden]),
+        unembed = weight([d.head_rows, hidden], w),
     )

@@ -24,17 +24,17 @@ def mix(n, name, streams, hidden, dynamic = True):
     normed streams added to it."""
     width = 2 * streams + streams * streams
     return struct(
-        scale = weight(n(name + "_scale"), [3], dtype.f32),
-        base = weight(n(name + "_base"), [width], dtype.f32),
-        dynamic = weight(n(name + "_fn"), [width, streams * hidden], dtype.f32) if dynamic else None,
+        scale = weight([3], dtype.f32),
+        base = weight([width], dtype.f32),
+        dynamic = weight([width, streams * hidden], dtype.f32) if dynamic else None,
     )
 
 def head(prefix, streams, hidden):
     """The mix `prefix` that collapses the streams into one row."""
     return struct(
-        base = weight(prefix + ".base", [streams], dtype.f32),
-        dynamic = weight(prefix + ".fn", [streams, streams * hidden], dtype.f32),
-        scale = weight(prefix + ".scale", [1], dtype.f32),
+        base = weight([streams], dtype.f32),
+        dynamic = weight([streams, streams * hidden], dtype.f32),
+        scale = weight([1], dtype.f32),
     )
 
 DRAFT_EXPERTS = 256
@@ -81,15 +81,15 @@ def base(w, kv, d):
 
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
-        norm = lambda s, dim: weight(n(s), [dim], w)
+        norm = lambda s, dim: weight([dim], w)
         lora_a, lora_b = banks("layer.{}".format(l), hidden, compute(w))
         ratio = d.pool[l]
         if l < d.dense_layers:
             di = d.dense_inter
             mlp = struct(
                 kind = "dense",
-                gate_up = weight(n("gate_up"), [2 * di, hidden], w).packed([di, di]),
-                down = weight(n("down"), [hidden, di], w).rows(),
+                gate_up = weight([2 * di, hidden], w).packed([di, di]),
+                down = weight([hidden, di], w).rows(),
                 inter = di,
                 limit = d.swiglu_limit,
             )
@@ -97,10 +97,10 @@ def base(w, kv, d):
             mi = d.moe_inter
             mlp = struct(
                 kind = "routed",
-                router = weight(n("router"), [d.experts, hidden], w),
-                bias = weight(n("router_bias"), [d.experts], w),
-                gate_up = weight(n("experts_gate_up"), [d.experts, 2 * mi, hidden], w).bank([mi, mi]),
-                down = weight(n("experts_down"), [d.experts, hidden, mi], w).rows(),
+                router = weight([d.experts, hidden], w),
+                bias = weight([d.experts], w),
+                gate_up = weight([d.experts, 2 * mi, hidden], w).bank([mi, mi]),
+                down = weight([d.experts, hidden, mi], w).rows(),
                 experts = d.experts,
                 top_k = d.top_k,
                 inter = mi,
@@ -117,18 +117,18 @@ def base(w, kv, d):
                 theta = d.theta,
                 yarn = None,
                 sm_scale = f32(1.0 / f32(sqrt(d.head_dim))),
-                q_down = weight(n("q_down"), [d.q_lora, hidden], w),
+                q_down = weight([d.q_lora, hidden], w),
                 q_norm = norm("q_norm", d.q_lora),
                 q_norm_eps = d.norm_eps,
                 q_head_norm = True,
-                q_up = weight(n("q_up"), [q_w, d.q_lora], w).columns(),
-                kv_down = weight(n("kv_down"), [q_w, hidden], w).columns(),
-                kv_norm = weight(n("kv_norm"), [q_w], w).columns(),
+                q_up = weight([q_w, d.q_lora], w).columns(),
+                kv_down = weight([q_w, hidden], w).columns(),
+                kv_norm = weight([q_w], w).columns(),
                 kv_norm_eps = d.norm_eps,
-                o_down = weight(n("o_down"), [d.o_lora, q_w], w).rows(),
-                o_up = weight(n("o_up"), [hidden, d.o_lora], w),
+                o_down = weight([d.o_lora, q_w], w).rows(),
+                o_up = weight([hidden, d.o_lora], w),
                 o_groups = 1,
-                sink = weight(n("attn_sink"), [d.heads], w).columns(),
+                sink = weight([d.heads], w).columns(),
                 kv = "kv.{}".format(l),
                 pool = struct(ratio = ratio, entries = "pool.{}".format(l), compressor = None, owner = True)
                     if ratio != None else None,
@@ -151,11 +151,11 @@ def base(w, kv, d):
         window = d.window,
         kv = kv,
         hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn),
-        embed = weight("embed", [d.vocab, hidden], w),
+        embed = weight([d.vocab, hidden], w),
         head = None,
         hc_head = None,
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight("final_norm", [hidden], w),
+        final_norm = weight([hidden], w),
         final_norm_eps = d.norm_eps,
         mtp = None,
         token_map = None,
@@ -215,22 +215,22 @@ def moe_flash(n, d, experts, gate, banks, weights, dense, top_k = None):
     si = d.shared_inter
     hidden = d.hidden
     if banks.split:
-        half = lambda what, dt: weight(n(what), [experts, mi, hidden], dt).bank([mi])
+        half = lambda what, dt: weight([experts, mi, hidden], dt).bank([mi])
         gate_up = struct(fused = None, gate = half("experts_gate", banks.gate), up = half("experts_up", banks.up))
     else:
         gate_up = struct(
-            fused = weight(n("experts_gate_up"), [experts, 2 * mi, hidden], banks.gate).bank([mi, mi]),
+            fused = weight([experts, 2 * mi, hidden], banks.gate).bank([mi, mi]),
             gate = None,
             up = None,
         )
     return struct(
         kind = "moe_flash",
-        router = weight(n("gate"), [experts, hidden], dense),
+        router = weight([experts, hidden]),
         gate = gate,
         gate_up = gate_up,
-        down = weight(n("experts_down"), [experts, hidden, mi], banks.down).rows(),
-        shared_gate_up = weight(n("shared_gate_up"), [2 * si, hidden], weights).packed([si, si]),
-        shared_down = weight(n("shared_down"), [hidden, si], weights).rows(),
+        down = weight([experts, hidden, mi], banks.down).rows(),
+        shared_gate_up = weight([2 * si, hidden], weights).packed([si, si]),
+        shared_down = weight([hidden, si], weights).rows(),
         experts = experts,
         top_k = top_k if top_k != None else d.top_k,
         inter = mi,
@@ -254,10 +254,10 @@ def flash(w, r, kv, d, quant = None):
 
     def compressor(prefix, ratio, entries, norm_w):
         return struct(
-            wkv = weight(prefix + ".wkv", [entries, hidden], w),
-            wgate = weight(prefix + ".wgate", [entries, hidden], w),
-            ape = weight(prefix + ".ape", [ratio, entries], dtype.f32),
-            norm = weight(prefix + ".norm", [norm_w], dense),
+            wkv = weight([entries, hidden], w),
+            wgate = weight([entries, hidden], w),
+            ape = weight([ratio, entries], dtype.f32),
+            norm = weight([norm_w]),
             norm_eps = d.norm_eps,
         )
 
@@ -265,7 +265,7 @@ def flash(w, r, kv, d, quant = None):
         """The layer named `prefix`, its caches named by `key`."""
         n = lambda s: "{}.{}".format(prefix, s)
         q = lin if lin != None else weights
-        norm = lambda s, dim: weight(n(s), [dim], sdense)
+        norm = lambda s, dim: weight([dim], sdense)
         lora_a, lora_b = banks(prefix, hidden, sdense)
         has_indexer = ratio == 4
         pool = None
@@ -287,8 +287,8 @@ def flash(w, r, kv, d, quant = None):
                 theta = d.compress_theta,
                 yarn = YARN,
                 window = d.index_window,
-                wq_b = weight(n("indexer.wq_b"), [idx_w, d.q_lora], q),
-                weights_proj = weight(n("indexer.weights_proj"), [d.index_heads, hidden], weights),
+                wq_b = weight([idx_w, d.q_lora], q),
+                weights_proj = weight([d.index_heads, hidden], weights),
                 compressor = compressor(n("indexer.compressor"), ratio, 2 * d.index_head_dim, d.index_head_dim),
                 wk = None,
                 k_norm = None,
@@ -296,9 +296,9 @@ def flash(w, r, kv, d, quant = None):
                 owns_keys = True,
             )
         if hash:
-            gate = struct(kind = "hash", tid2eid = weight(n("gate.tid2eid"), [d.vocab, d.top_k], dtype.i64))
+            gate = struct(kind = "hash", tid2eid = weight([d.vocab, d.top_k], dtype.i64))
         else:
-            gate = struct(kind = "bias", bias = weight(n("gate.bias"), [experts], dtype.f32))
+            gate = struct(kind = "bias", bias = weight([experts], dtype.f32))
         return struct(
             attn_mix = mix(n, "attn_mix", streams, hidden),
             attn_norm = norm("attn_norm", hidden),
@@ -308,18 +308,18 @@ def flash(w, r, kv, d, quant = None):
                 theta = d.compress_theta if ratio != None else d.theta,
                 yarn = YARN if ratio != None else None,
                 sm_scale = f32(1.0 / f32(sqrt(d.head_dim))),
-                q_down = weight(n("q_down"), [d.q_lora, hidden], q),
+                q_down = weight([d.q_lora, hidden], q),
                 q_norm = norm("q_norm", d.q_lora),
                 q_norm_eps = d.norm_eps,
                 q_head_norm = True,
-                q_up = weight(n("q_up"), [q_w, d.q_lora], q).columns(),
-                kv_down = weight(n("kv_down"), [kv_latent, hidden], q),
+                q_up = weight([q_w, d.q_lora], q).columns(),
+                kv_down = weight([kv_latent, hidden], q),
                 kv_norm = norm("kv_norm", kv_latent),
                 kv_norm_eps = d.norm_eps,
-                o_down = weight(n("o_down"), [o_out, q_w // d.o_groups], weights).columns(),
-                o_up = weight(n("o_up"), [hidden, o_out], q).rows(),
+                o_down = weight([o_out, q_w // d.o_groups], weights).columns(),
+                o_up = weight([hidden, o_out], q).rows(),
                 o_groups = d.o_groups,
-                sink = weight(n("attn_sink"), [d.heads], sdense).columns(),
+                sink = weight([d.heads], sdense).columns(),
                 kv = "kv." + key,
                 pool = pool,
                 indexer = indexer,
@@ -351,10 +351,10 @@ def flash(w, r, kv, d, quant = None):
     if d.draft:
         bf = dtype.bf16
         mtp = struct(
-            enorm = weight("mtp.enorm", [hidden], bf),
-            hnorm = weight("mtp.hnorm", [hidden], bf),
-            e_proj = weight("mtp.e_proj", [hidden, hidden], bf),
-            h_proj = weight("mtp.h_proj", [streams * hidden, hidden], bf),
+            enorm = weight([hidden], bf),
+            hnorm = weight([hidden], bf),
+            e_proj = weight([hidden, hidden], bf),
+            h_proj = weight([streams * hidden, hidden], bf),
             block = layer_at(
                 "mtp.decoder",
                 key = "mtp",
@@ -366,7 +366,7 @@ def flash(w, r, kv, d, quant = None):
                 sdense = bf,
             ),
             hc_head = head("mtp.hc_head", streams, hidden),
-            norm = weight("mtp.norm", [hidden], bf),
+            norm = weight([hidden], bf),
             norm_eps = d.norm_eps,
         )
     return struct(
@@ -377,11 +377,11 @@ def flash(w, r, kv, d, quant = None):
         window = d.window,
         kv = kv,
         hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn),
-        embed = weight("embed", [d.vocab, hidden], w),
-        head = weight("lm_head", [d.vocab, hidden], w),
+        embed = weight([d.vocab, hidden], w),
+        head = weight([d.vocab, hidden], w),
         hc_head = head("hc_head", streams, hidden),
         layers = layers,
-        final_norm = weight("final_norm", [hidden], dense),
+        final_norm = weight([hidden]),
         final_norm_eps = d.norm_eps,
         mtp = mtp,
         token_map = None,
@@ -507,7 +507,7 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
     def layer(l):
         prefix = "layer.{}".format(l)
         n = lambda s: "{}.{}".format(prefix, s)
-        norm = lambda s, dim: weight(n(s), [dim], dense)
+        norm = lambda s, dim: weight([dim])
         lora_a, lora_b = banks(prefix, hidden, dense)
         ratio = plan.ratios[l]
         csa = csa_of(plan, l)
@@ -524,8 +524,8 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
                 ratio = ratio,
                 entries = "pool.{}".format(kv_of),
                 compressor = struct(
-                    wkv = weight(n("compressor.wkv"), [kv_latent, hidden], dense),
-                    wgate = weight(n("compressor.wgate"), [kv_latent, hidden], dense) if ratio > 1 else None,
+                    wkv = weight([kv_latent, hidden]),
+                    wgate = weight([kv_latent, hidden]) if ratio > 1 else None,
                     ape = None,
                     norm = norm("compressor.norm", kv_latent),
                     norm_eps = d.norm_eps,
@@ -542,10 +542,10 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
                 theta = d.compress_theta,
                 yarn = YARN,
                 window = d.window,
-                wq_b = weight(n("indexer.wq_b"), [idx_w, d.q_lora], q),
-                weights_proj = weight(n("indexer.weights_proj"), [d.index_heads, hidden], dense),
+                wq_b = weight([idx_w, d.q_lora], q),
+                weights_proj = weight([d.index_heads, hidden]),
                 compressor = None,
-                wk = weight(n("indexer.wk"), [d.index_head_dim, kv_latent], dense) if owner else None,
+                wk = weight([d.index_head_dim, kv_latent]) if owner else None,
                 k_norm = norm("indexer.k_norm", d.index_head_dim) if owner else None,
                 keys = "index.{}".format(kv_of if kv_of != None else l),
                 owns_keys = owner,
@@ -564,11 +564,11 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
             engram = struct(
                 # The release's table as it ships (MXFP8) where the release's
                 # precision is served, widened only at the rows a token reads.
-                table = weight(n("engram.embed"), [rows, e.head_dim], dtype.mxfp8 if quant != None else dense),
-                wkv = weight(n("engram.wkv"), [(streams + 1) * hidden, cols * e.head_dim], q)
+                table = weight([rows, e.head_dim], dtype.mxfp8 if quant != None else dense),
+                wkv = weight([(streams + 1) * hidden, cols * e.head_dim], q)
                     .packed([streams * hidden, hidden]),
-                q_weight = weight(n("engram.q_weight"), [streams, hidden], dense),
-                k_weight = weight(n("engram.k_weight"), [streams, hidden], dense),
+                q_weight = weight([streams, hidden]),
+                k_weight = weight([streams, hidden]),
                 mults = mults,
                 primes = primes,
                 offsets = offsets,
@@ -590,7 +590,7 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
         `top_k` a row. With `window_sink`, a DSpark stage's: its rows read that
         many window positions ending at their lane's last."""
         n = lambda s: "{}.{}".format(prefix, s)
-        norm = lambda s, dim: weight(n(s), [dim], dense)
+        norm = lambda s, dim: weight([dim])
         lora_a, lora_b = banks(prefix, hidden, dense)
         return struct(
             attn_mix = mix(n, "attn_mix", streams, hidden),
@@ -601,18 +601,18 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
                 theta = d.compress_theta if ratio > 0 else d.theta,
                 yarn = YARN if ratio > 0 else None,
                 sm_scale = f32(1.0 / f32(sqrt(d.head_dim))),
-                q_down = weight(n("q_down"), [d.q_lora, hidden], q),
+                q_down = weight([d.q_lora, hidden], q),
                 q_norm = norm("q_norm", d.q_lora),
                 q_norm_eps = d.norm_eps,
                 q_head_norm = False,
-                q_up = weight(n("q_up"), [q_w, d.q_lora], q).columns(),
-                kv_down = weight(n("kv_down"), [kv_latent, hidden], q),
+                q_up = weight([q_w, d.q_lora], q).columns(),
+                kv_down = weight([kv_latent, hidden], q),
                 kv_norm = norm("kv_norm", kv_latent),
                 kv_norm_eps = d.norm_eps,
-                o_down = weight(n("o_down"), [o_out, o_in], w),
-                o_up = weight(n("o_up"), [hidden, o_out], q).rows(),
+                o_down = weight([o_out, o_in], w),
+                o_up = weight([hidden, o_out], q).rows(),
                 o_groups = d.o_groups,
-                sink = weight(n("attn_sink"), [d.heads], dense).columns(),
+                sink = weight([d.heads]).columns(),
                 kv = kv_name,
                 pool = pool,
                 indexer = indexer,
@@ -624,7 +624,7 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
                 n,
                 d,
                 experts,
-                gate = struct(kind = "bias", bias = weight(n("gate.bias"), [experts], dtype.f32)),
+                gate = struct(kind = "bias", bias = weight([experts], dtype.f32)),
                 banks = banks_at(r, l),
                 weights = q,
                 dense = dense,
@@ -650,12 +650,12 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
             block = ds.block,
             noise = ds.noise,
             targets = targets,
-            main_proj = weight("dspark.main_proj", [hidden, hidden * len(targets)], q),
-            main_norm = weight("dspark.main_norm", [hidden], dense),
+            main_proj = weight([hidden, hidden * len(targets)], q),
+            main_norm = weight([hidden]),
             stages = stages,
-            norm = weight("dspark.norm", [hidden], dense),
-            markov_embed = weight("dspark.markov_embed", [d.vocab, ds.rank], dense),
-            markov_head = weight("dspark.markov_head", [d.vocab, ds.rank], dense),
+            norm = weight([hidden]),
+            markov_embed = weight([d.vocab, ds.rank]),
+            markov_head = weight([d.vocab, ds.rank]),
         )
 
     return struct(
@@ -666,14 +666,14 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
         window = d.window,
         kv = kv,
         hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn, single_pass = True),
-        embed = weight("embed", [d.vocab, hidden], dense),
-        head = weight("lm_head", [d.vocab, hidden], dense),
+        embed = weight([d.vocab, hidden]),
+        head = weight([d.vocab, hidden]),
         hc_head = None,
         layers = [layer(l) for l in range(plan.layers)],
-        final_norm = weight("final_norm", [hidden], dense),
+        final_norm = weight([hidden]),
         final_norm_eps = d.norm_eps,
         mtp = None,
-        token_map = weight("engram.token_map", [d.vocab], dtype.i64) if plan.engram_layers else None,
+        token_map = weight([d.vocab], dtype.i64) if plan.engram_layers else None,
         decoder = plan.decoder,
         dspark = draft_head() if dspark else None,
     )

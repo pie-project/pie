@@ -34,7 +34,7 @@ fn the_muse_spark_rows_bake() {
             trace
                 .params
                 .iter()
-                .find(|p| p.name == format!("layer.{l}.experts_down"))
+                .find(|p| p.name == format!("layers.{l}.down"))
                 .unwrap_or_else(|| panic!("`{}` has layer {l}'s down bank", row.name))
                 .dtype
         };

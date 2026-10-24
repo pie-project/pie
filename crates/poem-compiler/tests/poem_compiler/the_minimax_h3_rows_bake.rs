@@ -354,7 +354,7 @@ fn the_modality_gather_is_three_weight_blocks_and_one_column_slice() {
         let plan = trace(deployment, Platform::Cuda);
         for i in 0..d.blocks {
             for which in 0..model::MODALITIES {
-                let name = format!("dit.block.{i}.adaln.{which}");
+                let name = format!("dit.blocks.{i}.adaln.{which}.w");
                 let bank = plan
                     .params
                     .iter()
@@ -419,7 +419,7 @@ fn the_sharded_worlds_trace_and_bake() {
         poem_compiler::compile(&plan, &budget(), &poem_compiler::DeviceProfile::default())
             .unwrap_or_else(|why| panic!("`{deployment}` does not bake: {why}"));
         for which in 0..model::MODALITIES {
-            let name = format!("dit.block.0.adaln.{which}");
+            let name = format!("dit.blocks.0.adaln.{which}.w");
             let bank = plan
                 .params
                 .iter()

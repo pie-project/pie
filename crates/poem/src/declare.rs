@@ -17,6 +17,10 @@ pub struct Weight {
     /// Where the weight's leading plane (its codes) may be served from; its
     /// companions (a scale) stay on the device.
     pub placement: ParamPlacement,
+    /// The values, row-major, the layout states this weight holds: the
+    /// importer lands them, whatever the checkpoint holds, and no format
+    /// reads it.
+    pub values: Option<Vec<f32>>,
 }
 
 impl Weight {
@@ -35,6 +39,7 @@ impl Weight {
             source: ParamSource::Checkpoint,
             layout: ParamLayout::Natural,
             placement: ParamPlacement::Device,
+            values: None,
         }
     }
 
@@ -569,6 +574,7 @@ impl Weight {
             source: p.source,
             layout: p.layout,
             placement: p.placement,
+            values: None,
         }
     }
 }

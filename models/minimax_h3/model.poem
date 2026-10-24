@@ -2,17 +2,16 @@
 # embedder, caption refiner, blocks (each with an adaLN projection per
 # modality) and output heads; and the text encoder the full model carries.
 
-def linear(name, out, in_, banks, bias = True):
+def linear(out, in_, banks, bias = True):
     """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
     return struct(
-        w = weight(name, [out, in_], banks),
-        bias = weight(name + ".bias", [out], compute(banks)) if bias else None,
+        w = weight([out, in_], banks),
+        bias = weight([out]) if bias else None,
     )
 
 def encoder(c, layers, banks, sharded = False):
     """The encoder of config `c` through its first `layers` layers; with
     `sharded`, its attention and mlp split across ranks."""
-    dense = compute(banks)
     hidden, hd, inter = c.hidden, c.head_dim, c.inter
 
     def columns(w, heads = None):
@@ -26,16 +25,16 @@ def encoder(c, layers, banks, sharded = False):
     def layer(l):
         n = lambda s: "te.layer.{}.{}".format(l, s)
         return struct(
-            attn_norm = weight(n("attn_norm"), [hidden], dense),
-            q = columns(weight(n("q"), [c.q_heads * hd, hidden], banks)),
-            k = columns(weight(n("k"), [c.kv_heads * hd, hidden], banks), c.kv_heads),
-            v = columns(weight(n("v"), [c.kv_heads * hd, hidden], banks), c.kv_heads),
-            o = rows(weight(n("o"), [hidden, c.q_heads * hd], banks)),
-            q_norm = weight(n("q_norm"), [hd], dense),
-            k_norm = weight(n("k_norm"), [hd], dense),
-            mlp_norm = weight(n("mlp_norm"), [hidden], dense),
-            gate_up = weight(n("gate_up"), [2 * inter, hidden], banks).packed([inter, inter]),
-            down = rows(weight(n("down"), [hidden, inter], banks)),
+            attn_norm = weight([hidden]),
+            q = columns(weight([c.q_heads * hd, hidden], banks)),
+            k = columns(weight([c.kv_heads * hd, hidden], banks), c.kv_heads),
+            v = columns(weight([c.kv_heads * hd, hidden], banks), c.kv_heads),
+            o = rows(weight([hidden, c.q_heads * hd], banks)),
+            q_norm = weight([hd]),
+            k_norm = weight([hd]),
+            mlp_norm = weight([hidden]),
+            gate_up = weight([2 * inter, hidden], banks).packed([inter, inter]),
+            down = rows(weight([hidden, inter], banks)),
             kv = "te.kv.{}".format(l),
         )
 
@@ -49,7 +48,7 @@ def encoder(c, layers, banks, sharded = False):
         theta = c.theta,
         eps = c.eps,
         sm_scale = f32(1.0 / f32(sqrt(hd))),
-        embed = weight("te.embed", [c.vocab, hidden], banks),
+        embed = weight([c.vocab, hidden], banks),
         layers = [layer(l) for l in range(layers)],
     )
 
@@ -112,46 +111,41 @@ DIMS = {
     ),
 }
 
-def attn(prefix, d, banks):
-    dense = compute(banks)
+def attn(d, banks):
     inner = d.heads * d.head_dim
     return struct(
-        qkv = weight(prefix + ".qkv", [3 * inner, d.dim], banks).packed([inner, inner, inner]),
-        q_norm = weight(prefix + ".q_norm", [d.head_dim], dense),
-        k_norm = weight(prefix + ".k_norm", [d.head_dim], dense),
-        out = weight(prefix + ".out", [d.dim, inner], banks),
+        qkv = weight([3 * inner, d.dim], banks).packed([inner, inner, inner]),
+        q_norm = weight([d.head_dim]),
+        k_norm = weight([d.head_dim]),
+        out = weight([d.dim, inner], banks),
     )
 
 def mlp(prefix, d, banks):
     return struct(
-        fc1 = weight(prefix + ".fc1", [2 * d.inter, d.dim], banks).packed([d.inter, d.inter]),
-        fc2 = weight(prefix + ".fc2", [d.dim, d.inter], banks),
+        fc1 = weight([2 * d.inter, d.dim], banks).packed([d.inter, d.inter]),
+        fc2 = weight([d.dim, d.inter], banks),
     )
 
 def block(prefix, d, banks, modulated):
     """A refiner block, or (`modulated`) a denoiser block with an adaLN
     projection per modality."""
-    dense = compute(banks)
     return struct(
-        norm1 = weight(prefix + ".norm1", [d.dim], dense),
-        norm2 = weight(prefix + ".norm2", [d.dim], dense),
-        attn = attn(prefix + ".attn", d, banks),
+        norm1 = weight([d.dim]),
+        norm2 = weight([d.dim]),
+        attn = attn(d, banks),
         mlp = mlp(prefix + ".mlp", d, banks),
         adaln = [
-            linear("{}.adaln.{}".format(prefix, m), ADALN_SLICES * d.dim, d.t_dim, banks)
+            linear(ADALN_SLICES * d.dim, d.t_dim, banks)
             for m in range(MODALITIES)
         ] if modulated else None,
     )
 
 def layout(id, deploy):
-    if len(deploy.weights) != 1:
-        fail("{} stores its weights at one dtype, not {}".format(id, deploy.weights))
-    banks = deploy.weights[0]
+    banks = roles(deploy, "banks", exact = True).banks
     d = DIMS[id]
     rotary = 6 * d.rope_freqs
     if rotary % 2 != 0 or rotary > d.head_dim:
         fail("the three rotary axes cover {} of a {}-wide head".format(rotary, d.head_dim))
-    dense = compute(banks)
     dim = d.dim
     return struct(
         kv = dtype.bf16,
@@ -164,18 +158,18 @@ def layout(id, deploy):
         video_features = VIDEO_FEATURES,
         audio_channels = AUDIO_CHANNELS,
         dit = struct(
-            video_patch = linear("dit.video_patch", dim, VIDEO_FEATURES, banks),
-            audio_patch = linear("dit.audio_patch", dim, AUDIO_CHANNELS, banks),
-            condition = linear("dit.condition", dim, d.text_dim, banks),
-            t_in = linear("dit.t_in", d.t_hidden, d.t_freq, banks),
-            t_out = linear("dit.t_out", d.t_dim, d.t_hidden, banks),
+            video_patch = linear(dim, VIDEO_FEATURES, banks),
+            audio_patch = linear(dim, AUDIO_CHANNELS, banks),
+            condition = linear(dim, d.text_dim, banks),
+            t_in = linear(d.t_hidden, d.t_freq, banks),
+            t_out = linear(d.t_dim, d.t_hidden, banks),
             refine = [block("dit.refine.{}".format(i), d, banks, False) for i in range(d.refiners)],
-            refine_norm = weight("dit.refine_norm", [dim], dense),
+            refine_norm = weight([dim]),
             blocks = [block("dit.block.{}".format(i), d, banks, True) for i in range(d.blocks)],
-            final_norm = weight("dit.final_norm", [dim], dense),
-            final_adaln = linear("dit.final_adaln", FINAL_SLICES * dim, d.t_dim, banks),
-            video_out = linear("dit.video_out", VIDEO_FEATURES, dim, banks),
-            audio_out = linear("dit.audio_out", AUDIO_CHANNELS, dim, banks),
+            final_norm = weight([dim]),
+            final_adaln = linear(FINAL_SLICES * dim, d.t_dim, banks),
+            video_out = linear(VIDEO_FEATURES, dim, banks),
+            audio_out = linear(AUDIO_CHANNELS, dim, banks),
         ),
         te = encoder(TE, TE_LAYERS, banks, sharded = True) if id == "minimax-h3-fl2va" else None,
     )

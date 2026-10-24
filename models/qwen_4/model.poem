@@ -7,26 +7,25 @@
 load("//lib/media.poem", "smart_resize")
 load("//lib/rope.poem", "yarn")
 
-def gated_attn(n, d, w, kv):
+def gated_attn(d, w, kv):
     """Gated attention over `d`'s heads, its projections at `w`, caching in `kv`."""
-    dense = compute(w)
     hd = d.head_dim
     return struct(
         rotary_dim = d.rotary_dim,
         theta = d.theta,
         sm_scale = f32(1.0 / f32(sqrt(hd))),
-        qg_proj = weight(n("qg_proj"), [2 * d.q_heads * hd, d.hidden], w).columns(),
-        k_proj = weight(n("k_proj"), [d.kv_heads * hd, d.hidden], w).columns(heads = d.kv_heads),
-        v_proj = weight(n("v_proj"), [d.kv_heads * hd, d.hidden], w).columns(heads = d.kv_heads),
-        o_proj = weight(n("o_proj"), [d.hidden, d.q_heads * hd], w).rows(),
-        q_norm = weight(n("q_norm"), [hd], dense),
+        qg_proj = weight([2 * d.q_heads * hd, d.hidden], w).columns(),
+        k_proj = weight([d.kv_heads * hd, d.hidden], w).columns(heads = d.kv_heads),
+        v_proj = weight([d.kv_heads * hd, d.hidden], w).columns(heads = d.kv_heads),
+        o_proj = weight([d.hidden, d.q_heads * hd], w).rows(),
+        q_norm = weight([hd]),
         q_norm_eps = d.norm_eps,
-        k_norm = weight(n("k_norm"), [hd], dense),
+        k_norm = weight([hd]),
         k_norm_eps = d.norm_eps,
         kv = kv,
     )
 
-def gdn(n, d, proj, ba, dense, conv_state, delta_state):
+def gdn(d, proj, ba, dense, conv_state, delta_state):
     """A GDN mixer: its projections at `proj`, beta/alpha's at `ba`, its
     convolution and gate parameters at `dense`."""
     k_w = d.k_heads * d.k_dim
@@ -39,14 +38,14 @@ def gdn(n, d, proj, ba, dense, conv_state, delta_state):
         v_dim = d.v_dim,
         qkv_width = qkv,
         conv_kernel = d.conv_kernel,
-        in_qkvz = weight(n("in_qkvz"), [qkv + v_w, d.hidden], proj).packed([k_w, k_w, v_w, v_w]),
-        in_ba = weight(n("in_ba"), [2 * d.v_heads, d.hidden], ba).packed([d.v_heads, d.v_heads]),
-        conv = weight(n("conv"), [qkv, d.conv_kernel], dense).packed([k_w, k_w, v_w]),
-        dt_bias = weight(n("dt_bias"), [d.v_heads], dense).columns(),
-        a_log = weight(n("a_log"), [d.v_heads], dtype.f32).columns(),
-        norm = weight(n("gdn_norm"), [d.v_dim], dtype.f32),
+        in_qkvz = weight([qkv + v_w, d.hidden], proj).packed([k_w, k_w, v_w, v_w]),
+        in_ba = weight([2 * d.v_heads, d.hidden], ba).packed([d.v_heads, d.v_heads]),
+        conv = weight([qkv, d.conv_kernel]).packed([k_w, k_w, v_w]),
+        dt_bias = weight([d.v_heads]).columns(),
+        a_log = weight([d.v_heads], dtype.f32).columns(),
+        norm = weight([d.v_dim], dtype.f32),
         norm_eps = d.norm_eps,
-        out_proj = weight(n("out_proj"), [d.hidden, v_w], proj).rows(),
+        out_proj = weight([d.hidden, v_w], proj).rows(),
         conv_state = conv_state,
         delta_state = delta_state,
     )
@@ -56,12 +55,12 @@ def routed(n, hidden, m, experts, proj, gate):
     `gate`, beside a shared expert at `proj` whose gate is at `gate`."""
     return struct(
         routed = True,
-        router = weight(n("router"), [m.experts, hidden], gate),
-        gate_up = weight(n("experts_gate_up"), [m.experts, 2 * m.inter, hidden], experts).bank([m.inter, m.inter]),
-        down = weight(n("experts_down"), [m.experts, hidden, m.inter], experts).rows(),
-        shared_gate_up = weight(n("shared_gate_up"), [2 * m.shared_inter, hidden], proj).packed([m.shared_inter, m.shared_inter]),
-        shared_down = weight(n("shared_down"), [hidden, m.shared_inter], proj).rows(),
-        shared_gate = weight(n("shared_gate"), [1, hidden], gate),
+        router = weight([m.experts, hidden], gate),
+        gate_up = weight([m.experts, 2 * m.inter, hidden], experts).bank([m.inter, m.inter]),
+        down = weight([m.experts, hidden, m.inter], experts).rows(),
+        shared_gate_up = weight([2 * m.shared_inter, hidden], proj).packed([m.shared_inter, m.shared_inter]),
+        shared_down = weight([hidden, m.shared_inter], proj).rows(),
+        shared_gate = weight([1, hidden], gate),
         experts = m.experts,
         top_k = m.top_k,
         inter = m.inter,
@@ -88,7 +87,6 @@ def media(id, deploy):
     return struct(image = struct(
         patch = PATCH, block = MERGE, mrope = True,
         prefix = "<|vision_start|>", placeholder = "<|image_pad|>", suffix = "<|vision_end|>",
-        frame = lambda h, w, budget: smart_resize(h, w, PATCH * MERGE, 65536, 16777216),
     ))
 
 def tower(size, out, dt):
@@ -97,8 +95,8 @@ def tower(size, out, dt):
     ti = size.inter
     merged = MERGE * MERGE * th
     head_dim = th // size.heads
-    plane = lambda s, dims: weight("visual." + s, dims, dt)
-    vec = lambda s, length: weight("visual." + s, [length], dt)
+    plane = lambda s, dims: weight(dims, dt)
+    vec = lambda s, length: weight([length], dt)
 
     def block(l):
         b = lambda s: "block.{}.{}".format(l, s)
@@ -358,10 +356,10 @@ def build(mix, kv, rope, d, hashes, draft, vision):
 
     def residual(prefix, inject):
         return struct(
-            norm = weight(prefix + ".norm", [sh], dense),
-            down = weight(prefix + ".down", [d.lowrank, sh], proj),
-            up = weight(prefix + ".up", [sh, d.lowrank], proj),
-            inject = weight(prefix + ".inject", [d.streams, sh], mix.inject) if inject else None,
+            norm = weight([sh]),
+            down = weight([d.lowrank, sh], proj),
+            up = weight([sh, d.lowrank], proj),
+            inject = weight([d.streams, sh], mix.inject) if inject else None,
             eps = d.norm_eps,
         )
 
@@ -384,9 +382,9 @@ def build(mix, kv, rope, d, hashes, draft, vision):
             ratio = ix.ratio,
             top_k = ix.budget // ix.ratio,
             norm_eps = d.norm_eps,
-            qk_proj = weight(n("index_qk_proj"), [q_w + ix.head_dim, hidden], proj).packed([q_w, ix.head_dim]),
-            q_norm = weight(n("index_q_norm"), [ix.head_dim], dense),
-            k_norm = weight(n("index_k_norm"), [ix.head_dim], dense),
+            qk_proj = weight([q_w + ix.head_dim, hidden], proj).packed([q_w, ix.head_dim]),
+            q_norm = weight([ix.head_dim]),
+            k_norm = weight([ix.head_dim]),
             keys = keys,
         )
 
@@ -394,8 +392,8 @@ def build(mix, kv, rope, d, hashes, draft, vision):
         n = lambda s: "layer.{}.{}".format(l, s)
         if l % d.attn_every == d.attn_every - 1:
             indexer = index(n, "index.{}".format(l))
-            return block(n, gated_attn(n, d, proj, "kv.{}".format(l)), indexer, None, mix.experts)
-        delta = gdn(n, d, proj, mix.gdn_ba, dense, "conv.{}".format(l), "delta.{}".format(l))
+            return block(n, gated_attn(d, proj, "kv.{}".format(l)), indexer, None, mix.experts)
+        delta = gdn(d, proj, mix.gdn_ba, dense, "conv.{}".format(l), "delta.{}".format(l))
         return block(n, None, None, delta, mix.experts)
 
     visual = tower(LARGE, hidden, dense) if vision else None
@@ -404,11 +402,11 @@ def build(mix, kv, rope, d, hashes, draft, vision):
     if draft:
         n = lambda s: "mtp.layer." + s
         mtp = struct(
-            norm_embed = weight("mtp.norm_embed", [hidden], dense),
-            norm_hidden = weight("mtp.norm_hidden", [sh], dense),
-            fc_embed = weight("mtp.fc_embed", [hidden, hidden], dense),
-            fc_hidden = weight("mtp.fc_hidden", [sh, hidden], dense),
-            block = block(n, gated_attn(n, d, proj, "kv.mtp"), None, None, proj),
+            norm_embed = weight([hidden]),
+            norm_hidden = weight([sh]),
+            fc_embed = weight([hidden, hidden]),
+            fc_hidden = weight([sh, hidden]),
+            block = block(n, gated_attn(d, proj, "kv.mtp"), None, None, proj),
             mixer = residual("mtp.mixer", False),
             eps = d.norm_eps,
             depth = DRAFT_DEPTH,
@@ -430,13 +428,13 @@ def build(mix, kv, rope, d, hashes, draft, vision):
         # Read only by the n-gram gather, a few rows a token: a card whose
         # profile says so serves it from pinned host memory.
         # one band a rank: the n-gram gather offsets an id by its rank's first row
-        table = weight("ple.table", [padded, hidden // heads], mix.table).packed([padded]).host(),
-        key_proj = weight("ple.key_proj", [sh, hidden], proj),
-        value_proj = weight("ple.value_proj", [hidden, hidden], proj),
-        norm_key = weight("ple.norm_key", [sh], dense),
-        norm_query = weight("ple.norm_query", [sh], dense),
-        norm_conv = weight("ple.norm_conv", [sh], dense),
-        conv = weight("ple.conv", [sh, p.conv_kernel], dense),
+        table = weight([padded, hidden // heads], mix.table).packed([padded]).host(),
+        key_proj = weight([sh, hidden], proj),
+        value_proj = weight([hidden, hidden], proj),
+        norm_key = weight([sh]),
+        norm_query = weight([sh]),
+        norm_conv = weight([sh]),
+        conv = weight([sh, p.conv_kernel]),
         conv_kernel = p.conv_kernel,
         dilation = p.ngram,
         eps = d.norm_eps,
@@ -453,8 +451,8 @@ def build(mix, kv, rope, d, hashes, draft, vision):
         streams = d.streams,
         kv = kv,
         rope = rope,
-        embed = weight("embed", [d.vocab, hidden], mix.embed),
-        head = weight("lm_head", [d.vocab, hidden], mix.head),
+        embed = weight([d.vocab, hidden], mix.embed),
+        head = weight([d.vocab, hidden], mix.head),
         layers = [layer(l) for l in range(d.layers)],
         mixer = residual("mixer", False),
         ple = ple,

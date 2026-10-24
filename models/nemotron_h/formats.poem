@@ -4,13 +4,9 @@
 # one scale, one shared expert's down projection NVFP4 (widened here), the
 # rest bf16. Ultra's release: every plane bf16, an expert a tensor.
 
-load("//lib/modelopt/formats.poem", "nvfp4_bank")
-
-load("//lib/blockfp8/formats.poem", "fp8_proj", "fp8_read")
+load("//pie/codec.poem", "weight", released = "bank")
 
 BF = raw(dtype.bf16)
-
-F32 = raw(dtype.f32)
 
 def formats(m):
     return [format(
@@ -25,36 +21,11 @@ def formats(m):
         ],
     )]
 
-def proj(reads, w, name):
-    """`w` from `name`: the export's FP8 kept, or bf16 as stored or widened
-    from the export's NVFP4."""
-    if fp8_proj(w):
-        fp8_read(reads, w, [name])
-    elif w.dtype in [dtype.nvfp4, dtype.nvfp4a4]:
-        reads.read(w, name)
-    elif stored(name) == BF:
-        reads.read(w, name)
-    else:
-        reads.push(tensor(w.name, nvfp4_widened(reads, name), BF))
-
-def nvfp4_widened(reads, name):
-    """The modelopt NVFP4 projection `name` as bf16: its e2m1 codes times
-    their e4m3 scale a 16 times the tensor's `weight_scale_2`."""
-    stem = name[:-len(".weight")]
-    rows, half = shape(name)[0], shape(name)[1]
-    cols = 2 * half
-    reads.extend([
-        tensor(name + ".scales", src(stem + ".weight_scale").cast(F32), F32, internal = True),
-        tensor(name + ".tensor", src(stem + ".weight_scale_2").transmute([1, 1], F32), F32, shape = [1, 1], internal = True),
-        tensor(name + ".blocked", src(name).transmute([rows, cols], encoding(dtype.nvfp4)).scale_by(out(name + ".scales")), BF, internal = True),
-    ])
-    return out(name + ".blocked").scale_by(out(name + ".tensor"))
-
 def bank(reads, w, stems):
     """A routed bank: NVFP4 legs as the export stores them, or bf16 planes
     stacked on the leading axis."""
     if w.dtype != dtype.bf16:
-        nvfp4_bank(reads, w, [[s] for s in stems])
+        released(reads, w, [[s + ".weight"] for s in stems])
         return
     dims = list(w.shape)
     # A bank cut across ranks reads its rank's share; a whole one, every row.
@@ -72,29 +43,29 @@ def read(m, reads):
         reads.read(w.norm, at("norm.weight"))
         if w.mamba != None:
             k = w.mamba
-            proj(reads, k.in_proj, mixer("in_proj.weight"))
+            weight(reads, k.in_proj, mixer("in_proj.weight"), quantized = "widen")
             reads.push(tensor(k.conv.name, src(mixer("conv1d.weight")).transmute([m.conv_dim, m.conv_kernel], BF), BF))
             reads.read(k.conv_bias, mixer("conv1d.bias"))
             reads.read(k.a_log, mixer("A_log"))
             reads.read(k.dt_bias, mixer("dt_bias"))
             reads.read(k.d, mixer("D"))
             reads.read(k.norm, mixer("norm.weight"))
-            proj(reads, k.out_proj, mixer("out_proj.weight"))
+            weight(reads, k.out_proj, mixer("out_proj.weight"), quantized = "widen")
         elif w.attn != None:
             a = w.attn
             reads.read(a.q, mixer("q_proj.weight"))
             reads.read(a.k, mixer("k_proj.weight"))
             reads.read(a.v, mixer("v_proj.weight"))
-            proj(reads, a.o, mixer("o_proj.weight"))
+            weight(reads, a.o, mixer("o_proj.weight"), quantized = "widen")
         else:
             f = w.moe
             reads.read(f.router, mixer("gate.weight"))
             reads.read(f.bias, mixer("gate.e_score_correction_bias"))
             if f.down_latent != None:
-                proj(reads, f.down_latent, mixer("fc1_latent_proj.weight"))
-                proj(reads, f.up_latent, mixer("fc2_latent_proj.weight"))
+                weight(reads, f.down_latent, mixer("fc1_latent_proj.weight"), quantized = "widen")
+                weight(reads, f.up_latent, mixer("fc2_latent_proj.weight"), quantized = "widen")
             expert = lambda e, leaf: mixer("experts.{}.{}".format(e, leaf))
             bank(reads, f.up, [expert(e, "up_proj") for e in range(m.experts)])
             bank(reads, f.down, [expert(e, "down_proj") for e in range(m.experts)])
-            proj(reads, f.shared_up, mixer("shared_experts.up_proj.weight"))
-            proj(reads, f.shared_down, mixer("shared_experts.down_proj.weight"))
+            weight(reads, f.shared_up, mixer("shared_experts.up_proj.weight"), quantized = "widen")
+            weight(reads, f.shared_down, mixer("shared_experts.down_proj.weight"), quantized = "widen")
