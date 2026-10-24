@@ -857,8 +857,8 @@ def forward(m, inputs):
 
     if m.self_cond != None:
         sc = m.self_cond
-        den, enc = y.on(fact.bidirectional()), y.on(~fact.bidirectional())
-        input_den = inputs.on(fact.bidirectional())
+        den, enc = y.on(fact.denoise()), y.on(~fact.denoise())
+        input_den = inputs.on(fact.denoise())
         soft = ops.gather.embed_weighted(
             input_den.self_cond_rows(sc.taps),
             input_den.self_cond_weights(sc.taps),

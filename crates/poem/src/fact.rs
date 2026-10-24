@@ -77,9 +77,10 @@ pub fn scores() -> Predicate {
     flag(Request::SCORES)
 }
 
+/// The rows of a denoise pass.
 #[must_use]
-pub fn bidirectional() -> Predicate {
-    flag(Request::BIDIRECTIONAL)
+pub fn denoise() -> Predicate {
+    flag(Request::DENOISE)
 }
 
 /// The rows of a prompt only a causal encoder-decoder's encoder reads.

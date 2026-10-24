@@ -16,12 +16,13 @@ use starlark::values::{Heap, NoSerialize, StarlarkValue, Value as Star};
 use starlark_derive::{starlark_module, starlark_value};
 
 use crate::star::forward::{CacheHandle, InputHandle, ValueHandle, held, hold, input_of};
-use crate::star::values::{DtypeValue, weight};
+use crate::star::values::{DtypeValue, predicate, weight};
 use crate::{ValueId, Weight};
 use spelled::*;
 
 /// The types an op's parameters are spelled in.
 pub(crate) mod spelled {
+    pub(crate) use crate::fact::Predicate;
     pub(crate) use crate::ops::conv::ConvShape;
     pub(crate) use crate::ops::elemwise::{RopeScaling, Yarn};
     pub(crate) use crate::{
@@ -89,6 +90,12 @@ impl<'v> Arg<'v> for Value {
 impl<'v> Arg<'v> for Weight {
     fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
         weight(given(v)?)
+    }
+}
+
+impl<'v> Arg<'v> for Predicate {
+    fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
+        predicate(given(v)?)
     }
 }
 

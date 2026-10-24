@@ -67,8 +67,8 @@ impl Request {
     pub const BLOCK_DRAFT: &'static str = "block_draft";
     /// The flag an inferlet sets on rows whose attention scores it reads.
     pub const SCORES: &'static str = "scores";
-    /// The flag an inferlet sets on rows that attend both ways.
-    pub const BIDIRECTIONAL: &'static str = "bidirectional";
+    /// The flag the runtime sets on the rows of a denoise pass.
+    pub const DENOISE: &'static str = "denoise";
     /// The flag a backend sets on the rows of a prompt a causal
     /// encoder-decoder's decoder skips (bounded replay): only its encoder
     /// reads them.
@@ -83,7 +83,7 @@ impl Request {
         Self::DRAFTS,
         Self::BLOCK_DRAFT,
         Self::SCORES,
-        Self::BIDIRECTIONAL,
+        Self::DENOISE,
         Self::ENCODE,
     ];
     /// The custom choices a request carries.
@@ -217,7 +217,7 @@ impl Request {
             Self::DRAFTS => self.drafts,
             Self::BLOCK_DRAFT => self.block_draft,
             Self::SCORES => self.captures_scores,
-            Self::BIDIRECTIONAL => self.denoise,
+            Self::DENOISE => self.denoise,
             Self::ENCODE => self.encode,
             _ => panic!("`{name}` is no flag a request carries"),
         }
