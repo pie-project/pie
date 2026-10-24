@@ -40,6 +40,17 @@ impl<'a> ArgValue<'a> {
         })
     }
 
+    /// `v`'s elements back to back, passed by value as one aggregate: a
+    /// params struct whose length is known only at run time.
+    #[must_use]
+    pub fn of_slice<T>(v: &'a [T]) -> Self {
+        Self::Bytes(Aggregate {
+            ptr: v.as_ptr().cast(),
+            len: core::mem::size_of_val(v),
+            _borrow: core::marker::PhantomData,
+        })
+    }
+
     #[must_use]
     pub const fn kind(self) -> &'static str {
         match self {

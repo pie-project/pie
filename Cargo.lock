@@ -3138,7 +3138,9 @@ name = "kernels-cuda"
 version = "0.5.4"
 dependencies = [
  "cudarc",
+ "eta-compiler",
  "pie-dtype",
+ "pie-eta-ir",
  "pie-profile",
  "tracing",
  "ztensor-compat",
