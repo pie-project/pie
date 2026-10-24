@@ -387,6 +387,8 @@ pub const SM100: kernels_cuda::tuning::Tuning = kernels_cuda::tuning::Tuning {
     moe_routes_sized: true,
     moe_gather_ahead_until: 128,
     moe_w4a8_fused_from: 512,
+    moe_mega_until: 2048,
+    moe_mega_bf16_from: 64,
     attn_res_fused_norm: true,
     mla_expanded_from: 256,
     gemm_fp8_gemv_until: 4,
