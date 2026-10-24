@@ -26,6 +26,7 @@ pub fn alone() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+mod an_expert_parallel_group_reads_its_expert_balance;
 mod an_expert_parallel_group_rebalances_its_experts;
 mod an_expert_parallel_group_serves_through_its_engines;
 mod an_expert_parallel_pair_answers_what_one_rank_answers;
