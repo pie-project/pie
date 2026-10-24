@@ -217,8 +217,6 @@ pub struct Lane {
     #[serde(default)]
     pub block_draft: bool,
     #[serde(default)]
-    pub bidirectional: bool,
-    #[serde(default)]
     pub self_cond: Option<SelfCondInput>,
     #[serde(default)]
     pub rs: RsVerb,
@@ -351,16 +349,6 @@ impl Lane {
         if !self.channels.is_empty() && !serves.device_channel_commit {
             return Err(Error::unsupported("engine", F3_CHANNEL_TICKETS));
         }
-        if self.bidirectional && self.mask.is_none() {
-            return Err(Error::Invalid(format!(
-                "lane in slot {} attends bidirectionally and states no mask; the custom-mask \
-                 arm is where the causal bound is lifted, so the lane must carry one",
-                self.slot
-            )));
-        }
-        if self.bidirectional && !serves.bidirectional {
-            return Err(Error::unsupported("engine", BIDIRECTIONAL_WITHOUT_ARM));
-        }
         if let Some(sc) = &self.self_cond {
             let cells = self.rows() as usize * sc.taps as usize;
             let fed = sc.channels.is_some() && sc.rows.is_empty() && sc.weight_bits.is_empty();
@@ -417,14 +405,11 @@ const F3_CHANNEL_TICKETS: &str =
 
 const RS_VERBS_WITHOUT_DEVICE_HALF: &str =
     "Lane::rs beyond RsVerb::Fold: this engine has no device half for it";
-const BIDIRECTIONAL_WITHOUT_ARM: &str =
-    "Lane::bidirectional: this engine's attention applies its own causal bound and cannot lift it";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Serves {
     pub device_channel_commit: bool,
     pub rs_verbs: bool,
-    pub bidirectional: bool,
     pub adapter_attachments: bool,
     pub rs_snapshots: u32,
 }
@@ -433,7 +418,6 @@ impl Serves {
     pub const NONE: Serves = Serves {
         device_channel_commit: false,
         rs_verbs: false,
-        bidirectional: false,
         adapter_attachments: false,
         rs_snapshots: 0,
     };
@@ -443,7 +427,6 @@ impl Serves {
         Serves {
             device_channel_commit: caps.device_channel_commit,
             rs_verbs: caps.rs_verbs,
-            bidirectional: caps.bidirectional_attention,
             adapter_attachments: caps.adapter_attachments,
             rs_snapshots: caps.rs_snapshots,
         }

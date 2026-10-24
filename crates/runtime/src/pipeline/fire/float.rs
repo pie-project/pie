@@ -144,7 +144,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         req.max_layers = pass.max_layers;
     }
     req.single_token_mode = false;
-    stamp_lane_words(&mut req, false, false, None);
+    stamp_lane_words(&mut req, false, false, false, None);
     let groups = vec![(ws.id, (0..req.lanes.len()).collect())];
     if let Err(refusal) = seat_lane_slots(&mut req, &stores, &groups).await {
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
