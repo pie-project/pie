@@ -34,7 +34,7 @@ use crate::exports::Exports;
 use crate::inputs::Inputs;
 use crate::program::{Fired, Plane as ProgramPlane, Session as ProgramSession};
 use crate::record::{self, Bodies as GraphCache};
-use crate::run::RsMove;
+use crate::run::{RsMove, WeightRow};
 use crate::store::Pools;
 use crate::store::kv::{self, Seat};
 use crate::store::rs::Buffers;
@@ -159,8 +159,82 @@ impl Shell {
             &self.compiled.arena,
             self.compiled.arena_forked.as_ref(),
         )?;
+        ep.hold_banks(self.routed_banks());
         self.ep = Some(ep);
         Ok(())
+    }
+
+    /// Each routed bank's planes by layer, in the trace's order: slot-major
+    /// runs a rebalance copies whole, or why a layer's cannot move.
+    fn routed_banks(&self) -> crate::ep::Banks {
+        let table = self.weights.table();
+        let mut banks = crate::ep::Banks::new();
+        for (at, param) in self.trace.params.iter().enumerate() {
+            let Some(held) = param.experts else {
+                continue;
+            };
+            let planes = match table.0.get(at).copied().flatten() {
+                _ if table.1.contains_key(&at) || table.2.contains_key(&at) => {
+                    Err(format!("`{}` is requantized at load", param.name))
+                }
+                Some(WeightRow::Dense(t)) => Ok(vec![t]),
+                Some(WeightRow::Planes {
+                    codes,
+                    scales,
+                    biases,
+                    repacked: false,
+                    atoms: false,
+                    lanes: false,
+                    ..
+                }) => Ok([Some(codes), Some(scales), biases]
+                    .into_iter()
+                    .flatten()
+                    .collect()),
+                Some(WeightRow::Planes { .. } | WeightRow::Ordered(_)) => Err(format!(
+                    "`{}` is laid out for its product, not slot by slot",
+                    param.name
+                )),
+                Some(WeightRow::Streamed { .. }) => {
+                    Err(format!("`{}` streams through the expert tier", param.name))
+                }
+                None => Err(format!("`{}` is not bound", param.name)),
+            }
+            .and_then(|tensors| {
+                tensors
+                    .into_iter()
+                    .map(|t| {
+                        let bits = t.elements() * t.dtype.bits();
+                        let slots = u64::from(held.slots);
+                        if bits % (8 * slots) != 0 {
+                            return Err(format!("`{}` does not split into its slots", param.name));
+                        }
+                        Ok(crate::ep::Plane {
+                            ptr: t.ptr,
+                            slot_bytes: bits / 8 / slots,
+                        })
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            });
+            let layer = banks.entry(held.layer).or_insert_with(|| Ok(Vec::new()));
+            match (layer, planes) {
+                (Ok(all), Ok(mine)) => all.extend(mine),
+                (layer @ Ok(_), Err(why)) => *layer = Err(why),
+                (Err(_), _) => {}
+            }
+        }
+        banks
+    }
+
+    /// This rank's expert-parallel state and its compute stream, for the
+    /// group's rebalance.
+    pub fn rebalance_view(&mut self) -> Option<(&mut crate::ep::EpRank, *mut core::ffi::c_void)> {
+        let stream = self.device.stream();
+        self.ep.as_mut().map(|ep| (ep, stream))
+    }
+
+    /// Waits for everything this shell has enqueued.
+    pub fn quiesce(&self) -> Result<()> {
+        self.device.synchronize()
     }
 
     /// The token bucket a fire of `rows` rows composes at, or `None` past

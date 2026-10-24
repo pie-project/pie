@@ -220,6 +220,7 @@ struct Group {
     wired: Mutex<(usize, Option<Result<(), String>>)>,
     wired_cv: Condvar,
     firing: Firing,
+    rebalancer: Option<Mutex<crate::ep::rebalance::Rebalancer>>,
 }
 
 /// What a rank's thread fires: its frame's step, or an idle step.
@@ -404,8 +405,14 @@ impl Group {
         }
     }
 
-    /// Fires `formed` on every rank at once, each on its own thread.
+    /// Fires `formed` on every rank at once, each on its own thread, the
+    /// group rebalanced first when it is due.
     fn fire(&self, formed: Formed<(Step, engine::StepDone)>) -> Vec<Option<Fired>> {
+        if let Some(why) = self.rebalance().err() {
+            self.poison(&why);
+            let refused = |_| Some(Err(Error::Device(why.clone())));
+            return (0..self.ranks.len()).map(refused).collect();
+        }
         let bucket = formed.bucket;
         let answers = self
             .firing
@@ -441,6 +448,45 @@ impl Group {
     }
 }
 
+impl Group {
+    /// Rebalances the group's experts when it is due, before the step's
+    /// launches: every rank's work finished first, the leader's thread
+    /// running the copies on rank 0's device. A failure leaves the planes
+    /// and the tables apart, so the group stops.
+    fn rebalance(&self) -> Result<(), String> {
+        let Some(rebalancer) = &self.rebalancer else {
+            return Ok(());
+        };
+        let mut rebalancer = rebalancer.lock().expect("lockstep rebalance lock poisoned");
+        if !rebalancer.due() {
+            return Ok(());
+        }
+        let mut cudas: Vec<_> = self
+            .ranks
+            .iter()
+            .map(|cuda| cuda.lock().expect("rank lock poisoned"))
+            .collect();
+        let mut views = Vec::with_capacity(cudas.len());
+        for (cuda, &ordinal) in cudas.iter_mut().zip(&self.ordinals) {
+            crate::device::ctx::bind_thread(ordinal).map_err(|f| f.to_string())?;
+            let shell = cuda.shell_mut().ok_or("a rank has no model loaded")?;
+            shell.quiesce().map_err(|f| f.to_string())?;
+            views.push(
+                shell
+                    .rebalance_view()
+                    .ok_or("a rank is in no expert-parallel group")?,
+            );
+        }
+        crate::device::ctx::bind_thread(self.ordinals[0]).map_err(|f| f.to_string())?;
+        let stream = views[0].1;
+        let mut ranks: Vec<&mut crate::ep::EpRank> = views.into_iter().map(|(ep, _)| ep).collect();
+        rebalancer
+            .run(&mut ranks, stream)
+            .map(|_| ())
+            .map_err(|f| format!("the expert rebalance failed: {f}"))
+    }
+}
+
 /// One rank of an expert-parallel group in this process, an engine of its
 /// own: its scheduler submits to it alone, and its steps fire in lockstep
 /// with the group's.
@@ -462,6 +508,13 @@ pub fn open_lockstep(
         ));
     }
     let ordinals: Vec<i32> = boots.iter().map(|boot| boot.ordinal).collect();
+    let knobs = &boots[0].knobs;
+    let rebalance = (knobs.expert_rebalance_steps.filter(|&every| every > 0)).map(|every| {
+        crate::ep::rebalance::Rebalance {
+            every,
+            window: knobs.expert_load_window.unwrap_or(every).max(every),
+        }
+    });
     let mut ranks = Vec::with_capacity(size);
     for (rank, boot) in boots.into_iter().enumerate() {
         let mut cuda = crate::boot::open(boot, contract_for)?;
@@ -469,6 +522,7 @@ pub fn open_lockstep(
         ranks.push(Arc::new(Mutex::new(cuda)));
     }
     let firing = Firing::start(&ranks, &ordinals)?;
+    let rebalancer = rebalance.map(|knob| Mutex::new(crate::ep::rebalance::Rebalancer::new(knob)));
     let group = Arc::new(Group {
         ranks,
         ordinals,
@@ -480,6 +534,7 @@ pub fn open_lockstep(
         wired: Mutex::new((0, None)),
         wired_cv: Condvar::new(),
         firing,
+        rebalancer,
     });
     // Each rank's load meets the group at arming. The hook holds the group
     // weakly: the group holds the ranks that hold the hooks.
@@ -502,6 +557,19 @@ pub fn open_lockstep(
 }
 
 impl Rank {
+    /// Clears seat `slot` for a new sequence (`Cuda::open`).
+    pub fn open(&self, slot: u32) -> EngineResult<()> {
+        self.with(|cuda| cuda.open(slot))
+    }
+
+    /// The slot copies the group's rebalances made since load.
+    #[must_use]
+    pub fn moved_experts(&self) -> u64 {
+        self.group.rebalancer.as_ref().map_or(0, |r| {
+            r.lock().expect("lockstep rebalance lock poisoned").moved()
+        })
+    }
+
     fn cuda(&self) -> EngineResult<std::sync::MutexGuard<'_, Cuda>> {
         crate::device::ctx::bind_thread(self.group.ordinals[self.rank])
             .map_err(|f| Error::Device(f.to_string()))?;

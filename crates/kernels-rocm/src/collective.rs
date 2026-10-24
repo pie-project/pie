@@ -266,6 +266,7 @@ pub struct Placement {
     pub stride: u32,
     pub experts: u32,
     pub slots: u32,
+    pub loads: u64,
 }
 
 /// `kernels_cuda::collective::Landing`.
