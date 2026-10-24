@@ -22,6 +22,7 @@ pub mod group;
 #[cfg(not(feature = "rocm"))]
 pub mod grouped_decode;
 pub mod inputs;
+pub mod lockstep;
 pub mod mask;
 pub mod narrow;
 pub mod program;
