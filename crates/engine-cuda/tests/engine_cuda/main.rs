@@ -56,6 +56,8 @@ mod a_prefill_past_the_gemvs_grid_is_served;
 mod a_regions_own_values_outlive_its_last_pass;
 mod a_repacked_projection_serves_what_the_row_major_one_serves;
 mod a_schedule_is_carved_where_it_is_launched;
+#[cfg(feature = "cuda")]
+mod a_seamed_fold_answers_its_fold_and_pre_mix;
 mod a_second_fire_reads_the_port_cells_it_was_handed;
 mod a_shared_adapter_is_one_slot_and_one_load;
 mod a_shifted_body_admits_the_split_that_moved;
