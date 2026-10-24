@@ -98,6 +98,9 @@ enum BodySynth {
     Wide {
         lanes: Vec<LaneRows>,
     },
+    /// An expert-parallel rank's step with no lanes of its own, at a bucket
+    /// its group's busy ranks fire at: it serves their routes.
+    Idle,
 }
 
 impl BodySynth {
@@ -108,6 +111,7 @@ impl BodySynth {
             BodySynth::Mixed { .. } => Kind::Mixed,
             BodySynth::Tower { .. } => Kind::Tower,
             BodySynth::Wide { .. } => Kind::Wide,
+            BodySynth::Idle => Kind::Idle,
         }
     }
 
@@ -131,6 +135,7 @@ impl BodySynth {
                 Vec::new(),
             ),
             BodySynth::Wide { lanes } => (lanes.clone(), Vec::new()),
+            BodySynth::Idle => (Vec::new(), Vec::new()),
             BodySynth::Tower {
                 class,
                 rows,
@@ -148,10 +153,11 @@ pub enum Kind {
     Mixed,
     Tower,
     Wide,
+    Idle,
 }
 
 impl Kind {
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 6;
 
     pub const ALL: [Kind; Kind::COUNT] = [
         Kind::Decode,
@@ -159,6 +165,7 @@ impl Kind {
         Kind::Mixed,
         Kind::Tower,
         Kind::Wide,
+        Kind::Idle,
     ];
 
     pub fn at(self) -> usize {
@@ -174,6 +181,7 @@ impl core::fmt::Display for Kind {
             Kind::Mixed => "mixed",
             Kind::Tower => "tower",
             Kind::Wide => "wide",
+            Kind::Idle => "idle",
         })
     }
 }
@@ -197,6 +205,8 @@ struct Deployment {
     context: u32,
     max_lanes: u32,
     patch_fold: u32,
+    /// Whether the load is an expert-parallel rank's, which fires idle steps.
+    idle: bool,
 }
 
 #[derive(Default)]
@@ -355,8 +365,32 @@ fn wide_keys(deployment: &Deployment, into: &mut Targets) {
     }
 }
 
-const ARMS: [fn(&Deployment, &mut Targets); Kind::COUNT] =
-    [decode_keys, prefill_keys, mixed_keys, tower_keys, wide_keys];
+/// An expert-parallel rank's idle step at every bucket a step of its group
+/// composes at, decodes' and prefills' alike: a body for each, or an idle
+/// rank walks every one of its group's steps eagerly.
+fn idle_keys(deployment: &Deployment, into: &mut Targets) {
+    if !deployment.idle {
+        return;
+    }
+    let mut buckets: Vec<u32> = (deployment.points.iter())
+        .map(|point| point.bucket)
+        .chain(deployment.buckets.iter().copied())
+        .collect();
+    buckets.sort_unstable();
+    buckets.dedup();
+    for bucket in buckets {
+        into.targets.push((bucket, BodySynth::Idle));
+    }
+}
+
+const ARMS: [fn(&Deployment, &mut Targets); Kind::COUNT] = [
+    decode_keys,
+    prefill_keys,
+    mixed_keys,
+    tower_keys,
+    wide_keys,
+    idle_keys,
+];
 
 impl core::fmt::Display for BodySynth {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -388,6 +422,7 @@ impl core::fmt::Display for BodySynth {
                 }
                 Ok(())
             }
+            BodySynth::Idle => f.write_str("idle"),
         }
     }
 }
@@ -942,6 +977,7 @@ impl Shell {
             context,
             max_lanes,
             patch_fold: self.patch_fold,
+            idle: self.ep.is_some(),
         };
         let mut found = Targets::default();
         for enumerate in ARMS {
@@ -969,6 +1005,7 @@ impl Shell {
             Kind::Prefill => 2,
             Kind::Wide => 3,
             Kind::Tower => 4,
+            Kind::Idle => 5,
         };
         targets
             .sort_by_key(|(bucket, target)| (Some(*bucket) != top, rank(target.kind()), *bucket));
@@ -1019,6 +1056,9 @@ impl Shell {
             let owned = self.synthetic_lanes_with(&lanes, &media);
             self.armed_body = None;
             for _ in 0..record::WARM_FIRES {
+                if matches!(target, BodySynth::Idle) {
+                    self.at_bucket(bucket);
+                }
                 let fired = self.fire_synthetic(&owned);
                 let landed = self.device.synchronize();
                 if let Err(why) = fired.and(landed) {
