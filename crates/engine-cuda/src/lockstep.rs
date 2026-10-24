@@ -283,8 +283,7 @@ impl Group {
         drop(wiring);
         let ep =
             crate::ep::EpRank::new(wires, rank as u32, &shape.layers).map_err(|f| f.to_string())?;
-        shell.join_ep(ep);
-        Ok(())
+        shell.join_ep(ep)
     }
 
     /// A rank has loaded; the group serves once every rank has.

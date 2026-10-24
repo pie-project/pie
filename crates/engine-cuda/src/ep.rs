@@ -3,7 +3,8 @@
 //! outputs its peers combine back to it), mapped into every rank. Peers
 //! write only into these fixed buffers: each rank's arena is laid out per
 //! program and bucket, so no peer knows where a rank's IR values live. The
-//! dispatch and combine arms copy from them into the IR's values. Nothing
+//! values a dispatch or combine makes are seated on them instead of the
+//! arena ([`Seats`]), so the rows land where their readers read. Nothing
 //! here is taken while the ranks fire: an allocation between two ranks'
 //! launches can wait on a peer spinning for the rank that waits.
 #![allow(unsafe_code)]
@@ -12,7 +13,10 @@ use kernels_cuda::Tensor;
 use kernels_cuda::collective::{EP_MAX_RANKS, EP_SIGNAL_BYTES, Ep, Landing, ep_scratch_bytes};
 
 use crate::error::{Fault, Result};
-use poem_ir::Dtype;
+use crate::run::SlotTable;
+use poem_compiler::ArenaMap;
+use poem_compiler::arena::Placement as Slot;
+use poem_ir::{Collective, Dtype, Operands, Operation, Trace, ValueId};
 
 /// The widest step any dispatch or combine of the group fires: sizes the
 /// fixed buffers once, at load.
@@ -77,6 +81,134 @@ impl Wire {
             && row_bytes <= w.row_bytes
             && out_bytes <= w.out_bytes
             && top_k == w.top_k
+    }
+}
+
+/// Which of a rank's fixed buffers a dispatch or combine output sits on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seat {
+    Rows,
+    Local { k: u32 },
+    RowWeights { k: u32 },
+    Origin,
+    Routed { k: u32 },
+}
+
+/// The values of one arena map seated on the rank's fixed buffers, by id:
+/// every dispatch and combine output and whatever the map aliases to one
+/// (an op writing in place into the rows it read).
+///
+/// A peer writes into a rank's landing once every rank has entered the next
+/// dispatch, and into its return once every rank has sent that dispatch's
+/// rows: so a landing's values are read before the next dispatch, and a
+/// return's no later than it. [`Seats::of`] refuses a trace that reads one
+/// past that.
+#[derive(Clone, Debug, Default)]
+pub struct Seats(Vec<Option<Seat>>);
+
+impl Seats {
+    pub fn of(trace: &Trace, map: &ArenaMap) -> std::result::Result<Seats, String> {
+        let root = |mut value: ValueId| {
+            for _ in 0..=map.placements.len() {
+                match map.placements.get(value.0 as usize) {
+                    Some(Slot::Alias(to)) => value = *to,
+                    _ => break,
+                }
+            }
+            value
+        };
+        let mut made: Vec<Option<(Seat, usize)>> = vec![None; trace.values.len()];
+        for (at, node) in trace.nodes.iter().enumerate() {
+            let mut seat = |value: ValueId, seat| made[value.0 as usize] = Some((seat, at));
+            match &node.op {
+                Operation::Collective(Collective::Dispatch {
+                    top_k,
+                    rows,
+                    local,
+                    row_weights,
+                    origin,
+                    ..
+                }) => {
+                    seat(*rows, Seat::Rows);
+                    seat(*local, Seat::Local { k: *top_k });
+                    if let Some(w) = row_weights {
+                        seat(*w, Seat::RowWeights { k: *top_k });
+                    }
+                    seat(*origin, Seat::Origin);
+                }
+                Operation::Collective(Collective::Combine { top_k, routed, .. }) => {
+                    seat(*routed, Seat::Routed { k: *top_k });
+                }
+                _ => {}
+            }
+        }
+        let seated: Vec<Option<(Seat, usize)>> = (0..trace.values.len())
+            .map(|v| made[root(ValueId(v as u32)).0 as usize])
+            .collect();
+        let dispatches: Vec<usize> = (trace.nodes.iter().enumerate())
+            .filter(|(_, n)| matches!(n.op, Operation::Collective(Collective::Dispatch { .. })))
+            .map(|(at, _)| at)
+            .collect();
+        let mut ins = Vec::new();
+        for (at, node) in trace.nodes.iter().enumerate() {
+            ins.clear();
+            node.op.inputs(&mut ins);
+            for v in &ins {
+                let Some((seat, from)) = seated[v.0 as usize] else {
+                    continue;
+                };
+                let Some(&next) = dispatches.iter().find(|&&d| d > from) else {
+                    continue;
+                };
+                let past = match seat {
+                    Seat::Routed { .. } => at > next,
+                    _ => at >= next,
+                };
+                if past {
+                    return Err(format!(
+                        "node {at} reads value {}, which node {from} seated on this rank's \
+                         expert-parallel buffers and the dispatch at node {next} hands back \
+                         to its peers",
+                        v.0
+                    ));
+                }
+            }
+        }
+        Ok(Seats(
+            seated
+                .into_iter()
+                .map(|s| s.map(|(seat, _)| seat))
+                .collect(),
+        ))
+    }
+
+    /// Points each seated slot of `slots` at `wire`'s buffers for a step at
+    /// token `bucket`. A slot the wire cannot hold keeps its arena rows, and
+    /// the arm that writes it refuses.
+    pub fn seat(&self, wire: &Wire, bucket: u32, slots: &mut SlotTable) {
+        for (cell, seat) in slots.0.iter_mut().zip(&self.0) {
+            let (Some(slot), Some(seat)) = (cell.as_mut(), seat) else {
+                continue;
+            };
+            let row_bytes =
+                u64::from(slot.width) * poem_compiler::arena::elem_bytes(slot.dtype).unwrap_or(0);
+            let fits = match seat {
+                Seat::Rows => wire.holds(bucket, row_bytes, 0, wire.widest.top_k),
+                Seat::Routed { .. } => wire.holds(bucket, 0, row_bytes, wire.widest.top_k),
+                _ => wire.holds(bucket, 0, 0, wire.widest.top_k),
+            };
+            if !fits {
+                continue;
+            }
+            let landing = |k| wire.landing(bucket, k, slot.width, slot.dtype, true);
+            *slot = match *seat {
+                Seat::Rows => landing(1).rows,
+                Seat::Local { k } => landing(k).local,
+                Seat::RowWeights { k } => landing(k).row_weights.unwrap_or(*slot),
+                Seat::Origin => landing(1).origin,
+                Seat::Routed { k } => wire.routed(bucket, k, slot.width, slot.dtype),
+            };
+        }
     }
 }
 
@@ -191,6 +323,8 @@ pub struct EpRank {
     pub wires: Vec<Wire>,
     pub rank: u32,
     layers: std::collections::BTreeMap<u32, Layer>,
+    seats: Seats,
+    seats_forked: Seats,
 }
 
 impl EpRank {
@@ -228,7 +362,32 @@ impl EpRank {
             wires,
             rank,
             layers: held,
+            seats: Seats::default(),
+            seats_forked: Seats::default(),
         })
+    }
+
+    /// Seats the values of `trace` on this rank's buffers, under the arena
+    /// map in order and the one forked for side streams.
+    pub fn seat(
+        &mut self,
+        trace: &Trace,
+        map: &ArenaMap,
+        forked: Option<&ArenaMap>,
+    ) -> std::result::Result<(), String> {
+        self.seats = Seats::of(trace, map)?;
+        self.seats_forked = forked.map_or(Ok(Seats::default()), |m| Seats::of(trace, m))?;
+        Ok(())
+    }
+
+    /// The seats of a fire that carves the forked map, or the one in order.
+    #[must_use]
+    pub fn seats(&self, forked: bool) -> &Seats {
+        if forked {
+            &self.seats_forked
+        } else {
+            &self.seats
+        }
     }
 
     #[must_use]
@@ -239,5 +398,91 @@ impl EpRank {
     #[must_use]
     pub fn placement(&self, layer: u32) -> Option<kernels_cuda::collective::Placement> {
         self.layers.get(&layer).map(|l| l.place)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use poem_ir::{Dtype, Platform};
+
+    use super::*;
+
+    fn lowered() -> Trace {
+        let whole = poem_compiler::catalog::trace_of(
+            "qwen3-a3b-micro",
+            Dtype::Bf16,
+            Dtype::Bf16,
+            Platform::Cuda,
+        );
+        poem_compiler::expert::lower(whole, 2, 0).expect("the micro's MoE lowers")
+    }
+
+    fn unaliased() -> ArenaMap {
+        ArenaMap {
+            placements: Vec::new(),
+            spans: Vec::new(),
+            live_in: Vec::new(),
+            bytes: 0,
+        }
+    }
+
+    #[test]
+    fn every_dispatch_and_combine_output_is_seated() {
+        let trace = lowered();
+        let seats = Seats::of(&trace, &unaliased()).expect("the micro reads its landings in time");
+        let mut outs = Vec::new();
+        for node in &trace.nodes {
+            if let Operation::Collective(Collective::Dispatch { .. } | Collective::Combine { .. }) =
+                &node.op
+            {
+                outs.clear();
+                node.op.outputs(&mut outs);
+                let counts = match &node.op {
+                    Operation::Collective(Collective::Dispatch { counts, .. }) => Some(*counts),
+                    _ => None,
+                };
+                for v in outs.iter().filter(|&&v| Some(v) != counts) {
+                    assert!(
+                        seats.0[v.0 as usize].is_some(),
+                        "value {} is not seated",
+                        v.0
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_landing_read_past_the_next_dispatch_is_refused() {
+        let mut trace = lowered();
+        let first = trace
+            .nodes
+            .iter()
+            .position(|n| matches!(n.op, Operation::Collective(Collective::Dispatch { .. })))
+            .expect("the micro dispatches");
+        let Operation::Collective(Collective::Dispatch { rows, .. }) = trace.nodes[first].op else {
+            unreachable!()
+        };
+        let mut ins = Vec::new();
+        let reader = trace.nodes[first + 1..]
+            .iter()
+            .find(|n| {
+                ins.clear();
+                n.op.inputs(&mut ins);
+                ins.contains(&rows)
+            })
+            .expect("the rows are read")
+            .clone();
+        assert!(
+            trace
+                .nodes
+                .iter()
+                .skip(first + 1)
+                .any(|n| { matches!(n.op, Operation::Collective(Collective::Dispatch { .. })) }),
+            "the micro dispatches more than once"
+        );
+        trace.nodes.push(reader);
+        let why = Seats::of(&trace, &unaliased()).expect_err("a stale landing read");
+        assert!(why.contains("hands back to its peers"), "{why}");
     }
 }

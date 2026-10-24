@@ -150,8 +150,17 @@ pub(crate) struct KvReport {
 
 impl Shell {
     /// Joins this rank to its expert-parallel group.
-    pub fn join_ep(&mut self, ep: crate::ep::EpRank) {
+    /// Joins an expert-parallel group as `ep`, its dispatch and combine
+    /// outputs seated on the rank's fixed buffers; refuses a trace that
+    /// reads one after its peers may write it again.
+    pub fn join_ep(&mut self, mut ep: crate::ep::EpRank) -> std::result::Result<(), String> {
+        ep.seat(
+            &self.trace,
+            &self.compiled.arena,
+            self.compiled.arena_forked.as_ref(),
+        )?;
         self.ep = Some(ep);
+        Ok(())
     }
 
     /// The token bucket a fire of `rows` rows composes at, or `None` past

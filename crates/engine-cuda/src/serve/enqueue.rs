@@ -569,11 +569,11 @@ impl FireCtx<'_> {
             let until = self.compiled.streams.forked_until;
             until == 0 || p.composition.bucket() <= until
         };
-        let map = match &self.compiled.arena_forked {
-            Some(forked) if forks => forked,
-            _ => &self.compiled.arena,
+        let (map, forked) = match &self.compiled.arena_forked {
+            Some(forked) if forks => (forked, true),
+            _ => (&self.compiled.arena, false),
         };
-        let slots = self.arena.slots(
+        let mut slots = self.arena.slots(
             map,
             poem_compiler::FireRows {
                 tokens: carve_rows,
@@ -585,6 +585,10 @@ impl FireCtx<'_> {
                 readouts: p.readout_rows.len() as u64,
             },
         );
+        if let Some(ep) = self.ep {
+            ep.seats(forked)
+                .seat(ep.wire(), p.composition.bucket(), &mut slots);
+        }
         for land in &p.merge_lands {
             let Some(column) = slots.0[land.merge.0 as usize] else {
                 return Err(Fault::Unbound {

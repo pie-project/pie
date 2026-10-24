@@ -51,7 +51,13 @@ impl Run<'_> {
                     .placement(*layer)
                     .ok_or_else(|| backend(OP, format!("no placement for layer {layer}")))?;
                 let x = self.tensor(*x);
-                let step = self.bucket().max(x.rows);
+                let step = self.bucket();
+                if x.rows > step {
+                    return Err(backend(
+                        OP,
+                        format!("{} rows past the step's bucket of {step}", x.rows),
+                    ));
+                }
                 let tokens = Tokens {
                     x,
                     routes: self.tensor(*routes),
@@ -63,6 +69,13 @@ impl Run<'_> {
                     .iter()
                     .map(|w| w.landing(step, *top_k, x.width, x.dtype, weights.is_some()))
                     .collect();
+                let own = landing[ep.rank as usize];
+                seated(OP, own.rows, self.tensor(*rows))?;
+                seated(OP, own.local, self.tensor(*local))?;
+                seated(OP, own.origin, self.tensor(*origin))?;
+                if let (Some(on), Some(value)) = (own.row_weights, *row_weights) {
+                    seated(OP, on, self.tensor(value))?;
+                }
                 let mut counts = self.tensor(*counts);
                 collective::dispatch(
                     self.ctx(),
@@ -71,17 +84,7 @@ impl Run<'_> {
                     tokens,
                     &landing,
                     &mut counts,
-                )?;
-                // Peers wrote into this rank's fixed landing; the IR's values
-                // are the arena's.
-                let own = landing[ep.rank as usize];
-                self.land(OP, own.rows, self.tensor(*rows))?;
-                self.land(OP, own.local, self.tensor(*local))?;
-                self.land(OP, own.origin, self.tensor(*origin))?;
-                if let (Some(from), Some(to)) = (own.row_weights, *row_weights) {
-                    self.land(OP, from, self.tensor(to))?;
-                }
-                Ok(())
+                )
             }
             Collective::Combine {
                 y,
@@ -97,7 +100,7 @@ impl Run<'_> {
                     .ok_or_else(|| backend(OP, "this rank is in no expert-parallel group"))?;
                 let y = self.tensor(*y);
                 let local = self.tensor(*local);
-                let step = local.rows / ep.wires.len() as u32;
+                let step = self.bucket();
                 let landing = Landing {
                     rows: Tensor::ABSENT,
                     local,
@@ -109,26 +112,22 @@ impl Run<'_> {
                     .iter()
                     .map(|w| w.routed(step, *top_k, y.width, y.dtype))
                     .collect();
-                collective::combine(self.ctx(), &ep.wire().ep, &landing, y, &back)?;
-                // An eager walk's `routed` is its live rows: the return holds
-                // them from its first row, as the dispatch numbered them.
-                self.land(OP, back[ep.rank as usize], self.tensor(*routed))
+                seated(OP, back[ep.rank as usize], self.tensor(*routed))?;
+                collective::combine(self.ctx(), &ep.wire().ep, &landing, y, &back)
             }
         }
     }
+}
 
-    /// Copies the head of `from` (a fixed EP buffer) into the IR's `to`.
-    fn land(&self, op: &'static str, from: Tensor, to: Tensor) -> Result<(), Error> {
-        let bytes = to.elements() * to.dtype.bytes_ceil();
-        if bytes > from.elements() * from.dtype.bytes_ceil() {
-            return Err(backend(op, "an IR value wider than its EP buffer"));
-        }
-        crate::device::alloc::copy_any(
-            self.ctx().stream(),
-            to.ptr,
-            from.ptr,
-            usize::try_from(bytes).unwrap_or(usize::MAX),
-        )
-        .map_err(|fault| backend(op, fault))
+/// Refuses an IR value the fire did not seat on the EP buffer its peers
+/// write (`ep::Seats`): its readers would read rows nobody wrote.
+fn seated(op: &'static str, on: Tensor, value: Tensor) -> Result<(), Error> {
+    if value.ptr == on.ptr && value.rows <= on.rows {
+        Ok(())
+    } else {
+        Err(backend(
+            op,
+            "an IR value not seated on its expert-parallel buffer",
+        ))
     }
 }

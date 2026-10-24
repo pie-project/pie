@@ -203,7 +203,7 @@ fn group(lowered: &Trace, graphs: bool) -> Vec<Loaded> {
     let wires = wire(&[0, 0], shape.widest).expect("one device reaches itself");
     for (r, (staged, _)) in staged.iter_mut().enumerate() {
         let ep = EpRank::new(wires.clone(), r as u32, &shape.layers).expect("the placement");
-        staged.shell.join_ep(ep);
+        staged.shell.join_ep(ep).expect("the seats");
     }
     std::thread::scope(|scope| {
         let armed: Vec<_> = staged
