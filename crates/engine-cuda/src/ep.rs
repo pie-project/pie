@@ -214,8 +214,8 @@ impl Seats {
 
 /// Wires `ordinals` (one rank each, in rank order) for expert parallelism
 /// at `widest`. The ranks must reach one another as the peer collectives
-/// do ([`crate::comm::open_peers`] checks the path first); there is no
-/// fallback for a dispatch.
+/// do ([`crate::comm::reach`] checks the path first); there is no fallback
+/// for a dispatch.
 pub fn wire(ordinals: &[i32], widest: Widest) -> Result<Vec<Wire>> {
     let off = |why: String| Fault::program("ep::wire", why);
     let world = u32::try_from(ordinals.len()).unwrap_or(u32::MAX);
@@ -224,11 +224,11 @@ pub fn wire(ordinals: &[i32], widest: Widest) -> Result<Vec<Wire>> {
             "expert parallelism runs 2 to 8 ranks, not {world}"
         )));
     }
-    if crate::comm::open_peers(ordinals).is_none() {
-        return Err(off(
-            "expert parallelism needs every rank to map every other's memory (NVLink peers)".into(),
-        ));
-    }
+    crate::comm::reach(ordinals).map_err(|why| {
+        off(format!(
+            "expert parallelism needs every rank to map every other's memory: {why}"
+        ))
+    })?;
     let cap = u64::from(world) * u64::from(widest.tokens);
     let k = u64::from(widest.top_k);
     let parts = [
