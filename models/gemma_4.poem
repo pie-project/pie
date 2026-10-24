@@ -916,10 +916,11 @@ def forward(m, inputs):
         seam.at(seam.ATTN_Q, [q])
 
         # Each lane by its kind (the tail's whole rows are lanes that mask or
-        # capture scores, so only those two); a global layer's scores go out
-        # at their seam.
+        # capture scores, so only those two), a denoise lane over every key it
+        # holds; a global layer's scores go out at their seam.
+        causal = ~fact.denoise() if m.self_cond != None else None
         a = ops.attn.attend(q, trunk_inputs, at.kv, m.q_heads, kv_heads, d, at.sm_scale, window = win,
-                            mask = True, scores = True, scores_seam = at.reading != SLIDING)
+                            causal = causal, mask = True, scores = True, scores_seam = at.reading != SLIDING)
         seam.at(seam.ATTN_OUT, [a])
         return normed, a, routes
 
@@ -996,7 +997,7 @@ def forward(m, inputs):
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
     hb = None
     if dr != None:
-        hb = arm(dr, inputs, tapped, h_block, inputs.mask(), block_rows(dr))
+        hb = arm(dr, inputs, tapped, h_block, block_rows(dr))
         x = merge([hb, x])
     if tail == None:
         x = ops.gather.gather_rows(x, inputs.readout_rows())

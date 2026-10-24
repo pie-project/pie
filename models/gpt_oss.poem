@@ -397,7 +397,7 @@ def forward(m, inputs):
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
     hb = None
     if dr != None:
-        hb = arm(dr, inputs, tapped, h_block, inputs.mask(), block_rows(dr))
+        hb = arm(dr, inputs, tapped, h_block, block_rows(dr))
         x = merge([hb, x])
     x = ops.gather.gather_rows(x, inputs.readout_rows())
     logits = ops.linear.lm_head(x, m.head)
