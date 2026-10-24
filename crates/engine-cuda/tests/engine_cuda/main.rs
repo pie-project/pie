@@ -63,6 +63,7 @@ mod a_two_reading_plan_reads_each_lane_back_from_its_own_seam;
 mod a_windowed_row_reads_what_the_full_row_reads;
 mod an_adapter_is_not_a_lanes_scratch;
 mod an_epilogue_agrees_with_the_host_interpreter;
+mod an_expert_parallel_wire_carries_tokens_out_and_back;
 mod an_exported_kv_stays_mapped;
 mod an_mla_body_appends_only_its_window;
 mod every_armed_body_answers_its_eager_walk;
