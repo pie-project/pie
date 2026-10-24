@@ -1,9 +1,8 @@
 # Models
 
-Each directory here is a model package, written in Starlark against the
-builtins of `crates/poem`. A package is whatever `.poem` files its directory
-holds; what they are named says nothing. It is read by the entries it
-defines, each defined once across its files:
+Each `.poem` file here is a model package, written in Starlark against the
+builtins of `crates/poem`, named for its stem. It is read by the entries it
+defines:
 
 | entry      | states                                                          |
 | ---------- | --------------------------------------------------------------- |
@@ -13,10 +12,29 @@ defines, each defined once across its files:
 | `caches(m, c)`, `forward(m, inputs)` | the caches it holds and the forward its rows run |
 | `formats(m)` | the checkpoint formats it is read in, and what lands where |
 
-One file may hold them all. A package split across files still names each
-entry once; a name a file only `load()`s is not its definition. `lib/`
-holds the helpers every package may load, as `//lib/…`; what a library
-defines is never a package's entry.
+A package reads top to bottom: its deployments, then its layout, then how
+each checkpoint format is read, then its forward. Where a format reads what
+the layout declares and the forward runs it, the three share a stem:
+`resnet` declares a block's weights, `read_resnet` reads them and
+`run_resnet` runs them. A package may instead be a directory of `.poem`
+files, each entry defined once across them; a name a file only `load()`s is
+not its definition. `lib/` holds the helpers every package may load, as
+`//lib/…`; what a library defines is never a package's entry.
+
+A weight is named by where it sits in the struct `layout` returns:
+`layers.3.q` is the `q` of the fourth of `layers`, `head` the field `head`.
+That name is its parameter in the trace, its tensor in an artifact and what
+the host finds an adapter bank by (`layers.{l}.lora_a`). A weight reached
+at two paths is one weight, named by the first.
+
+How a release stores its quantized weights is the importer's, not a
+package's: `//pie/codec.poem`, which ships with pie, reads block FP8,
+per-channel FP8, MXFP8 and NVFP4 as the release stores them. A package's
+formats name a weight's legs (`weight(reads, w, legs)`) or a bank's experts'
+(`bank(reads, w, experts)`), and the weight's declared dtype says which
+encoding it keeps. A quantized leg of a weight read plainly is refused
+(`quantized = "refuse"`, the default), read as stored (`"read"`) or
+dequantized to bf16 (`"widen"`).
 
 A deployment is named `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-yarn{f}][-tap.{key}][-tp{n}]`; `yarn{f}` stretches the
 model's native context `f` times by YaRN, in a package that turns it
@@ -31,6 +49,17 @@ and its products run on CUDA's tcgen05 GEMMs. Where there are none (Hopper,
 Ampere, sm120), CUDA reads the same planes against bf16 activations: an
 MXFP4 or NVFP4 bank as W4A16, a block-FP8 one as W8A16
 (`crates/engine-cuda/src/dispatch/linear.rs`, `select_a16` and `matmul_a16`).
+
+A layout reads its deployment's dtypes by role: `roles(deploy, "proj",
+"experts")` is a struct with a dtype for each, the deployment stating one
+dtype for them all or one a role, in order; `exact = True` asks for one a
+role. A `weight(shape)` stating no dtype computes at the deployment's
+compute dtype, the one its first stored dtype computes in, as norms and
+gates do.
+A weight that states its `values` (`weight([1], dtype.f32, values =
+[1000.0])`) is a table the model holds rather than reads, such as a VAE's
+latent statistics from its config: the importer lands it whatever the
+checkpoint holds, and no format names it.
 
 ## What a model says of its tokens
 
@@ -50,8 +79,8 @@ A model is spoken through a template and a tokenizer, both stated as data in
 
 ## How a still is read
 
-Nothing about a model's pictures is in Rust. `media(id, deploy)` in
-`model.poem` states how a still is spelled and framed: `patch` and
+Nothing about a model's pictures is in Rust. `media(id, deploy)`
+states how a still is spelled and framed: `patch` and
 `block` (the tower's patch size and the side of the block its row fold
 takes, one token a block), `mrope` (tokens placed on the merged grid or in
 sequence), the delimiter tokens, and `frame(h, w, budget)`, the resize the

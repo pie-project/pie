@@ -1,0 +1,948 @@
+# Z-Image Turbo, with its Qwen3 text encoder and its VAE, and a miniature of
+# its diffusion transformer alone.
+
+load("//lib/spoken.poem", "QWEN_STOP")
+
+CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
+TOKENIZER = tokenizer(markers = [QWEN_STOP])
+
+MODELS = [
+    model("z-image-turbo", template = CHATML, tokenizer = TOKENIZER, arch = "z_image", layers = 35, vocab = 151936, taps = True),
+    model("z-image-mini", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "z_image", layers = 6, vocab = 0, taps = True),
+]
+
+DEPLOYMENTS = [
+    deployment("z-image-turbo", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("z-image-turbo", weights = dtype.u4g64, kv = dtype.bf16),
+    deployment("z-image-mini", weights = dtype.bf16, kv = dtype.bf16),
+]
+
+# The weights of Z-Image: a single-stream diffusion transformer whose image
+# rows first pass noise refiners and whose caption rows pass context refiners,
+# a Qwen3 4B text encoder and a Flux VAE. A deployment's tap (`-tap.{key}`)
+# names an intermediate the denoiser reads out instead of its velocity.
+
+def linear(out, in_, banks, bias = True):
+    """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
+    return struct(
+        w = weight([out, in_], banks),
+        bias = weight([out]) if bias else None,
+    )
+
+BLOCKS = [128, 256, 512, 512]
+
+LAYERS_PER_BLOCK = 2
+
+flux_vae_RGB = 3
+
+TAPS3 = 9
+
+def conv_weights(c_out, c_in, taps):
+    return struct(
+        w = weight([c_out, c_in * taps], dtype.bf16).conv_taps_major(c_in, taps),
+        bias = weight([c_out], dtype.f32),
+        c_in = c_in,
+        c_out = c_out,
+        taps = taps,
+    )
+
+def group_norm(c):
+    return struct(
+        weight = weight([c], dtype.f32),
+        bias = weight([c], dtype.f32),
+    )
+
+def resnet(c_in, c_out):
+    return struct(
+        norm1 = group_norm(c_in),
+        conv1 = conv_weights(c_out, c_in, TAPS3),
+        norm2 = group_norm(c_out),
+        conv2 = conv_weights(c_out, c_out, TAPS3),
+        shortcut = conv_weights(c_out, c_in, 1) if c_in != c_out else None,
+    )
+
+def mid(c):
+    return struct(
+        res0 = resnet(c, c),
+        attn = struct(
+            norm = group_norm(c),
+            q = linear(c, c, dtype.bf16),
+            k = linear(c, c, dtype.bf16),
+            v = linear(c, c, dtype.bf16),
+            out = linear(c, c, dtype.bf16),
+            width = c,
+        ),
+        res1 = resnet(c, c),
+    )
+
+def flux_vae(channels, encoder_out, latent):
+    """The VAE whose decoder takes `channels` and whose encoder gives
+    `encoder_out`; `latent()` lays out what carries a latent to and from
+    them."""
+    top = BLOCKS[-1]
+    up = []
+    c_prev = top
+    for i, c in enumerate(reversed(BLOCKS)):
+        name = "vae.dec.up{}".format(i)
+        resnets = []
+        for r in range(LAYERS_PER_BLOCK + 1):
+            resnets.append(resnet(c_prev, c))
+            c_prev = c
+        last = i + 1 == len(BLOCKS)
+        up.append(struct(
+            resnets = resnets,
+            upsample = conv_weights(c, c, TAPS3) if not last else None,
+        ))
+    down = []
+    c_prev = BLOCKS[0]
+    for i, c in enumerate(BLOCKS):
+        name = "vae.enc.down{}".format(i)
+        resnets = []
+        for r in range(LAYERS_PER_BLOCK):
+            resnets.append(resnet(c_prev, c))
+            c_prev = c
+        last = i + 1 == len(BLOCKS)
+        down.append(struct(
+            resnets = resnets,
+            downsample = conv_weights(c, c, TAPS3) if not last else None,
+        ))
+    return struct(
+        latent = latent(),
+        decoder = struct(
+            conv_in = conv_weights(top, channels, TAPS3),
+            mid = mid(top),
+            up = up,
+            norm_out = group_norm(BLOCKS[0]),
+            conv_out = conv_weights(flux_vae_RGB, BLOCKS[0], TAPS3),
+        ),
+        encoder = struct(
+            conv_in = conv_weights(BLOCKS[0], flux_vae_RGB, TAPS3),
+            down = down,
+            mid = mid(top),
+            norm_out = group_norm(top),
+            conv_out = conv_weights(encoder_out, top, TAPS3),
+        ),
+    )
+
+QWEN3_4B = struct(
+    hidden = 2560,
+    vocab = 151936,
+    q_heads = 32,
+    kv_heads = 8,
+    head_dim = 128,
+    inter = 9728,
+    theta = 1000000.0,
+    eps = 1e-6,
+)
+
+def encoder(c, layers, banks, sharded = False):
+    """The encoder of config `c` through its first `layers` layers; with
+    `sharded`, its attention and mlp split across ranks."""
+    hidden, hd, inter = c.hidden, c.head_dim, c.inter
+
+    def columns(w, heads = None):
+        if not sharded:
+            return w
+        return w.columns() if heads == None else w.columns(heads = heads)
+
+    def rows(w):
+        return w.rows() if sharded else w
+
+    def layer(l):
+        return struct(
+            attn_norm = weight([hidden]),
+            q = columns(weight([c.q_heads * hd, hidden], banks)),
+            k = columns(weight([c.kv_heads * hd, hidden], banks), c.kv_heads),
+            v = columns(weight([c.kv_heads * hd, hidden], banks), c.kv_heads),
+            o = rows(weight([hidden, c.q_heads * hd], banks)),
+            q_norm = weight([hd]),
+            k_norm = weight([hd]),
+            mlp_norm = weight([hidden]),
+            gate_up = weight([2 * inter, hidden], banks).packed([inter, inter]),
+            down = rows(weight([hidden, inter], banks)),
+            kv = "te.kv.{}".format(l),
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = c.vocab,
+        q_heads = c.q_heads,
+        kv_heads = c.kv_heads,
+        head_dim = hd,
+        inter = inter,
+        theta = c.theta,
+        eps = c.eps,
+        sm_scale = f32(1.0 / f32(sqrt(hd))),
+        embed = weight([c.vocab, hidden], banks),
+        layers = [layer(l) for l in range(layers)],
+    )
+
+CHANNELS = 16
+PATCH = 2
+PATCH_FEATURES = CHANNELS * PATCH * PATCH
+SPATIAL_COMPRESSION = 8
+ADALN_DIM = 256
+T_MID = 1024
+T_FREQ_DIM = 256
+TRAIN_STEPS = 1000
+# The timestep the forward flips its sigma about (`1000 - t`).
+T_FLIP = 1000.0
+ROPE_AXES = 3
+MOD_SLICES = 4
+RGB = 3
+TE_LAYERS = 35
+TE_MAX_TOKENS = 512
+
+DIMS = {
+    "z-image-turbo": struct(
+        dim = 3840,
+        heads = 30,
+        head_dim = 128,
+        inter = 10240,
+        joint_layers = 30,
+        refiner_layers = 2,
+        cap_width = QWEN3_4B.hidden,
+        rope_dims = [32, 48, 48, 0],
+    ),
+    "z-image-mini": struct(
+        dim = 256,
+        heads = 4,
+        head_dim = 64,
+        inter = 682,
+        joint_layers = 2,
+        refiner_layers = 2,
+        cap_width = 64,
+        rope_dims = [16, 24, 24, 0],
+    ),
+}
+
+def block(d, modulated, banks):
+    dim, hd, inter = d.dim, d.head_dim, d.inter
+    norm = lambda s, width: weight([width])
+    return struct(
+        ada = linear(MOD_SLICES * dim, ADALN_DIM, banks) if modulated else None,
+        attn_norm1 = norm("attn_norm1", dim),
+        attn_norm2 = norm("attn_norm2", dim),
+        ffn_norm1 = norm("ffn_norm1", dim),
+        ffn_norm2 = norm("ffn_norm2", dim),
+        attn = struct(
+            qkv = weight([3 * dim, dim], banks).packed([dim, dim, dim]),
+            q_norm = norm("q_norm", hd),
+            k_norm = norm("k_norm", hd),
+            out = weight([dim, dim], banks),
+        ),
+        mlp = struct(
+            gate_up = weight([2 * inter, dim], banks).packed([inter, inter]),
+            down = weight([dim, inter], banks),
+        ),
+    )
+
+# The latent's shift, which the VAE's diffusers config states and no
+# checkpoint tensor holds.
+SHIFT_FACTOR = 0.1159
+
+def vae_latent():
+    return struct(shift = weight([CHANNELS], values = [SHIFT_FACTOR] * CHANNELS))
+
+def layout(id, deploy):
+    banks = roles(deploy, "banks", exact = True).banks
+    d = DIMS[id]
+    if d.rope_dims[0] + d.rope_dims[1] + d.rope_dims[2] + d.rope_dims[3] != d.head_dim or d.heads * d.head_dim != d.dim:
+        fail("the rotary axes cover the whole head, and heads × head_dim is the width")
+    dim = d.dim
+    blocks = lambda stem, count, modulated: [
+        block(d, modulated, banks)
+        for i in range(count)
+    ]
+    turbo = id == "z-image-turbo"
+    return struct(
+        dims = d,
+        sm_scale = f32(1.0 / f32(sqrt(d.head_dim))),
+        kv = dtype.bf16,
+        channels = CHANNELS,
+        patch_features = PATCH_FEATURES,
+        t_freq_dim = T_FREQ_DIM,
+        rope_axes = ROPE_AXES,
+        dit = struct(
+            x_embed = linear(dim, PATCH_FEATURES, banks),
+            x_pad_mod = weight([2 * dim, 1]),
+            cap_norm = weight([d.cap_width]),
+            cap_embed = linear(dim, d.cap_width, banks),
+            cap_pad_mod = weight([2 * dim, 1]),
+            t_mlp0 = linear(T_MID, T_FREQ_DIM, banks),
+            t_mlp1 = linear(ADALN_DIM, T_MID, banks),
+            t_flip = weight([1], dtype.f32, values = [T_FLIP]),
+            noise_refiner = blocks("noise", d.refiner_layers, True),
+            context_refiner = blocks("context", d.refiner_layers, False),
+            layers = blocks("layer", d.joint_layers, True),
+            final_ada = linear(dim, ADALN_DIM, banks),
+            final_linear = linear(PATCH_FEATURES, dim, banks),
+        ),
+        te = encoder(QWEN3_4B, TE_LAYERS, banks) if turbo else None,
+        vae = flux_vae(CHANNELS, CHANNELS, vae_latent) if turbo else None,
+        shift = 3.0,
+        tap = deploy.tap or "",
+    )
+
+def turbo_sigmas(shift):
+    out = []
+    for i in range(8):
+        sigma = f32(1.0 - f32(f32(i) / 8.0))
+        out.append(f32(f32(shift * sigma) / f32(1.0 + f32((shift - 1.0) * sigma))))
+    return out
+
+def generative(m):
+    d = m.dims
+    next = [0]
+
+    def take(present):
+        if not present:
+            return None
+        next[0] += 1
+        return next[0] - 1
+
+    text = take(m.te != None)
+    refine = take(True)
+    denoise = take(True)
+    vae_decode = take(m.vae != None)
+    vae_encode = take(m.vae != None)
+    readings = []
+    if text != None:
+        readings.append(reading(
+            "text",
+            index = text,
+            has_kv = True,
+            takes_tokens = True,
+            streams = ["text"],
+            readout = "hidden",
+            readout_width = m.te.hidden,
+        ))
+    readings.append(reading(
+        "refine",
+        index = refine,
+        streams = ["context"],
+        ports = [
+            port("pad", "latents", 1, ["context"]),
+            port("caption", "context", d.cap_width, ["context"]),
+            port("positions", "axis_positions", ROPE_AXES, ["context"]),
+        ],
+        positions = positions(
+            axes = ["time", "height", "width"],
+            text_axis = 0,
+            text_origin = 1,
+            image_follows_text = False,
+        ),
+        readout = "hidden",
+        readout_width = d.dim,
+    ))
+    readings.append(reading(
+        "denoise",
+        index = denoise,
+        streams = ["image", "context"],
+        ports = [
+            port("pad", "latents", 1, ["image"]),
+            port("latents", "latents", PATCH_FEATURES, ["image"]),
+            port("context", "latents", d.dim, ["context"]),
+            port("timestep", "lane_vector", 1, ["image", "context"]),
+            port("positions", "axis_positions", ROPE_AXES, ["image", "context"]),
+        ],
+        positions = positions(
+            axes = ["time", "height", "width"],
+            text_axis = 0,
+            text_origin = 1,
+            image_follows_text = True,
+        ),
+        readout = "velocity",
+        readout_width = PATCH_FEATURES if m.tap in ["", "latents", "final_linear"] else d.dim,
+    ))
+    if vae_decode != None and vae_encode != None:
+        readings.append(reading(
+            "vae.decode",
+            index = vae_decode,
+            streams = ["image"],
+            ports = [port("latent", "voxels", CHANNELS, ["image"])],
+            readout = "pixels",
+            readout_width = RGB,
+        ))
+        readings.append(reading(
+            "vae.encode",
+            index = vae_encode,
+            streams = ["image"],
+            ports = [port("pixels", "voxels", RGB, ["image"], at = 1)],
+            readout = "pixels",
+            readout_width = CHANNELS,
+        ))
+    return generation(
+        readings = readings,
+        latent = latent_space(
+            channels = CHANNELS,
+            patch_t = 1,
+            patch_h = PATCH,
+            patch_w = PATCH,
+            spatial_compression = SPATIAL_COMPRESSION,
+            temporal_compression = 1,
+        ),
+        schedule = schedule(
+            "flow",
+            shift = m.shift,
+            train_steps = TRAIN_STEPS,
+            pinned_sigmas = turbo_sigmas(m.shift),
+        ),
+        max_rows = 16384 + TE_MAX_TOKENS if m.te != None else 4096,
+    )
+
+# How a Z-Image checkpoint is laid out: a diffusers pipeline, its components
+# under `dit.`, `te.` and `vae.`; or, for a model of the transformer alone,
+# a bare transformer state_dict.
+
+def biased(reads, w, stem):
+    """The projection `w` from `stem.weight`, and its bias (if any) from
+    `stem.bias`."""
+    reads.read(w.w, stem + ".weight")
+    if w.bias != None:
+        reads.read(w.bias, stem + ".bias")
+
+def read_conv(reads, c, stem):
+    """The convolution `c` from `stem`, its kernel transmuted to the taps-major
+    plane the layout holds."""
+    name = stem + ".weight"
+    reads.read_expr(c.w, src(name).transmute(c.w.shape, stored(name)))
+    reads.read(c.bias, stem + ".bias")
+
+def conv_head(reads, c, stem, rows_stored):
+    """The convolution `c`: the first of the `rows_stored` output channels
+    the checkpoint holds at `stem`."""
+    kernel = stem + ".weight"
+    natural = list(c.w.shape)
+    natural[0] = rows_stored
+    rows = c.c_out
+    reads.read_expr(c.w, src(kernel).transmute(natural, stored(kernel)).slice(0, 0, rows))
+    bias = stem + ".bias"
+    held = stored(bias)
+    want = encoding(c.bias.dtype)
+    head = c.bias.name + ".head"
+    reads.push(tensor(head, src(bias).slice(0, 0, rows), held, shape = c.bias.shape, internal = True))
+    reads.push(tensor(c.bias.name, out(head) if want == held else out(head).cast(want), want, shape = c.bias.shape))
+
+def read_group_norm(reads, n, stem):
+    reads.read(n.weight, stem + ".weight")
+    reads.read(n.bias, stem + ".bias")
+
+def read_resnet(reads, r, stem):
+    read_group_norm(reads, r.norm1, stem + ".norm1")
+    read_conv(reads, r.conv1, stem + ".conv1")
+    read_group_norm(reads, r.norm2, stem + ".norm2")
+    read_conv(reads, r.conv2, stem + ".conv2")
+    if r.shortcut != None:
+        read_conv(reads, r.shortcut, stem + ".conv_shortcut")
+
+def read_mid(reads, m, stem):
+    read_resnet(reads, m.res0, stem + ".resnets.0")
+    a = m.attn
+    n = lambda s: stem + ".attentions.0." + s
+    read_group_norm(reads, a.norm, n("group_norm"))
+    biased(reads, a.q, n("to_q"))
+    biased(reads, a.k, n("to_k"))
+    biased(reads, a.v, n("to_v"))
+    biased(reads, a.out, n("to_out.0"))
+    read_resnet(reads, m.res1, stem + ".resnets.1")
+
+def vae_read(reads, v, encoder_out_stored = None):
+    """The decoder, then the encoder; with `encoder_out_stored`, the
+    encoder's output convolution is the head of the one stored."""
+    at = lambda tail: "vae." + tail
+    d = v.decoder
+    read_conv(reads, d.conv_in, at("decoder.conv_in"))
+    read_mid(reads, d.mid, at("decoder.mid_block"))
+    for i, up in enumerate(d.up):
+        for r, block in enumerate(up.resnets):
+            read_resnet(reads, block, at("decoder.up_blocks.{}.resnets.{}".format(i, r)))
+        if up.upsample != None:
+            read_conv(reads, up.upsample, at("decoder.up_blocks.{}.upsamplers.0.conv".format(i)))
+    read_group_norm(reads, d.norm_out, at("decoder.conv_norm_out"))
+    read_conv(reads, d.conv_out, at("decoder.conv_out"))
+
+    e = v.encoder
+    read_conv(reads, e.conv_in, at("encoder.conv_in"))
+    for i, down in enumerate(e.down):
+        for r, block in enumerate(down.resnets):
+            read_resnet(reads, block, at("encoder.down_blocks.{}.resnets.{}".format(i, r)))
+        if down.downsample != None:
+            read_conv(reads, down.downsample, at("encoder.down_blocks.{}.downsamplers.0.conv".format(i)))
+    read_mid(reads, e.mid, at("encoder.mid_block"))
+    read_group_norm(reads, e.norm_out, at("encoder.conv_norm_out"))
+    if encoder_out_stored == None:
+        read_conv(reads, e.conv_out, at("encoder.conv_out"))
+    else:
+        conv_head(reads, e.conv_out, at("encoder.conv_out"), encoder_out_stored)
+
+def te_read(reads, te, prefix):
+    reads.read(te.embed, prefix + "embed_tokens.weight")
+    for l, w in enumerate(te.layers):
+        n = lambda s: "{}layers.{}.{}".format(prefix, l, s)
+        reads.read(w.attn_norm, n("input_layernorm.weight"))
+        reads.read(w.q, n("self_attn.q_proj.weight"))
+        reads.read(w.k, n("self_attn.k_proj.weight"))
+        reads.read(w.v, n("self_attn.v_proj.weight"))
+        reads.read(w.o, n("self_attn.o_proj.weight"))
+        reads.read(w.q_norm, n("self_attn.q_norm.weight"))
+        reads.read(w.k_norm, n("self_attn.k_norm.weight"))
+        reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
+        reads.read_concat(w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+        reads.read(w.down, n("mlp.down_proj.weight"))
+
+def product(xs):
+    out = 1
+    for x in xs:
+        out *= x
+    return out
+
+DIFFUSERS = "a diffusers pipeline (`dit.`/`te.` prefixes)"
+BARE = "a bare transformer state_dict"
+
+def formats(m):
+    pipeline = lambda checkpoint: has_prefix("dit.")
+    out = [format(DIFFUSERS, recognizes = pipeline, read = lambda reads: read(m, reads, "dit."))]
+    if m.te == None:
+        out.append(format(
+            BARE,
+            recognizes = lambda checkpoint: not pipeline(checkpoint),
+            read = lambda reads: read(m, reads, ""),
+        ))
+    return out
+
+def read(m, reads, prefix):
+    dit(reads, m.dit, prefix)
+    if m.te != None:
+        te_read(reads, m.te, "te.model.")
+    if m.vae != None:
+        vae_read(reads, m.vae, 2 * m.vae.encoder.conv_out.c_out)
+
+def raw_of(w, name, what):
+    held = stored(name)
+    if held.raw == None:
+        fail("`{}`: `{}` is stored {}; {}".format(w.name, name, held, what))
+    return held.raw
+
+def pad_table(reads, w, token):
+    dt = raw_of(w, token, "a pad token is a raw float row")
+    dim = w.shape[0] // 2
+    reads.read_expr(w, concat(0, [
+        constant(w.name, [-1.0] * dim, [dim, 1], dt),
+        src(token).transmute([dim, 1], raw(dt)),
+    ]))
+
+def dit(reads, m, prefix):
+    at = lambda tail: prefix + tail
+    biased(reads, m.x_embed, at("all_x_embedder.2-1"))
+    pad_table(reads, m.x_pad_mod, at("x_pad_token"))
+    reads.read(m.cap_norm, at("cap_embedder.0.weight"))
+    biased(reads, m.cap_embed, at("cap_embedder.1"))
+    pad_table(reads, m.cap_pad_mod, at("cap_pad_token"))
+    biased(reads, m.t_mlp0, at("t_embedder.mlp.0"))
+    biased(reads, m.t_mlp1, at("t_embedder.mlp.2"))
+    for stem, blocks in [
+        ("noise_refiner", m.noise_refiner),
+        ("context_refiner", m.context_refiner),
+        ("layers", m.layers),
+    ]:
+        for i, b in enumerate(blocks):
+            transformer_block(reads, b, at("{}.{}".format(stem, i)))
+    biased(reads, m.final_ada, at("all_final_layer.2-1.adaLN_modulation.1"))
+    biased(reads, m.final_linear, at("all_final_layer.2-1.linear"))
+
+def transformer_block(reads, b, stem):
+    n = lambda s: stem + "." + s
+    if b.ada != None:
+        biased(reads, b.ada, n("adaLN_modulation.0"))
+    reads.read(b.attn_norm1, n("attention_norm1.weight"))
+    reads.read(b.attn_norm2, n("attention_norm2.weight"))
+    reads.read(b.ffn_norm1, n("ffn_norm1.weight"))
+    reads.read(b.ffn_norm2, n("ffn_norm2.weight"))
+    reads.read_concat(b.attn.qkv, [
+        n("attention.to_q.weight"),
+        n("attention.to_k.weight"),
+        n("attention.to_v.weight"),
+    ])
+    reads.read(b.attn.q_norm, n("attention.norm_q.weight"))
+    reads.read(b.attn.k_norm, n("attention.norm_k.weight"))
+    reads.read(b.attn.out, n("attention.to_out.0.weight"))
+    reads.read_concat(b.mlp.gate_up, [n("feed_forward.w1.weight"), n("feed_forward.w3.weight")])
+    reads.read(b.mlp.down, n("feed_forward.w2.weight"))
+
+# The forward of Z-Image: the text encoder's last hidden rows, the context
+# refiner over the caption, the denoiser over the image and the refined
+# context jointly, and the VAE's decode and encode, each its own reading.
+
+def run_linear(w, x):
+    """`x` through the projection `w`, plus its bias if it has one."""
+    y = ops.linear.matmul(x, w.w)
+    if w.bias == None:
+        return y
+    return ops.elemwise.add_bias(w.bias, y)
+
+def chunks(x, widths):
+    """`x`'s rows cut into consecutive pieces of `widths`, the last one
+    whatever remains."""
+    out = []
+    for width in widths[:-1]:
+        head, x = ops.gather.split_rows(x, width)
+        out.append(head)
+    out.append(x)
+    return out
+
+def attend(q, k, v, rows, over, head_dim, sm_scale, mask):
+    """`q`'s rows attending `k` and `v`'s, each side grouped by its own
+    `perm` and `csr`."""
+    o = ops.attn.ragged(
+        ops.gather.pack_rows(q, rows.perm),
+        ops.gather.pack_rows(k, over.perm),
+        ops.gather.pack_rows(v, over.perm),
+        rows.csr,
+        over.csr,
+        head_dim,
+        sm_scale,
+        mask,
+    )
+    return ops.gather.unpack_rows(o, rows.perm)
+
+GN_GROUPS = 32
+
+GN_EPS = 1e-6
+
+def convolve(x, grid, c):
+    shape = conv([1, 1], [1, 1], [0, 0]) if c.taps == 1 else conv([3, 3], [1, 1], [1, 1])
+    return ops.conv.conv3d(x, grid, c.w, c.bias, shape, None)[0]
+
+def run_group_norm(x, grid, n, silu):
+    return ops.conv.group_norm(x, grid, GN_GROUPS, n.weight, n.bias, GN_EPS, silu)
+
+def run_resnet(x, grid, r):
+    h = run_group_norm(x, grid, r.norm1, True)
+    h = convolve(h, grid, r.conv1)
+    h = run_group_norm(h, grid, r.norm2, True)
+    h = convolve(h, grid, r.conv2)
+    skip = convolve(x, grid, r.shortcut) if r.shortcut != None else x
+    return ops.elemwise.add(skip, h)
+
+def attention(x, grid, a):
+    h = run_group_norm(x, grid, a.norm, False)
+    q = run_linear(a.q, h)
+    k = run_linear(a.k, h)
+    v = run_linear(a.v, h)
+    o = ops.attn.voxel(q, k, v, grid, f32(1.0 / f32(sqrt(a.width))))
+    return ops.elemwise.add(x, run_linear(a.out, o))
+
+def run_mid(x, grid, m):
+    h = run_resnet(x, grid, m.res0)
+    h = attention(h, grid, m.attn)
+    return run_resnet(h, grid, m.res1)
+
+def vae_decode(vae, z, grid):
+    """The pixels the decoder makes of the latent `z`, read out."""
+    d = vae.decoder
+    h = convolve(z, grid, d.conv_in)
+    h = run_mid(h, grid, d.mid)
+    for block in d.up:
+        for res in block.resnets:
+            h = run_resnet(h, grid, res)
+        if block.upsample != None:
+            up, grid = ops.conv.upsample_nearest(h, grid, [1, 2, 2], False)
+            h = convolve(up, grid, block.upsample)
+    h = run_group_norm(h, grid, d.norm_out, True)
+    y = convolve(h, grid, d.conv_out)
+    seam.at(seam.PIXELS, [y, grid])
+    return y
+
+def vae_encode(vae, arm):
+    """The encoder's output over `arm`'s pixels, and its grid."""
+    e = vae.encoder
+    grid = arm.grid()
+    x = arm.voxels(1, RGB, dtype.bf16)
+    h = convolve(x, grid, e.conv_in)
+    for block in e.down:
+        for res in block.resnets:
+            h = run_resnet(h, grid, res)
+        if block.downsample != None:
+            c = block.downsample
+            h, grid = ops.conv.conv3d(h, grid, c.w, c.bias, conv([3, 3], [2, 2], [0, 0], pad_back = [0, 1, 1]), None)
+    h = run_mid(h, grid, e.mid)
+    h = run_group_norm(h, grid, e.norm_out, True)
+    return convolve(h, grid, e.conv_out), grid
+
+def qwen3_caches(te, c, kv):
+    space = c.kv_space(kv)
+    plane = te.kv_heads * te.head_dim
+    for layer in te.layers:
+        c.kv(space, layer.kv, [plane, plane], te.head_dim, heads = True)
+
+def qwen3_encode(arm, te, tap = None):
+    """The encoder over `arm`'s tokens. `tap(l, y)` sees each layer's output
+    rows and reads the encoder out; without one, the last layer's rows are
+    its readout."""
+    plan = ops.attn.plan_prefill(arm, te.q_heads, te.kv_heads, te.head_dim, None)
+    ids = arm.tokens()
+    positions = arm.positions()
+    y = ops.gather.embed(ids, te.embed, te.vocab)
+    last = len(te.layers) - 1
+
+    def layer(l, w, y):
+        pages = arm.kv(w.kv)
+        x = ops.elemwise.rmsnorm(y, w.attn_norm, te.eps)
+        q = ops.linear.matmul(x, w.q)
+        k = ops.linear.matmul(x, w.k)
+        v = ops.linear.matmul(x, w.v)
+        q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, te.head_dim, te.eps)
+        k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, te.head_dim, te.eps)
+        q, k = ops.elemwise.rope(q, positions, te.head_dim, te.theta, rotary.full(), k = k)
+        ops.attn.kv_append(k, v, pages, arm.write_page(w.kv), arm.write_offset(w.kv))
+        o = ops.attn.prefill(q, plan, pages, None, te.head_dim, te.kv_heads, te.sm_scale)
+        y = ops.elemwise.residual_add(ops.linear.matmul(o, w.o), y)
+
+        x = ops.elemwise.rmsnorm(y, w.mlp_norm, te.eps)
+        f = ops.linear.matmul(
+            ops.linear.glu(ops.linear.matmul(x, w.gate_up), gating.swiglu(), te.inter),
+            w.down,
+        )
+        y = ops.elemwise.residual_add(f, y)
+        if tap != None:
+            tap(l, y)
+        elif l == last:
+            seam.at(seam.HIDDEN, [y])
+        return y
+
+    arm.fold_layers(te.layers, y, layer)
+
+T_MAX_PERIOD = 10000.0
+NORM_EPS = 1e-5
+FINAL_LN_EPS = 1e-6
+ROPE_THETA = 256.0
+SCALING_FACTOR = 0.3611
+
+def caches(m, c):
+    if m.te != None:
+        qwen3_caches(m.te, c, m.kv)
+
+def forward(m, inputs):
+    if m.te != None:
+        inputs.reading("text", lambda rows: qwen3_encode(rows, m.te))
+    inputs.reading("refine", lambda rows: refine(rows, m))
+    velocity = inputs.reading("denoise", lambda rows: denoise(rows, m))
+    if m.vae != None:
+        inputs.reading("vae.decode", lambda rows: decode(rows, m))
+        inputs.reading("vae.encode", lambda rows: encode(rows, m))
+    return velocity
+
+def pad_rows(x, flag, bank):
+    return ops.elemwise.modulate(x, ops.linear.matmul(flag, bank), None, "scale_shift")
+
+def refine(arm, m):
+    d, dit = m.dims, m.dit
+    c = arm.context(0, d.cap_width)
+    c = ops.elemwise.rmsnorm(c, dit.cap_norm, NORM_EPS)
+    c = run_linear(dit.cap_embed, c)
+    c = pad_rows(c, arm.latents(0, 1, dtype.bf16), dit.cap_pad_mod)
+    geom = struct(
+        positions = arm.axis_positions(0, m.rope_axes),
+        perm = arm.row_permutation(),
+        csr = arm.lane_indptr(),
+        mask = unmasked(),
+    )
+    last = len(dit.context_refiner) - 1
+
+    def layer(l, b, c):
+        c = run_block(c, b, None, m, geom, "")[0]
+        if l == last:
+            seam.at(seam.HIDDEN, [c])
+        return c
+
+    arm.fold_layers(dit.context_refiner, c, layer)
+
+def adaln(mods, dim):
+    scale_msa, gate_msa, scale_mlp, gate_mlp = chunks(mods, [dim, dim, dim, dim])
+    return struct(
+        scale_msa = scale_msa,
+        gate_msa = ops.elemwise.tanh(gate_msa),
+        scale_mlp = scale_mlp,
+        gate_mlp = ops.elemwise.tanh(gate_mlp),
+    )
+
+def seam_tapped(image, context):
+    """`image` and `context`, cut to `image`'s width, read out as the
+    velocity at a tap."""
+    width = image.width()
+    if width < context.width():
+        context = ops.gather.split_rows(context, width)[0]
+    both = merge([image, context])
+    seam.at(seam.VELOCITY, [both])
+    return both
+
+def denoise(arm, m):
+    d, dit = m.dims, m.dit
+    image = fact.stream("image")
+    img, ctx = arm.on(image), arm.on(~image)
+
+    lanes = arm.request_of_token()
+    positions = arm.axis_positions(0, m.rope_axes)
+    joint = struct(
+        positions = positions,
+        perm = arm.row_permutation(),
+        csr = arm.group_indptr(),
+        mask = group_block_diagonal(),
+    )
+
+    # 1000 - t. An in-place op cannot write a runtime input, so `t + t`
+    # makes the value the scale owns, the scale halving it back.
+    t = arm.lane_vector(0, 1)
+    u = ops.elemwise.add_bias(dit.t_flip, ops.elemwise.mul_scalar(-0.5, ops.elemwise.add(t, t)))
+    temb = ops.elemwise.sinusoid(u, m.t_freq_dim, T_MAX_PERIOD, True, 1.0)
+    temb = run_linear(dit.t_mlp1, ops.elemwise.silu(run_linear(dit.t_mlp0, temb)))
+
+    img_lanes = lanes.on(image)
+    img_positions = positions.on(image)
+    temb_img = temb.on(image)
+    own = struct(
+        positions = img_positions,
+        perm = img.row_permutation(),
+        csr = img.lane_indptr(),
+        mask = unmasked(),
+    )
+    x = img.latents(1, m.patch_features, dtype.bf16)
+
+    # A tap reads the context in first, and ends the forward at its
+    # intermediate; a fold carries `struct(tapped = ...)` past its rest.
+    tap = m.tap
+    context = ctx.latents(2, d.dim, dtype.bf16) if tap else None
+    stop = lambda v: struct(tapped = seam_tapped(v, context))
+    if tap == "latents":
+        return seam_tapped(x, context)
+    x = run_linear(dit.x_embed, x)
+    if tap == "x_linear":
+        return seam_tapped(x, context)
+    x = pad_rows(x, img.latents(0, 1, dtype.bf16), dit.x_pad_mod)
+    if tap == "x_embed":
+        return seam_tapped(x, context)
+
+    def refiner(l, b, x):
+        if type(x) == "struct":
+            return x
+        mods = adaln(run_linear(b.ada, temb_img), d.dim)
+        if l == 0 and tap in ["normed0", "scaled0"]:
+            h = ops.elemwise.rmsnorm(x, b.attn_norm1, NORM_EPS)
+            if tap == "scaled0":
+                h = ops.elemwise.modulate(h, mods.scale_msa, img_lanes, "scale")
+            return stop(h)
+        x, hit = run_block(x, b, (mods, img_lanes), m, own, tap if l == 0 else "")
+        if hit != None:
+            return stop(hit)
+        if tap == "refiner{}".format(l):
+            return stop(x)
+        return x
+
+    x = img.fold_layers(dit.noise_refiner, x, refiner)
+    if type(x) == "struct":
+        return x.tapped
+    if tap == "x_refined":
+        return seam_tapped(x, context)
+    c = context if context != None else ctx.latents(2, d.dim, dtype.bf16)
+
+    def layer(l, b, u):
+        if type(u) == "struct":
+            return u
+        mods = adaln(run_linear(b.ada, temb), d.dim)
+        u = run_block(u, b, (mods, lanes), m, joint, "")[0]
+        if tap == "layer{}".format(l):
+            return struct(tapped = seam_tapped(u.on(image), u.on(~image)))
+        return u
+
+    u = arm.fold_layers(dit.layers, merge([x, c]), layer)
+    if type(u) == "struct":
+        return u.tapped
+
+    scale = run_linear(dit.final_ada, ops.elemwise.silu(temb)).on(image)
+    u = u.on(image)
+    h = ops.elemwise.modulate(ops.elemwise.layernorm_no_scale(u, FINAL_LN_EPS), scale, img_lanes, "scale")
+    if tap == "final_norm":
+        return seam_tapped(h, context)
+    v = run_linear(dit.final_linear, h)
+    if tap == "final_linear":
+        return seam_tapped(v, context)
+    if tap:
+        fail("the tap {} names no intermediate of z-image".format(tap))
+    velocity = ops.elemwise.mul_scalar(-1.0, v)
+    seam.at(seam.VELOCITY, [velocity])
+    return velocity
+
+def run_block(x, b, mods, m, g, tap):
+    """The block's output, and the value at `tap` if it names one of its
+    first block's intermediates."""
+    d = m.dims
+    dim, hd = d.dim, d.head_dim
+    hit = [None]
+
+    def at(name, v):
+        if tap == name:
+            hit[0] = v
+
+    h = ops.elemwise.rmsnorm(x, b.attn_norm1, NORM_EPS)
+    if mods != None:
+        h = ops.elemwise.modulate(h, mods[0].scale_msa, mods[1], "scale")
+    q, k, v = ops.gather.split_qkv(ops.linear.matmul(h, b.attn.qkv), dim, dim)
+
+    def turn(x, gain):
+        return ops.elemwise.rope_axes(
+            ops.elemwise.rmsnorm_per_head(x, gain, hd, NORM_EPS),
+            g.positions,
+            d.rope_dims,
+            [ROPE_THETA] * 4,
+            "interleaved",
+            hd,
+            hd,
+        )
+
+    q = turn(q, b.attn.q_norm)
+    k = turn(k, b.attn.k_norm)
+    at("b0.q", q)
+    at("b0.k", k)
+    at("b0.v", v)
+    o = attend(q, k, v, g, g, hd, m.sm_scale, g.mask)
+    at("b0.attn", o)
+    o = ops.linear.matmul(o, b.attn.out)
+    at("b0.out", o)
+    o = ops.elemwise.rmsnorm(o, b.attn_norm2, NORM_EPS)
+    at("b0.norm2", o)
+    if mods != None:
+        x = ops.elemwise.gated_residual_add(x, mods[0].gate_msa, o, mods[1])
+    else:
+        x = ops.elemwise.residual_add(o, x)
+    at("b0.res1", x)
+
+    h = ops.elemwise.rmsnorm(x, b.ffn_norm1, NORM_EPS)
+    if mods != None:
+        h = ops.elemwise.modulate(h, mods[0].scale_mlp, mods[1], "scale")
+    f = ops.linear.matmul(
+        ops.linear.glu(ops.linear.matmul(h, b.mlp.gate_up), gating.swiglu(), d.inter),
+        b.mlp.down,
+    )
+    at("b0.ffn", f)
+    f = ops.elemwise.rmsnorm(f, b.ffn_norm2, NORM_EPS)
+    at("b0.ffn_norm2", f)
+    if mods != None:
+        out = ops.elemwise.gated_residual_add(x, mods[0].gate_mlp, f, mods[1])
+    else:
+        out = ops.elemwise.residual_add(f, x)
+    at("b0.res2", out)
+    return (out, hit[0])
+
+def decode(arm, m):
+    grid = arm.grid()
+    z = arm.voxels(0, m.channels, dtype.bf16)
+    # z / s + shift, `z + z` owned (as above) and its halving folded into 1 / s.
+    scale = f32(0.5 * f32(1.0 / f32(SCALING_FACTOR)))
+    z = ops.elemwise.add_bias(m.vae.latent.shift, ops.elemwise.mul_scalar(scale, ops.elemwise.add(z, z)))
+    return vae_decode(m.vae, z, grid)
+
+def encode(arm, m):
+    mean, grid = vae_encode(m.vae, arm)
+    seam.at(seam.PIXELS, [mean, grid])
+    return mean

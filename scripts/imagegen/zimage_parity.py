@@ -60,7 +60,7 @@ that order and then decodes both final latents.
 BISECTING A FAILURE. `zimage_golden.py --taps` records every stage of the
 Turbo transformer over the step-0 inputs, and a tapped deployment
 (`z-image-mini-bf16-kv-bf16-tap.<key>`, read as `deploy.tap` in
-`models/z_image/model.poem`) makes the `denoise` reading read one of them
+`models/z_image.poem`) makes the `denoise` reading read one of them
 back instead of the velocity; import the artifact under it first. `--mode tiny` is the 32-row case those taps were cut for, and
 `--ctx_tap` reads the caption half of a `layer{l}` tap off the context
 lane:

@@ -2584,23 +2584,6 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "linear",
-        name: "moe_matmul_select_quant",
-        params: &["x", "bank", "routes", "top_k"],
-        call: |a, heap| {
-            let x: Value = a.next()?;
-            let bank: Weight = a.next()?;
-            let routes: Value = a.next()?;
-            let top_k: u32 = a.next()?;
-            result(
-                heap,
-                dsl("linear.moe_matmul_select_quant", || {
-                    ops::linear::moe_matmul_select_quant(&x, &bank, &routes, top_k)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
         name: "moe_weighted_sum",
         params: &["routed", "weights"],
         call: |a, heap| {

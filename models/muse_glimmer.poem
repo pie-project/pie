@@ -1,0 +1,206 @@
+# Muse Glimmer 30B, and its eight-layer miniature, which reads the first
+# eight layers of the whole model's checkpoint.
+
+load("//pie/codec.poem", "mapped")
+load("//lib/adapters.poem", "banks")
+
+ATEM = template("atem")
+TOKENIZER = tokenizer(markers = [["<|eot|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start|>", "<|message|>", "<|eom|>"]])
+
+MODELS = [
+    model("muse-glimmer-30b", template = ATEM, tokenizer = TOKENIZER, arch = "muse_glimmer", layers = 52, vocab = 202048),
+    model("muse-glimmer-30b-mini-l8", mini = True, template = ATEM, tokenizer = TOKENIZER, arch = "muse_glimmer", layers = 8, vocab = 202048),
+]
+
+DEPLOYMENTS = [
+    deployment("muse-glimmer-30b", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("muse-glimmer-30b", weights = dtype.u4g64, kv = dtype.bf16),
+    deployment("muse-glimmer-30b-mini-l8", weights = dtype.bf16, kv = dtype.bf16),
+]
+
+# Muse Glimmer: a dense decoder of sliding-window layers with a full-attention
+# layer every fourth, gated attention and sandwich norms.
+
+def dims(layers = 52):
+    return struct(
+        hidden = 6656,
+        layers = layers,
+        full_every = 4,
+        q_heads = 32,
+        kv_heads = 2,
+        head_dim = 128,
+        inter = 19968,
+        vocab = 202048,
+        window = 2048,
+        theta = 500000.0,
+        qk_scale = 3.87,
+        softcap = 20.0,
+        output_multiplier = 0.19611613,
+        norm_eps = 1e-5,
+        post_norm_eps = 1e-8,
+    )
+
+DIMS = {
+    "muse-glimmer-30b": dims(),
+    "muse-glimmer-30b-mini-l8": dims(layers = 8),
+}
+
+def layout(id, deploy):
+    w = roles(deploy, "w", exact = True).w
+    d = DIMS[id]
+    dense = compute(w)
+    proj = dtype.u4g64tiled if w == dtype.u4g64 else w
+    hidden = d.hidden
+    hd = d.head_dim
+    q_w = d.q_heads * hd
+    kv_w = d.kv_heads * hd
+    iw = d.inter
+
+    def layer(l):
+        norm = lambda s: weight([hidden])
+        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        return struct(
+            full = l % d.full_every == d.full_every - 1,
+            qkv = weight([q_w + 2 * kv_w, hidden], proj).packed([q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
+            gate = weight([q_w, hidden], proj).columns(),
+            o_proj = weight([hidden, q_w], proj).rows(),
+            kv = "kv.{}".format(l),
+            attn_norm = norm("attn_norm"),
+            attn_norm_eps = d.norm_eps,
+            post_attn_norm = norm("post_attn_norm"),
+            post_attn_norm_eps = d.post_norm_eps,
+            pre_ffw_norm = norm("pre_ffw_norm"),
+            pre_ffw_norm_eps = d.norm_eps,
+            post_ffw_norm = norm("post_ffw_norm"),
+            post_ffw_norm_eps = d.post_norm_eps,
+            gate_up = weight([2 * iw, hidden], proj).packed([iw, iw]),
+            inter = iw,
+            down = weight([hidden, iw], proj).rows(),
+            lora_a = lora_a,
+            lora_b = lora_b,
+        )
+
+    lm_head = weight([d.vocab, hidden], proj).packed([d.vocab])
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        q_heads = d.q_heads,
+        kv_heads = d.kv_heads,
+        head_dim = hd,
+        window = d.window,
+        theta = d.theta,
+        sm_scale = f32(f32(d.qk_scale) / f32(sqrt(hd))),
+        norm_eps = d.norm_eps,
+        kv = deploy.kv,
+        softcap = d.softcap,
+        output_multiplier = d.output_multiplier,
+        embed = weight([d.vocab, hidden], w),
+        lm_head = lm_head,
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight([hidden]),
+        final_norm_eps = d.norm_eps,
+    )
+
+# How a Muse Glimmer checkpoint is laid out: transformers' names, the text
+# model under `model.language_model.`, and mlx_lm's, under `language_model.model.`.
+
+LAYOUTS = {
+    "huggingface": struct(trunk = "model.language_model.", lm_head = "lm_head.weight"),
+    "mlx_lm": struct(trunk = "language_model.model.", lm_head = "language_model.lm_head.weight"),
+}
+
+def formats(m):
+    return [safetensors_format(m, "huggingface"), safetensors_format(m, "mlx_lm")]
+
+def safetensors_format(m, name):
+    layout = LAYOUTS[name]
+    return format(
+        name,
+        recognizes = lambda checkpoint: has(layout.trunk + "embed_tokens.weight"),
+        read = lambda reads: mapped(reads, m, rows(layout), quantized = "read"),
+    )
+
+def rows(layout):
+    """The checkpoint's names, under `layout`'s prefixes, mapped onto the
+    layout's."""
+    t = lambda leaf: layout.trunk + leaf
+    n = lambda leaf: t("layers.{l}." + leaf)
+    return [
+        (t("embed_tokens.weight"), "embed"),
+        (t("norm.weight"), "final_norm"),
+        (layout.lm_head, "lm_head"),
+        (n("input_layernorm.weight"), "layers.{l}.attn_norm"),
+        (n("post_attention_layernorm.weight"), "layers.{l}.post_attn_norm"),
+        (n("pre_feedforward_layernorm.weight"), "layers.{l}.pre_ffw_norm"),
+        (n("post_feedforward_layernorm.weight"), "layers.{l}.post_ffw_norm"),
+        ([n("self_attn.q_proj.weight"), n("self_attn.k_proj.weight"), n("self_attn.v_proj.weight")], "layers.{l}.qkv"),
+        (n("self_attn.gate_proj.weight"), "layers.{l}.gate"),
+        (n("self_attn.o_proj.weight"), "layers.{l}.o_proj"),
+        ([n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")], "layers.{l}.gate_up"),
+        (n("mlp.down_proj.weight"), "layers.{l}.down"),
+    ]
+
+# The forward of Muse Glimmer: sandwich-normed gated attention over a sliding
+# window, every fourth layer over the whole context, then a SwiGLU MLP.
+
+WINDOWED = 0
+FULL = 1
+
+def caches(m, c):
+    kv = c.kv_space(m.kv)
+    plane = m.kv_heads * m.head_dim
+    for w in m.layers:
+        c.kv(kv, w.kv, [plane, plane], m.head_dim, heads = True)
+
+def forward(m, inputs):
+    d = m.head_dim
+    windows = [m.window, None]
+    positions = inputs.positions()
+
+    y = ops.elemwise.rmsnorm_no_scale(
+        ops.gather.embed(inputs.tokens(), m.embed, m.vocab),
+        m.hidden,
+        m.norm_eps,
+    )
+    routes = inputs.adapter_routes()
+
+    def block(l, w, y):
+        reading = FULL if w.full else WINDOWED
+        win = windows[reading]
+        normed = ops.elemwise.rmsnorm_plus_one(y, w.attn_norm, w.attn_norm_eps)
+        pages = inputs.kv(w.kv)
+
+        q, k, v = ops.gather.split_qkv(ops.linear.matmul(normed, w.qkv), m.q_heads * d, m.kv_heads * d)
+        q = ops.elemwise.rmsnorm_no_scale(q, d, m.norm_eps)
+        k = ops.elemwise.rmsnorm_no_scale(k, d, m.norm_eps)
+        if not w.full:
+            q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.full(), k = k)
+        ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
+        seam.at(seam.ATTN_Q, [q])
+
+        # Each lane by its kind; a full layer's scores go out at their seam.
+        a = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, window = win,
+                            mask = True, scores = True, scores_seam = w.full)
+        seam.at(seam.ATTN_OUT, [a])
+
+        gate = ops.linear.matmul(normed, w.gate)
+        o = ops.linear.matmul(ops.elemwise.gate_sigmoid_mul(a, gate), w.o_proj)
+        adapted = fact.has(fact.Adapter)
+        o = ops.linear.lora_correct(normed.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+
+        y = ops.elemwise.residual_add(
+            ops.elemwise.rmsnorm_plus_one(o, w.post_attn_norm, w.post_attn_norm_eps),
+            y,
+        )
+        mlp_in = ops.elemwise.rmsnorm_plus_one(y, w.pre_ffw_norm, w.pre_ffw_norm_eps)
+        act = ops.linear.glu(ops.linear.matmul(mlp_in, w.gate_up), gating.swiglu(), w.inter)
+        f = ops.linear.matmul(act, w.down)
+        return ops.elemwise.residual_add(
+            ops.elemwise.rmsnorm_plus_one(f, w.post_ffw_norm, w.post_ffw_norm_eps),
+            y,
+        )
+
+    y = inputs.fold_layers(m.layers, y, block)
+    x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps) * m.output_multiplier
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
+    return ops.attn.logit_softcap(ops.linear.lm_head(x, m.lm_head), m.softcap)

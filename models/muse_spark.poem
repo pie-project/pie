@@ -1,0 +1,305 @@
+# Muse Spark Open and its eight- and four-layer, sixteen-expert miniatures.
+# Ships bf16, modelopt NVFP4 and AMD Quark MXFP4 experts (first and last
+# layers' kept bf16), NVFP4 served against bf16 activations or, as vLLM
+# does, NVFP4 ones.
+
+load("//pie/codec.poem", "stacked_bank")
+load("//lib/adapters.poem", "banks")
+
+ATEM = template("atem")
+TOKENIZER = tokenizer(markers = [["<|eot|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start|>", "<|message|>", "<|eom|>"]])
+
+MODELS = [
+    model("muse-spark-open", template = ATEM, tokenizer = TOKENIZER, arch = "muse_spark", layers = 62, vocab = 202048),
+    model("muse-spark-open-mini-l8", mini = True, template = ATEM, tokenizer = TOKENIZER, arch = "muse_spark", layers = 8, vocab = 202048),
+    model("muse-spark-open-mini-l4", mini = True, template = ATEM, tokenizer = TOKENIZER, arch = "muse_spark", layers = 4, vocab = 202048),
+]
+
+NVFP4 = [dtype.bf16, dtype.nvfp4]
+
+NVFP4_A4 = [dtype.bf16, dtype.nvfp4a4]
+
+MXFP4 = [dtype.bf16, dtype.mxfp4]
+
+# An NVFP4 checkpoint identifies as NVFP4 activations, as vLLM serves it.
+DEPLOYMENTS = [
+    deployment("muse-spark-open", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("muse-spark-open", weights = NVFP4_A4, kv = dtype.bf16),
+    deployment("muse-spark-open-mini-l8", weights = NVFP4_A4, kv = dtype.bf16),
+    deployment("muse-spark-open", weights = NVFP4, kv = dtype.bf16),
+    deployment("muse-spark-open-mini-l8", weights = NVFP4, kv = dtype.bf16),
+    deployment("muse-spark-open", weights = MXFP4, kv = dtype.bf16),
+    deployment("muse-spark-open-mini-l4", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("muse-spark-open-mini-l4", weights = MXFP4, kv = dtype.bf16),
+    # Keys and values e4m3 under a unit scale (vLLM's `fp8` KV).
+    deployment("muse-spark-open", weights = NVFP4_A4, kv = dtype.e4m3),
+    deployment("muse-spark-open-mini-l8", weights = NVFP4_A4, kv = dtype.e4m3),
+]
+
+# Muse Spark Open: gated attention (sliding windows, a full NoPE layer every
+# fourth), residual gates on both sublayers, and a mixture of experts at a
+# pooled width (the row pooled and normed, each expert's output normed).
+
+def dims(layers = 62, experts = 256):
+    return struct(
+        hidden = 8192,
+        layers = layers,
+        q_heads = 128,
+        kv_heads = 16,
+        head_dim = 64,
+        vocab = 202048,
+        window = 2048,
+        theta = 500000.0,
+        qk_scale = 5.4730064863875,
+        softcap = 20.0,
+        output_multiplier = 0.17677669529663687,
+        norm_eps = 1e-5,
+        post_norm_eps = 1e-8,
+        gate_temperature = 0.3,
+        pooled = 4096,
+        inter = 4096,
+        experts = experts,
+        top_k = 8,
+        # The release's first and last layers keep their experts bf16 (the
+        # NVFP4 export's `exclude_modules`); a miniature's first.
+        dense_experts = [0, 61],
+    )
+
+DIMS = {
+    "muse-spark-open": dims(),
+    "muse-spark-open-mini-l8": dims(layers = 8, experts = 16),
+    "muse-spark-open-mini-l4": dims(layers = 4, experts = 16),
+}
+
+def full(l):
+    """The full-attention (and NoPE) layers: every fourth, from the second."""
+    return l % 4 == 1
+
+def layout(id, deploy):
+    if deploy.weights not in [[dtype.bf16, dtype.nvfp4], [dtype.bf16, dtype.nvfp4a4], [dtype.bf16, dtype.mxfp4], [dtype.bf16]]:
+        fail("{} stores its weights bf16 with NVFP4 or MXFP4 experts, not {}".format(id, deploy.weights))
+    d = DIMS[id]
+    w = dtype.bf16
+    dense = compute(w)
+    routed = deploy.weights[1] if len(deploy.weights) > 1 else w
+    hidden = d.hidden
+    hd = d.head_dim
+    q_w = d.q_heads * hd
+    kv_w = d.kv_heads * hd
+    pooled = d.pooled
+    iw = d.inter
+
+    def layer(l):
+        norm = lambda s, dim: weight([dim])
+        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        bank = w if l in d.dense_experts else routed
+        return struct(
+            full = full(l),
+            # q, k, v and the output gate, one projection of the normed row.
+            qkvg = weight([2 * q_w + 2 * kv_w, hidden], w).packed([q_w, kv_w, kv_w, q_w], heads = [d.q_heads, d.kv_heads, d.kv_heads, d.q_heads]),
+            o_proj = weight([hidden, q_w], w).rows(),
+            kv = "kv.{}".format(l),
+            attn_norm = norm("attn_norm", hidden),
+            attn_gate = weight([hidden], dtype.f32),
+            pre_ffw_norm = norm("pre_ffw_norm", hidden),
+            # `1 + w` as stored bf16: the scale a post norm's input takes.
+            post_ffw_scale = norm("post_ffw_scale", hidden),
+            ffw_gate = weight([hidden], dtype.f32),
+            router = weight([d.experts, hidden]),
+            router_bias = weight([d.experts], dtype.f32),
+            pool = weight([pooled, hidden], w),
+            pool_norm = norm("pool_norm", pooled),
+            gate_up = weight([d.experts, 2 * iw, pooled], bank).bank([iw, iw]),
+            down = weight([d.experts, pooled, iw], bank).rows(),
+            expert_scale = norm("expert_scale", pooled),
+            unpool = weight([hidden, pooled], w),
+            lora_a = lora_a,
+            lora_b = lora_b,
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        q_heads = d.q_heads,
+        kv_heads = d.kv_heads,
+        head_dim = hd,
+        window = d.window,
+        theta = d.theta,
+        sm_scale = f32(f32(d.qk_scale) / f32(sqrt(hd))),
+        norm_eps = d.norm_eps,
+        post_norm_eps = d.post_norm_eps,
+        gate_temperature = d.gate_temperature,
+        kv = deploy.kv,
+        softcap = d.softcap,
+        output_multiplier = d.output_multiplier,
+        experts = d.experts,
+        top_k = d.top_k,
+        inter = iw,
+        embed = weight([d.vocab, hidden], w),
+        lm_head = weight([d.vocab, hidden], w),
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight([hidden]),
+        final_norm_eps = d.norm_eps,
+    )
+
+# How a Muse Spark Open checkpoint is laid out: transformers' names, the text
+# model under `model.language_model.`, each layer's experts one stacked bank
+# a leg (bf16, or modelopt's NVFP4 under its scales); or AMD's Quark MXFP4
+# release, one plane an expert and leg (bf16, or MXFP4 codes beside their
+# e8m0 `weight_scale`).
+
+TRUNK = "model.language_model."
+
+def formats(m):
+    return [format("huggingface", read = lambda reads: huggingface(m, reads))]
+
+def huggingface(m, reads):
+    at = lambda leaf: TRUNK + leaf
+    reads.read(m.embed, at("embed_tokens.weight"))
+    # The head's input multiplier folded into the final norm's weight.
+    reads.read_over(m.final_norm, at("norm.weight"), lambda x: x.scale(m.output_multiplier))
+    reads.read(m.lm_head, "lm_head.weight")
+    for l, w in enumerate(m.layers):
+        n = lambda leaf: "{}layers.{}.{}".format(TRUNK, l, leaf)
+        reads.read(w.attn_norm, n("input_layernorm.weight"))
+        reads.read_concat(w.qkvg, [
+            n("self_attn.q_proj.weight"),
+            n("self_attn.k_proj.weight"),
+            n("self_attn.v_proj.weight"),
+            n("self_attn.gate_proj.weight"),
+        ])
+        reads.read(w.o_proj, n("self_attn.o_proj.weight"))
+        reads.read(w.attn_gate, n("post_attention_residual_gate.gate"))
+        reads.read(w.pre_ffw_norm, n("pre_feedforward_layernorm.weight"))
+        # A post norm's scale is stored as its offset from one.
+        reads.read_over(w.post_ffw_scale, n("post_feedforward_layernorm.weight"), lambda x: x.bias(1.0))
+        reads.read(w.ffw_gate, n("post_feedforward_residual_gate.gate"))
+        # The router's output multiplier folded into its weight, as vLLM does.
+        reads.read_over(w.router, n("mlp.gate.weight"), lambda x: x.scale(m.output_multiplier))
+        reads.read(w.router_bias, n("mlp.gate.e_score_correction_bias"))
+        reads.read(w.pool, n("mlp.pre_expert_proj.weight"))
+        reads.read(w.pool_norm, n("mlp.pre_expert_norm.weight"))
+        reads.read_over(w.expert_scale, n("mlp.experts.post_expert_norm.weight"), lambda x: x.bias(1.0))
+        reads.read(w.unpool, n("mlp.post_expert_proj.weight"))
+        if not has(n("mlp.experts.gate_up_proj")):
+            leg = lambda e, which: n("mlp.experts.{}.{}_proj.weight".format(e, which))
+            quark_bank(reads, w.gate_up, [[leg(e, "gate"), leg(e, "up")] for e in range(m.experts)])
+            quark_bank(reads, w.down, [[leg(e, "down")] for e in range(m.experts)])
+            continue
+        for bank, leg in [(w.gate_up, "gate_up_proj"), (w.down, "down_proj")]:
+            stem = n("mlp.experts." + leg)
+            if bank.dtype == dtype.bf16:
+                reads.read(bank, stem)
+            else:
+                stacked_bank(reads, bank, stem, legs = 2 if leg == "gate_up_proj" else 1)
+
+def quark_bank(reads, w, experts):
+    """A bank `[experts, rows, cols]` from one plane an expert and leg: bf16
+    rows stacked, or MXFP4 codes with their exponents."""
+    rows, cols = w.shape[1], w.shape[2]
+    if w.dtype != dtype.mxfp4:
+        reads.read_expr(w, concat(0, [src(p) for legs in experts for p in legs]).transmute(list(w.shape), encoding(dtype.bf16)))
+        return
+    codes = []
+    scales = []
+    per = rows // len(experts[0])
+    for legs in experts:
+        for part in legs:
+            scale = part + "_scale"
+            if not has(scale):
+                fail("`{}`: `{}` holds MXFP4 codes and the checkpoint holds no `{}`".format(w.name, part, scale))
+            codes.append(src(part).transmute([1, per, cols], encoding(dtype.mxfp4)))
+            scales.append(src(scale).transmute([1, per, cols // 32], encoding(dtype.e8m0)))
+    counted = scales_shape(w)
+    codes = concat(0, codes)
+    scales = concat(0, scales)
+    # Two legs an expert stack to `[2E, inter, cols]`, the bank byte for byte.
+    if len(experts[0]) > 1:
+        codes = codes.transmute(list(w.shape), encoding(dtype.mxfp4))
+        scales = scales.transmute(counted, encoding(dtype.e8m0))
+    reads.extend([
+        tensor(w.name, codes, encoding(dtype.mxfp4)),
+        tensor(scales_name(w.name), scales, encoding(dtype.e8m0), shape = counted, scaling = w),
+    ])
+
+# The forward of Muse Spark Open: gated sliding-window attention (every
+# fourth layer full and unrotated), sublayer outputs normed and joined to the
+# stream through a residual gate, and a mixture of experts at a pooled width.
+
+WINDOWED = 0
+FULL = 1
+
+def caches(m, c):
+    kv = c.kv_space(m.kv)
+    plane = m.kv_heads * m.head_dim
+    for w in m.layers:
+        c.kv(kv, w.kv, [plane, plane], m.head_dim, heads = True)
+
+def moe(m, w, x):
+    """The routed experts at the pooled width: routed on the row, the row
+    pooled down and normed, each route's output normed under its scale, the
+    routes weighed and summed, and the sum unpooled."""
+    logits = ops.linear.matmul(x, w.router)
+    routes, weights = ops.linear.moe_route(
+        logits,
+        m.experts,
+        m.top_k,
+        routing.sigmoid(renormalize = True, scaling = 1.0),
+        bias = w.router_bias,
+    )
+    h = ops.elemwise.rmsnorm_plus_one(ops.linear.matmul(x, w.pool), w.pool_norm, m.norm_eps)
+
+    act = ops.linear.glu(ops.linear.moe_matmul_select(h, w.gate_up, routes, m.top_k), gating.swiglu(), m.inter)
+    out = ops.elemwise.norm_gate(ops.linear.moe_matmul_select(act, w.down, routes, m.top_k), w.expert_scale, None, None, m.post_norm_eps, 1.0)
+    return ops.linear.matmul(ops.linear.moe_weighted_sum(out, weights), w.unpool)
+
+def forward(m, inputs):
+    d = m.head_dim
+    windows = [m.window, None]
+    positions = inputs.positions()
+
+    y = ops.elemwise.rmsnorm_no_scale(
+        ops.gather.embed(inputs.tokens(), m.embed, m.vocab),
+        m.hidden,
+        m.norm_eps,
+    )
+    routes = inputs.adapter_routes()
+
+    # Each residual gate lands the norm the next sublayer reads beside the
+    # stream: the attention's, the experts', the next layer's or the head's.
+    def block(l, w, carried):
+        y, normed = carried
+        reading = FULL if w.full else WINDOWED
+        win = windows[reading]
+        pages = inputs.kv(w.kv)
+
+        qkv, gate = ops.gather.split_rows(ops.linear.matmul(normed, w.qkvg), (m.q_heads + 2 * m.kv_heads) * d)
+        q, k, v = ops.gather.split_qkv(qkv, m.q_heads * d, m.kv_heads * d)
+        q = ops.elemwise.rmsnorm_no_scale(q, d, m.norm_eps)
+        k = ops.elemwise.rmsnorm_no_scale(k, d, m.norm_eps)
+        if not w.full:
+            q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.full(), k = k)
+        ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
+        seam.at(seam.ATTN_Q, [q])
+
+        # Each lane by its kind; a full layer's scores go out at their seam.
+        a = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, window = win,
+                            mask = True, scores = True, scores_seam = w.full)
+        seam.at(seam.ATTN_OUT, [a])
+
+        # Each head normed, then gated, in one pass.
+        a = ops.elemwise.rmsnorm_gated(a, gate, None, d, m.norm_eps, "sigmoid")
+        o = ops.linear.matmul(a, w.o_proj)
+        adapted = fact.has(fact.Adapter)
+        o = ops.linear.lora_correct(normed.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        y, x = ops.elemwise.norm_gate(o, None, y, w.attn_gate, m.post_norm_eps, m.gate_temperature, (w.pre_ffw_norm, m.norm_eps))
+
+        f = moe(m, w, x)
+        last = l + 1 == len(m.layers)
+        after = (m.final_norm, m.final_norm_eps) if last else (m.layers[l + 1].attn_norm, m.norm_eps)
+        return ops.elemwise.norm_gate(f, w.post_ffw_scale, y, w.ffw_gate, m.post_norm_eps, m.gate_temperature, after, not last)
+
+    first = ops.elemwise.rmsnorm_plus_one(y, m.layers[0].attn_norm, m.norm_eps)
+    _, x = inputs.fold_layers(m.layers, (y, first), block)
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
+    return ops.attn.logit_softcap(ops.linear.lm_head(x, m.lm_head), m.softcap)

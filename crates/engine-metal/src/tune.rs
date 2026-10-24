@@ -166,8 +166,9 @@ fn weight(grid: &Grid, rows: u32, n: u32, k: u32, bank: Bank, fp16_on: bool) -> 
     per_rows * share * unchosen / alike as f64 * per_shape
 }
 
-/// A spread of constants, and every rung value `base` holds.
-fn candidates(base: &Profile) -> Vec<Qmm> {
+/// A spread of constants, and every rung value `base` holds, that a GPU of
+/// `family` answers right on.
+fn candidates(base: &Profile, family: u32) -> Vec<Qmm> {
     let mut out = vec![Qmm::Mpp];
     for crossover_tg in [64, 96, 128, 160, 256] {
         out.push(Qmm::Tiled { crossover_tg });
@@ -186,6 +187,7 @@ fn candidates(base: &Profile) -> Vec<Qmm> {
             out.push(*q);
         }
     }
+    out.retain(|q| q.runs_on(family));
     out
 }
 
@@ -849,7 +851,7 @@ pub fn run(
         let text = std::fs::read_to_string(&kept)
             .map_err(|e| format!("no measurements at {}: {e}", kept.display()))?;
         say(&format!("refitting the measurements in {}", kept.display()));
-        Measured::from_text(&text, &candidates(&base))?
+        Measured::from_text(&text, &candidates(&base, device.family()))?
     } else {
         let m = measure(&device, &base, cores, &grid, say)?;
         if let Some(dir) = kept.parent() {
@@ -989,7 +991,7 @@ fn measure(
     grid: &Grid,
     say: &mut dyn FnMut(&str),
 ) -> Result<Measured, String> {
-    let candidates = candidates(base);
+    let candidates = candidates(base, device.family());
     // `base` with `overrides` under `[kernel]`, in each format.
     let tunings = |overrides: &str| -> Result<[Tuning; 2], String> {
         let at = |fp16: bool| -> Result<Tuning, String> {
@@ -1282,7 +1284,7 @@ mod tests {
             None,
         );
         let registry = crate::chip::registry();
-        for q in candidates(&base) {
+        for q in candidates(&base, 10) {
             let p = registry
                 .overlay(
                     &base,
@@ -1300,7 +1302,7 @@ mod tests {
         let facts = crate::chip::facts(9, Some(40), 10, true);
         let (base, _) = crate::chip::resolve("Apple M4 Max", &facts, None);
         let grid = Grid::of(Depth::Quick);
-        let candidates = candidates(&base);
+        let candidates = candidates(&base, 9);
         // A synthetic device: the tiled kernel wins from 12 rows, MPP never
         // runs, and the vector kernel's two-pack variant answers wrongly.
         let mut points = Vec::new();
@@ -1415,7 +1417,7 @@ mod tests {
             &crate::chip::facts(9, Some(40), 10, true),
             None,
         );
-        let candidates = candidates(&base);
+        let candidates = candidates(&base, 9);
         let mut times = vec![None; candidates.len()];
         times[0] = Some(1.5e-4);
         times[3] = Some(2.25e-5);

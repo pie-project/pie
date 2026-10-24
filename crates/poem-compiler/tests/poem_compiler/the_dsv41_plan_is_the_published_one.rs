@@ -20,13 +20,13 @@ fn the_dsv41_plan_is_the_published_one() {
             .unwrap_or_else(|| panic!("no `{name}`"))
             .shape[0]
     };
-    assert_eq!(rows_of("layer.1.engram.embed"), 384_006_168);
-    assert_eq!(rows_of("layer.14.engram.embed"), 384_016_682);
+    assert_eq!(rows_of("layers.1.engram.table"), 384_006_168);
+    assert_eq!(rows_of("layers.14.engram.table"), 384_016_682);
     assert!(
         trace
             .params
             .iter()
-            .all(|p| !p.name.starts_with("layer.0.engram"))
+            .all(|p| !p.name.starts_with("layers.0.engram"))
     );
 
     let kv_rows: Vec<&str> = trace
@@ -64,16 +64,16 @@ fn the_dsv41_plan_is_the_published_one() {
         trace
             .params
             .iter()
-            .any(|p| p.name == "layer.2.compressor.wgate")
+            .any(|p| p.name == "layers.2.attn.pool.compressor.wgate")
     );
     assert!(
         trace
             .params
             .iter()
-            .all(|p| p.name != "layer.20.compressor.wgate")
+            .all(|p| p.name != "layers.20.attn.pool.compressor.wgate")
     );
-    assert!(trace.params.iter().any(|p| p.name == "layer.20.indexer.wk"));
-    assert!(trace.params.iter().all(|p| p.name != "layer.24.indexer.wk"));
+    assert!(trace.params.iter().any(|p| p.name == "layers.20.attn.indexer.wk"));
+    assert!(trace.params.iter().all(|p| p.name != "layers.24.attn.indexer.wk"));
 
     // Bounded replay: a prompt's encoder-only rows run the encoder and the
     // decoder's sources (layer 20's pool and index keys, from the encoder's
@@ -173,6 +173,6 @@ fn the_dsv41_dspark_head_drafts_through_its_stages() {
         trace
             .params
             .iter()
-            .any(|p| p.name == "dspark.2.experts_down")
+            .any(|p| p.name == "dspark.stages.2.mlp.down")
     );
 }

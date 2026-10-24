@@ -1,0 +1,1974 @@
+# DeepSeek-V4: V4.1-Flash (CSA2, Single-Pass mHC, Engram) and its
+# eight-layer miniature; V4-Flash (with its MTP head or not) and its
+# miniature; V4-Pro and its five-layer, sixteen-expert miniature; and the
+# small V4 base.
+
+load("//lib/adapters.poem", "banks")
+
+R1 = template("deepseek")
+TOKENIZER = tokenizer(markers = [["<｜end▁of▁sentence｜>", "<|EOT|>"]])
+
+MODELS = [
+    model("dsv41-flash", template = R1, tokenizer = TOKENIZER, drafters = ["dspark"], arch = "deepseek_v4", layers = 40, vocab = 129280),
+    model("dsv41-flash-trunc8", mini = True, template = R1, tokenizer = TOKENIZER, arch = "deepseek_v4", layers = 8, vocab = 129280),
+    model("dsv41-flash-mini", mini = True, template = R1, tokenizer = TOKENIZER, drafters = ["dspark"], arch = "deepseek_v4", layers = 8, vocab = 129280),
+    model("dsv4-flash", template = R1, tokenizer = TOKENIZER, drafters = ["mtp"], arch = "deepseek_v4", layers = 43, vocab = 129280),
+    model("dsv4-flash-mini", mini = True, template = R1, tokenizer = TOKENIZER, drafters = ["mtp"], arch = "deepseek_v4", layers = 5, vocab = 129280),
+    model("dsv4-pro", template = R1, tokenizer = TOKENIZER, arch = "deepseek_v4", layers = 61, vocab = 129280),
+    model("dsv4-pro-mini", mini = True, template = R1, tokenizer = TOKENIZER, arch = "deepseek_v4", layers = 5, vocab = 129280),
+    model("dsv4-base", mini = True, template = R1, tokenizer = TOKENIZER, arch = "deepseek_v4", layers = 6, vocab = 129280),
+]
+
+BF = dtype.bf16
+U4 = dtype.u4g64
+U2 = dtype.u2g64
+FP4 = dtype.mxfp4
+
+# DeepSeek's reference precision: its fp8 projections and fp4 experts each
+# read e4m3 activations in 1x128 blocks (W8A8 and W4A8).
+W8A8 = [dtype.fp8b128a8, dtype.mxfp4a8]
+
+# V4.1's release as DeepSeek serves it: MXFP8 projections (32x32 blocks)
+# and MXFP4 experts, each against e4m3 activations in 1x32 blocks.
+MX8 = [dtype.fp8b32a8g32, dtype.mxfp4a8g32]
+
+DEPLOYMENTS = [
+    deployment("dsv41-flash", weights = U4, kv = BF),
+    deployment("dsv41-flash", weights = [BF, FP4], kv = BF),
+    deployment("dsv41-flash-mini", weights = [BF, FP4], kv = BF),
+    deployment("dsv41-flash", weights = MX8, kv = BF),
+    deployment("dsv41-flash-mini", weights = MX8, kv = BF),
+    deployment("dsv41-flash-trunc8", weights = MX8, kv = BF),
+    deployment("dsv41-flash", weights = MX8, kv = dtype.nvfp4),
+    deployment("dsv41-flash-mini", weights = MX8, kv = dtype.nvfp4),
+    # DSpark, DeepSeek's draft head, beside the release's own serving format.
+    deployment("dsv41-flash", weights = MX8, kv = dtype.nvfp4, drafter = "dspark"),
+    deployment("dsv41-flash-mini", weights = MX8, kv = dtype.nvfp4, drafter = "dspark"),
+    deployment("dsv4-flash", weights = [BF, FP4], kv = BF, drafter = "mtp"),
+    deployment("dsv4-flash", weights = [BF, FP4], kv = BF),
+    deployment("dsv4-flash", weights = W8A8, kv = BF),
+    deployment("dsv4-flash", weights = [U4, U2, FP4], kv = BF, drafter = "mtp"),
+    deployment("dsv4-flash-mini", weights = [U4, U2, FP4], kv = BF, drafter = "mtp"),
+    deployment("dsv4-flash", weights = [U4, U2], kv = BF),
+    deployment("dsv4-flash-mini", weights = [U4, U2], kv = BF),
+    deployment("dsv4-flash-mini", weights = BF, kv = BF),
+    deployment("dsv4-flash-mini", weights = [BF, FP4], kv = BF),
+    deployment("dsv4-flash-mini", weights = W8A8, kv = BF),
+    # DeepSeek's fp8 rows (FlashMLA's fp8_ds_mla), the kv vLLM serves V4 at.
+    deployment("dsv4-flash", weights = W8A8, kv = dtype.e4m3),
+    deployment("dsv4-flash-mini", weights = W8A8, kv = dtype.e4m3),
+    deployment("dsv4-pro",weights = [BF, FP4], kv = BF),
+    deployment("dsv4-pro-mini", weights = [BF, FP4], kv = BF),
+    deployment("dsv4-base", weights = BF, kv = BF),
+    deployment("dsv4-flash", weights = BF, kv = BF),
+]
+
+# The weights of DeepSeek-V4 (Flash and Pro): multi-latent attention over a
+# sliding window and a pool of compressed entries, residual streams mixed by
+# manifold hyper-connections, DeepSeekMoE experts; V4.1-Flash adds Compressed Sparse
+# Attention 2 (cross-layer KV and index reuse), Single-Pass mHC and Engram.
+
+def hyper(streams, norm_eps, gate_eps, alpha, sinkhorn, single_pass = False):
+    """The streams' shape and the constants their gates are computed with;
+    under `single_pass` each sublayer's input mix is the one the previous
+    sublayer predicted."""
+    return struct(
+        streams = streams,
+        norm_eps = norm_eps,
+        gate_eps = gate_eps,
+        alpha = alpha,
+        sinkhorn = sinkhorn,
+        single_pass = single_pass,
+    )
+
+def mix(n, name, streams, hidden, dynamic = True):
+    """A sublayer's mix `name` over `streams` streams `hidden` wide: a
+    static `base` and `scale`, and with `dynamic` a projection of the
+    normed streams added to it."""
+    width = 2 * streams + streams * streams
+    return struct(
+        scale = weight([3], dtype.f32),
+        base = weight([width], dtype.f32),
+        dynamic = weight([width, streams * hidden], dtype.f32) if dynamic else None,
+    )
+
+def head(prefix, streams, hidden):
+    """The mix `prefix` that collapses the streams into one row."""
+    return struct(
+        base = weight([streams], dtype.f32),
+        dynamic = weight([streams, streams * hidden], dtype.f32),
+        scale = weight([1], dtype.f32),
+    )
+
+DRAFT_EXPERTS = 256
+
+def routed(gate, up, down, split, gate_at = []):
+    """The dtypes a layer's routed banks are stored at: `gate`, `up` and
+    `down`, the gate overridden at `dtype` on the layers `gate_at` lists as
+    `(layer, dtype)`; with `split` the gate and up banks apart."""
+    return struct(gate = gate, up = up, down = down, split = split, gate_at = gate_at)
+
+def uniform(w):
+    return routed(w, w, w, False)
+
+def split_of(w):
+    return routed(w, w, w, True)
+
+DQ_2BIT = routed(dtype.u2g32, dtype.u2g64, dtype.u2g64, True, [(4, dtype.u2g64)])
+DQ_2BIT_FULL = routed(dtype.u2g32, dtype.u2g64, dtype.u2g64, True, [(42, dtype.u2g64)])
+
+def banks_at(r, layer):
+    """`r` as stored on `layer`."""
+    gate = r.gate
+    for at, d in r.gate_at:
+        if at == layer:
+            gate = d
+    return routed(gate, r.up, r.down, r.split)
+
+# ---------------------------------------------------------------------------
+# The V4 base.
+# ---------------------------------------------------------------------------
+
+BASE = struct(
+    hidden = 2048, layers = 6, dense_layers = 1, pool = [1, 2, 4, None, None, None],
+    heads = 16, head_dim = 128, q_lora = 768, o_lora = 512, rope_dim = 64, theta = 10000.0,
+    window = 2048, streams = 4, gate_eps = 1e-6, alpha = 2.0, sinkhorn = 20, dense_inter = 5632,
+    experts = 64, top_k = 6, moe_inter = 1024, renorm = False, scaling = 2.5,
+    swiglu_limit = 7.0, vocab = 129280, norm_eps = 1e-5,
+)
+
+def base(w, kv, d):
+    hidden = d.hidden
+    streams = d.streams
+    q_w = d.heads * d.head_dim
+
+    def layer(l):
+        n = lambda s: "layer.{}.{}".format(l, s)
+        norm = lambda s, dim: weight([dim], w)
+        lora_a, lora_b = banks("layer.{}".format(l), hidden, compute(w))
+        ratio = d.pool[l]
+        if l < d.dense_layers:
+            di = d.dense_inter
+            mlp = struct(
+                kind = "dense",
+                gate_up = weight([2 * di, hidden], w).packed([di, di]),
+                down = weight([hidden, di], w).rows(),
+                inter = di,
+                limit = d.swiglu_limit,
+            )
+        else:
+            mi = d.moe_inter
+            mlp = struct(
+                kind = "routed",
+                router = weight([d.experts, hidden], w),
+                bias = weight([d.experts], w),
+                gate_up = weight([d.experts, 2 * mi, hidden], w).bank([mi, mi]),
+                down = weight([d.experts, hidden, mi], w).rows(),
+                experts = d.experts,
+                top_k = d.top_k,
+                inter = mi,
+                limit = d.swiglu_limit,
+                renorm = d.renorm,
+                scaling = d.scaling,
+            )
+        return struct(
+            attn_mix = mix(n, "attn_mix", streams, hidden, dynamic = False),
+            attn_norm = None,
+            mlp_norm = None,
+            attn = struct(
+                rope_dim = d.rope_dim,
+                theta = d.theta,
+                yarn = None,
+                sm_scale = f32(1.0 / f32(sqrt(d.head_dim))),
+                q_down = weight([d.q_lora, hidden], w),
+                q_norm = norm("q_norm", d.q_lora),
+                q_norm_eps = d.norm_eps,
+                q_head_norm = True,
+                q_up = weight([q_w, d.q_lora], w).columns(),
+                kv_down = weight([q_w, hidden], w).columns(),
+                kv_norm = weight([q_w], w).columns(),
+                kv_norm_eps = d.norm_eps,
+                o_down = weight([d.o_lora, q_w], w).rows(),
+                o_up = weight([hidden, d.o_lora], w),
+                o_groups = 1,
+                sink = weight([d.heads], w).columns(),
+                kv = "kv.{}".format(l),
+                pool = struct(ratio = ratio, entries = "pool.{}".format(l), compressor = None, owner = True)
+                    if ratio != None else None,
+                indexer = None,
+                selection = "none",
+                window_sink = None,
+            ),
+            mlp_mix = mix(n, "mlp_mix", streams, hidden, dynamic = False),
+            mlp = mlp,
+            lora_a = lora_a,
+            lora_b = lora_b,
+            engram = None,
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        heads = d.heads,
+        head_dim = d.head_dim,
+        window = d.window,
+        kv = kv,
+        hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn),
+        embed = weight([d.vocab, hidden], w),
+        head = None,
+        hc_head = None,
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight([hidden], w),
+        final_norm_eps = d.norm_eps,
+        mtp = None,
+        token_map = None,
+        decoder = None,
+        dspark = None,
+    )
+
+# ---------------------------------------------------------------------------
+# V4-Flash.
+# ---------------------------------------------------------------------------
+
+def flash_ratios():
+    return [None, None] + [4 if l % 2 == 0 else 128 for l in range(2, 43)]
+
+FLASH_MICRO_RATIOS = [None, None, 4, 128, 4]
+
+YARN = struct(factor = 16.0, beta_fast = 32.0, beta_slow = 1.0, original_max_position = 65536)
+
+def flash_dims(layers, pool, hash, experts = 256, draft = False, **over):
+    d = dict(
+        hidden = 4096, layers = layers, pool = pool, num_hash_layers = hash, heads = 64,
+        head_dim = 512, q_lora = 1024, kv_latent = 512, o_groups = 8, o_lora = 1024, rope_dim = 64,
+        theta = 10000.0, compress_theta = 160000.0, draft = draft, window = 128,
+        index_heads = 64, index_head_dim = 128, index_top_k = 512, index_window = 128,
+        streams = 4, gate_eps = 1e-6, alpha = 2.0, sinkhorn = 20, experts = experts, top_k = 6,
+        moe_inter = 2048, shared_inter = 2048, renorm = True, scaling = 1.5,
+        swiglu_limit = 10.0, vocab = 129280, norm_eps = 1e-6,
+    )
+    d.update(over)
+    return struct(**d)
+
+# ---------------------------------------------------------------------------
+# V4-Pro: V4-Flash wider and deeper, its first two layers pooling at 128
+# rather than attending over the window alone.
+# ---------------------------------------------------------------------------
+
+def pro_ratios():
+    return [128, 128] + [4 if l % 2 == 0 else 128 for l in range(2, 61)]
+
+# The miniature: source layers 0-4, the two hash-routed layers pooling at 128,
+# the third hash-routed layer with its indexer, then a bias-routed layer of
+# each ratio.
+PRO_MINI_RATIOS = [128, 128, 4, 128, 4]
+
+def pro_dims(layers, pool, hash, experts = 384):
+    return flash_dims(
+        layers, pool, hash, experts,
+        hidden = 7168, heads = 128, q_lora = 1536, o_groups = 16, index_top_k = 1024,
+        moe_inter = 3072, shared_inter = 3072, scaling = 2.5,
+    )
+
+def moe_flash(n, d, experts, gate, banks, weights, dense, top_k = None):
+    """A DeepSeekMoE block of `experts` routed by `gate` (each row to
+    `top_k` of them, else the model's), its routed banks stored as `banks`
+    says, its shared expert in `weights` and its router in `dense`."""
+    mi = d.moe_inter
+    si = d.shared_inter
+    hidden = d.hidden
+    if banks.split:
+        half = lambda what, dt: weight([experts, mi, hidden], dt).bank([mi])
+        gate_up = struct(fused = None, gate = half("experts_gate", banks.gate), up = half("experts_up", banks.up))
+    else:
+        gate_up = struct(
+            fused = weight([experts, 2 * mi, hidden], banks.gate).bank([mi, mi]),
+            gate = None,
+            up = None,
+        )
+    return struct(
+        kind = "moe_flash",
+        router = weight([experts, hidden]),
+        gate = gate,
+        gate_up = gate_up,
+        down = weight([experts, hidden, mi], banks.down).rows(),
+        shared_gate_up = weight([2 * si, hidden], weights).packed([si, si]),
+        shared_down = weight([hidden, si], weights).rows(),
+        experts = experts,
+        top_k = top_k if top_k != None else d.top_k,
+        inter = mi,
+        shared_inter = si,
+        limit = d.swiglu_limit,
+        renorm = d.renorm,
+        scaling = d.scaling,
+    )
+
+def flash(w, r, kv, d, quant = None):
+    """V4-Flash or V4-Pro at `w`, its routed banks as `r` says; with `quant`
+    the projections DeepSeek's reference reads at fp8 are at that precision,
+    the rest at `w`."""
+    dense = compute(w)
+    hidden = d.hidden
+    streams = d.streams
+    q_w = d.heads * d.head_dim
+    kv_latent = d.kv_latent
+    o_out = d.o_groups * d.o_lora
+    idx_w = d.index_heads * d.index_head_dim
+
+    def compressor(prefix, ratio, entries, norm_w):
+        return struct(
+            wkv = weight([entries, hidden], w),
+            wgate = weight([entries, hidden], w),
+            ape = weight([ratio, entries], dtype.f32),
+            norm = weight([norm_w]),
+            norm_eps = d.norm_eps,
+        )
+
+    def layer_at(prefix, key, ratio, hash, experts, routed_banks, weights, sdense, lin = None):
+        """The layer named `prefix`, its caches named by `key`."""
+        n = lambda s: "{}.{}".format(prefix, s)
+        q = lin if lin != None else weights
+        norm = lambda s, dim: weight([dim], sdense)
+        lora_a, lora_b = banks(prefix, hidden, sdense)
+        has_indexer = ratio == 4
+        pool = None
+        if ratio != None:
+            entries = 2 * kv_latent if has_indexer else kv_latent
+            pool = struct(
+                ratio = ratio,
+                entries = "pool." + key,
+                compressor = compressor(n("compressor"), ratio, entries, kv_latent),
+                owner = True,
+            )
+        indexer = None
+        if has_indexer:
+            indexer = struct(
+                heads = d.index_heads,
+                head_dim = d.index_head_dim,
+                top_k = d.index_top_k,
+                rope_dim = d.rope_dim,
+                theta = d.compress_theta,
+                yarn = YARN,
+                window = d.index_window,
+                wq_b = weight([idx_w, d.q_lora], q),
+                weights_proj = weight([d.index_heads, hidden], weights),
+                compressor = compressor(n("indexer.compressor"), ratio, 2 * d.index_head_dim, d.index_head_dim),
+                wk = None,
+                k_norm = None,
+                keys = "index." + key,
+                owns_keys = True,
+            )
+        if hash:
+            gate = struct(kind = "hash", tid2eid = weight([d.vocab, d.top_k], dtype.i64))
+        else:
+            gate = struct(kind = "bias", bias = weight([experts], dtype.f32))
+        return struct(
+            attn_mix = mix(n, "attn_mix", streams, hidden),
+            attn_norm = norm("attn_norm", hidden),
+            mlp_norm = norm("ffn_norm", hidden),
+            attn = struct(
+                rope_dim = d.rope_dim,
+                theta = d.compress_theta if ratio != None else d.theta,
+                yarn = YARN if ratio != None else None,
+                sm_scale = f32(1.0 / f32(sqrt(d.head_dim))),
+                q_down = weight([d.q_lora, hidden], q),
+                q_norm = norm("q_norm", d.q_lora),
+                q_norm_eps = d.norm_eps,
+                q_head_norm = True,
+                q_up = weight([q_w, d.q_lora], q).columns(),
+                kv_down = weight([kv_latent, hidden], q),
+                kv_norm = norm("kv_norm", kv_latent),
+                kv_norm_eps = d.norm_eps,
+                o_down = weight([o_out, q_w // d.o_groups], weights).columns(),
+                o_up = weight([hidden, o_out], q).rows(),
+                o_groups = d.o_groups,
+                sink = weight([d.heads], sdense).columns(),
+                kv = "kv." + key,
+                pool = pool,
+                indexer = indexer,
+                selection = "own" if has_indexer else "none",
+                window_sink = None,
+            ),
+            mlp_mix = mix(n, "mlp_mix", streams, hidden),
+            mlp = moe_flash(n, d, experts, gate, routed_banks, q, sdense),
+            lora_a = lora_a,
+            lora_b = lora_b,
+            engram = None,
+        )
+
+    layers = [
+        layer_at(
+            "layer.{}".format(l),
+            key = str(l),
+            ratio = d.pool[l],
+            hash = l < d.num_hash_layers,
+            experts = d.experts,
+            routed_banks = banks_at(r, l),
+            weights = w,
+            sdense = dense,
+            lin = quant,
+        )
+        for l in range(d.layers)
+    ]
+    mtp = None
+    if d.draft:
+        bf = dtype.bf16
+        mtp = struct(
+            enorm = weight([hidden], bf),
+            hnorm = weight([hidden], bf),
+            e_proj = weight([hidden, hidden], bf),
+            h_proj = weight([streams * hidden, hidden], bf),
+            block = layer_at(
+                "mtp.decoder",
+                key = "mtp",
+                ratio = None,
+                hash = False,
+                experts = DRAFT_EXPERTS,
+                routed_banks = split_of(dtype.mxfp4),
+                weights = bf,
+                sdense = bf,
+            ),
+            hc_head = head("mtp.hc_head", streams, hidden),
+            norm = weight([hidden], bf),
+            norm_eps = d.norm_eps,
+        )
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        heads = d.heads,
+        head_dim = d.head_dim,
+        window = d.window,
+        kv = kv,
+        hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn),
+        embed = weight([d.vocab, hidden], w),
+        head = weight([d.vocab, hidden], w),
+        hc_head = head("hc_head", streams, hidden),
+        layers = layers,
+        final_norm = weight([hidden]),
+        final_norm_eps = d.norm_eps,
+        mtp = mtp,
+        token_map = None,
+        decoder = None,
+        dspark = None,
+    )
+
+# ---------------------------------------------------------------------------
+# V4.1-Flash: Causal Encoder-Decoder over CSA2 with cross-layer KV and index
+# reuse, Single-Pass mHC, and Engram conditional memory.
+# ---------------------------------------------------------------------------
+
+# `decoder`: the first decoder layer of the Causal Encoder-Decoder, whose
+# pool and index keys (projected from the encoder's last hidden states) are
+# the only ones the decoder reads.
+V41_PLAN = struct(
+    layers = 40,
+    ratios = [0, 0] + [2] * 18 + [1] * 20,
+    kv_sources = [2, 8, 14, 20],
+    index_sources = [2, 8, 14, 20, 24, 28, 32, 36],
+    engram_layers = [1, 14],
+    decoder = 20,
+    dspark_targets = [37, 38, 39],
+)
+
+# The miniature: source layers 0,1,2,3,20,21,24,25 of the release, so every
+# layer kind is present once, with 16 of the 384 experts and an Engram table
+# hashed at base 20 000 instead of 16 000 000.
+V41_MINI_PLAN = struct(
+    layers = 8,
+    ratios = [0, 0, 2, 2, 1, 1, 1, 1],
+    kv_sources = [2, 4],
+    index_sources = [2, 4, 6],
+    engram_layers = [1],
+    decoder = 4,
+    dspark_targets = [5, 6, 7],
+)
+
+# The release truncated to its first eight layers, every expert and Engram
+# table as released.
+V41_TRUNC8_PLAN = struct(
+    layers = 8,
+    ratios = [0, 0, 2, 2, 2, 2, 2, 2],
+    kv_sources = [2],
+    index_sources = [2],
+    engram_layers = [1],
+    decoder = None,
+    dspark_targets = [],
+)
+
+def dims41(plan, experts = 384, base_vocab = 16000000):
+    return struct(
+        hidden = 5120, plan = plan, heads = 64, head_dim = 512, q_lora = 1280, kv_latent = 512,
+        o_groups = 8, o_lora = 1024, rope_dim = 64, theta = 10000.0, compress_theta = 160000.0,
+        window = 128, index_heads = 32, index_head_dim = 128, index_top_k = 512, streams = 4,
+        gate_eps = 1e-6, alpha = 2.0, sinkhorn = 20, experts = experts, top_k = 6,
+        moe_inter = 2304, shared_inter = 2304, renorm = True, scaling = 1.5, swiglu_limit = 10.0,
+        vocab = 129280, norm_eps = 1e-20,
+        engram = struct(ngram = 4, heads = 8, head_dim = 256, base_vocab = base_vocab,
+                        compressed_vocab = 99092, pad = 2),
+        # DSpark: three draft stages over a block of five rows (an anchor and
+        # four noise tokens), each stage's experts 128 (or the miniature's
+        # all) taken three a row, a rank-256 Markov head over the drafts.
+        dspark = struct(stages = 3, block = 5, noise = 128799, experts = min(128, experts),
+                        top_k = 3, rank = 256),
+    )
+
+def csa_of(plan, layer):
+    if plan.ratios[layer] == 0:
+        return "swa"
+    if layer in plan.kv_sources:
+        return "full"
+    if layer in plan.index_sources:
+        return "reindex"
+    return "reuse"
+
+I64_MAX = 9223372036854775807
+
+def engram_hash_constants(e, engram_layers, which):
+    """Engram's hash geometry for the `which`-th module: every (module,
+    n-gram order, head) owns a distinct prime-sized bucket range, the primes
+    drawn in module order, each order restarting at `base_vocab - 1` and never
+    reusing a prime; the multipliers are the module's own
+    `numpy.random.default_rng(10007 * layer)` draws, made odd."""
+    seen = []
+    primes = []
+    offsets = []
+    for module in range(len(engram_layers)):
+        total = 0
+        for _ in range(e.ngram - 1):
+            current = e.base_vocab - 1
+            for _ in range(e.heads):
+                current = prime_after(current)
+                for _ in range(1000000):
+                    if current not in seen:
+                        break
+                    current = prime_after(current)
+                seen.append(current)
+                if module == which:
+                    primes.append(current)
+                    offsets.append(total)
+                    total += current
+    layer = engram_layers[which]
+    bound = max(I64_MAX // max(e.compressed_vocab, 1) // 2, 1)
+    mults = [v * 2 + 1 for v in numpy_integers(10007 * layer, bound, e.ngram)]
+    return mults, primes, offsets
+
+def flash41(w, r, kv, d, quant = None, dspark = False):
+    """V4.1-Flash at `w`, its routed banks as `r` says; with `quant` the
+    projections DeepSeek's reference reads at fp8 are at that precision, the
+    rest at `w`. With `dspark`, its DSpark draft head."""
+    plan = d.plan
+    dense = compute(w)
+    q = quant if quant != None else w
+    hidden = d.hidden
+    streams = d.streams
+    q_w = d.heads * d.head_dim
+    kv_latent = d.kv_latent
+    o_out = d.o_groups * d.o_lora
+    o_in = q_w // d.o_groups
+    idx_w = d.index_heads * d.index_head_dim
+
+    def layer(l):
+        prefix = "layer.{}".format(l)
+        n = lambda s: "{}.{}".format(prefix, s)
+        norm = lambda s, dim: weight([dim])
+        lora_a, lora_b = banks(prefix, hidden, dense)
+        ratio = plan.ratios[l]
+        csa = csa_of(plan, l)
+        kv_of = None
+        for s in plan.kv_sources:
+            if s <= l and (kv_of == None or s > kv_of):
+                kv_of = s
+        owner = kv_of == l
+        pool = None
+        if ratio > 0:
+            if kv_of == None:
+                fail("layer {} compresses at ratio {} but no KV source precedes it".format(l, ratio))
+            pool = struct(
+                ratio = ratio,
+                entries = "pool.{}".format(kv_of),
+                compressor = struct(
+                    wkv = weight([kv_latent, hidden]),
+                    wgate = weight([kv_latent, hidden]) if ratio > 1 else None,
+                    ape = None,
+                    norm = norm("compressor.norm", kv_latent),
+                    norm_eps = d.norm_eps,
+                ) if owner else None,
+                owner = owner,
+            )
+        indexer = None
+        if csa in ["full", "reindex"]:
+            indexer = struct(
+                heads = d.index_heads,
+                head_dim = d.index_head_dim,
+                top_k = d.index_top_k,
+                rope_dim = d.rope_dim,
+                theta = d.compress_theta,
+                yarn = YARN,
+                window = d.window,
+                wq_b = weight([idx_w, d.q_lora], q),
+                weights_proj = weight([d.index_heads, hidden]),
+                compressor = None,
+                wk = weight([d.index_head_dim, kv_latent]) if owner else None,
+                k_norm = norm("indexer.k_norm", d.index_head_dim) if owner else None,
+                keys = "index.{}".format(kv_of if kv_of != None else l),
+                owns_keys = owner,
+            )
+        selection = {"swa": "none", "full": "own", "reindex": "own", "reuse": "shared"}[csa]
+
+        engram = None
+        if l in plan.engram_layers:
+            which = plan.engram_layers.index(l)
+            e = d.engram
+            mults, primes, offsets = engram_hash_constants(e, plan.engram_layers, which)
+            rows = 0
+            for p in primes:
+                rows += p
+            cols = (e.ngram - 1) * e.heads
+            engram = struct(
+                # The release's table as it ships (MXFP8) where the release's
+                # precision is served, widened only at the rows a token reads.
+                table = weight([rows, e.head_dim], dtype.mxfp8 if quant != None else dense),
+                wkv = weight([(streams + 1) * hidden, cols * e.head_dim], q)
+                    .packed([streams * hidden, hidden]),
+                q_weight = weight([streams, hidden]),
+                k_weight = weight([streams, hidden]),
+                mults = mults,
+                primes = primes,
+                offsets = offsets,
+                ngram = e.ngram,
+                heads_per_ngram = e.heads,
+                head_dim = e.head_dim,
+                pad = e.pad,
+                eps = d.norm_eps,
+                ids_state = "engram.{}".format(l),
+            )
+
+        return block(prefix, l, "kv.{}".format(l), ratio, pool, indexer, selection, engram,
+                     d.experts, d.top_k)
+
+    def block(prefix, l, kv_name, ratio, pool, indexer, selection, engram, experts, top_k,
+              window_sink = None):
+        """A V4.1 block under `prefix` (routed banks stored as layer `l`'s):
+        attention over the window `kv_name` and `pool`, MoE of `experts` taken
+        `top_k` a row. With `window_sink`, a DSpark stage's: its rows read that
+        many window positions ending at their lane's last."""
+        n = lambda s: "{}.{}".format(prefix, s)
+        norm = lambda s, dim: weight([dim])
+        lora_a, lora_b = banks(prefix, hidden, dense)
+        return struct(
+            attn_mix = mix(n, "attn_mix", streams, hidden),
+            attn_norm = norm("attn_norm", hidden),
+            mlp_norm = norm("ffn_norm", hidden),
+            attn = struct(
+                rope_dim = d.rope_dim,
+                theta = d.compress_theta if ratio > 0 else d.theta,
+                yarn = YARN if ratio > 0 else None,
+                sm_scale = f32(1.0 / f32(sqrt(d.head_dim))),
+                q_down = weight([d.q_lora, hidden], q),
+                q_norm = norm("q_norm", d.q_lora),
+                q_norm_eps = d.norm_eps,
+                q_head_norm = False,
+                q_up = weight([q_w, d.q_lora], q).columns(),
+                kv_down = weight([kv_latent, hidden], q),
+                kv_norm = norm("kv_norm", kv_latent),
+                kv_norm_eps = d.norm_eps,
+                o_down = weight([o_out, o_in], w),
+                o_up = weight([hidden, o_out], q).rows(),
+                o_groups = d.o_groups,
+                sink = weight([d.heads]).columns(),
+                kv = kv_name,
+                pool = pool,
+                indexer = indexer,
+                selection = selection,
+                window_sink = window_sink,
+            ),
+            mlp_mix = mix(n, "mlp_mix", streams, hidden),
+            mlp = moe_flash(
+                n,
+                d,
+                experts,
+                gate = struct(kind = "bias", bias = weight([experts], dtype.f32)),
+                banks = banks_at(r, l),
+                weights = q,
+                dense = dense,
+                top_k = top_k,
+            ),
+            lora_a = lora_a,
+            lora_b = lora_b,
+            engram = engram,
+        )
+
+    def draft_head():
+        """DSpark (`mtp.*` in the release): its stages, each a window-only
+        block over its own window cache; the target layers' inputs it
+        projects into the window keys; and the Markov head over its drafts."""
+        ds = d.dspark
+        targets = plan.dspark_targets
+        stages = [
+            block("dspark.{}".format(s), plan.layers + s, "dspark.{}".format(s), 0, None, None, "none",
+                  None, ds.experts, ds.top_k, window_sink = d.window + ds.block)
+            for s in range(ds.stages)
+        ]
+        return struct(
+            block = ds.block,
+            noise = ds.noise,
+            targets = targets,
+            main_proj = weight([hidden, hidden * len(targets)], q),
+            main_norm = weight([hidden]),
+            stages = stages,
+            norm = weight([hidden]),
+            markov_embed = weight([d.vocab, ds.rank]),
+            markov_head = weight([d.vocab, ds.rank]),
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        heads = d.heads,
+        head_dim = d.head_dim,
+        window = d.window,
+        kv = kv,
+        hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn, single_pass = True),
+        embed = weight([d.vocab, hidden]),
+        head = weight([d.vocab, hidden]),
+        hc_head = None,
+        layers = [layer(l) for l in range(plan.layers)],
+        final_norm = weight([hidden]),
+        final_norm_eps = d.norm_eps,
+        mtp = None,
+        token_map = weight([d.vocab], dtype.i64) if plan.engram_layers else None,
+        decoder = plan.decoder,
+        dspark = draft_head() if dspark else None,
+    )
+
+def layout(id, deploy):
+    ws = deploy.weights
+    bf = dtype.bf16
+    u4 = dtype.u4g64
+    mx = dtype.mxfp4
+    fp8 = dtype.fp8b128a8
+    mxa8 = dtype.mxfp4a8
+    fp8b32 = dtype.fp8b32a8g32
+    mxg32 = dtype.mxfp4a8g32
+    kv = deploy.kv
+    mtp = deploy.drafter == "mtp"
+    dspark = deploy.drafter == "dspark"
+    if id == "dsv41-flash" and ws == [u4]:
+        return flash41(u4, split_of(u4), kv, dims41(V41_PLAN))
+    if id == "dsv41-flash" and ws == [bf, mx]:
+        return flash41(bf, split_of(mx), kv, dims41(V41_PLAN))
+    if id == "dsv41-flash-mini" and ws == [bf, mx]:
+        return flash41(bf, split_of(mx), kv, dims41(V41_MINI_PLAN, experts = 16, base_vocab = 20000))
+    if id == "dsv41-flash" and ws == [fp8b32, mxg32]:
+        return flash41(bf, split_of(mxg32), kv, dims41(V41_PLAN), quant = fp8b32, dspark = dspark)
+    if id == "dsv41-flash-mini" and ws == [fp8b32, mxg32]:
+        return flash41(bf, split_of(mxg32), kv, dims41(V41_MINI_PLAN, experts = 16, base_vocab = 20000),
+                       quant = fp8b32, dspark = dspark)
+    if id == "dsv41-flash-trunc8" and ws == [fp8b32, mxg32] and not dspark:
+        return flash41(bf, split_of(mxg32), kv, dims41(V41_TRUNC8_PLAN), quant = fp8b32)
+    if id == "dsv4-flash":
+        if ws == [bf] and not mtp:
+            return flash(bf, uniform(bf), kv, flash_dims(43, flash_ratios(), 3))
+        if ws == [u4, dtype.u2g64] and not mtp:
+            return flash(u4, DQ_2BIT_FULL, kv, flash_dims(43, flash_ratios(), 3))
+        if ws == [u4, dtype.u2g64, mx] and mtp:
+            return flash(u4, DQ_2BIT_FULL, kv, flash_dims(43, flash_ratios(), 3, draft = True))
+        if ws == [bf, mx]:
+            return flash(bf, split_of(mx), kv, flash_dims(43, flash_ratios(), 3, draft = mtp))
+        if ws == [fp8, mxa8] and not mtp:
+            return flash(bf, uniform(mxa8), kv, flash_dims(43, flash_ratios(), 3), quant = fp8)
+    if id == "dsv4-flash-mini":
+        if ws == [bf] and not mtp:
+            return flash(bf, uniform(bf), kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16))
+        if ws == [u4, dtype.u2g64] and not mtp:
+            return flash(u4, DQ_2BIT, kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16))
+        if ws == [u4, dtype.u2g64, mx] and mtp:
+            return flash(u4, DQ_2BIT, kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16, draft = True))
+        if ws == [bf, mx] and not mtp:
+            return flash(bf, split_of(mx), kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16))
+        if ws == [fp8, mxa8] and not mtp:
+            return flash(bf, uniform(mxa8), kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16), quant = fp8)
+    if id == "dsv4-pro" and ws == [bf, mx] and not mtp:
+        return flash(bf, split_of(mx), kv, pro_dims(61, pro_ratios(), 3))
+    if id == "dsv4-pro-mini" and ws == [bf, mx] and not mtp:
+        return flash(bf, split_of(mx), kv, pro_dims(5, PRO_MINI_RATIOS, 3, experts = 16))
+    if id == "dsv4-base" and ws == [bf] and not mtp:
+        return base(bf, kv, BASE)
+    fail("{} does not ship {}".format(id, deploy))
+
+# How a DeepSeek-V4 checkpoint is laid out. V4.1-Flash: its per-expert
+# release layout, or MLX's stacked one. V4-Flash, V4-Pro and the base: the
+# release layout (dense planes bf16, or fp8 beside `.scale` exponents), an
+# `--aux` artifact, mlx, transformers' deepseek-v3 or GGUF names; the flash
+# spellings share names, so a reading tells them apart.
+
+AFFINE = [dtype.u4g64, dtype.u8g64, dtype.u4g32, dtype.u2g32, dtype.u2g64, dtype.u2g128]
+
+def formats(m):
+    if m.hyper.single_pass:
+        return [
+            format(
+                "a DeepSeek-V4.1 checkpoint",
+                recognizes = lambda checkpoint: has("embed.weight"),
+                read = lambda reads: v41(m, reads, False),
+            ),
+            format(
+                "a DeepSeek-V4.1 MLX checkpoint",
+                recognizes = lambda checkpoint: has("model.layers.0.ffn.switch_mlp.gate_proj.weight"),
+                read = lambda reads: v41_mlx(m, reads),
+            ),
+        ]
+    return [
+        format(
+            "a DeepSeek-V4 checkpoint",
+            recognizes = lambda checkpoint: has("embed.weight"),
+            read = lambda reads: release(m, reads),
+        ),
+        format("an artifact with an `--aux` overlay", read = lambda reads: own_with_aux(m, reads)),
+        format("flash mlx", read = lambda reads: flash_mlx(m, reads)),
+        format("huggingface", read = lambda reads: huggingface(m, reads)),
+        format("gguf", recognizes = lambda checkpoint: has("token_embd.weight"), read = lambda reads: gguf(m, reads)),
+    ]
+
+# ---------------------------------------------------------------------------
+# The flash mlx spelling.
+# ---------------------------------------------------------------------------
+
+# A read the mlx spelling makes: `weight` from the one tensor `names`
+# holds, or joined along `axis` from several.
+
+def one(w, name):
+    return struct(weight = w, names = [name], axis = None)
+
+def joined(w, axis, names):
+    return struct(weight = w, names = names, axis = axis)
+
+def layer_reads(w, n, reads):
+    for mix, tag in [(w.attn_mix, "attn_hc"), (w.mlp_mix, "ffn_hc")]:
+        reads.append(one(mix.scale, n(tag + ".scale")))
+        reads.append(one(mix.base, n(tag + ".base")))
+        if mix.dynamic != None:
+            reads.append(one(mix.dynamic, n(tag + ".fn")))
+    if w.attn_norm != None:
+        reads.append(one(w.attn_norm, n("attn_norm.weight")))
+    if w.mlp_norm != None:
+        reads.append(one(w.mlp_norm, n("ffn_norm.weight")))
+    at = w.attn
+    reads.append(one(at.q_down, n("attn.wq_a.weight")))
+    reads.append(one(at.q_norm, n("attn.q_norm.weight")))
+    reads.append(one(at.q_up, n("attn.wq_b.weight")))
+    reads.append(one(at.kv_down, n("attn.wkv.weight")))
+    reads.append(one(at.kv_norm, n("attn.kv_norm.weight")))
+    reads.append(one(at.o_down, n("attn.wo_a.weight")))
+    reads.append(one(at.o_up, n("attn.wo_b.weight")))
+    reads.append(one(at.sink, n("attn.attn_sink")))
+    if at.pool != None and at.pool.compressor != None:
+        c = at.pool.compressor
+        reads.append(one(c.wkv, n("attn.compressor.wkv.weight")))
+        if c.wgate != None:
+            reads.append(one(c.wgate, n("attn.compressor.wgate.weight")))
+        if c.ape != None:
+            reads.append(one(c.ape, n("attn.compressor.ape")))
+        reads.append(one(c.norm, n("attn.compressor.norm.weight")))
+    ix = at.indexer
+    if ix != None:
+        reads.append(one(ix.wq_b, n("attn.indexer.wq_b.weight")))
+        reads.append(one(ix.weights_proj, n("attn.indexer.weights_proj.weight")))
+        if ix.compressor != None:
+            c = ix.compressor
+            reads.append(one(c.wkv, n("attn.indexer.compressor.wkv.weight")))
+            if c.wgate != None:
+                reads.append(one(c.wgate, n("attn.indexer.compressor.wgate.weight")))
+            if c.ape != None:
+                reads.append(one(c.ape, n("attn.indexer.compressor.ape")))
+            reads.append(one(c.norm, n("attn.indexer.compressor.norm.weight")))
+    f = w.mlp
+    if f.kind == "moe_flash":
+        if f.gate.kind == "hash":
+            reads.append(one(f.router, n("ffn.gate.weight")))
+            reads.append(one(f.gate.tid2eid, n("ffn.gate.tid2eid")))
+        else:
+            reads.append(one(f.router, n("ffn.gate.weight")))
+            reads.append(one(f.gate.bias, n("ffn.gate.e_score_correction_bias")))
+        if f.gate_up.fused != None:
+            reads.append(joined(f.gate_up.fused, 1, [
+                n("ffn.switch_mlp.gate_proj.weight"),
+                n("ffn.switch_mlp.up_proj.weight"),
+            ]))
+        else:
+            reads.append(one(f.gate_up.gate, n("ffn.switch_mlp.gate_proj.weight")))
+            reads.append(one(f.gate_up.up, n("ffn.switch_mlp.up_proj.weight")))
+        reads.append(one(f.down, n("ffn.switch_mlp.down_proj.weight")))
+        reads.append(joined(f.shared_gate_up, 0, [
+            n("ffn.shared_experts.gate_proj.weight"),
+            n("ffn.shared_experts.up_proj.weight"),
+        ]))
+        reads.append(one(f.shared_down, n("ffn.shared_experts.down_proj.weight")))
+
+def mlx_reads(m):
+    reads = [one(m.embed, "model.embed_tokens.weight")]
+    if m.head != None:
+        reads.append(one(m.head, "lm_head.weight"))
+    reads.append(one(m.final_norm, "model.norm.weight"))
+    if m.hc_head != None:
+        reads.append(one(m.hc_head.base, "model.hc_head.base"))
+        reads.append(one(m.hc_head.dynamic, "model.hc_head.fn"))
+        reads.append(one(m.hc_head.scale, "model.hc_head.scale"))
+    for l, w in enumerate(m.layers):
+        layer_reads(w, lambda s: "model.layers.{}.{}".format(l, s), reads)
+    if m.mtp != None:
+        mtp = m.mtp
+        reads.append(one(mtp.enorm, "aux.enorm.weight"))
+        reads.append(one(mtp.hnorm, "aux.hnorm.weight"))
+        reads.append(one(mtp.e_proj, "aux.e_proj.weight"))
+        reads.append(joined(mtp.h_proj, 0, ["aux.h_proj.weight"] * m.hyper.streams))
+        layer_reads(mtp.block, lambda s: "aux.decoder." + s, reads)
+        reads.append(one(mtp.hc_head.base, "aux.hc_head.base"))
+        reads.append(one(mtp.hc_head.dynamic, "aux.hc_head.fn"))
+        reads.append(one(mtp.hc_head.scale, "aux.hc_head.scale"))
+        reads.append(one(mtp.norm, "aux.norm.weight"))
+    return reads
+
+def concat_expr(m, w, axis, names):
+    parts = [
+        src(name).transmute([-1, -1, m.hidden], encoding(w.dtype)) if len(w.shape) == 3 else src(name)
+        for name in names
+    ]
+    return concat(axis, parts)
+
+def land(m, reads, r):
+    if r.axis == None:
+        reads.read(r.weight, r.names[0])
+    elif r.weight.dtype in AFFINE:
+        reads.read_concat(r.weight, r.names)
+    else:
+        reads.read_expr(r.weight, concat_expr(m, r.weight, r.axis, r.names))
+
+def flash_mlx(m, reads):
+    for r in mlx_reads(m):
+        land(m, reads, r)
+
+def own_with_aux(m, reads):
+    if m.mtp == None:
+        fail("this row declares no draft head, so there is no overlay to land on an artifact")
+    for r in mlx_reads(m):
+        if all([name.startswith("aux.") for name in r.names]):
+            land(m, reads, r)
+        else:
+            reads.read_own(r.weight)
+
+# ---------------------------------------------------------------------------
+# The V4 release layout: `layers.` at the top, one plane per expert, the
+# routed legs MXFP4 codes beside their `.scale` exponents.
+# ---------------------------------------------------------------------------
+
+def compressor_reads(reads, c, at):
+    reads.read(c.wkv, at + ".wkv.weight")
+    if c.wgate != None:
+        reads.read(c.wgate, at + ".wgate.weight")
+    if c.ape != None:
+        reads.read(c.ape, at + ".ape")
+    reads.read(c.norm, at + ".norm.weight")
+
+def release(m, reads):
+    reads.read(m.embed, "embed.weight")
+    if m.head != None:
+        reads.read(m.head, "head.weight")
+    reads.read(m.final_norm, "norm.weight")
+    if m.hc_head != None:
+        head_reads(reads, m.hc_head, "")
+    for l, w in enumerate(m.layers):
+        release_layer(reads, w, "layers.{}.".format(l))
+    if m.mtp != None:
+        mtp = m.mtp
+        if not has("mtp.0.e_proj.weight"):
+            fail("this deployment declares a draft head, and the checkpoint holds no `mtp.0.`")
+        reads.read(mtp.enorm, "mtp.0.enorm.weight")
+        reads.read(mtp.hnorm, "mtp.0.hnorm.weight")
+        reads.read(mtp.e_proj, "mtp.0.e_proj.weight")
+        # one projection the hyper-connection streams share, read once a stream
+        reads.read_expr(mtp.h_proj, concat(0, [src("mtp.0.h_proj.weight")] * m.hyper.streams))
+        release_layer(reads, mtp.block, "mtp.0.")
+        head_reads(reads, mtp.hc_head, "mtp.0.")
+        reads.read(mtp.norm, "mtp.0.norm.weight")
+
+def head_reads(reads, h, at):
+    reads.read(h.base, at + "hc_head_base")
+    reads.read(h.dynamic, at + "hc_head_fn")
+    reads.read(h.scale, at + "hc_head_scale")
+
+def release_layer(reads, w, at):
+    """One block under `at` (`layers.N.`, or the draft head's `mtp.0.`): dense
+    planes at whatever the file stores (bf16, or fp8 beside `.scale` e8m0
+    exponents), the routed legs one plane per expert."""
+    n = lambda s: at + s
+    for mix, tag in [(w.attn_mix, "attn"), (w.mlp_mix, "ffn")]:
+        reads.read(mix.scale, n("hc_{}_scale".format(tag)))
+        reads.read(mix.base, n("hc_{}_base".format(tag)))
+        if mix.dynamic != None:
+            reads.read(mix.dynamic, n("hc_{}_fn".format(tag)))
+    if w.attn_norm != None:
+        reads.read(w.attn_norm, n("attn_norm.weight"))
+    if w.mlp_norm != None:
+        reads.read(w.mlp_norm, n("ffn_norm.weight"))
+    a = w.attn
+    reads.read(a.q_down, n("attn.wq_a.weight"))
+    reads.read(a.q_norm, n("attn.q_norm.weight"))
+    reads.read(a.q_up, n("attn.wq_b.weight"))
+    reads.read(a.kv_down, n("attn.wkv.weight"))
+    reads.read(a.kv_norm, n("attn.kv_norm.weight"))
+    reads.read(a.o_down, n("attn.wo_a.weight"))
+    reads.read(a.o_up, n("attn.wo_b.weight"))
+    reads.read(a.sink, n("attn.attn_sink"))
+    if a.pool != None and a.pool.compressor != None:
+        compressor_reads(reads, a.pool.compressor, n("attn.compressor"))
+    ix = a.indexer
+    if ix != None:
+        reads.read(ix.wq_b, n("attn.indexer.wq_b.weight"))
+        reads.read(ix.weights_proj, n("attn.indexer.weights_proj.weight"))
+        if ix.compressor != None:
+            compressor_reads(reads, ix.compressor, n("attn.indexer.compressor"))
+    f = w.mlp
+    if f.kind != "moe_flash":
+        fail("the release layout holds DeepSeekMoE blocks only")
+    reads.read(f.router, n("ffn.gate.weight"))
+    if f.gate.kind == "hash":
+        reads.read(f.gate.tid2eid, n("ffn.gate.tid2eid"))
+    else:
+        reads.read(f.gate.bias, n("ffn.gate.bias"))
+    expert = lambda e, leg: n("ffn.experts.{}.{}.weight".format(e, leg))
+    if f.gate_up.fused != None:
+        # Each expert's gate rows, then its up rows: one bank a fused
+        # gate-up select reads, its GLU over the packed rows.
+        read_bank_packed(reads, f.gate_up.fused,
+            [[expert(e, "w1"), expert(e, "w3")] for e in range(f.experts)])
+    else:
+        read_bank(reads, f.gate_up.gate, [expert(e, "w1") for e in range(f.experts)])
+        read_bank(reads, f.gate_up.up, [expert(e, "w3") for e in range(f.experts)])
+    read_bank(reads, f.down, [expert(e, "w2") for e in range(f.experts)])
+    reads.read_concat(f.shared_gate_up, [n("ffn.shared_experts.w1.weight"), n("ffn.shared_experts.w3.weight")])
+    reads.read(f.shared_down, n("ffn.shared_experts.w2.weight"))
+
+# ---------------------------------------------------------------------------
+# V4.1-Flash.
+# ---------------------------------------------------------------------------
+
+def v41_mlx(m, reads):
+    if not has("model.layers.0.ffn.switch_mlp.gate_proj.weight"):
+        fail("no stacked MLX V4.1 expert bank in model.layers")
+    v41(m, reads, True)
+
+def read_bank_packed(reads, w, pairs):
+    """A routed MXFP4 bank `[experts, 2 * rows, cols]` whose expert `e` is
+    the planes `pairs[e]` stacked by rows (its gate rows, then its up rows),
+    codes and e8m0 exponents alike."""
+    rows, cols = w.shape[1] // 2, w.shape[2]
+    if w.dtype != dtype.mxfp4:
+        fail("`{}`: a packed gate-up bank is read from MXFP4 halves only".format(w.name))
+    codes = []
+    scales = []
+    for pair in pairs:
+        stems = [part[:-len(".weight")] if part.endswith(".weight") else part for part in pair]
+        for part, stem in zip(pair, stems):
+            if not has(stem + ".scale"):
+                fail("`{}`: `{}` is read as MXFP4 codes, whose exponents are stored beside it as `{}`, and the checkpoint holds none".format(w.name, part, stem + ".scale"))
+        codes.append(concat(1, [src(part).transmute([1, rows, cols], encoding(dtype.mxfp4)) for part in pair]))
+        scales.append(concat(1, [src(stem + ".scale").transmute([1, rows, cols // 32], encoding(dtype.e8m0)) for stem in stems]))
+    reads.extend([
+        tensor(w.name, concat(0, codes), encoding(dtype.mxfp4)),
+        tensor(scales_name(w.name), concat(0, scales), encoding(dtype.e8m0), shape = scales_shape(w), scaling = w),
+    ])
+
+def read_bank(reads, w, parts):
+    """A routed bank `[experts, rows, cols]` from one plane per expert, at
+    whatever representation the file stores them: bf16 rows are stacked,
+    MLX affine trios by the affine reader, and MXFP4 codes (`w.weight` nibble
+    pairs beside `w.scale` e8m0 exponents) with their exponents."""
+    rows, cols = w.shape[1], w.shape[2]
+    if w.dtype == dtype.mxfp4:
+        codes = []
+        scales = []
+        for part in parts:
+            stem = part[:-len(".weight")] if part.endswith(".weight") else part
+            scale = stem + ".scale"
+            if not has(scale):
+                fail("`{}`: `{}` is read as MXFP4 codes, whose exponents are stored beside it as `{}`, and the checkpoint holds none".format(w.name, part, scale))
+            codes.append(src(part).transmute([1, rows, cols], encoding(dtype.mxfp4)))
+            scales.append(src(scale).transmute([1, rows, cols // 32], encoding(dtype.e8m0)))
+        reads.extend([
+            tensor(w.name, concat(0, codes), encoding(dtype.mxfp4)),
+            tensor(scales_name(w.name), concat(0, scales), encoding(dtype.e8m0), shape = scales_shape(w), scaling = w),
+        ])
+    elif w.dtype in AFFINE:
+        reads.read_stack(w, [[part] for part in parts])
+    else:
+        reads.read_expr(w, concat(0, [src(part).transmute([1, rows, cols], encoding(w.dtype)) for part in parts]))
+
+def v41(m, reads, mlx):
+    reads.read(m.embed, "model.embed_tokens.weight" if mlx else "embed.weight")
+    if m.head != None:
+        reads.read(m.head, "lm_head.weight" if mlx else "head.weight")
+    reads.read(m.final_norm, "model.norm.weight" if mlx else "norm.weight")
+    if m.token_map != None:
+        if not has("engram.token_map"):
+            fail("`{}`: Engram hashes tokenizer-compressed ids, and this checkpoint carries no `engram.token_map`; write it beside the weights with `scripts/bench/engram_token_map.py` first".format(m.token_map.name))
+        reads.read(m.token_map, "engram.token_map")
+
+    for l, w in enumerate(m.layers):
+        v41_block(reads, w, lambda s: ("model.layers.{}.{}" if mlx else "layers.{}.{}").format(l, s), mlx)
+
+    ds = m.dspark
+    if ds != None:
+        if mlx:
+            fail("the DSpark head is read from DeepSeek's release only")
+        if not has("mtp.0.main_proj.weight"):
+            fail("this deployment declares a DSpark head, and the checkpoint holds no `mtp.0.main_proj`")
+        reads.read(ds.main_proj, "mtp.0.main_proj.weight")
+        reads.read(ds.main_norm, "mtp.0.main_norm.weight")
+        for s, w in enumerate(ds.stages):
+            v41_block(reads, w, lambda name: "mtp.{}.{}".format(s, name), False)
+        last = len(ds.stages) - 1
+        reads.read(ds.norm, "mtp.{}.norm.weight".format(last))
+        reads.read(ds.markov_embed, "mtp.{}.markov_head.embed.weight".format(last))
+        reads.read(ds.markov_head, "mtp.{}.markov_head.head.weight".format(last))
+
+def v41_block(reads, w, n, mlx):
+    """A V4.1 block whose tensors `n` names: a layer's, or a DSpark stage's."""
+    at = w.attn
+    for mix, tag in [(w.attn_mix, "attn"), (w.mlp_mix, "ffn")]:
+        name = lambda plane: n("{}_hc.{}".format(tag, plane)) if mlx else n("hc_{}_{}".format(tag, plane))
+        reads.read(mix.scale, name("scale"))
+        reads.read(mix.base, name("base"))
+        if mix.dynamic != None:
+            reads.read(mix.dynamic, name("fn"))
+    if w.attn_norm != None:
+        reads.read(w.attn_norm, n("attn_norm.weight"))
+    if w.mlp_norm != None:
+        reads.read(w.mlp_norm, n("ffn_norm.weight"))
+
+    reads.read(at.q_down, n("attn.wq_a.weight"))
+    reads.read(at.q_norm, n("attn.q_norm.weight"))
+    reads.read(at.q_up, n("attn.wq_b.weight"))
+    reads.read(at.kv_down, n("attn.wkv.weight"))
+    reads.read(at.kv_norm, n("attn.kv_norm.weight"))
+    reads.read(at.o_down, n("attn.wo_a.weight"))
+    reads.read(at.o_up, n("attn.wo_b.weight"))
+    reads.read(at.sink, n("attn.attn_sink"))
+
+    if at.pool != None and at.pool.compressor != None:
+        c = at.pool.compressor
+        reads.read(c.wkv, n("attn.compressor.wkv.weight"))
+        if c.wgate != None:
+            reads.read(c.wgate, n("attn.compressor.wgate.weight"))
+        reads.read(c.norm, n("attn.compressor.norm.weight"))
+    ix = at.indexer
+    if ix != None:
+        reads.read(ix.wq_b, n("attn.indexer.wq_b.weight"))
+        reads.read(ix.weights_proj, n("attn.indexer.weights_proj.weight"))
+        if ix.wk != None:
+            reads.read(ix.wk, n("attn.indexer.wk.weight"))
+            reads.read(ix.k_norm, n("attn.indexer.k_norm.weight"))
+
+    f = w.mlp
+    if f.kind != "moe_flash":
+        fail("every V4.1 layer is a DeepSeekMoE block")
+    reads.read(f.router, n("ffn.gate.weight"))
+    if f.gate.kind != "bias":
+        fail("V4.1 routes by bias-corrected scores on every layer")
+    reads.read(f.gate.bias, n("ffn.gate.e_score_correction_bias" if mlx else "ffn.gate.bias"))
+    expert = lambda e, leg: n("ffn.experts.{}.{}.weight".format(e, leg))
+    if f.gate_up.fused != None:
+        fail("V4.1 keeps its routed gate and up legs apart")
+    if mlx:
+        reads.read(f.gate_up.gate, n("ffn.switch_mlp.gate_proj.weight"))
+        reads.read(f.gate_up.up, n("ffn.switch_mlp.up_proj.weight"))
+    else:
+        read_bank(reads, f.gate_up.gate, [expert(e, "w1") for e in range(f.experts)])
+        read_bank(reads, f.gate_up.up, [expert(e, "w3") for e in range(f.experts)])
+    if mlx:
+        reads.read(f.down, n("ffn.switch_mlp.down_proj.weight"))
+    else:
+        read_bank(reads, f.down, [expert(e, "w2") for e in range(f.experts)])
+    reads.read_concat(f.shared_gate_up, [
+        n("ffn.shared_experts.gate_proj.weight" if mlx else "ffn.shared_experts.w1.weight"),
+        n("ffn.shared_experts.up_proj.weight" if mlx else "ffn.shared_experts.w3.weight"),
+    ])
+    reads.read(f.shared_down, n("ffn.shared_experts.down_proj.weight" if mlx else "ffn.shared_experts.w2.weight"))
+
+    if w.engram != None:
+        e = w.engram
+        reads.read(e.table, n("engram.embed.weight"))
+        reads.read(e.wkv, n("engram.wkv.weight"))
+        # The gate's normalisations carry `weight + 1`.
+        reads.read_over(e.q_weight, n("engram.q_weight"), lambda x: x.bias(-1.0))
+        reads.read_over(e.k_weight, n("engram.k_weight"), lambda x: x.bias(-1.0))
+
+# ---------------------------------------------------------------------------
+# transformers' deepseek-v3 spelling, and GGUF's.
+# ---------------------------------------------------------------------------
+
+def huggingface(m, reads):
+    if m.mtp != None:
+        fail("this deployment declares a draft head, which only the flash mlx reading (with an `--aux` overlay) lands")
+    reads.read(m.embed, "model.embed_tokens.weight")
+    reads.read(m.final_norm, "model.norm.weight")
+    for l, w in enumerate(m.layers):
+        n = lambda s: "model.layers.{}.{}".format(l, s)
+        at = w.attn
+        reads.read(w.attn_mix.scale, n("hc_attn_scale"))
+        reads.read(w.attn_mix.base, n("hc_attn_base"))
+        reads.read(w.mlp_mix.scale, n("hc_mlp_scale"))
+        reads.read(w.mlp_mix.base, n("hc_mlp_base"))
+        reads.read(at.q_down, n("self_attn.q_a_proj.weight"))
+        reads.read(at.q_norm, n("self_attn.q_a_layernorm.weight"))
+        reads.read(at.q_up, n("self_attn.q_b_proj.weight"))
+        reads.read(at.kv_down, n("self_attn.kv_a_proj_with_mqa.weight"))
+        reads.read(at.kv_norm, n("self_attn.kv_a_layernorm.weight"))
+        reads.read(at.o_down, n("self_attn.o_a_proj.weight"))
+        reads.read(at.o_up, n("self_attn.o_b_proj.weight"))
+        reads.read(at.sink, n("self_attn.sinks"))
+        f = w.mlp
+        if f.kind == "dense":
+            reads.read_concat(f.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+            reads.read(f.down, n("mlp.down_proj.weight"))
+        elif f.kind == "routed":
+            reads.read(f.router, n("mlp.gate.weight"))
+            reads.read(f.bias, n("mlp.gate.e_score_correction_bias"))
+            inter = f.gate_up.shape[1] // 2
+            hidden = f.gate_up.shape[2]
+            leg = lambda e, half: src(n("mlp.experts.{}.{}.weight".format(e, half))).transmute(
+                [1, inter, hidden], encoding(f.gate_up.dtype))
+            reads.read_expr(f.gate_up, concat(0, [
+                concat(1, [leg(e, "gate_proj"), leg(e, "up_proj")]) for e in range(f.experts)
+            ]))
+            reads.read_expr(f.down, concat(0, [
+                src(n("mlp.experts.{}.down_proj.weight".format(e))).transmute(
+                    [1, f.down.shape[1], f.down.shape[2]], encoding(f.down.dtype))
+                for e in range(f.experts)
+            ]))
+        else:
+            fail("a flash deployment cannot read the deepseek-v3 huggingface layout; its artifact is the mlx one (`model.hc_head.base`)")
+
+def gguf(m, reads):
+    if m.mtp != None:
+        fail("this deployment declares a draft head and no gguf spelling of one is settled")
+    reads.read(m.embed, "token_embd.weight")
+    reads.read(m.final_norm, "output_norm.weight")
+    for l, w in enumerate(m.layers):
+        n = lambda s: "blk.{}.{}".format(l, s)
+        at = w.attn
+        reads.read(w.attn_mix.scale, n("hc_attn_scale.weight"))
+        reads.read(w.attn_mix.base, n("hc_attn_base.weight"))
+        reads.read(w.mlp_mix.scale, n("hc_mlp_scale.weight"))
+        reads.read(w.mlp_mix.base, n("hc_mlp_base.weight"))
+        reads.read(at.q_down, n("attn_q_a.weight"))
+        reads.read(at.q_norm, n("attn_q_a_norm.weight"))
+        reads.read(at.q_up, n("attn_q_b.weight"))
+        reads.read(at.kv_down, n("attn_kv_a_mqa.weight"))
+        reads.read(at.kv_norm, n("attn_kv_a_norm.weight"))
+        reads.read(at.o_down, n("attn_o_a.weight"))
+        reads.read(at.o_up, n("attn_o_b.weight"))
+        reads.read(at.sink, n("attn_sinks"))
+        f = w.mlp
+        if f.kind == "dense":
+            reads.read_concat(f.gate_up, [n("ffn_gate.weight"), n("ffn_up.weight")])
+            reads.read(f.down, n("ffn_down.weight"))
+        elif f.kind == "routed":
+            reads.read(f.router, n("ffn_gate_inp.weight"))
+            reads.read(f.bias, n("exp_probs_b.bias"))
+            reads.read_concat(f.gate_up, [n("ffn_gate_exps.weight"), n("ffn_up_exps.weight")])
+            reads.read(f.down, n("ffn_down_exps.weight"))
+        else:
+            fail("a flash deployment has no gguf layout")
+
+# The forward of DeepSeek-V4: each layer reads its sub-block inputs out of
+# the residual streams, attends over a sliding window and, where it pools, a
+# compressed (and on V4.1 sparsely selected) pool, and folds its outputs back;
+# V4.1's Engram writes n-gram memories into the streams before a layer.
+
+# How many experts the next layer's router is predicted to take.
+PREDICT_K = 16
+
+def mixes(normed, mix, hy):
+    """`mix`'s per-row mixes of the `normed` streams: its dynamic
+    projection, or with none the leading rows of the streams."""
+    if mix.dynamic != None:
+        return ops.elemwise.hc_project(normed, mix.dynamic, hy.streams)
+    head, _ = ops.gather.split_rows(normed, mix.base.shape[0])
+    return head
+
+def gate(streams, mix, hy):
+    """The sublayer input `mix` reads out of `streams`, and the post and
+    combine mixes its output is folded back with."""
+    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
+    return ops.elemwise.hc_gates(
+        mixes(normed, mix, hy),
+        streams,
+        mix.scale,
+        mix.base,
+        hy.streams,
+        hy.gate_eps,
+        hy.alpha,
+        hy.sinkhorn,
+    )
+
+def collapse(streams, head, hy):
+    """The streams collapsed into one row through the mix `head`."""
+    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
+    mixed = ops.elemwise.hc_project(normed, head.dynamic, hy.streams)
+    return ops.elemwise.hc_collapse(mixed, streams, head.scale, head.base, hy.streams, hy.gate_eps)
+
+def summed(streams, hidden, count):
+    """The `count` streams, each `hidden` wide, added into one row."""
+    y, rest = ops.gather.split_rows(streams, hidden)
+    for _ in range(1, count - 1):
+        stream, rest = ops.gather.split_rows(rest, hidden)
+        y = ops.elemwise.residual_add(stream, y)
+    return ops.elemwise.residual_add(rest, y)
+
+def predict_route(streams, hy, mix, norm, norm_eps, router, bias, experts):
+    """The experts a following MLP's router is predicted to take: the
+    streams through its `mix` and `norm`, scored by its `router`."""
+    x, _, _ = gate(streams, mix, hy)
+    x = ops.elemwise.rmsnorm(x, norm, norm_eps)
+    logits = ops.linear.matmul(x, router)
+    return ops.linear.moe_route(logits, experts, PREDICT_K, routing.predict(), bias = bias)[0]
+
+def boundaries(positions, row_valid, ratio, split = True):
+    """Where the rows close entries of a key pool that compresses `ratio`
+    rows into one: each boundary's position, request and rope position.
+    With `split` the decode and prefill arms find theirs apart."""
+    if not split:
+        return ops.attn.pool_boundary(positions, row_valid, ratio, decode = False)
+    one = fact.single_token()
+    dpos, dreq, drope = ops.attn.pool_boundary(positions.on(one), row_valid, ratio, decode = True)
+    ppos, preq, prope = ops.attn.pool_boundary(positions.on(~one), row_valid, ratio, decode = False)
+    return merge([dpos, ppos]), merge([dreq, preq]), merge([drope, prope])
+
+# An e4m3 kv deployment keeps the window's plane and the compressed rows as
+# DeepSeek's fp8 rows (FlashMLA's fp8_ds_mla): 448 e4m3 codes and the 64
+# rotated dims in bf16 a position, with seven ue8m0 exponents (one a 64
+# codes) in each page's footer, 584 bytes a position in a u8 plane. The
+# index keys stay at bf16.
+DS_ROW = 584
+
+# An nvfp4 kv deployment keeps V4.1's caches as its reference quantizes
+# them: the window's plane as MXFP8 rows (all 512 dims e4m3 under one ue8m0
+# a 32, 528 bytes a position), the compressed rows as NVFP4 ones (e2m1 under
+# one e4m3 a 16, 288 bytes) and the index keys as FP4 ones (e2m1 under one
+# ue8m0 a 32, 68 bytes), its index queries read at FP4 against them.
+MX8_ROW = 528
+NV4_ROW = 288
+FP4_KEY_ROW = 68
+
+# The ratios whose pools pack their entries a row each: every page size a
+# deployment serves at is a multiple of them.
+COMPACT_RATIOS = [2, 4]
+
+def fp8_rows(m):
+    return m.kv == dtype.e4m3
+
+def fp4_rows(m):
+    return m.kv == dtype.nvfp4
+
+def caches(m, c):
+    fp8 = fp8_rows(m)
+    fp4 = fp4_rows(m)
+    rows = dtype.u8 if fp8 or fp4 else m.kv
+    keys = dtype.u8 if fp4 else dtype.bf16 if fp8 else m.kv
+
+    def row(at):
+        if fp8:
+            return [DS_ROW]
+        if fp4:
+            return [MX8_ROW]
+        return [at.kv_down.shape[0]]
+
+    # A pool compressing `ratio` positions into an entry keeps its entries
+    # compact, a row each: each position holds `1 / ratio` of a row (a page
+    # of positions `page / ratio` entries), where the ratio divides a page.
+    # A coarser pool (V4's 128) keeps a row a position, at each group's last.
+    def packed(width, ratio):
+        if ratio in COMPACT_RATIOS and width % ratio == 0:
+            return [width // ratio]
+        return [width]
+
+    # The window's plane is read only through its window: a windowed space,
+    # so a sequence keeps just its last `m.window` positions of it.
+    kv = c.kv_space(rows, m.window)
+    for w in m.layers:
+        at = w.attn
+        c.kv(kv, at.kv, row(at), m.head_dim, heads = at.kv_down.cut_axis != None)
+        ratio = at.pool.ratio if at.pool != None else 1
+        if at.pool != None and at.pool.owner:
+            pool = c.kv_space(rows)
+            entry = DS_ROW if fp8 else NV4_ROW if fp4 else m.head_dim
+            c.kv(pool, at.pool.entries, packed(entry, ratio), m.head_dim)
+        if at.indexer != None and at.indexer.owns_keys:
+            index = c.kv_space(keys)
+            key = FP4_KEY_ROW if fp4 else at.indexer.head_dim
+            c.kv(index, at.indexer.keys, packed(key, ratio), at.indexer.head_dim)
+        if w.engram != None:
+            c.state(w.engram.ids_state, [w.engram.ngram - 1], dtype.i32)
+    if m.decoder != None:
+        c.state(REPLAY, [1], dtype.i32)
+    if m.mtp != None:
+        at = m.mtp.block.attn
+        c.kv(kv, at.kv, row(at), m.head_dim, heads = at.kv_down.cut_axis != None)
+    if m.dspark != None:
+        # A DSpark stage's window: the last `m.window` committed positions
+        # and the drafted block above them.
+        ds = m.dspark
+        space = c.kv_space(rows, m.window + ds.block)
+        for st in ds.stages:
+            at = st.attn
+            c.kv(space, at.kv, row(at), m.head_dim, heads = at.kv_down.cut_axis != None)
+
+# The dtype the forward computes in on every deployment.
+ACT = dtype.bf16
+
+# A causal encoder-decoder's bounded replay (V4.1): a long prompt's leading
+# rows may run through the encoder alone (`fact.encode()` lanes), the decoder
+# replaying its last window; its windows read no keys below a lane's floor.
+REPLAY = "replay"
+
+def replay_floor(inputs, positions):
+    """Each row's replay floor: an encoder-only lane's rows set it past
+    themselves, every other row reads its own."""
+    state = inputs.state(REPLAY)
+    skipped = fact.encode()
+    ops.attn.replay_floor(positions.on(skipped), state, True)
+    return ops.attn.replay_floor(positions.on(~skipped), state, False)
+
+# What a layer leaves the next: the last sublayer's input mix (under
+# Single-Pass mHC the next sublayer reads its input through it) and the
+# last selection an indexer ranked (a CSA2 Reuse Mode layer reads it).
+NO_TRAIL = struct(mix = None, selection = None)
+
+def kv_heads(m):
+    if not m.layers:
+        return m.heads
+    row = m.layers[0].attn.kv_down.shape[0]
+    if m.head_dim == 0 or row % m.head_dim != 0:
+        fail("the cached row is {} wide and the head width is {}".format(row, m.head_dim))
+    return row // m.head_dim
+
+def forward(m, inputs):
+    hy = m.hyper
+    ds = m.dspark
+    # A DSpark deployment's drafted blocks run its stages alone: the trunk
+    # runs every other lane, its plans and tokens theirs.
+    trunk = inputs.on(~fact.block_draft()) if ds != None else inputs
+    positions = inputs.positions()
+    kvh = kv_heads(m)
+    plan = ops.attn.plan_prefill(trunk, m.heads, kvh, m.head_dim, m.window)
+    ids = inputs.tokens()
+    if ds != None:
+        ids = ids.on(~fact.block_draft())
+    streams = ops.elemwise.hc_expand(ops.gather.embed(ids, m.embed, m.vocab), hy.streams)
+    adapters = inputs.adapter_routes()
+    floor = None
+    replay_plan = None
+    if m.decoder != None:
+        floor = replay_floor(inputs, positions.on(~fact.block_draft()) if ds != None else positions)
+        # The decoder's rows are its own classes': a plan of their own.
+        replayed = trunk.on(~fact.encode())
+        replay_plan = ops.attn.plan_prefill(replayed, m.heads, kvh, m.head_dim, m.window)
+    rows = struct(inputs = inputs, plan = plan, positions = positions, ids = ids, adapters = adapters,
+                  kv_heads = kvh, floor = floor, replay_plan = replay_plan)
+
+    def block(l, w, carried):
+        streams, trail, taps = carried
+        if w.engram != None:
+            streams = engram(streams, ids, inputs, m, w.engram)
+        if ds != None and l in ds.targets:
+            # DSpark reads its target layers' inputs, the streams averaged.
+            taps = taps + [summed(streams, m.hidden, hy.streams) * f32(1.0 / hy.streams)]
+        following = m.layers[l + 1] if l + 1 < len(m.layers) else None
+        decoding = m.decoder != None and l >= m.decoder
+        streams, trail = layer(m, rows, w, streams, trail, following = following,
+                               narrow = m.decoder != None and l == m.decoder, replays = decoding)
+        return streams, trail, taps
+
+    streams, trail, taps = inputs.fold_layers(m.layers, (streams, NO_TRAIL, []), block)
+
+    if m.hc_head != None:
+        y = collapse(streams, m.hc_head, hy)
+    elif hy.single_pass:
+        y = premix(streams, trail.mix, m)
+    else:
+        y = summed(streams, m.hidden, hy.streams)
+    x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
+    ends = None
+    if ds != None:
+        dspark_keys(m, rows, taps)
+        # Each row's lane's last key: a drafted block's rows read the window
+        # that ends at the block's last, however its rows are laid out.
+        ends = ops.attn.kv_ends(inputs.request_of_token(), inputs.kv(ds.stages[0].attn.kv))
+        x = merge([dspark_block(m, inputs, rows, ends), x])
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
+    logits = ops.linear.lm_head(x, m.head if m.head != None else m.embed)
+    if m.mtp != None:
+        draft(m, rows, streams, logits)
+    if ds != None:
+        logits = dspark_readout(m, inputs, logits, ends)
+    return logits
+
+def dspark_keys(m, rows, taps):
+    """Each DSpark stage's window keys at the trunk's rows: its key
+    projection of the target layers' inputs, side by side, projected and
+    normed (`main_x`)."""
+    ds = m.dspark
+    hy = m.hyper
+    inputs = rows.inputs
+    main = ops.linear.matmul(ops.gather.concat_cols(taps), ds.main_proj)
+    main = ops.elemwise.rmsnorm(main, ds.main_norm, hy.norm_eps)
+    for st in ds.stages:
+        at = st.attn
+        plane = ops.linear.matmul(main, at.kv_down)
+        plane = ops.elemwise.rmsnorm(plane, at.kv_norm, at.kv_norm_eps)
+        plane = rope(plane, rows.positions, at.rope_dim, m.head_dim, at.theta, at.yarn)
+        ops.attn.kv_append(
+            plane,
+            None,
+            inputs.kv(at.kv),
+            inputs.write_page(at.kv),
+            inputs.write_offset(at.kv),
+        )
+
+def dspark_block(m, whole, rows, ends):
+    """A drafted block's rows (its anchor, then noise tokens) through the
+    DSpark stages: each row reads its stage's window and the whole block."""
+    ds = m.dspark
+    hy = m.hyper
+    drafted = whole.on(fact.block_draft())
+    ids = drafted.tokens()
+    streams = ops.elemwise.hc_expand(ops.gather.embed(ids, m.embed, m.vocab), hy.streams)
+    block_rows = struct(
+        inputs = drafted,
+        plan = None,
+        positions = drafted.positions(),
+        ids = ids,
+        adapters = rows.adapters,
+        kv_heads = rows.kv_heads,
+        floor = None,
+        replay_plan = None,
+        ends = ends.on(fact.block_draft()),
+    )
+    trail = NO_TRAIL
+    for st in ds.stages:
+        streams, trail = layer(m, block_rows, st, streams, trail)
+    y = premix(streams, trail.mix, m)
+    return ops.elemwise.rmsnorm(y, ds.norm, hy.norm_eps)
+
+def dspark_readout(m, inputs, logits, ends):
+    """States the DSpark head on the trace and plants its proposals: a
+    drafted block's logits through the Markov head, each row biased by the
+    token the row before it picked, and those picks."""
+    ds = m.dspark
+    drafting = fact.block_draft()
+    block_drafter(
+        logits,
+        rows = ds.block,
+        mask_token = ds.noise,
+        bidirectional = False,
+        proposals_from = 0,
+    )
+    read = lambda x: ops.gather.gather_rows(x, inputs.readout_rows()).on(drafting)
+    biased, picks = ops.sampling.markov_walk(logits.on(drafting), read(inputs.tokens()), read(inputs.positions()),
+                                         read(ends), ds.markov_embed, ds.markov_head, ds.block)
+    seam.at(seam.MTP, [biased])
+    seam.at(seam.MTP_DRAFTS, [picks])
+    return merge([biased, logits.on(~drafting)])
+
+def draft(m, rows, streams, logits):
+    """The MTP head's drafted token, from the trunk's last streams and the
+    token its logits pick."""
+    hy = m.hyper
+    mtp = m.mtp
+    inputs = rows.inputs
+    drafted = inputs.on(fact.drafts())
+    plan = ops.attn.plan_prefill(drafted, m.heads, rows.kv_heads, m.head_dim, m.window)
+    hidden = ops.gather.gather_rows(streams, inputs.readout_rows()).on(fact.drafts())
+    positions = rows.positions.on(fact.drafts())
+    token = ops.sampling.argmax([logits.on(fact.drafts())])
+
+    e = ops.gather.embed(token, m.embed, m.vocab)
+    e = ops.elemwise.rmsnorm(e, mtp.enorm, mtp.norm_eps)
+    e = ops.elemwise.hc_expand(ops.linear.matmul(e, mtp.e_proj), hy.streams)
+    h = ops.elemwise.rmsnorm_per_head(hidden, mtp.hnorm, m.hidden, mtp.norm_eps)
+    routes = ops.linear.group_routes(h, hy.streams)
+    h = ops.linear.matmul_grouped(h, mtp.h_proj, routes, hy.streams)
+    fused = ops.elemwise.residual_add(e, h)
+
+    draft_rows = struct(
+        inputs = drafted,
+        plan = plan,
+        positions = positions,
+        ids = token,
+        adapters = rows.adapters,
+        kv_heads = rows.kv_heads,
+        floor = None,
+        replay_plan = None,
+    )
+    out, _ = layer(m, draft_rows, mtp.block, fused, NO_TRAIL)
+    y = ops.elemwise.rmsnorm(collapse(out, mtp.hc_head, hy), mtp.norm, mtp.norm_eps)
+    proposal = ops.linear.lm_head(y, m.head)
+    seam.at(seam.MTP, [proposal])
+    seam.at(seam.MTP_DRAFTS, [ops.sampling.argmax([proposal])])
+
+def rope(x, pos, rope_dim, head_dim, theta, scaling, inverse = False):
+    if scaling != None:
+        scaling = yarn(
+            factor = scaling.factor,
+            beta_fast = scaling.beta_fast,
+            beta_slow = scaling.beta_slow,
+            original_max_position = scaling.original_max_position,
+        )
+    return ops.elemwise.rope(
+        x,
+        pos,
+        head_dim,
+        theta,
+        rotary.last(rope_dim, interleaved = True, inverse = inverse, yarn = scaling),
+    )
+
+def layer(m, rows, w, streams, trail, following = None, narrow = False, replays = False):
+    """The layer `w` over `rows`, given the `trail` earlier layers left it:
+    the streams it leaves and its own trail. With `narrow` (a causal
+    encoder-decoder's first decoder layer) its pool and index keys are
+    written for every row and the rest runs on the rows the decoder
+    replays; with `replays` its window reads nothing below `rows.floor`."""
+    hy = m.hyper
+    inputs = rows.inputs
+    pos = rows.positions
+    at = w.attn
+    pages = inputs.kv(at.kv)
+    write_page = inputs.write_page(at.kv)
+    write_offset = inputs.write_offset(at.kv)
+
+    x, post_mix, comb_mix, mix = sublayer_input(streams, w.attn_mix, m, trail.mix)
+    if w.attn_norm != None:
+        x = ops.elemwise.rmsnorm(x, w.attn_norm, hy.norm_eps)
+    floor = rows.floor if replays else None
+    plan = rows.replay_plan if replays else rows.plan
+
+    if narrow:
+        p = at.pool
+        if p == None or not p.owner:
+            fail("a decoder's first layer writes the pool its layers read")
+        bpos, breq, brope = boundaries(pos, inputs.row_valid(), p.ratio)
+        pool_sources(m, inputs, at, x, pages, write_page, write_offset, bpos, breq, brope)
+        # Every later op of the decoder reads x or what it leads to: the
+        # rows of encoder-only lanes go no further.
+        x = x.on(~fact.encode())
+        if m.dspark != None:
+            # The streams are the trunk's lanes', not every lane's: they
+            # narrow with the rows explicitly.
+            replayed = ~fact.encode()
+            streams = streams.on(replayed)
+            post_mix = post_mix.on(replayed)
+            comb_mix = comb_mix.on(replayed)
+            if mix != None:
+                mix = struct(mixes = mix.mixes.on(replayed), scale = mix.scale, base = mix.base)
+
+    q_a = ops.linear.matmul(x, at.q_down)
+    q_a = ops.elemwise.rmsnorm(q_a, at.q_norm, at.q_norm_eps)
+    q = ops.linear.matmul(q_a, at.q_up)
+    if at.q_head_norm:
+        q = ops.elemwise.rmsnorm_no_scale(q, m.head_dim, at.q_norm_eps)
+    q = rope(q, pos, at.rope_dim, m.head_dim, at.theta, at.yarn)
+    seam.at(seam.ATTN_Q, [q])
+
+    plane = ops.linear.matmul(x, at.kv_down)
+    plane = ops.elemwise.rmsnorm(plane, at.kv_norm, at.kv_norm_eps)
+    plane = rope(plane, pos, at.rope_dim, m.head_dim, at.theta, at.yarn)
+    ops.attn.kv_append(plane, None, pages, write_page, write_offset)
+
+    selection = trail.selection
+    p = at.pool
+    if p != None:
+        entries = inputs.kv(p.entries)
+        row_valid = inputs.row_valid()
+        request_of_token = inputs.request_of_token()
+        # Each layer finds its own pool's boundaries (cheaper than holding
+        # them across layers). A CSA2 layer reading its source's pool closes none.
+        own_index = at.selection == "own" and at.indexer.compressor != None
+        if not narrow and (p.owner or own_index):
+            bpos, breq, brope = boundaries(pos, row_valid, p.ratio)
+
+        if p.owner and not narrow:
+            pool_sources(m, inputs, at, x, pages, write_page, write_offset, bpos, breq, brope)
+
+        if at.selection == "own":
+            ix = at.indexer
+            if ix.compressor != None:
+                picked = indexer(x, q_a, ix, pos, bpos, breq, brope, inputs.kv(ix.keys),
+                                 inputs.write_page(ix.keys), inputs.write_offset(ix.keys))
+            else:
+                picked = rank(x, q_a, ix, pos, inputs.kv(ix.keys), p.ratio)
+            selection = struct(picked = picked, top_k = ix.top_k)
+        elif at.selection == "shared" and selection == None:
+            fail("a CSA2 Reuse Mode layer follows a layer that ranked")
+        # The window's attention runs beside the pool's, where a backend
+        # may land the two, their merge and the sinks as one.
+        o, lse = ops.attn.prefill(
+            q,
+            plan,
+            pages,
+            m.window,
+            m.head_dim,
+            rows.kv_heads,
+            at.sm_scale,
+            lse = True,
+            floor = floor,
+        )
+        if at.selection != "none":
+            po, plse = ops.attn.pool_lse(
+                q,
+                pos,
+                request_of_token,
+                entries,
+                p.ratio,
+                m.heads,
+                m.head_dim,
+                at.sm_scale,
+                selection = selection.picked,
+                top_k = selection.top_k,
+            )
+        else:
+            po, plse = ops.attn.pool_lse(q, pos, request_of_token, entries, p.ratio, m.heads, m.head_dim, at.sm_scale)
+        o, lse = ops.attn.merge_lse(o, lse, po, plse, m.heads, m.head_dim)
+    elif at.window_sink != None:
+        # A DSpark stage: every row of a block reads the window that ends
+        # at the block's last, the whole block bidirectionally, its sinks in.
+        o = ops.attn.window_sink(q, rows.ends, inputs.request_of_token(), pages, at.sink, at.window_sink,
+                                 m.head_dim, at.sm_scale)
+    else:
+        if floor != None:
+            fail("a replaying layer pools")
+        o, lse = ops.attn.prefill(
+            q,
+            plan,
+            pages,
+            m.window,
+            m.head_dim,
+            rows.kv_heads,
+            at.sm_scale,
+            lse = True,
+        )
+
+    if at.window_sink == None:
+        o = ops.attn.sink(o, lse, at.sink, m.head_dim)
+    o = rope(o, pos, at.rope_dim, m.head_dim, at.theta, at.yarn, inverse = True)
+    seam.at(seam.ATTN_OUT, [o])
+
+    if at.o_groups > 1:
+        routes = ops.linear.group_routes(o, at.o_groups)
+        o = ops.linear.matmul_grouped(o, at.o_down, routes, at.o_groups)
+    else:
+        o = ops.linear.matmul(o, at.o_down)
+    o = ops.linear.matmul(o, at.o_up)
+    adapted = fact.has(fact.Adapter)
+    o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, rows.adapters, o.on(adapted))
+    if replays:
+        # The correction lands on every row it is read for: a replaying
+        # layer's, the decoder's (a DSpark deployment's trunk's).
+        if m.dspark != None:
+            o = o.on(~fact.block_draft())
+        o = o.on(~fact.encode())
+    streams = ops.elemwise.hc_fold(o, streams, post_mix, comb_mix)
+
+    x, post_mix, comb_mix, mix = sublayer_input(streams, w.mlp_mix, m, mix)
+    if w.mlp_norm != None:
+        x = ops.elemwise.rmsnorm(x, w.mlp_norm, hy.norm_eps)
+    # The next layer's predicted experts, where the backend streams them.
+    f = mlp(x, rows.ids, w.mlp, streams, following if inputs.route_hints() else None, hy)
+    streams = ops.elemwise.hc_fold(f, streams, post_mix, comb_mix)
+    return streams, struct(mix = mix, selection = selection)
+
+def pool_sources(m, inputs, at, x, pages, write_page, write_offset, bpos, breq, brope):
+    """A pool owner's entries (and, under CSA2, its index keys) from `x`,
+    appended at the boundaries `bpos`."""
+    hy = m.hyper
+    p = at.pool
+    latent = compress(m, x, p, pages, write_page, write_offset, bpos, breq)
+    ix = at.indexer
+    if ix != None and ix.wk != None:
+        # CSA2: the index keys are a projection of the compressed
+        # latent, taken before its rotation.
+        k = ops.elemwise.rmsnorm(ops.linear.matmul(latent, ix.wk), ix.k_norm, hy.norm_eps)
+        k = rope(k, brope, ix.rope_dim, ix.head_dim, ix.theta, ix.yarn)
+        ops.attn.pool_kv_append(k, bpos, breq, inputs.kv(ix.keys), inputs.write_page(ix.keys), inputs.write_offset(ix.keys))
+    pooled = rope(latent, brope, at.rope_dim, m.head_dim, at.theta, at.yarn)
+    ops.attn.pool_kv_append(pooled, bpos, breq, inputs.kv(p.entries), inputs.write_page(p.entries), inputs.write_offset(p.entries))
+
+def compress(m, x, p, pages, write_page, write_offset, bpos, breq):
+    c = p.compressor
+    if c == None:
+        return ops.attn.pool_gather(bpos, breq, pages, None, m.head_dim, p.ratio, ACT)
+    if c.wgate != None:
+        state_kv = ops.linear.matmul(x, c.wkv)
+        state_score = ops.linear.matmul(x, c.wgate)
+        ops.attn.pool_state_write(state_kv, state_score, pages, write_page, write_offset, m.head_dim, p.ratio)
+        pooled = ops.attn.pool_gather(bpos, breq, pages, c.ape, m.head_dim, p.ratio, ACT)
+        return ops.elemwise.rmsnorm(pooled, c.norm, c.norm_eps)
+    kv = ops.linear.matmul(x, c.wkv)
+    return ops.elemwise.rmsnorm(kv, c.norm, c.norm_eps)
+
+def sublayer_input(streams, mix, m, prev):
+    """A sublayer's input read out of `streams`, the post and combine mixes
+    its output folds back with, and the mix the next sublayer reads its
+    input through: under Single-Pass mHC this one's, `prev` read here."""
+    hy = m.hyper
+    if not hy.single_pass:
+        x, post_mix, comb_mix = gate(streams, mix, hy)
+        return x, post_mix, comb_mix, prev
+    normed = ops.elemwise.hc_rmsnorm_f32(streams, hy.norm_eps)
+    mixed = mixes(normed, mix, hy)
+    _, post_mix, comb_mix = ops.elemwise.hc_gates(mixed, streams, mix.scale, mix.base, hy.streams,
+                                                  hy.gate_eps, hy.alpha, hy.sinkhorn)
+    x = premix(streams, prev, m)
+    return x, post_mix, comb_mix, struct(mixes = mixed, scale = mix.scale, base = mix.base)
+
+def premix(streams, prev, m):
+    hy = m.hyper
+    if prev != None:
+        x, _, _ = ops.elemwise.hc_gates(prev.mixes, streams, prev.scale, prev.base, hy.streams,
+                                        hy.gate_eps, hy.alpha, hy.sinkhorn)
+        return x
+    return ops.gather.split_rows(streams, m.hidden)[0]
+
+def engram(streams, ids, inputs, m, e):
+    hy = m.hyper
+    state = inputs.state(e.ids_state)
+    one = fact.single_token()
+    ids_d, ids_p = ids.on(one), ids.on(~one)
+    grams = merge([
+        ops.gather.ngram_ids(ids_d, state, e.pad, e.mults, e.primes, e.offsets, e.heads_per_ngram, m.token_map),
+        ops.gather.ngram_ids_chunked(ids_p, state, e.pad, e.mults, e.primes, e.offsets, e.heads_per_ngram, m.token_map),
+    ])
+    rows = 0
+    for p in e.primes:
+        rows += p
+    fetched = ops.gather.embed_concat(grams, e.table, rows)
+    kv = ops.linear.matmul(fetched, e.wkv)
+    key, value = ops.gather.split_rows(kv, hy.streams * m.hidden)
+    key = ops.elemwise.rmsnorm_grouped_plus_one(key, e.k_weight, m.hidden, e.eps)
+    query = ops.elemwise.rmsnorm_grouped_plus_one(streams, e.q_weight, m.hidden, e.eps)
+    gated = ops.elemwise.ple_gate(key, query, value, hy.streams)
+    return ops.elemwise.residual_add(gated, streams)
+
+def predict_next(streams, following, hy):
+    if following == None:
+        return None
+    f = following.mlp
+    if f.kind != "moe_flash" or f.gate.kind != "bias":
+        return None
+    if hy.single_pass:
+        # The next layer's input mix is this layer's own prediction, which is
+        # not settled here: the hint would score the wrong row.
+        return None
+    return predict_route(streams, hy, following.mlp_mix, following.mlp_norm, hy.norm_eps, f.router, f.gate.bias, f.experts)
+
+def mlp(x, ids, f, streams, following, hy):
+    if f.kind == "dense":
+        return ops.linear.matmul(
+            ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter, limit = f.limit),
+            f.down,
+        )
+    if f.kind == "routed":
+        routes, weights = ops.linear.moe_route(
+            ops.linear.matmul(x, f.router),
+            f.experts,
+            f.top_k,
+            routing.sqrt_softplus(renormalize = f.renorm, scaling = f.scaling),
+            bias = f.bias,
+        )
+        hidden = ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k)
+        act = ops.linear.glu(hidden, gating.swiglu(), f.inter, limit = f.limit)
+        return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
+    if f.gate.kind == "bias":
+        hint = predict_next(streams, following, hy)
+        routes, weights = ops.linear.moe_route(
+            ops.linear.matmul(x, f.router),
+            f.experts,
+            f.top_k,
+            routing.sqrt_softplus(renormalize = f.renorm, scaling = f.scaling),
+            bias = f.gate.bias,
+            hint = hint,
+        )
+    else:
+        vocab = f.gate.tid2eid.shape[0]
+        routes, weights = ops.linear.moe_route(
+            ops.linear.matmul(x, f.router),
+            f.experts,
+            f.top_k,
+            routing.hash(vocab, renormalize = f.renorm, scaling = f.scaling),
+            ids = ids,
+            table = f.gate.tid2eid,
+        )
+    shared = ops.linear.matmul(
+        ops.linear.glu(
+            ops.linear.matmul(x, f.shared_gate_up),
+            gating.swiglu(),
+            f.shared_inter,
+            limit = f.limit,
+        ),
+        f.shared_down,
+    )
+
+    if f.down.precision != f.down.dtype and f.gate_up.fused != None:
+        # The same over one packed gate-up bank: each expert's gate rows,
+        # then its up rows.
+        act = ops.linear.glu(
+            ops.linear.moe_matmul_select(x, f.gate_up.fused, routes, f.top_k),
+            gating.swiglu(),
+            f.inter,
+            weights = weights,
+            limit = f.limit,
+        )
+        return ops.linear.moe_sum_add(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), shared)
+    if f.down.precision != f.down.dtype and f.gate_up.fused == None:
+        # DeepSeek's expert weighs its activations before its down leg
+        # quantizes them, and sums its routes and the shared expert in f32.
+        act = ops.linear.glu(
+            ops.linear.moe_matmul_select(x, f.gate_up.gate, routes, f.top_k),
+            gating.swiglu(),
+            up = ops.linear.moe_matmul_select(x, f.gate_up.up, routes, f.top_k),
+            weights = weights,
+            limit = f.limit,
+        )
+        return ops.linear.moe_sum_add(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), shared)
+    if f.gate_up.fused != None:
+        act = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up.fused, routes, f.top_k), gating.swiglu(), f.inter, limit = f.limit)
+    else:
+        act = ops.linear.glu(
+            ops.linear.moe_matmul_select(x, f.gate_up.gate, routes, f.top_k),
+            gating.swiglu(),
+            up = ops.linear.moe_matmul_select(x, f.gate_up.up, routes, f.top_k),
+            limit = f.limit,
+        )
+    routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
+    return ops.elemwise.residual_add(shared, routed)
+
+def indexer(x, q_a, ix, positions, bpos, breq, brope, keys, write_page, write_offset):
+    c = ix.compressor
+    ratio = c.ape.shape[0]
+    state_kv = ops.linear.matmul(x, c.wkv)
+    state_score = ops.linear.matmul(x, c.wgate)
+    ops.attn.pool_state_write(state_kv, state_score, keys, write_page, write_offset, ix.head_dim, ratio)
+    k = ops.attn.pool_gather(bpos, breq, keys, c.ape, ix.head_dim, ratio, ACT)
+    k = ops.elemwise.rmsnorm(k, c.norm, c.norm_eps)
+    k = rope(k, brope, ix.rope_dim, ix.head_dim, ix.theta, ix.yarn)
+    ops.attn.pool_kv_append(k, bpos, breq, keys, write_page, write_offset)
+    q = ops.linear.matmul(q_a, ix.wq_b)
+    q = rope(q, positions, ix.rope_dim, ix.head_dim, ix.theta, ix.yarn)
+    weights = ops.linear.matmul(x, ix.weights_proj)
+    return ops.attn.index_topk(q, weights, keys, ix.heads, ix.head_dim, ix.top_k, ratio)
+
+def rank(x, q_a, ix, positions, keys, ratio):
+    q = ops.linear.matmul(q_a, ix.wq_b)
+    q = rope(q, positions, ix.rope_dim, ix.head_dim, ix.theta, ix.yarn)
+    weights = ops.linear.matmul(x, ix.weights_proj)
+    return ops.attn.index_topk(q, weights, keys, ix.heads, ix.head_dim, ix.top_k, ratio)

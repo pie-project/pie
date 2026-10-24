@@ -106,7 +106,13 @@ fn the_contract_carries_the_forks_signs_value_for_value() {
     );
     let mut checked = 0;
     for width in BONSAI_SIGN_WIDTHS {
-        let signs = landed(&log, &format!("prism.hadamard.signs.{width}"));
+        let bank = match width {
+            5120 => "bonsai.hidden",
+            6144 => "bonsai.ssm",
+            17408 => "bonsai.ffn_down",
+            other => panic!("no Bonsai sign bank is {other} wide"),
+        };
+        let signs = landed(&log, bank);
         assert_eq!(
             signs, oracle[&width],
             "width {width}: signs differ from the fork oracle"

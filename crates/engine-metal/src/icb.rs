@@ -560,11 +560,7 @@ impl Builder<'_> {
             bound.push(self.bind(&command, fire, at, *arg)?);
         }
 
-        let group = if fire.group == [0, 0, 0] {
-            crate::device::ctx::threadgroup(&pipeline, fire.lanes)
-        } else {
-            size(fire.group)
-        };
+        let group = crate::device::ctx::group_of(&pipeline, fire)?;
         command.concurrentDispatchThreads_threadsPerThreadgroup(size(fire.lanes), group);
         command.setBarrier();
 

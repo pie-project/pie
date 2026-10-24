@@ -9,7 +9,15 @@ fn main() {
     let mut packages: Vec<(String, Vec<(String, String)>)> = Vec::new();
     for dir in std::fs::read_dir(&root).expect("the repository's models/") {
         let dir = dir.expect("a models/ entry").path();
-        // A package is a directory of `.poem` files, `lib/` excepted.
+        // A package is a `.poem` file, or a directory of them, `lib/`
+        // excepted.
+        if dir.is_file() && dir.extension().is_some_and(|e| e == "poem") {
+            println!("cargo:rerun-if-changed={}", dir.display());
+            let name = dir.file_stem().unwrap().to_str().unwrap().to_string();
+            let path = dir.canonicalize().expect("a package file's path");
+            packages.push((name.clone(), vec![(format!("{name}.poem"), path.display().to_string())]));
+            continue;
+        }
         let poem = |entry: std::fs::DirEntry| entry.path().extension().is_some_and(|e| e == "poem");
         let is_package = dir.is_dir()
             && dir.file_name().is_some_and(|name| name != "lib")

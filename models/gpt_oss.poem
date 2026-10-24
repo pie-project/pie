@@ -1,0 +1,406 @@
+# gpt-oss 20B (with a DFlash drafter or without), its five-layer,
+# sixteen-expert miniature, and 120B.
+
+load("//lib/adapters.poem", "banks")
+load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches", dflash_declare = "declare", dflash_head = "head")
+
+HARMONY = template("harmony")
+TOKENIZER = tokenizer(markers = [["<|endoftext|>", "<|return|>", "<|call|>"]])
+
+MODELS = [
+    model("gptoss-20b", template = HARMONY, tokenizer = TOKENIZER, drafters = ["dflash"], arch = "gptoss", layers = 24, vocab = 201088),
+    model("gptoss-20b-mini", mini = True, template = HARMONY, tokenizer = TOKENIZER, arch = "gptoss", layers = 5, vocab = 201088),
+    model("gptoss-120b", template = HARMONY, tokenizer = TOKENIZER, arch = "gptoss", layers = 36, vocab = 201088),
+]
+
+DEPLOYMENTS = [
+    deployment("gptoss-20b", weights = [dtype.u4g64, dtype.mxfp4], kv = dtype.bf16, drafter = "dflash"),
+    deployment("gptoss-20b", weights = [dtype.u4g64, dtype.mxfp4], kv = dtype.bf16),
+    deployment("gptoss-20b", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
+    deployment("gptoss-20b-mini", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
+    deployment("gptoss-120b", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.bf16),
+    # Keys and values e4m3 under a unit scale, as vLLM's Blackwell recipe
+    # serves gpt-oss.
+    deployment("gptoss-20b", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.e4m3),
+    deployment("gptoss-120b", weights = [dtype.bf16, dtype.mxfp4], kv = dtype.e4m3),
+]
+
+# The drafter published apart from the model it drafts for.
+PUBLISHED = [
+    published(target = "mlx-community/gpt-oss-20b-MXFP4-Q4", head = "z-lab/gpt-oss-20b-DFlash", drafter = "dflash", deployment = "gptoss-20b-dflash-u4g64-mxfp4-kv-bf16"),
+]
+
+# The weights of gpt-oss: attention with sinks, every other layer over a
+# sliding window, YaRN rope, and routed experts with biases, their banks
+# stored as the second dtype of a deployment's weights.
+
+def dims(layers = 24, experts = 32):
+    return struct(
+        hidden = 2880,
+        layers = layers,
+        q_heads = 64,
+        kv_heads = 8,
+        head_dim = 64,
+        theta = 150000.0,
+        yarn_factor = 32.0,
+        yarn_beta_fast = 32.0,
+        yarn_beta_slow = 1.0,
+        yarn_attention_factor = 1.3465736,
+        yarn_original_max_position = 4096,
+        window = 128,
+        experts = experts,
+        top_k = 4,
+        inter = 2880,
+        swiglu_limit = 7.0,
+        swiglu_alpha = 1.702,
+        vocab = 201088,
+        norm_eps = 1e-5,
+    )
+
+DIMS = {
+    "gptoss-20b": dims(),
+    "gptoss-20b-mini": dims(layers = 5, experts = 16),
+    "gptoss-120b": dims(layers = 36, experts = 128),
+}
+
+DFLASH_20B = dflash_head(
+    taps = [1, 6, 11, 16, 21],
+    windows = [None] * 8,
+    q_heads = 64,
+    kv_heads = 8,
+    head_dim = 64,
+    inter = 7680,
+    theta = 150000.0,
+    block = 8,
+    mask_token = 200000,
+    attn_bias = True,
+)
+
+WINDOWED = 0
+FULL = 1
+
+# An expert's width is cut in MXFP4 blocks of 32, and padded to whole tiles
+# of 128 the fused expert kernels take when it does not split in blocks.
+BLOCK = 32
+TILE = 128
+
+def inter(iw, tp):
+    """An expert's width as `tp` ranks hold it: the checkpoint's, or zero-padded
+    when its blocks do not split `tp` ways; a zero gate and up row yields a zero
+    SwiGLU, and a zero down column adds nothing."""
+    if (iw // BLOCK) % tp == 0:
+        return iw
+    tile = tp * TILE
+    return (iw + tile - 1) // tile * tile
+
+def layout(id, deploy):
+    if deploy.drafter != None and deploy.drafter != "dflash":
+        fail("{} drafts with dflash or nothing, not {}".format(id, deploy.drafter))
+    d = DIMS[id]
+    r = roles(deploy, "weights", "experts", exact = True)
+    weights, experts = r.weights, r.experts
+    dense = compute(weights)
+    router = dtype.u8g64 if weights == dtype.u4g64 else weights
+    hidden = d.hidden
+    hd = d.head_dim
+    q_w = d.q_heads * hd
+    kv_w = d.kv_heads * hd
+    iw = inter(d.inter, deploy.tp)
+
+    def layer(l):
+        norm = lambda s, cols: weight([cols])
+        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        return struct(
+            attn = struct(
+                reading = WINDOWED if l % 2 == 0 else FULL,
+                # q, k and v as one product, split after its bias.
+                qkv = weight([q_w + 2 * kv_w, hidden], weights).packed(
+                    [q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
+                qkv_bias = weight([q_w + 2 * kv_w]).packed(
+                    [q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
+                o_proj = weight([hidden, q_w], weights).rows(),
+                o_bias = weight([hidden]),
+                sinks = weight([d.q_heads]).columns(),
+                kv = "kv.{}".format(l),
+            ),
+            attn_norm = norm("attn_norm", hidden),
+            attn_norm_eps = d.norm_eps,
+            mlp_norm = norm("mlp_norm", hidden),
+            mlp_norm_eps = d.norm_eps,
+            mlp = struct(
+                experts = d.experts,
+                top_k = d.top_k,
+                inter = iw,
+                swiglu_limit = d.swiglu_limit,
+                swiglu_alpha = d.swiglu_alpha,
+                router = weight([d.experts, hidden], router),
+                router_bias = weight([d.experts]),
+                gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
+                gate_up_bias = weight([d.experts, 2 * iw]).bank([iw, iw]),
+                down = weight([d.experts, hidden, iw], experts).rows(),
+                down_bias = weight([d.experts, hidden]),
+            ),
+            lora_a = lora_a,
+            lora_b = lora_b,
+        )
+
+    head = weight([d.vocab, hidden], weights).packed([d.vocab])
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        q_heads = d.q_heads,
+        kv_heads = d.kv_heads,
+        head_dim = hd,
+        window = d.window,
+        sm_scale = f32(1.0 / f32(sqrt(hd))),
+        rope = struct(
+            theta = d.theta,
+            factor = d.yarn_factor,
+            beta_fast = d.yarn_beta_fast,
+            beta_slow = d.yarn_beta_slow,
+            attention_factor = d.yarn_attention_factor,
+            original_max_position = d.yarn_original_max_position,
+        ),
+        kv = deploy.kv,
+        embed = weight([d.vocab, hidden], weights),
+        head = head,
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight([hidden]),
+        final_norm_eps = d.norm_eps,
+        dflash = dflash_declare(DFLASH_20B, "aux", hidden, d.vocab, d.norm_eps, weights, dense)
+            if deploy.drafter == "dflash" else None,
+    )
+
+# How a gpt-oss checkpoint is laid out. transformers banks each layer's
+# experts as `gate_up_proj_blocks` bytes; mlx_lm splits them into
+# `gate_proj`/`up_proj`/`down_proj` words.
+
+TRANSFORMERS = dtype.u8
+MLX = dtype.u32
+BANK_ROWS = 1
+
+def formats(m):
+    codes = lambda probe, want: lambda checkpoint: has(probe) and stored(probe) == raw(want)
+    return [
+        format(
+            "transformers",
+            recognizes = codes("model.layers.0.mlp.experts.gate_up_proj_blocks", TRANSFORMERS),
+            read = lambda reads: read(m, reads, TRANSFORMERS),
+            states = configured(m),
+        ),
+        format(
+            "mlx_lm",
+            recognizes = codes("model.layers.0.mlp.experts.gate_proj.weight", MLX),
+            read = lambda reads: read(m, reads, MLX),
+            states = configured(m),
+        ),
+    ]
+
+def configured(m):
+    """The shape a transformers configuration states of this model."""
+    return [
+        config("hidden_size", m.hidden),
+        config("vocab_size", m.vocab),
+        config("num_attention_heads", m.q_heads),
+        config("num_key_value_heads", m.kv_heads),
+        config("head_dim", m.head_dim),
+        config("num_hidden_layers", len(m.layers), or_deeper = True),
+        config("rms_norm_eps", m.final_norm_eps),
+        config("sliding_window", m.window),
+        config("num_local_experts", m.layers[0].mlp.experts, or_deeper = True),
+        config("rope_theta", m.rope.theta),
+    ]
+
+def read(m, reads, codes):
+    reads.read(m.embed, "model.embed_tokens.weight")
+    reads.read(m.final_norm, "model.norm.weight")
+    reads.read(m.head, "lm_head.weight")
+    for l, layer in enumerate(m.layers):
+        ck = lambda what: "model.layers.{}.{}".format(l, what)
+        attn = layer.attn
+        mlp = layer.mlp
+        reads.read(layer.attn_norm, ck("input_layernorm.weight"))
+        reads.read(layer.mlp_norm, ck("post_attention_layernorm.weight"))
+        proj = lambda part: [ck("self_attn.{}_proj.{}".format(x, part)) for x in ["q", "k", "v"]]
+        reads.read_concat(attn.qkv, proj("weight"))
+        reads.read_concat(attn.qkv_bias, proj("bias"))
+        reads.read(attn.o_proj, ck("self_attn.o_proj.weight"))
+        reads.read(attn.o_bias, ck("self_attn.o_proj.bias"))
+        reads.read(attn.sinks, ck("self_attn.sinks"))
+        reads.read(mlp.router, ck("mlp.router.weight"))
+        reads.read(mlp.router_bias, ck("mlp.router.bias"))
+        if codes == TRANSFORMERS:
+            rows = mlp.inter
+            reads.extend(bank_planes(
+                mlp.gate_up,
+                ck("mlp.experts.gate_up_proj_blocks"),
+                ck("mlp.experts.gate_up_proj_scales"),
+                codes,
+                lambda e: deinterleaved(e, rows),
+            ))
+            reads.read_expr(mlp.gate_up_bias, deinterleaved(src(ck("mlp.experts.gate_up_proj_bias")), rows))
+            reads.extend(bank_planes(
+                mlp.down,
+                ck("mlp.experts.down_proj_blocks"),
+                ck("mlp.experts.down_proj_scales"),
+                codes,
+                lambda e: e,
+            ))
+            reads.read(mlp.down_bias, ck("mlp.experts.down_proj_bias"))
+        else:
+            reads.extend(banked_split(mlp.gate_up, [ck("mlp.experts.gate_proj"), ck("mlp.experts.up_proj")], codes))
+            reads.read_concat(mlp.gate_up_bias, [ck("mlp.experts.gate_proj.bias"), ck("mlp.experts.up_proj.bias")])
+            reads.extend(banked_split(mlp.down, [ck("mlp.experts.down_proj")], codes))
+            reads.read(mlp.down_bias, ck("mlp.experts.down_proj.bias"))
+    if m.dflash != None:
+        bind_aux(m.dflash, reads, lambda name: src(name).bias(-1.0))
+
+def stored_as(w, plane, want):
+    if stored(plane) != raw(want):
+        fail("`{}`: `{}` is stored {}, and this spelling of the bank carries it as raw {}".format(
+            w.name, plane, stored(plane), want))
+
+def bank_planes(w, blocks, scales, codes, lay):
+    stored_as(w, blocks, codes)
+    stored_as(w, scales, dtype.u8)
+    e8m0 = encoding(dtype.e8m0)
+    return [
+        tensor(w.name, lay(src(blocks).transmute(w.shape, grouped(w))), grouped(w)),
+        tensor(
+            scales_name(w.name),
+            lay(src(scales).transmute(scales_shape(w), e8m0)),
+            e8m0,
+            shape = scales_shape(w),
+            scaling = w,
+        ),
+    ]
+
+def banked_split(w, stems, codes):
+    legs = len(stems)
+
+    def leg(whole):
+        cut = list(whole)
+        cut[BANK_ROWS] = cut[BANK_ROWS] // legs
+        return cut
+
+    e8m0 = encoding(dtype.e8m0)
+    code_legs = []
+    scale_legs = []
+    for stem in stems:
+        weight_ = stem + ".weight"
+        scales = stem + ".scales"
+        stored_as(w, weight_, codes)
+        stored_as(w, scales, dtype.u8)
+        code_legs.append(src(weight_).transmute(leg(w.shape), grouped(w)))
+        scale_legs.append(src(scales).transmute(leg(scales_shape(w)), e8m0))
+    joined = lambda legs: legs[0] if len(legs) == 1 else concat(BANK_ROWS, legs)
+    return [
+        tensor(w.name, joined(code_legs), grouped(w)),
+        tensor(scales_name(w.name), joined(scale_legs), e8m0, shape = scales_shape(w), scaling = w),
+    ]
+
+def deinterleaved(e, rows):
+    return concat(BANK_ROWS, [e.stride(BANK_ROWS, 0, rows, 2), e.stride(BANK_ROWS, 1, rows, 2)])
+
+# The forward of gpt-oss: biased attention with sinks over YaRN rope, every
+# other layer windowed, then experts with clamped SwiGLU; and with a DFlash
+# drafter, the block it drafts.
+
+def caches(m, c):
+    kv = c.kv_space(m.kv)
+    plane = m.kv_heads * m.head_dim
+    for w in m.layers:
+        c.kv(kv, w.attn.kv, [plane, plane], m.head_dim, heads = True)
+    if m.dflash != None:
+        dflash_caches(m.dflash, c, kv)
+
+def forward(m, inputs):
+    dr = m.dflash
+    trunk_inputs = inputs.on(~block_rows(dr)) if dr != None else inputs
+    positions = trunk_inputs.positions()
+    d = m.head_dim
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
+    h_block = None
+    if dr != None:
+        h_block = y.on(block_rows(dr))
+        y = y.on(~block_rows(dr))
+    routes = inputs.adapter_routes()
+
+    def block(l, w, carried):
+        y, tapped = carried
+        at = w.attn
+        pages = inputs.kv(at.kv)
+        write_page = inputs.write_page(at.kv)
+        write_offset = inputs.write_offset(at.kv)
+
+        x = ops.elemwise.rmsnorm(y, w.attn_norm, w.attn_norm_eps)
+        q, k, v = ops.gather.split_qkv(
+            ops.elemwise.add_bias(at.qkv_bias, ops.linear.matmul(x, at.qkv)),
+            m.q_heads * d,
+            m.kv_heads * d,
+        )
+        seam.at(seam.ATTN_QV, [q, v])
+
+        rope = m.rope
+        q, k = ops.elemwise.rope(
+            q,
+            positions,
+            d,
+            rope.theta,
+            rotary.yarn(
+                yarn(
+                    factor = rope.factor,
+                    beta_fast = rope.beta_fast,
+                    beta_slow = rope.beta_slow,
+                    original_max_position = rope.original_max_position,
+                ),
+                attention_factor = rope.attention_factor,
+            ),
+            k = k,
+        )
+        ops.attn.kv_append(k, v, pages, write_page, write_offset)
+        seam.at(seam.ATTN_Q, [q])
+
+        r = at.reading
+        win = m.window if r == WINDOWED else None
+        # Each lane by its kind, the sinks folded in; a full layer's scores
+        # go out at their seam.
+        a = ops.attn.attend(q, trunk_inputs, at.kv, m.q_heads, m.kv_heads, d, m.sm_scale, window = win,
+                            sinks = at.sinks, mask = True, scores = True, scores_seam = r == FULL)
+        seam.at(seam.ATTN_OUT, [a])
+
+        o = ops.elemwise.add_bias(at.o_bias, ops.linear.matmul(a, at.o_proj))
+        adapted = fact.has(fact.Adapter)
+        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        y = ops.elemwise.residual_add(o, y)
+
+        e = w.mlp
+        x = ops.elemwise.rmsnorm(y, w.mlp_norm, w.mlp_norm_eps)
+        experts, weights = ops.linear.moe_route(
+            ops.elemwise.add_bias(e.router_bias, ops.linear.matmul(x, e.router)),
+            e.experts,
+            e.top_k,
+            routing.softmax(),
+        )
+        packed = ops.linear.moe_matmul_select_bias(x, e.gate_up, e.gate_up_bias, experts, e.top_k)
+        act = ops.linear.glu(packed, gating.swiglu_alpha(e.swiglu_alpha), e.inter, limit = e.swiglu_limit)
+        routed = ops.linear.moe_matmul_select(act, e.down, experts, e.top_k)
+        f = ops.linear.moe_weighted_sum(routed, weights)
+        f = ops.linear.moe_bias_sum(f, e.down_bias, experts, weights)
+        y = ops.elemwise.residual_add(f, y)
+        if dr != None:
+            tapped = tap(dr, l, y, tapped)
+        return (y, tapped)
+
+    y, tapped = inputs.fold_layers(m.layers, (y, None), block)
+
+    x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
+    hb = None
+    if dr != None:
+        hb = arm(dr, inputs, tapped, h_block, inputs.mask(), block_rows(dr))
+        x = merge([hb, x])
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
+    logits = ops.linear.lm_head(x, m.head)
+    if dr != None:
+        plant_readout(dr, logits, inputs, x, block_rows(dr))
+    return logits

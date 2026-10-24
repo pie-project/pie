@@ -71,7 +71,7 @@ fn attend_is_the_dispatch_a_model_wrote_by_hand() {
     for id in ["llama31-8b", "llama33-70b-mini-l4"] {
         for (w, kv) in [(Dtype::Bf16, Dtype::Bf16), (Dtype::Bf16, Dtype::E4m3)] {
             let stock = trace_of(id, w, kv, Platform::Cuda);
-            let by_hand = replacing(id, "forward.poem", "forward", BY_HAND)
+            let by_hand = replacing(id, "forward", BY_HAND)
                 .unwrap_or_else(|why| panic!("{why}"))
                 .trace(id, &one_rank(w, kv), id, Platform::Cuda)
                 .unwrap_or_else(|why| panic!("{id}: {why:#}"));

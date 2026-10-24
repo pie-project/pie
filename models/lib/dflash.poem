@@ -1,0 +1,341 @@
+# The weights of a DFlash block drafter: a few transformer blocks that draft
+# a block of tokens at once from taps of the trunk's residual stream.
+#
+# A head states the drafter's shape: `taps` (the trunk layers it reads),
+# `windows` (one per block, `None` attending the whole masked block both
+# ways), whether a windowed block also reads its own block both ways
+# (`bidirectional`), its attention and MLP widths, the `block` it drafts and the
+# `mask_token` that fills it, an optional dynamic `conv` around each block's
+# branches, and its `readout`: "argmax", or a `selector` or `markov` walk
+# over the top candidates.
+
+def head(
+        taps,
+        windows,
+        q_heads,
+        kv_heads,
+        head_dim,
+        inter,
+        theta,
+        block,
+        mask_token,
+        proposals_from = 1,
+        conv = None,
+        readout = "argmax",
+        attn_bias = False,
+        bidirectional = False):
+    return struct(
+        taps = taps,
+        windows = windows,
+        q_heads = q_heads,
+        kv_heads = kv_heads,
+        head_dim = head_dim,
+        inter = inter,
+        theta = theta,
+        block = block,
+        mask_token = mask_token,
+        proposals_from = proposals_from,
+        conv = conv,
+        readout = readout,
+        attn_bias = attn_bias,
+        bidirectional = bidirectional,
+    )
+
+def selector(rank, top_k):
+    return struct(kind = "selector", rank = rank, top_k = top_k)
+
+def markov(rank, top_k):
+    return struct(kind = "markov", rank = rank, top_k = top_k)
+
+def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None):
+    """The drafter `head` describes, its weights under `prefix`, over a
+    trunk of `hidden` and `vocab` whose norms take `norm_eps`, its banks
+    stored as `w` (its blocks' projections as `blocks_w`, when given) and its
+    vectors as `dense`."""
+    bw = blocks_w if blocks_w != None else w
+    dq, dkv, hd = head.q_heads, head.kv_heads, head.head_dim
+    inter = head.inter
+
+    def conv(l, which):
+        c = head.conv
+        if c == None:
+            return None
+        return struct(
+            base = weight([2 * c.taps, hidden]),
+            proj = weight([2 * c.taps * (hidden // c.group), hidden],
+                w,
+            ).columns(),
+            taps = c.taps,
+            group = c.group,
+        )
+
+    def block(l, window):
+        bias = lambda s, width: weight([width]) if head.attn_bias else None
+        return struct(
+            mixer_norm = weight([hidden]),
+            mixer_norm_eps = norm_eps,
+            attn = struct(
+                q_heads = dq,
+                kv_heads = dkv,
+                head_dim = hd,
+                rotary_dim = hd,
+                theta = head.theta,
+                sm_scale = f32(1.0 / f32(sqrt(hd))),
+                q_proj = weight([dq * hd, hidden], bw).columns(),
+                k_proj = weight([dkv * hd, hidden], bw).columns(heads = dkv),
+                v_proj = weight([dkv * hd, hidden], bw).columns(heads = dkv),
+                o_proj = weight([hidden, dq * hd], bw).rows(),
+                q_norm = weight([hd]),
+                q_norm_eps = norm_eps,
+                k_norm = weight([hd]),
+                k_norm_eps = norm_eps,
+                q_bias = bias("q_bias", dq * hd),
+                k_bias = bias("k_bias", dkv * hd),
+                v_bias = bias("v_bias", dkv * hd),
+                o_bias = bias("o_bias", hidden),
+                kv = "kv.dflash.{}".format(l),
+            ),
+            mlp_norm = weight([hidden]),
+            mlp_norm_eps = norm_eps,
+            mlp = struct(
+                gate_up = weight([2 * inter, hidden], bw).packed([inter, inter]),
+                down = weight([hidden, inter], bw).rows(),
+                inter = inter,
+            ),
+            window = window,
+            attn_conv = conv(l, "attention_conv"),
+            mlp_conv = conv(l, "mlp_conv"),
+        )
+
+    codebook = lambda s, rank: weight([vocab, rank])
+    readout = head.readout
+    if readout == "argmax":
+        chooser = None
+    elif readout.kind == "selector":
+        chooser = struct(
+            kind = "selector",
+            hidden_projection = weight([readout.rank, hidden],
+                w,
+            ).columns(),
+            pred = codebook("candidate_selector.predecessor_codebook", readout.rank),
+            succ = codebook("candidate_selector.successor_codebook", readout.rank),
+            top_k = readout.top_k,
+        )
+    else:
+        chooser = struct(
+            kind = "markov",
+            hidden_projection = None,
+            pred = codebook("markov_w1", readout.rank),
+            succ = codebook("markov_w2", readout.rank),
+            top_k = readout.top_k,
+        )
+    return struct(
+        taps = head.taps,
+        fc = [weight([hidden, hidden], w) for i in range(len(head.taps))],
+        hidden_norm = weight([hidden]),
+        hidden_norm_eps = norm_eps,
+        blocks = [block(l, window) for l, window in enumerate(head.windows)],
+        norm = weight([hidden]),
+        norm_eps = norm_eps,
+        block = head.block,
+        mask_token = head.mask_token,
+        selector = chooser,
+        proposals_from = head.proposals_from,
+        bidirectional = head.bidirectional,
+    )
+
+# How a DFlash drafter is read from a checkpoint it was imported into: under
+# `aux.`, as the drafter's own release spells it. `norm(name)` reads one of
+# its norms as the trunk's checkpoint states norms.
+
+def product(xs):
+    out = 1
+    for x in xs:
+        out *= x
+    return out
+
+def flattened(name, want, broadcast = False):
+    """The tensor `name` as stored, its elements read as `want`; with
+    `broadcast`, a single stored value is read as any shape."""
+    held = shape(name)
+    if (not broadcast or product(held) > 1) and product(held) != product(want):
+        fail("`{}` is stored {} ({} elements) and the plan reads it as {} ({} elements)".format(
+            name, held, product(held), want, product(want)))
+    return src(name).transmute(want, stored(name))
+
+def bind_aux(d, reads, norm):
+    reads.read_expr(d.hidden_norm, norm("aux.hidden_norm.weight"))
+    span = d.fc[0].shape[1]
+    for i, bank in enumerate(d.fc):
+        reads.read_expr(bank, src("aux.fc.weight").slice(1, span * i, span))
+    for l, block in enumerate(d.blocks):
+        n = lambda s: "aux.layers.{}.{}".format(l, s)
+        a = block.attn
+        reads.read_expr(block.mixer_norm, norm(n("input_layernorm.weight")))
+        reads.read(a.q_proj, n("self_attn.q_proj.weight"))
+        reads.read(a.k_proj, n("self_attn.k_proj.weight"))
+        reads.read(a.v_proj, n("self_attn.v_proj.weight"))
+        reads.read(a.o_proj, n("self_attn.o_proj.weight"))
+        for bias, leaf in [(a.q_bias, "q_proj"), (a.k_bias, "k_proj"), (a.v_bias, "v_proj"), (a.o_bias, "o_proj")]:
+            if bias != None:
+                reads.read(bias, n("self_attn.{}.bias".format(leaf)))
+        reads.read_expr(a.q_norm, norm(n("self_attn.q_norm.weight")))
+        reads.read_expr(a.k_norm, norm(n("self_attn.k_norm.weight")))
+        reads.read_expr(block.mlp_norm, norm(n("post_attention_layernorm.weight")))
+        for c, which in [(block.attn_conv, "attention_conv"), (block.mlp_conv, "mlp_conv")]:
+            if c != None:
+                reads.read_expr(c.base, flattened(n("{}.base_kernel".format(which)), c.base.shape))
+                reads.read(c.proj, n("{}.kernel_projection.weight".format(which)))
+        reads.read_concat(block.mlp.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+        reads.read(block.mlp.down, n("mlp.down_proj.weight"))
+    reads.read_expr(d.norm, norm("aux.norm.weight"))
+    sel = d.selector
+    if sel == None:
+        return
+    if sel.kind == "selector":
+        if sel.hidden_projection != None:
+            reads.read(sel.hidden_projection, "aux.candidate_selector.hidden_projection.weight")
+        reads.read(sel.pred, "aux.candidate_selector.predecessor_codebook")
+        reads.read(sel.succ, "aux.candidate_selector.successor_codebook")
+    else:
+        reads.read(sel.pred, "aux.markov_head.markov_w1.weight")
+        reads.read(sel.succ, "aux.markov_head.markov_w2.weight")
+
+# The forward of a DFlash block drafter: it reads the trunk's tapped residual
+# stream into its blocks' kv, then drafts a masked block of rows through
+# them, its proposals read out of the trunk's own head.
+
+def caches(d, c, space):
+    for b in d.blocks:
+        a = b.attn
+        plane = a.kv_heads * a.head_dim
+        c.kv(space, a.kv, [plane, plane], a.head_dim, heads = True)
+
+def reads_a_mask(d):
+    """Whether a block attends through the lane's mask: one with no window,
+    or any block of a head that reads its block both ways, attends every row
+    the mask shows it."""
+    if d.bidirectional:
+        return True
+    for b in d.blocks:
+        if b.window == None:
+            return True
+    return False
+
+def block_rows(d):
+    """The rows of a drafted block. A drafter whose attention reads the mask
+    drafts only rows that carry one; the runtime stamps the whole extent on a
+    block lane its inferlet sent without."""
+    if reads_a_mask(d):
+        return fact.block_draft() & fact.has(fact.Mask)
+    return fact.block_draft()
+
+def tap(d, layer, y, fused):
+    """`fused`, with the trunk's residual `y` after `layer` added if the
+    drafter taps it."""
+    if layer not in d.taps:
+        return fused
+    part = ops.linear.matmul(y, d.fc[d.taps.index(layer)])
+    if fused == None:
+        return part
+    return ops.elemwise.residual_add(part, fused)
+
+def biased(x, bias):
+    if bias == None:
+        return x
+    return ops.elemwise.add_bias(bias, x)
+
+def conv_prepare(x, c):
+    if c == None:
+        return x, None
+    coeff = ops.linear.matmul(x, c.proj)
+    return ops.ssm.dyn_conv(x, coeff, c.base, 0, c.taps, c.group), coeff
+
+def conv_finish(y, c, coeff):
+    if c == None or coeff == None:
+        return y
+    return ops.ssm.dyn_conv(y, coeff, c.base, 1, c.taps, c.group)
+
+def arm(d, inputs, fused, h_block, mask, block_draft):
+    """The drafted block's hidden rows, from the trunk's `fused` taps and
+    the block's embedded `h_block`."""
+    h_ctx = ops.elemwise.rmsnorm_plus_one(fused, d.hidden_norm, d.hidden_norm_eps)
+    ctx_positions = inputs.positions().on(~block_draft)
+    for b in d.blocks:
+        a = b.attn
+        hd = a.head_dim
+        k = biased(ops.linear.matmul(h_ctx, a.k_proj), a.k_bias)
+        v = biased(ops.linear.matmul(h_ctx, a.v_proj), a.v_bias)
+        k = ops.elemwise.rmsnorm_per_head_plus_one(k, a.k_norm, hd, a.k_norm_eps)
+        k = ops.elemwise.rope(k, ctx_positions, hd, a.theta, rotary.partial(a.rotary_dim))
+        ops.attn.kv_append(k, v, inputs.kv(a.kv), inputs.write_page(a.kv), inputs.write_offset(a.kv))
+
+    input_block = inputs.on(block_draft)
+    block_positions = inputs.positions().on(block_draft)
+    h = h_block
+    for b in d.blocks:
+        a = b.attn
+        hd = a.head_dim
+        plan = ops.attn.plan_prefill(input_block, a.q_heads, a.kv_heads, hd, b.window)
+        x = ops.elemwise.rmsnorm_plus_one(h, b.mixer_norm, b.mixer_norm_eps)
+        x, attn_coeff = conv_prepare(x, b.attn_conv)
+        q = biased(ops.linear.matmul(x, a.q_proj), a.q_bias)
+        k = biased(ops.linear.matmul(x, a.k_proj), a.k_bias)
+        v = biased(ops.linear.matmul(x, a.v_proj), a.v_bias)
+        q = ops.elemwise.rmsnorm_per_head_plus_one(q, a.q_norm, hd, a.q_norm_eps)
+        k = ops.elemwise.rmsnorm_per_head_plus_one(k, a.k_norm, hd, a.k_norm_eps)
+        q, k = ops.elemwise.rope(q, block_positions, hd, a.theta, rotary.partial(a.rotary_dim), k = k)
+        ops.attn.kv_append(k, v, inputs.kv(a.kv), inputs.write_page(a.kv), inputs.write_offset(a.kv))
+        if b.window != None and not d.bidirectional:
+            o = ops.attn.prefill(q, plan, inputs.kv(a.kv), b.window, hd, a.kv_heads, a.sm_scale)
+        else:
+            o = ops.attn.prefill(
+                q,
+                plan,
+                inputs.kv(a.kv),
+                b.window,
+                hd,
+                a.kv_heads,
+                a.sm_scale,
+                mask = mask,
+                causal = False,
+            )
+        o = biased(ops.linear.matmul(o, a.o_proj), a.o_bias)
+        o = conv_finish(o, b.attn_conv, attn_coeff)
+        h = ops.elemwise.residual_add(o, h)
+
+        x = ops.elemwise.rmsnorm_plus_one(h, b.mlp_norm, b.mlp_norm_eps)
+        x, mlp_coeff = conv_prepare(x, b.mlp_conv)
+        f = ops.linear.matmul(
+            ops.linear.glu(ops.linear.matmul(x, b.mlp.gate_up), gating.swiglu(), b.mlp.inter),
+            b.mlp.down,
+        )
+        f = conv_finish(f, b.mlp_conv, mlp_coeff)
+        h = ops.elemwise.residual_add(f, h)
+    return ops.elemwise.rmsnorm_plus_one(h, d.norm, d.norm_eps)
+
+def plant_readout(d, logits, inputs, read, block_draft):
+    """States the drafter on the trace and plants its proposals: the block's
+    logits, and the tokens drafted from them. `read` is the hidden state at
+    the readout rows `logits` were taken from: a fire may read out fewer of a
+    block's rows than it drafts (the verify width), and the selector walks
+    exactly the rows it has logits for."""
+    block_drafter(
+        logits,
+        rows = d.block,
+        mask_token = d.mask_token,
+        bidirectional = reads_a_mask(d),
+        proposals_from = d.proposals_from,
+    )
+    dlogits = logits.on(block_draft)
+    seam.at(seam.MTP, [dlogits])
+    sel = d.selector
+    if sel != None:
+        unary, cand = ops.sampling.top_k(dlogits, sel.top_k)
+        hb = read.on(block_draft)
+        hp = ops.linear.matmul(hb, sel.hidden_projection) if sel.hidden_projection != None else None
+        toks = ops.gather.gather_rows(inputs.tokens(), inputs.readout_rows()).on(block_draft)
+        picks = ops.sampling.selector_walk(cand, unary, hp, toks, sel.pred, sel.succ, d.proposals_from)
+    else:
+        picks = ops.sampling.argmax([dlogits])
+    seam.at(seam.MTP_DRAFTS, [picks])

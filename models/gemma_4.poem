@@ -1,0 +1,1135 @@
+# Gemma 4: 26B-A4B (experts; with a DFlash drafter, its MTP assistant or its
+# vision tower), 31B (with its assistant or vision tower), 12B, E4B (with an EAGLE
+# head or vision tower), E2B and E4B's miniatures; and DiffusionGemma, 26B-A4B
+# as a block-diffusion text model.
+
+load("//pie/codec.poem", "nvfp4_bank")
+load("//lib/adapters.poem", "banks")
+load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches", dflash_head = "head", dflash_declare = "declare")
+load("//lib/media.poem", "budget_resize")
+
+GEMMA = template("gemma")
+# 26B-A4B and 31B: an unthinking turn's cue closes an empty thought channel
+GEMMA_THOUGHT = template("gemma", thinking = True)
+TOKENIZER = tokenizer(markers = [["<turn|>", "<eos>"]], parts = {"vision": [["<|image>", "<|image|>", "<image|>"]]})
+
+MODELS = [
+    model("gemma4-26b-a4b", template = GEMMA_THOUGHT, tokenizer = TOKENIZER, parts = ["vision"], drafters = ["mtp", "dflash"], arch = "gemma4", layers = 30, vocab = 262144),
+    model("gemma4-31b", template = GEMMA_THOUGHT, tokenizer = TOKENIZER, parts = ["vision"], drafters = ["mtp"], arch = "gemma4", layers = 60, vocab = 262144),
+    model("gemma4-12b", template = GEMMA_THOUGHT, tokenizer = TOKENIZER, arch = "gemma4", layers = 48, vocab = 262144),
+    model("gemma4-e2b", template = GEMMA, tokenizer = TOKENIZER, arch = "gemma4", layers = 35, vocab = 262144),
+    model("gemma4-e4b", template = GEMMA, tokenizer = TOKENIZER, parts = ["vision"], drafters = ["eagle"], arch = "gemma4", layers = 42, vocab = 262144),
+    model("gemma4-e4b-mini-l1", mini = True, template = GEMMA, tokenizer = TOKENIZER, arch = "gemma4", layers = 1, vocab = 262144),
+    model("gemma4-e4b-mini-l6", mini = True, template = GEMMA, tokenizer = TOKENIZER, arch = "gemma4", layers = 6, vocab = 262144),
+    model("gemma4-e4b-mini-l24", mini = True, template = GEMMA, tokenizer = TOKENIZER, arch = "gemma4", layers = 24, vocab = 262144),
+    model("gemma4-e4b-mini-l30", mini = True, template = GEMMA, tokenizer = TOKENIZER, arch = "gemma4", layers = 30, vocab = 262144),
+    model("gemma4-e4b-mini-l36", mini = True, template = GEMMA, tokenizer = TOKENIZER, arch = "gemma4", layers = 36, vocab = 262144),
+    model("diffusiongemma-26b-a4b", template = GEMMA, tokenizer = TOKENIZER, parts = ["selfcond"], arch = "diffusion_gemma", layers = 30, vocab = 262144),
+]
+
+U4 = dtype.u4g64
+BF = dtype.bf16
+
+DEPLOYMENTS = [
+    deployment("gemma4-26b-a4b", weights = U4, kv = BF, drafter = "dflash"),
+    deployment("gemma4-26b-a4b", weights = U4, kv = BF, drafter = "mtp"),
+    deployment("gemma4-26b-a4b", weights = U4, kv = BF),
+    deployment("gemma4-26b-a4b", weights = BF, kv = BF),
+    deployment("gemma4-31b", weights = U4, kv = BF, drafter = "mtp"),
+    deployment("gemma4-31b", weights = U4, kv = BF),
+    deployment("gemma4-12b", weights = U4, kv = BF),
+    deployment("gemma4-12b", weights = BF, kv = BF),
+    deployment("gemma4-e2b", weights = BF, kv = BF),
+    deployment("gemma4-e2b", weights = U4, kv = BF),
+    deployment("gemma4-e4b", weights = U4, kv = BF),
+    deployment("gemma4-e4b", weights = BF, kv = BF, drafter = "eagle"),
+    deployment("gemma4-e4b", weights = BF, kv = BF),
+    deployment("gemma4-31b", weights = BF, kv = BF),
+    deployment("gemma4-e4b-mini-l1", weights = BF, kv = BF),
+    deployment("gemma4-e4b-mini-l6", weights = BF, kv = BF),
+    deployment("gemma4-e4b-mini-l24", weights = BF, kv = BF),
+    deployment("gemma4-e4b-mini-l30", weights = BF, kv = BF),
+    deployment("gemma4-e4b-mini-l36", weights = BF, kv = BF),
+    # Keys and values e4m3 under a unit scale (vLLM's `fp8` KV).
+    deployment("gemma4-26b-a4b", weights = U4, kv = dtype.e4m3),
+    deployment("gemma4-26b-a4b", weights = BF, kv = dtype.e4m3),
+    deployment("gemma4-31b", weights = U4, kv = dtype.e4m3),
+    deployment("gemma4-31b", weights = BF, kv = dtype.e4m3),
+    deployment("gemma4-12b", weights = BF, kv = dtype.e4m3),
+    deployment("gemma4-e4b", weights = BF, kv = dtype.e4m3),
+    deployment("gemma4-e2b", weights = BF, kv = dtype.e4m3),
+    # nvidia's modelopt exports as vLLM serves them: the 26B-A4B's experts
+    # NVFP4 against NVFP4 rows (or bf16 ones), the 31B's MLP NVFP4 against
+    # bf16 rows, the rest bf16; keys and values e4m3.
+    deployment("gemma4-26b-a4b", weights = [BF, dtype.nvfp4a4], kv = dtype.e4m3),
+    deployment("gemma4-26b-a4b", weights = [BF, dtype.nvfp4a4], kv = BF),
+    deployment("gemma4-26b-a4b", weights = [BF, dtype.nvfp4], kv = dtype.e4m3),
+    deployment("gemma4-31b", weights = [BF, dtype.nvfp4], kv = dtype.e4m3),
+    deployment("gemma4-31b", weights = [BF, dtype.nvfp4], kv = BF),
+    deployment("gemma4-e4b", weights = BF, kv = BF, parts = ["vision"]),
+    deployment("gemma4-26b-a4b", weights = U4, kv = BF, parts = ["vision"]),
+    deployment("gemma4-31b", weights = U4, kv = BF, parts = ["vision"]),
+    deployment("diffusiongemma-26b-a4b", weights = U4, kv = BF),
+    deployment("diffusiongemma-26b-a4b", weights = dtype.u8g64, kv = BF),
+    deployment("diffusiongemma-26b-a4b", weights = [dtype.u8g64, U4], kv = BF),
+    deployment("diffusiongemma-26b-a4b", weights = [U4, dtype.u8g64], kv = BF),
+    deployment("diffusiongemma-26b-a4b", weights = [dtype.u8g64, U4, U4], kv = BF, parts = ["selfcond"]),
+    deployment("diffusiongemma-26b-a4b", weights = [BF, U4], kv = BF),
+]
+
+# The drafter published apart from the model it drafts for.
+PUBLISHED = [
+    published(target = "mlx-community/gemma-4-26b-a4b-it-4bit", head = "z-lab/gemma-4-26B-A4B-it-DFlash", drafter = "dflash", deployment = "gemma4-26b-a4b-dflash-u4g64-kv-bf16"),
+]
+
+# The weights of Gemma 4: sliding-window layers with a global one every
+# sixth, attention-only layers that borrow an earlier layer's kv in E4B's
+# shared tail, per-layer embeddings (E4B), routed experts beside the dense
+# MLP (26B-A4B), a vision tower, and the drafters each pairs with.
+
+SLIDING = 0
+GLOBAL = 1
+
+SELF_COND_TAPS = 64
+CANVAS = 256
+
+ASSISTANT_HIDDEN = 1024
+ASSISTANT_INTER = 8192
+ASSISTANT_READINGS = [SLIDING, SLIDING, SLIDING, GLOBAL]
+
+def trunk(hidden, layers, q_heads, kv_heads, global_kv_heads, inter, window, shared_tail = None, ple_dim = None, moe = None,
+          full_every = 6, wide_tail = False):
+    """`full_every`: every that many layers one reads globally, the last of
+    each run. `wide_tail`: the layers that borrow their kv run an MLP twice as
+    wide (E2B's `use_double_wide_mlp`)."""
+    return struct(
+        hidden = hidden, layers = layers, q_heads = q_heads, kv_heads = kv_heads,
+        global_kv_heads = global_kv_heads, inter = inter, window = window,
+        shared_tail = shared_tail, ple_dim = ple_dim, moe = moe, wide_tail = wide_tail,
+        full_every = full_every, head_dim = 256, global_head_dim = 512, global_rotary_dim = 128,
+        theta_local = 10000.0, theta_global = 1000000.0, sm_scale = 1.0, vocab = 262144,
+        softcap = 30.0, norm_eps = 1e-6,
+    )
+
+def e4b(layers):
+    owned = 42 - 18
+    return trunk(hidden = 2560, layers = layers, q_heads = 8, kv_heads = 2, global_kv_heads = 2, inter = 10240,
+                 window = 512, shared_tail = layers - owned if layers > owned else None, ple_dim = 256)
+
+E2B = trunk(hidden = 1536, layers = 35, q_heads = 8, kv_heads = 1, global_kv_heads = 1, inter = 6144,
+            window = 512, shared_tail = 20, ple_dim = 256, full_every = 5, wide_tail = True)
+
+A4B = trunk(hidden = 2816, layers = 30, q_heads = 16, kv_heads = 8, global_kv_heads = 2, inter = 2112,
+            window = 1024, moe = struct(experts = 128, top_k = 8, inter = 704))
+
+TRUNKS = {
+    "gemma4-26b-a4b": A4B,
+    "gemma4-31b": trunk(hidden = 5376, layers = 60, q_heads = 32, kv_heads = 16, global_kv_heads = 4,
+                        inter = 21504, window = 1024),
+    "gemma4-12b": trunk(hidden = 3840, layers = 48, q_heads = 16, kv_heads = 8, global_kv_heads = 1,
+                        inter = 15360, window = 1024),
+    "gemma4-e2b": E2B,
+    "gemma4-e4b": e4b(42),
+    "gemma4-e4b-mini-l1": e4b(1),
+    "gemma4-e4b-mini-l6": e4b(6),
+    "gemma4-e4b-mini-l24": e4b(24),
+    "gemma4-e4b-mini-l30": e4b(30),
+    "gemma4-e4b-mini-l36": e4b(36),
+    "diffusiongemma-26b-a4b": A4B,
+}
+
+PATCH = 16
+
+POOL = 3
+
+SOFT_TOKENS = 280
+
+VIDEO_SOFT_TOKENS = 70
+
+def vision_tower(depth, hidden, heads, inter, clipped, standardize):
+    return struct(depth = depth, hidden = hidden, heads = heads, inter = inter, clipped = clipped,
+                  standardize = standardize, patch = PATCH, patch_width = 3 * PATCH * PATCH, pool = POOL,
+                  positions = 10240, theta = 100.0, norm_eps = 1e-6, sm_scale = 1.0)
+
+def media(id, deploy):
+    """How a still is spoken: framed within the soft-token budget, cut into
+    `PATCH` patches in `POOL` blocks, its tokens placed in sequence."""
+    if "vision" not in deploy.parts:
+        return None
+    return struct(image = struct(
+        patch = PATCH, block = POOL, mrope = False,
+        prefix = "<|image>", placeholder = "<|image|>", suffix = "<image|>",
+    ))
+
+WIDE_TOWER = vision_tower(depth = 27, hidden = 1152, heads = 16, inter = 4304, clipped = False, standardize = True)
+
+TOWERS = {
+    "gemma4-26b-a4b": WIDE_TOWER,
+    "gemma4-31b": WIDE_TOWER,
+    "gemma4-e4b": vision_tower(depth = 16, hidden = 768, heads = 12, inter = 3072, clipped = True, standardize = False),
+}
+
+DFLASH_26B_A4B = dflash_head(
+    taps = [1, 6, 11, 17, 22, 27],
+    windows = [2048, 2048, 2048, 2048, None],
+    q_heads = 32,
+    kv_heads = 8,
+    head_dim = 128,
+    inter = 5632,
+    theta = 1000000.0,
+    block = 16,
+    mask_token = 4,
+)
+
+def modelopt(d, weights):
+    """Whether `weights` is modelopt's NVFP4 export as nvidia ships it and
+    vLLM serves it: the routed experts (26B-A4B) or the MLP (31B) NVFP4, the
+    rest bf16. The experts take NVFP4 rows or bf16 ones; a dense MLP, bf16
+    ones (W4A16), there being no dense NVFP4 product against NVFP4 rows."""
+    if len(weights) != 2 or weights[0] != dtype.bf16:
+        return False
+    if d.moe != None:
+        return weights[1] in [dtype.nvfp4, dtype.nvfp4a4]
+    return weights[1] == dtype.nvfp4
+
+def layout(id, deploy):
+    """`id`'s weights as `deploy` stores them: the trunk's at its first
+    dtype, the experts' at the second if it has one, DiffusionGemma's
+    self-conditioning block's at the third."""
+    d = TRUNKS[id]
+    weights = deploy.weights
+    drafter = deploy.drafter
+    vision = "vision" in deploy.parts
+    self_cond = id == "diffusiongemma-26b-a4b"
+    if self_cond:
+        if len(weights) not in ([3] if "selfcond" in deploy.parts else [1, 2]):
+            fail("{} does not ship {}".format(id, deploy))
+    elif len(weights) != 1 and not modelopt(d, weights):
+        fail("{} stores its weights at one dtype, or as modelopt's NVFP4 export [bf16, nvfp4(a4)], not {}".format(id, weights))
+    if vision and drafter != None:
+        fail("{} does not ship {}".format(id, deploy))
+    w = weights[0]
+    xw = weights[1] if len(weights) > 1 else w
+    sw = weights[2] if len(weights) > 2 else w
+    dense = compute(w)
+    gate = dtype.u8g64 if w == dtype.u4g64 else w
+    proj = dtype.u4g64tiled if w == dtype.u4g64 else w
+    # modelopt's 31B export stores its MLP NVFP4; the 26B-A4B's, bf16.
+    mlp_at = weights[1] if not self_cond and len(weights) == 2 and d.moe == None else proj
+    hidden = d.hidden
+    full_at = lambda l: l % d.full_every == d.full_every - 1
+    shared_at = lambda l: d.shared_tail != None and l >= d.layers - d.shared_tail
+
+    def owner(l):
+        if not shared_at(l):
+            return l
+        for s in range(l - 1, -1, -1):
+            if not shared_at(s) and full_at(s) == full_at(l):
+                return s
+        fail("layer {} borrows its kv cache and none of the layers before the shared tail is of its kind".format(l))
+
+    sliding = struct(head_dim = d.head_dim, kv_heads = d.kv_heads, window = d.window, theta = d.theta_local)
+    glob = struct(head_dim = d.global_head_dim, kv_heads = d.global_kv_heads,
+                  rotary_dim = d.global_rotary_dim, theta = d.theta_global)
+
+    def layer(l):
+        norm = lambda s, length: weight([length])
+        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        reading = GLOBAL if full_at(l) else SLIDING
+        head_dim, row_heads = (sliding.head_dim, sliding.kv_heads) if reading == SLIDING else (glob.head_dim, glob.kv_heads)
+        q_w = d.q_heads * head_dim
+        kv_w = row_heads * head_dim
+        iw = d.inter * 2 if d.wide_tail and shared_at(l) else d.inter
+        if shared_at(l):
+            attn_banks = struct(shared = True, q_proj = weight([q_w, hidden], proj).columns())
+        else:
+            attn_banks = struct(
+                shared = False,
+                qkv = weight([q_w + 2 * kv_w, hidden], proj).packed([q_w, kv_w, kv_w], heads = [d.q_heads, row_heads, row_heads]),
+                k_norm = norm("k_norm", head_dim),
+                k_norm_eps = d.norm_eps,
+            )
+        moe = None
+        if d.moe != None:
+            mi = d.moe.inter
+            moe = struct(
+                router_norm = norm("router_norm", hidden),
+                router_norm_eps = d.norm_eps,
+                router = weight([d.moe.experts, hidden], gate),
+                per_expert_scale = weight([d.moe.experts]).columns(),
+                pre_ffw_norm_2 = norm("pre_ffw_norm_2", hidden),
+                pre_ffw_norm_2_eps = d.norm_eps,
+                post_ffw_norm_1 = norm("post_ffw_norm_1", hidden),
+                post_ffw_norm_1_eps = d.norm_eps,
+                post_ffw_norm_2 = norm("post_ffw_norm_2", hidden),
+                post_ffw_norm_2_eps = d.norm_eps,
+                gate_up = weight([d.moe.experts, 2 * mi, hidden], xw).bank([mi, mi]),
+                down = weight([d.moe.experts, hidden, mi], xw).rows(),
+                experts = d.moe.experts,
+                top_k = d.moe.top_k,
+                inter = mi,
+            )
+        return struct(
+            attn = struct(
+                sm_scale = d.sm_scale,
+                q_norm = norm("q_norm", head_dim),
+                q_norm_eps = d.norm_eps,
+                kv = "kv.{}".format(owner(l)),
+                banks = attn_banks,
+                reading = reading,
+            ),
+            o_proj = weight([hidden, q_w], proj).rows(),
+            attn_norm = norm("attn_norm", hidden),
+            attn_norm_eps = d.norm_eps,
+            post_attn_norm = norm("post_attn_norm", hidden),
+            post_attn_norm_eps = d.norm_eps,
+            pre_ffw_norm = norm("pre_ffw_norm", hidden),
+            pre_ffw_norm_eps = d.norm_eps,
+            post_ffw_norm = norm("post_ffw_norm", hidden),
+            post_ffw_norm_eps = d.norm_eps,
+            gate_up = weight([2 * iw, hidden], mlp_at).packed([iw, iw]),
+            inter = iw,
+            down = weight([hidden, iw], mlp_at).rows(),
+            scalar = weight([1]) if d.ple_dim == None else None,
+            lora_a = lora_a,
+            lora_b = lora_b,
+            moe = moe,
+        )
+
+    tower = None
+    if vision:
+        t = TOWERS[id]
+        th = t.hidden
+        ti = t.inter
+        head_dim = t.hidden // t.heads
+        bank = lambda s, dims: weight(dims)
+        vec1 = lambda s, length: weight([length])
+
+        def clip(s, dims):
+            return struct(
+                bank = bank(s, dims),
+                clip = struct(
+                    in_lo = vec1(s + "_in_lo", 1),
+                    in_hi = vec1(s + "_in_hi", 1),
+                    out_lo = vec1(s + "_out_lo", 1),
+                    out_hi = vec1(s + "_out_hi", 1),
+                ) if t.clipped else None,
+            )
+
+        def block(l):
+            b = lambda s: "block.{}.{}".format(l, s)
+            return struct(
+                attn_norm = vec1(b("attn_norm"), th),
+                post_attn_norm = vec1(b("post_attn_norm"), th),
+                pre_ffw_norm = vec1(b("pre_ffw_norm"), th),
+                post_ffw_norm = vec1(b("post_ffw_norm"), th),
+                q = clip(b("q"), [th, th]),
+                k = clip(b("k"), [th, th]),
+                v = clip(b("v"), [th, th]),
+                o = clip(b("o"), [th, th]),
+                q_norm = vec1(b("q_norm"), head_dim),
+                k_norm = vec1(b("k_norm"), head_dim),
+                gate = clip(b("gate"), [ti, th]),
+                up = clip(b("up"), [ti, th]),
+                down = clip(b("down"), [th, ti]),
+            )
+
+        tower = struct(
+            hidden = t.hidden,
+            heads = t.heads,
+            head_dim = head_dim,
+            pool = t.pool,
+            patch = t.patch,
+            patch_width = t.patch_width,
+            grid_side = t.positions,
+            positions = 2 * t.positions,
+            theta = t.theta,
+            norm_eps = t.norm_eps,
+            sm_scale = t.sm_scale,
+            patch_embed = bank("patch_embed", [th, t.patch_width]),
+            pos_embed = bank("pos_embed", [2 * t.positions, th]),
+            blocks = [block(l) for l in range(t.depth)],
+            projection = weight([hidden, th], w),
+            std = struct(bias = vec1("std_bias", th), scale = vec1("std_scale", th)) if t.standardize else None,
+        )
+
+    # E4B's EAGLE head.
+    draft = None
+    if drafter == "eagle":
+        hd = glob.head_dim
+        q_w = d.q_heads * hd
+        kv_w = glob.kv_heads * hd
+        iw = d.inter
+        anorm = lambda s, length: weight([length])
+        draft = struct(
+            fc_embed = weight([hidden, hidden], w),
+            fc_hidden = weight([hidden, hidden], w),
+            attn_norm = anorm("attn_norm", hidden),
+            post_attn_norm = anorm("post_attn_norm", hidden),
+            pre_ffw_norm = anorm("pre_ffw_norm", hidden),
+            post_ffw_norm = anorm("post_ffw_norm", hidden),
+            attn = struct(
+                sm_scale = d.sm_scale,
+                q_norm = anorm("q_norm", hd),
+                q_norm_eps = d.norm_eps,
+                kv = "kv.mtp",
+                banks = struct(
+                    shared = False,
+                    qkv = weight([q_w + 2 * kv_w, hidden], w).packed([q_w, kv_w, kv_w], heads = [d.q_heads, glob.kv_heads, glob.kv_heads]),
+                    k_norm = anorm("k_norm", hd),
+                    k_norm_eps = d.norm_eps,
+                ),
+                reading = GLOBAL,
+            ),
+            o_proj = weight([hidden, q_w], w).rows(),
+            gate_up = weight([2 * iw, hidden], w).packed([iw, iw]),
+            inter = iw,
+            down = weight([hidden, iw], w).rows(),
+            norm_eps = d.norm_eps,
+        )
+
+    # The MTP assistant of 26B-A4B and 31B.
+    assistant = None
+    if drafter == "mtp":
+        def last(want_full):
+            for l in range(d.layers - 1, -1, -1):
+                if not shared_at(l) and full_at(l) == want_full:
+                    return owner(l)
+            fail("the trunk has a layer of each reading")
+
+        ah = ASSISTANT_HIDDEN
+        iw = ASSISTANT_INTER
+
+        def assistant_layer(l, reading):
+            norm = lambda s, length: weight([length])
+            hd = sliding.head_dim if reading == SLIDING else glob.head_dim
+            q_w = d.q_heads * hd
+            return struct(
+                attn = struct(
+                    sm_scale = d.sm_scale,
+                    q_norm = norm("q_norm", hd),
+                    q_norm_eps = d.norm_eps,
+                    kv = "kv.{}".format(last(reading == GLOBAL)),
+                    banks = struct(shared = True, q_proj = weight([q_w, ah], w)),
+                    reading = reading,
+                ),
+                o_proj = weight([ah, q_w], w),
+                attn_norm = norm("attn_norm", ah),
+                post_attn_norm = norm("post_attn_norm", ah),
+                pre_ffw_norm = norm("pre_ffw_norm", ah),
+                post_ffw_norm = norm("post_ffw_norm", ah),
+                gate_up = weight([2 * iw, ah], w).packed([iw, iw]),
+                inter = iw,
+                down = weight([ah, iw], w),
+                scalar = norm("scalar", 1),
+            )
+
+        assistant = struct(
+            pre_embed = weight([ah, hidden], w),
+            pre_hidden = weight([ah, hidden], w),
+            post = weight([hidden, ah], w),
+            embed = weight([d.vocab, ah], w),
+            norm = weight([ah]),
+            norm_eps = d.norm_eps,
+            layers = [assistant_layer(l, r) for l, r in enumerate(ASSISTANT_READINGS)],
+        )
+
+    embed = weight([d.vocab, hidden], dense if self_cond else w)
+    if not self_cond:
+        embed = embed.packed([d.vocab])
+
+    ple = None
+    if d.ple_dim != None:
+        p = d.ple_dim
+        ple = struct(
+            dim = p,
+            model_proj = weight([d.layers * p, hidden], w),
+            model_norm = weight([p]),
+            model_norm_eps = d.norm_eps,
+            per_layer = [struct(
+                table = weight([d.vocab, p], w),
+                gate = weight([p, hidden], w),
+                proj = weight([hidden, p], w),
+                norm = weight([hidden]),
+                norm_eps = d.norm_eps,
+                scalar = weight([1]),
+            ) for l in range(d.layers)],
+        )
+
+    self_cond_block = None
+    if self_cond:
+        iw = d.inter
+        self_cond_block = struct(
+            taps = SELF_COND_TAPS,
+            pre_norm = weight([hidden]),
+            norm_eps = d.norm_eps,
+            gate_up = weight([2 * iw, hidden], sw).packed([iw, iw]),
+            inter = iw,
+            down = weight([hidden, iw], sw).rows(),
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        q_heads = d.q_heads,
+        sliding = sliding,
+        glob = glob,
+        tower = tower,
+        kv = deploy.kv,
+        softcap = d.softcap,
+        embed = embed,
+        ple = ple,
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight([hidden]),
+        final_norm_eps = d.norm_eps,
+        draft = draft,
+        assistant = assistant,
+        self_cond = self_cond_block,
+        dflash = dflash_declare(DFLASH_26B_A4B, "aux", hidden, d.vocab, d.norm_eps, w, dense) if drafter == "dflash" else None,
+    )
+
+def diffusion(m):
+    if m.self_cond == None:
+        return None
+    return canvas(canvas = CANVAS, hidden = m.hidden, self_cond_taps = SELF_COND_TAPS)
+
+# How a Gemma 4 checkpoint is laid out: transformers', mlx_lm's and GGUF's
+# spellings, and DiffusionGemma's own.
+
+def product(xs):
+    out = 1
+    for x in xs:
+        out *= x
+    return out
+
+def flattened(name, want, broadcast = False):
+    """The tensor `name` as stored, its elements read as `want`; with
+    `broadcast`, a single stored value is read as any shape."""
+    held = shape(name)
+    if (not broadcast or product(held) > 1) and product(held) != product(want):
+        fail("`{}` is stored {} ({} elements) and the plan reads it as {} ({} elements)".format(
+            name, held, product(held), want, product(want)))
+    return src(name).transmute(want, stored(name))
+
+LAYOUTS = {
+    "transformers": struct(
+        trunk = "model.language_model.",
+        vision = "model.vision_tower.",
+        embed_vision = "model.embed_vision.embedding_projection.weight",
+    ),
+    "mlx_lm": struct(
+        trunk = "language_model.model.",
+        vision = "vision_tower.",
+        embed_vision = "embed_vision.embedding_projection.weight",
+    ),
+    "diffusion": struct(
+        trunk = "model.decoder.",
+        vision = "model.encoder.vision_tower.",
+        embed_vision = "model.encoder.embed_vision.embedding_projection.weight",
+    ),
+}
+
+def formats(m):
+    if m.self_cond != None:
+        return [format("diffusion", read = lambda reads: safetensors(m, reads, LAYOUTS["diffusion"]))]
+    arch = text_attribute("general.architecture") or ""
+    return [
+        safetensors_format(m, "transformers"),
+        safetensors_format(m, "mlx_lm"),
+        format(
+            "gguf",
+            recognizes = lambda checkpoint: text_attribute("general.architecture") != None,
+            read = lambda reads: gguf(m, reads),
+            states = attributed(m, arch),
+        ),
+    ]
+
+def safetensors_format(m, name):
+    layout = LAYOUTS[name]
+    return format(
+        name,
+        recognizes = lambda checkpoint: has(layout.trunk + "embed_tokens.weight"),
+        read = lambda reads: safetensors(m, reads, layout),
+        states = configured(m, "text_config."),
+    )
+
+def configured(m, at):
+    """The shape a transformers configuration states of this model, its text
+    model's keys under `at`."""
+    return [
+        config(at + "hidden_size", m.hidden),
+        config(at + "vocab_size", m.vocab),
+        config(at + "num_attention_heads", m.q_heads),
+        config(at + "num_key_value_heads", m.sliding.kv_heads),
+        config(at + "head_dim", m.sliding.head_dim),
+        config(at + "global_head_dim", m.glob.head_dim),
+        config(at + "num_hidden_layers", len(m.layers), or_deeper = True),
+        config(at + "rms_norm_eps", m.final_norm_eps),
+        config(at + "sliding_window", m.sliding.window),
+        config(at + "rope_parameters.sliding_attention.rope_theta", m.sliding.theta),
+        config(at + "rope_parameters.full_attention.rope_theta", m.glob.theta),
+    ]
+
+def attributed(m, arch):
+    """The shape a GGUF's metadata states of this model, under `arch`."""
+    return [
+        attribute(arch + ".embedding_length", m.hidden),
+        attribute(arch + ".block_count", len(m.layers), or_deeper = True),
+        attribute(arch + ".attention.head_count", m.q_heads),
+        attribute(arch + ".attention.sliding_window", m.sliding.window),
+    ]
+
+def safetensors(m, reads, layout):
+    at = lambda leaf: layout.trunk + leaf
+    reads.read(m.embed, at("embed_tokens.weight"))
+    reads.read(m.final_norm, at("norm.weight"))
+
+    for l, w in enumerate(m.layers):
+        n = lambda leaf: "{}layers.{}.{}".format(layout.trunk, l, leaf)
+        reads.read(w.attn_norm, n("input_layernorm.weight"))
+        reads.read(w.post_attn_norm, n("post_attention_layernorm.weight"))
+        reads.read(w.pre_ffw_norm, n("pre_feedforward_layernorm.weight"))
+        reads.read(w.post_ffw_norm, n("post_feedforward_layernorm.weight"))
+        reads.read(w.attn.q_norm, n("self_attn.q_norm.weight"))
+        banks = w.attn.banks
+        if not banks.shared:
+            reads.read(banks.k_norm, n("self_attn.k_norm.weight"))
+            k = n("self_attn.k_proj.weight")
+            v = n("self_attn.v_proj.weight")
+            reads.read_concat(banks.qkv, [n("self_attn.q_proj.weight"), k, v if has(v) else k])
+        else:
+            reads.read(banks.q_proj, n("self_attn.q_proj.weight"))
+        reads.read(w.o_proj, n("self_attn.o_proj.weight"))
+        reads.read_concat(w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+        reads.read(w.down, n("mlp.down_proj.weight"))
+
+        if w.moe != None:
+            x = w.moe
+            reads.read_expr(x.router_norm, src(n("router.scale")).scale(powf32(m.hidden, -0.5)))
+            reads.read(x.router, n("router.proj.weight"))
+            reads.read(x.per_expert_scale, n("router.per_expert_scale"))
+            reads.read(x.pre_ffw_norm_2, n("pre_feedforward_layernorm_2.weight"))
+            reads.read(x.post_ffw_norm_1, n("post_feedforward_layernorm_1.weight"))
+            reads.read(x.post_ffw_norm_2, n("post_feedforward_layernorm_2.weight"))
+            fused = n("experts.gate_up_proj")
+            fused_quantized = n("experts.gate_up_proj.weight")
+            if has(n("experts.0.gate_proj.weight_scale")):
+                # modelopt's NVFP4 export: each expert apart, its legs NVFP4.
+                e = lambda i, leg: n("experts.{}.{}_proj".format(i, leg))
+                nvfp4_bank(reads, x.gate_up, [[e(i, "gate"), e(i, "up")] for i in range(x.experts)])
+                nvfp4_bank(reads, x.down, [[e(i, "down")] for i in range(x.experts)])
+            elif has(fused):
+                reads.read(x.gate_up, fused)
+                reads.read(x.down, n("experts.down_proj"))
+            elif has(fused_quantized):
+                reads.read(x.gate_up, fused_quantized)
+                reads.read(x.down, n("experts.down_proj.weight"))
+            else:
+                reads.read_concat(x.gate_up, [
+                    n("experts.switch_glu.gate_proj.weight"),
+                    n("experts.switch_glu.up_proj.weight"),
+                ])
+                reads.read(x.down, n("experts.switch_glu.down_proj.weight"))
+
+        if w.scalar != None:
+            reads.read(w.scalar, n("layer_scalar"))
+
+    if m.ple != None:
+        ple = m.ple
+        rows = ple.model_proj.shape[0]
+        name = at("per_layer_model_projection.weight")
+        if has(name) and shape(name)[0] != rows:
+            reads.read_expr(ple.model_proj, src(name).slice(0, 0, rows))
+        else:
+            reads.read(ple.model_proj, name)
+        reads.read(ple.model_norm, at("per_layer_projection_norm.weight"))
+        for l, p in enumerate(ple.per_layer):
+            n = lambda leaf: "{}layers.{}.{}".format(layout.trunk, l, leaf)
+            reads.read_columns(p.table, at("embed_tokens_per_layer.weight"), l * ple.dim, ple.dim)
+            reads.read(p.gate, n("per_layer_input_gate.weight"))
+            reads.read(p.proj, n("per_layer_projection.weight"))
+            reads.read(p.norm, n("post_per_layer_input_norm.weight"))
+            reads.read(p.scalar, n("layer_scalar"))
+
+    if m.tower != None:
+        t = m.tower
+        v = lambda s: layout.vision + s
+        reads.read(t.patch_embed, v("patch_embedder.input_proj.weight"))
+        reads.read_expr(t.pos_embed, flattened(v("patch_embedder.position_embedding_table"), t.pos_embed.shape, broadcast = True))
+        reads.read(t.projection, layout.embed_vision)
+        if t.std != None:
+            reads.read(t.std.bias, v("std_bias"))
+            reads.read(t.std.scale, v("std_scale"))
+        for l, blk in enumerate(t.blocks):
+            n = lambda s: v("encoder.layers.{}.{}".format(l, s))
+            for weight_, name in [
+                (blk.attn_norm, n("input_layernorm.weight")),
+                (blk.post_attn_norm, n("post_attention_layernorm.weight")),
+                (blk.pre_ffw_norm, n("pre_feedforward_layernorm.weight")),
+                (blk.post_ffw_norm, n("post_feedforward_layernorm.weight")),
+                (blk.q_norm, n("self_attn.q_norm.weight")),
+                (blk.k_norm, n("self_attn.k_norm.weight")),
+            ]:
+                reads.read(weight_, name)
+            for c, stem in [
+                (blk.q, n("self_attn.q_proj")),
+                (blk.k, n("self_attn.k_proj")),
+                (blk.v, n("self_attn.v_proj")),
+                (blk.o, n("self_attn.o_proj")),
+                (blk.gate, n("mlp.gate_proj")),
+                (blk.up, n("mlp.up_proj")),
+                (blk.down, n("mlp.down_proj")),
+            ]:
+                reads.read(c.bank, stem + ".linear.weight")
+                if c.clip != None:
+                    k = c.clip
+                    for weight_, suffix in [
+                        (k.in_lo, "input_min"),
+                        (k.in_hi, "input_max"),
+                        (k.out_lo, "output_min"),
+                        (k.out_hi, "output_max"),
+                    ]:
+                        reads.read_expr(weight_, flattened(stem + "." + suffix, weight_.shape, broadcast = True))
+
+    if m.self_cond != None:
+        sc = m.self_cond
+        reads.read(sc.pre_norm, at("self_conditioning.pre_norm.weight"))
+        reads.read_concat(sc.gate_up, [
+            at("self_conditioning.gate_proj.weight"),
+            at("self_conditioning.up_proj.weight"),
+        ])
+        reads.read(sc.down, at("self_conditioning.down_proj.weight"))
+
+    if m.draft != None:
+        a = m.draft
+        half = a.fc_embed.shape[1]
+        reads.read_expr(a.fc_embed, src("aux.fc.weight").slice(1, 0, half))
+        reads.read_expr(a.fc_hidden, src("aux.fc.weight").slice(1, half, half))
+        n = lambda s: "aux.layers.0." + s
+        for weight_, name in [
+            (a.attn_norm, n("input_layernorm.weight")),
+            (a.post_attn_norm, n("post_attention_layernorm.weight")),
+            (a.pre_ffw_norm, n("pre_feedforward_layernorm.weight")),
+            (a.post_ffw_norm, n("post_feedforward_layernorm.weight")),
+            (a.attn.q_norm, n("self_attn.q_norm.weight")),
+            (a.o_proj, n("self_attn.o_proj.weight")),
+        ]:
+            reads.read(weight_, name)
+        reads.read_concat(a.attn.banks.qkv, [
+            n("self_attn.q_proj.weight"),
+            n("self_attn.k_proj.weight"),
+            n("self_attn.v_proj.weight"),
+        ])
+        reads.read(a.attn.banks.k_norm, n("self_attn.k_norm.weight"))
+        reads.read_concat(a.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+        reads.read(a.down, n("mlp.down_proj.weight"))
+
+    if m.assistant != None:
+        a = m.assistant
+        if has("aux.pre_projection_embed.weight"):
+            reads.read(a.pre_embed, "aux.pre_projection_embed.weight")
+            reads.read(a.pre_hidden, "aux.pre_projection_hidden.weight")
+        else:
+            th = a.pre_embed.shape[1]
+            reads.read_expr(a.pre_embed, src("aux.pre_projection.weight").slice(1, 0, th))
+            reads.read_expr(a.pre_hidden, src("aux.pre_projection.weight").slice(1, th, th))
+        reads.read(a.post, "aux.post_projection.weight")
+        reads.read(a.embed, "aux.model.embed_tokens.weight")
+        reads.read(a.norm, "aux.model.norm.weight")
+        for l, w in enumerate(a.layers):
+            n = lambda s: "aux.model.layers.{}.{}".format(l, s)
+            for weight_, name in [
+                (w.attn_norm, n("input_layernorm.weight")),
+                (w.post_attn_norm, n("post_attention_layernorm.weight")),
+                (w.pre_ffw_norm, n("pre_feedforward_layernorm.weight")),
+                (w.post_ffw_norm, n("post_feedforward_layernorm.weight")),
+                (w.attn.q_norm, n("self_attn.q_norm.weight")),
+                (w.attn.banks.q_proj, n("self_attn.q_proj.weight")),
+                (w.o_proj, n("self_attn.o_proj.weight")),
+                (w.scalar, n("layer_scalar")),
+                (w.down, n("mlp.down_proj.weight")),
+            ]:
+                reads.read(weight_, name)
+            reads.read_concat(w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+
+    if m.dflash != None:
+        bind_aux(m.dflash, reads, lambda name: src(name).bias(-1.0))
+
+def gguf(m, reads):
+    if m.self_cond != None:
+        fail("this deployment is a block-diffusion text and no GGUF spelling of its self-conditioning block is settled; import it from the safetensors checkpoint")
+    if m.draft != None or m.assistant != None:
+        fail("this deployment declares an aux draft head and no GGUF spelling of one is settled; import it from the safetensors artifact")
+    if m.tower != None:
+        fail("this deployment declares a vision tower and no GGUF spelling of one is settled; import it from the safetensors checkpoint")
+    for w in m.layers:
+        if w.moe != None:
+            fail("this deployment declares a routed feedforward branch and no GGUF spelling of gemma 4's `experts.switch_glu.*` or `router.*` is settled; import it from the safetensors checkpoint")
+    reads.read(m.embed, "token_embd.weight")
+    reads.read(m.final_norm, "output_norm.weight")
+    for l, w in enumerate(m.layers):
+        blk = lambda s: "blk.{}.{}".format(l, s)
+        reads.read(w.attn_norm, blk("attn_norm.weight"))
+        reads.read(w.post_attn_norm, blk("post_attention_norm.weight"))
+        reads.read(w.pre_ffw_norm, blk("ffn_norm.weight"))
+        reads.read(w.post_ffw_norm, blk("post_ffw_norm.weight"))
+        reads.read(w.attn.q_norm, blk("attn_q_norm.weight"))
+        banks = w.attn.banks
+        if not banks.shared:
+            reads.read(banks.k_norm, blk("attn_k_norm.weight"))
+            reads.read_concat(banks.qkv, [blk("attn_q.weight"), blk("attn_k.weight"), blk("attn_v.weight")])
+        else:
+            reads.read(banks.q_proj, blk("attn_q.weight"))
+        reads.read(w.o_proj, blk("attn_output.weight"))
+        reads.read_concat(w.gate_up, [blk("ffn_gate.weight"), blk("ffn_up.weight")])
+        reads.read(w.down, blk("ffn_down.weight"))
+        if w.scalar != None:
+            reads.read(w.scalar, blk("layer_scalar"))
+    if m.ple != None:
+        ple = m.ple
+        reads.read(ple.model_proj, "per_layer_model_proj.weight")
+        reads.read(ple.model_norm, "per_layer_proj_norm.weight")
+        for l, p in enumerate(ple.per_layer):
+            reads.read_expr(p.table, src("per_layer_token_embd.weight").slice(1, l * ple.dim, ple.dim))
+            reads.read(p.gate, "blk.{}.inp_gate.weight".format(l))
+            reads.read(p.proj, "blk.{}.proj.weight".format(l))
+            reads.read(p.norm, "blk.{}.post_norm.weight".format(l))
+            reads.read(p.scalar, "blk.{}.layer_scalar".format(l))
+
+# The forward of Gemma 4: sliding and global attention, a GeGLU MLP (with
+# routed experts beside it on 26B-A4B), per-layer embeddings on E4B, a vision
+# tower's rows scattered into the embedding, a block-diffusion model's
+# self-conditioning, and each drafter's proposals.
+
+FRAC_1_SQRT_2 = 0.70710677
+
+def caches(m, c):
+    kv = c.kv_space(m.kv)
+    spaces = [c.kv_space(m.kv, m.sliding.window), kv]
+    for w in m.layers:
+        if not w.attn.banks.shared:
+            head_dim, kv_heads, _ = geometry(m, w.attn.reading)
+            plane = kv_heads * head_dim
+            c.kv(spaces[w.attn.reading], w.attn.kv, [plane, plane], head_dim, heads = True)
+    if m.draft != None:
+        plane = m.glob.kv_heads * m.glob.head_dim
+        c.kv(kv, m.draft.attn.kv, [plane, plane], m.glob.head_dim, heads = True)
+    if m.dflash != None:
+        dflash_caches(m.dflash, c, kv)
+
+def geometry(m, reading):
+    if reading == SLIDING:
+        return m.sliding.head_dim, m.sliding.kv_heads, m.sliding.window
+    return m.glob.head_dim, m.glob.kv_heads, None
+
+def plans(m, input, plan):
+    """`plan` over `input` for each reading, indexed by it."""
+    return [
+        plan(input, m.q_heads, m.sliding.kv_heads, m.sliding.head_dim, m.sliding.window),
+        plan(input, m.q_heads, m.glob.kv_heads, m.glob.head_dim, None),
+    ]
+
+def readout_tail(m, inputs, dr):
+    """The first layer of the shared tail, when the backend attends a
+    readout row as its token and nothing past the trunk reads its other
+    rows; else None."""
+    if dr != None or m.self_cond != None or not inputs.readout_attention():
+        return None
+    for l, w in enumerate(m.layers):
+        if w.attn.banks.shared:
+            return l
+    return None
+
+def forward(m, inputs):
+    dr = m.dflash
+    trunk_inputs = inputs.on(~block_rows(dr)) if dr != None else inputs
+    positions = trunk_inputs.positions()
+
+    towered = tower(inputs, m.tower) if m.tower != None else None
+
+    ids = inputs.tokens()
+    root = f32(sqrt(m.hidden))
+    y = ops.gather.embed(ids, m.embed, m.vocab) * root
+
+    if towered != None:
+        imaged = y.on(fact.has(fact.Media))
+        y = ops.gather.scatter_live_rows(towered, inputs.patch_routes(), imaged).everywhere()
+
+    if m.self_cond != None:
+        sc = m.self_cond
+        den, enc = y.on(fact.bidirectional()), y.on(~fact.bidirectional())
+        input_den = inputs.on(fact.bidirectional())
+        soft = ops.gather.embed_weighted(
+            input_den.self_cond_rows(sc.taps),
+            input_den.self_cond_weights(sc.taps),
+            m.embed,
+            m.vocab,
+        ) * root
+        normed = ops.elemwise.rmsnorm(soft, sc.pre_norm, sc.norm_eps)
+        act = ops.linear.glu(ops.linear.matmul(normed, sc.gate_up), gating.geglu_tanh(), sc.inter)
+        signal = ops.linear.matmul(act, sc.down)
+        den = ops.elemwise.rmsnorm_no_scale(ops.elemwise.residual_add(den, signal), m.hidden, sc.norm_eps)
+        y = merge([den, enc])
+
+    h_block = None
+    if dr != None:
+        h_block = y.on(block_rows(dr))
+        y = y.on(~block_rows(dr))
+
+    relay = None
+    if m.ple != None:
+        ple = m.ple
+        proj = ops.linear.matmul(y, ple.model_proj) * f32(1.0 / root)
+        relay = ops.elemwise.rmsnorm_per_head(proj, ple.model_norm, ple.dim, ple.model_norm_eps)
+
+    routes = inputs.adapter_routes()
+
+    # The shared tail writes no kv, so past its first layer only the rows a
+    # lane reads out still matter: a lane that masks its attention or
+    # captures scores keeps every row, the rest go on as their readouts.
+    tail = readout_tail(m, inputs, dr)
+    if tail != None:
+        read = ~fact.has(fact.Mask) & ~fact.scores()
+        input_r = trunk_inputs.on(read)
+        rows_r = input_r.readout_rows()
+        plan_r = plans(m, input_r, ops.attn.plan_decode)
+        gathered = lambda v: ops.gather.gather_rows(v.on(read), rows_r)
+        adapted_r = read & fact.has(fact.Adapter)
+        ro = struct(
+            positions = gathered(positions),
+            ids = gathered(ids),
+            relay = gathered(relay) if relay != None else None,
+            routes = ops.gather.gather_rows(routes.on(adapted_r), input_r.on(fact.has(fact.Adapter)).readout_rows()),
+            plans = plan_r,
+        )
+
+    def attend(l, w, y, whole):
+        normed = ops.elemwise.rmsnorm(y, w.attn_norm, w.attn_norm_eps)
+        at = w.attn
+        d, kv_heads, win = geometry(m, at.reading)
+        pages = inputs.kv(at.kv)
+        if at.banks.shared:
+            q = q_only(normed, positions, m, at, d, at.banks.q_proj)
+        else:
+            q = qkv_unfused(normed, positions, inputs, m, at, d, kv_heads, at.banks.qkv,
+                            at.banks.k_norm, at.banks.k_norm_eps, pages)
+        seam.at(seam.ATTN_Q, [q])
+
+        # Each lane by its kind (the tail's whole rows are lanes that mask or
+        # capture scores, so only those two); a global layer's scores go out
+        # at their seam.
+        a = ops.attn.attend(q, trunk_inputs, at.kv, m.q_heads, kv_heads, d, at.sm_scale, window = win,
+                            mask = True, scores = True, scores_seam = at.reading != SLIDING)
+        seam.at(seam.ATTN_OUT, [a])
+        return normed, a, routes
+
+    def attend_readouts(l, w, y):
+        """A shared layer over readout rows: each attends as the token it
+        reads out."""
+        normed = ops.elemwise.rmsnorm(y, w.attn_norm, w.attn_norm_eps)
+        at = w.attn
+        d, _, win = geometry(m, at.reading)
+        q = q_only(normed, ro.positions, m, at, d, at.banks.q_proj)
+        a = ops.attn.decode(q, ro.plans[at.reading], inputs.kv(at.kv), win, d, at.sm_scale)
+        return normed, a, ro.routes
+
+    def layer(l, w, y, readouts = False, whole = False):
+        if readouts:
+            normed, a, layer_routes = attend_readouts(l, w, y)
+        else:
+            normed, a, layer_routes = attend(l, w, y, whole)
+        o = ops.linear.matmul(a, w.o_proj)
+        adapted = fact.has(fact.Adapter)
+        o = ops.linear.lora_correct(normed.on(adapted), w.lora_a, w.lora_b, layer_routes, o.on(adapted))
+
+        y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, w.post_attn_norm, w.post_attn_norm_eps), y)
+        mlp_in = ops.elemwise.rmsnorm(y, w.pre_ffw_norm, w.pre_ffw_norm_eps)
+        act = ops.linear.glu(ops.linear.matmul(mlp_in, w.gate_up), gating.geglu_tanh(), w.inter)
+        f = ops.linear.matmul(act, w.down)
+        if w.moe != None:
+            x = w.moe
+            h1 = ops.elemwise.rmsnorm(f, x.post_ffw_norm_1, x.post_ffw_norm_1_eps)
+            experts, weights = ops.linear.moe_route(
+                ops.linear.matmul(ops.elemwise.rmsnorm(y, x.router_norm, x.router_norm_eps), x.router),
+                x.experts,
+                x.top_k,
+                routing.softmax(),
+                scale = x.per_expert_scale,
+            )
+            moe_in = ops.elemwise.rmsnorm(y, x.pre_ffw_norm_2, x.pre_ffw_norm_2_eps)
+            hidden = ops.linear.glu(ops.linear.moe_matmul_select(moe_in, x.gate_up, experts, x.top_k), gating.geglu_tanh(), x.inter)
+            routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(hidden, x.down, experts, x.top_k), weights)
+            h2 = ops.elemwise.rmsnorm(routed, x.post_ffw_norm_2, x.post_ffw_norm_2_eps)
+            f = ops.elemwise.residual_add(h1, h2)
+        y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, w.post_ffw_norm, w.post_ffw_norm_eps), y)
+
+        if relay != None:
+            ple = m.ple
+            lp = ple.per_layer[l]
+            layer_ids, layer_relay = (ro.ids, ro.relay) if readouts else (ids, relay)
+            table = ops.gather.embed(layer_ids, lp.table, m.vocab) * f32(sqrt(ple.dim))
+            mixed = ops.elemwise.residual_add(table, ops.gather.select(layer_relay, l, ple.dim)) * FRAC_1_SQRT_2
+            gated = ops.linear.glu(ops.linear.matmul(y, lp.gate), gating.geglu_tanh(), up = mixed)
+            out = ops.linear.matmul(gated, lp.proj)
+            out = ops.elemwise.rmsnorm(out, lp.norm, lp.norm_eps)
+            y = ops.elemwise.scale(lp.scalar, ops.elemwise.residual_add(out, y))
+
+        if w.scalar != None:
+            y = ops.elemwise.scale(w.scalar, y)
+        return y
+
+    def block(l, w, carried):
+        y, tapped = carried
+        if tail != None and l >= tail:
+            if l == tail:
+                y = struct(whole = y.on(~read), readouts = gathered(y))
+            return (struct(whole = layer(l, w, y.whole, whole = True), readouts = layer(l, w, y.readouts, readouts = True)), tapped)
+        y = layer(l, w, y)
+        if dr != None:
+            tapped = tap(dr, l, y, tapped)
+        return (y, tapped)
+
+    y, tapped = inputs.fold_layers(m.layers, (y, None), block)
+
+    if tail != None:
+        y = merge([ops.gather.gather_rows(y.whole, trunk_inputs.on(~read).readout_rows()), y.readouts])
+    x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
+    hb = None
+    if dr != None:
+        hb = arm(dr, inputs, tapped, h_block, inputs.mask(), block_rows(dr))
+        x = merge([hb, x])
+    if tail == None:
+        x = ops.gather.gather_rows(x, inputs.readout_rows())
+    logits = ops.attn.logit_softcap(ops.linear.lm_head(x, m.embed), m.softcap)
+    if dr != None:
+        plant_readout(dr, logits, inputs, x, block_rows(dr))
+
+    if m.draft != None:
+        eagle_draft(m, inputs, x, logits, root)
+    if m.assistant != None:
+        assistant_draft(m, inputs, positions, x, logits, root)
+    return logits
+
+def eagle_draft(m, inputs, x, logits, root):
+    """E4B's EAGLE head (`m.draft`) proposes one token from the trunk's last
+    hidden row and the token the trunk chose."""
+    a = m.draft
+    input_draft = inputs.on(fact.drafts())
+    plan_draft = ops.attn.plan_prefill(input_draft, m.q_heads, m.glob.kv_heads, m.glob.head_dim, None)
+    dx = x.on(fact.drafts())
+    dlogits = logits.on(fact.drafts())
+    chosen = ops.sampling.argmax([dlogits])
+    e = ops.gather.embed(chosen, m.embed, m.vocab) * root
+    dy = ops.elemwise.residual_add(ops.linear.matmul(e, a.fc_embed), ops.linear.matmul(dx, a.fc_hidden))
+
+    normed = ops.elemwise.rmsnorm(dy, a.attn_norm, a.norm_eps)
+    at = a.attn
+    hd = m.glob.head_dim
+    pages = inputs.kv(at.kv)
+    q = qkv_unfused(normed, inputs.positions(), inputs, m, at, hd, m.glob.kv_heads, at.banks.qkv,
+                    at.banks.k_norm, at.banks.k_norm_eps, pages)
+    o = ops.attn.prefill(q, plan_draft, pages, None, hd, m.glob.kv_heads, at.sm_scale)
+    o = ops.linear.matmul(o, a.o_proj)
+    dy = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, a.post_attn_norm, a.norm_eps), dy)
+    mlp_in = ops.elemwise.rmsnorm(dy, a.pre_ffw_norm, a.norm_eps)
+    act = ops.linear.glu(ops.linear.matmul(mlp_in, a.gate_up), gating.geglu_tanh(), a.inter)
+    f = ops.linear.matmul(act, a.down)
+    dy = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, a.post_ffw_norm, a.norm_eps), dy)
+
+    draft = ops.attn.logit_softcap(ops.linear.lm_head(ops.elemwise.rmsnorm(dy, m.final_norm, m.final_norm_eps), m.embed), m.softcap)
+    seam.at(seam.MTP, [draft])
+    seam.at(seam.MTP_DRAFTS, [ops.sampling.argmax([draft])])
+
+def assistant_draft(m, inputs, positions, x, logits, root):
+    """The MTP assistant (`m.assistant`) proposes one token from the trunk's
+    last hidden row and the token the trunk chose, attending the trunk's
+    last cache of each reading."""
+    a = m.assistant
+    input_draft = inputs.on(fact.drafts())
+    dpos = positions.on(fact.drafts())
+    plan_draft = plans(m, input_draft, ops.attn.plan_prefill)
+    dx = x.on(fact.drafts())
+    dlogits = logits.on(fact.drafts())
+    token = ops.sampling.argmax([dlogits])
+    e = ops.gather.embed(token, m.embed, m.vocab) * root
+    y = ops.elemwise.residual_add(ops.linear.matmul(e, a.pre_embed), ops.linear.matmul(dx, a.pre_hidden))
+    for w in a.layers:
+        at = w.attn
+        d, kv_heads, win = geometry(m, at.reading)
+        pages = inputs.kv(at.kv)
+        normed = ops.elemwise.rmsnorm(y, w.attn_norm, a.norm_eps)
+        q = q_only(normed, dpos, m, at, d, at.banks.q_proj)
+        o = ops.attn.prefill(q, plan_draft[at.reading], pages, win, d, kv_heads, at.sm_scale)
+        o = ops.linear.matmul(o, w.o_proj)
+        y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, w.post_attn_norm, a.norm_eps), y)
+        mlp_in = ops.elemwise.rmsnorm(y, w.pre_ffw_norm, a.norm_eps)
+        act = ops.linear.glu(ops.linear.matmul(mlp_in, w.gate_up), gating.geglu_tanh(), w.inter)
+        f = ops.linear.matmul(act, w.down)
+        y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, w.post_ffw_norm, a.norm_eps), y)
+        y = ops.elemwise.scale(w.scalar, y)
+    draft = ops.linear.lm_head(ops.elemwise.rmsnorm(y, a.norm, a.norm_eps), a.embed)
+    seam.at(seam.MTP, [draft])
+    seam.at(seam.MTP_DRAFTS, [ops.sampling.argmax([draft])])
+
+def clipped(x, c):
+    if c.clip == None:
+        return ops.linear.matmul(x, c.bank)
+    k = c.clip
+    held = ops.elemwise.clamp_learned(ops.elemwise.copy(x), k.in_lo, k.in_hi)
+    return ops.elemwise.clamp_learned(ops.linear.matmul(held, c.bank), k.out_lo, k.out_hi)
+
+def tower(inputs, t):
+    d = t.head_dim
+    x = ops.gather.pixels(inputs.pixels(3 * t.patch * t.patch), [0.5, 0.5, 0.5], [0.5, 0.5, 0.5], "hwc", 1)
+    segments = inputs.patch_segments()
+    grid = inputs.patch_positions()
+
+    y = ops.linear.matmul(x, t.patch_embed)
+    ids, weights = ops.gather.grid_taps(grid, inputs.image_grids(), segments, "axes", t.grid_side)
+    pos = ops.gather.embed_weighted(ids, weights, t.pos_embed, t.positions)
+    y = ops.elemwise.residual_add(pos, y)
+
+    for b in t.blocks:
+        n = ops.elemwise.rmsnorm(y, b.attn_norm, t.norm_eps)
+        q = ops.elemwise.rmsnorm_per_head(clipped(n, b.q), b.q_norm, d, t.norm_eps)
+        k = ops.elemwise.rmsnorm_per_head(clipped(n, b.k), b.k_norm, d, t.norm_eps)
+        v = ops.elemwise.rmsnorm_no_scale(clipped(n, b.v), d, t.norm_eps)
+        q, k = ops.elemwise.rope(q, grid, d, t.theta, rotary.mrope([0, d // 4, d // 4], "split", d), k = k)
+        o = ops.attn.dense(q, k, v, segments, d, t.sm_scale)
+        y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(clipped(o, b.o), b.post_attn_norm, t.norm_eps), y)
+
+        n = ops.elemwise.rmsnorm(y, b.pre_ffw_norm, t.norm_eps)
+        act = ops.linear.glu(clipped(n, b.gate), gating.geglu_tanh(), up = clipped(n, b.up))
+        y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(clipped(act, b.down), b.post_ffw_norm, t.norm_eps), y)
+
+    pooled = ops.gather.pool_rows(y, t.pool) * f32(sqrt(t.hidden))
+    if t.std != None:
+        pooled = ops.elemwise.standardize(pooled, t.std.bias, t.std.scale)
+    return ops.linear.matmul(pooled, t.projection)
+
+def qkv_unfused(x, pos, inputs, m, at, d, kv_heads, qkv, k_norm, k_norm_eps, pages):
+    write_page = inputs.write_page(at.kv)
+    write_offset = inputs.write_offset(at.kv)
+    q, k, v = ops.gather.split_qkv(ops.linear.matmul(x, qkv), m.q_heads * d, kv_heads * d)
+    v = ops.elemwise.rmsnorm_no_scale(v, d, at.q_norm_eps)
+    q = ops.elemwise.rmsnorm_per_head(q, at.q_norm, d, at.q_norm_eps)
+    k = ops.elemwise.rmsnorm_per_head(k, k_norm, d, k_norm_eps)
+    if at.reading == GLOBAL:  # proportional: a pair sits half a head apart
+        q, k = ops.elemwise.rope(
+            q,
+            pos,
+            d,
+            m.glob.theta,
+            rotary.partial(m.glob.rotary_dim, span = d // 2),
+            k = k,
+        )
+    else:
+        q, k = ops.elemwise.rope(q, pos, d, m.sliding.theta, rotary.full(), k = k)
+    ops.attn.kv_append(k, v, pages, write_page, write_offset)
+    return q
+
+def q_only(x, pos, m, at, d, q_proj):
+    q = ops.elemwise.rmsnorm_per_head(ops.linear.matmul(x, q_proj), at.q_norm, d, at.q_norm_eps)
+    if at.reading == GLOBAL:  # proportional, as above
+        return ops.elemwise.rope(q, pos, d, m.glob.theta, rotary.partial(m.glob.rotary_dim, span = d // 2))
+    return ops.elemwise.rope(q, pos, d, m.sliding.theta, rotary.partial(d))

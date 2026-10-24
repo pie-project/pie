@@ -24,7 +24,7 @@ const BLOCK_ORDER: &str = "indices: [0, 4, 1, 5, 2, 6, 3, 7]";
 fn in_ba_concatenates_beta_first() {
     let scratch = Scratch::new("qwen3-in-ba");
     let log = reads(&scratch.0, "qwen35-tiny", Dtype::Bf16, &[arch("qwen35")]);
-    let read = read_of(&log, "layer.0.in_ba");
+    let read = read_of(&log, "layers.0.gdn.in_ba");
     let beta = read
         .find("blk.0.ssm_beta.weight")
         .expect("in_ba reads ssm_beta");
@@ -38,13 +38,13 @@ fn in_ba_concatenates_beta_first() {
 fn a_qwen35_gguf_gathers_its_tiled_heads_into_block_order() {
     let scratch = Scratch::new("qwen3-tiled");
     let tiled = reads(&scratch.0, "qwen35-tiny", Dtype::Bf16, &[arch("qwen35")]);
-    let read = read_of(&tiled, "layer.0.dt_bias");
+    let read = read_of(&tiled, "layers.0.gdn.dt_bias");
     assert!(
         read.contains(BLOCK_ORDER),
         "the tiled v-heads are gathered into block order: {read}"
     );
     assert!(
-        read_of(&tiled, "layer.0.out_proj").contains("Gather"),
+        read_of(&tiled, "layers.0.gdn.out_proj").contains("Gather"),
         "out_proj's tiled columns are gathered too"
     );
 }
@@ -61,9 +61,9 @@ fn a_v_grouped_gguf_keeps_its_folded_out_proj() {
             ("prism.hadamard.gdn_v_grouped", Kv::Bool(true)),
         ],
     );
-    assert!(read_of(&grouped, "layer.0.dt_bias").contains(BLOCK_ORDER));
+    assert!(read_of(&grouped, "layers.0.gdn.dt_bias").contains(BLOCK_ORDER));
     assert!(
-        !read_of(&grouped, "layer.0.out_proj").contains("Gather"),
+        !read_of(&grouped, "layers.0.gdn.out_proj").contains("Gather"),
         "a Hadamard-folded out_proj is already in block order"
     );
 }
@@ -72,6 +72,6 @@ fn a_v_grouped_gguf_keeps_its_folded_out_proj() {
 fn a_block_stored_gguf_is_read_as_stored() {
     let scratch = Scratch::new("qwen3-block");
     let plain = reads(&scratch.0, "qwen35-tiny", Dtype::Bf16, &[arch("qwen3next")]);
-    assert!(!read_of(&plain, "layer.0.dt_bias").contains("Gather"));
-    assert!(!read_of(&plain, "layer.0.out_proj").contains("Gather"));
+    assert!(!read_of(&plain, "layers.0.gdn.dt_bias").contains("Gather"));
+    assert!(!read_of(&plain, "layers.0.gdn.out_proj").contains("Gather"));
 }

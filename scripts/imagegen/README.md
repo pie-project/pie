@@ -314,7 +314,7 @@ latents).  The row is served with `engine.graphs = "off"` pinned in a user profi
 **Bisecting a mismatch.**  `--tap <dump key>` on `run`, `collect` and
 `compare` reads an INTERMEDIATE out in the velocity's place. The tap is part
 of the deployment's name (`-tap.{key}`, read as `deploy.tap` in
-`models/mini_dit/model.poem`): the plan plants its readout seam on that
+`models/mini_dit.poem`): the plan plants its readout seam on that
 rectangle, so the artifact is imported under the tapped deployment — `collect` lays the pie rows
 out the way the golden's tensor is shaped (a `[B, H, N, DH]` head tensor is
 transposed back; a joint `[txt || img]` rectangle takes its caption rows from

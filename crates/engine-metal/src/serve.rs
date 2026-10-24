@@ -362,6 +362,16 @@ impl Shell {
         let (chip, chip_report) =
             crate::chip::resolve(device.name(), &measured, boot.profiles.as_deref());
         crate::chip::tell_untuned(device.name(), &chip_report);
+        if chip
+            .ladder::<kernels_metal::tuning::Qmm>()
+            .values()
+            .any(|q| !q.runs_on(device.family()))
+        {
+            return Err(Fault::Param {
+                name: "kernel.qmm".to_string(),
+                why: "names the staged tile, which answers right only on an Apple10 GPU",
+            });
+        }
         let tuning = kernels_metal::Tuning::new(chip.clone(), wide_range, device.cores());
         let boot = Boot {
             trace: poem_compiler::fuse::fuse(

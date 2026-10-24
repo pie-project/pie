@@ -85,8 +85,11 @@ inline void topk_group_pop(
 // hundred columns, so the lanes of a simdgroup rarely part. Each thread keeps
 // its candidates in registers. A vocabulary-wide row takes a thousand
 // threads; a narrow one keeps the hundred and twenty-eight it always had.
+// The group is stated to the compiler: left to itself it spends registers on
+// a k = 16 list that cap the pipeline below a thousand threads on some
+// devices (640 on an M1 Max), and the wide launch then never runs.
 template <typename T, int K, uint kTopkThreads>
-[[kernel]] void topk_rows(
+[[kernel, max_total_threads_per_threadgroup(kTopkThreads)]] void topk_rows(
     const device T* x          [[buffer(0)]],
     device float* values       [[buffer(1)]],
     device int* indices        [[buffer(2)]],

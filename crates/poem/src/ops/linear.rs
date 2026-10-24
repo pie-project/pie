@@ -299,24 +299,14 @@ pub fn matmul_grouped(x: &Value, w: &Weight, routes: &Value, groups: u32) -> Val
     );
     y
 }
+/// A routed bank's select, as the bank is stored: a bf16, f16 or f32 bank's
+/// plain, any other through its codes and factors.
 pub fn moe_matmul_select(x: &Value, bank: &Weight, routes: &Value, top_k: u32) -> Value {
-    unquantized(bank, "a dense bank's select");
-    let r = x.rec();
-    let y = r.fresh(tensor(Dim::TokensTimes(top_k), bank.dim(1), x.dtype()));
-    r.push(
-        Linear::MoeSelect {
-            x: x.id(),
-            bank: r.weight(bank),
-            routes: routes.id(),
-            y: y.id(),
-            bias: None,
-            input_scales: None,
-            quantized: false,
-            quant: None,
-        },
-        &[x, routes],
-    );
-    y
+    if bank.act.is_none() && matches!(bank.dtype, Dtype::Bf16 | Dtype::F16 | Dtype::F32) {
+        select::plain(x, bank, routes, top_k)
+    } else {
+        select::quantized(x, bank, routes, top_k)
+    }
 }
 
 pub fn moe_matmul_select_bias(
@@ -342,42 +332,6 @@ pub fn moe_matmul_select_bias(
         },
         &[x, routes],
     );
-    y
-}
-
-/// A quantized bank's select; a bank whose precision quantizes its
-/// activations has each route's quantized first.
-pub fn moe_matmul_select_quant(x: &Value, bank: &Weight, routes: &Value, top_k: u32) -> Value {
-    let r = x.rec();
-    let y = r.fresh(tensor(Dim::TokensTimes(top_k), bank.dim(1), x.dtype()));
-    match bank.act {
-        None => r.push(
-            Linear::MoeSelect {
-                x: x.id(),
-                bank: r.weight(bank),
-                routes: routes.id(),
-                y: y.id(),
-                bias: None,
-                input_scales: None,
-                quantized: true,
-                quant: None,
-            },
-            &[x, routes],
-        ),
-        Some(quant) => r.push(
-            Linear::MoeSelect {
-                x: x.id(),
-                bank: r.weight(bank),
-                routes: routes.id(),
-                quant: Some(quant),
-                input_scales: input_scales(r, bank, quant),
-                y: y.id(),
-                bias: None,
-                quantized: true,
-            },
-            &[x, routes],
-        ),
-    }
     y
 }
 
@@ -465,4 +419,65 @@ pub fn lora_correct(
         &[x, routes, y],
     );
     y_out.everywhere()
+}
+
+/// A select's two lowerings, for a pattern that names the one it matches.
+pub mod select {
+    use super::*;
+
+    pub fn plain(x: &Value, bank: &Weight, routes: &Value, top_k: u32) -> Value {
+        unquantized(bank, "a dense bank's select");
+        let r = x.rec();
+        let y = r.fresh(tensor(Dim::TokensTimes(top_k), bank.dim(1), x.dtype()));
+        r.push(
+            Linear::MoeSelect {
+                x: x.id(),
+                bank: r.weight(bank),
+                routes: routes.id(),
+                y: y.id(),
+                bias: None,
+                input_scales: None,
+                quantized: false,
+                quant: None,
+            },
+            &[x, routes],
+        );
+        y
+    }
+
+    /// A quantized bank's select; a bank whose precision quantizes its
+    /// activations has each route's quantized first.
+    pub fn quantized(x: &Value, bank: &Weight, routes: &Value, top_k: u32) -> Value {
+        let r = x.rec();
+        let y = r.fresh(tensor(Dim::TokensTimes(top_k), bank.dim(1), x.dtype()));
+        match bank.act {
+            None => r.push(
+                Linear::MoeSelect {
+                    x: x.id(),
+                    bank: r.weight(bank),
+                    routes: routes.id(),
+                    y: y.id(),
+                    bias: None,
+                    input_scales: None,
+                    quantized: true,
+                    quant: None,
+                },
+                &[x, routes],
+            ),
+            Some(quant) => r.push(
+                Linear::MoeSelect {
+                    x: x.id(),
+                    bank: r.weight(bank),
+                    routes: routes.id(),
+                    quant: Some(quant),
+                    input_scales: input_scales(r, bank, quant),
+                    y: y.id(),
+                    bias: None,
+                    quantized: true,
+                },
+                &[x, routes],
+            ),
+        }
+        y
+    }
 }
