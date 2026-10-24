@@ -24,6 +24,57 @@ template <typename T>
 
 instantiate_swiglu_clamp(bfloat16, bfloat)
 
+// packed_swiglu_clamp_alpha over a gate and an up plane held apart.
+template <typename T>
+[[kernel]] void swiglu_clamp_alpha(
+    const device T* gate        [[buffer(0)]],
+    const device T* up          [[buffer(1)]],
+    device T* out               [[buffer(2)]],
+    const constant float& limit [[buffer(3)]],
+    const constant float& alpha [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+  float g = float(gate[gid]);
+  float u = float(up[gid]);
+  g = min(g, limit);
+  u = clamp(u, -limit, limit);
+  const float sig = 1.0f / (1.0f + fast::exp(-alpha * g));
+  out[gid] = static_cast<T>((g * sig) * (u + 1.0f));
+}
+
+#define instantiate_swiglu_clamp_alpha(name, itype)                \
+  template [[host_name("swiglu_clamp_alpha_" #name)]]              \
+  [[kernel]] void swiglu_clamp_alpha<itype>(                       \
+      const device itype*, const device itype*, device itype*,     \
+      const constant float&, const constant float&, uint);
+
+instantiate_swiglu_clamp_alpha(bfloat16, bfloat)
+
+// packed_situ over a gate and an up plane held apart.
+template <typename T>
+[[kernel]] void situ(
+    const device T* gate         [[buffer(0)]],
+    const device T* up           [[buffer(1)]],
+    device T* out                [[buffer(2)]],
+    const constant float& beta   [[buffer(3)]],
+    const constant float& up_cap [[buffer(4)]],
+    uint gid [[thread_position_in_grid]]) {
+  const float g = float(gate[gid]);
+  float u = float(up[gid]);
+  const float s = beta * precise::tanh(g / beta) / (1.0f + metal::exp(-g));
+  if (up_cap > 0.0f) {
+    u = up_cap * precise::tanh(u / up_cap);
+  }
+  out[gid] = static_cast<T>(s * u);
+}
+
+#define instantiate_situ(name, itype)                              \
+  template [[host_name("situ_" #name)]]                            \
+  [[kernel]] void situ<itype>(                                     \
+      const device itype*, const device itype*, device itype*,     \
+      const constant float&, const constant float&, uint);
+
+instantiate_situ(bfloat16, bfloat)
+
 inline float gelu_tanh(float x) {
   constexpr float k = 0.7978845608028654f;
   const float inner = k * (x + 0.044715f * x * x * x);
