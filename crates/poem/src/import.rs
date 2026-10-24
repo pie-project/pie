@@ -80,6 +80,9 @@ pub struct Builder<'a> {
     tp: u32,
     platform: Platform,
     tensors: Vec<TensorContract>,
+    /// The weights the compiler lays out tiled (an affine projection a
+    /// package states row-major).
+    tiled: std::collections::BTreeSet<String>,
 }
 
 impl<'a> Builder<'a> {
@@ -90,11 +93,28 @@ impl<'a> Builder<'a> {
             tp,
             platform,
             tensors: Vec::new(),
+            tiled: std::collections::BTreeSet::new(),
         }
     }
 
+    /// The builder storing the weights `tiled` names in the tiled order.
+    #[must_use]
+    pub fn tiling(mut self, tiled: &[String]) -> Builder<'a> {
+        self.tiled = tiled.iter().cloned().collect();
+        self
+    }
+
+    /// `w` as this platform stores it, tiled where the compiler lays it so.
+    fn laid(&self, w: &Weight) -> Weight {
+        let mut w = w.placed(self.platform);
+        if w.dtype == Dtype::U4g64 && self.tiled.contains(&w.name) {
+            w.dtype = self.platform.placement(Dtype::U4g64tiled);
+        }
+        w
+    }
+
     pub fn read(&mut self, w: &Weight, from: impl Into<String>) -> Result<(), Error> {
-        let w = &w.placed(self.platform);
+        let w = &self.laid(w);
         let from = from.into();
         if recorded(|| format!("read {w:?} {from:?}")) {
             return Ok(());
@@ -110,7 +130,7 @@ impl<'a> Builder<'a> {
         w: &Weight,
         parts: impl IntoIterator<Item = String>,
     ) -> Result<(), Error> {
-        let w = &w.placed(self.platform);
+        let w = &self.laid(w);
         let parts: Vec<String> = parts.into_iter().collect();
         if recorded(|| format!("read_concat {w:?} {parts:?}")) {
             return Ok(());
@@ -126,7 +146,7 @@ impl<'a> Builder<'a> {
         w: &Weight,
         rows: impl IntoIterator<Item = Vec<String>>,
     ) -> Result<(), Error> {
-        let w = &w.placed(self.platform);
+        let w = &self.laid(w);
         let rows: Vec<Vec<String>> = rows.into_iter().collect();
         if recorded(|| format!("read_stack {w:?} {rows:?}")) {
             return Ok(());
@@ -143,7 +163,7 @@ impl<'a> Builder<'a> {
         from: impl Into<String>,
         over: impl FnOnce(Expr) -> Expr,
     ) -> Result<(), Error> {
-        let w = &w.placed(self.platform);
+        let w = &self.laid(w);
         let from = from.into();
         let over = over(Expr::src(from.clone()));
         if recorded(|| format!("read_over {w:?} {from:?} {over:?}")) {
@@ -167,7 +187,7 @@ impl<'a> Builder<'a> {
     }
 
     pub fn read_expr(&mut self, w: &Weight, expr: Expr) -> Result<(), Error> {
-        let w = &w.placed(self.platform);
+        let w = &self.laid(w);
         if recorded(|| format!("read_expr {w:?} {expr:?}")) {
             return Ok(());
         }
@@ -188,7 +208,7 @@ impl<'a> Builder<'a> {
         start: i64,
         len: i64,
     ) -> Result<(), Error> {
-        let w = &w.placed(self.platform);
+        let w = &self.laid(w);
         let from = from.into();
         if recorded(|| format!("read_columns {w:?} {from:?} {start} {len}")) {
             return Ok(());
@@ -206,7 +226,7 @@ impl<'a> Builder<'a> {
     }
 
     pub fn read_own(&mut self, w: &Weight) -> Result<(), Error> {
-        let w = &w.placed(self.platform);
+        let w = &self.laid(w);
         if recorded(|| format!("read_own {w:?}")) {
             return Ok(());
         }

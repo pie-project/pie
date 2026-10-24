@@ -33,6 +33,15 @@ pub struct Join {
     pub axis: u32,
 }
 
+/// What the compiler decides of a deployment's weights that its import
+/// stores accordingly: the weights it joins, and the ones it lays out in the
+/// matrix core's tiled order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Lowering {
+    pub joins: Vec<Join>,
+    pub tiled: Vec<String>,
+}
+
 impl Join {
     /// The name `legs` go by joined: their common path, then the rest of
     /// each one's, run together where each is one letter (`qkv`), else
