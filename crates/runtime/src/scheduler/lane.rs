@@ -95,7 +95,7 @@ pub(super) enum LaneCommit {
         pipeline_id: Option<ProcessId>,
     },
     CloseInstance {
-        id: u64,
+        id: ::engine::InstanceId,
     },
     AsyncControl {
         result: std::result::Result<SubmissionCompletion, String>,
@@ -312,7 +312,8 @@ impl Lane {
         stats: Arc<SchedulerStats>,
     ) {
         let mut channels = ChannelJoin::new();
-        let mut landed_instances: HashMap<::engine::FrameId, Vec<Vec<u64>>> = HashMap::new();
+        let mut landed_instances: HashMap<::engine::FrameId, Vec<Vec<::engine::InstanceId>>> =
+            HashMap::new();
         let broker = crate::engine::CompletionBroker::new();
         let settlements = crate::engine::completion::FrameSettlements::new();
         if let Some(engine) = engine.as_mut() {
@@ -432,15 +433,15 @@ impl Lane {
                         .unwrap_or_default();
                     if let Some(engine) = engine.as_mut() {
                         if let Err(error) = engine.publish_landed() {
-                            tracing::error!(frame, step, %error, "publishing a landed step");
+                            tracing::error!(frame = frame.0, step, %error, "publishing a landed step");
                         }
                         for instance in instances {
                             if let Err(error) = channels.pump_out(engine.as_mut(), instance) {
-                                tracing::error!(frame, step, %error, "channel take after landing");
+                                tracing::error!(frame = frame.0, step, %error, "channel take after landing");
                             }
                         }
                     }
-                    tracing::debug!(frame, step, "channels pumped out after landing");
+                    tracing::debug!(frame = frame.0, step, "channels pumped out after landing");
                     settlements.settled(frame, step as usize, &outcome, &broker);
                     if landed_instances
                         .get(&frame)
@@ -511,7 +512,7 @@ impl Lane {
         stash: &mut Option<LaneRequest>,
         broker: &crate::engine::CompletionBroker,
         settlements: &std::sync::Arc<crate::engine::completion::FrameSettlements>,
-        landed: &mut HashMap<::engine::FrameId, Vec<Vec<u64>>>,
+        landed: &mut HashMap<::engine::FrameId, Vec<Vec<::engine::InstanceId>>>,
     ) -> std::result::Result<SubmissionCompletion, String> {
         use crate::engine::completion;
 
@@ -660,7 +661,7 @@ impl Lane {
                     Self::release_wait_slots([bind.pacing_wait_id]);
                     tracing::warn!(
                         operation = "register_channels_bind",
-                        program_id = bind.program_id(),
+                        program_id = bind.program_id().0,
                         "scheduler RPC cancelled before resource creation"
                     );
                     return LaneCommit::BindFinished { pipeline_id };
@@ -735,7 +736,7 @@ impl Lane {
                     if program_registered {
                         tracing::warn!(
                             operation = "register_channels_bind",
-                            program_id = bind.program_id(),
+                            program_id = bind.program_id().0,
                             "scheduler RPC cancelled after program registration; retaining engine-lifetime program"
                         );
                     }
@@ -815,7 +816,7 @@ impl Lane {
                         LaneCommit::CloseInstance { id }
                     }
                     Err(err) => {
-                        tracing::warn!(instance_id = id, ?err, "scheduler close_instance failed");
+                        tracing::warn!(instance_id = id.0, ?err, "scheduler close_instance failed");
                         LaneCommit::None
                     }
                 }
@@ -832,7 +833,7 @@ impl Lane {
                         })
                     };
                     if let Err(err) = result {
-                        tracing::warn!(channel_id = id, ?err, "scheduler close_channel failed");
+                        tracing::warn!(channel_id = id.0, ?err, "scheduler close_channel failed");
                     }
                 }
                 LaneCommit::None
@@ -851,7 +852,7 @@ impl Lane {
         Ok(bound)
     }
 
-    fn close_channel(engine: &mut EngineBox, id: u64) -> Result<()> {
+    fn close_channel(engine: &mut EngineBox, id: ::engine::ChannelId) -> Result<()> {
         match engine.close_channel(id) {
             Ok(()) | Err(engine::Error::Unsupported { .. }) => Ok(()),
             Err(error) => Err(anyhow::Error::from(error)),
@@ -909,7 +910,7 @@ impl Lane {
                     tracing::error!(
                         operation,
                         cancellation,
-                        channel_id,
+                        channel_id = channel_id.0,
                         ?error,
                         "scheduler cancellation rollback close_channel failed"
                     );

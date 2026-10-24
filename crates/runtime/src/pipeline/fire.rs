@@ -3027,7 +3027,7 @@ fn prove_frame_admissible(k: usize, slots: &[SlotAccess]) -> Result<(), String> 
         publishes: usize,
     }
     struct DeviceRingUse {
-        global_id: u64,
+        global_id: ::engine::ChannelId,
         capacity: u64,
         pressure: u64,
     }

@@ -59,8 +59,8 @@ pub struct Cuda {
     contract_for: ContractFor,
     shell: Option<Shell>,
     caps: Option<Capabilities>,
-    next_fire: FireId,
-    next_frame: FrameId,
+    next_fire: u64,
+    next_frame: u64,
     channels: BTreeMap<ChannelId, Arc<crate::program::Endpoint>>,
     sink: Option<engine::CompletionSink>,
     tap_sink: Option<engine::TapSink>,
@@ -136,7 +136,9 @@ impl Cuda {
         })
     }
 
-    pub fn channel_predictions(&mut self) -> EngineResult<Vec<(u64, Vec<crate::program::Cursor>)>> {
+    pub fn channel_predictions(
+        &mut self,
+    ) -> EngineResult<Vec<(InstanceId, Vec<crate::program::Cursor>)>> {
         Ok(self.loaded_mut()?.channel_predictions())
     }
 
@@ -146,7 +148,7 @@ impl Cuda {
             .map_err(fault)?
             .ok_or(Error::Closed {
                 what: "instance",
-                id,
+                id: id.0,
             })
     }
 
@@ -746,7 +748,7 @@ impl Engine for Cuda {
                 .as_ref()
                 .map_or(engine::Serves::NONE, engine::Serves::of),
         )?;
-        let id = self.next_frame;
+        let id = FrameId(self.next_frame);
         self.next_frame = self.next_frame.wrapping_add(1);
         self.pending = None;
 
@@ -1108,7 +1110,7 @@ impl Cuda {
         at: engine::StepDone,
         announce: bool,
     ) -> EngineResult<(FireTicket, PendingStep)> {
-        let id = self.next_fire;
+        let id = FireId(self.next_fire);
         self.next_fire = self.next_fire.wrapping_add(1);
 
         let done = self

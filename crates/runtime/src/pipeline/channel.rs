@@ -11,13 +11,13 @@ pub const TICKET_NONE: u64 = u64::MAX;
 
 static NEXT_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
 
-pub fn next_channel_id() -> u64 {
-    NEXT_CHANNEL_ID.fetch_add(1, Ordering::Relaxed)
+pub fn next_channel_id() -> engine::ChannelId {
+    engine::ChannelId(NEXT_CHANNEL_ID.fetch_add(1, Ordering::Relaxed))
 }
 
 #[derive(Clone, Debug)]
 pub struct ChannelCell {
-    pub global_id: u64,
+    pub global_id: engine::ChannelId,
     pub shape: Vec<u32>,
     pub dtype: Dtype,
     pub capacity: u32,
@@ -795,8 +795,8 @@ pub struct Channel {
 
 pub fn detach_channel_close_notifications(
     resources: &mut wasmtime::component::ResourceTable,
-) -> Vec<(usize, Vec<u64>)> {
-    let mut by_engine: std::collections::BTreeMap<usize, Vec<u64>> =
+) -> Vec<(usize, Vec<engine::ChannelId>)> {
+    let mut by_engine: std::collections::BTreeMap<usize, Vec<engine::ChannelId>> =
         std::collections::BTreeMap::new();
     for entry in resources.iter_mut() {
         let Some(channel) = entry.downcast_ref::<Channel>() else {
@@ -947,7 +947,7 @@ mod tests {
         ]
     }
 
-    fn publish_wire(cell: &Arc<Mutex<ChannelCell>>, instance_id: u64, wire: &[u8]) {
+    fn publish_wire(cell: &Arc<Mutex<ChannelCell>>, wire: &[u8]) {
         let capacity = cell.lock().unwrap().capacity;
         let mut mirror = vec![0u8; wire.len() * capacity.saturating_add(1) as usize];
         mirror[..wire.len()].copy_from_slice(wire);
@@ -964,7 +964,7 @@ mod tests {
         cell.lock()
             .unwrap()
             .attach_reader_mirror(
-                instance_id,
+                0,
                 mirror.as_ptr() as u64,
                 words.as_ptr() as u64,
                 wire.len() as u32,
@@ -977,7 +977,6 @@ mod tests {
             )
             .unwrap();
         words[1].store(1, Ordering::Release);
-        let _ = instance_id;
     }
 
     #[test]
@@ -1070,12 +1069,11 @@ mod tests {
 
     fn writer_put_reader_take_roundtrip() {
         let cells = bound();
-        let out_id = cells[1].lock().unwrap().global_id;
         assert_eq!(
             cells[1].lock().unwrap().take().unwrap_err(),
             ChannelError::Empty
         );
-        publish_wire(&cells[1], out_id, &5i32.to_le_bytes());
+        publish_wire(&cells[1], &5i32.to_le_bytes());
         assert_eq!(
             cells[1].lock().unwrap().read().unwrap(),
             5i32.to_le_bytes().to_vec(),
@@ -1102,7 +1100,7 @@ mod tests {
         ));
         let cell = Arc::new(Mutex::new(cell));
         let native = vec![1, 0, 0, 1, 1, 0, 1, 0, 1, 1];
-        publish_wire(&cell, 88, &pack_bool(&native));
+        publish_wire(&cell, &pack_bool(&native));
         assert_eq!(cell.lock().unwrap().take().unwrap(), native);
     }
 }

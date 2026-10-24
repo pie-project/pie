@@ -1124,7 +1124,13 @@ impl FrameShell for Shell {
             triples
         };
         let taps = self.self_cond_taps as usize;
-        let mut self_cond_feeds: Vec<(usize, usize, u64, u64, u64)> = Vec::new();
+        let mut self_cond_feeds: Vec<(
+            usize,
+            usize,
+            engine::ChannelId,
+            engine::ChannelId,
+            engine::InstanceId,
+        )> = Vec::new();
         let (mut self_cond_rows, mut self_cond_weights) = if taps == 0 {
             (Vec::new(), Vec::new())
         } else {

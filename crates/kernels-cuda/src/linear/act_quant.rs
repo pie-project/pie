@@ -17,7 +17,7 @@ use cudarc::runtime::sys as rt;
 use dtype::Dtype;
 
 use crate::error::Error;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, stated, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, kernel, refuse, stated};
 use crate::linear::gemm_sm100;
 use crate::tensor::Tensor;
 
@@ -172,10 +172,10 @@ fn launch(
                 .map_err(|_| refuse(op, format!("{blocks} blocks overflow a launch")))?;
             ctx.fire(
                 op,
-                Fire::at(
+                Fire::at(kernel(
                     ACT_QUANT,
-                    symbol(&format!("::pie::linear::act_quant_nvfp4<{mode}, {fan}>")),
-                )
+                    &format!("::pie::linear::act_quant_nvfp4<{mode}, {fan}>"),
+                ))
                 .apply(Launch::flat(threads, BLOCK)),
                 &[
                     src.x.arg(),
@@ -217,12 +217,10 @@ fn launch(
                 .map_err(|_| refuse(op, format!("{blocks} blocks overflow a launch")))?;
             ctx.fire(
                 op,
-                Fire::at(
+                Fire::at(kernel(
                     ACT_QUANT,
-                    symbol(&format!(
-                        "::pie::linear::act_quant_e4m3{wide}<{mode}, {gran}, {fan}>"
-                    )),
-                )
+                    &format!("::pie::linear::act_quant_e4m3{wide}<{mode}, {gran}, {fan}>"),
+                ))
                 .apply(Launch::flat(threads, BLOCK).programmatic(pdl)),
                 &[
                     src.x.arg(),
@@ -287,7 +285,7 @@ pub fn swiglu_quant(
     let int = |v: u32| stated(op, v).map(|v| v.arg());
     ctx.fire(
         op,
-        Fire::at(ACT_QUANT, "::pie::linear::swiglu_quant_e4m3_v8")
+        Fire::at(kernel(ACT_QUANT, "::pie::linear::swiglu_quant_e4m3_v8"))
             .apply(Launch::flat(threads, BLOCK).programmatic(ctx.tuning().pdl)),
         &[
             ArgValue::Ptr(h),
@@ -355,7 +353,7 @@ pub fn fp8_tile_requant(
     }
     ctx.fire(
         op,
-        Fire::at(ACT_QUANT, "::pie::linear::fp8_tile_requant").apply(Launch::grid(
+        Fire::at(kernel(ACT_QUANT, "::pie::linear::fp8_tile_requant")).apply(Launch::grid(
             [cols.div_ceil(128), rows.div_ceil(128), 1],
             [32, 8, 1],
         )),
@@ -391,7 +389,7 @@ pub fn scales_to_atoms(
     })?;
     ctx.fire(
         op,
-        Fire::at(ACT_QUANT, "::pie::linear::scales_to_atoms").apply(Launch::flat(n, BLOCK)),
+        Fire::at(kernel(ACT_QUANT, "::pie::linear::scales_to_atoms")).apply(Launch::flat(n, BLOCK)),
         &[
             ArgValue::Ptr(plane),
             ArgValue::Ptr(atoms),
@@ -782,7 +780,7 @@ pub(crate) fn lay_out_quant_nvfp4(
     let [(up, up_alpha), (down, down_alpha)] = alphas;
     ctx.fire(
         op,
-        Fire::at(ROUTE, "::pie::linear::route_lay_out_quant_nvfp4").apply(
+        Fire::at(kernel(ROUTE, "::pie::linear::route_lay_out_quant_nvfp4")).apply(
             Launch::grid([grid, 1, 1], [256, 1, 1])
                 .smem(smem)
                 .programmatic(ctx.tuning().pdl),
@@ -897,7 +895,7 @@ pub(crate) fn lay_out_with(
     if count <= SMALL_LAYOUT && alphas.len() <= 2 {
         ctx.fire(
             op,
-            Fire::at(ROUTE, "::pie::linear::route_lay_out_small")
+            Fire::at(kernel(ROUTE, "::pie::linear::route_lay_out_small"))
                 .apply(Launch::flat(1024, 1024).smem(8 * experts)),
             &[
                 routes.arg(),
@@ -939,7 +937,7 @@ pub(crate) fn lay_out_with(
     let tally = Launch::flat(count.div_ceil(TALLY_ROUTES) * BLOCK, BLOCK).smem(8 * experts);
     ctx.fire(
         op,
-        Fire::at(ROUTE, "::pie::linear::route_count_tally").apply(tally),
+        Fire::at(kernel(ROUTE, "::pie::linear::route_count_tally")).apply(tally),
         &[
             routes.arg(),
             int(count)?,
@@ -952,7 +950,8 @@ pub(crate) fn lay_out_with(
     ctx.fire(
         op,
         // One block scans the experts' rows into their starts.
-        Fire::at(ROUTE, "::pie::linear::route_offsets_scan").apply(Launch::flat(1024, 1024)),
+        Fire::at(kernel(ROUTE, "::pie::linear::route_offsets_scan"))
+            .apply(Launch::flat(1024, 1024)),
         &[
             ArgValue::Ptr(counts),
             int(experts)?,
@@ -964,7 +963,7 @@ pub(crate) fn lay_out_with(
     )?;
     ctx.fire(
         op,
-        Fire::at(ROUTE, "::pie::linear::route_place_tally").apply(tally),
+        Fire::at(kernel(ROUTE, "::pie::linear::route_place_tally")).apply(tally),
         &[
             routes.arg(),
             int(count)?,
@@ -1002,7 +1001,7 @@ pub(crate) fn gather_back(
     let int = |v: u32| stated(op, v).map(|v| v.arg());
     ctx.fire(
         op,
-        Fire::at(ROUTE, entry).apply(Launch::flat(threads, BLOCK)),
+        Fire::at(kernel(ROUTE, entry)).apply(Launch::flat(threads, BLOCK)),
         &[
             ArgValue::Ptr(grouped),
             ArgValue::Ptr(pos),
@@ -1065,13 +1064,13 @@ pub(crate) fn weighted_gather(
     };
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             COMBINE,
-            symbol(&format!(
+            &format!(
                 "::pie::linear::route_weighted_gather_vec8<{}, {ahead}>",
                 scale != 0
-            )),
-        )
+            ),
+        ))
         .apply(Launch::grid([tokens, blocks, 1], [block, 1, 1])),
         &[
             ArgValue::Ptr(grouped),
@@ -1117,7 +1116,11 @@ pub(crate) fn sum_gather(
     let int = |v: u32| stated(op, v).map(|v| v.arg());
     ctx.fire(
         op,
-        Fire::at(COMBINE, "::pie::linear::route_weighted_gather_vec8<false>").apply(Launch::grid(
+        Fire::at(kernel(
+            COMBINE,
+            "::pie::linear::route_weighted_gather_vec8<false>",
+        ))
+        .apply(Launch::grid(
             [tokens, (n / 8).div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
         )),
@@ -1151,7 +1154,8 @@ pub(crate) fn scatter_f32(
     let int = |x: u32| stated(op, x).map(|x| x.arg());
     ctx.fire(
         op,
-        Fire::at(COMBINE, "::pie::linear::route_scatter_f32").apply(Launch::flat(count, BLOCK)),
+        Fire::at(kernel(COMBINE, "::pie::linear::route_scatter_f32"))
+            .apply(Launch::flat(count, BLOCK)),
         &[
             ArgValue::Ptr(v),
             ArgValue::Ptr(pos),
@@ -1190,7 +1194,8 @@ pub(crate) fn scatter_rows(
     let int = |v: u32| stated(op, v).map(|v| v.arg());
     ctx.fire(
         op,
-        Fire::at(COMBINE, "::pie::linear::route_scatter_rows").apply(Launch::flat(runs, BLOCK)),
+        Fire::at(kernel(COMBINE, "::pie::linear::route_scatter_rows"))
+            .apply(Launch::flat(runs, BLOCK)),
         &[
             x.arg(),
             ArgValue::Ptr(pos),
@@ -1216,7 +1221,7 @@ pub fn expert_alpha(
 ) -> Result<(), Error> {
     ctx.fire(
         op,
-        Fire::at(ROUTE, "::pie::linear::expert_alpha").apply(Launch::flat(experts, BLOCK)),
+        Fire::at(kernel(ROUTE, "::pie::linear::expert_alpha")).apply(Launch::flat(experts, BLOCK)),
         &[
             ArgValue::Ptr(input_scales),
             ArgValue::Ptr(tensor_scales),
@@ -1252,10 +1257,10 @@ pub fn rmsnorm_act_quant_e4m3(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             ACT_QUANT,
             "::pie::linear::rmsnorm_act_quant_e4m3<::pie::bf16>",
-        )
+        ))
         .apply(Launch::per_row(y.rows, 256)),
         &[
             x.arg(),

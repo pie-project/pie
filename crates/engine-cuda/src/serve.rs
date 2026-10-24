@@ -485,7 +485,10 @@ impl Shell {
         self.weights.seats()
     }
 
-    pub fn program_adapter_sink(&self, program_id: u64) -> Result<Option<crate::adapter::Sink>> {
+    pub fn program_adapter_sink(
+        &self,
+        program_id: engine::ProgramId,
+    ) -> Result<Option<crate::adapter::Sink>> {
         let program = self.programs.program(program_id).ok_or_else(|| {
             Fault::program(
                 "serve::shell",
@@ -527,19 +530,19 @@ impl Shell {
     pub fn register_program(
         &mut self,
         registration: &engine::program::ProgramRegistration,
-    ) -> Result<u64> {
+    ) -> Result<engine::ProgramId> {
         self.programs.register(&self.device, registration)
     }
 
     pub fn bind_program(
         &mut self,
-        program_id: u64,
+        program_id: engine::ProgramId,
         seeds: &[(u32, Vec<u8>)],
         extents: eta_exec::Extents,
         geometry: eta_ir::registry::GeometryClass,
         adopted: &[Option<std::sync::Arc<crate::program::Endpoint>>],
-        ids: &[u64],
-    ) -> Result<u64> {
+        ids: &[engine::ChannelId],
+    ) -> Result<engine::InstanceId> {
         let stream = self.device.stream();
         self.programs
             .bind(program_id, seeds, extents, geometry, adopted, ids, stream)
@@ -548,13 +551,13 @@ impl Shell {
     #[must_use]
     pub fn program_ticket_disagreement(
         &self,
-        instance_id: u64,
+        instance_id: engine::InstanceId,
         tickets: &[engine::Ticket],
     ) -> Option<String> {
         self.programs.disagreeing_ticket(instance_id, tickets)
     }
 
-    pub fn program_ready(&self, instance_id: u64) -> Result<Option<u32>> {
+    pub fn program_ready(&self, instance_id: engine::InstanceId) -> Result<Option<u32>> {
         self.programs.ready(instance_id)
     }
 
@@ -595,22 +598,25 @@ impl Shell {
 
     /// Instance `instance_id`, what has landed settled: a take reads only
     /// cells settled fires put, and a publish is staged behind airborne fires.
-    pub fn program_instance(&mut self, instance_id: u64) -> Result<Option<&mut ProgramSession>> {
+    pub fn program_instance(
+        &mut self,
+        instance_id: engine::InstanceId,
+    ) -> Result<Option<&mut ProgramSession>> {
         self.reap_landed_guests()?;
         Ok(self.programs.instance_mut(instance_id))
     }
 
     #[must_use]
-    pub fn channel_predictions(&self) -> Vec<(u64, Vec<crate::program::Cursor>)> {
+    pub fn channel_predictions(&self) -> Vec<(engine::InstanceId, Vec<crate::program::Cursor>)> {
         self.programs.predictions()
     }
 
-    pub fn close_program_instance(&mut self, instance_id: u64) -> Result<()> {
+    pub fn close_program_instance(&mut self, instance_id: engine::InstanceId) -> Result<()> {
         self.reap_landed_guests()?;
         self.programs.close_instance(instance_id)
     }
 
-    pub fn fire_program(&mut self, instance_id: u64) -> Result<Fired> {
+    pub fn fire_program(&mut self, instance_id: engine::InstanceId) -> Result<Fired> {
         self.reap_guests()?;
         self.programs.fire(&self.device, instance_id)
     }
@@ -794,8 +800,8 @@ pub(crate) struct PortFeedPlan {
     pub(crate) rows: u32,
     pub(crate) bytes: u64,
     pub(crate) cast: bool,
-    pub(crate) channel: u64,
-    pub(crate) instance: u64,
+    pub(crate) channel: engine::ChannelId,
+    pub(crate) instance: engine::InstanceId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -806,8 +812,8 @@ pub(crate) struct VoxelFeedPlan {
     pub(crate) width: u32,
     pub(crate) cast: bool,
     pub(crate) bytes: u64,
-    pub(crate) channel: u64,
-    pub(crate) instance: u64,
+    pub(crate) channel: engine::ChannelId,
+    pub(crate) instance: engine::InstanceId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -838,7 +844,13 @@ pub struct Prepared<'a> {
     mrope_positions: Vec<i32>,
     self_cond_rows: Vec<i32>,
     self_cond_weights: Vec<f32>,
-    self_cond_feeds: Vec<(usize, usize, u64, u64, u64)>,
+    self_cond_feeds: Vec<(
+        usize,
+        usize,
+        engine::ChannelId,
+        engine::ChannelId,
+        engine::InstanceId,
+    )>,
     packings: Vec<poem_exec::fire::Packed>,
     port_feeds: Vec<PortFeedPlan>,
     voxel_feeds: Vec<VoxelFeedPlan>,

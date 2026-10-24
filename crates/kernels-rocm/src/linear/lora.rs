@@ -2,7 +2,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::Tensor;
 
@@ -112,7 +112,7 @@ pub fn correct(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::lora_combine<{t}>")))
+        Fire::at(kernel(FILE, &format!("::pie::linear::lora_combine<{t}>")))
             .apply(Launch::grid(grid, [BLOCK, 1, 1])),
         &[
             routes.arg(),

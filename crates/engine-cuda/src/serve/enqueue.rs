@@ -31,7 +31,7 @@ use super::{Golden, Graphs, Prepared, Readback, Shell};
 
 #[derive(Debug)]
 pub(super) struct GuestBatch {
-    launched: Vec<(usize, u64)>,
+    launched: Vec<(usize, engine::InstanceId)>,
     pub(super) seq: u64,
     /// Recorded behind the batch's programs.
     landed: Event,
@@ -42,7 +42,7 @@ pub(super) type Owed = std::collections::VecDeque<GuestBatch>;
 
 impl GuestBatch {
     /// The instances whose epilogues this batch launched.
-    pub(super) fn instances(&self) -> impl Iterator<Item = u64> + '_ {
+    pub(super) fn instances(&self) -> impl Iterator<Item = engine::InstanceId> + '_ {
         self.launched.iter().map(|&(_, instance)| instance)
     }
 }
@@ -1386,7 +1386,7 @@ impl FireCtx<'_> {
 
 #[derive(Default)]
 struct AirborneFires {
-    launched: Vec<(usize, u64)>,
+    launched: Vec<(usize, engine::InstanceId)>,
     rings: Vec<usize>,
     settled: Vec<(usize, Fired)>,
     flown: bool,
@@ -1398,7 +1398,7 @@ impl AirborneFires {
         device: &Context,
         programs: &mut ProgramPlane,
         tag: usize,
-        instance: u64,
+        instance: engine::InstanceId,
     ) -> Result<Option<Fired>> {
         if self.launched.is_empty() && !self.flown && programs.staged() != 0 {
             programs.abandon_wave();
@@ -1540,7 +1540,7 @@ fn settle_batch(
     }
 }
 
-fn committed_or(fired: Fired, instance: u64, at: &str) -> Result<()> {
+fn committed_or(fired: Fired, instance: engine::InstanceId, at: &str) -> Result<()> {
     match fired {
         Fired::Committed => Ok(()),
         Fired::Blocked(channel) => Err(Fault::program(
@@ -1573,7 +1573,7 @@ mod tests {
     fn a_pass_that_does_not_commit_on_an_admitted_fire_errors_by_name() {
         let attached = Attached {
             lane: 0,
-            instance: 77,
+            instance: engine::InstanceId(77),
             at: Boundary::Epilogue,
         };
         committed_or(Fired::Committed, attached.instance, "epilogue")

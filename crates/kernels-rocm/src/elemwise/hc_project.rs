@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::elemwise::hc::MAX_HC_MULT;
 use crate::elemwise::hc::rmsnorm_f32;
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::Tensor;
 
@@ -142,7 +142,7 @@ pub fn project(
     if !fan.is_multiple_of(64) || !normed.ptr.is_multiple_of(16) || !hc_fn.ptr.is_multiple_of(16) {
         return ctx.fire(
             OP,
-            Fire::at(FILE, "::pie::elemwise::hc_project<256>")
+            Fire::at(kernel(FILE, "::pie::elemwise::hc_project<256>"))
                 .apply(Launch::grid([rows * mix_hc, 1, 1], [BLOCK, 1, 1])),
             &[
                 normed.arg(),
@@ -159,13 +159,13 @@ pub fn project(
     let part = plan.part(ctx, OP, rows, mix_hc, false)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
+            &format!(
                 "::pie::elemwise::hc_project_tiled<{mix_hc}, {}, {PROJECT_WAVES}>",
                 plan.nt
-            )),
-        )
+            ),
+        ))
         .apply(plan.launch()),
         &[
             normed.arg(),
@@ -183,13 +183,10 @@ pub fn project(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
-                "::pie::elemwise::hc_project_sum<{mix_hc}, {}>",
-                plan.slices
-            )),
-        )
+            &format!("::pie::elemwise::hc_project_sum<{mix_hc}, {}>", plan.slices),
+        ))
         .apply(Launch::flat(rows * mix_hc, 64)),
         &[part, mixes.arg(), stated(OP, rows)?.arg(), ctx.stage()],
     )
@@ -250,13 +247,13 @@ pub fn norm_project(
     let part = plan.part(ctx, OP, rows, mix_hc + 1, true)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
+            &format!(
                 "::pie::elemwise::hc_norm_project_tiled<{t}, {mix_hc}, {}, {PROJECT_WAVES}>",
                 plan.nt
-            )),
-        )
+            ),
+        ))
         .apply(plan.launch()),
         &[
             streams.arg(),
@@ -270,13 +267,13 @@ pub fn norm_project(
     )?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
+            &format!(
                 "::pie::elemwise::hc_norm_project_sum<{mix_hc}, {}>",
                 plan.slices
-            )),
-        )
+            ),
+        ))
         .apply(Launch::per_row(rows, (mix_hc + 64) / 64 * 64)),
         &[
             part,

@@ -1,6 +1,6 @@
 use crate::attn::kv;
 use crate::error::Error;
-use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::Tensor;
 
 pub mod voxel;
@@ -88,12 +88,10 @@ pub fn bidirectional(
 
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             DENSE,
-            symbol(&format!(
-                "::pie::attn::dense_bidirectional<{stamp}, {WARPS}>"
-            )),
-        )
+            &format!("::pie::attn::dense_bidirectional<{stamp}, {WARPS}>"),
+        ))
         .apply(Launch::grid([rows.unsigned_abs(), num_q_heads, 1], [BLOCK, 1, 1]).smem(smem)),
         &[
             q.arg(),

@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
 const FILE: &str = "linear/kquant.cu";
@@ -122,13 +122,13 @@ fn kquant(
     let tile = (BLOCK_LANES / WARP) * ROWS_PER_WARP;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
+            &format!(
                 "::pie::linear::{}<{t}, ::pie::i32({ROWS_PER_WARP})>",
                 scheme.point()
-            )),
-        )
+            ),
+        ))
         .apply(Launch::grid(
             [y.rows, n.div_ceil(tile), 1],
             [BLOCK_LANES, 1, 1],

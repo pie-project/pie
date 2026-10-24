@@ -1,6 +1,6 @@
 use crate::error::Error;
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, aligned16, count, dtype_dispatch, refuse, stated,
+    Arg, ArgValue, Ctx, Fire, Launch, aligned16, count, dtype_dispatch, kernel, refuse, stated,
 };
 use crate::tensor::Tensor;
 use crate::voxels::lane_pair;
@@ -237,18 +237,14 @@ pub fn conv3d_on(
 
     let (entry, tile, block, smem) = if mma {
         (
-            crate::jit::symbol(&format!("::pie::conv::conv3d_mma<{MMA_STAGES}>")),
+            format!("::pie::conv::conv3d_mma<{MMA_STAGES}>"),
             MMA_TILE,
             MMA_BLOCK,
             MMA_SMEM,
         )
     } else {
         (
-            if vectorised {
-                "::pie::conv::conv3d_direct<true>"
-            } else {
-                "::pie::conv::conv3d_direct<false>"
-            },
+            format!("::pie::conv::conv3d_direct<{vectorised}>"),
             DIRECT_TILE,
             DIRECT_BLOCK,
             0,
@@ -261,7 +257,7 @@ pub fn conv3d_on(
     .smem(smem);
     ctx.fire(
         OP,
-        Fire::at(FILE, entry).apply(launch),
+        Fire::at(kernel(FILE, &entry)).apply(launch),
         &[
             x.arg(),
             grid.arg(),
@@ -305,7 +301,7 @@ pub fn conv_weight_taps_major(
     let (blocks, _) = crate::voxels::flat_elements(OP, src, BLOCK)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::conv::conv_weight_taps_major")
+        Fire::at(kernel(FILE, "::pie::conv::conv_weight_taps_major"))
             .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[src.arg(), dst.arg(), c_out.arg(), c_in.arg(), taps.arg()],
     )

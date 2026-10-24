@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 use crate::error::Error;
 use crate::jit::{
-    Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::Tensor;
 use dtype::Dtype;
@@ -44,7 +44,7 @@ pub fn embed(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, instantiation).apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
+        Fire::at(kernel(FILE, instantiation)).apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
             ids.arg(),
             table.arg(),
@@ -74,8 +74,11 @@ pub fn embed_vocab_shard(
     let rank = comm_rank(ctx, OP)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::gather::embed_vocab_shard<::pie::bf16>")
-            .apply(Launch::grid([rows, 1, 1], [BLOCK, 1, 1])),
+        Fire::at(kernel(
+            FILE,
+            "::pie::gather::embed_vocab_shard<::pie::bf16>",
+        ))
+        .apply(Launch::grid([rows, 1, 1], [BLOCK, 1, 1])),
         &[
             ids.arg(),
             table.arg(),
@@ -138,7 +141,7 @@ pub fn embed_scale_add(
         .map_err(|_| refuse(OP, format!("{total} gather lanes do not fit a 32-bit grid")))?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::gather::embed_scale_add")
+        Fire::at(kernel(FILE, "::pie::gather::embed_scale_add"))
             .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
             ids.arg(),
@@ -206,7 +209,7 @@ pub fn embed_scale_add_select(
         .map_err(|_| refuse(OP, format!("{total} gather lanes do not fit a 32-bit grid")))?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::gather::embed_scale_add_select")
+        Fire::at(kernel(FILE, "::pie::gather::embed_scale_add_select"))
             .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
             ids.arg(),
@@ -258,7 +261,7 @@ pub fn embed_concat(
     })?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::gather::embed_concat<{t}>")))
+        Fire::at(kernel(FILE, &format!("::pie::gather::embed_concat<{t}>")))
             .apply(Launch::flat(lanes, BLOCK)),
         &[
             ids.arg(),
@@ -328,10 +331,10 @@ pub fn embed_concat_mlxu4(
     })?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::gather::embed_concat_mlxu4<{t}>")),
-        )
+            &format!("::pie::gather::embed_concat_mlxu4<{t}>"),
+        ))
         .apply(Launch::flat(lanes, BLOCK)),
         &[
             ids.arg(),
@@ -417,7 +420,7 @@ pub fn embed_mlx_affine(
     })?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::gather::{entry}<{t}>")))
+        Fire::at(kernel(FILE, &format!("::pie::gather::{entry}<{t}>")))
             .apply(Launch::flat(lanes, BLOCK)),
         &[
             ids.arg(),
@@ -490,7 +493,7 @@ fn gather(
     let entry = entry.replace('T', t);
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&format!("::pie::gather::{entry}")))
+        Fire::at(kernel(FILE, &format!("::pie::gather::{entry}")))
             .apply(Launch::flat(lanes, BLOCK)),
         &[
             ids.arg(),
@@ -660,7 +663,7 @@ pub fn embed_weighted(
         .min(MAX_BLOCK);
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::gather::embed_weighted<{t}>")))
+        Fire::at(kernel(FILE, &format!("::pie::gather::embed_weighted<{t}>")))
             .apply(Launch::per_row(rows, threads)),
         &[
             ids.arg(),

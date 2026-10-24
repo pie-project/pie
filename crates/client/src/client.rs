@@ -1,7 +1,7 @@
 use crate::crypto::ParsedPrivateKey;
+use crate::error::{Error, Result};
 use crate::message::{CHUNK_SIZE_BYTES, ClientMessage, Props, ServerMessage};
 use crate::utils::IdPool;
-use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -113,10 +113,7 @@ impl Process {
             process_id: self.id.clone(),
             message: message.to_string(),
         };
-        self.inner
-            .ws_writer_tx
-            .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
-        Ok(())
+        self.inner.send(&msg)
     }
 
     pub async fn transfer_file(&self, blob: &[u8]) -> Result<()> {
@@ -138,25 +135,20 @@ impl Process {
                 total_chunks,
                 chunk_data: blob[start..end].to_vec(),
             };
-            self.inner
-                .ws_writer_tx
-                .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
+            self.inner.send(&msg)?;
         }
         Ok(())
     }
 
     pub async fn recv(&mut self) -> Result<ProcessEvent> {
-        self.event_rx
-            .recv()
-            .await
-            .ok_or(anyhow!("Event channel closed"))
+        self.event_rx.recv().await.ok_or(Error::EventsClosed)
     }
 
     pub fn try_recv(&mut self) -> Result<Option<ProcessEvent>> {
         match self.event_rx.try_recv() {
             Ok(event) => Ok(Some(event)),
             Err(mpsc::error::TryRecvError::Empty) => Ok(None),
-            Err(mpsc::error::TryRecvError::Disconnected) => Err(anyhow!("Event channel closed")),
+            Err(mpsc::error::TryRecvError::Disconnected) => Err(Error::EventsClosed),
         }
     }
 
@@ -164,7 +156,7 @@ impl Process {
         loop {
             match self.recv().await? {
                 ProcessEvent::Return(value) => return Ok(value),
-                ProcessEvent::Error(e) => return Err(anyhow!("inferlet returned an error: {e}")),
+                ProcessEvent::Error(e) => return Err(Error::Inferlet(e)),
                 ProcessEvent::Stdout(s) | ProcessEvent::Stderr(s) => eprint!("{s}"),
                 ProcessEvent::Message(_) | ProcessEvent::File(_) => {}
             }
@@ -174,22 +166,24 @@ impl Process {
 
 impl Client {
     pub async fn connect(ws_host: &str) -> Result<Client> {
-        Self::connect_inner(connect_async(ws_host).await?.0)
+        let (ws_stream, _) = connect_async(ws_host).await.map_err(Error::Connect)?;
+        Ok(Self::connect_inner(ws_stream))
     }
 
     pub async fn connect_with_identity(ws_host: &str, identity: &str) -> Result<Client> {
-        let mut request = ws_host.into_client_request()?;
-        request
-            .headers_mut()
-            .insert("x-pie-identity", HeaderValue::from_str(identity)?);
-        Self::connect_inner(connect_async(request).await?.0)
+        let mut request = ws_host.into_client_request().map_err(Error::Connect)?;
+        let identity = HeaderValue::from_str(identity)
+            .map_err(|e| Error::InvalidInput(format!("invalid identity {identity:?}: {e}")))?;
+        request.headers_mut().insert("x-pie-identity", identity);
+        let (ws_stream, _) = connect_async(request).await.map_err(Error::Connect)?;
+        Ok(Self::connect_inner(ws_stream))
     }
 
     fn connect_inner(
         ws_stream: tokio_tungstenite::WebSocketStream<
             tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
         >,
-    ) -> Result<Client> {
+    ) -> Client {
         let (mut ws_write, mut ws_read) = ws_stream.split();
         let (ws_writer_tx, mut ws_writer_rx) = unbounded_channel();
 
@@ -226,11 +220,11 @@ impl Client {
             handle_server_termination(&reader_inner).await;
         });
 
-        Ok(Client {
+        Client {
             inner,
             reader_handle,
             writer_handle,
-        })
+        }
     }
 
     pub async fn close(self) -> Result<()> {
@@ -242,34 +236,24 @@ impl Client {
         reader_handle.abort();
         let _ = reader_handle.await;
         drop(inner);
-        writer_handle.await?;
-        Ok(())
+        writer_handle
+            .await
+            .map_err(|e| Error::Internal(format!("writer task failed: {e}")))
     }
 
     async fn send_msg_and_wait(&self, mut msg: ClientMessage) -> Result<(bool, String)> {
         let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
-        let corr_id_ref = match &mut msg {
-            ClientMessage::AuthIdentify { corr_id, .. }
-            | ClientMessage::AuthProve { corr_id, .. }
-            | ClientMessage::CheckProgram { corr_id, .. }
-            | ClientMessage::TerminateProcess { corr_id, .. }
-            | ClientMessage::Query { corr_id, .. }
-            | ClientMessage::AddProgram { corr_id, .. }
-            | ClientMessage::LaunchProcess { corr_id, .. }
-            | ClientMessage::ListProcesses { corr_id }
-            | ClientMessage::Ping { corr_id } => corr_id,
-            _ => anyhow::bail!("Invalid message type for this helper"),
+        let Some(corr_id_ref) = msg.corr_id_mut() else {
+            return Err(Error::Internal(
+                "a message with no correlation id has no reply to wait for".to_string(),
+            ));
         };
         *corr_id_ref = *corr_id_guard;
 
         let (tx, rx) = oneshot::channel();
         self.inner.pending_requests.insert(*corr_id_guard, tx);
-        self.inner
-            .ws_writer_tx
-            .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
-
-        let (ok, result) = rx.await?;
-        Ok((ok, result))
+        self.inner.send(&msg)?;
+        rx.await.map_err(|_| Error::Disconnected)
     }
 
     pub async fn authenticate(
@@ -281,13 +265,12 @@ impl Client {
             corr_id: 0,
             username: username.to_string(),
         };
-        let (ok, result) = self
-            .send_msg_and_wait(msg)
-            .await
-            .context("Failed to send identification message to engine")?;
+        let (ok, result) = self.send_msg_and_wait(msg).await?;
 
         if !ok {
-            anyhow::bail!("Username '{}' rejected by engine: {}", username, result)
+            return Err(Error::Auth(format!(
+                "Username '{username}' rejected by engine: {result}"
+            )));
         }
 
         if result == "Authenticated (Engine disabled authentication)"
@@ -296,12 +279,16 @@ impl Client {
             return Ok(());
         }
 
-        let private_key = private_key
-            .context("Client private key is required when engine uses public key authentication")?;
+        let private_key = private_key.ok_or_else(|| {
+            Error::Auth(
+                "Client private key is required when engine uses public key authentication"
+                    .to_string(),
+            )
+        })?;
 
         let challenge = base64::engine::general_purpose::STANDARD
             .decode(result.as_bytes())
-            .context("Failed to decode challenge from base64")?;
+            .map_err(|e| Error::Protocol(format!("Failed to decode challenge from base64: {e}")))?;
 
         let signature_bytes = private_key.sign(&challenge)?;
         let signature = base64::engine::general_purpose::STANDARD.encode(&signature_bytes);
@@ -311,18 +298,13 @@ impl Client {
             signature,
         };
 
-        let (ok, result) = self
-            .send_msg_and_wait(msg)
-            .await
-            .context("Failed to send signature message to engine")?;
+        let (ok, result) = self.send_msg_and_wait(msg).await?;
         if ok {
             Ok(())
         } else {
-            anyhow::bail!(
-                "Signature verification failed for username '{}': {}",
-                username,
-                result
-            )
+            Err(Error::Auth(format!(
+                "Signature verification failed for username '{username}': {result}"
+            )))
         }
     }
 
@@ -336,7 +318,7 @@ impl Client {
         if ok {
             Ok(result)
         } else {
-            anyhow::bail!("Query failed: {}", result)
+            Err(Error::request("Query", result))
         }
     }
 
@@ -349,10 +331,9 @@ impl Client {
             LazyLock::new(|| Regex::new(r"^([a-zA-Z0-9][a-zA-Z0-9_-]*)@(\d+\.\d+\.\d+)$").unwrap());
 
         let caps = RE.captures(inferlet).ok_or_else(|| {
-            anyhow!(
-                "Invalid program identifier '{}': expected 'name@major.minor.patch'",
-                inferlet
-            )
+            Error::InvalidInput(format!(
+                "Invalid program identifier '{inferlet}': expected 'name@major.minor.patch'"
+            ))
         })?;
         let msg = ClientMessage::CheckProgram {
             corr_id: 0,
@@ -363,7 +344,7 @@ impl Client {
         if ok {
             Ok(result == "true")
         } else {
-            anyhow::bail!("CheckProgram failed: {}", result)
+            Err(Error::request("CheckProgram", result))
         }
     }
 
@@ -373,11 +354,14 @@ impl Client {
         version: Option<&str>,
         force_overwrite: bool,
     ) -> Result<String> {
-        let blob = fs::read(path).with_context(|| format!("Failed to read {:?}", path))?;
+        let blob = fs::read(path).map_err(|source| Error::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
         let file = path
             .file_name()
             .and_then(|f| f.to_str())
-            .with_context(|| format!("{:?} has no file name", path))?;
+            .ok_or_else(|| Error::InvalidInput(format!("{path:?} has no file name")))?;
         self.add_program_bytes(&blob, file, version, force_overwrite)
             .await
     }
@@ -414,16 +398,14 @@ impl Client {
                 total_chunks,
                 chunk_data: blob[start..end].to_vec(),
             };
-            self.inner
-                .ws_writer_tx
-                .send(Message::Binary(Bytes::from(encode::to_vec_named(&msg)?)))?;
+            self.inner.send(&msg)?;
         }
 
-        let (ok, result) = rx.await?;
+        let (ok, result) = rx.await.map_err(|_| Error::Disconnected)?;
         if ok {
             Ok(result)
         } else {
-            anyhow::bail!("Program install failed: {}", result)
+            Err(Error::request("Program install", result))
         }
     }
 
@@ -458,7 +440,7 @@ impl Client {
         let (ok, result) = self.send_msg_and_wait(msg).await?;
 
         if !ok {
-            anyhow::bail!("Launch process failed: {}", result);
+            return Err(Error::request("Launch process", result));
         }
 
         let process_id = result;
@@ -472,7 +454,8 @@ impl Client {
     }
 
     pub async fn attach_process(&self, process_id: &str) -> Result<Process> {
-        let _uuid = Uuid::parse_str(process_id)?;
+        Uuid::parse_str(process_id)
+            .map_err(|e| Error::InvalidInput(format!("invalid process id '{process_id}': {e}")))?;
         let msg = ClientMessage::AttachProcess {
             corr_id: 0,
             process_id: process_id.to_string(),
@@ -480,7 +463,7 @@ impl Client {
         let (ok, result) = self.send_msg_and_wait(msg).await?;
 
         if !ok {
-            anyhow::bail!("Attach process failed: {}", result);
+            return Err(Error::request("Attach process", result));
         }
 
         let rx = attach_process_events(&self.inner, process_id);
@@ -498,7 +481,7 @@ impl Client {
         if ok {
             Ok(())
         } else {
-            anyhow::bail!("Ping failed: {}", result)
+            Err(Error::request("Ping", result))
         }
     }
 
@@ -519,7 +502,7 @@ impl Client {
                 .collect();
             Ok(ids)
         } else {
-            anyhow::bail!("List processes failed: {}", result)
+            Err(Error::request("List processes", result))
         }
     }
 
@@ -532,8 +515,17 @@ impl Client {
         if ok {
             Ok(())
         } else {
-            anyhow::bail!("Terminate process failed: {}", result)
+            Err(Error::request("Terminate process", result))
         }
+    }
+}
+
+impl ClientInner {
+    fn send(&self, msg: &ClientMessage) -> Result<()> {
+        let bin = encode::to_vec_named(msg).map_err(Error::Encode)?;
+        self.ws_writer_tx
+            .send(Message::Binary(Bytes::from(bin)))
+            .map_err(|_| Error::Disconnected)
     }
 }
 

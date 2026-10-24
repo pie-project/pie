@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 use crate::error::Error;
 
-use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, refuse};
+use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, kernel, refuse};
 use crate::tensor::Tensor;
 
 const FILE: &str = "collective/all_reduce.cu";
@@ -51,7 +51,7 @@ impl Peers {
     pub fn answer(&self, ctx: &Ctx, status: u64) -> Result<(), Error> {
         ctx.fire(
             "collective.peers_answer",
-            Fire::at(FILE, "::pie::collective::peers_answer")
+            Fire::at(kernel(FILE, "::pie::collective::peers_answer"))
                 .apply(Launch::grid([1, 1, 1], [1, 1, 1])),
             &[
                 ArgValue::Ptr(self.stages),
@@ -82,7 +82,7 @@ impl Peers {
             let packs = bytes / 16;
             ctx.fire(
                 op,
-                Fire::at(FILE, entry).apply(Self::launch(packs)),
+                Fire::at(kernel(FILE, entry)).apply(Self::launch(packs)),
                 &[
                     ArgValue::Ptr(self.stages),
                     ArgValue::Ptr(self.signals),
@@ -115,7 +115,8 @@ impl Peers {
             copy(ctx, op, self.stage, x.ptr + first * row, rows * row)?;
             ctx.fire(
                 op,
-                Fire::at(FILE, entry).apply(Self::launch(rows * row / 16 * u64::from(self.world))),
+                Fire::at(kernel(FILE, entry))
+                    .apply(Self::launch(rows * row / 16 * u64::from(self.world))),
                 &[
                     ArgValue::Ptr(self.stages),
                     ArgValue::Ptr(self.signals),

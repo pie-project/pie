@@ -9,7 +9,7 @@ use crate::attn::kv;
 use crate::attn::kv_dequant;
 use crate::attn::plan::PrefillPlan;
 use crate::error::Error;
-use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, symbol};
+use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, kernel};
 use crate::linear::gemm_sm100::supported;
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
@@ -272,12 +272,9 @@ pub(crate) fn try_prefill(
         };
         ctx.fire(
             op,
-            Fire::at(
-                PREFILL_SM100,
-                symbol(&format!(
+            Fire::at(kernel(PREFILL_SM100, &format!(
                     "::pie::attn::fmha::tc5_fmha_prefill<{dqk}, {bkv}, {stages}, {dv}, {io}, {pair}>"
-                )),
-            )
+                )))
             .apply(
                 Launch::grid(grid, [threads, 1, 1])
                     .smem(smem_bytes(dqk, dv, bkv, stages)),
@@ -305,13 +302,13 @@ pub(crate) fn try_prefill(
     // Two blocks a key head, each landing half of O, side by side in y.
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             PREFILL_SM100,
-            symbol(&format!(
+            &format!(
                 "::pie::attn::fmha::tc5_fmha_prefill_wide<{}, {}, {}, {}, {}>",
                 w.d, w.bkv, w.qt, w.atoms, w.slots
-            )),
-        )
+            ),
+        ))
         .apply(
             Launch::grid([bound, kv_heads * (w.d / 256), 1], [192, 1, 1]).smem(wide_smem_bytes(&w)),
         ),
@@ -440,12 +437,10 @@ pub fn prefill_planes(ctx: &Ctx, op: &'static str, at: &Planes) -> Result<(), Er
     let smem = smem_bytes(dqk, dv, bkv, stages);
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             PREFILL_SM100,
-            symbol(&format!(
-                "::pie::attn::fmha::tc5_fmha_prefill<{dqk}, {bkv}, {stages}, {dv}>"
-            )),
-        )
+            &format!("::pie::attn::fmha::tc5_fmha_prefill<{dqk}, {bkv}, {stages}, {dv}>"),
+        ))
         // A block walks items, an SM a block.
         .apply(Launch::grid([sms.min(bound * at.heads).max(1), 1, 1], [192, 1, 1]).smem(smem)),
         &[

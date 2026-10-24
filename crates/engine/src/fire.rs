@@ -2,13 +2,31 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
-use crate::channel::Ticket;
+use crate::channel::{ChannelId, Ticket};
 use crate::error::{Error, Result};
 use crate::program::InstanceId;
 
-pub type FireId = u64;
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+pub struct FireId(pub u64);
 
-pub type FrameId = u64;
+impl std::fmt::Display for FireId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+pub struct FrameId(pub u64);
+
+impl std::fmt::Display for FrameId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Mask {
@@ -275,7 +293,7 @@ pub enum PortKind {
 pub struct PortFeed {
     pub kind: PortKind,
     pub port: u8,
-    pub channel: u64,
+    pub channel: ChannelId,
 }
 
 impl Lane {
@@ -438,12 +456,12 @@ pub struct SelfCondInput {
     pub rows: Vec<u32>,
     pub weight_bits: Vec<u32>,
     #[serde(default)]
-    pub channels: Option<(u64, u64)>,
+    pub channels: Option<(ChannelId, ChannelId)>,
 }
 
 impl SelfCondInput {
     #[must_use]
-    pub fn from_channels(taps: u32, rows: u64, weights: u64) -> Self {
+    pub fn from_channels(taps: u32, rows: ChannelId, weights: ChannelId) -> Self {
         Self {
             taps,
             rows: Vec::new(),

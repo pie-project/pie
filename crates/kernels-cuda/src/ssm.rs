@@ -2,7 +2,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated,
 };
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 

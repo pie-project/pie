@@ -1,6 +1,6 @@
 use crate::error::Error;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
+use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::Tensor;
 
 const BLOCK: u32 = 256;
@@ -31,10 +31,10 @@ pub fn split_q_b(
     })?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             "attn/mla.hip",
-            crate::jit::symbol(&format!("::pie::attn::mla_split_q_b<{t}, {vec}>")),
-        )
+            &format!("::pie::attn::mla_split_q_b<{t}, {vec}>"),
+        ))
         .apply(Launch::flat(total.unsigned_abs(), BLOCK)),
         &[
             q_b.arg(),

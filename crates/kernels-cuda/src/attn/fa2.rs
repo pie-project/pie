@@ -2,7 +2,7 @@
 use crate::error::Error;
 
 use crate::attn::plan::Device;
-use crate::jit::{ArgValue, Ctx, Fire, Launch, refuse, symbol};
+use crate::jit::{ArgValue, Ctx, Fire, Launch, kernel, refuse};
 
 pub const FILE: &str = "attn/fa2.cu";
 
@@ -50,7 +50,7 @@ fn decode_symbol(
     g: &DecodeGeometry,
     arm: DecodeArm,
     kv: KvWidth,
-) -> Result<&'static str, Error> {
+) -> Result<String, Error> {
     instantiated(op, g.head_dim)?;
     let (variant, params) = match arm {
         DecodeArm::Full => ("VariantFull", "DecodeParams"),
@@ -64,7 +64,7 @@ fn decode_symbol(
     // An e4m3 pool's pages read as they are: every arm, over the same params
     // with e4m3 pages (`attn.cuh`'s `*8` spellings).
     let width = if kv == KvWidth::E4M3 { "8" } else { "" };
-    Ok(symbol(&format!(
+    Ok(format!(
         "::pie::attn::fa2::BatchDecodeWithPagedKVCacheKernel<\
          ::pie::attn::fa2::PosEncodingMode::kNone, \
          {ns}, {tile}, {vec}, {bdx}, {bdy}, {bdz}, \
@@ -75,7 +75,7 @@ fn decode_symbol(
         bdx = g.bdx,
         bdy = g.bdy,
         bdz = g.bdz,
-    )))
+    ))
 }
 
 fn prefill_symbol(
@@ -83,7 +83,7 @@ fn prefill_symbol(
     g: &PrefillGeometry,
     arm: PrefillArm,
     kv: KvWidth,
-) -> Result<&'static str, Error> {
+) -> Result<String, Error> {
     instantiated(op, g.head_dim)?;
     let (mask, variant, params) = match arm {
         PrefillArm::CausalFullSoftcap => ("kCausal", "VariantFullSoftcap", "PrefillParams"),
@@ -102,15 +102,13 @@ fn prefill_symbol(
     // An e4m3 pool's pages read as they are: every arm, over the same params
     // with e4m3 pages (`attn.cuh`'s `*8` spellings).
     let (params, pages) = if kv == KvWidth::E4M3 {
-        let params = symbol(&format!("{params}8"));
-        (
-            params,
-            symbol(&format!(", ::pie::attn::fa2::{params}, __nv_fp8_e4m3")),
-        )
+        let params = format!("{params}8");
+        let pages = format!(", ::pie::attn::fa2::{params}, __nv_fp8_e4m3");
+        (params, pages)
     } else {
-        (params, "")
+        (params.to_owned(), String::new())
     };
-    Ok(symbol(&format!(
+    Ok(format!(
         "::pie::attn::fa2::BatchPrefillWithPagedKVCacheKernel<\
          ::pie::attn::fa2::PagedTraits<::pie::attn::fa2::MaskMode::{mask}, \
          {q}, {mmaq}, {kv}, {dqk}, {dvo}, {wq}, {wkv}, \
@@ -122,7 +120,7 @@ fn prefill_symbol(
         dvo = g.num_mma_d_vo,
         wq = g.num_warps_q,
         wkv = g.num_warps_kv,
-    )))
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,7 +136,7 @@ fn prefill_ragged_symbol(
     op: &'static str,
     g: &PrefillGeometry,
     arm: RaggedArm,
-) -> Result<&'static str, Error> {
+) -> Result<String, Error> {
     instantiated(op, g.head_dim)?;
     let (mask, variant, params) = match arm {
         RaggedArm::Full => ("kNone", "VariantFull", "RaggedParams"),
@@ -147,7 +145,7 @@ fn prefill_ragged_symbol(
         RaggedArm::ClassTable => ("kCustom", "ClassTable", "RaggedClassParams"),
         RaggedArm::RelativeBias => ("kNone", "RelativeBias", "RaggedBiasParams"),
     };
-    Ok(symbol(&format!(
+    Ok(format!(
         "::pie::attn::fa2::BatchPrefillWithRaggedKVCacheKernel<\
          ::pie::attn::fa2::PagedTraits<::pie::attn::fa2::MaskMode::{mask}, \
          {q}, {mmaq}, {kv}, {dqk}, {dvo}, {wq}, {wkv}, \
@@ -159,7 +157,7 @@ fn prefill_ragged_symbol(
         dvo = g.num_mma_d_vo,
         wq = g.num_warps_q,
         wkv = g.num_warps_kv,
-    )))
+    ))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -197,7 +195,7 @@ pub(crate) fn decode<P>(
 
     ctx.fire(
         op,
-        Fire::at(FILE, decode_symbol(op, &geometry, at.arm, at.kv)?).apply(
+        Fire::at(kernel(FILE, &decode_symbol(op, &geometry, at.arm, at.kv)?)).apply(
             Launch::grid(
                 DecodeGeometry::grid(at.padded_batch_size, at.num_kv_heads),
                 geometry.block(),
@@ -219,7 +217,7 @@ pub(crate) fn prefill<P>(
         PrefillGeometry::derive(op, at.head_dim, at.widths, at.cta_tile_q, at.kv, &at.device)?;
     ctx.fire(
         op,
-        Fire::at(FILE, prefill_symbol(op, &geometry, at.arm, at.kv)?).apply(
+        Fire::at(kernel(FILE, &prefill_symbol(op, &geometry, at.arm, at.kv)?)).apply(
             Launch::grid(
                 PrefillGeometry::grid(at.padded_batch_size, at.num_kv_heads),
                 geometry.block(),
@@ -256,7 +254,7 @@ pub(crate) fn prefill_ragged<P>(
     )?;
     ctx.fire(
         op,
-        Fire::at(FILE, prefill_ragged_symbol(op, &geometry, at.arm)?).apply(
+        Fire::at(kernel(FILE, &prefill_ragged_symbol(op, &geometry, at.arm)?)).apply(
             Launch::grid(
                 PrefillGeometry::grid(at.padded_batch_size, at.num_kv_heads),
                 geometry.block(),
@@ -354,8 +352,7 @@ fn decode_blocks_per_sm_uncached(head_dim: u32, group_size: u32) -> Option<u32> 
     const OP: &str = "attn.plan_decode";
     let geometry = DecodeGeometry::derive(OP, head_dim, group_size, KvWidth::BF16).ok()?;
     let entrypoint = decode_symbol(OP, &geometry, DecodeArm::Full, KvWidth::BF16).ok()?;
-    let root = crate::jit::Root::of(FILE)?;
-    let resolved = crate::jit::cache::resolve(&root, entrypoint).ok()?;
+    let resolved = crate::jit::kernel(FILE, &entrypoint).resolve().ok()?;
 
     if geometry.smem_bytes > 48 * 1024 {
         // SAFETY: `resolve` returned a function the cache keeps loaded for

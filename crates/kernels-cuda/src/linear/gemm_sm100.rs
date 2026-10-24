@@ -15,7 +15,7 @@ use std::sync::{Mutex, OnceLock};
 use cudarc::driver::sys as dr;
 
 use crate::error::Error;
-use crate::jit::{ArgValue, Ctx, Fire, Launch, refuse, symbol};
+use crate::jit::{ArgValue, Ctx, Fire, Launch, kernel, refuse};
 
 const GEMM_SM100: &str = "linear/gemm_sm100.cu";
 
@@ -1168,7 +1168,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     };
     let units = job.tiles * splits;
     let grid = ctas * units.min(sms / ctas).max(1);
-    let entry = symbol(&format!(
+    let entry = format!(
         "::pie::linear::tc5_gemm<{}, {}, {}, {}, {}, {}, {}, {}, {ctas}, {}, {}, {}, {}>",
         kind.code(),
         kind.format(p.elem),
@@ -1185,7 +1185,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
             Kind::Mixed(mix) => mix,
             _ => 0,
         },
-    ));
+    );
     let map = ArgValue::of::<[u64; 16]>;
     let values = [
         map(&map_p),
@@ -1210,7 +1210,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     ];
     ctx.fire(
         OP,
-        Fire::at(GEMM_SM100, entry).apply(
+        Fire::at(kernel(GEMM_SM100, &entry)).apply(
             Launch::grid(
                 [grid, 1, 1],
                 [
@@ -1248,7 +1248,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     let quads = job.y_rows * n / 4;
     ctx.fire(
         OP,
-        Fire::at(GEMM_SM100, "::pie::linear::tc5_finalize")
+        Fire::at(kernel(GEMM_SM100, "::pie::linear::tc5_finalize"))
             .apply(Launch::flat(quads, 256).programmatic(ctx.tuning().pdl)),
         &[
             ArgValue::Ptr(part),
@@ -1276,7 +1276,8 @@ fn fire_routed(
     let int = |v: u32| i32::try_from(v).map_err(|_| refuse(OP, format!("{v} overflows an int")));
     ctx.fire(
         OP,
-        Fire::at(FILE, entry).apply(Launch::per_row(rows, 128).programmatic(ctx.tuning().pdl)),
+        Fire::at(kernel(FILE, entry))
+            .apply(Launch::per_row(rows, 128).programmatic(ctx.tuning().pdl)),
         &[
             ArgValue::Ptr(part),
             ArgValue::Ptr(y),

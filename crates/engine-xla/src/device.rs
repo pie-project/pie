@@ -64,15 +64,12 @@ impl Device {
         let client = open_client(plugin).map_err(|e| Fault::NoDevice {
             detail: e.to_string(),
         })?;
-        let device = *client
-            .devices()
-            .get(ordinal)
-            .ok_or_else(|| Fault::NoDevice {
-                detail: format!(
-                    "device {ordinal} asked of a client that addresses {}",
-                    client.devices().len()
-                ),
-            })?;
+        let device = client.device(ordinal).ok_or_else(|| Fault::NoDevice {
+            detail: format!(
+                "device {ordinal} asked of a client that addresses {}",
+                client.device_count()
+            ),
+        })?;
         let kind = client.device_kind(device).unwrap_or_default();
         let stats = client.memory_stats(device).ok();
         let limit = stats
@@ -112,11 +109,7 @@ impl Device {
         };
         let kind = client
             .as_ref()
-            .and_then(|c| {
-                c.devices()
-                    .get(ordinal)
-                    .and_then(|d| c.device_kind(*d).ok())
-            })
+            .and_then(|c| c.device(ordinal).and_then(|d| c.device_kind(d).ok()))
             // Without a client, the v6e the defaults were measured on.
             .unwrap_or_else(|| "TPU v6 lite".to_string());
         Ok(Device {
@@ -179,8 +172,8 @@ impl Device {
         self.held
     }
 
-    fn device(&self) -> Result<pjrt::Device> {
-        Ok(self.client()?.devices()[self.ordinal])
+    fn device(&self) -> Result<pjrt::Device<'_>> {
+        self.client()?.device(self.ordinal).ok_or(Fault::Deviceless)
     }
 
     /// Lands `bytes` as a `[rows, width]` array of `dtype` (packed dtypes as

@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
 const LANE_GEMM: &str = "linear/lane_gemm.cu";
@@ -56,10 +56,10 @@ pub fn act_x_wt(
     let warps = BLOCK / 32;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             LANE_GEMM,
-            symbol(&format!("::pie::linear::lane_gemm<{ta}, {tw}, {ty}>")),
-        )
+            &format!("::pie::linear::lane_gemm<{ta}, {tw}, {ty}>"),
+        ))
         .apply(Launch::grid([n.div_ceil(warps), y.rows, 1], [BLOCK, 1, 1])),
         &[
             act.arg(),

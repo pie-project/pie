@@ -9,7 +9,7 @@
 use crate::error::Error;
 use crate::hip::blas::{self, Operand};
 use crate::hip::{lt, sys};
-use crate::jit::{Ctx, refuse};
+use crate::jit::{Ctx, kernel, refuse};
 
 use super::dense_batch::dense_batch_bf16;
 use super::gemv::{
@@ -271,7 +271,7 @@ pub(crate) fn act_x_wt_live(
     k: u32,
 ) -> Result<bool, Error> {
     use crate::hip::lt_grouped::{USER_ARGS_BYTES, library};
-    use crate::jit::{ArgValue, Fire, Launch, symbol};
+    use crate::jit::{ArgValue, Fire, Launch};
     let Ok(lib) = library(dtype::Dtype::Bf16) else {
         return Ok(false);
     };
@@ -294,10 +294,10 @@ pub(crate) fn act_x_wt_live(
     let args = ctx.scratch(op, "linear.live_args", 6 * USER_ARGS_BYTES)? as u64;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             "linear/moe.hip",
-            symbol("::pie::linear::dense_lt_live_args<::pie::bf16>"),
-        )
+            "::pie::linear::dense_lt_live_args<::pie::bf16>",
+        ))
         .apply(Launch::grid([1, 1, 1], [64, 1, 1])),
         &[
             ArgValue::Ptr(live),

@@ -1,7 +1,7 @@
 use dtype::Dtype;
 
 use crate::error::Error;
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::linear::affine::GemmSplit;
 use crate::linear::moe::GroupSeat;
 use crate::tensor::Tensor;
@@ -250,12 +250,10 @@ fn tiled_launch(
     let split = GemmSplit::plan(ctx, op, y.rows, n, k, blocks, cus)?;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
-                "::pie::linear::matmul_affine_tiled<::pie::i32({group}), ::pie::i32({m})>"
-            )),
-        )
+            &format!("::pie::linear::matmul_affine_tiled<::pie::i32({group}), ::pie::i32({m})>"),
+        ))
         .apply(Launch::grid(
             [y.rows.div_ceil(m), n.div_ceil(tile_n), split.splits],
             [threads, 1, 1],
@@ -446,12 +444,10 @@ pub fn gemv_with(
     }
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
-                "::pie::linear::gemv_affine_tiled<::pie::i32({group}), ::pie::i32({split})>"
-            )),
-        )
+            &format!("::pie::linear::gemv_affine_tiled<::pie::i32({group}), ::pie::i32({split})>"),
+        ))
         .apply(Launch::grid([n_pad / BAND, 1, 1], [carve.threads(), 1, 1])),
         &[
             act.arg(),
@@ -511,8 +507,11 @@ pub fn repack(
     let words = n_pad / BAND * (k / BAND) * 32;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::linear::repack_affine_tiled<::pie::i32(4)>")
-            .apply(Launch::flat(words, BLOCK)),
+        Fire::at(kernel(
+            FILE,
+            "::pie::linear::repack_affine_tiled<::pie::i32(4)>",
+        ))
+        .apply(Launch::flat(words, BLOCK)),
         &[
             codes.arg(),
             out_codes.arg(),
@@ -522,7 +521,7 @@ pub fn repack(
     )?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::linear::repack_factors_tiled")
+        Fire::at(kernel(FILE, "::pie::linear::repack_factors_tiled"))
             .apply(Launch::flat(n_pad * groups, BLOCK)),
         &[
             scales.arg(),

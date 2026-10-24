@@ -291,7 +291,7 @@ impl Bench {
         let text = func.module("bench", &results);
         self.last_module = text.clone();
         let client = client.lock().map_err(|e| e.to_string())?;
-        let dev = client.devices()[0];
+        let dev = client.device(0).ok_or("the client addresses no device")?;
         let exe = client.compile(&text).map_err(|e| e.to_string())?;
         let mut uploads: Vec<Option<crate::pjrt::Buffer>> = Vec::new();
         for &b in &env.params {
@@ -380,7 +380,7 @@ impl Bench {
         self.last_module = text.clone();
 
         let client = client.lock().map_err(|e| e.to_string())?;
-        let dev = client.devices()[0];
+        let dev = client.device(0).ok_or("the client addresses no device")?;
         let exe = client
             .compile(&text)
             .map_err(|e| format!("{e}\n--- module ---\n{text}"))?;

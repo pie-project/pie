@@ -177,7 +177,10 @@ impl Gate {
         if airborne == 0 {
             return Ok(());
         }
-        tracing::debug!(instance, "fire parks until the instance's guest pass ran");
+        tracing::debug!(
+            instance = instance.0,
+            "fire parks until the instance's guest pass ran"
+        );
         crate::device::host::block_on_poll("guest gate", |cx| {
             let mut inner = self.inner.lock().expect("lock poisoned");
             if inner.0 == 0 {
@@ -383,11 +386,11 @@ impl Plane {
             )));
         }
         self.next_program += 1;
-        let id = self.next_program;
+        let id = ProgramId(self.next_program);
 
         let admitted = self.forms.admit(id, &plan.package);
         tracing::debug!(
-            program = id,
+            program = id.0,
             device_form = admitted,
             why = self.forms.refusal(id).map(ToString::to_string),
             "guest program registered"
@@ -444,7 +447,7 @@ impl Plane {
             .map(|_| ())
             .ok_or(Refusal::Closed {
                 what: "channel",
-                id,
+                id: id.0,
             })
     }
 
@@ -459,7 +462,7 @@ impl Plane {
             .cloned()
             .ok_or(Refusal::Closed {
                 what: "program",
-                id: binding.program,
+                id: binding.program.0,
             })?;
         let declared = plan.package.channels.len();
         if binding.channels.len() != declared {
@@ -505,7 +508,7 @@ impl Plane {
             Refusal::Program(format!("program {} does not bind: {why}", binding.program))
         })?;
         self.next_instance += 1;
-        let id = self.next_instance;
+        let id = InstanceId(self.next_instance);
         let poisoned = Arc::new(AtomicBool::new(false));
         self.instances.insert(
             id,
@@ -613,14 +616,14 @@ impl Plane {
             .map(|_| ())
             .ok_or(Refusal::Closed {
                 what: "instance",
-                id,
+                id: id.0,
             })
     }
 
     pub fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         let Some(binding) = seat
             .plan
@@ -676,7 +679,7 @@ impl Plane {
     ) -> Result<Option<Vec<u32>>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         if !seat.geometry.ports().contains(Port::EmbedTokens) {
             return Ok(None);
@@ -722,7 +725,7 @@ impl Plane {
     pub fn lane_count(&self, instance: InstanceId) -> Result<usize, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         Ok(self.embed_indptr(seat).len().saturating_sub(1).max(1))
     }
@@ -859,7 +862,7 @@ impl Plane {
         for (instance, lane) in attachments {
             let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
                 what: "instance",
-                id: instance,
+                id: instance.0,
             })?;
             attached.push(Attached {
                 lane,
@@ -890,7 +893,7 @@ impl Plane {
     ) -> Result<Option<engine::fire::Masking>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         if !seat.geometry.ports().contains(Port::EmbedTokens) {
             return Ok(None);
@@ -965,7 +968,7 @@ impl Plane {
     ) -> Result<(), Refusal> {
         let seat = self.instances.get_mut(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         if let Some(values) = mtp_logits
             && mtp_width != vocab
@@ -1064,7 +1067,7 @@ impl Plane {
     fn instance_mut(&mut self, id: InstanceId) -> Result<&mut Instance, Refusal> {
         self.instances.get_mut(&id).ok_or(Refusal::Closed {
             what: "instance",
-            id,
+            id: id.0,
         })
     }
 }

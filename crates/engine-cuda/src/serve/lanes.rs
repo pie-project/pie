@@ -110,7 +110,7 @@ impl<'a> Seated<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Attached {
     pub lane: u32,
-    pub instance: u64,
+    pub instance: engine::InstanceId,
     pub at: Boundary,
 }
 

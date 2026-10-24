@@ -1,3 +1,4 @@
+use engine::program::ProgramId;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -178,13 +179,13 @@ impl Compiled {
 
 #[derive(Default)]
 pub struct Forms {
-    compiled: HashMap<u64, Arc<Compiled>>,
+    compiled: HashMap<ProgramId, Arc<Compiled>>,
 
-    refused: HashMap<u64, Refused>,
+    refused: HashMap<ProgramId, Refused>,
 }
 
 impl Forms {
-    pub fn admit(&mut self, program: u64, package: &LaunchPackage) -> bool {
+    pub fn admit(&mut self, program: ProgramId, package: &LaunchPackage) -> bool {
         match Compiled::of(package) {
             Ok(compiled) => {
                 self.compiled.insert(program, Arc::new(compiled));
@@ -198,16 +199,16 @@ impl Forms {
     }
 
     #[must_use]
-    pub fn get(&self, program: u64) -> Option<&Arc<Compiled>> {
+    pub fn get(&self, program: ProgramId) -> Option<&Arc<Compiled>> {
         self.compiled.get(&program)
     }
 
     #[must_use]
-    pub fn refusal(&self, program: u64) -> Option<&Refused> {
+    pub fn refusal(&self, program: ProgramId) -> Option<&Refused> {
         self.refused.get(&program)
     }
 
-    pub fn forget(&mut self, program: u64) {
+    pub fn forget(&mut self, program: ProgramId) {
         self.compiled.remove(&program);
         self.refused.remove(&program);
     }

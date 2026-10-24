@@ -54,6 +54,18 @@ impl<'a> ArgValue<'a> {
         }
     }
 
+    /// The bytes the kernel's parameter for this argument must take: a
+    /// scalar's natural width, an aggregate's own size.
+    #[must_use]
+    pub const fn width(self) -> usize {
+        match self {
+            Self::Ptr(_) | Self::I64(_) | Self::Usize(_) => 8,
+            Self::I32(_) | Self::U32(_) | Self::F32(_) => 4,
+            Self::Bool(_) => 1,
+            Self::Bytes(Aggregate { len, .. }) => len,
+        }
+    }
+
     #[must_use]
     pub const fn cell(self) -> u64 {
         match self {

@@ -1,5 +1,5 @@
 use crate::error::Error;
-use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
+use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::Tensor;
 use crate::voxels::{flat_elements, lane_pair};
 
@@ -37,11 +37,8 @@ pub fn upsample_nearest(
     let (blocks, total) = flat_elements(OP, *o, BLOCK)?;
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            crate::jit::symbol(&format!("::pie::conv::upsample_nearest<{t}>")),
-        )
-        .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
+        Fire::at(kernel(FILE, &format!("::pie::conv::upsample_nearest<{t}>")))
+            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
             x.arg(),
             grid.arg(),
@@ -101,11 +98,8 @@ pub fn pixel_shuffle(
     let (blocks, total) = flat_elements(OP, *o, BLOCK)?;
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            crate::jit::symbol(&format!("::pie::conv::pixel_shuffle<{t}>")),
-        )
-        .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
+        Fire::at(kernel(FILE, &format!("::pie::conv::pixel_shuffle<{t}>")))
+            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
             x.arg(),
             grid.arg(),
@@ -148,11 +142,8 @@ pub fn pixel_unshuffle(
     let (blocks, total) = flat_elements(OP, *o, BLOCK)?;
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            crate::jit::symbol(&format!("::pie::conv::pixel_unshuffle<{t}>")),
-        )
-        .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
+        Fire::at(kernel(FILE, &format!("::pie::conv::pixel_unshuffle<{t}>")))
+            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
             x.arg(),
             grid.arg(),
@@ -198,11 +189,8 @@ pub fn avg_down(
     let (blocks, total) = flat_elements(OP, *o, BLOCK)?;
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            crate::jit::symbol(&format!("::pie::conv::avg_down<{t}>")),
-        )
-        .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
+        Fire::at(kernel(FILE, &format!("::pie::conv::avg_down<{t}>")))
+            .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
             x.arg(),
             grid.arg(),

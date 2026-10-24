@@ -1,7 +1,7 @@
 use dtype::Dtype;
 
 use crate::error::Error;
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::{RaggedTensor, Tensor};
 
 const DYN_CONV: &str = "ssm/dyn_conv.cu";
@@ -93,7 +93,7 @@ pub fn dyn_conv(
     );
     ctx.fire(
         OP,
-        Fire::at(DYN_CONV, symbol(&format!("::pie::ssm::dyn_conv<{t}>"))).apply(Launch::grid(
+        Fire::at(kernel(DYN_CONV, &format!("::pie::ssm::dyn_conv<{t}>"))).apply(Launch::grid(
             [channels.div_ceil(BLOCK), lanes, 1],
             [channels.min(BLOCK), 1, 1],
         )),

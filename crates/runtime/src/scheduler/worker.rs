@@ -121,7 +121,7 @@ static NEXT_LOGICAL_FIRE_ID: AtomicU64 = AtomicU64::new(1);
 pub(crate) struct PendingRequest {
     pub(crate) logical_fire_id: u64,
     pub(crate) request: crate::engine::FireRequest,
-    pub(crate) instance_id: u64,
+    pub(crate) instance_id: ::engine::InstanceId,
     pub(crate) completion: WorkItemCompletion,
     pub(crate) process_id: Option<ProcessId>,
     pub(crate) pipeline_id: Option<ProcessId>,
@@ -142,7 +142,7 @@ impl PendingRequest {
     )]
     fn direct(
         request: crate::engine::FireRequest,
-        instance_id: u64,
+        instance_id: ::engine::InstanceId,
         completion: WorkItemCompletion,
         process_id: Option<ProcessId>,
         pipeline_id: Option<ProcessId>,
@@ -233,22 +233,23 @@ enum SchedulerItem {
         plans: Vec<ChannelRegistration>,
         program: Option<Box<ProgramRegistration>>,
         bind: InstanceBindingPlan,
-        response:
-            tokio::sync::oneshot::Sender<Result<(Vec<RegisteredChannel>, u64, BoundInstance)>>,
+        response: tokio::sync::oneshot::Sender<
+            Result<(Vec<RegisteredChannel>, ::engine::ProgramId, BoundInstance)>,
+        >,
     },
     CopyTracked {
         plan: PreLaunchCopy,
         completion: ControlCompletion,
     },
     CloseInstance {
-        id: u64,
+        id: ::engine::InstanceId,
         pacing_wait_id: u64,
     },
     CloseChannel {
-        id: u64,
+        id: ::engine::ChannelId,
     },
     CloseChannels {
-        ids: Vec<u64>,
+        ids: Vec<::engine::ChannelId>,
     },
     Nudge,
     PipelineLeave(
@@ -383,10 +384,11 @@ impl PreLaunchCopy {
 
 pub(super) struct BindRespond {
     pub(super) registered: Vec<RegisteredChannel>,
-    pub(super) program_id: u64,
+    pub(super) program_id: ::engine::ProgramId,
     pub(super) program_registered: bool,
-    pub(super) response:
-        tokio::sync::oneshot::Sender<Result<(Vec<RegisteredChannel>, u64, BoundInstance)>>,
+    pub(super) response: tokio::sync::oneshot::Sender<
+        Result<(Vec<RegisteredChannel>, ::engine::ProgramId, BoundInstance)>,
+    >,
 }
 
 pub(super) enum QueuedItem {
@@ -402,8 +404,9 @@ pub(super) enum QueuedItem {
         plans: Vec<ChannelRegistration>,
         program: Option<Box<ProgramRegistration>>,
         bind: InstanceBindingPlan,
-        response:
-            tokio::sync::oneshot::Sender<Result<(Vec<RegisteredChannel>, u64, BoundInstance)>>,
+        response: tokio::sync::oneshot::Sender<
+            Result<(Vec<RegisteredChannel>, ::engine::ProgramId, BoundInstance)>,
+        >,
     },
     CopyTracked {
         plan: PreLaunchCopy,
@@ -414,11 +417,11 @@ pub(super) enum QueuedItem {
         response: tokio::sync::oneshot::Sender<Result<Vec<u8>>>,
     },
     CloseInstance {
-        id: u64,
+        id: ::engine::InstanceId,
         pacing_wait_id: u64,
     },
     CloseChannels {
-        ids: Vec<u64>,
+        ids: Vec<::engine::ChannelId>,
     },
 }
 
@@ -681,7 +684,15 @@ struct SchedulerControl {
     active_senders: AtomicUsize,
     shutdown_wait: Condvar,
     shutdown_gate: Mutex<()>,
-    program_ids: Mutex<HashMap<u64, (u64, ::eta_compiler::codegen::launch::LaunchPackage)>>,
+    program_ids: Mutex<
+        HashMap<
+            u64,
+            (
+                ::engine::ProgramId,
+                ::eta_compiler::codegen::launch::LaunchPackage,
+            ),
+        >,
+    >,
     accepting: AtomicBool,
     stats: Arc<SchedulerStats>,
     device_domain: ::engine::MemoryDomain,
@@ -759,7 +770,7 @@ impl SchedulerHandle {
     pub fn submit_with_identity_and_copy(
         &self,
         request: crate::engine::FireRequest,
-        instance_id: u64,
+        instance_id: ::engine::InstanceId,
         completion: WorkItemCompletion,
         pipeline_id: Option<ProcessId>,
         prelaunch_copy: Option<::engine::KvCopy>,
@@ -784,7 +795,7 @@ impl SchedulerHandle {
     pub fn submit_prebuilt_with_copy(
         &self,
         request: crate::engine::FireRequest,
-        instance_id: u64,
+        instance_id: ::engine::InstanceId,
         completion: WorkItemCompletion,
         prelaunch_copy: Option<::engine::KvCopy>,
         prelaunch_state_copy: Option<StateCopy>,
@@ -809,7 +820,7 @@ impl SchedulerHandle {
     pub fn submit_prebuilt_tracked_with_copy(
         &self,
         request: crate::engine::FireRequest,
-        instance_id: u64,
+        instance_id: ::engine::InstanceId,
         completion: WorkItemCompletion,
         process_id: ProcessId,
         pipeline_id: ProcessId,
@@ -916,15 +927,15 @@ impl SchedulerHandle {
         .map_err(|_| anyhow!("scheduler did not answer the debug dump"))?
     }
 
-    pub fn close_instance(&self, id: u64, pacing_wait_id: u64) -> Result<()> {
+    pub fn close_instance(&self, id: ::engine::InstanceId, pacing_wait_id: u64) -> Result<()> {
         self.send(SchedulerItem::CloseInstance { id, pacing_wait_id })
     }
 
-    pub fn close_channel(&self, id: u64) -> Result<()> {
+    pub fn close_channel(&self, id: ::engine::ChannelId) -> Result<()> {
         self.send(SchedulerItem::CloseChannel { id })
     }
 
-    pub fn close_channels(&self, ids: Vec<u64>) -> Result<()> {
+    pub fn close_channels(&self, ids: Vec<::engine::ChannelId>) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
@@ -1344,7 +1355,7 @@ impl BatchScheduler {
         pending: &VecDeque<QueuedItem>,
         in_flight_launches: &VecDeque<PendingLaunchBatch>,
         in_flight_control: &InFlightControls,
-        instances: &HashMap<u64, TrackedInstance>,
+        instances: &HashMap<::engine::InstanceId, TrackedInstance>,
         frame_policy: &FramePolicy,
     ) -> String {
         use std::fmt::Write as _;
@@ -1413,7 +1424,7 @@ impl BatchScheduler {
         terminated_processes: &mut HashSet<ProcessId>,
         in_flight_launches: &VecDeque<PendingLaunchBatch>,
         in_flight_control: &mut InFlightControls,
-        instances: &HashMap<u64, TrackedInstance>,
+        instances: &HashMap<::engine::InstanceId, TrackedInstance>,
         limits: SchedulerLimits,
         page_size: u32,
         stopping: &mut bool,
@@ -1692,7 +1703,10 @@ impl BatchScheduler {
         pending.push_back(QueuedItem::Launch(QueuedLaunch::new(Box::new(request))));
     }
 
-    fn instance_has_queued_work(pending: &VecDeque<QueuedItem>, instance_id: u64) -> bool {
+    fn instance_has_queued_work(
+        pending: &VecDeque<QueuedItem>,
+        instance_id: ::engine::InstanceId,
+    ) -> bool {
         pending.iter().any(|item| match item {
             QueuedItem::Launch(request) => request.instance_id == instance_id,
             _ => false,
@@ -1734,7 +1748,7 @@ impl BatchScheduler {
         )
     }
 
-    fn queue_close_channel(pending: &mut PendingQueue, id: u64) {
+    fn queue_close_channel(pending: &mut PendingQueue, id: ::engine::ChannelId) {
         const CLOSE_CHANNEL_BATCH_MAX: usize = 512;
         if let Some(QueuedItem::CloseChannels { ids }) = pending.back_mut()
             && ids.len() < CLOSE_CHANNEL_BATCH_MAX
@@ -1771,7 +1785,7 @@ impl BatchScheduler {
     fn dispatch_ready_items(
         engine_loop: &Lane,
         replies: &mut LaneReplies,
-        instances: &mut HashMap<u64, TrackedInstance>,
+        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
         pending: &mut PendingQueue,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         in_flight_control: &mut InFlightControls,
@@ -1897,7 +1911,7 @@ impl BatchScheduler {
     fn post_control(
         engine_loop: &Lane,
         replies: &mut LaneReplies,
-        instances: &mut HashMap<u64, TrackedInstance>,
+        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
         in_flight_control: &mut InFlightControls,
         item: QueuedItem,
     ) {
@@ -1924,7 +1938,7 @@ impl BatchScheduler {
                 };
                 if let Some(message) = error {
                     tracing::warn!(
-                        instance_id = id,
+                        instance_id = id.0,
                         error = %message,
                         "scheduler close_instance skipped"
                     );
@@ -2020,7 +2034,7 @@ impl BatchScheduler {
         frame_policy: &mut FramePolicy,
         engine_loop: &Lane,
         replies: &mut LaneReplies,
-        instances: &mut HashMap<u64, TrackedInstance>,
+        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
         pending: &mut PendingQueue,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         in_flight_control: &InFlightControls,
@@ -2159,7 +2173,7 @@ impl BatchScheduler {
 
     fn admits_to_frame(
         request: &PendingRequest,
-        instances: &HashMap<u64, TrackedInstance>,
+        instances: &HashMap<::engine::InstanceId, TrackedInstance>,
     ) -> bool {
         if request.completion.is_settled() || request.completion.cancel_requested() {
             if !request.completion.is_settled() {
@@ -2191,7 +2205,7 @@ impl BatchScheduler {
         slot_buffer: &mut SlotBuffer,
         engine_loop: &Lane,
         replies: &mut LaneReplies,
-        instances: &mut HashMap<u64, TrackedInstance>,
+        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
         pending: &mut PendingQueue,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
         page_size: u32,
@@ -2280,7 +2294,7 @@ impl BatchScheduler {
 
     fn retire_ready_launches(
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
-        instances: &mut HashMap<u64, TrackedInstance>,
+        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
         stats: &Arc<SchedulerStats>,
         frame_policy: &mut FramePolicy,
     ) -> bool {
@@ -2395,7 +2409,7 @@ impl BatchScheduler {
 
     fn accept_launch_reply(
         batch: &mut PendingLaunchBatch,
-        instances: &mut HashMap<u64, TrackedInstance>,
+        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
         result: LaunchResult,
     ) {
         match result {
@@ -2418,7 +2432,7 @@ impl BatchScheduler {
     fn apply_lane_reply(
         reply: LaneReply,
         in_flight_launches: &mut VecDeque<PendingLaunchBatch>,
-        instances: &mut HashMap<u64, TrackedInstance>,
+        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
         in_flight_control: &mut InFlightControls,
         frame_policy: &mut FramePolicy,
         rollback_tx: &SchedTx,
@@ -2446,7 +2460,7 @@ impl BatchScheduler {
         id: u64,
         commit: LaneCommit,
         in_flight_control: &mut InFlightControls,
-        instances: &mut HashMap<u64, TrackedInstance>,
+        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
         frame_policy: &mut FramePolicy,
         rollback_tx: &SchedTx,
     ) {
@@ -2469,7 +2483,7 @@ impl BatchScheduler {
                 frame_policy.on_bind_completed(pipeline_id);
                 if instances.contains_key(&bound.instance_id) {
                     tracing::error!(
-                        instance_id = bound.instance_id,
+                        instance_id = bound.instance_id.0,
                         "bind committed an already-bound instance id"
                     );
                     let error = anyhow!("instance {} is already bound", bound.instance_id);
@@ -2483,14 +2497,14 @@ impl BatchScheduler {
                 {
                     tracing::warn!(
                         operation = "register_channels_bind",
-                        instance_id = bound.instance_id,
+                        instance_id = bound.instance_id.0,
                         channel_count = registered.len(),
                         "scheduler cancellation rollback enqueued bound instance and channels"
                     );
                     if program_registered {
                         tracing::warn!(
                             operation = "register_channels_bind",
-                            program_id,
+                            program_id = program_id.0,
                             "scheduler RPC cancelled after program registration; retaining engine-lifetime program"
                         );
                     }
@@ -2505,7 +2519,7 @@ impl BatchScheduler {
                     {
                         tracing::error!(
                             operation = "register_channels_bind",
-                            instance_id,
+                            instance_id = instance_id.0,
                             "scheduler cancellation rollback close_instance enqueue failed"
                         );
                     }
@@ -2517,7 +2531,7 @@ impl BatchScheduler {
                         {
                             tracing::error!(
                                 operation = "register_channels_bind",
-                                channel_id,
+                                channel_id = channel_id.0,
                                 "scheduler cancellation rollback close_channel enqueue failed"
                             );
                         }
@@ -2552,7 +2566,7 @@ impl BatchScheduler {
 
     fn shutdown_instances(
         engine: &mut Option<EngineBox>,
-        instances: &mut HashMap<u64, TrackedInstance>,
+        instances: &mut HashMap<::engine::InstanceId, TrackedInstance>,
     ) {
         let outstanding = std::mem::take(instances);
         for (instance_id, instance) in outstanding {
@@ -2560,7 +2574,7 @@ impl BatchScheduler {
                 && let Err(err) = engine.close_instance(instance_id)
             {
                 tracing::warn!(
-                    instance_id,
+                    instance_id = instance_id.0,
                     ?err,
                     "scheduler shutdown close_instance failed"
                 );
@@ -2575,7 +2589,11 @@ impl BatchScheduler {
             if let Some(engine) = engine.as_mut()
                 && let Err(err) = engine.close_channel(channel_id)
             {
-                tracing::warn!(channel_id, ?err, "scheduler shutdown close_channel failed");
+                tracing::warn!(
+                    channel_id = channel_id.0,
+                    ?err,
+                    "scheduler shutdown close_channel failed"
+                );
             }
         }
     }
@@ -2646,7 +2664,7 @@ mod tests {
             lora_program: false,
             logical_fire_id: 9,
             request: crate::engine::FireRequest::default(),
-            instance_id: 1,
+            instance_id: ::engine::InstanceId(1),
             completion: crate::engine::WorkItemCompletion::new(1, 0),
             process_id: None,
             pipeline_id: Some(pipeline),
@@ -2687,7 +2705,7 @@ mod tests {
                         },
                         terminal_cells: Vec::new(),
                         completions: Vec::new(),
-                        instances: vec![0],
+                        instances: vec![::engine::InstanceId(0)],
                         logical_fire_ids: vec![token],
                     }],
                 },
@@ -2764,7 +2782,7 @@ mod tests {
                     },
                     terminal_cells: Vec::new(),
                     completions: Vec::new(),
-                    instances: vec![0],
+                    instances: vec![::engine::InstanceId(0)],
                     logical_fire_ids: vec![42],
                 }],
             },

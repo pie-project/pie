@@ -3,7 +3,7 @@ use core::ffi::c_void;
 
 use crate::error::Error;
 
-use crate::jit::{ArgValue, refuse};
+use crate::jit::{ArgValue, Kernel, refuse};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Launch {
@@ -99,19 +99,16 @@ impl Launch {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fire {
-    pub file: &'static str,
-
-    pub entrypoint: &'static str,
+    pub kernel: &'static Kernel,
 
     pub launch: Launch,
 }
 
 impl Fire {
     #[must_use]
-    pub const fn at(file: &'static str, entrypoint: &'static str) -> Self {
+    pub const fn at(kernel: &'static Kernel) -> Self {
         Self {
-            file,
-            entrypoint,
+            kernel,
             launch: Launch::grid([0, 0, 0], [0, 0, 0]),
         }
     }
@@ -548,12 +545,12 @@ impl Ctx {
     }
 
     pub fn fire(&self, op: &'static str, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
-        let Some(root) = crate::jit::Root::of(fire.file) else {
+        if fire.kernel.root.is_none() {
             return Err(refuse(
                 op,
-                format!("no carried unit is named `{}`", fire.file),
+                format!("no carried unit is named `{}`", fire.kernel.file),
             ));
-        };
+        }
         if fire.launch.empty() {
             return Err(refuse(op, "the grid is empty"));
         }
@@ -567,40 +564,43 @@ impl Ctx {
                 *last = Some(now);
                 gap
             };
-            eprintln!("fire: {gap} {op} {}", fire.entrypoint);
+            eprintln!("fire: {gap} {op} {}", fire.kernel.name);
         }
-        self.issue(op, &root, fire.entrypoint, fire.launch, args)
+        self.issue(op, fire.kernel, fire.launch, args)
     }
 
     #[cfg(feature = "cuda")]
     fn issue(
         &self,
         op: &'static str,
-        root: &crate::jit::Root,
-        instantiation: &'static str,
+        kernel: &'static Kernel,
         launch: Launch,
         args: &[ArgValue],
     ) -> Result<(), Error> {
-        let resolved = match crate::jit::cache::resolve(root, instantiation) {
+        let resolved = match kernel.resolve() {
             Ok(resolved) => resolved,
-            Err(why) => return Err(said(root.name, instantiation, why).at(op)),
+            Err(why) => return Err(said(kernel, why).at(op)),
         };
 
+        if let Some(why) = mismatch(&resolved.params, args) {
+            return Err(refuse(op, format!("`{}`: {why}", kernel.name)));
+        }
         let mut bound = crate::jit::abi::Bound::new(args);
 
         // SAFETY: `resolved.function` lives for the process (the cache
         // leaks it) and was loaded in the context `resolve` bound to this
         // thread; `self.stream` is live by `Ctx::on`'s contract. `bound`
-        // owns one slot per argument and outlives the call. That the
-        // arguments match the kernel's parameters, and that every pointer
-        // among them is a live device address, is not checked here: `fire`
-        // takes it on trust from its caller.
+        // owns one slot per argument and outlives the call, and `mismatch`
+        // held the arguments to the kernel's parameters, so the driver reads
+        // no slot past its value. That every pointer among them is a live
+        // device address is not checked here: `fire` takes it on trust from
+        // its caller.
         let fired = unsafe {
             crate::jit::launch::issue(resolved.function, launch, bound.slots_mut(), self.stream)
         };
         match fired {
             Ok(()) => Ok(()),
-            Err(why) => Err(said(root.name, instantiation, why).at(op)),
+            Err(why) => Err(said(kernel, why).at(op)),
         }
     }
 
@@ -609,13 +609,35 @@ impl Ctx {
     fn issue(
         &self,
         op: &'static str,
-        _root: &crate::jit::Root,
-        _instantiation: &'static str,
+        _kernel: &'static Kernel,
         _launch: Launch,
         _args: &[ArgValue],
     ) -> Result<(), Error> {
         Err(crate::jit::runtimeless(op))
     }
+}
+
+/// Why `args` cannot fill a kernel whose parameters are `params` bytes each,
+/// or `None` when each argument is exactly its parameter's width.
+#[cfg(any(feature = "cuda", test))]
+fn mismatch(params: &[usize], args: &[ArgValue]) -> Option<String> {
+    if params.len() != args.len() {
+        return Some(format!(
+            "the kernel takes {} parameters and the fire passes {}",
+            params.len(),
+            args.len()
+        ));
+    }
+    for (at, (&size, arg)) in params.iter().zip(args).enumerate() {
+        if arg.width() != size {
+            return Some(format!(
+                "parameter {at} is {size} bytes and the fire passes {} of {}",
+                arg.kind(),
+                arg.width()
+            ));
+        }
+    }
+    None
 }
 
 /// Whether a device instantiation that will not fire (it does not compile,
@@ -637,10 +659,11 @@ pub fn strict_kernels() {
 static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(feature = "cuda")]
-fn said(root: &str, instantiation: &str, why: crate::jit::Fault) -> crate::jit::Fault {
+fn said(kernel: &Kernel, why: crate::jit::Fault) -> crate::jit::Fault {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
 
+    let (root, instantiation) = (kernel.file, kernel.name);
     assert!(
         !kernels_strict(),
         "strict kernels: `{root}` {instantiation} will not fire: {why}"
@@ -717,6 +740,20 @@ mod tests {
             ctx.opaque_rows(9),
             9,
             "the pad is the fire's, and the stream outlives the fire"
+        );
+    }
+
+    #[test]
+    fn a_fire_is_held_to_its_kernels_parameters() {
+        let args = [ArgValue::F32(2.0), ArgValue::Ptr(0), ArgValue::I32(3)];
+        assert_eq!(mismatch(&[4, 8, 4], &args), None, "every width matches");
+        assert!(
+            mismatch(&[4, 8, 4, 8], &args).is_some_and(|why| why.contains("takes 4")),
+            "a missing argument would have the driver read past the slots"
+        );
+        assert!(
+            mismatch(&[4, 8, 8], &args).is_some_and(|why| why.contains("parameter 2")),
+            "an i32 into an 8-byte parameter is refused"
         );
     }
 }
