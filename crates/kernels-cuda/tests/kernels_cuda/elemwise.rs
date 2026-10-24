@@ -1,3 +1,4 @@
+mod frame;
 mod group_norm;
 mod hc;
 mod modulate;
