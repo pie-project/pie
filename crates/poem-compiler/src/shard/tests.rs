@@ -69,3 +69,40 @@ fn an_inferred_package_reduces_each_projection_once() {
 
 /// The layers of Llama 3.1 8B.
 const LLAMA_8B_LAYERS: usize = 32;
+
+/// A projection a package states whole reads the share before it gathered:
+/// each block of GLM-5.3-Flash's vision tower cuts its gate and up by their
+/// columns and gathers what its whole down projection reads, and its merger
+/// does the same, one gather each and none in the text model.
+#[test]
+fn a_whole_projection_reads_its_share_gathered() {
+    let deployment = crate::catalog::deployment("glm53-flash-vision-u8g64-u2g64-kv-bf16-tp2")
+        .expect("the catalog ships the row");
+    let trace = deployment.trace(Platform::Cuda);
+    let shard = |name: &str| {
+        &trace
+            .params
+            .iter()
+            .find(|p| p.name == name)
+            .expect("the tower states it")
+            .shard
+    };
+    assert!(matches!(
+        shard("tower.blocks.0.gate_up"),
+        poem_ir::Shard::Cut { .. }
+    ));
+    assert_eq!(*shard("tower.blocks.0.down"), poem_ir::Shard::Replicated);
+    let gathers = trace
+        .nodes
+        .iter()
+        .filter(|node| poem_ir::Operands::name(&node.op) == "collective.all_gather")
+        .count();
+    assert_eq!(
+        gathers,
+        GLM_TOWER_BLOCKS + 1,
+        "one a block and one for the merger"
+    );
+}
+
+/// The blocks of GLM-5.3-Flash's vision tower.
+const GLM_TOWER_BLOCKS: usize = 24;
