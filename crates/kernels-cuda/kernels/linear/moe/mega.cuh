@@ -154,8 +154,17 @@ __device__ __forceinline__ void lay_out(Routing& R, const i32* __restrict__ rout
         __syncwarp();
     }
     __syncthreads();
-    // Each expert's count, and its warps' first ranks.
-    for (int e = tid; e < experts; e += kThreads) {
+    // Each expert's count, its warps' first ranks, and the routes' and
+    // blocks' prefix sums: thread t takes experts 2t and 2t + 1, its sums
+    // scanned across the block (a count and a block count a word, 2048
+    // routes at most).
+    static_assert(2 * kThreads >= kMaxExperts, "two experts a thread");
+    unsigned* wsum = reinterpret_cast<unsigned*>(seg + 8 * experts);
+    unsigned v[2] = {0u, 0u};
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const int e = 2 * tid + h;
+        if (e >= experts) continue;
         int run = 0;
         for (int w = 0; w < 8; ++w) {
             const int c = seg[w * experts + e];
@@ -163,36 +172,34 @@ __device__ __forceinline__ void lay_out(Routing& R, const i32* __restrict__ rout
             run += c;
         }
         R.count[e] = run;
+        v[h] = static_cast<unsigned>(run) | (static_cast<unsigned>((run + kBN - 1) / kBN) << 16);
     }
+    unsigned inc = v[0] + v[1];
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        const unsigned up = __shfl_up_sync(0xffffffffu, inc, d);
+        if (lane >= d) inc += up;
+    }
+    if (lane == 31) wsum[warp] = inc;
     __syncthreads();
-    // The routes' and blocks' prefix sums, warp 0 alone (512 experts at most).
-    if (warp == 0) {
-        int routes_before = 0, blocks_before = 0;
-        for (int e0 = 0; e0 < experts; e0 += 32) {
-            const int e = e0 + lane;
-            const int c = e < experts ? R.count[e] : 0;
-            const int b = (c + kBN - 1) / kBN;
-            int ic = c, ib = b;
-            for (int d = 1; d < 32; d <<= 1) {
-                const int uc = __shfl_up_sync(0xffffffffu, ic, d);
-                const int ub = __shfl_up_sync(0xffffffffu, ib, d);
-                if (lane >= d) {
-                    ic += uc;
-                    ib += ub;
-                }
-            }
-            if (e < experts) {
-                R.start[e] = routes_before + ic - c;
-                R.bstart[e] = blocks_before + ib - b;
-            }
-            routes_before += __shfl_sync(0xffffffffu, ic, 31);
-            blocks_before += __shfl_sync(0xffffffffu, ib, 31);
+    unsigned base = 0;
+    for (int w = 0; w < warp; ++w) base += wsum[w];
+    unsigned before = base + inc - v[0] - v[1];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const int e = 2 * tid + h;
+        if (e < experts) {
+            R.start[e] = static_cast<int>(before & 0xFFFFu);
+            R.bstart[e] = static_cast<int>(before >> 16);
         }
-        if (lane == 0) {
-            R.start[experts] = routes_before;
-            R.bstart[experts] = blocks_before;
-            R.count[experts] = 0;
-        }
+        before += v[h];
+    }
+    if (tid == 0) {
+        unsigned all = 0;
+        for (int w = 0; w < kThreads / 32; ++w) all += wsum[w];
+        R.start[experts] = static_cast<int>(all & 0xFFFFu);
+        R.bstart[experts] = static_cast<int>(all >> 16);
+        R.count[experts] = 0;
     }
     __syncthreads();
 #pragma unroll

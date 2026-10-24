@@ -482,7 +482,10 @@ fn the_mega_moe_lands_its_live_window_alone() {
     };
     let mut b = Bench::new(0x3a1d);
     let w = w4a8(&mut b, s, true);
-    let ctx = b.ctx().with_tuning(SM100);
+    // As B200 launches it: a programmatic dependent, not a cooperative launch.
+    let ctx = b
+        .ctx()
+        .with_tuning(kernels_cuda::tuning::Tuning { pdl: true, ..SM100 });
     let tokens = 24usize;
     let (live, first) = (9usize, 5usize);
     let f = fire_of(&mut b, s, tokens, 0x91);
