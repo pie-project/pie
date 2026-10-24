@@ -1714,9 +1714,17 @@ impl FrameShell for Shell {
             .slot
             .take()
             .expect("a `Prepared` holds its staging slot until `enqueue` borrows it");
+        let stream = self.device.stream();
+        let timing = match self.fire_timer.as_mut().filter(|_| !self.arming) {
+            Some(timer) => timer.begin(stream)?,
+            None => None,
+        };
         match self.enqueue_on(&mut p, &slot) {
             Ok((launches, readback)) => {
                 p.slot = Some(slot);
+                if let (Some(timing), Some(timer)) = (timing, self.fire_timer.as_mut()) {
+                    timer.end(timing, stream, p.composition.bucket())?;
+                }
                 Ok(Enqueued {
                     prepared: p,
                     launches,
@@ -1724,6 +1732,9 @@ impl FrameShell for Shell {
                 })
             }
             Err(fault) => {
+                if let (Some(timing), Some(timer)) = (timing, self.fire_timer.as_mut()) {
+                    timer.abandon(timing);
+                }
                 let _ = self.device.synchronize();
                 drop(slot);
                 Err(fault)

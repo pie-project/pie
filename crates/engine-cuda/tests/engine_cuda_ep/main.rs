@@ -30,6 +30,7 @@ mod an_expert_parallel_group_reads_its_expert_balance;
 mod an_expert_parallel_group_rebalances_its_experts;
 mod an_expert_parallel_group_serves_through_its_engines;
 mod an_expert_parallel_pair_answers_what_one_rank_answers;
+mod an_expert_parallel_rank_times_its_fires_on_the_device;
 mod an_expert_parallel_wire_carries_tokens_out_and_back;
 mod micro;
 mod peer_collectives_answer_what_every_rank_holds;

@@ -17,6 +17,8 @@ pub struct Diagnostics {
     pub nan_check: bool,
     pub fuse_chains: bool,
     pub gumbel_direct: bool,
+    /// Each serving fire's span on the device (`crate::serve::timing`).
+    pub fire_timing: bool,
     /// What a fire that waits for the device does (`crate::device::guard`).
     pub sync_guard: Option<SyncGuard>,
 }
@@ -47,6 +49,7 @@ impl Default for Diagnostics {
             nan_check: false,
             fuse_chains: true,
             gumbel_direct: true,
+            fire_timing: false,
             sync_guard: None,
         }
     }
@@ -69,6 +72,7 @@ impl Diagnostics {
             ("reap-trace", self.reap_trace),
             ("trace-census", self.trace_census),
             ("nan-check", self.nan_check),
+            ("fire-timing", self.fire_timing),
         ] {
             if on {
                 words.push(word.to_string());
@@ -117,7 +121,7 @@ const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `ptr-trace=<key substring>`, `graph-dot=<dir>`, `grid-trace=<key substring>`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
      `trace-census`, `nan-check`, `fuse-chains=off`, `gumbel-direct=off`, \
-     `sync-guard[=panic]`";
+     `fire-timing`, `sync-guard[=panic]`";
 
 impl std::str::FromStr for Diagnostics {
     type Err = String;
@@ -141,6 +145,7 @@ impl std::str::FromStr for Diagnostics {
                 "reap-trace" => diag.reap_trace = switch(word, value)?,
                 "trace-census" => diag.trace_census = switch(word, value)?,
                 "nan-check" => diag.nan_check = switch(word, value)?,
+                "fire-timing" => diag.fire_timing = switch(word, value)?,
                 "fuse-chains" => diag.fuse_chains = switch(word, value)?,
                 "gumbel-direct" => diag.gumbel_direct = switch(word, value)?,
                 "sync-guard" => {

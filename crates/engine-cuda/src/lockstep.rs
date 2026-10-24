@@ -621,6 +621,23 @@ impl Rank {
         }
     }
 
+    /// This rank's fires on its device by token bucket, its own steps and
+    /// its idle ones, under `fire-timing` (none without it). Waits for
+    /// nothing: a fire the device has not passed is not in it yet.
+    pub fn fire_times(
+        &self,
+    ) -> EngineResult<Option<std::collections::BTreeMap<u32, crate::serve::timing::FireTime>>> {
+        self.with(|cuda| {
+            let shell = cuda
+                .shell_mut()
+                .ok_or_else(|| Error::Load("this rank has no model loaded".into()))?;
+            let times = shell
+                .fire_times()
+                .map_err(|f| Error::Device(f.to_string()))?;
+            Ok(times.cloned())
+        })
+    }
+
     fn rebalancer(&self) -> MutexGuard<'_, crate::ep::rebalance::Rebalancer> {
         (self.group.rebalancer.lock()).expect("lockstep rebalance lock poisoned")
     }
