@@ -44,7 +44,12 @@ pub fn joins(trace: &Trace) -> Vec<Join> {
             });
             std::iter::once(weight).chain(bias)
         })
-        .collect()
+        .fold(Vec::new(), |mut joins: Vec<Join>, join| {
+            if !joins.iter().any(|j| j.name == join.name) {
+                joins.push(join);
+            }
+            joins
+        })
 }
 
 /// `trace` with each join made.
@@ -422,7 +427,62 @@ fn groups(trace: &Trace) -> Vec<Group> {
         });
     }
     out.sort_by_key(|g| g.nodes[0]);
-    out
+    consistent(trace, out)
+}
+
+/// The groups whose legs every reader of them joins alike: a weight read at
+/// several sites (a layer run twice) joins only where every site reads it
+/// in a group of the same legs, so one joined weight serves them all.
+fn consistent(trace: &Trace, groups: Vec<Group>) -> Vec<Group> {
+    // The nodes reading each param, through any of its values.
+    let mut readers: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); trace.params.len()];
+    let mut ins = Vec::new();
+    for (at, node) in trace.nodes.iter().enumerate() {
+        ins.clear();
+        node.op.inputs(&mut ins);
+        for v in &ins {
+            if let Def::Weight(p) = trace.values[v.0 as usize].def {
+                readers[p as usize].insert(at);
+            }
+        }
+    }
+    let legs_of = |g: &Group| -> Vec<u32> {
+        let mut legs = g.params.clone();
+        if let Some(b) = &g.biases {
+            legs.extend(b.iter().map(|b| b.param));
+        }
+        legs
+    };
+    let sites_of = |g: &Group| -> BTreeSet<usize> {
+        let mut sites: BTreeSet<usize> = g.nodes.iter().copied().collect();
+        if let Some(b) = &g.biases {
+            sites.extend(b.iter().map(|b| b.at));
+        }
+        sites
+    };
+    let mut by_leg: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (i, g) in groups.iter().enumerate() {
+        for p in legs_of(g) {
+            by_leg.entry(p).or_default().push(i);
+        }
+    }
+    let ok: Vec<bool> = groups
+        .iter()
+        .map(|g| {
+            legs_of(g).iter().all(|p| {
+                let mine = &by_leg[p];
+                let sites: BTreeSet<usize> =
+                    mine.iter().flat_map(|&i| sites_of(&groups[i])).collect();
+                mine.iter().all(|&i| legs_of(&groups[i]) == legs_of(g))
+                    && readers[*p as usize].is_subset(&sites)
+            })
+        })
+        .collect();
+    groups
+        .into_iter()
+        .zip(ok)
+        .filter_map(|(g, ok)| ok.then_some(g))
+        .collect()
 }
 
 /// `legs` joined along their rows under `name`: each one's cut a segment of
@@ -519,7 +579,8 @@ fn apply(mut trace: Trace, groups: &[Group]) -> Trace {
                 into.insert(*plane, (g as u32, i + 1));
             }
         }
-        joined_at.insert(first, made);
+        // A weight several sites read joins once; each site is rewritten.
+        joined_at.entry(first).or_insert(made);
     }
     let mut params = Vec::with_capacity(trace.params.len());
     let mut new_index: BTreeMap<u32, u32> = BTreeMap::new();
