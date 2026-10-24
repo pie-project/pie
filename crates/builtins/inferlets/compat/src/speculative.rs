@@ -144,17 +144,47 @@ impl Yield {
 
     /// Tokens a round at `width` is expected to emit, the target's own included.
     fn expect(&self, width: u32) -> f64 {
-        let (mut chain, mut total, mut rate) = (1.0f64, 1.0f64, 1.0f64);
-        for i in 0..width.saturating_sub(1) as usize {
-            // An untried position takes the rate of the one before it.
-            if self.tries[i] > 0.0 {
-                rate = self.hits[i] / self.tries[i];
-            }
-            chain *= rate;
-            total += chain;
-        }
-        total
+        1.0 + self
+            .survival(width)
+            .iter()
+            .map(|&c| f64::from(c))
+            .sum::<f64>()
     }
+
+    /// The chance a round at `width` keeps each of its proposals and every
+    /// one before it. An untried position takes the rate of the one before
+    /// it, so a lane with no rounds yet reads as sure: its first rounds are
+    /// how it learns.
+    fn survival(&self, width: u32) -> Vec<f32> {
+        let (mut chain, mut rate) = (1.0f64, 1.0f64);
+        (0..width.saturating_sub(1) as usize)
+            .map(|i| {
+                if self.tries[i] > 0.0 {
+                    rate = self.hits[i] / self.tries[i];
+                }
+                chain *= rate;
+                chain as f32
+            })
+            .collect()
+    }
+}
+
+/// Whether a round beside other requests drafts, and how wide.
+///
+/// Alone, a lane prices its own rounds by its own clock. Beside others that
+/// clock prices the batch it waited for, and a verify row costs every lane in
+/// the fire it batches into, so with no verify budget a crowded lane does not
+/// draft at all (#1040). Under the runtime's budget it bids its proposals'
+/// survival and verifies the prefix the budget grants it, which goes to the
+/// likeliest proposals across every drafting request and stops where the
+/// measured decode curve says rows stop being nearly free; a grant of no
+/// proposal is a plain fire. The draft fire itself is not in the budget.
+fn crowded(pipe: &Pipeline, yields: &Yield, widest: u32) -> Option<u32> {
+    if !Pipeline::verify_budgeted() {
+        return None;
+    }
+    let granted = pipe.allot_verify(&yields.survival(widest));
+    (granted > 0).then(|| (granted + 1).min(widest))
 }
 
 /// The widths a round may verify at: a fire's price is a staircase in rows.
@@ -204,6 +234,8 @@ pub async fn generate(
     // closure waits: a probe that loses doubles it.
     let (mut wait, mut backoff) = (0u32, 8u32);
     let mut rounds = 0u32;
+    // Whether this lane's bid for verify rows stands.
+    let mut bidding = false;
     while generated < max_tokens {
         // Price the plain fire first; then draft at the widest rung until the
         // yield is known, then at whichever width (or none) earns the most.
@@ -211,11 +243,21 @@ pub async fn generate(
             .iter()
             .filter_map(|&w| prices.round(w).map(|p| (w, yields.expect(w) / p)))
             .max_by(|a, b| a.1.total_cmp(&b.1));
+        let live = Pipeline::live();
+        if bidding && live <= 1 {
+            // Alone again: a standing bid would only hold rows from no one.
+            bidding = false;
+            let _ = pipe.allot_verify(&[]);
+        }
         let width = match (Prices::median(&prices.verify[1]), best) {
             (None, _) => None,
             // Beside other requests a plain fire batches with theirs for
-            // nearly nothing, and a round would cost all of them.
-            _ if Pipeline::live() > 1 => None,
+            // nearly nothing, and a round costs all of them: it drafts only
+            // for the rows a verify budget grants.
+            _ if live > 1 => {
+                bidding = true;
+                crowded(&pipe, &yields, widest)
+            }
             (Some(_), _) if rounds < 2 => Some(widest),
             (Some(_), _) if wait > 1 => {
                 wait -= 1;
@@ -289,4 +331,46 @@ pub async fn generate(
     }
     pipe.close();
     Ok((generated, cached))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn yields(widest: usize) -> Yield {
+        Yield {
+            hits: vec![0.0; widest],
+            tries: vec![0.0; widest],
+        }
+    }
+
+    #[test]
+    fn a_lane_with_no_rounds_bids_as_sure() {
+        assert_eq!(yields(4).survival(4), [1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn a_bid_is_the_chance_of_keeping_each_proposal_and_those_before_it() {
+        let mut y = yields(4);
+        // Half the rounds keep the first proposal; those that do keep the
+        // second; the third is never tried.
+        for kept in [0, 2, 0, 2] {
+            y.record(kept, 3);
+        }
+        let survival = y.survival(4);
+        assert!((survival[0] - 0.5).abs() < 0.05, "{survival:?}");
+        assert!((survival[1] - survival[0]).abs() < 1e-6, "{survival:?}");
+        assert!((survival[2] - survival[1]).abs() < 1e-6, "{survival:?}");
+    }
+
+    #[test]
+    fn the_expected_round_is_one_plus_the_survivals() {
+        let mut y = yields(4);
+        for kept in [1, 0, 3, 1] {
+            y.record(kept, 4);
+        }
+        let sum: f64 = y.survival(4).iter().map(|&c| f64::from(c)).sum();
+        assert!((y.expect(4) - 1.0 - sum).abs() < 1e-9);
+        assert_eq!(y.survival(1), Vec::<f32>::new());
+    }
 }
