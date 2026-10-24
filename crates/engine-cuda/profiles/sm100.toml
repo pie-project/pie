@@ -44,13 +44,15 @@ ssm.conv_vec4 = true
 elemwise.rows_vec = true
 elemwise.hc_tile = true
 elemwise.hc_mma = true
-# A sublayer's fold and the next one's pre-mix in one tcgen05 launch from 64
-# to 1024 rows (DeepSeek-V4-Flash, held operand: 64 rows 16.9 -> 15.5 us,
-# 128 42.4 -> 19.9, 256 45.2 -> 23.0, 512 51.7 -> 33.1, 1024 64.2 -> 59.1);
-# a decode's few rows run the launches apart (11.2 against 12.3 at 8), and
-# past 1024 they are even.
-elemwise.hc_mega_from = 64
-elemwise.hc_mega_until = 1024
+# A sublayer's fold and the next one's pre-mix in one tcgen05 launch from 43
+# to 1120 rows, where it wins by 3% or more (DeepSeek-V4-Flash, held
+# operand, medians of 5: 43 rows 16.2 -> 15.2 us, 64 17.0 -> 15.7, 128
+# 42.5 -> 20.6, 256 45.4 -> 23.8, 512 52.0 -> 34.8, 1024 64.6 -> 61.2,
+# 1120 67.4 -> 64.8); under 43 rows the launches apart win (42: 14.6
+# against 15.1), and past 1120 they are even (1152: 68.2 against 66.5,
+# 1280: 72.9 against 73.9).
+elemwise.hc_mega_from = 43
+elemwise.hc_mega_until = 1120
 # Gemma 4's q norm and rotation on its kv-shared layers a warp a (row, head).
 elemwise.q_norm_rope_warp = true
 # A fused norm-and-fold leaves unwritten the rows nothing reads past it.

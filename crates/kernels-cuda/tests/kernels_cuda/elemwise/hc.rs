@@ -668,7 +668,12 @@ fn the_seam_rate() {
         t.norm_emit = true;
         t
     };
-    for rows in [1usize, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096] {
+    // `PIE_HC_SEAM_ROWS` (comma-separated) narrows the rows measured.
+    let rows_of: Vec<usize> = std::env::var("PIE_HC_SEAM_ROWS")
+        .ok()
+        .map(|v| v.split(',').filter_map(|r| r.trim().parse().ok()).collect())
+        .unwrap_or_else(|| vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096]);
+    for rows in rows_of {
         let per = 24 * M * H * 4 + rows * (H * 2 * 3 + M * H * 2 * 2);
         let sets = (320usize << 20).div_ceil(per).clamp(2, 64);
         let inputs: Vec<SeamIn> = (0..sets)
