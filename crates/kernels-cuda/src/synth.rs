@@ -47,6 +47,8 @@ pub enum In {
     Rows(Dtype),
     /// One row every row reads (a norm's weight).
     Shared(Dtype),
+    /// One element every row reads (a layer's scale): a scalar parameter.
+    One(Dtype),
 }
 
 /// How a region's result is stored.
@@ -92,7 +94,7 @@ pub fn supports(region: &Region, ins: &[In], outs: &[Out]) -> Result<(), Refusal
     let dtypes = ins
         .iter()
         .map(|form| match form {
-            In::Rows(dtype) | In::Shared(dtype) => ("parameter", *dtype),
+            In::Rows(dtype) | In::Shared(dtype) | In::One(dtype) => ("parameter", *dtype),
         })
         .chain(outs.iter().map(|Out::Rows(dtype)| ("result", *dtype)));
     for (k, (what, dtype)) in dtypes.enumerate() {
@@ -149,23 +151,36 @@ pub struct Synthesized {
     ins: usize,
     outs: usize,
     width: u32,
+    /// The parameters (by bit) the frame reads one element of.
+    ones: u32,
 }
 
 /// The kernel for `body` (the body of a region [`supports`] takes) over
-/// `ins` parameters and `outs` results, rows `width` wide: the same one for
-/// every call with the same body and shape. Nothing compiles here;
-/// [`Synthesized::load`] does.
-pub fn synth(body: &Body, ins: usize, outs: usize, width: u32) -> Result<Synthesized, Error> {
-    if ins == 0 || outs == 0 {
+/// parameters stored as `ins` and `outs` results, rows `width` wide: the
+/// same one for every call with the same body and shape. Nothing compiles
+/// here; [`Synthesized::load`] does.
+pub fn synth(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Synthesized, Error> {
+    if ins.is_empty() || outs == 0 {
         return Err(refuse(OP, "a region of no parameter or no result"));
     }
+    if ins.len() > 32 {
+        return Err(refuse(OP, "a region of more than 32 parameters"));
+    }
+    let ones = (0u32..)
+        .zip(ins)
+        .filter(|(_, form)| matches!(form, In::One(_)))
+        .fold(0u32, |mask, (k, _)| mask | 1 << k);
     let per = frame::per(OP, width)?;
     let root = unit(body)?;
     Ok(Synthesized {
-        kernel: crate::jit::generated(root, &frame::entrypoint(BODY, per, ins, outs)),
-        ins,
+        kernel: crate::jit::generated(
+            root,
+            &frame::entrypoint(BODY, per, ins.len(), outs, ones),
+        ),
+        ins: ins.len(),
         outs,
         width,
+        ones,
     })
 }
 
@@ -217,7 +232,8 @@ impl Synthesized {
     /// Fires the kernel over `rows` rows, the stage window's live ones
     /// (`ctx.stage()`) where one is armed: `ins[k]` is the region's
     /// parameter `k` and `outs[k]` its result `k`, each a 16-byte aligned
-    /// bf16 plane. Refused unless [`Synthesized::load`] loaded it on this
+    /// bf16 plane (a scalar parameter's, [`In::One`], its one element, any
+    /// alignment). Refused unless [`Synthesized::load`] loaded it on this
     /// device.
     pub fn fire(self, ctx: &Ctx, ins: &[Plane], outs: &[Plane], rows: u32) -> Result<(), Error> {
         if ins.len() != self.ins || outs.len() != self.outs {
@@ -252,6 +268,7 @@ impl Synthesized {
             outs,
             rows,
             self.width,
+            self.ones,
         )
     }
 }

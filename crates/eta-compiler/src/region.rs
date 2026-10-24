@@ -132,9 +132,10 @@ impl std::error::Error for RegionError {}
 /// };
 /// ```
 ///
-/// fired as `::pie::elemwise::row_frame<Body, BLOCK, PER, IN, OUT>(planes,
+/// fired as `::pie::elemwise::row_frame<Body, BLOCK, PER, IN, OUT, ONES>(planes,
 /// Body{}, win)`, `IN` the region's parameters and `OUT` its results, every
-/// one a row plane. The struct holds no fields: the region's constants (a
+/// one a plane: a row plane, or (a bit of `ONES`) a scalar parameter's one
+/// element. The struct holds no fields: the region's constants (a
 /// norm's eps, its width) are literals in the source, so `hash` keys them.
 /// Inside `operator()`, `F` provides:
 ///
@@ -142,6 +143,7 @@ impl std::error::Error for RegionError {}
 /// |---|---|
 /// | `F::N` | the elements of the row a thread holds (`PER * 8`) |
 /// | `f.ld(k, e)` | element `e` of parameter `k`, as f32 |
+/// | `f.one(k)` | scalar parameter `k`, one value every row reads (a layer's scale), as f32 |
 /// | `f.st(k, e, v)` | write element `e` of result `k`; returns `v` as stored (rounded to the plane's dtype), which every later read of that value uses |
 /// | `f.valid(e)` | element `e` lies inside the row; elements past it read garbage, and the body keeps them out of its reductions |
 /// | `f.reduce_sum(v)`, `f.reduce_max(v)` | `v` combined over the block, the total returned to every thread |
@@ -151,8 +153,9 @@ impl std::error::Error for RegionError {}
 /// - **Indices are constant.** Every `k` and `e` the body passes is a
 ///   constant once its loops unroll, so the frame's arrays stay in
 ///   registers.
-/// - **Rows only.** Parameters and results are rows of the region's width;
-///   a region with a scalar parameter or result has no body.
+/// - **Rows.** Results are rows of the region's width, and parameters rows
+///   or scalars (one value every row reads); a region with a scalar result
+///   has no body.
 /// - **Math.** f32, each op as the region states it, in its order (the JIT
 ///   compiles with `fmad=false`, so a product and a sum stay two roundings),
 ///   through `expf`, `logf`, `sinf`, `cosf`, `sqrtf`, `rsqrtf`, `fmaxf`,

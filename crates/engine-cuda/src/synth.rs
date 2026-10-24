@@ -69,7 +69,10 @@ impl Regions {
                 .iter()
                 .map(|&v| {
                     let dtype = stored(v)?;
-                    Ok(if shared(&trace.values[v.0 as usize]) {
+                    let decl = &trace.values[v.0 as usize];
+                    Ok(if one(decl) {
+                        In::One(dtype)
+                    } else if shared(decl) {
                         In::Shared(dtype)
                     } else {
                         In::Rows(dtype)
@@ -88,7 +91,7 @@ impl Regions {
                 )));
             }
             if let std::collections::btree_map::Entry::Vacant(slot) = kernels.entry((body, width)) {
-                let kernel = kernels_cuda::synth::synth(&synth.body, ins.len(), outs.len(), width)?;
+                let kernel = kernels_cuda::synth::synth(&synth.body, &forms, outs.len(), width)?;
                 kernel.load()?;
                 slot.insert(kernel);
             }
@@ -155,6 +158,14 @@ fn aliased(ins: &[ValueId], outs: &[ValueId]) -> Option<String> {
 pub(crate) fn shared(decl: &ValueDecl) -> bool {
     matches!(decl.def, Def::Weight(_))
         && matches!(&decl.ty, Ty::Tensor { shape, .. } if shape.len() == 1)
+}
+
+/// Whether `decl` is one element every row reads: a weight of one element
+/// (a layer's scale).
+#[cfg(not(feature = "rocm"))]
+pub(crate) fn one(decl: &ValueDecl) -> bool {
+    matches!(decl.def, Def::Weight(_))
+        && matches!(&decl.ty, Ty::Tensor { shape, .. } if shape.as_slice() == [poem_ir::Dim::Const(1)])
 }
 
 /// How `v` is stored, a weight as its parameter states; `None` for a

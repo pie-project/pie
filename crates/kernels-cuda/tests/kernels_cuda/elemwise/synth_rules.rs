@@ -44,6 +44,9 @@ use kernels_cuda::tuning::Tuning;
 
 const EPS: f32 = 1e-6;
 
+/// Gemma 4's layer scale, as a bf16.
+const SCALE: f32 = 0.71875;
+
 /// One chain a hand rule forms and the fold forms as a region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Chain {
@@ -51,11 +54,14 @@ enum Chain {
     ResidualNorm { plus_one: bool, stream: bool },
     /// `rmsnorm_residual_add`; `post` whether the sum is normed again.
     NormResidual { post: bool },
+    /// `rmsnorm_residual_add` with Gemma 4's layer scale (a weight of one
+    /// element) on the sum, then the next norm.
+    ScaledNormResidual,
 }
 
 impl Chain {
     /// The chains the bench times, as the catalog forms them most.
-    const TIMED: [Chain; 4] = [
+    const TIMED: [Chain; 5] = [
         Chain::ResidualNorm {
             plus_one: false,
             stream: true,
@@ -66,6 +72,7 @@ impl Chain {
         },
         Chain::NormResidual { post: false },
         Chain::NormResidual { post: true },
+        Chain::ScaledNormResidual,
     ];
 
     fn name(self) -> &'static str {
@@ -74,6 +81,7 @@ impl Chain {
             Chain::ResidualNorm { stream: false, .. } => "residual_add_rmsnorm (final)",
             Chain::NormResidual { post: false } => "rmsnorm_residual_add",
             Chain::NormResidual { post: true } => "rmsnorm_residual_add + post",
+            Chain::ScaledNormResidual => "rmsnorm_residual_add scaled",
         }
     }
 
@@ -82,7 +90,9 @@ impl Chain {
         match self {
             Chain::ResidualNorm { .. } => [2048, 4096, 5120, 6144, 8192],
             // 8192 is past the frame with post's six planes; Gemma's widths
-            Chain::NormResidual { .. } => [1536, 2560, 2816, 3840, 5376],
+            Chain::NormResidual { .. } | Chain::ScaledNormResidual => {
+                [1536, 2560, 2816, 3840, 5376]
+            }
         }
     }
 
@@ -92,6 +102,15 @@ impl Chain {
             Chain::ResidualNorm { .. } => &[2],
             Chain::NormResidual { post: false } => &[1],
             Chain::NormResidual { post: true } => &[1, 3],
+            Chain::ScaledNormResidual => &[1, 4],
+        }
+    }
+
+    /// Which parameters are one element every row reads.
+    fn ones(self) -> &'static [usize] {
+        match self {
+            Chain::ScaledNormResidual => &[3],
+            _ => &[],
         }
     }
 
@@ -99,6 +118,7 @@ impl Chain {
         match self {
             Chain::ResidualNorm { stream, .. } => 1 + usize::from(stream),
             Chain::NormResidual { post } => 1 + usize::from(post),
+            Chain::ScaledNormResidual => 2,
         }
     }
 
@@ -106,8 +126,8 @@ impl Chain {
     /// parameter row read, each result row written, each weight once.
     fn bytes(self, rows: usize, width: usize) -> usize {
         let plane = rows * width * 2;
-        let rows_in = self.region(width).params.len() - self.shared().len();
-        (rows_in + self.outs()) * plane + self.shared().len() * width * 2
+        let rows_in = self.region(width).params.len() - self.shared().len() - self.ones().len();
+        (rows_in + self.outs()) * plane + self.shared().len() * width * 2 + self.ones().len() * 2
     }
 
     /// The region `fuse::chain` lowers the chain to.
@@ -122,6 +142,19 @@ impl Chain {
                 let out = b.scaled(n, 2, plus_one);
                 b.round(out);
                 b.finish(if stream { vec![h, out] } else { vec![out] })
+            }
+            Chain::ScaledNormResidual => {
+                // parameters x, w, y, the scale, the post norm's weight
+                b.params(5);
+                let n = b.rms_normed(0);
+                let t = b.scaled(n, 1, false);
+                b.round(t);
+                let sum = b.stored(Op::Add(2, t));
+                let scaled = b.stored(Op::Mul(sum, 3));
+                let n = b.rms_normed(scaled);
+                let out = b.scaled(n, 4, false);
+                b.round(out);
+                b.finish_with(vec![scaled, out], &[3])
             }
             Chain::NormResidual { post } => {
                 // parameters x, w, y, then the post norm's weight
@@ -210,14 +243,25 @@ impl Build {
     }
 
     fn finish(self, results: Vec<u32>) -> Region {
+        self.finish_with(results, &[])
+    }
+
+    /// The region, the parameters `ones` names scalars.
+    fn finish_with(self, results: Vec<u32>, ones: &[usize]) -> Region {
         let row = SymbolicType {
             dtype: eta_ir::Dtype::F32,
             dims: vec![Dimension::Static(
                 u32::try_from(self.width).expect("a width"),
             )],
         };
+        let one = SymbolicType {
+            dtype: eta_ir::Dtype::F32,
+            dims: Vec::new(),
+        };
         Region {
-            params: vec![row; self.params as usize],
+            params: (0..self.params as usize)
+                .map(|k| if ones.contains(&k) { one.clone() } else { row.clone() })
+                .collect(),
             ops: self.ops,
             results,
             rounds: self.rounds,
@@ -230,7 +274,9 @@ fn generated(chain: Chain, width: usize) -> Synthesized {
     let region = chain.region(width);
     let ins: Vec<In> = (0..region.params.len())
         .map(|k| {
-            if chain.shared().contains(&k) {
+            if chain.ones().contains(&k) {
+                In::One(Bf16)
+            } else if chain.shared().contains(&k) {
                 In::Shared(Bf16)
             } else {
                 In::Rows(Bf16)
@@ -242,7 +288,7 @@ fn generated(chain: Chain, width: usize) -> Synthesized {
     let body = region.body().expect("the stream core writes the region");
     let kernel = synth::synth(
         &body,
-        ins.len(),
+        &ins,
         outs.len(),
         u32::try_from(width).expect("a width"),
     )
@@ -278,11 +324,13 @@ impl Knobs {
     }
 
     /// The rows the hand norm-and-fold lands: under `skip_unread` the
-    /// engine leaves the normed row it alone reads unwritten.
-    fn keep(self) -> Keep {
-        match self {
-            Knobs::Default => Keep::ALL,
-            Knobs::Tuned => Keep { t: false, y: true },
+    /// engine leaves the normed row it alone reads unwritten, and the sum
+    /// too where only its scaled copy goes on.
+    fn keep(self, chain: Chain) -> Keep {
+        match (self, chain) {
+            (Knobs::Default, _) => Keep::ALL,
+            (Knobs::Tuned, Chain::ScaledNormResidual) => Keep { t: false, y: false },
+            (Knobs::Tuned, _) => Keep { t: false, y: true },
         }
     }
 }
@@ -317,6 +365,8 @@ impl Planes {
 struct Weights {
     w: u64,
     w1: u64,
+    /// A layer's scale: one element.
+    s: u64,
 }
 
 /// The hand kernel of `chain` over `p`: the stream summed into `y`.
@@ -358,7 +408,26 @@ fn fire_hand(
                     eps: EPS,
                     out: &mut out,
                 }),
-                knobs.keep(),
+                knobs.keep(chain),
+            )
+        }
+        Chain::ScaledNormResidual => {
+            let (mut out, mut scaled) = (t(p.out), t(p.h));
+            norm_residual::rmsnorm_residual_add_keeping(
+                ctx,
+                t(p.x),
+                weight(w.w),
+                EPS,
+                &mut t(p.t),
+                &mut t(p.y),
+                Some((ten(w.s, 1, 1, Bf16), &mut scaled)),
+                Some(PostNorm {
+                    weight: weight(w.w1),
+                    plus_one: false,
+                    eps: EPS,
+                    out: &mut out,
+                }),
+                knobs.keep(chain),
             )
         }
     }
@@ -390,6 +459,16 @@ fn fire_region(
         }
         Chain::NormResidual { post: true } => (
             vec![row(p.x), weight(w.w), row(p.y), weight(w.w1)],
+            vec![row(p.h), row(p.out)],
+        ),
+        Chain::ScaledNormResidual => (
+            vec![
+                row(p.x),
+                weight(w.w),
+                row(p.y),
+                Plane::shared(&ten(w.s, 1, 1, Bf16)),
+                weight(w.w1),
+            ],
             vec![row(p.h), row(p.out)],
         ),
     };
@@ -456,11 +535,18 @@ fn land(chain: Chain, rows: usize, width: usize, by: Option<Knobs>) -> Landed {
     let weights = Weights {
         w: gpu.up(&w),
         w1: gpu.up(&w1),
+        s: gpu.up(&[to_bf16(SCALE)]),
     };
     let stream_at = match by {
         Some(knobs) => {
             fire_hand(&knobs.ctx(&gpu), knobs, chain, rows, width, p, weights);
-            p.y
+            // the hand kernel sums the stream into `y`, and lands a scaled
+            // one in its own plane
+            if chain == Chain::ScaledNormResidual {
+                p.h
+            } else {
+                p.y
+            }
         }
         None => {
             let kernel = generated(chain, width);
@@ -470,9 +556,9 @@ fn land(chain: Chain, rows: usize, width: usize, by: Option<Knobs>) -> Landed {
     };
     gpu.sync();
     let (stream, out) = match chain {
-        Chain::ResidualNorm { stream: true, .. } | Chain::NormResidual { post: true } => {
-            (Some(gpu.down(stream_at, n)), gpu.down(p.out, n))
-        }
+        Chain::ResidualNorm { stream: true, .. }
+        | Chain::NormResidual { post: true }
+        | Chain::ScaledNormResidual => (Some(gpu.down(stream_at, n)), gpu.down(p.out, n)),
         Chain::ResidualNorm { stream: false, .. } => (None, gpu.down(p.out, n)),
         Chain::NormResidual { post: false } => (None, gpu.down(stream_at, n)),
     };
@@ -514,10 +600,25 @@ fn host(chain: Chain, rows: usize, width: usize) -> Landed {
                     out.extend((0..width).map(|e| to_bf16(sum[e] * r * w1[e])));
                 }
             }
+            Chain::ScaledNormResidual => {
+                let r = inv(x);
+                let scaled: Vec<f32> = (0..width)
+                    .map(|e| {
+                        let t = from_bf16(to_bf16(x[e] * r * w[e]));
+                        let sum = from_bf16(to_bf16(y[e] + t));
+                        from_bf16(to_bf16(sum * from_bf16(to_bf16(SCALE))))
+                    })
+                    .collect();
+                stream.extend(scaled.iter().map(|&v| to_bf16(v)));
+                let r = inv(&scaled);
+                out.extend((0..width).map(|e| to_bf16(scaled[e] * r * w1[e])));
+            }
         }
     }
     match chain {
-        Chain::ResidualNorm { stream: true, .. } | Chain::NormResidual { post: true } => Landed {
+        Chain::ResidualNorm { stream: true, .. }
+        | Chain::NormResidual { post: true }
+        | Chain::ScaledNormResidual => Landed {
             stream: Some(stream),
             out,
         },
@@ -562,7 +663,7 @@ fn each_rules_region_lands_its_math_and_is_set_against_the_hand_kernel() {
                     // up again: a sanity bound; the hand kernel's bits are
                     // the test
                     let within = match (chain, what) {
-                        (Chain::NormResidual { .. }, _) => 8.0,
+                        (Chain::NormResidual { .. } | Chain::ScaledNormResidual, _) => 8.0,
                         _ => 1.0,
                     };
                     let (_, most) = apart(got, want);
@@ -652,6 +753,7 @@ fn synthesized_rule_rate() {
                 let weights = Weights {
                     w: gpu.zeros(width * 2),
                     w1: gpu.zeros(width * 2),
+                    s: gpu.zeros(16),
                 };
                 let sets: Vec<Planes> = (0..copies)
                     .map(|_| Planes::zeros(&mut gpu, plane))

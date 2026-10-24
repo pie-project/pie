@@ -39,6 +39,8 @@ pub struct Uncovered {
 enum Held {
     /// A parameter, read through `f.ld`.
     Param { k: u32 },
+    /// A scalar parameter, one value every row reads: `f.one(k)`.
+    One { k: u32 },
     /// A uniform: one per row, a local named `v{id}`.
     Uniform,
     /// A row value local to the loop that computes it.
@@ -87,18 +89,20 @@ pub(crate) fn emit_body(
     let count = streams.view.value_types.len();
     let mut values: Vec<Option<Value>> = (0..count).map(|_| None).collect();
     for k in 0..params {
-        if !matches!(streams.class(k), RowClass::Full(_)) {
-            return Err(whole(
-                "a parameter that is not a row, and a frame's planes are rows",
-            ));
-        }
+        let held = match streams.class(k) {
+            RowClass::Full(_) => Held::Param { k },
+            RowClass::Scalar => Held::One { k },
+            _ => {
+                return Err(whole(
+                    "a parameter that is neither a row nor a scalar, and a frame's planes are \
+                     one of those",
+                ));
+            }
+        };
         if streams.dtype(k) != Dtype::F32 {
             return Err(whole("a parameter that is not f32, and `f.ld` reads f32"));
         }
-        values[k as usize] = Some(Value {
-            phase: 0,
-            held: Held::Param { k },
-        });
+        values[k as usize] = Some(Value { phase: 0, held });
     }
     for &r in results {
         if r as usize >= count
@@ -435,6 +439,7 @@ fn c_type(dtype: Dtype) -> &'static str {
 fn name(values: &[Option<Value>], value: u32) -> String {
     match values[value as usize].as_ref().map(|v| v.held) {
         Some(Held::Param { k }) => format!("f.ld({k}, e)"),
+        Some(Held::One { k }) => format!("f.one({k})"),
         Some(Held::Kept) => format!("v{value}[e]"),
         _ => format!("v{value}"),
     }

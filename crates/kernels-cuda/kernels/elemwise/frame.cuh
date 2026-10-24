@@ -28,8 +28,10 @@ struct Planes {
 // where its results go, and the row's sums. Every index a body passes is a
 // constant once its loops unroll, so the arrays live in registers. An
 // element past the row (`!valid(e)`) reads garbage and is never stored; a
-// body keeps it out of its reductions.
-template <int BLOCK, int PER, int IN, int OUT>
+// body keeps it out of its reductions. A parameter whose bit `ONES` sets is
+// one element every row reads (a layer's scale), read once and named
+// `one(k)`; its plane is never read as a row.
+template <int BLOCK, int PER, int IN, int OUT, unsigned ONES = 0u>
 struct RowFrame {
     static constexpr int N = PER * 8;
 
@@ -40,6 +42,7 @@ struct RowFrame {
     uint4* dst[OUT];
     uint4 in[IN][PER];
     uint4 out[OUT][PER];
+    float ones[IN];
 
     // Every parameter's vectors are issued up front, before any body math.
     __device__ __forceinline__ RowFrame(const Planes<IN, OUT>& planes, long long row, float* buf)
@@ -53,6 +56,10 @@ struct RowFrame {
         }
 #pragma unroll
         for (int k = 0; k < IN; ++k) {
+            if ((ONES >> k) & 1u) {
+                ones[k] = bf16_to_f32(planes.in[k].base[0]);
+                continue;
+            }
             const uint4* src =
                 reinterpret_cast<const uint4*>(planes.in[k].base + row * planes.in[k].row_stride);
 #pragma unroll
@@ -64,6 +71,8 @@ struct RowFrame {
     }
 
     __device__ __forceinline__ bool valid(int e) const { return tid + (e / 8) * BLOCK < vectors; }
+
+    __device__ __forceinline__ float one(int k) const { return ones[k]; }
 
     __device__ __forceinline__ float ld(int k, int e) const {
         return bf16_to_f32(reinterpret_cast<const bf16*>(&in[k][e / 8])[e % 8]);
@@ -108,7 +117,7 @@ struct RowFrame {
 // A row frame a block a row: `body(f)` computes the row in hooks over `f`,
 // its own fields (a norm's eps) passed by value. The rows past a staged
 // window's live count are left as they are.
-template <class Body, int BLOCK, int PER, int IN, int OUT>
+template <class Body, int BLOCK, int PER, int IN, int OUT, unsigned ONES = 0u>
 __global__ void __launch_bounds__(BLOCK) row_frame(
     const Planes<IN, OUT> planes,
     const Body body,
@@ -123,7 +132,7 @@ __global__ void __launch_bounds__(BLOCK) row_frame(
     const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
 
     __shared__ float buf[BLOCK / 32 + 1];
-    RowFrame<BLOCK, PER, IN, OUT> f(planes, plane_row, buf);
+    RowFrame<BLOCK, PER, IN, OUT, ONES> f(planes, plane_row, buf);
     body(f);
 }
 

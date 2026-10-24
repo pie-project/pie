@@ -72,14 +72,20 @@ pub(crate) fn per(op: &'static str, width: u32) -> Result<u32, Error> {
 }
 
 /// The frame's kernel around `body` (a type the unit defines) for `ins`
-/// parameters and `outs` results, `per` vectors a thread.
-pub(crate) fn entrypoint(body: &str, per: u32, ins: usize, outs: usize) -> String {
-    format!("::pie::elemwise::row_frame<{body}, {BLOCK}, {per}, {ins}, {outs}>")
+/// parameters and `outs` results, `per` vectors a thread, the parameters
+/// `ones` sets (by bit) read as one element.
+pub(crate) fn entrypoint(body: &str, per: u32, ins: usize, outs: usize, ones: u32) -> String {
+    if ones == 0 {
+        format!("::pie::elemwise::row_frame<{body}, {BLOCK}, {per}, {ins}, {outs}>")
+    } else {
+        format!("::pie::elemwise::row_frame<{body}, {BLOCK}, {per}, {ins}, {outs}, {ones}u>")
+    }
 }
 
 /// Fires `kernel`, a row frame of [`entrypoint`] (`fields` its body's
 /// members by value), over `rows` rows of bf16 planes `width` wide:
-/// `ins[k]` is the body's parameter `k` and `outs[k]` its result `k`.
+/// `ins[k]` is the body's parameter `k` and `outs[k]` its result `k`, a
+/// parameter `ones` sets (by bit) one element, read as is.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fire(
     ctx: &Ctx,
@@ -90,10 +96,14 @@ pub(crate) fn fire(
     outs: &[Plane],
     rows: u32,
     width: u32,
+    ones: u32,
 ) -> Result<(), Error> {
     let rows = nonzero(op, "rows", rows)?;
-    if !ins
-        .iter()
+    let rowed = (0u32..)
+        .zip(ins)
+        .filter(|(k, _)| (ones >> k) & 1 == 0)
+        .map(|(_, p)| p);
+    if !rowed
         .chain(outs)
         .all(|p| aligned16(p.base) && p.row_stride % i64::from(VEC_WIDTH) == 0)
     {
@@ -144,11 +154,12 @@ pub fn residual_add_rmsnorm(
     fire(
         ctx,
         OP,
-        kernel(FRAME, &entrypoint(&body, per, 3, 2)),
+        kernel(FRAME, &entrypoint(&body, per, 3, 2, 0)),
         eps.arg(),
         &[Plane::rows(&x), Plane::rows(y), Plane::shared(&weight)],
         &[Plane::rows(out), Plane::rows(y)],
         y.rows,
         y.width,
+        0,
     )
 }

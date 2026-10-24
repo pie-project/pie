@@ -95,7 +95,8 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 /// `body` loaded for `ins` parameters and `outs` results at `width`.
 fn loaded(body: &Body, ins: usize, outs: usize, width: usize) -> synth::Synthesized {
     let kernel =
-        synth::synth(body, ins, outs, u32::try_from(width).expect("a width")).expect("synthesized");
+        synth::synth(body, &vec![In::Rows(Bf16); ins], outs, u32::try_from(width).expect("a width"))
+            .expect("synthesized");
     kernel
         .load()
         .expect("the generated kernel compiles and loads");
@@ -395,7 +396,8 @@ fn a_kernel_never_loaded_is_refused_at_its_fire() {
         results: vec![2],
         rounds: vec![],
     };
-    let kernel = synth::synth(&body_of(&region, &[]), 2, 1, width as u32).expect("synthesized");
+    let kernel = synth::synth(&body_of(&region, &[]), &[In::Rows(Bf16); 2], 1, width as u32)
+        .expect("synthesized");
     let mut gpu = Gpu::open();
     let at = gpu.zeros(width * 2);
     let plane = Plane::rows(&ten(at, 1, width, Bf16));
