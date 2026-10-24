@@ -591,6 +591,10 @@ pub struct Run<'c> {
     /// This rank's expert-parallel group, where the trace dispatches.
     ep: Option<&'c crate::ep::EpRank>,
 
+    /// The node launching works on the received rows (an expert region's,
+    /// past its dispatch): its kernels see no window of this rank's.
+    received: Cell<bool>,
+
     /// Rows this walk quantized for the FP8 products, by value, staged
     /// window and context, with the region and hold they sit in: their codes
     /// and scales, for the later products of the same rows.
@@ -688,6 +692,7 @@ impl<'c> Run<'c> {
             tapping: None,
             expert: &[],
             ep: None,
+            received: Cell::new(false),
             #[cfg(feature = "rocm")]
             fp8_rows: Vec::new(),
             #[cfg(feature = "rocm")]
@@ -785,6 +790,26 @@ impl<'c> Run<'c> {
     pub fn ep(mut self, ep: Option<&'c crate::ep::EpRank>) -> Self {
         self.ep = ep;
         self
+    }
+
+    /// Notes whether `node` works on the received rows: it makes an expert
+    /// region's value and is not the dispatch that receives them (which
+    /// reads this rank's own live tokens).
+    pub(crate) fn enter(&self, node: &poem_ir::Node) {
+        use poem_ir::Operands;
+        if self.expert.is_empty() {
+            return;
+        }
+        let dispatch = matches!(
+            node.op,
+            poem_ir::Operation::Collective(poem_ir::Collective::Dispatch { .. })
+        );
+        let mut outs = Vec::new();
+        node.op.outputs(&mut outs);
+        let held = outs
+            .iter()
+            .any(|v| self.expert.get(v.0 as usize).copied().unwrap_or(false));
+        self.received.set(held && !dispatch);
     }
 
     pub(crate) fn ep_rank(&self) -> Option<&'c crate::ep::EpRank> {
@@ -1242,8 +1267,15 @@ impl<'c> Run<'c> {
                 n => self.side.get(n as usize - 1).copied().unwrap_or(self.ctx),
             },
         };
-        ctx.arm(self.here());
-        ctx.arm_stage(self.live_at());
+        // The received rows are every rank's, padding marked -1: neither
+        // this rank's window nor its pad says which are live.
+        if self.received.get() {
+            ctx.arm(Pad::default());
+            ctx.arm_stage(0);
+        } else {
+            ctx.arm(self.here());
+            ctx.arm_stage(self.live_at());
+        }
         let region = self.place.region.get();
         ctx.arm_region(region);
         ctx.arm_lane(self.place.lane.get());

@@ -5,6 +5,7 @@ pub mod diag;
 mod enqueue;
 mod lanes;
 mod load;
+pub use load::Staged;
 mod prepare;
 mod segments;
 mod settle;

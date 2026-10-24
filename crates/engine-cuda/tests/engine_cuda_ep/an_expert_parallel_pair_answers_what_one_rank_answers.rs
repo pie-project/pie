@@ -118,7 +118,19 @@ impl Loaded {
     }
 }
 
-fn load(trace: &Trace, rank: u32, tag: &str) -> Loaded {
+/// Moves a value to the thread that drives it: see `Loaded`'s `Send`.
+struct Carried<T>(T);
+
+// SAFETY: as `Loaded`'s.
+unsafe impl<T> Send for Carried<T> {}
+
+/// A rank's load up to its bodies, and the directory its checkpoint is in.
+fn stage(
+    trace: &Trace,
+    rank: u32,
+    tag: &str,
+    graphs: bool,
+) -> (engine_cuda::serve::Staged, Scratch) {
     let dir = std::env::temp_dir().join(format!("pie-ep-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("the scratch directory");
@@ -129,8 +141,9 @@ fn load(trace: &Trace, rank: u32, tag: &str) -> Loaded {
         poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
             .expect("a container of the plan's own planes is read by its own names");
     drop(source);
-    let chip = engine_cuda::chip::profile("[engine]\ngraphs = \"off\"\n");
-    let shell = Shell::load(engine_cuda::Boot {
+    let graphs = if graphs { "on" } else { "off" };
+    let chip = engine_cuda::chip::profile(&format!("[engine]\ngraphs = \"{graphs}\"\n"));
+    let staged = Shell::stage(engine_cuda::Boot {
         trace: trace.clone(),
         contract: &contract,
         checkpoint: &container,
@@ -155,10 +168,53 @@ fn load(trace: &Trace, rank: u32, tag: &str) -> Loaded {
         comm: core::ptr::null_mut(),
     })
     .expect("the micro loads");
+    (staged, Scratch(dir))
+}
+
+fn load(trace: &Trace, tag: &str, graphs: bool) -> Loaded {
+    let (staged, dir) = stage(trace, 0, tag, graphs);
     Loaded {
-        shell,
-        _dir: Scratch(dir),
+        shell: staged.finish().expect("the micro arms"),
+        _dir: dir,
     }
+}
+
+/// A staged rank armed on the thread that will have driven it.
+fn arm(staged: Carried<(engine_cuda::serve::Staged, Scratch)>) -> Carried<Loaded> {
+    let Carried((staged, dir)) = staged;
+    engine_cuda::device::ctx::bind_thread(0).unwrap();
+    Carried(Loaded {
+        shell: staged.finish().expect("the rank arms"),
+        _dir: dir,
+    })
+}
+
+/// The group's ranks, wired between staging and arming: arming fires the
+/// collectives, so every rank arms at once.
+fn group(lowered: &Trace, graphs: bool) -> Vec<Loaded> {
+    let mut staged: Vec<_> = (0..RANKS)
+        .map(|r| stage(lowered, r, &format!("rank{r}-{graphs}"), graphs))
+        .collect();
+    let shape = staged[0]
+        .0
+        .shell
+        .ep_shape()
+        .expect("the lowered micro dispatches");
+    let wires = wire(&[0, 0], shape.widest).expect("one device reaches itself");
+    for (r, (staged, _)) in staged.iter_mut().enumerate() {
+        let ep = EpRank::new(wires.clone(), r as u32, &shape.layers).expect("the placement");
+        staged.shell.join_ep(ep);
+    }
+    std::thread::scope(|scope| {
+        let armed: Vec<_> = staged
+            .into_iter()
+            .map(|staged| {
+                let staged = Carried(staged);
+                scope.spawn(move || arm(staged))
+            })
+            .collect();
+        armed.into_iter().map(|h| h.join().unwrap().0).collect()
+    })
 }
 
 fn prompt(len: u32, seed: u32) -> Vec<u32> {
@@ -189,10 +245,17 @@ fn close(got: &[f32], want: &[f32], what: &str) {
 
 #[test]
 fn an_expert_parallel_pair_answers_what_one_rank_answers() {
+    let _alone = crate::alone();
     if !engine_cuda::device::present() {
         eprintln!("skipping: no CUDA device on this machine");
         return;
     }
+    check(false);
+    check(true);
+}
+
+/// Eager walks, or captured bodies armed on every rank at once.
+fn check(graphs: bool) {
     let whole = poem_compiler::catalog::trace_of(MICRO, Dtype::Bf16, Dtype::Bf16, Platform::Cuda);
     let lowered =
         poem_compiler::expert::lower(whole.clone(), RANKS, 0).expect("the micro's MoE lowers");
@@ -205,7 +268,7 @@ fn an_expert_parallel_pair_answers_what_one_rank_answers() {
     let word = |len: u32| whole.facts.word(&Request::new(len, false));
 
     // One rank holding every expert.
-    let mut one = load(&whole, 0, "one");
+    let mut one = load(&whole, &format!("one-{graphs}"), graphs);
     one.shell.open(0).unwrap();
     one.shell.open(1).unwrap();
     let want_a = one
@@ -226,17 +289,8 @@ fn an_expert_parallel_pair_answers_what_one_rank_answers() {
         .unwrap();
     drop(one);
 
-    let mut ranks: Vec<Loaded> = (0..RANKS)
-        .map(|r| load(&lowered, r, &format!("rank{r}")))
-        .collect();
-    let shape = ranks[0]
-        .shell
-        .ep_shape()
-        .expect("the lowered micro dispatches");
-    let wires = wire(&[0, 0], shape.widest).expect("one device reaches itself");
-    for (r, loaded) in ranks.iter_mut().enumerate() {
-        let ep = EpRank::new(wires.clone(), r as u32, &shape.layers).expect("the placement");
-        loaded.shell.join_ep(ep);
+    let mut ranks = group(&lowered, graphs);
+    for loaded in &mut ranks {
         loaded.shell.open(0).unwrap();
         loaded.shell.open(1).unwrap();
     }
@@ -259,8 +313,16 @@ fn an_expert_parallel_pair_answers_what_one_rank_answers() {
         let second = scope.spawn(|| r1.fire_at(bucket, lane(0, 52, &b)));
         (first.join().unwrap(), second.join().unwrap())
     });
-    close(&got_a[0], &want_a[0], "rank 0's prompt beside rank 1's");
-    close(&got_b[0], &want_b[0], "rank 1's prompt beside rank 0's");
+    close(
+        &got_a[0],
+        &want_a[0],
+        &format!("rank 0's prompt beside rank 1's (graphs {graphs})"),
+    );
+    close(
+        &got_b[0],
+        &want_b[0],
+        &format!("rank 1's prompt beside rank 0's (graphs {graphs})"),
+    );
 
     // Rank 1 idles through rank 0's step, serving its routes.
     let got = std::thread::scope(|scope| {
@@ -269,5 +331,9 @@ fn an_expert_parallel_pair_answers_what_one_rank_answers() {
         idle.join().unwrap();
         first.join().unwrap()
     });
-    close(&got[0], &want_a[0], "rank 0's prompt with rank 1 idle");
+    close(
+        &got[0],
+        &want_a[0],
+        &format!("rank 0's prompt with rank 1 idle (graphs {graphs})"),
+    );
 }

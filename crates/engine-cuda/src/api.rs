@@ -70,7 +70,12 @@ pub struct Cuda {
     /// This rank's place in its expert-parallel group (`size` 1 outside
     /// one): which experts' planes its banks load.
     expert: World,
+    /// Run between a load's staging and its arming: an expert-parallel
+    /// group wires its ranks there, since arming fires their collectives.
+    before_arming: Option<BeforeArming>,
 }
+
+pub(crate) type BeforeArming = Box<dyn FnMut(&mut Shell) -> std::result::Result<(), String> + Send>;
 
 impl Cuda {
     #[must_use]
@@ -90,7 +95,12 @@ impl Cuda {
             adapters: BTreeMap::new(),
             replay: None,
             expert: World::default(),
+            before_arming: None,
         }
+    }
+
+    pub(crate) fn before_arming(&mut self, hook: BeforeArming) {
+        self.before_arming = Some(hook);
     }
 
     /// Places this engine at `rank` of an expert-parallel group of `size`,
@@ -627,7 +637,7 @@ impl Engine for Cuda {
         let patches = patch_ladder(&trace, &budgets);
         let voxels = voxel_ladder(&trace, &budgets);
         let budget = bake_budgets(&budgets, &trace);
-        let mut shell = Shell::load(Boot {
+        let mut staged = Shell::stage(Boot {
             trace,
             contract: &contract,
             checkpoint: &path,
@@ -657,6 +667,10 @@ impl Engine for Cuda {
                 .map_or(core::ptr::null(), Arc::as_ptr),
         })
         .map_err(fault)?;
+        if let Some(hook) = self.before_arming.as_mut() {
+            hook(&mut staged.shell).map_err(Error::Load)?;
+        }
+        let mut shell = staged.finish().map_err(fault)?;
 
         shell.mount_adapters(self.boot.adapter_dir.clone());
         let host_kv_pages = shell

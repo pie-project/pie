@@ -208,11 +208,23 @@ struct Group {
     ranks: Vec<Arc<Mutex<Cuda>>>,
     ordinals: Vec<i32>,
     steps: Rendezvous<(Step, engine::StepDone), Fired>,
-    /// Ranks loaded, and whether the group is wired; a rank's first frame
-    /// waits for the wiring, which the last rank to load does.
+    /// Each rank's shape as it reaches arming, and the group's wires once
+    /// the last has: every rank's load meets the others there.
+    wiring: Mutex<Wiring>,
+    /// Ranks loaded, and whether every one has; a rank's first frame waits
+    /// for the group.
     wired: Mutex<(usize, Option<Result<(), String>>)>,
     wired_cv: Condvar,
 }
+
+struct Wiring {
+    shapes: Vec<Option<crate::ep::Shape>>,
+    wires: Option<Result<Vec<crate::ep::Wire>, String>>,
+}
+
+/// How long a rank's load waits at arming for the group's other ranks: the
+/// worker loads every rank of a group at once.
+const MEET: Duration = Duration::from_secs(3600);
 
 impl Group {
     fn poison(&self, why: &str) {
@@ -224,41 +236,65 @@ impl Group {
         self.wired_cv.notify_all();
     }
 
-    /// The last rank to load wires every rank: their EP buffers mapped into
-    /// one another, each lowered layer's placement on each device.
+    /// A rank's load at arming: it states what it dispatches and waits for
+    /// the others; the last to come maps every rank's EP buffers into the
+    /// others. Each rank then lays its layers' placements on its own device.
+    fn meet(&self, rank: usize, shell: &mut crate::serve::Shell) -> Result<(), String> {
+        let shape = shell
+            .ep_shape()
+            .ok_or("the loaded trace dispatches nothing: it is not an expert-parallel rank's")?;
+        let mut wiring = self.wiring.lock().expect("lockstep wiring lock poisoned");
+        wiring.shapes[rank] = Some(shape.clone());
+        if wiring.wires.is_none() && wiring.shapes.iter().all(Option::is_some) {
+            let same = wiring
+                .shapes
+                .iter()
+                .all(|other| other.as_ref() == Some(&shape));
+            wiring.wires = Some(if same {
+                let wired =
+                    crate::ep::wire(&self.ordinals, shape.widest).map_err(|f| f.to_string());
+                crate::device::ctx::bind_thread(self.ordinals[rank]).map_err(|f| f.to_string())?;
+                wired
+            } else {
+                Err("the group's ranks loaded traces that dispatch differently".into())
+            });
+            self.wired_cv.notify_all();
+        }
+        let deadline = Instant::now() + MEET;
+        while wiring.wires.is_none() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                let missing: Vec<usize> = (0..self.ranks.len())
+                    .filter(|&r| wiring.shapes[r].is_none())
+                    .collect();
+                return Err(format!(
+                    "rank(s) {missing:?} of the expert-parallel group never reached arming \
+                     within {}s; every rank of a group loads at once",
+                    MEET.as_secs()
+                ));
+            }
+            wiring = self
+                .wired_cv
+                .wait_timeout(wiring, left)
+                .expect("lockstep wiring lock poisoned")
+                .0;
+        }
+        let wires = wiring.wires.clone().expect("checked above")?;
+        drop(wiring);
+        let ep =
+            crate::ep::EpRank::new(wires, rank as u32, &shape.layers).map_err(|f| f.to_string())?;
+        shell.join_ep(ep);
+        Ok(())
+    }
+
+    /// A rank has loaded; the group serves once every rank has.
     fn loaded(&self) {
         let mut wired = self.wired.lock().expect("lockstep wiring lock poisoned");
         wired.0 += 1;
-        if wired.0 < self.ranks.len() || wired.1.is_some() {
-            return;
+        if wired.0 == self.ranks.len() && wired.1.is_none() {
+            wired.1 = Some(Ok(()));
         }
-        let done = self.wire();
-        if let Err(why) = &done {
-            self.steps.poison(why);
-        }
-        wired.1 = Some(done);
         self.wired_cv.notify_all();
-    }
-
-    fn wire(&self) -> Result<(), String> {
-        let shape = {
-            let first = self.ranks[0].lock().expect("rank lock poisoned");
-            first
-                .shell()
-                .and_then(crate::serve::Shell::ep_shape)
-                .ok_or("the loaded trace dispatches nothing: it is not an expert-parallel rank's")?
-        };
-        let wires = crate::ep::wire(&self.ordinals, shape.widest).map_err(|f| f.to_string())?;
-        for (rank, (cuda, &ordinal)) in self.ranks.iter().zip(&self.ordinals).enumerate() {
-            crate::device::ctx::bind_thread(ordinal).map_err(|f| f.to_string())?;
-            let ep = crate::ep::EpRank::new(wires.clone(), rank as u32, &shape.layers)
-                .map_err(|f| f.to_string())?;
-            let mut cuda = cuda.lock().expect("rank lock poisoned");
-            cuda.shell_mut()
-                .ok_or("a rank of the group has no model loaded")?
-                .join_ep(ep);
-        }
-        Ok(())
     }
 
     fn ready(&self) -> EngineResult<()> {
@@ -360,9 +396,24 @@ pub fn open_lockstep(
         ranks,
         ordinals,
         steps: Rendezvous::new(size, GATHER),
+        wiring: Mutex::new(Wiring {
+            shapes: vec![None; size],
+            wires: None,
+        }),
         wired: Mutex::new((0, None)),
         wired_cv: Condvar::new(),
     });
+    // Each rank's load meets the group at arming. The hook holds the group
+    // weakly: the group holds the ranks that hold the hooks.
+    for (rank, cuda) in group.ranks.iter().enumerate() {
+        let weak = Arc::downgrade(&group);
+        cuda.lock()
+            .expect("rank lock poisoned")
+            .before_arming(Box::new(move |shell| {
+                let group = weak.upgrade().ok_or("the expert-parallel group is gone")?;
+                group.meet(rank, shell).inspect_err(|why| group.poison(why))
+            }));
+    }
     Ok((0..size)
         .map(|rank| Rank {
             rank,

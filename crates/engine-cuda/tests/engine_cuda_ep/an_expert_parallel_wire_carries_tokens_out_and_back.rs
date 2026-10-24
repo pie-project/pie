@@ -40,6 +40,7 @@ fn up<T: Copy>(values: &[T]) -> Buffer {
 
 #[test]
 fn an_expert_parallel_wire_carries_tokens_out_and_back() {
+    let _alone = crate::alone();
     if !engine_cuda::device::present() {
         eprintln!("no CUDA device: skipping");
         return;
