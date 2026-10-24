@@ -108,6 +108,10 @@ ssm.kda_step_fused = true
 # W4A16 NVFP4 selects on the register-dequant MMA from 32 to 8192 routes.
 moe.nvfp4_mma_from = 32
 moe.nvfp4_mma_until = 8192
+# The router's product and its top-k in one tcgen05 launch up to 256 rows
+# (DeepSeek-V4-Flash's 4096 by 256 router, 6 picks: 1.1x at 1 row, 1.6-1.7x
+# at 16-64, 1.3x at 256; past it the product and the router apart).
+moe.gate_tc5_until = 256
 # Tactic timing charges a split's reduce launch 2 us, at every row count.
 gemm.split_launch_ns = 2000
 # Dense tcgen05 GEMMs raster 16 tiles a band.

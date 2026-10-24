@@ -347,6 +347,7 @@ pub const SM100: kernels_cuda::tuning::Tuning = kernels_cuda::tuning::Tuning {
     gemm_fp8_gemv_until: 4,
     nvfp4_mma_from: 32,
     nvfp4_mma_until: 8192,
+    gate_tc5_until: 256,
     ..kernels_cuda::tuning::Tuning::DEFAULT
 };
 

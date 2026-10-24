@@ -121,6 +121,30 @@ __device__ __forceinline__ void cluster_sync() {
                      : "memory");
 }
 
+// cluster_sync's halves, apart: an arrival that orders nothing (it says this
+// CTA is running, so its peers may reach its shared memory once they wait),
+// and the wait for every CTA's. Each thread alternates them.
+__device__ __forceinline__ void cluster_arrive_relaxed() {
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+}
+
+__device__ __forceinline__ void cluster_wait() {
+    asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
+}
+
+// `v` to `at`'s offset in the shared memory of cluster CTA `rank`, its 4
+// bytes counted on the barrier at `bar`'s offset there (complete_tx): the
+// receiver waits on its own barrier, not on the cluster.
+__device__ __forceinline__ void st_async_f32(u32 at, u32 bar, u32 rank, float v) {
+    asm volatile(
+        "{\n\t.reg .b32 ra, rb;\n\t"
+        "mapa.shared::cluster.u32 ra, %0, %2;\n\t"
+        "mapa.shared::cluster.u32 rb, %1, %2;\n\t"
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [ra], %3, [rb];\n\t}" ::"r"(at),
+        "r"(bar), "r"(rank), "f"(v)
+        : "memory");
+}
+
 // Arrives once on the barrier at `bar`'s offset in CTA `rank` of the cluster.
 __device__ __forceinline__ void bar_arrive_at(u64* bar, u32 rank) {
     asm volatile(

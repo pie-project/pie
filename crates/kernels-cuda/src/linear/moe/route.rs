@@ -619,3 +619,276 @@ pub fn group_routes(ctx: &Ctx, groups: u32, routes: &mut Tensor) -> Result<(), E
         ],
     )
 }
+
+/// How a fused gate ([`gate`]) scores its router's logits: one of the
+/// routers above, the same picks and weights.
+#[derive(Clone, Copy, Debug)]
+pub enum GateScore {
+    /// [`topk_softmax`]; with `gain`, [`topk_softmax_scaled`] (a bf16 gain
+    /// an expert).
+    Softmax { gain: Option<Tensor> },
+    /// [`topk_sigmoid`].
+    Sigmoid {
+        bias: Option<Tensor>,
+        renormalize: bool,
+        scaling: f32,
+    },
+    /// [`topk_sqrt_softplus`] (DeepSeek-V4's).
+    SqrtSoftplus {
+        bias: Tensor,
+        renormalize: bool,
+        scaling: f32,
+    },
+}
+
+/// A fused gate: the router's product `x . router^T` landing at `logits`
+/// (bf16 for `linear.matmul`, f32 for `linear.matmul_f32`), then
+/// `experts` routed to `top_k` a row as `score` says.
+#[derive(Clone, Copy, Debug)]
+pub struct Gate {
+    pub experts: u32,
+    pub top_k: u32,
+    pub logits: Dtype,
+    pub score: GateScore,
+}
+
+/// `pie::linear::gate_tc5::Params`, field for field.
+#[cfg(feature = "cuda")]
+#[repr(C)]
+struct GateParams {
+    bias: u64,
+    gain: u64,
+    routes: u64,
+    weights: u64,
+    win: u64,
+    rows: i32,
+    k: i32,
+    experts: i32,
+    top_k: i32,
+    renormalize: i32,
+    scaling: f32,
+}
+
+/// The CTAs a cluster splits the router's K over: B200 seats one cluster of
+/// 16 one-block SMs a GPC.
+#[cfg(feature = "cuda")]
+const GATE_SPLIT: u32 = 16;
+
+/// The token blocks (clusters of [`GATE_SPLIT`]) a fused gate launches at
+/// most before it widens its block: past four, B200 seats them in waves.
+#[cfg(feature = "cuda")]
+const GATE_BLOCKS: u32 = 4;
+
+/// The token blocks the gate takes (an MMA's N), narrowest first.
+#[cfg(feature = "cuda")]
+const GATE_BN: [u32; 4] = [16, 32, 64, 128];
+
+/// The most experts a gate holds: four 128-lane accumulators.
+#[cfg(feature = "cuda")]
+const GATE_MAX_EXPERTS: u32 = 512;
+
+/// The most picks a gate lands: a lane each.
+#[cfg(feature = "cuda")]
+const GATE_MAX_TOP_K: u32 = 32;
+
+/// The ring's bytes a CTA, its partials' too: past them the barriers and
+/// the alignment, under the 227 KiB a block opts into.
+#[cfg(feature = "cuda")]
+const GATE_RING: u32 = 200 * 1024;
+
+/// A gate CTA's threads: a loader warp, an MMA warp, four epilogue warps
+/// and two that stage the experts' bias; all eight score and rank.
+#[cfg(feature = "cuda")]
+const GATE_THREADS: u32 = 256;
+
+/// The head before a gate CTA's ring: its barriers and TMEM slot, then the
+/// experts' bias or gain.
+#[cfg(feature = "cuda")]
+const GATE_HEAD: u32 = 1024 + GATE_MAX_EXPERTS * 4;
+
+/// The partials a gate CTA of a split of `split` ranks lands for the
+/// tokens it ranks, then their keys and scores
+/// (`pie::linear::gate_tc5::recv_bytes`).
+#[cfg(feature = "cuda")]
+const fn gate_recv(groups: u32, bn: u32, split: u32) -> u32 {
+    (split + 2) * bn.div_ceil(split) * groups * 128 * 4
+}
+
+/// The dynamic shared memory a gate CTA takes with its partials beside its
+/// ring (`pie::linear::gate_tc5::kRoom`); past it they land over the ring.
+#[cfg(feature = "cuda")]
+const GATE_ROOM: u32 = 224 * 1024;
+
+/// `pie::linear::gate_tc5::smem_bytes`: the 1024-byte alignment, the head,
+/// the ring and the partials beside it where they fit, else over it.
+#[cfg(feature = "cuda")]
+const fn gate_smem(groups: u32, bn: u32, split: u32, stages: u32) -> u32 {
+    let ring = stages * (groups * 128 * 128 + bn * 128);
+    let recv = gate_recv(groups, bn, split);
+    if 1024 + GATE_HEAD + ring + recv <= GATE_ROOM {
+        1024 + GATE_HEAD + ring + recv
+    } else {
+        1024 + GATE_HEAD + if ring > recv { ring } else { recv }
+    }
+}
+
+/// The router's product and its top-k in one tcgen05 launch
+/// (`linear/moe/route_sm100.cu`): the routes and weights `matmul` (or
+/// `matmul_f32`, as `gate.logits` says) and then `gate.score`'s router
+/// land, without the logits. `Ok(false)` where it does not take the fire
+/// (not a tcgen05 chip, past `kernel.moe.gate_tc5_until` rows, an operand
+/// it does not read, more than 512 experts or 32 picks, a softmax of more
+/// than 16): the caller runs the two.
+pub fn gate(
+    ctx: &Ctx,
+    x: Tensor,
+    router: Tensor,
+    gate: Gate,
+    routes: &mut Tensor,
+    weights: &mut Tensor,
+) -> Result<bool, Error> {
+    #[cfg(feature = "cuda")]
+    {
+        gate_tc5(ctx, x, router, gate, routes, weights)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (ctx, x, router, gate, routes, weights);
+        Ok(false)
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn gate_tc5(
+    ctx: &Ctx,
+    x: Tensor,
+    router: Tensor,
+    gate: Gate,
+    routes: &mut Tensor,
+    weights: &mut Tensor,
+) -> Result<bool, Error> {
+    use crate::linear::gemm_sm100::{Map, encode, supported};
+    use cudarc::driver::sys as dr;
+    const OP: &str = "linear.moe_gate";
+    let Gate {
+        experts,
+        top_k,
+        logits,
+        score,
+    } = gate;
+    let rows = x.rows;
+    let k = x.width;
+    let (code, bias, gain, renormalize, scaling) = match score {
+        GateScore::Softmax { gain } => {
+            let fits = top_k <= 16
+                && logits == Dtype::Bf16
+                && gain.is_none_or(|g| g.dtype == Dtype::Bf16 && g.rows * g.width == experts);
+            if !fits {
+                return Ok(false);
+            }
+            (0, None, gain, false, 1.0)
+        }
+        GateScore::Sigmoid {
+            bias,
+            renormalize,
+            scaling,
+        } => (1, bias, None, renormalize, scaling),
+        GateScore::SqrtSoftplus {
+            bias,
+            renormalize,
+            scaling,
+        } => (2, Some(bias), None, renormalize, scaling),
+    };
+    let takes = supported()
+        && rows > 0
+        && rows <= ctx.tuning().gate_tc5_until
+        && x.dtype == Dtype::Bf16
+        && router.dtype == Dtype::Bf16
+        && matches!(logits, Dtype::Bf16 | Dtype::F32)
+        && router.rows == experts
+        && router.width == k
+        && (1..=GATE_MAX_EXPERTS).contains(&experts)
+        && (1..=GATE_MAX_TOP_K.min(experts)).contains(&top_k)
+        && k > 0
+        && k.is_multiple_of(8)
+        && x.ptr.is_multiple_of(16)
+        && router.ptr.is_multiple_of(16)
+        && bias.is_none_or(|b| b.dtype == Dtype::F32 && b.rows * b.width == experts)
+        && routes.dtype == Dtype::I32
+        && weights.dtype == Dtype::F32
+        && routes.rows == rows
+        && weights.rows == rows
+        && routes.width == top_k
+        && weights.width == top_k;
+    if !takes {
+        return Ok(false);
+    }
+    let groups = experts.div_ceil(128);
+    let nb = k.div_ceil(64);
+    let split = GATE_SPLIT.min(nb);
+    // The narrowest block that keeps the launch to its clusters; else the
+    // widest whose partials the ring holds.
+    let fit = |bn: u32| gate_recv(groups, bn, split) <= GATE_RING;
+    let widest = GATE_BN.into_iter().rfind(|&bn| fit(bn)).unwrap_or(16);
+    let bn = GATE_BN
+        .into_iter()
+        .find(|&bn| fit(bn) && rows.div_ceil(bn) <= GATE_BLOCKS)
+        .unwrap_or(widest);
+    let blocks = rows.div_ceil(bn);
+    let stage = groups * 128 * 128 + bn * 128;
+    let stages = nb.div_ceil(split).min(GATE_RING / stage).max(1);
+    let map_w = encode(Map {
+        ptr: router.ptr,
+        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        dims: [k, experts, 0],
+        strides: [u64::from(k) * 2, 0],
+        boxes: [64, 128, 1],
+        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+    })?;
+    let map_x = encode(Map {
+        ptr: x.ptr,
+        ty: dr::CUtensorMapDataType::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        dims: [k, rows, 0],
+        strides: [u64::from(k) * 2, 0],
+        boxes: [64, bn, 1],
+        swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
+    })?;
+    let params = GateParams {
+        bias: bias.map_or(0, |b| b.ptr),
+        gain: gain.map_or(0, |g| g.ptr),
+        routes: routes.ptr,
+        weights: weights.ptr,
+        win: match ctx.stage() {
+            ArgValue::Ptr(p) => p,
+            _ => 0,
+        },
+        rows: stated(OP, rows)?,
+        k: stated(OP, k)?,
+        experts: stated(OP, experts)?,
+        top_k: stated(OP, top_k)?,
+        renormalize: i32::from(renormalize),
+        scaling,
+    };
+    let round = logits == Dtype::Bf16;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            ROUTE_SM100,
+            &format!(
+                "::pie::linear::moe_gate_tc5<{groups}, {bn}, {split}, {stages}, {code}, {round}>"
+            ),
+        ))
+        .apply(
+            Launch::grid([blocks * split, 1, 1], [GATE_THREADS, 1, 1])
+                .smem(gate_smem(groups, bn, split, stages))
+                .cluster(split)
+                .programmatic(ctx.tuning().pdl),
+        ),
+        &[
+            ArgValue::of(&map_w),
+            ArgValue::of(&map_x),
+            ArgValue::of(&params),
+        ],
+    )?;
+    Ok(true)
+}
