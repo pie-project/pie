@@ -3,6 +3,7 @@
 //! passes on the device (`Plane::fire_guests`), instances of one program
 //! batched into one executable per stage; any other runs in the host
 //! interpreter.
+#![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -95,7 +96,7 @@ impl Latch {
         if let Err(why) = outcome {
             self.fault
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("fault lock poisoned")
                 .get_or_insert(why);
         }
         if self.holds.fetch_sub(1, Ordering::AcqRel) != 1 {
@@ -106,11 +107,7 @@ impl Latch {
             step = self.at.step,
             "xla step landed"
         );
-        let fault = self
-            .fault
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+        let fault = self.fault.lock().expect("fault lock poisoned").take();
         if let Some(sink) = &self.sink {
             sink(
                 self.at,
@@ -167,9 +164,7 @@ pub struct InFlight {
 
 impl Flights {
     fn lock(&self) -> std::sync::MutexGuard<'_, Book> {
-        self.book
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.book.lock().expect("book lock poisoned")
     }
 
     /// Starts a deferred pass's download; it lands itself when the bytes
@@ -214,6 +209,8 @@ impl Flights {
         let event = match event {
             Ok(event) => event,
             Err(why) => {
+                // SAFETY: `dst` came from `Box::into_raw` above, and the
+                // copy failed to start, so the plugin never took it.
                 drop(unsafe { Box::from_raw(dst) });
                 let outcome = self.land(id, Err(why.to_string()), None);
                 if let Some(latch) = latch {
@@ -302,10 +299,7 @@ impl Flights {
     pub(crate) fn wait_ring(&self, ring: &Arc<ChannelState>) {
         let mut book = self.lock();
         while Self::on_ring(&book, ring) {
-            book = self
-                .landed
-                .wait(book)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            book = self.landed.wait(book).expect("landed lock poisoned");
         }
     }
 
@@ -313,10 +307,7 @@ impl Flights {
     pub(crate) fn wait_all(&self) {
         let mut book = self.lock();
         while !book.open.is_empty() {
-            book = self
-                .landed
-                .wait(book)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            book = self.landed.wait(book).expect("landed lock poisoned");
         }
     }
 

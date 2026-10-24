@@ -2,6 +2,7 @@
 //! own staging waits for its stream, so small host copies go through a
 //! pinned ring. (Device buffers and endpoint memory are kept on both:
 //! `device::held`.)
+#![allow(unsafe_code)]
 
 use crate::device::Pinned;
 use crate::error::Result;
@@ -66,9 +67,7 @@ pub(crate) fn staged_through_ring(
     unsafe { check("hipGetDevice", rt::hipGetDevice(&raw mut device))? };
 
     static RINGS: Mutex<Option<HashMap<core::ffi::c_int, StageRing>>> = Mutex::new(None);
-    let mut rings = RINGS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut rings = RINGS.lock().expect("rings lock poisoned");
     let rings = rings.get_or_insert_with(HashMap::new);
     let ring = match rings.entry(device) {
         std::collections::hash_map::Entry::Occupied(held) => held.into_mut(),

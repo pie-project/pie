@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use super::select_fp4::{matmul_select_mlxu4, matmul_select_mxfp4};
 use super::*;
 use crate::error::Error;

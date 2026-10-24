@@ -29,3 +29,6 @@ tokio = { version = "1.53", features = ["net", "io-util", "rt", "macros", "rt-mu
 
 [build-dependencies]
 bindgen = { version = "0.73", optional = true }
+
+[lints]
+workspace = true

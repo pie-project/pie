@@ -1,6 +1,7 @@
 //! Device memory kept behind a fence on the compute streams and handed out
 //! again once it lands, rather than given back to the driver and asked for
 //! anew.
+#![allow(unsafe_code)]
 
 use std::sync::atomic::{AtomicPtr, Ordering};
 
@@ -23,9 +24,7 @@ static LIVE: std::sync::RwLock<Vec<(i32, usize)>> = std::sync::RwLock::new(Vec::
 /// A context's compute stream, every fire of `ordinal` it runs launching on
 /// it; the latest live one is where kept memory is zeroed for reuse.
 pub fn adopt_stream(ordinal: i32, stream: *mut core::ffi::c_void) {
-    let mut live = LIVE
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut live = LIVE.write().expect("live lock poisoned");
     live.push((ordinal, stream as usize));
     if let Some(slot) = usize::try_from(ordinal).ok().and_then(|at| STREAMS.get(at)) {
         slot.store(stream, Ordering::Release);
@@ -36,9 +35,7 @@ pub fn adopt_stream(ordinal: i32, stream: *mut core::ffi::c_void) {
 /// stream, if any, takes its place) and runs `destroy` before any recorder
 /// can see the stream again.
 pub fn retire_stream(ordinal: i32, stream: *mut core::ffi::c_void, destroy: impl FnOnce()) {
-    let mut live = LIVE
-        .write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut live = LIVE.write().expect("live lock poisoned");
     if let Some(at) = live
         .iter()
         .position(|&entry| entry == (ordinal, stream as usize))
@@ -83,9 +80,7 @@ pub(crate) fn with_stream<R>(
     device: i32,
     use_stream: impl FnOnce(*mut core::ffi::c_void) -> R,
 ) -> Option<R> {
-    let _live = LIVE
-        .read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _live = LIVE.read().expect("live lock poisoned");
     stream_of(device).map(use_stream)
 }
 
@@ -102,9 +97,7 @@ impl Fence {
     /// `None` where a stream would not record; an empty fence where the
     /// device has no live stream, so nothing of it is airborne.
     pub(crate) fn record(device: i32) -> Option<Fence> {
-        let live = LIVE
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let live = LIVE.read().expect("live lock poisoned");
         let mut fence = Fence(Vec::new());
         for &(_, stream) in live.iter().filter(|(ordinal, _)| *ordinal == device) {
             let mut event: rt::cudaEvent_t = core::ptr::null_mut();
@@ -222,9 +215,7 @@ pub mod pool {
         if !adopted(key.device) {
             return None;
         }
-        let mut pool = POOL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pool = POOL.lock().expect("pool lock poisoned");
         let list = pool.as_mut()?.get_mut(&key)?;
         let at = list.iter().position(|entry| entry.fence.landed())?;
         let entry = list.swap_remove(at);
@@ -257,9 +248,7 @@ pub mod pool {
         let Some(fence) = Fence::record(key.device) else {
             return;
         };
-        let mut pool = POOL
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pool = POOL.lock().expect("pool lock poisoned");
         let list = pool
             .get_or_insert_with(HashMap::new)
             .entry(key)
@@ -305,8 +294,7 @@ pub(crate) mod recycle {
     static HELD: AtomicUsize = AtomicUsize::new(0);
 
     fn kept() -> std::sync::MutexGuard<'static, Shelf> {
-        KEPT.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        KEPT.lock().expect("kept lock poisoned")
     }
 
     /// `bytes` of device memory: a kept buffer whose last reader has
@@ -577,9 +565,7 @@ pub(crate) mod heap {
     }
 
     fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-        mutex
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        mutex.lock().expect("mutex lock poisoned")
     }
 
     /// The heaps' thread: makes the chunks asked for, one heap at a time,
@@ -593,10 +579,7 @@ pub(crate) mod heap {
                     if let Some(key) = wanted.pop() {
                         break key;
                     }
-                    wanted = heaps
-                        .wake
-                        .wait(wanted)
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    wanted = heaps.wake.wait(wanted).expect("wake lock poisoned");
                 }
             };
             let made = (key.ordinal < 0 || crate::device::ctx::bind_thread(key.ordinal).is_ok())

@@ -273,7 +273,7 @@ static GLOBAL: LazyLock<Mutex<Registry>> = LazyLock::new(|| {
 });
 
 fn global() -> MutexGuard<'static, Registry> {
-    GLOBAL.lock().unwrap_or_else(|e| e.into_inner())
+    GLOBAL.lock().expect("global lock poisoned")
 }
 
 pub fn register(

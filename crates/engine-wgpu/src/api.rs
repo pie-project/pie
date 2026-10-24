@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -118,11 +119,6 @@ impl Wgpu {
     #[must_use]
     pub fn contract_for(&self) -> ContractFor {
         self.contract_for
-    }
-
-    #[must_use]
-    pub fn shell(&self) -> Option<&Shell> {
-        self.shell.as_ref()
     }
 
     pub fn shell_mut(&mut self) -> Option<&mut Shell> {
@@ -1116,6 +1112,3 @@ pub(crate) fn lane_readouts(policies: &[Readout], rows: &[Vec<f32>]) -> Vec<Lane
         })
         .collect()
 }
-
-unsafe impl Send for Wgpu {}
-unsafe impl Sync for Wgpu {}

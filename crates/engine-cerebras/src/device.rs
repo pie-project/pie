@@ -473,10 +473,7 @@ impl Device {
     #[must_use]
     pub fn dry_texts(&self) -> Vec<String> {
         self.dry.as_ref().map_or_else(Vec::new, |texts| {
-            texts
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
+            texts.lock().expect("texts lock poisoned").clone()
         })
     }
 
@@ -532,12 +529,7 @@ impl Device {
     /// [`crate::trace::Tracer::finish`]), from the cache or freshly built.
     pub fn program(&self, text: &str, sig: Signature) -> Result<Arc<Program>> {
         let key = *blake3::hash(text.as_bytes()).as_bytes();
-        if let Some(hit) = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-        {
+        if let Some(hit) = self.cache.lock().expect("cache lock poisoned").get(&key) {
             return Ok(Arc::clone(hit));
         }
         let hex = blake3::hash(text.as_bytes()).to_hex().to_string();
@@ -548,7 +540,7 @@ impl Device {
         if let Some(texts) = &self.dry {
             texts
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("texts lock poisoned")
                 .push(text.to_string());
         }
         let exe = if self.dry.is_none() || self.dry_compiles {
@@ -563,7 +555,7 @@ impl Device {
         });
         self.cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("cache lock poisoned")
             .insert(key, Arc::clone(&program));
         Ok(program)
     }
@@ -622,10 +614,7 @@ impl Device {
 
     #[must_use]
     pub fn compiled(&self) -> usize {
-        self.cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        self.cache.lock().expect("cache lock poisoned").len()
     }
 
     /// Runs `program` over `args` (in its parameter order); returns its
@@ -645,7 +634,7 @@ impl Device {
     pub fn queue_moves(&self, moves: Vec<PoolMove>) {
         self.moves
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("moves lock poisoned")
             .extend(moves);
     }
 
@@ -720,12 +709,8 @@ impl Device {
             .filter(|(source, _)| matches!(source, crate::trace::Source::Weight { .. }))
             .map(|(_, name)| name.clone())
             .collect();
-        let moves: Vec<PoolMove> = std::mem::take(
-            &mut *self
-                .moves
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        let moves: Vec<PoolMove> =
+            std::mem::take(&mut *self.moves.lock().expect("moves lock poisoned"));
         let ran = run_phases(
             &fabric_run()?,
             target_name(self.platform.target()),
@@ -1072,9 +1057,7 @@ pub fn run_phases(
         if let Some(servers) = servers {
             // The program stays loaded: its server runs the spec. A server
             // that fails is dropped (killed); the next run starts a new one.
-            let mut pool = servers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut pool = servers.lock().expect("servers lock poisoned");
             let ran = pool
                 .get(runner, dir, target)?
                 .run(&spec_path, phase_timeout(), at);

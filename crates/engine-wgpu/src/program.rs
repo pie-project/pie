@@ -151,28 +151,19 @@ pub(crate) struct Gate {
 #[cfg(feature = "wgpu")]
 impl Gate {
     fn enter(self: &Arc<Self>) -> Held {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .0 += 1;
+        self.inner.lock().expect("lock poisoned").0 += 1;
         Held {
             gate: Arc::clone(self),
         }
     }
 
     fn airborne(&self) -> u32 {
-        self.inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .0
+        self.inner.lock().expect("lock poisoned").0
     }
 
     fn leave(&self) {
         let waker = {
-            let mut inner = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = self.inner.lock().expect("lock poisoned");
             inner.0 = inner.0.saturating_sub(1);
             if inner.0 == 0 { inner.1.take() } else { None }
         };
@@ -182,20 +173,13 @@ impl Gate {
     }
 
     fn settle(&self, instance: InstanceId) -> Result<(), Refusal> {
-        let airborne = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .0;
+        let airborne = self.inner.lock().expect("lock poisoned").0;
         if airborne == 0 {
             return Ok(());
         }
         tracing::debug!(instance, "fire parks until the instance's guest pass ran");
         crate::device::host::block_on_poll("guest gate", |cx| {
-            let mut inner = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut inner = self.inner.lock().expect("lock poisoned");
             if inner.0 == 0 {
                 std::task::Poll::Ready(())
             } else {
@@ -339,28 +323,26 @@ impl Guests {
                             at,
                             width,
                         });
-                        half.lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .fire(
-                                &device,
-                                &widen,
-                                &tally,
-                                Pass {
-                                    logits,
-                                    rows,
-                                    vocab,
-                                    mtp_logits: mtp.as_deref(),
-                                    mtp_width,
-                                    readout,
-                                    pixels: pixels.as_ref().map(|(plane, count)| {
-                                        crate::guest::run::Readout {
-                                            seat: plane,
-                                            at: 0,
-                                            width: *count,
-                                        }
-                                    }),
-                                },
-                            )
+                        half.lock().expect("half lock poisoned").fire(
+                            &device,
+                            &widen,
+                            &tally,
+                            Pass {
+                                logits,
+                                rows,
+                                vocab,
+                                mtp_logits: mtp.as_deref(),
+                                mtp_width,
+                                readout,
+                                pixels: pixels.as_ref().map(|(plane, count)| {
+                                    crate::guest::run::Readout {
+                                        seat: plane,
+                                        at: 0,
+                                        width: *count,
+                                    }
+                                }),
+                            },
+                        )
                     });
                     job
                 },

@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use crate::error::Error;
 
 use crate::jit::{Ctx, refuse};
@@ -42,6 +43,9 @@ pub fn all_reduce(ctx: &Ctx, buf: &mut Tensor) -> Result<(), Error> {
         let Some((send, count)) = message(*buf) else {
             return Ok(());
         };
+        // SAFETY: `comm` and `ctx.stream()` are the live communicator and
+        // stream `Ctx::with_comm` and `Ctx::on` promise; `send` is `buf`'s own
+        // device storage, `count` elements, reduced in place.
         let code = unsafe {
             (nccl.ncclAllReduce)(
                 send,
@@ -80,6 +84,10 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
         };
 
         if x.rows <= 1 {
+            // SAFETY: `send` is `count` elements of `x`, and `y` holds one such
+            // shard per rank (its elements are a whole multiple of `x`'s);
+            // `comm` and the stream are live per `Ctx::with_comm` and
+            // `Ctx::on`.
             let code = unsafe {
                 (nccl.ncclAllGather)(
                     send,
@@ -102,6 +110,8 @@ pub fn all_gather(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
         let bytes = usize::try_from(y.elements().saturating_mul(y.dtype.bytes_ceil()))
             .map_err(|_| refuse(OP, "the gathered rectangle does not fit this address space"))?;
         let stage = ctx.scratch(OP, "all_gather_stage", bytes)?;
+        // SAFETY: `stage` is a slab of `bytes`, the whole gathered rectangle;
+        // `send`, `comm` and the stream as in the one-row case.
         let code = unsafe { (nccl.ncclAllGather)(send, stage, count, dtype, comm, ctx.stream()) };
         answered(OP, "ncclAllGather", code)?;
         crate::gather::rows::gather_width_concat(ctx, stage as usize as u64, y, x.width, world)
@@ -119,8 +129,12 @@ pub fn grouped<R>(op: &'static str, body: impl FnOnce() -> Result<R, Error>) -> 
     #[cfg(feature = "rocm")]
     {
         let nccl = rccl(op)?;
+        // SAFETY: `ncclGroupStart` takes no arguments; it opens a group on this
+        // thread.
         answered(op, "ncclGroupStart", unsafe { (nccl.ncclGroupStart)() })?;
         let ran = body();
+        // SAFETY: closes the group opened above, on the same thread, whatever
+        // `body` answered.
         let ended = answered(op, "ncclGroupEnd", unsafe { (nccl.ncclGroupEnd)() });
         let out = ran?;
         ended?;
@@ -162,6 +176,9 @@ pub fn reduce_scatter(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error>
         let Some((recv, count)) = message(*y) else {
             return Ok(());
         };
+        // SAFETY: `x` is the whole one-row input and `recv` is `count` elements
+        // of `y`, this rank's shard; `comm` and the stream are live per
+        // `Ctx::with_comm` and `Ctx::on`.
         let code = unsafe {
             (nccl.ncclReduceScatter)(
                 x.ptr as usize as *const core::ffi::c_void,

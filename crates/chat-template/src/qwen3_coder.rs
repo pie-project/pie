@@ -25,14 +25,13 @@ pub struct Qwen3Coder {
 }
 
 impl Qwen3Coder {
-    #[must_use]
-    pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
+    pub fn try_new(tokenizer: Arc<Tokenizer>) -> Result<Self, String> {
         // The tokenizer must spell this as a special.
-        let _ = special(&tokenizer, "<|im_start|>");
-        Self {
-            stop_ids: specials(&tokenizer, STOP_TOKENS),
+        let _ = special(&tokenizer, "<|im_start|>")?;
+        Ok(Self {
+            stop_ids: specials(&tokenizer, STOP_TOKENS)?,
             tokenizer,
-        }
+        })
     }
 
     fn turn(&self, role: &str, body: &str) -> Vec<u32> {

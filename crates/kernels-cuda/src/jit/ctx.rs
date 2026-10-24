@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use core::ffi::c_void;
 
 use crate::error::Error;
@@ -561,9 +562,7 @@ impl Ctx {
             let gap = {
                 static LAST: std::sync::Mutex<Option<std::time::Instant>> =
                     std::sync::Mutex::new(None);
-                let mut last = LAST
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut last = LAST.lock().expect("last lock poisoned");
                 let gap = last.map_or(0, |at| now.duration_since(at).as_micros());
                 *last = Some(now);
                 gap
@@ -589,6 +588,13 @@ impl Ctx {
 
         let mut bound = crate::jit::abi::Bound::new(args);
 
+        // SAFETY: `resolved.function` lives for the process (the cache
+        // leaks it) and was loaded in the context `resolve` bound to this
+        // thread; `self.stream` is live by `Ctx::on`'s contract. `bound`
+        // owns one slot per argument and outlives the call. That the
+        // arguments match the kernel's parameters, and that every pointer
+        // among them is a live device address, is not checked here: `fire`
+        // takes it on trust from its caller.
         let fired = unsafe {
             crate::jit::launch::issue(resolved.function, launch, bound.slots_mut(), self.stream)
         };

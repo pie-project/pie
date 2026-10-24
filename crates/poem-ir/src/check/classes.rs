@@ -669,10 +669,10 @@ mod tests {
         // on `f0 ∧ f1` reads rows no arm was meant to write.
         let mut b = Build::new();
         let q = b.input();
-        let bound = Guard::not(Guard::and(fact(0), fact(1)));
+        let bound = !Guard::and(fact(0), fact(1));
         let masked = Guard::and(fact(1), bound.clone());
-        let scored = Guard::and(Guard::not(fact(1)), fact(2));
-        let rest = Guard::and(Guard::not(fact(1)), Guard::not(fact(2)));
+        let scored = Guard::and(!fact(1), fact(2));
+        let rest = Guard::and(!fact(1), !fact(2));
         let m = b.op(q, masked.clone());
         let s = b.op(q, scored.clone());
         let r = b.op(q, rest.clone());
@@ -687,8 +687,8 @@ mod tests {
         let mut b = Build::new();
         let q = b.input();
         let d = b.op(q, fact(0));
-        let p = b.op(q, Guard::not(fact(0)));
-        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))]);
+        let p = b.op(q, !fact(0));
+        let o = b.merge(&[(d, fact(0)), (p, !fact(0))]);
         b.out(o);
 
         let classes = b.resolve().expect("a covering split resolves");
@@ -705,8 +705,8 @@ mod tests {
         let mut b = Build::new();
         let q = b.input();
         let d = b.op(q, fact(0));
-        let m = b.op(q, Guard::and(Guard::not(fact(0)), fact(1)));
-        let o = b.merge(&[(d, fact(0)), (m, Guard::and(Guard::not(fact(0)), fact(1)))]);
+        let m = b.op(q, Guard::and(!fact(0), fact(1)));
+        let o = b.merge(&[(d, fact(0)), (m, Guard::and(!fact(0), fact(1)))]);
         b.out(o);
 
         let faults = b.resolve().expect_err("a hole is a fault");

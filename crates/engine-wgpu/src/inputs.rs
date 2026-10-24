@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use kernels_slang::Tensor;
 use poem_compiler::Budget;
 use poem_ir::Dtype;
@@ -733,6 +734,8 @@ fn u32s(handles: &crate::device::Handles, store: &Buffer, at: u64, rows: u32) ->
 }
 
 fn bytes_of(values: &[i32]) -> &[u8] {
+    // SAFETY: `i32` has no padding, so every byte is initialised, and `u8`
+    // has no alignment requirement.
     unsafe {
         core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
     }

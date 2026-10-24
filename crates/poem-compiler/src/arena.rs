@@ -423,7 +423,22 @@ pub struct ArenaMap {
     pub bytes: u64,
 }
 
-pub type LiveSlot = (ValueId, Span, u64, u64);
+/// An arena slot: the value it holds, the nodes it is live over, and where.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LiveSlot {
+    pub value: ValueId,
+    pub span: Span,
+    pub offset: u64,
+    pub bytes: u64,
+}
+
+/// The node where the most arena bytes are live at once, and the slots live
+/// there, largest first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peak {
+    pub at: u32,
+    pub slots: Vec<LiveSlot>,
+}
 
 impl ArenaMap {
     #[must_use]
@@ -507,13 +522,16 @@ impl ArenaMap {
         let live: Vec<_> = self
             .live()
             .into_iter()
-            .map(|(value, span, at, bytes)| (value, conc.reach(span), at, bytes))
+            .map(|slot| (slot, conc.reach(slot.span)))
             .collect();
         let mut found = Vec::new();
-        for (i, (a, a_reach, a_at, a_bytes)) in live.iter().enumerate() {
-            for (b, b_reach, b_at, b_bytes) in &live[i + 1..] {
-                if *a_at < b_at + b_bytes && *b_at < a_at + a_bytes && a_reach.overlaps(b_reach) {
-                    found.push((*a, *b));
+        for (i, (a, a_reach)) in live.iter().enumerate() {
+            for (b, b_reach) in &live[i + 1..] {
+                if a.offset < b.offset + b.bytes
+                    && b.offset < a.offset + a.bytes
+                    && a_reach.overlaps(b_reach)
+                {
+                    found.push((a.value, b.value));
                 }
             }
         }
@@ -523,13 +541,19 @@ impl ArenaMap {
     #[must_use]
     pub fn live_bound(&self) -> u64 {
         let mut live = self.live();
-        live.sort_by_key(|(_, _, offset, _)| *offset);
-        let end = live.iter().map(|(_, s, _, _)| s.last).max().unwrap_or(0);
+        live.sort_by_key(|slot| slot.offset);
+        let end = live.iter().map(|slot| slot.span.last).max().unwrap_or(0);
         let mut most = 0u64;
         for at in 0..=end {
             let mut total = 0u64;
             let mut column: Option<(u64, u64)> = None;
-            for (_, span, offset, bytes) in &live {
+            for LiveSlot {
+                span,
+                offset,
+                bytes,
+                ..
+            } in &live
+            {
                 if span.first > at || at > span.last {
                     continue;
                 }
@@ -590,24 +614,29 @@ impl ArenaMap {
     }
 
     #[must_use]
-    pub fn peak(&self) -> (u32, Vec<LiveSlot>) {
+    pub fn peak(&self) -> Peak {
         let live = self.live();
-        let end = live.iter().map(|(_, s, _, _)| s.last).max().unwrap_or(0);
-        let mut best: (u32, u64, Vec<LiveSlot>) = (0, 0, Vec::new());
+        let end = live.iter().map(|slot| slot.span.last).max().unwrap_or(0);
+        let mut best = Peak {
+            at: 0,
+            slots: Vec::new(),
+        };
+        let mut best_total = 0;
         for at in 0..=end {
             let here: Vec<LiveSlot> = live
                 .iter()
-                .filter(|(_, span, _, _)| span.first <= at && at <= span.last)
+                .filter(|slot| slot.span.first <= at && at <= slot.span.last)
                 .copied()
                 .collect();
-            let total: u64 = here.iter().map(|(_, _, _, bytes)| align(*bytes)).sum();
-            if total > best.1 {
-                best = (at, total, here);
+            let total: u64 = here.iter().map(|slot| align(slot.bytes)).sum();
+            if total > best_total {
+                best_total = total;
+                best = Peak { at, slots: here };
             }
         }
-        let mut slots = best.2;
-        slots.sort_by_key(|slot| core::cmp::Reverse(slot.3));
-        (best.0, slots)
+        best.slots
+            .sort_by_key(|slot| core::cmp::Reverse(slot.bytes));
+        best
     }
 
     fn live(&self) -> Vec<LiveSlot> {
@@ -615,12 +644,12 @@ impl ArenaMap {
             .iter()
             .enumerate()
             .filter_map(|(id, slot)| match slot {
-                Placement::Arena { offset, bytes, .. } => Some((
-                    ValueId(id as u32),
-                    self.spans[id].expect("the carve spans every arena slot"),
-                    *offset,
-                    *bytes,
-                )),
+                Placement::Arena { offset, bytes, .. } => Some(LiveSlot {
+                    value: ValueId(id as u32),
+                    span: self.spans[id].expect("the carve spans every arena slot"),
+                    offset: *offset,
+                    bytes: *bytes,
+                }),
                 _ => None,
             })
             .collect()
@@ -1225,8 +1254,8 @@ mod tests {
         let mut b = Build::new();
         let x = b.input(8);
         let d = b.op(x, 8, fact(0));
-        let p = b.op(x, 4, Guard::not(fact(0)));
-        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 8);
+        let p = b.op(x, 4, !fact(0));
+        let o = b.merge(&[(d, fact(0)), (p, !fact(0))], 8);
         b.out(o);
 
         let classes = resolve_classes(&b.trace).expect("resolves");

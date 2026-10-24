@@ -204,14 +204,11 @@ mod tests {
         let mut b = Build::new();
         let x = b.input(8);
         let mut v = b.op(x, 4, Guard::Always);
-        let xor = Guard::or(
-            Guard::and(fact(0), Guard::not(fact(1))),
-            Guard::and(Guard::not(fact(0)), fact(1)),
-        );
+        let xor = Guard::or(Guard::and(fact(0), !fact(1)), Guard::and(!fact(0), fact(1)));
         for axis in [fact(0), fact(1), xor] {
             let taken = b.op(v, 4, axis.clone());
-            let other = b.op(v, 4, Guard::not(axis.clone()));
-            v = b.merge(&[(taken, axis.clone()), (other, Guard::not(axis))], 4);
+            let other = b.op(v, 4, !axis.clone());
+            v = b.merge(&[(taken, axis.clone()), (other, !axis)], 4);
         }
         let y = b.op(v, 4, Guard::Always);
         b.out(y);

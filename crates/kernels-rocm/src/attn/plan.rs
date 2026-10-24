@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use crate::error::Error;
 
 use crate::attn::{sched_decode, sched_mla, sched_prefill};

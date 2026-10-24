@@ -3,7 +3,7 @@
 //! the commit bump, the publish back to the host mirrors and the settle of
 //! the words, at 1, 7, 128 and 512 lanes of four tickets each, refusals
 //! included.
-
+#![allow(unsafe_code)]
 #![cfg(feature = "rocm")]
 
 mod common;

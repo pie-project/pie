@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use kernels_slang::{ArgValue, Encode, Error, Fire, Target};
 
 use crate::device::ctx::Frame;
@@ -80,7 +81,7 @@ pub fn profiling() -> bool {
 pub fn kernel_profile() -> Vec<(String, u64, u64)> {
     let mut rows: Vec<(String, u64, u64)> = KERNEL_PROFILE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .expect("kernel profile lock poisoned")
         .iter()
         .map(|(name, &(ns, n))| (name.clone(), ns, n))
         .collect();
@@ -90,16 +91,14 @@ pub fn kernel_profile() -> Vec<(String, u64, u64)> {
 
 #[cfg(feature = "vulkan")]
 pub(crate) fn credit(name: &str, ns: u64) {
-    let mut table = KERNEL_PROFILE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
     table.entry(name.to_string()).or_insert((0, 0)).0 += ns;
 }
 
 pub fn reset_kernel_profile() {
     KERNEL_PROFILE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .expect("kernel profile lock poisoned")
         .clear();
     HOST_ENCODE_NS.store(0, std::sync::atomic::Ordering::Relaxed);
     BARRIERS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -112,9 +111,7 @@ pub fn reset_kernel_profile() {
 
 #[cfg(feature = "vulkan")]
 fn record_kernel(name: &str) {
-    let mut table = KERNEL_PROFILE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
     table.entry(name.to_string()).or_insert((0, 0)).1 += 1;
 }
 
@@ -137,11 +134,7 @@ pub fn capture_shapes(on: bool) {
 
 #[must_use]
 pub fn take_shapes() -> Vec<DispatchShape> {
-    std::mem::take(
-        &mut *SHAPES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    )
+    std::mem::take(&mut *SHAPES.lock().expect("shapes lock poisoned"))
 }
 
 #[cfg(feature = "vulkan")]
@@ -213,6 +206,13 @@ impl<'a> Sink<'a> {
             op: fire.entrypoint,
             detail,
         }
+    }
+}
+
+#[cfg(feature = "vulkan")]
+impl Drop for Sink<'_> {
+    fn drop(&mut self) {
+        crate::probe::clear_frame(self.frame);
     }
 }
 
@@ -439,6 +439,11 @@ impl Sink<'_> {
                 continue;
             }
 
+            // SAFETY: only the lifetime changes, so `sets` can live in the
+            // reused scratch. `WriteDescriptorSet` keeps a raw pointer to
+            // `info`, which is read only by `update_descriptor_sets` below,
+            // while `infos` is untouched; `sets` is cleared before `infos`
+            // changes again on the next fire, and no one reads it in between.
             let info: &'static vk::DescriptorBufferInfo = unsafe { std::mem::transmute(info) };
             scratch.sets.push(
                 vk::WriteDescriptorSet::default()
@@ -448,6 +453,13 @@ impl Sink<'_> {
                     .buffer_info(std::slice::from_ref(info)),
             );
         }
+        // SAFETY: `set` was handed out by `descriptor_set` to this dispatch
+        // alone and no submitted command uses it yet, so updating it needs no
+        // further sync; every buffer it names is a live slab the frame retains,
+        // with offsets and ranges from bound views. `cmd` is the open frame's
+        // buffer, recorded only by this sink's thread (`Frame` is not `Sync`).
+        // The push block's length was checked against the layout's range,
+        // and a timestamp index stays below the pool's `capacity * 2`.
         unsafe {
             if !scratch.sets.is_empty() {
                 d.update_descriptor_sets(&scratch.sets, &[]);
@@ -487,7 +499,7 @@ impl Sink<'_> {
                     .inner
                     .timing
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .expect("timing lock poisoned");
                 match slot.as_mut() {
                     Some(t) if (t.names.len() as u32) < t.capacity => {
                         let at = t.names.len() as u32;
@@ -521,7 +533,7 @@ impl Sink<'_> {
             use ash::vk::Handle;
             SHAPES
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("shapes lock poisoned")
                 .push(DispatchShape {
                     entrypoint: key,
                     bindings: infos

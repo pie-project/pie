@@ -4,6 +4,7 @@
 //! directory) and `PIE_XLA_DEPLOYMENT` (the catalog row that reads it).
 
 use std::time::Instant;
+use tokenizer::Specials;
 
 use crate::common;
 
@@ -95,7 +96,7 @@ fn a_prompt_is_answered_and_its_decode_agrees_with_its_prefill() {
         step_times.push(at.elapsed().as_secs_f64());
         produced.push(argmax(&rows[0]));
     }
-    let text = tokenizer.decode(&produced, true);
+    let text = tokenizer.decode(&produced, Specials::Skip);
     eprintln!("gen {produced:?}\n  => {text:?}");
     eprintln!(
         "decode steps (s): first {:.3}, then median {:.4}",
@@ -213,8 +214,8 @@ fn a_prompt_is_answered_and_its_decode_agrees_with_its_prefill() {
     for (lane, (a, b)) in alone.iter().zip(&together).enumerate() {
         eprintln!(
             "lane {lane}: alone {:?} / together {:?}",
-            tokenizer.decode(a, true),
-            tokenizer.decode(b, true)
+            tokenizer.decode(a, Specials::Skip),
+            tokenizer.decode(b, Specials::Skip)
         );
     }
     assert_eq!(

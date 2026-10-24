@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::future::Future;

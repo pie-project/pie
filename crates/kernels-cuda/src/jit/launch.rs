@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use core::ffi::c_void;
 
 use cudarc::driver::sys as dr;
@@ -6,6 +7,13 @@ use crate::jit::{Fault, Launch};
 
 const DEFAULT_DYNAMIC_SMEM: u32 = 48 * 1024;
 
+/// # Safety
+///
+/// `function` is a live function handle in the thread's current context and
+/// `stream` a live stream on that context (or null). `slots` holds one
+/// pointer per kernel parameter, in order, each to at least that
+/// parameter's size of readable bytes. Every device address among the
+/// arguments is valid for whatever the kernel reads and writes there.
 pub(crate) unsafe fn issue(
     function: dr::CUfunction,
     launch: Launch,
@@ -16,6 +24,9 @@ pub(crate) unsafe fn issue(
         raise_dynamic_smem_cap(function, launch.smem)?;
     }
 
+    // SAFETY: `CUlaunchAttribute` is a C struct of an enum id whose zero is
+    // `CU_LAUNCH_ATTRIBUTE_IGNORE` and a plain-data union; all-zero bytes are
+    // a valid value. Only the first `n` entries reach the driver.
     let mut attrs: [dr::CUlaunchAttribute; 3] = unsafe { core::mem::zeroed() };
     let mut n = 0usize;
     if launch.cooperative {
@@ -26,6 +37,8 @@ pub(crate) unsafe fn issue(
     // Past the portable 8 a cluster is the function's to allow (B200 seats
     // 16 one-block SMs a cluster).
     if launch.cluster > 8 {
+        // SAFETY: `function` is live by this fn's contract; the attribute
+        // takes a plain flag.
         let code = unsafe {
             dr::cuFuncSetAttribute(
                 function,
@@ -71,6 +84,10 @@ pub(crate) unsafe fn issue(
         numAttrs: n as core::ffi::c_uint,
     };
 
+    // SAFETY: `config` and the `n` attributes it points at are locals that
+    // outlive the call. `function`, `stream` and `slots` are as this fn's
+    // contract states; `extra` is null, so the driver takes the arguments
+    // from `slots` alone.
     let code = unsafe {
         dr::cuLaunchKernelEx(
             std::ptr::addr_of!(config),
@@ -92,6 +109,7 @@ pub(crate) unsafe fn issue(
 fn raise_dynamic_smem_cap(function: dr::CUfunction, bytes: u32) -> Result<(), Fault> {
     let mut device: dr::CUdevice = 0;
 
+    // SAFETY: `device` is a local out-pointer.
     let code = unsafe { dr::cuCtxGetDevice(&raw mut device) };
     if code != dr::CUresult::CUDA_SUCCESS {
         return Err(Fault::Device {
@@ -100,15 +118,16 @@ fn raise_dynamic_smem_cap(function: dr::CUfunction, bytes: u32) -> Result<(), Fa
         });
     }
     let key = (device, function.addr());
-    let mut granted = GRANTED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut granted = GRANTED.lock().expect("granted lock poisoned");
     if let Some((_, high_water)) = granted.iter().find(|(k, _)| *k == key)
         && bytes <= *high_water
     {
         return Ok(());
     }
 
+    // SAFETY: `function` is the live handle `issue`'s caller vouched for;
+    // the attribute takes a byte count, and one the device cannot seat
+    // comes back as an error code.
     let code = unsafe {
         dr::cuFuncSetAttribute(
             function,

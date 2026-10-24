@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 pub mod kv;
 pub mod rs;
 

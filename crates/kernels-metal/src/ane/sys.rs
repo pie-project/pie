@@ -1,5 +1,6 @@
 //! The C face of `native/ane.m`: every call into the private framework goes
 //! through one of these. Nothing outside this module touches them.
+#![allow(unsafe_code)]
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 
@@ -72,6 +73,8 @@ pub(super) fn message() -> Message {
 }
 
 pub(super) fn failure(err: &Message) -> String {
+    // SAFETY: a `Message` starts all NUL and the bridge writes it only with
+    // `snprintf` bounded by `CAP`, so it always holds a terminator.
     unsafe { CStr::from_ptr(err.as_ptr()) }
         .to_string_lossy()
         .into_owned()

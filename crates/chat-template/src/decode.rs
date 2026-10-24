@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tokenizer::Specials;
 
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
@@ -14,7 +15,7 @@ impl GenericChatDecoder {
     #[must_use]
     pub fn new(tokenizer: Arc<Tokenizer>, stop_ids: Vec<u32>) -> Self {
         Self {
-            decoder: tokenizer.decoder(false),
+            decoder: tokenizer.decoder(Specials::Keep),
             stop_ids,
             text: String::new(),
         }
@@ -68,7 +69,7 @@ impl ThinkingDecoder {
             "a thinking block that opens with nothing is a block that never opens"
         );
         Self {
-            decoder: tokenizer.decoder(false),
+            decoder: tokenizer.decoder(Specials::Keep),
             open,
             close,
             starts_inside: false,

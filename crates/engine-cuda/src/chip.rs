@@ -1,6 +1,7 @@
 //! The GPU's profile: the CUDA registry, the facts this engine measures, the
 //! checked-in profiles, and resolution for one load. A ROCm build reads the
 //! same registry against AMD's chips, keyed by their gfx version.
+#![allow(unsafe_code)]
 
 use std::path::Path;
 use std::sync::LazyLock;

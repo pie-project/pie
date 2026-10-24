@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 pub mod compressed;
 pub mod dense;
 

@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use crate::error::Error;
 
 use crate::attn::plan::Device;
@@ -357,6 +358,9 @@ fn decode_blocks_per_sm_uncached(head_dim: u32, group_size: u32) -> Option<u32> 
     let resolved = crate::jit::cache::resolve(&root, entrypoint).ok()?;
 
     if geometry.smem_bytes > 48 * 1024 {
+        // SAFETY: `resolve` returned a function the cache keeps loaded for
+        // the process, in the context it bound to this thread; a byte count
+        // the device cannot seat comes back as an error code.
         unsafe {
             dr::cuFuncSetAttribute(
                 resolved.function,
@@ -368,6 +372,8 @@ fn decode_blocks_per_sm_uncached(head_dim: u32, group_size: u32) -> Option<u32> 
 
     let mut blocks: core::ffi::c_int = 0;
 
+    // SAFETY: `blocks` is a local out-pointer and `resolved.function` is the
+    // live handle above; the query launches nothing.
     let code = unsafe {
         dr::cuOccupancyMaxActiveBlocksPerMultiprocessor(
             &raw mut blocks,

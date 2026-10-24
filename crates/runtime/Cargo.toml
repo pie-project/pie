@@ -149,3 +149,6 @@ profile-fire = []
 tempfile = "3"
 builtins = { path = "../builtins", features = ["test-policies"] }
 wasmtime = { version = "49", default-features = false, features = ["wat"] }
+
+[lints]
+workspace = true

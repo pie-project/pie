@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use core::ffi::c_void;
 
 use crate::error::{Fault, Result};
@@ -179,6 +180,8 @@ pub fn open(stream: *mut c_void, handle: u64, kind: Kind) -> Result<Conditional>
             dr::cuCtxGetCurrent(&raw mut ctx)
         })?;
 
+        // SAFETY: a plain C union of ints and raw pointers, for which all
+        // zero bytes is a valid value; the fields the call reads are set below.
         let mut params: dr::CUgraphNodeParams = unsafe { core::mem::zeroed() };
         params.type_ = dr::CUgraphNodeType::CU_GRAPH_NODE_TYPE_CONDITIONAL;
         params.__bindgen_anon_1.conditional = dr::CUDA_CONDITIONAL_NODE_PARAMS {

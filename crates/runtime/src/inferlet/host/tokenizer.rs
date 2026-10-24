@@ -3,10 +3,14 @@ use crate::inferlet::host::pie;
 use crate::model;
 use anyhow::Result;
 
-fn token_table((ids, bytes): (Vec<u32>, Vec<Vec<u8>>)) -> Vec<pie::inferlet::tokenizer::Token> {
-    ids.into_iter()
-        .zip(bytes)
-        .map(|(id, bytes)| pie::inferlet::tokenizer::Token { id, bytes })
+fn token_table<'a>(
+    tokens: impl Iterator<Item = (u32, &'a [u8])>,
+) -> Vec<pie::inferlet::tokenizer::Token> {
+    tokens
+        .map(|(id, bytes)| pie::inferlet::tokenizer::Token {
+            id,
+            bytes: bytes.to_vec(),
+        })
         .collect()
 }
 
@@ -32,7 +36,7 @@ impl pie::inferlet::tokenizer::Host for ProcessCtx {
     }
 
     async fn vocabs(&mut self) -> Result<Vec<pie::inferlet::tokenizer::Token>> {
-        Ok(crate::rt::spawn_blocking(|| token_table(model::model().get_vocabs())).await?)
+        Ok(crate::rt::spawn_blocking(|| token_table(model::model().vocabs())).await?)
     }
 
     async fn token_bytes(&mut self, tokens: Vec<u32>) -> Result<Vec<Vec<u8>>> {
@@ -44,10 +48,11 @@ impl pie::inferlet::tokenizer::Host for ProcessCtx {
     }
 
     async fn split_regex(&mut self) -> Result<String> {
-        Ok(model::model().get_split_regex())
+        // a guest reads "no single regex" as the empty string
+        Ok(model::model().split_regex().unwrap_or_default().to_owned())
     }
 
     async fn special_tokens(&mut self) -> Result<Vec<pie::inferlet::tokenizer::Token>> {
-        Ok(token_table(model::model().get_special_tokens()))
+        Ok(token_table(model::model().special_tokens()))
     }
 }

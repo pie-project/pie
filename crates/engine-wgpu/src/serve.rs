@@ -1507,9 +1507,7 @@ impl Shell {
             tracing::debug!(seq = flight.seq, "harvest parks until the step lands");
             let mailbox = std::sync::Arc::clone(&self.mailbox);
             crate::device::host::block_on_poll("harvest", |cx| {
-                let mut post = mailbox
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut post = mailbox.lock().expect("mailbox lock poisoned");
                 if post.landed.is_empty() {
                     post.waker = Some(cx.waker().clone());
                     std::task::Poll::Pending
@@ -1521,13 +1519,8 @@ impl Shell {
     }
 
     fn collect(&mut self) {
-        let landed = std::mem::take(
-            &mut self
-                .mailbox
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .landed,
-        );
+        let landed =
+            std::mem::take(&mut self.mailbox.lock().expect("mailbox lock poisoned").landed);
         for step in landed {
             if self
                 .inflight
@@ -2377,7 +2370,7 @@ impl Shell {
             )?;
         }
 
-        let Encoded::Live(_) = sink;
+        drop(sink);
         let launches = (0..self.compiled.template().len() as u32)
             .map(|region| p.windows.runs(region).max(1))
             .sum();

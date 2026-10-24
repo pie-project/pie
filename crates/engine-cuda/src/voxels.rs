@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use poem_compiler::VoxelLadder;
 use poem_exec::fire::LaneRow;
 use poem_ir::Dtype;

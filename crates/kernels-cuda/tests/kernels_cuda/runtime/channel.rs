@@ -1,4 +1,5 @@
 #![cfg(feature = "cuda")]
+#![allow(unsafe_code)]
 
 use crate::common::Gpu;
 use kernels_cuda::runtime::channel::{WordRun, gather_words};

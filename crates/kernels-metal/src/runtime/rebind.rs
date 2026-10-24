@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 pub const FILE: &str = "runtime/rebind.metal";
 
 pub const ENTRYPOINT: &str = "icb_rebind";
@@ -211,11 +212,32 @@ impl SlotRow {
     }
 }
 
+/// One of this module's rows: `#[repr(C)]` over integers with its padding
+/// spelled out as fields, so every byte of one is initialised. Sealed, so
+/// [`bytes_of`] reads no other type.
+pub trait Row: Copy + sealed::Sealed {}
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+impl sealed::Sealed for Plan {}
+impl Row for Plan {}
+impl sealed::Sealed for LawRow {}
+impl Row for LawRow {}
+impl sealed::Sealed for BindRow {}
+impl Row for BindRow {}
+impl sealed::Sealed for ArmRow {}
+impl Row for ArmRow {}
+impl sealed::Sealed for SlotRow {}
+impl Row for SlotRow {}
+impl sealed::Sealed for PipeRow {}
+impl Row for PipeRow {}
+
 #[must_use]
-pub fn bytes_of<T: Copy>(rows: &[T]) -> &[u8] {
-    // SAFETY: every row in this module is `#[repr(C)]` over integers with its
-    // padding spelled out as fields, so the whole object is initialised and
-    // `u8` has no alignment requirement.
+pub fn bytes_of<T: Row>(rows: &[T]) -> &[u8] {
+    // SAFETY: `T: Row` is one of this module's rows, every byte of which is
+    // initialised, and `u8` has no alignment requirement.
     unsafe { std::slice::from_raw_parts(rows.as_ptr().cast::<u8>(), std::mem::size_of_val(rows)) }
 }
 

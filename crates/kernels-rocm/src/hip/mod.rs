@@ -1,6 +1,7 @@
 //! The thin layer over HIP this crate launches through: hiprtc compiles a
 //! unit to a code object, a [`Module`] loads it, and [`Module::launch`] fires
 //! one of its kernels on a [`Stream`].
+#![allow(unsafe_code)]
 
 pub mod blas;
 pub mod lt;
@@ -322,10 +323,14 @@ pub fn compile(
     };
     let log = {
         let mut bytes = 0usize;
-        // SAFETY: `program` is live; the buffer is sized by the first call.
-        unsafe { (api.rtc.hiprtcGetProgramLogSize)(program.0, &raw mut bytes) };
+        // SAFETY: `program` is live and `bytes` a live out-parameter.
+        let sized = unsafe { (api.rtc.hiprtcGetProgramLogSize)(program.0, &raw mut bytes) };
         let mut text = vec![0u8; bytes.max(1)];
-        unsafe { (api.rtc.hiprtcGetProgramLog)(program.0, text.as_mut_ptr().cast()) };
+        if sized == sys::HIPRTC_SUCCESS {
+            // SAFETY: `text` holds at least the `bytes` the size query just
+            // reported, which is all the log call writes.
+            unsafe { (api.rtc.hiprtcGetProgramLog)(program.0, text.as_mut_ptr().cast()) };
+        }
         String::from_utf8_lossy(&text)
             .trim_end_matches('\0')
             .trim()
@@ -351,6 +356,8 @@ pub fn compile(
             return Err(rtc_fault(unit, "hiprtcGetLoweredName", code, ""));
         }
         lowered.push(
+            // SAFETY: `out` is non-null and NUL-terminated, owned by `program`,
+            // which outlives this copy.
             unsafe { CStr::from_ptr(out) }
                 .to_string_lossy()
                 .into_owned(),
@@ -364,6 +371,8 @@ pub fn compile(
         return Err(rtc_fault(unit, "hiprtcGetCodeSize", code, ""));
     }
     let mut image = vec![0u8; size];
+    // SAFETY: `image` holds the `size` bytes `hiprtcGetCodeSize` just reported
+    // for this program.
     let code = unsafe { (api.rtc.hiprtcGetCode)(program.0, image.as_mut_ptr().cast()) };
     if code != sys::HIPRTC_SUCCESS {
         return Err(rtc_fault(unit, "hiprtcGetCode", code, ""));

@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
@@ -361,7 +362,12 @@ struct Api {
     api_version: u32,
 }
 
+// SAFETY: `Api` is the loaded library and a function table the driver filled
+// once in `load`; neither changes afterwards, and NVENC's entry points take the
+// session they act on, so any thread may call them.
 unsafe impl Send for Api {}
+// SAFETY: shared access only reads the table's function pointers, and `API` is
+// a static, so the library they point into is never unloaded.
 unsafe impl Sync for Api {}
 
 static API: OnceLock<Result<Api, String>> = OnceLock::new();
@@ -414,6 +420,9 @@ fn load() -> Result<&'static Api, String> {
         };
         let api_version = api_version(API_MAJOR, minor);
 
+        // SAFETY: `FunctionList` is `repr(C)` integers, raw pointers and
+        // `Option`al fn pointers, for which all-zero is a valid value (0, null,
+        // `None`).
         let mut list: FunctionList = unsafe { std::mem::zeroed() };
         list.version = struct_version(api_version, 2);
         // SAFETY: `list` is a correctly sized, zeroed NV_ENCODE_API_FUNCTION_LIST
@@ -503,6 +512,9 @@ impl Session {
             .ok_or("NVENC exposes no nvEncGetSequenceParams")?;
         let mut buf = vec![0u8; 512];
         let mut written: u32 = 0;
+        // SAFETY: `SequenceParamPayload` is `repr(C)` integers and raw
+        // pointers, for which all-zero is a valid value; the header asks for a
+        // zeroed record.
         let mut p: SequenceParamPayload = unsafe { std::mem::zeroed() };
         p.version = struct_version(self.api.api_version, 1);
         p.in_buffer_size = buf.len() as u32;
@@ -562,6 +574,8 @@ pub fn encode_h264(
         .list
         .open_encode_session_ex
         .ok_or("NVENC exposes no nvEncOpenEncodeSessionEx")?;
+    // SAFETY: `OpenSessionExParams` is `repr(C)` integers and raw pointers, for
+    // which all-zero is a valid value; the header asks for a zeroed record.
     let mut params: OpenSessionExParams = unsafe { std::mem::zeroed() };
     params.version = struct_version(api.api_version, 1);
     params.device_type = NV_ENC_DEVICE_TYPE_CUDA;
@@ -584,6 +598,8 @@ pub fn encode_h264(
         outputs: Vec::new(),
     };
 
+    // SAFETY: `PresetConfig` is `repr(C)` integers, GUIDs and raw pointers, for
+    // which all-zero is a valid value; the header asks for a zeroed record.
     let mut preset: PresetConfig = unsafe { std::mem::zeroed() };
     preset.version = struct_version_ex(api.api_version, 5);
     preset.preset_cfg.version = struct_version_ex(api.api_version, 9);
@@ -617,6 +633,8 @@ pub fn encode_h264(
     config.rc_params.average_bitrate = bitrate;
     config.rc_params.max_bitrate = bitrate * 2;
 
+    // SAFETY: `InitializeParams` is `repr(C)` integers, GUIDs and raw pointers,
+    // for which all-zero is a valid value; the header asks for a zeroed record.
     let mut init: InitializeParams = unsafe { std::mem::zeroed() };
     init.version = struct_version_ex(api.api_version, 7);
     init.encode_guid = H264_GUID;
@@ -651,6 +669,9 @@ pub fn encode_h264(
         .create_bitstream_buffer
         .ok_or("no nvEncCreateBitstreamBuffer")?;
     for _ in 0..depth {
+        // SAFETY: `CreateInputBuffer` is `repr(C)` integers and raw pointers,
+        // for which all-zero is a valid value; the header asks for a zeroed
+        // record.
         let mut cib: CreateInputBuffer = unsafe { std::mem::zeroed() };
         cib.version = struct_version(api.api_version, 2);
         cib.width = width;
@@ -662,8 +683,13 @@ pub fn encode_h264(
         session.check(s, "nvEncCreateInputBuffer")?;
         session.inputs.push(cib.input_buffer);
 
+        // SAFETY: `CreateBitstreamBuffer` is `repr(C)` integers and raw
+        // pointers, for which all-zero is a valid value; the header asks for a
+        // zeroed record.
         let mut cbb: CreateBitstreamBuffer = unsafe { std::mem::zeroed() };
         cbb.version = struct_version(api.api_version, 1);
+        // SAFETY: an initialised creation record; the driver writes
+        // `bitstream_buffer` and the session owns it from here.
         let s = unsafe { create_output(encoder, &mut cbb) };
         session.check(s, "nvEncCreateBitstreamBuffer")?;
         session.outputs.push(cbb.bitstream_buffer);
@@ -688,6 +714,8 @@ pub fn encode_h264(
         unlock: unsafe extern "C" fn(*mut c_void, *mut c_void) -> Status,
         out: &mut Vec<Vec<u8>>,
     ) -> Result<(), String> {
+        // SAFETY: `LockBitstream` is `repr(C)` integers and raw pointers, for
+        // which all-zero is a valid value; the header asks for a zeroed record.
         let mut lb: LockBitstream = unsafe { std::mem::zeroed() };
         lb.version = struct_version_ex(session.api.api_version, 2);
         lb.output_bitstream = session.outputs[slot];
@@ -699,6 +727,9 @@ pub fn encode_h264(
         let bytes = if lb.bitstream_buffer_ptr.is_null() {
             Vec::new()
         } else {
+            // SAFETY: the lock succeeded, so `bitstream_buffer_ptr` maps
+            // `bitstream_size_in_bytes` readable bytes until the unlock below;
+            // they are copied out before it.
             unsafe {
                 std::slice::from_raw_parts(
                     lb.bitstream_buffer_ptr as *const u8,
@@ -726,6 +757,8 @@ pub fn encode_h264(
         }
         let slot = frame % depth;
 
+        // SAFETY: `LockInputBuffer` is `repr(C)` integers and raw pointers, for
+        // which all-zero is a valid value; the header asks for a zeroed record.
         let mut lib_: LockInputBuffer = unsafe { std::mem::zeroed() };
         lib_.version = struct_version(api.api_version, 1);
         lib_.input_buffer = session.inputs[slot];
@@ -754,6 +787,8 @@ pub fn encode_h264(
         let s = unsafe { unlock_input(encoder, session.inputs[slot]) };
         session.check(s, "nvEncUnlockInputBuffer")?;
 
+        // SAFETY: `PicParams` is `repr(C)` integers and raw pointers, for which
+        // all-zero is a valid value; the header asks for a zeroed record.
         let mut pp: PicParams = unsafe { std::mem::zeroed() };
         pp.version = struct_version_ex(api.api_version, 7);
         pp.input_width = width;
@@ -783,6 +818,8 @@ pub fn encode_h264(
         }
     }
 
+    // SAFETY: `PicParams` is `repr(C)` integers and raw pointers, for which
+    // all-zero is a valid value; the header asks for a zeroed record.
     let mut eos: PicParams = unsafe { std::mem::zeroed() };
     eos.version = struct_version_ex(api.api_version, 7);
     eos.encode_pic_flags = NV_ENC_PIC_FLAG_EOS;
@@ -852,6 +889,8 @@ mod tests {
     }
 
     fn reordering_is_off_after_configuring() {
+        // SAFETY: `Config` is `repr(C)` integers, GUIDs and raw pointers, for
+        // which all-zero is a valid value.
         let mut c: Config = unsafe { std::mem::zeroed() };
         c.frame_interval_p = 3;
         c.rc_params.flags = RC_FLAG_LOOKAHEAD | RC_FLAG_EXT_LOOKAHEAD | 0x8;

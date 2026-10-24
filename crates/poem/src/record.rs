@@ -599,7 +599,7 @@ impl FirstMatch {
     /// The rows `holds` is the first case to hold for.
     pub(crate) fn case(&mut self, holds: Guard) -> Guard {
         let rest = self.rest.take().unwrap_or(Guard::Always);
-        self.rest = Some(Guard::and(rest.clone(), Guard::not(holds.clone())));
+        self.rest = Some(Guard::and(rest.clone(), !holds.clone()));
         Guard::and(rest, holds)
     }
 
