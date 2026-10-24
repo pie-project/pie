@@ -41,6 +41,8 @@ mod a_fitted_pool_is_pledged_what_it_declared;
 mod a_four_rank_group_fires_a_sharded_plan;
 mod a_fragmented_window_gets_a_view_per_run;
 mod a_fused_geglu_reads_its_affine_bank_as_planes;
+#[cfg(feature = "cuda")]
+mod a_fused_router_answers_what_its_product_and_pick_answer;
 mod a_fused_swiglu_sizes_the_decoded_tile_to_its_packed_plane;
 mod a_group_with_two_reference_lanes_keeps_each_to_itself;
 mod a_grouped_window_is_one_window_and_a_segment_list;

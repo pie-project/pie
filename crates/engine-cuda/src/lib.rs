@@ -70,6 +70,7 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
             rules::moe_select_glu(),
             rules::matmul_softcap(),
             rules::matmul_bias(),
+            rules::matmul_moe_route(),
             rules::matmul_split_rows(),
             rules::gated_residual_norm_modulate(),
             rules::norm_modulate(),
