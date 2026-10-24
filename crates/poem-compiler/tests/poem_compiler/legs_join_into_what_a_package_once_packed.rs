@@ -160,12 +160,12 @@ impl ForwardHybrid for Banks {
         );
         let act = match (&self.gate, &self.up, &self.gate_up) {
             (Some(gate), Some(up), None) => {
-                let gate = moe_matmul_select(&x, gate, &routes, TOP_K);
-                let up = moe_matmul_select(&x, up, &routes, TOP_K);
+                let gate = moe_matmul_select(&x, gate, &routes, TOP_K, None);
+                let up = moe_matmul_select(&x, up, &routes, TOP_K, None);
                 glu(&gate, poem_ir::GluAct::Swiglu, None, Some(&up), None, None)
             }
             (None, None, Some(gate_up)) => {
-                let packed = moe_matmul_select(&x, gate_up, &routes, TOP_K);
+                let packed = moe_matmul_select(&x, gate_up, &routes, TOP_K, None);
                 glu(
                     &packed,
                     poem_ir::GluAct::Swiglu,
@@ -177,7 +177,7 @@ impl ForwardHybrid for Banks {
             }
             _ => unreachable!("a micro states its banks one way"),
         };
-        let routed = moe_matmul_select(&act, &self.down, &routes, TOP_K);
+        let routed = moe_matmul_select(&act, &self.down, &routes, TOP_K, None);
         let y = moe_weighted_sum(&routed, &weights);
         ops::linear::lm_head(&y, &self.head)
     }

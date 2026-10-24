@@ -382,7 +382,7 @@ def forward(m, inputs):
             e.top_k,
             routing.softmax(),
         )
-        packed = ops.linear.moe_matmul_select_bias(x, e.gate_up, e.gate_up_bias, experts, e.top_k)
+        packed = ops.linear.moe_matmul_select(x, e.gate_up, experts, e.top_k, bias = e.gate_up_bias)
         act = ops.linear.glu(packed, gating.swiglu_alpha(e.swiglu_alpha), e.inter, limit = e.swiglu_limit)
         routed = ops.linear.moe_matmul_select(act, e.down, experts, e.top_k)
         f = ops.linear.moe_weighted_sum(routed, weights)

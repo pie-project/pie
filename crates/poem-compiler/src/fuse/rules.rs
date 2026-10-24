@@ -1061,7 +1061,7 @@ pub fn moe_experts() -> Rule {
                         0 => {
                             linear::select::plain(x, &p.weight(bank, [W, W, W]), &routes, top_k)
                         }
-                        1 => linear::moe_matmul_select_bias(
+                        1 => linear::select::biased(
                             x,
                             &p.weight(bank, [W, W, W]),
                             &p.weight(bias, [W, W]),
@@ -1268,7 +1268,7 @@ pub fn moe_select_glu() -> Rule {
                 let top_k = p.u32("top_k");
                 let packed = match select {
                     0 => linear::select::plain(&x, &bank, &routes, top_k),
-                    1 => linear::moe_matmul_select_bias(
+                    1 => linear::select::biased(
                         &x,
                         &bank,
                         &p.weight("bias", [W, W]),

@@ -300,39 +300,23 @@ pub fn matmul_grouped(x: &Value, w: &Weight, routes: &Value, groups: u32) -> Val
     y
 }
 /// A routed bank's select, as the bank is stored: a bf16, f16 or f32 bank's
-/// plain, any other through its codes and factors.
-pub fn moe_matmul_select(x: &Value, bank: &Weight, routes: &Value, top_k: u32) -> Value {
+/// plain, any other through its codes and factors; `bias` (a row per expert)
+/// added to each routed row where given.
+pub fn moe_matmul_select(
+    x: &Value,
+    bank: &Weight,
+    routes: &Value,
+    top_k: u32,
+    bias: Option<&Weight>,
+) -> Value {
+    if let Some(bias) = bias {
+        return select::biased(x, bank, bias, routes, top_k);
+    }
     if bank.act.is_none() && matches!(bank.dtype, Dtype::Bf16 | Dtype::F16 | Dtype::F32) {
         select::plain(x, bank, routes, top_k)
     } else {
         select::quantized(x, bank, routes, top_k)
     }
-}
-
-pub fn moe_matmul_select_bias(
-    x: &Value,
-    bank: &Weight,
-    bias: &Weight,
-    routes: &Value,
-    top_k: u32,
-) -> Value {
-    unquantized(bank, "a biased select");
-    let r = x.rec();
-    let y = r.fresh(tensor(Dim::TokensTimes(top_k), bank.dim(1), x.dtype()));
-    r.push(
-        Linear::MoeSelect {
-            x: x.id(),
-            bank: r.weight(bank),
-            bias: Some(r.weight(bias)),
-            routes: routes.id(),
-            y: y.id(),
-            input_scales: None,
-            quantized: false,
-            quant: None,
-        },
-        &[x, routes],
-    );
-    y
 }
 
 pub fn moe_weighted_sum(routed: &Value, weights: &Value) -> Value {
@@ -478,6 +462,32 @@ pub mod select {
                 &[x, routes],
             ),
         }
+        y
+    }
+
+    pub fn biased(
+        x: &Value,
+        bank: &Weight,
+        bias: &Weight,
+        routes: &Value,
+        top_k: u32,
+    ) -> Value {
+        unquantized(bank, "a biased select");
+        let r = x.rec();
+        let y = r.fresh(tensor(Dim::TokensTimes(top_k), bank.dim(1), x.dtype()));
+        r.push(
+            Linear::MoeSelect {
+                x: x.id(),
+                bank: r.weight(bank),
+                bias: Some(r.weight(bias)),
+                routes: routes.id(),
+                y: y.id(),
+                input_scales: None,
+                quantized: false,
+                quant: None,
+            },
+            &[x, routes],
+        );
         y
     }
 }
