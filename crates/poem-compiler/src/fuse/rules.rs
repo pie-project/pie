@@ -7,8 +7,8 @@ use poem::ops::{attn, elemwise, gather, linear, ssm};
 use poem::pattern::{Pattern, Template, template};
 use poem_ir::ops::fused::{Intermediates, PostNorm, Scaled};
 use poem_ir::{
-    ActQuant, Dim, Dtype, Elemwise, Fused, Gather, ModulateForm, NormKind, Operation, StructKind,
-    Ty,
+    ActQuant, Dim, Dtype, Elemwise, Fused, Gather, Linear, ModulateForm, NormKind, Operation,
+    RouteScore, StructKind, Ty,
 };
 use poem_ir::{NormAxis, NormWeight, Turn};
 
@@ -64,6 +64,7 @@ pub fn all() -> Vec<Rule> {
         moe_select_glu(),
         matmul_softcap(),
         matmul_bias(),
+        matmul_moe_route(),
         matmul_split_rows(),
         gated_residual_norm_modulate(),
         norm_modulate(),
@@ -1393,6 +1394,72 @@ pub fn matmul_bias() -> Rule {
         bias: m.value("bias"),
         y: m.value("y"),
         y_out: m.value("y_out"),
+    })
+}
+
+/// A router's unquantized product read only by the top-k it feeds, a
+/// softmax, sigmoid or sqrt-softplus pick (bf16 or f32 logits alike: the
+/// product is one op either way). Its bias, gain and hint pass through; a
+/// hashed route, which reads its experts off a table, stays apart.
+#[must_use]
+pub fn matmul_moe_route() -> Rule {
+    let pattern = template(|p| {
+        let logits = linear::matmul(&p.rows("act", W), &p.weight("w", [W, W]));
+        p.name("logits", &logits);
+        for field in ["experts", "top_k", "score", "bias", "scale", "hint"] {
+            p.free(field);
+        }
+        let (routes, weights) = linear::moe_route(
+            &logits,
+            W as u32,
+            8,
+            RouteScore::Softmax,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        p.export("routes", &routes);
+        p.export("weights", &weights);
+    });
+    Rule::new("fused.matmul_moe_route", [pattern], |m| {
+        let Operation::Linear(Linear::MoeRoute {
+            bias,
+            scale,
+            hint,
+            experts,
+            top_k,
+            score,
+            ..
+        }) = m.op("routes")
+        else {
+            panic!("`routes` comes from a route");
+        };
+        Fused::MatmulMoeRoute {
+            act: m.value("act"),
+            w: m.value("w"),
+            bias: *bias,
+            scale: *scale,
+            hint: *hint,
+            experts: *experts,
+            top_k: *top_k,
+            score: *score,
+            logits: m.value("logits"),
+            routes: m.value("routes"),
+            weights: m.value("weights"),
+        }
+    })
+    .when(|m| {
+        matches!(
+            m.op("routes"),
+            Operation::Linear(Linear::MoeRoute {
+                score: RouteScore::Softmax
+                    | RouteScore::Sigmoid { .. }
+                    | RouteScore::SqrtSoftplus { .. },
+                ..
+            })
+        )
     })
 }
 

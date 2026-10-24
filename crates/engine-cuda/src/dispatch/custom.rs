@@ -61,6 +61,7 @@ impl DispatchFused for Run<'_> {
             | Fused::MatmulSwigluMatmul { .. }
             | Fused::MatmulSoftcap { .. }
             | Fused::MatmulBias { .. }
+            | Fused::MatmulMoeRoute { .. }
             | Fused::MatmulSplitRows { .. }
             | Fused::MoeSelectGlu { .. }
             | Fused::MoeExperts { .. } => self.fused_linear(op),

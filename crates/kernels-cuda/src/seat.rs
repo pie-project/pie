@@ -111,6 +111,7 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("linear.gelu_tanh", Reads::Rows),
     entry("linear.moe_combine", Reads::Rows),
     entry("linear.moe_route", Reads::Rows),
+    entry("fused.matmul_moe_route", Reads::Rows),
     entry("linear.moe_select", Reads::Rows),
     entry("linear.relu2", Reads::Rows),
     entry("fused.matmul_swiglu_matmul", Reads::Rows),

@@ -53,6 +53,7 @@ impl DispatchFused for Run<'_> {
             // and run as the primitives they stand for where a trace states
             // them.
             Fused::MatmulGlu { .. }
+            | Fused::MatmulMoeRoute { .. }
             | Fused::MatmulSplitRows { .. }
             | Fused::MoeSelectGlu { .. }
             | Fused::MoeExperts { .. }
@@ -410,6 +411,48 @@ impl Run<'_> {
                         width: *width,
                         left: *left,
                         right: *right,
+                    },
+                )
+            }
+            Fused::MatmulMoeRoute {
+                act,
+                w,
+                bias,
+                scale,
+                hint,
+                experts,
+                top_k,
+                score,
+                logits,
+                routes,
+                weights,
+            } => {
+                DispatchLinear::dispatch(
+                    self,
+                    &Linear::Matmul {
+                        act: *act,
+                        w: *w,
+                        y: *logits,
+                        input_scales: None,
+                        scales: None,
+                        quant: None,
+                        logits: false,
+                    },
+                )?;
+                DispatchLinear::dispatch(
+                    self,
+                    &Linear::MoeRoute {
+                        ids: None,
+                        table: None,
+                        logits: *logits,
+                        bias: *bias,
+                        scale: *scale,
+                        hint: *hint,
+                        experts: *experts,
+                        top_k: *top_k,
+                        score: *score,
+                        routes: *routes,
+                        weights: *weights,
                     },
                 )
             }
