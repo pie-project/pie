@@ -14,8 +14,9 @@ pub(super) const KERNELS: [(&str, &str); 2] = [
 /// `kSendWarps`.
 const SEND_WARPS: u32 = 8;
 
-/// A grid that strides over the landing rather than covering it.
-const MAX_BLOCKS: u32 = 1024;
+/// Send blocks (of 256 threads) a multiprocessor: each strides over its
+/// rows, so a thread waits on its stores' fence once.
+const SEND_BLOCKS_PER_SM: u32 = 4;
 
 /// `pie::collective::CombineParams`, field for field.
 #[repr(C)]
@@ -91,16 +92,24 @@ pub fn combine(
         packs: (row / 16) as i32,
         top_k: top_k as i32,
     };
-    let blocks = cap.div_ceil(SEND_WARPS).clamp(1, MAX_BLOCKS);
-    ctx.fire(
-        OP,
-        Fire::at(kernel(FILE, KERNELS[0].1))
-            .apply(Launch::grid([blocks, 1, 1], [32 * SEND_WARPS, 1, 1])),
-        &[ArgValue::of(&params)],
-    )?;
+    if cap > 0 {
+        ctx.fire(
+            OP,
+            Fire::at(kernel(FILE, KERNELS[0].1)).apply(Launch::grid(
+                [cap.div_ceil(SEND_WARPS).min(send_blocks(ctx)), 1, 1],
+                [32 * SEND_WARPS, 1, 1],
+            )),
+            &[ArgValue::of(&params)],
+        )?;
+    }
     ctx.fire(
         OP,
         Fire::at(kernel(FILE, KERNELS[1].1)).apply(Launch::grid([1, 1, 1], [32, 1, 1])),
         &[ArgValue::of(&params)],
     )
+}
+
+/// The blocks a send kernel strides with on `ctx`'s device.
+pub(super) fn send_blocks(ctx: &Ctx) -> u32 {
+    ctx.multiprocessors().unwrap_or(148) * SEND_BLOCKS_PER_SM
 }

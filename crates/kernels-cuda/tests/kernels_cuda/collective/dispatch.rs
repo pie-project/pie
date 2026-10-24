@@ -2,9 +2,12 @@
 //! each rank a stream and its own buffers, as peers map one another's. The
 //! rows each rank lands, their routes, weights, origins and per-slot counts
 //! match the host's walk in source-rank then token order; the combine puts
-//! every live route's output back at its token, and nothing else.
+//! every live route's output back at its token, and nothing else. Where the
+//! process sees several devices the same walk runs with rank r on device
+//! r % devices: real peers over the link, and past two ranks real and
+//! virtual peers in one group.
 
-use crate::common::Gpu;
+use crate::common::{Alone, Gpu, device_count};
 use dtype::Dtype::{Bf16, F32, I32};
 use kernels_cuda::Tensor;
 use kernels_cuda::collective::{
@@ -108,7 +111,9 @@ struct Held {
 /// What a slot's load holds before a dispatch adds its rows.
 const LOADS_BEFORE: u32 = 5;
 
-fn hold(c: &Case, g: &mut Gpu, d: &Data, signals: u64) -> Held {
+/// What a peer reads or writes sits in a mapping every device of the group
+/// (`readers`) reaches; the rest is the rank's own.
+fn hold(c: &Case, g: &mut Gpu, d: &Data, signals: u64, readers: &[i32]) -> Held {
     let (t, k, h, w) = (c.tokens, c.top_k, c.width, c.out_width);
     let (cap, slots) = (c.world * t, c.slots());
     let x = Tensor::new(g.up(&d.x), t as u32, h as u32, Bf16);
@@ -116,17 +121,18 @@ fn hold(c: &Case, g: &mut Gpu, d: &Data, signals: u64) -> Held {
     let weights = c
         .weights
         .then(|| Tensor::new(g.up(&d.weights), t as u32, k as u32, F32));
+    let mut peer = |bytes| g.shared(bytes, readers);
     let landing = Landing {
-        rows: Tensor::new(g.zeros(cap * h * 2), cap as u32, h as u32, Bf16),
-        local: Tensor::new(g.zeros(cap * k * 4), cap as u32, k as u32, I32),
+        rows: Tensor::new(peer(cap * h * 2), cap as u32, h as u32, Bf16),
+        local: Tensor::new(peer(cap * k * 4), cap as u32, k as u32, I32),
         row_weights: c
             .weights
-            .then(|| Tensor::new(g.zeros(cap * k * 4), cap as u32, k as u32, F32)),
-        origin: Tensor::new(g.zeros(cap * 4), cap as u32, 1, I32),
+            .then(|| Tensor::new(peer(cap * k * 4), cap as u32, k as u32, F32)),
+        origin: Tensor::new(peer(cap * 4), cap as u32, 1, I32),
     };
     let counts = Tensor::new(g.zeros(slots * 4), 1, slots as u32, I32);
     let routed = Tensor::new(
-        g.up(&vec![UNTOUCHED; t * k * w]),
+        g.up_shared(&vec![UNTOUCHED; t * k * w], readers),
         (t * k) as u32,
         w as u32,
         Bf16,
@@ -182,14 +188,15 @@ fn ep_of(held: &[Held], rank: usize) -> Ep {
     }
 }
 
-// The ranks' launches meet on the device: a legacy-stream call from a test
-// running beside them, landing between two ranks' launches, would wait on
-// the first rank's spin while holding back the second's. They run alone.
+// The ranks' launches meet on the device: a call that waits on it from a
+// test running beside them, landing between two ranks' launches, would wait
+// on the first rank's spin while holding back the second's. Every check
+// holds the devices alone (`open_ranks`).
 fn fire_dispatch(c: &Case, gpus: &[Gpu], held: &[Held]) {
-    let _alone = crate::common::capturing();
     let landing: Vec<_> = held.iter().map(|h| h.landing).collect();
     let ctxs: Vec<_> = gpus.iter().map(Gpu::ctx).collect();
     for (r, ctx) in ctxs.iter().enumerate() {
+        gpus[r].bind();
         if c.window.is_some() {
             ctx.arm_stage(held[r].window);
         }
@@ -208,10 +215,10 @@ fn fire_dispatch(c: &Case, gpus: &[Gpu], held: &[Held]) {
 }
 
 fn fire_combine(gpus: &[Gpu], held: &[Held]) {
-    let _alone = crate::common::capturing();
     let routed: Vec<_> = held.iter().map(|h| h.routed).collect();
     let ctxs: Vec<_> = gpus.iter().map(Gpu::ctx).collect();
     for (r, ctx) in ctxs.iter().enumerate() {
+        gpus[r].bind();
         combine(ctx, &ep_of(held, r), &held[r].landing, held[r].y, &routed)
             .expect("the combine fires");
     }
@@ -225,28 +232,48 @@ fn pattern(origin: usize, j: usize, slot: usize, w: usize) -> u16 {
 }
 
 fn check(c: &Case) {
+    check_on(c, 1);
+}
+
+/// The group's ranks, rank r on device r % `devices`, with the devices to
+/// themselves until the first of the three is dropped (it is the last).
+fn open_ranks(world: usize, devices: i32) -> (Alone, Vec<Gpu>, Vec<i32>) {
+    let alone = crate::common::alone();
+    let gpus: Vec<_> = (0..world)
+        .map(|r| Gpu::open_on(r as i32 % devices))
+        .collect();
+    let mut readers: Vec<_> = gpus.iter().map(Gpu::ordinal).collect();
+    readers.sort_unstable();
+    readers.dedup();
+    // No module load may land between the ranks' launches: each device
+    // loads them before any rank fires.
+    for g in &gpus {
+        g.bind();
+        kernels_cuda::collective::load_ep().expect("the EP kernels load");
+    }
+    (alone, gpus, readers)
+}
+
+fn check_on(c: &Case, devices: i32) {
     let (world, t, k, h, w) = (c.world, c.tokens, c.top_k, c.width, c.out_width);
     let (slots, cap) = (c.slots(), world * t);
-    let mut gpus: Vec<_> = (0..world).map(|_| Gpu::open()).collect();
+    let (_alone, mut gpus, readers) = open_ranks(world, devices);
     let signals: Vec<_> = gpus
         .iter_mut()
-        .map(|g| g.zeros(EP_SIGNAL_BYTES as usize))
+        .map(|g| g.shared(EP_SIGNAL_BYTES as usize, &readers))
         .collect();
-
-    // No module load may land between the ranks' launches.
-    kernels_cuda::collective::load_ep().expect("the EP kernels load");
 
     // Two rounds on the same signal blocks: the second meets the ranks on
     // counters the first left behind.
     for round in 0..2 {
         let data: Vec<_> = (0..world).map(|r| c.data(r, round)).collect();
         let held: Vec<_> = (0..world)
-            .map(|r| hold(c, &mut gpus[r], &data[r], signals[r]))
+            .map(|r| hold(c, &mut gpus[r], &data[r], signals[r], &readers))
             .collect();
         fire_dispatch(c, &gpus, &held);
 
         for (d, g) in gpus.iter_mut().enumerate() {
-            let at = format!("{world} ranks, round {round}, rank {d}");
+            let at = format!("{world} ranks on {devices} devices, round {round}, rank {d}");
             let mut want = Vec::new();
             for (s, src) in data.iter().enumerate() {
                 for tok in (0..t).filter(|&tok| c.live(tok)) {
@@ -329,8 +356,9 @@ fn check(c: &Case) {
             for tok in 0..t {
                 for j in 0..k {
                     let got = &routed[(tok * k + j) * w..][..w];
-                    let at =
-                        format!("{world} ranks, round {round}: rank {s} token {tok} route {j}");
+                    let at = format!(
+                        "{world} ranks on {devices} devices, round {round}: rank {s} token {tok} route {j}"
+                    );
                     match c
                         .physical(s, &data[s].routes, tok, j)
                         .filter(|_| c.live(tok))
@@ -412,4 +440,188 @@ fn a_fire_past_one_count_block_scans_across_its_chunks() {
         window: None,
         short: None,
     });
+}
+
+/// The devices to spread the ranks over, or `None` (with a note) on a
+/// machine with one.
+fn peer_devices() -> Option<i32> {
+    let devices = device_count();
+    if devices < 2 {
+        eprintln!("one device: no real peers to check");
+        return None;
+    }
+    Some(devices)
+}
+
+#[test]
+fn real_peers_land_and_return_what_one_device_does() {
+    let Some(devices) = peer_devices() else {
+        return;
+    };
+    let base = Case {
+        world: 2,
+        tokens: 37,
+        width: 256,
+        out_width: 128,
+        top_k: 6,
+        experts: 32,
+        extra: 0,
+        weights: true,
+        window: None,
+        short: None,
+    };
+    for world in [2, 4, 8] {
+        check_on(&Case { world, ..base }, devices);
+    }
+    let replicas = Case {
+        world: 4,
+        width: 64,
+        out_width: 64,
+        top_k: 8,
+        extra: 8,
+        weights: false,
+        ..base
+    };
+    check_on(&replicas, devices);
+    check_on(
+        &Case {
+            window: Some([20, 5]),
+            ..replicas
+        },
+        devices,
+    );
+    check_on(
+        &Case {
+            world: 8,
+            short: Some(30),
+            weights: true,
+            ..replicas
+        },
+        devices,
+    );
+    check_on(
+        &Case {
+            tokens: 1500,
+            width: 64,
+            out_width: 32,
+            top_k: 4,
+            experts: 16,
+            ..base
+        },
+        devices,
+    );
+}
+
+/// Dispatch's and combine's rate across real peers at two ranks, a rank a
+/// device: the bytes one rank sends the other over the link per fire (its
+/// rows there, and back each route's output), against the ~956 GB/s a
+/// direction NV18 carries. Every rank fires the rounds back to back, so the
+/// time is the slower rank's.
+#[test]
+#[ignore = "a rate bench: cargo test --release ... -- --ignored peer_rate --nocapture"]
+fn peer_rate() {
+    let Some(devices) = peer_devices() else {
+        return;
+    };
+    let (reps, replays) = (5, 40);
+    for width in [2048usize, 4096, 7168] {
+        for tokens in [64usize, 256, 1024, 4096] {
+            let c = Case {
+                world: 2,
+                tokens,
+                width,
+                out_width: width,
+                top_k: 8,
+                experts: 256,
+                extra: 0,
+                weights: true,
+                window: None,
+                short: None,
+            };
+            let (_alone, mut gpus, readers) = open_ranks(c.world, devices);
+            let signals: Vec<_> = gpus
+                .iter_mut()
+                .map(|g| g.shared(EP_SIGNAL_BYTES as usize, &readers))
+                .collect();
+            let data: Vec<_> = (0..c.world).map(|r| c.data(r, 0)).collect();
+            let held: Vec<_> = (0..c.world)
+                .map(|r| hold(&c, &mut gpus[r], &data[r], signals[r], &readers))
+                .collect();
+            // Rank 0's tokens and routes that cross to rank 1.
+            let slots = c.slots();
+            let (mut rows, mut routes) = (0, 0);
+            for tok in 0..tokens {
+                let there = (0..c.top_k)
+                    .filter(|&j| {
+                        c.physical(0, &data[0].routes, tok, j)
+                            .is_some_and(|p| p / slots == 1)
+                    })
+                    .count();
+                rows += usize::from(there > 0);
+                routes += there;
+            }
+            let landing: Vec<_> = held.iter().map(|h| h.landing).collect();
+            let routed: Vec<_> = held.iter().map(|h| h.routed).collect();
+            let ctxs: Vec<_> = gpus.iter().map(Gpu::ctx).collect();
+            // Each rank's rounds in one graph, so the time is the devices'
+            // and not the host's launches.
+            let timed = |fire: &dyn Fn(usize)| {
+                let graphs: Vec<_> = gpus
+                    .iter()
+                    .enumerate()
+                    .map(|(r, g)| {
+                        g.bind();
+                        crate::common::captured(&ctxs[r], || (0..reps).for_each(|_| fire(r)))
+                    })
+                    .collect();
+                let _capture = crate::common::capturing();
+                let replay = || {
+                    for (r, g) in gpus.iter().enumerate() {
+                        g.bind();
+                        crate::common::replay(&ctxs[r], graphs[r]);
+                    }
+                };
+                replay();
+                gpus.iter().for_each(Gpu::sync);
+                // The fastest replay: the devices are shared, and another
+                // process's kernels only ever add time.
+                let best = (0..replays)
+                    .map(|_| {
+                        let start = std::time::Instant::now();
+                        replay();
+                        gpus.iter().for_each(Gpu::sync);
+                        start.elapsed()
+                    })
+                    .min()
+                    .expect("a replay");
+                graphs.into_iter().for_each(crate::common::forget);
+                best.as_secs_f64() * 1e6 / f64::from(reps)
+            };
+            let dispatch_us = timed(&|r| {
+                let mut counts = held[r].counts;
+                let ep = ep_of(&held, r);
+                dispatch(
+                    &ctxs[r],
+                    &ep,
+                    held[r].place,
+                    held[r].tokens,
+                    &landing,
+                    &mut counts,
+                )
+                .expect("the dispatch fires");
+            });
+            let combine_us = timed(&|r| {
+                let ep = ep_of(&held, r);
+                combine(&ctxs[r], &ep, &held[r].landing, held[r].y, &routed)
+                    .expect("the combine fires");
+            });
+            let gbs = |bytes: usize, us: f64| (bytes * width * 2) as f64 / us / 1e3;
+            eprintln!(
+                "hidden {width} tokens {tokens}: dispatch {dispatch_us:.1} us {:.0} GB/s, \
+                 combine {combine_us:.1} us {:.0} GB/s",
+                gbs(rows, dispatch_us),
+                gbs(routes, combine_us),
+            );
+        }
+    }
 }

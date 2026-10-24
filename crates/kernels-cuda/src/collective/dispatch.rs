@@ -16,14 +16,15 @@ pub(super) const KERNELS: [(&str, &str); 3] = [
 pub const EP_MAX_RANKS: u32 = 8;
 
 /// Bytes of one rank's EP signal block (`peer::Signals`, then the inbox at
-/// `kInboxAt`), zeroed when the group opens and never cleared after.
+/// `kInboxAt` and the count's ticket), zeroed when the group opens and never
+/// cleared after.
 pub const EP_SIGNAL_BYTES: u64 = 4096;
 
-/// `kCountThreads`.
+/// `kCountThreads`: a count block's chunk of tokens.
 const COUNT_THREADS: u32 = 1024;
 
-/// `kSendWarps`.
-const SEND_WARPS: u32 = 8;
+/// `kSendThreads`: a warp a destination.
+const SEND_THREADS: u32 = 32 * EP_MAX_RANKS;
 
 /// A rank's view of an expert-parallel group whose ranks map one another's
 /// memory: every rank's EP signal block, in rank order, and this rank's
@@ -41,11 +42,20 @@ pub struct Ep {
 }
 
 /// Bytes of a rank's dispatch scratch for `tokens` tokens in a group of
-/// `world`: where its rows start on each rank, then each token's row on
-/// each.
+/// `world`: where its rows start on each rank, where each chunk's start
+/// among them, then each token's row in its chunk's on each.
 #[must_use]
 pub const fn ep_scratch_bytes(tokens: u32, world: u32) -> u64 {
-    EP_MAX_RANKS as u64 * 4 + tokens as u64 * world as u64 * 4
+    (1 + chunks(tokens) as u64) * EP_MAX_RANKS as u64 * 4 + tokens as u64 * world as u64 * 4
+}
+
+/// The count's blocks for `tokens`: one even for none, to meet the ranks.
+const fn chunks(tokens: u32) -> u32 {
+    if tokens == 0 {
+        1
+    } else {
+        tokens.div_ceil(COUNT_THREADS)
+    }
 }
 
 /// Where each logical expert lives: `[experts][stride]` i32 on the device,
@@ -98,6 +108,7 @@ struct Params {
     win: u64,
     place: u64,
     pos: u64,
+    base: u64,
     offs: u64,
     counts: u64,
     loads: u64,
@@ -197,7 +208,8 @@ pub fn dispatch(
         ));
     }
     let offs = ep.scratch;
-    let pos = ep.scratch + u64::from(EP_MAX_RANKS) * 4;
+    let base = offs + u64::from(EP_MAX_RANKS) * 4;
+    let pos = base + u64::from(chunks(tokens)) * u64::from(EP_MAX_RANKS) * 4;
     let by_rank = |f: &dyn Fn(&Landing) -> u64| {
         let mut out = [0u64; EP_MAX_RANKS as usize];
         for (o, l) in out.iter_mut().zip(landing) {
@@ -215,6 +227,7 @@ pub fn dispatch(
         },
         place: place.table,
         pos,
+        base,
         offs,
         counts: counts.ptr,
         loads: place.loads,
@@ -237,15 +250,16 @@ pub fn dispatch(
     let one = Launch::grid([1, 1, 1], [COUNT_THREADS, 1, 1]);
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, KERNELS[0].1)).apply(one),
+        Fire::at(kernel(FILE, KERNELS[0].1))
+            .apply(Launch::grid([chunks(tokens), 1, 1], [COUNT_THREADS, 1, 1])),
         &[ArgValue::of(&params)],
     )?;
     if tokens > 0 {
         ctx.fire(
             OP,
             Fire::at(kernel(FILE, KERNELS[1].1)).apply(Launch::grid(
-                [tokens.div_ceil(SEND_WARPS), 1, 1],
-                [32 * SEND_WARPS, 1, 1],
+                [tokens.min(super::combine::send_blocks(ctx)), 1, 1],
+                [SEND_THREADS, 1, 1],
             )),
             &[ArgValue::of(&params)],
         )?;
