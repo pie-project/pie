@@ -37,21 +37,7 @@ pub(crate) unsafe fn issue(
     // Past the portable 8 a cluster is the function's to allow (B200 seats
     // 16 one-block SMs a cluster).
     if launch.cluster > 8 {
-        // SAFETY: `function` is live by this fn's contract; the attribute
-        // takes a plain flag.
-        let code = unsafe {
-            dr::cuFuncSetAttribute(
-                function,
-                dr::CUfunction_attribute::CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
-                1,
-            )
-        };
-        if code != dr::CUresult::CUDA_SUCCESS {
-            return Err(Fault::Device {
-                call: "cuFuncSetAttribute",
-                code: code as i32,
-            });
-        }
+        allow_wide_clusters(function)?;
     }
     if launch.cluster > 1 {
         attrs[n].id = dr::CUlaunchAttributeID::CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION;
@@ -150,3 +136,35 @@ fn raise_dynamic_smem_cap(function: dr::CUfunction, bytes: u32) -> Result<(), Fa
 
 static GRANTED: std::sync::Mutex<Vec<((dr::CUdevice, usize), u32)>> =
     std::sync::Mutex::new(Vec::new());
+
+/// Lets `function` launch clusters past the portable 8, once: a function
+/// attribute is set through the driver's context lock, which a launch
+/// beside another rank's spinning collective on the same context must not
+/// wait on every time.
+fn allow_wide_clusters(function: dr::CUfunction) -> Result<(), Fault> {
+    let key = function.addr();
+    let mut allowed = WIDE.lock().expect("wide-cluster lock poisoned");
+    if allowed.contains(&key) {
+        return Ok(());
+    }
+    // SAFETY: `function` is the live handle `issue`'s caller vouched for;
+    // the attribute takes a plain flag.
+    let code = unsafe {
+        dr::cuFuncSetAttribute(
+            function,
+            dr::CUfunction_attribute::CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED,
+            1,
+        )
+    };
+    if code != dr::CUresult::CUDA_SUCCESS {
+        return Err(Fault::Device {
+            call: "cuFuncSetAttribute",
+            code: code as i32,
+        });
+    }
+    allowed.push(key);
+    Ok(())
+}
+
+/// The functions (each its context's own handle) allowed wide clusters.
+static WIDE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());

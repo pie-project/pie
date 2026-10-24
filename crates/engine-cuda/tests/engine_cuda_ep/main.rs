@@ -1,8 +1,10 @@
-//! The tests that run several ranks of one group on one device: a binary of
-//! their own. A rank spins in a barrier until its peers arrive, and a
-//! legacy-stream call from a test running beside it (in this process, on
-//! this device) waits on that spin while holding back a peer's launch: one
-//! device's ranks and nothing else, one test at a time.
+//! The tests that run the ranks of one group in one process: a binary of
+//! their own. Rank `r` runs on device `r % count` (`PIE_EP_RANKS` ranks,
+//! two by default), so a pair runs on two peers and a larger group puts
+//! several ranks on a device. A rank spins in a barrier until its peers
+//! arrive, and a legacy-stream call from a test running beside it (in this
+//! process, on its device) waits on that spin while holding back a peer's
+//! launch: the group's ranks and nothing else, one test at a time.
 #![cfg(feature = "cuda")]
 
 // Strict kernels for the whole binary, as `engine_cuda`'s.
@@ -26,6 +28,7 @@ pub fn alone() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+mod an_expert_parallel_group_decodes_at_its_buckets;
 mod an_expert_parallel_group_rebalances_its_experts;
 mod an_expert_parallel_group_serves_through_its_engines;
 mod an_expert_parallel_pair_answers_what_one_rank_answers;

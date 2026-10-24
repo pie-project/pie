@@ -13,7 +13,34 @@ use poem::{Dtype, Platform};
 use poem_ir::{ParamSource, Trace};
 
 pub const MICRO: &str = "qwen3-a3b-micro";
-pub const RANKS: u32 = 2;
+
+/// The group's ranks: `PIE_EP_RANKS` (2, 4 or 8), two by default.
+pub fn ranks() -> u32 {
+    let ranks = std::env::var("PIE_EP_RANKS").map_or(2, |word| {
+        word.parse()
+            .unwrap_or_else(|_| panic!("PIE_EP_RANKS is a rank count, not `{word}`"))
+    });
+    assert!(
+        matches!(ranks, 2 | 4 | 8),
+        "an expert-parallel group is 2, 4 or 8 ranks, not {ranks}"
+    );
+    ranks
+}
+
+/// Each rank's device: rank `r` on device `r % count`, so two ranks run on
+/// two peers and a larger group shares each device among its ranks.
+pub fn ordinals(ranks: u32) -> Vec<i32> {
+    let count = engine_cuda::device::ctx::count().max(1) as u32;
+    (0..ranks).map(|rank| (rank % count) as i32).collect()
+}
+
+/// The share of its device a load may hold, less what is in use as it
+/// begins (the ranks loaded before it, other processes): every load's kv
+/// is small and fixed, so the ranks sharing a device fit beside each other.
+pub const SHARE: f64 = 0.95;
+
+/// Each load's kv.
+pub const KV: u64 = 64 << 20;
 
 pub struct Scratch(pub PathBuf);
 
@@ -133,16 +160,24 @@ pub fn request(trace: &Trace, checkpoint: &Path) -> LoadRequest {
             max_voxels: None,
             max_clips: None,
         },
-        // Ranks sharing one device: each its share of it, and a small kv.
+        // Ranks sharing a device: each its share of it, and a small kv.
         residency: Residency {
-            device_memory_share: 0.3,
-            device_kv_budget: Some(64 << 20),
+            device_memory_share: SHARE,
+            device_kv_budget: Some(KV),
             host_kv_budget: Some(64 << 20),
             disk_kv_budget: Some(0),
             ..Residency::default()
         },
         ordinal: -1,
         frames_in_flight: 1,
+    }
+}
+
+/// A rank's boot on `ordinal`.
+pub fn boot(ordinal: i32) -> engine_cuda::DeviceBoot {
+    engine_cuda::DeviceBoot {
+        ordinal,
+        ..engine_cuda::DeviceBoot::default()
     }
 }
 

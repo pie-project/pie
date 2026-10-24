@@ -861,7 +861,8 @@ impl Drop for Pinning {
 #[cfg(feature = "cuda")]
 const BOUNCED: usize = 32 << 10;
 
-/// Pinned buffers a thread cycles its bounced copies through. A buffer is
+/// Pinned buffers a thread cycles its bounced copies through, a ring for
+/// each device it binds (a ring's events are its device's). A buffer is
 /// written again only once the copy that last read it has run, so the ring
 /// holds the host back only when the device is that many copies behind.
 #[cfg(feature = "cuda")]
@@ -876,7 +877,8 @@ struct Bounces {
 
 #[cfg(feature = "cuda")]
 thread_local! {
-    static BOUNCES_HELD: core::cell::RefCell<Bounces> = core::cell::RefCell::default();
+    static BOUNCES_HELD: core::cell::RefCell<std::collections::BTreeMap<i32, Bounces>> =
+        core::cell::RefCell::default();
 }
 
 /// Copies `bytes` to `dst` on `stream` through this thread's pinned ring
@@ -889,8 +891,12 @@ fn bounce(stream: *mut core::ffi::c_void, dst: u64, bytes: &[u8]) -> Result<bool
     if bytes.len() < BOUNCED {
         return Ok(false);
     }
+    let Some(device) = crate::device::held::current_device() else {
+        return Ok(false);
+    };
     BOUNCES_HELD.with(|held| {
-        let mut held = held.borrow_mut();
+        let mut rings = held.borrow_mut();
+        let held = rings.entry(device).or_default();
         let at = held.next;
         held.next = (at + 1) % BOUNCES;
         if held.ring.len() <= at {
