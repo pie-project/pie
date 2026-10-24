@@ -168,8 +168,12 @@ def layout(id, deploy):
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
             attn_norm = weight([hidden]),
-            qkv = weight([q_width + 2 * kv_width, hidden], proj).packed([q_width, kv_width, kv_width], heads = heads),
-            qkv_bias = weight([q_width + 2 * kv_width]).packed([q_width, kv_width, kv_width], heads = heads),
+            q = weight([q_width, hidden], proj).columns(heads = heads[0]),
+            k = weight([kv_width, hidden], proj).columns(heads = heads[1]),
+            v = weight([kv_width, hidden], proj).columns(heads = heads[2]),
+            q_bias = weight([q_width]).columns(heads = heads[0]),
+            k_bias = weight([kv_width]).columns(heads = heads[1]),
+            v_bias = weight([kv_width]).columns(heads = heads[2]),
             o = weight([hidden, q_width], proj).rows(),
             q_norm = weight([hd]) if d.qk_norm else None,
             k_norm = weight([hd]) if d.qk_norm else None,
@@ -238,16 +242,12 @@ TRANSFORMERS = [
     ("model.norm.weight", "final_norm"),
     ("lm_head.weight", "head"),
     ("model.layers.{l}.input_layernorm.weight", "layers.{l}.attn_norm"),
-    ([
-        "model.layers.{l}.self_attn.q_proj.weight",
-        "model.layers.{l}.self_attn.k_proj.weight",
-        "model.layers.{l}.self_attn.v_proj.weight",
-    ], "layers.{l}.qkv"),
-    ([
-        "model.layers.{l}.self_attn.q_proj.bias",
-        "model.layers.{l}.self_attn.k_proj.bias",
-        "model.layers.{l}.self_attn.v_proj.bias",
-    ], "layers.{l}.qkv_bias"),
+    ("model.layers.{l}.self_attn.q_proj.weight", "layers.{l}.q"),
+    ("model.layers.{l}.self_attn.k_proj.weight", "layers.{l}.k"),
+    ("model.layers.{l}.self_attn.v_proj.weight", "layers.{l}.v"),
+    ("model.layers.{l}.self_attn.q_proj.bias", "layers.{l}.q_bias"),
+    ("model.layers.{l}.self_attn.k_proj.bias", "layers.{l}.k_bias"),
+    ("model.layers.{l}.self_attn.v_proj.bias", "layers.{l}.v_bias"),
     ("model.layers.{l}.self_attn.o_proj.weight", "layers.{l}.o"),
     ("model.layers.{l}.self_attn.q_norm.weight", "layers.{l}.q_norm"),
     ("model.layers.{l}.self_attn.k_norm.weight", "layers.{l}.k_norm"),
@@ -322,11 +322,9 @@ def mlp(x, f):
 def attention(x, inputs, m, positions, w):
     pages = inputs.kv(w.kv)
     d = m.head_dim
-    q, k, v = ops.gather.split_qkv(
-        ops.elemwise.add_bias(w.qkv_bias, ops.linear.matmul(x, w.qkv)),
-        m.q_width,
-        m.kv_width,
-    )
+    q = ops.elemwise.add_bias(w.q_bias, ops.linear.matmul(x, w.q))
+    k = ops.elemwise.add_bias(w.k_bias, ops.linear.matmul(x, w.k))
+    v = ops.elemwise.add_bias(w.v_bias, ops.linear.matmul(x, w.v))
     seam.at(seam.ATTN_QV, [q, v])
     if w.q_norm != None:
         q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, d, m.eps)

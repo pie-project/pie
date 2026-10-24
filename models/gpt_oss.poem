@@ -113,11 +113,12 @@ def layout(id, deploy):
         return struct(
             attn = struct(
                 reading = WINDOWED if l % 2 == 0 else FULL,
-                # q, k and v as one product, split after its bias.
-                qkv = weight([q_w + 2 * kv_w, hidden], weights).packed(
-                    [q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
-                qkv_bias = weight([q_w + 2 * kv_w]).packed(
-                    [q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
+                q = weight([q_w, hidden], weights).columns(heads = d.q_heads),
+                k = weight([kv_w, hidden], weights).columns(heads = d.kv_heads),
+                v = weight([kv_w, hidden], weights).columns(heads = d.kv_heads),
+                q_bias = weight([q_w]).columns(heads = d.q_heads),
+                k_bias = weight([kv_w]).columns(heads = d.kv_heads),
+                v_bias = weight([kv_w]).columns(heads = d.kv_heads),
                 o_proj = weight([hidden, q_w], weights).rows(),
                 o_bias = weight([hidden]),
                 sinks = weight([d.q_heads]).columns(),
@@ -221,9 +222,9 @@ def read(m, reads, codes):
         mlp = layer.mlp
         reads.read(layer.attn_norm, ck("input_layernorm.weight"))
         reads.read(layer.mlp_norm, ck("post_attention_layernorm.weight"))
-        proj = lambda part: [ck("self_attn.{}_proj.{}".format(x, part)) for x in ["q", "k", "v"]]
-        reads.read_concat(attn.qkv, proj("weight"))
-        reads.read_concat(attn.qkv_bias, proj("bias"))
+        for x in ["q", "k", "v"]:
+            reads.read(getattr(attn, x), ck("self_attn.{}_proj.weight".format(x)))
+            reads.read(getattr(attn, x + "_bias"), ck("self_attn.{}_proj.bias".format(x)))
         reads.read(attn.o_proj, ck("self_attn.o_proj.weight"))
         reads.read(attn.o_bias, ck("self_attn.o_proj.bias"))
         reads.read(attn.sinks, ck("self_attn.sinks"))
@@ -334,11 +335,9 @@ def forward(m, inputs):
         write_offset = inputs.write_offset(at.kv)
 
         x = ops.elemwise.rmsnorm(y, w.attn_norm, w.attn_norm_eps)
-        q, k, v = ops.gather.split_qkv(
-            ops.elemwise.add_bias(at.qkv_bias, ops.linear.matmul(x, at.qkv)),
-            m.q_heads * d,
-            m.kv_heads * d,
-        )
+        q = ops.elemwise.add_bias(at.q_bias, ops.linear.matmul(x, at.q))
+        k = ops.elemwise.add_bias(at.k_bias, ops.linear.matmul(x, at.k))
+        v = ops.elemwise.add_bias(at.v_bias, ops.linear.matmul(x, at.v))
         seam.at(seam.ATTN_QV, [q, v])
 
         rope = m.rope
