@@ -64,7 +64,14 @@ impl Run<'_> {
                     .map(|w| w.landing(step, *top_k, x.width, x.dtype, weights.is_some()))
                     .collect();
                 let mut counts = self.tensor(*counts);
-                collective::dispatch(self.ctx(), &ep.wire().ep, place, tokens, &landing, &mut counts)?;
+                collective::dispatch(
+                    self.ctx(),
+                    &ep.wire().ep,
+                    place,
+                    tokens,
+                    &landing,
+                    &mut counts,
+                )?;
                 // Peers wrote into this rank's fixed landing; the IR's values
                 // are the arena's.
                 let own = landing[ep.rank as usize];

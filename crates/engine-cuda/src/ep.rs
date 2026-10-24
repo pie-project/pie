@@ -216,7 +216,13 @@ impl EpRank {
                 experts,
                 slots,
             };
-            held.insert(layer, Layer { place, _table: buffer });
+            held.insert(
+                layer,
+                Layer {
+                    place,
+                    _table: buffer,
+                },
+            );
         }
         Ok(EpRank {
             wires,

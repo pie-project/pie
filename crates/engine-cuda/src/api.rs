@@ -49,7 +49,7 @@ pub struct DeviceBoot {
     pub adapter_dir: Option<std::path::PathBuf>,
 }
 
-struct PendingStep {
+pub(crate) struct PendingStep {
     readout: Vec<Readout>,
     settled: crate::serve::Settled,
 }
@@ -67,6 +67,9 @@ pub struct Cuda {
     pending: Option<(FrameId, Vec<PendingStep>)>,
     adapters: BTreeMap<InstanceId, crate::Binding>,
     replay: Option<crate::replay::Replay>,
+    /// This rank's place in its expert-parallel group (`size` 1 outside
+    /// one): which experts' planes its banks load.
+    expert: World,
 }
 
 impl Cuda {
@@ -86,7 +89,19 @@ impl Cuda {
             pending: None,
             adapters: BTreeMap::new(),
             replay: None,
+            expert: World::default(),
         }
+    }
+
+    /// Places this engine at `rank` of an expert-parallel group of `size`,
+    /// before it loads.
+    pub(crate) fn set_expert_rank(&mut self, rank: u32, size: u32) {
+        self.expert = World { rank, size };
+    }
+
+    #[must_use]
+    pub(crate) fn expert_rank(&self) -> World {
+        self.expert
     }
 
     #[must_use]
@@ -186,6 +201,61 @@ impl Cuda {
             self.boot.world.rank,
             self.boot.world.size,
         )
+    }
+
+    /// A frame an expert-parallel rank brings to its group: validated, its
+    /// id minted, and the token bucket each of its steps needs. A step the
+    /// replay would split fires twice, which the group's other ranks would
+    /// not match: refused.
+    pub(crate) fn lockstep_frame(
+        &mut self,
+        frame: &FrameSubmission,
+    ) -> EngineResult<(FrameId, Vec<u32>)> {
+        frame.validate_for(
+            self.caps
+                .as_ref()
+                .map_or(engine::Serves::NONE, engine::Serves::of),
+        )?;
+        if let Some(replay) = self.replay
+            && frame.steps.iter().any(|step| replay.split(step).is_some())
+        {
+            return Err(Error::Unsupported {
+                verb: "an encoder replay split under expert parallelism",
+                engine: "cuda",
+            });
+        }
+        let shell = self.loaded_mut()?;
+        let buckets = frame
+            .steps
+            .iter()
+            .map(|step| shell.bucket_for(step.rows()))
+            .collect::<Option<Vec<u32>>>()
+            .ok_or_else(|| Error::Invalid("a step wider than the widest bucket".into()))?;
+        let id = FrameId(self.next_frame);
+        self.next_frame = self.next_frame.wrapping_add(1);
+        self.pending = None;
+        Ok((id, buckets))
+    }
+
+    /// Fires `step` at its group's `bucket`.
+    pub(crate) fn fire_step_at(
+        &mut self,
+        step: &Step,
+        at: engine::StepDone,
+        bucket: u32,
+    ) -> EngineResult<(FireTicket, PendingStep)> {
+        self.loaded_mut()?.at_bucket(bucket);
+        self.fire_step(step, at, true)
+    }
+
+    /// Fires a step with no lanes at the group's `bucket`.
+    pub(crate) fn fire_idle(&mut self, bucket: u32) -> EngineResult<()> {
+        self.loaded_mut()?.fire_idle(bucket).map_err(fault)
+    }
+
+    /// The steps of frame `id` its group fired, to settle as a frame.
+    pub(crate) fn adopt(&mut self, id: FrameId, settled: Vec<PendingStep>) {
+        self.pending = Some((id, settled));
     }
 
     fn loaded_mut(&mut self) -> EngineResult<&mut Shell> {

@@ -153,6 +153,14 @@ impl Shell {
         self.ep = Some(ep);
     }
 
+    /// The token bucket a fire of `rows` rows composes at, or `None` past
+    /// the widest.
+    #[must_use]
+    pub fn bucket_for(&self, rows: u32) -> Option<u32> {
+        let top = self.budget.buckets.last().copied()?;
+        (rows <= top).then(|| poem_exec::fire::rung_of(&self.budget.buckets, rows))
+    }
+
     /// The next fire composes at token bucket `bucket`, the one its
     /// expert-parallel group agreed for the step.
     pub fn at_bucket(&mut self, bucket: u32) {
