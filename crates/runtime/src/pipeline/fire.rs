@@ -526,7 +526,8 @@ fn fire_rows() -> Option<u32> {
 }
 
 /// Each piece but the last ends on a page boundary; the last holds every row
-/// the program reads out.
+/// the program reads out. The pages before the first media row are a piece
+/// of their own, which seals.
 fn host_cuts(
     req: &crate::engine::FireRequest,
     cuttable: bool,
@@ -543,10 +544,12 @@ fn host_cuts(
         return vec![(0, rows)];
     }
     let (held, page) = (lane.kv.held, page.max(1));
-    let tail = tail_row(lane, rows).min(first_media_row(req).unwrap_or(rows));
+    let media = first_media_row(req);
+    let tail = tail_row(lane, rows).min(media.unwrap_or(rows));
     let mut ends: Vec<u32> = forced
         .iter()
         .copied()
+        .chain(media.map(|row| ((held + row) / page * page).saturating_sub(held)))
         .filter(|&end| 0 < end && end < rows)
         .collect();
     if share > 0 {
@@ -753,22 +756,27 @@ fn separable_lanes(req: &crate::engine::FireRequest) -> bool {
         })
 }
 
-/// Whether a fire's KV is its tokens' alone, so its pages seal under their keys.
-fn keyed_rows(req: &crate::engine::FireRequest) -> bool {
+/// How many of a fire's first rows hold KV that is their tokens' alone, so
+/// their pages seal under their keys: those before its first media row.
+fn keyed_rows(req: &crate::engine::FireRequest) -> u32 {
     let [lane] = req.lanes.as_slice() else {
-        return false;
+        return 0;
     };
     let held = lane.kv.held;
-    plain_lane(lane)
+    let keyed = plain_lane(lane)
         && lane.mask.is_none()
-        && !lane.tokens.is_empty()
         && !lane.tokens.contains(&u32::MAX)
         && (lane.positions.is_empty()
             || lane
                 .positions
                 .iter()
                 .enumerate()
-                .all(|(i, &at)| at == held + i as u32))
+                .all(|(i, &at)| at == held + i as u32));
+    if !keyed {
+        return 0;
+    }
+    let rows = u32::try_from(lane.tokens.len()).unwrap_or(u32::MAX);
+    first_media_row(req).unwrap_or(rows).min(rows)
 }
 
 static SEALED_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -2433,7 +2441,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let keyable = decode_envelope.is_none()
             && groups.len() == 1
             && !hooked
-            && !carries_media
             && !fire_wide_mask
             && !p_reads_mtp_logits
             && req.max_layers.is_none();
@@ -2445,9 +2452,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
             && !ring
             && folds_all;
         let mut full = req;
-        // Its fires seal their share of the slot hashes; sealed pages holding
-        // its rows already are mapped in.
-        let mut pass_slots = (keyable && keyed_rows(&full))
+        // Its fires seal their share of the slot hashes, up to its first
+        // media row; sealed pages holding its rows already are mapped in.
+        let keyed = if keyable { keyed_rows(&full) } else { 0 };
+        let mut pass_slots = (keyed > 0)
             .then(|| {
                 let lane = &full.lanes[0];
                 let start = u64::from(lane.kv.held);
@@ -2460,7 +2468,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     &domain,
                     prev,
                     start,
-                    &lane.tokens,
+                    &lane.tokens[..keyed as usize],
                 ))
             })
             .flatten();
@@ -2478,8 +2486,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
             Attach::No
         };
         // Rows no worker here holds may be prefilled on a peer, whose pages
-        // land in the host tier for the promote below to find.
+        // land in the host tier for the promote below to find. Media stays
+        // here.
         if matches!(attach, Attach::Kv)
+            && !carries_media
             && let Some(slots) = &pass_slots
         {
             let lane = &full.lanes[0];
@@ -2530,7 +2540,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // What was mapped in is skipped: the pass runs from there.
             let rows = u32::try_from(full.lanes[0].tokens.len()).unwrap_or(u32::MAX);
             full = rows_of_lanes(&full, &[Some((supplied, rows))], true, page_size);
-            stamp_lane_words(&mut full, false, false, None);
+            let media = !full.media.is_empty();
+            stamp_lane_words(&mut full, false, media, None);
             pass_slots = pass_slots.map(|slots| slots[supplied as usize..].to_vec());
             let total = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
                 kv.supplied_tokens(ws.id)
@@ -2754,7 +2765,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     )));
                 };
                 let mut tags = Vec::new();
+                // A piece carrying media is not its tokens' alone: it cuts
+                // the log.
                 let rows = match (&pass_slots, pages) {
+                    (Some(_), _) if !req.media.is_empty() => LogRows::Unknown,
                     (Some(_), _) => LogRows::Known {
                         start: slots.start,
                         tokens: req.lanes[0].tokens.clone(),
@@ -4243,6 +4257,7 @@ mod cut_tests {
         the_last_piece_holds_what_the_program_reads();
         several_lanes_are_cut_and_end_together();
         a_pass_with_media_is_cut_before_its_first_span();
+        a_pass_with_media_keys_the_rows_before_it();
     }
 
     fn prefill_lane(held: u32, rows: u32, page: u32) -> crate::engine::FireRequest {
@@ -4334,6 +4349,28 @@ mod cut_tests {
         assert_eq!(tail.media[0].routes[10], -1, "a dropped row stays dropped");
         assert_eq!(tail.media[0].token_positions.len(), 3 * 41);
         assert_eq!(tail.media[0].token_positions[0], 3 * 59);
+    }
+
+    fn a_pass_with_media_keys_the_rows_before_it() {
+        let mut req = prefill_lane(5, 100, 16);
+        assert_eq!(keyed_rows(&req), 100);
+        req.media.push(::engine::fire::StepMedia {
+            lane: 0,
+            rows: vec![10],
+            routes: (60..70).collect(),
+            ..Default::default()
+        });
+        assert_eq!(keyed_rows(&req), 60, "up to its first media row");
+        // The pages before it are a piece of their own, short as the pass is.
+        let cuts = host_cuts(&req, true, 128, 16, &[]);
+        assert_eq!(cuts, [(0, 59), (59, 100)]);
+        let first = rows_of_lanes(&req, &[Some(cuts[0])], false, 16);
+        assert!(first.media.is_empty(), "it logs its rows and seals");
+        assert_eq!(keyed_rows(&first), 59);
+        let tail = rows_of_lanes(&req, &[Some(cuts[1])], true, 16);
+        assert!(!tail.media.is_empty(), "it cuts the log");
+        req.lanes[0].positions = (0..100).collect();
+        assert_eq!(keyed_rows(&req), 0, "rows rotated off their slots");
     }
 
     fn several_lanes_are_cut_and_end_together() {
