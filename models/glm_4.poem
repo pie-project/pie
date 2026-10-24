@@ -140,7 +140,8 @@ def layout(id, deploy):
             down_w = dtype.bf16 if mlp_w == dtype.e4m3g128a8 and iw % 128 != 0 else mlp_w
             return struct(
                 routed = False,
-                gate_up = weight([2 * iw, hidden], mlp_w).packed([iw, iw]),
+                gate = weight([iw, hidden], mlp_w).columns(),
+                up = weight([iw, hidden], mlp_w).columns(),
                 down = weight([hidden, iw], down_w).rows(),
                 inter = iw,
             )
@@ -152,7 +153,8 @@ def layout(id, deploy):
             gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
             down = weight([d.experts, hidden, iw], experts).rows(),
             shared = struct(
-                gate_up = weight([2 * sw, hidden], mlp_w).packed([sw, sw]),
+                gate = weight([sw, hidden], mlp_w).columns(),
+                up = weight([sw, hidden], mlp_w).columns(),
                 down = weight([hidden, sw], mlp_w).rows(),
                 inter = sw,
             ),
@@ -251,14 +253,13 @@ TRANSFORMERS = [
     ("model.layers.{l}.self_attn.k_norm.weight", "layers.{l}.k_norm"),
     ("model.layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
     # A dense layer's MLP; a routed one's router, shared expert and banks.
-    (["model.layers.{l}.mlp.gate_proj.weight", "model.layers.{l}.mlp.up_proj.weight"], "layers.{l}.mlp.gate_up"),
+    ("model.layers.{l}.mlp.gate_proj.weight", "layers.{l}.mlp.gate"),
+    ("model.layers.{l}.mlp.up_proj.weight", "layers.{l}.mlp.up"),
     ("model.layers.{l}.mlp.down_proj.weight", "layers.{l}.mlp.down"),
     ("model.layers.{l}.mlp.gate.weight", "layers.{l}.mlp.router"),
     ("model.layers.{l}.mlp.gate.e_score_correction_bias", "layers.{l}.mlp.bias"),
-    ([
-        "model.layers.{l}.mlp.shared_experts.gate_proj.weight",
-        "model.layers.{l}.mlp.shared_experts.up_proj.weight",
-    ], "layers.{l}.mlp.shared.gate_up"),
+    ("model.layers.{l}.mlp.shared_experts.gate_proj.weight", "layers.{l}.mlp.shared.gate"),
+    ("model.layers.{l}.mlp.shared_experts.up_proj.weight", "layers.{l}.mlp.shared.up"),
     ("model.layers.{l}.mlp.shared_experts.down_proj.weight", "layers.{l}.mlp.shared.down"),
     ([
         "model.layers.{l}.mlp.experts.{e}.gate_proj.weight",
@@ -301,10 +302,8 @@ def forward(m, inputs):
 
 def mlp(x, f):
     if not f.routed:
-        return ops.linear.matmul(
-            ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter),
-            f.down,
-        )
+        gate, up = ops.linear.matmul(x, f.gate), ops.linear.matmul(x, f.up)
+        return ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), f.down)
     routes, weights = ops.linear.moe_route(
         ops.linear.matmul(x, f.router),
         f.experts,
@@ -313,7 +312,8 @@ def mlp(x, f):
         bias = f.bias,
     )
 
-    act = ops.linear.glu(ops.linear.matmul(x, f.shared.gate_up), gating.swiglu(), f.shared.inter)
+    gate, up = ops.linear.matmul(x, f.shared.gate), ops.linear.matmul(x, f.shared.up)
+    act = ops.linear.glu(gate, gating.swiglu(), up = up)
     shared = ops.linear.matmul(act, f.shared.down)
     act = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k), gating.swiglu(), f.inter)
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
