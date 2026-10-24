@@ -125,11 +125,7 @@ impl Session {
                 }
                 continue;
             }
-            let shared = session
-                .rings
-                .endpoint(*channel as usize)
-                .filter(|endpoint| endpoint.role() == HostRole::None);
-            if let Some(endpoint) = shared
+            if let Some(endpoint) = session.rings.endpoint(*channel as usize)
                 && !endpoint.claim_seeding()
             {
                 continue;

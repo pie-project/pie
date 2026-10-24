@@ -1538,6 +1538,7 @@ impl ProcessCtx {
                     port.name
                 )));
             }
+            let writes = |dense: usize| prog.channel_accesses[dense] != (false, false);
             let mut cells: BoundCells = Vec::with_capacity(channels.len());
             for (i, ch) in channels.iter().enumerate() {
                 let cell = self.ctx().table.get(ch)?.cell.clone();
@@ -1551,7 +1552,7 @@ impl ProcessCtx {
                     let extern_binding = extern_bindings[i]
                         .as_ref()
                         .map(|(name, dir)| (name.as_str(), *dir));
-                    if let Err(e) = c.validate_attachment(&decls[i], extern_binding) {
+                    if let Err(e) = c.validate_attachment(&decls[i], writes(i), extern_binding) {
                         return Ok(Err(format!(
                             "pipeline: channel {i} (id {}): {e}",
                             c.global_id
@@ -1692,11 +1693,12 @@ impl ProcessCtx {
                 let extern_binding = extern_bindings[dense]
                     .as_ref()
                     .map(|(name, dir)| (name.as_str(), *dir));
-                if let Err(error) =
-                    cell.lock()
-                        .unwrap()
-                        .attach(instance_id, &decls[dense], extern_binding)
-                {
+                if let Err(error) = cell.lock().unwrap().attach(
+                    instance_id,
+                    &decls[dense],
+                    writes(dense),
+                    extern_binding,
+                ) {
                     for attached in &cells {
                         attached.lock().unwrap().detach(instance_id);
                     }

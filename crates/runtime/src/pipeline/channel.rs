@@ -23,7 +23,7 @@ pub struct ChannelCell {
     pub capacity: u32,
     pub role: Option<HostRole>,
     pub seeded: bool,
-    pub seed_taken: bool,
+    taken_seed: Option<Vec<u8>>,
     endpoint: Option<Arc<ChannelEndpoint>>,
     declared_dtype: Option<ChanDType>,
     extern_name: Option<String>,
@@ -55,6 +55,7 @@ struct ReaderMirror {
 #[derive(Clone, Debug)]
 struct ChannelAttachment {
     instance_id: u64,
+    writes: bool,
     extern_dir: Option<ExternDir>,
 }
 
@@ -100,7 +101,7 @@ impl ChannelCell {
             capacity,
             role: None,
             seeded: false,
-            seed_taken: false,
+            taken_seed: None,
             endpoint: None,
             declared_dtype: None,
             extern_name: None,
@@ -127,12 +128,16 @@ impl ChannelCell {
 
     #[cfg(test)]
     pub fn matches_decl(&self, decl: &ChannelDecl) -> Result<(), String> {
-        self.validate_attachment(decl, None)
+        self.validate_attachment(decl, false, None)
     }
 
+    /// `writes`: the pass's program takes or puts this channel. A host-visible
+    /// or seeded channel no attached pass writes is read-only on the device,
+    /// so any number of passes may share it.
     pub fn validate_attachment(
         &self,
         decl: &ChannelDecl,
+        writes: bool,
         extern_binding: Option<(&str, ExternDir)>,
     ) -> Result<(), String> {
         let decl_dims = decl.shape.dims().to_vec();
@@ -162,14 +167,26 @@ impl ChannelCell {
         }
         if !self.attachments.is_empty() {
             let Some((name, dir)) = extern_binding else {
-                if decl.host_role != HostRole::None
+                let host_written = decl.host_role != HostRole::None
                     || decl.seeded
                     || self.role != Some(HostRole::None)
-                    || self.seeded
-                {
-                    return Err(
-                        "a host-visible or seeded channel may attach to only one pass".into(),
-                    );
+                    || self.seeded;
+                if !host_written {
+                    return Ok(());
+                }
+                if writes || self.attachments.iter().any(|attachment| attachment.writes) {
+                    return Err("a host-visible or seeded channel a pass takes or puts may \
+                                attach to only one pass"
+                        .into());
+                }
+                if self.role != Some(decl.host_role) || self.seeded != decl.seeded {
+                    return Err(format!(
+                        "declared {:?}{} conflicts with prior {:?}{}",
+                        decl.host_role,
+                        if decl.seeded { " seeded" } else { "" },
+                        self.role.unwrap_or(HostRole::None),
+                        if self.seeded { " seeded" } else { "" },
+                    ));
                 }
                 return Ok(());
             };
@@ -223,15 +240,17 @@ impl ChannelCell {
         &mut self,
         instance_id: u64,
         decl: &ChannelDecl,
+        writes: bool,
         extern_binding: Option<(&str, ExternDir)>,
     ) -> Result<(), String> {
-        self.validate_attachment(decl, extern_binding)?;
+        self.validate_attachment(decl, writes, extern_binding)?;
         self.bind(decl);
         if let Some((name, _)) = extern_binding {
             self.extern_name = Some(name.to_string());
         }
         self.attachments.push(ChannelAttachment {
             instance_id,
+            writes,
             extern_dir: extern_binding.map(|(_, dir)| dir),
         });
         Ok(())
@@ -350,7 +369,7 @@ impl ChannelCell {
         match self.role {
             None | Some(HostRole::Writer) => {}
             Some(role) => {
-                if !(self.seeded && !self.seed_taken) {
+                if !(self.seeded && self.taken_seed.is_none()) {
                     return Err(ChannelError::WrongRole { role, op: "put" });
                 }
                 if !self.staged.is_empty() {
@@ -359,7 +378,7 @@ impl ChannelCell {
             }
         }
         if self.role == Some(HostRole::Writer)
-            && !(self.seeded && !self.seed_taken)
+            && !(self.seeded && self.taken_seed.is_none())
             && let Some(endpoint) = self.endpoint.clone()
         {
             debug_assert!(
@@ -425,7 +444,7 @@ impl ChannelCell {
             if committed_tail <= head {
                 if self.role == Some(HostRole::Writer)
                     && self.seeded
-                    && self.seed_taken
+                    && self.taken_seed.is_some()
                     && head == tail
                     && self.ring_host_copies.is_empty()
                 {
@@ -552,7 +571,7 @@ impl ChannelCell {
     }
 
     pub fn flush_writer_staging(&mut self) -> Result<(), ChannelError> {
-        if self.role != Some(HostRole::Writer) || (self.seeded && !self.seed_taken) {
+        if self.role != Some(HostRole::Writer) || (self.seeded && self.taken_seed.is_none()) {
             return Ok(());
         }
         let Some(endpoint) = self.endpoint.clone() else {
@@ -647,20 +666,25 @@ impl ChannelCell {
     #[cfg(test)]
     pub fn take_seed(&mut self) -> Result<Vec<u8>, ChannelError> {
         let seed = self.staged.pop_front().ok_or(ChannelError::MissingSeed)?;
-        self.seed_taken = true;
+        self.taken_seed = Some(seed.clone());
         Ok(seed)
     }
 
+    /// The seed every pass bound to this channel starts from: the one put
+    /// before the first bind, kept once committed so a later pass that
+    /// shares the channel binds the same value.
     pub fn peek_seed(&self) -> Result<Vec<u8>, ChannelError> {
-        self.staged
-            .front()
-            .cloned()
+        self.taken_seed
+            .clone()
+            .or_else(|| self.staged.front().cloned())
             .ok_or(ChannelError::MissingSeed)
     }
 
     pub fn commit_seed(&mut self) {
-        let _ = self.staged.pop_front();
-        self.seed_taken = true;
+        if self.taken_seed.is_some() {
+            return;
+        }
+        self.taken_seed = self.staged.pop_front();
         if self.role != Some(HostRole::Writer) {
             return;
         }
@@ -986,6 +1010,39 @@ mod tests {
         bind_validates_constructor_geometry();
         writer_put_reader_take_roundtrip();
         packed_bool_mirror_decodes_to_native_bytes();
+        passes_share_a_seeded_channel_none_writes();
+    }
+
+    fn passes_share_a_seeded_channel_none_writes() {
+        let seeded = decl(Shape::vector(1), Dtype::I32, HostRole::None, true);
+        let mut c = ChannelCell::new(vec![1], Dtype::I32, 1);
+        c.put_ref(&7i32.to_le_bytes()).unwrap();
+        c.attach(1, &seeded, false, None).unwrap();
+        c.commit_seed();
+        c.attach(2, &seeded, false, None).unwrap();
+        assert_eq!(
+            c.peek_seed().unwrap(),
+            7i32.to_le_bytes().to_vec(),
+            "a later pass binds the committed seed"
+        );
+        assert!(
+            c.validate_attachment(&seeded, true, None).is_err(),
+            "a pass that takes or puts it does not join"
+        );
+        let writer = decl(Shape::vector(1), Dtype::I32, HostRole::Writer, true);
+        assert!(
+            c.validate_attachment(&writer, false, None).is_err(),
+            "every pass declares the same host role"
+        );
+
+        let mut w = ChannelCell::new(vec![1], Dtype::I32, 1);
+        w.attach(1, &seeded, true, None).unwrap();
+        assert!(
+            w.validate_attachment(&seeded, false, None).is_err(),
+            "a pass already writes it"
+        );
+        w.detach(1);
+        assert!(w.validate_attachment(&seeded, true, None).is_ok());
     }
 
     fn prebind_put_stages_and_seed_pops() {
@@ -993,7 +1050,7 @@ mod tests {
         c.put_ref(&7i32.to_le_bytes()).unwrap();
         c.bind(&decl(Shape::vector(1), Dtype::I32, HostRole::None, true));
         assert_eq!(c.take_seed().unwrap(), 7i32.to_le_bytes().to_vec());
-        assert!(c.seed_taken);
+        assert!(c.taken_seed.is_some());
         assert_eq!(
             c.put_ref(&9i32.to_le_bytes()).unwrap_err(),
             ChannelError::WrongRole {
