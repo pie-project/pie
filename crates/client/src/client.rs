@@ -243,21 +243,10 @@ impl Client {
 
     async fn send_msg_and_wait(&self, mut msg: ClientMessage) -> Result<(bool, String)> {
         let corr_id_guard = self.inner.corr_id_pool.acquire().await?;
-        let corr_id_ref = match &mut msg {
-            ClientMessage::AuthIdentify { corr_id, .. }
-            | ClientMessage::AuthProve { corr_id, .. }
-            | ClientMessage::CheckProgram { corr_id, .. }
-            | ClientMessage::TerminateProcess { corr_id, .. }
-            | ClientMessage::Query { corr_id, .. }
-            | ClientMessage::AddProgram { corr_id, .. }
-            | ClientMessage::LaunchProcess { corr_id, .. }
-            | ClientMessage::ListProcesses { corr_id }
-            | ClientMessage::Ping { corr_id } => corr_id,
-            _ => {
-                return Err(Error::Internal(
-                    "Invalid message type for this helper".to_string(),
-                ));
-            }
+        let Some(corr_id_ref) = msg.corr_id_mut() else {
+            return Err(Error::Internal(
+                "a message with no correlation id has no reply to wait for".to_string(),
+            ));
         };
         *corr_id_ref = *corr_id_guard;
 
