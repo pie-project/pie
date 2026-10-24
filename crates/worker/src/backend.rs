@@ -231,6 +231,8 @@ fn device_boot(
     }
     knobs.expert_rebalance_steps = opts.expert_rebalance_steps;
     knobs.expert_load_window = opts.expert_load_window;
+    knobs.expert_rebalance_moves = opts.expert_rebalance_moves;
+    knobs.expert_rebalance_gain = opts.expert_rebalance_gain;
     if let Some(word) = opts.nccl_transport.as_deref() {
         knobs.nccl_transport = word
             .parse::<Transport>()

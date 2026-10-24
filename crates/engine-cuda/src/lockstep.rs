@@ -28,6 +28,7 @@ use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{FireTicket, FrameSubmission, FrameTicket, Step};
 use engine::load::{LoadRequest, Loaded};
+use engine::placement::Limits;
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{KvCopy, KvHandle, StateCopy};
 
@@ -513,7 +514,12 @@ pub fn open_lockstep(
         crate::ep::rebalance::Rebalance {
             every,
             window: knobs.expert_load_window.unwrap_or(every).max(every),
-            limits: engine::placement::Limits::DEFAULT,
+            limits: Limits {
+                moves: knobs
+                    .expert_rebalance_moves
+                    .unwrap_or(Limits::DEFAULT.moves),
+                gain: knobs.expert_rebalance_gain.unwrap_or(Limits::DEFAULT.gain),
+            },
         }
     });
     let mut ranks = Vec::with_capacity(size);
