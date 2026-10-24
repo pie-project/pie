@@ -8,6 +8,8 @@ license = "Apache-2.0"
 repository = "https://github.com/pie-project/pie"
 
 [dependencies]
+engine = { path = "../engine" }
+poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 transport = { path = "../transport", features = ["tcp"] }
 tokio = { version = "1.53", features = ["sync", "rt"] }
 tracing = "0.1"
@@ -17,6 +19,7 @@ tracing = "0.1"
 nixl = ["transport/nixl"]
 
 [dev-dependencies]
+poem-compiler = { package = "pie-poem-compiler", path = "../poem-compiler" }
 tokio = { version = "1.53", features = ["sync", "rt", "macros", "rt-multi-thread"] }
 
 [lints]

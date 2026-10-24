@@ -5,17 +5,26 @@
 //! part of every MoE layer's experts from the one checkpoint, dispatches
 //! its tokens to the ranks holding their routes and combines the outputs
 //! back. Each rank's logits are the logits one rank holding every expert
-//! answers for the same prompt, whether the other ranks fire their own
-//! prompts in the step or idle through it serving the first rank's routes.
+//! answers for the same prompt at the step's bucket, whether the other
+//! ranks fire their own prompts in the step or idle through it serving the
+//! first rank's routes; and every route of the last MoE layer comes back
+//! to its token as its expert answers the row that landed.
+//!
+//! The micro's logits move by a few tenths of their spread of 8 under a
+//! bf16 step in one expert row (a route taken another way four layers
+//! on): the routes are checked first, exactly where they are made, so a
+//! wrong route is told apart from a kernel that rounds another way.
 
 use checkpoint::contract::ModelContract;
-use engine_cuda::ep::{EpRank, wire};
+use engine_cuda::ep::{EpRank, Wire, wire};
 use engine_cuda::{Lane, Shell};
 use poem::{Dtype, Platform, Request};
 use poem_compiler::Budget;
-use poem_ir::Trace;
+use poem_ir::{Collective, Def, Linear, Operation, Trace};
 
-use crate::micro::{KV, MICRO, SHARE, Scratch, close, ordinals, prompt, ranks, write_checkpoint};
+use crate::micro::{
+    KV, MICRO, SHARE, Scratch, close, ordinals, prompt, ranks, values, write_checkpoint,
+};
 
 const CEILING: u32 = 256;
 const PAGE: u32 = 16;
@@ -124,9 +133,14 @@ fn arm(staged: Carried<(engine_cuda::serve::Staged, Scratch)>, ordinal: i32) -> 
     })
 }
 
-/// The group's ranks, wired between staging and arming: arming fires the
-/// collectives, so every rank arms at once.
-fn group(lowered: &Trace, whole: &Trace, ordinals: &[i32], graphs: bool) -> Vec<Loaded> {
+/// The group's ranks and their wire, wired between staging and arming:
+/// arming fires the collectives, so every rank arms at once.
+fn group(
+    lowered: &Trace,
+    whole: &Trace,
+    ordinals: &[i32],
+    graphs: bool,
+) -> (Vec<Loaded>, Vec<Wire>) {
     let size = ordinals.len() as u32;
     let mut staged: Vec<_> = (0..size)
         .map(|rank| {
@@ -147,7 +161,7 @@ fn group(lowered: &Trace, whole: &Trace, ordinals: &[i32], graphs: bool) -> Vec<
         let ep = EpRank::new(wires.clone(), r as u32, &shape.layers).expect("the placement");
         staged.shell.join_ep(ep).expect("the seats");
     }
-    std::thread::scope(|scope| {
+    let ranks = std::thread::scope(|scope| {
         let armed: Vec<_> = (staged.into_iter().zip(ordinals))
             .map(|(staged, &ordinal)| {
                 let staged = Carried(staged);
@@ -155,7 +169,8 @@ fn group(lowered: &Trace, whole: &Trace, ordinals: &[i32], graphs: bool) -> Vec<
             })
             .collect();
         armed.into_iter().map(|h| h.join().unwrap().0).collect()
-    })
+    });
+    (ranks, wires)
 }
 
 /// A lane of `tokens` at `slot`, its word read off their count.
@@ -196,29 +211,37 @@ fn check(graphs: bool) {
 
     // One rank holding every expert, on each rank's device: the group's
     // kernels are loaded and tuned on every device before its ranks spin.
+    // It answers each prompt at the step's bucket, the widest prompt's, as
+    // the group fires it: a fire padded to another bucket rounds its
+    // products another way, which no expert parallelism did.
+    let widest = prompts.iter().map(Vec::len).max().unwrap_or(0) as u32;
     let mut want = Vec::new();
+    let mut bucket = 0;
     for &ordinal in ordinals.iter().take(engine_cuda::device::ctx::count()) {
         let tag = format!("one-{graphs}-{ordinal}");
         let mut one = load(&whole, ordinal, &tag, graphs);
+        bucket = (one.shell)
+            .bucket_for(widest)
+            .expect("a bucket holds every prompt");
         want = (prompts.iter())
             .map(|p| {
                 one.shell.open(0).unwrap();
-                one.shell.fire(&[lane(0, p)]).unwrap().remove(0)
+                one.fire_at(bucket, lane(0, p)).remove(0)
             })
             .collect();
     }
 
-    let mut ranks = group(&lowered, &whole, &ordinals, graphs);
+    let (mut ranks, wires) = group(&lowered, &whole, &ordinals, graphs);
     for loaded in &mut ranks {
         engine_cuda::device::ctx::bind_thread(loaded.ordinal).unwrap();
         loaded.shell.open(0).unwrap();
         loaded.shell.open(1).unwrap();
     }
-    let widest = prompts.iter().map(Vec::len).max().unwrap_or(0) as u32;
-    let bucket = ranks[0]
-        .shell
-        .bucket_for(widest)
-        .expect("a bucket holds every prompt");
+    assert_eq!(
+        ranks[0].shell.bucket_for(widest),
+        Some(bucket),
+        "a rank of the group buckets the step as one rank does"
+    );
 
     // Every rank brings a prompt to the step.
     let got: Vec<Vec<Vec<f32>>> = std::thread::scope(|scope| {
@@ -227,6 +250,8 @@ fn check(graphs: bool) {
             .collect();
         fired.into_iter().map(|h| h.join().unwrap()).collect()
     });
+    let live: Vec<usize> = prompts.iter().map(Vec::len).collect();
+    routes_return(&lowered, &whole, &wires, &ordinals, bucket, &live, graphs);
     for (r, (got, want)) in got.iter().zip(&want).enumerate() {
         close(
             &got[0],
@@ -250,4 +275,174 @@ fn check(graphs: bool) {
         &want[0],
         &format!("rank 0's prompt with the others idle (graphs {graphs})"),
     );
+}
+
+fn bf16(bits: u16) -> f32 {
+    f32::from_bits(u32::from(bits) << 16)
+}
+
+/// `x` rounded to bf16, to nearest even, as a kernel lands it.
+fn round(x: f32) -> f32 {
+    let bits = x.to_bits();
+    f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff_0000)
+}
+
+fn down<T: Copy + Default>(at: u64, count: usize) -> Vec<T> {
+    use kernels_cuda::cudarc::runtime::sys as rt;
+    let mut out = vec![T::default(); count];
+    // SAFETY: `out` holds `count` elements; `at` is a device range of at
+    // least that many the wire carved; the copy is synchronous, and every
+    // rank's fire has settled.
+    let code = unsafe {
+        rt::cudaMemcpy(
+            out.as_mut_ptr().cast(),
+            at as *const core::ffi::c_void,
+            core::mem::size_of_val(out.as_slice()),
+            rt::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+        )
+    };
+    assert_eq!(code, rt::cudaError::cudaSuccess, "cudaMemcpy D2H");
+    out
+}
+
+/// After a step at `bucket` that every rank brought `live[r]` tokens to:
+/// each route of the last MoE layer came back to its token's row as its
+/// expert answers the row that landed. The wire holds that layer's
+/// landing and return until the next step; the experts' gate-up select,
+/// GLU and down select are worked on the host from the checkpoint's
+/// planes, each product rounded to bf16 as the kernels land it.
+#[allow(clippy::too_many_arguments)]
+fn routes_return(
+    lowered: &Trace,
+    whole: &Trace,
+    wires: &[Wire],
+    ordinals: &[i32],
+    bucket: u32,
+    live: &[usize],
+    graphs: bool,
+) {
+    let at = (lowered.nodes.iter())
+        .rposition(|n| matches!(n.op, Operation::Collective(Collective::Dispatch { .. })))
+        .expect("the lowered micro dispatches");
+    let Operation::Collective(Collective::Dispatch {
+        x,
+        local,
+        experts,
+        slots,
+        top_k,
+        ..
+    }) = lowered.nodes[at].op
+    else {
+        unreachable!()
+    };
+    // The layer's two selects, in order, and the GLU between them.
+    let mut banks = Vec::new();
+    let mut inter = 0;
+    for node in &lowered.nodes[at..] {
+        match node.op {
+            Operation::Linear(Linear::MoeSelect { bank, routes, .. }) if routes == local => {
+                let Def::Weight(p) = lowered.values[bank.0 as usize].def else {
+                    panic!("a bank is a weight");
+                };
+                banks.push(&lowered.params[p as usize].name);
+            }
+            Operation::Linear(Linear::Glu { intermediate, .. }) if banks.len() == 1 => {
+                inter = intermediate as usize;
+            }
+            _ => {}
+        }
+    }
+    let [gate_up, down_bank] = banks[..] else {
+        panic!("the last layer's experts are two selects");
+    };
+    let plane = |name: &str| -> Vec<f32> {
+        let param = (whole.params.iter())
+            .find(|p| p.name == *name)
+            .unwrap_or_else(|| panic!("`{name}` is one rank's plane"));
+        let count = param.shape.iter().product::<u64>() as usize;
+        values(name, count).into_iter().map(bf16).collect()
+    };
+    let (gate_up, down_bank) = (plane(gate_up), plane(down_bank));
+    let width = match &lowered.values[x.0 as usize].ty {
+        poem_ir::Ty::Tensor { shape, .. } => match shape.last() {
+            Some(poem_ir::Dim::Const(w)) => *w as usize,
+            _ => panic!("a token row is of a stated width"),
+        },
+        poem_ir::Ty::Struct(_) => panic!("a token row is a tensor"),
+    };
+    let expert = |e: usize, row: &[f32]| -> Vec<f32> {
+        let gu = &gate_up[e * 2 * inter * width..][..2 * inter * width];
+        let h: Vec<f32> = (gu.chunks(width))
+            .map(|w| round(row.iter().zip(w).map(|(a, b)| a * b).sum()))
+            .collect();
+        let a: Vec<f32> = (0..inter)
+            .map(|c| round(h[c] / (1.0 + (-h[c]).exp()) * h[inter + c]))
+            .collect();
+        let dn = &down_bank[e * width * inter..][..width * inter];
+        (dn.chunks(inter))
+            .map(|w| round(a.iter().zip(w).map(|(p, q)| p * q).sum()))
+            .collect()
+    };
+
+    let world = wires.len();
+    let (k, step, slots) = (top_k as usize, bucket as usize, slots as usize);
+    let held = engine::placement::Placement::uniform(experts, world as u32, slots as u32)
+        .expect("the uniform placement")
+        .held;
+    let routed: Vec<Vec<u16>> = (wires.iter().zip(ordinals))
+        .map(|(w, &ordinal)| {
+            engine_cuda::device::ctx::bind_thread(ordinal).unwrap();
+            let r = w.routed(bucket, top_k, width as u32, Dtype::Bf16);
+            down(r.ptr, step * k * width)
+        })
+        .collect();
+    let mut returned: Vec<usize> = vec![0; world];
+    for (d, (w, &ordinal)) in wires.iter().zip(ordinals).enumerate() {
+        engine_cuda::device::ctx::bind_thread(ordinal).unwrap();
+        let landing = w.landing(bucket, top_k, width as u32, Dtype::Bf16, false);
+        let cap = world * step;
+        let rows: Vec<u16> = down(landing.rows.ptr, cap * width);
+        let slot: Vec<i32> = down(landing.local.ptr, cap * k);
+        let origin: Vec<i32> = down(landing.origin.ptr, cap);
+        for (i, &o) in origin.iter().enumerate() {
+            let Ok(o) = usize::try_from(o) else {
+                continue;
+            };
+            let (s, t) = (o / step, o % step);
+            assert!(
+                t < live[s],
+                "rank {d}'s row {i} came from a token rank {s} lacks"
+            );
+            let row: Vec<f32> = rows[i * width..][..width]
+                .iter()
+                .map(|&b| bf16(b))
+                .collect();
+            for j in 0..k {
+                let Ok(l) = usize::try_from(slot[i * k + j]) else {
+                    continue;
+                };
+                let e = held[d * slots + l] as usize;
+                let want = expert(e, &row);
+                let got = &routed[s][(t * k + j) * width..][..width];
+                let scale = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                let worst = (got.iter().zip(&want))
+                    .map(|(&g, w)| (bf16(g) - w).abs())
+                    .fold(0.0f32, f32::max);
+                // A bf16 step or two on a few of the products' sums.
+                assert!(
+                    worst <= 0.02 * scale,
+                    "rank {s} token {t} route {j} (expert {e}, slot {l} of rank {d}) came back \
+                     {worst} off its expert's answer of scale {scale} (graphs {graphs})"
+                );
+                returned[s] += 1;
+            }
+        }
+    }
+    for (s, &n) in returned.iter().enumerate() {
+        assert_eq!(
+            n,
+            live[s] * k,
+            "rank {s}'s every route was served once (graphs {graphs})"
+        );
+    }
 }

@@ -1861,6 +1861,9 @@ dependencies = [
 name = "engine-cpu"
 version = "0.5.4"
 dependencies = [
+ "engine",
+ "pie-poem-compiler",
+ "pie-poem-ir",
  "tokio",
  "tracing",
  "transport",
