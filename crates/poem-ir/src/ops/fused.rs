@@ -470,6 +470,24 @@ pub enum Fused {
         #[output]
         o_out: ValueId,
     },
+    /// A sublayer's hyper-connection fold (`fold`, an `HcFold`) and the next
+    /// sublayer's whole pre-mix over the streams it folds: stream norm
+    /// (`norm`), mix projection (`project`), combined gates (`gates`) and the
+    /// pre-mixed row's `rmsnorm`, as [`Fused::HcPre`]'s. The folded streams
+    /// are still an output, read on; the pre-mix's intermediates are still
+    /// outputs, read by nothing else.
+    HcFoldPre {
+        #[part]
+        fold: Box<Elemwise>,
+        #[part]
+        norm: Box<Elemwise>,
+        #[part]
+        project: Box<Elemwise>,
+        #[part]
+        gates: Box<Elemwise>,
+        #[part]
+        rmsnorm: Box<Elemwise>,
+    },
     /// A sublayer's whole hyper-connection pre-mix: stream norm (`norm`, an
     /// `HcRmsnormF32`), mix projection (`project`, an `HcProject`), combined
     /// gates (`gates`, an `HcGates`) and the pre-mixed row's `rmsnorm`. The

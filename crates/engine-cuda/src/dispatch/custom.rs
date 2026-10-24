@@ -68,6 +68,7 @@ impl DispatchFused for Run<'_> {
             Fused::HcPrenormProject { .. } => self.hc_prenorm_project(op),
             Fused::HcGatesNorm { .. } => self.hc_gates_norm(op),
             Fused::ResBlendRmsnorm { .. } => self.res_blend_rmsnorm(op),
+            Fused::HcFoldPre { .. } => self.hc_fold_pre(op),
             Fused::HcPre { .. } => self.hc_pre(op),
             Fused::MatmulGlu { .. }
             | Fused::MatmulSwigluMatmul { .. }
@@ -155,6 +156,98 @@ impl Run<'_> {
         Ok(None)
     }
 
+    /// A sublayer's fold and the next sublayer's whole pre-mix: one launch
+    /// where the profile's seam rows take it (`kernel.elemwise.hc_mega_from`
+    /// to `hc_mega_until`, unread rows left unwritten), else the fold and
+    /// [`Run::hc_pre`]'s pre-mix.
+    fn hc_fold_pre(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        let Fused::HcFoldPre {
+            fold,
+            norm,
+            project,
+            gates,
+            rmsnorm,
+        } = op
+        else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        if let (
+            poem_ir::Elemwise::HcFold {
+                x,
+                streams,
+                post_mix: post_in,
+                comb_mix: comb_in,
+                y: folded,
+            },
+            poem_ir::Elemwise::HcRmsnormF32 { eps: mix_eps, .. },
+            poem_ir::Elemwise::HcProject {
+                weight: plane,
+                stream_count,
+                ..
+            },
+            poem_ir::Elemwise::HcGates {
+                scale,
+                base,
+                gate_eps,
+                alpha,
+                sinkhorn,
+                comb: true,
+                post_mix,
+                comb_mix,
+                ..
+            },
+            poem_ir::Elemwise::Rmsnorm {
+                weight: NormWeight::Scale(weight),
+                eps,
+                y,
+                axis: NormAxis::Row,
+                ..
+            },
+        ) = (&**fold, &**norm, &**project, &**gates, &**rmsnorm)
+            && let tuning = self.ctx().tuning()
+            && (tuning.hc_mega_from..=tuning.hc_mega_until).contains(&self.tensor(*y).rows)
+        {
+            let emits = self.tensor(*y).width.is_multiple_of(256);
+            let held = self.hc_pre_held(*y, emits)?;
+            let seam = kernels_cuda::elemwise::hc::Seam {
+                x: self.tensor(*x),
+                streams: self.tensor(*streams),
+                post_mix: self.tensor(*post_in),
+                comb_mix: self.tensor(*comb_in),
+                mix_eps: *mix_eps,
+                hc_fn: self.tensor(*plane),
+                stream_count: *stream_count,
+                gate: kernels_cuda::elemwise::hc::Gate {
+                    scale: self.tensor(*scale),
+                    base: self.tensor(*base),
+                    gate_eps: *gate_eps,
+                    alpha: *alpha,
+                    sinkhorn: *sinkhorn,
+                },
+                weight: self.tensor(*weight),
+                norm_eps: *eps,
+            };
+            if kernels_cuda::elemwise::hc::fold_pre(
+                self.ctx(),
+                seam,
+                &mut self.tensor(*folded),
+                held,
+                &mut self.tensor(*post_mix),
+                &mut self.tensor(*comb_mix),
+                &mut self.tensor(*y),
+            )? {
+                return Ok(());
+            }
+            // The planes held for the seam's normed row were not landed.
+            #[cfg(feature = "cuda")]
+            if held.is_some() {
+                self.drop_held();
+            }
+        }
+        self.elemwise(fold)?;
+        self.pre_mix(norm, project, gates, rmsnorm)
+    }
+
     /// A sublayer's whole pre-mix: two launches where the profile's tiled
     /// hyper-connection kernels run (unread rows left unwritten), else as traced.
     fn hc_pre(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
@@ -167,17 +260,28 @@ impl Run<'_> {
         else {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
+        self.pre_mix(norm, project, gates, rmsnorm)
+    }
+
+    /// [`Run::hc_pre`] over its parts.
+    fn pre_mix(
+        &mut self,
+        norm: &poem_ir::Elemwise,
+        project: &poem_ir::Elemwise,
+        gates: &poem_ir::Elemwise,
+        rmsnorm: &poem_ir::Elemwise,
+    ) -> Result<(), kernels_cuda::Error> {
         // A prefill's rows: the one-pass projection, then the gates and the
         // norm apart, whose 16-byte forms stream a long fire faster than the
         // block-a-row pre-mix.
         if self.ctx().tuning().hc_tile
-            && let poem_ir::Elemwise::HcRmsnormF32 { streams, eps, .. } = &**norm
+            && let poem_ir::Elemwise::HcRmsnormF32 { streams, eps, .. } = norm
             && let poem_ir::Elemwise::HcProject {
                 weight,
                 stream_count,
                 mixes,
                 ..
-            } = &**project
+            } = project
             && self.tensor(*streams).rows >= kernels_cuda::elemwise::hc::PRE_WIDE_FROM
             && kernels_cuda::elemwise::hc_project::prenorm_project(
                 self.ctx(),
@@ -200,7 +304,7 @@ impl Run<'_> {
                     eps,
                     y,
                     axis: NormAxis::Row,
-                } = &**rmsnorm
+                } = rmsnorm
                 && self.tensor(*y).width == 4096
             {
                 let planes = self.hold_e4m3(*y)?;
@@ -249,7 +353,7 @@ impl Run<'_> {
                     axis: NormAxis::Row,
                     ..
                 },
-            ) = (&**norm, &**project, &**gates, &**rmsnorm)
+            ) = (norm, project, gates, rmsnorm)
             && let emits = kernels_cuda::elemwise::hc::pre_emits(
                 &self.tensor(*streams),
                 &self.tensor(*plane),

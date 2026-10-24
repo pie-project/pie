@@ -21,6 +21,7 @@ pub(crate) fn refuses(op: &Fused) -> bool {
             | Fused::PoolCompress { .. }
             | Fused::PoolAttention { .. }
             | Fused::MlaPrefillExpanded { .. }
+            | Fused::HcFoldPre { .. }
             | Fused::HcPre { .. }
             | Fused::HcGatesNorm { .. }
             | Fused::HcPrenormProject { .. }
@@ -67,6 +68,7 @@ impl DispatchFused for Run<'_> {
             | Fused::PoolCompress { .. }
             | Fused::PoolAttention { .. }
             | Fused::MlaPrefillExpanded { .. }
+            | Fused::HcFoldPre { .. }
             | Fused::HcPre { .. }
             | Fused::HcGatesNorm { .. }
             | Fused::HcPrenormProject { .. }

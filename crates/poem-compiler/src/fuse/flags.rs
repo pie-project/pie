@@ -71,6 +71,7 @@ flags! {
     HcPrenormProject = "fuse.hc_prenorm_project" => "fused.hc_prenorm_project",
     HcGatesNorm = "fuse.hc_gates_norm" => "fused.hc_gates_norm",
     ResBlendRmsnorm = "fuse.res_blend_rmsnorm" => "fused.res_blend_rmsnorm",
+    HcFoldPre = "fuse.hc_fold_pre" => "fused.hc_fold_pre",
     HcPre = "fuse.hc_pre" => "fused.hc_pre",
 }
 
