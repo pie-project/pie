@@ -389,19 +389,20 @@ impl<'r, 't> Walk<'r, 't> {
         }
     }
 
-    /// Whether `v`, a share, is gathered where it is wanted whole: a share
-    /// of one column cut's run, as wide as each segment of it, which a
-    /// gather puts back in order.
-    fn gathers(&self, v: ValueId) -> bool {
-        let Some(Held::Split(os)) = &self.held[v.0 as usize] else {
+    /// Whether `v`, held as `share`, is one a gather puts back in order:
+    /// a share of column cuts' runs each as wide as every segment of them,
+    /// so each rank holds one block of it.
+    fn gathers(&self, v: ValueId, share: &Held) -> bool {
+        let Held::Split(os) = share else {
             return false;
         };
-        let [o] = os.iter().copied().collect::<Vec<_>>()[..] else {
-            return false;
-        };
-        let (segments, _) = self.segments(o.param, o.lo, o.hi);
-        self.width(v)
-            .is_some_and(|w| segments.iter().all(|s| *s == w))
+        self.width(v).is_some_and(|w| {
+            !os.is_empty()
+                && os.iter().all(|o| {
+                    let (segments, _) = self.segments(o.param, o.lo, o.hi);
+                    segments.iter().all(|s| *s == w)
+                })
+        })
     }
 
     /// A value an op reads whole: a share's cuts put back, a weight kept
@@ -513,11 +514,12 @@ impl<'r, 't> Walk<'r, 't> {
                         self.read_whole(*v);
                     }
                 }
-                let one = match self.held(a) {
+                let share = self.held(a);
+                let one = match share.clone() {
                     Held::Split(origins) => {
                         if self.decide(p, Cut::Row(input)) {
                             Held::Partial(origins)
-                        } else if self.pinned.contains(&p) && self.gathers(a) {
+                        } else if self.pinned.contains(&p) && self.gathers(a, &share) {
                             // A weight the model states whole reads its
                             // share gathered.
                             Held::Whole
@@ -757,60 +759,91 @@ impl<'r, 't> Walk<'r, 't> {
             if !matches!(h, Held::Split(_)) {
                 continue;
             }
-            let Some(o) = self.whole_run(*v) else {
-                continue;
-            };
-            let width = o.hi - o.lo;
-            let pieces: Vec<(u64, Option<u64>)> = match (op.name(), *name) {
-                ("ssm.gated_delta" | "ssm.gated_delta_chunked", "qkv") => {
-                    match (int("k_heads"), int("v_heads"), int("k_dim"), int("v_dim")) {
-                        (Some(kh), Some(vh), Some(kd), Some(vd)) => {
-                            vec![(kh * kd, None), (kh * kd, None), (vh * vd, None)]
-                        }
-                        _ => Vec::new(),
+            // A share of several runs as wide as itself (the arms of a merge)
+            // holds what each of them does.
+            for o in self.whole_runs(*v) {
+                self.count_run(op, t, name, o, head_dim);
+            }
+        }
+    }
+
+    /// The runs `v` is all of: each column cut's output it is a share of,
+    /// if every one is as wide as `v`.
+    fn whole_runs(&self, v: ValueId) -> Vec<Origin> {
+        let Some(Held::Split(os)) = &self.held[v.0 as usize] else {
+            return Vec::new();
+        };
+        let width = self.width(v);
+        if os.iter().all(|o| Some(o.hi - o.lo) == width) {
+            os.iter().copied().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The heads and segments op `op` says run `o` of its `name` input holds.
+    fn count_run(
+        &mut self,
+        op: &Operation,
+        t: &Tree,
+        name: &str,
+        o: Origin,
+        head_dim: Option<u64>,
+    ) {
+        let int = |name: &str| match tree::field(t, name) {
+            Some(Tree::Int(n)) => u64::try_from(*n).ok().filter(|n| *n > 0),
+            _ => None,
+        };
+        let width = o.hi - o.lo;
+        let pieces: Vec<(u64, Option<u64>)> = match (op.name(), name) {
+            ("ssm.gated_delta" | "ssm.gated_delta_chunked", "qkv") => {
+                match (int("k_heads"), int("v_heads"), int("k_dim"), int("v_dim")) {
+                    (Some(kh), Some(vh), Some(kd), Some(vd)) => {
+                        vec![(kh * kd, None), (kh * kd, None), (vh * vd, None)]
                     }
-                }
-                ("ssm.kda" | "ssm.kda_chunked", "mixed") => vec![(width / 3, None); 3],
-                ("ssm.gdn_gates", "ba") => vec![(width / 2, None); 2],
-                ("ssm.mamba2" | "ssm.mamba2_chunked", "xbc") => {
-                    match (int("heads"), int("groups"), int("state_dim")) {
-                        (Some(heads), Some(groups), Some(state)) => {
-                            let bc = groups * state;
-                            vec![
-                                (width.saturating_sub(2 * bc), Some(heads)),
-                                (bc, Some(groups)),
-                                (bc, Some(groups)),
-                            ]
-                        }
-                        _ => Vec::new(),
-                    }
-                }
-                ("ssm.mamba2" | "ssm.mamba2_chunked", "z" | "dt") => {
-                    vec![(width, int("heads"))]
-                }
-                ("linear.glu", "packed") => vec![(width / 2, None); 2],
-                _ => match head_dim {
-                    Some(d) if width.is_multiple_of(d) => vec![(width, Some(width / d))],
                     _ => Vec::new(),
-                },
-            };
-            if pieces.iter().map(|(w, _)| w).sum::<u64>() != width {
-                continue;
-            }
-            let mut lo = o.lo;
-            for (w, heads) in pieces {
-                self.bounds.entry(o.param).or_default().insert(lo);
-                if let Some(h) = heads {
-                    self.heads
-                        .entry(Origin {
-                            param: o.param,
-                            lo,
-                            hi: lo + w,
-                        })
-                        .or_insert(h);
                 }
-                lo += w;
             }
+            ("ssm.kda" | "ssm.kda_chunked", "mixed") => vec![(width / 3, None); 3],
+            ("ssm.gdn_gates", "ba") => vec![(width / 2, None); 2],
+            ("ssm.mamba2" | "ssm.mamba2_chunked", "xbc") => {
+                match (int("heads"), int("groups"), int("state_dim")) {
+                    (Some(heads), Some(groups), Some(state)) => {
+                        let bc = groups * state;
+                        vec![
+                            (width.saturating_sub(2 * bc), Some(heads)),
+                            (bc, Some(groups)),
+                            (bc, Some(groups)),
+                        ]
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            ("ssm.mamba2" | "ssm.mamba2_chunked", "z" | "dt") => {
+                vec![(width, int("heads"))]
+            }
+            ("linear.glu", "packed") => vec![(width / 2, None); 2],
+            _ => match head_dim {
+                Some(d) if width.is_multiple_of(d) => vec![(width, Some(width / d))],
+                _ => Vec::new(),
+            },
+        };
+        if pieces.iter().map(|(w, _)| w).sum::<u64>() != width {
+            return;
+        }
+        let mut lo = o.lo;
+        for (w, heads) in pieces {
+            self.bounds.entry(o.param).or_default().insert(lo);
+            if let Some(h) = heads {
+                self.heads
+                    .entry(Origin {
+                        param: o.param,
+                        lo,
+                        hi: lo + w,
+                    })
+                    .or_insert(h);
+            }
+            lo += w;
         }
     }
 
