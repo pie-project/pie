@@ -178,7 +178,7 @@ fn biased(trace: &Trace, read: &[u32], y: ValueId) -> Option<Biased> {
         ins.clear();
         node.op.inputs(&mut ins);
         let param = weight_param(trace, *bias)?;
-        (read[bias.0 as usize] == 1 && leg(&trace.params[param as usize])).then_some(Biased {
+        leg(&trace.params[param as usize]).then_some(Biased {
             at,
             param,
             bias: *bias,
@@ -208,14 +208,14 @@ fn groups(trace: &Trace) -> Vec<Group> {
             continue;
         };
         let param = &trace.params[p as usize];
-        if read[w.0 as usize] != 1 || !leg(param) || param.shape.len() < 2 {
+        if !leg(param) || param.shape.len() < 2 {
             continue;
         }
         if let Some(s) = scales {
             let Some(sp) = weight_param(trace, *s) else {
                 continue;
             };
-            if read[s.0 as usize] != 1 || !leg(&trace.params[sp as usize]) {
+            if !leg(&trace.params[sp as usize]) {
                 continue;
             }
         }
@@ -264,7 +264,7 @@ fn groups(trace: &Trace) -> Vec<Group> {
             continue;
         };
         let param = &trace.params[p as usize];
-        if read[bank.0 as usize] != 1 || !leg_along(param, 1) || param.shape.len() < 3 {
+        if !leg_along(param, 1) || param.shape.len() < 3 {
             continue;
         }
         let planes: Vec<String> = planes_of(trace, &param.name)
@@ -621,6 +621,7 @@ fn apply(mut trace: Trace, groups: &[Group]) -> Trace {
     // the other legs' products gone.
     let mut drop: BTreeSet<usize> = BTreeSet::new();
     let mut after: BTreeMap<usize, Vec<Node>> = BTreeMap::new();
+    let mut retyped: BTreeSet<ValueId> = BTreeSet::new();
     for group in groups {
         let first = group.nodes[0];
         // What each leg stands for: its product, or the bias added to it.
@@ -672,8 +673,10 @@ fn apply(mut trace: Trace, groups: &[Group]) -> Trace {
         };
         let w_rows = tall(&trace, legs.iter().map(|l| l.0).collect());
         let s_rows = tall(&trace, legs.iter().filter_map(|l| l.1).collect());
+        // A weight value several sites read is retyped once, at the first.
         for (v, rows) in [(Some(legs[0].0), w_rows), (legs[0].1, s_rows)] {
             if let Some(v) = v
+                && retyped.insert(v)
                 && let Ty::Tensor { shape, .. } = &mut trace.values[v.0 as usize].ty
             {
                 shape[axis] = Dim::Const(rows);
