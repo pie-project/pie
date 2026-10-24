@@ -14,6 +14,11 @@
 //! the apart row than the defaults' apart row is, and its top token one
 //! that tuning's reach could also pick.
 //!
+//! A mega-MoE the kernel declines loses nothing: its row fires what the row
+//! with the mega rule off fires, op for op, and answers it to the bit (GLM's
+//! 1408-wide experts, a decode's few routes, Qwen3.5's gated shared expert
+//! under the micro's narrow banks).
+//!
 //! The fusions are turned off as a user turns them off, by a `[fuse]` file
 //! in the profile directory the load resolves; the walk is eager
 //! (`engine.graphs = "off"`) so each fire's count is that fire's alone.
@@ -30,15 +35,17 @@ const CEILING: u32 = 256;
 const PAGE: u32 = 16;
 
 /// Routed rows of bf16 planes: Qwen3-MoE's softmax router, GLM-4.5-Air's
-/// biased sigmoid and DeepSeek-V4's biased sqrt-softplus (its hashed layers
-/// routed apart), each MLP of dense banks a mega-MoE; and whether the
-/// mega-MoE kernel takes the row's experts. GLM-4.5-Air's are 1408 wide,
-/// not the multiple of 256 its GLU tiles need, so each of its fires runs as
-/// its legs.
-const ROWS: [(&str, bool); 3] = [
+/// biased sigmoid, DeepSeek-V4's biased sqrt-softplus (its hashed layers
+/// routed apart) and Qwen3.5's softmax under a gated shared expert, each MLP
+/// of dense banks a mega-MoE; and whether the mega-MoE kernel takes the
+/// row's experts. GLM-4.5-Air's are 1408 wide, not the multiple of 256 its
+/// GLU tiles need, and the Qwen3.5 micro's 512-wide rows are under the
+/// kernel's 1024-column chunk, so each of their fires is declined.
+const ROWS: [(&str, bool); 4] = [
     ("qwen3-30b-a3b-mini-bf16-kv-bf16", true),
     ("glm45-air-mini-bf16-kv-bf16", false),
     ("dsv4-flash-mini-bf16-kv-bf16", true),
+    ("qwen3-a3b-micro-bf16-kv-bf16", false),
 ];
 
 /// The row whose fused router is its pair's to the bit, and whose mega-MoE
@@ -48,6 +55,23 @@ const CHAOTIC: &str = "dsv4-flash-mini-bf16-kv-bf16";
 /// The share of the flags-off logits' spread a fused leg may move a logit:
 /// the kernels' own bf16 bound, carried through the row.
 const SPREAD_SHARE: f32 = 0.01;
+
+/// Each op's fires over one fire.
+type Fires = std::collections::BTreeMap<&'static str, u64>;
+
+/// What one load answers: its logits, the fires each op counted over its one
+/// fire, and that fire's time.
+struct Answer {
+    logits: Vec<f32>,
+    fires: Fires,
+    took: std::time::Duration,
+}
+
+impl Answer {
+    fn fired(&self, op: &str) -> u64 {
+        self.fires.get(op).copied().unwrap_or(0)
+    }
+}
 
 /// The ops whose fires the fused kernels count under.
 const GATE: &str = "linear.moe_gate";
@@ -165,9 +189,8 @@ enum Tuning {
     Defaults,
 }
 
-/// The logits of `prompt` under `trace` and `tuning` (a chip profile read
-/// through a user file in `profiles`), and the fires each fused op counted
-/// over that one fire.
+/// What `prompt` answers under `trace` and `tuning` (a chip profile read
+/// through a user file in `profiles`).
 fn logits(
     trace: &Trace,
     container: &Path,
@@ -175,7 +198,7 @@ fn logits(
     device: &str,
     tuning: Tuning,
     prompt: &[u32],
-) -> (Vec<f32>, u64, u64) {
+) -> Answer {
     let knobs = match tuning {
         Tuning::Chip(flags) => {
             let user = engine_cuda::chip::SHELF.user_path(profiles, device);
@@ -233,10 +256,8 @@ fn logits(
     let mut shell = staged.finish().expect("the row arms");
     shell.open(0).unwrap();
     let word = trace.facts.word(&Request::new(prompt.len() as u32, false));
-    let (gate, mega) = (
-        kernels_cuda::jit::fires(GATE),
-        kernels_cuda::jit::fires(MEGA),
-    );
+    let before = kernels_cuda::jit::fire_counts();
+    let began = std::time::Instant::now();
     let mut out = shell
         .fire(&[Lane {
             slot: 0,
@@ -244,11 +265,17 @@ fn logits(
             tokens: prompt,
         }])
         .unwrap();
-    (
-        out.remove(0),
-        kernels_cuda::jit::fires(GATE) - gate,
-        kernels_cuda::jit::fires(MEGA) - mega,
-    )
+    let took = began.elapsed();
+    let fires = kernels_cuda::jit::fire_counts()
+        .into_iter()
+        .map(|(op, n)| (op, n - before.get(op).copied().unwrap_or(0)))
+        .filter(|(_, n)| *n > 0)
+        .collect();
+    Answer {
+        logits: out.remove(0),
+        fires,
+        took,
+    }
 }
 
 /// The largest |a - b|.
@@ -285,8 +312,17 @@ fn top(logits: &[f32]) -> usize {
 }
 
 fn check(name: &str, mega_takes: bool, device: &str) {
-    let row =
-        poem_compiler::catalog::deployment(name).unwrap_or_else(|| panic!("`{name}` is listed"));
+    // The micro is served from its fixture's own spelling, not the list.
+    let spelled;
+    let row = match poem_compiler::catalog::deployment(name) {
+        Some(row) => row,
+        None => {
+            spelled = poem_compiler::catalog::repository()
+                .parse(name)
+                .unwrap_or_else(|| panic!("`{name}` spells a deployment"));
+            &spelled
+        }
+    };
     let trace = row.trace(Platform::Cuda);
     let fused = poem_compiler::fuse::fuse(trace.clone(), engine_cuda::FUSIONS.iter());
     let formed = |which: fn(&Fused) -> bool| {
@@ -322,12 +358,20 @@ fn check(name: &str, mega_takes: bool, device: &str) {
     for count in [1u32, 41, 200] {
         let prompt: Vec<u32> = (0..count).map(|t| (t * 7 + 11) % vocab.min(4096)).collect();
         let run = |tuning| logits(&trace, &container, &profiles, device, tuning, &prompt);
-        let (apart, gate, mega) = run(Tuning::Chip(OFF));
+        // A shape's first load times its tactics (each trial a fire), so the
+        // rows a declined mega-MoE is held to are each a second load's.
+        let warm = |tuning| {
+            run(tuning);
+            run(tuning)
+        };
+        let off = warm(Tuning::Chip(OFF));
         assert_eq!(
-            (gate, mega),
+            (off.fired(GATE), off.fired(MEGA)),
             (0, 0),
             "{name} over {count} rows: the fusions off fire neither"
         );
+        let apart_row = off.logits.clone();
+        let apart = &apart_row;
         let spread = apart.iter().copied().fold(f32::NEG_INFINITY, f32::max)
             - apart.iter().copied().fold(f32::INFINITY, f32::min);
         assert!(
@@ -336,7 +380,10 @@ fn check(name: &str, mega_takes: bool, device: &str) {
         );
         // The apart row's own reach under another tuning, where a mega-MoE
         // is held to it.
-        let retuned = (name == CHAOTIC && count > 1).then(|| run(Tuning::Defaults).0);
+        let retuned = (name == CHAOTIC && count > 1).then(|| run(Tuning::Defaults).logits);
+        // The row with the mega rule off, under each router flag: what a
+        // declined mega-MoE answers.
+        let mut unmega = vec![(false, off)];
         for flags in [
             Flags {
                 router: true,
@@ -351,7 +398,12 @@ fn check(name: &str, mega_takes: bool, device: &str) {
                 mega: true,
             },
         ] {
-            let (got, gate, mega) = run(Tuning::Chip(flags));
+            let answer = if flags.mega {
+                run(Tuning::Chip(flags))
+            } else {
+                warm(Tuning::Chip(flags))
+            };
+            let (got, gate, mega) = (&answer.logits, answer.fired(GATE), answer.fired(MEGA));
             let what = format!("{name} over {count} rows, {flags:?}");
             assert_eq!(
                 gate,
@@ -369,15 +421,36 @@ fn check(name: &str, mega_takes: bool, device: &str) {
                 got.iter().all(|v| v.is_finite()),
                 "{what}: a non-finite logit"
             );
-            let (far, rms) = (worst(&got, &apart), relative_rms(&got, &apart));
+            let (far, rms) = (worst(got, apart), relative_rms(got, apart));
             eprintln!(
-                "{what}: {gate} gate and {mega} mega fires; max |d| {far} of spread {spread}, \
-                 RMS {rms:.4} of the logits' deviation"
+                "{what}: {gate} gate and {mega} mega fires in {:?}; max |d| {far} of spread \
+                 {spread}, RMS {rms:.4} of the logits' deviation",
+                answer.took
             );
+            if flags.mega && !takes {
+                let (_, without) = unmega
+                    .iter()
+                    .find(|(router, _)| *router == flags.router)
+                    .expect("the row without the mega rule ran first");
+                eprintln!(
+                    "{what}: declined in {:?}, the rule off in {:?}",
+                    answer.took, without.took
+                );
+                assert_eq!(
+                    answer.fires, without.fires,
+                    "{what}: a declined mega-MoE fires what the row without the rule fires"
+                );
+                assert!(
+                    got.iter()
+                        .zip(&without.logits)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "{what}: a declined mega-MoE answers the row without the rule to the bit"
+                );
+            }
             if name == CHAOTIC && !flags.mega {
                 assert!(
                     got.iter()
-                        .zip(&apart)
+                        .zip(apart)
                         .all(|(a, b)| a.to_bits() == b.to_bits()),
                     "{what}: the fused sqrt-softplus router answers its pair to the bit"
                 );
@@ -385,7 +458,7 @@ fn check(name: &str, mega_takes: bool, device: &str) {
             match &retuned {
                 Some(retuned) if takes => {
                     let (reach, reach_rms) =
-                        (worst(retuned, &apart), relative_rms(retuned, &apart));
+                        (worst(retuned, apart), relative_rms(retuned, apart));
                     eprintln!(
                         "{what}: the defaults' apart row is {reach} away, RMS {reach_rms:.4}"
                     );
@@ -393,7 +466,7 @@ fn check(name: &str, mega_takes: bool, device: &str) {
                         rms <= reach_rms,
                         "{what}: RMS {rms} past the apart row's own {reach_rms} under the defaults"
                     );
-                    let (want, picked) = (top(&apart), top(&got));
+                    let (want, picked) = (top(apart), top(got));
                     assert!(
                         picked == want || apart[want] - apart[picked] <= reach,
                         "{what}: top token {picked} for {want}, {} below it, past a tie the \
@@ -407,8 +480,11 @@ fn check(name: &str, mega_takes: bool, device: &str) {
                         far <= bound,
                         "{what}: max |d| {far} past {bound} (1% of {spread})"
                     );
-                    assert_eq!(top(&got), top(&apart), "{what}: the top token moves");
+                    assert_eq!(top(got), top(apart), "{what}: the top token moves");
                 }
+            }
+            if !flags.mega {
+                unmega.push((flags.router, answer));
             }
         }
     }
