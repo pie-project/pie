@@ -12,6 +12,7 @@
 //! wanting it whole is all-reduced or all-gathered right after the op that
 //! made it.
 
+pub mod infer;
 mod rules;
 #[cfg(test)]
 mod tests;

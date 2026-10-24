@@ -696,53 +696,66 @@ impl<T: Arm> Switch<'_, T> {
 }
 
 fn restated(shard: &Shard, logical: &[u64], plane: &[u64], name: &str) -> Shard {
+    restate(shard, logical, plane).unwrap_or_else(|why| panic!("`{name}`: {why}"))
+}
+
+/// The cut `shard` of a weight `logical` wide states of one of its planes,
+/// stored `plane` wide: the same axis, its segments in the plane's blocks.
+pub fn restate(shard: &Shard, logical: &[u64], plane: &[u64]) -> Result<Shard, String> {
     let Shard::Cut {
         axis,
         segments,
         heads,
     } = shard
     else {
-        return Shard::Replicated;
+        return Ok(Shard::Replicated);
     };
     let at = *axis as usize;
-    let whole = logical[at];
+    let whole = *logical
+        .get(at)
+        .ok_or_else(|| format!("a cut names axis {at} of {logical:?}"))?;
     // A plane that stops short of the cut axis (an nvfp4 bank's per-row
     // and per-expert scales under a cut of its contracted axis) is held
     // whole by every rank.
     let Some(&stored) = plane.get(at) else {
-        return Shard::Replicated;
+        return Ok(Shard::Replicated);
     };
     // An axis before the cut is stored verbatim, or (a block-fp8
     // projection's block exponents) one a 128- or 32-wide block.
-    assert!(
-        logical[..at]
-            .iter()
-            .zip(&plane[..at])
-            .all(|(l, p)| p == l || *p == l.div_ceil(128) || *p == l.div_ceil(32)),
-        "`{name}`: the axes before its cut, {:?}, are stored {:?}",
-        &logical[..at],
-        &plane[..at],
-    );
-    assert!(
-        stored > 0 && whole.is_multiple_of(stored),
-        "`{name}`: axis {at} is {whole} logically and {stored} as stored",
-    );
-    let block = whole / stored;
-    Shard::Cut {
-        axis: *axis,
-        segments: segments
-            .iter()
-            .map(|s| {
-                assert!(
-                    s.is_multiple_of(block),
-                    "`{name}`: a segment of {s} is not a whole number of \
-                     {block}-wide blocks",
-                );
-                s / block
-            })
-            .collect(),
-        heads: heads.clone(),
+    if !logical[..at]
+        .iter()
+        .zip(&plane[..at])
+        .all(|(l, p)| p == l || *p == l.div_ceil(128) || *p == l.div_ceil(32))
+    {
+        return Err(format!(
+            "the axes before its cut, {:?}, are stored {:?}",
+            &logical[..at],
+            &plane[..at],
+        ));
     }
+    if stored == 0 || !whole.is_multiple_of(stored) {
+        return Err(format!(
+            "axis {at} is {whole} logically and {stored} as stored"
+        ));
+    }
+    let block = whole / stored;
+    let segments = segments
+        .iter()
+        .map(|s| {
+            if s.is_multiple_of(block) {
+                Ok(s / block)
+            } else {
+                Err(format!(
+                    "a segment of {s} is not a whole number of {block}-wide blocks"
+                ))
+            }
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(Shard::Cut {
+        axis: *axis,
+        segments,
+        heads: heads.clone(),
+    })
 }
 
 /// Whether two values' rows are one set of rows, written alike or not.
