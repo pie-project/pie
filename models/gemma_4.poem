@@ -13,6 +13,15 @@ GEMMA = template("gemma")
 GEMMA_THOUGHT = template("gemma", thinking = True)
 TOKENIZER = tokenizer(markers = [["<turn|>", "<eos>"]], parts = {"vision": [["<|image>", "<|image|>", "<image|>"]]})
 
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: q, k and v by their heads, the gates and ups, dense and routed, by
+# their channels, the output and down projections by their rows, the tied
+# table by its vocabulary. The vision tower, the self-conditioned table and
+# the MTP assistant's q, table and down projection it holds whole, as the
+# package always has, so the assistant's gate and up are gathered for its
+# down.
+CUTS = "inferred"
+
 MODELS = [
     model("gemma4-26b-a4b", template = GEMMA_THOUGHT, tokenizer = TOKENIZER, parts = ["vision"], drafters = ["mtp", "dflash"], arch = "gemma4", layers = 30, vocab = 262144),
     model("gemma4-31b", template = GEMMA_THOUGHT, tokenizer = TOKENIZER, parts = ["vision"], drafters = ["mtp"], arch = "gemma4", layers = 60, vocab = 262144),
@@ -241,13 +250,13 @@ def layout(id, deploy):
         kv_w = row_heads * head_dim
         iw = d.inter * 2 if d.wide_tail and shared_at(l) else d.inter
         if shared_at(l):
-            attn_banks = struct(shared = True, q_proj = weight([q_w, hidden], proj).columns())
+            attn_banks = struct(shared = True, q_proj = weight([q_w, hidden], proj))
         else:
             attn_banks = struct(
                 shared = False,
-                q = weight([q_w, hidden], proj).columns(heads = d.q_heads),
-                k = weight([kv_w, hidden], proj).columns(heads = row_heads),
-                v = weight([kv_w, hidden], proj).columns(heads = row_heads),
+                q = weight([q_w, hidden], proj),
+                k = weight([kv_w, hidden], proj),
+                v = weight([kv_w, hidden], proj),
                 k_norm = norm("k_norm", head_dim),
                 k_norm_eps = d.norm_eps,
             )
@@ -258,15 +267,15 @@ def layout(id, deploy):
                 router_norm = norm("router_norm", hidden),
                 router_norm_eps = d.norm_eps,
                 router = weight([d.moe.experts, hidden], gate),
-                per_expert_scale = weight([d.moe.experts]).columns(),
+                per_expert_scale = weight([d.moe.experts]),
                 pre_ffw_norm_2 = norm("pre_ffw_norm_2", hidden),
                 pre_ffw_norm_2_eps = d.norm_eps,
                 post_ffw_norm_1 = norm("post_ffw_norm_1", hidden),
                 post_ffw_norm_1_eps = d.norm_eps,
                 post_ffw_norm_2 = norm("post_ffw_norm_2", hidden),
                 post_ffw_norm_2_eps = d.norm_eps,
-                gate_up = weight([d.moe.experts, 2 * mi, hidden], xw).bank([mi, mi]),
-                down = weight([d.moe.experts, hidden, mi], xw).rows(),
+                gate_up = weight([d.moe.experts, 2 * mi, hidden], xw),
+                down = weight([d.moe.experts, hidden, mi], xw),
                 experts = d.moe.experts,
                 top_k = d.moe.top_k,
                 inter = mi,
@@ -280,7 +289,7 @@ def layout(id, deploy):
                 banks = attn_banks,
                 reading = reading,
             ),
-            o_proj = weight([hidden, q_w], proj).rows(),
+            o_proj = weight([hidden, q_w], proj),
             attn_norm = norm("attn_norm", hidden),
             attn_norm_eps = d.norm_eps,
             post_attn_norm = norm("post_attn_norm", hidden),
@@ -289,10 +298,10 @@ def layout(id, deploy):
             pre_ffw_norm_eps = d.norm_eps,
             post_ffw_norm = norm("post_ffw_norm", hidden),
             post_ffw_norm_eps = d.norm_eps,
-            gate = weight([iw, hidden], mlp_at).columns(),
-            up = weight([iw, hidden], mlp_at).columns(),
+            gate = weight([iw, hidden], mlp_at),
+            up = weight([iw, hidden], mlp_at),
             inter = iw,
-            down = weight([hidden, iw], mlp_at).rows(),
+            down = weight([hidden, iw], mlp_at),
             scalar = weight([1]) if d.ple_dim == None else None,
             lora_a = lora_a,
             lora_b = lora_b,
@@ -305,7 +314,7 @@ def layout(id, deploy):
         th = t.hidden
         ti = t.inter
         head_dim = t.hidden // t.heads
-        bank = lambda s, dims: weight(dims)
+        bank = lambda s, dims: weight(dims).replicated()
         vec1 = lambda s, length: weight([length])
 
         def clip(s, dims):
@@ -378,19 +387,19 @@ def layout(id, deploy):
                 kv = "kv.mtp",
                 banks = struct(
                     shared = False,
-                    q = weight([q_w, hidden], w).columns(heads = d.q_heads),
-                    k = weight([kv_w, hidden], w).columns(heads = glob.kv_heads),
-                    v = weight([kv_w, hidden], w).columns(heads = glob.kv_heads),
+                    q = weight([q_w, hidden], w),
+                    k = weight([kv_w, hidden], w),
+                    v = weight([kv_w, hidden], w),
                     k_norm = anorm("k_norm", hd),
                     k_norm_eps = d.norm_eps,
                 ),
                 reading = GLOBAL,
             ),
-            o_proj = weight([hidden, q_w], w).rows(),
-            gate = weight([iw, hidden], w).columns(),
-            up = weight([iw, hidden], w).columns(),
+            o_proj = weight([hidden, q_w], w),
+            gate = weight([iw, hidden], w),
+            up = weight([iw, hidden], w),
             inter = iw,
-            down = weight([hidden, iw], w).rows(),
+            down = weight([hidden, iw], w),
             norm_eps = d.norm_eps,
         )
 
@@ -416,7 +425,7 @@ def layout(id, deploy):
                     q_norm = norm("q_norm", hd),
                     q_norm_eps = d.norm_eps,
                     kv = "kv.{}".format(last(reading == GLOBAL)),
-                    banks = struct(shared = True, q_proj = weight([q_w, ah], w)),
+                    banks = struct(shared = True, q_proj = weight([q_w, ah], w).replicated()),
                     reading = reading,
                 ),
                 o_proj = weight([ah, q_w], w),
@@ -424,10 +433,10 @@ def layout(id, deploy):
                 post_attn_norm = norm("post_attn_norm", ah),
                 pre_ffw_norm = norm("pre_ffw_norm", ah),
                 post_ffw_norm = norm("post_ffw_norm", ah),
-                gate = weight([iw, ah], w).columns(),
-                up = weight([iw, ah], w).columns(),
+                gate = weight([iw, ah], w),
+                up = weight([iw, ah], w),
                 inter = iw,
-                down = weight([ah, iw], w),
+                down = weight([ah, iw], w).replicated(),
                 scalar = norm("scalar", 1),
             )
 
@@ -435,15 +444,15 @@ def layout(id, deploy):
             pre_embed = weight([ah, hidden], w),
             pre_hidden = weight([ah, hidden], w),
             post = weight([hidden, ah], w),
-            embed = weight([d.vocab, ah], w),
+            embed = weight([d.vocab, ah], w).replicated(),
             norm = weight([ah]),
             norm_eps = d.norm_eps,
             layers = [assistant_layer(l, r) for l, r in enumerate(ASSISTANT_READINGS)],
         )
 
     embed = weight([d.vocab, hidden], dense if self_cond else w)
-    if not self_cond:
-        embed = embed.packed([d.vocab])
+    if self_cond:
+        embed = embed.replicated()
 
     ple = None
     if d.ple_dim != None:
@@ -470,10 +479,10 @@ def layout(id, deploy):
             taps = SELF_COND_TAPS,
             pre_norm = weight([hidden]),
             norm_eps = d.norm_eps,
-            gate = weight([iw, hidden], sw).columns(),
-            up = weight([iw, hidden], sw).columns(),
+            gate = weight([iw, hidden], sw),
+            up = weight([iw, hidden], sw),
             inter = iw,
-            down = weight([hidden, iw], sw).rows(),
+            down = weight([hidden, iw], sw),
         )
 
     return struct(

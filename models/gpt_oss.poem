@@ -7,6 +7,12 @@ load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap
 HARMONY = template("harmony")
 TOKENIZER = tokenizer(markers = [["<|endoftext|>", "<|return|>", "<|call|>"]])
 
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: q, k, v, their biases and the sinks by their heads, each expert's
+# gate and up and their biases by its channels, the output and down
+# projections by their rows, the head by its vocabulary.
+CUTS = "inferred"
+
 MODELS = [
     model("gptoss-20b", template = HARMONY, tokenizer = TOKENIZER, drafters = ["dflash"], arch = "gptoss", layers = 24, vocab = 201088),
     model("gptoss-20b-mini", mini = True, template = HARMONY, tokenizer = TOKENIZER, arch = "gptoss", layers = 5, vocab = 201088),
@@ -113,15 +119,15 @@ def layout(id, deploy):
         return struct(
             attn = struct(
                 reading = WINDOWED if l % 2 == 0 else FULL,
-                q = weight([q_w, hidden], weights).columns(heads = d.q_heads),
-                k = weight([kv_w, hidden], weights).columns(heads = d.kv_heads),
-                v = weight([kv_w, hidden], weights).columns(heads = d.kv_heads),
-                q_bias = weight([q_w]).columns(heads = d.q_heads),
-                k_bias = weight([kv_w]).columns(heads = d.kv_heads),
-                v_bias = weight([kv_w]).columns(heads = d.kv_heads),
-                o_proj = weight([hidden, q_w], weights).rows(),
+                q = weight([q_w, hidden], weights),
+                k = weight([kv_w, hidden], weights),
+                v = weight([kv_w, hidden], weights),
+                q_bias = weight([q_w]),
+                k_bias = weight([kv_w]),
+                v_bias = weight([kv_w]),
+                o_proj = weight([hidden, q_w], weights),
                 o_bias = weight([hidden]),
-                sinks = weight([d.q_heads]).columns(),
+                sinks = weight([d.q_heads]),
                 kv = "kv.{}".format(l),
             ),
             attn_norm = norm("attn_norm", hidden),
@@ -136,16 +142,16 @@ def layout(id, deploy):
                 swiglu_alpha = d.swiglu_alpha,
                 router = weight([d.experts, hidden], router),
                 router_bias = weight([d.experts]),
-                gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
-                gate_up_bias = weight([d.experts, 2 * iw]).bank([iw, iw]),
-                down = weight([d.experts, hidden, iw], experts).rows(),
+                gate_up = weight([d.experts, 2 * iw, hidden], experts),
+                gate_up_bias = weight([d.experts, 2 * iw]),
+                down = weight([d.experts, hidden, iw], experts),
                 down_bias = weight([d.experts, hidden]),
             ),
             lora_a = lora_a,
             lora_b = lora_b,
         )
 
-    head = weight([d.vocab, hidden], weights).packed([d.vocab])
+    head = weight([d.vocab, hidden], weights)
     return struct(
         hidden = hidden,
         vocab = d.vocab,
