@@ -135,6 +135,60 @@ pub fn swiglu_clamp_split(
     )
 }
 
+/// [`swiglu_clamp_alpha`] over a gate and an up plane held apart.
+pub fn swiglu_clamp_alpha_split(
+    ctx: &Ctx<'_>,
+    gate: Tensor,
+    up: Tensor,
+    limit: f32,
+    alpha: f32,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.glu";
+    let entry =
+        dtype_dispatch!(OP, gate.dtype, { Bf16 => "linear_glu_swiglu_clamp_alpha_split_bf16" });
+    let (lanes, n) = split_grid(OP, gate, up, y)?;
+    ctx.fire(
+        Fire::at(GLU, entry).apply(Grid::of(lanes, [GROUP, 1, 1])),
+        &[
+            gate.arg(),
+            up.arg(),
+            y.arg_mut(),
+            limit.arg(),
+            alpha.arg(),
+            n.arg(),
+        ],
+    )
+}
+
+/// [`situ`] over a gate and an up plane held apart.
+pub fn situ_split(
+    ctx: &Ctx<'_>,
+    gate: Tensor,
+    up: Tensor,
+    beta: f32,
+    up_cap: Option<f32>,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.glu";
+    if beta == 0.0 {
+        return Err(refuse(OP, "beta is zero, and the gate divides by it"));
+    }
+    let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "linear_glu_situ_split_bf16" });
+    let (lanes, n) = split_grid(OP, gate, up, y)?;
+    ctx.fire(
+        Fire::at(GLU, entry).apply(Grid::of(lanes, [GROUP, 1, 1])),
+        &[
+            gate.arg(),
+            up.arg(),
+            y.arg_mut(),
+            beta.arg(),
+            up_cap.unwrap_or(0.0).arg(),
+            n.arg(),
+        ],
+    )
+}
+
 pub fn geglu_tanh(ctx: &Ctx<'_>, gate: Tensor, up: Tensor, y: Tensor) -> Result<(), Error> {
     const OP: &str = "linear.glu";
     let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "linear_glu_geglu_tanh_bf16" });

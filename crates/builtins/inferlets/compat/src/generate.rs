@@ -11,9 +11,17 @@
 //! sampled token's log-probability under the model's raw logits and the
 //! `top_logprobs` likeliest tokens', as vLLM's `raw_logprobs` reports them.
 //!
+//! Asked for prompt logprobs, the prefill reads out every prompt row but the
+//! last and scores row `i` against token `i + 1`: its logprob, its rank and
+//! the likeliest alternatives, in passes of at most the runtime's readout
+//! rows. A pass that reads out rows is not mapped in from the prefix cache,
+//! so the prompt is computed whole: the price of asking.
+//!
 //! With a grammar the loop is depth-1 — the mask for fire k+1 exists only
 //! once fire k's token has advanced the matcher — so constrained generation
-//! submits one fire at a time; unconstrained generation runs ahead.
+//! submits one fire at a time; unconstrained generation runs ahead. A
+//! grammar that holds only after a trigger ([`crate::trigger`]) is a
+//! guide too, so its free stretches go a fire at a time as well, unmasked.
 
 use std::ops::ControlFlow;
 
@@ -46,6 +54,10 @@ pub struct Sampling {
     /// Land each sampled token's logprob and this many likeliest
     /// alternatives' (`Some(0)`: the sampled token's alone).
     pub logprobs: Option<u32>,
+    /// Score every prompt token after the first under the rows before it,
+    /// with its rank and this many likeliest alternatives (vLLM's
+    /// `prompt_logprobs`); a text prompt only.
+    pub prompt_logprobs: Option<u32>,
 }
 
 /// The most alternatives a step reports, as OpenAI caps `top_logprobs`.
@@ -57,6 +69,45 @@ pub const MAX_TOP_LOGPROBS: u32 = 20;
 pub struct Logprob {
     pub logprob: f32,
     pub top: Vec<(u32, f32)>,
+    /// Where the token ranks among the vocabulary, 1 for the likeliest:
+    /// counted for prompt tokens, which were not sampled.
+    pub rank: Option<u32>,
+}
+
+/// What constrains generation fire by fire: a grammar's matcher, or a
+/// grammar that holds only part of the way ([`crate::trigger`]).
+pub trait Guide {
+    /// The tokens allowed next as a packed bitmask, empty for any.
+    fn mask(&mut self) -> Vec<u32>;
+    /// Advance past a sampled `token`.
+    fn accept(&mut self, token: u32) -> Result<()>;
+    /// The grammar ended the turn.
+    fn is_terminated(&self) -> bool;
+}
+
+impl Guide for Matcher {
+    fn mask(&mut self) -> Vec<u32> {
+        Matcher::mask(self)
+    }
+
+    fn accept(&mut self, token: u32) -> Result<()> {
+        self.accept_tokens(&[token])
+            .map_err(|e| format!("token {token} rejected: {e:?}"))
+    }
+
+    fn is_terminated(&self) -> bool {
+        Matcher::is_terminated(self)
+    }
+}
+
+/// What [`generate`] did: how many tokens it sampled, how many of the
+/// prompt's were mapped in from the prefix cache, and, where asked, the
+/// logprob of every prompt token after the first.
+#[derive(Clone, Debug, Default)]
+pub struct Generated {
+    pub sampled: usize,
+    pub cached: usize,
+    pub prompt_logprobs: Vec<Logprob>,
 }
 
 impl Default for Sampling {
@@ -72,6 +123,7 @@ impl Default for Sampling {
             repetition_penalty: 1.0,
             min_p: 0.0,
             logprobs: None,
+            prompt_logprobs: None,
         }
     }
 }
@@ -104,7 +156,10 @@ impl Sampling {
         if !(0.0..=1.0).contains(&self.min_p) {
             return Err("min_p must be in [0, 1]".into());
         }
-        if self.logprobs.is_some_and(|k| k > MAX_TOP_LOGPROBS) {
+        if [self.logprobs, self.prompt_logprobs]
+            .iter()
+            .any(|k| k.is_some_and(|k| k > MAX_TOP_LOGPROBS))
+        {
             return Err(format!(
                 "logprobs are at most {MAX_TOP_LOGPROBS} alternatives a token"
             ));
@@ -301,6 +356,7 @@ fn logprob_of(values: &[f32], ids: &[i32]) -> Logprob {
             .zip(values.iter().skip(1))
             .map(|(&id, &lp)| (id as u32, lp))
             .collect(),
+        rank: None,
     }
 }
 
@@ -347,34 +403,137 @@ async fn take_logprob(channels: Option<&(Channel, Option<Channel>)>) -> Result<O
     Ok(Some(logprob_of(&values, &ids)))
 }
 
+/// The prompt's own logprobs: rows `0..prompt.len() - 1` prefilled and read
+/// out, row `i` scored against token `i + 1` — its logprob under the raw
+/// logits, its rank, and the `top` likeliest tokens' — in passes of at most
+/// the runtime's readout rows. The last prompt token is left for the pass
+/// that samples after it.
+async fn score_prompt(
+    ws: &WorkingSet,
+    pipe: &Pipeline,
+    prompt: &[i32],
+    top: u32,
+    ends: &[u32],
+) -> Result<Vec<Logprob>> {
+    let vocab = model::output_vocab_size();
+    let rows = prompt.len().saturating_sub(1) as u32;
+    let mut scored = Vec::with_capacity(rows as usize);
+    for (at, &(base, end)) in readout_spans(rows, model::ReadoutKind::Logits)
+        .iter()
+        .enumerate()
+    {
+        let len = end - base;
+        let (base, end) = (base as usize, end as usize);
+        let toks = Channel::from(&prompt[base..end]).named(&format!("toks_s{at}"));
+        let embed_indptr = Channel::from([0u32, len]).named(&format!("embed_indptr_s{at}"));
+        let readout = Channel::from_iter(0..len).named(&format!("readout_s{at}"));
+        let targets = Channel::from(&prompt[base + 1..end + 1]).named(&format!("targets_s{at}"));
+        let chosen_out = Channel::new([len], dtype::f32).named(&format!("chosen_s{at}"));
+        let rank_out = Channel::new([len], dtype::f32).named(&format!("rank_s{at}"));
+        let top_out = (top > 0).then(|| {
+            (
+                Channel::new([len, top], dtype::f32).named(&format!("top_s{at}")),
+                Channel::new([len, top], dtype::i32).named(&format!("top_ids_s{at}")),
+            )
+        });
+
+        let fwd = ForwardPass::new();
+        fwd.embed(&toks, &embed_indptr)?;
+        fwd.state(&[ws], StateGeometry::folding())?;
+        fwd.readout(&readout)?;
+        fwd.epilogue(move || {
+            let lp = log_softmax(reshape(intrinsics::logits(), [len, vocab]));
+            let chosen = scalar_gather(&lp, targets.take());
+            // Rank 1 is the likeliest: one more than the tokens likelier.
+            let likelier = gt(&lp, broadcast(reshape(&chosen, [len, 1]), [len, vocab]));
+            rank_out.put(reduce_sum(cast(&likelier, dtype::f32)) + 1.0f32);
+            chosen_out.put(&chosen);
+            if let Some((values, ids)) = top_out {
+                let (top_values, top_ids) = top_k(&lp, top);
+                values.put(&top_values);
+                ids.put(cast(&top_ids, dtype::i32));
+            }
+        });
+        fwd.checkpoints(ends)?;
+        fwd.submit(pipe)
+            .with_context(|| format!("prompt scoring submit @{base}"))?;
+        let chosen = chosen_out.take_host::<Vec<f32>>().await?;
+        let ranks = rank_out.take_host::<Vec<f32>>().await?;
+        let (values, ids) = match top_out {
+            Some((values, ids)) => (
+                values.take_host::<Vec<f32>>().await?,
+                ids.take_host::<Vec<i32>>().await?,
+            ),
+            None => (Vec::new(), Vec::new()),
+        };
+        scored.extend(prompt_rows(&chosen, &ranks, &values, &ids, top as usize));
+    }
+    Ok(scored)
+}
+
+/// The host's read of a scoring pass: each row's chosen logprob and rank,
+/// and its `top` alternatives off the flat `[rows, top]` values and ids.
+fn prompt_rows(
+    chosen: &[f32],
+    ranks: &[f32],
+    values: &[f32],
+    ids: &[i32],
+    top: usize,
+) -> Vec<Logprob> {
+    chosen
+        .iter()
+        .zip(ranks)
+        .enumerate()
+        .map(|(row, (&logprob, &rank))| {
+            let span = row * top..(row + 1) * top;
+            Logprob {
+                logprob,
+                top: ids
+                    .get(span.clone())
+                    .unwrap_or_default()
+                    .iter()
+                    .zip(values.get(span).unwrap_or_default())
+                    .map(|(&id, &lp)| (id as u32, lp))
+                    .collect(),
+                rank: Some(rank as u32),
+            }
+        })
+        .collect()
+}
+
 /// Generate up to `max_tokens` after `prompt`; each picture's span is
 /// prefilled whole in a fire of its own. Every sampled token — the
 /// stop token included, if one comes — goes to `on_token`, which ends
-/// generation by returning `Break`; the return value is how many tokens
-/// were sampled, and how many of the prompt's were mapped in from the
-/// prefix cache.
+/// generation by returning `Break`. Where `sampling` asks for prompt
+/// logprobs, `on_prompt` has them ([`Generated::prompt_logprobs`]) before
+/// the first token comes.
 ///
-/// With a `matcher`, every fire's logits are masked to what the grammar
-/// allows next, and generation ends when the grammar terminates.
+/// With a `guide`, every fire's logits are masked to what it allows next,
+/// and generation ends when it terminates.
 pub async fn generate(
     prompt: &Prompt,
     sampling: Sampling,
     max_tokens: usize,
-    matcher: Option<&Matcher>,
+    mut guide: Option<&mut dyn Guide>,
+    on_prompt: &mut dyn FnMut(&[Logprob]),
     on_token: &mut dyn FnMut(u32, Option<Logprob>) -> ControlFlow<()>,
-) -> Result<(usize, usize)> {
+) -> Result<Generated> {
     sampling.validate()?;
     let images = &prompt.images;
     let ends = &prompt.ends;
     let prompt = &prompt.tokens[..];
     if max_tokens == 0 {
-        return Ok((0, 0));
+        return Ok(Generated::default());
+    }
+    if sampling.prompt_logprobs.is_some() && !images.is_empty() {
+        return Err("prompt logprobs score a text prompt; this one carries pictures".into());
     }
     if sampling.speculative
         && sampling.temperature == 0.0
         && !sampling.penalized()
-        && matcher.is_none()
+        && guide.is_none()
         && sampling.logprobs.is_none()
+        && sampling.prompt_logprobs.is_none()
         && !prompt.is_empty()
         && images.is_empty()
         // Beside other requests the run-ahead decode below batches with
@@ -384,10 +543,16 @@ pub async fn generate(
         && draft.proposals_from <= 1
         && (2..=16).contains(&draft.rows)
     {
-        return crate::speculative::generate(prompt, ends, max_tokens, draft, &mut |t| {
-            on_token(t, None)
-        })
-        .await;
+        let (sampled, cached) =
+            crate::speculative::generate(prompt, ends, max_tokens, draft, &mut |t| {
+                on_token(t, None)
+            })
+            .await?;
+        return Ok(Generated {
+            sampled,
+            cached,
+            prompt_logprobs: Vec::new(),
+        });
     }
     if model::pass_kind() == model::ForwardKind::Diffusion {
         return Err(
@@ -422,8 +587,18 @@ pub async fn generate(
         })
         .collect();
     let rope_delta: u32 = runs.iter().map(|r| r.2).sum();
+    let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
+    // Scored, every prompt row but the last is prefilled by the scoring
+    // passes, and only the last token is left to sample after.
+    let prompt_logprobs = match sampling.prompt_logprobs {
+        Some(top) => score_prompt(&ws, &pipe, &prompt_i32, top, ends).await?,
+        None => Vec::new(),
+    };
+    if sampling.prompt_logprobs.is_some() {
+        on_prompt(&prompt_logprobs);
+    }
     let mut spans = Vec::new();
-    let mut at = 0;
+    let mut at = prompt_logprobs.len() as u32;
     for &(start, end, _) in runs.iter().chain([(n, n, 0)].iter()) {
         if start > at {
             spans.push((at, start));
@@ -434,14 +609,13 @@ pub async fn generate(
         at = end;
     }
 
-    let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     // Unconstrained, the prompt's last fire samples its token straight into
     // the decode pass's channels, as each decode fire does for the next: the
     // decode fires queue behind the prompt with no turn through the host,
     // which reads the prompt's token once they are on their way. A grammar
     // advances on the host before the next mask exists, so it waits; so do
     // logprobs, which the host reads beside each token.
-    let carried_on = (matcher.is_none() && sampling.logprobs.is_none()).then(|| {
+    let carried_on = (guide.is_none() && sampling.logprobs.is_none()).then(|| {
         (
             Channel::new([1], dtype::i32).named("tok_in").queued(),
             penalized.then(|| {
@@ -472,7 +646,9 @@ pub async fn generate(
                 Channel::from(present.clone()).named("present_p"),
             )
         });
-        let mask = matcher.map(|_| Channel::new([vocab], dtype::bool).named("mask_p"));
+        let mask = guide
+            .is_some()
+            .then(|| Channel::new([vocab], dtype::bool).named("mask_p"));
         let g0_ch = Channel::new([1], dtype::i32).named("g0");
         // Only the last span's token is sampled for the answer, so only it
         // lands logprobs.
@@ -517,8 +693,8 @@ pub async fn generate(
                 }
             }
         });
-        if let (Some(m), Some(matcher)) = (mask, matcher) {
-            m.put(unpack_mask(&matcher.mask(), vocab));
+        if let (Some(m), Some(guide)) = (mask, guide.as_deref_mut()) {
+            m.put(unpack_mask(&guide.mask(), vocab));
         }
         // Checkpoints only where messages end: each costs a state slot.
         fwd.checkpoints(ends)?;
@@ -544,17 +720,19 @@ pub async fn generate(
     let mut sampled = 0usize;
     if carried_on.is_none() {
         sampled = 1;
-        if let Some(matcher) = matcher {
-            matcher
-                .accept_tokens(&[g0 as u32])
-                .context("advance grammar")?;
+        if let Some(guide) = guide.as_deref_mut() {
+            guide.accept(g0 as u32).context("advance grammar")?;
         }
         if on_token(g0 as u32, lp0).is_break()
             || max_tokens == 1
-            || matcher.is_some_and(|m| m.is_terminated())
+            || guide.as_deref().is_some_and(|g| g.is_terminated())
         {
             pipe.close();
-            return Ok((sampled, cached as usize));
+            return Ok(Generated {
+                sampled,
+                cached: cached as usize,
+                prompt_logprobs,
+            });
         }
     }
 
@@ -589,7 +767,9 @@ pub async fn generate(
             )
         })
     });
-    let mask = matcher.map(|_| Channel::new([vocab], dtype::bool).named("mask"));
+    let mask = guide
+        .is_some()
+        .then(|| Channel::new([vocab], dtype::bool).named("mask"));
 
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;
@@ -632,19 +812,19 @@ pub async fn generate(
     });
 
     let budget = max_tokens - 1;
-    match (matcher, mask) {
-        (Some(matcher), Some(mask)) => {
+    match (guide, mask) {
+        (Some(guide), Some(mask)) => {
             let mut fired = 0usize;
             while fired < budget {
-                mask.put(unpack_mask(&matcher.mask(), vocab));
+                mask.put(unpack_mask(&guide.mask(), vocab));
                 fwd.submit(&pipe).context("constrained decode submit")?;
                 fired += 1;
                 let t = out.take_host::<Vec<i32>>().await?;
                 let token = *t.first().unwrap_or(&0) as u32;
                 let lp = take_logprob(lp_ch.as_ref()).await?;
                 sampled += 1;
-                matcher.accept_tokens(&[token]).context("advance grammar")?;
-                if on_token(token, lp).is_break() || matcher.is_terminated() {
+                guide.accept(token).context("advance grammar")?;
+                if on_token(token, lp).is_break() || guide.is_terminated() {
                     break;
                 }
             }
@@ -682,5 +862,56 @@ pub async fn generate(
         }
     }
     pipe.close();
-    Ok((sampled, cached as usize))
+    Ok(Generated {
+        sampled,
+        cached: cached as usize,
+        prompt_logprobs,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_scored_row_reads_its_own_slice_of_the_flat_alternatives() {
+        let rows = prompt_rows(
+            &[-0.5, -2.0],
+            &[1.0, 7.0],
+            &[-0.5, -1.0, -0.1, -0.3],
+            &[4, 9, 2, 3],
+            2,
+        );
+        assert_eq!(
+            rows,
+            vec![
+                Logprob {
+                    logprob: -0.5,
+                    top: vec![(4, -0.5), (9, -1.0)],
+                    rank: Some(1),
+                },
+                Logprob {
+                    logprob: -2.0,
+                    top: vec![(2, -0.1), (3, -0.3)],
+                    rank: Some(7),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_row_scored_with_no_alternatives_has_none() {
+        let rows = prompt_rows(&[-1.0], &[3.0], &[], &[], 0);
+        assert_eq!(rows[0].top, Vec::new());
+        assert_eq!(rows[0].rank, Some(3));
+    }
+
+    #[test]
+    fn prompt_logprobs_past_the_cap_are_refused() {
+        let sampling = Sampling {
+            prompt_logprobs: Some(MAX_TOP_LOGPROBS + 1),
+            ..Sampling::default()
+        };
+        assert!(sampling.validate().is_err());
+    }
 }

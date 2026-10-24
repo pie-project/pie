@@ -372,10 +372,12 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
+            // An unclamped unit clamps at the largest finite f32, which keeps
+            // every finite value.
             Linear::Glu {
                 packed: Some(packed),
                 intermediate,
-                limit: Some(limit),
+                limit,
                 y,
                 gate: None,
                 weights: None,
@@ -388,7 +390,7 @@ impl Run<'_> {
                     self.tensor(*packed),
                     *intermediate,
                     fan,
-                    *limit,
+                    limit.unwrap_or(f32::MAX),
                     *alpha,
                     &mut self.tensor(*y),
                 )
@@ -397,7 +399,7 @@ impl Run<'_> {
                 gate: Some(gate),
                 up: Some(up),
                 weights: Some(weights),
-                limit: Some(limit),
+                limit,
                 y,
                 packed: None,
                 act: poem_ir::GluAct::Swiglu,
@@ -410,7 +412,7 @@ impl Run<'_> {
                     self.tensor(*up),
                     self.tensor(*weights),
                     fan,
-                    *limit,
+                    limit.unwrap_or(f32::MAX),
                     &mut self.tensor(*y),
                 )
             }
@@ -418,7 +420,7 @@ impl Run<'_> {
                 packed: Some(packed),
                 intermediate,
                 weights: Some(weights),
-                limit: Some(limit),
+                limit,
                 y,
                 gate: None,
                 act: poem_ir::GluAct::Swiglu,
@@ -431,7 +433,7 @@ impl Run<'_> {
                     *intermediate,
                     self.tensor(*weights),
                     fan,
-                    *limit,
+                    limit.unwrap_or(f32::MAX),
                     &mut self.tensor(*y),
                 )
             }
@@ -498,10 +500,12 @@ impl Run<'_> {
                     poem_ir::ActQuant::Nvfp4 => Err(nvfp4_activations(OP)),
                 }
             }
+            // Legs the pack left apart: the packed forms over a gate and an
+            // up plane, an unclamped SwiGLU clamped at the largest finite f32.
             Linear::Glu {
                 gate: Some(gate),
                 up: Some(up),
-                limit: Some(limit),
+                limit,
                 y,
                 packed: None,
                 weights: None,
@@ -511,9 +515,51 @@ impl Run<'_> {
                 self.ctx(),
                 self.tensor(*gate),
                 self.tensor(*up),
-                *limit,
+                limit.unwrap_or(f32::MAX),
                 &mut self.tensor(*y),
             ),
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                limit,
+                y,
+                packed: None,
+                weights: None,
+                act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
+                ..
+            } => {
+                let fan = self.plane_fan(*y);
+                linear::glu::swiglu_clamp_alpha_split(
+                    self.ctx(),
+                    self.tensor(*gate),
+                    self.tensor(*up),
+                    fan,
+                    limit.unwrap_or(f32::MAX),
+                    *alpha,
+                    &mut self.tensor(*y),
+                )
+            }
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                y,
+                packed: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Situ { beta, up_cap, .. },
+                ..
+            } => {
+                let fan = self.plane_fan(*y);
+                linear::glu::situ_split(
+                    self.ctx(),
+                    self.tensor(*gate),
+                    self.tensor(*up),
+                    fan,
+                    *beta,
+                    *up_cap,
+                    &mut self.tensor(*y),
+                )
+            }
             Linear::Glu {
                 gate: Some(gate),
                 up: Some(up),

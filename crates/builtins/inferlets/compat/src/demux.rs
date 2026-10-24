@@ -32,6 +32,10 @@ pub enum Event {
     /// The logprobs of tokens just sampled, ahead of whatever text they
     /// make (streamed requests that ask for logprobs only).
     Logprobs(Vec<(u32, crate::generate::Logprob)>),
+    /// Every prompt token with its logprob (`None` for the first), once,
+    /// ahead of the first sampled token (streamed requests that ask for
+    /// prompt logprobs only).
+    PromptLogprobs(Vec<(u32, Option<crate::generate::Logprob>)>),
 }
 
 pub(crate) struct Demux {

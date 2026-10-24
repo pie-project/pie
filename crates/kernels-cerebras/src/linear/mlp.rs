@@ -79,6 +79,63 @@ pub fn swiglu(ctx: &Ctx<'_>, packed: Tensor, intermediate: u32, y: Tensor) -> Re
     })
 }
 
+/// [`swiglu`] over a gate and an up plane held apart, element for element.
+pub fn swiglu_split(ctx: &Ctx<'_>, gate: Tensor, up: Tensor, y: Tensor) -> Result<(), Error> {
+    const OP: &str = "linear.glu";
+    expect(OP, gate, &[Dtype::Bf16, Dtype::F32])?;
+    expect(OP, up, &[Dtype::Bf16, Dtype::F32])?;
+    expect(OP, y, &[Dtype::Bf16, Dtype::F32])?;
+    if (up.rows, up.width) != (gate.rows, gate.width) || y.width != gate.width || y.rows > gate.rows
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "gate is {}x{}, up is {}x{}, y is {}x{}",
+                gate.rows, gate.width, up.rows, up.width, y.rows, y.width
+            ),
+        ));
+    }
+    let (rg, cg) = if gate.rows == y.rows {
+        ctx.plan().tile(
+            OP,
+            Footprint {
+                rows: y.rows,
+                width: gate.width,
+                per_row: 3 * u64::from(gate.width),
+                per_col: 0,
+                whole: 0,
+                merge: 0,
+                unit: 1,
+            },
+        )?
+    } else {
+        (1, 1)
+    };
+    let pes = rg * cg;
+    let n = y.elements() / u64::from(pes);
+    ctx.emit(&mut |cx| {
+        let gb = cx.read(gate)?;
+        let ub = cx.read(up)?;
+        let yb = cx.write(y)?;
+        if pes > 1 {
+            cx.over(pes);
+            let tile = Shard::Tile {
+                rows: rg,
+                cols: cg,
+                segments: 1,
+            };
+            cx.shard(&gb, tile);
+            cx.shard(&ub, tile);
+            cx.shard(&yb, tile);
+        }
+        cx.call(
+            Kernel::SwigluSplit,
+            vec![Arg::Ptr(gb), Arg::Ptr(ub), Arg::Ptr(yb), Arg::Int(n as i64)],
+        );
+        Ok(())
+    })
+}
+
 /// `y = ½x(1 + tanh(√(2/π)(x + 0.044715x³)))`, element for element.
 pub fn gelu_tanh(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
     const OP: &str = "linear.gelu_tanh";

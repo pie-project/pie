@@ -234,6 +234,35 @@ __global__ void mlp_swiglu_clamp_alpha(const T* __restrict__ packed, T* __restri
     });
 }
 
+// mlp_swiglu_clamp_alpha over a gate and an up plane held apart.
+template <class T>
+__global__ void mlp_swiglu_clamp_alpha_split(const T* __restrict__ gate, const T* __restrict__ up,
+                                             T* __restrict__ y, i32 n, i32 width, float limit, float alpha,
+                                             i32 fan, const u32* __restrict__ win) {
+    const i32 i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const long long at = flat_at(i, width, fan, win);
+    if (at < 0) return;
+    const float g = fminf(to_f32(gate[at]), limit);
+    const float u = fminf(fmaxf(to_f32(up[at]), -limit), limit);
+    y[at] = from_f32<T>((u + 1.f) * (g / (1.f + expf(-alpha * g))));
+}
+
+// mlp_situ over a gate and an up plane held apart.
+template <class T>
+__global__ void mlp_situ_split(const T* __restrict__ gate, const T* __restrict__ up, T* __restrict__ y, i32 n,
+                               i32 width, float beta, float linear_beta, i32 fan, const u32* __restrict__ win) {
+    const i32 i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const long long at = flat_at(i, width, fan, win);
+    if (at < 0) return;
+    const float g = to_f32(gate[at]);
+    float u = to_f32(up[at]);
+    const float s = beta * tanhf(g / beta) / (1.f + __expf(-g));
+    if (linear_beta > 0.f) u = linear_beta * tanhf(u / linear_beta);
+    y[at] = from_f32<T>(s * u);
+}
+
 // ---------------------------------------------------------------- MoE --
 
 // y = routed + shared · sigmoid(gate[row · stride]): the shared expert
