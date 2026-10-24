@@ -278,8 +278,11 @@ impl Model {
                 self.id
             );
         }
-        if deploy.tp == 0 {
+        if deploy.tp == 0 || deploy.ep == 0 {
             anyhow::bail!("a deployment runs on at least one rank");
+        }
+        if deploy.tp > 1 && deploy.ep > 1 {
+            anyhow::bail!("a deployment splits its ranks by tensor or by expert, not both yet");
         }
         if deploy.weights.is_empty() {
             anyhow::bail!("a deployment of `{}` states no weight precision", self.id);
@@ -288,7 +291,7 @@ impl Model {
     }
 
     /// The name a deployment of this model is served under:
-    /// `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-yarn{f}][-tap.{key}][-tp{n}]`, its parts in
+    /// `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-yarn{f}][-tap.{key}][-tp{n}][-ep{n}]`, its parts in
     /// the order the model states them.
     #[must_use]
     pub fn name(&self, deploy: &Deploy) -> String {
@@ -315,6 +318,9 @@ impl Model {
         }
         if deploy.tp > 1 {
             name.push_str(&format!("-tp{}", deploy.tp));
+        }
+        if deploy.ep > 1 {
+            name.push_str(&format!("-ep{}", deploy.ep));
         }
         name
     }
@@ -360,10 +366,16 @@ impl Model {
             }
             None => None,
         };
-        let tp = match words.next() {
-            None => 1,
-            Some(word) => word.strip_prefix("tp")?.parse().ok().filter(|tp| *tp > 1)?,
+        let mut ranks = |prefix: &str| match words.peek().and_then(|w| w.strip_prefix(prefix)) {
+            Some(n) => {
+                let n = n.parse().ok().filter(|n| *n > 1)?;
+                words.next();
+                Some(n)
+            }
+            None => Some(1),
         };
+        let tp = ranks("tp")?;
+        let ep = ranks("ep")?;
         if words.next().is_some() || weights.is_empty() {
             return None;
         }
@@ -371,6 +383,7 @@ impl Model {
             weights,
             kv,
             tp,
+            ep,
             parts,
             drafter,
             yarn,
@@ -523,6 +536,7 @@ pub(crate) fn manifest(builder: &mut GlobalsBuilder) {
                 weights,
                 kv: kv.0,
                 tp: 1,
+                ep: 1,
                 parts: parts.items,
                 drafter: drafter.into_option(),
                 yarn: None,

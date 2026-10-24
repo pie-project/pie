@@ -95,6 +95,7 @@ pub fn reads(dir: &Path, id: &str, w: poem::Dtype, kvs: &[(&str, Kv)]) -> Vec<St
         weights: vec![w.into()],
         kv: poem::Dtype::Bf16,
         tp: 1,
+        ep: 1,
         parts: Vec::new(),
         drafter: None,
         yarn: None,

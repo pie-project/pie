@@ -48,7 +48,9 @@ impl Deployment {
             .package
             .trace(&self.model.id, &self.deploy, &self.name, platform)
             .map_err(|why| Refused(format!("{why:#}")))?;
-        crate::shard::shard(trace, self.deploy.tp).map_err(|why| Refused(why.to_string()))
+        let trace =
+            crate::shard::shard(trace, self.deploy.tp).map_err(|why| Refused(why.to_string()))?;
+        crate::expert::lower(trace, self.deploy.ep, 0).map_err(|why| Refused(why.to_string()))
     }
 
     /// [`Deployment::try_trace`], panicking: for a listed deployment, which builds.
@@ -480,6 +482,7 @@ pub fn one_rank(w: Dtype, kv: Dtype) -> Deploy {
         weights: vec![w.into()],
         kv,
         tp: 1,
+        ep: 1,
         parts: Vec::new(),
         drafter: None,
         yarn: None,

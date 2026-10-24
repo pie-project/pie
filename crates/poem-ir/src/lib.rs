@@ -27,8 +27,8 @@ pub use ops::{
 pub use poem_ir_macros::Op;
 pub use request::{Request, Stream};
 pub use trace::{
-    BlockDrafter, CacheRow, Node, Param, ParamLayout, ParamPlacement, ParamSource, Platform, Seam,
-    Shard, Trace,
+    BlockDrafter, CacheRow, ExpertSlots, Node, Param, ParamLayout, ParamPlacement, ParamSource,
+    Platform, Seam, Shard, Trace,
 };
 pub use value::{
     BIASES, Def, Dim, Dtype, GLOBAL_SCALES, GeomKind, INPUT_SCALES, PerAxis, RowAxis, RuntimeInput,

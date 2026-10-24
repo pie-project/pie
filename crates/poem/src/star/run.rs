@@ -67,6 +67,9 @@ pub struct Deploy {
     pub weights: Vec<Precision>,
     pub kv: Dtype,
     pub tp: u32,
+    /// The expert-parallel ranks a MoE layer's routed experts spread
+    /// over, each holding its own tokens (`-ep{n}` in its name).
+    pub ep: u32,
     pub parts: Vec<String>,
     pub drafter: Option<String>,
     /// The YaRN factor the deployment stretches the model's native context
@@ -88,6 +91,7 @@ impl Deploy {
             ("weights", heap.alloc(weights)),
             ("kv", heap.alloc(DtypeValue(self.kv))),
             ("tp", heap.alloc(self.tp)),
+            ("ep", heap.alloc(self.ep)),
             ("parts", heap.alloc(self.parts.clone())),
             (
                 "drafter",

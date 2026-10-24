@@ -116,6 +116,20 @@ pub struct Param {
     pub layout: ParamLayout,
     #[serde(default)]
     pub placement: ParamPlacement,
+    /// A routed bank an expert-parallel group spreads (axis 0, its
+    /// experts): each rank holds `slots` planes, which experts by its
+    /// engine's placement of MoE layer `layer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub experts: Option<ExpertSlots>,
+}
+
+/// How an expert-parallel group holds a routed bank ([`Param::experts`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpertSlots {
+    pub layer: u32,
+    pub ep: u32,
+    pub experts: u32,
+    pub slots: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

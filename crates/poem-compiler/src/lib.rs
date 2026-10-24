@@ -5,6 +5,7 @@ pub mod catalog;
 pub mod compiled;
 pub mod costs;
 pub mod error;
+pub mod expert;
 pub mod fuse;
 pub mod layout;
 pub mod lowering;

@@ -414,6 +414,7 @@ fn intern(
         source,
         layout,
         placement,
+        experts: None,
     });
     (p.params.len() - 1) as u32
 }
