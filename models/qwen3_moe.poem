@@ -67,8 +67,8 @@ DEPLOYMENTS = (
     rows("qwen3-coder-30b-a3b")
 )
 
-# The weights of Qwen 3 MoE: per layer an RMS norm, q, k and v packed into
-# one projection with per-head q and k norms, the output projection, an RMS
+# The weights of Qwen 3 MoE: per layer an RMS norm, the q, k and v
+# projections with per-head q and k norms, the output projection, an RMS
 # norm, the router and the routed experts' banks (gate and up packed); the
 # token embedding, a final norm and the head. The deployment's first dtype
 # stores the projections, its second (or the first) the expert banks; the
@@ -124,7 +124,9 @@ def layout(id, deploy):
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
             attn_norm = weight([hidden]),
-            qkv = weight([q_width + 2 * kv_width, hidden], proj).packed([q_width, kv_width, kv_width], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
+            q = weight([q_width, hidden], proj).columns(heads = d.q_heads),
+            k = weight([kv_width, hidden], proj).columns(heads = d.kv_heads),
+            v = weight([kv_width, hidden], proj).columns(heads = d.kv_heads),
             o = weight([hidden, q_width], proj).rows(),
             q_norm = weight([hd]),
             k_norm = weight([hd]),
@@ -193,11 +195,9 @@ TRANSFORMERS = [
     ("model.norm.weight", "final_norm"),
     ("lm_head.weight", "head"),
     ("model.layers.{l}.input_layernorm.weight", "layers.{l}.attn_norm"),
-    ([
-        "model.layers.{l}.self_attn.q_proj.weight",
-        "model.layers.{l}.self_attn.k_proj.weight",
-        "model.layers.{l}.self_attn.v_proj.weight",
-    ], "layers.{l}.qkv"),
+    ("model.layers.{l}.self_attn.q_proj.weight", "layers.{l}.q"),
+    ("model.layers.{l}.self_attn.k_proj.weight", "layers.{l}.k"),
+    ("model.layers.{l}.self_attn.v_proj.weight", "layers.{l}.v"),
     ("model.layers.{l}.self_attn.o_proj.weight", "layers.{l}.o"),
     ("model.layers.{l}.self_attn.q_norm.weight", "layers.{l}.q_norm"),
     ("model.layers.{l}.self_attn.k_norm.weight", "layers.{l}.k_norm"),
@@ -252,7 +252,7 @@ def moe(x, m, w):
 def attention(x, inputs, m, positions, w):
     pages = inputs.kv(w.kv)
     d = m.head_dim
-    q, k, v = ops.gather.split_qkv(ops.linear.matmul(x, w.qkv), m.q_width, m.kv_width)
+    q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
     seam.at(seam.ATTN_QV, [q, v])
     q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, d, m.eps)
     k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, d, m.eps)
