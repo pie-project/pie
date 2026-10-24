@@ -83,11 +83,11 @@ def attention(n, d, hidden, weights, norms, eps, kv, theta = None, gated = False
         theta = theta,
         sm_scale = f32(1.0 / f32(sqrt(qk_head_dim))),
         q_a_proj = weight([d.q_lora_rank, hidden], weights),
-        q_a_norm = weight([d.q_lora_rank], norms),
+        q_a_norm = weight([d.q_lora_rank]),
         q_a_norm_eps = eps,
         q_b_proj = weight([d.heads * qk_head_dim, d.q_lora_rank], weights).columns(),
         kv_a_proj = weight([d.kv_lora_rank + d.qk_rope_head_dim, hidden], weights),
-        kv_a_norm = weight([d.kv_lora_rank], norms),
+        kv_a_norm = weight([d.kv_lora_rank]),
         kv_a_norm_eps = eps,
         kv_b_proj = weight([d.heads * (d.qk_nope_head_dim + d.v_head_dim), d.kv_lora_rank],
             side,
@@ -192,11 +192,11 @@ def layout(id, deploy):
                 wq_b = weight([index_width, a.q_lora_rank], side),
                 wk = weight([d.index_head_dim, hidden], side),
                 weights_proj = weight([d.index_heads, hidden], side),
-                k_norm = weight([d.index_head_dim], dense),
-                k_norm_bias = weight([d.index_head_dim], dense),
+                k_norm = weight([d.index_head_dim]),
+                k_norm_bias = weight([d.index_head_dim]),
                 k_norm_eps = d.norm_eps,
                 kpool_ape = weight([d.index_kpool, d.index_head_dim], dtype.f32),
-                kpool_gate = weight([d.index_head_dim, hidden], dense),
+                kpool_gate = weight([d.index_head_dim, hidden]),
                 keys = keys,
             ),
         )
@@ -208,7 +208,7 @@ def layout(id, deploy):
         sw = m.shared_inter
         return struct(
             routed = True,
-            router = weight([m.experts, hidden], dense),
+            router = weight([m.experts, hidden]),
             bias = weight([m.experts], dtype.f32),
             gate_up = weight([m.experts, 2 * iw, hidden], banks_dtype).bank([iw, iw]),
             down = weight([m.experts, hidden, iw], banks_dtype).rows(),
@@ -227,7 +227,7 @@ def layout(id, deploy):
 
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
-        norm = lambda s, width: weight([width], dense)
+        norm = lambda s, width: weight([width])
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         if (l + 1) % d.full_attn_every == 0:
             mixer = mla_at("layer.{}".format(l), "kv.{}".format(l), "index.{}".format(l))
@@ -273,17 +273,17 @@ def layout(id, deploy):
     mtp = None
     if draft != None:
         mtp = struct(
-            enorm = weight([hidden], dense),
-            hnorm = weight([hidden], dense),
+            enorm = weight([hidden]),
+            hnorm = weight([hidden]),
             e_proj = weight([hidden, hidden], dtype.bf16),
             h_proj = weight([hidden, hidden], dtype.bf16),
-            mixer_norm = weight([hidden], dense),
+            mixer_norm = weight([hidden]),
             mixer_norm_eps = d.norm_eps,
             attn = mla_at("mtp", "kv.mtp", "index.mtp"),
-            mlp_norm = weight([hidden], dense),
+            mlp_norm = weight([hidden]),
             mlp_norm_eps = d.norm_eps,
             mlp = routed_at("mtp", draft),
-            norm = weight([hidden], dense),
+            norm = weight([hidden]),
             norm_eps = d.norm_eps,
         )
 
@@ -299,7 +299,7 @@ def layout(id, deploy):
         embed = weight([d.vocab, hidden], table),
         head = weight([d.vocab, hidden], table),
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight([hidden], dense),
+        final_norm = weight([hidden]),
         final_norm_eps = d.norm_eps,
         mtp = mtp,
         tower = tower(d) if vision else None,

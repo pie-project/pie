@@ -59,10 +59,8 @@ LOCAL = 0
 GLOBAL = 1
 
 def layout(id, deploy):
-    if len(deploy.weights) != 1:
-        fail("{} stores its weights at one dtype, not {}".format(id, deploy.weights))
     d = DIMS[id]
-    w = deploy.weights[0]
+    w = roles(deploy, "w", exact = True).w
     dense = compute(w)
     hidden = d.hidden
     hd = d.head_dim
@@ -71,14 +69,14 @@ def layout(id, deploy):
     kw = d.conv_width
 
     def layer(l):
-        vec = lambda s, length: weight([length], dense)
+        vec = lambda s, length: weight([length])
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         if (l + 1) % d.global_every == 0:
             reading, kv_heads, extent = GLOBAL, d.global_kv_heads, d.global_extent
         else:
             reading, kv_heads, extent = LOCAL, d.local_kv_heads, d.window
         kv_w = kv_heads * hd
-        conv = lambda s, channels: weight([channels, kw], dense).columns()
+        conv = lambda s, channels: weight([channels, kw]).columns()
         if l < d.dense_layers:
             iw = d.dense_inter
             mlp = struct(
@@ -116,11 +114,11 @@ def layout(id, deploy):
             o_proj = weight([hidden, q_w], w).rows(),
             q_norm = vec("q_norm", hd),
             k_norm = vec("k_norm", hd),
-            rel_proj = weight([d.d_rel, extent], dense),
+            rel_proj = weight([d.d_rel, extent]),
             k_conv = conv("k_conv", kv_w),
             v_conv = conv("v_conv", kv_w),
-            attn_conv = weight([hidden, kw], dense),
-            mlp_conv = weight([hidden, kw], dense),
+            attn_conv = weight([hidden, kw]),
+            mlp_conv = weight([hidden, kw]),
             kv = "kv.{}".format(l),
             k_state = "conv.{}.k".format(l),
             v_state = "conv.{}.v".format(l),
@@ -147,8 +145,8 @@ def layout(id, deploy):
         log_scaling = (d.log_floor, d.log_alpha),
         kv = deploy.kv,
         embed = weight([d.vocab, hidden], w),
-        embed_norm = weight([hidden], dense),
+        embed_norm = weight([hidden]),
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight([hidden], dense),
+        final_norm = weight([hidden]),
         unembed = weight([d.head_rows, hidden], w),
     )

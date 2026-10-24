@@ -65,12 +65,11 @@ def inter(iw, tp):
     return (iw + tile - 1) // tile * tile
 
 def layout(id, deploy):
-    if len(deploy.weights) != 2:
-        fail("{} stores its weights and its experts at a dtype each, not {}".format(id, deploy.weights))
     if deploy.drafter != None and deploy.drafter != "dflash":
         fail("{} drafts with dflash or nothing, not {}".format(id, deploy.drafter))
     d = DIMS[id]
-    weights, experts = deploy.weights
+    r = roles(deploy, "weights", "experts", exact = True)
+    weights, experts = r.weights, r.experts
     dense = compute(weights)
     router = dtype.u8g64 if weights == dtype.u4g64 else weights
     hidden = d.hidden
@@ -80,7 +79,7 @@ def layout(id, deploy):
     iw = inter(d.inter, deploy.tp)
 
     def layer(l):
-        norm = lambda s, cols: weight([cols], dense)
+        norm = lambda s, cols: weight([cols])
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
             attn = struct(
@@ -88,11 +87,11 @@ def layout(id, deploy):
                 # q, k and v as one product, split after its bias.
                 qkv = weight([q_w + 2 * kv_w, hidden], weights).packed(
                     [q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
-                qkv_bias = weight([q_w + 2 * kv_w], dense).packed(
+                qkv_bias = weight([q_w + 2 * kv_w]).packed(
                     [q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
                 o_proj = weight([hidden, q_w], weights).rows(),
-                o_bias = weight([hidden], dense),
-                sinks = weight([d.q_heads], dense).columns(),
+                o_bias = weight([hidden]),
+                sinks = weight([d.q_heads]).columns(),
                 kv = "kv.{}".format(l),
             ),
             attn_norm = norm("attn_norm", hidden),
@@ -106,11 +105,11 @@ def layout(id, deploy):
                 swiglu_limit = d.swiglu_limit,
                 swiglu_alpha = d.swiglu_alpha,
                 router = weight([d.experts, hidden], router),
-                router_bias = weight([d.experts], dense),
+                router_bias = weight([d.experts]),
                 gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
-                gate_up_bias = weight([d.experts, 2 * iw], dense).bank([iw, iw]),
+                gate_up_bias = weight([d.experts, 2 * iw]).bank([iw, iw]),
                 down = weight([d.experts, hidden, iw], experts).rows(),
-                down_bias = weight([d.experts, hidden], dense),
+                down_bias = weight([d.experts, hidden]),
             ),
             lora_a = lora_a,
             lora_b = lora_b,
@@ -137,7 +136,7 @@ def layout(id, deploy):
         embed = weight([d.vocab, hidden], weights),
         head = head,
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight([hidden], dense),
+        final_norm = weight([hidden]),
         final_norm_eps = d.norm_eps,
         dflash = dflash_declare(DFLASH_20B, "aux", hidden, d.vocab, d.norm_eps, weights, dense)
             if deploy.drafter == "dflash" else None,

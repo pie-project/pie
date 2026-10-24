@@ -131,10 +131,14 @@ impl Package {
             .heap()
             .access_owned_frozen_value(&self.required("layout")?);
         let heap = module.heap();
-        let m = eval
-            .eval_function(layout, &[heap.alloc(id), deploy.alloc(heap)], &[])
-            .map_err(error)?;
-        Ok(crate::star::paths::named(heap, m))
+        let compute = deploy
+            .weights
+            .first()
+            .and_then(|stated| crate::compute_dtype(stated.dtype));
+        let before = crate::star::layout::COMPUTE.with(|c| c.replace(compute));
+        let m = eval.eval_function(layout, &[heap.alloc(id), deploy.alloc(heap)], &[]);
+        crate::star::layout::COMPUTE.with(|c| c.set(before));
+        Ok(crate::star::paths::named(heap, m.map_err(error)?))
     }
 
     /// What `id`'s deployment `deploy` states of itself as a generative

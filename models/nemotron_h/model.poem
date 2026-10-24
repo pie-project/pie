@@ -99,7 +99,6 @@ def layout(id, deploy):
     if d.pattern == SUPER and deploy.weights != [dtype.bf16, dtype.nvfp4a4, dtype.e4m3tile128a8]:
         fail("{} ships as released: bf16, NVFP4 experts against NVFP4 activations and its FP8 projections; not {}".format(id, deploy))
     w, experts, f8 = (dtype.bf16, dtype.bf16, dtype.bf16) if plain else deploy.weights
-    norms = compute(w)
     hidden = d.hidden
     inner = d.mamba_heads * d.mamba_head_dim
     conv_dim = inner + 2 * d.groups * d.state_dim
@@ -117,7 +116,7 @@ def layout(id, deploy):
             a_log = weight([d.mamba_heads], dtype.f32),
             dt_bias = weight([d.mamba_heads], dtype.f32),
             d = weight([d.mamba_heads], dtype.f32),
-            norm = weight([inner], norms),
+            norm = weight([inner]),
             out_proj = proj(n("out_proj"), "out_proj", l, [hidden, inner]),
             conv_state = "conv.{}".format(l),
             ssm_state = "ssm.{}".format(l),
@@ -151,7 +150,7 @@ def layout(id, deploy):
         kind = d.pattern[l]
         return struct(
             kind = kind,
-            norm = weight([hidden], norms),
+            norm = weight([hidden]),
             mamba = mamba(l) if kind == "M" else None,
             attn = attention(l) if kind == "*" else None,
             moe = moe(l) if kind == "E" else None,
@@ -179,7 +178,7 @@ def layout(id, deploy):
         embed = weight([d.vocab, hidden], w),
         head = weight([d.vocab, hidden], w),
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight([hidden], norms),
+        final_norm = weight([hidden]),
     )
 
 def nano_layout(id, deploy):
@@ -187,13 +186,11 @@ def nano_layout(id, deploy):
     (NVFP4) keep every attention and the Mamba-2 ahead of it bf16; the
     deployment's first dtype stores the other projections and the shared
     expert, its second (or the first) the routed experts."""
-    ws = deploy.weights
-    if deploy.drafter != None or deploy.parts or len(ws) not in [1, 2]:
-        fail("{} stores its weights at one dtype, or its projections and experts at a dtype each; not {}".format(id, deploy))
-    proj = ws[0]
-    experts = ws[-1]
+    if deploy.drafter != None or deploy.parts:
+        fail("{} has no draft head or parts here; not {}".format(id, deploy))
+    r = roles(deploy, "proj", "experts")
+    proj, experts = r.proj, r.experts
     d = DIMS[id]
-    norms = compute(dtype.bf16)
     hidden = d.hidden
     inner = d.mamba_heads * d.mamba_head_dim
     conv_dim = inner + 2 * d.groups * d.state_dim
@@ -209,12 +206,12 @@ def nano_layout(id, deploy):
         if kind == "M":
             mamba = struct(
                 in_proj = weight([inner + conv_dim + d.mamba_heads, hidden], at(l)),
-                conv = weight([conv_dim, d.conv_kernel], norms),
-                conv_bias = weight([conv_dim], norms),
+                conv = weight([conv_dim, d.conv_kernel]),
+                conv_bias = weight([conv_dim]),
                 a_log = weight([d.mamba_heads], dtype.f32),
                 dt_bias = weight([d.mamba_heads], dtype.f32),
                 d = weight([d.mamba_heads], dtype.f32),
-                norm = weight([inner], norms),
+                norm = weight([inner]),
                 out_proj = weight([hidden, inner], at(l)),
                 conv_state = "conv.{}".format(l),
                 ssm_state = "ssm.{}".format(l),
@@ -230,7 +227,7 @@ def nano_layout(id, deploy):
             )
         else:
             moe = struct(
-                router = weight([d.experts, hidden], norms),
+                router = weight([d.experts, hidden]),
                 bias = weight([d.experts], dtype.f32),
                 down_latent = None,
                 up_latent = None,
@@ -241,7 +238,7 @@ def nano_layout(id, deploy):
             )
         return struct(
             kind = kind,
-            norm = weight([hidden], norms),
+            norm = weight([hidden]),
             mamba = mamba,
             attn = attn,
             moe = moe,
@@ -266,8 +263,8 @@ def nano_layout(id, deploy):
         scaling = d.scaling,
         eps = d.eps,
         kv = deploy.kv,
-        embed = weight([d.vocab, hidden], norms),
-        head = weight([d.vocab, hidden], norms),
+        embed = weight([d.vocab, hidden]),
+        head = weight([d.vocab, hidden]),
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight([hidden], norms),
+        final_norm = weight([hidden]),
     )

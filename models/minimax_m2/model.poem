@@ -30,29 +30,23 @@ DIMS = {
 }
 
 def layout(id, deploy):
-    ws = deploy.weights
-    if len(ws) == 1:
-        proj, experts = ws[0], ws[0]
-    elif len(ws) == 2:
-        proj, experts = ws
-    else:
-        fail("{} stores its weights at one dtype, or its attention and experts at a dtype each; not {}".format(id, ws))
+    r = roles(deploy, "proj", "experts")
+    proj, experts = r.proj, r.experts
     if deploy.drafter != None or deploy.parts:
         fail("{} ships no drafter and no parts".format(id))
-    dense = compute(dtype.bf16)
     d = DIMS[id]
     hidden, hd = d.hidden, d.head_dim
     q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
 
     def layer(l):
         return struct(
-            attn_norm = weight([hidden], dense),
+            attn_norm = weight([hidden]),
             qkv = weight([q_width + 2 * kv_width, hidden], proj).packed([q_width, kv_width, kv_width], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
             o = weight([hidden, q_width], proj).rows(),
-            q_norm = weight([q_width], dense),
-            k_norm = weight([kv_width], dense),
-            mlp_norm = weight([hidden], dense),
-            router = weight([d.experts, hidden], dense),
+            q_norm = weight([q_width]),
+            k_norm = weight([kv_width]),
+            mlp_norm = weight([hidden]),
+            router = weight([d.experts, hidden]),
             bias = weight([d.experts], dtype.f32),
             gate_up = weight([d.experts, 2 * d.inter, hidden], experts).bank([d.inter, d.inter]),
             down = weight([d.experts, hidden, d.inter], experts).rows(),
@@ -76,8 +70,8 @@ def layout(id, deploy):
         eps = d.norm_eps,
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         kv = deploy.kv,
-        embed = weight([d.vocab, hidden], dense),
-        head = weight([d.vocab, hidden], dense).columns(),
+        embed = weight([d.vocab, hidden]),
+        head = weight([d.vocab, hidden]).columns(),
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight([hidden], dense),
+        final_norm = weight([hidden]),
     )

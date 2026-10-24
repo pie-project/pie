@@ -54,7 +54,7 @@ def layout(id, deploy):
     iw = d.inter
 
     def layer(l):
-        norm = lambda s, dim: weight([dim], dense)
+        norm = lambda s, dim: weight([dim])
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         bank = w if l in d.dense_experts else routed
         return struct(
@@ -69,7 +69,7 @@ def layout(id, deploy):
             # `1 + w` as stored bf16: the scale a post norm's input takes.
             post_ffw_scale = norm("post_ffw_scale", hidden),
             ffw_gate = weight([hidden], dtype.f32),
-            router = weight([d.experts, hidden], dense),
+            router = weight([d.experts, hidden]),
             router_bias = weight([d.experts], dtype.f32),
             pool = weight([pooled, hidden], w),
             pool_norm = norm("pool_norm", pooled),
@@ -102,6 +102,6 @@ def layout(id, deploy):
         embed = weight([d.vocab, hidden], w),
         lm_head = weight([d.vocab, hidden], w),
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight([hidden], dense),
+        final_norm = weight([hidden]),
         final_norm_eps = d.norm_eps,
     )

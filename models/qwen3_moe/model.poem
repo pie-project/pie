@@ -43,13 +43,8 @@ DIMS = {
 RELEASED = [dtype.e4m3tile128a8, dtype.nvfp4, dtype.nvfp4a4]
 
 def layout(id, deploy):
-    ws = deploy.weights
-    if len(ws) == 1:
-        proj, experts = ws[0], ws[0]
-    elif len(ws) == 2:
-        proj, experts = ws
-    else:
-        fail("{} stores its weights at one dtype, or its projections and experts at a dtype each; not {}".format(id, ws))
+    r = roles(deploy, "proj", "experts")
+    proj, experts = r.proj, r.experts
     if deploy.drafter != None or deploy.parts:
         fail("{} ships no drafter and no parts".format(id))
     table = dtype.bf16 if proj in RELEASED else proj
@@ -61,13 +56,13 @@ def layout(id, deploy):
     def layer(l):
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
-            attn_norm = weight([hidden], dense),
+            attn_norm = weight([hidden]),
             qkv = weight([q_width + 2 * kv_width, hidden], proj).packed([q_width, kv_width, kv_width], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
             o = weight([hidden, q_width], proj).rows(),
-            q_norm = weight([hd], dense),
-            k_norm = weight([hd], dense),
-            mlp_norm = weight([hidden], dense),
-            router = weight([d.experts, hidden], dense),
+            q_norm = weight([hd]),
+            k_norm = weight([hd]),
+            mlp_norm = weight([hidden]),
+            router = weight([d.experts, hidden]),
             gate_up = weight([d.experts, 2 * d.inter, hidden], experts).bank([d.inter, d.inter]),
             down = weight([d.experts, hidden, d.inter], experts).rows(),
             kv = "kv.{}".format(l),
@@ -93,5 +88,5 @@ def layout(id, deploy):
         embed = weight([d.vocab, hidden], table),
         head = weight([d.vocab, hidden], table).columns(),
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight([hidden], dense),
+        final_norm = weight([hidden]),
     )

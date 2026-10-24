@@ -28,10 +28,8 @@ DIMS = {
 }
 
 def layout(id, deploy):
-    if len(deploy.weights) != 1:
-        fail("{} stores its weights at one dtype, not {}".format(id, deploy.weights))
+    w = roles(deploy, "w", exact = True).w
     d = DIMS[id]
-    w = deploy.weights[0]
     dense = compute(w)
     proj = dtype.u4g64tiled if w == dtype.u4g64 else w
     hidden = d.hidden
@@ -41,7 +39,7 @@ def layout(id, deploy):
     iw = d.inter
 
     def layer(l):
-        norm = lambda s: weight([hidden], dense)
+        norm = lambda s: weight([hidden])
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
             full = l % d.full_every == d.full_every - 1,
@@ -81,6 +79,6 @@ def layout(id, deploy):
         embed = weight([d.vocab, hidden], w),
         lm_head = lm_head,
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight([hidden], dense),
+        final_norm = weight([hidden]),
         final_norm_eps = d.norm_eps,
     )

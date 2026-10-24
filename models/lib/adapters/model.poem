@@ -7,6 +7,6 @@ def banks(prefix, hidden, dense):
     """The `lora_a` and `lora_b` banks under `prefix`, over a `hidden`-wide
     residual, in `dense`."""
     return (
-        weight([ADAPTERS.slots, ADAPTERS.rank, hidden], dense).registered(),
-        weight([ADAPTERS.slots, hidden, ADAPTERS.rank], dense).registered(),
+        weight([ADAPTERS.slots, ADAPTERS.rank, hidden]).registered(),
+        weight([ADAPTERS.slots, hidden, ADAPTERS.rank]).registered(),
     )

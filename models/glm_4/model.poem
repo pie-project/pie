@@ -88,7 +88,7 @@ def layout(id, deploy):
         iw, sw = d.inter, d.shared_inter
         return struct(
             routed = True,
-            router = weight([d.experts, hidden], dense),
+            router = weight([d.experts, hidden]),
             bias = weight([d.experts], dtype.f32),
             gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
             down = weight([d.experts, hidden, iw], experts).rows(),
@@ -106,13 +106,13 @@ def layout(id, deploy):
     def layer(l):
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
-            attn_norm = weight([hidden], dense),
+            attn_norm = weight([hidden]),
             qkv = weight([q_width + 2 * kv_width, hidden], proj).packed([q_width, kv_width, kv_width], heads = heads),
-            qkv_bias = weight([q_width + 2 * kv_width], dense).packed([q_width, kv_width, kv_width], heads = heads),
+            qkv_bias = weight([q_width + 2 * kv_width]).packed([q_width, kv_width, kv_width], heads = heads),
             o = weight([hidden, q_width], proj).rows(),
-            q_norm = weight([hd], dense) if d.qk_norm else None,
-            k_norm = weight([hd], dense) if d.qk_norm else None,
-            mlp_norm = weight([hidden], dense),
+            q_norm = weight([hd]) if d.qk_norm else None,
+            k_norm = weight([hd]) if d.qk_norm else None,
+            mlp_norm = weight([hidden]),
             mlp = mlp(l),
             kv = "kv.{}".format(l),
             lora_a = lora_a,
@@ -137,5 +137,5 @@ def layout(id, deploy):
         embed = weight([d.vocab, hidden], table),
         head = weight([d.vocab, hidden], table).columns(),
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight([hidden], dense),
+        final_norm = weight([hidden]),
     )

@@ -6,7 +6,7 @@ def linear(out, in_, banks, bias = True):
     """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
     return struct(
         w = weight([out, in_], banks),
-        bias = weight([out], compute(banks)) if bias else None,
+        bias = weight([out]) if bias else None,
     )
 
 def packed_linear(seams, in_, banks):
@@ -16,7 +16,7 @@ def packed_linear(seams, in_, banks):
         out += s
     return struct(
         w = weight([out, in_], banks).packed(seams),
-        bias = weight([out], compute(banks)).packed(seams),
+        bias = weight([out]).packed(seams),
     )
 
 HIDDEN = 256
@@ -38,21 +38,19 @@ def rows(l):
     return struct(w = l.w.rows(), bias = l.bias)
 
 def self_attn(banks):
-    dense = compute(banks)
     return struct(
         qkv = packed_linear([HIDDEN] * 3, HIDDEN, banks),
-        q_norm = weight([HEAD_DIM], dense),
-        k_norm = weight([HEAD_DIM], dense),
+        q_norm = weight([HEAD_DIM]),
+        k_norm = weight([HEAD_DIM]),
         out = rows(linear(HIDDEN, HIDDEN, banks)),
     )
 
 def cross_attn(banks):
-    dense = compute(banks)
     return struct(
         q = columns(linear(HIDDEN, HIDDEN, banks)),
         kv = packed_linear([HIDDEN] * 2, CONTEXT_WIDTH, banks),
-        q_norm = weight([HEAD_DIM], dense),
-        k_norm = weight([HEAD_DIM], dense),
+        q_norm = weight([HEAD_DIM]),
+        k_norm = weight([HEAD_DIM]),
         out = rows(linear(HIDDEN, HIDDEN, banks)),
     )
 
@@ -70,10 +68,7 @@ def side(banks):
     )
 
 def layout(id, deploy):
-    if len(deploy.weights) != 1:
-        fail("{} stores its weights at one dtype, not {}".format(id, deploy.weights))
-    banks = deploy.weights[0]
-    dense = compute(banks)
+    banks = roles(deploy, "banks", exact = True).banks
     return struct(
         hidden = HIDDEN,
         head_dim = HEAD_DIM,
@@ -87,11 +82,11 @@ def layout(id, deploy):
         single = side(banks),
         double = struct(img = side(banks), txt = side(banks)),
         cross = struct(
-            mod_table = weight([MOD_SLICES * HIDDEN], dense),
+            mod_table = weight([MOD_SLICES * HIDDEN]),
             ada = linear(MOD_SLICES * HIDDEN, HIDDEN, banks),
             self_attn = self_attn(banks),
-            norm = weight([HIDDEN], dense),
-            norm_bias = weight([HIDDEN], dense),
+            norm = weight([HIDDEN]),
+            norm_bias = weight([HIDDEN]),
             cross = cross_attn(banks),
             mlp = swiglu(banks),
         ),

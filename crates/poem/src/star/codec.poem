@@ -7,8 +7,8 @@
 # `.weight_scale` a row), MXFP8 (e4m3 codes beside an e8m0 exponent a 1x32
 # block) and modelopt's NVFP4 (e2m1 pairs, e4m3 scales a 16, a tensor scale
 # and an input scale). A weight the deployment reads plainly is read as
-# stored; a quantized leg of it is refused, or, where its package says it
-# may be (`widen`), dequantized to bf16 first.
+# stored; a quantized leg of it is refused, left to the importer's own read
+# or dequantized to bf16 first, as its package says (`quantized`).
 
 E4M3 = raw(dtype.e4m3)
 

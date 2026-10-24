@@ -56,8 +56,8 @@ def attention(n, d, proj, dense, kv):
         k_proj = weight([d.kv_heads * hd, d.hidden], proj).columns(heads = d.kv_heads),
         v_proj = weight([d.kv_heads * hd, d.hidden], proj).columns(heads = d.kv_heads),
         o_proj = weight([d.hidden, d.q_heads * hd], proj).rows(),
-        q_norm = weight([hd], dense),
-        k_norm = weight([hd], dense),
+        q_norm = weight([hd]),
+        k_norm = weight([hd]),
         norm_eps = d.norm_eps,
         kv = kv,
     )
@@ -75,8 +75,8 @@ def indexer(n, d, dense, keys, proj = None):
         norm_eps = d.norm_eps,
         q_proj = weight([ix.heads * ix.head_dim, d.hidden], proj),
         k_proj = weight([ix.head_dim, d.hidden], proj),
-        q_norm = weight([ix.head_dim], dense),
-        k_norm = weight([ix.head_dim], dense),
+        q_norm = weight([ix.head_dim]),
+        k_norm = weight([ix.head_dim]),
         keys = keys,
     )
 
@@ -94,7 +94,7 @@ def routed(n, d, mix, dense):
     """`d.top_k` of `d.experts` experts, sigmoid-routed with a correction
     bias, beside the one shared expert."""
     return struct(
-        router = weight([d.experts, d.hidden], dense),
+        router = weight([d.experts, d.hidden]),
         bias = weight([d.experts], dtype.f32),
         gate_up = weight([d.experts, 2 * d.inter, d.hidden], mix.experts).bank([d.inter, d.inter]),
         down = weight([d.experts, d.hidden, d.inter], mix.experts).rows(),
@@ -118,10 +118,10 @@ def layout(id, deploy):
         n = lambda s: "layer.{}.{}".format(l, s)
         sparse = l >= d.dense_layers
         return struct(
-            attn_norm = weight([d.hidden], dense),
+            attn_norm = weight([d.hidden]),
             attn = attention(n, d, mix.proj, dense, "kv.{}".format(l)),
             indexer = indexer(n, d, dense, "index.{}".format(l), mix.index) if sparse else None,
-            mlp_norm = weight([d.hidden], dense),
+            mlp_norm = weight([d.hidden]),
             mlp = routed(n, d, mix, dense) if sparse else None,
             dense = None if sparse else mlp(d, d.dense_inter, mix.proj),
         )
@@ -136,6 +136,6 @@ def layout(id, deploy):
         kv = deploy.kv,
         embed = weight([d.vocab, d.hidden], mix.embed),
         head = weight([d.vocab, d.hidden], mix.head),
-        final_norm = weight([d.hidden], dense),
+        final_norm = weight([d.hidden]),
         layers = [layer(l) for l in range(d.layers)],
     )

@@ -22,8 +22,8 @@ DEPLOYMENTS = [deployment("stranger-1b", weights = dtype.bf16, kv = dtype.bf16)]
 const MODEL: &str = r#"
 def layout(id, deploy):
     return struct(
-        embed = weight("embed", [16, 8], deploy.weights[0]),
-        head = weight("head", [16, 8], deploy.weights[0]),
+        embed = weight([16, 8], deploy.weights[0]),
+        head = weight([16, 8], deploy.weights[0]),
     )
 "#;
 

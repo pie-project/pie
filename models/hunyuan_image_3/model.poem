@@ -6,7 +6,7 @@ def linear(out, in_, banks, bias = True):
     """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
     return struct(
         w = weight([out, in_], banks),
-        bias = weight([out], compute(banks)) if bias else None,
+        bias = weight([out]) if bias else None,
     )
 
 TRAIN_STEPS = 1000
@@ -81,17 +81,15 @@ def embedder(hidden, out, banks):
 def layout(id, deploy):
     d = DIMS[id]
     if id == "hunyuanimage3-mini":
-        if len(deploy.weights) != 1:
-            fail("{} stores its weights at one dtype, not {}".format(id, deploy.weights))
-        banks = deploy.weights[0]
+        banks = roles(deploy, "banks", exact = True).banks
         experts = banks
     else:
-        if len(deploy.weights) != 2 or deploy.weights[0] != dtype.bf16:
-            fail("{} does not ship {}".format(id, deploy.weights))
-        banks, experts = deploy.weights
+        r = roles(deploy, "banks", "experts", exact = True)
+        banks, experts = r.banks, r.experts
+        if banks != dtype.bf16:
+            fail("{} stores its weights at bf16, not {}".format(id, banks))
     if d.head_dim % 4 != 0:
         fail("the 2-D rope splits a head into two even blocks")
-    dense = compute(banks)
     hidden = d.hidden
     hd = d.head_dim
     q_w = d.q_heads * hd
@@ -101,14 +99,14 @@ def layout(id, deploy):
 
     def layer(l):
         return struct(
-            attn_norm = weight([hidden], dense),
+            attn_norm = weight([hidden]),
             qkv = weight([q_w + 2 * kv_w, hidden], banks).packed([q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
-            q_norm = weight([hd], dense),
-            k_norm = weight([hd], dense),
+            q_norm = weight([hd]),
+            k_norm = weight([hd]),
             o_proj = weight([hidden, q_w], banks).rows(),
             kv = "kv.{}".format(l),
-            mlp_norm = weight([hidden], dense),
-            router = weight([d.experts, hidden], dense),
+            mlp_norm = weight([hidden]),
+            router = weight([d.experts, hidden]),
             experts_gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
             experts_down = weight([d.experts, hidden, iw], experts).rows(),
             shared_gate_up = weight([2 * sw, hidden], banks).packed([sw, sw]),
@@ -127,7 +125,7 @@ def layout(id, deploy):
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         embed = weight([d.vocab, hidden], banks),
         head = weight([d.vocab, hidden], banks),
-        final_norm = weight([hidden], dense),
+        final_norm = weight([hidden]),
         layers = [layer(l) for l in range(d.layers)],
         timestep_emb = embedder(hidden, 2 * hidden, banks),
         time_embed = embedder(hidden, hidden, banks),

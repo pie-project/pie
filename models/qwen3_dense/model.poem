@@ -35,11 +35,9 @@ DIMS = {
 RELEASED = [dtype.e4m3tile128a8, dtype.e4m3g128, dtype.e4m3g128a8, dtype.nvfp4]
 
 def layout(id, deploy):
-    if len(deploy.weights) != 1:
-        fail("{} stores its weights at one dtype, not {}".format(id, deploy.weights))
     if deploy.drafter != None or deploy.parts:
         fail("{} ships no drafter and no parts".format(id))
-    proj = deploy.weights[0]
+    proj = roles(deploy, "proj", exact = True).proj
     w = dtype.bf16 if proj in RELEASED else proj
     d = DIMS[id]
     dense = compute(w)
@@ -48,14 +46,14 @@ def layout(id, deploy):
     def layer(l):
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
-            attn_norm = weight([hidden], dense),
+            attn_norm = weight([hidden]),
             q = weight([d.q_heads * hd, hidden], proj).columns(),
             k = weight([d.kv_heads * hd, hidden], proj).columns(heads = d.kv_heads),
             v = weight([d.kv_heads * hd, hidden], proj).columns(heads = d.kv_heads),
             o = weight([hidden, d.q_heads * hd], proj).rows(),
-            q_norm = weight([hd], dense),
-            k_norm = weight([hd], dense),
-            mlp_norm = weight([hidden], dense),
+            q_norm = weight([hd]),
+            k_norm = weight([hd]),
+            mlp_norm = weight([hidden]),
             gate_up = weight([2 * d.inter, hidden], proj).packed([d.inter, d.inter]),
             down = weight([hidden, d.inter], proj).rows(),
             kv = "kv.{}".format(l),
@@ -77,8 +75,8 @@ def layout(id, deploy):
         rope = yarn(deploy, 32768),
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         kv = deploy.kv,
-        embed = weight([d.vocab, hidden], dense),
-        head = None if d.tied else weight([d.vocab, hidden], dense).columns(),
+        embed = weight([d.vocab, hidden]),
+        head = None if d.tied else weight([d.vocab, hidden]).columns(),
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight([hidden], dense),
+        final_norm = weight([hidden]),
     )

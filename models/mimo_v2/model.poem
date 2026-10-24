@@ -58,14 +58,13 @@ WINDOWED = 0
 FULL = 1
 
 def layout(id, deploy):
-    if len(deploy.weights) != 2:
-        fail("{} stores its weights and its experts at a dtype each, not {}".format(id, deploy.weights))
     if deploy.drafter != None:
         fail("{} drafts with nothing, not {}".format(id, deploy.drafter))
     d = DIMS[id]
     if PADDED != 2 * d.v_head_dim:
         fail("the output projection reads a padded head's first half, its values")
-    weights, experts = deploy.weights
+    r = roles(deploy, "weights", "experts", exact = True)
+    weights, experts = r.weights, r.experts
     dense = compute(weights)
     # The release's FP8 qkv kept as stored, its heads 192 (values 128) wide:
     # the attention prologue lays them 256 wide.
@@ -74,7 +73,7 @@ def layout(id, deploy):
     q_w = d.q_heads * PADDED
 
     def layer(l):
-        norm = lambda s: weight([hidden], dense)
+        norm = lambda s: weight([hidden])
         reading = FULL if l in d.full else WINDOWED
         kv_heads = d.full_kv_heads if reading == FULL else d.window_kv_heads
         kv_w = kv_heads * PADDED
@@ -96,7 +95,7 @@ def layout(id, deploy):
                 experts = d.experts,
                 top_k = d.top_k,
                 inter = iw,
-                router = weight([d.experts, hidden], dense),
+                router = weight([d.experts, hidden]),
                 bias = weight([d.experts], dtype.f32),
                 gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
                 down = weight([d.experts, hidden, iw], experts).rows(),
@@ -113,8 +112,8 @@ def layout(id, deploy):
                     [q_w, kv_w, kv_w],
                     heads = [d.q_heads, kv_heads, kv_heads],
                 ),
-                o_proj = weight([hidden, d.q_heads * d.v_head_dim], dense).rows(),
-                sinks = weight([d.q_heads], dense).columns() if reading == WINDOWED else None,
+                o_proj = weight([hidden, d.q_heads * d.v_head_dim]).rows(),
+                sinks = weight([d.q_heads]).columns() if reading == WINDOWED else None,
                 kv = "kv.{}".format(l),
             ),
             attn_norm = norm("attn_norm"),
@@ -142,9 +141,9 @@ def layout(id, deploy):
         sm_scale = f32(1.0 / f32(sqrt(d.qk_head_dim))),
         shards = d.shards,
         kv = deploy.kv,
-        embed = weight([d.vocab, hidden], dense),
-        head = weight([d.vocab, hidden], dense).packed([d.vocab]),
+        embed = weight([d.vocab, hidden]),
+        head = weight([d.vocab, hidden]).packed([d.vocab]),
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight([hidden], dense),
+        final_norm = weight([hidden]),
         final_norm_eps = d.norm_eps,
     )

@@ -6,7 +6,7 @@ def linear(out, in_, banks, bias = True):
     """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
     return struct(
         w = weight([out, in_], banks),
-        bias = weight([out], compute(banks)) if bias else None,
+        bias = weight([out]) if bias else None,
     )
 
 def packed_linear(seams, in_, banks):
@@ -16,7 +16,7 @@ def packed_linear(seams, in_, banks):
         out += s
     return struct(
         w = weight([out, in_], banks).packed(seams),
-        bias = weight([out], compute(banks)).packed(seams),
+        bias = weight([out]).packed(seams),
     )
 
 def embedder(prefix, in_, dim, banks):
@@ -99,7 +99,7 @@ DIMS = {
 }
 
 def gain(width, banks):
-    return weight([width], compute(banks))
+    return weight([width])
 
 def attention(prefix, dim, heads, head_dim, banks, ctx = None):
     """Self-attention, or (given the `ctx` width it attends) cross-attention,
@@ -216,8 +216,7 @@ def vae(banks):
             stride = stride,
             resnets = [vae_resnet(c_out, banks) for r in range(VAE_UP_RESNETS[i])],
         ))
-    dense = compute(banks)
-    row = lambda name: weight([VAE_Z], dense)
+    row = lambda name: weight([VAE_Z])
     return struct(
         z = VAE_Z,
         patch = VAE_PATCH,
@@ -231,9 +230,7 @@ def vae(banks):
     )
 
 def layout(id, deploy):
-    if len(deploy.weights) != 1:
-        fail("{} stores its weights at one dtype, not {}".format(id, deploy.weights))
-    banks = deploy.weights[0]
+    banks = roles(deploy, "banks", exact = True).banks
     d = DIMS[id]
     return struct(
         dims = d,

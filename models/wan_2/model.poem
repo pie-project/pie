@@ -5,7 +5,7 @@ def linear(out, in_, banks, bias = True):
     """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
     return struct(
         w = weight([out, in_], banks),
-        bias = weight([out], compute(banks)) if bias else None,
+        bias = weight([out]) if bias else None,
     )
 
 def packed_linear(seams, in_, banks):
@@ -15,7 +15,7 @@ def packed_linear(seams, in_, banks):
         out += s
     return struct(
         w = weight([out, in_], banks).packed(seams),
-        bias = weight([out], compute(banks)).packed(seams),
+        bias = weight([out]).packed(seams),
     )
 
 def embedder(prefix, in_, dim, banks):
@@ -81,9 +81,8 @@ DIMS = {
 }
 
 def block(d, banks):
-    dense = compute(banks)
     dim = d.dim
-    gain = lambda s: weight([dim], dense)
+    gain = lambda s: weight([dim])
     return struct(
         table = weight([MOD_SLICES * dim], dtype.f32),
         self_attn = struct(
@@ -108,18 +107,17 @@ def block(d, banks):
     )
 
 def text_encoder(banks):
-    dense = compute(banks)
     inner = TE_HEADS * TE_HEAD_DIM
 
     def layer(l):
         return struct(
-            attn_norm = weight([TE_HIDDEN], dense),
+            attn_norm = weight([TE_HIDDEN]),
             q = weight([inner, TE_HIDDEN], banks),
             k = weight([inner, TE_HIDDEN], banks),
             v = weight([inner, TE_HIDDEN], banks),
             o = weight([TE_HIDDEN, inner], banks),
-            rel_bias = weight([TE_BUCKETS, TE_HEADS], dense),
-            ffn_norm = weight([TE_HIDDEN], dense),
+            rel_bias = weight([TE_BUCKETS, TE_HEADS]),
+            ffn_norm = weight([TE_HIDDEN]),
             wi_0 = weight([TE_INTER, TE_HIDDEN], banks),
             wi_1 = weight([TE_INTER, TE_HIDDEN], banks),
             wo = weight([TE_HIDDEN, TE_INTER], banks),
@@ -132,7 +130,7 @@ def text_encoder(banks):
         max_tokens = CONTEXT_LEN,
         embed = weight([TE_VOCAB, TE_HIDDEN], banks),
         layers = [layer(l) for l in range(TE_LAYERS)],
-        final_norm = weight([TE_HIDDEN], dense),
+        final_norm = weight([TE_HIDDEN]),
     )
 
 def conv(name, c_out, c_in, k, plane, banks, front = None):
@@ -149,24 +147,22 @@ def conv(name, c_out, c_in, k, plane, banks, front = None):
     )
 
 def resnet(prefix, c_in, c_out, plane, banks):
-    dense = compute(banks)
     return struct(
-        norm1 = weight([c_in], dense),
+        norm1 = weight([c_in]),
         conv1 = conv(prefix + ".conv1", c_out, c_in, [3, 3, 3], plane, banks),
-        norm2 = weight([c_out], dense),
+        norm2 = weight([c_out]),
         conv2 = conv(prefix + ".conv2", c_out, c_out, [3, 3, 3], plane, banks),
         shortcut = conv(prefix + ".shortcut", c_out, c_in, [1, 1, 1], plane, banks) if c_in != c_out else None,
     )
 
 def mid_attention(top, banks):
     return struct(
-        norm = weight([top], compute(banks)),
+        norm = weight([top]),
         qkv = linear(3 * top, top, banks),
         proj = linear(top, top, banks),
     )
 
 def vae_encoder(banks):
-    dense = compute(banks)
     dims = VAE_ENCODER_DIMS
     p0 = VAE_MAX_LATENT_PLANE
     plane = 64 * p0
@@ -205,15 +201,14 @@ def vae_encoder(banks):
         mid_res0 = resnet("vae.enc.mid.res.0", top, top, plane, banks),
         mid_attn = mid_attention(top, banks),
         mid_res1 = resnet("vae.enc.mid.res.1", top, top, plane, banks),
-        norm_out = weight([top], dense),
+        norm_out = weight([top]),
         conv_out = conv("vae.enc.conv_out", 2 * VAE_Z, top, [3, 3, 3], plane, banks),
         quant = conv("vae.enc.quant", VAE_Z, 2 * VAE_Z, [1, 1, 1], plane, banks),
-        norm_bias = weight([VAE_Z], dense),
-        norm_scale = weight([VAE_Z], dense),
+        norm_bias = weight([VAE_Z]),
+        norm_scale = weight([VAE_Z]),
     )
 
 def vae(banks):
-    dense = compute(banks)
     dims = VAE_DECODER_DIMS
     top = dims[0]
     p0 = VAE_MAX_LATENT_PLANE
@@ -250,23 +245,21 @@ def vae(banks):
         z = VAE_Z,
         rgb = VAE_RGB,
         patch = VAE_PATCH,
-        denorm_bias = weight([VAE_Z], dense),
-        denorm_scale = weight([VAE_Z], dense),
+        denorm_bias = weight([VAE_Z]),
+        denorm_scale = weight([VAE_Z]),
         post_quant = conv("vae.post_quant", VAE_Z, VAE_Z, [1, 1, 1], p0, banks),
         conv_in = conv("vae.conv_in", top, VAE_Z, [3, 3, 3], p0, banks),
         mid_res0 = resnet("vae.mid.res.0", top, top, p0, banks),
         mid_attn = mid_attention(top, banks),
         mid_res1 = resnet("vae.mid.res.1", top, top, p0, banks),
         up = up,
-        norm_out = weight([last], dense),
+        norm_out = weight([last]),
         conv_out = conv("vae.conv_out", VAE_PIX_CHANNELS, last, [3, 3, 3], plane, banks),
         enc = vae_encoder(banks),
     )
 
 def layout(id, deploy):
-    if len(deploy.weights) != 1:
-        fail("{} stores its weights at one dtype, not {}".format(id, deploy.weights))
-    banks = deploy.weights[0]
+    banks = roles(deploy, "banks", exact = True).banks
     d = DIMS[id]
     whole = id == "wan22-ti2v-5b"
     if d.heads * d.head_dim != d.dim:

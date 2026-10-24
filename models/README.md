@@ -29,8 +29,9 @@ package's: `//pie/codec.poem`, which ships with pie, reads block FP8,
 per-channel FP8, MXFP8 and NVFP4 as the release stores them. A package's
 formats name a weight's legs (`weight(reads, w, legs)`) or a bank's experts'
 (`bank(reads, w, experts)`), and the weight's declared dtype says which
-encoding it keeps; a quantized leg of a weight read plainly is refused,
-or, with `widen = True`, dequantized to bf16.
+encoding it keeps. A quantized leg of a weight read plainly is refused
+(`quantized = "refuse"`, the default), read as stored (`"read"`) or
+dequantized to bf16 (`"widen"`).
 
 A deployment is named `{id}[-{part}…][-{drafter}]-{weights…}-kv-{kv}[-yarn{f}][-tap.{key}][-tp{n}]`; `yarn{f}` stretches the
 model's native context `f` times by YaRN, in a package that turns it
@@ -45,6 +46,13 @@ and its products run on CUDA's tcgen05 GEMMs. Where there are none (Hopper,
 Ampere, sm120), CUDA reads the same planes against bf16 activations: an
 MXFP4 or NVFP4 bank as W4A16, a block-FP8 one as W8A16
 (`crates/engine-cuda/src/dispatch/linear.rs`, `select_a16` and `matmul_a16`).
+
+A layout reads its deployment's dtypes by role: `roles(deploy, "proj",
+"experts")` is a struct with a dtype for each, the deployment stating one
+dtype for them all or one a role, in order; `exact = True` asks for one a
+role. A `weight(shape)` stating no dtype computes at the deployment's
+compute dtype, the one its first stored dtype computes in, as norms and
+gates do.
 
 ## What a model says of its tokens
 

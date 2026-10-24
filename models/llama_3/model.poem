@@ -36,11 +36,9 @@ DIMS = {
 RELEASED = [dtype.e4m3tile128a8, dtype.nvfp4]
 
 def layout(id, deploy):
-    if len(deploy.weights) != 1:
-        fail("{} stores its projections at one dtype, not {}".format(id, deploy.weights))
     if deploy.drafter != None or deploy.parts:
         fail("{} ships no drafter and no parts".format(id))
-    proj = deploy.weights[0]
+    proj = roles(deploy, "proj", exact = True).proj
     table = dtype.bf16 if proj in RELEASED else proj
     dense = compute(table)
     d = DIMS[id]
@@ -50,10 +48,10 @@ def layout(id, deploy):
     def layer(l):
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
-            attn_norm = weight([hidden], dense),
+            attn_norm = weight([hidden]),
             qkv = weight([q_width + 2 * kv_width, hidden], proj).packed([q_width, kv_width, kv_width], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
             o = weight([hidden, q_width], proj).rows(),
-            mlp_norm = weight([hidden], dense),
+            mlp_norm = weight([hidden]),
             gate_up = weight([2 * d.inter, hidden], proj).packed([d.inter, d.inter]),
             down = weight([hidden, d.inter], proj).rows(),
             kv = "kv.{}".format(l),
@@ -83,5 +81,5 @@ def layout(id, deploy):
         embed = weight([d.vocab, hidden], table),
         head = weight([d.vocab, hidden], table).columns(),
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight([hidden], dense),
+        final_norm = weight([hidden]),
     )
