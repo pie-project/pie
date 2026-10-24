@@ -1958,12 +1958,13 @@ fn pass_lanes<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyho
     for &rep in &lanes {
         let res: Resource<WorkingSet> = Resource::new_borrow(rep);
         let cursor = ctx.resources().get(&res)?.cursor.clone();
-        let now = *cursor.lock().unwrap();
+        let now = cursor.lock().unwrap().clone();
         places.push(geometry::Place {
             folded: now.folded,
             folded_exact: now.folded_exact,
             tail: now.tail,
             shared: lanes.iter().filter(|&&other| other == rep).count() > 1,
+            spans: now.spans,
         });
         cursors.push(cursor);
     }
@@ -1981,10 +1982,12 @@ fn pass_lanes<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyho
 
 type CursorCell = std::sync::Arc<std::sync::Mutex<crate::inferlet::host::working_set::Cursor>>;
 
-/// Working sets in `settles` freeze where the fire settles.
+/// Working sets in `settles` freeze where the fire settles; `matched` are the
+/// media runs the fire carries.
 fn advance_cursors(
     lanes: &PassLanes,
     landings: Option<&[geometry::Landing]>,
+    matched: &[crate::pipeline::media::MatchedRun],
     fold: &geometry::Fold,
     settles: &[CursorCell],
 ) {
@@ -2017,6 +2020,22 @@ fn advance_cursors(
             .unwrap_or(0);
         cursor.tail = Some(end);
         cursor.reserved = cursor.reserved.max(end);
+        let start = mine
+            .iter()
+            .filter_map(|&lane| landings.get(lane))
+            .map(|landing| landing.start)
+            .min()
+            .unwrap_or(end);
+        let spans = matched
+            .iter()
+            .filter(|run| mine.contains(&(run.lane as usize)))
+            .map(|run| {
+                let at = landings[run.lane as usize].start + run.anchor;
+                let lag = run.span.token_count.saturating_sub(run.span.position_span);
+                (at, at + run.rows, lag)
+            })
+            .filter(|&(_, _, lag)| lag > 0);
+        cursor.rewrite(start, spans);
         // Exact, or a bound below the fold still to be placed.
         if let Some(count) = fold.of(mine[0]) {
             let folded = cursor.folded.saturating_add(count).min(end);
@@ -2044,7 +2063,7 @@ fn fold_at(
         return None;
     }
     let first = *group.first()?;
-    let place = lanes.places[first];
+    let place = &lanes.places[first];
     let count = fold.of(first);
     if count == Some(0) {
         return None;
@@ -2852,7 +2871,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // order on the device, so it is submitted now, as a decode's
             // next pass is, rather than once this one retires.
         }
-        advance_cursors(&pass_lanes, Some(&landings), &fold, &settles);
+        advance_cursors(&pass_lanes, Some(&landings), &matched, &fold, &settles);
         crate::probe_fire_record!(submit_probe.total_us, submit_clock.elapsed());
         crate::probe_fire_count!(submit_probe.submits);
         Ok(Ok(()))
@@ -3536,10 +3555,28 @@ async fn fire_device_geometry<C: FireContext>(
     // Every page from the frozen prefix up to what `reserve` granted is backed
     // before the fire.
     let page = u64::from(stores.kv_page_size.max(1));
+    let states_positions = ctx
+        .resources()
+        .get(&fwd)?
+        .instance
+        .program
+        .bound
+        .container
+        .ports
+        .iter()
+        .any(|binding| binding.port == Port::Positions);
     let mut write_indexes: Vec<Vec<u64>> = Vec::with_capacity(groups.len());
     for (_, lanes) in &groups {
         let lane = lanes[0];
-        let place = pass_lanes.places[lane];
+        let place = &pass_lanes.places[lane];
+        // A row rotates behind its slot past an M-RoPE span; the device
+        // picks the slot, so it cannot.
+        if !states_positions && !place.spans.is_empty() {
+            return Ok(Err(format!(
+                "pipeline: lane {lane}'s rows land where the device says, past a media span \
+                 whose rotation runs behind its slots; state its positions"
+            )));
+        }
         let reserved = pass_lanes.cursors[lane].lock().unwrap().reserved;
         if reserved <= place.folded {
             return Ok(Err(format!(
@@ -3857,7 +3894,7 @@ async fn fire_device_geometry<C: FireContext>(
     }
     ticket_reservation.commit();
     advance_shadow(ctx, &fwd)?;
-    advance_cursors(&pass_lanes, None, &fold, &settles);
+    advance_cursors(&pass_lanes, None, &[], &fold, &settles);
 
     pipe_fires
         .lock()
@@ -4392,12 +4429,13 @@ mod fold_tests {
             places: cursors
                 .iter()
                 .map(|cell| {
-                    let now = *cell.lock().unwrap();
+                    let now = cell.lock().unwrap().clone();
                     geometry::Place {
                         folded: now.folded,
                         folded_exact: now.folded_exact,
                         tail: now.tail,
                         shared: false,
+                        spans: now.spans,
                     }
                 })
                 .collect(),
@@ -4450,6 +4488,45 @@ mod fold_tests {
         a_device_fold_is_reported_and_placed_when_it_settles();
         the_last_fold_to_settle_makes_the_cursor_exact();
         a_fold_never_reported_leaves_the_cursor_a_bound();
+        a_fire_carrying_a_span_leaves_its_lag();
+    }
+
+    fn a_fire_carrying_a_span_leaves_its_lag() {
+        let cell = cursor(0, 0);
+        cell.lock().unwrap().spans = vec![(10, 14, 2), (50, 60, 4)];
+        let pass = lanes(&[&cell]);
+        let span = Arc::new(media::front::EncodedSpan {
+            token_count: 20,
+            position_span: 5,
+            grid: media::front::Grid::still(4, 5),
+            patch_grid: media::front::Grid::still(8, 10),
+            uses_mrope: true,
+            payload: Vec::new(),
+            rows: 80,
+            positions: Vec::new(),
+            prefix: Vec::new(),
+            placeholder: 0,
+            suffix: Vec::new(),
+        });
+        let run = crate::pipeline::media::MatchedRun {
+            lane: 0,
+            anchor: 3,
+            rows: 20,
+            span,
+        };
+        let landings = [geometry::Landing {
+            start: 40,
+            rows: 30,
+        }];
+        advance_cursors(&pass, Some(&landings), &[run], &geometry::Fold::None, &[]);
+        let now = cell.lock().unwrap().clone();
+        assert_eq!(now.tail, Some(70));
+        assert_eq!(
+            now.spans,
+            [(10, 14, 2), (43, 63, 15)],
+            "the write from slot 40 replaces what lay past it"
+        );
+        assert_eq!(crate::inferlet::host::working_set::lag(&now.spans, 70), 17);
     }
 
     fn a_fold_the_host_knows_is_placed_at_submit() {
@@ -4513,10 +4590,11 @@ mod fold_tests {
         advance_cursors(
             &pass,
             None,
+            &[],
             &geometry::Fold::Device,
             std::slice::from_ref(&cell),
         );
-        let now = *cell.lock().unwrap();
+        let now = cell.lock().unwrap().clone();
         assert!(!now.folded_exact && now.unsettled == 1 && now.tail.is_none());
 
         record_kv_writes(vec![report(req.lanes[0].reports, 3)]);
@@ -4530,7 +4608,7 @@ mod fold_tests {
         };
         settle_fold(&stores, ws, FoldAt { by, decoded: true }, &reported, true);
         assert_eq!(stores.kv.lock().folded(ws).unwrap(), 7);
-        let now = *cell.lock().unwrap();
+        let now = cell.lock().unwrap().clone();
         assert!(now.folded_exact && now.unsettled == 0 && now.folded == 7);
     }
 
@@ -4558,7 +4636,7 @@ mod fold_tests {
         // Counted from where the first left it, short of what the fire wrote.
         settle_fold(&stores, ws, settled(9, 10), &none, true);
         assert_eq!(stores.kv.lock().folded(ws).unwrap(), 10);
-        let now = *cell.lock().unwrap();
+        let now = cell.lock().unwrap().clone();
         assert!(now.folded_exact && now.folded == 10);
     }
 
@@ -4585,7 +4663,7 @@ mod fold_tests {
             true,
         );
         assert_eq!(stores.kv.lock().folded(ws).unwrap(), 4);
-        let now = *cell.lock().unwrap();
+        let now = cell.lock().unwrap().clone();
         assert!(!now.folded_exact && now.unsettled == 1);
     }
 }

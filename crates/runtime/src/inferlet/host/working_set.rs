@@ -15,7 +15,7 @@ use crate::store::registry as store_registry;
 use crate::store::rs::RsGeometry;
 use crate::store::rs::working_set::RsWorkingSet;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Cursor {
     pub folded: u32,
     /// False while a fold the host could not place at submit is on its
@@ -26,6 +26,29 @@ pub struct Cursor {
     pub unsettled: u32,
     pub tail: Option<u32>,
     pub reserved: u32,
+    /// The M-RoPE spans written, `(start_slot, end_slot, token_count -
+    /// position_span)`: the rotation of a row past one runs that far behind
+    /// its slot.
+    pub spans: Vec<(u32, u32, u32)>,
+}
+
+impl Cursor {
+    /// A write from `start` replaces the spans from there with its own: the
+    /// last write wins, as for `tail`.
+    pub fn rewrite(&mut self, start: u32, spans: impl IntoIterator<Item = (u32, u32, u32)>) {
+        self.spans.retain(|&(from, _, _)| from < start);
+        self.spans.extend(spans);
+    }
+}
+
+/// How far the rotation of the row at `slot` runs behind it: the lags of the
+/// spans ending at or before it. A row's default position is `slot - lag`.
+pub fn lag(spans: &[(u32, u32, u32)], slot: u32) -> u32 {
+    spans
+        .iter()
+        .filter(|&&(_, end, _)| end <= slot)
+        .map(|&(_, _, lag)| lag)
+        .sum()
 }
 
 impl Default for Cursor {
@@ -36,6 +59,7 @@ impl Default for Cursor {
             unsettled: 0,
             tail: Some(0),
             reserved: 0,
+            spans: Vec::new(),
         }
     }
 }
@@ -48,7 +72,7 @@ pub struct WorkingSet {
 
 impl WorkingSet {
     pub fn cursor(&self) -> Cursor {
-        *self.cursor.lock().unwrap()
+        self.cursor.lock().unwrap().clone()
     }
 }
 
@@ -237,4 +261,50 @@ pub(crate) fn grow_pages(kv: &KvWorkingSet, end: u32) -> Result<(), String> {
         Ok::<_, crate::store::kv::KvStoreError>(())
     })
     .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lag_every_case() {
+        a_row_lags_the_spans_ending_before_it();
+        a_write_drops_the_spans_from_where_it_starts();
+        a_fork_carries_the_spans();
+    }
+
+    fn a_row_lags_the_spans_ending_before_it() {
+        let spans = [(10, 30, 16), (40, 50, 7)];
+        assert_eq!(lag(&spans, 5), 0);
+        assert_eq!(lag(&spans, 29), 0, "inside the span");
+        assert_eq!(lag(&spans, 30), 16);
+        assert_eq!(lag(&spans, 50), 23);
+        assert_eq!(lag(&[], 100), 0, "no span, no lag");
+    }
+
+    fn a_write_drops_the_spans_from_where_it_starts() {
+        let mut cursor = Cursor::default();
+        cursor.rewrite(0, [(10, 30, 16), (40, 50, 7)]);
+        cursor.rewrite(40, [(45, 55, 3)]);
+        assert_eq!(cursor.spans, [(10, 30, 16), (45, 55, 3)]);
+        cursor.rewrite(35, []);
+        assert_eq!(cursor.spans, [(10, 30, 16)], "a text write past the span");
+        cursor.rewrite(10, []);
+        assert!(cursor.spans.is_empty(), "the span itself written over");
+    }
+
+    fn a_fork_carries_the_spans() {
+        let parent = WorkingSet {
+            kv: 0,
+            rs: None,
+            cursor: Arc::new(Mutex::new(Cursor::default())),
+        };
+        parent.cursor.lock().unwrap().rewrite(0, [(10, 30, 16)]);
+        // `fork` starts the child from the parent's cursor.
+        let child = Arc::new(Mutex::new(parent.cursor()));
+        parent.cursor.lock().unwrap().rewrite(0, []);
+        assert_eq!(child.lock().unwrap().spans, [(10, 30, 16)]);
+        assert!(parent.cursor().spans.is_empty(), "each its own");
+    }
 }
