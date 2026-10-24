@@ -68,18 +68,22 @@ impl Rebalancer {
     }
 
     /// Reads every rank's loads and moves what the new placement moves,
-    /// the copies enqueued on `stream` (a stream of the device the caller
-    /// bound). Every rank's work must have finished. The moves it made.
+    /// the copies enqueued on `stream` (a stream of rank 0's device). A
+    /// rank's loads and table are touched on its own device, `devices` in
+    /// rank order. Every rank's work must have finished. The moves it made.
     pub fn run(
         &mut self,
         ranks: &mut [&mut EpRank],
+        devices: &[i32],
         stream: *mut core::ffi::c_void,
     ) -> Result<usize> {
         let world = ranks.len() as u32;
-        let loads: Vec<_> = ranks
-            .iter_mut()
-            .map(|rank| rank.take_loads())
-            .collect::<Result<_>>()?;
+        let mut loads = Vec::with_capacity(ranks.len());
+        for (rank, &device) in ranks.iter_mut().zip(devices) {
+            crate::device::ctx::bind_thread(device)?;
+            loads.push(rank.take_loads()?);
+        }
+        crate::device::ctx::bind_thread(devices[0])?;
         let shape: Vec<(u32, u32, u32, u32)> = ranks[0].layers().collect();
         let window = (self.knob.window / self.knob.every.max(1)).max(1) as usize;
         let mut moved = Vec::new();
@@ -125,7 +129,8 @@ impl Rebalancer {
         for (layer, next, moves) in moved {
             let balance = self.layers.get_mut(&layer).expect("balanced above");
             let table = next.table(balance.stride);
-            for rank in ranks.iter_mut() {
+            for (rank, &device) in ranks.iter_mut().zip(devices) {
+                crate::device::ctx::bind_thread(device)?;
                 rank.write_table(layer, &table)?;
             }
             balance.placement = next;
