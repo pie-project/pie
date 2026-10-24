@@ -14,3 +14,4 @@ mod rope_mrope;
 mod rope_partial;
 mod rope_table;
 mod synth;
+mod synth_rules;
