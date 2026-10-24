@@ -642,10 +642,29 @@ def named(m, path):
             x = getattr(x, part)
     return True
 
-def mapped_row(reads, m, row, l, quantized):
-    """Reads `row` at layer `l`, where it names a weight of the shape it reads."""
+def leg_names(rows, path, l):
+    """The names the row of `rows` landing at `path` (at layer `l`) reads."""
+    for row in rows:
+        if row[1].format(l = l) == path:
+            names = [row[0]] if type(row[0]) == "string" else row[0]
+            return [name.format(l = l) for name in names]
+    fail("`{}` is joined with weights no row of this format reads".format(path))
+
+def mapped_row(reads, m, row, l, quantized, rows):
+    """Reads `row` at layer `l`, where it names a weight of the shape it reads;
+    a weight the compiler joins with others is read once, joined, from all
+    their rows (of `rows`), where the first of them is."""
     names, path = row[0], row[1]
     names = [names] if type(names) == "string" else names
+    j = joined(path.format(l = l))
+    if j != None:
+        if j.first:
+            legs = [at_path(m, leg) for leg in j.legs]
+            joined_names = []
+            for leg in j.legs:
+                joined_names += leg_names(rows, leg, l)
+            weight(reads, join(legs, j.name), joined_names, quantized = quantized)
+        return
     w = at_path(m, path.format(l = l))
     if w == None:
         return
@@ -677,7 +696,7 @@ def mapped(reads, m, rows, quantized = "refuse"):
         if "{l}" not in rows[i][1]:
             if not named(m, rows[i][1]):
                 fail("the row for `{}` names no weight of this layout".format(rows[i][1]))
-            mapped_row(reads, m, rows[i], None, quantized)
+            mapped_row(reads, m, rows[i], None, quantized, rows)
             i += 1
             continue
         j = i
@@ -689,5 +708,5 @@ def mapped(reads, m, rows, quantized = "refuse"):
                 fail("the row for `{}` names no weight of any layer of this layout".format(row[1]))
         for l in range(len(m.layers)):
             for row in rows[i:j]:
-                mapped_row(reads, m, row, l, quantized)
+                mapped_row(reads, m, row, l, quantized, rows)
         i = j

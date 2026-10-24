@@ -28,6 +28,8 @@ mod common_two_axis;
 mod common_vae;
 
 mod a_bank_says_which_site_it_corrects;
+#[cfg(feature = "cuda")]
+mod a_joined_projection_answers_what_its_legs_answer;
 mod a_bidirectional_attention_adds_its_relative_bias_through_the_engine;
 mod a_buffer_frees_after_another_context_closes;
 mod a_buffered_fold_is_the_fold_it_replaces;

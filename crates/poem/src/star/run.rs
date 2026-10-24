@@ -388,10 +388,43 @@ impl Package {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<checkpoint::contract::ModelContract, crate::import::Error> {
+        self.import_joined(id, deploy, src, platform, &[])
+    }
+
+    /// [`Package::import`], the weights of `joins` each read once, joined
+    /// along their rows, as the compiler joins them.
+    pub fn import_joined(
+        &self,
+        id: &str,
+        deploy: &Deploy,
+        src: &ztensor::Source,
+        platform: Platform,
+        joins: &[crate::Join],
+    ) -> Result<checkpoint::contract::ModelContract, crate::import::Error> {
+        /// The joins a read reads, held while it runs.
+        struct Held;
+        impl Drop for Held {
+            fn drop(&mut self) {
+                crate::star::formats::JOINS.with(|j| j.borrow_mut().clear());
+            }
+        }
+        crate::star::formats::JOINS.with(|j| *j.borrow_mut() = joins.to_vec());
+        let _held = Held;
         let name = self.name();
-        self.formats(id, deploy, src, platform, |built| {
+        let mut contract = self.formats(id, deploy, src, platform, |built| {
             crate::import::format::read_one(name, src, built)
-        })?
+        })??;
+        // A format that reads a joined weight's legs one by one (its own
+        // reads, not the codec's rows) has them joined here, plane by plane.
+        for join in joins {
+            crate::import::join_read(&mut contract, join).map_err(|detail| {
+                crate::import::Error::Illegible {
+                    name: id.to_string(),
+                    detail,
+                }
+            })?;
+        }
+        Ok(contract)
     }
 
     /// `then` of the formats of `formats(m)`, each reading `src` into

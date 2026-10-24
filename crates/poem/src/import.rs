@@ -296,6 +296,102 @@ pub fn own_contract(
     Ok(b.build())
 }
 
+/// `contract` with the legs of `join` (each read as its own weight, its
+/// planes beside it) joined along their rows under the joined name, plane by
+/// plane, the legs kept as the internal reads it is made of; nothing where the
+/// codec's rows read them joined already.
+pub fn join_read(contract: &mut ModelContract, join: &crate::Join) -> Result<(), String> {
+    let at = |name: &str| contract.tensors.iter().position(|t| t.name == name);
+    if at(&join.name).is_some() {
+        return Ok(());
+    }
+    let mut planes: Vec<Vec<usize>> = Vec::new();
+    for leg in &join.legs {
+        let main = at(leg).ok_or_else(|| {
+            format!(
+                "`{leg}` is joined into `{}` and no read lands it",
+                join.name
+            )
+        })?;
+        let mut mine = vec![main];
+        mine.extend(contract.tensors.iter().enumerate().filter_map(|(i, t)| {
+            let suffix = t.name.strip_prefix(leg.as_str())?.strip_prefix('.')?;
+            (!suffix.contains('.') || suffix.starts_with("leg")).then_some(i)
+        }));
+        planes.push(mine);
+    }
+    let suffix = |i: usize, leg: &str| contract.tensors[i].name[leg.len()..].to_string();
+    let first: Vec<String> = planes[0]
+        .iter()
+        .map(|&i| suffix(i, &join.legs[0]))
+        .collect();
+    for (leg, mine) in join.legs.iter().zip(&planes) {
+        let theirs: Vec<String> = mine.iter().map(|&i| suffix(i, leg)).collect();
+        if theirs != first {
+            return Err(format!(
+                "`{leg}` lands planes {theirs:?} and `{}` lands {first:?}, so no joined `{}` \
+                 holds both",
+                join.legs[0], join.name
+            ));
+        }
+    }
+    let rename = |name: &str| -> String {
+        join.legs
+            .iter()
+            .find_map(|leg| {
+                let rest = name.strip_prefix(leg.as_str())?;
+                (rest.is_empty() || rest.starts_with('.')).then(|| format!("{}{rest}", join.name))
+            })
+            .unwrap_or_else(|| name.to_string())
+    };
+    let mut made = Vec::new();
+    for (p, plane) in first.iter().enumerate() {
+        let legs: Vec<&TensorContract> = planes
+            .iter()
+            .map(|mine| &contract.tensors[mine[p]])
+            .collect();
+        let lead = legs[0];
+        if legs.iter().any(|t| t.encoding != lead.encoding) {
+            return Err(format!(
+                "the legs of `{}` land `{plane}` at two encodings",
+                join.name
+            ));
+        }
+        let shape = legs
+            .iter()
+            .map(|t| t.shape.clone())
+            .collect::<Option<Vec<_>>>()
+            .and_then(|shapes| {
+                let mut whole = shapes.first()?.clone();
+                *whole.first_mut()? = shapes
+                    .iter()
+                    .map(|s| s.first().copied())
+                    .sum::<Option<i64>>()?;
+                Some(whole)
+            });
+        made.push(TensorContract {
+            name: format!("{}{plane}", join.name),
+            expr: Expr::concat(0, legs.iter().map(|t| Expr::out(t.name.clone())).collect()),
+            shape,
+            encoding: lead.encoding.clone(),
+            scales: lead.scales.clone().map(|mut s| {
+                s.of = rename(&s.of);
+                s
+            }),
+            zero_points: lead.zero_points.as_deref().map(rename),
+            visibility: lead.visibility,
+        });
+    }
+    let last = planes.iter().flatten().copied().max().unwrap_or(0);
+    for i in planes.iter().flatten() {
+        contract.tensors[*i].visibility = checkpoint::types::Visibility::Internal;
+    }
+    let tail = contract.tensors.split_off(last + 1);
+    contract.tensors.extend(made);
+    contract.tensors.extend(tail);
+    Ok(())
+}
+
 /// `expr` reading an expert-parallel rank's slots of each bank it reads
 /// whole: a source whose leading axis is the bank's experts (its codes and
 /// the planes beside them, one row an expert), not one scale for them all.

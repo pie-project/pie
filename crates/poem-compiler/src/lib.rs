@@ -9,6 +9,7 @@ pub mod expert;
 pub mod fuse;
 pub mod layout;
 pub mod lowering;
+pub mod pack;
 mod pq;
 pub mod prefetch;
 mod region;

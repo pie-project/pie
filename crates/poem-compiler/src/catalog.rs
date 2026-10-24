@@ -64,8 +64,22 @@ impl Deployment {
         platform: Platform,
     ) -> Result<ModelContract, poem::import::Error> {
         whole(self.deploy.tp)?;
+        self.package.import_joined(
+            &self.model.id,
+            &self.deploy,
+            src,
+            platform,
+            &self.joins(platform),
+        )
+    }
+
+    /// The weights the compiler joins in this deployment's trace, which an
+    /// import reads joined: none where it does not trace.
+    pub fn joins(&self, platform: Platform) -> Vec<poem::Join> {
         self.package
-            .import(&self.model.id, &self.deploy, src, platform)
+            .trace(&self.model.id, &self.deploy, &self.name, platform)
+            .map(|trace| crate::pack::joins(&trace))
+            .unwrap_or_default()
     }
 
     pub fn try_generative(&self) -> Result<Option<Generative>, Refused> {
@@ -117,8 +131,10 @@ pub fn whole(tp: u32) -> Result<(), poem::import::Error> {
 }
 
 /// The trace each rank of `deploy` runs, from the one the package records:
-/// split across its tensor ranks, its experts across its expert ranks.
+/// its products of one activation joined ([`crate::pack`]), split across its
+/// tensor ranks, its experts across its expert ranks.
 pub fn lowered(trace: Trace, deploy: &Deploy) -> Result<Trace, String> {
+    let trace = crate::pack::pack(trace);
     let trace = crate::shard::shard(trace, deploy.tp).map_err(|why| why.to_string())?;
     crate::expert::lower(trace, deploy.ep, 0).map_err(|why| why.to_string())
 }
@@ -357,7 +373,11 @@ impl Catalog {
         let package = self
             .package_of(id)
             .unwrap_or_else(|| panic!("no package holds `{id}`"));
-        package.import(id, &one_rank(w, kv), src, platform)
+        let joins = package
+            .trace(id, &one_rank(w, kv), id, platform)
+            .map(|trace| crate::pack::joins(&trace))
+            .unwrap_or_default();
+        package.import_joined(id, &one_rank(w, kv), src, platform, &joins)
     }
 
     /// The package of `id` with its `function` renamed `whole_<function>` and
