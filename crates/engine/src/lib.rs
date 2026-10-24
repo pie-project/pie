@@ -18,6 +18,7 @@ pub mod fire;
 pub mod fit;
 pub mod frame;
 pub mod load;
+pub mod placement;
 pub mod ports;
 pub mod program;
 pub mod rs;
