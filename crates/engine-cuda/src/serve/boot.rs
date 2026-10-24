@@ -69,6 +69,11 @@ pub struct Knobs {
     pub profiles: Option<std::path::PathBuf>,
     /// A profile used as is instead of resolving one (`chip::pinned`).
     pub chip: Option<profile::Profile>,
+    /// An expert-parallel group's rebalance: every this many steps (none,
+    /// the engine's default; 0, never), over the loads of the last
+    /// `expert_load_window` steps.
+    pub expert_rebalance_steps: Option<u32>,
+    pub expert_load_window: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

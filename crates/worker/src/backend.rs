@@ -229,6 +229,8 @@ fn device_boot(
             .parse::<Diagnostics>()
             .map_err(|error| anyhow!("[engine] diagnostics: {error}"))?;
     }
+    knobs.expert_rebalance_steps = opts.expert_rebalance_steps;
+    knobs.expert_load_window = opts.expert_load_window;
     if let Some(word) = opts.nccl_transport.as_deref() {
         knobs.nccl_transport = word
             .parse::<Transport>()
