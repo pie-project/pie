@@ -100,8 +100,15 @@ impl Mismatch {
     }
 }
 
-/// A deployment's name without its `-kv-{kv}` segment.
+/// A deployment's name without its `-kv-{kv}` segment, nor an `-ep{n}`
+/// split: the artifact holds every expert whatever ranks load it.
 fn without_kv(name: &str) -> String {
+    let name = match name.rsplit_once("-ep") {
+        Some((head, ranks)) if !ranks.is_empty() && ranks.bytes().all(|b| b.is_ascii_digit()) => {
+            head
+        }
+        _ => name,
+    };
     match name.find("-kv-") {
         Some(at) => {
             let rest = &name[at + "-kv-".len()..];
@@ -708,5 +715,6 @@ mod deployment_words {
             without_kv("qwen3-0.6b-bf16-kv-bf16-tp2")
         );
         assert_ne!(without_kv("qwen3-0.6b-bf16-kv-bf16-tp2"), base);
+        assert_eq!(without_kv("qwen3-30b-a3b-bf16-kv-bf16-ep4"), without_kv("qwen3-30b-a3b-bf16-kv-bf16"));
     }
 }
