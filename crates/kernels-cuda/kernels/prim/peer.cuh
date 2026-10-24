@@ -100,10 +100,26 @@ __device__ __forceinline__ void st_na(int4* p, int4 v) {
                  : "memory");
 }
 
-// `n` 16-byte packs from `src` (unchanging, as `ld_nc` asks) to `dst` by the
-// warp, lane-strided.
-__device__ __forceinline__ void warp_copy(int4* dst, const int4* src, int n, int lane) {
-    for (int i = lane; i < n; i += 32) st_na(dst + i, ld_nc(src + i));
+// Packs a thread keeps in flight: a copy over the link is bound by the loads
+// it waits on, so each thread issues this many before its first store.
+constexpr int kInFlight = 4;
+
+// `n` 16-byte packs from `src` (unchanging, as `ld_nc` asks) to each of the
+// `ways` rows `dst[0 ..]` by `threads` threads, thread `at` taking the packs
+// `at`, `at + threads`, ...: each pack is read once however many rows take it.
+__device__ __forceinline__ void fan_copy(int4* const* dst, int ways, const int4* src, int n,
+                                         int at, int threads) {
+    for (int i = at; i < n; i += threads * kInFlight) {
+        int4 v[kInFlight];
+#pragma unroll
+        for (int u = 0; u < kInFlight; ++u)
+            if (i + u * threads < n) v[u] = ld_nc(src + i + u * threads);
+        for (int w = 0; w < ways; ++w) {
+#pragma unroll
+            for (int u = 0; u < kInFlight; ++u)
+                if (i + u * threads < n) st_na(dst[w] + i + u * threads, v[u]);
+        }
+    }
 }
 
 }  // namespace pie::peer
