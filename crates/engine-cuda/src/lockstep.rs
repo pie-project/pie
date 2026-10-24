@@ -513,6 +513,7 @@ pub fn open_lockstep(
         crate::ep::rebalance::Rebalance {
             every,
             window: knobs.expert_load_window.unwrap_or(every).max(every),
+            limits: engine::placement::Limits::DEFAULT,
         }
     });
     let mut ranks = Vec::with_capacity(size);
