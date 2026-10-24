@@ -56,20 +56,24 @@ const MAX_ROUTES: u32 = 2048;
 const MAX_COL_TILES: u32 = 64;
 const MAX_GLU_TILES: u32 = 32;
 /// `pie::linear::mega::ws_words`: the flags, zero at rest.
-const SYNC_WORDS: usize = 2 * MAX_ROUTES as usize + MAX_COL_TILES as usize + 1;
-const THREADS: u32 = 256;
+const SYNC_WORDS: usize = 2 * MAX_ROUTES as usize + MAX_COL_TILES as usize + 2;
+/// `pie::linear::mega::kChunk`: the columns a quantizer pass reads.
+const CHUNK: u32 = 1024;
+/// `pie::linear::mega::kPoolStride`: a block's pool rows 64 apart.
+const POOL_STRIDE: u32 = 64;
+const THREADS: u32 = 384;
 
 /// `pie::linear::mega::stage_bytes` and `tail_bytes`: a ring stage (two
 /// 128 x 128-byte weight boxes, two kBN x 128-byte row boxes, the weights'
-/// two scale atoms and the rows' one); the tail (barriers, the amax exchange,
-/// the routing: three 513-entry int tables, two 2048-entry short ones and
-/// two ints).
+/// two scale atoms and the rows' one); the tail (barriers and task slots,
+/// the two epilogue warpgroups' amax exchanges, the routing: three 513-entry int tables, two
+/// 2048-entry short ones and two ints).
 const fn stage_bytes(bn: u32) -> u32 {
     2 * 128 * 128 + 2 * bn * 128 + 1024 + 512
 }
 const ROUTING_BYTES: u32 = 3 * 513 * 4 + 2 * 2048 * 2 + 8;
 const fn tail_bytes(bn: u32) -> u32 {
-    256 + 16 * bn + ROUTING_BYTES
+    256 + 32 * bn + ROUTING_BYTES
 }
 /// The dynamic shared memory a CTA may take (227 KiB).
 const SMEM_CAP: u32 = 232_448;
@@ -78,7 +82,7 @@ const fn smem_bytes(bn: u32, stages: u32) -> u32 {
     stages * stage_bytes(bn) + tail_bytes(bn) + 1024
 }
 
-/// The deepest ring that fits.
+/// The deepest ring that fits (the tail holds eight stages' barriers).
 const fn stages_for(bn: u32) -> u32 {
     let mut s = 8;
     while s > 2 && smem_bytes(bn, s) > SMEM_CAP {
@@ -97,13 +101,14 @@ pub enum Fold {
     Weighted,
 }
 
-/// `pie::linear::mega::kPoolStride`: a block's pool rows 64 apart.
-const POOL_STRIDE: u32 = 64;
+/// The blocks of `bn` a fire's routes take at most: every route its own
+/// block, or each expert's last block short.
+fn blocks_for(count: u32, experts: u32, bn: u32) -> u32 {
+    count.min(count.div_ceil(bn) + experts.min(count))
+}
 
-/// The pool rows a fire's blocks of `bn` take: every route its own block at
-/// worst, or each expert's last block short, in whole 128-row atoms.
-fn pool_rows(count: u32, experts: u32, bn: u32) -> u32 {
-    let blocks = count.min(count.div_ceil(bn) + experts.min(count));
+/// The pool rows `blocks` take, in whole 128-row atoms.
+fn pool_rows(blocks: u32) -> u32 {
     (blocks * POOL_STRIDE).div_ceil(128) * 128
 }
 
@@ -176,7 +181,7 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
         || weights.rows != tokens
         || weights.width != top
         || top > 32
-        || !hidden.is_multiple_of(512)
+        || !hidden.is_multiple_of(CHUNK)
         || hidden / 128 > MAX_COL_TILES
         || !inter.is_multiple_of(512)
         || inter / 128 > MAX_GLU_TILES
@@ -239,23 +244,18 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
     let bn: u32 = 32;
     let stages = stages_for(bn);
     let smem = smem_bytes(bn, stages);
-    let pool = pool_rows(count, experts, bn);
+    let blocks = blocks_for(count, experts, bn);
+    let pool = pool_rows(blocks);
     let eb = if w4 { 1 } else { 2 };
     let rows = pool as usize;
     let xpool = ctx.scratch_stream(OP, POOL_X, rows * hidden as usize * eb)? as u64;
     let hpool = ctx.scratch_stream(OP, POOL_H, rows * inter as usize * eb)? as u64;
     let (xpool_sf, hpool_sf) = if w4 {
+        let x_atoms = gemm_sm100::atom_bytes(rows, hidden as usize, 128);
+        let h_atoms = gemm_sm100::atom_bytes(rows, inter as usize, 128);
         (
-            ctx.scratch_stream(
-                OP,
-                POOL_X_SF,
-                gemm_sm100::atom_bytes(rows, hidden as usize, 128),
-            )? as u64,
-            ctx.scratch_stream(
-                OP,
-                POOL_H_SF,
-                gemm_sm100::atom_bytes(rows, inter as usize, 128),
-            )? as u64,
+            ctx.scratch_stream(OP, POOL_X_SF, x_atoms)? as u64,
+            ctx.scratch_stream(OP, POOL_H_SF, h_atoms)? as u64,
         )
     } else {
         (0, 0)
@@ -328,7 +328,7 @@ mod tests {
             assert!(stages >= 4, "{bn}: {stages}");
             assert!(smem_bytes(bn, stages) <= SMEM_CAP);
         }
-        assert_eq!(pool_rows(6, 256, 32), 384);
-        assert_eq!(pool_rows(1536, 256, 32), (48 + 256) * 64);
+        assert_eq!(pool_rows(blocks_for(6, 256, 32)), 384);
+        assert_eq!(blocks_for(1536, 256, 32), 48 + 256);
     }
 }

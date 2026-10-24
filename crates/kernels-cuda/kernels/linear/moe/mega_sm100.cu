@@ -9,7 +9,8 @@
 // codebase's primitives:
 //
 //   - The routes are laid out by expert in every CTA alike
-//     (`linear/moe/mega.cuh`), blocks of kBN pool rows an expert.
+//     (`linear/moe/mega.cuh`), blocks of kBN routes an expert, and the CTAs
+//     claim the tasks from one count.
 //   - The MMA is swapped: the weight's 128 rows on M, a block's routes on N,
 //     both K-major from shared memory. A gate-up tile reads 128 gate rows and
 //     the 128 up rows `inter` on into two accumulators, so a thread holds a
@@ -19,17 +20,19 @@
 //     once their producers' flags say so (a block's quantized rows, the
 //     gate-up tiles that land the K a down step reads).
 //   - W4A8 (kKind 1, DeepSeek-V4's experts): MXFP4 weights against e4m3
-//     rows in 1x128 blocks, kind::mxf8f6f4 under the weights' ue8m0 a 32
-//     and the rows' a 128. The gate-up epilogue lands the GLU's rows as e4m3
-//     (the down product's operand) exactly as the apart GLU reads them back.
+//     rows in 1x128 blocks, kind::mxf8f6f4 under the weights' ue8m0 a 32 and
+//     the rows' a 128. The gate-up epilogue lands the GLU's rows as e4m3 (the
+//     down product's operand) exactly as the apart GLU reads them back.
 //     bf16 (kKind 0): kind::f16, the pools bf16.
-//   - The down epilogue lands each route's row in bf16; once a column tile's
-//     routes have all landed, each token's are folded in route order (the
-//     apart combine's sum, element for element).
+//   - Two epilogue warpgroups take alternate tasks, each its own
+//     accumulator. The down epilogue lands each route's row in bf16; once a
+//     column tile's routes have all landed, each token's are folded in route
+//     order (the apart combine's sum, element for element).
 //
-// Warps: 0 loads the weights, 1 the routes' rows, 2 issues the MMAs (and
-// owns TMEM), 3 quantizes the routes' rows into the pool, 4-7 run the
-// epilogue; 3-7 fold the routes at the end.
+// Warps: 0 claims the tasks and loads the weights, 1 the routes' rows, 2
+// issues the MMAs (and owns TMEM), 3 quantizes, 4-7 and 8-11 run the
+// epilogue; 3-11 quantize the routes' rows into the pool first and fold the
+// routes last.
 
 namespace pie::linear {
 
@@ -56,10 +59,15 @@ struct Params {
 };
 
 constexpr u32 kTileA = 128 * 128;  // a 128-row, 128-byte box
+constexpr u32 kStageA = 2 * kTileA;
 // A block's pool rows start 64 rows apart: its scales at an even quarter of
 // their 128-row atom, as the block-scaled MMA reads them.
 constexpr int kPoolStride = 64;
-constexpr u32 kStageA = 2 * kTileA;
+// Task slots between the claiming warp and the rest.
+constexpr int kSlots = 4;
+// Columns a quantizer pass reads of a row: eight 128-blocks, two at once
+// across the warp's halves, four passes' loads in flight.
+constexpr int kChunk = 1024;
 
 template <int kBN>
 __host__ __device__ constexpr u32 stage_b() { return 2u * kBN * 128u; }
@@ -67,11 +75,11 @@ __host__ __device__ constexpr u32 stage_b() { return 2u * kBN * 128u; }
 template <int kBN>
 __host__ __device__ constexpr u32 stage_bytes() { return kStageA + stage_b<kBN>() + 1024u + 512u; }
 
-// The fixed tail past the ring: barriers, the TMEM slot, the epilogue's
-// amax exchange and the routing.
+// The fixed tail past the ring: barriers and task slots, the epilogue
+// warpgroups' amax exchanges and the routing.
 template <int kBN>
 __host__ __device__ constexpr u32 tail_bytes() {
-    return 256u + 4u * 4u * kBN + static_cast<u32>(sizeof(Routing));
+    return 256u + 2u * 4u * 4u * kBN + static_cast<u32>(sizeof(Routing));
 }
 
 template <int kBN, int kStages>
@@ -103,7 +111,9 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
     static_assert(kBN == 32 || kBN == 64, "a block is 32 or 64 routes");
     static_assert(kKind == 0 || kKind == 1, "bf16 or W4A8");
     constexpr bool kW4 = kKind == 1;
-    // A box's K: 128 bytes of a row (fp4 lands a byte an element).
+    // A box's K: 128 bytes of a row (fp4 lands a byte an element). A gate-up
+    // stage is one box of its gate rows and one of its up rows, a down stage
+    // two boxes along K.
     constexpr int kBoxK = kW4 ? 128 : 64;
     constexpr u32 kStageB = stage_b<kBN>();
     constexpr u32 kOffB = kStages * kStageA;
@@ -119,6 +129,7 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
     constexpr u32 kTxA = kW4 ? 2 * (kTileA / 2) + 1024 : 2 * kTileA;
     constexpr u32 kTxB1 = kBN * 128 + (kW4 ? 512 : 0);
     constexpr u32 kTxB2 = 2 * kBN * 128 + (kW4 ? 512 : 0);
+    static_assert(2 * kStages + 4 + 2 * kSlots <= 28, "the tail holds the barriers");
 
     extern __shared__ unsigned char smem_raw[];
     const u32 raw = smem_addr(smem_raw);
@@ -127,10 +138,13 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
     u64* empty = full + kStages;
     u64* tfull = empty + kStages;
     u64* tempty = tfull + 2;
-    u32* tmem_slot = reinterpret_cast<u32*>(tempty + 2);
-    u32* last = tmem_slot + 1;
-    float* wmax = reinterpret_cast<float*>(smem + kOffTail + 256);
-    Routing& R = *reinterpret_cast<Routing*>(smem + kOffTail + 256 + 4 * 4 * kBN);
+    u64* task_full = tempty + 2;
+    u64* task_empty = task_full + kSlots;
+    int* task_slot = reinterpret_cast<int*>(task_empty + kSlots);
+    u32* tmem_slot = reinterpret_cast<u32*>(task_slot + kSlots);
+    u32* flag = tmem_slot + 1;
+    float* wmax_all = reinterpret_cast<float*>(smem + kOffTail + 256);
+    Routing& R = *reinterpret_cast<Routing*>(smem + kOffTail + 256 + 2 * 4 * 4 * kBN);
 
     const int warp = static_cast<int>(threadIdx.x) / 32;
     const int lane = static_cast<int>(threadIdx.x) % 32;
@@ -155,6 +169,11 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
             bar_init(&tfull[a], 1);
             bar_init(&tempty[a], 4);
         }
+        for (int a = 0; a < kSlots; ++a) {
+            bar_init(&task_full[a], 1);
+            // The row loader, the MMA warp and the task's epilogue warpgroup.
+            bar_init(&task_empty[a], 6);
+        }
         bar_init_fence();
     }
     if (warp == 2) {
@@ -176,17 +195,37 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
     const int live_routes = R.start[p.experts];
     const int tasks = blocks * (j1 + j2);
     const long long route0 = static_cast<long long>(R.t0) * K;
+    const u32 chunks = static_cast<u32>(H / kChunk);
     u32* xready = p.sync + ws_xready();
     u32* hready = p.sync + ws_hready();
     u32* done = p.sync + ws_done();
 
+    // A role's walk over the claimed tasks: slot n % kSlots, its phase.
+    auto claimed = [&](int n) {
+        const int s = n % kSlots;
+        bar_wait(&task_full[s], (n / kSlots) & 1);
+        return task_slot[s];
+    };
+
     if (warp == 0) {
-        // The weights: a stage is a gate-up tile's 128 K of its gate and up
-        // rows, or a down tile's 256 K (W4A8; bf16 half those), and their
-        // scales' atoms.
+        // Claims each task as the ring frees, then streams its weights: a
+        // gate-up stage's 128 K of its gate and up rows, a down stage's 256 K
+        // (W4A8; bf16 half those), and their scales' atoms. Past the last
+        // task, two slots say so (each epilogue warpgroup reads every other).
         if (lane == 0) {
             u32 s = 0, ph = 0;
-            for (int t = static_cast<int>(blockIdx.x); t < tasks; t += G) {
+            int ended = 0;
+            for (int n = 0; ended < 2; ++n) {
+                const int slot = n % kSlots;
+                bar_wait(&task_empty[slot], ((n / kSlots) & 1) ^ 1);
+                const u32 got = ended ? static_cast<u32>(tasks) : atomicAdd(p.sync + ws_next(), 1u);
+                const int t = got < static_cast<u32>(tasks) ? static_cast<int>(got) : -1;
+                task_slot[slot] = t;
+                bar_arrive(&task_full[slot]);
+                if (t < 0) {
+                    ++ended;
+                    continue;
+                }
                 const Task x = task_of<kBN>(R, t, blocks, j1, j2);
                 const int nk = x.l2 ? I / (2 * kBoxK) : H / kBoxK;
                 const int row = x.l2 ? x.e * H + 128 * x.j : x.e * 2 * I + 128 * x.j;
@@ -222,12 +261,15 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
         // The routes' rows from the pools, each once its producers say.
         if (lane == 0) {
             u32 s = 0, ph = 0;
-            for (int t = static_cast<int>(blockIdx.x); t < tasks; t += G) {
+            for (int n = 0;; ++n) {
+                const int t = claimed(n);
+                bar_arrive(&task_empty[n % kSlots]);
+                if (t < 0) break;
                 const Task x = task_of<kBN>(R, t, blocks, j1, j2);
                 const int nk = x.l2 ? I / (2 * kBoxK) : H / kBoxK;
                 const int p0 = x.b * kPoolStride;
                 if (!x.l2) {
-                    wait_count(&xready[x.b], static_cast<u32>(x.rows));
+                    wait_count(&xready[x.b], static_cast<u32>(x.rows) * chunks);
                     fence_proxy_global();
                 }
                 u32 have = 0;
@@ -237,8 +279,7 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
                         // (W4A8), or tile kb (bf16).
                         const u32 need = kW4 ? 3u << (2 * kb) : 1u << kb;
                         if ((have & need) != need) {
-                            wait_bits(&hready[x.b], need);
-                            have = ld_acquire(&hready[x.b]);
+                            have = wait_bits(&hready[x.b], need);
                             fence_proxy_global();
                         }
                     }
@@ -275,7 +316,11 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
         int it = 0;
         const u32 sfa = tmem + kSfCol;
         const u32 sfb = sfa + 8;
-        for (int t = static_cast<int>(blockIdx.x); t < tasks; t += G) {
+        for (int n = 0;; ++n) {
+            const int t = claimed(n);
+            __syncwarp();
+            if (lane == 0) bar_arrive(&task_empty[n % kSlots]);
+            if (t < 0) break;
             const Task x = task_of<kBN>(R, t, blocks, j1, j2);
             const int nk = x.l2 ? I / (2 * kBoxK) : H / kBoxK;
             const u32 acc = static_cast<u32>(it) % 2;
@@ -307,6 +352,8 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
                             const u64 b = db + (j / 4) * ((kBN * 128) >> 4) + 2 * (j % 4);
                             const bool more = kb > 0 || j > 0;
                             if constexpr (kW4) {
+                                // The weights' scale column kb * 8 + j (atom
+                                // j / 4), the rows' kb * 2 + j / 4.
                                 const u32 cq = 2 * static_cast<u32>(kb) + j / 4;
                                 const u32 desc = idesc_with_ids(
                                     idesc_scaled(kE2M1, kE4M3, 128, kBN, true), j % 4, cq % 4);
@@ -323,6 +370,8 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
                             for (u32 j = 0; j < 4; ++j) {
                                 const bool more = kb > 0 || j > 0;
                                 if constexpr (kW4) {
+                                    // The gate's (h 0) or up's atom, column j;
+                                    // the rows' column kb.
                                     const u32 desc = idesc_with_ids(
                                         idesc_scaled(kE2M1, kE4M3, 128, kBN, true), j,
                                         static_cast<u32>(kb) % 4);
@@ -350,13 +399,13 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
             ++it;
         }
         // Every commit has landed before the barriers retire.
-        if (it > 0) {
-            const u32 l = static_cast<u32>(it - 1);
-            bar_wait(&tempty[l % 2], (l / 2) & 1);
+        for (int l = max(0, it - 2); l < it; ++l) {
+            bar_wait(&tempty[l % 2], (static_cast<u32>(l) / 2) & 1);
         }
     } else {
-        // Warps 3-7 first quantize (or copy) the routes' rows of this CTA's
-        // blocks into the activation pool, a row a warp at a time.
+        // Warps 3-11 first quantize (or copy) the routes' rows of this CTA's
+        // blocks into the activation pool, a 1024-column chunk a warp at a
+        // time.
         {
             const int qw = warp - 3;
             int k = 0;
@@ -364,54 +413,49 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
                 const int e = R.block_expert[b];
                 const int m = b - R.bstart[e];
                 const int rows = min(R.count[e] - m * kBN, kBN);
-                for (int n = 0; n < rows; ++n, ++k) {
-                    if (k % 5 != qw) continue;
+                for (int item = 0; item < rows * static_cast<int>(chunks); ++item, ++k) {
+                    if (k % kHelpers != qw) continue;
+                    const int n = item / static_cast<int>(chunks);
+                    const int c0 = (item - n * static_cast<int>(chunks)) * (kChunk / 128);
                     const int r = R.sorted[R.start[e] + m * kBN + n];
                     const bf16* src = p.x + (route0 + r) / K * H;
                     const long long prow = static_cast<long long>(b) * kPoolStride + n;
-                    if constexpr (kW4) {
-                        // Two 128-blocks a pass, sixteen lanes a block, four
-                        // passes' loads in flight.
-                        const int half = lane / 16, sub = lane % 16;
-                        for (int c0 = 0; c0 < H / 128; c0 += 8) {
-                            uint4 w[4];
+                    const int half = lane / 16, sub = lane % 16;
+                    uint4 w[4];
 #pragma unroll
-                            for (int q = 0; q < 4; ++q) {
-                                const int c = c0 + 2 * q + half;
-                                w[q] = c < H / 128 ? *reinterpret_cast<const uint4*>(src + c * 128 + sub * 8)
-                                                   : make_uint4(0, 0, 0, 0);
+                    for (int q = 0; q < 4; ++q) {
+                        const int c = c0 + 2 * q + half;
+                        w[q] = *reinterpret_cast<const uint4*>(src + c * 128 + sub * 8);
+                    }
+#pragma unroll
+                    for (int q = 0; q < 4; ++q) {
+                        const int c = c0 + 2 * q + half;
+                        if constexpr (kW4) {
+                            // `E4m3Block<128>::load`'s amax over the block's
+                            // sixteen lanes, from the words already loaded.
+                            E4m3Block<128> blk;
+                            const unsigned words[4] = {w[q].x, w[q].y, w[q].z, w[q].w};
+                            float amax = 0.f;
+#pragma unroll
+                            for (int i = 0; i < 4; ++i) {
+                                blk.v[2 * i] = __uint_as_float(words[i] << 16);
+                                blk.v[2 * i + 1] = __uint_as_float(words[i] & 0xFFFF0000u);
+                                amax = fmaxf(amax, fmaxf(fabsf(blk.v[2 * i]), fabsf(blk.v[2 * i + 1])));
                             }
 #pragma unroll
-                            for (int q = 0; q < 4; ++q) {
-                                const int c = c0 + 2 * q + half;
-                                E4m3Block<128> blk;
-                                const unsigned words[4] = {w[q].x, w[q].y, w[q].z, w[q].w};
-                                float amax = 0.f;
-#pragma unroll
-                                for (int i = 0; i < 4; ++i) {
-                                    blk.v[2 * i] = __uint_as_float(words[i] << 16);
-                                    blk.v[2 * i + 1] = __uint_as_float(words[i] & 0xFFFF0000u);
-                                    amax = fmaxf(amax, fmaxf(fabsf(blk.v[2 * i]), fabsf(blk.v[2 * i + 1])));
-                                }
-#pragma unroll
-                                for (int o = 8; o > 0; o >>= 1) {
-                                    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
-                                }
-                                blk.e = e4m3_block_exp(amax);
-                                if (c < H / 128) {
-                                    *reinterpret_cast<unsigned long long*>(p.xpool + prow * H + c * 128 + sub * 8) =
-                                        blk.codes();
-                                    if (sub == 0) {
-                                        p.xpool_sf[atom_offset(static_cast<int>(prow), c, H / 128)] =
-                                            static_cast<u8>(blk.e + 127);
-                                    }
-                                }
+                            for (int o = 8; o > 0; o >>= 1) {
+                                amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
                             }
+                            blk.e = e4m3_block_exp(amax);
+                            *reinterpret_cast<unsigned long long*>(p.xpool + prow * H + c * 128 + sub * 8) =
+                                blk.codes();
+                            if (sub == 0) {
+                                p.xpool_sf[atom_offset(static_cast<int>(prow), c, H / 128)] =
+                                    static_cast<u8>(blk.e + 127);
+                            }
+                        } else {
+                            *reinterpret_cast<uint4*>(p.xpool + (prow * H + c * 128 + sub * 8) * 2) = w[q];
                         }
-                    } else {
-                        const uint4* s4 = reinterpret_cast<const uint4*>(src);
-                        uint4* d4 = reinterpret_cast<uint4*>(p.xpool + prow * H * 2);
-                        for (int c = lane; c < H / 8; c += 32) d4[c] = s4[c];
                     }
                     fence_proxy_global();
                     __syncwarp();
@@ -420,18 +464,34 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
             }
         }
         if (warp >= 4) {
-            // The epilogue: thread i holds row i of the tile (a GLU column, or
-            // an output column) for the block's kBN routes.
-            const int q = warp - 4;
+            // The epilogue: warpgroup wg takes the tasks claimed at n = wg, wg
+            // + 2, ... (accumulator wg); thread i holds row i of the tile (a
+            // GLU column, or an output column) for the block's kBN routes.
+            const int wg = (warp - 4) / 4;
+            const int q = warp % 4;
             const int i = q * 32 + lane;
-            int it = 0;
-            for (int t = static_cast<int>(blockIdx.x); t < tasks; t += G) {
+            float* wmax = wmax_all + wg * 4 * kBN;
+            for (int n = wg;; n += 2) {
+                const int t = claimed(n);
+                __syncwarp();
+                if (lane == 0) bar_arrive(&task_empty[n % kSlots]);
+                if (t < 0) break;
                 const Task x = task_of<kBN>(R, t, blocks, j1, j2);
-                const u32 acc = static_cast<u32>(it) % 2;
-                bar_wait(&tfull[acc], (static_cast<u32>(it) / 2) & 1);
+                const u32 acc = static_cast<u32>(wg);
+                bar_wait(&tfull[acc], (static_cast<u32>(n) / 2) & 1);
                 tc_fence_after();
                 const u32 base = tmem + acc * kAcc + ((static_cast<u32>(q) * 32) << 16);
                 const long long p0 = static_cast<long long>(x.b) * kPoolStride;
+                // Lane c's route (column c0 + c) and, gate-up, its weight
+                // (DeepSeek's), read while the accumulator lands.
+                long long r_lane[kBN / 32];
+                float w_lane[kBN / 32];
+#pragma unroll
+                for (int c0 = 0; c0 < kBN; c0 += 32) {
+                    const int n_me = c0 + lane;
+                    r_lane[c0 / 32] = n_me < x.rows ? route0 + R.sorted[x.s0 + n_me] : 0;
+                    w_lane[c0 / 32] = kFirst && !x.l2 && n_me < x.rows ? __ldg(&p.weights[r_lane[c0 / 32]]) : 1.f;
+                }
                 if (!x.l2) {
                     for (int c0 = 0; c0 < kBN; c0 += 32) {
                         u32 g[32], u[32];
@@ -443,19 +503,17 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
                             __syncwarp();
                             if (lane == 0) bar_arrive(&tempty[acc]);
                         }
-                        // Lane n's route: column c0 + n.
-                        const int n_me = c0 + lane;
-                        float w_me = 1.f;
-                        if (kFirst && n_me < x.rows) {
-                            w_me = __ldg(&p.weights[route0 + R.sorted[x.s0 + n_me]]);
-                        }
+                        if (c0 >= x.rows) continue;
+                        // The live columns' GLU (the rest hold another block's
+                        // garbage), the gate-up product read as the apart
+                        // select lands it, in bf16.
                         float v[32];
 #pragma unroll
-                        for (int n = 0; n < 32; ++n) {
-                            // The gate-up product lands bf16 apart, the GLU
-                            // reading it so.
-                            float gv = bf16_round(__uint_as_float(g[n]));
-                            float uv = bf16_round(__uint_as_float(u[n]));
+                        for (int c = 0; c < 32; ++c) {
+                            v[c] = 0.f;
+                            if (c0 + c >= x.rows) continue;
+                            float gv = bf16_round(__uint_as_float(g[c]));
+                            float uv = bf16_round(__uint_as_float(u[c]));
                             float y;
                             if constexpr (kGlu == 2) {
                                 gv = fminf(gv, p.limit);
@@ -465,50 +523,51 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
                                 y = gv / (1.f + __expf(-gv)) * uv;
                             }
                             if constexpr (kFirst) {
-                                y = y * __shfl_sync(0xffffffffu, w_me, n);
+                                y = y * __shfl_sync(0xffffffffu, w_lane[c0 / 32], c);
                             }
-                            v[n] = bf16_round(y);
+                            v[c] = bf16_round(y);
                         }
                         const int col = 128 * x.j + i;
                         if constexpr (kW4) {
                             // A 128-column block's amax: the warps' maxima met
                             // in shared memory.
-                            float mine = 0.f;
+                            float top = 0.f;
 #pragma unroll
-                            for (int n = 0; n < 32; ++n) {
-                                const u32 m = warp_max_u32(__float_as_uint(fabsf(v[n])));
-                                if (lane == n) mine = __uint_as_float(m);
+                            for (int c = 0; c < 32; ++c) {
+                                if (c0 + c >= x.rows) continue;
+                                const u32 m = warp_max_u32(__float_as_uint(fabsf(v[c])));
+                                if (lane == c) top = __uint_as_float(m);
                             }
-                            wmax[q * kBN + c0 + lane] = mine;
-                            epi_sync();
+                            wmax[q * kBN + c0 + lane] = top;
+                            wg_sync(wg);
 #pragma unroll
-                            for (int n = 0; n < 32; ++n) {
-                                if (c0 + n >= x.rows) break;
-                                const float amax = fmaxf(fmaxf(wmax[c0 + n], wmax[kBN + c0 + n]),
-                                                         fmaxf(wmax[2 * kBN + c0 + n], wmax[3 * kBN + c0 + n]));
+                            for (int c = 0; c < 32; ++c) {
+                                if (c0 + c >= x.rows) continue;
+                                const float amax = fmaxf(fmaxf(wmax[c0 + c], wmax[kBN + c0 + c]),
+                                                         fmaxf(wmax[2 * kBN + c0 + c], wmax[3 * kBN + c0 + c]));
                                 const int e = e4m3_block_exp(amax);
                                 const float inv = __uint_as_float(static_cast<unsigned>(127 - e) << 23);
-                                const float s = fminf(fmaxf(v[n] * inv, -448.f), 448.f);
-                                const unsigned short pair = static_cast<unsigned short>(
-                                    __nv_cvt_float2_to_fp8x2(make_float2(s, 0.f), __NV_SATFINITE, __NV_E4M3));
-                                p.hpool[(p0 + c0 + n) * I + col] = static_cast<u8>(pair & 0xFF);
-                                if (i == n) {
-                                    p.hpool_sf[atom_offset(static_cast<int>(p0 + c0 + n), x.j, I / 128)] =
+                                const float sv = fminf(fmaxf(v[c] * inv, -448.f), 448.f);
+                                const unsigned short code = static_cast<unsigned short>(
+                                    __nv_cvt_float2_to_fp8x2(make_float2(sv, 0.f), __NV_SATFINITE, __NV_E4M3));
+                                p.hpool[(p0 + c0 + c) * I + col] = static_cast<u8>(code & 0xFF);
+                                if (i == c) {
+                                    p.hpool_sf[atom_offset(static_cast<int>(p0 + c0 + c), x.j, I / 128)] =
                                         static_cast<u8>(e + 127);
                                 }
                             }
-                            epi_sync();
+                            wg_sync(wg);
                         } else {
-                            bf16* h = reinterpret_cast<bf16*>(p.hpool);
+                            bf16* hp = reinterpret_cast<bf16*>(p.hpool);
 #pragma unroll
-                            for (int n = 0; n < 32; ++n) {
-                                if (c0 + n >= x.rows) break;
-                                h[(p0 + c0 + n) * I + col] = f32_to_bf16(v[n]);
+                            for (int c = 0; c < 32; ++c) {
+                                if (c0 + c >= x.rows) continue;
+                                hp[(p0 + c0 + c) * I + col] = f32_to_bf16(v[c]);
                             }
                         }
                     }
                     fence_proxy_global();
-                    epi_sync();
+                    wg_sync(wg);
                     if (i == 0) or_release(&hready[x.b], 1u << x.j);
                 } else {
                     for (int c0 = 0; c0 < kBN; c0 += 32) {
@@ -520,21 +579,17 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
                             __syncwarp();
                             if (lane == 0) bar_arrive(&tempty[acc]);
                         }
-                        const int n_me = c0 + lane;
-                        const long long r_me = n_me < x.rows ? route0 + R.sorted[x.s0 + n_me] : 0;
                         const int col = 128 * x.j + i;
 #pragma unroll
-                        for (int n = 0; n < 32; ++n) {
-                            if (c0 + n >= x.rows) break;
-                            const long long r = __shfl_sync(0xffffffffu, r_me, n);
-                            p.routed[r * H + col] = f32_to_bf16(__uint_as_float(d[n]));
+                        for (int c = 0; c < 32; ++c) {
+                            if (c0 + c >= x.rows) continue;
+                            const long long r = __shfl_sync(0xffffffffu, r_lane[c0 / 32], c);
+                            p.routed[r * H + col] = f32_to_bf16(__uint_as_float(d[c]));
                         }
                     }
-                    __threadfence();
-                    epi_sync();
+                    wg_sync(wg);
                     if (i == 0) add_release(&done[x.j], static_cast<u32>(x.rows));
                 }
-                ++it;
             }
         }
         // The fold: token t's 128-column tile j once every route has landed
@@ -542,9 +597,10 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
         {
             const int fw = warp - 3;
             const int items = R.tokens * j2;
-            for (int item = static_cast<int>(blockIdx.x) + G * fw; item < items; item += 5 * G) {
+            for (int item = static_cast<int>(blockIdx.x) + G * fw; item < items; item += kHelpers * G) {
                 const int t = item / j2, j = item - t * j2;
-                wait_count(&done[j], static_cast<u32>(live_routes));
+                if (lane == 0) wait_count(&done[j], static_cast<u32>(live_routes));
+                __syncwarp();
                 if (lane < 16) {
                     const int col = 128 * j + 8 * lane;
                     const long long tok = R.t0 + t;
@@ -600,17 +656,20 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
     __syncthreads();
     if (threadIdx.x == 0) {
         __threadfence();
-        *last = atomicAdd(&p.sync[ws_finish()], 1u) == static_cast<u32>(G - 1) ? 1u : 0u;
+        *flag = atomicAdd(&p.sync[ws_finish()], 1u) == static_cast<u32>(G - 1) ? 1u : 0u;
     }
     __syncthreads();
-    if (*last != 0) {
+    if (*flag != 0) {
         __threadfence();
         for (int b = static_cast<int>(threadIdx.x); b < blocks; b += kThreads) {
             xready[b] = 0;
             hready[b] = 0;
         }
         for (int j = static_cast<int>(threadIdx.x); j < j2; j += kThreads) done[j] = 0;
-        if (threadIdx.x == 0) p.sync[ws_finish()] = 0;
+        if (threadIdx.x == 0) {
+            p.sync[ws_next()] = 0;
+            p.sync[ws_finish()] = 0;
+        }
     }
     if (warp == 2) {
         tc_fence_after();

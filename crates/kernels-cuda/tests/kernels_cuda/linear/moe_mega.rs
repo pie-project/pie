@@ -8,7 +8,7 @@ use crate::common::tc5::random;
 use dtype::Dtype::{Bf16, F32, I32, U8};
 use kernels_cuda::jit::Ctx;
 use kernels_cuda::linear::act_quant::{self, Bank, Format, Source};
-use kernels_cuda::linear::gemm_sm100::{Elem, atom_bytes, supported};
+use kernels_cuda::linear::gemm_sm100::{Elem, Glu, atom_bytes, supported};
 use kernels_cuda::linear::moe;
 use kernels_cuda::tensor::Tensor;
 
@@ -209,25 +209,38 @@ fn apart(ctx: &Ctx, s: Shape, w: &W4a8, f: &mut Fire, a: &mut Apart) {
     moe::sum_add(ctx, a.routed, f.shared, &mut f.y).expect("fires");
 }
 
-/// The mean microseconds of `body`, `reps` of it captured into one graph
-/// and replayed (a graph launch's own cost spread over them).
+/// The microseconds of `body` captured into a graph: the least of many
+/// replays each timed by events, a card shared with other work slowing
+/// some.
+#[allow(unsafe_code)]
 fn timed(b: &Bench, ctx: &Ctx, reps: u32, mut body: impl FnMut()) -> f64 {
+    use kernels_cuda::cudarc::runtime::sys as rt;
     body();
     b.sync();
-    let exec = crate::common::captured(ctx, || {
-        for _ in 0..reps {
-            body();
+    let exec = crate::common::captured(ctx, &mut body);
+    let stream = ctx.stream().cast();
+    let mut best = f32::MAX;
+    // SAFETY: the events are locals created and destroyed here, recorded on
+    // the test's live stream around a replay of `exec`, which outlives them.
+    unsafe {
+        let (mut start, mut stop): (rt::cudaEvent_t, rt::cudaEvent_t) =
+            (core::ptr::null_mut(), core::ptr::null_mut());
+        rt::cudaEventCreate(&raw mut start);
+        rt::cudaEventCreate(&raw mut stop);
+        for _ in 0..10 * reps {
+            rt::cudaEventRecord(start, stream);
+            crate::common::replay(ctx, exec);
+            rt::cudaEventRecord(stop, stream);
+            rt::cudaEventSynchronize(stop);
+            let mut ms = 0f32;
+            rt::cudaEventElapsedTime(&raw mut ms, start, stop);
+            best = best.min(ms);
         }
-    });
-    crate::common::replay(ctx, exec);
-    b.sync();
-    let start = std::time::Instant::now();
-    crate::common::replay(ctx, exec);
-    crate::common::replay(ctx, exec);
-    b.sync();
-    let us = start.elapsed().as_secs_f64() * 1e6 / f64::from(2 * reps);
+        rt::cudaEventDestroy(start);
+        rt::cudaEventDestroy(stop);
+    }
     crate::common::forget(exec);
-    us
+    f64::from(best) * 1e3
 }
 
 /// The mega-MoE's rate at DeepSeek-V4-Flash's decode shapes, against the
@@ -334,4 +347,156 @@ fn the_w4a8_mega_moe_answers_the_composition_apart() {
             "{tokens}: {mean:.3e} mean, {max:.3e} at most"
         );
     }
+}
+
+/// A bf16 bank `[experts][rows][k]` of small random values.
+fn bf16_bank(b: &mut Bench, experts: usize, rows: usize, k: usize) -> Tensor {
+    let mut bits = b.bits ^ (rows * 131 + k) as u64;
+    let words = tab(experts * rows * k, |_| {
+        let r = random(&mut bits);
+        // Values in (-1/16, 1/16): a 4096-long dot stays near one.
+        let v = ((r >> 8) as f32 / 16_777_216.0 - 0.5) / 8.0;
+        crate::common::to_bf16(v)
+    });
+    t(b.up(&words), experts, rows * k, Bf16)
+}
+
+/// A bf16 routed MLP as the engine runs it apart: the gate-up select, the
+/// GLU (clamped and under each route's weight where `first`), the down
+/// select, and the fold (the plain sum plus the shared row where `first`,
+/// else each route under its weight).
+#[allow(clippy::too_many_arguments)]
+fn apart_bf16(
+    ctx: &Ctx,
+    s: Shape,
+    (up, down): (Tensor, Tensor),
+    first: bool,
+    f: &mut Fire,
+    a: &mut Apart,
+) {
+    use kernels_cuda::linear::glu;
+    let (fan, i) = (s.top as u32, s.inter as u32);
+    let res = moe::ExpertTable::RESIDENT;
+    moe::matmul_select(ctx, f.x, up, f.routes, &mut a.packed, res).expect("fires");
+    if first {
+        glu::swiglu_clamp_routed(ctx, a.packed, i, f.weights, fan, LIMIT, &mut a.hidden)
+            .expect("fires");
+    } else {
+        glu::swiglu(ctx, a.packed, i, fan, &mut a.hidden).expect("fires");
+    }
+    moe::matmul_select(ctx, a.hidden, down, f.routes, &mut a.routed, res).expect("fires");
+    if first {
+        moe::sum_add(ctx, a.routed, f.shared, &mut f.y).expect("fires");
+    } else {
+        moe::weighted_sum(ctx, a.routed, f.weights, &mut f.y).expect("fires");
+    }
+}
+
+#[test]
+fn the_bf16_mega_moe_answers_the_composition_apart() {
+    if !supported() {
+        eprintln!("skipped: no tcgen05 on this device");
+        return;
+    }
+    let s = Shape {
+        hidden: 2048,
+        inter: 1024,
+        experts: 16,
+        top: 4,
+    };
+    let mut b = Bench::new(0xbf16);
+    let up = bf16_bank(&mut b, s.experts, 2 * s.inter, s.hidden);
+    let down = bf16_bank(&mut b, s.experts, s.hidden, s.inter);
+    let ctx = b.ctx().with_tuning(SM100);
+    for first in [false, true] {
+        for tokens in [1usize, 5, 40] {
+            let what = format!("{tokens} tokens, weights first {first}");
+            let mut f = fire_of(&mut b, s, tokens, 0x77 + tokens as u64);
+            let mut a = apart_of(&mut b, s, tokens);
+            apart_bf16(&ctx, s, (up, down), first, &mut f, &mut a);
+            let want = b.read(f.y.ptr, tokens * s.hidden);
+            let mut y = b.out(tokens, s.hidden);
+            let glu = if first {
+                Glu::SwigluClamp { limit: LIMIT }
+            } else {
+                Glu::Swiglu
+            };
+            let m = moe::RoutedMlp {
+                x: f.x,
+                up: moe::GluBank::Bf16(up),
+                glu,
+                down: moe::GluBank::Bf16(down),
+                routes: f.routes,
+                weights: f.weights,
+                inter: s.inter as u32,
+            };
+            let fold = if first {
+                moe::Fold::First(Some(f.shared))
+            } else {
+                moe::Fold::Weighted
+            };
+            let took = moe::mega(&ctx, m, fold, &mut y).expect("fires");
+            assert!(took, "{what}: the mega-MoE takes the fire");
+            let got = b.read(y.ptr, tokens * s.hidden);
+            let (mean, max) = spread(&got, &want);
+            eprintln!("bf16 {what}: mean {mean:.2e} max {max:.2e}");
+            assert!(
+                mean < 2e-3 && max < 5e-2,
+                "{what}: {mean:.3e} mean, {max:.3e} at most"
+            );
+        }
+    }
+}
+
+/// A fire under a live window (a graph's replay at fewer rows than it was
+/// captured for) lands those rows as a fire of them alone would, bit for
+/// bit, and leaves the rest.
+#[test]
+fn the_mega_moe_lands_its_live_window_alone() {
+    if !supported() {
+        eprintln!("skipped: no tcgen05 on this device");
+        return;
+    }
+    let s = Shape {
+        experts: 16,
+        ..V4_FLASH
+    };
+    let mut b = Bench::new(0x3a1d);
+    let w = w4a8(&mut b, s, true);
+    let ctx = b.ctx().with_tuning(SM100);
+    let tokens = 24usize;
+    let (live, first) = (9usize, 5usize);
+    let f = fire_of(&mut b, s, tokens, 0x91);
+    let mut whole = b.out(tokens, s.hidden);
+    let m = mlp_of(s, &w, &f);
+    let fold = moe::Fold::First(Some(f.shared));
+    assert!(
+        moe::mega(&ctx, m, fold, &mut whole).expect("fires"),
+        "takes the fire"
+    );
+    let want = b.read(whole.ptr, tokens * s.hidden);
+    let mut y = t(
+        b.up(&vec![0x7f7fu16; tokens * s.hidden]),
+        tokens,
+        s.hidden,
+        Bf16,
+    );
+    ctx.arm_stage(b.up(&[live as u32, first as u32]));
+    let took = moe::mega(&ctx, m, fold, &mut y).expect("fires");
+    ctx.disarm_stage();
+    assert!(took, "the windowed fire is taken");
+    let got = b.read(y.ptr, tokens * s.hidden);
+    let span = first * s.hidden..(first + live) * s.hidden;
+    let same = got[span.clone()]
+        .iter()
+        .zip(&want[span.clone()])
+        .all(|(g, w)| g.to_bits() == w.to_bits());
+    assert!(same, "the live rows are the whole fire's, bit for bit");
+    let sentinel = f64::from(crate::common::from_bf16(0x7f7f));
+    let rest = got
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !span.contains(i))
+        .all(|(_, &v)| v == sentinel);
+    assert!(rest, "rows past the window are untouched");
 }
