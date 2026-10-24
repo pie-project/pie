@@ -233,8 +233,13 @@ pub fn packaged(
     let trace = package
         .trace(&model.id, &deploy, &name, platform)
         .map_err(|why| anyhow!("`{name}` does not serve on {platform:?}: {why:#}"))?;
-    let trace = poem_compiler::shard::shard(trace, deploy.tp)
-        .map_err(|why| anyhow!("`{name}` does not split across {} ranks: {why}", deploy.tp))?;
+    let trace = poem_compiler::catalog::lowered(trace, &deploy).map_err(|why| {
+        anyhow!(
+            "`{name}` does not split across {} tensor and {} expert ranks: {why}",
+            deploy.tp,
+            deploy.ep
+        )
+    })?;
     Ok((name, deploy.tp, trace))
 }
 
@@ -483,12 +488,13 @@ pub fn contract_for(
             trace.name
         )
     })?;
-    if deployment.deploy.tp > 1 {
+    let ranks = deployment.deploy.tp.max(deployment.deploy.ep);
+    if ranks > 1 {
         return Err(format!(
-            "{:?} is a {}-rank deployment and {checkpoint:?} is an unconverted checkpoint: the \
-             ranks band their shares out of a stamped artifact, so convert it first (`pie model \
-             import`) and serve the artifact",
-            trace.name, deployment.deploy.tp
+            "{:?} is a {ranks}-rank deployment and {checkpoint:?} is an unconverted checkpoint: \
+             the ranks band their shares out of a stamped artifact, so convert it first (`pie \
+             model import`) and serve the artifact",
+            trace.name
         ));
     }
     deployment

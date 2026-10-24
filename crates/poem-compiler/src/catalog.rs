@@ -48,9 +48,7 @@ impl Deployment {
             .package
             .trace(&self.model.id, &self.deploy, &self.name, platform)
             .map_err(|why| Refused(format!("{why:#}")))?;
-        let trace =
-            crate::shard::shard(trace, self.deploy.tp).map_err(|why| Refused(why.to_string()))?;
-        crate::expert::lower(trace, self.deploy.ep, 0).map_err(|why| Refused(why.to_string()))
+        lowered(trace, &self.deploy).map_err(Refused)
     }
 
     /// [`Deployment::try_trace`], panicking: for a listed deployment, which builds.
@@ -116,6 +114,13 @@ pub fn whole(tp: u32) -> Result<(), poem::import::Error> {
              ranks; nothing has banded the file it is reading"
         ),
     })
+}
+
+/// The trace each rank of `deploy` runs, from the one the package records:
+/// split across its tensor ranks, its experts across its expert ranks.
+pub fn lowered(trace: Trace, deploy: &Deploy) -> Result<Trace, String> {
+    let trace = crate::shard::shard(trace, deploy.tp).map_err(|why| why.to_string())?;
+    crate::expert::lower(trace, deploy.ep, 0).map_err(|why| why.to_string())
 }
 
 /// The rank counts [`Catalog::splits`] tries.
