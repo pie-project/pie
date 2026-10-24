@@ -161,6 +161,7 @@ pub fn compile_axes(
         concurrency,
         streams,
         fold_refused: unit::fold_refused(&units),
+        expert: expert::held(trace),
         units,
         units_of,
         patches,

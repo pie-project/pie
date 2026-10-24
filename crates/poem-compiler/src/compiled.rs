@@ -27,6 +27,9 @@ pub struct CompiledModel {
     pub patches: Option<AxisPlan>,
     pub voxels: Option<AxisPlan>,
     pub fold_refused: bool,
+    /// [`crate::expert::held`]: the values an expert region makes, by id,
+    /// empty where nothing dispatches.
+    pub expert: Vec<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

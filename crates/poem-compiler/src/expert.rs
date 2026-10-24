@@ -442,6 +442,35 @@ impl Pass {
     }
 }
 
+/// Which values an expert region makes, by id: every Dispatch output and
+/// what is computed from one up to its Combine (whose output is the
+/// model's again). They are the received rows' values, `ep * tokens` rows
+/// on any rank whatever its own tokens. Empty where nothing dispatches.
+#[must_use]
+pub fn held(trace: &Trace) -> Vec<bool> {
+    let mut held = vec![false; trace.values.len()];
+    let (mut ins, mut outs) = (Vec::new(), Vec::new());
+    let mut any = false;
+    for node in &trace.nodes {
+        ins.clear();
+        node.op.inputs(&mut ins);
+        let inside = match &node.op {
+            Operation::Collective(Collective::Dispatch { .. }) => true,
+            Operation::Collective(Collective::Combine { .. }) => false,
+            _ => ins.iter().any(|v| held[v.0 as usize]),
+        };
+        if inside {
+            any = true;
+            outs.clear();
+            node.op.outputs(&mut outs);
+            for v in &outs {
+                held[v.0 as usize] = true;
+            }
+        }
+    }
+    if any { held } else { Vec::new() }
+}
+
 /// What a rank with no tokens of its own runs while the others step: each
 /// lowered layer's dispatch (sending nothing), the experts it holds over the
 /// rows the others send it, and the combine that sends them back, in layer
@@ -451,30 +480,25 @@ impl Pass {
 /// the model makes.
 #[must_use]
 pub fn idle(lowered: &Trace) -> Option<Trace> {
-    let mut kept = BTreeSet::new();
-    let mut held = BTreeSet::new();
+    let held = held(lowered);
+    if held.is_empty() {
+        return None;
+    }
     let mut ins = Vec::new();
     let mut outs = Vec::new();
+    let mut kept = BTreeSet::new();
     for (at, node) in lowered.nodes.iter().enumerate() {
-        ins.clear();
-        node.op.inputs(&mut ins);
         let take = match &node.op {
-            Operation::Collective(Collective::Dispatch { .. }) => true,
-            Operation::Collective(Collective::Combine { y, .. }) => held.contains(y),
-            _ => ins.iter().any(|v| held.contains(v)),
+            Operation::Collective(Collective::Combine { y, .. }) => held[y.0 as usize],
+            _ => {
+                outs.clear();
+                node.op.outputs(&mut outs);
+                outs.iter().any(|v| held[v.0 as usize])
+            }
         };
-        if !take {
-            continue;
+        if take {
+            kept.insert(at);
         }
-        kept.insert(at);
-        outs.clear();
-        node.op.outputs(&mut outs);
-        if !matches!(node.op, Operation::Collective(Collective::Combine { .. })) {
-            held.extend(outs.iter().copied());
-        }
-    }
-    if kept.is_empty() {
-        return None;
     }
 
     // Every value the kept nodes read is made by one of them, a weight, or a
