@@ -135,9 +135,15 @@ pub fn whole(tp: u32) -> Result<(), poem::import::Error> {
 /// projections tiled where the platform reads them so ([`crate::tile`]), split across its
 /// tensor ranks, its experts across its expert ranks.
 pub fn lowered(trace: Trace, deploy: &Deploy) -> Result<Trace, String> {
+    lowered_with(trace, deploy, 0)
+}
+
+/// [`lowered`], each expert rank holding `replicas` slots past its share of
+/// a layer's experts.
+pub fn lowered_with(trace: Trace, deploy: &Deploy, replicas: u32) -> Result<Trace, String> {
     let trace = crate::tile::tile(crate::pack::pack(trace));
     let trace = crate::shard::shard(trace, deploy.tp).map_err(|why| why.to_string())?;
-    crate::expert::lower(trace, deploy.ep, 0).map_err(|why| why.to_string())
+    crate::expert::lower(trace, deploy.ep, replicas).map_err(|why| why.to_string())
 }
 
 /// What [`lowered`] decides of `trace`'s weights that an import stores so.
