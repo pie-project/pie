@@ -323,6 +323,36 @@ def test_json_object(http: Http):
     assert isinstance(json.loads(content), dict), content
 
 
+def test_structural_tag(http: Http):
+    schema = {
+        "type": "object",
+        "properties": {"name": {"type": "string"}},
+        "required": ["name"],
+        "additionalProperties": False,
+    }
+    status, _, text = http.post(
+        "/v1/completions",
+        {
+            "prompt": 'Q: Paris\nA: The city <city>{"name": "Paris"}</city>\nQ: Rome\nA:',
+            "max_tokens": 40,
+            "temperature": 0,
+            "stop": ["\nQ:"],
+            "response_format": {
+                "type": "structural_tag",
+                "structures": [{"begin": "<city>", "schema": schema, "end": "</city>"}],
+                "triggers": ["<city>"],
+            },
+        },
+    )
+    assert status == 200, text
+    out = json.loads(text)["choices"][0]["text"]
+    # Free before the trigger, the schema and the end forced after it.
+    assert "<city>" in out, out
+    inside = out.split("<city>", 1)[1]
+    assert "</city>" in inside, out
+    assert isinstance(json.loads(inside.split("</city>", 1)[0])["name"], str), out
+
+
 def test_bad_requests(http: Http):
     status, _, text = chat(http, messages=[])
     assert status == 400, (status, text)
@@ -917,6 +947,7 @@ TESTS = [
     test_tool_result_round_trip,
     test_json_schema,
     test_json_object,
+    test_structural_tag,
     test_bad_requests,
     test_official_openai_client,
     test_anthropic_non_streaming,

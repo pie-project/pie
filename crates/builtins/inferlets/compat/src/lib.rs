@@ -11,6 +11,8 @@
 //! - [`generate`]: the ETA pipeline — chunked prefill, a device-carried decode
 //!   loop, and an epilogue sampler with temperature, top-p, top-k, the OpenAI
 //!   penalties, and an optional grammar mask.
+//! - [`trigger`]: a grammar that holds only once a trigger opens it
+//!   (structural tags).
 //! - [`demux`]: the generated token stream classified by the host's chat,
 //!   reasoning and tool decoders into [`Event`]s an adapter formats.
 //! - [`envelope`] and [`emit`]: the contract with the gateway — how the HTTP
@@ -31,12 +33,16 @@ pub mod prompt;
 pub mod request;
 pub mod run;
 mod speculative;
+pub mod trigger;
 
 pub use demux::Event;
 pub use envelope::Envelope;
 pub use error::ApiError;
 pub use generate::{Generated, Logprob, Sampling};
-pub use request::{Effort, Message, Request, ResponseFormat, Role, Thinking, ToolCall, ToolChoice};
+pub use request::{
+    Effort, Message, Request, ResponseFormat, Role, StructuralTag, Structure, Thinking, ToolCall,
+    ToolChoice,
+};
 pub use run::{Finish, Outcome, run};
 
 /// Runs `futures` side by side to their ends, their outputs in order: the

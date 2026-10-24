@@ -9,7 +9,7 @@
 //! is: `messages` is a chat completion, `prompt` a completion, `input` a
 //! response.
 
-use compat::{ApiError, Envelope};
+use compat::{ApiError, Envelope, ResponseFormat, StructuralTag, Structure};
 use serde_json::{Value, json};
 
 pub mod chat_completions;
@@ -127,6 +127,103 @@ fn prompt_logprobs(asked: Option<i64>, stream: bool) -> Result<Option<u32>, ApiE
                 Some("prompt_logprobs"),
             )
         })
+}
+
+/// The `response_format` field: `text`, `json_object`, `json_schema`, or
+/// vLLM's and SGLang's `structural_tag` —
+///
+/// ```json
+/// {"type": "structural_tag",
+///  "structures": [{"begin": "<function=get_weather>", "schema": {…}, "end": "</function>"}],
+///  "triggers": ["<function="]}
+/// ```
+///
+/// — free text in which a trigger opens the structures whose `begin` it
+/// starts: the rest of the `begin`, a document the `schema` admits and the
+/// `end` are then forced ([`compat::trigger`]).
+fn response_format(format: Option<Value>) -> Result<ResponseFormat, ApiError> {
+    let blame = Some("response_format");
+    let Some(v) = format else {
+        return Ok(ResponseFormat::Text);
+    };
+    Ok(match v.get("type").and_then(Value::as_str) {
+        None | Some("text") => ResponseFormat::Text,
+        Some("json_object") => ResponseFormat::JsonObject,
+        Some("json_schema") => {
+            let schema = v
+                .get("json_schema")
+                .and_then(|s| s.get("schema"))
+                .ok_or_else(|| {
+                    invalid(
+                        "response_format json_schema needs `json_schema.schema`",
+                        blame,
+                    )
+                })?;
+            ResponseFormat::JsonSchema(schema.to_string())
+        }
+        Some("structural_tag") => ResponseFormat::StructuralTag(structural_tag(&v)?),
+        Some(other) => {
+            return Err(invalid(
+                format!("unknown response_format type `{other}`"),
+                blame,
+            ));
+        }
+    })
+}
+
+/// A `structural_tag` response format's structures and triggers.
+fn structural_tag(v: &Value) -> Result<StructuralTag, ApiError> {
+    let blame = Some("response_format");
+    if v.get("format").is_some() {
+        return Err(invalid(
+            "a structural_tag `format` is not supported; send `structures` and `triggers`",
+            blame,
+        ));
+    }
+    let text = |item: &Value, key: &str| -> Result<String, ApiError> {
+        match item.get(key) {
+            None => Ok(String::new()),
+            Some(Value::String(s)) => Ok(s.clone()),
+            Some(_) => Err(invalid(
+                format!("structural_tag `{key}` must be a string"),
+                blame,
+            )),
+        }
+    };
+    let structures = v
+        .get("structures")
+        .and_then(Value::as_array)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid("structural_tag needs a non-empty `structures` array", blame))?
+        .iter()
+        .map(|item| {
+            let schema = item
+                .get("schema")
+                .ok_or_else(|| invalid("a structural_tag structure needs a `schema`", blame))?;
+            Ok(Structure {
+                begin: text(item, "begin")?,
+                schema: schema.to_string(),
+                end: text(item, "end")?,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let triggers = v
+        .get("triggers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("structural_tag needs a `triggers` array", blame))?
+        .iter()
+        .map(|t| {
+            t.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| invalid("structural_tag triggers must be strings", blame))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let tag = StructuralTag {
+        structures,
+        triggers,
+    };
+    tag.validate().map_err(|e| invalid(e, blame))?;
+    Ok(tag)
 }
 
 /// The `n` field: how many choices, at least one. A request of several is

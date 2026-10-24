@@ -19,7 +19,9 @@
 //!
 //! With a grammar the loop is depth-1 — the mask for fire k+1 exists only
 //! once fire k's token has advanced the matcher — so constrained generation
-//! submits one fire at a time; unconstrained generation runs ahead.
+//! submits one fire at a time; unconstrained generation runs ahead. A
+//! grammar that holds only after a trigger ([`crate::trigger`]) is a
+//! guide too, so its free stretches go a fire at a time as well, unmasked.
 
 use std::ops::ControlFlow;
 
@@ -70,6 +72,32 @@ pub struct Logprob {
     /// Where the token ranks among the vocabulary, 1 for the likeliest:
     /// counted for prompt tokens, which were not sampled.
     pub rank: Option<u32>,
+}
+
+/// What constrains generation fire by fire: a grammar's matcher, or a
+/// grammar that holds only part of the way ([`crate::trigger`]).
+pub trait Guide {
+    /// The tokens allowed next as a packed bitmask, empty for any.
+    fn mask(&mut self) -> Vec<u32>;
+    /// Advance past a sampled `token`.
+    fn accept(&mut self, token: u32) -> Result<()>;
+    /// The grammar ended the turn.
+    fn is_terminated(&self) -> bool;
+}
+
+impl Guide for Matcher {
+    fn mask(&mut self) -> Vec<u32> {
+        Matcher::mask(self)
+    }
+
+    fn accept(&mut self, token: u32) -> Result<()> {
+        self.accept_tokens(&[token])
+            .map_err(|e| format!("token {token} rejected: {e:?}"))
+    }
+
+    fn is_terminated(&self) -> bool {
+        Matcher::is_terminated(self)
+    }
 }
 
 /// What [`generate`] did: how many tokens it sampled, how many of the
@@ -480,13 +508,13 @@ fn prompt_rows(
 /// logprobs, `on_prompt` has them ([`Generated::prompt_logprobs`]) before
 /// the first token comes.
 ///
-/// With a `matcher`, every fire's logits are masked to what the grammar
-/// allows next, and generation ends when the grammar terminates.
+/// With a `guide`, every fire's logits are masked to what it allows next,
+/// and generation ends when it terminates.
 pub async fn generate(
     prompt: &Prompt,
     sampling: Sampling,
     max_tokens: usize,
-    matcher: Option<&Matcher>,
+    mut guide: Option<&mut dyn Guide>,
     on_prompt: &mut dyn FnMut(&[Logprob]),
     on_token: &mut dyn FnMut(u32, Option<Logprob>) -> ControlFlow<()>,
 ) -> Result<Generated> {
@@ -503,7 +531,7 @@ pub async fn generate(
     if sampling.speculative
         && sampling.temperature == 0.0
         && !sampling.penalized()
-        && matcher.is_none()
+        && guide.is_none()
         && sampling.logprobs.is_none()
         && sampling.prompt_logprobs.is_none()
         && !prompt.is_empty()
@@ -587,7 +615,7 @@ pub async fn generate(
     // which reads the prompt's token once they are on their way. A grammar
     // advances on the host before the next mask exists, so it waits; so do
     // logprobs, which the host reads beside each token.
-    let carried_on = (matcher.is_none() && sampling.logprobs.is_none()).then(|| {
+    let carried_on = (guide.is_none() && sampling.logprobs.is_none()).then(|| {
         (
             Channel::new([1], dtype::i32).named("tok_in").queued(),
             penalized.then(|| {
@@ -618,7 +646,9 @@ pub async fn generate(
                 Channel::from(present.clone()).named("present_p"),
             )
         });
-        let mask = matcher.map(|_| Channel::new([vocab], dtype::bool).named("mask_p"));
+        let mask = guide
+            .is_some()
+            .then(|| Channel::new([vocab], dtype::bool).named("mask_p"));
         let g0_ch = Channel::new([1], dtype::i32).named("g0");
         // Only the last span's token is sampled for the answer, so only it
         // lands logprobs.
@@ -663,8 +693,8 @@ pub async fn generate(
                 }
             }
         });
-        if let (Some(m), Some(matcher)) = (mask, matcher) {
-            m.put(unpack_mask(&matcher.mask(), vocab));
+        if let (Some(m), Some(guide)) = (mask, guide.as_deref_mut()) {
+            m.put(unpack_mask(&guide.mask(), vocab));
         }
         // Checkpoints only where messages end: each costs a state slot.
         fwd.checkpoints(ends)?;
@@ -690,14 +720,12 @@ pub async fn generate(
     let mut sampled = 0usize;
     if carried_on.is_none() {
         sampled = 1;
-        if let Some(matcher) = matcher {
-            matcher
-                .accept_tokens(&[g0 as u32])
-                .context("advance grammar")?;
+        if let Some(guide) = guide.as_deref_mut() {
+            guide.accept(g0 as u32).context("advance grammar")?;
         }
         if on_token(g0 as u32, lp0).is_break()
             || max_tokens == 1
-            || matcher.is_some_and(|m| m.is_terminated())
+            || guide.as_deref().is_some_and(|g| g.is_terminated())
         {
             pipe.close();
             return Ok(Generated {
@@ -739,7 +767,9 @@ pub async fn generate(
             )
         })
     });
-    let mask = matcher.map(|_| Channel::new([vocab], dtype::bool).named("mask"));
+    let mask = guide
+        .is_some()
+        .then(|| Channel::new([vocab], dtype::bool).named("mask"));
 
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;
@@ -782,19 +812,19 @@ pub async fn generate(
     });
 
     let budget = max_tokens - 1;
-    match (matcher, mask) {
-        (Some(matcher), Some(mask)) => {
+    match (guide, mask) {
+        (Some(guide), Some(mask)) => {
             let mut fired = 0usize;
             while fired < budget {
-                mask.put(unpack_mask(&matcher.mask(), vocab));
+                mask.put(unpack_mask(&guide.mask(), vocab));
                 fwd.submit(&pipe).context("constrained decode submit")?;
                 fired += 1;
                 let t = out.take_host::<Vec<i32>>().await?;
                 let token = *t.first().unwrap_or(&0) as u32;
                 let lp = take_logprob(lp_ch.as_ref()).await?;
                 sampled += 1;
-                matcher.accept_tokens(&[token]).context("advance grammar")?;
-                if on_token(token, lp).is_break() || matcher.is_terminated() {
+                guide.accept(token).context("advance grammar")?;
+                if on_token(token, lp).is_break() || guide.is_terminated() {
                     break;
                 }
             }

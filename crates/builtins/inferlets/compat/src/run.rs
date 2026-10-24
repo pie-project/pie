@@ -10,10 +10,11 @@ use inferlet::grammar::{Grammar, Matcher};
 use inferlet::pie::inferlet::tools;
 
 use crate::demux::{Demux, Event};
-use crate::generate::{Logprob, generate};
+use crate::generate::{Guide, Logprob, generate};
 use crate::holdback::HoldBack;
 use crate::prompt;
 use crate::request::{Request, ResponseFormat, ToolCall};
+use crate::trigger::{self, Triggered};
 
 /// Why generation ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,8 +62,8 @@ fn pair_prompt(tokens: &[u32], scored: &[Logprob]) -> Vec<(u32, Option<Logprob>)
 /// Each report takes a lock on the host.
 const REPORT_EVERY: u32 = 32;
 
-/// The constraint a request puts on the output, as a live matcher.
-fn constraint(req: &Request) -> Result<Option<Matcher>, String> {
+/// The constraint a request puts on the output, as a live guide.
+fn constraint(req: &Request) -> Result<Option<Box<dyn Guide>>, String> {
     let forced = req.forces_tool_call();
     let formatted = req.response_format != ResponseFormat::Text;
     if forced && formatted {
@@ -75,15 +76,20 @@ fn constraint(req: &Request) -> Result<Option<Matcher>, String> {
         if callable.is_empty() {
             return Err("tool_choice names a tool that is not in `tools`".into());
         }
-        return Ok(Some(tools::create_matcher(&callable)));
+        return Ok(Some(Box::new(tools::create_matcher(&callable))));
     }
     let grammar = match &req.response_format {
         ResponseFormat::Text => return Ok(None),
+        ResponseFormat::StructuralTag(tag) => {
+            tag.validate()?;
+            let triggered = Triggered::new(tag.clone(), trigger::Host::new());
+            return Ok(Some(Box::new(triggered)));
+        }
         ResponseFormat::JsonObject => Grammar::json(),
         ResponseFormat::JsonSchema(schema) => Grammar::from_json_schema(schema)
             .map_err(|e| format!("response_format schema: {e:?}"))?,
     };
-    Ok(Some(Matcher::new(&grammar)))
+    Ok(Some(Box::new(Matcher::new(&grammar))))
 }
 
 /// Content on its way to the sink passes the stop-sequence filter; what the
@@ -144,7 +150,7 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
         .unwrap_or_default();
     prompt.tokens.extend_from_slice(&continued);
     let mut generated = continued.len() as u32;
-    let matcher = constraint(req)?;
+    let mut guide = constraint(req)?;
     let stop_tokens = chat::stop_tokens();
     let mut demux = Demux::new(&chat::cue_thinking(prompt::thinks(req)), req.choice);
     if req.raw_prompt.is_some() {
@@ -207,7 +213,7 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
         &prompt,
         req.sampling,
         req.max_tokens.saturating_sub(continued.len()),
-        matcher.as_ref(),
+        guide.as_mut().map(|g| g.as_mut() as &mut dyn Guide),
         &mut on_prompt,
         &mut on_token,
     )
@@ -227,7 +233,7 @@ pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, Stri
 
     let mut finish = match out.finish {
         Some(f) => f,
-        None if matcher.as_ref().is_some_and(|m| m.is_terminated()) => Finish::Stop,
+        None if guide.as_ref().is_some_and(|g| g.is_terminated()) => Finish::Stop,
         None => Finish::Length,
     };
     if finish == Finish::Stop && !demux.tool_calls.is_empty() {

@@ -8,7 +8,8 @@
 //!
 //! Supported: `messages` (system/user/assistant/tool, text parts), `tools`
 //! and `tool_choice` (`none`/`auto`/`required`/named), `response_format`
-//! (`text`/`json_object`/`json_schema`), `stream` and
+//! (`text`/`json_object`/`json_schema`, and vLLM's and SGLang's
+//! `structural_tag`: see [`crate::response_format`]), `stream` and
 //! `stream_options.include_usage`, `temperature`, `top_p`, `top_k`,
 //! `max_tokens`/`max_completion_tokens`, `ignore_eos`, `stop`, `seed`,
 //! `presence_penalty`, `frequency_penalty`, `repetition_penalty`, vLLM's
@@ -27,8 +28,8 @@
 //! unknown field is ignored, as OpenAI does.
 
 use compat::{
-    ApiError, Effort, Envelope, Event, Finish, Message, Request, ResponseFormat, Role, Thinking,
-    ToolCall, ToolChoice, emit,
+    ApiError, Effort, Envelope, Event, Finish, Message, Request, Role, Thinking, ToolCall,
+    ToolChoice, emit,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -259,31 +260,7 @@ fn parse(body: Value) -> Result<(Request, bool, u32), ApiError> {
             Some("tool_choice"),
         ));
     }
-    req.response_format = match body.response_format {
-        None => ResponseFormat::Text,
-        Some(v) => match v.get("type").and_then(Value::as_str) {
-            None | Some("text") => ResponseFormat::Text,
-            Some("json_object") => ResponseFormat::JsonObject,
-            Some("json_schema") => {
-                let schema = v
-                    .get("json_schema")
-                    .and_then(|s| s.get("schema"))
-                    .ok_or_else(|| {
-                        invalid(
-                            "response_format json_schema needs `json_schema.schema`",
-                            Some("response_format"),
-                        )
-                    })?;
-                ResponseFormat::JsonSchema(schema.to_string())
-            }
-            Some(other) => {
-                return Err(invalid(
-                    format!("unknown response_format type `{other}`"),
-                    Some("response_format"),
-                ));
-            }
-        },
-    };
+    req.response_format = crate::response_format(body.response_format)?;
     if let Some(t) = body.temperature {
         req.sampling.temperature = t;
     }

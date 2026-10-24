@@ -5,6 +5,8 @@
 //! (default 16), `temperature`, `top_p`, `top_k`, `stop`, `seed`, `echo`,
 //! the penalties, `stream`, `stream_options.include_usage`, `ignore_eos`
 //! (vLLM's and SGLang's extension), vLLM's `min_tokens` and `min_p`, `n`,
+//! vLLM's `response_format` (as chat completions take it, `structural_tag`
+//! among them),
 //! and `logprobs` (an integer, up to 20: the legacy `tokens`,
 //! `token_logprobs`, `top_logprobs`, `text_offset` lists).
 //!
@@ -37,6 +39,7 @@ struct Body {
     top_p: Option<f32>,
     top_k: Option<u32>,
     stop: Option<Value>,
+    response_format: Option<Value>,
     seed: Option<i64>,
     n: Option<u32>,
     logprobs: Option<Value>,
@@ -151,6 +154,7 @@ fn parse(body: Value) -> Result<Parsed, ApiError> {
     }
     req.sampling.validate().map_err(|e| invalid(e, None))?;
     req.stop = stop_sequences(body.stop)?;
+    req.response_format = crate::response_format(body.response_format)?;
     Ok(Parsed {
         req,
         prompt,
@@ -434,6 +438,39 @@ mod tests {
         assert_eq!(parsed.req.sampling.prompt_logprobs, Some(5));
         assert_eq!(parsed.echo_logprobs(), Some(2));
         assert_eq!(parsed.prompt_logprobs, Some(5));
+    }
+
+    #[test]
+    fn a_structural_tag_reads_its_structures_and_triggers() {
+        let parsed = parse(json!({
+            "prompt": "Hi",
+            "response_format": {
+                "type": "structural_tag",
+                "structures": [{"begin": "<function=f>", "schema": {"type": "object"}, "end": "</function>"}],
+                "triggers": ["<function="],
+            },
+        }))
+        .unwrap();
+        let compat::ResponseFormat::StructuralTag(tag) = parsed.req.response_format else {
+            panic!("not a structural tag");
+        };
+        assert_eq!(tag.triggers, vec!["<function=".to_string()]);
+        assert_eq!(tag.structures[0].begin, "<function=f>");
+        assert_eq!(tag.structures[0].schema, r#"{"type":"object"}"#);
+        assert_eq!(tag.structures[0].end, "</function>");
+    }
+
+    #[test]
+    fn a_structural_tag_without_structures_or_with_a_lone_trigger_is_refused() {
+        for format in [
+            json!({"type": "structural_tag", "structures": [], "triggers": ["<f"]}),
+            json!({"type": "structural_tag", "structures": [{"begin": "<f>", "schema": {}}]}),
+            json!({"type": "structural_tag", "structures": [{"begin": "<f>"}], "triggers": ["<f"]}),
+            json!({"type": "structural_tag", "structures": [{"begin": "<f>", "schema": {}}], "triggers": ["<g"]}),
+            json!({"type": "structural_tag", "format": {"type": "triggered_tags"}}),
+        ] {
+            assert!(parse(json!({"prompt": "Hi", "response_format": format})).is_err());
+        }
     }
 
     #[test]
