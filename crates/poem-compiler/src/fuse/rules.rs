@@ -1092,19 +1092,23 @@ pub fn matmul_swiglu_matmul() -> Rule {
 /// the ones the kernel takes: DeepSeek-V4's W4A8 banks, the route weights
 /// scaling the clamped GLU's rows and the routes summed with the shared row
 /// added; and dense banks under the weighted sum (clamped or not), or the
-/// weights first under a clamp, the shared row added. A fire it declines
-/// still runs as its legs.
+/// weights first under a clamp, the shared row added. A weighted sum under
+/// Qwen's gated shared expert takes that gate-add along, as `moe_experts`
+/// does, so a fire the kernel declines runs as the whole `MoeExperts` the
+/// chain would have formed.
 #[must_use]
 pub fn moe_mega() -> Rule {
     let mut alternatives = Vec::new();
-    // (W4A8 banks, the weights first, a clamp)
+    // (W4A8 banks, the weights first, a clamp, a gated shared expert)
     let forms = [
-        (true, true, true),
-        (false, false, false),
-        (false, false, true),
-        (false, true, true),
+        (true, true, true, false),
+        (false, false, false, true),
+        (false, false, false, false),
+        (false, false, true, true),
+        (false, false, true, false),
+        (false, true, true, false),
     ];
-    for (w4a8, first, clamped) in forms {
+    for (w4a8, first, clamped, gated) in forms {
         alternatives.push(template(move |p| {
             let x = p.rows("x", W);
             let routes = p.value(
@@ -1147,12 +1151,22 @@ pub fn moe_mega() -> Rule {
             p.name("hidden", &hidden);
             let routed = select_of(&hidden, "down");
             p.name("routed", &routed);
-            let y = if first {
-                linear::moe_sum_add(&routed, &p.rows("shared", W))
+            if first {
+                p.export("y", &linear::moe_sum_add(&routed, &p.rows("shared", W)));
+                return;
+            }
+            let summed = linear::moe_weighted_sum(&routed, &weights);
+            if gated {
+                p.name("summed", &summed);
+                let y = linear::moe_sigmoid_gate_add(
+                    &summed,
+                    &p.rows("shared", W),
+                    &p.rows("gate", W),
+                );
+                p.export("y", &y);
             } else {
-                linear::moe_weighted_sum(&routed, &weights)
-            };
-            p.export("y", &y);
+                p.export("y", &summed);
+            }
         }));
     }
     Rule::new("fused.moe_mega", alternatives, |m| {
@@ -1160,11 +1174,17 @@ pub fn moe_mega() -> Rule {
             Operation::Linear(op) => Box::new(op.clone()),
             other => panic!("`{name}` is computed by {other:?}, not a linear op"),
         };
+        // Under a gate the sum is `summed` and the gate-add `y`.
+        let (sum, gate_add) = match m.get("summed") {
+            Some(_) => (linear_op("summed"), Some(linear_op("y"))),
+            None => (linear_op("y"), None),
+        };
         Fused::MoeMega {
             select: linear_op("packed"),
             glu: linear_op("hidden"),
             down: linear_op("routed"),
-            sum: linear_op("y"),
+            sum,
+            gate_add,
         }
     })
 }

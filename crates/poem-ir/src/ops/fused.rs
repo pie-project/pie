@@ -653,7 +653,10 @@ pub enum Fused {
     /// plainly with `sum`'s shared row added where given) or the weighted
     /// sum (`sum` takes them, no shared row). The rows between are still
     /// outputs, read by nothing else, so a backend that declines a fire
-    /// runs it as the `MoeExperts` it also is.
+    /// runs it as the `MoeExperts` it also is. A weighted sum under a gated
+    /// shared expert (Qwen's) carries that `MoeSigmoidGateAdd` as `gate_add`,
+    /// run after the launch, so the `MoeExperts` a decline runs is the whole
+    /// one the chain would have formed.
     MoeMega {
         #[part]
         select: Box<Linear>,
@@ -663,6 +666,8 @@ pub enum Fused {
         down: Box<Linear>,
         #[part]
         sum: Box<Linear>,
+        #[part]
+        gate_add: Option<Box<Linear>>,
     },
     /// `qkv` (a `QkvFusedQknormRopeVnormWrite`) on the first columns of its
     /// `packed` rows, the rest of each row (`rest`'s width) landing in

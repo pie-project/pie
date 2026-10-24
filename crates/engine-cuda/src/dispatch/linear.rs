@@ -109,15 +109,19 @@ impl Run<'_> {
                 glu,
                 down,
                 sum,
+                gate_add,
             } => {
                 #[cfg(feature = "cuda")]
                 if self.moe_mega(select, glu, down, sum)? {
-                    return Ok(());
+                    return match gate_add {
+                        Some(gate_add) => self.linear(gate_add),
+                        None => Ok(()),
+                    };
                 }
                 // Declined: dense banks under the weights first run their four
                 // legs apart, as no other fusion forms them; any other form is the
-                // grouped experts' (`MoeExperts`), whose own fallback runs it
-                // apart.
+                // grouped experts' (`MoeExperts`, its gate-add the one the chain
+                // carried), whose own fallback runs it apart.
                 if matches!(**select, Linear::MoeSelect { quant: None, .. })
                     && matches!(
                         **glu,
@@ -130,7 +134,10 @@ impl Run<'_> {
                     for leg in [select, glu, down, sum] {
                         self.linear(leg)?;
                     }
-                    return Ok(());
+                    return match gate_add {
+                        Some(gate_add) => self.linear(gate_add),
+                        None => Ok(()),
+                    };
                 }
                 self.fused_linear(&Fused::MoeExperts {
                     select: select.clone(),
@@ -138,7 +145,7 @@ impl Run<'_> {
                     down: down.clone(),
                     norm: None,
                     sum: sum.clone(),
-                    gate_add: None,
+                    gate_add: gate_add.clone(),
                 })
             }
             Fused::MatmulGlu {

@@ -468,11 +468,15 @@ impl Run<'_> {
                 glu,
                 down,
                 sum,
+                gate_add,
             } => {
                 for leg in [select, glu, down, sum] {
                     DispatchLinear::dispatch(self, leg)?;
                 }
-                Ok(())
+                match gate_add {
+                    Some(gate_add) => DispatchLinear::dispatch(self, gate_add),
+                    None => Ok(()),
+                }
             }
             Fused::MoeExperts {
                 select,
