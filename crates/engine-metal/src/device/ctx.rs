@@ -895,6 +895,37 @@ pub(crate) fn threadgroup(
     }
 }
 
+/// The threadgroup `fire` launches in: the one it states, else the widest
+/// `pipeline` runs over its lanes. A stated group wider than the pipeline
+/// runs is refused: Metal drops such a dispatch without a word, and the
+/// kernel's writes never land.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn group_of(
+    pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+    fire: kernels_metal::Fire,
+) -> Result<MTLSize> {
+    if fire.group == [0, 0, 0] {
+        return Ok(threadgroup(pipeline, fire.lanes));
+    }
+    let group = MTLSize {
+        width: fire.group[0].max(1) as usize,
+        height: fire.group[1].max(1) as usize,
+        depth: fire.group[2].max(1) as usize,
+    };
+    let threads = group.width * group.height * group.depth;
+    let most = pipeline.maxTotalThreadsPerThreadgroup();
+    if threads > most {
+        return Err(Fault::Shader {
+            file: fire.file,
+            entrypoint: fire.entrypoint,
+            why: format!(
+                "the fire asks for {threads} threads a group and this device runs the pipeline at most {most}"
+            ),
+        });
+    }
+    Ok(group)
+}
+
 /// Without a stated version a library compiles as the default of the SDK the
 /// app linked against, which can predate the MSL 4.0 some kernels need, so
 /// name 4.0 wherever the OS has it (26 on both macOS and iOS).
