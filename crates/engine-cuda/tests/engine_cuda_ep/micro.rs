@@ -61,7 +61,7 @@ fn fnv(name: &str) -> u64 {
 
 /// A plane's values, by its name: the same for one rank's whole bank and
 /// a rank's slots cut from it.
-fn values(name: &str, count: usize) -> Vec<u16> {
+pub fn values(name: &str, count: usize) -> Vec<u16> {
     let norm = name.ends_with("norm");
     let mut seed = fnv(name);
     (0..count)
