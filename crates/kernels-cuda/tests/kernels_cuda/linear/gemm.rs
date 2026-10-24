@@ -105,67 +105,6 @@ fn the_biased_projection_lands_the_dot_and_its_bias() {
 }
 
 #[test]
-fn a_batch_invariant_projection_lands_a_rows_bits_at_every_row_count() {
-    use kernels_cuda::linear::gemm::{matmul, matmul_bias};
-    // A decode's one row, a few, and prefill chunks, each against the
-    // widest launch's rows: the tuned tactics (the gemv, the few-rows
-    // kernel, a split cuBLASLt algorithm) follow the rows; batch-invariant,
-    // one algorithm a shape lands every row the same bits.
-    const ROWS: [usize; 11] = [1, 2, 3, 7, 8, 16, 33, 64, 128, 300, 1024];
-    let wide = ROWS[ROWS.len() - 1];
-    for (n, k, bias) in [
-        (4096, 4096, false),
-        (1536, 8192, true),
-        (32_768, 1024, false),
-    ] {
-        let mut b = Bench::new((n ^ k) as u64);
-        let ((x, xv), (w, wv), (bias_at, bv)) = (b.bf16(wide * k), b.bf16(n * k), b.bf16(n));
-        let mut ys: Vec<_> = ROWS.iter().map(|&m| b.out(m, n)).collect();
-        let base = Tuning {
-            gemm_rows_m: 8,
-            ..b.ctx().tuning()
-        };
-        let mut moved = Vec::new();
-        for tuning in [base, base.batch_invariant()] {
-            let ctx = b.ctx().with_tuning(tuning);
-            let wt = t(w, n, k, Bf16);
-            for (&m, y) in ROWS.iter().zip(&mut ys) {
-                // Twice: the first call picks the shape's tactic, the second runs it.
-                for _ in 0..2 {
-                    match bias {
-                        true => matmul_bias(&ctx, t(x, m, k, Bf16), wt, t(bias_at, 1, n, Bf16), y),
-                        false => matmul(&ctx, t(x, m, k, Bf16), wt, y),
-                    }
-                    .expect("the projection fires");
-                }
-            }
-            let all = b.read(ys[ROWS.len() - 1].ptr, wide * n);
-            let want = dense(&xv[..2 * k], &wv, [2, n, k], bias.then_some(&bv[..]));
-            check(
-                &all[..2 * n],
-                &want,
-                TOL,
-                &format!("{n}x{k} at {wide} rows"),
-            );
-            let off = |(&m, y): (&usize, &kernels_cuda::Tensor)| {
-                let rows = b.read(y.ptr, m * n);
-                rows.iter()
-                    .zip(&all)
-                    .filter(|(a, b)| a.to_bits() != b.to_bits())
-                    .count()
-            };
-            moved.push(ROWS.iter().zip(&ys).map(off).collect::<Vec<_>>());
-        }
-        eprintln!("{n}x{k}: values a row count moved, tuned: {:?}", moved[0]);
-        assert!(
-            moved[1].iter().all(|&off| off == 0),
-            "{n}x{k}: {:?}",
-            moved[1]
-        );
-    }
-}
-
-#[test]
 fn the_lane_projection_and_the_scalar_multiply_land_each_dtype() {
     use kernels_cuda::elemwise::pointwise::mul_scalar;
     use kernels_cuda::linear::lane_gemm::act_x_wt;

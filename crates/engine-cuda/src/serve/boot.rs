@@ -78,10 +78,6 @@ pub struct Knobs {
     /// (none or 0, never) it reads its loads and prints each MoE layer's
     /// `[expert-balance]` since the last read.
     pub expert_balance_steps: Option<u32>,
-    /// A lane's logits the same bits whatever else shares its fire: every
-    /// kernel's reduction order for a row fixed by the shapes it serves,
-    /// not by the fire's rows (`Tuning::batch_invariant`).
-    pub batch_invariant: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

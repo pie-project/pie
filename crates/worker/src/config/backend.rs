@@ -27,9 +27,6 @@ pub struct CudaEngineOptions {
     /// Every this many steps (0: never) an expert-parallel group prints
     /// each MoE layer's balance: rows a rank and a logical expert.
     pub expert_balance_steps: Option<u32>,
-    /// A request's logits the same bits whatever else shares its fire
-    /// (dense layers on CUDA; at some cost in speed).
-    pub batch_invariant: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]

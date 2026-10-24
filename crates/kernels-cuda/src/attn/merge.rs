@@ -167,12 +167,10 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<bool
     // narrow one's rows hold many, which the staged merge pipelines.
     // With sinks the warp fold takes every batch: it lands them in the same
     // pass, which outweighs the staged merge's edge on a narrow batch.
-    // Batch-invariant, it takes every batch too: the two fold a row's
-    // partials in different orders.
     let pairs = split.max_seq_len.saturating_mul(split.num_heads);
     if ctx.tuning().merge_warp
         && head_dim.is_multiple_of(64)
-        && (pairs >= num_sms * 8 || split.sinks != 0 || ctx.tuning().batch_invariant)
+        && (pairs >= num_sms * 8 || split.sinks != 0)
     {
         return fold_warp(ctx, op, split, num_sms).map(|()| split.sinks != 0);
     }
