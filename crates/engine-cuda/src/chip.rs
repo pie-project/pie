@@ -519,6 +519,7 @@ mod tests {
                 assert_eq!(tuning.decode_gqa, b200, "{gpu}");
                 assert_eq!(tuning.pool_mma, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(tuning.index_radix, major == 10 && minor == 0, "{gpu}");
+                assert_eq!(tuning.index_fp4_tc5, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(tuning.mla_sparse, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(
                     tuning.compressed_prefill_from,
@@ -636,6 +637,7 @@ mod tests {
                         mxfp4_cvt_ksplit_until: 0,
                         hc_mma: false,
                         index_tc5: false,
+                        index_fp4_tc5: false,
                         norm_emit: false,
                         qkv_rows_from: defaults.qkv_rows_from,
                         q_norm_rope_warp: false,
