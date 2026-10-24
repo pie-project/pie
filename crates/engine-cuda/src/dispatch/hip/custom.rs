@@ -176,7 +176,7 @@ impl Run<'_> {
             down_experts,
             intermediate,
             limit,
-            fan: self.plane_fan(self.tensor(*h).rows),
+            fan: self.plane_fan(*h),
             packed: self.tensor(*packed),
             h: self.tensor(*h),
             routed: self.tensor(*routed),

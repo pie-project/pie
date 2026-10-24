@@ -1773,7 +1773,12 @@ fn narrow(n: u64) -> i32 {
 /// The rows a fire's kernels write through its readout plane: a readout as
 /// tall as the fire is launched at the fire's bucket, so the plane must
 /// hold the bucket, not only the rows read out.
+/// A fire that reads nothing out (an idle expert-parallel rank's) writes
+/// nothing through it.
 fn readout_extent(rows: u32, bucket: u32, readouts: usize) -> u64 {
+    if readouts == 0 {
+        return 0;
+    }
     let pad = kernels_cuda::Pad { rows, bucket };
     u64::from(pad.extent(u32::try_from(readouts).unwrap_or(u32::MAX)))
 }
@@ -1870,5 +1875,6 @@ mod tests {
         assert_eq!(readout_extent(133, 256, 133), 256);
         assert_eq!(readout_extent(133, 256, 5), 5);
         assert_eq!(readout_extent(133, 133, 133), 133);
+        assert_eq!(readout_extent(0, 64, 0), 0);
     }
 }

@@ -13,8 +13,19 @@
 //! (the largest asked, which Dispatch's token count must agree on), fires
 //! the step on every rank, and posts each joined rank its result.
 
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+use crate::api::{ContractFor, Cuda, DeviceBoot, PendingStep};
+use engine::Engine;
+use engine::adapter::AdapterRegistration;
+use engine::caps::DeviceFacts;
+use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
+use engine::error::{Error, Result as EngineResult};
+use engine::fire::{FireTicket, FrameSubmission, FrameTicket, Step};
+use engine::load::{LoadRequest, Loaded};
+use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
+use engine::transfer::{KvCopy, KvHandle, StateCopy};
 
 /// What a rank brings to a step: its frame and the token bucket it asks.
 pub struct Arrival<F> {
@@ -187,222 +198,6 @@ impl<F, R> Rendezvous<F, R> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-    use std::thread;
-
-    fn lead_or_join(r: &Rendezvous<u32, u32>, rank: usize, frame: u32, bucket: u32) -> u32 {
-        match r
-            .arrive(rank, Arrival { frame, bucket })
-            .expect("not poisoned")
-        {
-            Part::Lead(formed) => {
-                // The stand-in fire: each rank's result is its frame, plus
-                // the bucket so a joined rank sees the step's.
-                let results = formed
-                    .frames
-                    .iter()
-                    .enumerate()
-                    .map(|(at, f)| f.filter(|_| at != rank).map(|f| f * 1000 + formed.bucket))
-                    .collect();
-                r.finish(formed.step, results);
-                frame * 1000 + formed.bucket
-            }
-            Part::Joined(result) => result,
-        }
-    }
-
-    /// A rank alone leads at once: nobody announced, nobody is waited for,
-    /// and the others idle in its step.
-    #[test]
-    fn a_lone_frame_fires_without_waiting_for_idle_ranks() {
-        let r = Rendezvous::<u32, u32>::new(4, Duration::from_secs(30));
-        let began = Instant::now();
-        match r
-            .arrive(
-                2,
-                Arrival {
-                    frame: 7,
-                    bucket: 64,
-                },
-            )
-            .unwrap()
-        {
-            Part::Lead(formed) => {
-                assert_eq!(formed.bucket, 64);
-                assert_eq!(formed.frames, vec![None, None, Some(7), None]);
-            }
-            Part::Joined(_) => panic!("the first arrival leads"),
-        }
-        assert!(
-            began.elapsed() < Duration::from_secs(5),
-            "it waited on idle ranks"
-        );
-    }
-
-    /// Announced ranks are waited for, so two busy ranks share one step at
-    /// the larger bucket instead of idling through each other's.
-    #[test]
-    fn announced_ranks_share_a_step_at_the_largest_bucket() {
-        let r = Arc::new(Rendezvous::<u32, u32>::new(2, Duration::from_secs(30)));
-        r.announce(1);
-        let late = {
-            let r = Arc::clone(&r);
-            thread::spawn(move || {
-                thread::sleep(Duration::from_millis(50));
-                lead_or_join(&r, 1, 2, 256)
-            })
-        };
-        let first = lead_or_join(&r, 0, 1, 32);
-        assert_eq!(first, 1256, "the leader fired at the joined rank's bucket");
-        assert_eq!(
-            late.join().unwrap(),
-            2256,
-            "the joined rank's frame fired in the same step"
-        );
-    }
-
-    /// An announced rank that never comes holds the step only to its
-    /// deadline.
-    #[test]
-    fn a_rank_that_announces_and_never_comes_holds_the_step_to_its_deadline() {
-        let r = Rendezvous::<u32, u32>::new(2, Duration::from_millis(100));
-        r.announce(1);
-        let began = Instant::now();
-        let Part::Lead(formed) = r
-            .arrive(
-                0,
-                Arrival {
-                    frame: 1,
-                    bucket: 8,
-                },
-            )
-            .unwrap()
-        else {
-            panic!("the first arrival leads");
-        };
-        assert!(began.elapsed() >= Duration::from_millis(100));
-        assert_eq!(formed.frames, vec![Some(1), None]);
-    }
-
-    /// Steps keep their order under many ranks submitting many frames: each
-    /// rank sees every one of its frames fire exactly once.
-    #[test]
-    fn every_frame_fires_once_across_many_steps() {
-        let ranks = 4;
-        let r = Arc::new(Rendezvous::<u32, u32>::new(ranks, Duration::from_millis(5)));
-        let threads: Vec<_> = (0..ranks)
-            .map(|rank| {
-                let r = Arc::clone(&r);
-                thread::spawn(move || {
-                    (0..200u32)
-                        .map(|i| {
-                            r.announce(rank);
-                            let frame = (rank as u32) * 1_000 + i;
-                            lead_or_join(&r, rank, frame, 16) / 1000
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        for (rank, t) in threads.into_iter().enumerate() {
-            let got = t.join().unwrap();
-            let want: Vec<u32> = (0..200).map(|i| (rank as u32) * 1_000 + i).collect();
-            assert_eq!(got, want, "rank {rank}'s frames");
-        }
-    }
-
-    /// A step forms while the one before it fires, but closes only after:
-    /// no two leaders fire at once.
-    #[test]
-    fn no_two_steps_fire_at_once() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let ranks = 4;
-        let r = Arc::new(Rendezvous::<u32, u32>::new(ranks, Duration::from_millis(1)));
-        let firing = Arc::new(AtomicBool::new(false));
-        let threads: Vec<_> = (0..ranks)
-            .map(|rank| {
-                let (r, firing) = (Arc::clone(&r), Arc::clone(&firing));
-                thread::spawn(move || {
-                    for i in 0..100u32 {
-                        match r
-                            .arrive(
-                                rank,
-                                Arrival {
-                                    frame: i,
-                                    bucket: 8,
-                                },
-                            )
-                            .unwrap()
-                        {
-                            Part::Lead(formed) => {
-                                assert!(
-                                    !firing.swap(true, Ordering::SeqCst),
-                                    "two steps fired at once"
-                                );
-                                thread::sleep(Duration::from_micros(200));
-                                firing.store(false, Ordering::SeqCst);
-                                let results = formed.frames.iter().map(|f| f.map(|_| 0)).collect();
-                                r.finish(formed.step, results);
-                            }
-                            Part::Joined(_) => {}
-                        }
-                    }
-                })
-            })
-            .collect();
-        threads.into_iter().for_each(|t| t.join().unwrap());
-    }
-
-    #[test]
-    fn a_poisoned_group_answers_every_waiting_rank() {
-        let r = Arc::new(Rendezvous::<u32, u32>::new(2, Duration::from_secs(30)));
-        r.announce(1);
-        let waiting = {
-            let r = Arc::clone(&r);
-            thread::spawn(move || {
-                r.arrive(
-                    0,
-                    Arrival {
-                        frame: 1,
-                        bucket: 8,
-                    },
-                )
-                .err()
-            })
-        };
-        thread::sleep(Duration::from_millis(50));
-        r.poison("rank 1 refused");
-        assert_eq!(waiting.join().unwrap().as_deref(), Some("rank 1 refused"));
-        assert!(
-            r.arrive(
-                1,
-                Arrival {
-                    frame: 2,
-                    bucket: 8
-                }
-            )
-            .is_err()
-        );
-    }
-}
-
-use std::sync::{Arc, Condvar as WiredCondvar};
-
-use engine::Engine;
-use engine::adapter::AdapterRegistration;
-use engine::caps::DeviceFacts;
-use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
-use engine::error::{Error, Result as EngineResult};
-use engine::fire::{FireTicket, FrameSubmission, FrameTicket, Step};
-use engine::load::{LoadRequest, Loaded};
-use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use engine::transfer::{KvCopy, KvHandle, StateCopy};
-
-use crate::api::{ContractFor, Cuda, DeviceBoot, PendingStep};
-
 /// How long a forming step waits for an announced rank's frame.
 const GATHER: Duration = Duration::from_millis(2);
 
@@ -416,7 +211,7 @@ struct Group {
     /// Ranks loaded, and whether the group is wired; a rank's first frame
     /// waits for the wiring, which the last rank to load does.
     wired: Mutex<(usize, Option<Result<(), String>>)>,
-    wired_cv: WiredCondvar,
+    wired_cv: Condvar,
 }
 
 impl Group {
@@ -566,7 +361,7 @@ pub fn open_lockstep(
         ordinals,
         steps: Rendezvous::new(size, GATHER),
         wired: Mutex::new((0, None)),
-        wired_cv: WiredCondvar::new(),
+        wired_cv: Condvar::new(),
     });
     Ok((0..size)
         .map(|rank| Rank {
@@ -778,5 +573,207 @@ impl Engine for Rank {
 
     fn disconnect(&self, message: &str) {
         self.group.poison(message);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    fn lead_or_join(r: &Rendezvous<u32, u32>, rank: usize, frame: u32, bucket: u32) -> u32 {
+        match r
+            .arrive(rank, Arrival { frame, bucket })
+            .expect("not poisoned")
+        {
+            Part::Lead(formed) => {
+                // The stand-in fire: each rank's result is its frame, plus
+                // the bucket so a joined rank sees the step's.
+                let results = formed
+                    .frames
+                    .iter()
+                    .enumerate()
+                    .map(|(at, f)| f.filter(|_| at != rank).map(|f| f * 1000 + formed.bucket))
+                    .collect();
+                r.finish(formed.step, results);
+                frame * 1000 + formed.bucket
+            }
+            Part::Joined(result) => result,
+        }
+    }
+
+    /// A rank alone leads at once: nobody announced, nobody is waited for,
+    /// and the others idle in its step.
+    #[test]
+    fn a_lone_frame_fires_without_waiting_for_idle_ranks() {
+        let r = Rendezvous::<u32, u32>::new(4, Duration::from_secs(30));
+        let began = Instant::now();
+        match r
+            .arrive(
+                2,
+                Arrival {
+                    frame: 7,
+                    bucket: 64,
+                },
+            )
+            .unwrap()
+        {
+            Part::Lead(formed) => {
+                assert_eq!(formed.bucket, 64);
+                assert_eq!(formed.frames, vec![None, None, Some(7), None]);
+            }
+            Part::Joined(_) => panic!("the first arrival leads"),
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "it waited on idle ranks"
+        );
+    }
+
+    /// Announced ranks are waited for, so two busy ranks share one step at
+    /// the larger bucket instead of idling through each other's.
+    #[test]
+    fn announced_ranks_share_a_step_at_the_largest_bucket() {
+        let r = Arc::new(Rendezvous::<u32, u32>::new(2, Duration::from_secs(30)));
+        r.announce(1);
+        let late = {
+            let r = Arc::clone(&r);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                lead_or_join(&r, 1, 2, 256)
+            })
+        };
+        let first = lead_or_join(&r, 0, 1, 32);
+        assert_eq!(first, 1256, "the leader fired at the joined rank's bucket");
+        assert_eq!(
+            late.join().unwrap(),
+            2256,
+            "the joined rank's frame fired in the same step"
+        );
+    }
+
+    /// An announced rank that never comes holds the step only to its
+    /// deadline.
+    #[test]
+    fn a_rank_that_announces_and_never_comes_holds_the_step_to_its_deadline() {
+        let r = Rendezvous::<u32, u32>::new(2, Duration::from_millis(100));
+        r.announce(1);
+        let began = Instant::now();
+        let Part::Lead(formed) = r
+            .arrive(
+                0,
+                Arrival {
+                    frame: 1,
+                    bucket: 8,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("the first arrival leads");
+        };
+        assert!(began.elapsed() >= Duration::from_millis(100));
+        assert_eq!(formed.frames, vec![Some(1), None]);
+    }
+
+    /// Steps keep their order under many ranks submitting many frames: each
+    /// rank sees every one of its frames fire exactly once.
+    #[test]
+    fn every_frame_fires_once_across_many_steps() {
+        let ranks = 4;
+        let r = Arc::new(Rendezvous::<u32, u32>::new(ranks, Duration::from_millis(5)));
+        let threads: Vec<_> = (0..ranks)
+            .map(|rank| {
+                let r = Arc::clone(&r);
+                thread::spawn(move || {
+                    (0..200u32)
+                        .map(|i| {
+                            r.announce(rank);
+                            let frame = (rank as u32) * 1_000 + i;
+                            lead_or_join(&r, rank, frame, 16) / 1000
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        for (rank, t) in threads.into_iter().enumerate() {
+            let got = t.join().unwrap();
+            let want: Vec<u32> = (0..200).map(|i| (rank as u32) * 1_000 + i).collect();
+            assert_eq!(got, want, "rank {rank}'s frames");
+        }
+    }
+
+    /// A step forms while the one before it fires, but closes only after:
+    /// no two leaders fire at once.
+    #[test]
+    fn no_two_steps_fire_at_once() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let ranks = 4;
+        let r = Arc::new(Rendezvous::<u32, u32>::new(ranks, Duration::from_millis(1)));
+        let firing = Arc::new(AtomicBool::new(false));
+        let threads: Vec<_> = (0..ranks)
+            .map(|rank| {
+                let (r, firing) = (Arc::clone(&r), Arc::clone(&firing));
+                thread::spawn(move || {
+                    for i in 0..100u32 {
+                        match r
+                            .arrive(
+                                rank,
+                                Arrival {
+                                    frame: i,
+                                    bucket: 8,
+                                },
+                            )
+                            .unwrap()
+                        {
+                            Part::Lead(formed) => {
+                                assert!(
+                                    !firing.swap(true, Ordering::SeqCst),
+                                    "two steps fired at once"
+                                );
+                                thread::sleep(Duration::from_micros(200));
+                                firing.store(false, Ordering::SeqCst);
+                                let results = formed.frames.iter().map(|f| f.map(|_| 0)).collect();
+                                r.finish(formed.step, results);
+                            }
+                            Part::Joined(_) => {}
+                        }
+                    }
+                })
+            })
+            .collect();
+        threads.into_iter().for_each(|t| t.join().unwrap());
+    }
+
+    #[test]
+    fn a_poisoned_group_answers_every_waiting_rank() {
+        let r = Arc::new(Rendezvous::<u32, u32>::new(2, Duration::from_secs(30)));
+        r.announce(1);
+        let waiting = {
+            let r = Arc::clone(&r);
+            thread::spawn(move || {
+                r.arrive(
+                    0,
+                    Arrival {
+                        frame: 1,
+                        bucket: 8,
+                    },
+                )
+                .err()
+            })
+        };
+        thread::sleep(Duration::from_millis(50));
+        r.poison("rank 1 refused");
+        assert_eq!(waiting.join().unwrap().as_deref(), Some("rank 1 refused"));
+        assert!(
+            r.arrive(
+                1,
+                Arrival {
+                    frame: 2,
+                    bucket: 8
+                }
+            )
+            .is_err()
+        );
     }
 }

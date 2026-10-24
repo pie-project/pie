@@ -343,7 +343,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::swiglu(
                     self.ctx(),
                     self.tensor(*packed),
@@ -362,7 +362,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::swiglu_clamp(
                     self.ctx(),
                     self.tensor(*packed),
@@ -382,7 +382,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::swiglu_clamp_alpha(
                     self.ctx(),
                     self.tensor(*packed),
@@ -403,7 +403,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::swiglu_clamp_split_routed(
                     self.ctx(),
                     self.tensor(*gate),
@@ -424,7 +424,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::swiglu_clamp_routed(
                     self.ctx(),
                     self.tensor(*packed),
@@ -490,8 +490,8 @@ impl Run<'_> {
                         })
                     }
                     poem_ir::ActQuant::E4m3 { gran } => {
+                        let fan = self.plane_fan(*x);
                         let x = self.tensor(*x);
-                        let fan = self.plane_fan(x.rows);
                         let x = linear::act_quant::quantized(self.ctx(), OP, x, gran, fan)?;
                         self.select_quant(x, *bank, *routes, *y)
                     }
@@ -524,7 +524,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::GegluTanh,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::geglu_tanh(
                     self.ctx(),
                     self.tensor(*gate),
@@ -534,11 +534,11 @@ impl Run<'_> {
                 )
             }
             Linear::GeluTanh { x, y } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::gelu_tanh(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
             }
             Linear::Relu2 { x, y } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::relu2(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
             }
             Linear::Glu {
@@ -551,7 +551,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::GegluTanh,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::geglu_tanh_packed(
                     self.ctx(),
                     self.tensor(*packed),
@@ -570,7 +570,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Situ { beta, up_cap, .. },
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::situ(
                     self.ctx(),
                     self.tensor(*packed),
@@ -1016,7 +1016,7 @@ impl Run<'_> {
                 0
             }
         } % linear::act_quant::FP8_HOLDS;
-        let fan = self.plane_fan(x.rows);
+        let fan = self.plane_fan(act);
         let (q, s) = linear::act_quant::quantized_codes_held(self.ctx(), op, x, hold, pow2, fan)?;
         // The hold's earlier rows are gone; past a decode batch nothing is
         // held (the stream's slab).

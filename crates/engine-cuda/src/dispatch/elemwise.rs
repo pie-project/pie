@@ -513,7 +513,7 @@ impl Run<'_> {
                 gate.map(|g| self.tensor(g)),
                 *eps,
                 *temperature,
-                self.plane_fan(self.tensor(*y).rows),
+                self.plane_fan(*y),
                 next.map(|n| elemwise::norm::Next {
                     weight: self.tensor(n.weight),
                     eps: n.eps,
@@ -936,7 +936,7 @@ impl Run<'_> {
                 heads: None,
                 x_out: _,
             } => {
-                let fan = self.plane_fan(self.tensor(*x).rows);
+                let fan = self.plane_fan(*x);
                 elemwise::gate::sigmoid_mul(
                     self.ctx(),
                     self.tensor(*gate),

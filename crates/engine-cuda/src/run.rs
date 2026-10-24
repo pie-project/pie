@@ -1286,10 +1286,17 @@ impl<'c> Run<'c> {
         self.standing().lanes(self.windows, self.window().span())
     }
 
-    pub(crate) fn plane_fan(&self, plane_rows: u32) -> u32 {
-        let tokens = self
-            .carve_rows()
-            .unwrap_or_else(|| self.window().span().rows);
+    /// How many rows of `plane` (a value laid over token rows, a run of
+    /// them per token) one token takes. An expert region's value is laid
+    /// over every rank's tokens at the bucket.
+    pub(crate) fn plane_fan(&self, plane: ValueId) -> u32 {
+        let plane_rows = self.tensor(plane).rows;
+        let tokens = if self.expert.get(plane.0 as usize).copied().unwrap_or(false) {
+            self.bucket() * self.ep_rank().map_or(1, |ep| ep.wires.len() as u32)
+        } else {
+            self.carve_rows()
+                .unwrap_or_else(|| self.window().span().rows)
+        };
         if tokens == 0 {
             return 1;
         }
