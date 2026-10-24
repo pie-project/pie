@@ -89,26 +89,34 @@ impl Rebalancer {
 
     /// Does what the boundary [`Rebalancer::due`] just counted is due: drops
     /// every rank's loads, or reads them and moves what the new placement
-    /// moves, the copies enqueued on `stream` (a stream of rank 0's device).
-    /// A rank's loads and table are touched on its own device, `devices` in
-    /// rank order. Every rank's work must have finished. The moves it made.
+    /// moves, the copies enqueued on rank 0's stream. A rank's loads and
+    /// table are touched on its own device and stream, `devices` and
+    /// `streams` in rank order: each rank's loads one copy and one memset,
+    /// every rank's enqueued before any is waited on. Every rank's work must
+    /// have finished. The moves it made.
     pub fn run(
         &mut self,
         due: Due,
         ranks: &mut [&mut EpRank],
         devices: &[i32],
-        stream: *mut core::ffi::c_void,
+        streams: &[*mut core::ffi::c_void],
     ) -> Result<usize> {
         let began = std::time::Instant::now();
-        let mut loads = Vec::with_capacity(ranks.len());
-        for (rank, &device) in ranks.iter_mut().zip(devices) {
+        for ((rank, &device), &stream) in ranks.iter_mut().zip(devices).zip(streams) {
             crate::device::ctx::bind_thread(device)?;
-            loads.push(rank.take_loads()?);
+            rank.take_loads(stream)?;
+        }
+        let mut loads = Vec::with_capacity(ranks.len());
+        for ((rank, &device), &stream) in ranks.iter().zip(devices).zip(streams) {
+            crate::device::ctx::bind_thread(device)?;
+            crate::device::ctx::sync(stream)?;
+            loads.push(rank.taken_loads());
         }
         crate::device::ctx::bind_thread(devices[0])?;
         if due == Due::Drop {
             return Ok(0);
         }
+        let stream = streams[0];
         let world = ranks.len() as u32;
         let shape: Vec<(u32, u32, u32, u32)> = ranks[0].layers().collect();
         let window = (self.knob.window / self.knob.every.max(1)).max(1) as usize;
