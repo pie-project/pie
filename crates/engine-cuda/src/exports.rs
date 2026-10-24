@@ -283,6 +283,31 @@ pub(crate) fn wide_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::
     })
 }
 
+/// A class's mask bits are staged once per lane, with causality baked in, and
+/// a wide class stages them unclipped: a causal masked prefill in a wide
+/// class would see future keys. Refuse a class that runs both.
+pub(crate) fn one_direction_per_mask(trace: &Trace, compiled: &CompiledModel) -> Result<()> {
+    let causal_masked = classes_running(trace, compiled, |op| {
+        matches!(
+            op,
+            poem_ir::Operation::Attn(poem_ir::Attn::Prefill {
+                mask: Some(_),
+                causal: true,
+                ..
+            })
+        )
+    });
+    match wide_classes(trace, compiled)
+        .iter()
+        .find(|&class| causal_masked.contains(class))
+    {
+        Some(class) => Err(Fault::Recipe(format!(
+            "class {class} attends both ways under one mask"
+        ))),
+        None => Ok(()),
+    }
+}
+
 #[must_use]
 pub(crate) fn corrected_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
     classes_running(trace, compiled, |op| {
@@ -839,6 +864,51 @@ pub(crate) fn regions_launching_schedules(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A drafter head's non-causal block and its trunk's causal masked
+    /// layers sit in different classes; one masked layer turned non-causal
+    /// puts both directions under its class's one mask, and the load
+    /// refuses it.
+    #[test]
+    fn a_class_attending_both_ways_under_one_mask_is_refused() {
+        let mut trace = poem_compiler::catalog::deployment("qwen35-d9b-dflash-u4g64-kv-bf16")
+            .expect("the catalog ships the drafter row")
+            .trace(poem::Platform::Cuda);
+        let compile = |trace: &Trace| {
+            poem_compiler::compile_axes(
+                trace,
+                &poem_compiler::Budgets {
+                    tokens: poem_compiler::Budget::new(4, 256),
+                    patches: None,
+                    voxels: None,
+                },
+                &poem_compiler::DeviceProfile::default(),
+            )
+            .expect("the plan bakes")
+        };
+        one_direction_per_mask(&trace, &compile(&trace)).expect("the row loads");
+        let causal = trace
+            .nodes
+            .iter_mut()
+            .find_map(|node| match &mut node.op {
+                poem_ir::Operation::Attn(poem_ir::Attn::Prefill {
+                    mask: Some(_),
+                    causal,
+                    ..
+                }) if *causal => Some(causal),
+                _ => None,
+            })
+            .expect("the trunk runs a causal masked prefill");
+        *causal = false;
+        let refusal = one_direction_per_mask(&trace, &compile(&trace))
+            .expect_err("one class now attends both ways under one mask");
+        assert!(
+            refusal
+                .to_string()
+                .ends_with("attends both ways under one mask"),
+            "{refusal}"
+        );
+    }
 
     #[test]
     fn every_flag_a_request_carries_lands_in_its_class() {

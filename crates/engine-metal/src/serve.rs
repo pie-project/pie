@@ -508,6 +508,32 @@ impl PreparedLoad<'_> {
                 }
             }
         }
+        // Mask bits are staged once per lane with causality baked in, and a
+        // wide class stages them unclipped: a causal masked prefill there
+        // would see future keys.
+        let mut causal_masked = poem_ir::ClassSet::default();
+        for region in compiled.template() {
+            let runs_causal_masked = region.nodes.clone().any(|node| {
+                matches!(
+                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
+                    Some(poem_ir::Operation::Attn(poem_ir::Attn::Prefill {
+                        mask: Some(_),
+                        causal: true,
+                        ..
+                    }))
+                )
+            });
+            if runs_causal_masked {
+                for class in region.mask.iter() {
+                    causal_masked.insert(class);
+                }
+            }
+        }
+        if let Some(class) = wide.iter().find(|&class| causal_masked.contains(class)) {
+            return Err(Fault::Recipe(format!(
+                "class {class} attends both ways under one mask"
+            )));
+        }
         let mut corrected = poem_ir::ClassSet::default();
         for region in compiled.template() {
             let runs_correction = region.nodes.clone().any(|node| {

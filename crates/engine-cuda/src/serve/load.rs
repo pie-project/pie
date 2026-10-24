@@ -7,7 +7,7 @@ use crate::device::Context;
 use crate::error::{Fault, Result};
 use crate::exports::{
     Exports, Feeds, corrected_classes, decoding_of, landing_requests, masked_classes,
-    media_classes, plain_of, read_only_by_decoders, regions_lane_shifting,
+    media_classes, one_direction_per_mask, plain_of, read_only_by_decoders, regions_lane_shifting,
     regions_launching_schedules, regions_shifting, schedule_streams, wide_classes,
 };
 use crate::inputs::Inputs;
@@ -661,6 +661,7 @@ impl Shell {
         let mut facts = kv::probe(&boot.trace)?;
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
         crate::window::no_grouped_window_is_also_a_prepare_window(&compiled)?;
+        one_direction_per_mask(&boot.trace, &compiled)?;
         let masked = masked_classes(&boot.trace, &compiled);
         let wide = wide_classes(&boot.trace, &compiled);
         let corrected = corrected_classes(&boot.trace, &compiled);
