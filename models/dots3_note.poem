@@ -1,0 +1,403 @@
+# Dots3 NOTE: the text half of the released model, and its six-layer,
+# 16-expert miniature.
+
+load("//lib/adapters.poem", "banks")
+
+DOTS = template("dots")
+TOKENIZER = tokenizer(markers = [
+    ["<|endoftext|>", "<|endofassistant|>"],
+    ["<|system|>", "<|endofsystem|>", "<|user|>", "<|endofuser|>", "<|assistant|>"],
+])
+
+MODELS = [
+    model("dots3-note", template = DOTS, tokenizer = TOKENIZER, arch = "dots3_note", layers = 46, vocab = 152064),
+    model("dots3-note-mini", mini = True, template = DOTS, tokenizer = TOKENIZER, arch = "dots3_note", layers = 6, vocab = 152064),
+]
+
+BF = dtype.bf16
+U4 = dtype.u4g64
+U2 = dtype.u2g64
+
+DEPLOYMENTS = [
+    deployment("dots3-note", weights = [U4, U2], kv = BF),
+    deployment("dots3-note", weights = U4, kv = BF),
+    deployment("dots3-note-mini", weights = BF, kv = BF),
+    deployment("dots3-note-mini", weights = U4, kv = BF),
+]
+
+# The weights of Dots3 NOTE: latent attention (MLA) on every layer, a full
+# layer reading the keys a lightning indexer picks and a sliding one reading
+# a window through its own wider latent; one dense layer, then routed
+# experts with a shared one.
+
+def attention(n, a, hidden, weights, norms, eps, kv, window = None, indexer = None):
+    """The latent attention named by `n` at the dims `a`, its projections in
+    `weights` and its norms in `norms`, caching under `kv`. The q and kv
+    latents' norms carry the checkpoint's `sqrt(hidden / rank)` rescale;
+    each head's output is gated by a sigmoid of the layer input."""
+    qk_head_dim = a.qk_nope_head_dim + a.qk_rope_head_dim
+    v_width = a.heads * a.v_head_dim
+    return struct(
+        heads = a.heads,
+        kv_lora_rank = a.kv_lora_rank,
+        qk_nope_head_dim = a.qk_nope_head_dim,
+        qk_rope_head_dim = a.qk_rope_head_dim,
+        v_head_dim = a.v_head_dim,
+        theta = a.theta,
+        window = window,
+        sm_scale = f32(1.0 / f32(sqrt(qk_head_dim))),
+        q_a_proj = weight([a.q_lora_rank, hidden], weights),
+        q_a_norm = weight([a.q_lora_rank]),
+        q_a_scale = sqrt(hidden / a.q_lora_rank),
+        q_b_proj = weight([a.heads * qk_head_dim, a.q_lora_rank], weights).columns(),
+        kv_a_proj = weight([a.kv_lora_rank + a.qk_rope_head_dim, hidden], weights),
+        kv_a_norm = weight([a.kv_lora_rank]),
+        kv_a_scale = sqrt(hidden / a.kv_lora_rank),
+        k_pe_norm = weight([a.qk_rope_head_dim]),
+        norm_eps = eps,
+        kv_b_proj = weight([a.heads * (a.qk_nope_head_dim + a.v_head_dim), a.kv_lora_rank],
+            weights,
+        ).columns(),
+        gate = weight([a.heads, hidden], weights).columns(),
+        o_proj = weight([hidden, v_width], weights).rows(),
+        kv = kv,
+        indexer = indexer,
+    )
+
+def note(layers = 46, experts = 256, full_layers = [0] + list(range(1, 46, 4))):
+    """Dots3 NOTE's dims, `layers` deep with `experts` routed experts; the
+    layers in `full_layers` read the whole context, the rest 513 tokens back,
+    themselves included."""
+    return struct(
+        hidden = 5120,
+        layers = layers,
+        dense_layers = 1,
+        full = struct(
+            heads = 128,
+            q_lora_rank = 1024,
+            kv_lora_rank = 512,
+            qk_nope_head_dim = 128,
+            qk_rope_head_dim = 64,
+            v_head_dim = 128,
+            theta = 80000000.0,
+        ),
+        sliding = struct(
+            heads = 64,
+            q_lora_rank = 1024,
+            kv_lora_rank = 1024,
+            qk_nope_head_dim = 192,
+            qk_rope_head_dim = 64,
+            v_head_dim = 128,
+            theta = 50000.0,
+        ),
+        full_layers = full_layers,
+        window = 513,
+        index_heads = 64,
+        index_head_dim = 128,
+        index_top_k = 2048,
+        index_norm_eps = 1e-6,
+        dense_inter = 13824,
+        experts = experts,
+        top_k = min(8, experts),
+        moe_inter = 1536,
+        shared_inter = 1536,
+        scaling = 1.0,
+        vocab = 152064,
+        norm_eps = 1e-5,
+    )
+
+DIMS = {
+    "dots3-note": note(),
+    # Layers 0-5 at full width with the first 16 routed experts: two full
+    # layers (the dense one first), three sliding ones, then a full one.
+    "dots3-note-mini": note(layers = 6, experts = 16, full_layers = [0, 1, 5]),
+}
+
+def layout(id, deploy):
+    r = roles(deploy, "weights", "experts")
+    weights, experts = r.weights, r.experts
+    d = DIMS[id]
+    dense = compute(weights)
+    hidden = d.hidden
+    index_width = d.index_heads * d.index_head_dim
+
+    def layer(l):
+        n = lambda s: "layer.{}.{}".format(l, s)
+        norm = lambda s, width: weight([width])
+        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        if l in d.full_layers:
+            a = d.full
+            attn = attention(
+                n,
+                a,
+                hidden,
+                weights = weights,
+                norms = dense,
+                eps = d.norm_eps,
+                kv = "kv.{}".format(l),
+                indexer = struct(
+                    heads = d.index_heads,
+                    head_dim = d.index_head_dim,
+                    top_k = d.index_top_k,
+                    rope_dim = a.qk_rope_head_dim,
+                    theta = a.theta,
+                    q_proj = weight([index_width, a.q_lora_rank], weights),
+                    k_proj = weight([d.index_head_dim, hidden], weights),
+                    weights_proj = weight([d.index_heads, hidden], weights),
+                    k_norm = norm("index_k_norm", d.index_head_dim),
+                    k_norm_bias = norm("index_k_norm_bias", d.index_head_dim),
+                    k_norm_eps = d.index_norm_eps,
+                    keys = "index.{}".format(l),
+                ),
+            )
+        else:
+            attn = attention(
+                n,
+                d.sliding,
+                hidden,
+                weights = weights,
+                norms = dense,
+                eps = d.norm_eps,
+                kv = "swa.{}".format(l),
+                window = d.window,
+            )
+        if l < d.dense_layers:
+            iw = d.dense_inter
+            mlp = struct(
+                routed = False,
+                gate_up = weight([2 * iw, hidden], weights).packed([iw, iw]),
+                down = weight([hidden, iw], weights).rows(),
+                inter = iw,
+            )
+        else:
+            iw = d.moe_inter
+            sw = d.shared_inter
+            mlp = struct(
+                routed = True,
+                router = weight([d.experts, hidden]),
+                bias = weight([d.experts], dtype.f32),
+                gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
+                down = weight([d.experts, hidden, iw], experts).rows(),
+                shared = struct(
+                    gate_up = weight([2 * sw, hidden], weights).packed([sw, sw]),
+                    down = weight([hidden, sw], weights).rows(),
+                    inter = sw,
+                ),
+                experts = d.experts,
+                top_k = d.top_k,
+                inter = iw,
+                scaling = d.scaling,
+            )
+        return struct(
+            attn = attn,
+            attn_norm = norm("attn_norm", hidden),
+            attn_norm_eps = d.norm_eps,
+            mlp_norm = norm("mlp_norm", hidden),
+            mlp_norm_eps = d.norm_eps,
+            mlp = mlp,
+            lora_a = lora_a,
+            lora_b = lora_b,
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        full = d.full,
+        sliding = d.sliding,
+        window = d.window,
+        kv = deploy.kv,
+        embed = weight([d.vocab, hidden], weights),
+        head = weight([d.vocab, hidden], weights).packed([d.vocab]),
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight([hidden]),
+        final_norm_eps = d.norm_eps,
+    )
+
+# How a Dots3 NOTE checkpoint is laid out: transformers' names, each
+# expert's projections a tensor of their own. The q and kv latents' rescale
+# (`apply_mla_qkv_lora_rescale`) is folded into their norms.
+
+def formats(m):
+    return [format("huggingface", read = lambda reads: huggingface(m, reads))]
+
+def read_attention(reads, a, at):
+    reads.read(a.q_a_proj, at("self_attn.q_a_proj.weight"))
+    reads.read_expr(a.q_a_norm, src(at("self_attn.q_a_layernorm.weight")).scale(a.q_a_scale))
+    reads.read(a.q_b_proj, at("self_attn.q_b_proj.weight"))
+    reads.read(a.kv_a_proj, at("self_attn.kv_a_proj_with_mqa.weight"))
+    reads.read_expr(a.kv_a_norm, src(at("self_attn.kv_a_layernorm.weight")).scale(a.kv_a_scale))
+    reads.read(a.k_pe_norm, at("self_attn.k_rope_only_layernorm.weight"))
+    reads.read(a.kv_b_proj, at("self_attn.kv_b_proj.weight"))
+    reads.read(a.gate, at("self_attn.g_proj.weight"))
+    reads.read(a.o_proj, at("self_attn.o_proj.weight"))
+    ix = a.indexer
+    if ix == None:
+        return
+    reads.read(ix.q_proj, at("self_attn.indexer.wq_b.weight"))
+    reads.read(ix.k_proj, at("self_attn.indexer.wk.weight"))
+    reads.read(ix.weights_proj, at("self_attn.indexer.weights_proj.weight"))
+    reads.read(ix.k_norm, at("self_attn.indexer.k_norm.weight"))
+    reads.read(ix.k_norm_bias, at("self_attn.indexer.k_norm.bias"))
+
+def huggingface(m, reads):
+    reads.read(m.embed, "model.embed_tokens.weight")
+    reads.read(m.final_norm, "model.norm.weight")
+    reads.read(m.head, "lm_head.weight")
+    for l, layer in enumerate(m.layers):
+        at = lambda tail: "model.layers.{}.{}".format(l, tail)
+        reads.read(layer.attn_norm, at("input_layernorm.weight"))
+        reads.read(layer.mlp_norm, at("post_attention_layernorm.weight"))
+        read_attention(reads, layer.attn, at)
+        f = layer.mlp
+        if not f.routed:
+            reads.read_concat(f.gate_up, [at("mlp.gate_proj.weight"), at("mlp.up_proj.weight")])
+            reads.read(f.down, at("mlp.down_proj.weight"))
+            continue
+        reads.read(f.router, at("mlp.gate.weight"))
+        reads.read(f.bias, at("mlp.gate.e_score_correction_bias"))
+        leaf = lambda e, proj: at("mlp.experts.{}.{}.weight".format(e, proj))
+        held = stored(leaf(0, "gate_proj"))
+        reads.read_expr(f.gate_up, concat(0, [
+            concat(0, [src(leaf(e, "gate_proj")), src(leaf(e, "up_proj"))]).transmute([1, -1, m.hidden], held)
+            for e in range(f.experts)
+        ]))
+        reads.read_expr(f.down, concat(0, [
+            src(leaf(e, "down_proj")).transmute([1, m.hidden, -1], held)
+            for e in range(f.experts)
+        ]))
+        reads.read_concat(f.shared.gate_up, [
+            at("mlp.shared_experts.gate_proj.weight"),
+            at("mlp.shared_experts.up_proj.weight"),
+        ])
+        reads.read(f.shared.down, at("mlp.shared_experts.down_proj.weight"))
+
+# The forward of Dots3 NOTE: latent attention over the keys the indexer
+# picks (full layers) or the window behind each row (sliding layers), its
+# rope pairs interleaved and each head gated; then a dense or routed SwiGLU
+# MLP.
+
+def rope(x, positions, a):
+    """`x`'s rope part rotated in adjacent pairs, as the checkpoint was
+    trained."""
+    d = a.qk_rope_head_dim
+    return ops.elemwise.rope(x, positions, d, a.theta, rotary.last(d, interleaved = True))
+
+def run_attention(x, inputs, a, select = None):
+    """Latent attention of the rows `x`. `select(q_a)`, if given, picks the
+    keys each query reads."""
+    pages = inputs.kv(a.kv)
+    positions = inputs.positions()
+    write_page = inputs.write_page(a.kv)
+    write_offset = inputs.write_offset(a.kv)
+
+    q_a = ops.elemwise.rmsnorm(ops.linear.matmul(x, a.q_a_proj), a.q_a_norm, a.norm_eps)
+    q_b = ops.linear.matmul(q_a, a.q_b_proj)
+    kv_a = ops.linear.matmul(x, a.kv_a_proj)
+    seam.at(seam.ATTN_QV, [q_b, kv_a])
+
+    selection = select(q_a) if select != None else None
+
+    kv_c, k_pe = ops.attn.mla_latents(kv_a, a.kv_a_norm, a.norm_eps, a.kv_lora_rank)
+    k_pe = rope(ops.elemwise.rmsnorm(k_pe, a.k_pe_norm, a.norm_eps), positions, a)
+    ops.attn.mla_kv_append(kv_c, k_pe, pages, write_page, write_offset)
+
+    q_nope, q_pe = ops.attn.mla_split_q_b(q_b, a.heads, a.qk_nope_head_dim, a.qk_rope_head_dim)
+    q_pe = rope(q_pe, positions, a)
+    q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
+    seam.at(seam.ATTN_Q, [q])
+
+    # A selection's lanes read the keys it picked; the rest their window.
+    scored = ops.attn.attend_mla(q, q_pe, inputs, a.kv, a.heads, a.kv_lora_rank, a.sm_scale,
+                                 window = a.window, selection = selection)
+
+    o = ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
+    o = ops.elemwise.gate_sigmoid_mul_heads(o, ops.linear.matmul(x, a.gate), a.v_head_dim, 1.0)
+    seam.at(seam.ATTN_OUT, [o])
+    return ops.linear.matmul(o, a.o_proj)
+
+def caches(m, c):
+    full = c.kv_space(m.kv)
+    sliding = c.kv_space(m.kv, m.window)
+    index = c.kv_space(m.kv)
+    for w in m.layers:
+        a = w.attn
+        c.kv(full if a.window == None else sliding, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
+        if a.indexer != None:
+            c.kv(index, a.indexer.keys, [a.indexer.head_dim], a.indexer.head_dim)
+
+def forward(m, inputs):
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
+    routes = inputs.adapter_routes()
+
+    def block(l, w, y):
+        a = w.attn
+        x = ops.elemwise.rmsnorm(y, w.attn_norm, w.attn_norm_eps)
+        if a.indexer != None:
+            o = run_attention(x, inputs, a, select = lambda q_a: index_select(x, q_a, inputs, a.indexer))
+        else:
+            o = run_attention(x, inputs, a)
+        adapted = fact.has(fact.Adapter)
+        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        y = ops.elemwise.residual_add(o, y)
+
+        x = ops.elemwise.rmsnorm(y, w.mlp_norm, w.mlp_norm_eps)
+        return ops.elemwise.residual_add(mlp(x, w.mlp), y)
+
+    y = inputs.fold_layers(m.layers, y, block)
+    x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
+    return ops.linear.lm_head(x, m.head)
+
+def mlp(x, f):
+    if not f.routed:
+        return ops.linear.matmul(
+            ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter),
+            f.down,
+        )
+    routes, weights = ops.linear.moe_route(
+        ops.linear.matmul(x, f.router),
+        f.experts,
+        f.top_k,
+        routing.sigmoid(renormalize = True, scaling = f.scaling),
+        bias = f.bias,
+    )
+
+    def select(act, bank):
+        if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
+            return ops.linear.moe_matmul_select(act, bank, routes, f.top_k)
+        return ops.linear.moe_matmul_select_quant(act, bank, routes, f.top_k)
+
+    act = ops.linear.glu(select(x, f.gate_up), gating.swiglu(), f.inter)
+    routed = ops.linear.moe_weighted_sum(select(act, f.down), weights)
+    s = f.shared
+    shared = ops.linear.matmul(
+        ops.linear.glu(ops.linear.matmul(x, s.gate_up), gating.swiglu(), s.inter),
+        s.down,
+    )
+    return ops.elemwise.residual_add(shared, routed)
+
+def index_select(x, q_a, inputs, ix):
+    keys = inputs.kv(ix.keys)
+    positions = inputs.positions()
+    write_page = inputs.write_page(ix.keys)
+    write_offset = inputs.write_offset(ix.keys)
+    k = ops.attn.index_layernorm_rope(
+        ops.linear.matmul(x, ix.k_proj),
+        positions,
+        ix.k_norm,
+        ix.k_norm_eps,
+        ix.k_norm_bias,
+        ix.rope_dim,
+        ix.theta,
+    )
+    ops.attn.index_kv_append(k, keys, write_page, write_offset)
+    q = ops.attn.index_rope(
+        ops.linear.matmul(q_a, ix.q_proj),
+        positions,
+        ix.heads,
+        ix.head_dim,
+        ix.rope_dim,
+        ix.theta,
+    )
+    weights = ops.linear.matmul(x, ix.weights_proj)
+    return ops.attn.index_topk(q, weights, keys, ix.heads, ix.head_dim, ix.top_k, 1)

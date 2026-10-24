@@ -1,0 +1,372 @@
+# Inkling and Inkling-Small, each with its miniature of seven layers and
+# eight experts, which reads a prefix of the whole model's checkpoint.
+
+load("//lib/adapters.poem", "banks")
+
+INKLING = template("inkling")
+TOKENIZER = tokenizer(markers = [
+    ["<|content_model_end_sampling|>", "<|endoftext|>"],
+    ["<|message_user|>", "<|message_model|>", "<|message_system|>", "<|message_tool|>", "<|content_text|>", "<|content_thinking|>", "<|end_message|>"],
+])
+
+MODELS = [
+    model("inkling", template = INKLING, tokenizer = TOKENIZER, arch = "inkling", layers = 66, vocab = 200058),
+    model("inkling-mini-l7-e8", mini = True, template = INKLING, tokenizer = TOKENIZER, arch = "inkling", layers = 7, vocab = 200058),
+    model("inkling-small", template = INKLING, tokenizer = TOKENIZER, arch = "inkling", layers = 42, vocab = 200058),
+    model("inkling-small-mini-l7-e8", mini = True, template = INKLING, tokenizer = TOKENIZER, arch = "inkling", layers = 7, vocab = 200058),
+]
+
+DEPLOYMENTS = [
+    deployment("inkling", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("inkling-mini-l7-e8", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("inkling-small", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("inkling-small-mini-l7-e8", weights = dtype.bf16, kv = dtype.bf16),
+    # Keys and values e4m3 under a unit scale (vLLM's `fp8` KV).
+    deployment("inkling", weights = dtype.bf16, kv = dtype.e4m3),
+    deployment("inkling-small", weights = dtype.bf16, kv = dtype.e4m3),
+    deployment("inkling-small-mini-l7-e8", weights = dtype.bf16, kv = dtype.e4m3),
+]
+
+# The weights of Inkling: attention with a relative bias over a local window,
+# every sixth layer over a longer reach; short convolutions on its keys,
+# values and both residual branches; two dense layers, then routed experts
+# with sink experts always taken.
+
+def dims(layers = 66, experts = 256, **over):
+    d = dict(
+        hidden = 6144,
+        layers = layers,
+        vocab = 201024,
+        head_rows = 200058,
+        heads = 64,
+        head_dim = 128,
+        local_kv_heads = 16,
+        global_kv_heads = 8,
+        d_rel = 16,
+        window = 512,
+        global_extent = 1024,
+        conv_width = 4,
+        global_every = 6,
+        dense_layers = 2,
+        dense_inter = 24576,
+        experts = experts,
+        top_k = min(6, experts),
+        sink = 2,
+        moe_inter = 3072,
+        route_scale = 8.0,
+        mup = 24.0,
+        norm_eps = 1e-6,
+        log_floor = 128000,
+        log_alpha = 0.1,
+    )
+    d.update(over)
+    return struct(**d)
+
+def small(layers = 42, experts = 256):
+    """Inkling-Small: the same layer pattern, narrower and shallower."""
+    return dims(
+        layers,
+        experts,
+        hidden = 4096,
+        heads = 32,
+        local_kv_heads = 8,
+        dense_inter = 16384,
+        moe_inter = 2048,
+        mup = 16.0,
+    )
+
+DIMS = {
+    "inkling": dims(),
+    "inkling-mini-l7-e8": dims(layers = 7, experts = 8),
+    "inkling-small": small(),
+    "inkling-small-mini-l7-e8": small(layers = 7, experts = 8),
+}
+
+LOCAL = 0
+GLOBAL = 1
+
+def layout(id, deploy):
+    d = DIMS[id]
+    w = roles(deploy, "w", exact = True).w
+    dense = compute(w)
+    hidden = d.hidden
+    hd = d.head_dim
+    q_w = d.heads * hd
+    r_w = d.heads * d.d_rel
+    kw = d.conv_width
+
+    def layer(l):
+        vec = lambda s, length: weight([length])
+        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        if (l + 1) % d.global_every == 0:
+            reading, kv_heads, extent = GLOBAL, d.global_kv_heads, d.global_extent
+        else:
+            reading, kv_heads, extent = LOCAL, d.local_kv_heads, d.window
+        kv_w = kv_heads * hd
+        conv = lambda s, channels: weight([channels, kw]).columns()
+        if l < d.dense_layers:
+            iw = d.dense_inter
+            mlp = struct(
+                routed = False,
+                gate_up = weight([2 * iw, hidden], w).packed([iw, iw]),
+                inter = iw,
+                down = weight([hidden, iw], w).rows(),
+                scale = vec("mlp_scale", 1),
+            )
+        else:
+            bank = d.experts + d.sink
+            mi = d.moe_inter
+            mlp = struct(
+                routed = True,
+                router = weight([bank, hidden], w),
+                bias = weight([d.experts], dtype.f32),
+                scale = weight([1], dtype.f32),
+                gate_up = weight([bank, 2 * mi, hidden], w).bank([mi, mi]),
+                down = weight([bank, hidden, mi], w).rows(),
+                experts = d.experts,
+                top_k = d.top_k,
+                sink = d.sink,
+                inter = mi,
+                scaling = d.route_scale,
+            )
+        return struct(
+            reading = reading,
+            kv_heads = kv_heads,
+            extent = extent,
+            attn_norm = vec("attn_norm", hidden),
+            q_proj = weight([q_w, hidden], w).columns(),
+            k_proj = weight([kv_w, hidden], w).columns(heads = kv_heads),
+            v_proj = weight([kv_w, hidden], w).columns(heads = kv_heads),
+            r_proj = weight([r_w, hidden], w).columns(),
+            o_proj = weight([hidden, q_w], w).rows(),
+            q_norm = vec("q_norm", hd),
+            k_norm = vec("k_norm", hd),
+            rel_proj = weight([d.d_rel, extent]),
+            k_conv = conv("k_conv", kv_w),
+            v_conv = conv("v_conv", kv_w),
+            attn_conv = weight([hidden, kw]),
+            mlp_conv = weight([hidden, kw]),
+            kv = "kv.{}".format(l),
+            k_state = "conv.{}.k".format(l),
+            v_state = "conv.{}.v".format(l),
+            attn_state = "conv.{}.attn".format(l),
+            mlp_state = "conv.{}.mlp".format(l),
+            mlp_norm = vec("mlp_norm", hidden),
+            mlp = mlp,
+            lora_a = lora_a,
+            lora_b = lora_b,
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        head_rows = d.head_rows,
+        heads = d.heads,
+        head_dim = hd,
+        d_rel = d.d_rel,
+        window = d.window,
+        conv_width = kw,
+        sm_scale = f32(1.0 / f32(hd)),
+        norm_eps = d.norm_eps,
+        head_scale = f32(1.0 / f32(d.mup)),
+        log_scaling = (d.log_floor, d.log_alpha),
+        kv = deploy.kv,
+        embed = weight([d.vocab, hidden], w),
+        embed_norm = weight([hidden]),
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight([hidden]),
+        unembed = weight([d.head_rows, hidden], w),
+    )
+
+# How an Inkling checkpoint is laid out: the language model under
+# `model.llm.`, its MLPs' gate and up projections interleaved row by row.
+
+def product(xs):
+    out = 1
+    for x in xs:
+        out *= x
+    return out
+
+def flattened(name, want, broadcast = False):
+    """The tensor `name` as stored, its elements read as `want`; with
+    `broadcast`, a single stored value is read as any shape."""
+    held = shape(name)
+    if (not broadcast or product(held) > 1) and product(held) != product(want):
+        fail("`{}` is stored {} ({} elements) and the plan reads it as {} ({} elements)".format(
+            name, held, product(held), want, product(want)))
+    return src(name).transmute(want, stored(name))
+
+TRUNK = "model.llm."
+
+def formats(m):
+    return [format("huggingface", read = lambda reads: huggingface(m, reads))]
+
+def huggingface(m, reads):
+    at = lambda leaf: TRUNK + leaf
+    reads.read(m.embed, at("embed.weight"))
+    reads.read(m.embed_norm, at("embed_norm.weight"))
+    reads.read(m.final_norm, at("norm.weight"))
+    reads.read_expr(m.unembed, src(at("unembed.weight")).slice(0, 0, m.head_rows))
+    for l, w in enumerate(m.layers):
+        n = lambda leaf: "{}layers.{}.{}".format(TRUNK, l, leaf)
+        reads.read(w.attn_norm, n("attn_norm.weight"))
+        reads.read(w.mlp_norm, n("mlp_norm.weight"))
+        reads.read(w.q_proj, n("attn.wq_du.weight"))
+        reads.read(w.k_proj, n("attn.wk_dv.weight"))
+        reads.read(w.v_proj, n("attn.wv_dv.weight"))
+        reads.read(w.r_proj, n("attn.wr_du.weight"))
+        reads.read(w.o_proj, n("attn.wo_ud.weight"))
+        reads.read(w.q_norm, n("attn.q_norm.weight"))
+        reads.read(w.k_norm, n("attn.k_norm.weight"))
+        reads.read(w.rel_proj, n("attn.rel_logits_proj.proj"))
+        for weight, leaf in [
+            (w.k_conv, "attn.k_sconv.weight"),
+            (w.v_conv, "attn.v_sconv.weight"),
+            (w.attn_conv, "attn_sconv.weight"),
+            (w.mlp_conv, "mlp_sconv.weight"),
+        ]:
+            reads.read_expr(weight, flattened(n(leaf), weight.shape))
+        f = w.mlp
+        if not f.routed:
+            w13 = src(n("mlp.w13_dn.weight"))
+            reads.read_expr(f.gate_up, concat(0, [
+                w13.stride(0, 0, f.inter, 2),
+                w13.stride(0, 1, f.inter, 2),
+            ]))
+            reads.read(f.down, n("mlp.w2_md.weight"))
+            reads.read(f.scale, n("mlp.global_scale"))
+            continue
+        reads.read(f.router, n("mlp.gate.weight"))
+        reads.read(f.bias, n("mlp.gate.bias"))
+        reads.read(f.scale, n("mlp.gate.global_scale"))
+        combed = lambda name: concat(1, [
+            src(name).stride(1, 0, f.inter, 2),
+            src(name).stride(1, 1, f.inter, 2),
+        ])
+        reads.read_expr(f.gate_up, concat(0, [
+            combed(n("mlp.experts.w13_weight")),
+            combed(n("mlp.shared_experts.shared_w13_weight")),
+        ]))
+        reads.read_expr(f.down, concat(0, [
+            src(n("mlp.experts.w2_weight")),
+            src(n("mlp.shared_experts.shared_w2_weight")),
+        ]))
+
+# The forward of Inkling: relative-biased attention, short convolutions
+# around it and the MLP, a dense or sink-routed MLP.
+
+def caches(m, c):
+    kv = c.kv_space(m.kv)
+    taps = m.conv_width
+    for w in m.layers:
+        plane = w.kv_heads * m.head_dim
+        c.kv(kv, w.kv, [plane, plane], m.head_dim, heads = True)
+        c.state(w.k_state, [taps, plane], dtype.bf16, split = 1)
+        c.state(w.v_state, [taps, plane], dtype.bf16, split = 1)
+        c.state(w.attn_state, [taps, m.hidden], dtype.bf16)
+        c.state(w.mlp_state, [taps, m.hidden], dtype.bf16)
+
+def kv_heads_of(m, reading):
+    for w in m.layers:
+        if w.reading == reading:
+            return w.kv_heads
+    return 0
+
+def forward(m, inputs):
+    d = m.head_dim
+    one = fact.single_token()
+    input_d, input_p = inputs.on(one), inputs.on(~one)
+    geometry = [(kv_heads_of(m, LOCAL), m.window), (kv_heads_of(m, GLOBAL), None)]
+    plan_d = [
+        ops.attn.plan_decode(input_d, m.heads, kv_heads, d, win) if kv_heads > 0 else None
+        for kv_heads, win in geometry
+    ]
+    plan_p = [
+        ops.attn.plan_prefill(input_p, m.heads, kv_heads, d, win) if kv_heads > 0 else None
+        for kv_heads, win in geometry
+    ]
+
+    y = ops.elemwise.rmsnorm(ops.gather.embed(inputs.tokens(), m.embed, m.vocab), m.embed_norm, m.norm_eps)
+    routes = inputs.adapter_routes()
+
+    def block(l, w, y):
+        reading = w.reading
+        win = geometry[reading][1]
+        x = ops.elemwise.rmsnorm(y, w.attn_norm, m.norm_eps)
+        pages = inputs.kv(w.kv)
+
+        q = ops.linear.matmul(x, w.q_proj)
+        k = conv(ops.linear.matmul(x, w.k_proj), w.k_conv, w.k_state, inputs, m)
+        v = conv(ops.linear.matmul(x, w.v_proj), w.v_conv, w.v_state, inputs, m)
+        r = ops.linear.matmul(x, w.r_proj)
+        q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, d, m.norm_eps)
+        k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, d, m.norm_eps)
+        ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
+        seam.at(seam.ATTN_Q, [q])
+
+        bias = ops.linear.rel_bias(r, w.rel_proj, m.heads, m.d_rel, w.extent)
+        log_scaling = m.log_scaling if reading == GLOBAL else None
+        a = merge([
+            ops.attn.decode(
+                q.on(one),
+                plan_d[reading],
+                pages,
+                win,
+                d,
+                m.sm_scale,
+                bias = bias.on(one),
+                extent = w.extent,
+                log_scaling = log_scaling,
+            ),
+            ops.attn.prefill(
+                q.on(~one),
+                plan_p[reading],
+                pages,
+                win,
+                d,
+                w.kv_heads,
+                m.sm_scale,
+                bias = bias.on(~one),
+                extent = w.extent,
+                log_scaling = log_scaling,
+            ),
+        ])
+        seam.at(seam.ATTN_OUT, [a])
+        o = ops.linear.matmul(a, w.o_proj)
+        adapted = fact.has(fact.Adapter)
+        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        o = conv(o, w.attn_conv, w.attn_state, inputs, m)
+        y = ops.elemwise.residual_add(o, y)
+
+        x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.norm_eps)
+        f = conv(mlp(x, w.mlp), w.mlp_conv, w.mlp_state, inputs, m)
+        return ops.elemwise.residual_add(f, y)
+
+    y = inputs.fold_layers(m.layers, y, block)
+    x = ops.elemwise.rmsnorm(y, m.final_norm, m.norm_eps) * m.head_scale
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
+    return ops.linear.lm_head(x, m.unembed)
+
+def mlp(x, f):
+    if not f.routed:
+        act = ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter)
+        return ops.elemwise.scale(f.scale, ops.linear.matmul(act, f.down))
+    fan = f.top_k + f.sink
+    routes, weights = ops.linear.moe_route(
+        ops.linear.matmul(x, f.router),
+        f.experts,
+        f.top_k,
+        routing.sigmoid_sink(f.sink, scaling = f.scaling),
+        bias = f.bias,
+        scale = f.scale,
+    )
+    hidden = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, routes, fan), gating.swiglu(), f.inter)
+    return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(hidden, f.down, routes, fan), weights)
+
+def conv(v, weight, state, inputs, m):
+    slab = inputs.state(state)
+    one = fact.single_token()
+    return merge([
+        ops.ssm.short_conv(v.on(one), weight, slab, m.conv_width),
+        ops.ssm.short_conv_chunked(v.on(~one), weight, slab, m.conv_width),
+    ])

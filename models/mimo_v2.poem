@@ -1,0 +1,438 @@
+# MiMo-V2.6: Flash (311B) and Pro (1.02T), each with an eight-expert
+# miniature; and Flash's first six layers with every expert kept.
+
+load("//lib/adapters.poem", "banks")
+
+MIMO = template("mimo")
+TOKENIZER = tokenizer(markers = [["<|im_end|>", "<|endoftext|>", "<think>", "</think>"]])
+
+def mimo(id, layers, **kwargs):
+    return model(id, template = MIMO, tokenizer = TOKENIZER, arch = "mimo_v2", layers = layers, vocab = 152576, **kwargs)
+
+MODELS = [
+    mimo("mimo26-flash", 48),
+    mimo("mimo26-flash-mini", 6, mini = True),
+    mimo("mimo26-flash-l6", 6, mini = True),
+    mimo("mimo26-pro", 70),
+    mimo("mimo26-pro-mini", 4, mini = True),
+]
+
+BF = dtype.bf16
+FP4 = dtype.mxfp4
+
+# The release as vLLM serves it: its FP8 projections (o_proj stays bf16)
+# against e4m3 in 1x128 blocks, its MXFP4 experts likewise.
+W8A8 = [dtype.e4m3g128a8, dtype.mxfp4a8]
+
+DEPLOYMENTS = [
+    deployment("mimo26-flash", weights = [BF, FP4], kv = BF),
+    deployment("mimo26-flash", weights = W8A8, kv = BF),
+    deployment("mimo26-flash-mini", weights = [BF, FP4], kv = BF),
+    deployment("mimo26-flash-mini", weights = W8A8, kv = BF),
+    deployment("mimo26-flash-mini", weights = [BF, dtype.mxfp4a8], kv = BF),
+    deployment("mimo26-flash-l6", weights = [BF, FP4], kv = BF),
+    deployment("mimo26-flash-l6", weights = W8A8, kv = BF),
+    deployment("mimo26-flash-l6", weights = [BF, dtype.mxfp4a8], kv = BF),
+    deployment("mimo26-pro", weights = [BF, FP4], kv = BF),
+    deployment("mimo26-pro", weights = W8A8, kv = BF),
+    deployment("mimo26-pro-mini", weights = [BF, FP4], kv = BF),
+    deployment("mimo26-pro-mini", weights = W8A8, kv = BF),
+]
+
+# The weights of MiMo-V2.6: GQA, full on a few layers and windowed (128,
+# with sinks) on the rest, keys 192 wide and values 128; a dense first layer
+# then routed experts behind a biased sigmoid router (banks at the
+# deployment's second dtype).
+#
+# The kernels read heads 64/128/256/512 wide, so heads are zero-padded to 256;
+# the output projection reads each head's first 128. The scale stays the
+# 192-wide head's.
+
+PADDED = 256
+
+def dims(hidden, layers, full, dense, q_heads, full_kv_heads, window_kv_heads, experts, norm_eps, value_scale, shards):
+    """`full` lists the full-attention layers and `dense` the dense ones;
+    `shards` is the count the checkpoint's fused qkv is stored cut into."""
+    return struct(
+        hidden = hidden,
+        layers = layers,
+        full = full,
+        dense = dense,
+        q_heads = q_heads,
+        full_kv_heads = full_kv_heads,
+        window_kv_heads = window_kv_heads,
+        qk_head_dim = 192,
+        v_head_dim = 128,
+        rotary_dim = 64,
+        full_theta = 10000000.0,
+        window_theta = 10000.0,
+        window = 128,
+        value_scale = value_scale,
+        experts = experts,
+        top_k = 8,
+        inter = 2048,
+        dense_inter = 16384,
+        vocab = 152576,
+        norm_eps = norm_eps,
+        shards = shards,
+    )
+
+def flash(layers = 48, full = [0, 5, 11, 17, 23, 29, 35, 41, 47], experts = 256):
+    return dims(4096, layers, full, [0], 64, 4, 8, experts, 1e-6, 0.707, 4)
+
+def pro(layers = 70, full = [0, 7, 15, 23, 31, 39, 47, 55, 62, 69], experts = 384):
+    return dims(6144, layers, full, [0], 128, 8, 8, experts, 1e-5, 0.612, 8)
+
+DIMS = {
+    "mimo26-flash": flash(),
+    "mimo26-flash-mini": flash(layers = 6, full = [0, 5], experts = 8),
+    # the release's first six layers at full width, every expert kept
+    "mimo26-flash-l6": flash(layers = 6, full = [0, 5]),
+    "mimo26-pro": pro(),
+    # layers 0, 1, 2 and 7 of the release
+    "mimo26-pro-mini": pro(layers = 4, full = [0, 3], experts = 8),
+}
+
+WINDOWED = 0
+FULL = 1
+
+def layout(id, deploy):
+    if deploy.drafter != None:
+        fail("{} drafts with nothing, not {}".format(id, deploy.drafter))
+    d = DIMS[id]
+    if PADDED != 2 * d.v_head_dim:
+        fail("the output projection reads a padded head's first half, its values")
+    r = roles(deploy, "weights", "experts", exact = True)
+    weights, experts = r.weights, r.experts
+    dense = compute(weights)
+    # The release's FP8 qkv kept as stored, its heads 192 (values 128) wide:
+    # the attention prologue lays them 256 wide.
+    unpadded = weights == dtype.e4m3g128a8
+    hidden = d.hidden
+    q_w = d.q_heads * PADDED
+
+    def layer(l):
+        norm = lambda s: weight([hidden])
+        reading = FULL if l in d.full else WINDOWED
+        kv_heads = d.full_kv_heads if reading == FULL else d.window_kv_heads
+        kv_w = kv_heads * PADDED
+        q_qk = d.q_heads * d.qk_head_dim
+        kv_kv = kv_heads * (d.qk_head_dim + d.v_head_dim)
+        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        if l in d.dense:
+            di = d.dense_inter
+            mlp = struct(
+                routed = False,
+                inter = di,
+                gate_up = weight([2 * di, hidden], weights).packed([di, di]),
+                down = weight([hidden, di], weights).rows(),
+            )
+        else:
+            iw = d.inter
+            mlp = struct(
+                routed = True,
+                experts = d.experts,
+                top_k = d.top_k,
+                inter = iw,
+                router = weight([d.experts, hidden]),
+                bias = weight([d.experts], dtype.f32),
+                gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
+                down = weight([d.experts, hidden, iw], experts).rows(),
+            )
+        return struct(
+            attn = struct(
+                reading = reading,
+                kv_heads = kv_heads,
+                theta = d.full_theta if reading == FULL else d.window_theta,
+                qkv = weight([q_qk + kv_kv, hidden], weights).packed(
+                    [q_qk, kv_heads * d.qk_head_dim, kv_heads * d.v_head_dim],
+                    heads = [d.q_heads, kv_heads, kv_heads],
+                ) if unpadded else weight([q_w + 2 * kv_w, hidden], weights).packed(
+                    [q_w, kv_w, kv_w],
+                    heads = [d.q_heads, kv_heads, kv_heads],
+                ),
+                o_proj = weight([hidden, d.q_heads * d.v_head_dim]).rows(),
+                sinks = weight([d.q_heads]).columns() if reading == WINDOWED else None,
+                kv = "kv.{}".format(l),
+            ),
+            attn_norm = norm("attn_norm"),
+            attn_norm_eps = d.norm_eps,
+            mlp_norm = norm("mlp_norm"),
+            mlp_norm_eps = d.norm_eps,
+            mlp = mlp,
+            lora_a = lora_a,
+            lora_b = lora_b,
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        q_heads = d.q_heads,
+        full_kv_heads = d.full_kv_heads,
+        unpadded = unpadded,
+        window_kv_heads = d.window_kv_heads,
+        head_dim = PADDED,
+        qk_head_dim = d.qk_head_dim,
+        v_head_dim = d.v_head_dim,
+        rotary_dim = d.rotary_dim,
+        window = d.window,
+        value_scale = d.value_scale,
+        sm_scale = f32(1.0 / f32(sqrt(d.qk_head_dim))),
+        shards = d.shards,
+        kv = deploy.kv,
+        embed = weight([d.vocab, hidden]),
+        head = weight([d.vocab, hidden]).packed([d.vocab]),
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight([hidden]),
+        final_norm_eps = d.norm_eps,
+    )
+
+# How a MiMo-V2.6 checkpoint is laid out: transformers' names, routed experts
+# one MXFP4 plane each (`.weight` beside `.weight_scale`), dense projections
+# fp8 beside `weight_scale_inv`. The fused qkv is pre-sharded in `shards`
+# chunks ([Q_0|K_0|V_0|Q_1|...]); each head is read out and laid 256 wide.
+# Kept FP8, each laid row carries its 128x128 block's factor (`e4m3g128`).
+
+FP8 = raw(dtype.e4m3)
+
+def kept(w):
+    """Whether `w` keeps the release's FP8 codes, a factor a row."""
+    return w.dtype in [dtype.e4m3g128, dtype.e4m3g128a8]
+
+def factor_rows(start, count, chunk):
+    """Rows `start .. start + count`' factor rows in a `weight_scale_inv` of
+    128-row blocks, counted afresh in each `chunk` rows."""
+    return [(r // chunk) * ((chunk + 127) // 128) + (r % chunk) // 128 for r in range(start, start + count)]
+
+def kept_read(reads, w, codes, factors, rows):
+    """`w` from its laid e4m3 `codes` and the f32 `factors` of its `rows`."""
+    reads.extend([
+        tensor(w.name, codes, encoding(dtype.e4m3)),
+        tensor(scales_name(w.name), factors, encoding(dtype.f32), shape = [rows, w.shape[1] // 128]),
+    ])
+
+def kept_legs(reads, w, names):
+    """`w` as its legs `names` stacked on the rows, each row its block's factor."""
+    factors = [src(nm[:-len(".weight")] + ".weight_scale_inv").gather(0, factor_rows(0, shape(nm)[0], shape(nm)[0])) for nm in names]
+    codes = [src(nm) for nm in names]
+    one = len(names) == 1
+    kept_read(reads, w, codes[0] if one else concat(0, codes), factors[0] if one else concat(0, factors), w.shape[0])
+
+def formats(m):
+    return [format(
+        "huggingface",
+        recognizes = lambda checkpoint: has("model.layers.0.self_attn.qkv_proj.weight"),
+        read = lambda reads: huggingface(m, reads),
+        states = configured(m),
+    )]
+
+def configured(m):
+    """The shape a transformers configuration states of this model."""
+    routed = [w.mlp for w in m.layers if w.mlp.routed]
+    stated = [
+        config("hidden_size", m.hidden),
+        config("vocab_size", m.vocab),
+        config("num_attention_heads", m.q_heads),
+        config("num_key_value_heads", m.full_kv_heads),
+        config("swa_num_key_value_heads", m.window_kv_heads),
+        config("head_dim", m.qk_head_dim),
+        config("v_head_dim", m.v_head_dim),
+        config("num_hidden_layers", len(m.layers)),
+        config("layernorm_epsilon", m.final_norm_eps),
+        config("sliding_window", m.window),
+        config("attention_value_scale", m.value_scale),
+    ]
+    if routed:
+        stated.append(config("n_routed_experts", routed[0].experts))
+    return stated
+
+def huggingface(m, reads):
+    reads.read(m.embed, "model.embed_tokens.weight")
+    reads.read(m.final_norm, "model.norm.weight")
+    reads.read(m.head, "lm_head.weight")
+    for l, w in enumerate(m.layers):
+        n = lambda leaf: "model.layers.{}.{}".format(l, leaf)
+        at = w.attn
+        reads.read(w.attn_norm, n("input_layernorm.weight"))
+        reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
+        qkv(m, reads, at, n("self_attn.qkv_proj.weight"))
+        reads.read(at.o_proj, n("self_attn.o_proj.weight"))
+        if at.sinks != None:
+            reads.read(at.sinks, n("self_attn.attention_sink_bias"))
+        f = w.mlp
+        if not f.routed:
+            legs = [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")]
+            if kept(f.gate_up):
+                kept_legs(reads, f.gate_up, legs)
+                kept_legs(reads, f.down, [n("mlp.down_proj.weight")])
+                continue
+            reads.push(tensor(f.gate_up.name, concat(0, [readable(reads, f.gate_up, leg) for leg in legs]), encoding(f.gate_up.dtype)))
+            reads.read(f.down, n("mlp.down_proj.weight"))
+            continue
+        reads.read(f.router, n("mlp.gate.weight"))
+        reads.read(f.bias, n("mlp.gate.e_score_correction_bias"))
+        expert = lambda e, leg: n("mlp.experts.{}.{}_proj".format(e, leg))
+        gate_up = []
+        for e in range(f.experts):
+            gate_up += [expert(e, "gate"), expert(e, "up")]
+        packed_bank(reads, f.gate_up, gate_up)
+        packed_bank(reads, f.down, [expert(e, "down") for e in range(f.experts)])
+
+def readable(reads, w, name, rows = None, chunks = 0):
+    """The tensor `name` (its `rows` = (start, count), if given) at `w`'s
+    dtype: an fp8 plane is read out through its block factors on its own
+    first, since a join reads whole planes, its rows stored cut into
+    `chunks` each scaled apart, if stated."""
+    whole = src(name)
+    part = whole.slice(0, rows[0], rows[1]) if rows != None else whole
+    if stored(name) != FP8:
+        return part
+    tag = name if rows == None else "{}.{}+{}".format(name, rows[0], rows[1])
+    held = "{}.{}".format(w.name, tag)
+    reads.push(tensor(held, part.cast(encoding(w.dtype), chunks = chunks), encoding(w.dtype), internal = True))
+    return out(held)
+
+def qkv(m, reads, at, name):
+    """Each head's rows out of the chunk that holds it, queries and keys zero
+    from 192 to 256 and values from 128."""
+    d = m.head_dim
+    hidden = m.hidden
+    kv = at.kv_heads
+    if m.q_heads % m.shards != 0 or kv % m.shards != 0:
+        fail("`{}`: {} query and {} kv heads do not cut into the {} chunks it is stored in".format(name, m.q_heads, kv, m.shards))
+    per_q = m.q_heads // m.shards
+    per_kv = kv // m.shards
+    qk = m.qk_head_dim
+    vd = m.v_head_dim
+    chunk = per_q * qk + per_kv * (qk + vd)
+    held = shape(name)
+    if held != [m.shards * chunk, hidden]:
+        fail("`{}`: {} chunks of {} heads of queries and {} of keys and values are [{}, {}], and it is stored {}".format(
+            name, m.shards, per_q, per_kv, m.shards * chunk, hidden, held))
+    starts = []
+    for h in range(m.q_heads):
+        starts.append(((h // per_q) * chunk + (h % per_q) * qk, qk))
+    for g in range(kv):
+        starts.append(((g // per_kv) * chunk + per_q * qk + (g % per_kv) * qk, qk))
+    for g in range(kv):
+        starts.append(((g // per_kv) * chunk + (per_q + per_kv) * qk + (g % per_kv) * vd, vd))
+    if kept(at.qkv):
+        # Each head as stored, unpadded; the attention prologue lays it out.
+        parts = []
+        factors = []
+        for start, rows in starts:
+            parts.append(src(name).slice(0, start, rows))
+            factors += factor_rows(start, rows, chunk)
+        held = src(name[:-len(".weight")] + ".weight_scale_inv").gather(0, factors)
+        kept_read(reads, at.qkv, concat(0, parts), held, at.qkv.shape[0])
+        return
+    pad = lambda rows: fill(0.0, [rows, hidden], encoding(at.qkv.dtype))
+    head = lambda start, rows: readable(reads, at.qkv, name, (start, rows), chunks = m.shards)
+    parts = []
+    for start, rows in starts:
+        parts += [head(start, rows), pad(d - rows)]
+    reads.push(tensor(at.qkv.name, concat(0, parts), encoding(at.qkv.dtype), shape = at.qkv.shape))
+
+def packed_bank(reads, w, stems):
+    """A routed bank from MXFP4 legs: each `*.weight` a `[rows, cols/2]` u8
+    plane of e2m1 nibble pairs beside a `[rows, cols/32]` u8 e8m0
+    `*.weight_scale`, stacked on the leading axis and read as the bank's
+    `[experts, ...]` rectangle."""
+    rows, cols = w.shape[1], w.shape[2]
+    legs = len(stems)
+    per_leg = rows * w.shape[0] // legs
+    codes = []
+    scales = []
+    for stem in stems:
+        if stored(stem + ".weight") != raw(dtype.u8) or not has(stem + ".weight_scale"):
+            fail("`{}`: `{}.weight` is read as MXFP4 codes beside their `{}.weight_scale` exponents".format(w.name, stem, stem))
+        codes.append(src(stem + ".weight").transmute([1, per_leg, cols], encoding(dtype.mxfp4)))
+        scales.append(src(stem + ".weight_scale").transmute([1, per_leg, cols // 32], encoding(dtype.e8m0)))
+    counted = scales_shape(w)
+    codes = concat(0, codes)
+    scales = concat(0, scales)
+
+    # Two legs per expert (gate, up) stack to `[2E, inter, cols]`, which is
+    # the declared `[E, 2*inter, cols]` rectangle byte for byte.
+    if [legs, per_leg, cols] != list(w.shape):
+        codes = codes.transmute(w.shape, encoding(dtype.mxfp4))
+        scales = scales.transmute(counted, encoding(dtype.e8m0))
+    reads.extend([
+        tensor(w.name, codes, encoding(dtype.mxfp4)),
+        tensor(scales_name(w.name), scales, encoding(dtype.e8m0), shape = counted, scaling = w),
+    ])
+
+# The forward of MiMo-V2.6: attention over heads stored 256 wide, the first 64
+# of each rotated, full on its few layers and over a 128-token window with
+# sinks on the rest; then a dense SwiGLU MLP, or experts chosen by a biased
+# sigmoid router.
+
+def caches(m, c):
+    spaces = [c.kv_space(m.kv, m.window), c.kv_space(m.kv)]
+    for w in m.layers:
+        at = w.attn
+        plane = at.kv_heads * m.head_dim
+        c.kv(spaces[at.reading], at.kv, [plane, plane], m.head_dim, heads = True, live = [m.qk_head_dim, m.v_head_dim])
+
+def forward(m, inputs):
+    positions = inputs.positions()
+    d = m.head_dim
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
+    routes = inputs.adapter_routes()
+
+    def block(l, w, y):
+        at = w.attn
+        r = at.reading
+        win = m.window if r == WINDOWED else None
+        kv_heads = at.kv_heads
+        pages = inputs.kv(at.kv)
+
+        x = ops.elemwise.rmsnorm(y, w.attn_norm, w.attn_norm_eps)
+        packed = ops.linear.matmul(x, at.qkv)
+        if m.unpadded:
+            q, k, v = ops.gather.split_qkv_padded(packed, m.q_heads, kv_heads, m.qk_head_dim, m.v_head_dim, d)
+        else:
+            q, k, v = ops.gather.split_qkv(packed, m.q_heads * d, kv_heads * d)
+        v = v * f32(m.value_scale)
+        seam.at(seam.ATTN_QV, [q, v])
+        q, k = ops.elemwise.rope(q, positions, d, at.theta, rotary.partial(m.rotary_dim), k = k)
+        ops.attn.kv_append(k, v, pages, inputs.write_page(at.kv), inputs.write_offset(at.kv))
+        seam.at(seam.ATTN_Q, [q])
+
+        # Each lane by its kind; a layer with sinks folds them in and keeps
+        # its scores in, one without reads them out at their seam.
+        a = ops.attn.attend(q, inputs, at.kv, m.q_heads, kv_heads, d, m.sm_scale, window = win,
+                            sinks = at.sinks, mask = True, scores = True, scores_seam = at.sinks == None)
+        seam.at(seam.ATTN_OUT, [a])
+
+        # Each head's values are its first half; the padding after them is
+        # cut off before the output projection reads them.
+        a, _ = ops.gather.split_q_gate(a, m.v_head_dim)
+        o = ops.linear.matmul(a, at.o_proj)
+        adapted = fact.has(fact.Adapter)
+        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        y = ops.elemwise.residual_add(o, y)
+
+        x = ops.elemwise.rmsnorm(y, w.mlp_norm, w.mlp_norm_eps)
+        return ops.elemwise.residual_add(mlp(x, w.mlp), y)
+
+    y = inputs.fold_layers(m.layers, y, block)
+
+    x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
+    return ops.linear.lm_head(x, m.head)
+
+def mlp(x, f):
+    if not f.routed:
+        act = ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter)
+        return ops.linear.matmul(act, f.down)
+    routes, weights = ops.linear.moe_route(
+        ops.linear.matmul(x, f.router),
+        f.experts,
+        f.top_k,
+        routing.sigmoid(renormalize = True, scaling = 1.0),
+        bias = f.bias,
+    )
+    packed = ops.linear.moe_matmul_select_quant(x, f.gate_up, routes, f.top_k)
+    act = ops.linear.glu(packed, gating.swiglu(), f.inter)
+    return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select_quant(act, f.down, routes, f.top_k), weights)

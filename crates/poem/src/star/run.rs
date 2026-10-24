@@ -1,5 +1,5 @@
 //! A deployment of a package traced and read: its layout evaluated, then the
-//! caches and forward of `forward.poem` recorded into a trace, or the formats
+//! caches and forward it runs recorded into a trace, or the formats
 //! of `formats(m)` read into a contract.
 
 use std::cell::RefCell;

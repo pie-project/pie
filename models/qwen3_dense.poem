@@ -1,0 +1,232 @@
+# Qwen 3, dense and text-only (Qwen/Qwen3-0.6B ... -32B): full attention in
+# every layer, its q and k RMS-normed per head and rotated in full, and a
+# SwiGLU MLP; as released, as Qwen releases it in FP8 (128-square blocks
+# against e4m3 activations) and as modelopt exports it in NVFP4 (against bf16
+# activations). Qwen 3.5 and later, with gated-delta layers, are `qwen_3`;
+# Qwen 3's mixtures of experts are `qwen3_moe`.
+# A u4g64 row also reads an AWQ or GPTQ int4 export (Qwen/Qwen3-8B-AWQ), its
+# codes moved as they are.
+
+load("//pie/codec.poem", "mapped")
+load("//lib/adapters.poem", "banks")
+load("//lib/rope.poem", "yarn")
+load("//lib/spoken.poem", "QWEN_STOP")
+
+CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
+TOKENIZER = tokenizer(markers = [QWEN_STOP])
+
+def qwen3(id, layers):
+    return model(id, template = CHATML, tokenizer = TOKENIZER, arch = "qwen3", layers = layers, vocab = 151936)
+
+MODELS = [
+    qwen3("qwen3-0.6b", layers = 28),
+    qwen3("qwen3-8b", layers = 36),
+    qwen3("qwen3-14b", layers = 40),
+    qwen3("qwen3-32b", layers = 64),
+]
+
+F8 = dtype.e4m3tile128a8
+
+DEPLOYMENTS = [
+    deployment("qwen3-0.6b", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("qwen3-8b", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("qwen3-8b", weights = dtype.u4g64, kv = dtype.bf16),
+    deployment("qwen3-14b", weights = dtype.bf16, kv = dtype.bf16),
+    # Keys and values e4m3 under a unit scale (vLLM's `fp8` KV).
+    deployment("qwen3-0.6b", weights = dtype.bf16, kv = dtype.e4m3),
+    deployment("qwen3-14b", weights = dtype.bf16, kv = dtype.e4m3),
+    # compressed-tensors per-channel FP8 (RedHatAI/Qwen3-*-FP8-dynamic): a
+    # factor a row against e4m3 activations in 1x128 blocks (finer than the
+    # release's per-token), keys and values e4m3 as vLLM serves it on B200.
+    deployment("qwen3-0.6b", weights = dtype.e4m3g128a8, kv = dtype.e4m3),
+    deployment("qwen3-0.6b", weights = dtype.e4m3g128a8, kv = dtype.bf16),
+    deployment("qwen3-14b", weights = dtype.e4m3g128a8, kv = dtype.e4m3),
+    deployment("qwen3-14b", weights = dtype.e4m3g128a8, kv = dtype.bf16),
+    deployment("qwen3-8b", weights = F8, kv = dtype.bf16),
+    deployment("qwen3-8b", weights = F8, kv = dtype.e4m3),
+    deployment("qwen3-8b", weights = dtype.nvfp4, kv = dtype.e4m3),
+    deployment("qwen3-14b", weights = F8, kv = dtype.e4m3),
+    deployment("qwen3-32b", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("qwen3-32b", weights = F8, kv = dtype.e4m3),
+    deployment("qwen3-32b", weights = dtype.nvfp4, kv = dtype.e4m3),
+    deployment("qwen3-32b", weights = dtype.u4g64, kv = dtype.bf16),
+    deployment("qwen3-8b", weights = dtype.e4m3g128a8, kv = dtype.e4m3),
+    deployment("qwen3-32b", weights = dtype.e4m3g128a8, kv = dtype.e4m3),
+    deployment("qwen3-14b", weights = dtype.u4g64, kv = dtype.bf16),
+]
+
+# The weights of Qwen 3 (dense): per layer an RMS norm, q, k, v and o
+# projections with per-head q and k norms, an RMS norm and a SwiGLU MLP; the
+# token embedding, which the 0.6B also reads out through (tied), a final norm.
+# Each layer also has the LoRA banks the host registers. A deployment's dtype
+# is its projections'; the embedding and head stay at its compute dtype, as
+# an AWQ or GPTQ export keeps them.
+
+def dims(hidden, layers, q_heads, kv_heads, inter, tied):
+    return struct(
+        hidden = hidden,
+        layers = layers,
+        q_heads = q_heads,
+        kv_heads = kv_heads,
+        inter = inter,
+        tied = tied,
+        head_dim = 128,
+        vocab = 151936,
+        theta = 1000000.0,
+        norm_eps = 1e-6,
+    )
+
+DIMS = {
+    "qwen3-0.6b": dims(hidden = 1024, layers = 28, q_heads = 16, kv_heads = 8, inter = 3072, tied = True),
+    "qwen3-8b": dims(hidden = 4096, layers = 36, q_heads = 32, kv_heads = 8, inter = 12288, tied = False),
+    "qwen3-14b": dims(hidden = 5120, layers = 40, q_heads = 40, kv_heads = 8, inter = 17408, tied = False),
+    "qwen3-32b": dims(hidden = 5120, layers = 64, q_heads = 64, kv_heads = 8, inter = 25600, tied = False),
+}
+
+# A release whose projections a deployment keeps as released (Qwen's block
+# FP8, compressed-tensors' per-channel FP8 as RedHatAI's *-FP8-dynamic store
+# it, modelopt's NVFP4), its tables and norms bf16.
+RELEASED = [dtype.e4m3tile128a8, dtype.e4m3g128, dtype.e4m3g128a8, dtype.nvfp4]
+
+def layout(id, deploy):
+    if deploy.drafter != None or deploy.parts:
+        fail("{} ships no drafter and no parts".format(id))
+    proj = roles(deploy, "proj", exact = True).proj
+    w = dtype.bf16 if proj in RELEASED else proj
+    d = DIMS[id]
+    dense = compute(w)
+    hidden, hd = d.hidden, d.head_dim
+
+    def layer(l):
+        lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
+        return struct(
+            attn_norm = weight([hidden]),
+            q = weight([d.q_heads * hd, hidden], proj).columns(),
+            k = weight([d.kv_heads * hd, hidden], proj).columns(heads = d.kv_heads),
+            v = weight([d.kv_heads * hd, hidden], proj).columns(heads = d.kv_heads),
+            o = weight([hidden, d.q_heads * hd], proj).rows(),
+            q_norm = weight([hd]),
+            k_norm = weight([hd]),
+            mlp_norm = weight([hidden]),
+            gate_up = weight([2 * d.inter, hidden], proj).packed([d.inter, d.inter]),
+            down = weight([hidden, d.inter], proj).rows(),
+            kv = "kv.{}".format(l),
+            lora_a = lora_a,
+            lora_b = lora_b,
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        q_heads = d.q_heads,
+        kv_heads = d.kv_heads,
+        head_dim = hd,
+        inter = d.inter,
+        theta = d.theta,
+        eps = d.norm_eps,
+        # Qwen3's native context, which YaRN stretches (its card: factor 4
+        # over 32768 tokens).
+        rope = yarn(deploy, 32768),
+        sm_scale = f32(1.0 / f32(sqrt(hd))),
+        kv = deploy.kv,
+        embed = weight([d.vocab, hidden]),
+        head = None if d.tied else weight([d.vocab, hidden]).columns(),
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight([hidden]),
+    )
+
+# How a Qwen 3 (dense) checkpoint is read: transformers' safetensors, under
+# `model.`, as released (bf16), as Qwen releases it in FP8 (e4m3 codes beside
+# 128-square block factors), as compressed-tensors stores it in FP8 (a scale
+# a row: RedHatAI's *-FP8-dynamic) or as modelopt exports it in NVFP4;
+# recognized by its per-head q norm and checked against its config.
+
+def configured(m):
+    return [
+        config("hidden_size", m.hidden),
+        config("vocab_size", m.vocab),
+        config("num_attention_heads", m.q_heads),
+        config("num_key_value_heads", m.kv_heads),
+        config("head_dim", m.head_dim),
+        config("num_hidden_layers", len(m.layers)),
+        config("intermediate_size", m.inter),
+        config("rms_norm_eps", m.eps),
+        config("rope_theta", m.theta),
+    ]
+
+def formats(m):
+    return [format(
+        "transformers",
+        recognizes = lambda checkpoint: has("model.embed_tokens.weight") and has("model.layers.0.self_attn.q_norm.weight") and not has("model.layers.0.mlp.experts.0.down_proj.weight"),
+        read = lambda reads: mapped(reads, m, TRANSFORMERS),
+        states = configured(m),
+    )]
+
+TRANSFORMERS = [
+    ("model.embed_tokens.weight", "embed"),
+    ("model.norm.weight", "final_norm"),
+    ("lm_head.weight", "head"),
+    ("model.layers.{l}.input_layernorm.weight", "layers.{l}.attn_norm"),
+    ("model.layers.{l}.self_attn.q_proj.weight", "layers.{l}.q"),
+    ("model.layers.{l}.self_attn.k_proj.weight", "layers.{l}.k"),
+    ("model.layers.{l}.self_attn.v_proj.weight", "layers.{l}.v"),
+    ("model.layers.{l}.self_attn.o_proj.weight", "layers.{l}.o"),
+    ("model.layers.{l}.self_attn.q_norm.weight", "layers.{l}.q_norm"),
+    ("model.layers.{l}.self_attn.k_norm.weight", "layers.{l}.k_norm"),
+    ("model.layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
+    (["model.layers.{l}.mlp.gate_proj.weight", "model.layers.{l}.mlp.up_proj.weight"], "layers.{l}.gate_up"),
+    ("model.layers.{l}.mlp.down_proj.weight", "layers.{l}.down"),
+]
+
+# The forward of Qwen 3 (dense): pre-norm layers of full attention, its q and
+# k RMS-normed per head and rotated in full (neox halves), and a SwiGLU MLP.
+# A row with an adapter adds its LoRA correction to the attention's output.
+# A deployment stretched by YaRN turns its rotation at the scaled frequencies.
+
+def caches(m, c):
+    kv = c.kv_space(m.kv)
+    plane = m.kv_heads * m.head_dim
+    for w in m.layers:
+        c.kv(kv, w.kv, [plane, plane], m.head_dim, heads = True)
+
+def forward(m, inputs):
+    positions = inputs.positions()
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
+    routes = inputs.adapter_routes()
+    scaling = rope_scaling(m.rope)
+
+    def block(l, w, y):
+        x = ops.elemwise.rmsnorm(y, w.attn_norm, m.eps)
+        o = attention(x, inputs, m, positions, w, scaling)
+        adapted = fact.has(fact.Adapter)
+        o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
+        y = ops.elemwise.residual_add(o, y)
+        x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
+        f = ops.linear.matmul(
+            ops.linear.glu(ops.linear.matmul(x, w.gate_up), gating.swiglu(), m.inter),
+            w.down,
+        )
+        return ops.elemwise.residual_add(f, y)
+
+    y = inputs.fold_layers(m.layers, y, block)
+    x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
+    return ops.linear.lm_head(x, m.embed if m.head == None else m.head)
+
+def attention(x, inputs, m, positions, w, scaling):
+    pages = inputs.kv(w.kv)
+    d = m.head_dim
+    q = ops.linear.matmul(x, w.q)
+    k = ops.linear.matmul(x, w.k)
+    v = ops.linear.matmul(x, w.v)
+    seam.at(seam.ATTN_QV, [q, v])
+    q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, d, m.eps)
+    k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, d, m.eps)
+    q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.full(), k = k, scaling = scaling)
+    ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
+    seam.at(seam.ATTN_Q, [q])
+
+    # Each lane by its kind; a lane may bring its own mask or capture scores.
+    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
+    seam.at(seam.ATTN_OUT, [o])
+    return ops.linear.matmul(o, w.o)

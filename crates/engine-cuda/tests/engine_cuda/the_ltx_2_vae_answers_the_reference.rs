@@ -23,7 +23,7 @@ def forward(m, inputs):
 "#;
 
 fn vae_only() -> Trace {
-    poem_compiler::catalog::replacing("ltx25", "forward.poem", "forward", VAE_ONLY)
+    poem_compiler::catalog::replacing("ltx25", "forward", VAE_ONLY)
         .unwrap_or_else(|why| panic!("the VAE-only package: {why}"))
         .trace(
             "ltx25",
@@ -37,12 +37,12 @@ fn vae_only() -> Trace {
 /// The VAE's reads alone, by the package's own functions.
 const VAE_FORMATS: &str = r#"
 def formats(m):
-    return [format("vae", read = lambda reads: vae(reads, m.vae))]
+    return [format("vae", read = lambda reads: read_vae(reads, m.vae))]
 "#;
 
 fn import_vae(src: &ztensor::Source) -> checkpoint::contract::ModelContract {
     let package =
-        poem_compiler::catalog::replacing("ltx25", "formats.poem", "formats", VAE_FORMATS)
+        poem_compiler::catalog::replacing("ltx25", "formats", VAE_FORMATS)
             .unwrap_or_else(|why| panic!("the VAE-only package: {why}"));
     package
         .import("ltx25", &deploy(FLAGSHIP), src, Platform::Cuda)

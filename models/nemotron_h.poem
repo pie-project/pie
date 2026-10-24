@@ -1,0 +1,489 @@
+# Nemotron-3 Super and Ultra (`nemotron_h`): Mamba-2 mixers, a few NoPE
+# attention layers and latent MoE layers of relu2 experts; and their
+# nine-layer miniatures (four of each mixer kind but one attention, Ultra's at
+# 64 experts). Super is served as modelopt exports it and vLLM serves it:
+# routed experts NVFP4 against NVFP4 activations, the projections the export
+# keeps FP8 at FP8, the rest bf16. Ultra is served as released, every weight
+# bf16. Nemotron-3 Nano: the same mixers, its experts on the residual itself,
+# and its six-layer miniature.
+
+load("//pie/codec.poem", read_weight = "weight", released = "bank")
+
+STOP = ["<|im_end|>"]
+CHATML = template("chatml", thinking = True, tools = True, generation_suffix = "<think>\n", stop = STOP)
+TOKENIZER = tokenizer(markers = [STOP])
+
+MODELS = [
+    model("nemotron3-super", template = CHATML, tokenizer = TOKENIZER, arch = "nemotron_h", layers = 88, vocab = 131072),
+    model("nemotron3-ultra", template = CHATML, tokenizer = TOKENIZER, arch = "nemotron_h", layers = 108, vocab = 131072),
+    model("nemotron3-super-mini", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "nemotron_h", layers = 9, vocab = 131072),
+    model("nemotron3-ultra-mini", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "nemotron_h", layers = 9, vocab = 131072),
+    model("nemotron3-nano", template = CHATML, tokenizer = TOKENIZER, arch = "nemotron_h", layers = 52, vocab = 131072),
+    model("nemotron3-nano-mini", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "nemotron_h", layers = 6, vocab = 131072),
+]
+
+RELEASE = [dtype.bf16, dtype.nvfp4a4, dtype.e4m3tile128a8]
+
+DEPLOYMENTS = [
+    # Super's keys and values cached e4m3, as vLLM serves the export (its
+    # scales are one); the miniature also bf16. Ultra as released.
+    deployment("nemotron3-super", weights = RELEASE, kv = dtype.e4m3),
+    deployment("nemotron3-super-mini", weights = RELEASE, kv = dtype.e4m3),
+    deployment("nemotron3-super-mini", weights = RELEASE, kv = dtype.bf16),
+    deployment("nemotron3-ultra", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("nemotron3-ultra-mini", weights = dtype.bf16, kv = dtype.bf16),
+    # Nano as released (bf16), and modelopt's NVFP4 export (attention and the
+    # Mamba-2 ahead of it bf16, the rest NVFP4 against bf16 activations: the
+    # experts' 1856 rows are no whole number of the 128-row blocks the
+    # NVFP4-activation product takes).
+    deployment("nemotron3-nano", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("nemotron3-nano", weights = dtype.bf16, kv = dtype.e4m3),
+    deployment("nemotron3-nano", weights = [dtype.nvfp4, dtype.nvfp4], kv = dtype.e4m3),
+    deployment("nemotron3-nano-mini", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("nemotron3-nano-mini", weights = [dtype.nvfp4, dtype.nvfp4], kv = dtype.e4m3),
+]
+
+# The weights of Nemotron-3 Super, Ultra and Nano: per layer an RMS norm and
+# one mixer, a Mamba-2 (`M`), a NoPE GQA attention (`*`) or an MoE (`E`) of
+# relu2 experts beside a relu2 shared expert (Super's and Ultra's reading the
+# residual squeezed to a latent width, Nano's reading it whole); the token
+# embedding, a final norm and the head.
+
+# Super's and Nano's `hybrid_override_pattern`; Ultra's `layers_block_type`,
+# one letter a layer.
+SUPER = "MEMEMEM*EMEMEMEM*EMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEMEM*EMEMEMEM*EMEMEMEME"
+ULTRA = "MEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+NANO = "MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+
+def nano(layers, experts):
+    return struct(
+        pattern = NANO,
+        layers = layers,
+        hidden = 2688,
+        vocab = 131072,
+        heads = 32,
+        kv_heads = 2,
+        head_dim = 128,
+        mamba_heads = 64,
+        mamba_head_dim = 64,
+        groups = 8,
+        state_dim = 128,
+        conv_kernel = 4,
+        experts = experts,
+        top_k = 6,
+        latent = None,
+        moe_inter = 1856,
+        shared_inter = 3712,
+        scaling = 2.5,
+        eps = 1e-5,
+    )
+
+def dims(layers, pattern = SUPER, wide = 1, experts = 512):
+    """Super's widths, or Ultra's (`wide = 2`): twice the residual, heads,
+    Mamba heads, latent and expert widths, the same experts and fan-out; a
+    miniature may keep fewer `experts`."""
+    return struct(
+        layers = layers,
+        pattern = pattern,
+        hidden = 4096 * wide,
+        vocab = 131072,
+        heads = 32 * wide,
+        kv_heads = 2,
+        head_dim = 128,
+        mamba_heads = 128 * wide,
+        mamba_head_dim = 64,
+        groups = 8,
+        state_dim = 128,
+        conv_kernel = 4,
+        experts = experts,
+        top_k = 22,
+        latent = 1024 * wide,
+        moe_inter = 2688 if wide == 1 else 5120,
+        shared_inter = 5376 if wide == 1 else 10240,
+        scaling = 5.0,
+        eps = 1e-5,
+    )
+
+DIMS = {
+    "nemotron3-super": dims(88),
+    "nemotron3-super-mini": dims(9),
+    "nemotron3-ultra": dims(108, ULTRA, 2),
+    # Ultra's first nine layers at 64 of its experts: a 512-expert bank is
+    # 21 GiB a layer in bf16, past one 80 GB card four times over.
+    "nemotron3-ultra-mini": dims(9, ULTRA, 2, experts = 64),
+    "nemotron3-nano": nano(52, 128),
+    # Its first six layers: every mixer kind, the attention last.
+    "nemotron3-nano-mini": nano(6, 16),
+}
+
+# The release's own precision a projection, as modelopt chose it layer by
+# layer: the layers each projection is kept bf16 at where most are FP8, or
+# FP8 at where most are bf16; and the one shared expert stored NVFP4, read
+# here as bf16.
+BF16_AT = {
+    "in_proj": [22, 24, 33, 35, 38, 42, 44, 46, 64, 75, 77, 80],
+    "out_proj": [6, 15, 20, 22, 24, 27, 29, 31, 33, 35, 46],
+    "shared_up": [41],
+    "shared_down": [1, 8, 76],
+}
+FP8_AT = {
+    "fc1_latent": [1, 3, 5],
+    "fc2_latent": [3],
+    "o_proj": [69, 78],
+}
+
+def layout(id, deploy):
+    if DIMS[id].latent == None:
+        return nano_layout(id, deploy)
+    d = DIMS[id]
+    if deploy.drafter != None or deploy.parts:
+        fail("{} has no draft head or parts here; not {}".format(id, deploy))
+    plain = deploy.weights == [dtype.bf16]
+    if d.pattern == ULTRA and not plain:
+        fail("{} ships as released: every weight bf16; not {}".format(id, deploy))
+    if d.pattern == SUPER and deploy.weights != [dtype.bf16, dtype.nvfp4a4, dtype.e4m3tile128a8]:
+        fail("{} ships as released: bf16, NVFP4 experts against NVFP4 activations and its FP8 projections; not {}".format(id, deploy))
+    w, experts, f8 = (dtype.bf16, dtype.bf16, dtype.bf16) if plain else deploy.weights
+    hidden = d.hidden
+    inner = d.mamba_heads * d.mamba_head_dim
+    conv_dim = inner + 2 * d.groups * d.state_dim
+    bc = d.groups * d.state_dim
+
+    def proj(name, kind, l, shape):
+        kept = plain or (l in BF16_AT[kind] if kind in BF16_AT else l not in FP8_AT[kind])
+        return weight(shape, w if kept else f8)
+
+    def mamba(l):
+        n = lambda s: "layer.{}.{}".format(l, s)
+        return struct(
+            # tensor parallel: a rank holds a share of the Mamba heads and of the B/C groups
+            in_proj = proj(n("in_proj"), "in_proj", l, [inner + conv_dim + d.mamba_heads, hidden]).packed([inner, inner, bc, bc, d.mamba_heads], heads = [d.mamba_heads, d.mamba_heads, d.groups, d.groups, d.mamba_heads]),
+            conv = weight([conv_dim, d.conv_kernel], w).packed([inner, bc, bc], heads = [d.mamba_heads, d.groups, d.groups]),
+            conv_bias = weight([conv_dim], w).packed([inner, bc, bc], heads = [d.mamba_heads, d.groups, d.groups]),
+            a_log = weight([d.mamba_heads], dtype.f32).columns(),
+            dt_bias = weight([d.mamba_heads], dtype.f32).columns(),
+            d = weight([d.mamba_heads], dtype.f32).columns(),
+            norm = weight([inner]).columns(heads = d.groups),
+            out_proj = proj(n("out_proj"), "out_proj", l, [hidden, inner]).rows(),
+            conv_state = "conv.{}".format(l),
+            ssm_state = "ssm.{}".format(l),
+        )
+
+    def attention(l):
+        n = lambda s: "layer.{}.{}".format(l, s)
+        hd = d.head_dim
+        return struct(
+            q = weight([d.heads * hd, hidden], w).columns(),
+            k = weight([d.kv_heads * hd, hidden], w).columns(heads = d.kv_heads),
+            v = weight([d.kv_heads * hd, hidden], w).columns(heads = d.kv_heads),
+            o = proj(n("o"), "o_proj", l, [hidden, d.heads * hd]).rows(),
+            kv = "kv.{}".format(l),
+        )
+
+    def moe(l):
+        n = lambda s: "layer.{}.{}".format(l, s)
+        return struct(
+            router = weight([d.experts, hidden], w),
+            bias = weight([d.experts], dtype.f32),
+            down_latent = proj(n("fc1_latent"), "fc1_latent", l, [d.latent, hidden]),
+            up_latent = proj(n("fc2_latent"), "fc2_latent", l, [hidden, d.latent]),
+            up = weight([d.experts, d.moe_inter, d.latent], experts).bank([d.moe_inter]),
+            down = weight([d.experts, d.latent, d.moe_inter], experts).rows(),
+            shared_up = proj(n("shared_up"), "shared_up", l, [d.shared_inter, hidden]).columns(),
+            shared_down = proj(n("shared_down"), "shared_down", l, [hidden, d.shared_inter]).rows(),
+        )
+
+    def layer(l):
+        kind = d.pattern[l]
+        return struct(
+            kind = kind,
+            norm = weight([hidden]),
+            mamba = mamba(l) if kind == "M" else None,
+            attn = attention(l) if kind == "*" else None,
+            moe = moe(l) if kind == "E" else None,
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        heads = d.heads,
+        kv_heads = d.kv_heads,
+        head_dim = d.head_dim,
+        sm_scale = f32(1.0 / f32(sqrt(d.head_dim))),
+        mamba_heads = d.mamba_heads,
+        mamba_head_dim = d.mamba_head_dim,
+        groups = d.groups,
+        state_dim = d.state_dim,
+        conv_kernel = d.conv_kernel,
+        inner = inner,
+        conv_dim = conv_dim,
+        experts = d.experts,
+        top_k = d.top_k,
+        scaling = d.scaling,
+        eps = d.eps,
+        kv = deploy.kv,
+        embed = weight([d.vocab, hidden], w),
+        head = weight([d.vocab, hidden], w),
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight([hidden]),
+    )
+
+def nano_layout(id, deploy):
+    """Nemotron-3 Nano: experts on the residual itself. Its modelopt exports
+    (NVFP4) keep every attention and the Mamba-2 ahead of it bf16; the
+    deployment's first dtype stores the other projections and the shared
+    expert, its second (or the first) the routed experts."""
+    if deploy.drafter != None or deploy.parts:
+        fail("{} has no draft head or parts here; not {}".format(id, deploy))
+    r = roles(deploy, "proj", "experts")
+    proj, experts = r.proj, r.experts
+    d = DIMS[id]
+    hidden = d.hidden
+    inner = d.mamba_heads * d.mamba_head_dim
+    conv_dim = inner + 2 * d.groups * d.state_dim
+    pattern = d.pattern
+    kept = lambda l: pattern[l] == "*" or (l + 1 < len(pattern) and pattern[l + 1] == "*")
+    at = lambda l: dtype.bf16 if kept(l) else proj
+
+    def layer(l):
+        kind = pattern[l]
+        mamba = None
+        attn = None
+        moe = None
+        if kind == "M":
+            mamba = struct(
+                in_proj = weight([inner + conv_dim + d.mamba_heads, hidden], at(l)),
+                conv = weight([conv_dim, d.conv_kernel]),
+                conv_bias = weight([conv_dim]),
+                a_log = weight([d.mamba_heads], dtype.f32),
+                dt_bias = weight([d.mamba_heads], dtype.f32),
+                d = weight([d.mamba_heads], dtype.f32),
+                norm = weight([inner]),
+                out_proj = weight([hidden, inner], at(l)),
+                conv_state = "conv.{}".format(l),
+                ssm_state = "ssm.{}".format(l),
+            )
+        elif kind == "*":
+            hd = d.head_dim
+            attn = struct(
+                q = weight([d.heads * hd, hidden], dtype.bf16),
+                k = weight([d.kv_heads * hd, hidden], dtype.bf16),
+                v = weight([d.kv_heads * hd, hidden], dtype.bf16),
+                o = weight([hidden, d.heads * hd], dtype.bf16),
+                kv = "kv.{}".format(l),
+            )
+        else:
+            moe = struct(
+                router = weight([d.experts, hidden]),
+                bias = weight([d.experts], dtype.f32),
+                down_latent = None,
+                up_latent = None,
+                up = weight([d.experts, d.moe_inter, hidden], experts),
+                down = weight([d.experts, hidden, d.moe_inter], experts),
+                shared_up = weight([d.shared_inter, hidden], proj),
+                shared_down = weight([hidden, d.shared_inter], proj),
+            )
+        return struct(
+            kind = kind,
+            norm = weight([hidden]),
+            mamba = mamba,
+            attn = attn,
+            moe = moe,
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = d.vocab,
+        heads = d.heads,
+        kv_heads = d.kv_heads,
+        head_dim = d.head_dim,
+        sm_scale = f32(1.0 / f32(sqrt(d.head_dim))),
+        mamba_heads = d.mamba_heads,
+        mamba_head_dim = d.mamba_head_dim,
+        groups = d.groups,
+        state_dim = d.state_dim,
+        conv_kernel = d.conv_kernel,
+        inner = inner,
+        conv_dim = conv_dim,
+        experts = d.experts,
+        top_k = d.top_k,
+        scaling = d.scaling,
+        eps = d.eps,
+        kv = deploy.kv,
+        embed = weight([d.vocab, hidden]),
+        head = weight([d.vocab, hidden]),
+        layers = [layer(l) for l in range(d.layers)],
+        final_norm = weight([hidden]),
+    )
+
+# How a Nemotron-3 checkpoint is laid out: transformers' names under
+# `backbone.`. Super as modelopt's mixed-precision export stores it: routed
+# experts NVFP4 an expert a tensor, the projections it quantized e4m3 under
+# one scale, one shared expert's down projection NVFP4 (widened here), the
+# rest bf16. Ultra's release: every plane bf16, an expert a tensor.
+
+BF = raw(dtype.bf16)
+
+def formats(m):
+    return [format(
+        "transformers",
+        recognizes = lambda checkpoint: has("backbone.embeddings.weight"),
+        read = lambda reads: read(m, reads),
+        states = [
+            config("hidden_size", m.hidden),
+            config("num_hidden_layers", len(m.layers)),
+            config("n_routed_experts", m.experts),
+            config("mamba_num_heads", m.mamba_heads),
+        ],
+    )]
+
+def bank(reads, w, stems):
+    """A routed bank: NVFP4 legs as the export stores them, or bf16 planes
+    stacked on the leading axis."""
+    if w.dtype != dtype.bf16:
+        released(reads, w, [[s + ".weight"] for s in stems])
+        return
+    dims = list(w.shape)
+    # A bank cut across ranks reads its rank's share; a whole one, every row.
+    if w.cut_axis != None:
+        dims[w.cut_axis] = -1
+    reads.read_expr(w, concat(0, [src(s + ".weight") for s in stems]).transmute(dims, BF))
+
+def read(m, reads):
+    reads.read(m.embed, "backbone.embeddings.weight")
+    reads.read(m.final_norm, "backbone.norm_f.weight")
+    reads.read(m.head, "lm_head.weight")
+    for l, w in enumerate(m.layers):
+        at = lambda s: "backbone.layers.{}.{}".format(l, s)
+        mixer = lambda s: at("mixer." + s)
+        reads.read(w.norm, at("norm.weight"))
+        if w.mamba != None:
+            k = w.mamba
+            read_weight(reads, k.in_proj, mixer("in_proj.weight"), quantized = "widen")
+            reads.push(tensor(k.conv.name, src(mixer("conv1d.weight")).transmute([m.conv_dim, m.conv_kernel], BF), BF))
+            reads.read(k.conv_bias, mixer("conv1d.bias"))
+            reads.read(k.a_log, mixer("A_log"))
+            reads.read(k.dt_bias, mixer("dt_bias"))
+            reads.read(k.d, mixer("D"))
+            reads.read(k.norm, mixer("norm.weight"))
+            read_weight(reads, k.out_proj, mixer("out_proj.weight"), quantized = "widen")
+        elif w.attn != None:
+            a = w.attn
+            reads.read(a.q, mixer("q_proj.weight"))
+            reads.read(a.k, mixer("k_proj.weight"))
+            reads.read(a.v, mixer("v_proj.weight"))
+            read_weight(reads, a.o, mixer("o_proj.weight"), quantized = "widen")
+        else:
+            f = w.moe
+            reads.read(f.router, mixer("gate.weight"))
+            reads.read(f.bias, mixer("gate.e_score_correction_bias"))
+            if f.down_latent != None:
+                read_weight(reads, f.down_latent, mixer("fc1_latent_proj.weight"), quantized = "widen")
+                read_weight(reads, f.up_latent, mixer("fc2_latent_proj.weight"), quantized = "widen")
+            expert = lambda e, leaf: mixer("experts.{}.{}".format(e, leaf))
+            bank(reads, f.up, [expert(e, "up_proj") for e in range(m.experts)])
+            bank(reads, f.down, [expert(e, "down_proj") for e in range(m.experts)])
+            read_weight(reads, f.shared_up, mixer("shared_experts.up_proj.weight"), quantized = "widen")
+            read_weight(reads, f.shared_down, mixer("shared_experts.down_proj.weight"), quantized = "widen")
+
+# The forward of Nemotron-3 Super, Ultra and Nano: pre-norm layers, each one
+# mixer added to the residual: a Mamba-2 scan, a NoPE GQA attention, or an MoE
+# whose relu2 experts read the residual (Super's and Ultra's squeezed to the
+# latent width) beside a relu2 shared expert reading it whole.
+
+def caches(m, c):
+    kv = c.kv_space(m.kv)
+    plane = m.kv_heads * m.head_dim
+    for w in m.layers:
+        if w.attn != None:
+            c.kv(kv, w.attn.kv, [plane, plane], m.head_dim, heads = True)
+        elif w.mamba != None:
+            c.state(w.mamba.conv_state, [m.conv_kernel, m.conv_dim], dtype.bf16, split = 1)
+            c.state(w.mamba.ssm_state, [m.mamba_heads, m.mamba_head_dim, m.state_dim], dtype.f32, split = 0)
+
+def forward(m, inputs):
+    y = ops.gather.embed(inputs.tokens(), m.embed, m.vocab)
+
+    def block(l, w, y):
+        x = ops.elemwise.rmsnorm(y, w.norm, m.eps)
+        if w.mamba != None:
+            o = mamba(x, inputs, m, w.mamba)
+        elif w.attn != None:
+            o = attention(x, inputs, m, w.attn)
+        else:
+            o = moe(x, m, w.moe)
+        return ops.elemwise.residual_add(o, y)
+
+    y = inputs.fold_layers(m.layers, y, block)
+    x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
+    x = ops.gather.gather_rows(x, inputs.readout_rows())
+    return ops.linear.lm_head(x, m.head)
+
+def mamba(x, inputs, m, k):
+    conv_state = inputs.state(k.conv_state)
+    ssm_state = inputs.state(k.ssm_state)
+    z, rest = ops.gather.split_rows(ops.linear.matmul(x, k.in_proj), m.inner)
+    xbc, dt = ops.gather.split_rows(rest, m.conv_dim)
+    seam.at(seam.RECURRENT, [xbc])
+
+    def scan(xbc, chunked):
+        rows = (lambda v: v.on(~fact.single_token())) if chunked else (lambda v: v.on(fact.single_token()))
+        conv = ops.ssm.causal_conv1d_chunked if chunked else ops.ssm.causal_conv1d
+        return ops.ssm.mamba2(
+            conv(xbc, k.conv, conv_state, m.conv_kernel, k.conv_bias),
+            rows(dt),
+            rows(z),
+            k.a_log,
+            k.dt_bias,
+            k.d,
+            k.norm,
+            m.eps,
+            ssm_state,
+            m.mamba_heads,
+            m.groups,
+            m.state_dim,
+            chunked,
+        )
+
+    o = switch(xbc, [(fact.single_token(), lambda xbc: scan(xbc, False))], otherwise = lambda xbc: scan(xbc, True))
+    return ops.linear.matmul(o, k.out_proj)
+
+def attention(x, inputs, m, a):
+    pages = inputs.kv(a.kv)
+    d = m.head_dim
+    q = ops.linear.matmul(x, a.q)
+    k = ops.linear.matmul(x, a.k)
+    v = ops.linear.matmul(x, a.v)
+    seam.at(seam.ATTN_QV, [q, v])
+    ops.attn.kv_append(k, v, pages, inputs.write_page(a.kv), inputs.write_offset(a.kv))
+    seam.at(seam.ATTN_Q, [q])
+
+    # Each lane by its kind; a lane may bring its own mask or capture scores.
+    o = ops.attn.attend(q, inputs, a.kv, m.heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
+    seam.at(seam.ATTN_OUT, [o])
+    return ops.linear.matmul(o, a.o)
+
+def moe(x, m, f):
+    routes, weights = ops.linear.moe_route(
+        ops.linear.matmul_f32(x, f.router),
+        m.experts,
+        m.top_k,
+        routing.sigmoid(renormalize = True, scaling = m.scaling),
+        bias = f.bias,
+    )
+    # Super's and Ultra's experts read the residual squeezed to the latent
+    # width; Nano's read it whole.
+    z = ops.linear.matmul(x, f.down_latent) if f.down_latent != None else x
+    hidden = ops.linear.relu2(select(z, f.up, routes, m.top_k))
+    routed = ops.linear.moe_weighted_sum(select(hidden, f.down, routes, m.top_k), weights)
+    shared = ops.linear.matmul(ops.linear.relu2(ops.linear.matmul(x, f.shared_up)), f.shared_down)
+    if f.up_latent != None:
+        routed = ops.linear.matmul(routed, f.up_latent)
+    return ops.elemwise.residual_add(routed, shared)
+
+def select(x, bank, routes, top_k):
+    """A routed bank's select: a bf16 bank's plain, a quantized one's
+    through its codes and factors."""
+    if bank.dtype == dtype.bf16:
+        return ops.linear.moe_matmul_select(x, bank, routes, top_k)
+    return ops.linear.moe_matmul_select_quant(x, bank, routes, top_k)

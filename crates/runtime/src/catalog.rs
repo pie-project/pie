@@ -1,7 +1,8 @@
 //! The catalog this build serves: `$PIE_HOME/models/`, which [`install`] seeds
-//! from the packages the binary embeds and keeps whole. A seeded directory
-//! records its seed's digest in `.seeded`: untouched, it follows the binary;
-//! edited, it is kept, with a warning once the built-in it came from moves on.
+//! from the packages the binary embeds and keeps whole. A seeded package
+//! records its seed's digest beside it (`.{name}.seeded`, or `.seeded` in a
+//! directory): untouched, it follows the binary; edited, it is kept, with a
+//! warning once the built-in it came from moves on.
 
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, OnceLock};
@@ -93,7 +94,7 @@ pub fn install(models: &Path) -> &'static [(String, Seeded)] {
                         package = name,
                         ?models,
                         "edited by hand from an older built-in, which has changed since; delete \
-                         the directory to take this build's, or carry the edit over"
+                         it to take this build's, or carry the edit over"
                     ),
                 }
             }
@@ -194,33 +195,114 @@ fn write(dir: &Path, files: &[(String, String)], seeded: &str) -> std::io::Resul
     Ok(())
 }
 
+/// Where a seed lands: a package of one file as `{name}.poem` beside the
+/// others, its digest in `.{name}.seeded`; `lib`, and a package of several
+/// files, as a directory holding its digest in `.seeded`.
+enum Place {
+    File { path: PathBuf, marker: PathBuf },
+    Dir(PathBuf),
+}
+
+impl Place {
+    fn of(models: &Path, name: &str, files: &[(String, String)]) -> Place {
+        match files {
+            [(file, _)] if name != LIB && *file == format!("{name}.poem") => Place::File {
+                path: models.join(file),
+                marker: models.join(format!(".{name}{SEEDED}")),
+            },
+            _ => Place::Dir(models.join(name)),
+        }
+    }
+
+    fn held(&self) -> std::io::Result<Option<Vec<(String, String)>>> {
+        match self {
+            Place::File { path, .. } if path.is_file() => {
+                let file = path.file_name().and_then(|f| f.to_str()).unwrap_or_default();
+                Ok(Some(vec![(file.to_string(), std::fs::read_to_string(path)?)]))
+            }
+            Place::Dir(dir) if dir.is_dir() => on_disk(dir).map(Some),
+            _ => Ok(None),
+        }
+    }
+
+    fn marker(&self) -> PathBuf {
+        match self {
+            Place::File { marker, .. } => marker.clone(),
+            Place::Dir(dir) => dir.join(SEEDED),
+        }
+    }
+
+    /// Writes `files` and the marker; a file is written beside its place
+    /// and renamed over it, so a seed that dies partway leaves it whole.
+    fn write(&self, files: &[(String, String)], seeded: &str) -> std::io::Result<()> {
+        match self {
+            Place::Dir(dir) => write(dir, files, seeded),
+            Place::File { path, marker } => {
+                let fresh = path.with_extension(format!("poem.{}.seeding", std::process::id()));
+                std::fs::write(&fresh, &files[0].1)?;
+                std::fs::rename(&fresh, path)?;
+                std::fs::write(marker, seeded)
+            }
+        }
+    }
+}
+
+/// An earlier build's seed of `name` as a directory, where it now ships as
+/// one file: gone if nobody edited it, else what it was found to be.
+fn earlier(models: &Path, name: &str, ships: &str) -> std::io::Result<Option<Seeded>> {
+    let dir = models.join(name);
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    let held = digest(&on_disk(&dir)?);
+    match std::fs::read_to_string(dir.join(SEEDED)).ok() {
+        Some(seeded) if seeded == held => {
+            std::fs::remove_dir_all(&dir)?;
+            Ok(None)
+        }
+        Some(seeded) => Ok(Some(Seeded::Edited {
+            behind: seeded != ships,
+        })),
+        None => Ok(Some(Seeded::Foreign)),
+    }
+}
+
 fn seed(models: &Path) -> std::io::Result<Vec<(String, Seeded)>> {
     std::fs::create_dir_all(models)?;
     let mut outcome = Vec::new();
     for (name, files) in seeds(&embedded_tree()) {
-        let dir = models.join(&name);
+        let place = Place::of(models, &name, &files);
         let ships = digest(&files);
-        let seeded = if !dir.is_dir() {
-            write(&dir, &files, &ships)?;
-            Seeded::Written
-        } else {
-            let held = digest(&on_disk(&dir)?);
-            let marker = std::fs::read_to_string(dir.join(SEEDED)).ok();
-            if held == ships {
-                if marker.as_deref() != Some(ships.as_str()) {
-                    std::fs::write(dir.join(SEEDED), &ships)?;
-                }
-                Seeded::Current
-            } else {
-                match marker.as_deref() {
-                    None => Seeded::Foreign,
-                    Some(seeded) if seeded == held => {
-                        write(&dir, &files, &ships)?;
-                        Seeded::Updated
+        if matches!(place, Place::File { .. })
+            && let Some(kept) = earlier(models, &name, &ships)?
+        {
+            outcome.push((name, kept));
+            continue;
+        }
+        let seeded = match place.held()? {
+            None => {
+                place.write(&files, &ships)?;
+                Seeded::Written
+            }
+            Some(held) => {
+                let held = digest(&held);
+                let marker = std::fs::read_to_string(place.marker()).ok();
+                if held == ships {
+                    if marker.as_deref() != Some(ships.as_str()) {
+                        std::fs::write(place.marker(), &ships)?;
                     }
-                    Some(seeded) => Seeded::Edited {
-                        behind: seeded != ships,
-                    },
+                    Seeded::Current
+                } else {
+                    match marker.as_deref() {
+                        None => Seeded::Foreign,
+                        Some(seeded) if seeded == held => {
+                            place.write(&files, &ships)?;
+                            Seeded::Updated
+                        }
+                        Some(seeded) => Seeded::Edited {
+                            behind: seeded != ships,
+                        },
+                    }
                 }
             }
         };
@@ -288,7 +370,7 @@ mod tests {
 
         let first = seed(&models).unwrap();
         assert!(first.iter().all(|(_, s)| *s == Seeded::Written));
-        assert!(models.join("qwen_3").is_dir());
+        assert!(models.join("qwen_3.poem").is_file());
         assert!(models.join(LIB).join(SEEDED).is_file());
 
         let again = seed(&models).unwrap();
@@ -297,9 +379,11 @@ mod tests {
             "{again:?}"
         );
 
-        let qwen = models.join("qwen_3");
-        std::fs::write(qwen.join("forward.poem"), "# an older build's\n").unwrap();
-        std::fs::write(qwen.join(SEEDED), digest(&on_disk(&qwen).unwrap())).unwrap();
+        let qwen = models.join("qwen_3.poem");
+        let marker = models.join(".qwen_3.seeded");
+        let digest_of = |text: &str| digest(&[("qwen_3.poem".to_string(), text.to_string())]);
+        std::fs::write(&qwen, "# an older build's\n").unwrap();
+        std::fs::write(&marker, digest_of("# an older build's\n")).unwrap();
         let updated = seed(&models).unwrap();
         assert!(
             updated
@@ -307,12 +391,9 @@ mod tests {
                 .any(|(n, s)| n == "qwen_3" && *s == Seeded::Updated),
             "{updated:?}"
         );
-        assert_ne!(
-            std::fs::read_to_string(qwen.join("forward.poem")).unwrap(),
-            "# an older build's\n"
-        );
+        assert_ne!(std::fs::read_to_string(&qwen).unwrap(), "# an older build's\n");
 
-        std::fs::write(qwen.join("forward.poem"), "# mine\n").unwrap();
+        std::fs::write(&qwen, "# mine\n").unwrap();
         let edited = seed(&models).unwrap();
         assert!(
             edited
@@ -320,12 +401,9 @@ mod tests {
                 .any(|(n, s)| n == "qwen_3" && *s == Seeded::Edited { behind: false }),
             "{edited:?}"
         );
-        assert_eq!(
-            std::fs::read_to_string(qwen.join("forward.poem")).unwrap(),
-            "# mine\n"
-        );
+        assert_eq!(std::fs::read_to_string(&qwen).unwrap(), "# mine\n");
 
-        std::fs::write(qwen.join(SEEDED), "an older build's digest").unwrap();
+        std::fs::write(&marker, "an older build's digest").unwrap();
         let behind = seed(&models).unwrap();
         assert!(
             behind
@@ -334,7 +412,7 @@ mod tests {
             "{behind:?}"
         );
 
-        std::fs::remove_file(qwen.join(SEEDED)).unwrap();
+        std::fs::remove_file(&marker).unwrap();
         let foreign = seed(&models).unwrap();
         assert!(
             foreign
@@ -343,11 +421,38 @@ mod tests {
             "{foreign:?}"
         );
 
-        std::fs::remove_dir_all(models.join("gemma_4")).unwrap();
+        std::fs::remove_file(models.join("gemma_4.poem")).unwrap();
         let back = seed(&models).unwrap();
         assert!(
             back.iter()
                 .any(|(n, s)| n == "gemma_4" && *s == Seeded::Written)
         );
+    }
+
+    #[test]
+    fn an_earlier_seed_directory_gives_way_to_its_one_file() {
+        let home = tempfile::tempdir().unwrap();
+        let models = home.path().join("models");
+        seed(&models).unwrap();
+        // An earlier build seeded `glm_4/` and `mimo_v2/` as directories;
+        // nobody touched the first, the second was edited.
+        for name in ["glm_4", "mimo_v2"] {
+            std::fs::remove_file(models.join(format!("{name}.poem"))).unwrap();
+            std::fs::remove_file(models.join(format!(".{name}.seeded"))).unwrap();
+            let dir = models.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("model.poem"), "# an older build's\n").unwrap();
+            std::fs::write(dir.join(SEEDED), digest(&on_disk(&dir).unwrap())).unwrap();
+        }
+        std::fs::write(models.join("mimo_v2").join("model.poem"), "# mine\n").unwrap();
+        let outcome = seed(&models).unwrap();
+        assert!(!models.join("glm_4").exists(), "the untouched directory is gone");
+        assert!(models.join("glm_4.poem").is_file());
+        assert!(
+            outcome.iter().any(|(n, s)| n == "mimo_v2" && *s == Seeded::Edited { behind: true }),
+            "{outcome:?}"
+        );
+        assert!(models.join("mimo_v2").is_dir() && !models.join("mimo_v2.poem").exists());
+        Tree::read(&models).expect("the seeded tree reads");
     }
 }

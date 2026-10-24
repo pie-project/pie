@@ -1,0 +1,526 @@
+# HunyuanImage 3: an autoregressive mixture of experts that also denoises an
+# image canvas through the same trunk, a small U-Net at each end of it; and
+# its two-layer miniature.
+
+STOP = ["<|endoftext|>", "</answer>"]
+LINES = template("lines", stop = STOP, bos = "<|startoftext|>", eos = "<|endoftext|>")
+TOKENIZER = tokenizer(
+    markers = [
+        STOP,
+        ["<boi>", "<eoi>", "<img>", "<cfg>", "<timestep>", "<guidance>", "<joint_img_sep>", "<img_size_1024>", "<img_ratio_0>"],
+        ["<think>", "</think>", "<recaption>", "</recaption>", "<answer>"],
+        ["<|startoftext|>"],
+    ],
+    pinned = {"<boi>": 128000, "<eoi>": 128001, "<img>": 128006},
+)
+
+MODELS = [
+    model("hunyuanimage3-80b-a13b", template = LINES, tokenizer = TOKENIZER, arch = "hunyuan_image_3_moe", layers = 32, vocab = 133120),
+    model("hunyuanimage3-mini", mini = True, template = LINES, tokenizer = TOKENIZER, arch = "hunyuan_image_3_moe", layers = 2, vocab = 133120),
+]
+
+DEPLOYMENTS = [
+    deployment("hunyuanimage3-80b-a13b", weights = [dtype.bf16, dtype.u8g64], kv = dtype.bf16),
+    deployment("hunyuanimage3-80b-a13b", weights = [dtype.bf16, dtype.u4g64], kv = dtype.bf16),
+    deployment("hunyuanimage3-mini", weights = dtype.bf16, kv = dtype.bf16),
+]
+
+# The weights of HunyuanImage 3: the trunk's layers (GQA attention with a 2-D
+# rope, routed and shared experts), the timestep embedders, and the U-Net
+# blocks that take a latent clip into the trunk and its rows back out.
+
+def linear(out, in_, banks, bias = True):
+    """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
+    return struct(
+        w = weight([out, in_], banks),
+        bias = weight([out]) if bias else None,
+    )
+
+TRAIN_STEPS = 1000
+FLOW_SHIFT = 3.0
+ROPE_AXES = 2
+T_FREQ_DIM = 256
+PATCH = 1
+LATENT_CHANNELS = 32
+SPATIAL_COMPRESSION = 16
+CONV3 = [1, 3, 3]
+CONV1 = [1, 1, 1]
+
+DIMS = {
+    "hunyuanimage3-80b-a13b": struct(
+        hidden = 4096,
+        layers = 32,
+        q_heads = 32,
+        kv_heads = 8,
+        head_dim = 128,
+        vocab = 133120,
+        experts = 64,
+        top_k = 8,
+        moe_inter = 3072,
+        shared_inter = 3072,
+        head_hidden = 1024,
+    ),
+    "hunyuanimage3-mini": struct(
+        hidden = 256,
+        layers = 2,
+        q_heads = 4,
+        kv_heads = 2,
+        head_dim = 64,
+        vocab = 133120,
+        experts = 8,
+        top_k = 2,
+        moe_inter = 256,
+        shared_inter = 256,
+        head_hidden = 64,
+    ),
+}
+
+def conv_weights(c_out, c_in, k, banks):
+    taps = k[0] * k[1] * k[2]
+    return struct(
+        w = weight([c_out, c_in * taps], banks).conv_taps_major(c_in, taps),
+        bias = weight([c_out], dtype.f32),
+        k = k,
+    )
+
+def group_norm(c):
+    return struct(
+        weight = weight([c], dtype.f32),
+        bias = weight([c], dtype.f32),
+    )
+
+def resblock(c_in, c_out, emb, banks):
+    return struct(
+        norm_in = group_norm(c_in),
+        conv_in = conv_weights(c_out, c_in, CONV3, banks),
+        emb = linear(2 * c_out, emb, banks),
+        norm_out = group_norm(c_out),
+        conv_out = conv_weights(c_out, c_out, CONV3, banks),
+        skip = conv_weights(c_out, c_in, CONV1, banks) if c_in != c_out else None,
+    )
+
+def embedder(hidden, out, banks):
+    return struct(
+        mlp_in = linear(hidden, T_FREQ_DIM, banks),
+        mlp_out = linear(out, hidden, banks),
+    )
+
+def layout(id, deploy):
+    d = DIMS[id]
+    if id == "hunyuanimage3-mini":
+        banks = roles(deploy, "banks", exact = True).banks
+        experts = banks
+    else:
+        r = roles(deploy, "banks", "experts", exact = True)
+        banks, experts = r.banks, r.experts
+        if banks != dtype.bf16:
+            fail("{} stores its weights at bf16, not {}".format(id, banks))
+    if d.head_dim % 4 != 0:
+        fail("the 2-D rope splits a head into two even blocks")
+    hidden = d.hidden
+    hd = d.head_dim
+    q_w = d.q_heads * hd
+    kv_w = d.kv_heads * hd
+    iw = d.moe_inter
+    sw = d.shared_inter
+
+    def layer(l):
+        return struct(
+            attn_norm = weight([hidden]),
+            qkv = weight([q_w + 2 * kv_w, hidden], banks).packed([q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
+            q_norm = weight([hd]),
+            k_norm = weight([hd]),
+            o_proj = weight([hidden, q_w], banks).rows(),
+            kv = "kv.{}".format(l),
+            mlp_norm = weight([hidden]),
+            router = weight([d.experts, hidden]),
+            experts_gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
+            experts_down = weight([d.experts, hidden, iw], experts).rows(),
+            shared_gate_up = weight([2 * sw, hidden], banks).packed([sw, sw]),
+            shared_down = weight([hidden, sw], banks).rows(),
+        )
+
+    hw = d.head_hidden
+    return struct(
+        dims = d,
+        kv = deploy.kv,
+        rope_axes = ROPE_AXES,
+        t_freq_dim = T_FREQ_DIM,
+        latent_channels = LATENT_CHANNELS,
+        q_width = q_w,
+        kv_width = kv_w,
+        sm_scale = f32(1.0 / f32(sqrt(hd))),
+        embed = weight([d.vocab, hidden], banks),
+        head = weight([d.vocab, hidden], banks),
+        final_norm = weight([hidden]),
+        layers = [layer(l) for l in range(d.layers)],
+        timestep_emb = embedder(hidden, 2 * hidden, banks),
+        time_embed = embedder(hidden, hidden, banks),
+        time_embed_2 = embedder(hidden, hidden, banks),
+        patch_embed = struct(
+            conv_in = conv_weights(hw, LATENT_CHANNELS, CONV3, banks),
+            res = resblock(hw, hidden, hidden, banks),
+        ),
+        final_layer = struct(
+            res = resblock(hidden, hw, hidden, banks),
+            norm_out = group_norm(hw),
+            conv_out = conv_weights(LATENT_CHANNELS, hw, CONV3, banks),
+        ),
+        # A column of ones over one of minus ones, the forward's spread of a
+        # special token's flag into its two halves.
+        ones = weight([2 * hidden, 1], banks, values = [1.0] * hidden + [-1.0] * hidden),
+    )
+
+def generative(m):
+    d = m.dims
+    p = lambda name, kind, width, at = None: port(name, kind, width, [], at = at)
+    return generation(
+        readings = [
+            reading(
+                "encode",
+                index = 0,
+                has_kv = True,
+                takes_tokens = True,
+                streams = ["text"],
+                ports = [p("positions", "axis_positions", ROPE_AXES)],
+                readout = "logits",
+                readout_width = d.vocab,
+            ),
+            reading(
+                "denoise",
+                index = 1,
+                has_kv = True,
+                takes_tokens = True,
+                streams = ["image"],
+                ports = [
+                    p("latents", "latents", d.hidden),
+                    p("special", "latents", 1),
+                    p("timestep", "lane_vector", 1),
+                    p("positions", "axis_positions", ROPE_AXES),
+                ],
+                readout = "hidden",
+                readout_width = d.hidden,
+            ),
+            reading(
+                "image.in",
+                index = 2,
+                streams = ["image"],
+                ports = [p("latent", "voxels", LATENT_CHANNELS + T_FREQ_DIM, at = 0)],
+                readout = "pixels",
+                readout_width = d.hidden,
+            ),
+            reading(
+                "image.out",
+                index = 3,
+                streams = ["image"],
+                ports = [p("rows", "voxels", d.hidden + T_FREQ_DIM, at = 1)],
+                readout = "pixels",
+                readout_width = LATENT_CHANNELS,
+            ),
+        ],
+        latent = latent_space(
+            channels = LATENT_CHANNELS,
+            patch_t = 1,
+            patch_h = PATCH,
+            patch_w = PATCH,
+            spatial_compression = SPATIAL_COMPRESSION,
+            temporal_compression = 1,
+        ),
+        schedule = schedule("flow", shift = FLOW_SHIFT, train_steps = TRAIN_STEPS),
+        max_rows = 8192 if d.layers > 4 else 1024,
+    )
+
+def diffusion(m):
+    side = 64 if m.dims.layers > 4 else 8
+    return canvas(canvas = side * side, hidden = m.dims.hidden, self_cond_taps = 0)
+
+# How a HunyuanImage 3 checkpoint is laid out: transformers' names. Its fused
+# qkv interleaves each kv group's query, key and value heads and its rope
+# channels are interleaved, so both are gathered into the trunk's order; its
+# gate-and-up projections hold up before gate.
+
+def biased(reads, w, stem):
+    """The projection `w` from `stem.weight`, and its bias (if any) from
+    `stem.bias`."""
+    reads.read(w.w, stem + ".weight")
+    if w.bias != None:
+        reads.read(w.bias, stem + ".bias")
+
+def read_conv(reads, c, stem):
+    """The convolution `c` from `stem`, its kernel transmuted to the taps-major
+    plane the layout holds."""
+    name = stem + ".weight"
+    reads.read_expr(c.w, src(name).transmute(c.w.shape, stored(name)))
+    reads.read(c.bias, stem + ".bias")
+
+def formats(m):
+    return [format("huggingface", read = lambda reads: read(m, reads))]
+
+def rope_channels(head_dim):
+    q = head_dim // 4
+    h = head_dim // 2
+    return ([2 * j for j in range(q)] + [2 * j + h for j in range(q)] +
+            [2 * j + 1 for j in range(q)] + [2 * j + 1 + h for j in range(q)])
+
+def head_permutation(heads, head_dim):
+    channels = rope_channels(head_dim)
+    return [h * head_dim + c for h in range(heads) for c in channels]
+
+def qkv_rows(kv_heads, groups, head_dim, q_perm, k_perm):
+    d = head_dim
+    stride = (groups + 2) * d
+    rows = []
+    for q in q_perm:
+        head, c = q // d, q % d
+        g, j = head // groups, head % groups
+        rows.append(g * stride + j * d + c)
+    for k in k_perm:
+        head, c = k // d, k % d
+        rows.append(head * stride + groups * d + c)
+    for g in range(kv_heads):
+        for c in range(d):
+            rows.append(g * stride + (groups + 1) * d + c)
+    return rows
+
+def swap_halves(e, inter):
+    return concat(0, [e.slice(0, inter, inter), e.slice(0, 0, inter)])
+
+def doubled(e):
+    return concat(0, [e, e])
+
+def read_embedder(reads, e, prefix):
+    biased(reads, e.mlp_in, prefix + ".mlp.0")
+    biased(reads, e.mlp_out, prefix + ".mlp.2")
+
+def read_group_norm(reads, g, name):
+    reads.read(g.weight, name + ".weight")
+    reads.read(g.bias, name + ".bias")
+
+def read_resblock(reads, r, prefix):
+    read_group_norm(reads, r.norm_in, prefix + ".in_layers.0")
+    read_conv(reads, r.conv_in, prefix + ".in_layers.2")
+    biased(reads, r.emb, prefix + ".emb_layers.1")
+    read_group_norm(reads, r.norm_out, prefix + ".out_layers.0")
+    read_conv(reads, r.conv_out, prefix + ".out_layers.3")
+    if r.skip != None:
+        read_conv(reads, r.skip, prefix + ".skip_connection")
+
+def read(m, reads):
+    d = m.dims
+    reads.read(m.embed, "model.wte.weight")
+    reads.read(m.head, "lm_head.weight")
+    reads.read(m.final_norm, "model.ln_f.weight")
+
+    hd = d.head_dim
+    groups = d.q_heads // d.kv_heads
+    q_perm = head_permutation(d.q_heads, hd)
+    k_perm = head_permutation(d.kv_heads, hd)
+    rope_perm = rope_channels(hd)
+    qkv = qkv_rows(d.kv_heads, groups, hd, q_perm, k_perm)
+
+    for l, w in enumerate(m.layers):
+        at = lambda tail: "model.layers.{}.{}".format(l, tail)
+        reads.read(w.attn_norm, at("input_layernorm.weight"))
+        reads.read(w.mlp_norm, at("post_attention_layernorm.weight"))
+        reads.read_expr(w.qkv, src(at("self_attn.qkv_proj.weight")).gather(0, qkv))
+        reads.read_expr(w.q_norm, src(at("self_attn.query_layernorm.weight")).gather(0, rope_perm))
+        reads.read_expr(w.k_norm, src(at("self_attn.key_layernorm.weight")).gather(0, rope_perm))
+        reads.read(w.o_proj, at("self_attn.o_proj.weight"))
+        reads.read(w.router, at("mlp.gate.wg.weight"))
+
+        inter = d.moe_inter
+        hidden = d.hidden
+        reads.read_expr(w.shared_gate_up, swap_halves(src(at("mlp.shared_mlp.gate_and_up_proj.weight")), d.shared_inter))
+        reads.read(w.shared_down, at("mlp.shared_mlp.down_proj.weight"))
+
+        held = stored(at("mlp.experts.0.down_proj.weight"))
+        expert = lambda e, leaf: src(at("mlp.experts.{}.{}.weight".format(e, leaf)))
+        reads.read_expr(w.experts_gate_up, concat(0, [
+            swap_halves(expert(e, "gate_and_up_proj"), inter).transmute([1, 2 * inter, hidden], held)
+            for e in range(d.experts)
+        ]))
+        reads.read_expr(w.experts_down, concat(0, [
+            expert(e, "down_proj").transmute([1, hidden, inter], held)
+            for e in range(d.experts)
+        ]))
+
+    biased(reads, m.timestep_emb.mlp_in, "timestep_emb.mlp.0")
+    reads.read_expr(m.timestep_emb.mlp_out.w, doubled(src("timestep_emb.mlp.2.weight")))
+    reads.read_expr(m.timestep_emb.mlp_out.bias, doubled(src("timestep_emb.mlp.2.bias")))
+    read_embedder(reads, m.time_embed, "time_embed")
+    read_embedder(reads, m.time_embed_2, "time_embed_2")
+
+    read_conv(reads, m.patch_embed.conv_in, "patch_embed.model.0")
+    read_resblock(reads, m.patch_embed.res, "patch_embed.model.1")
+    read_resblock(reads, m.final_layer.res, "final_layer.model.0")
+    read_group_norm(reads, m.final_layer.norm_out, "final_layer.model.1.0")
+    read_conv(reads, m.final_layer.conv_out, "final_layer.model.1.2")
+
+# The forward of HunyuanImage 3. One trunk carries the text rows it encodes
+# and the canvas rows it denoises; the `image.in` and `image.out` readings
+# run its U-Net ends over a latent clip and the trunk's rows.
+
+def run_linear(w, x):
+    """`x` through the projection `w`, plus its bias if it has one."""
+    y = ops.linear.matmul(x, w.w)
+    if w.bias == None:
+        return y
+    return ops.elemwise.add_bias(w.bias, y)
+
+NORM_EPS = 1e-5
+ROPE_THETA = 10000.0
+T_MAX_PERIOD = 10000.0
+GN_GROUPS = 32
+GN_EPS = 1e-5
+
+def caches(m, c):
+    kv = c.kv_space(m.kv)
+    plane = m.kv_width
+    for w in m.layers:
+        c.kv(kv, w.kv, [plane, plane], m.dims.head_dim, heads = True)
+
+def on_canvas():
+    """The canvas rows: the denoise reading's, with the mask the canvas
+    attends through. A denoise lane sent without one reads as text."""
+    return fact.reading("denoise") & fact.has(fact.Mask)
+
+def forward(m, inputs):
+    inputs.reading("image.in", lambda rows: image_in(rows, m))
+    inputs.reading("image.out", lambda rows: image_out(rows, m))
+    trunk_rows = inputs.on(~fact.reading("image.in") & ~fact.reading("image.out"))
+    canvas_rows = trunk_rows.on(on_canvas())
+    return trunk(trunk_rows, canvas_rows, m)
+
+def run_embedder(e, t_freq):
+    return run_linear(e.mlp_out, ops.elemwise.gelu(run_linear(e.mlp_in, t_freq), True))
+
+def trunk(all, den, m):
+    d = m.dims
+    hd = d.head_dim
+    sm = m.sm_scale
+    classes = [on_canvas(), fact.single_token()]
+    ([canvas_in, ar_decode], ar_prefill) = all.partition(classes)
+
+    plan_den = ops.attn.plan_prefill(canvas_in, d.q_heads, d.kv_heads, hd, None)
+    plan_dec = ops.attn.plan_decode(ar_decode, d.q_heads, d.kv_heads, hd, None)
+    plan_pre = ops.attn.plan_prefill(ar_prefill, d.q_heads, d.kv_heads, hd, None)
+    mask = canvas_in.mask()
+
+    positions = all.axis_positions(0, m.rope_axes)
+    y = ops.gather.embed(all.tokens(), m.embed, d.vocab)
+    encoded = y.on(~on_canvas())
+    y = merge([canvas_rows(den, m), encoded])
+    rope_dims = [hd // 2, hd // 2, 0, 0]
+
+    def block(l, w, y):
+        n = ops.elemwise.rmsnorm(y, w.attn_norm, NORM_EPS)
+        q, k, v = ops.gather.split_qkv(ops.linear.matmul(n, w.qkv), m.q_width, m.kv_width)
+        turn = lambda x: ops.elemwise.rope_axes(x, positions, rope_dims, [ROPE_THETA] * 4, "split", hd, hd)
+        q = ops.elemwise.rmsnorm_per_head(turn(q), w.q_norm, hd, NORM_EPS)
+        k = ops.elemwise.rmsnorm_per_head(turn(k), w.k_norm, hd, NORM_EPS)
+
+        pages = all.kv(w.kv)
+        ops.attn.kv_append(k, v, pages, all.write_page(w.kv), all.write_offset(w.kv))
+
+        ([dq, aq], pq) = q.partition(classes)
+        a = merge([
+            ops.attn.prefill(dq, plan_den, pages, None, hd, d.kv_heads, sm, mask = mask, causal = False),
+            ops.attn.decode(aq, plan_dec, pages, None, hd, sm),
+            ops.attn.prefill(pq, plan_pre, pages, None, hd, d.kv_heads, sm),
+        ])
+        o = ops.linear.matmul(a, w.o_proj)
+        if l == 0:
+            y = ops.elemwise.add(o, y)
+        else:
+            y = ops.elemwise.residual_add(o, y)
+
+        n = ops.elemwise.rmsnorm(y, w.mlp_norm, NORM_EPS)
+        return ops.elemwise.residual_add(moe(n, w, m), y)
+
+    y = all.fold_layers(m.layers, y, block)
+
+    canvas, text = y.on(on_canvas()), y.on(~on_canvas())
+    seam.at(seam.HIDDEN, [canvas])
+    text_in = all.on(~on_canvas())
+    x = ops.elemwise.rmsnorm(text, m.final_norm, NORM_EPS)
+    x = ops.gather.gather_rows(x, text_in.readout_rows())
+    logits = ops.linear.lm_head(x, m.head)
+    seam.at(seam.OUT, [logits])
+    return canvas
+
+def moe(x, w, m):
+    d = m.dims
+    routes, weights = ops.linear.moe_route(
+        ops.linear.matmul(x, w.router),
+        d.experts,
+        d.top_k,
+        routing.softmax(),
+    )
+
+    def select(act, bank):
+        if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
+            return ops.linear.moe_matmul_select(act, bank, routes, d.top_k)
+        return ops.linear.moe_matmul_select_quant(act, bank, routes, d.top_k)
+
+    act = ops.linear.glu(select(x, w.experts_gate_up), gating.swiglu(), d.moe_inter)
+    routed = ops.linear.moe_weighted_sum(select(act, w.experts_down), weights)
+    shared = ops.linear.matmul(
+        ops.linear.glu(ops.linear.matmul(x, w.shared_gate_up), gating.swiglu(), d.shared_inter),
+        w.shared_down,
+    )
+    return ops.elemwise.residual_add(shared, routed)
+
+def canvas_rows(arm, m):
+    d = m.dims
+    u = arm.latents(0, d.hidden, dtype.bf16)
+    flag = arm.latents(1, 1, dtype.bf16)
+    lanes = arm.request_of_token()
+
+    t = arm.lane_vector(0, 1)
+    freqs = ops.elemwise.sinusoid(t, m.t_freq_dim, T_MAX_PERIOD, True, 1.0)
+    doubled = run_embedder(m.timestep_emb, freqs)
+
+    spread = ops.linear.matmul(flag, m.ones)
+    pos, neg = ops.gather.split_rows(spread, d.hidden)
+    zero = ops.elemwise.add(pos, neg)
+    special = ops.elemwise.modulate(zero, doubled, lanes, "scale_shift")
+
+    kept = ops.elemwise.modulate(u, neg, None, "scale")
+    return ops.elemwise.add(kept, ops.elemwise.mul(special, pos))
+
+def convolve(x, g, c):
+    shape = conv(c.k, [1, 1, 1], [0, c.k[1] // 2, c.k[2] // 2])
+    return ops.conv.conv3d(x, g, c.w, c.bias, shape, None)
+
+def run_group_norm(x, g, n, silu):
+    return ops.conv.group_norm(x, g, GN_GROUPS, n.weight, n.bias, GN_EPS, silu)
+
+def run_resblock(x, g, r, temb):
+    h = run_group_norm(x, g, r.norm_in, True)
+    h, g1 = convolve(h, g, r.conv_in)
+    mod = run_linear(r.emb, ops.elemwise.silu(temb))
+    h = run_group_norm(h, g1, r.norm_out, False)
+    h = ops.elemwise.modulate(h, mod, None, "scale_shift")
+    h = ops.elemwise.silu(h)
+    h, _ = convolve(h, g1, r.conv_out)
+    skip = convolve(x, g, r.skip)[0] if r.skip != None else x
+    return ops.elemwise.add(skip, h)
+
+def image_in(arm, m):
+    g = arm.grid()
+    clip = arm.voxels(0, m.latent_channels + m.t_freq_dim, dtype.bf16)
+    z, freqs = ops.gather.split_rows(clip, m.latent_channels)
+    temb = run_embedder(m.time_embed, freqs)
+    h, g1 = convolve(z, g, m.patch_embed.conv_in)
+    x = run_resblock(h, g1, m.patch_embed.res, temb)
+    seam.at(seam.PIXELS, [x, g1])
+
+def image_out(arm, m):
+    g = arm.grid()
+    clip = arm.voxels(1, m.dims.hidden + m.t_freq_dim, dtype.bf16)
+    rows, freqs = ops.gather.split_rows(clip, m.dims.hidden)
+    temb = run_embedder(m.time_embed_2, freqs)
+    x = run_resblock(rows, g, m.final_layer.res, temb)
+    h = run_group_norm(x, g, m.final_layer.norm_out, True)
+    v, gv = convolve(h, g, m.final_layer.conv_out)
+    seam.at(seam.PIXELS, [v, gv])
