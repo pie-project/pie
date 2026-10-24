@@ -78,116 +78,175 @@ impl Placement {
     }
 
     /// The placement `loads` (tokens each logical expert took over the load
-    /// window) asks for, kept as close to `self` as it allows. Each expert
-    /// keeps one slot; each extra slot goes, one at a time, to the expert
-    /// with the most load per replica; the replicas are then packed onto
-    /// ranks heaviest first, each onto the least loaded rank with a free slot
-    /// that holds no replica of it yet. A packing whose busiest rank is no
-    /// lighter than `self`'s keeps `self`. Each packed group goes to the rank
-    /// that holds most of it, and on a rank an expert keeps the slot it held,
-    /// so only what changes rank moves.
+    /// window) asks for, reached from `self` by a few edits. An edit either
+    /// turns a replica slot (one of an expert held more than once) over to
+    /// another expert, one slot rewritten, or trades two experts between
+    /// ranks, two. Each edit is the one that leaves the ranks' loads, busiest
+    /// first, lowest; edits stop when none lowers them or `limits.moves`
+    /// slots are spent, and those past the lowest peak are dropped. Unless the peak
+    /// ([`Placement::balance`]) falls by more than `limits.gain`, `self` is
+    /// kept:
+    /// a replica stays where it is until moving it pays.
     #[must_use]
-    pub fn rebalance(&self, loads: &[u64]) -> Placement {
+    pub fn rebalance(&self, loads: &[u64], limits: Limits) -> Placement {
         let experts = self.experts as usize;
         let ranks = self.ranks as usize;
         let slots = self.slots as usize;
-        let load = |e: usize| loads.get(e).copied().unwrap_or(0);
-
-        let mut replicas = vec![1u32; experts];
-        for _ in experts..ranks * slots {
-            let hottest = (0..experts)
-                .max_by(|&a, &b| {
-                    let (la, lb) = (
-                        load(a) * u64::from(replicas[b]),
-                        load(b) * u64::from(replicas[a]),
-                    );
-                    la.cmp(&lb).then(b.cmp(&a))
-                })
-                .unwrap_or(0);
-            replicas[hottest] += 1;
-        }
-
-        let mut pieces: Vec<(u64, usize)> = (0..experts)
-            .flat_map(|e| {
-                let share = load(e) / u64::from(replicas[e]);
-                (0..replicas[e]).map(move |_| (share, e))
-            })
-            .collect();
-        pieces.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
-
-        let mut on_rank: Vec<Vec<u32>> = vec![Vec::new(); ranks];
-        let mut weight = vec![0u64; ranks];
-        for (share, e) in pieces {
-            let fits = |r: usize, fresh: bool| {
-                on_rank[r].len() < slots && (!fresh || !on_rank[r].contains(&(e as u32)))
-            };
-            let pick = |fresh: bool| {
-                (0..ranks)
-                    .filter(|&r| fits(r, fresh))
-                    .min_by_key(|&r| (weight[r], usize::from(!self.on(r as u32, e as u32)), r))
-            };
-            let r = pick(true).or_else(|| pick(false)).unwrap_or(0);
-            on_rank[r].push(e as u32);
-            weight[r] += share;
-        }
-
-        let peak = |held: &[u32], replicas: &[u32]| {
-            (0..ranks)
-                .map(|r| {
-                    held[r * slots..(r + 1) * slots]
-                        .iter()
-                        .map(|&e| load(e as usize) / u64::from(replicas[e as usize].max(1)))
-                        .sum::<u64>()
-                })
-                .max()
-                .unwrap_or(0)
-        };
-        if weight.iter().copied().max().unwrap_or(0) >= peak(&self.held, &self.replicas()) {
+        let load = |e: usize| loads.get(e).copied().unwrap_or(0) as f64;
+        let total: f64 = (0..experts).map(load).sum();
+        if ranks < 2 || total == 0.0 {
             return self.clone();
         }
+        let mean = total / ranks as f64;
+        let near = mean * 1e-9;
 
-        // The ranks are interchangeable: each packed group goes to the rank
-        // that already holds most of it.
-        let overlap =
-            |g: usize, r: usize| on_rank[g].iter().filter(|&&e| self.on(r as u32, e)).count();
-        let mut rank_of = vec![usize::MAX; ranks];
-        let mut taken = vec![false; ranks];
-        for _ in 0..ranks {
-            let best = (0..ranks)
-                .filter(|&g| rank_of[g] == usize::MAX)
-                .flat_map(|g| (0..ranks).filter(|&r| !taken[r]).map(move |r| (g, r)))
-                .max_by_key(|&(g, r)| (overlap(g, r), core::cmp::Reverse((g, r))));
-            if let Some((g, r)) = best {
-                rank_of[g] = r;
-                taken[r] = true;
-            }
+        let mut next = self.clone();
+        let mut replicas = next.replicas();
+        // How many slots of each rank hold each expert, `experts * ranks`.
+        let mut count = vec![0u32; experts * ranks];
+        for (p, &e) in next.held.iter().enumerate() {
+            count[e as usize * ranks + p / slots] += 1;
         }
+        let mut weight = next.weights(loads);
+        let peak = |w: &[f64]| w.iter().copied().fold(0.0, f64::max);
+        let start = peak(&weight);
+        let (mut best, mut kept) = (start, None);
 
-        let mut held = vec![u32::MAX; ranks * slots];
-        for (g, mine) in on_rank.into_iter().enumerate() {
-            let base = rank_of[g] * slots;
-            let mut rest = Vec::new();
-            for e in mine {
-                let kept =
-                    (0..slots).find(|&s| self.held[base + s] == e && held[base + s] == u32::MAX);
-                match kept {
-                    Some(s) => held[base + s] = e,
-                    None => rest.push(e),
+        // Whether ranks' loads `a`, busiest first, sit lower than `b`'s.
+        let lower = |a: &[f64], b: &[f64]| {
+            a.iter()
+                .zip(b)
+                .find(|(x, y)| (*x - *y).abs() > near)
+                .is_some_and(|(x, y)| x < y)
+        };
+        let sorted = |w: &[f64], out: &mut Vec<f64>| {
+            out.clear();
+            out.extend_from_slice(w);
+            out.sort_by(|a, b| b.total_cmp(a));
+        };
+
+        let mut budget = limits.moves;
+        let (mut here, mut trial, mut pick) = (Vec::new(), Vec::new(), Vec::new());
+        let mut scratch = vec![0.0; ranks];
+        while budget > 0 {
+            sorted(&weight, &mut here);
+            pick.clone_from(&here);
+            let mut edit = None;
+
+            // A replica slot of `a` given to `b`, which its rank lacks.
+            for p in 0..ranks * slots {
+                let (a, r) = (next.held[p] as usize, p / slots);
+                if replicas[a] < 2 {
+                    continue;
+                }
+                let (ka, la) = (f64::from(replicas[a]), load(a));
+                for b in (0..experts).filter(|&b| count[b * ranks + r] == 0) {
+                    let (kb, lb) = (f64::from(replicas[b]), load(b));
+                    for (t, w) in scratch.iter_mut().enumerate() {
+                        let (ca, cb) = (count[a * ranks + t], count[b * ranks + t]);
+                        let (na, nb) = (ca - u32::from(t == r), cb + u32::from(t == r));
+                        *w = weight[t]
+                            + la * (f64::from(na) / (ka - 1.0) - f64::from(ca) / ka)
+                            + lb * (f64::from(nb) / (kb + 1.0) - f64::from(cb) / kb);
+                    }
+                    sorted(&scratch, &mut trial);
+                    if lower(&trial, &pick) {
+                        core::mem::swap(&mut pick, &mut trial);
+                        edit = Some((p, b as u32, None));
+                    }
                 }
             }
-            let free = (0..slots)
-                .filter(|&s| held[base + s] == u32::MAX)
-                .collect::<Vec<_>>();
-            for (s, e) in free.into_iter().zip(rest) {
-                held[base + s] = e;
+
+            // Two experts traded between ranks, neither landing beside a
+            // replica of itself: only where it lowers the loads further than
+            // any retarget, which rewrites one slot to its two.
+            if budget >= 2 {
+                let share = |e: usize| load(e) / f64::from(replicas[e].max(1));
+                for p in 0..ranks * slots {
+                    let (a, r) = (next.held[p] as usize, p / slots);
+                    for q in (r + 1) * slots..ranks * slots {
+                        let (b, s) = (next.held[q] as usize, q / slots);
+                        if count[a * ranks + s] > 0 || count[b * ranks + r] > 0 {
+                            continue;
+                        }
+                        scratch.copy_from_slice(&weight);
+                        let shift = share(b) - share(a);
+                        scratch[r] += shift;
+                        scratch[s] -= shift;
+                        sorted(&scratch, &mut trial);
+                        if lower(&trial, &pick) {
+                            core::mem::swap(&mut pick, &mut trial);
+                            edit = Some((p, b as u32, Some(q)));
+                        }
+                    }
+                }
+            }
+
+            let Some((p, b, traded)) = edit else {
+                break;
+            };
+            let a = next.held[p];
+            let mut set = |slot: usize, e: u32| {
+                let old = next.held[slot] as usize;
+                count[old * ranks + slot / slots] -= 1;
+                count[e as usize * ranks + slot / slots] += 1;
+                replicas[old] -= 1;
+                replicas[e as usize] += 1;
+                next.held[slot] = e;
+            };
+            match traded {
+                Some(q) => {
+                    set(p, b);
+                    set(q, a);
+                    budget -= 2;
+                }
+                None => {
+                    set(p, b);
+                    budget -= 1;
+                }
+            }
+            weight = next.weights(loads);
+            if peak(&weight) < best - near {
+                best = peak(&weight);
+                kept = Some(next.clone());
             }
         }
-        Placement {
-            experts: self.experts,
-            ranks: self.ranks,
-            slots: self.slots,
-            held,
+
+        match kept {
+            Some(placement) if start - best > limits.gain * mean => placement,
+            _ => self.clone(),
         }
+    }
+
+    /// Each rank's load under `loads`: its slots' experts' tokens, an
+    /// expert's split evenly between its replicas.
+    #[must_use]
+    pub fn weights(&self, loads: &[u64]) -> Vec<f64> {
+        let replicas = self.replicas();
+        let slots = self.slots as usize;
+        (0..self.ranks as usize)
+            .map(|r| {
+                self.held[r * slots..(r + 1) * slots]
+                    .iter()
+                    .map(|&e| {
+                        let load = loads.get(e as usize).copied().unwrap_or(0) as f64;
+                        load / f64::from(replicas[e as usize])
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    /// How far `loads` leave the ranks from even: the busiest rank's load
+    /// over the mean, 1 when even (or when there is no load).
+    #[must_use]
+    pub fn balance(&self, loads: &[u64]) -> f64 {
+        let weight = self.weights(loads);
+        let total: f64 = weight.iter().sum();
+        if total == 0.0 {
+            return 1.0;
+        }
+        weight.iter().copied().fold(0.0, f64::max) * weight.len() as f64 / total
     }
 
     /// Whether rank `rank` holds logical expert `expert`.
@@ -298,6 +357,31 @@ impl Placement {
     }
 }
 
+/// How far one [`Placement::rebalance`] may go.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Limits {
+    /// The most slots it rewrites in the layer.
+    pub moves: u32,
+    /// How far it must lower the layer's peak, the busiest rank's load over
+    /// the mean ([`Placement::balance`]), before it moves anything.
+    pub gain: f64,
+}
+
+impl Limits {
+    /// Two trades a layer, as the expert offload tier makes at most two
+    /// swaps a fire, and only for a peak lowered by a twentieth of the mean.
+    pub const DEFAULT: Limits = Limits {
+        moves: 4,
+        gain: 0.05,
+    };
+}
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits::DEFAULT
+    }
+}
+
 /// The `from` of a [`Move`] that reads the spare slot (see
 /// [`Placement::moves`]).
 pub const SPARE: u32 = u32::MAX;
@@ -361,7 +445,9 @@ impl Window {
 
 #[cfg(test)]
 mod tests {
-    use super::{Move, Placement, SPARE, Unplaceable, Window};
+    use super::{Limits, Move, Placement, SPARE, Unplaceable, Window};
+
+    const LIMITS: Limits = Limits::DEFAULT;
 
     fn apply(from: &Placement, moves: &[Move]) -> Vec<u32> {
         let mut held = from.held.clone();
@@ -403,12 +489,123 @@ mod tests {
         assert_eq!(Placement::uniform(4, 0, 2), Err(Unplaceable::Empty));
     }
 
+    /// A skewed layer's loads: expert `e` of `experts` a Zipf weight,
+    /// shuffled by `seed` so the hot ones are not the first.
+    fn skewed(experts: u32, seed: u64) -> Vec<u64> {
+        let mut order: Vec<u64> = (0..u64::from(experts)).collect();
+        let mut x = seed;
+        for i in (1..order.len()).rev() {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            order.swap(i, (x >> 33) as usize % (i + 1));
+        }
+        order.iter().map(|&rank| 100_000 / (rank + 1)).collect()
+    }
+
+    /// The slots `next` holds a different expert in than `from`.
+    fn rewritten(from: &Placement, next: &Placement) -> u32 {
+        (from.held.iter().zip(&next.held))
+            .filter(|(a, b)| a != b)
+            .count() as u32
+    }
+
+    /// Rebalances on `loads` until a placement holds, at most `rounds`
+    /// times; every placement on the way.
+    fn settle(p: &Placement, loads: &[u64], rounds: usize) -> Vec<Placement> {
+        let mut out = vec![p.clone()];
+        for _ in 0..rounds {
+            let next = out.last().unwrap().rebalance(loads, LIMITS);
+            if &next == out.last().unwrap() {
+                return out;
+            }
+            out.push(next);
+        }
+        panic!("no placement held after {rounds} rebalances");
+    }
+
     #[test]
     fn a_hot_expert_gets_the_replicas_and_spreads_across_ranks() {
         let p = Placement::uniform(4, 4, 2).unwrap();
-        let next = p.rebalance(&[300, 10, 10, 10]);
-        assert_eq!(next.replicas(), [5, 1, 1, 1]);
-        assert!((0..4).all(|r| next.on(r, 0)));
+        let loads = [300, 10, 10, 10];
+        let last = settle(&p, &loads, 8).pop().unwrap();
+        assert!(last.replicas()[0] >= 4, "{:?}", last.replicas());
+        assert!((0..4).all(|r| last.on(r, 0)));
+    }
+
+    #[test]
+    fn a_second_rebalance_on_the_same_loads_moves_nothing() {
+        let p = Placement::uniform(8, 4, 3).unwrap();
+        for loads in [
+            vec![90, 1, 1, 1, 1, 1, 1, 1],
+            vec![1, 1, 1, 1, 1, 1, 1, 90],
+            vec![40, 30, 20, 10, 10, 20, 30, 40],
+        ] {
+            let next = p.rebalance(&loads, LIMITS);
+            assert_ne!(next, p, "{loads:?} moves something");
+            assert_eq!(next.rebalance(&loads, LIMITS), next, "{loads:?}");
+        }
+        // And wherever the rebalances settle, on a layer too skewed for one.
+        let p = Placement::uniform(64, 2, 34).unwrap();
+        for seed in 0..8 {
+            let loads = skewed(64, seed);
+            let last = settle(&p, &loads, 64).pop().unwrap();
+            assert_eq!(last.rebalance(&loads, LIMITS), last, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn a_rebalance_moves_only_what_lowers_the_peak_past_the_gain() {
+        for (experts, ranks, slots) in [(64, 2, 34), (64, 4, 18), (16, 4, 5)] {
+            let p = Placement::uniform(experts, ranks, slots).unwrap();
+            for seed in 0..8 {
+                let loads = skewed(experts, seed);
+                for pair in settle(&p, &loads, 64).windows(2) {
+                    let (was, now) = (pair[0].balance(&loads), pair[1].balance(&loads));
+                    assert!(
+                        was - now > LIMITS.gain,
+                        "{experts}/{ranks}x{slots} seed {seed}: {was} to {now}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_rebalance_rewrites_at_most_its_budget_of_slots() {
+        for (experts, ranks, slots) in [(256, 2, 130), (64, 4, 18), (8, 4, 3)] {
+            let p = Placement::uniform(experts, ranks, slots).unwrap();
+            for seed in 0..8 {
+                let loads = skewed(experts, seed);
+                for pair in settle(&p, &loads, 256).windows(2) {
+                    assert!(rewritten(&pair[0], &pair[1]) <= LIMITS.moves);
+                    let moves = pair[0].moves(&pair[1]);
+                    assert_eq!(apply(&pair[0], &moves), pair[1].held);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_skewed_load_converges_over_several_rebalances() {
+        // Every hot expert on the first rank.
+        let p = Placement::uniform(128, 2, 66).unwrap();
+        let loads: Vec<u64> = (0..128).map(|e| if e < 64 { 100 } else { 10 }).collect();
+        let path = settle(&p, &loads, 64);
+        let (first, last) = (p.balance(&loads), path.last().unwrap().balance(&loads));
+        assert!(path.len() > 2, "one rebalance is capped short of balance");
+        assert!(first > 1.5 && last < 1.0 + LIMITS.gain, "{first} to {last}");
+        // The window's noise about the settled loads moves nothing.
+        let mut x = 1u64;
+        let noisy: Vec<u64> = loads
+            .iter()
+            .map(|&l| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
+                l + l * ((x >> 33) % 3) / 100
+            })
+            .collect();
+        let last = path.last().unwrap();
+        assert_eq!(&last.rebalance(&noisy, LIMITS), last);
     }
 
     #[test]
@@ -416,13 +613,13 @@ mod tests {
         // Two ranks of three: the hot expert's two replicas already split it
         // evenly; a third would leave one rank holding two of them.
         let p = Placement::uniform(4, 2, 3).unwrap();
-        assert_eq!(p.rebalance(&[100, 10, 10, 10]), p);
+        assert_eq!(p.rebalance(&[100, 10, 10, 10], LIMITS), p);
     }
 
     #[test]
     fn hot_experts_on_one_rank_are_parted() {
         let p = Placement::uniform(4, 2, 2).unwrap();
-        let next = p.rebalance(&[100, 90, 10, 10]);
+        let next = p.rebalance(&[100, 90, 10, 10], LIMITS);
         assert!(next.on(0, 0) != next.on(0, 1));
         // Expert 1 trades places with one of rank 1's: two copies and the
         // spare between them.
@@ -434,7 +631,7 @@ mod tests {
     #[test]
     fn balanced_loads_move_nothing() {
         let p = Placement::uniform(8, 4, 2).unwrap();
-        let next = p.rebalance(&[5; 8]);
+        let next = p.rebalance(&[5; 8], LIMITS);
         assert_eq!(next, p);
         assert!(p.moves(&next).is_empty());
     }
@@ -443,7 +640,7 @@ mod tests {
     fn the_ranks_end_near_even() {
         let p = Placement::uniform(16, 4, 5).unwrap();
         let loads: Vec<u64> = (0..16).map(|e| 1 + e * e * 7).collect();
-        let next = p.rebalance(&loads);
+        let next = p.rebalance(&loads, LIMITS);
         let replicas = next.replicas();
         let per_rank: Vec<u64> = (0..4)
             .map(|r| {
@@ -471,10 +668,10 @@ mod tests {
             vec![1, 1, 1, 1, 1, 1, 1, 90],
             vec![40, 30, 20, 10, 10, 20, 30, 40],
         ] {
-            let next = p.rebalance(&loads);
+            let next = p.rebalance(&loads, LIMITS);
             let moves = p.moves(&next);
             assert_eq!(apply(&p, &moves), next.held, "{loads:?}");
-            let again = next.rebalance(&loads);
+            let again = next.rebalance(&loads, LIMITS);
             assert_eq!(again, next, "a second rebalance on the same loads holds");
         }
     }
