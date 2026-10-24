@@ -28,6 +28,9 @@ sdpa.mla_dense_short = true
 # A prefill's pooled index scored on tcgen05 and ranked by radix select.
 sdpa.index_tc5 = true
 sdpa.index_radix = true
+# V4.1's FP4 index keys scored as they are on the block-scaled MMA, at any
+# row count.
+sdpa.index_fp4_tc5 = true
 # The hyper-connection pre-mix norm emits the next fp8 GEMM's operand.
 elemwise.norm_emit = true
 # Routed bf16 selects on the tcgen05 grouped GEMM.

@@ -410,6 +410,15 @@ pub struct SdpaIndexMma;
 #[decision(id = "kernel.sdpa.index_tc5", flag, default = false, tune = search)]
 pub struct SdpaIndexTc5;
 
+/// Whether a pooled index over FP4 keys (DeepSeek-V4.1's, its queries read
+/// at FP4) scores them on tcgen05's block-scaled MMA as they are
+/// (`attn/index/logits_fp4_sm100.cu`: e2m1 against e2m1, a key a lane, a
+/// decode's keys split over the multiprocessors), then ranks in a launch of
+/// its own; off, the keys are widened to bf16 for the other scorers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.index_fp4_tc5", flag, default = false, tune = search)]
+pub struct SdpaIndexFp4Tc5;
+
 /// Whether a prefill's hyper-connection pre-mix norm lands its row's e4m3
 /// 1x128 operand beside it, for the fp8 GEMMs that read it next, in place of
 /// their quantize launch.
@@ -856,6 +865,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaSelectedMma>()
         .add::<SdpaIndexMma>()
         .add::<SdpaIndexTc5>()
+        .add::<SdpaIndexFp4Tc5>()
         .add::<ElemwiseNormEmit>()
         .add::<SdpaIndexRadix>()
         .add::<SdpaPoolMma>()
@@ -992,6 +1002,7 @@ tuning! {
     selected_mma: bool = false, on SdpaSelectedMma;
     index_mma: bool = false, on SdpaIndexMma;
     index_tc5: bool = false, on SdpaIndexTc5;
+    index_fp4_tc5: bool = false, on SdpaIndexFp4Tc5;
     norm_emit: bool = false, on ElemwiseNormEmit;
     index_radix: bool = false, on SdpaIndexRadix;
     pool_mma: bool = false, on SdpaPoolMma;

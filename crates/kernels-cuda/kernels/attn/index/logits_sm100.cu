@@ -1,5 +1,5 @@
 #include "attn/index/index.cuh"
-#include "attn/fmha_sm100.cuh"
+#include "prim/mma_sm100.cuh"
 
 // A pooled index's scores at prefill widths on tcgen05 (sm_100a): for each
 // row and each block it sees, `sum_h w_h * relu(q_h . k)` over the row's
@@ -370,7 +370,7 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
                                 const float cs = turn_c[rr][pr];
                                 const float a = __uint_as_float(static_cast<u32>(e[2 * u]) << 16);
                                 const float b = __uint_as_float(static_cast<u32>(e[2 * u + 1]) << 16);
-                                const u32 packed = fmha::pack_bf16x2(a * cs - b * sn, b * cs + a * sn);
+                                const u32 packed = ::pie::pack_bf16x2(a * cs - b * sn, b * cs + a * sn);
                                 e[2 * u] = static_cast<unsigned short>(packed & 0xffffu);
                                 e[2 * u + 1] = static_cast<unsigned short>(packed >> 16);
                             }
