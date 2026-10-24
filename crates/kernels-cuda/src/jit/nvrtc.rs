@@ -475,6 +475,17 @@ mod tests {
             &["::pie::linear::moe_select_mxfp4_cvt<2, 1, 2, 4, 3, 1>"],
         ),
         (
+            "elemwise/hc_sm100.cu",
+            // (hidden: DeepSeek-V4-Flash's and V4's, the held e4m3 operand or
+            // not): the forms `hc::fold_pre` launches.
+            &[
+                "::pie::elemwise::hc_fold_pre_tc5<4096, true>",
+                "::pie::elemwise::hc_fold_pre_tc5<4096, false>",
+                "::pie::elemwise::hc_fold_pre_tc5<7168, true>",
+                "::pie::elemwise::hc_fold_pre_tc5<7168, false>",
+            ],
+        ),
+        (
             "linear/moe/mega_sm100.cu",
             // (kind: W4A8 or bf16, block width 32, Glu code, weights first,
             // the five-stage ring 32 fits): every form `moe::mega` launches.
