@@ -1,9 +1,11 @@
 #![cfg(feature = "cuda")]
 
-//! A model served with `compiler.synth_regions` on, each chain of
-//! elementwise and row ops one generated kernel, answers the logits it
-//! answers with the flag off, where the chain's ops run as their hand
-//! kernels: a prefill and the decode steps after it, armed and captured.
+//! A model served with `compiler.synth_regions` on (CUDA's default), each
+//! chain of elementwise and row ops one generated kernel, answers the
+//! logits it answers with the flag off, where the chain's ops run as their
+//! hand kernels: a prefill and the decode steps after it, armed and
+//! captured. Qwen3's residual norms, and Gemma 4's sandwich norms with
+//! their layer scale; CUDA forms no hand fused op for either.
 //!
 //! Bit for bit. A chain rounds every value it defines where the unfused
 //! ops store it, its stream among them (read on by the norm as stored,
@@ -22,11 +24,8 @@ use poem_ir::{ParamSource, Trace};
 
 const PAGE: u32 = 16;
 
-/// The residual norm unfused, so each layer's `residual_add` and `rmsnorm`
-/// form a chain, folded under the flag into one generated kernel.
-const UNFUSED: &str = "[fuse]\nresidual_add_rmsnorm = false\n";
-
-const SYNTH: &str = "[compiler]\nsynth_regions = true\n";
+/// Each chain's ops as their own kernels.
+const OPS: &str = "[compiler]\nsynth_regions = false\n";
 
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
@@ -206,37 +205,34 @@ fn a_synthesized_region_serves_the_logits_of_its_ops() {
         eprintln!("skipping: no CUDA device on this machine");
         return;
     }
-    let fixture = fixture("qwen3-micro-text");
-    // A prefill's logits, then each greedy decode step's after it.
-    let served = |overrides: &str, generates: bool| {
-        let mut shell = load(&fixture, overrides, TOKENS);
-        assert_eq!(
-            !shell.regions().is_empty(),
-            generates,
-            "under {overrides:?}, the load generates a kernel exactly where a chain folds"
-        );
-        shell.open(0).expect("slot 0 opens");
-        let mut steps = vec![step(&mut shell, &fixture.trace, &prompt(37)).0];
-        for _ in 0..DECODES {
-            let next = argmax(steps.last().expect("a step"));
-            steps.push(step(&mut shell, &fixture.trace, &[next]).0);
-        }
-        steps
-    };
-    let ops = served(UNFUSED, false);
-    let hand = served("", false);
-    let synth = served(&format!("{UNFUSED}{SYNTH}"), true);
-    bit_for_bit(&synth, &ops, "the unfused ops");
-    bit_for_bit(&synth, &hand, "the hand residual norm");
-    // With the hand rule on, the residual norm is one fused op with matmuls
-    // on both sides: no chain forms and the flag folds nothing.
-    let lone = served(SYNTH, false);
-    bit_for_bit(&lone, &hand, "the hand residual norm");
+    for model in ["qwen3-micro-text", "gemma4-e4b-mini-l1"] {
+        let fixture = fixture(model);
+        // A prefill's logits, then each greedy decode step's after it.
+        let served = |overrides: &str, generates: bool| {
+            let mut shell = load(&fixture, overrides, TOKENS);
+            assert_eq!(
+                !shell.regions().is_empty(),
+                generates,
+                "{model} under {overrides:?}: the load generates a kernel exactly where a chain \
+                 folds"
+            );
+            shell.open(0).expect("slot 0 opens");
+            let mut steps = vec![step(&mut shell, &fixture.trace, &prompt(37)).0];
+            for _ in 0..DECODES {
+                let next = argmax(steps.last().expect("a step"));
+                steps.push(step(&mut shell, &fixture.trace, &[next]).0);
+            }
+            steps
+        };
+        let ops = served(OPS, false);
+        let synth = served("", true);
+        bit_for_bit(&synth, &ops, &format!("{model}'s unfused ops"));
+    }
 }
 
 /// Qwen3-8B's shape (seeded weights): a prefill step and a decode step with
-/// its residual norms as the hand fused kernel, as their two ops, and as
-/// one generated kernel each, the median of each fire's wall time:
+/// its residual norms as their two ops and as one generated kernel each,
+/// the median of each fire's wall time:
 /// `cargo test --release ... -- --ignored synth_regions_step_rate --nocapture`.
 #[test]
 #[ignore = "a rate bench: --release -- --ignored synth_regions_step_rate --nocapture"]
@@ -252,9 +248,8 @@ fn synth_regions_step_rate() {
     };
     eprintln!("residual norm       prefill {PREFILL} ms  decode us  generated kernels");
     for (what, overrides) in [
-        ("hand fused kernel", String::new()),
-        ("two hand kernels", UNFUSED.to_owned()),
-        ("generated kernel", format!("{UNFUSED}{SYNTH}")),
+        ("two hand kernels", OPS.to_owned()),
+        ("generated kernel", String::new()),
     ] {
         let mut shell = load(&fixture, &overrides, PREFILL);
         let mut prefills = Vec::with_capacity(PREFILLS);

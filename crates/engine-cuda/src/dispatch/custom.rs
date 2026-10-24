@@ -9,10 +9,13 @@ use poem_ir::{NormAxis, NormWeight, ValueId};
 use crate::run::Run;
 
 /// The fused ops this backend's dispatch turns away. Its rules form none of
-/// them (`every_fused_op_its_rules_form_is_one_dispatch_fires`).
+/// them (`every_fused_op_its_rules_form_is_one_dispatch_fires`): the residual
+/// norms run as generated regions here, their fused ops ROCm's and Metal's.
 pub(crate) fn refuses(op: &Fused) -> bool {
     match op {
         Fused::GdnStep { .. }
+        | Fused::ResidualAddRmsnorm { .. }
+        | Fused::RmsnormResidualAdd { .. }
         | Fused::QGateNormRopeAppend {
             intermediates: Intermediates::Written,
             ..
@@ -46,6 +49,8 @@ impl DispatchFused for Run<'_> {
                 }
             }
             Fused::GdnStep { .. }
+            | Fused::ResidualAddRmsnorm { .. }
+            | Fused::RmsnormResidualAdd { .. }
             | Fused::QGateNormRopeAppend {
                 intermediates: Intermediates::Written,
                 ..
@@ -79,9 +84,7 @@ impl DispatchFused for Run<'_> {
             | Fused::MoeSelectGlu { .. }
             | Fused::MoeExperts { .. }
             | Fused::MoeMega { .. } => self.fused_linear(op),
-            Fused::ResidualAddRmsnorm { .. }
-            | Fused::RmsnormResidualAdd { .. }
-            | Fused::EmbedScaleAdd { .. }
+            Fused::EmbedScaleAdd { .. }
             | Fused::EmbedScaleAddSelect { .. }
             | Fused::NormRope { .. }
             | Fused::HcNormProject { .. }

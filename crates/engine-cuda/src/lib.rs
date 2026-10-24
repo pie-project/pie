@@ -62,10 +62,8 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
         vec![
             rules::split_qkv_fused(),
             rules::qkv_fused_qknorm_rope_vnorm_write(),
-            rules::rmsnorm_residual_add(),
             rules::embed_scale_add_select(),
             rules::embed_scale_add(),
-            rules::residual_add_rmsnorm(),
             rules::matmul_glu(&[GluAct::GegluTanh, GluAct::Swiglu]),
             rules::moe_mega(),
             rules::moe_experts(),
@@ -123,10 +121,7 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
 
 /// The fused kernels left on with `fuse-chains=off`.
 #[cfg(not(feature = "rocm"))]
-pub const UNCHAINED: [&str; 2] = [
-    "fused.qkv_fused_qknorm_rope_vnorm_write",
-    "fused.residual_add_rmsnorm",
-];
+pub const UNCHAINED: [&str; 1] = ["fused.qkv_fused_qknorm_rope_vnorm_write"];
 #[cfg(feature = "rocm")]
 pub const UNCHAINED: [&str; 1] = ["fused.residual_add_rmsnorm"];
 

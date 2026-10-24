@@ -1249,7 +1249,9 @@ impl<'c> Run<'c> {
     }
 
     /// Whether nothing reads `id`; a value the table does not cover is read.
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    /// Read by no dispatch since the residual norms (whose hand kernel left
+    /// a row nothing reads unwritten) run as generated regions.
+    #[allow(dead_code)]
     pub(crate) fn is_unread(&self, id: ValueId) -> bool {
         self.unread.get(id.0 as usize).copied().unwrap_or(false)
     }

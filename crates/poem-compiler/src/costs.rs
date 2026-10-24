@@ -54,8 +54,9 @@ pub struct DagStreams;
 /// Whether the compiler forms each chain of elementwise and row ops into a
 /// region lowered to eta (`fuse::chain`), for kernels-* to generate one
 /// kernel for, and plans the trace with each chain folded into one
-/// `fused.region` op (`CompiledModel::trace`). Off unless a chip's profile
-/// turns it on; an engine that does runs the folded trace.
+/// `fused.region` op (`CompiledModel::trace`). Off unless the backend
+/// registers it on ([`register_regions`], CUDA) or a chip's profile turns it
+/// on; an engine that does runs the folded trace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "compiler.synth_regions", flag, default = false, tune = engine)]
 pub struct SynthRegions;
@@ -83,6 +84,21 @@ pub fn register(registry: &mut Registry, side_streams: u32) {
 }
 
 pub fn register_for(registry: &mut Registry, side_streams: u32, conditionals: Conditionals) {
+    register_all(registry, side_streams, conditionals, false);
+}
+
+/// [`register`], `compiler.synth_regions` on by default: a backend whose
+/// rule list leaves the residual norms to generated row kernels.
+pub fn register_regions(registry: &mut Registry, side_streams: u32) {
+    register_all(registry, side_streams, Conditionals::Native, true);
+}
+
+fn register_all(
+    registry: &mut Registry,
+    side_streams: u32,
+    conditionals: Conditionals,
+    regions: bool,
+) {
     registry.add::<LaunchUs>();
     match conditionals {
         Conditionals::Native => registry.add::<CondFixedUs>(),
@@ -104,7 +120,7 @@ pub fn register_for(registry: &mut Registry, side_streams: u32, conditionals: Co
         .add::<Branches>()
         .add::<DagStreams>()
         .add::<DagStreamsUntil>()
-        .add::<SynthRegions>()
+        .add_defaulting::<SynthRegions>(if regions { "true" } else { "false" })
         .add_defaulting::<SideStreams>(&side_streams.to_string());
 }
 
