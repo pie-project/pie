@@ -44,7 +44,7 @@ pub fn landing(facts: &Facts, classes: &poem_ir::ClassTable) -> Vec<Vec<Request>
         .collect();
     for reading in readings {
         for stream in Stream::ALL {
-            for bits in 0..256u32 {
+            for bits in 0..512u32 {
                 let request = Request::new(if bits & 1 == 0 { 1 } else { 2 }, bits & 2 != 0)
                     .adapted(bits & 4 != 0)
                     .drafting(bits & 8 != 0)
@@ -52,6 +52,7 @@ pub fn landing(facts: &Facts, classes: &poem_ir::ClassTable) -> Vec<Vec<Request>
                     .with_media(bits & 32 != 0)
                     .denoising(bits & 64 != 0)
                     .drafting_a_block(bits & 128 != 0)
+                    .encoding(bits & 256 != 0)
                     .on_stream(stream);
                 let request = match reading {
                     Some(name) => request.in_reading(name),
@@ -73,6 +74,7 @@ pub fn landing(facts: &Facts, classes: &poem_ir::ClassTable) -> Vec<Vec<Request>
                 + u32::from(r.has_media())
                 + u32::from(r.denoise())
                 + u32::from(r.drafts_a_block())
+                + u32::from(r.flag(Request::ENCODE))
                 + u32::from(r.stream() != Stream::Text)
                 + u32::from(r.reading().is_some())
         });
