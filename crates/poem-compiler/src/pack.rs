@@ -21,22 +21,26 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use poem::Join;
 use poem_ir::{
-    Def, Dim, Gather, Linear, Node, Operands, Operation, Param, ParamLayout, ParamPlacement,
-    ParamSource, Shard, Trace, Ty, ValueDecl, ValueId,
+    Def, Dim, Elemwise, Gather, Linear, Node, Operands, Operation, Param, ParamLayout,
+    ParamPlacement, ParamSource, Shard, Trace, Ty, ValueDecl, ValueId,
 };
 
 /// The joins [`pack`] makes of `trace`, in the order it makes them.
 #[must_use]
 pub fn joins(trace: &Trace) -> Vec<Join> {
+    let name = |p: &u32| trace.params[*p as usize].name.clone();
     groups(trace)
         .iter()
-        .map(|g| Join {
-            name: g.name.clone(),
-            legs: g
-                .params
-                .iter()
-                .map(|p| trace.params[*p as usize].name.clone())
-                .collect(),
+        .flat_map(|g| {
+            let weight = Join {
+                name: g.name.clone(),
+                legs: g.params.iter().map(name).collect(),
+            };
+            let bias = g.biases.as_ref().map(|b| Join {
+                name: g.bias_name.clone(),
+                legs: b.iter().map(|b| name(&b.param)).collect(),
+            });
+            std::iter::once(weight).chain(bias)
         })
         .collect()
 }
@@ -62,9 +66,22 @@ enum Form {
     Rows { left: u32 },
 }
 
+/// A product's bias, added by the op right after it: that op, the bias's
+/// param and value, and the op's result, which the leg then stands for.
+#[derive(Debug, Clone, Copy)]
+struct Biased {
+    at: usize,
+    param: u32,
+    bias: ValueId,
+    out: ValueId,
+}
+
 #[derive(Debug)]
 struct Group {
     name: String,
+    /// Each leg's bias, where they are biased (all or none).
+    biases: Option<Vec<Biased>>,
+    bias_name: String,
     /// The products, ascending.
     nodes: Vec<usize>,
     /// Each product's weight's param, and its planes' (suffix, param).
@@ -130,6 +147,32 @@ fn weight_param(trace: &Trace, v: ValueId) -> Option<u32> {
     }
 }
 
+/// The bias the op reading `y` (and nothing else does) adds to it, where
+/// it is a weight a join may take as a leg.
+fn biased(trace: &Trace, read: &[u32], y: ValueId) -> Option<Biased> {
+    if read[y.0 as usize] != 1 {
+        return None;
+    }
+    let mut ins = Vec::new();
+    trace.nodes.iter().enumerate().find_map(|(at, node)| {
+        let Operation::Elemwise(Elemwise::AddBias { bias, out, out_out }) = &node.op else {
+            return None;
+        };
+        if *out != y {
+            return None;
+        }
+        ins.clear();
+        node.op.inputs(&mut ins);
+        let param = weight_param(trace, *bias)?;
+        (read[bias.0 as usize] == 1 && leg(&trace.params[param as usize])).then_some(Biased {
+            at,
+            param,
+            bias: *bias,
+            out: *out_out,
+        })
+    })
+}
+
 fn groups(trace: &Trace) -> Vec<Group> {
     let read = reads(trace);
     // Each candidate product, keyed by what must agree for a join.
@@ -167,8 +210,14 @@ fn groups(trace: &Trace) -> Vec<Group> {
             .map(|(suffix, _)| suffix)
             .collect();
 
+        let bias = biased(trace, &read, *y).map(|b| {
+            (
+                headed(&trace.params[b.param as usize]),
+                trace.params[b.param as usize].dtype,
+            )
+        });
         let key = format!(
-            "{}|{quant:?}|{:?}|{:?}|{}|{planes:?}|{:?}|{:?}|{:?}|{}",
+            "{}|{quant:?}|{:?}|{:?}|{}|{planes:?}|{:?}|{:?}|{:?}|{}|{bias:?}",
             act.0,
             param.dtype,
             &param.shape[1..],
@@ -186,10 +235,20 @@ fn groups(trace: &Trace) -> Vec<Group> {
         if nodes.len() < 2 {
             continue;
         }
-        let ys: Vec<ValueId> = nodes
+        let biases: Option<Vec<Biased>> = nodes
             .iter()
             .map(|&at| match &trace.nodes[at].op {
-                Operation::Linear(Linear::Matmul { y, .. }) => *y,
+                Operation::Linear(Linear::Matmul { y, .. }) => biased(trace, &read, *y),
+                _ => unreachable!("grouped nodes are products"),
+            })
+            .collect();
+        // What each leg stands for: its product, or the bias added to it.
+        let ys: Vec<ValueId> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, &at)| match (&biases, &trace.nodes[at].op) {
+                (Some(b), _) => b[i].out,
+                (None, Operation::Linear(Linear::Matmul { y, .. })) => *y,
                 _ => unreachable!("grouped nodes are products"),
             })
             .collect();
@@ -235,8 +294,30 @@ fn groups(trace: &Trace) -> Vec<Group> {
             .iter()
             .map(|p| planes_of(trace, &trace.params[*p as usize].name))
             .collect();
+        let name = Join::name_of(&names);
+        // A bias named for its weight (`q_bias` beside `q`) is named so for
+        // the joined weight (`qkv_bias`).
+        let bias_name = biases.as_ref().map_or_else(String::new, |b| {
+            let bias_names: Vec<&str> = b
+                .iter()
+                .map(|b| trace.params[b.param as usize].name.as_str())
+                .collect();
+            let suffixes: Option<Vec<&str>> = bias_names
+                .iter()
+                .zip(&names)
+                .map(|(bias, leg)| bias.strip_prefix(leg))
+                .collect();
+            match suffixes {
+                Some(s) if !s[0].is_empty() && s.iter().all(|x| *x == s[0]) => {
+                    format!("{name}{}", s[0])
+                }
+                _ => Join::name_of(&bias_names),
+            }
+        });
         out.push(Group {
-            name: Join::name_of(&names),
+            biases,
+            bias_name,
+            name,
             nodes,
             params,
             planes,
@@ -299,6 +380,9 @@ fn apply(mut trace: Trace, groups: &[Group]) -> Trace {
     let mut gone: BTreeSet<u32> = BTreeSet::new();
     // A leg's main or plane param, and the joined param that takes its place.
     let mut into: BTreeMap<u32, (u32, usize)> = BTreeMap::new();
+    // Each join's bias, in its first leg's bias's place.
+    let mut bias_at: BTreeMap<u32, (u32, Param)> = BTreeMap::new();
+    let mut bias_into: BTreeMap<u32, u32> = BTreeMap::new();
     for (g, group) in groups.iter().enumerate() {
         let legs: Vec<&Param> = group
             .params
@@ -314,6 +398,18 @@ fn apply(mut trace: Trace, groups: &[Group]) -> Trace {
                 .collect();
             made.push(joined(format!("{}.{suffix}", group.name), &planes));
         }
+        if let Some(biases) = &group.biases {
+            let legs: Vec<&Param> = biases
+                .iter()
+                .map(|b| &trace.params[b.param as usize])
+                .collect();
+            let at = biases[0].param;
+            bias_at.insert(at, (g as u32, joined(group.bias_name.clone(), &legs)));
+            for b in biases {
+                gone.insert(b.param);
+                bias_into.insert(b.param, g as u32);
+            }
+        }
         let first = group.params[0];
         for (leg, p) in group.params.iter().enumerate() {
             gone.insert(*p);
@@ -328,6 +424,7 @@ fn apply(mut trace: Trace, groups: &[Group]) -> Trace {
     let mut params = Vec::with_capacity(trace.params.len());
     let mut new_index: BTreeMap<u32, u32> = BTreeMap::new();
     let mut group_index: BTreeMap<(u32, usize), u32> = BTreeMap::new();
+    let mut bias_index: BTreeMap<u32, u32> = BTreeMap::new();
     for (at, param) in trace.params.iter().enumerate() {
         let at = at as u32;
         if let Some(made) = joined_at.remove(&at) {
@@ -337,6 +434,10 @@ fn apply(mut trace: Trace, groups: &[Group]) -> Trace {
                 params.push(p);
             }
         }
+        if let Some((g, p)) = bias_at.remove(&at) {
+            bias_index.insert(g, params.len() as u32);
+            params.push(p);
+        }
         if !gone.contains(&at) {
             new_index.insert(at, params.len() as u32);
             params.push(param.clone());
@@ -344,6 +445,9 @@ fn apply(mut trace: Trace, groups: &[Group]) -> Trace {
     }
     for (old, (g, i)) in &into {
         new_index.insert(*old, group_index[&(*g, *i)]);
+    }
+    for (old, g) in &bias_into {
+        new_index.insert(*old, bias_index[g]);
     }
     trace.params = params;
     for decl in &mut trace.values {
@@ -355,17 +459,21 @@ fn apply(mut trace: Trace, groups: &[Group]) -> Trace {
     // Nodes: each join's product in its first leg's place, its split after;
     // the other legs' products gone.
     let mut drop: BTreeSet<usize> = BTreeSet::new();
-    let mut after: BTreeMap<usize, Node> = BTreeMap::new();
+    let mut after: BTreeMap<usize, Vec<Node>> = BTreeMap::new();
     for group in groups {
         let first = group.nodes[0];
-        let ys: Vec<ValueId> = group
-            .nodes
-            .iter()
-            .map(|&at| match &trace.nodes[at].op {
-                Operation::Linear(Linear::Matmul { y, .. }) => *y,
-                _ => unreachable!("grouped nodes are products"),
-            })
-            .collect();
+        // What each leg stands for: its product, or the bias added to it.
+        let ys: Vec<ValueId> = match &group.biases {
+            Some(biases) => biases.iter().map(|b| b.out).collect(),
+            None => group
+                .nodes
+                .iter()
+                .map(|&at| match &trace.nodes[at].op {
+                    Operation::Linear(Linear::Matmul { y, .. }) => *y,
+                    _ => unreachable!("grouped nodes are products"),
+                })
+                .collect(),
+        };
         let whole: u64 = group.widths.iter().sum();
         let y_ty = match &trace.values[ys[0].0 as usize].ty {
             Ty::Tensor { shape, dtype } => Ty::Tensor {
@@ -414,6 +522,38 @@ fn apply(mut trace: Trace, groups: &[Group]) -> Trace {
         for &at in &group.nodes[1..] {
             drop.insert(at);
         }
+        // A biased join adds the joined bias to the joined product, and the
+        // split reads that.
+        let mut extra = Vec::new();
+        let y = match &group.biases {
+            None => y,
+            Some(biases) => {
+                let ty = trace.values[y.0 as usize].ty.clone();
+                let z = ValueId(trace.values.len() as u32);
+                trace.values.push(ValueDecl {
+                    def: Def::Op(u32::MAX),
+                    ty,
+                });
+                let rows: u64 = group.widths.iter().sum();
+                if let Ty::Tensor { shape, .. } = &mut trace.values[biases[0].bias.0 as usize].ty {
+                    shape[0] = Dim::Const(rows);
+                }
+                for b in biases {
+                    drop.insert(b.at);
+                }
+                let node = &trace.nodes[first];
+                extra.push(Node {
+                    op: Operation::Elemwise(Elemwise::AddBias {
+                        bias: biases[0].bias,
+                        out: y,
+                        out_out: z,
+                    }),
+                    guard: node.guard.clone(),
+                    layer: node.layer,
+                });
+                z
+            }
+        };
         match group.form {
             Form::Glu { at } => {
                 if let Operation::Linear(Linear::Glu {
@@ -427,39 +567,34 @@ fn apply(mut trace: Trace, groups: &[Group]) -> Trace {
             }
             Form::Qkv { q, kv } => {
                 let node = &trace.nodes[first];
-                after.insert(
-                    first,
-                    Node {
-                        op: Operation::Gather(Gather::SplitQkv {
-                            packed: y,
-                            q_width: q,
-                            kv_width: kv,
-                            q: ys[0],
-                            k: ys[1],
-                            v: ys[2],
-                        }),
-                        guard: node.guard.clone(),
-                        layer: node.layer,
-                    },
-                );
+                extra.push(Node {
+                    op: Operation::Gather(Gather::SplitQkv {
+                        packed: y,
+                        q_width: q,
+                        kv_width: kv,
+                        q: ys[0],
+                        k: ys[1],
+                        v: ys[2],
+                    }),
+                    guard: node.guard.clone(),
+                    layer: node.layer,
+                });
             }
             Form::Rows { left } => {
                 let node = &trace.nodes[first];
-                after.insert(
-                    first,
-                    Node {
-                        op: Operation::Gather(Gather::SplitRows {
-                            x: y,
-                            width: left,
-                            left: ys[0],
-                            right: ys[1],
-                        }),
-                        guard: node.guard.clone(),
-                        layer: node.layer,
-                    },
-                );
+                extra.push(Node {
+                    op: Operation::Gather(Gather::SplitRows {
+                        x: y,
+                        width: left,
+                        left: ys[0],
+                        right: ys[1],
+                    }),
+                    guard: node.guard.clone(),
+                    layer: node.layer,
+                });
             }
         }
+        after.insert(first, extra);
     }
     let old = std::mem::take(&mut trace.nodes);
     for (at, node) in old.into_iter().enumerate() {
@@ -467,9 +602,7 @@ fn apply(mut trace: Trace, groups: &[Group]) -> Trace {
             continue;
         }
         trace.nodes.push(node);
-        if let Some(split) = after.remove(&at) {
-            trace.nodes.push(split);
-        }
+        trace.nodes.extend(after.remove(&at).unwrap_or_default());
     }
     compact(trace)
 }
