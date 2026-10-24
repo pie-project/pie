@@ -7,25 +7,33 @@
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
+use std::marker::PhantomPinned;
+use std::pin::Pin;
 
-/// `std::__cxx11::basic_string<char>`: `{ ptr, len, sso[16] }`.
+/// `std::__cxx11::basic_string<char>`: `{ ptr, len, sso[16] }`, where a
+/// short string's `ptr` is its own `sso` and a long one's `sso` holds its
+/// capacity.
 ///
-/// Boxed so the small-string self-pointer never moves. Long strings own a
-/// `malloc` buffer; libstdc++ frees with `operator delete`, which is
-/// `malloc`-compatible, so a callee that moves the string out is fine.
+/// Pinned: a short string points into itself, and so does one a callee has
+/// moved from (libstdc++ leaves it empty and local), so the value must never
+/// move. Long strings own a `malloc` buffer; libstdc++ frees with `operator
+/// delete`, which is `malloc`-compatible, so a callee that moves the string
+/// out is fine.
 #[repr(C)]
 pub struct CxxString {
     ptr: *mut u8,
     len: usize,
     sso: [u8; 16],
+    _pinned: PhantomPinned,
 }
 
 impl CxxString {
-    pub fn new(s: &str) -> Box<Self> {
+    pub fn new(s: &str) -> Pin<Box<Self>> {
         let mut b = Box::new(CxxString {
             ptr: std::ptr::null_mut(),
             len: s.len(),
             sso: [0; 16],
+            _pinned: PhantomPinned,
         });
         if s.len() < 16 {
             b.sso[..s.len()].copy_from_slice(s.as_bytes());
@@ -41,15 +49,28 @@ impl CxxString {
                 *p.add(s.len()) = 0;
             }
             b.ptr = p;
+            // the capacity a long string keeps where a short one keeps its
+            // bytes, as libstdc++ reads it back
+            b.sso[..8].copy_from_slice(&s.len().to_ne_bytes());
         }
-        b
+        Box::into_pin(b)
+    }
+
+    /// The string for a callee that may move from it: in place, as it must
+    /// stay.
+    pub fn as_mut_ptr(self: Pin<&mut Self>) -> *mut CxxString {
+        // SAFETY: the pointer goes to C++, which moves the string's contents
+        // at most, never the object, so the pinned value stays where it is.
+        unsafe { self.get_unchecked_mut() }
     }
 }
 
 impl Drop for CxxString {
     fn drop(&mut self) {
         if !self.ptr.is_null() && self.ptr != self.sso.as_mut_ptr() {
-            // SAFETY: ptr came from malloc in `new` and has not been freed.
+            // SAFETY: a long string's buffer, owned by this string and not
+            // yet freed: `new`'s `malloc`, or one a callee's `std::string`
+            // grew into with `operator new`, which is `malloc`-compatible.
             unsafe { libc::free(self.ptr as *mut c_void) };
         }
     }
@@ -182,5 +203,41 @@ impl SimPlatform {
 
     pub fn as_ptr(&self) -> *const c_void {
         self.0.as_ptr() as *const c_void
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CxxString;
+
+    #[test]
+    fn a_string_is_laid_out_as_libstdcxx_reads_it() {
+        let short = CxxString::new("hello");
+        assert_eq!(short.len, 5);
+        assert_eq!(
+            short.ptr.cast_const(),
+            short.sso.as_ptr(),
+            "a short string is local"
+        );
+        assert_eq!(&short.sso[..6], b"hello\0");
+
+        let text = "a string past the sixteen local bytes";
+        let long = CxxString::new(text);
+        assert_eq!(long.len, text.len());
+        assert_ne!(
+            long.ptr.cast_const(),
+            long.sso.as_ptr(),
+            "a long string is on the heap"
+        );
+        let capacity = usize::from_ne_bytes(long.sso[..8].try_into().unwrap());
+        assert_eq!(
+            capacity,
+            text.len(),
+            "its capacity sits where a short one's bytes do"
+        );
+        // SAFETY: `new` wrote `len` bytes and a NUL at `ptr`.
+        let held = unsafe { std::slice::from_raw_parts(long.ptr, text.len() + 1) };
+        assert_eq!(&held[..text.len()], text.as_bytes());
+        assert_eq!(held[text.len()], 0);
     }
 }

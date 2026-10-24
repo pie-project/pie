@@ -49,7 +49,7 @@
 
 #![allow(unsafe_code)]
 
-pub mod abi;
+pub(crate) mod abi;
 pub mod cslc;
 pub mod sys;
 
@@ -428,12 +428,12 @@ impl Runtime {
                 this.as_ptr(),
                 artifacts.as_ptr(),
                 platform.as_ptr(),
-                &mut *msg,
+                msg.as_mut().as_mut_ptr(),
                 true,
                 false,
                 false,
-                &mut *cslc_prefix,
-                &mut *out_prefix,
+                cslc_prefix.as_mut().as_mut_ptr(),
+                out_prefix.as_mut().as_mut_ptr(),
             )
         };
         Ok(Runtime {
