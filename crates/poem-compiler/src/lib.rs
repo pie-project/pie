@@ -15,6 +15,7 @@ pub mod prefetch;
 mod region;
 pub mod shard;
 pub mod stream;
+pub mod tile;
 mod tree;
 pub mod unit;
 

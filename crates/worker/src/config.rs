@@ -761,6 +761,7 @@ impl ModelConfig {
             tp: None,
             ep: None,
             rank: None,
+            expert_replicas: None,
             yarn: self
                 .rope_scaling
                 .as_ref()
@@ -973,6 +974,10 @@ pub struct EngineConfig {
     /// beside it is not served yet.
     #[serde(default = "default_ep_size")]
     pub expert_parallel_size: u32,
+    /// Slots each expert-parallel rank holds past its share of a MoE layer's
+    /// experts, which the busiest experts' replicas fill.
+    #[serde(default)]
+    pub expert_replicas: u32,
     /// Compute dtype for activations, e.g. `"bfloat16"`. Separate from
     /// `weight_dtype`: a deployment can store weights narrower than it
     /// computes.

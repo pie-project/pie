@@ -388,27 +388,31 @@ impl Package {
         src: &ztensor::Source,
         platform: Platform,
     ) -> Result<checkpoint::contract::ModelContract, crate::import::Error> {
-        self.import_joined(id, deploy, src, platform, &[])
+        self.import_lowered(id, deploy, src, platform, &crate::Lowering::default())
     }
 
-    /// [`Package::import`], the weights of `joins` each read once, joined
-    /// along their rows, as the compiler joins them.
-    pub fn import_joined(
+    /// [`Package::import`], its weights stored as the compiler lowers them
+    /// (`lowering`): the weights of each join read once, joined along their
+    /// rows; the tiled ones in the tiled order.
+    pub fn import_lowered(
         &self,
         id: &str,
         deploy: &Deploy,
         src: &ztensor::Source,
         platform: Platform,
-        joins: &[crate::Join],
+        lowering: &crate::Lowering,
     ) -> Result<checkpoint::contract::ModelContract, crate::import::Error> {
+        let joins = &lowering.joins;
         /// The joins a read reads, held while it runs.
         struct Held;
         impl Drop for Held {
             fn drop(&mut self) {
                 crate::star::formats::JOINS.with(|j| j.borrow_mut().clear());
+                crate::star::formats::TILED.with(|t| t.borrow_mut().clear());
             }
         }
         crate::star::formats::JOINS.with(|j| *j.borrow_mut() = joins.to_vec());
+        crate::star::formats::TILED.with(|t| *t.borrow_mut() = lowering.tiled.clone());
         let _held = Held;
         let name = self.name();
         let mut contract = self.formats(id, deploy, src, platform, |built| {
@@ -417,12 +421,15 @@ impl Package {
         // A format that reads a joined weight's legs one by one (its own
         // reads, not the codec's rows) has them joined here, plane by plane.
         for join in joins {
-            crate::import::join_read(&mut contract, join).map_err(|detail| {
+            crate::import::join_read(src, &mut contract, join).map_err(|detail| {
                 crate::import::Error::Illegible {
                     name: id.to_string(),
                     detail,
                 }
             })?;
+        }
+        if let Some(read) = &lowering.read {
+            crate::import::prune(&mut contract, read);
         }
         Ok(contract)
     }
@@ -527,7 +534,8 @@ impl Package {
                             })?;
                         let reads = crate::star::formats::READS
                             .with(|r| std::mem::take(&mut *r.borrow_mut()));
-                        let mut b = crate::import::Builder::new(src, 1, platform);
+                        let tiled = crate::star::formats::TILED.with(|t| t.borrow().clone());
+                        let mut b = crate::import::Builder::new(src, 1, platform).tiling(&tiled);
                         for t in stated {
                             crate::star::formats::Read::Push(t.clone()).onto(&mut b)?;
                         }

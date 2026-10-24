@@ -64,21 +64,21 @@ impl Deployment {
         platform: Platform,
     ) -> Result<ModelContract, poem::import::Error> {
         whole(self.deploy.tp)?;
-        self.package.import_joined(
+        self.package.import_lowered(
             &self.model.id,
             &self.deploy,
             src,
             platform,
-            &self.joins(platform),
+            &self.lowering(platform),
         )
     }
 
-    /// The weights the compiler joins in this deployment's trace, which an
-    /// import reads joined: none where it does not trace.
-    pub fn joins(&self, platform: Platform) -> Vec<poem::Join> {
+    /// What the compiler decides of this deployment's weights that its
+    /// import stores so: nothing where it does not trace.
+    pub fn lowering(&self, platform: Platform) -> poem::Lowering {
         self.package
             .trace(&self.model.id, &self.deploy, &self.name, platform)
-            .map(|trace| crate::pack::joins(&trace))
+            .map(|trace| lowering_of(&trace))
             .unwrap_or_default()
     }
 
@@ -131,12 +131,29 @@ pub fn whole(tp: u32) -> Result<(), poem::import::Error> {
 }
 
 /// The trace each rank of `deploy` runs, from the one the package records:
-/// its products of one activation joined ([`crate::pack`]), split across its
+/// its products of one activation joined ([`crate::pack`]), its u4
+/// projections tiled where the platform reads them so ([`crate::tile`]), split across its
 /// tensor ranks, its experts across its expert ranks.
 pub fn lowered(trace: Trace, deploy: &Deploy) -> Result<Trace, String> {
-    let trace = crate::pack::pack(trace);
+    lowered_with(trace, deploy, 0)
+}
+
+/// [`lowered`], each expert rank holding `replicas` slots past its share of
+/// a layer's experts.
+pub fn lowered_with(trace: Trace, deploy: &Deploy, replicas: u32) -> Result<Trace, String> {
+    let trace = crate::tile::tile(crate::pack::pack(trace));
     let trace = crate::shard::shard(trace, deploy.tp).map_err(|why| why.to_string())?;
-    crate::expert::lower(trace, deploy.ep, 0).map_err(|why| why.to_string())
+    crate::expert::lower(trace, deploy.ep, replicas).map_err(|why| why.to_string())
+}
+
+/// What [`lowered`] decides of `trace`'s weights that an import stores so.
+#[must_use]
+pub fn lowering_of(trace: &Trace) -> poem::Lowering {
+    let joins = crate::pack::joins(trace);
+    let lowered = crate::tile::tile(crate::pack::pack(trace.clone()));
+    let tiled = crate::tile::tiled(&crate::pack::pack(trace.clone()));
+    let read = Some(lowered.params.iter().map(|p| p.name.clone()).collect());
+    poem::Lowering { joins, tiled, read }
 }
 
 /// The rank counts [`Catalog::splits`] tries.
@@ -373,11 +390,11 @@ impl Catalog {
         let package = self
             .package_of(id)
             .unwrap_or_else(|| panic!("no package holds `{id}`"));
-        let joins = package
+        let lowering = package
             .trace(id, &one_rank(w, kv), id, platform)
-            .map(|trace| crate::pack::joins(&trace))
+            .map(|trace| lowering_of(&trace))
             .unwrap_or_default();
-        package.import_joined(id, &one_rank(w, kv), src, platform, &joins)
+        package.import_lowered(id, &one_rank(w, kv), src, platform, &lowering)
     }
 
     /// The package of `id` with its `function` renamed `whole_<function>` and

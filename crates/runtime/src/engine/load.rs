@@ -58,6 +58,9 @@ pub struct Overrides {
     /// Which of those ranks loads: its slots of each routed bank, its own
     /// disk tier.
     pub rank: Option<u32>,
+    /// Slots each expert rank holds past its share of a layer's experts,
+    /// for replicas of the busiest.
+    pub expert_replicas: Option<u32>,
     /// A YaRN factor to stretch the model's native context by, where its
     /// package turns one; unstated, the factor the checkpoint's config.json
     /// states, where its package does not already scale its rotation.
@@ -233,7 +236,8 @@ pub fn packaged(
     let trace = package
         .trace(&model.id, &deploy, &name, platform)
         .map_err(|why| anyhow!("`{name}` does not serve on {platform:?}: {why:#}"))?;
-    let trace = poem_compiler::catalog::lowered(trace, &deploy).map_err(|why| {
+    let replicas = overrides.expert_replicas.unwrap_or(0);
+    let trace = poem_compiler::catalog::lowered_with(trace, &deploy, replicas).map_err(|why| {
         anyhow!(
             "`{name}` does not split across {} tensor and {} expert ranks: {why}",
             deploy.tp,

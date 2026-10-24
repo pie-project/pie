@@ -80,6 +80,9 @@ pub struct Builder<'a> {
     tp: u32,
     platform: Platform,
     tensors: Vec<TensorContract>,
+    /// The weights the compiler lays out tiled (an affine projection a
+    /// package states row-major).
+    tiled: std::collections::BTreeSet<String>,
 }
 
 impl<'a> Builder<'a> {
@@ -90,11 +93,28 @@ impl<'a> Builder<'a> {
             tp,
             platform,
             tensors: Vec::new(),
+            tiled: std::collections::BTreeSet::new(),
         }
     }
 
+    /// The builder storing the weights `tiled` names in the tiled order.
+    #[must_use]
+    pub fn tiling(mut self, tiled: &[String]) -> Builder<'a> {
+        self.tiled = tiled.iter().cloned().collect();
+        self
+    }
+
+    /// `w` as this platform stores it, tiled where the compiler lays it so.
+    fn laid(&self, w: &Weight) -> Weight {
+        let mut w = w.placed(self.platform);
+        if w.dtype == Dtype::U4g64 && self.tiled.contains(&w.name) {
+            w.dtype = self.platform.placement(Dtype::U4g64tiled);
+        }
+        w
+    }
+
     pub fn read(&mut self, w: &Weight, from: impl Into<String>) -> Result<(), Error> {
-        let w = &w.placed(self.platform);
+        let w = &self.laid(w);
         let from = from.into();
         if recorded(|| format!("read {w:?} {from:?}")) {
             return Ok(());
@@ -110,7 +130,7 @@ impl<'a> Builder<'a> {
         w: &Weight,
         parts: impl IntoIterator<Item = String>,
     ) -> Result<(), Error> {
-        let w = &w.placed(self.platform);
+        let w = &self.laid(w);
         let parts: Vec<String> = parts.into_iter().collect();
         if recorded(|| format!("read_concat {w:?} {parts:?}")) {
             return Ok(());
@@ -126,7 +146,7 @@ impl<'a> Builder<'a> {
         w: &Weight,
         rows: impl IntoIterator<Item = Vec<String>>,
     ) -> Result<(), Error> {
-        let w = &w.placed(self.platform);
+        let w = &self.laid(w);
         let rows: Vec<Vec<String>> = rows.into_iter().collect();
         if recorded(|| format!("read_stack {w:?} {rows:?}")) {
             return Ok(());
@@ -143,7 +163,7 @@ impl<'a> Builder<'a> {
         from: impl Into<String>,
         over: impl FnOnce(Expr) -> Expr,
     ) -> Result<(), Error> {
-        let w = &w.placed(self.platform);
+        let w = &self.laid(w);
         let from = from.into();
         let over = over(Expr::src(from.clone()));
         if recorded(|| format!("read_over {w:?} {from:?} {over:?}")) {
@@ -167,7 +187,7 @@ impl<'a> Builder<'a> {
     }
 
     pub fn read_expr(&mut self, w: &Weight, expr: Expr) -> Result<(), Error> {
-        let w = &w.placed(self.platform);
+        let w = &self.laid(w);
         if recorded(|| format!("read_expr {w:?} {expr:?}")) {
             return Ok(());
         }
@@ -188,7 +208,7 @@ impl<'a> Builder<'a> {
         start: i64,
         len: i64,
     ) -> Result<(), Error> {
-        let w = &w.placed(self.platform);
+        let w = &self.laid(w);
         let from = from.into();
         if recorded(|| format!("read_columns {w:?} {from:?} {start} {len}")) {
             return Ok(());
@@ -206,7 +226,7 @@ impl<'a> Builder<'a> {
     }
 
     pub fn read_own(&mut self, w: &Weight) -> Result<(), Error> {
-        let w = &w.placed(self.platform);
+        let w = &self.laid(w);
         if recorded(|| format!("read_own {w:?}")) {
             return Ok(());
         }
@@ -296,11 +316,107 @@ pub fn own_contract(
     Ok(b.build())
 }
 
+/// `contract` without the weights `read` (the params a trace reads, by
+/// name) holds none of: a public tensor neither a param nor a plane of one,
+/// and the internal ones only those read.
+pub fn prune(contract: &mut ModelContract, read: &[String]) {
+    let read: std::collections::BTreeSet<&str> = read.iter().map(String::as_str).collect();
+    let held = |name: &str| {
+        read.contains(name)
+            || name
+                .rsplit_once('.')
+                .is_some_and(|(stem, _)| read.contains(stem))
+    };
+    let mut keep: Vec<bool> = contract
+        .tensors
+        .iter()
+        .map(|t| t.visibility != checkpoint::types::Visibility::Public || held(&t.name))
+        .collect();
+    // An internal tensor stays only where a kept one reads it.
+    let at: std::collections::BTreeMap<&str, usize> = contract
+        .tensors
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.name.as_str(), i))
+        .collect();
+    let mut needed = vec![false; contract.tensors.len()];
+    for i in (0..contract.tensors.len()).rev() {
+        let public = contract.tensors[i].visibility == checkpoint::types::Visibility::Public;
+        if !(keep[i] && (public || needed[i])) {
+            continue;
+        }
+        let mut outs = Vec::new();
+        outs_of(&contract.tensors[i].expr, &mut outs);
+        for name in outs {
+            if let Some(&j) = at.get(name.as_str()) {
+                needed[j] = true;
+            }
+        }
+    }
+    for (i, t) in contract.tensors.iter().enumerate() {
+        if t.visibility != checkpoint::types::Visibility::Public {
+            keep[i] = needed[i];
+        }
+    }
+    let mut i = 0;
+    contract.tensors.retain(|_| {
+        i += 1;
+        keep[i - 1]
+    });
+}
+
+fn outs_of(expr: &Expr, into: &mut Vec<String>) {
+    if let Expr::Out(name) = expr {
+        into.push(name.clone());
+        return;
+    }
+    let _ = expr.clone().map_children(|child| {
+        outs_of(&child, into);
+        Ok(child)
+    });
+}
+
+/// One static input scale for legs joined into `of`, each stating its own
+/// (`names`, one f32 each): the first leg's where they agree, else the
+/// largest, under which no leg's activations overflow (as vLLM fuses them).
+fn input_scale(src: &ztensor::Source, names: &[String], of: &str) -> Result<Expr, Error> {
+    let value = |name: &str| -> Result<f32, Error> {
+        let bytes = src
+            .tensor(name)
+            .ok()
+            .and_then(|t| t.bytes().ok().map(|b| b.into_owned()))
+            .ok_or_else(|| Error::Missing(name.to_string()))?;
+        let word: [u8; 4] = bytes.as_slice().try_into().map_err(|_| Error::Illegible {
+            name: of.to_string(),
+            detail: format!("`{name}` is not one f32"),
+        })?;
+        Ok(f32::from_le_bytes(word))
+    };
+    // A checkpoint of headers alone (a plan's dry run) holds no values: its
+    // legs' first scale stands, as an import that cannot compare them reads.
+    let Ok(values) = names
+        .iter()
+        .map(|n| value(n))
+        .collect::<Result<Vec<_>, _>>()
+    else {
+        return Ok(Expr::src(names[0].clone()));
+    };
+    if values.iter().all(|v| v.to_bits() == values[0].to_bits()) {
+        return Ok(Expr::src(names[0].clone()));
+    }
+    let largest = values.iter().copied().fold(f32::MIN, f32::max);
+    constant(of, &[largest], Vec::new(), checkpoint::types::DType::F32)
+}
+
 /// `contract` with the legs of `join` (each read as its own weight, its
 /// planes beside it) joined along their rows under the joined name, plane by
 /// plane, the legs kept as the internal reads it is made of; nothing where the
 /// codec's rows read them joined already.
-pub fn join_read(contract: &mut ModelContract, join: &crate::Join) -> Result<(), String> {
+pub fn join_read(
+    src: &ztensor::Source,
+    contract: &mut ModelContract,
+    join: &crate::Join,
+) -> Result<(), String> {
     let at = |name: &str| contract.tensors.iter().position(|t| t.name == name);
     if at(&join.name).is_some() {
         return Ok(());
@@ -357,21 +473,46 @@ pub fn join_read(contract: &mut ModelContract, join: &crate::Join) -> Result<(),
                 join.name
             ));
         }
+        // A plane of no axis (a static input scale) is one for the product:
+        // the first leg's, the others the same value.
+        if lead.shape.as_deref() == Some(&[]) {
+            let names: Vec<String> = legs
+                .iter()
+                .map(|t| match &t.expr {
+                    Expr::Src(name) => Ok(name.clone()),
+                    other => Err(format!(
+                        "`{}` reads {other:?}, not one stored scale",
+                        t.name
+                    )),
+                })
+                .collect::<Result<_, _>>()?;
+            let expr = input_scale(src, &names, &join.name).map_err(|why| format!("{why}"))?;
+            made.push(TensorContract {
+                name: format!("{}{plane}", join.name),
+                expr,
+                ..lead.clone()
+            });
+            continue;
+        }
         let shape = legs
             .iter()
             .map(|t| t.shape.clone())
             .collect::<Option<Vec<_>>>()
             .and_then(|shapes| {
+                let at = join.axis as usize;
                 let mut whole = shapes.first()?.clone();
-                *whole.first_mut()? = shapes
+                *whole.get_mut(at)? = shapes
                     .iter()
-                    .map(|s| s.first().copied())
+                    .map(|s| s.get(at).copied())
                     .sum::<Option<i64>>()?;
                 Some(whole)
             });
         made.push(TensorContract {
             name: format!("{}{plane}", join.name),
-            expr: Expr::concat(0, legs.iter().map(|t| Expr::out(t.name.clone())).collect()),
+            expr: Expr::concat(
+                u8::try_from(join.axis).unwrap_or(0),
+                legs.iter().map(|t| Expr::out(t.name.clone())).collect(),
+            ),
             shape,
             encoding: lead.encoding.clone(),
             scales: lead.scales.clone().map(|mut s| {
@@ -1757,6 +1898,17 @@ fn nv_planes(
     let first = parts[0].strip_suffix(".weight").unwrap_or(&parts[0]);
     let input = format!("{first}.input_scale");
     one_f32(src, &input, &w.name)?;
+    // One product quantizes its activations under one static scale.
+    let inputs: Vec<String> = parts
+        .iter()
+        .map(|part| {
+            format!(
+                "{}.input_scale",
+                part.strip_suffix(".weight").unwrap_or(part)
+            )
+        })
+        .collect();
+    let input_expr = input_scale(src, &inputs, &w.name)?;
     let counted = divided(
         &extents(w),
         pairing.channel_axis,
@@ -1782,7 +1934,7 @@ fn nv_planes(
         .offsetting(w.name.clone()),
         TensorContract::new(
             crate::input_scales_name(&w.name),
-            Expr::src(input),
+            input_expr,
             Vec::new(),
             f32_raw,
         ),
@@ -2781,7 +2933,11 @@ mod tests {
         };
         let rows = |value: f32| vec![value; LEG as usize];
         assert_eq!(f32s("proj.global_scales"), [rows(0.5), rows(2.0)].concat());
-        assert_eq!(f32s("proj.input_scales"), [0.25]);
+        assert_eq!(
+            f32s("proj.input_scales"),
+            [0.75],
+            "the larger of the legs' input scales"
+        );
         let codes = &sink.tensors["proj"];
         let half = (LEG * WIDTH / 2) as usize;
         assert!(codes[..half].iter().all(|b| *b == 1) && codes[half..].iter().all(|b| *b == 2));

@@ -91,6 +91,10 @@ pub(crate) fn load_model_engines(
             residency.kv_export = user_cfg.offload.transfer == crate::config::OffloadTransfer::Nixl;
             let devices: Vec<usize> = topology.iter().flatten().copied().collect();
             let rank_opts = cuda_rank_options(user_cfg, 0, &devices, &embedded_base_opts)?;
+            let overrides = runtime::engine::load::Overrides {
+                expert_replicas: Some(e.expert_replicas),
+                ..m.overrides()?
+            };
             group_engines = crate::backend::create_engine_lockstep(
                 &rank_opts,
                 &snapshot_dir,
@@ -101,7 +105,7 @@ pub(crate) fn load_model_engines(
                 residency,
                 m.patch_ceilings(),
                 m.voxel_ceilings(),
-                &m.overrides()?,
+                &overrides,
             )
             .with_context(|| {
                 format!(

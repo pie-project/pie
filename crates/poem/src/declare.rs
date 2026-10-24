@@ -29,6 +29,20 @@ pub struct Weight {
 pub struct Join {
     pub name: String,
     pub legs: Vec<String>,
+    /// The axis their rows run along: 0, or a routed bank's 1.
+    pub axis: u32,
+}
+
+/// What the compiler decides of a deployment's weights that its import
+/// stores accordingly: the weights it joins, and the ones it lays out in the
+/// matrix core's tiled order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Lowering {
+    pub joins: Vec<Join>,
+    pub tiled: Vec<String>,
+    /// The params the deployment's trace reads, by name, where known: a
+    /// layout weight none of them is (or is a plane of) is not stored.
+    pub read: Option<Vec<String>>,
 }
 
 impl Join {
@@ -98,6 +112,10 @@ impl Weight {
         let first = legs
             .first()
             .ok_or_else(|| format!("`{name}` joins no legs"))?;
+        let Shard::Cut { axis, .. } = first.shard else {
+            return Err(format!("`{}` is not cut along its rows", first.name));
+        };
+        let at = axis as usize;
         let mut rows = 0;
         let mut segments = Vec::new();
         let mut heads = Vec::new();
@@ -109,7 +127,7 @@ impl Weight {
                 && leg.placement == first.placement
                 && leg.values.is_none()
                 && leg.shape.len() == first.shape.len()
-                && leg.shape[1..] == first.shape[1..];
+                && (0..leg.shape.len()).all(|i| i == at || leg.shape[i] == first.shape[i]);
             if !alike {
                 return Err(format!(
                     "`{}` and `{}` are not stored alike, so no joined `{name}` holds both",
@@ -117,20 +135,23 @@ impl Weight {
                 ));
             }
             let Shard::Cut {
-                axis: 0,
+                axis: leg_axis,
                 segments: cut,
                 heads: held,
             } = &leg.shard
             else {
                 return Err(format!("`{}` is not cut along its rows", leg.name));
             };
+            if *leg_axis != axis {
+                return Err(format!("`{}` is cut along another axis", leg.name));
+            }
             if !held.is_empty() && held.len() != cut.len() {
                 return Err(format!(
                     "`{}` states heads for some segments only",
                     leg.name
                 ));
             }
-            rows += leg.shape[0];
+            rows += leg.shape[at];
             segments.extend(cut.iter().copied());
             heads.push(held.clone());
         }
@@ -144,12 +165,12 @@ impl Weight {
             ));
         };
         let mut shape = first.shape.clone();
-        shape[0] = rows;
+        shape[at] = rows;
         Ok(Weight {
             name,
             shape,
             shard: Shard::Cut {
-                axis: 0,
+                axis,
                 segments,
                 heads,
             },

@@ -371,6 +371,8 @@ thread_local! {
     static MISSED: RefCell<Option<String>> = const { RefCell::new(None) };
     /// The weights the compiler joins for the deployment being read.
     pub(crate) static JOINS: RefCell<Vec<crate::Join>> = const { RefCell::new(Vec::new()) };
+    /// The weights the compiler lays out tiled for the deployment being read.
+    pub(crate) static TILED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
 }
 
 fn source<R>(f: impl FnOnce(&Snapshot) -> R) -> anyhow::Result<R> {
