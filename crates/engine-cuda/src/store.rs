@@ -1139,6 +1139,12 @@ impl Pools {
         }
     }
 
+    /// Backs a prefix of `bytes` of an arena beside the pool's budget
+    /// (`elastic::commit_beside`).
+    pub(crate) fn commit_beside(&self, arena: &mut Arena, bytes: u64) -> Result<()> {
+        elastic::commit_beside(&self.pool, arena, &elastic::Want::Prefix(bytes))
+    }
+
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
         self.arenas().map(elastic::Arena::committed_bytes).sum()

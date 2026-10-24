@@ -3,14 +3,17 @@ use std::collections::HashMap;
 use poem_ir::{Dim, Dtype, Operands, Operation, Ssm, Trace, Ty, ValueId};
 
 use crate::device::Buffer;
-use crate::device::elastic::Arena;
+use crate::device::elastic::{self, Arena};
 use crate::error::{Fault, Result};
+use crate::run::RsScratch;
 use crate::store::Pools;
 use crate::store::kv::Paging;
 
 pub const PLANE_DTYPE: Dtype = Dtype::Bf16;
 
 const ELEMENT: u64 = 2;
+
+const SCRATCH: &str = "rs extended-run scratch";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Plane {
@@ -43,6 +46,12 @@ impl Planes {
 pub struct Buffers {
     arena: Arena,
     committed_pages: u32,
+    /// The extended run's scratch: a fire's rows and the buffered slots its
+    /// lanes replay ahead of them, a row each at the widest recurrence's
+    /// width. Backed beside the pool as fires reach further, as a kernel's
+    /// slab is, and mapped under the base the fires in flight hold, so a
+    /// growth waits for none of them.
+    scratch: Arena,
     planes: Planes,
     page_tokens: u32,
     slots: u32,
@@ -52,7 +61,16 @@ pub struct Buffers {
 }
 
 impl Buffers {
-    pub fn reserve(trace: &Trace, paging: Paging, pools: &Pools) -> Result<Option<Buffers>> {
+    /// Reserves the page slots `paging` names, and the scratch's range for
+    /// fires of up to `max_rows` rows beside every page slot replayed once.
+    /// A flat arena backs its whole range on its first commit, so its
+    /// scratch is reserved when a fire first asks, for what it asks.
+    pub fn reserve(
+        trace: &Trace,
+        paging: Paging,
+        max_rows: u32,
+        pools: &Pools,
+    ) -> Result<Option<Buffers>> {
         let Some((planes, per_token, layers)) = read(trace, paging.page_size)? else {
             return Ok(None);
         };
@@ -62,9 +80,16 @@ impl Buffers {
             .saturating_mul(u64::from(paging.slots))
             .saturating_mul(u64::from(layers))
             .saturating_mul(ELEMENT);
+        let reach = if elastic::mapped_on_demand() {
+            let rows = max_rows.saturating_add(paging.slots.saturating_mul(paging.page_size));
+            RsScratch::need(rows, ext_row_bytes)
+        } else {
+            0
+        };
         Ok(Some(Buffers {
             arena: pools.reserve_arena(bytes, "rs buffered activations")?,
             committed_pages: 0,
+            scratch: pools.reserve_arena(reach, SCRATCH)?,
             planes,
             page_tokens: paging.page_size,
             slots: paging.slots,
@@ -406,6 +431,35 @@ impl Buffers {
         Ok(())
     }
 
+    /// Whether the scratch's range holds an extended run of `rows_ext`
+    /// rows. Past it [`Buffers::ensure_scratch`] reserves the scratch anew,
+    /// at a base the fires in flight do not hold, so they land first.
+    #[must_use]
+    pub fn scratch_reaches(&self, rows_ext: u32) -> bool {
+        RsScratch::need(rows_ext, self.ext_row_bytes) <= self.scratch.max_bytes()
+    }
+
+    /// Backs the scratch for an extended run of `rows_ext` rows: in place
+    /// within its range, anew past it (a flat arena's first fire, or the
+    /// lanes of one group replaying one buffer, more slots between them
+    /// than the pool holds).
+    pub fn ensure_scratch(&mut self, pools: &Pools, rows_ext: u32) -> Result<()> {
+        let bytes = RsScratch::need(rows_ext, self.ext_row_bytes);
+        if bytes <= self.scratch.committed_bytes() {
+            return Ok(());
+        }
+        if !self.scratch_reaches(rows_ext) {
+            self.scratch = pools.reserve_arena(bytes, SCRATCH)?;
+        }
+        pools.commit_beside(&mut self.scratch, bytes)
+    }
+
+    /// The scratch's base and the bytes of it backed.
+    #[must_use]
+    pub fn scratch(&self) -> (u64, u64) {
+        (self.scratch.base(), self.scratch.committed_bytes())
+    }
+
     /// The page `slot` names across the layers, when it is backed.
     #[must_use]
     pub fn page_span(&self, slot: u32) -> Option<(u64, u64)> {
@@ -413,11 +467,6 @@ impl Buffers {
             let bytes = self.slot_bytes();
             (self.arena.base() + u64::from(slot) * bytes, bytes)
         })
-    }
-
-    #[must_use]
-    pub fn ext_row_bytes(&self) -> u64 {
-        self.ext_row_bytes
     }
 
     pub fn row(&self, plane: Plane, page_slot: u32, row: u32) -> Result<u64> {

@@ -757,7 +757,7 @@ impl Shell {
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
-        let buffers = Buffers::reserve(&boot.trace, paging, &pools)?;
+        let buffers = Buffers::reserve(&boot.trace, paging, budgets.tokens.max_tokens, &pools)?;
         let mut pools = pools;
         if let Some(buffers) = &buffers {
             pools.seat_buffered(buffers.slot_bytes(), buffers.map_unit());
@@ -940,7 +940,6 @@ impl Shell {
             arena,
             pools,
             buffers,
-            rs_scratch: None,
             predicate,
             inputs,
             facts,
