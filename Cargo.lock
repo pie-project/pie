@@ -1875,10 +1875,12 @@ dependencies = [
  "engine",
  "eta-compiler",
  "eta-exec",
+ "inferlet",
  "kernels-cuda",
  "kernels-rocm",
  "libc",
  "memmap2",
+ "pie-eta-dsl",
  "pie-eta-ir",
  "pie-poem",
  "pie-poem-compiler",
@@ -2962,6 +2964,7 @@ name = "inferlet"
 version = "0.5.4"
 dependencies = [
  "blake3",
+ "eta-compiler",
  "inferlet-macros",
  "pie-eta-dsl",
  "serde",

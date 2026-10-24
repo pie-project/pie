@@ -189,6 +189,41 @@ pub fn verify_point_rows(
     }
 }
 
+/// What [`verify_point_rows`] reads, traced into a verify fire's epilogue
+/// so no vocabulary row leaves the device: for `rows` verify rows of
+/// `sampling` (`[rows, vocab]`, the logits the target samples from, after
+/// temperature, penalties and masks), row `j`'s `proposals[j]` (`[rows]`,
+/// i32 or u32), and a Gumbel-max `noise` state, it returns `chances` (`[rows]` f32,
+/// each row's probability of its proposal) and `draws` (`[rows]` i32, each
+/// row's draw with its proposal struck out). The last row has no proposal:
+/// whatever `proposals` holds there is ignored, and its draw is the plain
+/// one past the last proposal, so `draws[rows - 1]` is the bonus.
+pub fn point_rows(
+    sampling: &eta_dsl::Tensor,
+    proposals: &eta_dsl::Tensor,
+    rows: u32,
+    vocab: u32,
+    noise: &eta_dsl::Tensor,
+) -> (eta_dsl::Tensor, eta_dsl::Tensor) {
+    use eta_dsl::prelude::*;
+    let probs = softmax(sampling);
+    let chances = scalar_gather(&probs, cast(proposals, dtype::u32));
+    let proposals = cast(proposals, dtype::i32);
+    let ids = broadcast(
+        reshape(cast(iota(vocab), dtype::i32), [1, vocab]),
+        [rows, vocab],
+    );
+    let proposed = eq(&ids, broadcast(&proposals, [rows, vocab]));
+    let has_proposal = lt(iota(rows), broadcast(rows - 1, [rows]));
+    let struck = and(&proposed, broadcast(&has_proposal, [rows, vocab]));
+    let residual = select(
+        &struck,
+        broadcast(f32::NEG_INFINITY, [rows, vocab]),
+        sampling,
+    );
+    (chances, gumbel_max(&residual, noise))
+}
+
 /// `row[token]`, or nothing for a token past the row.
 fn chance(row: &[f32], token: u32) -> f64 {
     row.get(token as usize).copied().map_or(0.0, f64::from)
@@ -474,6 +509,124 @@ mod tests {
             let u = a.uniform();
             assert!((0.0..1.0).contains(&u));
             assert_eq!(u.to_bits(), b.uniform().to_bits());
+        }
+    }
+
+    /// The interpreter's run of `point_rows` over fixed logits: each step's
+    /// chances, and each row's draw, over `steps` steps of one Gumbel stream.
+    fn landed(logits: &[f32], proposals: [i32; 3], steps: usize) -> (Vec<f32>, Vec<[u32; 3]>) {
+        use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
+        use eta_dsl::eta::registry::ModelProfile;
+        use eta_dsl::eta::validate::bind;
+        use eta_dsl::prelude::*;
+        const ROWS: u32 = 3;
+        let vocab = (logits.len() / ROWS as usize) as u32;
+        let leak = |c: Channel| -> &'static Channel { Box::leak(Box::new(c)) };
+        let tok = leak(Channel::new([ROWS], dtype::i32).named("tok"));
+        let indptr = leak(Channel::from([0u32, ROWS]).named("indptr"));
+        let kv_len = leak(Channel::from([ROWS]).named("kv_len"));
+        let positions = leak(Channel::from([0u32, 1, 2]).named("positions"));
+        let readout = leak(Channel::from([0u32, 1, 2]).named("readout"));
+        let props = leak(Channel::from(proposals).named("props"));
+        let rng = leak(Channel::from([9u32, 0]).named("rng"));
+        let chances = leak(Channel::new([ROWS], dtype::f32).named("chances"));
+        let draws = leak(Channel::new([ROWS], dtype::i32).named("draws"));
+        tok.put(proposals);
+        let mut b = Builder::new(vocab, 4);
+        b.bind_port(Port::EmbedTokens, tok);
+        b.bind_port(Port::EmbedIndptr, indptr);
+        b.bind_port(Port::KvLen, kv_len);
+        b.bind_port(Port::Positions, positions);
+        b.bind_port(Port::Readout, readout);
+        b.stage(Stage::Epilogue, move || {
+            tok.put(tok.take());
+            positions.put(positions.take());
+            let r = rng.take();
+            let logits = reshape(intrinsics::logits(), [ROWS, vocab]);
+            let (c, d) = point_rows(&logits, &props.read(), ROWS, vocab, &r);
+            chances.put(c);
+            draws.put(d);
+            rng.put(&r + Tensor::constant([0u32, 1u32]));
+        });
+        chances.note_host_take();
+        draws.note_host_take();
+        let traced = b.build().expect("the epilogue traces");
+        let profile = ModelProfile {
+            vocab,
+            page_size: 4,
+            num_layers: 2,
+            ..ModelProfile::dummy()
+        };
+        let bound = bind(traced.container().clone(), profile).expect("the trace binds");
+        let names = traced.channel_names();
+        let at = |name: &str| names.iter().position(|n| n == name).unwrap() as u32;
+        let seeds = [
+            (at("tok"), Value::I32(proposals.to_vec())),
+            (at("indptr"), Value::U32(vec![0, ROWS])),
+            (at("kv_len"), Value::U32(vec![ROWS])),
+            (at("positions"), Value::U32(vec![0, 1, 2])),
+            (at("readout"), Value::U32(vec![0, 1, 2])),
+            (at("props"), Value::I32(proposals.to_vec())),
+            (at("rng"), Value::U32(vec![9, 0])),
+        ];
+        let mut instance = Instance::new(&bound, &seeds).expect("the trace instantiates");
+        let inputs = PassInputs {
+            logits: Some(Value::F32(logits.to_vec())),
+            ..Default::default()
+        };
+        let (mut first, mut out) = (Vec::new(), Vec::new());
+        for _ in 0..steps {
+            instance
+                .step(&bound, &inputs, &mut NoKernels)
+                .expect("a step runs");
+            let Value::F32(c) = instance.host_take(&bound, at("chances")).unwrap() else {
+                panic!("chances are f32");
+            };
+            let Value::I32(d) = instance.host_take(&bound, at("draws")).unwrap() else {
+                panic!("draws are i32");
+            };
+            if first.is_empty() {
+                first = c;
+            }
+            out.push([d[0] as u32, d[1] as u32, d[2] as u32]);
+        }
+        (first, out)
+    }
+
+    #[test]
+    fn a_verify_fire_lands_each_rows_chance_and_its_struck_out_draw() {
+        const STEPS: usize = 20_000;
+        const LOOSE: f64 = 0.02;
+        let logits: [f32; 12] = [
+            0.0, 1.0, 2.0, -1.0, //
+            1.5, 0.5, 0.0, 0.25, //
+            -0.5, 0.0, 0.5, 1.0,
+        ];
+        let proposals = [2, 0, 3];
+        let softmax = |row: &[f32]| -> Vec<f64> {
+            let total: f64 = row.iter().map(|&v| f64::from(v).exp()).sum();
+            row.iter().map(|&v| f64::from(v).exp() / total).collect()
+        };
+        let (chances, draws) = landed(&logits, proposals, STEPS);
+        for row in 0..3 {
+            let p = softmax(&logits[row * 4..row * 4 + 4]);
+            let x = proposals[row] as usize;
+            assert!((f64::from(chances[row]) - p[x]).abs() < 1e-5, "{chances:?}");
+            // The last row strikes nothing: its draw is the plain one.
+            let struck = if row < 2 { p[x] } else { 0.0 };
+            for (v, &pv) in p.iter().enumerate() {
+                let want = if row < 2 && v == x {
+                    0.0
+                } else {
+                    pv / (1.0 - struck)
+                };
+                let got =
+                    draws.iter().filter(|d| d[row] as usize == v).count() as f64 / STEPS as f64;
+                assert!(
+                    (got - want).abs() < LOOSE,
+                    "row {row} token {v}: {got} vs {want}"
+                );
+            }
         }
     }
 }

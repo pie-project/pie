@@ -64,6 +64,8 @@ device = []
 windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
 
 [dev-dependencies]
+eta-dsl = { package = "pie-eta-dsl", path = "../eta-dsl" }
+inferlet = { path = "../inferlet" }
 poem = { package = "pie-poem", path = "../poem" }
 tokenizer = { path = "../tokenizer" }
 ztensor = { workspace = true }
