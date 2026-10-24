@@ -49,11 +49,6 @@ struct Input {
     verify_rows: u32,
     #[serde(default)]
     block: Option<u32>,
-    /// Bind no mask to the draft fire. The runtime then stamps the whole
-    /// extent on the block lane and reads it both ways, which is the mask
-    /// this loop would build, without building it on the guest every round.
-    #[serde(default)]
-    no_mask: bool,
     #[serde(default)]
     margin_width: bool,
     #[serde(default)]
@@ -526,7 +521,6 @@ async fn main(input: Input) -> Result<Output> {
         .unwrap_or(BLOCK_ROWS)
         .max(2);
     let mask_token = advertised.map_or(MASK_TOKEN, |d| d.mask_token as i32);
-    let bind_mask = !input.no_mask && advertised.is_none_or(|d| d.bidirectional);
     // The first block row whose pick is a proposal: 1 when the anchor row
     // proposes nothing (DFlash), 0 when it proposes the next token (DSpark).
     let from = advertised.map_or(1, |d| d.proposals_from) as usize;
@@ -705,9 +699,6 @@ async fn main(input: Input) -> Result<Output> {
             let indptr = Channel::from([0u32, block]).named("embed_indptr_d");
             let slots = Channel::from_iter(held..held + block).named("slots_d");
             let kv_len = Channel::from([held + block]).named("kv_len_d");
-            // The drafter attends bidirectionally over the block.
-            let visible = vec![true; (block * (held + block)) as usize];
-            let mask = Channel::from_shaped([block, held + block], visible).named("mask_d");
             // A DFlash2 head's selector picks one row per block row, so the
             // readout covers the block; the proposals are cut to the verify
             // width afterwards.
@@ -736,7 +727,6 @@ async fn main(input: Input) -> Result<Output> {
                 StateGeometry {
                     slots: Some(&slots),
                     kv_len: Some(&kv_len),
-                    mask: if bind_mask { Some(&mask) } else { None },
                     ..StateGeometry::default()
                 },
             )?;

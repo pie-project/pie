@@ -18,7 +18,7 @@ fn non_causal(op: &Operation) -> bool {
         op,
         Operation::Attn(Attn::Prefill {
             causal: false,
-            mask: Some(_),
+            mask: None,
             selection: None,
             bias: None,
             lse: None,

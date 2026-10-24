@@ -7,7 +7,9 @@ pub struct LaneMask<'a> {
     pub mask: Option<&'a Masking>,
     pub have: u32,
     pub rows: u32,
-    pub bidirectional: bool,
+    /// The lane's class attends both ways: no causal bound clips its mask,
+    /// and without one every key the lane holds is kept.
+    pub wide: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -17,7 +19,7 @@ pub struct Staged {
 }
 
 pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
-    if lanes.iter().all(|lane| lane.mask.is_none()) {
+    if lanes.iter().all(|lane| lane.mask.is_none() && !lane.wide) {
         return Ok(None);
     }
     let mut bits: Vec<u8> = Vec::new();
@@ -25,6 +27,15 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
     indptr.push(0);
     for (at, lane) in lanes.iter().enumerate() {
         let kv = u64::from(lane.have) + u64::from(lane.rows);
+        if lane.mask.is_none() && lane.wide {
+            let cells = u64::from(lane.rows) * kv;
+            let bytes = usize::try_from(cells.div_ceil(8)).unwrap_or(usize::MAX);
+            let base = bits.len();
+            bits.resize(base + bytes, 0);
+            for cell in 0..cells {
+                bits[base + (cell / 8) as usize] |= 1 << (cell % 8);
+            }
+        }
         if let Some(masking) = lane.mask {
             let stated: &[Mask] = masking.masks();
             if let Some(bad) = stated.iter().find(|mask| mask.total < kv) {
@@ -60,7 +71,7 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                         let end = at_position.saturating_add(u64::from(run)).min(kv);
                         if index % 2 == 1 {
                             for key in at_position..end {
-                                let first = if lane.bidirectional {
+                                let first = if lane.wide {
                                     0
                                 } else {
                                     key.saturating_sub(u64::from(lane.have))
@@ -79,7 +90,7 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                 Masking::Rows(rows) => {
                     for (q, mask) in rows.iter().enumerate() {
                         let q = q as u64;
-                        let bound = if lane.bidirectional {
+                        let bound = if lane.wide {
                             kv
                         } else {
                             u64::from(lane.have) + q
@@ -121,6 +132,7 @@ mod tests {
         the_runs_and_the_causal_bound_intersect();
         a_windowed_prefill_expands_row_by_row();
         a_mask_short_of_its_lanes_extent_is_refused();
+        a_wide_lane_keeps_every_key_its_mask_shows();
     }
 
     fn the_runs_and_the_causal_bound_intersect() {
@@ -129,7 +141,7 @@ mod tests {
             mask: Some(&mask),
             have: 2,
             rows: 3,
-            bidirectional: false,
+            wide: false,
         }])
         .expect("the mask covers the lane's extent")
         .expect("a masked fire stages bits");
@@ -154,7 +166,7 @@ mod tests {
             mask: Some(&mask),
             have: 0,
             rows: N as u32,
-            bidirectional: false,
+            wide: false,
         }])
         .expect("every row covers the lane's extent")
         .expect("a masked fire stages bits");
@@ -176,7 +188,7 @@ mod tests {
             mask: Some(&mask),
             have: 7,
             rows: 1,
-            bidirectional: false,
+            wide: false,
         }]);
         assert!(
             matches!(
@@ -189,5 +201,31 @@ mod tests {
             ),
             "a 4-position mask on an 8-position lane is refused: {refused:?}"
         );
+    }
+
+    fn a_wide_lane_keeps_every_key_its_mask_shows() {
+        let mask = Masking::Extent(Mask::new(vec![1, 4], 5));
+        let staged = stage(&[
+            LaneMask {
+                mask: None,
+                have: 2,
+                rows: 3,
+                wide: true,
+            },
+            LaneMask {
+                mask: Some(&mask),
+                have: 2,
+                rows: 3,
+                wide: true,
+            },
+        ])
+        .expect("both lanes cover their extent")
+        .expect("a wide fire stages bits");
+        for q in 0..3u64 {
+            for k in 0..5u64 {
+                assert!(keeps(&staged, 0, 5, q, k), "maskless cell ({q}, {k})");
+                assert_eq!(keeps(&staged, 1, 5, q, k), k >= 1, "masked cell ({q}, {k})");
+            }
+        }
     }
 }

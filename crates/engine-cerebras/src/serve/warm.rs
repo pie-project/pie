@@ -43,6 +43,7 @@ impl Shell {
         let plain = |shell: &Shell, word: u64| {
             classes.class_of(word & classes.mask).is_some_and(|class| {
                 !shell.masked.contains(class)
+                    && !shell.wide.contains(class)
                     && !shell.corrected.contains(class)
                     && !shell.capturing.contains(class)
             })

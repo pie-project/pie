@@ -97,7 +97,6 @@ struct Owned {
     clip: Option<([u32; 3], Vec<u8>)>,
     media: Option<OwnedMedia>,
     kv_less: bool,
-    bidirectional: bool,
     /// A block drafter reads every row back.
     readout: Option<Vec<u32>>,
 }
@@ -232,7 +231,6 @@ impl Shell {
             seated.stream = lane_owned.stream;
             seated.ports = &cells[at];
             seated.kv_less = lane_owned.kv_less;
-            seated.bidirectional = lane_owned.bidirectional;
             seated.readout = lane_owned.readout.as_deref();
             seated.self_cond =
                 lane_owned
@@ -338,7 +336,6 @@ impl Shell {
                 .then(|| Masking::Extent(Mask::new(vec![0, rows], u64::from(rows)))),
             adapter: self.corrected.contains(class).then_some(0),
             captures: self.capturing.contains(class),
-            bidirectional: request.drafts_a_block(),
             readout: request.drafts_a_block().then(|| (0..rows).collect()),
             stream: request.stream().code(),
             ports,

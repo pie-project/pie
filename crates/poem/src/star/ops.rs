@@ -980,6 +980,7 @@ pub(crate) static OPS: &[Op] = &[
             "sm_scale",
             "window",
             "sinks",
+            "causal",
             "mask",
             "scores",
             "scores_seam",
@@ -997,6 +998,7 @@ pub(crate) static OPS: &[Op] = &[
             let sm_scale: f32 = a.next()?;
             let window: Option<u32> = a.next()?;
             let sinks: Option<Weight> = a.next()?;
+            let causal: Option<Predicate> = a.next()?;
             let mask: Option<bool> = a.next()?;
             let scores: Option<bool> = a.next()?;
             let scores_seam: Option<bool> = a.next()?;
@@ -1016,6 +1018,7 @@ pub(crate) static OPS: &[Op] = &[
                         sm_scale,
                         window,
                         sinks.as_ref(),
+                        causal.as_ref(),
                         mask.unwrap_or(false),
                         scores.unwrap_or(false),
                         scores_seam,

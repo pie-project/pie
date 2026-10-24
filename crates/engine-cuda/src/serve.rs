@@ -72,6 +72,7 @@ pub struct Shell {
     facts: kv::Facts,
     spaces: usize,
     masked: poem_ir::ClassSet,
+    wide: poem_ir::ClassSet,
     feeds: crate::exports::Feeds,
     corrected: poem_ir::ClassSet,
     decoding: poem_ir::ClassSet,
@@ -645,6 +646,14 @@ impl Shell {
 
     fn keyable_units(compiled: &CompiledModel) -> bool {
         compiled.units.len() <= 2
+    }
+
+    /// Whether the class of `word` attends both ways.
+    pub(crate) fn wide(&self, word: u64) -> bool {
+        let classes = &self.compiled.classes;
+        classes
+            .class_of(word & classes.mask)
+            .is_some_and(|class| self.wide.contains(class))
     }
 
     fn lane_ceiling(&self) -> u32 {

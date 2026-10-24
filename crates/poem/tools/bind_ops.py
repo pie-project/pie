@@ -34,6 +34,7 @@ PARAMS = {
     "Option<bool>": ("Option<bool>", "{}"),
     "Option<&Value>": ("Option<Value>", "{}.as_ref()"),
     "Option<&Weight>": ("Option<Weight>", "{}.as_ref()"),
+    "Option<&Predicate>": ("Option<Predicate>", "{}.as_ref()"),
     "Option<(u32, f32)>": ("Option<(u32, f32)>", "{}"),
     "[u32; 3]": ("[u32; 3]", "{}"),
     "[u32; 4]": ("[u32; 4]", "{}"),

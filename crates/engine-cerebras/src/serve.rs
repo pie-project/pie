@@ -154,8 +154,6 @@ pub struct Seated<'a> {
 
     pub media: Option<Media<'a>>,
 
-    pub bidirectional: bool,
-
     /// The float ports this lane feeds, cells already read off its channels.
     pub ports: &'a [PortCell<'a>],
 
@@ -206,7 +204,6 @@ impl<'a> Seated<'a> {
             captures_scores: false,
             rs: &FOLD,
             media: None,
-            bidirectional: false,
             ports: &[],
             stream: 0,
             group: None,
@@ -264,6 +261,7 @@ pub struct Shell {
     capturing: poem_ir::ClassSet,
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
     masked: poem_ir::ClassSet,
+    wide: poem_ir::ClassSet,
     corrected: poem_ir::ClassSet,
     adapter_fact: Option<u32>,
     adapters: crate::adapter::Slots,
@@ -508,6 +506,12 @@ impl Shell {
                         ..
                     }
                 )
+            )
+        });
+        let wide = classes_running(&boot.trace, &compiled, |op| {
+            matches!(
+                op,
+                poem_ir::Operation::Attn(poem_ir::Attn::Prefill { causal: false, .. })
             )
         });
         let corrected = classes_running(&boot.trace, &compiled, |op| {
@@ -755,6 +759,7 @@ impl Shell {
             capturing,
             rs_layout,
             masked,
+            wide,
             corrected,
             adapter_fact,
             adapters,
@@ -1127,7 +1132,6 @@ impl Shell {
                 || seated.adapter.is_some()
                 || seated.captures_scores
                 || seated.kv_less
-                || seated.bidirectional
                 || seated.readout.is_some()
                 || !seated.ports.is_empty()
                 || seated.self_cond.is_some()
@@ -1139,6 +1143,7 @@ impl Shell {
             let word = seated.lane.word;
             let class = classes.class_of(word & classes.mask)?;
             if self.masked.contains(class)
+                || self.wide.contains(class)
                 || self.corrected.contains(class)
                 || self.capturing.contains(class)
             {
@@ -1287,7 +1292,7 @@ impl Shell {
                     mask: None,
                     have: 0,
                     rows: row.rows,
-                    bidirectional: false,
+                    wide: false,
                 });
                 slot_ids.push(sink_slot as i32);
                 for at in 0..row.rows {
@@ -1376,7 +1381,7 @@ impl Shell {
                 mask: seated.mask,
                 have,
                 rows: row.rows,
-                bidirectional: seated.bidirectional,
+                wide: self.wide.contains(row.class as usize),
             });
             let runs_capture_arm = self.capturing.contains(row.class as usize);
             if seated.captures_scores && self.capturing.is_empty() {

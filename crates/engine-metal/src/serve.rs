@@ -164,7 +164,6 @@ pub struct Seated<'a> {
     pub pages: &'a [u32],
     pub held: Option<u32>,
     pub mask: Option<&'a Masking>,
-    pub bidirectional: bool,
     pub self_cond: Option<&'a engine::fire::SelfCondInput>,
     pub adapter: Option<u32>,
     pub positions: &'a [u32],
@@ -191,7 +190,6 @@ impl<'a> Seated<'a> {
             pages: &[],
             held: None,
             mask: None,
-            bidirectional: false,
             self_cond: None,
             adapter: None,
             positions: &[],
@@ -313,6 +311,7 @@ pub struct Shell {
     copies: bool,
     last: FireCost,
     masked: poem_ir::ClassSet,
+    wide: poem_ir::ClassSet,
     corrected: poem_ir::ClassSet,
     adapter_fact: Option<u32>,
     adapters: crate::adapter::Slots,
@@ -489,6 +488,23 @@ impl PreparedLoad<'_> {
             if runs_masked {
                 for class in region.mask.iter() {
                     masked.insert(class);
+                }
+            }
+        }
+        let mut wide = poem_ir::ClassSet::default();
+        for region in compiled.template() {
+            let runs_wide = region.nodes.clone().any(|node| {
+                matches!(
+                    boot.trace.nodes.get(node as usize).map(|node| &node.op),
+                    Some(poem_ir::Operation::Attn(poem_ir::Attn::Prefill {
+                        causal: false,
+                        ..
+                    }))
+                )
+            });
+            if runs_wide {
+                for class in region.mask.iter() {
+                    wide.insert(class);
                 }
             }
         }
@@ -1132,6 +1148,7 @@ impl PreparedLoad<'_> {
             copies: false,
             last: FireCost::default(),
             masked,
+            wide,
             adapter_fact,
             adapters: adapter_slots,
             blobs: crate::blob::Store::new(),
@@ -2915,7 +2932,7 @@ impl Shell {
                 mask: masking,
                 have,
                 rows: row.rows,
-                bidirectional: seated.bidirectional,
+                wide: self.wide.contains(row.class as usize),
             });
             let runs_correction = self.corrected.contains(row.class as usize);
             if seated.adapter.is_some() && self.corrected.is_empty() {

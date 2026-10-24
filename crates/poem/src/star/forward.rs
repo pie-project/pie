@@ -543,8 +543,8 @@ fn facts(builder: &mut GlobalsBuilder) {
         Ok(PredicateValue(fact::scores()))
     }
 
-    fn bidirectional() -> anyhow::Result<PredicateValue> {
-        Ok(PredicateValue(fact::bidirectional()))
+    fn denoise() -> anyhow::Result<PredicateValue> {
+        Ok(PredicateValue(fact::denoise()))
     }
 
     fn encode() -> anyhow::Result<PredicateValue> {

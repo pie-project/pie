@@ -1,5 +1,6 @@
 use super::conv::{expect_grid, expect_voxels};
 use super::*;
+use crate::fact::Predicate;
 use crate::forward::Input;
 use poem_ir::{Blocks, Relative, VoxelSegment};
 
@@ -154,10 +155,10 @@ pub fn decode(
     (o, lse)
 }
 
-/// Each row's query against its lane's paged keys, causally; or, given
-/// `mask`, as the mask lets it (and causally too where `causal`). `floor`,
-/// each row's least window position, below which the window reads no key.
-/// A selection, a relative bias and `lse` as [`decode`]'s.
+/// Each row's query against its lane's paged keys: causally where `causal`,
+/// else every key the lane holds; given `mask`, only the keys the mask lets
+/// it. `floor`, each row's least window position, below which the window
+/// reads no key. A selection, a relative bias and `lse` as [`decode`]'s.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill(
     q: &Value,
@@ -178,10 +179,6 @@ pub fn prefill(
     extent: Option<u32>,
     log_scaling: Option<(u32, f32)>,
 ) -> (Value, Option<Value>) {
-    assert!(
-        causal || mask.is_some(),
-        "a prefill reads causally unless a mask states what each row sees"
-    );
     let selected = blocks(selection, ratio, per_head);
     let rel = relative(bias, extent, log_scaling);
     let r = q.rec();
@@ -1118,8 +1115,9 @@ pub fn voxel_over(
     o
 }
 
-/// Attention of `q` over the kv row `kv`, each lane by its kind: a lane with
-/// its own mask by that mask (when the model opens `mask`), a lane capturing
+/// Attention of `q` over the kv row `kv`, each lane by its kind: a lane
+/// `causal` does not hold for over every key it holds, a lane with its own
+/// mask by that mask (when the model opens `mask`), a lane capturing
 /// scores by its own arm (when it opens `scores`), its log-sum-exp read out
 /// at the scores seam where `scores_seam` holds, a lane querying one token by
 /// decode, and the rest by prefill. The kinds are taken in that order, each
@@ -1143,6 +1141,7 @@ pub fn attend(
     sm_scale: f32,
     window: Option<u32>,
     sinks: Option<&Weight>,
+    causal: Option<&Predicate>,
     mask: bool,
     scores: bool,
     scores_seam: Option<bool>,
@@ -1163,6 +1162,7 @@ pub fn attend(
     use crate::fact;
     use crate::record::{FirstMatch, Refine};
 
+    let wide = causal.map(|causal| !causal.clone());
     let pages = inputs.kv(kv);
     let rec = inputs.recorder();
     let plan = |decode: bool, lanes: &Input| {
@@ -1183,6 +1183,7 @@ pub fn attend(
     let lanes = |kind: Option<fact::Predicate>| {
         let mut first = FirstMatch::default();
         let mut cases = Vec::new();
+        cases.extend(wide.clone());
         if mask {
             cases.push(fact::has(fact::Mask));
         }
@@ -1223,6 +1224,34 @@ pub fn attend(
     };
     let mut first = FirstMatch::default();
     let mut arms = Vec::new();
+    if let Some(wide) = &wide
+        && let Some(q) = rows_of(first.case(rec.guard_of(wide)))
+    {
+        let p = plan(false, &lanes(Some(wide.clone())));
+        let (o, lse) = prefill(
+            &q,
+            &p,
+            pages,
+            window,
+            head_dim,
+            kv_heads,
+            sm_scale,
+            sinks.is_some(),
+            None,
+            false,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+        arms.push(match lse {
+            Some(lse) => sunk((o, lse)),
+            None => o,
+        });
+    }
     if mask && let Some(q) = rows_of(first.case(rec.guard_of(&fact::has(fact::Mask)))) {
         let masks = inputs.whole_mask();
         let p = plan(false, &lanes(Some(fact::has(fact::Mask))));

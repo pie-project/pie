@@ -272,6 +272,17 @@ pub(crate) fn masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir
     })
 }
 
+/// The classes attending both ways: running a prefill that is not causal.
+#[must_use]
+pub(crate) fn wide_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
+    classes_running(trace, compiled, |op| {
+        matches!(
+            op,
+            poem_ir::Operation::Attn(poem_ir::Attn::Prefill { causal: false, .. })
+        )
+    })
+}
+
 #[must_use]
 pub(crate) fn corrected_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
     classes_running(trace, compiled, |op| {

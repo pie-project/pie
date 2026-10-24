@@ -1240,7 +1240,6 @@ impl Xla {
                 captures_scores: lane.captures_scores,
                 rs: &verbs[at],
                 media: media_of[at],
-                bidirectional: lane.bidirectional,
                 ports: &port_cells[at],
                 stream: lane.stream as u8,
                 group: lane.group,

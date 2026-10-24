@@ -290,7 +290,19 @@ fn land(
     }
     let deployment = request.trace.name.clone();
     let disk_kv_dir = request.residency.disk_kv_dir.clone();
+    let wide = request.trace.nodes.iter().any(|node| {
+        matches!(
+            node.op,
+            poem_ir::Operation::Attn(poem_ir::Attn::Prefill { causal: false, .. })
+        )
+    });
     let loaded = backend.load(request).map_err(anyhow::Error::from)?;
+    if wide && !loaded.caps.bidirectional_attention {
+        return Err(anyhow!(
+            "{deployment} attends both ways (a prefill that is not causal), and this \
+             engine's attention applies its own causal bound and cannot lift it"
+        ));
+    }
     Ok((loaded, deployment, disk_kv_dir))
 }
 

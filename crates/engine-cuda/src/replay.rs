@@ -61,13 +61,14 @@ impl Replay {
 
     /// `step` as the encoder-only step to fire first and the step to fire
     /// after it, where a lane of it is a prompt longer than the window;
-    /// `None` where none is.
+    /// `None` where none is. `wide` says whether a word's class attends both
+    /// ways.
     #[must_use]
-    pub fn split(self, step: &Step) -> Option<(Step, Step)> {
+    pub fn split(self, step: &Step, wide: impl Fn(u64) -> bool) -> Option<(Step, Step)> {
         let window = self.window as usize;
         let cuts: Vec<Option<usize>> = (0..step.lanes.len())
             .map(|at| {
-                self.cuts(step, at)
+                self.cuts(step, at, &wide)
                     .then(|| step.lanes[at].tokens.len() - window)
             })
             .collect();
@@ -110,7 +111,7 @@ impl Replay {
     /// Whether lane `at` of `step` is a plain prompt longer than the window (no mask,
     /// scores, draft, conditioning, media or resolved ports; pages stated; readouts
     /// in its last window). Its program and channels ride the second fire.
-    fn cuts(self, step: &Step, at: usize) -> bool {
+    fn cuts(self, step: &Step, at: usize, wide: impl Fn(u64) -> bool) -> bool {
         let lane = &step.lanes[at];
         let window = self.window as usize;
         let rows = lane.tokens.len();
@@ -122,7 +123,7 @@ impl Replay {
             && lane.adapter.is_none()
             && !lane.captures_scores
             && !lane.block_draft
-            && !lane.bidirectional
+            && !wide(lane.word)
             && lane.self_cond.is_none()
             && matches!(lane.rs, RsVerb::Fold)
             && lane.ports.is_empty()
@@ -180,7 +181,7 @@ mod tests {
             ..Step::default()
         };
         let (head, tail) = replay
-            .split(&step)
+            .split(&step, |_| false)
             .expect("two prompts are longer than the window");
         assert_eq!(head.lanes.len(), 2);
         assert!(head.attachments.is_empty());
@@ -223,6 +224,6 @@ mod tests {
             lanes: vec![read],
             ..Step::default()
         };
-        assert!(replay.split(&step).is_none());
+        assert!(replay.split(&step, |_| false).is_none());
     }
 }

@@ -1376,7 +1376,7 @@ def forward(m, inputs):
     head = m.embed if m.head == None else m.head
     hb = None
     if dr != None:
-        hb = arm(dr, inputs, fused, h_block, mask, block_rows(dr))
+        hb = arm(dr, inputs, fused, h_block, block_rows(dr))
         x = merge([hb, x])
     x = ops.gather.gather_rows(x, inputs.readout_rows())
     # Bonsai's output head is stored rotated: its input turns with it.

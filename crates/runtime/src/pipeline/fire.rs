@@ -602,7 +602,6 @@ fn plain_lane(lane: &::engine::Lane) -> bool {
         && lane.adapter.is_none()
         && !lane.drafts
         && !lane.block_draft
-        && !lane.bidirectional
         && lane.self_cond.is_none()
         && lane.ports.is_empty()
         && !lane.kv_less
@@ -1536,20 +1535,13 @@ pub(crate) async fn drain_pipeline_fires<C: FireContext>(
     }
 }
 
-fn stamp_denoise(
+fn stamp_self_cond(
     req: &mut crate::engine::FireRequest,
     payload: Option<crate::pipeline::instance::SelfCondPayload>,
 ) -> Result<(), String> {
     let wanted: usize = req.lanes.iter().map(|lane| lane.tokens.len()).sum();
     let mut cursor = 0usize;
     for lane in &mut req.lanes {
-        lane.bidirectional = true;
-        if lane.mask.is_none() {
-            lane.mask = Some(::engine::Masking::Extent(::engine::Mask::new(
-                vec![0, u32::MAX],
-                u64::from(u32::MAX),
-            )));
-        }
         if let Some(payload) = &payload
             && let Some((rows_channel, weights_channel)) = payload.channels
         {
@@ -1589,27 +1581,6 @@ fn stamp_denoise(
     Ok(())
 }
 
-/// A drafted block of a drafter whose attention reads the mask attends every
-/// row before it and every row of the block, so a block lane its inferlet sent
-/// without a mask carries that whole extent, as a denoise lane does.
-fn stamp_block_masks(req: &mut crate::engine::FireRequest) {
-    if !crate::model::model().eta_caps().draft_bidirectional {
-        return;
-    }
-    for lane in &mut req.lanes {
-        if !lane.block_draft {
-            continue;
-        }
-        lane.bidirectional = true;
-        if lane.mask.is_none() {
-            lane.mask = Some(::engine::Masking::Extent(::engine::Mask::new(
-                vec![0, u32::MAX],
-                u64::from(u32::MAX),
-            )));
-        }
-    }
-}
-
 /// `device_rows`, when given, are the rows each lane carries on the device:
 /// a pooled pass stages no host tokens, and its words still state its rows,
 /// so a single-token lane takes the decode branch.
@@ -1617,6 +1588,7 @@ fn stamp_lane_words(
     req: &mut crate::engine::FireRequest,
     fire_wide_mask: bool,
     carries_media: bool,
+    denoise: bool,
     device_rows: Option<&[u32]>,
 ) {
     let model = crate::model::model();
@@ -1632,7 +1604,7 @@ fn stamp_lane_words(
             lane.captures_scores,
             carries_media,
             lane.block_draft,
-            lane.bidirectional,
+            denoise,
             crate::pipeline::instance::stream_of_lane(lane.stream),
             lane.reading,
         );
@@ -2331,9 +2303,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
         if let Err(error) = attn_mask.apply_to(&mut req) {
             return Ok(Err(format!("pipeline: fire attention mask: {error}")));
         }
-        {
+        // A denoise pass's rows read one another: it is never cut, keyed or
+        // logged by its tokens.
+        let denoise = {
             let pass = ctx.resources().get_mut(&fwd)?;
-            if pass.bindings.canvas == Some(crate::pipeline::instance::CanvasMode::Denoise) {
+            let denoise =
+                pass.bindings.canvas == Some(crate::pipeline::instance::CanvasMode::Denoise);
+            if denoise {
                 let payload = if pass
                     .bindings
                     .self_cond
@@ -2344,13 +2320,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 } else {
                     pass.bindings.self_cond.take()
                 };
-                if let Err(error) = stamp_denoise(&mut req, payload) {
+                if let Err(error) = stamp_self_cond(&mut req, payload) {
                     return Ok(Err(format!("pipeline: self-conditioning: {error}")));
                 }
             }
-        }
-        stamp_block_masks(&mut req);
-        stamp_lane_words(&mut req, fire_wide_mask, carries_media, None);
+            denoise
+        };
+        stamp_lane_words(&mut req, fire_wide_mask, carries_media, denoise, None);
         if !matched.is_empty() {
             let lane_rows: Vec<u32> = req
                 .lanes
@@ -2412,6 +2388,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
         let (attention_stages, adapted) = hook_program_of(ctx, &fwd)?;
         let hooked = attention_stages || adapted;
         let keyable = decode_envelope.is_none()
+            && !denoise
             && groups.len() == 1
             && !hooked
             && !carries_media
@@ -2419,6 +2396,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             && !p_reads_mtp_logits
             && req.max_layers.is_none();
         let cuttable = decode_envelope.is_none()
+            && !denoise
             && !attention_stages
             && (!adapted || crate::model::model().eta_caps().adapter_attachments)
             && !fire_wide_mask
@@ -2511,7 +2489,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // What was mapped in is skipped: the pass runs from there.
             let rows = u32::try_from(full.lanes[0].tokens.len()).unwrap_or(u32::MAX);
             full = rows_of_lanes(&full, &[Some((supplied, rows))], true, page_size);
-            stamp_lane_words(&mut full, false, false, None);
+            stamp_lane_words(&mut full, false, false, false, None);
             pass_slots = pass_slots.map(|slots| slots[supplied as usize..].to_vec());
             let total = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
                 kv.supplied_tokens(ws.id)
@@ -2629,7 +2607,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             } else {
                 let mut rows = rows_of_lanes(&full, piece, last, page_size);
                 let media = !rows.media.is_empty();
-                stamp_lane_words(&mut rows, false, media, None);
+                stamp_lane_words(&mut rows, false, media, false, None);
                 rows
             };
             let spans: Vec<(std::ops::Range<u64>, std::ops::Range<u64>)> = groups
@@ -2695,6 +2673,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // it folds seals once it settles.
             let reports = pass_slots.is_none()
                 && decode_envelope.is_some()
+                && !denoise
                 && plain_decode(&req, hooked, fire_wide_mask, req.max_layers);
             let mut parts = Vec::with_capacity(group_sets.len());
             for (group, ((set, (slots, written)), (lease, kvtxn))) in group_sets
@@ -3720,9 +3699,10 @@ async fn fire_device_geometry<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
     }
-    {
+    let denoise = {
         let pass = ctx.resources().get_mut(&fwd)?;
-        if pass.bindings.canvas == Some(crate::pipeline::instance::CanvasMode::Denoise) {
+        let denoise = pass.bindings.canvas == Some(crate::pipeline::instance::CanvasMode::Denoise);
+        if denoise {
             let payload = if pass
                 .bindings
                 .self_cond
@@ -3733,13 +3713,14 @@ async fn fire_device_geometry<C: FireContext>(
             } else {
                 pass.bindings.self_cond.take()
             };
-            if let Err(error) = stamp_denoise(&mut req, payload) {
+            if let Err(error) = stamp_self_cond(&mut req, payload) {
                 let reason = format!("pipeline: self-conditioning: {error}");
                 record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
                 return Ok(Err(reason));
             }
         }
-    }
+        denoise
+    };
     {
         let program = &ctx.resources().get(&fwd)?.instance.program;
         let (drafts, captures) = (program.reads_mtp_logits, program.reads_attn_score);
@@ -3754,13 +3735,18 @@ async fn fire_device_geometry<C: FireContext>(
         for lane in &mut req.lanes {
             lane.block_draft = true;
         }
-        stamp_block_masks(&mut req);
     }
     // A split narrow enough to stage no host rows still knows each lane's
     // rows; its words carry them.
     let device_rows: Option<Vec<u32>> =
         (!wide).then(|| split.windows(2).map(|lane| lane[1] - lane[0]).collect());
-    stamp_lane_words(&mut req, fire_wide_mask, false, device_rows.as_deref());
+    stamp_lane_words(
+        &mut req,
+        fire_wide_mask,
+        false,
+        denoise,
+        device_rows.as_deref(),
+    );
     if let Err(refusal) = seat_lane_slots(&mut req, &stores, &groups).await {
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
         return Ok(Err(refusal));
@@ -3784,12 +3770,13 @@ async fn fire_device_geometry<C: FireContext>(
     // A decode lane whose KV is its tokens' alone asks the engine what it
     // wrote, so its slots are logged.
     let max_layers = ctx.resources().get(&fwd)?.max_layers;
-    let plain_decode = plain_decode(
-        &req,
-        hook_program || lora_program,
-        fire_wide_mask,
-        max_layers,
-    );
+    let plain_decode = !denoise
+        && plain_decode(
+            &req,
+            hook_program || lora_program,
+            fire_wide_mask,
+            max_layers,
+        );
     let mut parts = Vec::with_capacity(group_sets.len());
     for ((((set, (log_seq, log_pages)), lease), kvtxn), (_, lanes)) in group_sets
         .iter()
