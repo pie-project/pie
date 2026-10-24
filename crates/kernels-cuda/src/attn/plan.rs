@@ -562,7 +562,7 @@ pub fn upload(ctx: &Ctx, op: &'static str, bytes: &[u8], int_ptr: u64) -> Result
         // reaches it (the fire before's kernels), so a plan the next fire
         // stages ahead would wait out the card; a pinned slot leaves it
         // queued.
-        let from = pinned::stage(op, bytes)?;
+        let from = pinned::stage(op, ctx.stream().cast(), bytes)?;
         // SAFETY: `from` is a pinned slot holding a copy of `bytes`, which
         // the ring does not reuse until an event recorded after this copy
         // fires; the stream is `ctx`'s, live by `Ctx::on`'s contract. That
@@ -664,14 +664,18 @@ pub struct MlaPlanInfo {
 /// queued is passed over for a new one, so staging a plan never waits for
 /// the device: the ring grows to the copies in flight, warm launches size
 /// its slots, and only past `MOST` does a stage wait out the oldest. A
-/// thread keeps one ring a device: a slot's event is its device's, recorded
-/// on that device's streams alone.
+/// stream keeps one ring, process-wide, whichever thread fires on it: a
+/// slot's event is recorded on that stream alone, so a stage waits (past
+/// `MOST`) only on its own stream's copies, and the fires a load warms a
+/// stream with (on the thread that loads) leave the slots the fires that
+/// serve it (an expert-parallel rank's, on its firing thread) stage into:
+/// no page-locked allocation, which waits on the device, in a step.
 #[cfg(feature = "cuda")]
 mod pinned {
     use super::{Error, refuse};
-    use core::cell::RefCell;
     use cudarc::runtime::sys as rt;
     use std::collections::BTreeMap;
+    use std::sync::{Mutex, PoisonError};
 
     /// Slots before a stage waits for the oldest copy rather than grow.
     const MOST: usize = 64;
@@ -690,24 +694,30 @@ mod pinned {
         next: usize,
     }
 
-    thread_local! {
-        static RINGS: RefCell<BTreeMap<usize, Ring>> = const { RefCell::new(BTreeMap::new()) };
-    }
+    // SAFETY: a ring holds page-locked allocations and events, driver
+    // handles any thread may use; it is reached only under its lock.
+    unsafe impl Send for Ring {}
 
-    /// `f` on this thread's ring of the device it has bound.
+    /// Every stream's ring, by its handle: each its own lock, so a stage
+    /// waiting out its stream's oldest copy holds back no other stream's.
+    static RINGS: Mutex<BTreeMap<usize, &'static Mutex<Ring>>> = Mutex::new(BTreeMap::new());
+
+    /// `f` on `stream`'s ring.
     fn on_ring<R>(
-        op: &'static str,
+        stream: rt::cudaStream_t,
         f: impl FnOnce(&mut Ring) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        let device = crate::jit::cache::current_device()
-            .map_err(|fault| refuse(op, format!("staging the plan: {fault}")))?;
-        RINGS.with(|rings| {
-            let mut rings = rings.borrow_mut();
-            f(rings.entry(device).or_insert(Ring {
-                slots: Vec::new(),
-                next: 0,
-            }))
-        })
+        let ring: &'static Mutex<Ring> = *RINGS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(stream as usize)
+            .or_insert_with(|| {
+                Box::leak(Box::new(Mutex::new(Ring {
+                    slots: Vec::new(),
+                    next: 0,
+                })))
+            });
+        f(&mut ring.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     fn check(op: &'static str, what: &str, code: rt::cudaError_t) -> Result<(), Error> {
@@ -723,8 +733,12 @@ mod pinned {
 
     /// `bytes` copied into the ring's next slot, waiting out the copy that
     /// last read it; the slot's address.
-    pub(super) fn stage(op: &'static str, bytes: &[u8]) -> Result<*const u8, Error> {
-        on_ring(op, |ring| {
+    pub(super) fn stage(
+        op: &'static str,
+        stream: rt::cudaStream_t,
+        bytes: &[u8],
+    ) -> Result<*const u8, Error> {
+        on_ring(stream, |ring| {
             let at = ring.next;
             // The slot at `at` is the oldest a copy read; one still queued
             // gets a new slot before it, which keeps it the oldest.
@@ -782,7 +796,7 @@ mod pinned {
 
     /// The slot `stage` handed out is read once `stream` runs to here.
     pub(super) fn sent(op: &'static str, stream: rt::cudaStream_t) -> Result<(), Error> {
-        on_ring(op, |ring| {
+        on_ring(stream, |ring| {
             let at = ring.next;
             ring.next = (at + 1) % ring.slots.len();
             // SAFETY: an event this ring created, on the caller's stream.
