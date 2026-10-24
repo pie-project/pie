@@ -271,7 +271,8 @@ impl FamilyCosts {
                 | poem_ir::Fused::HcGatesNorm { .. }
                 | poem_ir::Fused::ResBlendRmsnorm { .. }
                 | poem_ir::Fused::HcPre { .. }
-                | poem_ir::Fused::GatedResidualNormModulate { .. } => self.elemwise,
+                | poem_ir::Fused::GatedResidualNormModulate { .. }
+                | poem_ir::Fused::Region { .. } => self.elemwise,
             },
             poem_ir::Operation::Conv(_) => self.conv,
         }
