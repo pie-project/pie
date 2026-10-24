@@ -3,6 +3,7 @@
 //! tools a system turn of their own, and Qwen3-Coder's XML calls.
 
 use std::sync::Arc;
+use tokenizer::Specials;
 
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
@@ -33,17 +34,16 @@ pub struct Mimo {
 }
 
 impl Mimo {
-    #[must_use]
-    pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
-        Self {
-            im_start: special(&tokenizer, "<|im_start|>"),
-            im_end: special(&tokenizer, "<|im_end|>"),
+    pub fn try_new(tokenizer: Arc<Tokenizer>) -> Result<Self, String> {
+        Ok(Self {
+            im_start: special(&tokenizer, "<|im_start|>")?,
+            im_end: special(&tokenizer, "<|im_end|>")?,
             newline: tokenizer.encode("\n"),
-            think_open: special(&tokenizer, THINK_OPEN),
-            think_close: special(&tokenizer, THINK_CLOSE),
-            stop_ids: specials(&tokenizer, STOP_TOKENS),
+            think_open: special(&tokenizer, THINK_OPEN)?,
+            think_close: special(&tokenizer, THINK_CLOSE)?,
+            stop_ids: specials(&tokenizer, STOP_TOKENS)?,
             tokenizer,
-        }
+        })
     }
 
     fn header(&self, role: &str) -> Vec<u32> {
@@ -136,7 +136,7 @@ impl Instruct for Mimo {
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(MimoToolDecoder {
-            decoder: self.tokenizer.decoder(false),
+            decoder: self.tokenizer.decoder(Specials::Keep),
             accumulated: String::new(),
             inside: false,
         })
@@ -165,7 +165,7 @@ struct MimoToolDecoder {
 /// Qwen3-Coder's XML calls read back, as MiMo writes them too.
 pub(crate) fn xml_call_decoder(tokenizer: &Arc<Tokenizer>) -> Box<dyn ToolDecoder> {
     Box::new(MimoToolDecoder {
-        decoder: tokenizer.decoder(false),
+        decoder: tokenizer.decoder(Specials::Keep),
         accumulated: String::new(),
         inside: false,
     })

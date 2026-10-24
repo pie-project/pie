@@ -1,8 +1,8 @@
 //! A fire's inputs: host arrays the shell stages, each a root the program
 //! reads as a parameter. Only what the traced program names is uploaded.
 
+use crate::handle::Tensor;
 use dtype::Dtype;
-use kernels_xla::Tensor;
 
 use crate::device::Device;
 use crate::error::Result;

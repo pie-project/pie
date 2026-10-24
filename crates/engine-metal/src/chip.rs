@@ -1,5 +1,6 @@
 //! The Metal profile registry, the checked-in profiles, and resolution for
 //! one load. Kernel decisions are declared in `kernels-metal`.
+#![allow(unsafe_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
@@ -165,7 +166,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<ExpertsThreads>()
         .add::<KeepAliveSpin>()
         .add::<UnreportedCores>();
-    poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
+    poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     // Metal forks no side streams: one queue serves every region.
     poem_compiler::costs::register(&mut r, 0);
     r

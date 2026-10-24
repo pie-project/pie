@@ -1,4 +1,4 @@
-use poem::ops::spatial::{self, Conv};
+use poem::ops::conv::{self, ConvShape};
 use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, seam, trace_hybrid};
 use poem_ir::{Dim, Operands, ParamLayout, Ty};
 
@@ -45,18 +45,32 @@ impl ForwardHybrid for Decoder {
     fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
         let x = inputs.voxels(0, C_IN, Dtype::Bf16);
-        let (h, g1) = spatial::conv3d(&x, &g, &self.conv1, Some(&self.b1), Conv::same3(), None);
+        let (h, g1) = conv::conv3d(
+            &x,
+            &g,
+            &self.conv1,
+            Some(&self.b1),
+            ConvShape::same3(),
+            None,
+        );
         assert_eq!(h.rows(), Dim::Voxels, "a convolution keeps its rows");
         assert_eq!(h.width(), u64::from(C_MID));
-        let h = spatial::group_norm(&h, &g1, 4, &self.gn_w, &self.gn_b, 1e-6, true);
-        let (h, g2) = spatial::upsample_nearest(&h, &g1, [1, 2, 2], false);
+        let h = conv::group_norm(&h, &g1, 4, &self.gn_w, &self.gn_b, 1e-6, true);
+        let (h, g2) = conv::upsample_nearest(&h, &g1, [1, 2, 2], false);
         assert_eq!(
             h.rows(),
             Dim::VoxelsTimes(4),
             "an upsample grows rows by its volume"
         );
-        let (h, g3) = spatial::conv3d(&h, &g2, &self.conv2, Some(&self.b2), Conv::same3(), None);
-        let (y, g4) = spatial::pixel_shuffle(&h, &g3, [1, 2, 2]);
+        let (h, g3) = conv::conv3d(
+            &h,
+            &g2,
+            &self.conv2,
+            Some(&self.b2),
+            ConvShape::same3(),
+            None,
+        );
+        let (y, g4) = conv::pixel_shuffle(&h, &g3, [1, 2, 2]);
         assert_eq!(
             y.rows(),
             Dim::VoxelsTimes(16),
@@ -82,15 +96,15 @@ fn the_decoder_traces_and_its_grids_are_values() {
     assert_eq!(
         names,
         vec![
-            "spatial.grid",
-            "spatial.conv3d",
-            "spatial.group_norm",
-            "spatial.grid",
-            "spatial.upsample_nearest",
-            "spatial.grid",
-            "spatial.conv3d",
-            "spatial.grid",
-            "spatial.pixel_shuffle",
+            "conv.grid",
+            "conv.conv3d",
+            "conv.group_norm",
+            "conv.grid",
+            "conv.upsample",
+            "conv.grid",
+            "conv.conv3d",
+            "conv.grid",
+            "conv.pixel_shuffle",
         ],
         "one grid node ahead of every op that changes the box, none for the norm"
     );
@@ -147,14 +161,14 @@ impl ForwardHybrid for Patchifier {
         let g = inputs.grid();
         let x = inputs.voxels(0, C_IN, Dtype::Bf16);
         let tg = inputs.token_grid([1, 2, 2]);
-        let tokens = spatial::patchify(&x, &g, [1, 2, 2], &tg);
+        let tokens = conv::patchify(&x, &g, [1, 2, 2], &tg);
         assert_eq!(
             tokens.rows(),
             Dim::Tokens,
             "patchify lands on the token axis"
         );
         assert_eq!(tokens.width(), u64::from(C_IN) * 4);
-        let back = spatial::unpatchify(&tokens, &tg, [1, 2, 2], &g);
+        let back = conv::unpatchify(&tokens, &tg, [1, 2, 2], &g);
         assert_eq!(back.rows(), Dim::Voxels, "and unpatchify comes back");
         assert_eq!(back.width(), u64::from(C_IN));
         seam::at(seam::PIXELS, &[&back, &g]);
@@ -166,7 +180,7 @@ fn the_patchify_pair_crosses_the_axis_and_back() {
     let trace = trace_hybrid("patchify", &Patchifier, Platform::Cuda);
     poem_ir::check(&trace).expect("the validator accepts the pair");
     let names: Vec<&str> = trace.nodes.iter().map(|node| node.op.name()).collect();
-    assert_eq!(names, vec!["spatial.patchify", "spatial.unpatchify"]);
+    assert_eq!(names, vec!["conv.patchify", "conv.unpatchify"]);
     assert!(trace.values.iter().any(|decl| matches!(
         decl.def,
         poem_ir::Def::Input(poem_ir::RuntimeInput::TokenGrid { p: [1, 2, 2] })
@@ -187,7 +201,7 @@ impl ForwardHybrid for NaturalWeight {
             [u64::from(C_MID), u64::from(C_IN) * 27],
             Dtype::Bf16,
         );
-        spatial::conv3d(&x, &g, &w, None, Conv::same3(), None).0
+        conv::conv3d(&x, &g, &w, None, ConvShape::same3(), None).0
     }
 }
 

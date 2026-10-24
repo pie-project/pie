@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use core::ffi::c_void;
 
 use crate::error::Error;
@@ -119,7 +120,7 @@ impl Slabs {
 
     /// # Safety
     ///
-    /// `stream` must be a live CUDA stream that outlives every launch
+    /// `stream` must be a live HIP stream that outlives every launch
     /// this context is used for.
     pub unsafe fn attach(self, stream: *mut c_void) {
         #[cfg(feature = "rocm")]
@@ -193,7 +194,7 @@ pub struct Ctx {
 impl Ctx {
     /// # Safety
     ///
-    /// `stream` must be a live CUDA stream that outlives this context.
+    /// `stream` must be a live HIP stream that outlives this context.
     #[must_use]
     pub const unsafe fn on(stream: *mut c_void) -> Self {
         Self {
@@ -442,7 +443,7 @@ impl Ctx {
     }
 
     #[must_use]
-    pub fn stage(&self) -> ArgValue {
+    pub fn stage(&self) -> ArgValue<'static> {
         ArgValue::Ptr(self.stage.get())
     }
 
@@ -503,6 +504,11 @@ impl Ctx {
 
         let mut bound = crate::jit::abi::Bound::new(args);
 
+        // SAFETY: `resolved.function` is a kernel of a module the cache never
+        // unloads; `bound` owns every cell its slots point at and outlives the
+        // call; `self.stream` is live per `Ctx::on`. That `args` has one value
+        // per kernel parameter, in order, is each entry's to keep: the
+        // instantiation's signature is not checked here.
         let fired = unsafe {
             crate::jit::launch::issue(resolved.function, launch, bound.slots_mut(), self.stream)
         };
@@ -526,11 +532,33 @@ impl Ctx {
     }
 }
 
+/// Whether a device instantiation that will not fire (it does not compile,
+/// or its module does not load) panics rather than falling back: on under
+/// `PIE_STRICT_KERNELS=1` or [`strict_kernels`], as the test harnesses run.
+/// Off, the fallback serves (another chip's toolchain may lack what one
+/// unit asks) and the fault is said once.
+#[must_use]
+pub fn kernels_strict() -> bool {
+    STRICT.load(std::sync::atomic::Ordering::Relaxed)
+        || std::env::var_os("PIE_STRICT_KERNELS").is_some_and(|v| v == "1")
+}
+
+/// Turns [`kernels_strict`] on for this process.
+pub fn strict_kernels() {
+    STRICT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(feature = "rocm")]
 fn said(root: &str, instantiation: &str, why: crate::jit::Fault) -> crate::jit::Fault {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
 
+    assert!(
+        !kernels_strict(),
+        "strict kernels: `{root}` {instantiation} will not fire: {why}"
+    );
     static SAID: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     let said = SAID.get_or_init(|| Mutex::new(HashSet::new()));
     if let Ok(mut said) = said.lock()

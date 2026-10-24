@@ -54,7 +54,8 @@ fn qwen3_coder_lists_its_tools_as_xml_and_writes_its_calls_as_functions() {
     ) else {
         return;
     };
-    let template = chat_template::qwen3_coder::Qwen3Coder::new(tokenizer);
+    let template = chat_template::qwen3_coder::Qwen3Coder::try_new(tokenizer)
+        .expect("the tokenizer has the template's markers");
     let question: Vec<u32> = vec![
         151644, 872, 198, 3838, 374, 220, 16, 22, 3039, 220, 17, 18, 30, 151645, 198,
     ];
@@ -126,10 +127,11 @@ fn minimax2_opens_on_its_identity_and_cues_an_open_think_block() {
     ) else {
         return;
     };
-    let template = chat_template::minimax2::MiniMax2::new(
+    let template = chat_template::minimax2::MiniMax2::try_new(
         tokenizer,
         "You are a helpful assistant. Your name is MiniMax-M2.5 and is built by MiniMax.",
-    );
+    )
+    .expect("the tokenizer has the template's markers");
     let opening: Vec<u32> = vec![
         200034, 200019, 28463, 10, 2985, 457, 258, 12473, 23413, 46, 5324, 1925, 355, 35353, 12973,
         5145, 50, 46, 53, 306, 355, 6904, 531, 35353, 12973, 46, 200020, 10,
@@ -208,7 +210,9 @@ fn glm47_writes_its_turns_back_to_back_and_its_calls_in_xml() {
     ) else {
         return;
     };
-    let template = chat_template::glm::Glm::with_style(tokenizer, chat_template::glm::Style::Glm47);
+    let template =
+        chat_template::glm::Glm::try_with_style(tokenizer, chat_template::glm::Style::Glm47)
+            .expect("the tokenizer has the template's markers");
     let question: Vec<u32> = vec![151336, 3838, 374, 220, 99419, 3039, 220, 99619, 30];
 
     let mut got = template.first_user(MESSAGE);
@@ -276,7 +280,9 @@ fn glm45_writes_a_newline_after_each_marker() {
     ) else {
         return;
     };
-    let template = chat_template::glm::Glm::with_style(tokenizer, chat_template::glm::Style::Glm45);
+    let template =
+        chat_template::glm::Glm::try_with_style(tokenizer, chat_template::glm::Style::Glm45)
+            .expect("the tokenizer has the template's markers");
     let question: Vec<u32> = vec![151336, 198, 3838, 374, 220, 99419, 3039, 220, 99619, 30];
 
     let mut got = template.first_user(MESSAGE);
@@ -349,7 +355,8 @@ fn llama_opens_on_its_dated_system_turn_and_writes_its_calls_as_json() {
     ) else {
         return;
     };
-    let template = chat_template::llama::Llama::new(tokenizer);
+    let template = chat_template::llama::Llama::try_new(tokenizer)
+        .expect("the tokenizer has the template's markers");
     let dates: Vec<u32> = vec![
         38766, 1303, 33025, 2696, 25, 6790, 220, 2366, 18, 198, 15724, 2696, 25, 220, 1627, 10263,
         220, 2366, 19, 271,
@@ -429,7 +436,8 @@ fn dots_opens_on_the_default_system_turn_and_answers_a_tool_in_a_user_turn() {
     let Some(tokenizer) = snapshot("dots-studio/dots3-note-prev", "mini-l6-e16") else {
         return;
     };
-    let template = chat_template::dots::Dots::new(tokenizer);
+    let template = chat_template::dots::Dots::try_new(tokenizer)
+        .expect("the tokenizer has the template's markers");
     let question: Vec<u32> = vec![151665, 3838, 374, 220, 16, 22, 3039, 220, 17, 18, 30];
     let default_system: Vec<u32> = vec![151650, 2610, 525, 264, 10950, 17847, 13, 151651];
     let terse: Vec<u32> = vec![151650, 2610, 525, 50537, 13, 151651];
@@ -483,8 +491,10 @@ fn hy_writes_the_reasoning_mode_the_turns_the_calls_and_the_cue() {
     ) else {
         return;
     };
-    let template = chat_template::hy::Hy::new(tokenizer.clone(), true);
-    let quiet = chat_template::hy::Hy::new(tokenizer, false);
+    let template = chat_template::hy::Hy::try_new(tokenizer.clone(), true)
+        .expect("the tokenizer has the template's markers");
+    let quiet = chat_template::hy::Hy::try_new(tokenizer, false)
+        .expect("the tokenizer has the template's markers");
     let high: Vec<u32> = vec![120039, 59785, 287, 62, 4138, 506, 25, 19369, 120025];
     let no_think: Vec<u32> = vec![
         120039, 59785, 287, 62, 4138, 506, 25, 3202, 32980, 1121, 120025,
@@ -566,7 +576,8 @@ fn mimo_writes_its_turns_untrimmed_and_its_tools_a_turn_ahead() {
     let Some(tokenizer) = snapshot("XiaomiMiMo/MiMo-V2.6-Flash-RL", "mini-l6-e8") else {
         return;
     };
-    let template = chat_template::mimo::Mimo::new(tokenizer);
+    let template = chat_template::mimo::Mimo::try_new(tokenizer)
+        .expect("the tokenizer has the template's markers");
     let turns: Vec<u32> = vec![
         151644, 8948, 198, 2610, 525, 50537, 13, 151645, 151644, 872, 198, 3838, 374, 220, 16, 22,
         3039, 220, 17, 18, 5267, 151645,
@@ -612,7 +623,7 @@ fn chatml_trims_the_turn_and_closes_an_empty_thinking_block() {
     ) else {
         return;
     };
-    let template = chat_template::chatml::ChatMLInstruct::new(
+    let template = chat_template::chatml::ChatMLInstruct::try_new(
         tokenizer,
         chat_template::chatml::ChatML {
             thinking: true,
@@ -623,7 +634,8 @@ fn chatml_trims_the_turn_and_closes_an_empty_thinking_block() {
             generation_suffix: String::new(),
             stop_tokens: vec!["<|im_end|>".to_string()],
         },
-    );
+    )
+    .expect("the tokenizer has the template's markers");
     let mut got = template.system_user("You are terse.", &format!("{MESSAGE}\n"));
     got.extend(template.cue_without_thinking());
     let want: Vec<u32> = vec![
@@ -654,7 +666,8 @@ fn qwen38_opens_a_thinking_request_with_its_reasoning_effort_instruction() {
         generation_suffix: String::new(),
         stop_tokens: vec!["<|im_end|>".to_string()],
     };
-    let qwen38 = chat_template::chatml::ChatMLInstruct::new(tokenizer.clone(), config(true));
+    let qwen38 = chat_template::chatml::ChatMLInstruct::try_new(tokenizer.clone(), config(true))
+        .expect("the tokenizer has the template's markers");
     let render =
         |template: &chat_template::chatml::ChatMLInstruct, system: Option<&str>, effort| {
             let mut got = template.system_thinking(system, effort);
@@ -694,7 +707,8 @@ fn qwen38_opens_a_thinking_request_with_its_reasoning_effort_instruction() {
         [system, terse, end, user].concat()
     );
     // A template that states no instruction writes the plain system turn.
-    let plain = chat_template::chatml::ChatMLInstruct::new(tokenizer, config(false));
+    let plain = chat_template::chatml::ChatMLInstruct::try_new(tokenizer, config(false))
+        .expect("the tokenizer has the template's markers");
     assert_eq!(
         render(&plain, Some("You are terse."), Effort::Xhigh),
         [system, terse, end, user].concat()
@@ -713,7 +727,7 @@ fn qwen38_cues_a_thinking_answer_inside_an_open_think_block() {
     ) else {
         return;
     };
-    let qwen38 = chat_template::chatml::ChatMLInstruct::new(
+    let qwen38 = chat_template::chatml::ChatMLInstruct::try_new(
         tokenizer.clone(),
         chat_template::chatml::ChatML {
             thinking: true,
@@ -724,7 +738,8 @@ fn qwen38_cues_a_thinking_answer_inside_an_open_think_block() {
             generation_suffix: "<think>\n".to_string(),
             stop_tokens: vec!["<|im_end|>".to_string()],
         },
-    );
+    )
+    .expect("the tokenizer has the template's markers");
     let mut got = qwen38.system_thinking(Some("You are terse."), Effort::Xhigh);
     got.extend(qwen38.user(&format!("{MESSAGE}\n")));
     got.extend(qwen38.cue());
@@ -770,7 +785,7 @@ fn qwen38_replays_every_earlier_answer_inside_its_thinking_block() {
     ) else {
         return;
     };
-    let qwen38 = chat_template::chatml::ChatMLInstruct::new(
+    let qwen38 = chat_template::chatml::ChatMLInstruct::try_new(
         tokenizer,
         chat_template::chatml::ChatML {
             thinking: true,
@@ -781,7 +796,8 @@ fn qwen38_replays_every_earlier_answer_inside_its_thinking_block() {
             generation_suffix: String::new(),
             stop_tokens: vec!["<|im_end|>".to_string()],
         },
-    );
+    )
+    .expect("the tokenizer has the template's markers");
     let render = |answer: &str| {
         let mut got = qwen38.system_user("You are terse.", &format!("{MESSAGE}\n"));
         got.extend(qwen38.assistant(answer));
@@ -822,7 +838,8 @@ fn gemma_closes_an_empty_thought_channel_where_its_template_does() {
         236770, 236832, 2782, 236743, 236778, 236800, 236881, 106, 107, 105, 4368, 107,
     ];
     for (thinking, closed) in [(false, vec![]), (true, vec![100, 45518, 107, 101])] {
-        let template = chat_template::gemma::Gemma::new(tokenizer.clone(), thinking);
+        let template = chat_template::gemma::Gemma::try_new(tokenizer.clone(), thinking)
+            .expect("the tokenizer has the template's markers");
         let mut got = template.system_user("You are terse.", &format!("{MESSAGE}\n"));
         got.extend(template.cue());
         assert_eq!(got, [turns.clone(), closed].concat());
@@ -834,7 +851,8 @@ fn inkling_writes_the_effort_line_the_user_turn_and_the_cue() {
     let Some(tokenizer) = snapshot("thinkingmachines/Inkling", "mini-l7-e8") else {
         return;
     };
-    let template = chat_template::inkling::Inkling::new(tokenizer);
+    let template = chat_template::inkling::Inkling::try_new(tokenizer)
+        .expect("the tokenizer has the template's markers");
     let mut got = template.first_user(MESSAGE);
     got.extend(template.cue());
     let want: Vec<u32> = vec![
@@ -849,7 +867,8 @@ fn atem_writes_the_user_turn_and_the_cue_after_the_opening() {
     let Some(tokenizer) = snapshot("meta-models/Muse-Glimmer-30B", "mini-l8-ends") else {
         return;
     };
-    let template = chat_template::atem::Atem::new(tokenizer);
+    let template = chat_template::atem::Atem::try_new(tokenizer)
+        .expect("the tokenizer has the template's markers");
     let mut got = template.first_user(MESSAGE);
     got.extend(template.cue());
     let want: Vec<u32> = vec![
@@ -888,7 +907,8 @@ fn minimax_opens_with_the_system_and_developer_turns() {
     ) else {
         return;
     };
-    let template = chat_template::minimax::MiniMax::new(tokenizer);
+    let template = chat_template::minimax::MiniMax::try_new(tokenizer)
+        .expect("the tokenizer has the template's markers");
     let opening: Vec<u32> = vec![
         200034, 200019, 28463, 10, 11393, 2428, 4423, 355, 35353, 12973, 5145, 51, 44, 6415, 531,
         35353, 12973, 46, 31058, 70273, 58, 8031, 32, 1421, 54, 46, 106114, 296, 4364, 32, 1421,
@@ -980,7 +1000,7 @@ fn qwen38_writes_its_tools_calls_and_results_as_its_template_does() {
     let reference: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/qwen38_reference.json")).unwrap();
     let expect = |case: &str| tokenizer.encode(reference[case].as_str().unwrap());
-    let qwen38 = chat_template::chatml::ChatMLInstruct::new(
+    let qwen38 = chat_template::chatml::ChatMLInstruct::try_new(
         tokenizer.clone(),
         chat_template::chatml::ChatML {
             thinking: true,
@@ -991,7 +1011,8 @@ fn qwen38_writes_its_tools_calls_and_results_as_its_template_does() {
             generation_suffix: "<think>\n".to_string(),
             stop_tokens: vec!["<|im_end|>".to_string()],
         },
-    );
+    )
+    .expect("the tokenizer has the template's markers");
     let tool = r#"{"type":"function","function":{"name":"get_weather","description":"Get the weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}},"required":["city"]}}}"#.to_string();
     let tools = std::slice::from_ref(&tool);
 
@@ -1060,7 +1081,8 @@ fn opens_llama_3_1_8b_instruct() {
     ) else {
         return;
     };
-    let template = chat_template::llama::Llama::new(tokenizer);
+    let template = chat_template::llama::Llama::try_new(tokenizer)
+        .expect("the tokenizer has the template's markers");
     let want: Vec<u32> = vec![
         128000, 128006, 9125, 128007, 271, 13013, 25, 6125, 27993, 198, 38766, 1303, 33025, 2696,
         25, 6790, 220, 2366, 18, 198, 15724, 2696, 25, 220, 1627, 10263, 220, 2366, 19, 271, 2675,
@@ -1090,7 +1112,9 @@ fn opens_glm_4_7() {
     ) else {
         return;
     };
-    let template = chat_template::glm::Glm::with_style(tokenizer, chat_template::glm::Style::Glm47);
+    let template =
+        chat_template::glm::Glm::try_with_style(tokenizer, chat_template::glm::Style::Glm47)
+            .expect("the tokenizer has the template's markers");
     let want: Vec<u32> = vec![
         151331, 151333, 151335, 198, 2, 13843, 271, 2610, 1231, 1618, 825, 476, 803, 5746, 311,
         7789, 448, 279, 1196, 3239, 382, 2610, 525, 3897, 448, 729, 32479, 2878, 366, 15906, 1472,
@@ -1114,7 +1138,9 @@ fn opens_glm_4_5() {
     ) else {
         return;
     };
-    let template = chat_template::glm::Glm::with_style(tokenizer, chat_template::glm::Style::Glm45);
+    let template =
+        chat_template::glm::Glm::try_with_style(tokenizer, chat_template::glm::Style::Glm45)
+            .expect("the tokenizer has the template's markers");
     let want: Vec<u32> = vec![
         151331, 151333, 151335, 198, 2, 13843, 271, 2610, 1231, 1618, 825, 476, 803, 5746, 311,
         7789, 448, 279, 1196, 3239, 382, 2610, 525, 3897, 448, 729, 32479, 2878, 366, 15906, 1472,
@@ -1139,10 +1165,11 @@ fn opens_minimax_m2_5() {
     ) else {
         return;
     };
-    let template = chat_template::minimax2::MiniMax2::new(
+    let template = chat_template::minimax2::MiniMax2::try_new(
         tokenizer,
         "You are a helpful assistant. Your name is MiniMax-M2.5 and is built by MiniMax.",
-    );
+    )
+    .expect("the tokenizer has the template's markers");
     let want: Vec<u32> = vec![
         200034, 200019, 28463, 10, 2985, 457, 6000, 101, 634, 35, 31455, 10, 2985, 992, 1728, 841,
         436, 812, 6629, 301, 7202, 418, 275, 3100, 9560, 320, 9806, 457, 275, 6629, 3136, 296,
@@ -1169,7 +1196,8 @@ fn opens_qwen3_coder_30b_a3b_instruct() {
     ) else {
         return;
     };
-    let template = chat_template::qwen3_coder::Qwen3Coder::new(tokenizer);
+    let template = chat_template::qwen3_coder::Qwen3Coder::try_new(tokenizer)
+        .expect("the tokenizer has the template's markers");
     let want: Vec<u32> = vec![
         151644, 8948, 198, 2610, 525, 50537, 382, 2, 13852, 271, 2610, 614, 2615, 311, 279, 2701,
         5746, 1447, 27, 15918, 397, 27, 1688, 397, 27, 606, 29, 455, 69364, 522, 606, 397, 27,

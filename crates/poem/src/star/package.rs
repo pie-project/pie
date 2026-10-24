@@ -1,78 +1,36 @@
-//! A model package: its files, each evaluated with the globals of its stage
-//! and frozen, so a deployment's layout, forward and formats are functions
-//! a trace or an import calls.
+//! A model package: its files, each evaluated with the DSL's globals and
+//! frozen, so a deployment's layout, forward and formats are functions a
+//! trace or an import calls. A file's name says nothing of what it holds: the
+//! package's entries (`MODELS`, `layout`, `caches`, `forward`, `formats`, …)
+//! are found in whichever one file defines each, so a package may be one file
+//! or several. What a stage's builtins read (the trace being recorded, the
+//! checkpoint being read) is there only while the runtime calls that stage's
+//! entry, and a builtin called outside it says so.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
 use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, LibraryExtension, Module};
 use starlark::eval::{Evaluator, ReturnFileLoader};
 use starlark::syntax::{AstModule, Dialect};
-use starlark::values::FrozenHeapName;
+use starlark::values::{FrozenHeapName, OwnedFrozenValue};
 
 use crate::star::manifest::Manifest;
 
-/// What a file of a package may use.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Stage {
-    /// `package.poem`: the models a package holds and the deployments of
-    /// them it lists.
-    Manifest,
-    /// `model.poem`: a deployment's dims and the weights they lay out.
-    Layout,
-    /// `forward.poem`: the caches a deployment holds and the forward its
-    /// rows run.
-    Forward,
-    /// `formats.poem`: the formats a deployment's checkpoints are read in.
-    Formats,
-    /// Any other file: pure helpers every stage may load.
-    Lib,
-}
-
-/// The prefix a library shared between packages is loaded under: a stage
-/// file of `//lib/<name>/` is evaluated in its stage, and only that stage's
-/// files may load it.
-pub const LIBRARY: &str = "//lib/";
-
-impl Stage {
-    /// The stage a package file named `file` is evaluated in.
-    #[must_use]
-    pub fn of(file: &str) -> Stage {
-        match file.rsplit('/').next().unwrap_or(file) {
-            "package.poem" => Stage::Manifest,
-            "model.poem" => Stage::Layout,
-            "forward.poem" => Stage::Forward,
-            "formats.poem" => Stage::Formats,
-            _ => Stage::Lib,
-        }
-    }
-
-    fn globals(self) -> &'static Globals {
-        static LIB: LazyLock<Globals> = LazyLock::new(|| base().build());
-        static MANIFEST: LazyLock<Globals> =
-            LazyLock::new(|| base().with(crate::star::manifest::manifest).build());
-        static LAYOUT: LazyLock<Globals> = LazyLock::new(|| {
-            base()
-                .with(crate::star::layout::layout)
-                .with(crate::star::generative::generative)
-                .build()
-        });
-        static FORWARD: LazyLock<Globals> = LazyLock::new(|| {
-            base()
-                .with(crate::star::forward::forward)
-                .with(crate::star::forward::ops)
-                .build()
-        });
-        static FORMATS: LazyLock<Globals> =
-            LazyLock::new(|| base().with(crate::star::formats::formats).build());
-        match self {
-            Stage::Manifest => &MANIFEST,
-            Stage::Layout => &LAYOUT,
-            Stage::Forward => &FORWARD,
-            Stage::Formats => &FORMATS,
-            Stage::Lib => &LIB,
-        }
-    }
+/// The globals every file of a package is evaluated with: Starlark's own
+/// library, and every stage's builtins.
+fn globals() -> &'static Globals {
+    static ALL: LazyLock<Globals> = LazyLock::new(|| {
+        base()
+            .with(crate::star::manifest::manifest)
+            .with(crate::star::layout::layout)
+            .with(crate::star::generative::generative)
+            .with(crate::star::forward::forward)
+            .with(crate::star::forward::ops)
+            .with(crate::star::formats::formats)
+            .build()
+    });
+    &ALL
 }
 
 /// What every stage may use: Starlark's own library with structs, the
@@ -93,6 +51,8 @@ pub struct Package {
     name: String,
     sources: BTreeMap<String, String>,
     modules: BTreeMap<String, FrozenModule>,
+    /// What each file binds by `load`, which is another file's, not its own.
+    loaded: BTreeMap<String, BTreeSet<String>>,
     manifest: Manifest,
 }
 
@@ -101,11 +61,19 @@ impl Package {
     pub fn new(name: &str, files: &[(&str, &str)]) -> anyhow::Result<Package> {
         let sources: BTreeMap<&str, &str> = files.iter().copied().collect();
         let mut modules = BTreeMap::new();
+        let mut loaded = BTreeMap::new();
         for file in sources.keys() {
-            freeze(name, file, &sources, &mut modules, &mut Vec::new())?;
+            freeze(
+                name,
+                file,
+                &sources,
+                &mut modules,
+                &mut loaded,
+                &mut Vec::new(),
+            )?;
         }
-        let manifest = match modules.get("package.poem") {
-            Some(module) => Manifest::of(name, module)?,
+        let manifest = match defining(name, &modules, &loaded, "MODELS")? {
+            Some(file) => Manifest::of(name, &modules[file])?,
             None => Manifest::default(),
         };
         Ok(Package {
@@ -115,6 +83,7 @@ impl Package {
                 .map(|(f, s)| ((*f).to_string(), (*s).to_string()))
                 .collect(),
             modules,
+            loaded,
             manifest,
         })
     }
@@ -137,7 +106,7 @@ impl Package {
         hasher.finalize().to_hex().to_string()
     }
 
-    /// What the package states of itself in `package.poem`.
+    /// What the package states of itself in its `MODELS` and `DEPLOYMENTS`.
     #[must_use]
     pub fn manifest(&self) -> &Manifest {
         &self.manifest
@@ -149,11 +118,21 @@ impl Package {
         &self.name
     }
 
-    /// The frozen file `file`.
-    pub(crate) fn module(&self, file: &str) -> anyhow::Result<&FrozenModule> {
-        self.modules
-            .get(file)
-            .ok_or_else(|| anyhow::anyhow!("the package `{}` has no `{file}`", self.name))
+    /// The entry `name` (`layout`, `forward`, …): what the one file that
+    /// defines it defines, or none if no file does.
+    pub(crate) fn entry(&self, name: &str) -> anyhow::Result<Option<OwnedFrozenValue>> {
+        Ok(
+            match defining(&self.name, &self.modules, &self.loaded, name)? {
+                Some(file) => Some(self.modules[file].get(name)?),
+                None => None,
+            },
+        )
+    }
+
+    /// The entry `name`, which the package must define.
+    pub(crate) fn required(&self, name: &str) -> anyhow::Result<OwnedFrozenValue> {
+        self.entry(name)?
+            .ok_or_else(|| anyhow::anyhow!("the package `{}` defines no `{name}`", self.name))
     }
 }
 
@@ -162,6 +141,7 @@ fn freeze(
     file: &str,
     sources: &BTreeMap<&str, &str>,
     modules: &mut BTreeMap<String, FrozenModule>,
+    loaded: &mut BTreeMap<String, BTreeSet<String>>,
     loading: &mut Vec<String>,
 ) -> anyhow::Result<()> {
     if modules.contains_key(file) {
@@ -184,15 +164,11 @@ fn freeze(
     .map_err(|e| anyhow::anyhow!("{e}"))?;
     loading.push(file.to_string());
     for load in ast.loads() {
-        let loaded = load.module_id;
-        let shared = loaded.starts_with(LIBRARY) && Stage::of(loaded) == Stage::of(file);
-        if Stage::of(loaded) != Stage::Lib && !shared {
-            anyhow::bail!(
-                "`{package}/{file}` loads `{loaded}`, a stage of its own; a stage loads only \
-                 helper files and a library's files of its own stage"
-            );
-        }
-        freeze(package, loaded, sources, modules, loading)?;
+        loaded
+            .entry(file.to_string())
+            .or_default()
+            .extend(load.symbols.keys().map(|local| (*local).to_string()));
+        freeze(package, load.module_id, sources, modules, loaded, loading)?;
     }
     loading.pop();
     let loads: Vec<(String, &FrozenModule)> = ast
@@ -204,7 +180,7 @@ fn freeze(
     let loader = ReturnFileLoader {
         modules: &loads_map,
     };
-    let globals = Stage::of(file).globals();
+    let globals = globals();
     let frozen = Module::with_temp_heap(|module| -> anyhow::Result<FrozenModule> {
         {
             let mut eval = Evaluator::new(&module);
@@ -218,4 +194,36 @@ fn freeze(
     })?;
     modules.insert(file.to_string(), frozen);
     Ok(())
+}
+
+/// The prefix of the libraries every package may load: helpers, whose names
+/// are never a package's entries.
+const LIBRARY: &str = "//lib/";
+
+/// The one file of the package's own (`modules` but its libraries) that
+/// defines `name`, or none; two that do are refused, for an entry is the
+/// package's, not a file's.
+fn defining<'m>(
+    package: &str,
+    modules: &'m BTreeMap<String, FrozenModule>,
+    loaded: &BTreeMap<String, BTreeSet<String>>,
+    name: &str,
+) -> anyhow::Result<Option<&'m str>> {
+    let mut found = modules
+        .iter()
+        .filter(|(file, module)| {
+            !file.starts_with(LIBRARY)
+                && module.names().any(|n| n.as_str() == name)
+                && !loaded.get(*file).is_some_and(|names| names.contains(name))
+        })
+        .map(|(file, _)| file.as_str());
+    let first = found.next();
+    if let Some(second) = found.next() {
+        anyhow::bail!(
+            "the package `{package}` defines `{name}` in both `{}` and `{second}`; an entry is \
+             defined once",
+            first.expect("a first before a second")
+        );
+    }
+    Ok(first)
 }

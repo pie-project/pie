@@ -31,18 +31,25 @@ pub struct ToolGrammar {
     pub source: String,
 }
 
-#[must_use]
-pub fn special(tokenizer: &Tokenizer, marker: &str) -> u32 {
-    match tokenizer.token_to_id(marker) {
-        Some(id) => id,
-        None => panic!(
+/// The id of `marker`, a special token the template marks turns with.
+///
+/// # Errors
+///
+/// When the tokenizer's vocabulary has no `marker`.
+pub fn special(tokenizer: &Tokenizer, marker: &str) -> Result<u32, String> {
+    tokenizer.token_to_id(marker).ok_or_else(|| {
+        format!(
             "this tokenizer has no `{marker}`; a template cannot mark a turn with a token its vocabulary does not contain"
-        ),
-    }
+        )
+    })
 }
 
-#[must_use]
-pub fn specials<S: AsRef<str>>(tokenizer: &Tokenizer, markers: &[S]) -> Vec<u32> {
+/// The ids of `markers`, as [`special`] reads each.
+///
+/// # Errors
+///
+/// When the tokenizer's vocabulary misses one of them.
+pub fn specials<S: AsRef<str>>(tokenizer: &Tokenizer, markers: &[S]) -> Result<Vec<u32>, String> {
     markers
         .iter()
         .map(|marker| special(tokenizer, marker.as_ref()))

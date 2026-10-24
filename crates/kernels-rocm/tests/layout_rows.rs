@@ -6,7 +6,7 @@ mod common;
 
 use common::{Gpu, round_bf16, values};
 use dtype::Dtype;
-use kernels_rocm::layout;
+use kernels_rocm::gather;
 
 #[test]
 fn layout_rows() {
@@ -25,7 +25,7 @@ fn layout_rows() {
         let ids = [3i32, 0, 49, 99, 7];
         let id_t = gpu.column(&ids);
         let mut y = gpu.zeros(ids.len() as u32, hidden, Dtype::Bf16);
-        layout::embed(&ctx, id_t, table, vocab, &mut y).unwrap();
+        gather::embed(&ctx, id_t, table, vocab, &mut y).unwrap();
         let got = gpu.read(&y);
         for (n, &id) in ids.iter().enumerate() {
             let src = if (0..vocab as i32).contains(&id) {
@@ -51,7 +51,7 @@ fn layout_rows() {
     let packed = gpu.tensor(&packed_v, rows, heads * 2 * hd, Dtype::Bf16);
     let mut q = gpu.zeros(rows, heads * hd, Dtype::Bf16);
     let mut g = gpu.zeros(rows, heads * hd, Dtype::Bf16);
-    layout::split_q_gate(&ctx, packed, hd, &mut q, &mut g).unwrap();
+    gather::split_q_gate(&ctx, packed, hd, &mut q, &mut g).unwrap();
     let (qv, gv) = (gpu.read(&q), gpu.read(&g));
     for head in 0..(rows * heads) as usize {
         let hd = hd as usize;
@@ -79,7 +79,7 @@ fn layout_rows() {
         let x = gpu.tensor(&xv, rows, lw + rw, dtype);
         let mut l = gpu.zeros(rows, lw, dtype);
         let mut r = gpu.zeros(rows, rw, dtype);
-        layout::split_rows(&ctx, x, lw, &mut l, &mut r).unwrap();
+        gather::split_rows(&ctx, x, lw, &mut l, &mut r).unwrap();
         let (lv, rv) = (gpu.read(&l), gpu.read(&r));
         for n in 0..rows as usize {
             let row = &xv[n * (lw + rw) as usize..(n + 1) * (lw + rw) as usize];
@@ -105,7 +105,7 @@ fn layout_rows() {
     let wide = gpu.tensor(&wide_v, 5, width, Dtype::Bf16);
     let index = gpu.column(&[4, 0, 2]);
     let mut tight = gpu.zeros(3, width, Dtype::Bf16);
-    layout::gather_rows(&ctx, wide, index, &mut tight).unwrap();
+    gather::gather_rows(&ctx, wide, index, &mut tight).unwrap();
     let got = gpu.read(&tight);
     for (n, src) in [4usize, 0, 2].into_iter().enumerate() {
         let w = width as usize;

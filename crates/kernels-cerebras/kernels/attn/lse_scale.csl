@@ -1,0 +1,14 @@
+// o[c * d + i] *= 2^(lse[c] - total[c]) for n cells of d (0 when the total
+// is -inf): a PE's normalised partial reweighted for the merged sum.
+fn k_lse_scale(o: [*]f32, lse: [*]f32, total: [*]f32, n: i32, d: i32) void {
+  var c: i32 = 0;
+  while (c < n) : (c += 1) {
+    var f: f32 = 0.0;
+    if (@bitcast(u32, total[c]) != 0xFF800000) {
+      f = math.exp_f32((lse[c] - total[c]) * 0.6931471805599453);
+    }
+    var i: i32 = 0;
+    while (i < d) : (i += 1) { o[c * d + i] = o[c * d + i] * f; }
+  }
+}
+

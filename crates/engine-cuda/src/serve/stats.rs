@@ -23,7 +23,7 @@ impl Shell {
     pub(crate) fn staging(&self) -> crate::window::Staging<'_> {
         crate::window::Staging {
             regions: &self.staging,
-            from: self.device.ctx().tuning().dsv4_prefill_from,
+            from: self.device.ctx().tuning().compressed_prefill_from,
         }
     }
 

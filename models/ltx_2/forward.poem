@@ -13,7 +13,7 @@ def chunks(x, widths):
     whatever remains."""
     out = []
     for width in widths[:-1]:
-        head, x = ops.layout.split_rows(x, width)
+        head, x = ops.gather.split_rows(x, width)
         out.append(head)
     out.append(x)
     return out
@@ -22,16 +22,16 @@ def attend(q, k, v, rows, over, head_dim, sm_scale, mask):
     """`q`'s rows attending `k` and `v`'s, each side grouped by its own
     `perm` and `csr`."""
     o = ops.attn.ragged(
-        ops.layout.pack_rows(q, rows.perm),
-        ops.layout.pack_rows(k, over.perm),
-        ops.layout.pack_rows(v, over.perm),
+        ops.gather.pack_rows(q, rows.perm),
+        ops.gather.pack_rows(k, over.perm),
+        ops.gather.pack_rows(v, over.perm),
         rows.csr,
         over.csr,
         head_dim,
         sm_scale,
         mask,
     )
-    return ops.layout.unpack_rows(o, rows.perm)
+    return ops.gather.unpack_rows(o, rows.perm)
 
 T_MAX_PERIOD = 10000.0
 NORM_EPS = 1e-6
@@ -97,7 +97,7 @@ def gate_out(o, h, a):
     return linear(a.out, gated)
 
 def self_attention(h, a, dims, g):
-    q, k, v = ops.layout.split_qkv(linear(a.qkv, h), a.inner, a.inner)
+    q, k, v = ops.gather.split_qkv(linear(a.qkv, h), a.inner, a.inner)
     q = turn(qk_norm(q, a.q_norm), g.positions, dims, a.head_dim)
     k = turn(qk_norm(k, a.k_norm), g.positions, dims, a.head_dim)
     o = attend(q, k, v, g, g, a.head_dim, a.sm_scale, group_block_diagonal())
@@ -105,7 +105,7 @@ def self_attention(h, a, dims, g):
 
 def cross_attention(h, ctx, a, rope, qg, kg):
     q = qk_norm(linear(a.qkv, h), a.q_norm)
-    k, v = ops.layout.split_rows(linear(a.kv, ctx), a.inner)
+    k, v = ops.gather.split_rows(linear(a.kv, ctx), a.inner)
     k = qk_norm(k, a.k_norm)
     if rope != None:
         q_pos, k_pos, dims = rope
@@ -187,7 +187,7 @@ def denoise(arm, m):
     )
     cg = struct(lanes = ctx.request_of_token(), perm = ctx.row_permutation(), csr = ctx.group_indptr())
     acg = struct(lanes = actx.request_of_token(), perm = actx.row_permutation(), csr = actx.group_indptr())
-    v_time, _ = ops.layout.split_rows(vg.positions, 1)
+    v_time, _ = ops.gather.split_rows(vg.positions, 1)
 
     vt = vid.lane_vector(0, 1)
     at = aud.lane_vector(0, 1)
@@ -244,7 +244,7 @@ def refine(arm, conn, text_in):
 
 def vconv(x, g, c):
     shape = conv3d(k = [3, 3, 3], stride = [1, 1, 1], pad = [1, 1, 1], pad_back = [1, 1, 1], time_pad = "replicate")
-    return ops.spatial.conv3d(x, g, c.w, c.bias, shape, None)
+    return ops.conv.conv3d(x, g, c.w, c.bias, shape, None)
 
 def norm_silu(x):
     return ops.elemwise.silu(ops.elemwise.rmsnorm_no_scale(x, x.width(), VAE_EPS))
@@ -265,12 +265,12 @@ def vae_decode(arm, vae):
         x = resnet(x, g, r)
     for up in vae.up:
         y, gy = vconv(x, g, up.upsampler)
-        x, g = ops.spatial.pixel_shuffle_trimming(y, gy, up.stride, up.stride[0] - 1)
+        x, g = ops.conv.pixel_shuffle_trimming(y, gy, up.stride, up.stride[0] - 1)
         for r in up.resnets:
             x = resnet(x, g, r)
 
     x = norm_silu(x)
     y, gy = vconv(x, g, vae.conv_out)
-    pixels, gp = ops.spatial.pixel_shuffle(y, gy, [1, vae.patch, vae.patch])
+    pixels, gp = ops.conv.pixel_shuffle(y, gy, [1, vae.patch, vae.patch])
     seam.at(seam.PIXELS, [pixels, gp])
     return pixels

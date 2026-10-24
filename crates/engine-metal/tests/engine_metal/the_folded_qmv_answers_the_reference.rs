@@ -24,7 +24,7 @@ use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::encode::{Arg, Encode, Fire, Grid};
-use kernels_metal::linear::quant;
+use kernels_metal::linear::qmv;
 use poem_ir::Dtype;
 
 const K: u32 = 2048; // contraction; a multiple of every group size and pack width
@@ -253,7 +253,8 @@ fn the_folded_qmv_answers_the_reference() {
 
             for &packs in &[1i32, 2] {
                 for &rung in rungs(packs, bits) {
-                    let Ok(point) = quant::qmv_rows_point("ref-grid", gs as i32, bits, rung, packs)
+                    let Ok(point) =
+                        qmv::rows::qmv_rows_point("ref-grid", gs as i32, bits, rung, packs)
                     else {
                         continue;
                     };
@@ -275,10 +276,11 @@ fn the_folded_qmv_answers_the_reference() {
                             ki.arg(),
                         ];
                         sink.fire(
-                            Fire::at("linear/quant_qmv_rows.metal", point.entry)
+                            Fire::at("linear/qmv_rows.metal", point.entry)
                                 .stamp(point.stamp)
                                 .apply(Grid::of(
-                                    quant::qmv_rows_grid("ref-grid", mi, rung, ni).expect("grid"),
+                                    qmv::rows::qmv_rows_grid("ref-grid", mi, rung, ni)
+                                        .expect("grid"),
                                     [32, 2, 1],
                                 )),
                             &args,

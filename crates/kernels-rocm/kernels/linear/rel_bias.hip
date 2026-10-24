@@ -4,7 +4,7 @@
 // proj[j, d], f32, over each head's `d_rel` relative features and a
 // [d_rel, extent] profile bank. Grid (⌈extent / block⌉, heads, rows).
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::linear {
 

@@ -8,7 +8,7 @@ mod common;
 
 use common::{Gpu, STATE, close_abs, round_bf16, values};
 use dtype::Dtype;
-use kernels_rocm::attn::ssm;
+use kernels_rocm::ssm;
 use kernels_rocm::{RaggedTensor, RecurrentPool, Tensor};
 
 struct Geo {
@@ -223,7 +223,7 @@ fn attn_ssm() {
         .collect();
     let a_log = values(g.v_heads, 8, 1.0);
     let mut gates = gpu.zeros(rows as u32, 2 * g.v_heads as u32, Dtype::F32);
-    ssm::gdn_prep(
+    ssm::gdn_gates(
         &ctx,
         gpu.tensor(&ba, rows as u32, 2 * g.v_heads as u32, Dtype::Bf16),
         gpu.tensor(&dt, 1, g.v_heads as u32, Dtype::Bf16),

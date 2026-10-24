@@ -1,0 +1,82 @@
+var k_dummy_f32: [1]f32;
+var k_dummy_u32: [1]u32;
+const k_base_f32 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> k_dummy_f32[i] });
+const k_base_u32 = @get_dsd(mem1d_dsd, .{ .tensor_access = |i|{1} -> k_dummy_u32[i] });
+
+// Rounds n f32 values at p to bf16 (nearest even) in place.
+fn k_round_bf16(p: [*]f32, n: i32) void {
+  var i: i32 = 0;
+  while (i < n) : (i += 1) {
+    var u: u32 = @bitcast(u32, p[i]);
+    u = u + 0x7FFF + ((u >> 16) & 1);
+    u = u & 0xFFFF0000;
+    p[i] = @bitcast(f32, u);
+  }
+}
+
+// Copies n f32 values from src[soff..] to dst[doff..].
+fn k_copy(dst: [*]f32, doff: i32, src: [*]f32, soff: i32, n: i32) void {
+  var d = @set_dsd_base_addr(k_base_f32, dst);
+  d = @set_dsd_length(d, @bitcast(u16, @as(i16, n)));
+  d = @increment_dsd_offset(d, @as(i16, doff), f32);
+  var s = @set_dsd_base_addr(k_base_f32, src);
+  s = @set_dsd_length(s, @bitcast(u16, @as(i16, n)));
+  s = @increment_dsd_offset(s, @as(i16, soff), f32);
+  @fmovs(d, s);
+}
+
+// Copies n u32 words from src[soff..] to dst[doff..].
+fn k_copy_u32(dst: [*]u32, doff: i32, src: [*]u32, soff: i32, n: i32) void {
+  var d = @set_dsd_base_addr(k_base_u32, dst);
+  d = @set_dsd_length(d, @bitcast(u16, @as(i16, n)));
+  d = @increment_dsd_offset(d, @as(i16, doff), u32);
+  var s = @set_dsd_base_addr(k_base_u32, src);
+  s = @set_dsd_length(s, @bitcast(u16, @as(i16, n)));
+  s = @increment_dsd_offset(s, @as(i16, soff), u32);
+  @mov32(d, s);
+}
+
+// dot(a[aoff..aoff+n], b[boff..boff+n]): per chunk of up to 256, the
+// products by one vector multiply into scratch, then a halving tree of
+// vector adds down to one word. (A reduction into a scalar,
+// `@fadds(&s, s, dsd)`, folds its start value when the compiler knows it
+// and then keeps only the last element, SDK 2.10; the tree never does.)
+const K_DOT_CHUNK: i32 = 256;
+var k_dot_tmp = @zeros([256]f32);
+fn k_dot(a: [*]f32, aoff: i32, b: [*]f32, boff: i32, n: i32) f32 {
+  var s: f32 = 0.0;
+  var at: i32 = 0;
+  while (at < n) : (at += K_DOT_CHUNK) {
+    var len: i32 = n - at;
+    if (len > K_DOT_CHUNK) { len = K_DOT_CHUNK; }
+    var p: i32 = 1;
+    while (p < len) : (p *= 2) {}
+    var da = @set_dsd_base_addr(k_base_f32, a);
+    da = @set_dsd_length(da, @bitcast(u16, @as(i16, len)));
+    da = @increment_dsd_offset(da, @as(i16, aoff + at), f32);
+    var db = @set_dsd_base_addr(k_base_f32, b);
+    db = @set_dsd_length(db, @bitcast(u16, @as(i16, len)));
+    db = @increment_dsd_offset(db, @as(i16, boff + at), f32);
+    var dt = @set_dsd_base_addr(k_base_f32, @ptrcast([*]f32, &k_dot_tmp));
+    dt = @set_dsd_length(dt, @bitcast(u16, @as(i16, len)));
+    @fmuls(dt, da, db);
+    if (p > len) {
+      var dz = @set_dsd_base_addr(k_base_f32, @ptrcast([*]f32, &k_dot_tmp));
+      dz = @set_dsd_length(dz, @bitcast(u16, @as(i16, p - len)));
+      dz = @increment_dsd_offset(dz, @as(i16, len), f32);
+      @fmuls(dz, dz, 0.0);
+    }
+    var h: i32 = p / 2;
+    while (h >= 1) : (h /= 2) {
+      var lo = @set_dsd_base_addr(k_base_f32, @ptrcast([*]f32, &k_dot_tmp));
+      lo = @set_dsd_length(lo, @bitcast(u16, @as(i16, h)));
+      var hi = @set_dsd_base_addr(k_base_f32, @ptrcast([*]f32, &k_dot_tmp));
+      hi = @set_dsd_length(hi, @bitcast(u16, @as(i16, h)));
+      hi = @increment_dsd_offset(hi, @as(i16, h), f32);
+      @fadds(lo, lo, hi);
+    }
+    s = s + k_dot_tmp[0];
+  }
+  return s;
+}
+

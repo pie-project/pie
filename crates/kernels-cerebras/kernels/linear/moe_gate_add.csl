@@ -1,0 +1,19 @@
+// y = routed + sigmoid(gate[row]) * shared.
+fn k_moe_gate_add(routed: [*]f32, shared: [*]f32, gate: [*]f32, y: [*]f32, rows: i32, width: i32) void {
+  var t: i32 = 0;
+  while (t < rows) : (t += 1) {
+    var g: f32 = 1.0 / (1.0 + math.exp_f32(-gate[t]));
+    var dy = @set_dsd_base_addr(k_base_f32, y);
+    dy = @set_dsd_length(dy, @bitcast(u16, @as(i16, width)));
+    dy = @increment_dsd_offset(dy, @as(i16, t * width), f32);
+    var dr = @set_dsd_base_addr(k_base_f32, routed);
+    dr = @set_dsd_length(dr, @bitcast(u16, @as(i16, width)));
+    dr = @increment_dsd_offset(dr, @as(i16, t * width), f32);
+    var ds = @set_dsd_base_addr(k_base_f32, shared);
+    ds = @set_dsd_length(ds, @bitcast(u16, @as(i16, width)));
+    ds = @increment_dsd_offset(ds, @as(i16, t * width), f32);
+    @fmovs(dy, dr);
+    @fmacs(dy, dy, ds, g);
+  }
+}
+

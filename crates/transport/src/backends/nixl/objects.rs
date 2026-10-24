@@ -2,13 +2,28 @@
 //! what speaks it, `AZURE_BLOB`, ...): a buffer is written to a name whole,
 //! and read back from it given its length. The agent moves each batch
 //! between host memory and the store itself; no peer takes part.
+#![allow(unsafe_code)]
 
 use std::ffi::{CString, c_void};
 use std::ptr;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use super::ffi::*;
+use super::ffi::{
+    nixl_capi_agent_t, nixl_capi_backend_t, nixl_capi_create_agent, nixl_capi_create_backend,
+    nixl_capi_create_opt_args, nixl_capi_create_params, nixl_capi_create_query_resp_list,
+    nixl_capi_create_reg_dlist, nixl_capi_create_xfer_dlist, nixl_capi_create_xfer_req,
+    nixl_capi_deregister_mem, nixl_capi_destroy_agent, nixl_capi_destroy_backend,
+    nixl_capi_destroy_opt_args, nixl_capi_destroy_params, nixl_capi_destroy_query_resp_list,
+    nixl_capi_destroy_reg_dlist, nixl_capi_destroy_xfer_dlist, nixl_capi_destroy_xfer_req,
+    nixl_capi_get_xfer_status, nixl_capi_mem_type_t, nixl_capi_mem_type_t_NIXL_CAPI_MEM_DRAM,
+    nixl_capi_mem_type_t_NIXL_CAPI_MEM_OBJECT, nixl_capi_opt_args_add_backend,
+    nixl_capi_opt_args_t, nixl_capi_params_add, nixl_capi_params_t, nixl_capi_post_xfer_req,
+    nixl_capi_query_mem, nixl_capi_query_resp_list_has_value, nixl_capi_query_resp_list_t,
+    nixl_capi_reg_dlist_add_desc, nixl_capi_reg_dlist_t, nixl_capi_register_mem,
+    nixl_capi_release_xfer_req, nixl_capi_xfer_dlist_add_desc, nixl_capi_xfer_dlist_t,
+    nixl_capi_xfer_op_t, nixl_capi_xfer_req_t,
+};
 use super::{OK, READ, WRITE, err};
 use crate::error::{Result, TransportError};
 
@@ -30,9 +45,12 @@ pub struct Objects {
     inner: Mutex<Inner>,
 }
 
-// SAFETY: every NIXL call goes through `inner`'s mutex, as in
-// `NixlBackend`.
+// SAFETY: the agent and backend are NIXL heap objects with no tie to the
+// thread that made them, only dereferenced by NIXL itself, and only under
+// `inner`'s mutex (or `&mut self` in `Drop`), as in `NixlBackend`.
 unsafe impl Send for Objects {}
+// SAFETY: `&Objects` reaches the agent only through `inner`'s mutex, so NIXL
+// never sees two calls at once.
 unsafe impl Sync for Objects {}
 
 /// One object of a batch: its name, and the host bytes it is written from
@@ -52,44 +70,56 @@ impl Objects {
             CString::new(s).map_err(|_| TransportError::Transfer(format!("`{s}` holds a nul")))
         };
         let (name, plugin) = (cstr(agent)?, cstr(plugin)?);
-        unsafe {
-            let mut handle: nixl_capi_agent_t = ptr::null_mut();
-            let st = nixl_capi_create_agent(name.as_ptr(), &mut handle);
-            if st != OK {
-                return Err(err("create_agent", st));
-            }
-            let fail = |what: &str, st| {
-                nixl_capi_destroy_agent(handle);
-                err(what, st)
-            };
-            let mut given: nixl_capi_params_t = ptr::null_mut();
-            let st = nixl_capi_create_params(&mut given);
-            if st != OK {
-                return Err(fail("create_params", st));
-            }
-            for (key, value) in params {
-                let (key, value) = (cstr(key)?, cstr(value)?);
-                let st = nixl_capi_params_add(given, key.as_ptr(), value.as_ptr());
-                if st != OK {
-                    nixl_capi_destroy_params(given);
-                    return Err(fail("params_add", st));
-                }
-            }
-            let mut backend: nixl_capi_backend_t = ptr::null_mut();
-            let st = nixl_capi_create_backend(handle, plugin.as_ptr(), given, &mut backend);
-            nixl_capi_destroy_params(given);
-            if st != OK {
-                return Err(fail("create_backend", st));
-            }
-            Ok(Self {
-                inner: Mutex::new(Inner {
-                    agent: handle,
-                    backend,
-                    name,
-                    next: 0,
-                }),
-            })
+        let params = params
+            .iter()
+            .map(|(key, value)| Ok((cstr(key)?, cstr(value)?)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut handle: nixl_capi_agent_t = ptr::null_mut();
+        // SAFETY: `name` is NUL-terminated and outlives the call; `handle` is
+        // a live out-parameter.
+        let st = unsafe { nixl_capi_create_agent(name.as_ptr(), &mut handle) };
+        if st != OK {
+            return Err(err("create_agent", st));
         }
+        let fail = |what: &str, st| {
+            // SAFETY: `handle` is the agent created above, which nothing else
+            // holds yet; only an early return calls this, once.
+            unsafe { nixl_capi_destroy_agent(handle) };
+            err(what, st)
+        };
+        let mut given: nixl_capi_params_t = ptr::null_mut();
+        // SAFETY: `given` is a live out-parameter.
+        let st = unsafe { nixl_capi_create_params(&mut given) };
+        if st != OK {
+            return Err(fail("create_params", st));
+        }
+        for (key, value) in &params {
+            // SAFETY: `given` is live; `key` and `value` are NUL-terminated and
+            // outlive the call.
+            let st = unsafe { nixl_capi_params_add(given, key.as_ptr(), value.as_ptr()) };
+            if st != OK {
+                // SAFETY: `given` is live and destroyed once, here.
+                unsafe { nixl_capi_destroy_params(given) };
+                return Err(fail("params_add", st));
+            }
+        }
+        let mut backend: nixl_capi_backend_t = ptr::null_mut();
+        // SAFETY: `handle` and `given` are live; `plugin` is NUL-terminated;
+        // `backend` is a live out-parameter.
+        let st = unsafe { nixl_capi_create_backend(handle, plugin.as_ptr(), given, &mut backend) };
+        // SAFETY: the backend copied what it needs; `given` is destroyed once.
+        unsafe { nixl_capi_destroy_params(given) };
+        if st != OK {
+            return Err(fail("create_backend", st));
+        }
+        Ok(Self {
+            inner: Mutex::new(Inner {
+                agent: handle,
+                backend,
+                name,
+                next: 0,
+            }),
+        })
     }
 
     /// Writes each buffer to its name, replacing what was there.
@@ -121,35 +151,55 @@ impl Objects {
             .map(|name| span(name, 0, 0))
             .collect::<Result<Vec<_>>>()?;
         let g = self.inner.lock().unwrap();
-        unsafe {
-            let descs: Vec<_> = names.iter().map(|s| (0, 0, 0, s.name.as_bytes())).collect();
-            let descs = reg_dlist(OBJECT, &descs)?;
-            let mut resp: nixl_capi_query_resp_list_t = ptr::null_mut();
-            let st = nixl_capi_create_query_resp_list(&mut resp);
-            if st != OK {
-                nixl_capi_destroy_reg_dlist(descs);
-                return Err(err("create_query_resp_list", st));
+        let descs: Vec<_> = names.iter().map(|s| (0, 0, 0, s.name.as_bytes())).collect();
+        let descs = reg_dlist(OBJECT, &descs)?;
+        let mut resp: nixl_capi_query_resp_list_t = ptr::null_mut();
+        // SAFETY: `resp` is a live out-parameter.
+        let st = unsafe { nixl_capi_create_query_resp_list(&mut resp) };
+        if st != OK {
+            // SAFETY: `descs` was built above and is destroyed once, here.
+            unsafe { nixl_capi_destroy_reg_dlist(descs) };
+            return Err(err("create_query_resp_list", st));
+        }
+        // SAFETY: `g.backend` is the live backend `open` created.
+        let opts = match unsafe { with_backend(g.backend) } {
+            Ok(opts) => opts,
+            Err(error) => {
+                // SAFETY: both were made above and are destroyed once, here.
+                unsafe {
+                    nixl_capi_destroy_query_resp_list(resp);
+                    nixl_capi_destroy_reg_dlist(descs);
+                }
+                return Err(error);
             }
-            let opts = with_backend(g.backend)?;
-            let st = nixl_capi_query_mem(g.agent, descs, resp, opts);
+        };
+        // SAFETY: `g.agent` is live and used under its lock; `descs`, `resp`
+        // and `opts` were all made above.
+        let st = unsafe { nixl_capi_query_mem(g.agent, descs, resp, opts) };
+        // SAFETY: the query is over; each is destroyed once.
+        unsafe {
             nixl_capi_destroy_opt_args(opts);
             nixl_capi_destroy_reg_dlist(descs);
-            let answer = if st == OK {
-                (0..names.len())
-                    .map(|at| {
-                        let mut has = false;
-                        match nixl_capi_query_resp_list_has_value(resp, at, &mut has) {
-                            OK => Ok(has),
-                            st => Err(err("query_resp_list_has_value", st)),
-                        }
-                    })
-                    .collect()
-            } else {
-                Err(err("query_mem", st))
-            };
-            nixl_capi_destroy_query_resp_list(resp);
-            answer
         }
+        let answer = if st == OK {
+            (0..names.len())
+                .map(|at| {
+                    let mut has = false;
+                    // SAFETY: an answered `resp` holds one entry per
+                    // descriptor, `names.len()` of them; `has` is a live
+                    // out-parameter.
+                    match unsafe { nixl_capi_query_resp_list_has_value(resp, at, &mut has) } {
+                        OK => Ok(has),
+                        st => Err(err("query_resp_list_has_value", st)),
+                    }
+                })
+                .collect()
+        } else {
+            Err(err("query_mem", st))
+        };
+        // SAFETY: `resp` is read no more; it is destroyed once.
+        unsafe { nixl_capi_destroy_query_resp_list(resp) };
+        answer
     }
 
     /// Registers the batch's host buffers and objects, moves it, and
@@ -174,59 +224,84 @@ impl Objects {
                 .map(|&(addr, len, device, _)| (addr, len, device))
                 .collect::<Vec<_>>()
         };
-        unsafe {
-            let opts = with_backend(g.backend)?;
-            let mut registered = Vec::new();
-            let mut moved = Ok(());
-            for (kind, descs) in [(DRAM, &host), (OBJECT, &store)] {
-                let dl = match reg_dlist(kind, descs) {
-                    Ok(dl) => dl,
-                    Err(error) => {
-                        moved = Err(error);
-                        break;
-                    }
-                };
-                let st = nixl_capi_register_mem(g.agent, dl, opts);
-                if st != OK {
-                    nixl_capi_destroy_reg_dlist(dl);
-                    moved = Err(err("register_mem", st));
+        // SAFETY: `g.backend` is the live backend `open` created.
+        let opts = unsafe { with_backend(g.backend) }?;
+        let mut registered = Vec::new();
+        let mut moved = Ok(());
+        for (kind, descs) in [(DRAM, &host), (OBJECT, &store)] {
+            let dl = match reg_dlist(kind, descs) {
+                Ok(dl) => dl,
+                Err(error) => {
+                    moved = Err(error);
                     break;
                 }
-                registered.push(dl);
+            };
+            // SAFETY: `g.agent` and `opts` are live, used under the lock; the
+            // host ranges are the caller's buffers, borrowed for this whole
+            // call and deregistered below before it returns.
+            let st = unsafe { nixl_capi_register_mem(g.agent, dl, opts) };
+            if st != OK {
+                // SAFETY: `dl` did not register; it is destroyed once, here.
+                unsafe { nixl_capi_destroy_reg_dlist(dl) };
+                moved = Err(err("register_mem", st));
+                break;
             }
-            if moved.is_ok() {
-                moved = match (
-                    xfer_dlist(DRAM, &places(&host)),
-                    xfer_dlist(OBJECT, &places(&store)),
-                ) {
-                    (Ok(local), Ok(remote)) => transfer(&g, op, local, remote),
-                    (local, remote) => {
-                        for dl in [&local, &remote].into_iter().flatten() {
-                            nixl_capi_destroy_xfer_dlist(*dl);
-                        }
-                        local.and(remote).map(|_| ())
+            registered.push(dl);
+        }
+        if moved.is_ok() {
+            moved = match (
+                xfer_dlist(DRAM, &places(&host)),
+                xfer_dlist(OBJECT, &places(&store)),
+            ) {
+                // SAFETY: both lists were just built and are handed over;
+                // every range they name was registered above, and the host
+                // buffers outlive this call.
+                (Ok(local), Ok(remote)) => unsafe { transfer(&g, op, local, remote) },
+                (local, remote) => {
+                    for dl in [&local, &remote].into_iter().flatten() {
+                        // SAFETY: a list built above and not handed on; it is
+                        // destroyed once, here.
+                        unsafe { nixl_capi_destroy_xfer_dlist(*dl) };
                     }
-                };
-            }
-            for dl in registered {
+                    local.and(remote).map(|_| ())
+                }
+            };
+        }
+        for dl in registered {
+            // SAFETY: `dl` was registered above with `opts`, and the transfer
+            // is over (`transfer` waits it out); it is deregistered and
+            // destroyed once.
+            unsafe {
                 nixl_capi_deregister_mem(g.agent, dl, opts);
                 nixl_capi_destroy_reg_dlist(dl);
             }
-            nixl_capi_destroy_opt_args(opts);
-            moved
         }
+        // SAFETY: `opts` is used no more; it is destroyed once.
+        unsafe { nixl_capi_destroy_opt_args(opts) };
+        moved
     }
 }
 
+/// Moves the batch between `host` and `store` and waits until it is over.
+///
+/// # Safety
+///
+/// `g.agent` must be live and used by no one else for the call. `host` and
+/// `store` must be live transfer lists, which this consumes; every range they
+/// name must be registered with `g.agent`, and the host memory must stay
+/// alive until this returns.
 unsafe fn transfer(
     g: &Inner,
     op: nixl_capi_xfer_op_t,
     host: nixl_capi_xfer_dlist_t,
     store: nixl_capi_xfer_dlist_t,
 ) -> Result<()> {
-    unsafe {
-        let mut req: nixl_capi_xfer_req_t = ptr::null_mut();
-        let st = nixl_capi_create_xfer_req(
+    let mut req: nixl_capi_xfer_req_t = ptr::null_mut();
+    // SAFETY: the caller hands over a live agent and two live lists; `g.name`
+    // is NUL-terminated (the agent's own: the store is local); `req` is a live
+    // out-parameter.
+    let st = unsafe {
+        nixl_capi_create_xfer_req(
             g.agent,
             op,
             host,
@@ -234,29 +309,40 @@ unsafe fn transfer(
             g.name.as_ptr(),
             &mut req,
             ptr::null_mut(),
-        );
+        )
+    };
+    // SAFETY: the request copied the lists, which are ours to destroy once.
+    unsafe {
         nixl_capi_destroy_xfer_dlist(host);
         nixl_capi_destroy_xfer_dlist(store);
-        if st != OK {
-            return Err(err("create_xfer_req", st));
-        }
-        let mut st = nixl_capi_post_xfer_req(g.agent, req, ptr::null_mut());
-        while st == super::INPROG {
-            std::thread::sleep(POLL);
-            st = nixl_capi_get_xfer_status(g.agent, req);
-        }
+    }
+    if st != OK {
+        return Err(err("create_xfer_req", st));
+    }
+    // SAFETY: `req` was just created on `g.agent`; no notification is sent.
+    let mut st = unsafe { nixl_capi_post_xfer_req(g.agent, req, ptr::null_mut()) };
+    while st == super::INPROG {
+        std::thread::sleep(POLL);
+        // SAFETY: `req` is live and posted on `g.agent`.
+        st = unsafe { nixl_capi_get_xfer_status(g.agent, req) };
+    }
+    // SAFETY: `req`'s status is final, so nothing is in flight; it is
+    // released and destroyed once.
+    unsafe {
         nixl_capi_release_xfer_req(g.agent, req);
         nixl_capi_destroy_xfer_req(req);
-        if st != OK {
-            return Err(err("moving objects", st));
-        }
-        Ok(())
     }
+    if st != OK {
+        return Err(err("moving objects", st));
+    }
+    Ok(())
 }
 
 impl Drop for Objects {
     fn drop(&mut self) {
         let g = self.inner.get_mut().unwrap();
+        // SAFETY: the backend and agent `open` created, each destroyed once,
+        // the backend first; `&mut self` rules out any call in flight.
         unsafe {
             nixl_capi_destroy_backend(g.backend);
             nixl_capi_destroy_agent(g.agent);
@@ -270,69 +356,87 @@ fn span(name: &str, addr: usize, len: usize) -> Result<Span> {
     Ok(Span { name, addr, len })
 }
 
+/// Transfer options naming `backend`; the caller destroys them.
+///
+/// # Safety
+///
+/// `backend` must be a live NIXL backend handle.
 unsafe fn with_backend(backend: nixl_capi_backend_t) -> Result<nixl_capi_opt_args_t> {
-    unsafe {
-        let mut opts: nixl_capi_opt_args_t = ptr::null_mut();
-        let st = nixl_capi_create_opt_args(&mut opts);
-        if st != OK {
-            return Err(err("create_opt_args", st));
-        }
-        let st = nixl_capi_opt_args_add_backend(opts, backend);
-        if st != OK {
-            nixl_capi_destroy_opt_args(opts);
-            return Err(err("opt_args_add_backend", st));
-        }
-        Ok(opts)
+    let mut opts: nixl_capi_opt_args_t = ptr::null_mut();
+    // SAFETY: `opts` is a live out-parameter.
+    let st = unsafe { nixl_capi_create_opt_args(&mut opts) };
+    if st != OK {
+        return Err(err("create_opt_args", st));
     }
+    // SAFETY: `opts` was just created; the caller vouches for `backend`.
+    let st = unsafe { nixl_capi_opt_args_add_backend(opts, backend) };
+    if st != OK {
+        // SAFETY: `opts` is live and destroyed once, here.
+        unsafe { nixl_capi_destroy_opt_args(opts) };
+        return Err(err("opt_args_add_backend", st));
+    }
+    Ok(opts)
 }
 
-unsafe fn reg_dlist(
+/// A registration list of `kind` holding `descs` as `(addr, len, device,
+/// metadata)`. The list only records them: nothing is read until it is
+/// registered, which is the caller's to answer for. The caller destroys it.
+fn reg_dlist(
     kind: nixl_capi_mem_type_t,
     descs: &[(usize, usize, u64, &[u8])],
 ) -> Result<nixl_capi_reg_dlist_t> {
-    unsafe {
-        let mut dl: nixl_capi_reg_dlist_t = ptr::null_mut();
-        let st = nixl_capi_create_reg_dlist(kind, &mut dl);
-        if st != OK {
-            return Err(err("create_reg_dlist", st));
-        }
-        for &(addr, len, device, meta) in descs {
-            let st = nixl_capi_reg_dlist_add_desc(
+    let mut dl: nixl_capi_reg_dlist_t = ptr::null_mut();
+    // SAFETY: `dl` is a live out-parameter.
+    let st = unsafe { nixl_capi_create_reg_dlist(kind, &mut dl) };
+    if st != OK {
+        return Err(err("create_reg_dlist", st));
+    }
+    for &(addr, len, device, meta) in descs {
+        // SAFETY: `dl` is live; `meta` is `meta.len()` readable bytes, which
+        // NIXL copies.
+        let st = unsafe {
+            nixl_capi_reg_dlist_add_desc(
                 dl,
                 addr,
                 len,
                 device,
                 meta.as_ptr() as *const c_void,
                 meta.len(),
-            );
-            if st != OK {
-                nixl_capi_destroy_reg_dlist(dl);
-                return Err(err("reg_dlist_add_desc", st));
-            }
+            )
+        };
+        if st != OK {
+            // SAFETY: `dl` is not returned; it is destroyed once, here.
+            unsafe { nixl_capi_destroy_reg_dlist(dl) };
+            return Err(err("reg_dlist_add_desc", st));
         }
-        Ok(dl)
     }
+    Ok(dl)
 }
 
-unsafe fn xfer_dlist(
+/// A transfer list of `kind` holding `descs` as `(addr, len, device)`. The
+/// list only records them: NIXL checks them against registered memory when
+/// a request is built from it. The caller destroys it.
+fn xfer_dlist(
     kind: nixl_capi_mem_type_t,
     descs: &[(usize, usize, u64)],
 ) -> Result<nixl_capi_xfer_dlist_t> {
-    unsafe {
-        let mut dl: nixl_capi_xfer_dlist_t = ptr::null_mut();
-        let st = nixl_capi_create_xfer_dlist(kind, &mut dl);
-        if st != OK {
-            return Err(err("create_xfer_dlist", st));
-        }
-        for &(addr, len, device) in descs {
-            let st = nixl_capi_xfer_dlist_add_desc(dl, addr, len, device);
-            if st != OK {
-                nixl_capi_destroy_xfer_dlist(dl);
-                return Err(err("xfer_dlist_add_desc", st));
-            }
-        }
-        Ok(dl)
+    let mut dl: nixl_capi_xfer_dlist_t = ptr::null_mut();
+    // SAFETY: `dl` is a live out-parameter.
+    let st = unsafe { nixl_capi_create_xfer_dlist(kind, &mut dl) };
+    if st != OK {
+        return Err(err("create_xfer_dlist", st));
     }
+    for &(addr, len, device) in descs {
+        // SAFETY: `dl` is live; a descriptor is plain data until a request is
+        // built from the list.
+        let st = unsafe { nixl_capi_xfer_dlist_add_desc(dl, addr, len, device) };
+        if st != OK {
+            // SAFETY: `dl` is not returned; it is destroyed once, here.
+            unsafe { nixl_capi_destroy_xfer_dlist(dl) };
+            return Err(err("xfer_dlist_add_desc", st));
+        }
+    }
+    Ok(dl)
 }
 
 #[cfg(test)]

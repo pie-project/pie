@@ -1,5 +1,6 @@
 //! A MIL program compiled for and loaded on the Neural Engine, and the
 //! bindings that tie its procedures to surfaces.
+#![allow(unsafe_code)]
 
 use std::ffi::{CStr, CString, c_int, c_void};
 use std::path::Path;
@@ -52,11 +53,20 @@ pub struct Program(Arc<RawProgram>);
 
 struct RawProgram(*mut c_void);
 
+// SAFETY: the bridge's `Program` is written only by `pie_ane_program` before
+// the handle exists and by `pie_ane_program_free` in `Drop`; between them it
+// is read-only, and its load and unload run on the bridge's serial queue.
+// Evaluations go to the process-wide `_ANEClient` connection, assumed (not
+// documented: the framework is private) to accept them from any thread.
 unsafe impl Send for RawProgram {}
+// SAFETY: as `Send`: every `&Program` call only reads the handle's fixed
+// arrays or hands its model to the shared connection.
 unsafe impl Sync for RawProgram {}
 
 impl Drop for RawProgram {
     fn drop(&mut self) {
+        // SAFETY: the handle came from `pie_ane_program` and this is its one
+        // owner's last reference, so nothing uses it after the free.
         unsafe { sys::pie_ane_program_free(self.0) };
     }
 }
@@ -81,6 +91,8 @@ impl Program {
             CString::new(directory.to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
         let key = CString::new(key).map_err(|e| e.to_string())?;
         let mut err = sys::message();
+        // SAFETY: both strings are NUL-terminated and live across the call;
+        // `err` is a `CAP`-byte buffer, the length the call is told.
         let raw = unsafe {
             sys::pie_ane_program(
                 directory.as_ptr(),
@@ -103,6 +115,7 @@ impl Program {
     #[must_use]
     pub fn procedure(&self, function: &str) -> Option<u32> {
         let function = CString::new(function).ok()?;
+        // SAFETY: a live program handle and a NUL-terminated name.
         let index = unsafe { sys::pie_ane_procedure(self.raw(), function.as_ptr()) };
         u32::try_from(index).ok()
     }
@@ -110,10 +123,16 @@ impl Program {
     /// The procedure's input names, in the order a binding supplies them.
     #[must_use]
     pub fn inputs(&self, procedure: u32) -> Vec<String> {
+        // SAFETY: a live program handle; the bridge answers 0 for a procedure
+        // the program does not have.
         let count = unsafe { sys::pie_ane_input_count(self.raw(), procedure as c_int) };
         (0..count)
             .map(|i| {
+                // SAFETY: a live handle, and `procedure` has `count` inputs, so
+                // `i` names one.
                 let name = unsafe { sys::pie_ane_input_name(self.raw(), procedure as c_int, i) };
+                // SAFETY: the name is a NUL-terminated string the program's
+                // input array keeps alive; it is copied out at once.
                 unsafe { CStr::from_ptr(name) }
                     .to_string_lossy()
                     .into_owned()
@@ -131,6 +150,9 @@ impl Program {
     ) -> Result<Binding, String> {
         let raw: Vec<*mut c_void> = inputs.iter().map(|s| s.handle()).collect();
         let mut err = sys::message();
+        // SAFETY: a live program handle; `raw` holds `raw.len()` live surface
+        // handles and `output` is live; the bridge refuses a procedure the
+        // program does not have; `err` is `CAP` bytes, as the call is told.
         let binding = unsafe {
             sys::pie_ane_bind(
                 self.raw(),
@@ -166,6 +188,9 @@ impl Program {
         report: Box<dyn FnOnce(bool) + Send>,
     ) -> Result<(), String> {
         extern "C" fn reported(context: *mut c_void, success: c_int) {
+            // SAFETY: `context` is the box `enqueue` leaked below, and the
+            // bridge calls this at most once per request, only for one it
+            // handed over, when `enqueue` does not take it back.
             let report: Box<Box<dyn FnOnce(bool) + Send>> =
                 unsafe { Box::from_raw(context.cast()) };
             report(success == 1);
@@ -174,6 +199,11 @@ impl Program {
         let waits_on = Retained::as_ptr(waits_on).cast_mut().cast::<c_void>();
         let signals = Retained::as_ptr(signals).cast_mut().cast::<c_void>();
         let mut err = sys::message();
+        // SAFETY: live program and binding handles; the caller's `Retained`s
+        // keep both events alive across the call, and the bridge's ARC wrappers
+        // take their own references past it;
+        // `reported` matches `context`'s type; the caller keeps the surfaces
+        // alive (this function's contract); `err` is `CAP` bytes.
         let queued = unsafe {
             sys::pie_ane_enqueue(
                 self.raw(),
@@ -198,6 +228,8 @@ impl Program {
                 Ok(())
             }
             _ => {
+                // SAFETY: 0 means nothing was handed over, so `reported` will
+                // never run and the box leaked above is still ours alone.
                 drop(unsafe { Box::from_raw(context.cast::<Box<dyn FnOnce(bool) + Send>>()) });
                 Err(sys::failure(&err))
             }
@@ -212,11 +244,17 @@ pub struct Binding(Arc<RawBinding>);
 
 struct RawBinding(*mut c_void);
 
+// SAFETY: the bridge's `Binding` is filled once by `pie_ane_bind` with
+// immutable `NSArray`s and `NSNumber`s, which are safe to read from any
+// thread, and freed only in `Drop`.
 unsafe impl Send for RawBinding {}
+// SAFETY: as `Send`: `&Binding` is only read, by `enqueue`.
 unsafe impl Sync for RawBinding {}
 
 impl Drop for RawBinding {
     fn drop(&mut self) {
+        // SAFETY: the handle came from `pie_ane_bind` and this is its one
+        // owner's last reference, so nothing uses it after the free.
         unsafe { sys::pie_ane_binding_free(self.0) };
     }
 }

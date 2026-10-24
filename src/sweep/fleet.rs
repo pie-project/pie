@@ -46,7 +46,7 @@ async fn run_one(addr: &str, program: &str, input: &str) -> Result<Vec<i64>, Str
         .await
         .map_err(|e| format!("connect ws://{addr}/v1/ws: {e}"))?;
     client
-        .authenticate("pie-sweep", &None)
+        .authenticate("pie-sweep", None)
         .await
         .map_err(|e| format!("authenticate: {e}"))?;
     let mut process = client

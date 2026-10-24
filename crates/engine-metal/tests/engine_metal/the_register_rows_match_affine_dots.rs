@@ -2,7 +2,7 @@
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
-use kernels_metal::linear::quant;
+use kernels_metal::linear::qmm;
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
 
@@ -108,13 +108,13 @@ fn every_register_row_answers_an_affine_reference() {
                 };
                 let frame = device.frame().expect("frame");
                 let sink = Sink::new(&device, &frame, &pipelines, &handles);
-                quant::matmul(
+                qmm::matmul(
                     &sink,
                     &tuning,
                     Tensor::new(ha, m, k, Dtype::Bf16),
                     bank,
                     Tensor::new(ho, m, n, Dtype::Bf16),
-                    quant::Scratch {
+                    qmm::Scratch {
                         precast: &precast,
                         partials: &partials,
                         table: None,
@@ -264,16 +264,16 @@ fn a_table_one_matmul_laid_feeds_the_next() {
                 }
                 Some((table, standing))
             };
-            let run = |bank: Bank, n: u32, out: u32, table: Option<quant::KeptTable<'_>>| {
+            let run = |bank: Bank, n: u32, out: u32, table: Option<qmm::KeptTable<'_>>| {
                 let frame = device.frame().expect("frame");
                 let sink = Sink::new(&device, &frame, &pipelines, &handles);
-                quant::matmul(
+                qmm::matmul(
                     &sink,
                     &tuning,
                     act,
                     bank,
                     Tensor::new(out, m, n, Dtype::Bf16),
-                    quant::Scratch {
+                    qmm::Scratch {
                         precast: &precast,
                         partials: &partials,
                         table,
@@ -393,13 +393,13 @@ fn a_norm_lays_the_table_its_projections_read() {
                 let kept = |rows: u32, width: u32, _: u32| Some((precast(rows, width)?, laid));
                 let frame = device.frame().expect("frame");
                 let sink = Sink::new(&device, &frame, &pipelines, &handles);
-                quant::matmul(
+                qmm::matmul(
                     &sink,
                     &tuning,
                     plain_out,
                     bank,
                     Tensor::new(out, m, n, Dtype::Bf16),
-                    quant::Scratch {
+                    qmm::Scratch {
                         precast: &precast,
                         partials: &partials,
                         table: Some(&kept),
@@ -502,13 +502,13 @@ fn a_swiglu_lays_the_table_its_down_reads() {
             let partials = |rows: u32, width: u32| {
                 (rows <= 64 && width == n).then(|| Tensor::new(ph, rows, width, Dtype::F32))
             };
-            quant::matmul(
+            qmm::matmul(
                 &sink,
                 &tuning,
                 plain,
                 bank,
                 Tensor::new(yh, m, n, Dtype::Bf16),
-                quant::Scratch {
+                qmm::Scratch {
                     precast: &precast,
                     partials: &partials,
                     table: None,
@@ -576,13 +576,13 @@ fn own_table(
     };
     let frame = device.frame().expect("frame");
     let sink = Sink::new(device, &frame, pipelines, handles);
-    quant::matmul(
+    qmm::matmul(
         &sink,
         &tuning,
         act,
         bank,
         Tensor::new(bind(&out_b), m, n, Dtype::Bf16),
-        quant::Scratch {
+        qmm::Scratch {
             precast: &precast,
             partials: &partials,
             table: None,

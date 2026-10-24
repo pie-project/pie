@@ -1,4 +1,4 @@
-use kernels_vulkan::Tensor;
+use kernels_slang::Tensor;
 use poem_compiler::{ArenaMap, FireRows};
 use poem_exec::store::arena::rect;
 use poem_ir::ValueId;

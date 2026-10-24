@@ -432,18 +432,18 @@ impl From<poem_exec::KernelError> for Fault {
 
 pub type Result<T> = std::result::Result<T, Fault>;
 
-impl From<kernels_vulkan::Error> for Fault {
-    fn from(error: kernels_vulkan::Error) -> Self {
+impl From<kernels_slang::Error> for Fault {
+    fn from(error: kernels_slang::Error) -> Self {
         Fault::from(kernel(error))
     }
 }
 
-pub fn kernel(error: kernels_vulkan::Error) -> KernelError {
+pub fn kernel(error: kernels_slang::Error) -> KernelError {
     match error {
-        kernels_vulkan::Error::Unsupported { op } => KernelError::Unsupported { op },
-        kernels_vulkan::Error::DtypeUnsupported { op, dtype } => {
+        kernels_slang::Error::Unsupported { op } => KernelError::Unsupported { op },
+        kernels_slang::Error::DtypeUnsupported { op, dtype } => {
             KernelError::DtypeUnsupported { op, dtype }
         }
-        kernels_vulkan::Error::Backend { op, detail } => KernelError::Backend { op, detail },
+        kernels_slang::Error::Backend { op, detail } => KernelError::Backend { op, detail },
     }
 }

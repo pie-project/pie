@@ -2,6 +2,7 @@ use poem_compiler::{Budget, Budgets, DeviceProfile, PatchLadder, RowAxis, compil
 use poem_ir::{
     CacheRow, Def, Dim, Dtype, Guard, Node, Operation, Param, Seam, Trace, Ty, ValueDecl, ValueId,
 };
+use poem_ir::{NormAxis, NormWeight};
 
 #[test]
 fn a_plan_that_states_patch_rows_bakes_two_units_and_stands_the_fold_down() {
@@ -56,11 +57,12 @@ fn tower_and_trunk() -> Trace {
     {
         let y = push(&mut values, Def::Op(at as u32), ty);
         nodes.push(Node {
-            op: Operation::Elementwise(poem_ir::Elementwise::RmsnormNoScale {
+            op: Operation::Elemwise(poem_ir::Elemwise::Rmsnorm {
                 x: chain,
-                head_dim: 1,
+                axis: NormAxis::Head(1),
                 eps: 1e-6,
                 y,
+                weight: NormWeight::None,
             }),
             guard: Guard::Always,
             layer: None,

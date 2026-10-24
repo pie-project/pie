@@ -314,13 +314,13 @@ impl Instance {
     fn with_chan<R>(&self, i: usize, f: impl FnOnce(&ChannelState) -> R) -> R {
         match &self.channels[i] {
             Chan::Local(st) => f(st),
-            Chan::Shared(ext) => f(&ext.inner.lock().unwrap_or_else(|e| e.into_inner())),
+            Chan::Shared(ext) => f(&ext.inner.lock().expect("lock poisoned")),
         }
     }
     fn with_chan_mut<R>(&mut self, i: usize, f: impl FnOnce(&mut ChannelState) -> R) -> R {
         match &mut self.channels[i] {
             Chan::Local(st) => f(st),
-            Chan::Shared(ext) => f(&mut ext.inner.lock().unwrap_or_else(|e| e.into_inner())),
+            Chan::Shared(ext) => f(&mut ext.inner.lock().expect("lock poisoned")),
         }
     }
     pub fn peek_front(&self, chan: u32) -> Option<Value> {

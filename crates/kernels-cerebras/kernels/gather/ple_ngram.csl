@@ -1,0 +1,84 @@
+// v mod m over u64 by long division (the hash primes need no u64 divide).
+fn k_umod64(v: u64, m: u64) u64 {
+  var x: u64 = v;
+  var r: u64 = 0;
+  var i: i32 = 0;
+  while (i < 64) : (i += 1) {
+    r = (r << 1) | (x >> 63);
+    x = x << 1;
+    if (r >= m) { r = r - m; }
+  }
+  return r;
+}
+// Each lane's rows [b, e) (lane l's bounds indptr[l], indptr[l + 1], or row
+// l alone when per_row) hash [id(t), the span ids before it] (the lane's
+// kept window in slab[slots[b]] before row b; after an eos only eos) with
+// mults into mixed, head (p, i) landing mixed mod primes[(p - 1) hpn + i]
+// + offsets[...] in out[t][...]; then the window moves on by the lane's
+// ids (as id + 1).
+fn k_ple_ngram(ids: [*]i32, indptr: [*]i32, lanes: i32, per_row: bool, slots: [*]i32, slab: [*]i32, slab_rows: i32,
+               out: [*]i32, rows: i32, eos: i32, mults: [*]u64, primes: [*]u64, offsets: [*]u64,
+               span: i32, heads: i32, hpn: i32, window: [*]i32, past: [*]i32) void {
+  var l: i32 = 0;
+  while (l < lanes) : (l += 1) {
+    var b: i32 = l;
+    var e: i32 = l + 1;
+    if (!per_row) { b = indptr[l]; e = indptr[l + 1]; }
+    if (b < 0) { b = 0; }
+    if (e < b) { e = b; }
+    if (b > rows) { b = rows; }
+    if (e > rows) { e = rows; }
+    var n: i32 = e - b;
+    var slot: i32 = -1;
+    if (b < rows) { slot = slots[b]; }
+    var kept: bool = slot >= 0 and slot < slab_rows;
+    var s: i32 = 0;
+    while (s < span) : (s += 1) {
+      past[s] = 0;
+      if (kept) { past[s] = slab[slot * span + s]; }
+    }
+    var j: i32 = 0;
+    while (j < n) : (j += 1) {
+      var t: i32 = b + j;
+      window[0] = ids[t];
+      var crossed: bool = false;
+      var p: i32 = 1;
+      while (p <= span) : (p += 1) {
+        var src: i32 = j - p;
+        var w: i32 = eos;
+        if (src >= 0) {
+          w = ids[t - p];
+        } else {
+          var cell: i32 = past[span + src];
+          if (cell == 0) { w = eos; } else { w = cell - 1; }
+        }
+        if (crossed) { w = eos; }
+        if (w == eos) { crossed = true; }
+        window[p] = w;
+      }
+      var mixed: u64 = 0;
+      p = 0;
+      while (p <= span) : (p += 1) {
+        mixed = mixed ^ (@bitcast(u64, @as(i64, window[p])) * mults[p]);
+        if (p >= 1) {
+          var lo: i32 = (p - 1) * hpn;
+          var i: i32 = 0;
+          while (i < hpn) : (i += 1) {
+            var r: u64 = k_umod64(mixed, primes[lo + i]) + offsets[lo + i];
+            out[t * heads + lo + i] = @bitcast(i32, @as(u32, r & 0xFFFFFFFF));
+          }
+        }
+      }
+    }
+    if (n > 0 and kept) {
+      s = 0;
+      while (s < span) : (s += 1) {
+        var src: i32 = n - span + s;
+        if (src >= 0) { window[s] = ids[b + src] + 1; } else { window[s] = past[src + span]; }
+      }
+      s = 0;
+      while (s < span) : (s += 1) { slab[slot * span + s] = window[s]; }
+    }
+  }
+}
+

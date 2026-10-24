@@ -4,7 +4,7 @@ use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
 use kernels_metal::elemwise::{gate, modulate, norm, pointwise, rope_axes, sinusoid};
-use kernels_metal::layout;
+use kernels_metal::gather;
 use poem_ir::Dtype;
 
 fn noise(at: u64) -> u32 {
@@ -803,7 +803,7 @@ fn a_pack_and_its_unpack_round_trip_the_rectangle() {
     let pt = Tensor::new(hp, ROWS, 1, Dtype::I32);
     let tight = Tensor::new(ht, PACKED, WIDTH, Dtype::Bf16);
 
-    rig.fire(|s| layout::pack_rows(s, xt, pt, tight).expect("pack"));
+    rig.fire(|s| gather::pack_rows(s, xt, pt, tight).expect("pack"));
     let packed = rig.read(ht, (PACKED * WIDTH) as usize, Dtype::Bf16);
     let w = WIDTH as usize;
     for (i, &from) in perm.iter().take(PACKED as usize).enumerate() {
@@ -818,7 +818,7 @@ fn a_pack_and_its_unpack_round_trip_the_rectangle() {
     let sentinel = vec![bf16_round(7.5); n];
     let (_ub, hu) = rig.plane(&sentinel, Dtype::Bf16);
     let wide = Tensor::new(hu, ROWS, WIDTH, Dtype::Bf16);
-    rig.fire(|s| layout::unpack_rows(s, tight, pt, wide).expect("unpack"));
+    rig.fire(|s| gather::unpack_rows(s, tight, pt, wide).expect("unpack"));
     let back = rig.read(hu, n, Dtype::Bf16);
     for row in 0..ROWS as usize {
         let named = perm

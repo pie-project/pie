@@ -144,7 +144,7 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
     let profile = poem_compiler::DeviceProfile::of(chip, sms, &crate::EXCLUSIVE, grouped);
     let trace = poem_compiler::fuse::fuse(
         row.trace(poem::Platform::Cuda),
-        &poem_compiler::fuse::flags::kernels(chip),
+        poem_compiler::fuse::flags::on(chip, &crate::FUSIONS),
     );
     #[cfg(not(feature = "rocm"))]
     let trace = {
@@ -155,7 +155,7 @@ fn plan_of(deployment: &str, chip: &Profile, sms: u32) -> Option<u64> {
                 tuning.decode_grouped_prefill_from,
                 tuning.decode_grouped_prefill_lse,
                 tuning.decode_grouped_prefill_window,
-                kernels_cuda::attn::xqa::Gate::of(tuning),
+                kernels_cuda::attn::decode_gqa::Gate::of(tuning),
             ),
             tuning.ssm_gdn_out_bf16,
         )

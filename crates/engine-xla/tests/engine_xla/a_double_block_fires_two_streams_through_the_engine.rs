@@ -168,7 +168,7 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
         "second fire, request 1 image",
     );
 
-    // Attention classes: text rows class 0, image rows class 1, and a table
+    // Attn classes: text rows class 0, image rows class 1, and a table
     // that keeps each class to itself, so each stream attends only within
     // itself (engine-cuda's ragged `ClassTable`).
     let apart = [request(&mut rng, 3, 5), request(&mut rng, 4, 6)];

@@ -513,7 +513,7 @@ fn kv_append_lands_each_row_in_its_slot_and_drops_the_padded_ones() {
 fn decode_over_a_wide_pool_spreads_lanes_over_pes() {
     let mut rng = Rng(21);
     let (qh, kvh, d) = (4, 2, 64);
-    // 9 pages x 4 rows x 128 wide: 4608 words a plane, past shard_words().
+    // 9 pages x 4 rows x 128 wide: 4608 words a plane, past the default shard_words.
     let pool = Pool::new(
         &mut rng,
         4,

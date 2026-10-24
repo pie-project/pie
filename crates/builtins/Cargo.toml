@@ -10,3 +10,6 @@ repository = "https://github.com/pie-project/pie"
 # Also embed the `test-*` policies, which misbehave on purpose: for the
 # policy hosts' own tests.
 test-policies = []
+
+[lints]
+workspace = true

@@ -12,7 +12,7 @@
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
-use kernels_metal::attn::ssm::{self, Committed, Paged, RS_SNAPSHOTS, Snapshots, VerifyGates};
+use kernels_metal::ssm::{self, Committed, Paged, RS_SNAPSHOTS, Snapshots, VerifyGates};
 use kernels_metal::tensor::RecurrentPool;
 use poem_ir::Dtype;
 
@@ -252,7 +252,7 @@ fn buffered(bench: &Bench, lanes: &Lanes, ext: Tensor) -> Buffered {
     const PLANE_AT: u32 = 256;
     let row = u64::from(ext.width) * ext.dtype.bits() / 8;
     let page_bytes = (u64::from(PLANE_AT) + u64::from(PAGE) * row).next_multiple_of(256);
-    let pages_a_lane = (kernels_metal::attn::ssm::RS_PAGE_INTS - 1) as usize;
+    let pages_a_lane = (kernels_metal::ssm::RS_PAGE_INTS - 1) as usize;
     let slots = lanes.rows.len() * pages_a_lane;
     let mut slab = vec![0u8; slots * page_bytes as usize];
     let mut table = Vec::new();
@@ -297,7 +297,7 @@ impl Buffered {
     /// Whether each lane's own rows landed in its buffer after its replayed
     /// ones.
     fn landed(&self, bench: &Bench, lanes: &Lanes) -> bool {
-        let pages_a_lane = (kernels_metal::attn::ssm::RS_PAGE_INTS - 1) as usize;
+        let pages_a_lane = (kernels_metal::ssm::RS_PAGE_INTS - 1) as usize;
         let row = u64::from(self.paged.row_bytes);
         lanes
             .spans()
@@ -808,8 +808,13 @@ fn price_round(bench: &Bench, rows: i32, replay: i32) {
             .iter()
             .position(|l| l.slots.buf == c.slots.buf)
             .unwrap_or(0) as u32;
-        kernels_metal::layout::copy_words(sink, slot(at), slot(at + LAYERS / 2), BANK_FLOATS * 4)
-            .expect("a bank copy");
+        kernels_metal::runtime::blit::copy_words(
+            sink,
+            slot(at),
+            slot(at + LAYERS / 2),
+            BANK_FLOATS * 4,
+        )
+        .expect("a bank copy");
     };
     if rows == 1 {
         eprintln!("one layer's bank copied: {:.1} us", price(&copy));

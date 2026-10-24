@@ -1,6 +1,7 @@
 //! The weight storage contract (`kernels_xla::pack`): banks landed the way
-//! the engine lands them — codes one per element in a native narrow type,
-//! mxfp4 pre-scaled to e5m2 — read by the dense, routed and gather kernels.
+//! the engine lands them (`engine_xla::pack`) — codes one per element in a
+//! native narrow type, mxfp4 pre-scaled to e5m2 — read by the dense, routed
+//! and gather kernels.
 //! The device types come from `engine_xla::trace::storage`, as the engine's
 //! tracer makes them.
 
@@ -10,12 +11,15 @@ use std::collections::{BTreeSet, HashMap};
 use dtype::Dtype;
 use engine_xla::bench::{assert_close, client, round_bf16};
 use engine_xla::device::element_type;
+use engine_xla::emit::{Cx, Emit, Env};
+use engine_xla::handle::{Bank, Tensor};
+use engine_xla::pack;
 use engine_xla::pjrt::Arg;
 use engine_xla::trace::storage;
+use kernels_xla::gather;
 use kernels_xla::hlo::{Func, Val, bf16_bits};
-use kernels_xla::linear::{moe, quant};
+use kernels_xla::linear::moe;
 use kernels_xla::tuning::{MoePath, Tuning};
-use kernels_xla::{Bank, Cx, Emit, Env, Tensor, layout, pack};
 
 fn hash(i: usize, seed: u32) -> u32 {
     (i as u32)
@@ -66,7 +70,7 @@ impl Native {
 
     fn run(
         &mut self,
-        body: impl FnOnce(&kernels_xla::Ctx<'_>) -> Result<(), kernels_xla::Error>,
+        body: impl FnOnce(&engine_xla::emit::Ctx<'_>) -> Result<(), kernels_xla::Error>,
     ) -> bool {
         let Some(client) = client() else {
             return false;
@@ -330,7 +334,7 @@ fn dense_projections_read_native_codes_and_prescaled_weights() {
         let o = outs.clone();
         if !nat.run(|ctx| {
             for (bank, y) in &o {
-                quant::matmul(ctx, xt, *bank, *y)?;
+                engine_xla::lower::linear::quant(ctx, false, xt, *bank, *y)?;
             }
             Ok(())
         }) {
@@ -360,7 +364,16 @@ fn an_embedding_gathers_native_codes() {
         width as u32,
         &vec![0.0; ids.len() * width],
     );
-    if !nat.run(|ctx| layout::embed_gather_mb_4bit(ctx, it, bank, vocab as u32, y)) {
+    if !nat.run(|ctx| {
+        engine_xla::lower::lower(ctx, |l| {
+            let ids_v = l.read(it)?;
+            let table_v = l.bank(bank)?;
+            let o_y = y;
+            let v =
+                gather::embed_gather_mb_4bit(l.f(), ids_v, table_v, vocab as u32, o_y.landing())?;
+            l.land(o_y, v)
+        })
+    }) {
         return;
     }
     let want: Vec<f32> = ids
@@ -458,9 +471,37 @@ fn routed_banks_read_native_codes_and_prescaled_weights_every_way() {
         let ran = nat.run(|ctx| {
             for (i, (bank, y)) in o.iter().enumerate() {
                 if i % 2 == 0 {
-                    moe::matmul_select_quant(ctx, xt, *bank, rt, *y)?;
+                    engine_xla::lower::lower(ctx, |l| {
+                        let x_v = l.read(xt)?;
+                        let routes_v = l.read(rt)?;
+                        let y_v = l.read(*y)?;
+                        let bank_v = l.bank(*bank)?;
+                        let o_y = *y;
+                        let tuning = l.tuning();
+                        let v =
+                            moe::matmul_select_quant(l.f(), x_v, bank_v, routes_v, y_v, tuning)?;
+                        l.land(o_y, v)
+                    })?;
                 } else {
-                    moe::matmul_select_bias(ctx, xt, *bank, bt, rt, *y)?;
+                    engine_xla::lower::lower(ctx, |l| {
+                        let x_v = l.read(xt)?;
+                        let routes_v = l.read(rt)?;
+                        let bias_v = l.read(bt)?;
+                        let y_v = l.read(*y)?;
+                        let bank_v = l.bank(*bank)?;
+                        let o_y = *y;
+                        let tuning = l.tuning();
+                        let v = moe::matmul_select_bias(
+                            l.f(),
+                            x_v,
+                            bank_v,
+                            bias_v,
+                            routes_v,
+                            y_v,
+                            tuning,
+                        )?;
+                        l.land(o_y, v)
+                    })?;
                 }
             }
             Ok(())

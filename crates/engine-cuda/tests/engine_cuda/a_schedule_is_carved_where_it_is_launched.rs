@@ -43,20 +43,24 @@ impl ForwardHybrid for TokensAndLatents {
         };
 
         let table = Weight::sym("embed", [u64::from(VOCAB), u64::from(WIDTH)], Dtype::Bf16);
-        let x = ops::layout::embed(&txt.tokens(), &table, VOCAB);
+        let x = ops::gather::embed(&txt.tokens(), &table, VOCAB);
         let q = ops::linear::matmul(&x, &w("txt.q", HEAD_DIM, WIDTH));
         let k = ops::linear::matmul(&x, &w("txt.k", HEAD_DIM, WIDTH));
         let v = ops::linear::matmul(&x, &w("txt.v", HEAD_DIM, WIDTH));
         let pages = txt.kv(KV_ROW);
         ops::attn::kv_append(
             &k,
-            &v,
+            Some(&v),
             pages,
             &txt.write_page(KV_ROW),
             &txt.write_offset(KV_ROW),
         );
         let plan = ops::attn::plan_prefill(&txt, HEADS, HEADS, HEAD_DIM, None);
-        let o = ops::attn::prefill(&q, &plan, pages, None, HEAD_DIM, HEADS, SM_SCALE);
+        let o = ops::attn::prefill(
+            &q, &plan, pages, None, HEAD_DIM, HEADS, SM_SCALE, false, None, true, None, None, None,
+            false, None, None, None,
+        )
+        .0;
         let h = ops::linear::matmul(&o, &w("txt.o", WIDTH, HEAD_DIM));
         seam::at(seam::HIDDEN, &[&h]);
 

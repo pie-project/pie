@@ -1,5 +1,5 @@
 #![cfg(target_vendor = "apple")]
-//! The routed MLP on the register tile (`moe_sg.metal`: expert tiles, the
+//! The routed MLP on the register tile (`linear/moe/select_sg.metal`: expert tiles, the
 //! gate-up landing its SwiGLU as the down's table, the down into sorted rows)
 //! against the per-route path (`matmul_select_quant`, `swiglu`, again, and
 //! the fold), with and without the shared expert riding along as tile 0; and
@@ -8,7 +8,7 @@
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
-use kernels_metal::linear::{mlp, moe, quant};
+use kernels_metal::linear::{mlp, moe, qmm};
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
 
@@ -359,13 +359,13 @@ fn the_register_routed_mlp_answers_the_per_route_path() {
                 moe::matmul_select_quant(&sink, xt, shared_gate_up, zt, opt).expect("own gate-up");
                 mlp::swiglu(&sink, opt, INTER, oht).expect("own swiglu");
                 moe::matmul_select_quant(&sink, oht, shared_down, zt, ot).expect("own down");
-                quant::matmul(
+                qmm::matmul(
                     &sink,
                     &tuning,
                     xt,
                     gate,
                     gt,
-                    quant::Scratch {
+                    qmm::Scratch {
                         precast: &|_, _| None,
                         partials: &|_, _| None,
                         table: None,

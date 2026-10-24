@@ -76,7 +76,7 @@ struct Input {
     case_7: Option<String>,
     #[serde(default)]
     euler: bool,
-    /// The family's `PIE_MINI_DIT_TAP` bisection knob is set: the readout
+    /// The artifact serves a tapped deployment (`-tap.{key}`): the readout
     /// is an intermediate, at whatever width the model declares.
     #[serde(default)]
     tap: bool,

@@ -8,7 +8,7 @@
 //! and no longer works is worse than one that moved.
 //!
 //! Every test here needs a Metal 4 device and skips without one.
-
+#![allow(unsafe_code)]
 #![cfg(target_vendor = "apple")]
 
 use engine_metal::Fault;

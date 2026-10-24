@@ -191,6 +191,22 @@ impl Input {
         &self.rec
     }
 
+    /// The rows these are.
+    pub(crate) fn rows(&self) -> &Guard {
+        &self.over
+    }
+
+    /// Every lane's own mask, over every row: what a masked arm reads,
+    /// whichever rows it runs on.
+    pub(crate) fn whole_mask(&self) -> Value {
+        Input {
+            rec: self.rec.clone(),
+            caches: self.caches.clone(),
+            over: Guard::Always,
+        }
+        .mask()
+    }
+
     /// The rows `predicate` holds for.
     #[must_use]
     pub fn on(&self, predicate: Predicate) -> Input {

@@ -1,0 +1,15 @@
+// k_kv_append into a pool packed two bf16 a word (slot and w in elements).
+fn k_kv_append_packed(k: [*]f32, v: [*]f32, keys: [*]u32, values: [*]u32, page: [*]i32, off: [*]i32, r0: i32, r1: i32, w: i32, ps: i32, pages: i32, shared: bool) void {
+  var i: i32 = r0;
+  while (i < r1) : (i += 1) {
+    var pg: i32 = page[i];
+    var o: i32 = off[i];
+    if (pg >= 0 and pg < pages and o >= 0 and o < ps) {
+      var slot: i32 = pg * ps + o;
+      k_pack_bf16(keys, slot * w, k, i * w, w);
+      if (!shared) {
+        k_pack_bf16(values, slot * w, v, i * w, w);
+      }
+    }
+  }
+}

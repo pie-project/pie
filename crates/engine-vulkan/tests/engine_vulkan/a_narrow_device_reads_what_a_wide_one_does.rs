@@ -2,7 +2,7 @@
 //! the readouts one pinned to 32 does: decode attention's per-lane registers
 //! once held HEAD_DIM / 32 dims whatever the width.
 //!
-//! Needs both devices in one process (`VK_ICD_FILENAMES=<lavapipe>:<gpu>`)
+//! Needs landed devices in one process (`VK_ICD_FILENAMES=<lavapipe>:<gpu>`)
 //! and a Vulkan-stamped artifact in `~/.pie/artifacts`; skips without them.
 
 use std::path::{Path, PathBuf};

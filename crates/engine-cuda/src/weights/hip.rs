@@ -2,6 +2,7 @@
 //! does: e4m3 made canonical for the FP8 matrix core (it reads e4m3fnuz),
 //! and fp8b32 / fp8b128 projections and mxfp4 expert banks put in the
 //! matrix core's order where they lie.
+#![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
 
@@ -84,7 +85,7 @@ pub(super) fn canonical_fp8(
         let plane = address(tier, store, places[at].offset, at)?;
         kernels_cuda::linear::act_quant::e4m3fn_shuffle(
             &ctx,
-            "linear.matmul_act_quant",
+            "linear.matmul",
             plane,
             staging.ptr(),
             rows,
@@ -202,14 +203,15 @@ fn fp8b_planes(trace: &Trace, tier: Option<&crate::experts::Tier>) -> Vec<(usize
                 reads[w] += 1;
             }
         }
-        if let Operation::Linear(Linear::MatmulActQuant {
+        if let Operation::Linear(Linear::Matmul {
             act,
             w,
-            quant: ActQuant::E4m3 {
+            quant: Some(ActQuant::E4m3 {
                 gran: side @ (32 | 128),
-            },
+            }),
             input_scales: None,
             scales: Some(scales),
+            logits: false,
             ..
         }) = &node.op
             && let (Some(w), Some(s)) = (weight(*w), weight(*scales))
@@ -311,7 +313,7 @@ pub(super) fn order_fp8b_planes(
         let plane = address(tier, store, places[at].offset, at)?;
         kernels_cuda::linear::act_quant::e4m3fn_shuffle(
             &ctx,
-            "linear.matmul_act_quant",
+            "linear.matmul",
             plane,
             staging.ptr(),
             rows,
@@ -384,11 +386,20 @@ fn lane_banks(
         };
         for leg in legs {
             let (x, bank) = match leg {
-                Linear::MoeMatmulSelectQuant { x, bank, .. } => (*x, *bank),
-                Linear::MoeMatmulSelectActQuant {
+                Linear::MoeSelect {
                     x,
                     bank,
-                    quant: ActQuant::E4m3 { .. },
+                    bias: None,
+                    quantized: true,
+                    quant: None,
+                    ..
+                } => (*x, *bank),
+                Linear::MoeSelect {
+                    x,
+                    bank,
+                    quant: Some(ActQuant::E4m3 { .. }),
+                    bias: None,
+                    quantized: true,
                     ..
                 } => (*x, *bank),
                 _ => continue,
@@ -480,7 +491,7 @@ pub(super) fn order_mxfp4_banks(
             let (c, e) = (codes + first * n * k / 2, exps + first * n * k / 32);
             kernels_cuda::linear::moe::mxfp4_lanes(
                 &ctx,
-                "linear.moe_matmul_select_quant",
+                "linear.moe_select",
                 c,
                 staged_codes,
                 e,

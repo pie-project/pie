@@ -3,7 +3,7 @@ use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Request, Stream, Value, Weight,
     ops, seam, trace_hybrid,
 };
-use poem_ir::{Layout, Operation};
+use poem_ir::{Gather, Operation};
 
 const WIDTH: u32 = 32;
 const HEAD_DIM: u32 = 8;
@@ -34,16 +34,16 @@ impl ForwardHybrid for LastJointBlock {
         let perm = inputs.row_permutation();
         let indptr = inputs.group_indptr();
         let o = ops::attn::ragged(
-            &ops::layout::pack_rows(&Value::merge(vec![qt, qi]), &perm),
-            &ops::layout::pack_rows(&Value::merge(vec![kt, ki]), &perm),
-            &ops::layout::pack_rows(&Value::merge(vec![vt, vi]), &perm),
+            &ops::gather::pack_rows(&Value::merge(vec![qt, qi]), &perm),
+            &ops::gather::pack_rows(&Value::merge(vec![kt, ki]), &perm),
+            &ops::gather::pack_rows(&Value::merge(vec![vt, vi]), &perm),
             &indptr,
             &indptr,
             HEAD_DIM,
             0.35,
             RaggedMask::GroupBlockDiagonal,
         );
-        let o = ops::layout::unpack_rows(&o, &perm);
+        let o = ops::gather::unpack_rows(&o, &perm);
         let o_img = o.on(!fact::stream(Stream::Text));
         let out = ops::linear::matmul(&o_img, &w("img.o"));
         seam::at(seam::VELOCITY, &[&out]);
@@ -80,7 +80,7 @@ fn the_pack_and_unpack_of_a_head_only_block_are_demanded_in_both_streams() {
         .filter(|(_, node)| {
             matches!(
                 node.op,
-                Operation::Layout(Layout::PackRows { .. } | Layout::UnpackRows { .. })
+                Operation::Gather(Gather::PackRows { .. } | Gather::UnpackRows { .. })
             )
         })
         .map(|(at, _)| at)

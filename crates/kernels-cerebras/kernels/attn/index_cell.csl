@@ -1,0 +1,14 @@
+// The pool cell of request `req`'s position `pos` through its page table
+// (indptr[req] the first page entry, pages of ps rows), or -1 when the
+// tables do not reach it or the cell is past `cells`.
+fn k_index_cell(indices: [*]i32, indptr: [*]i32, nidx: i32, nptr: i32, req: i32, pos: i32, ps: i32, cells: i32) i32 {
+  var p: i32 = pos;
+  if (p < 0) { p = 0; }
+  if (req < 0 or req >= nptr) { return -1; }
+  var at: i32 = indptr[req] + p / ps;
+  if (at < 0 or at >= nidx) { return -1; }
+  var cell: i32 = indices[at] * ps + (p - (p / ps) * ps);
+  if (cell < 0 or cell >= cells) { return -1; }
+  return cell;
+}
+

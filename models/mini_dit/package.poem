@@ -6,6 +6,6 @@ load("//lib/spoken.poem", "QWEN_STOP")
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP])
 
-MODELS = [model("mini-dit", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "mini_dit", layers = 3, vocab = 0)]
+MODELS = [model("mini-dit", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "mini_dit", layers = 3, vocab = 0, taps = True)]
 
 DEPLOYMENTS = [deployment("mini-dit", weights = dtype.bf16, kv = dtype.bf16)]

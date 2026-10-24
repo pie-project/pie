@@ -6,7 +6,7 @@
 // `segments` ({first row, rows} pairs), (⌈out / block⌉, the most rows a
 // segment, segments) — f32 accumulation in rank order.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::linear {
 

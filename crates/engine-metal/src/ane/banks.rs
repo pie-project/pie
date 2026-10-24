@@ -1,6 +1,7 @@
 //! The GPU's banks of a split, all views into the whole banks: the leading
 //! `keep` rows of gate and up (or of a projection) by offset, and the
 //! leading `keep` columns of down by a row stride wider than the width.
+#![allow(unsafe_code)]
 
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
@@ -57,7 +58,7 @@ pub fn mlps(trace: &poem_ir::Trace, weights: &crate::weights::Weights) -> Vec<Ml
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
-            poem_ir::Operation::Fused(poem_ir::Fused::MlpSwiglu {
+            poem_ir::Operation::Fused(poem_ir::Fused::MatmulSwigluMatmul {
                 gate_up,
                 down,
                 intermediate,
@@ -98,7 +99,13 @@ pub fn projections(
 ) -> Vec<((u32, u32), Vec<Projection>)> {
     let mut groups: Vec<((u32, u32), Vec<Projection>)> = Vec::new();
     for node in &trace.nodes {
-        let poem_ir::Operation::Linear(poem_ir::Linear::Matmul { w, .. }) = &node.op else {
+        let poem_ir::Operation::Linear(poem_ir::Linear::Matmul {
+            w,
+            quant: None,
+            logits: false,
+            ..
+        }) = &node.op
+        else {
             continue;
         };
         let Some(bank) = q4_bank(trace, weights, *w) else {

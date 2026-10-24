@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::cell::{Ref, RefCell};
 
 use super::alloc::{Buffer, Slab};

@@ -8,7 +8,7 @@ mod common;
 
 use common::{Gpu, close_bf16, gelu_tanh, round_bf16, sigmoid, values};
 use dtype::Dtype;
-use kernels_rocm::linear::mlp;
+use kernels_rocm::linear::glu;
 
 /// Bf16 values in [-scale, scale).
 fn bf16s(n: u32, seed: u64, scale: f32) -> Vec<f32> {
@@ -91,14 +91,14 @@ fn linear_glu_packed() {
                 ctx.arm_stage(s.ptr);
             }
             match name {
-                "geglu_tanh_packed" => mlp::geglu_tanh_packed(&ctx, x, width, fan, &mut y),
-                "situ" => mlp::situ(&ctx, x, width, fan, beta, None, &mut y),
-                "situ_capped" => mlp::situ(&ctx, x, width, fan, beta, Some(cap), &mut y),
-                "swiglu_clamp" => mlp::swiglu_clamp(&ctx, x, width, fan, limit, &mut y),
+                "geglu_tanh_packed" => glu::geglu_tanh_packed(&ctx, x, width, fan, &mut y),
+                "situ" => glu::situ(&ctx, x, width, fan, beta, None, &mut y),
+                "situ_capped" => glu::situ(&ctx, x, width, fan, beta, Some(cap), &mut y),
+                "swiglu_clamp" => glu::swiglu_clamp(&ctx, x, width, fan, limit, &mut y),
                 "swiglu_clamp_alpha" => {
-                    mlp::swiglu_clamp_alpha(&ctx, x, width, fan, limit, alpha, &mut y)
+                    glu::swiglu_clamp_alpha(&ctx, x, width, fan, limit, alpha, &mut y)
                 }
-                _ => mlp::swiglu(&ctx, x, width, fan, &mut y),
+                _ => glu::swiglu(&ctx, x, width, fan, &mut y),
             }
             .unwrap();
             ctx.disarm_stage();
@@ -137,7 +137,7 @@ fn linear_glu_flat() {
         if let Some(s) = &stage {
             ctx.arm_stage(s.ptr);
         }
-        mlp::geglu_tanh(&ctx, gate, up, fan, &mut y).unwrap();
+        glu::geglu_tanh(&ctx, gate, up, fan, &mut y).unwrap();
         ctx.disarm_stage();
         let want: Vec<f32> = gs
             .iter()
@@ -156,7 +156,7 @@ fn linear_glu_flat() {
         if let Some(s) = &stage {
             ctx.arm_stage(s.ptr);
         }
-        mlp::gelu_tanh(&ctx, gate, fan, &mut y).unwrap();
+        glu::gelu_tanh(&ctx, gate, fan, &mut y).unwrap();
         ctx.disarm_stage();
         let want: Vec<f32> = gs.iter().map(|&g| gelu_tanh(g)).collect();
         check_rows(
@@ -172,7 +172,7 @@ fn linear_glu_flat() {
     let xs = values(3000, 4, 4.0);
     let x = gpu.tensor(&xs, 3, 1000, Dtype::F32);
     let mut y = gpu.zeros(3, 1000, Dtype::F32);
-    mlp::gelu_tanh(&ctx, x, 1, &mut y).unwrap();
+    glu::gelu_tanh(&ctx, x, 1, &mut y).unwrap();
     let have = gpu.read(&y);
     for (i, (&h, &v)) in have.iter().zip(&xs).enumerate() {
         let want = gelu_tanh(v);
@@ -184,7 +184,7 @@ fn linear_glu_flat() {
 
     // relu(x)², the same walk.
     let mut y = gpu.zeros(3, 1000, Dtype::F32);
-    mlp::relu2(&ctx, x, 1, &mut y).unwrap();
+    glu::relu2(&ctx, x, 1, &mut y).unwrap();
     for (i, (&h, &v)) in gpu.read(&y).iter().zip(&xs).enumerate() {
         assert_eq!(h, v.max(0.0) * v.max(0.0), "relu2 f32[{i}]");
     }
@@ -274,7 +274,7 @@ fn linear_swiglu_clamp_split() {
     let gt = gpu.tensor(&g, rows, width, Dtype::Bf16);
     let ut = gpu.tensor(&u, rows, width, Dtype::Bf16);
     let mut y = gpu.zeros(rows, width, Dtype::Bf16);
-    mlp::swiglu_clamp_split(&ctx, gt, ut, limit, &mut y).unwrap();
+    glu::swiglu_clamp_split(&ctx, gt, ut, limit, &mut y).unwrap();
     let want: Vec<f32> = g
         .iter()
         .zip(&u)

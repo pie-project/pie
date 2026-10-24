@@ -1,0 +1,9 @@
+// y[i] += x[i] for i < n.
+fn k_residual_add(x: [*]f32, y: [*]f32, n: i32) void {
+  var dx = @set_dsd_base_addr(k_base_f32, x);
+  dx = @set_dsd_length(dx, @bitcast(u16, @as(i16, n)));
+  var dy = @set_dsd_base_addr(k_base_f32, y);
+  dy = @set_dsd_length(dy, @bitcast(u16, @as(i16, n)));
+  @fadds(dy, dy, dx);
+}
+

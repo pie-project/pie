@@ -1,0 +1,20 @@
+[package]
+name = "pie-poem-ir-macros"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "`#[derive(Op)]` for poem-ir: an op group's enum declares its name, its operands and their expected types once, on the fields."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+
+[lib]
+name = "poem_ir_macros"
+proc-macro = true
+
+[dependencies]
+syn = { version = "2.0", features = ["full"] }
+quote = "1.0"
+proc-macro2 = "1.0"
+
+[lints]
+workspace = true

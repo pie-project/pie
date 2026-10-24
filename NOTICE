@@ -22,8 +22,13 @@ Apache License 2.0
 Copyright (c) 2023-2025 by FlashInfer team
 Copyright (c) 2022-2024, NVIDIA CORPORATION. All rights reserved.
 
-  The CUDA headers under `crates/kernels-cuda/kernels/flashinfer/` are vendored
-  from FlashInfer, with local modifications marked in-file.
+  Internalized, not vendored: the attention code under
+  `crates/kernels-cuda/kernels/attn/fa2/` and the peer all-reduce in
+  `crates/kernels-cuda/kernels/collective/p2p.cuh` (which FlashInfer adapts
+  from vLLM, Copyright contributors to the vLLM project) derive from
+  FlashInfer v0.6.15, cut to what Pie uses and renamed into its namespaces;
+  each file keeps its copyright header. crates/kernels-cuda/NOTICE lists the
+  changes.
 
 --------------------------------------------------------------------------------
 MLX
@@ -31,8 +36,11 @@ https://github.com/ml-explore/mlx
 MIT License
 Copyright (c) 2023 Apple Inc.
 
-  The Metal shaders under `crates/kernels-metal/kernels/third_party/` are
-  vendored from MLX, as each file's header states.
+  Internalized, not vendored: the GEMM tile under
+  `crates/kernels-metal/kernels/prim/gemm_*.h` and the affine matmul and
+  matvec kernels in `crates/kernels-metal/kernels/linear/` derive from MLX,
+  renamed into Pie's namespaces; each file keeps its copyright and permission
+  notice. crates/kernels-metal/NOTICE lists the files and the changes.
 
 --------------------------------------------------------------------------------
 NIXL

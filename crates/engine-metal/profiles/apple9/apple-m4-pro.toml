@@ -12,6 +12,6 @@ ane.mlp         = [{ when = "ane", use = "share", percent = 74 }, "gpu"]
 ane.projections = "gpu"
 ane.min_rows    = 512
 # a 512-token prompt over Gemma 4 26B-A4B routes about 33 rows an expert: a 32-row tile
-# runs most experts half empty, as MLX's 16-row gather tile does not; gpt-oss's 67 rows
-# an expert take the same 16-row tile, which two simdgroups multiply as MLX's does
+# runs most experts half empty, as a 16-row tile does not; gpt-oss's 67 rows an expert
+# take the same 16-row tile, which two simdgroups multiply side by side
 moe.tile_rows   = [{ when = "per_expert < 2", value = 1 }, { value = 16 }]

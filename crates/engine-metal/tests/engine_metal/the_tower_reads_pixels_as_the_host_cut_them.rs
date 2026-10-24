@@ -8,7 +8,8 @@
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
-use kernels_metal::{Tensor, layout};
+use kernels_metal::Tensor;
+use kernels_metal::gather;
 use media::front::{Image, Rgb8};
 use poem_ir::Dtype;
 
@@ -178,7 +179,7 @@ fn run(
     );
     let frame = device.frame().expect("a frame");
     let sink = Sink::new(device, &frame, pipelines, handles);
-    layout::pixels(
+    gather::pixels(
         &sink,
         x,
         patch,
@@ -189,7 +190,7 @@ fn run(
         y,
     )
     .expect("pixels launches");
-    layout::grid_taps(
+    gather::grid_taps(
         &sink,
         positions_t,
         grids,

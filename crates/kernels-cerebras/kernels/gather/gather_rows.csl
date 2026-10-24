@@ -1,0 +1,10 @@
+// tight[i] = wide[clamp(index[i], 0, last)].
+fn k_gather_rows(wide: [*]f32, index: [*]i32, tight: [*]f32, rows: i32, width: i32, last: i32) void {
+  var i: i32 = 0;
+  while (i < rows) : (i += 1) {
+    var idx: i32 = index[i];
+    if (idx < 0) { idx = 0; } else if (idx > last) { idx = last; }
+    k_copy(tight, i * width, wide, idx * width, width);
+  }
+}
+

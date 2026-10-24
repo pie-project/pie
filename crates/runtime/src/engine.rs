@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 pub mod backend;
 pub mod channel;
 pub mod completion;

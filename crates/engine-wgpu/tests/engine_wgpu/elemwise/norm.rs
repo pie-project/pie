@@ -1,0 +1,564 @@
+//! The norm kernels on the first wgpu adapter (lavapipe through wgpu's Vulkan
+//! backend will do) against an f64 host reference: each variant the IR's
+//! `elemwise.rmsnorm` folds, over rows wider and narrower than a workgroup.
+
+use crate::gpu::{Gpu, bf16, close, noise, widen};
+use kernels_slang::Tensor;
+use poem_ir::Dtype;
+
+/// `x / rms(x)` over each `run`-wide slice, times `scale(i)` at column `i`
+/// of the row.
+fn reference(
+    x: &[f32],
+    width: usize,
+    run: usize,
+    eps: f32,
+    scale: impl Fn(usize) -> f64,
+) -> Vec<f64> {
+    let mut out = vec![0.0; x.len()];
+    for (r, row) in x.chunks_exact(width).enumerate() {
+        for (g, slice) in row.chunks_exact(run).enumerate() {
+            let ms = slice.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / run as f64;
+            let inv = 1.0 / (ms + f64::from(eps)).sqrt();
+            for (i, v) in slice.iter().enumerate() {
+                let col = g * run + i;
+                out[r * width + col] = f64::from(*v) * inv * scale(col);
+            }
+        }
+    }
+    out
+}
+
+/// A slang case: its name, the run it norms over, the scale at a column.
+type Case<'a> = (&'a str, usize, Box<dyn Fn(usize) -> f64 + 'a>);
+
+#[test]
+fn the_norms_answer_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no wgpu adapter");
+        return;
+    };
+    let eps = 1e-6;
+    for (rows, width, head) in [(3usize, 64usize, 16usize), (5, 4096, 128), (2, 2560, 256)] {
+        let n = rows * width;
+        let (x, xv) = gpu.up(&noise(rows as u64 * 31 + width as u64, n));
+        let (w, wv) = gpu.up(&noise(width as u64, width));
+        let (hw, hwv) = gpu.up(&noise(head as u64 + 7, head));
+        let shape = format!("{rows} x {width}");
+
+        // The same norms from the one Slang tree (kernels-slang), on the
+        // same device.
+        use kernels_slang::elemwise::norm as slang;
+        let st = |buf: u32, rows: usize, width: usize| {
+            kernels_slang::Tensor::new(buf, rows as u32, width as u32, Dtype::Bf16)
+        };
+        let cases: [Case<'_>; 6] = [
+            ("rmsnorm", width, Box::new(|c| f64::from(wv[c]))),
+            ("rmsnorm +1", width, Box::new(|c| 1.0 + f64::from(wv[c]))),
+            (
+                "rmsnorm per head",
+                head,
+                Box::new(|c| f64::from(hwv[c % head])),
+            ),
+            (
+                "rmsnorm per head +1",
+                head,
+                Box::new(|c| 1.0 + f64::from(hwv[c % head])),
+            ),
+            (
+                "rmsnorm grouped +1",
+                head,
+                Box::new(|c| 1.0 + f64::from(wv[c])),
+            ),
+            ("rmsnorm no scale", head, Box::new(|_| 1.0)),
+        ];
+        for (i, (what, run, scale)) in cases.iter().enumerate() {
+            let y = gpu.zeros(n);
+            let (xs, ys) = (st(x, rows, width), st(y, rows, width));
+            gpu.run(|s| match i {
+                0 => slang::rmsnorm(s, xs, st(w, 1, width), eps, ys),
+                1 => slang::rmsnorm_plus_one(s, xs, st(w, 1, width), eps, ys),
+                2 => slang::rmsnorm_per_head(s, xs, st(hw, 1, head), head as u32, eps, ys),
+                3 => slang::rmsnorm_per_head_plus_one(s, xs, st(hw, 1, head), head as u32, eps, ys),
+                4 => slang::rmsnorm_grouped_plus_one(s, xs, st(w, 1, width), head as u32, eps, ys),
+                _ => slang::rmsnorm_no_scale(s, xs, head as u32, eps, ys),
+            });
+            close(
+                &gpu.down(y, n),
+                &reference(&xv, width, *run, eps, scale),
+                &format!("{what} {shape}"),
+            );
+        }
+    }
+}
+
+/// `y = x / rms(x) * w * gate(z)` over each `vd`-wide head.
+fn gated_reference(
+    x: &[f32],
+    z: &[f32],
+    w: &[f32],
+    vd: usize,
+    eps: f32,
+    sigmoid: bool,
+) -> Vec<f64> {
+    let mut out = vec![0.0; x.len()];
+    for (h, head) in x.chunks_exact(vd).enumerate() {
+        let ms = head.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / vd as f64;
+        let inv = 1.0 / (ms + f64::from(eps)).sqrt();
+        for (i, v) in head.iter().enumerate() {
+            let zr = f64::from(z[h * vd + i]);
+            let sig = 1.0 / (1.0 + (-zr).exp());
+            let gate = if sigmoid { sig } else { zr * sig };
+            out[h * vd + i] = f64::from(*v) * inv * f64::from(w[i]) * gate;
+        }
+    }
+    out
+}
+
+#[test]
+fn the_gated_norms_answer_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let eps = 1e-6;
+    for (rows, heads, vd) in [(3usize, 2usize, 64usize), (4, 8, 128)] {
+        let width = heads * vd;
+        let n = rows * width;
+        let xv = noise(rows as u64 * 17 + vd as u64, n);
+        let x = gpu.up_f32(&xv);
+        let (z, zv) = gpu.up(&noise(vd as u64 + 3, n));
+        let wv = noise(vd as u64 + 5, vd);
+        let w = gpu.up_f32(&wv);
+        let f32t = |buf: u32, width: usize| Tensor::new(buf, rows as u32, width as u32, Dtype::F32);
+        let bt = |buf: u32| Tensor::new(buf, rows as u32, width as u32, Dtype::Bf16);
+        let shape = format!("{rows} x {heads} x {vd}");
+        for sigmoid in [false, true] {
+            let want = gated_reference(&xv, &zv, &wv, vd, eps, sigmoid);
+            let wt = Tensor::new(w, 1, vd as u32, Dtype::F32);
+            let y = gpu.zeros(n);
+            gpu.run(|s| {
+                kernels_slang::elemwise::norm::rmsnorm_gated(
+                    s,
+                    f32t(x, width),
+                    bt(z),
+                    wt,
+                    vd as u32,
+                    eps,
+                    sigmoid,
+                    bt(y),
+                )
+            });
+            close(
+                &gpu.down(y, n),
+                &want,
+                &format!("gated rms sigmoid={sigmoid} {shape}"),
+            );
+        }
+        let want = gated_reference(&xv, &zv, &wv, vd, eps, true);
+        let y = gpu.zeros(n);
+        gpu.run(|s| {
+            kernels_slang::elemwise::norm::rmsnorm_gated_by(
+                s,
+                f32t(x, width),
+                bt(z),
+                Tensor::new(w, 1, vd as u32, Dtype::F32),
+                heads as u32,
+                eps,
+                bt(y),
+            )
+        });
+        close(
+            &gpu.down(y, n),
+            &want,
+            &format!("gated rms by heads {shape}"),
+        );
+    }
+}
+
+/// The adds a norm leans on: `y += x` over a tensor and `out[r, c] +=
+/// bias[c]`, bf16 and f32 (odd-sized f32, the pair's tail half there).
+#[test]
+fn the_sums_answer_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    for (rows, width) in [(3usize, 64usize), (5, 1000)] {
+        let n = rows * width;
+        let (xv, yv) = (noise(width as u64, n), noise(width as u64 + 1, n));
+        let bv = noise(width as u64 + 2, width);
+        let bt = |buf: u32, rows: usize, width: usize| {
+            Tensor::new(buf, rows as u32, width as u32, Dtype::Bf16)
+        };
+        let (x, xr) = gpu.up(&xv);
+        let (_, yr) = gpu.up(&yv);
+        let (_, br) = gpu.up(&bv);
+        let sum: Vec<f64> = xr
+            .iter()
+            .zip(&yr)
+            .map(|(a, b)| f64::from(*a) + f64::from(*b))
+            .collect();
+        let biased: Vec<f64> = (0..n)
+            .map(|i| f64::from(yr[i]) + f64::from(br[i % width]))
+            .collect();
+        let shape = format!("{rows} x {width}");
+        let (y, _) = gpu.up(&yv);
+        let (yt, xt) = (bt(y, rows, width), bt(x, rows, width));
+        gpu.run(|s| kernels_slang::elemwise::pointwise::residual_add(s, xt, yt));
+
+        close(&gpu.down(y, n), &sum, &format!("residual add bf16 {shape}"));
+        let (y, _) = gpu.up(&yv);
+        let (b, _) = gpu.up(&bv);
+        let (yt, b) = (bt(y, rows, width), bt(b, 1, width));
+        gpu.run(|s| kernels_slang::elemwise::pointwise::add_bias(s, b, yt));
+
+        close(&gpu.down(y, n), &biased, &format!("add bias bf16 {shape}"));
+    }
+    for (rows, width) in [(3usize, 7usize), (5, 1001)] {
+        let n = rows * width;
+        let (xv, yv) = (noise(width as u64 + 3, n), noise(width as u64 + 4, n));
+        let bv = noise(width as u64 + 5, width);
+        let ft = |buf: u32, rows: usize, width: usize| {
+            Tensor::new(buf, rows as u32, width as u32, Dtype::F32)
+        };
+        let shape = format!("{rows} x {width}");
+        let x = gpu.up_f32(&xv);
+        let y = gpu.up_f32(&yv);
+        gpu.run(|s| {
+            kernels_slang::elemwise::pointwise::residual_add(
+                s,
+                ft(x, rows, width),
+                ft(y, rows, width),
+            )
+        });
+        let want: Vec<f64> = xv
+            .iter()
+            .zip(&yv)
+            .map(|(a, b)| f64::from(*a) + f64::from(*b))
+            .collect();
+        close(
+            &gpu.down_f32(y, n),
+            &want,
+            &format!("residual add f32 {shape}"),
+        );
+        let want: Vec<f64> = (0..n)
+            .map(|i| f64::from(yv[i]) + f64::from(bv[i % width]))
+            .collect();
+        let y = gpu.up_f32(&yv);
+        let b = gpu.up_f32(&bv);
+        gpu.run(|s| {
+            kernels_slang::elemwise::pointwise::add_bias(s, ft(b, 1, width), ft(y, rows, width))
+        });
+        close(&gpu.down_f32(y, n), &want, &format!("add bias f32 {shape}"));
+        if width % 2 == 0 {
+            continue;
+        }
+        // A bf16 bias under f32 rows; the bias is read an element at a time,
+        // so it may be odd wide.
+        let (b, br) = gpu.up(&bv);
+        let want: Vec<f64> = (0..n)
+            .map(|i| f64::from(yv[i]) + f64::from(br[i % width]))
+            .collect();
+        let y = gpu.up_f32(&yv);
+        let bias = Tensor::new(b, 1, width as u32, Dtype::Bf16);
+        gpu.run(|s| kernels_slang::elemwise::pointwise::add_bias(s, bias, ft(y, rows, width)));
+        close(
+            &gpu.down_f32(y, n),
+            &want,
+            &format!("add bf16 bias to f32 {shape}"),
+        );
+    }
+}
+
+/// `(x - mean) / sqrt(var + eps)` over each row, times `w` plus `b` when given.
+fn layernorm_reference(
+    x: &[f32],
+    width: usize,
+    eps: f32,
+    affine: Option<(&[f32], &[f32])>,
+) -> Vec<f64> {
+    let mut out = Vec::with_capacity(x.len());
+    for row in x.chunks_exact(width) {
+        let mean = row.iter().map(|v| f64::from(*v)).sum::<f64>() / width as f64;
+        let var = row
+            .iter()
+            .map(|v| (f64::from(*v) - mean).powi(2))
+            .sum::<f64>()
+            / width as f64;
+        let inv = 1.0 / (var + f64::from(eps)).sqrt();
+        for (c, v) in row.iter().enumerate() {
+            let n = (f64::from(*v) - mean) * inv;
+            out.push(match affine {
+                Some((w, b)) => n * f64::from(w[c]) + f64::from(b[c]),
+                None => n,
+            });
+        }
+    }
+    out
+}
+
+#[test]
+fn the_layernorms_answer_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let eps = 1e-5;
+    for (rows, width) in [(3usize, 64usize), (5, 1000), (2, 4096)] {
+        let n = rows * width;
+        let bt = |buf: u32, rows: usize| Tensor::new(buf, rows as u32, width as u32, Dtype::Bf16);
+        // Off-centre rows, so a missed mean shows.
+        let xv: Vec<f32> = noise(width as u64 + 7, n).iter().map(|v| v + 1.5).collect();
+        let (x, xr) = gpu.up(&xv);
+        let (w, wr) = gpu.up(&noise(width as u64 + 8, width));
+        let (b, br) = gpu.up(&noise(width as u64 + 9, width));
+        let shape = format!("{rows} x {width}");
+        let want = layernorm_reference(&xr, width, eps, Some((&wr, &br)));
+        let y = gpu.zeros(n);
+        gpu.run(|s| {
+            kernels_slang::elemwise::norm::layernorm(
+                s,
+                bt(x, rows),
+                bt(w, 1),
+                bt(b, 1),
+                eps,
+                bt(y, rows),
+            )
+        });
+        close(&gpu.down(y, n), &want, &format!("layernorm {shape}"));
+        let want = layernorm_reference(&xr, width, eps, None);
+        let y = gpu.zeros(n);
+        gpu.run(|s| {
+            kernels_slang::elemwise::norm::layernorm_no_scale(s, bt(x, rows), eps, bt(y, rows))
+        });
+        close(
+            &gpu.down(y, n),
+            &want,
+            &format!("layernorm no scale {shape}"),
+        );
+    }
+    for (rows, width) in [(3usize, 7usize), (4, 1001)] {
+        let n = rows * width;
+        let ft = |buf: u32| Tensor::new(buf, rows as u32, width as u32, Dtype::F32);
+        let xv: Vec<f32> = noise(width as u64 + 10, n)
+            .iter()
+            .map(|v| v - 0.75)
+            .collect();
+        let x = gpu.up_f32(&xv);
+        let y = gpu.zeros(2 * n);
+        gpu.run(|s| kernels_slang::elemwise::norm::layernorm_no_scale(s, ft(x), eps, ft(y)));
+        let want = layernorm_reference(&xv, width, eps, None);
+        close(
+            &gpu.down_f32(y, n),
+            &want,
+            &format!("layernorm no scale f32 {rows} x {width}"),
+        );
+    }
+}
+
+#[test]
+fn standardize_answers_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    for (rows, width) in [(3usize, 64usize), (5, 1000)] {
+        let n = rows * width;
+        let bt = |buf: u32, rows: usize| Tensor::new(buf, rows as u32, width as u32, Dtype::Bf16);
+        let xv = noise(width as u64 + 11, n);
+        let (_, xr) = gpu.up(&xv);
+        let (b, br) = gpu.up(&noise(width as u64 + 12, width));
+        let (s, sr) = gpu.up(&noise(width as u64 + 13, width));
+        let want: Vec<f64> = (0..n)
+            .map(|i| (f64::from(xr[i]) - f64::from(br[i % width])) * f64::from(sr[i % width]))
+            .collect();
+        let shape = format!("{rows} x {width}");
+        let (y, _) = gpu.up(&xv);
+        gpu.run(|k| kernels_slang::elemwise::norm::standardize(k, bt(b, 1), bt(s, 1), bt(y, rows)));
+        close(&gpu.down(y, n), &want, &format!("standardize {shape}"));
+    }
+}
+
+fn silu(v: f64) -> f64 {
+    v / (1.0 + (-v).exp())
+}
+
+/// The in-place scalar forms, `x *= s` (stated or read) and `x = silu(x * s)`,
+/// over even and odd counts: an odd bf16 tensor ends mid-word, and the half
+/// past it must come back untouched.
+#[test]
+fn the_scalars_answer_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let s = 0.3f32;
+    let sb = f64::from(widen(bf16(s)));
+    for (rows, width) in [(3usize, 64usize), (5, 1000), (3, 7)] {
+        let n = rows * width;
+        let bt = |buf: u32| Tensor::new(buf, rows as u32, width as u32, Dtype::Bf16);
+        // One element past the tensor, a sentinel the kernels leave alone.
+        let mut xv = noise(width as u64 + 14, n);
+        xv.push(7.0);
+        let (sbuf, sr) = gpu.up(&[-1.25]);
+        let (_, xr) = gpu.up(&xv);
+        let mut stated: Vec<f64> = xr.iter().map(|v| f64::from(*v) * sb).collect();
+        let mut read: Vec<f64> = xr
+            .iter()
+            .map(|v| f64::from(*v) * f64::from(sr[0]))
+            .collect();
+        let mut silued: Vec<f64> = xr
+            .iter()
+            .map(|v| silu(f64::from(*v) * f64::from(s)))
+            .collect();
+        for want in [&mut stated, &mut read, &mut silued] {
+            want[n] = 7.0;
+        }
+        let shape = format!("{rows} x {width}");
+        let even = n % 2 == 0;
+        let (x, _) = gpu.up(&xv);
+        gpu.run(|k| kernels_slang::elemwise::pointwise::mul_scalar(k, s, bt(x)));
+
+        close(
+            &gpu.down(x, n + 1),
+            &stated,
+            &format!("mul scalar bf16 {shape}"),
+        );
+        let (x, _) = gpu.up(&xv);
+        let sv = Tensor::new(sbuf, 1, 1, Dtype::Bf16);
+        gpu.run(|k| kernels_slang::elemwise::pointwise::scale(k, sv, bt(x)));
+
+        close(&gpu.down(x, n + 1), &read, &format!("scale bf16 {shape}"));
+        let (x, _) = gpu.up(&xv);
+        gpu.run(|k| kernels_slang::elemwise::pointwise::silu_scaled(k, s, bt(x)));
+
+        close(
+            &gpu.down(x, n + 1),
+            &silued,
+            &format!("silu scaled bf16 {shape}"),
+        );
+        if !even {
+            let (y, yr) = gpu.up(&noise(width as u64 + 15, n + 1));
+            let mut want: Vec<f64> = xr
+                .iter()
+                .zip(&yr)
+                .map(|(a, b)| f64::from(*a) + f64::from(*b))
+                .collect();
+            want[n] = f64::from(yr[n]);
+            let (x, _) = gpu.up(&xv);
+            gpu.run(|k| kernels_slang::elemwise::pointwise::residual_add(k, bt(x), bt(y)));
+            close(
+                &gpu.down(y, n + 1),
+                &want,
+                &format!("residual add bf16 {shape}"),
+            );
+        }
+        let ft = |buf: u32| Tensor::new(buf, rows as u32, width as u32, Dtype::F32);
+        let x = gpu.up_f32(&xv);
+        gpu.run(|k| kernels_slang::elemwise::pointwise::mul_scalar(k, s, ft(x)));
+        let mut want: Vec<f64> = xv.iter().map(|v| f64::from(*v) * f64::from(s)).collect();
+        want[n] = 7.0;
+        close(
+            &gpu.down_f32(x, n + 1),
+            &want,
+            &format!("mul scalar f32 {shape}"),
+        );
+        let x = gpu.up_f32(&xv);
+        gpu.run(|k| kernels_slang::elemwise::pointwise::silu_scaled(k, s, ft(x)));
+        let mut want: Vec<f64> = xv
+            .iter()
+            .map(|v| silu(f64::from(*v) * f64::from(s)))
+            .collect();
+        want[n] = 7.0;
+        close(
+            &gpu.down_f32(x, n + 1),
+            &want,
+            &format!("silu scaled f32 {shape}"),
+        );
+    }
+}
+
+/// Each row the softmax-weighted sum of its candidates (the stacked blocks,
+/// then the prefix), each candidate's logit `rms_norm(c) * w . proj`.
+fn blend_reference(
+    prefix: &[f32],
+    stack: &[f32],
+    n_blocks: usize,
+    (w, proj): (&[f32], &[f32]),
+    rows: usize,
+    hidden: usize,
+    eps: f32,
+) -> Vec<f64> {
+    let mut out = Vec::with_capacity(rows * hidden);
+    for r in 0..rows {
+        let cands: Vec<&[f32]> = (0..n_blocks)
+            .map(|j| &stack[(j * rows + r) * hidden..][..hidden])
+            .chain(std::iter::once(&prefix[r * hidden..][..hidden]))
+            .collect();
+        let logits: Vec<f64> = cands
+            .iter()
+            .map(|c| {
+                let ms = c.iter().map(|v| f64::from(*v).powi(2)).sum::<f64>() / hidden as f64;
+                let inv = 1.0 / (ms + f64::from(eps)).sqrt();
+                (0..hidden)
+                    .map(|h| f64::from(c[h]) * inv * f64::from(w[h]) * f64::from(proj[h]))
+                    .sum()
+            })
+            .collect();
+        let m = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let e: Vec<f64> = logits.iter().map(|l| (l - m).exp()).collect();
+        let sum: f64 = e.iter().sum();
+        for h in 0..hidden {
+            out.push(
+                cands
+                    .iter()
+                    .zip(&e)
+                    .map(|(c, p)| p / sum * f64::from(c[h]))
+                    .sum(),
+            );
+        }
+    }
+    out
+}
+
+#[test]
+fn res_blend_answers_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let eps = 1e-6;
+    for (rows, hidden, n_blocks) in [(3usize, 64usize, 0usize), (2, 1000, 3), (4, 512, 5)] {
+        let n = rows * hidden;
+        let t = |buf: u32, rows: usize| Tensor::new(buf, rows as u32, hidden as u32, Dtype::Bf16);
+        let (prefix, pr) = gpu.up(&noise(hidden as u64 + 20, n));
+        let (stack, sr) = gpu.up(&noise(
+            hidden as u64 + 21,
+            (n_blocks * rows).max(1) * hidden,
+        ));
+        // A small projection keeps the logits apart but not one-hot.
+        let pv: Vec<f32> = noise(hidden as u64 + 23, hidden)
+            .iter()
+            .map(|v| v * 0.05)
+            .collect();
+        let (w, wr) = gpu.up(&noise(hidden as u64 + 22, hidden));
+        let (proj, projr) = gpu.up(&pv);
+        let want = blend_reference(&pr, &sr, n_blocks, (&wr, &projr), rows, hidden, eps);
+        let blocks = vec![t(stack, rows); n_blocks];
+        let shape = format!("{rows} x {hidden}, {n_blocks} blocks");
+        let y = gpu.zeros(n);
+        gpu.run(|k| {
+            kernels_slang::elemwise::norm::res_blend(
+                k,
+                t(prefix, rows),
+                &blocks,
+                t(w, 1),
+                eps,
+                t(proj, 1),
+                t(y, rows),
+            )
+        });
+        close(&gpu.down(y, n), &want, &format!("res blend {shape}"));
+    }
+}

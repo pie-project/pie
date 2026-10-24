@@ -242,7 +242,7 @@ mod tests {
     }
 
     fn a_selection_is_a_split_arms_guard_as_two_words() {
-        let arm = Guard::and(Guard::Fact(3), Guard::not(Guard::Fact(5)));
+        let arm = Guard::and(Guard::Fact(3), !Guard::Fact(5));
         let select = Selection::of(&arm).expect("a conjunction of literals");
         assert_eq!(
             select,
@@ -261,7 +261,7 @@ mod tests {
             None
         );
         assert_eq!(
-            Selection::of(&Guard::and(Guard::Fact(0), Guard::not(Guard::Fact(0)))),
+            Selection::of(&Guard::and(Guard::Fact(0), !Guard::Fact(0))),
             None,
             "a contradiction admits no lane and is not a selection"
         );

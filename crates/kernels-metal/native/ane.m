@@ -329,8 +329,11 @@ int pie_ane_procedure(void *handle, const char *function) {
   return index == NSNotFound ? -1 : (int)index;
 }
 
+// The procedure's input count, or 0 for one the program does not have.
 int pie_ane_input_count(void *handle, int procedure) {
-  return (int)((Program *)handle)->inputs[procedure].count;
+  Program *program = (Program *)handle;
+  if (procedure < 0 || (NSUInteger)procedure >= program->inputs.count) return 0;
+  return (int)program->inputs[procedure].count;
 }
 
 const char *pie_ane_input_name(void *handle, int procedure, int input) {
@@ -346,6 +349,10 @@ typedef struct {
 // request takes, in the procedure's own input order.
 void *pie_ane_bind(void *handle, int procedure, void *const *inputs, int count, void *output, char *err, int cap) {
   Program *program = (Program *)handle;
+  if (procedure < 0 || (NSUInteger)procedure >= program->inputs.count) {
+    say(err, cap, @"the program has no such procedure");
+    return NULL;
+  }
   if (count != (int)program->inputs[procedure].count) {
     say(err, cap, @"the binding's input count is not the procedure's");
     return NULL;

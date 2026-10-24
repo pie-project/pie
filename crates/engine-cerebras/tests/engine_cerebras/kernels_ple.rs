@@ -1,7 +1,7 @@
 //! Per-layer-embedding n-gram hashing over lanes with a kept window.
 
 use engine_cerebras::bench::Bench;
-use kernels_cerebras::attn::ple;
+use kernels_cerebras::gather::ngram;
 use kernels_cerebras::tensor::{RaggedTensor, RecurrentPool};
 
 const EOS: i32 = 1;
@@ -54,7 +54,7 @@ fn chunked_ngram_ids_hash_each_rows_window_and_keep_the_tail() {
     };
     let ran = b
         .run(|ctx| {
-            ple::ngram_ids_chunked(
+            ngram::ngram_ids_chunked(
                 ctx,
                 RaggedTensor {
                     data: idt,
@@ -108,7 +108,7 @@ fn decode_ngram_ids_hash_against_the_kept_window() {
     };
     let ran = b
         .run(|ctx| {
-            ple::ngram_ids(
+            ngram::ngram_ids(
                 ctx, idt, &pool, EOS as u32, &MULTS, &PRIMES, &OFFSETS, 2, None, out,
             )
         })

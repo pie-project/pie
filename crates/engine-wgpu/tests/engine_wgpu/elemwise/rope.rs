@@ -1,0 +1,510 @@
+//! The rotary kernels on the first wgpu adapter against an f64 host
+//! reference: by halves at a span (full, partial, proportional), the rotated
+//! tail (halves or interleaved, forward or back, with and without a YaRN
+//! ramp), and whole-head YaRN.
+
+use crate::gpu::{Gpu, close, noise};
+use kernels_slang::Tensor;
+use poem_ir::Dtype;
+
+const ROWS: usize = 3;
+const HEADS: usize = 4;
+const POSITIONS: [i32; ROWS] = [0, 7, 1000];
+
+/// Turn pair `(a, b)` of every head of every row by `angle(row, k)`, `k`
+/// the pair's index; `scale` multiplies cos and sin.
+fn turn(
+    x: &[f32],
+    head_dim: usize,
+    pairs: impl Fn(usize) -> (usize, usize),
+    count: usize,
+    angle: impl Fn(f64, usize) -> f64,
+    scale: f64,
+) -> Vec<f64> {
+    let mut out: Vec<f64> = x.iter().map(|v| f64::from(*v)).collect();
+    for (r, position) in POSITIONS.iter().enumerate() {
+        for h in 0..HEADS {
+            let base = (r * HEADS + h) * head_dim;
+            for k in 0..count {
+                let (a, b) = pairs(k);
+                let t = angle(f64::from(*position), k);
+                let (c, s) = (t.cos() * scale, t.sin() * scale);
+                let (xa, xb) = (out[base + a], out[base + b]);
+                out[base + a] = xa * c - xb * s;
+                out[base + b] = xa * s + xb * c;
+            }
+        }
+    }
+    out
+}
+
+/// The YaRN ramp's first and last pair, as the host states them.
+fn ramp(width: f64, theta: f64, beta_fast: f64, beta_slow: f64, max_position: f64) -> (f64, f64) {
+    let corr =
+        |rot: f64| width * (max_position / (rot * std::f64::consts::TAU)).ln() / (2.0 * theta.ln());
+    let low = corr(beta_fast).floor().max(0.0);
+    (low, corr(beta_slow).ceil().min(width / 2.0 - 1.0).max(low))
+}
+
+fn ramped(f: f64, k: usize, factor: f64, low: f64, high: f64) -> f64 {
+    let r = ((k as f64 - low) / if high == low { 1e-3 } else { high - low }).clamp(0.0, 1.0);
+    f * ((1.0 - r) + r / factor)
+}
+
+#[test]
+fn the_ropes_answer_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let pos = gpu.up_i32(&POSITIONS);
+    let pt = Tensor::new(pos, ROWS as u32, 1, Dtype::I32);
+    let theta = 10_000.0f32;
+    let th = f64::from(theta);
+
+    // By halves at a span: full (span = head / 2), partial (span = rotary / 2)
+    // and proportional (span = head / 2 over a narrower rotary).
+    for (head_dim, rotary, span) in [(64usize, 64usize, 32usize), (128, 64, 32), (128, 64, 64)] {
+        let width = HEADS * head_dim;
+        let n = ROWS * width;
+        let t = |buf: u32| Tensor::new(buf, ROWS as u32, width as u32, Dtype::Bf16);
+        let qv = noise(head_dim as u64 + span as u64, n);
+        let kv = noise(head_dim as u64 + span as u64 + 1, n);
+        let (_, qr) = gpu.up(&qv);
+        let (_, kr) = gpu.up(&kv);
+        let angle = |p: f64, k: usize| p * th.powf(-(k as f64) / span as f64);
+        let pairs = |k: usize| (k, k + span);
+        let wq = turn(&qr, head_dim, pairs, rotary / 2, angle, 1.0);
+        let wk = turn(&kr, head_dim, pairs, rotary / 2, angle, 1.0);
+        let shape = format!("head {head_dim}, rotary {rotary}, span {span}");
+        let ((q, _), (k, _)) = (gpu.up(&qv), gpu.up(&kv));
+        let (hd, rd, sp) = (head_dim as u32, rotary as u32, span as u32);
+        match rotary == head_dim {
+            true => gpu
+                .run(|c| kernels_slang::elemwise::rope::full(c, t(q), t(k), pt, hd, theta, false)),
+            false => gpu.run(|c| {
+                kernels_slang::elemwise::rope::partial(c, t(q), t(k), pt, rd, hd, theta, sp)
+            }),
+        }
+        close(&gpu.down(q, n), &wq, &format!("rope q {shape}"));
+        close(&gpu.down(k, n), &wk, &format!("rope k {shape}"));
+        let (q, _) = gpu.up(&qv);
+        gpu.run(|c| kernels_slang::elemwise::rope::partial_q(c, t(q), pt, rd, hd, theta, sp));
+
+        close(&gpu.down(q, n), &wq, &format!("rope q alone {shape}"));
+    }
+
+    // The rotated tail.
+    let (head_dim, rotary) = (128usize, 64usize);
+    let width = HEADS * head_dim;
+    let n = ROWS * width;
+    let t = |buf: u32| Tensor::new(buf, ROWS as u32, width as u32, Dtype::Bf16);
+    let qv = noise(77, n);
+    let (_, qr) = gpu.up(&qv);
+    let yarn = kernels_slang::elemwise::rope::Yarn {
+        factor: 4.0,
+        beta_fast: 32.0,
+        beta_slow: 1.0,
+        original_max_position: 4096,
+    };
+    let (low, high) = ramp(rotary as f64, th, 32.0, 1.0, 4096.0);
+    for interleaved in [false, true] {
+        for inverse in [false, true] {
+            for ramped_tail in [false, true] {
+                let off = head_dim - rotary;
+                let half = rotary / 2;
+                let sign = if inverse { -1.0 } else { 1.0 };
+                let angle = |p: f64, k: usize| {
+                    let f = th.powf(-2.0 * k as f64 / rotary as f64);
+                    let f = if ramped_tail {
+                        ramped(f, k, 4.0, low, high)
+                    } else {
+                        f
+                    };
+                    sign * p * f
+                };
+                let want = if interleaved {
+                    turn(
+                        &qr,
+                        head_dim,
+                        |k| (off + 2 * k, off + 2 * k + 1),
+                        half,
+                        angle,
+                        1.0,
+                    )
+                } else {
+                    turn(
+                        &qr,
+                        head_dim,
+                        |k| (off + k, off + k + half),
+                        half,
+                        angle,
+                        1.0,
+                    )
+                };
+                let shape =
+                    format!("interleaved {interleaved}, inverse {inverse}, yarn {ramped_tail}");
+                let (hd, rd) = (head_dim as u32, rotary as u32);
+                let (q, _) = gpu.up(&qv);
+                gpu.run(|c| {
+                    kernels_slang::elemwise::rope::partial_last(
+                        c,
+                        t(q),
+                        pt,
+                        rd,
+                        hd,
+                        theta,
+                        interleaved,
+                        inverse,
+                        ramped_tail.then_some(yarn),
+                    )
+                });
+                close(&gpu.down(q, n), &want, &format!("rope tail {shape}"));
+            }
+        }
+    }
+
+    // Whole-head YaRN.
+    let head_dim = 64usize;
+    let width = HEADS * head_dim;
+    let n = ROWS * width;
+    let t = |buf: u32| Tensor::new(buf, ROWS as u32, width as u32, Dtype::Bf16);
+    let (qv, kv) = (noise(91, n), noise(92, n));
+    let (_, qr) = gpu.up(&qv);
+    let (_, kr) = gpu.up(&kv);
+    let (low, high) = ramp(head_dim as f64, th, 32.0, 1.0, 4096.0);
+    let mscale = 1.1f32;
+    for interleaved in [false, true] {
+        let half = head_dim / 2;
+        let angle = |p: f64, k: usize| {
+            p * ramped(
+                th.powf(-2.0 * k as f64 / head_dim as f64),
+                k,
+                4.0,
+                low,
+                high,
+            )
+        };
+        let pairs = |k: usize| {
+            if interleaved {
+                (2 * k, 2 * k + 1)
+            } else {
+                (k, k + half)
+            }
+        };
+        let wq = turn(&qr, head_dim, pairs, half, angle, f64::from(mscale));
+        let wk = turn(&kr, head_dim, pairs, half, angle, f64::from(mscale));
+        let hd = head_dim as u32;
+        let ((q, _), (k, _)) = (gpu.up(&qv), gpu.up(&kv));
+        gpu.run(|c| {
+            kernels_slang::elemwise::rope::yarn(
+                c,
+                t(q),
+                t(k),
+                pt,
+                hd,
+                theta,
+                4.0,
+                32.0,
+                1.0,
+                mscale,
+                4096,
+                interleaved,
+            )
+        });
+
+        close(
+            &gpu.down(q, n),
+            &wq,
+            &format!("rope yarn q interleaved {interleaved}"),
+        );
+        close(
+            &gpu.down(k, n),
+            &wk,
+            &format!("rope yarn k interleaved {interleaved}"),
+        );
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mrope {
+    Interleaved,
+    Blocked,
+    Split,
+}
+
+/// M-RoPE over every head of every row: per pair, the axis it reads from
+/// the row's (t, h, w) triple, its frequency, and its two columns.
+fn mrope_reference(
+    x: &[f32],
+    (heads, head_dim): (usize, usize),
+    form: Mrope,
+    sections: [usize; 3],
+    rotary: usize,
+    theta: f64,
+    positions: &[[i32; 3]],
+) -> Vec<f64> {
+    let total: usize = sections.iter().sum();
+    let pairs = match form {
+        Mrope::Interleaved => rotary / 2,
+        _ => (rotary / 2).min(total),
+    };
+    let mut out: Vec<f64> = x.iter().map(|v| f64::from(*v)).collect();
+    for (r, pos) in positions.iter().enumerate() {
+        for h in 0..heads {
+            let base = (r * heads + h) * head_dim;
+            for i in 0..pairs {
+                let section = if i < sections[0] {
+                    0
+                } else if i < sections[0] + sections[1] {
+                    1
+                } else {
+                    2
+                };
+                let before: usize = sections[..section].iter().sum();
+                let (axis, inv_freq, a, b) = match form {
+                    Mrope::Interleaved => {
+                        let axis = match i % 3 {
+                            1 if i < 3 * sections[1] => 1,
+                            2 if i < 3 * sections[2] => 2,
+                            _ => 0,
+                        };
+                        (
+                            axis,
+                            theta.powf(-(2.0 * i as f64) / (2 * pairs) as f64),
+                            i,
+                            i + pairs,
+                        )
+                    }
+                    Mrope::Blocked => {
+                        let within = i - before;
+                        (
+                            section,
+                            theta.powf(-(2.0 * within as f64) / total as f64),
+                            i,
+                            i + head_dim / 2,
+                        )
+                    }
+                    Mrope::Split => {
+                        let (within, width) = (i - before, sections[section]);
+                        let a = 2 * before + within;
+                        (
+                            section,
+                            theta.powf(-(within as f64) / width as f64),
+                            a,
+                            a + width,
+                        )
+                    }
+                };
+                let t = f64::from(pos[axis]) * inv_freq;
+                let (xa, xb) = (out[base + a], out[base + b]);
+                out[base + a] = xa * t.cos() - xb * t.sin();
+                out[base + b] = xa * t.sin() + xb * t.cos();
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn the_mropes_answer_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let triples: [[i32; 3]; ROWS] = [[0, 0, 0], [5, 2, 3], [900, 31, 17]];
+    let flat: Vec<i32> = triples.iter().flatten().copied().collect();
+    let pos = gpu.up_i32(&flat);
+    let pt = Tensor::new(pos, ROWS as u32, 3, Dtype::I32);
+    let theta = 1_000_000.0f32;
+    let (q_heads, k_heads) = (4usize, 2usize);
+    for (form, sections, rotary, head_dim) in [
+        (Mrope::Interleaved, [24usize, 20, 20], 128usize, 128usize),
+        (Mrope::Blocked, [16, 24, 24], 128, 128),
+        (Mrope::Split, [11, 10, 11], 64, 64),
+        (Mrope::Split, [8, 12, 12], 64, 64),
+    ] {
+        let qn = ROWS * q_heads * head_dim;
+        let kn = ROWS * k_heads * head_dim;
+        let qv = noise(head_dim as u64 + sections[0] as u64, qn);
+        let kv = noise(head_dim as u64 + sections[1] as u64, kn);
+        let (_, qr) = gpu.up(&qv);
+        let (_, kr) = gpu.up(&kv);
+        let th = f64::from(theta);
+        let wq = mrope_reference(
+            &qr,
+            (q_heads, head_dim),
+            form,
+            sections,
+            rotary,
+            th,
+            &triples,
+        );
+        let wk = mrope_reference(
+            &kr,
+            (k_heads, head_dim),
+            form,
+            sections,
+            rotary,
+            th,
+            &triples,
+        );
+        let t = |buf: u32, heads: usize| {
+            Tensor::new(buf, ROWS as u32, (heads * head_dim) as u32, Dtype::Bf16)
+        };
+        let s3 = sections.map(|s| s as u32);
+        let (rd, hd) = (rotary as u32, head_dim as u32);
+        let shape = format!("sections {sections:?}, rotary {rotary}, head {head_dim}");
+        let ((q, _), (k, _)) = (gpu.up(&qv), gpu.up(&kv));
+        let (qt, kt) = (t(q, q_heads), t(k, k_heads));
+        let (qt, kt, pt) = (qt, kt, pt);
+        gpu.run(|c| match form {
+            Mrope::Interleaved => {
+                kernels_slang::elemwise::rope::mrope_interleaved(c, qt, kt, pt, s3, rd, hd, theta)
+            }
+            Mrope::Blocked => {
+                kernels_slang::elemwise::rope::mrope_blocked(c, qt, kt, pt, s3, rd, hd, theta)
+            }
+            Mrope::Split => {
+                kernels_slang::elemwise::rope::mrope_split(c, qt, kt, pt, s3, rd, hd, theta)
+            }
+        });
+
+        close(&gpu.down(q, qn), &wq, &format!("mrope q {shape}"));
+        close(&gpu.down(k, kn), &wk, &format!("mrope k {shape}"));
+    }
+}
+
+/// Rotary over position axes, as the IR states it: per pair its axis, its
+/// frequency and its two channels, by `form` (0 interleaved, 1 neox, 2 split,
+/// 3 the split ladder).
+#[allow(clippy::too_many_arguments)]
+fn axes_reference(
+    x: &[f32],
+    heads: usize,
+    head_dim: usize,
+    dims: &[usize],
+    thetas: &[f64],
+    form: u8,
+    rotary: usize,
+    positions: &[f32],
+) -> Vec<f64> {
+    let mut out: Vec<f64> = x.iter().map(|v| f64::from(*v)).collect();
+    let angles = rotary / 2;
+    let axes = dims.len();
+    let span: usize = dims.iter().sum();
+    for row in 0..ROWS {
+        let pos = &positions[row * axes..][..axes];
+        for idx in 0..heads * angles {
+            let (head, angle) = (idx / angles, idx % angles);
+            let (lo, hi, t) = if form == 3 {
+                let pad = (heads * rotary - span) / 2;
+                let t = if idx >= pad {
+                    let slot = idx - pad;
+                    let (axis, f) = (slot % axes, slot / axes);
+                    let ladder = dims[axis] / 2;
+                    let e = if ladder > 1 {
+                        f as f64 / (ladder - 1) as f64
+                    } else {
+                        0.0
+                    };
+                    f64::from(pos[axis]) * thetas[axis].powf(e)
+                } else {
+                    0.0
+                };
+                (angle, angle + angles, t)
+            } else {
+                let (mut axis, mut first_angle, mut first_channel) = (0, 0, 0);
+                while angle >= first_angle + dims[axis] / 2 {
+                    first_angle += dims[axis] / 2;
+                    first_channel += dims[axis];
+                    axis += 1;
+                }
+                let within = angle - first_angle;
+                let t = f64::from(pos[axis])
+                    * thetas[axis].powf(-2.0 * within as f64 / dims[axis] as f64);
+                match form {
+                    0 => (
+                        first_channel + 2 * within,
+                        first_channel + 2 * within + 1,
+                        t,
+                    ),
+                    1 => (angle, angle + angles, t),
+                    _ => (
+                        first_channel + within,
+                        first_channel + dims[axis] / 2 + within,
+                        t,
+                    ),
+                }
+            };
+            let base = (row * heads + head) * head_dim;
+            let (a, b) = (out[base + lo], out[base + hi]);
+            out[base + lo] = a * t.cos() - b * t.sin();
+            out[base + hi] = b * t.cos() + a * t.sin();
+        }
+    }
+    out
+}
+
+#[test]
+fn the_axis_ropes_answer_the_reference() {
+    let Some(mut gpu) = Gpu::open() else {
+        eprintln!("not asked: no device");
+        return;
+    };
+    let heads = 4usize;
+    for (form, dims, rotary, head_dim) in [
+        (0u8, vec![16usize, 24, 24], 64usize, 80usize),
+        (1, vec![32, 32], 64, 64),
+        (2, vec![22, 20, 22], 64, 64),
+        (3, vec![40, 40], 32, 48),
+    ] {
+        let width = heads * head_dim;
+        let n = ROWS * width;
+        let axes = dims.len();
+        let posv: Vec<f32> = (0..ROWS * axes)
+            .map(|i| (i * 37 % 101) as f32 * 0.5)
+            .collect();
+        let pos = gpu.up_f32(&posv);
+        let pt = Tensor::new(pos, ROWS as u32, axes as u32, Dtype::F32);
+        let mut d4 = [0u32; 4];
+        let mut thetas = [0f32; 4];
+        for (a, d) in dims.iter().enumerate() {
+            d4[a] = *d as u32;
+            // The ladder raises its base to a growing power: a base under one
+            // keeps the angle where an f32 holds it.
+            thetas[a] = if form == 3 {
+                [0.001, 0.05, 0.2, 1.0][a]
+            } else {
+                [10_000.0, 500.0, 20_000.0, 1.0][a]
+            };
+        }
+        let (dims_u, th64): (Vec<usize>, Vec<f64>) =
+            (dims.clone(), thetas.iter().map(|t| f64::from(*t)).collect());
+        let xv = noise(head_dim as u64 + u64::from(form), n);
+        let (_, xr) = gpu.up(&xv);
+        let want = axes_reference(&xr, heads, head_dim, &dims_u, &th64, form, rotary, &posv);
+        let t = |buf: u32| Tensor::new(buf, ROWS as u32, width as u32, Dtype::Bf16);
+        let (rd, hd, dims) = (rotary as u32, head_dim as u32, d4);
+        let shape = format!("form {form}, dims {dims_u:?}, rotary {rotary}, head {head_dim}");
+
+        let sf = match form {
+            0 => kernels_slang::elemwise::rope::RopeForm::Interleaved,
+            1 => kernels_slang::elemwise::rope::RopeForm::Neox,
+            2 => kernels_slang::elemwise::rope::RopeForm::Split,
+            _ => kernels_slang::elemwise::rope::RopeForm::SplitLadder,
+        };
+        let (y, _) = gpu.up(&xv);
+        gpu.run(|c| kernels_slang::elemwise::rope::axes(c, t(y), pt, dims, thetas, sf, rd, hd));
+        close(&gpu.down(y, n), &want, &format!("rope axes {shape}"));
+        let y = gpu.up_f32(&xv);
+        let ft = Tensor::new(y, ROWS as u32, width as u32, Dtype::F32);
+        gpu.run(|c| kernels_slang::elemwise::rope::axes(c, ft, pt, dims, thetas, sf, rd, hd));
+        let want = axes_reference(&xv, heads, head_dim, &dims_u, &th64, form, rotary, &posv);
+        close(
+            &gpu.down_f32(y, n),
+            &want,
+            &format!("rope axes f32 {shape}"),
+        );
+    }
+}

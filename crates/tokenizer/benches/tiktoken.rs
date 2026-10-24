@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::hint::black_box;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokenizer::Specials;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
@@ -103,11 +104,11 @@ fn bench_kimi(c: &mut Criterion) {
 
     let ids = tokenizer.encode(&prompt);
     c.bench_function("kimi_decode/4k", |b| {
-        b.iter(|| black_box(tokenizer.decode(black_box(&ids), false)));
+        b.iter(|| black_box(tokenizer.decode(black_box(&ids), Specials::Keep)));
     });
     c.bench_function("kimi_incremental_decode/4k", |b| {
         b.iter(|| {
-            let mut decoder = tokenizer.decoder(false);
+            let mut decoder = tokenizer.decoder(Specials::Keep);
             for token in &ids {
                 black_box(decoder.feed(std::slice::from_ref(token)));
             }
@@ -129,7 +130,7 @@ fn bench_kimi(c: &mut Criterion) {
             b.iter(|| black_box(official.encode(black_box(&prompt))));
         });
         c.bench_function("kimi_official/decode_4k", |b| {
-            b.iter(|| black_box(official.decode(black_box(&official_ids), false)));
+            b.iter(|| black_box(official.decode(black_box(&official_ids), Specials::Keep)));
         });
         c.bench_function("kimi_official/load", |b| {
             b.iter(|| black_box(Tokenizer::from_file(black_box(&path)).unwrap()));

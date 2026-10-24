@@ -34,29 +34,30 @@ pub struct Inkling {
 }
 
 impl Inkling {
-    #[must_use]
-    pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
-        let stop_ids = specials(&tokenizer, STOP_TOKENS);
-        let content_text = special(&tokenizer, "<|content_text|>");
-        let end_message = special(&tokenizer, "<|end_message|>");
-        let header = |role: &str| -> Vec<u32> { vec![special(&tokenizer, role), content_text] };
-        let system_prefix = header("<|message_system|>");
+    pub fn try_new(tokenizer: Arc<Tokenizer>) -> Result<Self, String> {
+        let stop_ids = specials(&tokenizer, STOP_TOKENS)?;
+        let content_text = special(&tokenizer, "<|content_text|>")?;
+        let end_message = special(&tokenizer, "<|end_message|>")?;
+        let header = |role: &str| -> Result<Vec<u32>, String> {
+            Ok(vec![special(&tokenizer, role)?, content_text])
+        };
+        let system_prefix = header("<|message_system|>")?;
         let mut effort = system_prefix.clone();
         effort.extend(tokenizer.encode(&format!("Thinking effort level: {THINKING_EFFORT}")));
         effort.push(end_message);
-        Self {
-            user_prefix: header("<|message_user|>"),
-            model_prefix: header("<|message_model|>"),
-            tool_header: special(&tokenizer, "<|message_tool|>"),
-            content_thinking: special(&tokenizer, "<|content_thinking|>"),
-            end_sampling: special(&tokenizer, "<|content_model_end_sampling|>"),
+        Ok(Self {
+            user_prefix: header("<|message_user|>")?,
+            model_prefix: header("<|message_model|>")?,
+            tool_header: special(&tokenizer, "<|message_tool|>")?,
+            content_thinking: special(&tokenizer, "<|content_thinking|>")?,
+            end_sampling: special(&tokenizer, "<|content_model_end_sampling|>")?,
             system_prefix,
             content_text,
             end_message,
             stop_ids,
             effort,
             tokenizer,
-        }
+        })
     }
 
     fn message(&self, prefix: &[u32], msg: &str) -> Vec<u32> {

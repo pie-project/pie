@@ -1,4 +1,4 @@
-//! Kimi Delta Attention against a host reference: the staging (norms, gates)
+//! Kimi Delta Attn against a host reference: the staging (norms, gates)
 //! and the serial per-channel-decay recurrence in f64. The decode step (a
 //! block a row and head, and the tiled step), the token-by-token prefill and
 //! the chunk-parallel prefill, with commits, interior begins, fold masks,
@@ -10,7 +10,7 @@ mod common;
 
 use common::{Gpu, STATE, round_bf16, sigmoid, values};
 use dtype::Dtype;
-use kernels_rocm::attn::ssm;
+use kernels_rocm::ssm;
 use kernels_rocm::{Ctx, RaggedTensor, RecurrentPool, Tensor};
 
 /// The fires share the context's named scratch planes, so the tests in this
@@ -229,7 +229,7 @@ fn bind(gpu: &Gpu, g: Geo, inp: &Inputs, rows: usize, seats: &Seats) -> Bound {
 }
 
 fn step(gpu: &Gpu, ctx: &Ctx, g: Geo, bd: &mut Bound) {
-    ssm::kda_step(
+    ssm::kda(
         ctx,
         bd.mixed,
         bd.f,
@@ -316,9 +316,7 @@ const LOOSE: f32 = 1.5e-2;
 
 #[test]
 fn the_step_answers_the_recurrence() {
-    let _turn = TURN
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _turn = TURN.lock().expect("turn lock poisoned");
     let Some(gpu) = Gpu::open() else { return };
     // 70 rows of 4 heads take a block a row and head; 3 rows the tiles.
     for (n, (g, rows)) in [
@@ -393,9 +391,7 @@ fn the_step_answers_the_recurrence() {
 
 #[test]
 fn the_step_reads_its_window() {
-    let _turn = TURN
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _turn = TURN.lock().expect("turn lock poisoned");
     let Some(gpu) = Gpu::open() else { return };
     // Two heads take the tiles (a head over four blocks); GLM-5.3-Flash's 64
     // heads of 8 stated rows a block a whole head.
@@ -549,9 +545,7 @@ fn chunk_cases() -> Vec<Case> {
 }
 
 fn chunked_answers(scan: Scan, tol: f32) {
-    let _turn = TURN
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _turn = TURN.lock().expect("turn lock poisoned");
     let Some(gpu) = Gpu::open() else { return };
     let mut cases = chunk_cases();
     if scan == Scan::Serial {
@@ -610,9 +604,7 @@ fn the_chunked_prefill_answers_the_recurrence() {
 
 #[test]
 fn the_prefill_reads_its_window() {
-    let _turn = TURN
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _turn = TURN.lock().expect("turn lock poisoned");
     let Some(gpu) = Gpu::open() else { return };
     // 200 stated rows and four stated lanes; live are three requests over
     // 150 rows from row 30, their lanes from 1.

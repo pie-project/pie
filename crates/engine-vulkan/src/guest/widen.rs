@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::cell::Cell;
 use std::sync::Arc;
 
@@ -82,6 +83,10 @@ impl Widen {
             binding(2, vk::DescriptorType::STORAGE_BUFFER),
         ];
         let d = &core.device;
+        // SAFETY: `d` is live; each create info and what it borrows are locals
+        // that outlive the call, and `words` is the SPIR-V the guest compiler
+        // lowered from `SOURCE`, whose three storage bindings the layout
+        // declares. The module is destroyed only after the pipeline is built.
         unsafe {
             let set_layout = d
                 .create_descriptor_set_layout(
@@ -166,6 +171,12 @@ impl Widen {
         let set = frame.descriptor_set(self.set_layout)?;
         frame.retain(self.cfg.slab());
         let d = &self.core.device;
+        // SAFETY: `set` was handed to this widen alone by `descriptor_set` and
+        // no command uses it yet; its writes name live buffers with ranges
+        // inside them (the config slot is `SLOT_BYTES` wide), and `infos`
+        // outlives the update. `cmd` is the open frame's buffer, recorded only
+        // on this thread (`Frame` is not `Sync`), and the pipeline and layout
+        // are this widen's own.
         unsafe {
             let infos = [
                 [buffer_info(src)],
@@ -242,6 +253,9 @@ impl Widen {
 
 impl Drop for Widen {
     fn drop(&mut self) {
+        // SAFETY: the program plane drops its instances before its widen, and
+        // their sessions settle every frame a widen was recorded into, so no
+        // pending command uses these objects.
         unsafe {
             let d = &self.core.device;
             d.destroy_pipeline(self.pipeline, None);

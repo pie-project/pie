@@ -1,9 +1,10 @@
 //! Host references and fixtures several kernel tests share.
 #![allow(dead_code)]
+#![allow(unsafe_code)]
 
 use super::from_bf16;
 use super::tc5::{e2m1, e4m3, ue8m0};
-use kernels_cuda::attn::dsv4::{self, Rows};
+use kernels_cuda::attn::compressed::decode::{self, Rows};
 use kernels_cuda::cudarc::runtime::sys as rt;
 
 /// Asserts a runtime call answered success.
@@ -18,6 +19,9 @@ pub fn cuda_ok(code: rt::cudaError, call: &str) {
 /// Copies `values` over the device bytes at `at`.
 pub fn upload_to<T: Copy>(at: u64, values: &[T]) {
     let _legacy = super::legacy();
+    // SAFETY: the source is `values`, borrowed for the call, and the copy
+    // is synchronous. `at` is a device allocation of at least
+    // `size_of_val(values)` bytes: every test passes one it allocated so.
     let code = unsafe {
         rt::cudaMemcpy(
             at as *mut core::ffi::c_void,
@@ -172,11 +176,11 @@ pub fn ragged_attention(
 pub fn rows_read(raw: &[u8], cells: usize, page: usize, fmt: Rows) -> Vec<f32> {
     const D: usize = 512;
     let (data, scale) = match fmt {
-        Rows::Ds => (dsv4::DS_DATA as usize, 8),
+        Rows::Ds => (decode::DS_DATA as usize, 8),
         Rows::Mx8 => (512, 16),
         Rows::Nv4 => (256, 32),
     };
-    let nope = dsv4::DS_NOPE as usize;
+    let nope = decode::DS_NOPE as usize;
     let mut out = vec![0f32; cells * D];
     for cell in 0..cells {
         let base = cell / page * page * (data + scale);

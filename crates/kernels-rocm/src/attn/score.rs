@@ -47,7 +47,7 @@ pub fn capture(
     scores: &mut Tensor,
     seat_of: &Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "attention.score_capture";
+    const OP: &str = "attn.score_capture";
     plan.accepts(OP, head_dim, Some(kv_heads), window)?;
     if window.is_some() {
         return Err(refuse(

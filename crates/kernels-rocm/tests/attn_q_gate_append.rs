@@ -103,7 +103,7 @@ fn the_fused_prologue_lands_what_its_primitives_land() {
                 }
                 if fused {
                     assert!(
-                        kernels_rocm::custom::q_gate_k_norm_rope_append(
+                        kernels_rocm::attn::qkv_append::q_gate_k_norm_rope_append(
                             &ctx, qg, k, v, qw, kw, positions, 1e-6, 1e-6, &pool, w_page, w_off, d,
                             rotary, span, theta, &mut q, &mut gate, &mut qs,
                         )
@@ -113,7 +113,7 @@ fn the_fused_prologue_lands_what_its_primitives_land() {
                 } else {
                     let mut qn = gpu.zeros(rows, hq * d, Dtype::Bf16);
                     let mut kn = gpu.zeros(rows, hk * d, Dtype::Bf16);
-                    kernels_rocm::layout::split_q_gate(&ctx, qg, d, &mut qs, &mut gate).unwrap();
+                    kernels_rocm::gather::split_q_gate(&ctx, qg, d, &mut qs, &mut gate).unwrap();
                     kernels_rocm::elemwise::norm::rmsnorm_per_head_plus_one(
                         &ctx, qs, qw, d, 1e-6, &mut qn,
                     )

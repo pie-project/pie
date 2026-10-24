@@ -6,7 +6,7 @@ use crate::tensor::Tensor;
 const BLOCK: u32 = 256;
 
 pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, fan: u32, x: &mut Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.gate_sigmoid_mul";
+    const OP: &str = "elemwise.gate_sigmoid_mul";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     debug_assert_eq!(gate.dtype, x.dtype, "the gate rides the rectangle's dtype");
     debug_assert!(
@@ -23,14 +23,19 @@ pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, fan: u32, x: &mut Tensor) -> Result<
     nonzero(OP, "the gated rectangle's element count", lanes)?;
     ctx.fire(
         OP,
-        Fire::at("linear/glu.hip", "::pie::linear::gate_sigmoid_mul").apply(super::norm::sweep(
-            u64::from(lanes),
-            if x.width.is_multiple_of(4) && x.ptr.is_multiple_of(8) && gate.ptr.is_multiple_of(8) {
-                4
-            } else {
-                1
-            },
-        )),
+        Fire::at("linear/glu.hip", "::pie::linear::gate_sigmoid_mul").apply(
+            super::pointwise::sweep(
+                u64::from(lanes),
+                if x.width.is_multiple_of(4)
+                    && x.ptr.is_multiple_of(8)
+                    && gate.ptr.is_multiple_of(8)
+                {
+                    4
+                } else {
+                    1
+                },
+            ),
+        ),
         &[
             x.arg(),
             gate.arg(),
@@ -49,7 +54,7 @@ pub fn sigmoid_mul_heads(
     scale: f32,
     x: &mut Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.gate_sigmoid_mul_heads";
+    const OP: &str = "elemwise.gate_sigmoid_mul";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     debug_assert_eq!(gate.dtype, x.dtype, "the gate rides the rectangle's dtype");
     let rows = nonzero(OP, "rows", x.rows)?;

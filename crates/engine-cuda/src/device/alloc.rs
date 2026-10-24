@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use crate::error::{Fault, Result};
 
 #[derive(Debug)]
@@ -296,6 +297,8 @@ impl Buffer {
                 if status == rt::cudaError::cudaSuccess {
                     return Ok(());
                 }
+                // SAFETY: takes no arguments; it only clears this thread's
+                // sticky error from the refused batch.
                 let _ = unsafe { rt::cudaGetLastError() };
                 REFUSED.store(true, Ordering::Relaxed);
             }
@@ -786,6 +789,8 @@ impl Pinning {
             });
         };
         #[cfg(target_os = "linux")]
+        // SAFETY: `at` is the mapping `map_anon` just made of at least
+        // `bytes` bytes; MADV_HUGEPAGE is only a hint and changes no contents.
         unsafe {
             libc::madvise(at.cast(), bytes.max(1), libc::MADV_HUGEPAGE)
         };
@@ -1188,6 +1193,8 @@ pub fn is_host_pointer(at: u64) -> bool {
         use crate::device::rt;
         // SAFETY: a zeroed attribute record the call fills; the query reads nothing else.
         let mut attrs: rt::cudaPointerAttributes = unsafe { core::mem::zeroed() };
+        // SAFETY: `attrs` is a live local the call writes; `at` is only
+        // looked up, never dereferenced, so any value is a valid query.
         let asked =
             unsafe { rt::cudaPointerGetAttributes(&raw mut attrs, at as *const core::ffi::c_void) };
         asked == rt::cudaError::cudaSuccess && attrs.type_ == rt::cudaMemoryType::cudaMemoryTypeHost

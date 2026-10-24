@@ -3,7 +3,7 @@ use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Request, Stream, Value, Weight,
     ops, seam, trace_hybrid,
 };
-use poem_ir::{Attention, Def, Elementwise, GeomKind, Guard, Operation, RuntimeInput, Selection};
+use poem_ir::{Attn, Def, Elemwise, GeomKind, Guard, Operation, RuntimeInput, Selection};
 
 const WIDTH: u32 = 32;
 const HEAD_DIM: u32 = 8;
@@ -37,16 +37,16 @@ impl ForwardHybrid for DoubleBlock {
         let perm = inputs.row_permutation();
         let indptr = inputs.group_indptr();
         let o = ops::attn::ragged(
-            &ops::layout::pack_rows(&q, &perm),
-            &ops::layout::pack_rows(&k, &perm),
-            &ops::layout::pack_rows(&v, &perm),
+            &ops::gather::pack_rows(&q, &perm),
+            &ops::gather::pack_rows(&k, &perm),
+            &ops::gather::pack_rows(&v, &perm),
             &indptr,
             &indptr,
             HEAD_DIM,
             0.35,
             RaggedMask::GroupBlockDiagonal,
         );
-        let o = ops::layout::unpack_rows(&o, &perm);
+        let o = ops::gather::unpack_rows(&o, &perm);
         let (o_txt, o_img) = (
             o.on(fact::stream(Stream::Text)),
             o.on(!fact::stream(Stream::Text)),
@@ -65,19 +65,19 @@ impl ForwardHybrid for DoubleBlock {
 fn the_joint_attention_traces_and_its_answer_splits_back_onto_the_arms() {
     let trace = trace_hybrid("double", &DoubleBlock, Platform::Cuda);
     let text = Guard::Fact(Stream::Text.code());
-    let image = Guard::not(text.clone());
+    let image = !text.clone();
 
     let ragged = trace
         .nodes
         .iter()
-        .find(|node| matches!(node.op, Operation::Attention(Attention::Ragged { .. })))
+        .find(|node| matches!(node.op, Operation::Attn(Attn::Ragged { .. })))
         .expect("one joint attention");
     assert!(
         ragged
             .guard
             .equivalent(&Guard::or(text.clone(), image.clone()))
     );
-    let Operation::Attention(Attention::Ragged {
+    let Operation::Attn(Attn::Ragged {
         q_indptr,
         kv_indptr,
         mask,
@@ -102,12 +102,7 @@ fn the_joint_attention_traces_and_its_answer_splits_back_onto_the_arms() {
     let folds: Vec<&Guard> = trace
         .nodes
         .iter()
-        .filter(|node| {
-            matches!(
-                node.op,
-                Operation::Elementwise(Elementwise::ResidualAdd { .. })
-            )
-        })
+        .filter(|node| matches!(node.op, Operation::Elemwise(Elemwise::ResidualAdd { .. })))
         .map(|node| &node.guard)
         .collect();
     assert_eq!(
@@ -119,7 +114,16 @@ fn the_joint_attention_traces_and_its_answer_splits_back_onto_the_arms() {
         .nodes
         .iter()
         .rev()
-        .filter(|node| matches!(node.op, Operation::Linear(poem_ir::Linear::Matmul { .. })))
+        .filter(|node| {
+            matches!(
+                node.op,
+                Operation::Linear(poem_ir::Linear::Matmul {
+                    quant: None,
+                    logits: false,
+                    ..
+                })
+            )
+        })
         .take(2)
         .map(|node| &node.guard)
         .collect();

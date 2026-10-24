@@ -201,7 +201,7 @@ pub fn full(
     theta: f32,
     interleaved: bool,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_full";
+    const OP: &str = "elemwise.rope";
     if interleaved {
         return Err(refuse(
             OP,
@@ -226,7 +226,7 @@ pub fn partial(
     theta: f32,
     span: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_partial";
+    const OP: &str = "elemwise.rope";
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     let base = theta.log2();
     rotate(ctx, OP, q, positions, base, head_dim, rotary_dim, span)?;
@@ -242,7 +242,7 @@ pub fn partial_q(
     theta: f32,
     span: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_partial_q";
+    const OP: &str = "elemwise.rope";
     rotate(
         ctx,
         OP,
@@ -267,7 +267,7 @@ pub fn partial_last(
     inverse: bool,
     yarn: Option<Yarn>,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_partial_last";
+    const OP: &str = "elemwise.rope";
     if rotary_dim > head_dim {
         return Err(refuse(
             OP,
@@ -306,7 +306,7 @@ pub fn yarn(
     original_max_position: u32,
     interleaved: bool,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_yarn";
+    const OP: &str = "elemwise.rope";
     debug_assert_eq!(k.dtype, q.dtype, "`{OP}` rotates q and k in one element");
     let max_position = stated(
         OP,

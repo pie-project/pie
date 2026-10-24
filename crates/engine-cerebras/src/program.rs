@@ -90,7 +90,7 @@ impl Latch {
         if let Err(why) = outcome {
             self.fault
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("fault lock poisoned")
                 .get_or_insert(why);
         }
         if self.holds.fetch_sub(1, Ordering::AcqRel) != 1 {
@@ -101,11 +101,7 @@ impl Latch {
             step = self.at.step,
             "cerebras step landed"
         );
-        let fault = self
-            .fault
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+        let fault = self.fault.lock().expect("fault lock poisoned").take();
         if let Some(sink) = &self.sink {
             sink(
                 self.at,

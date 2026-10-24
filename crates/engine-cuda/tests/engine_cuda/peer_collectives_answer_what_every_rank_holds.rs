@@ -1,4 +1,7 @@
-#![cfg(feature = "device")]
+#![cfg(feature = "cuda")]
+#![allow(unsafe_code)]
+
+//! ROCm has no peer kernels (its collectives are RCCL's), so this is CUDA's alone.
 
 use engine_cuda::device::{Buffer, Context};
 use kernels_cuda::{Ctx, Tensor, collective};

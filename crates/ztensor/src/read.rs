@@ -110,7 +110,7 @@ impl DirectoryResolver {
 impl ShardResolver for DirectoryResolver {
     fn resolve(&self, name: &str, shard: &Shard) -> Result<PathBuf> {
         let algo = shard.digest.algorithm()?;
-        let mut cache = self.digests.lock().unwrap_or_else(|e| e.into_inner());
+        let mut cache = self.digests.lock().expect("digests lock poisoned");
         let bucket = cache.entry((shard.size, algo)).or_insert_with(|| {
             let mut found = BTreeMap::new();
             for path in self.by_size.get(&shard.size).into_iter().flatten() {

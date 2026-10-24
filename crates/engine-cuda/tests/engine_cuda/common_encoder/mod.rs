@@ -64,16 +64,16 @@ impl ForwardHybrid for EncoderLayer {
         let perm = inputs.row_permutation();
         let indptr = inputs.lane_indptr();
         let o = ops::attn::ragged(
-            &ops::layout::pack_rows(&q, &perm),
-            &ops::layout::pack_rows(&k, &perm),
-            &ops::layout::pack_rows(&v, &perm),
+            &ops::gather::pack_rows(&q, &perm),
+            &ops::gather::pack_rows(&k, &perm),
+            &ops::gather::pack_rows(&v, &perm),
             &indptr,
             &indptr,
             HEAD_DIM,
             SM_SCALE,
             ops::attn::relative_bias(&table, MAX_LEN),
         );
-        let o = ops::layout::unpack_rows(&o, &perm);
+        let o = ops::gather::unpack_rows(&o, &perm);
         let y = ops::linear::matmul(&o, &w("o", WIDTH, HEADS * HEAD_DIM));
         let out = ops::elemwise::residual_add(&x, &y);
         seam::at(seam::HIDDEN, &[&out]);

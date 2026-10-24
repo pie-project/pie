@@ -19,16 +19,20 @@ pub struct Lines {
 }
 
 impl Lines {
-    #[must_use]
-    pub fn new<S: AsRef<str>>(tokenizer: Arc<Tokenizer>, bos: &str, eos: &str, stop: &[S]) -> Self {
+    pub fn try_new<S: AsRef<str>>(
+        tokenizer: Arc<Tokenizer>,
+        bos: &str,
+        eos: &str,
+        stop: &[S],
+    ) -> Result<Self, String> {
         let sep = tokenizer.encode("\n\n");
-        Self {
-            bos: special(&tokenizer, bos),
-            eos: special(&tokenizer, eos),
+        Ok(Self {
+            bos: special(&tokenizer, bos)?,
+            eos: special(&tokenizer, eos)?,
             sep,
-            stop_ids: specials(&tokenizer, stop),
+            stop_ids: specials(&tokenizer, stop)?,
             tokenizer,
-        }
+        })
     }
 
     fn turn(&self, role: &str, msg: &str) -> Vec<u32> {

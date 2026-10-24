@@ -10,11 +10,11 @@ license = "Apache-2.0"
 name = "waker"
 path = "src/lib.rs"
 
-[lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
-
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
 [target.'cfg(not(loom))'.dev-dependencies]
 tokio = { version = "1", features = ["rt", "time", "macros"] }
+
+[lints]
+workspace = true

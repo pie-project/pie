@@ -2,7 +2,6 @@
 #include <metal_simdgroup>
 using namespace metal;
 
-
 template <typename T>
 [[kernel]] void binary_add(
     const device T* x  [[buffer(0)]],
@@ -323,3 +322,93 @@ template <typename T>
 
 instantiate_relative_bucket_bias(bfloat16, bfloat)
 instantiate_relative_bucket_bias(float32, float)
+
+template <typename T>
+[[kernel]] void residual_add(
+    const device T* x        [[buffer(0)]],
+    const device T* residual [[buffer(1)]],
+    device T* out            [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]) {
+  out[tid] = T(float(x[tid]) + float(residual[tid]));
+}
+
+#define instantiate_residual_add(name, itype)                     \
+  template [[host_name("residual_add_" #name)]]                   \
+  [[kernel]] void residual_add<itype>(                            \
+      const device itype*, const device itype*, device itype*, uint);
+
+instantiate_residual_add(bfloat16, bfloat)
+instantiate_residual_add(float32, float)
+
+template <typename T, typename TB>
+[[kernel]] void add_bias(
+    device T* out            [[buffer(0)]],
+    const device TB* bias    [[buffer(1)]],
+    const constant int& width [[buffer(2)]],
+    uint2 tid [[thread_position_in_grid]]) {
+  const size_t i = size_t(tid.y) * size_t(width) + size_t(tid.x);
+  out[i] = T(float(out[i]) + float(bias[tid.x]));
+}
+
+#define instantiate_add_bias(name, itype, btype)                   \
+  template [[host_name("add_bias_" #name)]]                        \
+  [[kernel]] void add_bias<itype, btype>(                          \
+      device itype*, const device btype*, const constant int&, uint2);
+
+instantiate_add_bias(bfloat16, bfloat, bfloat)
+instantiate_add_bias(float32, float, float)
+instantiate_add_bias(float32_bf16, float, bfloat)
+
+template <typename T>
+[[kernel]] void layer_scalar_mul(
+    const device T* x                [[buffer(0)]],
+    const device T* scalar           [[buffer(1)]],
+    device T* out                    [[buffer(2)]],
+    uint gid                         [[thread_position_in_grid]]) {
+  const float s = static_cast<float>(scalar[0]);
+  out[gid] = static_cast<T>(static_cast<float>(x[gid]) * s);
+}
+
+#define instantiate_layer_scalar(name, itype)                          \
+  template [[host_name("layer_scalar_mul_" #name)]]                    \
+  [[kernel]] void layer_scalar_mul<itype>(                             \
+      const device itype*, const device itype*, device itype*, uint);
+
+instantiate_layer_scalar(bfloat16, bfloat)
+
+instantiate_layer_scalar(float32, float)
+
+template <typename T>
+[[kernel]] void layer_scalar_mul_stated(
+    const device T* x                [[buffer(0)]],
+    const constant float& scalar     [[buffer(1)]],
+    device T* out                    [[buffer(2)]],
+    uint gid                         [[thread_position_in_grid]]) {
+  const float s = static_cast<float>(static_cast<T>(scalar));
+  out[gid] = static_cast<T>(static_cast<float>(x[gid]) * s);
+}
+
+#define instantiate_layer_scalar_stated(name, itype)                   \
+  template [[host_name("layer_scalar_mul_stated_" #name)]]             \
+  [[kernel]] void layer_scalar_mul_stated<itype>(                      \
+      const device itype*, const constant float&, device itype*, uint);
+
+instantiate_layer_scalar_stated(bfloat16, bfloat)
+instantiate_layer_scalar_stated(float32, float)
+
+template <typename T>
+[[kernel]] void silu_scaled(
+    device T* x                      [[buffer(0)]],
+    const constant float& scalar     [[buffer(1)]],
+    uint gid                         [[thread_position_in_grid]]) {
+  const float v = static_cast<float>(x[gid]) * scalar;
+  x[gid] = static_cast<T>(v / (1.0f + precise::exp(-v)));
+}
+
+#define instantiate_silu_scaled(name, itype)                           \
+  template [[host_name("silu_scaled_" #name)]]                         \
+  [[kernel]] void silu_scaled<itype>(                                  \
+      device itype*, const constant float&, uint);
+
+instantiate_silu_scaled(bfloat16, bfloat)
+instantiate_silu_scaled(float32, float)

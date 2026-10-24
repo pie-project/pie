@@ -1,4 +1,4 @@
-use kernels_xla::Tensor;
+use crate::handle::Tensor;
 use poem_compiler::CompiledModel;
 use poem_exec::fire::{MaskSpan, WindowTable, fallback};
 use poem_exec::store::check::{self, rebase};

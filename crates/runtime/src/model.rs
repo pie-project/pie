@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
+use tokenizer::Specials;
 
 use anyhow::{Result, anyhow};
 
@@ -421,11 +422,13 @@ impl Model {
     }
 
     pub fn detokenize(&self, tokens: &[u32]) -> String {
-        self.tokenizer.decode(tokens, false)
+        self.tokenizer.decode(tokens, Specials::Keep)
     }
 
-    pub fn get_vocabs(&self) -> (Vec<u32>, Vec<Vec<u8>>) {
-        self.vocab().clone()
+    /// Every token the vocabulary spells, each with its bytes.
+    pub fn vocabs(&self) -> impl Iterator<Item = (u32, &[u8])> {
+        let (ids, bytes) = self.vocab();
+        ids.iter().copied().zip(bytes.iter().map(Vec::as_slice))
     }
 
     fn vocab(&self) -> &(Vec<u32>, Vec<Vec<u8>>) {
@@ -454,12 +457,12 @@ impl Model {
         self.tokenizer.ids_with_prefix(prefix)
     }
 
-    pub fn get_split_regex(&self) -> String {
-        self.tokenizer.get_split_regex()
+    pub fn split_regex(&self) -> Option<&str> {
+        self.tokenizer.split_regex()
     }
 
-    pub fn get_special_tokens(&self) -> (Vec<u32>, Vec<Vec<u8>>) {
-        self.tokenizer.get_special_tokens()
+    pub fn special_tokens(&self) -> impl Iterator<Item = (u32, &[u8])> {
+        self.tokenizer.special_tokens()
     }
 
     #[must_use]

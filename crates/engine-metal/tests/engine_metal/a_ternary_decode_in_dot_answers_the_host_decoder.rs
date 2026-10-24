@@ -25,7 +25,7 @@
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::encode::{Arg, Encode, Fire, Grid};
-use kernels_metal::linear::quant;
+use kernels_metal::linear::{qmm, qmv};
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
 
@@ -33,7 +33,7 @@ use poem_ir::Dtype;
 // [u32;128] }` and `FORK_BLOCKS`, generated from the real GGUF + the fork dequant.
 include!("../../../checkpoint/src/codec/ptq1_0_fixture.rs");
 
-const PTQ1_0_FILE: &str = "linear/quant_ptq1_0.metal";
+const PTQ1_0_FILE: &str = "linear/qmv_ptq1_0.metal";
 const QMV_GROUP: [u32; 3] = [32, 2, 1];
 const BLOCK_BYTES: usize = 28;
 const BLOCK: usize = 128;
@@ -118,7 +118,7 @@ fn the_one_hot_probe_reads_back_the_host_decoder_bit_exact(
     let sink = Sink::new(device, &frame, pipelines, handles);
     sink.fire(
         Fire::at(PTQ1_0_FILE, "ptq1_0_qmv_bfloat16_f32").apply(Grid::of(
-            quant::qmv_grid("m1b.readback", mi, ni).expect("grid"),
+            qmv::qmv_grid("m1b.readback", mi, ni).expect("grid"),
             QMV_GROUP,
         )),
         &[
@@ -232,7 +232,7 @@ fn a_random_activation_answers_the_host_decoded_weights(
     let sink = Sink::new(device, &frame, pipelines, handles);
     sink.fire(
         Fire::at(PTQ1_0_FILE, "ptq1_0_qmv_bfloat16_f32").apply(Grid::of(
-            quant::qmv_grid("m1b.general.f32", mi, ni).expect("grid"),
+            qmv::qmv_grid("m1b.general.f32", mi, ni).expect("grid"),
             QMV_GROUP,
         )),
         &[
@@ -281,14 +281,14 @@ fn a_random_activation_answers_the_host_decoded_weights(
     let act = Tensor::new(hx, mi.unsigned_abs(), ki.unsigned_abs(), Dtype::Bf16);
     let y = Tensor::new(hy, mi.unsigned_abs(), ni.unsigned_abs(), Dtype::Bf16);
     let none = |_: u32, _: u32| None;
-    let scratch = quant::Scratch {
+    let scratch = qmm::Scratch {
         precast: &none,
         partials: &none,
         table: None,
     };
     let frame = device.frame().expect("a frame");
     let sink = Sink::new(device, &frame, pipelines, handles);
-    quant::matmul(
+    qmm::matmul(
         &sink,
         &engine_metal::chip::tuning("", false),
         act,

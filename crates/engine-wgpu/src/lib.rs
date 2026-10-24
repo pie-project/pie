@@ -26,6 +26,7 @@ mod scratch;
 pub mod serve;
 pub mod settle;
 pub mod store;
+pub mod tuning;
 pub mod weight_store;
 pub mod weights;
 pub mod window;
@@ -61,5 +62,6 @@ pub use store::Pools;
 pub use weights::{AdapterPlane, BankSeat, Weights};
 pub use window::{Copies, Gathered, GatheredSpace, Window, Windows};
 
-/// The fused kernels this backend ships; the compiler forms only these.
-pub const FUSED: [&str; 0] = [];
+/// The fusions this backend implements: none, so the compiler forms no
+/// fused op here.
+pub static FUSIONS: [poem_compiler::fuse::Rule; 0] = [];
