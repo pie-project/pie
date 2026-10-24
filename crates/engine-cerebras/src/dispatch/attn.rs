@@ -172,7 +172,7 @@ impl Run<'_> {
             Attn::Prefill {
                 q,
                 plan,
-                mask: Some(mask),
+                mask,
                 cache,
                 window,
                 head_dim,
@@ -186,8 +186,8 @@ impl Run<'_> {
                 selected: None,
                 rel: None,
                 lse: None,
-            } => {
-                let mask = self.cut_rows(self.tensor(*mask));
+            } if mask.is_some() || !*causal => {
+                let mask = self.cut_rows(self.mask_bits(*mask));
                 attn::masked(
                     self.ctx(),
                     self.ragged(*q),
@@ -204,7 +204,7 @@ impl Run<'_> {
             Attn::Prefill {
                 q,
                 plan,
-                mask: Some(mask),
+                mask,
                 cache,
                 window,
                 head_dim,
@@ -218,8 +218,8 @@ impl Run<'_> {
                 floor: None,
                 selected: None,
                 rel: None,
-            } => {
-                let mask = self.cut_rows(self.tensor(*mask));
+            } if mask.is_some() || !*causal => {
+                let mask = self.cut_rows(self.mask_bits(*mask));
                 attn::masked_lse(
                     self.ctx(),
                     self.ragged(*q),

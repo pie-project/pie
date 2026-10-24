@@ -1093,7 +1093,6 @@ impl Metal {
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
                     captures_scores: lane.captures_scores,
                     mask: lane.mask.as_ref(),
-                    bidirectional: lane.bidirectional,
                     self_cond: lane.self_cond.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
                     positions: &lane.positions,

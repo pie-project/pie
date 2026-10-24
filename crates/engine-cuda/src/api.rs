@@ -765,7 +765,10 @@ impl Engine for Cuda {
             // A causal encoder-decoder's long prompts: their leading rows
             // through the encoder alone first, unannounced, then the step
             // with each such prompt's last window (`crate::replay`).
-            let split = self.replay.and_then(|replay| replay.split(step));
+            let split = self
+                .replay
+                .zip(self.shell.as_ref())
+                .and_then(|(replay, shell)| replay.split(step, |word| shell.wide(word)));
             if let Some((head, _)) = &split
                 && let Err(error) = self.fire_step(head, at, false)
             {
@@ -1175,7 +1178,6 @@ impl Cuda {
                     adapter: lane_adapters[at].or(lane.adapter),
                     drafts: lane.drafts,
                     captures_scores: lane.captures_scores,
-                    bidirectional: lane.bidirectional,
                     self_cond: lane.self_cond.as_ref(),
                     rs: lane.rs.clone(),
                     rs_reset: lane.rs_reset,

@@ -451,7 +451,7 @@ impl Run<'_> {
             Attn::Prefill {
                 q,
                 plan,
-                mask: Some(mask),
+                mask,
                 cache,
                 window,
                 head_dim,
@@ -465,12 +465,12 @@ impl Run<'_> {
                 selected: None,
                 rel: None,
                 lse: None,
-            } => {
+            } if mask.is_some() || !*causal => {
                 let pool = *self.pool(*cache);
                 let call = attn::arbiter::masked(
                     self.ragged(*q),
                     self.prefill_plan(*plan),
-                    self.cut_rows(self.tensor(*mask)),
+                    self.cut_rows(self.mask_bits(*mask)),
                     *window,
                     *causal,
                     *head_dim,
@@ -483,7 +483,7 @@ impl Run<'_> {
             Attn::Prefill {
                 q,
                 plan,
-                mask: Some(mask),
+                mask,
                 cache,
                 window,
                 head_dim,
@@ -497,12 +497,12 @@ impl Run<'_> {
                 floor: None,
                 selected: None,
                 rel: None,
-            } => {
+            } if mask.is_some() || !*causal => {
                 let pool = *self.pool(*cache);
                 let call = attn::arbiter::masked_lse(
                     self.ragged(*q),
                     self.prefill_plan(*plan),
-                    self.cut_rows(self.tensor(*mask)),
+                    self.cut_rows(self.mask_bits(*mask)),
                     *window,
                     *causal,
                     *head_dim,

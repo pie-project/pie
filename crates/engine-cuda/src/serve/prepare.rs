@@ -865,7 +865,7 @@ impl FrameShell for Shell {
                 mask: masking,
                 have,
                 rows: row.rows,
-                bidirectional: seated.bidirectional,
+                wide: self.wide.contains(row.class as usize),
             });
             slot_ids.push(seated.rs_slot.unwrap_or(lane.slot) as i32);
             if scoring {
@@ -1371,11 +1371,9 @@ impl FrameShell for Shell {
             self.towered.then_some((&patches.classes, patches.bucket)),
         );
         let copies_here = copies
-            && key
-                .classes
-                .rungs()
-                .iter()
-                .all(|(class, _)| !self.masked.contains(*class as usize));
+            && key.classes.rungs().iter().all(|(class, _)| {
+                !self.masked.contains(*class as usize) && !self.wide.contains(*class as usize)
+            });
         let class_tables = [
             composition.table(poem_ir::RowAxis::Tokens),
             composition.table(poem_ir::RowAxis::Patches),

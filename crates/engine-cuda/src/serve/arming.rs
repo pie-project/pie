@@ -529,7 +529,6 @@ impl Shell {
                 adapter: lane.adapter,
                 drafts: lane.drafts,
                 captures_scores: lane.captures,
-                bidirectional: false,
                 self_cond: None,
                 readout: None,
                 rs: RsVerb::Fold,

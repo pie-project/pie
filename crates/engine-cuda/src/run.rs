@@ -1339,6 +1339,18 @@ impl<'c> Run<'c> {
         self.window().span().rows
     }
 
+    /// The fire's mask bits: what a prefill that is not causal reads where it
+    /// states no mask (its lanes' classes stage every key they hold).
+    pub(crate) fn mask_bits(&self) -> Tensor {
+        self.fire
+            .geometry
+            .first()
+            .and_then(|seat| seat.mask)
+            .unwrap_or_else(|| {
+                panic!("a prefill that is not causal reads mask bits this fire left unbound")
+            })
+    }
+
     pub(crate) fn mask_indptr(&self) -> Option<Tensor> {
         if self.plane_base() {
             return self.fire.tables.mask_indptr;

@@ -394,6 +394,12 @@ impl<'c> Run<'c> {
         self.slice(handle, skip, keep)
     }
 
+    /// `mask`'s bits, or the fire's where a prefill that is not causal states
+    /// none (its lanes' classes stage every key they hold).
+    pub(crate) fn mask_bits(&self, mask: Option<ValueId>) -> Tensor {
+        mask.map_or(self.fire.tables.mask, |mask| self.tensor(mask))
+    }
+
     pub(crate) fn tensor(&self, id: ValueId) -> Tensor {
         self.cut(id, self.whole(id))
     }

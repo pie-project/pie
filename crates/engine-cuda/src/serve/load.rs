@@ -8,7 +8,7 @@ use crate::error::{Fault, Result};
 use crate::exports::{
     Exports, Feeds, corrected_classes, decoding_of, landing_requests, masked_classes,
     media_classes, plain_of, read_only_by_decoders, regions_lane_shifting,
-    regions_launching_schedules, regions_shifting, schedule_streams,
+    regions_launching_schedules, regions_shifting, schedule_streams, wide_classes,
 };
 use crate::inputs::Inputs;
 use crate::program::Plane as ProgramPlane;
@@ -662,6 +662,7 @@ impl Shell {
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
         crate::window::no_grouped_window_is_also_a_prepare_window(&compiled)?;
         let masked = masked_classes(&boot.trace, &compiled);
+        let wide = wide_classes(&boot.trace, &compiled);
         let corrected = corrected_classes(&boot.trace, &compiled);
         let landing = landing_requests(&boot.trace.facts, &compiled.classes);
         let decoding = decoding_of(&landing);
@@ -849,7 +850,7 @@ impl Shell {
             u64::from(self_cond_taps),
             &feeds.seats(),
             feeds.selections.len(),
-            !masked.is_empty(),
+            !masked.is_empty() || !wide.is_empty(),
             &schedule_streams(&boot.trace, &compiled),
         )?;
 
@@ -912,6 +913,7 @@ impl Shell {
             facts,
             spaces,
             masked,
+            wide,
             feeds,
             adapter_fact,
             corrected,
