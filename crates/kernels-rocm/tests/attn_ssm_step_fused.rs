@@ -31,7 +31,7 @@ struct Case {
     conv_slab: Vec<f32>,
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn run(
     gpu: &Gpu,
     g: &Geo,

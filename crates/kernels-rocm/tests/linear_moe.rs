@@ -827,7 +827,7 @@ fn mxfp4_lanes_guard() {
     ] {
         let [e, t, kk, nn, kd] = [experts, tokens, top_k, n, k].map(|v| v as usize);
         let codes: Vec<u8> = (0..e * nn * kd / 2)
-            .map(|i| (i * 2654435761usize >> 13) as u8)
+            .map(|i| ((i * 2654435761usize) >> 13) as u8)
             .collect();
         let scales: Vec<u8> = (0..e * nn * kd / 32).map(|i| 120 + (i % 9) as u8).collect();
         let ct = gpu.upload(&codes, experts, n * k / 2, Dtype::U8);
