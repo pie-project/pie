@@ -5,6 +5,13 @@ load("//pie/codec.poem", "kept", "stacked_bank", read_weight = "weight")
 load("//lib/adapters.poem", "banks")
 
 HY = template("hy", thinking = True)
+
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: the latent attention's q and kv up-projections, its gate and its
+# sinks by their heads, the dense, shared and routed gates and ups by their
+# channels, the output and down projections by their rows. The head it
+# holds whole, as the package always has.
+CUTS = "inferred"
 TOKENIZER = tokenizer(
     markers = [
         ["<｜hy_end:opensource｜>"],
@@ -104,16 +111,16 @@ def attention(n, d, hidden, weights, norms, eps, kv, sink, indexer, kept = None)
         q_a_proj = weight([d.q_lora_rank, hidden], weights),
         q_a_norm = weight([d.q_lora_rank]),
         q_a_norm_eps = eps,
-        q_b_proj = weight([d.heads * qk_head_dim, d.q_lora_rank], weights).columns(),
+        q_b_proj = weight([d.heads * qk_head_dim, d.q_lora_rank], weights),
         kv_a_proj = weight([d.kv_lora_rank + d.qk_rope_head_dim, hidden], weights),
         kv_a_norm = weight([d.kv_lora_rank]),
         kv_a_norm_eps = eps,
         kv_b_proj = weight([d.heads * (d.qk_nope_head_dim + d.v_head_dim), d.kv_lora_rank],
             kept,
-        ).columns(),
-        gate = weight([v_width, hidden], kept).columns(),
-        sink = weight([d.heads], dtype.f32).columns(),
-        o_proj = weight([hidden, v_width], weights).rows(),
+        ),
+        gate = weight([v_width, hidden], kept),
+        sink = weight([d.heads], dtype.f32),
+        o_proj = weight([hidden, v_width], weights),
         kv = kv,
         indexer = indexer,
     )
@@ -222,12 +229,12 @@ def layout(id, deploy):
             routed = True,
             router = weight([m.experts, hidden]),
             bias = weight([m.experts], dtype.f32),
-            gate_up = weight([m.experts, 2 * iw, hidden], banks_dtype).bank([iw, iw]),
-            down = weight([m.experts, hidden, iw], banks_dtype).rows(),
+            gate_up = weight([m.experts, 2 * iw, hidden], banks_dtype),
+            down = weight([m.experts, hidden, iw], banks_dtype),
             shared = struct(
-                gate = weight([sw, hidden], proj).columns(),
-                up = weight([sw, hidden], proj).columns(),
-                down = weight([hidden, sw], proj).rows(),
+                gate = weight([sw, hidden], proj),
+                up = weight([sw, hidden], proj),
+                down = weight([hidden, sw], proj),
                 inter = sw,
             ),
             experts = m.experts,
@@ -247,9 +254,9 @@ def layout(id, deploy):
             iw = d.dense_inter
             mlp = struct(
                 routed = False,
-                gate = weight([iw, hidden], proj).columns(),
-                up = weight([iw, hidden], proj).columns(),
-                down = weight([hidden, iw], proj).rows(),
+                gate = weight([iw, hidden], proj),
+                up = weight([iw, hidden], proj),
+                down = weight([hidden, iw], proj),
                 inter = iw,
             )
         else:
@@ -290,7 +297,7 @@ def layout(id, deploy):
         kv = deploy.kv,
         hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha),
         embed = weight([d.vocab, hidden], weights),
-        head = weight([d.vocab, hidden], weights),
+        head = weight([d.vocab, hidden], weights).replicated(),
         hc_head = head("hc_head", streams, hidden),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),

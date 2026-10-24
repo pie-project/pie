@@ -14,6 +14,12 @@ load("//lib/adapters.poem", "banks")
 
 GLM45 = template("glm45")
 GLM47 = template("glm47")
+
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: q, k, v and their biases by their heads, the gate and the up, the
+# shared expert's and each routed expert's gate and up by their channels, the
+# output and down projections by their rows, the head by its vocabulary.
+CUTS = "inferred"
 TOKENIZER = tokenizer(markers = [["<|user|>", "<|observation|>", "<|endoftext|>"], ["[gMASK]", "<sop>", "<|system|>", "<|assistant|>", "<think>", "</think>"]])
 
 def glm(id, layers, spoken, mini = False):
@@ -130,7 +136,6 @@ def layout(id, deploy):
     d = DIMS[id]
     hidden, hd = d.hidden, d.head_dim
     q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
-    heads = [d.q_heads, d.kv_heads, d.kv_heads]
 
     def mlp(l):
         if l < d.dense_layers:
@@ -140,9 +145,9 @@ def layout(id, deploy):
             down_w = dtype.bf16 if mlp_w == dtype.e4m3g128a8 and iw % 128 != 0 else mlp_w
             return struct(
                 routed = False,
-                gate = weight([iw, hidden], mlp_w).columns(),
-                up = weight([iw, hidden], mlp_w).columns(),
-                down = weight([hidden, iw], down_w).rows(),
+                gate = weight([iw, hidden], mlp_w),
+                up = weight([iw, hidden], mlp_w),
+                down = weight([hidden, iw], down_w),
                 inter = iw,
             )
         iw, sw = d.inter, d.shared_inter
@@ -150,12 +155,12 @@ def layout(id, deploy):
             routed = True,
             router = weight([d.experts, hidden]),
             bias = weight([d.experts], dtype.f32),
-            gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
-            down = weight([d.experts, hidden, iw], experts).rows(),
+            gate_up = weight([d.experts, 2 * iw, hidden], experts),
+            down = weight([d.experts, hidden, iw], experts),
             shared = struct(
-                gate = weight([sw, hidden], mlp_w).columns(),
-                up = weight([sw, hidden], mlp_w).columns(),
-                down = weight([hidden, sw], mlp_w).rows(),
+                gate = weight([sw, hidden], mlp_w),
+                up = weight([sw, hidden], mlp_w),
+                down = weight([hidden, sw], mlp_w),
                 inter = sw,
             ),
             experts = d.experts,
@@ -168,13 +173,13 @@ def layout(id, deploy):
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
             attn_norm = weight([hidden]),
-            q = weight([q_width, hidden], proj).columns(heads = heads[0]),
-            k = weight([kv_width, hidden], proj).columns(heads = heads[1]),
-            v = weight([kv_width, hidden], proj).columns(heads = heads[2]),
-            q_bias = weight([q_width]).columns(heads = heads[0]),
-            k_bias = weight([kv_width]).columns(heads = heads[1]),
-            v_bias = weight([kv_width]).columns(heads = heads[2]),
-            o = weight([hidden, q_width], proj).rows(),
+            q = weight([q_width, hidden], proj),
+            k = weight([kv_width, hidden], proj),
+            v = weight([kv_width, hidden], proj),
+            q_bias = weight([q_width]),
+            k_bias = weight([kv_width]),
+            v_bias = weight([kv_width]),
+            o = weight([hidden, q_width], proj),
             q_norm = weight([hd]) if d.qk_norm else None,
             k_norm = weight([hd]) if d.qk_norm else None,
             mlp_norm = weight([hidden]),
@@ -200,7 +205,7 @@ def layout(id, deploy):
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         kv = deploy.kv,
         embed = weight([d.vocab, hidden], table),
-        head = weight([d.vocab, hidden], table).columns(),
+        head = weight([d.vocab, hidden], table),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
     )

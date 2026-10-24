@@ -18,6 +18,12 @@ CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 CODER = template("qwen3_coder")
 TOKENIZER = tokenizer(markers = [QWEN_STOP, ["<|im_start|>"]])
 
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: q, k and v by their heads, each expert's gate and up by its
+# channels, the output and down projections by their rows, the head by its
+# vocabulary.
+CUTS = "inferred"
+
 def qwen3(id, layers, mini = False, spoken = CHATML):
     return model(id, mini = mini, template = spoken, tokenizer = TOKENIZER, arch = "qwen3_moe", layers = layers, vocab = 151936)
 
@@ -124,16 +130,16 @@ def layout(id, deploy):
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
             attn_norm = weight([hidden]),
-            q = weight([q_width, hidden], proj).columns(heads = d.q_heads),
-            k = weight([kv_width, hidden], proj).columns(heads = d.kv_heads),
-            v = weight([kv_width, hidden], proj).columns(heads = d.kv_heads),
-            o = weight([hidden, q_width], proj).rows(),
+            q = weight([q_width, hidden], proj),
+            k = weight([kv_width, hidden], proj),
+            v = weight([kv_width, hidden], proj),
+            o = weight([hidden, q_width], proj),
             q_norm = weight([hd]),
             k_norm = weight([hd]),
             mlp_norm = weight([hidden]),
             router = weight([d.experts, hidden]),
-            gate_up = weight([d.experts, 2 * d.inter, hidden], experts).bank([d.inter, d.inter]),
-            down = weight([d.experts, hidden, d.inter], experts).rows(),
+            gate_up = weight([d.experts, 2 * d.inter, hidden], experts),
+            down = weight([d.experts, hidden, d.inter], experts),
             kv = "kv.{}".format(l),
             lora_a = lora_a,
             lora_b = lora_b,
@@ -155,7 +161,7 @@ def layout(id, deploy):
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         kv = deploy.kv,
         embed = weight([d.vocab, hidden], table),
-        head = weight([d.vocab, hidden], table).columns(),
+        head = weight([d.vocab, hidden], table),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
     )
