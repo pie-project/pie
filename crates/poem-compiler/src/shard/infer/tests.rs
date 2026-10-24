@@ -25,6 +25,7 @@ fn pattern(name: &str) -> String {
 fn spelled(shard: &Shard) -> String {
     match shard {
         Shard::Replicated => "whole".into(),
+        Shard::Inferred => "inferred".into(),
         Shard::Cut {
             axis,
             segments,
@@ -46,7 +47,7 @@ fn unhinted(shard: &Shard) -> Shard {
             segments: segments.clone(),
             heads: Vec::new(),
         },
-        Shard::Replicated => Shard::Replicated,
+        other => other.clone(),
     }
 }
 

@@ -75,11 +75,45 @@ const PER_HEAD: [(&str, &str); 25] = [
     ("ssm.mamba2_chunked", "norm"),
 ];
 
-/// Each param's cut, inferred from `trace`'s dataflow.
+/// Each param's cut, inferred from `trace`'s dataflow whatever the model
+/// states.
 #[must_use]
 pub fn infer(trace: &Trace) -> Vec<Shard> {
+    inferred(trace, BTreeSet::new()).0
+}
+
+/// `trace` with each weight whose cut the model left to the compiler cut as
+/// its dataflow says, a weight it states whole kept whole; and the cut of
+/// each such weight over its logical shape, by name, for an import to read
+/// it by. A trace that leaves none to the compiler is as it was.
+pub fn resolve(trace: &mut Trace) -> Vec<(String, Shard)> {
+    if !trace.params.iter().any(|p| p.shard == Shard::Inferred) {
+        return Vec::new();
+    }
+    let owner = Reading::of(trace).owner;
+    let pinned = (0..trace.params.len())
+        .filter(|p| owner[*p].is_none() && trace.params[*p].shard == Shard::Replicated)
+        .collect();
+    let (shards, lead) = inferred(trace, pinned);
+    let mut cuts = Vec::new();
+    for (p, cut) in shards.into_iter().enumerate() {
+        let param = &mut trace.params[p];
+        if param.shard != Shard::Inferred {
+            continue;
+        }
+        if owner[p].is_none() {
+            cuts.push((param.name.clone(), lead[p].clone()));
+        }
+        param.shard = cut;
+    }
+    cuts
+}
+
+/// Each param's cut, `pinned` leading params kept whole, and each leading
+/// param's cut over its logical shape.
+fn inferred(trace: &Trace, pinned: BTreeSet<usize>) -> (Vec<Shard>, Vec<Shard>) {
     let reading = Reading::of(trace);
-    let mut whole = BTreeSet::new();
+    let mut whole = pinned;
     loop {
         let mut walk = Walk::new(&reading, &whole);
         walk.run();
@@ -731,23 +765,29 @@ impl<'r, 't> Walk<'r, 't> {
     }
 
     /// Each param's cut, as the walk left them.
-    fn shards(&self) -> Vec<Shard> {
+    /// Each param's cut and each leading param's logical one: a weight one
+    /// of whose planes cannot be stored cut so is whole.
+    fn shards(&self) -> (Vec<Shard>, Vec<Shard>) {
         let trace = self.trace();
-        let lead: Vec<Shard> = (0..trace.params.len())
+        let mut lead: Vec<Shard> = (0..trace.params.len())
             .map(|p| self.logical_shard(p).unwrap_or_default())
             .collect();
-        trace
-            .params
-            .iter()
-            .enumerate()
-            .map(|(p, param)| {
-                let at = self.reading.owner[p].unwrap_or(p);
-                let Some(logical) = &self.reading.logical[at] else {
-                    return Shard::Replicated;
-                };
-                poem::restate(&lead[at], logical, &param.shape).unwrap_or_default()
-            })
-            .collect()
+        let restated = |lead: &[Shard], p: usize| -> Result<Shard, String> {
+            let at = self.reading.owner[p].unwrap_or(p);
+            match &self.reading.logical[at] {
+                Some(logical) => poem::restate(&lead[at], logical, &trace.params[p].shape),
+                None => Ok(Shard::Replicated),
+            }
+        };
+        for p in 0..trace.params.len() {
+            if restated(&lead, p).is_err() {
+                lead[self.reading.owner[p].unwrap_or(p)] = Shard::Replicated;
+            }
+        }
+        let shards = (0..trace.params.len())
+            .map(|p| restated(&lead, p).unwrap_or_default())
+            .collect();
+        (shards, lead)
     }
 
     /// The segments of run `lo..hi` of column cut `q`, and the heads each

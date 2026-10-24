@@ -708,7 +708,7 @@ pub fn restate(shard: &Shard, logical: &[u64], plane: &[u64]) -> Result<Shard, S
         heads,
     } = shard
     else {
-        return Ok(Shard::Replicated);
+        return Ok(shard.clone());
     };
     let at = *axis as usize;
     let whole = *logical

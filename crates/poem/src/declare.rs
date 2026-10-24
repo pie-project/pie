@@ -43,6 +43,9 @@ pub struct Lowering {
     /// The params the deployment's trace reads, by name, where known: a
     /// layout weight none of them is (or is a plane of) is not stored.
     pub read: Option<Vec<String>>,
+    /// The cuts the compiler inferred of the weights the model states none
+    /// of, by name, over each weight's logical shape.
+    pub cuts: Vec<(String, Shard)>,
 }
 
 impl Join {
@@ -202,6 +205,13 @@ impl Weight {
     #[must_use]
     pub fn registered(mut self) -> Weight {
         self.source = ParamSource::Registered;
+        self
+    }
+
+    /// Every rank holds the weight whole, whatever the compiler would infer.
+    #[must_use]
+    pub fn replicated(mut self) -> Weight {
+        self.shard = Shard::Replicated;
         self
     }
 
@@ -672,6 +682,7 @@ impl Weight {
         };
         let shard = match &p.shard {
             Shard::Replicated => Shard::Replicated,
+            Shard::Inferred => Shard::Inferred,
             Shard::Cut {
                 axis,
                 segments,

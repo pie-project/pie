@@ -187,6 +187,10 @@ impl Pass {
                 Ok(Some((*axis, blocks)))
             }
             Shard::Replicated => Ok(None),
+            Shard::Inferred => Err(format!(
+                "`{}` leaves its cut to inference, which has not run",
+                param.name
+            )),
         }
     }
 

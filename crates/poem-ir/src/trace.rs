@@ -61,6 +61,10 @@ pub enum Shard {
         /// segment evenly.
         heads: Vec<u64>,
     },
+    /// The model states no cut and leaves it to the compiler, which reads
+    /// it off the trace's dataflow before it splits the trace; no trace a
+    /// rank runs holds one.
+    Inferred,
 }
 
 impl Shard {

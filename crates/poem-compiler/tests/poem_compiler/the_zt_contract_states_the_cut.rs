@@ -268,7 +268,7 @@ fn a_cut_param_carries_a_shard_per_leg() {
             };
             let found = nodes(&entry.expr, &|expr| matches!(expr, Expr::Shard { .. }));
             let want = match &param.shard {
-                Shard::Replicated => 0,
+                Shard::Replicated | Shard::Inferred => 0,
                 Shard::Cut { segments, .. } => segments.len(),
             };
             if found != want {
@@ -292,7 +292,7 @@ fn a_replicated_param_reads_its_own_name_and_nothing_else() {
         for param in &one.params {
             match param.shard {
                 Shard::Cut { .. } => continue,
-                Shard::Replicated => {}
+                Shard::Replicated | Shard::Inferred => {}
             }
             let Some(entry) = supply.get(param.name.as_str()) else {
                 continue;
@@ -345,7 +345,7 @@ fn a_declared_shape_is_the_whole_tensors() {
                                 i64::try_from(segment * parts).expect("an extent no i64 holds")
                             })
                             .sum(),
-                        Shard::Cut { .. } | Shard::Replicated => extent,
+                        Shard::Cut { .. } | Shard::Replicated | Shard::Inferred => extent,
                     }
                 })
                 .collect();
