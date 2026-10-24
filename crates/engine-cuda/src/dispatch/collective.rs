@@ -77,6 +77,8 @@ impl Run<'_> {
                     seated(OP, on, self.tensor(value))?;
                 }
                 let mut counts = self.tensor(*counts);
+                let stream = self.ctx().stream();
+                fence(OP, ep, stream)?;
                 collective::dispatch(
                     self.ctx(),
                     &ep.wire().ep,
@@ -84,7 +86,8 @@ impl Run<'_> {
                     tokens,
                     &landing,
                     &mut counts,
-                )
+                )?;
+                fence(OP, ep, stream)
             }
             Collective::Combine {
                 y,
@@ -113,10 +116,23 @@ impl Run<'_> {
                     .map(|w| w.routed(step, *top_k, y.width, y.dtype))
                     .collect();
                 seated(OP, back[ep.rank as usize], self.tensor(*routed))?;
-                collective::combine(self.ctx(), &ep.wire().ep, &landing, y, &back)
+                let stream = self.ctx().stream();
+                fence(OP, ep, stream)?;
+                collective::combine(self.ctx(), &ep.wire().ep, &landing, y, &back)?;
+                fence(OP, ep, stream)
             }
         }
     }
+}
+
+/// A quiet point on each side of a collective while the group fences them
+/// (`EpRank::fence`, as it arms).
+fn fence(
+    op: &'static str,
+    ep: &crate::ep::EpRank,
+    stream: *mut core::ffi::c_void,
+) -> Result<(), Error> {
+    ep.fence(stream).map_err(|why| backend(op, why))
 }
 
 /// Refuses an IR value the fire did not seat on the EP buffer its peers

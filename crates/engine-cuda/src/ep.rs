@@ -40,10 +40,82 @@ pub struct Shape {
     pub widest: Widest,
 }
 
+/// The group's host barrier, for the points at which no rank may have a
+/// collective in flight. A call that takes the context (a module's load, a
+/// function's attribute, a graph's instantiation, a library's first tune)
+/// can wait for the device while it holds the context, and so hold back a
+/// peer's launch that a collective spinning on the same device waits for:
+/// a rank that makes one past [`Quiet::meet`], each rank having drained its
+/// collectives, waits on no spin. Held for the process's life, as the
+/// wiring's memory is.
+#[derive(Debug)]
+pub struct Quiet {
+    world: u32,
+    met: std::sync::Mutex<(u64, u32)>,
+    all: std::sync::Condvar,
+}
+
+/// How long a rank waits at [`Quiet::meet`] for a peer that never comes (a
+/// rank that failed, or diverged), as the device's barrier traps after its
+/// own patience.
+const QUIET_PATIENCE: std::time::Duration = std::time::Duration::from_secs(600);
+
+impl Quiet {
+    fn new(world: u32) -> &'static Quiet {
+        Box::leak(Box::new(Quiet {
+            world,
+            met: std::sync::Mutex::new((0, 0)),
+            all: std::sync::Condvar::new(),
+        }))
+    }
+
+    /// Waits until every rank of the group has met here.
+    pub fn meet(&self) -> Result<()> {
+        let mut met = self
+            .met
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = met.0;
+        met.1 += 1;
+        if met.1 == self.world {
+            *met = (generation + 1, 0);
+            self.all.notify_all();
+            return Ok(());
+        }
+        let (met, waited) = self
+            .all
+            .wait_timeout_while(met, QUIET_PATIENCE, |met| met.0 == generation)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if waited.timed_out() && met.0 == generation {
+            return Err(Fault::program(
+                "ep::Quiet",
+                format!(
+                    "{} of the group's {} ranks met at a quiet point in {} s; the others \
+                     failed or fire another sequence",
+                    met.1,
+                    self.world,
+                    QUIET_PATIENCE.as_secs()
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl PartialEq for Quiet {
+    fn eq(&self, other: &Quiet) -> bool {
+        core::ptr::eq(self, other)
+    }
+}
+
+impl Eq for Quiet {}
+
 /// One rank's part of the wiring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Wire {
     pub ep: Ep,
+    /// The group's host barrier, one for every rank's wire.
+    pub quiet: &'static Quiet,
     widest: Widest,
     rows: u64,
     local: u64,
@@ -250,6 +322,7 @@ pub fn wire(ordinals: &[i32], widest: Widest) -> Result<Vec<Wire>> {
     for (s, b) in signals.iter_mut().zip(&bases) {
         *s = b[0];
     }
+    let quiet = Quiet::new(world);
     Ok(bases
         .iter()
         .enumerate()
@@ -261,6 +334,7 @@ pub fn wire(ordinals: &[i32], widest: Widest) -> Result<Vec<Wire>> {
                 scratch: b[6],
                 scratch_tokens: widest.tokens,
             },
+            quiet,
             widest,
             rows: b[1],
             local: b[2],
@@ -348,6 +422,9 @@ pub struct EpRank {
     banks: Banks,
     seats: Seats,
     seats_forked: Seats,
+    /// Whether every collective is fenced ([`EpRank::fence`]): while the
+    /// group arms, each rank's first uses run with nothing spinning.
+    fenced: core::sync::atomic::AtomicBool,
 }
 
 impl EpRank {
@@ -395,7 +472,33 @@ impl EpRank {
             banks: Banks::new(),
             seats: Seats::default(),
             seats_forked: Seats::default(),
+            fenced: core::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Fences every collective of this rank's fires from here
+    /// ([`EpRank::fence`]), or no more. Every rank of the group fences
+    /// alike: the group arms with it on, firing one sequence of synthetic
+    /// steps; it serves with it off, each rank its own.
+    pub fn fenced(&self, on: bool) {
+        self.fenced.store(on, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A quiet point while fenced: `stream`'s work drained, then every rank
+    /// met ([`Quiet`]), so no collective of the group is in flight on any
+    /// device. Placed on each side of every collective, it leaves whatever
+    /// a fire first uses between two of them (a module's load, a tune, a
+    /// graph's instantiation) to a device with nothing spinning on it. A
+    /// stream being captured runs nothing, so there is nothing to drain or
+    /// meet over: every rank captures alike. Unfenced, nothing.
+    pub fn fence(&self, stream: *mut core::ffi::c_void) -> Result<()> {
+        if !self.fenced.load(core::sync::atomic::Ordering::Relaxed)
+            || crate::device::alloc::is_capturing(stream)
+        {
+            return Ok(());
+        }
+        crate::device::ctx::sync(stream)?;
+        self.wire().quiet.meet()
     }
 
     /// The routed banks this rank holds, by layer: what a rebalance copies.

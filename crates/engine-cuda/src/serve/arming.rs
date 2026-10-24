@@ -855,7 +855,24 @@ impl Shell {
         Ok(self.armed.as_ref().map_or(0, |armed| armed.armed))
     }
 
+    /// Arms the lattice, an expert-parallel rank with its collectives
+    /// fenced (`EpRank::fence`): every rank fires the same synthetic steps,
+    /// and whatever they first use (a module, a tune, a pinned slot, a
+    /// graph) is made with no collective of the group spinning on the
+    /// device, so none of it waits on a peer that waits on it. What the
+    /// steps warm is warm for the fires that serve after, unfenced.
     fn arm_lattice(&mut self, verify: bool) -> Result<()> {
+        if let Some(ep) = self.ep.as_ref() {
+            ep.fenced(true);
+        }
+        let armed = self.arm_lattice_fenced(verify);
+        if let Some(ep) = self.ep.as_ref() {
+            ep.fenced(false);
+        }
+        armed
+    }
+
+    fn arm_lattice_fenced(&mut self, verify: bool) -> Result<()> {
         if !self.records_bodies() || !Self::keyable_units(&self.compiled) {
             return Ok(());
         }
