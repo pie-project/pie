@@ -196,6 +196,7 @@ impl Shell {
             device: &self.device,
             trace: &self.trace,
             compiled: &self.compiled,
+            regions: &self.regions,
             ep: self.ep.as_ref(),
             weights: &self.weights,
             arena: &self.arena,
@@ -259,6 +260,7 @@ struct FireCtx<'a> {
     device: &'a Context,
     trace: &'a Trace,
     compiled: &'a CompiledModel,
+    regions: &'a crate::synth::Regions,
     ep: Option<&'a crate::ep::EpRank>,
     weights: &'a Weights,
     arena: &'a Arena,
@@ -840,6 +842,7 @@ impl FireCtx<'_> {
         .unread(self.unread)
         .tapping(self.tapping)
         .expert(&self.compiled.expert)
+        .regions(self.regions)
         .ep(self.ep);
         if let Some(body) = self.device.conditional_ctx() {
             run = run.conditional(body, &stream);

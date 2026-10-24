@@ -143,7 +143,7 @@ fn residual_norm_rate() {
 /// The device's copy rate in GB/s: bytes read plus bytes written by its
 /// fastest 1 GiB device-to-device copy.
 #[allow(unsafe_code)]
-fn copy_rate() -> f64 {
+pub(super) fn copy_rate() -> f64 {
     const BYTES: usize = 1 << 30;
     let mut gpu = Gpu::open();
     let (src, dst) = (gpu.zeros(BYTES), gpu.zeros(BYTES));
@@ -177,7 +177,7 @@ fn copy_rate() -> f64 {
 
 /// The fewest microseconds of `runs` runs of `run`: other work on a shared
 /// card only ever slows one.
-fn fastest(runs: u32, mut run: impl FnMut()) -> f64 {
+pub(super) fn fastest(runs: u32, mut run: impl FnMut()) -> f64 {
     (0..runs)
         .map(|_| {
             let start = std::time::Instant::now();

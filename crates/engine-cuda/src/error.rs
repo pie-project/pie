@@ -153,6 +153,14 @@ pub enum Fault {
         lowering: String,
     },
 
+    /// A `fused.region` the row frame does not take: poem-compiler's fold
+    /// forms only regions it does, so this names the compiler's bug.
+    Region {
+        node: u32,
+        body: u64,
+        why: String,
+    },
+
     Golden {
         key: String,
         why: String,
@@ -398,6 +406,12 @@ impl fmt::Display for Fault {
                  guessed, because exactly one arm runs and a guess is another arm's \
                  fire. Bake with `fat_region_us: INFINITY` — every region \
                  always-launch, which is the correctness mechanism"
+            ),
+            Self::Region { node, body, why } => write!(
+                f,
+                "the `fused.region` at node {node} (body {body:016x}) breaks the row frame's \
+                 contract: {why}. poem-compiler folds only chains the frame takes, so the fold \
+                 formed one it should have left as its ops"
             ),
             Self::Unbound { what } => {
                 write!(f, "this plan names {what}, which this shell does not bind")
