@@ -102,11 +102,6 @@ struct Output {
     prompt_tokens: u32,
     /// How many pictures the prompt carried.
     images: usize,
-    /// `token_count - position_span`: how far the rotation cursor lags the
-    /// token row after the span. Zero for a 1-D RoPE model (Gemma), positive
-    /// for M-RoPE (Qwen: an image spends `h·w` rows and advances the cursor
-    /// by `max(h, w)`). The decode loop rotates at `row - rope_delta`.
-    rope_delta: u32,
 }
 
 /// The three unambiguous fills. Named rather than free-form because the gate's
@@ -171,32 +166,15 @@ async fn main(input: Input) -> Result<Output> {
     //    none. `tokens()` answered the bound checkpoint's delimiter and pad
     //    ids, so nothing here counts a run or names a special.
     let mut prompt_tokens = chat::system(&input.system);
-    // Where each span's run begins and ends: every run is its own fire.
-    let mut runs: Vec<(u32, u32)> = Vec::with_capacity(images.len());
     for image in &images {
-        let start = prompt_tokens.len() as u32;
         prompt_tokens.extend(image.tokens());
-        runs.push((start, prompt_tokens.len() as u32));
     }
-    let split_at = runs.first().map_or(0, |r| r.0);
-    let run_end = runs.last().map_or(0, |r| r.1);
     prompt_tokens.extend(chat::user(&input.question));
     prompt_tokens.extend(chat::cue());
     let n = prompt_tokens.len() as u32;
     let stop = chat::stop_tokens();
 
     let soft_tokens: u32 = images.iter().map(media::Image::token_count).sum();
-    // **THE ROTATION CURSOR IS NOT THE TOKEN ROW** past an M-RoPE span: the
-    // host walks the reference cursor inside the fire that carries the span
-    // (an image's rows advance it by `position_span`, not `token_count`), and
-    // a decode fire, which carries no span, rotates at the position the guest
-    // states. So the guest states the cursor: the token row minus the lag the
-    // spans left, summed. Upstream's `mrope_position_deltas`, kept by the
-    // sequence's owner. KV slots and lengths keep counting rows.
-    let rope_delta: u32 = images
-        .iter()
-        .map(|image| image.token_count() - image.position_span())
-        .sum();
     let grid = img.grid();
     let digest = img
         .digest()
@@ -210,63 +188,27 @@ async fn main(input: Input) -> Result<Output> {
 
     // ───────────────────────── 1. THE MEDIA PREFILL ─────────────────────────
     //
-    // **THE RUN WHOLE IN ONE FIRE, THE TEXT AROUND IT IN ITS OWN.** The host
-    // scans each fire's own tokens for the run, so a run cut across fires is
-    // refused; the text before and after is prefilled separately. Keeping the
-    // run's fire to the run alone matters on a streamed-expert load: every
-    // distinct expert one fire routes to must be seated at once, and image
-    // rows beside diverse text rows can name more experts than the slab seats.
+    // **THE WHOLE PROMPT IN ONE PASS.** The host scans the pass's tokens for
+    // the runs and keeps where an M-RoPE span leaves the rotation behind the
+    // slots: the rows after it, and the decode, rotate there by default.
     let prompt_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
-    // The text before the runs, each run whole and alone, the text after.
-    // Empty pieces are skipped.
-    let mut spans: Vec<(u32, u32)> = vec![(0, split_at)];
-    spans.extend(runs.iter().copied());
-    spans.push((run_end, n));
-    let spans: Vec<(u32, u32)> = spans.into_iter().filter(|(base, end)| end > base).collect();
-    let mut g0 = 0i32;
-    for &(base, end) in &spans {
-        let len = end - base;
-        let carried = runs.iter().position(|&(start, _)| start == base);
-        let toks_p = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
-        let embed_indptr_p = Channel::from([0u32, len]).named("embed_indptr_p");
-        // **EVERY FIRE ROTATES AT ITS ROW MINUS THE LAG OF THE SPANS BEFORE
-        // IT**, not only the decode: the text after a span sits `rope_delta`
-        // behind its token row, as upstream's `get_rope_index` places it. A
-        // tail rotated at the raw row leaves a hole of `h·w - max(h, w)`
-        // positions and the decode then rotates backwards across it. A run's
-        // own fire states its first position the same way; the host walks
-        // the span from there. (These are rotations only: KV slots, lengths
-        // and the causal bound count rows.)
-        let lag: u32 = runs
-            .iter()
-            .zip(&images)
-            .filter(|((_, run_end), _)| *run_end <= base)
-            .map(|(_, image)| image.token_count() - image.position_span())
-            .sum();
-        let positions_p = Channel::from_iter((base..end).map(|row| row - lag)).named("positions_p");
-        let g0_ch = Channel::new([1], dtype::i32).named("g0");
+    let toks_p = Channel::from(&prompt_i32[..]).named("toks_p");
+    let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
+    let g0_ch = Channel::new([1], dtype::i32).named("g0");
 
-        let fwd_p = ForwardPass::new();
-        fwd_p.embed(&toks_p, &embed_indptr_p)?;
-        if let Some(at) = carried {
-            // **THE PAYLOAD, ORDER-MATCHED TO THE RUNS.** One span, one run,
-            // and the host is what checks that — the guest states the
-            // correspondence by ordering alone and can state nothing else.
-            fwd_p.media(&[media::Span::Image(&images[at])])?;
-        }
-        fwd_p.state(
-            &[&ws],
-            StateGeometry {
-                positions: Some(&positions_p),
-                ..StateGeometry::folding()
-            },
-        )?;
-        fwd_p.epilogue(move || {
-            g0_ch.put(&sample_token());
-        });
-        fwd_p.submit(&pipe).context("prefill submit")?;
-        g0 = g0_ch.take_host::<i32>().await?;
-    }
+    let fwd_p = ForwardPass::new();
+    fwd_p.embed(&toks_p, &embed_indptr_p)?;
+    // **THE PAYLOAD, ORDER-MATCHED TO THE RUNS.** One span, one run, and the
+    // host is what checks that — the guest states the correspondence by
+    // ordering alone and can state nothing else.
+    let spans: Vec<media::Span> = images.iter().map(media::Span::Image).collect();
+    fwd_p.media(&spans)?;
+    fwd_p.state(&[&ws], StateGeometry::folding())?;
+    fwd_p.epilogue(move || {
+        g0_ch.put(&sample_token());
+    });
+    fwd_p.submit(&pipe).context("prefill submit")?;
+    let g0 = g0_ch.take_host::<i32>().await?;
 
     let chat_dec = chat::Decoder::new();
     let mut text = String::new();
@@ -287,19 +229,14 @@ async fn main(input: Input) -> Result<Output> {
     // Carries no span and never will: the image is in the KV now, and a decode
     // fire that re-attached it would be a second submission of one picture.
     // Its tokens are sampled ids, so the run scan finds nothing in them —
-    // which is exactly the right answer for a fire that attached nothing.
+    // which is exactly the right answer for a fire that attached nothing. It
+    // rotates where the working set says: behind its slot, past a span.
     let budget = if done {
         0
     } else {
         max_tokens.saturating_sub(1)
     };
-    // The device computes the rotation and so the slots: reserve the decode's up front.
-    ws.reserve(n + budget as u32)?;
     let tok_in = Channel::from([g0]).named("tok_in");
-    let slot = Channel::from([n]).named("slot");
-    let kv_len = Channel::from([n + 1]).named("kv_len");
-    let pos = Channel::from([n - rope_delta]).named("pos");
-    let fold = Channel::from([1u32]).named("fold");
     let out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
         .named("out");
@@ -307,26 +244,11 @@ async fn main(input: Input) -> Result<Output> {
 
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;
-    // The token's rotation runs `rope_delta` behind its slot.
-    fwd.state(
-        &[&ws],
-        StateGeometry {
-            slots: Some(&slot),
-            kv_len: Some(&kv_len),
-            positions: Some(&pos),
-            fold: Fold::Count(&fold),
-            ..StateGeometry::default()
-        },
-    )?;
+    fwd.state(&[&ws], StateGeometry::folding())?;
     fwd.epilogue(move || {
-        let at = pos.take();
-        let next = &slot.take() + 1u32;
         let tok = sample_token();
         tok_in.put(&tok);
         out.put(&tok);
-        slot.put(&next);
-        kv_len.put(&(&next + 1u32));
-        pos.put(&(&at + 1u32));
     });
 
     run_ahead(&pipe, &fwd, budget, async || {
@@ -356,6 +278,5 @@ async fn main(input: Input) -> Result<Output> {
         digest,
         prompt_tokens: n,
         images: images.len(),
-        rope_delta,
     })
 }

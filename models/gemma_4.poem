@@ -159,6 +159,7 @@ def media(id, deploy):
     return struct(image = struct(
         patch = PATCH, block = POOL, mrope = False,
         prefix = "<|image>", placeholder = "<|image|>", suffix = "<image|>",
+        frame = lambda h, w, budget: budget_resize(h, w, PATCH, POOL, SOFT_TOKENS if budget == "still" else VIDEO_SOFT_TOKENS),
     ))
 
 WIDE_TOWER = vision_tower(depth = 27, hidden = 1152, heads = 16, inter = 4304, clipped = False, standardize = True)
