@@ -287,7 +287,7 @@ fn a_prompt_scan_lands_its_snapshots() {
                 &conv_pool(slot, rows),
                 WIDTH,
                 1,
-                Tensor::new(gpu.bind(&cy_b), rows, CHANNELS, Dtype::Bf16),
+                Tensor::new(gpu.bind(&cy_b), T, CHANNELS, Dtype::Bf16),
                 snapshots,
             )
             .expect("the conv");

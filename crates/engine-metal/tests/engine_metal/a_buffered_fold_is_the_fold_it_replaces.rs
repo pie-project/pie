@@ -115,11 +115,14 @@ fn pages() -> Vec<u32> {
     vec![0]
 }
 
-fn buffer(at: u32, fold: u32, replay: u32) -> RsVerb {
+/// A buffering verb whose state holds the slots below `folded`: a fire whose
+/// rows land at slot `first` replays the buffered slots `folded..first`, then
+/// folds `fold` of them.
+fn buffer(folded: u32, fold: u32) -> RsVerb {
     RsVerb::Buffer {
         pages: pages(),
         base: 0,
-        folded: at - replay,
+        folded,
         fold: FoldLen::Host(fold),
     }
 }
@@ -190,7 +193,7 @@ fn a_buffered_fold_is_the_fold_it_replaces() {
 
     shell.open(1).expect("slot 1 opens");
     let buffered = shell
-        .fire_seated(&[seated(1, &tokens, &buffer(0, 0, 0), RsReset::Fresh)])
+        .fire_seated(&[seated(1, &tokens, &buffer(0, 0), RsReset::Fresh)])
         .expect("the buffering fire runs");
     assert_eq!(
         shell.state_bytes(1).expect("slot 1"),
@@ -217,10 +220,10 @@ fn a_buffered_fold_is_the_fold_it_replaces() {
     );
     shell.open(3).expect("slot 3 opens");
     shell
-        .fire_seated(&[seated(3, &tokens, &buffer(0, 0, 0), RsReset::Fresh)])
+        .fire_seated(&[seated(3, &tokens, &buffer(0, 0), RsReset::Fresh)])
         .expect("the buffering fire runs");
     shell
-        .fire_seated(&[seated(3, &second, &buffer(k, j, k), RsReset::Held)])
+        .fire_seated(&[seated(3, &second, &buffer(0, j), RsReset::Held)])
         .expect("window B replays A and folds part of it");
     assert_eq!(
         shell.state_bytes(3).expect("slot 3"),
@@ -230,7 +233,7 @@ fn a_buffered_fold_is_the_fold_it_replaces() {
 
     shell.open(4).expect("slot 4 opens");
     let mixed = shell
-        .fire_seated(&[seated(4, &tokens, &buffer(0, j, 0), RsReset::Fresh)])
+        .fire_seated(&[seated(4, &tokens, &buffer(0, j), RsReset::Fresh)])
         .expect("the mixed fire runs");
     assert_eq!(
         shell.state_bytes(4).expect("slot 4"),
@@ -246,10 +249,10 @@ fn a_buffered_fold_is_the_fold_it_replaces() {
 
     shell.open(5).expect("slot 5 opens");
     shell
-        .fire_seated(&[seated(5, &tokens, &buffer(0, 0, 0), RsReset::Fresh)])
+        .fire_seated(&[seated(5, &tokens, &buffer(0, 0), RsReset::Fresh)])
         .expect("window A buffers");
     let round = shell
-        .fire_seated(&[seated(5, &second, &buffer(k, k, k), RsReset::Held)])
+        .fire_seated(&[seated(5, &second, &buffer(0, k), RsReset::Held)])
         .expect("window B replays A and buffers itself");
     assert_eq!(
         shell.state_bytes(5).expect("slot 5"),
@@ -285,7 +288,7 @@ fn a_buffered_fold_is_the_fold_it_replaces() {
     let beside = shell
         .fire_seated(&[
             seated(7, &third, &fold, RsReset::Fresh),
-            seated(1, &tokens, &buffer(0, 0, 0), RsReset::Fresh),
+            seated(1, &tokens, &buffer(0, 0), RsReset::Fresh),
         ])
         .expect("the mixed fire runs");
     assert_eq!(
@@ -318,10 +321,12 @@ fn a_buffered_fold_is_the_fold_it_replaces() {
     let rounds = 8u32;
     for r in 0..rounds {
         let rows = [steps[r as usize], junk];
+        // A holds slots 0..k folded; round r's window lands at slot k + r,
+        // past the survivor s_{r-1} the round before left at k + r - 1.
         let verb = if r == 0 {
-            buffer(0, 0, 0)
+            buffer(k, 0)
         } else {
-            buffer(r, 1, 1)
+            buffer(k + r - 1, 1)
         };
         let win = shell
             .fire_seated(&[seated_at(5, &rows, &verb, RsReset::Held, k + r)])
