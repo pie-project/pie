@@ -50,6 +50,7 @@ fn residual_norm(width: usize) -> Region {
             Op::Mul(11, 2),
         ],
         results: vec![3, 12],
+        rounds: vec![],
     }
 }
 
@@ -188,10 +189,11 @@ fn the_hand_body_through_synth_lands_the_register_kernels_bits() {
 }
 
 /// eta's residual norm against the hand register kernel. The stream is
-/// the same sum and lands the same bits. The normed row differs only in
-/// how its squares are summed: eta adds them one at a time (`a += h²`),
-/// the hand kernel two at a time (`a += h₀² + h₁²`), so a sum may differ in
-/// its last f32 bit and, through `rsqrt`, a normed element by one bf16 ulp.
+/// the same sum and lands the same bits, and the norm takes its squares two
+/// at a time as the hand kernel does (`a += h₀² + h₁²`); a sum whose
+/// threads split the row otherwise than the hand kernel's would differ in
+/// its last f32 bit and, through `rsqrt`, a normed element by one bf16 ulp,
+/// which is what this holds it to.
 #[test]
 fn etas_residual_norm_lands_the_hand_stream_and_its_norm_within_an_ulp() {
     for width in WIDTHS {
@@ -254,6 +256,7 @@ fn etas_add_then_mul_lands_the_hand_kernels_bits() {
             params: vec![row(width); 3],
             ops: vec![Op::Add(0, 1), Op::Mul(3, 2)],
             results: vec![3, 4],
+            rounds: vec![],
         };
         let kernel = loaded(&body_of(&region, &[]), 3, 2, width);
         for rows in ROWS {
@@ -304,6 +307,7 @@ fn etas_double_residual_rounds_once() {
             params: vec![row(width); 3],
             ops: vec![Op::Add(1, 0), Op::Add(3, 2)],
             results: vec![4],
+            rounds: vec![],
         };
         let kernel = loaded(&body_of(&region, &[]), 3, 1, width);
         for rows in ROWS {
@@ -389,6 +393,7 @@ fn a_kernel_never_loaded_is_refused_at_its_fire() {
         params: vec![row(width); 2],
         ops: vec![Op::Sub(0, 1)],
         results: vec![2],
+        rounds: vec![],
     };
     let kernel = synth::synth(&body_of(&region, &[]), 2, 1, width as u32).expect("synthesized");
     let mut gpu = Gpu::open();

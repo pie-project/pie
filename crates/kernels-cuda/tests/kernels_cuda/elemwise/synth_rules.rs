@@ -8,18 +8,24 @@
 //! Each region here is the one poem-compiler's `fuse::chain` lowers the
 //! rule's ops to on the catalog's models, op for op and in its parameters'
 //! order (the first read first), its results the values read past the
-//! chain:
+//! chain, and every value an op defines rounded to bf16 where it is
+//! defined, as the unfused ops store it:
 //!
 //! - `residual_add_rmsnorm`: `h = y + x`, `rmsnorm(h) · w`. The stream
-//!   leaves (a layer's residual norms), stored and normed as stored as the
-//!   hand kernel does; or only the normed row does (the final norm: nothing
-//!   reads the stream past it), the stream then normed unrounded where the
-//!   hand kernel stores it and norms what it stored.
+//!   leaves (a layer's residual norms), or only the normed row does (the
+//!   final norm: nothing reads the stream past it); either way the norm
+//!   reads the stream as stored.
 //! - `rmsnorm_residual_add`: `y + rmsnorm(x) · w` (Gemma's sandwich norm),
 //!   then optionally the next norm over the sum. The normed `t` is read by
-//!   the add alone, so it never leaves and is never rounded: the hand
-//!   kernel rounds it to bf16 before the add, so the two land different
-//!   sums, each within an ulp of its own math.
+//!   the add alone, so it never leaves, but the add reads it rounded, as the
+//!   hand kernel does.
+//!
+//! So each region lands the hand kernel's bits, its sums of squares taken
+//! two at a time as the hand kernels take them (`a += h₀² + h₁²`), but
+//! where a row's threads hold it otherwise than the hand kernel's: Gemma's
+//! norm-and-fold at 5376 splits the row over 512 threads, the frame over
+//! 256, so a sum's tree differs in its last bit and a normed element by an
+//! ulp, about once in a hundred thousand.
 //!
 //! The chains a rule forms that no region holds (Gemma's layer scalar, a
 //! one-element weight) are not here: with their rule off they run as more
@@ -111,9 +117,10 @@ impl Chain {
             Chain::ResidualNorm { plus_one, stream } => {
                 // parameters x, y, w
                 b.params(3);
-                let h = b.push(Op::Add(1, 0));
+                let h = b.stored(Op::Add(1, 0));
                 let n = b.rms_normed(h);
                 let out = b.scaled(n, 2, plus_one);
+                b.round(out);
                 b.finish(if stream { vec![h, out] } else { vec![out] })
             }
             Chain::NormResidual { post } => {
@@ -121,10 +128,12 @@ impl Chain {
                 b.params(if post { 4 } else { 3 });
                 let n = b.rms_normed(0);
                 let t = b.scaled(n, 1, false);
-                let sum = b.push(Op::Add(2, t));
+                b.round(t);
+                let sum = b.stored(Op::Add(2, t));
                 if post {
                     let n = b.rms_normed(sum);
                     let out = b.scaled(n, 3, false);
+                    b.round(out);
                     b.finish(vec![sum, out])
                 } else {
                     b.finish(vec![sum])
@@ -139,6 +148,7 @@ struct Build {
     width: usize,
     params: u32,
     ops: Vec<Op>,
+    rounds: Vec<(u32, eta_ir::Dtype)>,
 }
 
 impl Build {
@@ -147,6 +157,7 @@ impl Build {
             width,
             params: 0,
             ops: Vec::new(),
+            rounds: Vec::new(),
         }
     }
 
@@ -157,6 +168,18 @@ impl Build {
     fn push(&mut self, op: Op) -> u32 {
         self.ops.push(op);
         self.params + u32::try_from(self.ops.len()).expect("a value id") - 1
+    }
+
+    /// `v`, a trace value an op defines, rounded where it is defined.
+    fn round(&mut self, v: u32) {
+        self.rounds.push((v, eta_ir::Dtype::Bf16));
+    }
+
+    /// `op`'s value, a trace value, rounded.
+    fn stored(&mut self, op: Op) -> u32 {
+        let v = self.push(op);
+        self.round(v);
+        v
     }
 
     fn konst(&mut self, x: f32) -> u32 {
@@ -197,6 +220,7 @@ impl Build {
             params: vec![row; self.params as usize],
             ops: self.ops,
             results,
+            rounds: self.rounds,
         }
     }
 }
@@ -470,17 +494,8 @@ fn host(chain: Chain, rows: usize, width: usize) -> Landed {
         let at = r * width..(r + 1) * width;
         let (x, y) = (&x[at.clone()], &y[at]);
         match chain {
-            Chain::ResidualNorm {
-                plus_one,
-                stream: leaves,
-            } => {
-                // the sum rounded where it leaves, read on unrounded where not
-                let h: Vec<f32> = (0..width)
-                    .map(|e| {
-                        let h = y[e] + x[e];
-                        if leaves { from_bf16(to_bf16(h)) } else { h }
-                    })
-                    .collect();
+            Chain::ResidualNorm { plus_one, .. } => {
+                let h: Vec<f32> = (0..width).map(|e| from_bf16(to_bf16(y[e] + x[e]))).collect();
                 let r = inv(&h);
                 stream.extend(h.iter().map(|&v| to_bf16(v)));
                 out.extend((0..width).map(|e| {
@@ -491,7 +506,7 @@ fn host(chain: Chain, rows: usize, width: usize) -> Landed {
             Chain::NormResidual { post } => {
                 let r = inv(x);
                 let sum: Vec<f32> = (0..width)
-                    .map(|e| from_bf16(to_bf16(y[e] + x[e] * r * w[e])))
+                    .map(|e| from_bf16(to_bf16(y[e] + from_bf16(to_bf16(x[e] * r * w[e])))))
                     .collect();
                 stream.extend(sum.iter().map(|&v| to_bf16(v)));
                 if post {
@@ -541,10 +556,13 @@ fn each_rules_region_lands_its_math_and_is_set_against_the_hand_kernel() {
                     let (Some(got), Some(want)) = (got, want) else {
                         continue;
                     };
-                    // a post norm reads its sum as stored, so a sum an ulp
-                    // apart is normed an ulp apart, times its scale
+                    // `t` an ulp of itself apart (the host's `1 / sqrt` is
+                    // not `rsqrtf`) is a sum up to four of the sum's scale
+                    // apart where it cancels, and a post norm scales that
+                    // up again: a sanity bound; the hand kernel's bits are
+                    // the test
                     let within = match (chain, what) {
-                        (Chain::NormResidual { post: true }, "result") => 2.0,
+                        (Chain::NormResidual { .. }, _) => 8.0,
                         _ => 1.0,
                     };
                     let (_, most) = apart(got, want);
@@ -566,11 +584,18 @@ fn each_rules_region_lands_its_math_and_is_set_against_the_hand_kernel() {
                          apart, {most} ulps at most",
                         rows * width
                     );
-                    if let Chain::ResidualNorm { .. } = chain {
-                        // the same sum, stored as the hand kernel stores it,
-                        // and its norm but for the order of its squares
-                        assert_eq!(stream.map_or(0, |(n, _)| n), 0, "{case}: the stream");
-                        assert!(most <= 1.0, "{case}: the normed row is {most} ulps off");
+                    // The hand kernel's bits but where a sum of squares
+                    // lands in its last bit apart: a norm an ulp apart, and
+                    // the sum a norm's row joins (or the norm after it) an
+                    // ulp of its addends apart, about once in a million.
+                    let total = rows * width;
+                    for (what, apart) in [("stream", stream), ("result", Some((n, most)))] {
+                        let Some((n, most)) = apart else { continue };
+                        assert!(
+                            n * 10_000 <= total.max(10_000) && most <= 2.0,
+                            "{case}, hand {knobs:?}: {n} of {total} {what} elements apart, \
+                             {most} ulps at most"
+                        );
                     }
                 }
             }

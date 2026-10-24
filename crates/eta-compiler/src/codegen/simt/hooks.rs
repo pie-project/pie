@@ -64,12 +64,26 @@ enum Step {
 
 /// The body of the region `streams` views: `params` parameters (values
 /// `0..params`) and `results` the values that leave, `results[k]` written
-/// through `f.st(k, ..)`. Returned with the passes it makes over the row.
+/// through `f.st(k, ..)`, and `rounds` the values rounded where they are
+/// defined. Returned with the passes it makes over the row.
 pub(crate) fn emit_body(
     streams: &Streams<'_>,
     params: u32,
     results: &[u32],
+    rounds: &[(u32, Dtype)],
 ) -> Result<(String, u32), Uncovered> {
+    // `expr`, the value `value`, as the region holds it: rounded where it
+    // rounds.
+    let held = |value: u32, expr: String| -> Result<String, Uncovered> {
+        match rounds.iter().find(|(v, _)| *v == value) {
+            None => Ok(expr),
+            Some((_, Dtype::Bf16)) => Ok(format!("f.round_bf16({expr})")),
+            Some(_) => Err(Uncovered {
+                op: None,
+                why: "a value rounded to a dtype no hook rounds to",
+            }),
+        }
+    };
     let count = streams.view.value_types.len();
     let mut values: Vec<Option<Value>> = (0..count).map(|_| None).collect();
     for k in 0..params {
@@ -232,7 +246,7 @@ pub(crate) fn emit_body(
                 continue;
             }
             if let Step::Uniform { value, node } = step {
-                let expr = uniform_expr(streams, *node, &values)?;
+                let expr = held(*value, uniform_expr(streams, *node, &values)?)?;
                 let _ = writeln!(
                     s,
                     "  const {} v{value} = {expr};",
@@ -255,7 +269,10 @@ pub(crate) fn emit_body(
             {
                 rows.push((
                     *value,
-                    map_expr(streams, *node, &values, Some(*node as u32))?,
+                    held(
+                        *value,
+                        map_expr(streams, *node, &values, Some(*node as u32))?,
+                    )?,
                 ));
             }
         }
@@ -275,8 +292,14 @@ pub(crate) fn emit_body(
         }
 
         loops += 1;
+        // A reduction takes its elements two at a time, as the hand row
+        // kernels take a bf16 pair (`a += x₀ + x₁`): an even element waits
+        // in `p`, and its odd neighbour (in the same vector of 8, so valid
+        // with it) joins it into the partial. `e` is constant once the loop
+        // unrolls, so the choice folds away.
         for (value, tag, _) in &reductions {
             let _ = writeln!(s, "  float a{value} = {};", identity(*tag));
+            let _ = writeln!(s, "  float p{value} = {};", identity(*tag));
         }
         s.push_str("#pragma unroll\n");
         s.push_str("  for (int e = 0; e < F::N; ++e) {\n");
@@ -313,10 +336,11 @@ pub(crate) fn emit_body(
         }
         for (value, tag, input) in &reductions {
             let x = name(&values, *input);
+            let pair = combine(*tag, &format!("p{value}"), &x);
             let _ = writeln!(
                 s,
-                "    if (f.valid(e)) a{value} = {};",
-                combine(*tag, &format!("a{value}"), &x)
+                "    if (e % 2 == 0) p{value} = {x}; else if (f.valid(e)) a{value} = {};",
+                combine(*tag, &format!("a{value}"), &format!("({pair})"))
             );
         }
         s.push_str("  }\n");
@@ -324,7 +348,8 @@ pub(crate) fn emit_body(
             let _ = writeln!(s, "  f.template flush<{k}>();");
         }
         for (value, tag, _) in &reductions {
-            let _ = writeln!(s, "  const float v{value} = {};", finish(*tag, *value));
+            let total = held(*value, finish(*tag, *value))?;
+            let _ = writeln!(s, "  const float v{value} = {total};");
         }
     }
     let mut source = format!(

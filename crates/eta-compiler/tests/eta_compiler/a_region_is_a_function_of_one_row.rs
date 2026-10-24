@@ -42,6 +42,7 @@ fn residual_add_rmsnorm() -> Region {
             Op::Mul(12, 2),
         ],
         results: vec![13, 3],
+        rounds: vec![],
     }
 }
 
@@ -74,6 +75,7 @@ fn layernorm() -> Region {
             Op::Add(16, 2),                        // 17
         ],
         results: vec![17],
+        rounds: vec![],
     }
 }
 
@@ -174,7 +176,10 @@ fn a_residual_norm_body_keeps_its_row_across_the_reduction() {
         s.contains("float v3[F::N];"),
         "the stored stream is kept: {s}"
     );
-    assert!(s.contains("if (f.valid(e)) a5 = a5 + v4;"), "{s}");
+    assert!(
+        s.contains("if (e % 2 == 0) p5 = v4; else if (f.valid(e)) a5 = a5 + (p5 + v4);"),
+        "the squares are taken two at a time: {s}"
+    );
     let flushed = s.find("f.template flush<1>();").expect("result 1 flushes");
     let summed = s.find("f.reduce_sum(a5)").expect("the squares are summed");
     assert!(flushed < summed, "the stream leaves before the sum: {s}");
@@ -216,6 +221,7 @@ fn an_op_no_hook_serves_leaves_the_region_without_a_body() {
             Op::Mul(0, 2),
         ],
         results: vec![3],
+        rounds: vec![],
     };
     assert!(
         scalar
@@ -229,6 +235,7 @@ fn an_op_no_hook_serves_leaves_the_region_without_a_body() {
         params: vec![row()],
         ops: vec![Op::ReduceSum(0)],
         results: vec![1],
+        rounds: vec![],
     };
     assert!(sum_out.body().is_err(), "a scalar result is no plane");
 }
@@ -258,6 +265,7 @@ template <int N_, int IN, int OUT> struct HostFrame {
   bool valid(int e) const { return e < width; }
   float reduce_sum(float v) { return v; }
   float reduce_max(float v) { return v; }
+  float round_bf16(float v) const { return bf16(v); }
   template <int K> void flush() {}
 };
 "#;
@@ -324,6 +332,51 @@ fn hex_float(s: &str) -> f32 {
     (sign * m * 2f64.powi(exp.parse::<i32>().expect("exp"))) as f32
 }
 
+/// `h = x + y` rounded to bf16 where it is defined, then `h · h`: the
+/// interpreter and the body both read the sum on as rounded.
+fn rounded_square() -> Region {
+    Region {
+        params: vec![row(), row()],
+        ops: vec![Op::Add(0, 1), Op::Mul(2, 2)],
+        results: vec![3],
+        rounds: vec![(2, Dtype::Bf16)],
+    }
+}
+
+#[test]
+fn a_rounded_value_is_read_on_as_rounded() {
+    let (x, y) = (plane(7), plane(8));
+    let got = rounded_square()
+        .eval(&[Value::F32(x.clone()), Value::F32(y.clone())])
+        .expect("the region runs");
+    let want: Vec<f32> = x
+        .iter()
+        .zip(&y)
+        .map(|(x, y)| bf16(x + y) * bf16(x + y))
+        .collect();
+    assert_eq!(floats(&got[0]), want.as_slice());
+    let body = rounded_square().body().expect("the stream core covers it");
+    assert!(body.source.contains("f.round_bf16("), "{}", body.source);
+    let unrounded = Region {
+        rounds: vec![],
+        ..rounded_square()
+    };
+    assert_ne!(unrounded.body().expect("covered").hash, body.hash);
+    let param = Region {
+        rounds: vec![(0, Dtype::Bf16)],
+        ..rounded_square()
+    };
+    assert!(param.types().is_ok(), "a parameter is an f32 value");
+    let to_f32 = Region {
+        rounds: vec![(2, Dtype::F32)],
+        ..rounded_square()
+    };
+    assert!(matches!(
+        to_f32.types(),
+        Err(RegionError::Rounding { value: 2 })
+    ));
+}
+
 #[test]
 fn the_body_lands_what_the_interpreter_lands() {
     for (name, region, args) in [
@@ -333,6 +386,7 @@ fn the_body_lands_what_the_interpreter_lands() {
             vec![plane(1), plane(2), plane(3)],
         ),
         ("ln", layernorm(), vec![plane(4), plane(5), plane(6)]),
+        ("rounded", rounded_square(), vec![plane(9), plane(10)]),
     ] {
         let Some(stored) = run_on_host(&region, &args, name) else {
             return;

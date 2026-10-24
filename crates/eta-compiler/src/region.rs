@@ -22,7 +22,7 @@ use core::fmt;
 
 use eta_ir::infer::{BodyCtx, BodyError, body_types_after};
 use eta_ir::op::Op;
-use eta_ir::types::{Shape, ValueId, ValueType};
+use eta_ir::types::{Dtype, Shape, ValueId, ValueType};
 
 use crate::codegen::op_view::{OpView, result_bases};
 use crate::codegen::simt::hooks;
@@ -41,6 +41,11 @@ pub struct Region {
     pub ops: Vec<Op>,
     /// What leaves the kernel; `results[k]` is written through output `k`.
     pub results: Vec<ValueId>,
+    /// The values rounded where they are defined, each to a dtype narrower
+    /// than the f32 it is computed in and read on as rounded: the rounding
+    /// points the program a region came from states (a value it stores
+    /// between two ops), so a fusion lands what the ops it replaces land.
+    pub rounds: Vec<(ValueId, Dtype)>,
 }
 
 /// Why a region is not a function of one row.
@@ -60,6 +65,9 @@ pub enum RegionError {
     NotARow { value: ValueId },
     /// A result that names no value.
     NoSuchResult { result: u32, value: ValueId },
+    /// A rounding of no f32 value, or to a dtype that is not a narrower
+    /// float.
+    Rounding { value: ValueId },
     /// Arguments that are not the parameters' (`eval`).
     Arguments { param: u32 },
     /// The interpreter faulted (`eval`).
@@ -92,6 +100,13 @@ impl fmt::Display for RegionError {
                 write!(
                     f,
                     "result {result} names value {value}, which nothing defines"
+                )
+            }
+            RegionError::Rounding { value } => {
+                write!(
+                    f,
+                    "value {value} is rounded, and it is no f32 value or rounded to no \
+                     narrower float"
                 )
             }
             RegionError::Arguments { param } => {
@@ -131,6 +146,7 @@ impl std::error::Error for RegionError {}
 /// | `f.valid(e)` | element `e` lies inside the row; elements past it read garbage, and the body keeps them out of its reductions |
 /// | `f.reduce_sum(v)`, `f.reduce_max(v)` | `v` combined over the block, the total returned to every thread |
 /// | `f.template flush<K>()` | result `K` is complete; every thread calls it at the same point |
+/// | `f.round_bf16(v)` | `v` rounded to bf16 (nearest, ties to even) and back to f32: a value the region rounds ([`Region::rounds`]) |
 ///
 /// - **Indices are constant.** Every `k` and `e` the body passes is a
 ///   constant once its loops unroll, so the frame's arrays stay in
@@ -140,7 +156,8 @@ impl std::error::Error for RegionError {}
 /// - **Math.** f32, each op as the region states it, in its order (the JIT
 ///   compiles with `fmad=false`, so a product and a sum stay two roundings),
 ///   through `expf`, `logf`, `sinf`, `cosf`, `sqrtf`, `rsqrtf`, `fmaxf`,
-///   `fminf` and `fmodf`; a reduction sums one element at a time, and a
+///   `fminf` and `fmodf`; a reduction takes a thread's elements two at a
+///   time (`a += x₀ + x₁`, as the hand row kernels take a bf16 pair), and a
 ///   minimum is `-reduce_max(-v)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Body {
@@ -225,6 +242,14 @@ impl Region {
                 return Err(RegionError::NoSuchResult { result, value });
             }
         }
+        for &(value, dtype) in &self.rounds {
+            let f32_value = types
+                .get(value as usize)
+                .is_some_and(|ty| ty.dtype == Dtype::F32);
+            if !f32_value || !matches!(dtype, Dtype::Bf16 | Dtype::F16) {
+                return Err(RegionError::Rounding { value });
+            }
+        }
         Ok(types)
     }
 
@@ -249,7 +274,13 @@ impl Region {
         let mut vals: Vec<Value> = args.to_vec();
         for op in &self.ops {
             match crate::eval::interp::eval_op(op, &vals, &ty_of, &inputs, 0) {
-                Ok(Evaled::One(v)) => vals.push(v),
+                Ok(Evaled::One(v)) => {
+                    let at = u32::try_from(vals.len()).unwrap_or(u32::MAX);
+                    vals.push(match self.rounds.iter().find(|(r, _)| *r == at) {
+                        Some(&(_, dtype)) => rounded(v, dtype)?,
+                        None => v,
+                    });
+                }
                 Ok(Evaled::Two(a, b)) => {
                     vals.push(a);
                     vals.push(b);
@@ -299,13 +330,31 @@ impl Region {
             &kept,
             &no_topk,
         );
-        let (source, passes) = hooks::emit_body(&streams, params, &self.results)?;
+        let (source, passes) = hooks::emit_body(&streams, params, &self.results, &self.rounds)?;
         Ok(Body {
             hash: eta_ir::fnv1a64(source.as_bytes()),
             source,
             passes,
         })
     }
+}
+
+/// `v` rounded to `dtype` (nearest, ties to even) and widened back.
+fn rounded(v: Value, dtype: Dtype) -> Result<Value, RegionError> {
+    match (v, dtype) {
+        (Value::F32(x), Dtype::Bf16) => Ok(Value::F32(x.into_iter().map(round_bf16).collect())),
+        _ => Err(RegionError::Fault(format!(
+            "the interpreter rounds f32 values to bf16, not to {dtype:?}"
+        ))),
+    }
+}
+
+fn round_bf16(x: f32) -> f32 {
+    if x.is_nan() {
+        return x;
+    }
+    let bits = x.to_bits();
+    f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff_0000)
 }
 
 /// The stream core's row kinds (`codegen::simt::fused::stream_rows`): a

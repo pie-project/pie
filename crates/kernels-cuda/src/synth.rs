@@ -284,6 +284,7 @@ mod tests {
                 Op::Mul(11, 2),
             ],
             results: vec![3, 12],
+            rounds: vec![],
         }
     }
 

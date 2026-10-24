@@ -16,9 +16,11 @@
 //! the run reads but does not compute is a parameter; a value it computes
 //! that anything past the run may read (another op, a seam, a merge, or
 //! nothing at all, as the trace's last values) is a result, stored in its
-//! own dtype. A value only the run reads never leaves the registers, so the
-//! rounding it had between two kernels is gone: a generated kernel is held
-//! to the ops it replaces within a tolerance, not bit for bit.
+//! own dtype. A value only the run reads never leaves the registers, but it
+//! is rounded to its dtype where it is defined, as the ops it replaces
+//! store it ([`Region::rounds`]): a trace value's dtype is a rounding point
+//! the trace states, so fusing never changes what a chain lands. What one
+//! op computes inside itself (a norm's sum of squares) stays f32.
 //!
 //! **Folding** ([`fold`]) replaces each chain's ops with one
 //! `fused.region` op reading its parameters and landing its results, the
@@ -455,6 +457,21 @@ fn lower(trace: &Trace, run: Range<u32>, escapes: &Escapes) -> Option<Chain> {
         .iter()
         .map(|out| b.of.get(&out.value).copied())
         .collect::<Option<Vec<u32>>>()?;
+    // Every value an op of the run defines is rounded to its dtype where it
+    // is defined, as the unfused ops store it, so the region lands what
+    // they land; only what one op computes inside itself stays f32.
+    let mut rounds: Vec<(u32, eta_ir::Dtype)> = Vec::new();
+    for &v in &computed {
+        let narrow = match dtype_of(trace, v) {
+            Dtype::Bf16 => eta_ir::Dtype::Bf16,
+            Dtype::F16 => eta_ir::Dtype::F16,
+            _ => continue,
+        };
+        let id = b.get(v)?;
+        if id >= b.params && !rounds.iter().any(|(held, _)| *held == id) {
+            rounds.push((id, narrow));
+        }
+    }
     let row_type = SymbolicType {
         dtype: eta_ir::Dtype::F32,
         dims: vec![Dimension::Static(width)],
@@ -463,6 +480,7 @@ fn lower(trace: &Trace, run: Range<u32>, escapes: &Escapes) -> Option<Chain> {
         params: vec![row_type; ins.len()],
         ops: b.ops,
         results,
+        rounds,
     };
     region.types().ok()?;
     Some(Chain {

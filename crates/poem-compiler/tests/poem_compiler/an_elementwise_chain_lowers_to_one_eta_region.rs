@@ -38,6 +38,12 @@ fn row(seed: u32) -> Vec<f32> {
         .collect()
 }
 
+/// `x` rounded to bf16, nearest and ties to even.
+fn bf16(x: f32) -> f32 {
+    let bits = x.to_bits();
+    f32::from_bits(bits.wrapping_add(0x7fff + ((bits >> 16) & 1)) & 0xffff_0000)
+}
+
 fn the_one(chains: &[Chain]) -> &Chain {
     assert_eq!(chains.len(), 1, "{chains:#?}");
     &chains[0]
@@ -73,7 +79,18 @@ fn a_residual_add_and_its_norm_form_one_region() {
             Value::F32(w.clone()),
         ])
         .expect("the region runs");
-    let h: Vec<f32> = y.iter().zip(&x).map(|(y, x)| y + x).collect();
+    // Each value an op defines is rounded to its bf16 where it is defined,
+    // as the two ops store it: the stream, and the normed row.
+    assert_eq!(
+        chain.region.rounds,
+        chain
+            .region
+            .results
+            .iter()
+            .map(|&v| (v, eta_ir::Dtype::Bf16))
+            .collect::<Vec<_>>()
+    );
+    let h: Vec<f32> = y.iter().zip(&x).map(|(y, x)| bf16(y + x)).collect();
     assert_eq!(out[0], Value::F32(h.clone()), "result 0 is the stream");
     let ms = h.iter().map(|v| v * v).sum::<f32>() / WIDTH as f32;
     let r = 1.0 / (ms + EPS).sqrt();
@@ -82,8 +99,9 @@ fn a_residual_add_and_its_norm_form_one_region() {
     };
     for (e, got) in normed.iter().enumerate() {
         let want = h[e] * r * w[e];
+        assert_eq!(*got, bf16(*got), "{e}: the normed row is rounded");
         assert!(
-            (got - want).abs() <= 1e-5 * want.abs().max(1.0),
+            (got - want).abs() <= want.abs().max(1.0) / 128.0,
             "{e}: {got} vs {want}"
         );
     }

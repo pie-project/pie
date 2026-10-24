@@ -5,11 +5,11 @@
 //! answers with the flag off, where the chain's ops run as their hand
 //! kernels: a prefill and the decode steps after it, armed and captured.
 //!
-//! Bit for bit, on this draw. A residual norm's chain stores the stream as
-//! the hand kernels do and computes the norm in their order, but for its
-//! sum of squares: one at a time where the hand register kernel adds them
-//! two at a time, which moves a normed element by one bf16 ulp about once
-//! in two million (`kernels_cuda`'s `elemwise::synth` tests count them).
+//! Bit for bit. A chain rounds every value it defines where the unfused
+//! ops store it, its stream among them (read on by the norm as stored,
+//! even where nothing past the chain reads it), and computes the norm in
+//! the hand kernels' order, its squares two at a time
+//! (`kernels_cuda`'s `elemwise::synth` tests hold it to their bits).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};

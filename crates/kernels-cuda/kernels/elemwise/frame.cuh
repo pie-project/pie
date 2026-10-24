@@ -81,6 +81,10 @@ struct RowFrame {
         return __uint_as_float(__byte_perm(pair, 0, e % 2 == 0 ? 0x1044 : 0x3244));
     }
 
+    // `v` rounded to bf16 and back: a value the program a body came from
+    // stores between two ops, read on as it stored it.
+    __device__ __forceinline__ float round_bf16(float v) const { return bf16_to_f32(f32_to_bf16(v)); }
+
     __device__ __forceinline__ float reduce_sum(float local) {
         return block_reduce_sum_fast<BLOCK>(local, buf);
     }
