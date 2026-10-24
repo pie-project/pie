@@ -12,6 +12,7 @@
 //! wanting it whole is all-reduced or all-gathered right after the op that
 //! made it.
 
+pub mod infer;
 mod rules;
 #[cfg(test)]
 mod tests;
@@ -186,6 +187,10 @@ impl Pass {
                 Ok(Some((*axis, blocks)))
             }
             Shard::Replicated => Ok(None),
+            Shard::Inferred => Err(format!(
+                "`{}` leaves its cut to inference, which has not run",
+                param.name
+            )),
         }
     }
 

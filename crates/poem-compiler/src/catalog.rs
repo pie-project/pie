@@ -131,6 +131,7 @@ pub fn whole(tp: u32) -> Result<(), poem::import::Error> {
 }
 
 /// The trace each rank of `deploy` runs, from the one the package records:
+/// the cuts it leaves to the compiler inferred ([`crate::shard::infer`]),
 /// its products of one activation joined ([`crate::pack`]), its u4
 /// projections tiled where the platform reads them so ([`crate::tile`]), split across its
 /// tensor ranks, its experts across its expert ranks.
@@ -140,7 +141,8 @@ pub fn lowered(trace: Trace, deploy: &Deploy) -> Result<Trace, String> {
 
 /// [`lowered`], each expert rank holding `replicas` slots past its share of
 /// a layer's experts.
-pub fn lowered_with(trace: Trace, deploy: &Deploy, replicas: u32) -> Result<Trace, String> {
+pub fn lowered_with(mut trace: Trace, deploy: &Deploy, replicas: u32) -> Result<Trace, String> {
+    crate::shard::infer::resolve(&mut trace);
     let trace = crate::tile::tile(crate::pack::pack(trace));
     let trace = crate::shard::shard(trace, deploy.tp).map_err(|why| why.to_string())?;
     crate::expert::lower(trace, deploy.ep, replicas).map_err(|why| why.to_string())
@@ -149,11 +151,18 @@ pub fn lowered_with(trace: Trace, deploy: &Deploy, replicas: u32) -> Result<Trac
 /// What [`lowered`] decides of `trace`'s weights that an import stores so.
 #[must_use]
 pub fn lowering_of(trace: &Trace) -> poem::Lowering {
-    let joins = crate::pack::joins(trace);
+    let mut trace = trace.clone();
+    let cuts = crate::shard::infer::resolve(&mut trace);
+    let joins = crate::pack::joins(&trace);
     let lowered = crate::tile::tile(crate::pack::pack(trace.clone()));
-    let tiled = crate::tile::tiled(&crate::pack::pack(trace.clone()));
+    let tiled = crate::tile::tiled(&crate::pack::pack(trace));
     let read = Some(lowered.params.iter().map(|p| p.name.clone()).collect());
-    poem::Lowering { joins, tiled, read }
+    poem::Lowering {
+        joins,
+        tiled,
+        read,
+        cuts,
+    }
 }
 
 /// The rank counts [`Catalog::splits`] tries.

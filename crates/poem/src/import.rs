@@ -2279,7 +2279,9 @@ fn ladder(name: &str, expr: Expr, stored: &Encoding, want: &Encoding) -> Result<
 /// ranks in a row read the same share of it.
 fn banding(w: &Weight, tp: u32) -> Option<Bands> {
     match &w.shard {
-        Shard::Replicated => None,
+        // A weight whose cut was left to the compiler and reaches the
+        // import without one is read whole, as one stated whole is.
+        Shard::Replicated | Shard::Inferred => None,
         Shard::Cut {
             axis,
             segments,
@@ -2421,7 +2423,7 @@ fn whole(w: &Weight, tp: u32) -> Vec<i64> {
         let at = axis as usize;
         let seams: u64 = match &w.shard {
             Shard::Cut { segments, .. } => segments.iter().sum(),
-            Shard::Replicated => unreachable!("a band is a cut's"),
+            Shard::Replicated | Shard::Inferred => unreachable!("a band is a cut's"),
         };
         let dim = dims
             .get_mut(at)
@@ -2519,7 +2521,9 @@ fn channel_axis(w: &Weight) -> u8 {
 
 fn pack_axis(w: &Weight) -> u8 {
     match &w.shard {
-        Shard::Replicated => panic!("`{}` is replicated and has no cut axis", w.name),
+        Shard::Replicated | Shard::Inferred => {
+            panic!("`{}` is replicated and has no cut axis", w.name)
+        }
         Shard::Cut { axis, .. } => as_axis(*axis, &w.name),
     }
 }

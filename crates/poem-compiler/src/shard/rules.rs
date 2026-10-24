@@ -10,7 +10,7 @@ use super::{Dist, Pass};
 use crate::tree::{self, Tree};
 
 /// How an op meets the ranks.
-enum Rule {
+pub(super) enum Rule {
     /// Every value whole.
     Whole,
     /// Split by head or channel with the values it follows.
@@ -42,18 +42,18 @@ enum Rule {
 /// with them, and whose `scale` counts are each rank's share. Other
 /// activations are whole.
 #[derive(Clone, Copy)]
-struct Heads {
-    follow: &'static [&'static str],
-    scale: &'static [&'static str],
-    cache: Cache,
+pub(super) struct Heads {
+    pub(super) follow: &'static [&'static str],
+    pub(super) scale: &'static [&'static str],
+    pub(super) cache: Cache,
     /// The kv it appends to a cache or attends to without one, cut as its
     /// kv heads are.
-    kv: &'static [&'static str],
+    pub(super) kv: &'static [&'static str],
 }
 
 /// How the cache an op reads is held against the values it follows.
 #[derive(Clone, Copy, PartialEq)]
-enum Cache {
+pub(super) enum Cache {
     /// It reads none the ranks split.
     Whole,
     /// Split exactly when its values are.
@@ -64,7 +64,7 @@ enum Cache {
 }
 
 impl Cache {
-    fn allows(self, cut: bool, split: bool) -> bool {
+    pub(super) fn allows(self, cut: bool, split: bool) -> bool {
         match self {
             Cache::Whole => !cut,
             Cache::Split => cut == split,
@@ -93,7 +93,7 @@ impl Heads {
 }
 
 /// The head count of kv a group of ranks may share.
-const KV_HEADS: &str = "kv_heads";
+pub(super) const KV_HEADS: &str = "kv_heads";
 
 /// How op `name` splits by head or channel, if it does.
 fn heads(name: &str) -> Option<Heads> {
@@ -138,7 +138,7 @@ fn heads(name: &str) -> Option<Heads> {
     })
 }
 
-fn rule(op: &Operation) -> Rule {
+pub(super) fn rule(op: &Operation) -> Rule {
     // A norm splits by its axis: a whole row's weight against the row's
     // blocks, a head's like any per-head op, a group's not at all.
     if let Operation::Elemwise(Elemwise::Rmsnorm { axis, .. }) = op {
