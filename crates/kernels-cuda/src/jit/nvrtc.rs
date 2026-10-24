@@ -475,6 +475,18 @@ mod tests {
             &["::pie::linear::moe_select_mxfp4_cvt<2, 1, 2, 4, 3, 1>"],
         ),
         (
+            "linear/moe/mega_sm100.cu",
+            // (kind: W4A8 or bf16, block width 32, Glu code, weights first,
+            // the five-stage ring 32 fits): every form `moe::mega` launches.
+            &[
+                "::pie::linear::mega_moe<1, 32, 2, 1, 5>",
+                "::pie::linear::mega_moe<0, 32, 1, 0, 5>",
+                "::pie::linear::mega_moe<0, 32, 1, 1, 5>",
+                "::pie::linear::mega_moe<0, 32, 2, 0, 5>",
+                "::pie::linear::mega_moe<0, 32, 2, 1, 5>",
+            ],
+        ),
+        (
             "linear/moe/route_sm100.cu",
             &["::pie::linear::moe_gate_tc5<1, 64, 2, 2, 0, true>"],
         ),
