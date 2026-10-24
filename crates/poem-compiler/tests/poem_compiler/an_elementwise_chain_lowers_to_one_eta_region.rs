@@ -1,13 +1,14 @@
 //! Under `compiler.synth_regions`, a run of elementwise and row ops forms a
 //! chain, lowered to one eta region (`fuse::chain`): a function of one row
-//! the stream core writes a row frame's body for. Off, nothing forms.
+//! the stream core writes a row frame's body for, and folded into one
+//! `fused.region` op the plan is of. Off, nothing forms.
 
 use eta_compiler::eval::interp::Value;
 use poem::ops::{elemwise, linear};
 use poem::pattern::{Pattern, template};
 use poem_compiler::DeviceProfile;
-use poem_compiler::fuse::chain::{Chain, chains};
-use poem_ir::Trace;
+use poem_compiler::fuse::chain::{Chain, chains, fold};
+use poem_ir::{Fused, Operation, Trace, ValueId};
 
 use crate::common::bake_with;
 
@@ -167,34 +168,123 @@ fn an_op_no_region_lowers_ends_the_chain() {
     assert_eq!(spans, [0..2, 3..5], "erf's gelu has no eta form");
 }
 
-#[test]
-fn the_compiler_forms_regions_only_when_asked() {
-    let t = poem_compiler::catalog::deployments()
+fn qwen3() -> Trace {
+    poem_compiler::catalog::deployments()
         .find(|row| row.name.starts_with("qwen3"))
         .expect("a qwen3 row")
-        .trace(poem::Platform::Cuda);
+        .trace(poem::Platform::Cuda)
+}
+
+fn synth() -> DeviceProfile {
+    DeviceProfile {
+        synth_regions: true,
+        ..DeviceProfile::default()
+    }
+}
+
+/// The `fused.region` ops of `t`: their inputs, outputs and body hash.
+fn regions(t: &Trace) -> Vec<(Vec<ValueId>, Vec<ValueId>, u64)> {
+    t.nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Operation::Fused(Fused::Region {
+                ins, outs, body, ..
+            }) => Some((ins.clone(), outs.clone(), *body)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_compiler_folds_regions_only_when_asked() {
+    let t = qwen3();
     let off = bake_with(&t, &DeviceProfile::default()).expect("bakes");
-    assert!(off.chains.is_empty(), "off by default");
-    let on = bake_with(
-        &t,
-        &DeviceProfile {
-            synth_regions: true,
-            ..DeviceProfile::default()
-        },
-    )
-    .expect("bakes");
     assert!(
-        !on.chains.is_empty(),
+        off.trace.is_none(),
+        "off by default, the plan is of the trace given"
+    );
+    assert!(off.bodies.is_empty());
+
+    let on = bake_with(&t, &synth()).expect("bakes");
+    let folded = on.trace.as_ref().expect("the plan is of the folded trace");
+    let formed = chains(&t);
+    let ops = regions(folded);
+    assert!(
+        !ops.is_empty(),
         "a qwen3 forward has a residual norm a layer"
     );
-    assert_eq!(
-        poem_compiler::CompiledModel {
-            chains: Vec::new(),
-            ..on
-        },
-        off,
-        "the regions change nothing else"
+    assert_eq!(ops.len(), formed.len(), "each chain is one op");
+    let folded_away: usize = formed.iter().map(|chain| chain.nodes.len() - 1).sum();
+    assert_eq!(folded.nodes.len(), t.nodes.len() - folded_away);
+    for (ins, outs, body) in &ops {
+        let synth = on.bodies.get(body).expect("the op's body is held");
+        assert_eq!(synth.body.hash, *body);
+        assert_eq!(synth.region.params.len(), ins.len());
+        assert_eq!(synth.region.results.len(), outs.len());
+    }
+    assert!(
+        on.bodies.len() < ops.len(),
+        "a layer's chain shares the next's body"
     );
+    poem_ir::check(folded).expect("the folded trace checks");
+    assert_eq!(
+        on.classes.node_mask.len(),
+        folded.nodes.len(),
+        "the plan is of the folded trace"
+    );
+}
+
+/// The arena lands no region's output over one of its inputs: a row frame
+/// reads its row whole before it writes any of it, but a block's row is
+/// not another block's.
+#[test]
+fn no_region_lands_an_output_over_its_input() {
+    let t = qwen3();
+    let on = bake_with(&t, &synth()).expect("bakes");
+    let folded = on.trace.as_ref().expect("folded");
+    let fire = poem_compiler::FireRows::ceilings(&crate::common::budgets_of(folded));
+    let (mut wrong, mut held) = (Vec::new(), 0usize);
+    for (ins, outs, _) in regions(folded) {
+        for out in &outs {
+            for input in &ins {
+                let (o, i) = (on.arena.root(*out), on.arena.root(*input));
+                let overlap = match (on.arena.window(*out, fire), on.arena.window(*input, fire)) {
+                    (Some(a), Some(b)) => {
+                        held += 1;
+                        a.offset < b.offset + b.bytes && b.offset < a.offset + a.bytes
+                    }
+                    _ => false,
+                };
+                if o == i || overlap {
+                    wrong.push(format!("{out:?} lands over {input:?}"));
+                }
+            }
+        }
+    }
+    assert!(held > 0, "a region reads a value the arena holds");
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Every catalog deployment, on CUDA, folded: each chain one op, and the
+/// trace still checks.
+#[test]
+fn every_folded_catalog_trace_checks() {
+    let mut wrong: Vec<String> = Vec::new();
+    for row in poem_compiler::catalog::deployments() {
+        let t = row.trace(poem::Platform::Cuda);
+        let (folded, bodies) = fold(t.clone());
+        let ops = regions(&folded);
+        if ops.len() != chains(&t).len() {
+            wrong.push(format!("{}: a chain is not folded", row.name));
+        }
+        if ops.iter().any(|(_, _, body)| !bodies.contains_key(body)) {
+            wrong.push(format!("{}: an op names no body", row.name));
+        }
+        if let Err(faults) = poem_ir::check(&folded) {
+            wrong.push(format!("{}: {faults:?}", row.name));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// Every catalog deployment's chains, on CUDA: each lies in its trace, after

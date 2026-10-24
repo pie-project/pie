@@ -198,7 +198,8 @@ pub struct DeviceProfile {
     pub dag_streams_until: u32,
 
     /// Whether chains of elementwise and row ops are formed into regions
-    /// lowered to eta (`fuse::chain`, `compiler.synth_regions`).
+    /// lowered to eta and folded into `fused.region` ops (`fuse::chain`,
+    /// `compiler.synth_regions`).
     pub synth_regions: bool,
 
     pub family_us: FamilyCosts,

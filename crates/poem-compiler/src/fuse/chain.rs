@@ -18,19 +18,25 @@
 //! rounding it had between two kernels is gone: a generated kernel is held
 //! to the ops it replaces within a tolerance, not bit for bit.
 //!
-//! Chains are formed only under `compiler.synth_regions` (off by default);
-//! nothing consumes them yet.
+//! **Folding** ([`fold`]) replaces each chain's ops with one
+//! `fused.region` op reading its parameters and landing its results, the
+//! values only the chain read gone from the trace. No result lands over a
+//! parameter, so the arena gives each its own plane: a row frame's threads
+//! read their row whole before any writes it.
+//!
+//! Chains are formed and folded only under `compiler.synth_regions` (off by
+//! default).
 
 use std::collections::BTreeMap;
 use std::ops::Range;
 
 use eta_compiler::plan::{Dimension, SymbolicType};
-use eta_compiler::region::Region;
+use eta_compiler::region::{Body, Region};
 use eta_ir::op::Op;
 use eta_ir::types::Literal;
 use poem_ir::{
-    ActFn, BinaryOp, Bounds, Def, Dim, Dtype, Elemwise, Fused, NormAxis, NormWeight, Operands,
-    Operation, Trace, Ty, ValueId,
+    ActFn, BinaryOp, Bounds, Def, Dim, Dtype, Elemwise, Fused, Node, NormAxis, NormWeight,
+    Operands, Operation, Trace, Ty, ValueId,
 };
 
 /// The most ops one chain holds.
@@ -68,6 +74,88 @@ pub struct In {
 pub struct Out {
     pub value: ValueId,
     pub dtype: Dtype,
+}
+
+/// A generated kernel's region and the body the stream core wrote for it:
+/// what a `fused.region` op's `body` hash names.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Synth {
+    pub region: Region,
+    pub body: Body,
+}
+
+/// `trace` with each chain whose body the stream core writes replaced by
+/// one `fused.region` op, and the regions its ops name, by body hash. Two
+/// chains of one body (a layer's and the next's) share one entry.
+#[must_use]
+pub fn fold(trace: Trace) -> (Trace, BTreeMap<u64, Synth>) {
+    let mut bodies = BTreeMap::new();
+    let mut folded: Vec<(Range<u32>, Fused)> = Vec::new();
+    for chain in chains(&trace) {
+        let Ok(body) = chain.region.body() else {
+            continue;
+        };
+        let Ok(Some(width)) = chain.region.width() else {
+            continue;
+        };
+        folded.push((
+            chain.nodes.clone(),
+            Fused::Region {
+                ins: chain.ins.iter().map(|input| input.value).collect(),
+                width,
+                body: body.hash,
+                outs: chain.outs.iter().map(|out| out.value).collect(),
+            },
+        ));
+        bodies.entry(body.hash).or_insert(Synth {
+            region: chain.region,
+            body,
+        });
+    }
+    if folded.is_empty() {
+        return (trace, bodies);
+    }
+    (super::search::compact(replace(trace, folded)), bodies)
+}
+
+/// `trace` with each run's ops replaced by its op, landed where the run
+/// began, under the run's guard and layer; the runs are in order and apart.
+fn replace(mut trace: Trace, runs: Vec<(Range<u32>, Fused)>) -> Trace {
+    let mut landed = Vec::with_capacity(trace.nodes.len());
+    let mut nodes = Vec::with_capacity(trace.nodes.len());
+    let mut runs = runs.into_iter().peekable();
+    let mut inside: Option<(u32, u32)> = None;
+    for (at, node) in (0u32..).zip(std::mem::take(&mut trace.nodes)) {
+        if let Some((end, to)) = inside {
+            if at < end {
+                landed.push(to);
+                continue;
+            }
+            inside = None;
+        }
+        let here = u32::try_from(nodes.len()).unwrap_or(u32::MAX);
+        landed.push(here);
+        if runs.peek().is_some_and(|(run, _)| run.start == at) {
+            let (run, op) = runs.next().expect("peeked");
+            inside = Some((run.end, here));
+            nodes.push(Node {
+                op: Operation::Fused(op),
+                guard: node.guard,
+                layer: node.layer,
+            });
+        } else {
+            nodes.push(node);
+        }
+    }
+    for decl in &mut trace.values {
+        if let Def::Op(i) = &mut decl.def
+            && let Some(&to) = landed.get(*i as usize)
+        {
+            *i = to;
+        }
+    }
+    trace.nodes = nodes;
+    trace
 }
 
 /// Every chain of `trace`, in order; ops outside them run as they are.
