@@ -1400,13 +1400,3 @@ fn readouts_of(settle: &StepSettle) -> EngineResult<Vec<LaneReadout>> {
         })
         .collect()
 }
-
-// SAFETY: the only state that is not `Sync` is the shell's
-// `trace::Handles` (a `RefCell` and a `Cell`). Every method that reaches it
-// (`open`, `copy_*`, the fire path under `fire_padded`) takes `&mut Shell`,
-// so it runs under `&mut Cerebras`. What a shared `&Cerebras` reaches (the `Engine`
-// `&self` methods, `shell()`, `capabilities()` and the shell's `&self`
-// getters) never touches those cells. `Engine: Sync` is asked for only by
-// runtime's registry lock; the runtime moves an engine, never shares it.
-// `Cerebras` is `Send` on its own.
-unsafe impl Sync for Cerebras {}

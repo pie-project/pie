@@ -1112,11 +1112,3 @@ pub(crate) fn lane_readouts(policies: &[Readout], rows: &[Vec<f32>]) -> Vec<Lane
         })
         .collect()
 }
-
-// SAFETY: `Engine` asks for `Sync` only so the runtime's registry can sit in
-// a static `RwLock`; the runtime moves an engine in and out of it and never
-// shares one. Even so, the public `&self` surface (`boot`, `contract_for`,
-// `capabilities`, `device_facts`, constants) reads plain data and never the
-// `Shell`, whose `Cell`s and `RefCell`s are reached only from `&mut self`
-// methods (the private `loaded` is called from those alone).
-unsafe impl Sync for Wgpu {}

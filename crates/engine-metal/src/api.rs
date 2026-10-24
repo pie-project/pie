@@ -1173,11 +1173,3 @@ fn readouts_of(step: &PendingStep, seam: engine::fire::ReadoutSeam) -> Vec<LaneR
 // moves sole ownership of all of them, and Metal's device, queue, pipeline and
 // resource objects are documented usable from any thread.
 unsafe impl Send for Metal {}
-// SAFETY: `Engine` demands `Sync`. Every path to the shell, the adapters and
-// the pending step takes `&mut self`; through `&Metal` there are only `kind`,
-// `device_facts`, `capabilities` (plain data in `caps`) and
-// `settles_asynchronously`, which reads `Arms`' plain `Vec` length and touches
-// no `RefCell` or Objective-C object. Shared `&Metal`s therefore only read
-// memory nothing can write while they live. Held by convention: a new `&self`
-// verb that reaches the shell would break it.
-unsafe impl Sync for Metal {}

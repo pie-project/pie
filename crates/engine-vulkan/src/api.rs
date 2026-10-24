@@ -1306,10 +1306,3 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
 // so moving the whole engine to another thread moves every handle with it;
 // Vulkan handles are not tied to the thread that made them.
 unsafe impl Send for Vulkan {}
-// SAFETY: `Engine` demands `Sync` only because the runtime's registry keeps
-// engines in a `RwLock`; it moves an engine in and out and never shares one.
-// A `&Vulkan` reaches `kind`, `device_facts`, `settles_asynchronously`,
-// `capabilities` and the trait defaults, which read plain fields only; every
-// verb that touches the shell's `Cell`/`RefCell` state takes `&mut self`,
-// and no `&self` method hands out the `Shell`.
-unsafe impl Sync for Vulkan {}
