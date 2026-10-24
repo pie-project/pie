@@ -236,7 +236,7 @@ __device__ __forceinline__ void tile_softmax(const u32 (&vm)[32], const u32 (&vt
             s[i] = e0;
             s[i + 1] = e1;
         } else {
-            pk[i / 2] = fmha::pack_bf16x2(e0, e1);
+            pk[i / 2] = ::pie::pack_bf16x2(e0, e1);
         }
     }
     if constexpr (kE4) {
