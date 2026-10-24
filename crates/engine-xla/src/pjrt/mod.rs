@@ -15,6 +15,7 @@ pub mod sys;
 
 use std::ffi::c_void;
 use std::fmt;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
@@ -337,17 +338,17 @@ impl Api {
 
 /// A device the client addresses. Borrowed from the client; valid while it is.
 #[derive(Clone, Copy)]
-pub struct Device {
+pub struct Device<'c> {
     raw: *mut sys::PJRT_Device,
+    _client: PhantomData<&'c Client>,
 }
 
 // SAFETY: a `PJRT_Device` is owned by its client and only ever read through
 // it (description, kind, memory stats), which the client allows from any
-// thread. Nothing ties a `Device` to its `Client`'s lifetime, though: that is
-// the caller's to keep.
-unsafe impl Send for Device {}
+// thread; the `'c` borrow keeps that client alive.
+unsafe impl Send for Device<'_> {}
 // SAFETY: as for `Send`; `Device` has no state of its own to race on.
-unsafe impl Sync for Device {}
+unsafe impl Sync for Device<'_> {}
 
 /// What the device reports about its memory.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -359,7 +360,8 @@ pub struct MemoryStats {
 pub struct Client {
     api: Arc<Api>,
     raw: *mut sys::PJRT_Client,
-    devices: Vec<Device>,
+    /// The plugin's addressable devices, owned by `raw`.
+    devices: Vec<*mut sys::PJRT_Device>,
 }
 
 // SAFETY: `Client` owns its `PJRT_Client` and destroys it only in `Drop`.
@@ -394,7 +396,7 @@ impl Client {
         // SAFETY: the plugin owns this array for the client's lifetime.
         let devices =
             unsafe { std::slice::from_raw_parts(d.addressable_devices, d.num_addressable_devices) };
-        client.devices = devices.iter().map(|&raw| Device { raw }).collect();
+        client.devices = devices.to_vec();
         Ok(client)
     }
 
@@ -403,9 +405,18 @@ impl Client {
         &self.api
     }
 
+    /// The addressable device at `ordinal`, if there is one.
     #[must_use]
-    pub fn devices(&self) -> &[Device] {
-        &self.devices
+    pub fn device(&self, ordinal: usize) -> Option<Device<'_>> {
+        self.devices.get(ordinal).map(|&raw| Device {
+            raw,
+            _client: PhantomData,
+        })
+    }
+
+    #[must_use]
+    pub fn device_count(&self) -> usize {
+        self.devices.len()
     }
 
     pub fn platform_name(&self) -> Result<String> {
@@ -416,7 +427,7 @@ impl Client {
         Ok(unsafe { text(a.platform_name, a.platform_name_size) })
     }
 
-    pub fn device_kind(&self, device: Device) -> Result<String> {
+    pub fn device_kind(&self, device: Device<'_>) -> Result<String> {
         let mut d = args!(PJRT_Device_GetDescription_Args { device: device.raw });
         call!(&self.api, PJRT_Device_GetDescription, &mut d)?;
         let mut k = args!(PJRT_DeviceDescription_Kind_Args {
@@ -428,7 +439,7 @@ impl Client {
         Ok(unsafe { text(k.device_kind, k.device_kind_size) })
     }
 
-    pub fn memory_stats(&self, device: Device) -> Result<MemoryStats> {
+    pub fn memory_stats(&self, device: Device<'_>) -> Result<MemoryStats> {
         let mut a = args!(PJRT_Device_MemoryStats_Args { device: device.raw });
         call!(&self.api, PJRT_Device_MemoryStats, &mut a)?;
         Ok(MemoryStats {
@@ -472,7 +483,7 @@ impl Client {
     /// The host bytes may be reused once this returns.
     pub fn upload(
         &self,
-        device: Device,
+        device: Device<'_>,
         data: &[u8],
         ty: ElementType,
         dims: &[i64],
