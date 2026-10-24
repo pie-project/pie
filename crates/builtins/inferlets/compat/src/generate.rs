@@ -28,10 +28,17 @@ use crate::prompt::Prompt;
 /// no truncation, no penalties.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Sampling {
-    /// Draft with the model's block drafter where it pays (greedy; alone,
-    /// or beside other requests under the runtime's `verify_budget`); on
-    /// unless the request turns it off.
+    /// Draft with the model's block drafter where it pays (greedy, or
+    /// sampled under `speculative_sampled`; alone, or beside other requests
+    /// under the runtime's `verify_budget`); on unless the request turns it
+    /// off.
     pub speculative: bool,
+    /// Draft above temperature zero too, verifying by speculative
+    /// sampling's acceptance rule (temperature alone, no truncation). Off
+    /// unless the request asks for speculation outright: which rounds draft
+    /// follows the lane's clock, and with it which noise a seeded request's
+    /// tokens draw, so a seed no longer pins the text.
+    pub speculative_sampled: bool,
     pub temperature: f32,
     pub top_p: f32,
     /// 0 means off.
@@ -64,6 +71,7 @@ impl Default for Sampling {
     fn default() -> Self {
         Self {
             speculative: true,
+            speculative_sampled: false,
             temperature: 1.0,
             top_p: 1.0,
             top_k: 0,
@@ -81,6 +89,11 @@ impl Sampling {
     /// The API's 64-bit seed folded into the sampler's 32-bit state.
     pub fn set_seed(&mut self, seed: i64) {
         self.seed = (seed as u64 as u32) ^ ((seed as u64 >> 32) as u32);
+    }
+
+    /// Whether temperature alone shapes the distribution sampled from.
+    fn untruncated(&self) -> bool {
+        self.top_k == 0 && self.top_p == 1.0 && self.min_p == 0.0
     }
 
     fn penalized(&self) -> bool {
@@ -371,8 +384,9 @@ pub async fn generate(
     if max_tokens == 0 {
         return Ok((0, 0));
     }
+    let sampled = sampling.temperature > 0.0;
     if sampling.speculative
-        && sampling.temperature == 0.0
+        && (!sampled || (sampling.speculative_sampled && sampling.untruncated()))
         && !sampling.penalized()
         && matcher.is_none()
         && sampling.logprobs.is_none()
@@ -387,7 +401,8 @@ pub async fn generate(
         && draft.proposals_from <= 1
         && (2..=16).contains(&draft.rows)
     {
-        return crate::speculative::generate(prompt, ends, max_tokens, draft, &mut |t| {
+        let sampled = sampled.then_some((sampling.temperature, sampling.seed));
+        return crate::speculative::generate(prompt, ends, max_tokens, draft, sampled, &mut |t| {
             on_token(t, None)
         })
         .await;

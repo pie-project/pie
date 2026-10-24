@@ -1,4 +1,16 @@
+//! A block drafter's loop for the API inferlets: one draft fire and one
+//! verify fire a round, where drafting pays.
+//!
+//! At temperature zero the verify keeps the proposals the target's argmax
+//! agrees with. Above it the verify samples: the drafter names its tokens
+//! without a distribution (it drafted from a point mass), so each verify row
+//! lands the target's chance of its proposal and a draw with the proposal
+//! struck out (`inferlet::speculative::point_rows`), and the host keeps a
+//! proposal with that chance and stops on the struck-out draw
+//! (`verify_point_rows`); the text is distributed as plain sampling's.
+
 use inferlet::eta::prelude::*;
+use inferlet::speculative::{SplitMix64, point_rows, verify_point_rows};
 use std::ops::ControlFlow;
 
 enum Round<'a> {
@@ -9,13 +21,31 @@ enum Round<'a> {
     Plain,
 }
 
+/// How a non-draft pass picks the target's tokens above temperature zero.
+#[derive(Clone, Copy)]
+struct Pick {
+    temperature: f32,
+    vocab: u32,
+    /// The Gumbel stream every pass's draws advance.
+    noise: Channel,
+}
+
+/// What a pass landed: a token a row (the target's argmax, a draw past
+/// the row's proposal, or the draft's picks), and under a `Pick` each
+/// row's chance of its proposal.
+struct Landed {
+    tokens: Vec<i32>,
+    chances: Vec<f32>,
+}
+
 async fn pass(
     pipe: &Pipeline,
     ws: &WorkingSet,
     tokens: &[i32],
     base: u32,
     round: Round<'_>,
-) -> Result<Vec<i32>> {
+    pick: Option<&Pick>,
+) -> Result<Landed> {
     let count = tokens.len() as u32;
     let end = base + count;
     let drafting = matches!(round, Round::Draft);
@@ -39,6 +69,22 @@ async fn pass(
         None => Fold::All,
     };
     let out = Channel::new([shown], dtype::i32).named("spec_output");
+    // Row `j` of a verify reads the token proposal `j` claims, the input
+    // one past it; the last row (and a prompt's or plain fire's one) has
+    // none.
+    let sampled = pick.filter(|_| !drafting).map(|pick| {
+        let mut proposals: Vec<u32> = match round {
+            Round::Verify(_) => tokens[1..].iter().map(|&t| t as u32).collect(),
+            _ => Vec::new(),
+        };
+        proposals.resize(shown as usize, 0);
+        (
+            *pick,
+            Channel::from(proposals).named("spec_proposals"),
+            Channel::new([shown], dtype::f32).named("spec_chances"),
+        )
+    });
+    let chances = sampled.as_ref().map(|(_, _, chances)| *chances);
     let fwd = ForwardPass::new();
     if drafting {
         fwd.set_drafting_block(true).context("draft block")?;
@@ -57,17 +103,40 @@ async fn pass(
         fwd.checkpoints(ends)?;
     }
     fwd.epilogue(move || {
-        let next = if drafting {
-            intrinsics::mtp_drafts(shown)
-        } else {
-            reduce_argmax(intrinsics::logits())
+        if drafting {
+            out.put(reshape(intrinsics::mtp_drafts(shown), [shown]));
+            return;
+        }
+        let Some((pick, proposals, chances)) = &sampled else {
+            out.put(reshape(reduce_argmax(intrinsics::logits()), [shown]));
+            return;
         };
-        out.put(reshape(next, [shown]));
+        let logits = reshape(intrinsics::logits(), [shown, pick.vocab]);
+        let r = pick.noise.take();
+        let (chance, draws) = point_rows(
+            &(&logits / pick.temperature),
+            &proposals.read(),
+            shown,
+            pick.vocab,
+            &r,
+        );
+        out.put(reshape(draws, [shown]));
+        chances.put(reshape(chance, [shown]));
+        pick.noise.put(&r + iota(2));
     });
     fwd.submit(pipe).context("speculative submit")?;
-    out.take_host::<Vec<i32>>()
+    let tokens = out
+        .take_host::<Vec<i32>>()
         .await
-        .context("speculative readback")
+        .context("speculative readback")?;
+    let chances = match chances {
+        Some(chances) => chances
+            .take_host::<Vec<f32>>()
+            .await
+            .context("speculative chances")?,
+        None => Vec::new(),
+    };
+    Ok(Landed { tokens, chances })
 }
 
 /// Fire prices, the median of the last few of each shape, so the loop drafts
@@ -197,11 +266,14 @@ fn rungs(widest: u32) -> Vec<u32> {
     out
 }
 
+/// Generate as the target would, drafting where it pays: greedily, or with
+/// `sampled`'s `(temperature, seed)` by speculative sampling.
 pub async fn generate(
     prompt: &[u32],
     ends: &[u32],
     max_tokens: usize,
     draft: model::BlockDrafter,
+    sampled: Option<(f32, u32)>,
     on_token: &mut dyn FnMut(u32) -> ControlFlow<()>,
 ) -> Result<(usize, usize)> {
     let block = draft.rows;
@@ -212,7 +284,17 @@ pub async fn generate(
     let ws = WorkingSet::new();
     let pipe = Pipeline::new();
     let prompt: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let mut anchor = pass(&pipe, &ws, &prompt, 0, Round::Prompt(ends)).await?[0];
+    let pick = sampled.map(|(temperature, seed)| Pick {
+        temperature,
+        vocab: model::output_vocab_size(),
+        noise: Channel::from([seed, 0u32]).named("spec_noise"),
+    });
+    // The acceptance draws, a stream apart from the device's noise.
+    let mut uniform = SplitMix64::new(u64::from(sampled.map_or(0, |(_, seed)| seed)) ^ 0x5bec);
+    let pick = pick.as_ref();
+    let mut anchor = pass(&pipe, &ws, &prompt, 0, Round::Prompt(ends), pick)
+        .await?
+        .tokens[0];
     let cached = ws.cached_tokens() as usize;
     let mut generated = 1;
     if on_token(anchor as u32).is_break() || generated == max_tokens {
@@ -281,7 +363,9 @@ pub async fn generate(
         let Some(width) = width else {
             // A plain fire folds whatever the last round buffered.
             let fired = inferlet::monotonic_now_ns();
-            let truth = pass(&pipe, &ws, &[anchor], held, Round::Plain).await?;
+            let truth = pass(&pipe, &ws, &[anchor], held, Round::Plain, pick)
+                .await?
+                .tokens;
             if survivors == 0 {
                 Prices::keep(&mut prices.verify[1], inferlet::monotonic_now_ns() - fired);
             }
@@ -300,26 +384,43 @@ pub async fn generate(
         let mut input = vec![draft.mask_token as i32; block as usize];
         input[0] = anchor;
         let fired = inferlet::monotonic_now_ns();
-        let picks = pass(&pipe, &ws, &input, held, Round::Draft).await?;
+        let picks = pass(&pipe, &ws, &input, held, Round::Draft, None)
+            .await?
+            .tokens;
         Prices::keep(&mut prices.draft, inferlet::monotonic_now_ns() - fired);
         let proposals = &picks[from..from + width as usize - 1];
         let mut verify = vec![anchor];
         verify.extend_from_slice(proposals);
         let fired = inferlet::monotonic_now_ns();
-        let truth = pass(&pipe, &ws, &verify, held, Round::Verify(survivors)).await?;
+        let landed = pass(&pipe, &ws, &verify, held, Round::Verify(survivors), pick).await?;
         Prices::keep(
             &mut prices.verify[width as usize],
             inferlet::monotonic_now_ns() - fired,
         );
-        let kept = proposals
-            .iter()
-            .zip(&truth)
-            .take_while(|(p, t)| p == t)
-            .count();
+        let k = proposals.len();
+        let (kept, next) = if pick.is_some() {
+            let verdict = verify_point_rows(
+                &landed.chances[..k],
+                &landed.tokens[..k]
+                    .iter()
+                    .map(|&t| t as u32)
+                    .collect::<Vec<_>>(),
+                landed.tokens[k] as u32,
+                &mut uniform,
+            );
+            (verdict.kept, verdict.next as i32)
+        } else {
+            let kept = proposals
+                .iter()
+                .zip(&landed.tokens)
+                .take_while(|(p, t)| p == t)
+                .count();
+            (kept, landed.tokens[kept])
+        };
         yields.record(kept, width);
         rounds += 1;
         survivors = kept as u32 + 1;
-        anchor = truth[kept];
+        anchor = next;
         held += survivors;
         for &token in proposals[..kept].iter().chain(std::iter::once(&anchor)) {
             generated += 1;
