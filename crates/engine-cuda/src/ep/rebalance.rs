@@ -11,6 +11,7 @@
 //! reads the planes and the table where they were.
 
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 use engine::placement::{Move, Placement, SPARE, Window};
 
@@ -95,6 +96,7 @@ impl Rebalancer {
         devices: &[i32],
         stream: *mut core::ffi::c_void,
     ) -> Result<usize> {
+        let began = Instant::now();
         let mut loads = Vec::with_capacity(ranks.len());
         for (rank, &device) in ranks.iter_mut().zip(devices) {
             crate::device::ctx::bind_thread(device)?;
@@ -108,6 +110,7 @@ impl Rebalancer {
         let shape: Vec<(u32, u32, u32, u32)> = ranks[0].layers().collect();
         let window = (self.knob.window / self.knob.every.max(1)).max(1) as usize;
         let mut moved = Vec::new();
+        let mut bytes = 0;
         for (layer, experts, slots, stride) in shape {
             let balance = match self.layers.entry(layer) {
                 std::collections::btree_map::Entry::Occupied(at) => at.into_mut(),
@@ -139,7 +142,7 @@ impl Rebalancer {
                 continue;
             };
             let moves = balance.placement.moves(&next);
-            self.copy(&planes, slots, &moves, stream)?;
+            bytes += self.copy(&planes, slots, &moves, stream)?;
             moved.push((layer, next, moves.len()));
         }
         if moved.is_empty() {
@@ -158,19 +161,24 @@ impl Rebalancer {
             count += moves;
         }
         self.moved += count as u64;
-        eprintln!("engine-cuda: rebalanced the experts: {count} slot copies");
+        eprintln!(
+            "engine-cuda: rebalanced the experts: {count} slot copies, {} KiB, in {} us",
+            bytes >> 10,
+            began.elapsed().as_micros()
+        );
         Ok(count)
     }
 
     /// Enqueues `moves` in order: each copies one expert's planes, every
     /// rank's planes of the layer in `planes` (rank order), slot to slot.
+    /// The bytes they copy.
     fn copy(
         &mut self,
         planes: &[Vec<Plane>],
         slots: u32,
         moves: &[Move],
         stream: *mut core::ffi::c_void,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let expert_bytes: u64 = planes[0].iter().map(|p| p.slot_bytes).sum();
         if self
             .spare
@@ -199,7 +207,7 @@ impl Rebalancer {
                 offset += held.slot_bytes;
             }
         }
-        Ok(())
+        Ok(moves.len() as u64 * expert_bytes)
     }
 }
 
