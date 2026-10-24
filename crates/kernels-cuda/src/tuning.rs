@@ -49,6 +49,14 @@ pub struct MoeMxfp4MmaUntil(pub u32);
 #[decision(id = "kernel.moe.nvfp4_mma_until", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeNvfp4MmaUntil(pub u32);
 
+/// The most rows a router's product and its top-k run as one tcgen05 launch
+/// (`linear/moe/route_sm100.cu`, sm_100a: the K split over a cluster, its
+/// partials met in shared memory, the logits never stored) rather than the
+/// product and the router apart. 0 never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.gate_tc5_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeGateTc5Until(pub u32);
+
 /// The fewest routes of [`MoeNvfp4MmaUntil`]'s span.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.nvfp4_mma_from", constant(range(1..=65_536)), default = 1, tune = search)]
@@ -832,6 +840,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmRowsM>()
         .add::<GemmTc5SplitTickets>()
         .add::<MoeNvfp4MmaUntil>()
+        .add::<MoeGateTc5Until>()
         .add::<MoeNvfp4MmaFrom>()
         .add::<PrefillTc5>()
         .add::<PrefillWideSliding>()
@@ -968,6 +977,7 @@ tuning! {
     gemm_tc5_split_tickets: u32 = 0, get GemmTc5SplitTickets;
     nvfp4_mma_from: u32 = 1, get MoeNvfp4MmaFrom;
     nvfp4_mma_until: u32 = 0, get MoeNvfp4MmaUntil;
+    gate_tc5_until: u32 = 0, get MoeGateTc5Until;
     prefill_tc5: bool = false, on PrefillTc5;
     prefill_wide_sliding: bool = false, on PrefillWideSliding;
     decode_grouped_prefill_from: u32 = 0, get DecodeGroupedPrefillFrom;
