@@ -2,7 +2,7 @@
 # single-stream blocks over both; a Qwen3 4B text encoder whose three tapped
 # layers project into the context; and a VAE with a batch-normed latent.
 
-def linear(name, out, in_, banks, bias = True):
+def linear(out, in_, banks, bias = True):
     """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
     return struct(
         w = weight([out, in_], banks),
@@ -16,7 +16,7 @@ LAYERS_PER_BLOCK = 2
 
 TAPS3 = 9
 
-def vae_conv(name, c_out, c_in, taps):
+def vae_conv(c_out, c_in, taps):
     return struct(
         w = weight([c_out, c_in * taps], dtype.bf16).conv_taps_major(c_in, taps),
         bias = weight([c_out], dtype.f32),
@@ -25,33 +25,33 @@ def vae_conv(name, c_out, c_in, taps):
         taps = taps,
     )
 
-def group_norm(name, c):
+def group_norm(c):
     return struct(
         weight = weight([c], dtype.f32),
         bias = weight([c], dtype.f32),
     )
 
-def resnet(name, c_in, c_out):
+def resnet(c_in, c_out):
     return struct(
-        norm1 = group_norm(name + ".norm1", c_in),
-        conv1 = vae_conv(name + ".conv1", c_out, c_in, TAPS3),
-        norm2 = group_norm(name + ".norm2", c_out),
-        conv2 = vae_conv(name + ".conv2", c_out, c_out, TAPS3),
-        shortcut = vae_conv(name + ".shortcut", c_out, c_in, 1) if c_in != c_out else None,
+        norm1 = group_norm(c_in),
+        conv1 = vae_conv(c_out, c_in, TAPS3),
+        norm2 = group_norm(c_out),
+        conv2 = vae_conv(c_out, c_out, TAPS3),
+        shortcut = vae_conv(c_out, c_in, 1) if c_in != c_out else None,
     )
 
-def mid(name, c):
+def mid(c):
     return struct(
-        res0 = resnet(name + ".res0", c, c),
+        res0 = resnet(c, c),
         attn = struct(
-            norm = group_norm(name + ".attn.norm", c),
-            q = linear(name + ".attn.q", c, c, dtype.bf16),
-            k = linear(name + ".attn.k", c, c, dtype.bf16),
-            v = linear(name + ".attn.v", c, c, dtype.bf16),
-            out = linear(name + ".attn.out", c, c, dtype.bf16),
+            norm = group_norm(c),
+            q = linear(c, c, dtype.bf16),
+            k = linear(c, c, dtype.bf16),
+            v = linear(c, c, dtype.bf16),
+            out = linear(c, c, dtype.bf16),
             width = c,
         ),
-        res1 = resnet(name + ".res1", c, c),
+        res1 = resnet(c, c),
     )
 
 def flux_vae(channels, encoder_out, latent):
@@ -65,12 +65,12 @@ def flux_vae(channels, encoder_out, latent):
         name = "vae.dec.up{}".format(i)
         resnets = []
         for r in range(LAYERS_PER_BLOCK + 1):
-            resnets.append(resnet("{}.res{}".format(name, r), c_prev, c))
+            resnets.append(resnet(c_prev, c))
             c_prev = c
         last = i + 1 == len(BLOCKS)
         up.append(struct(
             resnets = resnets,
-            upsample = vae_conv(name + ".upsample", c, c, TAPS3) if not last else None,
+            upsample = vae_conv(c, c, TAPS3) if not last else None,
         ))
     down = []
     c_prev = BLOCKS[0]
@@ -78,28 +78,28 @@ def flux_vae(channels, encoder_out, latent):
         name = "vae.enc.down{}".format(i)
         resnets = []
         for r in range(LAYERS_PER_BLOCK):
-            resnets.append(resnet("{}.res{}".format(name, r), c_prev, c))
+            resnets.append(resnet(c_prev, c))
             c_prev = c
         last = i + 1 == len(BLOCKS)
         down.append(struct(
             resnets = resnets,
-            downsample = vae_conv(name + ".downsample", c, c, TAPS3) if not last else None,
+            downsample = vae_conv(c, c, TAPS3) if not last else None,
         ))
     return struct(
         latent = latent(),
         decoder = struct(
-            conv_in = vae_conv("vae.dec.conv_in", top, channels, TAPS3),
-            mid = mid("vae.dec.mid", top),
+            conv_in = vae_conv(top, channels, TAPS3),
+            mid = mid(top),
             up = up,
-            norm_out = group_norm("vae.dec.norm_out", BLOCKS[0]),
-            conv_out = vae_conv("vae.dec.conv_out", RGB, BLOCKS[0], TAPS3),
+            norm_out = group_norm(BLOCKS[0]),
+            conv_out = vae_conv(RGB, BLOCKS[0], TAPS3),
         ),
         encoder = struct(
-            conv_in = vae_conv("vae.enc.conv_in", BLOCKS[0], RGB, TAPS3),
+            conv_in = vae_conv(BLOCKS[0], RGB, TAPS3),
             down = down,
-            mid = mid("vae.enc.mid", top),
-            norm_out = group_norm("vae.enc.norm_out", top),
-            conv_out = vae_conv("vae.enc.conv_out", encoder_out, top, TAPS3),
+            mid = mid(top),
+            norm_out = group_norm(top),
+            conv_out = vae_conv(encoder_out, top, TAPS3),
         ),
     )
 
@@ -195,7 +195,7 @@ DIMS = {
     ),
 }
 
-def attn(prefix, d, banks):
+def attn(d, banks):
     dense = compute(banks)
     dim = d.dim
     return struct(
@@ -205,14 +205,14 @@ def attn(prefix, d, banks):
         out = weight([dim, dim], banks),
     )
 
-def swiglu(prefix, d, banks):
+def swiglu(d, banks):
     return struct(
         linear_in = weight([2 * d.inter, d.dim], banks).packed([d.inter, d.inter]),
         linear_out = weight([d.dim, d.inter], banks),
     )
 
-def side(prefix, d, banks):
-    return struct(attn = attn(prefix + ".attn", d, banks), ff = swiglu(prefix + ".ff", d, banks))
+def side(d, banks):
+    return struct(attn = attn(d, banks), ff = swiglu(d, banks))
 
 def single(prefix, d, banks):
     dense = compute(banks)
@@ -225,7 +225,7 @@ def single(prefix, d, banks):
         out_mlp = weight([dim, inter], banks),
     )
 
-def embedder(prefix, d, banks):
+def embedder(d, banks):
     return struct(
         linear_1 = weight([d.dim, T_FREQ_DIM], banks),
         linear_2 = weight([d.dim, d.dim], banks),
@@ -238,8 +238,8 @@ def vae_latent():
         bn_scale = bn("scale"),
         bn_rscale = bn("rscale"),
         bn_mean = bn("mean"),
-        quant_conv = vae_conv("vae.quant", VAE_CHANNELS, 2 * VAE_CHANNELS, 1),
-        post_quant_conv = vae_conv("vae.post_quant", VAE_CHANNELS, VAE_CHANNELS, 1),
+        quant_conv = vae_conv(VAE_CHANNELS, 2 * VAE_CHANNELS, 1),
+        post_quant_conv = vae_conv(VAE_CHANNELS, VAE_CHANNELS, 1),
     )
 
 def layout(id, deploy):
@@ -269,15 +269,15 @@ def layout(id, deploy):
         dit = struct(
             x_embed = weight([dim, IN_CHANNELS], banks),
             context_embed = weight([dim, d.context_in], banks) if te == None else None,
-            t_embed = embedder("dit.t_embed", d, banks),
-            g_embed = embedder("dit.g_embed", d, banks) if d.guidance_embeds else None,
+            t_embed = embedder(d, banks),
+            g_embed = embedder(d, banks) if d.guidance_embeds else None,
             mod_img = weight([DOUBLE_MOD_SLICES * dim, dim], banks),
             mod_txt = weight([DOUBLE_MOD_SLICES * dim, dim], banks),
             mod_single = weight([SINGLE_MOD_SLICES * dim, dim], banks),
             double = [
                 struct(
-                    img = side("dit.double.{}.img".format(i), d, banks),
-                    txt = side("dit.double.{}.txt".format(i), d, banks),
+                    img = side(d, banks),
+                    txt = side(d, banks),
                 )
                 for i in range(d.double_blocks)
             ],

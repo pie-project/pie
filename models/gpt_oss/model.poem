@@ -80,7 +80,6 @@ def layout(id, deploy):
     iw = inter(d.inter, deploy.tp)
 
     def layer(l):
-        n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s, cols: weight([cols], dense)
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(

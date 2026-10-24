@@ -7,7 +7,7 @@
 load("//lib/media.poem", "smart_resize")
 load("//lib/rope.poem", "yarn")
 
-def gated_attn(n, d, w, kv):
+def gated_attn(d, w, kv):
     """Gated attention over `d`'s heads, its projections at `w`, caching in `kv`."""
     dense = compute(w)
     hd = d.head_dim
@@ -26,7 +26,7 @@ def gated_attn(n, d, w, kv):
         kv = kv,
     )
 
-def gdn(n, d, proj, ba, dense, conv_state, delta_state):
+def gdn(d, proj, ba, dense, conv_state, delta_state):
     """A GDN mixer: its projections at `proj`, beta/alpha's at `ba`, its
     convolution and gate parameters at `dense`."""
     k_w = d.k_heads * d.k_dim
@@ -88,7 +88,6 @@ def media(id, deploy):
     return struct(image = struct(
         patch = PATCH, block = MERGE, mrope = True,
         prefix = "<|vision_start|>", placeholder = "<|image_pad|>", suffix = "<|vision_end|>",
-        frame = lambda h, w, budget: smart_resize(h, w, PATCH * MERGE, 65536, 16777216),
     ))
 
 def tower(size, out, dt):
@@ -394,8 +393,8 @@ def build(mix, kv, rope, d, hashes, draft, vision):
         n = lambda s: "layer.{}.{}".format(l, s)
         if l % d.attn_every == d.attn_every - 1:
             indexer = index(n, "index.{}".format(l))
-            return block(n, gated_attn(n, d, proj, "kv.{}".format(l)), indexer, None, mix.experts)
-        delta = gdn(n, d, proj, mix.gdn_ba, dense, "conv.{}".format(l), "delta.{}".format(l))
+            return block(n, gated_attn(d, proj, "kv.{}".format(l)), indexer, None, mix.experts)
+        delta = gdn(d, proj, mix.gdn_ba, dense, "conv.{}".format(l), "delta.{}".format(l))
         return block(n, None, None, delta, mix.experts)
 
     visual = tower(LARGE, hidden, dense) if vision else None
@@ -408,7 +407,7 @@ def build(mix, kv, rope, d, hashes, draft, vision):
             norm_hidden = weight([sh], dense),
             fc_embed = weight([hidden, hidden], dense),
             fc_hidden = weight([sh, hidden], dense),
-            block = block(n, gated_attn(n, d, proj, "kv.mtp"), None, None, proj),
+            block = block(n, gated_attn(d, proj, "kv.mtp"), None, None, proj),
             mixer = residual("mtp.mixer", False),
             eps = d.norm_eps,
             depth = DRAFT_DEPTH,

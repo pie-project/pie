@@ -2,7 +2,7 @@
 # embedder, caption refiner, blocks (each with an adaLN projection per
 # modality) and output heads; and the text encoder the full model carries.
 
-def linear(name, out, in_, banks, bias = True):
+def linear(out, in_, banks, bias = True):
     """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
     return struct(
         w = weight([out, in_], banks),
@@ -112,7 +112,7 @@ DIMS = {
     ),
 }
 
-def attn(prefix, d, banks):
+def attn(d, banks):
     dense = compute(banks)
     inner = d.heads * d.head_dim
     return struct(
@@ -135,10 +135,10 @@ def block(prefix, d, banks, modulated):
     return struct(
         norm1 = weight([d.dim], dense),
         norm2 = weight([d.dim], dense),
-        attn = attn(prefix + ".attn", d, banks),
+        attn = attn(d, banks),
         mlp = mlp(prefix + ".mlp", d, banks),
         adaln = [
-            linear("{}.adaln.{}".format(prefix, m), ADALN_SLICES * d.dim, d.t_dim, banks)
+            linear(ADALN_SLICES * d.dim, d.t_dim, banks)
             for m in range(MODALITIES)
         ] if modulated else None,
     )
@@ -164,18 +164,18 @@ def layout(id, deploy):
         video_features = VIDEO_FEATURES,
         audio_channels = AUDIO_CHANNELS,
         dit = struct(
-            video_patch = linear("dit.video_patch", dim, VIDEO_FEATURES, banks),
-            audio_patch = linear("dit.audio_patch", dim, AUDIO_CHANNELS, banks),
-            condition = linear("dit.condition", dim, d.text_dim, banks),
-            t_in = linear("dit.t_in", d.t_hidden, d.t_freq, banks),
-            t_out = linear("dit.t_out", d.t_dim, d.t_hidden, banks),
+            video_patch = linear(dim, VIDEO_FEATURES, banks),
+            audio_patch = linear(dim, AUDIO_CHANNELS, banks),
+            condition = linear(dim, d.text_dim, banks),
+            t_in = linear(d.t_hidden, d.t_freq, banks),
+            t_out = linear(d.t_dim, d.t_hidden, banks),
             refine = [block("dit.refine.{}".format(i), d, banks, False) for i in range(d.refiners)],
             refine_norm = weight([dim], dense),
             blocks = [block("dit.block.{}".format(i), d, banks, True) for i in range(d.blocks)],
             final_norm = weight([dim], dense),
-            final_adaln = linear("dit.final_adaln", FINAL_SLICES * dim, d.t_dim, banks),
-            video_out = linear("dit.video_out", VIDEO_FEATURES, dim, banks),
-            audio_out = linear("dit.audio_out", AUDIO_CHANNELS, dim, banks),
+            final_adaln = linear(FINAL_SLICES * dim, d.t_dim, banks),
+            video_out = linear(VIDEO_FEATURES, dim, banks),
+            audio_out = linear(AUDIO_CHANNELS, dim, banks),
         ),
         te = encoder(TE, TE_LAYERS, banks, sharded = True) if id == "minimax-h3-fl2va" else None,
     )

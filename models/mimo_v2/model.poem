@@ -74,7 +74,6 @@ def layout(id, deploy):
     q_w = d.q_heads * PADDED
 
     def layer(l):
-        n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s: weight([hidden], dense)
         reading = FULL if l in d.full else WINDOWED
         kv_heads = d.full_kv_heads if reading == FULL else d.window_kv_heads

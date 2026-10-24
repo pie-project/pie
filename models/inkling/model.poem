@@ -71,7 +71,6 @@ def layout(id, deploy):
     kw = d.conv_width
 
     def layer(l):
-        n = lambda s: "layer.{}.{}".format(l, s)
         vec = lambda s, length: weight([length], dense)
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         if (l + 1) % d.global_every == 0:

@@ -202,7 +202,6 @@ def nano_layout(id, deploy):
     at = lambda l: dtype.bf16 if kept(l) else proj
 
     def layer(l):
-        n = lambda s: "layer.{}.{}".format(l, s)
         kind = pattern[l]
         mamba = None
         attn = None

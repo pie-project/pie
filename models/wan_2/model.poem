@@ -1,14 +1,14 @@
 # The weights of Wan 2.2: a diffusion transformer over video latents with
 # cross-attention to text, its UMT5-XXL text encoder, and its causal 3D VAE.
 
-def linear(name, out, in_, banks, bias = True):
+def linear(out, in_, banks, bias = True):
     """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
     return struct(
         w = weight([out, in_], banks),
         bias = weight([out], compute(banks)) if bias else None,
     )
 
-def packed_linear(name, seams, in_, banks):
+def packed_linear(seams, in_, banks):
     """A biased projection whose output is the `seams`-wide pieces end to end."""
     out = 0
     for s in seams:
@@ -21,8 +21,8 @@ def packed_linear(name, seams, in_, banks):
 def embedder(prefix, in_, dim, banks):
     """A two-layer timestep (or caption) embedder from `in_` to `dim`."""
     return struct(
-        linear_1 = linear(prefix + ".1", dim, in_, banks),
-        linear_2 = linear(prefix + ".2", dim, dim, banks),
+        linear_1 = linear(dim, in_, banks),
+        linear_2 = linear(dim, dim, banks),
     )
 
 PATCH_T = 1
@@ -80,31 +80,30 @@ DIMS = {
     "wan22-mini-nano": dims(dim = 48, heads = 2, head_dim = 24, ffn = 128, layers = 2, channels = 16, freq_dim = 32),
 }
 
-def block(prefix, d, banks):
+def block(d, banks):
     dense = compute(banks)
     dim = d.dim
-    n = lambda s: prefix + "." + s
     gain = lambda s: weight([dim], dense)
     return struct(
         table = weight([MOD_SLICES * dim], dtype.f32),
         self_attn = struct(
-            qkv = packed_linear(n("self.qkv"), [dim, dim, dim], dim, banks),
+            qkv = packed_linear([dim, dim, dim], dim, banks),
             norm_q = gain("self.norm_q"),
             norm_k = gain("self.norm_k"),
-            out = linear(n("self.out"), dim, dim, banks),
+            out = linear(dim, dim, banks),
         ),
         norm2 = gain("norm2"),
         norm2_bias = gain("norm2.bias"),
         cross = struct(
-            q = linear(n("cross.q"), dim, dim, banks),
-            kv = packed_linear(n("cross.kv"), [dim, dim], dim, banks),
+            q = linear(dim, dim, banks),
+            kv = packed_linear([dim, dim], dim, banks),
             norm_q = gain("cross.norm_q"),
             norm_k = gain("cross.norm_k"),
-            out = linear(n("cross.out"), dim, dim, banks),
+            out = linear(dim, dim, banks),
         ),
         ffn = struct(
-            up = linear(n("ffn.up"), d.ffn, dim, banks),
-            down = linear(n("ffn.down"), dim, d.ffn, banks),
+            up = linear(d.ffn, dim, banks),
+            down = linear(dim, d.ffn, banks),
         ),
     )
 
@@ -113,7 +112,6 @@ def text_encoder(banks):
     inner = TE_HEADS * TE_HEAD_DIM
 
     def layer(l):
-        n = lambda s: "te.layer.{}.{}".format(l, s)
         return struct(
             attn_norm = weight([TE_HIDDEN], dense),
             q = weight([inner, TE_HIDDEN], banks),
@@ -160,11 +158,11 @@ def resnet(prefix, c_in, c_out, plane, banks):
         shortcut = conv(prefix + ".shortcut", c_out, c_in, [1, 1, 1], plane, banks) if c_in != c_out else None,
     )
 
-def mid_attention(prefix, top, banks):
+def mid_attention(top, banks):
     return struct(
         norm = weight([top], compute(banks)),
-        qkv = linear(prefix + ".qkv", 3 * top, top, banks),
-        proj = linear(prefix + ".proj", top, top, banks),
+        qkv = linear(3 * top, top, banks),
+        proj = linear(top, top, banks),
     )
 
 def vae_encoder(banks):
@@ -205,7 +203,7 @@ def vae_encoder(banks):
         conv_in = conv("vae.enc.conv_in", dims[0], VAE_PIX_CHANNELS, [3, 3, 3], 64 * p0, banks),
         down = down,
         mid_res0 = resnet("vae.enc.mid.res.0", top, top, plane, banks),
-        mid_attn = mid_attention("vae.enc.mid.attn", top, banks),
+        mid_attn = mid_attention(top, banks),
         mid_res1 = resnet("vae.enc.mid.res.1", top, top, plane, banks),
         norm_out = weight([top], dense),
         conv_out = conv("vae.enc.conv_out", 2 * VAE_Z, top, [3, 3, 3], plane, banks),
@@ -257,7 +255,7 @@ def vae(banks):
         post_quant = conv("vae.post_quant", VAE_Z, VAE_Z, [1, 1, 1], p0, banks),
         conv_in = conv("vae.conv_in", top, VAE_Z, [3, 3, 3], p0, banks),
         mid_res0 = resnet("vae.mid.res.0", top, top, p0, banks),
-        mid_attn = mid_attention("vae.mid.attn", top, banks),
+        mid_attn = mid_attention(top, banks),
         mid_res1 = resnet("vae.mid.res.1", top, top, p0, banks),
         up = up,
         norm_out = weight([last], dense),
@@ -278,14 +276,14 @@ def layout(id, deploy):
         dims = d,
         rope_axes = ROPE_AXES,
         dit = struct(
-            patch_embed = linear("dit.patch_embed", dim, d.patch, banks),
+            patch_embed = linear(dim, d.patch, banks),
             text_embed = embedder("dit.text_embed", d.text_dim, dim, banks),
             time_embed = embedder("dit.time_embed", d.freq_dim, dim, banks),
-            time_proj = linear("dit.time_proj", MOD_SLICES * dim, dim, banks),
-            head_proj = linear("dit.head_proj", HEAD_SLICES * dim, dim, banks),
-            blocks = [block("dit.block.{}".format(i), d, banks) for i in range(d.layers)],
+            time_proj = linear(MOD_SLICES * dim, dim, banks),
+            head_proj = linear(HEAD_SLICES * dim, dim, banks),
+            blocks = [block(d, banks) for i in range(d.layers)],
             head_table = weight([HEAD_SLICES * dim], dtype.f32),
-            proj_out = linear("dit.proj_out", d.patch, dim, banks),
+            proj_out = linear(d.patch, dim, banks),
         ),
         te = text_encoder(banks) if whole else None,
         vae = vae(dtype.bf16) if whole else None,

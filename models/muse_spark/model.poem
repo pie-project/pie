@@ -54,7 +54,6 @@ def layout(id, deploy):
     iw = d.inter
 
     def layer(l):
-        n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s, dim: weight([dim], dense)
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         bank = w if l in d.dense_experts else routed

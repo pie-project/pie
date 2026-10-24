@@ -79,7 +79,6 @@ def media(id, deploy):
     return struct(image = struct(
         patch = PATCH, block = POOL, mrope = False,
         prefix = "<|image>", placeholder = "<|image|>", suffix = "<image|>",
-        frame = lambda h, w, budget: budget_resize(h, w, PATCH, POOL, SOFT_TOKENS if budget == "still" else VIDEO_SOFT_TOKENS),
     ))
 
 WIDE_TOWER = vision_tower(depth = 27, hidden = 1152, heads = 16, inter = 4304, clipped = False, standardize = True)
@@ -154,7 +153,6 @@ def layout(id, deploy):
                   rotary_dim = d.global_rotary_dim, theta = d.theta_global)
 
     def layer(l):
-        n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s, length: weight([length], dense)
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         reading = GLOBAL if full_at(l) else SLIDING
@@ -224,7 +222,6 @@ def layout(id, deploy):
         th = t.hidden
         ti = t.inter
         head_dim = t.hidden // t.heads
-        tn = lambda s: "vision." + s
         bank = lambda s, dims: weight(dims, dense)
         vec1 = lambda s, length: weight([length], dense)
 
@@ -283,7 +280,6 @@ def layout(id, deploy):
         q_w = d.q_heads * hd
         kv_w = glob.kv_heads * hd
         iw = d.inter
-        an = lambda s: "aux." + s
         anorm = lambda s, length: weight([length], dense)
         draft = struct(
             fc_embed = weight([hidden, hidden], w),
@@ -325,7 +321,6 @@ def layout(id, deploy):
         iw = ASSISTANT_INTER
 
         def assistant_layer(l, reading):
-            n = lambda s: "aux.layer.{}.{}".format(l, s)
             norm = lambda s, length: weight([length], dense)
             hd = sliding.head_dim if reading == SLIDING else glob.head_dim
             q_w = d.q_heads * hd

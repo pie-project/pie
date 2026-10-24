@@ -80,7 +80,7 @@ def indexer(n, d, dense, keys, proj = None):
         keys = keys,
     )
 
-def mlp(n, d, inter, proj, prefix = ""):
+def mlp(d, inter, proj):
     """A clamped SwiGLU-OAI MLP `inter` wide, its gate and up packed."""
     return struct(
         gate_up = weight([2 * inter, d.hidden], proj).packed([inter, inter]),
@@ -98,7 +98,7 @@ def routed(n, d, mix, dense):
         bias = weight([d.experts], dtype.f32),
         gate_up = weight([d.experts, 2 * d.inter, d.hidden], mix.experts).bank([d.inter, d.inter]),
         down = weight([d.experts, d.hidden, d.inter], mix.experts).rows(),
-        shared = mlp(n, d, d.shared_inter, mix.proj, prefix = "shared_"),
+        shared = mlp(d, d.shared_inter, mix.proj),
         experts = d.experts,
         top_k = d.top_k,
         inter = d.inter,
@@ -123,7 +123,7 @@ def layout(id, deploy):
             indexer = indexer(n, d, dense, "index.{}".format(l), mix.index) if sparse else None,
             mlp_norm = weight([d.hidden], dense),
             mlp = routed(n, d, mix, dense) if sparse else None,
-            dense = None if sparse else mlp(n, d, d.dense_inter, mix.proj),
+            dense = None if sparse else mlp(d, d.dense_inter, mix.proj),
         )
 
     return struct(

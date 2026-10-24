@@ -181,8 +181,7 @@ def layout(id, deploy):
             indexer = indexer(n, keys) if keys != None else None,
         )
 
-    def routed_at(prefix, banks_dtype):
-        n = lambda s: "{}.{}".format(prefix, s)
+    def routed_at(banks_dtype):
         iw = d.moe_inter
         sw = d.shared_inter
         return struct(
@@ -204,7 +203,6 @@ def layout(id, deploy):
         )
 
     def layer(l):
-        n = lambda s: "layer.{}.{}".format(l, s)
         norm = lambda s, width: weight([width], w)
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         keys = "index.{}".format(l) if ranks(d, l) else None
@@ -218,7 +216,7 @@ def layout(id, deploy):
                 inter = iw,
             )
         else:
-            mlp = routed_at("layer.{}".format(l), experts)
+            mlp = routed_at(experts)
         return struct(
             attn = attn,
             attn_norm = norm("attn_norm", hidden),
@@ -240,7 +238,7 @@ def layout(id, deploy):
             attn_norm = weight([hidden], w),
             attn = mla_at("mtp", "kv.mtp", "index.mtp"),
             mlp_norm = weight([hidden], w),
-            mlp = routed_at("mtp", draft),
+            mlp = routed_at(draft),
             norm = weight([hidden], w),
             norm_eps = d.norm_eps,
         )

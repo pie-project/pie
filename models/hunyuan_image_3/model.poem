@@ -2,7 +2,7 @@
 # rope, routed and shared experts), the timestep embedders, and the U-Net
 # blocks that take a latent clip into the trunk and its rows back out.
 
-def linear(name, out, in_, banks, bias = True):
+def linear(out, in_, banks, bias = True):
     """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
     return struct(
         w = weight([out, in_], banks),
@@ -48,7 +48,7 @@ DIMS = {
     ),
 }
 
-def conv(name, c_out, c_in, k, banks):
+def conv(c_out, c_in, k, banks):
     taps = k[0] * k[1] * k[2]
     return struct(
         w = weight([c_out, c_in * taps], banks).conv_taps_major(c_in, taps),
@@ -56,27 +56,26 @@ def conv(name, c_out, c_in, k, banks):
         k = k,
     )
 
-def group_norm(name, c):
+def group_norm(c):
     return struct(
         weight = weight([c], dtype.f32),
         bias = weight([c], dtype.f32),
     )
 
-def resblock(prefix, c_in, c_out, emb, banks):
-    n = lambda s: prefix + "." + s
+def resblock(c_in, c_out, emb, banks):
     return struct(
-        norm_in = group_norm(n("norm_in"), c_in),
-        conv_in = conv(n("conv_in"), c_out, c_in, CONV3, banks),
-        emb = linear(n("emb"), 2 * c_out, emb, banks),
-        norm_out = group_norm(n("norm_out"), c_out),
-        conv_out = conv(n("conv_out"), c_out, c_out, CONV3, banks),
-        skip = conv(n("skip"), c_out, c_in, CONV1, banks) if c_in != c_out else None,
+        norm_in = group_norm(c_in),
+        conv_in = conv(c_out, c_in, CONV3, banks),
+        emb = linear(2 * c_out, emb, banks),
+        norm_out = group_norm(c_out),
+        conv_out = conv(c_out, c_out, CONV3, banks),
+        skip = conv(c_out, c_in, CONV1, banks) if c_in != c_out else None,
     )
 
-def embedder(prefix, hidden, out, banks):
+def embedder(hidden, out, banks):
     return struct(
-        mlp_in = linear(prefix + ".in", hidden, T_FREQ_DIM, banks),
-        mlp_out = linear(prefix + ".out", out, hidden, banks),
+        mlp_in = linear(hidden, T_FREQ_DIM, banks),
+        mlp_out = linear(out, hidden, banks),
     )
 
 def layout(id, deploy):
@@ -101,7 +100,6 @@ def layout(id, deploy):
     sw = d.shared_inter
 
     def layer(l):
-        n = lambda s: "layer.{}.{}".format(l, s)
         return struct(
             attn_norm = weight([hidden], dense),
             qkv = weight([q_w + 2 * kv_w, hidden], banks).packed([q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
@@ -131,17 +129,17 @@ def layout(id, deploy):
         head = weight([d.vocab, hidden], banks),
         final_norm = weight([hidden], dense),
         layers = [layer(l) for l in range(d.layers)],
-        timestep_emb = embedder("timestep_emb", hidden, 2 * hidden, banks),
-        time_embed = embedder("time_embed", hidden, hidden, banks),
-        time_embed_2 = embedder("time_embed_2", hidden, hidden, banks),
+        timestep_emb = embedder(hidden, 2 * hidden, banks),
+        time_embed = embedder(hidden, hidden, banks),
+        time_embed_2 = embedder(hidden, hidden, banks),
         patch_embed = struct(
-            conv_in = conv("patch_embed.conv", hw, LATENT_CHANNELS, CONV3, banks),
-            res = resblock("patch_embed.res", hw, hidden, hidden, banks),
+            conv_in = conv(hw, LATENT_CHANNELS, CONV3, banks),
+            res = resblock(hw, hidden, hidden, banks),
         ),
         final_layer = struct(
-            res = resblock("final_layer.res", hidden, hw, hidden, banks),
-            norm_out = group_norm("final_layer.norm_out", hw),
-            conv_out = conv("final_layer.conv", LATENT_CHANNELS, hw, CONV3, banks),
+            res = resblock(hidden, hw, hidden, banks),
+            norm_out = group_norm(hw),
+            conv_out = conv(LATENT_CHANNELS, hw, CONV3, banks),
         ),
         ones = weight([2 * hidden, 1], banks),
     )

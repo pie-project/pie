@@ -11,7 +11,7 @@ load("//lib/dflash/model.poem", dflash_declare = "declare", dflash_head = "head"
 
 # The Bonsai online-Hadamard rotation: a sign diagonal per rotated input width.
 
-def gated_attn(n, d, w, kv):
+def gated_attn(d, w, kv):
     """Gated attention over `d`'s heads, its projections at `w`, caching in `kv`."""
     dense = compute(w)
     hd = d.head_dim
@@ -30,7 +30,7 @@ def gated_attn(n, d, w, kv):
         kv = kv,
     )
 
-def gdn(n, d, proj, ba, dense, conv_state, delta_state):
+def gdn(d, proj, ba, dense, conv_state, delta_state):
     """A GDN mixer: its projections at `proj`, beta/alpha's at `ba`, its
     convolution and gate parameters at `dense`."""
     k_w = d.k_heads * d.k_dim
@@ -96,7 +96,6 @@ def media(id, deploy):
     return struct(image = struct(
         patch = PATCH, block = MERGE, mrope = True,
         prefix = "<|vision_start|>", placeholder = "<|image_pad|>", suffix = "<|vision_end|>",
-        frame = lambda h, w, budget: smart_resize(h, w, PATCH * MERGE, 65536, 16777216),
     ))
 
 def tower(size, out, dt):
@@ -412,13 +411,13 @@ def layout(id, deploy):
         attn = None
         delta = None
         if attn_at(l):
-            attn = gated_attn(n, d, proj, "kv.{}".format(l))
+            attn = gated_attn(d, proj, "kv.{}".format(l))
         else:
             # Ternary-Bonsai stores the GDN beta/alpha projections in bf16,
             # not ternary: they are served as stored.
             # The FP8 release keeps them unquantized, as does its router.
             ba = dense if bonsai or fp8 or mix != None else proj
-            delta = gdn(n, d, proj, ba, dense, "conv.{}".format(l), "delta.{}".format(l))
+            delta = gdn(d, proj, ba, dense, "conv.{}".format(l), "delta.{}".format(l))
         if d.mlp.routed:
             mlp = routed(n, hidden, d.mlp, experts, mlp_at, gate)
         else:
@@ -442,7 +441,6 @@ def layout(id, deploy):
     if d.draft != None and d.draft not in blocks:
         inter = d.mlp.inter
         p = "mtp" if d.draft == "mtp" else "aux"
-        pn = lambda s: "{}.{}".format(p, s)
         mtp = struct(
             prefix = p,
             pre_fc = struct(
@@ -454,7 +452,7 @@ def layout(id, deploy):
             fc_hidden = weight([hidden, hidden], w),
             mixer_norm = weight([hidden], dense),
             mixer_norm_eps = d.norm_eps,
-            attn = gated_attn(pn, d, w, "kv.mtp"),
+            attn = gated_attn(d, w, "kv.mtp"),
             mlp_norm = weight([hidden], dense),
             mlp_norm_eps = d.norm_eps,
             mlp = dense_mlp(w, hidden, inter, p),

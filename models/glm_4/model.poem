@@ -73,7 +73,7 @@ def layout(id, deploy):
     q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
     heads = [d.q_heads, d.kv_heads, d.kv_heads]
 
-    def mlp(n, l):
+    def mlp(l):
         if l < d.dense_layers:
             iw = d.dense_inter
             # The Air's dense MLP is 10944 wide, not a whole number of 128s:
@@ -104,7 +104,6 @@ def layout(id, deploy):
         )
 
     def layer(l):
-        n = lambda s: "layer.{}.{}".format(l, s)
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
             attn_norm = weight([hidden], dense),
@@ -114,7 +113,7 @@ def layout(id, deploy):
             q_norm = weight([hd], dense) if d.qk_norm else None,
             k_norm = weight([hd], dense) if d.qk_norm else None,
             mlp_norm = weight([hidden], dense),
-            mlp = mlp(n, l),
+            mlp = mlp(l),
             kv = "kv.{}".format(l),
             lora_a = lora_a,
             lora_b = lora_b,

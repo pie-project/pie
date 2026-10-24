@@ -45,7 +45,6 @@ def layout(id, deploy):
     q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
 
     def layer(l):
-        n = lambda s: "layer.{}.{}".format(l, s)
         return struct(
             attn_norm = weight([hidden], dense),
             qkv = weight([q_width + 2 * kv_width, hidden], proj).packed([q_width, kv_width, kv_width], heads = [d.q_heads, d.kv_heads, d.kv_heads]),

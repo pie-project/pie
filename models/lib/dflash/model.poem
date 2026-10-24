@@ -53,7 +53,6 @@ def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None):
     stored as `w` (its blocks' projections as `blocks_w`, when given) and its
     vectors as `dense`."""
     bw = blocks_w if blocks_w != None else w
-    n = lambda s: "{}.{}".format(prefix, s)
     dq, dkv, hd = head.q_heads, head.kv_heads, head.head_dim
     inter = head.inter
 
@@ -71,7 +70,6 @@ def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None):
         )
 
     def block(l, window):
-        b = lambda s: "{}.layers.{}.{}".format(prefix, l, s)
         bias = lambda s, width: weight([width], dense) if head.attn_bias else None
         return struct(
             mixer_norm = weight([hidden], dense),
