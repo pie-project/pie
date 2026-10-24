@@ -225,7 +225,8 @@ def layout(id, deploy):
             gate_up = weight([m.experts, 2 * iw, hidden], banks_dtype).bank([iw, iw]),
             down = weight([m.experts, hidden, iw], banks_dtype).rows(),
             shared = struct(
-                gate_up = weight([2 * sw, hidden], proj).packed([sw, sw]),
+                gate = weight([sw, hidden], proj).columns(),
+                up = weight([sw, hidden], proj).columns(),
                 down = weight([hidden, sw], proj).rows(),
                 inter = sw,
             ),
@@ -246,7 +247,8 @@ def layout(id, deploy):
             iw = d.dense_inter
             mlp = struct(
                 routed = False,
-                gate_up = weight([2 * iw, hidden], proj).packed([iw, iw]),
+                gate = weight([iw, hidden], proj).columns(),
+                up = weight([iw, hidden], proj).columns(),
                 down = weight([hidden, iw], proj).rows(),
                 inter = iw,
             )
@@ -355,12 +357,8 @@ def huggingface(m, reads):
         if f.routed:
             moe(reads, f, at)
         else:
-            read_weight(
-                reads,
-                f.gate_up,
-                [at("mlp.gate_proj.weight"), at("mlp.up_proj.weight")],
-                quantized = "read",
-            )
+            read_weight(reads, f.gate, [at("mlp.gate_proj.weight")], quantized = "read")
+            read_weight(reads, f.up, [at("mlp.up_proj.weight")], quantized = "read")
             read_weight(reads, f.down, [at("mlp.down_proj.weight")], quantized = "read")
 
     mtp = m.mtp
@@ -417,10 +415,8 @@ def moe(reads, f, at):
             stacked_bank(reads, w, name)
         else:
             reads.read(w, name)
-    read_weight(reads, f.shared.gate_up, [
-        at("mlp.shared_experts.gate_proj.weight"),
-        at("mlp.shared_experts.up_proj.weight"),
-    ], quantized = "read")
+    read_weight(reads, f.shared.gate, [at("mlp.shared_experts.gate_proj.weight")], quantized = "read")
+    read_weight(reads, f.shared.up, [at("mlp.shared_experts.up_proj.weight")], quantized = "read")
     read_weight(reads, f.shared.down, [at("mlp.shared_experts.down_proj.weight")], quantized = "read")
 
 # The forward of Hy4-preview: sublayers gated out of and folded back into
@@ -537,10 +533,8 @@ def index_select(x, q_a, inputs, positions, ix):
 
 def mlp(x, f):
     if not f.routed:
-        return ops.linear.matmul(
-            ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter),
-            f.down,
-        )
+        gate, up = ops.linear.matmul(x, f.gate), ops.linear.matmul(x, f.up)
+        return ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), f.down)
     routes, weights = ops.linear.moe_route(
         ops.linear.matmul(x, f.router),
         f.experts,
@@ -552,7 +546,8 @@ def mlp(x, f):
     act = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k), gating.swiglu(), f.inter, limit = f.limit)
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
     s = f.shared
-    act = ops.linear.glu(ops.linear.matmul(x, s.gate_up), gating.swiglu(), s.inter)
+    gate, up = ops.linear.matmul(x, s.gate), ops.linear.matmul(x, s.up)
+    act = ops.linear.glu(gate, gating.swiglu(), up = up)
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
 
 def caches(m, c):
