@@ -21,7 +21,8 @@
 //!
 //! A packed product's segments are where the ops that read its share take
 //! it apart, and a segment's heads are what an op reading it `head_dim`
-//! wide, or packing heads it counts, says it holds.
+//! wide, or packing heads it counts, says it holds; a weight an op reads one
+//! row a group of (a norm over groups of heads) holds the op's groups.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -76,6 +77,13 @@ const PER_HEAD: [(&str, &str); 25] = [
     ("ssm.mamba2_chunked", "dt_bias"),
     ("ssm.mamba2_chunked", "d"),
     ("ssm.mamba2_chunked", "norm"),
+];
+
+/// The weights an op reads one row a group of its shares' heads, and the
+/// field that counts its groups: a rank holds whole groups of them.
+const GROUPED: [(&str, &str, &str); 2] = [
+    ("ssm.mamba2", "norm", "groups"),
+    ("ssm.mamba2_chunked", "norm", "groups"),
 ];
 
 /// Each param's cut, inferred from `trace`'s dataflow whatever the model
@@ -255,6 +263,8 @@ struct Walk<'r, 't> {
     rejected: BTreeSet<usize>,
     /// Group indices, which follow the row they group.
     groups: BTreeSet<ValueId>,
+    /// The groups a weight read one row a group holds.
+    grouped: BTreeMap<usize, u64>,
 }
 
 impl<'r, 't> Walk<'r, 't> {
@@ -274,6 +284,7 @@ impl<'r, 't> Walk<'r, 't> {
             heads: BTreeMap::new(),
             rejected: BTreeSet::new(),
             groups: BTreeSet::new(),
+            grouped: BTreeMap::new(),
         }
     }
 
@@ -649,6 +660,16 @@ impl<'r, 't> Walk<'r, 't> {
                     .map_or("", |(n, _)| *n);
                 if PER_HEAD.contains(&(op.name(), name)) {
                     self.beside(p, like, &Held::Split(all.clone()), true);
+                    let count = GROUPED
+                        .iter()
+                        .find(|(o, w, _)| *o == op.name() && *w == name)
+                        .and_then(|(_, _, field)| match tree::field(t, field) {
+                            Some(Tree::Int(n)) => u64::try_from(*n).ok().filter(|n| *n > 0),
+                            _ => None,
+                        });
+                    if let Some(groups) = count {
+                        self.grouped.insert(p, groups);
+                    }
                 } else {
                     self.decide(p, Cut::Whole);
                 }
@@ -870,10 +891,13 @@ impl<'r, 't> Walk<'r, 't> {
             }),
             Cut::Beside(axis, origins) => {
                 let extent = *shape.get(*axis as usize)?;
-                let (segments, heads) = match origins.iter().collect::<Vec<_>>()[..] {
+                let (segments, mut heads) = match origins.iter().collect::<Vec<_>>()[..] {
                     [o] if o.hi - o.lo == extent => self.segments(o.param, o.lo, o.hi),
                     _ => (vec![extent], Vec::new()),
                 };
+                if let (Some(groups), [_]) = (self.grouped.get(&p), &segments[..]) {
+                    heads = vec![*groups];
+                }
                 Some(Shard::Cut {
                     axis: *axis,
                     segments,
