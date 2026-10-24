@@ -1,3 +1,4 @@
+use engine_cuda::serve::diag::SyncGuard;
 use engine_cuda::{Diagnostics, Knobs};
 
 /// Whether a boot's diagnostics turned a word on.
@@ -23,6 +24,9 @@ const WORDS: &[(&str, Reads)] = &[
     }),
     ("fuse-chains=off", |d| !d.fuse_chains),
     ("gumbel-direct=off", |d| !d.gumbel_direct),
+    ("sync-guard=panic", |d| {
+        d.sync_guard == Some(SyncGuard::Panic)
+    }),
 ];
 
 #[test]
