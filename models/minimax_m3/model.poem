@@ -33,6 +33,8 @@ DIMS = {
 
 MX8 = dtype.mxfp8a8g32
 
+NV4 = dtype.nvfp4a4
+
 def mix_of(w):
     """Where each kind of weight lands at deployment weights `w`: whole at
     bf16; at u4g64 the routed experts at four bits and the rest of the
@@ -43,6 +45,9 @@ def mix_of(w):
         return struct(embed = dtype.u8g64, head = dtype.u8g64, proj = dtype.u8g64, experts = dtype.u4g64, index = None)
     if w == MX8:
         return struct(embed = dtype.bf16, head = dtype.bf16, proj = MX8, experts = MX8, index = MX8)
+    if w == [MX8, NV4]:
+        # MiniMax-M3.1-Flash as it ships: the MXFP8 release's projections, its experts NVFP4 against NVFP4 activations
+        return struct(embed = dtype.bf16, head = dtype.bf16, proj = MX8, experts = NV4, index = MX8)
     return struct(embed = w, head = w, proj = w, experts = w, index = None)
 
 def attention(n, d, proj, dense, kv):
@@ -108,10 +113,11 @@ def routed(n, d, mix, dense):
     )
 
 def layout(id, deploy):
-    if len(deploy.weights) != 1 or deploy.weights[0] not in [dtype.bf16, dtype.u4g64, MX8] or deploy.parts or deploy.drafter != None:
+    mixed = deploy.weights == [MX8, NV4]
+    if not mixed and (len(deploy.weights) != 1 or deploy.weights[0] not in [dtype.bf16, dtype.u4g64, MX8]) or deploy.parts or deploy.drafter != None:
         fail("{} does not ship {}".format(id, deploy))
     d = DIMS[id]
-    mix = mix_of(deploy.weights[0])
+    mix = mix_of(deploy.weights if mixed else deploy.weights[0])
     dense = compute(mix.proj)
 
     def layer(l):

@@ -259,6 +259,13 @@ pub fn embed_concat(
             format!("{total} elements do not fit a 32-bit launch extent"),
         )
     })?;
+    // a table the ranks split by row: this rank holds its band, the others' rows land zero
+    let held = table.rows.min(vocab);
+    let base = if held < vocab {
+        comm_rank(ctx, OP)?.saturating_mul(held)
+    } else {
+        0
+    };
     ctx.fire(
         OP,
         Fire::at(kernel(FILE, &format!("::pie::gather::embed_concat<{t}>")))
@@ -271,6 +278,8 @@ pub fn embed_concat(
             stated(OP, heads)?.arg(),
             stated(OP, width)?.arg(),
             stated(OP, vocab)?.arg(),
+            stated(OP, held)?.arg(),
+            stated(OP, base)?.arg(),
             ctx.stage(),
         ],
     )

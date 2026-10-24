@@ -31,13 +31,15 @@ __device__ __forceinline__ bool concat_at(int rows, int heads, int width, const 
 
 template <class T>
 __global__ void embed_concat(const i32* __restrict__ ids, const T* __restrict__ table, T* __restrict__ y,
-                             int rows, int heads, int width, int vocab, const u32* __restrict__ win) {
+                             int rows, int heads, int width, int vocab, int held, int base, const u32* __restrict__ win) {
     ConcatAt at;
     if (!concat_at(rows, heads, width, win, at)) return;
     const long long slot = at.row * heads + at.head;
     const int id = ids[slot];
+    // a tensor-parallel rank holds rows [base, base + held) of the table, zeros elsewhere
+    const int local = id - base;
     y[slot * width + at.w] =
-        id < 0 || id >= vocab ? from_f32<T>(0.f) : table[static_cast<long long>(id) * width + at.w];
+        id < 0 || id >= vocab || local < 0 || local >= held ? from_f32<T>(0.f) : table[static_cast<long long>(local) * width + at.w];
 }
 
 // The three planes of an MLX affine table a streamed group seats: where a
