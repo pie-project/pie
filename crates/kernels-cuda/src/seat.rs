@@ -81,6 +81,7 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("fused.hc_prenorm_project", Reads::Rows),
     entry("fused.hc_gates_norm", Reads::Rows),
     entry("fused.res_blend_rmsnorm", Reads::Rows),
+    entry("fused.hc_fold_pre", Reads::Rows),
     entry("fused.hc_pre", Reads::Rows),
     entry("elemwise.layernorm", Reads::Rows),
     entry("elemwise.norm_gate", Reads::Rows),

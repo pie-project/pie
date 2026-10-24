@@ -82,6 +82,7 @@ pub fn all() -> Vec<Rule> {
         split_rope_yarn_append(),
         rope_yarn_append(),
         pool_attention(),
+        hc_fold_pre(),
         hc_pre(),
         mla_prefill_expanded(),
         hc_prenorm_project(),
@@ -89,6 +90,61 @@ pub fn all() -> Vec<Rule> {
         res_blend_rmsnorm(),
         lse_sink(),
     ]
+}
+
+/// A sublayer's hyper-connection fold and the next sublayer's whole pre-mix
+/// over the streams it folds ([`hc_pre`]'s chain): the folded streams read
+/// on, the pre-mix's intermediates read only inside it. The first sublayer's
+/// expanded streams (no fold), the last fold's (collapsed, not gated), an
+/// Engram layer's (written into before they are normed) and Single-Pass
+/// mHC's (whose normed row is the previous sublayer's mixes' pre-mix) match
+/// none of it.
+#[must_use]
+pub fn hc_fold_pre() -> Rule {
+    let pattern = template(|p| {
+        let streams = elemwise::hc_fold(
+            &p.rows("x", W),
+            &p.rows("residual", 4 * W),
+            &p.rows("post_in", 4),
+            &p.rows("comb_in", 16),
+        );
+        p.export("folded", &streams);
+        let normed = elemwise::hc_rmsnorm_f32(&streams, p.f32("mix_eps"));
+        p.name("normed", &normed);
+        p.free("stream_count");
+        let mixes = elemwise::hc_project(&normed, &p.weight("plane", [24, 4 * W]), 4);
+        p.name("mixes", &mixes);
+        let (x, post, comb) = elemwise::hc_gates(
+            &mixes,
+            &streams,
+            &p.weight("scale", [3]),
+            &p.weight("base", [24]),
+            4,
+            p.f32("gate_eps"),
+            p.f32("alpha"),
+            p.u32("sinkhorn"),
+        );
+        p.name("pre", &x);
+        p.export("post", &post);
+        p.export("comb", &comb);
+        let y = elemwise::rmsnorm(&x, &p.weight("weight", [W]), p.f32("eps"));
+        p.export("y", &y);
+    });
+    Rule::new("fused.hc_fold_pre", [pattern], |m| {
+        let elementwise = |name: &str| {
+            let Operation::Elemwise(op) = m.op(name) else {
+                panic!("`{name}` comes from an elementwise op");
+            };
+            Box::new(op.clone())
+        };
+        Fused::HcFoldPre {
+            fold: elementwise("folded"),
+            norm: elementwise("normed"),
+            project: elementwise("mixes"),
+            gates: elementwise("pre"),
+            rmsnorm: elementwise("y"),
+        }
+    })
 }
 
 /// A sublayer's whole hyper-connection pre-mix: the stream norm read only by
