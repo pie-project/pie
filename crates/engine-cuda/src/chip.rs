@@ -613,6 +613,7 @@ mod tests {
                         gemm_tc5_split_tickets: 0,
                         nvfp4_mma_from: defaults.nvfp4_mma_from,
                         nvfp4_mma_until: defaults.nvfp4_mma_until,
+                        gate_tc5_until: 0,
                         decode_grouped_prefill_lse: false,
                         decode_gqa: false,
                         decode_gqa_from_64: 0,
@@ -877,6 +878,7 @@ mod tests {
             (28, 1024, true)
         );
         assert_eq!((b200.nvfp4_mma_from, b200.nvfp4_mma_until), (32, 8192));
+        assert_eq!(b200.gate_tc5_until, 256);
         assert_eq!(b200.moe_w4a4_fused_from, 1);
         assert_eq!((b200.moe_even_waves_from, b200.moe_routes_sized), (3, true));
         assert_eq!(b200.moe_gather_ahead_until, 128);
