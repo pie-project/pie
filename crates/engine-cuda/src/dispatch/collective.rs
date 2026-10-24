@@ -22,6 +22,8 @@ impl Run<'_> {
             Collective::ReduceScatter { x, y } => {
                 collective::reduce_scatter(self.ctx(), self.tensor(*x), &mut self.tensor(*y))
             }
+            Collective::Dispatch { .. } => Err(kernels_cuda::Error::Unsupported { op: "dispatch" }),
+            Collective::Combine { .. } => Err(kernels_cuda::Error::Unsupported { op: "combine" }),
         }
     }
 }
