@@ -885,7 +885,7 @@ mod tests {
         assert_eq!((b200.moe_even_waves_from, b200.moe_routes_sized), (3, true));
         assert_eq!(b200.moe_gather_ahead_until, 128);
         assert_eq!(b200.moe_w4a8_fused_from, 512);
-        assert_eq!((b200.moe_mega_until, b200.moe_mega_bf16_from), (2048, 32));
+        assert_eq!((b200.moe_mega_until, b200.moe_mega_bf16_from), (2048, 64));
         assert_eq!(b200.mla_expanded_from, 256);
         assert_eq!(b200.gemm_fp8_gemv_until, 4);
         assert_eq!((b200.mxfp4_a8_from, b200.mxfp4_a8_until), (1, 48));

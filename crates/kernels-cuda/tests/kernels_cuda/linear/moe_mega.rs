@@ -543,7 +543,11 @@ fn mega_moe_bf16_rate() {
     let mut b = Bench::new(0xb1f6);
     let up = bf16_bank(&mut b, s.experts, 2 * s.inter, s.hidden);
     let down = bf16_bank(&mut b, s.experts, s.hidden, s.inter);
-    let ctx = b.ctx().with_tuning(SM100);
+    // Every width timed, B200's floor for bf16 banks (where it falls) aside.
+    let ctx = b.ctx().with_tuning(kernels_cuda::tuning::Tuning {
+        moe_mega_bf16_from: 0,
+        ..SM100
+    });
     for tokens in widths {
         let mut f = fire_of(&mut b, s, tokens, tokens as u64);
         let mut a = apart_of(&mut b, s, tokens);
