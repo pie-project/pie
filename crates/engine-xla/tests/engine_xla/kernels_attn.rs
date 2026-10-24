@@ -1138,8 +1138,6 @@ fn ragged_answers_every_mask_form() {
     let q = rng.bf16s(rows * qh * d, 1.0);
     let k = rng.bf16s(keys * kvh * d, 1.0);
     let v = rng.bf16s(keys * kvh * d, 1.0);
-    let q_tags = [0i32, -1, 1, 2, 2, -1, 3, 2, 0, 0];
-    let kv_tags = [0i32, 1, 0, 1, 1, 5, 5, 2, 3, 2, 3, 2];
     let q_cls = [0i32, 1, -1, 1, 0, 1, 1, 0, 0, 0];
     let kv_cls = [1i32, 0, 1, -1, 1, 0, 0, 1, 0, 1, -1, 0];
     let table = [1u8, 0, 0, 1];
@@ -1152,18 +1150,12 @@ fn ragged_answers_every_mask_form() {
     let vt = b.bf16(keys as u32, (kvh * d) as u32, &v);
     let qit = b.i32(4, 1, &qi);
     let kit = b.i32(4, 1, &ki);
-    let qtt = b.i32(rows as u32, 1, &q_tags);
-    let ktt = b.i32(keys as u32, 1, &kv_tags);
     let qct = b.i32(rows as u32, 1, &q_cls);
     let kct = b.i32(keys as u32, 1, &kv_cls);
     let tt = b.u8(4, 1, &table);
     let bt = b.f32(qh as u32, span as u32, &bias);
     let masks = [
         RaggedMask::Segments,
-        RaggedMask::ReferenceTags {
-            q_tags: qtt,
-            kv_tags: ktt,
-        },
         RaggedMask::ClassTable {
             q_classes: qct,
             kv_classes: kct,
@@ -1193,8 +1185,7 @@ fn ragged_answers_every_mask_form() {
     let seg_of = |r: usize| (0..3).find(|&s| qi[s] as usize <= r && r < qi[s + 1] as usize);
     let span_of = |r: usize| seg_of(r).map_or(0..0, |s| ki[s] as usize..ki[s + 1] as usize);
     let keep = |which: usize, r: usize, j: usize| match which {
-        1 => q_tags[r] < 0 || kv_tags[j] == q_tags[r],
-        2 => q_cls[r] < 0 || kv_cls[j] < 0 || table[(q_cls[r] * 2 + kv_cls[j]) as usize] != 0,
+        1 => q_cls[r] < 0 || kv_cls[j] < 0 || table[(q_cls[r] * 2 + kv_cls[j]) as usize] != 0,
         _ => true,
     };
     for (which, &o) in outs.iter().enumerate() {
@@ -1210,7 +1201,7 @@ fn ragged_answers_every_mask_form() {
             f64::from(0.18f32),
             &|r| span_of(r).filter(|&j| keep(which, r, j)).collect(),
             &|r, h, j| {
-                if which != 3 {
+                if which != 2 {
                     return 0.0;
                 }
                 let s = seg_of(r).unwrap();

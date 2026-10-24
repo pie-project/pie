@@ -124,7 +124,6 @@ fn reference(
     kp: &[i32],
     head_dim: usize,
     sm_scale: f32,
-    keep: &dyn Fn(usize, usize, usize) -> bool,
     bias: &dyn Fn(usize, usize, usize, usize) -> f32,
 ) -> Vec<f32> {
     let qh = Q_HEADS as usize;
@@ -140,10 +139,6 @@ fn reference(
                 let kvh = head / group;
                 let mut scores = Vec::with_capacity(ke - kb);
                 for j in kb..ke {
-                    if !keep(s, row, j) {
-                        scores.push(f32::NEG_INFINITY);
-                        continue;
-                    }
                     let mut dot = 0.0f32;
                     for d in 0..head_dim {
                         dot +=
@@ -231,39 +226,20 @@ fn run_case(rig: &Rig, head_dim: usize, mask_kind: &str) {
 
     let max_len: u32 = 24;
     let span = (2 * max_len - 1) as usize;
-    let q_tags: Vec<i32> = (0..q_rows)
-        .map(|r| if r % 5 == 0 { (r % 3) as i32 } else { -1 })
-        .collect();
-    let kv_tags: Vec<i32> = (0..kv_rows)
-        .map(|r| if r % 4 == 0 { (r % 3) as i32 } else { -1 })
-        .collect();
     let table: Vec<f32> = (0..(qh * span) as u64)
         .map(|at| 0.5 * unit(at ^ 0xB1A5))
         .collect();
 
-    let (_qtb, hqt) = rig.i32s(&q_tags);
-    let (_ktb, hkt) = rig.i32s(&kv_tags);
     let (_tb, htab) = rig.f32s(&table);
 
     let mask = match mask_kind {
         "segments" => RaggedMask::Segments,
-        "tags" => RaggedMask::ReferenceTags {
-            q_tags: Tensor::new(hqt, q_rows as u32, 1, Dtype::I32),
-            kv_tags: Tensor::new(hkt, kv_rows as u32, 1, Dtype::I32),
-        },
         _ => RaggedMask::RelativeBias {
             table: Tensor::new(htab, qh as u32, span as u32, Dtype::F32),
             max_len,
         },
     };
 
-    let keep = |_s: usize, row: usize, j: usize| -> bool {
-        if mask_kind != "tags" {
-            return true;
-        }
-        let t = q_tags[row];
-        t < 0 || kv_tags[j] == t
-    };
     let bias = |s: usize, row: usize, j: usize, head: usize| -> f32 {
         if mask_kind != "bias" {
             return 0.0;
@@ -273,7 +249,7 @@ fn run_case(rig: &Rig, head_dim: usize, mask_kind: &str) {
         let at = (kj - qi + max_len as i64 - 1).clamp(0, span as i64 - 1) as usize;
         table[head * span + at]
     };
-    let want = reference(&q, &k, &v, &qp, &kp, head_dim, sm_scale, &keep, &bias);
+    let want = reference(&q, &k, &v, &qp, &kp, head_dim, sm_scale, &bias);
 
     for (arm, bar) in [(Arm::Scalar, 3e-3f32), (Arm::Tiled, 4e-3f32)] {
         if arm == Arm::Tiled && !(head_dim == 64 || head_dim == 128) {
@@ -319,7 +295,7 @@ fn both_arms_answer_the_reference_under_every_mask() {
     };
     eprintln!("device: {}", rig.device.name());
     for head_dim in [64usize, 128] {
-        for mask in ["segments", "tags", "bias"] {
+        for mask in ["segments", "bias"] {
             run_case(&rig, head_dim, mask);
         }
     }

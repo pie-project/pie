@@ -808,12 +808,6 @@ impl Run<'_> {
                     RaggedMask::None | RaggedMask::GroupBlockDiagonal => {
                         attn::ragged::RaggedMask::Segments
                     }
-                    RaggedMask::ReferenceSelfOnly { q_tags, kv_tags } => {
-                        attn::ragged::RaggedMask::ReferenceTags {
-                            q_tags: self.uncut(*q_tags),
-                            kv_tags: self.uncut(*kv_tags),
-                        }
-                    }
                     RaggedMask::RelativeBias { table, max_len } => {
                         attn::ragged::RaggedMask::RelativeBias {
                             table: self.tensor(*table),

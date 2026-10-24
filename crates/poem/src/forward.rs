@@ -465,16 +465,6 @@ impl Input {
     }
 
     #[must_use]
-    pub fn reference_tags(&self) -> Value {
-        self.geometry(
-            TOKEN_SPACE,
-            GeomKind::ReferenceTag {
-                select: self.selection(),
-            },
-        )
-    }
-
-    #[must_use]
     pub fn row_permutation(&self) -> Value {
         self.rec
             .input(
@@ -656,10 +646,9 @@ impl Input {
             | GeomKind::KvLen
             | GeomKind::GroupOfLane => (Dim::Lanes, Dtype::I32),
             GeomKind::RowValid => (Dim::Tokens, Dtype::U8),
-            GeomKind::RequestOfToken
-            | GeomKind::WritePage
-            | GeomKind::WriteOffset
-            | GeomKind::ReferenceTag { .. } => (Dim::Tokens, Dtype::I32),
+            GeomKind::RequestOfToken | GeomKind::WritePage | GeomKind::WriteOffset => {
+                (Dim::Tokens, Dtype::I32)
+            }
         };
         self.rec
             .input(

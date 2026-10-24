@@ -51,7 +51,6 @@ struct PortAt {
 struct PackingAt {
     group_indptr: u64,
     lane_indptr: u64,
-    reference_tag: u64,
     permutation: u64,
 }
 
@@ -139,7 +138,6 @@ pub struct VoxelHandles {
 pub struct PackingHandles {
     pub group_indptr: Tensor,
     pub lane_indptr: Tensor,
-    pub reference_tag: Tensor,
     pub permutation: Tensor,
 }
 
@@ -191,7 +189,6 @@ pub struct Fire<'a> {
 pub struct PackingFire<'a> {
     pub group_indptr: &'a [i32],
     pub lane_indptr: &'a [i32],
-    pub reference_tag: &'a [i32],
     pub permutation: &'a [i32],
 }
 
@@ -361,7 +358,6 @@ impl Inputs {
             .map(|_| PackingAt {
                 group_indptr: take((lanes + 1) * 4),
                 lane_indptr: take((lanes + 1) * 4),
-                reference_tag: take(rows * 4),
                 permutation: take(rows * 4),
             })
             .collect();
@@ -764,11 +760,6 @@ impl Inputs {
                     u64::from(lanes) + 1,
                 ),
                 (
-                    "reference tags",
-                    staged.reference_tag.len() as u64,
-                    u64::from(rows),
-                ),
-                (
                     "packed row permutation",
                     staged.permutation.len() as u64,
                     u64::from(rows),
@@ -786,14 +777,11 @@ impl Inputs {
             self.store.write(at.group_indptr, bytes_of(&scratch))?;
             csr(&mut scratch, staged.lane_indptr, lanes + 1);
             self.store.write(at.lane_indptr, bytes_of(&scratch))?;
-            rows_table(&mut scratch, staged.reference_tag, rows);
-            self.store.write(at.reference_tag, bytes_of(&scratch))?;
             rows_table(&mut scratch, staged.permutation, rows);
             self.store.write(at.permutation, bytes_of(&scratch))?;
             packings.push(PackingHandles {
                 group_indptr: i32s(handles, &self.store, at.group_indptr, lanes + 1)?,
                 lane_indptr: i32s(handles, &self.store, at.lane_indptr, lanes + 1)?,
-                reference_tag: i32s(handles, &self.store, at.reference_tag, rows)?,
                 permutation: i32s(handles, &self.store, at.permutation, rows)?,
             });
         }

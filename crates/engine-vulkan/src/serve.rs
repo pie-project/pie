@@ -2653,7 +2653,6 @@ impl Shell {
             .map(|packed| crate::inputs::PackingFire {
                 group_indptr: &packed.group_indptr,
                 lane_indptr: &packed.lane_indptr,
-                reference_tag: &packed.reference_tag,
                 permutation: &packed.permutation,
             })
             .collect();

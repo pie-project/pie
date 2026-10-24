@@ -3214,18 +3214,6 @@ pub(crate) static INPUTS: &[Op] = &[
     },
     Op {
         module: "inputs",
-        name: "reference_tags",
-        params: &["inputs"],
-        call: |a, heap| {
-            let inputs: Input = a.next()?;
-            result(
-                heap,
-                dsl("inputs.reference_tags", || inputs.reference_tags())?,
-            )
-        },
-    },
-    Op {
-        module: "inputs",
         name: "row_permutation",
         params: &["inputs"],
         call: |a, heap| {

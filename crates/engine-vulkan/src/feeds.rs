@@ -76,10 +76,7 @@ impl Feeds {
                 }),
                 RuntimeInput::RowPermutation { select }
                 | RuntimeInput::Geometry {
-                    kind:
-                        GeomKind::GroupIndptr { select }
-                        | GeomKind::LaneIndptr { select }
-                        | GeomKind::ReferenceTag { select },
+                    kind: GeomKind::GroupIndptr { select } | GeomKind::LaneIndptr { select },
                     ..
                 } => {
                     if !feeds.selections.contains(&select) {

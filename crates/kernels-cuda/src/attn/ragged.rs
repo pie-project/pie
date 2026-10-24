@@ -1,6 +1,6 @@
 use crate::attn::fa2::abi::{
-    PrefillRaggedBiasParams, PrefillRaggedClassParams, PrefillRaggedParams, PrefillRaggedRefParams,
-    PrefillRaggedTagParams, UintFastdiv, sm_scale_or_default,
+    PrefillRaggedBiasParams, PrefillRaggedClassParams, PrefillRaggedParams, UintFastdiv,
+    sm_scale_or_default,
 };
 use crate::attn::fa2::{self, RaggedArm, RaggedPoint};
 use crate::attn::kv;
@@ -25,13 +25,6 @@ const KV_CHUNK_SENTINEL: i32 = i32::MAX;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RaggedMask {
     None,
-    ReferenceSelfOnly {
-        ref_start: Tensor,
-    },
-    ReferenceTags {
-        q_tags: Tensor,
-        kv_tags: Tensor,
-    },
     /// `q_classes[q] < 0 || kv_classes[kv] < 0 || table[q_class * count + kv_class] != 0`.
     ClassTable {
         q_classes: Tensor,
@@ -249,30 +242,6 @@ pub fn ragged(
     };
     match mask {
         RaggedMask::None => fa2::prefill_ragged(ctx, OP, point(RaggedArm::Full), &params),
-        RaggedMask::ReferenceTags { q_tags, kv_tags } => {
-            for (what, table, rows) in [("query", q_tags, q.rows), ("key", kv_tags, k.rows)] {
-                if table.dtype != Dtype::I32 || table.rows < rows {
-                    return Err(refuse(
-                        OP,
-                        format!(
-                            "the {what} tag table is {:?} with {} entries; the mask reads one \
-                             i32 per row of the {rows}-row {what} rectangle",
-                            table.dtype, table.rows
-                        ),
-                    ));
-                }
-            }
-            fa2::prefill_ragged(
-                ctx,
-                OP,
-                point(RaggedArm::ReferenceTags),
-                &PrefillRaggedTagParams {
-                    base: params,
-                    q_tags: q_tags.ptr,
-                    kv_tags: kv_tags.ptr,
-                },
-            )
-        }
         RaggedMask::ClassTable {
             q_classes,
             kv_classes,
@@ -313,27 +282,6 @@ pub fn ragged(
                     kv_classes: kv_classes.ptr,
                     table: table.ptr,
                     count,
-                },
-            )
-        }
-        RaggedMask::ReferenceSelfOnly { ref_start } => {
-            if ref_start.dtype != Dtype::I32 || ref_start.rows < groups.unsigned_abs() {
-                return Err(refuse(
-                    OP,
-                    format!(
-                        "the reference table is {:?} with {} entries; the mask reads one i32 \
-                         per group of the {groups} the tables name",
-                        ref_start.dtype, ref_start.rows
-                    ),
-                ));
-            }
-            fa2::prefill_ragged(
-                ctx,
-                OP,
-                point(RaggedArm::ReferenceSelfOnly),
-                &PrefillRaggedRefParams {
-                    base: params,
-                    ref_start: ref_start.ptr,
                 },
             )
         }

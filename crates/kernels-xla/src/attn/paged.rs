@@ -411,8 +411,6 @@ pub(crate) struct Rows {
     pub mask: Option<Val>,
     /// `[R, qh · extent]` f32 relative-bias rows.
     pub rel: Option<Val>,
-    /// Reference tag per row, i32.
-    pub tag: Option<Val>,
     /// Attn class per row, i32.
     pub class: Option<Val>,
     /// Row index within its segment, i32 (ragged bias).
@@ -432,7 +430,6 @@ impl Rows {
             enabled: None,
             mask: None,
             rel: None,
-            tag: None,
             class: None,
             qi: None,
             begin: None,
@@ -450,7 +447,6 @@ impl Rows {
             enabled: o(f, self.enabled)?,
             mask: o(f, self.mask)?,
             rel: o(f, self.rel)?,
-            tag: o(f, self.tag)?,
             class: o(f, self.class)?,
             qi: o(f, self.qi)?,
             begin: o(f, self.begin)?,
@@ -469,8 +465,6 @@ pub(crate) struct Rule {
     pub kp_span: Option<i64>,
     /// Relative bias rows: `(extent, log_floor, log_alpha)`.
     pub rel: Option<(i64, u32, f32)>,
-    /// Per-key reference tags `[n]`.
-    pub kv_tags: Option<Val>,
     /// `(kv_classes [n], table [count²] i32, count)`.
     pub classes: Option<(Val, Val, i64)>,
     /// `(table [qh · (2·max_len − 1)] f32, max_len)`.
@@ -534,16 +528,6 @@ fn logits(
         let keep = f.and(inb, keep)?;
         let off = f.not(on);
         let ok = f.or(off, keep)?;
-        valid = f.and(valid, ok)?;
-    }
-    if let (Some(kv_tags), Some(tag)) = (rule.kv_tags, rows.tag) {
-        let n = f.dims(kv_tags)[0];
-        let xc = clamp_i(f, x, 0, n - 1)?;
-        let kt = take(f, kv_tags, xc)?;
-        let qt = f.broadcast(tag, &dims, &[0])?;
-        let untagged = cmp_i(f, Cmp::Lt, qt, 0)?;
-        let same = f.compare(Cmp::Eq, kt, qt)?;
-        let ok = f.or(untagged, same)?;
         valid = f.and(valid, ok)?;
     }
     if let (Some((kv_classes, table, count)), Some(class)) = (rule.classes, rows.class) {

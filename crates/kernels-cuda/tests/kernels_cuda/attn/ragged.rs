@@ -13,13 +13,10 @@ use kernels_cuda::attn::ragged::{RaggedMask, ragged};
 enum Mask {
     None,
     Bias,
-    SelfOnly,
-    Tags,
     Class,
 }
 
 const MAX_LEN: usize = 130;
-const REF_START: [i32; 6] = [20, 100, 200, -1, 0, 3];
 
 /// `extra` plane rows past the table hold noise the arm, under an armed
 /// seat, must leave alone.
@@ -32,19 +29,12 @@ fn check(heads: [usize; 3], q_sizes: &[u32], kv_sizes: &[u32], mask: Mask, extra
     let (v_raw, v) = lcg.row(kr * kvh * hd);
     let (fill, span) = (lcg.row(qr * qh * hd).0, 2 * MAX_LEN - 1);
     let bias: Vec<f32> = (0..qh * span).map(|_| 2.0 * lcg.unit()).collect();
-    let tags: Vec<i32> = (0..qr as i32)
-        .map(|r| [-1, r / 3][usize::from(r % 9 >= 4)])
-        .collect();
     let classes: Vec<i32> = (0..qr as i32).map(|r| r % 3).collect();
     let allowed: Vec<u8> = (0..9).map(|c| u8::from(c % 4 == 0 || c % 3 == 1)).collect();
     let scale = 2.0 / (hd as f32).sqrt();
-    let mut want = ragged_attention([&q, &k, &v], &qt, &kt, heads, scale, |g, h, r, j| {
-        let start = qt[g] as usize + REF_START[g].max(0) as usize;
+    let mut want = ragged_attention([&q, &k, &v], &qt, &kt, heads, scale, |_, h, r, j| {
         let keep = match mask {
             Mask::None | Mask::Bias => true,
-            // A group's rows from its reference start read only those rows.
-            Mask::SelfOnly => r < start || j >= start,
-            Mask::Tags => tags[r] < 0 || tags[j] == tags[r],
             Mask::Class => allowed[(classes[r] * 3 + classes[j]) as usize] == 1,
         };
         let d = (j + MAX_LEN - 1).saturating_sub(r).min(span - 1);
@@ -56,16 +46,12 @@ fn check(heads: [usize; 3], q_sizes: &[u32], kv_sizes: &[u32], mask: Mask, extra
     // Every table ends where mapped memory ends: a padded query tile's read
     // past one faults, as it once read a neighbour's bytes.
     let mut edge = |v: &[i32]| ten(gpu.up_at_edge(v), v.len(), 1, I32);
-    let (qtab, ktab, tag_t) = (edge(&qt), edge(&kt), edge(&tags));
-    let (class_t, refs) = (edge(&classes), edge(&REF_START));
+    let (qtab, ktab, class_t) = (edge(&qt), edge(&kt), edge(&classes));
     let (table, max_len) = (ten(gpu.up(&bias), qh, span, F32), MAX_LEN as u32);
     let allowed = ten(gpu.up_at_edge(&allowed), 9, 1, U8);
     let arm = match mask {
         Mask::None => RaggedMask::None,
         Mask::Bias => RaggedMask::RelativeBias { table, max_len },
-        Mask::SelfOnly => RaggedMask::ReferenceSelfOnly { ref_start: refs },
-        #[rustfmt::skip]
-        Mask::Tags => RaggedMask::ReferenceTags { q_tags: tag_t, kv_tags: tag_t },
         #[rustfmt::skip]
         Mask::Class => RaggedMask::ClassTable { q_classes: class_t, kv_classes: class_t, table: allowed, count: 3 },
     };
@@ -87,14 +73,13 @@ fn check(heads: [usize; 3], q_sizes: &[u32], kv_sizes: &[u32], mask: Mask, extra
 fn the_ragged_arm_answers_the_reference() {
     let (q_cross, kv_cross) = (&[7, 0, 200, 300, 3], &[300, 40, 0, 500, 1]);
     let (lanes, seat) = (&[7u32, 11, 21], &[40, 100, 300, 64]);
-    let (refs, bias) = (&[64u32, 300, 200, 50, 40, 5], &[37, 130, 64]);
+    let bias = &[37u32, 130, 64];
     // Cross tables with empty groups at 64 and 128, the bias at full heads,
     // each lane mask, and every group served under an armed seat at 256.
     check([4, 2, 64], q_cross, kv_cross, Mask::None, 0);
     check([4, 2, 128], q_cross, kv_cross, Mask::None, 0);
     check([64, 16, 64], bias, bias, Mask::Bias, 0);
-    check([4, 2, 128], refs, refs, Mask::SelfOnly, 0);
-    check([2, 1, 256], lanes, lanes, Mask::Tags, 0);
+    check([2, 1, 256], lanes, lanes, Mask::Class, 0);
     check([4, 2, 64], lanes, lanes, Mask::Class, 0);
     check([2, 2, 256], seat, seat, Mask::None, 96);
 }

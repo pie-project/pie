@@ -182,31 +182,6 @@ const _: () = assert!(
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 #[repr(C)]
-pub struct PrefillRaggedRefParams {
-    pub base: PrefillRaggedParams,
-    pub ref_start: DevicePtr,
-}
-
-const _: () = assert!(
-    core::mem::size_of::<PrefillRaggedRefParams>() == 320,
-    "PrefillRaggedRefParams: sizeof disagrees with ::pie::attn::fa2::RaggedRefParams",
-);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[repr(C)]
-pub struct PrefillRaggedTagParams {
-    pub base: PrefillRaggedParams,
-    pub q_tags: DevicePtr,
-    pub kv_tags: DevicePtr,
-}
-
-const _: () = assert!(
-    core::mem::size_of::<PrefillRaggedTagParams>() == 328,
-    "PrefillRaggedTagParams: sizeof disagrees with ::pie::attn::fa2::RaggedTagParams",
-);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-#[repr(C)]
 pub struct PrefillRaggedClassParams {
     pub base: PrefillRaggedParams,
     pub q_classes: DevicePtr,

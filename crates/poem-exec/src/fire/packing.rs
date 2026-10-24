@@ -1,4 +1,4 @@
-use poem_ir::{Selection, Stream};
+use poem_ir::Selection;
 
 use super::Fault;
 use super::compose::LaneRow;
@@ -17,10 +17,7 @@ pub struct Packed {
     pub lanes: u32,
     pub group_indptr: Vec<i32>,
     pub lane_indptr: Vec<i32>,
-    pub reference_tag: Vec<i32>,
     pub permutation: Vec<i32>,
-    pub reference_start: Vec<i32>,
-    pub references: Vec<u32>,
     /// One attention class per packed row (-1 where the lane states none).
     pub attn_class: Vec<i32>,
 }
@@ -73,7 +70,7 @@ pub fn pack(
 }
 
 /// `pack`, with `classes[source]` the attention classes a source lane
-/// states (one per row), packed beside the reference tags.
+/// states (one per row), packed beside the permutation.
 pub fn pack_with_classes(
     select: Selection,
     lanes: &[LaneRow],
@@ -118,38 +115,18 @@ pub fn pack_with_classes(
 
     let mut group_indptr = vec![0i32; groups + 1];
     let mut lane_indptr = Vec::with_capacity(chosen.len() + 1);
-    let mut reference_tag = vec![-1i32; fire_rows as usize];
     let mut attn_class = vec![-1i32; fire_rows as usize];
     let mut permutation = vec![-1i32; fire_rows as usize];
-    let mut reference_start = vec![0i32; groups];
-    let mut references = vec![0u32; groups];
-    let mut seen_reference = vec![false; groups];
 
     let mut packed = origin;
     lane_indptr.push(packed as i32);
-    let mut group_first = vec![origin; groups];
-    let mut cursor_group: Option<i32> = None;
-    for &(group, stream, at) in &chosen {
+    for &(_, _, at) in &chosen {
         let row = &lanes[at];
-        let g = group as usize;
-        if cursor_group != Some(group) {
-            cursor_group = Some(group);
-            group_first[g] = packed;
-        }
-        let reference = stream == Stream::Reference.code();
-        if reference {
-            references[g] += 1;
-            if !seen_reference[g] {
-                seen_reference[g] = true;
-                reference_start[g] = (packed - group_first[g]) as i32;
-            }
-        }
         let stated = classes.get(row.source as usize).copied().flatten();
         for j in 0..row.rows {
             let fire_row = row.row_offset + j;
             let here = (packed + j) as usize;
             permutation[here] = fire_row as i32;
-            reference_tag[here] = if reference { at as i32 } else { -1 };
             attn_class[here] = stated
                 .and_then(|c| c.get(j as usize))
                 .copied()
@@ -160,15 +137,12 @@ pub fn pack_with_classes(
     }
     let mut bound = origin as i32;
     let mut run = 0usize;
-    for g in 0..groups {
-        group_indptr[g] = bound;
+    for (g, start) in group_indptr.iter_mut().take(groups).enumerate() {
+        *start = bound;
         let mut count = 0u32;
         while run < chosen.len() && chosen[run].0 as usize == g {
             count += lanes[chosen[run].2].rows;
             run += 1;
-        }
-        if !seen_reference[g] {
-            reference_start[g] = count as i32;
         }
         bound += count as i32;
     }
@@ -182,10 +156,7 @@ pub fn pack_with_classes(
         lanes: chosen.len() as u32,
         group_indptr,
         lane_indptr,
-        reference_tag,
         permutation,
-        reference_start,
-        references,
         attn_class,
     })
 }
@@ -207,13 +178,11 @@ mod tests {
 
     const TEXT: u64 = 1;
     const IMAGE: u64 = 2;
-    const REFERENCE: u64 = 32;
 
     #[test]
     fn packing_every_case() {
         a_joint_selection_packs_by_group_then_stream();
         a_class_selection_packs_at_its_own_window();
-        a_reference_lane_packs_last_and_is_tagged();
         a_scattered_selection_is_refused();
     }
 
@@ -251,8 +220,6 @@ mod tests {
         assert_eq!(packed.lane_indptr, vec![0, 3, 7, 9, 14]);
         let expected: Vec<i32> = (0..3).chain(5..9).chain(3..5).chain(9..14).collect();
         assert_eq!(packed.permutation, expected);
-        assert!(packed.reference_tag.iter().all(|&tag| tag == -1));
-        assert_eq!(packed.reference_start, vec![7, 7]);
     }
 
     fn a_class_selection_packs_at_its_own_window() {
@@ -280,34 +247,6 @@ mod tests {
         assert_eq!(packed.group_indptr, vec![5, 9, 9]);
         assert_eq!(packed.lane_indptr, vec![5, 9]);
         assert_eq!(packed.permutation, vec![-1, -1, -1, -1, -1, 5, 6, 7, 8]);
-    }
-
-    fn a_reference_lane_packs_last_and_is_tagged() {
-        let lanes = [
-            row(0, TEXT, 0, 2),
-            row(1, IMAGE, 2, 3),
-            row(2, REFERENCE, 5, 2),
-        ];
-        let facts = [
-            LaneFacts {
-                stream: 0,
-                group: Some(0),
-            },
-            LaneFacts {
-                stream: 1,
-                group: Some(0),
-            },
-            LaneFacts {
-                stream: 5,
-                group: Some(0),
-            },
-        ];
-        let groups = group_of_lane(&lanes, &facts);
-        let packed = pack(Selection::ALL, &lanes, &facts, &groups, 7).unwrap();
-        assert_eq!(packed.group_indptr, vec![0, 7]);
-        assert_eq!(packed.reference_tag, vec![-1, -1, -1, -1, -1, 2, 2]);
-        assert_eq!(packed.reference_start, vec![5]);
-        assert_eq!(packed.references, vec![1]);
     }
 
     fn a_scattered_selection_is_refused() {

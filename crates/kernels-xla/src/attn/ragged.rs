@@ -18,9 +18,6 @@ use crate::tensor::{Landing, Operand, Stored};
 pub enum RaggedMask<T> {
     /// Segments only (poem_ir `None` and `GroupBlockDiagonal`).
     Segments,
-    /// A row with tag `t >= 0` reads only keys tagged `t`; a negative tag
-    /// reads its whole segment. One i32 per query row / key row.
-    ReferenceTags { q_tags: T, kv_tags: T },
     /// `q_classes[q] < 0 || kv_classes[k] < 0 || table[q_class · count +
     /// kv_class] != 0` admits a pair (kernels-cuda's lane class table).
     ClassTable {
@@ -40,10 +37,6 @@ impl<T> RaggedMask<T> {
     pub fn try_map<U, E>(self, mut f: impl FnMut(T) -> Result<U, E>) -> Result<RaggedMask<U>, E> {
         Ok(match self {
             Self::Segments => RaggedMask::Segments,
-            Self::ReferenceTags { q_tags, kv_tags } => RaggedMask::ReferenceTags {
-                q_tags: f(q_tags)?,
-                kv_tags: f(kv_tags)?,
-            },
             Self::ClassTable {
                 q_classes,
                 kv_classes,
@@ -127,14 +120,6 @@ pub fn forward(
             }
             span as i64
         }
-        RaggedMask::ReferenceTags { q_tags, kv_tags } => {
-            for (t, n) in [(q_tags, q.rows), (kv_tags, k.rows)] {
-                if t.dtype != Dtype::I32 || t.elements() < u64::from(n) {
-                    return Err(refuse(OP, "a tag table is one i32 per row"));
-                }
-            }
-            0
-        }
         RaggedMask::ClassTable {
             q_classes,
             kv_classes,
@@ -171,18 +156,9 @@ pub fn forward(
     let ki = flat_i32(f, ki)?;
     let ki = head(f, ki, segments + 1)?;
     let mut rule = Rule::default();
-    let mut tags = None;
     let mut classes = None;
     match mask {
         RaggedMask::Segments => {}
-        RaggedMask::ReferenceTags { q_tags, kv_tags } => {
-            let a = q_tags.val;
-            let a = flat_i32(f, a)?;
-            tags = Some(head(f, a, r)?);
-            let b = kv_tags.val;
-            let b = flat_i32(f, b)?;
-            rule.kv_tags = Some(head(f, b, nk)?);
-        }
         RaggedMask::ClassTable {
             q_classes,
             kv_classes,
@@ -223,7 +199,6 @@ pub fn forward(
     let hi = fq.select(inside, hi, z)?;
     let q4 = fq.reshape(qv, &[r, heads.kvh, heads.g, heads.d])?;
     let mut rows = Rows::new(q4, lo, hi);
-    rows.tag = tags;
     rows.class = classes;
     if rule.rbias.is_some() {
         let io = fq.iota(Elem::I32, &[r], 0);

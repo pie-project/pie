@@ -320,10 +320,7 @@ impl Dit {
             match *input {
                 RuntimeInput::RowPermutation { select }
                 | RuntimeInput::Geometry {
-                    kind:
-                        GeomKind::GroupIndptr { select }
-                        | GeomKind::LaneIndptr { select }
-                        | GeomKind::ReferenceTag { select },
+                    kind: GeomKind::GroupIndptr { select } | GeomKind::LaneIndptr { select },
                     ..
                 } => {
                     if !dit.selections.contains(&select) {
@@ -823,7 +820,6 @@ impl Dit {
                 let bindings = PackingBindings {
                     group_indptr: inputs.i32s(handles, &lane_table(&packed.group_indptr), 1),
                     lane_indptr: inputs.i32s(handles, &lane_table(&packed.lane_indptr), 1),
-                    reference_tag: inputs.i32s(handles, &row_table(&packed.reference_tag), 1),
                     permutation: inputs.i32s(handles, &row_table(&packed.permutation), 1),
                     attn_class: inputs.i32s(handles, &row_table(&packed.attn_class), 1),
                 };
