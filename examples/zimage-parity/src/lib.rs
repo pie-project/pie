@@ -357,7 +357,7 @@ async fn trajectory(
     let out = Channel::new([rows, width], dtype::f32).named("traj_out");
     // The caption lane only modulates: its clock advances and nothing else.
     ctx_clock.drive(&context, |_| {});
-    let dts = loops.dts("traj_img");
+    let dts = loops.dts();
     let x = latent.clone();
     let readback = out.clone();
     img_clock.drive(&image, move |k| {

@@ -1181,6 +1181,13 @@ async fn main(input: Input) -> Result<Output> {
         w: grid_w,
     };
 
+    let dts = loops.dts();
+    // VIDEO2VIDEO: the encoded clip, seeded once, read by every fire of both
+    // branches and used by fire 0.
+    let init = init_latent
+        .as_ref()
+        .map(|rows| Channel::from_shaped(shape, rows.as_slice()).named("init"));
+
     let mut branches: Vec<Branch> = Vec::new();
     for (group, ctx) in [Some(&context), uncond.as_ref()]
         .into_iter()
@@ -1225,16 +1232,9 @@ async fn main(input: Input) -> Result<Output> {
             .capacity(channel_capacity() as u32)
             .named(&format!("{tag}_out"));
         text_clock.drive(&context_lane.pass, |_| {});
-        let dts = loops.dts(tag);
         let rng = Channel::from(rng_state(seed)).named(&format!("{tag}_rng"));
         let x = latent.clone();
         let readback = out.clone();
-        // VIDEO2VIDEO: the encoded clip, seeded once, read by every fire and
-        // used by fire 0. Its own channel per branch, since a seeded channel
-        // attaches to one pass (the runtime's channel-role rule).
-        let init = init_latent
-            .as_ref()
-            .map(|rows| Channel::from_shaped(shape, rows.as_slice()).named(&format!("{tag}_init")));
         image_clock.drive(&image_lane.pass, move |k| {
             // On the CFG path BOTH branches step with the SAME combine, each
             // computed from its own side: the conditional lane reads
