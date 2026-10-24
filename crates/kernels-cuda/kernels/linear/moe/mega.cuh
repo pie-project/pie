@@ -19,6 +19,11 @@
 // the gate-up tiles that land the K it reads, so every gate-up task
 // finishes and no wait closes a cycle.
 //
+// The launch is cooperative, its grid seated whole; and no CTA waits on
+// work a given CTA owns besides: the tasks, the quantizer's blocks and a
+// wide fold's items are all claimed from counts, so whichever CTAs run first
+// do every one of them.
+//
 // Between them, global flags (zero at rest, the last CTA out zeroing them):
 // a block's quantized row chunks (`xready`, a count), its intermediate
 // tiles (`hready`, a bit a tile), an output column tile's routes landed
@@ -47,12 +52,21 @@ __host__ __device__ constexpr int ws_hready() { return kMaxRoutes; }
 __host__ __device__ constexpr int ws_done() { return 2 * kMaxRoutes; }
 __host__ __device__ constexpr int ws_finish() { return 2 * kMaxRoutes + kMaxColTiles; }
 __host__ __device__ constexpr int ws_next() { return ws_finish() + 1; }
-__host__ __device__ constexpr int ws_words() { return ws_next() + 1; }
+// The quantizer's blocks claimed, and a wide fold's items.
+__host__ __device__ constexpr int ws_qnext() { return ws_finish() + 2; }
+__host__ __device__ constexpr int ws_fnext() { return ws_finish() + 3; }
+__host__ __device__ constexpr int ws_words() { return ws_finish() + 4; }
 
 // ---- cross-CTA flags ---------------------------------------------------------
 
 __device__ __forceinline__ void add_release(u32* p, u32 v) {
     asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+
+__device__ __forceinline__ u32 add_acq_rel(u32* p, u32 v) {
+    u32 old;
+    asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;" : "=r"(old) : "l"(p), "r"(v) : "memory");
+    return old;
 }
 
 __device__ __forceinline__ void or_release(u32* p, u32 v) {
@@ -91,6 +105,9 @@ __device__ __forceinline__ u32 wait_bits(const u32* p, u32 need) {
     return v;
 }
 
+// Warps 3-11's own barrier, sharing a claimed block's quantization.
+__device__ __forceinline__ void helpers_sync() { asm volatile("bar.sync 4, 288;" ::: "memory"); }
+
 // An epilogue warpgroup's own barrier (its four warps), 1 or 2.
 __device__ __forceinline__ void wg_sync(int wg) {
     asm volatile("bar.sync %0, 128;" ::"r"(1 + wg) : "memory");
@@ -105,7 +122,54 @@ struct Routing {
     unsigned short block_expert[kMaxRoutes];
     unsigned short sorted[kMaxRoutes];  // window-relative route ids, by expert
     int t0, tokens;                     // the live window's first token and its tokens
+    int route0;                         // the window's first route
+    // A wide fire's layout in global memory (`moe_route_order_scan`'s), or
+    // null: the routes by expert, and each block's (expert, slice) item.
+    const i32* order;
+    const i32* work;
 };
+
+// Sorted route s, as a route of the fire.
+__device__ __forceinline__ int route_at(const Routing& R, int s) {
+    return R.order != nullptr ? __ldg(&R.order[s]) : R.route0 + R.sorted[s];
+}
+
+// Block b's expert and its place among the expert's blocks.
+__device__ __forceinline__ void block_of(const Routing& R, int b, int& e, int& m) {
+    if (R.order != nullptr) {
+        const int w = __ldg(&R.work[b]);
+        e = w >> 16;
+        m = w & 0xFFFF;
+    } else {
+        e = R.block_expert[b];
+        m = b - R.bstart[e];
+    }
+}
+
+// A wide fire's layout read where `moe_route_order_scan` laid it (`offsets`
+// the experts' starts, the dropped routes' (the live count) and the work
+// items' count), every thread taking part.
+__device__ __forceinline__ void lay_out_global(Routing& R, const i32* __restrict__ order,
+                                               const i32* __restrict__ offsets,
+                                               const i32* __restrict__ work, int t0, int tokens,
+                                               int top, int experts) {
+    const int tid = static_cast<int>(threadIdx.x);
+    for (int e = tid; e < experts; e += kThreads) {
+        const int a = __ldg(&offsets[e]);
+        R.start[e] = a;
+        R.count[e] = __ldg(&offsets[e + 1]) - a;
+    }
+    if (tid == 0) {
+        R.start[experts] = __ldg(&offsets[experts]);
+        R.count[experts] = 0;
+        R.bstart[experts] = __ldg(&offsets[experts + 1]);
+        R.t0 = t0;
+        R.tokens = tokens;
+        R.route0 = t0 * top;
+        R.order = order;
+        R.work = work;
+    }
+}
 
 // The fire's layout, every thread of the CTA taking part: routes
 // `[t0 * top, (t0 + tokens) * top)` (those naming no expert left out) by
@@ -134,6 +198,9 @@ __device__ __forceinline__ void lay_out(Routing& R, const i32* __restrict__ rout
     if (tid == 0) {
         R.t0 = t0;
         R.tokens = tokens;
+        R.route0 = t0 * top;
+        R.order = nullptr;
+        R.work = nullptr;
     }
     __syncthreads();
     unsigned short* mine = seg + (warp < 8 ? warp : 0) * experts;
@@ -148,8 +215,17 @@ __device__ __forceinline__ void lay_out(Routing& R, const i32* __restrict__ rout
         __syncwarp();
     }
     __syncthreads();
-    // Each expert's count, and its warps' first ranks.
-    for (int e = tid; e < experts; e += kThreads) {
+    // Each expert's count, its warps' first ranks, and the routes' and
+    // blocks' prefix sums: thread t takes experts 2t and 2t + 1, its sums
+    // scanned across the block (a count and a block count a word, 2048
+    // routes at most).
+    static_assert(2 * kThreads >= kMaxExperts, "two experts a thread");
+    unsigned* wsum = reinterpret_cast<unsigned*>(seg + 8 * experts);
+    unsigned v[2] = {0u, 0u};
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const int e = 2 * tid + h;
+        if (e >= experts) continue;
         int run = 0;
         for (int w = 0; w < 8; ++w) {
             const int c = seg[w * experts + e];
@@ -157,36 +233,34 @@ __device__ __forceinline__ void lay_out(Routing& R, const i32* __restrict__ rout
             run += c;
         }
         R.count[e] = run;
+        v[h] = static_cast<unsigned>(run) | (static_cast<unsigned>((run + kBN - 1) / kBN) << 16);
     }
+    unsigned inc = v[0] + v[1];
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) {
+        const unsigned up = __shfl_up_sync(0xffffffffu, inc, d);
+        if (lane >= d) inc += up;
+    }
+    if (lane == 31) wsum[warp] = inc;
     __syncthreads();
-    // The routes' and blocks' prefix sums, warp 0 alone (512 experts at most).
-    if (warp == 0) {
-        int routes_before = 0, blocks_before = 0;
-        for (int e0 = 0; e0 < experts; e0 += 32) {
-            const int e = e0 + lane;
-            const int c = e < experts ? R.count[e] : 0;
-            const int b = (c + kBN - 1) / kBN;
-            int ic = c, ib = b;
-            for (int d = 1; d < 32; d <<= 1) {
-                const int uc = __shfl_up_sync(0xffffffffu, ic, d);
-                const int ub = __shfl_up_sync(0xffffffffu, ib, d);
-                if (lane >= d) {
-                    ic += uc;
-                    ib += ub;
-                }
-            }
-            if (e < experts) {
-                R.start[e] = routes_before + ic - c;
-                R.bstart[e] = blocks_before + ib - b;
-            }
-            routes_before += __shfl_sync(0xffffffffu, ic, 31);
-            blocks_before += __shfl_sync(0xffffffffu, ib, 31);
+    unsigned base = 0;
+    for (int w = 0; w < warp; ++w) base += wsum[w];
+    unsigned before = base + inc - v[0] - v[1];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const int e = 2 * tid + h;
+        if (e < experts) {
+            R.start[e] = static_cast<int>(before & 0xFFFFu);
+            R.bstart[e] = static_cast<int>(before >> 16);
         }
-        if (lane == 0) {
-            R.start[experts] = routes_before;
-            R.bstart[experts] = blocks_before;
-            R.count[experts] = 0;
-        }
+        before += v[h];
+    }
+    if (tid == 0) {
+        unsigned all = 0;
+        for (int w = 0; w < kThreads / 32; ++w) all += wsum[w];
+        R.start[experts] = static_cast<int>(all & 0xFFFFu);
+        R.bstart[experts] = static_cast<int>(all >> 16);
+        R.count[experts] = 0;
     }
     __syncthreads();
 #pragma unroll
@@ -235,8 +309,8 @@ __device__ __forceinline__ Task task_of(const Routing& R, int t, int blocks, int
     const int per = x.l2 ? j2 : j1;
     x.b = u / per;
     x.j = u - x.b * per;
-    x.e = R.block_expert[x.b];
-    const int m = x.b - R.bstart[x.e];
+    int m;
+    block_of(R, x.b, x.e, m);
     x.rows = min(R.count[x.e] - m * kBN, kBN);
     x.s0 = R.start[x.e] + m * kBN;
     return x;

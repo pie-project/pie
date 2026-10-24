@@ -6,7 +6,7 @@
 //! either fold. A fire the kernel does not take answers `Ok(false)`; the
 //! caller runs the four apart.
 
-use super::{GluBank, RoutedMlp};
+use super::{GluBank, RoutedMlp, Selected, Share, route_order_sliced};
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Fire, Launch, kernel, refuse};
 use crate::linear::gemm_sm100::{self, Glu, Map, encode};
@@ -41,6 +41,9 @@ struct Params {
     routed: u64,
     sync: u64,
     win: u64,
+    order: u64,
+    offsets: u64,
+    work: u64,
     tokens: i32,
     top: i32,
     experts: i32,
@@ -53,10 +56,15 @@ struct Params {
 /// tiles (a hidden width of 8192), gate-up tiles a block's ready word.
 const MAX_EXPERTS: u32 = 512;
 const MAX_ROUTES: u32 = 2048;
+/// The most routes a fire's layout in global memory (a wide fire's) takes:
+/// its blocks are the flags' 2048 at most.
+const MAX_WIDE_ROUTES: u32 = 65_536;
+/// `pie::linear::mega::kMaxRoutes`: the blocks a fire's flags count.
+const MAX_BLOCKS: u32 = 2048;
 const MAX_COL_TILES: u32 = 64;
 const MAX_GLU_TILES: u32 = 32;
 /// `pie::linear::mega::ws_words`: the flags, zero at rest.
-const SYNC_WORDS: usize = 2 * MAX_ROUTES as usize + MAX_COL_TILES as usize + 2;
+const SYNC_WORDS: usize = 2 * MAX_ROUTES as usize + MAX_COL_TILES as usize + 4;
 /// `pie::linear::mega::kChunk`: the columns a quantizer pass reads.
 const CHUNK: u32 = 1024;
 /// `pie::linear::mega::kPoolStride`: a block's pool rows 64 apart.
@@ -67,11 +75,11 @@ const THREADS: u32 = 384;
 /// 128 x 128-byte weight boxes, two kBN x 128-byte row boxes, the weights'
 /// two scale atoms and the rows' one); the tail (barriers and task slots,
 /// the two epilogue warpgroups' amax exchanges, the routing: three 513-entry int tables, two
-/// 2048-entry short ones and two ints).
+/// 2048-entry short ones, three ints and two pointers).
 const fn stage_bytes(bn: u32) -> u32 {
     2 * 128 * 128 + 2 * bn * 128 + 1024 + 512
 }
-const ROUTING_BYTES: u32 = 3 * 513 * 4 + 2 * 2048 * 2 + 8;
+const ROUTING_BYTES: u32 = 3 * 513 * 4 + 2 * 2048 * 2 + 3 * 4 + 2 * 8;
 const fn tail_bytes(bn: u32) -> u32 {
     256 + 32 * bn + ROUTING_BYTES
 }
@@ -182,7 +190,9 @@ fn operand_map(
 #[must_use]
 pub fn mega_takes(ctx: &Ctx, routes: Tensor) -> bool {
     let count = routes.rows * routes.width;
-    gemm_sm100::supported() && count > 0 && count <= ctx.tuning().moe_mega_until.min(MAX_ROUTES)
+    gemm_sm100::supported()
+        && count > 0
+        && count <= ctx.tuning().moe_mega_until.min(MAX_WIDE_ROUTES)
 }
 
 /// `y[t] = fold over t's routes r of down_e(glu(up_e . x[t]))`, the routed
@@ -273,7 +283,14 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
     let Some(sms) = ctx.multiprocessors() else {
         return Ok(false);
     };
+    // A decode's routes laid out by every CTA in shared memory; a wider
+    // fire's laid once in global memory (`moe_route_order_scan`). 32 routes a
+    // block either way (64 streamed V4-Flash's prefill 3-7% slower).
+    let wide = count > MAX_ROUTES;
     let bn: u32 = 32;
+    if blocks_for(count, experts, bn) > MAX_BLOCKS {
+        return Ok(false);
+    }
     let stages = stages_for(bn);
     let smem = smem_bytes(bn, stages);
     let blocks = blocks_for(count, experts, bn);
@@ -315,6 +332,17 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
     let map_x = operand_map(xpool, false, w4, pool, hidden, bn, View::Plain)?;
     let map_h = operand_map(hpool, false, w4, pool, inter, bn, View::Chunks)?;
     let int = |v: u32| i32::try_from(v).map_err(|_| refuse(OP, "a shape past i32"));
+    let (order, offsets, work) = if wide {
+        let fan = Selected {
+            route_count: count,
+            top_k: int(top)?,
+            by_token: true,
+        };
+        let laid = route_order_sliced(ctx, OP, routes, &fan, experts, bn, true, Share::No)?;
+        (laid.order, laid.offsets, laid.work)
+    } else {
+        (0, 0, 0)
+    };
     let win = match ctx.stage() {
         ArgValue::Ptr(at) => at,
         _ => 0,
@@ -334,6 +362,9 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
         routed,
         sync,
         win,
+        order,
+        offsets,
+        work,
         tokens: int(tokens)?,
         top: int(top)?,
         experts: int(experts)?,
@@ -343,17 +374,21 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
     };
     let kind = u32::from(w4);
     let first = u32::from(first);
+    // A cooperative launch: the driver seats the whole grid at once or
+    // refuses it, so the CTAs that wait on each other's flags are all
+    // resident whatever else holds the card. As a programmatic dependent
+    // (`kernel.pdl`) too, in the same launch.
+    let launch = Launch::grid([sms, 1, 1], [THREADS, 1, 1])
+        .smem(smem)
+        .cooperative()
+        .programmatic(ctx.tuning().pdl);
     ctx.fire(
         OP,
         Fire::at(kernel(
             FILE,
             &format!("::pie::linear::mega_moe<{kind}, {bn}, {code}, {first}, {stages}>"),
         ))
-        .apply(
-            Launch::grid([sms, 1, 1], [THREADS, 1, 1])
-                .smem(smem)
-                .cooperative(),
-        ),
+        .apply(launch),
         &[
             ArgValue::of(&map_up),
             ArgValue::of(&map_down),
