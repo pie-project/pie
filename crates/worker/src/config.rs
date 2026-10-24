@@ -760,6 +760,7 @@ impl ModelConfig {
             drafter,
             tp: None,
             ep: None,
+            rank: None,
             yarn: self
                 .rope_scaling
                 .as_ref()

@@ -40,12 +40,16 @@ pub(crate) fn load_model_engines(
             ep_degree,
         )
         .with_context(|| format!("model {:?} topology", m.name))?;
+        #[allow(unreachable_patterns)]
         if ep_degree > 1 {
-            anyhow::bail!(
-                "model {:?}: expert_parallel_size = {ep_degree} needs the cuda engine's \
-                 lockstep ranks, which this build does not open yet",
-                m.name,
-            );
+            match flavor {
+                #[cfg(feature = "engine-cuda")]
+                Flavor::Cuda => {}
+                _ => anyhow::bail!(
+                    "model {:?}: expert_parallel_size = {ep_degree} is only served on cuda",
+                    m.name,
+                ),
+            }
         }
 
         #[allow(unreachable_patterns)]
@@ -77,7 +81,39 @@ pub(crate) fn load_model_engines(
             .with_context(|| format!("reading the model metadata for {:?}", m.name))?;
         let snapshot_dir = resolved_model.path().to_path_buf();
         let mut group_engines: Vec<GroupEngine> = Vec::with_capacity(topology.len());
+        #[cfg(feature = "engine-cuda")]
+        if ep_degree > 1 {
+            let mut residency = m.residency();
+            residency.kv_seats = user_cfg
+                .runtime
+                .max_concurrent_processes
+                .and_then(|n| u32::try_from(n).ok());
+            residency.kv_export = user_cfg.offload.transfer == crate::config::OffloadTransfer::Nixl;
+            let devices: Vec<usize> = topology.iter().flatten().copied().collect();
+            let rank_opts = cuda_rank_options(user_cfg, 0, &devices, &embedded_base_opts)?;
+            group_engines = crate::backend::create_engine_lockstep(
+                &rank_opts,
+                &snapshot_dir,
+                home,
+                m.adapter_mount().as_deref(),
+                u8::try_from(user_cfg.runtime.frame_dispatch_depth).unwrap_or(u8::MAX),
+                &m.adapters,
+                residency,
+                m.patch_ceilings(),
+                m.voxel_ceilings(),
+                &m.overrides()?,
+            )
+            .with_context(|| {
+                format!(
+                    "opening model {:?} on {ep_degree} expert-parallel ranks",
+                    m.name
+                )
+            })?;
+        }
         for (group_idx, group) in topology.iter().enumerate() {
+            if ep_degree > 1 {
+                break;
+            }
             // The default swap tiers hold every seat the runtime admits.
             let mut residency = m.residency();
             residency.kv_seats = user_cfg

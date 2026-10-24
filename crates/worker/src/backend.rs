@@ -280,7 +280,13 @@ fn land(
     )?;
     if request.residency.disk_kv_budget != Some(0) && request.residency.disk_kv_dir.is_none() {
         match crate::disk::kv_dir(cache_dir, snapshot_dir) {
-            Ok(dir) => request.residency.disk_kv_dir = Some(dir),
+            // Each rank of an expert-parallel group keeps its own requests' kv.
+            Ok(dir) => {
+                request.residency.disk_kv_dir = Some(match overrides.ep {
+                    Some(_) => dir.join(format!("rank{}", overrides.rank.unwrap_or(0))),
+                    None => dir,
+                });
+            }
             Err(error) if request.residency.disk_kv_budget.is_none() => {
                 tracing::warn!(%error, "no directory for the default disk kv tier; serving without it");
                 request.residency.disk_kv_budget = Some(0);
@@ -435,6 +441,105 @@ pub(crate) fn create_engine_backend_group(
         disk_kv_dir,
         backend,
     })
+}
+
+/// The ranks of an expert-parallel group, one device each, loaded at once:
+/// each rank's load meets the others' before it arms, so each runs on a
+/// thread of its own.
+#[cfg(feature = "engine-cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_engine_lockstep(
+    rank_options: &[EngineOptions],
+    snapshot_dir: &Path,
+    home: &Path,
+    adapter_dir: Option<&Path>,
+    frames_in_flight: u8,
+    adapters: &crate::config::AdapterConfig,
+    residency: engine::Residency,
+    patch_ceilings: (Option<u32>, Option<u32>),
+    voxel_ceilings: (Option<u32>, Option<u32>),
+    overrides: &runtime::engine::load::Overrides,
+) -> Result<Vec<GroupEngine>> {
+    let cache_dir = &crate::disk::engine_cache_dir(home);
+    validate_snapshot_dir(snapshot_dir)?;
+    let mut boots = Vec::with_capacity(rank_options.len());
+    for (rank, options) in rank_options.iter().enumerate() {
+        #[allow(
+            irrefutable_let_patterns,
+            reason = "`EngineOptions` has one variant in a CUDA-only build"
+        )]
+        let EngineOptions::Cuda(opts) = options else {
+            return Err(anyhow!(
+                "an expert-parallel group requires cuda rank options"
+            ));
+        };
+        let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
+        if opts.verbose {
+            dump_device_boot(home, &boot, rank, Some(rank));
+        }
+        boots.push(boot);
+    }
+    let ep = u32::try_from(boots.len()).context("a rank count fits u32")?;
+    let backends = runtime::engine::backend::open::cuda_lockstep(boots)?;
+    #[allow(
+        irrefutable_let_patterns,
+        reason = "`EngineOptions` has one variant in a CUDA-only build"
+    )]
+    let EngineOptions::Cuda(opts) = &rank_options[0] else {
+        unreachable!("validated cuda options above");
+    };
+    let budgets = cuda_budgets(
+        opts,
+        adapters.seats(),
+        patch_ceilings,
+        voxel_ceilings,
+        declared_context(snapshot_dir, overrides),
+    );
+    let landed: Vec<Result<GroupEngine>> = std::thread::scope(|scope| {
+        let loads: Vec<_> = backends
+            .into_iter()
+            .enumerate()
+            .map(|(rank, mut backend)| {
+                let residency = residency.clone();
+                let budgets = budgets.clone();
+                let overrides = runtime::engine::load::Overrides {
+                    ep: Some(ep),
+                    rank: Some(rank as u32),
+                    ..overrides.clone()
+                };
+                scope.spawn(move || -> Result<GroupEngine> {
+                    let (loaded, deployment, disk_kv_dir) = land(
+                        &mut backend,
+                        snapshot_dir,
+                        cache_dir,
+                        budgets,
+                        residency,
+                        poem_ir::Platform::Cuda,
+                        frames_in_flight,
+                        &overrides,
+                    )
+                    .with_context(|| format!("loading expert-parallel rank {rank}"))?;
+                    register_operator_adapters(&mut backend, adapters)?;
+                    Ok(GroupEngine {
+                        deployment,
+                        caps: loaded.caps,
+                        facts: loaded.facts,
+                        snapshot_dir: snapshot_dir.to_path_buf(),
+                        disk_kv_dir,
+                        backend,
+                    })
+                })
+            })
+            .collect();
+        loads
+            .into_iter()
+            .map(|load| {
+                load.join()
+                    .unwrap_or_else(|_| Err(anyhow!("an expert-parallel rank's load panicked")))
+            })
+            .collect()
+    });
+    landed.into_iter().collect()
 }
 
 #[cfg_attr(

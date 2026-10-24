@@ -65,6 +65,20 @@ pub mod open {
         }
     }
 
+    /// The ranks of an expert-parallel group, one engine a device, each
+    /// loaded at once with the others.
+    #[cfg(feature = "engine-cuda")]
+    pub fn cuda_lockstep(boots: Vec<engine_cuda::DeviceBoot>) -> Result<Vec<EngineBox>> {
+        engine_cuda::lockstep::open_lockstep(boots, crate::engine::load::contract_for)
+            .map(|ranks| {
+                ranks
+                    .into_iter()
+                    .map(|rank| Box::new(rank) as EngineBox)
+                    .collect()
+            })
+            .map_err(::anyhow::Error::msg)
+    }
+
     #[cfg(all(feature = "metal", target_vendor = "apple"))]
     pub fn metal(config_bytes: &[u8]) -> Result<EngineBox> {
         engine_metal::open(config_bytes, crate::engine::load::contract_for)
