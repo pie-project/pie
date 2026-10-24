@@ -74,6 +74,10 @@ pub struct Knobs {
     /// the last `expert_load_window` steps (none: as many as it waits).
     pub expert_rebalance_steps: Option<u32>,
     pub expert_load_window: Option<u32>,
+    /// A lane's logits the same bits whatever else shares its fire: every
+    /// kernel's reduction order for a row fixed by the shapes it serves,
+    /// not by the fire's rows (`Tuning::batch_invariant`).
+    pub batch_invariant: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
