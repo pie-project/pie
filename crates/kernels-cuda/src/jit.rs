@@ -25,6 +25,18 @@ pub use ctx::{Ctx, Fire, Launch, Pad, Slabs, kernels_strict, strict_kernels};
 pub use kernel::{Kernel, kernel};
 pub use root::{Features, Root, Toolchain, specific_of};
 
+/// Binds the current device's primary context to this thread, once a
+/// thread. A kernel's first resolution on a thread does it otherwise, mid
+/// fire, where its `cudaFree` waits on the device (and on a peer spinning
+/// in an expert-parallel barrier that waits on this thread's launches).
+#[cfg(feature = "cuda")]
+pub fn bind_context() -> Result<(), crate::Error> {
+    cache::bind_context().map_err(|fault| crate::Error::Backend {
+        op: "jit.bind_context",
+        detail: fault.to_string(),
+    })
+}
+
 use crate::error::Error;
 
 /// The device's compute capability major, `None` without the device half.

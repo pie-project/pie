@@ -592,7 +592,12 @@ pub fn bind_thread(ordinal: i32) -> Result<()> {
     #[cfg(feature = "device")]
     {
         // SAFETY: an ordinal the runtime itself answered with.
-        unsafe { check("cudaSetDevice", crate::device::rt::cudaSetDevice(ordinal)) }
+        unsafe { check("cudaSetDevice", crate::device::rt::cudaSetDevice(ordinal))? };
+        // The kernels' own per-thread binding here, not at a kernel's first
+        // resolution mid-fire, where its `cudaFree` waits on the device.
+        #[cfg(all(feature = "cuda", not(feature = "rocm")))]
+        kernels_cuda::jit::bind_context().map_err(crate::error::kernel)?;
+        Ok(())
     }
     #[cfg(not(feature = "device"))]
     {
