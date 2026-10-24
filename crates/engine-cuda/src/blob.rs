@@ -390,7 +390,7 @@ pub struct Stamp {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Key {
     Shared(Stamp),
-    Own(u64),
+    Own(engine::InstanceId),
 }
 
 fn stat(at: &Path, file: &str, name: &str) -> Result<(String, u64, u128)> {
@@ -529,7 +529,7 @@ pub enum Source<'a> {
         name: &'a str,
     },
     Own {
-        instance: u64,
+        instance: engine::InstanceId,
         planes: &'a [AdapterPlane<'a>],
     },
 }

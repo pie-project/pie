@@ -50,8 +50,8 @@ pub struct Vulkan {
     contract_for: ContractFor,
     shell: Option<Shell>,
     caps: Option<Capabilities>,
-    next_fire: FireId,
-    next_frame: FrameId,
+    next_fire: u64,
+    next_frame: u64,
 
     sink: Option<engine::CompletionSink>,
 
@@ -543,7 +543,7 @@ impl Engine for Vulkan {
                 .as_ref()
                 .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
         )?;
-        let id = self.next_frame;
+        let id = FrameId(self.next_frame);
         self.next_frame = self.next_frame.wrapping_add(1);
 
         self.pending = None;
@@ -1094,7 +1094,7 @@ impl Vulkan {
             })
             .collect();
 
-        let id = self.next_fire;
+        let id = FireId(self.next_fire);
         self.next_fire = self.next_fire.wrapping_add(1);
 
         let mut resolved: Vec<Option<Vec<u32>>> = vec![None; submission.lanes.len()];

@@ -27,7 +27,7 @@ impl InstanceBindingPlan {
         engine_id: usize,
         pacing_wait_id: u64,
         program: ProgramId,
-        channels: Vec<u64>,
+        channels: Vec<engine::ChannelId>,
         seeds: Vec<ChannelSeed>,
         geometry: GeometryClass,
         extents: BindExtents,

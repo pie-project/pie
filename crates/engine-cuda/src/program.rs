@@ -7,8 +7,9 @@ pub mod wave;
 
 use std::collections::BTreeMap;
 
+use engine::channel::ChannelId;
 use engine::ports::Envelope;
-use engine::program::ProgramRegistration;
+use engine::program::{InstanceId, ProgramId, ProgramRegistration};
 use eta_exec::{Boundaries, ExecPlan, Extents, Versions, adopt_launch_package_with};
 use eta_ir::registry::GeometryClass;
 
@@ -25,7 +26,7 @@ pub use wave::Wave;
 
 #[derive(Debug)]
 pub struct Program {
-    pub id: u64,
+    pub id: ProgramId,
     pub hash: u64,
     pub plan: ExecPlan,
     pub compiled: Compiled,
@@ -82,9 +83,9 @@ impl Program {
 impl Plane {
     pub fn self_cond_cells(
         &self,
-        instance: u64,
-        rows: u64,
-        weights: u64,
+        instance: InstanceId,
+        rows: ChannelId,
+        weights: ChannelId,
         bytes: u64,
     ) -> Result<(u64, u64)> {
         let bound = self.instances.get(&instance).ok_or_else(|| {
@@ -120,7 +121,12 @@ impl Plane {
 }
 
 impl Plane {
-    fn dense_channel(&self, instance: u64, id: u64, what: &str) -> Result<(&Bound, u32)> {
+    fn dense_channel(
+        &self,
+        instance: InstanceId,
+        id: ChannelId,
+        what: &str,
+    ) -> Result<(&Bound, u32)> {
         let bound = self.instances.get(&instance).ok_or_else(|| {
             Fault::program(
                 "program::plane",
@@ -140,12 +146,12 @@ impl Plane {
         Ok((bound, dense as u32))
     }
 
-    pub fn feed_cell_bytes(&self, instance: u64, id: u64) -> Result<u64> {
+    pub fn feed_cell_bytes(&self, instance: InstanceId, id: ChannelId) -> Result<u64> {
         let (bound, dense) = self.dense_channel(instance, id, "float-port feed")?;
         bound.session.cell_bytes(dense)
     }
 
-    pub fn feed_cell(&self, instance: u64, id: u64) -> Result<(u64, u64)> {
+    pub fn feed_cell(&self, instance: InstanceId, id: ChannelId) -> Result<(u64, u64)> {
         let (bound, dense) = self.dense_channel(instance, id, "float-port feed")?;
         bound.session.feed_cell(dense)?.ok_or_else(|| {
             Fault::program(
@@ -163,18 +169,18 @@ impl Plane {
 #[derive(Debug)]
 pub struct Plane {
     cache: Cache,
-    programs: BTreeMap<u64, Program>,
-    by_hash: BTreeMap<u64, u64>,
-    instances: BTreeMap<u64, Bound>,
+    programs: BTreeMap<ProgramId, Program>,
+    by_hash: BTreeMap<u64, ProgramId>,
+    instances: BTreeMap<InstanceId, Bound>,
     next_program: u64,
     next_instance: u64,
-    staged: Vec<(u64, Extents, u64)>,
+    staged: Vec<(ProgramId, Extents, InstanceId)>,
     wave: Wave,
     shadow: bool,
     flight: u32,
     /// Instances closed while a fire of theirs was airborne: each closes
     /// when its last one settles, the device done reading its rings.
-    closing: std::collections::BTreeSet<u64>,
+    closing: std::collections::BTreeSet<InstanceId>,
 }
 
 impl Default for Plane {
@@ -213,7 +219,7 @@ impl Plane {
     }
 
     #[must_use]
-    pub fn predictions(&self) -> Vec<(u64, Vec<Cursor>)> {
+    pub fn predictions(&self) -> Vec<(InstanceId, Vec<Cursor>)> {
         self.instances
             .iter()
             .map(|(id, bound)| (*id, bound.session.predictions()))
@@ -229,7 +235,7 @@ impl Plane {
         &mut self,
         context: &Context,
         registration: &ProgramRegistration,
-    ) -> Result<u64> {
+    ) -> Result<ProgramId> {
         if let Some(&existing) = self.by_hash.get(&registration.program_hash) {
             return Ok(existing);
         }
@@ -242,7 +248,7 @@ impl Plane {
             Target::of(context)?,
         )?;
 
-        let id = self.next_program;
+        let id = ProgramId(self.next_program);
         self.next_program += 1;
         self.programs.insert(
             id,
@@ -259,21 +265,21 @@ impl Plane {
     }
 
     #[must_use]
-    pub fn program(&self, id: u64) -> Option<&Program> {
+    pub fn program(&self, id: ProgramId) -> Option<&Program> {
         self.programs.get(&id)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn bind(
         &mut self,
-        program_id: u64,
+        program_id: ProgramId,
         seeds: &[(u32, Vec<u8>)],
         extents: Extents,
         geometry: GeometryClass,
         adopted: &[Option<std::sync::Arc<Endpoint>>],
-        ids: &[u64],
+        ids: &[ChannelId],
         stream: *mut core::ffi::c_void,
-    ) -> Result<u64> {
+    ) -> Result<InstanceId> {
         let program = self
             .programs
             .get_mut(&program_id)
@@ -297,7 +303,7 @@ impl Plane {
                 return Err(why);
             }
         };
-        let id = self.next_instance;
+        let id = InstanceId(self.next_instance);
         self.next_instance += 1;
         self.instances.insert(
             id,
@@ -312,7 +318,7 @@ impl Plane {
         Ok(id)
     }
 
-    pub fn envelope(&self, id: u64) -> Result<Option<Envelope>> {
+    pub fn envelope(&self, id: InstanceId) -> Result<Option<Envelope>> {
         let bound = self
             .instances
             .get(&id)
@@ -336,12 +342,12 @@ impl Plane {
     }
 
     #[must_use]
-    pub fn geometry_of(&self, id: u64) -> Option<GeometryClass> {
+    pub fn geometry_of(&self, id: InstanceId) -> Option<GeometryClass> {
         self.instances.get(&id).map(|bound| bound.geometry)
     }
 
     #[must_use]
-    pub fn token_device_source(&self, id: u64) -> Option<(u64, u32)> {
+    pub fn token_device_source(&self, id: InstanceId) -> Option<(u64, u32)> {
         let bound = self.instances.get(&id)?;
         if bound.geometry == GeometryClass::Host {
             return None;
@@ -353,7 +359,7 @@ impl Plane {
     }
 
     #[must_use]
-    pub fn fold_device_source(&self, id: u64) -> Option<(u64, u32)> {
+    pub fn fold_device_source(&self, id: InstanceId) -> Option<(u64, u32)> {
         let bound = self.instances.get(&id)?;
         let program = self.programs.get(&bound.program_id)?;
         bound
@@ -362,18 +368,18 @@ impl Plane {
     }
 
     #[must_use]
-    pub fn instance(&self, id: u64) -> Option<&Session> {
+    pub fn instance(&self, id: InstanceId) -> Option<&Session> {
         self.instances.get(&id).map(|bound| &bound.session)
     }
 
-    pub fn instance_mut(&mut self, id: u64) -> Option<&mut Session> {
+    pub fn instance_mut(&mut self, id: InstanceId) -> Option<&mut Session> {
         self.instances.get_mut(&id).map(|bound| &mut bound.session)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn bind_intrinsic(
         &mut self,
-        id: u64,
+        id: InstanceId,
         intrinsic: eta_ir::op::IntrinsicId,
         base: u64,
         storage: u32,
@@ -388,7 +394,7 @@ impl Plane {
             .bind_intrinsic(intrinsic, base, storage, width, row_stride, row_offset)
     }
 
-    pub fn needs_mtp_drafts(&self, id: u64) -> Result<bool> {
+    pub fn needs_mtp_drafts(&self, id: InstanceId) -> Result<bool> {
         let bound = self
             .instances
             .get(&id)
@@ -406,7 +412,7 @@ impl Plane {
     }
 
     #[must_use]
-    pub fn declared_score_planes(&self, id: u64) -> Option<u32> {
+    pub fn declared_score_planes(&self, id: InstanceId) -> Option<u32> {
         let bound = self.instances.get(&id)?;
         let program = self.programs.get(&bound.program_id)?;
         program
@@ -419,7 +425,7 @@ impl Plane {
             .max()
     }
 
-    pub fn ready(&self, id: u64) -> Result<Option<u32>> {
+    pub fn ready(&self, id: InstanceId) -> Result<Option<u32>> {
         let bound = self
             .instances
             .get(&id)
@@ -437,7 +443,7 @@ impl Plane {
     }
 
     #[must_use]
-    pub fn disagreeing_ticket(&self, id: u64, tickets: &[engine::Ticket]) -> Option<String> {
+    pub fn disagreeing_ticket(&self, id: InstanceId, tickets: &[engine::Ticket]) -> Option<String> {
         let bound = self.instances.get(&id)?;
         for ticket in tickets {
             let Some(dense) = bound.ids.iter().position(|held| *held == ticket.channel) else {
@@ -466,7 +472,7 @@ impl Plane {
         None
     }
 
-    pub fn fire(&mut self, context: &Context, id: u64) -> Result<Fired> {
+    pub fn fire(&mut self, context: &Context, id: InstanceId) -> Result<Fired> {
         match self.stage(id)? {
             Launched::Airborne => {
                 self.fly(context)?;
@@ -478,7 +484,7 @@ impl Plane {
         }
     }
 
-    pub fn stage(&mut self, id: u64) -> Result<Launched> {
+    pub fn stage(&mut self, id: InstanceId) -> Result<Launched> {
         let Plane {
             programs,
             instances,
@@ -519,7 +525,7 @@ impl Plane {
             ..
         } = self;
 
-        let mut groups: Vec<(u64, Extents, Vec<u64>)> = Vec::new();
+        let mut groups: Vec<(ProgramId, Extents, Vec<InstanceId>)> = Vec::new();
         for (program_id, extents, instance) in staged.iter() {
             match groups
                 .iter_mut()
@@ -578,11 +584,11 @@ impl Plane {
     }
 
     fn fly_one(
-        programs: &mut BTreeMap<u64, Program>,
-        instances: &mut BTreeMap<u64, Bound>,
-        program_id: u64,
+        programs: &mut BTreeMap<ProgramId, Program>,
+        instances: &mut BTreeMap<InstanceId, Bound>,
+        program_id: ProgramId,
         extents: Extents,
-        members: &[u64],
+        members: &[InstanceId],
         stream: *mut core::ffi::c_void,
     ) -> Result<()> {
         {
@@ -650,7 +656,7 @@ impl Plane {
         self.wave.clear();
     }
 
-    pub fn settle_launched(&mut self, id: u64) -> Result<Fired> {
+    pub fn settle_launched(&mut self, id: InstanceId) -> Result<Fired> {
         let bound = self
             .instances
             .get_mut(&id)
@@ -664,7 +670,7 @@ impl Plane {
 
     /// The shared rings instance `id`'s stages put.
     #[must_use]
-    pub fn shared_puts(&self, id: u64) -> Vec<usize> {
+    pub fn shared_puts(&self, id: InstanceId) -> Vec<usize> {
         let Some(bound) = self.instances.get(&id) else {
             return Vec::new();
         };
@@ -677,7 +683,7 @@ impl Plane {
     /// The shared rings the host reads to resolve instance `id`'s
     /// descriptor ports (none for a host-geometry instance).
     #[must_use]
-    pub fn host_resolved_rings(&self, id: u64) -> Vec<usize> {
+    pub fn host_resolved_rings(&self, id: InstanceId) -> Vec<usize> {
         let Some(bound) = self.instances.get(&id) else {
             return Vec::new();
         };
@@ -692,7 +698,7 @@ impl Plane {
             .host_resolved_rings(&program.plan, bound.geometry)
     }
 
-    pub fn shared_rings(&self, id: u64) -> Vec<usize> {
+    pub fn shared_rings(&self, id: InstanceId) -> Vec<usize> {
         self.instances
             .get(&id)
             .map(|bound| bound.session.shared_rings().collect())
@@ -700,7 +706,7 @@ impl Plane {
     }
 
     /// Closes instance `id`, once its airborne fires settle if it has any.
-    pub fn close_instance(&mut self, id: u64) -> Result<()> {
+    pub fn close_instance(&mut self, id: InstanceId) -> Result<()> {
         let bound = self
             .instances
             .get(&id)
@@ -712,7 +718,7 @@ impl Plane {
         self.close_now(id)
     }
 
-    fn close_now(&mut self, id: u64) -> Result<()> {
+    fn close_now(&mut self, id: InstanceId) -> Result<()> {
         let bound = self
             .instances
             .remove(&id)
@@ -728,7 +734,7 @@ impl Plane {
         Ok(())
     }
 
-    pub fn close_program(&mut self, id: u64) -> Result<()> {
+    pub fn close_program(&mut self, id: ProgramId) -> Result<()> {
         let program = self
             .programs
             .get(&id)
@@ -757,11 +763,11 @@ impl Plane {
 
 #[derive(Debug)]
 struct Bound {
-    program_id: u64,
+    program_id: ProgramId,
     session: Session,
     endpoints: Vec<Option<std::sync::Arc<Endpoint>>>,
     geometry: GeometryClass,
-    ids: Vec<u64>,
+    ids: Vec<ChannelId>,
 }
 
 fn endpoints_for(

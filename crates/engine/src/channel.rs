@@ -2,7 +2,16 @@ use serde::{Deserialize, Serialize};
 
 use eta_ir::container::{ChanDType, ExternDir, HostRole};
 
-pub type ChannelId = u64;
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
+pub struct ChannelId(pub u64);
+
+impl std::fmt::Display for ChannelId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelSeed {
@@ -25,7 +34,7 @@ pub struct ChannelRegistration {
 impl Default for ChannelRegistration {
     fn default() -> ChannelRegistration {
         ChannelRegistration {
-            id: 0,
+            id: ChannelId(0),
             shape: Vec::new(),
             dtype: ChanDType::Concrete(eta_ir::types::Dtype::F32),
             host_role: HostRole::None,

@@ -244,7 +244,7 @@ impl<'a> Seated<'a> {
 pub struct Attached {
     pub lane: u32,
 
-    pub instance: u64,
+    pub instance: engine::InstanceId,
 
     pub at: Boundary,
 }

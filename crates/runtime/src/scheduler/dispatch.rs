@@ -7,15 +7,13 @@ use eta_ir::registry::GeometryClass;
 use ::engine::program::BindExtents;
 use ::engine::{ChannelRegistration, KvCopy, ProgramRegistration, StateCopy};
 
-use crate::engine::{
-    BoundInstance, ChannelEndpoint, ChannelValue, EngineId, InstanceBindingPlan, InstanceId,
-};
+use crate::engine::{BoundInstance, ChannelEndpoint, ChannelValue, EngineId, InstanceBindingPlan};
 
 use super::worker::PreLaunchCopy;
 use super::{ProcessId, scheduler_handle};
 
 fn seeds_in_declaration_order(
-    channel_ids: &[u64],
+    channel_ids: &[::engine::ChannelId],
     seed_values: Vec<ChannelValue>,
 ) -> Result<Vec<::engine::channel::ChannelSeed>> {
     seed_values
@@ -48,8 +46,7 @@ pub(crate) async fn register_channels_bind_classified(
     pipeline_id: Option<ProcessId>,
     plans: Vec<ChannelRegistration>,
     program: ProgramRegistration,
-    requested_instance_id: InstanceId,
-    channel_ids: Vec<u64>,
+    channel_ids: Vec<::engine::ChannelId>,
     seed_values: Vec<ChannelValue>,
     geometry_class: GeometryClass,
     extents: BindExtents,
@@ -58,7 +55,6 @@ pub(crate) async fn register_channels_bind_classified(
     BoundInstance,
     super::worker::SchedulerHandle,
 )> {
-    let _ = requested_instance_id;
     let handle = scheduler_handle(engine_idx)?;
     let table = waker::WakerTable::global();
     let pacing_wait_id = table.alloc();
@@ -72,7 +68,7 @@ pub(crate) async fn register_channels_bind_classified(
     let bind = InstanceBindingPlan::new(
         engine_idx,
         pacing_wait_id,
-        0,
+        ::engine::ProgramId(0),
         channel_ids,
         seeds,
         geometry_class,
@@ -101,7 +97,7 @@ pub(crate) async fn register_channels_bind_classified(
     }
 }
 
-pub(crate) fn close_channels(engine_idx: EngineId, ids: Vec<u64>) -> Result<()> {
+pub(crate) fn close_channels(engine_idx: EngineId, ids: Vec<::engine::ChannelId>) -> Result<()> {
     scheduler_handle(engine_idx)?.close_channels(ids)
 }
 

@@ -48,8 +48,8 @@ pub struct Metal {
     contract_for: ContractFor,
     shell: Option<Shell>,
     caps: Option<Capabilities>,
-    next_fire: FireId,
-    next_frame: FrameId,
+    next_fire: u64,
+    next_frame: u64,
     sink: Option<engine::CompletionSink>,
     pending: Option<(FrameId, Vec<PendingStep>)>,
     adapters: BTreeMap<InstanceId, crate::adapter::Binding>,
@@ -90,7 +90,7 @@ impl Metal {
             .map_err(fault)?
             .ok_or(Error::Closed {
                 what: "instance",
-                id,
+                id: id.0,
             })
     }
 
@@ -674,7 +674,7 @@ impl Engine for Metal {
                 .as_ref()
                 .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
         )?;
-        let id = self.next_frame;
+        let id = FrameId(self.next_frame);
         self.next_frame = self.next_frame.wrapping_add(1);
         self.pending = None;
 
@@ -1026,7 +1026,7 @@ impl Metal {
             })
             .collect();
 
-        let id = self.next_fire;
+        let id = FireId(self.next_fire);
         self.next_fire = self.next_fire.wrapping_add(1);
 
         for (index, lane) in submission.lanes.iter().enumerate() {

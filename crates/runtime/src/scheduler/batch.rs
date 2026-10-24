@@ -12,7 +12,7 @@ pub(crate) struct StepBuild {
     pub(crate) lanes: Vec<::engine::Lane>,
     pub(crate) media: Vec<engine::fire::StepMedia>,
     pub(crate) voxels: Vec<engine::fire::StepVoxels>,
-    pub(crate) instance_ids: Vec<u64>,
+    pub(crate) instance_ids: Vec<::engine::InstanceId>,
     pub(crate) boundary_programs: Vec<bool>,
     pub(crate) member_lane_indptr: Vec<u32>,
     pub(crate) terminal_cells: Vec<CellPtr>,
@@ -99,7 +99,7 @@ impl AdmissionLimits {
 
 #[derive(Default)]
 pub(crate) struct StepGroup {
-    instances: HashSet<u64>,
+    instances: HashSet<::engine::InstanceId>,
     pipelines: HashSet<ProcessId>,
     forward_requests: usize,
     forward_tokens: usize,
@@ -337,16 +337,17 @@ pub(crate) fn build_frame_submission(
 mod tests {
     use super::*;
     use crate::engine::{FireRequest, WorkItemCompletion};
+    use ::engine::InstanceId;
     use eta_ir::registry::GeometryClass;
 
-    fn pending(request: FireRequest, instance_id: u64) -> Box<PendingRequest> {
+    fn pending(request: FireRequest, instance_id: InstanceId) -> Box<PendingRequest> {
         Box::new(PendingRequest {
             hook_program: false,
             lora_program: false,
             logical_fire_id: 1,
             request,
             instance_id,
-            completion: WorkItemCompletion::new(instance_id, 0),
+            completion: WorkItemCompletion::new(instance_id.0, 0),
             process_id: None,
             pipeline_id: None,
             prelaunch_copy: None,
@@ -389,13 +390,16 @@ mod tests {
     fn every_member_owns_a_span_of_the_steps_lanes() {
         let placeholder = FireRequest::default();
         let requests = vec![
-            pending(decode(11, 3), 1),
-            pending(placeholder, 2),
-            pending(decode(22, 4), 3),
+            pending(decode(11, 3), InstanceId(1)),
+            pending(placeholder, InstanceId(2)),
+            pending(decode(22, 4), InstanceId(3)),
         ];
         let step = build_batch_request(&requests, 16, &SchedulerStats::default());
         assert_eq!(step.member_lane_indptr, vec![0, 1, 1, 2]);
-        assert_eq!(step.instance_ids, vec![1, 2, 3]);
+        assert_eq!(
+            step.instance_ids,
+            vec![InstanceId(1), InstanceId(2), InstanceId(3)]
+        );
         assert_eq!(step.lanes.len(), 2, "the placeholder contributes no lane");
         assert_eq!(step.lanes[0].tokens, vec![11]);
         assert_eq!(step.lanes[1].tokens, vec![22]);
@@ -412,7 +416,11 @@ mod tests {
         two.lanes[1].rs_reset = engine::fire::RsReset::Fresh;
         let expected = two.lanes.clone();
 
-        let step = build_batch_request(&[pending(two, 1)], 16, &SchedulerStats::default());
+        let step = build_batch_request(
+            &[pending(two, InstanceId(1))],
+            16,
+            &SchedulerStats::default(),
+        );
         assert_eq!(step.member_lane_indptr, vec![0, 2]);
         assert_eq!(step.lanes, expected);
     }
@@ -425,7 +433,10 @@ mod tests {
             ],
             ..FireRequest::default()
         };
-        let requests = [pending(two, 9), pending(decode(33, 5), 10)];
+        let requests = [
+            pending(two, InstanceId(9)),
+            pending(decode(33, 5), InstanceId(10)),
+        ];
         let step = build_batch_request(&requests, 16, &SchedulerStats::default());
 
         assert_eq!(step.member_lane_indptr, vec![0, 2, 3]);
@@ -447,7 +458,10 @@ mod tests {
             1,
         )));
 
-        let requests = [pending(masked, 20), pending(decode(22, 4), 21)];
+        let requests = [
+            pending(masked, InstanceId(20)),
+            pending(decode(22, 4), InstanceId(21)),
+        ];
         let step = build_batch_request(&requests, 16, &SchedulerStats::default());
         assert_eq!(
             step.lanes[0].mask,
@@ -480,7 +494,10 @@ mod tests {
             .expect("and its peer");
 
         let (frame, _) = build_frame_submission(
-            vec![vec![pending(first, 41), pending(second, 42)]],
+            vec![vec![
+                pending(first, InstanceId(41)),
+                pending(second, InstanceId(42)),
+            ]],
             limits(),
             16,
             &SchedulerStats::default(),
@@ -502,7 +519,10 @@ mod tests {
         pooled.lanes[0].kv.pages.clear();
 
         let (frame, flattened) = build_frame_submission(
-            vec![vec![pending(pooled, 13), pending(decode(22, 4), 12)]],
+            vec![vec![
+                pending(pooled, InstanceId(13)),
+                pending(decode(22, 4), InstanceId(12)),
+            ]],
             limits(),
             16,
             &SchedulerStats::default(),
@@ -517,7 +537,7 @@ mod tests {
             vec![GeometryClass::Host, GeometryClass::DeviceGeometry],
             "host first, device-resolved as the suffix run"
         );
-        assert_eq!(step.instances, vec![12, 13]);
+        assert_eq!(step.instances, vec![InstanceId(12), InstanceId(13)]);
     }
 
     fn a_device_resolved_lane_counts_against_the_token_cap() {
@@ -534,7 +554,10 @@ mod tests {
             vec![4, 5, 6, 7],
         ));
         let (frame, _) = build_frame_submission(
-            vec![vec![pending(pooled, 1), pending(prefill, 2)]],
+            vec![vec![
+                pending(pooled, InstanceId(1)),
+                pending(prefill, InstanceId(2)),
+            ]],
             limits(),
             16,
             &SchedulerStats::default(),
@@ -554,8 +577,8 @@ mod tests {
     fn a_frames_cells_are_one_per_member_and_never_shared() {
         let (frame, flattened) = build_frame_submission(
             vec![
-                vec![pending(decode(11, 3), 1)],
-                vec![pending(decode(22, 4), 2)],
+                vec![pending(decode(11, 3), InstanceId(1))],
+                vec![pending(decode(22, 4), InstanceId(2))],
             ],
             limits(),
             16,

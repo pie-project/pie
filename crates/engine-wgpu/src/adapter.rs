@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use engine::program::InstanceId;
 use eta_compiler::codegen::launch::{LaunchPackage, ValueOrigin};
 use eta_ir::op::tags;
 
@@ -408,7 +409,7 @@ pub fn bf16_bits(value: f32) -> u16 {
 #[derive(Debug, Clone, Copy)]
 pub enum Source<'a> {
     Own {
-        instance: u64,
+        instance: InstanceId,
 
         planes: &'a [AdapterPlane<'a>],
     },
@@ -431,7 +432,7 @@ pub struct Binding {
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Key {
-    Instance(u64),
+    Instance(InstanceId),
 
     Shared(crate::blob::Stamp),
 }

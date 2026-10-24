@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use engine::InstanceId;
 use engine_cuda::blob::{Adapters, Blobs, Layout, Source};
 use engine_cuda::{AdapterPlane, BankSeat};
 
@@ -171,7 +172,7 @@ fn a_byte_seeded_instance_gets_a_slot_of_its_own() {
     let own = adapters
         .bind(
             Source::Own {
-                instance: 7,
+                instance: InstanceId(7),
                 planes: &planes,
             },
             &seats,
@@ -187,7 +188,7 @@ fn a_byte_seeded_instance_gets_a_slot_of_its_own() {
     let again = adapters
         .bind(
             Source::Own {
-                instance: 7,
+                instance: InstanceId(7),
                 planes: &planes,
             },
             &seats,

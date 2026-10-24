@@ -937,10 +937,10 @@ pub struct FrameSettlements {
 
 #[derive(Default)]
 struct Book {
-    frames: std::collections::HashMap<u64, PendingFrame>,
+    frames: std::collections::HashMap<engine::FrameId, PendingFrame>,
     /// Steps that landed before their frame was booked, and whether each
     /// faulted.
-    early: std::collections::HashMap<u64, Vec<(usize, bool)>>,
+    early: std::collections::HashMap<engine::FrameId, Vec<(usize, bool)>>,
 }
 
 impl FrameSettlements {
@@ -953,7 +953,7 @@ impl FrameSettlements {
     /// step by step.
     pub fn expect(
         &self,
-        frame: u64,
+        frame: engine::FrameId,
         steps: Vec<LandingStep>,
         completion: &SubmissionCompletion,
         broker: &CompletionBroker,
@@ -990,7 +990,7 @@ impl FrameSettlements {
         }
     }
 
-    pub fn forget(&self, frame: u64) {
+    pub fn forget(&self, frame: engine::FrameId) {
         let mut book = self.inner.lock().unwrap();
         book.frames.remove(&frame);
         book.early.remove(&frame);
@@ -999,7 +999,7 @@ impl FrameSettlements {
     /// Step `step` of frame `frame` landed, as `outcome` says.
     pub fn settled(
         &self,
-        frame: u64,
+        frame: engine::FrameId,
         step: usize,
         outcome: &engine::StepOutcome,
         broker: &CompletionBroker,
@@ -1009,12 +1009,17 @@ impl FrameSettlements {
             let mut book = self.inner.lock().unwrap();
             let Some(pending) = book.frames.get_mut(&frame) else {
                 book.early.entry(frame).or_default().push((step, failed));
-                tracing::debug!(frame, step, failed, "settled before its frame was booked");
+                tracing::debug!(
+                    frame = frame.0,
+                    step,
+                    failed,
+                    "settled before its frame was booked"
+                );
                 return;
             };
             let landed = pending.land(step, failed);
             if landed.frame.is_some() {
-                tracing::debug!(frame, failed, "frame settled");
+                tracing::debug!(frame = frame.0, failed, "frame settled");
                 book.frames.remove(&frame);
             }
             landed

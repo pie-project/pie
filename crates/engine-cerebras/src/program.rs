@@ -97,7 +97,7 @@ impl Latch {
             return;
         }
         tracing::debug!(
-            frame = self.at.frame,
+            frame = self.at.frame.0,
             step = self.at.step,
             "cerebras step landed"
         );
@@ -161,10 +161,10 @@ impl Plane {
             )));
         }
         self.next_program += 1;
-        let id = self.next_program;
+        let id = ProgramId(self.next_program);
         let on_device = self.forms.admit(id, &plan.package);
         tracing::debug!(
-            program = id,
+            program = id.0,
             on_device,
             refused = self.forms.refusal(id).map(ToString::to_string),
             "guest program registered"
@@ -221,7 +221,7 @@ impl Plane {
             .map(|_| ())
             .ok_or(Refusal::Closed {
                 what: "channel",
-                id,
+                id: id.0,
             })
     }
 
@@ -232,7 +232,7 @@ impl Plane {
             .cloned()
             .ok_or(Refusal::Closed {
                 what: "program",
-                id: binding.program,
+                id: binding.program.0,
             })?;
         let declared = plan.package.channels.len();
         if binding.channels.len() != declared {
@@ -274,7 +274,7 @@ impl Plane {
         let inst = eta_exec::make_host_instance(&plan, &externs, &seeds);
 
         self.next_instance += 1;
-        let id = self.next_instance;
+        let id = InstanceId(self.next_instance);
         let poisoned = Arc::new(AtomicBool::new(false));
         self.instances.insert(
             id,
@@ -368,14 +368,14 @@ impl Plane {
             .map(|_| ())
             .ok_or(Refusal::Closed {
                 what: "instance",
-                id,
+                id: id.0,
             })
     }
 
     pub fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         let Some(binding) = seat
             .plan
@@ -416,7 +416,7 @@ impl Plane {
     ) -> Result<Option<Tokens>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         if !seat.geometry.ports().contains(Port::EmbedTokens) {
             return Ok(None);
@@ -457,7 +457,7 @@ impl Plane {
     pub fn lane_count(&self, instance: InstanceId) -> Result<usize, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         Ok(self.embed_indptr(seat).len().saturating_sub(1).max(1))
     }
@@ -595,7 +595,7 @@ impl Plane {
     ) -> Result<Option<engine::fire::Masking>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         if !seat.geometry.ports().contains(Port::EmbedTokens) {
             return Ok(None);
@@ -758,13 +758,13 @@ impl Plane {
                     ) {
                         Ok(()) => break Some(form),
                         Err(Unfit::Memory(why)) => {
-                            tracing::info!(program, cols = form.cols, %why, "a guest stage overflows the PE; widening");
+                            tracing::info!(program = program.0, cols = form.cols, %why, "a guest stage overflows the PE; widening");
                             if self.forms.widen(program, &plan.package, &why).is_none() {
                                 break None;
                             }
                         }
                         Err(Unfit::Other(why)) => {
-                            tracing::warn!(program, %why, "a guest program loses its device form");
+                            tracing::warn!(program = program.0, %why, "a guest program loses its device form");
                             self.forms.demote(program, why);
                             break None;
                         }
@@ -866,7 +866,7 @@ impl Plane {
     ) -> Result<(), Refusal> {
         let seat = self.instances.get_mut(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         if let Some(values) = mtp_logits
             && mtp_width != vocab
@@ -922,7 +922,7 @@ impl Plane {
     fn instance_mut(&mut self, id: InstanceId) -> Result<&mut Instance, Refusal> {
         self.instances.get_mut(&id).ok_or(Refusal::Closed {
             what: "instance",
-            id,
+            id: id.0,
         })
     }
 }
@@ -987,7 +987,7 @@ impl Plane {
     pub fn feed_cell(&self, instance: InstanceId, channel: ChannelId) -> Result<Value, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         let dense = seat
             .channels
@@ -1030,7 +1030,7 @@ impl Plane {
     ) -> Result<Option<engine::ports::Envelope>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         if seat.geometry == GeometryClass::Host {
             return Ok(None);
