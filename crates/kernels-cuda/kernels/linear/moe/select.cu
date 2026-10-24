@@ -578,8 +578,11 @@ __global__ void moe_matmul_select_mlxu4_grouped(
     unsigned int* __restrict__ group_hits)
 {
 
+    // 64 of K a tile: the widened tile and the routes' fit the 48 KiB of
+    // static shared memory a block has (128 of K asks 72.5 KiB, which ptxas
+    // refuses at every instantiation).
     constexpr int kTileN = 128;
-    constexpr int kTileK = 128;
+    constexpr int kTileK = 64;
     constexpr int kBatch = 16;
     constexpr int kSlots = 4;
     constexpr int kRowsPerThread = 2;
