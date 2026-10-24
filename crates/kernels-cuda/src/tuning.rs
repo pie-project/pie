@@ -446,6 +446,13 @@ pub struct ElemwiseNormEmit;
 #[decision(id = "kernel.sdpa.index_radix", flag, default = false, tune = search)]
 pub struct SdpaIndexRadix;
 
+/// The most rows a scored index's radix ranking spreads each row's keys
+/// over a group of CTAs for (`attn/index/select.cu`, arch-generic), its
+/// picks the block-a-row ranking's; more rows rank a block a row. 0 never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.index_split_until", constant(range(0..=65_536)), default = 256, tune = search)]
+pub struct SdpaIndexSplitUntil(pub u32);
+
 /// The widest dense bf16 product (in columns) the GEMM tuner may also time
 /// on the narrow kernel (a block a row, every column's sum in registers);
 /// 0 never offers it.
@@ -900,6 +907,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaIndexFp4Tc5>()
         .add::<ElemwiseNormEmit>()
         .add::<SdpaIndexRadix>()
+        .add::<SdpaIndexSplitUntil>()
         .add::<SdpaPoolMma>()
         .add::<SdpaCompressedPrefillFrom>()
         .add::<SdpaCompressedReplay>()
@@ -1041,6 +1049,7 @@ tuning! {
     index_fp4_tc5: bool = false, on SdpaIndexFp4Tc5;
     norm_emit: bool = false, on ElemwiseNormEmit;
     index_radix: bool = false, on SdpaIndexRadix;
+    index_split_until: u32 = 256, get SdpaIndexSplitUntil;
     pool_mma: bool = false, on SdpaPoolMma;
     compressed_prefill_from: u32 = 0, get SdpaCompressedPrefillFrom;
     compressed_replay: bool = false, on SdpaCompressedReplay;

@@ -66,6 +66,10 @@ __device__ __forceinline__ u32 order_bits(float v) {
     return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
 }
 
+// `order_bits` of a score read as its bits: read as a float into the split
+// ranking's registers, +NaN's order bits came out unflipped (below +inf).
+__device__ __forceinline__ u32 order_of(u32 b) { return (b & 0x80000000u) ? ~b : (b | 0x80000000u); }
+
 // Block-wide exclusive prefix of `flag`, and the block's total.
 __device__ __forceinline__ int block_prefix(bool flag, int tid, int* warp_sums, int& total) {
     const int lane = tid & 31, warp = tid >> 5;
@@ -163,6 +167,39 @@ __device__ __forceinline__ void select_top_radix(const float* __restrict__ frow,
         written += took;
     }
     for (int n = written + tid; n < topk; n += kBlock) srow[n] = -1;
+}
+
+// One row's request, first page, page count and the blocks it sees, from a
+// ranking's tables over its first `R` requests.
+struct RowInfo {
+    int req, pages_first, num_pages, nkeys;
+};
+
+template <class P>
+__device__ __forceinline__ RowInfo row_info(const P& p, int t, int R) {
+    RowInfo ri;
+    // The request whose rows hold t, by halving (a prefill's 32 requests in
+    // five reads, where every role asks for both rows of every pair).
+    int lo = 0, hi = R - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (t < static_cast<int>(p.qo_indptr[mid + 1])) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    const int r = lo;
+    const int qo_lo = static_cast<int>(p.qo_indptr[r]);
+    const int new_tokens = static_cast<int>(p.qo_indptr[r + 1]) - qo_lo;
+    ri.pages_first = static_cast<int>(p.page_indptr[r]);
+    ri.num_pages = static_cast<int>(p.page_indptr[r + 1]) - ri.pages_first;
+    const int kv_len = (ri.num_pages - 1) * p.page_size + static_cast<int>(p.last_page_lens[r]);
+    const int total = kv_len - new_tokens + (t - qo_lo) + 1;
+    const int stride = p.ratio > 0 ? p.ratio : 1;
+    ri.nkeys = total > 0 ? min(total / stride, p.score_stride) : 0;
+    ri.req = r;
+    return ri;
 }
 
 // DeepSeek-V4.1's FP4 index keys: a position's 128 dims as e2m1 pairs (64

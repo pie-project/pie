@@ -4,6 +4,7 @@ use crate::error::Error;
 
 use crate::attn::index::K_BLOCK;
 use crate::attn::index::QueryTurn;
+use crate::attn::index::select::ranked_split;
 use crate::jit::{ArgValue, Ctx, Fire, Launch, kernel, stated};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
@@ -171,11 +172,24 @@ pub(crate) fn ranked_tc5(
         ),
         &[ArgValue::of(&map), ArgValue::of(&map8), bytes],
     )?;
-    select(ctx, bytes, selection)?;
+    if !ranked_split(
+        ctx,
+        q,
+        keys,
+        top_k,
+        ratio,
+        score_stride,
+        scores,
+        num_requests,
+        selection,
+    )? {
+        select(ctx, bytes, selection)?;
+    }
     Ok(true)
 }
 
-/// The rows a scorer landed in `scores` ranked a block a row
+/// The rows a scorer landed in `scores` ranked with a row's keys over a
+/// group of CTAs where [`ranked_split`] takes the fire, else a block a row
 /// (`index_select_rows`), as [`ranked_tc5`] ranks its own.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn select_rows(
@@ -190,6 +204,19 @@ pub(super) fn select_rows(
     num_requests: i32,
     selection: &mut Tensor,
 ) -> Result<(), Error> {
+    if ranked_split(
+        ctx,
+        q,
+        keys,
+        top_k,
+        ratio,
+        score_stride,
+        scores,
+        num_requests,
+        selection,
+    )? {
+        return Ok(());
+    }
     let params = Tc5Params {
         q: q.data.ptr,
         w: 0,

@@ -14,6 +14,8 @@ use logits_fp4::ranked_fp4;
 mod logits;
 #[cfg(feature = "cuda")]
 mod logits_fp4;
+#[cfg(feature = "cuda")]
+mod select;
 
 const INDEX: &str = "attn/index/index.cu";
 
