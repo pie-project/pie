@@ -241,10 +241,13 @@ fn a_joined_projection_answers_what_its_legs_answer() {
 fn check(name: &str) {
     let row = poem_compiler::catalog::deployment(name)
         .unwrap_or_else(|| panic!("`{name}` is listed"));
-    let unjoined = row
+    let mut unjoined = row
         .package
         .trace(&row.model.id, &row.deploy, &row.name, Platform::Cuda)
         .expect("the row traces");
+    // A package leaving its cuts to the compiler states them once they are
+    // inferred, as the lowering does before it joins.
+    poem_compiler::shard::infer::resolve(&mut unjoined);
     let joins = poem_compiler::pack::joins(&unjoined);
     if joins.is_empty() {
         eprintln!("{name}: the compiler joins nothing");
