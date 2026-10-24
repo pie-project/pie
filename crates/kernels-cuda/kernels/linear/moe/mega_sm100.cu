@@ -590,39 +590,53 @@ __global__ void __launch_bounds__(mega::kThreads, 1) mega_moe(
             const int items = R.tokens * j2;
             for (int item = static_cast<int>(blockIdx.x) + G * fw; item < items; item += kHelpers * G) {
                 const int t = item / j2, j = item - t * j2;
+                const int col = 128 * j + 8 * (lane % 16);
+                const long long tok = R.t0 + t;
+                // The token's experts and weights (lane k route k's), and its
+                // shared row, read while its routes land.
+                const int e_lane = lane < K ? __ldg(&p.routes[tok * K + lane]) : -1;
+                const float w_lane = !kFirst && lane < K ? __ldg(&p.weights[tok * K + lane]) : 0.f;
+                uint4 sv = make_uint4(0, 0, 0, 0);
+                if (kFirst && p.shared != nullptr && lane < 16) {
+                    sv = *reinterpret_cast<const uint4*>(p.shared + tok * H + col);
+                }
                 if (lane == 0) wait_count(&done[j], static_cast<u32>(live_routes));
                 __syncwarp();
-                if (lane < 16) {
-                    const int col = 128 * j + 8 * lane;
-                    const long long tok = R.t0 + t;
-                    float acc[8];
+                float acc[8];
 #pragma unroll
-                    for (int c = 0; c < 8; ++c) acc[c] = 0.f;
-                    for (int k = 0; k < K; ++k) {
-                        const long long r = tok * K + k;
-                        const int e = __ldg(&p.routes[r]);
-                        uint4 v = make_uint4(0, 0, 0, 0);
-                        if (e >= 0 && e < p.experts) {
-                            v = __ldcg(reinterpret_cast<const uint4*>(p.routed + r * H + col));
+                for (int c = 0; c < 8; ++c) acc[c] = 0.f;
+                // Eight routes' rows in flight at once, summed in route order.
+                for (int k0 = 0; k0 < K; k0 += 8) {
+                    uint4 v[8];
+                    float wt[8];
+#pragma unroll
+                    for (int u = 0; u < 8; ++u) {
+                        const int k = k0 + u;
+                        const int e = __shfl_sync(0xffffffffu, e_lane, k % 32);
+                        wt[u] = __shfl_sync(0xffffffffu, w_lane, k % 32);
+                        v[u] = make_uint4(0, 0, 0, 0);
+                        if (k < K && e >= 0 && e < p.experts && lane < 16) {
+                            v[u] = __ldcg(reinterpret_cast<const uint4*>(p.routed + (tok * K + k) * H + col));
                         }
-                        const unsigned wv[4] = {v.x, v.y, v.z, v.w};
-                        if constexpr (kFirst) {
+                    }
 #pragma unroll
-                            for (int c = 0; c < 4; ++c) {
+                    for (int u = 0; u < 8; ++u) {
+                        if (k0 + u >= K) break;
+                        const unsigned wv[4] = {v[u].x, v[u].y, v[u].z, v[u].w};
+#pragma unroll
+                        for (int c = 0; c < 4; ++c) {
+                            if constexpr (kFirst) {
                                 acc[2 * c] += __uint_as_float(wv[c] << 16);
                                 acc[2 * c + 1] += __uint_as_float(wv[c] & 0xFFFF0000u);
-                            }
-                        } else {
-                            const float wt = __ldg(&p.weights[r]);
-#pragma unroll
-                            for (int c = 0; c < 4; ++c) {
-                                acc[2 * c] += wt * __uint_as_float(wv[c] << 16);
-                                acc[2 * c + 1] += wt * __uint_as_float(wv[c] & 0xFFFF0000u);
+                            } else {
+                                acc[2 * c] += wt[u] * __uint_as_float(wv[c] << 16);
+                                acc[2 * c + 1] += wt[u] * __uint_as_float(wv[c] & 0xFFFF0000u);
                             }
                         }
                     }
+                }
+                if (lane < 16) {
                     if (kFirst && p.shared != nullptr) {
-                        const uint4 sv = *reinterpret_cast<const uint4*>(p.shared + tok * H + col);
                         const unsigned sw[4] = {sv.x, sv.y, sv.z, sv.w};
 #pragma unroll
                         for (int c = 0; c < 4; ++c) {
