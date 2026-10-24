@@ -119,6 +119,7 @@ fn load(trace: &Trace, joins: &[Join], unjoined: &Trace, tag: &str) -> (Shell, S
         residency: engine_cuda::experts::Plan::default(),
         deferred_tier: false,
         world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
     })
     .expect("the model loads");
