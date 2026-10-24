@@ -1,7 +1,7 @@
 //! The GPU core count by model identifier, for devices whose IORegistry does
 //! not say: iPhones and iPads. A row holds only where Apple's tech specs give
 //! one count for every configuration the identifier names.
-
+#![allow(unsafe_code)]
 #![cfg_attr(not(target_os = "ios"), allow(dead_code))]
 
 /// `(identifier, marketing name, chip, GPU cores)`.

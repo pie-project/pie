@@ -130,9 +130,7 @@ impl Drop for Seat {
 static SEATS: LazyLock<Mutex<HashMap<ProcessId, Seat>>> = LazyLock::new(Default::default);
 
 fn seats_held() -> std::sync::MutexGuard<'static, HashMap<ProcessId, Seat>> {
-    SEATS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    SEATS.lock().expect("seats lock poisoned")
 }
 
 pub(crate) fn seats_capped() -> bool {
@@ -333,7 +331,7 @@ pub(crate) fn release_bind_permit(permit: Option<OrderedPermit>) {
     if BIND_RELEASE_HOLD.load(Relaxed) {
         let mut held = HELD_BIND_PERMITS
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .expect("held bind permits lock poisoned");
         if BIND_RELEASE_HOLD.load(Relaxed) {
             held.push(permit);
             return;
@@ -349,7 +347,7 @@ pub(crate) fn set_bind_release_hold(hold: bool) {
     let drained = {
         let mut held = HELD_BIND_PERMITS
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .expect("held bind permits lock poisoned");
         std::mem::take(&mut *held)
     };
     drop(drained);

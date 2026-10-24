@@ -99,6 +99,8 @@ pub enum UnaryOp {
     Rsqrt,
     Sigmoid,
     Square,
+    /// `1 / x`: a compressed-tensors global scale, which divides where modelopt's multiplies.
+    Recip,
     /// `max(x, floor)`, the floor an f32's bits.
     AtLeast(u32),
 }
@@ -112,6 +114,7 @@ impl UnaryOp {
             Self::Rsqrt => x.sqrt().recip(),
             Self::Sigmoid => 1.0 / (1.0 + (-x).exp()),
             Self::Square => x * x,
+            Self::Recip => x.recip(),
             Self::AtLeast(floor) => x.max(f64::from(f32::from_bits(floor))),
         }
     }
@@ -122,6 +125,7 @@ impl UnaryOp {
             Self::NegLn => x < 0.0,
             Self::Sqrt => x >= 0.0,
             Self::Rsqrt => x > 0.0,
+            Self::Recip => x != 0.0 && !x.is_nan(),
             Self::Sigmoid | Self::Square | Self::AtLeast(_) => !x.is_nan(),
         }
     }
@@ -132,6 +136,7 @@ impl UnaryOp {
             Self::NegLn => "strictly negative",
             Self::Sqrt => "non-negative",
             Self::Rsqrt => "strictly positive",
+            Self::Recip => "a non-zero number",
             Self::Sigmoid | Self::Square | Self::AtLeast(_) => "a number",
         }
     }

@@ -1,7 +1,7 @@
 //! The foundation every other kernel stands on: hiprtc compiles a unit for
 //! the device's architecture, the module loads, and a launch writes what the
 //! host expects. Skips (passes vacuously) on a machine with no HIP device.
-
+#![allow(unsafe_code)]
 #![cfg(feature = "rocm")]
 
 use core::ffi::c_void;

@@ -2,7 +2,7 @@ use super::norm::Next;
 use super::*;
 use crate::error::Error;
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::Tensor;
 use dtype::Dtype;
@@ -68,7 +68,7 @@ pub fn norm_gate(
     };
     ctx.fire(
         OP,
-        Fire::at(NORM_UNIT, symbol(&entry)).apply(Launch::per_row(rows, BLOCK)),
+        Fire::at(kernel(NORM_UNIT, &entry)).apply(Launch::per_row(rows, BLOCK)),
         &[
             x.arg(),
             absent(scale.as_ref()),
@@ -232,13 +232,10 @@ fn fire(
     }
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             MODULATE,
-            symbol(&format!(
-                "::pie::elemwise::modulate<{t}, {tm}, {}>",
-                form.stamp()
-            )),
-        )
+            &format!("::pie::elemwise::modulate<{t}, {tm}, {}>", form.stamp()),
+        ))
         .apply(Launch::per_row(rows, BLOCK)),
         &[
             x.arg(),
@@ -313,10 +310,10 @@ pub fn gated_residual_add(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             MODULATE,
-            symbol(&format!("::pie::elemwise::gated_residual_add<{t}, {tm}>")),
-        )
+            &format!("::pie::elemwise::gated_residual_add<{t}, {tm}>"),
+        ))
         .apply(Launch::per_row(rows, BLOCK)),
         &[
             r.arg(),
@@ -342,13 +339,13 @@ pub fn norm_modulate(
     let (t, tm, width, rows) = fused_shapes(OP, x, m, lane_of_row, norm, o)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             MODULATE,
-            symbol(&format!(
+            &format!(
                 "::pie::elemwise::norm_modulate<{t}, {tm}, {BLOCK}, {}>",
                 norm.stamp()
-            )),
-        )
+            ),
+        ))
         .apply(Launch::per_row(rows, BLOCK)),
         &[
             x.arg(),
@@ -401,13 +398,13 @@ pub fn gated_residual_norm_modulate(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             MODULATE,
-            symbol(&format!(
+            &format!(
                 "::pie::elemwise::gated_residual_norm_modulate<{t}, {tm}, {BLOCK}, {}>",
                 norm.stamp()
-            )),
-        )
+            ),
+        ))
         .apply(Launch::per_row(rows, BLOCK)),
         &[
             r.arg(),

@@ -1112,7 +1112,7 @@ impl ProcessCtx {
             ));
         };
         let want = vec![shape.canvas, shape.self_cond_taps];
-        let mut ids = [0u64; 2];
+        let mut ids = [::engine::ChannelId::default(); 2];
         for (slot, (channel, dtype, what)) in [
             (&rows, eta_ir::types::Dtype::U32, "ids"),
             (&weights, eta_ir::types::Dtype::F32, "weights"),
@@ -1724,7 +1724,8 @@ impl ProcessCtx {
                         .unwrap_or_default(),
                 });
             }
-            let channel_ids: Vec<u64> = cells.iter().map(|c| c.lock().unwrap().global_id).collect();
+            let channel_ids: Vec<::engine::ChannelId> =
+                cells.iter().map(|c| c.lock().unwrap().global_id).collect();
             let channel_reps: Vec<u32> = channels.iter().map(|c| c.rep()).collect();
             let program_registration = ::engine::ProgramRegistration {
                 program_hash: prog.hash,
@@ -1772,7 +1773,6 @@ impl ProcessCtx {
                     Some(process_id),
                     registration_plans,
                     program_registration,
-                    instance.instance_id,
                     channel_ids.clone(),
                     seed_values,
                     geometry_class,
@@ -2151,7 +2151,7 @@ mod tests {
             kind,
             port: 0,
             channel_rep: 1,
-            channel_id: 1,
+            channel_id: ::engine::ChannelId(1),
             rows,
             clip: None,
         }

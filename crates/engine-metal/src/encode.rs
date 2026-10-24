@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::cell::RefCell;
 
 #[cfg(target_vendor = "apple")]
@@ -293,7 +294,7 @@ fn profiling() -> bool {
 pub fn kernel_profile() -> Vec<(String, u64, u64)> {
     let mut rows: Vec<(String, u64, u64)> = KERNEL_PROFILE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .expect("kernel profile lock poisoned")
         .iter()
         .map(|(name, &(ns, n))| (name.clone(), ns, n))
         .collect();
@@ -304,7 +305,7 @@ pub fn kernel_profile() -> Vec<(String, u64, u64)> {
 pub fn reset_kernel_profile() {
     KERNEL_PROFILE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .expect("kernel profile lock poisoned")
         .clear();
 }
 
@@ -327,9 +328,7 @@ fn profile_key(entrypoint: &str, args: &[ArgValue]) -> String {
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 fn record_kernel(name: &str, seconds: f64) {
     let ns = (seconds * 1e9).max(0.0) as u64;
-    let mut table = KERNEL_PROFILE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
     let row = table.entry(name.to_string()).or_insert((0, 0));
     row.0 += ns;
     row.1 += 1;

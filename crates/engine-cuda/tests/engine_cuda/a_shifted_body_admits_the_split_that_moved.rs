@@ -86,12 +86,9 @@ fn subject() -> Trace {
     let tokens = b.value(Def::Input(RuntimeInput::Tokens), act());
     let head = b.op(tokens, Guard::Always);
     let hot = b.op(head, Guard::Fact(0));
-    let cold = b.op(head, Guard::not(Guard::Fact(0)));
+    let cold = b.op(head, !Guard::Fact(0));
     let merged = b.value(
-        Def::Merge(vec![
-            (hot, Guard::Fact(0)),
-            (cold, Guard::not(Guard::Fact(0))),
-        ]),
+        Def::Merge(vec![(hot, Guard::Fact(0)), (cold, !Guard::Fact(0))]),
         act(),
     );
     let y = b.op(merged, Guard::Always);

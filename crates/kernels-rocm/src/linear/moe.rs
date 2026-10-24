@@ -1,8 +1,9 @@
+#![allow(unsafe_code)]
 use crate::error::Error;
 use dtype::Dtype;
 
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Kernel, Launch, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::Tensor;
 
@@ -90,10 +91,10 @@ pub fn topk_softmax(
     let (e, k) = router_extents(OP, logits, experts, top_k)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::linear::moe_topk_softmax<{t}>")),
-        )
+            &format!("::pie::linear::moe_topk_softmax<{t}>"),
+        ))
         .apply(router_lane(logits.rows)),
         &[
             logits.arg(),
@@ -133,10 +134,10 @@ pub fn topk_softmax_scaled(
     let (e, k) = router_extents(OP, logits, experts, top_k)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::linear::moe_topk_softmax_scaled<{t}>")),
-        )
+            &format!("::pie::linear::moe_topk_softmax_scaled<{t}>"),
+        ))
         .apply(router_lane(logits.rows)),
         &[
             logits.arg(),
@@ -156,8 +157,7 @@ pub fn topk_softmax_scaled(
 fn ranked_router(
     ctx: &Ctx,
     op: &'static str,
-    file: &'static str,
-    entrypoint: &'static str,
+    router: &'static Kernel,
     logits: Tensor,
     correction_bias: Option<Tensor>,
     experts: u32,
@@ -171,7 +171,7 @@ fn ranked_router(
     let (e, k) = router_extents(op, logits, experts, top_k)?;
     ctx.fire(
         op,
-        Fire::at(file, entrypoint).apply(router_lane(logits.rows)),
+        Fire::at(router).apply(router_lane(logits.rows)),
         &[
             logits.arg(),
             routes.arg(),
@@ -203,8 +203,7 @@ pub fn topk_sigmoid(
     ranked_router(
         ctx,
         OP,
-        FILE,
-        symbol(&format!("::pie::linear::moe_topk_sigmoid<{t}>")),
+        kernel(FILE, &format!("::pie::linear::moe_topk_sigmoid<{t}>")),
         logits,
         correction_bias,
         experts,
@@ -271,10 +270,10 @@ pub fn topk_sigmoid_sink(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::linear::moe_topk_sigmoid_sink<{t}>")),
-        )
+            &format!("::pie::linear::moe_topk_sigmoid_sink<{t}>"),
+        ))
         .apply(router_lane(logits.rows)),
         &[
             logits.arg(),
@@ -313,8 +312,7 @@ pub fn topk_sqrt_softplus(
     ranked_router(
         ctx,
         OP,
-        FILE,
-        symbol(&format!("::pie::linear::moe_topk_sqrt_softplus<{t}>")),
+        kernel(FILE, &format!("::pie::linear::moe_topk_sqrt_softplus<{t}>")),
         logits,
         Some(bias),
         experts,
@@ -684,7 +682,7 @@ fn select_batch(
     args.extend_from_slice(tail);
     ctx.fire(
         op,
-        Fire::at(file, symbol(entry)).apply(Launch::grid(
+        Fire::at(kernel(file, entry)).apply(Launch::grid(
             [ordered.work_cap, y.width.div_ceil(64 * nbw), 1],
             [GROUP_BLOCK, 1, 1],
         )),
@@ -763,7 +761,7 @@ fn select_gemm(
     // One slice of K: slicing measured no faster.
     ctx.fire(
         op,
-        Fire::at("linear/fp8.hip", "::pie::linear::moe_bf16_gemm8").apply(Launch::grid(
+        Fire::at(kernel("linear/fp8.hip", "::pie::linear::moe_bf16_gemm8")).apply(Launch::grid(
             [ordered.work_cap, y.width.div_ceil(128), 1],
             [2 * GROUP_BLOCK, 1, 1],
         )),
@@ -823,13 +821,10 @@ fn select_wide(
     };
     ctx.fire(
         op,
-        Fire::at(
-            FILE,
-            symbol(&format!(
+        Fire::at(kernel(FILE, &format!(
                 "::pie::linear::moe_matmul_select_dense_wide<{t}, ::pie::i32({mw}), ::pie::i32({nt}), \
                  ::pie::i32({WIDE_K}), ::pie::i32({depth}), ::pie::i32(2)>"
-            )),
-        )
+            )))
         .apply(Launch::grid(
             [8 * per_xcd * y.width.div_ceil(nt), 1, 1],
             [GROUP_BLOCK, 1, 1],
@@ -937,7 +932,7 @@ fn route_order(
         ]);
         ctx.fire(
             op,
-            Fire::at("linear/quant.hip", symbol(entry))
+            Fire::at(kernel("linear/quant.hip", entry))
                 .apply(Launch::grid([spans, 1, 1], [256, 1, 1]).smem((experts + 1) * 4)),
             &args,
         )
@@ -947,7 +942,7 @@ fn route_order(
     }
     ctx.fire(
         op,
-        Fire::at("linear/quant.hip", symbol("::pie::linear::moe_route_order"))
+        Fire::at(kernel("linear/quant.hip", "::pie::linear::moe_route_order"))
             .apply(Launch::grid([1, 1, 1], [ORDER_BLOCK, 1, 1]).smem(2 * (experts + 1) * 4)),
         &[
             routes.arg(),
@@ -1070,7 +1065,7 @@ fn grouped_launch(
     };
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&entry)).apply(launch),
+        Fire::at(kernel(FILE, &entry)).apply(launch),
         &[
             x.arg(),
             ArgValue::Ptr(ordered.order),
@@ -1113,7 +1108,7 @@ mod ordered {
         grouped_worth, route_order, select_grouped_launch, selected, takes_tall, weighted_sum,
     };
     use crate::error::Error;
-    use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, stated, symbol};
+    use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, kernel, stated};
     use crate::tensor::Tensor;
 
     /// The routed swiglu MLP in expert order, when both legs are the grouped
@@ -1202,10 +1197,10 @@ mod ordered {
             let clamp = if p.limit.is_some() { "true" } else { "false" };
             ctx.fire(
                 op,
-                Fire::at(
+                Fire::at(kernel(
                     FILE,
-                    symbol(&format!("::pie::linear::moe_swiglu_ordered<{t}, {clamp}>")),
-                )
+                    &format!("::pie::linear::moe_swiglu_ordered<{t}, {clamp}>"),
+                ))
                 .apply(Launch::grid(
                     [fan.route_count, i.div_ceil(8 * 256), 1],
                     [256, 1, 1],
@@ -1319,7 +1314,7 @@ fn stage_lt(
     let act_div = if fan.by_token { fan.top_k } else { 1 };
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&format!("::pie::linear::moe_lt_scatter<{t}>")))
+        Fire::at(kernel(FILE, &format!("::pie::linear::moe_lt_scatter<{t}>")))
             .apply(Launch::grid([copy_blocks(rows, k), 1, 1], [256, 1, 1])),
         &[
             x.arg(),
@@ -1460,10 +1455,10 @@ fn mlp_lt(ctx: &Ctx, op: &'static str, p: &RoutedMlp, y: &mut Tensor) -> Result<
     let clamp = if p.limit.is_some() { "true" } else { "false" };
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::linear::moe_swiglu_ordered<{ty}, {clamp}>")),
-        )
+            &format!("::pie::linear::moe_swiglu_ordered<{ty}, {clamp}>"),
+        ))
         .apply(Launch::grid([rows, i.div_ceil(8 * 256), 1], [256, 1, 1])),
         &[
             ArgValue::Ptr(stage.staged_out),
@@ -1485,7 +1480,7 @@ fn mlp_lt(ctx: &Ctx, op: &'static str, p: &RoutedMlp, y: &mut Tensor) -> Result<
     )? as usize as u64;
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&format!("::pie::linear::moe_lt_args<{ty}>")))
+        Fire::at(kernel(FILE, &format!("::pie::linear::moe_lt_args<{ty}>")))
             .apply(Launch::grid([1, 1, 1], [256, 1, 1])),
         &[
             ArgValue::Ptr(stage.ordered.offsets),
@@ -1503,7 +1498,7 @@ fn mlp_lt(ctx: &Ctx, op: &'static str, p: &RoutedMlp, y: &mut Tensor) -> Result<
     // The fold, each route's row read where it sits.
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&format!("::pie::linear::moe_lt_fold<{ty}>")))
+        Fire::at(kernel(FILE, &format!("::pie::linear::moe_lt_fold<{ty}>")))
             .apply(elementwise_rows(op, y.rows, y.width)?),
         &[
             y.arg(),
@@ -1624,7 +1619,7 @@ fn select_grouped_blas(
 
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::moe_align_decode<::pie::i32>")
+        Fire::at(kernel(FILE, "::pie::linear::moe_align_decode<::pie::i32>"))
             .apply(Launch::grid([1, 1, 1], [BLOCK, 1, 1]).smem((3 * experts + 34) * 4)),
         &[
             routes.arg(),
@@ -1642,10 +1637,10 @@ fn select_grouped_blas(
     let gather_fan = if fan.by_token { fan.top_k } else { 1 };
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::linear::gather_moe_aligned_inputs<{t}>")),
-        )
+            &format!("::pie::linear::gather_moe_aligned_inputs<{t}>"),
+        ))
         .apply(Launch::grid(
             [rows, x.width.div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
@@ -1665,10 +1660,10 @@ fn select_grouped_blas(
 
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::linear::build_moe_leg_ptrs<{t}>")),
-        )
+            &format!("::pie::linear::build_moe_leg_ptrs<{t}>"),
+        ))
         .apply(Launch::flat(blocks, BLOCK)),
         &[
             ArgValue::Ptr(expert_ids),
@@ -1712,10 +1707,10 @@ fn select_grouped_blas(
 
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::linear::reorder_moe_aligned_output<{t}>")),
-        )
+            &format!("::pie::linear::reorder_moe_aligned_output<{t}>"),
+        ))
         .apply(Launch::grid(
             [rows, y.width.div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
@@ -1856,12 +1851,10 @@ pub(crate) fn select_gemv(
     let form = if fan.by_token { "by_token" } else { "by_route" };
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
-                "::pie::linear::moe_matmul_select_gemv_{form}<{t}>"
-            )),
-        )
+            &format!("::pie::linear::moe_matmul_select_gemv_{form}<{t}>"),
+        ))
         .apply(launch),
         &[
             routes.arg(),
@@ -1982,7 +1975,7 @@ fn matmul_select_mxfp4(
         ]);
         return ctx.fire(
             op,
-            Fire::at("linear/quant.hip", symbol(&entry)).apply(if wmma {
+            Fire::at(kernel("linear/quant.hip", &entry)).apply(if wmma {
                 group_launch(ordered.work_cap, ordered.routes, y.width)
             } else {
                 Launch::grid(
@@ -2006,10 +1999,10 @@ fn matmul_select_mxfp4(
     )?;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             "linear/quant.hip",
-            symbol(&format!("::pie::linear::moe_matmul_select_mxfp4<{t}>")),
-        )
+            &format!("::pie::linear::moe_matmul_select_mxfp4<{t}>"),
+        ))
         .apply(launch),
         &[
             x.arg(),
@@ -2069,7 +2062,7 @@ pub fn mxfp4_lanes(
     let grid = u32::try_from(chunks.div_ceil(256).min(16384)).unwrap_or(16384);
     ctx.fire(
         op,
-        Fire::at("linear/fp8.hip", "::pie::linear::mxfp4_lanes")
+        Fire::at(kernel("linear/fp8.hip", "::pie::linear::mxfp4_lanes"))
             .apply(Launch::grid([grid, 1, 1], [256, 1, 1])),
         &[
             ArgValue::Ptr(codes),
@@ -2126,7 +2119,7 @@ pub fn matmul_select_mxfp4_lanes(
         let (rnw, rtn, rnb) = (4, 1, 4);
         return ctx.fire(
             op,
-            Fire::at("linear/fp8.hip", symbol(&format!("::pie::linear::moe_mxfp4_route<::pie::i32({rnw}), ::pie::i32({rtn}), ::pie::i32({rnb})>")))
+            Fire::at(kernel("linear/fp8.hip", &format!("::pie::linear::moe_mxfp4_route<::pie::i32({rnw}), ::pie::i32({rtn}), ::pie::i32({rnb})>")))
                 .apply(Launch::grid([fan.route_count, y.width.div_ceil(16 * rnw * rtn), 1], [64 * rnw, 1, 1])),
             &[
                 x.arg(),
@@ -2145,12 +2138,9 @@ pub fn matmul_select_mxfp4_lanes(
     let ordered = route_order(ctx, op, routes, &fan, experts, 16 * tm)?;
     ctx.fire(
         op,
-        Fire::at(
-            "linear/fp8.hip",
-            symbol(&format!(
+        Fire::at(kernel("linear/fp8.hip", &format!(
                 "::pie::linear::moe_mxfp4_group<::pie::i32({nw}), ::pie::i32({tm}), ::pie::i32({nb}), ::pie::i32({tn})>"
-            )),
-        )
+            )))
         .apply(Launch::grid([ordered.work_cap, y.width.div_ceil(16 * tn * nw), 1], [64 * nw, 1, 1])),
         &[
             x.arg(),
@@ -2351,7 +2341,7 @@ pub fn matmul_select_fp8_quantized(
     ]);
     ctx.fire(
         op,
-        Fire::at("linear/fp8.hip", symbol(&entry)).apply(Launch::grid(
+        Fire::at(kernel("linear/fp8.hip", &entry)).apply(Launch::grid(
             [ordered.work_cap, y.width.div_ceil(rows), 1],
             [threads, 1, 1],
         )),
@@ -2498,7 +2488,7 @@ fn matmul_select_mlxu4(
         ]);
         return ctx.fire(
             op,
-            Fire::at("linear/quant.hip", symbol(&entry)).apply(if wmma {
+            Fire::at(kernel("linear/quant.hip", &entry)).apply(if wmma {
                 group_launch(ordered.work_cap, ordered.routes, y.width)
             } else {
                 Launch::grid(
@@ -2522,12 +2512,9 @@ fn matmul_select_mlxu4(
     )?;
     ctx.fire(
         op,
-        Fire::at(
-            "linear/quant.hip",
-            symbol(&format!(
+        Fire::at(kernel("linear/quant.hip", &format!(
                 "::pie::linear::moe_matmul_select_mlxu4<{t}, ::pie::i32({bits}), ::pie::i32({group})>"
-            )),
-        )
+            )))
         .apply(launch),
         &[
             x.arg(),
@@ -2581,10 +2568,10 @@ pub fn sum_add(ctx: &Ctx, routed: Tensor, shared: Tensor, y: &mut Tensor) -> Res
     };
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::linear::moe_sum_add<{t}, {vec}>")),
-        )
+            &format!("::pie::linear::moe_sum_add<{t}, {vec}>"),
+        ))
         .apply(elementwise_rows(OP, y.rows, y.width / vec)?),
         &[
             y.arg(),
@@ -2732,13 +2719,13 @@ pub fn decode_mlp(
     let rows_a_block = 4 * DECODE_RPW;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
+            &format!(
                 "::pie::linear::moe_decode_glu<{ty}, {}, {DECODE_RPW}>",
                 x.width / 512
-            )),
-        )
+            ),
+        ))
         .apply(Launch::grid(
             [fan.route_count, i.div_ceil(rows_a_block), 1],
             [DECODE_BLOCK, 1, 1],
@@ -2760,13 +2747,13 @@ pub fn decode_mlp(
     };
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
+            &format!(
                 "::pie::linear::moe_decode_down<{ty}, {}, {top_k}, {DECODE_RPW}>",
                 i / 512
-            )),
-        )
+            ),
+        ))
         .apply(Launch::grid(
             [x.rows, hidden.div_ceil(rows_a_block), 1],
             [DECODE_BLOCK, 1, 1],
@@ -2848,12 +2835,10 @@ fn batch_mlp(
     let shared_rows = stated(OP, if banks.is_some() { x.rows } else { 0 })?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
-                "::pie::linear::moe_matmul_select_dense_batch_swiglu<{t}, ::pie::i32({mt})>"
-            )),
-        )
+            &format!("::pie::linear::moe_matmul_select_dense_batch_swiglu<{t}, ::pie::i32({mt})>"),
+        ))
         .apply(Launch::grid(
             [shared_items + ordered.work_cap, i.div_ceil(32), 1],
             [GROUP_BLOCK, 1, 1],
@@ -2878,12 +2863,9 @@ fn batch_mlp(
     let nbw = dense_nbw(mt);
     ctx.fire(
         OP,
-        Fire::at(
-            FILE,
-            symbol(&format!(
+        Fire::at(kernel(FILE, &format!(
                 "::pie::linear::moe_matmul_select_dense_batch<{t}, ::pie::i32({mt}), ::pie::i32({nbw})>"
-            )),
-        )
+            )))
         .apply(Launch::grid(
             [shared_items + ordered.work_cap, hidden.div_ceil(64 * nbw), 1],
             [GROUP_BLOCK, 1, 1],
@@ -2989,10 +2971,10 @@ fn weighted_fold(
     let vec = if y.width.is_multiple_of(8) { 8 } else { 1 };
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::linear::moe_weighted_sum<{t}, {vec}>")),
-        )
+            &format!("::pie::linear::moe_weighted_sum<{t}, {vec}>"),
+        ))
         .apply(elementwise_rows(OP, y.rows, y.width / vec)?),
         &[
             shared.map_or(*y, |s| s.y).arg(),
@@ -3046,7 +3028,7 @@ pub fn bias_sum(
     let top_k = nonzero(OP, "the routed fan-out", routes.width)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::moe_bias_sum<{t}>")))
+        Fire::at(kernel(FILE, &format!("::pie::linear::moe_bias_sum<{t}>")))
             .apply(elementwise_rows(OP, y.rows, y.width)?),
         &[
             y.arg(),
@@ -3081,10 +3063,10 @@ pub fn sigmoid_gate_add(
     debug_assert_eq!(gate.rows, y.rows, "the gate column is one scalar per row");
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             "linear/glu.hip",
-            symbol(&format!("::pie::linear::moe_sigmoid_gate_add<{t}>")),
-        )
+            &format!("::pie::linear::moe_sigmoid_gate_add<{t}>"),
+        ))
         .apply(elementwise_rows(OP, y.rows, y.width)?),
         &[
             y.arg(),

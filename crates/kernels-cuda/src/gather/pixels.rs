@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::Tensor;
 
 const FILE: &str = "gather/pixels.cu";
@@ -50,7 +50,7 @@ pub fn pixels(
     let order: i32 = if channel_major { 0 } else { 1 };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::gather::pixels<{t}>")))
+        Fire::at(kernel(FILE, &format!("::pie::gather::pixels<{t}>")))
             .apply(Launch::per_row(x.rows, BLOCK)),
         &[
             x.arg(),
@@ -113,7 +113,7 @@ pub fn grid_taps(
     let kind: i32 = if bilinear { 0 } else { 1 };
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol("::pie::gather::grid_taps"))
+        Fire::at(kernel(FILE, "::pie::gather::grid_taps"))
             .apply(Launch::flat(positions.rows, BLOCK)),
         &[
             positions.arg(),

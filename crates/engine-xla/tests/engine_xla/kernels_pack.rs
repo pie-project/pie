@@ -90,7 +90,7 @@ impl Native {
         let results: Vec<Val> = written.iter().map(|b| env.current[b]).collect();
         let text = func.module("pack", &results);
         let client = client.lock().unwrap();
-        let dev = client.devices()[0];
+        let dev = client.device(0).expect("a device");
         let exe = client
             .compile(&text)
             .unwrap_or_else(|e| panic!("{e}\n{text}"));

@@ -4,7 +4,7 @@ use dtype::Dtype;
 use crate::elemwise::hc_project::TILE_FROM;
 use crate::elemwise::hc_project::prenorm_fits;
 use crate::elemwise::hc_project::prenorm_launch;
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
 const HC: &str = "elemwise/hc.cu";
@@ -61,7 +61,7 @@ pub fn expand(ctx: &Ctx, x: Tensor, streams: u32, y: &mut Tensor) -> Result<(), 
     );
     ctx.fire(
         OP,
-        Fire::at(HC, symbol(&format!("::pie::elemwise::hc_expand<{t}>")))
+        Fire::at(kernel(HC, &format!("::pie::elemwise::hc_expand<{t}>")))
             .apply(elementwise_in(OP, x.rows, x.width)?),
         &[
             x.arg(),
@@ -98,7 +98,7 @@ pub fn rmsnorm_f32(ctx: &Ctx, streams: Tensor, eps: f32, y: &mut Tensor) -> Resu
     };
     ctx.fire(
         OP,
-        Fire::at(HC, entry).apply(Launch::per_row(y.rows, block)),
+        Fire::at(kernel(HC, entry)).apply(Launch::per_row(y.rows, block)),
         &[
             streams.arg(),
             y.arg(),
@@ -177,7 +177,7 @@ pub fn gates(
         };
         return ctx.fire(
             OP,
-            Fire::at(HC, symbol(&entry)).apply(Launch::grid([x.rows, grid_y, 1], [BLOCK, 1, 1])),
+            Fire::at(kernel(HC, &entry)).apply(Launch::grid([x.rows, grid_y, 1], [BLOCK, 1, 1])),
             &[
                 normed.arg(),
                 scale.arg(),
@@ -197,7 +197,7 @@ pub fn gates(
     }
     ctx.fire(
         OP,
-        Fire::at(HC, symbol(&format!("::pie::elemwise::hc_gates<{t}, 256>")))
+        Fire::at(kernel(HC, &format!("::pie::elemwise::hc_gates<{t}, 256>")))
             .apply(Launch::per_row(x.rows, BLOCK)),
         &[
             normed.arg(),
@@ -278,15 +278,15 @@ fn gates_norm_launch(
     };
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             HC,
-            symbol(&format!(
+            &format!(
                 "::pie::elemwise::hc_gates_norm<{t}, {}, {}, {threads}, {}>",
                 y.width / BLOCK,
                 partial.is_some(),
                 held.is_some()
-            )),
-        )
+            ),
+        ))
         .apply(Launch::grid([y.rows, 2, 1], [threads, 1, 1]).programmatic(ctx.tuning().pdl)),
         &[
             mixes,
@@ -382,7 +382,7 @@ pub fn fold(
     {
         return ctx.fire(
             OP,
-            Fire::at(HC, symbol(&format!("::pie::elemwise::hc_fold_rows4<{t}>")))
+            Fire::at(kernel(HC, &format!("::pie::elemwise::hc_fold_rows4<{t}>")))
                 .apply(Launch::per_row(y.rows, 128)),
             &[
                 x.arg(),
@@ -407,7 +407,7 @@ pub fn fold(
     // The vec8 fold waits on its producer in-kernel (`kernel.pdl`).
     ctx.fire(
         OP,
-        Fire::at(HC, symbol(&entry))
+        Fire::at(kernel(HC, &entry))
             .apply(elementwise_in(OP, y.rows, width)?.programmatic(ctx.tuning().pdl && vec8)),
         &[
             x.arg(),
@@ -457,10 +457,10 @@ pub fn collapse(
     nonzero(OP, "rows", y.rows)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             HC,
-            symbol(&format!("::pie::elemwise::hc_head_postprocess<{t}, 256>")),
-        )
+            &format!("::pie::elemwise::hc_head_postprocess<{t}, 256>"),
+        ))
         .apply(Launch::per_row(y.rows, BLOCK)),
         &[
             mixes.arg(),
@@ -524,7 +524,7 @@ pub fn mix(
     };
     ctx.fire(
         OP,
-        Fire::at(HC, symbol(&entry)).apply(launch),
+        Fire::at(kernel(HC, &entry)).apply(launch),
         &[
             gates.arg(),
             normed.arg(),
@@ -573,7 +573,7 @@ pub fn inject(
     };
     ctx.fire(
         OP,
-        Fire::at(HC, symbol(&entry)).apply(launch),
+        Fire::at(kernel(HC, &entry)).apply(launch),
         &[
             o.arg(),
             gates.arg(),
@@ -617,7 +617,7 @@ pub fn ple_gate(
     })?;
     ctx.fire(
         OP,
-        Fire::at(HC, symbol(&format!("::pie::elemwise::ple_gate<{t}, 256>")))
+        Fire::at(kernel(HC, &format!("::pie::elemwise::ple_gate<{t}, 256>")))
             .apply(Launch::per_row(blocks, BLOCK)),
         &[
             key.arg(),

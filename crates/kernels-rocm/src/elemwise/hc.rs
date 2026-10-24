@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
 const FILE: &str = "elemwise/hc.hip";
@@ -77,12 +77,10 @@ pub fn expand(ctx: &Ctx, x: Tensor, streams: u32, y: &mut Tensor) -> Result<(), 
     let vec = packs(x.width, &[&x, y]);
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
-                "::pie::elemwise::hc_expand<{t}, {fan}, {CHUNK_BLOCK}, {vec}>"
-            )),
-        )
+            &format!("::pie::elemwise::hc_expand<{t}, {fan}, {CHUNK_BLOCK}, {vec}>"),
+        ))
         .apply(per_chunk(OP, x.rows, x.width, 0)?),
         &[x.arg(), y.arg(), stated(OP, x.width)?.arg(), ctx.stage()],
     )
@@ -110,12 +108,10 @@ pub fn rmsnorm_f32(ctx: &Ctx, streams: Tensor, eps: f32, y: &mut Tensor) -> Resu
     };
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
-                "::pie::elemwise::hc_rmsnorm_f32<{NORM_BLOCK}, {NORM_CAP}, {vec}>"
-            )),
-        )
+            &format!("::pie::elemwise::hc_rmsnorm_f32<{NORM_BLOCK}, {NORM_CAP}, {vec}>"),
+        ))
         .apply(Launch::per_row(y.rows, NORM_BLOCK)),
         &[
             streams.arg(),
@@ -176,12 +172,10 @@ pub fn gates(
     let vec = packs(x.width, &[&streams, x]);
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
-                "::pie::elemwise::hc_gates<{t}, {fan}, {CHUNK_BLOCK}, {vec}, {comb}>"
-            )),
-        )
+            &format!("::pie::elemwise::hc_gates<{t}, {fan}, {CHUNK_BLOCK}, {vec}, {comb}>"),
+        ))
         .apply(per_chunk(OP, x.rows, x.width, 1)?),
         &[
             normed.arg(),
@@ -222,12 +216,10 @@ pub fn fold(
     let vec = packs(x.width, &[&x, &streams, y]);
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
-                "::pie::elemwise::hc_fold<{t}, {fan}, {CHUNK_BLOCK}, {vec}>"
-            )),
-        )
+            &format!("::pie::elemwise::hc_fold<{t}, {fan}, {CHUNK_BLOCK}, {vec}>"),
+        ))
         .apply(per_chunk(OP, y.rows, x.width, 0)?),
         &[
             x.arg(),
@@ -275,12 +267,10 @@ pub fn collapse(
     let vec = packs(y.width, &[&streams, y]);
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
-                "::pie::elemwise::hc_head_postprocess<{t}, {fan}, {CHUNK_BLOCK}, {vec}>"
-            )),
-        )
+            &format!("::pie::elemwise::hc_head_postprocess<{t}, {fan}, {CHUNK_BLOCK}, {vec}>"),
+        ))
         .apply(per_chunk(OP, y.rows, y.width, 0)?),
         &[
             mixes.arg(),
@@ -317,12 +307,10 @@ pub fn mix(
     let vec = packs(y.width, &[&gates, &normed, y]);
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
-                "::pie::elemwise::hc_mix<{t}, {fan}, {CHUNK_BLOCK}, {vec}>"
-            )),
-        )
+            &format!("::pie::elemwise::hc_mix<{t}, {fan}, {CHUNK_BLOCK}, {vec}>"),
+        ))
         .apply(per_chunk(OP, y.rows, y.width, 0)?),
         &[
             gates.arg(),
@@ -355,12 +343,10 @@ pub fn inject(
     let vec = packs(o.width, &[&o, hyper]);
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
-                "::pie::elemwise::hc_inject<{t}, {fan}, {CHUNK_BLOCK}, {vec}>"
-            )),
-        )
+            &format!("::pie::elemwise::hc_inject<{t}, {fan}, {CHUNK_BLOCK}, {vec}>"),
+        ))
         .apply(per_chunk(OP, o.rows, o.width, 0)?),
         &[
             o.arg(),
@@ -404,10 +390,10 @@ pub fn ple_gate(
     })?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::elemwise::ple_gate<{t}, 256>")),
-        )
+            &format!("::pie::elemwise::ple_gate<{t}, 256>"),
+        ))
         .apply(Launch::per_row(blocks, BLOCK)),
         &[
             key.arg(),

@@ -3,6 +3,7 @@ pub mod abi;
 #[cfg(feature = "cuda")]
 pub mod cache;
 mod ctx;
+mod kernel;
 #[cfg(feature = "cuda")]
 mod launch;
 
@@ -21,6 +22,7 @@ mod root;
 
 pub use abi::{Arg, ArgValue};
 pub use ctx::{Ctx, Fire, Launch, Pad, Slabs, kernels_strict, strict_kernels};
+pub use kernel::{Kernel, kernel};
 pub use root::{Features, Root, Toolchain, specific_of};
 
 use crate::error::Error;
@@ -41,24 +43,6 @@ pub(crate) fn compute_capability_major() -> Option<u32> {
 #[must_use]
 pub const fn aligned16(addr: u64) -> bool {
     addr & 15 == 0
-}
-
-#[must_use]
-pub fn symbol(name: &str) -> &'static str {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-
-    static INTERNED: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
-    let mut map = INTERNED
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(found) = map.get(name) {
-        return found;
-    }
-    let leaked: &'static str = Box::leak(name.to_owned().into_boxed_str());
-    map.insert(name.to_owned(), leaked);
-    leaked
 }
 
 pub(crate) fn refuse(op: &'static str, detail: impl Into<String>) -> Error {

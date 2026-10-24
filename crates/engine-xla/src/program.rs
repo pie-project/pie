@@ -3,6 +3,7 @@
 //! passes on the device (`Plane::fire_guests`), instances of one program
 //! batched into one executable per stage; any other runs in the host
 //! interpreter.
+#![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -95,22 +96,18 @@ impl Latch {
         if let Err(why) = outcome {
             self.fault
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("fault lock poisoned")
                 .get_or_insert(why);
         }
         if self.holds.fetch_sub(1, Ordering::AcqRel) != 1 {
             return;
         }
         tracing::debug!(
-            frame = self.at.frame,
+            frame = self.at.frame.0,
             step = self.at.step,
             "xla step landed"
         );
-        let fault = self
-            .fault
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+        let fault = self.fault.lock().expect("fault lock poisoned").take();
         if let Some(sink) = &self.sink {
             sink(
                 self.at,
@@ -167,9 +164,7 @@ pub struct InFlight {
 
 impl Flights {
     fn lock(&self) -> std::sync::MutexGuard<'_, Book> {
-        self.book
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        self.book.lock().expect("book lock poisoned")
     }
 
     /// Starts a deferred pass's download; it lands itself when the bytes
@@ -214,6 +209,8 @@ impl Flights {
         let event = match event {
             Ok(event) => event,
             Err(why) => {
+                // SAFETY: `dst` came from `Box::into_raw` above, and the
+                // copy failed to start, so the plugin never took it.
                 drop(unsafe { Box::from_raw(dst) });
                 let outcome = self.land(id, Err(why.to_string()), None);
                 if let Some(latch) = latch {
@@ -302,10 +299,7 @@ impl Flights {
     pub(crate) fn wait_ring(&self, ring: &Arc<ChannelState>) {
         let mut book = self.lock();
         while Self::on_ring(&book, ring) {
-            book = self
-                .landed
-                .wait(book)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            book = self.landed.wait(book).expect("landed lock poisoned");
         }
     }
 
@@ -313,10 +307,7 @@ impl Flights {
     pub(crate) fn wait_all(&self) {
         let mut book = self.lock();
         while !book.open.is_empty() {
-            book = self
-                .landed
-                .wait(book)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            book = self.landed.wait(book).expect("landed lock poisoned");
         }
     }
 
@@ -426,11 +417,11 @@ impl Plane {
             )));
         }
         self.next_program += 1;
-        let id = self.next_program;
+        let id = ProgramId(self.next_program);
 
         let admitted = self.forms.admit(id, &plan.package);
         tracing::debug!(
-            program = id,
+            program = id.0,
             device_form = admitted,
             why = self.forms.refusal(id).map(ToString::to_string),
             "guest program registered"
@@ -487,7 +478,7 @@ impl Plane {
             .map(|_| ())
             .ok_or(Refusal::Closed {
                 what: "channel",
-                id,
+                id: id.0,
             })
     }
 
@@ -498,7 +489,7 @@ impl Plane {
             .cloned()
             .ok_or(Refusal::Closed {
                 what: "program",
-                id: binding.program,
+                id: binding.program.0,
             })?;
         let declared = plan.package.channels.len();
         if binding.channels.len() != declared {
@@ -540,7 +531,7 @@ impl Plane {
         let inst = eta_exec::make_host_instance(&plan, &externs, &seeds);
 
         self.next_instance += 1;
-        let id = self.next_instance;
+        let id = InstanceId(self.next_instance);
         let poisoned = Arc::new(AtomicBool::new(false));
         self.instances.insert(
             id,
@@ -634,14 +625,14 @@ impl Plane {
             .map(|_| ())
             .ok_or(Refusal::Closed {
                 what: "instance",
-                id,
+                id: id.0,
             })
     }
 
     pub fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         let Some(binding) = seat
             .plan
@@ -682,7 +673,7 @@ impl Plane {
     ) -> Result<Option<Tokens>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         if !seat.geometry.ports().contains(Port::EmbedTokens) {
             return Ok(None);
@@ -738,7 +729,7 @@ impl Plane {
     pub fn lane_count(&self, instance: InstanceId) -> Result<usize, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         Ok(self.embed_indptr(seat).len().saturating_sub(1).max(1))
     }
@@ -884,7 +875,7 @@ impl Plane {
     ) -> Result<Option<engine::fire::Masking>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         if !seat.geometry.ports().contains(Port::EmbedTokens) {
             return Ok(None);
@@ -992,7 +983,7 @@ impl Plane {
         for &(instance, lane) in attachments {
             let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
                 what: "instance",
-                id: instance,
+                id: instance.0,
             })?;
             let lanes = self.embed_indptr(seat).len().saturating_sub(1).max(1);
             let at = kept.and_then(|k| k.seat(lane as usize, lanes));
@@ -1223,7 +1214,7 @@ impl Plane {
     ) -> Result<(), Refusal> {
         let seat = self.instances.get_mut(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         if let Some(values) = mtp_logits
             && mtp_width != vocab
@@ -1287,7 +1278,7 @@ impl Plane {
     fn instance_mut(&mut self, id: InstanceId) -> Result<&mut Instance, Refusal> {
         self.instances.get_mut(&id).ok_or(Refusal::Closed {
             what: "instance",
-            id,
+            id: id.0,
         })
     }
 }
@@ -1360,7 +1351,7 @@ impl Plane {
     pub fn feed_cell(&self, instance: InstanceId, channel: ChannelId) -> Result<Value, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         let dense = seat
             .channels
@@ -1403,7 +1394,7 @@ impl Plane {
     ) -> Result<Option<engine::ports::Envelope>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
-            id: instance,
+            id: instance.0,
         })?;
         if seat.geometry == GeometryClass::Host {
             return Ok(None);

@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::{KvPool, Tensor};
 
 const QKV_APPEND: &str = "attn/qkv_append.cu";
@@ -166,7 +166,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     if let Some(instantiation) = by_row.filter(|_| packed.rows >= ctx.tuning().qkv_rows_from) {
         return ctx.fire(
             OP,
-            Fire::at(FILE, symbol(&instantiation))
+            Fire::at(kernel(FILE, &instantiation))
                 .apply(Launch::grid([packed.rows, 1, 1], [block, 1, 1]).smem(smem)),
             &[
                 packed.arg(),
@@ -209,7 +209,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
         let units = packed.rows.saturating_mul(heads);
         return ctx.fire(
             OP,
-            Fire::at(FILE, symbol(&instantiation)).apply(
+            Fire::at(kernel(FILE, &instantiation)).apply(
                 Launch::grid([units.div_ceil(WARPS_PER_BLOCK), 1, 1], [WARP_BLOCK, 1, 1])
                     .programmatic(ctx.tuning().pdl),
             ),
@@ -263,12 +263,12 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             QKV_APPEND,
-            symbol(&format!(
+            &format!(
                 "::pie::attn::qkv_decode_qk_norm_rope_vnorm_write_kv<::pie::i32(128), false{pages}>"
-            )),
-        )
+            ),
+        ))
         .apply(Launch::grid([packed.rows, heads, 1], [DECODE_BLOCK, 1, 1])),
         &[
             packed.arg(),

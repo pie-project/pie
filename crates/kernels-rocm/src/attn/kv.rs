@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, stated, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, kernel, refuse, stated};
 use crate::tensor::{KvPool, Tensor};
 
 const FILE: &str = "attn/kv.hip";
@@ -93,10 +93,10 @@ pub(crate) fn write_kv_to_pages(
     let hnd = pool.layout != 0;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::attn::kv_append_explicit<{hnd}, {fp8}>")),
-        )
+            &format!("::pie::attn::kv_append_explicit<{hnd}, {fp8}>"),
+        ))
         .apply(Launch::per_row(k.rows, BLOCK)),
         &[
             k.arg(),
@@ -151,7 +151,11 @@ fn envelope_update_appended(
 
     ctx.fire(
         op,
-        Fire::at("attn/kv_envelope.hip", "::pie::layout::update_appended").apply(Launch::grid(
+        Fire::at(kernel(
+            "attn/kv_envelope.hip",
+            "::pie::layout::update_appended",
+        ))
+        .apply(Launch::grid(
             [max_touched.unsigned_abs(), kv_heads.unsigned_abs(), 1],
             [threads_for(head_dim), 1, 1],
         )),
@@ -198,10 +202,10 @@ pub(crate) fn write_mla_to_pages(
     let fp8 = mla_fp8_rows(pool);
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             "attn/mla.hip",
-            symbol(&format!("::pie::attn::mla_kv_append<{fp8}>")),
-        )
+            &format!("::pie::attn::mla_kv_append<{fp8}>"),
+        ))
         .apply(Launch::per_row(ckv.rows, MLA_WRITE_BLOCK)),
         &[
             ckv.arg(),

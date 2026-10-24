@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard};
 
 use dtype::Dtype;
 use kernels_cerebras::plan::Plan;
@@ -22,7 +22,7 @@ use crate::sdk::{Arch, Compile, Cslc, Sdk};
 static SIMULATOR: Mutex<()> = Mutex::new(());
 
 fn simulator_lock() -> MutexGuard<'static, ()> {
-    SIMULATOR.lock().unwrap_or_else(PoisonError::into_inner)
+    SIMULATOR.lock().expect("simulator lock poisoned")
 }
 
 /// Rounds to bf16, nearest even, and back.

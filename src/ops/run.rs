@@ -384,7 +384,7 @@ async fn drive(
         .await
         .context("connect to the engine this command just booted")?;
     client
-        .authenticate("pie-run", &None)
+        .authenticate("pie-run", None)
         .await
         .context("authenticate")?;
 

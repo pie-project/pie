@@ -27,3 +27,6 @@ objc2-metal = { version = "0.3", default-features = false, features = [
 
 [build-dependencies]
 cc = "1"
+
+[lints]
+workspace = true

@@ -3,7 +3,7 @@
 # vision tower beside it unread. The MXFP8 release stores every projection
 # e4m3 beside `*.weight_scale_inv` (one e8m0 a 1x32 block of each row).
 
-load("//pie/codec.poem", "bank", "kept", "weight")
+load("//pie/codec.poem", "bank", "kept", "nvfp4_packed_bank", "weight")
 
 def lifted(w):
     """`w`'s shape, its cut axis left for the stack to fill."""
@@ -61,7 +61,11 @@ def read(m, reads):
         reads.read(f.router, moe("gate.weight"))
         reads.read(f.bias, moe("e_score_correction_bias"))
         leg = lambda e, w: moe("experts.{}.{}.weight".format(e, w))
-        if kept(f.gate_up):
+        if f.gate_up.dtype in [dtype.nvfp4, dtype.nvfp4a4]:
+            # MiniMax-M3.1-Flash: its experts compressed-tensors NVFP4 beside MXFP8 projections
+            nvfp4_packed_bank(reads, f.gate_up, [[moe("experts.{}.w1".format(e)), moe("experts.{}.w3".format(e))] for e in range(f.experts)])
+            nvfp4_packed_bank(reads, f.down, [[moe("experts.{}.w2".format(e))] for e in range(f.experts)])
+        elif kept(f.gate_up):
             bank(reads, f.gate_up, [[leg(e, "w1"), leg(e, "w3")] for e in range(f.experts)])
             bank(reads, f.down, [[leg(e, "w2")] for e in range(f.experts)])
         else:

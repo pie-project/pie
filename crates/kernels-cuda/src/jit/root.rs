@@ -172,47 +172,19 @@ impl Root {
         DEVICE_HEADERS
     }
 
+    /// The disk cache's name for `instantiation` of this unit on `arch`:
+    /// everything the compiled image depends on.
     #[must_use]
     pub fn key(&self, instantiation: &str, arch: &str) -> String {
         format!(
-            "{}/i{:016x}",
-            self.key_prefix(arch),
-            source::fnv1a64(instantiation.as_bytes()),
-        )
-    }
-
-    fn key_prefix(&self, arch: &str) -> &'static str {
-        use std::collections::HashMap;
-        use std::sync::{Mutex, OnceLock};
-
-        static PREFIXES: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
-        let identity = format!(
-            "{}\u{1f}{arch}\u{1f}{}\u{1f}{}\u{1f}{:p}",
+            "jit/{}/{arch}/{FLOAT_CONTRACT}/{}/nvrtc>={}/r{:016x}/h{:016x}/i{:016x}",
             self.name,
             self.options.join(","),
             self.floor,
-            self.text.as_ptr(),
-        );
-        let cache = PREFIXES.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut cache = cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(found) = cache.get(&identity) {
-            return found;
-        }
-        let prefix: &'static str = Box::leak(
-            format!(
-                "jit/{}/{arch}/{FLOAT_CONTRACT}/{}/nvrtc>={}/r{:016x}/h{:016x}",
-                self.name,
-                self.options.join(","),
-                self.floor,
-                source::fnv1a64(self.text.as_bytes()),
-                source::digest(self.header_set()),
-            )
-            .into_boxed_str(),
-        );
-        cache.insert(identity, prefix);
-        prefix
+            source::fnv1a64(self.text.as_bytes()),
+            source::digest(self.header_set()),
+            source::fnv1a64(instantiation.as_bytes()),
+        )
     }
 }
 

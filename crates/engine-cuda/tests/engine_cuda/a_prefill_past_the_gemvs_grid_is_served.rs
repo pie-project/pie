@@ -1,7 +1,8 @@
 #![cfg(feature = "device")]
+#![allow(unsafe_code)]
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard};
 
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Boot, Lane, Shell};
@@ -17,7 +18,7 @@ const BOTH: u32 = 8_192;
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 fn serialized() -> MutexGuard<'static, ()> {
-    ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner)
+    ONE_AT_A_TIME.lock().expect("one at a time lock poisoned")
 }
 
 const PAGE: u32 = 16;

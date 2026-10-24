@@ -1,6 +1,7 @@
 //! The GPU's banks of a split, all views into the whole banks: the leading
 //! `keep` rows of gate and up (or of a projection) by offset, and the
 //! leading `keep` columns of down by a row stride wider than the width.
+#![allow(unsafe_code)]
 
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;

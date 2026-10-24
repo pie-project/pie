@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tokenizer::Specials;
 
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
@@ -23,14 +24,13 @@ pub struct Harmony {
 }
 
 impl Harmony {
-    #[must_use]
-    pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
-        let stop_ids = specials(&tokenizer, STOP_TOKENS);
+    pub fn try_new(tokenizer: Arc<Tokenizer>) -> Result<Self, String> {
+        let stop_ids = specials(&tokenizer, STOP_TOKENS)?;
 
-        let start = special(&tokenizer, "<|start|>");
-        let message = special(&tokenizer, "<|message|>");
-        let channel = special(&tokenizer, "<|channel|>");
-        let end = special(&tokenizer, "<|end|>");
+        let start = special(&tokenizer, "<|start|>")?;
+        let message = special(&tokenizer, "<|message|>")?;
+        let channel = special(&tokenizer, "<|channel|>")?;
+        let end = special(&tokenizer, "<|end|>")?;
 
         let role_prefix = |role: &str| -> Vec<u32> {
             let mut tokens = vec![start];
@@ -55,7 +55,7 @@ impl Harmony {
         let mut generation_prefix = vec![start];
         generation_prefix.extend(tokenizer.encode("assistant"));
 
-        Self {
+        Ok(Self {
             developer_prefix: role_prefix("developer"),
             user_prefix: role_prefix("user"),
             assistant_final_prefix: channel_prefix("final"),
@@ -64,7 +64,7 @@ impl Harmony {
             analysis_prefix,
             generation_prefix,
             tokenizer,
-        }
+        })
     }
 
     fn wrap(&self, prefix: &[u32], msg: &str) -> Vec<u32> {
@@ -243,7 +243,7 @@ impl Instruct for Harmony {
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(HarmonyToolDecoder {
-            decoder: self.tokenizer.decoder(false),
+            decoder: self.tokenizer.decoder(Specials::Keep),
             accumulated: String::new(),
             calling: None,
         })

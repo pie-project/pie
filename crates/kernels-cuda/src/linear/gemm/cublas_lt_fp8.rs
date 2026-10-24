@@ -2,6 +2,7 @@
 //! laid in atoms) against the rows quantized to e4m3 in 1x128 blocks (W8A8)
 //! on cuBLASLt's block-scaled FP8 GEMM (`BLK128x128_32F` A scales,
 //! `VEC128_32F` B scales): the wgmma GEMM where there is no tcgen05 one.
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -12,7 +13,7 @@ use cudarc::runtime::sys::{cudaGetDevice, cudaMemcpyAsync, cudaMemcpyKind};
 use dtype::Dtype;
 
 use crate::error::Error;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, stated};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, kernel, refuse, stated};
 use crate::tensor::Tensor;
 
 const ACT_QUANT: &str = "linear/act_quant.cu";
@@ -38,11 +39,18 @@ unsafe impl Send for Plan {}
 
 impl Drop for Plan {
     fn drop(&mut self) {
-        unsafe {
-            let _ = lt::cublasLtMatrixLayoutDestroy(self.d);
-            let _ = lt::cublasLtMatrixLayoutDestroy(self.b);
-            let _ = lt::cublasLtMatrixLayoutDestroy(self.a);
-            let _ = lt::cublasLtMatmulDescDestroy(self.desc);
+        // A build that failed part way leaves the later handles null.
+        for layout in [self.d, self.b, self.a] {
+            if !layout.is_null() {
+                // SAFETY: a layout `build` created for this plan alone, freed
+                // once here.
+                let _ = unsafe { lt::cublasLtMatrixLayoutDestroy(layout) };
+            }
+        }
+        if !self.desc.is_null() {
+            // SAFETY: the descriptor `build` created for this plan alone,
+            // freed once here, after the layouts.
+            let _ = unsafe { lt::cublasLtMatmulDescDestroy(self.desc) };
         }
     }
 }
@@ -66,6 +74,7 @@ fn state() -> &'static Mutex<Lt> {
 
 fn device() -> i32 {
     let mut device = 0;
+    // SAFETY: `device` is a local out-pointer; on an error it keeps its 0.
     let _ = unsafe { cudaGetDevice(&raw mut device) };
     device
 }
@@ -78,8 +87,12 @@ fn build(handle: lt::cublasLtHandle_t, m: u32, n: u32, k: u32, workspace: usize)
         a: std::ptr::null_mut(),
         b: std::ptr::null_mut(),
         d: std::ptr::null_mut(),
+        // SAFETY: `cublasLtMatmulAlgo_t` is an opaque array of u64 words;
+        // all-zero bytes are a valid value, overwritten below.
         algo: unsafe { core::mem::zeroed() },
     };
+    // SAFETY: `plan.desc` is a local out-pointer; the compute and scale
+    // types are the enum values cuBLASLt documents.
     let created = unsafe {
         lt::cublasLtMatmulDescCreate(
             &raw mut plan.desc,
@@ -90,6 +103,9 @@ fn build(handle: lt::cublasLtHandle_t, m: u32, n: u32, k: u32, workspace: usize)
     if created != OK {
         return None;
     }
+    // SAFETY: `plan.desc` was just created; every caller below passes a
+    // pointer to a local of exactly `bytes` bytes, of the type the attribute
+    // names, and cuBLASLt copies it before returning.
     let set = |attribute, value: *const c_void, bytes| unsafe {
         lt::cublasLtMatmulDescSetAttribute(plan.desc, attribute, value, bytes) == OK
     };
@@ -145,6 +161,8 @@ fn build(handle: lt::cublasLtHandle_t, m: u32, n: u32, k: u32, workspace: usize)
         (&raw mut plan.b, T::CUDA_R_8F_E4M3, k, m),
         (&raw mut plan.d, T::CUDA_R_16BF, n, m),
     ] {
+        // SAFETY: `layout` points at a field of the local `plan`, which
+        // outlives the call; the dims are plain integers.
         if unsafe {
             lt::cublasLtMatrixLayoutCreate(
                 layout,
@@ -159,11 +177,19 @@ fn build(handle: lt::cublasLtHandle_t, m: u32, n: u32, k: u32, workspace: usize)
         }
     }
     let mut pref: lt::cublasLtMatmulPreference_t = std::ptr::null_mut();
+    // SAFETY: `pref` is a local out-pointer.
     if unsafe { lt::cublasLtMatmulPreferenceCreate(&raw mut pref) } != OK {
         return None;
     }
+    // SAFETY: the heuristic result is a C struct of the opaque algo words,
+    // integers, a status enum whose zero is SUCCESS and a float; all-zero
+    // bytes are a valid value.
     let mut found: lt::cublasLtMatmulHeuristicResult_t = unsafe { core::mem::zeroed() };
     let mut returned = 0;
+    // SAFETY: `pref` was just created and `workspace` is a local usize of
+    // the size passed. `handle` is the live handle `plan_for` keeps for this
+    // device, the descriptors were all created above, and `found` and
+    // `returned` are locals with room for the one result asked for.
     let asked = unsafe {
         lt::cublasLtMatmulPreferenceSetAttribute(
             pref,
@@ -184,8 +210,11 @@ fn build(handle: lt::cublasLtHandle_t, m: u32, n: u32, k: u32, workspace: usize)
                 &raw mut returned,
             ) == OK
     };
+    // SAFETY: the preference created above, used by nothing after here.
     let _ = unsafe { lt::cublasLtMatmulPreferenceDestroy(pref) };
     if !asked || returned < 1 {
+        // SAFETY: takes no arguments; it clears a sticky error a refused
+        // heuristic may leave.
         let _ = unsafe { cudarc::runtime::sys::cudaGetLastError() };
         return None;
     }
@@ -200,14 +229,14 @@ fn plan_for(
     k: u32,
     workspace: usize,
 ) -> Option<(lt::cublasLtHandle_t, Arc<Mutex<Plan>>)> {
-    let mut st = state()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut st = state().lock().expect("lock poisoned");
     let dev = device();
     let handle = match st.handles.get(&dev) {
         Some(&h) => h as lt::cublasLtHandle_t,
         None => {
             let mut h: lt::cublasLtHandle_t = std::ptr::null_mut();
+            // SAFETY: `h` is a local out-pointer; the handle it receives is
+            // kept in `st.handles` for the process and never destroyed.
             if unsafe { lt::cublasLtCreate(&raw mut h) } != OK || h.is_null() {
                 return None;
             }
@@ -239,7 +268,7 @@ fn weight_scales(op: &'static str, atoms: u64, n: u32, k: u32) -> Result<u64, Er
     let mut held = SCALES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .expect("lock poisoned");
     if let Some(&at) = held.get(&key) {
         return Ok(at);
     }
@@ -275,7 +304,7 @@ fn weight_scales(op: &'static str, atoms: u64, n: u32, k: u32) -> Result<u64, Er
                     let ctx = Ctx::on(stream.cast());
                     let fired = ctx.fire(
                         op,
-                        Fire::at(ACT_QUANT, "::pie::linear::fp8b128_atoms_to_lt").apply(
+                        Fire::at(kernel(ACT_QUANT, "::pie::linear::fp8b128_atoms_to_lt")).apply(
                             Launch::grid([((n / 128) * kbp).div_ceil(256), 1, 1], [256, 1, 1]),
                         ),
                         &[
@@ -343,7 +372,11 @@ pub fn matmul(
     let lanes = u64::from(mpad) * u64::from(blocks) * 16;
     ctx.fire(
         op,
-        Fire::at(ACT_QUANT, "::pie::linear::quantize_rows_e4m3b128_lt").apply(Launch::grid(
+        Fire::at(kernel(
+            ACT_QUANT,
+            "::pie::linear::quantize_rows_e4m3b128_lt",
+        ))
+        .apply(Launch::grid(
             [u32::try_from(lanes.div_ceil(128)).unwrap_or(u32::MAX), 1, 1],
             [128, 1, 1],
         )),
@@ -356,9 +389,7 @@ pub fn matmul(
             stated(op, k)?.arg(),
         ],
     )?;
-    let plan = plan
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let plan = plan.lock().expect("plan lock poisoned");
     let slab = ctx.scratch_shared(op, LT_WORKSPACE, workspace)?;
     use lt::cublasLtMatmulDescAttributes_t as A;
     let pointer = std::mem::size_of::<*const c_void>();
@@ -367,6 +398,14 @@ pub fn matmul(
         xs as usize as *const c_void,
     );
     let (alpha, beta) = (1.0f32, 0.0f32);
+    // SAFETY: `plan` is locked for the whole block, so no other call sets
+    // its scale pointers between the sets and the matmul that reads them;
+    // each set passes a local pointer of `pointer` bytes. `handle` is this
+    // device's live handle, the descriptors are the plan's, `alpha`/`beta`
+    // are host f32 locals as the 32F compute type takes, and `slab` is a
+    // `workspace`-byte scratch slab on `ctx`. `xq`, `xs` and `d` are slabs
+    // sized above for `mpad` rows; `codes` and the scales from `atoms` are
+    // the caller's weight plane, its size the caller's to vouch for.
     let status = unsafe {
         if lt::cublasLtMatmulDescSetAttribute(
             plan.desc,
@@ -410,6 +449,9 @@ pub fn matmul(
     }
     if d != y.ptr {
         // The padded product's first `m` rows are the output's.
+        // SAFETY: `d` is the `mpad * n` bf16 scratch slab the matmul wrote
+        // and `m <= mpad`; `y` is the caller's `m x n` bf16 output. Both are
+        // on `ctx`'s stream, live by `Ctx::on`'s contract.
         let copied = unsafe {
             cudaMemcpyAsync(
                 y.ptr as usize as *mut c_void,

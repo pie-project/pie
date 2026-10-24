@@ -1,8 +1,9 @@
 //! The selected attention a block a row on tcgen05 (`attn/mla_sparse.cuh`).
+#![allow(unsafe_code)]
 pub(super) const SPARSE_SM100: &str = "attn/mla/sparse_sm100.cu";
 
 use super::{Ctx, Error, KvPool, Tensor};
-use crate::jit::{Arg, ArgValue, Fire, Launch, aligned16, symbol};
+use crate::jit::{Arg, ArgValue, Fire, Launch, aligned16, kernel};
 use crate::linear::gemm_sm100::supported;
 use dtype::Dtype;
 
@@ -415,20 +416,20 @@ fn launch(ctx: &Ctx, op: &'static str, s: &Shape<'_>, o: &mut Tensor) -> Result<
         let smem = 5 * 32768 + rope + 2 * 8192 + 2 * 8192 + 4 * 128 * 4 + 1024 + 2048 + 1024;
         return ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 SPARSE_SM100,
-                symbol(&format!("::pie::attn::mla::mla_sparse_e4<{}>", s.rope)),
-            )
+                &format!("::pie::attn::mla::mla_sparse_e4<{}>", s.rope),
+            ))
             .apply(Launch::grid([rows.min(sms), 1, 1], [384, 1, 1]).smem(smem)),
             &[ArgValue::of(&params)],
         );
     }
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             SPARSE_SM100,
-            symbol(&format!("::pie::attn::mla::mla_sparse<{}, {fp8}>", s.rope)),
-        )
+            &format!("::pie::attn::mla::mla_sparse<{}, {fp8}>", s.rope),
+        ))
         .apply(Launch::grid([(rows * splits).min(sms), 1, 1], [384, 1, 1]).smem(smem(s.rope, fp8))),
         &[
             ArgValue::of(&map_ckv),
@@ -442,7 +443,7 @@ fn launch(ctx: &Ctx, op: &'static str, s: &Shape<'_>, o: &mut Tensor) -> Result<
     }
     ctx.fire(
         op,
-        Fire::at(SPARSE_SM100, "::pie::attn::mla::mla_sparse_fold")
+        Fire::at(kernel(SPARSE_SM100, "::pie::attn::mla::mla_sparse_fold"))
             .apply(Launch::grid([rows, 64, 1], [128, 1, 1]).programmatic(ctx.tuning().pdl)),
         &[
             ArgValue::Ptr(part_o),

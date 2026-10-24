@@ -3,7 +3,7 @@
 use dtype::Dtype;
 
 use crate::error::Error;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, stated, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, kernel, stated};
 use crate::tensor::Tensor;
 
 const GEMV_FP8: &str = "linear/gemv_fp8.cu";
@@ -50,17 +50,17 @@ pub fn fp8_block_gemv(
     };
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             GEMV_FP8,
-            symbol(&format!(
+            &format!(
                 "::pie::linear::fp8_block_gemv<{WARPS}, {ROWS}, {rows_pad}{}>",
                 if gran == 128 {
                     String::new()
                 } else {
                     format!(", {gran}")
                 }
-            )),
-        )
+            ),
+        ))
         .apply(
             Launch::grid(
                 [n.div_ceil(ROWS * (WARPS / splits)), 1, 1],

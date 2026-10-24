@@ -11,7 +11,7 @@ use crate::attn::kv::native_e4m3;
 use crate::attn::kv::scheme_of;
 #[cfg(feature = "cuda")]
 use crate::jit::ArgValue;
-use crate::jit::{Arg, Ctx, Fire, Launch, refuse};
+use crate::jit::{Arg, Ctx, Fire, Launch, kernel, refuse};
 use crate::tensor::KvPool;
 #[cfg(feature = "cuda")]
 use crate::tensor::Tensor;
@@ -53,7 +53,7 @@ pub(crate) fn widen_e4m3(
     let chunks = u64::from(pages) * row_bytes / 16;
     ctx.fire(
         op,
-        Fire::at(KV_DEQUANT, "::pie::attn::widen_e4m3_pages").apply(Launch::flat(
+        Fire::at(kernel(KV_DEQUANT, "::pie::attn::widen_e4m3_pages")).apply(Launch::flat(
             u32::try_from(chunks).unwrap_or(u32::MAX),
             BLOCK,
         )),
@@ -110,7 +110,7 @@ pub(crate) fn dequant_active(
     match scheme_of(op, pool)? {
         KvScheme::Fp8PerTensor => ctx.fire(
             op,
-            Fire::at(KV_DEQUANT, "::pie::attn::dequant_fp8_pages_active").apply(launch),
+            Fire::at(kernel(KV_DEQUANT, "::pie::attn::dequant_fp8_pages_active")).apply(launch),
             &[
                 pool.keys.arg(),
                 pool.values.arg(),
@@ -124,10 +124,10 @@ pub(crate) fn dequant_active(
         ),
         KvScheme::Fp8PerTokenHead => ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 KV_DEQUANT,
                 "::pie::attn::dequant_fp8_per_token_head_pages_active<::pie::bf16>",
-            )
+            ))
             .apply(launch),
             &[
                 pool.keys.arg(),
@@ -145,10 +145,10 @@ pub(crate) fn dequant_active(
         ),
         KvScheme::Int8PerTokenHead => ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 KV_DEQUANT,
                 "::pie::attn::dequant_int8_per_token_head_pages_active<::pie::bf16>",
-            )
+            ))
             .apply(launch),
             &[
                 pool.keys.arg(),
@@ -166,10 +166,10 @@ pub(crate) fn dequant_active(
         ),
         KvScheme::Fp4Block => ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 KV_DEQUANT,
                 "::pie::attn::dequant_fp4_pages_active<::pie::bf16>",
-            )
+            ))
             .apply(launch),
             &[
                 pool.keys.arg(),

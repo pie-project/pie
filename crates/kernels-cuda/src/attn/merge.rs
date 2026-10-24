@@ -1,9 +1,11 @@
 //! Partial attention states folded into one (`attn/merge.cu`): the split-KV
 //! fold, the LSE merge, the sink rescale and the logit softcap.
+#![allow(unsafe_code)]
 
 use crate::error::Error;
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Kernel, Launch, count, dtype_dispatch, kernel, nonzero, refuse,
+    stated,
 };
 use crate::tensor::Tensor;
 use dtype::Dtype;
@@ -38,14 +40,14 @@ const fn merge_smem_bytes(head_dim: u32) -> Option<u32> {
     Some(NUM_SMEM_STAGES * bdy * head_dim * 2 + NUM_THREADS * 4)
 }
 
-fn merge_varlen_inst(head_dim: u32) -> Option<&'static str> {
+fn merge_varlen_inst(head_dim: u32) -> Option<String> {
     let (vec_size, bdx, bdy) = merge_geometry(head_dim)?;
-    Some(symbol(&format!(
+    Some(format!(
         "::pie::attn::fa2::PersistentVariableLengthMergeStatesKernel<\
          {vec_size}, {bdx}, {bdy}, {NUM_SMEM_STAGES}, \
          ::pie::attn::merge_lse::DTypeIn, ::pie::attn::merge_lse::DTypeO, \
          ::pie::attn::merge_lse::IdType>",
-    )))
+    ))
 }
 
 fn no_merge_row(op: &'static str) -> Error {
@@ -64,17 +66,17 @@ fn grid_blocks(per_sm: u32, max_seq_len: u32, num_heads: u32, num_sms: u32) -> u
 }
 
 #[cfg(feature = "cuda")]
-fn merge_blocks_per_sm(instantiation: &'static str, smem: u32) -> u32 {
+fn merge_blocks_per_sm(merge: &'static Kernel, smem: u32) -> u32 {
     use cudarc::driver::sys as dr;
 
-    let Some(root) = crate::jit::Root::of(MERGE) else {
-        return 1;
-    };
-    let Ok(resolved) = crate::jit::cache::resolve(&root, instantiation) else {
+    let Ok(resolved) = merge.resolve() else {
         return 1;
     };
     let mut blocks: core::ffi::c_int = 0;
 
+    // SAFETY: `blocks` is a local out-pointer and `resolved.function` is a
+    // handle the cache keeps loaded for the process; the query launches
+    // nothing.
     let code = unsafe {
         dr::cuOccupancyMaxActiveBlocksPerMultiprocessor(
             &raw mut blocks,
@@ -90,7 +92,7 @@ fn merge_blocks_per_sm(instantiation: &'static str, smem: u32) -> u32 {
 }
 
 #[cfg(not(feature = "cuda"))]
-fn merge_blocks_per_sm(_instantiation: &'static str, _smem: u32) -> u32 {
+fn merge_blocks_per_sm(_merge: &'static Kernel, _smem: u32) -> u32 {
     1
 }
 
@@ -115,13 +117,13 @@ fn fold_warp(ctx: &Ctx, op: &'static str, split: &Partials, num_sms: u32) -> Res
     };
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             MERGE,
-            symbol(&format!(
+            &format!(
                 "::pie::attn::merge_partials_warp<{}, {sink}{live}>",
                 split.head_dim
-            )),
-        )
+            ),
+        ))
         .apply(Launch::grid([blocks, 1, 1], [32 * WARPS, 1, 1])),
         &[
             ArgValue::Ptr(split.tmp_v),
@@ -145,7 +147,10 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<bool
     let head_dim = split.head_dim;
     let (_, bdx, bdy) = merge_geometry(head_dim).ok_or_else(|| no_merge_row(op))?;
     let smem = merge_smem_bytes(head_dim).ok_or_else(|| no_merge_row(op))?;
-    let instantiation = merge_varlen_inst(head_dim).ok_or_else(|| no_merge_row(op))?;
+    let merge = kernel(
+        MERGE,
+        &merge_varlen_inst(head_dim).ok_or_else(|| no_merge_row(op))?,
+    );
     for (ptr, which) in [
         (split.tmp_v, "the partial value plane"),
         (split.tmp_s, "the partial state plane"),
@@ -172,7 +177,7 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<bool
     let unsinked = Partials { sinks: 0, ..*split };
     let split = &unsinked;
     let blocks = grid_blocks(
-        merge_blocks_per_sm(instantiation, smem),
+        merge_blocks_per_sm(merge, smem),
         split.max_seq_len,
         split.num_heads,
         num_sms,
@@ -180,7 +185,7 @@ pub(crate) fn fold(ctx: &Ctx, op: &'static str, split: &Partials) -> Result<bool
 
     ctx.fire(
         op,
-        Fire::at(MERGE, instantiation).apply(
+        Fire::at(merge).apply(
             Launch::grid([blocks, 1, 1], [bdx, bdy, 1])
                 .smem(smem)
                 .programmatic(ctx.tuning().pdl),
@@ -225,10 +230,10 @@ pub fn sink(
     let rows = count(OP, "rows", o.rows)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             MERGE,
-            symbol(&format!("::pie::attn::sink_rescale<{t}, {s}>")),
-        )
+            &format!("::pie::attn::sink_rescale<{t}, {s}>"),
+        ))
         .apply(per_head_elementwise(o.rows, heads, head_dim)),
         &[
             o.arg(),
@@ -270,10 +275,10 @@ pub fn merge_lse(
     let head_dim = count(OP, "the head width this merge states", head_dim)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             MERGE,
-            symbol(&format!("::pie::attn::merge_lse_combine<{t}>")),
-        )
+            &format!("::pie::attn::merge_lse_combine<{t}>"),
+        ))
         .apply(Launch::grid(
             [o.rows, heads.unsigned_abs(), 1],
             [
@@ -321,10 +326,10 @@ pub fn logit_softcap(ctx: &Ctx, x: &mut Tensor, cap: f32) -> Result<(), Error> {
     };
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             "attn/merge.cu",
-            symbol(&format!("::pie::attn::{entry}<{t}>")),
-        )
+            &format!("::pie::attn::{entry}<{t}>"),
+        ))
         .apply(elementwise(extent)),
         &[x.arg(), cap.arg(), (extent as usize).arg()],
     )

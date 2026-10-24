@@ -331,7 +331,7 @@ macro_rules! __policy {
             fn react(edges: ::std::vec::Vec<$crate::Edge>, now_ms: u64) {
                 let mut state = __PLEX_STATE
                     .lock()
-                    .unwrap_or_else(::std::sync::PoisonError::into_inner);
+                    .expect("plex state lock poisoned");
                 let policy = state.get_or_insert_with(::std::default::Default::default);
                 $crate::$world::react(policy, edges, now_ms);
             }

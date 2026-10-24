@@ -1,7 +1,7 @@
 use super::*;
 use crate::error::Error;
 use crate::jit::{
-    Arg, Ctx, Fire, Launch, aligned16, count, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, Ctx, Fire, Launch, aligned16, count, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::Tensor;
 use crate::voxels::{flat_elements, lanes_of};
@@ -86,12 +86,10 @@ fn rms_row(
         let runs = runs.next_power_of_two();
         return ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 NORM,
-                symbol(&format!(
-                    "::pie::elemwise::rmsnorm_runs<{t}, {runs}, {plus_one}>"
-                )),
-            )
+                &format!("::pie::elemwise::rmsnorm_runs<{t}, {runs}, {plus_one}>"),
+            ))
             .apply(Launch::grid([y.rows, 1, 1], [BLOCK, 1, 1]).programmatic(ctx.tuning().pdl)),
             &[
                 x.arg(),
@@ -125,13 +123,13 @@ fn rms_row(
         let plus_one = template == OFFSET_BANK;
         return ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 NORM,
-                symbol(&format!(
+                &format!(
                     "::pie::elemwise::rmsnorm_in_warp<{t}, {}, {plus_one}>",
                     width / 32
-                )),
-            )
+                ),
+            ))
             .apply(Launch::grid([units.div_ceil(8), 1, 1], [BLOCK, 1, 1])),
             &[
                 x.arg(),
@@ -149,23 +147,23 @@ fn rms_row(
         let plus_one = template == OFFSET_BANK;
         return ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 NORM,
-                symbol(&format!(
+                &format!(
                     "::pie::elemwise::rmsnorm_held<{t}, {}, {plus_one}>",
                     width / 256
-                )),
-            )
+                ),
+            ))
             .apply(launch),
             &[x.arg(), weight.arg(), y.arg(), eps.arg(), ctx.stage()],
         );
     }
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             NORM,
-            symbol(&format!("::pie::elemwise::{template}<{t}, 256>")),
-        )
+            &format!("::pie::elemwise::{template}<{t}, 256>"),
+        ))
         .apply(launch),
         &[
             x.arg(),
@@ -286,13 +284,13 @@ pub fn rmsnorm_no_scale(
             .ok_or_else(|| refuse(OP, format!("{} rows of heads overflow a grid", y.rows)))?;
         return ctx.fire(
             OP,
-            Fire::at(
+            Fire::at(kernel(
                 NORM,
-                symbol(&format!(
+                &format!(
                     "::pie::elemwise::rmsnorm_no_scale_vec<{t}, {}, {lanes}>",
                     hidden / (8 * lanes)
-                )),
-            )
+                ),
+            ))
             .apply(Launch::grid(
                 [units.div_ceil(256 / lanes.unsigned_abs()), 1, 1],
                 [BLOCK, 1, 1],
@@ -320,13 +318,13 @@ pub fn rmsnorm_no_scale(
             .ok_or_else(|| refuse(OP, format!("{} rows of heads overflow a grid", y.rows)))?;
         return ctx.fire(
             OP,
-            Fire::at(
+            Fire::at(kernel(
                 NORM,
-                symbol(&format!(
+                &format!(
                     "::pie::elemwise::rmsnorm_no_scale_warp<{t}, {}>",
                     hidden / 256
-                )),
-            )
+                ),
+            ))
             .apply(Launch::grid([units.div_ceil(8), 1, 1], [BLOCK, 1, 1])),
             &[
                 x.arg(),
@@ -340,10 +338,10 @@ pub fn rmsnorm_no_scale(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             NORM,
-            symbol(&format!("::pie::elemwise::rmsnorm_no_scale<{t}, 256>")),
-        )
+            &format!("::pie::elemwise::rmsnorm_no_scale<{t}, 256>"),
+        ))
         .apply(launch),
         &[
             x.arg(),
@@ -421,12 +419,10 @@ pub fn rmsnorm_gated(
             })?;
         return ctx.fire(
             OP,
-            Fire::at(
+            Fire::at(kernel(
                 NORM,
-                symbol(&format!(
-                    "::pie::elemwise::rmsnorm_gated_in_warp<{xin}, {t}, {per}, {lanes}>"
-                )),
-            )
+                &format!("::pie::elemwise::rmsnorm_gated_in_warp<{xin}, {t}, {per}, {lanes}>"),
+            ))
             .apply(Launch::grid(
                 [units.div_ceil(256 / lanes), 1, 1],
                 [BLOCK, 1, 1],
@@ -446,12 +442,10 @@ pub fn rmsnorm_gated(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             NORM,
-            symbol(&format!(
-                "::pie::elemwise::rmsnorm_gated_in<{xin}, {t}, 256>"
-            )),
-        )
+            &format!("::pie::elemwise::rmsnorm_gated_in<{xin}, {t}, 256>"),
+        ))
         .apply(launch),
         &[
             x.arg(),
@@ -511,12 +505,10 @@ pub(crate) fn rmsnorm_grouped(
     let launch = rows_per_head(op, y.rows, y.width, group)?;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             NORM,
-            symbol(&format!(
-                "::pie::elemwise::rmsnorm_grouped<{t}, 256, {plus_one}>"
-            )),
-        )
+            &format!("::pie::elemwise::rmsnorm_grouped<{t}, 256, {plus_one}>"),
+        ))
         .apply(launch),
         &[
             x.arg(),
@@ -564,12 +556,10 @@ pub fn rmsnorm_gated_by(
     let per_warp: u32 = if ctx.tuning().rows_vec { 2 } else { 1 };
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             NORM,
-            symbol(&format!(
-                "::pie::elemwise::rmsnorm_gated_by<{t}, {per_warp}>"
-            )),
-        )
+            &format!("::pie::elemwise::rmsnorm_gated_by<{t}, {per_warp}>"),
+        ))
         .apply(
             Launch::grid([pairs.div_ceil(8 * per_warp), 1, 1], [256, 1, 1])
                 .programmatic(ctx.tuning().pdl),
@@ -617,7 +607,7 @@ pub fn standardize(ctx: &Ctx, bias: Tensor, scale: Tensor, out: &mut Tensor) -> 
     }
     ctx.fire(
         OP,
-        Fire::at(NORM, symbol(&format!("::pie::elemwise::standardize<{t}>")))
+        Fire::at(kernel(NORM, &format!("::pie::elemwise::standardize<{t}>")))
             .apply(route_rows(out.rows, out.width)),
         &[out.arg(), bias.arg(), scale.arg(), width.arg()],
     )
@@ -632,10 +622,10 @@ pub fn layernorm_no_scale(ctx: &Ctx, x: Tensor, eps: f32, y: &mut Tensor) -> Res
     let rows = nonzero(OP, "rows", y.rows)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             NORM,
-            symbol(&format!("::pie::elemwise::layernorm_no_scale<{t}, 256>")),
-        )
+            &format!("::pie::elemwise::layernorm_no_scale<{t}, 256>"),
+        ))
         .apply(Launch::per_row(rows, BLOCK)),
         &[x.arg(), y.arg(), hidden.arg(), eps.arg(), ctx.stage()],
     )
@@ -655,10 +645,10 @@ pub fn layernorm(
     let rows = nonzero(OP, "rows", y.rows)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             NORM,
-            symbol(&format!("::pie::elemwise::layernorm<{t}, 256>")),
-        )
+            &format!("::pie::elemwise::layernorm<{t}, 256>"),
+        ))
         .apply(Launch::per_row(rows, BLOCK)),
         &[
             x.arg(),
@@ -738,7 +728,7 @@ pub fn group_norm(
 
     ctx.fire(
         OP,
-        Fire::at(NORM, "::pie::elemwise::group_norm_stats<1024>").apply(Launch::grid(
+        Fire::at(kernel(NORM, "::pie::elemwise::group_norm_stats<1024>")).apply(Launch::grid(
             [splits.unsigned_abs(), lanes.unsigned_abs(), 1],
             [STATS_BLOCK, 1, 1],
         )),
@@ -753,7 +743,7 @@ pub fn group_norm(
     )?;
     ctx.fire(
         OP,
-        Fire::at(NORM, "::pie::elemwise::group_norm_finalize").apply(Launch::grid(
+        Fire::at(kernel(NORM, "::pie::elemwise::group_norm_finalize")).apply(Launch::grid(
             [groups.unsigned_abs(), lanes.unsigned_abs(), 1],
             [32, 1, 1],
         )),
@@ -768,14 +758,14 @@ pub fn group_norm(
     let (blocks, total) = flat_elements(OP, x, APPLY_BLOCK)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             NORM,
             if silu {
                 "::pie::elemwise::group_norm_apply<true>"
             } else {
                 "::pie::elemwise::group_norm_apply<false>"
             },
-        )
+        ))
         .apply(Launch::grid([blocks, 1, 1], [APPLY_BLOCK, 1, 1])),
         &[
             x.arg(),

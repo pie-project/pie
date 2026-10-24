@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -49,8 +50,8 @@ pub struct Vulkan {
     contract_for: ContractFor,
     shell: Option<Shell>,
     caps: Option<Capabilities>,
-    next_fire: FireId,
-    next_frame: FrameId,
+    next_fire: u64,
+    next_frame: u64,
 
     sink: Option<engine::CompletionSink>,
 
@@ -77,11 +78,6 @@ impl Vulkan {
             programs,
             adapters: BTreeMap::new(),
         }
-    }
-
-    #[must_use]
-    pub fn shell(&self) -> Option<&Shell> {
-        self.shell.as_ref()
     }
 
     pub fn shell_mut(&mut self) -> Option<&mut Shell> {
@@ -547,7 +543,7 @@ impl Engine for Vulkan {
                 .as_ref()
                 .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
         )?;
-        let id = self.next_frame;
+        let id = FrameId(self.next_frame);
         self.next_frame = self.next_frame.wrapping_add(1);
 
         self.pending = None;
@@ -1098,7 +1094,7 @@ impl Vulkan {
             })
             .collect();
 
-        let id = self.next_fire;
+        let id = FireId(self.next_fire);
         self.next_fire = self.next_fire.wrapping_add(1);
 
         let mut resolved: Vec<Option<Vec<u32>>> = vec![None; submission.lanes.len()];
@@ -1305,5 +1301,8 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
         .collect()
 }
 
+// SAFETY: the loaded `Shell` owns its `ash` device, pools and buffers
+// outright and its `Cell`/`RefCell` scratch is not shared with anything else,
+// so moving the whole engine to another thread moves every handle with it;
+// Vulkan handles are not tied to the thread that made them.
 unsafe impl Send for Vulkan {}
-unsafe impl Sync for Vulkan {}

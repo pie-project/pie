@@ -377,8 +377,8 @@ mod tests {
         let x = b.input(4);
         let q = b.op(x, 4, Guard::Always);
         let d = b.op(q, 4, fact(0));
-        let p = b.op(q, 4, Guard::not(fact(0)));
-        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 4);
+        let p = b.op(q, 4, !fact(0));
+        let o = b.merge(&[(d, fact(0)), (p, !fact(0))], 4);
         let y = b.op(o, 4, Guard::Always);
         b.out(y);
         b

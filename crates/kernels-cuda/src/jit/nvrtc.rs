@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::ffi::{CStr, CString, c_char};
 
 use cudarc::nvrtc::sys as nvrtc;
@@ -9,6 +10,7 @@ pub(crate) fn version() -> Result<Toolchain, Fault> {
     let mut major = 0i32;
     let mut minor = 0i32;
 
+    // SAFETY: both out-pointers are locals that live across the call.
     let code = unsafe { nvrtc::nvrtcVersion(&raw mut major, &raw mut minor) };
     if code != nvrtc::nvrtcResult::NVRTC_SUCCESS {
         return Err(Fault::Device {
@@ -80,6 +82,10 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
 
     let mut handle: nvrtc::nvrtcProgram = std::ptr::null_mut();
 
+    // SAFETY: `root` and `name` are NUL-terminated CStrings; each array holds
+    // `count` pointers into the CStrings of `header_texts`/`header_names`,
+    // all of which outlive the call (NVRTC copies them) and `handle` is a
+    // local out-pointer. An empty array is passed as null, as NVRTC asks.
     let code = unsafe {
         nvrtc::nvrtcCreateProgram(
             &raw mut handle,
@@ -117,6 +123,8 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
         })
         .collect::<Result<_, Fault>>()?;
     for expr in &wanted {
+        // SAFETY: `program` holds the handle nvrtcCreateProgram just made and
+        // `expr` is a CString that outlives the call.
         let code = unsafe { nvrtc::nvrtcAddNameExpression(program.0, expr.as_ptr()) };
         if code != nvrtc::nvrtcResult::NVRTC_SUCCESS {
             return Err(Fault::Compile {
@@ -131,6 +139,9 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
 
     let option_ptrs: Vec<*const c_char> = options.iter().map(|o| o.as_ptr()).collect();
 
+    // SAFETY: `program` is live; `option_ptrs` holds `len` pointers into the
+    // CStrings of `options`, which outlive the call. NVRTC only reads them,
+    // so the `cast_mut` the C signature asks for is never written through.
     let code = unsafe {
         nvrtc::nvrtcCompileProgram(
             program.0,
@@ -155,6 +166,8 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
     for expr in &wanted {
         let mut mangled: *const c_char = std::ptr::null();
 
+        // SAFETY: `program` is live and compiled, `expr` was added to it
+        // before the compile, and `mangled` is a local out-pointer.
         let code =
             unsafe { nvrtc::nvrtcGetLoweredName(program.0, expr.as_ptr(), &raw mut mangled) };
         if code != nvrtc::nvrtcResult::NVRTC_SUCCESS || mangled.is_null() {
@@ -167,6 +180,9 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
             });
         }
 
+        // SAFETY: NVRTC returned success and a non-null pointer to a
+        // NUL-terminated name it owns until `program` is destroyed, which is
+        // after this copy.
         let mangled = unsafe { CStr::from_ptr(mangled) }
             .to_string_lossy()
             .into_owned();
@@ -175,6 +191,7 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
 
     let mut size = 0usize;
 
+    // SAFETY: `program` is live and compiled; `size` is a local out-pointer.
     let code = unsafe { nvrtc::nvrtcGetCUBINSize(program.0, &raw mut size) };
     if code != nvrtc::nvrtcResult::NVRTC_SUCCESS {
         return Err(Fault::Device {
@@ -184,6 +201,8 @@ pub(crate) fn compile_text(job: &Job<'_>) -> Result<Built, Fault> {
     }
     let mut cubin = vec![0u8; size];
 
+    // SAFETY: `cubin` has the `size` bytes NVRTC just reported for this same
+    // program, so the copy stays in bounds.
     let code = unsafe { nvrtc::nvrtcGetCUBIN(program.0, cubin.as_mut_ptr().cast()) };
     if code != nvrtc::nvrtcResult::NVRTC_SUCCESS {
         return Err(Fault::Device {
@@ -299,6 +318,8 @@ impl Program {
     fn log(&self) -> Option<String> {
         let mut size = 0usize;
 
+        // SAFETY: `self.0` is the live handle this `Program` owns; `size` is a
+        // local out-pointer.
         if unsafe { nvrtc::nvrtcGetProgramLogSize(self.0, &raw mut size) }
             != nvrtc::nvrtcResult::NVRTC_SUCCESS
             || size <= 1
@@ -307,6 +328,8 @@ impl Program {
         }
         let mut buf = vec![0u8; size];
 
+        // SAFETY: `buf` has the `size` bytes NVRTC just reported for this log,
+        // terminator included.
         if unsafe { nvrtc::nvrtcGetProgramLog(self.0, buf.as_mut_ptr().cast()) }
             != nvrtc::nvrtcResult::NVRTC_SUCCESS
         {
@@ -319,6 +342,8 @@ impl Program {
 
 impl Drop for Program {
     fn drop(&mut self) {
+        // SAFETY: `Program` is built only from a handle nvrtcCreateProgram
+        // returned, owns it alone, and drops it once.
         unsafe { nvrtc::nvrtcDestroyProgram(&raw mut self.0) };
     }
 }
@@ -377,6 +402,8 @@ mod tests {
     }
 
     fn nvrtc_is_here() -> bool {
+        // SAFETY: probing for the library only tries to load it; no symbol
+        // from it is called.
         let present = unsafe { nvrtc::is_culib_present() };
         if !present {
             eprintln!("skipped: libnvrtc is not loadable on this box");

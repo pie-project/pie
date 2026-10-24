@@ -31,6 +31,7 @@
 //! Guards: the hipBLASLt version must be a known major.minor, and only
 //! solutions whose argument contract matches the one above are offered.
 //! `tests/lt_grouped.rs` checks the results on a ROCm bump.
+#![allow(unsafe_code)]
 
 use core::ffi::{c_int, c_void};
 use std::collections::HashMap;
@@ -112,9 +113,12 @@ pub struct Library {
     functions: Mutex<HashMap<usize, usize>>,
 }
 
-// SAFETY: the module handle is only read (hipModuleGetFunction is
-// thread-safe); the function cache sits behind its lock.
+// SAFETY: `module` is a process-wide HIP handle any thread may use, and a
+// `Library` lives in a leaked static slot, so it is never unloaded; the
+// function cache holds plain addresses behind its own lock.
 unsafe impl Send for Library {}
+// SAFETY: `&Library` only reads the module handle (`hipModuleGetFunction`
+// is thread-safe) and reaches the function cache through its lock.
 unsafe impl Sync for Library {}
 
 /// The grouped library for `dtype` (bf16 or f16, the weight `[n, k]` rows,
@@ -127,7 +131,7 @@ pub fn library(dtype: Dtype) -> Result<&'static Library, String> {
     let mut map = LIBRARIES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .expect("lock poisoned");
     let slot = *map.entry((device, dtype)).or_insert_with(|| {
         let opened = Library::open(device, dtype);
         match &opened {
@@ -227,10 +231,7 @@ impl Library {
 
     /// The kernel of solution `at`, resolved once.
     pub fn function(&self, at: usize) -> Result<sys::Function, String> {
-        let mut map = self
-            .functions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self.functions.lock().expect("functions lock poisoned");
         if let Some(&f) = map.get(&at) {
             return Ok(f as sys::Function);
         }

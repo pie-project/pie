@@ -3,7 +3,7 @@ use dtype::Dtype;
 use crate::attn::kv;
 use crate::attn::plan::PrefillPlan;
 use crate::error::Error;
-use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const SCORE: &str = "attn/score.cu";
@@ -159,12 +159,10 @@ pub fn capture(
 
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             SCORE,
-            symbol(&format!(
-                "::pie::attn::score_capture<{stamp}, {WARPS}, {hnd}>"
-            )),
-        )
+            &format!("::pie::attn::score_capture<{stamp}, {WARPS}, {hnd}>"),
+        ))
         .apply(Launch::grid([requests, num_q_heads, 1], [BLOCK, 1, 1]).smem(smem)),
         &[
             q.data.arg(),

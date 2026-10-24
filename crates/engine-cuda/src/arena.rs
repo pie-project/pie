@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use kernels_cuda::Tensor;
 use poem_compiler::ArenaMap;
 use poem_exec::store::arena::rect;

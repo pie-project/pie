@@ -17,6 +17,7 @@
 //! scatter into its input pack); any other port that reads an in-flight
 //! cell waits for it to land. `PIE_XLA_SYNC=1` settles every frame inside
 //! `submit`, for an A/B.
+#![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -88,8 +89,8 @@ pub struct Xla {
     contract_for: ContractFor,
     shell: Option<Shell>,
     caps: Option<Capabilities>,
-    next_fire: FireId,
-    next_frame: FrameId,
+    next_fire: u64,
+    next_frame: u64,
     sink: Option<engine::CompletionSink>,
     adapters: BTreeMap<InstanceId, crate::adapter::Binding>,
 }
@@ -496,11 +497,11 @@ impl Engine for Xla {
                 .as_ref()
                 .map_or(engine::fire::Serves::NONE, engine::fire::Serves::of),
         )?;
-        let id = self.next_frame;
+        let id = FrameId(self.next_frame);
         self.next_frame = self.next_frame.wrapping_add(1);
         self.pending = None;
         tracing::debug!(
-            frame = id,
+            frame = id.0,
             steps = frame.steps.len(),
             airborne = self.programs.airborne(),
             "xla submit"
@@ -521,7 +522,7 @@ impl Engine for Xla {
         }
         let mut ticket = FrameTicket { id, steps };
         self.pending = Some((id, settles));
-        tracing::debug!(frame = id, "xla submitted");
+        tracing::debug!(frame = id.0, "xla submitted");
         if !self.settles_asynchronously() {
             self.settle_frame(&mut ticket)?;
         }
@@ -1088,7 +1089,7 @@ impl Xla {
                 token_positions: &row.token_positions,
             });
         }
-        let id = self.next_fire;
+        let id = FireId(self.next_fire);
         self.next_fire = self.next_fire.wrapping_add(1);
 
         let device = self.device_lanes(submission)?;
@@ -1413,10 +1414,3 @@ fn readouts_of(settle: &StepSettle) -> EngineResult<Vec<LaneReadout>> {
         })
         .collect()
 }
-
-// SAFETY: the runtime drives an engine from one thread at a time (it is
-// moved to the engine thread and stays there); the shell's interior cells
-// are never touched from two threads at once. engine-wgpu makes the same
-// promise for the same reason.
-unsafe impl Send for Xla {}
-unsafe impl Sync for Xla {}

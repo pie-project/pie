@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::io::IsTerminal;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

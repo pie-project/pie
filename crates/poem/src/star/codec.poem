@@ -351,6 +351,49 @@ def nvfp4_bank(reads, w, experts):
         tensor(input_scales_name(w.name), concat(0, inputs), F32, shape = [count]),
     ])
 
+# compressed-tensors: NVFP4 banks, their scalars the reciprocals of modelopt's.
+
+def recip(reads, name, expr, shape):
+    """`1 / expr` (read from `name`) as an f32 tensor of its own: a unary needs
+    a kernel, which a bank's join of byte runs cannot hold."""
+    inverse = name + ".recip"
+    reads.push(tensor(inverse, expr.unary("recip"), F32, shape = shape, internal = True))
+    return out(inverse)
+
+def nvfp4_packed_bank(reads, w, experts):
+    """A routed bank of compressed-tensors NVFP4 experts ("nvfp4-pack-quantized",
+    MiniMax-M3.1-Flash's), `experts` each expert's leg stems: `.weight_packed`
+    (e2m1 pairs), `.weight_scale` (e4m3 per 16), and scalars
+    `.weight_global_scale` / `.input_global_scale`, which divide where modelopt's
+    `.weight_scale_2` / `.input_scale` multiply: read as their reciprocals.
+    Legs stack into `[experts, rows, cols]`; an expert's legs read one
+    activation, so its first leg's input scale is the expert's."""
+    if w.dtype not in [dtype.nvfp4, dtype.nvfp4a4]:
+        fail("`{}`: this checkpoint's experts are NVFP4, and this deployment reads them as {}; import the deployment that keeps them NVFP4".format(w.name, w.dtype))
+    count, rows, cols = w.shape[0], w.shape[1], w.shape[2]
+    legs = len(experts[0])
+    per_leg = rows // legs
+    if len(experts) != count or per_leg * legs != rows:
+        fail("`{}` is {} and the checkpoint holds {} experts of {} legs".format(w.name, w.shape, len(experts), legs))
+    codes = []
+    scales = []
+    tensors = []
+    inputs = []
+    for stems in experts:
+        for stem in stems:
+            codes.append(src(stem + ".weight_packed").transmute([1, per_leg, cols], grouped(w)))
+            scales.append(src(stem + ".weight_scale").transmute([1, per_leg, cols // 16], E4M3))
+            tensors.append(recip(reads, stem + ".weight_global_scale", src(stem + ".weight_global_scale").transmute([1, 1], F32).gather(1, [0] * per_leg), [1, per_leg]))
+        inputs.append(recip(reads, stems[0] + ".input_global_scale", src(stems[0] + ".input_global_scale").transmute([1], F32), [1]))
+    counted = scales_shape(w)
+    whole = lambda expr, shape, encoding: expr if legs == 1 else expr.transmute(shape, encoding)
+    reads.extend([
+        tensor(w.name, whole(concat(0, codes), w.shape, grouped(w)), grouped(w)),
+        tensor(scales_name(w.name), whole(concat(0, scales), counted, E4M3), E4M3, shape = counted, scaling = w),
+        tensor(global_scales_name(w.name), whole(concat(0, tensors), [count, rows], F32), F32, shape = [count, rows], tensor_scaling = w),
+        tensor(input_scales_name(w.name), concat(0, inputs), F32, shape = [count]),
+    ])
+
 def fp8_tensor_leg(reads, name):
     """The modelopt FP8 projection `name` as bf16: its e4m3 codes widened to
     f32, scaled by the f32 `{stem}.weight_scale` it is stored under, and

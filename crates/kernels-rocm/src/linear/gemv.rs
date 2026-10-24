@@ -1,6 +1,7 @@
+#![allow(unsafe_code)]
 use crate::error::Error;
 
-use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, refuse};
+use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, kernel, refuse};
 
 pub(crate) fn gemv_bf16(
     ctx: &Ctx,
@@ -59,7 +60,7 @@ pub(crate) fn gemv_bf16(
     };
     ctx.fire(
         "linear.gemv",
-        Fire::at("linear/gemv.hip", instantiation)
+        Fire::at(kernel("linear/gemv.hip", instantiation))
             .apply(Launch::grid([grid, 1, 1], [64, WAVES, 1])),
         &values,
     )
@@ -383,7 +384,7 @@ pub(crate) fn skinny_planned(
     let smem = if act_global { red } else { staged + red };
     ctx.fire(
         OP,
-        Fire::at("linear/gemv.hip", crate::jit::symbol(&symbol))
+        Fire::at(kernel("linear/gemv.hip", &symbol))
             .apply(Launch::grid([grid, 1, 1], [64, block_waves, 1]).smem(smem)),
         &[
             ArgValue::Ptr(weight),
@@ -462,8 +463,7 @@ pub(crate) fn skinnyt(
     );
     ctx.fire(
         OP,
-        Fire::at("linear/gemv.hip", crate::jit::symbol(&symbol))
-            .apply(Launch::grid([grid, 1, 1], [64, ks, 1])),
+        Fire::at(kernel("linear/gemv.hip", &symbol)).apply(Launch::grid([grid, 1, 1], [64, ks, 1])),
         &[
             ArgValue::Ptr(weight),
             ArgValue::Ptr(act),

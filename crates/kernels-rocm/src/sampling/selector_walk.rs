@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::{RaggedTensor, Tensor};
 
 const FILE: &str = "sampling/selector_walk.hip";
@@ -115,7 +115,7 @@ pub fn selector_walk(
     let hp_arg = hp.map_or_else(|| pred.arg(), |h| h.arg());
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::selector_walk").apply(Launch::per_row(lanes, THREADS)),
+        Fire::at(kernel(FILE, "::pie::attn::selector_walk")).apply(Launch::per_row(lanes, THREADS)),
         &[
             cand.data.arg(),
             cand.indptr.arg(),

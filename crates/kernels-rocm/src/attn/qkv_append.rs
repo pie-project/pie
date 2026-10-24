@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::{KvPool, Tensor};
 
 const FILE: &str = "attn/qkv_fused.hip";
@@ -143,7 +143,7 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
         };
         return ctx.fire(
             OP,
-            Fire::at(FILE, symbol(&instantiation)).apply(Launch::grid(
+            Fire::at(kernel(FILE, &instantiation)).apply(Launch::grid(
                 [packed.rows, heads.div_ceil(slots(warps)), 1],
                 [64 * warps, 1, 1],
             )),
@@ -197,10 +197,10 @@ pub fn qkv_fused_qknorm_rope_vnorm_write(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
             "::pie::custom::qkv_decode_qk_norm_rope_vnorm_write_kv<::pie::i32(128), false>",
-        )
+        ))
         .apply(Launch::grid([packed.rows, heads, 1], [DECODE_BLOCK, 1, 1])),
         &[
             packed.arg(),
@@ -302,12 +302,10 @@ pub fn q_gate_k_norm_rope_append(
     let hnd = if pool.layout != 0 { "true" } else { "false" };
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            crate::jit::symbol(&format!(
-                "::pie::custom::q_gate_k_norm_rope_append<{head_dim}, {WAVES}, {hnd}>"
-            )),
-        )
+            &format!("::pie::custom::q_gate_k_norm_rope_append<{head_dim}, {WAVES}, {hnd}>"),
+        ))
         .apply(Launch::grid(
             [qg.rows, (num_q_heads + num_kv_heads).div_ceil(WAVES), 1],
             [64 * WAVES, 1, 1],

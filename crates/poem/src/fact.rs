@@ -28,7 +28,7 @@ impl Predicate {
             Predicate::Builtin(builtin) => facts.builtin(*builtin),
             Predicate::Flag(name) => facts.flag(name),
             Predicate::Choice(name, value) => facts.choice(name, value),
-            Predicate::Not(a) => Guard::not(a.guard(facts)),
+            Predicate::Not(a) => !a.guard(facts),
             Predicate::And(a, b) => Guard::and(a.guard(facts), b.guard(facts)),
         }
     }

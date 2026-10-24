@@ -36,7 +36,7 @@ fn f32s(bytes: &[u8]) -> Vec<f32> {
 #[test]
 fn a_matmul_and_a_reduce_answer_the_host() {
     let Some(client) = client() else { return };
-    let dev = client.devices()[0];
+    let dev = client.device(0).expect("a device");
     eprintln!("{:?} on {}", client, client.device_kind(dev).unwrap());
 
     let (m, n, k) = (4i64, 3i64, 8i64);
@@ -102,7 +102,7 @@ fn a_matmul_and_a_reduce_answer_the_host() {
 #[test]
 fn a_donated_buffer_is_updated_in_place() {
     let Some(client) = client() else { return };
-    let dev = client.devices()[0];
+    let dev = client.device(0).expect("a device");
     let mut f = Func::new("main");
     let pool = f.param(Ty::new(Elem::F32, &[8, 4]), Some(0));
     let row = f.param(Ty::new(Elem::F32, &[1, 4]), None);

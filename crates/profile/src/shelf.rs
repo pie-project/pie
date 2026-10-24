@@ -144,9 +144,7 @@ impl Shelf {
         if !report.untuned() {
             return;
         }
-        let mut told = TOLD
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut told = TOLD.lock().expect("told lock poisoned");
         if told.insert(format!("{}/{device}", self.backend)) {
             eprintln!(
                 "{}",

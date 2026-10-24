@@ -28,3 +28,6 @@ libloading = { version = "0.9", optional = true }
 [features]
 default = []
 nvenc = ["dep:cudarc", "dep:libloading", "cudarc/cuda-13000"]
+
+[lints]
+workspace = true

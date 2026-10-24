@@ -7,6 +7,7 @@
 //! results come back in a `tool` turn as `<response>`s.
 
 use std::sync::Arc;
+use tokenizer::Specials;
 
 use serde_json::Value;
 use tokenizer::{Tokenizer, TokenizerDecoder};
@@ -37,17 +38,16 @@ pub struct MiniMax2 {
 }
 
 impl MiniMax2 {
-    #[must_use]
-    pub fn new(tokenizer: Arc<Tokenizer>, identity: &str) -> Self {
+    pub fn try_new(tokenizer: Arc<Tokenizer>, identity: &str) -> Result<Self, String> {
         // The tokenizer must spell these as specials.
-        let _ = specials(&tokenizer, &[BOD, BOS, EOS, CALL_OPEN, CALL_CLOSE]);
-        Self {
+        let _ = specials(&tokenizer, &[BOD, BOS, EOS, CALL_OPEN, CALL_CLOSE])?;
+        Ok(Self {
             identity: identity.to_string(),
-            think_open: special(&tokenizer, THINK_OPEN),
-            think_close: special(&tokenizer, THINK_CLOSE),
-            stop_ids: specials(&tokenizer, STOP_TOKENS),
+            think_open: special(&tokenizer, THINK_OPEN)?,
+            think_close: special(&tokenizer, THINK_CLOSE)?,
+            stop_ids: specials(&tokenizer, STOP_TOKENS)?,
             tokenizer,
-        }
+        })
     }
 
     fn encode(&self, text: &str) -> Vec<u32> {
@@ -217,7 +217,7 @@ impl Instruct for MiniMax2 {
 
     fn tool_decoder(&self) -> Box<dyn ToolDecoder> {
         Box::new(MiniMax2ToolDecoder {
-            decoder: self.tokenizer.decoder(false),
+            decoder: self.tokenizer.decoder(Specials::Keep),
             accumulated: String::new(),
             inside: false,
         })

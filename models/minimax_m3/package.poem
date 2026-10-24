@@ -22,6 +22,8 @@ MX8 = dtype.mxfp8a8g32
 
 DEPLOYMENTS = [
     deployment("minimax-m3", weights = MX8, kv = BF),
+    # MiniMax-M3.1-Flash: MXFP8 projections, compressed-tensors NVFP4 experts
+    deployment("minimax-m3", weights = [MX8, dtype.nvfp4a4], kv = BF),
     deployment("minimax-m3", weights = U4, kv = BF),
     deployment("minimax-m3", weights = BF, kv = BF),
     deployment("minimax-m3-mini", weights = BF, kv = BF),

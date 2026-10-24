@@ -1,4 +1,5 @@
 use super::*;
+use crate::jit::kernel;
 
 const CONV1D: &str = "ssm/conv1d.cu";
 
@@ -134,7 +135,7 @@ fn conv1d_update(
     ];
     let (entrypoint, launch) = if vectors {
         (
-            symbol(&format!("::pie::ssm::conv1d_update_vec8{}", out.args())),
+            format!("::pie::ssm::conv1d_update_vec8{}", out.args()),
             Launch::grid(
                 [(channels / CONV_VEC).div_ceil(CONV_BLOCK), rows, 1],
                 [CONV_BLOCK, 1, 1],
@@ -144,7 +145,7 @@ fn conv1d_update(
     } else {
         args.push(dil.arg());
         (
-            symbol(&format!("::pie::ssm::conv1d_update{}", out.args())),
+            format!("::pie::ssm::conv1d_update{}", out.args()),
             Launch::grid([channels.div_ceil(BLOCK), rows, 1], [BLOCK, 1, 1]),
         )
     };
@@ -153,7 +154,11 @@ fn conv1d_update(
         state.write_state_mask.arg(),
         ctx.stage(),
     ]);
-    ctx.fire(op, Fire::at(CONV1D, entrypoint).apply(launch), &args)
+    ctx.fire(
+        op,
+        Fire::at(kernel(CONV1D, &entrypoint)).apply(launch),
+        &args,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -241,10 +246,7 @@ fn conv1d_chunked(
             .all(|&at| aligned16(at));
     let (entrypoint, launch) = if vec8 && ctx.tuning().ssm_conv_vec4 {
         (
-            symbol(&format!(
-                "::pie::ssm::conv1d_chunked_row_tile_vec4{}",
-                out.args()
-            )),
+            format!("::pie::ssm::conv1d_chunked_row_tile_vec4{}", out.args()),
             Launch::grid(
                 [
                     (channels / 4).div_ceil(TILE_BLOCK),
@@ -256,10 +258,7 @@ fn conv1d_chunked(
         )
     } else if vec8 {
         (
-            symbol(&format!(
-                "::pie::ssm::conv1d_chunked_row_tile_vec8{}",
-                out.args()
-            )),
+            format!("::pie::ssm::conv1d_chunked_row_tile_vec8{}", out.args()),
             Launch::grid(
                 [
                     (channels / 8).div_ceil(TILE_BLOCK),
@@ -271,10 +270,7 @@ fn conv1d_chunked(
         )
     } else if row_tiled {
         (
-            symbol(&format!(
-                "::pie::ssm::conv1d_chunked_row_tile{}",
-                out.args()
-            )),
+            format!("::pie::ssm::conv1d_chunked_row_tile{}", out.args()),
             Launch::grid(
                 [
                     channels.div_ceil(TILE_BLOCK),
@@ -286,10 +282,7 @@ fn conv1d_chunked(
         )
     } else if lanes >= CHANNEL_TILE_FROM {
         (
-            symbol(&format!(
-                "::pie::ssm::conv1d_chunked_channel_tile{}",
-                out.args()
-            )),
+            format!("::pie::ssm::conv1d_chunked_channel_tile{}", out.args()),
             Launch::grid(
                 [channels.div_ceil(TILE_BLOCK), lanes, 1],
                 [TILE_BLOCK, 1, 1],
@@ -297,13 +290,13 @@ fn conv1d_chunked(
         )
     } else {
         (
-            symbol(&format!("::pie::ssm::conv1d_chunked{}", out.args())),
+            format!("::pie::ssm::conv1d_chunked{}", out.args()),
             Launch::grid([channels, lanes, 1], [PER_CHANNEL_BLOCK, 1, 1]),
         )
     };
     ctx.fire(
         op,
-        Fire::at(CONV1D, entrypoint).apply(launch),
+        Fire::at(kernel(CONV1D, &entrypoint)).apply(launch),
         &[
             x.data.arg(),
             weight.arg(),
@@ -339,10 +332,10 @@ fn conv1d_chunked(
     let [snap, snap_rows, snap_slots] = state.snapshots.args();
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             CONV1D,
-            symbol("::pie::ssm::conv1d_state_commit<::pie::bf16>"),
-        )
+            "::pie::ssm::conv1d_state_commit<::pie::bf16>",
+        ))
         .apply(Launch::grid(
             [channels.div_ceil(TILE_BLOCK), lanes, 1],
             [TILE_BLOCK, 1, 1],

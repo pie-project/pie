@@ -85,7 +85,7 @@ pub struct PortBinding {
     pub kind: ::engine::fire::PortKind,
     pub port: u8,
     pub channel_rep: u32,
-    pub channel_id: u64,
+    pub channel_id: ::engine::ChannelId,
     pub rows: Option<u32>,
     pub clip: Option<[u32; 3]>,
 }
@@ -187,7 +187,7 @@ pub struct SelfCondPayload {
     pub taps: u32,
     pub rows: Vec<u32>,
     pub weights: Vec<f32>,
-    pub channels: Option<(u64, u64)>,
+    pub channels: Option<(::engine::ChannelId, ::engine::ChannelId)>,
 }
 
 #[derive(Clone, Copy)]
@@ -317,13 +317,13 @@ impl BoundForwardPass {
             self.bound_instance.pacing_wait_id,
         ) {
             tracing::warn!(
-                instance_id = self.bound_instance.instance_id,
+                instance_id = self.bound_instance.instance_id.0,
                 %error,
                 "forward-pass native cleanup: close_instance failed"
             );
         }
         for cell in &self.cells {
-            cell.lock().unwrap().detach(self.bound_instance.instance_id);
+            cell.lock().unwrap().detach(self.instance.instance_id);
         }
     }
 
@@ -344,7 +344,7 @@ impl Drop for BoundForwardPass {
             self.close_native();
         } else {
             tracing::error!(
-                instance_id = self.bound_instance.instance_id,
+                instance_id = self.bound_instance.instance_id.0,
                 pending_fires = self
                     .fires
                     .as_ref()

@@ -7,6 +7,7 @@
 //! [`atom_offset`]), atoms of one 128-row block consecutive along K, rows
 //! padded to whole blocks with finite (zero) bytes. A scale column covers
 //! `gran` K: 16 for NVFP4's ue4m3, 32 or 128 for ue8m0.
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -14,7 +15,7 @@ use std::sync::{Mutex, OnceLock};
 use cudarc::driver::sys as dr;
 
 use crate::error::Error;
-use crate::jit::{ArgValue, Ctx, Fire, Launch, refuse, symbol};
+use crate::jit::{ArgValue, Ctx, Fire, Launch, kernel, refuse};
 
 const GEMM_SM100: &str = "linear/gemm_sm100.cu";
 
@@ -1167,7 +1168,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     };
     let units = job.tiles * splits;
     let grid = ctas * units.min(sms / ctas).max(1);
-    let entry = symbol(&format!(
+    let entry = format!(
         "::pie::linear::tc5_gemm<{}, {}, {}, {}, {}, {}, {}, {}, {ctas}, {}, {}, {}, {}>",
         kind.code(),
         kind.format(p.elem),
@@ -1184,7 +1185,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
             Kind::Mixed(mix) => mix,
             _ => 0,
         },
-    ));
+    );
     let map = ArgValue::of::<[u64; 16]>;
     let values = [
         map(&map_p),
@@ -1209,7 +1210,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     ];
     ctx.fire(
         OP,
-        Fire::at(GEMM_SM100, entry).apply(
+        Fire::at(kernel(GEMM_SM100, &entry)).apply(
             Launch::grid(
                 [grid, 1, 1],
                 [
@@ -1247,7 +1248,7 @@ fn launch(ctx: &Ctx, job: Job, y: u64, [n, k]: [u32; 2], alpha: f32) -> Result<(
     let quads = job.y_rows * n / 4;
     ctx.fire(
         OP,
-        Fire::at(GEMM_SM100, "::pie::linear::tc5_finalize")
+        Fire::at(kernel(GEMM_SM100, "::pie::linear::tc5_finalize"))
             .apply(Launch::flat(quads, 256).programmatic(ctx.tuning().pdl)),
         &[
             ArgValue::Ptr(part),
@@ -1275,7 +1276,8 @@ fn fire_routed(
     let int = |v: u32| i32::try_from(v).map_err(|_| refuse(OP, format!("{v} overflows an int")));
     ctx.fire(
         OP,
-        Fire::at(FILE, entry).apply(Launch::per_row(rows, 128).programmatic(ctx.tuning().pdl)),
+        Fire::at(kernel(FILE, entry))
+            .apply(Launch::per_row(rows, 128).programmatic(ctx.tuning().pdl)),
         &[
             ArgValue::Ptr(part),
             ArgValue::Ptr(y),
@@ -1427,16 +1429,14 @@ pub(crate) struct Map {
 pub(crate) fn encode(m: Map) -> Result<[u64; 16], Error> {
     static MAPS: OnceLock<Mutex<HashMap<Map, [u64; 16]>>> = OnceLock::new();
     let maps = MAPS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(found) = maps
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&m)
-    {
+    if let Some(found) = maps.lock().expect("maps lock poisoned").get(&m) {
         return Ok(*found);
     }
     let dims = m.dims.map(u64::from);
     let steps = [1u32, 1, 1];
     let rank = if m.dims[2] == 0 { 2 } else { 3 };
+    // SAFETY: `CUtensorMap` is an opaque array of u64 words; all-zero bytes
+    // are a valid value, and the encode below overwrites them.
     let mut map: dr::CUtensorMap = unsafe { core::mem::zeroed() };
     // SAFETY: every pointer is to a live local of the length the rank says.
     let code = unsafe {
@@ -1466,9 +1466,7 @@ pub(crate) fn encode(m: Map) -> Result<[u64; 16], Error> {
     }
     // SAFETY: CUtensorMap is 128 opaque bytes, 64-aligned.
     let raw: [u64; 16] = unsafe { core::mem::transmute(map) };
-    maps.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(m, raw);
+    maps.lock().expect("maps lock poisoned").insert(m, raw);
     Ok(raw)
 }
 

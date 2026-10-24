@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 pub mod compressed;
 pub mod dense;
 
@@ -32,7 +33,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::attn::plan::{DecodePlan, PrefillPlan};
-use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const BLOCK: u32 = 256;
@@ -674,10 +675,10 @@ pub fn res_blend(
     };
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             "elemwise/norm.hip",
-            symbol(&format!("::pie::elemwise::res_blend<{t}>")),
-        )
+            &format!("::pie::elemwise::res_blend<{t}>"),
+        ))
         .apply(Launch::per_row(y.rows, BLOCK)),
         &[
             prefix.arg(),

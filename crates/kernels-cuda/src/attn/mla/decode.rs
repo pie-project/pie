@@ -13,7 +13,7 @@ const DECODE_SM80: &str = "attn/mla/decode_sm80.cu";
 pub(crate) mod naive {
     use super::DECODE_SM80;
     use super::{ArgValue, Ctx, Error, Fire, Launch, refuse};
-    use crate::jit::Arg;
+    use crate::jit::{Arg, kernel};
 
     pub const NAIVE_BLOCK: u32 = 256;
 
@@ -138,14 +138,14 @@ pub(crate) mod naive {
                 Launch::grid([blocks, rows, splits], [MMA_THREADS, 1, 1]).smem(MMA_SMEM_BYTES);
             ctx.fire(
                 op,
-                Fire::at(
+                Fire::at(kernel(
                     DECODE_SM80,
-                    crate::jit::symbol(&format!(
+                    &format!(
                         "::pie::attn::mla::mla_naive::mma_detail::mla_mma_paged_kernel<{}{}>",
                         shape.rope_dim,
                         if shape.fp8 { ", true" } else { "" }
-                    )),
-                )
+                    ),
+                ))
                 .apply(launch),
                 &[
                     ArgValue::Ptr(ptrs.q_nope),
@@ -176,10 +176,10 @@ pub(crate) mod naive {
             }
             return ctx.fire(
                 op,
-                Fire::at(
+                Fire::at(kernel(
                     DECODE_SM80,
                     "::pie::attn::mla::mla_naive::mma_detail::mla_mma_fold",
-                )
+                ))
                 .apply(Launch::grid([rows, heads, 1], [128, 1, 1])),
                 &[
                     ArgValue::Ptr(part_o),
@@ -235,14 +235,14 @@ pub(crate) mod naive {
         .smem(naive_smem_bytes(ckv));
         ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 DECODE_SM80,
                 if ckv / 32 > 16 {
                     "::pie::attn::mla::mla_naive::mla_naive_paged_kernel<32>"
                 } else {
                     "::pie::attn::mla::mla_naive::mla_naive_paged_kernel<16>"
                 },
-            )
+            ))
             .apply(launch),
             &[
                 ArgValue::Ptr(ptrs.q_nope),
@@ -277,7 +277,7 @@ pub(crate) mod fa2 {
     use super::{Ctx, Error, Layer, refuse};
     use crate::attn::fa2::abi::{UintFastdiv, resolve};
     use crate::attn::plan::{MlaPlan, MlaPlanInfo};
-    use crate::jit::{Fire, Launch};
+    use crate::jit::{Fire, Launch, kernel};
 
     pub const INST: [[&str; 2]; 3] = [
         [
@@ -516,7 +516,7 @@ pub(crate) mod fa2 {
 
         ctx.fire(
             op,
-            Fire::at(DECODE_SM80, row[usize::from(causal)]).apply(launch),
+            Fire::at(kernel(DECODE_SM80, row[usize::from(causal)])).apply(launch),
             &[crate::jit::ArgValue::of(params)],
         )
     }

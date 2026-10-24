@@ -20,7 +20,7 @@ pub mod tensor;
 mod voxels;
 
 pub use error::Error;
-pub use jit::{Arg, ArgValue, Ctx, Fire, Launch, Pad, Slabs};
+pub use jit::{Arg, ArgValue, Ctx, Fire, Kernel, Launch, Pad, Slabs, kernel};
 pub use seat::{ENTRIES, EntryInfo, Lanes, Reads, Routes, Rows};
 
 pub use tensor::{KvPool, RaggedTensor, RecurrentPool, Snapshots, Tensor};

@@ -3,7 +3,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, nonzero};
+use crate::jit::{Arg, Ctx, Fire, Launch, kernel, nonzero};
 use crate::tensor::{KvPool, RaggedTensor, RecurrentPool, Tensor};
 
 const FILE: &str = "attn/replay.hip";
@@ -30,7 +30,7 @@ pub fn floor(
     let lanes = nonzero(OP, "request lanes", positions.indptr.rows.saturating_sub(1))?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::replay_floor")
+        Fire::at(kernel(FILE, "::pie::attn::replay_floor"))
             .apply(Launch::grid([lanes, 1, 1], [BLOCK, 1, 1])),
         &[
             positions.data.arg(),
@@ -69,7 +69,7 @@ pub fn kv_ends(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::kv_ends").apply(Launch::flat(rows, BLOCK)),
+        Fire::at(kernel(FILE, "::pie::attn::kv_ends")).apply(Launch::flat(rows, BLOCK)),
         &[
             request_of_token.arg(),
             pool.page_indptr.arg(),

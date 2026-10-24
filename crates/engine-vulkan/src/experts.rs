@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -116,6 +117,10 @@ impl HostPlane {
                 have: map.len() as u64,
             })?;
 
+            // SAFETY: `src` is `take` bytes the mapping bounds-checked. The
+            // destination stays inside `into..into + per` (`at - start + take
+            // <= per`), which `gather`, the only caller, points at its own
+            // seat of a mapped staging slot no pending copy reads.
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     src.as_ptr(),
@@ -615,7 +620,20 @@ fn copy_plane(map: &Mapping, plane: &HostPlane, into: usize) -> Result<()> {
             need: file + len,
             have: map.len() as u64,
         })?;
+        if virt.saturating_add(len) > plane.bytes {
+            return Err(Fault::Ceiling {
+                what: "bytes of a host-tier plane a run writes",
+                need: virt.saturating_add(len),
+                have: plane.bytes,
+            });
+        }
 
+        // SAFETY: `src` is `len` bytes the mapping bounds-checked. `into` is
+        // the mapped base of a pump staging slot of `per` bytes, and `stage`
+        // checked `plane.bytes <= per`; the run was just checked to lie inside
+        // `plane.bytes`. The ring
+        // flushes before a slot comes round again, so no pending copy reads
+        // the slot while it is written.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 src.as_ptr(),
@@ -682,6 +700,11 @@ fn record_copy(
     let d = &frame.core().device;
     let cmd = frame.cmd();
 
+    // SAFETY: `cmd` is the open frame's buffer, recorded only on this thread
+    // (`Frame` is not `Sync`); both slabs are live buffers of its device and
+    // `span` bounds the copy in each. They are not retained by the frame: the
+    // seats and pump own them for the shell's life, and the shell's context
+    // drains the queue before they drop.
     unsafe {
         let before = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ)

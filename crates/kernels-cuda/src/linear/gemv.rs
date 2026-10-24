@@ -1,6 +1,6 @@
 use crate::error::Error;
 
-use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, refuse};
+use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, kernel, refuse};
 
 const GEMV: &str = "linear/gemv.cu";
 
@@ -68,7 +68,7 @@ pub(crate) fn gemv_bf16(
         };
         return ctx.fire(
             "linear.gemv",
-            Fire::at(GEMV, instantiation).apply(
+            Fire::at(kernel(GEMV, instantiation)).apply(
                 Launch::grid([n.unsigned_abs(), 1, 1], [32, warps, 1])
                     .programmatic(ctx.tuning().pdl),
             ),
@@ -83,7 +83,7 @@ pub(crate) fn gemv_bf16(
     };
     ctx.fire(
         "linear.gemv",
-        Fire::at("linear/gemv.cu", instantiation).apply(
+        Fire::at(kernel("linear/gemv.cu", instantiation)).apply(
             Launch::grid([n.unsigned_abs().div_ceil(4), 1, 1], [32, 4, 1])
                 .programmatic(ctx.tuning().pdl),
         ),
@@ -154,12 +154,10 @@ pub fn gemm_rows_bf16(
     let cl = rows_cluster(n, k);
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             GEMV,
-            crate::jit::symbol(&format!(
-                "::pie::linear::gemm_rows_bf16_kernel<{m}, {split}, {cl}>"
-            )),
-        )
+            &format!("::pie::linear::gemm_rows_bf16_kernel<{m}, {split}, {cl}>"),
+        ))
         .apply(
             Launch::grid([blocks * cl, 1, 1], [256, 1, 1])
                 .programmatic(pdl)
@@ -208,10 +206,10 @@ pub fn gemm_narrow_bf16(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             GEMV,
-            crate::jit::symbol(&format!("::pie::linear::gemm_narrow_bf16_kernel<{n}>")),
-        )
+            &format!("::pie::linear::gemm_narrow_bf16_kernel<{n}>"),
+        ))
         .apply(Launch::grid([m.unsigned_abs(), 1, 1], [256, 1, 1])),
         &[
             ArgValue::Ptr(weight),

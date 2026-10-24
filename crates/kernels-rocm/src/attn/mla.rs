@@ -1,9 +1,10 @@
+#![allow(unsafe_code)]
 use crate::error::Error;
 use dtype::Dtype;
 
 use crate::attn::kv;
 use crate::attn::plan::MlaPlan;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 pub mod prep;
@@ -105,10 +106,10 @@ fn split_kv_a_norm(
     }
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             "attn/mla.hip",
-            crate::jit::symbol(&format!("::pie::attn::mla_latents<{t}, 256>")),
-        )
+            &format!("::pie::attn::mla_latents<{t}, 256>"),
+        ))
         .apply(rms(kv_a.rows)),
         &[
             kv_a.arg(),
@@ -207,6 +208,10 @@ pub fn absorb_q(
     let handle = ctx.blas(OP)?;
 
     #[cfg(feature = "rocm")]
+    // SAFETY: `handle` and `ctx.stream()` are the live rocBLAS handle and
+    // stream this `Ctx` was built over (`with_blas`/`on`); `kv_b`, `q_nope` and
+    // `q_latent` are the caller's device tensors, each holding `heads` problems
+    // at the strides passed.
     unsafe {
         absorb(
             handle,
@@ -276,6 +281,10 @@ pub fn absorb_out(
         .wrapping_add(2 * u64::from(nope.unsigned_abs()) * u64::from(rank.unsigned_abs()));
 
     #[cfg(feature = "rocm")]
+    // SAFETY: `handle` and `ctx.stream()` are the live rocBLAS handle and
+    // stream this `Ctx` was built over (`with_blas`/`on`); `wv` is the value
+    // half of `kv_b`, and `latent` and `o` are the caller's device tensors,
+    // each holding `heads` problems at the strides passed.
     unsafe {
         absorb(
             handle,
@@ -304,6 +313,11 @@ pub fn absorb_out(
     }
 }
 
+/// # Safety
+///
+/// `handle` must be a live rocBLAS handle and `stream` a live stream; `a`,
+/// `b` and `c` must be device bf16 planes holding `heads` problems of the
+/// stated shape at the stated strides.
 #[cfg(feature = "rocm")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn absorb(
@@ -385,10 +399,10 @@ fn absorb_native(
     let tt = wt * 16 * ms;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             "attn/mla.hip",
-            crate::jit::symbol(&format!("::pie::attn::mla_absorb<{kn}, {wt}, {ms}>")),
-        )
+            &format!("::pie::attn::mla_absorb<{kn}, {wt}, {ms}>"),
+        ))
         .apply(Launch::grid(
             [n / 64, heads, tokens.div_ceil(tt)],
             [BLOCK, 1, 1],
@@ -454,7 +468,7 @@ pub fn kv_append(
 /// and rope width, a wavefront per (query row, key stride).
 pub(crate) mod naive {
     use super::{ArgValue, Ctx, Error, Fire, Launch, refuse};
-    use crate::jit::Arg;
+    use crate::jit::{Arg, kernel};
 
     pub const NAIVE_BLOCK: u32 = 256;
 
@@ -564,10 +578,10 @@ pub(crate) mod naive {
         .smem(naive_smem_bytes(ckv));
         ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 "attn/mla.hip",
                 "::pie::attn::mla_naive::mla_naive_paged_kernel",
-            )
+            ))
             .apply(launch),
             &[
                 ArgValue::Ptr(ptrs.q_nope),
@@ -602,7 +616,7 @@ pub(crate) mod naive {
 pub(crate) mod latent {
     use super::{ArgValue, Ctx, Error, Fire, Launch, Layer, refuse};
     use crate::attn::plan::MlaPlan;
-    use crate::jit::symbol;
+    use crate::jit::kernel;
 
     const FILE: &str = "attn/mla.hip";
 
@@ -775,13 +789,13 @@ pub(crate) mod latent {
         };
         #[allow(clippy::cast_sign_loss)]
         let grid = [info.num_blks_x as u32, info.num_blks_y as u32, 1];
-        let entry = symbol(&format!(
+        let entry = format!(
             "::pie::attn::mla::mla_paged<{}, {}>",
             layer.rope_dim, layer.fp8
-        ));
+        );
         ctx.fire(
             op,
-            Fire::at(FILE, entry).apply(Launch::grid(grid, [THREADS, 1, 1])),
+            Fire::at(kernel(FILE, &entry)).apply(Launch::grid(grid, [THREADS, 1, 1])),
             &[ArgValue::of(&work)],
         )?;
         let merge = Merge {
@@ -798,7 +812,7 @@ pub(crate) mod latent {
         };
         ctx.fire(
             op,
-            Fire::at(FILE, "::pie::attn::mla::mla_merge")
+            Fire::at(kernel(FILE, "::pie::attn::mla::mla_merge"))
                 .apply(Launch::grid([plan.device.num_sm.max(1), 1, 1], [256, 1, 1])),
             &[ArgValue::of(&merge)],
         )
@@ -855,12 +869,10 @@ pub(crate) mod latent {
         if let ArgValue::Ptr(win) = ctx.stage() {
             g.win = win;
         }
-        let entry = symbol(&format!(
-            "::pie::attn::mla::latent_gather<{rope}, {rank}, {fp8}>"
-        ));
+        let entry = format!("::pie::attn::mla::latent_gather<{rope}, {rank}, {fp8}>");
         ctx.fire(
             op,
-            Fire::at(FILE, entry).apply(Launch::grid(
+            Fire::at(kernel(FILE, &entry)).apply(Launch::grid(
                 [heads.div_ceil(BLOCK_ROWS), rows, splits * halves],
                 [THREADS, 1, 1],
             )),
@@ -871,10 +883,10 @@ pub(crate) mod latent {
         }
         ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 FILE,
-                symbol(&format!("::pie::attn::mla::latent_merge<{rank}>")),
-            )
+                &format!("::pie::attn::mla::latent_merge<{rank}>"),
+            ))
             .apply(Launch::grid([rows, heads, 1], [64, 1, 1])),
             &[
                 ArgValue::Ptr(g.part_o),

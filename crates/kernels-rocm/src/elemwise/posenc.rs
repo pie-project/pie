@@ -1,6 +1,6 @@
 use crate::error::Error;
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::Tensor;
 use crate::voxels::lane_pair;
@@ -62,7 +62,8 @@ pub fn sinusoid(
     }
     ctx.fire(
         OP,
-        Fire::at(POSENC_UNIT, "::pie::elemwise::sinusoid").apply(Launch::per_row(rows, BLOCK)),
+        Fire::at(kernel(POSENC_UNIT, "::pie::elemwise::sinusoid"))
+            .apply(Launch::per_row(rows, BLOCK)),
         &[
             t.arg(),
             o.arg(),
@@ -141,10 +142,10 @@ pub fn relative_bucket_bias(
     })?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             POSENC_UNIT,
-            symbol(&format!("::pie::elemwise::relative_bucket_bias<{t}>")),
-        )
+            &format!("::pie::elemwise::relative_bucket_bias<{t}>"),
+        ))
         .apply(Launch::flat(lanes, BLOCK)),
         &[
             embedding.arg(),
@@ -204,10 +205,10 @@ pub fn rel_bias(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             REL_BIAS_UNIT,
-            symbol(&format!("::pie::linear::rel_bias<{t}>")),
-        )
+            &format!("::pie::linear::rel_bias<{t}>"),
+        ))
         .apply(Launch::grid(
             [extent.div_ceil(BLOCK), heads, rows],
             [BLOCK, 1, 1],
@@ -335,7 +336,7 @@ pub fn derive_grid(
     };
     ctx.fire(
         OP,
-        Fire::at(POSENC_UNIT, "::pie::elemwise::grid_rule")
+        Fire::at(kernel(POSENC_UNIT, "::pie::elemwise::grid_rule"))
             .apply(Launch::grid([1, 1, 1], [64, 1, 1])),
         &[grid.arg(), o_grid.arg(), ArgValue::of(&geom)],
     )

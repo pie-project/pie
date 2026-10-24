@@ -4,7 +4,7 @@
 use crate::error::Error;
 
 use crate::attn::compressed::pool::compact;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, kernel};
 use crate::tensor::{KvPool, Tensor};
 
 const POOL_LSE_SM80: &str = "attn/compressed/pool_lse_sm80.cu";
@@ -44,12 +44,10 @@ pub(crate) fn pool_mma(
     let selected = selection.is_some();
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             POOL_LSE_SM80,
-            symbol(&format!(
-                "::pie::attn::compressed::pool_lse_mma<{d}, {selected}>"
-            )),
-        )
+            &format!("::pie::attn::compressed::pool_lse_mma<{d}, {selected}>"),
+        ))
         .apply(
             Launch::grid(
                 [o.rows, num_q_heads.unsigned_abs().div_ceil(HEADS), 1],

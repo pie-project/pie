@@ -80,10 +80,7 @@ fn queries_off_one_arm_and_keys_off_another_trace_under_the_or_of_both(trace: &T
     assert!(trace.caches.is_empty(), "a denoiser declares no kv space");
 
     let audio = cond_of(trace, &fact::stream(Stream::Audio));
-    let video = Guard::and(
-        Guard::not(audio.clone()),
-        cond_of(trace, &fact::stream(Stream::Video)),
-    );
+    let video = Guard::and(!audio.clone(), cond_of(trace, &fact::stream(Stream::Video)));
 
     let (at, ragged) = trace
         .nodes

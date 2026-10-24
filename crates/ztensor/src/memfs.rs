@@ -79,7 +79,7 @@ impl Lazy {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, LazyCache> {
-        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+        self.cache.lock().expect("lock poisoned")
     }
 
     fn pin_from(&self) -> u64 {
@@ -373,7 +373,7 @@ static MOUNTS: LazyLock<Mutex<HashMap<PathBuf, Chunks>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn table() -> std::sync::MutexGuard<'static, HashMap<PathBuf, Chunks>> {
-    MOUNTS.lock().unwrap_or_else(|e| e.into_inner())
+    MOUNTS.lock().expect("mounts lock poisoned")
 }
 
 pub fn mount(path: impl AsRef<Path>, bytes: Arc<[u8]>) {

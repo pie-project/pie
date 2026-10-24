@@ -2,7 +2,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::linear::moe::GroupSeat;
 use crate::tensor::Tensor;
@@ -240,15 +240,15 @@ fn dense_affine(
         let split = GemmSplit::plan_stages(ctx, op, y.rows, n, k / tile.ks, 2, blocks, cus)?;
         ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 FILE,
-                symbol(&format!(
+                &format!(
                     "::pie::linear::matmul_affine_tile<{t}, {f}, ::pie::i32({bits}), {axis}, \
                      ::pie::i32({group}), ::pie::i32({}), ::pie::i32({}), ::pie::i32({}), \
                      ::pie::i32({}), ::pie::i32({})>",
                     tile.ks, tile.wm, tile.rs, tile.nt, tile.depth
-                )),
-            )
+                ),
+            ))
             .apply(Launch::grid(
                 [
                     y.rows.div_ceil(tile.bm()),
@@ -286,13 +286,13 @@ fn dense_affine(
         let split = GemmSplit::plan(ctx, op, y.rows, n, k, blocks(bm), cus)?;
         ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 FILE,
-                symbol(&format!(
+                &format!(
                     "::pie::linear::matmul_affine_gemm<{t}, {f}, ::pie::i32({bits}), {axis}, \
                      ::pie::i32({group}), ::pie::i32({bm})>"
-                )),
-            )
+                ),
+            ))
             .apply(Launch::grid(
                 [y.rows.div_ceil(bm), n.div_ceil(GEMM_BN), split.splits],
                 [GEMM_THREADS, 1, 1],
@@ -318,15 +318,15 @@ fn dense_affine(
         let split = GemmSplit::fixed(ctx, op, y.rows, n, s.slices)?;
         ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 FILE,
-                symbol(&format!(
+                &format!(
                     "::pie::linear::matmul_affine_stream<{t}, {f}, ::pie::i32({bits}), {axis}, \
                      ::pie::i32({group}), ::pie::i32({}), ::pie::i32({}), ::pie::i32({}), \
                      ::pie::i32({}), ::pie::i32({}), ::pie::i32({}), ::pie::i32({})>",
                     s.lane, s.nt, s.rs, s.rows, s.pieces, s.split, s.depth
-                )),
-            )
+                ),
+            ))
             .apply(Launch::grid(
                 [s.blocks, s.slices, 1],
                 [WAVE * s.split, 1, 1],
@@ -350,15 +350,15 @@ fn dense_affine(
     let d = Decode::plan(bits, group, n, k, y.rows, cus);
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
+            &format!(
                 "::pie::linear::matmul_affine_decode<{t}, {f}, ::pie::i32({bits}), {axis}, \
                  ::pie::i32({group}), ::pie::i32({}), ::pie::i32({}), ::pie::i32({}), \
                  ::pie::i32({}), ::pie::i32({}), ::pie::i32({})>",
                 d.shape, d.lane, d.nt, d.rs, d.split, d.round
-            )),
-        )
+            ),
+        ))
         .apply(Launch::grid(
             [
                 n.div_ceil(d.shape * d.nt),
@@ -496,10 +496,10 @@ impl GemmSplit {
         let cells = self.rows * self.n;
         ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 file,
-                symbol(&format!("::pie::linear::affine_gemm_finalize<{t}>")),
-            )
+                &format!("::pie::linear::affine_gemm_finalize<{t}>"),
+            ))
             .apply(Launch::grid(
                 [cells.div_ceil(256).min(4096), 1, 1],
                 [256, 1, 1],

@@ -1,6 +1,6 @@
 use super::*;
 use crate::error::Error;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, nonzero, stated, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, kernel, nonzero, stated};
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
@@ -51,12 +51,10 @@ pub(super) fn select_bf16_wgmma(
     let smem = 3 * atoms * (64 + slice) * 128 + 1024;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             SELECT_SM90,
-            symbol(&format!(
-                "::pie::linear::moe_select_bf16_wgmma<{slice}, {atoms}>"
-            )),
-        )
+            &format!("::pie::linear::moe_select_bf16_wgmma<{slice}, {atoms}>"),
+        ))
         .apply(Launch::grid([work_cap, y.width / 64, 1], [128, 1, 1]).smem(smem)),
         &[
             x.arg(),
@@ -133,10 +131,10 @@ pub(super) fn select_bf16_mma(
     let smem = 3 * (128 + 8 * nb) * (64 + 8) * 2;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             SELECT_SM80,
-            symbol(&format!("::pie::linear::moe_select_bf16_mma<{nb}>")),
-        )
+            &format!("::pie::linear::moe_select_bf16_mma<{nb}>"),
+        ))
         .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(smem)),
         &[
             x.arg(),
@@ -232,12 +230,10 @@ pub fn select_bf16_held(
         let cols = if glu.is_some() { 128 } else { 256 };
         ctx.fire(
             op,
-            Fire::at(
+            Fire::at(kernel(
                 SELECT_SM90,
-                symbol(&format!(
-                    "::pie::linear::moe_select_bf16_wsgemm<{STAGES}, {code}>"
-                )),
-            )
+                &format!("::pie::linear::moe_select_bf16_wsgemm<{STAGES}, {code}>"),
+            ))
             .apply(
                 Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [384, 1, 1])
                     .smem(STAGES * 49152 + 1024 + 128),
@@ -285,24 +281,22 @@ pub fn select_bf16_held(
         const STAGES: u32 = 3;
         const WN: u32 = 2;
         let cols = if glu.is_some() { 64 } else { 128 };
-        Fire::at(
+        Fire::at(kernel(
             SELECT_SM80,
-            symbol(&format!(
-                "::pie::linear::moe_select_bf16_gemm<{STAGES}, {code}, {WN}>"
-            )),
-        )
+            &format!("::pie::linear::moe_select_bf16_gemm<{STAGES}, {code}, {WN}>"),
+        ))
         .apply(
             Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [64 * WN, 1, 1])
                 .smem(STAGES * (64 + 128) * 128),
         )
     } else {
         let cols = if glu.is_some() { 64 } else { 64 * tiles };
-        Fire::at(
+        Fire::at(kernel(
             SELECT,
-            symbol(&format!(
+            &format!(
                 "::pie::linear::moe_select_bf16_held<{nb}, {DEPTH}, {code}, {tiles}, {ksplit}>"
-            )),
-        )
+            ),
+        ))
         .apply(Launch::grid(
             [order.work_cap, y.width.div_ceil(cols), 1],
             [THREADS * ksplit, 1, 1],

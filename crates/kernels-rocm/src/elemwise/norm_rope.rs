@@ -3,7 +3,7 @@
 use super::rope::Yarn;
 use super::*;
 use crate::error::Error;
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, refuse, stated};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::Tensor;
 
 #[allow(clippy::too_many_arguments)]
@@ -45,8 +45,11 @@ pub fn rmsnorm_rope_partial_q(
     }
     ctx.fire(
         OP,
-        Fire::at(ROPE_UNIT, "::pie::elemwise::q_rmsnorm_rope_partial<128>")
-            .apply(Launch::grid([y.rows, heads, 1], [128, 1, 1])),
+        Fire::at(kernel(
+            ROPE_UNIT,
+            "::pie::elemwise::q_rmsnorm_rope_partial<128>",
+        ))
+        .apply(Launch::grid([y.rows, heads, 1], [128, 1, 1])),
         &[
             x.arg(),
             weight.arg(),

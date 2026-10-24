@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use eta_ir::container::HostRole;

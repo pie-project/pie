@@ -2,7 +2,7 @@
 //! the earliest among equals, read at each grant. Only the first gate holds
 //! waiters below the floor: one at a later gate holds an earlier permit.
 
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::oneshot;
 
@@ -52,7 +52,7 @@ impl OrderedSemaphore {
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        self.state.lock().expect("state lock poisoned")
     }
 
     pub(crate) fn available_permits(&self) -> usize {

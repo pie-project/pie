@@ -1,8 +1,9 @@
+#![allow(unsafe_code)]
 use super::select_fp4::{matmul_select_mlxu4, matmul_select_mxfp4};
 use super::*;
 use crate::error::Error;
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::Tensor;
 use dtype::Dtype;
@@ -379,7 +380,7 @@ pub(super) fn select_grouped(
 
     ctx.fire(
         op,
-        Fire::at(ROUTE, "::pie::linear::moe_align_decode<::pie::i32>")
+        Fire::at(kernel(ROUTE, "::pie::linear::moe_align_decode<::pie::i32>"))
             .apply(Launch::grid([1, 1, 1], [BLOCK, 1, 1]).smem((3 * experts + 34) * 4)),
         &[
             routes.arg(),
@@ -397,10 +398,10 @@ pub(super) fn select_grouped(
     let gather_fan = if fan.by_token { fan.top_k } else { 1 };
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             ROUTE,
-            symbol(&format!("::pie::linear::gather_moe_aligned_inputs<{t}>")),
-        )
+            &format!("::pie::linear::gather_moe_aligned_inputs<{t}>"),
+        ))
         .apply(Launch::grid(
             [rows, x.width.div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
@@ -420,10 +421,10 @@ pub(super) fn select_grouped(
 
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             ROUTE,
-            symbol(&format!("::pie::linear::build_moe_leg_ptrs<{t}>")),
-        )
+            &format!("::pie::linear::build_moe_leg_ptrs<{t}>"),
+        ))
         .apply(Launch::flat(blocks, BLOCK)),
         &[
             ArgValue::Ptr(expert_ids),
@@ -481,10 +482,10 @@ pub(super) fn select_grouped(
 
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             COMBINE,
-            symbol(&format!("::pie::linear::reorder_moe_aligned_output<{t}>")),
-        )
+            &format!("::pie::linear::reorder_moe_aligned_output<{t}>"),
+        ))
         .apply(Launch::grid(
             [rows, y.width.div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
@@ -546,7 +547,7 @@ pub(crate) fn select_gemv(
     let entry = format!("::pie::linear::moe_matmul_select_gemv_{form}<{t}, {ROWS}>");
     ctx.fire(
         op,
-        Fire::at(SELECT, symbol(&entry)).apply(
+        Fire::at(kernel(SELECT, &entry)).apply(
             Launch::grid(
                 [y.width.div_ceil(GEMV_WARPS * ROWS), grid_y, grid_z],
                 [WARP, GEMV_WARPS, 1],

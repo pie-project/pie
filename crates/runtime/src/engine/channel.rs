@@ -1,12 +1,15 @@
+#![allow(unsafe_code)]
 use std::sync::Arc;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use engine::{ChannelId, InstanceId};
 
 type OwnedRing = (Box<[u8]>, Box<[AtomicU64]>);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ChannelValue {
-    pub channel: u64,
+    pub channel: ChannelId,
     pub bytes: Vec<u8>,
 }
 
@@ -77,7 +80,7 @@ impl HostRing {
     }
 
     #[must_use]
-    pub fn binding(&self, channel_id: u64) -> ChannelBinding {
+    pub fn binding(&self, channel_id: ChannelId) -> ChannelBinding {
         ChannelBinding {
             channel_id,
             mirror_base: self.mirror_base,
@@ -96,7 +99,7 @@ impl HostRing {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChannelBinding {
-    pub channel_id: u64,
+    pub channel_id: ChannelId,
     pub mirror_base: u64,
     pub word_base: u64,
     pub mirror_bytes: u64,
@@ -122,7 +125,7 @@ impl RegisteredChannel {
     #[must_use]
     pub fn new(
         engine_id: usize,
-        id: u64,
+        id: ChannelId,
         cell_bytes: u32,
         capacity: u32,
         reader_wait_id: u64,
@@ -140,7 +143,7 @@ impl RegisteredChannel {
     #[must_use]
     pub fn over(
         engine_id: usize,
-        id: u64,
+        id: ChannelId,
         ring: Arc<HostRing>,
         reader_wait_id: u64,
         writer_wait_id: u64,
@@ -160,7 +163,7 @@ impl RegisteredChannel {
     }
 
     #[must_use]
-    pub fn id(&self) -> u64 {
+    pub fn id(&self) -> ChannelId {
         self.binding.channel_id
     }
 }
@@ -178,8 +181,8 @@ impl Eq for RegisteredChannel {}
 
 #[derive(Debug, Default)]
 pub struct ChannelJoin {
-    channels: std::collections::HashMap<u64, JoinedChannel>,
-    instances: std::collections::HashMap<u64, Vec<u64>>,
+    channels: std::collections::HashMap<ChannelId, JoinedChannel>,
+    instances: std::collections::HashMap<InstanceId, Vec<ChannelId>>,
 }
 
 #[derive(Debug, Clone)]
@@ -195,7 +198,7 @@ impl ChannelJoin {
     }
 
     #[must_use]
-    pub fn contains(&self, id: u64) -> bool {
+    pub fn contains(&self, id: ChannelId) -> bool {
         self.channels.contains_key(&id)
     }
 
@@ -209,12 +212,12 @@ impl ChannelJoin {
         self.channels.is_empty()
     }
 
-    pub fn ids(&self) -> impl Iterator<Item = u64> + '_ {
+    pub fn ids(&self) -> impl Iterator<Item = ChannelId> + '_ {
         self.channels.keys().copied()
     }
 
     #[must_use]
-    pub fn into_ids(self) -> Vec<u64> {
+    pub fn into_ids(self) -> Vec<ChannelId> {
         self.channels.into_keys().collect()
     }
 
@@ -232,19 +235,23 @@ impl ChannelJoin {
         );
     }
 
-    pub fn remove(&mut self, id: u64) {
+    pub fn remove(&mut self, id: ChannelId) {
         self.channels.remove(&id);
     }
 
-    pub fn bind(&mut self, instance: u64, channels: Vec<u64>) {
+    pub fn bind(&mut self, instance: InstanceId, channels: Vec<ChannelId>) {
         self.instances.insert(instance, channels);
     }
 
-    pub fn unbind(&mut self, instance: u64) {
+    pub fn unbind(&mut self, instance: InstanceId) {
         self.instances.remove(&instance);
     }
 
-    pub fn pump_in(&self, engine: &mut dyn engine::Engine, instance: u64) -> engine::Result<()> {
+    pub fn pump_in(
+        &self,
+        engine: &mut dyn engine::Engine,
+        instance: InstanceId,
+    ) -> engine::Result<()> {
         let Some(channels) = self.instances.get(&instance) else {
             return Ok(());
         };
@@ -291,14 +298,18 @@ impl ChannelJoin {
         Ok(())
     }
 
-    pub fn pump_out(&self, engine: &mut dyn engine::Engine, instance: u64) -> engine::Result<()> {
+    pub fn pump_out(
+        &self,
+        engine: &mut dyn engine::Engine,
+        instance: InstanceId,
+    ) -> engine::Result<()> {
         self.pump_out_with(engine, instance, None)
     }
 
     pub fn pump_out_with(
         &self,
         engine: &mut dyn engine::Engine,
-        instance: u64,
+        instance: InstanceId,
         mut deferred: Option<&mut Vec<u64>>,
     ) -> engine::Result<()> {
         let Some(channels) = self.instances.get(&instance) else {
@@ -373,7 +384,7 @@ fn store_word(word_base: u64, index: u32, value: u64) {
     }
 }
 
-pub type ChannelCloser = Arc<dyn Fn(u64) -> anyhow::Result<()> + Send + Sync>;
+pub type ChannelCloser = Arc<dyn Fn(ChannelId) -> anyhow::Result<()> + Send + Sync>;
 
 pub struct ChannelEndpoint {
     registered: RegisteredChannel,
@@ -410,6 +421,9 @@ impl std::fmt::Display for ChannelWaitError {
 impl std::error::Error for ChannelWaitError {}
 
 fn load_channel_word(word_base: u64, index: u32) -> u64 {
+    // SAFETY: as `load_word` — the binding is the one its engine minted over
+    // `registered.ring`, which the endpoint keeps alive while it waits, and
+    // `index` is one of that ring's four words.
     unsafe { (&*((word_base as *const AtomicU64).add(index as usize))).load(Ordering::Acquire) }
 }
 
@@ -477,7 +491,7 @@ impl ChannelEndpoint {
         .await
     }
 
-    pub fn detach_close_notification(&self) -> Option<u64> {
+    pub fn detach_close_notification(&self) -> Option<ChannelId> {
         if self.closed.load(Ordering::Acquire) {
             return None;
         }
@@ -501,7 +515,7 @@ impl ChannelEndpoint {
             && let Err(error) = closer(self.registered.binding.channel_id)
         {
             tracing::warn!(
-                channel_id = self.registered.binding.channel_id,
+                channel_id = self.registered.binding.channel_id.0,
                 ?error,
                 "ordered channel close failed"
             );

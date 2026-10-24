@@ -1,8 +1,9 @@
+#![allow(unsafe_code)]
 use crate::error::Error;
 use dtype::Dtype;
 
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::Tensor;
 
@@ -62,7 +63,7 @@ pub fn embed(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, instantiation).apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
+        Fire::at(kernel(FILE, instantiation)).apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
             ids.arg(),
             table.arg(),
@@ -92,7 +93,7 @@ pub fn embed_vocab_shard(
     let rank = comm_rank(ctx, OP)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::layout::embed_vocab_shard")
+        Fire::at(kernel(FILE, "::pie::layout::embed_vocab_shard"))
             .apply(Launch::grid([rows, 1, 1], [BLOCK, 1, 1])),
         &[
             ids.arg(),
@@ -155,7 +156,7 @@ pub(crate) fn gather_width_concat(
         .map_err(|_| refuse(OP, format!("{total} lanes do not fit a 32-bit grid")))?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::layout::gather_width_concat")
+        Fire::at(kernel(FILE, "::pie::layout::gather_width_concat"))
             .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
             ArgValue::Ptr(src),
@@ -195,7 +196,7 @@ pub fn embed_scale_add(
         .map_err(|_| refuse(OP, format!("{total} gather lanes do not fit a 32-bit grid")))?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::layout::embed_scale_add")
+        Fire::at(kernel(FILE, "::pie::layout::embed_scale_add"))
             .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
             ids.arg(),
@@ -263,7 +264,7 @@ pub fn embed_scale_add_select(
         .map_err(|_| refuse(OP, format!("{total} gather lanes do not fit a 32-bit grid")))?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::layout::embed_scale_add_select")
+        Fire::at(kernel(FILE, "::pie::layout::embed_scale_add_select"))
             .apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
             ids.arg(),
@@ -309,7 +310,7 @@ pub fn split_qkv(
     let width = q.width.max(k.width);
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::layout::split_qkv").apply(Launch::grid(
+        Fire::at(kernel(FILE, "::pie::layout::split_qkv")).apply(Launch::grid(
             [q.rows, width.div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
         )),
@@ -357,7 +358,7 @@ pub fn split_qkv_padded(
     let out8 = (heads[0] + 2 * heads[1]) * head_dim / 8;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::layout::split_qkv_padded").apply(Launch::grid(
+        Fire::at(kernel(FILE, "::pie::layout::split_qkv_padded")).apply(Launch::grid(
             [q.rows, out8.div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
         )),
@@ -399,7 +400,7 @@ pub fn split_q_gate(
     let block = if head_dim < 128 { 64 } else { 128 };
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::layout::split_q_gate")
+        Fire::at(kernel(FILE, "::pie::layout::split_q_gate"))
             .apply(Launch::grid([q.rows, heads, 1], [block, 1, 1])),
         &[
             packed.arg(),
@@ -442,7 +443,7 @@ pub fn split_rows(
     );
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&entrypoint)).apply(launch),
+        Fire::at(kernel(FILE, &entrypoint)).apply(launch),
         &[
             x.arg(),
             left.arg(),
@@ -488,7 +489,7 @@ pub fn select(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::layout::select<{t}>")))
+        Fire::at(kernel(FILE, &format!("::pie::layout::select<{t}>")))
             .apply(route_rows(y.rows, width)),
         &[
             table.arg(),
@@ -561,7 +562,7 @@ fn move_rows(
     let per_row = u32::try_from(bytes / width).unwrap_or(u32::MAX);
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&format!("::pie::layout::{entry}<{unit}>")))
+        Fire::at(kernel(FILE, &format!("::pie::layout::{entry}<{unit}>")))
             .apply(route_rows(rows, per_row)),
         &[
             args[0].arg(),
@@ -650,7 +651,7 @@ fn permute_rows(
     let per_row = u32::try_from(bytes / width).unwrap_or(u32::MAX);
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&format!("::pie::layout::{entry}<{unit}>")))
+        Fire::at(kernel(FILE, &format!("::pie::layout::{entry}<{unit}>")))
             .apply(route_rows(rows, per_row)),
         &[
             x.arg(),

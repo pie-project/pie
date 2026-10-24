@@ -56,3 +56,6 @@ vulkan = [
     "kernels-slang/spirv",
     "kernels-slang/probe",
 ]
+
+[lints]
+workspace = true

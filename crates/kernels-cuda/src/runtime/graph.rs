@@ -1,6 +1,6 @@
 use crate::error::Error;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, kernel};
 
 const FILE: &str = "runtime/graph.cu";
 
@@ -36,7 +36,7 @@ pub fn set_conditional(
     let lanes = i32::try_from(lanes).unwrap_or(i32::MAX);
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol("::pie::runtime::graph::set_conditional")).apply(once()),
+        Fire::at(kernel(FILE, "::pie::runtime::graph::set_conditional")).apply(once()),
         &[
             handle.arg(),
             crate::ArgValue::Ptr(indptr),
@@ -58,7 +58,7 @@ pub fn set_conditional_byte(
     const OP: &str = "graph.set_conditional_byte";
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol("::pie::runtime::graph::set_conditional_byte")).apply(once()),
+        Fire::at(kernel(FILE, "::pie::runtime::graph::set_conditional_byte")).apply(once()),
         &[
             handle.arg(),
             crate::ArgValue::Ptr(live),
@@ -81,7 +81,7 @@ pub fn set_switch(
     let lanes = i32::try_from(lanes).unwrap_or(i32::MAX);
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol("::pie::runtime::graph::set_switch")).apply(once()),
+        Fire::at(kernel(FILE, "::pie::runtime::graph::set_switch")).apply(once()),
         &[
             handle.arg(),
             arm.arg(),

@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -11,30 +12,20 @@ pub struct Resolved {
     pub function: sys::Function,
 }
 
+// SAFETY: `module` and `function` are process-wide HIP handles any thread may
+// use, and a `Resolved` is never dropped (it lives in a leaked slot), so
+// neither handle is ever unloaded under a user.
 unsafe impl Send for Resolved {}
 
+// SAFETY: shared access only copies the two handles out; HIP launches one
+// function from several threads at once.
 unsafe impl Sync for Resolved {}
 
-type Slot = OnceLock<Result<Resolved, Fault>>;
-
-fn slot(key: &str) -> &'static Slot {
-    static SLOTS: OnceLock<Mutex<HashMap<String, &'static Slot>>> = OnceLock::new();
-    let mut map = SLOTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(found) = map.get(key) {
-        return found;
-    }
-
-    let fresh: &'static Slot = Box::leak(Box::new(OnceLock::new()));
-    map.insert(key.to_owned(), fresh);
-    fresh
-}
-
-pub(crate) fn resolve(root: &Root, instantiation: &str) -> Result<&'static Resolved, Fault> {
+/// The ordinal of the device bound to this thread.
+pub(crate) fn current_device() -> Result<i32, Fault> {
     let api = api("hipGetDevice")?;
     let mut ordinal: i32 = 0;
+    // SAFETY: `ordinal` is a live local out-parameter.
     let code = unsafe { (api.hip.hipGetDevice)(&raw mut ordinal) };
     if code != sys::HIP_SUCCESS {
         return Err(Fault::Device {
@@ -42,22 +33,21 @@ pub(crate) fn resolve(root: &Root, instantiation: &str) -> Result<&'static Resol
             code,
         });
     }
+    Ok(ordinal)
+}
+
+/// `instantiation` of `root` loaded on device `ordinal`: from the disk cache,
+/// or compiled and written there.
+pub(crate) fn load(root: &Root, instantiation: &str, ordinal: i32) -> Result<Resolved, Fault> {
     let arch = arch(ordinal).ok_or(Fault::Device {
         call: "hipGetDeviceProperties",
         code: -1,
     })?;
-    let key = format!(
+    let key = &format!(
         "{}/rtc{}",
         root.key(instantiation, arch),
         hiprtc::version()?
     );
-    slot(&format!("hip:{ordinal}|{key}"))
-        .get_or_init(|| load(root, instantiation, &key, arch))
-        .as_ref()
-        .map_err(Clone::clone)
-}
-
-fn load(root: &Root, instantiation: &str, key: &str, arch: &str) -> Result<Resolved, Fault> {
     let started = std::time::Instant::now();
     let (image, mangled, compiled) = match read_disk(key) {
         Some(hit) => (hit.0, hit.1, false),
@@ -94,6 +84,8 @@ fn load(root: &Root, instantiation: &str, key: &str, arch: &str) -> Result<Resol
     let module = load_image(root.name, &image)?;
     let function = entry_by_name(root.name, module, instantiation, &mangled).inspect_err(|_| {
         if let Ok(api) = sys::api() {
+            // SAFETY: `module` was loaded just above and this error drops its
+            // only handle, so it is unloaded once and never used again.
             unsafe { (api.hip.hipModuleUnload)(module) };
         }
     })?;
@@ -122,6 +114,9 @@ fn load_image(root: &'static str, image: &[u8]) -> Result<sys::Module, Fault> {
     let api = api("hipModuleLoadData")?;
     let mut module: sys::Module = std::ptr::null_mut();
 
+    // SAFETY: `image` is a non-empty code object (hiprtc's output, or the bytes
+    // the disk cache stored under this exact key, their hash checked by
+    // `decode`) alive across the call; `module` is a live out-parameter.
     let code = unsafe { (api.hip.hipModuleLoadData)(&raw mut module, image.as_ptr().cast()) };
     if code == sys::HIP_SUCCESS {
         Ok(module)
@@ -151,6 +146,8 @@ fn entry_by_name(
     let api = api("hipModuleGetFunction")?;
     let mut function: sys::Function = std::ptr::null_mut();
 
+    // SAFETY: `module` is loaded, `c_name` NUL-terminated and alive, and
+    // `function` a live out-parameter.
     let code =
         unsafe { (api.hip.hipModuleGetFunction)(&raw mut function, module, c_name.as_ptr()) };
     match code {
@@ -206,8 +203,18 @@ fn disk_path(key: &str) -> Option<PathBuf> {
 }
 
 fn read_disk(key: &str) -> Option<(Vec<u8>, String)> {
-    let bytes = std::fs::read(disk_path(key)?).ok()?;
-    let (stored_key, rest) = take_str(&bytes)?;
+    decode(key, &std::fs::read(disk_path(key)?).ok()?)
+}
+
+/// A cache file's entry, if it is whole and under `key`: a file whose
+/// trailing hash disagrees with its body (a torn write, a bad disk) is a
+/// miss, and the recompile overwrites it.
+fn decode(key: &str, bytes: &[u8]) -> Option<(Vec<u8>, String)> {
+    let (body, sum) = bytes.split_at_checked(bytes.len().checked_sub(8)?)?;
+    if u64::from_le_bytes(sum.try_into().ok()?) != crate::source::fnv1a64(body) {
+        return None;
+    }
+    let (stored_key, rest) = take_str(body)?;
     if stored_key != key {
         return None;
     }
@@ -228,15 +235,22 @@ fn write_disk(key: &str, image: &[u8], mangled: &str) {
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let mut out = Vec::with_capacity(image.len() + mangled.len() + key.len() + 8);
-    put_str(&mut out, key);
-    put_str(&mut out, mangled);
-    out.extend_from_slice(image);
-
+    let out = encode(key, image, mangled);
     let staging = path.with_extension(format!("hsaco.{}", std::process::id()));
     if std::fs::write(&staging, &out).is_ok() && std::fs::rename(&staging, &path).is_err() {
         let _ = std::fs::remove_file(&staging);
     }
+}
+
+/// `key`, `mangled` and `image`, then the FNV-1a hash of all three.
+fn encode(key: &str, image: &[u8], mangled: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(image.len() + mangled.len() + key.len() + 16);
+    put_str(&mut out, key);
+    put_str(&mut out, mangled);
+    out.extend_from_slice(image);
+    let sum = crate::source::fnv1a64(&out);
+    out.extend_from_slice(&sum.to_le_bytes());
+    out
 }
 
 fn put_str(out: &mut Vec<u8>, text: &str) {
@@ -252,9 +266,30 @@ pub fn arch(ordinal: i32) -> Option<&'static str> {
     let mut map = ARCHES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .expect("lock poisoned");
     *map.entry(ordinal).or_insert_with(|| {
         let name = crate::jit::device::arch_name(ordinal)?;
         Some(Box::leak(name.into_boxed_str()))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode, encode};
+
+    #[test]
+    fn a_damaged_cache_file_is_a_miss() {
+        let file = encode("key", b"\x7fELF image", "_Z6kernel");
+        assert_eq!(
+            decode("key", &file),
+            Some((b"\x7fELF image".to_vec(), "_Z6kernel".to_owned()))
+        );
+        assert_eq!(decode("other", &file), None);
+        for at in 0..file.len() {
+            let mut torn = file.clone();
+            torn[at] ^= 0x01;
+            assert_eq!(decode("key", &torn), None, "a flip at byte {at} was loaded");
+        }
+        assert_eq!(decode("key", &file[..file.len() - 1]), None);
+    }
 }

@@ -6,7 +6,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::linear::moe::GroupSeat;
 #[cfg(feature = "cuda")]
@@ -264,14 +264,14 @@ fn dense_affine(
     let tile = (BLOCK_LANES / WARP) * ROWS_PER_WARP;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             AFFINE,
-            symbol(&format!(
+            &format!(
                 "::pie::linear::matmul_affine<{t}, {f}, ::pie::i32({bits}), {}, \
                  ::pie::i32({group}), ::pie::i32({ROWS_PER_WARP})>",
                 offset.axis()
-            )),
-        )
+            ),
+        ))
         .apply(Launch::grid(
             [y.rows, n.div_ceil(tile), 1],
             [BLOCK_LANES, 1, 1],

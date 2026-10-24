@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,31 +21,27 @@ fn slot() -> &'static Mutex<Option<PathBuf>> {
 pub fn dump_to(dir: impl Into<PathBuf>) {
     let dir = dir.into();
     let _ = std::fs::create_dir_all(&dir);
-    *slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dir);
+    *slot().lock().expect("lock poisoned") = Some(dir);
 }
 
 pub fn stop() {
-    *slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    *slot().lock().expect("lock poisoned") = None;
 }
 
 pub(crate) fn dir() -> Option<PathBuf> {
-    slot()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()
+    slot().lock().expect("lock poisoned").clone()
 }
 
 pub(crate) fn next_seq() -> u64 {
     SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Points this thread's probes at `frame` and returns the frame it pointed at
+/// before. `encode::Sink` sets it for as long as it borrows the frame and puts
+/// the previous one back when dropped, so the pointer is live or null.
 #[cfg(feature = "wgpu")]
-pub(crate) fn set_frame(frame: *const Frame) {
-    FRAME.with(|f| f.set(frame));
+pub(crate) fn set_frame(frame: *const Frame) -> *const Frame {
+    FRAME.with(|f| f.replace(frame))
 }
 
 pub(crate) fn with_frame<R>(f: impl FnOnce(&Frame) -> R) -> Option<R> {
@@ -53,6 +50,8 @@ pub(crate) fn with_frame<R>(f: impl FnOnce(&Frame) -> R) -> Option<R> {
         return None;
     }
 
+    // SAFETY: a non-null `FRAME` is the frame a live `Sink` on this thread
+    // borrows (see `set_frame`), so it outlives this call.
     Some(f(unsafe { &*frame }))
 }
 
@@ -62,5 +61,6 @@ pub(crate) fn flush() -> Result<()> {
         return Ok(());
     }
 
+    // SAFETY: as `with_frame`.
     unsafe { (*frame).flush() }
 }

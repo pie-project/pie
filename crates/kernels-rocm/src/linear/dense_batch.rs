@@ -7,7 +7,7 @@
 //! Refuses what it does not cover.
 
 use crate::error::Error;
-use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16};
+use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, kernel};
 
 const OP: &str = "linear.dense_batch";
 
@@ -95,7 +95,7 @@ pub(crate) fn dense_batch_bf16(
     );
     ctx.fire(
         OP,
-        Fire::at("linear/moe.hip", crate::jit::symbol(&symbol))
+        Fire::at(kernel("linear/moe.hip", &symbol))
             .apply(Launch::grid([blocks, 1, 1], [256, 1, 1])),
         &[
             ArgValue::Ptr(act),
@@ -119,10 +119,10 @@ pub(crate) fn dense_batch_bf16(
         let grid = (mu * nu / 4).div_ceil(256).min(4096);
         ctx.fire(
             OP,
-            Fire::at(
+            Fire::at(kernel(
                 "linear/mgemm.hip",
-                crate::jit::symbol(&format!("::pie::linear::mgemm_finalize<{swiglu}>")),
-            )
+                &format!("::pie::linear::mgemm_finalize<{swiglu}>"),
+            ))
             .apply(Launch::grid([grid, 1, 1], [256, 1, 1])),
             &[
                 ArgValue::Ptr(part),

@@ -6,7 +6,7 @@
 use dtype::Dtype;
 
 use crate::error::Error;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, stated, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, kernel, refuse, stated};
 use crate::linear::gemm;
 use crate::tensor::Tensor;
 
@@ -157,23 +157,19 @@ pub fn matmul(
         // Hopper's wgmma, the codes widened once into its A registers.
         let fire = if wgmma {
             const WG_STAGES: u32 = 3;
-            Fire::at(
+            Fire::at(kernel(
                 W8A16_SM90,
-                symbol(&format!(
-                    "::pie::linear::fp8_w8a16_wgmma<{gran}, {WG_STAGES}>"
-                )),
-            )
+                &format!("::pie::linear::fp8_w8a16_wgmma<{gran}, {WG_STAGES}>"),
+            ))
             .apply(
                 Launch::grid([n.div_ceil(128), 1, splits], [128, 1, 1])
                     .smem(WG_STAGES * 33792 + 1024),
             )
         } else {
-            Fire::at(
+            Fire::at(kernel(
                 W8A16_SM80,
-                symbol(&format!(
-                    "::pie::linear::fp8_w8a16_gemm<{bm}, {stages}, {gran}>"
-                )),
-            )
+                &format!("::pie::linear::fp8_w8a16_gemm<{bm}, {stages}, {gran}>"),
+            ))
             .apply(Launch::grid([n.div_ceil(128), m.div_ceil(bm), splits], [256, 1, 1]).smem(smem))
         };
         ctx.fire(op, fire, &args)?;
@@ -181,7 +177,7 @@ pub fn matmul(
             let pairs = m * n / 2;
             ctx.fire(
                 op,
-                Fire::at(W8A16_SM80, symbol("::pie::linear::fp8_w8a16_fold"))
+                Fire::at(kernel(W8A16_SM80, "::pie::linear::fp8_w8a16_fold"))
                     .apply(Launch::grid([pairs.div_ceil(256), 1, 1], [256, 1, 1])),
                 &[
                     ArgValue::Ptr(part),
@@ -198,13 +194,13 @@ pub fn matmul(
     }
     let fire = {
         let s = Shape::for_rows(m);
-        Fire::at(
+        Fire::at(kernel(
             W8A16_SM80,
-            symbol(&format!(
+            &format!(
                 "::pie::linear::fp8_w8a16_mma<{}, {}, {}, {}, {STAGES}, {gran}>",
                 s.mt, s.n_sub, s.warps_n, s.warps_k
-            )),
-        )
+            ),
+        ))
         .apply(
             Launch::grid(
                 [n.div_ceil(s.columns()), m.div_ceil(16 * s.mt), 1],
@@ -240,10 +236,10 @@ pub fn widen(
     let chunks = u64::from(n) * u64::from(k / 16);
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             W8A16_SM80,
-            symbol(&format!("::pie::linear::fp8_atoms_to_bf16<{gran}>")),
-        )
+            &format!("::pie::linear::fp8_atoms_to_bf16<{gran}>"),
+        ))
         .apply(Launch::grid(
             [
                 u32::try_from(chunks.div_ceil(256)).unwrap_or(u32::MAX),
@@ -288,12 +284,12 @@ pub(crate) fn affine_w4a16_mma(
     let smem = (WARPS_K * STAGES * 16 * 128).max(WARPS_K * 16 * COLUMNS * 4);
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             W8A16_SM80,
-            symbol(&format!(
+            &format!(
                 "::pie::linear::affine_w4a16_mma<1, {N_SUB}, 1, {WARPS_K}, {STAGES}, {DEPTH}>"
-            )),
-        )
+            ),
+        ))
         .apply(
             Launch::grid(
                 [n.div_ceil(COLUMNS), y.rows.div_ceil(16), 1],

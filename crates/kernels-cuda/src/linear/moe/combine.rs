@@ -1,6 +1,6 @@
 use super::*;
 use crate::error::Error;
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
@@ -52,7 +52,7 @@ pub fn weighted_sum(
     };
     ctx.fire(
         OP,
-        Fire::at(COMBINE, symbol(&format!("::pie::linear::{entry}<{t}>")))
+        Fire::at(kernel(COMBINE, &format!("::pie::linear::{entry}<{t}>")))
             .apply(elementwise_rows(OP, y.rows, threads)?.programmatic(ctx.tuning().pdl && vec8)),
         &[
             y.arg(),
@@ -86,7 +86,7 @@ pub fn sum_add(ctx: &Ctx, routed: Tensor, shared: Tensor, y: &mut Tensor) -> Res
     let top_k = routed.rows / y.rows;
     ctx.fire(
         OP,
-        Fire::at(COMBINE, symbol(&format!("::pie::linear::moe_sum_add<{t}>")))
+        Fire::at(kernel(COMBINE, &format!("::pie::linear::moe_sum_add<{t}>")))
             .apply(elementwise_rows(OP, y.rows, y.width)?),
         &[
             y.arg(),
@@ -134,10 +134,10 @@ pub fn bias_sum(
     let top_k = nonzero(OP, "the routed fan-out", routes.width)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             COMBINE,
-            symbol(&format!("::pie::linear::moe_bias_sum<{t}>")),
-        )
+            &format!("::pie::linear::moe_bias_sum<{t}>"),
+        ))
         .apply(elementwise_rows(OP, y.rows, y.width)?),
         &[
             y.arg(),
@@ -172,10 +172,10 @@ pub fn sigmoid_gate_add(
     debug_assert_eq!(gate.rows, y.rows, "the gate column is one scalar per row");
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             COMBINE,
-            symbol(&format!("::pie::linear::moe_sigmoid_gate_add<{t}>")),
-        )
+            &format!("::pie::linear::moe_sigmoid_gate_add<{t}>"),
+        ))
         .apply(elementwise_rows(OP, y.rows, y.width)?),
         &[
             y.arg(),

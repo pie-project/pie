@@ -1,4 +1,5 @@
 #![cfg(feature = "device")]
+#![allow(unsafe_code)]
 
 use engine_cuda::store::{Pools, kv};
 use poem::{Dtype, Platform};

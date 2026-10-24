@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
 const FILE: &str = "linear/lane_gemm.hip";
@@ -56,10 +56,10 @@ pub fn act_x_wt(
     let waves = BLOCK / 64;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::linear::lane_gemm<{ta}, {tw}, {ty}>")),
-        )
+            &format!("::pie::linear::lane_gemm<{ta}, {tw}, {ty}>"),
+        ))
         .apply(Launch::grid([n.div_ceil(waves), y.rows, 1], [BLOCK, 1, 1])),
         &[
             act.arg(),

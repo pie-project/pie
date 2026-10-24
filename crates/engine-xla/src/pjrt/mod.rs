@@ -15,6 +15,7 @@ pub mod sys;
 
 use std::ffi::c_void;
 use std::fmt;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
@@ -162,8 +163,12 @@ pub struct Api {
     _lib: std::mem::ManuallyDrop<libloading::Library>,
 }
 
-// SAFETY: the PJRT C API is thread-safe by contract; the vtable is immutable.
+// SAFETY: `raw` points at the plugin's static `PJRT_Api` table, which the
+// plugin never writes after `GetPjrtApi` returns, and the library is never
+// unloaded; `Api` itself has no mutable state.
 unsafe impl Send for Api {}
+// SAFETY: as for `Send`: `&Api` only reads the immutable table and calls
+// through it; what each call touches is the callee object's own guarantee.
 unsafe impl Sync for Api {}
 
 impl fmt::Debug for Api {
@@ -184,6 +189,8 @@ macro_rules! call {
         let entry = api.entry(std::mem::offset_of!(sys::PJRT_Api, $f), stringify!($f));
         match entry {
             Err(e) => Err(e),
+            // SAFETY: `entry` just checked the field lies inside the
+            // plugin's `struct_size`, and `raw` is its live, static table.
             Ok(()) => match unsafe { (*api.raw).$f } {
                 None => Err(Error::local(concat!(
                     stringify!($f),
@@ -222,6 +229,8 @@ impl Api {
             lib.get(b"GetPjrtApi\0")
         }
         .map_err(|e| Error::local(format!("{} is not a PJRT plugin: {e}", path.display())))?;
+        // SAFETY: `GetPjrtApi` takes nothing and returns the plugin's static
+        // table (or null, checked below); `lib` is kept loaded for good.
         let raw = unsafe { get() };
         if raw.is_null() {
             return Err(Error::local(format!(
@@ -329,12 +338,17 @@ impl Api {
 
 /// A device the client addresses. Borrowed from the client; valid while it is.
 #[derive(Clone, Copy)]
-pub struct Device {
+pub struct Device<'c> {
     raw: *mut sys::PJRT_Device,
+    _client: PhantomData<&'c Client>,
 }
 
-unsafe impl Send for Device {}
-unsafe impl Sync for Device {}
+// SAFETY: a `PJRT_Device` is owned by its client and only ever read through
+// it (description, kind, memory stats), which the client allows from any
+// thread; the `'c` borrow keeps that client alive.
+unsafe impl Send for Device<'_> {}
+// SAFETY: as for `Send`; `Device` has no state of its own to race on.
+unsafe impl Sync for Device<'_> {}
 
 /// What the device reports about its memory.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -346,10 +360,17 @@ pub struct MemoryStats {
 pub struct Client {
     api: Arc<Api>,
     raw: *mut sys::PJRT_Client,
-    devices: Vec<Device>,
+    /// The plugin's addressable devices, owned by `raw`.
+    devices: Vec<*mut sys::PJRT_Device>,
 }
 
+// SAFETY: `Client` owns its `PJRT_Client` and destroys it only in `Drop`.
+// The plugin's client is XLA's `PjRtClient`, which serves compile, upload and
+// queries from any thread.
 unsafe impl Send for Client {}
+// SAFETY: every `&self` method is a PJRT client call that may run on many
+// threads at once (warm-up compiles on up to 8 threads over one client);
+// `Client` keeps no state of its own besides the device list it never edits.
 unsafe impl Sync for Client {}
 
 impl fmt::Debug for Client {
@@ -375,7 +396,7 @@ impl Client {
         // SAFETY: the plugin owns this array for the client's lifetime.
         let devices =
             unsafe { std::slice::from_raw_parts(d.addressable_devices, d.num_addressable_devices) };
-        client.devices = devices.iter().map(|&raw| Device { raw }).collect();
+        client.devices = devices.to_vec();
         Ok(client)
     }
 
@@ -384,28 +405,41 @@ impl Client {
         &self.api
     }
 
+    /// The addressable device at `ordinal`, if there is one.
     #[must_use]
-    pub fn devices(&self) -> &[Device] {
-        &self.devices
+    pub fn device(&self, ordinal: usize) -> Option<Device<'_>> {
+        self.devices.get(ordinal).map(|&raw| Device {
+            raw,
+            _client: PhantomData,
+        })
+    }
+
+    #[must_use]
+    pub fn device_count(&self) -> usize {
+        self.devices.len()
     }
 
     pub fn platform_name(&self) -> Result<String> {
         let mut a = args!(PJRT_Client_PlatformName_Args { client: self.raw });
         call!(&self.api, PJRT_Client_PlatformName, &mut a)?;
+        // SAFETY: the name is owned by the client, which `&self` keeps alive,
+        // and is `platform_name_size` bytes long; `text` copies it out.
         Ok(unsafe { text(a.platform_name, a.platform_name_size) })
     }
 
-    pub fn device_kind(&self, device: Device) -> Result<String> {
+    pub fn device_kind(&self, device: Device<'_>) -> Result<String> {
         let mut d = args!(PJRT_Device_GetDescription_Args { device: device.raw });
         call!(&self.api, PJRT_Device_GetDescription, &mut d)?;
         let mut k = args!(PJRT_DeviceDescription_Kind_Args {
             device_description: d.device_description
         });
         call!(&self.api, PJRT_DeviceDescription_Kind, &mut k)?;
+        // SAFETY: the kind string is owned by `device`, which lives as long
+        // as this client, and is `device_kind_size` bytes; `text` copies it.
         Ok(unsafe { text(k.device_kind, k.device_kind_size) })
     }
 
-    pub fn memory_stats(&self, device: Device) -> Result<MemoryStats> {
+    pub fn memory_stats(&self, device: Device<'_>) -> Result<MemoryStats> {
         let mut a = args!(PJRT_Device_MemoryStats_Args { device: device.raw });
         call!(&self.api, PJRT_Device_MemoryStats, &mut a)?;
         Ok(MemoryStats {
@@ -449,7 +483,7 @@ impl Client {
     /// The host bytes may be reused once this returns.
     pub fn upload(
         &self,
-        device: Device,
+        device: Device<'_>,
         data: &[u8],
         ty: ElementType,
         dims: &[i64],
@@ -494,7 +528,12 @@ pub struct Buffer {
     raw: *mut sys::PJRT_Buffer,
 }
 
+// SAFETY: `Buffer` owns its `PJRT_Buffer` and destroys it only in `Drop`;
+// a PJRT buffer may be used and freed from any thread.
 unsafe impl Send for Buffer {}
+// SAFETY: every `&self` method is a read of the buffer (dims, type, ready
+// event, a copy to host), which XLA's `PjRtBuffer` allows concurrently. An
+// `Arc<Buffer>` rides into the plugin's on-ready callback, so this is needed.
 unsafe impl Sync for Buffer {}
 
 impl fmt::Debug for Buffer {
@@ -510,6 +549,8 @@ impl Buffer {
     pub fn dims(&self) -> Result<Vec<i64>> {
         let mut a = args!(PJRT_Buffer_Dimensions_Args { buffer: self.raw });
         call!(&self.api, PJRT_Buffer_Dimensions, &mut a)?;
+        // SAFETY: `dims` has the buffer's lifetime and `num_dims` entries;
+        // `&self` keeps the buffer, and the slice is copied out at once.
         Ok(unsafe { slice(a.dims, a.num_dims) }.to_vec())
     }
 
@@ -591,7 +632,12 @@ pub struct Executable {
     outputs: usize,
 }
 
+// SAFETY: `Executable` owns its `PJRT_LoadedExecutable` and destroys it only
+// in `Drop`; a loaded executable may be run and freed from any thread.
 unsafe impl Send for Executable {}
+// SAFETY: `&self` only serializes or executes, and XLA's
+// `PjRtLoadedExecutable` runs concurrent executes; `outputs` is never written
+// after `adopt`.
 unsafe impl Sync for Executable {}
 
 impl fmt::Debug for Executable {
@@ -655,6 +701,8 @@ impl Executable {
             let out =
                 unsafe { slice(a.serialized_bytes.cast::<u8>(), a.serialized_bytes_size) }.to_vec();
             if let Some(deleter) = a.serialized_executable_deleter {
+                // SAFETY: the plugin's own deleter for this object, called
+                // once, after the bytes are copied out.
                 unsafe { deleter(a.serialized_executable) };
             }
             out
@@ -731,8 +779,9 @@ pub struct Event {
     raw: *mut sys::PJRT_Event,
 }
 
+// SAFETY: `Event` owns its `PJRT_Event`; `wait` and `on_ready` consume it and
+// `Drop` destroys it, all from whichever thread holds it, which PJRT allows.
 unsafe impl Send for Event {}
-unsafe impl Sync for Event {}
 
 impl Event {
     fn adopt(api: Arc<Api>, raw: *mut sys::PJRT_Event) -> Self {
@@ -807,16 +856,23 @@ fn row_major_layout(order: &[i64]) -> sys::PJRT_Buffer_MemoryLayout {
     layout
 }
 
+/// # Safety
+/// A non-null `p` points at `n` readable bytes.
 unsafe fn text(p: *const std::os::raw::c_char, n: usize) -> String {
     if p.is_null() {
         return String::new();
     }
+    // SAFETY: `p` is non-null and the caller vouches for its `n` bytes.
     String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(p.cast::<u8>(), n) }).into_owned()
 }
 
+/// # Safety
+/// A non-null `p` points at `n` initialized `T`s that outlive `'a` unchanged.
 unsafe fn slice<'a, T>(p: *const T, n: usize) -> &'a [T] {
     if p.is_null() || n == 0 {
         return &[];
     }
+    // SAFETY: `p` is non-null and the caller vouches for its `n` elements
+    // and their lifetime.
     unsafe { std::slice::from_raw_parts(p, n) }
 }

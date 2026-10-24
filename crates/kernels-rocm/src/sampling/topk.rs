@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
 const TOPK_FILE: &str = "sampling/topk.hip";
@@ -31,10 +31,10 @@ pub fn argmax(ctx: &Ctx, x: Tensor, column: u32, y: &mut Tensor) -> Result<(), E
     debug_assert_eq!(x.rows, y.rows, "an argmax lands one entry per row");
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             TOPK_FILE,
-            symbol(&format!("::pie::layout::argmax_rows<{t}>")),
-        )
+            &format!("::pie::layout::argmax_rows<{t}>"),
+        ))
         .apply(Launch::per_row(rows, THREADS)),
         &[
             x.arg(),
@@ -94,10 +94,10 @@ pub fn top_k(
         })?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             TOPK_FILE,
-            symbol(&format!("::pie::layout::topk_rows<{t}, {k}>")),
-        )
+            &format!("::pie::layout::topk_rows<{t}, {k}>"),
+        ))
         .apply(Launch::per_row(rows, TOPK_THREADS).smem(pool)),
         &[
             x.arg(),

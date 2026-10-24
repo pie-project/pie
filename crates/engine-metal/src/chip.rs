@@ -1,5 +1,6 @@
 //! The Metal profile registry, the checked-in profiles, and resolution for
 //! one load. Kernel decisions are declared in `kernels-metal`.
+#![allow(unsafe_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;

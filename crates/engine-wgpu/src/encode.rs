@@ -175,7 +175,7 @@ fn label(name: &'static str, fire: Fire, args: &[ArgValue]) -> std::borrow::Cow<
 pub fn kernel_profile() -> Vec<(String, u64, u64)> {
     let mut rows: Vec<(String, u64, u64)> = KERNEL_PROFILE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .expect("kernel profile lock poisoned")
         .iter()
         .map(|(name, &(ns, n))| (name.clone(), ns, n))
         .collect();
@@ -185,16 +185,14 @@ pub fn kernel_profile() -> Vec<(String, u64, u64)> {
 
 #[cfg(feature = "wgpu")]
 pub(crate) fn record_timing(name: &str, ns: u64) {
-    let mut table = KERNEL_PROFILE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
     table.entry(name.to_string()).or_insert((0, 0)).0 += ns;
 }
 
 pub fn reset_kernel_profile() {
     KERNEL_PROFILE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .expect("kernel profile lock poisoned")
         .clear();
     HOST_NS.store(0, std::sync::atomic::Ordering::Relaxed);
     SUBMIT_NS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -214,9 +212,7 @@ pub fn reset_kernel_profile() {
 
 #[cfg(feature = "wgpu")]
 fn record_kernel(name: &str) {
-    let mut table = KERNEL_PROFILE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
     table.entry(name.to_string()).or_insert((0, 0)).1 += 1;
 }
 
@@ -226,6 +222,14 @@ pub struct Sink<'a> {
     frame: &'a Frame,
     pipelines: &'a Pipelines,
     handles: &'a Handles,
+    outer: *const Frame,
+}
+
+#[cfg(feature = "wgpu")]
+impl Drop for Sink<'_> {
+    fn drop(&mut self) {
+        crate::probe::set_frame(self.outer);
+    }
 }
 
 #[cfg(feature = "wgpu")]
@@ -237,12 +241,13 @@ impl<'a> Sink<'a> {
         pipelines: &'a Pipelines,
         handles: &'a Handles,
     ) -> Sink<'a> {
-        crate::probe::set_frame(frame);
+        let outer = crate::probe::set_frame(frame);
         Sink {
             device,
             frame,
             pipelines,
             handles,
+            outer,
         }
     }
 

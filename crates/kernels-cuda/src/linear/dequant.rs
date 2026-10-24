@@ -4,7 +4,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, refuse, stated, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, kernel, refuse, stated};
 use crate::linear::affine::Affine;
 use crate::linear::affine::OffsetKind;
 use crate::linear::affine::affine;
@@ -95,14 +95,14 @@ pub fn decoded_plane(
     let words = extent(op, u64::from(n) * u64::from(k) / u64::from(32 / bits))?;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             DEQUANT,
-            symbol(&format!(
+            &format!(
                 "::pie::linear::dequant_affine<{f}, ::pie::i32({bits}), {}, \
                  ::pie::i32({group})>",
                 offset.axis()
-            )),
-        )
+            ),
+        ))
         .apply(Launch::flat(words, BLOCK)),
         &[
             codes.arg(),
@@ -165,14 +165,14 @@ pub fn decode_into(
     let words = extent(op, u64::from(n) * u64::from(k) / u64::from(32 / bits))?;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             DEQUANT,
-            symbol(&format!(
+            &format!(
                 "::pie::linear::dequant_affine<{f}, ::pie::i32({bits}), {}, \
                  ::pie::i32({group})>",
                 offset.axis()
-            )),
-        )
+            ),
+        ))
         .apply(Launch::flat(words, BLOCK)),
         &[
             codes.arg(),
@@ -269,14 +269,14 @@ fn dense_affine_via_dense(
     let words = extent(op, u64::from(n) * u64::from(k) / u64::from(32 / bits))?;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             DEQUANT,
-            symbol(&format!(
+            &format!(
                 "::pie::linear::dequant_affine<{f}, ::pie::i32({bits}), {}, \
                  ::pie::i32({group})>",
                 offset.axis()
-            )),
-        )
+            ),
+        ))
         .apply(Launch::flat(words, BLOCK)),
         &[
             codes.arg(),
@@ -386,7 +386,7 @@ pub fn nvfp4_plane(
     })?;
     ctx.fire(
         op,
-        Fire::at(DEQUANT, symbol("::pie::linear::dequant_nvfp4<::pie::bf16>"))
+        Fire::at(kernel(DEQUANT, "::pie::linear::dequant_nvfp4<::pie::bf16>"))
             .apply(Launch::flat(pairs, BLOCK)),
         &[
             codes.arg(),

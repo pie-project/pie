@@ -11,12 +11,13 @@
 //! `PIE_XLA_SAMPLER_PENALTIES=0` drops the vocabulary-wide histogram.
 
 use crate::common;
+use tokenizer::Specials;
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use engine::channel::ChannelSeed;
-use engine::program::{InstanceBinding, ProgramRegistration};
+use engine::channel::{ChannelId, ChannelSeed};
+use engine::program::{InstanceBinding, InstanceId, ProgramRegistration};
 use engine_xla::program::Plane;
 use engine_xla::{Boot, DeviceBoot, Lane, Seated, Shell};
 use eta_compiler::plan::compile_bound;
@@ -202,7 +203,7 @@ fn wire(v: &Value) -> Vec<u8> {
     bytes
 }
 
-fn token(plane: &mut Plane, instance: u64, chan: u32) -> i32 {
+fn token(plane: &mut Plane, instance: InstanceId, chan: u32) -> i32 {
     let bytes = plane
         .take(instance, chan)
         .expect("the channel reads")
@@ -278,7 +279,7 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
         "{:?}",
         device_plane.device_form(on_device).1
     );
-    let mut ids: BTreeMap<u32, (u64, u64)> = BTreeMap::new();
+    let mut ids: BTreeMap<u32, (InstanceId, InstanceId)> = BTreeMap::new();
     for lane in 0..lanes {
         let seeds = vec![
             ChannelSeed {
@@ -292,7 +293,9 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
         ];
         let bind = |program| InstanceBinding {
             program,
-            channels: (0..4).map(|c| u64::from(lane * 16 + c + 1)).collect(),
+            channels: (0..4)
+                .map(|c| ChannelId(u64::from(lane * 16 + c + 1)))
+                .collect(),
             seeds: seeds.clone(),
             geometry: GeometryClass::Host,
             extents: Default::default(),
@@ -357,7 +360,7 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
         let fired = shell.fire_kept(&seated).expect("a decode fires");
         let kept = fired.kept.expect("the fire kept its readout");
         let t1 = Instant::now();
-        let attached: Vec<(u64, u32)> = (0..lanes).map(|l| (ids[&l].0, l)).collect();
+        let attached: Vec<(InstanceId, u32)> = (0..lanes).map(|l| (ids[&l].0, l)).collect();
         let ran = device_plane
             .fire_guests(shell.device(), &attached, Some(&kept), vocab, 0)
             .expect("the guest passes run");
@@ -415,7 +418,7 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
         }
     }
     for (l, text) in texts.iter().enumerate().take(4) {
-        eprintln!("lane {l}: {:?}", tokenizer.decode(text, false));
+        eprintln!("lane {l}: {:?}", tokenizer.decode(text, Specials::Keep));
     }
     let per = |d: Duration| d.as_secs_f64() * 1e3 / steps as f64;
     eprintln!(
