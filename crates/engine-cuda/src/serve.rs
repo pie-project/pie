@@ -256,19 +256,21 @@ impl Shell {
     /// the rows the other ranks send, and the combines.
     pub fn fire_idle(&mut self, bucket: u32) -> Result<()> {
         self.at_bucket(bucket);
-        let prepared = FrameShell::prepare(
-            self,
-            StepView {
-                lanes: &[],
-                attachments: &[],
-                media: &[],
-                voxels: &[],
-            },
-            None,
-        )?;
-        let enqueued = FrameShell::enqueue(self, prepared)?;
-        FrameShell::settle(self, enqueued)?;
-        Ok(())
+        diag::guarded(|| {
+            let prepared = FrameShell::prepare(
+                self,
+                StepView {
+                    lanes: &[],
+                    attachments: &[],
+                    media: &[],
+                    voxels: &[],
+                },
+                None,
+            )?;
+            let enqueued = FrameShell::enqueue(self, prepared)?;
+            FrameShell::settle(self, enqueued)?;
+            Ok(())
+        })
     }
 
     /// What the trace dispatches, for wiring the group.

@@ -3,6 +3,7 @@ pub mod conditional;
 pub mod ctx;
 pub mod elastic;
 pub mod graph;
+pub mod guard;
 #[cfg(feature = "device")]
 pub mod held;
 /// Without a device runtime nothing is kept: no shape pools.

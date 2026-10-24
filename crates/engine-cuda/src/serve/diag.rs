@@ -17,6 +17,17 @@ pub struct Diagnostics {
     pub nan_check: bool,
     pub fuse_chains: bool,
     pub gumbel_direct: bool,
+    /// What a fire that waits for the device does (`crate::device::guard`).
+    pub sync_guard: Option<SyncGuard>,
+}
+
+/// The sync guard's answer to a fire that waited for the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncGuard {
+    /// Print each call the first time a thread's fire makes it.
+    Report,
+    /// Refuse the fire: a panic naming every call it made.
+    Panic,
 }
 
 impl Default for Diagnostics {
@@ -36,6 +47,7 @@ impl Default for Diagnostics {
             nan_check: false,
             fuse_chains: true,
             gumbel_direct: true,
+            sync_guard: None,
         }
     }
 }
@@ -82,6 +94,11 @@ impl Diagnostics {
         if !self.gumbel_direct {
             words.push("gumbel-direct=off".to_string());
         }
+        match self.sync_guard {
+            Some(SyncGuard::Report) => words.push("sync-guard".to_string()),
+            Some(SyncGuard::Panic) => words.push("sync-guard=panic".to_string()),
+            None => {}
+        }
         (!words.is_empty()).then(|| words.join(","))
     }
 }
@@ -99,7 +116,8 @@ fn switch(word: &str, value: &str) -> std::result::Result<bool, String> {
 const WORDS: &str = "`golden-probe`, `arm-trace`, \
      `ptr-trace=<key substring>`, `graph-dot=<dir>`, `grid-trace=<key substring>`, \
      `plan-trace=<rows|all>`, `arm-bench=<key>`, `capture-serial`, `boundary-trace`, `reap-trace`, \
-     `trace-census`, `nan-check`, `fuse-chains=off`, `gumbel-direct=off`";
+     `trace-census`, `nan-check`, `fuse-chains=off`, `gumbel-direct=off`, \
+     `sync-guard[=panic]`";
 
 impl std::str::FromStr for Diagnostics {
     type Err = String;
@@ -125,6 +143,12 @@ impl std::str::FromStr for Diagnostics {
                 "nan-check" => diag.nan_check = switch(word, value)?,
                 "fuse-chains" => diag.fuse_chains = switch(word, value)?,
                 "gumbel-direct" => diag.gumbel_direct = switch(word, value)?,
+                "sync-guard" => {
+                    diag.sync_guard = match value {
+                        "panic" => Some(SyncGuard::Panic),
+                        _ => switch(word, value)?.then_some(SyncGuard::Report),
+                    }
+                }
                 "ptr-trace" | "grid-trace" | "plan-trace" | "graph-dot" | "arm-bench" => {
                     if value.is_empty() {
                         return Err(format!(
@@ -178,6 +202,33 @@ pub fn on() -> &'static Diagnostics {
         .unwrap_or_else(|| OFF.get_or_init(Diagnostics::default))
 }
 
+/// Runs `fire` under the sync guard when it is on: each call it made that
+/// waits for the device printed on its first sighting, or the fire refused.
+pub(crate) fn guarded<T>(fire: impl FnOnce() -> T) -> T {
+    let Some(guard) = on().sync_guard else {
+        return fire();
+    };
+    let (fired, waits) = crate::device::guard::watched(fire);
+    if waits.is_empty() {
+        return fired;
+    }
+    match guard {
+        SyncGuard::Report => {
+            for wait in waits.iter().filter(|w| w.from.is_some()) {
+                eprintln!("engine-cuda: [sync-guard] a fire called {wait}");
+            }
+        }
+        SyncGuard::Panic => {
+            let waits: Vec<String> = waits.iter().map(ToString::to_string).collect();
+            panic!(
+                "[sync-guard] a fire waited for the device: {}",
+                waits.join("; ")
+            );
+        }
+    }
+    fired
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +257,9 @@ mod tests {
         assert_eq!(diag.ptr_trace.as_deref(), Some("decode:c0"));
         assert!(!diag.fuse_chains);
         assert!(diag.gumbel_direct, "an unnamed arm keeps its default");
+        assert_eq!(diag.sync_guard, None);
+        let guarded: Diagnostics = "sync-guard".parse().expect("the guard parses");
+        assert_eq!(guarded.sync_guard, Some(SyncGuard::Report));
     }
 
     fn an_unknown_word_refuses_by_name() {
@@ -223,7 +277,7 @@ mod tests {
     }
 
     fn the_words_round_trip() {
-        let list = "arm-trace,capture-serial,plan-trace=all,gumbel-direct=off";
+        let list = "arm-trace,capture-serial,plan-trace=all,gumbel-direct=off,sync-guard=panic";
         let diag: Diagnostics = list.parse().expect("parses");
         let again: Diagnostics = diag
             .words()

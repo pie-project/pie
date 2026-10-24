@@ -1384,7 +1384,7 @@ impl Cuda {
             })
             .collect();
 
-        let settled = {
+        let settled = crate::serve::diag::guarded(|| {
             use engine::frame::Shell as FrameShell;
             let prepared = FrameShell::prepare(
                 shell,
@@ -1398,8 +1398,8 @@ impl Cuda {
             )
             .map_err(fault)?;
             let enqueued = FrameShell::enqueue(shell, prepared).map_err(fault)?;
-            shell.settle_step(enqueued, done).map_err(fault)?
-        };
+            shell.settle_step(enqueued, done).map_err(fault)
+        })?;
 
         Ok((
             FireTicket {
