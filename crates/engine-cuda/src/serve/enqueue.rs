@@ -172,24 +172,20 @@ impl Shell {
         let seq = self.airborne.next_seq();
         self.cache.at_step(seq);
         if p.rs.rows_ext > 0 {
-            let need = crate::run::RsScratch::need(
-                p.rs.rows_ext,
-                self.buffers.as_ref().map_or(0, Buffers::ext_row_bytes),
-            );
+            // The scratch grows in place within its range; past it, it is
+            // reserved anew, and the fires holding the old one land first.
             if self
-                .rs_scratch
+                .buffers
                 .as_ref()
-                .is_none_or(|have| (have.bytes() as u64) < need)
+                .is_some_and(|buffers| !buffers.scratch_reaches(p.rs.rows_ext))
             {
                 self.drain()?;
-                self.rs_scratch =
-                    Some(Buffer::zeroed(usize::try_from(need).unwrap_or(usize::MAX))?);
+            }
+            if let Some(buffers) = self.buffers.as_mut() {
+                buffers.ensure_scratch(&self.pools, p.rs.rows_ext)?;
             }
         }
-        let rs_scratch = self
-            .rs_scratch
-            .as_ref()
-            .map(|have| (have.ptr(), have.bytes() as u64));
+        let rs_scratch = self.buffers.as_ref().map(Buffers::scratch);
         let tapping = self.tapping(p.lanes)?;
         let mut fire = FireCtx {
             tapping: tapping.as_ref(),

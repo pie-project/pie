@@ -838,6 +838,15 @@ pub fn commit_atomically(pool: &mut PhysicalPool, targets: &mut [Target<'_>]) ->
     Ok(Commit::Committed)
 }
 
+/// Backs `want` of `arena` beside the pool's budget rather than out of it,
+/// as a kernel's slab is: what the device has free pays for it, and the
+/// budget recalibrates around it. What a fire grows past the fit takes none
+/// of the pages the fit pledged the cache rows.
+pub fn commit_beside(pool: &PhysicalPool, arena: &mut Arena, want: &Want) -> Result<()> {
+    let units = arena.target_units(want)?;
+    arena.grow(pool, &units)
+}
+
 /// `bytes` on `device` that every device in `readers` may load and store,
 /// without turning on peer access for the whole device: that maps every
 /// later allocation into the peers, and freeing one then waits on a peer

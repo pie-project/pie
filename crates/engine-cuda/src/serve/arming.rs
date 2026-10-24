@@ -1223,7 +1223,10 @@ impl Shell {
                 self.inputs.bytes() >> 20,
                 self.buffer_bytes() >> 20,
                 self.readout_rows.bytes() >> 20,
-                self.rs_scratch.as_ref().map_or(0, |buffer| buffer.bytes()) >> 20,
+                self.buffers
+                    .as_ref()
+                    .map_or(0, |buffers| buffers.scratch().1)
+                    >> 20,
                 self.pools.committed_bytes() >> 20,
             );
             eprintln!(
