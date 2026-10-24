@@ -580,6 +580,7 @@ mod tests {
                         mla_naive: false,
                         moe_tc5: defaults.moe_tc5,
                         moe_mega_until: defaults.moe_mega_until,
+                        moe_mega_split: defaults.moe_mega_split,
                         ssm_gdn_fused_scan: false,
                         ssm_gdn_tc5: false,
                         rows_vec: false,
@@ -884,7 +885,7 @@ mod tests {
         assert_eq!((b200.moe_even_waves_from, b200.moe_routes_sized), (3, true));
         assert_eq!(b200.moe_gather_ahead_until, 128);
         assert_eq!(b200.moe_w4a8_fused_from, 512);
-        assert_eq!(b200.moe_mega_until, 2048);
+        assert_eq!((b200.moe_mega_until, b200.moe_mega_split), (2048, 4));
         assert_eq!(b200.mla_expanded_from, 256);
         assert_eq!(b200.gemm_fp8_gemv_until, 4);
         assert_eq!((b200.mxfp4_a8_from, b200.mxfp4_a8_until), (1, 48));

@@ -22,6 +22,7 @@ const POOL_X_SF: &str = "linear.moe_mega_x_atoms";
 const POOL_H: &str = "linear.moe_mega_h";
 const POOL_H_SF: &str = "linear.moe_mega_h_atoms";
 const ROUTED: &str = "linear.moe_mega_routed";
+const PARTIALS: &str = "linear.moe_mega_partials";
 const SYNC: &str = "linear.moe_mega_sync";
 
 /// `pie::linear::mega::Params`, field for field.
@@ -39,6 +40,7 @@ struct Params {
     hpool: u64,
     hpool_sf: u64,
     routed: u64,
+    partials: u64,
     sync: u64,
     win: u64,
     tokens: i32,
@@ -47,6 +49,7 @@ struct Params {
     hidden: i32,
     inter: i32,
     limit: f32,
+    split: i32,
 }
 
 /// `pie::linear::mega` bounds: experts, routes a fire, 128-column output
@@ -56,7 +59,10 @@ const MAX_ROUTES: u32 = 2048;
 const MAX_COL_TILES: u32 = 64;
 const MAX_GLU_TILES: u32 = 32;
 /// `pie::linear::mega::ws_words`: the flags, zero at rest.
-const SYNC_WORDS: usize = 2 * MAX_ROUTES as usize + MAX_COL_TILES as usize + 2;
+/// `pie::linear::mega::kMaxSplitTiles`: a split fire's gate-up tiles.
+const MAX_SPLIT_TILES: u32 = 8192;
+const SYNC_WORDS: usize =
+    2 * MAX_ROUTES as usize + MAX_COL_TILES as usize + 2 + MAX_SPLIT_TILES as usize;
 /// `pie::linear::mega::kChunk`: the columns a quantizer pass reads.
 const CHUNK: u32 = 1024;
 /// `pie::linear::mega::kPoolStride`: a block's pool rows 64 apart.
@@ -112,8 +118,17 @@ fn pool_rows(blocks: u32) -> u32 {
     (blocks * POOL_STRIDE).div_ceil(128) * 128
 }
 
-/// A K-major `rows x k` operand's map: boxes of 128 bytes of K by `box_rows`,
-/// swizzled 128B (an fp4 one landing a byte an element).
+/// How an operand's map views it, its boxes 128 bytes of K by `box_rows`
+/// rows, swizzled 128B (an fp4 one landing a byte an element): plain (a
+/// box a load), two adjacent boxes along K a load (`Chunks`), or a gate-up
+/// bank's gate rows and the up rows `inter` on a load (`Halves`).
+#[derive(Clone, Copy)]
+enum View {
+    Plain,
+    Chunks,
+    Halves { inter: u32 },
+}
+
 fn operand_map(
     ptr: u64,
     w4: bool,
@@ -121,28 +136,49 @@ fn operand_map(
     rows: u32,
     k: u32,
     box_rows: u32,
+    view: View,
 ) -> Result<[u64; 16], Error> {
     use dr::CUtensorMapDataType as T;
-    let (ty, stride, box_k) = if w4 {
+    // (type, row stride in bytes, box width in elements, a box's bytes of K)
+    let (ty, stride, box_k, box_bytes) = if w4 {
         (
             T::CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN16B,
             u64::from(k) / 2,
             128,
+            64,
         )
     } else if fp8 {
-        (T::CU_TENSOR_MAP_DATA_TYPE_UINT8, u64::from(k), 128)
+        (T::CU_TENSOR_MAP_DATA_TYPE_UINT8, u64::from(k), 128, 128)
     } else {
-        (T::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, u64::from(k) * 2, 64)
+        (
+            T::CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+            u64::from(k) * 2,
+            64,
+            128,
+        )
     };
     if !ptr.is_multiple_of(16) || !stride.is_multiple_of(16) {
         return Err(refuse(OP, "TMA needs 16-byte rows and base"));
     }
+    let (dims, strides, boxes) = match view {
+        View::Plain => ([k, rows, 0], [stride, 0], [box_k, box_rows, 1]),
+        View::Chunks => (
+            [box_k, rows, k / box_k],
+            [stride, box_bytes],
+            [box_k, box_rows, 2],
+        ),
+        View::Halves { inter } => (
+            [k, inter, rows / inter],
+            [stride, stride * u64::from(inter)],
+            [box_k, box_rows, 2],
+        ),
+    };
     encode(Map {
         ptr,
         ty,
-        dims: [k, rows, 0],
-        strides: [stride, 0],
-        boxes: [box_k, box_rows, 1],
+        dims,
+        strides,
+        boxes,
         swizzle: dr::CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
     })
 }
@@ -183,7 +219,7 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
         || top > 32
         || !hidden.is_multiple_of(CHUNK)
         || hidden / 128 > MAX_COL_TILES
-        || !inter.is_multiple_of(512)
+        || !inter.is_multiple_of(256)
         || inter / 128 > MAX_GLU_TILES
     {
         return Ok(false);
@@ -261,11 +297,45 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
         (0, 0)
     };
     let routed = ctx.scratch_stream(OP, ROUTED, count as usize * hidden as usize * 2)? as u64;
+    // A decode's few gate-up tiles split K, each share on its own SM, so the
+    // first product's tiles fill the card (`kernel.moe.mega_split`, the most
+    // shares a tile): as many shares as bring the tiles its expert count
+    // makes at most to the SMs.
+    let tiles = experts.min(count) * (inter / 128);
+    let mut split = 1u32;
+    while split < ctx.tuning().moe_mega_split
+        && tiles * split < sms
+        && count * (inter / 128) <= MAX_SPLIT_TILES
+    {
+        split *= 2;
+    }
+    let partials = if split > 1 {
+        let bytes = split as usize * count as usize * 2 * inter as usize * 4;
+        ctx.scratch_stream(OP, PARTIALS, bytes)? as u64
+    } else {
+        0
+    };
     let sync = ctx.scratch_stream_zeroed(OP, SYNC, SYNC_WORDS * 4)? as u64;
-    let map_up = operand_map(up_codes.ptr, w4, false, experts * 2 * inter, hidden, 128)?;
-    let map_down = operand_map(down_codes.ptr, w4, false, experts * hidden, inter, 128)?;
-    let map_x = operand_map(xpool, false, w4, pool, hidden, bn)?;
-    let map_h = operand_map(hpool, false, w4, pool, inter, bn)?;
+    let map_up = operand_map(
+        up_codes.ptr,
+        w4,
+        false,
+        experts * 2 * inter,
+        hidden,
+        128,
+        View::Halves { inter },
+    )?;
+    let map_down = operand_map(
+        down_codes.ptr,
+        w4,
+        false,
+        experts * hidden,
+        inter,
+        128,
+        View::Chunks,
+    )?;
+    let map_x = operand_map(xpool, false, w4, pool, hidden, bn, View::Plain)?;
+    let map_h = operand_map(hpool, false, w4, pool, inter, bn, View::Chunks)?;
     let int = |v: u32| i32::try_from(v).map_err(|_| refuse(OP, "a shape past i32"));
     let win = match ctx.stage() {
         ArgValue::Ptr(at) => at,
@@ -284,6 +354,7 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
         hpool,
         hpool_sf,
         routed,
+        partials,
         sync,
         win,
         tokens: int(tokens)?,
@@ -292,6 +363,7 @@ pub fn mega(ctx: &Ctx, m: RoutedMlp, fold: Fold, y: &mut Tensor) -> Result<bool,
         hidden: int(hidden)?,
         inter: int(inter)?,
         limit,
+        split: int(split)?,
     };
     let kind = u32::from(w4);
     let first = u32::from(first);

@@ -185,6 +185,13 @@ pub struct SsmKdaStepFused;
 #[decision(id = "kernel.moe.mega_until", constant(range(0..=2048)), default = 0, tune = search)]
 pub struct MoeMegaUntil(pub u32);
 
+/// The most shares of K a mega-MoE gate-up tile takes, a decode's few tiles
+/// spread so over the SMs (each share's sums landed and the last share in
+/// summing them); 1, never split, but where a chip's profile says (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mega_split", constant(range(1..=8)), default = 1, tune = search)]
+pub struct MoeMegaSplit(pub u32);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.w4a8_fused_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
 pub struct MoeW4a8FusedFrom(pub u32);
@@ -828,6 +835,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeW4a4FusedFrom>()
         .add::<MoeW4a8FusedFrom>()
         .add::<MoeMegaUntil>()
+        .add::<MoeMegaSplit>()
         .add::<MlaExpandedFrom>()
         .add::<GemmFp8GemvUntil>()
         .add::<GemmFp8Shadow>()
@@ -965,6 +973,7 @@ tuning! {
     moe_w4a4_fused_from: u32 = 65_536, get MoeW4a4FusedFrom;
     moe_w4a8_fused_from: u32 = 65_536, get MoeW4a8FusedFrom;
     moe_mega_until: u32 = 0, get MoeMegaUntil;
+    moe_mega_split: u32 = 1, get MoeMegaSplit;
     mla_expanded_from: u32 = 65_536, get MlaExpandedFrom;
     gemm_fp8_gemv_until: u32 = 0, get GemmFp8GemvUntil;
     gemm_fp8_shadow: bool = false, on GemmFp8Shadow;

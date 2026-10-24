@@ -315,37 +315,52 @@ fn the_w4a8_mega_moe_answers_the_composition_apart() {
         eprintln!("skipped: no tcgen05 on this device");
         return;
     }
-    let s = Shape {
-        experts: 32,
-        ..V4_FLASH
+    // V4-Flash's experts (fewer of them), and a narrower GLU of whole 256s
+    // (768 wide, Qwen3-30B-A3B's) under eight routes a token.
+    let narrow = Shape {
+        hidden: 2048,
+        inter: 768,
+        experts: 24,
+        top: 8,
     };
-    let mut b = Bench::new(0x3e9a);
-    let w = w4a8(&mut b, s, true);
-    let ctx = b.ctx().with_tuning(SM100);
-    for tokens in [1usize, 3, 8, 33, 100] {
-        let mut f = fire_of(&mut b, s, tokens, 0x51 + tokens as u64);
-        let mut a = apart_of(&mut b, s, tokens);
-        apart(&ctx, s, &w, &mut f, &mut a);
-        let want = b.read(f.y.ptr, tokens * s.hidden);
-        let mut y = b.out(tokens, s.hidden);
-        let m = mlp_of(s, &w, &f);
-        let took = moe::mega(&ctx, m, moe::Fold::First(Some(f.shared)), &mut y).expect("fires");
-        assert!(took, "{tokens}: the mega-MoE takes the fire");
-        let got = b.read(y.ptr, tokens * s.hidden);
-        let (mean, max) = spread(&got, &want);
-        let same = got
-            .iter()
-            .zip(&want)
-            .filter(|(g, w)| g.to_bits() == w.to_bits())
-            .count();
-        eprintln!(
-            "{tokens} tokens: mean {mean:.2e} max {max:.2e}, {same} of {} bit for bit",
-            got.len()
-        );
-        assert!(
-            mean < 1e-2 && max < 0.2,
-            "{tokens}: {mean:.3e} mean, {max:.3e} at most"
-        );
+    for (s, widths) in [
+        (
+            Shape {
+                experts: 32,
+                ..V4_FLASH
+            },
+            &[1usize, 3, 8, 33, 100][..],
+        ),
+        (narrow, &[2, 40][..]),
+    ] {
+        let mut b = Bench::new(0x3e9a ^ s.inter as u64);
+        let w = w4a8(&mut b, s, true);
+        let ctx = b.ctx().with_tuning(SM100);
+        for &tokens in widths {
+            let mut f = fire_of(&mut b, s, tokens, 0x51 + tokens as u64);
+            let mut a = apart_of(&mut b, s, tokens);
+            apart(&ctx, s, &w, &mut f, &mut a);
+            let want = b.read(f.y.ptr, tokens * s.hidden);
+            let mut y = b.out(tokens, s.hidden);
+            let m = mlp_of(s, &w, &f);
+            let took = moe::mega(&ctx, m, moe::Fold::First(Some(f.shared)), &mut y).expect("fires");
+            assert!(took, "{tokens}: the mega-MoE takes the fire");
+            let got = b.read(y.ptr, tokens * s.hidden);
+            let (mean, max) = spread(&got, &want);
+            let same = got
+                .iter()
+                .zip(&want)
+                .filter(|(g, w)| g.to_bits() == w.to_bits())
+                .count();
+            eprintln!(
+                "{tokens} tokens: mean {mean:.2e} max {max:.2e}, {same} of {} bit for bit",
+                got.len()
+            );
+            assert!(
+                mean < 1e-3 && max < 0.05,
+                "{tokens}: {mean:.3e} mean, {max:.3e} at most"
+            );
+        }
     }
 }
 
@@ -499,4 +514,57 @@ fn the_mega_moe_lands_its_live_window_alone() {
         .filter(|(i, _)| !span.contains(i))
         .all(|(_, &v)| v == sentinel);
     assert!(rest, "rows past the window are untouched");
+}
+
+/// The bf16 mega-MoE's rate at Qwen3-30B-A3B's routed experts (128 of them,
+/// top 8, 2048 by 768), against the composition apart.
+#[test]
+#[ignore = "a rate bench: cargo test ... -- --ignored mega_moe_bf16_rate --nocapture"]
+fn mega_moe_bf16_rate() {
+    if !supported() {
+        eprintln!("skipped: no tcgen05 on this device");
+        return;
+    }
+    let s = Shape {
+        hidden: 2048,
+        inter: 768,
+        experts: 128,
+        top: 8,
+    };
+    let widths: Vec<usize> = std::env::var("PIE_TOKENS")
+        .unwrap_or_else(|_| "1,4,16,64,128,256".to_string())
+        .split(',')
+        .map(|v| v.trim().parse().expect("a count"))
+        .collect();
+    let mut b = Bench::new(0xb1f6);
+    let up = bf16_bank(&mut b, s.experts, 2 * s.inter, s.hidden);
+    let down = bf16_bank(&mut b, s.experts, s.hidden, s.inter);
+    let ctx = b.ctx().with_tuning(SM100);
+    for tokens in widths {
+        let mut f = fire_of(&mut b, s, tokens, tokens as u64);
+        let mut a = apart_of(&mut b, s, tokens);
+        let us = timed(&b, &ctx, 20, || {
+            apart_bf16(&ctx, s, (up, down), false, &mut f, &mut a)
+        });
+        let mut y = b.out(tokens, s.hidden);
+        let m = moe::RoutedMlp {
+            x: f.x,
+            up: moe::GluBank::Bf16(up),
+            glu: Glu::Swiglu,
+            down: moe::GluBank::Bf16(down),
+            routes: f.routes,
+            weights: f.weights,
+            inter: s.inter as u32,
+        };
+        let mega = timed(&b, &ctx, 20, || {
+            assert!(
+                moe::mega(&ctx, m, moe::Fold::Weighted, &mut y).expect("fires"),
+                "takes the fire"
+            );
+        });
+        let speedup = us / mega;
+        eprintln!(
+            "qwen3-30b bf16 {tokens} tokens: apart {us:.1} us, mega {mega:.1} us ({speedup:.2}x)"
+        );
+    }
 }
