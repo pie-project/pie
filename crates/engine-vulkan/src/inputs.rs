@@ -29,7 +29,7 @@ pub struct VoxelSeat {
     pub clips: u64,
     pub channels: u64,
     pub dtype: Dtype,
-    pub token_grid: bool,
+    pub token_patch: Option<[u32; 3]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -371,7 +371,7 @@ impl Inputs {
             VoxelAt {
                 payload: take(seat.rows * seat.channels * element),
                 grid: take(seat.clips * 4 * 4),
-                token_grid: if seat.token_grid {
+                token_grid: if seat.token_patch.is_some() {
                     take(seat.clips * 4 * 4)
                 } else {
                     0
@@ -731,7 +731,11 @@ impl Inputs {
                     (
                         "voxel token grid",
                         (staged.token_grid.len() / 4) as u64,
-                        if seat.token_grid { seat.clips } else { 0 },
+                        if seat.token_patch.is_some() {
+                            seat.clips
+                        } else {
+                            0
+                        },
                     ),
                     ("voxel clip slots", staged.slots.len() as u64, seat.clips),
                 ] {
@@ -770,7 +774,7 @@ impl Inputs {
                         4,
                         Dtype::I32,
                     ),
-                    token_grid: if seat.token_grid {
+                    token_grid: if seat.token_patch.is_some() {
                         Some(Tensor::new(
                             handles.bind(&self.store, at.token_grid, clips * 16)?,
                             clips32,
