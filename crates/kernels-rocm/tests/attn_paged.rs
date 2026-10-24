@@ -410,6 +410,21 @@ fn run_prefill_window(
     }
 }
 
+/// A windowed run: the case, its query and cached lengths, its splits, its
+/// window, and whether a captured plan pads the grid.
+type WindowRun<'a> = (&'a Case, &'a [u32], &'a [u32], usize, u32, bool);
+
+/// An Inkling run: query and cached lengths, the window, the page floor, the
+/// (sink, scale) pair and the split budget.
+type InklingRun = (
+    &'static [u32],
+    &'static [u32],
+    Option<u32>,
+    u32,
+    (u32, f32),
+    u32,
+);
+
 #[test]
 fn attn_paged() {
     let Some(gpu) = Gpu::open() else { return };
@@ -454,7 +469,7 @@ fn attn_paged_wide_heads() {
     // DeepSeek-V4's 128-key window as its decode reads it (whole, then a
     // split batch), windowed prefills whose tiles straddle tokens, windows
     // long enough to split, and captured plans padding their grid.
-    let windows: &[(&Case, &[u32], &[u32], usize, u32, bool)] = &[
+    let windows: &[WindowRun] = &[
         (&mqa, &[1, 1, 1, 1], &[0, 40, 127, 900], 1, 128, false),
         (&mqa, &[1; 64], &[600; 64], 7, 128, false),
         (&mqa, &[3, 70, 200], &[300, 0, 31], 1, 128, false),
@@ -933,7 +948,7 @@ fn attn_paged_relative_bias() {
     let wide = Case::new(16, 1, 256, 16, true);
     // Decode rows, whole and split; a window; prefill rows, grown and windowed.
     #[rustfmt::skip]
-    let cases: &[(&[u32], &[u32], Option<u32>, u32, (u32, f32), u32)] = &[
+    let cases: &[InklingRun] = &[
         (&[1, 1, 1, 1], &[0, 36, 299, 1000], None, 16, (64, 0.1), 4096),
         (&[1, 1, 1, 1], &[0, 36, 299, 1000], None, 16, (64, 0.1), 1),
         (&[1, 1], &[200, 2000], Some(128), 300, (0, 0.0), 4096),

@@ -183,7 +183,7 @@ struct Case {
 fn run(gpu: &Gpu, c: &Case, seed: u64) {
     let ctx = gpu.ctx();
     let w = Weight::new(c.bits, c.group, c.offset, c.n, c.k, c.e, seed);
-    let (codes, scales, offs) = w.planes(&gpu, c.e);
+    let (codes, scales, offs) = w.planes(gpu, c.e);
     let x: Vec<f32> = values((c.rows * c.k) as usize, seed + 7, 1.0)
         .into_iter()
         .map(|v| c.e.round(v))
