@@ -110,11 +110,6 @@ impl Cuda {
     }
 
     #[must_use]
-    pub(crate) fn expert_rank(&self) -> World {
-        self.expert
-    }
-
-    #[must_use]
     pub fn shell(&self) -> Option<&Shell> {
         self.shell.as_ref()
     }
@@ -595,6 +590,20 @@ impl Engine for Cuda {
             frames_in_flight,
         } = request;
 
+        // A rank of an expert-parallel group of `size` holds part of a bank
+        // only in a trace lowered for that many ranks.
+        let size = self.expert.size;
+        if size > 1
+            && !trace
+                .params
+                .iter()
+                .any(|param| param.experts.is_some_and(|slots| slots.ep == size))
+        {
+            return Err(Error::Load(format!(
+                "this engine is a rank of an expert-parallel group of {size}, and its trace \
+                 holds no bank lowered for {size} ranks: load the deployment's `-ep{size}` trace"
+            )));
+        }
         let Checkpoint::Path(path) = checkpoint else {
             return Err(Error::Load(
                 "the cuda shell lands a checkpoint or nothing runs; \
