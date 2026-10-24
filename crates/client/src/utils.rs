@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use crate::error::{Error, Result};
 use num_traits::PrimInt;
 use std::collections::BTreeSet;
 use std::ops::Deref;
@@ -62,7 +62,7 @@ where
             self.next = self.next + T::one();
             Ok(addr)
         } else {
-            Err(anyhow!("ID pool exhausted"))
+            Err(Error::TooManyRequests)
         }
     }
 

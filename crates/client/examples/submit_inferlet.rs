@@ -40,5 +40,5 @@ pub async fn submit_inferlet(ws_host: &str, path: &Path, input: &str) -> Result<
         .await
         .with_context(|| format!("launch_process {inferlet}"))?;
 
-    proc.wait_for_return().await
+    Ok(proc.wait_for_return().await?)
 }
