@@ -58,6 +58,23 @@
 
 namespace pie::elemwise {
 
+// Two f32 lanes of one sm_100 packed add, each rounded as its scalar
+// `add.rn` would round it.
+__device__ __forceinline__ u64 hc_f32x2(float lo, float hi) {
+    return static_cast<u64>(__float_as_uint(lo)) | (static_cast<u64>(__float_as_uint(hi)) << 32);
+}
+
+__device__ __forceinline__ void hc_f32x2_split(u64 v, float& lo, float& hi) {
+    lo = __uint_as_float(static_cast<u32>(v));
+    hi = __uint_as_float(static_cast<u32>(v >> 32));
+}
+
+__device__ __forceinline__ u64 hc_add_f32x2(u64 a, u64 b) {
+    u64 d;
+    asm("add.rn.f32x2 %0, %1, %2;" : "=l"(d) : "l"(a), "l"(b));
+    return d;
+}
+
 constexpr int kMegaRows = 128;
 constexpr int kMegaCols = 32;
 constexpr int kMegaStages = 3;
@@ -678,17 +695,27 @@ __global__ void __launch_bounds__(kMegaThreads, 1) hc_fold_pre_tc5(
                     uint4 ow;
                     bf16* o8 = reinterpret_cast<bf16*>(&ow);
 #pragma unroll
-                    for (int e = 0; e < 8; ++e) {
+                    for (int e = 0; e < 8; e += 2) {
                         // Each product rounded, then summed: `hc_fold`
                         // under NVRTC's `--fmad=false`, not a fused
-                        // multiply-add.
-                        float acc = __fmul_rn(post[j], xf[e]);
+                        // multiply-add. The sums two columns a packed add;
+                        // the products stay scalar, as ptxas fuses a packed
+                        // `mul.rn.f32x2` into the packed add after it.
+                        u64 acc = hc_f32x2(__fmul_rn(post[j], xf[e]), __fmul_rn(post[j], xf[e + 1]));
 #pragma unroll
-                        for (int i = 0; i < kMegaStreams; ++i)
-                            acc = __fadd_rn(acc, __fmul_rn(comb[i * 4 + j], rf[i][e]));
-                        o8[e] = f32_to_bf16(acc);
-                        const float v = bf16_to_f32(o8[e]);
-                        sq[k] = fmaf(v, v, sq[k]);
+                        for (int i = 0; i < kMegaStreams; ++i) {
+                            const float g = comb[i * 4 + j];
+                            acc = hc_add_f32x2(
+                                acc, hc_f32x2(__fmul_rn(g, rf[i][e]), __fmul_rn(g, rf[i][e + 1])));
+                        }
+                        float a0, a1;
+                        hc_f32x2_split(acc, a0, a1);
+                        o8[e] = f32_to_bf16(a0);
+                        o8[e + 1] = f32_to_bf16(a1);
+                        const float v0 = bf16_to_f32(o8[e]);
+                        sq[k] = fmaf(v0, v0, sq[k]);
+                        const float v1 = bf16_to_f32(o8[e + 1]);
+                        sq[k] = fmaf(v1, v1, sq[k]);
                     }
                     *reinterpret_cast<uint4*>(rt + j * (kMegaRows * 64) + at) = ow;
                 }
