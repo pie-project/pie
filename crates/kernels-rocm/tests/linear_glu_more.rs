@@ -286,3 +286,72 @@ fn linear_swiglu_clamp_split() {
         .collect();
     close_bf16("swiglu_clamp_split", &gpu.read(&y), &want, 1.0);
 }
+
+/// Legs the pack left apart: each unit over a gate and an up plane lands
+/// what it lands over the `[gate | up]` rows of the same values, bit for
+/// bit, routed or not, an unclamped one clamped at the largest finite f32.
+#[test]
+fn linear_glu_apart_lands_what_packed_lands() {
+    let Some(gpu) = Gpu::open() else { return };
+    let ctx = gpu.ctx();
+    let (rows, width) = (5u32, 1000u32);
+    let w = width as usize;
+    let (gs, us) = (bf16s(rows * width, 41, 9.0), bf16s(rows * width, 42, 9.0));
+    let ps: Vec<f32> = gs
+        .chunks(w)
+        .zip(us.chunks(w))
+        .flat_map(|(g, u)| g.iter().chain(u).copied().collect::<Vec<_>>())
+        .collect();
+    let gate = gpu.tensor(&gs, rows, width, Dtype::Bf16);
+    let up = gpu.tensor(&us, rows, width, Dtype::Bf16);
+    let packed = gpu.tensor(&ps, rows, 2 * width, Dtype::Bf16);
+    let weights = gpu.tensor(&values(rows as usize, 43, 1.0), rows, 1, Dtype::F32);
+    let (limit, alpha, beta, cap, max) = (7.0f32, 1.702f32, 2.5f32, 3.0f32, f32::MAX);
+    let forms = [
+        "swiglu",
+        "swiglu_clamp",
+        "swiglu_clamp_routed",
+        "swiglu_routed",
+        "swiglu_clamp_alpha",
+        "swiglu_alpha",
+        "situ",
+        "situ_capped",
+        "geglu_tanh",
+    ];
+    for (k, name) in forms.iter().enumerate() {
+        let mut apart = gpu.zeros(rows, width, Dtype::Bf16);
+        let mut joined = gpu.zeros(rows, width, Dtype::Bf16);
+        let (a, j) = (&mut apart, &mut joined);
+        match k {
+            0 => glu::swiglu_clamp_split(&ctx, gate, up, max, a),
+            1 => glu::swiglu_clamp_split(&ctx, gate, up, limit, a),
+            2 => glu::swiglu_clamp_split_routed(&ctx, gate, up, weights, 1, limit, a),
+            3 => glu::swiglu_clamp_split_routed(&ctx, gate, up, weights, 1, max, a),
+            4 => glu::swiglu_clamp_alpha_split(&ctx, gate, up, 1, limit, alpha, a),
+            5 => glu::swiglu_clamp_alpha_split(&ctx, gate, up, 1, max, alpha, a),
+            6 => glu::situ_split(&ctx, gate, up, 1, beta, None, a),
+            7 => glu::situ_split(&ctx, gate, up, 1, beta, Some(cap), a),
+            _ => glu::geglu_tanh(&ctx, gate, up, 1, a),
+        }
+        .unwrap();
+        match k {
+            0 => glu::swiglu_clamp(&ctx, packed, width, 1, max, j),
+            1 => glu::swiglu_clamp(&ctx, packed, width, 1, limit, j),
+            2 => glu::swiglu_clamp_routed(&ctx, packed, width, weights, 1, limit, j),
+            3 => glu::swiglu_clamp_routed(&ctx, packed, width, weights, 1, max, j),
+            4 => glu::swiglu_clamp_alpha(&ctx, packed, width, 1, limit, alpha, j),
+            5 => glu::swiglu_clamp_alpha(&ctx, packed, width, 1, max, alpha, j),
+            6 => glu::situ(&ctx, packed, width, 1, beta, None, j),
+            7 => glu::situ(&ctx, packed, width, 1, beta, Some(cap), j),
+            _ => glu::geglu_tanh_packed(&ctx, packed, width, 1, j),
+        }
+        .unwrap();
+        let (a, j) = (gpu.read(&apart), gpu.read(&joined));
+        let off = a
+            .iter()
+            .zip(&j)
+            .filter(|(a, j)| a.to_bits() != j.to_bits())
+            .count();
+        assert_eq!(off, 0, "{name}: {off} values differ apart and joined");
+    }
+}
