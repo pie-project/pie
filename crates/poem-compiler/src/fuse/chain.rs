@@ -5,10 +5,12 @@
 //!
 //! **Forming** is conservative, as the fuse rules are: a chain is a run of
 //! consecutive ops, each one this module lowers, each reading a value an
-//! earlier op of the run computes, all under one guard and layer and over
-//! rows of one width; at most [`MAX_CHAIN`] ops, and at least two (a lone op
-//! keeps its hand kernel). Nothing is searched, so no unplanned combination
-//! forms.
+//! earlier op of the run computes, all under one guard and over rows of one
+//! width (a run may cross a layer's end, as a layer's last residual add and
+//! the next layer's input norm do, and lands in its last op's layer, as a
+//! fuse rule's match does); at most [`MAX_CHAIN`] ops, and at least two (a
+//! lone op keeps its hand kernel). Nothing is searched, so no unplanned
+//! combination forms.
 //!
 //! **Lowering** turns each op into the eta math it states, in f32. A value
 //! the run reads but does not compute is a parameter; a value it computes
@@ -163,8 +165,19 @@ fn planes_fit(planes: usize, width: u32) -> bool {
 }
 
 /// `trace` with each run's ops replaced by its op, landed where the run
-/// began, under the run's guard and layer; the runs are in order and apart.
+/// began, under the run's guard and in the layer of its last op that has
+/// one (a fuse rule's match lands so too); the runs are in order and apart.
 fn replace(mut trace: Trace, runs: Vec<(Range<u32>, Fused)>) -> Trace {
+    let layers: Vec<Option<u32>> = runs
+        .iter()
+        .map(|(run, _)| {
+            trace.nodes[run.start as usize..run.end as usize]
+                .iter()
+                .rev()
+                .find_map(|node| node.layer)
+        })
+        .collect();
+    let mut layers = layers.into_iter();
     let mut landed = Vec::with_capacity(trace.nodes.len());
     let mut nodes = Vec::with_capacity(trace.nodes.len());
     let mut runs = runs.into_iter().peekable();
@@ -185,7 +198,7 @@ fn replace(mut trace: Trace, runs: Vec<(Range<u32>, Fused)>) -> Trace {
             nodes.push(Node {
                 op: Operation::Fused(op),
                 guard: node.guard,
-                layer: node.layer,
+                layer: layers.next().expect("a layer a run"),
             });
         } else {
             nodes.push(node);
@@ -269,14 +282,16 @@ fn row_of(trace: &Trace, node: u32) -> Option<Rows> {
 }
 
 /// Whether `node` extends the run `run` over `row`: it lowers over the same
-/// rows, under the run's guard and layer, and reads what the run computes.
+/// rows, under the run's guard, and reads what the run computes. Its layer
+/// may be the next one's: a layer's last residual add and the next layer's
+/// input norm are one chain, as they are one fused op by a rule.
 fn joins(trace: &Trace, run: Range<u32>, node: u32, row: Rows) -> bool {
     if row_of(trace, node) != Some(row) {
         return false;
     }
     let first = &trace.nodes[run.start as usize];
     let next = &trace.nodes[node as usize];
-    if next.guard != first.guard || next.layer != first.layer {
+    if next.guard != first.guard {
         return false;
     }
     let mut ins = Vec::new();

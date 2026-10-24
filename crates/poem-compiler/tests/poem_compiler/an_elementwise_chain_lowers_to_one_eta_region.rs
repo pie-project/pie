@@ -223,6 +223,40 @@ fn a_folded_trace_plans_as_it_stands() {
     );
 }
 
+/// A layer's last residual add and the next layer's input norm are one
+/// chain, as `fuse.residual_add_rmsnorm` makes them one op: no residual add
+/// of a qwen3 forward is left outside a region, and a region that crosses a
+/// layer's end lands in one of its layers, so the folded trace's layers
+/// still only climb.
+#[test]
+fn a_residual_add_and_the_next_layers_norm_form_one_region() {
+    let t = qwen3();
+    let crossing = chains(&t)
+        .iter()
+        .filter(|chain| {
+            t.nodes[chain.nodes.start as usize].layer != t.nodes[chain.nodes.end as usize - 1].layer
+        })
+        .count();
+    assert!(crossing > 0, "a layer's stream is normed by the next");
+    let (folded, _) = fold(t.clone());
+    let left = folded
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.op,
+                Operation::Elemwise(poem_ir::Elemwise::ResidualAdd { .. })
+            )
+        })
+        .count();
+    assert_eq!(left, 0, "every residual add folds with the norm after it");
+    let layers: Vec<u32> = folded.nodes.iter().filter_map(|node| node.layer).collect();
+    assert!(
+        layers.windows(2).all(|pair| pair[0] <= pair[1]),
+        "the folded trace's layers climb"
+    );
+}
+
 /// The arena lands no region's output over one of its inputs: a row frame
 /// reads its row whole before it writes any of it, but a block's row is
 /// not another block's.
