@@ -5,10 +5,12 @@
 //! submissions into one sequence of steps.
 //!
 //! A step forms when its first frame arrives. It waits for each rank that
-//! has announced a next frame (`Engine::expect_fire`) and has not yet
-//! brought it, up to a deadline; a rank that announced nothing is idle and
-//! is not waited for. Without the wait two busy ranks a moment apart would
-//! split every step in two, each idling through the other's. The first
+//! has announced a next frame (`Engine::expect_fire`) or brought one to the
+//! step before, and has not yet brought it, up to a deadline from when the
+//! step before is done; any other rank is idle and is not waited for, and a
+//! busy rank that misses the deadline is idle from then on. Without the
+//! wait two busy ranks a moment apart would split every step in two, each
+//! idling through the other's. The first
 //! arrival leads: it is handed every arrived frame and the step's bucket
 //! (the largest asked, which Dispatch's token count must agree on), fires
 //! the step on every rank, and posts each joined rank its result. Each rank
@@ -62,6 +64,11 @@ struct State<F, R> {
     /// has, so two steps never fire at once.
     fired: u64,
     announced: Vec<bool>,
+    /// Ranks that brought a frame to the last step formed. A decode's next
+    /// step is known only once its last has settled, so a busy rank has no
+    /// next frame to announce: it is waited for as an announced one is,
+    /// until a step forms without it.
+    busy: Vec<bool>,
     arrived: Vec<Option<Arrival<F>>>,
     /// Results of fired steps, by rank, until the rank takes its own.
     results: Vec<Option<(u64, R)>>,
@@ -83,6 +90,7 @@ impl<F, R> Rendezvous<F, R> {
                 forming: false,
                 fired: 0,
                 announced: vec![false; ranks],
+                busy: vec![false; ranks],
                 arrived: (0..ranks).map(|_| None).collect(),
                 results: (0..ranks).map(|_| None).collect(),
                 poisoned: None,
@@ -122,25 +130,25 @@ impl<F, R> Rendezvous<F, R> {
             return self.joined(s, rank, step);
         }
         s.forming = true;
-        let deadline = Instant::now() + self.wait;
+        // The wait runs from when the step before is done: a rank busy in
+        // that one brings its next frame only once it has its result.
+        let mut deadline = None;
         loop {
             if let Some(why) = &s.poisoned {
                 return Err(why.clone());
             }
-            let waiting = s
-                .announced
-                .iter()
-                .zip(&s.arrived)
-                .any(|(&announced, arrived)| announced && arrived.is_none());
+            let waiting = (0..s.arrived.len())
+                .any(|r| (s.announced[r] || s.busy[r]) && s.arrived[r].is_none());
             let now = Instant::now();
             let previous = s.fired == step;
-            if previous && (!waiting || now >= deadline) {
-                break;
-            }
-            // The step before still firing: keep gathering until it is done.
             let until = if previous {
+                let deadline = *deadline.get_or_insert(now + self.wait);
+                if !waiting || now >= deadline {
+                    break;
+                }
                 deadline - now
             } else {
+                // The step before still firing: keep gathering until it is done.
                 Duration::from_millis(50)
             };
             s = self
@@ -150,6 +158,7 @@ impl<F, R> Rendezvous<F, R> {
                 .0;
         }
         let frames: Vec<Option<Arrival<F>>> = s.arrived.iter_mut().map(Option::take).collect();
+        s.busy = frames.iter().map(Option::is_some).collect();
         s.open += 1;
         s.forming = false;
         self.changed.notify_all();
@@ -871,6 +880,80 @@ mod tests {
         };
         assert!(began.elapsed() >= Duration::from_millis(100));
         assert_eq!(formed.frames, vec![Some(1), None]);
+    }
+
+    /// A step every rank brought a frame to.
+    fn together(r: &Arc<Rendezvous<u32, u32>>) {
+        r.announce(1);
+        let other = {
+            let r = Arc::clone(r);
+            thread::spawn(move || lead_or_join(&r, 1, 2, 8))
+        };
+        lead_or_join(r, 0, 1, 8);
+        other.join().unwrap();
+    }
+
+    /// The step after one both ranks were busy in waits for the later rank,
+    /// which announced nothing: a decode has no next step to announce.
+    #[test]
+    fn a_rank_busy_in_the_last_step_is_waited_for_in_the_next() {
+        let r = Arc::new(Rendezvous::<u32, u32>::new(2, Duration::from_secs(30)));
+        together(&r);
+        let late = {
+            let r = Arc::clone(&r);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                lead_or_join(&r, 1, 4, 256)
+            })
+        };
+        assert_eq!(
+            lead_or_join(&r, 0, 3, 8),
+            3256,
+            "the busy rank's frame fired in the same step"
+        );
+        assert_eq!(late.join().unwrap(), 4256);
+    }
+
+    /// A busy rank that brings nothing more holds one step to its deadline,
+    /// counted from when the step before was done, and none after it.
+    #[test]
+    fn a_busy_rank_that_stops_holds_one_step_to_its_deadline() {
+        let r = Arc::new(Rendezvous::<u32, u32>::new(2, Duration::from_millis(100)));
+        together(&r);
+        let began = Instant::now();
+        let Part::Lead(formed) = r
+            .arrive(
+                0,
+                Arrival {
+                    frame: 3,
+                    bucket: 8,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("the first arrival leads");
+        };
+        assert!(began.elapsed() >= Duration::from_millis(100));
+        assert_eq!(formed.frames, vec![Some(3), None]);
+        r.finish(formed.step, vec![None, None]);
+        let began = Instant::now();
+        let Part::Lead(formed) = r
+            .arrive(
+                0,
+                Arrival {
+                    frame: 5,
+                    bucket: 8,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("the first arrival leads");
+        };
+        assert!(
+            began.elapsed() < Duration::from_millis(100),
+            "it waited on a rank idle in the step before"
+        );
+        assert_eq!(formed.frames, vec![Some(5), None]);
     }
 
     /// Steps keep their order under many ranks submitting many frames: each
