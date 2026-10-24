@@ -13,8 +13,16 @@ use worker_api::peer::KvAccess;
 /// Opens this worker's agent over its exported kv; its name is the worker's
 /// bulk address, which is its own on a host. A build without a transfer
 /// agent opens none, and the bulk link carries every page.
-pub fn open(name: &str, handle: engine::KvHandle) -> Result<()> {
-    imp::open(name, handle)
+///
+/// # Safety
+///
+/// As for [`transport::Backend::register`]: every region of `handle` must
+/// stay allocated, and unraced by this worker while peers may read or write
+/// it, for the rest of the process, since the agent is never closed.
+#[allow(unsafe_code)]
+pub unsafe fn open(name: &str, handle: engine::KvHandle) -> Result<()> {
+    // SAFETY: the caller's promise, passed on.
+    unsafe { imp::open(name, handle) }
 }
 
 /// What this worker's peer [`worker_api::peer::Hello`] says of its kv.
@@ -61,11 +69,14 @@ mod imp {
     /// The key this worker's own kv is registered under.
     const OURS: WorkerId = WorkerId(0);
 
-    pub fn open(name: &str, handle: engine::KvHandle) -> Result<()> {
+    #[allow(unsafe_code)]
+    pub unsafe fn open(name: &str, handle: engine::KvHandle) -> Result<()> {
         let backend =
             Arc::new(transport::NixlBackend::new(name).context("opening the kv transfer agent")?);
-        let mine = backend
-            .register(OURS, handle.clone())
+        // SAFETY: `open`'s caller keeps `handle`'s regions allocated and
+        // unraced for the rest of the process, which the agent cannot
+        // outlive: it lands in `AGENT` or is dropped right here.
+        let mine = unsafe { backend.register(OURS, handle.clone()) }
             .context("registering this worker's kv with its transfer agent")?;
         let access = KvAccess {
             handle: serde_json::to_vec(&handle)?,
@@ -138,7 +149,8 @@ mod imp {
     use futures::future::BoxFuture;
     use worker_api::peer::KvAccess;
 
-    pub fn open(_name: &str, _handle: engine::KvHandle) -> Result<()> {
+    #[allow(unsafe_code)]
+    pub unsafe fn open(_name: &str, _handle: engine::KvHandle) -> Result<()> {
         Ok(())
     }
 

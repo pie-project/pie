@@ -306,7 +306,7 @@ impl Backend for NixlBackend {
         BackendKind::Nixl
     }
 
-    fn register(&self, owner: WorkerId, handle: KvHandle) -> Result<RegisteredHandle> {
+    unsafe fn register(&self, owner: WorkerId, handle: KvHandle) -> Result<RegisteredHandle> {
         let mut g = self.inner.lock().unwrap();
         for region in &handle.regions {
             let (kind, device) = segment(region.domain)?;
@@ -334,9 +334,8 @@ impl Backend for NixlBackend {
                 return Err(err("reg_dlist_add_desc", st));
             }
             // SAFETY: `g.agent` is live and used under its lock, and `dl` was
-            // just built. What this registers is the engine's word: the region
-            // must stay allocated for the agent's life, since peers may read or
-            // write it from then on and nothing deregisters it.
+            // just built. The region stays allocated and unraced for the
+            // agent's life, as `register`'s caller promised.
             let st = unsafe { nixl_capi_register_mem(g.agent, dl, ptr::null_mut()) };
             // SAFETY: registering copied the list; `dl` is destroyed once.
             unsafe { nixl_capi_destroy_reg_dlist(dl) };
@@ -547,9 +546,12 @@ mod tests {
         );
         let ours_at = (ours.as_mut_ptr(), ours.len());
         let theirs_at = (theirs.as_mut_ptr(), theirs.len());
-        let mine = a.register(WorkerId(1), host(ours_at.0, ours_at.1)).unwrap();
-        b.register(WorkerId(2), host(theirs_at.0, theirs_at.1))
-            .unwrap();
+        // SAFETY: `ours` and `theirs` are declared before `a` and `b`, so
+        // they outlive both agents, and neither is touched until the read
+        // below has completed.
+        let mine = unsafe { a.register(WorkerId(1), host(ours_at.0, ours_at.1)) }.unwrap();
+        // SAFETY: as above.
+        unsafe { b.register(WorkerId(2), host(theirs_at.0, theirs_at.1)) }.unwrap();
         a.connect(&PeerConn {
             worker: WorkerId(2),
             handle: host(theirs_at.0, theirs_at.1),

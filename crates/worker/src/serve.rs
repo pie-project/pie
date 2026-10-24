@@ -246,7 +246,17 @@ async fn start_peers(user_cfg: &config::Config) -> Result<()> {
             Some(listen) => peer::bulk_addr(listen)?,
             None => format!("pie-worker-{}", std::process::id()),
         };
-        kv::open(&name, handle)?;
+        // SAFETY: `handle` is what `boot_decode` stored: the first engine
+        // group's own export of its paged kv arenas, which the engine backs
+        // whole at load and frees only when the runtime drops. Peers touch
+        // only pages the offload protocol hands them. The runtime is held
+        // until shutdown, but the agent is a static: past a shutdown that
+        // keeps the process alive, or a failed boot after this point, the
+        // arenas are freed while it still names them (see `kv::open`).
+        #[allow(unsafe_code)]
+        unsafe {
+            kv::open(&name, handle)?;
+        }
     }
     let hello = peer::hello(WorkerId(0), &engine);
     peer::set_hello(hello.clone());
