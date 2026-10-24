@@ -174,6 +174,29 @@ fn the_routed_glus_land_the_clamped_swiglu_and_its_read_back() {
 }
 
 #[test]
+fn the_alpha_glu_lands_alike_over_packed_rows_and_split_planes() {
+    // MiniMax's clamped SwiGLU, `(u + 1) * g * sigmoid(alpha * g)`: its
+    // gate and up packed in one row, and held apart where the pack left them.
+    for (rows, inter) in [(41, 3072), (5, 200)] {
+        let (mut b, limit, alpha) = (Bench::new(0xa1f + rows as u64), 7.0, 1.702);
+        let packed = tab(rows * 2 * inter, |_| to_bf16(b.lcg.unit() * 20.0));
+        let at = |i: usize, o: usize| i / inter * 2 * inter + o + i % inter;
+        let half = |o: usize| tab(rows * inter, |i| packed[at(i, o)]);
+        let gate = t(b.up(&half(0)), rows, inter, Bf16);
+        let up = t(b.up(&half(inter)), rows, inter, Bf16);
+        let pt = t(b.up(&packed), rows, 2 * inter, Bf16);
+        let (mut ys, ctx, n) = ([(); 2].map(|_| b.out(rows, inter)), b.ctx(), inter as u32);
+        glu::swiglu_clamp_alpha(&ctx, pt, n, 1, limit, alpha, &mut ys[0]).expect("fires");
+        glu::swiglu_clamp_alpha_split(&ctx, gate, up, 1, limit, alpha, &mut ys[1]).expect("fires");
+        let v = |i: usize, o: usize| f64::from(from_bf16(packed[at(i, o)]));
+        let f = Glu::SwigluClampAlpha { limit, alpha };
+        let want = tab(rows * inter, |i| (glu(f, v(i, 0), v(i, inter)), 0.0));
+        b.check(ys[0].ptr, &want, TOL, &format!("{rows}x{inter} packed"));
+        b.check(ys[1].ptr, &want, TOL, &format!("{rows}x{inter} split"));
+    }
+}
+
+#[test]
 fn the_e4m3_table_gathers_widen_only_their_rows() {
     use kernels_cuda::gather::{embed_concat_e4m3, embed_concat_mxfp8};
     // e4m3 rows under one scale, 16-byte runs a thread (160) and a code a

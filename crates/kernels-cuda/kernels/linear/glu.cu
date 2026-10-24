@@ -374,9 +374,12 @@ __global__ void swiglu_clamp_lanes(
     }
 }
 
-template <class T>
+// Over packed rows (`PACKED`: row r's `I` gate columns at 2 r I, its up
+// columns after them), or a gate and an up plane held apart (`up`).
+template <class T, bool PACKED>
 __global__ void swiglu_clamp_alpha(
-    const T* __restrict__ packed,
+    const T* __restrict__ gate,
+    const T* __restrict__ up,
     T* __restrict__ y,
     i32 I, float limit, float alpha,
     i32 fan,
@@ -391,9 +394,14 @@ __global__ void swiglu_clamp_alpha(
     if (i >= I) return;
 
     const long long row = static_cast<long long>(plane_row) * I;
-    const long long packed_row = row * 2;
-    float g = Elem<T>::to_f32(packed[packed_row + i]);
-    float u = Elem<T>::to_f32(packed[packed_row + I + i]);
+    float g, u;
+    if constexpr (PACKED) {
+        g = Elem<T>::to_f32(gate[row * 2 + i]);
+        u = Elem<T>::to_f32(gate[row * 2 + I + i]);
+    } else {
+        g = Elem<T>::to_f32(gate[row + i]);
+        u = Elem<T>::to_f32(up[row + i]);
+    }
     g = fminf(g, limit);
     u = fminf(fmaxf(u, -limit), limit);
     const float glu = g / (1.f + expf(-alpha * g));
