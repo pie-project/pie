@@ -369,8 +369,22 @@ impl Pass {
             }
         }
 
-        // The banks: `slots` planes on each rank.
+        // The banks: `slots` planes on each rank, and so the planes stored
+        // beside a bank (`{bank}.scales`, ...), which hold one row an expert.
+        let mut banks = layer.banks.clone();
         for &p in &layer.banks {
+            let name = self.trace.params[p as usize].name.clone();
+            for (at, param) in self.trace.params.iter().enumerate() {
+                let beside = param
+                    .name
+                    .strip_prefix(name.as_str())
+                    .is_some_and(|rest| rest.starts_with('.'));
+                if beside && param.shape.first() == Some(&u64::from(layer.experts)) {
+                    banks.insert(at as u32);
+                }
+            }
+        }
+        for &p in &banks {
             let param = &mut self.trace.params[p as usize];
             if param.experts.is_some() {
                 continue;
@@ -391,7 +405,7 @@ impl Pass {
         }
         for decl in &mut self.trace.values {
             if let Def::Weight(p) = decl.def
-                && layer.banks.contains(&p)
+                && banks.contains(&p)
                 && let Ty::Tensor { shape, .. } = &mut decl.ty
                 && let Some(Dim::Const(n)) = shape.first_mut()
                 && *n == u64::from(layer.experts)
@@ -441,4 +455,3 @@ impl Pass {
         self.trace.nodes = nodes;
     }
 }
-

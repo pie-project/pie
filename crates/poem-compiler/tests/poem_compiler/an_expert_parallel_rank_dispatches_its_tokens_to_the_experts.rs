@@ -175,7 +175,22 @@ fn every_moe_row_dispatches_every_layer() {
             "`{}`: every MoE layer dispatches",
             row.name
         );
+        // A bank's planes hold the rank's slots with it.
+        for param in &trace.params {
+            let Some(bank) = trace.params.iter().find(|b| {
+                b.experts.is_some()
+                    && param
+                        .name
+                        .strip_prefix(b.name.as_str())
+                        .is_some_and(|r| r.starts_with('.'))
+            }) else {
+                continue;
+            };
+            let cut = bank.experts.unwrap();
+            if param.shape.first() == Some(&u64::from(cut.slots)) || param.experts.is_some() {
+                assert_eq!(param.experts, Some(cut), "`{}`: `{}`", row.name, param.name);
+            }
+        }
     }
     assert!(moe > 0, "the catalog lists MoE rows");
 }
-
