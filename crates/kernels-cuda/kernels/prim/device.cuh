@@ -324,6 +324,28 @@ __device__ __forceinline__ void pdl_launch() {
 #endif
 }
 
+// A count other blocks of the grid add to, read with acquire at gpu
+// scope: what an adder wrote before its release is visible after.
+__device__ __forceinline__ unsigned ld_acquire_gpu(const unsigned* p) {
+    unsigned v;
+    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+
+// The same count read relaxed, for a spin: an acquire load invalidates the
+// SM's L1 (CCTL.IVALL) each time, which a spinning warp would do every few
+// hundred cycles under its block's other warps. Spin relaxed, then acquire
+// once.
+__device__ __forceinline__ unsigned ld_relaxed_gpu(const unsigned* p) {
+    unsigned v;
+    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+
+__device__ __forceinline__ void red_add_release_gpu(unsigned* p, unsigned v) {
+    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+
 // 16 bytes streamed past L1 (read once: weights, codes).
 __device__ __forceinline__ uint4 ld_stream(const void* p) {
     uint4 v;

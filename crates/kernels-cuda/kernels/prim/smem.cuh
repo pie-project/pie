@@ -8,6 +8,12 @@ __device__ __forceinline__ unsigned smem_addr(const void* p) {
     return static_cast<unsigned>(__cvta_generic_to_shared(p));
 }
 
+// Hardware barrier `id` (1-15; 0 is __syncthreads') over `threads`, a
+// multiple of 32: the warps of one role meet without the rest of the block.
+__device__ __forceinline__ void named_bar_sync(unsigned id, unsigned threads) {
+    asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(threads) : "memory");
+}
+
 // `ldmatrix` of 16-bit elements (sm_75 up): each lane names one eight-element
 // row of shared memory at `row` (lanes 0-7 the first matrix, 8-15 the second,
 // and so on), and register `i` of each lane lands its share of matrix `i`.
