@@ -845,9 +845,34 @@ pub struct ModelEngines {
     pub groups: Vec<GroupEngine>,
 }
 
-pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec<usize>>> {
+/// The devices each engine of the worker runs on: one tensor-parallel group,
+/// or under expert parallelism one device for each of `ep_degree` ranks.
+pub fn calculate_topology(
+    world_size: usize,
+    tp_degree: usize,
+    ep_degree: usize,
+) -> Result<Vec<Vec<usize>>> {
     if tp_degree == 0 {
         anyhow::bail!("tensor_parallel_size must be > 0");
+    }
+    if ep_degree == 0 {
+        anyhow::bail!("expert_parallel_size must be > 0");
+    }
+    if ep_degree > 1 {
+        if tp_degree > 1 {
+            anyhow::bail!(
+                "expert_parallel_size = {ep_degree} beside tensor_parallel_size = \
+                 {tp_degree}: a worker splits its devices by expert or by tensor, \
+                 not both yet"
+            );
+        }
+        if world_size != ep_degree {
+            anyhow::bail!(
+                "[engine] device lists {world_size} devices and expert_parallel_size \
+                 = {ep_degree}: an expert-parallel worker runs one rank on each device"
+            );
+        }
+        return Ok((0..ep_degree).map(|rank| vec![rank]).collect());
     }
     if !world_size.is_multiple_of(tp_degree) {
         anyhow::bail!(
@@ -956,20 +981,38 @@ mod topology_tests {
         topology_rejects_dp_two();
         topology_rejects_indivisible();
         topology_rejects_zero_tp();
+        topology_spreads_expert_ranks();
+        topology_rejects_expert_and_tensor_ranks();
+    }
+
+    fn topology_spreads_expert_ranks() {
+        assert_eq!(
+            calculate_topology(4, 1, 4).unwrap(),
+            [vec![0], vec![1], vec![2], vec![3]]
+        );
+        let err = calculate_topology(8, 1, 4).unwrap_err().to_string();
+        assert!(err.contains("one rank on each device"), "got: {err}");
+        let err = calculate_topology(4, 1, 0).unwrap_err().to_string();
+        assert!(err.contains("must be > 0"), "got: {err}");
+    }
+
+    fn topology_rejects_expert_and_tensor_ranks() {
+        let err = calculate_topology(4, 2, 2).unwrap_err().to_string();
+        assert!(err.contains("not both yet"), "got: {err}");
     }
 
     fn topology_rejects_dp_two() {
-        let err = calculate_topology(2, 1).unwrap_err().to_string();
+        let err = calculate_topology(2, 1, 1).unwrap_err().to_string();
         assert!(err.contains("run 2 workers"), "got: {err}");
     }
 
     fn topology_rejects_indivisible() {
-        let err = calculate_topology(3, 2).unwrap_err().to_string();
+        let err = calculate_topology(3, 2, 1).unwrap_err().to_string();
         assert!(err.contains("must be divisible"), "got: {err}");
     }
 
     fn topology_rejects_zero_tp() {
-        let err = calculate_topology(4, 0).unwrap_err().to_string();
+        let err = calculate_topology(4, 0, 1).unwrap_err().to_string();
         assert!(err.contains("must be > 0"), "got: {err}");
     }
 }

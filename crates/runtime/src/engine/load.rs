@@ -52,6 +52,9 @@ pub struct Overrides {
     /// `Some(None)` serves without the checkpoint's drafter.
     pub drafter: Option<Option<String>>,
     pub tp: Option<u32>,
+    /// The expert-parallel ranks the deployment spreads its routed experts
+    /// over, each running its own tokens.
+    pub ep: Option<u32>,
     /// A YaRN factor to stretch the model's native context by, where its
     /// package turns one; unstated, the factor the checkpoint's config.json
     /// states, where its package does not already scale its rotation.
@@ -164,6 +167,9 @@ fn composed(
     }
     if let Some(tp) = overrides.tp {
         deploy.tp = tp;
+    }
+    if let Some(ep) = overrides.ep {
+        deploy.ep = ep;
     }
     if let Some(factor) = overrides.yarn {
         deploy.yarn = Some(factor);

@@ -759,6 +759,7 @@ impl ModelConfig {
             off,
             drafter,
             tp: None,
+            ep: None,
             yarn: self
                 .rope_scaling
                 .as_ref()
@@ -965,6 +966,12 @@ pub struct EngineConfig {
     /// Ranks the model is sharded across. Must divide the device list.
     #[serde(default = "default_tp_size")]
     pub tensor_parallel_size: u32,
+    /// Ranks a MoE model's routed experts spread across, each rank one
+    /// device running its own requests (attention data-parallel, experts
+    /// expert-parallel). Must equal the device list; tensor parallelism
+    /// beside it is not served yet.
+    #[serde(default = "default_ep_size")]
+    pub expert_parallel_size: u32,
     /// Compute dtype for activations, e.g. `"bfloat16"`. Separate from
     /// `weight_dtype`: a deployment can store weights narrower than it
     /// computes.
@@ -1079,6 +1086,9 @@ impl EngineKind {
 }
 
 fn default_tp_size() -> u32 {
+    1
+}
+fn default_ep_size() -> u32 {
     1
 }
 fn default_activation_dtype() -> String {

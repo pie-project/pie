@@ -33,8 +33,20 @@ pub(crate) fn load_model_engines(
         } else {
             e.tensor_parallel_size as usize
         };
-        let topology = crate::backend::calculate_topology(world_size, tp_degree)
-            .with_context(|| format!("model {:?} topology", m.name))?;
+        let ep_degree = e.expert_parallel_size as usize;
+        let topology = crate::backend::calculate_topology(
+            world_size,
+            if ep_degree > 1 { 1 } else { tp_degree },
+            ep_degree,
+        )
+        .with_context(|| format!("model {:?} topology", m.name))?;
+        if ep_degree > 1 {
+            anyhow::bail!(
+                "model {:?}: expert_parallel_size = {ep_degree} needs the cuda engine's \
+                 lockstep ranks, which this build does not open yet",
+                m.name,
+            );
+        }
 
         #[allow(unreachable_patterns)]
         if tp_degree > 1 {
