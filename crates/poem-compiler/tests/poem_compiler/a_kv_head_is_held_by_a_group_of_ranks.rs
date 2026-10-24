@@ -35,14 +35,13 @@ fn a_kv_head_is_held_by_a_group_of_ranks() {
         }
     }
 
-    for name in ["layers.3.attn.k_proj", "layers.3.attn.v_proj"] {
-        let param = trace
-            .params
-            .iter()
-            .find(|p| p.name == name)
-            .unwrap_or_else(|| panic!("the row reads `{name}`"));
-        assert_eq!(param.shape, [256, 1024], "`{name}` is one head's rows");
-    }
+    // k and v are one product, a kv head each a rank.
+    let kv = trace
+        .params
+        .iter()
+        .find(|p| p.name == JOINED)
+        .unwrap_or_else(|| panic!("the row reads `{JOINED}`"));
+    assert_eq!(kv.shape, [256 + 256, 1024], "one k and one v head");
     let q = trace
         .params
         .iter()
@@ -54,6 +53,9 @@ fn a_kv_head_is_held_by_a_group_of_ranks() {
         "two query heads and their gates"
     );
 }
+
+/// The 0.8b's k and v, joined (its q states no heads, so stays apart).
+const JOINED: &str = "layers.3.attn.k_proj_v_proj";
 
 /// A rank's k projection is the share of the whole one its group reads: the
 /// four ranks read it in two groups of two.
@@ -90,9 +92,18 @@ fn the_contract_reads_a_kv_head_once_per_group() {
             .expr
             .clone()
     };
-    for name in ["layers.3.attn.k_proj", "layers.3.attn.v_proj"] {
-        assert_eq!(read(name), Expr::src(name).shard_among(0, 2), "`{name}`");
-    }
+    // The one k and one v head each read by a group of two.
+    let src = || Expr::src(JOINED);
+    assert_eq!(
+        read(JOINED),
+        Expr::concat(
+            0,
+            vec![
+                src().slice(0, 0, 2 * 256).shard_among(0, 2),
+                src().slice(0, 2 * 256, 2 * 256).shard_among(0, 2),
+            ]
+        ),
+    );
     assert_eq!(
         read("layers.3.attn.qg_proj"),
         Expr::src("layers.3.attn.qg_proj").shard(0),

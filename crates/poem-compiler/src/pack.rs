@@ -6,9 +6,10 @@
 //! into, so the trace and the artifact agree.
 //!
 //! What joins: products with no input scale (an operand, or a static plane
-//! beside the weight) and no logits head, each by a checkpoint
-//! weight of one segment cut along its rows that nothing else reads, under
-//! one guard and one layer, at one precision, the weights' planes alike.
+//! beside the weight) and no logits head, each by a checkpoint weight of one
+//! segment cut along its rows that nothing else reads, under one guard and
+//! one layer, at one precision, the weights' planes alike, each stating the
+//! heads it holds or none of them.
 //! Two such products a gated unit reads as its gate and its up become one
 //! packed unit; three whose last two are as wide (q, k, v) a split into
 //! three; two others a split into two. Anything else runs as written.
@@ -89,29 +90,20 @@ fn reads(trace: &Trace) -> Vec<u32> {
 }
 
 /// A param a join may take as a leg: a checkpoint weight on the device in
-/// its natural order, one segment cut along its rows, which every rank count
-/// a mesh splits by cuts once per rank (a leg of fewer heads than ranks is
-/// held by groups of ranks, which a joined weight's split cannot say). The
-/// join is the artifact's, so it holds on every mesh.
+/// its natural order, one segment cut along its rows.
 fn leg(param: &Param) -> bool {
-    let Shard::Cut {
-        axis: 0,
-        segments,
-        heads,
-    } = &param.shard
-    else {
-        return false;
-    };
-    let even = crate::catalog::RANKS.iter().all(|&world| {
-        Shard::parts(heads.first().copied(), u64::from(world))
-            .is_ok_and(|parts| parts == u64::from(world))
-    });
     param.source == ParamSource::Checkpoint
         && param.placement == ParamPlacement::Device
         && param.layout == ParamLayout::Natural
         && param.experts.is_none()
-        && segments.len() == 1
-        && even
+        && matches!(&param.shard, Shard::Cut { axis: 0, segments, .. } if segments.len() == 1)
+}
+
+/// Whether `param`'s cut states the heads its segment holds: legs that do
+/// join only with legs that do (a joined cut either holds each segment's
+/// heads whole or cuts every segment evenly).
+fn headed(param: &Param) -> bool {
+    matches!(&param.shard, Shard::Cut { heads, .. } if !heads.is_empty())
 }
 
 /// The planes stored beside the param named `name` (`name.scales`, ...),
@@ -178,7 +170,7 @@ fn groups(trace: &Trace) -> Vec<Group> {
             continue;
         }
         let key = format!(
-            "{}|{quant:?}|{:?}|{:?}|{}|{planes:?}|{:?}|{:?}|{:?}",
+            "{}|{quant:?}|{:?}|{:?}|{}|{planes:?}|{:?}|{:?}|{:?}|{}",
             act.0,
             param.dtype,
             &param.shape[1..],
@@ -186,6 +178,7 @@ fn groups(trace: &Trace) -> Vec<Group> {
             node.guard,
             node.layer,
             rows_of(&trace.values[y.0 as usize].ty),
+            headed(param),
         );
         keyed.entry(key).or_default().push(at);
     }
