@@ -422,6 +422,10 @@ impl Package {
             let m = self
                 .layout(id, deploy, &module, &mut eval)
                 .map_err(|e| illegible(format!("{e:#}")))?;
+            let stated = crate::star::paths::stated(m)
+                .iter()
+                .map(crate::import::stated)
+                .collect::<Result<Vec<_>, _>>()?;
             let formats = self
                 .required("formats")
                 .map_err(|e| illegible(format!("{e:#}")))?;
@@ -465,6 +469,7 @@ impl Package {
                     })
                     .collect::<Result<_, _>>()?;
                 let eval = &eval;
+                let stated = &stated;
                 let said = name.clone();
                 let reads =
                     move || -> Result<checkpoint::contract::ModelContract, crate::import::Error> {
@@ -486,6 +491,9 @@ impl Package {
                         let reads = crate::star::formats::READS
                             .with(|r| std::mem::take(&mut *r.borrow_mut()));
                         let mut b = crate::import::Builder::new(src, 1, platform);
+                        for t in stated {
+                            crate::star::formats::Read::Push(t.clone()).onto(&mut b)?;
+                        }
                         for read in reads {
                             read.onto(&mut b)?;
                         }

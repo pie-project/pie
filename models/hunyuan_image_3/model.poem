@@ -139,7 +139,9 @@ def layout(id, deploy):
             norm_out = group_norm(hw),
             conv_out = conv(LATENT_CHANNELS, hw, CONV3, banks),
         ),
-        ones = weight([2 * hidden, 1], banks),
+        # A column of ones over one of minus ones, the forward's spread of a
+        # special token's flag into its two halves.
+        ones = weight([2 * hidden, 1], banks, values = [1.0] * hidden + [-1.0] * hidden),
     )
 
 def generative(m):

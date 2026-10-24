@@ -53,6 +53,10 @@ dtype for them all or one a role, in order; `exact = True` asks for one a
 role. A `weight(shape)` stating no dtype computes at the deployment's
 compute dtype, the one its first stored dtype computes in, as norms and
 gates do.
+A weight that states its `values` (`weight([1], dtype.f32, values =
+[1000.0])`) is a table the model holds rather than reads, such as a VAE's
+latent statistics from its config: the importer lands it whatever the
+checkpoint holds, and no format names it.
 
 ## What a model says of its tokens
 

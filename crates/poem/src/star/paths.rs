@@ -114,3 +114,25 @@ fn walk<'v>(
     }
     v
 }
+
+/// The weights the layout `m` states the values of, each once.
+pub(crate) fn stated<'v>(m: Star<'v>) -> Vec<crate::Weight> {
+    fn gather<'v>(v: Star<'v>, out: &mut Vec<crate::Weight>) {
+        if let Some(w) = v.downcast_ref::<WeightValue>() {
+            if w.0.values.is_some() && !out.iter().any(|o| o.name == w.0.name) {
+                out.push(w.0.clone());
+            }
+        } else if let Some(s) = StructRef::from_value(v) {
+            s.iter().for_each(|(_, x)| gather(x, out));
+        } else if let Some(l) = ListRef::from_value(v) {
+            l.iter().for_each(|x| gather(x, out));
+        } else if let Some(t) = TupleRef::from_value(v) {
+            t.iter().for_each(|x| gather(x, out));
+        } else if let Some(d) = DictRef::from_value(v) {
+            d.iter().for_each(|(_, x)| gather(x, out));
+        }
+    }
+    let mut out = Vec::new();
+    gather(m, &mut out);
+    out
+}

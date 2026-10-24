@@ -28,9 +28,12 @@ pub(crate) fn layout(builder: &mut GlobalsBuilder) {
     /// A weight of `shape`, stored as `dtype` (a dtype, or a precision whose
     /// products quantize their activations), or, stating none, in the
     /// deployment's compute dtype. It is named by where the layout puts it.
+    /// A weight stating its `values` (row-major, as many as its shape holds)
+    /// holds them whatever the checkpoint does.
     fn weight<'v>(
         #[starlark(require = pos)] shape: UnpackList<u64>,
         #[starlark(require = pos)] dtype: Option<Value<'v>>,
+        #[starlark(require = named)] values: Option<UnpackList<UnpackFloat>>,
     ) -> anyhow::Result<WeightValue> {
         let stated = match dtype.filter(|d| !d.is_none()) {
             Some(dtype) => precision(dtype)?,
@@ -38,7 +41,19 @@ pub(crate) fn layout(builder: &mut GlobalsBuilder) {
                 anyhow::anyhow!("a weight states no dtype and its deployment computes in none")
             })?),
         };
-        Ok(WeightValue(Weight::at(String::new(), shape.items, stated)))
+        let mut w = Weight::at(String::new(), shape.items, stated);
+        if let Some(values) = values {
+            let held: u64 = w.shape.iter().product();
+            if values.items.len() as u64 != held {
+                anyhow::bail!(
+                    "a weight of shape {:?} holds {held} values, and states {}",
+                    w.shape,
+                    values.items.len()
+                );
+            }
+            w.values = Some(values.items.iter().map(|v| v.0 as f32).collect());
+        }
+        Ok(WeightValue(w))
     }
 
     /// The deployment's stated dtypes named as the layout reads them: one

@@ -166,6 +166,8 @@ ADALN_DIM = 256
 T_MID = 1024
 T_FREQ_DIM = 256
 TRAIN_STEPS = 1000
+# The timestep the forward flips its sigma about (`1000 - t`).
+T_FLIP = 1000.0
 ROPE_AXES = 3
 MOD_SLICES = 4
 RGB = 3
@@ -216,8 +218,12 @@ def block(d, modulated, banks):
         ),
     )
 
+# The latent's shift, which the VAE's diffusers config states and no
+# checkpoint tensor holds.
+SHIFT_FACTOR = 0.1159
+
 def vae_latent():
-    return struct(shift = weight([CHANNELS]))
+    return struct(shift = weight([CHANNELS], values = [SHIFT_FACTOR] * CHANNELS))
 
 def layout(id, deploy):
     banks = roles(deploy, "banks", exact = True).banks
@@ -246,7 +252,7 @@ def layout(id, deploy):
             cap_pad_mod = weight([2 * dim, 1]),
             t_mlp0 = linear(T_MID, T_FREQ_DIM, banks),
             t_mlp1 = linear(ADALN_DIM, T_MID, banks),
-            t_flip = weight([1], dtype.f32),
+            t_flip = weight([1], dtype.f32, values = [T_FLIP]),
             noise_refiner = blocks("noise", d.refiner_layers, True),
             context_refiner = blocks("context", d.refiner_layers, False),
             layers = blocks("layer", d.joint_layers, True),
