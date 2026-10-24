@@ -647,7 +647,7 @@ def leg_names(rows, path, l):
     for row in rows:
         if row[1].format(l = l) == path:
             names = [row[0]] if type(row[0]) == "string" else row[0]
-            return [name.format(l = l) for name in names]
+            return [name.replace("{l}", str(l)) for name in names]
     fail("`{}` is joined with weights no row of this format reads".format(path))
 
 def mapped_row(reads, m, row, l, quantized, rows):
@@ -660,10 +660,22 @@ def mapped_row(reads, m, row, l, quantized, rows):
     if j != None:
         if j.first:
             legs = [at_path(m, leg) for leg in j.legs]
-            joined_names = []
-            for leg in j.legs:
-                joined_names += leg_names(rows, leg, l)
-            weight(reads, join(legs, j.name), joined_names, quantized = quantized)
+            w = join(legs, j.name)
+            if len(w.shape) == 3:
+                # A bank: each expert's legs, every leg's own names.
+                per_leg = [leg_names(rows, leg, l) for leg in j.legs]
+                experts = []
+                for e in range(w.shape[0]):
+                    names = []
+                    for leg in per_leg:
+                        names += [name.replace("{e}", str(e)) for name in leg]
+                    experts.append(names)
+                bank(reads, w, experts)
+            else:
+                joined_names = []
+                for leg in j.legs:
+                    joined_names += leg_names(rows, leg, l)
+                weight(reads, w, joined_names, quantized = quantized)
         return
     w = at_path(m, path.format(l = l))
     if w == None:

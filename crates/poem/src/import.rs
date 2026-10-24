@@ -296,23 +296,31 @@ pub fn own_contract(
     Ok(b.build())
 }
 
-/// The tensors `names` hold one value: what legs joined into `of` read once.
-fn alike(src: &ztensor::Source, names: &[String], of: &str) -> Result<(), Error> {
-    let bytes = |name: &str| -> Option<Vec<u8>> {
-        src.tensor(name).ok()?.bytes().ok().map(|b| b.into_owned())
-    };
-    let first = bytes(&names[0]);
-    if let Some(differs) = names[1..].iter().find(|name| bytes(name) != first) {
-        return Err(Error::Illegible {
+/// One static input scale for legs joined into `of`, each stating its own
+/// (`names`, one f32 each): the first leg's where they agree, else the
+/// largest, under which no leg's activations overflow (as vLLM fuses them).
+fn input_scale(src: &ztensor::Source, names: &[String], of: &str) -> Result<Expr, Error> {
+    let value = |name: &str| -> Result<f32, Error> {
+        let bytes = src
+            .tensor(name)
+            .ok()
+            .and_then(|t| t.bytes().ok().map(|b| b.into_owned()))
+            .ok_or_else(|| Error::Missing(name.to_string()))?;
+        let word: [u8; 4] = bytes.as_slice().try_into().map_err(|_| Error::Illegible {
             name: of.to_string(),
-            detail: format!(
-                "`{}` and `{differs}` quantize the activation their joined product reads at two \
-                 static scales, and one product quantizes it once",
-                names[0]
-            ),
-        });
+            detail: format!("`{name}` is not one f32"),
+        })?;
+        Ok(f32::from_le_bytes(word))
+    };
+    let values = names
+        .iter()
+        .map(|n| value(n))
+        .collect::<Result<Vec<_>, _>>()?;
+    if values.iter().all(|v| v.to_bits() == values[0].to_bits()) {
+        return Ok(Expr::src(names[0].clone()));
     }
-    Ok(())
+    let largest = values.iter().copied().fold(f32::MIN, f32::max);
+    constant(of, &[largest], Vec::new(), checkpoint::types::DType::F32)
 }
 
 /// `contract` with the legs of `join` (each read as its own weight, its
@@ -393,10 +401,10 @@ pub fn join_read(
                     )),
                 })
                 .collect::<Result<_, _>>()?;
-            alike(src, &names, &join.name).map_err(|why| format!("{why}"))?;
+            let expr = input_scale(src, &names, &join.name).map_err(|why| format!("{why}"))?;
             made.push(TensorContract {
                 name: format!("{}{plane}", join.name),
-                expr: lead.expr.clone(),
+                expr,
                 ..lead.clone()
             });
             continue;
@@ -406,16 +414,20 @@ pub fn join_read(
             .map(|t| t.shape.clone())
             .collect::<Option<Vec<_>>>()
             .and_then(|shapes| {
+                let at = join.axis as usize;
                 let mut whole = shapes.first()?.clone();
-                *whole.first_mut()? = shapes
+                *whole.get_mut(at)? = shapes
                     .iter()
-                    .map(|s| s.first().copied())
+                    .map(|s| s.get(at).copied())
                     .sum::<Option<i64>>()?;
                 Some(whole)
             });
         made.push(TensorContract {
             name: format!("{}{plane}", join.name),
-            expr: Expr::concat(0, legs.iter().map(|t| Expr::out(t.name.clone())).collect()),
+            expr: Expr::concat(
+                u8::try_from(join.axis).unwrap_or(0),
+                legs.iter().map(|t| Expr::out(t.name.clone())).collect(),
+            ),
             shape,
             encoding: lead.encoding.clone(),
             scales: lead.scales.clone().map(|mut s| {
@@ -1811,7 +1823,7 @@ fn nv_planes(
             )
         })
         .collect();
-    alike(src, &inputs, &w.name)?;
+    let input_expr = input_scale(src, &inputs, &w.name)?;
     let counted = divided(
         &extents(w),
         pairing.channel_axis,
@@ -1837,7 +1849,7 @@ fn nv_planes(
         .offsetting(w.name.clone()),
         TensorContract::new(
             crate::input_scales_name(&w.name),
-            Expr::src(input),
+            input_expr,
             Vec::new(),
             f32_raw,
         ),
@@ -2836,7 +2848,11 @@ mod tests {
         };
         let rows = |value: f32| vec![value; LEG as usize];
         assert_eq!(f32s("proj.global_scales"), [rows(0.5), rows(2.0)].concat());
-        assert_eq!(f32s("proj.input_scales"), [0.25]);
+        assert_eq!(
+            f32s("proj.input_scales"),
+            [0.75],
+            "the larger of the legs' input scales"
+        );
         let codes = &sink.tensors["proj"];
         let half = (LEG * WIDTH / 2) as usize;
         assert!(codes[..half].iter().all(|b| *b == 1) && codes[half..].iter().all(|b| *b == 2));

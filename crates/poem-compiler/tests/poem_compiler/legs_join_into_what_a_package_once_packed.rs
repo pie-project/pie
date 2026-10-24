@@ -124,3 +124,93 @@ fn legs_join_into_what_a_package_once_packed() {
     let names: Vec<&str> = joins.iter().map(|j| j.name.as_str()).collect();
     assert_eq!(names, ["qkv", "qkv_bias", "gate_up"]);
 }
+
+const EXPERTS: u64 = 8;
+const TOP_K: u32 = 2;
+
+struct Banks {
+    embed: Weight,
+    router: Weight,
+    gate: Option<Weight>,
+    up: Option<Weight>,
+    gate_up: Option<Weight>,
+    down: Weight,
+    head: Weight,
+}
+
+impl ForwardHybrid for Banks {
+    fn caches(&self) -> HybridSpec {
+        HybridSpec::new()
+    }
+
+    fn forward(&self, inputs: Input) -> Value {
+        use ops::linear::{glu, matmul, moe_matmul_select, moe_route, moe_weighted_sum};
+        let x = ops::gather::embed(&inputs.tokens(), &self.embed, VOCAB);
+        let logits = matmul(&x, &self.router);
+        let (routes, weights) = moe_route(
+            &logits,
+            EXPERTS as u32,
+            TOP_K,
+            poem_ir::RouteScore::Softmax,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let act = match (&self.gate, &self.up, &self.gate_up) {
+            (Some(gate), Some(up), None) => {
+                let gate = moe_matmul_select(&x, gate, &routes, TOP_K);
+                let up = moe_matmul_select(&x, up, &routes, TOP_K);
+                glu(&gate, poem_ir::GluAct::Swiglu, None, Some(&up), None, None)
+            }
+            (None, None, Some(gate_up)) => {
+                let packed = moe_matmul_select(&x, gate_up, &routes, TOP_K);
+                glu(
+                    &packed,
+                    poem_ir::GluAct::Swiglu,
+                    Some(INTER as u32),
+                    None,
+                    None,
+                    None,
+                )
+            }
+            _ => unreachable!("a micro states its banks one way"),
+        };
+        let routed = moe_matmul_select(&act, &self.down, &routes, TOP_K);
+        let y = moe_weighted_sum(&routed, &weights);
+        ops::linear::lm_head(&y, &self.head)
+    }
+}
+
+/// A gate's bank and an up's selected over one route, apart, join into the
+/// packed bank a package once stated.
+#[test]
+fn routed_legs_join_into_one_bank() {
+    let bank = |name: &str, rows: u64| Weight::sym(name, [EXPERTS, rows, HIDDEN], Dtype::Bf16);
+    let banks = |gate: Option<Weight>, up: Option<Weight>, gate_up: Option<Weight>| Banks {
+        embed: embed(),
+        router: Weight::sym("router", [EXPERTS, HIDDEN], Dtype::Bf16),
+        gate,
+        up,
+        gate_up,
+        down: Weight::sym("down", [EXPERTS, HIDDEN, INTER], Dtype::Bf16).bank([HIDDEN]),
+        head: head(),
+    };
+    let apart = banks(
+        Some(bank("gate", INTER).bank([INTER])),
+        Some(bank("up", INTER).bank([INTER])),
+        None,
+    );
+    let packed = banks(
+        None,
+        None,
+        Some(bank("gate_up", 2 * INTER).bank([INTER, INTER])),
+    );
+    let joined = poem_compiler::pack::pack(trace_hybrid("moe", &apart, Platform::Cuda));
+    let want = trace_hybrid("moe", &packed, Platform::Cuda);
+    assert_eq!(canon::difference(&want, &joined), None);
+    let joins = poem_compiler::pack::joins(&trace_hybrid("moe", &apart, Platform::Cuda));
+    assert_eq!(joins.len(), 1);
+    assert_eq!((joins[0].name.as_str(), joins[0].axis), ("gate_up", 1));
+}
