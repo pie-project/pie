@@ -119,9 +119,10 @@ def indexer(n, d, dense, keys, proj = None):
     )
 
 def mlp(d, inter, proj):
-    """A clamped SwiGLU-OAI MLP `inter` wide, its gate and up packed."""
+    """A clamped SwiGLU-OAI MLP `inter` wide."""
     return struct(
-        gate_up = weight([2 * inter, d.hidden], proj).packed([inter, inter]),
+        gate = weight([inter, d.hidden], proj).columns(),
+        up = weight([inter, d.hidden], proj).columns(),
         down = weight([d.hidden, inter], proj).rows(),
         inter = inter,
         limit = d.swiglu_limit,
@@ -256,7 +257,8 @@ def read(m, reads):
         read_mlp(reads, f.shared, lambda leaf: moe("shared_experts." + leaf))
 
 def read_mlp(reads, f, n):
-    read_weight(reads, f.gate_up, [n("gate_proj.weight"), n("up_proj.weight")], quantized = "read")
+    read_weight(reads, f.gate, [n("gate_proj.weight")], quantized = "read")
+    read_weight(reads, f.up, [n("up_proj.weight")], quantized = "read")
     read_weight(reads, f.down, [n("down_proj.weight")], quantized = "read")
 
 # The forward of MiniMax-M3: pre-norm layers of GQA attention and a clamped
@@ -292,12 +294,8 @@ def forward(m, inputs):
     return ops.linear.lm_head(x, m.head)
 
 def swiglu_oai(x, f):
-    act = ops.linear.glu(
-        ops.linear.matmul(x, f.gate_up),
-        gating.swiglu_alpha(f.alpha),
-        f.inter,
-        limit = f.limit,
-    )
+    gate, up = ops.linear.matmul(x, f.gate), ops.linear.matmul(x, f.up)
+    act = ops.linear.glu(gate, gating.swiglu_alpha(f.alpha), up = up, limit = f.limit)
     return ops.linear.matmul(act, f.down)
 
 def moe(x, f):
