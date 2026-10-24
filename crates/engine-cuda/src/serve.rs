@@ -56,6 +56,9 @@ pub struct Shell {
     /// This rank's part of an expert-parallel group, once the group wires
     /// it after every rank has loaded.
     ep: Option<crate::ep::EpRank>,
+    /// The token bucket the next fire composes at, where its group agreed
+    /// one: taken by that fire.
+    forced_bucket: Option<u32>,
     budget: Budget,
     patch_seat: Option<crate::inputs::PatchSeat>,
     mrope_seat: bool,
@@ -148,6 +151,32 @@ impl Shell {
     /// Joins this rank to its expert-parallel group.
     pub fn join_ep(&mut self, ep: crate::ep::EpRank) {
         self.ep = Some(ep);
+    }
+
+    /// The next fire composes at token bucket `bucket`, the one its
+    /// expert-parallel group agreed for the step.
+    pub fn at_bucket(&mut self, bucket: u32) {
+        self.forced_bucket = Some(bucket);
+    }
+
+    /// An expert-parallel rank's step with no lanes of its own, at the
+    /// group's `bucket`: the walk runs only the dispatches, the experts over
+    /// the rows the other ranks send, and the combines.
+    pub fn fire_idle(&mut self, bucket: u32) -> Result<()> {
+        self.at_bucket(bucket);
+        let prepared = FrameShell::prepare(
+            self,
+            StepView {
+                lanes: &[],
+                attachments: &[],
+                media: &[],
+                voxels: &[],
+            },
+            None,
+        )?;
+        let enqueued = FrameShell::enqueue(self, prepared)?;
+        FrameShell::settle(self, enqueued)?;
+        Ok(())
     }
 
     /// What the trace dispatches, for wiring the group.

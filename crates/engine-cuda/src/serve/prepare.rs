@@ -1,6 +1,6 @@
 use engine::fire::{Boundary, FoldLen, Masking, RsReset, RsVerb};
 use engine::frame::{Demand, Shell as FrameShell};
-use poem_exec::fire::{FireDescriptor, Lane as FireLane, compose_axes};
+use poem_exec::fire::{FireDescriptor, Lane as FireLane, compose_axes_at};
 
 use crate::error::{Fault, Result};
 use crate::record;
@@ -408,7 +408,8 @@ impl FrameShell for Shell {
                 ),
             })
             .collect();
-        let composition = compose_axes(&self.compiled, &self.budgets, &submitted)?;
+        let at = self.forced_bucket.take();
+        let composition = compose_axes_at(&self.compiled, &self.budgets, &submitted, at)?;
         let mut readout_rows: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut readout_first = vec![0u32; lanes.len()];
         let mut readout_count = vec![0u32; lanes.len()];

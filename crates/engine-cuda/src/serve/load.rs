@@ -893,6 +893,7 @@ impl Shell {
             trace: boot.trace,
             compiled,
             ep: None,
+            forced_bucket: None,
             budget: budgets.tokens.clone(),
             budgets,
             patch_seat,
