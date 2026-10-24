@@ -30,8 +30,12 @@ struct Planes {
 // element past the row (`!valid(e)`) reads garbage and is never stored; a
 // body keeps it out of its reductions. A parameter whose bit `ONES` sets is
 // one element every row reads (a layer's scale), read once and named
-// `one(k)`; its plane is never read as a row.
-template <int BLOCK, int PER, int IN, int OUT, unsigned ONES = 0u>
+// `one(k)`; its plane is never read as a row. With `READ_ONLY` no result
+// lands over a parameter, so the parameters are read through the read-only
+// path (`ld.global.nc`), as a hand kernel reads its `const __restrict__`
+// rows; a frame that sums a stream in place (a parameter's plane also a
+// result's) reads them as plain loads.
+template <int BLOCK, int PER, int IN, int OUT, unsigned ONES = 0u, bool READ_ONLY = false>
 struct RowFrame {
     static constexpr int N = PER * 8;
 
@@ -65,7 +69,7 @@ struct RowFrame {
 #pragma unroll
             for (int p = 0; p < PER; ++p) {
                 const int i = tid + p * BLOCK;
-                if (i < vectors) in[k][p] = src[i];
+                if (i < vectors) in[k][p] = READ_ONLY ? __ldg(src + i) : src[i];
             }
         }
     }
@@ -117,7 +121,7 @@ struct RowFrame {
 // A row frame a block a row: `body(f)` computes the row in hooks over `f`,
 // its own fields (a norm's eps) passed by value. The rows past a staged
 // window's live count are left as they are.
-template <class Body, int BLOCK, int PER, int IN, int OUT, unsigned ONES = 0u>
+template <class Body, int BLOCK, int PER, int IN, int OUT, unsigned ONES = 0u, bool READ_ONLY = false>
 __global__ void __launch_bounds__(BLOCK) row_frame(
     const Planes<IN, OUT> planes,
     const Body body,
@@ -132,7 +136,7 @@ __global__ void __launch_bounds__(BLOCK) row_frame(
     const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
 
     __shared__ float buf[BLOCK / 32 + 1];
-    RowFrame<BLOCK, PER, IN, OUT, ONES> f(planes, plane_row, buf);
+    RowFrame<BLOCK, PER, IN, OUT, ONES, READ_ONLY> f(planes, plane_row, buf);
     body(f);
 }
 

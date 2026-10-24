@@ -175,7 +175,7 @@ pub fn synth(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Synthes
     Ok(Synthesized {
         kernel: crate::jit::generated(
             root,
-            &frame::entrypoint(BODY, per, ins.len(), outs, ones),
+            &frame::entrypoint(BODY, per, ins.len(), outs, ones, true),
         ),
         ins: ins.len(),
         outs,
@@ -233,8 +233,8 @@ impl Synthesized {
     /// (`ctx.stage()`) where one is armed: `ins[k]` is the region's
     /// parameter `k` and `outs[k]` its result `k`, each a 16-byte aligned
     /// bf16 plane (a scalar parameter's, [`In::One`], its one element, any
-    /// alignment). Refused unless [`Synthesized::load`] loaded it on this
-    /// device.
+    /// alignment), no result over a parameter. Refused unless
+    /// [`Synthesized::load`] loaded it on this device.
     pub fn fire(self, ctx: &Ctx, ins: &[Plane], outs: &[Plane], rows: u32) -> Result<(), Error> {
         if ins.len() != self.ins || outs.len() != self.outs {
             return Err(refuse(
@@ -247,6 +247,15 @@ impl Synthesized {
                     ins.len(),
                     outs.len()
                 ),
+            ));
+        }
+        // The frame reads its parameters through the read-only path, so no
+        // result may land over one.
+        if outs.iter().any(|out| ins.iter().any(|input| input.base() == out.base())) {
+            return Err(refuse(
+                OP,
+                "a result lands over a parameter, and a generated kernel reads its parameters \
+                 read-only",
             ));
         }
         if !self.kernel.is_loaded() {

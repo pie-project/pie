@@ -161,26 +161,28 @@ fn the_hand_body_through_synth_lands_the_register_kernels_bits() {
             let n = rows * width;
             let (planes, w) = draw(rows, width, 2);
             let mut gpu = Gpu::open();
-            let (x, y, w, out) = (
+            let (x, y, w, h, out) = (
                 gpu.up(&planes[0]),
                 gpu.up(&planes[1]),
                 gpu.up(&w),
                 gpu.zeros(n * 2),
+                gpu.zeros(n * 2),
             );
             let plane = |at| Plane::rows(&ten(at, rows, width, Bf16));
-            // The stream summed in place, as the hand kernel sums it.
+            // The stream into a plane of its own: a generated kernel reads
+            // its parameters read-only, so no result lands over one.
+            let ins = [plane(x), plane(y), Plane::shared(&ten(w, 1, width, Bf16))];
+            let refused = kernel
+                .fire(&gpu.ctx(), &ins, &[plane(out), plane(y)], rows as u32)
+                .expect_err("a result over a parameter is refused");
+            assert!(refused.to_string().contains("over a parameter"), "{refused}");
             kernel
-                .fire(
-                    &gpu.ctx(),
-                    &[plane(x), plane(y), Plane::shared(&ten(w, 1, width, Bf16))],
-                    &[plane(out), plane(y)],
-                    rows as u32,
-                )
+                .fire(&gpu.ctx(), &ins, &[plane(out), plane(h)], rows as u32)
                 .expect("the hand body fires");
             gpu.sync();
             let (y_want, out_want) = hand_residual_norm(rows, width);
             let case = format!("{rows} rows of {width}");
-            assert!(gpu.down::<u16>(y, n) == y_want, "{case}: the summed stream");
+            assert!(gpu.down::<u16>(h, n) == y_want, "{case}: the summed stream");
             assert!(
                 gpu.down::<u16>(out, n) == out_want,
                 "{case}: the normed row"
@@ -399,10 +401,11 @@ fn a_kernel_never_loaded_is_refused_at_its_fire() {
     let kernel = synth::synth(&body_of(&region, &[]), &[In::Rows(Bf16); 2], 1, width as u32)
         .expect("synthesized");
     let mut gpu = Gpu::open();
-    let at = gpu.zeros(width * 2);
+    let (at, to) = (gpu.zeros(width * 2), gpu.zeros(width * 2));
     let plane = Plane::rows(&ten(at, 1, width, Bf16));
+    let out = Plane::rows(&ten(to, 1, width, Bf16));
     let refused = kernel
-        .fire(&gpu.ctx(), &[plane, plane], &[plane], 1)
+        .fire(&gpu.ctx(), &[plane, plane], &[out], 1)
         .expect_err("a fire does not load a module");
     assert!(refused.to_string().contains("not loaded"), "{refused}");
 }

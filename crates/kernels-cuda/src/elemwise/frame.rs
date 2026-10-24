@@ -50,6 +50,12 @@ impl Plane {
             row_stride: 0,
         }
     }
+
+    /// The plane's first element.
+    #[must_use]
+    pub const fn base(&self) -> u64 {
+        self.base
+    }
 }
 
 /// The vectors of 8 a thread holds of each plane of a `width`-wide row, or
@@ -73,12 +79,23 @@ pub(crate) fn per(op: &'static str, width: u32) -> Result<u32, Error> {
 
 /// The frame's kernel around `body` (a type the unit defines) for `ins`
 /// parameters and `outs` results, `per` vectors a thread, the parameters
-/// `ones` sets (by bit) read as one element.
-pub(crate) fn entrypoint(body: &str, per: u32, ins: usize, outs: usize, ones: u32) -> String {
-    if ones == 0 {
+/// `ones` sets (by bit) read as one element. A `read_only` frame's results
+/// land over none of its parameters, so it reads them through the
+/// read-only path.
+pub(crate) fn entrypoint(
+    body: &str,
+    per: u32,
+    ins: usize,
+    outs: usize,
+    ones: u32,
+    read_only: bool,
+) -> String {
+    if ones == 0 && !read_only {
         format!("::pie::elemwise::row_frame<{body}, {BLOCK}, {per}, {ins}, {outs}>")
     } else {
-        format!("::pie::elemwise::row_frame<{body}, {BLOCK}, {per}, {ins}, {outs}, {ones}u>")
+        format!(
+            "::pie::elemwise::row_frame<{body}, {BLOCK}, {per}, {ins}, {outs}, {ones}u, {read_only}>"
+        )
     }
 }
 
@@ -154,7 +171,7 @@ pub fn residual_add_rmsnorm(
     fire(
         ctx,
         OP,
-        kernel(FRAME, &entrypoint(&body, per, 3, 2, 0)),
+        kernel(FRAME, &entrypoint(&body, per, 3, 2, 0, false)),
         eps.arg(),
         &[Plane::rows(&x), Plane::rows(y), Plane::shared(&weight)],
         &[Plane::rows(out), Plane::rows(y)],
