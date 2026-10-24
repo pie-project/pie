@@ -31,6 +31,8 @@ impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         match op {
             _ if refuses(op) => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+            // A synthesized region's body is not launched here yet.
+            Fused::Region { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             Fused::GdnStep { .. }
             | Fused::QGateNormRopeAppend {
                 intermediates: Intermediates::Written,
