@@ -1585,8 +1585,9 @@ impl ProcessCtx {
             } else {
                 (vec![self.mint_scratch_working_set()?], Vec::new())
             };
+            // The pass binds on the engine its working sets live on.
+            let engine = super::working_set::kv_of(self, kv_lanes[0])?.engine;
             let (devgeo, decode_envelope, geometry_class) = if state.is_some() {
-                let engine = super::working_set::kv_of(self, kv_lanes[0])?.engine;
                 let device_port_mask = crate::engine::get_spec(engine)?.device_geometry_port_mask;
                 let needs_mask_port = prog.bound.container.ports.iter().any(|binding| {
                     matches!(binding.port, eta_ir::registry::Port::AttnMask)
@@ -1769,7 +1770,7 @@ impl ProcessCtx {
             let process_id = self.id();
             let (registered, bound_instance, scheduler) =
                 match crate::scheduler::register_channels_bind_classified(
-                    0,
+                    engine,
                     Some(process_id),
                     registration_plans,
                     program_registration,
