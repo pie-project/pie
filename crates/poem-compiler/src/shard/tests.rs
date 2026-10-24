@@ -106,3 +106,62 @@ fn a_whole_projection_reads_its_share_gathered() {
 
 /// The blocks of GLM-5.3-Flash's vision tower.
 const GLM_TOWER_BLOCKS: usize = 24;
+
+/// A padded q, k and v split shards by its heads: MiMo's FP8 rows, whose qkv
+/// is stored unpadded, split eight ways run every one-rank op, each padded
+/// split taking apart its rank's share (a query head in eight, a kv head a
+/// group of ranks shares), and add nothing but the collectives.
+#[test]
+fn a_padded_qkv_split_takes_apart_each_ranks_heads() {
+    const WORLD: u64 = 8;
+    let split = crate::catalog::deployment("mimo26-flash-mini-e4m3g128a8-mxfp4a8-kv-bf16-tp8")
+        .expect("the catalog ships the row")
+        .trace(Platform::Cuda);
+    let whole = crate::catalog::deployment("mimo26-flash-mini-e4m3g128a8-mxfp4a8-kv-bf16")
+        .expect("the one-rank row")
+        .trace(Platform::Cuda);
+    let ops = |trace: &poem_ir::Trace| {
+        let mut names: Vec<&str> = trace
+            .nodes
+            .iter()
+            .map(|node| poem_ir::Operands::name(&node.op))
+            .filter(|name| !name.starts_with("collective."))
+            .collect();
+        names.sort_unstable();
+        names
+    };
+    assert_eq!(ops(&split), ops(&whole), "every op but the collectives");
+    let padded = |trace: &poem_ir::Trace| -> Vec<([u32; 2], [u32; 2], u32)> {
+        trace
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                poem_ir::Operation::Gather(poem_ir::Gather::SplitQkvPadded {
+                    heads,
+                    widths,
+                    head_dim,
+                    ..
+                }) => Some((*heads, *widths, *head_dim)),
+                _ => None,
+            })
+            .collect()
+    };
+    let (split, whole) = (padded(&split), padded(&whole));
+    assert!(!whole.is_empty(), "the FP8 rows split q, k and v padded");
+    assert_eq!(split.len(), whole.len());
+    for ((heads, widths, head_dim), (all, all_widths, all_dim)) in split.iter().zip(&whole) {
+        let kv_parts =
+            poem_ir::Shard::parts(Some(u64::from(all[1])), WORLD).expect("kv heads split");
+        assert_eq!(
+            u64::from(heads[0]),
+            u64::from(all[0]) / WORLD,
+            "a rank's query heads"
+        );
+        assert_eq!(
+            u64::from(heads[1]),
+            u64::from(all[1]) / kv_parts,
+            "a rank's kv heads"
+        );
+        assert_eq!((widths, head_dim), (all_widths, all_dim));
+    }
+}

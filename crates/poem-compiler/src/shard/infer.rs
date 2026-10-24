@@ -42,7 +42,11 @@ const PLANES: [&str; 4] = [
 
 /// Ops that unpack one packed share into the pieces their outputs are, in
 /// order.
-const UNPACKS: [&str; 2] = ["gather.split_qkv", "gather.split_rows"];
+const UNPACKS: [&str; 3] = [
+    "gather.split_qkv",
+    "gather.split_qkv_padded",
+    "gather.split_rows",
+];
 
 /// Per-head ops affine in what they follow, which a partial sum reaches
 /// as it does a sum: reduced first, no pair recut for it.
@@ -682,7 +686,13 @@ impl<'r, 't> Walk<'r, 't> {
             && let [(_, v)] = followed[..]
             && let Some(o) = self.whole_run(v)
         {
-            let widths: Option<Vec<u64>> = outs.iter().map(|o| self.width(*o)).collect();
+            let widths = padded_qkv(t)
+                .map(|pieces| pieces.iter().map(|(w, _)| *w).collect())
+                .or_else(|| {
+                    outs.iter()
+                        .map(|o| self.width(*o))
+                        .collect::<Option<Vec<u64>>>()
+                });
             if let Some(widths) = widths
                 && widths.iter().sum::<u64>() == o.hi - o.lo
             {
@@ -823,6 +833,10 @@ impl<'r, 't> Walk<'r, 't> {
                 vec![(width, int("heads"))]
             }
             ("linear.glu", "packed") => vec![(width / 2, None); 2],
+            ("gather.split_qkv_padded", "packed") => padded_qkv(t)
+                .map_or_else(Vec::new, |pieces| {
+                    pieces.into_iter().map(|(w, h)| (w, Some(h))).collect()
+                }),
             _ => match head_dim {
                 Some(d) if width.is_multiple_of(d) => vec![(width, Some(width / d))],
                 _ => Vec::new(),
@@ -939,6 +953,27 @@ impl<'r, 't> Walk<'r, 't> {
             }
         }
     }
+}
+
+/// The runs a padded q, k and v split takes its packed input apart into, as
+/// stored (each head its own width, before the op pads it), and the heads
+/// of each: its `heads` are q's and kv's, its `widths` a q or k head's and a
+/// v head's.
+fn padded_qkv(t: &Tree) -> Option<Vec<(u64, u64)>> {
+    let pair = |name: &str| match tree::field(t, name) {
+        Some(Tree::Seq(items)) => match items[..] {
+            [Tree::Int(a), Tree::Int(b)] => Some((u64::try_from(a).ok()?, u64::try_from(b).ok()?)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let (q_heads, kv_heads) = pair("heads")?;
+    let (qk, v) = pair("widths")?;
+    Some(vec![
+        (q_heads * qk, q_heads),
+        (kv_heads * qk, kv_heads),
+        (kv_heads * v, kv_heads),
+    ])
 }
 
 /// The column cuts whose shares `helds` are.
