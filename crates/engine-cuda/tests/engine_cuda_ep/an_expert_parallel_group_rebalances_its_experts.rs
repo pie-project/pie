@@ -47,16 +47,19 @@ fn check(replicas: u32) {
             .collect()
     };
 
-    let boot = || {
+    // A rank a device where there are enough, so the rebalance reaches
+    // each rank's loads and table on the device that holds them.
+    let apart = engine_cuda::device::count() >= RANKS as usize;
+    let boot = |rank: i32| {
         let mut boot = DeviceBoot {
-            ordinal: 0,
+            ordinal: if apart { rank } else { 0 },
             ..DeviceBoot::default()
         };
         boot.knobs.expert_rebalance_steps = Some(1);
         boot.knobs.expert_load_window = Some(1);
         boot
     };
-    let mut ranks = engine_cuda::lockstep::open_lockstep(vec![boot(), boot()], contract_for)
+    let mut ranks = engine_cuda::lockstep::open_lockstep(vec![boot(0), boot(1)], contract_for)
         .expect("the group opens");
     let (dir, path) = checkpoint(&whole, &format!("rebalance-group-{replicas}"));
     std::thread::scope(|scope| {
