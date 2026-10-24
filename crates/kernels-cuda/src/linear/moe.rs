@@ -1,5 +1,7 @@
 mod combine;
 mod experts;
+#[cfg(feature = "cuda")]
+mod mega;
 mod route;
 mod select;
 #[cfg(feature = "cuda")]
@@ -9,6 +11,8 @@ mod select_fp8;
 
 pub use combine::*;
 pub use experts::*;
+#[cfg(feature = "cuda")]
+pub use mega::*;
 pub use route::*;
 pub use select::*;
 #[cfg(feature = "cuda")]

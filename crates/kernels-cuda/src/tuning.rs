@@ -170,6 +170,13 @@ pub struct SsmKdaStepFused;
 /// weighted sum with (its GLU landing the down leg's e4m3 operand from the
 /// gate-up epilogue); never (65 536 past any fire) but where a chip's
 /// profile says (B200's).
+/// The most routes a routed MLP runs as the mega-MoE (`linear::moe::mega`:
+/// the gate-up product, GLU, down product and fold in one persistent
+/// launch); none (0) but where a chip's profile says (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mega_until", constant(range(0..=2048)), default = 0, tune = search)]
+pub struct MoeMegaUntil(pub u32);
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.w4a8_fused_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
 pub struct MoeW4a8FusedFrom(pub u32);
@@ -812,6 +819,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmBiasEpilogue>()
         .add::<MoeW4a4FusedFrom>()
         .add::<MoeW4a8FusedFrom>()
+        .add::<MoeMegaUntil>()
         .add::<MlaExpandedFrom>()
         .add::<GemmFp8GemvUntil>()
         .add::<GemmFp8Shadow>()
@@ -947,6 +955,7 @@ tuning! {
     gemm_bias_epilogue: bool = false, on GemmBiasEpilogue;
     moe_w4a4_fused_from: u32 = 65_536, get MoeW4a4FusedFrom;
     moe_w4a8_fused_from: u32 = 65_536, get MoeW4a8FusedFrom;
+    moe_mega_until: u32 = 0, get MoeMegaUntil;
     mla_expanded_from: u32 = 65_536, get MlaExpandedFrom;
     gemm_fp8_gemv_until: u32 = 0, get GemmFp8GemvUntil;
     gemm_fp8_shadow: bool = false, on GemmFp8Shadow;
