@@ -19,6 +19,11 @@ pub struct CudaEngineOptions {
     pub verbose: bool,
     pub diagnostics: Option<String>,
     pub nccl_transport: Option<String>,
+    /// An expert-parallel group rebalances its experts across its ranks
+    /// every this many steps (0: never), from the loads of the last
+    /// `expert_load_window` steps.
+    pub expert_rebalance_steps: Option<u32>,
+    pub expert_load_window: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
