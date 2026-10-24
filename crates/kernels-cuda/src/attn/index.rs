@@ -7,9 +7,13 @@ use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, kernel
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 #[cfg(feature = "cuda")]
 use logits::{TC5_FROM, ranked_tc5};
+#[cfg(feature = "cuda")]
+use logits_fp4::ranked_fp4;
 
 #[cfg(feature = "cuda")]
 mod logits;
+#[cfg(feature = "cuda")]
+mod logits_fp4;
 
 const INDEX: &str = "attn/index/index.cu";
 
@@ -425,71 +429,28 @@ pub fn topk_tokens(
     )
 }
 
+/// A ranking's shape, checked, and its scores scratch: a row's blocks
+/// `score_stride` apart, at most one a `ratio` positions it sees.
+struct Scored {
+    num_requests: i32,
+    ratio: i32,
+    score_stride: i32,
+    scores: u64,
+}
+
 #[allow(clippy::too_many_arguments)]
-fn ranked(
+fn scored(
     ctx: &Ctx,
     q: RaggedTensor,
     weights: Option<Tensor>,
     keys: &KvPool,
-    heads: u32,
-    head_dim: u32,
-    top_k: u32,
+    heads: i32,
+    head_dim: i32,
+    top_k: i32,
     ratio: u32,
-    turn: Option<QueryTurn>,
-    selection: &mut Tensor,
-) -> Result<bool, Error> {
+    selection: &Tensor,
+) -> Result<Scored, Error> {
     const OP: &str = "attn.index_topk";
-    dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
-    debug_assert_eq!(selection.dtype, Dtype::I32, "`{OP}` writes i32 page ids");
-    let heads = count(OP, "the head count this ranking states", heads)?;
-    let head_dim = count(OP, "the key width this ranking states", head_dim)?;
-    let top_k = count(OP, "the selection budget this ranking states", top_k)?;
-
-    // DeepSeek-V4.1's FP4 keys, read against its queries read at FP4: by
-    // the tensor-core scorer as they are, where it takes the shape and the
-    // tcgen05 one does not; else widened to bf16 pages for the others.
-    let fp4 = fp4_keys(keys);
-    let q = if fp4 {
-        if turn.is_some() || head_dim != 128 {
-            return Ok(false);
-        }
-        let q = fp4_queries(ctx, OP, q)?;
-        #[cfg(feature = "cuda")]
-        let tc5 = ctx.tuning().index_tc5 && selection.rows >= TC5_FROM;
-        #[cfg(not(feature = "cuda"))]
-        let tc5 = false;
-        if !(ctx.tuning().index_mma && heads <= 64) || tc5 {
-            let staged = stage_fp4(ctx, OP, keys)?;
-            return ranked(
-                ctx,
-                q,
-                weights,
-                &staged,
-                heads.unsigned_abs(),
-                head_dim.unsigned_abs(),
-                top_k.unsigned_abs(),
-                ratio,
-                None,
-                selection,
-            );
-        }
-        q
-    } else {
-        if !crate::attn::compressed::pool::compact(keys, ratio.max(1), i64::from(head_dim)) {
-            pool_pitch(OP, keys, head_dim)?;
-        }
-        q
-    };
-    // The keys a row each (`page_size / ratio` a page) in a compact pool.
-    let compact = crate::attn::compressed::pool::compact(
-        keys,
-        ratio.max(1),
-        if fp4 {
-            i64::from(FP4_ROW)
-        } else {
-            i64::from(head_dim)
-        },
-    );
     let q_width = stated(OP, q.data.width)?;
     if q_width != heads.saturating_mul(head_dim) {
         return Err(refuse(
@@ -533,6 +494,113 @@ fn ranked(
             .saturating_mul(score_stride as usize)
             .saturating_mul(core::mem::size_of::<f32>()),
     )?;
+    Ok(Scored {
+        num_requests,
+        ratio,
+        score_stride,
+        scores: scores as usize as u64,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ranked(
+    ctx: &Ctx,
+    q: RaggedTensor,
+    weights: Option<Tensor>,
+    keys: &KvPool,
+    heads: u32,
+    head_dim: u32,
+    top_k: u32,
+    ratio: u32,
+    turn: Option<QueryTurn>,
+    selection: &mut Tensor,
+) -> Result<bool, Error> {
+    const OP: &str = "attn.index_topk";
+    dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
+    debug_assert_eq!(selection.dtype, Dtype::I32, "`{OP}` writes i32 page ids");
+    let heads = count(OP, "the head count this ranking states", heads)?;
+    let head_dim = count(OP, "the key width this ranking states", head_dim)?;
+    let top_k = count(OP, "the selection budget this ranking states", top_k)?;
+
+    // DeepSeek-V4.1's FP4 keys, read against its queries read at FP4: on
+    // tcgen05's block-scaled MMA as they are, where the profile says
+    // (`kernel.sdpa.index_fp4_tc5`) and the pool lands as it reads; by the
+    // tensor-core scorer widened as they load, where it takes the shape and
+    // the tcgen05 one does not; else widened to bf16 pages for the others.
+    let fp4 = fp4_keys(keys);
+    let q = if fp4 {
+        if turn.is_some() || head_dim != 128 {
+            return Ok(false);
+        }
+        #[cfg(feature = "cuda")]
+        if ctx.tuning().index_fp4_tc5 && heads <= 64 {
+            let compact =
+                crate::attn::compressed::pool::compact(keys, ratio.max(1), i64::from(FP4_ROW));
+            let s = scored(
+                ctx, q, weights, keys, heads, head_dim, top_k, ratio, selection,
+            )?;
+            if ranked_fp4(
+                ctx,
+                q,
+                weights,
+                keys,
+                heads,
+                top_k,
+                s.ratio,
+                s.score_stride,
+                s.scores,
+                s.num_requests,
+                compact,
+                selection,
+            )? {
+                return Ok(true);
+            }
+        }
+        let q = fp4_queries(ctx, OP, q)?;
+        #[cfg(feature = "cuda")]
+        let tc5 = ctx.tuning().index_tc5 && selection.rows >= TC5_FROM;
+        #[cfg(not(feature = "cuda"))]
+        let tc5 = false;
+        if !(ctx.tuning().index_mma && heads <= 64) || tc5 {
+            let staged = stage_fp4(ctx, OP, keys)?;
+            return ranked(
+                ctx,
+                q,
+                weights,
+                &staged,
+                heads.unsigned_abs(),
+                head_dim.unsigned_abs(),
+                top_k.unsigned_abs(),
+                ratio,
+                None,
+                selection,
+            );
+        }
+        q
+    } else {
+        if !crate::attn::compressed::pool::compact(keys, ratio.max(1), i64::from(head_dim)) {
+            pool_pitch(OP, keys, head_dim)?;
+        }
+        q
+    };
+    // The keys a row each (`page_size / ratio` a page) in a compact pool.
+    let compact = crate::attn::compressed::pool::compact(
+        keys,
+        ratio.max(1),
+        if fp4 {
+            i64::from(FP4_ROW)
+        } else {
+            i64::from(head_dim)
+        },
+    );
+    let Scored {
+        num_requests,
+        ratio,
+        score_stride,
+        scores,
+    } = scored(
+        ctx, q, weights, keys, heads, head_dim, top_k, ratio, selection,
+    )?;
 
     #[cfg(feature = "cuda")]
     if ctx.tuning().index_tc5
@@ -550,7 +618,7 @@ fn ranked(
             ratio,
             turn,
             score_stride,
-            scores as usize as u64,
+            scores,
             num_requests,
             compact,
             selection,
@@ -633,7 +701,7 @@ fn ranked(
             keys.page_indices.arg(),
             keys.page_indptr.arg(),
             keys.last_page_lens.arg(),
-            ArgValue::Ptr(scores as usize as u64),
+            ArgValue::Ptr(scores),
             selection.arg(),
             num_requests.arg(),
             heads.arg(),

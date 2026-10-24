@@ -292,6 +292,18 @@ __device__ __forceinline__ u64 sdesc_sw128(u32 saddr) {
     return d;
 }
 
+// As sdesc_sw128 for the 64-byte swizzle: rows of 64 bytes (128 packed
+// e2m1), 8-row atoms 512 bytes apart, the tile 512-aligned.
+__device__ __forceinline__ u64 sdesc_sw64(u32 saddr) {
+    u64 d = 0;
+    d |= static_cast<u64>((saddr & 0x3FFFFu) >> 4);
+    d |= static_cast<u64>(1) << 16;
+    d |= static_cast<u64>(512 >> 4) << 32;
+    d |= static_cast<u64>(1) << 46;
+    d |= static_cast<u64>(4) << 61;  // SWIZZLE_64B
+    return d;
+}
+
 // Descriptor tcgen05.cp reads a scale atom through: unswizzled rows of 16
 // bytes, 8-row core matrices 128 bytes apart.
 __device__ __forceinline__ u64 sdesc_sf(u32 saddr) {
@@ -308,7 +320,7 @@ enum : u32 {
     kE4M3 = 0,     // kind::f8f6f4 / mxf8f6f4
     kE5M2 = 1,
     kE2M1 = 5,     // kind::f8f6f4 / mxf8f6f4, unpacked in shared memory
-    kNvE2M1 = 1,   // kind::mxf4nvf4, packed
+    kNvE2M1 = 1,   // kind::mxf4 / mxf4nvf4, packed
 };
 
 // Instruction descriptor, dense kinds (f16, f8f6f4): f32 accumulator,
@@ -371,6 +383,17 @@ __device__ __forceinline__ void mma_nvf4(u32 d, u64 a, u64 b, u32 idesc, bool ac
                                          u32 sfb) {
     PIE_TC5_GROUP(G, PIE_TC5_MMA_HEAD,
                   ".kind::mxf4nvf4.block_scale.block16 [%0], %1, %2, %3, [%5], [%6], p;\n\t}",
+                  ::"r"(d), "l"(a), "l"(b), "r"(idesc), "r"(static_cast<u32>(acc)), "r"(sfa),
+                  "r"(sfb))
+}
+
+// MXFP4: packed e2m1, one ue8m0 scale per 32 K of each row; an MMA's K of
+// 64 reads two bytes of each scale column from its scale id on.
+template <int G = 1>
+__device__ __forceinline__ void mma_mxf4(u32 d, u64 a, u64 b, u32 idesc, bool acc, u32 sfa,
+                                         u32 sfb) {
+    PIE_TC5_GROUP(G, PIE_TC5_MMA_HEAD,
+                  ".kind::mxf4.block_scale.block32 [%0], %1, %2, %3, [%5], [%6], p;\n\t}",
                   ::"r"(d), "l"(a), "l"(b), "r"(idesc), "r"(static_cast<u32>(acc)), "r"(sfa),
                   "r"(sfb))
 }
