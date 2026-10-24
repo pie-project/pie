@@ -6,7 +6,7 @@ use crate::attn::fa2::{self, RaggedArm, RaggedPoint};
 use crate::attn::kv;
 use crate::attn::plan::Device;
 use crate::error::Error;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
@@ -183,7 +183,7 @@ pub fn ragged(
 
     ctx.fire(
         OP,
-        Fire::at(RAGGED, symbol("::pie::attn::ragged_schedule"))
+        Fire::at(kernel(RAGGED, "::pie::attn::ragged_schedule"))
             .apply(Launch::grid([1, 1, 1], [SCHEDULE_BLOCK, 1, 1]).smem(SCHEDULE_BLOCK * 4)),
         &[
             q_indptr.arg(),

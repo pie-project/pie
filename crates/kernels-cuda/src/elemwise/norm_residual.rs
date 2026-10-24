@@ -1,7 +1,7 @@
 use super::*;
 use crate::error::Error;
 use crate::jit::{
-    Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::Tensor;
 use dtype::Dtype;
@@ -54,7 +54,7 @@ pub fn residual_add_rmsnorm(
     ctx.fire(
         OP,
         // The register kernel waits on its producer in-kernel (`kernel.pdl`).
-        Fire::at(NORM_RESIDUAL, symbol(&entrypoint)).apply(
+        Fire::at(kernel(NORM_RESIDUAL, &entrypoint)).apply(
             Launch::per_row(rows, block)
                 .programmatic(ctx.tuning().pdl && entrypoint.contains("_reg<")),
         ),
@@ -212,7 +212,7 @@ pub fn rmsnorm_residual_add_keeping(
     ctx.fire(
         OP,
         // The vec8 form waits on its producer in-kernel (`kernel.pdl`).
-        Fire::at(NORM_RESIDUAL, symbol(&entrypoint))
+        Fire::at(kernel(NORM_RESIDUAL, &entrypoint))
             .apply(Launch::per_row(rows, block).programmatic(ctx.tuning().pdl && vectors)),
         &[
             x.arg(),

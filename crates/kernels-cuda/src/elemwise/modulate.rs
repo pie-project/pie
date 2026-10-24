@@ -1,8 +1,8 @@
 use super::norm::Next;
 use crate::error::Error;
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, aligned16, count, dtype_dispatch, nonzero, refuse, stated,
-    symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, aligned16, count, dtype_dispatch, kernel, nonzero, refuse,
+    stated,
 };
 use crate::tensor::Tensor;
 use dtype::Dtype;
@@ -87,7 +87,7 @@ pub fn norm_gate(
         args.push(stated(OP, rows)?.arg());
     }
     args.push(ctx.stage());
-    ctx.fire(OP, Fire::at(MODULATE, symbol(&entry)).apply(launch), &args)
+    ctx.fire(OP, Fire::at(kernel(MODULATE, &entry)).apply(launch), &args)
 }
 
 const BLOCK: u32 = 256;
@@ -236,13 +236,10 @@ fn fire(
     }
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             MODULATE,
-            symbol(&format!(
-                "::pie::elemwise::modulate<{t}, {tm}, {}>",
-                form.stamp()
-            )),
-        )
+            &format!("::pie::elemwise::modulate<{t}, {tm}, {}>", form.stamp()),
+        ))
         .apply(Launch::per_row(rows, BLOCK)),
         &[
             x.arg(),
@@ -317,10 +314,10 @@ pub fn gated_residual_add(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             MODULATE,
-            symbol(&format!("::pie::elemwise::gated_residual_add<{t}, {tm}>")),
-        )
+            &format!("::pie::elemwise::gated_residual_add<{t}, {tm}>"),
+        ))
         .apply(Launch::per_row(rows, BLOCK)),
         &[
             r.arg(),
@@ -346,13 +343,13 @@ pub fn norm_modulate(
     let (t, tm, width, rows) = fused_shapes(OP, x, m, lane_of_row, norm, o)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             MODULATE,
-            symbol(&format!(
+            &format!(
                 "::pie::elemwise::norm_modulate<{t}, {tm}, {BLOCK}, {}>",
                 norm.stamp()
-            )),
-        )
+            ),
+        ))
         .apply(Launch::per_row(rows, BLOCK)),
         &[
             x.arg(),
@@ -405,13 +402,13 @@ pub fn gated_residual_norm_modulate(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             MODULATE,
-            symbol(&format!(
+            &format!(
                 "::pie::elemwise::gated_residual_norm_modulate<{t}, {tm}, {BLOCK}, {}>",
                 norm.stamp()
-            )),
-        )
+            ),
+        ))
         .apply(Launch::per_row(rows, BLOCK)),
         &[
             r.arg(),
@@ -516,10 +513,10 @@ pub fn res_blend(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             MODULATE,
-            symbol(&format!("::pie::elemwise::res_blend<{t}>")),
-        )
+            &format!("::pie::elemwise::res_blend<{t}>"),
+        ))
         .apply(Launch::per_row(y.rows, BLOCK)),
         &[
             prefix.arg(),
@@ -589,10 +586,10 @@ pub fn res_blend_norm(
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             MODULATE,
-            symbol(&format!("::pie::elemwise::res_blend_norm<{t}, {threads}>")),
-        )
+            &format!("::pie::elemwise::res_blend_norm<{t}, {threads}>"),
+        ))
         .apply(Launch::per_row(y.rows, threads)),
         &[
             prefix.arg(),

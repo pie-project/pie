@@ -1,4 +1,5 @@
 use super::*;
+use crate::jit::kernel;
 
 const GDN_RECURRENT: &str = "ssm/gdn_recurrent.cu";
 
@@ -46,7 +47,7 @@ pub fn gated_delta(
     };
     ctx.fire(
         OP,
-        Fire::at(GDN_RECURRENT, entrypoint).apply(launch),
+        Fire::at(kernel(GDN_RECURRENT, entrypoint)).apply(launch),
         &[
             ArgValue::Ptr(staged.q_norm),
             ArgValue::Ptr(staged.k_norm),
@@ -139,7 +140,7 @@ impl Delta {
             .min(sms * fused_blocks_per_sm(ctx.smem_per_sm(), ctx.tuning().ssm_gdn_step_blocks));
         ctx.fire(
             op,
-            Fire::at(GDN_RECURRENT, "::pie::ssm::gdn_step_fused<4>")
+            Fire::at(kernel(GDN_RECURRENT, "::pie::ssm::gdn_step_fused<4>"))
                 .apply(Launch::grid([blocks, 1, 1], [32 * FUSED_WARPS, 1, 1]).smem(FUSED_SMEM)),
             &[
                 qkv.arg(),

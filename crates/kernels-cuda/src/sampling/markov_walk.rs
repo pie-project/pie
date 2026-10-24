@@ -4,7 +4,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, nonzero, refuse, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, kernel, nonzero, refuse};
 use crate::tensor::Tensor;
 
 const FILE: &str = "sampling/markov_walk.cu";
@@ -77,7 +77,8 @@ pub fn markov_walk(
     let keys = ctx.scratch_stream(OP, "markov.keys", r * 8)? as u64;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::sampling::plan").apply(Launch::grid([1, 1, 1], [1024, 1, 1])),
+        Fire::at(kernel(FILE, "::pie::sampling::plan"))
+            .apply(Launch::grid([1, 1, 1], [1024, 1, 1])),
         &[
             positions.arg(),
             ends.arg(),
@@ -95,7 +96,7 @@ pub fn markov_walk(
         // The depth's embeddings, a warp a readout, then its tiles.
         ctx.fire(
             OP,
-            Fire::at(FILE, "::pie::sampling::gather")
+            Fire::at(kernel(FILE, "::pie::sampling::gather"))
                 .apply(Launch::grid([readouts.div_ceil(8), 1, 1], [256, 1, 1])),
             &[
                 tokens.arg(),
@@ -111,7 +112,7 @@ pub fn markov_walk(
         )?;
         ctx.fire(
             OP,
-            Fire::at(FILE, symbol(&format!("::pie::sampling::step<{t}>")))
+            Fire::at(kernel(FILE, &format!("::pie::sampling::step<{t}>")))
                 .apply(Launch::grid([tiles, 1, 1], [256, 1, 1]).smem(STEP_SMEM)),
             &[
                 logits.arg(),
@@ -129,7 +130,7 @@ pub fn markov_walk(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::sampling::picks").apply(Launch::flat(readouts, 128)),
+        Fire::at(kernel(FILE, "::pie::sampling::picks")).apply(Launch::flat(readouts, 128)),
         &[ArgValue::Ptr(keys), picks.arg(), int(readouts).arg()],
     )
 }

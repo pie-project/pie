@@ -1,7 +1,6 @@
 #![allow(unsafe_code)]
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 use cudarc::driver::sys as dr;
 use cudarc::runtime::sys as rt;
@@ -25,25 +24,26 @@ unsafe impl Send for Resolved {}
 // the driver serialises whatever it does with them internally.
 unsafe impl Sync for Resolved {}
 
-type Slot = OnceLock<Result<Resolved, Fault>>;
-
-fn slot(key: &str) -> &'static Slot {
-    static SLOTS: OnceLock<Mutex<HashMap<String, &'static Slot>>> = OnceLock::new();
-    let mut map = SLOTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("lock poisoned");
-    if let Some(found) = map.get(key) {
-        return found;
+/// The ordinal of the device bound to this thread.
+pub(crate) fn current_device() -> Result<usize, Fault> {
+    let mut ordinal: i32 = 0;
+    // SAFETY: `ordinal` is a local out-pointer.
+    let code = unsafe { rt::cudaGetDevice(&raw mut ordinal) };
+    if code != rt::cudaError::cudaSuccess {
+        return Err(Fault::Device {
+            call: "cudaGetDevice",
+            code: code as i32,
+        });
     }
-
-    let fresh: &'static Slot = Box::leak(Box::new(OnceLock::new()));
-    map.insert(key.to_owned(), fresh);
-    fresh
+    usize::try_from(ordinal).map_err(|_| Fault::Device {
+        call: "cudaGetDevice",
+        code: ordinal,
+    })
 }
 
-pub(crate) fn resolve(root: &Root, instantiation: &str) -> Result<&'static Resolved, Fault> {
-    bind_context()?;
+/// `instantiation` of `root` loaded on the current device: from the disk
+/// cache, or compiled and written there.
+pub(crate) fn load(root: &Root, instantiation: &str) -> Result<Resolved, Fault> {
     let plain = arch().ok_or(Fault::Device {
         call: "cuDeviceGet",
         code: -1,
@@ -59,23 +59,7 @@ pub(crate) fn resolve(root: &Root, instantiation: &str) -> Result<&'static Resol
         ),
     })?;
     let arch = target.as_str();
-    let key = root.key(instantiation, arch);
-    let mut ordinal: i32 = 0;
-    // SAFETY: `ordinal` is a local out-pointer.
-    let code = unsafe { rt::cudaGetDevice(&raw mut ordinal) };
-    if code != rt::cudaError::cudaSuccess {
-        return Err(Fault::Device {
-            call: "cudaGetDevice",
-            code: code as i32,
-        });
-    }
-    slot(&format!("cuda:{ordinal}|{key}"))
-        .get_or_init(|| load(root, instantiation, &key, arch))
-        .as_ref()
-        .map_err(Clone::clone)
-}
-
-fn load(root: &Root, instantiation: &str, key: &str, arch: &str) -> Result<Resolved, Fault> {
+    let key = &root.key(instantiation, arch);
     let started = std::time::Instant::now();
     let (cubin, mangled, compiled) = match read_disk(key) {
         Some(hit) => (hit.0, hit.1, false),

@@ -1,6 +1,6 @@
 use super::*;
 use crate::error::Error;
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
@@ -15,7 +15,7 @@ pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
         let lanes = u32::try_from(n / 8).unwrap_or(u32::MAX);
         return ctx.fire(
             OP,
-            Fire::at(POINTWISE, "::pie::elemwise::residual_add_vec8")
+            Fire::at(kernel(POINTWISE, "::pie::elemwise::residual_add_vec8"))
                 .apply(Launch::flat(lanes, BLOCK).programmatic(ctx.tuning().pdl)),
             &[
                 y.arg(),
@@ -28,10 +28,10 @@ pub fn residual_add(ctx: &Ctx, x: Tensor, y: &mut Tensor) -> Result<(), Error> {
     }
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             POINTWISE,
-            symbol(&format!("::pie::elemwise::residual_add<{t}>")),
-        )
+            &format!("::pie::elemwise::residual_add<{t}>"),
+        ))
         .apply(launch),
         &[
             y.arg(),
@@ -51,10 +51,10 @@ pub fn add_bias(ctx: &Ctx, bias: Tensor, out: &mut Tensor) -> Result<(), Error> 
     let width = stated(OP, nonzero(OP, "the biased row's width", out.width)?)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             POINTWISE,
-            symbol(&format!("::pie::elemwise::add_bias<{t}, {tb}>")),
-        )
+            &format!("::pie::elemwise::add_bias<{t}, {tb}>"),
+        ))
         .apply(route_rows(out.rows, out.width)),
         &[out.arg(), bias.arg(), width.arg(), ctx.stage()],
     )
@@ -66,10 +66,10 @@ pub fn silu_scaled(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
     let (launch, n) = elementwise(OP, *x)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             POINTWISE,
-            symbol(&format!("::pie::elemwise::silu_scaled<{t}>")),
-        )
+            &format!("::pie::elemwise::silu_scaled<{t}>"),
+        ))
         .apply(launch),
         &[
             x.arg(),
@@ -87,10 +87,10 @@ pub fn mul_scalar(ctx: &Ctx, s: f32, x: &mut Tensor) -> Result<(), Error> {
     let (launch, n) = elementwise(OP, *x)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             POINTWISE,
-            symbol(&format!("::pie::elemwise::mul_scalar<{t}>")),
-        )
+            &format!("::pie::elemwise::mul_scalar<{t}>"),
+        ))
         .apply(launch),
         &[
             x.arg(),
@@ -108,7 +108,7 @@ pub fn scale(ctx: &Ctx, s: Tensor, x: &mut Tensor) -> Result<(), Error> {
     let (launch, n) = elementwise(OP, *x)?;
     ctx.fire(
         OP,
-        Fire::at(POINTWISE, symbol(&format!("::pie::elemwise::scale<{t}>")))
+        Fire::at(kernel(POINTWISE, &format!("::pie::elemwise::scale<{t}>")))
             .apply(launch.programmatic(ctx.tuning().pdl)),
         &[
             x.arg(),
@@ -162,10 +162,10 @@ fn fire_unary(
     nonzero(op, "the element count", lanes)?;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             POINTWISE,
-            symbol(&format!("::pie::elemwise::activation<{t}, {stamp}>")),
-        )
+            &format!("::pie::elemwise::activation<{t}, {stamp}>"),
+        ))
         .apply(Launch::flat(lanes, BLOCK)),
         &[
             x.arg(),
@@ -216,10 +216,10 @@ fn fire_binary(
     nonzero(op, "the element count", lanes)?;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             POINTWISE,
-            symbol(&format!("::pie::elemwise::binary<{t}, {stamp}>")),
-        )
+            &format!("::pie::elemwise::binary<{t}, {stamp}>"),
+        ))
         .apply(Launch::flat(lanes, BLOCK)),
         &[
             x.arg(),
@@ -254,7 +254,7 @@ pub fn clamp(ctx: &Ctx, lo: f32, hi: f32, x: &mut Tensor) -> Result<(), Error> {
     nonzero(OP, "the element count", lanes)?;
     ctx.fire(
         OP,
-        Fire::at(POINTWISE, symbol(&format!("::pie::elemwise::clamp<{t}>")))
+        Fire::at(kernel(POINTWISE, &format!("::pie::elemwise::clamp<{t}>")))
             .apply(Launch::flat(lanes, BLOCK)),
         &[
             x.arg(),
@@ -301,10 +301,10 @@ pub fn clamp_learned(ctx: &Ctx, lo: Tensor, hi: Tensor, x: &mut Tensor) -> Resul
     nonzero(OP, "the element count", lanes)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             POINTWISE,
-            symbol(&format!("::pie::elemwise::clamp_learned<{t}>")),
-        )
+            &format!("::pie::elemwise::clamp_learned<{t}>"),
+        ))
         .apply(Launch::flat(lanes, BLOCK)),
         &[
             x.arg(),

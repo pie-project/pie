@@ -7,7 +7,7 @@ use crate::error::Error;
 use crate::attn::kv;
 use crate::jit::Ctx;
 #[cfg(feature = "cuda")]
-use crate::jit::{ArgValue, Fire, Launch, refuse};
+use crate::jit::{ArgValue, Fire, Launch, kernel, refuse};
 use crate::tensor::{KvPool, Tensor};
 #[cfg(feature = "cuda")]
 use dtype::Dtype;
@@ -124,7 +124,8 @@ pub fn prefill_expanded(
         let int = |v: u32| ArgValue::I32(i32::try_from(v).unwrap_or(i32::MAX));
         ctx.fire(
             OP,
-            Fire::at(EXPAND, "::pie::attn::mla::gather").apply(Launch::flat(threads, BLOCK)),
+            Fire::at(kernel(EXPAND, "::pie::attn::mla::gather"))
+                .apply(Launch::flat(threads, BLOCK)),
             &[
                 ArgValue::Ptr(pool.keys.ptr),
                 ArgValue::Ptr(pool.values.ptr),
@@ -153,7 +154,7 @@ pub fn prefill_expanded(
         let key_runs = cells * u64::from(h.heads) * u64::from(dqk / 8);
         ctx.fire(
             OP,
-            Fire::at(EXPAND, "::pie::attn::mla::pack_keys").apply(Launch::flat(
+            Fire::at(kernel(EXPAND, "::pie::attn::mla::pack_keys")).apply(Launch::flat(
                 u32::try_from(key_runs)
                     .map_err(|_| refuse(OP, "the key pack overflows a launch"))?,
                 BLOCK,
@@ -183,7 +184,7 @@ pub fn prefill_expanded(
                 let q_runs = u64::from(rows) * u64::from(h.heads) * u64::from(dqk / 8);
                 ctx.fire(
                     OP,
-                    Fire::at(EXPAND, "::pie::attn::mla::pack_queries").apply(Launch::flat(
+                    Fire::at(kernel(EXPAND, "::pie::attn::mla::pack_queries")).apply(Launch::flat(
                         u32::try_from(q_runs)
                             .map_err(|_| refuse(OP, "the query pack overflows a launch"))?,
                         BLOCK,

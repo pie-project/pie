@@ -4,7 +4,7 @@ use super::rope::{Yarn, YarnAppend, partial_last, ramp_bounds};
 use super::*;
 use crate::error::Error;
 use crate::jit::{
-    Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::{KvPool, Tensor};
 use dtype::Dtype;
@@ -68,12 +68,10 @@ pub fn rmsnorm_rope_partial_q(
         })?;
         return ctx.fire(
             OP,
-            Fire::at(
+            Fire::at(kernel(
                 NORM_ROPE,
-                symbol(&format!(
-                    "::pie::elemwise::q_rmsnorm_rope_partial_warp<{WARPS}, {runs}>"
-                )),
-            )
+                &format!("::pie::elemwise::q_rmsnorm_rope_partial_warp<{WARPS}, {runs}>"),
+            ))
             .apply(Launch::grid([blocks, 1, 1], [WARPS as u32 * 32, 1, 1])),
             &[
                 x.arg(),
@@ -93,8 +91,11 @@ pub fn rmsnorm_rope_partial_q(
     }
     ctx.fire(
         OP,
-        Fire::at(NORM_ROPE, "::pie::elemwise::q_rmsnorm_rope_partial<128>")
-            .apply(Launch::grid([y.rows, heads, 1], [128, 1, 1])),
+        Fire::at(kernel(
+            NORM_ROPE,
+            "::pie::elemwise::q_rmsnorm_rope_partial<128>",
+        ))
+        .apply(Launch::grid([y.rows, heads, 1], [128, 1, 1])),
         &[
             x.arg(),
             weight.arg(),
@@ -300,12 +301,10 @@ fn one_pass(
     };
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             NORM_ROPE,
-            symbol(&format!(
-                "::pie::elemwise::norm_rope_last<{per}, {weighted}, {appends}>"
-            )),
-        )
+            &format!("::pie::elemwise::norm_rope_last<{per}, {weighted}, {appends}>"),
+        ))
         .apply(Launch::grid(
             [strided_blocks(ctx, units), 1, 1],
             [256, 1, 1],
@@ -390,13 +389,10 @@ pub fn qg_qknorm_rope_append(
         .ok_or_else(|| refuse(OP, "the (row, head) units overflow a grid"))?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             NORM_ROPE,
-            symbol(&format!(
-                "::pie::elemwise::qg_qknorm_rope_append<{}>",
-                head_dim / 32
-            )),
-        )
+            &format!("::pie::elemwise::qg_qknorm_rope_append<{}>", head_dim / 32),
+        ))
         .apply(Launch::grid([units.div_ceil(8), 1, 1], [256, 1, 1])),
         &[
             qg.arg(),
@@ -525,12 +521,10 @@ pub fn norm_rope_pair(
     };
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             NORM_ROPE,
-            symbol(&format!(
-                "::pie::elemwise::norm_rope_pair<{qper}, {appends}>"
-            )),
-        )
+            &format!("::pie::elemwise::norm_rope_pair<{qper}, {appends}>"),
+        ))
         .apply(Launch::grid(
             [strided_blocks(ctx, units), 1, 1],
             [256, 1, 1],

@@ -1,4 +1,5 @@
 use super::*;
+use crate::jit::kernel;
 
 const MAMBA2: &str = "ssm/mamba2.cu";
 
@@ -86,7 +87,7 @@ pub fn mamba2(
     let rows = nonzero(OP, "rows", xbc.rows)?;
     ctx.fire(
         OP,
-        Fire::at(MAMBA2, "::pie::ssm::mamba2_step")
+        Fire::at(kernel(MAMBA2, "::pie::ssm::mamba2_step"))
             .apply(Launch::grid([rows, m.heads, 1], [BLOCK, 1, 1])),
         &[
             xbc.arg(),
@@ -135,7 +136,7 @@ pub fn mamba2_chunked(
     seated(OP, state, "mamba2_scan", true, true, true)?;
     ctx.fire(
         OP,
-        Fire::at(MAMBA2, "::pie::ssm::mamba2_scan")
+        Fire::at(kernel(MAMBA2, "::pie::ssm::mamba2_scan"))
             .apply(Launch::grid([lanes * m.heads, 1, 1], [128, 1, 1]).smem(SMEM)),
         &[
             xbc.data.arg(),

@@ -4,7 +4,7 @@ use crate::error::Error;
 
 use crate::attn::index::K_BLOCK;
 use crate::attn::index::QueryTurn;
-use crate::jit::{ArgValue, Ctx, Fire, Launch, stated, symbol};
+use crate::jit::{ArgValue, Ctx, Fire, Launch, kernel, stated};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const LOGITS_SM100: &str = "attn/index/logits_sm100.cu";
@@ -158,10 +158,10 @@ pub(crate) fn ranked_tc5(
     let groups = selection.rows.div_ceil(128 / h);
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             LOGITS_SM100,
-            symbol(&format!("::pie::attn::index::index_logits_tc5<{h}>")),
-        )
+            &format!("::pie::attn::index::index_logits_tc5<{h}>"),
+        ))
         .apply(
             Launch::grid(
                 [groups.min(ctx.multiprocessors().unwrap_or(148)), 1, 1],
@@ -174,10 +174,10 @@ pub(crate) fn ranked_tc5(
     let radix = ctx.tuning().index_radix;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             LOGITS_SM100,
-            symbol(&format!("::pie::attn::index::index_select_rows<{radix}>")),
-        )
+            &format!("::pie::attn::index::index_select_rows<{radix}>"),
+        ))
         .apply(Launch::grid([selection.rows, 1, 1], [K_BLOCK, 1, 1])),
         &[bytes, selection.arg()],
     )?;

@@ -10,7 +10,7 @@ use dtype::Dtype;
 use crate::attn::fa2::abi::DecodeParams;
 use crate::attn::plan::DecodePlan;
 use crate::error::Error;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, kernel};
 use crate::tensor::{KvPool, Tensor};
 
 const FILE: &str = "attn/decode_gqa_sm80.cu";
@@ -264,7 +264,7 @@ pub fn decode(
     };
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&entry)).apply(launch),
+        Fire::at(kernel(FILE, &entry)).apply(launch),
         &[
             ArgValue::Ptr(params.q),
             ArgValue::Ptr(kv.k_data),

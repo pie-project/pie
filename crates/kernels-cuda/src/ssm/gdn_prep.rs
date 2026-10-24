@@ -1,4 +1,5 @@
 use super::*;
+use crate::jit::kernel;
 
 pub fn gdn_gates(
     ctx: &Ctx,
@@ -28,7 +29,11 @@ pub fn gdn_gates(
     let rows = nonzero(OP, "rows", ba.rows)?;
     ctx.fire(
         OP,
-        Fire::at(GDN_PREP, "::pie::ssm::gdn_prep_ba_gates<::pie::bf16>").apply(Launch::grid(
+        Fire::at(kernel(
+            GDN_PREP,
+            "::pie::ssm::gdn_prep_ba_gates<::pie::bf16>",
+        ))
+        .apply(Launch::grid(
             [rows, v_heads.div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
         )),
@@ -124,8 +129,11 @@ impl Delta {
         let q_scale = (self.k_dim as f32).sqrt().recip();
         ctx.fire(
             op,
-            Fire::at(GDN_PREP, "::pie::ssm::gdn_prep_qk_norm<::pie::bf16, 128>")
-                .apply(Launch::grid([self.n, self.k_heads, 1], [PREP_BLOCK, 1, 1])),
+            Fire::at(kernel(
+                GDN_PREP,
+                "::pie::ssm::gdn_prep_qk_norm<::pie::bf16, 128>",
+            ))
+            .apply(Launch::grid([self.n, self.k_heads, 1], [PREP_BLOCK, 1, 1])),
             &[
                 qkv.arg(),
                 ArgValue::Ptr(staged.q_norm),
@@ -139,8 +147,11 @@ impl Delta {
         )?;
         ctx.fire(
             op,
-            Fire::at(GDN_PREP, "::pie::ssm::gdn_prep_v_gates<::pie::bf16, 128>")
-                .apply(Launch::grid([self.n, self.v_heads, 1], [PREP_BLOCK, 1, 1])),
+            Fire::at(kernel(
+                GDN_PREP,
+                "::pie::ssm::gdn_prep_v_gates<::pie::bf16, 128>",
+            ))
+            .apply(Launch::grid([self.n, self.v_heads, 1], [PREP_BLOCK, 1, 1])),
             &[
                 qkv.arg(),
                 gates.arg(),

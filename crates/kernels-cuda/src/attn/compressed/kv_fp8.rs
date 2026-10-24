@@ -8,7 +8,7 @@ use dtype::Dtype;
 
 use crate::attn::compressed::decode::Rows;
 use crate::attn::compressed::decode::ds_pool;
-use crate::jit::{Arg, Ctx, Fire, Launch, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, kernel, refuse, stated};
 use crate::tensor::{KvPool, Tensor};
 
 const KV_FP8: &str = "attn/compressed/kv_fp8.cu";
@@ -35,7 +35,7 @@ pub fn append(
     }
     ctx.fire(
         OP,
-        Fire::at(KV_FP8, rows_symbol("append", fmt))
+        Fire::at(kernel(KV_FP8, &rows_symbol("append", fmt)))
             .apply(Launch::grid([rows.rows.div_ceil(4), 1, 1], [128, 1, 1])),
         &[
             rows.arg(),
@@ -69,7 +69,7 @@ pub fn store_entries(
     }
     ctx.fire(
         OP,
-        Fire::at(KV_FP8, rows_symbol("store_entries", fmt))
+        Fire::at(kernel(KV_FP8, &rows_symbol("store_entries", fmt)))
             .apply(Launch::grid([entries.rows.div_ceil(4), 1, 1], [128, 1, 1])),
         &[
             entries.arg(),
@@ -86,9 +86,6 @@ pub fn store_entries(
 }
 
 /// A row writer's symbol: the format's instance of the generic one.
-fn rows_symbol(what: &str, fmt: Rows) -> &'static str {
-    symbol(&format!(
-        "::pie::attn::compressed::rows_{what}<{}>",
-        fmt.code()
-    ))
+fn rows_symbol(what: &str, fmt: Rows) -> String {
+    format!("::pie::attn::compressed::rows_{what}<{}>", fmt.code())
 }

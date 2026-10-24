@@ -4,7 +4,7 @@ use super::*;
 #[cfg(feature = "cuda")]
 use crate::error::Error;
 #[cfg(feature = "cuda")]
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, kernel, nonzero, refuse, stated};
 #[cfg(feature = "cuda")]
 use crate::tensor::Tensor;
 #[cfg(feature = "cuda")]
@@ -47,7 +47,7 @@ pub(super) fn quantize_rows_e4m3b128(
     let lanes = u32::try_from(rows * (k / 128) * 16).map_err(|_| refuse(op, "too many rows"))?;
     ctx.fire(
         op,
-        Fire::at(ACT_QUANT, "::pie::linear::quantize_rows_e4m3b128")
+        Fire::at(kernel(ACT_QUANT, "::pie::linear::quantize_rows_e4m3b128"))
             .apply(Launch::grid([lanes.div_ceil(128), 1, 1], [128, 1, 1])),
         &[
             x.arg(),
@@ -125,10 +125,10 @@ pub fn select_fp8_w8a8(
         let smem = 3 * (128 + slice) * 128 + 1024;
         return ctx.fire(
             OP,
-            Fire::at(
+            Fire::at(kernel(
                 SELECT_SM90,
-                symbol(&format!("::pie::linear::moe_select_fp8a8_wgmma<{slice}>")),
-            )
+                &format!("::pie::linear::moe_select_fp8a8_wgmma<{slice}>"),
+            ))
             .apply(Launch::grid([work_cap, y.width / 128, 1], [128, 1, 1]).smem(smem)),
             &[
                 ArgValue::Ptr(xq),
@@ -174,10 +174,10 @@ pub fn select_fp8_w8a8(
     )?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             SELECT_SM80,
-            symbol(&format!("::pie::linear::moe_select_fp8a8_mma<{nb}, false>")),
-        )
+            &format!("::pie::linear::moe_select_fp8a8_mma<{nb}, false>"),
+        ))
         .apply(
             Launch::grid([work_cap, y.width.div_ceil(128), 1], [128, 1, 1]).smem(fp8_mma_smem(nb)),
         ),
@@ -240,10 +240,10 @@ pub fn matmul_fp8_w8a8(
     };
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             SELECT_SM80,
-            symbol(&format!("::pie::linear::moe_select_fp8a8_mma<{nb}, true>")),
-        )
+            &format!("::pie::linear::moe_select_fp8a8_mma<{nb}, true>"),
+        ))
         .apply(
             Launch::grid(
                 [x.rows.div_ceil(8 * nb), y.width.div_ceil(128), splits],
@@ -274,7 +274,7 @@ pub fn matmul_fp8_w8a8(
     let quads = u32::try_from(count / 4).map_err(|_| refuse(OP, "too many outputs"))?;
     ctx.fire(
         OP,
-        Fire::at(SELECT_SM80, "::pie::linear::fp8a8_fold")
+        Fire::at(kernel(SELECT_SM80, "::pie::linear::fp8a8_fold"))
             .apply(Launch::grid([quads.div_ceil(256), 1, 1], [256, 1, 1])),
         &[
             ArgValue::Ptr(part),
@@ -356,24 +356,19 @@ pub fn select_fp8_w8a16(
         const STAGES: u32 = 3;
         const WN: u32 = 2;
         let cols = if glu.is_some() { 64 } else { 128 };
-        Fire::at(
+        Fire::at(kernel(
             SELECT_SM80,
-            symbol(&format!(
-                "::pie::linear::moe_select_fp8_gemm<{STAGES}, {code}, {gran}, {WN}>"
-            )),
-        )
+            &format!("::pie::linear::moe_select_fp8_gemm<{STAGES}, {code}, {gran}, {WN}>"),
+        ))
         .apply(
             Launch::grid([order.work_cap, y.width.div_ceil(cols), 1], [64 * WN, 1, 1])
                 .smem(STAGES * (64 * 128 + 128 * 64) + 128 * 128),
         )
     } else {
         let cols = if glu.is_some() { 64 } else { 64 * tiles };
-        Fire::at(
-            SELECT_SM80,
-            symbol(&format!(
+        Fire::at(kernel(SELECT_SM80, &format!(
                 "::pie::linear::moe_select_fp8_mma<{nb}, {DEPTH}, {code}, {gran}, {tiles}, {ksplit}>"
-            )),
-        )
+            )))
         .apply(Launch::grid(
             [order.work_cap, y.width.div_ceil(cols), 1],
             [THREADS * ksplit, 1, 1],
@@ -519,13 +514,13 @@ pub fn matmul_grouped_fp8_with(
     let smem = (y.rows * (k + 16) + y.rows * (k / 128) * 4).max(tiles * (split - 1) * 4 * 32 * 4);
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             SELECT_SM80,
-            symbol(&format!(
+            &format!(
                 "::pie::linear::grouped_mma_fp8b128<::pie::i32({tiles}), ::pie::i32({split}), \
                  ::pie::i32({depth})>"
-            )),
-        )
+            ),
+        ))
         .apply(Launch::grid([n / (16 * tiles), groups, 1], [32 * split * tiles, 1, 1]).smem(smem)),
         &[
             ArgValue::Ptr(codes),
@@ -561,7 +556,7 @@ pub fn quantize_fp8b128(ctx: &Ctx, src: Tensor, codes: u64, atoms: u64) -> Resul
     }
     ctx.fire(
         OP,
-        Fire::at(ACT_QUANT, "::pie::linear::quantize_fp8b128").apply(Launch::grid(
+        Fire::at(kernel(ACT_QUANT, "::pie::linear::quantize_fp8b128")).apply(Launch::grid(
             [src.width / 128, src.rows / 128, 1],
             [256, 1, 1],
         )),
@@ -595,7 +590,8 @@ pub fn dequantize_fp8b128(
         .map_err(|_| refuse(OP, "the plane's 16-code runs pass a 32-bit launch"))?;
     ctx.fire(
         OP,
-        Fire::at(DEQUANT, "::pie::linear::dequantize_fp8b128").apply(Launch::flat(threads, 256)),
+        Fire::at(kernel(DEQUANT, "::pie::linear::dequantize_fp8b128"))
+            .apply(Launch::flat(threads, 256)),
         &[
             ArgValue::Ptr(codes),
             ArgValue::Ptr(atoms),
@@ -657,10 +653,10 @@ pub fn matmul_grouped_strided(
         let rows = groups * n;
         return ctx.fire(
             OP,
-            Fire::at(
+            Fire::at(kernel(
                 GEMV,
                 "::pie::linear::gemv_bf16_grouped_kernel<::pie::i32(4)>",
-            )
+            ))
             .apply(Launch::grid([rows.div_ceil(4), 1, 1], [32, 4, 1])),
             &[
                 w.arg(),

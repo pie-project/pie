@@ -2,7 +2,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::elemwise::hc::MAX_HC_MULT;
-use crate::jit::{Arg, Ctx, Fire, Launch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
 const HC_PROJECT: &str = "elemwise/hc_project.cu";
@@ -80,7 +80,7 @@ pub fn project(
     }
     ctx.fire(
         OP,
-        Fire::at(HC_PROJECT, "::pie::elemwise::hc_project<256>")
+        Fire::at(kernel(HC_PROJECT, "::pie::elemwise::hc_project<256>"))
             .apply(Launch::grid([rows * mix_hc, 1, 1], [BLOCK, 1, 1])),
         &[
             normed.arg(),
@@ -201,7 +201,7 @@ pub(crate) fn prenorm_launch(
     );
     ctx.fire(
         op,
-        Fire::at(HC_PROJECT, symbol(&entry)).apply(
+        Fire::at(kernel(HC_PROJECT, &entry)).apply(
             Launch {
                 smem,
                 ..Launch::grid([row_blocks, slices, 1], [threads, 1, 1])
@@ -248,7 +248,7 @@ fn prenorm_launch_mma(
         ctx.scratch_shared(op, "elemwise.hc_fn_split", (48 * fan) as usize * 2)? as usize as u64;
     ctx.fire(
         op,
-        Fire::at(HC_PROJECT, "::pie::elemwise::hc_fn_split").apply(Launch::grid(
+        Fire::at(kernel(HC_PROJECT, "::pie::elemwise::hc_fn_split")).apply(Launch::grid(
             [(24 * fan).div_ceil(4 * 256), 1, 1],
             [256, 1, 1],
         )),
@@ -279,12 +279,10 @@ fn prenorm_launch_mma(
     let smem = STAGES * (ROWS + 48) * (TILE_K + 8) * 2;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             HC_PROJECT,
-            symbol(&format!(
-                "::pie::elemwise::hc_prenorm_project_mma_t<{STAGES}, {TILES}>"
-            )),
-        )
+            &format!("::pie::elemwise::hc_prenorm_project_mma_t<{STAGES}, {TILES}>"),
+        ))
         .apply(Launch {
             smem,
             ..Launch::grid([row_blocks, slices, 1], [128, 1, 1])
@@ -327,10 +325,17 @@ pub fn prenorm_project(
         // A few slices over many rows (the tensor-core form's) fold a
         // thread a row; a decode's many slices a warp a mix.
         let fold = if ctx.tuning().hc_mma && landed.slices <= 8 && rows >= 1024 {
-            Fire::at(HC_PROJECT, "::pie::elemwise::hc_prenorm_project_fold_rows")
-                .apply(Launch::grid([rows.div_ceil(256), 1, 1], [256, 1, 1]))
+            Fire::at(kernel(
+                HC_PROJECT,
+                "::pie::elemwise::hc_prenorm_project_fold_rows",
+            ))
+            .apply(Launch::grid([rows.div_ceil(256), 1, 1], [256, 1, 1]))
         } else {
-            Fire::at(HC_PROJECT, "::pie::elemwise::hc_prenorm_project_fold").apply(Launch::grid(
+            Fire::at(kernel(
+                HC_PROJECT,
+                "::pie::elemwise::hc_prenorm_project_fold",
+            ))
+            .apply(Launch::grid(
                 [(rows * mix_hc).div_ceil(8), 1, 1],
                 [BLOCK, 1, 1],
             ))
@@ -395,23 +400,19 @@ fn project_sliced(
         mixes.ptr
     };
     let fire = if tile {
-        Fire::at(
+        Fire::at(kernel(
             HC_PROJECT,
-            symbol(&format!(
-                "::pie::elemwise::hc_project_tile<{br}, {kg}, {kt}, {stages}>"
-            )),
-        )
+            &format!("::pie::elemwise::hc_project_tile<{br}, {kg}, {kt}, {stages}>"),
+        ))
         .apply(Launch {
             smem: stages * (br + TILE_COLS) * (kt + 4) * 4,
             ..Launch::grid([row_blocks, slices, 1], [br * kg, 1, 1])
         })
     } else {
-        Fire::at(
+        Fire::at(kernel(
             HC_PROJECT,
-            symbol(&format!(
-                "::pie::elemwise::hc_project_split<{PROJECT_ROWS}, {PROJECT_COLS}>"
-            )),
-        )
+            &format!("::pie::elemwise::hc_project_split<{PROJECT_ROWS}, {PROJECT_COLS}>"),
+        ))
         .apply(Launch::grid([row_blocks, slices, 1], [BLOCK, 1, 1]))
     };
     ctx.fire(
@@ -433,7 +434,7 @@ fn project_sliced(
     }
     ctx.fire(
         op,
-        Fire::at(HC_PROJECT, "::pie::elemwise::hc_project_fold")
+        Fire::at(kernel(HC_PROJECT, "::pie::elemwise::hc_project_fold"))
             .apply(Launch::flat(rows * mix_hc, BLOCK)),
         &[
             crate::jit::ArgValue::Ptr(out),

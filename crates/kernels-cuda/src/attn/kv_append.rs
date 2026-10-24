@@ -13,7 +13,7 @@ use crate::attn::kv::native_bf16;
 use crate::attn::kv::native_e4m3;
 use crate::attn::kv::scheme_of;
 use crate::attn::kv_envelope::envelope_update_appended;
-use crate::jit::{Arg, Ctx, Fire, Launch, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, kernel, refuse, stated};
 use crate::tensor::{KvPool, Tensor};
 
 const KV_APPEND: &str = "attn/kv_append.cu";
@@ -77,12 +77,10 @@ fn write_kv_bf16(
     };
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             KV_APPEND,
-            symbol(&format!(
-                "::pie::attn::kv_append_explicit<{layout}, {pages}>"
-            )),
-        )
+            &format!("::pie::attn::kv_append_explicit<{layout}, {pages}>"),
+        ))
         .apply(Launch::per_row(k.rows, BLOCK)),
         &[
             k.arg(),
@@ -134,7 +132,7 @@ fn write_kv_quantised(
     match scheme_of(op, pool)? {
         KvScheme::Fp8PerTensor => ctx.fire(
             op,
-            Fire::at(KV_APPEND, "::pie::attn::kv_append_fp8_per_tensor")
+            Fire::at(kernel(KV_APPEND, "::pie::attn::kv_append_fp8_per_tensor"))
                 .apply(Launch::per_row(tokens, BLOCK)),
             &[
                 k.arg(),
@@ -163,7 +161,7 @@ fn write_kv_quantised(
             let smem = 2 * (BLOCK / 32) * (core::mem::size_of::<f32>() as u32);
             ctx.fire(
                 op,
-                Fire::at(KV_APPEND, instantiation)
+                Fire::at(kernel(KV_APPEND, instantiation))
                     .apply(Launch::grid([tokens, heads, 1], [BLOCK, 1, 1]).smem(smem)),
                 &[
                     k.arg(),
@@ -190,10 +188,9 @@ fn write_kv_quantised(
                 head_dim.div_euclid(block_size) + i32::from(head_dim.rem_euclid(block_size) != 0);
             ctx.fire(
                 op,
-                Fire::at(KV_APPEND, "::pie::attn::kv_append_fp4_block").apply(Launch::grid(
-                    [tokens, heads, blocks.unsigned_abs()],
-                    [32, 1, 1],
-                )),
+                Fire::at(kernel(KV_APPEND, "::pie::attn::kv_append_fp4_block")).apply(
+                    Launch::grid([tokens, heads, blocks.unsigned_abs()], [32, 1, 1]),
+                ),
                 &[
                     k.arg(),
                     v.arg(),

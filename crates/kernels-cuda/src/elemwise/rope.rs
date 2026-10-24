@@ -3,7 +3,7 @@
 use super::*;
 use crate::error::Error;
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, aligned16, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::{KvPool, Tensor};
 use dtype::Dtype;
@@ -86,10 +86,10 @@ pub fn full(
     let per_block = heads_per_block(half);
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             ROPE,
             "::pie::elemwise::rope_full<::pie::false_type::value, false>",
-        )
+        ))
         .apply(rotate_launch(
             q.rows,
             num_q_heads + num_kv_heads,
@@ -252,7 +252,7 @@ pub fn partial_last(
         let heads_per_block = (ROTATE_BLOCK / (half / 4)).max(1);
         return ctx.fire(
             OP,
-            Fire::at(ROPE, "::pie::elemwise::rope_partial_last_vec").apply(
+            Fire::at(kernel(ROPE, "::pie::elemwise::rope_partial_last_vec")).apply(
                 Launch::grid(
                     [q.rows, num_q_heads.div_ceil(heads_per_block), 1],
                     [ROTATE_BLOCK, 1, 1],
@@ -282,7 +282,7 @@ pub fn partial_last(
         let heads = num_q_heads;
         return ctx.fire(
             OP,
-            Fire::at(ROPE, "::pie::elemwise::rope_partial_last_spread").apply(
+            Fire::at(kernel(ROPE, "::pie::elemwise::rope_partial_last_spread")).apply(
                 Launch::grid([q.rows, heads.div_ceil(HEADS), 1], [ROTATE_BLOCK, 1, 1])
                     .smem(half * 8),
             ),
@@ -305,7 +305,7 @@ pub fn partial_last(
     }
     ctx.fire(
         OP,
-        Fire::at(ROPE, "::pie::elemwise::rope_partial_last")
+        Fire::at(kernel(ROPE, "::pie::elemwise::rope_partial_last"))
             .apply(Launch::per_row(q.rows, ROTATE_BLOCK)),
         &[
             q.arg(),
@@ -429,7 +429,7 @@ pub fn yarn_split_append(
     let per_block = heads_per_block(half);
     ctx.fire(
         OP,
-        Fire::at(ROPE, "::pie::elemwise::rope_yarn_split_append").apply(rotate_launch(
+        Fire::at(kernel(ROPE, "::pie::elemwise::rope_yarn_split_append")).apply(rotate_launch(
             q_out.rows,
             num_q_heads + num_kv_heads,
             per_block,
@@ -518,7 +518,7 @@ fn yarn_fire(
     };
     ctx.fire(
         op,
-        Fire::at(ROPE, entry).apply(rotate_launch(
+        Fire::at(kernel(ROPE, entry)).apply(rotate_launch(
             q.rows,
             num_q_heads + num_kv_heads,
             per_block,
@@ -567,7 +567,7 @@ fn rope_partial(
     let num_kv_heads = heads(op, k.width, head_dim)?;
     ctx.fire(
         op,
-        Fire::at(ROPE, "::pie::elemwise::rope_partial<::pie::bf16>")
+        Fire::at(kernel(ROPE, "::pie::elemwise::rope_partial<::pie::bf16>"))
             .apply(Launch::per_row(q.rows, ROTATE_BLOCK)),
         &[
             q.arg(),
@@ -759,13 +759,10 @@ fn fire_axes(
     let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             ROPE,
-            symbol(&format!(
-                "::pie::elemwise::rope_axes<{t}, {}>",
-                form.stamp()
-            )),
-        )
+            &format!("::pie::elemwise::rope_axes<{t}, {}>", form.stamp()),
+        ))
         .apply(Launch::per_row(rows, ROTATE_BLOCK)),
         &[
             x.arg(),
@@ -908,7 +905,7 @@ fn fire_mrope(
     let rows = nonzero(OP, "rows", q.rows)?;
     ctx.fire(
         OP,
-        Fire::at(ROPE, entry).apply(Launch::per_row(rows, ROTATE_BLOCK)),
+        Fire::at(kernel(ROPE, entry)).apply(Launch::per_row(rows, ROTATE_BLOCK)),
         &[
             q.arg(),
             k.arg(),
@@ -1038,7 +1035,7 @@ pub fn rope(
     let rows = nonzero(op, "rows", q.rows)?;
     ctx.fire(
         op,
-        Fire::at(ROPE, "::pie::elemwise::rope_table<::pie::bf16>")
+        Fire::at(kernel(ROPE, "::pie::elemwise::rope_table<::pie::bf16>"))
             .apply(Launch::per_row(rows, ROTATE_BLOCK).smem(2 * turned * 4)),
         &[
             q.arg(),

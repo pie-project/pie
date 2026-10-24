@@ -1,7 +1,7 @@
 use super::*;
 use crate::error::Error;
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, ArgValue, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::linear::dequant::{Planes, planes};
 use crate::tensor::Tensor;
@@ -226,13 +226,13 @@ pub(super) fn select_mxfp4_mma(
             2 => 3,
             _ => 2,
         };
-        Fire::at(
+        Fire::at(kernel(
             SELECT_FP4_SM100,
-            symbol(&format!(
+            &format!(
                 "::pie::linear::moe_select_mxfp4_cvt<{nb}, {code}, {DEPTH}, {win}, {blocks}, \
                  {ksplit}>"
-            )),
-        )
+            ),
+        ))
         .apply(
             Launch::grid(grid, [THREADS, 1, 1])
                 .smem(nb * win * 4096)
@@ -249,22 +249,18 @@ pub(super) fn select_mxfp4_mma(
         let ctas = fan.route_count.div_ceil(64) * grid[1];
         let stages: u32 = if ctas >= 3 * sms - sms / 2 { 2 } else { 3 };
         let smem = stages * (64 * 256 + 128 * (64 + 8)) + 128 * 32 + 1024;
-        Fire::at(
+        Fire::at(kernel(
             SELECT_SM90,
-            symbol(&format!(
-                "::pie::linear::moe_select_fp4_wgmma<{code}, {nv}, {stages}>"
-            )),
-        )
+            &format!("::pie::linear::moe_select_fp4_wgmma<{code}, {nv}, {stages}>"),
+        ))
         .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(smem))
     } else if staged {
         const STAGES: u32 = 3;
         let nv = tensor_scales.is_some();
-        Fire::at(
+        Fire::at(kernel(
             SELECT_FP4_SM80,
-            symbol(&format!(
-                "::pie::linear::moe_select_mxfp4_mma_staged<{nb}, {STAGES}, {code}, {nv}>"
-            )),
-        )
+            &format!("::pie::linear::moe_select_mxfp4_mma_staged<{nb}, {STAGES}, {code}, {nv}>"),
+        ))
         .apply(Launch::grid(grid, [THREADS, 1, 1]).smem(STAGES * 8 * nb * 16 * 16))
     } else {
         let depth = MMA_DEPTH;
@@ -282,13 +278,10 @@ pub(super) fn select_mxfp4_mma(
             1
         };
         let nv = tensor_scales.is_some();
-        Fire::at(
-            SELECT_FP4_SM80,
-            // NVFP4 (`nv`): an e4m3 scale a 16 codes, a tensor scale a row.
-            symbol(&format!(
-                "::pie::linear::moe_select_mxfp4_mma<{nb}, {depth}, {code}, {nv}, {ksplit}>"
-            )),
-        )
+        Fire::at(kernel(
+            SELECT_FP4_SM80, // NVFP4 (`nv`): an e4m3 scale a 16 codes, a tensor scale a row.
+            &format!("::pie::linear::moe_select_mxfp4_mma<{nb}, {depth}, {code}, {nv}, {ksplit}>"),
+        ))
         .apply(Launch::grid(grid, [THREADS * ksplit, 1, 1]))
     };
     let mut args = vec![
@@ -467,7 +460,7 @@ pub(super) fn matmul_select_mxfp4(
         ]);
         return ctx.fire(
             op,
-            Fire::at(if wmma { SELECT_SM80 } else { SELECT }, symbol(&entry)).apply(Launch::grid(
+            Fire::at(kernel(if wmma { SELECT_SM80 } else { SELECT }, &entry)).apply(Launch::grid(
                 [
                     if wmma { work_cap } else { experts },
                     y.width.div_ceil(GROUPED_TILE_N),
@@ -480,13 +473,13 @@ pub(super) fn matmul_select_mxfp4(
     }
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             SELECT,
-            symbol(&format!(
+            &format!(
                 "::pie::linear::moe_matmul_select_mxfp4<{t}, ::pie::i32({ROWS_PER_WARP}){}>",
                 if lean { ", true" } else { "" }
-            )),
-        )
+            ),
+        ))
         .apply(Launch::grid(
             [fan.route_count, y.width.div_ceil(tile), 1],
             [block, 1, 1],
@@ -648,7 +641,7 @@ pub(super) fn matmul_select_mlxu4(
         ]);
         return ctx.fire(
             op,
-            Fire::at(if wmma { SELECT_SM80 } else { SELECT }, symbol(&entry)).apply(Launch::grid(
+            Fire::at(kernel(if wmma { SELECT_SM80 } else { SELECT }, &entry)).apply(Launch::grid(
                 [
                     if wmma { work_cap } else { experts },
                     y.width.div_ceil(GROUPED_TILE_N),
@@ -661,13 +654,10 @@ pub(super) fn matmul_select_mlxu4(
     }
     ctx.fire(
         op,
-        Fire::at(
-            SELECT,
-            symbol(&format!(
+        Fire::at(kernel(SELECT, &format!(
                 "::pie::linear::moe_matmul_select_mlxu4<{t}, ::pie::i32({bits}), ::pie::i32({group}), \
                  ::pie::i32({ROWS_PER_WARP})>"
-            )),
-        )
+            )))
         .apply(Launch::grid(
             [fan.route_count, y.width.div_ceil(tile), 1],
             [DECODE_BLOCK, 1, 1],
@@ -838,10 +828,10 @@ pub(crate) fn select_nvfp4_grouped(
     let act_div = if fan.by_token { fan.top_k } else { 1 };
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             SELECT_FP4_SM80,
-            symbol("::pie::linear::moe_matmul_select_nvfp4_mma"),
-        )
+            "::pie::linear::moe_matmul_select_nvfp4_mma",
+        ))
         .apply(Launch::grid(
             [work_cap, y.width.div_ceil(GROUPED_TILE_N), 1],
             [GROUPED_BLOCK, 1, 1],
@@ -894,13 +884,13 @@ pub(crate) fn select_nvfp4_routed(
     }
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             SELECT,
-            symbol(&format!(
+            &format!(
                 "::pie::linear::moe_matmul_select_nvfp4<{t}, ::pie::i32({NVFP4_ROWS_PER_WARP}){}>",
                 if lean { ", true" } else { "" }
-            )),
-        )
+            ),
+        ))
         .apply(Launch::grid(
             [route_count, y.width.div_ceil(tile), 1],
             [block, 1, 1],
