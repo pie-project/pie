@@ -35,15 +35,28 @@ fn fnv(name: &str) -> u64 {
     hash
 }
 
-/// A plane's bf16 values, by its name.
+/// A plane's bf16 values, by its name. A head's q and k norms scale by a
+/// quarter: at one, Gemma 4's 256-wide heads under its unit softmax scale
+/// score keys 16 apart, an argmax whose near ties a last-place rounding
+/// flips: its joined trace answered 6 apart over a spread of 10 with its
+/// qkv write fused and with it unfused.
 fn values(name: &str, count: usize) -> Vec<u16> {
     let norm = name.ends_with("norm");
+    let scale = if name.ends_with("q_norm") || name.ends_with("k_norm") {
+        0.25
+    } else {
+        1.0
+    };
     let mut seed = fnv(name);
     (0..count)
         .map(|_| {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
             let unit = ((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5;
-            let value = if norm { 1.0 + 0.05 * unit } else { 0.08 * unit };
+            let value = if norm {
+                scale * (1.0 + 0.05 * unit)
+            } else {
+                0.08 * unit
+            };
             (value.to_bits() >> 16) as u16
         })
         .collect()
@@ -168,28 +181,27 @@ fn logits(trace: &Trace, joins: &[Join], unjoined: &Trace, tag: &str, prompt: &[
 
 /// Text rows of the packages the compiler joins products in: their legs
 /// apart (the trace as the package records it) and joined (as it serves).
-const ROWS: [&str; 3] = [
+const ROWS: [&str; 11] = [
     ROW,
     "llama33-70b-mini-l4-bf16-kv-bf16",
     "glm45-air-mini-bf16-kv-bf16",
-];
-
-/// Rows whose legs apart this engine does not yet answer as joined: the
-/// apart form is what serves only where the compiler cannot join them.
-/// gemma 4's q, k and v apart answer 6.1 off over a spread of 9.7; hy 4's
-/// gate and up apart reach a refused `linear.glu` in a fused region; the
-/// rest from minimax m3 on are not yet run apart.
-const APART_OPEN: [&str; 9] = [
     "gemma4-e4b-mini-l6-bf16-kv-bf16",
     "hy4-mini-bf16-kv-bf16",
     "minimax-m3-mini-bf16-kv-bf16",
-    "muse-glimmer-30b-mini-l8-bf16-kv-bf16",
     "nemotron3-nano-mini-bf16-kv-bf16",
     "qwen3-30b-a3b-mini-bf16-kv-bf16",
     "qwen35-d0.8b-bf16-kv-bf16",
     "dots3-note-mini-bf16-kv-bf16",
     "inkling-mini-l7-e8-bf16-kv-bf16",
 ];
+
+/// Rows whose legs apart this engine does not yet answer as joined: the
+/// apart form is what serves only where the compiler cannot join them.
+/// Muse's apart answers 0.17 off over a spread of 3.2, as its joined trace
+/// does with its qkv write unfused: its unit-RMS q and k heads, unscaled,
+/// score keys 3.9 apart under its softmax scale, and its eight layers carry
+/// a last-place rounding 5% of the spread.
+const APART_OPEN: [&str; 1] = ["muse-glimmer-30b-mini-l8-bf16-kv-bf16"];
 
 #[test]
 #[ignore = "the engine's apart forms of these rows are open"]
