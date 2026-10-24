@@ -263,6 +263,10 @@ pub struct Toggles {
     pub static_max_requests: u32,
 
     pub decode_gqa: crate::attn::decode_gqa::Gate,
+
+    /// `Tuning::batch_invariant`: a request's tiles and splits are its own
+    /// lengths', whatever else the batch holds.
+    pub invariant: bool,
 }
 
 impl Toggles {
@@ -275,6 +279,7 @@ impl Toggles {
             prefill_ctas_per_sm: tuning.prefill_ctas_per_sm,
             static_max_requests: tuning.decode_static_max_requests,
             decode_gqa: crate::attn::decode_gqa::Gate::of(tuning),
+            invariant: tuning.batch_invariant,
         }
     }
 }
@@ -370,6 +375,7 @@ pub fn plan_decode(
     };
     let windowed_split = toggles.window_split && window_left >= 0;
     let built = if !windowed_split
+        && !toggles.invariant
         && decode::can_use_static_nonsplit(shape.num_requests, enable_cuda_graph, toggles)
     {
         decode::static_nonsplit(
@@ -392,7 +398,10 @@ pub fn plan_decode(
             enable_cuda_graph,
             chunk_floor_128: toggles.chunk_floor_128,
             window_left: u32::try_from(window_left).ok(),
-            whole: ranks > 0
+            // Batch-invariant, a request's keys are one work item, folded
+            // alone: the split the batch would size is not taken.
+            whole: toggles.invariant
+                || ranks > 0
                 || toggles
                     .decode_gqa
                     .whole(shape.head_dim, shape.group_size(), window_left),
@@ -458,6 +467,7 @@ pub fn plan_prefill(
         enable_cuda_graph,
         window_left: window.map(|w| w - 1),
         ctas_per_sm: toggles.prefill_ctas_per_sm,
+        invariant: toggles.invariant,
     };
 
     let (built, capturable, graph_refusal) =

@@ -119,17 +119,13 @@ pub(crate) fn act_x_wt(
         n,
         k,
     };
-    let capturing = capture_status(stream);
     let tuning = ctx.tuning();
+    if tuning.batch_invariant {
+        return act_x_wt_invariant(ctx, op, stream, call).map(|()| false);
+    }
+    let capturing = capture_status(stream);
     let (plan, tactic, lt_handle, want) = with_device(|device| {
-        device.configure(
-            (tuning.gemm_workspace_mb as usize) << 20,
-            tuning.gemm_heuristics as usize,
-            tuning.gemm_narrow_n,
-            tuning.gemm_split_launch_ns,
-            tuning.gemm_rows_m,
-            tuning.gemm_split_launch_from,
-        );
+        device.configure(tuning);
         let plan = device.plan_for(call);
         let tactic = capturing
             .and_then(|status| device.tactic_for(handle, stream, plan.as_deref(), call, status));
@@ -221,6 +217,51 @@ pub(crate) fn act_x_wt(
         format!(
             "`cublasGemmEx` answered {status:?} at M={m} N={n} K={k}, and the \
              non-tensor-op and cuBLASLt retries failed too"
+        ),
+    ))
+}
+
+/// [`act_x_wt`] under `Tuning::batch_invariant`: every product of a
+/// (columns, contraction) on one cuBLASLt algorithm, unsplit along K, so a
+/// row's sums run in one order whatever rows share its launch. The bias is
+/// left to the add after.
+fn act_x_wt_invariant(
+    ctx: &Ctx,
+    op: &'static str,
+    stream: *mut c_void,
+    call: Call,
+) -> Result<(), Error> {
+    let tuning = ctx.tuning();
+    let (picked, lt_handle, want) = with_device(|device| {
+        device.configure(tuning);
+        (
+            device.invariant_for(call),
+            device.lt.handle,
+            device.lt.workspace_bytes,
+        )
+    });
+    let Some((plan, algo)) = picked else {
+        return Err(refuse(
+            op,
+            format!(
+                "cuBLASLt has no algorithm that runs N={} K={} unsplit at every row count",
+                call.n, call.k
+            ),
+        ));
+    };
+    let (ws, ws_bytes) = match ctx.scratch_shared(op, LT_WORKSPACE, want) {
+        Ok(ws) if !ws.is_null() => (ws, want),
+        _ => (std::ptr::null_mut(), 0),
+    };
+    if run_lt(lt_handle, &plan, &algo, stream, call, ws, ws_bytes) {
+        return Ok(());
+    }
+    clear_error();
+    Err(refuse(
+        op,
+        format!(
+            "the batch-invariant algorithm for N={} K={} refused M={}",
+            call.n, call.k, call.m
         ),
     ))
 }
@@ -385,6 +426,10 @@ pub(crate) fn act_x_wt_f32(
 
 const LT_WORKSPACE: &str = "linear.lt_workspace";
 
+/// The rows a batch-invariant product's one algorithm is chosen at: a
+/// prefill chunk's, where most of a load's GEMM time goes.
+const INVARIANT_ROWS: i32 = 128;
+
 struct LtCtx {
     handle: lt::cublasLtHandle_t,
     workspace_bytes: usize,
@@ -448,25 +493,9 @@ impl Drop for LtPlan {
     }
 }
 
-fn build_lt_plan(
-    lt_handle: lt::cublasLtHandle_t,
-    workspace_bytes: usize,
-    heuristics_wanted: usize,
-    m: i32,
-    n: i32,
-    k: i32,
-    in_place: bool,
-) -> Option<LtPlan> {
-    struct Pref(lt::cublasLtMatmulPreference_t);
-    impl Drop for Pref {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                // SAFETY: a non-null preference this guard alone owns, freed once.
-                let _ = unsafe { lt::cublasLtMatmulPreferenceDestroy(self.0) };
-            }
-        }
-    }
-
+/// An `m x n x k` product's descriptors (`act . w^T`, bf16 in and out, f32
+/// sums), no algorithm chosen.
+fn describe(m: i32, n: i32, k: i32) -> Option<LtPlan> {
     let ok = lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS;
     let mut plan = LtPlan {
         op_desc: std::ptr::null_mut(),
@@ -529,6 +558,30 @@ fn build_lt_plan(
             return None;
         }
     }
+    Some(plan)
+}
+
+fn build_lt_plan(
+    lt_handle: lt::cublasLtHandle_t,
+    workspace_bytes: usize,
+    heuristics_wanted: usize,
+    m: i32,
+    n: i32,
+    k: i32,
+    in_place: bool,
+) -> Option<LtPlan> {
+    struct Pref(lt::cublasLtMatmulPreference_t);
+    impl Drop for Pref {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: a non-null preference this guard alone owns, freed once.
+                let _ = unsafe { lt::cublasLtMatmulPreferenceDestroy(self.0) };
+            }
+        }
+    }
+
+    let ok = lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS;
+    let mut plan = describe(m, n, k)?;
     let mut pref = Pref(std::ptr::null_mut());
     // SAFETY: `pref.0` is a local out-pointer, freed by the guard.
     if unsafe { lt::cublasLtMatmulPreferenceCreate(&raw mut pref.0) } != ok {
@@ -832,6 +885,10 @@ struct Device {
     /// few-rows kernel.
     rows_m: u32,
     plans: HashMap<(i32, i32, i32), Arc<LtPlan>>,
+    /// Under `Tuning::batch_invariant`: each (N, K)'s one algorithm, and
+    /// each shape's descriptors it runs over.
+    invariant: HashMap<(i32, i32), Option<lt::cublasLtMatmulAlgo_t>>,
+    described: HashMap<(i32, i32, i32), Arc<LtPlan>>,
     chosen: HashMap<u64, Tactic>,
     disk: DiskCache,
 }
@@ -855,6 +912,8 @@ fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
                 split_from: 0,
                 rows_m: 0,
                 plans: HashMap::new(),
+                invariant: HashMap::new(),
+                described: HashMap::new(),
                 chosen: HashMap::new(),
                 disk: DiskCache::new(),
             }))
@@ -868,15 +927,15 @@ impl Device {
     /// Lay a load's GEMM settings on this device (`kernel.gemm.workspace_mb`,
     /// `kernel.gemm.heuristics`): plans and tactics chosen under other
     /// settings are dropped, since an algorithm may need more workspace.
-    fn configure(
-        &mut self,
-        workspace_bytes: usize,
-        heuristics: usize,
-        narrow_n: u32,
-        split_ns: u32,
-        rows_m: u32,
-        split_from: u32,
-    ) {
+    fn configure(&mut self, tuning: crate::tuning::Tuning) {
+        let workspace_bytes = (tuning.gemm_workspace_mb as usize) << 20;
+        let heuristics = tuning.gemm_heuristics as usize;
+        let (narrow_n, split_ns, rows_m, split_from) = (
+            tuning.gemm_narrow_n,
+            tuning.gemm_split_launch_ns,
+            tuning.gemm_rows_m,
+            tuning.gemm_split_launch_from,
+        );
         if self.lt.workspace_bytes != workspace_bytes
             || self.heuristics != heuristics
             || self.narrow_n != narrow_n
@@ -891,6 +950,7 @@ impl Device {
             self.split_ns = split_ns;
             self.rows_m = rows_m;
             self.plans.clear();
+            self.invariant.clear();
             self.chosen.clear();
         }
     }
@@ -902,6 +962,101 @@ impl Device {
         } else {
             0
         }
+    }
+
+    /// The algorithm every product of `call`'s columns and contraction
+    /// runs under `Tuning::batch_invariant`, with `call`'s descriptors:
+    /// cuBLASLt's first heuristic at [`INVARIANT_ROWS`] that runs unsplit
+    /// along K at one row and at those rows. A tile walks a row's K in one
+    /// order whatever the launch's rows; which tile, and any split, are what
+    /// the rows would otherwise choose.
+    fn invariant_for(&mut self, call: Call) -> Option<(Arc<LtPlan>, lt::cublasLtMatmulAlgo_t)> {
+        let (m, n, k) = (call.m, call.n, call.k);
+        if !self.lt.ensure() {
+            return None;
+        }
+        let algo = match self.invariant.get(&(n, k)) {
+            Some(algo) => *algo,
+            None => {
+                let algo = self.unsplit(n, k);
+                self.invariant.insert((n, k), algo);
+                algo
+            }
+        }?;
+        let plan = match self.described.get(&(m, n, k)) {
+            Some(plan) => Arc::clone(plan),
+            None => {
+                let plan = Arc::new(describe(m, n, k)?);
+                self.described.insert((m, n, k), Arc::clone(&plan));
+                plan
+            }
+        };
+        Some((plan, algo))
+    }
+
+    /// [`Device::invariant_for`]'s algorithm for (N, K), its split along K
+    /// laid to one.
+    fn unsplit(&self, n: i32, k: i32) -> Option<lt::cublasLtMatmulAlgo_t> {
+        let ok = lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS;
+        let at = build_lt_plan(
+            self.lt.handle,
+            self.lt.workspace_bytes,
+            self.heuristics,
+            INVARIANT_ROWS,
+            n,
+            k,
+            false,
+        )?;
+        let one = describe(1, n, k)?;
+        let whole: i32 = 1;
+        let scheme = lt::cublasLtReductionScheme_t::CUBLASLT_REDUCTION_SCHEME_NONE;
+        at.heuristics.iter().find_map(|heuristic| {
+            let mut algo = heuristic.algo;
+            // SAFETY: `algo` is a local copy of a returned algorithm; `whole`
+            // and `scheme` are locals of the sizes passed.
+            let set = unsafe {
+                lt::cublasLtMatmulAlgoConfigSetAttribute(
+                    &raw mut algo,
+                    lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_SPLITK_NUM,
+                    std::ptr::from_ref(&whole).cast(),
+                    std::mem::size_of::<i32>(),
+                ) == ok
+                    && lt::cublasLtMatmulAlgoConfigSetAttribute(
+                        &raw mut algo,
+                        lt::cublasLtMatmulAlgoConfigAttributes_t::CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME,
+                        std::ptr::from_ref(&scheme).cast(),
+                        std::mem::size_of::<lt::cublasLtReductionScheme_t>(),
+                    ) == ok
+            };
+            let runs = |plan: &LtPlan| {
+                // SAFETY: as for `heuristics` in `build_lt_plan`: all-zero
+                // bytes are a valid value.
+                let mut result: lt::cublasLtMatmulHeuristicResult_t =
+                    unsafe { core::mem::zeroed() };
+                // SAFETY: `self.lt.handle` and `plan`'s descriptors are live,
+                // `algo` a local configured above, `result` a local out-pointer.
+                let checked = unsafe {
+                    lt::cublasLtMatmulAlgoCheck(
+                        self.lt.handle,
+                        plan.op_desc,
+                        plan.a_desc,
+                        plan.b_desc,
+                        plan.c_desc,
+                        plan.c_desc,
+                        &raw const algo,
+                        &raw mut result,
+                    )
+                };
+                checked == ok
+                    && result.state == ok
+                    && result.workspaceSize <= self.lt.workspace_bytes
+            };
+            let taken = set && runs(&at) && runs(&one);
+            if !taken {
+                clear_error();
+            }
+            taken.then_some(algo)
+        })
     }
 
     fn plan_for(&mut self, call: Call) -> Option<Arc<LtPlan>> {

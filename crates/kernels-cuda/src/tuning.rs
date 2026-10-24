@@ -868,15 +868,22 @@ macro_rules! tuning {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub struct Tuning {
             $($(#[$doc])* pub $field: $ty,)*
+            /// Whether a row's reduction order is fixed by the shapes a
+            /// kernel serves, not by the launch's rows: no profile states
+            /// it; [`Tuning::batch_invariant`] lays it.
+            pub batch_invariant: bool,
         }
 
         impl Tuning {
             /// The registry defaults; a test holds the two equal.
-            pub const DEFAULT: Tuning = Tuning { $($field: $default,)* };
+            pub const DEFAULT: Tuning = Tuning { $($field: $default,)* batch_invariant: false };
 
             #[must_use]
             pub fn of(profile: &Profile) -> Tuning {
-                Tuning { $($field: tuning!(@read profile, $how $($decision)::+),)* }
+                Tuning {
+                    $($field: tuning!(@read profile, $how $($decision)::+),)*
+                    batch_invariant: false,
+                }
             }
         }
     };
@@ -992,6 +999,37 @@ tuning! {
     mla_sparse: bool = false, on SdpaMlaSparse;
     mla_dense_short: bool = false, on SdpaMlaDenseShort;
     gemm_narrow_n: u32 = 0, get GemmNarrowN;
+}
+
+impl Tuning {
+    /// These decisions with every row's result made independent of the
+    /// rows it shares a launch with: each choice a fire's row count (or
+    /// request count) makes is pinned to one arm, and the kernels whose own
+    /// schedules follow the batch (the dense GEMM's tactic, the attention
+    /// plans' splits and tiles, the split's fold) take a fixed one. A
+    /// request's logits are then the same bits alone or in any crowd.
+    #[must_use]
+    pub const fn batch_invariant(self) -> Tuning {
+        Tuning {
+            batch_invariant: true,
+            // Every dense bf16 product on cuBLASLt (one algorithm a shape's
+            // columns and contraction, whatever its rows); a packed one as
+            // one product, cut after.
+            gemm_skinny_rows: 0,
+            gemm_split_rows_from: u32::MAX,
+            // The row kernels' forms, one at every fire width.
+            qg_prologue_until: u32::MAX,
+            qkv_rows_from: u32::MAX,
+            norm_fold_block: 0,
+            ssm_gdn_scan_until: 0,
+            // Attention on FA2's schedules, with no batch-sized split.
+            prefill_tc5: false,
+            decode_grouped_prefill_from: 0,
+            decode_gqa_from_64: 0,
+            decode_gqa_cluster: 0,
+            ..self
+        }
+    }
 }
 
 #[cfg(test)]

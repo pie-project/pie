@@ -33,6 +33,8 @@ fn prefill_float_bytes(
         facts.head_dim,
         device,
         toggles.prefill_ctas_per_sm,
+        #[cfg(not(feature = "rocm"))]
+        toggles.invariant,
     );
     let heads = u64::from(facts.q_heads);
     let rows = prefill_partial_rows(tile, facts.q_heads, facts.kv_heads);

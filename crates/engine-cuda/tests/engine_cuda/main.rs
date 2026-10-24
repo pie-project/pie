@@ -29,6 +29,8 @@ mod common_vae;
 
 mod a_bank_says_which_site_it_corrects;
 #[cfg(feature = "cuda")]
+mod a_batch_invariant_lane_answers_what_it_answers_alone;
+#[cfg(feature = "cuda")]
 mod a_joined_projection_answers_what_its_legs_answer;
 mod a_bidirectional_attention_adds_its_relative_bias_through_the_engine;
 mod a_buffer_frees_after_another_context_closes;

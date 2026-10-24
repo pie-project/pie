@@ -57,7 +57,20 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             chip
         }
     };
-    device.set_tuning(kernels_cuda::tuning::Tuning::of(&chip));
+    let tuning = kernels_cuda::tuning::Tuning::of(&chip);
+    #[cfg(not(feature = "rocm"))]
+    let tuning = if boot.knobs.batch_invariant {
+        tuning.batch_invariant()
+    } else {
+        tuning
+    };
+    #[cfg(feature = "rocm")]
+    if boot.knobs.batch_invariant {
+        return Err(Fault::Unsupported(
+            "`batch_invariant`: the HIP kernels keep their batch-sized schedules".into(),
+        ));
+    }
+    device.set_tuning(tuning);
     let engine = crate::chip::Engine::of(&chip);
     if boot.budget.max_tokens == 0 {
         boot.budget.max_tokens = match engine.forward_tokens {
@@ -120,7 +133,6 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     boot.trace = poem_compiler::fuse::fuse(boot.trace.clone(), kernels);
     #[cfg(not(feature = "rocm"))]
     {
-        let tuning = kernels_cuda::tuning::Tuning::of(&chip);
         boot.trace = crate::grouped_decode::rewrite_with(
             boot.trace.clone(),
             tuning.decode_grouped_prefill_from,
