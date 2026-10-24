@@ -246,13 +246,8 @@ def moe(x, m, w):
         routing.softmax(),
     )
 
-    def select(act, bank):
-        if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
-            return ops.linear.moe_matmul_select(act, bank, experts, m.top_k)
-        return ops.linear.moe_matmul_select_quant(act, bank, experts, m.top_k)
-
-    hidden = ops.linear.glu(select(x, w.gate_up), gating.swiglu(), m.inter)
-    return ops.linear.moe_weighted_sum(select(hidden, w.down), weights)
+    hidden = ops.linear.glu(ops.linear.moe_matmul_select(x, w.gate_up, experts, m.top_k), gating.swiglu(), m.inter)
+    return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(hidden, w.down, experts, m.top_k), weights)
 
 def attention(x, inputs, m, positions, w):
     pages = inputs.kv(w.kv)

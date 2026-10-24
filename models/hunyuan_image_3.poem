@@ -457,13 +457,8 @@ def moe(x, w, m):
         routing.softmax(),
     )
 
-    def select(act, bank):
-        if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
-            return ops.linear.moe_matmul_select(act, bank, routes, d.top_k)
-        return ops.linear.moe_matmul_select_quant(act, bank, routes, d.top_k)
-
-    act = ops.linear.glu(select(x, w.experts_gate_up), gating.swiglu(), d.moe_inter)
-    routed = ops.linear.moe_weighted_sum(select(act, w.experts_down), weights)
+    act = ops.linear.glu(ops.linear.moe_matmul_select(x, w.experts_gate_up, routes, d.top_k), gating.swiglu(), d.moe_inter)
+    routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, w.experts_down, routes, d.top_k), weights)
     shared = ops.linear.matmul(
         ops.linear.glu(ops.linear.matmul(x, w.shared_gate_up), gating.swiglu(), d.shared_inter),
         w.shared_down,

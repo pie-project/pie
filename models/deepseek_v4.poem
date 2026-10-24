@@ -1918,43 +1918,38 @@ def mlp(x, ids, f, streams, following, hy):
         f.shared_down,
     )
 
-    def select(act, bank):
-        if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
-            return ops.linear.moe_matmul_select(act, bank, routes, f.top_k)
-        return ops.linear.moe_matmul_select_quant(act, bank, routes, f.top_k)
-
     if f.down.precision != f.down.dtype and f.gate_up.fused != None:
         # The same over one packed gate-up bank: each expert's gate rows,
         # then its up rows.
         act = ops.linear.glu(
-            select(x, f.gate_up.fused),
+            ops.linear.moe_matmul_select(x, f.gate_up.fused, routes, f.top_k),
             gating.swiglu(),
             f.inter,
             weights = weights,
             limit = f.limit,
         )
-        return ops.linear.moe_sum_add(select(act, f.down), shared)
+        return ops.linear.moe_sum_add(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), shared)
     if f.down.precision != f.down.dtype and f.gate_up.fused == None:
         # DeepSeek's expert weighs its activations before its down leg
         # quantizes them, and sums its routes and the shared expert in f32.
         act = ops.linear.glu(
-            select(x, f.gate_up.gate),
+            ops.linear.moe_matmul_select(x, f.gate_up.gate, routes, f.top_k),
             gating.swiglu(),
-            up = select(x, f.gate_up.up),
+            up = ops.linear.moe_matmul_select(x, f.gate_up.up, routes, f.top_k),
             weights = weights,
             limit = f.limit,
         )
-        return ops.linear.moe_sum_add(select(act, f.down), shared)
+        return ops.linear.moe_sum_add(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), shared)
     if f.gate_up.fused != None:
-        act = ops.linear.glu(select(x, f.gate_up.fused), gating.swiglu(), f.inter, limit = f.limit)
+        act = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up.fused, routes, f.top_k), gating.swiglu(), f.inter, limit = f.limit)
     else:
         act = ops.linear.glu(
-            select(x, f.gate_up.gate),
+            ops.linear.moe_matmul_select(x, f.gate_up.gate, routes, f.top_k),
             gating.swiglu(),
-            up = select(x, f.gate_up.up),
+            up = ops.linear.moe_matmul_select(x, f.gate_up.up, routes, f.top_k),
             limit = f.limit,
         )
-    routed = ops.linear.moe_weighted_sum(select(act, f.down), weights)
+    routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
     return ops.elemwise.residual_add(shared, routed)
 
 def indexer(x, q_a, ix, positions, bpos, breq, brope, keys, write_page, write_offset):

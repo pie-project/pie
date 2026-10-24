@@ -984,9 +984,9 @@ def mlp(x, f, hint):
         bias = f.bias,
         hint = hint,
     )
-    packed = select(x, f.gate_up, routes, f.top_k)
+    packed = ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k)
     act = ops.linear.glu(packed, gating.swiglu(), f.inter, limit = f.limit)
-    routed = ops.linear.moe_weighted_sum(select(act, f.down, routes, f.top_k), weights)
+    routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
     s = f.shared
     act = ops.linear.glu(ops.linear.matmul(x, s.gate_up), gating.swiglu(), s.inter, limit = f.limit)
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
@@ -1080,9 +1080,3 @@ def run_tower(inputs, t):
     a = ops.linear.glu(h, gating.swiglu(), t.merger_inter, limit = t.limit)
     return ops.linear.matmul(a, mg.down)
 
-def select(x, bank, routes, top_k):
-    """A routed bank's select: a bf16 bank's plain, a quantized one's
-    through its codes and factors."""
-    if bank.dtype == dtype.bf16:
-        return ops.linear.moe_matmul_select(x, bank, routes, top_k)
-    return ops.linear.moe_matmul_select_quant(x, bank, routes, top_k)

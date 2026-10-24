@@ -753,10 +753,10 @@ def mlp(x, f):
         )
     lat = f.latent
     z = ops.linear.matmul(x, lat.down) if lat != None else x
-    hidden = ops.linear.moe_matmul_select_quant(z, f.gate_up, routes, f.top_k)
+    hidden = ops.linear.moe_matmul_select(z, f.gate_up, routes, f.top_k)
     act = ops.linear.glu(hidden, gating.situ(f.beta, up_cap = f.up_cap), f.inter)
     routed = ops.linear.moe_weighted_sum(
-        ops.linear.moe_matmul_select_quant(act, f.down, routes, f.top_k),
+        ops.linear.moe_matmul_select(act, f.down, routes, f.top_k),
         weights,
     )
     if lat != None:

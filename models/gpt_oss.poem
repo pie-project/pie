@@ -384,7 +384,7 @@ def forward(m, inputs):
         )
         packed = ops.linear.moe_matmul_select_bias(x, e.gate_up, e.gate_up_bias, experts, e.top_k)
         act = ops.linear.glu(packed, gating.swiglu_alpha(e.swiglu_alpha), e.inter, limit = e.swiglu_limit)
-        routed = ops.linear.moe_matmul_select_quant(act, e.down, experts, e.top_k)
+        routed = ops.linear.moe_matmul_select(act, e.down, experts, e.top_k)
         f = ops.linear.moe_weighted_sum(routed, weights)
         f = ops.linear.moe_bias_sum(f, e.down_bias, experts, weights)
         y = ops.elemwise.residual_add(f, y)

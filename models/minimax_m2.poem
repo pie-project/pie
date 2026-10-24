@@ -213,13 +213,8 @@ def moe(x, m, w):
         bias = w.bias,
     )
 
-    def select(act, bank):
-        if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
-            return ops.linear.moe_matmul_select(act, bank, routes, m.top_k)
-        return ops.linear.moe_matmul_select_quant(act, bank, routes, m.top_k)
-
-    act = ops.linear.glu(select(x, w.gate_up), gating.swiglu(), m.inter)
-    return ops.linear.moe_weighted_sum(select(act, w.down), weights)
+    act = ops.linear.glu(ops.linear.moe_matmul_select(x, w.gate_up, routes, m.top_k), gating.swiglu(), m.inter)
+    return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, w.down, routes, m.top_k), weights)
 
 def attention(x, inputs, m, positions, w):
     pages = inputs.kv(w.kv)

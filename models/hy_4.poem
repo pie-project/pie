@@ -549,13 +549,8 @@ def mlp(x, f):
         bias = f.bias,
     )
 
-    def select(act, bank):
-        if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
-            return ops.linear.moe_matmul_select(act, bank, routes, f.top_k)
-        return ops.linear.moe_matmul_select_quant(act, bank, routes, f.top_k)
-
-    act = ops.linear.glu(select(x, f.gate_up), gating.swiglu(), f.inter, limit = f.limit)
-    routed = ops.linear.moe_weighted_sum(select(act, f.down), weights)
+    act = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k), gating.swiglu(), f.inter, limit = f.limit)
+    routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
     s = f.shared
     act = ops.linear.glu(ops.linear.matmul(x, s.gate_up), gating.swiglu(), s.inter)
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)

@@ -433,6 +433,6 @@ def mlp(x, f):
         routing.sigmoid(renormalize = True, scaling = 1.0),
         bias = f.bias,
     )
-    packed = ops.linear.moe_matmul_select_quant(x, f.gate_up, routes, f.top_k)
+    packed = ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k)
     act = ops.linear.glu(packed, gating.swiglu(), f.inter)
-    return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select_quant(act, f.down, routes, f.top_k), weights)
+    return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)

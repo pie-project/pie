@@ -249,13 +249,8 @@ def moe(m, w, x):
     )
     h = ops.elemwise.rmsnorm_plus_one(ops.linear.matmul(x, w.pool), w.pool_norm, m.norm_eps)
 
-    def select(act, bank):
-        if bank.dtype in [dtype.bf16, dtype.f16, dtype.f32]:
-            return ops.linear.moe_matmul_select(act, bank, routes, m.top_k)
-        return ops.linear.moe_matmul_select_quant(act, bank, routes, m.top_k)
-
-    act = ops.linear.glu(select(h, w.gate_up), gating.swiglu(), m.inter)
-    out = ops.elemwise.norm_gate(select(act, w.down), w.expert_scale, None, None, m.post_norm_eps, 1.0)
+    act = ops.linear.glu(ops.linear.moe_matmul_select(h, w.gate_up, routes, m.top_k), gating.swiglu(), m.inter)
+    out = ops.elemwise.norm_gate(ops.linear.moe_matmul_select(act, w.down, routes, m.top_k), w.expert_scale, None, None, m.post_norm_eps, 1.0)
     return ops.linear.matmul(ops.linear.moe_weighted_sum(out, weights), w.unpool)
 
 def forward(m, inputs):

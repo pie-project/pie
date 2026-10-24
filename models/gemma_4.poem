@@ -840,13 +840,6 @@ def readout_tail(m, inputs, dr):
             return l
     return None
 
-def select(x, bank, routes, top_k):
-    """A routed bank's select: a bf16 bank's plain, a quantized one's
-    through its codes and factors."""
-    if bank.dtype == dtype.bf16:
-        return ops.linear.moe_matmul_select(x, bank, routes, top_k)
-    return ops.linear.moe_matmul_select_quant(x, bank, routes, top_k)
-
 def forward(m, inputs):
     dr = m.dflash
     trunk_inputs = inputs.on(~block_rows(dr)) if dr != None else inputs
@@ -964,8 +957,8 @@ def forward(m, inputs):
                 scale = x.per_expert_scale,
             )
             moe_in = ops.elemwise.rmsnorm(y, x.pre_ffw_norm_2, x.pre_ffw_norm_2_eps)
-            hidden = ops.linear.glu(select(moe_in, x.gate_up, experts, x.top_k), gating.geglu_tanh(), x.inter)
-            routed = ops.linear.moe_weighted_sum(select(hidden, x.down, experts, x.top_k), weights)
+            hidden = ops.linear.glu(ops.linear.moe_matmul_select(moe_in, x.gate_up, experts, x.top_k), gating.geglu_tanh(), x.inter)
+            routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(hidden, x.down, experts, x.top_k), weights)
             h2 = ops.elemwise.rmsnorm(routed, x.post_ffw_norm_2, x.post_ffw_norm_2_eps)
             f = ops.elemwise.residual_add(h1, h2)
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, w.post_ffw_norm, w.post_ffw_norm_eps), y)

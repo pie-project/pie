@@ -1059,7 +1059,7 @@ pub fn moe_experts() -> Rule {
                                      bias: &'static str,
                                      kind: u32| match kind {
                         0 => {
-                            linear::moe_matmul_select(x, &p.weight(bank, [W, W, W]), &routes, top_k)
+                            linear::select::plain(x, &p.weight(bank, [W, W, W]), &routes, top_k)
                         }
                         1 => linear::moe_matmul_select_bias(
                             x,
@@ -1068,19 +1068,19 @@ pub fn moe_experts() -> Rule {
                             &routes,
                             top_k,
                         ),
-                        2 => linear::moe_matmul_select_quant(
+                        2 => linear::select::quantized(
                             x,
                             &p.weight(bank, [W, W, W]),
                             &routes,
                             top_k,
                         ),
-                        3 => linear::moe_matmul_select_quant(
+                        3 => linear::select::quantized(
                             x,
                             &p.weight_at(bank, [W, W, W], W4A4),
                             &routes,
                             top_k,
                         ),
-                        _ => linear::moe_matmul_select_quant(
+                        _ => linear::select::quantized(
                             x,
                             &p.weight_at(bank, [W, W, W], W4A8),
                             &routes,
@@ -1190,7 +1190,7 @@ pub fn moe_experts() -> Rule {
             },
         );
         let top_k = p.u32("top_k");
-        let packed = linear::moe_matmul_select_quant(
+        let packed = linear::select::quantized(
             &x,
             &p.weight_at("bank", [W, W, W], W4A8),
             &routes,
@@ -1213,7 +1213,7 @@ pub fn moe_experts() -> Rule {
             Some(p.f32("limit")),
         );
         p.name("hidden", &hidden);
-        let routed = linear::moe_matmul_select_quant(
+        let routed = linear::select::quantized(
             &hidden,
             &p.weight_at("down", [W, W, W], W4A8),
             &routes,
@@ -1267,7 +1267,7 @@ pub fn moe_select_glu() -> Rule {
                 );
                 let top_k = p.u32("top_k");
                 let packed = match select {
-                    0 => linear::moe_matmul_select(&x, &bank, &routes, top_k),
+                    0 => linear::select::plain(&x, &bank, &routes, top_k),
                     1 => linear::moe_matmul_select_bias(
                         &x,
                         &bank,
@@ -1275,7 +1275,7 @@ pub fn moe_select_glu() -> Rule {
                         &routes,
                         top_k,
                     ),
-                    _ => linear::moe_matmul_select_quant(&x, &bank, &routes, top_k),
+                    _ => linear::select::quantized(&x, &bank, &routes, top_k),
                 };
                 p.name("packed", &packed);
                 let intermediate = p.u32("intermediate");
