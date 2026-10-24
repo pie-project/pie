@@ -49,7 +49,8 @@ fn a_rewritten_package_keeps_its_traces() {
                 // A weight now named by its path is the one recorded under
                 // its stated name, its planes beside it; the longest stated
                 // name a param's begins with is its weight's.
-                let mut renames = renames.clone();
+                let mut renames: Vec<(String, String)> =
+                    renames.iter().filter(|(stated, _)| !stated.is_empty()).cloned().collect();
                 renames.sort_by_key(|(stated, _)| std::cmp::Reverse(stated.len()));
                 for param in &mut before.params {
                     for (stated, path) in &renames {

@@ -5,8 +5,8 @@
 def linear(name, out, in_, banks, bias = True):
     """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
     return struct(
-        w = weight(name, [out, in_], banks),
-        bias = weight(name + ".bias", [out], compute(banks)) if bias else None,
+        w = weight([out, in_], banks),
+        bias = weight([out], compute(banks)) if bias else None,
     )
 
 def packed_linear(name, seams, in_, banks):
@@ -15,8 +15,8 @@ def packed_linear(name, seams, in_, banks):
     for s in seams:
         out += s
     return struct(
-        w = weight(name, [out, in_], banks).packed(seams),
-        bias = weight(name + ".bias", [out], compute(banks)).packed(seams),
+        w = weight([out, in_], banks).packed(seams),
+        bias = weight([out], compute(banks)).packed(seams),
     )
 
 def embedder(prefix, in_, dim, banks):
@@ -99,7 +99,7 @@ DIMS = {
 }
 
 def gain(name, width, banks):
-    return weight(name, [width], compute(banks))
+    return weight([width], compute(banks))
 
 def attention(prefix, dim, heads, head_dim, banks, ctx = None):
     """Self-attention, or (given the `ctx` width it attends) cross-attention,
@@ -132,7 +132,7 @@ def ffn(prefix, dim, mult, bias, banks):
     )
 
 def block(prefix, d, banks):
-    table = lambda name, slices, width: weight(name, [slices * width], dtype.f32)
+    table = lambda name, slices, width: weight([slices * width], dtype.f32)
 
     def side(stem, width, heads, head_dim, ctx, bias):
         return struct(
@@ -166,7 +166,7 @@ def stream(prefix, channels, dim, banks):
         av_ss = adaln(prefix + ".av_ss", dim, AV_SS_SLICES, banks),
         av_gate = adaln(prefix + ".av_gate", dim, AV_GATE_SLICES, banks),
         head_proj = linear(prefix + ".head_proj", HEAD_SLICES * dim, dim, banks),
-        head_table = weight(prefix + ".head_table", [HEAD_SLICES * dim], dtype.f32),
+        head_table = weight([HEAD_SLICES * dim], dtype.f32),
         proj_out = linear(prefix + ".proj_out", channels, dim, banks),
     )
 
@@ -191,8 +191,8 @@ def connector(prefix, text_in, dim, heads, layers, caption, banks):
 def vae_conv(name, c_out, c_in, banks):
     taps = 27
     return struct(
-        w = weight(name, [c_out, c_in * taps], banks).conv_taps_major(c_in, taps),
-        bias = weight(name + ".bias", [c_out], dtype.f32),
+        w = weight([c_out, c_in * taps], banks).conv_taps_major(c_in, taps),
+        bias = weight([c_out], dtype.f32),
         c_in = c_in,
         c_out = c_out,
     )
@@ -217,7 +217,7 @@ def vae(banks):
             resnets = [vae_resnet("{}.res.{}".format(prefix, r), c_out, banks) for r in range(VAE_UP_RESNETS[i])],
         ))
     dense = compute(banks)
-    row = lambda name: weight(name, [VAE_Z], dense)
+    row = lambda name: weight([VAE_Z], dense)
     return struct(
         z = VAE_Z,
         patch = VAE_PATCH,

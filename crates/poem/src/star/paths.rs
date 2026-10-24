@@ -9,7 +9,7 @@ use starlark::values::dict::{AllocDict, DictRef};
 use starlark::values::list::{AllocList, ListRef};
 use starlark::values::structs::{AllocStruct, StructRef};
 use starlark::values::tuple::{AllocTuple, TupleRef};
-use starlark::values::{Heap, Value as Star, ValueLike};
+use starlark::values::{Heap, Value as Star, ValueIdentity, ValueLike};
 
 use crate::star::values::WeightValue;
 
@@ -28,9 +28,16 @@ pub fn renamed<R>(f: impl FnOnce() -> R) -> (R, Vec<(String, String)>) {
     (out, log)
 }
 
+/// What makes two weights one: the object, or a name a Rust caller stated.
+#[derive(PartialEq, Eq, Hash)]
+enum Same<'v> {
+    Object(ValueIdentity<'v>),
+    Stated(String),
+}
+
 /// The layout `m` with each weight named by its path in it. A weight met at
-/// two paths, or two weights stated under one name (a tied embedding and
-/// head), are one weight: the first path names it.
+/// two paths (a head tied to its embedding) is one weight: the first path
+/// names it.
 pub(crate) fn named<'v>(heap: Heap<'v>, m: Star<'v>) -> Star<'v> {
     walk(heap, m, "", &mut HashMap::new())
 }
@@ -47,13 +54,15 @@ fn walk<'v>(
     heap: Heap<'v>,
     v: Star<'v>,
     path: &str,
-    seen: &mut HashMap<String, String>,
+    seen: &mut HashMap<Same<'v>, String>,
 ) -> Star<'v> {
     if let Some(w) = v.downcast_ref::<WeightValue>() {
-        let name = seen
-            .entry(w.0.name.clone())
-            .or_insert_with(|| path.to_string())
-            .clone();
+        let same = if w.0.name.is_empty() {
+            Same::Object(v.identity())
+        } else {
+            Same::Stated(w.0.name.clone())
+        };
+        let name = seen.entry(same).or_insert_with(|| path.to_string()).clone();
         RENAMED.with(|r| {
             if let Some(log) = r.borrow_mut().as_mut() {
                 log.push((w.0.name.clone(), name.clone()));

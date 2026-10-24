@@ -155,7 +155,7 @@ def layout(id, deploy):
 
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
-        norm = lambda s, length: weight(n(s), [length], dense)
+        norm = lambda s, length: weight([length], dense)
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         reading = GLOBAL if full_at(l) else SLIDING
         head_dim, row_heads = (sliding.head_dim, sliding.kv_heads) if reading == SLIDING else (glob.head_dim, glob.kv_heads)
@@ -163,11 +163,11 @@ def layout(id, deploy):
         kv_w = row_heads * head_dim
         iw = d.inter * 2 if d.wide_tail and shared_at(l) else d.inter
         if shared_at(l):
-            attn_banks = struct(shared = True, q_proj = weight(n("q_proj"), [q_w, hidden], proj).columns())
+            attn_banks = struct(shared = True, q_proj = weight([q_w, hidden], proj).columns())
         else:
             attn_banks = struct(
                 shared = False,
-                qkv = weight(n("qkv"), [q_w + 2 * kv_w, hidden], proj).packed([q_w, kv_w, kv_w], heads = [d.q_heads, row_heads, row_heads]),
+                qkv = weight([q_w + 2 * kv_w, hidden], proj).packed([q_w, kv_w, kv_w], heads = [d.q_heads, row_heads, row_heads]),
                 k_norm = norm("k_norm", head_dim),
                 k_norm_eps = d.norm_eps,
             )
@@ -177,16 +177,16 @@ def layout(id, deploy):
             moe = struct(
                 router_norm = norm("router_norm", hidden),
                 router_norm_eps = d.norm_eps,
-                router = weight(n("router"), [d.moe.experts, hidden], gate),
-                per_expert_scale = weight(n("per_expert_scale"), [d.moe.experts], dense).columns(),
+                router = weight([d.moe.experts, hidden], gate),
+                per_expert_scale = weight([d.moe.experts], dense).columns(),
                 pre_ffw_norm_2 = norm("pre_ffw_norm_2", hidden),
                 pre_ffw_norm_2_eps = d.norm_eps,
                 post_ffw_norm_1 = norm("post_ffw_norm_1", hidden),
                 post_ffw_norm_1_eps = d.norm_eps,
                 post_ffw_norm_2 = norm("post_ffw_norm_2", hidden),
                 post_ffw_norm_2_eps = d.norm_eps,
-                gate_up = weight(n("experts_gate_up"), [d.moe.experts, 2 * mi, hidden], xw).bank([mi, mi]),
-                down = weight(n("experts_down"), [d.moe.experts, hidden, mi], xw).rows(),
+                gate_up = weight([d.moe.experts, 2 * mi, hidden], xw).bank([mi, mi]),
+                down = weight([d.moe.experts, hidden, mi], xw).rows(),
                 experts = d.moe.experts,
                 top_k = d.moe.top_k,
                 inter = mi,
@@ -200,7 +200,7 @@ def layout(id, deploy):
                 banks = attn_banks,
                 reading = reading,
             ),
-            o_proj = weight(n("o_proj"), [hidden, q_w], proj).rows(),
+            o_proj = weight([hidden, q_w], proj).rows(),
             attn_norm = norm("attn_norm", hidden),
             attn_norm_eps = d.norm_eps,
             post_attn_norm = norm("post_attn_norm", hidden),
@@ -209,10 +209,10 @@ def layout(id, deploy):
             pre_ffw_norm_eps = d.norm_eps,
             post_ffw_norm = norm("post_ffw_norm", hidden),
             post_ffw_norm_eps = d.norm_eps,
-            gate_up = weight(n("gate_up"), [2 * iw, hidden], mlp_at).packed([iw, iw]),
+            gate_up = weight([2 * iw, hidden], mlp_at).packed([iw, iw]),
             inter = iw,
-            down = weight(n("down"), [hidden, iw], mlp_at).rows(),
-            scalar = weight(n("scalar"), [1], dense) if d.ple_dim == None else None,
+            down = weight([hidden, iw], mlp_at).rows(),
+            scalar = weight([1], dense) if d.ple_dim == None else None,
             lora_a = lora_a,
             lora_b = lora_b,
             moe = moe,
@@ -225,8 +225,8 @@ def layout(id, deploy):
         ti = t.inter
         head_dim = t.hidden // t.heads
         tn = lambda s: "vision." + s
-        bank = lambda s, dims: weight(tn(s), dims, dense)
-        vec1 = lambda s, length: weight(tn(s), [length], dense)
+        bank = lambda s, dims: weight(dims, dense)
+        vec1 = lambda s, length: weight([length], dense)
 
         def clip(s, dims):
             return struct(
@@ -272,7 +272,7 @@ def layout(id, deploy):
             patch_embed = bank("patch_embed", [th, t.patch_width]),
             pos_embed = bank("pos_embed", [2 * t.positions, th]),
             blocks = [block(l) for l in range(t.depth)],
-            projection = weight(tn("projection"), [hidden, th], w),
+            projection = weight([hidden, th], w),
             std = struct(bias = vec1("std_bias", th), scale = vec1("std_scale", th)) if t.standardize else None,
         )
 
@@ -284,10 +284,10 @@ def layout(id, deploy):
         kv_w = glob.kv_heads * hd
         iw = d.inter
         an = lambda s: "aux." + s
-        anorm = lambda s, length: weight(an(s), [length], dense)
+        anorm = lambda s, length: weight([length], dense)
         draft = struct(
-            fc_embed = weight(an("fc_embed"), [hidden, hidden], w),
-            fc_hidden = weight(an("fc_hidden"), [hidden, hidden], w),
+            fc_embed = weight([hidden, hidden], w),
+            fc_hidden = weight([hidden, hidden], w),
             attn_norm = anorm("attn_norm", hidden),
             post_attn_norm = anorm("post_attn_norm", hidden),
             pre_ffw_norm = anorm("pre_ffw_norm", hidden),
@@ -299,16 +299,16 @@ def layout(id, deploy):
                 kv = "kv.mtp",
                 banks = struct(
                     shared = False,
-                    qkv = weight(an("qkv"), [q_w + 2 * kv_w, hidden], w).packed([q_w, kv_w, kv_w], heads = [d.q_heads, glob.kv_heads, glob.kv_heads]),
+                    qkv = weight([q_w + 2 * kv_w, hidden], w).packed([q_w, kv_w, kv_w], heads = [d.q_heads, glob.kv_heads, glob.kv_heads]),
                     k_norm = anorm("k_norm", hd),
                     k_norm_eps = d.norm_eps,
                 ),
                 reading = GLOBAL,
             ),
-            o_proj = weight(an("o_proj"), [hidden, q_w], w).rows(),
-            gate_up = weight(an("gate_up"), [2 * iw, hidden], w).packed([iw, iw]),
+            o_proj = weight([hidden, q_w], w).rows(),
+            gate_up = weight([2 * iw, hidden], w).packed([iw, iw]),
             inter = iw,
-            down = weight(an("down"), [hidden, iw], w).rows(),
+            down = weight([hidden, iw], w).rows(),
             norm_eps = d.norm_eps,
         )
 
@@ -326,7 +326,7 @@ def layout(id, deploy):
 
         def assistant_layer(l, reading):
             n = lambda s: "aux.layer.{}.{}".format(l, s)
-            norm = lambda s, length: weight(n(s), [length], dense)
+            norm = lambda s, length: weight([length], dense)
             hd = sliding.head_dim if reading == SLIDING else glob.head_dim
             q_w = d.q_heads * hd
             return struct(
@@ -335,31 +335,31 @@ def layout(id, deploy):
                     q_norm = norm("q_norm", hd),
                     q_norm_eps = d.norm_eps,
                     kv = "kv.{}".format(last(reading == GLOBAL)),
-                    banks = struct(shared = True, q_proj = weight(n("q_proj.weight"), [q_w, ah], w)),
+                    banks = struct(shared = True, q_proj = weight([q_w, ah], w)),
                     reading = reading,
                 ),
-                o_proj = weight(n("o_proj.weight"), [ah, q_w], w),
+                o_proj = weight([ah, q_w], w),
                 attn_norm = norm("attn_norm", ah),
                 post_attn_norm = norm("post_attn_norm", ah),
                 pre_ffw_norm = norm("pre_ffw_norm", ah),
                 post_ffw_norm = norm("post_ffw_norm", ah),
-                gate_up = weight(n("gate_up.weight"), [2 * iw, ah], w).packed([iw, iw]),
+                gate_up = weight([2 * iw, ah], w).packed([iw, iw]),
                 inter = iw,
-                down = weight(n("down.weight"), [ah, iw], w),
+                down = weight([ah, iw], w),
                 scalar = norm("scalar", 1),
             )
 
         assistant = struct(
-            pre_embed = weight("aux.pre_embed.weight", [ah, hidden], w),
-            pre_hidden = weight("aux.pre_hidden.weight", [ah, hidden], w),
-            post = weight("aux.post.weight", [hidden, ah], w),
-            embed = weight("aux.embed.weight", [d.vocab, ah], w),
-            norm = weight("aux.final_norm", [ah], dense),
+            pre_embed = weight([ah, hidden], w),
+            pre_hidden = weight([ah, hidden], w),
+            post = weight([hidden, ah], w),
+            embed = weight([d.vocab, ah], w),
+            norm = weight([ah], dense),
             norm_eps = d.norm_eps,
             layers = [assistant_layer(l, r) for l, r in enumerate(ASSISTANT_READINGS)],
         )
 
-    embed = weight("embed", [d.vocab, hidden], dense if self_cond else w)
+    embed = weight([d.vocab, hidden], dense if self_cond else w)
     if not self_cond:
         embed = embed.packed([d.vocab])
 
@@ -368,16 +368,16 @@ def layout(id, deploy):
         p = d.ple_dim
         ple = struct(
             dim = p,
-            model_proj = weight("ple.model_proj", [d.layers * p, hidden], w),
-            model_norm = weight("ple.model_norm", [p], dense),
+            model_proj = weight([d.layers * p, hidden], w),
+            model_norm = weight([p], dense),
             model_norm_eps = d.norm_eps,
             per_layer = [struct(
-                table = weight("layer.{}.ple_table".format(l), [d.vocab, p], w),
-                gate = weight("layer.{}.ple_gate".format(l), [p, hidden], w),
-                proj = weight("layer.{}.ple_proj".format(l), [hidden, p], w),
-                norm = weight("layer.{}.ple_norm".format(l), [hidden], dense),
+                table = weight([d.vocab, p], w),
+                gate = weight([p, hidden], w),
+                proj = weight([hidden, p], w),
+                norm = weight([hidden], dense),
                 norm_eps = d.norm_eps,
-                scalar = weight("layer.{}.ple_scalar".format(l), [1], dense),
+                scalar = weight([1], dense),
             ) for l in range(d.layers)],
         )
 
@@ -386,11 +386,11 @@ def layout(id, deploy):
         iw = d.inter
         self_cond_block = struct(
             taps = SELF_COND_TAPS,
-            pre_norm = weight("self_cond.pre_norm", [hidden], dense),
+            pre_norm = weight([hidden], dense),
             norm_eps = d.norm_eps,
-            gate_up = weight("self_cond.gate_up", [2 * iw, hidden], sw).packed([iw, iw]),
+            gate_up = weight([2 * iw, hidden], sw).packed([iw, iw]),
             inter = iw,
-            down = weight("self_cond.down", [hidden, iw], sw).rows(),
+            down = weight([hidden, iw], sw).rows(),
         )
 
     return struct(
@@ -405,7 +405,7 @@ def layout(id, deploy):
         embed = embed,
         ple = ple,
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight("final_norm", [hidden], dense),
+        final_norm = weight([hidden], dense),
         final_norm_eps = d.norm_eps,
         draft = draft,
         assistant = assistant,

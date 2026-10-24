@@ -130,7 +130,7 @@ fn renaming(
         .map(|line| match line.split_once('\t') {
             Some((deployment, json)) if json.starts_with('{') => {
                 let mut ours: Vec<&(String, String)> =
-                    renames.get(deployment).into_iter().flatten().collect();
+                    renames.get(deployment).into_iter().flatten().filter(|(stated, _)| !stated.is_empty()).collect();
                 ours.sort_by_key(|(stated, _)| std::cmp::Reverse(stated.len()));
                 let rename = |name: &str| -> Option<String> {
                     ours.iter().find_map(|(stated, path)| {

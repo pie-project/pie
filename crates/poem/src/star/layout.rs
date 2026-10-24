@@ -14,15 +14,15 @@ use crate::star::values::{
 
 #[starlark_module]
 pub(crate) fn layout(builder: &mut GlobalsBuilder) {
-    /// A weight named `name`, of `shape`, stored as `dtype` (a dtype, or a
-    /// precision whose products quantize their activations).
+    /// A weight of `shape`, stored as `dtype` (a dtype, or a precision whose
+    /// products quantize their activations). It is named by where the layout
+    /// puts it.
     fn weight<'v>(
-        #[starlark(require = pos)] name: String,
         #[starlark(require = pos)] shape: UnpackList<u64>,
         #[starlark(require = pos)] dtype: Value<'v>,
     ) -> anyhow::Result<WeightValue> {
         Ok(WeightValue(Weight::at(
-            name,
+            String::new(),
             shape.items,
             precision(dtype)?,
         )))

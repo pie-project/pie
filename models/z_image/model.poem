@@ -6,8 +6,8 @@
 def linear(name, out, in_, banks, bias = True):
     """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
     return struct(
-        w = weight(name, [out, in_], banks),
-        bias = weight(name + ".bias", [out], compute(banks)) if bias else None,
+        w = weight([out, in_], banks),
+        bias = weight([out], compute(banks)) if bias else None,
     )
 
 BLOCKS = [128, 256, 512, 512]
@@ -20,8 +20,8 @@ TAPS3 = 9
 
 def conv(name, c_out, c_in, taps):
     return struct(
-        w = weight(name, [c_out, c_in * taps], dtype.bf16).conv_taps_major(c_in, taps),
-        bias = weight(name + ".bias", [c_out], dtype.f32),
+        w = weight([c_out, c_in * taps], dtype.bf16).conv_taps_major(c_in, taps),
+        bias = weight([c_out], dtype.f32),
         c_in = c_in,
         c_out = c_out,
         taps = taps,
@@ -29,8 +29,8 @@ def conv(name, c_out, c_in, taps):
 
 def group_norm(name, c):
     return struct(
-        weight = weight(name + ".weight", [c], dtype.f32),
-        bias = weight(name + ".bias", [c], dtype.f32),
+        weight = weight([c], dtype.f32),
+        bias = weight([c], dtype.f32),
     )
 
 def resnet(name, c_in, c_out):
@@ -133,16 +133,16 @@ def encoder(c, layers, banks, sharded = False):
     def layer(l):
         n = lambda s: "te.layer.{}.{}".format(l, s)
         return struct(
-            attn_norm = weight(n("attn_norm"), [hidden], dense),
-            q = columns(weight(n("q"), [c.q_heads * hd, hidden], banks)),
-            k = columns(weight(n("k"), [c.kv_heads * hd, hidden], banks), c.kv_heads),
-            v = columns(weight(n("v"), [c.kv_heads * hd, hidden], banks), c.kv_heads),
-            o = rows(weight(n("o"), [hidden, c.q_heads * hd], banks)),
-            q_norm = weight(n("q_norm"), [hd], dense),
-            k_norm = weight(n("k_norm"), [hd], dense),
-            mlp_norm = weight(n("mlp_norm"), [hidden], dense),
-            gate_up = weight(n("gate_up"), [2 * inter, hidden], banks).packed([inter, inter]),
-            down = rows(weight(n("down"), [hidden, inter], banks)),
+            attn_norm = weight([hidden], dense),
+            q = columns(weight([c.q_heads * hd, hidden], banks)),
+            k = columns(weight([c.kv_heads * hd, hidden], banks), c.kv_heads),
+            v = columns(weight([c.kv_heads * hd, hidden], banks), c.kv_heads),
+            o = rows(weight([hidden, c.q_heads * hd], banks)),
+            q_norm = weight([hd], dense),
+            k_norm = weight([hd], dense),
+            mlp_norm = weight([hidden], dense),
+            gate_up = weight([2 * inter, hidden], banks).packed([inter, inter]),
+            down = rows(weight([hidden, inter], banks)),
             kv = "te.kv.{}".format(l),
         )
 
@@ -156,7 +156,7 @@ def encoder(c, layers, banks, sharded = False):
         theta = c.theta,
         eps = c.eps,
         sm_scale = f32(1.0 / f32(sqrt(hd))),
-        embed = weight("te.embed", [c.vocab, hidden], banks),
+        embed = weight([c.vocab, hidden], banks),
         layers = [layer(l) for l in range(layers)],
     )
 
@@ -201,7 +201,7 @@ def block(prefix, d, modulated, banks):
     dense = compute(banks)
     dim, hd, inter = d.dim, d.head_dim, d.inter
     n = lambda s: prefix + "." + s
-    norm = lambda s, width: weight(n(s), [width], dense)
+    norm = lambda s, width: weight([width], dense)
     return struct(
         ada = linear(n("ada"), MOD_SLICES * dim, ADALN_DIM, banks) if modulated else None,
         attn_norm1 = norm("attn_norm1", dim),
@@ -209,19 +209,19 @@ def block(prefix, d, modulated, banks):
         ffn_norm1 = norm("ffn_norm1", dim),
         ffn_norm2 = norm("ffn_norm2", dim),
         attn = struct(
-            qkv = weight(n("qkv"), [3 * dim, dim], banks).packed([dim, dim, dim]),
+            qkv = weight([3 * dim, dim], banks).packed([dim, dim, dim]),
             q_norm = norm("q_norm", hd),
             k_norm = norm("k_norm", hd),
-            out = weight(n("out"), [dim, dim], banks),
+            out = weight([dim, dim], banks),
         ),
         mlp = struct(
-            gate_up = weight(n("gate_up"), [2 * inter, dim], banks).packed([inter, inter]),
-            down = weight(n("down"), [dim, inter], banks),
+            gate_up = weight([2 * inter, dim], banks).packed([inter, inter]),
+            down = weight([dim, inter], banks),
         ),
     )
 
 def vae_latent():
-    return struct(shift = weight("vae.shift", [CHANNELS], compute(dtype.bf16)))
+    return struct(shift = weight([CHANNELS], compute(dtype.bf16)))
 
 def layout(id, deploy):
     if len(deploy.weights) != 1:
@@ -247,13 +247,13 @@ def layout(id, deploy):
         rope_axes = ROPE_AXES,
         dit = struct(
             x_embed = linear("dit.x_embed", dim, PATCH_FEATURES, banks),
-            x_pad_mod = weight("dit.x_pad_mod", [2 * dim, 1], dense),
-            cap_norm = weight("dit.cap_norm", [d.cap_width], dense),
+            x_pad_mod = weight([2 * dim, 1], dense),
+            cap_norm = weight([d.cap_width], dense),
             cap_embed = linear("dit.cap_embed", dim, d.cap_width, banks),
-            cap_pad_mod = weight("dit.cap_pad_mod", [2 * dim, 1], dense),
+            cap_pad_mod = weight([2 * dim, 1], dense),
             t_mlp0 = linear("dit.t_mlp0", T_MID, T_FREQ_DIM, banks),
             t_mlp1 = linear("dit.t_mlp1", ADALN_DIM, T_MID, banks),
-            t_flip = weight("dit.t_flip", [1], dtype.f32),
+            t_flip = weight([1], dtype.f32),
             noise_refiner = blocks("noise", d.refiner_layers, True),
             context_refiner = blocks("context", d.refiner_layers, False),
             layers = blocks("layer", d.joint_layers, True),

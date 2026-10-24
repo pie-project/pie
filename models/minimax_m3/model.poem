@@ -52,12 +52,12 @@ def attention(n, d, proj, dense, kv):
         rotary_dim = d.rotary_dim,
         theta = d.theta,
         sm_scale = f32(1.0 / f32(sqrt(hd))),
-        q_proj = weight(n("q_proj"), [d.q_heads * hd, d.hidden], proj).columns(),
-        k_proj = weight(n("k_proj"), [d.kv_heads * hd, d.hidden], proj).columns(heads = d.kv_heads),
-        v_proj = weight(n("v_proj"), [d.kv_heads * hd, d.hidden], proj).columns(heads = d.kv_heads),
-        o_proj = weight(n("o_proj"), [d.hidden, d.q_heads * hd], proj).rows(),
-        q_norm = weight(n("q_norm"), [hd], dense),
-        k_norm = weight(n("k_norm"), [hd], dense),
+        q_proj = weight([d.q_heads * hd, d.hidden], proj).columns(),
+        k_proj = weight([d.kv_heads * hd, d.hidden], proj).columns(heads = d.kv_heads),
+        v_proj = weight([d.kv_heads * hd, d.hidden], proj).columns(heads = d.kv_heads),
+        o_proj = weight([d.hidden, d.q_heads * hd], proj).rows(),
+        q_norm = weight([hd], dense),
+        k_norm = weight([hd], dense),
         norm_eps = d.norm_eps,
         kv = kv,
     )
@@ -73,18 +73,18 @@ def indexer(n, d, dense, keys, proj = None):
         block = ix.block,
         top_k = ix.top_k,
         norm_eps = d.norm_eps,
-        q_proj = weight(n("index_q_proj"), [ix.heads * ix.head_dim, d.hidden], proj),
-        k_proj = weight(n("index_k_proj"), [ix.head_dim, d.hidden], proj),
-        q_norm = weight(n("index_q_norm"), [ix.head_dim], dense),
-        k_norm = weight(n("index_k_norm"), [ix.head_dim], dense),
+        q_proj = weight([ix.heads * ix.head_dim, d.hidden], proj),
+        k_proj = weight([ix.head_dim, d.hidden], proj),
+        q_norm = weight([ix.head_dim], dense),
+        k_norm = weight([ix.head_dim], dense),
         keys = keys,
     )
 
 def mlp(n, d, inter, proj, prefix = ""):
     """A clamped SwiGLU-OAI MLP `inter` wide, its gate and up packed."""
     return struct(
-        gate_up = weight(n(prefix + "gate_up"), [2 * inter, d.hidden], proj).packed([inter, inter]),
-        down = weight(n(prefix + "down"), [d.hidden, inter], proj).rows(),
+        gate_up = weight([2 * inter, d.hidden], proj).packed([inter, inter]),
+        down = weight([d.hidden, inter], proj).rows(),
         inter = inter,
         limit = d.swiglu_limit,
         alpha = d.swiglu_alpha,
@@ -94,10 +94,10 @@ def routed(n, d, mix, dense):
     """`d.top_k` of `d.experts` experts, sigmoid-routed with a correction
     bias, beside the one shared expert."""
     return struct(
-        router = weight(n("router"), [d.experts, d.hidden], dense),
-        bias = weight(n("router_bias"), [d.experts], dtype.f32),
-        gate_up = weight(n("experts_gate_up"), [d.experts, 2 * d.inter, d.hidden], mix.experts).bank([d.inter, d.inter]),
-        down = weight(n("experts_down"), [d.experts, d.hidden, d.inter], mix.experts).rows(),
+        router = weight([d.experts, d.hidden], dense),
+        bias = weight([d.experts], dtype.f32),
+        gate_up = weight([d.experts, 2 * d.inter, d.hidden], mix.experts).bank([d.inter, d.inter]),
+        down = weight([d.experts, d.hidden, d.inter], mix.experts).rows(),
         shared = mlp(n, d, d.shared_inter, mix.proj, prefix = "shared_"),
         experts = d.experts,
         top_k = d.top_k,
@@ -118,10 +118,10 @@ def layout(id, deploy):
         n = lambda s: "layer.{}.{}".format(l, s)
         sparse = l >= d.dense_layers
         return struct(
-            attn_norm = weight(n("attn_norm"), [d.hidden], dense),
+            attn_norm = weight([d.hidden], dense),
             attn = attention(n, d, mix.proj, dense, "kv.{}".format(l)),
             indexer = indexer(n, d, dense, "index.{}".format(l), mix.index) if sparse else None,
-            mlp_norm = weight(n("mlp_norm"), [d.hidden], dense),
+            mlp_norm = weight([d.hidden], dense),
             mlp = routed(n, d, mix, dense) if sparse else None,
             dense = None if sparse else mlp(n, d, d.dense_inter, mix.proj),
         )
@@ -134,8 +134,8 @@ def layout(id, deploy):
         head_dim = d.head_dim,
         norm_eps = d.norm_eps,
         kv = deploy.kv,
-        embed = weight("embed", [d.vocab, d.hidden], mix.embed),
-        head = weight("lm_head", [d.vocab, d.hidden], mix.head),
-        final_norm = weight("final_norm", [d.hidden], dense),
+        embed = weight([d.vocab, d.hidden], mix.embed),
+        head = weight([d.vocab, d.hidden], mix.head),
+        final_norm = weight([d.hidden], dense),
         layers = [layer(l) for l in range(d.layers)],
     )

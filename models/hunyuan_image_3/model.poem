@@ -5,8 +5,8 @@
 def linear(name, out, in_, banks, bias = True):
     """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
     return struct(
-        w = weight(name, [out, in_], banks),
-        bias = weight(name + ".bias", [out], compute(banks)) if bias else None,
+        w = weight([out, in_], banks),
+        bias = weight([out], compute(banks)) if bias else None,
     )
 
 TRAIN_STEPS = 1000
@@ -51,15 +51,15 @@ DIMS = {
 def conv(name, c_out, c_in, k, banks):
     taps = k[0] * k[1] * k[2]
     return struct(
-        w = weight(name, [c_out, c_in * taps], banks).conv_taps_major(c_in, taps),
-        bias = weight(name + ".bias", [c_out], dtype.f32),
+        w = weight([c_out, c_in * taps], banks).conv_taps_major(c_in, taps),
+        bias = weight([c_out], dtype.f32),
         k = k,
     )
 
 def group_norm(name, c):
     return struct(
-        weight = weight(name, [c], dtype.f32),
-        bias = weight(name + ".bias", [c], dtype.f32),
+        weight = weight([c], dtype.f32),
+        bias = weight([c], dtype.f32),
     )
 
 def resblock(prefix, c_in, c_out, emb, banks):
@@ -103,18 +103,18 @@ def layout(id, deploy):
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         return struct(
-            attn_norm = weight(n("attn_norm"), [hidden], dense),
-            qkv = weight(n("qkv"), [q_w + 2 * kv_w, hidden], banks).packed([q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
-            q_norm = weight(n("q_norm"), [hd], dense),
-            k_norm = weight(n("k_norm"), [hd], dense),
-            o_proj = weight(n("o_proj"), [hidden, q_w], banks).rows(),
+            attn_norm = weight([hidden], dense),
+            qkv = weight([q_w + 2 * kv_w, hidden], banks).packed([q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
+            q_norm = weight([hd], dense),
+            k_norm = weight([hd], dense),
+            o_proj = weight([hidden, q_w], banks).rows(),
             kv = "kv.{}".format(l),
-            mlp_norm = weight(n("mlp_norm"), [hidden], dense),
-            router = weight(n("router"), [d.experts, hidden], dense),
-            experts_gate_up = weight(n("experts_gate_up"), [d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
-            experts_down = weight(n("experts_down"), [d.experts, hidden, iw], experts).rows(),
-            shared_gate_up = weight(n("shared_gate_up"), [2 * sw, hidden], banks).packed([sw, sw]),
-            shared_down = weight(n("shared_down"), [hidden, sw], banks).rows(),
+            mlp_norm = weight([hidden], dense),
+            router = weight([d.experts, hidden], dense),
+            experts_gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
+            experts_down = weight([d.experts, hidden, iw], experts).rows(),
+            shared_gate_up = weight([2 * sw, hidden], banks).packed([sw, sw]),
+            shared_down = weight([hidden, sw], banks).rows(),
         )
 
     hw = d.head_hidden
@@ -127,9 +127,9 @@ def layout(id, deploy):
         q_width = q_w,
         kv_width = kv_w,
         sm_scale = f32(1.0 / f32(sqrt(hd))),
-        embed = weight("wte", [d.vocab, hidden], banks),
-        head = weight("lm_head", [d.vocab, hidden], banks),
-        final_norm = weight("ln_f", [hidden], dense),
+        embed = weight([d.vocab, hidden], banks),
+        head = weight([d.vocab, hidden], banks),
+        final_norm = weight([hidden], dense),
         layers = [layer(l) for l in range(d.layers)],
         timestep_emb = embedder("timestep_emb", hidden, 2 * hidden, banks),
         time_embed = embedder("time_embed", hidden, hidden, banks),
@@ -143,7 +143,7 @@ def layout(id, deploy):
             norm_out = group_norm("final_layer.norm_out", hw),
             conv_out = conv("final_layer.conv", LATENT_CHANNELS, hw, CONV3, banks),
         ),
-        ones = weight("special.ones", [2 * hidden, 1], banks),
+        ones = weight([2 * hidden, 1], banks),
     )
 
 def generative(m):

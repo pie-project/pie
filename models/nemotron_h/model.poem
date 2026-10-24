@@ -106,18 +106,18 @@ def layout(id, deploy):
 
     def proj(name, kind, l, shape):
         kept = plain or (l in BF16_AT[kind] if kind in BF16_AT else l not in FP8_AT[kind])
-        return weight(name, shape, w if kept else f8)
+        return weight(shape, w if kept else f8)
 
     def mamba(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         return struct(
             in_proj = proj(n("in_proj"), "in_proj", l, [inner + conv_dim + d.mamba_heads, hidden]),
-            conv = weight(n("conv"), [conv_dim, d.conv_kernel], w),
-            conv_bias = weight(n("conv_bias"), [conv_dim], w),
-            a_log = weight(n("a_log"), [d.mamba_heads], dtype.f32),
-            dt_bias = weight(n("dt_bias"), [d.mamba_heads], dtype.f32),
-            d = weight(n("d"), [d.mamba_heads], dtype.f32),
-            norm = weight(n("ssm_norm"), [inner], norms),
+            conv = weight([conv_dim, d.conv_kernel], w),
+            conv_bias = weight([conv_dim], w),
+            a_log = weight([d.mamba_heads], dtype.f32),
+            dt_bias = weight([d.mamba_heads], dtype.f32),
+            d = weight([d.mamba_heads], dtype.f32),
+            norm = weight([inner], norms),
             out_proj = proj(n("out_proj"), "out_proj", l, [hidden, inner]),
             conv_state = "conv.{}".format(l),
             ssm_state = "ssm.{}".format(l),
@@ -127,9 +127,9 @@ def layout(id, deploy):
         n = lambda s: "layer.{}.{}".format(l, s)
         hd = d.head_dim
         return struct(
-            q = weight(n("q"), [d.heads * hd, hidden], w),
-            k = weight(n("k"), [d.kv_heads * hd, hidden], w),
-            v = weight(n("v"), [d.kv_heads * hd, hidden], w),
+            q = weight([d.heads * hd, hidden], w),
+            k = weight([d.kv_heads * hd, hidden], w),
+            v = weight([d.kv_heads * hd, hidden], w),
             o = proj(n("o"), "o_proj", l, [hidden, d.heads * hd]),
             kv = "kv.{}".format(l),
         )
@@ -137,12 +137,12 @@ def layout(id, deploy):
     def moe(l):
         n = lambda s: "layer.{}.{}".format(l, s)
         return struct(
-            router = weight(n("router"), [d.experts, hidden], w),
-            bias = weight(n("router_bias"), [d.experts], dtype.f32),
+            router = weight([d.experts, hidden], w),
+            bias = weight([d.experts], dtype.f32),
             down_latent = proj(n("fc1_latent"), "fc1_latent", l, [d.latent, hidden]),
             up_latent = proj(n("fc2_latent"), "fc2_latent", l, [hidden, d.latent]),
-            up = weight(n("experts_up"), [d.experts, d.moe_inter, d.latent], experts),
-            down = weight(n("experts_down"), [d.experts, d.latent, d.moe_inter], experts),
+            up = weight([d.experts, d.moe_inter, d.latent], experts),
+            down = weight([d.experts, d.latent, d.moe_inter], experts),
             shared_up = proj(n("shared_up"), "shared_up", l, [d.shared_inter, hidden]),
             shared_down = proj(n("shared_down"), "shared_down", l, [hidden, d.shared_inter]),
         )
@@ -151,7 +151,7 @@ def layout(id, deploy):
         kind = d.pattern[l]
         return struct(
             kind = kind,
-            norm = weight("layer.{}.norm".format(l), [hidden], norms),
+            norm = weight([hidden], norms),
             mamba = mamba(l) if kind == "M" else None,
             attn = attention(l) if kind == "*" else None,
             moe = moe(l) if kind == "E" else None,
@@ -176,10 +176,10 @@ def layout(id, deploy):
         scaling = d.scaling,
         eps = d.eps,
         kv = deploy.kv,
-        embed = weight("embed", [d.vocab, hidden], w),
-        head = weight("lm_head", [d.vocab, hidden], w),
+        embed = weight([d.vocab, hidden], w),
+        head = weight([d.vocab, hidden], w),
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight("final_norm", [hidden], norms),
+        final_norm = weight([hidden], norms),
     )
 
 def nano_layout(id, deploy):
@@ -209,40 +209,40 @@ def nano_layout(id, deploy):
         moe = None
         if kind == "M":
             mamba = struct(
-                in_proj = weight(n("in_proj"), [inner + conv_dim + d.mamba_heads, hidden], at(l)),
-                conv = weight(n("conv"), [conv_dim, d.conv_kernel], norms),
-                conv_bias = weight(n("conv_bias"), [conv_dim], norms),
-                a_log = weight(n("a_log"), [d.mamba_heads], dtype.f32),
-                dt_bias = weight(n("dt_bias"), [d.mamba_heads], dtype.f32),
-                d = weight(n("d"), [d.mamba_heads], dtype.f32),
-                norm = weight(n("ssm_norm"), [inner], norms),
-                out_proj = weight(n("out_proj"), [hidden, inner], at(l)),
+                in_proj = weight([inner + conv_dim + d.mamba_heads, hidden], at(l)),
+                conv = weight([conv_dim, d.conv_kernel], norms),
+                conv_bias = weight([conv_dim], norms),
+                a_log = weight([d.mamba_heads], dtype.f32),
+                dt_bias = weight([d.mamba_heads], dtype.f32),
+                d = weight([d.mamba_heads], dtype.f32),
+                norm = weight([inner], norms),
+                out_proj = weight([hidden, inner], at(l)),
                 conv_state = "conv.{}".format(l),
                 ssm_state = "ssm.{}".format(l),
             )
         elif kind == "*":
             hd = d.head_dim
             attn = struct(
-                q = weight(n("q"), [d.heads * hd, hidden], dtype.bf16),
-                k = weight(n("k"), [d.kv_heads * hd, hidden], dtype.bf16),
-                v = weight(n("v"), [d.kv_heads * hd, hidden], dtype.bf16),
-                o = weight(n("o"), [hidden, d.heads * hd], dtype.bf16),
+                q = weight([d.heads * hd, hidden], dtype.bf16),
+                k = weight([d.kv_heads * hd, hidden], dtype.bf16),
+                v = weight([d.kv_heads * hd, hidden], dtype.bf16),
+                o = weight([hidden, d.heads * hd], dtype.bf16),
                 kv = "kv.{}".format(l),
             )
         else:
             moe = struct(
-                router = weight(n("router"), [d.experts, hidden], norms),
-                bias = weight(n("router_bias"), [d.experts], dtype.f32),
+                router = weight([d.experts, hidden], norms),
+                bias = weight([d.experts], dtype.f32),
                 down_latent = None,
                 up_latent = None,
-                up = weight(n("experts_up"), [d.experts, d.moe_inter, hidden], experts),
-                down = weight(n("experts_down"), [d.experts, hidden, d.moe_inter], experts),
-                shared_up = weight(n("shared_up"), [d.shared_inter, hidden], proj),
-                shared_down = weight(n("shared_down"), [hidden, d.shared_inter], proj),
+                up = weight([d.experts, d.moe_inter, hidden], experts),
+                down = weight([d.experts, hidden, d.moe_inter], experts),
+                shared_up = weight([d.shared_inter, hidden], proj),
+                shared_down = weight([hidden, d.shared_inter], proj),
             )
         return struct(
             kind = kind,
-            norm = weight(n("norm"), [hidden], norms),
+            norm = weight([hidden], norms),
             mamba = mamba,
             attn = attn,
             moe = moe,
@@ -267,8 +267,8 @@ def nano_layout(id, deploy):
         scaling = d.scaling,
         eps = d.eps,
         kv = deploy.kv,
-        embed = weight("embed", [d.vocab, hidden], norms),
-        head = weight("lm_head", [d.vocab, hidden], norms),
+        embed = weight([d.vocab, hidden], norms),
+        head = weight([d.vocab, hidden], norms),
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight("final_norm", [hidden], norms),
+        final_norm = weight([hidden], norms),
     )

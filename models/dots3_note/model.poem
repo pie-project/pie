@@ -21,22 +21,20 @@ def attention(n, a, hidden, weights, norms, eps, kv, window = None, indexer = No
         theta = a.theta,
         window = window,
         sm_scale = f32(1.0 / f32(sqrt(qk_head_dim))),
-        q_a_proj = weight(n("q_a_proj"), [a.q_lora_rank, hidden], weights),
-        q_a_norm = weight(n("q_a_norm"), [a.q_lora_rank], norms),
+        q_a_proj = weight([a.q_lora_rank, hidden], weights),
+        q_a_norm = weight([a.q_lora_rank], norms),
         q_a_scale = sqrt(hidden / a.q_lora_rank),
-        q_b_proj = weight(n("q_b_proj"), [a.heads * qk_head_dim, a.q_lora_rank], weights).columns(),
-        kv_a_proj = weight(n("kv_a_proj"), [a.kv_lora_rank + a.qk_rope_head_dim, hidden], weights),
-        kv_a_norm = weight(n("kv_a_norm"), [a.kv_lora_rank], norms),
+        q_b_proj = weight([a.heads * qk_head_dim, a.q_lora_rank], weights).columns(),
+        kv_a_proj = weight([a.kv_lora_rank + a.qk_rope_head_dim, hidden], weights),
+        kv_a_norm = weight([a.kv_lora_rank], norms),
         kv_a_scale = sqrt(hidden / a.kv_lora_rank),
-        k_pe_norm = weight(n("k_pe_norm"), [a.qk_rope_head_dim], norms),
+        k_pe_norm = weight([a.qk_rope_head_dim], norms),
         norm_eps = eps,
-        kv_b_proj = weight(
-            n("kv_b_proj"),
-            [a.heads * (a.qk_nope_head_dim + a.v_head_dim), a.kv_lora_rank],
+        kv_b_proj = weight([a.heads * (a.qk_nope_head_dim + a.v_head_dim), a.kv_lora_rank],
             weights,
         ).columns(),
-        gate = weight(n("o_gate"), [a.heads, hidden], weights).columns(),
-        o_proj = weight(n("o_proj"), [hidden, v_width], weights).rows(),
+        gate = weight([a.heads, hidden], weights).columns(),
+        o_proj = weight([hidden, v_width], weights).rows(),
         kv = kv,
         indexer = indexer,
     )
@@ -104,7 +102,7 @@ def layout(id, deploy):
 
     def layer(l):
         n = lambda s: "layer.{}.{}".format(l, s)
-        norm = lambda s, width: weight(n(s), [width], dense)
+        norm = lambda s, width: weight([width], dense)
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         if l in d.full_layers:
             a = d.full
@@ -122,9 +120,9 @@ def layout(id, deploy):
                     top_k = d.index_top_k,
                     rope_dim = a.qk_rope_head_dim,
                     theta = a.theta,
-                    q_proj = weight(n("index_q_proj"), [index_width, a.q_lora_rank], weights),
-                    k_proj = weight(n("index_k_proj"), [d.index_head_dim, hidden], weights),
-                    weights_proj = weight(n("index_weights"), [d.index_heads, hidden], weights),
+                    q_proj = weight([index_width, a.q_lora_rank], weights),
+                    k_proj = weight([d.index_head_dim, hidden], weights),
+                    weights_proj = weight([d.index_heads, hidden], weights),
                     k_norm = norm("index_k_norm", d.index_head_dim),
                     k_norm_bias = norm("index_k_norm_bias", d.index_head_dim),
                     k_norm_eps = d.index_norm_eps,
@@ -146,8 +144,8 @@ def layout(id, deploy):
             iw = d.dense_inter
             mlp = struct(
                 routed = False,
-                gate_up = weight(n("gate_up"), [2 * iw, hidden], weights).packed([iw, iw]),
-                down = weight(n("down"), [hidden, iw], weights).rows(),
+                gate_up = weight([2 * iw, hidden], weights).packed([iw, iw]),
+                down = weight([hidden, iw], weights).rows(),
                 inter = iw,
             )
         else:
@@ -155,13 +153,13 @@ def layout(id, deploy):
             sw = d.shared_inter
             mlp = struct(
                 routed = True,
-                router = weight(n("router"), [d.experts, hidden], dense),
-                bias = weight(n("router_bias"), [d.experts], dtype.f32),
-                gate_up = weight(n("experts_gate_up"), [d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
-                down = weight(n("experts_down"), [d.experts, hidden, iw], experts).rows(),
+                router = weight([d.experts, hidden], dense),
+                bias = weight([d.experts], dtype.f32),
+                gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
+                down = weight([d.experts, hidden, iw], experts).rows(),
                 shared = struct(
-                    gate_up = weight(n("shared_gate_up"), [2 * sw, hidden], weights).packed([sw, sw]),
-                    down = weight(n("shared_down"), [hidden, sw], weights).rows(),
+                    gate_up = weight([2 * sw, hidden], weights).packed([sw, sw]),
+                    down = weight([hidden, sw], weights).rows(),
                     inter = sw,
                 ),
                 experts = d.experts,
@@ -187,9 +185,9 @@ def layout(id, deploy):
         sliding = d.sliding,
         window = d.window,
         kv = deploy.kv,
-        embed = weight("embed", [d.vocab, hidden], weights),
-        head = weight("lm_head", [d.vocab, hidden], weights).packed([d.vocab]),
+        embed = weight([d.vocab, hidden], weights),
+        head = weight([d.vocab, hidden], weights).packed([d.vocab]),
         layers = [layer(l) for l in range(d.layers)],
-        final_norm = weight("final_norm", [hidden], dense),
+        final_norm = weight([hidden], dense),
         final_norm_eps = d.norm_eps,
     )
