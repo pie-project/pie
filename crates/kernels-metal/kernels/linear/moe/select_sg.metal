@@ -342,8 +342,11 @@ constant constexpr uint kMixGates = kGroupRoutes;
 // `qmm_sg_table` does. The grid's y extent is its tile slots: slot y takes
 // tiles y, y + slots, ... of the live count; launched on the grid the
 // grouping wrote, a slot a live tile.
+// Compiled for its SG simdgroups a threadgroup: left to itself a compiler
+// may fit fewer (the M1 Max's, 384 threads), and a launch past a pipeline's
+// most threads is undefined.
 template <int HF, int SG>
-[[kernel]] void affine_qmm_sg_glu_routed(
+[[kernel]] [[max_total_threads_per_threadgroup(32 * SG)]] void affine_qmm_sg_glu_routed(
     const device uint *codes [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
     const device bfloat *biases [[buffer(2)]], const device uint *shared_codes [[buffer(3)]],
     const device bfloat *shared_scales [[buffer(4)]], const device bfloat *shared_biases [[buffer(5)]],
@@ -420,9 +423,10 @@ PIE_MOE_SG_GLU(2, 8)
 // A routed projection of each live tile's table by its expert's columns, SG
 // simdgroups of 16 a threadgroup, into the tile's rows of `out` that hold a
 // route (the rest are left as they were, read by nothing); the grid's y
-// extent is its tile slots, as the gate-up's.
+// extent is its tile slots, as the gate-up's; compiled for its SG simdgroups
+// as the gate-up is (the M1 Max's compiler fits 448 threads of it otherwise).
 template <int SG>
-[[kernel]] void affine_qmm_sg_routed(
+[[kernel]] [[max_total_threads_per_threadgroup(32 * SG)]] void affine_qmm_sg_routed(
     const device uint *codes [[buffer(0)]], const device bfloat *scales [[buffer(1)]],
     const device bfloat *biases [[buffer(2)]], const device uint *shared_codes [[buffer(3)]],
     const device bfloat *shared_scales [[buffer(4)]], const device bfloat *shared_biases [[buffer(5)]],
