@@ -647,6 +647,21 @@ pub enum Fused {
         #[output]
         q: ValueId,
     },
+    /// A chain of elementwise and row ops the compiler generates one kernel
+    /// for (poem-compiler's `fuse::chain`): `ins[k]` is the kernel's
+    /// parameter `k` and `outs[k]` its result `k`, each a row of `width` a
+    /// row (an input one row every row reads, a weight's). `body` is the
+    /// generated body's hash, the key its region and source are held under
+    /// in the compiled model. No output lands over an input: each has a
+    /// plane of its own.
+    Region {
+        #[input]
+        ins: Vec<ValueId>,
+        width: u32,
+        body: u64,
+        #[output]
+        outs: Vec<ValueId>,
+    },
 }
 
 #[cfg(test)]
@@ -792,6 +807,20 @@ mod tests {
             project: Box::new(project),
         };
         assert_eq!(operands(&prenorm), (vec![1, 2], vec![10, 11], vec![]));
+    }
+
+    /// A generated region reads its parameters and lands its results, none
+    /// over another.
+    #[test]
+    fn a_region_lands_no_result_over_its_parameters() {
+        let op = Fused::Region {
+            ins: vec![v(1), v(2), v(3)],
+            width: 64,
+            body: 0x5eed,
+            outs: vec![v(4), v(5)],
+        };
+        assert_eq!(operands(&op), (vec![1, 2, 3], vec![4, 5], vec![]));
+        assert_eq!(op.name(), "fused.region");
     }
 
     /// The sinks scale the merged plane where it lies; a log-sum-exp

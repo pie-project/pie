@@ -53,8 +53,9 @@ pub struct DagStreams;
 
 /// Whether the compiler forms each chain of elementwise and row ops into a
 /// region lowered to eta (`fuse::chain`), for kernels-* to generate one
-/// kernel for. Off unless a chip's profile turns it on; nothing consumes
-/// the regions yet.
+/// kernel for, and plans the trace with each chain folded into one
+/// `fused.region` op (`CompiledModel::trace`). Off unless a chip's profile
+/// turns it on; an engine that does runs the folded trace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "compiler.synth_regions", flag, default = false, tune = engine)]
 pub struct SynthRegions;
