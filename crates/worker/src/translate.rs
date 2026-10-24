@@ -114,8 +114,6 @@ fn scheduler(runtime: &config::RuntimeConfig) -> runtime::bootstrap::SchedulerCo
         silence_timeout_secs: runtime.silence_timeout.as_secs(),
         frame_size: runtime.frame_size,
         frame_dispatch_depth: runtime.frame_dispatch_depth,
-        // `RuntimeConfig::validate` refused any other.
-        verify_budget: runtime.verify_budget.parse().unwrap_or_default(),
     }
 }
 

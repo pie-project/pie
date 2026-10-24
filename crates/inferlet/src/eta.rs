@@ -1196,21 +1196,6 @@ impl Pipeline {
     pub fn live() -> u32 {
         wit_pipeline::live()
     }
-
-    /// How many of a round's proposals its verify may carry under the
-    /// runtime's cross-request verify budget, `survival[j]` being the
-    /// chance the round keeps proposal `j` and every one before it: a
-    /// prefix, all of them with no budget set. An empty bid withdraws.
-    #[must_use]
-    pub fn allot_verify(&self, survival: &[f32]) -> u32 {
-        self.wit.allot_verify(survival)
-    }
-
-    /// Whether the runtime shares a verify budget across requests.
-    #[must_use]
-    pub fn verify_budgeted() -> bool {
-        wit_pipeline::verify_budgeted()
-    }
 }
 
 impl Default for Pipeline {

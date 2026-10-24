@@ -64,8 +64,6 @@ impl RuntimeShutdown {
     }
 }
 
-pub use crate::pipeline::verify::Budget as VerifyBudget;
-
 pub struct Config {
     pub host: String,
     pub port: u16,
@@ -184,8 +182,6 @@ pub struct SchedulerConfig {
     pub silence_timeout_secs: u64,
     pub frame_size: u32,
     pub frame_dispatch_depth: u32,
-    /// The verify rows drafting requests share (`[runtime] verify_budget`).
-    pub verify_budget: VerifyBudget,
 }
 
 #[derive(Debug, Clone)]
@@ -583,7 +579,6 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     ));
     crate::scheduler::set_frame_size(scheduler.frame_size as usize);
     crate::scheduler::set_dispatch_depth(scheduler.frame_dispatch_depth as usize);
-    crate::pipeline::verify::configure(scheduler.verify_budget);
     let scheduler_shutdown = crate::scheduler::spawn(&engines, kv_page_size as u32).await?;
     active_guard.disarm();
     Ok(BootstrapHandle {

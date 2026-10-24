@@ -19,25 +19,10 @@ interface pipeline {
         /// Later submissions fail. Work never submitted is simply absent.
         /// Resource drop has exactly these semantics.
         close: func();
-
-        /// How many of a drafted round's proposals its verify may carry,
-        /// under the verify budget the runtime shares across every request
-        /// drafting now (`[runtime] verify_budget`). `survival[j]` is the
-        /// chance the round keeps proposal `j` and every one before it; the
-        /// budget's rows go to the largest chances across requests, so the
-        /// answer is a prefix, at most `survival`'s length. The bid stands
-        /// until the next, and an empty one withdraws it. With no budget set
-        /// every bid is granted whole.
-        allot-verify: func(survival: list<f32>) -> u32;
     }
 
     /// How many pipelines are open on the engine, this one included: a
     /// program that trades compute for latency (speculation) reads whether
     /// it is alone.
     live: func() -> u32;
-
-    /// Whether the runtime shares a verify budget across requests
-    /// (`allot-verify`): a program that drafts only alone may then draft
-    /// beside others, for the rows the budget grants it.
-    verify-budgeted: func() -> bool;
 }

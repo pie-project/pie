@@ -876,19 +876,6 @@ pub struct RuntimeConfig {
     /// plane's are `[cluster] cluster_policies`.
     #[serde(default)]
     pub worker_policy: Option<String>,
-    /// The verify rows the requests drafting at once share: `"off"`, `"auto"`
-    /// (the rows the measured decode curve carries before a frame runs a
-    /// fifth longer) or a count of rows.
-    ///
-    /// Off, each speculating request prices its own verify and the built-in
-    /// API inferlets draft only while alone. On, a request bids its draft's
-    /// chances, the rows go to the likeliest proposals across requests, and
-    /// the API inferlets draft beside others for the rows they are granted.
-    /// Off by default: a granted row may still lengthen every request's step
-    /// by up to the slack, and the draft fire is outside the budget, so
-    /// whether a crowd gains is a measurement of the deployment, not a given.
-    #[serde(default = "default_verify_budget")]
-    pub verify_budget: String,
 }
 
 impl Default for RuntimeConfig {
@@ -900,7 +887,6 @@ impl Default for RuntimeConfig {
             frame_dispatch_depth: default_frame_dispatch_depth(),
             max_concurrent_processes: None,
             worker_policy: None,
-            verify_budget: default_verify_budget(),
         }
     }
 }
@@ -947,12 +933,6 @@ impl RuntimeConfig {
         if let Some(n) = self.max_concurrent_processes {
             ensure!(n > 0, "runtime.max_concurrent_processes must be > 0 if set");
         }
-        if let Err(why) = self
-            .verify_budget
-            .parse::<runtime::bootstrap::VerifyBudget>()
-        {
-            anyhow::bail!("runtime.{why}");
-        }
         Ok(())
     }
 }
@@ -971,10 +951,6 @@ fn default_frame_size() -> u32 {
 
 fn default_frame_dispatch_depth() -> u32 {
     2
-}
-
-fn default_verify_budget() -> String {
-    "off".into()
 }
 
 /// `[engine]`: the keys every engine reads, and beside them the named
