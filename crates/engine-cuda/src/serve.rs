@@ -10,7 +10,6 @@ mod prepare;
 mod segments;
 mod settle;
 mod stats;
-pub mod timing;
 
 pub use arming::{Armed, Kind, Seal};
 pub use boot::{Boot, DEFAULT_BODIES_MEGABYTES, Golden, Graphs, Knobs, Recording};
@@ -112,8 +111,6 @@ pub struct Shell {
     bodies_mem: usize,
     decoded_tiles: Vec<u64>,
     arming: bool,
-    /// `fire-timing`: each serving fire's span on the device.
-    fire_timer: Option<timing::FireTimer>,
     golden_arm: Golden,
     armed_body: Option<record::BodyKey>,
     segments: std::collections::HashMap<record::BodyKey, Segmented>,
