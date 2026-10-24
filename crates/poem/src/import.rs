@@ -281,9 +281,41 @@ pub fn own_contract(
         if param.source != crate::ParamSource::Checkpoint || companions.contains(&param.name) {
             continue;
         }
+        let before = b.tensors.len();
         b.read_own(&Weight::of_plane(param))?;
+        if let Some(cut) = param.experts {
+            for tensor in &mut b.tensors[before..] {
+                let expr = std::mem::replace(&mut tensor.expr, Expr::src(""));
+                tensor.expr = slotted(src, expr, cut).map_err(|why| Error::Illegible {
+                    name: param.name.clone(),
+                    detail: format!("{why}"),
+                })?;
+            }
+        }
     }
     Ok(b.build())
+}
+
+/// `expr` reading an expert-parallel rank's slots of each bank it reads
+/// whole: a source whose leading axis is the bank's experts (its codes and
+/// the planes beside them, one row an expert), not one scale for them all.
+fn slotted(
+    src: &ztensor::Source,
+    expr: Expr,
+    cut: poem_ir::ExpertSlots,
+) -> Result<Expr, checkpoint::error::Error> {
+    let experts = i64::from(cut.experts);
+    match expr {
+        Expr::Src(name) => {
+            let leading = stored_shape(src, &name).and_then(|shape| shape.first().copied());
+            Ok(if leading == Some(experts) {
+                Expr::src(name).experts(experts, i64::from(cut.slots))
+            } else {
+                Expr::Src(name)
+            })
+        }
+        expr => expr.map_children(|child| slotted(src, child, cut)),
+    }
 }
 
 enum Kind {
@@ -2441,6 +2473,58 @@ mod tests {
         modelopt_nvfp4_legs_land_their_codes_scales_and_a_tensor_scale_a_row();
         deepseek_fp8_legs_land_their_codes_and_block_exponents_as_stored();
         a_gather_over_k_quants_computes_over_their_decoded_values();
+        an_expert_rank_loads_its_slots_of_a_bank();
+    }
+
+    /// A bank of four experts over two ranks of three slots: rank 1 holds
+    /// experts 3, 0 and 1 (the placement wraps), bytes as stored.
+    fn an_expert_rank_loads_its_slots_of_a_bank() {
+        use checkpoint::executor::Execution;
+        use checkpoint::executor::sink::MemorySink;
+        use checkpoint::plan::{StorageTarget, compile};
+
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let mut writer =
+            ztensor::Writer::create(dir.path().join("model.zt")).expect("the container opens");
+        // Expert `e`'s four bf16 values are each `e + 1` in their low byte.
+        let bytes: Vec<u8> = (0..4u8).flat_map(|e| [e + 1, 0].repeat(4)).collect();
+        writer
+            .add("bank", vec![4, 2, 2], ztensor::Leaf::BF16, &bytes)
+            .expect("the bank lands");
+        writer.finish().expect("the container closes");
+        let src = ztensor::Source::open(dir.path().join("model.zt")).expect("it reads back");
+        let param = crate::Param {
+            name: "bank".into(),
+            shape: vec![3, 2, 2],
+            shard: crate::Shard::Replicated,
+            dtype: Dtype::Bf16,
+            source: crate::ParamSource::Checkpoint,
+            layout: poem_ir::ParamLayout::Natural,
+            placement: poem_ir::ParamPlacement::Device,
+            experts: Some(poem_ir::ExpertSlots {
+                layer: 0,
+                ep: 2,
+                experts: 4,
+                slots: 3,
+            }),
+        };
+        let contract =
+            own_contract(&src, &[param], 1, Platform::Cuda).expect("the bank's contract");
+        let metadata = checkpoint::file::read::parse_metadata(dir.path()).expect("it parses");
+        for (rank, held) in [(0u32, [1u8, 2, 3]), (1, [4, 1, 2])] {
+            let target = StorageTarget {
+                ep_rank: rank,
+                ..StorageTarget::default()
+            };
+            let plan = compile(&metadata, &contract, target).expect("it compiles");
+            let mut sink = MemorySink::default();
+            Execution::new(&plan, dir.path())
+                .sink(&mut sink)
+                .run()
+                .expect("the plan executes");
+            let want: Vec<u8> = held.iter().flat_map(|e| [*e, 0].repeat(4)).collect();
+            assert_eq!(sink.tensors["bank"], want, "rank {rank}");
+        }
     }
 
     fn deepseek_fp8_legs_land_their_codes_and_block_exponents_as_stored() {

@@ -41,7 +41,7 @@ pub fn build_instance(
 ) -> Result<LoadPlan> {
     let sources = Sources::new(metadata);
     let partition = Partition::new(target.tp_rank, target.tp_size);
-    let resolver = Resolver::new(&sources, partition);
+    let resolver = Resolver::new(&sources, partition).for_expert_rank(target.ep_rank);
     let resolver = match instance {
         Some(index) => resolver.for_instance(index),
         None => resolver,
@@ -313,6 +313,7 @@ impl Builder<'_> {
             | Expr::Concat { .. }
             | Expr::Transmute { .. }
             | Expr::Shard { .. }
+            | Expr::Experts { .. }
             | Expr::SrcIndexed(_)
             | Expr::Select { .. } => (self.affine(&expr, &decl)?, decl),
         };
