@@ -6,6 +6,12 @@ use dtype::Dtype;
 
 const FILE: &str = "collective/dispatch.cu";
 
+pub(super) const KERNELS: [(&str, &str); 3] = [
+    (FILE, "::pie::collective::dispatch_count"),
+    (FILE, "::pie::collective::dispatch_send"),
+    (FILE, "::pie::collective::dispatch_settle"),
+];
+
 /// `peer::kMaxRanks`.
 pub const EP_MAX_RANKS: u32 = 8;
 
@@ -20,13 +26,26 @@ const COUNT_THREADS: u32 = 1024;
 const SEND_WARPS: u32 = 8;
 
 /// A rank's view of an expert-parallel group whose ranks map one another's
-/// memory: every rank's EP signal block, in rank order. Every rank fires
-/// every dispatch and combine, in the same order.
+/// memory: every rank's EP signal block, in rank order, and this rank's
+/// scratch for a dispatch of up to `scratch_tokens` tokens
+/// ([`ep_scratch_bytes`]). Every rank fires every dispatch and combine, in
+/// the same order. Nothing here allocates: a rank's allocation between two
+/// ranks' launches could wait on a peer spinning for the rank that waits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ep {
     pub rank: u32,
     pub world: u32,
     pub signals: [u64; EP_MAX_RANKS as usize],
+    pub scratch: u64,
+    pub scratch_tokens: u32,
+}
+
+/// Bytes of a rank's dispatch scratch for `tokens` tokens in a group of
+/// `world`: where its rows start on each rank, then each token's row on
+/// each.
+#[must_use]
+pub const fn ep_scratch_bytes(tokens: u32, world: u32) -> u64 {
+    EP_MAX_RANKS as u64 * 4 + tokens as u64 * world as u64 * 4
 }
 
 /// Where each logical expert lives: `[experts][stride]` i32 on the device,
@@ -154,8 +173,14 @@ pub fn dispatch(
         }
     }
 
-    let pos = ctx.scratch_stream(OP, "dispatch_pos", tokens as usize * world as usize * 4)?;
-    let offs = ctx.scratch_stream(OP, "dispatch_offs", EP_MAX_RANKS as usize * 4)?;
+    if tokens > ep.scratch_tokens {
+        return Err(refuse(
+            OP,
+            "more tokens than the rank's dispatch scratch holds",
+        ));
+    }
+    let offs = ep.scratch;
+    let pos = ep.scratch + u64::from(EP_MAX_RANKS) * 4;
     let by_rank = |f: &dyn Fn(&Landing) -> u64| {
         let mut out = [0u64; EP_MAX_RANKS as usize];
         for (o, l) in out.iter_mut().zip(landing) {
@@ -172,8 +197,8 @@ pub fn dispatch(
             _ => 0,
         },
         place: place.table,
-        pos: pos as usize as u64,
-        offs: offs as usize as u64,
+        pos,
+        offs,
         counts: counts.ptr,
         rows: by_rank(&|l| l.rows.ptr),
         local: by_rank(&|l| l.local.ptr),
@@ -193,13 +218,13 @@ pub fn dispatch(
     let one = Launch::grid([1, 1, 1], [COUNT_THREADS, 1, 1]);
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::collective::dispatch_count")).apply(one),
+        Fire::at(kernel(FILE, KERNELS[0].1)).apply(one),
         &[ArgValue::of(&params)],
     )?;
     if tokens > 0 {
         ctx.fire(
             OP,
-            Fire::at(kernel(FILE, "::pie::collective::dispatch_send")).apply(Launch::grid(
+            Fire::at(kernel(FILE, KERNELS[1].1)).apply(Launch::grid(
                 [tokens.div_ceil(SEND_WARPS), 1, 1],
                 [32 * SEND_WARPS, 1, 1],
             )),
@@ -208,7 +233,7 @@ pub fn dispatch(
     }
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::collective::dispatch_settle")).apply(one),
+        Fire::at(kernel(FILE, KERNELS[2].1)).apply(one),
         &[ArgValue::of(&params)],
     )
 }

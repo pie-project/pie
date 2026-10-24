@@ -6,6 +6,11 @@ use crate::tensor::Tensor;
 
 const FILE: &str = "collective/combine.cu";
 
+pub(super) const KERNELS: [(&str, &str); 2] = [
+    (FILE, "::pie::collective::combine_send"),
+    (FILE, "::pie::collective::combine_settle"),
+];
+
 /// `kSendWarps`.
 const SEND_WARPS: u32 = 8;
 
@@ -89,14 +94,13 @@ pub fn combine(
     let blocks = cap.div_ceil(SEND_WARPS).clamp(1, MAX_BLOCKS);
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::collective::combine_send"))
+        Fire::at(kernel(FILE, KERNELS[0].1))
             .apply(Launch::grid([blocks, 1, 1], [32 * SEND_WARPS, 1, 1])),
         &[ArgValue::of(&params)],
     )?;
     ctx.fire(
         OP,
-        Fire::at(kernel(FILE, "::pie::collective::combine_settle"))
-            .apply(Launch::grid([1, 1, 1], [32, 1, 1])),
+        Fire::at(kernel(FILE, KERNELS[1].1)).apply(Launch::grid([1, 1, 1], [32, 1, 1])),
         &[ArgValue::of(&params)],
     )
 }

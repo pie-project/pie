@@ -8,7 +8,7 @@ use crate::common::Gpu;
 use dtype::Dtype::{Bf16, F32, I32};
 use kernels_cuda::Tensor;
 use kernels_cuda::collective::{
-    EP_SIGNAL_BYTES, Ep, Landing, Placement, Tokens, combine, dispatch,
+    EP_SIGNAL_BYTES, Ep, Landing, Placement, Tokens, combine, dispatch, ep_scratch_bytes,
 };
 
 /// What `routed` holds where no route wrote.
@@ -94,6 +94,7 @@ struct Held {
     routed: Tensor,
     y: Tensor,
     signals: u64,
+    scratch: u64,
     window: u64,
     place: Placement,
 }
@@ -123,6 +124,7 @@ fn hold(c: &Case, g: &mut Gpu, d: &Data, signals: u64) -> Held {
     );
     let y = Tensor::new(g.zeros(cap * k * w * 2), (cap * k) as u32, w as u32, Bf16);
     let window = g.up(&c.window.unwrap_or([0, 0]));
+    let scratch = g.zeros(ep_scratch_bytes(t as u32, c.world as u32) as usize);
     let place = Placement {
         table: g.up(&c.table()),
         stride: 3,
@@ -136,6 +138,7 @@ fn hold(c: &Case, g: &mut Gpu, d: &Data, signals: u64) -> Held {
         routed,
         y,
         signals,
+        scratch,
         window,
         place,
     }
@@ -150,6 +153,8 @@ fn ep_of(held: &[Held], rank: usize) -> Ep {
         rank: rank as u32,
         world: held.len() as u32,
         signals,
+        scratch: held[rank].scratch,
+        scratch_tokens: held[rank].tokens.x.rows,
     }
 }
 
@@ -204,23 +209,8 @@ fn check(c: &Case) {
         .map(|g| g.zeros(EP_SIGNAL_BYTES as usize))
         .collect();
 
-    // Each stream loads the modules and takes its scratch on a group of one
-    // first, so no load or allocation lands between the ranks' launches
-    // (as many tokens as the group lands, for scratch as wide).
-    let solo = Case {
-        world: 1,
-        tokens: cap,
-        extra: 0,
-        window: None,
-        ..*c
-    };
-    for g in &mut gpus {
-        let d = solo.data(0, 0);
-        let lone = g.zeros(EP_SIGNAL_BYTES as usize);
-        let held = [hold(&solo, g, &d, lone)];
-        fire_dispatch(&solo, core::slice::from_ref(g), &held);
-        fire_combine(core::slice::from_ref(g), &held);
-    }
+    // No module load may land between the ranks' launches.
+    kernels_cuda::collective::load_ep().expect("the EP kernels load");
 
     // Two rounds on the same signal blocks: the second meets the ranks on
     // counters the first left behind.
