@@ -57,6 +57,7 @@ impl DispatchFused for Run<'_> {
             | Fused::MatmulSplitRows { .. }
             | Fused::MoeSelectGlu { .. }
             | Fused::MoeExperts { .. }
+            | Fused::MoeMega { .. }
             | Fused::LseSink { .. }
             | Fused::RopeYarnAppend { .. }
             | Fused::SplitRopeYarnAppend { .. } => return self.primitives(op),
@@ -459,6 +460,17 @@ impl Run<'_> {
             Fused::MoeSelectGlu { select, glu } => {
                 DispatchLinear::dispatch(self, select)?;
                 DispatchLinear::dispatch(self, glu)
+            }
+            Fused::MoeMega {
+                select,
+                glu,
+                down,
+                sum,
+            } => {
+                for leg in [select, glu, down, sum] {
+                    DispatchLinear::dispatch(self, leg)?;
+                }
+                Ok(())
             }
             Fused::MoeExperts {
                 select,

@@ -76,7 +76,8 @@ impl DispatchFused for Run<'_> {
             | Fused::MatmulMoeRoute { .. }
             | Fused::MatmulSplitRows { .. }
             | Fused::MoeSelectGlu { .. }
-            | Fused::MoeExperts { .. } => self.fused_linear(op),
+            | Fused::MoeExperts { .. }
+            | Fused::MoeMega { .. } => self.fused_linear(op),
             Fused::ResidualAddRmsnorm { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::EmbedScaleAdd { .. }

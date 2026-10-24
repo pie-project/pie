@@ -628,6 +628,24 @@ pub enum Fused {
         #[part]
         gate_add: Option<Box<Linear>>,
     },
+    /// A routed MLP a mega-MoE kernel lands in one launch: the gate-up
+    /// select (gate rows then up rows per expert), its packed SwiGLU, the
+    /// down select on the same routes and the fold (`MoeCombine`). The fold
+    /// is the route weights' first (`glu` takes them, the routes summed
+    /// plainly with `sum`'s shared row added where given) or the weighted
+    /// sum (`sum` takes them, no shared row). The rows between are still
+    /// outputs, read by nothing else, so a backend that declines a fire
+    /// runs it as the `MoeExperts` it also is.
+    MoeMega {
+        #[part]
+        select: Box<Linear>,
+        #[part]
+        glu: Box<Linear>,
+        #[part]
+        down: Box<Linear>,
+        #[part]
+        sum: Box<Linear>,
+    },
     /// `qkv` (a `QkvFusedQknormRopeVnormWrite`) on the first columns of its
     /// `packed` rows, the rest of each row (`rest`'s width) landing in
     /// `rest`: a row split (Muse Spark's qkv|gate) read in place.

@@ -22,6 +22,7 @@ mod a_rewritten_format_keeps_its_contracts;
 mod a_rewritten_package_keeps_its_traces;
 mod a_routed_bank_is_the_rectangle_the_grouped_leg_reads;
 mod a_router_product_and_its_pick_fuse;
+mod a_routed_mlp_lands_as_one_mega_moe;
 mod a_trace_is_the_same_whatever_order_it_was_recorded_in;
 mod a_u4_trunk_projection_decodes_on_the_tiled_arm;
 mod a_width_the_ranks_cannot_split_lands_padded_with_zeros;

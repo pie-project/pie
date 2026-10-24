@@ -1391,7 +1391,8 @@ fn decoded_weight_planes(
                 #[cfg(not(feature = "rocm"))]
                 poem_ir::Operation::Fused(
                     poem_ir::Fused::MoeSelectGlu { select, .. }
-                    | poem_ir::Fused::MoeExperts { select, .. },
+                    | poem_ir::Fused::MoeExperts { select, .. }
+                    | poem_ir::Fused::MoeMega { select, .. },
                 ) if matches!(
                     **select,
                     poem_ir::Linear::MoeSelect {
@@ -1429,7 +1430,9 @@ fn decoded_weight_planes(
                     },
                 )
                 | poem_ir::Operation::Fused(
-                    poem_ir::Fused::MoeSelectGlu { .. } | poem_ir::Fused::MoeExperts { .. },
+                    poem_ir::Fused::MoeSelectGlu { .. }
+                    | poem_ir::Fused::MoeExperts { .. }
+                    | poem_ir::Fused::MoeMega { .. },
                 ) => continue,
                 // A fused projection runs its matmul when no fused kernel
                 // takes it, and decodes the same plane that matmul would.
@@ -1448,7 +1451,9 @@ fn decoded_weight_planes(
                 }
                 #[cfg(feature = "rocm")]
                 poem_ir::Operation::Fused(
-                    poem_ir::Fused::MoeSelectGlu { .. } | poem_ir::Fused::MoeExperts { .. },
+                    poem_ir::Fused::MoeSelectGlu { .. }
+                    | poem_ir::Fused::MoeExperts { .. }
+                    | poem_ir::Fused::MoeMega { .. },
                 ) => {
                     outputs.clear();
                     node.op.outputs(&mut outputs);

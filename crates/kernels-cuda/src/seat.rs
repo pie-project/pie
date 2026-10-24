@@ -117,6 +117,7 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("fused.matmul_swiglu_matmul", Reads::Rows),
     entry("linear.moe_bias_sum", Reads::Rows),
     entry("fused.moe_experts", Reads::Rows),
+    entry("fused.moe_mega", Reads::Rows),
     entry("linear.lora_correct", Reads::Rows),
     entry("linear.moe_sigmoid_gate_add", Reads::Rows),
     entry("linear.rel_bias", Reads::Rows),
