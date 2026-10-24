@@ -2,6 +2,7 @@
 //! classified event stream — with stop tokens, stop sequences and the
 //! token budget applied.
 
+use std::cell::RefCell;
 use std::ops::ControlFlow;
 
 use inferlet::chat;
@@ -41,6 +42,20 @@ pub struct Outcome {
     /// Every sampled token's logprobs, in order (the stop token that ended
     /// the turn among them), where the request asked for them.
     pub logprobs: Vec<(u32, Logprob)>,
+    /// Every prompt token with its logprob under the tokens before it
+    /// (`None` for the first, which nothing conditions), the model's prefix
+    /// among them, where the request asked for them.
+    pub prompt_logprobs: Vec<(u32, Option<Logprob>)>,
+}
+
+/// The prompt's tokens beside their scores: the first has none, each after
+/// it the score of the row before it.
+fn pair_prompt(tokens: &[u32], scored: &[Logprob]) -> Vec<(u32, Option<Logprob>)> {
+    tokens
+        .iter()
+        .zip(std::iter::once(None).chain(scored.iter().cloned().map(Some)))
+        .map(|(&token, lp)| (token, lp))
+        .collect()
 }
 
 /// Each report takes a lock on the host.
@@ -108,8 +123,11 @@ impl Output {
 }
 
 /// Run `req`, handing every event to `sink` as it happens.
-pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, String> {
+pub async fn run(req: &Request, sink: impl FnMut(Event)) -> Result<Outcome, String> {
+    // The prompt's logprobs and the tokens' events both go out through it.
+    let sink = RefCell::new(sink);
     let mut prompt = prompt::build(req)?;
+    let prompt_len = prompt.tokens.len();
     // The worker's policy sees the prompt while this process still waits.
     let prompt_tokens = prompt.tokens.len() as u32;
     inferlet::session::set_tokens(prompt_tokens, 0);
@@ -144,16 +162,25 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
     // (`crate::continuation`), so they all stand where they stood.
     for &token in &continued {
         if let Ok(events) = demux.feed(token) {
-            let _ = out.deliver(events, &mut sink);
+            let _ = out.deliver(events, &mut *sink.borrow_mut());
         }
     }
+
+    // A continued turn's own tokens are no part of the prompt it scores.
+    let mut prompt_logprobs = Vec::new();
+    let mut on_prompt = |scored: &[Logprob]| {
+        prompt_logprobs = pair_prompt(&prompt.tokens[..prompt_len], scored);
+        if req.stream {
+            (sink.borrow_mut())(Event::PromptLogprobs(prompt_logprobs.clone()));
+        }
+    };
 
     let mut logprobs: Vec<(u32, Logprob)> = Vec::new();
     let mut on_token = |token: u32, logprob: Option<Logprob>| -> ControlFlow<()> {
         crate::continuation::note(token);
         if let Some(logprob) = logprob {
             if req.stream {
-                sink(Event::Logprobs(vec![(token, logprob.clone())]));
+                (sink.borrow_mut())(Event::Logprobs(vec![(token, logprob.clone())]));
             }
             logprobs.push((token, logprob));
         }
@@ -169,21 +196,24 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
             return ControlFlow::Break(());
         }
         match demux.feed(token) {
-            Ok(events) => out.deliver(events, &mut sink),
+            Ok(events) => out.deliver(events, &mut *sink.borrow_mut()),
             Err(e) => {
                 error = Some(e);
                 ControlFlow::Break(())
             }
         }
     };
-    let (sampled, cached_tokens) = generate(
+    let done = generate(
         &prompt,
         req.sampling,
         req.max_tokens.saturating_sub(continued.len()),
         matcher.as_ref(),
+        &mut on_prompt,
         &mut on_token,
     )
     .await?;
+    let (sampled, cached_tokens) = (done.sampled, done.cached);
+    let mut sink = sink.into_inner();
     inferlet::session::set_tokens(prompt_tokens, generated);
     if let Some(e) = error {
         return Err(e);
@@ -217,5 +247,25 @@ pub async fn run(req: &Request, mut sink: impl FnMut(Event)) -> Result<Outcome, 
         reasoning: demux.reasoning_text,
         tool_calls: demux.tool_calls,
         logprobs,
+        prompt_logprobs,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_first_prompt_token_has_no_score_and_each_after_it_the_row_before_its() {
+        let score = |logprob| Logprob {
+            logprob,
+            top: Vec::new(),
+            rank: Some(1),
+        };
+        let paired = pair_prompt(&[10, 11, 12], &[score(-1.0), score(-2.0)]);
+        assert_eq!(
+            paired,
+            vec![(10, None), (11, Some(score(-1.0))), (12, Some(score(-2.0)))]
+        );
+    }
 }

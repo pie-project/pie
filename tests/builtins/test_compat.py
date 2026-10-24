@@ -614,6 +614,33 @@ def test_sampling_arms(http: Http):
         assert mean > -6.0, f"{knobs}: drawn tokens average logprob {mean:.2f}"
 
 
+def test_completions_prompt_logprobs(http: Http):
+    prompt = "The capital of France is"
+    status, _, text = http.post(
+        "/v1/completions",
+        {"prompt": prompt, "max_tokens": 4, "temperature": 0, "echo": True, "logprobs": 2, "prompt_logprobs": 1},
+    )
+    assert status == 200, text
+    choice = json.loads(text)["choices"][0]
+    assert choice["text"].startswith(prompt), choice["text"]
+    lp = choice["logprobs"]
+    # The echoed tokens spell the prompt, and the generated ones follow it.
+    assert "".join(lp["tokens"]).startswith(prompt), lp["tokens"]
+    assert len(lp["tokens"]) == len(lp["token_logprobs"]) == len(lp["top_logprobs"]) == len(lp["text_offset"])
+    assert lp["text_offset"][0] == 0 and lp["text_offset"] == sorted(lp["text_offset"])
+    scored = [v for v in lp["token_logprobs"] if v is not None]
+    assert len(scored) >= len(lp["tokens"]) - 1 and all(v <= 0.0 for v in scored), lp
+    assert all(top is None or len(top) <= 2 for top in lp["top_logprobs"]), lp["top_logprobs"]
+    # vLLM's shape: null first, then the prompt token's own entry with its rank.
+    rows = choice["prompt_logprobs"]
+    assert rows[0] is None and len(rows) >= 2, rows
+    for row in rows[1:]:
+        assert any(entry["rank"] >= 1 for entry in row.values()), row
+    # Scoring is opt-in: without it the shape is as before.
+    status, _, text = http.post("/v1/completions", {"prompt": prompt, "max_tokens": 4, "echo": True})
+    assert status == 200 and json.loads(text)["choices"][0]["logprobs"] is None, text
+
+
 def test_completions_streaming(http: Http):
     status, _, resp = http.post(
         "/v1/completions",
@@ -899,6 +926,7 @@ TESTS = [
     test_official_anthropic_client,
     test_completions,
     test_sampling_arms,
+    test_completions_prompt_logprobs,
     test_completions_streaming,
     test_responses_non_streaming,
     test_responses_streaming,

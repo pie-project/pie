@@ -82,6 +82,53 @@ fn chat_logprob(token: u32, logprob: &compat::Logprob) -> Value {
     out
 }
 
+/// vLLM's `prompt_logprobs`: `null` for the first prompt token, then for
+/// each token a map from token id to its logprob, rank and text — the
+/// prompt's own token first, then the `top` likeliest.
+fn vllm_prompt_logprobs(prompt: &[(u32, Option<compat::Logprob>)], top: usize) -> Value {
+    let entry = |logprob: f32, rank: Option<u32>, token: u32| json!({"logprob": logprob.max(-9999.0), "rank": rank, "decoded_token": token_text(token)});
+    let rows = prompt.iter().map(|(token, lp)| {
+        let Some(lp) = lp else {
+            return Value::Null;
+        };
+        let mut row = serde_json::Map::new();
+        row.insert(token.to_string(), entry(lp.logprob, lp.rank, *token));
+        for (rank, &(alt, alt_lp)) in (1u32..).zip(lp.top.iter().take(top)) {
+            row.entry(alt.to_string())
+                .or_insert_with(|| entry(alt_lp, Some(rank), alt));
+        }
+        Value::Object(row)
+    });
+    Value::Array(rows.collect())
+}
+
+/// The `prompt_logprobs` field (vLLM's): how many alternatives each prompt
+/// token is scored with. It is not streamed, as vLLM does not.
+fn prompt_logprobs(asked: Option<i64>, stream: bool) -> Result<Option<u32>, ApiError> {
+    let Some(top) = asked else {
+        return Ok(None);
+    };
+    if stream {
+        return Err(invalid(
+            "`prompt_logprobs` is not supported with `stream`",
+            Some("prompt_logprobs"),
+        ));
+    }
+    u32::try_from(top)
+        .ok()
+        .filter(|&k| k <= compat::generate::MAX_TOP_LOGPROBS)
+        .map(Some)
+        .ok_or_else(|| {
+            invalid(
+                format!(
+                    "`prompt_logprobs` must be between 0 and {}",
+                    compat::generate::MAX_TOP_LOGPROBS
+                ),
+                Some("prompt_logprobs"),
+            )
+        })
+}
+
 /// The `n` field: how many choices, at least one. A request of several is
 /// not continued ([`compat::continuation::opt_out`]): its choices' tokens
 /// would interleave in what its frames name.
@@ -99,12 +146,17 @@ fn choices(n: Option<u32>) -> Result<u32, ApiError> {
 }
 
 /// The request of the `index`-th of `n` choices: its own random stream.
+/// The prompt is the same for every choice, so unstreamed only the first
+/// scores it and the response gives its scores to all.
 fn choice_request(req: &compat::Request, index: u32) -> compat::Request {
     let mut req = req.clone();
     req.sampling.seed = req
         .sampling
         .seed
         .wrapping_add(index.wrapping_mul(0x9e37_79b9));
+    if index > 0 && !req.stream {
+        req.sampling.prompt_logprobs = None;
+    }
     req.choice = index;
     req
 }

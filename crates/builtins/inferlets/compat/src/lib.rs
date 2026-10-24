@@ -35,7 +35,7 @@ mod speculative;
 pub use demux::Event;
 pub use envelope::Envelope;
 pub use error::ApiError;
-pub use generate::{Logprob, Sampling};
+pub use generate::{Generated, Logprob, Sampling};
 pub use request::{Effort, Message, Request, ResponseFormat, Role, Thinking, ToolCall, ToolChoice};
 pub use run::{Finish, Outcome, run};
 
