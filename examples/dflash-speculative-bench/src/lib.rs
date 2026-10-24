@@ -68,8 +68,6 @@ struct Input {
     /// Every round drafts, and verifies the rows its draft's confidence pays
     /// for at the rows' measured prices; see `budget`. Overrides `priced`,
     /// `auto_width` and the yield floor; `verify_rows` still caps the block.
-    /// Beside other requests under the runtime's `verify_budget`, the round
-    /// bids its rows' survival and verifies the prefix it is granted.
     #[serde(default)]
     verify_budget: bool,
     #[serde(default = "default_drafter")]
@@ -779,16 +777,6 @@ async fn main(input: Input) -> Result<Output> {
                 confidence = value[from..shown as usize].to_vec();
                 // `verify` holds the widest the block (or `verify_rows`) allows.
                 verify = budget.width(&confidence, verify, |w| prices.budget_round(w));
-                // Beside other requests, under the runtime's verify budget,
-                // the lane verifies only the prefix the budget grants it.
-                if Pipeline::live() > 1 && Pipeline::verify_budgeted() {
-                    let bid: Vec<f32> = budget
-                        .survival(&confidence, verify)
-                        .iter()
-                        .map(|&c| c as f32)
-                        .collect();
-                    verify = pipe.allot_verify(&bid) + 1;
-                }
                 budget_expected += budget.expected(&confidence, verify);
             }
             if want_margin {
