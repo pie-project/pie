@@ -417,7 +417,7 @@ impl Package {
         // A format that reads a joined weight's legs one by one (its own
         // reads, not the codec's rows) has them joined here, plane by plane.
         for join in joins {
-            crate::import::join_read(&mut contract, join).map_err(|detail| {
+            crate::import::join_read(src, &mut contract, join).map_err(|detail| {
                 crate::import::Error::Illegible {
                     name: id.to_string(),
                     detail,

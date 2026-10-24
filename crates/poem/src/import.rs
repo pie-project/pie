@@ -296,11 +296,34 @@ pub fn own_contract(
     Ok(b.build())
 }
 
+/// The tensors `names` hold one value: what legs joined into `of` read once.
+fn alike(src: &ztensor::Source, names: &[String], of: &str) -> Result<(), Error> {
+    let bytes = |name: &str| -> Option<Vec<u8>> {
+        src.tensor(name).ok()?.bytes().ok().map(|b| b.into_owned())
+    };
+    let first = bytes(&names[0]);
+    if let Some(differs) = names[1..].iter().find(|name| bytes(name) != first) {
+        return Err(Error::Illegible {
+            name: of.to_string(),
+            detail: format!(
+                "`{}` and `{differs}` quantize the activation their joined product reads at two \
+                 static scales, and one product quantizes it once",
+                names[0]
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// `contract` with the legs of `join` (each read as its own weight, its
 /// planes beside it) joined along their rows under the joined name, plane by
 /// plane, the legs kept as the internal reads it is made of; nothing where the
 /// codec's rows read them joined already.
-pub fn join_read(contract: &mut ModelContract, join: &crate::Join) -> Result<(), String> {
+pub fn join_read(
+    src: &ztensor::Source,
+    contract: &mut ModelContract,
+    join: &crate::Join,
+) -> Result<(), String> {
     let at = |name: &str| contract.tensors.iter().position(|t| t.name == name);
     if at(&join.name).is_some() {
         return Ok(());
@@ -356,6 +379,27 @@ pub fn join_read(contract: &mut ModelContract, join: &crate::Join) -> Result<(),
                 "the legs of `{}` land `{plane}` at two encodings",
                 join.name
             ));
+        }
+        // A plane of no axis (a static input scale) is one for the product:
+        // the first leg's, the others the same value.
+        if lead.shape.as_deref() == Some(&[]) {
+            let names: Vec<String> = legs
+                .iter()
+                .map(|t| match &t.expr {
+                    Expr::Src(name) => Ok(name.clone()),
+                    other => Err(format!(
+                        "`{}` reads {other:?}, not one stored scale",
+                        t.name
+                    )),
+                })
+                .collect::<Result<_, _>>()?;
+            alike(src, &names, &join.name).map_err(|why| format!("{why}"))?;
+            made.push(TensorContract {
+                name: format!("{}{plane}", join.name),
+                expr: lead.expr.clone(),
+                ..lead.clone()
+            });
+            continue;
         }
         let shape = legs
             .iter()
@@ -1757,6 +1801,17 @@ fn nv_planes(
     let first = parts[0].strip_suffix(".weight").unwrap_or(&parts[0]);
     let input = format!("{first}.input_scale");
     one_f32(src, &input, &w.name)?;
+    // One product quantizes its activations under one static scale.
+    let inputs: Vec<String> = parts
+        .iter()
+        .map(|part| {
+            format!(
+                "{}.input_scale",
+                part.strip_suffix(".weight").unwrap_or(part)
+            )
+        })
+        .collect();
+    alike(src, &inputs, &w.name)?;
     let counted = divided(
         &extents(w),
         pairing.channel_axis,

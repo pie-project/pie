@@ -5,14 +5,17 @@
 //! weight a kernel reads at once, and [`joins`] is what an import reads them
 //! into, so the trace and the artifact agree.
 //!
-//! What joins: products with no input scale (an operand, or a static plane
-//! beside the weight) and no logits head, each by a checkpoint weight of one
+//! What joins: products with no input-scale operand and no logits head, each by a checkpoint weight of one
 //! segment cut along its rows that nothing else reads, under one guard and
 //! one layer, at one precision, the weights' planes alike, each stating the
 //! heads it holds or none of them.
 //! Two such products a gated unit reads as its gate and its up become one
 //! packed unit; three whose last two are as wide (q, k, v) a split into
-//! three; two others a split into two. Anything else runs as written.
+//! three; two others a split into two. Anything else runs as written. A
+//! joined weight's static input scale (one product quantizes its
+//! activations under one) is its first leg's: the legs read one activation,
+//! so a calibration states them alike, and an import whose legs' differ is
+//! refused.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -163,12 +166,7 @@ fn groups(trace: &Trace) -> Vec<Group> {
             .into_iter()
             .map(|(suffix, _)| suffix)
             .collect();
-        // A static input scale is the leg's alone: one product quantizes its
-        // activations under one, and whether the legs' agree only the
-        // checkpoint says.
-        if planes.iter().any(|plane| plane == "input_scales") {
-            continue;
-        }
+
         let key = format!(
             "{}|{quant:?}|{:?}|{:?}|{}|{planes:?}|{:?}|{:?}|{:?}|{}",
             act.0,
