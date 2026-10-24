@@ -5,6 +5,12 @@ load("//pie/codec.poem", "mapped")
 load("//lib/adapters.poem", "banks")
 
 ATEM = template("atem")
+
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: q, k, v and the attention's gate by their heads, the MLP's gate
+# and up by their channels, the output and down projections by their rows,
+# the head by its vocabulary.
+CUTS = "inferred"
 TOKENIZER = tokenizer(markers = [["<|eot|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start|>", "<|message|>", "<|eom|>"]])
 
 MODELS = [
@@ -61,11 +67,11 @@ def layout(id, deploy):
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
             full = l % d.full_every == d.full_every - 1,
-            q = weight([q_w, hidden], proj).columns(heads = d.q_heads),
-            k = weight([kv_w, hidden], proj).columns(heads = d.kv_heads),
-            v = weight([kv_w, hidden], proj).columns(heads = d.kv_heads),
-            gate = weight([q_w, hidden], proj).columns(),
-            o_proj = weight([hidden, q_w], proj).rows(),
+            q = weight([q_w, hidden], proj),
+            k = weight([kv_w, hidden], proj),
+            v = weight([kv_w, hidden], proj),
+            gate = weight([q_w, hidden], proj),
+            o_proj = weight([hidden, q_w], proj),
             kv = "kv.{}".format(l),
             attn_norm = norm("attn_norm"),
             attn_norm_eps = d.norm_eps,
@@ -76,16 +82,16 @@ def layout(id, deploy):
             post_ffw_norm = norm("post_ffw_norm"),
             post_ffw_norm_eps = d.post_norm_eps,
             mlp = struct(
-                gate = weight([iw, hidden], proj).columns(),
-                up = weight([iw, hidden], proj).columns(),
+                gate = weight([iw, hidden], proj),
+                up = weight([iw, hidden], proj),
             ),
             inter = iw,
-            down = weight([hidden, iw], proj).rows(),
+            down = weight([hidden, iw], proj),
             lora_a = lora_a,
             lora_b = lora_b,
         )
 
-    lm_head = weight([d.vocab, hidden], proj).packed([d.vocab])
+    lm_head = weight([d.vocab, hidden], proj)
     return struct(
         hidden = hidden,
         vocab = d.vocab,
