@@ -130,7 +130,14 @@ impl Slabs {
         }
     }
 
-    pub fn release(self) {
+    /// Frees every slab these arenas hold.
+    ///
+    /// # Safety
+    ///
+    /// Nothing reads the slabs again: no `Ctx` carrying them fires after
+    /// this, and no graph captured on their stream is replayed. A `Slabs` is
+    /// `Copy`, so that is the caller's to keep across every copy.
+    pub unsafe fn release(self) {
         #[cfg(feature = "rocm")]
         {
             crate::jit::device::release(self.0);
