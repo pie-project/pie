@@ -10,6 +10,17 @@ use anyhow::Result;
 use futures::future::BoxFuture;
 use worker_api::peer::KvAccess;
 
+/// This worker's open kv agent: peers read and write the kv it registered
+/// until it drops, and not after.
+#[must_use = "the agent closes when this drops"]
+pub struct KvAgent(());
+
+impl Drop for KvAgent {
+    fn drop(&mut self) {
+        imp::close();
+    }
+}
+
 /// Opens this worker's agent over its exported kv; its name is the worker's
 /// bulk address, which is its own on a host. A build without a transfer
 /// agent opens none, and the bulk link carries every page.
@@ -18,11 +29,12 @@ use worker_api::peer::KvAccess;
 ///
 /// As for [`transport::Backend::register`]: every region of `handle` must
 /// stay allocated, and unraced by this worker while peers may read or write
-/// it, for the rest of the process, since the agent is never closed.
+/// it, until the returned [`KvAgent`] drops.
 #[allow(unsafe_code)]
-pub unsafe fn open(name: &str, handle: engine::KvHandle) -> Result<()> {
+pub unsafe fn open(name: &str, handle: engine::KvHandle) -> Result<KvAgent> {
     // SAFETY: the caller's promise, passed on.
-    unsafe { imp::open(name, handle) }
+    unsafe { imp::open(name, handle) }?;
+    Ok(KvAgent(()))
 }
 
 /// What this worker's peer [`worker_api::peer::Hello`] says of its kv.
@@ -45,8 +57,8 @@ pub fn read(peer: u64, remote: Vec<u32>, local: Vec<u32>) -> BoxFuture<'static, 
 #[cfg(feature = "nixl")]
 mod imp {
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex, OnceLock};
-    use std::time::Duration;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use anyhow::{Context, Result, anyhow, bail};
     use futures::future::BoxFuture;
@@ -56,50 +68,89 @@ mod imp {
     /// How long a read is polled between looks.
     const POLL: Duration = Duration::from_micros(200);
 
+    /// How long closing waits for the reads in flight to let the agent go.
+    const DRAIN: Duration = Duration::from_secs(10);
+
     struct Agent {
-        backend: Arc<transport::NixlBackend>,
+        backend: transport::NixlBackend,
         mine: RegisteredHandle,
         access: KvAccess,
         /// Peers learned, by their agent's name: the key each is read by.
         peers: Mutex<HashMap<Vec<u8>, u64>>,
     }
 
-    static AGENT: OnceLock<Agent> = OnceLock::new();
+    /// The open agent, if any. A read holds its own reference for as long as
+    /// its transfer may be in flight, so closing waits on it.
+    static AGENT: Mutex<Option<Arc<Agent>>> = Mutex::new(None);
+
+    fn agent() -> Option<Arc<Agent>> {
+        AGENT.lock().expect("kv agent lock poisoned").clone()
+    }
 
     /// The key this worker's own kv is registered under.
     const OURS: WorkerId = WorkerId(0);
 
     #[allow(unsafe_code)]
     pub unsafe fn open(name: &str, handle: engine::KvHandle) -> Result<()> {
-        let backend =
-            Arc::new(transport::NixlBackend::new(name).context("opening the kv transfer agent")?);
+        let backend = transport::NixlBackend::new(name).context("opening the kv transfer agent")?;
         // SAFETY: `open`'s caller keeps `handle`'s regions allocated and
-        // unraced for the rest of the process, which the agent cannot
-        // outlive: it lands in `AGENT` or is dropped right here.
+        // unraced until its `KvAgent` drops, and the agent cannot outlive
+        // that: it lands in `AGENT`, which `close` empties and drains, or is
+        // dropped right here.
         let mine = unsafe { backend.register(OURS, handle.clone()) }
             .context("registering this worker's kv with its transfer agent")?;
         let access = KvAccess {
             handle: serde_json::to_vec(&handle)?,
             agent: backend.local_metadata()?,
         };
-        AGENT
-            .set(Agent {
-                backend,
-                mine,
-                access,
-                peers: Mutex::new(HashMap::new()),
-            })
-            .map_err(|_| anyhow!("this worker's kv transfer agent is open already"))?;
+        let mut open = AGENT.lock().expect("kv agent lock poisoned");
+        if open.is_some() {
+            bail!("this worker's kv transfer agent is open already");
+        }
+        *open = Some(Arc::new(Agent {
+            backend,
+            mine,
+            access,
+            peers: Mutex::new(HashMap::new()),
+        }));
         tracing::info!(agent = name, "kv readable in place by peers");
         Ok(())
     }
 
+    /// Takes the agent down: no read starts after, and the backend (whose
+    /// drop releases its transfers and destroys the agent with every
+    /// registration) drops once the reads in flight let it go.
+    pub fn close() {
+        let Some(mut agent) = AGENT.lock().expect("kv agent lock poisoned").take() else {
+            return;
+        };
+        let deadline = Instant::now() + DRAIN;
+        loop {
+            match Arc::try_unwrap(agent) {
+                Ok(agent) => {
+                    drop(agent);
+                    return;
+                }
+                Err(held) if Instant::now() < deadline => {
+                    agent = held;
+                    std::thread::sleep(POLL);
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "a kv read held the transfer agent past closing; it drops with the read"
+                    );
+                    return;
+                }
+            }
+        }
+    }
+
     pub fn access() -> Option<KvAccess> {
-        Some(AGENT.get()?.access.clone())
+        Some(agent()?.access.clone())
     }
 
     pub fn connect(access: &KvAccess) -> Result<Option<u64>> {
-        let Some(agent) = AGENT.get() else {
+        let Some(agent) = agent() else {
             return Ok(None);
         };
         let handle: engine::KvHandle =
@@ -123,9 +174,7 @@ mod imp {
 
     pub fn read(peer: u64, remote: Vec<u32>, local: Vec<u32>) -> BoxFuture<'static, Result<()>> {
         Box::pin(async move {
-            let agent = AGENT
-                .get()
-                .ok_or_else(|| anyhow!("this worker has no kv transfer agent"))?;
+            let agent = agent().ok_or_else(|| anyhow!("this worker has no kv transfer agent"))?;
             let id = agent.backend.recv_mapped(
                 &agent.mine,
                 &PageSet::new(local),
@@ -153,6 +202,8 @@ mod imp {
     pub unsafe fn open(_name: &str, _handle: engine::KvHandle) -> Result<()> {
         Ok(())
     }
+
+    pub fn close() {}
 
     pub fn access() -> Option<KvAccess> {
         None

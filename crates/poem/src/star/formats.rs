@@ -306,7 +306,9 @@ fn expr_methods(builder: &mut MethodsBuilder) {
             "square" => UnaryOp::Square,
             "recip" => UnaryOp::Recip,
             other => {
-                anyhow::bail!("a unary op is neg_ln, sqrt, rsqrt, sigmoid, square or recip, not {other:?}")
+                anyhow::bail!(
+                    "a unary op is neg_ln, sqrt, rsqrt, sigmoid, square or recip, not {other:?}"
+                )
             }
         };
         Ok(ExprValue(this.0.clone().unary(op)))

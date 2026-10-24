@@ -42,6 +42,8 @@ impl EdgeServer {
 }
 
 pub struct RuntimeHandle {
+    /// Closed before the runtime: the kv it lets peers read is the runtime's.
+    kv_agent: Option<kv::KvAgent>,
     runtime: Option<runtime::bootstrap::BootstrapHandle>,
     edge_server: EdgeServer,
     control_tasks: Vec<tokio::task::JoinHandle<()>>,
@@ -93,6 +95,7 @@ impl RuntimeHandle {
         }
         tracing::info!(worker = ?self.control_plane.worker_id(), "leaving control plane");
         drop(self.control_plane);
+        drop(self.kv_agent.take());
         if let Some(runtime) = self.runtime.take()
             && let Err(err) = runtime.shutdown().await
         {
@@ -173,7 +176,7 @@ pub async fn start_runtime(
     home: &Path,
     coordinator: Coordinator,
 ) -> Result<RuntimeHandle> {
-    let (model, booted) = boot_decode(&user_cfg, home).await?;
+    let (model, booted, kv_agent) = boot_decode(&user_cfg, home).await?;
     let (edge_server, control_tasks, control_plane, url) =
         assemble_control_and_edge(coordinator, &user_cfg, model).await?;
     log_serving(&user_cfg, &url);
@@ -182,6 +185,7 @@ pub async fn start_runtime(
         edge_server,
         control_tasks,
         control_plane,
+        kv_agent,
         runtime: Some(booted.runtime),
         summary: booted.summary,
     })
@@ -194,7 +198,7 @@ pub async fn start_runtime_embedded<C: ControlLink>(
     gateways: Vec<String>,
     client_edge: Option<String>,
 ) -> Result<RuntimeHandle> {
-    let (model, booted) = boot_decode(&user_cfg, home).await?;
+    let (model, booted, kv_agent) = boot_decode(&user_cfg, home).await?;
     let addr = topology::addr_from_host_port(&user_cfg.server.host, user_cfg.server.port);
     let (edge_server, control_tasks, worker_id) = assemble_distributed(
         control,
@@ -212,13 +216,19 @@ pub async fn start_runtime_embedded<C: ControlLink>(
         edge_server,
         control_tasks,
         control_plane: ClusterControl::Embedded { worker_id },
+        kv_agent,
         runtime: Some(booted.runtime),
         summary: booted.summary,
     })
 }
 
-/// Boots a worker on its configured engine, with offload set up.
-async fn boot_decode(user_cfg: &config::Config, home: &Path) -> Result<(String, Embedded)> {
+/// Boots a worker on its configured engine, with offload set up: its model,
+/// the runtime, and the kv agent peers read it through, which must close
+/// before the runtime does.
+async fn boot_decode(
+    user_cfg: &config::Config,
+    home: &Path,
+) -> Result<(String, Embedded, Option<kv::KvAgent>)> {
     let mut loaded = Embedded::load(
         user_cfg,
         home,
@@ -232,16 +242,16 @@ async fn boot_decode(user_cfg: &config::Config, home: &Path) -> Result<(String, 
     if let Some(handle) = kv_handle {
         runtime::offload::set_home_kv_handle(handle);
     }
-    start_peers(user_cfg).await?;
-    Ok((model, booted))
+    let kv_agent = start_peers(user_cfg).await?;
+    Ok((model, booted, kv_agent))
 }
 
 /// Serves other workers' passes, and dials the peers this worker's passes
 /// may be prefilled on, retrying until one takes them.
-async fn start_peers(user_cfg: &config::Config) -> Result<()> {
+async fn start_peers(user_cfg: &config::Config) -> Result<Option<kv::KvAgent>> {
     let engine = engine_of(user_cfg);
     // Its kv agent first: the hello says whether peers can read it in place.
-    if let Some(handle) = runtime::offload::home_kv_handle() {
+    let kv_agent = if let Some(handle) = runtime::offload::home_kv_handle() {
         let name = match &user_cfg.offload.listen {
             Some(listen) => peer::bulk_addr(listen)?,
             None => format!("pie-worker-{}", std::process::id()),
@@ -249,15 +259,14 @@ async fn start_peers(user_cfg: &config::Config) -> Result<()> {
         // SAFETY: `handle` is what `boot_decode` stored: the first engine
         // group's own export of its paged kv arenas, which the engine backs
         // whole at load and frees only when the runtime drops. Peers touch
-        // only pages the offload protocol hands them. The runtime is held
-        // until shutdown, but the agent is a static: past a shutdown that
-        // keeps the process alive, or a failed boot after this point, the
-        // arenas are freed while it still names them (see `kv::open`).
+        // only pages the offload protocol hands them. The agent drops first:
+        // here if the rest of this boot fails, else in `RuntimeHandle`, which
+        // closes it before it shuts the runtime down.
         #[allow(unsafe_code)]
-        unsafe {
-            kv::open(&name, handle)?;
-        }
-    }
+        Some(unsafe { kv::open(&name, handle) }?)
+    } else {
+        None
+    };
     let hello = peer::hello(WorkerId(0), &engine);
     peer::set_hello(hello.clone());
     if let Some(listen) = &user_cfg.offload.listen {
@@ -284,7 +293,7 @@ async fn start_peers(user_cfg: &config::Config) -> Result<()> {
             }
         });
     }
-    Ok(())
+    Ok(kv_agent)
 }
 
 /// The verbose banner goes to stderr; the ready line is the CLI's to print,
