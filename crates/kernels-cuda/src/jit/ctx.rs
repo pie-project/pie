@@ -586,15 +586,19 @@ impl Ctx {
             Err(why) => return Err(said(root.name, instantiation, why).at(op)),
         };
 
+        if let Some(why) = mismatch(&resolved.params, args) {
+            return Err(refuse(op, format!("`{instantiation}`: {why}")));
+        }
         let mut bound = crate::jit::abi::Bound::new(args);
 
         // SAFETY: `resolved.function` lives for the process (the cache
         // leaks it) and was loaded in the context `resolve` bound to this
         // thread; `self.stream` is live by `Ctx::on`'s contract. `bound`
-        // owns one slot per argument and outlives the call. That the
-        // arguments match the kernel's parameters, and that every pointer
-        // among them is a live device address, is not checked here: `fire`
-        // takes it on trust from its caller.
+        // owns one slot per argument and outlives the call, and `mismatch`
+        // held the arguments to the kernel's parameters, so the driver reads
+        // no slot past its value. That every pointer among them is a live
+        // device address is not checked here: `fire` takes it on trust from
+        // its caller.
         let fired = unsafe {
             crate::jit::launch::issue(resolved.function, launch, bound.slots_mut(), self.stream)
         };
@@ -616,6 +620,29 @@ impl Ctx {
     ) -> Result<(), Error> {
         Err(crate::jit::runtimeless(op))
     }
+}
+
+/// Why `args` cannot fill a kernel whose parameters are `params` bytes each,
+/// or `None` when each argument is exactly its parameter's width.
+#[cfg(any(feature = "cuda", test))]
+fn mismatch(params: &[usize], args: &[ArgValue]) -> Option<String> {
+    if params.len() != args.len() {
+        return Some(format!(
+            "the kernel takes {} parameters and the fire passes {}",
+            params.len(),
+            args.len()
+        ));
+    }
+    for (at, (&size, arg)) in params.iter().zip(args).enumerate() {
+        if arg.width() != size {
+            return Some(format!(
+                "parameter {at} is {size} bytes and the fire passes {} of {}",
+                arg.kind(),
+                arg.width()
+            ));
+        }
+    }
+    None
 }
 
 /// Whether a device instantiation that will not fire (it does not compile,
@@ -717,6 +744,20 @@ mod tests {
             ctx.opaque_rows(9),
             9,
             "the pad is the fire's, and the stream outlives the fire"
+        );
+    }
+
+    #[test]
+    fn a_fire_is_held_to_its_kernels_parameters() {
+        let args = [ArgValue::F32(2.0), ArgValue::Ptr(0), ArgValue::I32(3)];
+        assert_eq!(mismatch(&[4, 8, 4], &args), None, "every width matches");
+        assert!(
+            mismatch(&[4, 8, 4, 8], &args).is_some_and(|why| why.contains("takes 4")),
+            "a missing argument would have the driver read past the slots"
+        );
+        assert!(
+            mismatch(&[4, 8, 8], &args).is_some_and(|why| why.contains("parameter 2")),
+            "an i32 into an 8-byte parameter is refused"
         );
     }
 }

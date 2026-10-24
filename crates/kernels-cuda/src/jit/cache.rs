@@ -12,6 +12,8 @@ pub struct Resolved {
     #[allow(dead_code)]
     module: dr::CUmodule,
     pub function: dr::CUfunction,
+    /// Each parameter's size in bytes, as the driver reads the image.
+    pub params: Box<[usize]>,
 }
 
 // SAFETY: both fields are opaque driver handles that are written once, in
@@ -123,7 +125,40 @@ fn load(root: &Root, instantiation: &str, key: &str, arch: &str) -> Result<Resol
         ms = started.elapsed().as_secs_f64() * 1e3,
         "resolved a device instantiation"
     );
-    Ok(Resolved { module, function })
+    let params = param_sizes(function).inspect_err(|_| {
+        // SAFETY: as above: `module` is loaded, and unloaded once here.
+        unsafe { dr::cuModuleUnload(module) };
+    })?;
+    Ok(Resolved {
+        module,
+        function,
+        params,
+    })
+}
+
+/// `function`'s parameter sizes, asked of the driver once at load so a fire
+/// can hold its arguments to them.
+fn param_sizes(function: dr::CUfunction) -> Result<Box<[usize]>, Fault> {
+    let mut sizes = Vec::new();
+    loop {
+        let (mut offset, mut size) = (0usize, 0usize);
+        // SAFETY: `function` was just resolved from a loaded module, and
+        // both out-pointers are locals.
+        let code = unsafe {
+            dr::cuFuncGetParamInfo(function, sizes.len(), &raw mut offset, &raw mut size)
+        };
+        match code {
+            dr::CUresult::CUDA_SUCCESS => sizes.push(size),
+            // past the last parameter
+            dr::CUresult::CUDA_ERROR_INVALID_VALUE => return Ok(sizes.into_boxed_slice()),
+            other => {
+                return Err(Fault::Device {
+                    call: "cuFuncGetParamInfo",
+                    code: other as i32,
+                });
+            }
+        }
+    }
 }
 
 fn load_image(root: &'static str, image: &[u8]) -> Result<dr::CUmodule, Fault> {
