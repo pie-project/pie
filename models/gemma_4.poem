@@ -289,7 +289,8 @@ def layout(id, deploy):
             pre_ffw_norm_eps = d.norm_eps,
             post_ffw_norm = norm("post_ffw_norm", hidden),
             post_ffw_norm_eps = d.norm_eps,
-            gate_up = weight([2 * iw, hidden], mlp_at).packed([iw, iw]),
+            gate = weight([iw, hidden], mlp_at).columns(),
+            up = weight([iw, hidden], mlp_at).columns(),
             inter = iw,
             down = weight([hidden, iw], mlp_at).rows(),
             scalar = weight([1]) if d.ple_dim == None else None,
@@ -609,7 +610,8 @@ def safetensors(m, reads, layout):
         else:
             reads.read(banks.q_proj, n("self_attn.q_proj.weight"))
         reads.read(w.o_proj, n("self_attn.o_proj.weight"))
-        reads.read_concat(w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+        reads.read(w.gate, n("mlp.gate_proj.weight"))
+        reads.read(w.up, n("mlp.up_proj.weight"))
         reads.read(w.down, n("mlp.down_proj.weight"))
 
         if w.moe != None:
@@ -790,7 +792,8 @@ def gguf(m, reads):
         else:
             reads.read(banks.q_proj, blk("attn_q.weight"))
         reads.read(w.o_proj, blk("attn_output.weight"))
-        reads.read_concat(w.gate_up, [blk("ffn_gate.weight"), blk("ffn_up.weight")])
+        reads.read(w.gate, blk("ffn_gate.weight"))
+        reads.read(w.up, blk("ffn_up.weight"))
         reads.read(w.down, blk("ffn_down.weight"))
         if w.scalar != None:
             reads.read(w.scalar, blk("layer_scalar"))
@@ -954,7 +957,8 @@ def forward(m, inputs):
 
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(o, w.post_attn_norm, w.post_attn_norm_eps), y)
         mlp_in = ops.elemwise.rmsnorm(y, w.pre_ffw_norm, w.pre_ffw_norm_eps)
-        act = ops.linear.glu(ops.linear.matmul(mlp_in, w.gate_up), gating.geglu_tanh(), w.inter)
+        gate, up = ops.linear.matmul(mlp_in, w.gate), ops.linear.matmul(mlp_in, w.up)
+        act = ops.linear.glu(gate, gating.geglu_tanh(), up = up)
         f = ops.linear.matmul(act, w.down)
         if w.moe != None:
             x = w.moe
