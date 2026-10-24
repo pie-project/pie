@@ -39,6 +39,8 @@ class RuntimeConfig:
     max_concurrent_processes: Optional[int] = None
     # The worker-plane policy: a built-in name or a .wasm path.
     worker_policy: Optional[str] = None
+    # The verify rows drafting requests share: "off", "auto" or a row count.
+    verify_budget: Optional[str] = None
 
 
 @dataclass
