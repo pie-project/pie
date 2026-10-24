@@ -70,37 +70,6 @@ struct Params {
     int sub;
 };
 
-// One row's request, first page, page count and the blocks it sees.
-struct RowInfo {
-    int req, pages_first, num_pages, nkeys;
-};
-
-__device__ __forceinline__ RowInfo row_info(const Params& p, int t, int R) {
-    RowInfo ri;
-    // The request whose rows hold t, by halving (a prefill's 32 requests in
-    // five reads, where every role asks for both rows of every pair).
-    int lo = 0, hi = R - 1;
-    while (lo < hi) {
-        const int mid = (lo + hi) >> 1;
-        if (t < static_cast<int>(p.qo_indptr[mid + 1])) {
-            hi = mid;
-        } else {
-            lo = mid + 1;
-        }
-    }
-    const int r = lo;
-    const int qo_lo = static_cast<int>(p.qo_indptr[r]);
-    const int new_tokens = static_cast<int>(p.qo_indptr[r + 1]) - qo_lo;
-    ri.pages_first = static_cast<int>(p.page_indptr[r]);
-    ri.num_pages = static_cast<int>(p.page_indptr[r + 1]) - ri.pages_first;
-    const int kv_len = (ri.num_pages - 1) * p.page_size + static_cast<int>(p.last_page_lens[r]);
-    const int total = kv_len - new_tokens + (t - qo_lo) + 1;
-    const int stride = p.ratio > 0 ? p.ratio : 1;
-    ri.nkeys = total > 0 ? min(total / stride, p.score_stride) : 0;
-    ri.req = r;
-    return ri;
-}
-
 // A pass: rows `t[0..count)` (local rows) of request `ri[0].req`, scored
 // over `nkeys` blocks (the largest of theirs). Rows that see no more than
 // `top_k` blocks are left to the ranking; a pass with no row to score is

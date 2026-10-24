@@ -15,6 +15,7 @@ use kernels_cuda::tensor::{KvPool, RaggedTensor};
 use kernels_cuda::tuning::Tuning;
 
 mod logits_fp4;
+mod select;
 
 const DIM: usize = 128;
 
