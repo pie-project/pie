@@ -244,7 +244,7 @@ fn zeros(ty: ValueType) -> Value {
     }
 }
 
-pub(super) fn value_matches(v: &Value, ty: ValueType) -> bool {
+pub(crate) fn value_matches(v: &Value, ty: ValueType) -> bool {
     v.dtype() == ty.dtype && v.len() as u64 == ty.shape.numel().max(1)
 }
 

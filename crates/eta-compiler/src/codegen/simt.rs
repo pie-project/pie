@@ -3,13 +3,14 @@
 //! says what differs between the compilers.
 
 pub mod fused;
+pub(crate) mod hooks;
 pub mod order;
 pub mod region_analysis;
 pub mod runtime;
 pub mod sampler;
 pub mod scan;
 pub mod singleton;
-mod stream;
+pub(crate) mod stream;
 pub use stream::spent_values;
 pub mod validate;
 
