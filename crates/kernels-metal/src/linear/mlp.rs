@@ -238,15 +238,9 @@ pub fn swiglu_clamp_alpha(
     )
 }
 
-pub fn swiglu_clamp_split(
-    ctx: &Ctx<'_>,
-    gate: Tensor,
-    up: Tensor,
-    limit: f32,
-    y: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "linear.glu";
-    let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "swiglu_clamp_bfloat16" });
+/// The gate, the up and the activation of a unit held apart are one
+/// rectangle.
+fn split_planes(gate: Tensor, up: Tensor, y: Tensor) {
     debug_assert_eq!(
         (up.rows, up.width),
         (gate.rows, gate.width),
@@ -257,12 +251,75 @@ pub fn swiglu_clamp_split(
         (gate.rows, gate.width),
         "the activation lands on the halves' own rectangle"
     );
+}
+
+pub fn swiglu_clamp_split(
+    ctx: &Ctx<'_>,
+    gate: Tensor,
+    up: Tensor,
+    limit: f32,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.glu";
+    let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "swiglu_clamp_bfloat16" });
+    split_planes(gate, up, y);
     ctx.fire(
         Fire::at("linear/glu_split.metal", entry).apply(Grid::of(
             elementwise(OP, gate.width, gate.rows)?,
             [GROUP, 1, 1],
         )),
         &[gate.arg(), up.arg(), y.arg_mut(), limit.arg()],
+    )
+}
+
+/// [`swiglu_clamp_alpha`] over a gate and an up plane held apart.
+pub fn swiglu_clamp_alpha_split(
+    ctx: &Ctx<'_>,
+    gate: Tensor,
+    up: Tensor,
+    limit: f32,
+    alpha: f32,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.glu";
+    let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "swiglu_clamp_alpha_bfloat16" });
+    split_planes(gate, up, y);
+    ctx.fire(
+        Fire::at("linear/glu_split.metal", entry).apply(Grid::of(
+            elementwise(OP, gate.width, gate.rows)?,
+            [GROUP, 1, 1],
+        )),
+        &[gate.arg(), up.arg(), y.arg_mut(), limit.arg(), alpha.arg()],
+    )
+}
+
+/// [`situ`] over a gate and an up plane held apart.
+pub fn situ_split(
+    ctx: &Ctx<'_>,
+    gate: Tensor,
+    up: Tensor,
+    beta: f32,
+    up_cap: Option<f32>,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.glu";
+    if beta == 0.0 {
+        return Err(refuse(OP, "beta is zero, and the gate divides by it"));
+    }
+    let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "situ_bfloat16" });
+    split_planes(gate, up, y);
+    ctx.fire(
+        Fire::at("linear/glu_split.metal", entry).apply(Grid::of(
+            elementwise(OP, gate.width, gate.rows)?,
+            [GROUP, 1, 1],
+        )),
+        &[
+            gate.arg(),
+            up.arg(),
+            y.arg_mut(),
+            beta.arg(),
+            up_cap.unwrap_or(0.0).arg(),
+        ],
     )
 }
 

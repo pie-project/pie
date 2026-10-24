@@ -128,6 +128,11 @@ pub fn swiglu_clamp_alpha(
     const OP: &str = "linear.glu";
     halves(OP, packed, intermediate, y)?;
     let (g, u) = read_halves(f, packed, intermediate)?;
+    alpha_unit(f, g, u, limit, alpha)
+}
+
+/// [`swiglu_clamp_alpha`]'s unit of a gate and an up.
+fn alpha_unit(f: &mut Func, g: Val, u: Val, limit: f32, alpha: f32) -> Result<Val, Error> {
     let (g, u) = clamped(f, g, u, limit)?;
     let ag = f.scale(g, f64::from(alpha))?;
     let n = f.neg(ag);
@@ -137,6 +142,33 @@ pub fn swiglu_clamp_alpha(
     let u1 = f.offset(u, 1.0)?;
     let out = f.mul(s, u1)?;
     Ok(out)
+}
+
+/// [`swiglu`] over a gate and an up plane held apart.
+pub fn swiglu_split(f: &mut Func, gate: Operand, up: Operand, y: Landing) -> Result<Val, Error> {
+    const OP: &str = "linear.glu";
+    split(OP, gate, up, y)?;
+    let g = gate.f32(f);
+    let u = up.f32(f);
+    let s = silu(f, g)?;
+    let out = f.mul(s, u)?;
+    Ok(out)
+}
+
+/// [`swiglu_clamp_alpha`] over a gate and an up plane held apart.
+pub fn swiglu_clamp_alpha_split(
+    f: &mut Func,
+    gate: Operand,
+    up: Operand,
+    limit: f32,
+    alpha: f32,
+    y: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "linear.glu";
+    split(OP, gate, up, y)?;
+    let g = gate.f32(f);
+    let u = up.f32(f);
+    alpha_unit(f, g, u, limit, alpha)
 }
 
 pub fn swiglu_clamp_split(
@@ -209,8 +241,32 @@ pub fn situ(
         return Err(refuse(OP, "beta is zero, and the gate divides by it"));
     }
     halves(OP, packed, intermediate, y)?;
-    let cap = up_cap.unwrap_or(0.0);
     let (g, u) = read_halves(f, packed, intermediate)?;
+    situ_unit(f, g, u, beta, up_cap)
+}
+
+/// [`situ`] over a gate and an up plane held apart.
+pub fn situ_split(
+    f: &mut Func,
+    gate: Operand,
+    up: Operand,
+    beta: f32,
+    up_cap: Option<f32>,
+    y: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "linear.glu";
+    if beta == 0.0 {
+        return Err(refuse(OP, "beta is zero, and the gate divides by it"));
+    }
+    split(OP, gate, up, y)?;
+    let g = gate.f32(f);
+    let u = up.f32(f);
+    situ_unit(f, g, u, beta, up_cap)
+}
+
+/// [`situ`]'s unit of a gate and an up.
+fn situ_unit(f: &mut Func, g: Val, u: Val, beta: f32, up_cap: Option<f32>) -> Result<Val, Error> {
+    let cap = up_cap.unwrap_or(0.0);
     let gb = f.scale(g, 1.0 / f64::from(beta))?;
     let t = pie_tanh(f, gb)?;
     let t = f.scale(t, f64::from(beta))?;

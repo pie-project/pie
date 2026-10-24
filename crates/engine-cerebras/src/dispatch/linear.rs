@@ -55,6 +55,23 @@ impl Run<'_> {
                 *intermediate,
                 self.tensor(*y),
             ),
+            // Legs the pack left apart: the same unit over a gate and an up
+            // plane.
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                y,
+                packed: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            } => linear::mlp::swiglu_split(
+                self.ctx(),
+                self.tensor(*gate),
+                self.tensor(*up),
+                self.tensor(*y),
+            ),
             Linear::LoraCorrect {
                 x,
                 bank_a,
