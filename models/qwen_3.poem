@@ -231,7 +231,10 @@ def routed(n, hidden, m, experts, proj, gate):
         router = weight([m.experts, hidden], gate),
         gate_up = weight([m.experts, 2 * m.inter, hidden], experts).bank([m.inter, m.inter]),
         down = weight([m.experts, hidden, m.inter], experts).rows(),
-        shared_gate_up = weight([2 * m.shared_inter, hidden], proj).packed([m.shared_inter, m.shared_inter]),
+        shared = struct(
+            gate = weight([m.shared_inter, hidden], proj).columns(),
+            up = weight([m.shared_inter, hidden], proj).columns(),
+        ),
         shared_down = weight([hidden, m.shared_inter], proj).rows(),
         shared_gate = weight([1, hidden], gate),
         experts = m.experts,
@@ -527,7 +530,8 @@ def dense_mlp(w, hidden, inter, prefix):
     n = lambda s: "{}.{}".format(prefix, s)
     return struct(
         routed = False,
-        gate_up = weight([2 * inter, hidden], w).packed([inter, inter]),
+        gate = weight([inter, hidden], w).columns(),
+        up = weight([inter, hidden], w).columns(),
         down = weight([hidden, inter], w).rows(),
         inter = inter,
     )
@@ -783,12 +787,8 @@ def read_routed(reads, f, n, layout):
     else:
         reads.read(f.gate_up, n("mlp.experts.gate_up_proj"))
         reads.read(f.down, n("mlp.experts.down_proj"))
-    read_weight(
-        reads,
-        f.shared_gate_up,
-        [n("mlp.shared_expert.gate_proj.weight"), n("mlp.shared_expert.up_proj.weight")],
-        quantized = "read",
-    )
+    read_weight(reads, f.shared.gate, n("mlp.shared_expert.gate_proj.weight"), quantized = "read")
+    read_weight(reads, f.shared.up, n("mlp.shared_expert.up_proj.weight"), quantized = "read")
     read_weight(reads, f.shared_down, n("mlp.shared_expert.down_proj.weight"), quantized = "read")
     reads.read(f.shared_gate, n("mlp.shared_expert_gate.weight"))
 
@@ -945,12 +945,8 @@ def qwen3_next(m, reads):
         down = [[e(i, "down_proj")] for i in range(f.experts)]
         bank(reads, f.gate_up, gate_up)
         bank(reads, f.down, down)
-        read_weight(
-            reads,
-            f.shared_gate_up,
-            [n("mlp.shared_expert.gate_proj.weight"), n("mlp.shared_expert.up_proj.weight")],
-            quantized = "read",
-        )
+        read_weight(reads, f.shared.gate, n("mlp.shared_expert.gate_proj.weight"), quantized = "read")
+        read_weight(reads, f.shared.up, n("mlp.shared_expert.up_proj.weight"), quantized = "read")
         read_weight(reads, f.shared_down, n("mlp.shared_expert.down_proj.weight"), quantized = "read")
         reads.read(f.shared_gate, n("mlp.shared_expert_gate.weight"))
 
@@ -999,7 +995,8 @@ def safetensors(m, reads, layout):
         if w.mlp.routed:
             read_routed(reads, w.mlp, n, layout)
         else:
-            reads.read_concat(w.mlp.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+            reads.read(w.mlp.gate, n("mlp.gate_proj.weight"))
+            reads.read(w.mlp.up, n("mlp.up_proj.weight"))
             reads.read(w.mlp.down, n("mlp.down_proj.weight"))
 
     if m.tower != None:
@@ -1030,7 +1027,8 @@ def safetensors(m, reads, layout):
         reads.read(a.q_norm, n("self_attn.q_norm.weight"))
         reads.read(a.k_norm, n("self_attn.k_norm.weight"))
         reads.read(mtp.mlp_norm, n("post_attention_layernorm.weight"))
-        reads.read_concat(mtp.mlp.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+        reads.read(mtp.mlp.gate, n("mlp.gate_proj.weight"))
+        reads.read(mtp.mlp.up, n("mlp.up_proj.weight"))
         reads.read(mtp.mlp.down, n("mlp.down_proj.weight"))
         if mtp.norm != None:
             reads.read(mtp.norm, p + ".norm.weight")
@@ -1139,13 +1137,15 @@ def gguf(m, reads):
 
         f = w.mlp
         if not f.routed:
-            reads.read_concat(f.gate_up, [n("ffn_gate.weight"), n("ffn_up.weight")])
+            reads.read(f.gate, n("ffn_gate.weight"))
+            reads.read(f.up, n("ffn_up.weight"))
             reads.read(f.down, n("ffn_down.weight"))
         else:
             reads.read(f.router, n("ffn_gate_inp.weight"))
             reads.read_concat(f.gate_up, [n("ffn_gate_exps.weight"), n("ffn_up_exps.weight")])
             reads.read(f.down, n("ffn_down_exps.weight"))
-            reads.read_concat(f.shared_gate_up, [n("ffn_gate_shexp.weight"), n("ffn_up_shexp.weight")])
+            reads.read(f.shared.gate, n("ffn_gate_shexp.weight"))
+            reads.read(f.shared.up, n("ffn_up_shexp.weight"))
             reads.read(f.shared_down, n("ffn_down_shexp.weight"))
             reads.read(f.shared_gate, n("ffn_gate_inp_shexp.weight"))
 
@@ -1224,10 +1224,8 @@ def run_moe(x, f):
 
     hidden = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, experts, f.top_k), gating.swiglu(), f.inter)
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(hidden, f.down, experts, f.top_k), weights)
-    shared = ops.linear.matmul(
-        ops.linear.glu(ops.linear.matmul(x, f.shared_gate_up), gating.swiglu(), f.shared_inter),
-        f.shared_down,
-    )
+    gate, up = ops.linear.matmul(x, f.shared.gate), ops.linear.matmul(x, f.shared.up)
+    shared = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), f.shared_down)
     return ops.linear.moe_sigmoid_gate_add(routed, shared, ops.linear.matmul(x, f.shared_gate))
 
 MROPE_SECTIONS = [11, 11, 10]
@@ -1393,7 +1391,8 @@ def mlp(x, f, bonsai):
         # Bonsai: the gate and up projections share the rotated residual;
         # down rotates the swiglu intermediate.
         gate_in = rot_copy(x, bonsai.hidden) if bonsai != None else x
-        h = ops.linear.glu(ops.linear.matmul(gate_in, f.gate_up), gating.swiglu(), f.inter)
+        gate, up = ops.linear.matmul(gate_in, f.gate), ops.linear.matmul(gate_in, f.up)
+        h = ops.linear.glu(gate, gating.swiglu(), up = up)
         down_in = rot_take(h, bonsai.ffn_down) if bonsai != None else h
         return ops.linear.matmul(down_in, f.down)
     return run_moe(x, f)
@@ -1416,10 +1415,8 @@ def draft(m, inputs, x, logits, head):
     dy = ops.elemwise.residual_add(o, dy)
 
     nx = ops.elemwise.rmsnorm_plus_one(dy, mtp.mlp_norm, mtp.mlp_norm_eps)
-    f = ops.linear.matmul(
-        ops.linear.glu(ops.linear.matmul(nx, mtp.mlp.gate_up), gating.swiglu(), mtp.mlp.inter),
-        mtp.mlp.down,
-    )
+    gate, up = ops.linear.matmul(nx, mtp.mlp.gate), ops.linear.matmul(nx, mtp.mlp.up)
+    f = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), mtp.mlp.down)
     dy = ops.elemwise.residual_add(f, dy)
 
     read = ops.elemwise.rmsnorm_plus_one(dy, mtp.norm, mtp.norm_eps) if mtp.norm != None else dy
