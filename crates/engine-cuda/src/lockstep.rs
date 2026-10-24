@@ -243,8 +243,43 @@ enum Job {
 /// reads the answers.
 struct Firing {
     jobs: Vec<mpsc::Sender<Job>>,
-    answers: Mutex<mpsc::Receiver<(usize, Option<Fired>)>>,
+    answers: Mutex<Answers>,
     threads: Vec<JoinHandle<()>>,
+}
+
+/// What the ranks' firing threads answer, and which idle fires of the step
+/// before have not answered yet: a step's leader waits only for the ranks
+/// that brought frames, and the next step's leader hears the idle ones out
+/// before it hands anything on.
+struct Answers {
+    inbox: mpsc::Receiver<(usize, Option<Fired>)>,
+    idle: Vec<bool>,
+}
+
+impl Answers {
+    /// Takes `rank`'s answer to an idle fire: its refusal, if it refused.
+    fn idle(&mut self, rank: usize, fired: Option<Fired>) -> Option<String> {
+        self.idle[rank] = false;
+        match fired {
+            Some(Err(error)) => Some(format!("rank {rank}'s idle fire refused: {error}")),
+            _ => None,
+        }
+    }
+
+    /// Waits for the idle fires of the step before: a rank that refused one
+    /// stops the group before another step's launches go out.
+    fn settle_idle(&mut self) -> Result<(), String> {
+        let mut refused = None;
+        while let Some(rank) = self.idle.iter().position(|&owed| owed) {
+            let Ok((from, fired)) = self.inbox.recv() else {
+                self.idle.fill(false);
+                return Err(format!("rank {rank}'s idle fire panicked"));
+            };
+            let why = self.idle(from, fired);
+            refused = refused.or(why);
+        }
+        refused.map_or(Ok(()), Err)
+    }
 }
 
 impl Firing {
@@ -264,7 +299,10 @@ impl Firing {
         }
         Ok(Firing {
             jobs,
-            answers: Mutex::new(answers),
+            answers: Mutex::new(Answers {
+                inbox: answers,
+                idle: vec![false; ranks.len()],
+            }),
             threads,
         })
     }
@@ -417,41 +455,51 @@ impl Group {
     /// Fires `formed` on every rank at once, each on its own thread, the
     /// group rebalanced first when it is due.
     fn fire(&self, formed: Formed<(Step, engine::StepDone)>) -> Vec<Option<Fired>> {
-        if let Some(why) = self.rebalance().err() {
+        let mut answers = self
+            .firing
+            .answers
+            .lock()
+            .expect("lockstep answers lock poisoned");
+        let ready = answers.settle_idle().and_then(|()| self.rebalance());
+        if let Err(why) = ready {
             self.poison(&why);
             let refused = |_| Some(Err(Error::Device(why.clone())));
             return (0..self.ranks.len()).map(refused).collect();
         }
         let bucket = formed.bucket;
-        let answers = self
-            .firing
-            .answers
-            .lock()
-            .expect("lockstep answers lock poisoned");
         let mut results: Vec<Option<Fired>> = (0..self.ranks.len()).map(|_| None).collect();
         let mut owed = vec![false; self.ranks.len()];
         for (rank, frame) in formed.frames.into_iter().enumerate() {
-            let job = match frame {
-                Some((step, at)) => Job::Step(step, at, bucket),
-                None => Job::Idle(bucket),
+            let (job, busy) = match frame {
+                Some((step, at)) => (Job::Step(step, at, bucket), true),
+                None => (Job::Idle(bucket), false),
             };
-            owed[rank] = self.firing.jobs[rank].send(job).is_ok();
-            if !owed[rank] {
+            if self.firing.jobs[rank].send(job).is_err() {
                 results[rank] = Some(Err(Error::Device(format!(
                     "rank {rank}'s firing thread is gone"
                 ))));
+            } else if busy {
+                owed[rank] = true;
+            } else {
+                answers.idle[rank] = true;
             }
         }
+        // The busy ranks' answers; an idle rank's that comes first is taken
+        // as it comes, its refusal stopping the group.
         while owed.iter().any(|&o| o) {
-            let Ok((rank, fired)) = answers.recv() else {
+            let Ok((rank, fired)) = answers.inbox.recv() else {
                 for (rank, _) in owed.iter().enumerate().filter(|(_, o)| **o) {
                     results[rank] =
                         Some(Err(Error::Device(format!("rank {rank}'s fire panicked"))));
                 }
                 break;
             };
-            owed[rank] = false;
-            results[rank] = fired;
+            if owed[rank] {
+                owed[rank] = false;
+                results[rank] = fired;
+            } else if let Some(why) = answers.idle(rank, fired) {
+                self.poison(&why);
+            }
         }
         results
     }
