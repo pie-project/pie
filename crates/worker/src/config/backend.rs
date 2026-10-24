@@ -24,6 +24,9 @@ pub struct CudaEngineOptions {
     /// `expert_load_window` steps.
     pub expert_rebalance_steps: Option<u32>,
     pub expert_load_window: Option<u32>,
+    /// A request's logits the same bits whatever else shares its fire
+    /// (dense layers on CUDA; at some cost in speed).
+    pub batch_invariant: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
