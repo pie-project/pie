@@ -565,7 +565,7 @@ def layout(id, deploy):
     fp8 = w in [dtype.e4m3tile128, dtype.e4m3tile128a8]
     table = dtype.bf16 if fp8 else w
     gate = dtype.u8g64 if w == dtype.u4g64 else table
-    proj = dtype.u4g64tiled if w == dtype.u4g64 else w
+    proj = w
     experts = w
     mlp_at = proj
     head_at = proj if table == w else table

@@ -49,7 +49,7 @@ def layout(id, deploy):
     w = roles(deploy, "w", exact = True).w
     d = DIMS[id]
     dense = compute(w)
-    proj = dtype.u4g64tiled if w == dtype.u4g64 else w
+    proj = w
     hidden = d.hidden
     hd = d.head_dim
     q_w = d.q_heads * hd

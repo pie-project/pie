@@ -213,7 +213,7 @@ def layout(id, deploy):
     sw = weights[2] if len(weights) > 2 else w
     dense = compute(w)
     gate = dtype.u8g64 if w == dtype.u4g64 else w
-    proj = dtype.u4g64tiled if w == dtype.u4g64 else w
+    proj = w
     # modelopt's 31B export stores its MLP NVFP4; the 26B-A4B's, bf16.
     mlp_at = weights[1] if not self_cond and len(weights) == 2 and d.moe == None else proj
     hidden = d.hidden
