@@ -461,6 +461,7 @@ pub fn join_read(
             .unwrap_or_else(|| name.to_string())
     };
     let mut made = Vec::new();
+    let mut inlined: Vec<String> = Vec::new();
     for (p, plane) in first.iter().enumerate() {
         let legs: Vec<&TensorContract> = planes
             .iter()
@@ -507,12 +508,27 @@ pub fn join_read(
                     .sum::<Option<i64>>()?;
                 Some(whole)
             });
+        // Legs read straight from the checkpoint are joined as their reads,
+        // the extents landing in the joined plane as a stated pack's do: a
+        // serving load lands no leg apart to move it after. A leg the load
+        // computes is joined as what it lands, which only an import moves.
+        let read = legs.iter().all(|t| t.expr.is_affine());
+        let parts = legs
+            .iter()
+            .map(|t| {
+                if read {
+                    t.expr.clone()
+                } else {
+                    Expr::out(t.name.clone())
+                }
+            })
+            .collect();
+        if read {
+            inlined.extend(legs.iter().map(|t| t.name.clone()));
+        }
         made.push(TensorContract {
             name: format!("{}{plane}", join.name),
-            expr: Expr::concat(
-                u8::try_from(join.axis).unwrap_or(0),
-                legs.iter().map(|t| Expr::out(t.name.clone())).collect(),
-            ),
+            expr: Expr::concat(u8::try_from(join.axis).unwrap_or(0), parts),
             shape,
             encoding: lead.encoding.clone(),
             scales: lead.scales.clone().map(|mut s| {
@@ -530,6 +546,17 @@ pub fn join_read(
     let tail = contract.tensors.split_off(last + 1);
     contract.tensors.extend(made);
     contract.tensors.extend(tail);
+    // A leg joined as its reads lands nothing of its own, unless something
+    // else reads what it lands.
+    let read: std::collections::BTreeSet<String> = contract
+        .tensors
+        .iter()
+        .flat_map(|t| t.expr.outputs())
+        .map(str::to_string)
+        .collect();
+    contract
+        .tensors
+        .retain(|t| !inlined.contains(&t.name) || read.contains(&t.name));
     Ok(())
 }
 
