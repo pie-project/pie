@@ -10,6 +10,14 @@ TOKENIZER = tokenizer(markers = [["<|im_end|>", "[EOS]"]])
 XTML = template("kimi3")
 TOKENIZER3 = tokenizer(markers = [["<|end_of_msg|>", "[EOS]", "[EOT]"]])
 
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: the KDA mixer's packed q, k and v, its convolution, its forget
+# and output gates and its per-head parameters by their heads, the latent
+# attention's q and kv up-projections and gate by theirs, the dense, shared
+# and routed gates and ups by their channels, the output and down
+# projections by their rows, the head by its vocabulary.
+CUTS = "inferred"
+
 MODELS = [
     model("kimik3-2.8t", template = XTML, tokenizer = TOKENIZER3, arch = "kimi_k3", layers = 93, vocab = 163840),
     model("kimik3-mini", mini = True, template = XTML, tokenizer = TOKENIZER3, arch = "kimi_k3", layers = 8, vocab = 163840),
@@ -38,11 +46,11 @@ def kda(n, l, k, hidden, weights, conv, eps, gate_floor, gate_rank = None, **ext
     or a pair through `gate_rank`. `extra` rides along."""
     width = k.heads * k.head_dim
     if gate_rank == None:
-        gate = [weight([width, hidden], weights).columns()]
+        gate = [weight([width, hidden], weights)]
     else:
         gate = [
             weight([gate_rank, hidden], weights),
-            weight([width, gate_rank], weights).columns(),
+            weight([width, gate_rank], weights),
         ]
     return struct(
         heads = k.heads,
@@ -50,17 +58,17 @@ def kda(n, l, k, hidden, weights, conv, eps, gate_floor, gate_rank = None, **ext
         conv_kernel = k.conv_kernel,
         norm_eps = eps,
         gate_floor = gate_floor,
-        qkv = weight([3 * width, hidden], weights).packed([width] * 3),
-        conv = weight([3 * width, k.conv_kernel], conv).packed([width] * 3),
+        qkv = weight([3 * width, hidden], weights),
+        conv = weight([3 * width, k.conv_kernel], conv),
         f_a = weight([k.f_rank, hidden], weights),
-        f_b = weight([width, k.f_rank], weights).columns(),
+        f_b = weight([width, k.f_rank], weights),
         gate = gate,
-        b = weight([k.heads, hidden], weights).columns(),
-        dt_bias = weight([k.heads, k.head_dim], dtype.f32).columns(),
-        a_log = weight([k.heads], dtype.f32).columns(),
+        b = weight([k.heads, hidden], weights),
+        dt_bias = weight([k.heads, k.head_dim], dtype.f32),
+        a_log = weight([k.heads], dtype.f32),
         o_norm = weight([k.head_dim], dtype.f32),
         o_norm_eps = eps,
-        o_proj = weight([hidden, width], weights).rows(),
+        o_proj = weight([hidden, width], weights),
         conv_state = "conv.{}".format(l),
         delta_state = "delta.{}".format(l),
         **extra
@@ -84,15 +92,15 @@ def attention(n, d, hidden, weights, norms, eps, kv, theta = None, gated = False
         q_a_proj = weight([d.q_lora_rank, hidden], weights),
         q_a_norm = weight([d.q_lora_rank]),
         q_a_norm_eps = eps,
-        q_b_proj = weight([d.heads * qk_head_dim, d.q_lora_rank], weights).columns(),
+        q_b_proj = weight([d.heads * qk_head_dim, d.q_lora_rank], weights),
         kv_a_proj = weight([d.kv_lora_rank + d.qk_rope_head_dim, hidden], weights),
         kv_a_norm = weight([d.kv_lora_rank]),
         kv_a_norm_eps = eps,
         kv_b_proj = weight([d.heads * (d.qk_nope_head_dim + d.v_head_dim), d.kv_lora_rank],
             weights,
-        ).columns(),
-        gate = weight([v_width, hidden], weights).columns() if gated else None,
-        o_proj = weight([hidden, v_width], weights).rows(),
+        ),
+        gate = weight([v_width, hidden], weights) if gated else None,
+        o_proj = weight([hidden, v_width], weights),
         kv = kv,
         **extra
     )
@@ -250,8 +258,8 @@ def layout(id, deploy):
                 routed = True,
                 router = weight([m.experts, hidden], weights),
                 bias = weight([m.experts], dtype.f32) if m.bias else None,
-                gate_up = weight([m.experts, 2 * inter, moe_in], experts).bank([inter, inter]),
-                down = weight([m.experts, moe_in, inter], experts).rows(),
+                gate_up = weight([m.experts, 2 * inter, moe_in], experts),
+                down = weight([m.experts, moe_in, inter], experts),
                 latent = struct(
                     width = m.latent,
                     down = weight([m.latent, hidden], weights),
@@ -260,9 +268,9 @@ def layout(id, deploy):
                     up = weight([hidden, m.latent], weights),
                 ) if m.latent != None else None,
                 shared = struct(
-                    gate = weight([sw, hidden], weights).columns(),
-                    up = weight([sw, hidden], weights).columns(),
-                    down = weight([hidden, sw], weights).rows(),
+                    gate = weight([sw, hidden], weights),
+                    up = weight([sw, hidden], weights),
+                    down = weight([hidden, sw], weights),
                     inter = sw,
                 ),
                 experts = m.experts,
@@ -277,9 +285,9 @@ def layout(id, deploy):
             inter = d.dense_inter
             mlp = struct(
                 routed = False,
-                gate = weight([inter, hidden], weights).columns(),
-                up = weight([inter, hidden], weights).columns(),
-                down = weight([hidden, inter], weights).rows(),
+                gate = weight([inter, hidden], weights),
+                up = weight([inter, hidden], weights),
+                down = weight([hidden, inter], weights),
                 inter = inter,
                 beta = d.situ_beta,
                 up_cap = d.situ_cap,
@@ -306,7 +314,7 @@ def layout(id, deploy):
         kv_lora_rank = a.kv_lora_rank,
         kv = deploy.kv,
         embed = weight([d.vocab, hidden], weights),
-        head = weight([d.vocab, hidden], weights).packed([d.vocab]),
+        head = weight([d.vocab, hidden], weights),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden], weights),
         final_norm_eps = d.norm_eps,
