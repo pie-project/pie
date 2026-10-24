@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 
 use crate::check::V;
-use crate::ops::{Attention, Fused, Layout, Spatial};
+use crate::ops::{Attn, Conv, Fused, Gather, Ssm};
 use crate::{Def, Guard, Operands, Operation, Trace, ValueId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -392,74 +392,62 @@ fn passes_through(trace: &Trace, i: usize, id: ValueId) -> Option<ValueId> {
 fn spans_classes(op: &Operation) -> bool {
     matches!(
         op,
-        Operation::Attention(Attention::Ragged { .. })
-            | Operation::Layout(Layout::PackRows { .. } | Layout::UnpackRows { .. })
+        Operation::Attn(Attn::Ragged { .. })
+            | Operation::Gather(Gather::PackRows { .. } | Gather::UnpackRows { .. })
     )
 }
 
 fn writes_cache(op: &Operation) -> bool {
     match op {
-        Operation::Attention(op) => match op {
-            Attention::KvAppend { .. }
-            | Attention::KvAppendShared { .. }
-            | Attention::MlaKvAppend { .. }
-            | Attention::IndexKvAppend { .. }
-            | Attention::PoolKvAppend { .. }
-            | Attention::PoolStateWrite { .. } => true,
-            Attention::SsmCausalConv1d { .. }
-            | Attention::SsmCausalConv1dChunked { .. }
-            | Attention::ShortConv { .. }
-            | Attention::ShortConvChunked { .. }
-            | Attention::SsmGatedDelta { .. }
-            | Attention::SsmGatedDeltaChunked { .. }
-            | Attention::SsmKdaStep { .. }
-            | Attention::SsmKdaChunked { .. }
-            | Attention::SsmMamba2 { .. }
-            | Attention::PleNgramIds { .. }
-            | Attention::PleNgramIdsChunked { .. }
-            | Attention::ReplayFloor { .. } => true,
-            Attention::PlanDecode { .. }
-            | Attention::PlanPrefill { .. }
-            | Attention::Decode { .. }
-            | Attention::Prefill { .. }
-            | Attention::DecodeRel { .. }
-            | Attention::PrefillRel { .. }
-            | Attention::Masked { .. }
-            | Attention::MaskedLse { .. }
-            | Attention::Dense { .. }
-            | Attention::Ragged { .. }
-            | Attention::DecodeLse { .. }
-            | Attention::PrefillLse { .. }
-            | Attention::DecodeSelected { .. }
-            | Attention::PrefillSelected { .. }
-            | Attention::Sink { .. }
-            | Attention::MergeLse { .. }
-            | Attention::LogitSoftcap { .. }
-            | Attention::MlaPlan { .. }
-            | Attention::MlaLatents { .. }
-            | Attention::MlaLatentsRope { .. }
-            | Attention::MlaSplitQB { .. }
-            | Attention::MlaAbsorbQ { .. }
-            | Attention::MlaAbsorbOut { .. }
-            | Attention::MlaDecode { .. }
-            | Attention::MlaPrefill { .. }
-            | Attention::MlaDecodeSelected { .. }
-            | Attention::MlaPrefillSelected { .. }
-            | Attention::SsmGdnPrep { .. }
-            | Attention::BlockDynConv { .. }
-            | Attention::SelectorWalk { .. }
-            | Attention::KvEnds { .. }
-            | Attention::WindowSink { .. }
-            | Attention::MarkovWalk { .. }
-            | Attention::IndexLayernormRope { .. }
-            | Attention::IndexRope { .. }
-            | Attention::IndexTopk { .. }
-            | Attention::IndexBlockMean { .. }
-            | Attention::PoolBoundaryDecode { .. }
-            | Attention::PoolBoundaryPrefill { .. }
-            | Attention::PoolGather { .. }
-            | Attention::PoolLse { .. }
-            | Attention::PoolLseSelected { .. } => false,
+        Operation::Attn(op) => match op {
+            Attn::KvAppend { .. }
+            | Attn::MlaKvAppend { .. }
+            | Attn::IndexKvAppend { .. }
+            | Attn::PoolKvAppend { .. }
+            | Attn::PoolStateWrite { .. } => true,
+            Attn::ReplayFloor { .. } => true,
+            Attn::PlanDecode { .. }
+            | Attn::PlanPrefill { .. }
+            | Attn::Decode { .. }
+            | Attn::Prefill { .. }
+            | Attn::Dense { .. }
+            | Attn::Ragged { .. }
+            | Attn::Voxel { .. }
+            | Attn::Sink { .. }
+            | Attn::MergeLse { .. }
+            | Attn::MlaPlan { .. }
+            | Attn::MlaLatents { .. }
+            | Attn::MlaLatentsRope { .. }
+            | Attn::MlaSplitQB { .. }
+            | Attn::MlaAbsorbQ { .. }
+            | Attn::MlaAbsorbOut { .. }
+            | Attn::MlaDecode {
+                selection: None, ..
+            }
+            | Attn::MlaPrefill {
+                selection: None, ..
+            }
+            | Attn::MlaDecode {
+                selection: Some(_), ..
+            }
+            | Attn::MlaPrefill {
+                selection: Some(_), ..
+            }
+            | Attn::KvEnds { .. }
+            | Attn::WindowSink { .. }
+            | Attn::IndexLayernormRope { .. }
+            | Attn::IndexRope { .. }
+            | Attn::IndexTopk { .. }
+            | Attn::IndexBlockMean { .. }
+            | Attn::PoolBoundary { decode: true, .. }
+            | Attn::PoolBoundary { decode: false, .. }
+            | Attn::PoolGather { .. }
+            | Attn::PoolLse {
+                selection: None, ..
+            }
+            | Attn::PoolLse {
+                selection: Some(_), ..
+            } => false,
         },
         Operation::Fused(op) => matches!(
             op,
@@ -470,25 +458,23 @@ fn writes_cache(op: &Operation) -> bool {
                 | Fused::PoolCompress { .. }
                 | Fused::NormRopePair { .. }
                 | Fused::SplitRopeYarnAppend { .. }
-                | Fused::QgQknormRopeAppend { .. }
+                | Fused::QGateNormRopeAppend {
+                    intermediates: crate::ops::fused::Intermediates::Unwritten,
+                    ..
+                }
         ),
-        Operation::Spatial(op) => match op {
-            Spatial::Conv3d { cache, .. } => cache.is_some(),
-            Spatial::CacheStore { .. } => true,
-            Spatial::Grid { .. }
-            | Spatial::GroupNorm { .. }
-            | Spatial::Attention { .. }
-            | Spatial::UpsampleNearest { .. }
-            | Spatial::PixelShuffle { .. }
-            | Spatial::PixelUnshuffle { .. }
-            | Spatial::AvgDown { .. }
-            | Spatial::Patchify { .. }
-            | Spatial::Unpatchify { .. } => false,
+        Operation::Conv(op) => match op {
+            Conv::Conv3d { cache, .. } => cache.is_some(),
+            Conv::CacheStore { .. } => true,
+            _ => false,
         },
+        Operation::Gather(Gather::NgramIds { .. } | Gather::NgramIdsChunked { .. }) => true,
         Operation::Linear(_)
-        | Operation::Elementwise(_)
-        | Operation::Layout(_)
-        | Operation::Collective(_) => false,
+        | Operation::Elemwise(_)
+        | Operation::Gather(_)
+        | Operation::Collective(_)
+        | Operation::Sampling(_) => false,
+        Operation::Ssm(op) => !matches!(op, Ssm::DynConv { .. } | Ssm::GdnGates { .. }),
     }
 }
 
@@ -554,7 +540,7 @@ impl ClassTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ops::{Attention, Elementwise};
+    use crate::ops::{Attn, Elemwise};
     use crate::{Dim, Dtype, Node, RuntimeInput, Ty, ValueDecl};
 
     struct Build {
@@ -617,10 +603,12 @@ mod tests {
             let node = self.trace.nodes.len() as u32;
             let y = self.value(Def::Op(node));
             self.trace.nodes.push(Node {
-                op: Elementwise::MulScalar {
-                    s: 2.0,
+                op: Elemwise::Act {
+                    scale: Some(2.0),
                     x,
                     x_out: y,
+                    s: None,
+                    act: poem_ir::ActFn::Identity,
                 }
                 .into(),
                 guard,
@@ -634,8 +622,9 @@ mod tests {
             let page = self.input();
             let offset = self.input();
             self.trace.nodes.push(Node {
-                op: Attention::KvAppendShared {
-                    plane: x,
+                op: Attn::KvAppend {
+                    k: x,
+                    v: None,
                     cache,
                     write_page: page,
                     write_offset: offset,
@@ -680,10 +669,10 @@ mod tests {
         // on `f0 ∧ f1` reads rows no arm was meant to write.
         let mut b = Build::new();
         let q = b.input();
-        let bound = Guard::not(Guard::and(fact(0), fact(1)));
+        let bound = !Guard::and(fact(0), fact(1));
         let masked = Guard::and(fact(1), bound.clone());
-        let scored = Guard::and(Guard::not(fact(1)), fact(2));
-        let rest = Guard::and(Guard::not(fact(1)), Guard::not(fact(2)));
+        let scored = Guard::and(!fact(1), fact(2));
+        let rest = Guard::and(!fact(1), !fact(2));
         let m = b.op(q, masked.clone());
         let s = b.op(q, scored.clone());
         let r = b.op(q, rest.clone());
@@ -698,8 +687,8 @@ mod tests {
         let mut b = Build::new();
         let q = b.input();
         let d = b.op(q, fact(0));
-        let p = b.op(q, Guard::not(fact(0)));
-        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))]);
+        let p = b.op(q, !fact(0));
+        let o = b.merge(&[(d, fact(0)), (p, !fact(0))]);
         b.out(o);
 
         let classes = b.resolve().expect("a covering split resolves");
@@ -716,8 +705,8 @@ mod tests {
         let mut b = Build::new();
         let q = b.input();
         let d = b.op(q, fact(0));
-        let m = b.op(q, Guard::and(Guard::not(fact(0)), fact(1)));
-        let o = b.merge(&[(d, fact(0)), (m, Guard::and(Guard::not(fact(0)), fact(1)))]);
+        let m = b.op(q, Guard::and(!fact(0), fact(1)));
+        let o = b.merge(&[(d, fact(0)), (m, Guard::and(!fact(0), fact(1)))]);
         b.out(o);
 
         let faults = b.resolve().expect_err("a hole is a fault");

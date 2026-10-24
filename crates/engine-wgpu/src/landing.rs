@@ -17,6 +17,8 @@ pub(crate) struct Seat {
     pub seat: Buffer,
     pub mirror: Buffer,
     pub draft: Option<(u32, Buffer)>,
+    /// The fire's pixel plane and its element count, where it wrote one.
+    pub pixels: Option<(Buffer, u32)>,
     pub guests: Option<Guests>,
 }
 
@@ -70,6 +72,7 @@ struct Landing {
     width: u32,
     seat: Buffer,
     mtp_width: u32,
+    pixels: Option<(Buffer, u32)>,
     read: Result<Rows, String>,
     guests: Option<Guests>,
     mailbox: Mailbox,
@@ -92,6 +95,7 @@ impl Landing {
                 &self.layout,
                 self.width,
                 self.mtp_width,
+                self.pixels.as_ref(),
             );
             tracing::debug!(seq = self.seq, guests = jobs.len(), "landing: guests run");
             worker
@@ -101,7 +105,15 @@ impl Landing {
         }
         #[cfg(not(feature = "wgpu"))]
         {
-            let _ = (rows, drafts, self.width, &self.seat, self.mtp_width, worker);
+            let _ = (
+                rows,
+                drafts,
+                self.width,
+                &self.seat,
+                self.mtp_width,
+                &self.pixels,
+                worker,
+            );
             match guests {}
         }
     }
@@ -126,9 +138,7 @@ impl Landing {
             tracing::warn!(seq, arm, failed, %why, "landing: the step faulted");
         }
         let parked = {
-            let mut post = mailbox
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut post = mailbox.lock().expect("mailbox lock poisoned");
             post.landed.push(Landed {
                 seq,
                 arm,
@@ -216,10 +226,7 @@ impl Worker {
 
     #[cfg(feature = "wgpu")]
     fn runner(&self, at: usize) -> crate::device::host::channel::Sender<Runnable> {
-        let mut state = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = self.inner.lock().expect("lock poisoned");
         while state.runners.len() <= at {
             let (tx, rx) = crate::device::host::channel::unbounded::<Runnable>();
             crate::device::host::thread::spawn(
@@ -237,10 +244,7 @@ impl Worker {
     }
     fn land(&self, landing: Landing) {
         let inline = {
-            let mut state = self
-                .inner
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = self.inner.lock().expect("lock poisoned");
             if state.queued == 0 && landing.guests.is_none() {
                 Some(landing)
             } else {
@@ -266,11 +270,7 @@ impl Worker {
             while let Ok(mut landing) = rx.recv() {
                 let fault = landing.run_guests(&worker);
                 landing.finish(fault);
-                worker
-                    .inner
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .queued -= 1;
+                worker.inner.lock().expect("lock poisoned").queued -= 1;
             }
         })
         .expect("spawn the landing worker");
@@ -293,6 +293,7 @@ pub(crate) fn on_done(
         seat,
         mirror,
         draft,
+        pixels,
         guests,
     } = seat;
     let mtp_width = draft.as_ref().map_or(0, |&(width, _)| width);
@@ -306,6 +307,7 @@ pub(crate) fn on_done(
             width,
             seat,
             mtp_width,
+            pixels,
             read,
             guests,
             mailbox,

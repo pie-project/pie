@@ -16,9 +16,9 @@ const MXFP4_BLOCK: u32 = 32;
 
 const SOFTMAX_OVER_SELECTED: u32 = 0;
 
-const ROUTE_FILE: &str = "linear/moe_route.metal";
+const ROUTE_FILE: &str = "linear/moe/route.metal";
 
-const QMM_FILE: &str = "linear/quant_qmm_t.metal";
+const QMM_FILE: &str = "linear/qmm_t.metal";
 
 const QMM_BK: u32 = 32;
 
@@ -129,7 +129,7 @@ pub fn topk_softmax(
     routes: Tensor,
     weights: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_softmax";
+    const OP: &str = "linear.moe_route";
     let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_topk_f32w_bfloat16" });
     debug_assert_eq!(
         logits.width, experts,
@@ -140,7 +140,7 @@ pub fn topk_softmax(
     let lanes = router_lanes(OP, experts)?;
     nonzero(OP, "rows", logits.rows)?;
     ctx.fire(
-        Fire::at("linear/moe_route.metal", entry)
+        Fire::at("linear/moe/route.metal", entry)
             .apply(Grid::of([lanes, logits.rows, 1], [lanes, 1, 1])),
         &[
             logits.arg(),
@@ -164,7 +164,7 @@ pub fn topk_softmax_scaled(
     routes: Tensor,
     weights: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_softmax_scaled";
+    const OP: &str = "linear.moe_route";
     let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_topk_scaled_f32w_bfloat16" });
     debug_assert_eq!(
         scale.dtype, logits.dtype,
@@ -177,7 +177,7 @@ pub fn topk_softmax_scaled(
     );
     let grid = ranked(OP, logits, experts, top_k, routes, weights)?;
     ctx.fire(
-        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        Fire::at("linear/moe/route.metal", entry).apply(grid),
         &[
             logits.arg(),
             routes.arg_mut(),
@@ -202,11 +202,11 @@ pub fn topk_sigmoid(
     routes: Tensor,
     weights: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_sigmoid";
+    const OP: &str = "linear.moe_route";
     let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_topk_sigmoid" });
     let grid = ranked(OP, logits, experts, top_k, routes, weights)?;
     ctx.fire(
-        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        Fire::at("linear/moe/route.metal", entry).apply(grid),
         &[
             logits.arg(),
             routes.arg_mut(),
@@ -231,7 +231,7 @@ pub fn topk_sigmoid_biased(
     routes: Tensor,
     weights: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_sigmoid";
+    const OP: &str = "linear.moe_route";
     let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_topk_sigmoid_biased" });
     debug_assert_eq!(
         bias.dtype,
@@ -240,7 +240,7 @@ pub fn topk_sigmoid_biased(
     );
     let grid = ranked(OP, logits, experts, top_k, routes, weights)?;
     ctx.fire(
-        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        Fire::at("linear/moe/route.metal", entry).apply(grid),
         &[
             logits.arg(),
             bias.arg(),
@@ -266,7 +266,7 @@ pub fn topk_sqrt_softplus(
     routes: Tensor,
     weights: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_topk_sqrt_softplus";
+    const OP: &str = "linear.moe_route";
     let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_topk_sqrt_softplus" });
     debug_assert_eq!(
         bias.dtype,
@@ -275,7 +275,7 @@ pub fn topk_sqrt_softplus(
     );
     let grid = ranked(OP, logits, experts, top_k, routes, weights)?;
     ctx.fire(
-        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        Fire::at("linear/moe/route.metal", entry).apply(grid),
         &[
             logits.arg(),
             bias.arg(),
@@ -298,7 +298,7 @@ pub fn predict_route(
     routes: Tensor,
     weights: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_predict_route";
+    const OP: &str = "linear.moe_route";
     let entry = dtype_dispatch!(OP, logits.dtype, { Bf16 => "router_predict_sqrt_softplus" });
     debug_assert_eq!(
         bias.dtype,
@@ -307,7 +307,7 @@ pub fn predict_route(
     );
     let grid = ranked(OP, logits, experts, top_k, routes, weights)?;
     ctx.fire(
-        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        Fire::at("linear/moe/route.metal", entry).apply(grid),
         &[
             logits.arg(),
             bias.arg(),
@@ -334,7 +334,7 @@ pub fn hash_route(
     routes: Tensor,
     weights: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_hash_route";
+    const OP: &str = "linear.moe_route";
     debug_assert!(
         matches!(ids.dtype, Dtype::U32 | Dtype::I32),
         "`{OP}` gathers by a 32-bit token id column"
@@ -517,12 +517,12 @@ pub fn matmul_select(
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select";
+    const OP: &str = "linear.moe_select";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "select_gemv" });
     debug_assert_eq!(bank.dtype, x.dtype, "the bank rides the activation's dtype");
     let fan = selected(OP, x, routes, y)?;
     ctx.fire(
-        Fire::at("linear/moe_select.metal", entry).apply(select_gemv_grid(OP, y.width, y.rows)?),
+        Fire::at("linear/moe/select.metal", entry).apply(select_gemv_grid(OP, y.width, y.rows)?),
         &[
             x.arg(),
             bank.arg(),
@@ -552,7 +552,7 @@ fn routed_point(op: &'static str, bank: Bank, biased: bool) -> Result<&'static s
         (affine, group, bits) => Err(refuse(
             op,
             format!(
-                "the bank is {} at {bits} bits in groups of {group}, and `quant_qmv.metal` \
+                "the bank is {} at {bits} bits in groups of {group}, and `qmv.metal` \
                  instantiates the routed shapes at affine/{{32,64,128}}/2, affine/64/4 \
                  and mxfp4/32/4 only",
                 if affine { "affine" } else { "symmetric" }
@@ -593,7 +593,7 @@ pub fn matmul_select_bias(
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select_bias";
+    const OP: &str = "linear.moe_select";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     let entry = routed_point(OP, bank, true)?;
     debug_assert_eq!(
@@ -603,7 +603,7 @@ pub fn matmul_select_bias(
     let fan = selected(OP, x, routes, y)?;
     routed_bank(OP, x, bank)?;
     ctx.fire(
-        Fire::at("linear/quant_qmv.metal", entry).apply(Grid::of(
+        Fire::at("linear/qmv.metal", entry).apply(Grid::of(
             routed_qmv_grid(OP, fan.tokens, y.width, fan.top_k)?,
             QMV_GROUP,
         )),
@@ -631,13 +631,13 @@ pub fn matmul_select_quant(
     routes: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select_quant";
+    const OP: &str = "linear.moe_select";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     let entry = routed_point(OP, bank, false)?;
     let fan = selected(OP, x, routes, y)?;
     routed_bank(OP, x, bank)?;
     ctx.fire(
-        Fire::at("linear/quant_qmv.metal", entry).apply(Grid::of(
+        Fire::at("linear/qmv.metal", entry).apply(Grid::of(
             routed_qmv_grid(OP, fan.tokens, y.width, fan.top_k)?,
             QMV_GROUP,
         )),
@@ -701,8 +701,8 @@ fn mpp_point(
 }
 
 /// The MPP point of a routed MXFP4 matmul, as `(row tile, column tile, simdgroups)`: the
-/// codes are decoded into threadgroup bfloat a 64-wide slice at a time, as mlx-lm's
-/// `gather_qmm_rhs_nax` does, so a row tile is the sorted tile, inside one expert's rows.
+/// codes are decoded into threadgroup bfloat a 64-wide slice at a time, so a row tile is
+/// the sorted tile, inside one expert's rows.
 fn mxfp4_mpp_point(
     x: Tensor,
     bank: Bank,
@@ -731,15 +731,15 @@ fn batched_point(
     bm: u32,
     bn: u32,
     fp16: bool,
-) -> Result<Option<crate::linear::quant::Point>, Error> {
+) -> Result<Option<crate::linear::qmm::Point>, Error> {
     let (bm, bn) = (stated(op, bm)?, stated(op, bn)?);
     match (bank.affine(), bank.group, bank.bits, biased) {
-        (true, 64, 4, false) if fp16 => Ok(Some(crate::linear::quant::Point {
-            entry: crate::linear::quant::routed_fp16_point(op, bm, bn)?,
+        (true, 64, 4, false) if fp16 => Ok(Some(crate::linear::qmm::Point {
+            entry: crate::linear::qmm::tiled::routed_fp16_point(op, bm, bn)?,
             stamp: "",
         })),
-        (true, group, bits, false) if crate::linear::quant::qmm_stamps_width(bits) => {
-            Ok(Some(crate::linear::quant::qmm_point(
+        (true, group, bits, false) if crate::linear::qmm::tiled::qmm_stamps_width(bits) => {
+            Ok(Some(crate::linear::qmm::tiled::qmm_point(
                 op,
                 "_routed",
                 "PIE_STAMP_qmm_t_routed",
@@ -749,8 +749,8 @@ fn batched_point(
                 bn,
             )?))
         }
-        (false, MXFP4_BLOCK, 4, biased) => Ok(Some(crate::linear::quant::Point {
-            entry: crate::linear::quant::mxfp4_routed_point(
+        (false, MXFP4_BLOCK, 4, biased) => Ok(Some(crate::linear::qmm::Point {
+            entry: crate::linear::qmm::tiled::mxfp4_routed_point(
                 op,
                 if biased { "_bias" } else { "" },
                 bm,
@@ -945,13 +945,13 @@ pub fn matmul_select_batched(
     }
 
     if let Some((m, n, simdgroups)) = mxfp4 {
-        const FILE: &str = "linear/quant_qmm_mpp.metal";
+        const FILE: &str = "linear/qmm_mpp.metal";
         let biased = bias.is_some();
-        let entry = crate::linear::quant::symbol(&format!(
+        let entry = crate::linear::qmm::symbol(&format!(
             "mxfp4_qmm_mpp_routed_m{m}_n{n}_s{simdgroups}_t{tile}_b{}",
             u8::from(biased)
         ));
-        let stamp = crate::linear::quant::symbol(&format!(
+        let stamp = crate::linear::qmm::symbol(&format!(
             "PIE_MPP_MXFP4_POINT(\"{entry}\",{m},{n},{simdgroups},{tile},{biased})"
         ));
         ctx.fire(
@@ -975,7 +975,7 @@ pub fn matmul_select_batched(
             ],
         )?;
     } else if let Some((m, n, simdgroups)) = mpp {
-        const FILE: &str = "linear/quant_qmm_mpp.metal";
+        const FILE: &str = "linear/qmm_mpp.metal";
         let k = stated(op, x.width)?;
         debug_assert!(
             !sorted.sums
@@ -990,10 +990,10 @@ pub fn matmul_select_batched(
                 &[scratch.x.arg(), scratch.sums.arg_mut(), k.arg(), m.arg()],
             )?;
         }
-        let entry = crate::linear::quant::symbol(&format!(
+        let entry = crate::linear::qmm::symbol(&format!(
             "affine_qmm_mpp_routed_m{m}_n{n}_s{simdgroups}_t{tile}"
         ));
-        let stamp = crate::linear::quant::symbol(&format!(
+        let stamp = crate::linear::qmm::symbol(&format!(
             "PIE_MPP_ROUTED_POINT(\"{entry}\",{m},{n},{simdgroups},{tile})"
         ));
         ctx.fire(
@@ -1031,7 +1031,7 @@ pub fn matmul_select_batched(
             args.push(ctx.absent()?);
         }
         args.push(scratch.tile_expert.arg());
-        let mut grid = crate::linear::quant::qmm_grid(
+        let mut grid = crate::linear::qmm::tiled::qmm_grid(
             op,
             stated(op, y.width)?,
             stated(op, bn)?,
@@ -1039,14 +1039,14 @@ pub fn matmul_select_batched(
             stated(op, tile)?,
             1,
         )?;
-        // The stamped affine kernel is the steel tile's own; the MXFP4 and fp16 ones
+        // The stamped affine kernel is the gemm tile's own; the MXFP4 and fp16 ones
         // take the routed threadgroup.
         let group = if point.stamp.is_empty() {
-            let group = crate::linear::quant::routed_group(stated(op, tile)?);
+            let group = crate::linear::qmm::tiled::routed_group(stated(op, tile)?);
             grid[2] = group[2];
             group
         } else {
-            crate::linear::quant::qmm_group(stated(op, tile)?)
+            crate::linear::qmm::tiled::qmm_group(stated(op, tile)?)
         };
         ctx.fire(
             Fire::at(QMM_FILE, point.entry)
@@ -1096,7 +1096,7 @@ pub const REGISTER_EXPERTS: u32 = ROUTER_MAX_EXPERTS;
 /// [`REGISTER_TOKENS`] tokens' routes of it.
 pub const REGISTER_FAN_OUT: u32 = 16;
 
-const REGISTER_FILE: &str = "linear/moe_sg.metal";
+const REGISTER_FILE: &str = "linear/moe/select_sg.metal";
 
 /// How the register expert passes cut their work: the intermediate's
 /// 8-column fragments a simdgroup of the gate-up takes (each with its gate
@@ -1144,7 +1144,7 @@ impl RegisterCut {
     }
 }
 
-/// The scratch of a routed MLP on the register tile, as `moe_sg.metal` reads it.
+/// The scratch of a routed MLP on the register tile, as `linear/moe/select_sg.metal` reads it.
 #[derive(Clone, Copy, Debug)]
 pub struct RegisterRooms {
     /// The live tile count, then each tile's expert: i32, [`register_tiles`] + 1.
@@ -1260,7 +1260,7 @@ pub fn register_group(
     groups: [u32; 2],
     rooms: RegisterRooms,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select_quant";
+    const OP: &str = "linear.moe_select";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     debug_assert_eq!(routes.dtype, Dtype::I32, "`{OP}` walks i32 routes");
     let tokens = nonzero(OP, "the routed tokens", routes.rows)?;
@@ -1427,7 +1427,7 @@ pub fn register_glu(
     rooms: RegisterRooms,
     cut: RegisterCut,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select_quant";
+    const OP: &str = "linear.moe_select";
     let (fragments, simdgroups) = (cut.fragments, cut.glu_simdgroups);
     let entry = match (fragments, simdgroups) {
         (1, 4) => "affine_qmm_sg_glu_routed_h1_s4",
@@ -1494,7 +1494,7 @@ pub fn register_down(
     rooms: RegisterRooms,
     cut: RegisterCut,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_matmul_select_quant";
+    const OP: &str = "linear.moe_select";
     let simdgroups = cut.down_simdgroups;
     let entry = match simdgroups {
         4 => "affine_qmm_sg_routed_s4",
@@ -1554,7 +1554,7 @@ pub fn weighted_sum(
     weights: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_weighted_sum";
+    const OP: &str = "linear.moe_combine";
     let entry = dtype_dispatch!(OP, routed.dtype, { Bf16 => "expert_combine" });
     debug_assert_eq!(weights.dtype, Dtype::F32, "`{OP}` reads f32 route weights");
     nonzero(OP, "the token rows this fold lands on", y.rows)?;
@@ -1578,7 +1578,7 @@ pub fn weighted_sum(
     );
     let grid = route_rows(OP, y.width, y.rows)?;
     ctx.fire(
-        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        Fire::at("linear/moe/route.metal", entry).apply(grid),
         &[
             routed.arg(),
             weights.arg(),
@@ -1599,7 +1599,7 @@ pub fn weighted_sum_sorted(
     top_k: u32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "linear.moe_weighted_sum";
+    const OP: &str = "linear.moe_combine";
     dtype_dispatch!(OP, sorted.dtype, { Bf16 => () });
     nonzero(OP, "the token rows this fold lands on", y.rows)?;
     debug_assert_eq!(
@@ -1607,7 +1607,7 @@ pub fn weighted_sum_sorted(
         "the sorted rows are the routed width"
     );
     ctx.fire(
-        Fire::at("linear/moe_route.metal", "expert_combine_sorted")
+        Fire::at("linear/moe/route.metal", "expert_combine_sorted")
             .apply(route_rows(OP, y.width, y.rows)?),
         &[
             sorted.arg(),
@@ -1655,7 +1655,7 @@ pub fn bias_sum(
     let top_k = nonzero(OP, "the routed fan-out", routes.width)?;
     let grid = route_rows(OP, y.width, y.rows)?;
     ctx.fire(
-        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        Fire::at("linear/moe/route.metal", entry).apply(grid),
         &[
             x.arg(),
             bias.arg(),
@@ -1692,7 +1692,7 @@ pub fn sigmoid_gate_add(
     );
     let grid = route_rows(OP, routed.width, routed.rows)?;
     ctx.fire(
-        Fire::at("linear/moe_route.metal", entry).apply(grid),
+        Fire::at("linear/moe/route.metal", entry).apply(grid),
         &[
             routed.arg(),
             shared.arg(),

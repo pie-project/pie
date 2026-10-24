@@ -1,4 +1,5 @@
-use kernels_vulkan::{Tensor, layout};
+use kernels_slang::Tensor;
+use kernels_slang::gather::rows;
 use poem_compiler::Region;
 use poem_exec::KernelError;
 use poem_exec::fire::{Serve, fallback};
@@ -134,17 +135,18 @@ impl Run<'_> {
         Ok(())
     }
 
-    fn move_rows(&self, region: &Region, out: bool) -> Result<(), kernels_vulkan::Error> {
+    fn move_rows(&self, region: &Region, out: bool) -> Result<(), kernels_slang::Error> {
         let index = self.gathered_rows(region);
         for slot in &self.staged_copy().slots {
             let moving = if out { slot.written } else { slot.read };
             if !moving {
                 continue;
             }
+            let (tight, wide) = (slot.tight, slot.wide);
             if out {
-                layout::scatter_rows(self.ctx(), slot.tight, index, slot.wide)?;
+                rows::scatter_rows(self.ctx, tight, index, wide)?;
             } else {
-                layout::gather_rows(self.ctx(), slot.wide, index, slot.tight)?;
+                rows::gather_rows(self.ctx, wide, index, tight)?;
             }
         }
         Ok(())

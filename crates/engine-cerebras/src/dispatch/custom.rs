@@ -1,5 +1,5 @@
-use poem_exec::{DispatchFused, DispatchProbe, DispatchSpatial, KernelError};
-use poem_ir::{Fused, Operands, Spatial};
+use poem_exec::{DispatchConv, DispatchFused, DispatchProbe, KernelError};
+use poem_ir::{Conv, Fused, Operands};
 
 use crate::run::Run;
 
@@ -10,8 +10,8 @@ impl DispatchFused for Run<'_> {
     }
 }
 
-impl DispatchSpatial for Run<'_> {
-    fn dispatch(&mut self, op: &Spatial) -> Result<(), KernelError> {
+impl DispatchConv for Run<'_> {
+    fn dispatch(&mut self, op: &Conv) -> Result<(), KernelError> {
         self.ctx().scope(op.name());
         Err(KernelError::Unsupported { op: op.name() })
     }

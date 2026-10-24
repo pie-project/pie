@@ -1,7 +1,8 @@
 #![cfg(feature = "device")]
+#![allow(unsafe_code)]
 
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard};
 
 use checkpoint::contract::ModelContract;
 use engine_cuda::{Boot, Lane, Shell};
@@ -17,7 +18,7 @@ const BOTH: u32 = 8_192;
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
 fn serialized() -> MutexGuard<'static, ()> {
-    ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner)
+    ONE_AT_A_TIME.lock().expect("one at a time lock poisoned")
 }
 
 const PAGE: u32 = 16;
@@ -256,22 +257,11 @@ fn a_prefill_past_the_gemvs_grid_is_served() {
         finite(&logits[0], "the wide prefill");
     }
 
-    // The GEMV carries a route run past its grid's y axis on z, so it serves the fire too.
-    #[cfg(not(feature = "rocm"))]
-    {
-        let (logits, _) = fire_at(&fixture, WIDE, Leg::Gemv).unwrap_or_else(|why| {
-            panic!("a prefill of 65600 routes fires on the GEMV leg past grid y: {why}")
-        });
-        finite(&logits[0], "the wide prefill on the GEMV");
-    }
-    // ROCm's refuses it, naming the route run against the grid it does not fit.
-    #[cfg(feature = "rocm")]
-    {
-        let why = fire_at(&fixture, WIDE, Leg::Gemv)
-            .expect_err("with the grouped leg declined, a 65600-route fire is past the GEMV's grid")
-            .to_string();
-        assert!(why.contains("65600") || why.contains("65535"), "{why}");
-    }
+    // The GEMV serves the fire too: CUDA's carries a route run past its grid's
+    // y axis on z, and ROCm's lays the routes along x, whose ceiling is 2^31-1.
+    let (logits, _) = fire_at(&fixture, WIDE, Leg::Gemv)
+        .unwrap_or_else(|why| panic!("a prefill of 65600 routes fires on the GEMV leg: {why}"));
+    finite(&logits[0], "the wide prefill on the GEMV");
 }
 
 fn the_two_legs_answer_the_same_model() {

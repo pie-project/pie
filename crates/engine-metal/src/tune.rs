@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use kernels_metal::linear::quant;
+use kernels_metal::linear::qmm;
 use kernels_metal::tuning::{Qmm, QmmFp16};
 use kernels_metal::{ArgValue, Encode, Error, Fire, Tensor, Tuning};
 use poem_ir::Dtype;
@@ -44,30 +44,30 @@ struct Bank {
 /// The catalog's quantised bank shapes, `(n, k, banks)`, heaviest
 /// (`n * k * banks`) first; `the_census_is_the_catalogs` keeps it current.
 const CENSUS: &[(u32, u32, u32)] = &[
-    (34816, 5120, 593),
-    (5120, 17408, 593),
-    (43008, 5376, 180),
-    (16384, 5120, 432),
-    (24576, 4096, 264),
-    (36864, 8192, 73),
-    (5376, 21504, 180),
-    (5120, 6144, 578),
-    (4096, 8192, 494),
-    (6144, 16384, 163),
-    (16384, 6144, 163),
+    (34816, 5120, 761),
+    (5120, 17408, 761),
+    (43008, 5376, 240),
+    (16384, 5120, 528),
+    (36864, 8192, 142),
+    (57344, 8192, 80),
+    (4096, 8192, 954),
+    (24576, 4096, 300),
+    (5376, 21504, 240),
+    (8192, 16384, 189),
+    (6144, 16384, 241),
+    (16384, 6144, 241),
+    (5120, 6144, 706),
+    (14336, 5120, 276),
+    (20480, 4096, 229),
+    (8192, 28672, 80),
+    (5120, 12288, 285),
+    (16384, 5376, 200),
+    (51200, 5120, 64),
     (39936, 6656, 52),
-    (16384, 5376, 150),
-    (8192, 16384, 97),
-    (4096, 4096, 699),
-    (12288, 5120, 146),
-    (20480, 4096, 94),
-    (4096, 16384, 116),
-    (16384, 2560, 183),
-    (6656, 19968, 52),
-    (8192, 4096, 202),
-    (5376, 8192, 150),
-    (32768, 8192, 24),
-    (16384, 4096, 88),
+    (4096, 4096, 803),
+    (32768, 8192, 47),
+    (12288, 5120, 178),
+    (16384, 4096, 133),
 ];
 
 struct Grid {
@@ -221,20 +221,20 @@ fn forcing(q: &Qmm) -> String {
 fn ran(files: &[&str], q: &Qmm) -> bool {
     let has = |name: &str| files.iter().any(|f| f.contains(name));
     match q {
-        Qmm::Mpp => has("quant_qmm_mpp"),
-        Qmm::Staged => has("quant_qmm_staged"),
-        Qmm::Register => has("quant_qmm_sg"),
+        Qmm::Mpp => has("linear/qmm_mpp.metal"),
+        Qmm::Staged => has("linear/qmm_staged.metal"),
+        Qmm::Register => has("linear/qmm_sg.metal"),
         Qmm::Tiled { .. } => {
-            !has("quant_qmm_mpp")
-                && !has("quant_qmm_staged")
-                && !has("quant_qmm_sg")
-                && has("quant_qmm_t")
+            !has("linear/qmm_mpp.metal")
+                && !has("linear/qmm_staged.metal")
+                && !has("linear/qmm_sg.metal")
+                && has("linear/qmm_t.metal")
         }
         Qmm::Qmv { .. } => {
-            !has("quant_qmm_mpp")
-                && !has("quant_qmm_staged")
-                && !has("quant_qmm_sg")
-                && !has("quant_qmm_t")
+            !has("linear/qmm_mpp.metal")
+                && !has("linear/qmm_staged.metal")
+                && !has("linear/qmm_sg.metal")
+                && !has("linear/qmm_t.metal")
         }
     }
 }
@@ -612,7 +612,7 @@ fn plan_of(deployment: &str, text: &str, cores: Option<u32>) -> Option<u64> {
     let row = poem_compiler::catalog::deployment(deployment)?;
     let trace = poem_compiler::fuse::fuse(
         row.trace(poem::Platform::Metal),
-        &poem_compiler::fuse::flags::kernels(&profile),
+        poem_compiler::fuse::flags::on(&profile, &crate::FUSIONS),
     );
     let slots = *LANES.iter().max().expect("lanes") as u32;
     let mut budgets = poem_compiler::Budgets::of(poem_compiler::Budget::new(slots, CONTEXT));
@@ -1081,13 +1081,13 @@ fn measure(
                         (width == n && u64::from(rows) <= partial_rows)
                             .then(|| Tensor::new(hq, rows, width, Dtype::F32))
                     };
-                    quant::matmul(
+                    qmm::matmul(
                         sink,
                         tuning,
                         Tensor::new(ha, m, k, Dtype::Bf16),
                         b,
                         Tensor::new(ho, m, n, Dtype::Bf16),
-                        quant::Scratch {
+                        qmm::Scratch {
                             precast: &precast,
                             partials: &partials,
                             table: None,
@@ -1457,7 +1457,7 @@ mod tests {
             "kernel.sdpa.prefill",
             "kernel.gdn.scan",
             "kernel.ane.mlp",
-            "fuse.mlp_swiglu",
+            "fuse.matmul_swiglu_matmul",
             "compiler.launch_us",
         ] {
             assert!(ids.contains(&want), "{want} not searched: {ids:?}");

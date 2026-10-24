@@ -5,7 +5,7 @@ pub use classes::{fact_width, resolve_classes};
 use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 
-use crate::ops::{Attention, Elementwise, Fused, Layout, Linear, RaggedMask, Spatial};
+use crate::ops::Elemwise;
 use crate::{Def, Dim, Dtype, Operands, Operation, StructKind, Trace, Ty, ValueId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,17 +26,25 @@ pub enum DefKind {
     Merge,
 }
 
+/// The operand a type check names: the field the op declares it on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Port {
-    In(usize),
-    Out(usize),
-}
+pub struct Port(pub &'static str);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expect {
     Struct(&'static [StructKind]),
     Cache,
     Tensor(Dtype),
+}
+
+impl Expect {
+    pub const I32: Self = Self::Tensor(Dtype::I32);
+    pub const F32: Self = Self::Tensor(Dtype::F32);
+    pub const U8: Self = Self::Tensor(Dtype::U8);
+    pub const CACHE: Self = Self::Cache;
+    pub const DECODE_PLAN: Self = Self::Struct(&[StructKind::AttnDecodePlan]);
+    pub const PREFILL_PLAN: Self = Self::Struct(&[StructKind::AttnPrefillPlan]);
+    pub const MLA_PLAN: Self = Self::Struct(&[StructKind::MlaPlan]);
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -141,11 +149,6 @@ pub enum Fault {
         merge_ty: Ty,
         arm_ty: Ty,
     },
-    PortMissing {
-        node: usize,
-        op: &'static str,
-        port: Port,
-    },
     PortKind {
         node: usize,
         op: &'static str,
@@ -205,6 +208,7 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
     let mut matched = vec![false; len];
     let mut folded: Vec<Option<(usize, &'static str)>> = vec![None; len];
     let (mut ins, mut outs, mut pairs) = (Vec::new(), Vec::new(), Vec::new());
+    let mut named = Vec::new();
     let mut seen = HashSet::new();
 
     for (j, node) in trace.nodes.iter().enumerate() {
@@ -297,15 +301,10 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
             }
         }
 
-        for &(port, want) in expect(&node.op) {
-            let id = match port {
-                Port::In(i) => ins.get(i),
-                Port::Out(i) => outs.get(i),
-            };
-            let Some(&id) = id else {
-                faults.push(Fault::PortMissing { node: j, op, port });
-                continue;
-            };
+        named.clear();
+        node.op.ports(&mut named);
+        let ports = named.iter().map(|&(name, id, want)| (Port(name), id, want));
+        for (port, id, want) in ports {
             if !in_range(id) {
                 continue;
             }
@@ -340,7 +339,7 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
             }
         }
 
-        if let Operation::Elementwise(Elementwise::Hadamard {
+        if let Operation::Elemwise(Elemwise::Hadamard {
             x, block, signs, ..
         }) = &node.op
         {
@@ -609,453 +608,6 @@ fn intact(
     }
 }
 
-fn expect(op: &Operation) -> &'static [(Port, Expect)] {
-    use Port::{In, Out};
-
-    const I32: Expect = Expect::Tensor(Dtype::I32);
-    const F32: Expect = Expect::Tensor(Dtype::F32);
-    const U8: Expect = Expect::Tensor(Dtype::U8);
-    const CACHE: Expect = Expect::Cache;
-    const DECODE_PLAN: Expect = Expect::Struct(&[StructKind::AttnDecodePlan]);
-    const PREFILL_PLAN: Expect = Expect::Struct(&[StructKind::AttnPrefillPlan]);
-    const MLA_PLAN: Expect = Expect::Struct(&[StructKind::MlaPlan]);
-
-    match op {
-        Operation::Attention(op) => match op {
-            Attention::PlanDecode { .. } | Attention::PlanPrefill { .. } => {
-                &[(In(0), I32), (In(1), I32), (In(2), I32), (In(3), I32)]
-            }
-            Attention::Decode { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE)],
-            Attention::Prefill { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE)],
-            Attention::Masked { .. } => &[(In(1), PREFILL_PLAN), (In(3), CACHE)],
-            Attention::MaskedLse { .. } => &[(In(1), PREFILL_PLAN), (In(3), CACHE), (Out(1), F32)],
-            Attention::Dense { .. } => &[(In(3), I32)],
-            Attention::Ragged {
-                mask: RaggedMask::ReferenceSelfOnly { .. },
-                ..
-            } => &[(In(3), I32), (In(4), I32), (In(5), I32), (In(6), I32)],
-            Attention::Ragged {
-                mask: RaggedMask::RelativeBias { .. },
-                ..
-            } => &[(In(3), I32), (In(4), I32), (In(5), F32)],
-            Attention::Ragged { .. } => &[(In(3), I32), (In(4), I32)],
-            Attention::DecodeLse { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)],
-            Attention::PrefillLse { floor: Some(_), .. } => &[
-                (In(1), PREFILL_PLAN),
-                (In(2), CACHE),
-                (In(3), I32),
-                (Out(1), F32),
-            ],
-            Attention::PrefillLse { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE), (Out(1), F32)],
-            Attention::DecodeSelected { .. } => {
-                &[(In(1), DECODE_PLAN), (In(2), I32), (In(3), CACHE)]
-            }
-            Attention::PrefillSelected { .. } => {
-                &[(In(1), PREFILL_PLAN), (In(2), I32), (In(3), CACHE)]
-            }
-            Attention::DecodeRel { .. } => &[(In(1), DECODE_PLAN), (In(2), CACHE), (In(3), F32)],
-            Attention::PrefillRel { .. } => &[(In(1), PREFILL_PLAN), (In(2), CACHE), (In(3), F32)],
-            Attention::Sink { .. } => &[(In(1), F32)],
-            Attention::MergeLse { .. } => &[(In(1), F32), (In(3), F32), (Out(1), F32)],
-            Attention::LogitSoftcap { .. } => &[],
-            Attention::KvAppend { .. } => &[(In(2), CACHE), (In(3), I32), (In(4), I32)],
-            Attention::KvAppendShared { .. } => &[(In(1), CACHE), (In(2), I32), (In(3), I32)],
-            Attention::MlaPlan { .. } => &[(In(0), I32), (In(1), I32), (In(2), I32), (In(3), I32)],
-            Attention::MlaLatents { .. }
-            | Attention::MlaSplitQB { .. }
-            | Attention::MlaAbsorbQ { .. }
-            | Attention::MlaAbsorbOut { .. } => &[],
-            Attention::MlaLatentsRope { .. } => &[(In(1), I32)],
-            Attention::MlaKvAppend { .. } => &[(In(2), CACHE), (In(3), I32), (In(4), I32)],
-            Attention::MlaDecode { lse: Some(_), .. }
-            | Attention::MlaPrefill { lse: Some(_), .. } => {
-                &[(In(1), MLA_PLAN), (In(3), CACHE), (Out(1), F32)]
-            }
-            Attention::MlaDecode { .. } | Attention::MlaPrefill { .. } => {
-                &[(In(1), MLA_PLAN), (In(3), CACHE)]
-            }
-            Attention::MlaDecodeSelected { lse: Some(_), .. }
-            | Attention::MlaPrefillSelected { lse: Some(_), .. } => &[
-                (In(1), MLA_PLAN),
-                (In(3), I32),
-                (In(4), CACHE),
-                (Out(1), F32),
-            ],
-            Attention::MlaDecodeSelected { .. } | Attention::MlaPrefillSelected { .. } => {
-                &[(In(1), MLA_PLAN), (In(3), I32), (In(4), CACHE)]
-            }
-            Attention::SsmCausalConv1d { .. }
-            | Attention::SsmCausalConv1dChunked { .. }
-            | Attention::ShortConv { .. }
-            | Attention::ShortConvChunked { .. } => &[(In(2), CACHE)],
-            Attention::BlockDynConv { .. } => &[],
-            Attention::SelectorWalk { .. } => &[(In(0), I32), (In(1), F32), (Out(0), I32)],
-            Attention::SsmGdnPrep { .. } => &[(Out(0), F32)],
-            Attention::SsmGatedDelta { .. } | Attention::SsmGatedDeltaChunked { .. } => {
-                &[(In(3), CACHE)]
-            }
-            Attention::SsmKdaStep { .. } | Attention::SsmKdaChunked { .. } => &[(In(5), CACHE)],
-            Attention::SsmMamba2 { .. } => &[(In(7), CACHE)],
-            Attention::IndexLayernormRope { .. } | Attention::IndexRope { .. } => &[(In(1), I32)],
-            Attention::IndexTopk { .. } => &[(In(1), CACHE), (Out(0), I32)],
-            Attention::IndexKvAppend { .. } => &[(In(1), CACHE), (In(2), I32), (In(3), I32)],
-            Attention::IndexBlockMean { .. } => &[(In(0), I32), (In(1), I32), (In(2), CACHE)],
-            Attention::PoolBoundaryDecode { .. } | Attention::PoolBoundaryPrefill { .. } => &[
-                (In(0), I32),
-                (In(1), U8),
-                (Out(0), I32),
-                (Out(1), I32),
-                (Out(2), I32),
-            ],
-            Attention::PoolStateWrite { .. } => &[(In(2), CACHE), (In(3), I32), (In(4), I32)],
-            Attention::PoolGather { ape: None, .. } => {
-                &[(In(0), I32), (In(1), I32), (In(2), CACHE)]
-            }
-            Attention::PoolGather { ape: Some(_), .. } => {
-                &[(In(0), I32), (In(1), I32), (In(2), CACHE), (In(3), F32)]
-            }
-            Attention::PoolKvAppend { .. } => &[
-                (In(1), I32),
-                (In(2), I32),
-                (In(3), CACHE),
-                (In(4), I32),
-                (In(5), I32),
-            ],
-            Attention::PoolLse { .. } => {
-                &[(In(1), I32), (In(2), I32), (In(3), CACHE), (Out(1), F32)]
-            }
-            Attention::PoolLseSelected { .. } => &[
-                (In(1), I32),
-                (In(2), I32),
-                (In(3), I32),
-                (In(4), CACHE),
-                (Out(1), F32),
-            ],
-            Attention::PleNgramIds { .. } | Attention::PleNgramIdsChunked { .. } => {
-                &[(In(0), I32), (In(1), CACHE), (Out(0), I32)]
-            }
-            Attention::ReplayFloor { .. } => &[(In(0), I32), (In(1), CACHE), (Out(0), I32)],
-            Attention::KvEnds { .. } => &[(In(0), I32), (In(1), CACHE), (Out(0), I32)],
-            Attention::WindowSink { .. } => &[(In(1), I32), (In(2), I32), (In(3), CACHE)],
-            Attention::MarkovWalk { .. } => {
-                &[(In(1), I32), (In(2), I32), (In(3), I32), (Out(1), I32)]
-            }
-        },
-        Operation::Linear(op) => match op {
-            Linear::MoeTopkSoftmax { .. }
-            | Linear::MoeTopkSoftmaxScaled { .. }
-            | Linear::MoeTopkSigmoid { .. }
-            | Linear::MoeTopkSigmoidSink { .. }
-            | Linear::MoeTopkSqrtSoftplus { .. }
-            | Linear::MoePredictRoute { .. } => &[(Out(0), I32), (Out(1), F32)],
-            Linear::RelBias { .. } => &[(Out(0), F32)],
-            Linear::MoeHashRoute { .. } => &[(In(0), I32), (Out(0), I32), (Out(1), F32)],
-            Linear::GroupRoutes { .. } => &[(Out(0), I32)],
-            Linear::MatmulGrouped { .. } => &[(In(2), I32)],
-            Linear::MoeMatmulSelect { .. } => &[(In(2), I32)],
-            Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32)],
-            Linear::MoeMatmulSelectQuant { .. } => &[(In(2), I32)],
-            Linear::MoeMatmulSelectActQuant {
-                input_scales: Some(_),
-                ..
-            } => &[(In(2), I32), (In(3), F32)],
-            Linear::MoeMatmulSelectActQuant { .. } => &[(In(2), I32)],
-            Linear::MatmulActQuant {
-                input_scales: Some(_),
-                ..
-            } => &[(In(2), F32)],
-            Linear::MoeWeightedSum { .. } => &[(In(1), F32)],
-            Linear::MlpSwigluClampSplitRouted { .. } => &[(In(2), F32)],
-            Linear::MlpSwigluClampRouted { .. } => &[(In(1), F32)],
-            Linear::MoeBiasSum { .. } => &[(In(2), I32), (In(3), F32)],
-            Linear::LoraCorrect { .. } => &[(In(3), I32)],
-            Linear::Matmul { .. }
-            | Linear::MatmulActQuant { .. }
-            | Linear::LmHead { .. }
-            | Linear::MlpSwiglu { .. }
-            | Linear::MlpSwigluClamp { .. }
-            | Linear::MlpSwigluClampAlpha { .. }
-            | Linear::MlpSwigluClampSplit { .. }
-            | Linear::MoeSumAdd { .. }
-            | Linear::MlpGegluTanh { .. }
-            | Linear::MlpGeluTanh { .. }
-            | Linear::MlpRelu2 { .. }
-            | Linear::MlpGegluTanhPacked { .. }
-            | Linear::MlpSitu { .. }
-            | Linear::MoeSigmoidGateAdd { .. } => &[],
-        },
-        Operation::Elementwise(op) => match op {
-            Elementwise::RopeFull { .. }
-            | Elementwise::RopePartial { .. }
-            | Elementwise::RopeMrope { .. }
-            | Elementwise::RopeYarn { .. } => &[(In(2), I32)],
-            Elementwise::RopePartialQ { .. } | Elementwise::RopePartialLast { .. } => {
-                &[(In(1), I32)]
-            }
-            Elementwise::RopeAxes { .. } => &[(In(1), F32)],
-            Elementwise::Modulate {
-                lane_of_row: Some(_),
-                ..
-            } => &[(In(2), I32)],
-            Elementwise::GatedResidualAdd {
-                lane_of_row: Some(_),
-                ..
-            } => &[(In(3), I32)],
-            Elementwise::Sinusoid { .. } => &[(In(0), F32), (Out(0), F32)],
-            Elementwise::RelativeBucketBias { .. } => &[(Out(0), F32)],
-            Elementwise::HcRmsnormF32 { .. } => &[(Out(0), F32)],
-            Elementwise::HcProject { .. } => &[(In(0), F32), (In(1), F32), (Out(0), F32)],
-            Elementwise::HcGates { .. } => &[(In(0), F32), (Out(1), F32), (Out(2), F32)],
-            Elementwise::HcCollapse { .. } => &[(In(0), F32), (In(2), F32), (In(3), F32)],
-            Elementwise::Rmsnorm { .. }
-            | Elementwise::RmsnormPerHead { .. }
-            | Elementwise::RmsnormPlusOne { .. }
-            | Elementwise::RmsnormPerHeadPlusOne { .. }
-            | Elementwise::RmsnormNoScale { .. }
-            | Elementwise::NormGate { .. }
-            | Elementwise::LayernormNoScale { .. }
-            | Elementwise::Layernorm { .. }
-            | Elementwise::Clamp { .. }
-            | Elementwise::ClampLearned { .. }
-            | Elementwise::RmsnormGated { .. }
-            | Elementwise::RmsnormGatedBy { .. }
-            | Elementwise::ResidualAdd { .. }
-            | Elementwise::AddBias { .. }
-            | Elementwise::Standardize { .. }
-            | Elementwise::MulScalar { .. }
-            | Elementwise::Scale { .. }
-            | Elementwise::ResBlend { .. }
-            | Elementwise::GateSigmoidMul { .. }
-            | Elementwise::GateSigmoidMulHeads { .. }
-            | Elementwise::HcExpand { .. }
-            | Elementwise::HcFold { .. }
-            | Elementwise::RmsnormGroupedPlusOne { .. }
-            | Elementwise::SiluScaled { .. }
-            | Elementwise::HcMix { .. }
-            | Elementwise::HcInject { .. }
-            | Elementwise::PleGate { .. }
-            | Elementwise::Modulate {
-                lane_of_row: None, ..
-            }
-            | Elementwise::GatedResidualAdd {
-                lane_of_row: None, ..
-            }
-            | Elementwise::Silu { .. }
-            | Elementwise::Gelu { .. }
-            | Elementwise::Tanh { .. }
-            | Elementwise::Hadamard { .. }
-            | Elementwise::Mul { .. }
-            | Elementwise::Add { .. } => &[],
-        },
-        Operation::Layout(op) => match op {
-            Layout::Embed { .. } | Layout::EmbedConcat { .. } => &[(In(0), I32)],
-            Layout::GatherRows { .. } => &[(In(1), I32)],
-            Layout::EmbedWeighted { .. } => &[(In(0), I32), (In(1), F32)],
-            Layout::ScatterRows { .. } | Layout::ScatterLiveRows { .. } => &[(In(1), I32)],
-            Layout::SplitQkv { .. }
-            | Layout::SplitQkvPadded { .. }
-            | Layout::SplitQGate { .. }
-            | Layout::SplitRows { .. }
-            | Layout::Select { .. }
-            | Layout::PoolRows { .. }
-            | Layout::MergeRows { .. }
-            | Layout::Argmax { .. } => &[],
-            Layout::TopK { .. } => &[(Out(0), F32), (Out(1), I32)],
-            Layout::PackRows { .. } | Layout::UnpackRows { .. } => &[(In(1), I32)],
-            Layout::Pixels { .. } => &[(In(0), U8)],
-            Layout::ConcatCols { .. } => &[],
-            Layout::GridTaps { .. } => &[
-                (In(0), I32),
-                (In(1), I32),
-                (In(2), I32),
-                (Out(0), I32),
-                (Out(1), F32),
-            ],
-        },
-        Operation::Fused(op) => match op {
-            Fused::NormModulate {
-                lane_of_row: Some(_),
-                ..
-            } => &[(In(2), I32)],
-            Fused::GatedResidualNormModulate {
-                lane_of_row: Some(_),
-                ..
-            } => &[(In(4), I32)],
-            Fused::RmsnormRopePartialQ { .. } => &[(In(2), I32)],
-            Fused::HcNormProject { .. } => &[(In(1), F32), (Out(0), F32)],
-            Fused::QGateNormRopeAppend { .. } => {
-                &[(In(4), I32), (In(6), CACHE), (In(7), I32), (In(8), I32)]
-            }
-            Fused::GdnStep { .. } => {
-                &[(In(2), CACHE), (In(6), CACHE), (Out(3), F32), (Out(4), F32)]
-            }
-            Fused::NormRopeLast { .. } => &[(In(1), I32)],
-            Fused::IndexTopkRope { .. } => &[(In(1), I32), (In(2), CACHE), (Out(1), I32)],
-            // q's rows and positions, then the plane's rows, weight,
-            // positions, cache and write tables.
-            Fused::NormRopePair { .. } => &[
-                (In(1), I32),
-                (In(4), I32),
-                (In(5), CACHE),
-                (In(6), I32),
-                (In(7), I32),
-            ],
-            Fused::PoolCompress { .. } => &[
-                (In(0), I32),
-                (In(1), I32),
-                (In(2), CACHE),
-                (In(4), I32),
-                (In(5), CACHE),
-                (In(6), I32),
-                (In(7), I32),
-            ],
-            Fused::NormRopeLastAppend { .. } => {
-                &[(In(2), I32), (In(3), CACHE), (In(4), I32), (In(5), I32)]
-            }
-            Fused::EmbedScaleAdd { .. } | Fused::EmbedScaleAddSelect { .. } => &[(In(0), I32)],
-            Fused::QkvFusedQknormRopeVnormWrite { .. } | Fused::SplitQkvFused { .. } => {
-                &[(In(1), CACHE), (In(2), I32), (In(3), I32)]
-            }
-            Fused::RopeYarnAppend { .. } => {
-                &[(In(3), I32), (In(4), CACHE), (In(5), I32), (In(6), I32)]
-            }
-            Fused::SplitRopeYarnAppend { .. } => {
-                &[(In(1), I32), (In(2), CACHE), (In(3), I32), (In(4), I32)]
-            }
-            Fused::QgQknormRopeAppend { .. } => {
-                &[(In(3), I32), (In(6), CACHE), (In(7), I32), (In(8), I32)]
-            }
-            // The window's plan and cache (inputs 1, 2), the pool's from input
-            // 4 (5 under a floored window, whose floor is input 3), and the
-            // three f32 log-sum-exp planes (outputs 1, 3, 5).
-            Fused::PoolAttention { window, pool, .. }
-                if matches!(**window, Attention::PrefillLse { floor: Some(_), .. }) =>
-            {
-                match **pool {
-                    Attention::PoolLseSelected { .. } => &[
-                        (In(1), PREFILL_PLAN),
-                        (In(2), CACHE),
-                        (In(3), I32),
-                        (In(5), I32),
-                        (In(6), I32),
-                        (In(7), I32),
-                        (In(8), CACHE),
-                        (Out(1), F32),
-                        (Out(3), F32),
-                        (Out(5), F32),
-                    ],
-                    _ => &[
-                        (In(1), PREFILL_PLAN),
-                        (In(2), CACHE),
-                        (In(3), I32),
-                        (In(5), I32),
-                        (In(6), I32),
-                        (In(7), CACHE),
-                        (Out(1), F32),
-                        (Out(3), F32),
-                        (Out(5), F32),
-                    ],
-                }
-            }
-            Fused::PoolAttention { pool, .. } => match **pool {
-                Attention::PoolLseSelected { .. } => &[
-                    (In(1), PREFILL_PLAN),
-                    (In(2), CACHE),
-                    (In(4), I32),
-                    (In(5), I32),
-                    (In(6), I32),
-                    (In(7), CACHE),
-                    (Out(1), F32),
-                    (Out(3), F32),
-                    (Out(5), F32),
-                ],
-                _ => &[
-                    (In(1), PREFILL_PLAN),
-                    (In(2), CACHE),
-                    (In(4), I32),
-                    (In(5), I32),
-                    (In(6), CACHE),
-                    (Out(1), F32),
-                    (Out(3), F32),
-                    (Out(5), F32),
-                ],
-            },
-            // The plane, then the normed rows and the mixes.
-            Fused::HcPrenormProject { .. } => &[(In(1), F32), (Out(0), F32), (Out(1), F32)],
-            // The gates' mixes, then their post and combine mixes.
-            Fused::HcGatesNorm { .. } => &[(In(0), F32), (Out(1), F32), (Out(2), F32)],
-            Fused::ResBlendRmsnorm { .. } => &[],
-            // The plane, then the normed streams, the mixes and the post and
-            // combine mixes.
-            Fused::HcPre { .. } => &[
-                (In(1), F32),
-                (Out(0), F32),
-                (Out(1), F32),
-                (Out(3), F32),
-                (Out(4), F32),
-            ],
-            // `kv_b` (input 1), the plan, then the cache: after the rope
-            // half where the rows come apart.
-            Fused::MlaPrefillExpanded { split: Some(_), .. } => {
-                &[(In(2), MLA_PLAN), (In(3), CACHE)]
-            }
-            Fused::MlaPrefillExpanded { split: None, .. } => &[(In(2), MLA_PLAN), (In(4), CACHE)],
-            // The attention's own, and the sink's f32 log-sum-exp is its.
-            Fused::LseSink { attn, .. } => match **attn {
-                Attention::DecodeLse { .. } => {
-                    &[(In(1), DECODE_PLAN), (In(2), CACHE), (Out(1), F32)]
-                }
-                Attention::PrefillLse { .. } => {
-                    &[(In(1), PREFILL_PLAN), (In(2), CACHE), (Out(1), F32)]
-                }
-                _ => &[],
-            },
-            Fused::ResidualAddRmsnorm { .. }
-            | Fused::RmsnormResidualAdd { .. }
-            | Fused::NormModulate {
-                lane_of_row: None, ..
-            }
-            | Fused::GatedResidualNormModulate {
-                lane_of_row: None, ..
-            }
-            | Fused::MatmulGeglu { .. }
-            | Fused::MatmulSwiglu { .. }
-            | Fused::MlpSwiglu { .. }
-            | Fused::LmHeadSoftcap { .. }
-            | Fused::MatmulBias { .. }
-            | Fused::MatmulSplitRows { .. } => &[],
-            // The select's own: its routes are i32.
-            Fused::MoeSelectGlu { select, .. } => match select.as_ref() {
-                Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32)],
-                _ => &[(In(2), I32)],
-            },
-            // The select's routes, then the sum's weights.
-            Fused::MoeExperts { select, .. } => match select.as_ref() {
-                Linear::MoeMatmulSelectBias { .. } => &[(In(3), I32), (In(4), F32)],
-                Linear::MoeMatmulSelectActQuant {
-                    input_scales: Some(_),
-                    ..
-                } => &[(In(2), I32), (In(3), F32), (In(4), F32)],
-                _ => &[(In(2), I32), (In(3), F32)],
-            },
-        },
-        Operation::Collective(_) => &[],
-        Operation::Spatial(op) => match op {
-            Spatial::Grid { .. } => &[(In(0), I32), (Out(0), I32)],
-            Spatial::Conv3d { .. } => &[(In(1), I32)],
-            Spatial::GroupNorm { .. } => &[(In(1), I32), (In(2), F32), (In(3), F32)],
-            Spatial::Attention { .. } => &[(In(3), I32)],
-            Spatial::UpsampleNearest { .. }
-            | Spatial::PixelShuffle { .. }
-            | Spatial::PixelUnshuffle { .. }
-            | Spatial::AvgDown { .. }
-            | Spatial::Patchify { .. }
-            | Spatial::Unpatchify { .. } => &[(In(1), I32), (In(2), I32)],
-            Spatial::CacheStore { .. } => &[(In(1), I32)],
-        },
-    }
-}
-
 impl DefKind {
     fn of(def: &Def) -> Self {
         match def {
@@ -1128,10 +680,7 @@ impl Display for D {
 
 impl Display for Port {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            Port::In(i) => write!(f, "input {i}"),
-            Port::Out(i) => write!(f, "output {i}"),
-        }
+        write!(f, "`{}`", self.0)
     }
 }
 
@@ -1357,12 +906,6 @@ impl Display for Fault {
                     V(*arm),
                     T(arm_ty),
                     T(merge_ty)
-                )
-            }
-            Fault::PortMissing { node, op, port } => {
-                write!(
-                    f,
-                    "node {node} ({op}): the port table expects {port}, but the op's Operands impl does not produce it — the hand-written impl and the table have drifted"
                 )
             }
             Fault::PortKind {

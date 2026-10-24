@@ -80,3 +80,6 @@ serde_json = "1"
 ztensor = { workspace = true }
 ztensor-compat = { workspace = true }
 eta-dsl = { package = "pie-eta-dsl", path = "../eta-dsl" }
+
+[lints]
+workspace = true

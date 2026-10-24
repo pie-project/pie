@@ -2,6 +2,7 @@
 //! growing size, on one PE and on several, timed by
 //! `PIE_CEREBRAS_TRACE_PHASES` (run with `--nocapture`). The assertion only
 //! checks the results; the timings are the point.
+#![allow(unsafe_code)]
 
 use engine_cerebras::bench::{Bench, assert_close};
 use kernels_cerebras::elemwise::norm;

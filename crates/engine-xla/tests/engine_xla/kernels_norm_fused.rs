@@ -51,10 +51,63 @@ fn the_qwen_path_norms_answer_the_host() {
     let y4 = b.zeros(Dtype::Bf16, r, w);
     if !b
         .run(|ctx| {
-            norm::rmsnorm_plus_one(ctx, x, wt, 1e-6, y1)?;
-            norm::rmsnorm_gated(ctx, a, z, g, vd as u32, 1e-6, false, y2)?;
-            norm::rmsnorm_gated(ctx, a, z, g, vd as u32, 1e-6, true, y3)?;
-            norm::rmsnorm_gated_by(ctx, a, z, g, (width / vd) as u32, 1e-6, y4)
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let weight_v = l.read(wt)?;
+                let o_y = y1;
+                let v = norm::rmsnorm_plus_one(l.f(), x_v, weight_v, 1e-6)?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(a)?;
+                let gate_v = l.read(z)?;
+                let weight_v = l.read(g)?;
+                let o_y = y2;
+                let v = norm::rmsnorm_gated(
+                    l.f(),
+                    x_v,
+                    gate_v,
+                    weight_v,
+                    vd as u32,
+                    1e-6,
+                    false,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(a)?;
+                let gate_v = l.read(z)?;
+                let weight_v = l.read(g)?;
+                let o_y = y3;
+                let v = norm::rmsnorm_gated(
+                    l.f(),
+                    x_v,
+                    gate_v,
+                    weight_v,
+                    vd as u32,
+                    1e-6,
+                    true,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(a)?;
+                let gate_v = l.read(z)?;
+                let weight_v = l.read(g)?;
+                let o_y = y4;
+                let v = norm::rmsnorm_gated_by(
+                    l.f(),
+                    x_v,
+                    gate_v,
+                    weight_v,
+                    (width / vd) as u32,
+                    1e-6,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            })
         })
         .unwrap()
     {
@@ -94,7 +147,14 @@ fn layernorm_without_scale_answers_the_host() {
     let x = b.bf16(r, w, &xs);
     let ln = b.zeros(Dtype::Bf16, r, w);
     if !b
-        .run(|ctx| norm::layernorm_no_scale(ctx, x, 1e-5, ln))
+        .run(|ctx| {
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let o_y = ln;
+                let v = norm::layernorm_no_scale(l.f(), x_v, 1e-5, o_y.landing())?;
+                l.land(o_y, v)
+            })
+        })
         .unwrap()
     {
         return;
@@ -132,7 +192,28 @@ fn res_blend_softmaxes_over_blocks_and_prefix() {
     let pt = b.bf16(1, h, &pw);
     let y = b.zeros(Dtype::Bf16, r, h);
     if !b
-        .run(|ctx| norm::res_blend(ctx, p, &bs, nt, 1e-6, pt, y))
+        .run(|ctx| {
+            engine_xla::lower::lower(ctx, |l| {
+                let blocks_v = bs
+                    .iter()
+                    .map(|t| l.read(*t))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let prefix_v = l.read(p)?;
+                let weight_v = l.read(nt)?;
+                let proj_v = l.read(pt)?;
+                let o_y = y;
+                let v = norm::res_blend(
+                    l.f(),
+                    prefix_v,
+                    &blocks_v,
+                    weight_v,
+                    1e-6,
+                    proj_v,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            })
+        })
         .unwrap()
     {
         return;
@@ -184,15 +265,68 @@ fn the_remaining_norm_entries_answer_the_host() {
     let s = b.bf16(1, 1, &[1.5]);
     if !b
         .run(|ctx| {
-            norm::rmsnorm_per_head(ctx, x, ht, head as u32, 1e-6, per_head)?;
-            norm::rmsnorm_grouped_plus_one(ctx, x, wt, group as u32, 1e-6, grouped)?;
-            norm::rmsnorm_no_scale(ctx, x, head as u32, 1e-6, no_scale)?;
-            norm::layernorm(ctx, x, wt, bt, 1e-5, ln)?;
-            norm::add_bias(ctx, bt, biased)?;
-            norm::standardize(ctx, bt, wt, std)?;
-            norm::mul_scalar(ctx, 0.3, ms)?;
-            norm::silu_scaled(ctx, 1.7, ss)?;
-            norm::scale(ctx, s, sc)
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let weight_v = l.read(ht)?;
+                let o_y = per_head;
+                let v = norm::rmsnorm_per_head(l.f(), x_v, weight_v, head as u32, 1e-6)?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let weight_v = l.read(wt)?;
+                let o_y = grouped;
+                let v = norm::rmsnorm_grouped_plus_one(l.f(), x_v, weight_v, group as u32, 1e-6)?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let o_y = no_scale;
+                let v = norm::rmsnorm_no_scale(l.f(), x_v, head as u32, 1e-6)?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(x)?;
+                let weight_v = l.read(wt)?;
+                let bias_v = l.read(bt)?;
+                let o_y = ln;
+                let v = norm::layernorm(l.f(), x_v, weight_v, bias_v, 1e-5)?;
+                l.land(o_y, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let bias_v = l.read(bt)?;
+                let out_v = l.read(biased)?;
+                let o_out = biased;
+                let v = norm::add_bias(l.f(), bias_v, out_v)?;
+                l.land(o_out, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let bias_v = l.read(bt)?;
+                let scale_v = l.read(wt)?;
+                let out_v = l.read(std)?;
+                let o_out = std;
+                let v = norm::standardize(l.f(), bias_v, scale_v, out_v)?;
+                l.land(o_out, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(ms)?;
+                let o_x = ms;
+                let v = norm::mul_scalar(l.f(), 0.3, x_v)?;
+                l.land(o_x, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(ss)?;
+                let o_x = ss;
+                let v = norm::silu_scaled(l.f(), 1.7, x_v)?;
+                l.land(o_x, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let s_v = l.read(s)?;
+                let x_v = l.read(sc)?;
+                let o_x = sc;
+                let v = norm::scale(l.f(), s_v, x_v)?;
+                l.land(o_x, v)
+            })
         })
         .unwrap()
     {

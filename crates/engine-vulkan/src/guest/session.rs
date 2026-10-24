@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::sync::Arc;
 
 use ash::vk;
@@ -43,14 +44,14 @@ fn desc_words(d: &ValueDesc) -> [u32; DESC_WORDS] {
     out
 }
 
-fn as_bytes<T: Copy>(items: &[T]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(size_of_val(items));
-    for item in items {
-        out.extend_from_slice(unsafe {
-            std::slice::from_raw_parts((item as *const T).cast::<u8>(), size_of::<T>())
-        });
+fn words_le(words: &[u32]) -> Vec<u8> {
+    words.iter().flat_map(|word| word.to_le_bytes()).collect()
+}
+
+impl Cfg {
+    fn to_le_bytes(self) -> Vec<u8> {
+        words_le(&[self.value_count, self.temporary, self.op_count, self.lane])
     }
-    out
 }
 
 /// A stage's pipelines, which follow from its SPIR-V alone: built once per
@@ -66,6 +67,9 @@ pub struct Built {
 impl Drop for Built {
     fn drop(&mut self) {
         let d = &self.core.device;
+        // SAFETY: the last `Arc<Built>` is gone with the last session that ran
+        // it; each session settles its frames before it drops, so no pending
+        // command uses these pipelines or layouts.
         unsafe {
             for &pipeline in &self.pipelines {
                 d.destroy_pipeline(pipeline, None);
@@ -189,6 +193,8 @@ impl Session {
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(stages.len() as u32),
         ];
+        // SAFETY: `core.device` is live and the create info and `sizes` outlive
+        // the call.
         let pool = unsafe {
             core.device
                 .create_descriptor_pool(
@@ -216,6 +222,9 @@ impl Session {
     fn bind_sets(&mut self) -> Result<()> {
         let d = &self.core.device;
         for at in 0..self.stages.len() {
+            // SAFETY: `&mut self` owns the pool, so its external sync holds;
+            // it was sized for one set per stage and this runs once, at
+            // construction. The layout is the stage's live set layout.
             let set = unsafe {
                 let layouts = [self.stages[at].built.set_layout];
                 d.allocate_descriptor_sets(
@@ -255,6 +264,10 @@ impl Session {
                         .buffer_info(info)
                 })
                 .collect();
+            // SAFETY: `set` was just allocated and no command uses it yet; each
+            // write names a live buffer of this session over its whole length,
+            // with the descriptor type its layout binding declares, and the
+            // `infos` it points into outlive the call.
             unsafe { d.update_descriptor_sets(&writes, &[]) };
             self.stages[at].set = set;
         }
@@ -377,11 +390,7 @@ impl Session {
     /// one is recorded.
     pub fn lend_landing(&mut self, device: &Context, stage: usize) -> Result<Buffer> {
         let bytes = self.stages[stage].landing.bytes();
-        let spare = self
-            .landings
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pop();
+        let spare = self.landings.lock().expect("landings lock poisoned").pop();
         match spare {
             Some(buffer) if buffer.bytes() >= bytes => Ok(buffer),
             _ => Buffer::with(device, bytes, Memory::Host),
@@ -482,6 +491,10 @@ impl Session {
             why: format!("stage {at} is past this package's {}", self.stages.len()),
         })?;
         let d = &self.core.device;
+        // SAFETY: `cmd` is the open frame's buffer, recorded only on this
+        // thread (`Frame` is not `Sync`). The set, layout and pipelines are
+        // this session's own and stay alive until it settles the frame; the
+        // set was written once at construction and matches the layout.
         unsafe {
             let cmd = frame.cmd();
 
@@ -562,6 +575,9 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         let _ = self.settle();
+        // SAFETY: `settle` waited every frame this session sent out, so no
+        // pending command uses its descriptor sets; destroying the pool frees
+        // them with it.
         unsafe {
             let d = &self.core.device;
             d.destroy_descriptor_pool(self.pool, None);
@@ -612,7 +628,7 @@ fn build_stage(
 
     let desc_bytes: Vec<u8> = descriptors
         .iter()
-        .flat_map(|d| as_bytes(&desc_words(d)))
+        .flat_map(|d| words_le(&desc_words(d)))
         .collect();
     let offset_words: Vec<u32> = scratch
         .values
@@ -640,16 +656,17 @@ fn build_stage(
     let mut descs = Buffer::zeroed(device, desc_bytes.len().max(DESC_WORDS * 4) as u64)?;
     descs.write(0, &desc_bytes)?;
     let mut offs = Buffer::zeroed(device, (offset_words.len().max(1) * 4) as u64)?;
-    offs.write(0, &as_bytes(&offset_words))?;
+    offs.write(0, &words_le(&offset_words))?;
     let mut params = Buffer::zeroed(
         device,
         (records.len().max(1) * size_of::<OpParams>()) as u64,
     )?;
     if !records.is_empty() {
-        params.write(0, &as_bytes(&records))?;
+        let record_bytes: Vec<u8> = records.iter().flat_map(OpParams::to_le_bytes).collect();
+        params.write(0, &record_bytes)?;
     }
     let mut cfg = Buffer::with(device, size_of::<Cfg>() as u64, Memory::Host)?;
-    cfg.write(0, &as_bytes(&[config]))?;
+    cfg.write(0, &config.to_le_bytes())?;
 
     let bytes = scratch.total.max(256);
     let heap = Buffer::zeroed(device, bytes)?;
@@ -693,6 +710,11 @@ fn build_pipelines(device: &Context, lowered: &crate::guest::Lowered) -> Result<
         })
         .collect();
     let d = &core.device;
+    // SAFETY: `d` is live; every create info and the arrays and names it
+    // borrows are locals that outlive their call. `lowered.words` is SPIR-V
+    // the guest compiler emitted for these entry points and bindings. Each
+    // failure path destroys exactly what was made before it, and the module
+    // is destroyed only after the pipelines are built from it.
     unsafe {
         let set_layout = d
             .create_descriptor_set_layout(

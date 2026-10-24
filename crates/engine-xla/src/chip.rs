@@ -138,14 +138,14 @@ pub enum Mxfp4Prescale {
 /// HBM roofline on v6e where `[N, K]` reaches 1.2-1.4 TB/s
 /// (`crate::weights::gemm_only`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "layout.gemm_transpose", flag, default = true, tune = search)]
+#[decision(id = "gather.gemm_transpose", flag, default = true, tune = search)]
 pub struct GemmTranspose;
 
 /// Whether gather-only sub-byte tables land folded, so a gather does not
 /// relayout the whole table (`crate::weights::gather_only`; gpt-oss's
 /// embedding: 1.75 ms a step as codes, 0.78 ms folded).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "layout.embed_fold", flag, default = true, tune = search)]
+#[decision(id = "gather.embed_fold", flag, default = true, tune = search)]
 pub struct EmbedFold;
 
 /// How far apart the canonical fire shapes sit, in percent: each row,
@@ -189,7 +189,7 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<MixedHostRung>()
         .add::<PageFloor>()
         .add::<PrefillFloor>();
-    poem_compiler::fuse::flags::register(&mut r, &crate::FUSED);
+    poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
     poem_compiler::costs::register(&mut r, 2);
     r
 });

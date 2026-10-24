@@ -2,7 +2,7 @@
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
-use kernels_metal::linear::quant;
+use kernels_metal::linear::qmm;
 use kernels_metal::{Bank, Tensor};
 use poem_ir::Dtype;
 
@@ -99,13 +99,13 @@ fn every_staged_row_answers_an_affine_reference() {
                 };
                 let frame = device.frame().expect("frame");
                 let sink = Sink::new(&device, &frame, &pipelines, &handles);
-                quant::matmul(
+                qmm::matmul(
                     &sink,
                     &tuning,
                     Tensor::new(ha, m, k, Dtype::Bf16),
                     bank,
                     Tensor::new(ho, m, n, Dtype::Bf16),
-                    quant::Scratch {
+                    qmm::Scratch {
                         precast: &precast,
                         partials: &partials,
                         table: None,
@@ -222,13 +222,13 @@ fn the_coop_swiglu_is_the_matmul_then_the_swiglu() {
             );
             let frame = device.frame().expect("frame");
             let sink = Sink::new(&device, &frame, &pipelines, &handles);
-            quant::matmul(
+            qmm::matmul(
                 &sink,
                 &tuning,
                 act,
                 bank,
                 packed,
-                quant::Scratch {
+                qmm::Scratch {
                     precast: &|_, _| None,
                     partials: &|_, _| None,
                     table: None,
@@ -238,7 +238,8 @@ fn the_coop_swiglu_is_the_matmul_then_the_swiglu() {
             .expect("gate and up");
             kernels_metal::linear::mlp::swiglu(&sink, packed, intermediate, two).expect("swiglu");
             assert!(
-                quant::coop_swiglu(&sink, &tuning, act, bank, intermediate, one, 8).expect("fused"),
+                qmm::staged::coop_swiglu(&sink, &tuning, act, bank, intermediate, one, 8)
+                    .expect("fused"),
                 "the fused tile takes K={k} I={intermediate}"
             );
             frame.commit().expect("commit");
@@ -325,12 +326,12 @@ fn the_coop_segments_are_their_matmuls() {
             .iter()
             .map(|&(_, _, w)| upload(&vec![0xa5; (m * w * 2) as usize]))
             .collect();
-        let segments: Vec<quant::Segment> = banks
+        let segments: Vec<qmm::sg::Segment> = banks
             .iter()
             .zip(&planes)
             .zip(&outs)
             .enumerate()
-            .map(|(i, ((&(_, first, w), plane), out))| quant::Segment {
+            .map(|(i, ((&(_, first, w), plane), out))| qmm::sg::Segment {
                 // the two halves of one bank
                 w: if i == 1 { planes[0].0 } else { plane.0 },
                 first,
@@ -340,11 +341,11 @@ fn the_coop_segments_are_their_matmuls() {
             .collect();
         let frame = device.frame().expect("frame");
         let sink = Sink::new(&device, &frame, &pipelines, &handles);
-        quant::coop_segments(&sink, &segments, act, m as i32, k as i32).expect("segments");
+        qmm::staged::coop_segments(&sink, &segments, act, m as i32, k as i32).expect("segments");
         // the 6144-row bank alone, unsplit, for the halves to match
         let whole = upload(&vec![0; (m * 6144 * 2) as usize]);
         let whole_t = Tensor::new(bind(&whole), m, 6144, Dtype::Bf16);
-        quant::coop_matmul(
+        qmm::staged::coop(
             &sink,
             act,
             planes[0].0,

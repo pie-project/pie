@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -11,8 +12,13 @@ pub struct Resolved {
     pub function: sys::Function,
 }
 
+// SAFETY: `module` and `function` are process-wide HIP handles any thread may
+// use, and a `Resolved` is never dropped (it lives in a leaked slot), so
+// neither handle is ever unloaded under a user.
 unsafe impl Send for Resolved {}
 
+// SAFETY: shared access only copies the two handles out; HIP launches one
+// function from several threads at once.
 unsafe impl Sync for Resolved {}
 
 type Slot = OnceLock<Result<Resolved, Fault>>;
@@ -22,7 +28,7 @@ fn slot(key: &str) -> &'static Slot {
     let mut map = SLOTS
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .expect("lock poisoned");
     if let Some(found) = map.get(key) {
         return found;
     }
@@ -35,6 +41,7 @@ fn slot(key: &str) -> &'static Slot {
 pub(crate) fn resolve(root: &Root, instantiation: &str) -> Result<&'static Resolved, Fault> {
     let api = api("hipGetDevice")?;
     let mut ordinal: i32 = 0;
+    // SAFETY: `ordinal` is a live local out-parameter.
     let code = unsafe { (api.hip.hipGetDevice)(&raw mut ordinal) };
     if code != sys::HIP_SUCCESS {
         return Err(Fault::Device {
@@ -94,6 +101,8 @@ fn load(root: &Root, instantiation: &str, key: &str, arch: &str) -> Result<Resol
     let module = load_image(root.name, &image)?;
     let function = entry_by_name(root.name, module, instantiation, &mangled).inspect_err(|_| {
         if let Ok(api) = sys::api() {
+            // SAFETY: `module` was loaded just above and this error drops its
+            // only handle, so it is unloaded once and never used again.
             unsafe { (api.hip.hipModuleUnload)(module) };
         }
     })?;
@@ -122,6 +131,9 @@ fn load_image(root: &'static str, image: &[u8]) -> Result<sys::Module, Fault> {
     let api = api("hipModuleLoadData")?;
     let mut module: sys::Module = std::ptr::null_mut();
 
+    // SAFETY: `image` is a non-empty code object (hiprtc's output, or the bytes
+    // the disk cache stored under this exact key) alive across the call;
+    // `module` is a live out-parameter.
     let code = unsafe { (api.hip.hipModuleLoadData)(&raw mut module, image.as_ptr().cast()) };
     if code == sys::HIP_SUCCESS {
         Ok(module)
@@ -151,6 +163,8 @@ fn entry_by_name(
     let api = api("hipModuleGetFunction")?;
     let mut function: sys::Function = std::ptr::null_mut();
 
+    // SAFETY: `module` is loaded, `c_name` NUL-terminated and alive, and
+    // `function` a live out-parameter.
     let code =
         unsafe { (api.hip.hipModuleGetFunction)(&raw mut function, module, c_name.as_ptr()) };
     match code {
@@ -252,7 +266,7 @@ pub fn arch(ordinal: i32) -> Option<&'static str> {
     let mut map = ARCHES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+        .expect("lock poisoned");
     *map.entry(ordinal).or_insert_with(|| {
         let name = crate::jit::device::arch_name(ordinal)?;
         Some(Box::leak(name.into_boxed_str()))

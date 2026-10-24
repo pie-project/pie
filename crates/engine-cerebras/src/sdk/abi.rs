@@ -4,6 +4,7 @@
 //! libstdc++ 13, `_GLIBCXX_USE_CXX11_ABI=1`) by dumping the objects the SDK's
 //! own pybind module builds, and is checked by the simulator round trip in
 //! `examples/gemv.rs`. Nothing in this file is a public API.
+#![allow(unsafe_code)]
 
 use std::ffi::c_void;
 
@@ -33,6 +34,8 @@ impl CxxString {
             // SAFETY: plain C allocation of len + 1 bytes, filled and NUL-terminated below.
             let p = unsafe { libc::malloc(s.len() + 1) } as *mut u8;
             assert!(!p.is_null(), "malloc failed");
+            // SAFETY: `p` is a fresh, non-null allocation of `len + 1` bytes
+            // that cannot overlap `s`; the copy fills `len` and the NUL the last.
             unsafe {
                 std::ptr::copy_nonoverlapping(s.as_ptr(), p, s.len());
                 *p.add(s.len()) = 0;

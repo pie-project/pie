@@ -1,7 +1,21 @@
+#![allow(unsafe_code)]
 pub mod kv;
 
 use engine::transfer::KvRun;
-use kernels_vulkan::{KvPool, RecurrentPool, Tensor};
+use kernels_slang::{KvPool, Tensor};
+
+/// A layer's recurrent cache: the state bank, each row's slot in it, and the
+/// convolution window before and after the step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RecurrentPool {
+    pub state: Tensor,
+
+    pub slots: Tensor,
+
+    pub conv_state: Tensor,
+
+    pub new_conv_state: Tensor,
+}
 use poem_ir::{CacheRow, Dtype, Trace};
 
 use crate::device::ctx::Frame;

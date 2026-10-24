@@ -192,7 +192,7 @@ pub(crate) fn wave_trace_emit(line: String) {
                 loop {
                     std::thread::sleep(std::time::Duration::from_secs(1));
                     let drained: Vec<String> =
-                        std::mem::take(&mut *LINES.lock().unwrap_or_else(|e| e.into_inner()));
+                        std::mem::take(&mut *LINES.lock().expect("lines lock poisoned"));
                     for line in drained {
                         eprintln!("{line}");
                     }
@@ -202,7 +202,7 @@ pub(crate) fn wave_trace_emit(line: String) {
         on
     });
     if buffered {
-        LINES.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+        LINES.lock().expect("lines lock poisoned").push(line);
     } else {
         eprintln!("{line}");
     }

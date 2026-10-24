@@ -1,0 +1,11 @@
+fn k_silu_s(z: f32) f32 {
+  return z / (1.0 + math.exp_f32(-z));
+}
+// x = silu(s * x) over n elements, in place.
+fn k_silu_scaled(x: [*]f32, n: i32, s: f32) void {
+  var dx = @set_dsd_base_addr(k_base_f32, x);
+  dx = @set_dsd_length(dx, @bitcast(u16, @as(i16, n)));
+  @fmuls(dx, dx, s);
+  @map(k_silu_s, dx, dx);
+}
+

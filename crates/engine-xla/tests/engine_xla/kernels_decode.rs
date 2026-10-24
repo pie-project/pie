@@ -6,10 +6,8 @@
 
 use dtype::Dtype;
 use engine_xla::bench::{Bench, assert_close, round_bf16};
-use kernels_xla::attn::pool;
+use engine_xla::handle::{Bank, KvPool, Tensor};
 use kernels_xla::elemwise::norm;
-use kernels_xla::linear::decode;
-use kernels_xla::{Bank, KvPool, Tensor};
 
 fn hash(i: usize, seed: u32) -> u32 {
     (i as u32)
@@ -133,7 +131,7 @@ fn a_bank_decodes_to_the_plane_its_codes_and_factors_state() {
     let ran = b
         .run(|ctx| {
             for (bank, out, _, _) in &cases {
-                decode::decoded_plane(ctx, "attention.mla_absorb_q", *bank, *out)?;
+                engine_xla::lower::linear::decoded_plane(ctx, "attn.mla_absorb_q", *bank, *out)?;
             }
             Ok(())
         })
@@ -162,9 +160,24 @@ fn mul_scalar_rounds_its_scalar_to_the_row_element() {
     let xh = b.raw(Dtype::F16, rows as u32, width as u32, f16_bytes);
     let ran = b
         .run(|ctx| {
-            norm::mul_scalar(ctx, s, xf)?;
-            norm::mul_scalar(ctx, s, xb)?;
-            norm::mul_scalar(ctx, s, xh)
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(xf)?;
+                let o_x = xf;
+                let v = norm::mul_scalar(l.f(), s, x_v)?;
+                l.land(o_x, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(xb)?;
+                let o_x = xb;
+                let v = norm::mul_scalar(l.f(), s, x_v)?;
+                l.land(o_x, v)
+            })?;
+            engine_xla::lower::lower(ctx, |l| {
+                let x_v = l.read(xh)?;
+                let o_x = xh;
+                let v = norm::mul_scalar(l.f(), s, x_v)?;
+                l.land(o_x, v)
+            })
         })
         .unwrap();
     if !ran {
@@ -221,8 +234,7 @@ fn a_pooled_reader_whose_bound_closes_no_block_reads_nothing() {
     let lse = b.f32(rows as u32, heads as u32, &vec![1.0; rows * heads]);
     let ran = b
         .run(|ctx| {
-            pool::attention_lse(
-                ctx,
+            let call = kernels_xla::attn::pool::attention_lse(
                 q,
                 pos,
                 req,
@@ -233,7 +245,8 @@ fn a_pooled_reader_whose_bound_closes_no_block_reads_nothing() {
                 0.5,
                 o,
                 lse,
-            )
+            )?;
+            engine_xla::lower::attn::pool::lse(ctx, call, pages)
         })
         .unwrap();
     if !ran {

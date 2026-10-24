@@ -66,6 +66,7 @@ enum Command {
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn die_quietly_on_closed_pipe() {
     // SAFETY: setting a signal disposition to SIG_DFL before any threads that
     // could observe a different one. This is the documented workaround for

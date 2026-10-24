@@ -315,8 +315,8 @@ pub struct QgPrologueUntil(pub u32);
 /// their fold and the sinks) lands in one launch at; more run the four
 /// launches. 0 (never) but where a chip's profile says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.dsv4_decode_until", constant(range(0..=65_536)), default = 0, tune = search)]
-pub struct Dsv4DecodeUntil(pub u32);
+#[decision(id = "kernel.sdpa.compressed_decode_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct CompressedDecodeUntil(pub u32);
 
 /// Whether a selected (sparse) attention runs on the tensor cores, a block a
 /// row and kv head, rather than the scalar walk. Off reads every key the
@@ -335,11 +335,11 @@ pub struct SdpaPoolMma;
 
 /// The fewest rows DeepSeek-V4's attention (`attention.pool_attention`: the
 /// window, the pool, their merge and the sinks) runs as one tcgen05 pass,
-/// a block a row (`attn/dsv4_sparse.cuh`, sm_100a: Q in TMEM, whole 64-key
+/// a block a row (`attn/compressed/sparse_sm100.cuh`, sm_100a: Q in TMEM, whole 64-key
 /// tiles, V the tile K brought) rather than its four ops. 0 never does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.dsv4_prefill_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
-pub struct SdpaDsv4PrefillFrom(pub u32);
+#[decision(id = "kernel.sdpa.compressed_prefill_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct SdpaCompressedPrefillFrom(pub u32);
 
 /// Whether DeepSeek-V4.1's Causal Encoder-Decoder prefills by bounded
 /// replay, as its release describes: a long prompt's leading rows run the
@@ -350,17 +350,17 @@ pub struct SdpaDsv4PrefillFrom(pub u32);
 /// layer, as vLLM does. It changes what the model computes, so no search
 /// turns it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.dsv4_replay", flag, default = false, tune = never)]
-pub struct SdpaDsv4Replay;
+#[decision(id = "kernel.sdpa.compressed_replay", flag, default = false, tune = never)]
+pub struct SdpaCompressedReplay;
 
 /// The fewest rows DeepSeek-V4.1's attention over its FP4 cache (an MXFP8
 /// window over NVFP4 entries) takes the tcgen05 pass a block a row, which
 /// widens each row's keys once for all 64 heads as its tiles land, rather
 /// than the decode launch, whose four blocks a row widen them each. 0 never
-/// does below `kernel.sdpa.dsv4_prefill_from`.
+/// does below `kernel.sdpa.compressed_prefill_from`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.dsv4_fp4_pass_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
-pub struct SdpaDsv4Fp4PassFrom(pub u32);
+#[decision(id = "kernel.sdpa.compressed_fp4_pass_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
+pub struct SdpaCompressedFp4PassFrom(pub u32);
 
 /// The most rows a grouped projection on an fp8 plane (`kernel.gemm.fp8_o_down`)
 /// runs group by group on the tcgen05 GEMM against the plane as it is, past
@@ -659,7 +659,7 @@ pub struct MoeMxfp4SelectLean;
 #[decision(id = "kernel.gemm.grouped_gemv", flag, default = false, tune = search)]
 pub struct GemmGroupedGemv;
 
-/// Whether a decode's few rows (`linear::quant::AFFINE_MMA_UNTIL`) of a
+/// Whether a decode's few rows (`linear::affine::AFFINE_MMA_UNTIL`) of a
 /// 4-bit MLX plane run on the mma.sync GEMV (`affine_w4a16_mma`), its codes
 /// read once for every row, rather than the per-row affine kernel. Off but
 /// where a chip's profile turns it on (A100's).
@@ -710,31 +710,31 @@ pub struct DecodeGroupedPrefillWindow;
 pub struct Fa2Live;
 
 /// Whether a paged decode of a group of at most eight query heads reads its
-/// cache on tensor cores (`attn/xqa.cuh`, the group's rows one MMA tile)
+/// cache on tensor cores (`attn/decode_gqa_sm80.cu`, the group's rows one MMA tile)
 /// rather than the FA2 decode kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.xqa", flag, default = false, tune = search)]
-pub struct DecodeXqa;
+#[decision(id = "kernel.sdpa.decode.gqa", flag, default = false, tune = search)]
+pub struct DecodeGqa;
 
 /// The fewest requests a 64-wide decode takes the tensor-core kernel at;
 /// narrower, the FA2 decode reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.xqa_from_64", constant(range(0..=65_536)), default = 0, tune = search)]
-pub struct DecodeXqaFrom64(pub u32);
+#[decision(id = "kernel.sdpa.decode.gqa_from_64", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct DecodeGqaFrom64(pub u32);
 
 /// The widest sliding window (keys a query row sees) the tensor-core decode
 /// reads whole, a block a (request, kv head) landing its rows and sinks
 /// itself, with no split to fold; 0 splits every window as the plan sizes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.xqa_whole_window", constant(range(0..=65_536)), default = 0, tune = search)]
-pub struct DecodeXqaWholeWindow(pub u32);
+#[decision(id = "kernel.sdpa.decode.gqa_whole_window", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct DecodeGqaWholeWindow(pub u32);
 
 /// The most blocks a cluster splits an unwindowed tensor-core decode row's
 /// keys across, folding them through distributed shared memory in place of
 /// the plan's split and its fold launch; 0 leaves the split to the plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.xqa_cluster", constant(set(0, 1, 2, 4, 8)), default = 0, tune = search)]
-pub struct DecodeXqaCluster(pub u32);
+#[decision(id = "kernel.sdpa.decode.gqa_cluster", constant(set(0, 1, 2, 4, 8)), default = 0, tune = search)]
+pub struct DecodeGqaCluster(pub u32);
 
 /// Whether a 64-wide tensor-core decode over a bf16 pool keeps three key
 /// tiles in flight a warp rather than two, its key rows swizzled rather than
@@ -742,8 +742,8 @@ pub struct DecodeXqaCluster(pub u32);
 /// warp load at once, one memory latency rather than two. The same products,
 /// so the same bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.sdpa.decode.xqa_deep_64", flag, default = false, tune = search)]
-pub struct DecodeXqaDeep64;
+#[decision(id = "kernel.sdpa.decode.gqa_deep_64", flag, default = false, tune = search)]
+pub struct DecodeGqaDeep64;
 
 /// Whether a split attention's partial states fold a warp a (row, head)
 /// rather than through the staged persistent merge.
@@ -782,7 +782,7 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeTc5From>()
         .add::<GemmSplitRowsFrom>()
         .add::<QgPrologueUntil>()
-        .add::<Dsv4DecodeUntil>()
+        .add::<CompressedDecodeUntil>()
         .add::<SsmGdnFusedScan>()
         .add::<SsmGdnTc5>()
         .add::<SsmGdnScanUntil>()
@@ -839,20 +839,20 @@ pub fn register(registry: &mut Registry) {
         .add::<DecodeGroupedPrefillLse>()
         .add::<DecodeGroupedPrefillWindow>()
         .add::<Fa2Live>()
-        .add::<DecodeXqa>()
-        .add::<DecodeXqaFrom64>()
-        .add::<DecodeXqaWholeWindow>()
-        .add::<DecodeXqaCluster>()
-        .add::<DecodeXqaDeep64>()
+        .add::<DecodeGqa>()
+        .add::<DecodeGqaFrom64>()
+        .add::<DecodeGqaWholeWindow>()
+        .add::<DecodeGqaCluster>()
+        .add::<DecodeGqaDeep64>()
         .add::<SdpaSelectedMma>()
         .add::<SdpaIndexMma>()
         .add::<SdpaIndexTc5>()
         .add::<ElemwiseNormEmit>()
         .add::<SdpaIndexRadix>()
         .add::<SdpaPoolMma>()
-        .add::<SdpaDsv4PrefillFrom>()
-        .add::<SdpaDsv4Replay>()
-        .add::<SdpaDsv4Fp4PassFrom>()
+        .add::<SdpaCompressedPrefillFrom>()
+        .add::<SdpaCompressedReplay>()
+        .add::<SdpaCompressedFp4PassFrom>()
         .add::<GemmFp8GroupedTc5Until>()
         .add::<SdpaMlaSparse>()
         .add::<SdpaMlaDenseShort>()
@@ -917,7 +917,7 @@ tuning! {
     moe_tc5_from: u32 = 16, get MoeTc5From;
     gemm_split_rows_from: u32 = 256, get GemmSplitRowsFrom;
     qg_prologue_until: u32 = 0, get QgPrologueUntil;
-    dsv4_decode_until: u32 = 0, get Dsv4DecodeUntil;
+    compressed_decode_until: u32 = 0, get CompressedDecodeUntil;
     ssm_gdn_fused_scan: bool = false, on SsmGdnFusedScan;
     ssm_gdn_tc5: bool = false, on SsmGdnTc5;
     ssm_gdn_scan_until: u32 = 32, get SsmGdnScanUntil;
@@ -974,20 +974,20 @@ tuning! {
     decode_grouped_prefill_lse: bool = false, on DecodeGroupedPrefillLse;
     decode_grouped_prefill_window: bool = false, on DecodeGroupedPrefillWindow;
     fa2_live: bool = false, on Fa2Live;
-    decode_xqa: bool = false, on DecodeXqa;
-    decode_xqa_from_64: u32 = 0, get DecodeXqaFrom64;
-    decode_xqa_whole_window: u32 = 0, get DecodeXqaWholeWindow;
-    decode_xqa_cluster: u32 = 0, get DecodeXqaCluster;
-    decode_xqa_deep_64: bool = false, on DecodeXqaDeep64;
+    decode_gqa: bool = false, on DecodeGqa;
+    decode_gqa_from_64: u32 = 0, get DecodeGqaFrom64;
+    decode_gqa_whole_window: u32 = 0, get DecodeGqaWholeWindow;
+    decode_gqa_cluster: u32 = 0, get DecodeGqaCluster;
+    decode_gqa_deep_64: bool = false, on DecodeGqaDeep64;
     selected_mma: bool = false, on SdpaSelectedMma;
     index_mma: bool = false, on SdpaIndexMma;
     index_tc5: bool = false, on SdpaIndexTc5;
     norm_emit: bool = false, on ElemwiseNormEmit;
     index_radix: bool = false, on SdpaIndexRadix;
     pool_mma: bool = false, on SdpaPoolMma;
-    dsv4_prefill_from: u32 = 0, get SdpaDsv4PrefillFrom;
-    dsv4_replay: bool = false, on SdpaDsv4Replay;
-    dsv4_fp4_pass_from: u32 = 0, get SdpaDsv4Fp4PassFrom;
+    compressed_prefill_from: u32 = 0, get SdpaCompressedPrefillFrom;
+    compressed_replay: bool = false, on SdpaCompressedReplay;
+    compressed_fp4_pass_from: u32 = 0, get SdpaCompressedFp4PassFrom;
     gemm_fp8_grouped_tc5_until: u32 = 0, get GemmFp8GroupedTc5Until;
     mla_sparse: bool = false, on SdpaMlaSparse;
     mla_dense_short: bool = false, on SdpaMlaDenseShort;

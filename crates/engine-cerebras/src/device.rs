@@ -12,12 +12,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::fabric::lanes::{LanePlan, picks};
 use dtype::Dtype;
-use kernels_cerebras::program::{
-    BankSplit, ColPlane, HostOp, HostPhase, Manifest, Reduce, Rendered, Segment, picks,
-};
+use kernels_cerebras::phase::{BankSplit, ColPlane, HostOp, Reduce, Segment};
 
 use crate::error::{Fault, Result};
+use crate::fabric::{HostPhase, Manifest, Rendered};
 use crate::sdk::{Arch, Compile, Cslc, Target};
 use crate::trace::Signature;
 
@@ -473,10 +473,7 @@ impl Device {
     #[must_use]
     pub fn dry_texts(&self) -> Vec<String> {
         self.dry.as_ref().map_or_else(Vec::new, |texts| {
-            texts
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
+            texts.lock().expect("texts lock poisoned").clone()
         })
     }
 
@@ -532,12 +529,7 @@ impl Device {
     /// [`crate::trace::Tracer::finish`]), from the cache or freshly built.
     pub fn program(&self, text: &str, sig: Signature) -> Result<Arc<Program>> {
         let key = *blake3::hash(text.as_bytes()).as_bytes();
-        if let Some(hit) = self
-            .cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&key)
-        {
+        if let Some(hit) = self.cache.lock().expect("cache lock poisoned").get(&key) {
             return Ok(Arc::clone(hit));
         }
         let hex = blake3::hash(text.as_bytes()).to_hex().to_string();
@@ -548,7 +540,7 @@ impl Device {
         if let Some(texts) = &self.dry {
             texts
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("texts lock poisoned")
                 .push(text.to_string());
         }
         let exe = if self.dry.is_none() || self.dry_compiles {
@@ -563,7 +555,7 @@ impl Device {
         });
         self.cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("cache lock poisoned")
             .insert(key, Arc::clone(&program));
         Ok(program)
     }
@@ -593,14 +585,14 @@ impl Device {
                 std::fs::create_dir_all(&dir).map_err(|e| Fault::Unbound {
                     what: format!("the program cache at {}: {e}", dir.display()),
                 })?;
-                std::fs::write(dir.join("layout.csl"), &rendered.layout)
+                std::fs::write(dir.join("gather.csl"), &rendered.layout)
                     .map_err(|e| io_fault(&dir, e))?;
                 std::fs::write(dir.join("pe.csl"), &rendered.pe).map_err(|e| io_fault(&dir, e))?;
                 let started = std::time::Instant::now();
                 let (w, h) = rendered.manifest.rect;
                 let compile = Compile::memcpy(
                     Arch::from(self.platform.target()),
-                    dir.join("layout.csl"),
+                    dir.join("gather.csl"),
                     w,
                     h,
                     &out,
@@ -622,10 +614,7 @@ impl Device {
 
     #[must_use]
     pub fn compiled(&self) -> usize {
-        self.cache
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+        self.cache.lock().expect("cache lock poisoned").len()
     }
 
     /// Runs `program` over `args` (in its parameter order); returns its
@@ -645,7 +634,7 @@ impl Device {
     pub fn queue_moves(&self, moves: Vec<PoolMove>) {
         self.moves
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("moves lock poisoned")
             .extend(moves);
     }
 
@@ -720,12 +709,8 @@ impl Device {
             .filter(|(source, _)| matches!(source, crate::trace::Source::Weight { .. }))
             .map(|(_, name)| name.clone())
             .collect();
-        let moves: Vec<PoolMove> = std::mem::take(
-            &mut *self
-                .moves
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        let moves: Vec<PoolMove> =
+            std::mem::take(&mut *self.moves.lock().expect("moves lock poisoned"));
         let ran = run_phases(
             &fabric_run()?,
             target_name(self.platform.target()),
@@ -815,7 +800,7 @@ pub fn run_phases(
         // A whole fire over rows of PEs: row `y` runs its own table, and
         // every row's PEs mirror the fire's PEs across, so a buffer is laid
         // out for the `w` PEs of a row.
-        let row_tables: Vec<&kernels_cerebras::program::Table> = if manifest.tables.is_empty() {
+        let row_tables: Vec<&crate::fabric::Table> = if manifest.tables.is_empty() {
             manifest.table.iter().collect()
         } else {
             manifest.tables.iter().collect()
@@ -889,13 +874,12 @@ pub fn run_phases(
             sent_of.insert(export.name.clone(), laid);
         }
         let pes = w as usize * h as usize;
-        let packed_back = |e: &kernels_cerebras::program::Export| {
-            e.packed && e.role != kernels_cerebras::program::Symbol::Input
-        };
-        let comes_back = |e: &kernels_cerebras::program::Export| {
+        let packed_back =
+            |e: &crate::fabric::Export| e.packed && e.role != crate::fabric::Symbol::Input;
+        let comes_back = |e: &crate::fabric::Export| {
             !skip.contains(&e.name.as_str())
                 && (!e.packed || packed_back(e))
-                && e.role != kernels_cerebras::program::Symbol::Input
+                && e.role != crate::fabric::Symbol::Input
         };
         let write_in = |file: &str, words: &[u32]| -> Result<()> {
             let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -972,7 +956,7 @@ pub fn run_phases(
                     t.arena
                         .iter()
                         .filter(|(_, off, _)| {
-                            *off < keep_chunks as u64 * kernels_cerebras::program::ARENA_CHUNK
+                            *off < keep_chunks as u64 * crate::fabric::ARENA_CHUNK
                         })
                         .map(|(n, o, w)| (n.clone(), *o as usize, *w as usize))
                         .collect()
@@ -1015,7 +999,7 @@ pub fn run_phases(
                 }
             }
             for c in keep_chunks..chunks.unwrap_or(1) {
-                let lo = c * kernels_cerebras::program::ARENA_CHUNK as usize;
+                let lo = c * crate::fabric::ARENA_CHUNK as usize;
                 let len = chunk_len(c);
                 let mut words = Vec::with_capacity(pes * len);
                 for pe in 0..pes {
@@ -1073,9 +1057,7 @@ pub fn run_phases(
         if let Some(servers) = servers {
             // The program stays loaded: its server runs the spec. A server
             // that fails is dropped (killed); the next run starts a new one.
-            let mut pool = servers
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut pool = servers.lock().expect("servers lock poisoned");
             let ran = pool
                 .get(runner, dir, target)?
                 .run(&spec_path, phase_timeout(), at);
@@ -1110,7 +1092,7 @@ pub fn run_phases(
                 .map(|(_, words)| vec![0u32; lay_pes * words])
                 .collect();
             for c in keep_chunks..chunks.unwrap_or(1) {
-                let lo = c * kernels_cerebras::program::ARENA_CHUNK as usize;
+                let lo = c * crate::fabric::ARENA_CHUNK as usize;
                 let len = chunk_len(c);
                 let words = read_out(&format!("arena{c}.out"))?;
                 for pe in 0..pes {
@@ -1214,8 +1196,8 @@ pub fn run_phases(
                     // Partial sums are added in f32 and rounded here.
                     if matches!(
                         export.shard,
-                        kernels_cerebras::program::Shard::SumCols { .. }
-                            | kernels_cerebras::program::Shard::SumGrid { .. }
+                        kernels_cerebras::phase::Shard::SumCols { .. }
+                            | kernels_cerebras::phase::Shard::SumGrid { .. }
                     ) && export.dtype == Dtype::Bf16
                     {
                         for v in words.iter_mut() {
@@ -1247,18 +1229,19 @@ pub fn run_phases(
 /// their offsets, scratch zeros) back to back, and every PE's op rows
 /// (opcode, then the arguments resolved to arena offsets and words).
 fn pack_table(
-    table: &kernels_cerebras::program::Table,
-    exports: &[kernels_cerebras::program::Export],
+    table: &crate::fabric::Table,
+    exports: &[crate::fabric::Export],
     sent_of: &HashMap<String, Vec<u32>>,
     pes: usize,
     at: usize,
     moves: &[PoolMove],
 ) -> Result<(Vec<u32>, Vec<u32>)> {
-    use kernels_cerebras::csl::Arg;
-    use kernels_cerebras::program::{
-        FabricOp, MOVE_ROW_WORDS, OP_BROADCAST, OP_BROADCAST_FROM, OP_GATHER, OP_HANDOFF, OP_NOP,
-        OP_ON, OP_REDUCE, OP_ROOT, TableOp, op_words,
+    use crate::fabric::{
+        MOVE_ROW_WORDS, OP_BROADCAST, OP_BROADCAST_FROM, OP_GATHER, OP_HANDOFF, OP_NOP, OP_ON,
+        OP_REDUCE, OP_ROOT, TableOp, op_words,
     };
+    use kernels_cerebras::csl::Arg;
+    use kernels_cerebras::phase::FabricOp;
     let arena_words = table.arena_words as usize;
     let mut arena = vec![0u32; pes * arena_words];
     let offset = |name: &str| -> Option<usize> {
@@ -1275,7 +1258,7 @@ fn pack_table(
         // An output's slot may be a dead input's: nothing goes up for it.
         if exports
             .iter()
-            .any(|e| e.name == *name && e.role == kernels_cerebras::program::Symbol::Output)
+            .any(|e| e.name == *name && e.role == crate::fabric::Symbol::Output)
         {
             continue;
         }
@@ -1382,7 +1365,7 @@ fn pack_table(
         let copy = table
             .kernels
             .iter()
-            .position(|k| k == "k_copy")
+            .position(|k| *k == kernels_cerebras::library::Kernel::Copy)
             .ok_or_else(|| unbound("a page move without k_copy".to_string()))?
             as i32;
         let scratch = offset("move_scratch")
@@ -1407,7 +1390,7 @@ fn pack_table(
             let mut done = 0u64;
             while done < u64::from(m.rows) {
                 let left = u64::from(m.rows) - done;
-                let fit = (kernels_cerebras::program::MOVE_SCRATCH / row_words.max(1)).max(1);
+                let fit = (crate::fabric::MOVE_SCRATCH / row_words.max(1)).max(1);
                 let n = left
                     .min(fit)
                     .min(ps - (m.src_row + done) % ps)
@@ -2568,12 +2551,8 @@ struct Paged {
 }
 
 impl LaneLayout {
-    fn plan(
-        lane: &kernels_cerebras::program::LanePlan,
-        state: &HashMap<String, Vec<u32>>,
-        at: usize,
-    ) -> Result<LaneLayout> {
-        use kernels_cerebras::program::{LaneKind, PageSource};
+    fn plan(lane: &LanePlan, state: &HashMap<String, Vec<u32>>, at: usize) -> Result<LaneLayout> {
+        use kernels_cerebras::phase::{LaneKind, PageSource};
         let pes = lane.pes.max(1) as usize;
         // A plan without banks names no slot table.
         let no_slots = Vec::new();
@@ -3521,10 +3500,10 @@ fn lay_out(
     words: &[u32],
     rows: usize,
     width: usize,
-    shard: kernels_cerebras::program::Shard,
+    shard: kernels_cerebras::phase::Shard,
     pes: usize,
 ) -> Vec<u32> {
-    use kernels_cerebras::program::Shard;
+    use kernels_cerebras::phase::Shard;
     match shard {
         Shard::Whole | Shard::Local(_) => words
             .iter()
@@ -3661,10 +3640,10 @@ fn gather_up(
     laid: &[u32],
     rows: usize,
     width: usize,
-    shard: kernels_cerebras::program::Shard,
+    shard: kernels_cerebras::phase::Shard,
     pes: usize,
 ) -> Vec<u32> {
-    use kernels_cerebras::program::Shard;
+    use kernels_cerebras::phase::Shard;
     let n = rows * width;
     match shard {
         Shard::Whole | Shard::Local(_) => laid[..n.min(laid.len())].to_vec(),

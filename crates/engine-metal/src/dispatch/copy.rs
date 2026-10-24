@@ -1,4 +1,5 @@
-use kernels_metal::{Tensor, layout};
+use kernels_metal::Tensor;
+use kernels_metal::gather;
 use poem_compiler::Region;
 use poem_exec::KernelError;
 use poem_exec::fire::{Serve, fallback};
@@ -135,9 +136,9 @@ impl Run<'_> {
                 continue;
             }
             if out {
-                layout::scatter_rows(self.ctx(), slot.tight, index, slot.wide)?;
+                gather::scatter_rows(self.ctx(), slot.tight, index, slot.wide)?;
             } else {
-                layout::gather_rows(self.ctx(), slot.wide, index, slot.tight)?;
+                gather::gather_rows(self.ctx(), slot.wide, index, slot.tight)?;
             }
         }
         Ok(())

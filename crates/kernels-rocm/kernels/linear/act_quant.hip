@@ -6,7 +6,7 @@
 // exact there, as an fp8b128 weight's values are. gfx942 converts fnuz, so
 // the OCP codes are read and written by their bits.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::linear {
 

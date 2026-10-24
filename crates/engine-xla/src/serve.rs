@@ -16,10 +16,10 @@ mod warm;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crate::handle::Tensor;
 use checkpoint::contract::ModelContract;
 use engine::fire::Masking;
 use engine::frame::{Demand, Supply};
-use kernels_xla::Tensor;
 use poem_compiler::{Budget, Budgets, CompiledModel, FireRows, compile_axes};
 use poem_exec::fire::{At, Cursor, Filter, FireDescriptor, Lane as FireLane, compose_axes, walk};
 use poem_ir::{Dtype, Trace, ValueId};
@@ -416,7 +416,7 @@ impl Shell {
         let boot = Boot {
             trace: poem_compiler::fuse::fuse(
                 boot.trace,
-                &poem_compiler::fuse::flags::kernels(&chip),
+                poem_compiler::fuse::flags::on(&chip, &crate::FUSIONS),
             ),
             ..boot
         };
@@ -455,8 +455,20 @@ impl Shell {
         let masked = classes_running(&boot.trace, &compiled, |op| {
             matches!(
                 op,
-                poem_ir::Operation::Attention(
-                    poem_ir::Attention::Masked { .. } | poem_ir::Attention::MaskedLse { .. }
+                poem_ir::Operation::Attn(
+                    poem_ir::Attn::Prefill {
+                        mask: Some(_),
+                        selection: None,
+                        bias: None,
+                        lse: None,
+                        ..
+                    } | poem_ir::Attn::Prefill {
+                        mask: Some(_),
+                        selection: None,
+                        bias: None,
+                        lse: Some(_),
+                        ..
+                    }
                 )
             )
         });
@@ -633,7 +645,7 @@ impl Shell {
             use poem_ir::Operands;
             let mut outs = Vec::new();
             match op {
-                poem_ir::Operation::Attention(a) => a.outputs(&mut outs),
+                poem_ir::Operation::Attn(a) => a.outputs(&mut outs),
                 _ => return false,
             }
             outs.iter().any(|v| scores.iter().any(|(_, s)| s == v))
@@ -668,9 +680,9 @@ impl Shell {
             .nodes
             .iter()
             .filter_map(|node| match node.op {
-                poem_ir::Operation::Layout(
-                    poem_ir::Layout::PoolRows { side, .. }
-                    | poem_ir::Layout::MergeRows { side, .. },
+                poem_ir::Operation::Gather(
+                    poem_ir::Gather::PoolRows { side, .. }
+                    | poem_ir::Gather::MergeRows { side, .. },
                 ) => Some(side.saturating_mul(side)),
                 _ => None,
             })
@@ -679,7 +691,7 @@ impl Shell {
         let drops_patch_rows = boot.trace.nodes.iter().any(|node| {
             matches!(
                 node.op,
-                poem_ir::Operation::Layout(poem_ir::Layout::ScatterLiveRows { .. })
+                poem_ir::Operation::Gather(poem_ir::Gather::ScatterLiveRows { .. })
             )
         });
         let states_mrope = declared_width(&boot.trace, poem_ir::RuntimeInput::MropePositions) > 0;

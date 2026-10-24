@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use super::Lcg;
-use kernels_cuda::linear::tc5::{Elem, atom_bytes, atom_offset};
+use kernels_cuda::linear::gemm_sm100::{Elem, atom_bytes, atom_offset};
 
 impl Side {
     /// The scale atoms with row `r` placed at atom row `at(r)`, in a tensor

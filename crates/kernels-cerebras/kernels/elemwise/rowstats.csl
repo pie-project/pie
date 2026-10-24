@@ -1,0 +1,13 @@
+// st[r * 2] = sum of row r of x, st[r * 2 + 1] = its sum of squares.
+fn k_rowstats(x: [*]f32, st: [*]f32, rows: i32, width: i32) void {
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var base: i32 = r * width;
+    var sum: f32 = 0.0;
+    var i: i32 = 0;
+    while (i < width) : (i += 1) { sum = sum + x[base + i]; }
+    st[r * 2] = sum;
+    st[r * 2 + 1] = k_dot(x, base, x, base, width);
+  }
+}
+

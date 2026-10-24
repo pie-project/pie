@@ -11,16 +11,19 @@
 //! the routes laid out by expert on the device, each quantized into its
 //! expert's rows (under its expert's global), one grouped [`tc5`] GEMM, and
 //! the rows gathered back to route order.
+#![allow(unsafe_code)]
 
 use cudarc::runtime::sys as rt;
 use dtype::Dtype;
 
 use crate::error::Error;
 use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, stated, symbol};
-use crate::linear::tc5;
+use crate::linear::gemm_sm100;
 use crate::tensor::Tensor;
 
-const FILE: &str = "linear/act_quant.cuh";
+const ACT_QUANT: &str = "linear/act_quant.cu";
+const COMBINE: &str = "linear/moe/combine.cu";
+const ROUTE: &str = "linear/moe/route.cu";
 
 const BLOCK: u32 = 256;
 /// The routes one `route_*_tally` block lays out (`kTallyRoutes`).
@@ -170,7 +173,7 @@ fn launch(
             ctx.fire(
                 op,
                 Fire::at(
-                    FILE,
+                    ACT_QUANT,
                     symbol(&format!("::pie::linear::act_quant_nvfp4<{mode}, {fan}>")),
                 )
                 .apply(Launch::flat(threads, BLOCK)),
@@ -215,7 +218,7 @@ fn launch(
             ctx.fire(
                 op,
                 Fire::at(
-                    FILE,
+                    ACT_QUANT,
                     symbol(&format!(
                         "::pie::linear::act_quant_e4m3{wide}<{mode}, {gran}, {fan}>"
                     )),
@@ -284,7 +287,7 @@ pub fn swiglu_quant(
     let int = |v: u32| stated(op, v).map(|v| v.arg());
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::swiglu_quant_e4m3_v8")
+        Fire::at(ACT_QUANT, "::pie::linear::swiglu_quant_e4m3_v8")
             .apply(Launch::flat(threads, BLOCK).programmatic(ctx.tuning().pdl)),
         &[
             ArgValue::Ptr(h),
@@ -330,82 +333,6 @@ pub fn read_back(
     Ok(Tensor::new(out, src.rows, src.x.width, Dtype::Bf16))
 }
 
-/// A block-FP8 projection (`n x k` e4m3 codes at `codes`, their ue8m0
-/// exponents laid in atoms a row a `gran` columns, 128 or 32) at a decode's
-/// few rows as a GEMV (`linear/fp8_gemv.cuh`): the activations as they are,
-/// bf16, the codes streamed once. `Ok(false)` past `kernel.gemm.fp8_gemv_until` rows
-/// or for a shape it does not read (`k` a whole number of 128s: a warp's
-/// lanes past `k` on its last 512-code pass read nothing).
-pub fn fp8_block_gemv(
-    ctx: &Ctx,
-    act: Tensor,
-    codes: u64,
-    atoms: u64,
-    gran: u32,
-    y: &mut Tensor,
-) -> Result<bool, Error> {
-    const OP: &str = "linear.fp8_block_gemv";
-    const WARPS: u32 = 8;
-    const ROWS: u32 = 4;
-    let (m, n, k) = (act.rows, y.width, act.width);
-    if m == 0
-        || m > ctx.tuning().gemm_fp8_gemv_until
-        || act.dtype != Dtype::Bf16
-        || y.dtype != Dtype::Bf16
-        || y.rows != m
-        || !matches!(gran, 32 | 128)
-        || k == 0
-        || !k.is_multiple_of(128)
-        || n == 0
-        || !codes.is_multiple_of(16)
-        || !act.ptr.is_multiple_of(16)
-    {
-        return Ok(false);
-    }
-    // Warps a row group: each at least two 512-code passes of K.
-    let splits = (k / 1024).clamp(1, WARPS).next_power_of_two().min(WARPS);
-    let rows_pad: u32 = match m {
-        1 => 1,
-        2 => 2,
-        3 | 4 => 4,
-        _ => return Ok(false),
-    };
-    ctx.fire(
-        OP,
-        Fire::at(
-            "linear/fp8_gemv.cuh",
-            symbol(&format!(
-                "::pie::linear::fp8_block_gemv<{WARPS}, {ROWS}, {rows_pad}{}>",
-                if gran == 128 {
-                    String::new()
-                } else {
-                    format!(", {gran}")
-                }
-            )),
-        )
-        .apply(
-            Launch::grid(
-                [n.div_ceil(ROWS * (WARPS / splits)), 1, 1],
-                [WARPS * 32, 1, 1],
-            )
-            .programmatic(ctx.tuning().pdl),
-        ),
-        &[
-            act.arg(),
-            stated(OP, act.width)?.arg(),
-            ArgValue::Ptr(codes),
-            ArgValue::Ptr(atoms),
-            y.arg(),
-            stated(OP, y.width)?.arg(),
-            stated(OP, m)?.arg(),
-            stated(OP, n)?.arg(),
-            stated(OP, k)?.arg(),
-            stated(OP, splits)?.arg(),
-        ],
-    )?;
-    Ok(true)
-}
-
 /// A block-FP8 plane (`rows x cols` e4m3 codes at `codes`) under f32 factors
 /// (`[rows / per][cols / 128]` at `factors`, `per` rows a factor: 128, or 1
 /// for a row's own) requantized in place to ue8m0 exponents (`exps`, the
@@ -428,7 +355,7 @@ pub fn fp8_tile_requant(
     }
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::fp8_tile_requant").apply(Launch::grid(
+        Fire::at(ACT_QUANT, "::pie::linear::fp8_tile_requant").apply(Launch::grid(
             [cols.div_ceil(128), rows.div_ceil(128), 1],
             [32, 8, 1],
         )),
@@ -464,7 +391,7 @@ pub fn scales_to_atoms(
     })?;
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::scales_to_atoms").apply(Launch::flat(n, BLOCK)),
+        Fire::at(ACT_QUANT, "::pie::linear::scales_to_atoms").apply(Launch::flat(n, BLOCK)),
         &[
             ArgValue::Ptr(plane),
             ArgValue::Ptr(atoms),
@@ -503,7 +430,7 @@ pub struct Weight {
     pub scales: u64,
     pub n: u32,
     pub k: u32,
-    pub elem: tc5::Elem,
+    pub elem: gemm_sm100::Elem,
     pub gran: u32,
     pub laid: bool,
 }
@@ -533,7 +460,7 @@ pub fn matmul(
         return Ok(());
     }
     let codes = ctx.scratch_stream(op, ACT_CODES, m as usize * fmt.row_bytes(k) as usize)?;
-    let atom_bytes = tc5::atom_bytes(m as usize, k as usize, fmt.gran() as usize);
+    let atom_bytes = gemm_sm100::atom_bytes(m as usize, k as usize, fmt.gran() as usize);
     let atoms = atoms_of(ctx, op, act_atoms(fmt), atom_bytes)?;
     quantize(ctx, op, fmt, act, codes as u64, atoms, atom_bytes)?;
     product(ctx, op, fmt, [codes as u64, atoms], m, w, y, alpha)
@@ -550,7 +477,7 @@ pub fn held_planes(ctx: &Ctx, op: &'static str, rows: u32, k: u32) -> Result<[u6
     let fmt = Format::E4m3 { gran: 128 };
     fmt.check(op, k)?;
     let codes = ctx.scratch_stream(op, HELD_CODES, rows as usize * fmt.row_bytes(k) as usize)?;
-    let atom_bytes = tc5::atom_bytes(rows as usize, k as usize, 128);
+    let atom_bytes = gemm_sm100::atom_bytes(rows as usize, k as usize, 128);
     let atoms = ctx.scratch_stream_zeroed(op, HELD_ATOMS, atom_bytes)?;
     Ok([codes as u64, atoms as u64])
 }
@@ -599,19 +526,19 @@ fn product(
     let w_atoms = if w.laid {
         w.scales
     } else {
-        let bytes = tc5::atom_bytes(w.n as usize, k as usize, w.gran as usize);
+        let bytes = gemm_sm100::atom_bytes(w.n as usize, k as usize, w.gran as usize);
         let atoms = ctx.scratch_stream(op, WEIGHT_ATOMS, bytes)? as u64;
         scales_to_atoms(ctx, op, w.scales, atoms, w.n, k / w.gran, 1)?;
         atoms
     };
     let a_elem = match fmt {
-        Format::Nvfp4 => tc5::Elem::E2m1,
-        Format::E4m3 { .. } => tc5::Elem::E4m3,
+        Format::Nvfp4 => gemm_sm100::Elem::E2m1,
+        Format::E4m3 { .. } => gemm_sm100::Elem::E4m3,
     };
-    tc5::gemm(
+    gemm_sm100::gemm(
         ctx,
-        tc5::Operand::scaled(codes, a_elem, atoms, fmt.gran()),
-        tc5::Operand::scaled(w.codes, w.elem, w_atoms, w.gran),
+        gemm_sm100::Operand::scaled(codes, a_elem, atoms, fmt.gran()),
+        gemm_sm100::Operand::scaled(w.codes, w.elem, w_atoms, w.gran),
         y.ptr,
         [m, w.n, k],
         alpha,
@@ -629,7 +556,7 @@ pub struct Bank {
     pub experts: u32,
     pub n: u32,
     pub k: u32,
-    pub elem: tc5::Elem,
+    pub elem: gemm_sm100::Elem,
     pub gran: u32,
     pub alpha_e: u64,
     /// Where `alpha_e` comes from, when the select lays it: NVFP4's input
@@ -660,7 +587,7 @@ const FAN_TOKENS: u32 = 64;
 /// A select's experts start whole 128-row scale blocks apart when its
 /// activations carry block scales (the atoms it lands are whole blocks).
 pub(crate) const BLOCK_ROWS: u32 = 128;
-const _: () = assert!(BLOCK_ROWS.is_multiple_of(tc5::GROUP_ALIGN));
+const _: () = assert!(BLOCK_ROWS.is_multiple_of(gemm_sm100::GROUP_ALIGN));
 
 const ROUTE_COUNTS: &str = "linear.act_quant.route_counts";
 const ROUTE_OFFSETS: &str = "linear.act_quant.route_offsets";
@@ -717,9 +644,9 @@ pub fn select(
     } = layout;
     let (e, gran) = (experts as usize, fmt.gran() as usize);
     let atom_bytes = if m_max > 0 {
-        tc5::masked_atom_bytes(e, m_max as usize, k as usize, gran)
+        gemm_sm100::masked_atom_bytes(e, m_max as usize, k as usize, gran)
     } else {
-        tc5::atom_bytes(rows as usize, k as usize, gran)
+        gemm_sm100::atom_bytes(rows as usize, k as usize, gran)
     };
     let codes = ctx.scratch_stream(op, ACT_CODES, rows as usize * fmt.row_bytes(k) as usize)?;
     let atoms = atoms_of(ctx, op, act_atoms(fmt), atom_bytes)?;
@@ -737,15 +664,15 @@ pub fn select(
     quantize(ctx, op, fmt, src, codes as u64, atoms, atom_bytes)?;
     let grouped = ctx.scratch_stream(op, GROUPED_Y, rows as usize * n as usize * 2)? as u64;
     let a_elem = match fmt {
-        Format::Nvfp4 => tc5::Elem::E2m1,
-        Format::E4m3 { .. } => tc5::Elem::E4m3,
+        Format::Nvfp4 => gemm_sm100::Elem::E2m1,
+        Format::E4m3 { .. } => gemm_sm100::Elem::E4m3,
     };
-    tc5::grouped_gemm_epi(
+    gemm_sm100::grouped_gemm_epi(
         ctx,
-        tc5::Operand::scaled(codes as u64, a_elem, atoms, fmt.gran()),
-        tc5::Operand::scaled(bank.codes, bank.elem, bank.atoms, bank.gran),
+        gemm_sm100::Operand::scaled(codes as u64, a_elem, atoms, fmt.gran()),
+        gemm_sm100::Operand::scaled(bank.codes, bank.elem, bank.atoms, bank.gran),
         grouped,
-        tc5::Grouped {
+        gemm_sm100::Grouped {
             experts,
             groups,
             alpha_e: bank.alpha_e,
@@ -753,9 +680,9 @@ pub fn select(
         [n, k],
         1.0,
         // An expert's padding rows land nowhere.
-        tc5::Epilogue {
+        gemm_sm100::Epilogue {
             live_rows: layout.live_rows(),
-            ..tc5::Epilogue::STORE
+            ..gemm_sm100::Epilogue::STORE
         },
         count,
     )?;
@@ -773,7 +700,7 @@ pub fn select(
 pub(crate) struct Layout {
     pub pos: u64,
     pub rows: u32,
-    pub groups: tc5::Groups,
+    pub groups: gemm_sm100::Groups,
     pub m_max: u32,
     /// Each expert's live rows (`i32 [experts]`), the rest of a contiguous
     /// expert's block padding.
@@ -785,8 +712,8 @@ impl Layout {
     /// counts (a masked one's tiles already stop at them).
     pub(crate) fn live_rows(&self) -> u64 {
         match self.groups {
-            tc5::Groups::Contiguous { .. } => self.counts,
-            tc5::Groups::Masked { .. } => 0,
+            gemm_sm100::Groups::Contiguous { .. } => self.counts,
+            gemm_sm100::Groups::Masked { .. } => 0,
         }
     }
 }
@@ -855,7 +782,7 @@ pub(crate) fn lay_out_quant_nvfp4(
     let [(up, up_alpha), (down, down_alpha)] = alphas;
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::route_lay_out_quant_nvfp4").apply(
+        Fire::at(ROUTE, "::pie::linear::route_lay_out_quant_nvfp4").apply(
             Launch::grid([grid, 1, 1], [256, 1, 1])
                 .smem(smem)
                 .programmatic(ctx.tuning().pdl),
@@ -889,7 +816,7 @@ pub(crate) fn lay_out_quant_nvfp4(
         pos,
         rows,
         // A router names an expert once a token.
-        groups: tc5::Groups::Contiguous {
+        groups: gemm_sm100::Groups::Contiguous {
             offsets,
             rows,
             cap: routes.rows,
@@ -939,7 +866,7 @@ pub(crate) fn lay_out_with(
             Layout {
                 pos,
                 rows: experts * m_max,
-                groups: tc5::Groups::Masked { counts, m_max },
+                groups: gemm_sm100::Groups::Masked { counts, m_max },
                 m_max,
                 counts,
             }
@@ -949,7 +876,7 @@ pub(crate) fn lay_out_with(
             Layout {
                 pos,
                 rows,
-                groups: tc5::Groups::Contiguous {
+                groups: gemm_sm100::Groups::Contiguous {
                     offsets,
                     rows,
                     cap: if distinct == Some(true) { tokens } else { 0 },
@@ -970,7 +897,7 @@ pub(crate) fn lay_out_with(
     if count <= SMALL_LAYOUT && alphas.len() <= 2 {
         ctx.fire(
             op,
-            Fire::at(FILE, "::pie::linear::route_lay_out_small")
+            Fire::at(ROUTE, "::pie::linear::route_lay_out_small")
                 .apply(Launch::flat(1024, 1024).smem(8 * experts)),
             &[
                 routes.arg(),
@@ -1012,7 +939,7 @@ pub(crate) fn lay_out_with(
     let tally = Launch::flat(count.div_ceil(TALLY_ROUTES) * BLOCK, BLOCK).smem(8 * experts);
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::route_count_tally").apply(tally),
+        Fire::at(ROUTE, "::pie::linear::route_count_tally").apply(tally),
         &[
             routes.arg(),
             int(count)?,
@@ -1025,7 +952,7 @@ pub(crate) fn lay_out_with(
     ctx.fire(
         op,
         // One block scans the experts' rows into their starts.
-        Fire::at(FILE, "::pie::linear::route_offsets_scan").apply(Launch::flat(1024, 1024)),
+        Fire::at(ROUTE, "::pie::linear::route_offsets_scan").apply(Launch::flat(1024, 1024)),
         &[
             ArgValue::Ptr(counts),
             int(experts)?,
@@ -1037,7 +964,7 @@ pub(crate) fn lay_out_with(
     )?;
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::route_place_tally").apply(tally),
+        Fire::at(ROUTE, "::pie::linear::route_place_tally").apply(tally),
         &[
             routes.arg(),
             int(count)?,
@@ -1075,7 +1002,7 @@ pub(crate) fn gather_back(
     let int = |v: u32| stated(op, v).map(|v| v.arg());
     ctx.fire(
         op,
-        Fire::at(FILE, entry).apply(Launch::flat(threads, BLOCK)),
+        Fire::at(ROUTE, entry).apply(Launch::flat(threads, BLOCK)),
         &[
             ArgValue::Ptr(grouped),
             ArgValue::Ptr(pos),
@@ -1139,7 +1066,7 @@ pub(crate) fn weighted_gather(
     ctx.fire(
         op,
         Fire::at(
-            FILE,
+            COMBINE,
             symbol(&format!(
                 "::pie::linear::route_weighted_gather_vec8<{}, {ahead}>",
                 scale != 0
@@ -1190,7 +1117,7 @@ pub(crate) fn sum_gather(
     let int = |v: u32| stated(op, v).map(|v| v.arg());
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::route_weighted_gather_vec8<false>").apply(Launch::grid(
+        Fire::at(COMBINE, "::pie::linear::route_weighted_gather_vec8<false>").apply(Launch::grid(
             [tokens, (n / 8).div_ceil(BLOCK), 1],
             [BLOCK, 1, 1],
         )),
@@ -1224,7 +1151,7 @@ pub(crate) fn scatter_f32(
     let int = |x: u32| stated(op, x).map(|x| x.arg());
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::route_scatter_f32").apply(Launch::flat(count, BLOCK)),
+        Fire::at(COMBINE, "::pie::linear::route_scatter_f32").apply(Launch::flat(count, BLOCK)),
         &[
             ArgValue::Ptr(v),
             ArgValue::Ptr(pos),
@@ -1263,7 +1190,7 @@ pub(crate) fn scatter_rows(
     let int = |v: u32| stated(op, v).map(|v| v.arg());
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::route_scatter_rows").apply(Launch::flat(runs, BLOCK)),
+        Fire::at(COMBINE, "::pie::linear::route_scatter_rows").apply(Launch::flat(runs, BLOCK)),
         &[
             x.arg(),
             ArgValue::Ptr(pos),
@@ -1289,7 +1216,7 @@ pub fn expert_alpha(
 ) -> Result<(), Error> {
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::linear::expert_alpha").apply(Launch::flat(experts, BLOCK)),
+        Fire::at(ROUTE, "::pie::linear::expert_alpha").apply(Launch::flat(experts, BLOCK)),
         &[
             ArgValue::Ptr(input_scales),
             ArgValue::Ptr(tensor_scales),
@@ -1298,4 +1225,48 @@ pub fn expert_alpha(
             stated(op, rows)?.arg(),
         ],
     )
+}
+
+/// A prefill's RMS norm of a 4096-wide row landing, beside the bf16 row, its
+/// e4m3 1x128 operand in `planes` (`[codes, atoms]`, act_quant's layout) for
+/// the GEMM that reads it next (`rmsnorm_act_quant_e4m3`). `Ok(false)` where the
+/// row is not that shape: the caller norms as before.
+pub fn rmsnorm_act_quant_e4m3(
+    ctx: &Ctx,
+    x: Tensor,
+    weight: Tensor,
+    eps: f32,
+    y: &mut Tensor,
+    planes: [u64; 2],
+) -> Result<bool, Error> {
+    const OP: &str = "elemwise.rmsnorm_emit";
+    if x.dtype != Dtype::Bf16
+        || y.dtype != Dtype::Bf16
+        || weight.dtype != Dtype::Bf16
+        || x.width != 4096
+        || y.width != 4096
+        || weight.rows * weight.width != 4096
+        || ![x.ptr, y.ptr, weight.ptr].iter().all(|at| at % 16 == 0)
+    {
+        return Ok(false);
+    }
+    ctx.fire(
+        OP,
+        Fire::at(
+            ACT_QUANT,
+            "::pie::linear::rmsnorm_act_quant_e4m3<::pie::bf16>",
+        )
+        .apply(Launch::per_row(y.rows, 256)),
+        &[
+            x.arg(),
+            weight.arg(),
+            y.arg(),
+            stated(OP, y.width)?.arg(),
+            eps.arg(),
+            ArgValue::Ptr(planes[0]),
+            ArgValue::Ptr(planes[1]),
+            ctx.stage(),
+        ],
+    )?;
+    Ok(true)
 }

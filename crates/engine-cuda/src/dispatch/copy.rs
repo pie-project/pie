@@ -1,8 +1,8 @@
-use kernels_cuda::{Tensor, layout};
+use kernels_cuda::{Tensor, gather};
 use poem_compiler::Region;
 use poem_exec::KernelError;
 use poem_exec::fire::Serve;
-use poem_ir::{Def, Dim, Operands, Operation, Ty, ValueId};
+use poem_ir::{Def, Dim, Operands, Ty, ValueId};
 
 use crate::run::Run;
 
@@ -99,21 +99,8 @@ impl Run<'_> {
             };
             ins.clear();
             outs.clear();
-            macro_rules! collect {
-                ($op:expr) => {{
-                    $op.inputs(&mut ins);
-                    $op.outputs(&mut outs);
-                }};
-            }
-            match &node.op {
-                Operation::Attention(op) => collect!(op),
-                Operation::Linear(op) => collect!(op),
-                Operation::Elementwise(op) => collect!(op),
-                Operation::Layout(op) => collect!(op),
-                Operation::Collective(op) => collect!(op),
-                Operation::Fused(op) => collect!(op),
-                Operation::Spatial(op) => collect!(op),
-            }
+            node.op.inputs(&mut ins);
+            node.op.outputs(&mut outs);
             for &id in &ins {
                 note(&mut plan, id, false);
             }
@@ -147,9 +134,9 @@ impl Run<'_> {
             let mut wide = slot.wide;
             let mut tight = slot.tight;
             if out {
-                layout::scatter_rows(self.ctx(), tight, index, &mut wide)?;
+                gather::scatter_rows(self.ctx(), tight, index, &mut wide)?;
             } else {
-                layout::gather_rows(self.ctx(), wide, index, &mut tight)?;
+                gather::gather_rows(self.ctx(), wide, index, &mut tight)?;
             }
         }
         self.set_copy(plan);

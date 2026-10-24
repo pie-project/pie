@@ -35,7 +35,7 @@ pub fn rope_axes(
     head_dim: u32,
     o: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rope_axes";
+    const OP: &str = "elemwise.rope_axes";
     let entry = dtype_dispatch!(OP, o.dtype, {
         Bf16 => "rope_axes_bfloat16",
         F32 => "rope_axes_float32",

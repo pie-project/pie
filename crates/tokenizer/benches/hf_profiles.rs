@@ -4,6 +4,7 @@ mod common;
 use std::hint::black_box;
 use std::path::Path;
 use std::sync::Arc;
+use tokenizer::Specials;
 
 use common::{MergeFormat, byte_level_json, gemma_json};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
@@ -83,7 +84,7 @@ fn bench_hf_profiles(c: &mut Criterion) {
     let mut decode = c.benchmark_group("hf_profile_decode_4k");
     for (name, tokenizer, ids) in &encoded {
         decode.bench_function(*name, |b| {
-            b.iter(|| black_box(tokenizer.decode(black_box(ids), false)));
+            b.iter(|| black_box(tokenizer.decode(black_box(ids), Specials::Keep)));
         });
     }
     decode.finish();
@@ -92,7 +93,7 @@ fn bench_hf_profiles(c: &mut Criterion) {
     for (name, tokenizer, ids) in &encoded {
         incremental.bench_function(*name, |b| {
             b.iter(|| {
-                let mut decoder = tokenizer.decoder(false);
+                let mut decoder = tokenizer.decoder(Specials::Keep);
                 for token in ids {
                     black_box(decoder.feed(std::slice::from_ref(token)));
                 }
@@ -134,7 +135,7 @@ fn bench_official_profiles(c: &mut Criterion, short: &str, prompt: &str) {
             b.iter(|| black_box(tokenizer.encode(black_box(prompt))));
         });
         c.bench_function(&format!("official_decode_4k/{fixture}"), |b| {
-            b.iter(|| black_box(tokenizer.decode(black_box(&ids), false)));
+            b.iter(|| black_box(tokenizer.decode(black_box(&ids), Specials::Keep)));
         });
         c.bench_function(&format!("official_load/{fixture}"), |b| {
             b.iter(|| black_box(Tokenizer::from_file(black_box(&path)).unwrap()));

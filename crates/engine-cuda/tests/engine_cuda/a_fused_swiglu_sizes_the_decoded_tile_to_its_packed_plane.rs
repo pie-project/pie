@@ -6,6 +6,7 @@ use checkpoint::contract::ModelContract;
 use engine_cuda::{Boot, Diagnostics, Graphs, Knobs, Lane, Shell};
 use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid};
 use poem_compiler::Budget;
+use poem_ir::GluAct;
 use poem_ir::{Fused, Operation, Trace};
 
 const VOCAB: u32 = 1000;
@@ -41,8 +42,15 @@ impl ForwardHybrid for Micro {
     }
 
     fn forward(&self, inputs: Input) -> Value {
-        let x = ops::layout::embed(&inputs.tokens(), &self.embed, VOCAB);
-        let act = ops::linear::mlp_swiglu(&ops::linear::matmul(&x, &self.gate_up), INTER);
+        let x = ops::gather::embed(&inputs.tokens(), &self.embed, VOCAB);
+        let act = ops::linear::glu(
+            &ops::linear::matmul(&x, &self.gate_up),
+            GluAct::Swiglu,
+            Some(INTER),
+            None,
+            None,
+            None,
+        );
         let h = ops::linear::matmul(&act, &self.down);
         ops::linear::lm_head(&h, &self.head)
     }
@@ -227,12 +235,17 @@ fn a_fused_swiglu_sizes_the_decoded_tile_to_its_packed_plane() {
     }
     let fixture = fixture();
 
-    let fused = poem_compiler::fuse::fuse(fixture.trace.clone(), &["linear.matmul_swiglu"]);
+    let fused = poem_compiler::fuse::fuse(
+        fixture.trace.clone(),
+        [&poem_compiler::fuse::rules::matmul_glu(&[
+            poem_ir::GluAct::Swiglu,
+        ])],
+    );
     assert!(
         fused
             .nodes
             .iter()
-            .any(|node| matches!(node.op, Operation::Fused(Fused::MatmulSwiglu { .. }))),
+            .any(|node| matches!(node.op, Operation::Fused(Fused::MatmulGlu { .. }))),
         "the gate-up matmul and the swiglu over it fold into one node"
     );
 

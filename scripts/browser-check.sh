@@ -4,11 +4,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-WASM_CRATES=(pie-browser runtime engine-wgpu kernels-wgpu web-std wasmtime-web
+WASM_CRATES=(pie-browser runtime engine-wgpu kernels-slang web-std wasmtime-web
   checkpoint ztensor ztensor-compat tokenizer grammar chat-template
   pie-poem-ir pie-poem pie-poem-compiler engine pie-poem-exec pie-eta-ir pie-eta-dsl eta-compiler
   eta-exec waker ids pie-dtype pie-client-api)
-NATIVE_CRATES=(pie-browser runtime engine-wgpu kernels-wgpu web-std wasmtime-web)
+NATIVE_CRATES=(pie-browser runtime engine-wgpu kernels-slang web-std wasmtime-web)
 
 pkgs() { for c in "$@"; do printf -- '-p %s ' "$c"; done; }
 
@@ -27,7 +27,7 @@ echo "== javascript"
 for f in packages/javascript/server-web/src/*.mjs tests/browser/*.mjs tests/browser/tools/*.mjs scripts/bench/browser/*.mjs; do
   node --check "$f"
 done
-for f in tests/browser/*.html crates/kernels-wgpu/tools/*.html; do
+for f in tests/browser/*.html crates/kernels-slang/tools/*.html; do
   node -e '
     const fs = require("fs");
     const m = fs.readFileSync(process.argv[1], "utf8").match(/<script type="module">([\s\S]*?)<\/script>/);

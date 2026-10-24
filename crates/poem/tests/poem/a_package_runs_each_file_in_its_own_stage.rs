@@ -1,6 +1,6 @@
-//! A package's files see only their stage's builtins, a misuse of the DSL is
-//! an error naming the script's line rather than a crash, and a stage loads
-//! no other stage.
+//! A package's entries are found in whichever file defines each, so it may
+//! be one file; a builtin called outside its stage, or another misuse of the
+//! DSL, is an error naming the script's line rather than a crash.
 
 use poem::star::{Deploy, Package};
 use poem::{Dtype, Platform};
@@ -26,6 +26,7 @@ fn deploy() -> Deploy {
         parts: vec![],
         drafter: None,
         yarn: None,
+        tap: None,
     }
 }
 
@@ -38,7 +39,7 @@ fn a_forward_traces_the_ops_it_calls() {
     let forward = format!(
         "{CACHES}
 def forward(m, inputs):
-    x = ops.layout.embed(inputs.tokens(), m.embed, 16)
+    x = ops.gather.embed(inputs.tokens(), m.embed, 16)
     return ops.linear.lm_head(x, m.head)
 "
     );
@@ -54,22 +55,23 @@ def forward(m, inputs):
             n.op.name()
         })
         .collect();
-    assert_eq!(ops, ["layout.embed", "linear.lm_head"], "{ops:?}");
+    assert_eq!(ops, ["gather.embed", "linear.matmul"], "{ops:?}");
     assert_eq!(trace.params.len(), 2);
 }
 
 #[test]
-fn a_layout_cannot_call_an_op() {
+fn an_op_called_by_a_layout_is_an_error_at_its_line() {
     let model = r#"
 def layout(id, deploy):
     return ops.linear.matmul(None, None)
 "#;
     let forward = format!("{CACHES}\ndef forward(m, inputs):\n    return None\n");
     let why = package(model, &forward)
-        .err()
-        .expect("a layout has no ops, so the package does not load");
+        .expect("every file sees every builtin, so the package loads")
+        .trace("toy", &deploy(), "toy-bf16", Platform::Cuda)
+        .expect_err("a layout records no trace for an op to join");
     let why = format!("{why:#}");
-    assert!(why.contains("Variable `ops` not found"), "{why}");
+    assert!(why.contains("ops.linear.matmul"), "{why}");
     assert!(
         why.contains("toy/model.poem:3"),
         "at the line that calls one: {why}"
@@ -81,7 +83,7 @@ fn a_misused_op_is_an_error_at_the_scripts_line() {
     let forward = format!(
         "{CACHES}
 def forward(m, inputs):
-    x = ops.layout.embed(inputs.tokens(), m.embed, 16)
+    x = ops.gather.embed(inputs.tokens(), m.embed, 16)
     y = ops.elemwise.residual_add(x.on(fact.drafts()), x.on(~fact.drafts()))
     return ops.linear.lm_head(y, m.head)
 "
@@ -102,21 +104,32 @@ def forward(m, inputs):
 }
 
 #[test]
-fn a_stage_loads_no_other_stage() {
-    let forward = format!(
-        "load(\"model.poem\", \"layout\")\n{CACHES}\ndef forward(m, inputs):\n    return None\n"
+fn a_package_may_be_one_file() {
+    let whole = format!(
+        "{MODEL}\n{CACHES}\ndef forward(m, inputs):\n    return ops.linear.lm_head(ops.gather.embed(inputs.tokens(), m.embed, 16), m.head)\n"
     );
+    let package = Package::new("toy", &[("toy.poem", &whole)]).expect("one file, every entry");
+    package
+        .trace("toy", &deploy(), "toy-bf16", Platform::Cuda)
+        .expect("it traces as the files apart do");
+}
+
+#[test]
+fn an_entry_is_defined_once() {
+    let forward = format!("{MODEL}\n{CACHES}\ndef forward(m, inputs):\n    return None\n");
     let why = package(MODEL, &forward)
-        .err()
-        .expect("a forward does not load the layout's file");
+        .expect("a package loads whatever its files define")
+        .trace("toy", &deploy(), "toy-bf16", Platform::Cuda)
+        .expect_err("`layout` is defined twice");
+    let why = format!("{why:#}");
     assert!(
-        format!("{why:#}").contains("a stage loads only helper files"),
-        "{why:#}"
+        why.contains("defines `layout` in both `forward.poem` and `model.poem`"),
+        "{why}"
     );
 }
 
 #[test]
-fn a_library_is_loaded_by_the_files_of_its_own_stage() {
+fn a_library_is_loaded_by_any_file_that_needs_it() {
     let forward = r#"
 load("//lib/head/forward.poem", "read_out")
 
@@ -124,7 +137,7 @@ def caches(m, c):
     pass
 
 def forward(m, inputs):
-    return read_out(m, ops.layout.embed(inputs.tokens(), m.embed, 16))
+    return read_out(m, ops.gather.embed(inputs.tokens(), m.embed, 16))
 "#;
     let library = r#"
 def read_out(m, x):
@@ -144,16 +157,18 @@ def read_out(m, x):
         .unwrap_or_else(|e| panic!("{e:#}"));
     assert_eq!(trace.params.len(), 2);
 
+    // A file that loads a helper binds it without defining it: the helper's
+    // entries stay the helper's own.
     let layout = "load(\"//lib/head/forward.poem\", \"read_out\")\n".to_string() + MODEL;
-    let why = Package::new(
+    Package::new(
         "toy",
         &[
             ("model.poem", &layout),
+            ("forward.poem", forward),
             ("//lib/head/forward.poem", library),
         ],
     )
-    .err()
-    .map(|e| format!("{e:#}"))
-    .expect("a layout loads no forward library");
-    assert!(why.contains("of its own stage"), "{why}");
+    .unwrap_or_else(|e| panic!("{e:#}"))
+    .trace("toy", &deploy(), "toy-bf16", Platform::Cuda)
+    .unwrap_or_else(|e| panic!("two files load one helper: {e:#}"));
 }

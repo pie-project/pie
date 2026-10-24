@@ -19,14 +19,13 @@ pub mod skinny;
 
 pub mod lora;
 
-pub mod mlp;
+pub mod glu;
 
 pub mod moe;
 
 pub mod moe_route;
 
-pub mod rel_bias;
+pub mod cast;
+pub mod dequant;
 
-pub mod quant;
-
-pub mod tiled;
+pub mod affine;

@@ -275,7 +275,7 @@ impl Client {
     pub async fn authenticate(
         &self,
         username: &str,
-        private_key: &Option<ParsedPrivateKey>,
+        private_key: Option<&ParsedPrivateKey>,
     ) -> Result<()> {
         let msg = ClientMessage::AuthIdentify {
             corr_id: 0,
@@ -297,7 +297,6 @@ impl Client {
         }
 
         let private_key = private_key
-            .as_ref()
             .context("Client private key is required when engine uses public key authentication")?;
 
         let challenge = base64::engine::general_purpose::STANDARD
@@ -578,7 +577,9 @@ async fn handle_server_message(msg: ServerMessage, inner: &Arc<ClientInner>) {
             if !inner.pending_downloads.contains_key(&file_hash) {
                 let state = DownloadState {
                     process_id: process_id.clone(),
-                    buffer: Vec::with_capacity(total_chunks * CHUNK_SIZE_BYTES),
+                    // grown as chunks land: `total_chunks` is the server's
+                    // word, not a size to reserve up front
+                    buffer: Vec::new(),
                     name: name.clone(),
                 };
                 inner
@@ -586,7 +587,7 @@ async fn handle_server_message(msg: ServerMessage, inner: &Arc<ClientInner>) {
                     .insert(file_hash.clone(), Mutex::new(state));
             }
 
-            let is_last = chunk_index == total_chunks - 1;
+            let is_last = chunk_index.checked_add(1) == Some(total_chunks);
             if let Some(state_mutex) = inner.pending_downloads.get(&file_hash) {
                 let mut state = state_mutex.lock().await;
                 state.buffer.extend_from_slice(&chunk_data);

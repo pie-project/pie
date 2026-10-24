@@ -401,8 +401,8 @@ pub struct Tuning {
     pub gemm_live_tiles: [u32; 3],
     /// DeepSeek's fused prefill pass and bounded replay, CUDA's decisions:
     /// never on ROCm.
-    pub dsv4_prefill_from: u32,
-    pub dsv4_replay: bool,
+    pub compressed_prefill_from: u32,
+    pub compressed_replay: bool,
 }
 
 impl Tuning {
@@ -456,8 +456,8 @@ impl Tuning {
         ssm_gdn_wide_from: 0,
         gemm_live_from: 0,
         gemm_live_tiles: [192_032_128, 256_128_064, 176_256_064],
-        dsv4_prefill_from: 0,
-        dsv4_replay: false,
+        compressed_prefill_from: 0,
+        compressed_replay: false,
     };
 
     #[must_use]
@@ -515,8 +515,8 @@ impl Tuning {
                 profile.get::<GemmLiveTileMid>().0,
                 profile.get::<GemmLiveTileLarge>().0,
             ],
-            dsv4_prefill_from: 0,
-            dsv4_replay: false,
+            compressed_prefill_from: 0,
+            compressed_replay: false,
         }
     }
 }

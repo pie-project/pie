@@ -145,7 +145,7 @@ impl Spec {
 pub fn build(spec: &Spec, tokenizer: Arc<Tokenizer>) -> Result<Arc<dyn Instruct>, String> {
     spec.check()?;
     Ok(match spec.format.as_str() {
-        "chatml" => Arc::new(ChatMLInstruct::new(
+        "chatml" => Arc::new(ChatMLInstruct::try_new(
             tokenizer,
             ChatML {
                 thinking: spec.thinking,
@@ -156,36 +156,39 @@ pub fn build(spec: &Spec, tokenizer: Arc<Tokenizer>) -> Result<Arc<dyn Instruct>
                 generation_suffix: spec.generation_suffix.clone(),
                 stop_tokens: spec.stop.clone(),
             },
-        )),
-        "harmony" => Arc::new(crate::harmony::Harmony::new(tokenizer)),
-        "gemma" => Arc::new(crate::gemma::Gemma::new(tokenizer, spec.thinking)),
-        "deepseek" => Arc::new(crate::deepseek::DeepSeek::new(tokenizer)),
-        "dots" => Arc::new(crate::dots::Dots::new(tokenizer)),
-        "glm" => Arc::new(crate::glm::Glm::new(tokenizer)),
-        "glm47" => Arc::new(crate::glm::Glm::with_style(
+        )?),
+        "harmony" => Arc::new(crate::harmony::Harmony::try_new(tokenizer)?),
+        "gemma" => Arc::new(crate::gemma::Gemma::try_new(tokenizer, spec.thinking)?),
+        "deepseek" => Arc::new(crate::deepseek::DeepSeek::try_new(tokenizer)?),
+        "dots" => Arc::new(crate::dots::Dots::try_new(tokenizer)?),
+        "glm" => Arc::new(crate::glm::Glm::try_new(tokenizer)?),
+        "glm47" => Arc::new(crate::glm::Glm::try_with_style(
             tokenizer,
             crate::glm::Style::Glm47,
-        )),
-        "glm45" => Arc::new(crate::glm::Glm::with_style(
+        )?),
+        "glm45" => Arc::new(crate::glm::Glm::try_with_style(
             tokenizer,
             crate::glm::Style::Glm45,
-        )),
-        "kimi" => Arc::new(crate::kimi::Kimi::new(tokenizer)),
-        "kimi3" => Arc::new(crate::kimi3::Kimi3::new(tokenizer)),
-        "inkling" => Arc::new(crate::inkling::Inkling::new(tokenizer)),
-        "atem" => Arc::new(crate::atem::Atem::new(tokenizer)),
-        "mimo" => Arc::new(crate::mimo::Mimo::new(tokenizer)),
-        "minimax" => Arc::new(crate::minimax::MiniMax::new(tokenizer)),
-        "minimax2" => Arc::new(crate::minimax2::MiniMax2::new(tokenizer, &spec.identity)),
-        "hy" => Arc::new(crate::hy::Hy::new(tokenizer, spec.thinking)),
-        "llama" => Arc::new(crate::llama::Llama::new(tokenizer)),
-        "qwen3_coder" => Arc::new(crate::qwen3_coder::Qwen3Coder::new(tokenizer)),
-        "lines" => Arc::new(crate::lines::Lines::new(
+        )?),
+        "kimi" => Arc::new(crate::kimi::Kimi::try_new(tokenizer)?),
+        "kimi3" => Arc::new(crate::kimi3::Kimi3::try_new(tokenizer)?),
+        "inkling" => Arc::new(crate::inkling::Inkling::try_new(tokenizer)?),
+        "atem" => Arc::new(crate::atem::Atem::try_new(tokenizer)?),
+        "mimo" => Arc::new(crate::mimo::Mimo::try_new(tokenizer)?),
+        "minimax" => Arc::new(crate::minimax::MiniMax::try_new(tokenizer)?),
+        "minimax2" => Arc::new(crate::minimax2::MiniMax2::try_new(
+            tokenizer,
+            &spec.identity,
+        )?),
+        "hy" => Arc::new(crate::hy::Hy::try_new(tokenizer, spec.thinking)?),
+        "llama" => Arc::new(crate::llama::Llama::try_new(tokenizer)?),
+        "qwen3_coder" => Arc::new(crate::qwen3_coder::Qwen3Coder::try_new(tokenizer)?),
+        "lines" => Arc::new(crate::lines::Lines::try_new(
             tokenizer,
             spec.bos.as_deref().unwrap_or_default(),
             spec.eos.as_deref().unwrap_or_default(),
             &spec.stop,
-        )),
+        )?),
         "raw" => Arc::new(crate::raw::Raw::new(tokenizer, &spec.stop)),
         _ => unreachable!("checked above"),
     })

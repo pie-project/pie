@@ -7,7 +7,7 @@
 // softmax pool, or a plain mean of index keys), stores it, and attends over
 // the pool: every entry, or the top-k an indexer selected.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 #include "attn/mla.hip"
 
 namespace pie::attn {

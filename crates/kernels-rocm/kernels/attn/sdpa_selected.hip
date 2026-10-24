@@ -6,8 +6,8 @@
 // whole causal test. A block a (row, G heads): 32-lane groups walk keys
 // round-robin under an online softmax, folded through LDS.
 
-#include "prelude/device.hip"
-#include "prelude/mfma.hip"
+#include "prim/device.hip"
+#include "prim/mfma.hip"
 
 namespace pie::attn::sdpa_selected {
 

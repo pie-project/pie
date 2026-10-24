@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use tokenizer::Specials;
 
 use tokenizer::{Tokenizer, TokenizerDecoder};
 
@@ -39,16 +40,17 @@ pub struct Glm {
 }
 
 impl Glm {
-    #[must_use]
-    pub fn new(tokenizer: Arc<Tokenizer>) -> Self {
-        Self::with_style(tokenizer, Style::Glm5)
+    pub fn try_new(tokenizer: Arc<Tokenizer>) -> Result<Self, String> {
+        Self::try_with_style(tokenizer, Style::Glm5)
     }
 
-    #[must_use]
-    pub fn with_style(tokenizer: Arc<Tokenizer>, style: Style) -> Self {
-        let stop_ids = specials(&tokenizer, STOP_TOKENS);
-        let system_marker = special(&tokenizer, "<|system|>");
-        let mut prefix = vec![special(&tokenizer, "[gMASK]"), special(&tokenizer, "<sop>")];
+    pub fn try_with_style(tokenizer: Arc<Tokenizer>, style: Style) -> Result<Self, String> {
+        let stop_ids = specials(&tokenizer, STOP_TOKENS)?;
+        let system_marker = special(&tokenizer, "<|system|>")?;
+        let mut prefix = vec![
+            special(&tokenizer, "[gMASK]")?,
+            special(&tokenizer, "<sop>")?,
+        ];
         if style == Style::Glm5 {
             prefix.push(system_marker);
             prefix.extend(tokenizer.encode(EFFORT));
@@ -60,18 +62,18 @@ impl Glm {
             1,
             "`</think>` is one token in GLM's vocabulary"
         );
-        Self {
+        Ok(Self {
             prefix,
             style,
             system_marker,
-            user_marker: special(&tokenizer, "<|user|>"),
-            assistant_marker: special(&tokenizer, "<|assistant|>"),
-            observation: special(&tokenizer, "<|observation|>"),
+            user_marker: special(&tokenizer, "<|user|>")?,
+            assistant_marker: special(&tokenizer, "<|assistant|>")?,
+            observation: special(&tokenizer, "<|observation|>")?,
             think_open,
             think_close: think_close[0],
             stop_ids,
             tokenizer,
-        }
+        })
     }
 
     /// What GLM-4.5 writes after a role marker.
@@ -308,7 +310,7 @@ impl Instruct for Glm {
             return Box::new(NoopToolDecoder);
         }
         Box::new(GlmToolDecoder {
-            decoder: self.tokenizer.decoder(false),
+            decoder: self.tokenizer.decoder(Specials::Keep),
             accumulated: String::new(),
             inside: false,
         })

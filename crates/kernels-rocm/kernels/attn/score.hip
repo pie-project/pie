@@ -5,7 +5,7 @@
 // a (request, head); wavefronts take keys round-robin, two passes a row (the
 // softmax's max and sum, then the mass).
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 #include "attn/kv.hip"
 
 namespace pie::attn {

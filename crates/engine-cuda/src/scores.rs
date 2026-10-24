@@ -159,7 +159,7 @@ impl Scores {
         let row = u64::from(KV_MAX) * 4;
         let base = self.seat_base(seat);
         let band = self.layout.band;
-        kernels_cuda::collective::grouped("attention.score_gather", || {
+        kernels_cuda::collective::grouped("attn.score_gather", || {
             for (_, mine) in &self.layout.planes_of {
                 let block = mine - self.world.rank.saturating_mul(band);
                 let send = Tensor::new(

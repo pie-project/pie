@@ -124,9 +124,22 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
                         matches!(
                             node.op,
                             Operation::Linear(
-                                poem_ir::Linear::MoeMatmulSelect { .. }
-                                    | poem_ir::Linear::MoeMatmulSelectQuant { .. }
-                                    | poem_ir::Linear::MoeMatmulSelectActQuant { .. }
+                                poem_ir::Linear::MoeSelect {
+                                    bias: None,
+                                    quantized: false,
+                                    quant: None,
+                                    ..
+                                } | poem_ir::Linear::MoeSelect {
+                                    bias: None,
+                                    quantized: true,
+                                    quant: None,
+                                    ..
+                                } | poem_ir::Linear::MoeSelect {
+                                    bias: None,
+                                    quantized: true,
+                                    quant: Some(_),
+                                    ..
+                                }
                             )
                         )
                     })
@@ -300,8 +313,8 @@ mod tests {
         let plan = b.prepare(Guard::Always);
         let q = b.op(x, 4, Guard::Always);
         let d = b.decode(q, plan, fact(0));
-        let p = b.op(q, 4, Guard::not(fact(0)));
-        let o = b.merge(&[(d, fact(0)), (p, Guard::not(fact(0)))], 4);
+        let p = b.op(q, 4, !fact(0));
+        let o = b.merge(&[(d, fact(0)), (p, !fact(0))], 4);
         let y = b.op(o, 4, Guard::Always);
         b.out(y);
         b

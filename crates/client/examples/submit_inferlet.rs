@@ -26,7 +26,7 @@ pub async fn submit_inferlet(ws_host: &str, path: &Path, input: &str) -> Result<
         .with_context(|| format!("connect to engine at {ws_host}"))?;
 
     client
-        .authenticate("test-user", &None)
+        .authenticate("test-user", None)
         .await
         .context("authenticate")?;
 

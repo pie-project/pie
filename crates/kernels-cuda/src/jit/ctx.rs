@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use core::ffi::c_void;
 
 use crate::error::Error;
@@ -316,9 +317,24 @@ impl Ctx {
         self.stream
     }
 
+    /// The context's cuBLAS handle, set to sum a split K's partials in the
+    /// compute type: cuBLAS's default adds them in a bf16 or f16 output's own
+    /// type, and over a cancelling K that is off by percents (sm89 splits a
+    /// hundred-row bf16 product so).
     pub fn cublas(&self, op: &'static str) -> Result<*mut c_void, Error> {
         if self.cublas.is_null() {
             return Err(refuse(op, "this context carries no cuBLAS handle"));
+        }
+        #[cfg(feature = "cuda")]
+        {
+            use cudarc::cublas::sys::{cublasMath_t, cublasSetMathMode};
+            // SAFETY: a live handle this context carries.
+            let _ = unsafe {
+                cublasSetMathMode(
+                    self.cublas.cast(),
+                    cublasMath_t::CUBLAS_MATH_DISALLOW_REDUCED_PRECISION_REDUCTION,
+                )
+            };
         }
         Ok(self.cublas)
     }
@@ -464,7 +480,7 @@ impl Ctx {
     }
 
     #[must_use]
-    pub fn stage(&self) -> ArgValue {
+    pub fn stage(&self) -> ArgValue<'static> {
         ArgValue::Ptr(self.stage.get())
     }
 
@@ -510,6 +526,13 @@ impl Ctx {
         }
     }
 
+    /// Whether a block asking `bytes` of dynamic shared memory can launch
+    /// here; true where the device does not say.
+    #[must_use]
+    pub fn smem_fits(&self, bytes: u32) -> bool {
+        self.smem_per_block_optin().is_none_or(|max| bytes <= max)
+    }
+
     /// The shared memory one SM holds across its resident blocks.
     #[allow(clippy::unused_self)]
     #[must_use]
@@ -539,9 +562,7 @@ impl Ctx {
             let gap = {
                 static LAST: std::sync::Mutex<Option<std::time::Instant>> =
                     std::sync::Mutex::new(None);
-                let mut last = LAST
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut last = LAST.lock().expect("last lock poisoned");
                 let gap = last.map_or(0, |at| now.duration_since(at).as_micros());
                 *last = Some(now);
                 gap
@@ -567,6 +588,13 @@ impl Ctx {
 
         let mut bound = crate::jit::abi::Bound::new(args);
 
+        // SAFETY: `resolved.function` lives for the process (the cache
+        // leaks it) and was loaded in the context `resolve` bound to this
+        // thread; `self.stream` is live by `Ctx::on`'s contract. `bound`
+        // owns one slot per argument and outlives the call. That the
+        // arguments match the kernel's parameters, and that every pointer
+        // among them is a live device address, is not checked here: `fire`
+        // takes it on trust from its caller.
         let fired = unsafe {
             crate::jit::launch::issue(resolved.function, launch, bound.slots_mut(), self.stream)
         };

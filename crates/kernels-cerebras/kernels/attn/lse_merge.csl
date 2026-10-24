@@ -1,0 +1,23 @@
+// total[j] = log2 Σ_p 2^all[p * n + j] over g parts (base 2; all -inf stays
+// -inf): the merged log-sum-exp of g PEs' per-cell partials.
+fn k_lse_merge(all: [*]f32, total: [*]f32, g: i32, n: i32) void {
+  var j: i32 = 0;
+  while (j < n) : (j += 1) {
+    var m: f32 = all[j];
+    var p: i32 = 1;
+    while (p < g) : (p += 1) {
+      if (all[p * n + j] > m) { m = all[p * n + j]; }
+    }
+    if (@bitcast(u32, m) == 0xFF800000) {
+      total[j] = m;
+    } else {
+      var s: f32 = 0.0;
+      p = 0;
+      while (p < g) : (p += 1) {
+        s = s + math.exp_f32((all[p * n + j] - m) * 0.6931471805599453);
+      }
+      total[j] = m + math.log_f32(s) * 1.4426950408889634;
+    }
+  }
+}
+

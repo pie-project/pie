@@ -2,7 +2,7 @@
 //! of them in a row the same one, while they split the query heads.
 
 use checkpoint::contract::Expr;
-use poem::{Attention, CacheRow, Operation, Platform};
+use poem::{Attn, CacheRow, Operation, Platform};
 
 /// qwen 3.5 0.8b attends 8 query heads to 2 kv heads 256 wide.
 const ROW: &str = "qwen35-d0.8b-bf16-kv-bf16-tp4";
@@ -14,11 +14,11 @@ fn a_kv_head_is_held_by_a_group_of_ranks() {
 
     let mut plans = 0;
     for node in &trace.nodes {
-        if let Operation::Attention(
-            Attention::PlanPrefill {
+        if let Operation::Attn(
+            Attn::PlanPrefill {
                 q_heads, kv_heads, ..
             }
-            | Attention::PlanDecode {
+            | Attn::PlanDecode {
                 q_heads, kv_heads, ..
             },
         ) = &node.op

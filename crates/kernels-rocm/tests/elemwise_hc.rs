@@ -11,7 +11,7 @@ mod common;
 use common::{Gpu, bf16s, close_bf16, round_bf16, sigmoid, values};
 use dtype::Dtype;
 use kernels_rocm::Tensor;
-use kernels_rocm::elemwise::hc;
+use kernels_rocm::elemwise::{hc, hc_project};
 
 /// A row shape: `n` rows of `m` streams of `h`.
 #[derive(Clone, Copy, Debug)]
@@ -209,13 +209,13 @@ fn mhc_chain(gpu: &Gpu, s: Shape) {
         let fn_h = values(rows_out * m * h, 2, 0.05);
         let hc_fn = gpu.tensor(&fn_h, rows_out as u32, wide, Dtype::F32);
         let mut mixes = gpu.zeros(rows, rows_out as u32, Dtype::F32);
-        hc::project(&ctx, normed, hc_fn, m as u32, &mut mixes).unwrap();
+        hc_project::project(&ctx, normed, hc_fn, m as u32, &mut mixes).unwrap();
         let (want, tol) = host_project(&normed_h, &fn_h, m * h, rows_out);
         close_within(&what("hc_project"), &gpu.read(&mixes), &want, &tol);
 
         // The norm and the projection in one, against the host's norm.
         let mut fused = gpu.zeros(rows, rows_out as u32, Dtype::F32);
-        hc::norm_project(&ctx, streams, hc_fn, eps, m as u32, &mut fused).unwrap();
+        hc_project::norm_project(&ctx, streams, hc_fn, eps, m as u32, &mut fused).unwrap();
         let (want, tol) = host_project(&host_normed(s, &streams_h, eps), &fn_h, m * h, rows_out);
         close_within(&what("hc_norm_project"), &gpu.read(&fused), &want, &tol);
     }
@@ -356,8 +356,8 @@ fn mhc_chain(gpu: &Gpu, s: Shape) {
     let mut head = gpu.zeros(rows, h as u32, Dtype::Bf16);
     ctx.arm_stage(win.ptr);
     hc::rmsnorm_f32(&ctx, streams, eps, &mut normed_w).unwrap();
-    hc::project(&ctx, normed, hc_fn, m as u32, &mut mixes_w).unwrap();
-    hc::norm_project(&ctx, streams, hc_fn, eps, m as u32, &mut fused_w).unwrap();
+    hc_project::project(&ctx, normed, hc_fn, m as u32, &mut mixes_w).unwrap();
+    hc_project::norm_project(&ctx, streams, hc_fn, eps, m as u32, &mut fused_w).unwrap();
     hc::gates(
         &ctx, mixes, streams, scale, base, m as u32, gate_eps, alpha, iters, true, &mut x,
         &mut post, &mut comb,

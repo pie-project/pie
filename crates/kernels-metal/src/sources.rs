@@ -5,20 +5,36 @@ macro_rules! source_root {
 }
 pub const SOURCES: &[(&str, &str)] = &[
     (
-        "common/mpp.metal",
-        include_str!(concat!(source_root!(), "/common/mpp.metal")),
+        "attn/dense.metal",
+        include_str!(concat!(source_root!(), "/attn/dense.metal")),
     ),
     (
-        "common/register_mma.metal",
-        include_str!(concat!(source_root!(), "/common/register_mma.metal")),
+        "attn/index.metal",
+        include_str!(concat!(source_root!(), "/attn/index.metal")),
     ),
     (
-        "common/register_table.metal",
-        include_str!(concat!(source_root!(), "/common/register_table.metal")),
+        "attn/kv_codec.metal",
+        include_str!(concat!(source_root!(), "/attn/kv_codec.metal")),
     ),
     (
-        "attn/q8_write.metal",
-        include_str!(concat!(source_root!(), "/attn/q8_write.metal")),
+        "attn/kv_write.metal",
+        include_str!(concat!(source_root!(), "/attn/kv_write.metal")),
+    ),
+    (
+        "attn/logit_softcap.metal",
+        include_str!(concat!(source_root!(), "/attn/logit_softcap.metal")),
+    ),
+    (
+        "attn/merge.metal",
+        include_str!(concat!(source_root!(), "/attn/merge.metal")),
+    ),
+    (
+        "attn/mla.metal",
+        include_str!(concat!(source_root!(), "/attn/mla.metal")),
+    ),
+    (
+        "attn/pool.metal",
+        include_str!(concat!(source_root!(), "/attn/pool.metal")),
     ),
     (
         "attn/q8_decode.metal",
@@ -33,48 +49,12 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/attn/q8_split.metal")),
     ),
     (
-        "attn/attn_sink.metal",
-        include_str!(concat!(source_root!(), "/attn/attn_sink.metal")),
-    ),
-    (
-        "layout/keepalive.metal",
-        include_str!(concat!(source_root!(), "/layout/keepalive.metal")),
-    ),
-    (
-        "attn/dense.metal",
-        include_str!(concat!(source_root!(), "/attn/dense.metal")),
-    ),
-    (
-        "attn/index.metal",
-        include_str!(concat!(source_root!(), "/attn/index.metal")),
-    ),
-    (
-        "attn/kv_write.metal",
-        include_str!(concat!(source_root!(), "/attn/kv_write.metal")),
-    ),
-    (
-        "attn/logit_softcap.metal",
-        include_str!(concat!(source_root!(), "/attn/logit_softcap.metal")),
-    ),
-    (
-        "attn/merge_lse.metal",
-        include_str!(concat!(source_root!(), "/attn/merge_lse.metal")),
-    ),
-    (
-        "attn/mla.metal",
-        include_str!(concat!(source_root!(), "/attn/mla.metal")),
-    ),
-    (
-        "attn/ple.metal",
-        include_str!(concat!(source_root!(), "/attn/ple.metal")),
+        "attn/q8_write.metal",
+        include_str!(concat!(source_root!(), "/attn/q8_write.metal")),
     ),
     (
         "attn/ragged.metal",
         include_str!(concat!(source_root!(), "/attn/ragged.metal")),
-    ),
-    (
-        "attn/pool.metal",
-        include_str!(concat!(source_root!(), "/attn/pool.metal")),
     ),
     (
         "attn/score.metal",
@@ -89,52 +69,32 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/attn/sdpa_paged_mma.metal")),
     ),
     (
-        "attn/sdpa_sliding.metal",
-        include_str!(concat!(source_root!(), "/attn/sdpa_sliding.metal")),
+        "attn/sink.metal",
+        include_str!(concat!(source_root!(), "/attn/sink.metal")),
     ),
     (
-        "attn/sdpa_vector.metal",
-        include_str!(concat!(source_root!(), "/attn/sdpa_vector.metal")),
+        "attn/voxel.metal",
+        include_str!(concat!(source_root!(), "/attn/voxel.metal")),
     ),
     (
-        "attn/split_qkv.metal",
-        include_str!(concat!(source_root!(), "/attn/split_qkv.metal")),
+        "conv/conv3d.metal",
+        include_str!(concat!(source_root!(), "/conv/conv3d.metal")),
     ),
     (
-        "attn/block_dyn_conv.metal",
-        include_str!(concat!(source_root!(), "/attn/block_dyn_conv.metal")),
+        "conv/grid.h",
+        include_str!(concat!(source_root!(), "/conv/grid.h")),
     ),
     (
-        "attn/selector_walk.metal",
-        include_str!(concat!(source_root!(), "/attn/selector_walk.metal")),
+        "conv/group_norm.metal",
+        include_str!(concat!(source_root!(), "/conv/group_norm.metal")),
     ),
     (
-        "attn/ssm_causal_conv1d.metal",
-        include_str!(concat!(source_root!(), "/attn/ssm_causal_conv1d.metal")),
+        "conv/resample.metal",
+        include_str!(concat!(source_root!(), "/conv/resample.metal")),
     ),
     (
-        "attn/ssm_gated_delta.metal",
-        include_str!(concat!(source_root!(), "/attn/ssm_gated_delta.metal")),
-    ),
-    (
-        "attn/ssm_gdn_core.metal",
-        include_str!(concat!(source_root!(), "/attn/ssm_gdn_core.metal")),
-    ),
-    (
-        "attn/ssm_gdn_staged.metal",
-        include_str!("../kernels/attn/ssm_gdn_staged.metal"),
-    ),
-    (
-        "attn/ssm_gdn_scan.metal",
-        include_str!(concat!(source_root!(), "/attn/ssm_gdn_scan.metal")),
-    ),
-    (
-        "attn/ssm_gdn_prep.metal",
-        include_str!(concat!(source_root!(), "/attn/ssm_gdn_prep.metal")),
-    ),
-    (
-        "attn/ssm_kda.metal",
-        include_str!(concat!(source_root!(), "/attn/ssm_kda.metal")),
+        "conv/rule.metal",
+        include_str!(concat!(source_root!(), "/conv/rule.metal")),
     ),
     (
         "elemwise/gate.metal",
@@ -145,40 +105,12 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/elemwise/hc.metal")),
     ),
     (
-        "elemwise/norm_add_bias.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_add_bias.metal")),
-    ),
-    (
-        "elemwise/norm_gated_rms.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_gated_rms.metal")),
-    ),
-    (
-        "elemwise/norm_layer_scalar.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_layer_scalar.metal")),
-    ),
-    (
-        "elemwise/norm_layernorm.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_layernorm.metal")),
-    ),
-    (
-        "elemwise/norm_residual_add.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_residual_add.metal")),
-    ),
-    (
-        "elemwise/norm_rms.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_rms.metal")),
-    ),
-    (
-        "elemwise/norm_standardize.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_standardize.metal")),
-    ),
-    (
-        "elemwise/norm_vector.metal",
-        include_str!(concat!(source_root!(), "/elemwise/norm_vector.metal")),
-    ),
-    (
         "elemwise/modulate.metal",
         include_str!(concat!(source_root!(), "/elemwise/modulate.metal")),
+    ),
+    (
+        "elemwise/norm.metal",
+        include_str!(concat!(source_root!(), "/elemwise/norm.metal")),
     ),
     (
         "elemwise/pointwise.metal",
@@ -189,16 +121,8 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/elemwise/res_blend.metal")),
     ),
     (
-        "probe/nan_check.metal",
-        include_str!(concat!(source_root!(), "/probe/nan_check.metal")),
-    ),
-    (
         "elemwise/rope_axes.metal",
         include_str!(concat!(source_root!(), "/elemwise/rope_axes.metal")),
-    ),
-    (
-        "elemwise/sinusoid.metal",
-        include_str!(concat!(source_root!(), "/elemwise/sinusoid.metal")),
     ),
     (
         "elemwise/rope_mrope.metal",
@@ -209,92 +133,68 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/elemwise/rope_neox.metal")),
     ),
     (
-        "icb/rebind.metal",
-        include_str!(concat!(source_root!(), "/icb/rebind.metal")),
+        "elemwise/sinusoid.metal",
+        include_str!(concat!(source_root!(), "/elemwise/sinusoid.metal")),
     ),
     (
-        "layout/argmax.metal",
-        include_str!(concat!(source_root!(), "/layout/argmax.metal")),
+        "gather/deinterleave.metal",
+        include_str!(concat!(source_root!(), "/gather/deinterleave.metal")),
     ),
     (
-        "spatial/grid.metal",
-        include_str!(concat!(source_root!(), "/spatial/grid.metal")),
+        "gather/embed.metal",
+        include_str!(concat!(source_root!(), "/gather/embed.metal")),
     ),
     (
-        "spatial/rule.metal",
-        include_str!(concat!(source_root!(), "/spatial/rule.metal")),
+        "gather/embed_gather.metal",
+        include_str!(concat!(source_root!(), "/gather/embed_gather.metal")),
     ),
     (
-        "spatial/conv.metal",
-        include_str!(concat!(source_root!(), "/spatial/conv.metal")),
+        "gather/embed_weighted.metal",
+        include_str!(concat!(source_root!(), "/gather/embed_weighted.metal")),
     ),
     (
-        "spatial/norm.metal",
-        include_str!(concat!(source_root!(), "/spatial/norm.metal")),
+        "gather/fold.metal",
+        include_str!(concat!(source_root!(), "/gather/fold.metal")),
     ),
     (
-        "spatial/attn.metal",
-        include_str!(concat!(source_root!(), "/spatial/attn.metal")),
+        "gather/grid_taps.metal",
+        include_str!(concat!(source_root!(), "/gather/grid_taps.metal")),
     ),
     (
-        "spatial/resample.metal",
-        include_str!(concat!(source_root!(), "/spatial/resample.metal")),
+        "gather/ngram.metal",
+        include_str!(concat!(source_root!(), "/gather/ngram.metal")),
     ),
     (
-        "layout/topk.metal",
-        include_str!(concat!(source_root!(), "/layout/topk.metal")),
+        "gather/pixels.metal",
+        include_str!(concat!(source_root!(), "/gather/pixels.metal")),
     ),
     (
-        "layout/blit.metal",
-        include_str!(concat!(source_root!(), "/layout/blit.metal")),
+        "gather/rows.metal",
+        include_str!(concat!(source_root!(), "/gather/rows.metal")),
     ),
     (
-        "layout/deinterleave.metal",
-        include_str!(concat!(source_root!(), "/layout/deinterleave.metal")),
-    ),
-    (
-        "layout/embed.metal",
-        include_str!(concat!(source_root!(), "/layout/embed.metal")),
-    ),
-    (
-        "layout/embed_gather.metal",
-        include_str!(concat!(source_root!(), "/layout/embed_gather.metal")),
-    ),
-    (
-        "layout/embed_weighted.metal",
-        include_str!(concat!(source_root!(), "/layout/embed_weighted.metal")),
-    ),
-    (
-        "layout/fold.metal",
-        include_str!(concat!(source_root!(), "/layout/fold.metal")),
-    ),
-    (
-        "layout/grid_taps.metal",
-        include_str!(concat!(source_root!(), "/layout/grid_taps.metal")),
-    ),
-    (
-        "layout/pixels.metal",
-        include_str!(concat!(source_root!(), "/layout/pixels.metal")),
-    ),
-    (
-        "layout/ple_combine.metal",
-        include_str!(concat!(source_root!(), "/layout/ple_combine.metal")),
-    ),
-    (
-        "layout/row_gather.metal",
-        include_str!(concat!(source_root!(), "/layout/row_gather.metal")),
+        "gather/split_qkv.metal",
+        include_str!(concat!(source_root!(), "/gather/split_qkv.metal")),
     ),
     (
         "linear/ane.metal",
         include_str!(concat!(source_root!(), "/linear/ane.metal")),
     ),
     (
-        "linear/gemm_dense.metal",
-        include_str!(concat!(source_root!(), "/linear/gemm_dense.metal")),
+        "linear/dequant.h",
+        include_str!(concat!(source_root!(), "/linear/dequant.h")),
     ),
     (
-        "linear/kv_codec.metal",
-        include_str!(concat!(source_root!(), "/linear/kv_codec.metal")),
+        "linear/gemm.metal",
+        include_str!(concat!(source_root!(), "/linear/gemm.metal")),
+    ),
+    (
+        "linear/glu_packed.metal",
+        include_str!(concat!(source_root!(), "/linear/glu_packed.metal")),
+    ),
+    (
+        "linear/glu_split.metal",
+        include_str!(concat!(source_root!(), "/linear/glu_split.metal")),
     ),
     (
         "linear/lane_gemm.metal",
@@ -305,96 +205,128 @@ pub const SOURCES: &[(&str, &str)] = &[
         include_str!(concat!(source_root!(), "/linear/lora.metal")),
     ),
     (
-        "linear/mlp_gated.metal",
-        include_str!(concat!(source_root!(), "/linear/mlp_gated.metal")),
+        "linear/moe/route.metal",
+        include_str!(concat!(source_root!(), "/linear/moe/route.metal")),
     ),
     (
-        "linear/mlp_packed.metal",
-        include_str!(concat!(source_root!(), "/linear/mlp_packed.metal")),
+        "linear/moe/select.metal",
+        include_str!(concat!(source_root!(), "/linear/moe/select.metal")),
     ),
     (
-        "linear/moe_route.metal",
-        include_str!(concat!(source_root!(), "/linear/moe_route.metal")),
+        "linear/moe/select_sg.metal",
+        include_str!(concat!(source_root!(), "/linear/moe/select_sg.metal")),
     ),
     (
-        "linear/moe_select.metal",
-        include_str!(concat!(source_root!(), "/linear/moe_select.metal")),
+        "linear/qmm_mpp.metal",
+        include_str!(concat!(source_root!(), "/linear/qmm_mpp.metal")),
     ),
     (
-        "linear/quant_qmm_t.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_qmm_t.metal")),
+        "linear/qmm_sg.metal",
+        include_str!(concat!(source_root!(), "/linear/qmm_sg.metal")),
     ),
     (
-        "linear/quant_qmm_mpp.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_qmm_mpp.metal")),
+        "linear/qmm_staged.metal",
+        include_str!(concat!(source_root!(), "/linear/qmm_staged.metal")),
     ),
     (
-        "linear/quant_qmm_staged.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_qmm_staged.metal")),
+        "linear/qmm_t.metal",
+        include_str!(concat!(source_root!(), "/linear/qmm_t.metal")),
     ),
     (
-        "linear/moe_sg.metal",
-        include_str!(concat!(source_root!(), "/linear/moe_sg.metal")),
+        "linear/qmv.metal",
+        include_str!(concat!(source_root!(), "/linear/qmv.metal")),
     ),
     (
-        "linear/quant_qmm_sg.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_qmm_sg.metal")),
+        "linear/qmv_ptq1_0.metal",
+        include_str!(concat!(source_root!(), "/linear/qmv_ptq1_0.metal")),
     ),
     (
-        "linear/quant_qmv.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_qmv.metal")),
+        "linear/qmv_rows.metal",
+        include_str!(concat!(source_root!(), "/linear/qmv_rows.metal")),
     ),
     (
-        "linear/quant_ptq1_0.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_ptq1_0.metal")),
+        "linear/register_mma.h",
+        include_str!(concat!(source_root!(), "/linear/register_mma.h")),
     ),
     (
-        "linear/quant_qmv_rows.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_qmv_rows.metal")),
+        "prim/gemm_loader.h",
+        include_str!(concat!(source_root!(), "/prim/gemm_loader.h")),
     ),
     (
-        "linear/quant_transcode.metal",
-        include_str!(concat!(source_root!(), "/linear/quant_transcode.metal")),
+        "prim/gemm_mma.h",
+        include_str!(concat!(source_root!(), "/prim/gemm_mma.h")),
     ),
     (
-        "ptir/logits_copy.metal",
-        include_str!(concat!(source_root!(), "/ptir/logits_copy.metal")),
+        "prim/gemm_traits.h",
+        include_str!(concat!(source_root!(), "/prim/gemm_traits.h")),
     ),
     (
-        "sample/argmax.metal",
-        include_str!(concat!(source_root!(), "/sample/argmax.metal")),
+        "prim/gemm_transforms.h",
+        include_str!(concat!(source_root!(), "/prim/gemm_transforms.h")),
     ),
     (
-        "third_party/mlx_quantized_block.metal",
-        include_str!(concat!(
-            source_root!(),
-            "/third_party/mlx_quantized_block.metal"
-        )),
+        "prim/mpp.h",
+        include_str!(concat!(source_root!(), "/prim/mpp.h")),
     ),
     (
-        "third_party/mlx_steel_loader.metal",
-        include_str!(concat!(
-            source_root!(),
-            "/third_party/mlx_steel_loader.metal"
-        )),
+        "prim/register_table.h",
+        include_str!(concat!(source_root!(), "/prim/register_table.h")),
     ),
     (
-        "third_party/mlx_steel_mma.metal",
-        include_str!(concat!(source_root!(), "/third_party/mlx_steel_mma.metal")),
+        "runtime/blit.metal",
+        include_str!(concat!(source_root!(), "/runtime/blit.metal")),
     ),
     (
-        "third_party/mlx_steel_prelude.metal",
-        include_str!(concat!(
-            source_root!(),
-            "/third_party/mlx_steel_prelude.metal"
-        )),
+        "runtime/keepalive.metal",
+        include_str!(concat!(source_root!(), "/runtime/keepalive.metal")),
     ),
     (
-        "third_party/mlx_steel_transforms.metal",
-        include_str!(concat!(
-            source_root!(),
-            "/third_party/mlx_steel_transforms.metal"
-        )),
+        "runtime/nan_check.metal",
+        include_str!(concat!(source_root!(), "/runtime/nan_check.metal")),
+    ),
+    (
+        "runtime/rebind.metal",
+        include_str!(concat!(source_root!(), "/runtime/rebind.metal")),
+    ),
+    (
+        "sampling/argmax_rows.metal",
+        include_str!(concat!(source_root!(), "/sampling/argmax_rows.metal")),
+    ),
+    (
+        "sampling/selector_walk.metal",
+        include_str!(concat!(source_root!(), "/sampling/selector_walk.metal")),
+    ),
+    (
+        "sampling/topk.metal",
+        include_str!(concat!(source_root!(), "/sampling/topk.metal")),
+    ),
+    (
+        "ssm/conv1d.metal",
+        include_str!(concat!(source_root!(), "/ssm/conv1d.metal")),
+    ),
+    (
+        "ssm/dyn_conv.metal",
+        include_str!(concat!(source_root!(), "/ssm/dyn_conv.metal")),
+    ),
+    (
+        "ssm/gated_delta.metal",
+        include_str!(concat!(source_root!(), "/ssm/gated_delta.metal")),
+    ),
+    (
+        "ssm/gdn_prep.metal",
+        include_str!(concat!(source_root!(), "/ssm/gdn_prep.metal")),
+    ),
+    (
+        "ssm/gdn_scan.metal",
+        include_str!(concat!(source_root!(), "/ssm/gdn_scan.metal")),
+    ),
+    (
+        "ssm/gdn_staged.metal",
+        include_str!(concat!(source_root!(), "/ssm/gdn_staged.metal")),
+    ),
+    (
+        "ssm/kda.metal",
+        include_str!(concat!(source_root!(), "/ssm/kda.metal")),
     ),
 ];
 

@@ -8,7 +8,7 @@ mod common;
 
 use common::{Gpu, STATE, round_bf16, values};
 use dtype::Dtype;
-use kernels_rocm::attn::ssm;
+use kernels_rocm::ssm;
 use kernels_rocm::tuning::Tuning;
 use kernels_rocm::{RaggedTensor, RecurrentPool, Tensor};
 
@@ -178,9 +178,7 @@ fn worst(have: &[f32], want: &[f32]) -> (f32, usize) {
 
 #[test]
 fn the_chunked_gated_delta_answers_the_serial_scan() {
-    let _turn = TURN
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _turn = TURN.lock().expect("turn lock poisoned");
     let Some(gpu) = Gpu::open() else { return };
     let cases = [
         Case {
@@ -246,9 +244,7 @@ fn the_chunked_gated_delta_answers_the_serial_scan() {
 /// its rows answer stepped one at a time.
 #[test]
 fn the_batch_step_answers_its_rows_one_at_a_time() {
-    let _turn = TURN
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _turn = TURN.lock().expect("turn lock poisoned");
     let Some(gpu) = Gpu::open() else { return };
     let (kh, vh) = (4u32, 16u32);
     let rows = 24u32;

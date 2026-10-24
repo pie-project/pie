@@ -2,14 +2,14 @@ use engine_cuda::record::{BodyKey, Tiers};
 use engine_cuda::window::{Copies, Windows};
 use poem_compiler::{Budget, CompiledModel, DeviceProfile, compile};
 use poem_exec::fire::{Composition, Lane, compose};
-use poem_ir::ops::Elementwise;
+use poem_ir::ops::Elemwise;
 
 fn test_slots() -> engine_cuda::window::Slots {
     engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 4, 4096)
 }
 use poem_ir::{
-    CacheRow, Def, Dim, Dtype, Guard, Node, Operands, Platform, RuntimeInput, Seam, Trace, Ty,
-    ValueDecl, ValueId,
+    CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Seam, Trace, Ty, ValueDecl,
+    ValueId,
 };
 
 const WIDTH: u64 = 8;
@@ -66,7 +66,14 @@ impl Build {
         let node = self.trace.nodes.len() as u32;
         let y = self.value(Def::Op(node), act());
         self.trace.nodes.push(Node {
-            op: Elementwise::LayernormNoScale { x, eps: 1e-6, y }.into(),
+            op: Elemwise::Layernorm {
+                x,
+                eps: 1e-6,
+                y,
+                weight: None,
+                bias: None,
+            }
+            .into(),
             guard,
             layer: None,
         });
@@ -79,12 +86,9 @@ fn subject() -> Trace {
     let tokens = b.value(Def::Input(RuntimeInput::Tokens), act());
     let head = b.op(tokens, Guard::Always);
     let hot = b.op(head, Guard::Fact(0));
-    let cold = b.op(head, Guard::not(Guard::Fact(0)));
+    let cold = b.op(head, !Guard::Fact(0));
     let merged = b.value(
-        Def::Merge(vec![
-            (hot, Guard::Fact(0)),
-            (cold, Guard::not(Guard::Fact(0))),
-        ]),
+        Def::Merge(vec![(hot, Guard::Fact(0)), (cold, !Guard::Fact(0))]),
         act(),
     );
     let y = b.op(merged, Guard::Always);
@@ -112,7 +116,7 @@ fn shifting(trace: &Trace, compiled: &CompiledModel) -> Vec<bool> {
                 trace
                     .nodes
                     .get(node as usize)
-                    .is_some_and(|node| engine_cuda::shifted(Operands::name(&node.op)))
+                    .is_some_and(|node| engine_cuda::shifted(&node.op))
             })
         })
         .collect()

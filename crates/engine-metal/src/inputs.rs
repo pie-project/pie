@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use kernels_metal::Tensor;
 use poem_compiler::Budget;
 use poem_ir::Dtype;
@@ -1046,7 +1047,7 @@ impl Inputs {
 }
 
 /// The ints of one lane's row in the snapshot table: its rows, then its slots.
-const SNAP_INTS: u32 = 2 * kernels_metal::attn::ssm::RS_SNAPSHOTS;
+const SNAP_INTS: u32 = 2 * kernels_metal::ssm::RS_SNAPSHOTS;
 
 fn csr(into: &mut Vec<i32>, staged: &[i32], ceiling: u32) {
     into.clear();

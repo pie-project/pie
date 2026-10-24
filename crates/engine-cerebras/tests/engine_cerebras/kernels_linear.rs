@@ -127,7 +127,7 @@ fn a_tall_and_wide_matmul_spreads_over_a_three_way_grid() {
 /// on the host, as a host phase of the program.
 #[test]
 fn a_vocabulary_sized_matmul_runs_on_the_host() {
-    let (m, k, n) = (2u32, 64u32, 135_168u32); // over MAX_PES x shard_words() elements
+    let (m, k, n) = (2u32, 64u32, 135_168u32); // over the default max_pes x shard_words elements
     let acts = data((m * k) as usize, 40);
     let ws = data((n * k) as usize, 41);
     let mut b = Bench::new();
@@ -220,7 +220,7 @@ fn lora_case(rows: usize, n_in: usize, n_out: usize, rank: usize, adapters: usiz
 
 #[test]
 fn a_wide_matmul_spreads_its_weight_over_a_row_of_pes() {
-    // 12 x 1024 weights: over shard_words() (4096) elements, split 3 ways.
+    // 12 x 1024 weights: over the default shard_words (4096) elements, split 3 ways.
     let (m, k, n) = (3u32, 1024u32, 12u32);
     let acts = data((m * k) as usize, 30);
     let ws = data((n * k) as usize, 31);

@@ -7,7 +7,7 @@
 // the row's kv slot ((w_page, w_off), else request r's last slot);
 // `row_valid` drops dead rows.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 #include "attn/kv.hip"
 #include "elemwise/rope.hip"
 

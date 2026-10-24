@@ -1,0 +1,30 @@
+// y[r] += B[a] (A[a] x[r]) for rows [r0, r1) and a = routes[r] inside [0, adapters).
+fn k_lora(x: [*]f32, a: [*]f32, b: [*]f32, routes: [*]i32, y: [*]f32, waist: [*]f32,
+          r0: i32, r1: i32, o0: i32, o1: i32, k0: i32, k1: i32, xr0: i32, in_w: i32, out_w: i32, rank: i32, adapters: i32, aw: i32, bw: i32, sharded: bool) void {
+  // Whole banks and y rows, or (sharded) this PE's outputs [o0, o1) and
+  // ranks [k0, k1): its down bank rows are [rl][in_w], its up bank rows
+  // [ol][rl], its y rows ol wide, and y gets this PE's partial over its
+  // ranks (the host adds the rank groups up). x holds rows from xr0 on.
+  var rl: i32 = k1 - k0;
+  var ol: i32 = o1 - o0;
+  var awl: i32 = aw;
+  var bwl: i32 = bw;
+  var yw: i32 = out_w;
+  var os: i32 = 0;
+  if (sharded) { awl = rl * in_w; bwl = ol * rl; yw = ol; os = o0; }
+  var r: i32 = r0;
+  while (r < r1) : (r += 1) {
+    var ad: i32 = routes[r];
+    if (ad >= 0 and ad < adapters) {
+      var k: i32 = 0;
+      while (k < rl) : (k += 1) {
+        waist[k] = k_dot(a, ad * awl + k * in_w, x, (r - xr0) * in_w, in_w);
+      }
+      var o: i32 = o0;
+      while (o < o1) : (o += 1) {
+        y[r * yw + (o - os)] = y[r * yw + (o - os)] + k_dot(b, ad * bwl + (o - os) * rl, waist, 0, rl);
+      }
+    }
+  }
+}
+

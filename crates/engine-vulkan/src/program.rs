@@ -414,7 +414,7 @@ impl Plane {
         if seat
             .landing
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("landing lock poisoned")
             .contains(&(channel, head))
         {
             return Ok(None);
@@ -667,7 +667,7 @@ impl Plane {
             .collect();
         seat.landing
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .expect("landing lock poisoned")
             .extend(owed.iter().copied());
 
         let status = seat.session.status_cell();
@@ -688,10 +688,7 @@ impl Plane {
                     Err(why) => Some(why.to_string()),
                 };
             }
-            let lent = landing
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take();
+            let lent = landing.lock().expect("landing lock poisoned").take();
             if fault.is_none()
                 && let Some(lent) = lent.as_ref()
             {
@@ -710,13 +707,10 @@ impl Plane {
             }
             owing
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("owing lock poisoned")
                 .retain(|cell| !owed.contains(cell));
             if let Some(lent) = lent {
-                spare
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(lent);
+                spare.lock().expect("spare lock poisoned").push(lent);
             }
             if let Some(done) = done.as_ref() {
                 let outcome = match fault {

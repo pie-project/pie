@@ -1,4 +1,5 @@
-use kernels_vulkan::{ArgValue, Encode, Error, Fire};
+#![allow(unsafe_code)]
+use kernels_slang::{ArgValue, Encode, Error, Fire, Target};
 
 use crate::device::ctx::Frame;
 use crate::device::handles::NIL;
@@ -80,7 +81,7 @@ pub fn profiling() -> bool {
 pub fn kernel_profile() -> Vec<(String, u64, u64)> {
     let mut rows: Vec<(String, u64, u64)> = KERNEL_PROFILE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .expect("kernel profile lock poisoned")
         .iter()
         .map(|(name, &(ns, n))| (name.clone(), ns, n))
         .collect();
@@ -90,16 +91,14 @@ pub fn kernel_profile() -> Vec<(String, u64, u64)> {
 
 #[cfg(feature = "vulkan")]
 pub(crate) fn credit(name: &str, ns: u64) {
-    let mut table = KERNEL_PROFILE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
     table.entry(name.to_string()).or_insert((0, 0)).0 += ns;
 }
 
 pub fn reset_kernel_profile() {
     KERNEL_PROFILE
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .expect("kernel profile lock poisoned")
         .clear();
     HOST_ENCODE_NS.store(0, std::sync::atomic::Ordering::Relaxed);
     BARRIERS.store(0, std::sync::atomic::Ordering::Relaxed);
@@ -112,9 +111,7 @@ pub fn reset_kernel_profile() {
 
 #[cfg(feature = "vulkan")]
 fn record_kernel(name: &str) {
-    let mut table = KERNEL_PROFILE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut table = KERNEL_PROFILE.lock().expect("kernel profile lock poisoned");
     table.entry(name.to_string()).or_insert((0, 0)).1 += 1;
 }
 
@@ -137,11 +134,7 @@ pub fn capture_shapes(on: bool) {
 
 #[must_use]
 pub fn take_shapes() -> Vec<DispatchShape> {
-    std::mem::take(
-        &mut *SHAPES
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-    )
+    std::mem::take(&mut *SHAPES.lock().expect("shapes lock poisoned"))
 }
 
 #[cfg(feature = "vulkan")]
@@ -217,6 +210,13 @@ impl<'a> Sink<'a> {
 }
 
 #[cfg(feature = "vulkan")]
+impl Drop for Sink<'_> {
+    fn drop(&mut self) {
+        crate::probe::clear_frame(self.frame);
+    }
+}
+
+#[cfg(feature = "vulkan")]
 impl Encode for Sink<'_> {
     fn fire(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
         let started = profiling().then(std::time::Instant::now);
@@ -245,7 +245,11 @@ impl Encode for Sink<'_> {
         Ok(ArgValue::Buffer(NIL))
     }
 
-    fn comm(&self, op: &'static str) -> Result<kernels_vulkan::Comm, Error> {
+    fn target(&self) -> Target {
+        Target::Spirv
+    }
+
+    fn comm(&self, op: &'static str) -> Result<kernels_slang::Comm, Error> {
         let comm = self.comm.ok_or(Error::Unsupported { op })?;
 
         let band = self
@@ -259,11 +263,10 @@ impl Encode for Sink<'_> {
             op,
             detail: fault.to_string(),
         })?;
-        Ok(kernels_vulkan::Comm {
+        Ok(kernels_slang::Comm {
             rank: comm.rank(),
             world: comm.world(),
-
-            band: kernels_vulkan::Tensor::new(band, 1, 0, poem_ir::Dtype::Bf16),
+            band,
             slot_bytes,
         })
     }
@@ -285,9 +288,15 @@ impl Sink<'_> {
     fn fire_inner(&self, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
         use ash::vk;
 
+        let key = kernels_slang::key(fire.entrypoint, fire.tier).ok_or_else(|| {
+            Sink::backend(
+                fire,
+                format!("not instantiated at the {} tier", fire.tier.name()),
+            )
+        })?;
         let pipeline = self
             .pipelines
-            .get(self.device, fire)
+            .get(self.device, fire.file, key)
             .map_err(|fault| Sink::refuse(fire, fault))?;
 
         let dummy = &self.device.dummy;
@@ -430,6 +439,11 @@ impl Sink<'_> {
                 continue;
             }
 
+            // SAFETY: only the lifetime changes, so `sets` can live in the
+            // reused scratch. `WriteDescriptorSet` keeps a raw pointer to
+            // `info`, which is read only by `update_descriptor_sets` below,
+            // while `infos` is untouched; `sets` is cleared before `infos`
+            // changes again on the next fire, and no one reads it in between.
             let info: &'static vk::DescriptorBufferInfo = unsafe { std::mem::transmute(info) };
             scratch.sets.push(
                 vk::WriteDescriptorSet::default()
@@ -439,6 +453,13 @@ impl Sink<'_> {
                     .buffer_info(std::slice::from_ref(info)),
             );
         }
+        // SAFETY: `set` was handed out by `descriptor_set` to this dispatch
+        // alone and no submitted command uses it yet, so updating it needs no
+        // further sync; every buffer it names is a live slab the frame retains,
+        // with offsets and ranges from bound views. `cmd` is the open frame's
+        // buffer, recorded only by this sink's thread (`Frame` is not `Sync`).
+        // The push block's length was checked against the layout's range,
+        // and a timestamp index stays below the pool's `capacity * 2`.
         unsafe {
             if !scratch.sets.is_empty() {
                 d.update_descriptor_sets(&scratch.sets, &[]);
@@ -478,11 +499,11 @@ impl Sink<'_> {
                     .inner
                     .timing
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    .expect("timing lock poisoned");
                 match slot.as_mut() {
                     Some(t) if (t.names.len() as u32) < t.capacity => {
                         let at = t.names.len() as u32;
-                        t.names.push(fire.entrypoint);
+                        t.names.push(key);
                         Some((t.pool, at))
                     }
                     _ => None,
@@ -507,14 +528,14 @@ impl Sink<'_> {
             }
         }
         self.frame.dispatches.set(self.frame.dispatches.get() + 1);
-        record_kernel(fire.entrypoint);
+        record_kernel(key);
         if CAPTURING.load(std::sync::atomic::Ordering::Acquire) {
             use ash::vk::Handle;
             SHAPES
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .expect("shapes lock poisoned")
                 .push(DispatchShape {
-                    entrypoint: fire.entrypoint,
+                    entrypoint: key,
                     bindings: infos
                         .iter()
                         .take(declared)
@@ -572,4 +593,32 @@ impl Encode for Sink<'_> {
     fn absent(&self) -> Result<ArgValue, Error> {
         Ok(ArgValue::Buffer(NIL))
     }
+
+    fn target(&self) -> Target {
+        Target::Spirv
+    }
+}
+
+/// The device's `kernel.qmm` ladder at this shape, as kernels-slang's rungs.
+pub(crate) fn qmm_ladder(
+    tuning: &crate::tuning::Tuning,
+    rows: u32,
+    columns: u32,
+    contraction: u32,
+    bank: kernels_slang::Bank,
+) -> Vec<kernels_slang::linear::qmm::Qmm> {
+    use crate::tuning::Qmm;
+    use kernels_slang::linear::qmm::Qmm as Rung;
+    let at = tuning.qmm_at(rows, columns, contraction, bank.bits, bank.group);
+    tuning
+        .qmm(&at)
+        .iter()
+        .map(|q| match *q {
+            Qmm::Coopmat => Rung::Coopmat,
+            Qmm::RegisterTiled { bm, k16 } => Rung::RegisterTiled { bm, k16 },
+            Qmm::Tiled { crossover_tg } => Rung::Tiled { crossover_tg },
+            Qmm::OneRow { lanes, rows } => Rung::OneRow { lanes, rows },
+            Qmm::Qmv { vecs } => Rung::Qmv { vecs },
+        })
+        .collect()
 }

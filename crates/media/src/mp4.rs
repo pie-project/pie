@@ -412,11 +412,14 @@ fn parse_at(data: &[u8], from: usize, to: usize) -> Result<Vec<Node>, String> {
                         String::from_utf8_lossy(&kind)
                     ));
                 }
-                u64::from_be_bytes(data[at + 8..at + 16].try_into().unwrap()) as usize
+                usize::try_from(u64::from_be_bytes(
+                    data[at + 8..at + 16].try_into().unwrap(),
+                ))
+                .unwrap_or(usize::MAX)
             }
             n => n,
         };
-        if size < 8 || at + size > to {
+        if size < 8 || size > to - at {
             return Err(format!(
                 "box '{}' at {at} claims {size} bytes, {} remain",
                 String::from_utf8_lossy(&kind),

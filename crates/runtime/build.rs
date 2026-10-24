@@ -9,7 +9,12 @@ fn main() {
     let mut packages: Vec<(String, Vec<(String, String)>)> = Vec::new();
     for dir in std::fs::read_dir(&root).expect("the repository's models/") {
         let dir = dir.expect("a models/ entry").path();
-        if !dir.join("package.poem").is_file() {
+        // A package is a directory of `.poem` files, `lib/` excepted.
+        let poem = |entry: std::fs::DirEntry| entry.path().extension().is_some_and(|e| e == "poem");
+        let is_package = dir.is_dir()
+            && dir.file_name().is_some_and(|name| name != "lib")
+            && std::fs::read_dir(&dir).is_ok_and(|entries| entries.flatten().any(poem));
+        if !is_package {
             continue;
         }
         println!("cargo:rerun-if-changed={}", dir.display());

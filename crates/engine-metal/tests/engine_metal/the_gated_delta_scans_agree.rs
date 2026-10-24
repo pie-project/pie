@@ -3,8 +3,8 @@
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
 use kernels_metal::Tensor;
-use kernels_metal::attn::ssm::{self, Committed};
 use kernels_metal::encode::{Arg, Encode, Fire, Grid};
+use kernels_metal::ssm::{self, Committed};
 use kernels_metal::tensor::{RaggedTensor, RecurrentPool};
 use poem_ir::Dtype;
 
@@ -18,7 +18,7 @@ const BANK_FLOATS: u64 = V_HEADS as u64 * V_DIM as u64 * K_DIM as u64;
 const T: u32 = 33;
 const J: u32 = 5;
 
-const OLD_FILE: &str = "attn/ssm_gated_delta.metal";
+const OLD_FILE: &str = "ssm/gated_delta.metal";
 
 const SLOTS: u32 = 8;
 const SLOT_OLD_COMMITTED: u32 = 0;

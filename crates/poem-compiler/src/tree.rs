@@ -63,13 +63,15 @@ pub fn fields_mut(tree: &mut Tree) -> &mut Vec<(&'static str, Tree)> {
     }
 }
 
-/// The values a field holds, through an `Option` or a list.
+/// The values a field holds, through an `Option`, a list or an enum's
+/// variant (`NormWeight::Scale(w)`).
 #[must_use]
 pub fn ids(tree: &Tree) -> Vec<ValueId> {
     match tree {
         Tree::Id(id) => vec![ValueId(*id)],
         Tree::Some(inner) => ids(inner),
         Tree::Seq(items) => items.iter().flat_map(ids).collect(),
+        Tree::Variant(_, inner) => ids(inner),
         _ => Vec::new(),
     }
 }

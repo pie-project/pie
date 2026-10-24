@@ -11,14 +11,14 @@ mod common;
 
 use common::{Gpu, bf16, bf16s, close_bf16, e4m3_value, round_bf16, values};
 use dtype::Dtype;
-use kernels_rocm::layout_embed_concat::{embed_concat, embed_concat_mlxu4, embed_mlx_affine};
-use kernels_rocm::layout_embed_e4m3::embed_concat_mxfp8;
-use kernels_rocm::layout_embed_weighted::embed_weighted;
-use kernels_rocm::layout_fold::{merge_rows, pool_rows};
-use kernels_rocm::layout_pixels::{grid_taps, pixels};
-use kernels_rocm::layout_scatter_live::scatter_live_rows;
+use kernels_rocm::gather::embed_concat_mxfp8;
+use kernels_rocm::gather::embed_weighted;
+use kernels_rocm::gather::scatter_live_rows;
+use kernels_rocm::gather::{embed_concat, embed_concat_mlxu4, embed_mlx_affine};
+use kernels_rocm::gather::{grid_taps, pixels};
+use kernels_rocm::gather::{merge_rows, pool_rows};
 use kernels_rocm::linear::moe::GroupSeat;
-use kernels_rocm::{ArgValue, Ctx, Fire, Launch, Tensor, layout};
+use kernels_rocm::{ArgValue, Ctx, Fire, Launch, Tensor, gather, sampling};
 
 /// bf16 values as the bytes of a u8 plane [rows, 2·width].
 fn bf16_bytes(gpu: &Gpu, v: &[f32], rows: u32, width: u32) -> Tensor {
@@ -73,7 +73,7 @@ fn split_qkv_and_select() {
         let mut q = gpu.zeros(rows, qd, Dtype::Bf16);
         let mut k = gpu.zeros(rows, kvd, Dtype::Bf16);
         let mut v = gpu.zeros(rows, kvd, Dtype::Bf16);
-        layout::split_qkv(&ctx, x, qd, kvd, &mut q, &mut k, &mut v).unwrap();
+        gather::split_qkv(&ctx, x, qd, kvd, &mut q, &mut k, &mut v).unwrap();
         assert_eq!(gpu.read(&q), wq, "q {qd}/{kvd}");
         assert_eq!(gpu.read(&k), wk, "k {qd}/{kvd}");
         assert_eq!(gpu.read(&v), wv, "v {qd}/{kvd}");
@@ -83,7 +83,7 @@ fn split_qkv_and_select() {
         let mut k = gpu.zeros(rows, kvd, Dtype::Bf16);
         let mut v = gpu.zeros(rows, kvd, Dtype::Bf16);
         windowed(&gpu, &ctx, 2, 1, 0, || {
-            layout::split_qkv(&ctx, x, qd, kvd, &mut q, &mut k, &mut v).unwrap();
+            gather::split_qkv(&ctx, x, qd, kvd, &mut q, &mut k, &mut v).unwrap();
         });
         assert_eq!(
             gpu.read(&q),
@@ -113,11 +113,11 @@ fn split_qkv_and_select() {
         })
         .collect();
     let mut y = gpu.zeros(rows, width, Dtype::Bf16);
-    layout::select(&ctx, table, 2, width, &mut y).unwrap();
+    gather::select(&ctx, table, 2, width, &mut y).unwrap();
     assert_eq!(gpu.read(&y), want, "select");
     let mut y = gpu.zeros(rows, width, Dtype::Bf16);
     windowed(&gpu, &ctx, 3, 2, 0, || {
-        layout::select(&ctx, table, 2, width, &mut y).unwrap();
+        gather::select(&ctx, table, 2, width, &mut y).unwrap();
     });
     assert_eq!(
         gpu.read(&y),
@@ -168,7 +168,7 @@ fn embed_scale_add_and_shards() {
     let mut es = gpu.zeros(rows, hidden, Dtype::Bf16);
     let mut y = gpu.tensor(&yv, rows, hidden, Dtype::Bf16);
     let mut ys = gpu.zeros(rows, hidden, Dtype::Bf16);
-    layout::embed_scale_add(
+    gather::embed_scale_add(
         &ctx, id_t, table, vocab, &mut e, a, &mut es, &mut y, b, &mut ys,
     )
     .unwrap();
@@ -187,7 +187,7 @@ fn embed_scale_add_and_shards() {
     let mut y = gpu.tensor(&yv, rows, hidden, Dtype::Bf16);
     let mut ys = gpu.zeros(rows, hidden, Dtype::Bf16);
     windowed(&gpu, &ctx, 3, 2, 0, || {
-        layout::embed_scale_add(
+        gather::embed_scale_add(
             &ctx, id_t, table, vocab, &mut e, a, &mut es, &mut y, b, &mut ys,
         )
         .unwrap();
@@ -212,7 +212,7 @@ fn embed_scale_add_and_shards() {
     let mut es = gpu.zeros(rows, hidden, Dtype::Bf16);
     let mut y = gpu.zeros(rows, hidden, Dtype::Bf16);
     let mut ys = gpu.zeros(rows, hidden, Dtype::Bf16);
-    layout::embed_scale_add_select(
+    gather::embed_scale_add_select(
         &ctx, id_t, table, vocab, &mut e, a, &mut es, stacked, 1, hidden, &mut y, b, &mut ys,
     )
     .unwrap();
@@ -231,7 +231,7 @@ fn embed_scale_add_and_shards() {
     let y = gpu.zeros(rows, hidden, Dtype::Bf16);
     ctx.fire(
         "test.embed_vocab_shard",
-        Fire::at("layout/layout.hip", "::pie::layout::embed_vocab_shard")
+        Fire::at("gather/rows.hip", "::pie::layout::embed_vocab_shard")
             .apply(Launch::grid([rows, 1, 1], [256, 1, 1])),
         &[
             id_t.arg(),
@@ -264,7 +264,7 @@ fn embed_scale_add_and_shards() {
     let total = rows * (world * shard) as u32;
     ctx.fire(
         "test.gather_width_concat",
-        Fire::at("layout/layout.hip", "::pie::layout::gather_width_concat")
+        Fire::at("gather/rows.hip", "::pie::layout::gather_width_concat")
             .apply(Launch::flat(total, 256)),
         &[
             src.arg(),
@@ -301,20 +301,20 @@ fn permutations_folds_and_scatters() {
         let perm = [3i32, 5, 0, 1, 4, 2];
         let perm_t = gpu.column(&perm);
         let mut packed = gpu.zeros(rows, width, dtype);
-        layout::pack_rows(&ctx, x, perm_t, &mut packed).unwrap();
+        gather::pack_rows(&ctx, x, perm_t, &mut packed).unwrap();
         let want: Vec<f32> = perm
             .iter()
             .flat_map(|&p| xv[p as usize * w..(p as usize + 1) * w].to_vec())
             .collect();
         assert_eq!(gpu.read(&packed), want, "pack_rows {width}");
         let mut back = gpu.zeros(rows, width, dtype);
-        layout::unpack_rows(&ctx, packed, perm_t, &mut back).unwrap();
+        gather::unpack_rows(&ctx, packed, perm_t, &mut back).unwrap();
         assert_eq!(gpu.read(&back), xv, "unpack_rows {width}");
 
         // Rows 1..4 of the pack only.
         let mut packed = gpu.zeros(rows, width, dtype);
         windowed(&gpu, &ctx, 3, 1, 0, || {
-            layout::pack_rows(&ctx, x, perm_t, &mut packed).unwrap();
+            gather::pack_rows(&ctx, x, perm_t, &mut packed).unwrap();
         });
         assert_eq!(
             gpu.read(&packed),
@@ -699,7 +699,7 @@ fn argmax_and_topk() {
 
         // argmax lands in column 1 of a 2-wide plane.
         let mut y = gpu.zeros(rows, 2, Dtype::I32);
-        layout::argmax(&ctx, x, 1, &mut y).unwrap();
+        sampling::argmax(&ctx, x, 1, &mut y).unwrap();
         let got = gpu.read_as::<i32>(&y);
         for r in 0..rows as usize {
             assert_eq!(got[2 * r], 0, "argmax {width} row {r} column 0 untouched");
@@ -709,7 +709,7 @@ fn argmax_and_topk() {
         for k in [8u32, 16] {
             let mut v = gpu.zeros(rows, k, Dtype::F32);
             let mut i = gpu.zeros(rows, k, Dtype::I32);
-            layout::topk(&ctx, x, k, &mut v, &mut i).unwrap();
+            sampling::top_k(&ctx, x, k, &mut v, &mut i).unwrap();
             let (gv, gi) = (gpu.read(&v), gpu.read_as::<i32>(&i));
             for r in 0..rows as usize {
                 let k = k as usize;
@@ -730,7 +730,7 @@ fn argmax_and_topk() {
         // Under a window of 2 rows, rows 2.. are not written.
         let mut y = gpu.zeros(rows, 1, Dtype::I32);
         windowed(&gpu, &ctx, 2, 0, 0, || {
-            layout::argmax(&ctx, x, 0, &mut y).unwrap()
+            sampling::argmax(&ctx, x, 0, &mut y).unwrap()
         });
         let got = gpu.read_as::<i32>(&y);
         assert_eq!(
@@ -799,7 +799,7 @@ fn envelope_update_appended() {
         let fire = || {
             ctx.fire(
                 "test.envelope",
-                Fire::at("layout/envelope.hip", "::pie::layout::update_appended")
+                Fire::at("attn/kv_envelope.hip", "::pie::layout::update_appended")
                     // Two slots past the four touched pages do nothing.
                     .apply(Launch::grid(
                         [6, kv_heads as u32, 1],

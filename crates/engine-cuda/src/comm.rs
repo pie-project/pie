@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use core::ffi::c_void;
 use std::fmt;
 
@@ -59,10 +60,15 @@ pub struct Comm {
     peers: Option<kernels_cuda::collective::Peers>,
 }
 
-// SAFETY: NCCL communicators are used from any thread as long as calls on one
-// communicator are not concurrent, which the group guarantees by driving each
-// rank from one thread at a time.
+// SAFETY: an NCCL communicator may be used from any thread as long as calls
+// on it are not concurrent; the group drives each rank's collectives from that
+// rank's one lane thread.
 unsafe impl Send for Comm {}
+// SAFETY: the group shares `Arc<Comm>` with its abort closures. Through `&self`
+// a `Comm` only hands out its immutable fields (`raw`, `peers`, `rank`,
+// `size`) or calls `ncclCommAbort`, which NCCL allows from another thread
+// while a collective runs on the communicator; `Poison::set` runs the aborts
+// once.
 unsafe impl Sync for Comm {}
 
 impl Comm {
@@ -161,7 +167,7 @@ impl PartialEq for Comm {
 
 /// Bytes of each rank's peer stage; a longer message goes in stage-sized
 /// chunks.
-#[cfg(feature = "device")]
+#[cfg(feature = "cuda")]
 const STAGE_BYTES: u64 = 16 << 20;
 
 /// Maps every rank's stage into every other rank when each pair of devices
@@ -170,10 +176,11 @@ const STAGE_BYTES: u64 = 16 << 20;
 /// handshake below is the whole decision: a link that carries the kernels'
 /// stores and loads carries every message, since the peer all-reduce reads
 /// no more than NCCL's ring moves and never crosses host memory (#777).
-/// `None` otherwise, and the collectives stay on NCCL.
+/// `None` otherwise, and the collectives stay on NCCL; always `None` on ROCm,
+/// which has no peer kernels and carries every message on RCCL.
 #[must_use]
 pub fn open_peers(ordinals: &[i32]) -> Option<Vec<kernels_cuda::collective::Peers>> {
-    #[cfg(feature = "device")]
+    #[cfg(feature = "cuda")]
     {
         match wire_peers(ordinals) {
             Ok(peers) => {
@@ -186,14 +193,14 @@ pub fn open_peers(ordinals: &[i32]) -> Option<Vec<kernels_cuda::collective::Peer
             }
         }
     }
-    #[cfg(not(feature = "device"))]
+    #[cfg(not(feature = "cuda"))]
     {
         let _ = ordinals;
         None
     }
 }
 
-#[cfg(feature = "device")]
+#[cfg(feature = "cuda")]
 fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::Peers>>> {
     use crate::device::rt;
 

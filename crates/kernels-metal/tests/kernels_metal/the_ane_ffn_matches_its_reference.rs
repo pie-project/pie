@@ -1,4 +1,5 @@
 #![cfg(target_vendor = "apple")]
+#![allow(unsafe_code)]
 
 use kernels_metal::ane::ffn::{Ffn, INTERMEDIATE_BLOCK, Memory, SEGMENT, Shape, signs};
 use kernels_metal::ane::{Surface, available};
@@ -49,6 +50,8 @@ impl Random {
 }
 
 fn put_i8(surface: &Surface, row: u32, column: u32, value: i8) {
+    // SAFETY: callers pass a row and column inside the surface's shape, so the
+    // byte lies inside its allocation, and no evaluation is in flight.
     unsafe {
         *surface
             .base()
@@ -57,6 +60,9 @@ fn put_i8(surface: &Surface, row: u32, column: u32, value: i8) {
     };
 }
 fn put_f16(surface: &Surface, row: u32, column: u32, value: f32) {
+    // SAFETY: callers pass a row and column inside an fp16 surface's shape, so
+    // the 2-aligned element lies inside its allocation, and no evaluation is in
+    // flight.
     unsafe {
         *surface
             .base()
@@ -65,6 +71,7 @@ fn put_f16(surface: &Surface, row: u32, column: u32, value: f32) {
     };
 }
 fn get_f16(surface: &Surface, row: u32, column: u32) -> f64 {
+    // SAFETY: as `put_f16`; the evaluation has reported before any read.
     float(unsafe {
         *surface
             .base()
@@ -142,6 +149,8 @@ fn the_ane_ffn_matches_its_reference_on_one_chunk() {
     let event: Retained<_> = device.newSharedEvent().unwrap();
     let evaluation = ffn.evaluation(rows).unwrap();
     let (tx_done, rx_done) = std::sync::mpsc::channel();
+    // SAFETY: `memory` holds the binding's surfaces to the end of the test,
+    // which waits for the evaluation to report first.
     unsafe {
         ffn.program
             .enqueue(

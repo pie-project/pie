@@ -1,7 +1,7 @@
 
 
-#ifndef PIE_VENDOR_CUDA_H_
-#define PIE_VENDOR_CUDA_H_
+#ifndef PIE_SHIM_CUDA_H_
+#define PIE_SHIM_CUDA_H_
 
 #include <cstdint>
 

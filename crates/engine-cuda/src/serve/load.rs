@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+use poem_compiler::arena::{LiveSlot, Peak};
 use poem_compiler::{Budget, Budgets, CompiledModel, DeviceProfile};
 
 use crate::arena::Arena;
@@ -104,15 +106,15 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
 
     let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
     let profile = DeviceProfile::of(&chip, device.device().num_sm, &crate::EXCLUSIVE, grouped);
-    let mut kernels = poem_compiler::fuse::flags::kernels(&chip);
+    let mut kernels = poem_compiler::fuse::flags::on(&chip, &crate::FUSIONS);
     if !boot.knobs.diagnostics.fuse_chains {
-        kernels.retain(|kernel| crate::UNCHAINED.contains(kernel));
+        kernels.retain(|rule| crate::UNCHAINED.contains(&rule.kernel()));
     }
     #[cfg(feature = "rocm")]
     {
         boot.trace = crate::split_arm::split_into_arms(boot.trace.clone());
     }
-    boot.trace = poem_compiler::fuse::fuse(boot.trace.clone(), &kernels);
+    boot.trace = poem_compiler::fuse::fuse(boot.trace.clone(), kernels);
     #[cfg(not(feature = "rocm"))]
     {
         let tuning = kernels_cuda::tuning::Tuning::of(&chip);
@@ -121,7 +123,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             tuning.decode_grouped_prefill_from,
             tuning.decode_grouped_prefill_lse,
             tuning.decode_grouped_prefill_window,
-            kernels_cuda::attn::xqa::Gate::of(tuning),
+            kernels_cuda::attn::decode_gqa::Gate::of(tuning),
         );
         boot.trace = crate::narrow::gdn_out_bf16(boot.trace.clone(), tuning.ssm_gdn_out_bf16);
     }
@@ -235,10 +237,10 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 .nodes
                 .get(region.nodes.start as usize)
                 .map_or("?", |node| poem_ir::Operands::name(&node.op));
-            if op.starts_with("attention.") {
+            if op.starts_with("attn.") || op.starts_with("ssm.") {
                 streams.entry(region.stream).or_default().push(format!(
                     "r{at}:{}:{:?}",
-                    op.trim_start_matches("attention."),
+                    op.trim_start_matches("attn."),
                     region.mask.iter().collect::<Vec<_>>()
                 ));
             }
@@ -249,7 +251,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
                 regions.join(" ")
             );
         }
-        let (at, slots) = compiled.arena.peak();
+        let Peak { at, slots } = compiled.arena.peak();
         eprintln!(
             "[arm-trace] budget: max_tokens {} max_lanes {} buckets {:?}",
             boot.budget.max_tokens, boot.budget.max_lanes, boot.budget.buckets
@@ -264,9 +266,15 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
             compiled.arena.bytes >> 20,
             compiled.arena.live_bound() >> 20,
             slots.len(),
-            slots.iter().map(|(_, _, _, bytes)| *bytes).sum::<u64>() >> 20
+            slots.iter().map(|slot| slot.bytes).sum::<u64>() >> 20
         );
-        for (value, span, offset, bytes) in slots.iter().take(16) {
+        for LiveSlot {
+            value,
+            span,
+            offset,
+            bytes,
+        } in slots.iter().take(16)
+        {
             let what = match &boot.trace.values[value.0 as usize].def {
                 poem_ir::Def::Op(node) => {
                     poem_ir::Operands::name(&boot.trace.nodes[*node as usize].op).to_string()
@@ -568,12 +576,12 @@ impl Shell {
         // `kernel.gemm.fp8_o_down`: grouped projections on fp8b128, as vLLM
         // reads DeepSeek-V4's `wo_a` (the wide fires on tcgen05).
         #[cfg(feature = "cuda")]
-        if device.ctx().tuning().fp8_o_down && kernels_cuda::linear::tc5::supported() {
+        if device.ctx().tuning().fp8_o_down && kernels_cuda::linear::gemm_sm100::supported() {
             weights.requantize_grouped(&boot.trace, device.stream())?;
         }
         // `kernel.gemm.fp8_shadow`: block-FP8 dense planes keep a bf16 copy.
         #[cfg(feature = "cuda")]
-        if device.ctx().tuning().gemm_fp8_shadow && !kernels_cuda::linear::tc5::supported() {
+        if device.ctx().tuning().gemm_fp8_shadow && !kernels_cuda::linear::gemm_sm100::supported() {
             weights.shadow_fp8_dense(&boot.trace, device.stream())?;
         }
         if boot.knobs.diagnostics.arm_trace {
@@ -622,13 +630,13 @@ impl Shell {
             if wants_if {
                 warmed(
                     "conditional setter",
-                    kernels_cuda::graph::set_conditional(
+                    kernels_cuda::runtime::graph::set_conditional(
                         device.ctx(),
                         0,
                         0,
                         0,
                         false,
-                        kernels_cuda::graph::Arm::Warm,
+                        kernels_cuda::runtime::graph::Arm::Warm,
                         0,
                     ),
                 )?;
@@ -636,13 +644,13 @@ impl Shell {
             if wants_switch {
                 warmed(
                     "switch setter",
-                    kernels_cuda::graph::set_switch(
+                    kernels_cuda::runtime::graph::set_switch(
                         device.ctx(),
                         0,
                         0,
                         0,
                         0,
-                        kernels_cuda::graph::Arm::Warm,
+                        kernels_cuda::runtime::graph::Arm::Warm,
                         0,
                     ),
                 )?;
@@ -739,7 +747,7 @@ impl Shell {
             crate::store::rs::snapshots(&boot.trace, |k_dim| {
                 #[cfg(not(feature = "rocm"))]
                 {
-                    kernels_cuda::attn::ssm::gdn_lands_snapshots(device.ctx(), k_dim)
+                    kernels_cuda::ssm::gdn_lands_snapshots(device.ctx(), k_dim)
                 }
                 #[cfg(feature = "rocm")]
                 {
@@ -805,7 +813,7 @@ impl Shell {
         let drops_patch_rows = boot.trace.nodes.iter().any(|node| {
             matches!(
                 node.op,
-                poem_ir::Operation::Layout(poem_ir::Layout::ScatterLiveRows { .. })
+                poem_ir::Operation::Gather(poem_ir::Gather::ScatterLiveRows { .. })
             )
         });
         if let Some(value) = feeds.unlanded.first() {
@@ -1022,7 +1030,7 @@ impl Shell {
             let Some(ctx) = ctx else {
                 continue;
             };
-            kernels_cuda::linear::quant::warm_decoded_weight(ctx, tile).map_err(|why| {
+            kernels_cuda::linear::dequant::warm_decoded_weight(ctx, tile).map_err(|why| {
                 Fault::Residency(format!(
                     "the card does not hold this deployment: the decoded-weight tile stream \
                      {stream} decodes its widest plane into, {tile} bytes, would not allocate \
@@ -1298,14 +1306,32 @@ fn decoded_weight_planes(
                 // A low-precision product decodes no bf16 tile.
                 #[cfg(not(feature = "rocm"))]
                 poem_ir::Operation::Linear(
-                    poem_ir::Linear::MatmulActQuant { .. }
-                    | poem_ir::Linear::MoeMatmulSelectActQuant { .. },
+                    poem_ir::Linear::Matmul {
+                        quant: Some(_),
+                        logits: false,
+                        ..
+                    }
+                    | poem_ir::Linear::MoeSelect {
+                        bias: None,
+                        quantized: true,
+                        quant: Some(_),
+                        ..
+                    },
                 ) => continue,
                 #[cfg(not(feature = "rocm"))]
                 poem_ir::Operation::Fused(
                     poem_ir::Fused::MoeSelectGlu { select, .. }
                     | poem_ir::Fused::MoeExperts { select, .. },
-                ) if matches!(**select, poem_ir::Linear::MoeMatmulSelectActQuant { .. }) => {
+                ) if matches!(
+                    **select,
+                    poem_ir::Linear::MoeSelect {
+                        bias: None,
+                        quantized: true,
+                        quant: Some(_),
+                        ..
+                    }
+                ) =>
+                {
                     continue;
                 }
                 // A routed select reads its bank's codes as they are, whatever
@@ -1313,9 +1339,24 @@ fn decoded_weight_planes(
                 // grouped and per-route ones): it decodes no bf16 tile.
                 #[cfg(not(feature = "rocm"))]
                 poem_ir::Operation::Linear(
-                    poem_ir::Linear::MoeMatmulSelect { .. }
-                    | poem_ir::Linear::MoeMatmulSelectBias { .. }
-                    | poem_ir::Linear::MoeMatmulSelectQuant { .. },
+                    poem_ir::Linear::MoeSelect {
+                        bias: None,
+                        quantized: false,
+                        quant: None,
+                        ..
+                    }
+                    | poem_ir::Linear::MoeSelect {
+                        bias: Some(_),
+                        quantized: false,
+                        quant: None,
+                        ..
+                    }
+                    | poem_ir::Linear::MoeSelect {
+                        bias: None,
+                        quantized: true,
+                        quant: None,
+                        ..
+                    },
                 )
                 | poem_ir::Operation::Fused(
                     poem_ir::Fused::MoeSelectGlu { .. } | poem_ir::Fused::MoeExperts { .. },
@@ -1324,12 +1365,11 @@ fn decoded_weight_planes(
                 // takes it, and decodes the same plane that matmul would.
                 poem_ir::Operation::Linear(_)
                 | poem_ir::Operation::Fused(
-                    poem_ir::Fused::MatmulSwiglu { .. }
-                    | poem_ir::Fused::MatmulGeglu { .. }
-                    | poem_ir::Fused::MlpSwiglu { .. }
+                    poem_ir::Fused::MatmulGlu { .. }
+                    | poem_ir::Fused::MatmulSwigluMatmul { .. }
                     | poem_ir::Fused::MatmulBias { .. }
                     | poem_ir::Fused::MatmulSplitRows { .. }
-                    | poem_ir::Fused::LmHeadSoftcap { .. },
+                    | poem_ir::Fused::MatmulSoftcap { .. },
                 ) => {
                     outputs.clear();
                     node.op.outputs(&mut outputs);
@@ -1343,7 +1383,7 @@ fn decoded_weight_planes(
                     node.op.outputs(&mut outputs);
                     outputs.iter().any(|id| token_rows(*id))
                 }
-                poem_ir::Operation::Attention(_) => true,
+                poem_ir::Operation::Attn(_) | poem_ir::Operation::Ssm(_) => true,
                 _ => continue,
             };
             inputs.clear();
@@ -1363,12 +1403,14 @@ fn decoded_weight_planes(
             #[cfg(feature = "rocm")]
             let decoded = true;
             #[cfg(all(feature = "cuda", not(feature = "rocm")))]
-            let decoded = !kernels_cuda::linear::tc5::supported();
+            let decoded = !kernels_cuda::linear::gemm_sm100::supported();
             #[cfg(any(feature = "rocm", feature = "cuda"))]
             if decoded
-                && let poem_ir::Operation::Linear(poem_ir::Linear::MatmulActQuant {
+                && let poem_ir::Operation::Linear(poem_ir::Linear::Matmul {
                     w,
                     scales: Some(_),
+                    quant: Some(_),
+                    logits: false,
                     ..
                 }) = &node.op
                 && let Some(poem_ir::Ty::Tensor { shape, .. }) =
@@ -1423,8 +1465,8 @@ fn patch_fold(trace: &poem_ir::Trace) -> u32 {
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
-            poem_ir::Operation::Layout(
-                poem_ir::Layout::MergeRows { side, .. } | poem_ir::Layout::PoolRows { side, .. },
+            poem_ir::Operation::Gather(
+                poem_ir::Gather::MergeRows { side, .. } | poem_ir::Gather::PoolRows { side, .. },
             ) => Some(side.saturating_mul(*side)),
             _ => None,
         })
@@ -1455,10 +1497,9 @@ fn walk_fire_fit(trace: &poem_ir::Trace, rows: u32, sms: u32) -> Option<u32> {
         .nodes
         .iter()
         .filter_map(|node| match &node.op {
-            poem_ir::Operation::Attention(poem_ir::Attention::SsmGatedDeltaChunked {
-                v_heads,
-                ..
-            }) => Some(*v_heads),
+            poem_ir::Operation::Ssm(poem_ir::Ssm::GatedDeltaChunked { v_heads, .. }) => {
+                Some(*v_heads)
+            }
             _ => None,
         })
         .max()?;

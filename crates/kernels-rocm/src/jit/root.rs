@@ -49,7 +49,7 @@ impl Root {
         let mut cache = PREFIXES
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .expect("lock poisoned");
         if let Some(found) = cache.get(&identity) {
             return found;
         }

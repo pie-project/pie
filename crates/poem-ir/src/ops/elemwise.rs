@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use crate::operands::Operands;
+use crate::Op;
+use crate::check::Expect;
+use crate::operands::{Part, Slot};
 use crate::value::ValueId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -22,7 +24,7 @@ pub struct RopeFreqs {
     pub mscale: f32,
 }
 
-/// The norm a [`Elementwise::NormGate`] also lands over its output: `y =
+/// The norm a [`Elemwise::NormGate`] also lands over its output: `y =
 /// rmsnorm(out) * weight` (`1 + weight` where `plus_one`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct NormNext {
@@ -32,38 +34,79 @@ pub struct NormNext {
     pub y: ValueId,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum Elementwise {
+/// What an [`Elemwise::Rmsnorm`] scales its normed rows by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NormWeight {
+    /// Unscaled.
+    None,
+    /// `* weight`.
+    Scale(ValueId),
+    /// `* (1 + weight)`.
+    PlusOne(ValueId),
+}
+
+impl Slot for NormWeight {
+    fn each(&self, f: &mut dyn FnMut(ValueId)) {
+        match self {
+            NormWeight::None => {}
+            NormWeight::Scale(w) | NormWeight::PlusOne(w) => f(*w),
+        }
+    }
+}
+
+/// The runs of a row an [`Elemwise::Rmsnorm`] norms on their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum NormAxis {
+    /// The whole row.
+    Row,
+    /// Each `head_dim`-wide head, one weight of that width shared by all.
+    Head(u32),
+    /// Each `group`-wide run, the weight as wide as the row.
+    Group(u32),
+}
+
+/// The gate an [`Elemwise::ResidualAdd`] scales its addend by: one row a
+/// row, or with `lane_of_row` one a request lane, each row reading its lane's.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ResidualGate {
+    pub g: ValueId,
+    pub lane_of_row: Option<ValueId>,
+}
+
+impl Part for ResidualGate {
+    fn inputs(&self, sink: &mut Vec<ValueId>) {
+        sink.push(self.g);
+        sink.extend(self.lane_of_row);
+    }
+    fn outputs(&self, _sink: &mut Vec<ValueId>) {}
+    fn ports(&self, sink: &mut Vec<(&'static str, ValueId, Expect)>) {
+        if let Some(lanes) = self.lane_of_row {
+            sink.push(("lane_of_row", lanes, Expect::I32));
+        }
+    }
+}
+
+impl Part for NormNext {
+    fn inputs(&self, sink: &mut Vec<ValueId>) {
+        sink.push(self.weight);
+    }
+    fn outputs(&self, sink: &mut Vec<ValueId>) {
+        sink.push(self.y);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Op)]
+#[op(group = "elemwise")]
+pub enum Elemwise {
+    /// `x / rms(x)` over each `axis` run, times `weight`.
     Rmsnorm {
+        #[input]
         x: ValueId,
-        weight: ValueId,
+        #[input]
+        weight: NormWeight,
+        axis: NormAxis,
         eps: f32,
-        y: ValueId,
-    },
-    RmsnormPerHead {
-        x: ValueId,
-        weight: ValueId,
-        head_dim: u32,
-        eps: f32,
-        y: ValueId,
-    },
-    RmsnormPlusOne {
-        x: ValueId,
-        weight: ValueId,
-        eps: f32,
-        y: ValueId,
-    },
-    RmsnormPerHeadPlusOne {
-        x: ValueId,
-        weight: ValueId,
-        head_dim: u32,
-        eps: f32,
-        y: ValueId,
-    },
-    RmsnormNoScale {
-        x: ValueId,
-        head_dim: u32,
-        eps: f32,
+        #[output]
         y: ValueId,
     },
     /// Muse Spark's post-norm and residual gate: `u = x * scale` rounded
@@ -72,330 +115,328 @@ pub enum Elementwise {
     /// `alpha = sqrt(max(sigmoid(-w) * (1 + beta), 1e-3))` of the gate's
     /// `w = gate / temperature` a column (f32); else `y = n`.
     NormGate {
+        #[input]
         x: ValueId,
+        #[input]
         scale: Option<ValueId>,
+        #[input]
         res: Option<ValueId>,
+        #[input]
         gate: Option<ValueId>,
         eps: f32,
         temperature: f32,
+        #[output]
+        y: ValueId,
+        #[part]
         next: Option<NormNext>,
-        y: ValueId,
     },
-    LayernormNoScale {
-        x: ValueId,
-        eps: f32,
-        y: ValueId,
-    },
+    /// `(x - mean) / std` over the row, times `weight` plus `bias` where
+    /// given.
     Layernorm {
+        #[input]
         x: ValueId,
-        weight: ValueId,
-        bias: ValueId,
+        #[input]
+        weight: Option<ValueId>,
+        #[input]
+        bias: Option<ValueId>,
         eps: f32,
+        #[output]
         y: ValueId,
     },
-    RmsnormGroupedPlusOne {
-        x: ValueId,
-        weight: ValueId,
-        group: u32,
-        eps: f32,
-        y: ValueId,
-    },
+    /// `x` clamped into `[lo, hi]`, in place: bounds stated outright, or
+    /// learned planes read as `lo` and `hi`.
     Clamp {
+        #[input]
         x: ValueId,
-        lo: f32,
-        hi: f32,
+        #[input]
+        lo: Option<ValueId>,
+        #[input]
+        hi: Option<ValueId>,
+        bounds: Bounds,
+        #[output(alias = x)]
         x_out: ValueId,
     },
-    ClampLearned {
-        x: ValueId,
-        lo: ValueId,
-        hi: ValueId,
-        x_out: ValueId,
-    },
-    /// `act(gate) * rmsnorm(x) * weight` (no weight: scaleless) per head.
     RmsnormGated {
+        #[input]
         x: ValueId,
+        #[input]
         gate: ValueId,
+        #[input]
         weight: Option<ValueId>,
         head_dim: u32,
         eps: f32,
         act: GateActivation,
+        #[output]
         y: ValueId,
     },
     RmsnormGatedBy {
+        #[input]
         x: ValueId,
+        #[input]
         gate: ValueId,
+        #[input]
         weight: ValueId,
         heads: u32,
         eps: f32,
+        #[output]
         y: ValueId,
     },
+    /// `y += x`, in place; under a `gate`, `y += gate ⊙ x`.
     ResidualAdd {
+        #[input]
         x: ValueId,
+        #[part]
+        gate: Option<ResidualGate>,
+        #[input]
         y: ValueId,
+        #[output(alias = y)]
         y_out: ValueId,
     },
     AddBias {
+        #[input]
         bias: ValueId,
+        #[input]
         out: ValueId,
+        #[output(alias = out)]
         out_out: ValueId,
     },
     Standardize {
+        #[input]
         x: ValueId,
+        #[input]
         bias: ValueId,
+        #[input]
         scale: ValueId,
+        #[output(alias = x)]
         x_out: ValueId,
     },
-    MulScalar {
-        s: f32,
+    /// `act(x · k)`, in place: `k` the f32 `scale`, the first element of the
+    /// device scalar `s`, or 1.
+    Act {
+        #[input]
+        s: Option<ValueId>,
+        #[input]
         x: ValueId,
+        act: ActFn,
+        scale: Option<f32>,
+        #[output(alias = x)]
         x_out: ValueId,
     },
-    SiluScaled {
-        s: f32,
+    /// `cap · tanh(x / cap)`, in place.
+    Softcap {
+        #[input]
         x: ValueId,
-        x_out: ValueId,
-    },
-    Scale {
-        s: ValueId,
-        x: ValueId,
+        cap: f32,
+        #[output(alias = x)]
         x_out: ValueId,
     },
     ResBlend {
+        #[input]
         prefix: ValueId,
+        #[input]
         blocks: Vec<ValueId>,
+        #[input]
         weight: ValueId,
-        eps: f32,
+        #[input]
         proj: ValueId,
+        eps: f32,
+        #[output]
         y: ValueId,
     },
-    RopeFull {
+    /// The rotary turn of each head's dims at its row's position, q and
+    /// (where given) k in place. `turn` says which dims turn and how their
+    /// frequencies run; `freqs` states the frequencies outright where the
+    /// model's `rope_scaling` does.
+    Rope {
+        #[input]
         q: ValueId,
-        k: ValueId,
+        #[input]
+        k: Option<ValueId>,
+        #[input(I32)]
         positions: ValueId,
         head_dim: u32,
         theta: f32,
-        interleaved: bool,
-        q_out: ValueId,
-        k_out: ValueId,
+        turn: Turn,
         #[serde(default)]
         freqs: Option<RopeFreqs>,
-    },
-    /// The first `rotary_dim/2` pairs of each head turn, pair `i` being
-    /// `(i, i + span)` at `theta^(-i/span)`: `span` is `rotary_dim/2` for a
-    /// plain partial rotary, `head_dim/2` for a proportional one (Gemma 4's
-    /// global layers).
-    RopePartial {
-        q: ValueId,
-        k: ValueId,
-        positions: ValueId,
-        rotary_dim: u32,
-        head_dim: u32,
-        theta: f32,
-        span: u32,
+        #[output(alias = q)]
         q_out: ValueId,
-        k_out: ValueId,
-        #[serde(default)]
-        freqs: Option<RopeFreqs>,
+        #[output(alias = k)]
+        k_out: Option<ValueId>,
     },
-    RopeMrope {
-        q: ValueId,
-        k: ValueId,
-        positions: ValueId,
-        sections: [u32; 3],
-        form: MropeForm,
-        rotary_dim: u32,
-        head_dim: u32,
-        theta: f32,
-        q_out: ValueId,
-        k_out: ValueId,
-        #[serde(default)]
-        freqs: Option<RopeFreqs>,
-    },
-    RopePartialQ {
-        q: ValueId,
-        positions: ValueId,
-        rotary_dim: u32,
-        head_dim: u32,
-        theta: f32,
-        span: u32,
-        q_out: ValueId,
-        #[serde(default)]
-        freqs: Option<RopeFreqs>,
-    },
-    RopePartialLast {
-        q: ValueId,
-        positions: ValueId,
-        rotary_dim: u32,
-        head_dim: u32,
-        theta: f32,
-        interleaved: bool,
-        inverse: bool,
-        yarn: Option<Yarn>,
-        q_out: ValueId,
-    },
-    RopeYarn {
-        q: ValueId,
-        k: ValueId,
-        positions: ValueId,
-        head_dim: u32,
-        theta: f32,
-        factor: f32,
-        beta_fast: f32,
-        beta_slow: f32,
-        attention_factor: f32,
-        original_max_position: u32,
-        interleaved: bool,
-        q_out: ValueId,
-        k_out: ValueId,
-    },
+    /// `x ⊙ sigmoid(gate)`, in place: the gate as wide as `x`, or under
+    /// `heads` one logit a head.
     GateSigmoidMul {
+        #[input]
         x: ValueId,
+        #[input]
         gate: ValueId,
-        x_out: ValueId,
-    },
-    GateSigmoidMulHeads {
-        x: ValueId,
-        gate: ValueId,
-        head_dim: u32,
-        scale: f32,
+        heads: Option<GateHeads>,
+        #[output(alias = x)]
         x_out: ValueId,
     },
     HcExpand {
+        #[input]
         x: ValueId,
         streams: u32,
+        #[output]
         y: ValueId,
     },
     HcRmsnormF32 {
+        #[input]
         streams: ValueId,
         eps: f32,
+        #[output(F32)]
         y: ValueId,
     },
     HcProject {
+        #[input(F32)]
         normed: ValueId,
+        #[input(F32)]
         weight: ValueId,
         stream_count: u32,
+        #[output(F32)]
         mixes: ValueId,
     },
     HcGates {
+        #[input(F32)]
         normed: ValueId,
+        #[input]
         streams: ValueId,
+        #[input]
         scale: ValueId,
+        #[input]
         base: ValueId,
         stream_count: u32,
         gate_eps: f32,
         alpha: f32,
         sinkhorn: u32,
         comb: bool,
+        #[output]
         x: ValueId,
+        #[output(F32)]
         post_mix: ValueId,
+        #[output(F32)]
         comb_mix: ValueId,
     },
     HcFold {
+        #[input]
         x: ValueId,
+        #[input]
         streams: ValueId,
+        #[input]
         post_mix: ValueId,
+        #[input]
         comb_mix: ValueId,
+        #[output]
         y: ValueId,
     },
     HcCollapse {
+        #[input(F32)]
         mixes: ValueId,
+        #[input]
         streams: ValueId,
+        #[input(F32)]
         scale: ValueId,
+        #[input(F32)]
         base: ValueId,
         stream_count: u32,
         hc_eps: f32,
+        #[output]
         y: ValueId,
     },
-
     HcMix {
+        #[input]
         gates: ValueId,
+        #[input]
         normed: ValueId,
         streams: u32,
+        #[output]
         y: ValueId,
     },
     HcInject {
+        #[input]
         o: ValueId,
+        #[input]
         gates: ValueId,
-        streams: u32,
+        #[input]
         hyper: ValueId,
+        streams: u32,
+        #[output(alias = hyper)]
         hyper_out: ValueId,
     },
     PleGate {
+        #[input]
         key: ValueId,
+        #[input]
         query: ValueId,
+        #[input]
         value: ValueId,
         streams: u32,
+        #[output]
         y: ValueId,
     },
-
     Modulate {
+        #[input]
         x: ValueId,
+        #[input]
         m: ValueId,
+        #[input(I32)]
         lane_of_row: Option<ValueId>,
         form: ModulateForm,
+        #[output]
         y: ValueId,
-    },
-    GatedResidualAdd {
-        r: ValueId,
-        g: ValueId,
-        y: ValueId,
-        lane_of_row: Option<ValueId>,
-        r_out: ValueId,
     },
     Sinusoid {
+        #[input(F32)]
         t: ValueId,
         dim: u32,
         max_period: f32,
         flip_sin_cos: bool,
         scale: f32,
+        #[output(F32)]
         y: ValueId,
     },
     RelativeBucketBias {
+        #[input]
         embedding: ValueId,
         max_len: u32,
         num_buckets: u32,
         max_distance: f32,
         bidirectional: bool,
+        #[output(F32)]
         y: ValueId,
-    },
-    Silu {
-        x: ValueId,
-        x_out: ValueId,
-    },
-    Gelu {
-        x: ValueId,
-        tanh: bool,
-        x_out: ValueId,
-    },
-    Tanh {
-        x: ValueId,
-        x_out: ValueId,
     },
     Hadamard {
+        #[input]
         x: ValueId,
-        x_out: ValueId,
-        block: u32,
+        #[input]
         signs: Option<ValueId>,
+        block: u32,
+        #[output(alias = x)]
+        x_out: ValueId,
     },
-    Mul {
+    /// `x op y`, element by element.
+    Binary {
+        #[input]
         x: ValueId,
+        #[input]
         y: ValueId,
-        z: ValueId,
-    },
-    Add {
-        x: ValueId,
-        y: ValueId,
+        op: BinaryOp,
+        #[output]
         z: ValueId,
     },
     RopeAxes {
+        #[input]
         x: ValueId,
+        #[input(F32)]
         positions: ValueId,
         dims: [u32; 4],
         thetas: [f32; 4],
         form: RopeForm,
         rotary_dim: u32,
         head_dim: u32,
+        #[output(alias = x)]
         x_out: ValueId,
     },
 }
@@ -417,6 +458,74 @@ impl ModulateForm {
     }
 }
 
+/// A [`Elemwise::GateSigmoidMul`] gating by head: `x[n, h·d + i] *= scale ·
+/// σ(gate[n, h])`, `d` the `head_dim`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GateHeads {
+    pub head_dim: u32,
+    pub scale: f32,
+}
+
+/// What an [`Elemwise::Binary`] computes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BinaryOp {
+    Add,
+    Mul,
+}
+
+/// The function an [`Elemwise::Act`] applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActFn {
+    Identity,
+    Silu,
+    Gelu { tanh: bool },
+    Tanh,
+}
+
+/// Where a [`Elemwise::Clamp`]'s bounds come from.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Bounds {
+    Fixed {
+        lo: f32,
+        hi: f32,
+    },
+    /// The op's `lo` and `hi` planes.
+    Learned,
+}
+
+/// Which of a head's dims a [`Elemwise::Rope`] turns, and how.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Turn {
+    /// Every pair: `(i, i + head_dim/2)`, or `(2i, 2i + 1)` interleaved.
+    Full { interleaved: bool },
+    /// The first `rotary_dim/2` pairs, pair `i` being `(i, i + span)` at
+    /// `theta^(-i/span)`: `span` is `rotary_dim/2` for a plain partial
+    /// rotary, `head_dim/2` for a proportional one (Gemma 4's global layers).
+    Partial { rotary_dim: u32, span: u32 },
+    /// The last `rotary_dim` dims (`inverse` turns them back), at frequencies
+    /// YaRN ramps where it is given.
+    Last {
+        rotary_dim: u32,
+        interleaved: bool,
+        inverse: bool,
+        yarn: Option<Yarn>,
+    },
+    /// Every pair at YaRN's stretched frequencies, cos and sin scaled by
+    /// `attention_factor`.
+    Yarn {
+        yarn: Yarn,
+        attention_factor: f32,
+        interleaved: bool,
+    },
+    /// Multimodal: a `(t, h, w)` position a row, `sections` naming which
+    /// pairs of the first `rotary_dim` turn by which axis.
+    Mrope {
+        sections: [u32; 3],
+        form: MropeForm,
+        rotary_dim: u32,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RopeForm {
     Interleaved,
@@ -436,324 +545,4 @@ pub enum MropeForm {
     Interleaved,
     Blocked,
     Split,
-}
-
-impl Operands for Elementwise {
-    fn inputs(&self, sink: &mut Vec<ValueId>) {
-        match self {
-            Self::Rmsnorm { x, weight, .. } => sink.extend([*x, *weight]),
-            Self::RmsnormPerHead { x, weight, .. } => sink.extend([*x, *weight]),
-            Self::RmsnormPlusOne { x, weight, .. } => sink.extend([*x, *weight]),
-            Self::RmsnormPerHeadPlusOne { x, weight, .. } => sink.extend([*x, *weight]),
-            Self::RmsnormGroupedPlusOne { x, weight, .. } => sink.extend([*x, *weight]),
-            Self::RmsnormNoScale { x, .. } => sink.push(*x),
-            Self::NormGate {
-                x,
-                scale,
-                res,
-                gate,
-                next,
-                ..
-            } => {
-                sink.push(*x);
-                sink.extend(*scale);
-                sink.extend(*res);
-                sink.extend(*gate);
-                sink.extend(next.map(|n| n.weight));
-            }
-            Self::LayernormNoScale { x, .. } => sink.push(*x),
-            Self::Layernorm {
-                x, weight, bias, ..
-            } => sink.extend([*x, *weight, *bias]),
-            Self::Clamp { x, .. } => sink.push(*x),
-            Self::ClampLearned { x, lo, hi, .. } => sink.extend([*x, *lo, *hi]),
-            Self::RmsnormGated {
-                x, gate, weight, ..
-            } => {
-                sink.extend([*x, *gate]);
-                sink.extend(*weight);
-            }
-            Self::RmsnormGatedBy {
-                x, gate, weight, ..
-            } => sink.extend([*x, *gate, *weight]),
-            Self::ResidualAdd { x, y, .. } => sink.extend([*x, *y]),
-            Self::AddBias { bias, out, .. } => sink.extend([*bias, *out]),
-            Self::Standardize { x, bias, scale, .. } => sink.extend([*x, *bias, *scale]),
-            Self::MulScalar { x, .. } => sink.push(*x),
-            Self::SiluScaled { x, .. } => sink.push(*x),
-            Self::Scale { s, x, .. } => sink.extend([*s, *x]),
-            Self::ResBlend {
-                prefix,
-                blocks,
-                weight,
-                proj,
-                ..
-            } => {
-                sink.push(*prefix);
-                sink.extend_from_slice(blocks);
-                sink.push(*weight);
-                sink.push(*proj);
-            }
-            Self::RopeFull {
-                q, k, positions, ..
-            } => sink.extend([*q, *k, *positions]),
-            Self::RopePartial {
-                q, k, positions, ..
-            } => sink.extend([*q, *k, *positions]),
-            Self::RopeMrope {
-                q, k, positions, ..
-            } => sink.extend([*q, *k, *positions]),
-            Self::RopePartialQ { q, positions, .. } => sink.extend([*q, *positions]),
-            Self::RopePartialLast { q, positions, .. } => sink.extend([*q, *positions]),
-            Self::RopeYarn {
-                q, k, positions, ..
-            } => sink.extend([*q, *k, *positions]),
-            Self::GateSigmoidMul { x, gate, .. } => sink.extend([*x, *gate]),
-            Self::GateSigmoidMulHeads { x, gate, .. } => sink.extend([*x, *gate]),
-            Self::HcExpand { x, .. } => sink.push(*x),
-            Self::HcRmsnormF32 { streams, .. } => sink.push(*streams),
-            Self::HcProject { normed, weight, .. } => sink.extend([*normed, *weight]),
-            Self::HcGates {
-                normed,
-                streams,
-                scale,
-                base,
-                ..
-            } => {
-                sink.extend([*normed, *streams, *scale, *base]);
-            }
-            Self::HcFold {
-                x,
-                streams,
-                post_mix,
-                comb_mix,
-                ..
-            } => {
-                sink.extend([*x, *streams, *post_mix, *comb_mix]);
-            }
-            Self::HcCollapse {
-                mixes,
-                streams,
-                scale,
-                base,
-                ..
-            } => {
-                sink.extend([*mixes, *streams, *scale, *base]);
-            }
-            Self::HcMix { gates, normed, .. } => sink.extend([*gates, *normed]),
-            Self::HcInject {
-                o, gates, hyper, ..
-            } => sink.extend([*o, *gates, *hyper]),
-            Self::PleGate {
-                key, query, value, ..
-            } => sink.extend([*key, *query, *value]),
-            Self::Modulate {
-                x, m, lane_of_row, ..
-            } => {
-                sink.extend([*x, *m]);
-                sink.extend(*lane_of_row);
-            }
-            Self::GatedResidualAdd {
-                r,
-                g,
-                y,
-                lane_of_row,
-                ..
-            } => {
-                sink.extend([*r, *g, *y]);
-                sink.extend(*lane_of_row);
-            }
-            Self::Sinusoid { t, .. } => sink.push(*t),
-            Self::RelativeBucketBias { embedding, .. } => sink.push(*embedding),
-            Self::Silu { x, .. } => sink.push(*x),
-            Self::Gelu { x, .. } => sink.push(*x),
-            Self::Tanh { x, .. } => sink.push(*x),
-            Self::Hadamard { x, signs, .. } => {
-                sink.push(*x);
-                if let Some(s) = signs {
-                    sink.push(*s);
-                }
-            }
-            Self::Mul { x, y, .. } => sink.extend([*x, *y]),
-            Self::Add { x, y, .. } => sink.extend([*x, *y]),
-            Self::RopeAxes { x, positions, .. } => sink.extend([*x, *positions]),
-        }
-    }
-    fn outputs(&self, sink: &mut Vec<ValueId>) {
-        match self {
-            Self::Rmsnorm { y, .. } => sink.push(*y),
-            Self::RmsnormPerHead { y, .. } => sink.push(*y),
-            Self::RmsnormPlusOne { y, .. } => sink.push(*y),
-            Self::RmsnormPerHeadPlusOne { y, .. } => sink.push(*y),
-            Self::RmsnormGroupedPlusOne { y, .. } => sink.push(*y),
-            Self::RmsnormNoScale { y, .. } => sink.push(*y),
-            Self::NormGate { y, next, .. } => {
-                sink.extend(std::iter::once(*y).chain(next.map(|n| n.y)))
-            }
-            Self::LayernormNoScale { y, .. } => sink.push(*y),
-            Self::Layernorm { y, .. } => sink.push(*y),
-            Self::Clamp { x_out, .. } => sink.push(*x_out),
-            Self::ClampLearned { x_out, .. } => sink.push(*x_out),
-            Self::RmsnormGated { y, .. } => sink.push(*y),
-            Self::RmsnormGatedBy { y, .. } => sink.push(*y),
-            Self::ResidualAdd { y_out, .. } => sink.push(*y_out),
-            Self::AddBias { out_out, .. } => sink.push(*out_out),
-            Self::Standardize { x_out, .. } => sink.push(*x_out),
-            Self::MulScalar { x_out, .. } => sink.push(*x_out),
-            Self::SiluScaled { x_out, .. } => sink.push(*x_out),
-            Self::Scale { x_out, .. } => sink.push(*x_out),
-            Self::ResBlend { y, .. } => sink.push(*y),
-            Self::RopeFull { q_out, k_out, .. } => sink.extend([*q_out, *k_out]),
-            Self::RopePartial { q_out, k_out, .. } => sink.extend([*q_out, *k_out]),
-            Self::RopeMrope { q_out, k_out, .. } => sink.extend([*q_out, *k_out]),
-            Self::RopePartialQ { q_out, .. } => sink.push(*q_out),
-            Self::RopePartialLast { q_out, .. } => sink.push(*q_out),
-            Self::RopeYarn { q_out, k_out, .. } => sink.extend([*q_out, *k_out]),
-            Self::GateSigmoidMul { x_out, .. } => sink.push(*x_out),
-            Self::GateSigmoidMulHeads { x_out, .. } => sink.push(*x_out),
-            Self::HcExpand { y, .. } => sink.push(*y),
-            Self::HcRmsnormF32 { y, .. } => sink.push(*y),
-            Self::HcProject { mixes, .. } => sink.push(*mixes),
-            Self::HcGates {
-                x,
-                post_mix,
-                comb_mix,
-                ..
-            } => sink.extend([*x, *post_mix, *comb_mix]),
-            Self::HcFold { y, .. } => sink.push(*y),
-            Self::HcCollapse { y, .. } => sink.push(*y),
-            Self::HcMix { y, .. } => sink.push(*y),
-            Self::HcInject { hyper_out, .. } => sink.push(*hyper_out),
-            Self::PleGate { y, .. } => sink.push(*y),
-            Self::Modulate { y, .. } => sink.push(*y),
-            Self::GatedResidualAdd { r_out, .. } => sink.push(*r_out),
-            Self::Sinusoid { y, .. } => sink.push(*y),
-            Self::RelativeBucketBias { y, .. } => sink.push(*y),
-            Self::Silu { x_out, .. } => sink.push(*x_out),
-            Self::Gelu { x_out, .. } => sink.push(*x_out),
-            Self::Tanh { x_out, .. } => sink.push(*x_out),
-            Self::Hadamard { x_out, .. } => sink.push(*x_out),
-            Self::Mul { z, .. } => sink.push(*z),
-            Self::Add { z, .. } => sink.push(*z),
-            Self::RopeAxes { x_out, .. } => sink.push(*x_out),
-        }
-    }
-    fn aliases(&self, sink: &mut Vec<(ValueId, ValueId)>) {
-        match self {
-            Self::Rmsnorm { .. } => {}
-            Self::RmsnormPerHead { .. } => {}
-            Self::RmsnormPlusOne { .. } => {}
-            Self::RmsnormPerHeadPlusOne { .. } => {}
-            Self::RmsnormGroupedPlusOne { .. } => {}
-            Self::RmsnormNoScale { .. } => {}
-            Self::NormGate { .. } => {}
-            Self::LayernormNoScale { .. } => {}
-            Self::Layernorm { .. } => {}
-            Self::Clamp { x_out, x, .. } => sink.push((*x_out, *x)),
-            Self::ClampLearned { x_out, x, .. } => sink.push((*x_out, *x)),
-            Self::RmsnormGated { .. } => {}
-            Self::RmsnormGatedBy { .. } => {}
-            Self::ResidualAdd { y_out, y, .. } => sink.push((*y_out, *y)),
-            Self::AddBias { out_out, out, .. } => sink.push((*out_out, *out)),
-            Self::Standardize { x_out, x, .. } => sink.push((*x_out, *x)),
-            Self::MulScalar { x_out, x, .. } => sink.push((*x_out, *x)),
-            Self::SiluScaled { x_out, x, .. } => sink.push((*x_out, *x)),
-            Self::Scale { x_out, x, .. } => sink.push((*x_out, *x)),
-            Self::ResBlend { .. } => {}
-            Self::RopeFull {
-                q_out, q, k_out, k, ..
-            } => sink.extend([(*q_out, *q), (*k_out, *k)]),
-            Self::RopePartial {
-                q_out, q, k_out, k, ..
-            } => {
-                sink.extend([(*q_out, *q), (*k_out, *k)]);
-            }
-            Self::RopeMrope {
-                q_out, q, k_out, k, ..
-            } => {
-                sink.extend([(*q_out, *q), (*k_out, *k)]);
-            }
-            Self::RopePartialQ { q_out, q, .. } => sink.push((*q_out, *q)),
-            Self::RopePartialLast { q_out, q, .. } => sink.push((*q_out, *q)),
-            Self::RopeYarn {
-                q_out, q, k_out, k, ..
-            } => sink.extend([(*q_out, *q), (*k_out, *k)]),
-            Self::GateSigmoidMul { x_out, x, .. } => sink.push((*x_out, *x)),
-            Self::GateSigmoidMulHeads { x_out, x, .. } => sink.push((*x_out, *x)),
-            Self::HcExpand { .. } => {}
-            Self::HcRmsnormF32 { .. } => {}
-            Self::HcProject { .. } => {}
-            Self::HcGates { .. } => {}
-            Self::HcFold { .. } => {}
-            Self::HcCollapse { .. } => {}
-            Self::HcMix { .. } => {}
-            Self::HcInject {
-                hyper_out, hyper, ..
-            } => sink.push((*hyper_out, *hyper)),
-            Self::PleGate { .. } => {}
-            Self::Modulate { .. } => {}
-            Self::GatedResidualAdd { r_out, r, .. } => sink.push((*r_out, *r)),
-            Self::Sinusoid { .. } => {}
-            Self::RelativeBucketBias { .. } => {}
-            Self::Silu { x_out, x, .. } => sink.push((*x_out, *x)),
-            Self::Gelu { x_out, x, .. } => sink.push((*x_out, *x)),
-            Self::Tanh { x_out, x, .. } => sink.push((*x_out, *x)),
-            Self::Hadamard { x_out, x, .. } => sink.push((*x_out, *x)),
-            Self::Mul { .. } => {}
-            Self::Add { .. } => {}
-            Self::RopeAxes { x_out, x, .. } => sink.push((*x_out, *x)),
-        }
-    }
-    fn name(&self) -> &'static str {
-        match self {
-            Self::Rmsnorm { .. } => "elementwise.rmsnorm",
-            Self::RmsnormPerHead { .. } => "elementwise.rmsnorm_per_head",
-            Self::RmsnormPlusOne { .. } => "elementwise.rmsnorm_plus_one",
-            Self::RmsnormPerHeadPlusOne { .. } => "elementwise.rmsnorm_per_head_plus_one",
-            Self::RmsnormGroupedPlusOne { .. } => "elementwise.rmsnorm_grouped_plus_one",
-            Self::RmsnormNoScale { .. } => "elementwise.rmsnorm_no_scale",
-            Self::NormGate { .. } => "elementwise.norm_gate",
-            Self::LayernormNoScale { .. } => "elementwise.layernorm_no_scale",
-            Self::Layernorm { .. } => "elementwise.layernorm",
-            Self::Clamp { .. } => "elementwise.clamp",
-            Self::ClampLearned { .. } => "elementwise.clamp_learned",
-            Self::RmsnormGated { .. } => "elementwise.rmsnorm_gated",
-            Self::RmsnormGatedBy { .. } => "elementwise.rmsnorm_gated_by",
-            Self::ResidualAdd { .. } => "elementwise.residual_add",
-            Self::AddBias { .. } => "elementwise.add_bias",
-            Self::Standardize { .. } => "elementwise.standardize",
-            Self::MulScalar { .. } => "elementwise.mul_scalar",
-            Self::SiluScaled { .. } => "elementwise.silu_scaled",
-            Self::Scale { .. } => "elementwise.scale",
-            Self::ResBlend { .. } => "elementwise.res_blend",
-            Self::RopeFull { .. } => "elementwise.rope_full",
-            Self::RopePartial { .. } => "elementwise.rope_partial",
-            Self::RopeMrope { .. } => "elementwise.rope_mrope",
-            Self::RopePartialQ { .. } => "elementwise.rope_partial_q",
-            Self::RopePartialLast { .. } => "elementwise.rope_partial_last",
-            Self::RopeYarn { .. } => "elementwise.rope_yarn",
-            Self::GateSigmoidMul { .. } => "elementwise.gate_sigmoid_mul",
-            Self::GateSigmoidMulHeads { .. } => "elementwise.gate_sigmoid_mul_heads",
-            Self::HcExpand { .. } => "elementwise.hc_expand",
-            Self::HcRmsnormF32 { .. } => "elementwise.hc_rmsnorm_f32",
-            Self::HcProject { .. } => "elementwise.hc_project",
-            Self::HcGates { .. } => "elementwise.hc_gates",
-            Self::HcFold { .. } => "elementwise.hc_fold",
-            Self::HcCollapse { .. } => "elementwise.hc_collapse",
-            Self::HcMix { .. } => "elementwise.hc_mix",
-            Self::HcInject { .. } => "elementwise.hc_inject",
-            Self::PleGate { .. } => "elementwise.ple_gate",
-            Self::Modulate { .. } => "elementwise.modulate",
-            Self::GatedResidualAdd { .. } => "elementwise.gated_residual_add",
-            Self::Sinusoid { .. } => "elementwise.sinusoid",
-            Self::RelativeBucketBias { .. } => "elementwise.relative_bucket_bias",
-            Self::Silu { .. } => "elementwise.silu",
-            Self::Gelu { .. } => "elementwise.gelu",
-            Self::Tanh { .. } => "elementwise.tanh",
-            Self::Hadamard { .. } => "elementwise.hadamard",
-            Self::Mul { .. } => "elementwise.mul",
-            Self::Add { .. } => "elementwise.add",
-            Self::RopeAxes { .. } => "elementwise.rope_axes",
-        }
-    }
 }

@@ -7,7 +7,7 @@ mod common;
 
 use common::{Gpu, close_bf16, round_bf16, values};
 use dtype::Dtype;
-use kernels_rocm::elemwise::norm;
+use kernels_rocm::elemwise::{norm, norm_residual, pointwise};
 
 fn rms(x: &[f32], w: Option<&[f32]>, plus_one: bool, eps: f32) -> Vec<f32> {
     let inv = 1.0 / (x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32 + eps).sqrt();
@@ -53,7 +53,7 @@ fn elemwise_norm() {
         let ys: Vec<f32> = values(n, 3, 2.0).into_iter().map(round_bf16).collect();
         let mut stream = gpu.tensor(&ys, rows_n, width, Dtype::Bf16);
         let mut out = gpu.zeros(rows_n, width, Dtype::Bf16);
-        norm::residual_add_rmsnorm(&ctx, x, &mut stream, w, true, 1e-6, &mut out).unwrap();
+        norm_residual::residual_add_rmsnorm(&ctx, x, &mut stream, w, true, 1e-6, &mut out).unwrap();
         let summed: Vec<f32> = ys.iter().zip(&xs).map(|(a, b)| round_bf16(a + b)).collect();
         close_bf16(
             "residual_add_rmsnorm stream",
@@ -65,7 +65,7 @@ fn elemwise_norm() {
         close_bf16("residual_add_rmsnorm out", &gpu.read(&out), &want, 1.0);
 
         let mut stream = gpu.tensor(&ys, rows_n, width, Dtype::Bf16);
-        norm::residual_add(&ctx, x, &mut stream).unwrap();
+        pointwise::residual_add(&ctx, x, &mut stream).unwrap();
         close_bf16("residual_add", &gpu.read(&stream), &summed, 0.0);
     }
 

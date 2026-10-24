@@ -1,4 +1,5 @@
 #![cfg(feature = "device")]
+#![allow(unsafe_code)]
 
 use std::path::{Path, PathBuf};
 

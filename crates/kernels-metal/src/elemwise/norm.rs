@@ -2,7 +2,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::encode::{
-    Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise, elementwise_rows, nonzero, refuse, stated,
+    Arg, Ctx, Fire, Grid, dtype_dispatch, elementwise_rows, nonzero, refuse, stated,
 };
 use crate::tensor::Tensor;
 
@@ -82,7 +82,7 @@ fn rms_row(
     });
     let grid = rms_grid(op, x.width, axis, x.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_rms.metal", entry).apply(grid),
+        Fire::at("elemwise/norm.metal", entry).apply(grid),
         &[
             x.arg(),
             weight.arg(),
@@ -105,7 +105,7 @@ pub fn residual_add_rmsnorm(
     eps: f32,
     out: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.residual_add_rmsnorm";
+    const OP: &str = "fused.residual_add_rmsnorm";
     let entry = dtype_dispatch!(OP, y.dtype, { Bf16 => "residual_add_rms_single_row_bfloat16" });
     debug_assert!(
         x.rows == y.rows && x.width == y.width && out.rows == y.rows && out.width == y.width,
@@ -113,7 +113,7 @@ pub fn residual_add_rmsnorm(
     );
     let grid = rms_grid(OP, y.width, y.width, y.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_rms.metal", entry).apply(grid),
+        Fire::at("elemwise/norm.metal", entry).apply(grid),
         &[
             x.arg(),
             y.arg_mut(),
@@ -130,7 +130,7 @@ pub fn residual_add_rmsnorm(
 
 /// [`residual_add_rmsnorm`] that also lays the register tile's input table of
 /// the normed rows in `table`, with `counters` arrival counters zeroed: the
-/// table `linear::quant`'s register matmul lays over `out`, bit for bit, so
+/// table `linear::qmm::sg`'s register matmul lays over `out`, bit for bit, so
 /// the projections of `out` read it and run no table pass. At most eight bf16
 /// rows, a whole number of 64-input groups wide.
 #[allow(clippy::too_many_arguments)]
@@ -145,7 +145,7 @@ pub fn residual_add_rmsnorm_table(
     table: Tensor,
     counters: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.residual_add_rmsnorm";
+    const OP: &str = "fused.residual_add_rmsnorm";
     dtype_dispatch!(OP, y.dtype, { Bf16 => () });
     if y.rows > 8 || !y.width.is_multiple_of(64) {
         return Err(refuse(
@@ -158,7 +158,7 @@ pub fn residual_add_rmsnorm_table(
     }
     let grid = rms_grid(OP, y.width, y.width, y.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_rms.metal", "residual_add_rms_table_bfloat16").apply(grid),
+        Fire::at("elemwise/norm.metal", "residual_add_rms_table_bfloat16").apply(grid),
         &[
             x.arg(),
             y.arg_mut(),
@@ -179,7 +179,7 @@ pub fn residual_add_rmsnorm_table(
 pub fn rmsnorm(ctx: &Ctx<'_>, x: Tensor, weight: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
     rms_row(
         ctx,
-        "elementwise.rmsnorm",
+        "elemwise.rmsnorm",
         x,
         weight,
         y,
@@ -193,7 +193,7 @@ pub fn rmsnorm(ctx: &Ctx<'_>, x: Tensor, weight: Tensor, eps: f32, y: Tensor) ->
 
 /// [`rmsnorm`] (or [`rmsnorm_plus_one`]) over at most eight bf16 rows that also lays the register
 /// tile's input table of the normed rows in `table`, with `counters` arrival
-/// counters zeroed: the table `linear::quant`'s register matmul lays over `y`,
+/// counters zeroed: the table `linear::qmm::sg`'s register matmul lays over `y`,
 /// bit for bit, so the projections of `y` run no table pass.
 #[allow(clippy::too_many_arguments)]
 pub fn rmsnorm_table(
@@ -206,7 +206,7 @@ pub fn rmsnorm_table(
     table: Tensor,
     counters: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm";
+    const OP: &str = "elemwise.rmsnorm";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     if y.rows > 8 || !y.width.is_multiple_of(64) {
         return Err(refuse(
@@ -219,7 +219,7 @@ pub fn rmsnorm_table(
     }
     let grid = rms_grid(OP, x.width, x.width, x.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_rms.metal", "rms_table_bfloat16").apply(grid),
+        Fire::at("elemwise/norm.metal", "rms_table_bfloat16").apply(grid),
         &[
             x.arg(),
             weight.arg(),
@@ -246,7 +246,7 @@ pub fn rmsnorm_per_head(
 ) -> Result<(), Error> {
     rms_row(
         ctx,
-        "elementwise.rmsnorm_per_head",
+        "elemwise.rmsnorm",
         x,
         weight,
         y,
@@ -267,7 +267,7 @@ pub fn rmsnorm_plus_one(
 ) -> Result<(), Error> {
     rms_row(
         ctx,
-        "elementwise.rmsnorm_plus_one",
+        "elemwise.rmsnorm",
         x,
         weight,
         y,
@@ -289,7 +289,7 @@ pub fn rmsnorm_per_head_plus_one(
 ) -> Result<(), Error> {
     rms_row(
         ctx,
-        "elementwise.rmsnorm_per_head_plus_one",
+        "elemwise.rmsnorm",
         x,
         weight,
         y,
@@ -315,7 +315,7 @@ pub fn rmsnorm_per_head_plus_one_pair(
     head_dim: u32,
     eps: f32,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_per_head_plus_one";
+    const OP: &str = "elemwise.rmsnorm";
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     if x2.dtype != x.dtype || y.dtype != x.dtype || y2.dtype != x.dtype {
         return Err(refuse(OP, "a norm pair runs over bf16 rows alone"));
@@ -336,7 +336,7 @@ pub fn rmsnorm_per_head_plus_one_pair(
     };
     let (first, second) = (groups(x)?, groups(x2)?);
     ctx.fire(
-        Fire::at("elemwise/norm_rms.metal", "rms_single_row_pair_bfloat16").apply(Grid::of(
+        Fire::at("elemwise/norm.metal", "rms_single_row_pair_bfloat16").apply(Grid::of(
             [threads * (first + second), 1, 1],
             [threads, 1, 1],
         )),
@@ -365,7 +365,7 @@ pub fn rmsnorm_grouped_plus_one(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_grouped_plus_one";
+    const OP: &str = "elemwise.rmsnorm";
     let axis = nonzero(OP, "the group width", group)?;
     if !x.width.is_multiple_of(axis) {
         return Err(refuse(
@@ -390,7 +390,7 @@ pub fn rmsnorm_grouped_plus_one(
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "rms_grouped_row_bfloat16" });
     let grid = rms_grid(OP, x.width, axis, x.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_rms.metal", entry).apply(grid),
+        Fire::at("elemwise/norm.metal", entry).apply(grid),
         &[
             x.arg(),
             weight.arg(),
@@ -412,11 +412,11 @@ pub fn rmsnorm_no_scale(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_no_scale";
+    const OP: &str = "elemwise.rmsnorm";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "vnorm_single_row_bfloat16" });
     let grid = rms_grid(OP, x.width, head_dim, x.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_vector.metal", entry).apply(grid),
+        Fire::at("elemwise/norm.metal", entry).apply(grid),
         &[x.arg(), y.arg_mut(), eps.arg(), stated(OP, head_dim)?.arg()],
     )
 }
@@ -432,7 +432,7 @@ pub fn rmsnorm_gated(
     sigmoid_gate: bool,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_gated";
+    const OP: &str = "elemwise.rmsnorm_gated";
     debug_assert_eq!(x.dtype, Dtype::F32, "`{OP}` norms an f32 accumulator");
     debug_assert_eq!(weight.dtype, Dtype::F32, "`{OP}` scales by an f32 weight");
     let entry = if sigmoid_gate {
@@ -452,7 +452,7 @@ pub fn rmsnorm_gated(
     }
     let lanes = head_row_grid(OP, vd, x.width / vd, x.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_gated_rms.metal", entry).apply(Grid::of(lanes, [vd, 1, 1])),
+        Fire::at("elemwise/norm.metal", entry).apply(Grid::of(lanes, [vd, 1, 1])),
         &[
             x.arg(),
             gate.arg(),
@@ -466,7 +466,7 @@ pub fn rmsnorm_gated(
 
 /// [`rmsnorm_gated`] with the SiLU gate over at most eight rows that also
 /// lays the register tile's input table of `y` in `table`, with `counters`
-/// arrival counters zeroed: the table `linear::quant`'s register matmul lays
+/// arrival counters zeroed: the table `linear::qmm::sg`'s register matmul lays
 /// over `y`, bit for bit, so the out projection runs no table pass.
 #[allow(clippy::too_many_arguments)]
 pub fn rmsnorm_gated_table(
@@ -480,7 +480,7 @@ pub fn rmsnorm_gated_table(
     table: Tensor,
     counters: u32,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_gated";
+    const OP: &str = "elemwise.rmsnorm_gated";
     debug_assert_eq!(x.dtype, Dtype::F32, "`{OP}` norms an f32 accumulator");
     debug_assert_eq!(weight.dtype, Dtype::F32, "`{OP}` scales by an f32 weight");
     dtype_dispatch!(OP, gate.dtype, { Bf16 => () });
@@ -497,11 +497,8 @@ pub fn rmsnorm_gated_table(
     }
     let lanes = head_row_grid(OP, vd, x.width / vd, x.rows)?;
     ctx.fire(
-        Fire::at(
-            "elemwise/norm_gated_rms.metal",
-            "gated_rms_table_f32_bfloat16",
-        )
-        .apply(Grid::of(lanes, [vd, 1, 1])),
+        Fire::at("elemwise/norm.metal", "gated_rms_table_f32_bfloat16")
+            .apply(Grid::of(lanes, [vd, 1, 1])),
         &[
             x.arg(),
             gate.arg(),
@@ -525,7 +522,7 @@ pub fn rmsnorm_gated_by(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.rmsnorm_gated_by";
+    const OP: &str = "elemwise.rmsnorm_gated_by";
     debug_assert_eq!(x.dtype, Dtype::F32, "`{OP}` norms an f32 accumulator");
     debug_assert_eq!(weight.dtype, Dtype::F32, "`{OP}` scales by an f32 weight");
     let entry = dtype_dispatch!(OP, gate.dtype, { Bf16 => "gated_rms_sigmoid_f32_bfloat16" });
@@ -542,7 +539,7 @@ pub fn rmsnorm_gated_by(
     let vd = head_width(OP, x.width / heads)?;
     let lanes = head_row_grid(OP, vd, heads, x.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_gated_rms.metal", entry).apply(Grid::of(lanes, [vd, 1, 1])),
+        Fire::at("elemwise/norm.metal", entry).apply(Grid::of(lanes, [vd, 1, 1])),
         &[
             x.arg(),
             gate.arg(),
@@ -554,40 +551,6 @@ pub fn rmsnorm_gated_by(
     )
 }
 
-pub fn residual_add(ctx: &Ctx<'_>, x: Tensor, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.residual_add";
-    let entry = dtype_dispatch!(OP, y.dtype, {
-        Bf16 => "residual_add_bfloat16",
-        F32 => "residual_add_float32",
-    });
-    ctx.fire(
-        Fire::at("elemwise/norm_residual_add.metal", entry)
-            .apply(Grid::of(elementwise(OP, y.width, y.rows)?, [256, 1, 1])),
-        &[x.arg(), y.arg(), y.arg_mut()],
-    )
-}
-
-pub fn add_bias(ctx: &Ctx<'_>, bias: Tensor, out: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.add_bias";
-    let entry = match (out.dtype, bias.dtype) {
-        (Dtype::Bf16, Dtype::Bf16) => "add_bias_bfloat16",
-        (Dtype::F32, Dtype::F32) => "add_bias_float32",
-        (Dtype::F32, Dtype::Bf16) => "add_bias_float32_bf16",
-        (row, bank) => {
-            return Err(refuse(
-                OP,
-                format!("no point adds a {bank:?} bias to a {row:?} row"),
-            ));
-        }
-    };
-    let lanes = elementwise_rows(OP, out.width, out.rows)?;
-    ctx.fire(
-        Fire::at("elemwise/norm_add_bias.metal", entry)
-            .apply(Grid::of(lanes, [lanes[0].min(256), 1, 1])),
-        &[out.arg_mut(), bias.arg(), stated(OP, out.width)?.arg()],
-    )
-}
-
 pub fn layernorm(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -596,11 +559,11 @@ pub fn layernorm(
     eps: f32,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.layernorm";
+    const OP: &str = "elemwise.layernorm";
     let entry = dtype_dispatch!(OP, x.dtype, { Bf16 => "layernorm_bfloat16" });
     let grid = rms_grid(OP, x.width, x.width, x.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_layernorm.metal", entry).apply(grid),
+        Fire::at("elemwise/norm.metal", entry).apply(grid),
         &[
             x.arg(),
             weight.arg(),
@@ -613,7 +576,7 @@ pub fn layernorm(
 }
 
 pub fn layernorm_no_scale(ctx: &Ctx<'_>, x: Tensor, eps: f32, y: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.layernorm_no_scale";
+    const OP: &str = "elemwise.layernorm";
     let entry = dtype_dispatch!(OP, x.dtype, {
         Bf16 => "layernorm_no_scale_bfloat16",
         F32 => "layernorm_no_scale_float32",
@@ -624,13 +587,13 @@ pub fn layernorm_no_scale(ctx: &Ctx<'_>, x: Tensor, eps: f32, y: Tensor) -> Resu
     );
     let grid = rms_grid(OP, x.width, x.width, x.rows)?;
     ctx.fire(
-        Fire::at("elemwise/norm_layernorm.metal", entry).apply(grid),
+        Fire::at("elemwise/norm.metal", entry).apply(grid),
         &[x.arg(), y.arg_mut(), eps.arg(), x.width.arg()],
     )
 }
 
 pub fn standardize(ctx: &Ctx<'_>, bias: Tensor, scale: Tensor, out: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.standardize";
+    const OP: &str = "elemwise.standardize";
     let entry = dtype_dispatch!(OP, out.dtype, { Bf16 => "standardize_bfloat16" });
     let lanes = elementwise_rows(OP, out.width, out.rows)?;
     for (what, plane) in [("bias", bias), ("scale", scale)] {
@@ -656,53 +619,13 @@ pub fn standardize(ctx: &Ctx<'_>, bias: Tensor, scale: Tensor, out: Tensor) -> R
         }
     }
     ctx.fire(
-        Fire::at("elemwise/norm_standardize.metal", entry)
-            .apply(Grid::of(lanes, [lanes[0].min(256), 1, 1])),
+        Fire::at("elemwise/norm.metal", entry).apply(Grid::of(lanes, [lanes[0].min(256), 1, 1])),
         &[
             out.arg_mut(),
             bias.arg(),
             scale.arg(),
             stated(OP, out.width)?.arg(),
         ],
-    )
-}
-
-pub fn mul_scalar(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.mul_scalar";
-    let entry = dtype_dispatch!(OP, x.dtype, {
-        Bf16 => "layer_scalar_mul_stated_bfloat16",
-        F32 => "layer_scalar_mul_stated_float32",
-    });
-    ctx.fire(
-        Fire::at("elemwise/norm_layer_scalar.metal", entry)
-            .apply(Grid::of(elementwise(OP, x.width, x.rows)?, [256, 1, 1])),
-        &[x.arg(), s.arg(), x.arg_mut()],
-    )
-}
-
-pub fn silu_scaled(ctx: &Ctx<'_>, s: f32, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.silu_scaled";
-    let entry = dtype_dispatch!(OP, x.dtype, {
-        Bf16 => "silu_scaled_bfloat16",
-        F32 => "silu_scaled_float32",
-    });
-    ctx.fire(
-        Fire::at("elemwise/norm_layer_scalar.metal", entry)
-            .apply(Grid::of(elementwise(OP, x.width, x.rows)?, [256, 1, 1])),
-        &[x.arg_mut(), s.arg()],
-    )
-}
-
-pub fn scale(ctx: &Ctx<'_>, s: Tensor, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.scale";
-    let entry = dtype_dispatch!(OP, x.dtype, {
-        Bf16 => "layer_scalar_mul_bfloat16",
-        F32 => "layer_scalar_mul_float32",
-    });
-    ctx.fire(
-        Fire::at("elemwise/norm_layer_scalar.metal", entry)
-            .apply(Grid::of(elementwise(OP, x.width, x.rows)?, [256, 1, 1])),
-        &[x.arg(), s.arg(), x.arg_mut()],
     )
 }
 
@@ -717,7 +640,7 @@ pub fn res_blend(
     proj: Tensor,
     y: Tensor,
 ) -> Result<(), Error> {
-    const OP: &str = "elementwise.res_blend";
+    const OP: &str = "elemwise.res_blend";
     const MAX_BLOCKS: usize = 32;
 
     let entry = dtype_dispatch!(OP, y.dtype, {

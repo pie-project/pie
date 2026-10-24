@@ -6,7 +6,7 @@
 // A row whose width is a multiple of 8 and whose planes are 16-byte aligned
 // moves in 16-byte packs.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::elemwise {
 

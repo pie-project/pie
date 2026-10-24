@@ -7,7 +7,7 @@
 // An lse plane is f32 [row][head] in the log2 domain (paged.hip's
 // convention): lse = m + log2(Σ 2^(s - m)), -inf for a row that saw no key.
 
-#include "prelude/device.hip"
+#include "prim/device.hip"
 
 namespace pie::attn {
 

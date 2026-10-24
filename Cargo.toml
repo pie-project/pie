@@ -40,6 +40,7 @@ members = [
     "crates/wasmtime-web",
 
     "crates/poem-ir",
+    "crates/poem-ir-macros",
     "crates/poem",
     "crates/poem-compiler",
     "crates/chat-template",
@@ -49,9 +50,8 @@ members = [
     "crates/kernels-metal",
     "crates/engine-cuda",
     "crates/engine-metal",
-    "crates/kernels-vulkan",
+    "crates/kernels-slang",
     "crates/engine-vulkan",
-    "crates/kernels-wgpu",
     "crates/engine-wgpu",
     "crates/kernels-xla",
     "crates/engine-xla",
@@ -89,6 +89,7 @@ default-members = [
     "crates/poem-exec",
     "crates/eta-exec",
     "crates/poem-ir",
+    "crates/poem-ir-macros",
     "crates/poem",
     "crates/poem-compiler",
     "crates/checkpoint",
@@ -97,9 +98,8 @@ default-members = [
     "crates/kernels-cuda",
     "crates/kernels-rocm",
     "crates/kernels-metal",
-    "crates/kernels-vulkan",
+    "crates/kernels-slang",
     "crates/engine-vulkan",
-    "crates/kernels-wgpu",
     "crates/engine-wgpu",
     "crates/kernels-xla",
     "crates/engine-xla",
@@ -215,12 +215,17 @@ inventory = "0.3"
 ztensor = { path = "crates/ztensor" }
 ztensor-compat = { path = "crates/ztensor-compat" }
 
+[lints]
+workspace = true
+
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
 missing_docs = "allow"
 
 [workspace.lints.clippy]
 todo = "deny"
+undocumented_unsafe_blocks = "warn"
 unimplemented = "deny"
 dbg_macro = "deny"
 

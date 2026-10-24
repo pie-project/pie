@@ -36,12 +36,10 @@ fn old_tile(family: u32, pairs: u32, experts: u32) -> u32 {
     }
 }
 
-/// The M4 Pro's measured routed tile: 16 rows below 48 pairs an expert.
+/// The M4 Pro's measured routed tile: 16 rows wherever the old choice was
+/// wider (two simdgroups multiply a 16-row tile side by side, #1034).
 fn m4_pro_tile(family: u32, pairs: u32, experts: u32) -> u32 {
-    match old_tile(family, pairs, experts) {
-        32 if pairs / experts < 48 => 16,
-        tile => tile,
-    }
+    old_tile(family, pairs, experts).min(16)
 }
 
 /// The kernel the old cascade in `act_x_wt_over` ran a dense matmul on.
@@ -226,8 +224,11 @@ fn assert_old_tuning(
         "{device}"
     );
     assert_eq!(
-        poem_compiler::fuse::flags::kernels(&profile),
-        ["elementwise.residual_add_rmsnorm", "linear.mlp_swiglu"],
+        poem_compiler::fuse::flags::on(&profile, &engine_metal::FUSIONS)
+            .iter()
+            .map(|rule| rule.kernel())
+            .collect::<Vec<_>>(),
+        ["fused.residual_add_rmsnorm", "fused.matmul_swiglu_matmul"],
         "{device}"
     );
 }

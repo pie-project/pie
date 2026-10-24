@@ -1,6 +1,6 @@
-# The weights of mini-dit. `PIE_MINI_DIT_TAP` names an intermediate the
-# forward reads out instead of its velocity, for parity against the
-# reference.
+# The weights of mini-dit. A deployment's tap (`-tap.{key}`) names an
+# intermediate the forward reads out instead of its velocity, for parity
+# against the reference.
 
 def linear(name, out, in_, banks, bias = True):
     """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
@@ -97,7 +97,7 @@ def layout(id, deploy):
         ),
         final_ada = linear("final.ada", 2 * HIDDEN, HIDDEN, banks),
         final_proj = linear("final.proj", PATCH_FEATURES, HIDDEN, banks),
-        tap = env("PIE_MINI_DIT_TAP") or "",
+        tap = deploy.tap or "",
     )
 
 def generative(m):

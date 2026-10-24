@@ -1,39 +1,38 @@
 use dtype::Dtype;
 
-use crate::cx::{Ctx, expect};
+use crate::check::expect;
 use crate::error::{Error, refuse};
-use crate::tensor::Tensor;
+use crate::hlo::{Func, Val};
+use crate::tensor::Operand;
 
 const FLOATS: &[Dtype] = &[Dtype::Bf16, Dtype::F16, Dtype::F32];
 
-/// `x *= σ(gate)`, element for element. Reference: kernels-wgpu
+/// `x *= σ(gate)`, element for element. Reference: kernels-slang
 /// `norm/gate.wgsl`.
-pub fn sigmoid_mul(ctx: &Ctx<'_>, gate: Tensor, x: Tensor) -> Result<(), Error> {
-    const OP: &str = "elementwise.gate_sigmoid_mul";
+pub fn sigmoid_mul(f: &mut Func, gate: Operand, x: Operand) -> Result<Val, Error> {
+    const OP: &str = "elemwise.gate_sigmoid_mul";
     expect(OP, x, FLOATS)?;
     if gate.rows != x.rows || gate.width != x.width {
         return Err(refuse(OP, "the gate plane rides the rectangle it gates"));
     }
-    ctx.emit(&mut |cx| {
-        let g = cx.read_f32(gate)?;
-        let s = cx.sigmoid(g);
-        let v = cx.read_f32(x)?;
-        let v = cx.mul(v, s)?;
-        cx.write(x, v)
-    })
+    let g = gate.f32(f);
+    let s = f.sigmoid(g);
+    let v = x.f32(f);
+    let v = f.mul(v, s)?;
+    Ok(v)
 }
 
 /// `x[n, h·d + i] *= scale · σ(gate[n, h])`: one logit per head. Reference:
 /// kernels-cuda / kernels-metal `gate_sigmoid_mul_heads` (wgpu refuses it).
 /// The gate plane may hold more rows than `x`; the first `x.rows` are read.
 pub fn sigmoid_mul_heads(
-    ctx: &Ctx<'_>,
-    gate: Tensor,
+    f: &mut Func,
+    gate: Operand,
     head_dim: u32,
     scale: f32,
-    x: Tensor,
-) -> Result<(), Error> {
-    const OP: &str = "elementwise.gate_sigmoid_mul_heads";
+    x: Operand,
+) -> Result<Val, Error> {
+    const OP: &str = "elemwise.gate_sigmoid_mul";
     expect(OP, x, FLOATS)?;
     if head_dim == 0 || x.width == 0 || !x.width.is_multiple_of(head_dim) {
         return Err(refuse(
@@ -55,15 +54,13 @@ pub fn sigmoid_mul_heads(
         ));
     }
     let (rows, hs, d) = (i64::from(x.rows), i64::from(heads), i64::from(head_dim));
-    ctx.emit(&mut |cx| {
-        let g = cx.read_f32(gate)?;
-        let g = cx.slice_axis(g, 0, 0, rows)?;
-        let s = cx.sigmoid(g);
-        let s = cx.scale(s, f64::from(scale))?;
-        let s = cx.broadcast(s, &[rows, hs, d], &[0, 1])?;
-        let s = cx.reshape(s, &[rows, hs * d])?;
-        let v = cx.read_f32(x)?;
-        let v = cx.mul(v, s)?;
-        cx.write(x, v)
-    })
+    let g = gate.f32(f);
+    let g = f.slice_axis(g, 0, 0, rows)?;
+    let s = f.sigmoid(g);
+    let s = f.scale(s, f64::from(scale))?;
+    let s = f.broadcast(s, &[rows, hs, d], &[0, 1])?;
+    let s = f.reshape(s, &[rows, hs * d])?;
+    let v = x.f32(f);
+    let v = f.mul(v, s)?;
+    Ok(v)
 }

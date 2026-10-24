@@ -7,7 +7,7 @@ use super::tc5::{Side, e4m3, side, ue8m0};
 use super::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype;
 use kernels_cuda::linear::act_quant::{fp8_tile_requant, scales_to_atoms};
-use kernels_cuda::linear::tc5::{Elem, Glu, atom_bytes};
+use kernels_cuda::linear::gemm_sm100::{Elem, Glu, atom_bytes};
 use kernels_cuda::tensor::Tensor;
 
 /// The tolerance a bf16 product answers in, against its value plus its
