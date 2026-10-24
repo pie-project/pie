@@ -108,7 +108,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     );
 
     let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
-    let profile = DeviceProfile::of(&chip, device.device().num_sm, &crate::EXCLUSIVE, grouped);
+    let mut profile = DeviceProfile::of(&chip, device.device().num_sm, &crate::EXCLUSIVE, grouped);
     let mut kernels = poem_compiler::fuse::flags::on(&chip, &crate::FUSIONS);
     if !boot.knobs.diagnostics.fuse_chains {
         kernels.retain(|rule| crate::UNCHAINED.contains(&rule.kernel()));
@@ -135,6 +135,18 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     if profile.branches {
         boot.trace = poem_compiler::branch::split(boot.trace.clone());
     }
+    // `compiler.synth_regions`: each chain of elementwise and row ops folded
+    // into one `fused.region`, its body the stream core's, by the fold
+    // `compile_axes` plans under the flag. Folded once, here, the trace is
+    // the one the load runs and every plan after is of it as it stands.
+    let bodies = if profile.synth_regions {
+        let (folded, bodies) = poem_compiler::fuse::chain::fold(boot.trace.clone());
+        boot.trace = folded;
+        profile.synth_regions = false;
+        bodies
+    } else {
+        std::collections::BTreeMap::new()
+    };
     if boot.knobs.diagnostics.trace_census {
         let mut census: std::collections::BTreeMap<&'static str, usize> =
             std::collections::BTreeMap::new();
@@ -306,6 +318,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         compiled,
         budgets,
         profile,
+        bodies,
     })
 }
 
@@ -528,7 +541,11 @@ impl Shell {
             compiled,
             budgets,
             profile,
+            bodies,
         } = bake(&mut boot)?;
+        // Every generated kernel compiled and loaded now, before a fire can
+        // ask for one.
+        let regions = crate::synth::Regions::load(&boot.trace, &bodies)?;
         let (free_before, device_total) = crate::store::device_memory()?;
         // The pool's address space is reserved for every page its bytes
         // could hold, the stated budget or the share of the card before the
@@ -906,6 +923,7 @@ impl Shell {
             accounting,
             trace: boot.trace,
             compiled,
+            regions,
             ep: None,
             forced_bucket: None,
             budget: budgets.tokens.clone(),
@@ -1536,6 +1554,8 @@ pub(super) struct Baked {
     pub(super) compiled: CompiledModel,
     pub(super) budgets: Budgets,
     pub(super) profile: DeviceProfile,
+    /// The body each `fused.region` of the trace names, by hash.
+    pub(super) bodies: std::collections::BTreeMap<u64, poem_compiler::fuse::chain::Synth>,
 }
 
 /// The widest fire whose lanes of `rows` prompt rows put no more (lane,

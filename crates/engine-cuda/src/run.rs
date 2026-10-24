@@ -588,6 +588,9 @@ pub struct Run<'c> {
     /// The values an expert region makes, by id (`CompiledModel::expert`).
     expert: &'c [bool],
 
+    /// The generated kernels the trace's `fused.region`s fire.
+    regions: &'c crate::synth::Regions,
+
     /// This rank's expert-parallel group, where the trace dispatches.
     ep: Option<&'c crate::ep::EpRank>,
 
@@ -691,6 +694,7 @@ impl<'c> Run<'c> {
             stood: Cell::new(None),
             tapping: None,
             expert: &[],
+            regions: &crate::synth::NONE,
             ep: None,
             received: Cell::new(false),
             #[cfg(feature = "rocm")]
@@ -783,6 +787,12 @@ impl<'c> Run<'c> {
     #[must_use]
     pub fn expert(mut self, held: &'c [bool]) -> Self {
         self.expert = held;
+        self
+    }
+
+    #[must_use]
+    pub fn regions(mut self, regions: &'c crate::synth::Regions) -> Self {
+        self.regions = regions;
         self
     }
 
@@ -1609,6 +1619,17 @@ impl<'c> Run<'c> {
             node.op.inputs(&mut inputs);
             inputs.contains(&normed)
         })
+    }
+
+    /// The kernel the load generated for the region of `body` over rows
+    /// `width` wide.
+    #[cfg(not(feature = "rocm"))]
+    pub(crate) fn region_kernel(
+        &self,
+        body: u64,
+        width: u32,
+    ) -> Option<kernels_cuda::synth::Synthesized> {
+        self.regions.get(body, width)
     }
 
     pub(crate) fn lane_shaped(&self, id: ValueId) -> bool {
