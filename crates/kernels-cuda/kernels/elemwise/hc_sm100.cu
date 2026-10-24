@@ -679,9 +679,13 @@ __global__ void __launch_bounds__(kMegaThreads, 1) hc_fold_pre_tc5(
                     bf16* o8 = reinterpret_cast<bf16*>(&ow);
 #pragma unroll
                     for (int e = 0; e < 8; ++e) {
-                        float acc = post[j] * xf[e];
+                        // Each product rounded, then summed: `hc_fold`
+                        // under NVRTC's `--fmad=false`, not a fused
+                        // multiply-add.
+                        float acc = __fmul_rn(post[j], xf[e]);
 #pragma unroll
-                        for (int i = 0; i < kMegaStreams; ++i) acc = fmaf(comb[i * 4 + j], rf[i][e], acc);
+                        for (int i = 0; i < kMegaStreams; ++i)
+                            acc = __fadd_rn(acc, __fmul_rn(comb[i * 4 + j], rf[i][e]));
                         o8[e] = f32_to_bf16(acc);
                         const float v = bf16_to_f32(o8[e]);
                         sq[k] = fmaf(v, v, sq[k]);

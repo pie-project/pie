@@ -795,8 +795,10 @@ pub struct Seam {
 }
 
 /// Whether `hc_fold_pre_tc5` takes these: tcgen05, four streams whose
-/// width is whole 1024s, the 24-mix plane, bf16 rows and f32 gates
-/// 16-byte aligned, `kernel.elemwise.hc_mega_from` to `hc_mega_until` rows.
+/// width is whole 1024s, the 24-mix plane, a norm weight of the row's
+/// width in any rectangle (a load hands its `[H]` as H rows of one), bf16
+/// rows and f32 gates 16-byte aligned, `kernel.elemwise.hc_mega_from` to
+/// `hc_mega_until` rows.
 #[cfg(feature = "cuda")]
 fn fold_pre_fits(ctx: &Ctx, s: &Seam, folded: &Tensor, y: &Tensor) -> bool {
     let hidden = y.width;
@@ -826,7 +828,7 @@ fn fold_pre_fits(ctx: &Ctx, s: &Seam, folded: &Tensor, y: &Tensor) -> bool {
         && s.comb_mix.width == 16
         && s.hc_fn.rows == 24
         && s.hc_fn.width == wide
-        && s.weight.width == hidden
+        && s.weight.elements() == u64::from(hidden)
         && [
             s.x.ptr,
             s.streams.ptr,

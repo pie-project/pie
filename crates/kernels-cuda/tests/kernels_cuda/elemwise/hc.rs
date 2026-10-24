@@ -306,8 +306,13 @@ impl SeamIn {
     fn draw(gpu: &mut Gpu, lcg: &mut Lcg, rows: usize) -> Self {
         let (_, x) = bf16s(lcg, rows * H, 1.0);
         let (_, s) = bf16s(lcg, rows * M * H, 1.0);
-        let post: Vec<f32> = (0..rows * M).map(|_| lcg.unit().abs() * 2.0).collect();
-        let comb: Vec<f32> = (0..rows * M * M).map(|_| lcg.unit().abs()).collect();
+        // Gates of every f32 bit, as the gates kernel lands them: a gate
+        // drawn bf16 times a bf16 stream is exact in f32, where a fused
+        // multiply-add and a rounded product then a sum agree.
+        let post: Vec<f32> = (0..rows * M)
+            .map(|_| lcg.unit().abs() * 2.0 / 3.0)
+            .collect();
+        let comb: Vec<f32> = (0..rows * M * M).map(|_| lcg.unit().abs() / 3.0).collect();
         let w: Vec<f32> = (0..MIX * M * H).map(|_| lcg.unit() * 0.01).collect();
         let bias: Vec<f32> = (0..MIX).map(|_| lcg.unit()).collect();
         let (_, nw) = bf16s(lcg, H, 1.0);
@@ -358,7 +363,8 @@ impl SeamIn {
             &mut ten(co_at, live, M * M, F32),
         );
         let y = &mut ten(y_at, live, H, Bf16);
-        let (plane, weight) = (ten(w_at, MIX, M * H, F32), ten(nw_at, 1, H, Bf16));
+        // The norm weight `[H]` as a load hands it: H rows of one column.
+        let (plane, weight) = (ten(w_at, MIX, M * H, F32), ten(nw_at, H, 1, Bf16));
         if mega {
             let seam = hc::Seam {
                 x,
