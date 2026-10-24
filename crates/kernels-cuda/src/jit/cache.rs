@@ -173,8 +173,8 @@ fn load_image(root: &'static str, image: &[u8]) -> Result<dr::CUmodule, Fault> {
     // SAFETY: `module` is a local out-pointer and `image` is a non-empty
     // byte slice that outlives the call; the driver copies the image. The
     // driver reads its length from the cubin's own ELF headers, so the
-    // bytes must be a whole image: NVRTC's output, or a cache file that
-    // `write_disk` renamed into place only once fully written.
+    // bytes must be a whole image: NVRTC's output, or a cache file whose
+    // trailing hash `decode` checked against what `write_disk` stored.
     let code = unsafe { dr::cuModuleLoadData(&raw mut module, image.as_ptr().cast()) };
     if code == dr::CUresult::CUDA_SUCCESS {
         Ok(module)
@@ -223,8 +223,18 @@ fn disk_path(key: &str) -> Option<PathBuf> {
 }
 
 fn read_disk(key: &str) -> Option<(Vec<u8>, String)> {
-    let bytes = std::fs::read(disk_path(key)?).ok()?;
-    let (stored_key, rest) = take_str(&bytes)?;
+    decode(key, &std::fs::read(disk_path(key)?).ok()?)
+}
+
+/// A cache file's entry, if it is whole and under `key`: a file whose
+/// trailing hash disagrees with its body (a torn write, a bad disk) is a
+/// miss, and the recompile overwrites it.
+fn decode(key: &str, bytes: &[u8]) -> Option<(Vec<u8>, String)> {
+    let (body, sum) = bytes.split_at_checked(bytes.len().checked_sub(8)?)?;
+    if u64::from_le_bytes(sum.try_into().ok()?) != crate::source::fnv1a64(body) {
+        return None;
+    }
+    let (stored_key, rest) = take_str(body)?;
     if stored_key != key {
         return None;
     }
@@ -245,15 +255,22 @@ fn write_disk(key: &str, cubin: &[u8], mangled: &str) {
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let mut out = Vec::with_capacity(cubin.len() + mangled.len() + key.len() + 8);
-    put_str(&mut out, key);
-    put_str(&mut out, mangled);
-    out.extend_from_slice(cubin);
-
+    let out = encode(key, cubin, mangled);
     let staging = path.with_extension(format!("cubin.{}", std::process::id()));
     if std::fs::write(&staging, &out).is_ok() && std::fs::rename(&staging, &path).is_err() {
         let _ = std::fs::remove_file(&staging);
     }
+}
+
+/// `key`, `mangled` and `cubin`, then the FNV-1a hash of all three.
+fn encode(key: &str, cubin: &[u8], mangled: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(cubin.len() + mangled.len() + key.len() + 16);
+    put_str(&mut out, key);
+    put_str(&mut out, mangled);
+    out.extend_from_slice(cubin);
+    let sum = crate::source::fnv1a64(&out);
+    out.extend_from_slice(&sum.to_le_bytes());
+    out
 }
 
 fn put_str(out: &mut Vec<u8>, text: &str) {
@@ -330,4 +347,25 @@ fn attribute(device: dr::CUdevice, which: dr::CUdevice_attribute) -> Option<i32>
     // comes back as an error code, not a write.
     let code = unsafe { dr::cuDeviceGetAttribute(&raw mut value, which, device) };
     (code == dr::CUresult::CUDA_SUCCESS).then_some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode, encode};
+
+    #[test]
+    fn a_damaged_cache_file_is_a_miss() {
+        let file = encode("key", b"\x7fELF image", "_Z6kernel");
+        assert_eq!(
+            decode("key", &file),
+            Some((b"\x7fELF image".to_vec(), "_Z6kernel".to_owned()))
+        );
+        assert_eq!(decode("other", &file), None);
+        for at in 0..file.len() {
+            let mut torn = file.clone();
+            torn[at] ^= 0x01;
+            assert_eq!(decode("key", &torn), None, "a flip at byte {at} was loaded");
+        }
+        assert_eq!(decode("key", &file[..file.len() - 1]), None);
+    }
 }
