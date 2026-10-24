@@ -309,11 +309,27 @@ fn carve(_: i32, _: &[i32], _: &[u64; PARTS]) -> Result<[u64; PARTS]> {
     Err(Fault::Runtimeless)
 }
 
-/// One MoE layer's placement on a rank's device.
+pub mod rebalance;
+
+/// One MoE layer's placement on a rank's device: the table its dispatches
+/// read and the loads they add each local slot's rows to.
 struct Layer {
     place: kernels_cuda::collective::Placement,
-    _table: crate::device::Buffer,
+    table: crate::device::Buffer,
+    loads: crate::device::Buffer,
 }
+
+/// One plane of a routed bank on a rank: its `slots` slots, slot `s` the
+/// `slot_bytes` at `ptr + s * slot_bytes`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Plane {
+    pub ptr: u64,
+    pub slot_bytes: u64,
+}
+
+/// A layer's routed banks on a rank, every plane in the trace's order, or
+/// why its slots cannot move.
+pub type Banks = std::collections::BTreeMap<u32, std::result::Result<Vec<Plane>, String>>;
 
 /// A rank's expert-parallel state: every rank's wire (its own at `rank`)
 /// and each lowered MoE layer's placement table on this device, by the
@@ -323,6 +339,7 @@ pub struct EpRank {
     pub wires: Vec<Wire>,
     pub rank: u32,
     layers: std::collections::BTreeMap<u32, Layer>,
+    banks: Banks,
     seats: Seats,
     seats_forked: Seats,
 }
@@ -340,21 +357,25 @@ impl EpRank {
             let placement = engine::placement::Placement::uniform(experts, ranks, slots)
                 .map_err(|why| Fault::program("ep::EpRank", format!("layer {layer}: {why:?}")))?;
             let stride = engine::placement::Placement::stride_for(ranks * slots - experts + 1);
-            let table = placement.table(stride);
-            let bytes: Vec<u8> = table.iter().flat_map(|v| v.to_le_bytes()).collect();
-            let mut buffer = crate::device::Buffer::zeroed(bytes.len())?;
-            buffer.write(0, &bytes)?;
+            let bytes: Vec<u8> = (placement.table(stride).iter())
+                .flat_map(|v| v.to_le_bytes())
+                .collect();
+            let mut table = crate::device::Buffer::zeroed(bytes.len())?;
+            table.write(0, &bytes)?;
+            let loads = crate::device::Buffer::zeroed(slots as usize * 4)?;
             let place = kernels_cuda::collective::Placement {
-                table: buffer.ptr(),
+                table: table.ptr(),
                 stride,
                 experts,
                 slots,
+                loads: loads.ptr(),
             };
             held.insert(
                 layer,
                 Layer {
                     place,
-                    _table: buffer,
+                    table,
+                    loads,
                 },
             );
         }
@@ -362,9 +383,70 @@ impl EpRank {
             wires,
             rank,
             layers: held,
+            banks: Banks::new(),
             seats: Seats::default(),
             seats_forked: Seats::default(),
         })
+    }
+
+    /// The routed banks this rank holds, by layer: what a rebalance copies.
+    pub fn hold_banks(&mut self, banks: Banks) {
+        self.banks = banks;
+    }
+
+    /// A layer's bank planes on this rank, or why they cannot move.
+    pub fn planes(&self, layer: u32) -> std::result::Result<&[Plane], String> {
+        match self.banks.get(&layer) {
+            Some(Ok(planes)) => Ok(planes),
+            Some(Err(why)) => Err(why.clone()),
+            None => Err(format!("layer {layer} holds no routed bank on this rank")),
+        }
+    }
+
+    /// Each layer's `(layer, experts, slots, stride)`.
+    pub fn layers(&self) -> impl Iterator<Item = (u32, u32, u32, u32)> + '_ {
+        (self.layers.iter()).map(|(&l, layer)| {
+            (
+                l,
+                layer.place.experts,
+                layer.place.slots,
+                layer.place.stride,
+            )
+        })
+    }
+
+    /// Each layer's rows per local slot since the last read, which it
+    /// zeroes. The rank's dispatches must have finished.
+    pub fn take_loads(&mut self) -> Result<std::collections::BTreeMap<u32, Vec<u32>>> {
+        let mut out = std::collections::BTreeMap::new();
+        for (&l, layer) in &mut self.layers {
+            let mut bytes = vec![0u8; layer.loads.bytes()];
+            layer.loads.read(0, &mut bytes)?;
+            layer.loads.zero_span(0, bytes.len())?;
+            let loads = bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
+                .collect();
+            out.insert(l, loads);
+        }
+        Ok(out)
+    }
+
+    /// Rewrites `layer`'s table in place: a captured body reads it where it
+    /// was.
+    pub fn write_table(&mut self, layer: u32, table: &[i32]) -> Result<()> {
+        let layer = (self.layers.get_mut(&layer))
+            .ok_or_else(|| Fault::program("ep::write_table", format!("no layer {layer}")))?;
+        let bytes: Vec<u8> = table.iter().flat_map(|v| v.to_le_bytes()).collect();
+        if bytes.len() != layer.table.bytes() {
+            return Err(Fault::program(
+                "ep::write_table",
+                "a table of another stride than the one laid at load",
+            ));
+        }
+        layer.table.write(0, &bytes)
     }
 
     /// Seats the values of `trace` on this rank's buffers, under the arena

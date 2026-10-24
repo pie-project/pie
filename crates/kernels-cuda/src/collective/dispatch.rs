@@ -58,6 +58,9 @@ pub struct Placement {
     pub stride: u32,
     pub experts: u32,
     pub slots: u32,
+    /// `slots` u32 each local slot's received rows are added into, every
+    /// dispatch, until the group reads them; 0 for none.
+    pub loads: u64,
 }
 
 /// One rank's landing buffers, which every peer writes into: `world * T`
@@ -97,6 +100,7 @@ struct Params {
     pos: u64,
     offs: u64,
     counts: u64,
+    loads: u64,
     rows: [u64; EP_MAX_RANKS as usize],
     local: [u64; EP_MAX_RANKS as usize],
     row_weights: [u64; EP_MAX_RANKS as usize],
@@ -213,6 +217,7 @@ pub fn dispatch(
         pos,
         offs,
         counts: counts.ptr,
+        loads: place.loads,
         rows: by_rank(&|l| l.rows.ptr),
         local: by_rank(&|l| l.local.ptr),
         row_weights: by_rank(&|l| l.row_weights.map_or(0, |w| w.ptr)),

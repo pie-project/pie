@@ -105,6 +105,9 @@ struct Held {
     place: Placement,
 }
 
+/// What a slot's load holds before a dispatch adds its rows.
+const LOADS_BEFORE: u32 = 5;
+
 fn hold(c: &Case, g: &mut Gpu, d: &Data, signals: u64) -> Held {
     let (t, k, h, w) = (c.tokens, c.top_k, c.width, c.out_width);
     let (cap, slots) = (c.world * t, c.slots());
@@ -136,6 +139,7 @@ fn hold(c: &Case, g: &mut Gpu, d: &Data, signals: u64) -> Held {
         stride: 3,
         experts: c.experts as u32,
         slots: slots as u32,
+        loads: g.up(&vec![LOADS_BEFORE; slots]),
     };
     Held {
         tokens: Tokens {
@@ -296,6 +300,12 @@ fn check(c: &Case) {
                 }
             }
             assert_eq!(counts, tally, "{at}: rows per local slot");
+            let loads: Vec<u32> = g.down(held[d].place.loads, slots);
+            let summed: Vec<u32> = tally.iter().map(|&n| LOADS_BEFORE + n as u32).collect();
+            assert_eq!(
+                loads, summed,
+                "{at}: the loads each slot's rows are added to"
+            );
 
             // Stand-in experts: each landed route's output names its origin,
             // route and slot.

@@ -71,6 +71,7 @@ fn an_expert_parallel_wire_carries_tokens_out_and_back() {
         stride: 2,
         experts,
         slots,
+        loads: 0,
     };
     let xs: Vec<Vec<u16>> = (0..world)
         .map(|r| {

@@ -8,89 +8,11 @@
 //! first sends it. Every answer is the one a single engine holding every
 //! expert gives.
 
-use std::path::Path;
-
-use checkpoint::contract::ModelContract;
 use engine::Engine;
-use engine::fire::{FrameSubmission, Lane, Readout, Step};
-use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
 use engine_cuda::DeviceBoot;
 use poem::{Dtype, Platform, Request};
-use poem_ir::Trace;
 
-use crate::micro::{MICRO, RANKS, Scratch, close, prompt, write_checkpoint};
-
-fn contract_for(trace: &Trace, path: &Path) -> Result<ModelContract, String> {
-    let source = ztensor::Source::open(path).map_err(|why| why.to_string())?;
-    poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
-        .map_err(|why| why.to_string())
-}
-
-fn request(trace: &Trace, checkpoint: &Path) -> LoadRequest {
-    LoadRequest {
-        trace: trace.clone(),
-        checkpoint: Checkpoint::Path(checkpoint.to_path_buf()),
-        budgets: Budgets {
-            max_lanes: 2,
-            max_tokens: 256,
-            buckets: vec![16, 64, 256],
-            max_adapters: 0,
-            page_size: 16,
-            max_context: 256,
-            context_declared: false,
-            slots: 2,
-            max_patches: None,
-            max_images: None,
-            max_voxels: None,
-            max_clips: None,
-        },
-        // Ranks sharing one device: each its share of it, and a small kv.
-        residency: Residency {
-            device_memory_share: 0.3,
-            device_kv_budget: Some(64 << 20),
-            host_kv_budget: Some(64 << 20),
-            disk_kv_budget: Some(0),
-            ..Residency::default()
-        },
-        ordinal: -1,
-        frames_in_flight: 1,
-    }
-}
-
-/// `whole`'s checkpoint, every expert, in a directory of its own.
-fn checkpoint(whole: &Trace, tag: &str) -> (Scratch, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("pie-ep-engine-{tag}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).expect("the scratch directory");
-    let path = dir.join("micro.zt");
-    write_checkpoint(&path, whole);
-    (Scratch(dir), path)
-}
-
-fn step(slot: u32, word: u64, tokens: &[u32]) -> Step {
-    Step {
-        lanes: vec![Lane {
-            slot,
-            word,
-            tokens: tokens.to_vec(),
-            readout: Readout::Last,
-            ..Lane::default()
-        }],
-        attachments: Vec::new(),
-        media: Vec::new(),
-        voxels: Vec::new(),
-    }
-}
-
-/// One step's last-row logits, submitted and settled.
-fn answer(engine: &mut dyn Engine, step: &Step) -> Vec<f32> {
-    let mut ticket = engine
-        .submit(&FrameSubmission::of(step.clone()))
-        .expect("the frame fires");
-    engine.settle_frame(&mut ticket).expect("the frame settles");
-    let readout = &ticket.steps[0].readouts[0];
-    readout.values.clone()
-}
+use crate::micro::{MICRO, RANKS, answer, checkpoint, close, contract_for, prompt, request, step};
 
 #[test]
 fn an_expert_parallel_group_serves_through_its_engines() {

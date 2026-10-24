@@ -23,7 +23,8 @@ using peer::kMaxRanks;
 //   dispatch_send   (a warp a token) copies the rows into the destinations;
 //   dispatch_settle (one block)  meets the ranks again, so every row has
 //                                landed, then marks the tail as padding and
-//                                counts this rank's rows per local slot.
+//                                counts this rank's rows per local slot
+//                                (and adds them to the group's loads).
 
 // Where rank s tells rank d how many rows it sends: d's inbox, s's column.
 struct Inbox {
@@ -55,6 +56,9 @@ struct DispatchParams {
     i32* pos;
     i32* offs;
     i32* counts;
+    // Each local slot's received rows summed over the dispatches since the
+    // group last read them (the rebalance's loads), or null.
+    u32* loads;
     int4* rows[kMaxRanks];
     i32* local[kMaxRanks];
     float* row_weights[kMaxRanks];
@@ -191,6 +195,9 @@ __global__ void __launch_bounds__(kCountThreads) dispatch_settle(const DispatchP
             atomicAdd(&p.counts[local[i]], 1);
         }
     }
+    if (p.loads == nullptr) return;
+    __syncthreads();
+    for (int s = threadIdx.x; s < p.slots; s += blockDim.x) p.loads[s] += static_cast<u32>(p.counts[s]);
 }
 
 }  // namespace pie::collective
