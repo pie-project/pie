@@ -660,12 +660,15 @@ pub struct MlaPlanInfo {
 }
 
 /// A ring of page-locked slots the plans' uploads stage through, each
-/// reused once the copy that read it has run.
+/// reused once the copy that read it has run. A thread keeps one ring a
+/// device: a slot's event is its device's, recorded on that device's
+/// streams alone.
 #[cfg(feature = "cuda")]
 mod pinned {
     use super::{Error, refuse};
     use core::cell::RefCell;
     use cudarc::runtime::sys as rt;
+    use std::collections::BTreeMap;
 
     const SLOTS: usize = 8;
 
@@ -681,7 +684,23 @@ mod pinned {
     }
 
     thread_local! {
-        static RING: RefCell<Ring> = const { RefCell::new(Ring { slots: Vec::new(), next: 0 }) };
+        static RINGS: RefCell<BTreeMap<usize, Ring>> = const { RefCell::new(BTreeMap::new()) };
+    }
+
+    /// `f` on this thread's ring of the device it has bound.
+    fn on_ring<R>(
+        op: &'static str,
+        f: impl FnOnce(&mut Ring) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        let device = crate::jit::cache::current_device()
+            .map_err(|fault| refuse(op, format!("staging the plan: {fault}")))?;
+        RINGS.with(|rings| {
+            let mut rings = rings.borrow_mut();
+            f(rings.entry(device).or_insert(Ring {
+                slots: Vec::new(),
+                next: 0,
+            }))
+        })
     }
 
     fn check(op: &'static str, what: &str, code: rt::cudaError_t) -> Result<(), Error> {
@@ -698,8 +717,7 @@ mod pinned {
     /// `bytes` copied into the ring's next slot, waiting out the copy that
     /// last read it; the slot's address.
     pub(super) fn stage(op: &'static str, bytes: &[u8]) -> Result<*const u8, Error> {
-        RING.with(|ring| {
-            let mut ring = ring.borrow_mut();
+        on_ring(op, |ring| {
             let at = ring.next;
             if ring.slots.len() <= at {
                 let mut read: rt::cudaEvent_t = core::ptr::null_mut();
@@ -744,8 +762,7 @@ mod pinned {
 
     /// The slot `stage` handed out is read once `stream` runs to here.
     pub(super) fn sent(op: &'static str, stream: rt::cudaStream_t) -> Result<(), Error> {
-        RING.with(|ring| {
-            let mut ring = ring.borrow_mut();
+        on_ring(op, |ring| {
             let at = ring.next;
             ring.next = (at + 1) % SLOTS;
             // SAFETY: an event this ring created, on the caller's stream.
