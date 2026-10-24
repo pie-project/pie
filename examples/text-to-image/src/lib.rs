@@ -1057,6 +1057,17 @@ async fn main(input: Input) -> Result<Output> {
     let shape = [rows, row_width];
     let seed = input.seed.unwrap_or(0);
 
+    let dts = loops.dts();
+    let sigmas = loops.sigmas();
+    // IMG2IMG: the encoded picture, seeded once, read by every fire of both
+    // branches and used by fire 0.
+    let init = init_latent
+        .as_ref()
+        .map(|rows| Channel::from_shaped(shape, rows.as_slice()).named("init"));
+    let mask = painted
+        .as_ref()
+        .map(|m| Channel::from_shaped([rows], m.as_slice()).named("mask"));
+
     let mut branches: Vec<Branch> = Vec::new();
     for (group, ctx) in [Some(&context), uncond.as_ref()]
         .into_iter()
@@ -1114,20 +1125,9 @@ async fn main(input: Input) -> Result<Output> {
 
         // A lane that only modulates advances its clock and nothing else.
         text_clock.drive(&context_lane.pass, |_| {});
-        let dts = loops.dts(tag);
         let rng = Channel::from(rng_state(seed)).named(&format!("{tag}_rng"));
         let x = latent.clone();
         let readback = out.clone();
-        // IMG2IMG: the encoded picture, seeded once, read by every fire and
-        // used by fire 0. Its own channel per branch, since a seeded channel
-        // attaches to one pass (the runtime's channel-role rule).
-        let init = init_latent
-            .as_ref()
-            .map(|rows| Channel::from_shaped(shape, rows.as_slice()).named(&format!("{tag}_init")));
-        let mask = painted
-            .as_ref()
-            .map(|m| Channel::from_shaped([rows], m.as_slice()).named(&format!("{tag}_mask")));
-        let sigmas = loops.sigmas(tag);
         image_clock.drive(&image_lane.pass, move |k| {
             // On the CFG path BOTH branches step with the SAME combine, each
             // computed from its own side: the conditional lane reads

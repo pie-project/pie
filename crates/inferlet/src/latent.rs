@@ -308,9 +308,10 @@ impl LaneClock {
 
 pub struct DenoiseLoop {
     pipes: Vec<Pipeline>,
-    dts: Vec<f32>,
-    ts: Vec<f32>,
-    sigmas: Vec<f32>,
+    t0: f32,
+    ts: Channel,
+    dts: Channel,
+    sigmas: Channel,
     fires: u32,
 }
 
@@ -323,13 +324,7 @@ impl DenoiseLoop {
         let mut dts = vec![0.0];
         dts.extend(sched.dts());
         dts.push(0.0);
-        DenoiseLoop {
-            pipes: Vec::new(),
-            dts,
-            ts,
-            sigmas: sched.sigmas.clone(),
-            fires: sched.steps() + 1,
-        }
+        DenoiseLoop::of(sched, ts, dts, sched.steps() + 1)
     }
 
     /// One fire per step over a latent drawn up front by [`host_noise`].
@@ -339,12 +334,17 @@ impl DenoiseLoop {
         ts.push(0.0);
         let mut dts = sched.dts();
         dts.push(0.0);
+        DenoiseLoop::of(sched, ts, dts, sched.steps())
+    }
+
+    fn of(sched: &FlowMatchEuler, ts: Vec<f32>, dts: Vec<f32>, fires: u32) -> DenoiseLoop {
         DenoiseLoop {
             pipes: Vec::new(),
-            dts,
-            ts,
-            sigmas: sched.sigmas.clone(),
-            fires: sched.steps(),
+            t0: ts[0],
+            ts: Channel::from(ts).named("ts"),
+            dts: Channel::from(dts).named("dts"),
+            sigmas: Channel::from(sched.sigmas.clone()).named("sigmas"),
+            fires,
         }
     }
 
@@ -357,21 +357,22 @@ impl DenoiseLoop {
         self.pipes.push(Pipeline::new());
         LaneClock {
             step: Channel::from([0u32]).named(&format!("{tag}_step")),
-            timestep: Channel::from([self.ts[0]]).named(&format!("{tag}_t")),
-            ts: Channel::from(self.ts.clone()).named(&format!("{tag}_ts")),
+            timestep: Channel::from([self.t0]).named(&format!("{tag}_t")),
+            ts: self.ts,
         }
     }
 
+    /// The step each fire takes; every lane reads the same channel.
     #[must_use]
-    pub fn dts(&self, tag: &str) -> Channel {
-        Channel::from(self.dts.clone()).named(&format!("{tag}_dts"))
+    pub fn dts(&self) -> Channel {
+        self.dts
     }
 
     /// The sigma the latent sits at after fire `k`: fire 0 seeds at
     /// `sigmas[0]`, fire `k` steps to `sigmas[k]`, and the last lands on 0.
     #[must_use]
-    pub fn sigmas(&self, tag: &str) -> Channel {
-        Channel::from(self.sigmas.clone()).named(&format!("{tag}_sigmas"))
+    pub fn sigmas(&self) -> Channel {
+        self.sigmas
     }
 
     pub fn fire(&self, passes: &[&ForwardPass]) -> Result<(), String> {
@@ -566,12 +567,12 @@ impl Dpm2m {
     }
 
     #[must_use]
-    pub fn channels(&self, tag: &str) -> Dpm2mChannels {
+    pub fn channels(&self) -> Dpm2mChannels {
         Dpm2mChannels {
-            sigma_s: Channel::from(self.sigma_s.clone()).named(&format!("{tag}_sigma_s")),
-            ratio: Channel::from(self.ratio.clone()).named(&format!("{tag}_ratio")),
-            gain: Channel::from(self.gain.clone()).named(&format!("{tag}_gain")),
-            mix: Channel::from(self.mix.clone()).named(&format!("{tag}_mix")),
+            sigma_s: Channel::from(self.sigma_s.clone()).named("dpm_sigma_s"),
+            ratio: Channel::from(self.ratio.clone()).named("dpm_ratio"),
+            gain: Channel::from(self.gain.clone()).named("dpm_gain"),
+            mix: Channel::from(self.mix.clone()).named("dpm_mix"),
         }
     }
 }

@@ -620,7 +620,7 @@ async fn dpm2m_loop(
         }
         None => return Err("this model states no schedule; nothing here denoises".into()),
     };
-    let tables = Dpm2m::of(&sched).channels("dpm");
+    let tables = Dpm2m::of(&sched).channels();
     let mut loops = DenoiseLoop::new(&sched);
     let caption_clock = loops.lane("dpm_txt");
     let _context_clock = loops.lane("dpm_ctx");
@@ -732,7 +732,7 @@ async fn cached_loop(
     let caption_clock = loops.lane("cache_txt");
     let _context_clock = loops.lane("cache_ctx");
     let image_clock = loops.lane("cache_img");
-    let dts = loops.dts("cache_img");
+    let dts = loops.dts();
     let fires = loops.fires();
 
     // The caption lane. It modulates, so it carries a timestep of its own —
