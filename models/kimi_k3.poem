@@ -260,7 +260,8 @@ def layout(id, deploy):
                     up = weight([hidden, m.latent], weights),
                 ) if m.latent != None else None,
                 shared = struct(
-                    gate_up = weight([2 * sw, hidden], weights).packed([sw, sw]),
+                    gate = weight([sw, hidden], weights).columns(),
+                    up = weight([sw, hidden], weights).columns(),
                     down = weight([hidden, sw], weights).rows(),
                     inter = sw,
                 ),
@@ -276,7 +277,8 @@ def layout(id, deploy):
             inter = d.dense_inter
             mlp = struct(
                 routed = False,
-                gate_up = weight([2 * inter, hidden], weights).packed([inter, inter]),
+                gate = weight([inter, hidden], weights).columns(),
+                up = weight([inter, hidden], weights).columns(),
                 down = weight([hidden, inter], weights).rows(),
                 inter = inter,
                 beta = d.situ_beta,
@@ -434,7 +436,8 @@ def huggingface(m, reads, layout):
             read_kda(reads, n, w.mixer)
         f = w.mlp
         if not f.routed:
-            reads.read_concat(f.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+            reads.read(f.gate, n("mlp.gate_proj.weight"))
+            reads.read(f.up, n("mlp.up_proj.weight"))
             reads.read(f.down, n("mlp.down_proj.weight"))
             continue
         reads.read(f.router, n("block_sparse_moe.gate.weight"))
@@ -464,7 +467,8 @@ def huggingface(m, reads, layout):
         s = f.shared
         many = has(n("block_sparse_moe.shared_experts.gate_proj.weight"))
         stem = "block_sparse_moe.shared_experts" if many else "block_sparse_moe.shared_expert"
-        reads.read_concat(s.gate_up, [n(stem + ".gate_proj.weight"), n(stem + ".up_proj.weight")])
+        reads.read(s.gate, n(stem + ".gate_proj.weight"))
+        reads.read(s.up, n(stem + ".up_proj.weight"))
         reads.read(s.down, n(stem + ".down_proj.weight"))
     r = m.output_res
     if r != None:
@@ -566,13 +570,15 @@ def gguf(m, reads):
             reads.read(a.o_proj, blk(l, "ssm_out.weight"))
         f = w.mlp
         if not f.routed:
-            reads.read_concat(f.gate_up, [blk(l, "ffn_gate.weight"), blk(l, "ffn_up.weight")])
+            reads.read(f.gate, blk(l, "ffn_gate.weight"))
+            reads.read(f.up, blk(l, "ffn_up.weight"))
             reads.read(f.down, blk(l, "ffn_down.weight"))
             continue
         reads.read(f.router, blk(l, "ffn_gate_inp.weight"))
         reads.read_concat(f.gate_up, [blk(l, "ffn_gate_exps.weight"), blk(l, "ffn_up_exps.weight")])
         reads.read(f.down, blk(l, "ffn_down_exps.weight"))
-        reads.read_concat(f.shared.gate_up, [blk(l, "ffn_gate_shexp.weight"), blk(l, "ffn_up_shexp.weight")])
+        reads.read(f.shared.gate, blk(l, "ffn_gate_shexp.weight"))
+        reads.read(f.shared.up, blk(l, "ffn_up_shexp.weight"))
         reads.read(f.shared.down, blk(l, "ffn_down_shexp.weight"))
 
 # The forward of Kimi-K3: each layer's mixer (MLA or KDA) and MLP read a
@@ -733,7 +739,8 @@ def forward(m, inputs):
 
 def mlp(x, f):
     if not f.routed:
-        act = ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.situ(f.beta, up_cap = f.up_cap), f.inter)
+        gate, up = ops.linear.matmul(x, f.gate), ops.linear.matmul(x, f.up)
+        act = ops.linear.glu(gate, gating.situ(f.beta, up_cap = f.up_cap), up = up)
         return ops.linear.matmul(act, f.down)
     logits = ops.linear.matmul(x, f.router)
     if f.bias != None:
@@ -763,7 +770,8 @@ def mlp(x, f):
         r = ops.elemwise.rmsnorm(routed, lat.norm, lat.norm_eps) if lat.norm != None else routed
         routed = ops.linear.matmul(r, lat.up)
     s = f.shared
-    act = ops.linear.glu(ops.linear.matmul(x, s.gate_up), gating.situ(f.beta, up_cap = f.up_cap), s.inter)
+    gate, up = ops.linear.matmul(x, s.gate), ops.linear.matmul(x, s.up)
+    act = ops.linear.glu(gate, gating.situ(f.beta, up_cap = f.up_cap), up = up)
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
 
 def mla_mixer(x, inputs, plan, a):
