@@ -540,8 +540,7 @@ pub fn emit_fused_region(
     let direct_topk = analyze_direct_topk(stage);
     let streams = row_parallel.then(|| {
         super::stream::Streams::new(
-            stage,
-            region,
+            super::stream::View::of_stage(stage, region),
             &ops,
             &bases,
             &row_kinds,

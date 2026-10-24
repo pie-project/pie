@@ -7,6 +7,7 @@ mod msl_mutations;
 #[path = "common/traces.rs"]
 mod traces;
 
+mod a_region_is_a_function_of_one_row;
 mod cuda_region_rejection;
 mod emitted_source_shape;
 mod emitter_version;

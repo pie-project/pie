@@ -4363,6 +4363,8 @@ version = "0.5.4"
 dependencies = [
  "chat-template",
  "checkpoint",
+ "eta-compiler",
+ "pie-eta-ir",
  "pie-poem",
  "pie-poem-ir",
  "pie-profile",

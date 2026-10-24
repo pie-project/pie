@@ -30,6 +30,10 @@ pub struct CompiledModel {
     /// [`crate::expert::held`]: the values an expert region makes, by id,
     /// empty where nothing dispatches.
     pub expert: Vec<bool>,
+    /// [`crate::fuse::chain::chains`]: the trace's chains of elementwise and
+    /// row ops, each lowered to an eta region; empty unless
+    /// `compiler.synth_regions` is on.
+    pub chains: Vec<crate::fuse::chain::Chain>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
