@@ -892,6 +892,7 @@ impl Shell {
             accounting,
             trace: boot.trace,
             compiled,
+            ep: None,
             budget: budgets.tokens.clone(),
             budgets,
             patch_seat,

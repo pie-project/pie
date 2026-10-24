@@ -588,6 +588,9 @@ pub struct Run<'c> {
     /// The values an expert region makes, by id (`CompiledModel::expert`).
     expert: &'c [bool],
 
+    /// This rank's expert-parallel group, where the trace dispatches.
+    ep: Option<&'c crate::ep::EpRank>,
+
     /// Rows this walk quantized for the FP8 products, by value, staged
     /// window and context, with the region and hold they sit in: their codes
     /// and scales, for the later products of the same rows.
@@ -684,6 +687,7 @@ impl<'c> Run<'c> {
             stood: Cell::new(None),
             tapping: None,
             expert: &[],
+            ep: None,
             #[cfg(feature = "rocm")]
             fp8_rows: Vec::new(),
             #[cfg(feature = "rocm")]
@@ -775,6 +779,21 @@ impl<'c> Run<'c> {
     pub fn expert(mut self, held: &'c [bool]) -> Self {
         self.expert = held;
         self
+    }
+
+    #[must_use]
+    pub fn ep(mut self, ep: Option<&'c crate::ep::EpRank>) -> Self {
+        self.ep = ep;
+        self
+    }
+
+    pub(crate) fn ep_rank(&self) -> Option<&'c crate::ep::EpRank> {
+        self.ep
+    }
+
+    /// The step's token bucket, every rank's under expert parallelism.
+    pub(crate) fn bucket(&self) -> u32 {
+        self.ceilings.pad_on(poem_ir::RowAxis::Tokens).bucket
     }
 
     /// The walk has enqueued `node`.

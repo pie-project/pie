@@ -28,6 +28,14 @@ pub struct Widest {
     pub top_k: u32,
 }
 
+/// What a rank's trace dispatches: every `(layer, experts, slots)`, and the
+/// widest step a dispatch or combine of it fires.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Shape {
+    pub layers: Vec<(u32, u32, u32)>,
+    pub widest: Widest,
+}
+
 /// One rank's part of the wiring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Wire {
@@ -167,4 +175,63 @@ fn carve(device: i32, readers: &[i32], parts: &[u64; PARTS]) -> Result<[u64; PAR
 #[cfg(not(feature = "cuda"))]
 fn carve(_: i32, _: &[i32], _: &[u64; PARTS]) -> Result<[u64; PARTS]> {
     Err(Fault::Runtimeless)
+}
+
+/// One MoE layer's placement on a rank's device.
+struct Layer {
+    place: kernels_cuda::collective::Placement,
+    _table: crate::device::Buffer,
+}
+
+/// A rank's expert-parallel state: every rank's wire (its own at `rank`)
+/// and each lowered MoE layer's placement table on this device, by the
+/// layer number the trace's dispatches carry. Several dispatches may share
+/// a layer (a drafter block run at every draft step reads the same bank).
+pub struct EpRank {
+    pub wires: Vec<Wire>,
+    pub rank: u32,
+    layers: std::collections::BTreeMap<u32, Layer>,
+}
+
+impl EpRank {
+    /// The uniform placement of each `(layer, experts, slots)` the trace
+    /// dispatches, its table sized for any later rebalance.
+    pub fn new(wires: Vec<Wire>, rank: u32, layers: &[(u32, u32, u32)]) -> Result<EpRank> {
+        let ranks = wires.len() as u32;
+        let mut held = std::collections::BTreeMap::new();
+        for &(layer, experts, slots) in layers {
+            if held.contains_key(&layer) {
+                continue;
+            }
+            let placement = engine::placement::Placement::uniform(experts, ranks, slots)
+                .map_err(|why| Fault::program("ep::EpRank", format!("layer {layer}: {why:?}")))?;
+            let stride = engine::placement::Placement::stride_for(ranks * slots - experts + 1);
+            let table = placement.table(stride);
+            let bytes: Vec<u8> = table.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let mut buffer = crate::device::Buffer::zeroed(bytes.len())?;
+            buffer.write(0, &bytes)?;
+            let place = kernels_cuda::collective::Placement {
+                table: buffer.ptr(),
+                stride,
+                experts,
+                slots,
+            };
+            held.insert(layer, Layer { place, _table: buffer });
+        }
+        Ok(EpRank {
+            wires,
+            rank,
+            layers: held,
+        })
+    }
+
+    #[must_use]
+    pub fn wire(&self) -> &Wire {
+        &self.wires[self.rank as usize]
+    }
+
+    #[must_use]
+    pub fn placement(&self, layer: u32) -> Option<kernels_cuda::collective::Placement> {
+        self.layers.get(&layer).map(|l| l.place)
+    }
 }

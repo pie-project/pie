@@ -53,6 +53,9 @@ pub struct Shell {
     accounting: crate::store::Accounting,
     trace: Trace,
     compiled: CompiledModel,
+    /// This rank's part of an expert-parallel group, once the group wires
+    /// it after every rank has loaded.
+    ep: Option<crate::ep::EpRank>,
     budget: Budget,
     patch_seat: Option<crate::inputs::PatchSeat>,
     mrope_seat: bool,
@@ -142,6 +145,53 @@ pub(crate) struct KvReport {
 }
 
 impl Shell {
+    /// Joins this rank to its expert-parallel group.
+    pub fn join_ep(&mut self, ep: crate::ep::EpRank) {
+        self.ep = Some(ep);
+    }
+
+    /// What the trace dispatches, for wiring the group.
+    #[must_use]
+    pub fn ep_shape(&self) -> Option<crate::ep::Shape> {
+        use poem_ir::{Collective, Operation, Ty};
+        let width_bytes = |v: poem_ir::ValueId| match &self.trace.values[v.0 as usize].ty {
+            Ty::Tensor { shape, dtype } => shape.last().and_then(|d| match d {
+                poem_ir::Dim::Const(n) => Some(*n * dtype.bytes_ceil()),
+                _ => None,
+            }),
+            _ => None,
+        };
+        let mut layers = Vec::new();
+        let mut widest = crate::ep::Widest {
+            tokens: self.budget.max_tokens,
+            row_bytes: 0,
+            out_bytes: 0,
+            top_k: 0,
+        };
+        for node in &self.trace.nodes {
+            match &node.op {
+                Operation::Collective(Collective::Dispatch {
+                    x,
+                    experts,
+                    slots,
+                    top_k,
+                    layer,
+                    ..
+                }) => {
+                    layers.push((*layer, *experts, *slots));
+                    widest.row_bytes = widest.row_bytes.max(width_bytes(*x)?);
+                    widest.top_k = widest.top_k.max(*top_k);
+                }
+                Operation::Collective(Collective::Combine { y, top_k, .. }) => {
+                    widest.out_bytes = widest.out_bytes.max(width_bytes(*y)?);
+                    widest.top_k = widest.top_k.max(*top_k);
+                }
+                _ => {}
+            }
+        }
+        (!layers.is_empty()).then_some(crate::ep::Shape { layers, widest })
+    }
+
     /// Whether a lane may ask this load for a tap: it reads its layers out
     /// as they go, and someone is told what it read.
     #[must_use]
