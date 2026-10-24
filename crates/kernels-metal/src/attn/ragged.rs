@@ -17,7 +17,6 @@ const SCALAR_THREADS: u32 = 128;
 #[derive(Clone, Copy, Debug)]
 pub enum RaggedMask {
     Segments,
-    ReferenceTags { q_tags: Tensor, kv_tags: Tensor },
     RelativeBias { table: Tensor, max_len: u32 },
 }
 
@@ -25,7 +24,6 @@ impl RaggedMask {
     const fn suffix(&self) -> &'static str {
         match self {
             Self::Segments => "none",
-            Self::ReferenceTags { .. } => "tags",
             Self::RelativeBias { .. } => "bias",
         }
     }
@@ -155,20 +153,9 @@ fn shape(
     })
 }
 
-fn mask_args(ctx: &Ctx<'_>, mask: &RaggedMask, q_heads: u32) -> Result<[ArgValue; 4], Error> {
+fn mask_args(ctx: &Ctx<'_>, mask: &RaggedMask, q_heads: u32) -> Result<[ArgValue; 2], Error> {
     match mask {
-        RaggedMask::Segments => Ok([ctx.absent()?, ctx.absent()?, ctx.absent()?, 0i32.arg()]),
-        RaggedMask::ReferenceTags { q_tags, kv_tags } => {
-            for (what, t) in [("query", *q_tags), ("key", *kv_tags)] {
-                if t.dtype != Dtype::I32 {
-                    return Err(refuse(
-                        OP,
-                        format!("the {what} tag table is {:?}, and a tag is i32", t.dtype),
-                    ));
-                }
-            }
-            Ok([q_tags.arg(), kv_tags.arg(), ctx.absent()?, 0i32.arg()])
-        }
+        RaggedMask::Segments => Ok([ctx.absent()?, 0i32.arg()]),
         RaggedMask::RelativeBias { table, max_len } => {
             let max_len = nonzero(OP, "the bias table's reach", *max_len)?;
             let span = 2 * max_len - 1;
@@ -194,7 +181,7 @@ fn mask_args(ctx: &Ctx<'_>, mask: &RaggedMask, q_heads: u32) -> Result<[ArgValue
             }
             let stated = i32::try_from(max_len)
                 .map_err(|_| refuse(OP, format!("a reach of {max_len} does not fit an int")))?;
-            Ok([ctx.absent()?, ctx.absent()?, table.arg(), stated.arg()])
+            Ok([table.arg(), stated.arg()])
         }
     }
 }
@@ -272,8 +259,6 @@ pub fn fire(
                     sm_scale.arg(),
                     m[0],
                     m[1],
-                    m[2],
-                    m[3],
                     rows.arg(),
                 ],
             )
@@ -307,8 +292,6 @@ pub fn fire(
                     sm_scale.arg(),
                     m[0],
                     m[1],
-                    m[2],
-                    m[3],
                 ],
             )
         }

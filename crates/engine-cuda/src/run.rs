@@ -1689,9 +1689,6 @@ impl<'c> Run<'c> {
                     GeomKind::LaneIndptr { select } => {
                         return self.packing(at, *select).lane_indptr;
                     }
-                    GeomKind::ReferenceTag { select } => {
-                        return self.packing(at, *select).reference_tag;
-                    }
                     _ => {}
                 }
                 let seat = self.geometry(at, *space);
@@ -1707,8 +1704,7 @@ impl<'c> Run<'c> {
                     GeomKind::WriteOffset => seat.write_offset,
                     GeomKind::GroupOfLane
                     | GeomKind::GroupIndptr { .. }
-                    | GeomKind::LaneIndptr { .. }
-                    | GeomKind::ReferenceTag { .. } => unreachable!("the D2 tables return early"),
+                    | GeomKind::LaneIndptr { .. } => unreachable!("the D2 tables return early"),
                 };
                 bound.unwrap_or_else(|| {
                     panic!(

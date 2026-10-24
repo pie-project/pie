@@ -133,7 +133,6 @@ pub enum GeomKind {
     GroupOfLane,
     GroupIndptr { select: Selection },
     LaneIndptr { select: Selection },
-    ReferenceTag { select: Selection },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

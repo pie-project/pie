@@ -963,7 +963,8 @@ async fn main(input: Input) -> Result<Output> {
         None => None,
         Some(bytes) => {
             let reading = roles.encode.as_ref().ok_or_else(|| {
-                "this model declares no `vae.encode` reading, so it has no door a picture                  comes in through"
+                "this model declares no `vae.encode` reading, so it has no door a picture \
+                 comes in through"
                     .to_string()
             })?;
             let picture = inferlet::frames::Frames::decode(bytes)
@@ -971,7 +972,9 @@ async fn main(input: Input) -> Result<Output> {
             let (pw, ph) = (picture.width(), picture.height());
             if pw != width || ph != height {
                 return Err(format!(
-                    "the init image is {pw}x{ph} and this run is {width}x{height}; resize it                      before handing it over — a guest has no resampler and a silent one                      would be the wrong one"
+                    "the init image is {pw}x{ph} and this run is {width}x{height}; resize it \
+                     before handing it over — a guest has no resampler and a silent one \
+                     would be the wrong one"
                 )
                 .into());
             }

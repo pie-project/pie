@@ -305,7 +305,7 @@ pub(crate) fn landing_requests(
         .collect();
     for reading in readings {
         for stream in poem_ir::Stream::ALL {
-            for bits in 0..128u32 {
+            for bits in 0..512u32 {
                 let request =
                     poem_ir::Request::new(if bits & 1 == 0 { 1 } else { 2 }, bits & 2 != 0)
                         .adapted(bits & 4 != 0)
@@ -313,6 +313,8 @@ pub(crate) fn landing_requests(
                         .capturing_scores(bits & 16 != 0)
                         .with_media(bits & 32 != 0)
                         .denoising(bits & 64 != 0)
+                        .drafting_a_block(bits & 128 != 0)
+                        .encoding(bits & 256 != 0)
                         .on_stream(stream);
                 let request = match reading {
                     Some(name) => request.in_reading(name),
@@ -339,6 +341,8 @@ fn request_flags(request: &poem_ir::Request) -> u32 {
         + u32::from(request.captures_scores())
         + u32::from(request.has_media())
         + u32::from(request.denoise())
+        + u32::from(request.drafts_a_block())
+        + u32::from(request.flag(poem_ir::Request::ENCODE))
         + u32::from(request.stream() != poem_ir::Stream::Text)
         + u32::from(request.reading().is_some())
 }
@@ -559,10 +563,7 @@ impl Feeds {
                 }),
                 RuntimeInput::RowPermutation { select }
                 | RuntimeInput::Geometry {
-                    kind:
-                        GeomKind::GroupIndptr { select }
-                        | GeomKind::LaneIndptr { select }
-                        | GeomKind::ReferenceTag { select },
+                    kind: GeomKind::GroupIndptr { select } | GeomKind::LaneIndptr { select },
                     ..
                 } => {
                     if !feeds.selections.contains(&select) {
@@ -822,4 +823,40 @@ pub(crate) fn regions_launching_schedules(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_flag_a_request_carries_lands_in_its_class() {
+        let flags = poem_ir::Request::FLAGS;
+        let facts = poem_ir::Facts {
+            table: flags
+                .iter()
+                .map(|name| poem_ir::Fact::Flag((*name).to_string()))
+                .collect(),
+        };
+        let classes = poem_ir::ClassTable {
+            classes: (0..flags.len())
+                .map(|bit| poem_ir::Class {
+                    words: vec![1 << bit],
+                    live: Vec::new(),
+                })
+                .collect(),
+            node_mask: Vec::new(),
+            merges: Vec::new(),
+            merge_arm: Vec::new(),
+            mask: (1 << flags.len()) - 1,
+            dead: Vec::new(),
+        };
+        let landing = landing_requests(&facts, &classes);
+        for (class, name) in flags.iter().enumerate() {
+            assert!(
+                landing[class].iter().any(|request| request.flag(name)),
+                "no request with `{name}` set lands in its class"
+            );
+        }
+    }
 }

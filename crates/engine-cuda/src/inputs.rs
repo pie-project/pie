@@ -246,8 +246,6 @@ struct PortAt {
 pub struct PackingFire<'a> {
     pub group_indptr: &'a [i32],
     pub lane_indptr: &'a [i32],
-    pub reference_start: &'a [i32],
-    pub reference_tag: &'a [i32],
     pub attn_class: &'a [i32],
     pub permutation: &'a [i32],
 }
@@ -256,8 +254,6 @@ pub struct PackingFire<'a> {
 pub struct PackingHandles {
     pub group_indptr: Tensor,
     pub lane_indptr: Tensor,
-    pub reference_start: Tensor,
-    pub reference_tag: Tensor,
     pub attn_class: Tensor,
     pub permutation: Tensor,
 }
@@ -266,8 +262,6 @@ pub struct PackingHandles {
 struct PackingAt {
     group_indptr: u64,
     lane_indptr: u64,
-    reference_start: u64,
-    reference_tag: u64,
     attn_class: u64,
     permutation: u64,
 }
@@ -585,8 +579,6 @@ impl Inputs {
             .map(|_| PackingAt {
                 group_indptr: take((lanes + 1) * 4),
                 lane_indptr: take((lanes + 1) * 4),
-                reference_start: take(lanes * 4),
-                reference_tag: take(rows * 4),
                 attn_class: take(rows * 4),
                 permutation: take(rows * 4),
             })
@@ -993,20 +985,7 @@ impl Inputs {
                     lane_table.resize(space_lanes as usize + 1, last);
                     put(offset, bytes_of(&lane_table), what)?;
                 }
-                lane_table.clear();
-                lane_table.extend_from_slice(packing.reference_start);
-                lane_table.resize(space_lanes as usize, 0);
-                put(
-                    at.reference_start,
-                    bytes_of(&lane_table),
-                    "staged reference tails",
-                )?;
                 for (offset, table, what) in [
-                    (
-                        at.reference_tag,
-                        packing.reference_tag,
-                        "staged reference tags",
-                    ),
                     (
                         at.attn_class,
                         packing.attn_class,
@@ -1320,15 +1299,11 @@ impl Inputs {
             for at in &packing_places {
                 copy(at.group_indptr, (space_lanes as usize + 1) * 4)?;
                 copy(at.lane_indptr, (space_lanes as usize + 1) * 4)?;
-                copy(at.reference_start, space_lanes as usize * 4)?;
-                copy(at.reference_tag, rows as usize * 4)?;
                 copy(at.attn_class, rows as usize * 4)?;
                 copy(at.permutation, rows as usize * 4)?;
                 packings.push(PackingHandles {
                     group_indptr: i32s(base + at.group_indptr, space_lanes + 1),
                     lane_indptr: i32s(base + at.lane_indptr, space_lanes + 1),
-                    reference_start: i32s(base + at.reference_start, space_lanes),
-                    reference_tag: i32s(base + at.reference_tag, rows),
                     attn_class: i32s(base + at.attn_class, rows),
                     permutation: i32s(base + at.permutation, rows),
                 });

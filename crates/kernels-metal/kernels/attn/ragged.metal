@@ -3,8 +3,7 @@
 using namespace metal;
 
 constexpr constant int kMaskNone = 0;
-constexpr constant int kMaskTags = 1;
-constexpr constant int kMaskBias = 2;
+constexpr constant int kMaskBias = 1;
 
 inline int segment_of(const device int* indptr, int segments, int row) {
   const int first = indptr[0];
@@ -36,10 +35,8 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS, int MASK>
     const constant int& num_kv_heads  [[buffer(8)]],
     const constant int& head_dim      [[buffer(9)]],
     const constant float& sm_scale    [[buffer(10)]],
-    const device int* q_tags          [[buffer(11)]],
-    const device int* kv_tags         [[buffer(12)]],
-    const device float* bias          [[buffer(13)]],
-    const constant int& max_len       [[buffer(14)]],
+    const device float* bias          [[buffer(11)]],
+    const constant int& max_len       [[buffer(12)]],
     uint3 tgid     [[threadgroup_position_in_grid]],
     uint  simd_gid [[simdgroup_index_in_threadgroup]],
     uint  simd_lid [[thread_index_in_simdgroup]]) {
@@ -90,7 +87,6 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS, int MASK>
 
   const int group = num_q_heads / num_kv_heads;
   const int kv_head = head / group;
-  const int my_tag = MASK == kMaskTags ? q_tags[row] : -1;
   const int span_len = MASK == kMaskBias ? 2 * max_len - 1 : 0;
   const int qi = row - q_begin;
 
@@ -102,12 +98,6 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS, int MASK>
   float running_sum = 0.0f;
 
   for (int j = begin + warp; j < end; j += SIMDS) {
-
-    bool keep = true;
-    if (MASK == kMaskTags && my_tag >= 0) {
-      keep = kv_tags[j] == my_tag;
-    }
-
     const device T* k_row =
         k + (size_t(j) * size_t(num_kv_heads) + size_t(kv_head)) * size_t(head_dim);
     float dot = 0.0f;
@@ -125,11 +115,10 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS, int MASK>
       const int at = clamp(j - begin - qi + max_len - 1, 0, span_len - 1);
       score += bias[size_t(head) * size_t(span_len) + size_t(at)];
     }
-    if (!keep) score = NEG_INF;
 
     const float widened = max(running_max, score);
     const float rescale = fast::exp(running_max - widened);
-    const float weight = keep ? fast::exp(score - widened) : 0.0f;
+    const float weight = fast::exp(score - widened);
 
     const device T* v_row =
         v + (size_t(j) * size_t(num_kv_heads) + size_t(kv_head)) * size_t(head_dim);
@@ -180,13 +169,11 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS, int MASK>
       const device itype*, const device itype*, const device itype*,       \
       device itype*, const device int*, const device int*,                 \
       const constant int&, const constant int&, const constant int&,       \
-      const constant int&, const constant float&, const device int*,       \
-      const device int*, const device float*, const constant int&,         \
-      uint3, uint, uint);
+      const constant int&, const constant float&, const device float*,     \
+      const constant int&, uint3, uint, uint);
 
 #define instantiate_ragged_scalar_masks(name, itype, d)                    \
   instantiate_ragged_scalar(name, itype, d, kMaskNone, "none")             \
-  instantiate_ragged_scalar(name, itype, d, kMaskTags, "tags")             \
   instantiate_ragged_scalar(name, itype, d, kMaskBias, "bias")
 
 instantiate_ragged_scalar_masks(bfloat16, bfloat, 32)
@@ -205,11 +192,9 @@ template <typename T, int D, int KT, int MASK>
     const constant int& segments      [[buffer(6)]],
     const constant int& num_kv_heads  [[buffer(7)]],
     const constant float& sm_scale    [[buffer(8)]],
-    const device int* q_tags          [[buffer(9)]],
-    const device int* kv_tags         [[buffer(10)]],
-    const device float* bias          [[buffer(11)]],
-    const constant int& max_len       [[buffer(12)]],
-    const constant int& n_rows        [[buffer(13)]],
+    const device float* bias          [[buffer(9)]],
+    const constant int& max_len       [[buffer(10)]],
+    const constant int& n_rows        [[buffer(11)]],
     uint3 tid      [[threadgroup_position_in_grid]],
     uint3 tpg      [[threadgroups_per_grid]],
     uint  simd_gid [[simdgroup_index_in_threadgroup]],
@@ -258,7 +243,6 @@ template <typename T, int D, int KT, int MASK>
   }
 
   const int my_segment = live ? segment_of(q_indptr, segments, my_row) : -1;
-  const int my_tag = (MASK == kMaskTags && live) ? q_tags[my_row] : -1;
   const int span_len = MASK == kMaskBias ? 2 * max_len - 1 : 0;
 
   float Ov[DF * 2];
@@ -320,12 +304,9 @@ template <typename T, int D, int KT, int MASK>
         thread auto& e = S[c].thread_elements();
         for (int j = 0; j < 2; j++) {
           const int kk = c * 8 + int(fn) + j;
-          bool keep = mine && kk < cnt;
+          const bool keep = mine && kk < cnt;
           float s_val = 0.0f;
           if (keep) {
-            if (MASK == kMaskTags && my_tag >= 0) {
-              keep = kv_tags[base + kk] == my_tag;
-            }
             s_val = float(e[j]);
             if (MASK == kMaskBias) {
               const int at =
@@ -396,12 +377,11 @@ template <typename T, int D, int KT, int MASK>
       const device itype*, const device itype*, const device itype*,       \
       device itype*, const device int*, const device int*,                 \
       const constant int&, const constant int&, const constant float&,     \
-      const device int*, const device int*, const device float*,           \
-      const constant int&, const constant int&, uint3, uint3, uint, uint);
+      const device float*, const constant int&, const constant int&,       \
+      uint3, uint3, uint, uint);
 
 #define instantiate_ragged_mma_masks(name, itype, d, kt)                   \
   instantiate_ragged_mma(name, itype, d, kt, kMaskNone, "none")            \
-  instantiate_ragged_mma(name, itype, d, kt, kMaskTags, "tags")            \
   instantiate_ragged_mma(name, itype, d, kt, kMaskBias, "bias")
 
 instantiate_ragged_mma_masks(bfloat16, bfloat, 64, 16)

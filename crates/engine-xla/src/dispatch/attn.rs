@@ -328,26 +328,17 @@ impl Run<'_> {
                             count,
                         }
                     }
-                    poem_ir::RaggedMask::ReferenceSelfOnly { .. }
-                    | poem_ir::RaggedMask::RelativeBias { .. }
-                        if self.class_table().is_some() =>
-                    {
+                    poem_ir::RaggedMask::RelativeBias { .. } if self.class_table().is_some() => {
                         return Err(kernels_xla::Error::Backend {
                             op: "attn.ragged",
                             detail: "a lane states attention classes over an attention the \
-                                     model already masks (reference tags or a relative bias); \
-                                     the two do not compose"
+                                     model already masks (a relative bias); the two do not \
+                                     compose"
                                 .to_string(),
                         });
                     }
                     poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal => {
                         attn::ragged::RaggedMask::Segments
-                    }
-                    poem_ir::RaggedMask::ReferenceSelfOnly { q_tags, kv_tags } => {
-                        attn::ragged::RaggedMask::ReferenceTags {
-                            q_tags: self.tensor(*q_tags),
-                            kv_tags: self.tensor(*kv_tags),
-                        }
                     }
                     poem_ir::RaggedMask::RelativeBias { table, max_len } => {
                         attn::ragged::RaggedMask::RelativeBias {

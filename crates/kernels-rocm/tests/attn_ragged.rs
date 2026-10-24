@@ -14,13 +14,10 @@ use kernels_rocm::attn::ragged::{RaggedMask, ragged};
 enum Mask {
     None,
     Bias,
-    SelfOnly,
-    Tags,
     Class,
 }
 
 const MAX_LEN: usize = 130;
-const REF_START: [i32; 6] = [20, 100, 200, -1, 0, 3];
 
 /// The host softmax over a group's keys, `logit(g, h, r, j)` the bias a kept
 /// key adds (rows and keys global). A row with no kept key lands zeros.
@@ -93,12 +90,9 @@ fn check(
     let fill = bf16s(qr * qh * hd, seed + 3, 1.0);
     let span = 2 * MAX_LEN - 1;
     let bias: Vec<f32> = bf16s(qh * span, seed + 4, 2.0);
-    // Tags and classes are global per row; the q and kv tables are the same
-    // for these arms, so one table serves both sides.
+    // Classes are global per row; the q and kv tables are the same, so one
+    // table serves both sides.
     let ids = qr.max(kr);
-    let tags: Vec<i32> = (0..ids as i32)
-        .map(|r| [-1, r / 3][usize::from(r % 9 >= 4)])
-        .collect();
     let classes: Vec<i32> = (0..ids as i32).map(|r| r % 3).collect();
     let allowed: Vec<u8> = (0..9).map(|c| u8::from(c % 4 == 0 || c % 3 == 1)).collect();
     let scale = 2.0 / (hd as f32).sqrt();
@@ -114,11 +108,6 @@ fn check(
             let (qo, kv) = (r - qt[g] as usize, j - kt[g] as usize);
             let keep = match mask {
                 Mask::None | Mask::Bias => true,
-                Mask::SelfOnly => {
-                    let start = REF_START[g].max(0) as usize;
-                    qo < start || kv >= start
-                }
-                Mask::Tags => tags[r] < 0 || tags[j] == tags[r],
                 Mask::Class => allowed[(classes[r] * 3 + classes[j]) as usize] == 1,
             };
             let d = (kv + MAX_LEN - 1).saturating_sub(qo).min(span - 1);
@@ -137,20 +126,12 @@ fn check(
     let kp = gpu.tensor(&k, kr.max(1) as u32, (kvh * hd) as u32, Bf16);
     let vp = gpu.tensor(&v, kr.max(1) as u32, (kvh * hd) as u32, Bf16);
     let (qtab, ktab) = (gpu.column(&qt), gpu.column(&kt));
-    let tag_t = gpu.column(&tags);
     let class_t = gpu.column(&classes);
     let arm = match mask {
         Mask::None => RaggedMask::None,
         Mask::Bias => RaggedMask::RelativeBias {
             table: gpu.tensor(&bias, qh as u32, span as u32, F32),
             max_len: MAX_LEN as u32,
-        },
-        Mask::SelfOnly => RaggedMask::ReferenceSelfOnly {
-            ref_start: gpu.column(&REF_START),
-        },
-        Mask::Tags => RaggedMask::ReferenceTags {
-            q_tags: tag_t,
-            kv_tags: tag_t,
         },
         Mask::Class => RaggedMask::ClassTable {
             q_classes: class_t,
@@ -186,14 +167,13 @@ fn the_ragged_arm_answers_the_reference() {
     let Some(gpu) = Gpu::open() else { return };
     let (q_cross, kv_cross) = (&[7, 0, 200, 300, 3], &[300, 40, 0, 500, 1]);
     let lanes = &[7u32, 11, 21];
-    let (refs, bias) = (&[64u32, 300, 200, 50, 40, 5], &[37, 130, 64]);
+    let bias = &[37u32, 130, 64];
     // Cross tables with empty groups at 64 and 128, the bias at full heads,
     // each lane mask, and rows no group holds at 256 and a padded 80.
     check(&gpu, [4, 2, 64], q_cross, kv_cross, Mask::None, [0, 0]);
     check(&gpu, [4, 2, 128], q_cross, kv_cross, Mask::None, [0, 0]);
     check(&gpu, [64, 16, 64], bias, bias, Mask::Bias, [0, 0]);
-    check(&gpu, [4, 2, 128], refs, refs, Mask::SelfOnly, [0, 0]);
-    check(&gpu, [2, 1, 256], lanes, lanes, Mask::Tags, [0, 0]);
+    check(&gpu, [2, 1, 256], lanes, lanes, Mask::Class, [0, 0]);
     check(&gpu, [4, 2, 64], lanes, lanes, Mask::Class, [0, 0]);
     check(
         &gpu,

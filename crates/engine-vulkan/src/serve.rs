@@ -608,11 +608,9 @@ impl Shell {
                 clips: u64::from(ladder.max_clips),
                 channels: channels.max(1),
                 dtype: dtype.unwrap_or(Dtype::Bf16),
-                token_grid: boot.trace.values.iter().any(|decl| {
-                    matches!(
-                        decl.def,
-                        poem_ir::Def::Input(RuntimeInput::TokenGrid { .. })
-                    )
+                token_patch: boot.trace.values.iter().find_map(|decl| match decl.def {
+                    poem_ir::Def::Input(RuntimeInput::TokenGrid { p }) => Some(p),
+                    _ => None,
                 }),
             }
         });
@@ -2158,6 +2156,7 @@ impl Shell {
             .collect();
         let mut voxel_grid: Vec<i32> = Vec::new();
         let mut voxel_slots: Vec<i32> = Vec::new();
+        let mut voxel_token_grid: Vec<i32> = Vec::new();
         let mut voxel_payload: Vec<u8> = Vec::new();
         let composition = compose_axes(&self.compiled, &self.budgets, &submitted)?;
         let descriptor = FireDescriptor::of(&composition);
@@ -2616,6 +2615,7 @@ impl Shell {
                     continue;
                 };
                 let mut offset = row.voxel_offset;
+                let mut token_row = row.row_offset;
                 for boxed in tile.boxes {
                     voxel_grid.extend_from_slice(&[
                         narrow(u64::from(boxed[0])),
@@ -2626,6 +2626,13 @@ impl Shell {
                     voxel_slots.push(lanes[row.source as usize].lane.slot as i32);
                     offset = offset
                         .saturating_add(boxed[0].saturating_mul(boxed[1]).saturating_mul(boxed[2]));
+                    if let Some(p) = seat.token_patch {
+                        token_row = token_cell(&mut voxel_token_grid, *boxed, p, token_row)
+                            .ok_or_else(|| token_refusal(row.source))?;
+                    }
+                }
+                if seat.token_patch.is_some() && token_row != row.row_offset + row.rows {
+                    return Err(token_refusal(row.source));
                 }
                 if !tile.payload.is_empty() {
                     let at = u64::from(row.voxel_offset) * row_bytes;
@@ -2646,7 +2653,6 @@ impl Shell {
             .map(|packed| crate::inputs::PackingFire {
                 group_indptr: &packed.group_indptr,
                 lane_indptr: &packed.lane_indptr,
-                reference_tag: &packed.reference_tag,
                 permutation: &packed.permutation,
             })
             .collect();
@@ -2687,7 +2693,7 @@ impl Shell {
                 packings: &packing_fires,
                 voxels: (composition.clips() > 0).then_some(crate::inputs::VoxelFire {
                     grid: &voxel_grid,
-                    token_grid: &[],
+                    token_grid: &voxel_token_grid,
                     slots: &voxel_slots,
                     payload: &voxel_payload,
                 }),
@@ -3474,6 +3480,28 @@ fn bf16(bits: u16) -> f32 {
 
 fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
+}
+
+/// Appends the token side of a clip's cell (its box in tokens of patch `p`,
+/// then its first row) and returns the row past it, or `None` when the box
+/// does not divide by the patch.
+fn token_cell(grid: &mut Vec<i32>, boxed: [u32; 3], p: [u32; 3], row: u32) -> Option<u32> {
+    if p.contains(&0) || (0..3).any(|k| !boxed[k].is_multiple_of(p[k])) {
+        return None;
+    }
+    let [t, h, w] = [boxed[0] / p[0], boxed[1] / p[1], boxed[2] / p[2]];
+    grid.extend([t, h, w, row].map(|n| narrow(u64::from(n))));
+    row.checked_add(t.checked_mul(h)?.checked_mul(w)?)
+}
+
+fn token_refusal(lane: u32) -> Fault {
+    Fault::Program {
+        at: "serve::prepare",
+        why: format!(
+            "lane {lane} submits clips whose boxes do not divide by the plan's token patch \
+             into its token rows"
+        ),
+    }
 }
 
 fn program(at: &'static str, why: String) -> Fault {

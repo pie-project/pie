@@ -66,7 +66,6 @@ pub struct PatchBindings {
 pub struct PackingBindings {
     pub group_indptr: Tensor,
     pub lane_indptr: Tensor,
-    pub reference_tag: Tensor,
     pub permutation: Tensor,
     /// One attention class per packed row (-1 where the lane states none).
     pub attn_class: Tensor,
@@ -435,8 +434,7 @@ impl<'c> Run<'c> {
                     kind:
                         GeomKind::GroupOfLane
                         | GeomKind::GroupIndptr { .. }
-                        | GeomKind::LaneIndptr { .. }
-                        | GeomKind::ReferenceTag { .. },
+                        | GeomKind::LaneIndptr { .. },
                     ..
                 }),
             ) => self.dit_input(at, which),
@@ -461,8 +459,7 @@ impl<'c> Run<'c> {
                     GeomKind::WriteOffset => seat.write_offset,
                     GeomKind::GroupOfLane
                     | GeomKind::GroupIndptr { .. }
-                    | GeomKind::LaneIndptr { .. }
-                    | GeomKind::ReferenceTag { .. } => None,
+                    | GeomKind::LaneIndptr { .. } => None,
                 };
                 bound.unwrap_or_else(|| {
                     panic!(
@@ -562,7 +559,6 @@ impl<'c> Run<'c> {
                     .unwrap_or_else(|| missing("the group table")),
                 GeomKind::GroupIndptr { select } => packing(select).group_indptr,
                 GeomKind::LaneIndptr { select } => packing(select).lane_indptr,
-                GeomKind::ReferenceTag { select } => packing(select).reference_tag,
                 _ => missing("a geometry table"),
             },
             _ => missing("an input"),

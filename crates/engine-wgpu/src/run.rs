@@ -545,8 +545,7 @@ impl<'c> Run<'c> {
                     GeomKind::WriteOffset => seat.write_offset,
                     GeomKind::GroupOfLane
                     | GeomKind::GroupIndptr { .. }
-                    | GeomKind::LaneIndptr { .. }
-                    | GeomKind::ReferenceTag { .. } => None,
+                    | GeomKind::LaneIndptr { .. } => None,
                 };
                 bound.unwrap_or_else(|| {
                     panic!(

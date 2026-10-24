@@ -1541,8 +1541,6 @@ impl FrameShell for Shell {
             .map(|packed| crate::inputs::PackingFire {
                 group_indptr: &packed.group_indptr,
                 lane_indptr: &packed.lane_indptr,
-                reference_start: &packed.reference_start,
-                reference_tag: &packed.reference_tag,
                 attn_class: &packed.attn_class,
                 permutation: &packed.permutation,
             })

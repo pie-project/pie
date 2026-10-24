@@ -554,14 +554,12 @@ pub enum IndexScore {
 pub enum RaggedMask {
     None,
     GroupBlockDiagonal,
-    ReferenceSelfOnly { q_tags: ValueId, kv_tags: ValueId },
     RelativeBias { table: ValueId, max_len: u32 },
 }
 
 impl Part for RaggedMask {
     fn inputs(&self, sink: &mut Vec<ValueId>) {
         match self {
-            RaggedMask::ReferenceSelfOnly { q_tags, kv_tags } => sink.extend([*q_tags, *kv_tags]),
             RaggedMask::RelativeBias { table, .. } => sink.push(*table),
             RaggedMask::None | RaggedMask::GroupBlockDiagonal => {}
         }
@@ -569,10 +567,6 @@ impl Part for RaggedMask {
     fn outputs(&self, _sink: &mut Vec<ValueId>) {}
     fn ports(&self, sink: &mut Vec<(&'static str, ValueId, Expect)>) {
         match self {
-            RaggedMask::ReferenceSelfOnly { q_tags, kv_tags } => {
-                sink.push(("q_tags", *q_tags, Expect::I32));
-                sink.push(("kv_tags", *kv_tags, Expect::I32));
-            }
             RaggedMask::RelativeBias { table, .. } => sink.push(("table", *table, Expect::F32)),
             RaggedMask::None | RaggedMask::GroupBlockDiagonal => {}
         }

@@ -1576,10 +1576,6 @@ impl<'c> Run<'c> {
                 ..
             }) => self.packing(at, *select).lane_indptr,
             Def::Input(RuntimeInput::Geometry {
-                kind: GeomKind::ReferenceTag { select },
-                ..
-            }) => self.packing(at, *select).reference_tag,
-            Def::Input(RuntimeInput::Geometry {
                 kind: GeomKind::RequestOfToken,
                 ..
             }) => self.fire.tables.request_of_token,
@@ -1604,8 +1600,7 @@ impl<'c> Run<'c> {
                     GeomKind::RequestOfToken
                     | GeomKind::GroupOfLane
                     | GeomKind::GroupIndptr { .. }
-                    | GeomKind::LaneIndptr { .. }
-                    | GeomKind::ReferenceTag { .. } => None,
+                    | GeomKind::LaneIndptr { .. } => None,
                 };
                 bound.unwrap_or_else(|| {
                     panic!(

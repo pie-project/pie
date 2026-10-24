@@ -29,7 +29,7 @@ pub struct VoxelSeat {
     pub clips: u64,
     pub channels: u64,
     pub dtype: Dtype,
-    pub token_grid: bool,
+    pub token_patch: Option<[u32; 3]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -88,7 +88,6 @@ struct PortAt {
 struct PackingAt {
     group_indptr: u64,
     lane_indptr: u64,
-    reference_tag: u64,
     permutation: u64,
 }
 
@@ -96,7 +95,6 @@ struct PackingAt {
 pub struct PackingHandles {
     pub group_indptr: Tensor,
     pub lane_indptr: Tensor,
-    pub reference_tag: Tensor,
     pub permutation: Tensor,
 }
 
@@ -104,7 +102,6 @@ pub struct PackingHandles {
 pub struct PackingFire<'a> {
     pub group_indptr: &'a [i32],
     pub lane_indptr: &'a [i32],
-    pub reference_tag: &'a [i32],
     pub permutation: &'a [i32],
 }
 
@@ -351,7 +348,6 @@ impl Inputs {
             .map(|_| PackingAt {
                 group_indptr: take((lanes + 1) * 4),
                 lane_indptr: take((lanes + 1) * 4),
-                reference_tag: take(rows * 4),
                 permutation: take(rows * 4),
             })
             .collect();
@@ -371,7 +367,7 @@ impl Inputs {
             VoxelAt {
                 payload: take(seat.rows * seat.channels * element),
                 grid: take(seat.clips * 4 * 4),
-                token_grid: if seat.token_grid {
+                token_grid: if seat.token_patch.is_some() {
                     take(seat.clips * 4 * 4)
                 } else {
                     0
@@ -664,11 +660,6 @@ impl Inputs {
                     u64::from(lanes) + 1,
                 ),
                 (
-                    "reference tags",
-                    staged.reference_tag.len() as u64,
-                    u64::from(rows),
-                ),
-                (
                     "packed row permutation",
                     staged.permutation.len() as u64,
                     u64::from(rows),
@@ -686,14 +677,11 @@ impl Inputs {
             self.store.write(at.group_indptr, bytes_of(&scratch))?;
             csr(&mut scratch, staged.lane_indptr, lanes + 1);
             self.store.write(at.lane_indptr, bytes_of(&scratch))?;
-            rows_table(&mut scratch, staged.reference_tag, rows);
-            self.store.write(at.reference_tag, bytes_of(&scratch))?;
             rows_table(&mut scratch, staged.permutation, rows);
             self.store.write(at.permutation, bytes_of(&scratch))?;
             packings.push(PackingHandles {
                 group_indptr: i32s(handles, &self.store, at.group_indptr, lanes + 1)?,
                 lane_indptr: i32s(handles, &self.store, at.lane_indptr, lanes + 1)?,
-                reference_tag: i32s(handles, &self.store, at.reference_tag, rows)?,
                 permutation: i32s(handles, &self.store, at.permutation, rows)?,
             });
         }
@@ -731,7 +719,11 @@ impl Inputs {
                     (
                         "voxel token grid",
                         (staged.token_grid.len() / 4) as u64,
-                        if seat.token_grid { seat.clips } else { 0 },
+                        if seat.token_patch.is_some() {
+                            seat.clips
+                        } else {
+                            0
+                        },
                     ),
                     ("voxel clip slots", staged.slots.len() as u64, seat.clips),
                 ] {
@@ -770,7 +762,7 @@ impl Inputs {
                         4,
                         Dtype::I32,
                     ),
-                    token_grid: if seat.token_grid {
+                    token_grid: if seat.token_patch.is_some() {
                         Some(Tensor::new(
                             handles.bind(&self.store, at.token_grid, clips * 16)?,
                             clips32,
