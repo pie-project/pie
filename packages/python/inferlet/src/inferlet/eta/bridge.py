@@ -574,9 +574,6 @@ class ForwardPass:
         _wit(self.wit.readout, indices._wit(), what="readout")
         self._ports.append((Port.READOUT, indices))
 
-    def set_max_layers(self, max_layers: int) -> None:
-        _wit(self.wit.set_max_layers, max_layers, what="set_max_layers")
-
     def set_drafting_block(self, on: bool) -> None:
         """These rows are a block drafter's proposal, not the sequence's own."""
         self._require_kind((ForwardKind.TEXT,), "set_drafting_block")

@@ -127,10 +127,6 @@ interface forward-diffusion {
         /// prompt is what carries images.
         media: func(spans: list<media-span>) -> result<_, error>;
 
-        /// `forward.set-max-layers`, unchanged. Per pass, so an early
-        /// denoising step may run shallow and the last ones deep.
-        set-max-layers: func(max-layers: u32) -> result<_, error>;
-
         /// Attach canonical ETA bytes and channel handles in dense declaration
         /// order. Validation uses the engine-owned ModelProfile and rejects
         /// any stage this interface does not admit.

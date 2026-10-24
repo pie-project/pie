@@ -218,11 +218,6 @@ export class ForwardPass {
   */
   readout(indices: Channel): void;
   /**
-  * Run only the first `max-layers` layers and take the head there.
-  * Unset = the full model; zero is rejected.
-  */
-  setMaxLayers(maxLayers: number): void;
-  /**
   * **THESE ROWS ARE A BLOCK DRAFTER'S PROPOSAL, NOT THE SEQUENCE'S.**
   * A block drafter proposes many tokens in one pass over a block
   * whose first row is the correction the target just made and whose

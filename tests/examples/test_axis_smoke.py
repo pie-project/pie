@@ -57,22 +57,6 @@ LANES = [
             "mask_mode": "doc-isolation",
         },
     ),
-    (
-        "depth",
-        "naive-baseline",
-        {"prompt": PROMPT, "max_tokens": 32, "seed": 7, "max_layers": 8},
-    ),
-    (
-        "mask-x-depth",
-        "naive-masked",
-        {
-            "prompt": PROMPT,
-            "max_tokens": 32,
-            "seed": 12,
-            "mask_mode": "dense",
-            "max_layers": 8,
-        },
-    ),
 ]
 
 

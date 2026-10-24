@@ -42,10 +42,6 @@ struct Input {
     /// Stop after the prefill rows (the trunk alone).
     #[serde(default)]
     only_prefill: bool,
-    /// Run only the first `max_layers` layers and take the head there —
-    /// the logit lens, against the reference's per-layer hidden states.
-    #[serde(default)]
-    max_layers: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -141,9 +137,6 @@ async fn main(input: Input) -> Result<Output> {
 
         let fwd = ForwardPass::new();
         fwd.canvas(Mode::Encode)?;
-        if let Some(k) = input.max_layers {
-            fwd.set_max_layers(k)?;
-        }
         fwd.embed(&toks, &embed_indptr)?;
         fwd.state(
             &[&ws],

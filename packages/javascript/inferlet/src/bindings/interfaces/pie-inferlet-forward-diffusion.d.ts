@@ -119,11 +119,6 @@ export class ForwardPass {
   */
   media(spans: Array<MediaSpan>): void;
   /**
-  * `forward.set-max-layers`, unchanged. Per pass, so an early
-  * denoising step may run shallow and the last ones deep.
-  */
-  setMaxLayers(maxLayers: number): void;
-  /**
   * Attach canonical ETA bytes and channel handles in dense declaration
   * order. Validation uses the engine-owned ModelProfile and rejects
   * any stage this interface does not admit.

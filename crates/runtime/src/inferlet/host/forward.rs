@@ -1170,22 +1170,6 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
-    async fn core_set_max_layers(
-        &mut self,
-        this: Resource<ForwardPass>,
-        max_layers: u32,
-    ) -> Anyhow<Result<(), String>> {
-        let pass = self.ctx().table.get_mut(&this)?;
-        if pass.is_bound() {
-            return Ok(Err("forward pass program is already attached".to_string()));
-        }
-        if max_layers == 0 {
-            return Ok(Err("max-layers must be at least 1".to_string()));
-        }
-        pass.bindings.max_layers = Some(max_layers);
-        Ok(Ok(()))
-    }
-
     async fn core_set_drafting_block(
         &mut self,
         this: Resource<ForwardPass>,
@@ -1240,16 +1224,7 @@ impl ProcessCtx {
         container_bytes: Vec<u8>,
         channels: Vec<Resource<Channel>>,
     ) -> Anyhow<Result<(), String>> {
-        let (
-            embed,
-            state,
-            readout,
-            pass_max_layers,
-            pass_block_draft,
-            lane_facts,
-            port_bindings,
-            float_rows,
-        ) = {
+        let (embed, state, readout, pass_block_draft, lane_facts, port_bindings, float_rows) = {
             let port_cells: Vec<(String, Vec<u32>, Dtype)> = {
                 let pass = self.ctx().table.get(&this)?;
                 pass.bindings
@@ -1469,7 +1444,6 @@ impl ProcessCtx {
                 embed,
                 state,
                 pass.bindings.readout,
-                pass.bindings.max_layers,
                 pass.bindings.block_draft,
                 lane_facts,
                 port_bindings,
@@ -1844,7 +1818,6 @@ impl ProcessCtx {
                 fires: None,
                 lanes,
                 kv_lanes,
-                max_layers: pass_max_layers,
                 block_draft: pass_block_draft,
                 rs_ws: rs_reps,
                 failed: None,
@@ -1955,14 +1928,6 @@ macro_rules! forward_pass_common {
             indices: Resource<Channel>,
         ) -> Anyhow<Result<(), String>> {
             self.core_readout(this, indices).await
-        }
-
-        async fn set_max_layers(
-            &mut self,
-            this: Resource<ForwardPass>,
-            max_layers: u32,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_set_max_layers(this, max_layers).await
         }
 
         async fn program(

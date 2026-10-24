@@ -523,10 +523,6 @@ export class ForwardPass {
     this.ports.push([Port.READOUT, indices]);
   }
 
-  setMaxLayers(maxLayers: number): void {
-    wit('setMaxLayers', () => this.wit.setMaxLayers(maxLayers));
-  }
-
   /** These rows are a block drafter's proposal, not the sequence's own. */
   setDraftingBlock(on: boolean): void {
     this.requireKind(['text'], 'setDraftingBlock');

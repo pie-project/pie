@@ -48,7 +48,7 @@ Only `m + 1` tokens advance the committed length.
 | `max_tokens` | int | `64` | Number of generated tokens |
 | `k` | int | `4` | Draft tokens per round, capped at the model's `mtp_depth`; `0` decodes greedily through the same loop |
 
-`pad`, `max_layers`, `trace` and `margin` are diagnostics; see `src/lib.rs`.
+`pad`, `trace` and `margin` are diagnostics; see `src/lib.rs`.
 
 ## Implementation notes
 

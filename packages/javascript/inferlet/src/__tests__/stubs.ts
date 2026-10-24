@@ -148,7 +148,6 @@ export class ForwardPassStub {
   checkpoints(slots: Uint32Array) {
     this.checkpointSlots = Array.from(slots);
   }
-  setMaxLayers() {}
   setDraftingBlock() {}
   media(spans: unknown[]) {
     this.spans = [...spans];

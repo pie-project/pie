@@ -7,7 +7,6 @@ use crate::engine::completion::CellPtr;
 pub struct FireRequest {
     pub lanes: Vec<Lane>,
     pub geometry: GeometryClass,
-    pub max_layers: Option<u32>,
     pub single_token_mode: bool,
     pub has_user_mask: bool,
     pub boundary_program: bool,

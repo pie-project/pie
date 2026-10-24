@@ -152,10 +152,6 @@ interface forward {
         /// Bind an optional readout-index channel separately from embedding.
         readout: func(indices: borrow<channel>) -> result<_, error>;
 
-        /// Run only the first `max-layers` layers and take the head there.
-        /// Unset = the full model; zero is rejected.
-        set-max-layers: func(max-layers: u32) -> result<_, error>;
-
         /// **THESE ROWS ARE A BLOCK DRAFTER'S PROPOSAL, NOT THE SEQUENCE'S.**
         /// A block drafter proposes many tokens in one pass over a block
         /// whose first row is the correction the target just made and whose
