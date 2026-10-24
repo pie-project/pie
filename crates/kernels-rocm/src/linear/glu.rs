@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
 const FILE: &str = "linear/glu.hip";
@@ -78,7 +78,7 @@ pub fn swiglu(
     );
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&entry)).apply(launch),
+        Fire::at(kernel(FILE, &entry)).apply(launch),
         &[
             packed.arg(),
             y.arg(),
@@ -102,10 +102,10 @@ pub fn swiglu_clamp(
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::linear::mlp_swiglu_clamp<{t}>")),
-        )
+            &format!("::pie::linear::mlp_swiglu_clamp<{t}>"),
+        ))
         .apply(launch),
         &[
             packed.arg(),
@@ -132,10 +132,10 @@ pub fn swiglu_clamp_alpha(
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::linear::mlp_swiglu_clamp_alpha<{t}>")),
-        )
+            &format!("::pie::linear::mlp_swiglu_clamp_alpha<{t}>"),
+        ))
         .apply(launch),
         &[
             packed.arg(),
@@ -198,12 +198,10 @@ fn swiglu_clamp_lanes(
     let lanes = lanes / vec;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!(
-                "::pie::linear::mlp_swiglu_clamp_lanes<{t}, {packed}, {routed}, {vec}>"
-            )),
-        )
+            &format!("::pie::linear::mlp_swiglu_clamp_lanes<{t}, {packed}, {routed}, {vec}>"),
+        ))
         .apply(Launch::flat(lanes, BLOCK)),
         &[
             gate.arg(),
@@ -295,7 +293,7 @@ pub fn geglu_tanh(
     nonzero(OP, "the activation's element count", lanes)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::mlp_geglu_tanh<{t}>")))
+        Fire::at(kernel(FILE, &format!("::pie::linear::mlp_geglu_tanh<{t}>")))
             .apply(Launch::flat(lanes, BLOCK)),
         &[
             gate.arg(),
@@ -340,10 +338,10 @@ fn act(
     nonzero(op, "the activation's element count", lanes)?;
     ctx.fire(
         op,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::linear::mlp_act<{t}, {relu2}>")),
-        )
+            &format!("::pie::linear::mlp_act<{t}, {relu2}>"),
+        ))
         .apply(Launch::flat(lanes, BLOCK)),
         &[
             x.arg(),
@@ -377,7 +375,7 @@ pub fn geglu_tanh_packed(
     );
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&entry)).apply(launch),
+        Fire::at(kernel(FILE, &entry)).apply(launch),
         &[
             packed.arg(),
             y.arg(),
@@ -405,7 +403,7 @@ pub fn situ(
     let (launch, width) = packed_halves(OP, packed, intermediate, fan, y)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::linear::mlp_situ<{t}>"))).apply(launch),
+        Fire::at(kernel(FILE, &format!("::pie::linear::mlp_situ<{t}>"))).apply(launch),
         &[
             packed.arg(),
             y.arg(),

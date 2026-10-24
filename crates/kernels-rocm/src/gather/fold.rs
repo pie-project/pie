@@ -1,6 +1,6 @@
 use crate::error::Error;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
 const FILE: &str = "gather/fold.hip";
@@ -35,7 +35,7 @@ pub fn pool_rows(ctx: &Ctx, x: Tensor, side: u32, y: &mut Tensor) -> Result<(), 
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::layout::pool_rows<{t}>")))
+        Fire::at(kernel(FILE, &format!("::pie::layout::pool_rows<{t}>")))
             .apply(Launch::per_row(out, BLOCK)),
         &[x.arg(), y.arg(), width.arg(), stated(OP, block)?.arg()],
     )
@@ -77,7 +77,7 @@ pub fn merge_rows(ctx: &Ctx, x: Tensor, side: u32, y: &mut Tensor) -> Result<(),
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::layout::merge_rows<{t}>")))
+        Fire::at(kernel(FILE, &format!("::pie::layout::merge_rows<{t}>")))
             .apply(Launch::per_row(out, BLOCK)),
         &[
             x.arg(),

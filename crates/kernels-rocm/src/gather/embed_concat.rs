@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated, symbol};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
 const FILE: &str = "gather/embed_concat.hip";
@@ -36,7 +36,7 @@ pub fn embed_concat(
     })?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::layout::embed_concat<{t}>")))
+        Fire::at(kernel(FILE, &format!("::pie::layout::embed_concat<{t}>")))
             .apply(Launch::flat(lanes, BLOCK)),
         &[
             ids.arg(),
@@ -106,10 +106,10 @@ pub fn embed_concat_mlxu4(
     })?;
     ctx.fire(
         OP,
-        Fire::at(
+        Fire::at(kernel(
             FILE,
-            symbol(&format!("::pie::layout::embed_concat_mlxu4<{t}>")),
-        )
+            &format!("::pie::layout::embed_concat_mlxu4<{t}>"),
+        ))
         .apply(Launch::flat(lanes, BLOCK)),
         &[
             ids.arg(),
@@ -195,7 +195,7 @@ pub fn embed_mlx_affine(
     })?;
     ctx.fire(
         OP,
-        Fire::at(FILE, symbol(&format!("::pie::layout::{entry}<{t}>")))
+        Fire::at(kernel(FILE, &format!("::pie::layout::{entry}<{t}>")))
             .apply(Launch::flat(lanes, BLOCK)),
         &[
             ids.arg(),

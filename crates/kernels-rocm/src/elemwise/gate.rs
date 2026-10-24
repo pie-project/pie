@@ -1,6 +1,6 @@
 use crate::error::Error;
 
-use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, nonzero, refuse, stated};
+use crate::jit::{Arg, Ctx, Fire, Launch, dtype_dispatch, kernel, nonzero, refuse, stated};
 use crate::tensor::Tensor;
 
 const BLOCK: u32 = 256;
@@ -23,7 +23,7 @@ pub fn sigmoid_mul(ctx: &Ctx, gate: Tensor, fan: u32, x: &mut Tensor) -> Result<
     nonzero(OP, "the gated rectangle's element count", lanes)?;
     ctx.fire(
         OP,
-        Fire::at("linear/glu.hip", "::pie::linear::gate_sigmoid_mul").apply(
+        Fire::at(kernel("linear/glu.hip", "::pie::linear::gate_sigmoid_mul")).apply(
             super::pointwise::sweep(
                 u64::from(lanes),
                 if x.width.is_multiple_of(4)
@@ -81,8 +81,11 @@ pub fn sigmoid_mul_heads(
     }
     ctx.fire(
         OP,
-        Fire::at("linear/glu.hip", "::pie::linear::gate_sigmoid_mul_heads")
-            .apply(Launch::per_row(rows, BLOCK)),
+        Fire::at(kernel(
+            "linear/glu.hip",
+            "::pie::linear::gate_sigmoid_mul_heads",
+        ))
+        .apply(Launch::per_row(rows, BLOCK)),
         &[
             x.arg(),
             gate.arg(),

@@ -1,5 +1,7 @@
 use crate::error::Error;
-use crate::jit::{Arg, Ctx, Fire, Launch, aligned16, count, dtype_dispatch, refuse, stated};
+use crate::jit::{
+    Arg, Ctx, Fire, Launch, aligned16, count, dtype_dispatch, kernel, refuse, stated,
+};
 use crate::tensor::Tensor;
 use crate::voxels::lanes_of;
 
@@ -80,13 +82,10 @@ pub fn attention(
     let per_block = BLOCK / WAVE * qpw;
     let blocks = q.rows.div_ceil(per_block);
     let scale_log2 = sm_scale * core::f32::consts::LOG2_E;
-    let entry = crate::jit::symbol(&format!(
-        "::pie::attn::voxel::attention<{}, {qpw}>",
-        q.width
-    ));
+    let entry = format!("::pie::attn::voxel::attention<{}, {qpw}>", q.width);
     ctx.fire(
         OP,
-        Fire::at(FILE, entry).apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
+        Fire::at(kernel(FILE, &entry)).apply(Launch::grid([blocks, 1, 1], [BLOCK, 1, 1])),
         &[
             q.arg(),
             k.arg(),

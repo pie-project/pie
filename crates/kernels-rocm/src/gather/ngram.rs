@@ -1,7 +1,7 @@
 use crate::error::Error;
 use dtype::Dtype;
 
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, nonzero, refuse, stated};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, kernel, nonzero, refuse, stated};
 use crate::tensor::{RaggedTensor, RecurrentPool, Tensor};
 
 const FILE: &str = "gather/ngram.hip";
@@ -105,7 +105,8 @@ pub fn ngram_ids(
     let rows = nonzero(OP, "rows", ids.rows)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::ple_ngram_ids_update").apply(update_launch(rows, h.heads)),
+        Fire::at(kernel(FILE, "::pie::attn::ple_ngram_ids_update"))
+            .apply(update_launch(rows, h.heads)),
         &[
             ids.arg(),
             state.slab.arg(),
@@ -158,7 +159,7 @@ pub fn ngram_ids_chunked(
     let lanes = nonzero(OP, "request lanes", ids.indptr.rows.saturating_sub(1))?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::ple_ngram_ids_chunked")
+        Fire::at(kernel(FILE, "::pie::attn::ple_ngram_ids_chunked"))
             .apply(Launch::grid([lanes, 1, 1], [BLOCK, 1, 1])),
         &[
             ids.data.arg(),

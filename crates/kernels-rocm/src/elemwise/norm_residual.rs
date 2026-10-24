@@ -1,7 +1,7 @@
 use super::*;
 use crate::error::Error;
 use crate::jit::{
-    Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, nonzero, refuse, stated, symbol,
+    Arg, Ctx, Fire, Launch, aligned16, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::Tensor;
 use dtype::Dtype;
@@ -28,7 +28,7 @@ pub fn residual_add_rmsnorm(
     let block = BLOCK;
     ctx.fire(
         OP,
-        Fire::at(NORM_UNIT, symbol(&entrypoint)).apply(Launch::per_row(rows, block)),
+        Fire::at(kernel(NORM_UNIT, &entrypoint)).apply(Launch::per_row(rows, block)),
         &[
             x.arg(),
             y.arg(),
@@ -134,7 +134,7 @@ pub fn rmsnorm_residual_add(
     };
     ctx.fire(
         OP,
-        Fire::at(NORM_UNIT, symbol(&entrypoint)).apply(Launch::per_row(rows, block)),
+        Fire::at(kernel(NORM_UNIT, &entrypoint)).apply(Launch::per_row(rows, block)),
         &[
             x.arg(),
             w0.arg(),

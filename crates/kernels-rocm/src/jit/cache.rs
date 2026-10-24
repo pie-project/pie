@@ -21,24 +21,8 @@ unsafe impl Send for Resolved {}
 // function from several threads at once.
 unsafe impl Sync for Resolved {}
 
-type Slot = OnceLock<Result<Resolved, Fault>>;
-
-fn slot(key: &str) -> &'static Slot {
-    static SLOTS: OnceLock<Mutex<HashMap<String, &'static Slot>>> = OnceLock::new();
-    let mut map = SLOTS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("lock poisoned");
-    if let Some(found) = map.get(key) {
-        return found;
-    }
-
-    let fresh: &'static Slot = Box::leak(Box::new(OnceLock::new()));
-    map.insert(key.to_owned(), fresh);
-    fresh
-}
-
-pub(crate) fn resolve(root: &Root, instantiation: &str) -> Result<&'static Resolved, Fault> {
+/// The ordinal of the device bound to this thread.
+pub(crate) fn current_device() -> Result<i32, Fault> {
     let api = api("hipGetDevice")?;
     let mut ordinal: i32 = 0;
     // SAFETY: `ordinal` is a live local out-parameter.
@@ -49,22 +33,21 @@ pub(crate) fn resolve(root: &Root, instantiation: &str) -> Result<&'static Resol
             code,
         });
     }
+    Ok(ordinal)
+}
+
+/// `instantiation` of `root` loaded on device `ordinal`: from the disk cache,
+/// or compiled and written there.
+pub(crate) fn load(root: &Root, instantiation: &str, ordinal: i32) -> Result<Resolved, Fault> {
     let arch = arch(ordinal).ok_or(Fault::Device {
         call: "hipGetDeviceProperties",
         code: -1,
     })?;
-    let key = format!(
+    let key = &format!(
         "{}/rtc{}",
         root.key(instantiation, arch),
         hiprtc::version()?
     );
-    slot(&format!("hip:{ordinal}|{key}"))
-        .get_or_init(|| load(root, instantiation, &key, arch))
-        .as_ref()
-        .map_err(Clone::clone)
-}
-
-fn load(root: &Root, instantiation: &str, key: &str, arch: &str) -> Result<Resolved, Fault> {
     let started = std::time::Instant::now();
     let (image, mangled, compiled) = match read_disk(key) {
         Some(hit) => (hit.0, hit.1, false),

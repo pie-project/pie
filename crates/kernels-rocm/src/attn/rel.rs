@@ -6,7 +6,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::attn::{RelBias, kv};
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, refuse, stated, symbol};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, kernel, refuse, stated};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const FILE: &str = "attn/rel.hip";
@@ -79,7 +79,7 @@ pub fn walk(
     let hnd = pool.layout != 0;
     ctx.fire(
         op,
-        Fire::at(FILE, symbol(&format!("::pie::attn::paged_rel<{hnd}>"))).apply(Launch::grid(
+        Fire::at(kernel(FILE, &format!("::pie::attn::paged_rel<{hnd}>"))).apply(Launch::grid(
             [o.rows, heads.div_ceil(WAVES), 1],
             [WAVES * 64, 1, 1],
         )),

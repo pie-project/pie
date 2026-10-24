@@ -2,7 +2,7 @@ use crate::error::Error;
 use dtype::Dtype;
 
 use crate::attn::kv;
-use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, refuse, stated};
+use crate::jit::{Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 const FILE: &str = "attn/sdpa_selected.hip";
@@ -178,7 +178,7 @@ fn selected(
     .smem(smem_bytes(head_dim));
     ctx.fire(
         op,
-        Fire::at(FILE, ENTRY).apply(launch),
+        Fire::at(kernel(FILE, ENTRY)).apply(launch),
         &[
             q.data.arg(),
             pool.keys.arg(),
@@ -294,14 +294,12 @@ fn selected_mfma(
     } else {
         0
     };
-    let entry = crate::jit::symbol(&format!(
-        "::pie::attn::sdpa_selected::sdpa_selected_mfma<{head_dim}, {group}>"
-    ));
+    let entry = format!("::pie::attn::sdpa_selected::sdpa_selected_mfma<{head_dim}, {group}>");
     #[allow(clippy::cast_sign_loss)]
     let launch = Launch::grid([rows, kv_heads as u32, splits], [MFMA_THREADS, 1, 1]);
     ctx.fire(
         op,
-        Fire::at(FILE, entry).apply(launch),
+        Fire::at(kernel(FILE, &entry)).apply(launch),
         &[
             q.data.arg(),
             pool.keys.arg(),
@@ -329,7 +327,11 @@ fn selected_mfma(
     }
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::attn::sdpa_selected::sdpa_selected_merge").apply(Launch::grid(
+        Fire::at(kernel(
+            FILE,
+            "::pie::attn::sdpa_selected::sdpa_selected_merge",
+        ))
+        .apply(Launch::grid(
             [rows, q_heads as u32, 1],
             [(head_dim as u32).min(MERGE_BLOCK), 1, 1],
         )),

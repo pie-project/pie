@@ -6,7 +6,7 @@ use crate::attn::index::pool_pitch;
 use crate::attn::kv;
 use crate::attn::mla::{latent, naive};
 use crate::jit::{
-    Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, nonzero, refuse, stated,
+    Arg, ArgValue, Ctx, Fire, Launch, count, dtype_dispatch, kernel, nonzero, refuse, stated,
 };
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
@@ -83,8 +83,11 @@ pub fn boundary_decode(
     let rows = count(OP, "rows", boundary_pos.rows)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::pool_boundary_decode<::pie::i32>")
-            .apply(Launch::flat(boundary_pos.rows, META_BLOCK)),
+        Fire::at(kernel(
+            FILE,
+            "::pie::attn::pool_boundary_decode<::pie::i32>",
+        ))
+        .apply(Launch::flat(boundary_pos.rows, META_BLOCK)),
         &[
             positions.arg(),
             boundary_pos.arg(),
@@ -115,8 +118,11 @@ pub fn boundary_prefill(
     let num_requests = kv::lanes_of(OP, positions.indptr)?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::pool_boundary_prefill<::pie::i32>")
-            .apply(Launch::flat(boundary_pos.rows, META_BLOCK)),
+        Fire::at(kernel(
+            FILE,
+            "::pie::attn::pool_boundary_prefill<::pie::i32>",
+        ))
+        .apply(Launch::flat(boundary_pos.rows, META_BLOCK)),
         &[
             positions.data.arg(),
             positions.indptr.arg(),
@@ -168,7 +174,7 @@ pub fn state_write(
     }
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::pool_state_write")
+        Fire::at(kernel(FILE, "::pie::attn::pool_state_write"))
             .apply(route_rows(kv.rows, width.unsigned_abs())),
         &[
             kv.arg(),
@@ -227,7 +233,7 @@ pub fn gather(
     };
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::pool_gather_paged")
+        Fire::at(kernel(FILE, "::pie::attn::pool_gather_paged"))
             .apply(route_rows(boundary_pos.rows, head_dim.unsigned_abs())),
         &[
             state_kv.arg(),
@@ -301,7 +307,7 @@ pub fn kv_append(
     let div = packing(OP, pool, i64::from(head_dim))?;
     ctx.fire(
         OP,
-        Fire::at(FILE, "::pie::attn::pool_store_entries")
+        Fire::at(kernel(FILE, "::pie::attn::pool_store_entries"))
             .apply(route_rows(entries.rows, entries.width)),
         &[
             entries.arg(),
@@ -428,7 +434,7 @@ fn attend_pool(
     .smem(naive::naive_smem_bytes(head_dim));
     ctx.fire(
         op,
-        Fire::at(FILE, "::pie::attn::pool_lse_paged").apply(launch),
+        Fire::at(kernel(FILE, "::pie::attn::pool_lse_paged")).apply(launch),
         &[
             read.q.arg(),
             entries.keys.arg(),
@@ -571,8 +577,11 @@ pub fn block_mean(
     let rows = count(OP, "rows", boundary_pos.rows)?;
     ctx.fire(
         OP,
-        Fire::at("attn/pool.hip", "::pie::attn::index_block_mean_paged")
-            .apply(Launch::per_row(boundary_pos.rows, POOL_BLOCK)),
+        Fire::at(kernel(
+            "attn/pool.hip",
+            "::pie::attn::index_block_mean_paged",
+        ))
+        .apply(Launch::per_row(boundary_pos.rows, POOL_BLOCK)),
         &[
             keys.keys.arg(),
             entries.arg(),

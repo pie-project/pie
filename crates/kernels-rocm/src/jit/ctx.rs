@@ -3,7 +3,7 @@ use core::ffi::c_void;
 
 use crate::error::Error;
 
-use crate::jit::{ArgValue, refuse};
+use crate::jit::{ArgValue, Kernel, refuse};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Launch {
@@ -70,19 +70,16 @@ impl Launch {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fire {
-    pub file: &'static str,
-
-    pub entrypoint: &'static str,
+    pub kernel: &'static Kernel,
 
     pub launch: Launch,
 }
 
 impl Fire {
     #[must_use]
-    pub const fn at(file: &'static str, entrypoint: &'static str) -> Self {
+    pub const fn at(kernel: &'static Kernel) -> Self {
         Self {
-            file,
-            entrypoint,
+            kernel,
             launch: Launch::grid([0, 0, 0], [0, 0, 0]),
         }
     }
@@ -476,30 +473,29 @@ impl Ctx {
     }
 
     pub fn fire(&self, op: &'static str, fire: Fire, args: &[ArgValue]) -> Result<(), Error> {
-        let Some(root) = crate::jit::Root::of(fire.file) else {
+        if fire.kernel.root.is_none() {
             return Err(refuse(
                 op,
-                format!("no carried unit is named `{}`", fire.file),
+                format!("no carried unit is named `{}`", fire.kernel.file),
             ));
-        };
+        }
         if fire.launch.empty() {
             return Err(refuse(op, "the grid is empty"));
         }
-        self.issue(op, &root, fire.entrypoint, fire.launch, args)
+        self.issue(op, fire.kernel, fire.launch, args)
     }
 
     #[cfg(feature = "rocm")]
     fn issue(
         &self,
         op: &'static str,
-        root: &crate::jit::Root,
-        instantiation: &'static str,
+        kernel: &'static Kernel,
         launch: Launch,
         args: &[ArgValue],
     ) -> Result<(), Error> {
-        let resolved = match crate::jit::cache::resolve(root, instantiation) {
+        let resolved = match kernel.resolve() {
             Ok(resolved) => resolved,
-            Err(why) => return Err(said(root.name, instantiation, why).at(op)),
+            Err(why) => return Err(said(kernel, why).at(op)),
         };
 
         let mut bound = crate::jit::abi::Bound::new(args);
@@ -514,7 +510,7 @@ impl Ctx {
         };
         match fired {
             Ok(()) => Ok(()),
-            Err(why) => Err(said(root.name, instantiation, why).at(op)),
+            Err(why) => Err(said(kernel, why).at(op)),
         }
     }
 
@@ -523,8 +519,7 @@ impl Ctx {
     fn issue(
         &self,
         op: &'static str,
-        _root: &crate::jit::Root,
-        _instantiation: &'static str,
+        _kernel: &'static Kernel,
         _launch: Launch,
         _args: &[ArgValue],
     ) -> Result<(), Error> {
@@ -551,10 +546,11 @@ pub fn strict_kernels() {
 static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(feature = "rocm")]
-fn said(root: &str, instantiation: &str, why: crate::jit::Fault) -> crate::jit::Fault {
+fn said(kernel: &Kernel, why: crate::jit::Fault) -> crate::jit::Fault {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
 
+    let (root, instantiation) = (kernel.file, kernel.name);
     assert!(
         !kernels_strict(),
         "strict kernels: `{root}` {instantiation} will not fire: {why}"
