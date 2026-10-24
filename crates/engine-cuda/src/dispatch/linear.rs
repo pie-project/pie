@@ -696,6 +696,28 @@ impl Run<'_> {
                     &mut self.tensor(*y),
                 )
             }
+            // MiniMax's unit, its legs apart.
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                limit,
+                y,
+                packed: None,
+                weights: None,
+                act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
+                ..
+            } => {
+                let fan = self.plane_fan(*y);
+                linear::glu::swiglu_clamp_alpha_split(
+                    self.ctx(),
+                    self.tensor(*gate),
+                    self.tensor(*up),
+                    fan,
+                    limit.unwrap_or(f32::INFINITY),
+                    *alpha,
+                    &mut self.tensor(*y),
+                )
+            }
             Linear::Glu {
                 gate: Some(gate),
                 up: Some(up),

@@ -129,13 +129,60 @@ pub fn swiglu_clamp_alpha(
         OP,
         Fire::at(kernel(
             GLU,
-            &format!("::pie::linear::swiglu_clamp_alpha<{t}>"),
+            &format!("::pie::linear::swiglu_clamp_alpha<{t}, true>"),
         ))
         .apply(launch),
         &[
             packed.arg(),
+            crate::jit::ArgValue::ABSENT,
             y.arg(),
             width.arg(),
+            limit.arg(),
+            alpha.arg(),
+            stated(OP, fan)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// [`swiglu_clamp_alpha`] over a gate and an up plane held apart.
+pub fn swiglu_clamp_alpha_split(
+    ctx: &Ctx,
+    gate: Tensor,
+    up: Tensor,
+    fan: u32,
+    limit: f32,
+    alpha: f32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.glu";
+    let t = dtype_dispatch!(OP, gate.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    debug_assert_eq!(
+        [(gate.rows, gate.width), (up.rows, up.width)],
+        [(y.rows, y.width); 2],
+        "`{OP}`'s gate and up planes are the activation's rectangle"
+    );
+    if fan == 0 || !y.rows.is_multiple_of(fan) {
+        return Err(refuse(
+            OP,
+            format!(
+                "a fan-out of {fan} does not divide the {}-row plane it is stated for",
+                y.rows
+            ),
+        ));
+    }
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            GLU,
+            &format!("::pie::linear::swiglu_clamp_alpha<{t}, false>"),
+        ))
+        .apply(elementwise_rows(OP, y.rows, y.width)?),
+        &[
+            gate.arg(),
+            up.arg(),
+            y.arg(),
+            stated(OP, y.width)?.arg(),
             limit.arg(),
             alpha.arg(),
             stated(OP, fan)?.arg(),
