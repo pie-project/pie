@@ -691,6 +691,13 @@ pub fn fires(op: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// Every op's fires since [`count_fires`], by op: what a test compares
+/// across two loads that should fire alike.
+#[must_use]
+pub fn fire_counts() -> std::collections::BTreeMap<&'static str, u64> {
+    FIRES.lock().expect("fire count lock poisoned").clone()
+}
+
 static COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static FIRES: std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>> =
     std::sync::Mutex::new(std::collections::BTreeMap::new());
