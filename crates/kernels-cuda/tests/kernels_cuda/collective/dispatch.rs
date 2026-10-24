@@ -522,7 +522,7 @@ fn peer_rate() {
     let Some(devices) = peer_devices() else {
         return;
     };
-    let (reps, replays) = (20, 5);
+    let (reps, replays) = (5, 40);
     for width in [2048usize, 4096, 7168] {
         for tokens in [64usize, 256, 1024, 4096] {
             let c = Case {
@@ -582,11 +582,19 @@ fn peer_rate() {
                 };
                 replay();
                 gpus.iter().for_each(Gpu::sync);
-                let start = std::time::Instant::now();
-                (0..replays).for_each(|_| replay());
-                gpus.iter().for_each(Gpu::sync);
+                // The fastest replay: the devices are shared, and another
+                // process's kernels only ever add time.
+                let best = (0..replays)
+                    .map(|_| {
+                        let start = std::time::Instant::now();
+                        replay();
+                        gpus.iter().for_each(Gpu::sync);
+                        start.elapsed()
+                    })
+                    .min()
+                    .expect("a replay");
                 graphs.into_iter().for_each(crate::common::forget);
-                start.elapsed().as_secs_f64() * 1e6 / f64::from(reps * replays)
+                best.as_secs_f64() * 1e6 / f64::from(reps)
             };
             let dispatch_us = timed(&|r| {
                 let mut counts = held[r].counts;

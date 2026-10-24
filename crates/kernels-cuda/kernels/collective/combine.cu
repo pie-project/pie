@@ -13,9 +13,10 @@ using peer::kMaxRanks;
 // outputs are unweighted: weighting is the caller's sum, as without EP.
 //
 // Two launches on each rank's stream: `combine_send` (a warp a received
-// row) copies, `combine_settle` (one block) meets the ranks so every rank's
-// rows have landed before `routed` is read. Nothing opens with a barrier:
-// the dispatch before it met the ranks after every earlier read of `routed`.
+// row at a time) copies, `combine_settle` (one block) meets the ranks so
+// every rank's rows have landed before `routed` is read. Nothing opens with
+// a barrier: the dispatch before it met the ranks after every earlier read
+// of `routed`.
 
 constexpr int kSlotCombine = 2;
 constexpr int kSendWarps = 8;
@@ -37,20 +38,22 @@ struct CombineParams {
 __global__ void __launch_bounds__(32 * kSendWarps) combine_send(const CombineParams p) {
     const int lane = threadIdx.x & 31;
     const int cap = p.ranks * p.tokens;
-    for (int i = blockIdx.x * kSendWarps + (threadIdx.x >> 5); i < cap;
-         i += gridDim.x * kSendWarps) {
+    for (long long i = blockIdx.x * kSendWarps + (threadIdx.x >> 5); i < cap;
+         i += static_cast<long long>(gridDim.x) * kSendWarps) {
         const int o = p.origin[i];
         if (o < 0) continue;
         const int s = o / p.tokens;
         const long long t = o - s * p.tokens;
-        for (int j = 0; j < p.top_k; ++j) {
-            const long long at = static_cast<long long>(i) * p.top_k + j;
-            if (p.local[at] < 0) continue;
-            peer::warp_copy(p.routed[s] + (t * p.top_k + j) * p.packs, p.y + at * p.packs, p.packs,
-                            lane);
+        // Each live route's output, its loads in flight across the warp.
+        unsigned live = __ballot_sync(~0u, lane < p.top_k && p.local[i * p.top_k + lane] >= 0);
+        for (; live != 0; live &= live - 1) {
+            const int j = __ffs(live) - 1;
+            int4* back = p.routed[s] + (t * p.top_k + j) * p.packs;
+            peer::fan_copy(&back, 1, p.y + (i * p.top_k + j) * p.packs, p.packs, lane, 32);
         }
     }
-    // As `dispatch_send`: the rows reach the peers before the settle's release.
+    // As `dispatch_send`: the rows reach the peers before the settle's
+    // release. A warp strides over the rows so each thread waits on it once.
     __threadfence_system();
 }
 
