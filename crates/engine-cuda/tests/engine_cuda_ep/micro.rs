@@ -173,12 +173,28 @@ pub fn request(trace: &Trace, checkpoint: &Path) -> LoadRequest {
     }
 }
 
-/// A rank's boot on `ordinal`.
+/// The diagnostics every boot of the process states, as a worker's boots
+/// would: `PIE_EP_DIAG`'s words (the sync guard: `sync-guard`,
+/// `sync-guard=panic`), none by default.
+pub fn diagnostics() -> engine_cuda::Diagnostics {
+    std::env::var("PIE_EP_DIAG").map_or_else(
+        |_| engine_cuda::Diagnostics::default(),
+        |words| {
+            words
+                .parse()
+                .unwrap_or_else(|why| panic!("PIE_EP_DIAG: {why}"))
+        },
+    )
+}
+
+/// A rank's boot on `ordinal`, or a one-rank engine's.
 pub fn boot(ordinal: i32) -> engine_cuda::DeviceBoot {
-    engine_cuda::DeviceBoot {
+    let mut boot = engine_cuda::DeviceBoot {
         ordinal,
         ..engine_cuda::DeviceBoot::default()
-    }
+    };
+    boot.knobs.diagnostics = diagnostics();
+    boot
 }
 
 /// `whole`'s checkpoint, every expert, in a directory of its own.

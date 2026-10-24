@@ -36,8 +36,11 @@ const DEFAULT_STATE_SLOTS: u32 = 256;
 
 pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     super::diag::publish(&boot.knobs.diagnostics);
-    if super::diag::on().sync_guard.is_some() {
+    if let Some(guard) = super::diag::on().sync_guard {
         crate::device::guard::arm()?;
+        if guard == super::diag::SyncGuard::Report {
+            crate::device::guard::speak();
+        }
     }
     // SAFETY: the boot's communicator is held by the engine for the life of
     // the shell it loads.

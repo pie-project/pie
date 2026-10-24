@@ -9,7 +9,6 @@
 //! expert gives.
 
 use engine::Engine;
-use engine_cuda::DeviceBoot;
 use poem::{Dtype, Platform, Request};
 
 use crate::micro::{
@@ -36,10 +35,7 @@ fn an_expert_parallel_group_serves_through_its_engines() {
     let mut want = Vec::new();
     for &ordinal in ordinals.iter().take(engine_cuda::device::ctx::count()) {
         let (_dir, path) = checkpoint(&whole, &format!("one-{ordinal}"));
-        let boot = DeviceBoot {
-            ordinal,
-            ..DeviceBoot::default()
-        };
+        let boot = boot(ordinal);
         let mut one = engine_cuda::open(boot, contract_for).expect("the engine opens");
         one.load(request(&whole, &path)).expect("the micro loads");
         want = (prompts.iter())

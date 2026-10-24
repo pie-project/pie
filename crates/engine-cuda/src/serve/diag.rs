@@ -24,7 +24,8 @@ pub struct Diagnostics {
 /// The sync guard's answer to a fire that waited for the device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncGuard {
-    /// Print each call the first time a thread's fire makes it.
+    /// Print each call the first time a thread's fire makes it, as it is
+    /// made: a fire that deadlocks on it has still named it.
     Report,
     /// Refuse the fire: a panic naming every call it made.
     Panic,
@@ -213,11 +214,8 @@ pub(crate) fn guarded<T>(fire: impl FnOnce() -> T) -> T {
         return fired;
     }
     match guard {
-        SyncGuard::Report => {
-            for wait in waits.iter().filter(|w| w.from.is_some()) {
-                eprintln!("engine-cuda: [sync-guard] a fire called {wait}");
-            }
-        }
+        // Printed inside each call as it was made (`guard::speak`).
+        SyncGuard::Report => {}
         SyncGuard::Panic => {
             let waits: Vec<String> = waits.iter().map(ToString::to_string).collect();
             panic!(

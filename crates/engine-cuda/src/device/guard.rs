@@ -41,6 +41,13 @@ pub fn arm() -> Result<()> {
         .map_err(|why| Fault::program("device::guard", why))
 }
 
+/// Prints each call a watched fire makes as the thread first makes it,
+/// from inside the call: a fire that never returns (a group deadlocked on
+/// it) has still said what it waited on, and from where.
+pub fn speak() {
+    cupti::SPOKEN.store(true, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Runs `fire`, noting each call on this thread that waits for the device.
 pub fn watched<T>(fire: impl FnOnce() -> T) -> (T, Vec<Wait>) {
     /// Ends the watch however the fire ends: a rank's thread outlives a
@@ -114,11 +121,54 @@ const BLOCKING: &[&str] = &[
     "cuMemHostUnregister",
 ];
 
+/// Calls that take the context's lock against everything it runs: a module
+/// load or unload, a function attribute, a graph's instantiation or
+/// teardown, a context limit, a virtual-memory unmap. Each waits for the
+/// device to reach a point where the context can change under it, so beside
+/// a peer rank's spinning collective on the same device it never returns.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+const CONTEXT: &[&str] = &[
+    "cuModuleLoad",
+    "cuModuleLoadData",
+    "cuModuleLoadDataEx",
+    "cuModuleLoadFatBinary",
+    "cuModuleUnload",
+    "cuLibraryLoadData",
+    "cuLibraryLoadFromFile",
+    "cuLibraryUnload",
+    "cuFuncSetAttribute",
+    "cuFuncSetCacheConfig",
+    "cuFuncSetSharedMemConfig",
+    "cuKernelSetAttribute",
+    "cuKernelSetCacheConfig",
+    "cudaFuncSetAttribute",
+    "cudaFuncSetCacheConfig",
+    "cudaFuncSetSharedMemConfig",
+    "cuGraphInstantiate",
+    "cuGraphInstantiateWithFlags",
+    "cuGraphInstantiateWithParams",
+    "cuGraphExecDestroy",
+    "cudaGraphInstantiate",
+    "cudaGraphInstantiateWithFlags",
+    "cudaGraphInstantiateWithParams",
+    "cudaGraphExecDestroy",
+    "cuCtxSetLimit",
+    "cuCtxSetCacheConfig",
+    "cudaDeviceSetLimit",
+    "cudaDeviceSetCacheConfig",
+    "cuMemUnmap",
+    "cuMemRelease",
+    "cuMemAddressFree",
+    "cuMemPoolTrimTo",
+    "cudaMemPoolTrimTo",
+];
+
 #[cfg(feature = "cuda")]
 mod cupti {
     use core::ffi::{CStr, c_void};
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeSet;
+    use std::sync::atomic::AtomicBool;
 
     use cudarc::cupti::sys as p;
     use cudarc::cupti::sys::{
@@ -126,7 +176,10 @@ mod cupti {
         CUpti_SubscriberHandle, CUptiResult, cuptiEnableDomain, cuptiSubscribe,
     };
 
-    use super::{BLOCKING, Wait, base};
+    use super::{BLOCKING, CONTEXT, Wait, base};
+
+    /// Whether a first sighting is printed as it is made ([`super::speak`]).
+    pub(super) static SPOKEN: AtomicBool = AtomicBool::new(false);
 
     thread_local! {
         pub(super) static FIRING: Cell<bool> = const { Cell::new(false) };
@@ -201,6 +254,8 @@ mod cupti {
         };
         let call = if BLOCKING.contains(&base(name)) {
             format!("{name} (blocks on the device)")
+        } else if CONTEXT.contains(&base(name)) {
+            format!("{name} (takes the context against the device)")
         } else if legacy(domain, name, data.functionParams) {
             format!("{name} on the legacy stream")
         } else {
@@ -213,6 +268,15 @@ mod cupti {
             })
             .unwrap_or(false);
         let from = first.then(|| std::backtrace::Backtrace::force_capture().to_string());
+        if let Some(from) = &from
+            && SPOKEN.load(core::sync::atomic::Ordering::Relaxed)
+        {
+            let thread = std::thread::current();
+            let on = thread
+                .name()
+                .map_or_else(|| format!("{:?}", thread.id()), ToString::to_string);
+            eprintln!("engine-cuda: [sync-guard] a fire on `{on}` calls {call}, from:\n{from}");
+        }
         let _ = NOTED.try_with(|noted| {
             if let Ok(mut noted) = noted.try_borrow_mut() {
                 noted.push(Wait { call, from });
@@ -283,6 +347,9 @@ mod cupti {
     use std::cell::{Cell, RefCell};
 
     use super::Wait;
+
+    pub(super) static SPOKEN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     thread_local! {
         pub(super) static FIRING: Cell<bool> = const { Cell::new(false) };

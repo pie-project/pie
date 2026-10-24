@@ -98,6 +98,7 @@ fn stage(
         ordinal,
         knobs: engine_cuda::Knobs {
             chip: Some(chip),
+            diagnostics: crate::micro::diagnostics(),
             ..engine_cuda::Knobs::default()
         },
         cache_dir: None,

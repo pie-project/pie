@@ -10,7 +10,6 @@
 //! on rows the group never served.
 
 use engine::Engine;
-use engine_cuda::DeviceBoot;
 use poem::{Dtype, Platform, Request};
 
 use crate::micro::{
@@ -44,10 +43,7 @@ fn check(replicas: u32) {
     let mut want: Vec<Vec<f32>> = Vec::new();
     for &ordinal in ordinals.iter().take(engine_cuda::device::ctx::count()) {
         let (_dir, path) = checkpoint(&whole, &format!("rebalance-one-{replicas}-{ordinal}"));
-        let boot = DeviceBoot {
-            ordinal,
-            ..DeviceBoot::default()
-        };
+        let boot = boot(ordinal);
         let mut one = engine_cuda::open(boot, contract_for).expect("the engine opens");
         one.load(request(&whole, &path)).expect("the micro loads");
         want = (prompts.iter())
