@@ -593,10 +593,12 @@ impl Run<'_> {
                 self.tensor(*shared),
                 &mut self.tensor(*y),
             ),
+            // Legs the pack left apart: an unclamped unit clamps at infinity,
+            // which keeps every finite value.
             Linear::Glu {
                 gate: Some(gate),
                 up: Some(up),
-                limit: Some(limit),
+                limit,
                 y,
                 packed: None,
                 weights: None,
@@ -609,7 +611,7 @@ impl Run<'_> {
                     self.tensor(*gate),
                     self.tensor(*up),
                     fan,
-                    *limit,
+                    limit.unwrap_or(f32::INFINITY),
                     &mut self.tensor(*y),
                 )
             }
