@@ -1,6 +1,12 @@
 # HunyuanImage 3: an autoregressive mixture of experts that also denoises an
 # image canvas through the same trunk, a small U-Net at each end of it; and
 # its two-layer miniature.
+#
+# The one exception to the TokenGrid contract (`RuntimeInput::TokenGrid`):
+# the canvas is denoised inside the language model's KV lane, a `<timestep>`
+# row ahead of its patches, so the guest gives the canvas rows (`latents`,
+# their `special` flags) and every row's `positions` (the text's sequence
+# positions and the canvas's 2-D offsets) itself; no token grid is read.
 
 STOP = ["<|endoftext|>", "</answer>"]
 LINES = template("lines", stop = STOP, bos = "<|startoftext|>", eos = "<|endoftext|>")
