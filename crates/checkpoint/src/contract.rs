@@ -576,8 +576,6 @@ impl Expr {
         self.shard_among(axis, 1)
     }
 
-    /// A rank's share of this along `axis`, each share held by `replicas`
-    /// ranks in a row.
     /// An expert-parallel rank's `slots` of this bank of `experts`
     /// ([`Expr::Experts`]).
     #[must_use]
@@ -589,6 +587,8 @@ impl Expr {
         }
     }
 
+    /// A rank's share of this along `axis`, each share held by `replicas`
+    /// ranks in a row.
     pub fn shard_among(self, axis: u8, replicas: u32) -> Self {
         Expr::Shard {
             src: Box::new(self),
