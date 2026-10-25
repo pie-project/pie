@@ -5,7 +5,6 @@ use super::compose::LaneRow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LaneFacts {
-    pub stream: u8,
     pub group: Option<u32>,
 }
 
@@ -62,11 +61,10 @@ pub fn groups_of(group_of_lane: &[i32]) -> u32 {
 pub fn pack(
     select: Selection,
     lanes: &[LaneRow],
-    facts: &[LaneFacts],
     group_of_lane: &[i32],
     fire_rows: u32,
 ) -> Result<Packed, Fault> {
-    pack_with_classes(select, lanes, facts, group_of_lane, fire_rows, &[])
+    pack_with_classes(select, lanes, group_of_lane, fire_rows, &[])
 }
 
 /// `pack`, with `classes[source]` the attention classes a source lane
@@ -74,28 +72,22 @@ pub fn pack(
 pub fn pack_with_classes(
     select: Selection,
     lanes: &[LaneRow],
-    facts: &[LaneFacts],
     group_of_lane: &[i32],
     fire_rows: u32,
     classes: &[Option<&[i32]>],
 ) -> Result<Packed, Fault> {
     let groups = groups_of(group_of_lane) as usize;
-    let mut chosen: Vec<(i32, u8, usize)> = lanes
+    let mut chosen: Vec<(i32, usize)> = lanes
         .iter()
         .enumerate()
         .filter(|(_, row)| select.holds(row.word))
-        .map(|(at, row)| {
-            let stream = facts
-                .get(row.source as usize)
-                .map_or(0, |facts| facts.stream);
-            (group_of_lane.get(at).copied().unwrap_or(0), stream, at)
-        })
+        .map(|(at, _)| (group_of_lane.get(at).copied().unwrap_or(0), at))
         .collect();
     chosen.sort_unstable();
 
     let mut by_row: Vec<(u32, u32)> = chosen
         .iter()
-        .map(|&(_, _, at)| (lanes[at].row_offset, lanes[at].rows))
+        .map(|&(_, at)| (lanes[at].row_offset, lanes[at].rows))
         .collect();
     by_row.sort_unstable();
     let origin = by_row.first().map_or(0, |(offset, _)| *offset);
@@ -120,7 +112,7 @@ pub fn pack_with_classes(
 
     let mut packed = origin;
     lane_indptr.push(packed as i32);
-    for &(_, _, at) in &chosen {
+    for &(_, at) in &chosen {
         let row = &lanes[at];
         let stated = classes.get(row.source as usize).copied().flatten();
         for j in 0..row.rows {
@@ -141,7 +133,7 @@ pub fn pack_with_classes(
         *start = bound;
         let mut count = 0u32;
         while run < chosen.len() && chosen[run].0 as usize == g {
-            count += lanes[chosen[run].2].rows;
+            count += lanes[chosen[run].1].rows;
             run += 1;
         }
         bound += count as i32;
@@ -181,12 +173,12 @@ mod tests {
 
     #[test]
     fn packing_every_case() {
-        a_joint_selection_packs_by_group_then_stream();
+        a_joint_selection_packs_by_group_then_lane();
         a_class_selection_packs_at_its_own_window();
         a_scattered_selection_is_refused();
     }
 
-    fn a_joint_selection_packs_by_group_then_stream() {
+    fn a_joint_selection_packs_by_group_then_lane() {
         let lanes = [
             row(0, TEXT, 0, 3),
             row(2, TEXT, 3, 2),
@@ -194,26 +186,14 @@ mod tests {
             row(3, IMAGE, 9, 5),
         ];
         let facts = [
-            LaneFacts {
-                stream: 0,
-                group: Some(7),
-            },
-            LaneFacts {
-                stream: 1,
-                group: Some(7),
-            },
-            LaneFacts {
-                stream: 0,
-                group: Some(9),
-            },
-            LaneFacts {
-                stream: 1,
-                group: Some(9),
-            },
+            LaneFacts { group: Some(7) },
+            LaneFacts { group: Some(7) },
+            LaneFacts { group: Some(9) },
+            LaneFacts { group: Some(9) },
         ];
         let groups = group_of_lane(&lanes, &facts);
         assert_eq!(groups, vec![0, 1, 0, 1]);
-        let packed = pack(Selection::ALL, &lanes, &facts, &groups, 14).unwrap();
+        let packed = pack(Selection::ALL, &lanes, &groups, 14).unwrap();
         assert_eq!(packed.origin, 0);
         assert_eq!(packed.rows, 14);
         assert_eq!(packed.group_indptr, vec![0, 7, 14]);
@@ -225,23 +205,14 @@ mod tests {
     fn a_class_selection_packs_at_its_own_window() {
         let lanes = [row(0, TEXT, 0, 3), row(2, TEXT, 3, 2), row(1, IMAGE, 5, 4)];
         let facts = [
-            LaneFacts {
-                stream: 0,
-                group: Some(1),
-            },
-            LaneFacts {
-                stream: 1,
-                group: Some(1),
-            },
-            LaneFacts {
-                stream: 0,
-                group: None,
-            },
+            LaneFacts { group: Some(1) },
+            LaneFacts { group: Some(1) },
+            LaneFacts { group: None },
         ];
         let groups = group_of_lane(&lanes, &facts);
         assert_eq!(groups, vec![0, 1, 0]);
         let image = Selection { mask: 2, value: 2 };
-        let packed = pack(image, &lanes, &facts, &groups, 9).unwrap();
+        let packed = pack(image, &lanes, &groups, 9).unwrap();
         assert_eq!(packed.origin, 5);
         assert_eq!(packed.rows, 4);
         assert_eq!(packed.group_indptr, vec![5, 9, 9]);
@@ -254,7 +225,7 @@ mod tests {
         let facts = [LaneFacts::default(); 3];
         let groups = group_of_lane(&lanes, &facts);
         let text = Selection { mask: 1, value: 1 };
-        let fault = pack(text, &lanes, &facts, &groups, 7).unwrap_err();
+        let fault = pack(text, &lanes, &groups, 7).unwrap_err();
         assert!(matches!(fault, Fault::ScatteredSelection { .. }), "{fault}");
     }
 }

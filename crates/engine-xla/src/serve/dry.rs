@@ -8,12 +8,12 @@
 //!
 //! A class's lanes are synthetic as engine-cuda's arming lanes are
 //! (`serve/arming.rs`): a representative request of the class (its word,
-//! mask, adapter, drafts, score capture), zero tokens, fresh pages; a class
+//! mask, adapter, score capture, switches), zero tokens, fresh pages; a class
 //! that reads guest inputs is fed zero cells of each input's width, a class
 //! over the voxel axis one clip, a class that lands media one image.
 
 use engine::fire::{Mask, Masking};
-use poem_ir::{Facts, Request, Stream};
+use poem_ir::{Facts, Request};
 
 use super::{Lane, Media, PATCH_ROUTE_DROP, Seated, Shell};
 use crate::dit::{Clips, InputCell};
@@ -35,49 +35,16 @@ pub struct Probe {
 }
 
 /// Every request shape the arming pass enumerates (engine-cuda
-/// `exports::landing_requests`), by the class it lands in.
+/// `exports::landing_requests`), by the class it lands in, the plainest
+/// first.
 #[must_use]
 pub fn landing(facts: &Facts, classes: &poem_ir::ClassTable) -> Vec<Vec<Request>> {
     let mut landing = vec![Vec::new(); classes.classes.len()];
-    let readings: Vec<Option<&str>> = std::iter::once(None)
-        .chain(facts.values(poem_ir::Request::READING).map(Some))
-        .collect();
-    for reading in readings {
-        for stream in Stream::ALL {
-            for bits in 0..512u32 {
-                let request = Request::new(if bits & 1 == 0 { 1 } else { 2 }, bits & 2 != 0)
-                    .adapted(bits & 4 != 0)
-                    .drafting(bits & 8 != 0)
-                    .capturing_scores(bits & 16 != 0)
-                    .with_media(bits & 32 != 0)
-                    .denoising(bits & 64 != 0)
-                    .drafting_a_block(bits & 128 != 0)
-                    .encoding(bits & 256 != 0)
-                    .on_stream(stream);
-                let request = match reading {
-                    Some(name) => request.in_reading(name),
-                    None => request,
-                };
-                let word = facts.word(&request) & classes.mask;
-                if let Some(class) = classes.class_of(word) {
-                    landing[class].push(request);
-                }
-            }
+    for request in facts.requests() {
+        let word = facts.word(&request) & classes.mask;
+        if let Some(class) = classes.class_of(word) {
+            landing[class].push(request);
         }
-    }
-    for requests in &mut landing {
-        requests.sort_by_key(|r| {
-            u32::from(r.has_custom_mask())
-                + u32::from(r.has_adapter())
-                + u32::from(r.drafts())
-                + u32::from(r.captures_scores())
-                + u32::from(r.has_media())
-                + u32::from(r.denoise())
-                + u32::from(r.drafts_a_block())
-                + u32::from(r.flag(Request::ENCODE))
-                + u32::from(r.stream() != Stream::Text)
-                + u32::from(r.reading().is_some())
-        });
     }
     landing
 }
@@ -91,7 +58,6 @@ struct Owned {
     mask: Option<Masking>,
     adapter: Option<u32>,
     captures: bool,
-    stream: u8,
     inputs: Vec<(u32, Vec<u8>)>,
     clip: Option<([u32; 3], Vec<u8>)>,
     media: Option<OwnedMedia>,
@@ -131,7 +97,7 @@ impl Shell {
                 requests
                     .iter()
                     .find(|r| (r.query_len() != 1) == prefill && !r.has_media())
-                    .copied()
+                    .cloned()
             };
             // (request, rows per lane, lanes)
             let mut shapes: Vec<(Request, u32, u32)> = Vec::new();
@@ -142,13 +108,14 @@ impl Shell {
                 shapes.push((request, 1, 3));
             }
             if self.patch_seat.is_some()
-                && let Some(media) = requests.iter().find(|r| r.has_media()).copied()
+                && let Some(media) = requests.iter().find(|r| r.has_media()).cloned()
             {
                 shapes.push((media, prefill.max(16), 1));
             }
             for (request, rows, lanes) in shapes {
                 let before = self.device().dry_texts().len();
-                let fired = self.dry_fire(class, request, facts.word(&request), rows, lanes);
+                let word = facts.word(&request);
+                let fired = self.dry_fire(class, &request, word, rows, lanes);
                 let finite = match (&fired, self.device().is_dry()) {
                     (Ok(fired), false) => {
                         let values = fired
@@ -184,7 +151,7 @@ impl Shell {
     fn dry_fire(
         &mut self,
         class: usize,
-        request: Request,
+        request: &Request,
         word: u64,
         rows: u32,
         lanes: u32,
@@ -219,7 +186,6 @@ impl Shell {
             seated.mask = lane_owned.mask.as_ref();
             seated.adapter = lane_owned.adapter;
             seated.captures_scores = lane_owned.captures;
-            seated.stream = lane_owned.stream;
             seated.inputs = &cells[at];
             seated.kv_less = lane_owned.kv_less;
             seated.readout = lane_owned.readout.as_deref();
@@ -250,7 +216,7 @@ impl Shell {
     fn dry_lane(
         &self,
         class: usize,
-        request: Request,
+        request: &Request,
         word: u64,
         rows: u32,
         lane: u32,
@@ -313,8 +279,8 @@ impl Shell {
                 .then(|| Masking::Extent(Mask::new(vec![0, rows], u64::from(rows)))),
             adapter: self.corrected.contains(class).then_some(0),
             captures: self.capturing.contains(class),
-            readout: request.drafts_a_block().then(|| (0..rows).collect()),
-            stream: request.stream().code(),
+            readout: (self.trace().drafter.is_some() && !request.switches().is_empty())
+                .then(|| (0..rows).collect()),
             inputs,
             clip,
             media,

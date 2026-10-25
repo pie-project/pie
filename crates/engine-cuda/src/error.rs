@@ -91,16 +91,6 @@ pub enum Fault {
         have: u64,
     },
 
-    Draftless {
-        lane: u32,
-    },
-
-    DraftWord {
-        lane: u32,
-        word: u64,
-        runs_draft_arm: bool,
-    },
-
     Scoreless {
         lane: u32,
     },
@@ -294,34 +284,6 @@ impl fmt::Display for Fault {
                 "this load wants {need} bytes of device memory and the device has \
                  {have} free"
             ),
-            Self::Draftless { lane } => write!(
-                f,
-                "lane {lane} asks for the model's draft head and this load's artifact declares \
-                 none: an MTP axis is a fact the MODEL states and this plan carries \
-                 no `mtp` export for the readout to come from"
-            ),
-            Self::DraftWord {
-                lane,
-                word,
-                runs_draft_arm,
-            } => {
-                if *runs_draft_arm {
-                    write!(
-                        f,
-                        "lane {lane}'s word {word:#x} puts it in a class that runs the draft \
-                         head, and it asked for no draft, so a transformer block and a \
-                         vocabulary-wide readout would run over its rows into a column nobody \
-                         collects"
-                    )
-                } else {
-                    write!(
-                        f,
-                        "lane {lane} asks for a draft and its word {word:#x} puts it in a class \
-                         outside the draft window, so no draft would be computed and the empty \
-                         readout would be indistinguishable from a draft of zeros"
-                    )
-                }
-            }
             Self::Scoreless { lane } => write!(
                 f,
                 "lane {lane} asks to capture its attention mass and this load's artifact \

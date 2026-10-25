@@ -9,7 +9,7 @@ use crate::store::kv::{self, Seat};
 use crate::window::Windows;
 
 use super::{
-    Enqueued, FireCost, MROPE_COORDS, Media, MergeLand, PATCH_ROUTE_DROP, InputFeedPlan, Prepared,
+    Enqueued, FireCost, InputFeedPlan, MROPE_COORDS, Media, MergeLand, PATCH_ROUTE_DROP, Prepared,
     RsFire, Settled, Shell, StepView, VoxelFeedPlan,
 };
 
@@ -485,7 +485,6 @@ impl FrameShell for Shell {
         let lane_facts: Vec<poem_exec::fire::LaneFacts> = lanes
             .iter()
             .map(|seated| poem_exec::fire::LaneFacts {
-                stream: seated.stream,
                 group: seated.group,
             })
             .collect();
@@ -503,7 +502,6 @@ impl FrameShell for Shell {
                 let packed = poem_exec::fire::pack_with_classes(
                     select,
                     composition.lanes(),
-                    &lane_facts,
                     &groups,
                     composition.rows(),
                     &lane_classes,
@@ -996,22 +994,6 @@ impl FrameShell for Shell {
                     lane: row.source,
                     word: lane.word,
                     runs_correction,
-                });
-            }
-            let runs_draft_arm = self
-                .exports
-                .mtp
-                .as_ref()
-                .is_some_and(|mtp| mtp.classes.contains(row.class as usize));
-            if seated.drafts && self.exports.mtp.is_none() {
-                return Err(Fault::Draftless { lane: row.source });
-            }
-            let block_drafter = self.trace.drafter.is_some();
-            if seated.drafts != runs_draft_arm && !block_drafter {
-                return Err(Fault::DraftWord {
-                    lane: row.source,
-                    word: lane.word,
-                    runs_draft_arm,
                 });
             }
             let runs_capture_arm = self.exports.capturing.contains(row.class as usize);

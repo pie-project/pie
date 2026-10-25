@@ -515,6 +515,7 @@ impl Engine for Vulkan {
             adapter_attachments: false,
             facts: shell.trace().facts.clone(),
             inputs: shell.inputs(),
+            classes: shell.classes(),
         };
 
         self.shell = Some(shell);
@@ -1235,7 +1236,6 @@ impl Vulkan {
                     #[cfg(not(feature = "vulkan"))]
                     feed: None,
 
-                    stream: lane.stream,
                     group: lane.group,
                     inputs: &input_cells[at],
                 })

@@ -24,6 +24,12 @@ impl Shell {
         self.feeds.decls(&self.trace, &self.compiled)
     }
 
+    /// This load's classes and what each runs.
+    #[must_use]
+    pub fn classes(&self) -> poem_ir::LaneClasses {
+        poem_exec::feeds::lane_classes(&self.trace, &self.compiled)
+    }
+
     /// The regions whose attention stages at a prefill's width, and the
     /// width (`crate::window::Staging`).
     pub(crate) fn staging(&self) -> crate::window::Staging<'_> {

@@ -2,6 +2,7 @@ use poem_compiler::CompiledModel;
 use poem_ir::{Operands, Trace, ValueId};
 
 use crate::error::{Fault, Result};
+use poem_exec::feeds::{classes_running, writer_classes};
 
 pub(crate) const OUT_SEAM: &str = poem_compiler::EXPORT_SEAMS[0];
 pub(crate) const MTP_SEAM: &str = poem_compiler::EXPORT_SEAMS[1];
@@ -215,39 +216,6 @@ impl Exports {
     }
 }
 
-fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> poem_ir::ClassSet {
-    if let Some(poem_ir::Def::Merge(arms)) =
-        trace.values.get(value.0 as usize).map(|decl| &decl.def)
-    {
-        let mut classes = poem_ir::ClassSet::default();
-        for (arm, _) in arms {
-            for class in writer_classes(trace, compiled, *arm).iter() {
-                classes.insert(class);
-            }
-        }
-        return classes;
-    }
-    let mut outputs: Vec<ValueId> = Vec::new();
-    let mut writers: Vec<u32> = Vec::new();
-    for (at, node) in trace.nodes.iter().enumerate() {
-        outputs.clear();
-        node.op.outputs(&mut outputs);
-        if outputs.contains(&value) {
-            writers.push(u32::try_from(at).unwrap_or(u32::MAX));
-        }
-    }
-    let mut classes = poem_ir::ClassSet::default();
-    for region in compiled.template() {
-        if !region.nodes.clone().any(|node| writers.contains(&node)) {
-            continue;
-        }
-        for class in region.mask.iter() {
-            classes.insert(class);
-        }
-    }
-    classes
-}
-
 #[must_use]
 pub(crate) fn masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
     classes_running(trace, compiled, |op| {
@@ -330,57 +298,21 @@ pub(crate) fn media_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir:
     })
 }
 
+/// Each class's requests, the plainest first: every request a lane can be
+/// stamped with, by the class its word lands in.
 #[must_use]
 pub(crate) fn landing_requests(
     facts: &poem_ir::Facts,
     classes: &poem_ir::ClassTable,
 ) -> Vec<Vec<poem_ir::Request>> {
     let mut landing = vec![Vec::new(); classes.classes.len()];
-    let readings: Vec<Option<&str>> = std::iter::once(None)
-        .chain(facts.values(poem_ir::Request::READING).map(Some))
-        .collect();
-    for reading in readings {
-        for stream in poem_ir::Stream::ALL {
-            for bits in 0..512u32 {
-                let request =
-                    poem_ir::Request::new(if bits & 1 == 0 { 1 } else { 2 }, bits & 2 != 0)
-                        .adapted(bits & 4 != 0)
-                        .drafting(bits & 8 != 0)
-                        .capturing_scores(bits & 16 != 0)
-                        .with_media(bits & 32 != 0)
-                        .denoising(bits & 64 != 0)
-                        .drafting_a_block(bits & 128 != 0)
-                        .encoding(bits & 256 != 0)
-                        .on_stream(stream);
-                let request = match reading {
-                    Some(name) => request.in_reading(name),
-                    None => request,
-                };
-                let word = facts.word(&request) & classes.mask;
-                if let Some(class) = classes.class_of(word) {
-                    landing[class].push(request);
-                }
-            }
+    for request in facts.requests() {
+        let word = facts.word(&request) & classes.mask;
+        if let Some(class) = classes.class_of(word) {
+            landing[class].push(request);
         }
     }
-    for requests in &mut landing {
-        requests.sort_by_key(request_flags);
-    }
     landing
-}
-
-fn request_flags(request: &poem_ir::Request) -> u32 {
-    u32::from(request.query_len() != 1)
-        + u32::from(request.has_custom_mask())
-        + u32::from(request.has_adapter())
-        + u32::from(request.drafts())
-        + u32::from(request.captures_scores())
-        + u32::from(request.has_media())
-        + u32::from(request.denoise())
-        + u32::from(request.drafts_a_block())
-        + u32::from(request.flag(poem_ir::Request::ENCODE))
-        + u32::from(request.stream() != poem_ir::Stream::Text)
-        + u32::from(request.reading().is_some())
 }
 
 #[must_use]
@@ -389,11 +321,7 @@ pub(crate) fn plain_of(landing: &[Vec<poem_ir::Request>]) -> poem_ir::ClassSet {
         landing
             .iter()
             .enumerate()
-            .filter(|(_, requests)| {
-                requests
-                    .iter()
-                    .any(|request| request_flags(request) == u32::from(request.query_len() != 1))
-            })
+            .filter(|(_, requests)| requests.iter().any(poem_ir::Request::plain))
             .map(|(class, _)| class),
     )
 }
@@ -514,28 +442,6 @@ fn lane_shifting_node(trace: &Trace, node: u32) -> bool {
             )
         )
     })
-}
-
-fn classes_running(
-    trace: &Trace,
-    compiled: &CompiledModel,
-    wanted: impl Fn(&poem_ir::Operation) -> bool,
-) -> poem_ir::ClassSet {
-    let mut classes = poem_ir::ClassSet::default();
-    for region in compiled.template() {
-        let runs = region.nodes.clone().any(|node| {
-            trace
-                .nodes
-                .get(node as usize)
-                .is_some_and(|node| wanted(&node.op))
-        });
-        if runs {
-            for class in region.mask.iter() {
-                classes.insert(class);
-            }
-        }
-    }
-    classes
 }
 
 pub(crate) use poem_exec::feeds::Feeds;
@@ -737,16 +643,20 @@ mod tests {
     }
 
     #[test]
-    fn every_flag_a_request_carries_lands_in_its_class() {
-        let flags = poem_ir::Request::FLAGS;
-        let facts = poem_ir::Facts {
-            table: flags
-                .iter()
-                .map(|name| poem_ir::Fact::Flag((*name).to_string()))
-                .collect(),
-        };
+    fn every_switch_a_request_carries_lands_in_its_class() {
+        let mut facts = poem_ir::Facts::default();
+        facts.declare("mode", &["plain", "wide"]).unwrap();
+        for builtin in [
+            poem_ir::Builtin::Drafts,
+            poem_ir::Builtin::Scores,
+            poem_ir::Builtin::Encode,
+        ] {
+            let _ = facts.builtin(builtin);
+        }
+        let _ = facts.switch("mode", "wide");
+        let bits = facts.table.len();
         let classes = poem_ir::ClassTable {
-            classes: (0..flags.len())
+            classes: (0..bits)
                 .map(|bit| poem_ir::Class {
                     words: vec![1 << bit],
                     live: Vec::new(),
@@ -755,14 +665,16 @@ mod tests {
             node_mask: Vec::new(),
             merges: Vec::new(),
             merge_arm: Vec::new(),
-            mask: (1 << flags.len()) - 1,
+            mask: (1 << bits) - 1,
             dead: Vec::new(),
         };
         let landing = landing_requests(&facts, &classes);
-        for (class, name) in flags.iter().enumerate() {
+        for (class, requests) in landing.iter().enumerate() {
             assert!(
-                landing[class].iter().any(|request| request.flag(name)),
-                "no request with `{name}` set lands in its class"
+                requests
+                    .iter()
+                    .any(|request| facts.word(request) == 1 << class),
+                "no request lands in class {class}"
             );
         }
     }

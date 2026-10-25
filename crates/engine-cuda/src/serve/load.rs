@@ -535,10 +535,9 @@ impl Shell {
             crate::store::window_of(&boot.trace)?,
             boot.budget.max_tokens,
         );
-        let decode_dense = landing_requests(&boot.trace.facts, &compiled.classes)
-            .iter()
-            .flatten()
-            .any(poem_ir::Request::denoise);
+        // A class attending both ways runs its dense planes over a whole
+        // canvas, decoded once at load.
+        let decode_dense = !crate::exports::wide_classes(&boot.trace, &compiled).is_empty();
         let decoded_dense = if decode_dense {
             crate::weights::decoded_dense_bytes(&boot.trace)
         } else {
@@ -673,7 +672,7 @@ impl Shell {
         let feeds = Feeds::of(&boot.trace, &compiled);
         // A wide body is captured from representative lanes and keyed by the
         // whole wide list, so only classes a synthetic lane can stand in for
-        // join it: text-stream, non-denoising, port-free.
+        // join it: every switch at its default, input-free.
         let tiers = crate::record::Tiers {
             plain: plain_of(&landing),
             wide: landing
@@ -681,11 +680,7 @@ impl Shell {
                 .enumerate()
                 .filter(|(class, requests)| {
                     !requests.is_empty()
-                        && requests.iter().all(|request| {
-                            !request.denoise()
-                                && request.stream() == poem_ir::Stream::Text
-                                && request.reading().is_none()
-                        })
+                        && requests.iter().all(|request| request.switches().is_empty())
                         && !feeds
                             .inputs
                             .iter()

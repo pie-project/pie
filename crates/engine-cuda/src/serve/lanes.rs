@@ -1,6 +1,4 @@
-use engine::fire::{
-    AttnClasses, Boundary, InputFeed, Masking, RsReset, RsSnapshot, RsVerb,
-};
+use engine::fire::{AttnClasses, Boundary, InputFeed, Masking, RsReset, RsSnapshot, RsVerb};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Lane<'a> {
@@ -23,14 +21,12 @@ pub struct Seated<'a> {
     pub window_copies: &'a [(u32, u32)],
     pub mask: Option<&'a Masking>,
     pub adapter: Option<u32>,
-    pub drafts: bool,
     pub captures_scores: bool,
     pub rs: RsVerb,
     pub rs_reset: RsReset,
     pub rs_slot: Option<u32>,
     pub rs_snapshots: &'a [RsSnapshot],
     pub readout: Option<&'a [u32]>,
-    pub stream: u8,
     pub group: Option<u32>,
     pub peer: Option<u32>,
     pub inputs: &'a [InputFeed],
@@ -53,14 +49,12 @@ impl<'a> Seated<'a> {
             window_copies: &[],
             mask: None,
             adapter: None,
-            drafts: false,
             captures_scores: false,
             rs: RsVerb::Fold,
             rs_reset: RsReset::Inferred,
             rs_slot: None,
             rs_snapshots: &[],
             readout: None,
-            stream: 0,
             group: None,
             peer: None,
             inputs: &[],
@@ -82,14 +76,6 @@ impl<'a> Seated<'a> {
     pub fn adapted(lane: Lane<'a>, id: u32) -> Seated<'a> {
         Seated {
             adapter: Some(id),
-            ..Seated::of(lane)
-        }
-    }
-
-    #[must_use]
-    pub fn drafting(lane: Lane<'a>) -> Seated<'a> {
-        Seated {
-            drafts: true,
             ..Seated::of(lane)
         }
     }

@@ -8,13 +8,14 @@ use crate::common_vae;
 use common_vae::{Score, artifact, bf16_bytes, boxed, deploy, f32s, golden, score, shapes};
 use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Lane, Shell};
-use poem::{Platform, Request, Stream, Trace};
+use poem::{Platform, Request, Trace};
 
 /// The VAE's encode readings alone, by the package's own functions.
 const VAE_ONLY: &str = r#"
 def forward(m, inputs):
-    inputs.reading("vae.encode.head", lambda rows: vae_encode(rows, m.vae.enc, True))
-    return inputs.reading("vae.encode", lambda rows: vae_encode(rows, m.vae.enc, False))
+    switch("reading", ["vae.encode.head", "vae.encode"])
+    vae_encode(inputs.on(switch_is("reading", "vae.encode.head")), m.vae.enc, True)
+    return vae_encode(inputs.on(switch_is("reading", "vae.encode")), m.vae.enc, False)
 "#;
 
 fn vae_only() -> Trace {
@@ -45,8 +46,8 @@ impl Encoder {
             slot: 0,
             word: self.shell.trace().facts.word(
                 &Request::new(1, false)
-                    .on_stream(Stream::Video)
-                    .in_reading(reading),
+                    .switched("stream", "video")
+                    .switched("reading", reading),
             ),
             tokens: &tokens,
         })];

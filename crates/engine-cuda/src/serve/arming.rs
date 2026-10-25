@@ -50,14 +50,12 @@ struct Synthetic {
     tokens: Vec<u32>,
     mask: Option<Masking>,
     adapter: Option<u32>,
-    drafts: bool,
     captures: bool,
     slot: u32,
     pages: Vec<u32>,
     window: Vec<u32>,
     held: Option<u32>,
     media: Option<SyntheticMedia>,
-    stream: u8,
 }
 
 #[derive(Clone)]
@@ -410,14 +408,12 @@ impl Shell {
                 let wants_media = media.get(at).is_some_and(|(images, _)| *images > 0);
                 let request = self.representative(class, rows, wants_media);
                 Synthetic {
-                    stream: request.stream().code(),
                     word: self.trace.facts.word(&request),
                     tokens: vec![0u32; rows as usize],
                     mask: request
                         .has_custom_mask()
                         .then(|| Masking::Extent(Mask::new(vec![0, rows], u64::from(rows)))),
                     adapter: request.has_adapter().then_some(0),
-                    drafts: request.drafts(),
                     captures: request.captures_scores(),
                     slot: (at as u32) % slots,
                     window: Vec::new(),
@@ -494,7 +490,7 @@ impl Shell {
                     .find(|request| request.has_media() == wants_media)
             })
             .or_else(|| landing.first())
-            .copied()
+            .cloned()
             .unwrap_or_else(|| {
                 panic!("the arming pass enumerated class {class}, which no request lands in")
             })
@@ -527,14 +523,12 @@ impl Shell {
                 window_copies: &[],
                 mask: lane.mask.as_ref(),
                 adapter: lane.adapter,
-                drafts: lane.drafts,
                 captures_scores: lane.captures,
                 readout: None,
                 rs: RsVerb::Fold,
                 rs_reset: RsReset::Inferred,
                 rs_slot: None,
                 rs_snapshots: &[],
-                stream: lane.stream,
                 group: None,
                 peer: None,
                 inputs: &[],

@@ -158,7 +158,6 @@ pub struct Lane<'a> {
 #[derive(Debug, Clone, Copy)]
 pub struct Seated<'a> {
     pub lane: Lane<'a>,
-    pub stream: u8,
     pub group: Option<u32>,
     pub inputs: &'a [engine::fire::InputFeed],
     pub pages: &'a [u32],
@@ -183,7 +182,6 @@ impl<'a> Seated<'a> {
         const FOLD: engine::fire::RsVerb = engine::fire::RsVerb::Fold;
         Seated {
             lane,
-            stream: 0,
             group: None,
             inputs: &[],
             pages: &[],
@@ -1335,6 +1333,12 @@ impl Shell {
     #[must_use]
     pub fn inputs(&self) -> Vec<poem_ir::InputDecl> {
         self.feeds.decls(&self.trace, &self.compiled)
+    }
+
+    /// This load's classes and what each runs.
+    #[must_use]
+    pub fn classes(&self) -> poem_ir::LaneClasses {
+        poem_exec::feeds::lane_classes(&self.trace, &self.compiled)
     }
 
     #[must_use]
@@ -3484,7 +3488,6 @@ impl Shell {
             let facts: Vec<poem_exec::fire::LaneFacts> = lanes
                 .iter()
                 .map(|seated| poem_exec::fire::LaneFacts {
-                    stream: seated.stream,
                     group: seated.group,
                 })
                 .collect();
@@ -3492,14 +3495,8 @@ impl Shell {
             let mut packings = Vec::with_capacity(self.feeds.selections.len());
             for &select in &self.feeds.selections {
                 packings.push(
-                    poem_exec::fire::pack(
-                        select,
-                        composition.lanes(),
-                        &facts,
-                        &group_of_lane,
-                        rows,
-                    )
-                    .map_err(|fault| Fault::from(poem_exec::Error::Fire(fault)))?,
+                    poem_exec::fire::pack(select, composition.lanes(), &group_of_lane, rows)
+                        .map_err(|fault| Fault::from(poem_exec::Error::Fire(fault)))?,
                 );
             }
             (group_of_lane, packings)

@@ -109,7 +109,6 @@ pub struct Dit {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Feed<'a> {
     pub slot: u32,
-    pub stream: u8,
     pub group: Option<u32>,
     pub inputs: &'a [InputCell<'a>],
     pub clips: Option<Clips<'a>>,
@@ -596,16 +595,11 @@ impl Dit {
                 .max()
                 .unwrap_or(0))
                 .map(|source| {
-                    feeds.get(source).map_or(
-                        LaneFacts {
-                            stream: 0,
-                            group: None,
-                        },
-                        |feed| LaneFacts {
-                            stream: feed.stream,
+                    feeds
+                        .get(source)
+                        .map_or(LaneFacts { group: None }, |feed| LaneFacts {
                             group: feed.group,
-                        },
-                    )
+                        })
                 })
                 .collect();
             let mut groups = poem_exec::fire::group_of_lane(lanes, &facts);
@@ -624,15 +618,9 @@ impl Dit {
                 key.push_str(&format!("ct{count};"));
             }
             for &select in &self.feeds.selections {
-                let packed = poem_exec::fire::pack_with_classes(
-                    select,
-                    lanes,
-                    &facts,
-                    &groups,
-                    rows,
-                    &lane_classes,
-                )
-                .map_err(poem_exec::Error::Fire)?;
+                let packed =
+                    poem_exec::fire::pack_with_classes(select, lanes, &groups, rows, &lane_classes)
+                        .map_err(poem_exec::Error::Fire)?;
                 let lane_table = |table: &[i32]| -> Vec<i32> {
                     let mut out = table.to_vec();
                     let last = table.last().copied().unwrap_or(0);

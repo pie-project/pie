@@ -8,7 +8,6 @@ use common_dit::{
     HostRequest, Lcg, Rig, WIDTH, Weights, assert_close, attach, bf, frame, lane, reference,
 };
 use engine::Engine;
-use engine::fire::LaneStream;
 
 #[test]
 fn the_plan_loads_at_the_ceiling_and_fires_below_the_first_rung() {
@@ -76,8 +75,8 @@ fn the_plan_loads_at_the_ceiling_and_fires_below_the_first_rung() {
         .engine
         .submit(&frame(
             vec![
-                lane(&rig, 0, &text, LaneStream::Text, 0),
-                lane(&rig, 1, &image, LaneStream::Image, 0),
+                lane(&rig, 0, &text, "text", 0),
+                lane(&rig, 1, &image, "image", 0),
             ],
             vec![attach(0, &text), attach(1, &image)],
         ))

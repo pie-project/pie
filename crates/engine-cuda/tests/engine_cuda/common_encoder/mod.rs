@@ -8,9 +8,7 @@ use checkpoint::file::emit::{self, Object};
 use checkpoint::serving::Stamp;
 use engine::Engine;
 use engine::channel::ChannelRegistration;
-use engine::fire::{
-    Attachment, Boundary, FrameSubmission, InputFeed, Lane, LaneStream, Readout, Step,
-};
+use engine::fire::{Attachment, Boundary, FrameSubmission, InputFeed, Lane, Readout, Step};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Loaded, Residency};
 use engine::program::{InstanceBinding, ProgramRegistration};
 use engine::{ChannelId, InstanceId, ProgramId};
@@ -439,9 +437,7 @@ pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, group: u32) -> Lane {
         word: rig.facts.word(&Request::new(handles.rows, false)),
         tokens: vec![0; handles.rows as usize],
         readout: Readout::Rows((0..handles.rows).collect()),
-        stream: LaneStream::Text,
         group: Some(group),
-        reading: 0,
         // `latents`, the plan's one input.
         inputs: vec![InputFeed {
             id: 0,

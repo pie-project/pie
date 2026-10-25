@@ -2,15 +2,15 @@
 
 use crate::common_dit::{Lcg, NAME, Rig, WIDTH, Weights, assert_close, attach, bf, frame, lane};
 use engine::Engine;
-use engine::fire::{LaneStream, ReadoutSeam};
+use engine::fire::ReadoutSeam;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
 use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Stream, Trace, Value, Weight,
-    ops, seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Trace, Value, Weight, ops,
+    seam, trace_hybrid,
 };
 use poem_ir::InputAxis;
 
@@ -26,9 +26,13 @@ impl ForwardHybrid for TwoReadings {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
+        inputs.recorder().declare_switch(
+            "stream",
+            &["text", "image", "video", "audio", "context", "reference"],
+        );
         let (txt, img) = (
-            inputs.on(fact::stream(Stream::Text)),
-            inputs.on(!fact::stream(Stream::Text)),
+            inputs.on(fact::switch_is("stream", "text")),
+            inputs.on(!fact::switch_is("stream", "text")),
         );
         let x_txt = txt.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
         let enc = Weight::sym("enc", [u64::from(HIDDEN), u64::from(WIDTH)], Dtype::Bf16);
@@ -181,8 +185,8 @@ fn each_lane_reads_back_its_own_arms_seam() {
     rig.publish(i.instance, 0, &image);
     rig.publish(i.instance, 1, &[timestep]);
 
-    let text_lane = lane(&rig, 0, &t, LaneStream::Text, 0);
-    let image_lane = lane(&rig, 1, &i, LaneStream::Image, 1);
+    let text_lane = lane(&rig, 0, &t, "text", 0);
+    let image_lane = lane(&rig, 1, &i, "image", 1);
     let mut ticket = rig
         .engine
         .submit(&frame(
