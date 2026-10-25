@@ -2103,7 +2103,11 @@ impl Shell {
         draft: Option<(u64, u64)>,
         drafts: Option<(u64, u64)>,
     ) -> Result<Vec<engine::InstanceId>> {
-        if prepared.attachments.is_empty() {
+        if !prepared
+            .attachments
+            .iter()
+            .any(|a| a.at == Boundary::Epilogue)
+        {
             return Ok(Vec::new());
         }
 
@@ -2390,6 +2394,28 @@ impl Shell {
         Ok(())
     }
 
+    /// Fires the programs attached at `Boundary::Prologue`, each to its
+    /// commit, before the step is staged: the descriptor reads and the input
+    /// feeds then see the cells a prologue put, as the forward's inputs.
+    fn fire_prologues(&mut self, attachments: &[Attached]) -> Result<()> {
+        for attached in attachments.iter().filter(|a| a.at == Boundary::Prologue) {
+            match self.programs.fire(&self.device, attached.instance)? {
+                crate::Fired::Committed => {}
+                other => {
+                    return Err(Fault::program(
+                        "serve::prologue",
+                        format!(
+                            "instance {}'s prologue did not commit ({other:?}), so the \
+                             forward has no cells to read",
+                            attached.instance
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn admit_attachments(&mut self, lanes: &[Seated<'_>], attachments: &[Attached]) -> Result<()> {
         if attachments.is_empty() {
             return Ok(());
@@ -2432,19 +2458,6 @@ impl Shell {
                          `{OUT_SEAM}` seam — its readout is the {:?} one, which a sampler \
                          cannot read as a vocabulary",
                         attached.instance, self.readout_seam
-                    ),
-                ));
-            }
-            if attached.at != Boundary::Epilogue {
-                return Err(Fault::program(
-                    "serve::prepare",
-                    format!(
-                        "attachment {index} runs instance {} at {:?}, and this plane \
-                         serves only `Boundary::Epilogue`: a prologue's channel writes \
-                         are inputs to the forward, and this shell stages every fire \
-                         input on the host before it opens a command buffer, so there \
-                         is no point in the step at which one could be encoded",
-                        attached.instance, attached.at
                     ),
                 ));
             }
@@ -4324,6 +4337,7 @@ impl engine::frame::Shell for Shell {
     {
         let _ = prev;
         self.admit_attachments(step.lanes, step.attachments)?;
+        self.fire_prologues(step.attachments)?;
         self.stage(step)
     }
 
@@ -4440,7 +4454,11 @@ impl engine::frame::Shell for Shell {
 
         let mut draft = None;
         let mut drafts = None;
-        if !prepared.attachments.is_empty() {
+        if prepared
+            .attachments
+            .iter()
+            .any(|a| a.at == Boundary::Epilogue)
+        {
             let arena = crate::device::alloc::slab_id(self.arena.store().slab());
             if crate::device::alloc::slab_id(&source) != arena {
                 return Err(Fault::Unbound {
