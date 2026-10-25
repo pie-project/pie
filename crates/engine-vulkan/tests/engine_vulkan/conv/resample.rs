@@ -199,9 +199,9 @@ fn the_resamplers_answer_the_reference() {
                         sr::upsample_nearest(c, x, grid, r, keep_first, o_grid, y)
                     }
                     Op::Shuffle { trim } => {
-                        sr::pixel_shuffle(c, x, grid, r, trim as u32, o_grid, y)
+                        sr::pixel_shuffle(c, x, grid, r, trim as u32, o_grid, y, [0, 0])
                     }
-                    Op::Unshuffle => sr::pixel_unshuffle(c, x, grid, r, o_grid, y),
+                    Op::Unshuffle => sr::pixel_unshuffle(c, x, grid, r, o_grid, y, [0, 0]),
                     Op::AvgDown { group } => sr::avg_down(c, x, grid, r, group as u32, o_grid, y),
                 })
             },

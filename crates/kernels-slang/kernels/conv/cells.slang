@@ -17,6 +17,10 @@ struct Params {
     uint axis;
     uint width;
     uint rows;
+    // The row `tgrid` addresses `y`'s row 0 at: a window of a segmented
+    // fire starts `y` at its own rows while the fire's grid holds fire-wide
+    // ones.
+    uint base;
 };
 PIE_PARAMS(3, Params, params);
 #else
@@ -46,11 +50,12 @@ void main(uint3 gid : SV_DispatchThreadID) {
         y[at + c] = 0.0;
     }
     Clip g;
-    if (clip_of(tgrid, int(params.clips), int(row), g) < 0) {
+    int fire_row = int(row) + int(params.base);
+    if (clip_of(tgrid, int(params.clips), fire_row, g) < 0) {
         y[at + params.axis] = float(positions[row]);
         return;
     }
-    Voxel v = unravel(g, int(row) - g.off);
+    Voxel v = unravel(g, fire_row - g.off);
     y[at] = float(v.t);
     y[at + 1u] = float(v.h);
     y[at + 2u] = float(v.w);

@@ -12,13 +12,16 @@ use crate::tensor::Tensor;
 const RESAMPLE: &str = "conv/resample.slang";
 
 /// Fire `entry` over `y`'s rows, a pair of its columns a lane; `scalars`
-/// follow the four planes, the row count and span after them.
+/// follow the four planes, the row count and span after them, then `bases`:
+/// the rows `grid` and `o_grid` address `x`'s and `y`'s row 0 at, nonzero in
+/// a window of a segmented fire whose grids hold fire-wide rows.
 fn fire(
     ctx: &Ctx<'_>,
     op: &'static str,
     entry: &'static str,
     [x, grid, o_grid, y]: [Tensor; 4],
     scalars: &[ArgValue],
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     if y.rows == 0 {
         return Ok(());
@@ -32,6 +35,8 @@ fn fire(
     args.extend_from_slice(scalars);
     args.push(y.rows.arg());
     args.push(span.arg());
+    args.push(bases[0].arg());
+    args.push(bases[1].arg());
     ctx.fire(Fire::at(RESAMPLE, entry).apply(shape), &args)
 }
 
@@ -74,11 +79,12 @@ pub fn upsample_nearest(
             factor[2].arg(),
             u32::from(keep_first_frame).arg(),
         ],
+        [0, 0],
     )
 }
 
 /// Channel blocks of `r[0] r[1] r[2]` spread into time and space, the
-/// first `trim_t` frames dropped.
+/// first `trim_t` frames dropped. `bases`: see [`fire`].
 pub fn pixel_shuffle(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -87,6 +93,7 @@ pub fn pixel_shuffle(
     trim_t: u32,
     o_grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.pixel_shuffle";
     let entry = dtype_dispatch!(OP, y.dtype, {
@@ -122,10 +129,12 @@ pub fn pixel_shuffle(
             r[2].arg(),
             trim_t.arg(),
         ],
+        bases,
     )
 }
 
-/// Time and space folded into channel blocks of `r[0] r[1] r[2]`.
+/// Time and space folded into channel blocks of `r[0] r[1] r[2]`; `bases`
+/// as [`pixel_shuffle`]'s.
 pub fn pixel_unshuffle(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -133,6 +142,7 @@ pub fn pixel_unshuffle(
     r: [u32; 3],
     o_grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.pixel_unshuffle";
     let entry = dtype_dispatch!(OP, y.dtype, {
@@ -167,6 +177,7 @@ pub fn pixel_unshuffle(
             r[1].arg(),
             r[2].arg(),
         ],
+        bases,
     )
 }
 
@@ -218,5 +229,6 @@ pub fn avg_down(
             factor[2].arg(),
             group.arg(),
         ],
+        [0, 0],
     )
 }
