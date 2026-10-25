@@ -211,10 +211,6 @@ async fn run_one(
 
     let prompt_i32: Vec<i32> = prompt_vec.iter().map(|&t| t as i32).collect();
 
-    // Recurrent state is kept where the prompt (one message) ends, as the
-    // compat routes keep it where messages end.
-    let checkpoints = [n];
-
     let toks_p = Channel::from(&prompt_i32[..]).named("toks_p");
     let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
     // Decode fires: the prefill sample already spends one of the
@@ -247,7 +243,6 @@ async fn run_one(
     fwd_p
         .state(&[&ws], StateGeometry::folding())
         .context("bind prefill state")?;
-    fwd_p.checkpoints(&checkpoints)?;
     fwd_p.epilogue(move || {
         let t = reshape(
             sample(
