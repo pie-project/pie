@@ -1116,9 +1116,26 @@ impl<'r, 't> Walk<'r, 't> {
             }),
             Cut::Beside(axis, origins) => {
                 let extent = *shape.get(*axis as usize)?;
-                let (segments, mut heads) = match origins.iter().collect::<Vec<_>>()[..] {
-                    [o] if o.hi - o.lo == extent => self.segments(o.param, o.lo, o.hi),
-                    _ => (vec![extent], Vec::new()),
+                // Read beside a share as wide as it, the weight holds that
+                // share's segments: one run's, or the runs' a concat lays
+                // side by side (in the order their weights are stated).
+                let whole: u64 = origins.iter().map(|o| o.hi - o.lo).sum();
+                let (segments, mut heads) = if whole == extent {
+                    let runs: Vec<(Vec<u64>, Vec<u64>)> = origins
+                        .iter()
+                        .map(|o| self.segments(o.param, o.lo, o.hi))
+                        .collect();
+                    let headed = runs.iter().all(|(s, h)| h.len() == s.len());
+                    (
+                        runs.iter().flat_map(|(s, _)| s.iter().copied()).collect(),
+                        if headed {
+                            runs.iter().flat_map(|(_, h)| h.iter().copied()).collect()
+                        } else {
+                            Vec::new()
+                        },
+                    )
+                } else {
+                    (vec![extent], Vec::new())
                 };
                 if let (Some(groups), [_]) = (self.grouped.get(&p), &segments[..]) {
                     heads = vec![*groups];
