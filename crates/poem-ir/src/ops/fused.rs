@@ -62,6 +62,16 @@ pub enum NormKind {
 
 /// Ops only the compiler forms, from the primitive ones a model writes; each
 /// is a kernel some backend ships.
+/// How a [`Fused::Region`] reads one of its inputs: row `r` reads row
+/// `ids[r]` of it where `by` names the ids (an index into the op's inputs,
+/// an i32 a row), else its own; and its columns from `from` on (one half of
+/// a packed modulation, one layer's row of a stack).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegionRead {
+    pub by: Option<u32>,
+    pub from: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Op)]
 #[op(group = "fused")]
 pub enum Fused {
@@ -717,14 +727,20 @@ pub enum Fused {
     /// A chain of elementwise and row ops the compiler generates one kernel
     /// for (poem-compiler's `fuse::chain`): `ins[k]` is the kernel's
     /// parameter `k` and `outs[k]` its result `k`, each a row of `width` a
-    /// row (an input one row every row reads, a weight's). `key` is the
-    /// region's own key (kernels-ir's `Region::key`, a hash of what it
-    /// computes, not of any backend's source), the one it is held under in
-    /// the compiled model; each backend prints its kernel from the region.
-    /// No output lands over an input: each has a plane of its own.
+    /// row (an input one row every row reads, a weight's; one element a
+    /// row, a position), or a row of whole `width`-wide parts (a row of
+    /// heads, the kernel's row one head). `reads[k]`, where given, says how
+    /// `ins[k]` is read otherwise than as its own rows: the row an id picks,
+    /// columns on from an offset. `key` is the region's own key (kernels-ir's
+    /// `Region::key`, a hash of what it computes, not of any backend's
+    /// source), the one it is held under in the compiled model; each backend
+    /// prints its kernel from the region. No output lands over an input:
+    /// each has a plane of its own.
     Region {
         #[input]
         ins: Vec<ValueId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reads: Vec<RegionRead>,
         width: u32,
         key: u64,
         #[output]
@@ -883,6 +899,7 @@ mod tests {
     fn a_region_lands_no_result_over_its_parameters() {
         let op = Fused::Region {
             ins: vec![v(1), v(2), v(3)],
+            reads: Vec::new(),
             width: 64,
             key: 0x5eed,
             outs: vec![v(4), v(5)],
