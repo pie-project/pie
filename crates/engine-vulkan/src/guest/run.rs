@@ -138,16 +138,15 @@ impl<'a> OnDevice<'a> {
             if root.source == ValueOrigin::Intrinsic
                 && (reads_readout(root.intrinsic) || root.intrinsic == Some(IntrinsicId::Pixels))
             {
-                let seat = self
-                    .offered(root.intrinsic, root.lane)
-                    .ok_or_else(|| Fault::Program {
-                        at: "guest::run",
-                        why: format!(
-                            "this pass reads {:?} of its lane {} and the fire offered no \
-                             readout there",
-                            root.intrinsic, root.lane
-                        ),
-                    })?;
+                let seat =
+                    self.offered(root.intrinsic, root.lane)
+                        .ok_or_else(|| Fault::Program {
+                            at: "guest::run",
+                            why: format!(
+                                "this pass reads {:?} of lane {}, which the fire read out none of",
+                                root.intrinsic, root.lane
+                            ),
+                        })?;
                 let (_, held) = self.session.span(at, local).ok_or_else(|| Fault::Program {
                     at: "guest::run",
                     why: format!("the logits root {local} is not stage {at}'s"),

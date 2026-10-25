@@ -1723,7 +1723,9 @@ impl Shell {
     fn pixel_rect(&self, p: &Prepared<'_>) -> Result<Option<(u64, u32, &PixelPlane)>> {
         let written = self.pixels.iter().find(|pixels| {
             p.slots.0[pixels.plane.0 as usize].is_some()
-                && p.classes.iter().any(|&class| pixels.classes.contains(class))
+                && p.classes
+                    .iter()
+                    .any(|&class| pixels.classes.contains(class))
         });
         let Some(pixels) = written else {
             return Ok(None);
@@ -2369,7 +2371,9 @@ impl Shell {
 
             tables.push(std::borrow::Cow::Borrowed(seated.pages));
 
-            let masking = seated.mask;
+            // A kv-less lane's mask is over its attention group's rows: the
+            // group-packed attention takes it, not the paged prefill's.
+            let masking = seated.mask.filter(|_| !seated.kv_less);
             let runs_masked_arm = self.masked.contains(row.class as usize);
             if masking.is_some() && self.masked.is_empty() {
                 return Err(Fault::Maskless { lane: row.source });
@@ -2722,6 +2726,8 @@ impl Shell {
             }
             (group_of_lane, packings)
         };
+        let group_masks =
+            self.group_masks_of(lanes, &composition, &group_of_lane, &packings, &clips_of)?;
         if composition.clips() > 0 {
             let seat = self
                 .voxel_seat
@@ -2818,6 +2824,8 @@ impl Shell {
                 }),
             },
         )?;
+        let group_masks =
+            self.inputs[arm].stage_group_masks(&self.device, &self.handles, &group_masks)?;
         windows.bind(&self.handles, bound.windows)?;
         let input_copies = self.feed_inputs(arm, &composition, lanes)?;
         let mut merge_lands: Vec<MergeLand> = Vec::new();
@@ -2890,6 +2898,7 @@ impl Shell {
         }
         let patch_seats = bound.patches;
         let bindings = FireBindings {
+            group_masks,
             tokens: bound.tokens,
             positions: bound.positions,
             readout_rows: bound.readout_rows,
@@ -3277,7 +3286,10 @@ impl engine::frame::Shell for Shell {
         Self: 'a,
     {
         let fed = self.feed(&prepared)?;
-        let key = self.recorder.records().then(|| self.record_key(&prepared));
+        // A fire's custom masks sit in a buffer that grows: a recording would
+        // keep the one it outgrew.
+        let key = (self.recorder.records() && prepared.bindings.group_masks.is_empty())
+            .then(|| self.record_key(&prepared));
 
         let replayable = key
             .and_then(|key| self.recorder.get(key))
@@ -3622,4 +3634,92 @@ fn token_refusal(lane: u32) -> Fault {
 
 fn program(at: &'static str, why: String) -> Fault {
     Fault::Program { at, why }
+}
+
+impl Shell {
+    /// The custom mask each group-packed attention of this fire applies,
+    /// out of the kv-less lanes' stated masks: none when no lane states one
+    /// (engine-cuda `serve/prepare.rs::group_masks_of`).
+    fn group_masks_of(
+        &self,
+        lanes: &[Seated<'_>],
+        composition: &Composition,
+        group_of_lane: &[i32],
+        packings: &[poem_exec::fire::Packed],
+        clips_of: &[Option<&Clips<'_>>],
+    ) -> Result<
+        Vec<(
+            poem_ir::Selection,
+            poem_ir::Selection,
+            poem_exec::fire::GroupMask,
+        )>,
+    > {
+        let stated: Vec<Option<poem_exec::fire::LaneMask>> = lanes
+            .iter()
+            .map(|seated| {
+                seated
+                    .mask
+                    .filter(|_| seated.kv_less)
+                    .map(|masking| poem_exec::fire::LaneMask {
+                        rows: masking
+                            .masks()
+                            .iter()
+                            .map(|mask| mask.admitted(0..mask.total).collect())
+                            .collect(),
+                    })
+            })
+            .collect();
+        if stated.iter().all(Option::is_none) {
+            return Ok(Vec::new());
+        }
+        if self.feeds.ragged.is_empty() {
+            return Err(program(
+                "serve::mask",
+                "a kv-less lane states an attention mask and this model packs no attention \
+                 group; the mask applies to group-packed `attention.ragged` only"
+                    .to_string(),
+            ));
+        }
+        let fire = |fault| Fault::from(poem_exec::Error::Fire(fault));
+        let patch = self.voxel_seat.and_then(|seat| seat.token_patch);
+        let mut guests = vec![poem_exec::fire::GuestRows::default(); lanes.len()];
+        for row in composition.lanes() {
+            let clips = clips_of
+                .get(row.source as usize)
+                .copied()
+                .flatten()
+                .map(|clips| clips.boxes);
+            guests[row.source as usize] =
+                poem_exec::fire::guest_rows(row, clips, patch).map_err(fire)?;
+        }
+        let masks: Vec<Option<&poem_exec::fire::LaneMask>> =
+            stated.iter().map(Option::as_ref).collect();
+        let packed = |select: poem_ir::Selection| {
+            packings
+                .iter()
+                .find(|packed| packed.select == select)
+                .ok_or_else(|| {
+                    program(
+                        "serve::mask",
+                        format!("no packing of selection {select:?} was staged for this fire"),
+                    )
+                })
+        };
+        let mut staged = Vec::new();
+        for &(q, kv) in &self.feeds.ragged {
+            if let Some(mask) = poem_exec::fire::group_mask(
+                composition.lanes(),
+                group_of_lane,
+                packed(q)?,
+                packed(kv)?,
+                &masks,
+                &guests,
+            )
+            .map_err(fire)?
+            {
+                staged.push((q, kv, mask));
+            }
+        }
+        Ok(staged)
+    }
 }
