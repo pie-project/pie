@@ -90,7 +90,6 @@ pub const ENTRIES: &[EntryInfo] = &[
     entry("elemwise.ple_gate", Reads::Rows),
     entry("elemwise.relative_bucket_bias", Reads::Nothing),
     entry("elemwise.residual_add", Reads::Rows),
-    entry("fused.residual_add_rmsnorm", Reads::Rows),
     entry("elemwise.rmsnorm", Reads::Rows),
     entry("elemwise.rmsnorm_gated", Reads::Rows),
     entry("elemwise.rmsnorm_gated_by", Reads::Rows),
