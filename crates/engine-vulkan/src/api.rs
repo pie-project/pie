@@ -9,7 +9,7 @@ use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFac
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
-    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout, Step,
+    Boundary, FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout, Step,
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
@@ -576,7 +576,7 @@ impl Engine for Vulkan {
                         step_pending.rows = Some(Vec::new());
                         return Ok((ticket, step_pending));
                     }
-                    if !step.attachments.is_empty()
+                    if epilogues(step).next().is_some()
                         && self.reads_on_device(step, &step_pending.landed)
                     {
                         // Every attachment reads its logits on the device:
@@ -588,7 +588,7 @@ impl Engine for Vulkan {
                         let shell = self.loaded_mut()?;
                         step_pending.rows = Some(shell.rows_of(&landed).map_err(fault)?);
                         shell.forget_seat(&landed);
-                    } else if !step.attachments.is_empty() {
+                    } else if epilogues(step).next().is_some() {
                         let shell = self.loaded_mut()?;
                         let rows = shell.rows_of(&step_pending.landed).map_err(fault)?;
 
@@ -873,10 +873,37 @@ impl Vulkan {
         };
         cfg!(feature = "vulkan")
             && shell.mtp_width() == 0
-            && step
-                .attachments
-                .iter()
+            && epilogues(step)
                 .all(|attachment| shell.readout_row(landed, attachment.lane).is_some())
+    }
+
+    /// Runs the programs attached at `Boundary::Prologue`, each to its
+    /// commit, before the step resolves its inputs: the forward reads the
+    /// cells a prologue put.
+    fn run_prologues(&mut self, step: &Step) -> EngineResult<()> {
+        for attachment in step
+            .attachments
+            .iter()
+            .filter(|attachment| attachment.at == Boundary::Prologue)
+        {
+            self.programs
+                .fire(
+                    attachment.instance,
+                    None,
+                    0,
+                    0,
+                    None,
+                    0,
+                    #[cfg(feature = "vulkan")]
+                    self.shell.as_ref().map(Shell::device),
+                    #[cfg(feature = "vulkan")]
+                    None,
+                    #[cfg(feature = "vulkan")]
+                    None,
+                )
+                .map_err(refusal)?;
+        }
+        Ok(())
     }
 
     fn run_attachments(
@@ -890,7 +917,7 @@ impl Vulkan {
         let Vulkan {
             shell, programs, ..
         } = self;
-        for attachment in &step.attachments {
+        for attachment in epilogues(step) {
             let readout = readouts.get(attachment.lane as usize);
             let (logits, rows, vocab) = match readout {
                 Some(lane) if lane.rows > 0 => {
@@ -961,6 +988,7 @@ impl Vulkan {
             self.sink.is_some()
                 && self.settles_asynchronously()
                 && step.attachments.len() == 1
+                && step.attachments[0].at == Boundary::Epilogue
                 && self
                     .shell
                     .as_ref()
@@ -1032,6 +1060,7 @@ impl Vulkan {
         at: engine::StepDone,
         defers: bool,
     ) -> EngineResult<(FireTicket, PendingStep)> {
+        self.run_prologues(submission)?;
         let mut staged: Vec<Vec<u8>> = Vec::new();
         if !submission.media.is_empty() {
             let Some(element) = self.loaded()?.patch_element() else {
@@ -1306,3 +1335,10 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
 // so moving the whole engine to another thread moves every handle with it;
 // Vulkan handles are not tied to the thread that made them.
 unsafe impl Send for Vulkan {}
+
+/// The attachments that run behind the forward.
+fn epilogues(step: &Step) -> impl Iterator<Item = &engine::fire::Attachment> {
+    step.attachments
+        .iter()
+        .filter(|attachment| attachment.at == Boundary::Epilogue)
+}
