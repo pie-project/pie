@@ -10,10 +10,10 @@
 //! step before is done; any other rank is idle and is not waited for, and a
 //! busy rank that misses the deadline is idle from then on. Without the
 //! wait two busy ranks a moment apart would split every step in two, each
-//! idling through the other's. The first
-//! arrival leads: it is handed every arrived frame and the step's bucket
-//! (the largest asked, which Dispatch's token count must agree on), fires
-//! the step on every rank, and posts each joined rank its result. Each rank
+//! idling through the other's. The first arrival leads: it is handed every
+//! arrived frame and the step's bucket (the largest asked, which
+//! Dispatch's token count must agree on), fires the step on every rank, and
+//! posts each joined rank its result. Each rank
 //! fires on a thread of its own, held for the group's life ([`Firing`]): a
 //! rank's fire may wait on its device, which waits on every other rank's
 //! launches.

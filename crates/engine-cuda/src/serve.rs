@@ -165,7 +165,6 @@ pub(crate) struct KvReport {
 }
 
 impl Shell {
-    /// Joins this rank to its expert-parallel group.
     /// Joins an expert-parallel group as `ep`, its dispatch and combine
     /// outputs seated on the rank's fixed buffers; refuses a trace that
     /// reads one after its peers may write it again.

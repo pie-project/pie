@@ -38,7 +38,10 @@ static WORK_QUEUES: extern "C" fn() = {
 
 /// Held by each test for its whole run. A test that fails leaves nothing
 /// behind it guards, so the next still runs.
-#[allow(clippy::disallowed_methods)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "the lock guards no state, so a test that panicked holding it left none half-written"
+)]
 pub fn alone() -> std::sync::MutexGuard<'static, ()> {
     static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     ONE.lock()

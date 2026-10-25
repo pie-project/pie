@@ -181,9 +181,7 @@ fn run(trace: &Trace, container: &Path, dir: &Path, seamed: bool) -> Vec<(Vec<f3
                     .unwrap();
                 (out.remove(0), at.elapsed().as_secs_f64() * 1e6)
             };
-            eprintln!("== seamed {seamed} rows {rows} first fire");
             let (first, _) = fire(&mut shell);
-            eprintln!("== seamed {seamed} rows {rows} first fire done");
             let mut times: Vec<f64> = (0..repeats)
                 .map(|_| {
                     let (again, us) = fire(&mut shell);

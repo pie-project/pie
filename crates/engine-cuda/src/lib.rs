@@ -246,8 +246,7 @@ mod tests {
         use poem_ir::Fused;
         let (mut wrong, mut held, mut planned, mut unplanned) =
             (Vec::new(), 0usize, 0usize, Vec::new());
-        let mut profile = poem_compiler::DeviceProfile::default();
-        profile.synth_regions = false;
+        let profile = poem_compiler::DeviceProfile::default();
         for row in poem_compiler::catalog::deployments() {
             let Ok(trace) = row.try_trace(poem_ir::Platform::Cuda) else {
                 continue;
