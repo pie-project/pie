@@ -90,7 +90,9 @@ class ForwardPass:
         """
         One working set per lane, in lane order; lanes sharing one state
         their slots. Required on a lane that reads kv (`model.lane`'s
-        `reads-kv`), refused on one that does not.
+        `reads-kv`) or a recurrent state (a causal VAE's conv caches:
+        each fire then folds one slot, and states no geometry), refused
+        on one that reads neither.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
