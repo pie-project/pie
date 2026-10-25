@@ -3932,7 +3932,12 @@ fn wire_channels_to_pipeline<C: FireContext>(
         let cres: Resource<Channel> = Resource::new_borrow(rep);
         if let Ok(ch) = ctx.resources().get_mut(&cres) {
             match &ch.fires {
+                // No pass takes or puts it, so no fire lands in it: the
+                // passes reading it may submit on pipelines of their own.
                 Some(existing) if !Arc::ptr_eq(existing, pipe_fires) => {
+                    if !ch.cell.lock().unwrap().written() {
+                        continue;
+                    }
                     return Ok(Err("pipeline: a channel is shared across pipelines \
                          (all passes binding a channel must submit on the same \
                          pipeline)"

@@ -256,6 +256,11 @@ impl ChannelCell {
         Ok(())
     }
 
+    /// Whether a pass attached to this channel takes or puts it.
+    pub fn written(&self) -> bool {
+        self.attachments.iter().any(|attachment| attachment.writes)
+    }
+
     pub fn detach(&mut self, instance_id: u64) {
         self.attachments
             .retain(|attachment| attachment.instance_id != instance_id);
