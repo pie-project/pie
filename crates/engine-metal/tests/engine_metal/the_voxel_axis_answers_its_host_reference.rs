@@ -166,6 +166,7 @@ fn voxels(extents: &[[i32; 3]]) -> usize {
 fn the_voxel_axis_answers_its_host_reference_every_case() {
     every_grid_rule_maps_the_box_its_host_twin_maps();
     the_convolution_answers_the_tap_walk();
+    the_spread_and_lone_channel_convolutions_answer_the_tap_walk();
     the_group_norm_answers_the_two_pass_reference();
     the_mid_block_attention_answers_the_plain_softmax();
     the_reshapes_land_the_reference_ordering();
@@ -293,6 +294,8 @@ fn the_convolution_answers_the_tap_walk() {
         pad_back: [0, 1, 1],
         causal_t: false,
         time_pad: conv3d::TimePad::Zero,
+        dilation: [1, 1, 1],
+        depthwise: false,
     };
     rig.fire(|s| {
         conv3d::conv3d(
@@ -340,6 +343,90 @@ fn the_convolution_answers_the_tap_walk() {
         }
     }
     within_a_bf16_ulp("conv3d", &want, &rig.read_bf16(hy, rows * C_OUT));
+}
+
+/// Causal convolutions along time, as a codec's are: taps spread two frames
+/// apart, and a depthwise one whose every channel reads only itself.
+fn the_spread_and_lone_channel_convolutions_answer_the_tap_walk() {
+    let Some(rig) = Rig::open() else {
+        eprintln!("not asked: no Metal device");
+        return;
+    };
+    const C: usize = 12;
+    const TAPS: usize = 3;
+    let clips: [[i32; 3]; 2] = [[9, 1, 1], [5, 1, 1]];
+    let grid = boxes(&clips);
+    let rows = voxels(&clips);
+    let x: Vec<f32> = (0..(rows * C) as u64)
+        .map(|at| bf16_round(unit(at)))
+        .collect();
+    for (dilation, depthwise) in [(2usize, false), (1, true), (3, true)] {
+        let per = if depthwise { 1 } else { C };
+        let w: Vec<f32> = (0..(C * TAPS * per) as u64)
+            .map(|at| bf16_round(0.2 * unit(at ^ 0x53)))
+            .collect();
+        let bias: Vec<f32> = (0..C as u64).map(|at| 0.1 * unit(at ^ 0x79)).collect();
+        let (_xb, hx) = rig.bf16(&x);
+        let (_wb, hw) = rig.bf16(&w);
+        let (_bb, hb) = rig.f32s(&bias);
+        let (_gb, hg) = rig.i32s(&grid);
+        let (_ogb, hog) = rig.i32s(&grid);
+        let (_yb, hy) = rig.empty((rows * C) as u64 * 2);
+        let conv3d = conv3d::Conv3d {
+            k: [TAPS as u32, 1, 1],
+            stride: [1, 1, 1],
+            pad: [((TAPS - 1) * dilation) as u32, 0, 0],
+            pad_back: [0, 0, 0],
+            causal_t: true,
+            time_pad: conv3d::TimePad::Zero,
+            dilation: [dilation as u32, 1, 1],
+            depthwise,
+        };
+        rig.fire(|s| {
+            conv3d::conv3d(
+                s,
+                Tensor::new(hx, rows as u32, C as u32, Dtype::Bf16),
+                Tensor::new(hg, 2, 4, Dtype::I32),
+                Tensor::new(hw, C as u32, (TAPS * per) as u32, Dtype::Bf16),
+                Some(Tensor::new(hb, C as u32, 1, Dtype::F32)),
+                None,
+                conv3d,
+                Tensor::new(hog, 2, 4, Dtype::I32),
+                Tensor::new(hy, rows as u32, C as u32, Dtype::Bf16),
+                [0, 0],
+            )
+            .expect("the launch")
+        });
+        let mut want = vec![0.0f32; rows * C];
+        for (clip, e) in clips.iter().enumerate() {
+            let off = grid[clip * 4 + 3] as usize;
+            for t in 0..e[0] as usize {
+                for n in 0..C {
+                    let mut acc = 0.0f32;
+                    for tap in 0..TAPS {
+                        let Some(src) = (t + tap * dilation).checked_sub((TAPS - 1) * dilation)
+                        else {
+                            continue;
+                        };
+                        let row = off + src;
+                        if depthwise {
+                            acc += x[row * C + n] * w[n * TAPS + tap];
+                        } else {
+                            for c in 0..C {
+                                acc += x[row * C + c] * w[(n * TAPS + tap) * C + c];
+                            }
+                        }
+                    }
+                    want[(off + t) * C + n] = bf16_round(acc + bias[n]);
+                }
+            }
+        }
+        within_a_bf16_ulp(
+            &format!("conv3d dilation {dilation}, depthwise {depthwise}"),
+            &want,
+            &rig.read_bf16(hy, rows * C),
+        );
+    }
 }
 
 fn the_group_norm_answers_the_two_pass_reference() {

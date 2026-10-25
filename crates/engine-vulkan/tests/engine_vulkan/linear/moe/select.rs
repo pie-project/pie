@@ -107,7 +107,7 @@ fn the_routed_selects_answer_the_reference() {
         // Affine banks.
         let (bias, biasr) = gpu.up(&noise(3, EXPERTS * N));
         let biast = t(bias, EXPERTS, N, Dtype::Bf16);
-        for (group, bits) in [(64usize, 4u32), (32, 2)] {
+        for (group, bits) in [(64usize, 8u32), (64, 4), (32, 2)] {
             let per = 32 / bits as usize;
             let cw = words(u64::from(bits), EXPERTS * N * K / per);
             let w = gpu.up_u32(&cw);

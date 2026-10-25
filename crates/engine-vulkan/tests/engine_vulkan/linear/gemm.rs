@@ -1,8 +1,8 @@
 //! The dense matmuls on the first Vulkan device against an f64 host
 //! reference: the vector kernels below four
 //! rows (an even contraction in eight-wide loads, an odd one), the tiled
-//! kernel over ragged tiles, the cooperative-matrix tier where the device
-//! has one, and the f32 lane form at every weight and result dtype.
+//! kernel over ragged tiles, the register tile from 96 rows at its 64- and
+//! 32-column forms, the cooperative-matrix tier where the device has one, and the f32 lane form at every weight and result dtype.
 
 use kernels_slang::Tensor;
 use kernels_slang::linear::gemm::{self, Tactic};
@@ -52,6 +52,9 @@ fn the_dense_matmuls_answer_the_reference() {
         (1usize, 24usize, 64usize, kernels_slang::Tier::Baseline),
         (3, 21, 60, kernels_slang::Tier::Baseline),
         (40, 50, 70, kernels_slang::Tier::Baseline),
+        // The register tile from 96 rows: its 64- and 32-column forms.
+        (130, 70, 48, kernels_slang::Tier::Baseline),
+        (100, 96, 32, kernels_slang::Tier::Baseline),
     ];
     if coopmat {
         cases.push((70, 64, 96, kernels_slang::Tier::Coopmat));

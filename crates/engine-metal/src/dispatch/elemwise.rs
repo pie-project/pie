@@ -300,17 +300,17 @@ impl Run<'_> {
                 scale: None,
                 act: poem_ir::ActFn::Gelu { tanh, .. },
                 ..
-            } => {
-                if !*tanh {
-                    return Err(kernels_metal::Error::Backend {
-                        op: "elemwise.act",
-                        detail: "the erf gelu has no shader here; the tanh approximation \
-                                 (`gelu(x, tanh = true)`) is what every DiT under study runs"
-                            .to_string(),
-                    });
-                }
+            } if *tanh => {
                 elemwise::pointwise::gelu_tanh(self.ctx(), self.tensor(*x), self.tensor(*x))
             }
+            Elemwise::Act {
+                x,
+                x_out: _,
+                s: None,
+                scale: None,
+                act: poem_ir::ActFn::Gelu { .. },
+                ..
+            } => elemwise::pointwise::gelu(self.ctx(), self.tensor(*x), self.tensor(*x)),
             Elemwise::Act {
                 x,
                 x_out: _,
@@ -327,6 +327,17 @@ impl Run<'_> {
                 act: poem_ir::ActFn::Sqrt,
                 ..
             } => elemwise::pointwise::sqrt(self.ctx(), self.tensor(*x), self.tensor(*x)),
+            Elemwise::Snake {
+                x,
+                alpha,
+                beta,
+                x_out: _,
+            } => elemwise::pointwise::snake(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*alpha),
+                self.tensor(*beta),
+            ),
             Elemwise::Hadamard {
                 x,
                 x_out: _,

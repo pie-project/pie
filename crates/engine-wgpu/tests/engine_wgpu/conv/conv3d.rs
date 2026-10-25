@@ -175,6 +175,8 @@ fn the_conv3d_answers_the_reference() {
             } else {
                 kernels_slang::conv::conv3d::TimePad::Zero
             },
+            dilation: [1, 1, 1],
+            depthwise: false,
         };
         let n = rows_out * C_OUT;
         landed(

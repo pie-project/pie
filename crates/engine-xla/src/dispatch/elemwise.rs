@@ -1104,7 +1104,9 @@ impl Run<'_> {
             }),
             // The XLA backend has no Hadamard/FWHT kernel; report it as
             // unsupported, the same way the wgpu and vulkan backends do.
-            Elemwise::Hadamard { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
+            Elemwise::Hadamard { .. } | Elemwise::Snake { .. } => {
+                Err(kernels_xla::Error::Unsupported { op: op.name() })
+            }
             // A weight and axis no builder pairs.
             Elemwise::Rmsnorm { .. } | Elemwise::Layernorm { .. } => {
                 Err(kernels_xla::Error::Unsupported { op: op.name() })
