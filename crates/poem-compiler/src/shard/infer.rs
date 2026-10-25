@@ -29,7 +29,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use poem_ir::{CacheRow, Def, Dim, Operands, Operation, Shard, Trace, Ty, ValueId};
+use poem_ir::{
+    CacheRow, Def, Dim, Operands, Operation, ParamPlacement, Shard, Trace, Ty, ValueId,
+};
 
 use super::rules::{self, Rule};
 use crate::tree::{self, Tree};
@@ -537,10 +539,17 @@ impl<'r, 't> Walk<'r, 't> {
                     self.read_whole(v);
                 }
                 // A table the head also contracts is cut by its rows with
-                // the head's columns; any other is whole.
+                // the head's columns, and one a host holds (read a few rows
+                // a token, too large for each rank to hold whole) by its
+                // rows alone: each rank looks up the rows it holds, the
+                // ranks' rows summed. Any other is whole.
                 let tied = field(table).first().and_then(|t| self.param(*t));
+                let banded = |p: usize| {
+                    self.reading.tied.contains(&p)
+                        || self.trace().params[p].placement == ParamPlacement::Host
+                };
                 match tied {
-                    Some(p) if self.reading.tied.contains(&p) && self.decide(p, Cut::Column(0)) => {
+                    Some(p) if banded(p) && self.decide(p, Cut::Column(0)) => {
                         vec![Held::Partial(BTreeSet::new()); outs.len()]
                     }
                     Some(p) => {
