@@ -688,8 +688,8 @@ def roster() -> list[Gate]:
             expected="an all-ones table IS the plain step; a split table moves it; "
                      "class-0 rows ignore class-1 text exactly",
             note="A STRUCTURED ATTENTION MASK STATED BY THE GUEST "
-                 "(`forward-pass.attention-classes`): one class per row and a "
-                 "count x count table, applied by the engine to the reading's "
+                 "(`forward-pass.mask`, built from one class per row and a "
+                 "count x count table), applied by the engine to the "
                  "group-packed `attention.ragged` with no family code involved. "
                  "Every claim is an identity within fires of one shape.",
             needs=[(a("mini-dit.zt"),

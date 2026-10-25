@@ -129,7 +129,7 @@ python mini_dit_ref.py --out-dir /somewhere/else
 (`mini_dit_dpm2m_{fp32,bf16}.npz`); `mini_dit_parity.py all --solver dpm2m` drives
 the guest's device loop (`latent::dpm2m_step`) against it, and `gates.py` runs that as
 the `dpm-2m` row. `mini_dit_parity.py classes` drives the guest-stated attention
-mask (`forward-pass.attention-classes`) through four modes and checks its identities
+mask (`forward-pass.mask`) through four modes and checks its identities
 without a golden; `gates.py` runs that as `attn-classes`.
 
 On a card smaller than the roster assumes, `gates.py` takes `PIE_GATES_ROWS`,
