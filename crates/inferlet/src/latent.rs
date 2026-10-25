@@ -27,26 +27,6 @@ impl FlowMatchEuler {
         FlowMatchEuler::from_schedule(&schedule, steps, rows)
     }
 
-    /// The schedule a lane whose `stream` switch is `lane` advances at.
-    pub fn for_stream(
-        fact: &ScheduleFact,
-        lane: &str,
-        steps: u32,
-        rows: Option<u32>,
-    ) -> Result<FlowMatchEuler, String> {
-        let mut fact = fact.clone();
-        if let Some(found) = fact
-            .stream_shifts
-            .iter()
-            .find(|shift| shift.lane == lane)
-            .map(|shift| shift.shift)
-        {
-            fact.shift = found;
-            fact.pinned_sigmas.clear();
-        }
-        FlowMatchEuler::from_schedule(&fact, steps, rows)
-    }
-
     pub fn from_schedule(
         fact: &ScheduleFact,
         steps: u32,

@@ -100,21 +100,8 @@ struct LaneState {
     prompting: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Doom {
-    Abandoned,
-}
-
-impl std::fmt::Display for Doom {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Abandoned => f.write_str(
-                "pipeline abandoned: silent past the silence timeout without submitting \
-                 and without calling forward.park()",
-            ),
-        }
-    }
-}
+pub(super) const ABANDONED: &str = "pipeline abandoned: silent past the silence timeout without \
+     submitting and without calling forward.park()";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GateVerdict {
@@ -145,7 +132,7 @@ pub(super) enum FramePlan {
     Dispatch(Vec<Vec<u64>>),
     Hold(Duration),
     Park,
-    Terminate(Vec<(ProcessId, Doom)>),
+    Terminate(Vec<ProcessId>),
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -1101,12 +1088,7 @@ ready_age_newest={}us",
             if !expired.is_empty() {
                 expired.sort_unstable();
                 expired.dedup();
-                return FramePlan::Terminate(
-                    expired
-                        .into_iter()
-                        .map(|pid| (pid, Doom::Abandoned))
-                        .collect(),
-                );
+                return FramePlan::Terminate(expired);
             }
             if super::worker::wave_trace() {
                 super::worker::wave_trace_emit(format!(

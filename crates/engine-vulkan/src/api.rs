@@ -540,7 +540,7 @@ impl Engine for Vulkan {
                         step_pending.rows = Some(Vec::new());
                         return Ok((ticket, step_pending));
                     }
-                    if epilogues(step).next().is_some()
+                    if program_attachments(step).next().is_some()
                         && self.reads_on_device(step, &step_pending.landed)
                     {
                         // Every attachment reads its logits on the device:
@@ -552,7 +552,7 @@ impl Engine for Vulkan {
                         let shell = self.loaded_mut()?;
                         step_pending.rows = Some(shell.rows_of(&landed).map_err(fault)?);
                         shell.forget_seat(&landed);
-                    } else if epilogues(step).next().is_some() {
+                    } else if program_attachments(step).next().is_some() {
                         let shell = self.loaded_mut()?;
                         let rows = shell.rows_of(&step_pending.landed).map_err(fault)?;
 
@@ -837,14 +837,14 @@ impl Vulkan {
         };
         cfg!(feature = "vulkan")
             && shell.mtp_width() == 0
-            && epilogues(step)
+            && program_attachments(step)
                 .all(|attachment| shell.readout_row(landed, attachment.lane).is_some())
     }
 
     /// Runs each program's prologue, to its commit, before the step
     /// resolves its inputs: the forward reads the cells a prologue put.
     fn run_prologues(&mut self, step: &Step) -> EngineResult<()> {
-        for attachment in epilogues(step) {
+        for attachment in program_attachments(step) {
             if !self.programs.prologue_runs(attachment.instance) {
                 continue;
             }
@@ -880,7 +880,7 @@ impl Vulkan {
         let Vulkan {
             shell, programs, ..
         } = self;
-        for attachment in epilogues(step) {
+        for attachment in program_attachments(step) {
             let readout = readouts.get(attachment.lane as usize);
             let (logits, rows, vocab) = match readout {
                 Some(lane) if lane.rows > 0 => {
@@ -1263,7 +1263,7 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
 unsafe impl Send for Vulkan {}
 
 /// The attachments whose program runs on this fire.
-fn epilogues(step: &Step) -> impl Iterator<Item = &engine::fire::Attachment> {
+fn program_attachments(step: &Step) -> impl Iterator<Item = &engine::fire::Attachment> {
     step.attachments
         .iter()
         .filter(|attachment| !attachment.adapter_only)

@@ -835,12 +835,6 @@ impl Shell {
         self.readout_seam
     }
 
-    /// The width of the plan's velocity export, when it plants one.
-    #[must_use]
-    pub fn velocity_width(&self) -> Option<u32> {
-        self.dit.velocity_width()
-    }
-
     /// Whether the plan exports pixels, and the pixel row's width.
     #[must_use]
     pub fn pixels_facts(&self) -> (bool, u32) {
@@ -2183,7 +2177,7 @@ impl Shell {
             .with_pack(pack_len)
             .with_unified(self.unified.clone());
         let place = At::new();
-        crate::dit::land(&tracer, &self.handles, slots, lands)?;
+        crate::dit::land(lands)?;
         let probed = {
             let mut run = Run::new(
                 &tracer,

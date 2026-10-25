@@ -8,7 +8,7 @@
 //! host tables handed to the traced program as inputs.
 
 use engine::fire::ReadoutSeam;
-use kernels_cerebras::{Emit, Tensor};
+use kernels_cerebras::Tensor;
 use poem_compiler::{CompiledModel, VoxelLadder};
 use poem_exec::feeds::{Feeds, Seat};
 use poem_exec::fire::{Composition, LaneFacts, LaneRow};
@@ -100,8 +100,8 @@ struct PixelsExport {
 pub struct Dit {
     feeds: Feeds,
     voxel: Option<VoxelSeat>,
-    velocity: Option<(ValueId, u32)>,
-    hidden: Option<(ValueId, u32)>,
+    velocity: Option<ValueId>,
+    hidden: Option<ValueId>,
     pixels: Vec<PixelsExport>,
 }
 
@@ -319,12 +319,8 @@ impl Dit {
                 .flat_map(|seam| seam.values.iter().copied())
                 .collect::<Vec<_>>()
         };
-        dit.velocity = first(VELOCITY_SEAM)
-            .first()
-            .map(|&value| (value, width_of(trace, value)));
-        dit.hidden = first(HIDDEN_SEAM)
-            .last()
-            .map(|&value| (value, width_of(trace, value)));
+        dit.velocity = first(VELOCITY_SEAM).first().copied();
+        dit.hidden = first(HIDDEN_SEAM).last().copied();
         dit.pixels = trace
             .seams
             .iter()
@@ -347,13 +343,8 @@ impl Dit {
     #[must_use]
     pub fn float_readout(&self) -> Option<(ReadoutSeam, ValueId)> {
         self.velocity
-            .map(|(value, _)| (ReadoutSeam::Velocity, value))
-            .or_else(|| self.hidden.map(|(value, _)| (ReadoutSeam::Hidden, value)))
-    }
-
-    #[must_use]
-    pub fn velocity_width(&self) -> Option<u32> {
-        self.velocity.map(|(_, width)| width)
+            .map(|value| (ReadoutSeam::Velocity, value))
+            .or_else(|| self.hidden.map(|value| (ReadoutSeam::Hidden, value)))
     }
 
     /// Whether the plan exports pixels, and the widest pixel row.
@@ -914,13 +905,7 @@ struct VoxelTables {
 
 /// Lands each merge-over-input's rows in its slot before the walk. Merged
 /// inputs are not placed on this backend yet: a fire that lands any is refused.
-pub fn land(
-    ctx: &dyn Emit,
-    handles: &Handles,
-    slots: &crate::run::SlotTable,
-    lands: &[Land],
-) -> Result<()> {
-    let _ = (ctx, handles, slots);
+pub fn land(lands: &[Land]) -> Result<()> {
     if let Some(land) = lands.first() {
         return Err(program(format!(
             "landing merge {} over a guest input, which this backend does not place",

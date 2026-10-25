@@ -101,8 +101,8 @@ struct PixelsExport {
 pub struct Dit {
     feeds: Feeds,
     voxel: Option<VoxelSeat>,
-    velocity: Option<(ValueId, u32)>,
-    hidden: Option<(ValueId, u32)>,
+    velocity: Option<ValueId>,
+    hidden: Option<ValueId>,
     pixels: Vec<PixelsExport>,
 }
 
@@ -280,12 +280,8 @@ impl Dit {
                 .flat_map(|seam| seam.values.iter().copied())
                 .collect::<Vec<_>>()
         };
-        dit.velocity = first(VELOCITY_SEAM)
-            .first()
-            .map(|&value| (value, width_of(trace, value)));
-        dit.hidden = first(HIDDEN_SEAM)
-            .last()
-            .map(|&value| (value, width_of(trace, value)));
+        dit.velocity = first(VELOCITY_SEAM).first().copied();
+        dit.hidden = first(HIDDEN_SEAM).last().copied();
         dit.pixels = trace
             .seams
             .iter()
@@ -308,8 +304,8 @@ impl Dit {
     #[must_use]
     pub fn float_readout(&self) -> Option<(ReadoutSeam, ValueId)> {
         self.velocity
-            .map(|(value, _)| (ReadoutSeam::Velocity, value))
-            .or_else(|| self.hidden.map(|(value, _)| (ReadoutSeam::Hidden, value)))
+            .map(|value| (ReadoutSeam::Velocity, value))
+            .or_else(|| self.hidden.map(|value| (ReadoutSeam::Hidden, value)))
     }
 
     /// Whether the plan exports pixels, and the widest pixel row.
