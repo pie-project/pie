@@ -433,9 +433,16 @@ def read(m, reads, prefix):
     if m.vae != None:
         vae_read(reads, m.vae, 2 * m.vae.encoder.conv_out.c_out)
 
+# The checkpoint orders a patch's features `(ph, pw, c)`; the graph's
+# `conv.patchify` packs `(c, ph, pw)`. Feature `f` of the graph's is the
+# checkpoint's `PATCH_ORDER[f]`.
+PATCH_ORDER = [(ph * PATCH + pw) * CHANNELS + c for c in range(CHANNELS) for ph in range(PATCH) for pw in range(PATCH)]
+
 def dit(reads, m, prefix):
     at = lambda tail: prefix + tail
-    biased(reads, m.x_embed, at("all_x_embedder.2-1"))
+    x_embed = at("all_x_embedder.2-1")
+    reads.read_expr(m.x_embed.w, src(x_embed + ".weight").gather(1, PATCH_ORDER))
+    reads.read(m.x_embed.bias, x_embed + ".bias")
     reads.read(m.cap_norm, at("cap_embedder.0.weight"))
     biased(reads, m.cap_embed, at("cap_embedder.1"))
     biased(reads, m.t_mlp0, at("t_embedder.mlp.0"))
@@ -448,7 +455,9 @@ def dit(reads, m, prefix):
         for i, b in enumerate(blocks):
             transformer_block(reads, b, at("{}.{}".format(stem, i)))
     biased(reads, m.final_ada, at("all_final_layer.2-1.adaLN_modulation.1"))
-    biased(reads, m.final_linear, at("all_final_layer.2-1.linear"))
+    final = at("all_final_layer.2-1.linear")
+    reads.read_expr(m.final_linear.w, src(final + ".weight").gather(0, PATCH_ORDER))
+    reads.read_expr(m.final_linear.bias, src(final + ".bias").gather(0, PATCH_ORDER))
 
 def transformer_block(reads, b, stem):
     n = lambda s: stem + "." + s
