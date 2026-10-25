@@ -251,7 +251,6 @@ impl DenoiseLoop {
         self.dts
     }
 
-
     /// `pass`'s epilogue: `body(k)` at fire `k`, then the clock moves on.
     pub fn drive(&self, pass: &ForwardPass, body: impl Fn(&Tensor) + 'static) {
         let (step, timestep, ts) = (self.step, self.timestep, self.ts);

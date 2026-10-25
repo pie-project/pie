@@ -436,10 +436,7 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
         let d = dims(deployment);
         let names = readings(&trace(deployment, Platform::Cuda));
         if is_flagship(deployment) {
-            assert_eq!(
-                names,
-                vec!["text", "denoise", "vae.decode", "vae.encode"]
-            );
+            assert_eq!(names, vec!["text", "denoise", "vae.decode", "vae.encode"]);
         } else {
             assert_eq!(names, vec!["denoise"]);
         }

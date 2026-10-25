@@ -117,7 +117,6 @@ impl Input {
     }
 }
 
-
 #[derive(Serialize)]
 struct Output {
     model: String,
@@ -243,7 +242,9 @@ fn denoise_reading() -> Result<Denoise> {
             continue;
         }
         if video.reads_kv {
-            return Err(format!("reading `{reading}` binds a kv space; a denoise pass binds none").into());
+            return Err(
+                format!("reading `{reading}` binds a kv space; a denoise pass binds none").into(),
+            );
         }
         let context_stream = stream_reading(&reading, "context")
             .ok_or_else(|| format!("reading `{reading}` reads no `context` for the prompt rows"))?;
@@ -310,13 +311,22 @@ fn encode(
     }
     let cap = max_readout_rows(model::ReadoutKind::Hidden);
     if len as usize > cap {
-        return Err(format!("the prompt is {len} tokens and one pass reads out {cap} hidden rows").into());
+        return Err(
+            format!("the prompt is {len} tokens and one pass reads out {cap} hidden rows").into(),
+        );
     }
     let rows = context.rows.unwrap_or(len);
     if len > rows {
-        return Err(format!("input `{}` takes exactly {rows} context rows and the prompt is {len} tokens", context.name).into());
+        return Err(format!(
+            "input `{}` takes exactly {rows} context rows and the prompt is {len} tokens",
+            context.name
+        )
+        .into());
     }
-    let ids: Vec<i32> = ids.iter().map(|&id| i32::try_from(id).unwrap_or(0)).collect();
+    let ids: Vec<i32> = ids
+        .iter()
+        .map(|&id| i32::try_from(id).unwrap_or(0))
+        .collect();
     let pass = ForwardPass::new();
     pass.switch(0, "reading", &text.reading)?;
     pass.embed(&Channel::from(ids), &Channel::from([0u32, len]))?;
@@ -329,7 +339,12 @@ fn encode(
     let width = text.width;
     let encoded = Channel::new([rows, width], dtype::f32).queued();
     pass.epilogue(move || {
-        encoded.put(pad_rows(&intrinsics::hidden(0, len, width), len, rows, width));
+        encoded.put(pad_rows(
+            &intrinsics::hidden(0, len, width),
+            len,
+            rows,
+            width,
+        ));
         if let Some(then) = &then {
             then();
         }
@@ -352,7 +367,6 @@ fn readout_width(reading: &str, stream: &str) -> Result<u32> {
         .map(|readout| readout.width)
         .ok_or_else(|| format!("reading `{reading}` reads nothing out on its `{stream}` lane"))
 }
-
 
 /// Standard base64 (`+/`, `=` padded) into the bytes it spells. The one
 /// thing that travels this way is an init clip's frames: argv is text, an
@@ -513,7 +527,6 @@ fn rgb8(pixels: &[f32]) -> Vec<u8> {
         .collect()
 }
 
-
 /// The prompt as ids, through the BOUND MODEL's own template and
 /// tokenizer: one user turn plus the generation cue, which is what every
 /// instruct-encoder pipeline renders before it tokenizes. Only reached on
@@ -543,7 +556,6 @@ fn ids_of(text: &str) -> Result<Vec<u32>> {
     Ok(out)
 }
 
-
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
     let text = text_reading()?;
@@ -553,7 +565,9 @@ async fn main(input: Input) -> Result<Output> {
         .iter()
         .find(|r| *r == "vae.decode")
         .cloned()
-        .ok_or("this model declares no `vae.decode` reading, so its latent has no way out as frames")?;
+        .ok_or(
+            "this model declares no `vae.decode` reading, so its latent has no way out as frames",
+        )?;
     let encode_reading = readings.iter().find(|r| *r == "vae.encode").cloned();
 
     // ---- the latent volume, the VAE's own -----------------------------------
@@ -564,10 +578,16 @@ async fn main(input: Input) -> Result<Output> {
         space.channels,
     );
     if tc == 1 {
-        return Err("this model's latent has no temporal compression: `text-to-image` is its driver".into());
+        return Err(
+            "this model's latent has no temporal compression: `text-to-image` is its driver".into(),
+        );
     }
     if c != denoise.latents.width {
-        return Err(format!("the latent space has {c} channels and `latents` reads {}", denoise.latents.width).into());
+        return Err(format!(
+            "the latent space has {c} channels and `latents` reads {}",
+            denoise.latents.width
+        )
+        .into());
     }
     let height = (input.height.unwrap_or(480) / sc).max(1) * sc;
     let width = (input.width.unwrap_or(832) / sc).max(1) * sc;
@@ -593,7 +613,9 @@ async fn main(input: Input) -> Result<Output> {
     let fact = model::schedule().ok_or("this model states no schedule; nothing here denoises")?;
     let steps = match input.steps.filter(|s| *s > 0) {
         Some(steps) => steps,
-        None if !fact.pinned_sigmas.is_empty() => u32::try_from(fact.pinned_sigmas.len()).unwrap_or(8),
+        None if !fact.pinned_sigmas.is_empty() => {
+            u32::try_from(fact.pinned_sigmas.len()).unwrap_or(8)
+        }
         None => 8,
     };
     // No dynamic shift: a video row's stated shift is the shift itself.
@@ -606,7 +628,10 @@ async fn main(input: Input) -> Result<Output> {
     }
     let sched = if has_init {
         let run = ((steps as f32 * strength).round() as u32).clamp(1, steps);
-        FlowMatchEuler::from_sigmas(full.sigmas[(steps - run) as usize..].to_vec(), full.train_steps)
+        FlowMatchEuler::from_sigmas(
+            full.sigmas[(steps - run) as usize..].to_vec(),
+            full.train_steps,
+        )
     } else {
         full
     };
@@ -622,8 +647,14 @@ async fn main(input: Input) -> Result<Output> {
             let shown = format!("<{} ids>", ids.len());
             (ids, shown, "prompt-ids")
         }
-        (None, Some(text)) if !text.trim().is_empty() => (template_ids(text), text.clone(), "prompt"),
-        _ => return Err("pass `prompt` or `prompt_ids`: this program films what it is told to".into()),
+        (None, Some(text)) if !text.trim().is_empty() => {
+            (template_ids(text), text.clone(), "prompt")
+        }
+        _ => {
+            return Err(
+                "pass `prompt` or `prompt_ids`: this program films what it is told to".into(),
+            );
+        }
     };
     let negative = match (&input.negative_prompt_ids, &input.negative_prompt) {
         (Some(ids), _) => Some(ids_of(ids)?),
@@ -650,7 +681,11 @@ async fn main(input: Input) -> Result<Output> {
             "this model declares no `vae.encode` reading, so an init clip has no door to come in through",
         )?;
         if init_b64.len() as u32 != frames {
-            return Err(format!("the init clip is {} frames and this run is {frames}", init_b64.len()).into());
+            return Err(format!(
+                "the init clip is {} frames and this run is {frames}",
+                init_b64.len()
+            )
+            .into());
         }
         let mut rgb: Vec<Vec<u8>> = Vec::with_capacity(init_b64.len());
         for (f, b64) in init_b64.iter().enumerate() {
@@ -676,23 +711,29 @@ async fn main(input: Input) -> Result<Output> {
             chunks.push(tc);
         }
         if chunks.iter().sum::<u32>() != frames || chunks.len() as u32 != lt {
-            return Err(format!("a {frames}-frame clip does not chunk into {lt} encode fires at tc = {tc}").into());
+            return Err(format!(
+                "a {frames}-frame clip does not chunk into {lt} encode fires at tc = {tc}"
+            )
+            .into());
         }
         let mut clip: Vec<f32> = Vec::with_capacity(lt as usize * plane);
         // One working set for the whole clip: the conv caches are its state.
         let enc_state = WorkingSet::new();
         let mut at = 0usize;
         for (k, take) in chunks.iter().copied().enumerate() {
-            let mut payload: Vec<u8> = Vec::with_capacity(take as usize * (height * width * 3) as usize);
+            let mut payload: Vec<u8> =
+                Vec::with_capacity(take as usize * (height * width * 3) as usize);
             for f in at..at + take as usize {
                 payload.extend_from_slice(&rgb[f]);
             }
             at += take as usize;
             let handle = Frames::from_rgb8(&payload, width, height, take, fps)
                 .map_err(|why| format!("encode chunk {k}: frames.from-rgb8: {why}"))?;
-            let landed = encode_chunk(reading, &handle, take, height, width, lh, lw, &enc_state, &pipe)
-                .await
-                .with_context(|| format!("encoding chunk {k}"))?;
+            let landed = encode_chunk(
+                reading, &handle, take, height, width, lh, lw, &enc_state, &pipe,
+            )
+            .await
+            .with_context(|| format!("encoding chunk {k}"))?;
             clip.extend_from_slice(&landed);
         }
         Some(Channel::from_shaped(lat, clip).named("init"))
@@ -722,8 +763,14 @@ async fn main(input: Input) -> Result<Output> {
     };
 
     // ---- the prompt, encoded on the device -----------------------------------
-    let (context, prompt_rows) =
-        encode(&pipe, &mut held, &text, &denoise.context, &ids, Some(Box::new(seed_loop)))?;
+    let (context, prompt_rows) = encode(
+        &pipe,
+        &mut held,
+        &text,
+        &denoise.context,
+        &ids,
+        Some(Box::new(seed_loop)),
+    )?;
     let uncond = match &negative {
         Some(neg) if cfg => Some(encode(&pipe, &mut held, &text, &denoise.context, neg, None)?.0),
         _ => None,
@@ -737,8 +784,15 @@ async fn main(input: Input) -> Result<Output> {
     let denoise_pass = |land: bool| -> Result<ForwardPass> {
         let pass = ForwardPass::new();
         let mut lanes = 0u32;
-        for (group, ctx) in [Some(&context), uncond.as_ref()].into_iter().flatten().enumerate() {
-            for (stream, latent) in [(&denoise.latent_stream, true), (&denoise.context_stream, false)] {
+        for (group, ctx) in [Some(&context), uncond.as_ref()]
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            for (stream, latent) in [
+                (&denoise.latent_stream, true),
+                (&denoise.context_stream, false),
+            ] {
                 let at = lanes;
                 lanes += 1;
                 set_switches(&pass, at, &denoise.reading, stream.as_deref())?;
@@ -765,7 +819,11 @@ async fn main(input: Input) -> Result<Output> {
         pass.epilogue(move || {
             let step = k.take();
             let v = if cfg {
-                cfg_combine(&intrinsics::velocity(0, n, vw), &intrinsics::velocity(2, n, vw), &Tensor::constant([guidance]))
+                cfg_combine(
+                    &intrinsics::velocity(0, n, vw),
+                    &intrinsics::velocity(2, n, vw),
+                    &Tensor::constant([guidance]),
+                )
             } else {
                 intrinsics::velocity(0, n, vw)
             };
@@ -786,16 +844,27 @@ async fn main(input: Input) -> Result<Output> {
     let step = denoise_pass(false)?;
     let last = denoise_pass(true)?;
     for fire in 0..sched.steps() {
-        let pass = if fire + 1 == sched.steps() { &last } else { &step };
-        pass.submit(&pipe).with_context(|| format!("denoise fire {fire}"))?;
+        let pass = if fire + 1 == sched.steps() {
+            &last
+        } else {
+            &step
+        };
+        pass.submit(&pipe)
+            .with_context(|| format!("denoise fire {fire}"))?;
     }
-    let latent = out.take_host::<Vec<f32>>().await.context("the denoised latent")?;
+    let latent = out
+        .take_host::<Vec<f32>>()
+        .await
+        .context("the denoised latent")?;
     // The denoise passes go before the decode opens: they hold seats.
     drop(step);
     drop(last);
     drop(held);
     if let Some(bad) = latent.iter().position(|v| !v.is_finite()) {
-        return Err(format!("the denoise loop left a non-finite latent (at {bad}); there is nothing to decode").into());
+        return Err(format!(
+            "the denoise loop left a non-finite latent (at {bad}); there is nothing to decode"
+        )
+        .into());
     }
 
     // ---- the decode: one fire per latent frame, in order ---------------------
@@ -804,13 +873,28 @@ async fn main(input: Input) -> Result<Output> {
     let vae_state = WorkingSet::new();
     for j in 0..lt {
         let at = j as usize * plane;
-        let landed = decode_frame(&decode, &latent[at..at + plane], lh, lw, if j == 0 { 1 } else { tc }, height, width, &vae_state, &pipe).await?;
+        let landed = decode_frame(
+            &decode,
+            &latent[at..at + plane],
+            lh,
+            lw,
+            if j == 0 { 1 } else { tc },
+            height,
+            width,
+            &vae_state,
+            &pipe,
+        )
+        .await?;
         pixels.extend_from_slice(&landed);
     }
     pipe.close();
     let want = (frames * height * width * 3) as usize;
     if pixels.len() != want {
-        return Err(format!("the decode landed {} values and a {frames}x{height}x{width} clip is {want}", pixels.len()).into());
+        return Err(format!(
+            "the decode landed {} values and a {frames}x{height}x{width} clip is {want}",
+            pixels.len()
+        )
+        .into());
     }
 
     // ---- the way out ----------------------------------------------------------
@@ -820,7 +904,11 @@ async fn main(input: Input) -> Result<Output> {
         "mp4" | "mp4-h264" => (ImageFormat::Mp4H264, "mp4"),
         "y4m" => (ImageFormat::Y4m, "y4m"),
         "rgb8" | "raw-rgb8" => (ImageFormat::RawRgb8, "rgb"),
-        other => return Err(format!("unknown video format {other:?}; try 'mp4', 'y4m' or 'rgb8'").into()),
+        other => {
+            return Err(
+                format!("unknown video format {other:?}; try 'mp4', 'y4m' or 'rgb8'").into(),
+            );
+        }
     };
     let handle = Frames::from_rgb8(&rgb8(&pixels), width, height, frames, fps)
         .map_err(|why| format!("frames.from-rgb8: {why}"))?;

@@ -455,7 +455,9 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
                     dtype: Dtype::Bf16,
                 }
             );
-            let lanes = lane_of_row.as_ref().expect("every modulation is per lane: nothing pads rows");
+            let lanes = lane_of_row
+                .as_ref()
+                .expect("every modulation is per lane: nothing pads rows");
             lane_scales += 1;
             assert_eq!(*form, poem::ModulateForm::Scale);
             assert_eq!(

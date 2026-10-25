@@ -221,7 +221,9 @@ fn denoise_reading() -> Result<Denoise> {
             continue;
         }
         if image.reads_kv {
-            return Err(format!("reading `{reading}` binds a kv space; a denoise pass binds none").into());
+            return Err(
+                format!("reading `{reading}` binds a kv space; a denoise pass binds none").into(),
+            );
         }
         let context_stream = stream_reading(&reading, "context").ok_or_else(|| {
             format!("reading `{reading}` reads no `context`; a text-conditioned sampler has nowhere to put the prompt")
@@ -256,7 +258,10 @@ fn bridge_reading(from: u32, to: u32) -> Result<Bridge> {
             let Ok(lane) = lane(&reading, stream.as_deref()) else {
                 continue;
             };
-            let hidden = lane.readout.as_ref().is_some_and(|r| r.kind == model::ReadoutKind::Hidden && r.width == to);
+            let hidden = lane
+                .readout
+                .as_ref()
+                .is_some_and(|r| r.kind == model::ReadoutKind::Hidden && r.width == to);
             if lane.embeds || lane.reads_kv || !hidden {
                 continue;
             }
@@ -317,13 +322,22 @@ fn encode(
     }
     let cap = max_readout_rows(model::ReadoutKind::Hidden);
     if len as usize > cap {
-        return Err(format!("the prompt is {len} tokens and one pass reads out {cap} hidden rows").into());
+        return Err(
+            format!("the prompt is {len} tokens and one pass reads out {cap} hidden rows").into(),
+        );
     }
     let rows = context.rows.unwrap_or(len);
     if len > rows {
-        return Err(format!("input `{}` takes {rows} rows and the prompt is {len} tokens", context.name).into());
+        return Err(format!(
+            "input `{}` takes {rows} rows and the prompt is {len} tokens",
+            context.name
+        )
+        .into());
     }
-    let ids: Vec<i32> = ids.iter().map(|&id| i32::try_from(id).unwrap_or(0)).collect();
+    let ids: Vec<i32> = ids
+        .iter()
+        .map(|&id| i32::try_from(id).unwrap_or(0))
+        .collect();
     let pass = ForwardPass::new();
     pass.switch(0, "reading", &text.reading)?;
     pass.embed(&Channel::from(ids), &Channel::from([0u32, len]))?;
@@ -340,7 +354,12 @@ fn encode(
         Some(_) => (None, then),
     };
     pass.epilogue(move || {
-        encoded.put(pad_rows(&intrinsics::hidden(0, len, width), len, rows, width));
+        encoded.put(pad_rows(
+            &intrinsics::hidden(0, len, width),
+            len,
+            rows,
+            width,
+        ));
         if let Some(then) = &here {
             then();
         }
@@ -368,7 +387,13 @@ fn encode(
 
 /// One weight per latent cell: the fraction of its `cell x cell` pixels the
 /// rectangle `(x0, y0, x1, y1)` or the gray mask covers.
-fn mask_cells(h: u32, w: u32, cell: u32, rect: Option<(u32, u32, u32, u32)>, gray: Option<&[f32]>) -> Vec<f32> {
+fn mask_cells(
+    h: u32,
+    w: u32,
+    cell: u32,
+    rect: Option<(u32, u32, u32, u32)>,
+    gray: Option<&[f32]>,
+) -> Vec<f32> {
     let width = (w * cell) as usize;
     let mut out = vec![0f32; (h * w) as usize];
     for a in 0..h {
@@ -377,7 +402,9 @@ fn mask_cells(h: u32, w: u32, cell: u32, rect: Option<(u32, u32, u32, u32)>, gra
             for y in a * cell..(a + 1) * cell {
                 for x in b * cell..(b + 1) * cell {
                     sum += match (rect, gray) {
-                        (Some((x0, y0, x1, y1)), _) => f32::from(u8::from(x >= x0 && x < x1 && y >= y0 && y < y1)),
+                        (Some((x0, y0, x1, y1)), _) => {
+                            f32::from(u8::from(x >= x0 && x < x1 && y >= y0 && y < y1))
+                        }
                         (None, Some(px)) => px[y as usize * width + x as usize],
                         (None, None) => 0.0,
                     };
@@ -396,7 +423,9 @@ fn parse_rect(text: &str) -> Result<(u32, u32, u32, u32)> {
         .collect::<std::result::Result<_, _>>()
         .map_err(|why| format!("`mask_rect` is `x0,y0,x1,y1` in pixels: {why}"))?;
     if parts.len() != 4 || parts[0] >= parts[2] || parts[1] >= parts[3] {
-        return Err(format!("`mask_rect` is `x0,y0,x1,y1` with x0 < x1 and y0 < y1, not `{text}`").into());
+        return Err(
+            format!("`mask_rect` is `x0,y0,x1,y1` with x0 < x1 and y0 < y1, not `{text}`").into(),
+        );
     }
     Ok((parts[0], parts[1], parts[2], parts[3]))
 }
@@ -459,7 +488,9 @@ async fn main(input: Input) -> Result<Output> {
         .iter()
         .find(|r| *r == "vae.decode")
         .cloned()
-        .ok_or("this model declares no `vae.decode` reading, so its latent has no way out as pixels")?;
+        .ok_or(
+            "this model declares no `vae.decode` reading, so its latent has no way out as pixels",
+        )?;
 
     // ---- the latent, the VAE's own ----------------------------------------
     let space = model::latent().ok_or("this model states no latent space")?;
@@ -481,7 +512,9 @@ async fn main(input: Input) -> Result<Output> {
     let fact = model::schedule().ok_or("this model states no schedule; nothing here denoises")?;
     let steps = match input.steps.filter(|s| *s > 0) {
         Some(steps) => steps,
-        None if !fact.pinned_sigmas.is_empty() => u32::try_from(fact.pinned_sigmas.len()).unwrap_or(8),
+        None if !fact.pinned_sigmas.is_empty() => {
+            u32::try_from(fact.pinned_sigmas.len()).unwrap_or(8)
+        }
         None => 8,
     };
     let full = FlowMatchEuler::from_schedule(&fact, steps, None)?;
@@ -501,7 +534,10 @@ async fn main(input: Input) -> Result<Output> {
         None => full,
         Some(_) => {
             let run = ((steps as f32 * strength).round() as u32).clamp(1, steps);
-            FlowMatchEuler::from_sigmas(full.sigmas[(steps - run) as usize..].to_vec(), full.train_steps)
+            FlowMatchEuler::from_sigmas(
+                full.sigmas[(steps - run) as usize..].to_vec(),
+                full.train_steps,
+            )
         }
     };
     let sigma0 = sched.sigmas[0];
@@ -510,7 +546,10 @@ async fn main(input: Input) -> Result<Output> {
 
     // ---- guidance: an input, or a second attention group ------------------
     let guidance = input.guidance.unwrap_or(1.0);
-    let negative = input.negative_prompt.clone().filter(|p| !p.trim().is_empty());
+    let negative = input
+        .negative_prompt
+        .clone()
+        .filter(|p| !p.trim().is_empty());
     if negative.is_some() && denoise.guidance {
         return Err(format!(
             "reading `{}` reads a `guidance` input, so this row is guidance-distilled and a \
@@ -527,7 +566,10 @@ async fn main(input: Input) -> Result<Output> {
         None
     } else {
         if init_b64.is_none() {
-            return Err("a mask says what to repaint; pass `init_image` for the picture it is cut from".into());
+            return Err(
+                "a mask says what to repaint; pass `init_image` for the picture it is cut from"
+                    .into(),
+            );
         }
         let rect = input.mask_rect.as_deref().map(parse_rect).transpose()?;
         let gray = match rect {
@@ -536,12 +578,21 @@ async fn main(input: Input) -> Result<Output> {
                 let mask = inferlet::frames::Frames::decode(&b64_decode(&mask_b64)?)
                     .map_err(|why| format!("the mask image does not decode: {why}"))?;
                 if mask.width() != width || mask.height() != height {
-                    return Err(format!("the mask is {}x{} and this run is {width}x{height}", mask.width(), mask.height()).into());
+                    return Err(format!(
+                        "the mask is {}x{} and this run is {width}x{height}",
+                        mask.width(),
+                        mask.height()
+                    )
+                    .into());
                 }
                 let rgb = mask
                     .encode(inferlet::frames::ImageFormat::RawRgb8)
                     .map_err(|why| format!("frames.encode(raw-rgb8): {why}"))?;
-                Some(rgb.chunks(3).map(|px| f32::from(px[0]) / 255.0).collect::<Vec<f32>>())
+                Some(
+                    rgb.chunks(3)
+                        .map(|px| f32::from(px[0]) / 255.0)
+                        .collect::<Vec<f32>>(),
+                )
             }
         };
         Some(mask_cells(lh, lw, sc, rect, gray.as_deref()))
@@ -558,7 +609,9 @@ async fn main(input: Input) -> Result<Output> {
     let seed = input.seed.unwrap_or(0);
     let draw = Channel::from(rng_state(seed)).named("draw");
     // The picture an inpainting step keeps, on the device.
-    let known = mask.as_ref().map(|_| Channel::new(lat, dtype::f32).queued().named("known"));
+    let known = mask
+        .as_ref()
+        .map(|_| Channel::new(lat, dtype::f32).queued().named("known"));
     // `x` from `start` (the encoded picture) or from noise alone, and the clock at 0.
     let seed_loop = move |start: Option<Tensor>| {
         let eps = normal(&draw.read(), lat);
@@ -580,10 +633,27 @@ async fn main(input: Input) -> Result<Output> {
 
     // ---- the prompt, and the picture, encoded on the device ----------------
     let seed_at_encode = init_b64.is_none();
-    let first: Option<Box<dyn Fn()>> = seed_at_encode.then(|| Box::new(move || seed_loop(None)) as Box<dyn Fn()>);
-    let context = encode(&pipe, &mut held, &text, bridge.as_ref(), &denoise.context, &prompt, first)?;
+    let first: Option<Box<dyn Fn()>> =
+        seed_at_encode.then(|| Box::new(move || seed_loop(None)) as Box<dyn Fn()>);
+    let context = encode(
+        &pipe,
+        &mut held,
+        &text,
+        bridge.as_ref(),
+        &denoise.context,
+        &prompt,
+        first,
+    )?;
     let uncond = match &negative {
-        Some(neg) if cfg => Some(encode(&pipe, &mut held, &text, bridge.as_ref(), &denoise.context, neg, None)?),
+        Some(neg) if cfg => Some(encode(
+            &pipe,
+            &mut held,
+            &text,
+            bridge.as_ref(),
+            &denoise.context,
+            neg,
+            None,
+        )?),
         _ => None,
     };
     if let Some(b64) = &init_b64 {
@@ -603,7 +673,10 @@ async fn main(input: Input) -> Result<Output> {
         }
         let (stream, pixels_in, latent_width) = vae_lane(reading)?;
         if latent_width != c {
-            return Err(format!("`{reading}` reads out {latent_width}-wide cells, the latent has {c} channels").into());
+            return Err(format!(
+                "`{reading}` reads out {latent_width}-wide cells, the latent has {c} channels"
+            )
+            .into());
         }
         let pass = ForwardPass::new();
         set_switches(&pass, 0, reading, stream.as_deref())?;
@@ -621,9 +694,16 @@ async fn main(input: Input) -> Result<Output> {
     let pass = ForwardPass::new();
     let guidance_ch = Channel::from([guidance]).named("guidance");
     let mut lanes = 0u32;
-    for (group, ctx) in [Some(&context), uncond.as_ref()].into_iter().flatten().enumerate() {
+    for (group, ctx) in [Some(&context), uncond.as_ref()]
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
         let group = group as u32;
-        for (stream, latent) in [(&denoise.latent_stream, true), (&denoise.context_stream, false)] {
+        for (stream, latent) in [
+            (&denoise.latent_stream, true),
+            (&denoise.context_stream, false),
+        ] {
             let at = lanes;
             lanes += 1;
             set_switches(&pass, at, &denoise.reading, stream.as_deref())?;
@@ -648,12 +728,18 @@ async fn main(input: Input) -> Result<Output> {
         }
     }
     let (n, vw) = (cells, denoise.velocity_width);
-    let mask_ch = mask.as_ref().map(|m| Channel::from_shaped([cells, 1], m.as_slice()).named("mask"));
+    let mask_ch = mask
+        .as_ref()
+        .map(|m| Channel::from_shaped([cells, 1], m.as_slice()).named("mask"));
     let noise = Channel::from(rng_state(seed ^ 0x5eed)).named("noise");
     pass.epilogue(move || {
         let step = k.take();
         let v = if cfg {
-            cfg_combine(&intrinsics::velocity(0, n, vw), &intrinsics::velocity(2, n, vw), &Tensor::constant([guidance]))
+            cfg_combine(
+                &intrinsics::velocity(0, n, vw),
+                &intrinsics::velocity(2, n, vw),
+                &Tensor::constant([guidance]),
+            )
         } else {
             intrinsics::velocity(0, n, vw)
         };
@@ -680,7 +766,8 @@ async fn main(input: Input) -> Result<Output> {
         k.put(&next);
     });
     for fire in 0..sched.steps() {
-        pass.submit(&pipe).with_context(|| format!("denoise fire {fire}"))?;
+        pass.submit(&pipe)
+            .with_context(|| format!("denoise fire {fire}"))?;
     }
     // Every pass so far is closed before the decode opens: a float pass
     // holds a seat until it closes, and the decode needs it (until B3).
@@ -690,7 +777,11 @@ async fn main(input: Input) -> Result<Output> {
     // ---- the decode, down the same pipeline ---------------------------------
     let (stream, latent_in, rgb) = vae_lane(&decode)?;
     if latent_in.width != c {
-        return Err(format!("`{decode}` reads {}-wide cells, the latent has {c} channels", latent_in.width).into());
+        return Err(format!(
+            "`{decode}` reads {}-wide cells, the latent has {c} channels",
+            latent_in.width
+        )
+        .into());
     }
     let pass = ForwardPass::new();
     set_switches(&pass, 0, &decode, stream.as_deref())?;
@@ -726,7 +817,9 @@ async fn main(input: Input) -> Result<Output> {
         cfg,
         sigmas: sched.sigmas.clone(),
         context_rows: context.shape().dims()[0],
-        context_readings: std::iter::once(text.reading.clone()).chain(bridge.map(|b| b.reading)).collect(),
+        context_readings: std::iter::once(text.reading.clone())
+            .chain(bridge.map(|b| b.reading))
+            .collect(),
         decode_reading: decode,
         file,
         mask_cells: mask.map(|m| m.iter().filter(|w| **w > 0.0).count() as u32),

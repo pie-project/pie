@@ -118,10 +118,11 @@ fn patchify_and_unpatchify_round_trip_over_the_token_box() {
         p,
         &mut tok,
         tg,
+        [0, 0],
     )
     .expect("patchify fires");
     let mut back = Tensor::new(back_at, rows as u32, c as u32, Dtype::Bf16);
-    unpatchify(&ctx, tok, tg, p, &mut back, g).expect("unpatchify fires");
+    unpatchify(&ctx, tok, tg, p, &mut back, g, [0, 0]).expect("unpatchify fires");
     gpu.sync();
     let got_tok: Vec<u16> = gpu.down(tok_at, tokens * c * 4);
     let got_back: Vec<u16> = gpu.down(back_at, rows * c);

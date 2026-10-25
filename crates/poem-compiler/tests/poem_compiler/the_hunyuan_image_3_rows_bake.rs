@@ -358,11 +358,7 @@ fn both_fact_columns_state_what_the_trace_does() {
                 latent.spatial_compression,
                 latent.temporal_compression
             ),
-            (
-                model::LATENT_CHANNELS,
-                model::SPATIAL_COMPRESSION,
-                1
-            )
+            (model::LATENT_CHANNELS, model::SPATIAL_COMPRESSION, 1)
         );
         let schedule = facts.schedule.as_ref().expect("a schedule");
         assert_eq!(schedule.kind, ScheduleKind::Flow);

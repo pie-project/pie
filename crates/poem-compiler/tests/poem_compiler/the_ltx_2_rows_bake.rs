@@ -497,7 +497,10 @@ fn the_latents_ride_the_voxels_and_the_positions_are_computed() {
             format!("positions:row:{}", model::ROPE_AXES),
             format!("audio_positions:row:{}", model::AUDIO_ROPE_AXES),
         ] {
-            assert!(inputs.contains(&want), "{deployment}: no `{want}` in {inputs:?}");
+            assert!(
+                inputs.contains(&want),
+                "{deployment}: no `{want}` in {inputs:?}"
+            );
         }
         assert!(
             !inputs.iter().any(|i| i.starts_with("latents:row")),
