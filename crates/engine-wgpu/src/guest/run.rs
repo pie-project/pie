@@ -16,6 +16,10 @@ pub struct Readout<'a> {
     pub at: u64,
 
     pub width: u32,
+
+    /// Whether the seat holds f32 values (copied in as they are) rather than
+    /// bf16 (widened).
+    pub f32: bool,
 }
 
 pub struct OnDevice<'a> {
@@ -23,6 +27,8 @@ pub struct OnDevice<'a> {
     session: &'a mut Session,
     widen: &'a Widen,
     logits: Option<Readout<'a>>,
+    /// Each lane of the pass's own readout rows (`velocity(k)`, `hidden(k)`).
+    lanes: Vec<Option<Readout<'a>>>,
     /// Each lane of the pass's pixels (`pixels(k)`), lane `k` at `k`.
     pixels: Vec<Option<Readout<'a>>>,
 
@@ -41,17 +47,32 @@ impl<'a> OnDevice<'a> {
             session,
             widen,
             logits,
+            lanes: Vec::new(),
             pixels: Vec::new(),
             ran: Vec::new(),
         }
     }
 
-    /// Each lane of the pass's pixels, offered to a pass that reads the
-    /// `pixels` intrinsic of that lane.
+    /// The pass's lanes' own readout rows and pixels, lane `k` at `k`.
     #[must_use]
-    pub fn with_pixels(mut self, pixels: Vec<Option<Readout<'a>>>) -> OnDevice<'a> {
+    pub fn with_lanes(
+        mut self,
+        lanes: Vec<Option<Readout<'a>>>,
+        pixels: Vec<Option<Readout<'a>>>,
+    ) -> OnDevice<'a> {
+        self.lanes = lanes;
         self.pixels = pixels;
         self
+    }
+
+    /// The readout a root of `intrinsic` at the pass's lane `lane` reads.
+    fn offered(&self, intrinsic: Option<IntrinsicId>, lane: u32) -> Option<Readout<'a>> {
+        let at = lane as usize;
+        match intrinsic {
+            Some(IntrinsicId::Logits) => self.logits,
+            Some(IntrinsicId::Pixels) => self.pixels.get(at).copied().flatten(),
+            _ => self.lanes.get(at).copied().flatten(),
+        }
     }
 
     #[must_use]
@@ -78,21 +99,23 @@ impl<'a> OnDevice<'a> {
             if root.source == ValueOrigin::Intrinsic
                 && matches!(
                     root.intrinsic,
-                    Some(IntrinsicId::Logits | IntrinsicId::Pixels)
+                    Some(
+                        IntrinsicId::Logits
+                            | IntrinsicId::Velocity
+                            | IntrinsicId::Hidden
+                            | IntrinsicId::Pixels
+                    )
                 )
             {
-                let offered = if root.intrinsic == Some(IntrinsicId::Pixels) {
-                    self.pixels.get(root.lane as usize).copied().flatten()
-                } else {
-                    self.logits
-                };
-                let seat = offered.ok_or_else(|| Fault::Program {
-                    at: "guest::run",
-                    why: format!(
-                        "this pass reads {:?} of lane {} and the fire offered no such row",
-                        root.intrinsic, root.lane
-                    ),
-                })?;
+                let seat =
+                    self.offered(root.intrinsic, root.lane)
+                        .ok_or_else(|| Fault::Program {
+                            at: "guest::run",
+                            why: format!(
+                                "this pass reads {:?} of lane {} and the fire offered no such row",
+                                root.intrinsic, root.lane
+                            ),
+                        })?;
                 let (_, held) = self.session.span(at, local).ok_or_else(|| Fault::Program {
                     at: "guest::run",
                     why: format!("the logits root {local} is not stage {at}'s"),
@@ -116,8 +139,13 @@ impl<'a> OnDevice<'a> {
                     .session
                     .span(at, local)
                     .expect("the span was just read");
-                self.widen
-                    .encode(&frame, seat.seat, seat.at, heap, into, seat.width)?;
+                if seat.f32 {
+                    let heap = heap.clone();
+                    frame.copy(seat.seat, seat.at, &heap, into, u64::from(seat.width) * 4)?;
+                } else {
+                    self.widen
+                        .encode(&frame, seat.seat, seat.at, heap, into, seat.width)?;
+                }
                 continue;
             }
             let bytes = root_bytes(
@@ -210,8 +238,14 @@ impl StageRunner for OnDevice<'_> {
     }
 
     fn binds(&self, id: Option<IntrinsicId>) -> bool {
-        (id == Some(IntrinsicId::Logits) && self.logits.is_some())
-            || (id == Some(IntrinsicId::Pixels) && self.pixels.iter().any(Option::is_some))
+        match id {
+            Some(IntrinsicId::Logits) => self.logits.is_some(),
+            Some(IntrinsicId::Pixels) => self.pixels.iter().any(Option::is_some),
+            Some(IntrinsicId::Velocity | IntrinsicId::Hidden) => {
+                self.lanes.iter().any(Option::is_some)
+            }
+            _ => false,
+        }
     }
 }
 
