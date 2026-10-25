@@ -456,7 +456,15 @@ pub fn emit_fused_region(
     let row_parallel = stream_kinds.is_some();
     let row_kinds: Vec<u8> = stream_kinds.unwrap_or_default();
     if row_parallel {
-        let kinds: Vec<String> = row_kinds.iter().map(|k| format!("{k}u")).collect();
+        // Each block narrows the values of its own row. A single-row region's
+        // values already are its one row, at row 0: they keep the dims they
+        // declare, which the ops that are not streams (a transpose, a gather
+        // along axis 0) index by.
+        let narrowed = row_geometry(stage, region).is_some();
+        let kinds: Vec<String> = row_kinds
+            .iter()
+            .map(|&k| format!("{}u", if narrowed { k } else { 0 }))
+            .collect();
         let count = kinds.len().max(1);
         let _ = writeln!(
             source,
