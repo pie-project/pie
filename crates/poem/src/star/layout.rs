@@ -5,12 +5,12 @@ use crate::{Dtype, Precision, Weight};
 use std::cell::Cell;
 
 use starlark::environment::GlobalsBuilder;
+use starlark::values::float::UnpackFloat;
 use starlark::values::list::ListRef;
+use starlark::values::list::UnpackList;
 use starlark::values::structs::AllocStruct;
 use starlark::values::tuple::UnpackTuple;
 use starlark::values::{Heap, Value};
-use starlark::values::float::UnpackFloat;
-use starlark::values::list::UnpackList;
 use starlark_derive::starlark_module;
 
 use crate::star::values::{
@@ -79,7 +79,13 @@ pub(crate) fn layout(builder: &mut GlobalsBuilder) {
             .ok_or_else(|| anyhow::anyhow!("a deployment's weights are a list"))?
             .iter()
             .collect();
-        let said = || weights.iter().map(|w| w.to_string()).collect::<Vec<_>>().join(", ");
+        let said = || {
+            weights
+                .iter()
+                .map(|w| w.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         let fields: Vec<(String, Value<'v>)> = if weights.len() == names.len() {
             names.into_iter().zip(weights.iter().copied()).collect()
         } else if weights.len() == 1 && !exact {

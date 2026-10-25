@@ -16,6 +16,7 @@ scripts/imagegen/
   zimage_vae_parity.py M1 drives pie's `vae.decode` reading FROM A GUEST
   flux2_golden.py     M2  FLUX.2-klein-4B golden + miniature forward
   wan22_golden.py     M3  Wan 2.2 TI2V-5B golden + miniature forwards
+  wan22_vae_parity.py M3  drives Wan's causal `vae.decode` frame by frame FROM A GUEST
   ltx2_golden.py      M4  the REAL LTX-2.5 video VAE decoder over a fixed latent
   hy3_golden.py       M6  HunyuanImage 3 miniature: one prefill + one denoise step
   hy3_parity.py       M6  drives pie's `hunyuanimage3-mini` row against it
@@ -128,7 +129,7 @@ python mini_dit_ref.py --out-dir /somewhere/else
 (`mini_dit_dpm2m_{fp32,bf16}.npz`); `mini_dit_parity.py all --solver dpm2m` drives
 the guest's device loop (`latent::dpm2m_step`) against it, and `gates.py` runs that as
 the `dpm-2m` row. `mini_dit_parity.py classes` drives the guest-stated attention
-mask (`forward-pass.attention-classes`) through four modes and checks its identities
+mask (`forward-pass.mask`) through four modes and checks its identities
 without a golden; `gates.py` runs that as `attn-classes`.
 
 On a card smaller than the roster assumes, `gates.py` takes `PIE_GATES_ROWS`,
@@ -381,7 +382,7 @@ the pixels the reference VAE decodes it to
 engine gate `engine-cuda/tests/the_z_image_vae_answers_the_reference` feeds
 that latent from the HOST; this script feeds it the way a guest can, through
 `examples/zimage-vae-parity`: the latent bound as the reading's
-`Voxels` port CHANNEL (whose declared shape is the clip's box), the answer
+voxel input CHANNEL (whose declared shape is the clip's box), the answer
 read off `intrinsics::pixels()`, and the picture out through
 `frames.from-channel` + `session.send-frames`.
 
@@ -438,7 +439,7 @@ Runs 64 target tokens + **2 references of 64 tokens** at RoPE `T = 10` and `T = 
 
 `AutoencoderKLFlux2` in fp32 (`force_upcast`) over the centre **32x32 tokens**
 of `--full`'s `latent.final`.  Both sides cut at the **128-wide /16 grid** the
-transformer itself holds, which is where `models::flux_2::vae` puts its port:
+transformer itself holds, which is where `models::flux_2::vae` puts its input:
 the VAE codes at 32 channels on a /8 grid and the pipeline packs a 2x2 block of
 those into one 128-channel cell (`_patchify_latents`), normalised by the frozen
 `BatchNorm2d(128)` (`(x - running_mean)/sqrt(running_var + eps)`).  There is no
@@ -469,11 +470,12 @@ encode `[1,512,512] -> [1,32,32]` cos 0.999957, mean |err| 0.0069, max 0.115.
 #### The pie side — `flux2_parity.py`
 
 `examples/flux2-parity` is the `flux2-mini` row's guest: one denoise
-step over three lanes of one group — the text lane (`context` port, the raw
-`[32, 192]` stack), the target lane (`latents`, 64 rows) and ONE reference
-lane (`latents` again, both references' 128 rows, at their own `T`
-offsets) — every lane binding `timestep` (`σ·1000`, i.e. 500) and
-`guidance` (4.0, raw), the target lane alone reading out `velocity()`.
+step as one pass over the lanes of one group — the text lane (`context`
+input, the raw `[32, 192]` stack), the target lane (`latents`, the VAE's own
+`[h, w, C]`) and one lane per reference picture (`latents` plus its
+`reference` ordinal; the model computes its `T` offset) — every lane binding
+`timestep` (`σ·1000`, i.e. 500) and `guidance` (4.0, raw), the target lane
+alone reading out `velocity(lane)`.
 `flux2_parity.py` turns `flux2_mini.npz`'s inputs into the case, runs it,
 and diffs pie's `[1, 64, 128]` against `mini.out.0[:, :64]` (the reference
 discards the reference rows' predictions; pie never computes them).
@@ -507,13 +509,9 @@ CUDA_VISIBLE_DEVICES=0 python flux2_klein_parity.py all \
 ```
 
 The config needs `[engine] max_model_len = 32768` (rows × submit depth) and
-`[model] source` at the artifact. It needs nothing said about `[runtime]
-submit_deadline` any more: this parity used to demand `"10s"` because at the
-50 ms default the cohort gate sealed the denoise group's FIRST frame with
-the image lane alone and the velocity came back unconditioned (cos ≈ 0.535
-against the golden, cos 0.9999 against a no-text reference). A stated cohort
-is now fired whole or not at all — the deadline is a density knob again, and
-this harness runs at the default so that a partial group would show up here.
+`[model] source` at the artifact. The step is one pass whose lanes are the
+group, so `[runtime] submit_deadline` cannot split it; this harness runs at
+the default so that a partial group would show up here.
 
 Measured (bf16 pie vs the bf16 golden, `graphs = "on"`):
 
@@ -600,6 +598,33 @@ CUDA_VISIBLE_DEVICES=3 python wan22_golden.py --vae     # needs `--full` to have
 |---|---|---:|---:|---|
 | decode | 5×30×52 → 17×480×832 | 0.999986 | 0.00244 | `the_wan_2_vae_answers_the_reference` |
 | encode | 17×480×832 → 5×30×52 | 0.999988 | 0.00492 | `the_wan_2_vae_encodes_the_reference` |
+
+#### The pie side, from a guest — `wan22_vae_parity.py`
+
+`wan22_golden.py --vae-ref` decodes a seeded DiT-space latent (`torch.randn`,
+seed 0, 3×16×16×48; needs only the snapshot's `vae/*`) into
+`golden/wan22/wan22_vae_ref/`. `examples/wan2-vae-parity` decodes it through
+the runtime the way `text-to-video` does — one `vae.decode` fire per latent
+frame, one working set whose recurrent state is the conv caches (frame =
+token), one pipeline; the derived `fresh` switch picks the head branch where
+the state is empty — and the script scores each chunk at
+`cos ≥ 0.9999`. The last chunk is decoded on a fork of the working set too,
+and must equal the parent's.
+
+```bash
+python wan22_golden.py --vae-ref --repo <snapshot dir>
+python wan22_vae_parity.py all --out /tmp/wan22-vae --config <config with Wan 2.2 as [model] source>
+```
+
+Measured 2026-10-25 (bf16 device vs fp32 reference; cos / mean |err| on
+`[−1, 1]`):
+
+| chunk | frames | cos | mean \|err\| |
+|---|---|---:|---:|
+| 0 (state empty) | 0 | 0.999984 | 0.00200 |
+| 1 | 1–4 | 0.999986 | 0.00149 |
+| 2 | 5–8 | 0.999986 | 0.00143 |
+| 2 on a fork | 5–8 | max \|diff\| from the parent's: 0.0 | |
 
 ### `ltx2_golden.py` → `/root/.cache/pie-imagegen/golden/ltx25/ltx2_vae/`
 
@@ -832,7 +857,7 @@ file is the roster, the plumbing and the reaper.
 | `zimage-vae` | `zimage_vae_parity.py all`, then `the_z_image_vae_answers_the_reference` | 0.99998 | the same VAE reading twice: once fired FROM A GUEST through the real runtime, once from the host. The two roads must agree with the reference to the same distance. |
 | `wan-mini` | `wan22_parity.py all`, `all --pertoken` | 0.999982, and the conditioning must MOVE | the `d128` miniature under both timestep forms (scalar, and TI2V's per-token one), each followed by the `conditioning` claim: zeroing the umT5 context must move the velocity by more than the gate's own slack. |
 | `hy3-mini` | `hy3_parity.py all` | velocity 0.999997, plus two claims | HunyuanImage 3's whole denoise step in three fires, plus `the prefix conditions the canvas` and `the prefix K/V is reused exactly` (D10's claim: after step 0 the prefix is never recomputed). |
-| `text-to-image` | the model-agnostic guest on `flux2-klein-4b.zt` | a real PNG | 4 steps at 1024², seed 0. FLUX.2 hands back the final latent (its VAE is traced, not a declared reading), so the gate finishes with `decode_latent.py` and then checks the PNG magic, its box and its size. |
+| `text-to-image` | the model-agnostic guest on `flux2-klein-4b.zt` | a real PNG | 4 steps at 1024², seed 0. The guest decodes through the row's `vae.decode` reading in-guest; the gate checks the PNG magic, its box and its size. |
 
 **The endpoint gates for distilled trajectories are BELOW the bf16 floor by
 design, and are reported rather than gated.**  Both `zimage`'s eight-step

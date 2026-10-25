@@ -100,7 +100,6 @@ SLIDING = 0
 GLOBAL = 1
 
 SELF_COND_TAPS = 64
-CANVAS = 256
 
 ASSISTANT_HIDDEN = 1024
 ASSISTANT_INTER = 8192
@@ -168,6 +167,7 @@ def media(id, deploy):
     return struct(image = struct(
         patch = PATCH, block = POOL, mrope = False,
         prefix = "<|image>", placeholder = "<|image|>", suffix = "<image|>",
+        frame = lambda h, w, budget: budget_resize(h, w, PATCH, POOL, SOFT_TOKENS if budget == "still" else VIDEO_SOFT_TOKENS),
     ))
 
 WIDE_TOWER = vision_tower(depth = 27, hidden = 1152, heads = 16, inter = 4304, clipped = False, standardize = True)
@@ -505,11 +505,6 @@ def layout(id, deploy):
         dflash = dflash_declare(DFLASH_26B_A4B, "aux", hidden, d.vocab, d.norm_eps, w, dense) if drafter == "dflash" else None,
     )
 
-def diffusion(m):
-    if m.self_cond == None:
-        return None
-    return canvas(canvas = CANVAS, hidden = m.hidden, self_cond_taps = SELF_COND_TAPS)
-
 # How a Gemma 4 checkpoint is laid out: transformers', mlx_lm's and GGUF's
 # spellings, and DiffusionGemma's own.
 
@@ -844,7 +839,7 @@ def geometry(m, reading):
     return m.glob.head_dim, m.glob.kv_heads, None
 
 def plans(m, input, plan):
-    """`plan` over `input` for each reading, indexed by it."""
+    """`plan` over `input` for the sliding and the global layers, in that order."""
     return [
         plan(input, m.q_heads, m.sliding.kv_heads, m.sliding.head_dim, m.sliding.window),
         plan(input, m.q_heads, m.glob.kv_heads, m.glob.head_dim, None),
@@ -863,6 +858,10 @@ def readout_tail(m, inputs, dr):
 
 def forward(m, inputs):
     dr = m.dflash
+    if m.self_cond != None:
+        switch("mode", ["encode", "denoise"])
+    if dr != None:
+        switch("block_draft", ["off", "on"])
     trunk_inputs = inputs.on(~block_rows(dr)) if dr != None else inputs
     positions = trunk_inputs.positions()
 
@@ -878,11 +877,12 @@ def forward(m, inputs):
 
     if m.self_cond != None:
         sc = m.self_cond
-        den, enc = y.on(fact.bidirectional()), y.on(~fact.bidirectional())
-        input_den = inputs.on(fact.bidirectional())
+        denoise = switch_is("mode", "denoise")
+        den, enc = y.on(denoise), y.on(~denoise)
+        input_den = inputs.on(denoise)
         soft = ops.gather.embed_weighted(
-            input_den.self_cond_rows(sc.taps),
-            input_den.self_cond_weights(sc.taps),
+            input_den.input("self_cond_ids", dtype.i32, "row", sc.taps),
+            input_den.input("self_cond_weights", dtype.f32, "row", sc.taps),
             m.embed,
             m.vocab,
         ) * root
@@ -940,8 +940,9 @@ def forward(m, inputs):
         # Each lane by its kind (the tail's whole rows are lanes that mask or
         # capture scores, so only those two); a global layer's scores go out
         # at their seam.
+        causal = ~switch_is("mode", "denoise") if m.self_cond != None else None
         a = ops.attn.attend(q, trunk_inputs, at.kv, m.q_heads, kv_heads, d, at.sm_scale, window = win,
-                            mask = True, scores = True, scores_seam = at.reading != SLIDING)
+                            causal = causal, mask = True, scores = True, scores_seam = at.reading != SLIDING)
         seam.at(seam.ATTN_OUT, [a])
         return normed, a, routes
 
@@ -1019,7 +1020,7 @@ def forward(m, inputs):
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
     hb = None
     if dr != None:
-        hb = arm(dr, inputs, tapped, h_block, inputs.mask(), block_rows(dr))
+        hb = arm(dr, inputs, tapped, h_block, block_rows(dr))
         x = merge([hb, x])
     if tail == None:
         x = ops.gather.gather_rows(x, inputs.readout_rows())

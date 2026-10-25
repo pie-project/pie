@@ -6,7 +6,6 @@ pub const PATCH_W: u32 = 2;
 pub const PATCH_VOL: u32 = PATCH_T * PATCH_H * PATCH_W;
 
 pub const ROPE_THETA: f32 = 10_000.0;
-pub const ROPE_AXES: u8 = 3;
 
 pub const TRAIN_STEPS: u32 = 1000;
 pub const SHIFT_TI2V: f32 = 5.0;
@@ -22,18 +21,9 @@ pub const TE_MAX_TOKENS: u32 = 512;
 
 pub const VAE_Z: u32 = 48;
 pub const VAE_PIX_CHANNELS: u32 = 12;
-pub const VAE_RGB: u32 = 3;
 pub const VAE_DECODER_DIMS: [u32; 5] = [1024, 1024, 1024, 512, 256];
 pub const VAE_RESNETS: u32 = 3;
 pub const VAE_TEMPORAL_UP: [bool; 4] = [true, true, false, false];
-
-pub mod port {
-    pub const LATENTS: u8 = 0;
-    pub const CONTEXT: u8 = 0;
-    pub const TIMESTEP: u8 = 0;
-    pub const POSITIONS: u8 = 0;
-    pub const VOXELS: u8 = 0;
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dims {
@@ -103,11 +93,6 @@ impl Dims {
     #[must_use]
     pub fn sm_scale(&self) -> f32 {
         (self.head_dim as f32).sqrt().recip()
-    }
-
-    #[must_use]
-    pub const fn patch_in(&self) -> u32 {
-        self.in_channels * PATCH_VOL
     }
 
     #[must_use]

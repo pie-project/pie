@@ -65,9 +65,6 @@ impl Palette {
     pub fn red<T: std::fmt::Display>(&self, text: T) -> Styled<T> {
         self.wrap("31", text)
     }
-    pub fn accent<T: std::fmt::Display>(&self, text: T) -> Styled<T> {
-        self.wrap("36", text)
-    }
 }
 
 pub struct Styled<T> {

@@ -255,11 +255,37 @@ def vae(banks):
         conv_out = vae_conv(VAE_RGB * VAE_PATCH * VAE_PATCH, dims[4], banks),
     )
 
+HALF_PI = 1.5707963267948966
+PATCH = [PATCH_T, PATCH_H, PATCH_W]
+ROPE_BASE_T = 20.0
+ROPE_BASE_HW = 2048.0
+# The text connectors' rope base length (`connector_rope_base_seq_len`).
+CONN_ROPE_BASE = 4096.0
+CAUSAL_OFFSET = 1
+AUDIO_COMPRESSION = 4
+AUDIO_HOP_SECONDS = 160.0 / 16000.0
+
+def constant(values):
+    return weight([len(values)], dtype.f32, values = values)
+
+def rope_constants():
+    video_t = VAE_TEMPORAL_COMPRESSION
+    hw_bias = f32(HALF_PI * (float(VAE_SPATIAL_COMPRESSION) / ROPE_BASE_HW) - HALF_PI)
+    return struct(
+        video_start = constant([float(CAUSAL_OFFSET - video_t)]),
+        video_end = constant([float(CAUSAL_OFFSET)]),
+        audio_start = constant([float(CAUSAL_OFFSET - AUDIO_COMPRESSION)]),
+        audio_end = constant([float(CAUSAL_OFFSET)]),
+        minus_half_pi = constant([-HALF_PI]),
+        hw_bias = constant([hw_bias, hw_bias]),
+    )
+
 def layout(id, deploy):
     banks = roles(deploy, "banks", exact = True).banks
     d = DIMS[id]
     return struct(
         dims = d,
+        rope = rope_constants(),
         rope_axes = ROPE_AXES,
         t_freq_dim = T_FREQ_DIM,
         dit = struct(
@@ -278,64 +304,14 @@ def layout(id, deploy):
 
 def generative(m):
     d = m.dims
-    refine_ports = [
-        port("text", "latents", d.text_in, ["text"], at = 1),
-        port("text_positions", "axis_positions", 1, ["text"], at = 1),
-    ]
-    readings = [
-        reading(
-            "denoise",
-            index = 0,
-            streams = ["video", "audio", "context", "reference"],
-            ports = [
-                port("latents", "latents", d.channels, ["video", "audio"], at = 0),
-                port("context", "context", d.cross_dim, ["context"], at = 0),
-                port("audio_context", "context", d.audio_cross_dim, ["reference"], at = 1),
-                port("timestep", "lane_vector", 1, [], at = 0),
-                port("positions", "axis_positions", ROPE_AXES, ["video"], at = 0),
-                port("audio_positions", "axis_positions", 1, ["audio"], at = 1),
-            ],
-            readout = "velocity",
-            readout_width = d.channels,
-        ),
-        reading(
-            "refine.video",
-            index = 1,
-            streams = ["text"],
-            ports = refine_ports,
-            readout = "hidden",
-            readout_width = d.cross_dim,
-        ),
-        reading(
-            "refine.audio",
-            index = 2,
-            streams = ["text"],
-            ports = refine_ports,
-            readout = "hidden",
-            readout_width = d.audio_cross_dim,
-        ),
-    ]
-    if m.vae != None:
-        readings.append(reading(
-            "vae.decode",
-            index = 3,
-            streams = ["video"],
-            ports = [port("latent", "voxels", VAE_Z, ["video"], at = 0)],
-            readout = "pixels",
-            readout_width = VAE_RGB,
-        ))
     return generation(
-        readings = readings,
         latent = latent_space(
             channels = d.channels,
-            patch_t = PATCH_T,
-            patch_h = PATCH_H,
-            patch_w = PATCH_W,
             spatial_compression = VAE_SPATIAL_COMPRESSION,
             temporal_compression = VAE_TEMPORAL_COMPRESSION,
+            first_frames = 1,
         ),
         schedule = schedule("flow", shift = 1.0, train_steps = TRAIN_STEPS, pinned_sigmas = DISTILLED_SIGMAS),
-        max_rows = 32768 + 2 * TEXT_LEN if d.layers == 48 else 4096,
     )
 
 # How an LTX-2.5 checkpoint is laid out: a diffusers pipeline, the
@@ -553,13 +529,16 @@ def caches(m, c):
     pass
 
 def forward(m, inputs):
-    velocity = inputs.reading("denoise", lambda rows: denoise(rows, m))
-    text_in = m.dims.text_in
+    switch("reading", ["denoise", "refine.video", "refine.audio"] + (["vae.decode"] if m.vae != None else []))
+    switch("stream", ["video", "audio", "context", "reference"])
+    switch("positions", ["computed", "given"])
+    reading = lambda name: inputs.on(switch_is("reading", name))
     video, audio = m.connectors
-    inputs.reading("refine.video", lambda rows: refine(rows, video, text_in))
-    inputs.reading("refine.audio", lambda rows: refine(rows, audio, text_in))
+    refine(reading("refine.video"), video, m)
+    refine(reading("refine.audio"), audio, m)
+    velocity = denoise(reading("denoise"), m)
     if m.vae != None:
-        inputs.reading("vae.decode", lambda rows: vae_decode(rows, m.vae))
+        vae_decode(reading("vae.decode"), m.vae)
     return velocity
 
 def rms(x):
@@ -676,22 +655,60 @@ def run_block(xv, xa, b, d, mv, ma, ctx, actx, vg, ag, v_time, cg, acg):
     xa = ff_sublayer(xa, b.audio.ffn, ma.m.mlp_ss, ma.m.mlp_gate, ag.lanes)
     return (xv, xa)
 
+def causal_mid(index, k, start, end):
+    """Twice the midpoint of latent index `i`'s causal span `[max(k·i + 1 - k, 0), k·(i + 1) + 1 - k)`."""
+    first = ops.elemwise.clamp(ops.elemwise.add_bias(start, ops.elemwise.mul_scalar(float(k), ops.elemwise.copy(index))), 0.0, 3.0e38)
+    last = ops.elemwise.add_bias(end, ops.elemwise.mul_scalar(float(k), ops.elemwise.copy(index)))
+    return ops.elemwise.add(first, last)
+
+def video_positions(rows, m):
+    """The patch's pixel-space midpoint (time in seconds), as `(2·coordinate / base - 1)·π/2`."""
+    given = switch_is("positions", "given")
+    stated = rows.on(given).input("positions", dtype.f32, "row", m.rope_axes)
+    rows = rows.on(~given)
+    cells, _ = ops.gather.split_rows(ops.conv.cells(rows.token_grid(PATCH), rows.positions(), 0), 3)
+    t, hw = ops.gather.split_rows(cells, 1)
+    c = m.rope
+    span = causal_mid(t, VAE_TEMPORAL_COMPRESSION, c.video_start, c.video_end)
+    fps = ops.gather.gather_rows(rows.input("fps", dtype.f32, "lane", 1), rows.request_of_token())
+    t = ops.elemwise.mul_scalar(f32(0.5 * HALF_PI * 2.0 / ROPE_BASE_T), ops.elemwise.div(span, fps))
+    t = ops.elemwise.add_bias(c.minus_half_pi, t)
+    scale = f32(HALF_PI * 2.0 * float(VAE_SPATIAL_COMPRESSION) / ROPE_BASE_HW)
+    hw = ops.elemwise.add_bias(c.hw_bias, ops.elemwise.mul_scalar(scale, hw))
+    return merge([stated, ops.gather.concat_cols([t, hw])])
+
+def audio_positions(rows, m):
+    """The latent frame's midpoint in seconds, as `(2·s / base - 1)·π/2`."""
+    given = switch_is("positions", "given")
+    stated = rows.on(given).input("audio_positions", dtype.f32, "row", 1)
+    rows = rows.on(~given)
+    f, _ = ops.gather.split_rows(ops.conv.cells(rows.token_grid(PATCH), rows.positions(), 0), 1)
+    c = m.rope
+    span = causal_mid(f, AUDIO_COMPRESSION, c.audio_start, c.audio_end)
+    t = ops.elemwise.mul_scalar(f32(0.5 * AUDIO_HOP_SECONDS * HALF_PI * 2.0 / ROPE_BASE_T), span)
+    return merge([stated, ops.elemwise.add_bias(c.minus_half_pi, t)])
+
+def patched(rows, d):
+    latents = rows.input("latents", dtype.bf16, "voxel", d.channels)
+    return ops.conv.patchify(latents, rows.grid(), PATCH, rows.token_grid(PATCH))
+
 def denoise(arm, m):
     d = m.dims
     dit = m.dit
-    ctx, rest = arm.on(fact.stream("context")), arm.on(~fact.stream("context"))
-    actx, media = rest.on(fact.stream("reference")), rest.on(~fact.stream("reference"))
-    vid, aud = media.on(fact.stream("video")), media.on(~fact.stream("video"))
+    stream = lambda name: switch_is("stream", name)
+    ctx, rest = arm.on(stream("context")), arm.on(~stream("context"))
+    actx, media = rest.on(stream("reference")), rest.on(~stream("reference"))
+    vid, aud = media.on(stream("video")), media.on(~stream("video"))
 
     vg = struct(
         lanes = vid.request_of_token(),
-        positions = vid.axis_positions(0, m.rope_axes),
+        positions = video_positions(vid, m),
         perm = vid.row_permutation(),
         csr = vid.group_indptr(),
     )
     ag = struct(
         lanes = aud.request_of_token(),
-        positions = aud.axis_positions(1, 1),
+        positions = audio_positions(aud, m),
         perm = aud.row_permutation(),
         csr = aud.group_indptr(),
     )
@@ -699,17 +716,17 @@ def denoise(arm, m):
     acg = struct(lanes = actx.request_of_token(), perm = actx.row_permutation(), csr = actx.group_indptr())
     v_time, _ = ops.gather.split_rows(vg.positions, 1)
 
-    vt = vid.lane_vector(0, 1)
-    at = aud.lane_vector(0, 1)
+    vt = vid.input("timestep", dtype.f32, "lane", 1)
+    at = aud.input("timestep", dtype.f32, "lane", 1)
     mods_v = stream_mods(dit.video, vt, m)
     mods_a = stream_mods(dit.audio, at, m)
-    prompt_v, _ = run_adaln(dit.prompt, sinusoid(ctx.lane_vector(0, 1), m))
-    prompt_a, _ = run_adaln(dit.audio_prompt, sinusoid(actx.lane_vector(0, 1), m))
+    prompt_v, _ = run_adaln(dit.prompt, sinusoid(ctx.input("timestep", dtype.f32, "lane", 1), m))
+    prompt_a, _ = run_adaln(dit.audio_prompt, sinusoid(actx.input("timestep", dtype.f32, "lane", 1), m))
 
-    xv = run_linear(dit.video.patchify, vid.latents(0, d.channels, dtype.bf16))
-    xa = run_linear(dit.audio.patchify, aud.latents(0, d.channels, dtype.bf16))
-    ctx_rows = ctx.context(0, d.cross_dim)
-    actx_rows = actx.context(1, d.audio_cross_dim)
+    xv = run_linear(dit.video.patchify, patched(vid, d))
+    xa = run_linear(dit.audio.patchify, patched(aud, d))
+    ctx_rows = ctx.input("context", dtype.bf16, "row", d.cross_dim)
+    actx_rows = actx.input("audio_context", dtype.bf16, "row", d.audio_cross_dim)
 
     def step(l, b, carried):
         xv, xa = carried
@@ -725,18 +742,31 @@ def denoise(arm, m):
 
     vv = head(xv, dit.video, mods_v, vg)
     va = head(xa, dit.audio, mods_a, ag)
-    velocity = merge([vv, va])
+    velocity = merge([
+        ops.conv.unpatchify(vv, vid.token_grid(PATCH), PATCH, vid.grid()),
+        ops.conv.unpatchify(va, aud.token_grid(PATCH), PATCH, aud.grid()),
+    ])
     seam.at(seam.VELOCITY, [velocity])
     return velocity
 
-def refine(arm, conn, text_in):
+def text_positions(arm, m):
+    """Prompt row `j` at `(2·j / base - 1)·π/2`."""
+    given = switch_is("positions", "given")
+    stated = arm.on(given).input("text_positions", dtype.f32, "row", 1)
+    rows = arm.on(~given)
+    j, _ = ops.gather.split_rows(ops.conv.cells(rows.token_grid(PATCH), rows.positions(), 0), 1)
+    t = ops.elemwise.mul_scalar(f32(HALF_PI * 2.0 / CONN_ROPE_BASE), j)
+    return merge([stated, ops.elemwise.add_bias(m.rope.minus_half_pi, t)])
+
+def refine(arm, conn, m):
+    text_in = m.dims.text_in
     g = struct(
         lanes = arm.request_of_token(),
-        positions = arm.axis_positions(1, 1),
+        positions = text_positions(arm, m),
         perm = arm.row_permutation(),
         csr = arm.lane_indptr(),
     )
-    x = arm.latents(1, text_in, dtype.bf16)
+    x = arm.input("text", dtype.bf16, "row", text_in)
     h = ops.elemwise.mul_scalar(conn.rescale, ops.linear.matmul(x, conn.aggregate.w))
     h = ops.elemwise.add_bias(conn.aggregate.bias, h)
 
@@ -766,7 +796,7 @@ def resnet(x, g, r):
 
 def vae_decode(arm, vae):
     g = arm.grid()
-    z = ops.elemwise.copy(arm.voxels(0, vae.z, dtype.bf16))
+    z = ops.elemwise.copy(arm.input("latent", dtype.bf16, "voxel", vae.z))
     z = ops.elemwise.standardize(z, vae.zero, vae.latents_std)
     z = ops.elemwise.add_bias(vae.latents_mean, z)
 

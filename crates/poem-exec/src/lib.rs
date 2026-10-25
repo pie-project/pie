@@ -11,6 +11,7 @@
 mod error;
 
 pub mod dispatch;
+pub mod feeds;
 pub mod fire;
 pub mod law;
 pub mod store;

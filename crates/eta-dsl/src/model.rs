@@ -34,7 +34,3 @@ pub(crate) fn vocab() -> u32 {
 pub(crate) fn page_size() -> u32 {
     MODEL.with(|m| m.get().page_size)
 }
-#[cfg(test)]
-pub fn with_test_profile<R>(profile: &eta_ir::registry::ModelProfile, f: impl FnOnce() -> R) -> R {
-    with_constants(profile.vocab, profile.page_size, f)
-}

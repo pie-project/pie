@@ -94,62 +94,14 @@ struct LaneState {
     leashed: bool,
     clock_from: Option<Instant>,
     frames: VecDeque<PendingFrame>,
-    group: Option<u32>,
     fired_this_boundary: bool,
     /// Its last sealed frame carried a prompt: its next pass is built on the
     /// host from what that prompt answers, so only decodes wait for it.
     prompting: bool,
 }
 
-#[derive(Debug)]
-struct Cohort {
-    expected: u32,
-    arrived: BTreeSet<ProcessId>,
-    since: Instant,
-    condemned: bool,
-}
-
-impl Cohort {
-    fn complete(&self) -> bool {
-        self.arrived.len() as u64 >= u64::from(self.expected)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum Doom {
-    Abandoned,
-    CohortNeverComplete {
-        group: u32,
-        expected: u32,
-        arrived: u32,
-    },
-}
-
-impl std::fmt::Display for Doom {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Abandoned => f.write_str(
-                "pipeline abandoned: silent past the silence timeout without submitting \
-                 and without calling forward.park()",
-            ),
-            Self::CohortNeverComplete {
-                group,
-                expected,
-                arrived,
-            } => write!(
-                f,
-                "attention group {group} never composed: {expected} live forward passes name \
-                 the group and only {arrived} of them reached the runtime on a lane of its \
-                 own before the silence timeout. A group attends inside ONE fire, so the \
-                 runtime will not fire it short — every forward pass that names a group must \
-                 submit into the group's next frame, each down a pipeline of its own (a \
-                 pipeline is serial, so two of a group's passes submitted to ONE pipeline \
-                 arrive as one lane and count once; a pass that means to sit out must not \
-                 name the group, and dropping it is enough to leave)"
-            ),
-        }
-    }
-}
+pub(super) const ABANDONED: &str = "pipeline abandoned: silent past the silence timeout without \
+     submitting and without calling forward.park()";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GateVerdict {
@@ -159,15 +111,6 @@ enum GateVerdict {
 }
 
 impl LaneState {
-    fn group_key(&self) -> Option<(ProcessId, u32)> {
-        self.owner.zip(self.group)
-    }
-
-    fn owes_its_group(&self) -> bool {
-        (self.awaited || self.leashed)
-            && !self.frames.front().is_some_and(PendingFrame::is_complete)
-    }
-
     fn gate_verdict(&self, relax: bool, owes: bool) -> GateVerdict {
         if !self.awaited || self.frames.front().is_some_and(PendingFrame::is_complete) {
             return GateVerdict::Satisfied;
@@ -189,7 +132,7 @@ pub(super) enum FramePlan {
     Dispatch(Vec<Vec<u64>>),
     Hold(Duration),
     Park,
-    Terminate(Vec<(ProcessId, Doom)>),
+    Terminate(Vec<ProcessId>),
 }
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
@@ -240,7 +183,6 @@ pub(super) struct FramePolicy {
     last_retire_at: Option<Instant>,
     idle_dumped: bool,
     pending_binds: BTreeMap<ProcessId, usize>,
-    cohorts: BTreeMap<(ProcessId, u32), Cohort>,
     staged: BTreeSet<ProcessId>,
     /// The seal under way takes prompts alone: the decodes wait out the
     /// lanes coming off a prompt, which no prompt waits for.
@@ -278,12 +220,6 @@ impl FramePolicy {
         self
     }
 
-    #[cfg(test)]
-    fn with_silence_timeout(mut self, timeout: Duration) -> Self {
-        self.silence_timeout = timeout;
-        self
-    }
-
     pub fn new(
         k: usize,
         max_wave_rows: usize,
@@ -301,7 +237,6 @@ impl FramePolicy {
             last_retire_at: None,
             idle_dumped: false,
             pending_binds: BTreeMap::new(),
-            cohorts: BTreeMap::new(),
             staged: BTreeSet::new(),
             prompts_only: false,
             pending_slots: 0,
@@ -335,9 +270,8 @@ impl FramePolicy {
         fire_id: u64,
         tokens: usize,
         rows: usize,
-        cohort: Option<(u32, u32)>,
     ) {
-        self.on_fire_reading(stamp, owner, fire_id, tokens, rows, rows, cohort);
+        self.on_fire_reading(stamp, owner, fire_id, tokens, rows, rows);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -349,10 +283,8 @@ impl FramePolicy {
         tokens: usize,
         rows: usize,
         readouts: usize,
-        cohort: Option<(u32, u32)>,
     ) {
         let accept_began = self.stats.is_some().then(Instant::now);
-        self.gather_cohort(stamp.lane, owner, cohort);
         self.record_arrival(
             stamp,
             owner,
@@ -364,11 +296,6 @@ impl FramePolicy {
                 readouts,
             },
         );
-        if let Some((group, _)) = cohort
-            && let Some(lane) = self.lanes.get_mut(&stamp.lane)
-        {
-            lane.group = Some(group);
-        }
         if let (Some(began), Some(stats)) = (accept_began, &self.stats) {
             use std::sync::atomic::Ordering::Relaxed;
             stats
@@ -392,74 +319,6 @@ impl FramePolicy {
                 readouts: 0,
             },
         );
-    }
-
-    fn gather_cohort(
-        &mut self,
-        lane: ProcessId,
-        owner: Option<ProcessId>,
-        cohort: Option<(u32, u32)>,
-    ) {
-        let (Some(owner), Some((group, expected))) = (owner, cohort) else {
-            return;
-        };
-        let entry = self
-            .cohorts
-            .entry((owner, group))
-            .or_insert_with(|| Cohort {
-                expected,
-                arrived: BTreeSet::new(),
-                since: Instant::now(),
-                condemned: false,
-            });
-        entry.expected = entry.expected.max(expected);
-        entry.arrived.insert(lane);
-        if entry.complete() {
-            self.cohorts.remove(&(owner, group));
-        }
-    }
-
-    fn cohort_verdict(&mut self, now: Instant) -> Vec<(ProcessId, Doom)> {
-        if self.cohorts.is_empty() {
-            return Vec::new();
-        }
-        let timeout = self.silence_timeout;
-        let mut doomed = Vec::new();
-        for ((owner, group), cohort) in self.cohorts.iter_mut() {
-            if cohort.condemned || now.saturating_duration_since(cohort.since) < timeout {
-                continue;
-            }
-            cohort.condemned = true;
-            doomed.push((
-                *owner,
-                Doom::CohortNeverComplete {
-                    group: *group,
-                    expected: cohort.expected,
-                    arrived: cohort.arrived.len() as u32,
-                },
-            ));
-        }
-        doomed
-    }
-
-    fn group_assembling(&self) -> bool {
-        !self.cohorts.is_empty()
-            || self
-                .lanes
-                .values()
-                .any(|lane| !lane.frames.is_empty() && self.group_short(lane))
-    }
-
-    fn group_short(&self, lane: &LaneState) -> bool {
-        let Some(key) = lane.group_key() else {
-            return false;
-        };
-        if self.cohorts.contains_key(&key) {
-            return true;
-        }
-        self.lanes
-            .values()
-            .any(|other| other.group_key() == Some(key) && other.owes_its_group())
     }
 
     fn record_arrival(&mut self, stamp: FrameStamp, owner: Option<ProcessId>, fire: ArrivedFire) {
@@ -486,7 +345,6 @@ impl FramePolicy {
             leashed: false,
             clock_from: None,
             frames: VecDeque::new(),
-            group: None,
             fired_this_boundary: true,
             prompting: false,
         });
@@ -692,7 +550,6 @@ impl FramePolicy {
         }
         if let Some(owner) = owner {
             self.pending_binds.remove(&owner);
-            self.cohorts.retain(|(who, _), _| *who != owner);
             self.forget_staged(owner);
         }
         self.maybe_reset_episode();
@@ -711,7 +568,6 @@ impl FramePolicy {
         }
         self.lanes.retain(|_, lane| lane.owner != Some(owner));
         self.pending_binds.remove(&owner);
-        self.cohorts.retain(|(who, _), _| *who != owner);
         self.suspended.remove(&owner);
         self.forget_staged(owner);
         self.maybe_reset_episode();
@@ -740,7 +596,6 @@ impl FramePolicy {
             }
         }
         self.pending_binds.remove(&owner);
-        self.cohorts.retain(|(who, _), _| *who != owner);
         self.forget_staged(owner);
         self.maybe_reset_episode();
     }
@@ -782,9 +637,9 @@ impl FramePolicy {
     }
 
     fn have_seal_candidate(&self) -> bool {
-        self.lanes.values().any(|lane| {
-            lane.frames.front().is_some_and(PendingFrame::is_complete) && !self.group_short(lane)
-        })
+        self.lanes
+            .values()
+            .any(|lane| lane.frames.front().is_some_and(PendingFrame::is_complete))
     }
 
     fn boundary_open(&self) -> bool {
@@ -833,9 +688,6 @@ impl FramePolicy {
                 if !lane.frames.front().is_some_and(PendingFrame::is_complete) {
                     continue;
                 }
-                if self.group_short(lane) {
-                    continue;
-                }
                 if mid_boundary && lane.fired_this_boundary {
                     continuing.push(*lane_id);
                 } else {
@@ -876,126 +728,70 @@ impl FramePolicy {
             let mut wave_readouts = vec![0usize; k];
             let mut members: HashSet<ProcessId> = HashSet::new();
             let mut dropped_empty = false;
-            let mut units: Vec<Vec<ProcessId>> = Vec::with_capacity(order.len());
-            let mut placed: BTreeSet<ProcessId> = BTreeSet::new();
             for lane_id in &order {
-                if !placed.insert(*lane_id) {
+                let Some(lane) = self.lanes.get_mut(lane_id) else {
                     continue;
-                }
-                match self.lanes.get(lane_id).and_then(LaneState::group_key) {
-                    None => units.push(vec![*lane_id]),
-                    Some(key) => {
-                        let unit: Vec<ProcessId> = order
-                            .iter()
-                            .copied()
-                            .filter(|id| {
-                                self.lanes.get(id).and_then(LaneState::group_key) == Some(key)
-                            })
-                            .collect();
-                        placed.extend(unit.iter().copied());
-                        units.push(unit);
-                    }
-                }
-            }
-            for unit in units {
-                let mut unit_fires: Vec<(ProcessId, Vec<PlacedFire>)> =
-                    Vec::with_capacity(unit.len());
-                let mut unit_rows = vec![0usize; k];
-                let mut unit_tokens = vec![0usize; k];
-                let mut unit_readouts = vec![0usize; k];
-                let mut short = false;
-                for lane_id in &unit {
-                    let Some(lane) = self.lanes.get_mut(lane_id) else {
-                        short = true;
-                        continue;
-                    };
-                    let Some(front) = lane.frames.front() else {
-                        short = true;
-                        continue;
-                    };
-                    let live: Vec<PlacedFire> = front
-                        .fires
-                        .iter()
-                        .filter_map(|fire| {
-                            fire.fire_id.map(|fire_id| PlacedFire {
-                                wave: (fire.slot as usize).min(k - 1),
-                                fire_id,
-                                rows: fire.rows.max(1),
-                                tokens: fire.tokens,
-                                readouts: fire.readouts,
-                            })
-                        })
-                        .collect();
-                    if live.is_empty() {
-                        lane.frames.pop_front();
-                        dropped_empty = true;
-                        short = true;
-                        continue;
-                    }
-                    let fits = live.iter().all(|fire| {
-                        let reading = wave_readouts[fire.wave] + unit_readouts[fire.wave];
-                        wave_rows[fire.wave] + unit_rows[fire.wave] + fire.rows <= max_wave_rows
-                            && wave_tokens[fire.wave] + unit_tokens[fire.wave] + fire.tokens
-                                <= max_wave_tokens
-                            && (max_wave_readouts == 0
-                                || reading == 0
-                                || reading + fire.readouts <= max_wave_readouts)
-                    });
-                    if !fits {
-                        short = true;
-                        continue;
-                    }
-                    for fire in &live {
-                        unit_rows[fire.wave] += fire.rows;
-                        unit_tokens[fire.wave] += fire.tokens;
-                        unit_readouts[fire.wave] += fire.readouts;
-                    }
-                    unit_fires.push((*lane_id, live));
-                }
-                if short {
+                };
+                let Some(front) = lane.frames.front() else {
                     continue;
-                }
-                let prompt = unit_fires
+                };
+                let live: Vec<PlacedFire> = front
+                    .fires
                     .iter()
-                    .flat_map(|(_, live)| live)
-                    .any(|fire| fire.tokens > fire.rows);
-                let grouped = self
-                    .lanes
-                    .get(&unit[0])
-                    .and_then(LaneState::group_key)
-                    .is_some();
-                if (self.prompts_only && (!prompt || grouped))
-                    || (prompt
-                        && !grouped
-                        && prompting_in_flight.iter().any(|lane| !unit.contains(lane)))
+                    .filter_map(|fire| {
+                        fire.fire_id.map(|fire_id| PlacedFire {
+                            wave: (fire.slot as usize).min(k - 1),
+                            fire_id,
+                            rows: fire.rows.max(1),
+                            tokens: fire.tokens,
+                            readouts: fire.readouts,
+                        })
+                    })
+                    .collect();
+                if live.is_empty() {
+                    lane.frames.pop_front();
+                    dropped_empty = true;
+                    continue;
+                }
+                let fits = live.iter().all(|fire| {
+                    let reading = wave_readouts[fire.wave];
+                    wave_rows[fire.wave] + fire.rows <= max_wave_rows
+                        && wave_tokens[fire.wave] + fire.tokens <= max_wave_tokens
+                        && (max_wave_readouts == 0
+                            || reading == 0
+                            || reading + fire.readouts <= max_wave_readouts)
+                });
+                if !fits {
+                    continue;
+                }
+                let prompting = live.iter().any(|fire| fire.tokens > fire.rows);
+                if (self.prompts_only && !prompting)
+                    || (prompting && prompting_in_flight.iter().any(|lane| lane != lane_id))
                 {
                     continue;
                 }
-                for (lane_id, live) in unit_fires {
-                    let prompting = live.iter().any(|fire| fire.tokens > fire.rows);
-                    for fire in &live {
-                        wave_rows[fire.wave] += fire.rows;
-                        wave_tokens[fire.wave] += fire.tokens;
-                        wave_readouts[fire.wave] += fire.readouts;
-                        waves[fire.wave].push(fire.fire_id);
-                        fire_waves.insert(fire.fire_id, fire.wave);
-                    }
-                    members.insert(lane_id);
-                    let lane = self.lanes.get_mut(&lane_id).expect("measured lane exists");
-                    let frame_complete_at = lane.frames.front().and_then(|front| front.complete_at);
-                    if let (Some(done), Some(from)) = (frame_complete_at, lane.retired_at) {
-                        let us = done.saturating_duration_since(from).as_micros() as u64;
-                        if let Some(stats) = &self.stats {
-                            use std::sync::atomic::Ordering::Relaxed;
-                            stats.fire.quorum.turnaround_sum_us.fetch_add(us, Relaxed);
-                            stats.fire.quorum.turnaround_n.fetch_add(1, Relaxed);
-                            stats.fire.quorum.turnaround_max_us.fetch_max(us, Relaxed);
-                        }
-                    }
-                    lane.served = true;
-                    lane.prompting = prompting;
-                    lane.frames.pop_front();
+                for fire in &live {
+                    wave_rows[fire.wave] += fire.rows;
+                    wave_tokens[fire.wave] += fire.tokens;
+                    wave_readouts[fire.wave] += fire.readouts;
+                    waves[fire.wave].push(fire.fire_id);
+                    fire_waves.insert(fire.fire_id, fire.wave);
                 }
+                members.insert(*lane_id);
+                let lane = self.lanes.get_mut(lane_id).expect("measured lane exists");
+                let frame_complete_at = lane.frames.front().and_then(|front| front.complete_at);
+                if let (Some(done), Some(from)) = (frame_complete_at, lane.retired_at) {
+                    let us = done.saturating_duration_since(from).as_micros() as u64;
+                    if let Some(stats) = &self.stats {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        stats.fire.quorum.turnaround_sum_us.fetch_add(us, Relaxed);
+                        stats.fire.quorum.turnaround_n.fetch_add(1, Relaxed);
+                        stats.fire.quorum.turnaround_max_us.fetch_max(us, Relaxed);
+                    }
+                }
+                lane.served = true;
+                lane.prompting = prompting;
+                lane.frames.pop_front();
             }
             if fire_waves.is_empty() {
                 if dropped_empty {
@@ -1231,10 +1027,6 @@ ready_age_newest={}us",
                 self.idle_dumped = false;
                 return FramePlan::Park;
             }
-            let doomed = self.cohort_verdict(now);
-            if !doomed.is_empty() {
-                return FramePlan::Terminate(doomed);
-            }
             let mut missing_decoders = 0usize;
             let mut missing = 0;
             let mut expired: Vec<ProcessId> = Vec::new();
@@ -1296,12 +1088,7 @@ ready_age_newest={}us",
             if !expired.is_empty() {
                 expired.sort_unstable();
                 expired.dedup();
-                return FramePlan::Terminate(
-                    expired
-                        .into_iter()
-                        .map(|pid| (pid, Doom::Abandoned))
-                        .collect(),
-                );
+                return FramePlan::Terminate(expired);
             }
             if super::worker::wave_trace() {
                 super::worker::wave_trace_emit(format!(
@@ -1343,9 +1130,6 @@ ready_age_newest={}us",
             match self.seal() {
                 Some(FramePlan::Dispatch(_)) => continue,
                 Some(plan) => return plan,
-                None if self.group_assembling() => {
-                    return FramePlan::Hold(Duration::from_micros(GATHER_POLL_US));
-                }
                 None => return FramePlan::Park,
             }
         }
@@ -1437,13 +1221,6 @@ mod tests {
     #[test]
     fn frame_every_case() {
         seals_complete_lanes_and_orders_waves_by_slot();
-        a_grouped_lanes_first_frame_waits_for_its_cohort();
-        a_group_composes_on_a_pipeline_that_already_fired_ungrouped();
-        a_stated_cohort_is_never_sealed_short();
-        a_cohort_that_never_completes_kills_its_request_by_name();
-        a_group_never_fires_short_when_the_leash_drops_a_member();
-        a_gathering_cohort_holds_its_own_lanes_and_not_the_fleet();
-        a_group_is_never_split_across_two_partitions();
         incomplete_lane_holds_the_seal_until_it_completes();
         sealed_frame_dispatches_whole_and_frames_overlap();
         a_fire_racing_the_suspend_seals_alone_without_rejoining_the_wait_set();
@@ -1464,15 +1241,7 @@ mod tests {
         let mut policy = FramePolicy::new(1, 64, 4096, None).with_max_wave_readouts(8);
         let lanes: Vec<ProcessId> = (0..3).map(|_| pid()).collect();
         for (at, &lane) in lanes.iter().enumerate() {
-            policy.on_fire_reading(
-                stamp(lane, 0, 0, 1),
-                Some(lane),
-                10 + at as u64,
-                5,
-                1,
-                5,
-                None,
-            );
+            policy.on_fire_reading(stamp(lane, 0, 0, 1), Some(lane), 10 + at as u64, 5, 1, 5);
         }
         let mut sealed_ids = Vec::new();
         for _ in 0..3 {
@@ -1490,7 +1259,7 @@ mod tests {
         assert_eq!(sealed_ids, vec![10, 11, 12], "every lane seals in its turn");
 
         let lone = pid();
-        policy.on_fire_reading(stamp(lone, 0, 0, 1), Some(lone), 20, 12, 1, 12, None);
+        policy.on_fire_reading(stamp(lone, 0, 0, 1), Some(lone), 20, 12, 1, 12);
         let queued: QueuedFireIds = [20].into_iter().collect();
         assert_eq!(
             fires(&plan(&mut policy, &queued, Instant::now())),
@@ -1523,7 +1292,7 @@ mod tests {
             );
             for (piece, frame) in framed.into_iter().enumerate() {
                 let id = 100 + 2 * at as u64 + piece as u64;
-                policy.on_fire_enqueued(frame.expect("framed"), Some(lane), id, 128, 1, None);
+                policy.on_fire_enqueued(frame.expect("framed"), Some(lane), id, 128, 1);
                 ids.push(id);
             }
         }
@@ -1569,9 +1338,9 @@ mod tests {
         let mut policy = FramePolicy::new(4, 64, 4096, None);
         let (a, b) = (pid(), pid());
         for slot in 0..4 {
-            policy.on_fire_enqueued(stamp(a, 0, slot, 4), Some(a), 100 + slot as u64, 1, 1, None);
+            policy.on_fire_enqueued(stamp(a, 0, slot, 4), Some(a), 100 + slot as u64, 1, 1);
         }
-        policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 200, 37, 1, None);
+        policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 200, 37, 1);
 
         let queued: QueuedFireIds = [100, 101, 102, 103, 200].into_iter().collect();
         let sealed = plan(&mut policy, &queued, Instant::now());
@@ -1586,245 +1355,13 @@ mod tests {
         assert_eq!(waves[3], vec![103]);
     }
 
-    fn a_grouped_lanes_first_frame_waits_for_its_cohort() {
-        let mut policy =
-            FramePolicy::new(1, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
-        let owner = pid();
-        let (caption, context, image) = (pid(), pid(), pid());
-        let now = Instant::now();
-
-        policy.on_fire_enqueued(stamp(caption, 0, 0, 1), Some(owner), 1, 8, 1, Some((7, 3)));
-        let queued: QueuedFireIds = [1].into_iter().collect();
-        assert!(
-            matches!(plan(&mut policy, &queued, now), FramePlan::Hold(_)),
-            "the first lane of a cohort of three must not seal alone"
-        );
-        policy.on_fire_enqueued(stamp(context, 0, 0, 1), Some(owner), 2, 16, 1, Some((7, 3)));
-        let queued: QueuedFireIds = [1, 2].into_iter().collect();
-        assert!(
-            matches!(plan(&mut policy, &queued, now), FramePlan::Hold(_)),
-            "two of three still hold"
-        );
-        policy.on_fire_enqueued(stamp(image, 0, 0, 1), Some(owner), 3, 64, 1, Some((7, 3)));
-        let queued: QueuedFireIds = [1, 2, 3].into_iter().collect();
-        let mut sealed = fires(&plan(&mut policy, &queued, now));
-        sealed.sort_unstable();
-        assert_eq!(
-            sealed,
-            vec![1, 2, 3],
-            "the whole cohort seals into one frame"
-        );
-        assert!(policy.cohorts.is_empty(), "a complete cohort is forgotten");
-
-        policy.on_fire_enqueued(stamp(caption, 1, 0, 1), Some(owner), 4, 8, 1, Some((7, 3)));
-        policy.on_fire_enqueued(stamp(image, 1, 0, 1), Some(owner), 5, 64, 1, Some((7, 3)));
-        let queued: QueuedFireIds = [4, 5].into_iter().collect();
-        assert!(matches!(
-            plan(&mut policy, &queued, now),
-            FramePlan::Hold(_)
-        ));
-        policy.on_fire_enqueued(stamp(context, 1, 0, 1), Some(owner), 6, 16, 1, Some((7, 3)));
-        assert!(policy.cohorts.is_empty(), "a complete cohort is forgotten");
-        let queued: QueuedFireIds = [4, 5, 6].into_iter().collect();
-        let mut sealed = fires(&plan(&mut policy, &queued, now));
-        sealed.sort_unstable();
-        assert_eq!(sealed, vec![4, 5, 6]);
-    }
-
-    fn a_group_composes_on_a_pipeline_that_already_fired_ungrouped() {
-        for reuse_first in [false, true] {
-            let mut policy =
-                FramePolicy::new(1, 64, 4096, None).with_submit_deadline(Duration::from_millis(50));
-            let owner = pid();
-            let (image, context) = (pid(), pid());
-            let now = Instant::now();
-
-            policy.on_fire_enqueued(stamp(image, 0, 0, 1), Some(owner), 1, 8, 1, None);
-            let queued: QueuedFireIds = [1].into_iter().collect();
-            assert_eq!(fires(&plan(&mut policy, &queued, now)), vec![1]);
-            policy.on_frame_retired([image]);
-
-            let (first, second) = if reuse_first {
-                ((image, 1, 2u64), (context, 0, 3u64))
-            } else {
-                ((context, 0, 2u64), (image, 1, 3u64))
-            };
-            policy.on_fire_enqueued(
-                stamp(first.0, first.1, 0, 1),
-                Some(owner),
-                first.2,
-                8,
-                1,
-                Some((0, 2)),
-            );
-            let queued: QueuedFireIds = [first.2].into_iter().collect();
-            assert!(
-                matches!(plan(&mut policy, &queued, now), FramePlan::Hold(_)),
-                "one lane of a cohort of two must not seal alone (reuse_first={reuse_first})"
-            );
-            policy.on_fire_enqueued(
-                stamp(second.0, second.1, 0, 1),
-                Some(owner),
-                second.2,
-                16,
-                1,
-                Some((0, 2)),
-            );
-            let queued: QueuedFireIds = [first.2, second.2].into_iter().collect();
-            let mut sealed = fires(&plan(&mut policy, &queued, now));
-            sealed.sort_unstable();
-            assert_eq!(
-                sealed,
-                vec![2, 3],
-                "the reused pipeline's fire completes the cohort (reuse_first={reuse_first})"
-            );
-            assert!(policy.cohorts.is_empty(), "a complete cohort is forgotten");
-        }
-    }
-
-    fn a_stated_cohort_is_never_sealed_short() {
-        let leash = Duration::from_millis(50);
-        let mut policy = FramePolicy::new(1, 64, 4096, None).with_submit_deadline(leash);
-        let owner = pid();
-        let (image, text) = (pid(), pid());
-        let now = Instant::now();
-        policy.on_fire_enqueued(stamp(image, 0, 0, 1), Some(owner), 1, 8, 1, Some((7, 2)));
-        let queued: QueuedFireIds = [1].into_iter().collect();
-        assert!(matches!(
-            plan(&mut policy, &queued, now),
-            FramePlan::Hold(_)
-        ));
-        for late in [leash + Duration::from_millis(1), leash * 20] {
-            match plan(&mut policy, &queued, now + late) {
-                FramePlan::Hold(_) => {}
-                plan => panic!("the image lane must not fire without its group, got {plan:?}"),
-            }
-        }
-        let landed = now + leash * 20;
-        policy.on_fire_enqueued(stamp(text, 0, 0, 1), Some(owner), 2, 16, 1, Some((7, 2)));
-        let queued: QueuedFireIds = [1, 2].into_iter().collect();
-        let mut sealed = fires(&plan(&mut policy, &queued, landed));
-        sealed.sort_unstable();
-        assert_eq!(sealed, vec![1, 2], "the late cohort still seals whole");
-    }
-
-    fn a_cohort_that_never_completes_kills_its_request_by_name() {
-        let silence = Duration::from_secs(30);
-        let mut policy = FramePolicy::new(1, 64, 4096, None)
-            .with_submit_deadline(Duration::from_millis(50))
-            .with_silence_timeout(silence);
-        let owner = pid();
-        let lone = pid();
-        let now = Instant::now();
-        policy.on_fire_enqueued(stamp(lone, 0, 0, 1), Some(owner), 1, 8, 1, Some((7, 2)));
-        let queued: QueuedFireIds = [1].into_iter().collect();
-        assert!(matches!(
-            plan(&mut policy, &queued, now),
-            FramePlan::Hold(_)
-        ));
-
-        let verdict = plan(&mut policy, &queued, now + silence + Duration::from_secs(1));
-        let FramePlan::Terminate(doomed) = &verdict else {
-            panic!("a cohort short past the silence timeout ends the request, got {verdict:?}");
-        };
-        assert_eq!(
-            doomed,
-            &vec![(
-                owner,
-                Doom::CohortNeverComplete {
-                    group: 7,
-                    expected: 2,
-                    arrived: 1,
-                },
-            )]
-        );
-        let said = doomed[0].1.to_string();
-        assert!(
-            said.contains("attention group 7")
-                && said.contains("2 live forward passes")
-                && said.contains("only 1")
-                && said.contains("must submit into the group's next frame"),
-            "the error names the group, the tally, and the guest's mistake: {said}"
-        );
-        match plan(&mut policy, &queued, now + silence * 3) {
-            FramePlan::Hold(_) => {}
-            plan => panic!("a condemned cohort neither repeats nor fires, got {plan:?}"),
-        }
-    }
-
-    fn a_group_never_fires_short_when_the_leash_drops_a_member() {
-        let leash = Duration::from_millis(50);
-        let mut policy = FramePolicy::new(1, 64, 4096, None).with_submit_deadline(leash);
-        let owner = pid();
-        let (image, text) = (pid(), pid());
-        let now = Instant::now();
-        policy.on_fire_enqueued(stamp(image, 0, 0, 1), Some(owner), 1, 8, 1, Some((7, 2)));
-        policy.on_fire_enqueued(stamp(text, 0, 0, 1), Some(owner), 2, 16, 1, Some((7, 2)));
-        let queued: QueuedFireIds = [1, 2].into_iter().collect();
-        assert_eq!(fires(&plan(&mut policy, &queued, now)).len(), 2);
-        policy.on_frame_retired([image, text]);
-        assert!(policy.cohorts.is_empty(), "steady state keeps no cohort");
-
-        policy.on_fire_enqueued(stamp(image, 1, 0, 1), Some(owner), 3, 8, 1, Some((7, 2)));
-        let queued: QueuedFireIds = [3].into_iter().collect();
-        for late in [Duration::ZERO, leash + Duration::from_millis(1), leash * 10] {
-            match plan(&mut policy, &queued, now + late) {
-                FramePlan::Hold(_) => {}
-                plan => panic!("half a group must never fire, got {plan:?}"),
-            }
-        }
-        policy.on_fire_enqueued(stamp(text, 1, 0, 1), Some(owner), 4, 16, 1, Some((7, 2)));
-        let queued: QueuedFireIds = [3, 4].into_iter().collect();
-        let mut sealed = fires(&plan(&mut policy, &queued, now + leash * 10));
-        sealed.sort_unstable();
-        assert_eq!(sealed, vec![3, 4]);
-    }
-
-    fn a_gathering_cohort_holds_its_own_lanes_and_not_the_fleet() {
-        let mut policy =
-            FramePolicy::new(1, 64, 4096, None).with_submit_deadline(Duration::from_millis(50));
-        let owner = pid();
-        let grouped = pid();
-        let stranger = pid();
-        let now = Instant::now();
-        policy.on_fire_enqueued(stamp(grouped, 0, 0, 1), Some(owner), 1, 8, 1, Some((7, 2)));
-        policy.on_fire_enqueued(stamp(stranger, 0, 0, 1), Some(stranger), 2, 8, 1, None);
-        let queued: QueuedFireIds = [1, 2].into_iter().collect();
-        assert_eq!(
-            fires(&plan(&mut policy, &queued, now)),
-            vec![2],
-            "the ungrouped lane fires; the grouped one waits for its group"
-        );
-    }
-
-    fn a_group_is_never_split_across_two_partitions() {
-        let mut policy =
-            FramePolicy::new(1, 8, 4096, None).with_submit_deadline(Duration::from_millis(50));
-        let owner = ProcessId::from_u128(9);
-        let stranger = ProcessId::from_u128(1);
-        let (image, text) = (ProcessId::from_u128(2), ProcessId::from_u128(3));
-        let now = Instant::now();
-        policy.on_fire_enqueued(stamp(stranger, 0, 0, 1), Some(stranger), 1, 2, 2, None);
-        policy.on_fire_enqueued(stamp(image, 0, 0, 1), Some(owner), 2, 4, 4, Some((7, 2)));
-        policy.on_fire_enqueued(stamp(text, 0, 0, 1), Some(owner), 3, 4, 4, Some((7, 2)));
-        let queued: QueuedFireIds = [1, 2, 3].into_iter().collect();
-        assert_eq!(
-            fires(&plan(&mut policy, &queued, now)),
-            vec![1],
-            "the group does not fit beside the stranger, so it takes the next partition whole"
-        );
-        let mut group_frame = fires(&plan(&mut policy, &queued, now));
-        group_frame.sort_unstable();
-        assert_eq!(group_frame, vec![2, 3], "the group's lanes ride one frame");
-    }
-
     fn incomplete_lane_holds_the_seal_until_it_completes() {
         let mut policy =
             FramePolicy::new(2, 64, 4096, None).with_submit_deadline(Duration::from_secs(86_400));
         let (fast, slow) = (pid(), pid());
-        policy.on_fire_enqueued(stamp(fast, 0, 0, 2), Some(fast), 1, 1, 1, None);
-        policy.on_fire_enqueued(stamp(fast, 0, 1, 2), Some(fast), 2, 1, 1, None);
-        policy.on_fire_enqueued(stamp(slow, 0, 0, 2), Some(slow), 3, 1, 1, None);
+        policy.on_fire_enqueued(stamp(fast, 0, 0, 2), Some(fast), 1, 1, 1);
+        policy.on_fire_enqueued(stamp(fast, 0, 1, 2), Some(fast), 2, 1, 1);
+        policy.on_fire_enqueued(stamp(slow, 0, 0, 2), Some(slow), 3, 1, 1);
 
         let queued: QueuedFireIds = [1, 2, 3].into_iter().collect();
         let t0 = Instant::now();
@@ -1840,7 +1377,7 @@ mod tests {
             plan => panic!("the watchdog reports, it must not fire: got {plan:?}"),
         }
 
-        policy.on_fire_enqueued(stamp(slow, 0, 1, 2), Some(slow), 4, 1, 1, None);
+        policy.on_fire_enqueued(stamp(slow, 0, 1, 2), Some(slow), 4, 1, 1);
         let queued: QueuedFireIds = [1, 2, 3, 4].into_iter().collect();
         let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("all lanes ready: the epoch must seal");
@@ -1852,17 +1389,17 @@ mod tests {
     fn sealed_frame_dispatches_whole_and_frames_overlap() {
         let mut policy = FramePolicy::new(2, 64, 4096, None);
         let (a, b) = (pid(), pid());
-        policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 50, 1, 1, None);
-        policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 51, 1, 1, None);
+        policy.on_fire_enqueued(stamp(a, 0, 0, 2), Some(a), 50, 1, 1);
+        policy.on_fire_enqueued(stamp(a, 0, 1, 2), Some(a), 51, 1, 1);
         let queued: QueuedFireIds = [50, 51].into_iter().collect();
         let FramePlan::Dispatch(frame0) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("expected lane a's whole frame");
         };
         assert_eq!(frame0, vec![vec![50], vec![51]]);
-        policy.on_fire_enqueued(stamp(b, 0, 0, 2), Some(b), 60, 1, 1, None);
-        policy.on_fire_enqueued(stamp(b, 0, 1, 2), Some(b), 61, 1, 1, None);
-        policy.on_fire_enqueued(stamp(a, 1, 0, 2), Some(a), 52, 1, 1, None);
-        policy.on_fire_enqueued(stamp(a, 1, 1, 2), Some(a), 53, 1, 1, None);
+        policy.on_fire_enqueued(stamp(b, 0, 0, 2), Some(b), 60, 1, 1);
+        policy.on_fire_enqueued(stamp(b, 0, 1, 2), Some(b), 61, 1, 1);
+        policy.on_fire_enqueued(stamp(a, 1, 0, 2), Some(a), 52, 1, 1);
+        policy.on_fire_enqueued(stamp(a, 1, 1, 2), Some(a), 53, 1, 1);
         let queued: QueuedFireIds = [52, 53, 60, 61].into_iter().collect();
         let FramePlan::Dispatch(merged) =
             policy.plan_dispatch(&queued, &HashSet::new(), true, Instant::now())
@@ -1881,10 +1418,10 @@ mod tests {
             let (x, y) = (pid(), pid());
             if x < y { (x, y) } else { (y, x) }
         };
-        policy.on_fire_enqueued(stamp(victim, 0, 0, 2), Some(victim), 100, 1, 1, None);
-        policy.on_fire_enqueued(stamp(victim, 0, 1, 2), Some(victim), 101, 1, 1, None);
-        policy.on_fire_enqueued(stamp(healthy, 0, 0, 2), Some(healthy), 102, 1, 1, None);
-        policy.on_fire_enqueued(stamp(healthy, 0, 1, 2), Some(healthy), 103, 1, 1, None);
+        policy.on_fire_enqueued(stamp(victim, 0, 0, 2), Some(victim), 100, 1, 1);
+        policy.on_fire_enqueued(stamp(victim, 0, 1, 2), Some(victim), 101, 1, 1);
+        policy.on_fire_enqueued(stamp(healthy, 0, 0, 2), Some(healthy), 102, 1, 1);
+        policy.on_fire_enqueued(stamp(healthy, 0, 1, 2), Some(healthy), 103, 1, 1);
         let queued: QueuedFireIds = [100, 101, 102, 103].into_iter().collect();
         assert!(matches!(
             plan(&mut policy, &queued, Instant::now()),
@@ -1892,9 +1429,9 @@ mod tests {
         ));
 
         policy.on_process_suspend(victim);
-        policy.on_fire_enqueued(stamp(victim, 1, 0, 2), Some(victim), 200, 1, 1, None);
-        policy.on_fire_enqueued(stamp(healthy, 1, 0, 2), Some(healthy), 300, 1, 1, None);
-        policy.on_fire_enqueued(stamp(healthy, 1, 1, 2), Some(healthy), 301, 1, 1, None);
+        policy.on_fire_enqueued(stamp(victim, 1, 0, 2), Some(victim), 200, 1, 1);
+        policy.on_fire_enqueued(stamp(healthy, 1, 0, 2), Some(healthy), 300, 1, 1);
+        policy.on_fire_enqueued(stamp(healthy, 1, 1, 2), Some(healthy), 301, 1, 1);
         assert!(
             !policy.lanes[&victim].awaited,
             "a suspended owner's arrival must not rejoin the wait-set"
@@ -1912,17 +1449,17 @@ mod tests {
         assert_eq!(waves[1], vec![301]);
 
         policy.on_process_resume(victim);
-        policy.on_fire_enqueued(stamp(victim, 1, 1, 2), Some(victim), 201, 1, 1, None);
-        policy.on_fire_enqueued(stamp(healthy, 2, 0, 2), Some(healthy), 302, 1, 1, None);
-        policy.on_fire_enqueued(stamp(healthy, 2, 1, 2), Some(healthy), 303, 1, 1, None);
+        policy.on_fire_enqueued(stamp(victim, 1, 1, 2), Some(victim), 201, 1, 1);
+        policy.on_fire_enqueued(stamp(healthy, 2, 0, 2), Some(healthy), 302, 1, 1);
+        policy.on_fire_enqueued(stamp(healthy, 2, 1, 2), Some(healthy), 303, 1, 1);
         let queued: QueuedFireIds = [201, 302, 303].into_iter().collect();
         let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
             panic!("the late slot must seal");
         };
         assert_eq!(waves[1], vec![201, 303], "the late slot keeps its wave");
 
-        policy.on_fire_enqueued(stamp(victim, 2, 0, 2), Some(victim), 400, 1, 1, None);
-        policy.on_fire_enqueued(stamp(victim, 2, 1, 2), Some(victim), 401, 1, 1, None);
+        policy.on_fire_enqueued(stamp(victim, 2, 0, 2), Some(victim), 400, 1, 1);
+        policy.on_fire_enqueued(stamp(victim, 2, 1, 2), Some(victim), 401, 1, 1);
         assert!(
             policy.lanes[&victim].awaited,
             "a resumed process rejoins on its next frame"
@@ -1932,7 +1469,7 @@ mod tests {
     fn a_lane_parked_mid_frame_seals_what_it_submitted() {
         let mut policy = FramePolicy::new(2, 64, 4096, None);
         let lane = pid();
-        policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), 10, 1, 1, None);
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 2), Some(lane), 10, 1, 1);
         policy.on_lane_leave(lane, Some(lane), false);
         let queued: QueuedFireIds = [10].into_iter().collect();
         let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
@@ -1945,8 +1482,8 @@ mod tests {
     fn truncated_frame_seals_with_submitted_fires_only() {
         let mut policy = FramePolicy::new(4, 64, 4096, None);
         let lane = pid();
-        policy.on_fire_enqueued(stamp(lane, 0, 0, 4), Some(lane), 30, 1, 1, None);
-        policy.on_fire_enqueued(stamp(lane, 0, 1, 4), Some(lane), 31, 1, 1, None);
+        policy.on_fire_enqueued(stamp(lane, 0, 0, 4), Some(lane), 30, 1, 1);
+        policy.on_fire_enqueued(stamp(lane, 0, 1, 4), Some(lane), 31, 1, 1);
         policy.on_frame_truncated(lane, 0, 2);
         let queued: QueuedFireIds = [30, 31].into_iter().collect();
         let FramePlan::Dispatch(waves) = plan(&mut policy, &queued, Instant::now()) else {
@@ -1960,13 +1497,13 @@ mod tests {
     fn graceful_close_releases_the_wait() {
         let mut policy = FramePolicy::new(2, 64, 4096, None);
         let (a, b) = (pid(), pid());
-        policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 90, 1, 1, None);
-        policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 91, 1, 1, None);
+        policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 90, 1, 1);
+        policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 91, 1, 1);
         let queued: QueuedFireIds = [90, 91].into_iter().collect();
         let bootstrap = plan(&mut policy, &queued, Instant::now());
         assert_eq!(fires(&bootstrap).len(), 2);
 
-        policy.on_fire_enqueued(stamp(b, 1, 0, 1), Some(b), 92, 1, 1, None);
+        policy.on_fire_enqueued(stamp(b, 1, 0, 1), Some(b), 92, 1, 1);
         let queued: QueuedFireIds = [92].into_iter().collect();
         match plan(&mut policy, &queued, Instant::now()) {
             FramePlan::Hold(_) => {}
@@ -1980,13 +1517,13 @@ mod tests {
     fn no_prompt_waits_for_a_lane_off_a_prompt() {
         let mut policy = FramePolicy::new(2, 64, 4096, None);
         let (a, b, c) = (pid(), pid(), pid());
-        policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 90, 512, 1, None);
-        policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 91, 1, 1, None);
+        policy.on_fire_enqueued(stamp(a, 0, 0, 1), Some(a), 90, 512, 1);
+        policy.on_fire_enqueued(stamp(b, 0, 0, 1), Some(b), 91, 1, 1);
         let queued: QueuedFireIds = [90, 91].into_iter().collect();
         assert_eq!(fires(&plan(&mut policy, &queued, Instant::now())).len(), 2);
 
-        policy.on_fire_enqueued(stamp(b, 1, 0, 1), Some(b), 92, 1, 1, None);
-        policy.on_fire_enqueued(stamp(c, 0, 0, 1), Some(c), 93, 256, 1, None);
+        policy.on_fire_enqueued(stamp(b, 1, 0, 1), Some(b), 92, 1, 1);
+        policy.on_fire_enqueued(stamp(c, 0, 0, 1), Some(c), 93, 256, 1);
         let queued: QueuedFireIds = [92, 93].into_iter().collect();
         assert_eq!(
             policy.plan_dispatch(&queued, &HashSet::new(), true, Instant::now()),
@@ -2008,7 +1545,7 @@ mod tests {
         policy.on_bind_enqueued(Some(executing));
         policy.on_bind_completed(Some(executing));
         policy.on_execution_slot_consumed(executing);
-        policy.on_fire_enqueued(stamp(executing, 0, 0, 1), Some(executing), 95, 1, 1, None);
+        policy.on_fire_enqueued(stamp(executing, 0, 0, 1), Some(executing), 95, 1, 1);
         policy.on_execution_slot_released(pid());
         policy.on_execution_slot_consumed(executing);
         policy.on_bind_enqueued(Some(bystander));

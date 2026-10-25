@@ -298,7 +298,7 @@ def guidance_readout(text: str) -> str:
 
     bits = []
     for pattern, label in (
-        (r"(PASS|FAIL) s=0 the combine (?:is|differs)", "peer is the other group:"),
+        (r"(PASS|FAIL) s=0 the combine (?:is|differs)", "the other group's lane:"),
         (r"(PASS|FAIL) guidance moves|(PASS|FAIL) s=0 and s=1 agree", "guidance moves:"),
         (r"(PASS|FAIL) s=2 is", "affine in s:"),
     ):
@@ -393,13 +393,8 @@ def wan_video_readout(text: str) -> str:
     size = re.search(r"\[gates\] (\d+)x(\d+) mp4, (\d+) frames", text)
     if size:
         bits.append(f"{size.group(1)}x{size.group(2)}x{size.group(3)} mp4")
-    stds = [float(v) for v in re.findall(r'"std":([0-9.]+)', text)]
     guided = re.findall(r'"cfg":(true|false)', text)
-    if len(stds) >= 2 and guided[:2] == ["false", "true"]:
-        moved = abs(stds[1] - stds[0]) / max(stds[0], 1e-9)
-        verdict = "pass" if moved > 0.05 else "FAIL"
-        bits.append(f"guided std {stds[0]:.3f} -> {stds[1]:.3f} ({verdict})")
-    elif guided:
+    if guided:
         bits.append(f"cfg runs {','.join(guided)}")
     bits += v2v_claims(text)
     if clips:
@@ -472,10 +467,8 @@ def v2v_claims(text: str) -> list[str]:
     except Exception as why:
         return [f"video2video claims unread: {why}"]
 
-REF_MOVES = 0.02
-
 def t2i_readout(text: str) -> str:
-    """The picture, the img2img claims, and the reference-lane claims.
+    """The picture, the img2img claims and the inpaint claim.
 
     The pictures are compared HERE rather than in the guest because only
     the harness sees all of them. Nothing below needs a golden.
@@ -488,22 +481,6 @@ def t2i_readout(text: str) -> str:
 
       strength 0.4 must land NEARER the input than either of those, or the
       encoded picture reached the sampler and changed nothing.
-
-    references — three claims at one prompt and one seed:
-
-      A reference must MOVE the picture: `ref-a` against `ref-none` by at
-      least `REF_MOVES`. Without this the lane could be attending nothing
-      and every other reading would still look right.
-
-      Two DIFFERENT references must give two different pictures: `ref-a`
-      against `ref-b`. Same prompt, same seed, same lane count, same fire
-      composition — so this one cannot be bf16 noise, and it is what says
-      the reference's CONTENT reached the attention rather than its mere
-      presence.
-
-      Both references at once must differ from EITHER alone: `ref-ab`
-      against each. Two references ride one lane at `10*1` and `10*2`, so
-      this is the claim that the stride is a stride and not a flag.
     """
     pngs = re.findall(r"\[gates\] picture: (\S+)", text)
     size = re.search(r"\[gates\] (\d+)x(\d+) PNG", text)
@@ -532,34 +509,6 @@ def t2i_readout(text: str) -> str:
             bits.append(f"strength 1.0 IS txt2img ({'pass' if same else 'FAIL'})")
         except Exception as why:
             bits.append(f"img2img claims unread: {why}")
-    if {"ref-none", "ref-a", "ref-b", "ref-ab"} <= named.keys():
-        try:
-            import numpy as np
-            from PIL import Image
-
-            def px(p):
-                return np.asarray(Image.open(p).convert("RGB"), dtype=np.float32) / 255.0
-
-            def diff(x, y):
-                return float(np.abs(px(named[x]) - px(named[y])).mean())
-
-            moved = diff("ref-a", "ref-none")
-            differ = diff("ref-a", "ref-b")
-            both = min(diff("ref-ab", "ref-a"), diff("ref-ab", "ref-b"))
-            ok = "pass" if moved >= REF_MOVES else "FAIL"
-            bits.append(f"a reference moves the picture {moved:.4f} ({ok})")
-            ok = "pass" if differ >= REF_MOVES else "FAIL"
-            bits.append(f"two references differ {differ:.4f} ({ok})")
-            ok = "pass" if both >= REF_MOVES else "FAIL"
-            bits.append(f"both-at-once differs from either {both:.4f} ({ok})")
-        except Exception as why:
-            bits.append(f"reference claims unread: {why}")
-    stat = re.search(r"\[gates\] inpaint: mask_rows=(\d+) kept_max_abs=(\S+) painted_mean_abs=(\S+)", text)
-    if stat:
-        rows, kept, painted = int(stat.group(1)), float(stat.group(2)), float(stat.group(3))
-        ok = "pass" if kept == 0.0 and painted > 0.0 and rows > 0 else "FAIL"
-        bits.append(f"inpaint: {rows} rows repainted, kept rows moved {kept} in latent, "
-                    f"painted rows {painted:.4f} ({ok})")
     if {"small", "inpaint"} <= named.keys():
         try:
             import numpy as np
@@ -652,7 +601,7 @@ def t2v_step(prompt_ids, width, height, frames, steps, seed,
     return build
 
 def t2i_step(prompt, width, height, steps, seed,
-             init_from=None, strength=None, refs_from=None, out_name="picture",
+             init_from=None, strength=None, out_name="picture",
              mask_rect=None):
     def build(ctx, gate):
         out = os.path.join(ctx.out, gate.name, out_name)
@@ -665,8 +614,6 @@ def t2i_step(prompt, width, height, steps, seed,
         if init_from is not None:
             argv += ["--init-image", os.path.join(ctx.out, gate.name, init_from, "image.png"),
                      "--strength", str(strength)]
-        for name in refs_from or []:
-            argv += ["--ref-image", os.path.join(ctx.out, gate.name, name, "image.png")]
         if mask_rect is not None:
             argv += ["--mask-rect", mask_rect]
         return (argv, REPO)
@@ -699,8 +646,8 @@ def roster() -> list[Gate]:
             expected="s=0 IS the unconditional branch of its own fire, guidance "
                      "moves the answer, and the combine is affine in s",
             note="classifier-free guidance ON THE DEVICE: six lanes, two attention "
-                 "groups, one fire, combined in the epilogue off "
-                 "`intrinsics::peer_velocity`. Needs no golden: every claim is "
+                 "groups, one pass, combined in the epilogue off "
+                 "`intrinsics::velocity(lane)` of both image lanes. Needs no golden: every claim is "
                  "checked WITHIN one fire's own answers, because a six-lane fire "
                  "and a three-lane one give the same lane different bf16 answers "
                  "(rel 0.0056) and a cross-fire identity is not one.",
@@ -741,8 +688,8 @@ def roster() -> list[Gate]:
             expected="an all-ones table IS the plain step; a split table moves it; "
                      "class-0 rows ignore class-1 text exactly",
             note="A STRUCTURED ATTENTION MASK STATED BY THE GUEST "
-                 "(`forward-pass.attention-classes`): one class per row and a "
-                 "count x count table, applied by the engine to the reading's "
+                 "(`forward-pass.mask`, built from one class per row and a "
+                 "count x count table), applied by the engine to the "
                  "group-packed `attention.ragged` with no family code involved. "
                  "Every claim is an identity within fires of one shape.",
             needs=[(a("mini-dit.zt"),
@@ -978,7 +925,7 @@ def roster() -> list[Gate]:
                   "the guest driving the family's TWO `vae.encode` arms, one chunk per fire "
                   "down one pipeline: the clip crosses as `frames` handles "
                   "(`frames.decode` per still, `frames.from-rgb8` per chunk, "
-                  "`frames.to-channel` onto the pixel port) and the encoder's rows go "
+                  "`frames.to-channel` onto the pixel input) and the encoder's rows go "
                   "STRAIGHT to `denoise` — the arm already answers `(mean - "
                   "latents_mean)/std`, the denoiser's own space. Both claims are "
                   "identities, so neither needs a golden; they are measured on `raw-rgb8`, "
@@ -987,21 +934,15 @@ def roster() -> list[Gate]:
         Gate(
             name="text-to-image",
             wraps="the model-agnostic guest on flux2-klein-4b.zt, 4 steps at 1024^2, "
-                  "then the same picture back in through `vae.encode` — as an init "
-                  "image, and as a reference lane",
+                  "then the same picture back in through `vae.encode` as an init image",
             expected="a real PNG; img2img at 0.4 lands nearer the input than txt2img, "
-                     "and at 1.0 IS txt2img; a reference MOVES the picture (>= 0.02 "
-                     "mean abs) and two different references move it two different "
-                     "ways",
-            note="img2img and reference editing are the guest driving the family's "
-                 "`vae.encode` reading: the picture crosses as a `frames` handle "
-                 "(`frames.decode` in, `frames.to-channel` onto the pixel port) and "
-                 "never enters the guest's linear memory. An init image seeds the "
-                 "trajectory; a REFERENCE rides a lane of its own on the reading's "
-                 "reference stream, at the offset the family states "
-                 "(`position-convention.reference-stride`), and reads nothing back. "
-                 "Every claim is an identity or a margin measured within this gate's "
-                 "own runs, so none needs a golden.",
+                     "and at 1.0 IS txt2img",
+            note="img2img is the guest driving the family's `vae.encode` reading: "
+                 "the picture crosses as a `frames` handle (`frames.decode` in, "
+                 "`frames.to-channel` onto the pixel input) and never enters the "
+                 "guest's linear memory. An init image seeds the trajectory. Every "
+                 "claim is an identity or a margin measured within this gate's own "
+                 "runs, so none needs a golden.",
             needs=[(a("flux2-klein-4b.zt"),
                     f"{IMPORT} <FLUX.2-klein-4B snapshot> --deployment flux2-klein-4b-bf16-kv-bf16 "
                     f"--out {a('flux2-klein-4b.zt')}")],
@@ -1020,18 +961,6 @@ def roster() -> list[Gate]:
                    ("the same prompt with no init",
                     t2i_step("a red bicycle leaning on a green hedge", T2I_SMALL, T2I_SMALL, 4, 0,
                              out_name="txt2img")),
-                   ("a picture with no reference at all",
-                    t2i_step("a bicycle in a snowy field at dawn", T2I_SMALL, T2I_SMALL, 4, 3,
-                             out_name="ref-none")),
-                   ("the same prompt and seed, with the blue-wall picture in view",
-                    t2i_step("a bicycle in a snowy field at dawn", T2I_SMALL, T2I_SMALL, 4, 3,
-                             refs_from=["small"], out_name="ref-a")),
-                   ("and with the green-hedge picture instead",
-                    t2i_step("a bicycle in a snowy field at dawn", T2I_SMALL, T2I_SMALL, 4, 3,
-                             refs_from=["txt2img"], out_name="ref-b")),
-                   ("and both at once, on one lane",
-                    t2i_step("a bicycle in a snowy field at dawn", T2I_SMALL, T2I_SMALL, 4, 3,
-                             refs_from=["small", "txt2img"], out_name="ref-ab")),
                    ("inpaint the right half of the small picture",
                     t2i_step("a red bicycle leaning on a green hedge", T2I_SMALL, T2I_SMALL, 4, 0,
                              init_from="small", strength=1.0, mask_rect=f"{T2I_SMALL // 2},0,{T2I_SMALL},{T2I_SMALL}",
@@ -1044,11 +973,8 @@ def roster() -> list[Gate]:
 def text_to_image(args) -> int:
     """`--text-to-image`: drive the generic guest and end with a real PNG.
 
-    Two exits, and which one the row takes is its own fact (D11): a row whose
-    `vae.decode` is a declared reading hands back `image.png` directly; FLUX.2
-    today hands back the final latent plus its JSON sidecar, and
-    `decode_latent.py` finishes the job with the checkpoint's own autoencoder.
-    Either way this prints `[gates] picture: <path>` and its pixel size.
+    One exit: the row's `vae.decode` reading, fired in-guest, hands back
+    `image.png`. This prints `[gates] picture: <path>` and its pixel size.
     """
     inferlet = os.path.join(REPO, "examples/text-to-image")
     workspace = os.path.dirname(inferlet)
@@ -1075,9 +1001,6 @@ def text_to_image(args) -> int:
         for i, piece in enumerate(b64_pieces(args.init_image)):
             cmd += [f"--init_image_{i}", piece]
         cmd += ["--strength", str(args.strength)]
-    for i, path in enumerate(args.ref_images or []):
-        for n, piece in enumerate(b64_pieces(path)):
-            cmd += [f"--ref_{i}_{n}", piece]
     if args.mask_rect:
         cmd += ["--mask_rect", args.mask_rect]
     print("$ " + " ".join(cmd), flush=True)
@@ -1087,46 +1010,10 @@ def text_to_image(args) -> int:
     if done.returncode != 0:
         print(f"[gates] pie run failed ({done.returncode})")
         return 1
-    for line in done.stdout.splitlines():
-        if line.startswith("{") and "kept_max_abs" in line:
-            try:
-                report = json.loads(line)
-            except ValueError:
-                continue
-            if report.get("mask_rows") is not None:
-                print(f"[gates] inpaint: mask_rows={report['mask_rows']} "
-                      f"kept_max_abs={report['kept_max_abs']} "
-                      f"painted_mean_abs={report['painted_mean_abs']}")
-
     png = os.path.join(args.out, "image.png")
     if not os.path.exists(png):
-        latent = os.path.join(args.out, "image.latent.f32")
-        sidecar = os.path.join(args.out, "image.json")
-        if not os.path.exists(latent):
-            print(f"[gates] neither {png} nor {latent} exists")
-            return 1
-        if not os.path.exists(sidecar):
-            body = [line for line in done.stdout.splitlines() if line.startswith("{")]
-            if not body:
-                print("[gates] no sidecar and no JSON report on stdout")
-                return 1
-            with open(sidecar, "w") as f:
-                f.write(body[-1])
-        snap = sorted(glob.glob(os.path.expanduser(
-            "~/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-4B/snapshots/*")))
-        if not snap:
-            print("[gates] no FLUX.2-klein-4B snapshot to decode the latent with")
-            return 1
-        decode = [sys.executable, os.path.join(HERE, "decode_latent.py"),
-                  "--latent", latent, "--sidecar", sidecar,
-                  "--model-dir", snap[-1], "--out", png, "--family", "flux2"]
-        print("$ " + " ".join(decode), flush=True)
-        done = subprocess.run(decode, cwd=REPO, capture_output=True, text=True)
-        sys.stdout.write(done.stdout)
-        sys.stderr.write(done.stderr)
-        if done.returncode != 0 or not os.path.exists(png):
-            print(f"[gates] decode_latent.py failed ({done.returncode})")
-            return 1
+        print(f"[gates] no {png}")
+        return 1
 
     with open(png, "rb") as f:
         head = f.read(33)
@@ -1330,8 +1217,6 @@ def main() -> int:
     ap.add_argument("--init-image", dest="init_image", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--init-clip", dest="init_clip", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--clip-format", dest="clip_format", default=None, help=argparse.SUPPRESS)
-    ap.add_argument("--ref-image", dest="ref_images", action="append", default=None,
-                    help=argparse.SUPPRESS)
     ap.add_argument("--strength", type=float, default=0.6, help=argparse.SUPPRESS)
     ap.add_argument("--mask-rect", dest="mask_rect", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--guidance", type=float, default=None, help=argparse.SUPPRESS)

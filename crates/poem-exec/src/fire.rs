@@ -19,7 +19,10 @@ pub use descriptor::{
     VOXEL_LANE_BYTES,
 };
 pub use fallback::{Serve, answers as fallback_answers, fragmentable, max_runs};
-pub use packing::{LaneFacts, Packed, group_of_lane, groups_of, pack, pack_with_classes};
+pub use packing::{
+    GroupMask, GuestRows, LaneFacts, LaneMask, Packed, group_mask, group_of_lane, groups_of,
+    guest_rows, pack,
+};
 pub use sink::{At, Cursor, EagerSink, EventId, Sink};
 pub use walk::{Filter, Phases, Regions, Units, walk, walk_phases, walk_regions};
 
@@ -144,6 +147,16 @@ pub enum Fault {
         at: u32,
         expected: u32,
     },
+    MaskRows {
+        lane: u32,
+        stated: usize,
+        rows: u64,
+    },
+    MaskPatches {
+        lane: u32,
+        tokens: u32,
+        clips: u32,
+    },
 }
 
 impl fmt::Display for Fault {
@@ -232,6 +245,23 @@ impl fmt::Display for Fault {
             Self::TooManyImages { images, max } => write!(
                 f,
                 "this fire assembles {images} images and the artifact was baked for {max}"
+            ),
+            Self::MaskRows { lane, stated, rows } => write!(
+                f,
+                "lane {lane} states an attention mask of {stated} rows and its group reads \
+                 {rows} of its rows; a mask states one row a row (a voxel lane's are its \
+                 voxels)"
+            ),
+            Self::MaskPatches {
+                lane,
+                tokens,
+                clips,
+            } => write!(
+                f,
+                "lane {lane} states an attention mask over its voxels and attends as {tokens} \
+                 token rows, which are not the patches of its {clips} clip(s) under the \
+                 model's token grid; a voxel lane's tokens are its patches in (t, h, w) \
+                 row-major order"
             ),
             Self::ScatteredSelection {
                 mask,

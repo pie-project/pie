@@ -16,8 +16,7 @@ use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
-use eta_ir::registry::{GeometryClass, ModelProfile, Port, PortMask};
-use eta_ir::types::Dtype;
+use eta_ir::registry::{GeometryClass, Port, PortMask};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder, VoxelLadder};
 use poem_ir::Trace;
 
@@ -224,8 +223,14 @@ impl Cuda {
                 .as_ref()
                 .map_or(engine::Serves::NONE, engine::Serves::of),
         )?;
-        if let Some(replay) = self.replay
-            && frame.steps.iter().any(|step| replay.split(step).is_some())
+        if let Some((replay, shell)) = self.replay.zip(self.shell.as_ref())
+            && frame.steps.iter().any(|step| {
+                replay
+                    .split(step, |word| {
+                        shell.trace().facts.plain(word) && !shell.wide(word)
+                    })
+                    .is_some()
+            })
         {
             return Err(Error::Unsupported {
                 verb: "an encoder replay split under expert parallelism",
@@ -296,16 +301,13 @@ fn fault(fault: Fault) -> Error {
             "this fire wants {need} {what} and the load reserved {have}"
         )),
         Fault::Fragmented { .. } | Fault::Integrity { .. } => Error::Device(fault.to_string()),
-        Fault::Straddled { .. } => Error::Load(fault.to_string()),
+        Fault::Straddled { .. } | Fault::Recipe(_) => Error::Load(fault.to_string()),
         Fault::Mask { .. }
         | Fault::MaskRows { .. }
         | Fault::Maskless { .. }
         | Fault::MaskWord { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
-        Fault::Draftless { .. }
-        | Fault::DraftWord { .. }
-        | Fault::Scoreless { .. }
-        | Fault::ScoreWord { .. } => Error::Invalid(fault.to_string()),
+        Fault::Scoreless { .. } | Fault::ScoreWord { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::AdapterSlots { .. } => Error::Exhausted {
             resource: "adapter slots",
@@ -474,43 +476,6 @@ pub fn voxel_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<VoxelLadder>
             .max_clips
             .unwrap_or(budgets.max_lanes)
             .clamp(1, max_voxels),
-    })
-}
-
-fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
-    let trace = shell.trace();
-    let layers = trace
-        .nodes
-        .iter()
-        .filter_map(|node| node.layer)
-        .max()
-        .map_or(0, |top| top + 1);
-    let vocab = match shell.out_width() {
-        Ok(width) => u32::try_from(width).unwrap_or(u32::MAX),
-        Err(_) if shell.readout_seam().is_some() => 0,
-        Err(why) => return Err(fault(why)),
-    };
-    let (has_pixels, pixels_width) = shell.pixels_facts();
-    Ok(ModelProfile {
-        vocab,
-        page_size: budgets.page_size,
-        num_layers: layers,
-        activation: Dtype::F32,
-        has_mtp_logits: shell.drafts(),
-        mtp_depth: shell.mtp_depth(),
-        draft_block: trace.drafter.map_or(0, |d| d.rows),
-        draft_mask_token: trace.drafter.map_or(0, |d| d.mask_token),
-        draft_bidirectional: trace.drafter.is_some_and(|d| d.bidirectional),
-        draft_proposals_from: trace.drafter.map_or(1, |d| d.proposals_from),
-        has_value_head: false,
-        has_attn_score: shell.observes_scores(),
-        has_attn_page_mask: false,
-        has_lora: true,
-        has_velocity: shell.velocity_width().is_some(),
-        velocity_width: shell.velocity_width().unwrap_or(0),
-        has_pixels,
-        pixels_width,
-        kernels: Vec::new(),
     })
 }
 
@@ -727,7 +692,8 @@ impl Engine for Cuda {
             .caches
             .iter()
             .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
-        let profile = profile(&shell, &budgets)?;
+        let trace = shell.trace();
+        let drafter = trace.drafter;
 
         let caps = Capabilities {
             device: DeviceFacts {
@@ -781,7 +747,14 @@ impl Engine for Cuda {
                     .unwrap_or(u32::MAX),
                 max_scoring_lanes: shell.scoring_lanes(),
             },
-            profile,
+            has_lora: true,
+            has_attn_page_mask: false,
+            has_mtp_logits: shell.drafts(),
+            mtp_depth: shell.mtp_depth(),
+            draft_block: drafter.map_or(0, |d| d.rows),
+            draft_mask_token: drafter.map_or(0, |d| d.mask_token),
+            draft_proposals_from: drafter.map_or(1, |d| d.proposals_from),
+            has_attn_score: shell.observes_scores(),
             ports: PortMask::DEVICE_GEOMETRY
                 .with(Port::AttnMask)
                 .with(Port::Fold),
@@ -804,6 +777,8 @@ impl Engine for Cuda {
             bidirectional_attention: true,
             adapter_attachments: true,
             facts: shell.trace().facts.clone(),
+            inputs: shell.inputs(),
+            classes: shell.classes(),
         };
 
         self.replay = crate::replay::Replay::of(&shell);
@@ -865,7 +840,14 @@ impl Engine for Cuda {
             // A causal encoder-decoder's long prompts: their leading rows
             // through the encoder alone first, unannounced, then the step
             // with each such prompt's last window (`crate::replay`).
-            let split = self.replay.and_then(|replay| replay.split(step));
+            let split = self
+                .replay
+                .zip(self.shell.as_ref())
+                .and_then(|(replay, shell)| {
+                    replay.split(step, |word| {
+                        shell.trace().facts.plain(word) && !shell.wide(word)
+                    })
+                });
             if let Some((head, _)) = &split
                 && let Err(error) = self.fire_step(head, at, false)
             {
@@ -1273,10 +1255,7 @@ impl Cuda {
                     window_copies: &lane.kv.window_copies,
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
-                    drafts: lane.drafts,
                     captures_scores: lane.captures_scores,
-                    bidirectional: lane.bidirectional,
-                    self_cond: lane.self_cond.as_ref(),
                     rs: lane.rs.clone(),
                     rs_reset: lane.rs_reset,
                     rs_slot: lane.rs_slot,
@@ -1285,11 +1264,8 @@ impl Cuda {
                         Readout::Rows(rows) => Some(rows.as_slice()),
                         Readout::Last | Readout::None => None,
                     },
-                    stream: lane.stream as u8,
                     group: lane.group,
-                    peer: lane.peer,
-                    ports: &lane.ports,
-                    attn_classes: lane.attn_classes.as_ref(),
+                    inputs: &lane.inputs,
                     reports: lane.reports,
                     tap: lane.tap.as_ref(),
                 })
@@ -1317,8 +1293,9 @@ impl Cuda {
             .iter()
             .map(|attachment| Attached {
                 lane: attachment.lane,
+                lanes: attachment.lanes,
                 instance: attachment.instance,
-                at: attachment.at,
+                adapter_only: attachment.adapter_only,
             })
             .collect();
 
@@ -1352,7 +1329,7 @@ impl Cuda {
             };
             voxel_bytes.reserve(submission.voxels.len());
             for row in &submission.voxels {
-                voxel_bytes.push(crate::voxels::port_bytes(&row.payload, element).map_err(
+                voxel_bytes.push(crate::voxels::input_bytes(&row.payload, element).map_err(
                     |why| Error::Unsupported {
                         verb: why,
                         engine: "cuda",
@@ -1547,6 +1524,7 @@ mod tests {
             nodes: Vec::new(),
             seams: Vec::new(),
             drafter: None,
+            inputs: Vec::new(),
         }
     }
 

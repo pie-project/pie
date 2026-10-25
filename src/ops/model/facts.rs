@@ -1,29 +1,15 @@
 #[derive(serde::Serialize)]
 pub struct GenerativeFacts {
-    pub readings: Vec<Reading>,
     pub latent: Option<Latent>,
     pub schedule: Option<Schedule>,
-    pub max_latent_rows: u32,
-}
-
-#[derive(serde::Serialize)]
-pub struct Reading {
-    pub name: String,
-    pub index: u8,
-    pub kv: bool,
-    pub tokens: bool,
-    pub streams: Vec<String>,
-    pub ports: Vec<String>,
-    pub readout: String,
-    pub readout_width: u32,
+    /// `inputs` and `switches` are traced, so only `pie model info` fills them.
+    pub inputs: Vec<String>,
+    pub switches: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
 pub struct Latent {
     pub channels: u32,
-    pub patch_t: u32,
-    pub patch_h: u32,
-    pub patch_w: u32,
     pub spatial_compression: u32,
     pub temporal_compression: u32,
 }
@@ -41,12 +27,8 @@ pub fn of(deployment: Option<&str>) -> Option<GenerativeFacts> {
     let deployment = runtime::catalog::catalog().parse(deployment?)?;
     let generative = deployment.try_generative().ok()??;
     Some(GenerativeFacts {
-        readings: generative.readings.iter().map(reading).collect(),
         latent: generative.latent.map(|l| Latent {
             channels: l.channels,
-            patch_t: l.patch_t,
-            patch_h: l.patch_h,
-            patch_w: l.patch_w,
             spatial_compression: l.spatial_compression,
             temporal_compression: l.temporal_compression,
         }),
@@ -62,51 +44,46 @@ pub fn of(deployment: Option<&str>) -> Option<GenerativeFacts> {
             boundary: s.boundary,
             pinned_sigmas: s.pinned_sigmas.clone(),
         }),
-        max_latent_rows: generative.max_rows,
+        inputs: Vec::new(),
+        switches: Vec::new(),
     })
 }
 
-fn reading(fact: &poem::generative::ReadingFact) -> Reading {
-    Reading {
-        name: fact.name.to_string(),
-        index: fact.index,
-        kv: fact.has_kv,
-        tokens: fact.takes_tokens,
-        streams: fact
-            .streams
-            .iter()
-            .map(|s| stream(*s).to_string())
-            .collect(),
-        ports: fact
-            .ports
-            .iter()
-            .map(|port| format!("{}[{}]", port.name, port.width))
-            .collect(),
-        readout: match fact.readout {
-            poem::generative::ReadoutKind::Logits => "logits",
-            poem::generative::ReadoutKind::Velocity => "velocity",
-            poem::generative::ReadoutKind::Hidden => "hidden",
-            poem::generative::ReadoutKind::Pixels => "pixels",
-        }
-        .to_string(),
-        readout_width: fact.readout_width,
-    }
+pub fn traced(deployment: &str) -> Option<poem::Trace> {
+    let deployment = runtime::catalog::catalog().parse(deployment)?;
+    deployment.try_trace(poem::Platform::Cuda).ok()
 }
 
-fn stream(stream: poem::Stream) -> &'static str {
-    match stream {
-        poem::Stream::Text => "text",
-        poem::Stream::Image => "image",
-        poem::Stream::Video => "video",
-        poem::Stream::Audio => "audio",
-        poem::Stream::Context => "context",
-        poem::Stream::Reference => "reference",
-    }
+/// `name = value|value|...`, the first value the default.
+pub fn switches(trace: &poem::Trace) -> Vec<String> {
+    trace
+        .facts
+        .switches
+        .iter()
+        .map(|decl| format!("{} = {}", decl.name, decl.values.join("|")))
+        .collect()
+}
+
+/// `name[axis, width]` each.
+pub fn inputs(trace: &poem::Trace) -> Vec<String> {
+    trace
+        .values
+        .iter()
+        .filter_map(|decl| match decl.def {
+            poem::Def::Input(poem::RuntimeInput::Guest {
+                id, axis, width, ..
+            }) => trace
+                .inputs
+                .get(id as usize)
+                .map(|input| format!("{}[{}, {width}]", input.name, axis.name())),
+            _ => None,
+        })
+        .collect()
 }
 
 impl GenerativeFacts {
     pub fn summary(&self) -> String {
-        let mut parts = vec![format!("{} readings", self.readings.len())];
+        let mut parts = Vec::new();
         if let Some(latent) = &self.latent {
             parts.push(format!("latent {}", latent.line()));
         }
@@ -116,39 +93,24 @@ impl GenerativeFacts {
         parts.join(" · ")
     }
 
+    /// Whether it binds the `latents` and `timestep` inputs `text-to-image` drives.
     pub fn text_to_image(&self) -> bool {
-        self.readings
+        ["latents[", "timestep["]
             .iter()
-            .any(|r| r.tokens && r.readout == "hidden")
-            && self
-                .readings
-                .iter()
-                .any(|r| !r.tokens && r.readout == "velocity")
+            .all(|name| self.inputs.iter().any(|input| input.starts_with(name)))
     }
 }
 
 impl Latent {
     pub fn line(&self) -> String {
-        let patch = if self.patch_t > 1 {
-            format!("patch {}x{}x{}", self.patch_t, self.patch_h, self.patch_w)
-        } else {
-            format!("patch {}x{}", self.patch_h, self.patch_w)
-        };
         let temporal = if self.temporal_compression > 1 {
             format!(", /{} frames", self.temporal_compression)
         } else {
             String::new()
         };
         format!(
-            "{} ch, {}, /{} px{temporal}",
-            self.channels, patch, self.spatial_compression
-        )
-    }
-
-    pub fn pixels_per_row(&self) -> (u32, u32) {
-        (
-            self.patch_w * self.spatial_compression,
-            self.patch_h * self.spatial_compression,
+            "{} ch, /{} px{temporal}",
+            self.channels, self.spatial_compression
         )
     }
 }
@@ -179,21 +141,27 @@ mod tests {
     }
 
     fn a_generative_row_reports_what_it_can_be_asked_to_draw() {
-        let facts = of(Some(FLUX2_KLEIN)).expect("flux2-klein-4b is a generative row");
+        let mut facts = of(Some(FLUX2_KLEIN)).expect("flux2-klein-4b is a generative row");
+        let trace = traced(FLUX2_KLEIN).expect("flux2-klein-4b traces");
+        facts.inputs = inputs(&trace);
+        facts.switches = switches(&trace);
+        assert!(facts.text_to_image(), "{:?}", facts.inputs);
         assert!(
-            facts.text_to_image(),
-            "klein-4B has a text reading and a denoise reading: {:?}",
             facts
-                .readings
-                .iter()
-                .map(|r| (&r.name, &r.readout, r.tokens))
-                .collect::<Vec<_>>()
+                .switches
+                .contains(&"reading = text|denoise|vae.decode|vae.encode".to_string()),
+            "{:?}",
+            facts.switches
         );
         let latent = facts.latent.expect("a denoiser has a latent space");
-        assert_eq!(latent.pixels_per_row(), (16, 16));
+        assert_eq!(latent.spatial_compression, 8);
         let schedule = facts.schedule.expect("a denoiser has a schedule");
         assert_eq!(schedule.kind, "flow");
-        assert!(facts.max_latent_rows > 0);
+        assert!(
+            facts.inputs.contains(&"latents[voxel, 32]".to_string()),
+            "{:?}",
+            facts.inputs
+        );
     }
 
     fn a_text_row_reports_nothing_here() {

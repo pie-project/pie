@@ -17,7 +17,7 @@ impl ForwardHybrid for Readout {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
-        let x = inputs.latents(0, 16, Dtype::Bf16);
+        let x = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, 16, None);
         let w = Weight::sym("w", [16, 16], Dtype::Bf16);
         let layers = [(); 2];
         let mut h = x;

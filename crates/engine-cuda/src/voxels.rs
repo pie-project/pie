@@ -35,7 +35,11 @@ impl Seat {
         for decl in &trace.values {
             match (&decl.def, &decl.ty) {
                 (
-                    poem_ir::Def::Input(poem_ir::RuntimeInput::Voxels { channels: c, .. }),
+                    poem_ir::Def::Input(poem_ir::RuntimeInput::Guest {
+                        axis: poem_ir::InputAxis::Voxel,
+                        width: c,
+                        ..
+                    }),
                     poem_ir::Ty::Tensor { dtype: d, .. },
                 ) => {
                     channels = channels.max(*c);
@@ -126,7 +130,7 @@ impl Tables {
             if fed != 0 && !seat.widths.contains(&fed) {
                 return Err(Fault::VoxelPayload {
                     lane: lanes.first().map_or(0, |lane| lane.source),
-                    what: "the channel-fed voxel port is not a width the plan reads",
+                    what: "the channel-fed voxel input is not a width the plan reads",
                 });
             }
             channels = fed;
@@ -147,14 +151,14 @@ impl Tables {
                 {
                     return Err(Fault::VoxelPayload {
                         lane: lane.source,
-                        what: "the payload is not one port row per voxel of the clips at a \
+                        what: "the payload is not one input row per voxel of the clips at a \
                                width the plan reads",
                     });
                 }
                 if channels != 0 && channels != width {
                     return Err(Fault::VoxelPayload {
                         lane: lane.source,
-                        what: "two lanes fed voxel ports of two widths in one fire (M0: one \
+                        what: "two lanes fed voxel inputs of two widths in one fire (M0: one \
                                voxel class per fire)",
                     });
                 }
@@ -214,12 +218,15 @@ impl Tables {
                     token_row += i64::from(tt) * i64::from(th) * i64::from(tw);
                 }
             }
+            // A lane whose class reads no token grid is one row (a VAE's);
+            // one that does carries its clips' patches, then any pad rows.
             if seat.token_patch.is_some()
-                && token_row != i64::from(lane.row_offset) + i64::from(lane.rows)
+                && lane.rows != 1
+                && token_row > i64::from(lane.row_offset) + i64::from(lane.rows)
             {
                 return Err(Fault::VoxelPayload {
                     lane: lane.source,
-                    what: "the lane's token rows are not its clips' token count",
+                    what: "the lane's clips have more patches than the lane has token rows",
                 });
             }
         }
@@ -316,7 +323,7 @@ impl Store {
 #[must_use]
 pub(crate) fn host_grid(
     trace: &poem_ir::Trace,
-    port_grid: &[i32],
+    fire_grid: &[i32],
     grid: poem_ir::ValueId,
 ) -> Option<Vec<i32>> {
     use poem_ir::{Conv, Def, Operation, RuntimeInput};
@@ -341,7 +348,7 @@ pub(crate) fn host_grid(
         }
     }
     rules.reverse();
-    let mut table = port_grid.to_vec();
+    let mut table = fire_grid.to_vec();
     for rule in rules {
         table = rule.apply(&table)?;
     }
@@ -353,7 +360,7 @@ fn i32_bytes(values: &[i32]) -> &[u8] {
     unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), values.len() * 4) }
 }
 
-pub fn port_bytes(values: &[f32], element: Dtype) -> std::result::Result<Vec<u8>, &'static str> {
+pub fn input_bytes(values: &[f32], element: Dtype) -> std::result::Result<Vec<u8>, &'static str> {
     match element {
         Dtype::Bf16 => Ok(values
             .iter()
@@ -361,7 +368,7 @@ pub fn port_bytes(values: &[f32], element: Dtype) -> std::result::Result<Vec<u8>
             .collect()),
         Dtype::F32 => Ok(values.iter().flat_map(|&v| v.to_le_bytes()).collect()),
         _ => {
-            Err("a voxel submission against a plan whose port element is neither `bf16` nor `f32`")
+            Err("a voxel submission against a plan whose input element is neither `bf16` nor `f32`")
         }
     }
 }

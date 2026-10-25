@@ -37,29 +37,6 @@ pub fn metal_intrinsic_supported(intr: u16) -> bool {
     )
 }
 
-pub fn metal_readout_collision(ops: &[OpView], region: &Region) -> Option<u16> {
-    let mut seen: Option<u16> = None;
-    for &node in &region.nodes {
-        let Some(op) = ops.get(node.index()) else {
-            continue;
-        };
-        if op.tag != tags::INTRINSIC_VAL {
-            continue;
-        }
-        if !matches!(
-            op.intr,
-            intrinsic_tags::LOGITS | intrinsic_tags::VELOCITY | intrinsic_tags::HIDDEN
-        ) {
-            continue;
-        }
-        match seen {
-            Some(first) if first != op.intr => return Some(op.intr),
-            _ => seen = Some(op.intr),
-        }
-    }
-    None
-}
-
 pub fn intrinsics_bindable(ops: &[OpView], region: &Region) -> Result<(), EmitError> {
     unbindable_intrinsic(ops, region, metal_intrinsic_supported)
 }
@@ -73,9 +50,6 @@ fn unbindable_intrinsic(
     region: &Region,
     bindable: fn(u16) -> bool,
 ) -> Result<(), EmitError> {
-    if let Some(second) = metal_readout_collision(ops, region) {
-        return Err(EmitError::UnbindableIntrinsic { intrinsic: second });
-    }
     for &node in &region.nodes {
         let Some(op) = ops.get(node.index()) else {
             continue;

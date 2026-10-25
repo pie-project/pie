@@ -2,15 +2,15 @@
 //! `scripts/imagegen/zimage_vae_parity.py`, and the first thing in the tree
 //! that walks the whole of design D8's guest road:
 //!
-//! 1. the model's own catalog says which reading decodes (`readings()`, the
-//!    one with a `Voxels` port and a `Pixels` readout) and how wide its port
-//!    is — nothing here hardcodes `z-image`;
-//! 2. the golden latent is bound as that port's CHANNEL, whose shape IS the
-//!    clip's box (`[h, w, 16]`), so the geometry the port needs and the
+//! 1. the model's own catalog says which reading decodes (its `reading` switch, the
+//!    one whose lane reads a voxel input and lands a `Pixels` readout) and
+//!    how wide that input is — nothing here hardcodes `z-image`;
+//! 2. the golden latent is bound as that input's CHANNEL, whose shape IS the
+//!    clip's box (`[h, w, 16]`), so the geometry the input needs and the
 //!    numbers it reads travel together and neither is a payload the guest
 //!    hands the shell;
-//! 3. the epilogue reads the `pixels` seam through `intrinsics::pixels(rows,
-//!    3)` — `8h·8w` rows of RGB in `[-1, 1]` — and puts it on one channel;
+//! 3. the epilogue reads the `pixels` seam through `intrinsics::pixels(0,
+//!    rows, 3)` — `8h·8w` rows of RGB in `[-1, 1]` — and puts it on one channel;
 //! 4. that channel becomes a `frames` handle through
 //!    `Channel::take_frames`, and `session::send_frames` streams it to the
 //!    client as a PNG. The pixels never enter linear memory on that road.
@@ -19,11 +19,6 @@
 //! is what the parity harness diffs against `pixels.f32`; the PNG path and
 //! the numbers path read the SAME channel cell, so a run that wants both
 //! asks for the numbers and lets this file re-encode them (see `main`).
-//!
-//! A lane of a VAE reading embeds no token and binds no `[rows, ·]` port: its
-//! rows are its clip's voxels, on the third axis. The library states that for the
-//! guest — `pass.input` on a voxel port is the only row-stating thing it
-//! needs — so nothing below mentions a row count the model did not.
 
 use inferlet::latent::prelude::*;
 use inferlet::{frames, session};
@@ -79,7 +74,7 @@ struct Input {
 /// the decoder's answer is expected at.
 #[derive(Deserialize)]
 struct Case {
-    /// `[h * w * channels]`, `w` fastest then `channels` — the port
+    /// `[h * w * channels]`, `w` fastest then `channels` — the input
     /// channel's own order.
     latent: Vec<f32>,
     h: u32,
@@ -95,8 +90,7 @@ struct Case {
 struct Output {
     /// Which reading fired, by the family's own name.
     reading: String,
-    /// Which port carried the clip.
-    port: String,
+    input: String,
     /// The clip's box, and the pixels' box.
     latent_h: u32,
     latent_w: u32,
@@ -124,60 +118,66 @@ struct Output {
 }
 
 /// The family's `vae.decode`: the token-less reading whose readout is
-/// `Pixels` and whose input port is a `Voxels` one. Read off the catalog so
+/// `Pixels` and whose lane reads one voxel input. Read off the catalog so
 /// a family that renames either fails here with its own vocabulary.
 struct Decode {
     name: String,
-    port: String,
+    input: String,
     channels: u32,
     readout_width: u32,
 }
 
 fn decode_reading() -> Result<Decode> {
-    let candidates: Vec<model::ReadingFact> = model::readings()
-        .into_iter()
-        .filter(|r| r.readout == model::ReadoutKind::Pixels && !r.takes_tokens)
-        .collect();
-    if candidates.is_empty() {
+    let readings = model::switch("reading")
+        .map(|decl| decl.values)
+        .unwrap_or_default();
+    // A VAE states two pixel readings — decode and encode. The DECODER is
+    // the one whose voxel input is WIDER than its answer: it reads a latent
+    // and lands RGB, where the encoder reads RGB and lands a latent.
+    let mut pixels = false;
+    let mut best: Option<(String, model::LaneDecl, model::InputDecl, u32)> = None;
+    for reading in readings {
+        let Ok(lane) = model::lane_of(&[("reading", &reading), ("stream", "image")]) else {
+            continue;
+        };
+        let Some(width) = lane
+            .readout
+            .as_ref()
+            .filter(|readout| readout.kind == model::ReadoutKind::Pixels && !lane.embeds)
+            .map(|readout| readout.width)
+        else {
+            continue;
+        };
+        pixels = true;
+        let [input] = &lane.inputs[..] else {
+            continue;
+        };
+        if input.axis == model::InputAxis::Voxel && input.width > width {
+            let input = input.clone();
+            best = Some((reading, lane, input, width));
+            break;
+        }
+    }
+    if !pixels {
         return Err("this model declares no reading that lands pixels; \
                     it has no VAE decoder to fire"
             .into());
     }
-    // A VAE states two pixel readings — decode and encode. The DECODER is
-    // the one whose voxel port is WIDER than its answer: it reads a latent
-    // and lands RGB, where the encoder reads RGB and lands a latent.
-    let mut best: Option<(model::ReadingFact, model::PortFact)> = None;
-    for reading in candidates {
-        let Some(port) = reading
-            .ports
-            .iter()
-            .find(|p| p.kind == model::PortKind::Voxels)
-            .cloned()
-        else {
-            continue;
-        };
-        if port.width > reading.readout_width {
-            best = Some((reading, port));
-            break;
-        }
-    }
-    let (reading, port) = best.ok_or_else(|| {
-        "no pixels reading of this model reads a voxel port wider than its answer; \
+    let (reading, lane, input, readout_width) = best.ok_or_else(|| {
+        "no pixels reading of this model reads one voxel input wider than its answer; \
          a decoder takes a latent clip and lands RGB"
             .to_string()
     })?;
-    if reading.has_kv {
+    if lane.state {
         return Err(format!(
-            "reading `{}` binds a kv space; a VAE tile binds none",
-            reading.name
-        )
-        .into());
+            "reading `{reading}` binds a working set; a VAE tile binds none"
+        ));
     }
     Ok(Decode {
-        name: reading.name.clone(),
-        port: port.name.clone(),
-        channels: port.width,
-        readout_width: reading.readout_width,
+        name: reading,
+        input: input.name,
+        channels: input.width,
+        readout_width,
     })
 }
 
@@ -221,10 +221,9 @@ async fn main(input: Input) -> Result<Output> {
     if case.channels != d.channels {
         return Err(format!(
             "the case's latent is {} channels wide and reading `{}` reads a {}-channel \
-             voxel port",
+             voxel input",
             case.channels, d.name, d.channels
-        )
-        .into());
+        ));
     }
     let want = (case.h as usize) * (case.w as usize) * (case.channels as usize);
     if case.latent.len() != want {
@@ -234,8 +233,7 @@ async fn main(input: Input) -> Result<Output> {
             case.h,
             case.w,
             case.channels
-        )
-        .into());
+        ));
     }
     // The family's own compression wins when it states one.
     let compression = match model::latent() {
@@ -249,21 +247,21 @@ async fn main(input: Input) -> Result<Output> {
     let rows = pixel_h * pixel_w;
     let width = d.readout_width;
 
-    // The port channel IS the clip: its shape is the box (design D8), and the
+    // The input's channel IS the clip: its shape is the box (design D8), and the
     // shell reads the committed cell straight into the voxel payload.
     let pipe = Pipeline::new();
     let pass = ForwardPass::new();
-    pass.reading(&d.name)?;
-    pass.stream(LaneStream::Image)?;
+    pass.switch(0, "reading", &d.name)?;
+    pass.switch(0, "stream", "image")?;
     let clip = Channel::from_shaped([case.h, case.w, case.channels], case.latent.as_slice())
         .named("latent");
-    pass.input(&d.port, &clip)?;
+    pass.input(0, &d.input, &clip)?;
 
     // The answer: one row per OUTPUT voxel, RGB in [-1, 1].
     let out = Channel::new([rows, width], dtype::f32).named("pixels");
-    let readback = out.clone();
+    let readback = out;
     pass.epilogue(move || {
-        readback.put(intrinsics::pixels(rows, width));
+        readback.put(intrinsics::pixels(0, rows, width));
     });
     pass.submit(&pipe).context("the vae.decode lane")?;
 
@@ -320,7 +318,7 @@ async fn main(input: Input) -> Result<Output> {
     let (mean, std, min, max, non_finite) = stats(&pixels);
     Ok(Output {
         reading: d.name,
-        port: d.port,
+        input: d.input,
         latent_h: case.h,
         latent_w: case.w,
         latent_channels: case.channels,

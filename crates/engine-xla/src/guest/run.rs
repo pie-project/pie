@@ -613,9 +613,10 @@ pub fn step_group(
     members: &mut [Member<'_>],
     carried: &[u32],
     cells: Option<BTreeMap<u32, Buffer>>,
+    at: Stage,
 ) -> (Vec<StepOutcome>, Option<BTreeMap<u32, Buffer>>) {
     let (outcomes, cells, deferred) = step_group_with(
-        device, stages, key, plan, kept, members, carried, cells, false,
+        device, stages, key, plan, kept, members, carried, cells, false, at,
     );
     debug_assert!(deferred.is_none(), "a synchronous pass defers nothing");
     (outcomes, cells)
@@ -635,13 +636,14 @@ pub fn step_group_deferred(
     members: &mut [Member<'_>],
     carried: &[u32],
     cells: Option<BTreeMap<u32, Buffer>>,
+    at: Stage,
 ) -> (
     Vec<StepOutcome>,
     Option<BTreeMap<u32, Buffer>>,
     Option<Deferred>,
 ) {
     step_group_with(
-        device, stages, key, plan, kept, members, carried, cells, true,
+        device, stages, key, plan, kept, members, carried, cells, true, at,
     )
 }
 
@@ -656,6 +658,7 @@ fn step_group_with(
     carried: &[u32],
     cells: Option<BTreeMap<u32, Buffer>>,
     defer: bool,
+    at: Stage,
 ) -> (
     Vec<StepOutcome>,
     Option<BTreeMap<u32, Buffer>>,
@@ -668,7 +671,7 @@ fn step_group_with(
             continue;
         }
         for (channel, ring) in member.inst.channels.iter().enumerate() {
-            let readiness = plan.package.channels.get(channel).and_then(|c| c.readiness);
+            let readiness = plan.readiness(channel as u32, at);
             let ready = match readiness {
                 Some(Direction::NeedsFull) => !ring.is_empty(),
                 Some(Direction::NeedsEmpty) => !ring.is_full(),
@@ -707,15 +710,16 @@ fn step_group_with(
     let last = kinds
         .iter()
         .flat_map(|kind| {
-            plan.stages
-                .iter()
-                .filter(move |sp| plan.package.stages[sp.stage_index].stage == *kind)
+            plan.stages.iter().filter(move |sp| {
+                plan.package.stages[sp.stage_index].stage == *kind
+                    && plan.runs_at(sp.stage_index, at)
+            })
         })
         .last()
         .map(|sp| sp.stage_index);
     let mut launched_out: Option<(Arc<Buffer>, usize, usize)> = None;
     for (k, kind) in kinds.iter().enumerate() {
-        if k == 1 {
+        if k == 1 && at != Stage::Prologue {
             for (m, member) in members.iter().enumerate() {
                 if outcome[m].is_some() {
                     continue;
@@ -728,7 +732,9 @@ fn step_group_with(
             }
         }
         for sp in &plan.stages {
-            if plan.package.stages[sp.stage_index].stage != *kind {
+            if plan.package.stages[sp.stage_index].stage != *kind
+                || !plan.runs_at(sp.stage_index, at)
+            {
                 continue;
             }
             let live: Vec<usize> = (0..members.len())

@@ -171,6 +171,8 @@ pub(crate) fn build_batch_request(
         member_lane_indptr.push(0);
         let mut media: Vec<engine::fire::StepMedia> = Vec::new();
         let mut voxels: Vec<engine::fire::StepVoxels> = Vec::new();
+        // Group ids renumber past earlier members', so two passes' groups never merge.
+        let mut groups = 0u32;
         for req in requests {
             boundary_programs.push(req.request.boundary_program);
             instance_ids.push(req.instance_id);
@@ -178,7 +180,18 @@ pub(crate) fn build_batch_request(
             completions.push(req.completion.clone());
             logical_fire_ids.push(req.logical_fire_id);
             let base = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
-            lanes.extend(req.request.lanes.iter().cloned());
+            let mut own: Vec<u32> = Vec::new();
+            lanes.extend(req.request.lanes.iter().cloned().map(|mut lane| {
+                lane.group = lane.group.map(|id| {
+                    let local = own.iter().position(|&seen| seen == id).unwrap_or_else(|| {
+                        own.push(id);
+                        own.len() - 1
+                    });
+                    groups + u32::try_from(local).unwrap_or(u32::MAX)
+                });
+                lane
+            }));
+            groups = groups.saturating_add(u32::try_from(own.len()).unwrap_or(u32::MAX));
             member_lane_indptr.push(u32::try_from(lanes.len()).unwrap_or(u32::MAX));
             media.extend(req.request.media.iter().cloned().map(|mut row| {
                 row.lane = row.lane.saturating_add(base);
@@ -255,8 +268,6 @@ pub(crate) fn build_frame_submission(
             .map(|(arrival, req)| fire_plan::MemberFacts {
                 hook_program: req.hook_program,
                 custom_mask: req.request.has_user_mask,
-                truncated: req.request.max_layers.is_some(),
-                max_layers: req.request.max_layers,
                 multi_token: req.request.lanes.iter().any(|lane| lane.tokens.len() > 1),
                 geometry_class: req.request.geometry,
                 arrival,
@@ -303,17 +314,19 @@ pub(crate) fn build_frame_submission(
         let mut attachments = Vec::new();
         let lanes = build.lanes;
         for (member, &instance) in build.instance_ids.iter().enumerate() {
-            // The fire that ends a pass runs its program; any other fire of
-            // an adapted pass still runs the adapter.
-            let at = if build.boundary_programs[member] {
-                ::engine::Boundary::Epilogue
-            } else if group[member].lora_program {
-                ::engine::Boundary::Adapter
-            } else {
+            // Only the fire ending a pass runs its program; earlier fires carry the adapter alone.
+            let adapter_only = !build.boundary_programs[member];
+            if adapter_only && !group[member].lora_program {
                 continue;
-            };
+            }
             let lane = build.member_lane_indptr[member];
-            attachments.push(::engine::Attachment { lane, instance, at });
+            let lanes = build.member_lane_indptr[member + 1] - lane;
+            attachments.push(::engine::Attachment {
+                lane,
+                lanes,
+                instance,
+                adapter_only,
+            });
         }
         steps.push(StepFire {
             submission: ::engine::Step {
@@ -380,6 +393,7 @@ mod tests {
         every_member_owns_a_span_of_the_steps_lanes();
         a_multi_lane_member_arrives_lane_for_lane();
         members_cobatch_by_concatenation();
+        two_passes_groups_never_meet();
         a_masked_lane_carries_its_own_mask_and_a_peer_carries_none();
         two_seated_members_batch_into_a_fire_the_contract_accepts();
         a_device_geometry_member_seriates_into_the_suffix();
@@ -446,6 +460,32 @@ mod tests {
                 .map(|lane| lane.tokens.clone())
                 .collect::<Vec<_>>(),
             vec![vec![11], vec![22], vec![33]]
+        );
+    }
+
+    fn two_passes_groups_never_meet() {
+        let grouped = |first: u32| {
+            let mut pass = FireRequest {
+                lanes: (0..4)
+                    .map(|at| crate::engine::fire::lane_of(at + first, vec![1], 0, vec![at]))
+                    .collect(),
+                ..FireRequest::default()
+            };
+            for (at, lane) in pass.lanes.iter_mut().enumerate() {
+                lane.group = Some(at as u32 / 2);
+            }
+            pass
+        };
+        let requests = [
+            pending(grouped(0), InstanceId(1)),
+            pending(grouped(4), InstanceId(2)),
+        ];
+        let step = build_batch_request(&requests, 16, &SchedulerStats::default());
+        let groups: Vec<Option<u32>> = step.lanes.iter().map(|lane| lane.group).collect();
+        assert_eq!(
+            groups,
+            [0, 0, 1, 1, 2, 2, 3, 3].map(Some).to_vec(),
+            "each pass keeps its own groups"
         );
     }
 

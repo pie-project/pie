@@ -86,6 +86,7 @@ impl Run<'_> {
                 segment(*how),
                 *sm_scale,
                 &mut self.tensor(*o),
+                self.grid_base(*grid, *q),
             ),
             Attn::PlanDecode {
                 kv_indptr,
@@ -414,6 +415,7 @@ impl Run<'_> {
                 *sm_scale,
                 &mut self.tensor(*o),
             ),
+            // `causal: false` marks a wide class: its staged mask bits are unclipped.
             Attn::Prefill {
                 kv_heads: _,
                 causal: _,
@@ -464,6 +466,63 @@ impl Run<'_> {
                 self.ragged_q(*q),
                 self.prefill_plan(*plan),
                 self.tensor(*mask),
+                &self.pool_absolute(*cache),
+                *window,
+                *head_dim,
+                *sm_scale,
+                &mut self.tensor(*o),
+                &mut self.tensor(*lse),
+            ),
+            Attn::Prefill {
+                kv_heads: _,
+                causal: false,
+                q,
+                plan,
+                mask: None,
+                cache,
+                window,
+                head_dim,
+                sm_scale,
+                o,
+                selection: None,
+                bias: None,
+                floor: None,
+                selected: None,
+                rel: None,
+                lse: None,
+            } => attn::masked(
+                self.ctx(),
+                self.ragged_q(*q),
+                self.prefill_plan(*plan),
+                self.mask_bits(),
+                &self.pool_absolute(*cache),
+                *window,
+                *head_dim,
+                *sm_scale,
+                &mut self.tensor(*o),
+            ),
+            Attn::Prefill {
+                kv_heads: _,
+                causal: false,
+                q,
+                plan,
+                mask: None,
+                cache,
+                window,
+                head_dim,
+                sm_scale,
+                o,
+                lse: Some(lse),
+                selection: None,
+                bias: None,
+                floor: None,
+                selected: None,
+                rel: None,
+            } => attn::masked_lse(
+                self.ctx(),
+                self.ragged_q(*q),
+                self.prefill_plan(*plan),
+                self.mask_bits(),
                 &self.pool_absolute(*cache),
                 *window,
                 *head_dim,
@@ -1287,57 +1346,37 @@ impl Run<'_> {
                 if self.run_index() > 0 {
                     return Ok(());
                 }
-                let mask = match mask {
-                    poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal
-                        if self.class_table().is_some() =>
-                    {
-                        let (table, count) = self.class_table().expect("checked above");
-                        let classes_of = |id: poem_ir::ValueId, what: &str| match self.values()
-                            [id.0 as usize]
-                            .def
-                        {
-                            poem_ir::Def::Input(poem_ir::RuntimeInput::Geometry {
-                                kind: poem_ir::GeomKind::GroupIndptr { select },
-                                ..
-                            }) => Ok(self.packing(id.0 as usize, select).attn_class),
-                            _ => Err(kernels_cuda::Error::Backend {
-                                op: "attn.ragged",
-                                detail: format!(
-                                    "a lane states attention classes and this attention's \
-                                         {what} rows are not packed by a group selection, so \
-                                         no class table applies to them"
-                                ),
-                            }),
-                        };
-                        kernels_cuda::attn::ragged::RaggedMask::ClassTable {
-                            q_classes: classes_of(*q_indptr, "query")?,
-                            kv_classes: classes_of(*kv_indptr, "key")?,
-                            table,
-                            count,
-                        }
-                    }
-                    poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal => {
+                let packing = |id: poem_ir::ValueId| match self.values()[id.0 as usize].def {
+                    poem_ir::Def::Input(poem_ir::RuntimeInput::Geometry {
+                        kind: poem_ir::GeomKind::GroupIndptr { select },
+                        ..
+                    }) => Some(select),
+                    _ => None,
+                };
+                let stated = packing(*q_indptr)
+                    .zip(packing(*kv_indptr))
+                    .and_then(|(q, kv)| self.group_mask(q, kv));
+                let mask = match (mask, stated) {
+                    (
+                        poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal,
+                        Some(stated),
+                    ) => kernels_cuda::attn::ragged::RaggedMask::Custom {
+                        bits: stated.bits,
+                        indptr: stated.indptr,
+                    },
+                    (poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal, None) => {
                         kernels_cuda::attn::ragged::RaggedMask::None
                     }
-                    poem_ir::RaggedMask::ReferenceSelfOnly { .. }
-                    | poem_ir::RaggedMask::RelativeBias { .. }
-                        if self.class_table().is_some() =>
-                    {
+                    (poem_ir::RaggedMask::RelativeBias { .. }, Some(_)) => {
                         return Err(kernels_cuda::Error::Backend {
                             op: "attn.ragged",
-                            detail: "a lane states attention classes over an attention the \
-                                  model already masks (reference tags or a relative bias); \
-                                  the two do not compose"
+                            detail: "a lane states an attention mask over an attention the \
+                                  model already biases (a relative bias); the two do not \
+                                  compose"
                                 .to_string(),
                         });
                     }
-                    poem_ir::RaggedMask::ReferenceSelfOnly { q_tags, kv_tags } => {
-                        kernels_cuda::attn::ragged::RaggedMask::ReferenceTags {
-                            q_tags: self.fire_wide(*q_tags),
-                            kv_tags: self.fire_wide(*kv_tags),
-                        }
-                    }
-                    poem_ir::RaggedMask::RelativeBias { table, max_len } => {
+                    (poem_ir::RaggedMask::RelativeBias { table, max_len }, None) => {
                         kernels_cuda::attn::ragged::RaggedMask::RelativeBias {
                             table: self.tensor(*table),
                             max_len: *max_len,

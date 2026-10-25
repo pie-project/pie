@@ -97,10 +97,8 @@ def run_cache(args, where: str, threshold: float | None) -> list[dict]:
             cmd += ["--config", args.config]
         cmd += ["run", "--path", binary, "--"]
         text = open(case).read()
-        n = 8
-        step = -(-len(text) // n)
-        for i in range(n):
-            cmd += [f"--case_{i}", text[i * step:(i + 1) * step]]
+        for i, piece in enumerate(P.pieces(text, 8)):
+            cmd += [f"--case_{i}", piece]
         cmd += ["--cache", "true",
                 "--cache_steps", str(args.steps),
                 "--cache_seed", str(args.seed)]

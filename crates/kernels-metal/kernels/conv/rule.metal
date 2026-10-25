@@ -73,3 +73,75 @@ inline int conv_axis(int n, int k, int s, int front, int back, thread bool& ok) 
     off += long(ot) * long(oh) * long(ow);
   }
 }
+
+// A row of a `tgrid` clip gets its patch's (t, h, w) and the clip's size in the last three
+// columns, any other row positions[row] in column `axis`. `base`: `y`'s row 0 in `tgrid`'s
+// fire-wide rows (a segmented fire's window starts later).
+[[kernel]] void cells(
+    const device int* tgrid           [[buffer(0)]],
+    const device int* positions       [[buffer(1)]],
+    device float* y                   [[buffer(2)]],
+    const constant int& clips         [[buffer(3)]],
+    const constant int& axis          [[buffer(4)]],
+    const constant int& width         [[buffer(5)]],
+    const constant int& rows          [[buffer(6)]],
+    const constant int& base          [[buffer(7)]],
+    uint gid                          [[thread_position_in_grid]]) {
+  const int row = int(gid);
+  if (row >= rows) return;
+  device float* o = y + size_t(width) * size_t(row);
+  for (int c = 0; c < width; ++c) o[c] = 0.0f;
+  SpatialClip g;
+  if (clip_of(tgrid, clips, row + base, g) < 0) {
+    o[axis] = float(positions[row]);
+    return;
+  }
+  const SpatialVoxel v = unravel(g, row + base - g.off);
+  o[0] = float(v.t);
+  o[1] = float(v.h);
+  o[2] = float(v.w);
+  o[width - 3] = float(g.t);
+  o[width - 2] = float(g.h);
+  o[width - 1] = float(g.w);
+}
+
+// Packed row csr[g] of `x` for the row's lane's group `g`, zeros where the group packs none.
+[[kernel]] void group_first(
+    const device float* x             [[buffer(0)]],
+    const device int* csr             [[buffer(1)]],
+    const device int* groups          [[buffer(2)]],
+    const device int* lanes           [[buffer(3)]],
+    device float* y                   [[buffer(4)]],
+    const constant int& width         [[buffer(5)]],
+    const constant int& x_rows        [[buffer(6)]],
+    const constant int& lane_count    [[buffer(7)]],
+    const constant int& group_count   [[buffer(8)]],
+    const constant int& rows          [[buffer(9)]],
+    uint gid                          [[thread_position_in_grid]]) {
+  const int row = int(gid);
+  if (row >= rows) return;
+  const int l = lanes[row];
+  const int g = (l >= 0 && l < lane_count) ? groups[l] : -1;
+  const int at = (g >= 0 && g < group_count && csr[g + 1] > csr[g]) ? csr[g] : -1;
+  device float* o = y + size_t(width) * size_t(row);
+  for (int c = 0; c < width; ++c) {
+    o[c] = (at >= 0 && at < x_rows) ? x[size_t(width) * size_t(at) + size_t(c)] : 0.0f;
+  }
+}
+
+// Each row's count of the rows `csr` packs in its lane's group.
+[[kernel]] void group_rows(
+    const device int* csr             [[buffer(0)]],
+    const device int* groups          [[buffer(1)]],
+    const device int* lanes           [[buffer(2)]],
+    device float* y                   [[buffer(3)]],
+    const constant int& lane_count    [[buffer(4)]],
+    const constant int& group_count   [[buffer(5)]],
+    const constant int& rows          [[buffer(6)]],
+    uint gid                          [[thread_position_in_grid]]) {
+  const int row = int(gid);
+  if (row >= rows) return;
+  const int l = lanes[row];
+  const int g = (l >= 0 && l < lane_count) ? groups[l] : -1;
+  y[row] = (g >= 0 && g < group_count) ? float(csr[g + 1] - csr[g]) : 0.0f;
+}

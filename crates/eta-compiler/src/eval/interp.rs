@@ -208,11 +208,10 @@ pub struct PassInputs {
     pub logits: Option<Value>,
     pub mtp_logits: Option<Value>,
     pub mtp_drafts: Option<Value>,
-    pub hidden: Option<Value>,
-    pub velocity: Option<Value>,
-    pub peer_velocity: Option<Value>,
-    pub pixels: Option<Value>,
-    pub value_head: Option<Value>,
+    /// Per lane of the pass.
+    pub hidden: Vec<Value>,
+    pub velocity: Vec<Value>,
+    pub pixels: Vec<Value>,
     pub query: Vec<Value>,
     pub attn_score: Option<Value>,
 }
@@ -329,9 +328,6 @@ impl Instance {
 
     pub fn poison(&mut self) {
         self.poisoned = true;
-    }
-    pub fn is_poisoned(&self) -> bool {
-        self.poisoned
     }
 
     pub fn host_put(&mut self, bound: &BoundTrace, chan: u32, v: Value) -> Result<(), HostError> {
@@ -462,7 +458,7 @@ impl Instance {
             .iter()
             .any(|s| taps.contains(&s.stage))
         {
-            for l in 0..bound.profile.num_layers {
+            for l in 0..bound.graph.num_layers {
                 for &stage in &taps {
                     exec_body(self, bound, &mut effects, stage, l, inputs, host)?;
                 }

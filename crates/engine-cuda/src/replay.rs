@@ -5,7 +5,7 @@
 //! the step with each prompt cut to its last window.
 
 use engine::fire::{Readout, RsReset, RsVerb, Step};
-use poem_ir::{Attn, Fact, Fused, Operation, Request};
+use poem_ir::{Attn, Builtin, Fact, Fused, Operation};
 
 use crate::serve::Shell;
 
@@ -36,7 +36,7 @@ impl Replay {
             .facts
             .table
             .iter()
-            .position(|fact| *fact == Fact::Flag(Request::ENCODE.to_string()))?;
+            .position(|fact| *fact == Fact::Builtin(Builtin::Encode))?;
         let floored = |attn: &Attn| match attn {
             Attn::Prefill {
                 window,
@@ -61,13 +61,13 @@ impl Replay {
 
     /// `step` as the encoder-only step to fire first and the step to fire
     /// after it, where a lane of it is a prompt longer than the window;
-    /// `None` where none is.
+    /// `None` where none is. `plain` says whether a word is a plain lane's, attending one way.
     #[must_use]
-    pub fn split(self, step: &Step) -> Option<(Step, Step)> {
+    pub fn split(self, step: &Step, plain: impl Fn(u64) -> bool) -> Option<(Step, Step)> {
         let window = self.window as usize;
         let cuts: Vec<Option<usize>> = (0..step.lanes.len())
             .map(|at| {
-                self.cuts(step, at)
+                self.cuts(step, at, &plain)
                     .then(|| step.lanes[at].tokens.len() - window)
             })
             .collect();
@@ -88,7 +88,6 @@ impl Replay {
             lead.word |= self.bit;
             lead.tokens.truncate(skipped);
             lead.readout = Readout::None;
-            lead.drafts = false;
             lead.channels.clear();
             head.lanes.push(lead);
 
@@ -107,31 +106,24 @@ impl Replay {
         Some((head, tail))
     }
 
-    /// Whether lane `at` of `step` is a plain prompt longer than the window (no mask,
-    /// scores, draft, conditioning, media or resolved ports; pages stated; readouts
-    /// in its last window). Its program and channels ride the second fire.
-    fn cuts(self, step: &Step, at: usize) -> bool {
+    /// A plain prompt longer than the window: its program rides the second fire.
+    fn cuts(self, step: &Step, at: usize, plain: impl Fn(u64) -> bool) -> bool {
         let lane = &step.lanes[at];
         let window = self.window as usize;
         let rows = lane.tokens.len();
         let at = at as u32;
         rows > window
-            && lane.word & self.bit == 0
+            && plain(lane.word)
             && lane.positions.is_empty()
             && lane.mask.is_none()
             && lane.adapter.is_none()
             && !lane.captures_scores
-            && !lane.block_draft
-            && !lane.bidirectional
-            && lane.self_cond.is_none()
             && matches!(lane.rs, RsVerb::Fold)
-            && lane.ports.is_empty()
-            && lane.attn_classes.is_none()
+            && lane.inputs.is_empty()
             && !lane.kv_less
             && !lane.kv.pages.is_empty()
             && lane.kv.translation.is_empty()
             && lane.group.is_none()
-            && lane.peer.is_none()
             && match &lane.readout {
                 Readout::Rows(read) => read.iter().all(|&row| row as usize >= rows - window),
                 Readout::Last | Readout::None => true,
@@ -180,7 +172,7 @@ mod tests {
             ..Step::default()
         };
         let (head, tail) = replay
-            .split(&step)
+            .split(&step, |word| word & replay.bit == 0)
             .expect("two prompts are longer than the window");
         assert_eq!(head.lanes.len(), 2);
         assert!(head.attachments.is_empty());
@@ -223,6 +215,6 @@ mod tests {
             lanes: vec![read],
             ..Step::default()
         };
-        assert!(replay.split(&step).is_none());
+        assert!(replay.split(&step, |word| word & replay.bit == 0).is_none());
     }
 }

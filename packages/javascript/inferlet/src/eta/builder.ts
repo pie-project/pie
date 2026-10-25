@@ -146,6 +146,7 @@ export class Traced {
 
 export class Builder {
   private ports: [Port, DslChannel][] = [];
+  private inputs: DslChannel[] = [];
   private stages: [Stage, () => void][] = [];
 
   constructor(
@@ -156,6 +157,12 @@ export class Builder {
   bindPort(port: Port, source: DslChannel): void {
     source.noteDescClaim(portConsumes(port));
     this.ports.push([port, source]);
+  }
+
+  /** List `source` as a guest model input, read at the descriptor phase. */
+  bindInput(source: DslChannel): void {
+    source.noteDescClaim(false);
+    this.inputs.push(source);
   }
 
   stage(stage: Stage, body: () => void): void {
@@ -176,8 +183,9 @@ export class Builder {
     return 1;
   }
 
-  private record(rows: number): { results: StageResult[]; ports: [Port, number][] } {
+  private record(rows: number): { results: StageResult[]; ports: [Port, number][]; inputs: number[] } {
     const ports: [Port, number][] = this.ports.map(([port, source]) => [port, internChannel(source.state)]);
+    const inputs = this.inputs.map((source) => internChannel(source.state));
     const results: StageResult[] = [];
     for (const stage of [Stage.PROLOGUE, Stage.ON_ATTN_PROJ, Stage.ON_ATTN, Stage.EPILOGUE]) {
       let body: (() => void) | undefined;
@@ -185,13 +193,13 @@ export class Builder {
       if (!body) continue;
       results.push(traceStage(stage, rows, body));
     }
-    return { results, ports };
+    return { results, ports, inputs };
   }
 
   build(): Traced {
     const rows = this.rows();
     const {
-      result: { results: stageResults, ports: rawPorts },
+      result: { results: stageResults, ports: rawPorts, inputs: rawInputs },
       channels: rawChannels,
       names: rawNames,
     } = withConstants(this.vocab, this.pageSize, () => withSession(() => this.record(rows)));
@@ -203,6 +211,7 @@ export class Builder {
     const channels = order.map((i) => rawChannels[i]);
     for (const r of stageResults) for (const op of r.ops) if (op.chan >= 0) op.chan = remap[op.chan];
     const ports: [Port, number][] = rawPorts.map(([p, ci]) => [p, remap[ci]]);
+    const inputs = [...new Set(rawInputs.map((ci) => remap[ci]))].sort((a, b) => a - b);
 
     // Name table: strictly sorted and unique.
     const nameOrder = rawNames.map((_, i) => i).sort((a, b) => (rawNames[a] < rawNames[b] ? -1 : rawNames[a] > rawNames[b] ? 1 : 0));
@@ -236,7 +245,7 @@ export class Builder {
 
     const stages: StageProgram[] = stageResults.map((r) => ({ stage: r.stage, ops: r.ops }));
     const portBindings: PortBinding[] = ports.sort((a, b) => a[0] - b[0]).map(([port, channel]) => ({ port, channel }));
-    const container: TraceContainer = { names, channels: decls, ports: portBindings, stages, externs: [] };
+    const container: TraceContainer = { names, channels: decls, ports: portBindings, stages, externs: [], inputs };
 
     lint(channels, sinks);
 

@@ -887,6 +887,22 @@ pub fn tanh(x: &Value) -> Value {
     x_out
 }
 
+pub fn sqrt(x: &Value) -> Value {
+    let r = x.rec();
+    let x_out = r.fresh(x.ty().clone());
+    r.push(
+        Elemwise::Act {
+            x: x.id(),
+            x_out: x_out.id(),
+            s: None,
+            scale: None,
+            act: poem_ir::ActFn::Sqrt,
+        },
+        &[x],
+    );
+    x_out
+}
+
 /// A blockwise Hadamard (butterfly FWHT) over the last dim. `block` is the
 /// power-of-two transform size; each contiguous `block`-vector is turned by the
 /// normalized Sylvester Hadamard matrix. When `signs` is `Some`, its ±1 entries
@@ -990,36 +1006,37 @@ pub fn norm_gate(
     (y, z)
 }
 
-pub fn mul(x: &Value, y: &Value) -> Value {
+fn binary(x: &Value, y: &Value, op: poem_ir::BinaryOp) -> Value {
     let r = x.rec();
-    assert_eq!(x.ty(), y.ty(), "a product's operands share a type");
+    assert_eq!(x.ty(), y.ty(), "a {op:?}'s operands share a type");
     let z = r.fresh(x.ty().clone());
     r.push(
         Elemwise::Binary {
             x: x.id(),
             y: y.id(),
             z: z.id(),
-            op: poem_ir::BinaryOp::Mul,
+            op,
         },
         &[x, y],
     );
     z
 }
 
+pub fn mul(x: &Value, y: &Value) -> Value {
+    binary(x, y, poem_ir::BinaryOp::Mul)
+}
+
 pub fn add(x: &Value, y: &Value) -> Value {
-    let r = x.rec();
-    assert_eq!(x.ty(), y.ty(), "a sum's operands share a type");
-    let z = r.fresh(x.ty().clone());
-    r.push(
-        Elemwise::Binary {
-            x: x.id(),
-            y: y.id(),
-            z: z.id(),
-            op: poem_ir::BinaryOp::Add,
-        },
-        &[x, y],
-    );
-    z
+    binary(x, y, poem_ir::BinaryOp::Add)
+}
+
+pub fn div(x: &Value, y: &Value) -> Value {
+    binary(x, y, poem_ir::BinaryOp::Div)
+}
+
+/// `x - y·floor(x / y)`, element by element: floored, as Python's `%`.
+pub fn mod_(x: &Value, y: &Value) -> Value {
+    binary(x, y, poem_ir::BinaryOp::Mod)
 }
 
 pub fn rope_axes(

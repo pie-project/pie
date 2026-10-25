@@ -23,19 +23,10 @@ const STAMPS: [u32; 5] = [64, 80, 96, 128, 256];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RaggedMask {
     None,
-    ReferenceSelfOnly {
-        ref_start: Tensor,
-    },
-    ReferenceTags {
-        q_tags: Tensor,
-        kv_tags: Tensor,
-    },
-    /// `q_classes[q] < 0 || kv_classes[kv] < 0 || table[q_class * count + kv_class] != 0`.
-    ClassTable {
-        q_classes: Tensor,
-        kv_classes: Tensor,
-        table: Tensor,
-        count: u32,
+    /// Keeps group `g`'s pair `(q, k)` where bit `q * kv_len + k` from byte `indptr[g]` is set.
+    Custom {
+        bits: Tensor,
+        indptr: Tensor,
     },
     RelativeBias {
         table: Tensor,
@@ -47,21 +38,16 @@ pub enum RaggedMask {
 #[derive(Clone, Copy)]
 enum Arm {
     Full = 0,
-    SelfOnly = 1,
-    Tags = 2,
-    Classes = 3,
-    Bias = 4,
+    Custom = 1,
+    Bias = 2,
 }
 
 /// The arm's operands, as the kernel takes them after the shape.
 struct Operands {
     arm: Arm,
-    ref_start: ArgValue<'static>,
-    q_ids: ArgValue<'static>,
-    kv_ids: ArgValue<'static>,
-    table: ArgValue<'static>,
+    bits: ArgValue<'static>,
+    mask_indptr: ArgValue<'static>,
     bias: ArgValue<'static>,
-    count: u32,
     max_len: u32,
 }
 
@@ -69,12 +55,9 @@ impl Operands {
     const fn of(arm: Arm) -> Self {
         Self {
             arm,
-            ref_start: ArgValue::ABSENT,
-            q_ids: ArgValue::ABSENT,
-            kv_ids: ArgValue::ABSENT,
-            table: ArgValue::ABSENT,
+            bits: ArgValue::ABSENT,
+            mask_indptr: ArgValue::ABSENT,
             bias: ArgValue::ABSENT,
-            count: 0,
             max_len: 0,
         }
     }
@@ -88,20 +71,6 @@ fn row_heads(what: &str, width: u32, head_dim: u32) -> Result<u32, Error> {
         ));
     }
     Ok(width / head_dim)
-}
-
-fn per_row(what: &str, table: Tensor, rows: u32, side: &str) -> Result<(), Error> {
-    if table.dtype != Dtype::I32 || table.rows < rows {
-        return Err(refuse(
-            OP,
-            format!(
-                "the {side} {what} table is {:?} with {} entries; the mask reads one i32 per row \
-                 of the {rows}-row {side} rectangle",
-                table.dtype, table.rows
-            ),
-        ));
-    }
-    Ok(())
 }
 
 /// Ragged (unpaged) attention over packed q/k/v, the vision towers' form: as
@@ -176,56 +145,25 @@ pub fn ragged(
 
     let operands = match mask {
         RaggedMask::None => Operands::of(Arm::Full),
-        RaggedMask::ReferenceSelfOnly { ref_start } => {
-            if ref_start.dtype != Dtype::I32 || ref_start.rows < groups.unsigned_abs() {
+        RaggedMask::Custom { bits, indptr } => {
+            if bits.dtype != Dtype::U8 || indptr.dtype != Dtype::I32 || indptr.rows != q_indptr.rows
+            {
                 return Err(refuse(
                     OP,
                     format!(
-                        "the reference table is {:?} with {} entries; the mask reads one i32 \
-                         per group of the {groups} the tables name",
-                        ref_start.dtype, ref_start.rows
+                        "a custom mask is u8 bits and an i32 byte offset a group; this one is \
+                         {:?} bits and {} {:?} offsets for {} groups",
+                        bits.dtype,
+                        indptr.rows,
+                        indptr.dtype,
+                        q_indptr.rows.saturating_sub(1)
                     ),
                 ));
             }
             Operands {
-                ref_start: ref_start.arg(),
-                ..Operands::of(Arm::SelfOnly)
-            }
-        }
-        RaggedMask::ReferenceTags { q_tags, kv_tags } => {
-            per_row("tag", q_tags, q.rows, "query")?;
-            per_row("tag", kv_tags, k.rows, "key")?;
-            Operands {
-                q_ids: q_tags.arg(),
-                kv_ids: kv_tags.arg(),
-                ..Operands::of(Arm::Tags)
-            }
-        }
-        RaggedMask::ClassTable {
-            q_classes,
-            kv_classes,
-            table,
-            count,
-        } => {
-            per_row("class", q_classes, q.rows, "query")?;
-            per_row("class", kv_classes, k.rows, "key")?;
-            let cells = u64::from(count) * u64::from(count);
-            if table.dtype != Dtype::U8 || u64::from(table.rows) < cells {
-                return Err(refuse(
-                    OP,
-                    format!(
-                        "the class table is {:?} with {} entries; the mask reads {count} x {count} \
-                         bytes",
-                        table.dtype, table.rows
-                    ),
-                ));
-            }
-            Operands {
-                q_ids: q_classes.arg(),
-                kv_ids: kv_classes.arg(),
-                table: table.arg(),
-                count,
-                ..Operands::of(Arm::Classes)
+                bits: bits.arg(),
+                mask_indptr: indptr.arg(),
+                ..Operands::of(Arm::Custom)
             }
         }
         RaggedMask::RelativeBias { table, max_len } => {
@@ -283,12 +221,9 @@ pub fn ragged(
             stated(OP, head_dim)?.arg(),
             sm_scale.arg(),
             rows.arg(),
-            operands.ref_start,
-            operands.q_ids,
-            operands.kv_ids,
-            operands.table,
+            operands.bits,
+            operands.mask_indptr,
             operands.bias,
-            stated(OP, operands.count)?.arg(),
             stated(OP, operands.max_len)?.arg(),
         ],
     )

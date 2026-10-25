@@ -4,7 +4,7 @@ use eta_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{ModelProfile, Port};
+use eta_ir::registry::{EngineCaps, Graph, Port, Readout, ReadoutKind};
 use eta_ir::types::{Dtype, Literal, Shape};
 use eta_ir::validate::bind;
 
@@ -16,6 +16,22 @@ fn channel(shape: Shape, dtype: Dtype, role: HostRole, seeded: bool) -> ChannelD
         host_role: role,
         seeded,
     }
+}
+
+fn served(c: TraceContainer, vocab: u32) -> BoundTrace {
+    bind(
+        c,
+        vec![Some(Readout {
+            kind: ReadoutKind::Logits,
+            width: vocab,
+        })],
+        Graph {
+            num_layers: 2,
+            ..Graph::default()
+        },
+        EngineCaps::default(),
+    )
+    .unwrap()
 }
 
 pub(super) fn program(prefix_constant: u32, global_channel_offset: usize) -> BoundTrace {
@@ -52,6 +68,7 @@ pub(super) fn program(prefix_constant: u32, global_channel_offset: usize) -> Bou
             ops: vec![
                 Op::IntrinsicVal {
                     intr: IntrinsicId::Logits,
+                    lane: 0,
                     shape: Shape::matrix(1, vocab),
                     dtype: Dtype::F32,
                 },
@@ -90,10 +107,9 @@ pub(super) fn program(prefix_constant: u32, global_channel_offset: usize) -> Bou
         ],
         stages,
         externs: vec![],
+        inputs: Vec::new(),
     };
-    let mut profile = ModelProfile::dummy();
-    profile.vocab = vocab;
-    bind(container, profile).unwrap()
+    served(container, vocab)
 }
 
 fn top_k_program(global_channel_offset: usize) -> BoundTrace {
@@ -121,7 +137,7 @@ fn top_k_program(global_channel_offset: usize) -> BoundTrace {
         HostRole::Reader,
         false,
     ));
-    bind(
+    served(
         TraceContainer {
             channels,
             stages: vec![StageProgram {
@@ -141,9 +157,8 @@ fn top_k_program(global_channel_offset: usize) -> BoundTrace {
             }],
             ..TraceContainer::default()
         },
-        ModelProfile::dummy(),
+        32,
     )
-    .unwrap()
 }
 
 #[test]

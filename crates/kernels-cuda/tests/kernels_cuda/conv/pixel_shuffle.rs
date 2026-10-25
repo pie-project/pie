@@ -65,6 +65,7 @@ fn a_trimmed_pixel_shuffle_drops_its_anchor_frames() {
         TRIM,
         &mut o,
         og,
+        [0, 0],
     )
     .expect("the shuffle fires");
     gpu.sync();

@@ -12,6 +12,7 @@
 // - `PIE_POOL`: bf16 rows averaged in blocks of `block` (a word a lane, two
 //   values).
 // - `PIE_SELECT`: a `width`-word slice at `offset` of each `stride`-word row.
+// - `PIE_PLACE`: a `width`-word row landed at `offset` of each `stride`-word row.
 // - `PIE_SPLIT`: each row cut into a left and a right part; `PIE_SPLIT_QKV`:
 //   into q, k and v; `PIE_SPLIT_Q_GATE`: each `2 * head`-word head into its
 //   query half and its gate half.
@@ -118,6 +119,27 @@ void main(uint3 gid : SV_DispatchThreadID) {
     }
 }
 
+#elif defined(PIE_PLACE)
+
+[[vk::binding(0)]] StructuredBuffer<uint> x;
+[[vk::binding(1)]] RWStructuredBuffer<uint> y;
+
+struct Params {
+    uint stride;
+    uint offset;
+    uint width;
+};
+PIE_PARAMS(2, Params, params);
+
+[shader("compute")]
+[numthreads(PIE_GROUP_X, 1, 1)]
+void main(uint3 gid : SV_DispatchThreadID) {
+    uint c = gid.x;
+    if (c < params.width) {
+        y[gid.y * params.stride + params.offset + c] = x[gid.y * params.width + c];
+    }
+}
+
 #elif defined(PIE_SPLIT)
 
 [[vk::binding(0)]] StructuredBuffer<uint> src;
@@ -221,6 +243,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
 // pie:instantiate gather_rows_scatter_live_words PIE_SCATTER_LIVE=1 PIE_GROUP_X=256
 // pie:instantiate gather_rows_pool_bf16 PIE_POOL=1 PIE_GROUP_X=256
 // pie:instantiate gather_rows_select_words PIE_SELECT=1 PIE_GROUP_X=256
+// pie:instantiate gather_rows_place_words PIE_PLACE=1 PIE_GROUP_X=256
 // pie:instantiate gather_rows_split_words PIE_SPLIT=1 PIE_GROUP_X=256
 // pie:instantiate gather_rows_split_qkv_words PIE_SPLIT_QKV=1 PIE_GROUP_X=256
 // pie:instantiate gather_rows_split_q_gate_words PIE_SPLIT_Q_GATE=1 PIE_GROUP_X=256

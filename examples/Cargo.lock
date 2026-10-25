@@ -823,6 +823,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "wan2-vae-parity"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "wasm-encoder"
 version = "0.259.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -12,13 +12,15 @@ use crate::tensor::Tensor;
 const RESAMPLE: &str = "conv/resample.slang";
 
 /// Fire `entry` over `y`'s rows, a pair of its columns a lane; `scalars`
-/// follow the four planes, the row count and span after them.
+/// follow the four planes, the row count and span after them, then `bases`: `x`'s and
+/// `y`'s row 0 in the grids' fire-wide rows, nonzero in a segmented fire's window.
 fn fire(
     ctx: &Ctx<'_>,
     op: &'static str,
     entry: &'static str,
     [x, grid, o_grid, y]: [Tensor; 4],
     scalars: &[ArgValue],
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     if y.rows == 0 {
         return Ok(());
@@ -32,11 +34,14 @@ fn fire(
     args.extend_from_slice(scalars);
     args.push(y.rows.arg());
     args.push(span.arg());
+    args.push(bases[0].arg());
+    args.push(bases[1].arg());
     ctx.fire(Fire::at(RESAMPLE, entry).apply(shape), &args)
 }
 
 /// Nearest upsampling by `factor` in `(t, h, w)`; with
 /// `keep_first_frame`, the first frame is not repeated.
+#[allow(clippy::too_many_arguments)]
 pub fn upsample_nearest(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -45,6 +50,7 @@ pub fn upsample_nearest(
     keep_first_frame: bool,
     o_grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.upsample";
     let entry = dtype_dispatch!(OP, y.dtype, {
@@ -74,11 +80,13 @@ pub fn upsample_nearest(
             factor[2].arg(),
             u32::from(keep_first_frame).arg(),
         ],
+        bases,
     )
 }
 
 /// Channel blocks of `r[0] r[1] r[2]` spread into time and space, the
 /// first `trim_t` frames dropped.
+#[allow(clippy::too_many_arguments)]
 pub fn pixel_shuffle(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -87,6 +95,7 @@ pub fn pixel_shuffle(
     trim_t: u32,
     o_grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.pixel_shuffle";
     let entry = dtype_dispatch!(OP, y.dtype, {
@@ -122,10 +131,10 @@ pub fn pixel_shuffle(
             r[2].arg(),
             trim_t.arg(),
         ],
+        bases,
     )
 }
 
-/// Time and space folded into channel blocks of `r[0] r[1] r[2]`.
 pub fn pixel_unshuffle(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -133,6 +142,7 @@ pub fn pixel_unshuffle(
     r: [u32; 3],
     o_grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.pixel_unshuffle";
     let entry = dtype_dispatch!(OP, y.dtype, {
@@ -167,12 +177,14 @@ pub fn pixel_unshuffle(
             r[1].arg(),
             r[2].arg(),
         ],
+        bases,
     )
 }
 
 /// The unshuffle by `factor`, each output channel the mean of a run of
 /// `group` unshuffled ones; time is front-padded to a multiple of
 /// `factor[0]`.
+#[allow(clippy::too_many_arguments)]
 pub fn avg_down(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -181,6 +193,7 @@ pub fn avg_down(
     group: u32,
     o_grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.avg_down";
     if x.dtype != Dtype::Bf16 || y.dtype != Dtype::Bf16 {
@@ -218,5 +231,6 @@ pub fn avg_down(
             factor[2].arg(),
             group.arg(),
         ],
+        bases,
     )
 }

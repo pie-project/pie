@@ -16,8 +16,7 @@ use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
-use eta_ir::registry::{GeometryClass, ModelProfile, Port, PortMask};
-use eta_ir::types::Dtype;
+use eta_ir::registry::{GeometryClass, Port, PortMask};
 use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
 
@@ -274,46 +273,6 @@ fn bf16_bits(value: f32) -> u16 {
     ((bits + rounding) >> 16) as u16
 }
 
-fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
-    let trace = shell.trace();
-    let layers = trace
-        .nodes
-        .iter()
-        .filter_map(|node| node.layer)
-        .max()
-        .map_or(0, |top| top + 1);
-    let width = u32::try_from(shell.out_width().map_err(fault)?).unwrap_or(u32::MAX);
-    let seam = shell.readout_seam();
-    let vocab = match seam {
-        engine::fire::ReadoutSeam::Logits => width,
-        _ => 0,
-    };
-    Ok(ModelProfile {
-        vocab,
-        page_size: budgets.page_size,
-        num_layers: layers,
-        activation: Dtype::F32,
-        has_mtp_logits: shell.drafts(),
-        mtp_depth: shell.mtp_depth(),
-        draft_block: shell.trace().drafter.map_or(0, |d| d.rows),
-        draft_mask_token: shell.trace().drafter.map_or(0, |d| d.mask_token),
-        draft_bidirectional: shell.trace().drafter.is_some_and(|d| d.bidirectional),
-        draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
-        has_value_head: false,
-        has_attn_score: shell.observes_scores(),
-        has_attn_page_mask: false,
-        has_lora: true,
-        has_velocity: seam == engine::fire::ReadoutSeam::Velocity,
-        velocity_width: match seam {
-            engine::fire::ReadoutSeam::Velocity => width,
-            _ => 0,
-        },
-        has_pixels: shell.pixels_width().is_some(),
-        pixels_width: shell.pixels_width().unwrap_or(0),
-        kernels: Vec::new(),
-    })
-}
-
 fn adapter_of(
     shell: &mut Shell,
     program: engine::program::ProgramId,
@@ -563,7 +522,6 @@ impl Engine for Metal {
             .caches
             .iter()
             .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
-        let profile = profile(&shell, &budgets)?;
 
         let caps = Capabilities {
             device: DeviceFacts {
@@ -615,7 +573,14 @@ impl Engine for Metal {
                 .unwrap_or(u32::MAX),
                 max_scoring_lanes: 0,
             },
-            profile,
+            has_lora: true,
+            has_attn_page_mask: false,
+            has_mtp_logits: shell.drafts(),
+            mtp_depth: shell.mtp_depth(),
+            draft_block: shell.trace().drafter.map_or(0, |d| d.rows),
+            draft_mask_token: shell.trace().drafter.map_or(0, |d| d.mask_token),
+            draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
+            has_attn_score: shell.observes_scores(),
             ports: PortMask::DEVICE_GEOMETRY
                 .with(Port::AttnMask)
                 .with(Port::Fold),
@@ -634,6 +599,8 @@ impl Engine for Metal {
             bidirectional_attention: true,
             adapter_attachments: false,
             facts: shell.trace().facts.clone(),
+            inputs: shell.inputs(),
+            classes: shell.classes(),
         };
 
         self.shell = Some(shell);
@@ -956,8 +923,9 @@ impl Metal {
             .iter()
             .map(|attachment| Attached {
                 lane: attachment.lane,
+                lanes: attachment.lanes,
                 instance: attachment.instance,
-                at: attachment.at,
+                adapter_only: attachment.adapter_only,
             })
             .collect();
 
@@ -1033,7 +1001,7 @@ impl Metal {
             let listed = matches!(lane.readout, Readout::Rows(_));
             let served = attached
                 .iter()
-                .any(|a| a.lane as usize == index && a.at == engine::fire::Boundary::Epilogue);
+                .any(|a| a.lane as usize == index && !a.adapter_only);
             if listed && !served {
                 return Err(Error::unsupported("metal", "row-selected readout"));
             }
@@ -1074,27 +1042,19 @@ impl Metal {
             .iter()
             .enumerate()
             .map(|(at, lane)| {
-                if lane.attn_classes.is_some() {
-                    return Err(Error::Unsupported {
-                        verb: "attention classes",
-                        engine: "metal",
-                    });
-                }
                 Ok(Seated {
                     lane: Lane {
                         slot: lane.slot,
                         word: words[at],
                         tokens: &lane.tokens,
                     },
-                    stream: lane.stream as u8,
                     group: lane.group,
-                    ports: &lane.ports,
+                    inputs: &lane.inputs,
                     pages: &lane.kv.pages,
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
                     captures_scores: lane.captures_scores,
                     mask: lane.mask.as_ref(),
-                    bidirectional: lane.bidirectional,
-                    self_cond: lane.self_cond.as_ref(),
+                    kv_less: lane.kv_less,
                     adapter: lane_adapters[at].or(lane.adapter),
                     positions: &lane.positions,
                     readout: match &lane.readout {

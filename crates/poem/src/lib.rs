@@ -21,9 +21,9 @@ pub use fact::Predicate;
 pub use forward::*;
 pub use poem_ir::{
     Attn, BlockDrafter, CacheRow, Collective, Def, Dim, Dtype, Elemwise, GateActivation, Gather,
-    GeomKind, Guard, IndexScore, Linear, ModulateForm, MropeForm, Operands, Operation, Param,
-    ParamSource, PixelOrder, Platform, RaggedMask, RopeForm, RuntimeInput, Sampling, Selection,
-    Shard, Stream, TapKind, Trace, Ty, ValueId, VoxelSegment, resolve_classes,
+    GeomKind, Guard, IndexScore, InputAxis, Linear, ModulateForm, MropeForm, Operands, Operation,
+    Param, ParamSource, PixelOrder, Platform, RaggedMask, RopeForm, RuntimeInput, Sampling,
+    Selection, Shard, TapKind, Trace, Ty, ValueId, VoxelSegment, resolve_classes,
 };
 pub use record::{Arm, Primitive, Recorder, Refine, Switch, Value, restate, switch};
 

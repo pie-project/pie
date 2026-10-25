@@ -1,6 +1,6 @@
 //! Elementwise kernels with no algorithm of their own (`elemwise.binary`,
 //! `residual_add`, `add_bias`, `mul_scalar`, `scale`, `silu`, `silu_scaled`,
-//! `tanh`, `cast`, `clamp`, `clamp_learned`, `gate_sigmoid_mul`) from
+//! `tanh`, `sqrt`, `cast`, `clamp`, `clamp_learned`, `gate_sigmoid_mul`) from
 //! `kernels/elemwise/pointwise.slang`, a pair of elements a lane. A
 //! whole-tensor kernel takes an odd count; an in-place one binds its tensor
 //! once, writable, as WebGPU asks.
@@ -27,19 +27,47 @@ fn flat(op: &'static str, x: Tensor) -> Result<(u32, Grid), Error> {
     Ok((n, Grid::of([n.div_ceil(2), 1, 1], [GROUP, 1, 1])))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BinaryOp {
+    Add,
+    Mul,
+    Div,
+    /// `x - y·floor(x / y)`: floored, as Python's `%`.
+    Mod,
+}
+
 /// `z = x + y`.
 pub fn add(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> {
+    binary(ctx, BinaryOp::Add, x, y, z)
+}
+
+/// `z = x op y`, the planes the same shape and element.
+pub fn binary(ctx: &Ctx<'_>, op: BinaryOp, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> {
     const OP: &str = "elemwise.binary";
     if x.dtype != z.dtype || y.dtype != z.dtype {
         return Err(refuse(
             OP,
-            format!("{:?} + {:?} into {:?}", x.dtype, y.dtype, z.dtype),
+            format!("{:?} {op:?} {:?} into {:?}", x.dtype, y.dtype, z.dtype),
         ));
     }
-    let entry = dtype_dispatch!(OP, z.dtype, {
-        Bf16 => "elemwise_pointwise_add_bf16",
-        F32 => "elemwise_pointwise_add_f32",
-    });
+    let entry = match op {
+        BinaryOp::Add => dtype_dispatch!(OP, z.dtype, {
+            Bf16 => "elemwise_pointwise_add_bf16",
+            F32 => "elemwise_pointwise_add_f32",
+        }),
+        BinaryOp::Mul => dtype_dispatch!(OP, z.dtype, {
+            Bf16 => "elemwise_pointwise_mul_bf16",
+            F32 => "elemwise_pointwise_mul_f32",
+        }),
+        BinaryOp::Div => dtype_dispatch!(OP, z.dtype, {
+            Bf16 => "elemwise_pointwise_div_bf16",
+            F32 => "elemwise_pointwise_div_f32",
+        }),
+        BinaryOp::Mod => dtype_dispatch!(OP, z.dtype, {
+            Bf16 => "elemwise_pointwise_mod_bf16",
+            F32 => "elemwise_pointwise_mod_f32",
+        }),
+    };
     let (n, grid) = flat(OP, z)?;
     ctx.fire(
         Fire::at(POINTWISE, entry).apply(grid),
@@ -128,6 +156,19 @@ fn silu_at(ctx: &Ctx<'_>, op: &'static str, s: f32, x: Tensor) -> Result<(), Err
     ctx.fire(
         Fire::at(POINTWISE, entry).apply(grid),
         &[x.arg_mut(), s.arg(), n.arg()],
+    )
+}
+
+pub fn sqrt(ctx: &Ctx<'_>, x: Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.act";
+    let entry = dtype_dispatch!(OP, x.dtype, {
+        Bf16 => "elemwise_pointwise_sqrt_bf16",
+        F32 => "elemwise_pointwise_sqrt_f32",
+    });
+    let (n, grid) = flat(OP, x)?;
+    ctx.fire(
+        Fire::at(POINTWISE, entry).apply(grid),
+        &[x.arg_mut(), n.arg()],
     )
 }
 

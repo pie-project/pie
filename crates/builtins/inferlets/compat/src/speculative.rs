@@ -87,7 +87,7 @@ async fn pass(
     let chances = sampled.as_ref().map(|(_, _, chances)| *chances);
     let fwd = ForwardPass::new();
     if drafting {
-        fwd.set_drafting_block(true).context("draft block")?;
+        fwd.switch(0, "block_draft", "on").context("draft block")?;
     }
     fwd.embed(&toks, &indptr)?;
     fwd.readout(&readout)?;

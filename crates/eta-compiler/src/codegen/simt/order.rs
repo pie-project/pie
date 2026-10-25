@@ -437,7 +437,7 @@ pub fn emit_order_region(
         let _ = writeln!(
             source,
             "  constexpr m1_u32 kIntrinsicSlots = {}u;",
-            super::fused::PTIR_INTRINSIC_SLOTS
+            super::fused::intrinsic_pitch(stage)
         );
         source.push_str(BODY_SELECT);
     } else {

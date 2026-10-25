@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel, Ticket};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, PassInputs, StepOutcome, Value};
+#[cfg(feature = "wgpu")]
+use eta_ir::registry::Stage;
 use eta_ir::registry::{GeometryClass, Port};
 
 #[derive(Debug)]
@@ -61,6 +63,12 @@ pub(crate) struct Tally {
     interpreted: AtomicU64,
 }
 
+#[derive(Debug, Clone)]
+pub struct InputCell {
+    pub bytes: Vec<u8>,
+    pub dtype: eta_ir::types::Dtype,
+}
+
 #[cfg(feature = "wgpu")]
 pub(crate) struct Half {
     id: InstanceId,
@@ -79,7 +87,10 @@ pub(crate) struct Pass<'a> {
     pub mtp_logits: Option<&'a [f32]>,
     pub mtp_width: u32,
     pub readout: Option<crate::guest::run::Readout<'a>>,
-    pub pixels: Option<crate::guest::run::Readout<'a>>,
+    /// The pass's own `velocity(k)` / `hidden(k)` readouts, lane `k` at `k`.
+    pub lanes: Vec<Option<crate::guest::run::Readout<'a>>>,
+    pub pixels: Vec<Option<crate::guest::run::Readout<'a>>>,
+    pub at: Stage,
 }
 
 #[cfg(feature = "wgpu")]
@@ -120,8 +131,9 @@ impl Half {
         };
         let mut runner =
             crate::guest::run::OnDevice::new(device, &mut self.session, widen, pass.readout)
-                .with_pixels(pass.pixels);
-        let outcome = eta_exec::step_with(&mut self.inst, &self.plan, &inputs, &mut runner);
+                .with_lanes(pass.lanes, pass.pixels);
+        let outcome =
+            eta_exec::step_with(&mut self.inst, &self.plan, &inputs, &mut runner, pass.at);
         let ran = runner.ran().len();
         if self.inst.poisoned {
             self.poisoned.store(true, Ordering::Release);
@@ -240,10 +252,9 @@ impl Guests {
         rows: &[Vec<f32>],
         drafts: &[Vec<f32>],
         seat: &crate::device::Buffer,
-        layout: &[(u32, u32)],
-        out_width: u32,
+        layout: &[crate::serve::ReadSpan],
         mtp_width: u32,
-        pixels: Option<&(crate::device::Buffer, u32)>,
+        pixels: Option<&(crate::device::Buffer, Vec<(u64, u32)>)>,
     ) -> Vec<Job> {
         let Guests {
             device,
@@ -292,21 +303,16 @@ impl Guests {
                                 .collect::<Vec<f32>>()
                         })
                         .filter(|values| !values.is_empty());
+                    let entries: Vec<crate::serve::ReadSpan> = span
+                        .clone()
+                        .filter_map(|lane| layout.get(lane).copied())
+                        .collect();
                     let on_device = {
-                        let entries: Vec<(u32, u32)> = span
-                            .clone()
-                            .filter_map(|lane| layout.get(lane).copied())
-                            .collect();
-                        let contiguous = entries
-                            .windows(2)
-                            .all(|pair| pair[0].0 + pair[0].1 == pair[1].0);
-                        let count: u32 = entries.iter().map(|&(_, count)| count).sum();
-                        (contiguous && count > 0).then(|| {
-                            (
-                                u64::from(entries[0].0) * u64::from(out_width) * 2,
-                                count * out_width,
-                            )
-                        })
+                        let contiguous = entries.windows(2).all(|pair| {
+                            pair[0].at + pair[0].bytes() == pair[1].at && pair[0].f32 == pair[1].f32
+                        });
+                        let count: u32 = entries.iter().map(crate::serve::ReadSpan::values).sum();
+                        (contiguous && count > 0).then(|| (entries[0].at, count, entries[0].f32))
                     };
                     let seat = seat.clone();
                     let pixels = pixels.cloned();
@@ -321,11 +327,13 @@ impl Guests {
                             }
                             _ => (None, 0, 0),
                         };
-                        let readout = on_device.map(|(at, width)| crate::guest::run::Readout {
-                            seat: &seat,
-                            at,
-                            width,
-                        });
+                        let readout =
+                            on_device.map(|(at, width, f32)| crate::guest::run::Readout {
+                                seat: &seat,
+                                at,
+                                width,
+                                f32,
+                            });
                         half.lock().expect("half lock poisoned").fire(
                             &device,
                             &widen,
@@ -337,13 +345,31 @@ impl Guests {
                                 mtp_logits: mtp.as_deref(),
                                 mtp_width,
                                 readout,
-                                pixels: pixels.as_ref().map(|(plane, count)| {
-                                    crate::guest::run::Readout {
-                                        seat: plane,
-                                        at: 0,
-                                        width: *count,
-                                    }
-                                }),
+                                lanes: entries
+                                    .iter()
+                                    .map(|entry| {
+                                        (entry.rows > 0).then_some(crate::guest::run::Readout {
+                                            seat: &seat,
+                                            at: entry.at,
+                                            width: entry.values(),
+                                            f32: entry.f32,
+                                        })
+                                    })
+                                    .collect(),
+                                pixels: span
+                                    .clone()
+                                    .map(|lane| {
+                                        let (plane, spans) = pixels.as_ref()?;
+                                        let &(at, width) = spans.get(lane)?;
+                                        (width > 0).then_some(crate::guest::run::Readout {
+                                            seat: plane,
+                                            at,
+                                            width,
+                                            f32: false,
+                                        })
+                                    })
+                                    .collect(),
+                                at: Stage::Epilogue,
                             },
                         )
                     });
@@ -620,6 +646,43 @@ impl Plane {
             })
     }
 
+    /// The oldest cell guest input channel `id` of `instance` holds, in wire bytes.
+    pub fn input_cell(&self, instance: InstanceId, id: ChannelId) -> Result<InputCell, Refusal> {
+        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance.0,
+        })?;
+        let dense = seat
+            .channels
+            .iter()
+            .position(|&held| held == id)
+            .ok_or_else(|| {
+                Refusal::Program(format!(
+                    "a guest input feed names channel {id}, which instance {instance} does not carry"
+                ))
+            })?;
+        #[cfg(feature = "wgpu")]
+        seat.gate.settle(instance)?;
+        let ring = &seat.inst.channels[dense];
+        #[cfg(feature = "wgpu")]
+        if ring.is_empty() {
+            self.settle_writers(id)?;
+        }
+        if ring.is_empty() {
+            return Err(Refusal::Program(format!(
+                "guest input channel {id} of instance {instance} holds no cell; publish one before \
+                 the fire that reads it"
+            )));
+        }
+        let value = ring.front();
+        let mut bytes = vec![0u8; eta_exec::wire_cell_bytes(value.dtype(), value.len())];
+        eta_exec::encode_wire(&value, &mut bytes);
+        Ok(InputCell {
+            bytes,
+            dtype: eta_exec::concrete_dtype(seat.plan.package.channels[dense].dtype),
+        })
+    }
+
     pub fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
@@ -849,6 +912,51 @@ impl Plane {
                 "channel {channel} of instance {instance}: cell dtype mismatch"
             ))),
         }
+    }
+
+    #[must_use]
+    pub fn prologue_runs(&self, instance: InstanceId) -> bool {
+        self.instances
+            .get(&instance)
+            .is_some_and(|seat| seat.plan.prologue_runs())
+    }
+
+    /// Waits for every pass airborne on `instance`'s channels before the prologue runs.
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn fire_prologue(
+        &self,
+        device: &crate::device::Context,
+        instance: InstanceId,
+    ) -> Result<(), Refusal> {
+        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance.0,
+        })?;
+        seat.gate.settle(instance)?;
+        for &channel in &seat.channels {
+            self.settle_writers(channel)?;
+        }
+        let widen = self.widen.as_ref().ok_or_else(|| {
+            Refusal::Program(format!(
+                "instance {instance} has a device half, but the plane built no readout widen"
+            ))
+        })?;
+        seat.half.lock().expect("half lock poisoned").fire(
+            device,
+            widen,
+            &self.tally,
+            Pass {
+                logits: None,
+                rows: 0,
+                vocab: 0,
+                mtp_logits: None,
+                mtp_width: 0,
+                readout: None,
+                lanes: Vec::new(),
+                pixels: Vec::new(),
+                at: Stage::Prologue,
+            },
+        )
     }
 
     #[cfg(feature = "wgpu")]

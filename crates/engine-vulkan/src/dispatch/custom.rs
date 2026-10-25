@@ -93,6 +93,7 @@ impl Run<'_> {
                     },
                     t(*y_grid),
                     t(*y),
+                    [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
                 )
             }
             Conv::GroupNorm {
@@ -127,6 +128,7 @@ impl Run<'_> {
                     partials,
                     stats,
                     t(*y),
+                    self.grid_base(*grid, *x),
                 )
             }
             Conv::Upsample {
@@ -144,6 +146,7 @@ impl Run<'_> {
                 *keep_first_frame,
                 t(*y_grid),
                 t(*y),
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
             ),
             Conv::PixelShuffle {
                 x,
@@ -152,14 +155,31 @@ impl Run<'_> {
                 trim_t,
                 y_grid,
                 y,
-            } => resample::pixel_shuffle(ctx, t(*x), t(*grid), *r, *trim_t, t(*y_grid), t(*y)),
+            } => resample::pixel_shuffle(
+                ctx,
+                t(*x),
+                t(*grid),
+                *r,
+                *trim_t,
+                t(*y_grid),
+                t(*y),
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
+            ),
             Conv::PixelUnshuffle {
                 x,
                 grid,
                 r,
                 y_grid,
                 y,
-            } => resample::pixel_unshuffle(ctx, t(*x), t(*grid), *r, t(*y_grid), t(*y)),
+            } => resample::pixel_unshuffle(
+                ctx,
+                t(*x),
+                t(*grid),
+                *r,
+                t(*y_grid),
+                t(*y),
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
+            ),
             Conv::AvgDown {
                 x,
                 grid,
@@ -167,10 +187,61 @@ impl Run<'_> {
                 group,
                 y_grid,
                 y,
-            } => resample::avg_down(ctx, t(*x), t(*grid), *factor, *group, t(*y_grid), t(*y)),
-            Conv::CacheStore { .. } | Conv::Patchify { .. } | Conv::Unpatchify { .. } => {
-                Err(kernels_slang::Error::Unsupported { op: op.name() })
-            }
+            } => resample::avg_down(
+                ctx,
+                t(*x),
+                t(*grid),
+                *factor,
+                *group,
+                t(*y_grid),
+                t(*y),
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
+            ),
+            Conv::Patchify {
+                x,
+                grid,
+                p,
+                tgrid,
+                y,
+            } => resample::pixel_unshuffle(
+                ctx,
+                t(*x),
+                t(*grid),
+                *p,
+                t(*tgrid),
+                t(*y),
+                [self.grid_base(*grid, *x), self.grid_base(*tgrid, *y)],
+            ),
+            Conv::Unpatchify {
+                x,
+                tgrid,
+                p,
+                grid,
+                y,
+            } => resample::pixel_shuffle(
+                ctx,
+                t(*x),
+                t(*tgrid),
+                *p,
+                0,
+                t(*grid),
+                t(*y),
+                [self.grid_base(*tgrid, *x), self.grid_base(*grid, *y)],
+            ),
+            Conv::Cells {
+                tgrid,
+                positions,
+                axis,
+                y,
+            } => rule::cells(
+                ctx,
+                t(*tgrid),
+                t(*positions),
+                *axis,
+                t(*y),
+                self.grid_base(*tgrid, *y),
+            ),
+            Conv::CacheStore { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
         }
     }
 }

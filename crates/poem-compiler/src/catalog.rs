@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use checkpoint::contract::ModelContract;
-use poem::generative::{Diffusion, Generative};
+use poem::generative::Generative;
 use poem::star::{Deploy, Model, Package, Published};
 use poem::{Dtype, Platform, Trace};
 
@@ -88,24 +88,11 @@ impl Deployment {
             .map_err(|why| Refused(format!("{why:#}")))
     }
 
-    pub fn try_diffusion(&self) -> Result<Option<Diffusion>, Refused> {
-        self.package
-            .diffusion(&self.model.id, &self.deploy)
-            .map_err(|why| Refused(format!("{why:#}")))
-    }
-
     /// [`Deployment::try_generative`], panicking: for a listed deployment.
     #[must_use]
     pub fn generative(&self) -> Option<Generative> {
         self.try_generative()
             .unwrap_or_else(|why| panic!("`{}` states no generative facts: {why}", self.name))
-    }
-
-    /// [`Deployment::try_diffusion`], panicking: for a listed deployment.
-    #[must_use]
-    pub fn diffusion(&self) -> Option<Diffusion> {
-        self.try_diffusion()
-            .unwrap_or_else(|why| panic!("`{}` states no canvas: {why}", self.name))
     }
 
     /// The marker groups the tokenizer must hold for the parts served.
@@ -156,7 +143,13 @@ pub fn lowering_of(trace: &Trace, tp: u32) -> poem::Lowering {
     let cuts = crate::shard::infer::resolve(&mut trace, tp);
     let joins = crate::pack::joins(&trace);
     let lowered = crate::tile::tile(crate::pack::pack(trace.clone()));
-    let tiled = crate::tile::tiled(&crate::pack::pack(trace));
+    let mut tiled = crate::tile::tiled(&crate::pack::pack(trace));
+    // A tiled join's legs are read tiled too, each leg's scales beside its codes.
+    for join in &joins {
+        if tiled.contains(&join.name) {
+            tiled.extend(join.legs.iter().cloned());
+        }
+    }
     let read = Some(lowered.params.iter().map(|p| p.name.clone()).collect());
     poem::Lowering {
         joins,

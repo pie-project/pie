@@ -3,11 +3,11 @@ use std::collections::BTreeSet;
 use crate::mini_dit_dims;
 
 use mini_dit_dims as model;
-use poem::generative::{PortKind, ReadoutKind};
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, GeomKind, Guard, Operands, Operation, Platform, Request,
-    RopeForm, RuntimeInput, Stream, Trace, Ty, ValueId, seam,
+    RopeForm, RuntimeInput, Trace, Ty, ValueId, seam,
 };
+use poem_ir::Conv;
 
 const DEPLOYMENT: &str = "mini-dit-bf16-kv-bf16";
 
@@ -31,12 +31,88 @@ fn trace(platform: Platform) -> Trace {
 #[test]
 fn the_mini_dit_row_bakes_every_case() {
     the_row_traces_on_every_platform_with_no_cache_and_a_velocity_readout();
-    the_row_reads_exactly_the_five_ports_it_declares();
+    the_row_reads_exactly_the_five_inputs_it_names();
     each_stream_classifies_into_its_own_class_and_every_merge_resolves();
     the_joint_attention_is_self_paired_and_the_cross_attention_is_not();
     every_rope_turns_three_axes_of_the_whole_head_interleaved();
     the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk();
-    the_generative_facts_are_the_ports_the_trace_reads();
+    the_generative_facts_state_the_reading_its_latent_and_its_schedule();
+    the_latent_is_patched_in_the_graph_and_the_positions_are_its_cells();
+}
+
+fn the_latent_is_patched_in_the_graph_and_the_positions_are_its_cells() {
+    let plan = trace(Platform::Cuda);
+    let patch = [1, model::PATCH, model::PATCH];
+    let ops: Vec<&Conv> = plan
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Operation::Conv(op) => Some(op),
+            _ => None,
+        })
+        .collect();
+    let patched = ops
+        .iter()
+        .filter(|op| matches!(op, Conv::Patchify { p, .. } if *p == patch))
+        .count();
+    let unpatched = ops
+        .iter()
+        .filter(|op| matches!(op, Conv::Unpatchify { p, .. } if *p == patch))
+        .count();
+    assert_eq!(
+        (patched, unpatched),
+        (1, 1),
+        "the latent in, the velocity out"
+    );
+    let cells: Vec<u32> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Conv::Cells { axis, .. } => Some(*axis),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        cells,
+        vec![0],
+        "a text row's position runs down the time axis"
+    );
+
+    let velocity = plan
+        .seams
+        .iter()
+        .find(|s| s.seam == seam::VELOCITY.name)
+        .expect("a velocity seam")
+        .values[0];
+    assert_eq!(
+        plan.values[velocity.0 as usize].ty,
+        Ty::Tensor {
+            shape: vec![Dim::Voxels, Dim::Const(u64::from(model::CHANNELS))],
+            dtype: Dtype::Bf16,
+        },
+        "the velocity reads out in the latent's own voxels"
+    );
+    assert_eq!(
+        plan.facts.declared("positions").map(|s| s.values.clone()),
+        Some(vec!["computed".to_string(), "given".to_string()])
+    );
+
+    let budgets = poem_compiler::Budgets::of(poem_compiler::Budget::new(4, 256)).with_voxels(
+        poem_compiler::VoxelLadder {
+            max_voxels: 1024,
+            buckets: vec![256, 1024],
+            max_clips: 4,
+        },
+    );
+    let compiled =
+        poem_compiler::compile_axes(&plan, &budgets, &poem_compiler::DeviceProfile::default())
+            .expect("the voxel-in, voxel-out denoiser bakes");
+    assert!(
+        compiled.units.contains(&poem_compiler::RowAxis::Voxels)
+            && compiled.units.contains(&poem_compiler::RowAxis::Tokens),
+        "the latent's voxels and the tokens are two units: {:?}",
+        compiled.units
+    );
+    assert!(compiled.arena.clashes(&compiled.concurrency).is_empty());
 }
 
 fn the_row_traces_on_every_platform_with_no_cache_and_a_velocity_readout() {
@@ -61,44 +137,32 @@ fn the_row_traces_on_every_platform_with_no_cache_and_a_velocity_readout() {
     }
 }
 
-fn the_row_reads_exactly_the_five_ports_it_declares() {
+fn the_row_reads_exactly_the_five_inputs_it_names() {
     let plan = trace(Platform::Cuda);
-    let ports: BTreeSet<String> = plan
+    let named: BTreeSet<String> = plan
         .values
         .iter()
         .filter_map(|decl| match &decl.def {
-            Def::Input(input) => match input {
-                RuntimeInput::Latents { port, width } => Some(format!("latents[{port}]:{width}")),
-                RuntimeInput::Context { port, width } => Some(format!("context[{port}]:{width}")),
-                RuntimeInput::LaneVector { port, width } => {
-                    Some(format!("lane_vector[{port}]:{width}"))
-                }
-                RuntimeInput::AxisPositions { port, axes } => {
-                    Some(format!("axis_positions[{port}]:{axes}"))
-                }
-                _ => None,
-            },
+            Def::Input(RuntimeInput::Guest {
+                id, axis, width, ..
+            }) => Some(format!(
+                "{}:{}:{width}",
+                plan.inputs[*id as usize].name,
+                axis.name()
+            )),
             _ => None,
         })
         .collect();
     let want: BTreeSet<String> = [
-        format!(
-            "latents[{}]:{}",
-            model::port::LATENTS,
-            model::PATCH_FEATURES
-        ),
-        format!("context[{}]:{}", model::port::TEXT, model::TEXT_WIDTH),
-        format!("context[{}]:{}", model::port::CONTEXT, model::CONTEXT_WIDTH),
-        format!("lane_vector[{}]:1", model::port::TIMESTEP),
-        format!(
-            "axis_positions[{}]:{}",
-            model::port::POSITIONS,
-            model::ROPE_AXES
-        ),
+        format!("latents:voxel:{}", model::CHANNELS),
+        format!("text:row:{}", model::TEXT_WIDTH),
+        format!("context:row:{}", model::CONTEXT_WIDTH),
+        "timestep:lane:1".to_string(),
+        format!("positions:row:{}", model::ROPE_AXES),
     ]
     .into_iter()
     .collect();
-    assert_eq!(ports, want);
+    assert_eq!(named, want);
 
     let sinusoids: Vec<(u32, f32, bool, f32)> = plan
         .nodes
@@ -131,8 +195,8 @@ fn each_stream_classifies_into_its_own_class_and_every_merge_resolves() {
     let _row = poem_compiler::catalog::deployment(DEPLOYMENT).expect("the row is in the catalog");
 
     let mut seen = Vec::new();
-    for stream in [Stream::Text, Stream::Image, Stream::Context] {
-        let request = Request::new(1, false).on_stream(stream);
+    for stream in ["text", "image", "context"] {
+        let request = Request::new(1, false).switched("stream", stream);
         let word = plan.facts.word(&request);
         let class = classes
             .class_of(word & classes.mask)
@@ -194,16 +258,19 @@ fn the_joint_attention_is_self_paired_and_the_cross_attention_is_not() {
         joint,
         "blocks 0 and 1 pack one sequence"
     );
-    let word = |stream: Stream| plan.facts.word(&Request::new(1, false).on_stream(stream));
-    assert!(joint.holds(word(Stream::Text)));
-    assert!(joint.holds(word(Stream::Image)));
-    assert!(!joint.holds(word(Stream::Context)));
+    let word = |stream: &str| {
+        plan.facts
+            .word(&Request::new(1, false).switched("stream", stream))
+    };
+    assert!(joint.holds(word("text")));
+    assert!(joint.holds(word("image")));
+    assert!(!joint.holds(word("context")));
 
     let (q_csr, kv_csr, _) = crossed[0];
-    assert!(selection_of(*q_csr).holds(word(Stream::Image)));
-    assert!(!selection_of(*q_csr).holds(word(Stream::Context)));
-    assert!(selection_of(*kv_csr).holds(word(Stream::Context)));
-    assert!(!selection_of(*kv_csr).holds(word(Stream::Image)));
+    assert!(selection_of(*q_csr).holds(word("image")));
+    assert!(!selection_of(*q_csr).holds(word("context")));
+    assert!(selection_of(*kv_csr).holds(word("context")));
+    assert!(!selection_of(*kv_csr).holds(word("image")));
 
     let joins = plan
         .nodes
@@ -329,109 +396,29 @@ fn the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk() {
     }
 }
 
-fn the_generative_facts_are_the_ports_the_trace_reads() {
+fn the_generative_facts_state_the_reading_its_latent_and_its_schedule() {
     let row = poem_compiler::catalog::deployment(DEPLOYMENT).expect("the row is in the catalog");
     let facts = row
         .generative()
         .expect("the first generative row states its readings");
-    assert_eq!(facts.readings.len(), 1, "one reading, today");
-    let reading = &facts.readings[0];
-    assert_eq!(reading.name, "denoise");
-    assert_eq!(reading.index, model::DENOISE_READING);
-    assert!(!reading.has_kv, "a denoise pass binds no kv");
-    assert!(!reading.takes_tokens, "and embeds no tokens");
-    assert_eq!(
-        reading.streams,
-        vec![Stream::Text, Stream::Image, Stream::Context]
-    );
-    assert_eq!(reading.readout, ReadoutKind::Velocity);
-    assert_eq!(reading.readout_width, model::PATCH_FEATURES);
-
-    let at = |name: &str| {
-        let (index, port) = reading.port(name).unwrap_or_else(|| {
-            panic!("the reading declares no port `{name}`");
-        });
-        (index, port.kind, port.width)
+    let declared = |name: &str| {
+        trace(Platform::Cuda)
+            .facts
+            .declared(name)
+            .map(|s| s.values.clone())
     };
     assert_eq!(
-        at("latents"),
-        (
-            model::port::LATENTS,
-            PortKind::Latents,
-            model::PATCH_FEATURES
-        )
+        declared("reading"),
+        Some(vec!["denoise".to_string()]),
+        "one reading, today"
     );
     assert_eq!(
-        at("text"),
-        (model::port::TEXT, PortKind::Context, model::TEXT_WIDTH)
-    );
-    assert_eq!(
-        at("context"),
-        (
-            model::port::CONTEXT,
-            PortKind::Context,
-            model::CONTEXT_WIDTH
-        )
-    );
-    assert_eq!(
-        at("timestep"),
-        (model::port::TIMESTEP, PortKind::LaneVector, 1)
-    );
-    assert_eq!(
-        at("positions"),
-        (
-            model::port::POSITIONS,
-            PortKind::AxisPositions,
-            u32::from(model::ROPE_AXES)
-        )
-    );
-
-    let plan = trace(Platform::Cuda);
-    let mut traced: Vec<(PortKind, u8, u32)> = plan
-        .values
-        .iter()
-        .filter_map(|decl| match &decl.def {
-            Def::Input(RuntimeInput::Latents { port, width }) => {
-                Some((PortKind::Latents, *port, *width))
-            }
-            Def::Input(RuntimeInput::Context { port, width }) => {
-                Some((PortKind::Context, *port, *width))
-            }
-            Def::Input(RuntimeInput::LaneVector { port, width }) => {
-                Some((PortKind::LaneVector, *port, *width))
-            }
-            Def::Input(RuntimeInput::AxisPositions { port, axes }) => {
-                Some((PortKind::AxisPositions, *port, u32::from(*axes)))
-            }
-            _ => None,
-        })
-        .collect();
-    traced.sort_by_key(|(kind, port, _)| (format!("{kind:?}"), *port));
-    let mut declared: Vec<(PortKind, u8, u32)> = reading
-        .ports_indexed()
-        .map(|(index, port)| (port.kind, index, port.width))
-        .collect();
-    declared.sort_by_key(|(kind, port, _)| (format!("{kind:?}"), *port));
-    assert_eq!(
-        traced, declared,
-        "the facts a guest binds by and the inputs the plan reads are one list"
+        declared("stream"),
+        Some(["text", "image", "context"].map(String::from).to_vec())
     );
 
     let latent = facts.latent.expect("a denoiser states its latent space");
-    assert_eq!(
-        (
-            latent.channels,
-            latent.patch_h,
-            latent.patch_w,
-            latent.patch_t
-        ),
-        (model::CHANNELS, model::PATCH, model::PATCH, 1)
-    );
-    assert_eq!(
-        latent.channels * latent.patch_t * latent.patch_h * latent.patch_w,
-        model::PATCH_FEATURES,
-        "a latent row is exactly the head's output row"
-    );
+    assert_eq!(latent.channels, model::CHANNELS);
     let schedule = facts.schedule.as_ref().expect("and its schedule");
     assert_eq!(schedule.kind, poem::generative::ScheduleKind::Flow);
     assert_eq!(schedule.pinned_sigmas, vec![1.0, 0.75, 0.5, 0.25]);

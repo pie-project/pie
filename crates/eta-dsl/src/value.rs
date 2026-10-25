@@ -1189,9 +1189,20 @@ pub fn nucleus_sample(logits: impl AsTensor, top_p: impl AsTensor, state: impl A
     Tensor::node(result, token_type)
 }
 
-pub(crate) fn intrinsic_val(intr: IntrinsicId, shape: Shape, dtype: Dtype) -> Tensor {
+pub(crate) fn intrinsic_val(intr: IntrinsicId, lane: u32, shape: Shape, dtype: Dtype) -> Tensor {
     let ty = ValueType::new(shape, dtype);
-    Tensor::node(emit(Op::IntrinsicVal { intr, shape, dtype }, &[ty]), ty)
+    Tensor::node(
+        emit(
+            Op::IntrinsicVal {
+                intr,
+                lane,
+                shape,
+                dtype,
+            },
+            &[ty],
+        ),
+        ty,
+    )
 }
 
 pub(crate) fn reshape_id_to(id: ValueId, from: ValueType, target: Shape) -> ValueId {

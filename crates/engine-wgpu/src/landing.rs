@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::device::{Buffer, OnDone};
 use crate::error::Fault;
+use crate::serve::ReadSpan;
 use crate::settle::{Airborne, Done};
 
 #[cfg(feature = "wgpu")]
@@ -12,20 +13,19 @@ pub enum Guests {}
 pub(crate) struct Seat {
     pub seq: u64,
     pub arm: usize,
-    pub layout: Vec<(u32, u32)>,
-    pub width: u32,
+    pub layout: Vec<ReadSpan>,
     pub seat: Buffer,
     pub mirror: Buffer,
     pub draft: Option<(u32, Buffer)>,
-    /// The fire's pixel plane and its element count, where it wrote one.
-    pub pixels: Option<(Buffer, u32)>,
+    /// The fire's pixel plane and each lane's (byte, element count) span of it.
+    pub pixels: Option<(Buffer, Vec<(u64, u32)>)>,
     pub guests: Option<Guests>,
 }
 
 pub(crate) struct Landed {
     pub seq: u64,
     pub arm: usize,
-    pub layout: Vec<(u32, u32)>,
+    pub layout: Vec<ReadSpan>,
     pub rows: Vec<Vec<f32>>,
     pub drafts: Vec<Vec<f32>>,
     pub failed: bool,
@@ -42,17 +42,24 @@ pub(crate) type Mailbox = Arc<Mutex<Post>>;
 type Rows = (Vec<Vec<f32>>, Vec<Vec<f32>>);
 
 fn read_seat(
-    layout: Vec<(u32, u32)>,
-    width: u32,
+    layout: Vec<ReadSpan>,
     seat: &Buffer,
     draft: Option<(u32, Buffer)>,
     on_read: impl FnOnce(Result<Rows, Fault>) + Send + 'static,
 ) {
-    let total: usize = layout.iter().map(|&(_, n)| n as usize).sum();
-    let width = width as usize;
-    seat.read_async(0, (total * width * 2) as u64, move |raw| {
+    let end = layout
+        .iter()
+        .map(|span| span.at + span.bytes())
+        .max()
+        .unwrap_or(0);
+    let total: usize = layout
+        .iter()
+        .filter(|span| span.voxels.is_none())
+        .map(|span| span.rows as usize)
+        .sum();
+    seat.read_async(0, end, move |raw| {
         let rows = match raw {
-            Ok(raw) => crate::serve::rows_from(&raw, &layout, width),
+            Ok(raw) => crate::serve::rows_from(&raw, &layout),
             Err(fault) => return on_read(Err(fault)),
         };
         let Some((draft_width, draft)) = draft else {
@@ -60,7 +67,7 @@ fn read_seat(
         };
         let draft_width = draft_width as usize;
         draft.read_async(0, (total * draft_width * 2) as u64, move |raw| {
-            on_read(raw.map(|raw| (rows, crate::serve::rows_from(&raw, &layout, draft_width))));
+            on_read(raw.map(|raw| (rows, crate::serve::drafts_from(&raw, &layout, draft_width))));
         });
     });
 }
@@ -68,11 +75,10 @@ fn read_seat(
 struct Landing {
     seq: u64,
     arm: usize,
-    layout: Vec<(u32, u32)>,
-    width: u32,
+    layout: Vec<ReadSpan>,
     seat: Buffer,
     mtp_width: u32,
-    pixels: Option<(Buffer, u32)>,
+    pixels: Option<(Buffer, Vec<(u64, u32)>)>,
     read: Result<Rows, String>,
     guests: Option<Guests>,
     mailbox: Mailbox,
@@ -93,7 +99,6 @@ impl Landing {
                 drafts,
                 &self.seat,
                 &self.layout,
-                self.width,
                 self.mtp_width,
                 self.pixels.as_ref(),
             );
@@ -108,7 +113,7 @@ impl Landing {
             let _ = (
                 rows,
                 drafts,
-                self.width,
+                &self.layout,
                 &self.seat,
                 self.mtp_width,
                 &self.pixels,
@@ -289,7 +294,6 @@ pub(crate) fn on_done(
         seq,
         arm,
         layout,
-        width,
         seat,
         mirror,
         draft,
@@ -304,7 +308,6 @@ pub(crate) fn on_done(
             seq,
             arm,
             layout,
-            width,
             seat,
             mtp_width,
             pixels,
@@ -319,7 +322,7 @@ pub(crate) fn on_done(
         tracing::debug!(seq, refused = refused.is_some(), "landing: work done");
         match refused {
             Some(why) => land(Err(why)),
-            None => read_seat(read_layout, width, &mirror, draft, move |read| {
+            None => read_seat(read_layout, &mirror, draft, move |read| {
                 let read = read.and_then(|rows| verdict.queue_verdict().map(|()| rows));
                 land(read.map_err(|fault| fault.to_string()));
             }),

@@ -2,7 +2,7 @@ use crate::common;
 
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, RaggedMask, Request, Stream, Value, Weight, ops, seam,
+    Dtype, ForwardHybrid, HybridSpec, Input, RaggedMask, Request, Value, Weight, ops, seam,
     trace_hybrid,
 };
 use poem_compiler::Placement;
@@ -20,15 +20,32 @@ impl ForwardHybrid for CrossAttention {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
-        let ([audio, video], _rest) =
-            inputs.partition([fact::stream(Stream::Audio), fact::stream(Stream::Video)]);
+        inputs
+            .recorder()
+            .declare_switch("stream", &["text", "audio", "video"]);
+        let ([audio, video], _rest) = inputs.partition([
+            fact::switch_is("stream", "audio"),
+            fact::switch_is("stream", "video"),
+        ]);
         let inner = HEADS * u64::from(HEAD_DIM);
         let wq = Weight::sym("audio.q", [inner, AUDIO], Dtype::Bf16);
         let wk = Weight::sym("video.k", [inner, VIDEO], Dtype::Bf16);
         let wv = Weight::sym("video.v", [inner, VIDEO], Dtype::Bf16);
         let wo = Weight::sym("audio.o", [AUDIO, inner], Dtype::Bf16);
-        let xa = audio.latents(0, AUDIO as u32, Dtype::Bf16);
-        let xv = video.latents(1, VIDEO as u32, Dtype::Bf16);
+        let xa = audio.input(
+            "audio",
+            Dtype::Bf16,
+            poem_ir::InputAxis::Row,
+            AUDIO as u32,
+            None,
+        );
+        let xv = video.input(
+            "video",
+            Dtype::Bf16,
+            poem_ir::InputAxis::Row,
+            VIDEO as u32,
+            None,
+        );
         let q = ops::gather::pack_rows(&ops::linear::matmul(&xa, &wq), &audio.row_permutation());
         let k = ops::gather::pack_rows(&ops::linear::matmul(&xv, &wk), &video.row_permutation());
         let v = ops::gather::pack_rows(&ops::linear::matmul(&xv, &wv), &video.row_permutation());
@@ -66,7 +83,7 @@ fn the_join_is_the_attentions_alone_and_the_velocity_lives_to_the_end() {
             .class_of(
                 trace
                     .facts
-                    .word(&Request::new(1, false).on_stream(Stream::Audio))
+                    .word(&Request::new(1, false).switched("stream", "audio"))
                     & compiled.classes.mask,
             )
             .expect("an audio lane has a class");
@@ -75,7 +92,7 @@ fn the_join_is_the_attentions_alone_and_the_velocity_lives_to_the_end() {
             .class_of(
                 trace
                     .facts
-                    .word(&Request::new(1, false).on_stream(Stream::Video))
+                    .word(&Request::new(1, false).switched("stream", "video"))
                     & compiled.classes.mask,
             )
             .expect("a video lane has a class");

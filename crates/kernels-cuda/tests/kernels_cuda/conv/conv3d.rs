@@ -88,6 +88,7 @@ fn check(case: &Case, path: ConvPath) {
         )),
         &mut o,
         Tensor::new(o_grid_at, outs.len() as u32, 4, Dtype::I32),
+        [0, 0],
     )
     .unwrap_or_else(|e| panic!("{name} on {path:?} fires: {e}"));
     gpu.sync();
@@ -262,6 +263,7 @@ fn the_tensor_core_kernel_refuses_a_channel_count_it_cannot_vectorise() {
         None,
         &mut o,
         Tensor::new(o_grid_at, 2, 4, Dtype::I32),
+        [0, 0],
     );
     assert!(refused.is_err(), "three channels do not vectorise");
 }

@@ -37,11 +37,26 @@ and an `epilogue` that returns a tensor publishes it on a channel the host
 same objects and stay available; `examples/text-completion-py` uses them for
 a one-pass prefill and a device loop-carried decode.
 
+A model receives two things per fire: **inputs** (device channels) and
+**switches** (a value from a finite set that picks the model's path). One
+`ForwardPass` holds every lane of one computation (a CFG denoise step's text
+and image lanes of both branches, say); `switch(lane, name, value)`,
+`input(lane, name, ch)`, `media(lane, spans)` and `group(lane, id)` address a
+lane by index, `mask(rows)` is pass-wide, and epilogue intrinsics take the lane
+(`velocity(lane, …)`, `hidden(lane, …)`, `pixels(lane, …)`). `model.switches()`
+lists a model's switches and `model.lane(switches)` says what a lane with those
+values binds: its inputs, whether it binds a working set (`state`), whether it
+embeds tokens, and its readout. Generative latents are the VAE's own
+`[t, h, w, C]`; patching and positions live in the model. A causal VAE
+decodes frame by frame into a working set, one latent frame per slot, and the
+runtime's `fresh` switch (cursor 0) picks its first-frame branch. A `prologue`
+runs before the forward, an `epilogue` after it.
+
 ## What is here
 
 | Module | Interface | Notes |
 |---|---|---|
-| `inferlet.eta` | `forward*`, `channel`, `working-set`, `pipeline` | The ETA authoring surface: `Tensor` + the op set, `Channel`, `WorkingSet`, `StateGeometry`, `ForwardPass`, `Pipeline` (`submit`, `run_ahead`), `readout_spans`, and `eta.diffusion` (the diffusion pass's `Mode` plus `entropy_bound_accept` / `stable_and_confident` / `linear_temperature`). A port of the Rust `eta-dsl`/`eta-ir` crates and `inferlet::eta`; the container bytes it emits are **byte-identical** to the Rust `inferlet` crate's for the same program (`tests/test_eta_goldens.py` pins them), so a Python and a Rust inferlet share the host's program cache. |
+| `inferlet.eta` | `forward`, `channel`, `working-set`, `pipeline` | The ETA authoring surface: `Tensor` + the op set, `Channel`, `WorkingSet`, `StateGeometry`, `ForwardPass`, `Pipeline` (`submit`, `run_ahead`), `readout_spans`, and `eta.diffusion` (a block-diffusion text's samplers `entropy_bound_accept` / `stable_and_confident` / `linear_temperature`). A port of the Rust `eta-dsl`/`eta-ir` crates and `inferlet::eta`; the container bytes it emits are **byte-identical** to the Rust `inferlet` crate's for the same program (`tests/test_eta_goldens.py` pins them), so a Python and a Rust inferlet share the host's program cache. |
 | `inferlet.model` / `inferlet.tokenizer` | `model`, `tokenizer` | The bound model's facts; `model` re-exports the tokenizer functions. |
 | `inferlet.grammar` / `inferlet.mask` | `grammar` | JSON-Schema / regex / EBNF constraints and the packed-bitmask helpers a `masked_argmax` epilogue reads. |
 | `inferlet.chat` / `inferlet.reasoning` / `inferlet.tools` | `chat`, `reasoning`, `tools` | The host's chat template, thinking-block and tool-call decoders. |

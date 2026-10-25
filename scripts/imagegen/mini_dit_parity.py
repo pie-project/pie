@@ -22,19 +22,17 @@ script is the other half: it turns the golden's *inputs* into the case JSON the
     # or all four
     python mini_dit_parity.py all --out /tmp/mini-dit-parity
 
-Nothing here imports torch: the reference numbers are already on disk, and
-patchify is a reshape.
+Nothing here imports torch: the reference numbers are already on disk.
 
 THE GUEST'S SHAPE
 -----------------
-One step is three passes (caption, image, context) in one attention group,
-each on ITS OWN pipeline: the scheduler seals a frame from every live
-pipeline and never seats two passes of one pipeline in one step, so three
-passes down one pipeline would be three fires, each lane attending alone.
-The runtime holds a fresh group's first frame for its cohort (`FireRequest::
-cohort`), so the three seal together from the first step -- and keeps holding
-it: a stated cohort is sealed whole or the request dies by name, never as a
-fire over whichever lanes were quick enough.
+One step is ONE pass of three lanes (caption, context, image) in one
+attention group: one logical computation is one pass, so its lanes always
+fire together. The latent goes in as the VAE holds it, `[H, W, C]`, and the
+velocity comes back on the same voxel axis, `[H*W, C]`: the model patchifies
+and computes its rotary positions in its own graph, so the case carries
+neither patches nor positions. `patchify` below exists only to check the
+golden's own `patches` and to land `final.tokens` for the diff.
 
 BISECTION
 ---------
@@ -74,11 +72,14 @@ def patchify(latent: np.ndarray, p: int) -> np.ndarray:
     x = x.transpose(0, 2, 4, 1, 3, 5)
     return np.ascontiguousarray(x.reshape(b, (hs // p) * (ws // p), c * p * p))
 
-def unpatchify(tokens: np.ndarray, c: int, hs: int, ws: int, p: int) -> np.ndarray:
-    b = tokens.shape[0]
-    x = tokens.reshape(b, hs // p, ws // p, c, p, p)
-    x = x.transpose(0, 3, 1, 4, 2, 5)
-    return np.ascontiguousarray(x.reshape(b, c, hs, ws))
+def hwc(latent: np.ndarray) -> np.ndarray:
+    """[B,C,H,W] -> [B,H,W,C]: the latent as the guest's voxel channel holds it."""
+    return np.ascontiguousarray(latent.transpose(0, 2, 3, 1))
+
+def chw(voxels: np.ndarray, c: int, hs: int, ws: int) -> np.ndarray:
+    """[B, H*W, C] (the voxel readout) -> [B,C,H,W]."""
+    b = voxels.shape[0]
+    return np.ascontiguousarray(voxels.reshape(b, hs, ws, c).transpose(0, 3, 1, 2))
 
 def loop_of(args) -> str | None:
     """The loop a run integrates: `euler`, a `--solver`, or none (one step)."""
@@ -115,17 +116,15 @@ def cases(args) -> list[str]:
     text = dump["in.text"]
     context = dump["in.context"]
     timestep = dump["in.timestep"]
-    txt_pos = dump["in.txt_pos"]
-    img_pos = dump["in.img_pos"]
     patches = patchify(dump["in.latent"], p)
     assert np.array_equal(patches, dump["patches"]), "patchify disagrees with the reference"
 
     if args.euler:
         euler = np.load(os.path.join(args.golden, f"mini_dit_euler_{args.policy}.npz"))
-        latents = patchify(euler["euler.x_init"], p)
+        latents = hwc(euler["euler.x_init"])
         sigmas = euler["euler.sigmas"].tolist()
     else:
-        latents = patches
+        latents = hwc(dump["in.latent"])
         sigmas = []
 
     os.makedirs(args.out, exist_ok=True)
@@ -133,16 +132,16 @@ def cases(args) -> list[str]:
     for b in range(latents.shape[0]):
         case = {
             "latents": latents[b].reshape(-1).astype(np.float32).tolist(),
-            "image_rows": int(latents.shape[1]),
-            "patch_features": int(latents.shape[2]),
+            "latent_h": int(hs),
+            "latent_w": int(ws),
+            "channels": int(c),
+            "image_tokens": int((hs // p) * (ws // p)),
             "text": text[b].reshape(-1).astype(np.float32).tolist(),
             "text_rows": int(text.shape[1]),
             "text_width": int(text.shape[2]),
             "context": context[b].reshape(-1).astype(np.float32).tolist(),
             "context_rows": int(context.shape[1]),
             "context_width": int(context.shape[2]),
-            "text_positions": txt_pos.reshape(-1).astype(np.float32).tolist(),
-            "image_positions": img_pos.reshape(-1).astype(np.float32).tolist(),
             "timestep": float(timestep[b]),
             "sigmas": [float(s) for s in sigmas],
             "t_scale": float(cfg["euler_t_scale"]),
@@ -152,7 +151,7 @@ def cases(args) -> list[str]:
         with open(path, "w") as f:
             json.dump(case, f)
         written.append(path)
-    print(f"[case] {len(written)} batch element(s), {latents.shape[1]} image rows -> {args.out}")
+    print(f"[case] {len(written)} batch element(s), a {hs}x{ws}x{c} latent -> {args.out}")
     return written
 
 def wasm(inferlet: str) -> str:
@@ -184,6 +183,18 @@ def wasm(inferlet: str) -> str:
         raise SystemExit(f"no wasm for {name}; tried {', '.join(candidates)}")
     return max(present, key=os.path.getmtime)
 
+def pieces(text: str, n: int) -> list[str]:
+    """`n` argv pieces of `text`, none starting with `-` (`pie run` reads those as flags)."""
+    step = -(-len(text) // n)
+    cuts = [0]
+    for i in range(1, n):
+        at = max(cuts[-1], min(i * step, len(text)))
+        while at < len(text) and text[at] == "-":
+            at += 1
+        cuts.append(at)
+    cuts.append(len(text))
+    return [text[a:b] for a, b in zip(cuts, cuts[1:])]
+
 def run(args) -> None:
     paths = numbered(args.out, "case", loop_of(args))
     if not paths:
@@ -205,10 +216,8 @@ def run(args) -> None:
             cmd += ["--case_file", os.path.basename(case)]
         else:
             text = open(case).read()
-            n = 8
-            step = -(-len(text) // n)
-            for i in range(n):
-                cmd += [f"--case_{i}", text[i * step:(i + 1) * step]]
+            for i, piece in enumerate(pieces(text, 8)):
+                cmd += [f"--case_{i}", piece]
         if args.solver:
             cmd += ["--solver", args.solver]
         elif args.euler:
@@ -281,10 +290,11 @@ def classes(args) -> int:
         return 1
     for at in range(batches):
         v = {mode: np.asarray(answers[mode][at]["velocity"], dtype=np.float32) for mode in answers}
-        rows = int(answers["none"][at]["image_rows"])
-        width = int(answers["none"][at]["patch_features"])
-        side = int(round(rows ** 0.5))
-        left = np.array([(i % side) < side // 2 for i in range(rows)])
+        doc = answers["none"][at]
+        rows = int(doc["image_rows"])
+        width = int(doc["velocity_width"])
+        cols = int(doc["latent_w"])
+        left = np.array([(i % cols) < cols // 2 for i in range(rows)])
         rel = lambda a, b: float(np.linalg.norm(a - b)) / max(float(np.linalg.norm(b)), 1e-30)
         if np.array_equal(v["all"], v["none"]):
             print(f"[classes] batch {at}: PASS an all-ones table is the plain step, exactly")
@@ -391,10 +401,9 @@ def sweep(args) -> int:
 def guidance(args) -> int:
     """CLASSIFIER-FREE GUIDANCE, ON THE DEVICE — does it run, and is it right?
 
-    Six lanes, two attention groups, one fire: group 0 holds the case's
-    context, group 1 a zeroed one, and group 0's image lane names group 1 as
-    its peer, so its epilogue holds BOTH branches' velocities and combines
-    them. That combine is what every guest did on the host until now.
+    Six lanes of one pass, two attention groups: group 0 holds the case's
+    context, group 1 a zeroed one, and the pass's epilogue reads both image
+    lanes' velocities and combines them.
 
     Checked with three claims, all WITHIN one fire's own answers and needing
     no golden. Same-fire matters: a six-lane fire and a three-lane one give
@@ -406,8 +415,8 @@ def guidance(args) -> int:
 
       s = 0  ->  the combine IS the unconditional branch, exactly. That
                  branch publishes its own velocity from the SAME fire, so
-                 this is bit-for-bit. It is the claim that proves the peer
-                 bind pointed at the OTHER group and not at its own rows —
+                 this is bit-for-bit. It is the claim that proves
+                 `velocity(lane)` read the OTHER group's lane and not at its own rows —
                  the one failure a plausible-looking picture would hide.
       s = 1 vs 0  ->  the two must differ by a real margin. Without this the
                  other two claims hold trivially: a lane guided by itself
@@ -445,7 +454,7 @@ def guidance(args) -> int:
 
         if np.array_equal(g0, unc):
             print(f"[guidance] batch {at}: PASS s=0 the combine is the unconditional "
-                  f"branch, exactly — the peer is the other group")
+                  f"branch, exactly — velocity(lane) read the other group")
         else:
             off = float(np.linalg.norm(g0 - unc)) / max(float(np.linalg.norm(unc)), 1e-30)
             print(f"[guidance] batch {at}: FAIL s=0 the combine differs from the "
@@ -480,17 +489,17 @@ def collect(args) -> str:
     if not paths:
         raise SystemExit(f"{args.out}: no pie answer; run `run` first")
     docs = [document(path) for path in paths]
-    rows, width = docs[0]["image_rows"], docs[0]["patch_features"]
+    rows, width = docs[0]["image_rows"], docs[0]["velocity_width"]
 
     def stack(key: str, at: int | None = None) -> np.ndarray:
-        tokens = np.stack(
+        voxels = np.stack(
             [
                 np.asarray(doc[key] if at is None else doc[key][at], dtype=np.float32)
                 .reshape(rows, width)
                 for doc in docs
             ]
         )
-        return unpatchify(tokens, c, hs, ws, p)
+        return chw(voxels, c, hs, ws)
 
     out: dict[str, np.ndarray] = {}
     if loop_of(args):
@@ -506,9 +515,7 @@ def collect(args) -> str:
         out[args.tap] = np.stack([plane.reshape(-1, tw) for plane in planes]).squeeze()
     else:
         out["velocity"] = stack("velocity")
-        out["final.tokens"] = np.stack(
-            [np.asarray(doc["velocity"], dtype=np.float32).reshape(rows, width) for doc in docs]
-        )
+        out["final.tokens"] = patchify(out["velocity"], p)
 
     path = os.path.join(args.out, f"mini_dit_pie{'_' + loop_of(args) if loop_of(args) else ''}.npz")
     np.savez(path, **out)

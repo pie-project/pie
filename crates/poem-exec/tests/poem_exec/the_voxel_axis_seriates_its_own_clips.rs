@@ -2,8 +2,8 @@ use poem_compiler::{Budget, Budgets, DeviceProfile, VoxelLadder, compile_axes};
 use poem_exec::fire::{Fault, FireDescriptor, Lane, compose_axes};
 use poem_ir::ops::Elemwise;
 use poem_ir::{
-    CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RowAxis, RuntimeInput, Seam, Trace, Ty,
-    ValueDecl, ValueId,
+    CacheRow, Def, Dim, Dtype, Guard, GuestInput, InputAxis, Node, Platform, RowAxis, RuntimeInput,
+    Seam, Trace, Ty, ValueDecl, ValueId,
 };
 use poem_ir::{NormAxis, NormWeight};
 
@@ -45,6 +45,7 @@ impl Build {
                 nodes: Vec::new(),
                 seams: Vec::new(),
                 drafter: None,
+                inputs: Vec::new(),
             },
         }
     }
@@ -76,10 +77,16 @@ impl Build {
 fn trunk_and_decoder() -> Trace {
     let mut b = Build::new();
     let tokens = b.value(Def::Input(RuntimeInput::Tokens), act());
-    let port = b.value(
-        Def::Input(RuntimeInput::Voxels {
-            port: 0,
-            channels: WIDTH as u32,
+    b.trace.inputs.push(GuestInput {
+        name: "latent".to_string(),
+        rows: None,
+    });
+    let latent = b.value(
+        Def::Input(RuntimeInput::Guest {
+            id: 0,
+            axis: InputAxis::Voxel,
+            width: WIDTH as u32,
+            dtype: Dtype::Bf16,
         }),
         voxel(Dim::Voxels),
     );
@@ -90,7 +97,7 @@ fn trunk_and_decoder() -> Trace {
         values: vec![y],
         layer: None,
     });
-    let h = b.op(port, voxel(Dim::Voxels), Guard::Fact(0));
+    let h = b.op(latent, voxel(Dim::Voxels), Guard::Fact(0));
     let pixels = b.op(h, voxel(Dim::VoxelsTimes(4)), Guard::Fact(0));
     b.trace.seams.push(Seam {
         seam: "pixels".to_string(),

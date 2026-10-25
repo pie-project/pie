@@ -172,7 +172,7 @@ impl Run<'_> {
             Attn::Prefill {
                 q,
                 plan,
-                mask: Some(mask),
+                mask,
                 cache,
                 window,
                 head_dim,
@@ -186,8 +186,8 @@ impl Run<'_> {
                 selected: None,
                 rel: None,
                 lse: None,
-            } => {
-                let mask = self.cut_rows(self.tensor(*mask));
+            } if mask.is_some() || !*causal => {
+                let mask = self.cut_rows(self.mask_bits(*mask));
                 attn::masked(
                     self.ctx(),
                     self.ragged(*q),
@@ -204,7 +204,7 @@ impl Run<'_> {
             Attn::Prefill {
                 q,
                 plan,
-                mask: Some(mask),
+                mask,
                 cache,
                 window,
                 head_dim,
@@ -218,8 +218,8 @@ impl Run<'_> {
                 floor: None,
                 selected: None,
                 rel: None,
-            } => {
-                let mask = self.cut_rows(self.tensor(*mask));
+            } if mask.is_some() || !*causal => {
+                let mask = self.cut_rows(self.mask_bits(*mask));
                 attn::masked_lse(
                     self.ctx(),
                     self.ragged(*q),
@@ -279,6 +279,61 @@ impl Run<'_> {
                 *sm_scale,
                 self.tensor(*o),
             ),
+            Attn::Ragged {
+                q,
+                k,
+                v,
+                q_indptr,
+                kv_indptr,
+                head_dim,
+                kv_heads,
+                sm_scale,
+                mask,
+                o,
+            } => {
+                // The packed rows span the fire: one launch, at its first run.
+                if self.run_index() > 0 {
+                    return Ok(());
+                }
+                let stated = self.group_mask(*q_indptr, *kv_indptr);
+                let mask = match (mask, stated) {
+                    (
+                        poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal,
+                        Some(keep),
+                    ) => attn::dense::RaggedMask::Custom { keep },
+                    (poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal, None) => {
+                        attn::dense::RaggedMask::Segments
+                    }
+                    (poem_ir::RaggedMask::RelativeBias { .. }, Some(_)) => {
+                        return Err(kernels_cerebras::Error::Backend {
+                            op: "attn.ragged",
+                            detail: "a lane states an attention mask over an attention the \
+                                     model already biases (a relative bias); the two do not \
+                                     compose"
+                                .to_string(),
+                        });
+                    }
+                    (poem_ir::RaggedMask::RelativeBias { table, max_len }, None) => {
+                        attn::dense::RaggedMask::RelativeBias {
+                            table: self.tensor(*table),
+                            max_len: *max_len,
+                        }
+                    }
+                };
+                attn::dense::ragged(
+                    self.ctx(),
+                    self.uncut(*q),
+                    self.uncut(*k),
+                    self.uncut(*v),
+                    self.uncut(*q_indptr),
+                    self.uncut(*kv_indptr),
+                    *head_dim,
+                    *kv_heads,
+                    *sm_scale,
+                    mask,
+                    self.uncut(*o),
+                )
+            }
             Attn::Decode {
                 q,
                 plan,

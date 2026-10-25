@@ -20,7 +20,9 @@ pub fn group_norm(
     eps: f32,
     silu: bool,
     y: Landing,
+    base: u32,
 ) -> Result<Val, Error> {
+    let grid = crate::conv::rebased(f, grid, base)?;
     const OP: &str = "conv.group_norm";
     if x.dtype != Dtype::Bf16 {
         return Err(Error::DtypeUnsupported {

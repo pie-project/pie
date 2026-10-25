@@ -30,7 +30,7 @@ Two doors lead out of a handle, and they are not the same door:
 interleaved RGB8 can build a handle before any VAE exists.
 
 `from-channel` is the OTHER constructor, and the one the VAE road uses. A
-`vae.decode` reading lands its pixels on the `pixels` seam; the pass's eta
+VAE decode pass lands its pixels on the `pixels` seam; the pass's eta
 epilogue reads that seam with `intrinsics::pixels()` and puts it on one of
 its own channels. `from-channel` takes that channel's
 committed cell HOST-SIDE — the same take `channel.take` would do, minus the
@@ -117,7 +117,7 @@ class Frames:
         name with both figures.
         
         This is the constructor that lets a test, or a guest holding pixels
-        it made itself, reach the encoders before a VAE decode reading
+        it made itself, reach the encoders before a VAE decode pass
         exists to produce a handle the other way.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
@@ -128,7 +128,7 @@ class Frames:
         """
         Build a handle from a channel's committed cell, WITHOUT the pixels
         entering linear memory. This is the VAE road: a
-        `vae.decode` pass's epilogue reads `intrinsics::pixels()` and puts
+        VAE decode pass's epilogue reads `intrinsics::pixels()` and puts
         the plane on `ch`; this takes that cell host-side, the way
         `channel.take` would, and turns it into frames.
         
@@ -157,13 +157,22 @@ class Frames:
         disagreed with the bytes would be one more thing to get wrong.
         
         This is `encode`'s pair, and it is what lets a guest hand a
-        PICTURE to a `vae.encode` reading: img2img, inpainting, a
+        PICTURE to a VAE encode pass: img2img, inpainting, a
         reference lane. `media.image` is the other door and the wrong one
         here — it patchifies for a vision tower and answers TOKENS, and a
         diffusion model has no vision front-end for it to ask.
         
         Errors, by name and with the byte count, when the bytes decode to
         nothing. A picture that did not decode is not a black picture.
+        
+        Raises: `componentize_py_types.Err(wit_world.imports.str)`
+        """
+        raise NotImplementedError
+    @classmethod
+    def concat(cls, parts: List[Self]) -> Self:
+        """
+        Join `parts`, in order, into one handle host-side; parts must share
+        width, height and fps, and an empty list is refused.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
@@ -176,8 +185,8 @@ class Frames:
         
         The cell is written as `count * height * width * 3` f32 in the
         model's own range, [-1, 1], one row per voxel in `(t, h, w)`
-        order with `w` fastest, which is what a `vae.encode` reading's
-        pixel port reads. RGB8 maps by `2 * (x / 255) - 1`, exactly
+        order with `w` fastest, which is what a VAE encode pass's
+        pixel input reads. RGB8 maps by `2 * (x / 255) - 1`, exactly
         undoing `from-channel`'s `(x + 1) / 2`.
         
         The put is `channel.put`'s — the SEED a channel takes before its

@@ -1,4 +1,4 @@
-"""The float-port loop closes (imagegen design D1/D3/D4) — a skeleton.
+"""The latent loop closes — a skeleton.
 
 `latent-probe` drives one `forward` pass in a token-less, KV-less reading:
 a latent channel seeded on the device by a keyed Normal draw, bound as
@@ -48,7 +48,7 @@ async def _probe(client, args, **inputs) -> dict:
         if any(mark in str(error) for mark in LATENTLESS):
             # conftest reports FileNotFoundError as SKIPPED.
             raise FileNotFoundError(
-                f"the loaded model has no latent reading, so the float-port loop has "
+                f"the loaded model has no latent reading, so the latent loop has "
                 f"nothing to drive (wants `{REQUIRES_MODEL}`): {error}"
             ) from error
         raise
@@ -63,7 +63,7 @@ async def test_latent_probe_closes_the_loop(client, args):
     r = await _probe(client, args, steps=steps, rows=rows, seed=7)
 
     print(f"  reading = {r['reading']}  rows = {r['rows']}  width = {r['width']}")
-    print(f"  ports   = {r['ports']}")
+    print(f"  inputs  = {r['inputs']}")
     print(f"  sigmas  = {[round(s, 4) for s in r['sigmas']]}")
     print(f"  trace   = {[round(m, 4) for m in r['trace']]}")
     print(f"  final   mean = {r['mean']:.4f}  std = {r['std']:.4f}  head = {r['head']}")
@@ -71,7 +71,7 @@ async def test_latent_probe_closes_the_loop(client, args):
     assert r["rows"] == rows and r["steps"] == steps, r
     assert r["non_finite"] == 0, f"the final latent carries non-finite values: {r}"
     assert len(r["sigmas"]) == steps + 1 and r["sigmas"][-1] == 0.0, r["sigmas"]
-    assert "latents" in r["ports"][0], r["ports"]
+    assert "latents" in r["inputs"][0], r["inputs"]
     # Fire 0 is the seed: a keyed Normal draw has mean-abs near sqrt(2/pi)
     # for any width worth probing.
     assert len(r["trace"]) == steps + 1, r["trace"]
@@ -102,4 +102,4 @@ def tests():
 
 
 if __name__ == "__main__":
-    run_tests(tests(), description="Float-port loop probe (wants a latent reading)")
+    run_tests(tests(), description="Latent loop probe (wants a latent reading)")

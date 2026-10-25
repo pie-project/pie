@@ -134,8 +134,8 @@ async def test_top_a_sampling_twins_agree(client, args):
 
 
 async def test_beam_search_twins_agree(client, args):
-    """On-device beam search — the widest surface of the twins: the `mask`
-    port, `from_shaped`, `capacity`, `top_k` / `gather` / `or` over a `[B, V]`
+    """On-device beam search — the widest surface of the twins: the pass
+    `mask`, `from_shaped`, `capacity`, `top_k` / `gather` / `or` over a `[B, V]`
     block, and `run_ahead` over one working set every beam shares. Every beam
     starts from BOS, so the whole report line is exact."""
     for inputs in ({"max_tokens": 6, "beams": 3}, {"max_tokens": 6, "beams": 1}):

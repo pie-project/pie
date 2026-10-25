@@ -28,25 +28,21 @@ type StageClosure<'a> = Box<dyn Fn() + 'a>;
 
 pub struct Builder<'a> {
     ports: Vec<(Port, PortInput)>,
+    inputs: Vec<PortInput>,
     stages: Vec<(Stage, StageClosure<'a>)>,
     vocab: u32,
     page_size: u32,
-    rows: Option<u32>,
 }
 
 impl<'a> Builder<'a> {
     pub fn new(vocab: u32, page_size: u32) -> Builder<'a> {
         Builder {
             ports: Vec::new(),
+            inputs: Vec::new(),
             stages: Vec::new(),
             vocab,
             page_size,
-            rows: None,
         }
-    }
-
-    pub fn rows_hint(&mut self, rows: u32) {
-        self.rows = Some(rows.max(1));
     }
 
     #[track_caller]
@@ -67,6 +63,14 @@ impl<'a> Builder<'a> {
         self.ports.push((port, source.into()));
     }
 
+    /// Lists `source` as a guest model input the forward reads.
+    #[track_caller]
+    pub fn bind_input(&mut self, source: impl Into<PortInput>) {
+        let source = source.into();
+        source.0.state().borrow_mut().desc_reads.push(Span::here());
+        self.inputs.push(source);
+    }
+
     pub fn stage(&mut self, stage: Stage, body: impl Fn() + 'a) {
         if let Some(slot) = self.stages.iter_mut().find(|(s, _)| *s == stage) {
             slot.1 = Box::new(body);
@@ -76,9 +80,6 @@ impl<'a> Builder<'a> {
     }
 
     fn rows(&self) -> u32 {
-        if let Some(rows) = self.rows {
-            return rows;
-        }
         if let Some(channel) = self.channel_port(Port::Readout) {
             return saturating_rows(channel.shape().numel()).max(1);
         }
@@ -105,7 +106,7 @@ impl<'a> Builder<'a> {
         if !authoring.is_empty() {
             return Err(TraceErrors(authoring));
         }
-        let (stage_results, ports) = result;
+        let (stage_results, ports, inputs) = result;
 
         let mut order: Vec<usize> = (0..channels.len()).collect();
         order.sort_by_key(|&i| channels[i].borrow().gid);
@@ -134,6 +135,10 @@ impl<'a> Builder<'a> {
                 p
             })
             .collect();
+
+        let mut inputs: Vec<u32> = inputs.into_iter().map(|ci| remap[ci as usize]).collect();
+        inputs.sort_unstable();
+        inputs.dedup();
 
         let mut name_order: Vec<usize> = (0..names.len()).collect();
         name_order.sort_by(|&a, &b| names[a].cmp(&names[b]));
@@ -210,6 +215,7 @@ impl<'a> Builder<'a> {
 
         let container = TraceContainer {
             externs: Vec::new(),
+            inputs,
             names,
             channels: channel_decls,
             ports,
@@ -231,7 +237,7 @@ impl<'a> Builder<'a> {
         })
     }
 
-    fn record(&self, rows: u32) -> (Vec<context::StageResult>, Vec<PortBinding>) {
+    fn record(&self, rows: u32) -> (Vec<context::StageResult>, Vec<PortBinding>, Vec<u32>) {
         let mut ports: Vec<PortBinding> = Vec::new();
         for (port, source) in &self.ports {
             let src = PortSource::Channel(context::intern_channel(source.0.state()));
@@ -240,6 +246,11 @@ impl<'a> Builder<'a> {
                 source: src,
             });
         }
+        let inputs: Vec<u32> = self
+            .inputs
+            .iter()
+            .map(|source| context::intern_channel(source.0.state()))
+            .collect();
 
         let mut results = Vec::new();
         for &stage in Stage::ALL {
@@ -249,7 +260,7 @@ impl<'a> Builder<'a> {
             let res = context::trace_stage(stage, rows, body);
             results.push(res);
         }
-        (results, ports)
+        (results, ports, inputs)
     }
 }
 

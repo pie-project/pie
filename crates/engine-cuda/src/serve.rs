@@ -65,7 +65,6 @@ pub struct Shell {
     budget: Budget,
     patch_seat: Option<crate::inputs::PatchSeat>,
     mrope_seat: bool,
-    self_cond_taps: u32,
     drops_patch_rows: bool,
     towered: bool,
     patch_fold: u32,
@@ -80,6 +79,7 @@ pub struct Shell {
     facts: kv::Facts,
     spaces: usize,
     masked: poem_ir::ClassSet,
+    wide: poem_ir::ClassSet,
     feeds: crate::exports::Feeds,
     corrected: poem_ir::ClassSet,
     decoding: poem_ir::ClassSet,
@@ -839,6 +839,13 @@ impl Shell {
         compiled.units.len() <= 2
     }
 
+    pub(crate) fn wide(&self, word: u64) -> bool {
+        let classes = &self.compiled.classes;
+        classes
+            .class_of(word & classes.mask)
+            .is_some_and(|class| self.wide.contains(class))
+    }
+
     fn lane_ceiling(&self) -> u32 {
         (self.held.len() as u32)
             .min(self.budget.max_lanes)
@@ -1014,8 +1021,8 @@ struct RsFire<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct PortFeedPlan {
-    pub(crate) seat: crate::inputs::PortSeat,
+pub(crate) struct InputFeedPlan {
+    pub(crate) seat: crate::inputs::Seat,
     pub(crate) first: u32,
     pub(crate) rows: u32,
     pub(crate) bytes: u64,
@@ -1039,7 +1046,7 @@ pub(crate) struct VoxelFeedPlan {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MergeLand {
     pub(crate) merge: poem_ir::ValueId,
-    pub(crate) seat: crate::inputs::PortSeat,
+    pub(crate) seat: crate::inputs::Seat,
     pub(crate) first: u32,
     pub(crate) rows: u32,
     pub(crate) fed: bool,
@@ -1062,17 +1069,13 @@ pub struct Prepared<'a> {
     patch_positions: Vec<i32>,
     patch_grids: Vec<i32>,
     mrope_positions: Vec<i32>,
-    self_cond_rows: Vec<i32>,
-    self_cond_weights: Vec<f32>,
-    self_cond_feeds: Vec<(
-        usize,
-        usize,
-        engine::ChannelId,
-        engine::ChannelId,
-        engine::InstanceId,
-    )>,
     packings: Vec<poem_exec::fire::Packed>,
-    port_feeds: Vec<PortFeedPlan>,
+    group_masks: Vec<(
+        poem_ir::Selection,
+        poem_ir::Selection,
+        poem_exec::fire::GroupMask,
+    )>,
+    input_feeds: Vec<InputFeedPlan>,
     voxel_feeds: Vec<VoxelFeedPlan>,
     merge_lands: Vec<MergeLand>,
     lane_carve: u32,

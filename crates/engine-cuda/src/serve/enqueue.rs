@@ -5,7 +5,7 @@ use poem_compiler::{Budget, CompiledModel};
 use poem_exec::fire::{Filter, walk};
 use poem_ir::{Dtype, Trace};
 
-use engine::fire::Boundary;
+use eta_ir::registry::Stage as Attach;
 
 use crate::arena::Arena;
 use crate::device::{Buffer, Context, graph::Event};
@@ -44,56 +44,6 @@ impl GuestBatch {
     /// The instances whose epilogues this batch launched.
     pub(super) fn instances(&self) -> impl Iterator<Item = engine::InstanceId> + '_ {
         self.launched.iter().map(|&(_, instance)| instance)
-    }
-}
-
-fn seating(lanes: &[super::Seated<'_>]) -> String {
-    let mut out = String::new();
-    for (at, lane) in lanes.iter().enumerate() {
-        if at > 0 {
-            out.push_str(", ");
-        }
-        match lane.group {
-            Some(group) => out.push_str(&format!("lane {at} group {group} stream {}", lane.stream)),
-            None => out.push_str(&format!("lane {at} ungrouped stream {}", lane.stream)),
-        }
-    }
-    out
-}
-
-fn peer_lane(lanes: &[super::Seated<'_>], at: usize, want: u32) -> Result<usize> {
-    if lanes[at].group == Some(want) {
-        return Err(Fault::program(
-            "serve::readback",
-            format!(
-                "lane {at} names attention group {want} as its peer and is itself a \
-                 lane of {want}; guidance combines two independent denoisings"
-            ),
-        ));
-    }
-    let stream = lanes[at].stream;
-    let mut found: Vec<usize> = (0..lanes.len())
-        .filter(|other| lanes[*other].group == Some(want) && lanes[*other].stream == stream)
-        .collect();
-    match found.len() {
-        1 => Ok(found.remove(0)),
-        0 => Err(Fault::program(
-            "serve::readback",
-            format!(
-                "lane {at} names attention group {want} as its peer, and this fire \
-                 seats no lane of {want} on stream {stream} for it to read; this \
-                 fire seats {}",
-                seating(lanes)
-            ),
-        )),
-        many => Err(Fault::program(
-            "serve::readback",
-            format!(
-                "lane {at} names attention group {want} as its peer, and this fire \
-                 seats {many} lanes of {want} on stream {stream}; which one is the \
-                 peer is not the shell's to guess"
-            ),
-        )),
     }
 }
 
@@ -225,8 +175,8 @@ impl Shell {
             seq,
         };
         super::btrace::mark("prepare_tail");
-        fire.prologue(p)?;
-        super::btrace::mark("prologue");
+        fire.gate(p)?;
+        super::btrace::mark("gate");
         let staged = fire.stage(p, slot)?;
         super::btrace::mark("stage");
         fire.route(p, &staged)?;
@@ -294,41 +244,73 @@ struct Staged {
     patches: Option<PatchHandles>,
     voxels: Option<crate::voxels::Handles>,
     mrope: Option<kernels_cuda::Tensor>,
-    self_cond: Option<(kernels_cuda::Tensor, kernels_cuda::Tensor)>,
-    ports: Vec<crate::run::PortBinding>,
+    group_masks: Vec<crate::inputs::GroupMaskHandles>,
+    inputs: Vec<crate::run::InputBinding>,
     slots: SlotTable,
     caches: CacheTable,
     paging: Paging,
 }
 
-impl FireCtx<'_> {
-    fn prologue(&mut self, p: &Prepared<'_>) -> Result<()> {
-        let mut verdicts: Vec<(usize, Fired)> = Vec::new();
-        let mut prologues = AirborneFires::default();
-        // A prologue mints against the cursors airborne fires predicted, as
-        // an epilogue does: only what has landed settles here.
-        if p.attachments.iter().any(|a| a.at == Boundary::Prologue) {
-            reap_guest_fires(
-                self.programs,
-                self.owed,
-                self.airborne,
-                self.spare_events,
-                "enqueue.prologue",
-                Reap::Landed,
-            )?;
+impl Shell {
+    /// Runs before the fire resolves its ports, which may read what a prologue put.
+    pub(super) fn prologue(&mut self, attachments: &[super::Attached]) -> Result<()> {
+        let runs =
+            |a: &&super::Attached| !a.adapter_only && self.programs.prologue_runs(a.instance);
+        let prologues: Vec<super::Attached> = attachments.iter().filter(runs).copied().collect();
+        if prologues.is_empty() {
+            return Ok(());
         }
-        for (at, attached) in p.attachments.iter().enumerate() {
-            if attached.at != Boundary::Prologue {
+        reap_guest_fires(
+            &mut self.programs,
+            &mut self.owed,
+            &self.airborne,
+            &mut self.spare_events,
+            "prepare.prologue",
+            Reap::Landed,
+        )?;
+        let mut verdicts: Vec<(usize, Fired)> = Vec::new();
+        let mut launched = AirborneFires::default();
+        for (at, attached) in attachments.iter().enumerate() {
+            if !prologues.contains(attached) {
                 continue;
             }
-            if let Some(fired) =
-                prologues.stage(self.device, self.programs, at, attached.instance)?
-            {
+            if let Some(fired) = launched.stage(
+                &self.device,
+                &mut self.programs,
+                at,
+                attached.instance,
+                Attach::Prologue,
+            )? {
                 verdicts.push((at, fired));
             }
         }
-        prologues.fly(self.device, self.programs)?;
+        launched.fly(&self.device, &mut self.programs)?;
+        if prologues
+            .iter()
+            .any(|attached| self.programs.resolves_prologue_put(attached.instance))
+        {
+            self.device.synchronize()?;
+        }
+        // The lanes' commits gate the body on the device; the host waits on none.
+        if let Some(batch) = launched.defer(
+            &self.device,
+            &mut self.programs,
+            &mut self.spare_events,
+            self.airborne.next_seq(),
+            &mut verdicts,
+        )? {
+            self.owed.push_back(batch);
+        }
+        for (at, fired) in verdicts {
+            committed_or(fired, attachments[at].instance, "prologue")?;
+        }
+        Ok(())
+    }
+}
 
+impl FireCtx<'_> {
+    
+    fn gate(&mut self, p: &Prepared<'_>) -> Result<()> {
         let lane_count = p.composition.lane_count();
         if p.rs.predicated || p.rs.truncates {
             let mut commits: Vec<u64> = vec![self.predicate.always(); lane_count as usize];
@@ -337,7 +319,10 @@ impl FireCtx<'_> {
                     commits[at] = self.predicate.never();
                 }
             }
-            for attached in p.attachments.iter().filter(|a| a.at == Boundary::Prologue) {
+            for attached in p.attachments {
+                if attached.adapter_only || !self.programs.prologue_runs(attached.instance) {
+                    continue;
+                }
                 let Some(&lane) = p.rs.order.get(attached.lane as usize) else {
                     continue;
                 };
@@ -360,22 +345,6 @@ impl FireCtx<'_> {
                 )
                 .map_err(Fault::from)?;
             }
-        }
-
-        // The lanes' commits gate the body on the device, so the host waits on
-        // none of them: their verdicts settle with the step, ahead of its
-        // epilogues'.
-        if let Some(batch) = prologues.defer(
-            self.device,
-            self.programs,
-            self.spare_events,
-            self.seq,
-            &mut verdicts,
-        )? {
-            self.owed.push_back(batch);
-        }
-        for (at, fired) in verdicts {
-            committed_or(fired, p.attachments[at].instance, "prologue")?;
         }
         Ok(())
     }
@@ -415,6 +384,9 @@ impl FireCtx<'_> {
                     .stage_mrope_positions(self.device.stream(), &p.mrope_positions)?,
             )
         };
+        let group_masks = self
+            .inputs
+            .stage_group_masks(self.device.stream(), &p.group_masks)?;
         let voxels = if p.voxel_tables.grid.is_empty() {
             None
         } else {
@@ -429,7 +401,7 @@ impl FireCtx<'_> {
             for feed in &p.voxel_feeds {
                 let dest = handles.voxels.ok_or_else(|| Fault::Unbound {
                     what: format!(
-                        "lane {}'s voxel port payload, which this fire's tables reserved \
+                        "lane {}'s voxel input payload, which this fire's tables reserved \
                          no rectangle for",
                         feed.lane
                     ),
@@ -455,55 +427,22 @@ impl FireCtx<'_> {
             }
         } else if !p.voxel_feeds.is_empty() {
             return Err(Fault::Unbound {
-                what: "a channel-fed voxel port on a fire that staged no voxel table; a \
+                what: "a channel-fed voxel input on a fire that staged no voxel table; a \
                        lane that feeds one submits its clips beside it (`Step::voxels`)"
                     .to_string(),
             });
         }
-        let self_cond = if p.self_cond_rows.is_empty() {
-            None
-        } else {
-            let staged = self.inputs.stage_self_cond(
-                self.device.stream(),
-                &p.self_cond_rows,
-                &p.self_cond_weights,
-            )?;
-            for &(first, cells, rows_channel, weights_channel, instance) in &p.self_cond_feeds {
-                let bytes = cells * 4;
-                let (rows_at, weights_at) = self.programs.self_cond_cells(
-                    instance,
-                    rows_channel,
-                    weights_channel,
-                    bytes as u64,
-                )?;
-                let offset = (first * 4) as u64;
-                crate::device::alloc::copy_d2d(
-                    self.device.stream(),
-                    staged.0.ptr + offset,
-                    rows_at,
-                    bytes,
-                )?;
-                crate::device::alloc::copy_d2d(
-                    self.device.stream(),
-                    staged.1.ptr + offset,
-                    weights_at,
-                    bytes,
-                )?;
-            }
-            Some(staged)
-        };
-
-        for feed in &p.port_feeds {
+        for feed in &p.input_feeds {
             let (source, _) = self.programs.feed_cell(feed.instance, feed.channel)?;
-            let rectangle = self
-                .inputs
-                .port(feed.seat.kind, feed.seat.port, u32::MAX)
-                .ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "the {:?} port {} rectangle, which this load carved none of",
-                        feed.seat.kind, feed.seat.port
-                    ),
-                })?;
+            let rectangle =
+                self.inputs
+                    .seat(feed.seat.id, u32::MAX)
+                    .ok_or_else(|| Fault::Unbound {
+                        what: format!(
+                            "guest input {}'s rectangle, which this load carved none of",
+                            feed.seat.id
+                        ),
+                    })?;
             let at = rectangle.ptr + u64::from(feed.first) * feed.seat.row_bytes();
             if feed.cast {
                 kernels_cuda::linear::cast::cast_fp32_to(
@@ -531,9 +470,9 @@ impl FireCtx<'_> {
             u64::from(rows)
         };
         let carve_lanes = u64::from(p.lane_carve).max(u64::from(lane_count));
-        let ports: Vec<crate::run::PortBinding> = self
+        let inputs: Vec<crate::run::InputBinding> = self
             .inputs
-            .ports()
+            .guest_seats()
             .into_iter()
             .filter_map(|seat| {
                 let rows = if seat.per_lane() {
@@ -542,14 +481,9 @@ impl FireCtx<'_> {
                     carve_rows
                 };
                 self.inputs
-                    .port(
-                        seat.kind,
-                        seat.port,
-                        u32::try_from(rows).unwrap_or(u32::MAX),
-                    )
-                    .map(|tensor| crate::run::PortBinding {
-                        kind: seat.kind,
-                        port: seat.port,
+                    .seat(seat.id, u32::try_from(rows).unwrap_or(u32::MAX))
+                    .map(|tensor| crate::run::InputBinding {
+                        id: seat.id,
                         tensor,
                     })
             })
@@ -589,7 +523,7 @@ impl FireCtx<'_> {
             let Some(column) = slots.0[land.merge.0 as usize] else {
                 return Err(Fault::Unbound {
                     what: format!(
-                        "value {}, a merge over a port, which the carve gave no rectangle",
+                        "value {}, a merge over a guest input, which the carve gave no rectangle",
                         land.merge.0
                     ),
                 });
@@ -598,15 +532,15 @@ impl FireCtx<'_> {
             let at = column.ptr + u64::from(land.first) * row_bytes;
             let bytes = usize::try_from(u64::from(land.rows) * row_bytes).unwrap_or(usize::MAX);
             if land.fed {
-                let rectangle = self
-                    .inputs
-                    .port(land.seat.kind, land.seat.port, u32::MAX)
-                    .ok_or_else(|| Fault::Unbound {
-                        what: format!(
-                            "the {:?} port {} rectangle, which this load carved none of",
-                            land.seat.kind, land.seat.port
-                        ),
-                    })?;
+                let rectangle =
+                    self.inputs
+                        .seat(land.seat.id, u32::MAX)
+                        .ok_or_else(|| Fault::Unbound {
+                            what: format!(
+                                "guest input {}'s rectangle, which this load carved none of",
+                                land.seat.id
+                            ),
+                        })?;
                 crate::device::alloc::copy_any(
                     self.device.stream(),
                     at,
@@ -648,8 +582,8 @@ impl FireCtx<'_> {
             patches,
             voxels,
             mrope,
-            self_cond,
-            ports,
+            group_masks,
+            inputs,
             slots,
             caches,
             paging,
@@ -729,18 +663,16 @@ impl FireCtx<'_> {
             token_grid: staged.voxels.as_ref().and_then(|seats| seats.token_grid),
             voxels: staged.voxels.as_ref().and_then(|seats| seats.voxels),
             clip_slots: staged.voxels.as_ref().map(|seats| seats.slots),
-            self_cond_rows: staged.self_cond.map(|(rows, _)| rows),
-            self_cond_weights: staged.self_cond.map(|(_, weights)| weights),
             lane_of_row: handles.lane_of_row,
             group_of_lane: handles.group_of_lane,
-            class_table: handles.class_table,
+            group_masks: staged.group_masks.clone(),
             packings: p
                 .packings
                 .iter()
                 .zip(&handles.packings)
                 .map(|(packed, tables)| (packed.select, *tables))
                 .collect(),
-            ports: staged.ports.clone(),
+            inputs: staged.inputs.clone(),
             geometry,
             schedules,
             plan_values: facts.plans.len(),
@@ -979,6 +911,13 @@ impl FireCtx<'_> {
             }
             _ => None,
         };
+        let mut class_of = vec![0usize; p.lanes.len()];
+        let mut voxel_first = vec![0u32; p.lanes.len()];
+        for row in p.composition.lanes() {
+            class_of[row.source as usize] = row.class as usize;
+            voxel_first[row.source as usize] = row.voxel_offset;
+        }
+        let lane_class_of = |lane: usize| class_of.get(lane).copied().unwrap_or(0);
         let mut pixels_at: Vec<Option<(kernels_cuda::Tensor, u32, u32)>> =
             vec![None; p.lanes.len()];
         if let (Some(seat), Some((_, grid))) =
@@ -986,7 +925,8 @@ impl FireCtx<'_> {
             && let Some(table) = crate::voxels::host_grid(self.trace, &p.voxel_tables.grid, grid)
         {
             for (lane, &(first, count)) in seat.lane_clips.iter().enumerate() {
-                if count == 0 {
+                // A denoise lane's voxels read out velocity, not pixels.
+                if count == 0 || !self.exports.writes_pixels(lane_class_of(lane)) {
                     continue;
                 }
                 let at = first as usize * 4;
@@ -1138,7 +1078,7 @@ impl FireCtx<'_> {
             }
         }
         let mut epilogues = AirborneFires::default();
-        for attached in p.attachments.iter().filter(|a| a.at == Boundary::Epilogue) {
+        for attached in p.attachments.iter().filter(|a| !a.adapter_only) {
             let lane = attached.lane as usize;
             let owned = lane_rows.get(lane).copied().unwrap_or(0);
             let stated = p.lanes.get(lane).and_then(|seated| seated.readout);
@@ -1160,59 +1100,62 @@ impl FireCtx<'_> {
             let consecutive = wanted
                 .windows(2)
                 .all(|pair| pair[1] == pair[0].wrapping_add(1));
-            let class = lane_class[lane];
-            let velocity = match self.exports.velocity_for(class) {
-                Some(export) => Some(plane_of(export.value, "velocity")?),
-                None => None,
-            };
-            let hidden = match self.exports.hidden_for(class) {
-                Some(export) => Some(plane_of(export.value, "hidden")?),
-                None => None,
-            };
-            if let Some(plane) = velocity {
-                self.programs.bind_intrinsic(
-                    attached.instance,
-                    eta_ir::op::IntrinsicId::Velocity,
-                    plane.ptr,
-                    storage_of(plane),
-                    plane.width,
-                    plane.width,
-                    first_row[lane],
-                )?;
-                if let Some(peer_group) = p.lanes[lane].peer {
-                    let peer = peer_lane(p.lanes, lane, peer_group)?;
+            
+            for k in 0..attached.lanes {
+                let at = lane + k as usize;
+                let class = lane_class[at];
+                let velocity = match self.exports.velocity_for(class) {
+                    Some(export) => Some((
+                        plane_of(export.value, "velocity")?,
+                        self.exports.on_voxels(self.trace, export.value),
+                    )),
+                    None => None,
+                };
+                let hidden = match self.exports.hidden_for(class) {
+                    Some(export) => Some(plane_of(export.value, "hidden")?),
+                    None => None,
+                };
+                if let Some((plane, voxel)) = velocity {
+                    // Voxel-axis velocity starts at the lane's first voxel, token-axis at its first row.
                     self.programs.bind_intrinsic(
                         attached.instance,
-                        eta_ir::op::IntrinsicId::PeerVelocity,
+                        eta_ir::op::IntrinsicId::Velocity,
+                        k,
                         plane.ptr,
                         storage_of(plane),
                         plane.width,
                         plane.width,
-                        first_row[peer],
+                        if voxel {
+                            voxel_first[at]
+                        } else {
+                            first_row[at]
+                        },
                     )?;
                 }
-            }
-            if let Some(plane) = hidden {
-                self.programs.bind_intrinsic(
-                    attached.instance,
-                    eta_ir::op::IntrinsicId::Hidden,
-                    plane.ptr,
-                    storage_of(plane),
-                    plane.width,
-                    plane.width,
-                    first_row[lane],
-                )?;
-            }
-            if let Some((plane, first, _)) = pixels_at[lane] {
-                self.programs.bind_intrinsic(
-                    attached.instance,
-                    eta_ir::op::IntrinsicId::Pixels,
-                    plane.ptr,
-                    storage_of(plane),
-                    plane.width,
-                    plane.width,
-                    first,
-                )?;
+                if let Some(plane) = hidden {
+                    self.programs.bind_intrinsic(
+                        attached.instance,
+                        eta_ir::op::IntrinsicId::Hidden,
+                        k,
+                        plane.ptr,
+                        storage_of(plane),
+                        plane.width,
+                        plane.width,
+                        first_row[at],
+                    )?;
+                }
+                if let Some((plane, first, _)) = pixels_at[at] {
+                    self.programs.bind_intrinsic(
+                        attached.instance,
+                        eta_ir::op::IntrinsicId::Pixels,
+                        k,
+                        plane.ptr,
+                        storage_of(plane),
+                        plane.width,
+                        plane.width,
+                        first,
+                    )?;
+                }
             }
             let logits = match lane_planes[lane] {
                 Some((engine::fire::ReadoutSeam::Logits, plane)) => plane,
@@ -1224,6 +1167,7 @@ impl FireCtx<'_> {
                 self.programs.bind_intrinsic(
                     attached.instance,
                     eta_ir::op::IntrinsicId::Logits,
+                    0,
                     logits.ptr,
                     INTRINSIC_STORAGE_RAW_BF16,
                     vocab,
@@ -1243,6 +1187,7 @@ impl FireCtx<'_> {
                 self.programs.bind_intrinsic(
                     attached.instance,
                     eta_ir::op::IntrinsicId::Logits,
+                    0,
                     self.readout_rows.ptr() + at,
                     crate::program::launch::INTRINSIC_STORAGE_ROW_POINTERS,
                     vocab,
@@ -1254,6 +1199,7 @@ impl FireCtx<'_> {
                 self.programs.bind_intrinsic(
                     attached.instance,
                     eta_ir::op::IntrinsicId::MtpLogits,
+                    0,
                     column.ptr,
                     INTRINSIC_STORAGE_RAW_BF16,
                     column.width,
@@ -1301,6 +1247,7 @@ impl FireCtx<'_> {
                 self.programs.bind_intrinsic(
                     attached.instance,
                     eta_ir::op::IntrinsicId::MtpDrafts,
+                    0,
                     plane.ptr + u64::from(wanted[0]) * u64::from(depth) * 4,
                     INTRINSIC_STORAGE_RAW_I32,
                     depth,
@@ -1327,6 +1274,7 @@ impl FireCtx<'_> {
                 self.programs.bind_intrinsic(
                     attached.instance,
                     eta_ir::op::IntrinsicId::AttnScore,
+                    0,
                     slab.seat_base(seat),
                     crate::program::launch::INTRINSIC_STORAGE_F32,
                     crate::scores::KV_MAX,
@@ -1339,6 +1287,7 @@ impl FireCtx<'_> {
                 self.programs,
                 attached.lane as usize,
                 attached.instance,
+                Attach::Epilogue,
             )? {
                 committed_or(fired, attached.instance, "epilogue")?;
             }
@@ -1360,7 +1309,7 @@ impl FireCtx<'_> {
             let attached = p
                 .attachments
                 .iter()
-                .find(|a| a.at == Boundary::Epilogue && a.lane as usize == lane)
+                .find(|a| !a.adapter_only && a.lane as usize == lane)
                 .ok_or_else(|| {
                     Fault::program(
                         "serve::enqueue",
@@ -1406,6 +1355,7 @@ impl AirborneFires {
         programs: &mut ProgramPlane,
         tag: usize,
         instance: engine::InstanceId,
+        at: Attach,
     ) -> Result<Option<Fired>> {
         if self.launched.is_empty() && !self.flown && programs.staged() != 0 {
             programs.abandon_wave();
@@ -1414,7 +1364,7 @@ impl AirborneFires {
         if rings.iter().any(|ring| self.rings.contains(ring)) {
             self.flush(device, programs)?;
         }
-        match programs.stage(instance)? {
+        match programs.stage(instance, at)? {
             crate::program::Launched::Airborne => {
                 self.rings.extend(rings);
                 self.launched.push((tag, instance));
@@ -1573,15 +1523,16 @@ fn committed_or(fired: Fired, instance: engine::InstanceId, at: &str) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{Boundary, Fired, committed_or};
+    use super::{Fired, committed_or};
     use crate::serve::Attached;
 
     #[test]
     fn a_pass_that_does_not_commit_on_an_admitted_fire_errors_by_name() {
         let attached = Attached {
             lane: 0,
+            lanes: 1,
             instance: engine::InstanceId(77),
-            at: Boundary::Epilogue,
+            adapter_only: false,
         };
         committed_or(Fired::Committed, attached.instance, "epilogue")
             .expect("a committed pass is the ordinary answer");

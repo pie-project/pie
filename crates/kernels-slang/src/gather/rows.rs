@@ -330,6 +330,40 @@ pub fn select(
     )
 }
 
+pub fn concat_cols(ctx: &Ctx<'_>, xs: &[Tensor], y: Tensor) -> Result<(), Error> {
+    const OP: &str = "gather.concat_cols";
+    let total: u32 = xs.iter().map(|x| x.width).sum();
+    if total != y.width || xs.iter().any(|x| x.dtype != y.dtype || x.rows < y.rows) {
+        return Err(refuse(
+            OP,
+            "the inputs share the output's element and rows, and their widths sum to its",
+        ));
+    }
+    if y.rows == 0 {
+        return Ok(());
+    }
+    let stride = words(OP, "output row", y.dtype, y.width)?;
+    let mut at = 0u32;
+    for x in xs {
+        let width = words(OP, "input row", x.dtype, x.width)?;
+        let offset = words(OP, "column offset", y.dtype, at)?;
+        if width > 0 {
+            ctx.fire(
+                Fire::at(ROWS, "gather_rows_place_words").apply(grid(OP, width, y.rows)?),
+                &[
+                    x.arg(),
+                    y.arg_mut(),
+                    stride.arg(),
+                    offset.arg(),
+                    width.arg(),
+                ],
+            )?;
+        }
+        at += x.width;
+    }
+    Ok(())
+}
+
 /// Each row of `x` cut into its first `width` columns and the rest.
 pub fn split_rows(
     ctx: &Ctx<'_>,

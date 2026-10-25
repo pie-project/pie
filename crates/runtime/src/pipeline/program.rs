@@ -10,8 +10,8 @@ use eta_compiler::plan::CompiledStage;
 use eta_ir::container::{self, ContainerDecodeError, PortSource, TraceContainer};
 use eta_ir::container_hash;
 use eta_ir::op::Op;
-use eta_ir::registry::{ModelProfile, Port};
-use eta_ir::validate::{BoundTrace, ValidateError, bind};
+use eta_ir::registry::{EngineCaps, Graph, Port, Readout};
+use eta_ir::validate::{BoundTrace, ValidateError, bind, check_intrinsics};
 use lru::LruCache;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,16 +112,20 @@ impl Registry {
         }
     }
 
+    /// A program bound for one pass is checked again against the next's `lanes`.
     pub fn register(
         &mut self,
         bytes: Vec<u8>,
-        profile: &ModelProfile,
+        lanes: Vec<Option<Readout>>,
+        graph: Graph,
+        caps: EngineCaps,
     ) -> Result<Arc<RegisteredProgram>, RegisterError> {
         let hash = container_hash(&bytes);
         if let Some(hit) = self.inner.get(&hash) {
             if hit.bytes != bytes {
                 return Err(RegisterError::HashCollision(hash));
             }
+            check_intrinsics(&hit.bound.container, &lanes, graph).map_err(RegisterError::Bind)?;
             return Ok(hit.clone());
         }
         let decoded = container::decode(&bytes).map_err(RegisterError::Decode)?;
@@ -129,7 +133,7 @@ impl Registry {
         let channel_accesses = Self::channel_accesses(&decoded);
         let reads_attn_score = Self::reads_attn_score(&decoded);
         let reads_mtp_logits = Self::reads_mtp_logits(&decoded);
-        let bound = bind(decoded, profile.clone()).map_err(RegisterError::Bind)?;
+        let bound = bind(decoded, lanes, graph, caps).map_err(RegisterError::Bind)?;
         let compiled_stages = eta_compiler::plan::compile_bound(&bound);
         let launch = std::sync::OnceLock::new();
         let entry = Arc::new(RegisteredProgram {
@@ -278,9 +282,21 @@ fn global() -> MutexGuard<'static, Registry> {
 
 pub fn register(
     bytes: Vec<u8>,
-    profile: &ModelProfile,
+    lanes: Vec<Option<Readout>>,
 ) -> Result<Arc<RegisteredProgram>, RegisterError> {
-    global().register(bytes, profile)
+    let m = crate::model::model();
+    let eta = m.eta_caps();
+    let graph = Graph {
+        num_layers: m.num_layers(),
+        mtp_logits: eta.has_mtp_logits,
+        mtp_depth: eta.mtp_depth,
+        attn_score: eta.has_attn_score,
+    };
+    let caps = EngineCaps {
+        lora: eta.has_lora,
+        attn_page_mask: eta.has_attn_page_mask,
+    };
+    global().register(bytes, lanes, graph, caps)
 }
 
 pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
@@ -327,57 +343,6 @@ pub fn with_host_codegen<'a>(
     std::borrow::Cow::Owned(next)
 }
 
-pub fn model_profile() -> ModelProfile {
-    let m = crate::model::model();
-    profile_from(
-        m.vocab_size(),
-        crate::store::registry::get(0, 0).kv_page_size,
-        m.num_layers(),
-        m.eta_caps(),
-        crate::model::velocity_facts(m.readings()),
-        crate::model::pixels_facts(m.readings()),
-    )
-}
-
-fn profile_from(
-    vocab: u32,
-    page_size: u32,
-    num_layers: u32,
-    eta: crate::model::EtaCaps,
-    (has_velocity, velocity_width): (bool, u32),
-    (has_pixels, pixels_width): (bool, u32),
-) -> ModelProfile {
-    ModelProfile {
-        vocab,
-        page_size,
-        num_layers,
-        activation: eta_ir::types::Dtype::F32,
-        has_lora: eta.has_lora,
-        has_mtp_logits: eta.has_mtp_logits,
-        mtp_depth: eta.mtp_depth,
-        draft_block: eta.draft_block,
-        draft_mask_token: eta.draft_mask_token,
-        draft_bidirectional: eta.draft_bidirectional,
-        draft_proposals_from: eta.draft_proposals_from,
-        has_value_head: eta.has_value_head,
-        has_attn_score: eta.has_attn_score,
-        has_attn_page_mask: eta.has_attn_page_mask,
-        has_velocity,
-        velocity_width,
-        has_pixels,
-        pixels_width,
-        kernels: if eta.has_kv_envelopes {
-            vec![eta_ir::registry::KernelInfo {
-                name: "envelope_dot".into(),
-                sink_scope: None,
-                replayable: true,
-            }]
-        } else {
-            Vec::new()
-        },
-    }
-}
-
 #[cfg(test)]
 mod pricing_tests {
     use super::price;
@@ -393,6 +358,7 @@ mod pricing_tests {
                 stage: Stage::Epilogue,
                 ops: vec![Op::IntrinsicVal {
                     intr: IntrinsicId::Velocity,
+                    lane: 0,
                     shape: Shape::matrix(256, 64),
                     dtype: Dtype::F32,
                 }],

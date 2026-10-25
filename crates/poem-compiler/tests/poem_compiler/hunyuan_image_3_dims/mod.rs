@@ -3,28 +3,12 @@
 pub const TRAIN_STEPS: u32 = 1000;
 pub const FLOW_SHIFT: f32 = 3.0;
 pub const ROPE_THETA: f32 = 10_000.0;
-pub const ROPE_AXES: u8 = 2;
-pub const T_FREQ_DIM: u32 = 256;
 pub const LATENT_CHANNELS: u32 = 32;
 pub const SPATIAL_COMPRESSION: u32 = 16;
-
-pub const ENCODE: u8 = 0;
-pub const DENOISE: u8 = 1;
-pub const IMAGE_IN: u8 = 2;
-pub const IMAGE_OUT: u8 = 3;
 
 #[must_use]
 pub fn rope_x_scale(head_dim: u32) -> f32 {
     ROPE_THETA.powf(-2.0 / head_dim as f32)
-}
-
-pub mod port {
-    pub const ROWS: u8 = 0;
-    pub const SPECIAL: u8 = 1;
-    pub const TIMESTEP: u8 = 0;
-    pub const POSITIONS: u8 = 0;
-    pub const LATENT_VOXELS: u8 = 0;
-    pub const ROW_VOXELS: u8 = 1;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -28,8 +28,6 @@ struct Input {
     ///                first half, a RAG document-isolation policy
     #[serde(default = "default_mask_mode")]
     mask_mode: String,
-    #[serde(default)]
-    max_layers: Option<u32>,
 }
 
 fn default_prompt() -> String {
@@ -135,17 +133,11 @@ async fn main(input: Input) -> Result<Output> {
     });
 
     let fwd_p = ForwardPass::new();
-    if let Some(k) = input.max_layers {
-        fwd_p.set_max_layers(k)?;
-    }
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.state(
-        &[&ws],
-        StateGeometry {
-            mask: mask_p.as_ref(),
-            ..StateGeometry::folding()
-        },
-    )?;
+    if let Some(mask_p) = &mask_p {
+        fwd_p.mask(mask_p)?;
+    }
+    fwd_p.state(&[&ws], StateGeometry::folding())?;
     fwd_p.epilogue(move || {
         let r = rng_p.take();
         let logits = intrinsics::logits();
@@ -185,17 +177,11 @@ async fn main(input: Input) -> Result<Output> {
         let lane1 = Channel::from(vec![0u32, 1u32]).named("embed_indptr");
 
         let fwd = ForwardPass::new();
-        if let Some(k) = input.max_layers {
-            fwd.set_max_layers(k)?;
-        }
         fwd.embed(&tok_in, &lane1)?;
-        fwd.state(
-            &[&ws],
-            StateGeometry {
-                mask: if masked { Some(&mask) } else { None },
-                ..StateGeometry::folding()
-            },
-        )?;
+        if masked {
+            fwd.mask(&mask)?;
+        }
+        fwd.state(&[&ws], StateGeometry::folding())?;
         fwd.epilogue(move || {
             // TAKES + compute first, PUTS last (value-id discipline).
             let base = fill.take(); // [1] u32
@@ -225,7 +211,7 @@ async fn main(input: Input) -> Result<Output> {
                 // (a seeded channel read — the causal half evolves, the
                 // document block is a constant of the request).
                 let new_mask = if doc_start > 0 {
-                    reshape(and(&reshape(new_mask, [span]), &doc_row.read()), [1, span])
+                    reshape(and(reshape(new_mask, [span]), doc_row.read()), [1, span])
                 } else {
                     new_mask
                 };

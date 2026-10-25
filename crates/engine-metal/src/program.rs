@@ -12,7 +12,7 @@ use engine::ports::Envelope;
 use engine::program::{InstanceId, ProgramId, ProgramRegistration};
 use eta_exec::adopt_launch_package;
 use eta_exec::{ExecPlan, Extents, Versions};
-use eta_ir::registry::GeometryClass;
+use eta_ir::registry::{GeometryClass, Stage as Attach};
 
 use crate::device::Context;
 use crate::device::ctx::Frame;
@@ -303,10 +303,12 @@ impl Plane {
         self.instances.get_mut(&id).map(|bound| &mut bound.session)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn bind_intrinsic(
         &mut self,
         id: InstanceId,
         intrinsic: eta_ir::op::IntrinsicId,
+        lane: u32,
         base: &crate::device::Buffer,
         offset: u64,
         width: u32,
@@ -316,7 +318,7 @@ impl Plane {
             .get_mut(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
             .session
-            .bind_intrinsic(intrinsic, base, offset, width, dtype)
+            .bind_intrinsic(intrinsic, lane, base, offset, width, dtype)
     }
 
     pub fn ready(&self, id: InstanceId) -> Result<Option<session::Blocked>> {
@@ -336,7 +338,15 @@ impl Plane {
         Ok(bound.session.readiness(&program.plan))
     }
 
-    pub fn fire(&mut self, context: &Context, id: InstanceId) -> Result<Fired> {
+    #[must_use]
+    pub fn prologue_runs(&self, id: InstanceId) -> bool {
+        self.instances
+            .get(&id)
+            .and_then(|bound| self.programs.get(&bound.program_id))
+            .is_some_and(|program| program.plan.prologue_runs())
+    }
+
+    pub fn fire(&mut self, context: &Context, id: InstanceId, at: Attach) -> Result<Fired> {
         let bound = self
             .instances
             .get_mut(&id)
@@ -350,9 +360,13 @@ impl Plane {
                 ),
             )
         })?;
-        bound
-            .session
-            .fire(context, &self.pipelines, &program.compiled, &program.plan)
+        bound.session.fire(
+            context,
+            &self.pipelines,
+            &program.compiled,
+            &program.plan,
+            at,
+        )
     }
 
     pub fn stage_into(&mut self, frame: &Frame, id: InstanceId) -> Result<Launched> {
@@ -422,7 +436,8 @@ impl Plane {
                 )
             })?;
             for (stage_index, stage) in program.compiled.stages.iter().enumerate() {
-                if stage.regions.is_empty() {
+                if stage.regions.is_empty() || !program.plan.runs_at(stage_index, Attach::Epilogue)
+                {
                     continue;
                 }
                 let mut groups: BTreeMap<Option<launch::BatchKey>, Vec<&mut launch::Prepared>> =
@@ -507,7 +522,12 @@ impl Plane {
             .is_some_and(|bound| bound.session.is_airborne())
     }
 
-    pub fn needs_pixels(&self, id: InstanceId) -> Result<bool> {
+    pub fn reads_lane(
+        &self,
+        id: InstanceId,
+        intrinsic: eta_ir::op::IntrinsicId,
+        lane: u32,
+    ) -> Result<bool> {
         let bound = self
             .instances
             .get(&id)
@@ -521,7 +541,12 @@ impl Plane {
                 ),
             )
         })?;
-        Ok(program.plan.needs_pixels)
+        Ok(program
+            .plan
+            .package
+            .values
+            .iter()
+            .any(|value| value.intrinsic == Some(intrinsic) && value.lane == lane))
     }
 
     pub fn needs_logits(&self, id: InstanceId) -> Result<bool> {

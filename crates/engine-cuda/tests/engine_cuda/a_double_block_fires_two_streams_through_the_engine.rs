@@ -6,7 +6,7 @@ use common_dit::{
     HostRequest, Lcg, Rig, WIDTH, Weights, assert_close, attach, bf, frame, lane, reference,
 };
 use engine::Engine;
-use engine::fire::{LaneStream, ReadoutSeam};
+use engine::fire::ReadoutSeam;
 
 fn request(rng: &mut Lcg, text_rows: usize, image_rows: usize) -> HostRequest {
     let w = WIDTH as usize;
@@ -32,10 +32,10 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
     let weights = Weights::random(&common_dit::trace(), 7);
     let mut rig = Rig::load(&weights, 64, vec![16, 32, 64]);
     assert!(
-        rig.profile().has_velocity,
+        rig.reads_out(poem_ir::ReadoutKind::Velocity).is_some(),
         "the plan plants a velocity seam"
     );
-    assert_eq!(rig.profile().velocity_width, WIDTH);
+    assert_eq!(rig.reads_out(poem_ir::ReadoutKind::Velocity), Some(WIDTH));
 
     let mut rng = Lcg::seeded(3);
     let requests = [request(&mut rng, 3, 5), request(&mut rng, 4, 6)];
@@ -71,14 +71,14 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
         );
         let slot = (2 * at) as u32;
         if at == 0 {
-            lanes.push(lane(&rig, slot, &image, LaneStream::Image, at as u32));
-            lanes.push(lane(&rig, slot + 1, &text, LaneStream::Text, at as u32));
+            lanes.push(lane(&rig, slot, &image, "image", at as u32));
+            lanes.push(lane(&rig, slot + 1, &text, "text", at as u32));
             attachments.push(attach(lanes.len() as u32 - 2, &image));
             attachments.push(attach(lanes.len() as u32 - 1, &text));
             handles.push((image, text));
         } else {
-            lanes.push(lane(&rig, slot, &text, LaneStream::Text, at as u32));
-            lanes.push(lane(&rig, slot + 1, &image, LaneStream::Image, at as u32));
+            lanes.push(lane(&rig, slot, &text, "text", at as u32));
+            lanes.push(lane(&rig, slot + 1, &image, "image", at as u32));
             attachments.push(attach(lanes.len() as u32 - 2, &text));
             attachments.push(attach(lanes.len() as u32 - 1, &image));
             handles.push((text, image));

@@ -111,13 +111,13 @@ async fn main(input: Input) -> Result<String> {
     let pos = Channel::from(vec![0u32; b as usize]).named("pos");
     let fill = Channel::from([1u32]).named("fill");
     let kv_len = Channel::from(vec![1u32; b as usize]).named("kv_len");
+    fwd.mask(&mask)?;
     fwd.state(
         &pool,
         StateGeometry {
             positions: Some(&pos),
             slots: Some(&slots),
             kv_len: Some(&kv_len),
-            mask: Some(&mask),
             fold: Fold::None,
         },
     )
@@ -136,7 +136,7 @@ async fn main(input: Input) -> Result<String> {
         out_par.put(&parent);
         out_scr.put(&s);
         // Cross-check: at `beams == 1` the raw-logit argmax must equal the beam pick every step.
-        out_greedy.put(&reshape(reduce_argmax(&logits), [b]));
+        out_greedy.put(reshape(reduce_argmax(&logits), [b]));
 
         let base = fill.take(); // [1]
         let base_b = broadcast(reshape(&base, [1]), [b]); // [1] -> [B]

@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::guard::Guard;
 use crate::ops::Operation;
-use crate::value::{Dtype, ValueDecl, ValueId};
+use crate::value::{Dtype, InputAxis, ValueDecl, ValueId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Platform {
@@ -200,13 +200,95 @@ pub struct Trace {
     /// The facts the trace's guards branch on, and the bits each takes.
     #[serde(default)]
     pub facts: crate::Facts,
+    /// Indexed by [`crate::RuntimeInput::Guest`] id.
+    #[serde(default)]
+    pub inputs: Vec<GuestInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestInput {
+    pub name: String,
+    #[serde(default)]
+    pub rows: Option<RowCount>,
+}
+
+/// The rows a lane binding an input carries; the guest pads its rows on device to them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RowCount {
+    Exact(u32),
+    /// The fewest rows, a multiple of this, that hold the guest's own.
+    Multiple(u32),
+}
+
+/// `readers` are the lane words, under `mask`, whose class reads the input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputDecl {
+    pub name: String,
+    pub axis: InputAxis,
+    pub width: u32,
+    pub dtype: Dtype,
+    pub rows: Option<RowCount>,
+    pub mask: u64,
+    pub readers: Vec<u64>,
+}
+
+impl InputDecl {
+    #[must_use]
+    pub fn read_by(&self, word: u64) -> bool {
+        self.readers.contains(&(word & self.mask))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ReadoutKind {
+    Logits,
+    Velocity,
+    Hidden,
+    Pixels,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Readout {
+    pub kind: ReadoutKind,
+    pub width: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneClass {
+    pub words: Vec<u64>,
+    pub reads_kv: bool,
+    /// A lane of it carries a recurrent state.
+    #[serde(default)]
+    pub reads_state: bool,
+    pub embeds: bool,
+    pub wide: bool,
+    pub readout: Option<Readout>,
+    /// A voxel lane of it attends as one token row per patch of its voxels.
+    #[serde(default)]
+    pub patch: Option<[u32; 3]>,
+}
+
+/// `mask` covers the word bits that tell the classes apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneClasses {
+    pub mask: u64,
+    pub classes: Vec<LaneClass>,
+}
+
+impl LaneClasses {
+    #[must_use]
+    pub fn of(&self, word: u64) -> Option<&LaneClass> {
+        let word = word & self.mask;
+        self.classes
+            .iter()
+            .find(|class| class.words.contains(&word))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockDrafter {
     pub rows: u32,
     pub mask_token: u32,
-    pub bidirectional: bool,
     #[serde(default = "one")]
     pub proposals_from: u32,
 }

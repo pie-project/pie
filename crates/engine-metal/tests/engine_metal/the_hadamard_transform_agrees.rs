@@ -328,6 +328,7 @@ fn hadamard_check_faults(d: u64, block: u32) -> bool {
     };
     let trace = Trace {
         facts: Default::default(),
+        inputs: Vec::new(),
         name: String::from("hadamard_shape_probe"),
         platform: Platform::Metal,
         params: Vec::new(),
@@ -378,6 +379,7 @@ fn hadamard_sign_dtype_faults(act: Dtype, sign: Dtype) -> bool {
     let sign_ty = Ty::Tensor { shape, dtype: sign };
     let trace = Trace {
         facts: Default::default(),
+        inputs: Vec::new(),
         name: String::from("hadamard_sign_dtype_probe"),
         platform: Platform::Metal,
         params: Vec::new(),

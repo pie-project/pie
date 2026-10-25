@@ -2,7 +2,7 @@
 //! round.
 //!
 //! ```text
-//! draft    [anchor, MASK x block-1]      one fire, `set-drafting-block`
+//! draft    [anchor, MASK x block-1]      one fire, `block_draft = on`
 //!          -> d[0..block-1]              d[j] proposes position held+j+1
 //! verify   [anchor, d[0] .. d[w-2]]      one fire, the trunk, plainly causal
 //!          -> t[i] = argmax(row i)       the target's own token for held+i+1
@@ -49,11 +49,6 @@ struct Input {
     verify_rows: u32,
     #[serde(default)]
     block: Option<u32>,
-    /// Bind no mask to the draft fire. The runtime then stamps the whole
-    /// extent on the block lane and reads it both ways, which is the mask
-    /// this loop would build, without building it on the guest every round.
-    #[serde(default)]
-    no_mask: bool,
     #[serde(default)]
     margin_width: bool,
     #[serde(default)]
@@ -526,7 +521,6 @@ async fn main(input: Input) -> Result<Output> {
         .unwrap_or(BLOCK_ROWS)
         .max(2);
     let mask_token = advertised.map_or(MASK_TOKEN, |d| d.mask_token as i32);
-    let bind_mask = !input.no_mask && advertised.is_none_or(|d| d.bidirectional);
     // The first block row whose pick is a proposal: 1 when the anchor row
     // proposes nothing (DFlash), 0 when it proposes the next token (DSpark).
     let from = advertised.map_or(1, |d| d.proposals_from) as usize;
@@ -575,7 +569,7 @@ async fn main(input: Input) -> Result<Output> {
         fwd.readout(&readout)?;
         fwd.state(&[&ws], StateGeometry::folding())?;
         fwd.epilogue(move || {
-            next.put(&reshape(reduce_argmax(intrinsics::logits()), [1]));
+            next.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
         });
         fwd.submit(&pipe).context("prefill submit")?;
         anchor = next
@@ -631,7 +625,7 @@ async fn main(input: Input) -> Result<Output> {
             fwd.embed(&toks, &indptr)?;
             fwd.state(&[&ws], StateGeometry::folding())?;
             fwd.epilogue(move || {
-                next.put(&reshape(reduce_argmax(intrinsics::logits()), [1]));
+                next.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
             });
             let fired_at = monotonic_now_ns();
             fwd.submit(&pipe).context("baseline submit")?;
@@ -705,9 +699,6 @@ async fn main(input: Input) -> Result<Output> {
             let indptr = Channel::from([0u32, block]).named("embed_indptr_d");
             let slots = Channel::from_iter(held..held + block).named("slots_d");
             let kv_len = Channel::from([held + block]).named("kv_len_d");
-            // The drafter attends bidirectionally over the block.
-            let visible = vec![true; (block * (held + block)) as usize];
-            let mask = Channel::from_shaped([block, held + block], visible).named("mask_d");
             // A DFlash2 head's selector picks one row per block row, so the
             // readout covers the block; the proposals are cut to the verify
             // width afterwards.
@@ -726,7 +717,7 @@ async fn main(input: Input) -> Result<Output> {
             let want_sure = input.verify_budget;
 
             let fwd = ForwardPass::new();
-            fwd.set_drafting_block(true)
+            fwd.switch(0, "block_draft", "on")
                 .map_err(|why| format!("stating the draft block: {why}"))?;
             fwd.embed(&toks, &indptr)?;
             fwd.readout(&readout)?;
@@ -736,18 +727,15 @@ async fn main(input: Input) -> Result<Output> {
                 StateGeometry {
                     slots: Some(&slots),
                     kv_len: Some(&kv_len),
-                    mask: if bind_mask { Some(&mask) } else { None },
                     ..StateGeometry::default()
                 },
             )?;
             {
-                let out = out.clone();
-                let conf = conf.clone();
                 fwd.epilogue(move || {
-                    out.put(&reshape(intrinsics::mtp_drafts(shown), [shown]));
+                    out.put(reshape(intrinsics::mtp_drafts(shown), [shown]));
                     if want_margin {
                         let (value, _) = top_k(intrinsics::logits(), 2);
-                        conf.put(&reshape(value, [shown * 2]));
+                        conf.put(reshape(value, [shown * 2]));
                     }
                     if want_sure {
                         // Each row's largest probability at temperature 1,
@@ -823,9 +811,8 @@ async fn main(input: Input) -> Result<Output> {
             },
         )?;
         {
-            let truth = truth.clone();
             fwd.epilogue(move || {
-                truth.put(&reshape(reduce_argmax(intrinsics::logits()), [verify]));
+                truth.put(reshape(reduce_argmax(intrinsics::logits()), [verify]));
             });
         }
         let verified_at = monotonic_now_ns();

@@ -69,7 +69,13 @@ impl ForwardHybrid for Decoder {
 
     fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
-        let x = inputs.voxels(0, C_IN as u32, Dtype::Bf16);
+        let x = inputs.input(
+            "voxels",
+            Dtype::Bf16,
+            poem_ir::InputAxis::Voxel,
+            C_IN as u32,
+            None,
+        );
         let (h, g1) = conv::conv3d(
             &x,
             &g,
@@ -371,7 +377,7 @@ fn scratch() -> PathBuf {
 }
 
 #[test]
-fn a_conv_decoder_fires_over_a_voxel_port() {
+fn a_conv_decoder_fires_over_a_voxel_input() {
     let device = DeviceBoot::default();
     if engine_wgpu::Context::bind(&device, 0.25).is_err() {
         eprintln!("not asked: no device");

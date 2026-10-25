@@ -742,7 +742,8 @@ __global__ __launch_bounds__(BLOCK) void group_norm_stats(
     float4* __restrict__ partials,
     int c,
     int groups,
-    int splits)
+    int splits,
+    int base)
 {
     __shared__ float s_cnt[BLOCK];
     __shared__ float s_mean[BLOCK];
@@ -761,7 +762,8 @@ __global__ __launch_bounds__(BLOCK) void group_norm_stats(
     float mean = 0.f;
     float m2 = 0.f;
     if (tid < c) {
-        const bf16* at = x + static_cast<long long>(g.off + begin) * c + tid;
+        // `base`: the row `grid` addresses `x`'s row 0 at.
+        const bf16* at = x + static_cast<long long>(g.off - base + begin) * c + tid;
         for (int v = begin; v < end; ++v, at += c) {
             const float val = bf16_to_f32(ldg(at));
             cnt += 1.f;
@@ -829,6 +831,7 @@ __global__ __launch_bounds__(256) void group_norm_apply(
     int c,
     int groups,
     int lanes,
+    int base,
     long long total)
 {
     const long long e = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -836,7 +839,7 @@ __global__ __launch_bounds__(256) void group_norm_apply(
     const int row = static_cast<int>(e / c);
     const int col = static_cast<int>(e - static_cast<long long>(row) * c);
     Lane box;
-    const int l = lane_of(grid, lanes, row, box);
+    const int l = lane_of(grid, lanes, row + base, box);
     float v = 0.f;
     if (l >= 0) {
         const int group = col / (c / groups);

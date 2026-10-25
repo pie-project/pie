@@ -28,6 +28,8 @@ struct Params {
     float sm_scale;
     uint rows;
     uint row_span;
+    // The rectangles' row 0 in `grid`'s fire-wide rows (a segmented fire's window starts later).
+    int base;
 };
 PIE_PARAMS(5, Params, params);
 
@@ -53,10 +55,11 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 
     if (tid == 0) {
         Clip g;
-        int l = clip_of(grid, int(params.clips), row, g);
+        int l = clip_of(grid, int(params.clips), row + params.base, g);
         int begin = 0;
         int end = 0;
         if (l >= 0) {
+            g.off -= params.base;
             segment_of(g, row - g.off, params.seg_frames, begin, end);
         }
         voxel_begin = begin;

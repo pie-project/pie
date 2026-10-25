@@ -44,13 +44,28 @@ for a one-pass prefill and a device loop-carried decode.
 crates and `inferlet::eta`): `Tensor` with `.add/.sub/.mul/.div/.rem/.neg/
 .divCeil`, the op set (`reduceArgmax`, `gumbelMax`, `nucleusSample`,
 `softmax`, `topK`, …), `Channel`, `WorkingSet`, `StateGeometry`,
-`ForwardPass`, `Pipeline` (`submit`, `runAhead`), `readoutSpans`, and `eta.diffusion`
-(the diffusion pass's `Mode` plus `entropyBoundAccept` / `stableAndConfident` /
-`linearTemperature`). The container bytes
+`ForwardPass`, `Pipeline` (`submit`, `runAhead`), `readoutSpans`, and
+`eta.diffusion` (a block-diffusion text's samplers `entropyBoundAccept` /
+`stableAndConfident` / `linearTemperature`). The container bytes
 it emits are **byte-identical** to the Rust `inferlet` crate's for the same program
 (`src/__tests__/eta_goldens.test.ts` pins them). `grammar`/`mask`, `chat`,
 `reasoning`, `tools`, `media`, `session`, `model`/`tokenizer` wrap the other
 host interfaces.
+
+A model receives two things per fire: **inputs** (device channels) and
+**switches** (a value from a finite set that picks the model's path). One
+`ForwardPass` holds every lane of one computation (a CFG denoise step's text
+and image lanes of both branches, say); `switch(lane, name, value)`,
+`input(lane, name, ch)`, `media(lane, spans)` and `group(lane, id)` address a
+lane by index, `mask(rows)` is pass-wide, and epilogue intrinsics take the lane
+(`velocity(lane, …)`, `hidden(lane, …)`, `pixels(lane, …)`). `model.switches()`
+lists a model's switches and `model.lane(switches)` says what a lane with those
+values binds: its inputs, whether it binds a working set (`state`), whether it
+embeds tokens, and its readout. Generative latents are the VAE's own
+`[t, h, w, C]`; patching and positions live in the model. A causal VAE
+decodes frame by frame into a working set, one latent frame per slot, and the
+runtime's `fresh` switch (cursor 0) picks its first-frame branch. A `prologue`
+runs before the forward, an `epilogue` after it.
 
 ## Async, and why host reads block
 

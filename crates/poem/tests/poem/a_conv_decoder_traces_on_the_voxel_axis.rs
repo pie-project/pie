@@ -44,7 +44,7 @@ impl ForwardHybrid for Decoder {
     }
     fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
-        let x = inputs.voxels(0, C_IN, Dtype::Bf16);
+        let x = inputs.input("voxels", Dtype::Bf16, poem_ir::InputAxis::Voxel, C_IN, None);
         let (h, g1) = conv::conv3d(
             &x,
             &g,
@@ -159,7 +159,7 @@ impl ForwardHybrid for Patchifier {
     }
     fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
-        let x = inputs.voxels(0, C_IN, Dtype::Bf16);
+        let x = inputs.input("voxels", Dtype::Bf16, poem_ir::InputAxis::Voxel, C_IN, None);
         let tg = inputs.token_grid([1, 2, 2]);
         let tokens = conv::patchify(&x, &g, [1, 2, 2], &tg);
         assert_eq!(
@@ -195,7 +195,7 @@ impl ForwardHybrid for NaturalWeight {
     }
     fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
-        let x = inputs.voxels(0, C_IN, Dtype::Bf16);
+        let x = inputs.input("voxels", Dtype::Bf16, poem_ir::InputAxis::Voxel, C_IN, None);
         let w = Weight::sym(
             "conv",
             [u64::from(C_MID), u64::from(C_IN) * 27],

@@ -109,6 +109,7 @@ impl Run<'_> {
                     },
                     self.tensor(*y_grid),
                     self.tensor(*y),
+                    [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
                 )
             }
             Conv::GroupNorm {
@@ -143,6 +144,7 @@ impl Run<'_> {
                     partials,
                     stats,
                     self.tensor(*y),
+                    self.grid_base(*grid, *x),
                 )
             }
             Conv::Upsample {
@@ -160,6 +162,7 @@ impl Run<'_> {
                 *keep_first_frame,
                 self.tensor(*y_grid),
                 self.tensor(*y),
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
             ),
             Conv::PixelShuffle {
                 x,
@@ -176,6 +179,7 @@ impl Run<'_> {
                 *trim_t,
                 self.tensor(*y_grid),
                 self.tensor(*y),
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
             ),
             Conv::PixelUnshuffle {
                 x,
@@ -190,6 +194,7 @@ impl Run<'_> {
                 *r,
                 self.tensor(*y_grid),
                 self.tensor(*y),
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
             ),
             Conv::AvgDown {
                 x,
@@ -206,6 +211,7 @@ impl Run<'_> {
                 *group,
                 self.tensor(*y_grid),
                 self.tensor(*y),
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
             ),
             Conv::CacheStore {
                 x,
@@ -214,6 +220,7 @@ impl Run<'_> {
                 cache,
                 x_out: _,
             } => {
+                let base = self.grid_base(*grid, *x);
                 let x = self.tensor(*x);
                 let grid = self.tensor(*grid);
                 let pool = self.recurrent(*cache);
@@ -223,11 +230,61 @@ impl Run<'_> {
                              lane of it staged"
                         .to_string(),
                 })?;
-                conv::resample::cache_store(self.ctx(), x, x, slots, grid, *frames, pool.state)
+                conv::resample::cache_store(
+                    self.ctx(),
+                    x,
+                    x,
+                    slots,
+                    grid,
+                    *frames,
+                    pool.state,
+                    base,
+                )
             }
-            Conv::Patchify { .. } | Conv::Unpatchify { .. } => {
-                Err(kernels_metal::Error::Unsupported { op: op.name() })
-            }
+            Conv::Patchify {
+                x,
+                grid,
+                p,
+                tgrid,
+                y,
+            } => conv::resample::pixel_unshuffle(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*grid),
+                *p,
+                self.tensor(*tgrid),
+                self.tensor(*y),
+                [self.grid_base(*grid, *x), self.grid_base(*tgrid, *y)],
+            ),
+            Conv::Unpatchify {
+                x,
+                tgrid,
+                p,
+                grid,
+                y,
+            } => conv::resample::pixel_shuffle(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*tgrid),
+                *p,
+                0,
+                self.tensor(*grid),
+                self.tensor(*y),
+                [self.grid_base(*tgrid, *x), self.grid_base(*grid, *y)],
+            ),
+            Conv::Cells {
+                tgrid,
+                positions,
+                axis,
+                y,
+            } => conv::rule::cells(
+                self.ctx(),
+                self.tensor(*tgrid),
+                self.tensor(*positions),
+                *axis,
+                self.tensor(*y),
+                self.grid_base(*tgrid, *y),
+            ),
         }
     }
 }

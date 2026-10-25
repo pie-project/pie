@@ -1,11 +1,11 @@
+use crate::msl_corpus::Served;
 use eta_compiler::codegen::error::{EmitError, EmitterKind};
 use eta_compiler::codegen::metal::{METAL_M2_MAX_FUSED_CHANNELS, emit_fused_region};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{ModelProfile, Stage};
+use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype, Shape};
-use eta_ir::validate::bind;
 
 const VOCAB: u32 = 8;
 
@@ -42,6 +42,7 @@ fn subject() -> TraceContainer {
     let mut ops = vec![
         Op::IntrinsicVal {
             intr: IntrinsicId::Logits,
+            lane: 0,
             shape: Shape::matrix(1, VOCAB),
             dtype: Dtype::F32,
         },
@@ -53,6 +54,7 @@ fn subject() -> TraceContainer {
         Op::ChanPut { chan: 0, value: 2 },
         Op::IntrinsicVal {
             intr: IntrinsicId::AttnScore,
+            lane: 0,
             shape: Shape::matrix(1, eta_ir::registry::ATTN_SCORE_KV_MAX),
             dtype: Dtype::F32,
         },
@@ -74,19 +76,17 @@ fn subject() -> TraceContainer {
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
-fn profile() -> ModelProfile {
-    let mut profile = ModelProfile::dummy();
-    profile.vocab = VOCAB;
-    profile.has_attn_score = true;
-    profile
+fn served() -> Served {
+    Served::of(VOCAB)
 }
 
 #[test]
 fn the_single_lane_form_declines_this_shape_by_the_score_ceiling() {
-    let bound = bind(subject(), profile()).expect("the subject binds");
+    let bound = served().bind(subject()).expect("the subject binds");
     let stages = compile_bound(&bound);
     let stage = stages.first().expect("one stage");
     assert_eq!(

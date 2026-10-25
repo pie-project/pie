@@ -1,8 +1,5 @@
 //! The widths and constants ltx_2's package declares.
 
-pub const VAE_Z: u32 = 128;
-
-pub const VAE_RGB: u32 = 3;
 pub const VAE_PATCH: u32 = 4;
 pub const VAE_EPS: f32 = 1e-8;
 pub const VAE_MID_RESNETS: u32 = 2;
@@ -18,19 +15,6 @@ pub const TRAIN_STEPS: u32 = 1000;
 pub const DISTILLED_SIGMAS: [f32; 8] = [
     1.0, 0.993_75, 0.987_5, 0.981_25, 0.975, 0.909_375, 0.725, 0.421_875,
 ];
-
-pub const TEXT_LAYERS: u32 = 49;
-
-pub mod port {
-    pub const LATENTS: u8 = 0;
-    pub const CONTEXT: u8 = 0;
-    pub const AUDIO_CONTEXT: u8 = 1;
-    pub const TEXT: u8 = 1;
-    pub const TIMESTEP: u8 = 0;
-    pub const POSITIONS: u8 = 0;
-    pub const TIME_POSITIONS: u8 = 1;
-    pub const VOXELS: u8 = 0;
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Dims {
@@ -98,11 +82,6 @@ impl Dims {
     }
 
     #[must_use]
-    pub const fn text_in(&self) -> u32 {
-        self.caption * TEXT_LAYERS
-    }
-
-    #[must_use]
     pub const fn rope_dims(&self) -> [u32; 4] {
         let f = self.dim() / (2 * ROPE_AXES as u32);
         [2 * f, 2 * f, 2 * f, 0]
@@ -124,8 +103,3 @@ pub const fn rope_pad(dim: u32, axes: u8) -> u32 {
     let axes = axes as u32;
     dim / 2 - axes * (dim / (2 * axes))
 }
-
-pub const DENOISE: u8 = 0;
-pub const REFINE_VIDEO: u8 = 1;
-pub const REFINE_AUDIO: u8 = 2;
-pub const VAE_DECODE: u8 = 3;

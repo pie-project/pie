@@ -1216,9 +1216,7 @@ pub fn moe_experts() -> Rule {
                                      bank: &'static str,
                                      bias: &'static str,
                                      kind: u32| match kind {
-                        0 => {
-                            linear::select::plain(x, &p.weight(bank, [W, W, W]), &routes, top_k)
-                        }
+                        0 => linear::select::plain(x, &p.weight(bank, [W, W, W]), &routes, top_k),
                         1 => linear::select::biased(
                             x,
                             &p.weight(bank, [W, W, W]),
@@ -1226,12 +1224,9 @@ pub fn moe_experts() -> Rule {
                             &routes,
                             top_k,
                         ),
-                        2 => linear::select::quantized(
-                            x,
-                            &p.weight(bank, [W, W, W]),
-                            &routes,
-                            top_k,
-                        ),
+                        2 => {
+                            linear::select::quantized(x, &p.weight(bank, [W, W, W]), &routes, top_k)
+                        }
                         3 => linear::select::quantized(
                             x,
                             &p.weight_at(bank, [W, W, W], W4A4),
@@ -1348,12 +1343,8 @@ pub fn moe_experts() -> Rule {
             },
         );
         let top_k = p.u32("top_k");
-        let packed = linear::select::quantized(
-            &x,
-            &p.weight_at("bank", [W, W, W], W4A8),
-            &routes,
-            top_k,
-        );
+        let packed =
+            linear::select::quantized(&x, &p.weight_at("bank", [W, W, W], W4A8), &routes, top_k);
         p.name("packed", &packed);
         let weights = p.value(
             "weights",

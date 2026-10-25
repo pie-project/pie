@@ -1,14 +1,7 @@
-// `eta.diffusion` — the diffusion pass's reading (`Mode`) and the reference
-// sampler pieces, a port of `inferlet::eta::diffusion`. The pass itself is
-// `new ForwardPass('diffusion')` with `canvas('denoise')` and
-// `selfConditioning(rows, weights)`.
+// `eta.diffusion` — a port of `inferlet::eta::diffusion`'s block-diffusion sampler pieces.
 
 import { Dtype } from './ir.js';
 import { Tensor, and, cast, cumsum, eq, iota, le, lt, neg, reduceSum, scatterSet, sortDesc } from './value.js';
-
-/** `'encode'` (causal, writes the sequence) or `'denoise'` (bidirectional
- * over the canvas, scratch KV). */
-export type Mode = import('pie:inferlet/forward-diffusion@0.3.0').Mode;
 
 /** The reference schedule `tMin + (tMax - tMin) * remaining / max`, with
  * `remaining` counting DOWN from `maxSteps` to 1. Host arithmetic; it reaches

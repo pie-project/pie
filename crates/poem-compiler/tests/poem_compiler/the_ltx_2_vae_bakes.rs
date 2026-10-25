@@ -2,10 +2,9 @@ use poem_ir::{NormAxis, NormWeight};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use crate::ltx_2_dims::{self as model, VAE_DECODE};
-use poem::generative::{PortKind, ReadoutKind};
+use crate::ltx_2_dims as model;
 use poem::{Def, Dtype, Operation, Platform, RuntimeInput, Trace};
-use poem_ir::{Conv, GridRule, TimePad};
+use poem_ir::{Conv, GridRule, InputAxis, TimePad};
 
 const FLAGSHIP: &str = "ltx25-bf16-kv-bf16";
 const MINI: &str = "ltx25-mini-bf16-kv-bf16";
@@ -27,44 +26,44 @@ fn the_ltx_2_vae_bakes_every_case() {
 }
 
 fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
-    let facts = row(FLAGSHIP).generative().expect("facts");
-    let decode = facts
-        .readings
-        .iter()
-        .find(|r| r.name == "vae.decode")
-        .expect("the flagship declares `vae.decode`");
-    assert_eq!(decode.index, VAE_DECODE);
+    let readings = |deployment: &str| {
+        trace(deployment)
+            .facts
+            .declared("reading")
+            .map(|s| s.values.clone())
+            .unwrap_or_default()
+    };
     assert_eq!(
-        usize::from(decode.index),
-        facts.readings.len() - 1,
-        "the last code"
+        readings(FLAGSHIP).last().map(String::as_str),
+        Some("vae.decode"),
+        "the flagship declares `vae.decode`, the last value"
     );
-    assert!(!decode.has_kv && !decode.takes_tokens);
-    assert_eq!(decode.streams, vec![poem::Stream::Video]);
-    assert_eq!(decode.ports.len(), 1);
-    let (index, port) = decode.port("latent").expect("the latent port");
-    assert_eq!(
-        (index, port.kind, port.width),
-        (model::port::VOXELS, PortKind::Voxels, model::VAE_Z)
-    );
-    assert!(decode.positions.is_none(), "a VAE tile takes no positions");
-    assert_eq!(decode.readout, ReadoutKind::Pixels);
-    assert_eq!(decode.readout_width, model::VAE_RGB);
-
-    let mini = row(MINI).generative().expect("facts");
     assert!(
-        mini.readings.iter().all(|r| r.name != "vae.decode"),
+        readings(MINI).iter().all(|r| r != "vae.decode"),
         "the miniature's checkpoint carries no VAE"
     );
-    for (deployment, want) in [(FLAGSHIP, 1), (MINI, 0)] {
-        let voxels = trace(deployment)
+    for (deployment, want) in [
+        (FLAGSHIP, vec!["latent", "latents"]),
+        (MINI, vec!["latents"]),
+    ] {
+        let plan = trace(deployment);
+        let voxels: BTreeSet<&str> = plan
             .values
             .iter()
-            .filter(|decl| matches!(decl.def, Def::Input(RuntimeInput::Voxels { .. })))
-            .count();
+            .filter_map(|decl| match decl.def {
+                Def::Input(RuntimeInput::Guest {
+                    id,
+                    axis: InputAxis::Voxel,
+                    ..
+                }) => Some(plan.inputs[id as usize].name.as_str()),
+                _ => None,
+            })
+            .collect();
         assert_eq!(
-            voxels, want,
-            "{deployment}: the voxel port iff the row carries the VAE"
+            voxels,
+            want.into_iter().collect(),
+            "{deployment}: the denoiser's latents on the voxel axis, and the VAE's input iff \
+             the row carries the VAE"
         );
     }
 }
@@ -111,6 +110,9 @@ fn the_shapes_are_the_ltx_decoders() {
                 GridRule::Conv { .. } | GridRule::Shuffle { .. } => {}
                 other => panic!("a grid rule this decoder never states: {other:?}"),
             },
+            Operation::Conv(
+                Conv::Patchify { .. } | Conv::Unpatchify { .. } | Conv::Cells { .. },
+            ) => {}
             Operation::Conv(other) => {
                 panic!("a spatial member this decoder never states: {other:?}")
             }

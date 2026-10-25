@@ -333,3 +333,143 @@ pub fn derive_grid(
         &[grid.arg(), o_grid.arg(), ArgValue::of(&geom)],
     )
 }
+
+/// `ops::conv::cells`: a clip row's patch `(t, h, w)` and clip size, any other row
+/// `positions[row]` in column `axis`. `base` is the fire row `y`'s row 0 stands at.
+pub fn cells(
+    ctx: &Ctx,
+    tgrid: Tensor,
+    positions: Tensor,
+    axis: u32,
+    y: &mut Tensor,
+    base: u32,
+) -> Result<(), Error> {
+    const OP: &str = "conv.cells";
+    if tgrid.dtype != Dtype::I32 || tgrid.width != 4 {
+        return Err(refuse(OP, "the token grid is a `[clips, 4]` i32 table"));
+    }
+    // A fire of no clips stages none: every row reads its position.
+    let clips = stated(OP, tgrid.rows)?;
+    if positions.dtype != Dtype::I32 || y.dtype != Dtype::F32 || y.width != axis.max(2) + 4 {
+        return Err(refuse(
+            OP,
+            format!(
+                "the positions are {:?} and the cells {} x {:?}; this reads i32 positions and \
+                 writes max(3, {axis} + 1) + 3 f32 columns",
+                positions.dtype, y.width, y.dtype
+            ),
+        ));
+    }
+    if positions.rows < y.rows {
+        return Err(refuse(
+            OP,
+            format!("{} positions for {} rows", positions.rows, y.rows),
+        ));
+    }
+    let rows = nonzero(OP, "rows", y.rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(POSENC, "::pie::elemwise::cells")).apply(Launch::flat(rows, BLOCK)),
+        &[
+            tgrid.arg(),
+            positions.arg(),
+            y.arg(),
+            clips.arg(),
+            stated(OP, axis)?.arg(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, rows)?.arg(),
+            stated(OP, base)?.arg(),
+        ],
+    )
+}
+
+/// `ops::gather::group_first`.
+pub fn group_first(
+    ctx: &Ctx,
+    x: Tensor,
+    csr: Tensor,
+    groups: Tensor,
+    lanes: Tensor,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "gather.group_first";
+    if [csr.dtype, groups.dtype, lanes.dtype] != [Dtype::I32; 3]
+        || x.dtype != Dtype::F32
+        || y.dtype != Dtype::F32
+        || y.width != x.width
+    {
+        return Err(refuse(
+            OP,
+            "the tables are i32 and the rows as many f32 columns as the packed rows",
+        ));
+    }
+    if lanes.rows < y.rows || csr.rows == 0 {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} row lanes for {} rows over a {}-entry indptr",
+                lanes.rows, y.rows, csr.rows
+            ),
+        ));
+    }
+    let rows = nonzero(OP, "rows", y.rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(POSENC, "::pie::elemwise::group_first")).apply(Launch::flat(rows, BLOCK)),
+        &[
+            x.arg(),
+            csr.arg(),
+            groups.arg(),
+            lanes.arg(),
+            y.arg(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, x.rows)?.arg(),
+            stated(OP, groups.rows)?.arg(),
+            stated(OP, csr.rows - 1)?.arg(),
+            stated(OP, rows)?.arg(),
+        ],
+    )
+}
+
+/// `ops::gather::group_rows`.
+pub fn group_rows(
+    ctx: &Ctx,
+    csr: Tensor,
+    groups: Tensor,
+    lanes: Tensor,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "gather.group_rows";
+    if [csr.dtype, groups.dtype, lanes.dtype] != [Dtype::I32; 3]
+        || y.dtype != Dtype::F32
+        || y.width != 1
+    {
+        return Err(refuse(
+            OP,
+            "the tables are i32 and the counts one f32 column",
+        ));
+    }
+    if lanes.rows < y.rows || csr.rows == 0 {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} row lanes for {} rows over a {}-entry indptr",
+                lanes.rows, y.rows, csr.rows
+            ),
+        ));
+    }
+    let rows = nonzero(OP, "rows", y.rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(POSENC, "::pie::elemwise::group_rows")).apply(Launch::flat(rows, BLOCK)),
+        &[
+            csr.arg(),
+            groups.arg(),
+            lanes.arg(),
+            y.arg(),
+            stated(OP, groups.rows)?.arg(),
+            stated(OP, csr.rows - 1)?.arg(),
+            stated(OP, rows)?.arg(),
+        ],
+    )
+}

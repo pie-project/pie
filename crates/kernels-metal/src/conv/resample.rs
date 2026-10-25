@@ -11,6 +11,7 @@ fn grid_of(op: &'static str, columns: u32, rows: u32) -> Result<Grid, Error> {
     Ok(Grid::of([columns, rows, 1], [256.min(columns), 1, 1]))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn upsample_nearest(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -19,6 +20,7 @@ pub fn upsample_nearest(
     keep_first_frame: bool,
     o_grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.upsample";
     let entry = dtype_dispatch!(OP, y.dtype, {
@@ -48,10 +50,15 @@ pub fn upsample_nearest(
             factor[1].arg(),
             factor[2].arg(),
             u32::from(keep_first_frame).arg(),
+            bases[0].arg(),
+            bases[1].arg(),
         ],
     )
 }
 
+/// `bases` (`[x, y]`): `x`'s and `y`'s row 0 in the grids' fire-wide rows, nonzero in a
+/// segmented fire's window.
+#[allow(clippy::too_many_arguments)]
 pub fn pixel_shuffle(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -60,6 +67,7 @@ pub fn pixel_shuffle(
     trim_t: u32,
     o_grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.pixel_shuffle";
     let entry = dtype_dispatch!(OP, y.dtype, {
@@ -96,10 +104,13 @@ pub fn pixel_shuffle(
             r[1].arg(),
             r[2].arg(),
             trim_t.arg(),
+            bases[0].arg(),
+            bases[1].arg(),
         ],
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn pixel_unshuffle(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -107,6 +118,7 @@ pub fn pixel_unshuffle(
     r: [u32; 3],
     o_grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.pixel_unshuffle";
     let entry = dtype_dispatch!(OP, y.dtype, {
@@ -142,10 +154,13 @@ pub fn pixel_unshuffle(
             r[0].arg(),
             r[1].arg(),
             r[2].arg(),
+            bases[0].arg(),
+            bases[1].arg(),
         ],
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn avg_down(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -154,6 +169,7 @@ pub fn avg_down(
     group: u32,
     o_grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.avg_down";
     if x.dtype != Dtype::Bf16 || y.dtype != Dtype::Bf16 {
@@ -194,6 +210,8 @@ pub fn avg_down(
             factor[1].arg(),
             factor[2].arg(),
             group.arg(),
+            bases[0].arg(),
+            bases[1].arg(),
         ],
     )
 }
@@ -258,6 +276,8 @@ pub fn cache_gather(
     )
 }
 
+/// `x_base`: `x`'s row 0 in `grid`'s fire-wide rows, nonzero in a segmented fire's window.
+#[allow(clippy::too_many_arguments)]
 pub fn cache_store(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -266,6 +286,7 @@ pub fn cache_store(
     grid: Tensor,
     frames: u32,
     slab: Tensor,
+    x_base: u32,
 ) -> Result<(), Error> {
     const OP: &str = "conv.cache_store";
     for t in [x, cache, slab] {
@@ -316,6 +337,7 @@ pub fn cache_store(
             frames.arg(),
             channels.arg(),
             stride.arg(),
+            x_base.arg(),
         ],
     )
 }

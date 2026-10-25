@@ -109,7 +109,8 @@ pub struct FireBindings {
 
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
-    pub ports: Vec<(engine::fire::PortKind, u8, Tensor)>,
+    pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
+    pub inputs: Vec<(u32, Tensor)>,
     pub voxels: Option<crate::inputs::VoxelHandles>,
 }
 
@@ -328,6 +329,26 @@ impl<'c> Run<'c> {
         self.whole(id)
     }
 
+    pub(crate) fn group_mask(
+        &self,
+        q_indptr: ValueId,
+        kv_indptr: ValueId,
+    ) -> Option<crate::inputs::GroupMaskHandles> {
+        let packing = |id: ValueId| match self.values.get(id.0 as usize).map(|decl| &decl.def) {
+            Some(Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::GroupIndptr { select },
+                ..
+            })) => Some(*select),
+            _ => None,
+        };
+        let (q, kv) = (packing(q_indptr)?, packing(kv_indptr)?);
+        self.fire
+            .group_masks
+            .iter()
+            .find(|mask| mask.q == q && mask.kv == kv)
+            .copied()
+    }
+
     pub(crate) fn address(&self, handle: u32) -> Option<(u64, u64)> {
         let row = self.handles.get(handle)?;
         Some((row.slab_id(), row.offset()))
@@ -481,6 +502,28 @@ impl<'c> Run<'c> {
         self.cut(id, self.whole(id))
     }
 
+    /// The row `grid` addresses `rows`' row 0 at: the fire's grids hold fire-wide rows, so the
+    /// window's first row; a grid an op derived counts from the window's first clip, so 0.
+    pub(crate) fn grid_base(&self, grid: ValueId, rows: ValueId) -> u32 {
+        let seated = self.window();
+        if seated.gathered.is_some()
+            || !matches!(
+                self.values[grid.0 as usize].def,
+                Def::Input(RuntimeInput::Grid | RuntimeInput::TokenGrid { .. })
+            )
+        {
+            return 0;
+        }
+        let Ty::Tensor { shape, .. } = &self.values[rows.0 as usize].ty else {
+            return 0;
+        };
+        match shape.first() {
+            Some(Dim::Tokens) => seated.span.row_offset,
+            Some(Dim::Voxels) => seated.voxel.row_offset,
+            _ => 0,
+        }
+    }
+
     fn whole(&self, id: ValueId) -> Tensor {
         let at = id.0 as usize;
         match &self.values[at].def {
@@ -527,12 +570,6 @@ impl<'c> Run<'c> {
             Def::Input(RuntimeInput::ImageGrids) => self.fire.patch_grids.unwrap_or_else(|| {
                 panic!("value {at} reads this fire's image grids, which no lane of it submitted")
             }),
-            Def::Input(RuntimeInput::SelfCondRows | RuntimeInput::SelfCondWeights) => {
-                panic!(
-                    "value {at} reads a self-conditioning input, which this shell stages none \
-                     of; the load refuses such a plan"
-                )
-            }
             Def::Input(RuntimeInput::MropePositions) => {
                 self.fire.mrope_positions.unwrap_or_else(|| {
                     panic!(
@@ -540,18 +577,6 @@ impl<'c> Run<'c> {
                          load reserved no triple — the plan declares no multimodal rotation"
                     )
                 })
-            }
-            Def::Input(RuntimeInput::Latents { port, .. }) => {
-                self.port(at, engine::fire::PortKind::Latents, *port)
-            }
-            Def::Input(RuntimeInput::LaneVector { port, .. }) => {
-                self.port(at, engine::fire::PortKind::LaneVector, *port)
-            }
-            Def::Input(RuntimeInput::Context { port, .. }) => {
-                self.port(at, engine::fire::PortKind::Context, *port)
-            }
-            Def::Input(RuntimeInput::AxisPositions { port, .. }) => {
-                self.port(at, engine::fire::PortKind::AxisPositions, *port)
             }
             Def::Input(RuntimeInput::RowPermutation { select }) => {
                 self.packing(at, *select).permutation
@@ -571,15 +596,15 @@ impl<'c> Run<'c> {
                 ..
             }) => self.packing(at, *select).lane_indptr,
             Def::Input(RuntimeInput::Geometry {
-                kind: GeomKind::ReferenceTag { select },
-                ..
-            }) => self.packing(at, *select).reference_tag,
-            Def::Input(RuntimeInput::Geometry {
                 kind: GeomKind::RequestOfToken,
                 ..
             }) if self.fire.geometry.is_empty() => self.fire.tables.request_of_token,
             Def::Input(RuntimeInput::Grid) => self.voxel_seat(at).grid,
-            Def::Input(RuntimeInput::Voxels { .. }) => self.voxel_seat(at).payload,
+            Def::Input(RuntimeInput::Guest {
+                axis: poem_ir::InputAxis::Voxel,
+                ..
+            }) => self.voxel_seat(at).payload,
+            Def::Input(RuntimeInput::Guest { id, .. }) => self.guest(at, *id),
             Def::Input(RuntimeInput::TokenGrid { .. }) => {
                 self.voxel_seat(at).token_grid.unwrap_or_else(|| {
                     panic!("value {at} reads the token side of the patchify pair, which this load carved none of")
@@ -606,8 +631,7 @@ impl<'c> Run<'c> {
                     GeomKind::WriteOffset => seat.write_offset,
                     GeomKind::GroupOfLane
                     | GeomKind::GroupIndptr { .. }
-                    | GeomKind::LaneIndptr { .. }
-                    | GeomKind::ReferenceTag { .. } => None,
+                    | GeomKind::LaneIndptr { .. } => None,
                 };
                 bound.unwrap_or_else(|| {
                     panic!(
@@ -656,14 +680,14 @@ impl<'c> Run<'c> {
         })
     }
 
-    fn port(&self, at: usize, kind: engine::fire::PortKind, port: u8) -> Tensor {
+    fn guest(&self, at: usize, id: u32) -> Tensor {
         self.fire
-            .ports
+            .inputs
             .iter()
-            .find(|(k, p, _)| *k == kind && *p == port)
-            .map(|(_, _, tensor)| *tensor)
+            .find(|(seat, _)| *seat == id)
+            .map(|(_, tensor)| *tensor)
             .unwrap_or_else(|| {
-                panic!("value {at} reads the {kind:?} port {port}, which this load carved none of")
+                panic!("value {at} reads guest input {id}, which this load carved no rectangle for")
             })
     }
 

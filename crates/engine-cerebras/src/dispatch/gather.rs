@@ -101,6 +101,36 @@ impl Run<'_> {
                 self.tensor(*q),
                 self.tensor(*gate),
             ),
+            Gather::ConcatCols { xs, y } => {
+                let xs: Vec<_> = xs.iter().map(|x| self.tensor(*x)).collect();
+                kernels_cerebras::conv::concat_cols(self.ctx(), &xs, self.tensor(*y))
+            }
+            Gather::GroupFirst {
+                x,
+                csr,
+                groups,
+                lanes,
+                y,
+            } => kernels_cerebras::conv::group_first(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*csr),
+                self.tensor(*groups),
+                self.tensor(*lanes),
+                self.tensor(*y),
+            ),
+            Gather::GroupRows {
+                csr,
+                groups,
+                lanes,
+                y,
+            } => kernels_cerebras::conv::group_rows(
+                self.ctx(),
+                self.tensor(*csr),
+                self.tensor(*groups),
+                self.tensor(*lanes),
+                self.tensor(*y),
+            ),
             Gather::SplitRows {
                 x,
                 width,

@@ -4,9 +4,9 @@ zimage_vae_parity.py -- drive the `vae.decode` reading FROM A GUEST and diff
 its pixels against the reference dump.
 
 The GPU gate `engine-cuda/tests/the_z_image_vae_answers_the_reference` already
-proves the VAE's numbers, but it feeds the port from the host, through a door
+proves the VAE's numbers, but it feeds the input from the host, through a door
 no guest can reach. This is the other half: the same golden latent, bound as a
-`Voxels` PORT CHANNEL by the `zimage-vae-parity` inferlet, fired through the
+voxel INPUT CHANNEL by the `zimage-vae-parity` inferlet, fired through the
 real runtime, read back through the `pixels()` intrinsic, and — the point —
 sent to the client as a PNG that `pie run -o DIR` writes to disk.
 
@@ -78,7 +78,7 @@ def case(args) -> str:
     """The golden latent as the inferlet's case JSON.
 
     The latent dump is `[h, w, channels]` row-major — the same order the
-    engine's own parity gate feeds it in, and the same order a `Voxels` port
+    engine's own parity gate feeds it in, and the same order a voxel input
     channel declares — so this is a copy, not a transpose.
     """
     meta = shapes(args.golden)
@@ -241,7 +241,7 @@ def compare(args) -> int:
             )
         got = f32s(dump)
     print(
-        f"[compare] reading `{doc.get('reading')}` port `{doc.get('port')}`: "
+        f"[compare] reading `{doc.get('reading')}` input `{doc.get('input')}`: "
         f"{doc.get('latent_h')}x{doc.get('latent_w')}x{doc.get('latent_channels')} -> "
         f"{doc.get('pixel_h')}x{doc.get('pixel_w')}x{doc.get('pixel_channels')}, "
         f"{doc.get('rows')} rows"

@@ -749,6 +749,64 @@ pub enum HostOp {
         width: u32,
         limit: u32,
     },
+    /// Each token row's cell (`conv.cells`), `width` f32 columns; `base` is the row `tgrid`
+    /// addresses `y`'s row 0 at.
+    Cells {
+        tgrid: String,
+        positions: String,
+        y: String,
+        clips: u32,
+        rows: u32,
+        axis: u32,
+        width: u32,
+        base: u32,
+    },
+    /// `y[r][at..at + width] = x[r]` for `rows` rows, `y` rows `stride` wide.
+    ConcatCols {
+        x: String,
+        y: String,
+        rows: u32,
+        width: u32,
+        stride: u32,
+        at: u32,
+    },
+    /// `y[r] = csr[g + 1] - csr[g]` for `g = groups[lanes[r]]`, 0 out of the tables.
+    GroupRows {
+        csr: String,
+        groups: String,
+        lanes: String,
+        y: String,
+        csr_len: u32,
+        lane_count: u32,
+        rows: u32,
+    },
+    /// `y[r] = x[csr[g]]` for `g = groups[lanes[r]]`, zeros out of the tables or for an empty group.
+    GroupFirst {
+        x: String,
+        csr: String,
+        groups: String,
+        lanes: String,
+        y: String,
+        csr_len: u32,
+        lane_count: u32,
+        rows: u32,
+        width: u32,
+        x_rows: u32,
+    },
+    /// Pixel unshuffle by `p` when `fold`, else shuffle, over `clips` boxes; a row no box holds
+    /// is zero. `bases`: the rows `grid` and `o_grid` address `x`'s and `y`'s row 0 at.
+    Patch {
+        x: String,
+        grid: String,
+        y: String,
+        o_grid: String,
+        clips: u32,
+        rows: u32,
+        channels: u32,
+        p: [u32; 3],
+        fold: bool,
+        bases: [u32; 2],
+    },
 }
 
 impl HostOp {
@@ -880,6 +938,31 @@ impl HostOp {
                 x, values, indices, ..
             } => vec![x, values, indices],
             HostOp::EmbedConcat { ids, table, y, .. } => vec![ids, table, y],
+            HostOp::Cells {
+                tgrid,
+                positions,
+                y,
+                ..
+            } => vec![tgrid, positions, y],
+            HostOp::GroupRows {
+                csr,
+                groups,
+                lanes,
+                y,
+                ..
+            } => vec![csr, groups, lanes, y],
+            HostOp::GroupFirst {
+                x,
+                csr,
+                groups,
+                lanes,
+                y,
+                ..
+            } => vec![x, csr, groups, lanes, y],
+            HostOp::ConcatCols { x, y, .. } => vec![x, y],
+            HostOp::Patch {
+                x, grid, y, o_grid, ..
+            } => vec![x, grid, y, o_grid],
         }
     }
 }

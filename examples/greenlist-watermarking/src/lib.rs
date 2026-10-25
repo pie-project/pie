@@ -49,7 +49,11 @@ const GREEN_SALT: u32 = 0x67ee_7157;
 /// green when its keyed uniform falls below `gamma`.
 fn green_mask(previous: &Tensor, gamma: f32, vocab: u32) -> Tensor {
     let is_counter = eq(iota(2), broadcast(1u32, [2]));
-    let state = select(&is_counter, broadcast(previous, [2]), broadcast(GREEN_SALT, [2]));
+    let state = select(
+        &is_counter,
+        broadcast(previous, [2]),
+        broadcast(GREEN_SALT, [2]),
+    );
     lt(rng(&state, [vocab]), broadcast(gamma, [vocab]))
 }
 

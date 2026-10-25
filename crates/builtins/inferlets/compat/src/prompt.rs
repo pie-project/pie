@@ -13,8 +13,8 @@ use inferlet::{chat, media, model};
 
 pub struct Prompt {
     pub tokens: Vec<u32>,
-    /// Each picture with the row its span starts at, in order.
-    pub images: Vec<(u32, media::Image)>,
+    /// Each picture, in the order its span sits in `tokens`.
+    pub images: Vec<media::Image>,
     pub ends: Vec<u32>,
     /// The tokens the opening system turn takes, when the template wrote
     /// one.
@@ -76,8 +76,8 @@ pub fn build(req: &Request) -> Result<Prompt, String> {
                     for bytes in &m.images {
                         let image =
                             media::Image::from_bytes(bytes).map_err(|e| format!("image: {e:?}"))?;
-                        images.push((tokens.len() as u32, image));
-                        tokens.extend(images.last().unwrap().1.tokens());
+                        tokens.extend(image.tokens());
+                        images.push(image);
                     }
                     tokens.extend(&turn[text_at..]);
                     seen_user = true;

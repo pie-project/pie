@@ -1,6 +1,4 @@
-use engine::fire::{
-    AttnClasses, Boundary, Masking, PortFeed, RsReset, RsSnapshot, RsVerb, SelfCondInput,
-};
+use engine::fire::{InputFeed, Masking, RsReset, RsSnapshot, RsVerb};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Lane<'a> {
@@ -23,20 +21,14 @@ pub struct Seated<'a> {
     pub window_copies: &'a [(u32, u32)],
     pub mask: Option<&'a Masking>,
     pub adapter: Option<u32>,
-    pub drafts: bool,
     pub captures_scores: bool,
-    pub bidirectional: bool,
-    pub self_cond: Option<&'a SelfCondInput>,
     pub rs: RsVerb,
     pub rs_reset: RsReset,
     pub rs_slot: Option<u32>,
     pub rs_snapshots: &'a [RsSnapshot],
     pub readout: Option<&'a [u32]>,
-    pub stream: u8,
     pub group: Option<u32>,
-    pub peer: Option<u32>,
-    pub ports: &'a [PortFeed],
-    pub attn_classes: Option<&'a AttnClasses>,
+    pub inputs: &'a [InputFeed],
     pub reports: u64,
     pub tap: Option<&'a engine::fire::Tap>,
 }
@@ -55,20 +47,14 @@ impl<'a> Seated<'a> {
             window_copies: &[],
             mask: None,
             adapter: None,
-            drafts: false,
             captures_scores: false,
-            bidirectional: false,
-            self_cond: None,
             rs: RsVerb::Fold,
             rs_reset: RsReset::Inferred,
             rs_slot: None,
             rs_snapshots: &[],
             readout: None,
-            stream: 0,
             group: None,
-            peer: None,
-            ports: &[],
-            attn_classes: None,
+            inputs: &[],
             reports: 0,
             tap: None,
         }
@@ -91,14 +77,6 @@ impl<'a> Seated<'a> {
     }
 
     #[must_use]
-    pub fn drafting(lane: Lane<'a>) -> Seated<'a> {
-        Seated {
-            drafts: true,
-            ..Seated::of(lane)
-        }
-    }
-
-    #[must_use]
     pub fn capturing(lane: Lane<'a>) -> Seated<'a> {
         Seated {
             captures_scores: true,
@@ -109,9 +87,12 @@ impl<'a> Seated<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Attached {
+    /// The first of its pass's lanes, `lanes` of them in a row.
     pub lane: u32,
+    pub lanes: u32,
     pub instance: engine::InstanceId,
-    pub at: Boundary,
+    /// Carries the pass's adapter alone and runs none of its stages.
+    pub adapter_only: bool,
 }
 
 pub(crate) const MROPE_COORDS: usize = 3;

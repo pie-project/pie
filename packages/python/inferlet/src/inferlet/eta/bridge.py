@@ -2,7 +2,7 @@
 The author-facing ETA bridge over the WIT forward surface — port of
 `crates/inferlet/src/eta.rs`.
 
-`ForwardPass` wraps the `pie:inferlet/forward*` resources and drives the
+`ForwardPass` wraps the `pie:inferlet/forward` resource and drives the
 neutral `Builder`, lowering author stage closures to the ETA container. A
 `Channel` owns both the trace declaration and the WIT resource.
 """
@@ -17,7 +17,6 @@ from typing import Awaitable, Callable, Literal, Sequence, TypeAlias
 from componentize_py_types import Err as _WitErr
 from wit_world.imports import channel as _wit_channel
 from wit_world.imports import forward as _wit_forward
-from wit_world.imports import forward_diffusion as _wit_diffusion
 from wit_world.imports import model as _wit_model
 from wit_world.imports import pie_inferlet_types as _wit_types
 from wit_world.imports import pipeline as _wit_pipeline
@@ -28,9 +27,6 @@ from .builder import Builder, DslChannel
 from .ir import Dtype, Port, Shape, Stage, numel, shape_of
 from .trace import ChannelState, TraceError
 from .value import ConstData, Tensor, const_data, reshape, unpack_elems
-
-ForwardKind = _wit_model.ForwardKind
-
 
 class InferletError(Exception):
     """A host-side refusal (`pie:inferlet` declares `type error = string`)."""
@@ -354,10 +350,9 @@ class Pipeline:
             p.attach_program()
         if not live:
             return
-        mod = live[0]._mod
         borrows: list = [p.wit if p is not None else None for p in slots]
         borrows.extend([None] * (k - len(borrows)))
-        _wit(mod.submit, self.wit, borrows, what="submit")
+        _wit(_wit_forward.submit, self.wit, borrows, what="submit")
 
     async def run_ahead(
         self,
@@ -374,8 +369,9 @@ class Pipeline:
         # so does a pass on a model with recurrent state, whose frame's waves
         # carry the same sequence's state one into the next (a frame of one
         # live slot measured faster than a full one on Qwen3.5-0.8B), and a
-        # canvas, which is redrawn whole. Any other pass fills the frame.
-        single = fwd.binds_device_mask() or _rs_state_size() > 0 or fwd.kind == ForwardKind.DIFFUSION
+        # pass off its model's default path (a canvas redrawn whole), which
+        # redraws what the last wrote. Any other pass fills the frame.
+        single = fwd.binds_device_mask() or _rs_state_size() > 0 or fwd.switched()
         r = 1 if single else frame_size()
         window_frames = max(_wit_model.run_ahead_window() // max(r, 1), 1)
         submitted = 0
@@ -436,8 +432,6 @@ class StateGeometry:
     """Per row, the slot it writes; a lane's rows write consecutive slots."""
     kv_len: Channel | None = None
     """Per lane, how many slots the lane reads."""
-    mask: Channel | None = None
-    """Per row, bool over the slots it may read."""
     fold: Fold = None
 
     @staticmethod
@@ -511,8 +505,7 @@ _SITE_BITS = {"q": 1, "k": 2, "v": 4, "o": 8, "gate_up": 16, "down": 32}
 
 
 class ForwardPass:
-    """The forward-pass builder over one `pie:inferlet/forward*` interface,
-    selected by `kind` (default: `model.pass_kind()`).
+    """The forward-pass builder over `pie:inferlet/forward`.
 
     Attach stage bodies with `epilogue(fn)` (also usable as a decorator),
     bind the lanes' working sets with `state([ws], geometry)`, and
@@ -520,18 +513,10 @@ class ForwardPass:
     ETA container.
     """
 
-    def __init__(self, kind: ForwardKind | None = None) -> None:
-        if kind is None:
-            kind = _wit_model.pass_kind()
-        self.kind = kind
-        if kind == ForwardKind.TEXT:
-            self._mod = _wit_forward
-        elif kind == ForwardKind.DIFFUSION:
-            self._mod = _wit_diffusion
-        else:
-            raise ValueError(f"unknown forward kind {kind!r}")
-        self.wit = self._mod.ForwardPass()
+    def __init__(self) -> None:
+        self.wit = _wit_forward.ForwardPass()
         self._ports: list[tuple[Port, Channel]] = []
+        self._inputs: list[tuple[int, str, Channel]] = []
         self._stages: list[tuple[Stage, Callable[[], None]]] = []
         self._vocab = _wit_model.output_vocab_size()
         self._page_size = kv_page_size()
@@ -541,6 +526,7 @@ class ForwardPass:
         # Keeps the bound working sets alive while the pass is bound.
         self._lanes: list[WorkingSet] = []
         self._fold_all: Channel | None = None
+        self._switches: list[tuple[int, str, str]] = []
 
     # -- ports ----------------------------------------------------------------
 
@@ -574,17 +560,8 @@ class ForwardPass:
         _wit(self.wit.readout, indices._wit(), what="readout")
         self._ports.append((Port.READOUT, indices))
 
-    def set_max_layers(self, max_layers: int) -> None:
-        _wit(self.wit.set_max_layers, max_layers, what="set_max_layers")
-
-    def set_drafting_block(self, on: bool) -> None:
-        """These rows are a block drafter's proposal, not the sequence's own."""
-        self._require_kind((ForwardKind.TEXT,), "set_drafting_block")
-        _wit(self.wit.set_drafting_block, on, what="set_drafting_block")
-
-    def media(self, spans: Sequence[Image | Audio]) -> None:
-        """Carry the payloads of `media.Image` / `media.Audio` spans,
-        order-matched to their placeholder token runs in the embed."""
+    def media(self, lane: int, spans: Sequence[Image | Audio]) -> None:
+        """Lane `lane`'s media span payloads, in placeholder order."""
         wrapped = []
         for s in spans:
             if isinstance(s, Audio):
@@ -593,7 +570,7 @@ class ForwardPass:
                 wrapped.append(_wit_forward.MediaSpan_Image(s.handle))
             else:
                 raise TypeError(f"media span must be media.Image or media.Audio, got {type(s).__name__}")
-        _wit(self.wit.media, wrapped, what="media")
+        _wit(self.wit.media, int(lane), wrapped, what="media")
 
     def state(self, lanes: Sequence[WorkingSet], geom: StateGeometry | None = None) -> None:
         """Bind one working set per lane, in lane order; lanes sharing a set must state `slots`."""
@@ -610,7 +587,6 @@ class ForwardPass:
             (Port.POSITIONS, geom.positions),
             (Port.SLOTS, geom.slots),
             (Port.KV_LEN, geom.kv_len),
-            (Port.ATTN_MASK, geom.mask),
             (Port.FOLD, fold),
         ]
         if not rebind:
@@ -620,7 +596,7 @@ class ForwardPass:
             self.wit.state,
             [lane.ws for lane in lanes],
             _wit_forward.StateGeometry(
-                positions=wits[0], slots=wits[1], kv_len=wits[2], mask=wits[3], fold=wits[4]
+                positions=wits[0], slots=wits[1], kv_len=wits[2], fold=wits[3]
             ),
             what="state",
         )
@@ -630,50 +606,46 @@ class ForwardPass:
 
     def checkpoints(self, slots: Sequence[int]) -> None:
         """Slots to keep a recurrent state at, so a later pass over these tokens resumes there."""
-        self._require_kind((ForwardKind.TEXT,), "checkpoints")
         _wit(self.wit.checkpoints, [int(s) for s in slots], what="checkpoints")
 
-    def _require_kind(self, kinds: tuple[ForwardKind, ...], what: str) -> None:
-        if self.kind not in kinds:
-            names = " / ".join(k.name.lower() for k in kinds)
-            raise InferletError(f"{what} binds a {names} pass; this pass is {self.kind.name.lower()}")
+    # -- switches and inputs ---------------------------------------------------
 
-    # -- readings and float ports ---------------------------------------------
+    def switch(self, lane: int, name: str, value: str) -> None:
+        """Set lane `lane`'s model switch `name` to `value`, before the program."""
+        if self._program_attached:
+            raise InferletError("forward pass program is already attached")
+        _wit(self.wit.switch, int(lane), name, value, what="switch")
+        self._switches.append((int(lane), name, value))
 
-    def reading(self, name: str) -> None:
-        """Which of the family's declared readings (`model.readings()`) this
-        pass runs — `"text"`, `"denoise"`, `"vae.decode"`, ... Optional when
-        the model declares at most one; before the program."""
-        _wit(self.wit.reading, name, what="reading")
+    def switched(self) -> bool:
+        """Whether a switch is off its default; such a pass posts one fire at a time."""
+        if not self._switches:
+            return False
+        declared = {d.name: d.values for d in _wit_model.switches()}
+        return any(
+            name in declared and declared[name][:1] != [value] for _, name, value in self._switches
+        )
 
-    def input(self, port: str, ch: Channel) -> None:
-        """Bind `ch` to the reading's float port `port`, read at every submit
-        from its committed cell. The host validates the shape; the program
-        must declare the channel, so a stage of the author's must touch it."""
-        _wit(self.wit.input, port, ch._wit(), what="input")
+    def input(self, lane: int, name: str, ch: Channel) -> None:
+        """Bind `ch` to lane `lane`'s model input `name`, read from its committed cell."""
+        if self._program_attached:
+            raise InferletError("forward pass program is already attached")
+        if any(at == lane and bound == name for at, bound, _ in self._inputs):
+            raise InferletError(f"input `{name}` is already bound on lane {lane}")
+        _wit(self.wit.input, int(lane), name, ch._wit(), what="input")
+        self._inputs.append((int(lane), name, ch))
 
-    def stream(self, s: "_wit_model.LaneStream") -> None:
-        """Which lane stream this pass's rows are (`model.LaneStream`)."""
-        _wit(self.wit.stream, s, what="stream")
+    def group(self, lane: int, id: int) -> None:
+        """Put lane `lane` in this pass's attention group `id`."""
+        if self._program_attached:
+            raise InferletError("forward pass program is already attached")
+        _wit(self.wit.group, int(lane), int(id), what="group")
 
-    def group(self, id: int) -> None:
-        """Put this pass's lanes in attention group `id` within a frame."""
-        _wit(self.wit.group, int(id), what="group")
-
-    # -- diffusion --------------------------------------------------------------
-
-    def canvas(self, mode: "_wit_diffusion.Mode") -> None:
-        """Which reading this diffusion pass runs (`diffusion.Mode.ENCODE` or
-        `DENOISE`). REQUIRED, once, before the first submit."""
-        self._require_kind((ForwardKind.DIFFUSION,), "canvas")
-        _wit(self.wit.canvas, mode, what="canvas")
-
-    def self_conditioning(self, rows: Sequence[int], weights: Sequence[float]) -> None:
-        """The previous step's distribution as taps — `model.canvas().self_cond_taps`
-        `(id, weight)` pairs per canvas row, row major — staged for this
-        pass's next submit."""
-        self._require_kind((ForwardKind.DIFFUSION,), "self_conditioning")
-        _wit(self.wit.self_conditioning, [int(r) for r in rows], [float(w) for w in weights], what="self_conditioning")
+    def mask(self, rows: Channel) -> None:
+        """Per row, the kv slots it attends, or its attention group's rows without kv."""
+        self._ensure_ports_available([Port.ATTN_MASK])
+        _wit(self.wit.mask, rows._wit(), what="mask")
+        self._ports.append((Port.ATTN_MASK, rows))
 
     # -- adapters ------------------------------------------------------------
 
@@ -780,6 +752,12 @@ class ForwardPass:
         builder = Builder(self._vocab, self._page_size)
         for port, ch in self._ports:
             builder.bind_port(port, ch._dsl)
+        # A channel several lanes read is one program input.
+        listed: list[Channel] = []
+        for _, _, ch in self._inputs:
+            if not any(seen is ch for seen in listed):
+                listed.append(ch)
+                builder.bind_input(ch._dsl)
         for stage, body in self._stages:
             builder.stage(stage, body)
         traced = builder.build()

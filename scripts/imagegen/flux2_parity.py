@@ -32,6 +32,15 @@ over `[target (64) ‖ ref_0 (64) ‖ ref_1 (64)]` image tokens and 32 text rows
 the target lane alone (the reference discards `pred[:, S_img:]`), so the diff
 is over `mini.out.0[:, :64]`, which `collect` writes beside pie's answer as
 `flux2_mini_target.npz` under the same key.
+
+THE LATENT IS THE VAE'S
+-----------------------
+The golden holds packed tokens (`[S, C*4]`, a 2x2 block of VAE cells in
+`(c, ph, pw)` order, rows row-major over the token grid its ids state). The
+guest takes the VAE's own `[2h, 2w, C]` and reads the velocity out the same
+way, so `case` unpacks each picture (the target, and each reference split
+off by its own `T` id) and `collect` packs the answer back. No ids cross:
+the model computes every position, a reference's from its ordinal.
 """
 
 from __future__ import annotations
@@ -68,6 +77,41 @@ def numbered(out: str, stem: str) -> list[str]:
             found.append((int(match.group(1)), os.path.join(out, name)))
     return [path for _, path in sorted(found)]
 
+PACK = 2
+
+def pictures(ids: np.ndarray) -> list[tuple[int, int, int, int]]:
+    """`(first row, rows, h, w)` for each run of one `T` in `ids`, in row order."""
+    out, start = [], 0
+    while start < len(ids):
+        t = ids[start, 0]
+        end = start
+        while end < len(ids) and ids[end, 0] == t:
+            end += 1
+        run = ids[start:end]
+        h, w = int(run[:, 1].max()) + 1, int(run[:, 2].max()) + 1
+        grid = np.stack(np.meshgrid(np.arange(h), np.arange(w), indexing="ij"), -1).reshape(-1, 2)
+        assert np.array_equal(run[:, 1:3].astype(np.int64), grid), "ids are not a row-major grid"
+        out.append((start, end - start, h, w))
+        start = end
+    return out
+
+def to_voxels(tokens: np.ndarray, h: int, w: int) -> np.ndarray:
+    """`[h*w, C*4]` packed tokens -> the VAE latent `[2h, 2w, C]`."""
+    c = tokens.shape[-1] // (PACK * PACK)
+    x = tokens.reshape(h, w, c, PACK, PACK).transpose(0, 3, 1, 4, 2)
+    return np.ascontiguousarray(x.reshape(h * PACK, w * PACK, c))
+
+def to_tokens(voxels: np.ndarray, h: int, w: int) -> np.ndarray:
+    """The VAE latent's `2h*2w*C` values -> `[h*w, C*4]` packed tokens."""
+    c = voxels.size // (h * PACK * w * PACK)
+    x = voxels.reshape(h, PACK, w, PACK, c).transpose(0, 2, 4, 1, 3)
+    return np.ascontiguousarray(x.reshape(h * w, c * PACK * PACK))
+
+def latent(tokens: np.ndarray, h: int, w: int) -> dict:
+    v = to_voxels(tokens, h, w)
+    return {"latents": v.reshape(-1).astype(np.float32).tolist(),
+            "height": int(v.shape[0]), "width": int(v.shape[1])}
+
 def cases(args) -> list[str]:
     """Write one `case_{b}.json` per batch element; answer their paths."""
     cfg = config(args.golden)
@@ -87,18 +131,19 @@ def cases(args) -> list[str]:
     os.makedirs(args.out, exist_ok=True)
     written = []
     for b in range(hs.shape[0]):
+        laid = pictures(img_ids[b])
+        (first, rows, th, tw), refs_laid = laid[0], laid[1:]
+        assert (first, rows, th * tw) == (0, s_img, s_img), laid
+        assert [int(img_ids[b, at, 0]) for at, *_ in refs_laid] == \
+            [10 * (k + 1) for k in range(len(refs_laid))], refs_laid
+        assert np.array_equal(txt_ids[b][:, 3], np.arange(ctx.shape[1])), "text ids are (0, 0, 0, j)"
         case = {
-            "latents": hs[b, :s_img].reshape(-1).astype(np.float32).tolist(),
-            "image_rows": int(s_img),
-            "channels": int(hs.shape[2]),
-            "reference": hs[b, s_img:].reshape(-1).astype(np.float32).tolist(),
-            "reference_rows": int(refs),
+            "target": latent(hs[b, :s_img], th, tw),
+            "channels": int(hs.shape[2]) // (PACK * PACK),
+            "references": [latent(hs[b, at:at + n], h, w) for at, n, h, w in refs_laid],
             "context": ctx[b].reshape(-1).astype(np.float32).tolist(),
             "text_rows": int(ctx.shape[1]),
             "context_width": int(ctx.shape[2]),
-            "text_positions": txt_ids[b].reshape(-1).astype(np.float32).tolist(),
-            "image_positions": img_ids[b, :s_img].reshape(-1).astype(np.float32).tolist(),
-            "reference_positions": img_ids[b, s_img:].reshape(-1).astype(np.float32).tolist(),
             "timestep": float(timestep[b]) * 1000.0,
             "guidance": float(guidance[b]),
         }
@@ -131,6 +176,18 @@ def wasm(inferlet: str) -> str:
         raise SystemExit(f"no wasm for {name}; tried {', '.join(candidates)}")
     return max(present, key=os.path.getmtime)
 
+def pieces(text: str, n: int) -> list[str]:
+    """`n` argv pieces of `text`, none starting with `-` (`pie run` reads those as flags)."""
+    step = -(-len(text) // n)
+    cuts = [0]
+    for i in range(1, n):
+        at = max(cuts[-1], min(i * step, len(text)))
+        while at < len(text) and text[at] == "-":
+            at += 1
+        cuts.append(at)
+    cuts.append(len(text))
+    return [text[a:b] for a, b in zip(cuts, cuts[1:])]
+
 def run(args) -> None:
     paths = numbered(args.out, "case")
     if not paths:
@@ -152,10 +209,8 @@ def run(args) -> None:
             cmd += ["--case_file", os.path.basename(case)]
         else:
             text = open(case).read()
-            n = 8
-            step = -(-len(text) // n)
-            for i in range(n):
-                cmd += [f"--case_{i}", text[i * step:(i + 1) * step]]
+            for i, piece in enumerate(pieces(text, 8)):
+                cmd += [f"--case_{i}", piece]
         print(f"[run] {' '.join(cmd[:8])} ... ({len(text) if not args.case_file else 0} bytes of case)")
         done = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO)
         if done.returncode != 0:
@@ -183,9 +238,10 @@ def collect(args) -> str:
     if not paths:
         raise SystemExit(f"{args.out}: no pie answer; run `run` first")
     docs = [document(path) for path in paths]
-    rows, width = docs[0]["image_rows"], docs[0]["channels"]
+    h, w = docs[0]["height"] // PACK, docs[0]["width"] // PACK
+    rows = h * w
     mine = np.stack(
-        [np.asarray(doc["velocity"], dtype=np.float32).reshape(rows, width) for doc in docs]
+        [to_tokens(np.asarray(doc["velocity"], dtype=np.float32), h, w) for doc in docs]
     )
     path = os.path.join(args.out, "flux2_mini_pie.npz")
     np.savez(path, **{"mini.out.0": mine})

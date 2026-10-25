@@ -516,7 +516,7 @@ mod tests {
     /// chances, and each row's draw, over `steps` steps of one Gumbel stream.
     fn landed(logits: &[f32], proposals: [i32; 3], steps: usize) -> (Vec<f32>, Vec<[u32; 3]>) {
         use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
-        use eta_dsl::eta::registry::ModelProfile;
+        use eta_dsl::eta::registry::{EngineCaps, Graph, Readout, ReadoutKind};
         use eta_dsl::eta::validate::bind;
         use eta_dsl::prelude::*;
         const ROWS: u32 = 3;
@@ -551,13 +551,21 @@ mod tests {
         chances.note_host_take();
         draws.note_host_take();
         let traced = b.build().expect("the epilogue traces");
-        let profile = ModelProfile {
-            vocab,
-            page_size: 4,
+        let lanes = vec![Some(Readout {
+            kind: ReadoutKind::Logits,
+            width: vocab,
+        })];
+        let graph = Graph {
             num_layers: 2,
-            ..ModelProfile::dummy()
+            ..Graph::default()
         };
-        let bound = bind(traced.container().clone(), profile).expect("the trace binds");
+        let bound = bind(
+            traced.container().clone(),
+            lanes,
+            graph,
+            EngineCaps::default(),
+        )
+        .expect("the trace binds");
         let names = traced.channel_names();
         let at = |name: &str| names.iter().position(|n| n == name).unwrap() as u32;
         let seeds = [

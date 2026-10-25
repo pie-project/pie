@@ -167,7 +167,6 @@ class Intrinsic(IntEnum):
     MTP_LOGITS = 1
     HIDDEN = 2
     QUERY = 3
-    VALUE_HEAD = 4
     LAYER = 5
     MTP_DRAFTS = 6
     ATTN_SCORE = 7
@@ -339,7 +338,7 @@ OP_TABLE: dict[int, tuple[str, int, tuple[str, ...]]] = {
     tags.CHAN_TAKE: ("chan_take", 1, (CHAN,)),
     tags.CHAN_READ: ("chan_read", 1, (CHAN,)),
     tags.CHAN_PUT: ("chan_put", 0, (CHAN, VALUE)),
-    tags.INTRINSIC_VAL: ("intrinsic_val", 1, (INTRINSIC, DTYPE, SHAPE)),
+    tags.INTRINSIC_VAL: ("intrinsic_val", 1, (INTRINSIC, IMM, DTYPE, SHAPE)),
     tags.KERNEL_CALL: ("kernel_call", 1, (NAME, DTYPE, SHAPE, ARGS)),
     tags.SINK_CALL: ("sink_call", 0, (NAME, ARGS)),
 }
@@ -447,8 +446,9 @@ class Op:
         return Op(tags.CHAN_PUT, [value], chan=chan)
 
     @staticmethod
-    def intrinsic_val(intr: Intrinsic, shape: Shape, dt: Dtype) -> "Op":
-        return Op(tags.INTRINSIC_VAL, intr=int(intr), shape=shape, dtype=int(dt))
+    def intrinsic_val(intr: Intrinsic, shape: Shape, dt: Dtype, lane: int = 0) -> "Op":
+        # `lane` (0 for non-per-lane intrinsics) rides the op's imm.
+        return Op(tags.INTRINSIC_VAL, intr=int(intr), imms=(lane,), shape=shape, dtype=int(dt))
 
     @staticmethod
     def kernel_call(name: int, args: list[int], shape: Shape, dt: Dtype) -> "Op":
@@ -523,6 +523,8 @@ class TraceContainer:
     ports: list[PortBinding] = field(default_factory=list)
     stages: list[StageProgram] = field(default_factory=list)
     externs: list[ExternDecl] = field(default_factory=list)
+    # The channels the forward reads as guest model inputs, sorted, unique.
+    inputs: list[int] = field(default_factory=list)
 
     def encode(self) -> bytes:
         return encode(self)
@@ -599,7 +601,7 @@ def encode_op(w: bytearray, op: Op) -> None:
 def encode(c: TraceContainer) -> bytes:
     w = bytearray()
     w += ETA_MAGIC
-    v2 = bool(c.externs)
+    v2 = bool(c.externs) or bool(c.inputs)
     _u16(w, ETA_VERSION_EXTERN if v2 else ETA_VERSION)
     _u16(w, 0)  # flags
     _u32(w, len(c.names))
@@ -608,6 +610,7 @@ def encode(c: TraceContainer) -> bytes:
     _u32(w, len(c.stages))
     if v2:
         _u32(w, len(c.externs))
+        _u32(w, len(c.inputs))
     for n in c.names:
         b = n.encode("utf-8")
         _u16(w, len(b))
@@ -631,6 +634,8 @@ def encode(c: TraceContainer) -> bytes:
         _u16(w, e.name)
         _u8(w, e.direction)
         _u32(w, e.chan)
+    for chan in c.inputs:
+        _u32(w, chan)
     return bytes(w)
 
 

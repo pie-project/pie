@@ -453,7 +453,7 @@ def mamba(x, inputs, m, k):
             chunked,
         )
 
-    o = switch(xbc, [(fact.single_token(), lambda xbc: scan(xbc, False))], otherwise = lambda xbc: scan(xbc, True))
+    o = branch(xbc, [(fact.single_token(), lambda xbc: scan(xbc, False))], otherwise = lambda xbc: scan(xbc, True))
     return ops.linear.matmul(o, k.out_proj)
 
 def attention(x, inputs, m, a):

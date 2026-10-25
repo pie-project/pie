@@ -45,7 +45,7 @@ impl ForwardHybrid for OneGather {
             }
             (Axis::Tokens, Lookup::Weighted) => ops::gather::embed_weighted(
                 &inputs.mrope_positions(),
-                &inputs.axis_positions(0, 3),
+                &inputs.input("positions", Dtype::F32, poem_ir::InputAxis::Row, 3, None),
                 &table,
                 VOCAB,
             ),

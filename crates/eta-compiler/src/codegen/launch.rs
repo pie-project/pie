@@ -31,6 +31,8 @@ pub struct LaunchValue {
     pub source: ValueOrigin,
     pub dtype: Dtype,
     pub intrinsic: Option<IntrinsicId>,
+    #[serde(default)]
+    pub lane: u32,
     pub channel: ChannelIndex,
     pub literal_bits: u32,
     pub shape: Vec<u32>,
@@ -43,6 +45,7 @@ impl Default for LaunchValue {
             source: ValueOrigin::OpResult,
             dtype: Dtype::F32,
             intrinsic: None,
+            lane: 0,
             channel: 0,
             literal_bits: 0,
             shape: Vec::new(),
@@ -232,6 +235,7 @@ pub struct LaunchStagePlan {
     pub mtp_rows: u32,
     #[serde(default)]
     pub drafts_len: u32,
+    pub intrinsic_pitch: u32,
     pub ops: Vec<LaunchOp>,
     pub source_ops: Vec<Vec<u32>>,
     pub value_types: Vec<LaunchPlanValue>,
@@ -250,6 +254,7 @@ pub struct LaunchPackage {
     pub values: Vec<LaunchValue>,
     pub channels: Vec<LaunchChannel>,
     pub ports: Vec<LaunchPort>,
+    pub inputs: Vec<ChannelIndex>,
     pub names: Vec<String>,
     pub stages: Vec<LaunchStage>,
     pub plans: Vec<LaunchStagePlan>,
@@ -278,6 +283,7 @@ pub fn build(bound: &BoundTrace, stages: &[CompiledStage]) -> LaunchPackage {
         values: lower_values(bound),
         channels: lower_channels(bound),
         ports: lower_ports(bound),
+        inputs: bound.container.inputs.clone(),
         names: bound.container.names.clone(),
         stages: lower_stages(bound),
         plans: stages.iter().map(lower_plan).collect(),
@@ -336,6 +342,7 @@ fn lower_values(bound: &BoundTrace) -> Vec<LaunchValue> {
                         LaunchValue {
                             source: ValueOrigin::Intrinsic,
                             intrinsic: IntrinsicId::from_u16(view.intr),
+                            lane: view.imm,
                             ..LaunchValue::default()
                         },
                     );
@@ -505,6 +512,7 @@ fn lower_plan(stage: &CompiledStage) -> LaunchStagePlan {
         needs: grouped.needs,
         mtp_rows: grouped.mtp_rows,
         drafts_len: grouped.drafts_len,
+        intrinsic_pitch: eta_ir::op::intrinsic_pitch(&normalized.ops),
         ops: ops.iter().map(lower_plan_op).collect(),
         source_ops: normalized.source_ops.clone(),
         value_map: normalized.value_map.clone(),

@@ -166,7 +166,7 @@ async fn main(input: Input) -> Result<Output> {
     // Lays out the block anchored at `a` (`[1]` i32) at `b` (`[1]` u32).
     let lay_block = move |a: &Tensor, b: &Tensor| {
         let j = iota(block);
-        blk.put(&select(
+        blk.put(select(
             eq(&j, Tensor::constant(0u32)),
             broadcast(a, [block]),
             broadcast(Tensor::constant(noise), [block]),
@@ -215,7 +215,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let draft = ForwardPass::new();
     draft
-        .set_drafting_block(true)
+        .switch(0, "block_draft", "on")
         .map_err(|why| format!("stating the draft block: {why}"))?;
     draft.embed(&blk, &indptr_d)?;
     draft.readout(&readout_d)?;
@@ -242,7 +242,7 @@ async fn main(input: Input) -> Result<Output> {
         let a = broadcast(gather(&tokens, iota(1)), [w]);
         // The window's tokens alone: its geometry is the verify's own
         // (`lay_verify`), so the verify's host reads nothing this puts.
-        win.put(&select(&first, &a, gather(&picks, &at)));
+        win.put(select(&first, &a, gather(&picks, &at)));
     });
 
     let verify = ForwardPass::new();

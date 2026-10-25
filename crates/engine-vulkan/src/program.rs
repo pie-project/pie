@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, PassInputs, StepOutcome, Value};
-use eta_ir::registry::{GeometryClass, Port};
+use eta_ir::registry::{GeometryClass, Port, Stage};
 
 #[derive(Debug)]
 pub enum Refusal {
@@ -37,7 +37,7 @@ struct Instance {
 }
 
 #[derive(Debug, Clone)]
-pub enum PortCell {
+pub enum InputCell {
     Host {
         bytes: Vec<u8>,
         dtype: eta_ir::types::Dtype,
@@ -240,7 +240,7 @@ impl Plane {
             })
     }
 
-    pub fn port_cell(&self, instance: InstanceId, id: ChannelId) -> Result<PortCell, Refusal> {
+    pub fn input_cell(&self, instance: InstanceId, id: ChannelId) -> Result<InputCell, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
             id: instance.0,
@@ -251,28 +251,32 @@ impl Plane {
             .position(|&held| held == id)
             .ok_or_else(|| {
                 Refusal::Program(format!(
-                    "a port feed names channel {id}, which instance {instance} does not carry"
+                    "a guest input feed names channel {id}, which instance {instance} does not carry"
                 ))
             })?;
         let ring = &seat.inst.channels[dense];
         let dtype = eta_exec::concrete_dtype(seat.plan.package.channels[dense].dtype);
+        // The forward reads the oldest cell; the kept device cell is the newest, so it is
+        // read only when the ring holds no other.
         #[cfg(feature = "vulkan")]
-        if let Some(cell) = seat.session.kept_cell(dense as u32) {
-            return Ok(PortCell::Device {
+        if ring.size() <= 1
+            && let Some(cell) = seat.session.kept_cell(dense as u32)
+        {
+            return Ok(InputCell::Device {
                 cell: cell.clone(),
                 dtype,
             });
         }
         if ring.is_empty() {
             return Err(Refusal::Program(format!(
-                "port channel {id} of instance {instance} holds no cell; publish one before \
+                "guest input channel {id} of instance {instance} holds no cell; publish one before \
                  the fire that reads it"
             )));
         }
         let value = ring.front();
         let mut bytes = vec![0u8; eta_exec::wire_cell_bytes(value.dtype(), value.len())];
         eta_exec::encode_wire(&value, &mut bytes);
-        Ok(PortCell::Host { bytes, dtype })
+        Ok(InputCell::Host { bytes, dtype })
     }
 
     pub fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
@@ -438,18 +442,26 @@ impl Plane {
         }
     }
 
+    #[must_use]
+    pub fn prologue_runs(&self, instance: InstanceId) -> bool {
+        self.instances
+            .get(&instance)
+            .is_some_and(|seat| seat.plan.prologue_runs())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn fire(
         &mut self,
         instance: InstanceId,
+        at: Stage,
         logits: Option<&[f32]>,
         rows: u32,
         vocab: u32,
         mtp_logits: Option<&[f32]>,
         mtp_width: u32,
         #[cfg(feature = "vulkan")] device: Option<&crate::device::Context>,
-        #[cfg(feature = "vulkan")] readout: Option<crate::guest::run::Readout<'_>>,
-        #[cfg(feature = "vulkan")] pixels: Option<crate::guest::run::Readout<'_>>,
+        #[cfg(feature = "vulkan")] readouts: Vec<Option<crate::guest::run::Readout<'_>>>,
+        #[cfg(feature = "vulkan")] pixels: Vec<Option<crate::guest::run::Readout<'_>>>,
     ) -> Result<(), Refusal> {
         let Plane {
             instances,
@@ -482,6 +494,8 @@ impl Plane {
         };
 
         #[cfg(feature = "vulkan")]
+        let readout = readouts.first().copied().flatten();
+        #[cfg(feature = "vulkan")]
         if seat.plan.needs_logits && readout.is_none() {
             return Err(Refusal::Program(format!(
                 "instance {instance} reads logits, but its lane offered no readout seat"
@@ -511,8 +525,8 @@ impl Plane {
             let widen = widen.as_ref().expect("the device arm checked for one");
             let session = &mut seat.session;
             let mut runner = crate::guest::run::OnDevice::new(device_half, session, widen, readout)
-                .with_pixels(pixels);
-            let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut runner);
+                .with_lanes(readouts, pixels);
+            let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut runner, at);
             let ran = runner.ran().len();
             widen.disarm();
             (outcome, ran)
@@ -520,7 +534,7 @@ impl Plane {
 
         #[cfg(not(feature = "vulkan"))]
         return {
-            let _ = (&inputs, tally, seat);
+            let _ = (&inputs, tally, seat, at);
             Err(Refusal::Program(format!(
                 "instance {instance}: this build carries no Vulkan device, so a guest pass has nowhere to run"
             )))
@@ -587,8 +601,8 @@ impl Plane {
         &mut self,
         instance: InstanceId,
         device: &crate::device::Context,
-        readout: Option<crate::guest::run::Readout<'_>>,
-        pixels: Option<crate::guest::run::Readout<'_>>,
+        readouts: Vec<Option<crate::guest::run::Readout<'_>>>,
+        pixels: Vec<Option<crate::guest::run::Readout<'_>>>,
         done: Option<crate::settle::Done>,
     ) -> Result<(), Refusal> {
         let Plane {
@@ -606,6 +620,7 @@ impl Plane {
                 "instance {instance} has a device half, but the plane built no readout widen"
             ))
         })?;
+        let readout = readouts.first().copied().flatten();
         if seat.plan.needs_logits && readout.is_none() {
             return Err(Refusal::Program(format!(
                 "instance {instance} reads logits, but its lane offered no readout seat"
@@ -621,9 +636,15 @@ impl Plane {
         };
         let mut runner =
             crate::guest::run::OnDevice::new(device, &mut seat.session, widen, readout)
-                .with_pixels(pixels)
+                .with_lanes(readouts, pixels)
                 .deferred();
-        let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut runner);
+        let outcome = eta_exec::step_with(
+            &mut seat.inst,
+            &seat.plan,
+            &inputs,
+            &mut runner,
+            Stage::Epilogue,
+        );
         let deferral = runner.take_deferral().unwrap_or_default();
         widen.disarm();
         let program = seat.program;

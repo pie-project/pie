@@ -1,6 +1,6 @@
 //! Sampler variants for DiffusionGemma, every one a guest program against
-//! the same `forward-diffusion` host as `diffusion-baseline`: the host owns
-//! the two attention readings and the KV; the guest owns the canvas, its
+//! the same host as `diffusion-baseline`: the host owns the model's two
+//! `mode`s (`encode`, `denoise`) and the KV; the guest owns the canvas, its
 //! acceptance rule, its schedule, its self-conditioning taps, its stopping
 //! rule, and what gets committed. Nothing here needed a host change.
 //!
@@ -37,12 +37,15 @@
 //! - `elide_commit`: the last block's causal encode is skipped — nothing
 //!   reads its KV.
 //! - `quality`: the commit encode reads every row out and reports the mean
-//!   log-probability of the committed tokens under the causal reading.
+//!   log-probability of the committed tokens under the `encode` mode.
 //! - `best_of`: K canvases per block, the lowest final entropy committed.
 //! - `clamp`: infilling — canvas positions held at given tokens.
 
 use inferlet::eta::diffusion::prelude::*;
 use serde::{Deserialize, Serialize};
+
+/// Tokens per block's canvas.
+const CANVAS: u32 = 256;
 
 #[derive(Deserialize)]
 struct Input {
@@ -166,7 +169,7 @@ struct Output {
     /// Final entropies of every candidate canvas per block (`best_of`).
     candidates: Vec<Vec<f32>>,
     /// Mean log-probability of each committed block's tokens under the
-    /// causal reading (`quality`), empty otherwise.
+    /// `encode` mode (`quality`), empty otherwise.
     self_logprob: Vec<f32>,
     denoise_fires: u32,
     encode_fires: u32,
@@ -308,12 +311,19 @@ impl Block<'_> {
         let stop = Channel::new([1], dtype::bool).named("stop");
         let mean_out = Channel::new([1], dtype::f32).named("mean_entropy");
         let tap_ids_out =
-            (taps_used > 0).then(|| Channel::new([length, taps_used], dtype::u32).named("tap_ids"));
+            (taps_used > 0).then(|| Channel::new([length, taps_used], dtype::i32).named("tap_ids"));
         let tap_weights_out = (taps_used > 0)
             .then(|| Channel::new([length, taps_used], dtype::f32).named("tap_weights"));
+        // The model's self-conditioning inputs, at its full tap width:
+        // zeros (no signal) until the host `set`s a step's taps.
+        let cells = n * taps_width as usize;
+        let self_cond_ids =
+            Channel::from_shaped([length, taps_width], vec![0i32; cells]).named("self_cond_ids");
+        let self_cond_weights = Channel::from_shaped([length, taps_width], vec![0f32; cells])
+            .named("self_cond_weights");
 
         let fwd = ForwardPass::new();
-        fwd.canvas(Mode::Denoise)?;
+        fwd.switch(0, "mode", "denoise")?;
         fwd.embed(&toks, &embed_indptr)?;
         fwd.state(
             &[ws],
@@ -323,8 +333,12 @@ impl Block<'_> {
             },
         )?;
         fwd.readout(&readout)?;
+        fwd.input(0, "self_cond_ids", &self_cond_ids)
+            .context("bind self_cond_ids")?;
+        fwd.input(0, "self_cond_weights", &self_cond_weights)
+            .context("bind self_cond_weights")?;
         {
-            let (tap_ids_out, tap_weights_out) = (tap_ids_out.clone(), tap_weights_out.clone());
+            let (tap_ids_out, tap_weights_out) = (tap_ids_out, tap_weights_out);
             fwd.epilogue(move || {
                 slots.put(slots.take());
 
@@ -351,12 +365,12 @@ impl Block<'_> {
                 let top_by_conf = || {
                     let (_, order) = sort_desc(&conf);
                     let zeros = cast(lt(iota(length), 0u32), dtype::i32);
-                    let rank = scatter_set(&zeros, &order, &cast(iota(length), dtype::i32));
-                    lt(&rank, &reshape(count.read(), []))
+                    let rank = scatter_set(&zeros, &order, cast(iota(length), dtype::i32));
+                    lt(&rank, reshape(count.read(), []))
                 };
                 // The single most confident row, so a threshold rule always
                 // decodes something.
-                let most_confident = || eq(&conf, &reshape(reduce_max(&conf), []));
+                let most_confident = || eq(&conf, reshape(reduce_max(&conf), []));
 
                 // ── the acceptance rule ──
                 let mut release = lt(iota(length), 0u32); // rows to re-noise (remdm)
@@ -367,8 +381,8 @@ impl Block<'_> {
                         // first `count` of them, `count` the host's schedule.
                         let (_, order) = sort_desc(-&h);
                         let zeros = cast(lt(iota(length), 0u32), dtype::i32);
-                        let rank = scatter_set(&zeros, &order, &cast(iota(length), dtype::i32));
-                        lt(&rank, &reshape(count.read(), []))
+                        let rank = scatter_set(&zeros, &order, cast(iota(length), dtype::i32));
+                        lt(&rank, reshape(count.read(), []))
                     }
                     Rule::Margin => {
                         let (top2, _) = top_k(&probs, 2);
@@ -378,15 +392,15 @@ impl Block<'_> {
                         gt(&gap, margin)
                     }
                     Rule::Llada => top_by_conf(),
-                    Rule::Threshold => or(&gt(&conf, threshold), &most_confident()),
+                    Rule::Threshold => or(gt(&conf, threshold), most_confident()),
                     Rule::Remdm => {
                         // Remask: a kept row now read under `remask_conf`,
                         // with probability `remask_rate`, while the
                         // schedule is in its first four fifths.
                         let u = rng(&(&r + iota(2)), [length]);
                         let on = lt(&(&step * 5u32), max_steps * 4);
-                        let doubt = and(&lt(&conf, remask_conf), &lt(&u, remask_rate));
-                        release = and(&doubt, &reshape(on, []));
+                        let doubt = and(lt(&conf, remask_conf), lt(&u, remask_rate));
+                        release = and(&doubt, reshape(on, []));
                         top_by_conf()
                     }
                     Rule::Klass => {
@@ -397,22 +411,22 @@ impl Block<'_> {
                         );
                         // log p_t at the previous argmax, off the scaled row's max and partition sum.
                         let m = reduce_max(&scaled);
-                        let lz = log(&reduce_sum(&exp(
+                        let lz = log(reduce_sum(exp(
                             &scaled - &broadcast(reshape(&m, [length, 1]), [length, vocab])
                         )));
                         let id_before = prev_id.take();
                         let lp_at = &(&gather_row(&scaled, &id_before) - &m) - &lz; // [length]
-                        let p_before = max_elem(&prev_p.take(), 1e-30f32);
+                        let p_before = max_elem(prev_p.take(), 1e-30f32);
                         let kl = &p_before * &(&log(&p_before) - &lp_at);
-                        prev_id.put(&cast(&argmax, dtype::u32));
+                        prev_id.put(cast(&argmax, dtype::u32));
                         prev_p.put(&conf);
                         let kl_before = prev_kl.take();
                         prev_kl.put(&kl);
                         let warm = reshape(ge(&step, 2u32), []);
-                        let still = and(&and(&lt(&kl, kl_eps), &lt(&kl_before, kl_eps)), &warm);
-                        let stable = and(&still, &gt(&conf, klass_conf));
-                        let any = gt(&reduce_sum(cast(&stable, dtype::i32)), 0i32);
-                        or(&stable, &and(&most_confident(), &not(&reshape(any, []))))
+                        let still = and(and(lt(&kl, kl_eps), lt(&kl_before, kl_eps)), &warm);
+                        let stable = and(&still, gt(&conf, klass_conf));
+                        let any = gt(reduce_sum(cast(&stable, dtype::i32)), 0i32);
+                        or(&stable, and(most_confident(), not(reshape(any, []))))
                     }
                 };
 
@@ -421,13 +435,13 @@ impl Block<'_> {
 
                 // ── sticky: an accepted row keeps its token from then on ──
                 let (next, commit, all_frozen) = if sticky {
-                    let was = and(&frozen.take(), &not(&release));
+                    let was = and(frozen.take(), not(&release));
                     let ids = frozen_ids.take();
-                    let newly = and(&accept, &not(&was));
+                    let newly = and(&accept, not(&was));
                     let now = or(&was, &newly);
                     let kept = select(&was, &ids, &sampled);
                     let next = select(&now, &kept, &noise);
-                    frozen_ids.put(&select(&now, &next, -1i32));
+                    frozen_ids.put(select(&now, &next, -1i32));
                     let count_frozen = reduce_sum(cast(&now, dtype::i32));
                     frozen.put(&now);
                     let commit = select(&now, &next, &argmax);
@@ -450,21 +464,21 @@ impl Block<'_> {
                 stable_run.put(&run_next);
                 let mean = &reduce_sum(&h) / (length as f32);
                 let confident = reshape(lt(&mean, confidence), [1]);
-                let done = or(&and(&ge(&run_next, stability), &confident), &all_frozen);
+                let done = or(and(ge(&run_next, stability), &confident), &all_frozen);
 
                 if let (Some(ids_out), Some(weights_out)) = (&tap_ids_out, &tap_weights_out) {
                     // Top ids of the scaled row (the softmax's ids) and their
                     // probabilities off the row's max and partition sum, so
                     // `probs` need not be read by a library op here.
                     let m = reduce_max(&scaled);
-                    let z = reduce_sum(&exp(
+                    let z = reduce_sum(exp(
                         &scaled - &broadcast(reshape(&m, [length, 1]), [length, vocab])
                     ));
                     let (top_vals, tap_ids) = top_k(&scaled, taps_used);
                     let tap_weights =
                         &exp(&top_vals - &broadcast(reshape(&m, [length, 1]), [length, taps_used]))
                             / &broadcast(reshape(&z, [length, 1]), [length, taps_used]);
-                    ids_out.put(&tap_ids);
+                    ids_out.put(cast(&tap_ids, dtype::i32));
                     weights_out.put(&tap_weights);
                 }
                 canvas_out.put(&next);
@@ -514,7 +528,7 @@ impl Block<'_> {
             mean = mean_out.take_host::<f32>().await.context("entropy drain")?;
             let taps_data = match (&tap_ids_out, &tap_weights_out) {
                 (Some(ids), Some(weights)) => Some((
-                    ids.take_host::<Vec<u32>>().await.context("tap ids drain")?,
+                    ids.take_host::<Vec<i32>>().await.context("tap ids drain")?,
                     weights
                         .take_host::<Vec<f32>>()
                         .await
@@ -534,11 +548,13 @@ impl Block<'_> {
                 // The host wants the model's full width per row; pad the
                 // narrower staging with zero-weight taps.
                 if taps_used == taps_width {
-                    fwd.self_conditioning(&ids, &weights)
-                        .context("stage self-conditioning")?;
+                    self_cond_ids.set(ids).context("set self_cond_ids")?;
+                    self_cond_weights
+                        .set(weights)
+                        .context("set self_cond_weights")?;
                 } else {
                     let (w, u) = (taps_width as usize, taps_used as usize);
-                    let mut full_ids = vec![0u32; n * w];
+                    let mut full_ids = vec![0i32; n * w];
                     let mut full_weights = vec![0f32; n * w];
                     for row in 0..n {
                         full_ids[row * w..row * w + u]
@@ -546,8 +562,10 @@ impl Block<'_> {
                         full_weights[row * w..row * w + u]
                             .copy_from_slice(&weights[row * u..(row + 1) * u]);
                     }
-                    fwd.self_conditioning(&full_ids, &full_weights)
-                        .context("stage self-conditioning")?;
+                    self_cond_ids.set(full_ids).context("set self_cond_ids")?;
+                    self_cond_weights
+                        .set(full_weights)
+                        .context("set self_cond_weights")?;
                 }
             }
         }
@@ -560,16 +578,26 @@ impl Block<'_> {
     }
 }
 
+fn self_cond_taps() -> Result<u32> {
+    let lane = model::lane_of(&[("mode", "denoise")])?;
+    let input = lane
+        .inputs
+        .iter()
+        .find(|input| input.name == "self_cond_ids");
+    Ok(input
+        .ok_or("the denoise lane reads no `self_cond_ids` input")?
+        .width)
+}
+
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Diffusion {
+    if !model::switch("mode").is_some_and(|mode| mode.values.iter().any(|v| v == "denoise")) {
         return Err(
             "this program drives a block-diffusion model; the bound model is not one".into(),
         );
     }
-    let shape = model::canvas().ok_or("a diffusion model states its canvas")?;
-    let length = shape.length;
-    let taps_width = shape.self_cond_taps;
+    let length = CANVAS;
+    let taps_width = self_cond_taps()?;
     let taps_used = input.taps.unwrap_or(taps_width).min(taps_width);
     // The canvas attends both ways, so the runtime cannot cut it: one fire reads every row.
     let readable = max_readout_rows(model::ReadoutKind::Logits);
@@ -712,7 +740,7 @@ async fn main(input: Input) -> Result<Output> {
     })
 }
 
-/// One `encode` pass over `tokens` at slots `base..`: the causal reading,
+/// One `encode` pass over `tokens` at slots `base..`: the default `encode` mode,
 /// whose K/V become the sequence and freeze. With `quality`, every row is read
 /// out and the mean log-probability of `tokens[1..]` under the rows that
 /// predict them comes back; otherwise only the last row is read (a pass
@@ -732,7 +760,6 @@ async fn encode(
     let slots = Channel::from_iter(base..base + len).named("slots_e");
 
     let fwd = ForwardPass::new();
-    fwd.canvas(Mode::Encode)?;
     fwd.embed(&toks, &embed_indptr)?;
     fwd.state(
         &[ws],
@@ -756,7 +783,7 @@ async fn encode(
         let denom = (len - 1) as f32;
         fwd.epilogue(move || {
             let lp = log_softmax(intrinsics::logits()); // [len, vocab]
-            let picks = gather_row(&lp, &next.read()); // [len]
+            let picks = gather_row(&lp, next.read()); // [len]
             let mean = &reduce_sum(&(&picks * &weight.read())) / denom;
             q_out.put(reshape(&mean, [1]));
         });

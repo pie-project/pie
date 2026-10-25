@@ -8,15 +8,15 @@
 //!
 //! A class's lanes are synthetic as engine-cuda's arming lanes are
 //! (`serve/arming.rs`): a representative request of the class (its word,
-//! mask, adapter, drafts, score capture), zero tokens, fresh pages; a class
-//! that reads float ports is fed zero cells of each port's width, a class
+//! mask, adapter, score capture, switches), zero tokens, fresh pages; a class
+//! that reads guest inputs is fed zero cells of each input's width, a class
 //! over the voxel axis one clip, a class that lands media one image.
 
 use engine::fire::{Mask, Masking};
-use poem_ir::{Facts, Request, Stream};
+use poem_ir::{Facts, Request};
 
 use super::{Lane, Media, PATCH_ROUTE_DROP, Seated, Shell};
-use crate::dit::{Clips, PortCell, SelfCond};
+use crate::dit::{Clips, InputCell};
 use crate::error::Result;
 
 /// One dry fire: which class, at how many rows, and what came of it.
@@ -35,47 +35,16 @@ pub struct Probe {
 }
 
 /// Every request shape the arming pass enumerates (engine-cuda
-/// `exports::landing_requests`), by the class it lands in.
+/// `exports::landing_requests`), by the class it lands in, the plainest
+/// first.
 #[must_use]
 pub fn landing(facts: &Facts, classes: &poem_ir::ClassTable) -> Vec<Vec<Request>> {
     let mut landing = vec![Vec::new(); classes.classes.len()];
-    let readings: Vec<Option<&str>> = std::iter::once(None)
-        .chain(facts.values(poem_ir::Request::READING).map(Some))
-        .collect();
-    for reading in readings {
-        for stream in Stream::ALL {
-            for bits in 0..256u32 {
-                let request = Request::new(if bits & 1 == 0 { 1 } else { 2 }, bits & 2 != 0)
-                    .adapted(bits & 4 != 0)
-                    .drafting(bits & 8 != 0)
-                    .capturing_scores(bits & 16 != 0)
-                    .with_media(bits & 32 != 0)
-                    .denoising(bits & 64 != 0)
-                    .drafting_a_block(bits & 128 != 0)
-                    .on_stream(stream);
-                let request = match reading {
-                    Some(name) => request.in_reading(name),
-                    None => request,
-                };
-                let word = facts.word(&request) & classes.mask;
-                if let Some(class) = classes.class_of(word) {
-                    landing[class].push(request);
-                }
-            }
+    for request in facts.requests() {
+        let word = facts.word(&request) & classes.mask;
+        if let Some(class) = classes.class_of(word) {
+            landing[class].push(request);
         }
-    }
-    for requests in &mut landing {
-        requests.sort_by_key(|r| {
-            u32::from(r.has_custom_mask())
-                + u32::from(r.has_adapter())
-                + u32::from(r.drafts())
-                + u32::from(r.captures_scores())
-                + u32::from(r.has_media())
-                + u32::from(r.denoise())
-                + u32::from(r.drafts_a_block())
-                + u32::from(r.stream() != Stream::Text)
-                + u32::from(r.reading().is_some())
-        });
     }
     landing
 }
@@ -89,13 +58,10 @@ struct Owned {
     mask: Option<Masking>,
     adapter: Option<u32>,
     captures: bool,
-    stream: u8,
-    ports: Vec<(engine::fire::PortKind, u8, Vec<f32>)>,
-    self_cond: Option<(u32, Vec<i32>, Vec<f32>)>,
+    inputs: Vec<(u32, Vec<u8>)>,
     clip: Option<([u32; 3], Vec<u8>)>,
     media: Option<OwnedMedia>,
     kv_less: bool,
-    bidirectional: bool,
     /// A block drafter reads every row back.
     readout: Option<Vec<u32>>,
 }
@@ -131,7 +97,7 @@ impl Shell {
                 requests
                     .iter()
                     .find(|r| (r.query_len() != 1) == prefill && !r.has_media())
-                    .copied()
+                    .cloned()
             };
             // (request, rows per lane, lanes)
             let mut shapes: Vec<(Request, u32, u32)> = Vec::new();
@@ -142,13 +108,14 @@ impl Shell {
                 shapes.push((request, 1, 3));
             }
             if self.patch_seat.is_some()
-                && let Some(media) = requests.iter().find(|r| r.has_media()).copied()
+                && let Some(media) = requests.iter().find(|r| r.has_media()).cloned()
             {
                 shapes.push((media, prefill.max(16), 1));
             }
             for (request, rows, lanes) in shapes {
                 let before = self.device().dry_texts().len();
-                let fired = self.dry_fire(class, request, facts.word(&request), rows, lanes);
+                let word = facts.word(&request);
+                let fired = self.dry_fire(class, &request, word, rows, lanes);
                 let finite = match (&fired, self.device().is_dry()) {
                     (Ok(fired), false) => {
                         let values = fired
@@ -184,7 +151,7 @@ impl Shell {
     fn dry_fire(
         &mut self,
         class: usize,
-        request: Request,
+        request: &Request,
         word: u64,
         rows: u32,
         lanes: u32,
@@ -197,16 +164,12 @@ impl Shell {
         let owned: Vec<Owned> = (0..lanes)
             .map(|at| self.dry_lane(class, request, word, rows, at))
             .collect::<Result<_>>()?;
-        let cells: Vec<Vec<PortCell<'_>>> = owned
+        let cells: Vec<Vec<InputCell<'_>>> = owned
             .iter()
             .map(|lane| {
-                lane.ports
+                lane.inputs
                     .iter()
-                    .map(|(kind, port, values)| PortCell {
-                        kind: *kind,
-                        port: *port,
-                        values,
-                    })
+                    .map(|(id, bytes)| InputCell { id: *id, bytes })
                     .collect()
             })
             .collect();
@@ -223,20 +186,9 @@ impl Shell {
             seated.mask = lane_owned.mask.as_ref();
             seated.adapter = lane_owned.adapter;
             seated.captures_scores = lane_owned.captures;
-            seated.stream = lane_owned.stream;
-            seated.ports = &cells[at];
+            seated.inputs = &cells[at];
             seated.kv_less = lane_owned.kv_less;
-            seated.bidirectional = lane_owned.bidirectional;
             seated.readout = lane_owned.readout.as_deref();
-            seated.self_cond =
-                lane_owned
-                    .self_cond
-                    .as_ref()
-                    .map(|(taps, rows, weights)| SelfCond {
-                        taps: *taps,
-                        rows,
-                        weights,
-                    });
             seated.media = lane_owned.media.as_ref().map(|m| Media {
                 rows: &m.rows,
                 patches: &m.patches,
@@ -264,7 +216,7 @@ impl Shell {
     fn dry_lane(
         &self,
         class: usize,
-        request: Request,
+        request: &Request,
         word: u64,
         rows: u32,
         lane: u32,
@@ -302,19 +254,14 @@ impl Shell {
         } else {
             Vec::new()
         };
-        let ports = dit
-            .dry_ports(class)
+        let inputs = dit
+            .dry_inputs(class)
             .into_iter()
-            .map(|(kind, port, width, per_lane)| {
-                let n = if per_lane { 1 } else { rows } as usize * width as usize;
-                (kind, port, vec![0f32; n])
+            .map(|seat| {
+                let n = if seat.per_lane() { 1 } else { rows } as usize;
+                (seat.id, vec![0u8; n * seat.row_bytes() as usize])
             })
             .collect();
-        let taps = dit.dry_self_cond_taps();
-        let self_cond = (taps > 0 && request.denoise()).then(|| {
-            let n = rows as usize * taps as usize;
-            (taps, vec![0i32; n], vec![0f32; n])
-        });
         let media = if request.has_media() {
             self.dry_media(rows)
         } else {
@@ -332,11 +279,9 @@ impl Shell {
                 .then(|| Masking::Extent(Mask::new(vec![0, rows], u64::from(rows)))),
             adapter: self.corrected.contains(class).then_some(0),
             captures: self.capturing.contains(class),
-            bidirectional: request.drafts_a_block(),
-            readout: request.drafts_a_block().then(|| (0..rows).collect()),
-            stream: request.stream().code(),
-            ports,
-            self_cond,
+            readout: (self.trace().drafter.is_some() && !request.switches().is_empty())
+                .then(|| (0..rows).collect()),
+            inputs,
             clip,
             media,
             kv_less: !self.dry_class_has_kv(class),

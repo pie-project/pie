@@ -319,6 +319,14 @@ impl Run<'_> {
                 act: poem_ir::ActFn::Tanh,
                 ..
             } => elemwise::pointwise::tanh(self.ctx(), self.tensor(*x), self.tensor(*x)),
+            Elemwise::Act {
+                x,
+                x_out: _,
+                s: None,
+                scale: None,
+                act: poem_ir::ActFn::Sqrt,
+                ..
+            } => elemwise::pointwise::sqrt(self.ctx(), self.tensor(*x), self.tensor(*x)),
             Elemwise::Hadamard {
                 x,
                 x_out: _,
@@ -334,26 +342,21 @@ impl Run<'_> {
                 x,
                 y,
                 z,
-                op: poem_ir::BinaryOp::Mul,
-                ..
-            } => elemwise::pointwise::mul(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*y),
-                self.tensor(*z),
-            ),
-            Elemwise::Binary {
-                x,
-                y,
-                z,
-                op: poem_ir::BinaryOp::Add,
-                ..
-            } => elemwise::pointwise::add(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*y),
-                self.tensor(*z),
-            ),
+                op: binary,
+            } => {
+                let f = match binary {
+                    poem_ir::BinaryOp::Add => elemwise::pointwise::add,
+                    poem_ir::BinaryOp::Mul => elemwise::pointwise::mul,
+                    poem_ir::BinaryOp::Div => elemwise::pointwise::div,
+                    poem_ir::BinaryOp::Mod => elemwise::pointwise::modulo,
+                };
+                f(
+                    self.ctx(),
+                    self.tensor(*x),
+                    self.tensor(*y),
+                    self.tensor(*z),
+                )
+            }
             Elemwise::RopeAxes {
                 x,
                 positions,

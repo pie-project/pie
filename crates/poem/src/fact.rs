@@ -1,21 +1,13 @@
-//! The facts a program branches its rows on.
-//!
-//! A builtin fact is one the runtime derives from what a lane carries, so an
-//! inferlet cannot state it apart from the buffers a kernel reads under it. A
-//! custom fact is one the program names and an inferlet sets; the names here
-//! are the ones every family shares.
-
 use std::ops::{BitAnd, Not};
 
-use poem_ir::{Builtin, Guard, Request, Stream};
+use poem_ir::{Builtin, Guard};
 
 pub use poem_ir::Builtin::{Adapted as Adapter, Masked as Mask, Media};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Predicate {
     Builtin(Builtin),
-    Flag(String),
-    Choice(String, String),
+    Switch(String, String),
     Not(Box<Predicate>),
     And(Box<Predicate>, Box<Predicate>),
 }
@@ -26,8 +18,7 @@ impl Predicate {
     pub fn guard(&self, facts: &mut poem_ir::Facts) -> Guard {
         match self {
             Predicate::Builtin(builtin) => facts.builtin(*builtin),
-            Predicate::Flag(name) => facts.flag(name),
-            Predicate::Choice(name, value) => facts.choice(name, value),
+            Predicate::Switch(name, value) => facts.switch(name, value),
             Predicate::Not(a) => !a.guard(facts),
             Predicate::And(a, b) => Guard::and(a.guard(facts), b.guard(facts)),
         }
@@ -38,8 +29,8 @@ impl Predicate {
 #[must_use]
 pub fn has(what: Builtin) -> Predicate {
     assert!(
-        what != Builtin::SingleToken,
-        "a single token is a count, not a buffer; it is `single_token()`"
+        matches!(what, Builtin::Masked | Builtin::Adapted | Builtin::Media),
+        "a lane carries a mask, adapter routes or media, not {what:?}"
     );
     Predicate::Builtin(what)
 }
@@ -50,54 +41,31 @@ pub fn single_token() -> Predicate {
     Predicate::Builtin(Builtin::SingleToken)
 }
 
-/// The rows whose inferlet turned the flag `name` on.
-#[must_use]
-pub fn flag(name: &str) -> Predicate {
-    Predicate::Flag(name.to_string())
-}
-
-/// The rows whose inferlet set the choice `name` to `value`.
-#[must_use]
-pub fn choice(name: &str, value: &str) -> Predicate {
-    Predicate::Choice(name.to_string(), value.to_string())
-}
-
 #[must_use]
 pub fn drafts() -> Predicate {
-    flag(Request::DRAFTS)
-}
-
-#[must_use]
-pub fn block_draft() -> Predicate {
-    flag(Request::BLOCK_DRAFT)
+    Predicate::Builtin(Builtin::Drafts)
 }
 
 #[must_use]
 pub fn scores() -> Predicate {
-    flag(Request::SCORES)
-}
-
-#[must_use]
-pub fn bidirectional() -> Predicate {
-    flag(Request::BIDIRECTIONAL)
+    Predicate::Builtin(Builtin::Scores)
 }
 
 /// The rows of a prompt only a causal encoder-decoder's encoder reads.
 #[must_use]
 pub fn encode() -> Predicate {
-    flag(Request::ENCODE)
+    Predicate::Builtin(Builtin::Encode)
 }
 
-/// The rows of the stream `stream`.
+/// Cursor 0: this fire starts the recurrent state from zeros.
 #[must_use]
-pub fn stream(stream: Stream) -> Predicate {
-    choice(Request::STREAM, stream.name())
+pub fn fresh() -> Predicate {
+    Predicate::Builtin(Builtin::Fresh)
 }
 
-/// The rows of the reading `name`.
 #[must_use]
-pub fn reading(name: &str) -> Predicate {
-    choice(Request::READING, name)
+pub fn switch_is(name: &str, value: &str) -> Predicate {
+    Predicate::Switch(name.to_string(), value.to_string())
 }
 
 impl BitAnd for Predicate {

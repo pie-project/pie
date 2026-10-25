@@ -37,6 +37,7 @@ fn check(gpu: &Gpu, boxes: &[Box3], c: usize, groups: usize, silu: bool) {
         eps,
         silu,
         &mut o,
+        0,
     )
     .expect("the norm fires");
     for (i, (&g, &w)) in gpu.read(&o).iter().zip(&want).enumerate() {

@@ -227,8 +227,7 @@ fn attach(fwd: &ForwardPass, w: &Weights, surface: &str, form: &str) -> Result<(
     if form == "scale" {
         let l = w.scale_channel();
         return fwd
-            .adapter(Site::O, |_x, y| inferlet::eta::adapter::scale(y, &l))
-            .map_err(|e| e.into());
+            .adapter(Site::O, |_x, y| inferlet::eta::adapter::scale(y, &l));
     }
     let (a, b) = w.channels();
     if surface == "sink" {
@@ -243,7 +242,6 @@ fn attach(fwd: &ForwardPass, w: &Weights, surface: &str, form: &str) -> Result<(
     // The CURRENT library SPELLING: a closed expression the surface CLASSIFIES —
     // never interprets — into the low-rank lowering `y + mm(b, mm(a, x))`.
     fwd.adapter(Site::O, |x, y| y + mm(&b, mm(&a, x)))
-        .map_err(|e| e.into())
 }
 
 #[inferlet::main]

@@ -980,6 +980,7 @@ pub(crate) static OPS: &[Op] = &[
             "sm_scale",
             "window",
             "sinks",
+            "causal",
             "mask",
             "scores",
             "scores_seam",
@@ -997,6 +998,7 @@ pub(crate) static OPS: &[Op] = &[
             let sm_scale: f32 = a.next()?;
             let window: Option<u32> = a.next()?;
             let sinks: Option<Weight> = a.next()?;
+            let causal: Option<Predicate> = a.next()?;
             let mask: Option<bool> = a.next()?;
             let scores: Option<bool> = a.next()?;
             let scores_seam: Option<bool> = a.next()?;
@@ -1016,6 +1018,7 @@ pub(crate) static OPS: &[Op] = &[
                         sm_scale,
                         window,
                         sinks.as_ref(),
+                        causal.as_ref(),
                         mask.unwrap_or(false),
                         scores.unwrap_or(false),
                         scores_seam,
@@ -1253,6 +1256,20 @@ pub(crate) static OPS: &[Op] = &[
                 dsl("conv.unpatchify", || {
                     ops::conv::unpatchify(&x, &tgrid, p, &grid)
                 })?,
+            )
+        },
+    },
+    Op {
+        module: "conv",
+        name: "cells",
+        params: &["tgrid", "positions", "axis"],
+        call: |a, heap| {
+            let tgrid: Value = a.next()?;
+            let positions: Value = a.next()?;
+            let axis: u32 = a.next()?;
+            result(
+                heap,
+                dsl("conv.cells", || ops::conv::cells(&tgrid, &positions, axis))?,
             )
         },
     },
@@ -2030,6 +2047,35 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "elemwise",
+        name: "div",
+        params: &["x", "y"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let y: Value = a.next()?;
+            result(heap, dsl("elemwise.div", || ops::elemwise::div(&x, &y))?)
+        },
+    },
+    Op {
+        module: "elemwise",
+        name: "mod",
+        params: &["x", "y"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let y: Value = a.next()?;
+            result(heap, dsl("elemwise.mod", || ops::elemwise::mod_(&x, &y))?)
+        },
+    },
+    Op {
+        module: "elemwise",
+        name: "sqrt",
+        params: &["x"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            result(heap, dsl("elemwise.sqrt", || ops::elemwise::sqrt(&x))?)
+        },
+    },
+    Op {
+        module: "elemwise",
         name: "rope_axes",
         params: &[
             "x",
@@ -2146,6 +2192,39 @@ pub(crate) static OPS: &[Op] = &[
             result(
                 heap,
                 dsl("gather.split_rows", || ops::gather::split_rows(&x, width))?,
+            )
+        },
+    },
+    Op {
+        module: "gather",
+        name: "group_rows",
+        params: &["csr", "groups", "lanes"],
+        call: |a, heap| {
+            let csr: Value = a.next()?;
+            let groups: Value = a.next()?;
+            let lanes: Value = a.next()?;
+            result(
+                heap,
+                dsl("gather.group_rows", || {
+                    ops::gather::group_rows(&csr, &groups, &lanes)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "gather",
+        name: "group_first",
+        params: &["x", "csr", "groups", "lanes"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let csr: Value = a.next()?;
+            let groups: Value = a.next()?;
+            let lanes: Value = a.next()?;
+            result(
+                heap,
+                dsl("gather.group_first", || {
+                    ops::gather::group_first(&x, &csr, &groups, &lanes)
+                })?,
             )
         },
     },
@@ -3079,34 +3158,6 @@ pub(crate) static INPUTS: &[Op] = &[
     },
     Op {
         module: "inputs",
-        name: "self_cond_rows",
-        params: &["inputs", "taps"],
-        call: |a, heap| {
-            let inputs: Input = a.next()?;
-            let taps: u32 = a.next()?;
-            result(
-                heap,
-                dsl("inputs.self_cond_rows", || inputs.self_cond_rows(taps))?,
-            )
-        },
-    },
-    Op {
-        module: "inputs",
-        name: "self_cond_weights",
-        params: &["inputs", "taps"],
-        call: |a, heap| {
-            let inputs: Input = a.next()?;
-            let taps: u32 = a.next()?;
-            result(
-                heap,
-                dsl("inputs.self_cond_weights", || {
-                    inputs.self_cond_weights(taps)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "inputs",
         name: "kv_indptr",
         params: &["inputs"],
         call: |a, heap| {
@@ -3197,18 +3248,6 @@ pub(crate) static INPUTS: &[Op] = &[
     },
     Op {
         module: "inputs",
-        name: "reference_tags",
-        params: &["inputs"],
-        call: |a, heap| {
-            let inputs: Input = a.next()?;
-            result(
-                heap,
-                dsl("inputs.reference_tags", || inputs.reference_tags())?,
-            )
-        },
-    },
-    Op {
-        module: "inputs",
         name: "row_permutation",
         params: &["inputs"],
         call: |a, heap| {
@@ -3216,62 +3255,6 @@ pub(crate) static INPUTS: &[Op] = &[
             result(
                 heap,
                 dsl("inputs.row_permutation", || inputs.row_permutation())?,
-            )
-        },
-    },
-    Op {
-        module: "inputs",
-        name: "latents",
-        params: &["inputs", "port", "width", "dtype"],
-        call: |a, heap| {
-            let inputs: Input = a.next()?;
-            let port: u8 = a.next()?;
-            let width: u32 = a.next()?;
-            let dtype: Dtype = a.next()?;
-            result(
-                heap,
-                dsl("inputs.latents", || inputs.latents(port, width, dtype))?,
-            )
-        },
-    },
-    Op {
-        module: "inputs",
-        name: "lane_vector",
-        params: &["inputs", "port", "width"],
-        call: |a, heap| {
-            let inputs: Input = a.next()?;
-            let port: u8 = a.next()?;
-            let width: u32 = a.next()?;
-            result(
-                heap,
-                dsl("inputs.lane_vector", || inputs.lane_vector(port, width))?,
-            )
-        },
-    },
-    Op {
-        module: "inputs",
-        name: "context",
-        params: &["inputs", "port", "width"],
-        call: |a, heap| {
-            let inputs: Input = a.next()?;
-            let port: u8 = a.next()?;
-            let width: u32 = a.next()?;
-            result(heap, dsl("inputs.context", || inputs.context(port, width))?)
-        },
-    },
-    Op {
-        module: "inputs",
-        name: "axis_positions",
-        params: &["inputs", "port", "axes"],
-        call: |a, heap| {
-            let inputs: Input = a.next()?;
-            let port: u8 = a.next()?;
-            let axes: u8 = a.next()?;
-            result(
-                heap,
-                dsl("inputs.axis_positions", || {
-                    inputs.axis_positions(port, axes)
-                })?,
             )
         },
     },
@@ -3286,16 +3269,20 @@ pub(crate) static INPUTS: &[Op] = &[
     },
     Op {
         module: "inputs",
-        name: "voxels",
-        params: &["inputs", "port", "channels", "dtype"],
+        name: "input",
+        params: &["inputs", "name", "dtype", "axis", "width", "rows"],
         call: |a, heap| {
             let inputs: Input = a.next()?;
-            let port: u8 = a.next()?;
-            let channels: u32 = a.next()?;
+            let name: String = a.next()?;
             let dtype: Dtype = a.next()?;
+            let axis: poem_ir::InputAxis = a.next()?;
+            let width: u32 = a.next()?;
+            let rows: Option<poem_ir::RowCount> = a.next()?;
             result(
                 heap,
-                dsl("inputs.voxels", || inputs.voxels(port, channels, dtype))?,
+                dsl("inputs.input", || {
+                    inputs.input(&name, dtype, axis, width, rows)
+                })?,
             )
         },
     },

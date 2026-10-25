@@ -1,5 +1,5 @@
 use eta_ir::container::HostRole;
-use eta_ir::registry::ModelProfile;
+use eta_ir::registry::{EngineCaps, Graph, Readout, ReadoutKind};
 use eta_ir::validate::bind;
 
 use eta_dsl::builder::Builder;
@@ -9,15 +9,18 @@ use eta_dsl::{Channel, Traced};
 const ROWS: u32 = 16;
 const WIDTH: u32 = 8;
 
-fn profile(has_velocity: bool) -> ModelProfile {
-    ModelProfile {
-        vocab: 32,
-        page_size: 2,
-        num_layers: 2,
-        has_velocity,
-        velocity_width: WIDTH,
-        ..ModelProfile::dummy()
-    }
+fn lane(velocity: bool) -> Vec<Option<Readout>> {
+    vec![Some(if velocity {
+        Readout {
+            kind: ReadoutKind::Velocity,
+            width: WIDTH,
+        }
+    } else {
+        Readout {
+            kind: ReadoutKind::Logits,
+            width: 32,
+        }
+    })]
 }
 
 fn float_lane() -> (Traced, [Channel; 4]) {
@@ -32,7 +35,6 @@ fn float_lane() -> (Traced, [Channel; 4]) {
     let (px, pt, pc) = (x.clone(), t.clone(), ctx.clone());
     let (ex, et, eo) = (x.clone(), t.clone(), out.clone());
     let mut b = Builder::new(32, 2);
-    b.rows_hint(ROWS);
     b.stage(Stage::Prologue, move || {
         let _ = px.read();
         let _ = pt.read();
@@ -41,11 +43,11 @@ fn float_lane() -> (Traced, [Channel; 4]) {
     b.stage(Stage::Epilogue, move || {
         let k = step.take();
         let x_cur = reshape(ex.take(), [ROWS, WIDTH]);
-        let v = intrinsics::velocity(WIDTH);
+        let v = intrinsics::velocity(0, ROWS, WIDTH);
         assert_eq!(
             v.shape().dims(),
             &[ROWS, WIDTH],
-            "velocity sized by the rows hint"
+            "velocity sized by its lane's rows"
         );
         let dt = gather(dts.read(), &k);
         let next = &x_cur + &(&v * &broadcast(&dt, [ROWS, WIDTH]));
@@ -65,7 +67,7 @@ fn float_lane() -> (Traced, [Channel; 4]) {
 }
 
 #[test]
-fn a_float_lane_program_traces_and_binds_under_a_velocity_profile() {
+fn a_float_lane_program_traces_and_binds_on_a_velocity_lane() {
     let (traced, [x, t, ctx, out]) = float_lane();
     let container = traced.container();
     assert!(
@@ -87,9 +89,21 @@ fn a_float_lane_program_traces_and_binds_under_a_velocity_profile() {
     assert_eq!(decl(&t).host_role, HostRole::None);
     assert_eq!(decl(&out).host_role, HostRole::Reader);
 
-    bind(container.clone(), profile(true)).expect("binds under a profile stating the velocity");
+    bind(
+        container.clone(),
+        lane(true),
+        Graph::default(),
+        EngineCaps::default(),
+    )
+    .expect("binds on a lane reading out the velocity");
     assert!(
-        bind(container.clone(), profile(false)).is_err(),
-        "a text profile refuses `velocity()` at bind"
+        bind(
+            container.clone(),
+            lane(false),
+            Graph::default(),
+            EngineCaps::default()
+        )
+        .is_err(),
+        "a lane reading logits refuses `velocity()` at bind"
     );
 }

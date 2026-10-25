@@ -3,8 +3,8 @@ use std::ops::Mul;
 use std::rc::Rc;
 
 use poem_ir::{
-    CacheRow, Def, Dim, Dtype, Guard, Node, Operands, Operation, Param, ParamLayout, ParamSource,
-    Platform, RuntimeInput, Seam, Shard, Trace, Ty, ValueDecl, ValueId,
+    CacheRow, Def, Dim, Dtype, Guard, InputAxis, Node, Operands, Operation, Param, ParamLayout,
+    ParamSource, Platform, RuntimeInput, Seam, Shard, Trace, Ty, ValueDecl, ValueId,
 };
 
 use crate::declare::Weight;
@@ -68,6 +68,7 @@ impl Recorder {
                 drafter: None,
                 seams: Vec::new(),
                 facts: poem_ir::Facts::default(),
+                inputs: Vec::new(),
             })),
             at: Rc::new(Cell::new(None)),
             once: Rc::default(),
@@ -260,6 +261,68 @@ impl Recorder {
         }
     }
 
+    /// The guest input `name`; a second read must state it alike.
+    pub fn guest(
+        &self,
+        name: &str,
+        dtype: Dtype,
+        axis: InputAxis,
+        width: u32,
+        rows: Option<poem_ir::RowCount>,
+    ) -> Value {
+        let id = {
+            let mut p = self.inner.borrow_mut();
+            match p.inputs.iter().position(|input| input.name == name) {
+                Some(id) => {
+                    let stated = p
+                        .values
+                        .iter()
+                        .find_map(|v| match v.def {
+                            Def::Input(RuntimeInput::Guest { id: seen, .. })
+                                if seen as usize == id =>
+                            {
+                                Some(v.def.clone())
+                            }
+                            _ => None,
+                        })
+                        .expect("a named input has its value");
+                    let want = Def::Input(RuntimeInput::Guest {
+                        id: id as u32,
+                        axis,
+                        width,
+                        dtype,
+                    });
+                    assert!(
+                        stated == want && p.inputs[id].rows == rows,
+                        "input `{name}` is read as {stated:?} (rows {:?}) and as {want:?} (rows \
+                         {rows:?}); one name is one input",
+                        p.inputs[id].rows
+                    );
+                    id
+                }
+                None => {
+                    p.inputs.push(poem_ir::GuestInput {
+                        name: name.to_string(),
+                        rows,
+                    });
+                    p.inputs.len() - 1
+                }
+            }
+        };
+        self.input(
+            RuntimeInput::Guest {
+                id: u32::try_from(id).expect("fewer than 2^32 inputs"),
+                axis,
+                width,
+                dtype,
+            },
+            Ty::Tensor {
+                shape: vec![axis.dim(), Dim::Const(u64::from(width))],
+                dtype,
+            },
+        )
+    }
+
     pub fn block_drafter(&self, facts: poem_ir::BlockDrafter) {
         let mut inner = self.inner.borrow_mut();
         match inner.drafter {
@@ -286,6 +349,12 @@ impl Recorder {
             .seams
             .iter()
             .any(|seam| seam.seam == name && seam.values.contains(&value.id))
+    }
+
+    pub fn declare_switch(&self, name: &str, values: &[&str]) {
+        if let Err(why) = self.inner.borrow_mut().facts.declare(name, values) {
+            panic!("{why}");
+        }
     }
 
     /// The guard over the rows `predicate` holds for, its facts given bits
@@ -345,9 +414,7 @@ impl Recorder {
 }
 
 /// A node reading a buffer a lane may not carry, on rows whose lanes are not
-/// known to carry it. Which rows carry a mask or adapter routes is a builtin
-/// fact; a custom fact an inferlet sets says nothing about them, so a kernel
-/// reading one runs only where its builtin holds.
+/// known to carry it: only a runtime switch says which lanes carry a mask or adapter routes.
 fn unguarded_read(plan: &Trace) -> Option<String> {
     let mut ins = Vec::new();
     for (j, node) in plan.nodes.iter().enumerate() {

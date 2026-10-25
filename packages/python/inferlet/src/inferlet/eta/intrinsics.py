@@ -50,36 +50,24 @@ def mtp_drafts(n: int) -> Tensor:
     return intrinsic_val(Intrinsic.MTP_DRAFTS, shape_of([max(n, 1)]), Dtype.I32)
 
 
-def hidden(width: int) -> Tensor:
-    """The residual stream at read-out (epilogue), `[n_out, width]`."""
-    rows = max(current_rows(), 1)
-    return intrinsic_val(Intrinsic.HIDDEN, shape_of([rows, max(width, 1)]), activation_type)
+def hidden(lane: int, rows: int, width: int) -> Tensor:
+    """The `rows` hidden rows lane `lane` of the pass reads out, `width` wide."""
+    return intrinsic_val(Intrinsic.HIDDEN, shape_of([max(rows, 1), max(width, 1)]), activation_type, lane)
 
 
-def velocity(width: int) -> Tensor:
-    """The flow-matching velocity a denoise reading predicts, `[n_out, width]`
-    F32 at the epilogue. `width` is declared, as `hidden`'s is, but bind
-    checks it against the model's `velocity_width`."""
-    rows = max(current_rows(), 1)
-    return intrinsic_val(Intrinsic.VELOCITY, shape_of([rows, max(width, 1)]), activation_type)
+def velocity(lane: int, rows: int, width: int) -> Tensor:
+    """The velocity lane `lane` predicts, `[rows, width]`."""
+    return intrinsic_val(Intrinsic.VELOCITY, shape_of([max(rows, 1), max(width, 1)]), activation_type, lane)
 
 
-def pixels(rows: int, width: int) -> Tensor:
-    """The pixels a VAE reading lands, `[rows, width]` F32 at the
-    epilogue: one row per OUTPUT voxel of the lane's clip. `rows` is declared
-    (a VAE lane has no token rows to derive it from); `width` is checked at
-    bind against the model's `pixels_width` when it states one."""
-    return intrinsic_val(Intrinsic.PIXELS, shape_of([max(rows, 1), max(width, 1)]), activation_type)
+def pixels(lane: int, rows: int, width: int) -> Tensor:
+    """The pixels lane `lane`'s VAE decode lands, one `[rows, width]` row per output voxel."""
+    return intrinsic_val(Intrinsic.PIXELS, shape_of([max(rows, 1), max(width, 1)]), activation_type, lane)
 
 
 def query(width: int) -> Tensor:
     """This layer's projected query (attn taps), `[width]`."""
     return intrinsic_val(Intrinsic.QUERY, shape_of([max(width, 1)]), activation_type)
-
-
-def value_head() -> Tensor:
-    """Model-gated scalar value head (epilogue), `[rows]`."""
-    return intrinsic_val(Intrinsic.VALUE_HEAD, shape_of([max(current_rows(), 1)]), Dtype.F32)
 
 
 def layer() -> Tensor:

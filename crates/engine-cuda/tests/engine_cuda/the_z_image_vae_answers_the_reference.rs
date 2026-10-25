@@ -41,7 +41,7 @@ fn fire(
     keep_what_reads(&mut contract, &trace);
     let word = trace
         .facts
-        .word(&poem::Request::new(1, false).on_stream(poem::Stream::Image));
+        .word(&poem::Request::new(1, false).switched("stream", "image"));
     let started = Instant::now();
     let mut shell = common_vae::load(trace, &contract, root, max_voxels);
     let load_s = started.elapsed().as_secs_f64();
@@ -75,7 +75,11 @@ fn the_vae_decodes_and_encodes_the_golden_clip() {
     let gold = golden("z-image/zimage_vae");
     let latent = f32s(&gold.join("latent.f32"));
     let pixels = f32s(&gold.join("pixels.f32"));
-    let mean = f32s(&gold.join("mean.f32"));
+    // The golden is diffusers' raw posterior mean; `vae.encode` lands `(mean - shift) * scale`.
+    let mean: Vec<f32> = f32s(&gold.join("mean.f32"))
+        .iter()
+        .map(|m| (m - 0.1159) * 0.3611)
+        .collect();
     let square = |len: usize, channels: usize| -> [u32; 3] {
         let side = ((len / channels) as f64).sqrt().round() as u32;
         assert_eq!(

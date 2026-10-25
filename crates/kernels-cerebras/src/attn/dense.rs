@@ -1,7 +1,5 @@
-//! Bidirectional attention inside image segments (vision encoders): every
-//! row attends to the key rows of its own segment, `segments` an i32
-//! `[images + 1]` boundary vector over the shared row numbering; a row
-//! outside every segment answers zeros.
+//! Bidirectional attention inside segments (vision encoders), or ragged over a second CSR
+//! under a keep plane or relative bias; a row outside every segment answers zeros.
 //!
 //! Placement: a lane plan with the segments as ragged lanes (no banks), the
 //! key rows split over the block's `a` axis and the kv heads over `b`; k and
@@ -36,39 +34,151 @@ pub fn bidirectional(
     o: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attn.dense";
-    for t in [q, k, v, o] {
-        expect(OP, t, &[Dtype::Bf16, Dtype::F32])?;
-    }
-    expect(OP, segments, &[Dtype::I32])?;
-    if head_dim == 0 || !q.width.is_multiple_of(head_dim) || !k.width.is_multiple_of(head_dim) {
+    if head_dim == 0 || !k.width.is_multiple_of(head_dim) {
         return Err(refuse(
             OP,
+            format!("k {} wide for heads of {head_dim}", k.width),
+        ));
+    }
+    attend(
+        OP,
+        ctx,
+        q,
+        k,
+        v,
+        segments,
+        segments,
+        head_dim,
+        k.width / head_dim,
+        sm_scale,
+        RaggedMask::Segments,
+        o,
+    )
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum RaggedMask {
+    Segments,
+    /// Keeps a pair of one segment where its `[q rows][k rows]` cell is nonzero.
+    Custom {
+        keep: Tensor,
+    },
+    /// Adds `table[h, clamp(k − q + max_len − 1)]` to the scaled logit, within the segment.
+    RelativeBias {
+        table: Tensor,
+        max_len: u32,
+    },
+}
+
+pub fn ragged(
+    ctx: &Ctx<'_>,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    q_indptr: Tensor,
+    kv_indptr: Tensor,
+    head_dim: u32,
+    kv_heads: u32,
+    sm_scale: f32,
+    mask: RaggedMask,
+    o: Tensor,
+) -> Result<(), Error> {
+    attend(
+        "attn.ragged",
+        ctx,
+        q,
+        k,
+        v,
+        q_indptr,
+        kv_indptr,
+        head_dim,
+        kv_heads,
+        sm_scale,
+        mask,
+        o,
+    )
+}
+
+fn attend(
+    op: &'static str,
+    ctx: &Ctx<'_>,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    segments: Tensor,
+    kv_segments: Tensor,
+    head_dim: u32,
+    kvh: u32,
+    sm_scale: f32,
+    mask: RaggedMask,
+    o: Tensor,
+) -> Result<(), Error> {
+    for t in [q, k, v, o] {
+        expect(op, t, &[Dtype::Bf16, Dtype::F32])?;
+    }
+    expect(op, segments, &[Dtype::I32])?;
+    expect(op, kv_segments, &[Dtype::I32])?;
+    if head_dim == 0 || !q.width.is_multiple_of(head_dim) || k.width != kvh * head_dim {
+        return Err(refuse(
+            op,
             format!(
-                "q {} and k {} wide for heads of {head_dim}",
+                "q {} and k {} wide for {kvh} kv heads of {head_dim}",
                 q.width, k.width
             ),
         ));
     }
-    let (qh, kvh) = (q.width / head_dim, k.width / head_dim);
+    let qh = q.width / head_dim;
     if kvh == 0 || !qh.is_multiple_of(kvh) || v.width != k.width || v.rows != k.rows {
         return Err(refuse(
-            OP,
+            op,
             format!("{qh} query heads do not group over {kvh} kv heads of one k/v rectangle"),
         ));
     }
     if o.rows != q.rows || o.width != q.width {
-        return Err(refuse(OP, "the answer is one row per query row"));
+        return Err(refuse(op, "the answer is one row per query row"));
     }
-    if segments.elements() < 2 {
+    let entries = segments.elements().min(kv_segments.elements());
+    if entries < 2 {
         return Err(refuse(
-            OP,
-            "the segment list is an i32 boundary vector naming at least one image",
+            op,
+            "the segment list is an i32 boundary vector naming at least one segment",
         ));
     }
     if q.rows == 0 || k.rows == 0 {
-        return Err(refuse(OP, "rows are nonzero"));
+        return Err(refuse(op, "rows are nonzero"));
     }
-    let images = (segments.elements() - 1) as u32;
+    let (keep, bias, max_len) = match mask {
+        RaggedMask::Segments => (None, None, 0),
+        RaggedMask::Custom { keep } => {
+            expect(op, keep, &[Dtype::Bf16, Dtype::F32])?;
+            if keep.rows != q.rows || keep.width != k.rows {
+                return Err(refuse(
+                    op,
+                    format!(
+                        "the keep plane is {} x {}, and it is one cell a (query row, key row) \
+                         of {} x {}",
+                        keep.rows, keep.width, q.rows, k.rows
+                    ),
+                ));
+            }
+            (Some(keep), None, 0)
+        }
+        RaggedMask::RelativeBias { table, max_len } => {
+            expect(op, table, &[Dtype::F32])?;
+            if max_len == 0 || table.elements() < u64::from(qh) * u64::from(2 * max_len - 1) {
+                return Err(refuse(
+                    op,
+                    format!(
+                        "the bias table holds {} cells, and this attention reads {qh} heads of \
+                         2 x {max_len} - 1",
+                        table.elements()
+                    ),
+                ));
+            }
+            (None, Some(table), max_len)
+        }
+    };
+    let images = (entries - 1) as u32;
     let group = qh / kvh;
     let d = head_dim;
     let (rows, keys) = (q.rows, k.rows);
@@ -78,7 +188,17 @@ pub fn bidirectional(
         let kv = 2 * u64::from(keys.div_ceil(ag)) * u64::from(kvh / hg) * u64::from(d);
         let qo = 2 * u64::from(n) * u64::from(qh / hg) * u64::from(d);
         let lse = u64::from(n) * u64::from(qh / hg);
-        kv + qo + lse + u64::from(images) + 1 + u64::from(d) + 16
+        let keep = if keep.is_some() {
+            u64::from(n) * u64::from(keys.div_ceil(ag))
+        } else {
+            0
+        };
+        let bias = if bias.is_some() {
+            u64::from(qh) * u64::from(2 * max_len - 1)
+        } else {
+            0
+        };
+        kv + qo + lse + keep + bias + 2 * (u64::from(images) + 1) + u64::from(d) + 16
     };
     // The fabric merge of a key split: the partial's copy, the lse copies
     // and the collectives library.
@@ -100,7 +220,7 @@ pub fn bidirectional(
         })
         .ok_or_else(|| {
             refuse(
-                OP,
+                op,
                 format!(
                     "one query row and one key row of one head exceed a PE's {}",
                     ctx.plan().pe_words().saturating_sub(CODE_WORDS)
@@ -126,10 +246,27 @@ pub fn bidirectional(
             let kb = cx.read(k)?;
             let vb = cx.read(v)?;
             let sb = cx.read(segments)?;
+            let tb = cx.read(kv_segments)?;
             let ob = cx.write(o)?;
             let acc = cx.scratch("acc", u64::from(d));
             let qb = cx.window_of(&qb, c0, n)?;
             let ob = cx.window_of(&ob, c0, n)?;
+            let keep = match keep {
+                Some(keep) => {
+                    let kb = cx.read(keep)?;
+                    Some(cx.window_of(&kb, c0, n)?)
+                }
+                None => None,
+            };
+            let bias = match bias {
+                Some(table) => Some(cx.read(table)?),
+                None => None,
+            };
+            let ptr_or = |b: &Option<crate::phase::Buf>| {
+                b.as_ref()
+                    .map_or(Arg::Dummy("f32"), |b| Arg::Ptr(b.clone()))
+            };
+            let (keep_arg, bias_arg) = (ptr_or(&keep), ptr_or(&bias));
             if whole {
                 cx.call(
                     Kernel::AttendDense,
@@ -140,6 +277,9 @@ pub fn bidirectional(
                         Arg::Ptr(ob),
                         Arg::Dummy("f32"),
                         Arg::Ptr(sb),
+                        Arg::Ptr(tb),
+                        keep_arg,
+                        bias_arg,
                         Arg::Scratch(acc.clone(), "f32"),
                         Arg::Int(0),
                         Arg::Int(i64::from(images)),
@@ -154,6 +294,8 @@ pub fn bidirectional(
                         Arg::Int(i64::from(d)),
                         Arg::Float(sm_scale),
                         Arg::Bool(false),
+                        Arg::Bool(keep.is_some()),
+                        Arg::Int(i64::from(max_len)),
                     ],
                 );
                 return Ok(());
@@ -193,6 +335,29 @@ pub fn bidirectional(
             } else {
                 Vec::new()
             };
+            let mut cols = vec![
+                heads(&kb, d, true),
+                heads(&vb, d, true),
+                heads(&qb, group * d, false),
+                heads(&ob, group * d, false),
+                heads(&lse, group, false),
+            ];
+            if let Some(keep) = &keep {
+                cols.push(ColPlane {
+                    name: keep.name.clone(),
+                    rows: keep.rows,
+                    width: keep.width,
+                    by_rows: false,
+                    row_block: false,
+                    segments: vec![Segment {
+                        base: 0,
+                        a_group: 1,
+                        a_stride: 1,
+                        b_stride: 0,
+                        span: 1,
+                    }],
+                });
+            }
             let lanes = Lanes {
                 kind: LaneKind::Ragged {
                     indptr: sb.name.clone(),
@@ -207,13 +372,7 @@ pub fn bidirectional(
                 }),
                 a_first: merge,
                 row_outputs: Vec::new(),
-                cols: vec![
-                    heads(&kb, d, true),
-                    heads(&vb, d, true),
-                    heads(&qb, group * d, false),
-                    heads(&ob, group * d, false),
-                    heads(&lse, group, false),
-                ],
+                cols,
                 reduce,
                 window: Some((c0, n)),
                 pages: None,
@@ -234,6 +393,9 @@ pub fn bidirectional(
                     Arg::Ptr(ob.clone()),
                     Arg::Ptr(lse.clone()),
                     Arg::Ptr(sb),
+                    Arg::Ptr(tb),
+                    keep_arg,
+                    bias_arg,
                     Arg::Scratch(acc.clone(), "f32"),
                     h(0),
                     h(1),
@@ -248,6 +410,8 @@ pub fn bidirectional(
                     Arg::Int(i64::from(d)),
                     Arg::Float(sm_scale),
                     Arg::Bool(true),
+                    Arg::Bool(keep.is_some()),
+                    Arg::Int(i64::from(max_len)),
                 ],
             );
             Ok(())

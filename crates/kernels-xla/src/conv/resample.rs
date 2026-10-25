@@ -1,8 +1,8 @@
 //! Resampling: nearest upsample, pixel (un)shuffle, average down, (un)patchify.
 
 use crate::conv::{
-    Boxes, Placed, add_k, boxes, cmp_k, div_k, k, lane_pair, movable, mul_k, place, ravel, rem_k,
-    spread, take_elems, take_rows_or_zero, unit_where_invalid, volume,
+    Boxes, Placed, add_k, boxes, cmp_k, div_k, k, lane_pair, movable, mul_k, place, ravel, rebased,
+    rem_k, spread, take_elems, take_rows_or_zero, unit_where_invalid, volume,
 };
 use crate::error::{Error, refuse};
 use crate::hlo::{Cmp, Elem, Fold, Func, Val};
@@ -19,7 +19,10 @@ pub fn upsample_nearest(
     keep_first_frame: bool,
     y: Landing,
     y_grid: Operand,
+    bases: [u32; 2],
 ) -> Result<Val, Error> {
+    let grid = rebased(f, grid, bases[0])?;
+    let y_grid = rebased(f, y_grid, bases[1])?;
     const OP: &str = "conv.upsample";
     movable(OP, x, y)?;
     lane_pair(OP, grid, y_grid)?;
@@ -80,7 +83,10 @@ pub fn pixel_shuffle(
     trim_t: u32,
     y: Landing,
     y_grid: Operand,
+    bases: [u32; 2],
 ) -> Result<Val, Error> {
+    let grid = rebased(f, grid, bases[0])?;
+    let y_grid = rebased(f, y_grid, bases[1])?;
     const OP: &str = "conv.pixel_shuffle";
     movable(OP, x, y)?;
     lane_pair(OP, grid, y_grid)?;
@@ -132,7 +138,10 @@ pub fn pixel_unshuffle(
     r: [u32; 3],
     y: Landing,
     y_grid: Operand,
+    bases: [u32; 2],
 ) -> Result<Val, Error> {
+    let grid = rebased(f, grid, bases[0])?;
+    let y_grid = rebased(f, y_grid, bases[1])?;
     const OP: &str = "conv.pixel_unshuffle";
     movable(OP, x, y)?;
     lane_pair(OP, grid, y_grid)?;
@@ -229,7 +238,10 @@ pub fn avg_down(
     group: u32,
     y: Landing,
     y_grid: Operand,
+    bases: [u32; 2],
 ) -> Result<Val, Error> {
+    let grid = rebased(f, grid, bases[0])?;
+    let y_grid = rebased(f, y_grid, bases[1])?;
     const OP: &str = "conv.avg_down";
     movable(OP, x, y)?;
     lane_pair(OP, grid, y_grid)?;
@@ -271,7 +283,8 @@ pub fn avg_down(
     Ok(s)
 }
 
-/// [`pixel_unshuffle`] by the patch size.
+/// [`pixel_unshuffle`] by the patch size; `bases` are the rows `grid` and `y_grid` address
+/// `x`'s and `y`'s row 0 at.
 pub fn patchify(
     f: &mut Func,
     x: Operand,
@@ -279,11 +292,12 @@ pub fn patchify(
     p: [u32; 3],
     y: Landing,
     y_grid: Operand,
+    bases: [u32; 2],
 ) -> Result<Val, Error> {
-    pixel_unshuffle(f, x, grid, p, y, y_grid)
+    pixel_unshuffle(f, x, grid, p, y, y_grid, bases)
 }
 
-/// [`pixel_shuffle`] by the patch size, untrimmed.
+/// [`pixel_shuffle`] by the patch size, untrimmed; `bases` as [`patchify`]'s.
 pub fn unpatchify(
     f: &mut Func,
     x: Operand,
@@ -291,6 +305,7 @@ pub fn unpatchify(
     p: [u32; 3],
     y: Landing,
     y_grid: Operand,
+    bases: [u32; 2],
 ) -> Result<Val, Error> {
-    pixel_shuffle(f, x, grid, p, 0, y, y_grid)
+    pixel_shuffle(f, x, grid, p, 0, y, y_grid, bases)
 }

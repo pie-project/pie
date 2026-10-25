@@ -40,6 +40,10 @@ struct ConvGeom {
     int replicate;
     int lanes;
     int rows_out;
+
+    // The rows the fire-wide grids address `x`'s and `o`'s row 0 at.
+    int x_base;
+    int o_base;
 };
 
 struct OutRow {
@@ -57,10 +61,11 @@ __device__ __forceinline__ OutRow out_row(const ConvGeom& g, const int* __restri
     r.cache_base = 0;
     if (m >= g.rows_out) return r;
     Lane og;
-    const int l = lane_of(o_grid, g.lanes, m, og);
+    const int l = lane_of(o_grid, g.lanes, m + g.o_base, og);
     if (l < 0) return r;
     r.in = lane_at(grid, l);
-    r.o = unravel(og, m - og.off);
+    r.in.off -= g.x_base;
+    r.o = unravel(og, m + g.o_base - og.off);
     // The cache holds `pt` frames a lane, lane after lane.
     int planes = 0;
     for (int j = 0; j < l; ++j) planes += lane_at(grid, j).plane();
@@ -213,7 +218,7 @@ __global__ __launch_bounds__(kDirectThreads) void conv3d_direct(const bf16* __re
         const int m = m0 + ty * 4 + i;
         if (m >= g.rows_out) continue;
         Lane box;
-        const bool live = lane_of(o_grid, g.lanes, m, box) >= 0;
+        const bool live = lane_of(o_grid, g.lanes, m + g.o_base, box) >= 0;
         bf16* orow = o + static_cast<long long>(m) * g.c_out;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {

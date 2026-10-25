@@ -1,4 +1,4 @@
-use eta_ir::registry::{GeometryClass, ModelProfile, PortMask};
+use eta_ir::registry::{GeometryClass, PortMask};
 use serde::{Deserialize, Serialize};
 
 use crate::transfer::{KvHandle, MemoryDomain};
@@ -124,7 +124,6 @@ pub struct Capabilities {
     pub device: DeviceFacts,
     pub pools: PoolFacts,
     pub limits: FireLimits,
-    pub profile: ModelProfile,
     pub ports: PortMask,
     pub geometry: GeometryClass,
     pub kv_copy: KvCopyDomains,
@@ -148,10 +147,39 @@ pub struct Capabilities {
     #[serde(default)]
     pub adapter_attachments: bool,
 
+    #[serde(default)]
+    pub has_lora: bool,
+
+    #[serde(default)]
+    pub has_attn_page_mask: bool,
+
+    /// The loaded graph drafts `mtp_depth` ids a fire.
+    #[serde(default)]
+    pub has_mtp_logits: bool,
+    #[serde(default)]
+    pub mtp_depth: u32,
+
+    #[serde(default)]
+    pub draft_block: u32,
+    #[serde(default)]
+    pub draft_mask_token: u32,
+    #[serde(default)]
+    pub draft_proposals_from: u32,
+
+    #[serde(default)]
+    pub has_attn_score: bool,
+
     /// The facts the loaded trace's rows branch on, which a lane's word is
     /// classified by.
     #[serde(default)]
     pub facts: poem_ir::Facts,
+
+    /// The guest's inputs by id, with the lane words that read each.
+    #[serde(default)]
+    pub inputs: Vec<poem_ir::InputDecl>,
+
+    #[serde(default)]
+    pub classes: poem_ir::LaneClasses,
 }
 
 impl Capabilities {

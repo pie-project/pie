@@ -14,8 +14,7 @@ use engine::fire::{
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
-use eta_ir::registry::{GeometryClass, ModelProfile, PortMask};
-use eta_ir::types::Dtype;
+use eta_ir::registry::{GeometryClass, PortMask, Stage};
 use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
 
@@ -270,48 +269,6 @@ fn voxel_bytes(
     }
 }
 
-fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
-    let trace = shell.trace();
-    let layers = trace
-        .nodes
-        .iter()
-        .filter_map(|node| node.layer)
-        .max()
-        .map_or(0, |top| top + 1);
-    let width = u32::try_from(shell.out_width().map_err(fault)?).unwrap_or(u32::MAX);
-    let seam = shell.readout_seam();
-    let vocab = match seam {
-        engine::fire::ReadoutSeam::Logits => width,
-        _ => 0,
-    };
-    Ok(ModelProfile {
-        vocab,
-        page_size: budgets.page_size,
-        num_layers: layers,
-
-        activation: Dtype::F32,
-        has_mtp_logits: shell.drafts(),
-        mtp_depth: shell.mtp_depth(),
-        draft_block: shell.trace().drafter.map_or(0, |d| d.rows),
-        draft_mask_token: shell.trace().drafter.map_or(0, |d| d.mask_token),
-        draft_bidirectional: shell.trace().drafter.is_some_and(|d| d.bidirectional),
-        draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
-        has_value_head: false,
-        has_attn_score: false,
-        has_attn_page_mask: false,
-
-        has_lora: true,
-        has_velocity: seam == engine::fire::ReadoutSeam::Velocity,
-        velocity_width: match seam {
-            engine::fire::ReadoutSeam::Velocity => width,
-            _ => 0,
-        },
-        has_pixels: shell.pixels_width().is_some(),
-        pixels_width: shell.pixels_width().unwrap_or(0),
-        kernels: Vec::new(),
-    })
-}
-
 fn adapter_of(
     shell: &mut Shell,
     package: &eta_compiler::codegen::launch::LaunchPackage,
@@ -446,7 +403,6 @@ impl Engine for Vulkan {
             .caches
             .iter()
             .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
-        let profile = profile(&shell, &budgets)?;
 
         let caps = Capabilities {
             device: DeviceFacts {
@@ -496,7 +452,14 @@ impl Engine for Vulkan {
                 .unwrap_or(u32::MAX),
                 max_scoring_lanes: 0,
             },
-            profile,
+            has_lora: true,
+            has_attn_page_mask: false,
+            has_mtp_logits: shell.drafts(),
+            mtp_depth: shell.mtp_depth(),
+            draft_block: shell.trace().drafter.map_or(0, |d| d.rows),
+            draft_mask_token: shell.trace().drafter.map_or(0, |d| d.mask_token),
+            draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
+            has_attn_score: false,
 
             ports: PortMask::DECODE_ENVELOPE.with(eta_ir::registry::Port::Fold),
             geometry: GeometryClass::DecodeEnvelope,
@@ -515,6 +478,8 @@ impl Engine for Vulkan {
             bidirectional_attention: false,
             adapter_attachments: false,
             facts: shell.trace().facts.clone(),
+            inputs: shell.inputs(),
+            classes: shell.classes(),
         };
 
         self.shell = Some(shell);
@@ -575,7 +540,7 @@ impl Engine for Vulkan {
                         step_pending.rows = Some(Vec::new());
                         return Ok((ticket, step_pending));
                     }
-                    if !step.attachments.is_empty()
+                    if program_attachments(step).next().is_some()
                         && self.reads_on_device(step, &step_pending.landed)
                     {
                         // Every attachment reads its logits on the device:
@@ -587,7 +552,7 @@ impl Engine for Vulkan {
                         let shell = self.loaded_mut()?;
                         step_pending.rows = Some(shell.rows_of(&landed).map_err(fault)?);
                         shell.forget_seat(&landed);
-                    } else if !step.attachments.is_empty() {
+                    } else if program_attachments(step).next().is_some() {
                         let shell = self.loaded_mut()?;
                         let rows = shell.rows_of(&step_pending.landed).map_err(fault)?;
 
@@ -872,10 +837,35 @@ impl Vulkan {
         };
         cfg!(feature = "vulkan")
             && shell.mtp_width() == 0
-            && step
-                .attachments
-                .iter()
+            && program_attachments(step)
                 .all(|attachment| shell.readout_row(landed, attachment.lane).is_some())
+    }
+
+    /// Before the step resolves its inputs: the forward reads the cells a prologue put.
+    fn run_prologues(&mut self, step: &Step) -> EngineResult<()> {
+        for attachment in program_attachments(step) {
+            if !self.programs.prologue_runs(attachment.instance) {
+                continue;
+            }
+            self.programs
+                .fire(
+                    attachment.instance,
+                    Stage::Prologue,
+                    None,
+                    0,
+                    0,
+                    None,
+                    0,
+                    #[cfg(feature = "vulkan")]
+                    self.shell.as_ref().map(Shell::device),
+                    #[cfg(feature = "vulkan")]
+                    Vec::new(),
+                    #[cfg(feature = "vulkan")]
+                    Vec::new(),
+                )
+                .map_err(refusal)?;
+        }
+        Ok(())
     }
 
     fn run_attachments(
@@ -889,7 +879,7 @@ impl Vulkan {
         let Vulkan {
             shell, programs, ..
         } = self;
-        for attachment in &step.attachments {
+        for attachment in program_attachments(step) {
             let readout = readouts.get(attachment.lane as usize);
             let (logits, rows, vocab) = match readout {
                 Some(lane) if lane.rows > 0 => {
@@ -904,34 +894,17 @@ impl Vulkan {
                 .map(Vec::as_slice);
 
             #[cfg(feature = "vulkan")]
-            let pixels = shell.as_ref().and_then(|shell| {
-                shell
-                    .pixels_row(landed)
-                    .map(|(seat, at, width)| crate::guest::run::Readout {
-                        seat,
-                        at,
-                        width,
-                        f32: false,
-                    })
-            });
-            #[cfg(feature = "vulkan")]
-            let (device, seat) = match shell.as_ref() {
-                Some(shell) => (
-                    Some(shell.device()),
-                    shell
-                        .readout_row(landed, attachment.lane)
-                        .map(|(seat, at, width, dtype)| crate::guest::run::Readout {
-                            seat,
-                            at,
-                            width,
-                            f32: dtype == poem_ir::Dtype::F32,
-                        }),
-                ),
-                None => (None, None),
+            let (device, seat, pixels) = match shell.as_ref() {
+                Some(shell) => {
+                    let (seat, pixels) = lane_readouts(shell, landed, attachment);
+                    (Some(shell.device()), seat, pixels)
+                }
+                None => (None, Vec::new(), Vec::new()),
             };
             programs
                 .fire(
                     attachment.instance,
+                    Stage::Epilogue,
                     logits,
                     rows,
                     vocab,
@@ -960,6 +933,7 @@ impl Vulkan {
             self.sink.is_some()
                 && self.settles_asynchronously()
                 && step.attachments.len() == 1
+                && !step.attachments[0].adapter_only
                 && self
                     .shell
                     .as_ref()
@@ -991,31 +965,10 @@ impl Vulkan {
                 .as_ref()
                 .ok_or_else(|| Error::Load("the vulkan engine has no model loaded".into()))?;
             let attachment = &step.attachments[0];
-            let seat =
-                shell
-                    .readout_row(landed, attachment.lane)
-                    .map(|(seat, at, width, dtype)| crate::guest::run::Readout {
-                        seat,
-                        at,
-                        width,
-                        f32: dtype == poem_ir::Dtype::F32,
-                    });
+            let (seat, pixels) = lane_readouts(shell, landed, attachment);
             let done = sink.clone().map(|sink| Done { at, sink });
             programs
-                .fire_deferred(
-                    attachment.instance,
-                    shell.device(),
-                    seat,
-                    shell
-                        .pixels_row(landed)
-                        .map(|(seat, at, width)| crate::guest::run::Readout {
-                            seat,
-                            at,
-                            width,
-                            f32: false,
-                        }),
-                    done,
-                )
+                .fire_deferred(attachment.instance, shell.device(), seat, pixels, done)
                 .map_err(refusal)
         }
         #[cfg(not(feature = "vulkan"))]
@@ -1031,6 +984,7 @@ impl Vulkan {
         at: engine::StepDone,
         defers: bool,
     ) -> EngineResult<(FireTicket, PendingStep)> {
+        self.run_prologues(submission)?;
         let mut staged: Vec<Vec<u8>> = Vec::new();
         if !submission.media.is_empty() {
             let Some(element) = self.loaded()?.patch_element() else {
@@ -1139,29 +1093,32 @@ impl Vulkan {
             }
         }
 
-        let mut port_cells: Vec<Vec<(engine::fire::PortFeed, crate::program::PortCell)>> =
+        let mut input_cells: Vec<Vec<(engine::fire::InputFeed, crate::program::InputCell)>> =
             vec![Vec::new(); submission.lanes.len()];
         for (at, lane) in submission.lanes.iter().enumerate() {
-            if lane.ports.is_empty() {
+            if lane.inputs.is_empty() {
                 continue;
             }
             let instance = submission
                 .attachments
                 .iter()
-                .find(|attachment| attachment.lane as usize == at)
+                .find(|attachment| {
+                    (attachment.lane..attachment.lane + attachment.lanes.max(1))
+                        .contains(&(at as u32))
+                })
                 .map(|attachment| attachment.instance)
                 .ok_or_else(|| {
                     Error::Invalid(format!(
-                        "lane {at} feeds input ports and has no attachment; a port is read \
+                        "lane {at} feeds guest inputs and has no attachment; an input is read \
                          through the instance the lane is attached to"
                     ))
                 })?;
-            for feed in &lane.ports {
+            for feed in &lane.inputs {
                 let cell = self
                     .programs
-                    .port_cell(instance, feed.channel)
+                    .input_cell(instance, feed.channel)
                     .map_err(refusal)?;
-                port_cells[at].push((*feed, cell));
+                input_cells[at].push((*feed, cell));
             }
         }
 
@@ -1201,46 +1158,43 @@ impl Vulkan {
             .lanes
             .iter()
             .enumerate()
-            .map(|(at, lane)| {
-                Ok(Seated {
-                    lane: Lane {
-                        slot: lane.slot,
+            .map(|(at, lane)| Seated {
+                lane: Lane {
+                    slot: lane.slot,
 
-                        word: words[at],
-                        tokens: resolved[at].as_deref().unwrap_or(&lane.tokens),
-                    },
-                    pages: &lane.kv.pages,
-                    held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
-                    kv_less: lane.kv_less,
-                    captures_scores: lane.captures_scores,
+                    word: words[at],
+                    tokens: resolved[at].as_deref().unwrap_or(&lane.tokens),
+                },
+                pages: &lane.kv.pages,
+                held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                kv_less: lane.kv_less,
+                captures_scores: lane.captures_scores,
 
-                    mask: lane.mask.as_ref(),
+                mask: lane.mask.as_ref(),
 
-                    adapter: lane_adapters[at].or(lane.adapter),
-                    positions: &lane.positions,
+                adapter: lane_adapters[at].or(lane.adapter),
+                positions: &lane.positions,
 
-                    readout: match &lane.readout {
-                        Readout::Rows(rows) => Some(rows.as_slice()),
-                        Readout::Last | Readout::None => None,
-                    },
+                readout: match &lane.readout {
+                    Readout::Rows(rows) => Some(rows.as_slice()),
+                    Readout::Last | Readout::None => None,
+                },
 
-                    translation: &lane.kv.translation,
+                translation: &lane.kv.translation,
 
-                    rs: &verbs[at],
-                    rs_reset: lane.rs_reset,
-                    rs_slot: lane.rs_slot,
+                rs: &verbs[at],
+                rs_reset: lane.rs_reset,
+                rs_slot: lane.rs_slot,
 
-                    #[cfg(feature = "vulkan")]
-                    feed: feeds[at].as_ref(),
-                    #[cfg(not(feature = "vulkan"))]
-                    feed: None,
+                #[cfg(feature = "vulkan")]
+                feed: feeds[at].as_ref(),
+                #[cfg(not(feature = "vulkan"))]
+                feed: None,
 
-                    stream: lane.stream,
-                    group: lane.group,
-                    ports: &port_cells[at],
-                })
+                group: lane.group,
+                inputs: &input_cells[at],
             })
-            .collect::<EngineResult<Vec<_>>>()?;
+            .collect();
 
         let landed = {
             use engine::frame::Shell as FrameShell;
@@ -1306,3 +1260,48 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
 // so moving the whole engine to another thread moves every handle with it;
 // Vulkan handles are not tied to the thread that made them.
 unsafe impl Send for Vulkan {}
+
+/// The attachments whose program runs on this fire.
+fn program_attachments(step: &Step) -> impl Iterator<Item = &engine::fire::Attachment> {
+    step.attachments
+        .iter()
+        .filter(|attachment| !attachment.adapter_only)
+}
+
+#[cfg(feature = "vulkan")]
+fn lane_readouts<'a>(
+    shell: &'a Shell,
+    landed: &crate::serve::Landed,
+    attachment: &engine::fire::Attachment,
+) -> (
+    Vec<Option<crate::guest::run::Readout<'a>>>,
+    Vec<Option<crate::guest::run::Readout<'a>>>,
+) {
+    let lanes = attachment.lane..attachment.lane + attachment.lanes.max(1);
+    let readouts = lanes
+        .clone()
+        .map(|lane| {
+            shell
+                .readout_row(landed, lane)
+                .map(|(seat, at, width, dtype)| crate::guest::run::Readout {
+                    seat,
+                    at,
+                    width,
+                    f32: dtype == poem_ir::Dtype::F32,
+                })
+        })
+        .collect();
+    let pixels = lanes
+        .map(|lane| {
+            shell
+                .pixels_row(landed, lane)
+                .map(|(seat, at, width)| crate::guest::run::Readout {
+                    seat,
+                    at,
+                    width,
+                    f32: false,
+                })
+        })
+        .collect();
+    (readouts, pixels)
+}

@@ -73,14 +73,22 @@ async fn main(input: Input) -> Result<String> {
     let video = match asked {
         "y4m" => ImageFormat::Y4m,
         "mp4" => ImageFormat::Mp4H264,
-        other => return Err(format!("unknown video format {other:?}; try 'mp4' or 'y4m'")),
+        other => {
+            return Err(format!(
+                "unknown video format {other:?}; try 'mp4' or 'y4m'"
+            ));
+        }
     };
     // A machine with no encoder is a fact about the machine, not a failure of
     // this program: report it and fall back, so the fixture still proves the
     // door works where it can.
     let (video_name, video_note) = match session::send_frames(&clip, video, "gradient") {
         Ok(()) => (
-            if matches!(video, ImageFormat::Mp4H264) { "gradient.mp4" } else { "gradient.y4m" },
+            if matches!(video, ImageFormat::Mp4H264) {
+                "gradient.mp4"
+            } else {
+                "gradient.y4m"
+            },
             String::new(),
         ),
         Err(error) => {

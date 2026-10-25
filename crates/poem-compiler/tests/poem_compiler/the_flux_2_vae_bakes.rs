@@ -5,9 +5,8 @@ use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, Partition, TensorType};
 
 use crate::flux_2_dims::{self as model, vae};
-use poem::generative::{PortKind, ReadoutKind};
-use poem::{Def, Dim, Dtype, Operation, Platform, Request, Stream, Trace, Ty, seam};
-use poem_ir::{Attn, Conv, GridRule, ParamLayout, Seam};
+use poem::{Def, Dim, Dtype, Operation, Platform, Request, Trace, Ty, seam};
+use poem_ir::{Attn, Conv, GridRule, InputAxis, ParamLayout, Seam};
 
 const KLEIN: &str = "flux2-klein-4b-bf16-kv-bf16";
 const MINI: &str = "flux2-mini-bf16-kv-bf16";
@@ -21,111 +20,87 @@ fn trace(deployment: &str) -> Trace {
     row(deployment).trace(Platform::Cuda)
 }
 
-fn reading<'a>(
-    facts: &'a poem::generative::Generative,
-    name: &str,
-) -> &'a poem::generative::ReadingFact {
-    facts
-        .readings
-        .iter()
-        .find(|r| r.name == name)
-        .unwrap_or_else(|| panic!("no reading `{name}`"))
+fn readings(deployment: &str) -> Vec<String> {
+    trace(deployment)
+        .facts
+        .declared("reading")
+        .map(|s| s.values.clone())
+        .unwrap_or_default()
 }
 
 #[test]
 fn the_flux_2_vae_bakes_every_case() {
     the_flagship_declares_the_two_vae_readings_and_the_miniature_neither();
-    the_trace_reads_two_voxel_ports_and_plants_pixels_twice();
+    the_trace_reads_its_voxel_inputs_and_plants_pixels_twice();
     the_shapes_are_the_flux2_autoencoders();
     each_vae_lane_has_a_class_of_its_own();
     the_import_reads_every_vae_tensor_of_the_real_snapshot_once();
 }
 
 fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
+    assert_eq!(
+        readings(KLEIN),
+        ["text", "denoise", "vae.decode", "vae.encode"].map(String::from)
+    );
     let facts = row(KLEIN).generative().expect("facts");
-    let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
-    assert_eq!(names, vec!["text", "denoise", "vae.decode", "vae.encode"]);
-    let decode = reading(&facts, "vae.decode");
-    let encode = reading(&facts, "vae.encode");
-    for r in [decode, encode] {
-        assert!(!r.has_kv && !r.takes_tokens, "a voxel lane");
-        assert_eq!(r.streams, vec![Stream::Image]);
-        assert_eq!(r.readout, ReadoutKind::Pixels);
-        assert_eq!(r.ports.len(), 1);
-        assert_eq!(r.ports[0].kind, PortKind::Voxels);
-        assert_eq!(r.ports[0].streams, vec![Stream::Image]);
-    }
-    assert_eq!(
-        (
-            decode.ports[0].name.as_str(),
-            decode.ports[0].width,
-            decode.readout_width
-        ),
-        ("latent", model::IN_CHANNELS, vae::RGB)
-    );
-    assert_eq!(
-        (
-            encode.ports[0].name.as_str(),
-            encode.ports[0].width,
-            encode.readout_width
-        ),
-        ("pixels", vae::RGB, model::IN_CHANNELS)
-    );
-    assert_eq!(decode.port("latent").map(|(index, _)| index), Some(0));
-    assert_eq!(
-        encode.port("pixels").map(|(index, _)| index),
-        Some(model::port::PIXEL_VOXELS)
-    );
-    assert_eq!(
-        (decode.ports[0].at, encode.ports[0].at),
-        (None, Some(model::port::PIXEL_VOXELS)),
-        "the pixel clip is seated at its own voxel index"
-    );
-    assert_eq!((decode.index, encode.index), (2, 3));
     let latent = facts.latent.as_ref().expect("a latent space");
     assert_eq!(
         (latent.channels, latent.spatial_compression),
-        (model::IN_CHANNELS, model::TOKEN_COMPRESSION)
+        (model::VAE_CHANNELS, model::VAE_COMPRESSION),
+        "the public latent is the VAE's own 32 channels at /8"
     );
     assert_eq!(
         model::VAE_CHANNELS * model::PACK * model::PACK,
         model::IN_CHANNELS,
-        "the port's 128 channels ARE the VAE's 32 packed 2x2"
+        "the denoiser's 128-wide rows are the VAE's 32 channels packed 2x2"
     );
 
-    let mini = row(MINI).generative().expect("facts");
     assert!(
-        !mini.readings.iter().any(|r| r.name.starts_with("vae.")),
+        !readings(MINI).iter().any(|r| r.starts_with("vae.")),
         "the miniature has no VAE"
     );
-    assert!(
-        !trace(MINI)
-            .values
-            .iter()
-            .any(|v| matches!(v.def, Def::Input(poem::RuntimeInput::Voxels { .. }))),
-        "and reads no voxel port"
-    );
-}
-
-fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
-    let plan = trace(KLEIN);
-    let mut ports: Vec<(u8, u32, String)> = plan
+    let mini = trace(MINI);
+    let voxel_inputs: Vec<&str> = mini
         .values
         .iter()
-        .filter_map(|v| match (&v.def, &v.ty) {
-            (
-                Def::Input(poem::RuntimeInput::Voxels { port, channels }),
-                Ty::Tensor { dtype, .. },
-            ) => Some((*port, *channels, format!("{dtype:?}"))),
+        .filter_map(|v| match &v.def {
+            Def::Input(poem::RuntimeInput::Guest {
+                id,
+                axis: InputAxis::Voxel,
+                ..
+            }) => Some(mini.inputs[*id as usize].name.as_str()),
             _ => None,
         })
         .collect();
-    ports.sort_unstable();
     assert_eq!(
-        ports,
+        voxel_inputs,
+        vec!["latents"],
+        "and reads no voxel input but the denoiser's latent"
+    );
+}
+
+fn the_trace_reads_its_voxel_inputs_and_plants_pixels_twice() {
+    let plan = trace(KLEIN);
+    let mut named: Vec<(&str, u32, Dtype)> = plan
+        .values
+        .iter()
+        .filter_map(|v| match &v.def {
+            Def::Input(poem::RuntimeInput::Guest {
+                id,
+                axis: InputAxis::Voxel,
+                width,
+                dtype,
+            }) => Some((plan.inputs[*id as usize].name.as_str(), *width, *dtype)),
+            _ => None,
+        })
+        .collect();
+    named.sort_unstable_by_key(|(name, ..)| *name);
+    assert_eq!(
+        named,
         vec![
-            (model::port::VOXELS, model::IN_CHANNELS, "Bf16".to_string()),
-            (model::port::PIXEL_VOXELS, vae::RGB, "Bf16".to_string())
+            ("latent", model::VAE_CHANNELS, Dtype::Bf16),
+            ("latents", model::VAE_CHANNELS, Dtype::Bf16),
+            ("pixels", vae::RGB, Dtype::Bf16)
         ]
     );
     let pixels: Vec<&Seam> = plan
@@ -155,7 +130,7 @@ fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
     };
     let mut want = vec![
         plane(Dim::VoxelsTimes(256), u64::from(vae::RGB)),
-        plane(Dim::Voxels, u64::from(model::IN_CHANNELS)),
+        plane(Dim::VoxelsTimes(4), u64::from(model::VAE_CHANNELS)),
     ];
     want.sort_by_key(|ty| format!("{ty:?}"));
     assert_eq!(planes, want);
@@ -267,9 +242,16 @@ fn the_shapes_are_the_flux2_autoencoders() {
     }
     assert_eq!(attentions, 2, "one mid-block attention per reading");
     assert_eq!(upsamples, 3);
-    assert_eq!(copies, 1, "the decode arm's one fresh copy of the port");
+    assert_eq!(
+        copies, 0,
+        "the decode's pack is its fresh copy of the input"
+    );
     assert_eq!(strided, 3);
-    assert_eq!((shuffles, unshuffles), (1, 1), "the 2x2 packing, both ways");
+    assert_eq!(
+        (shuffles, unshuffles),
+        (2, 2),
+        "each reading packs 2x2 for the batch norm and unpacks after"
+    );
     assert_eq!(convs, 64);
     assert_eq!(norms, 52);
     assert_eq!(silu_off, 2, "only the attention's norm has no SiLU");
@@ -278,22 +260,22 @@ fn the_shapes_are_the_flux2_autoencoders() {
 fn each_vae_lane_has_a_class_of_its_own() {
     let plan = trace(KLEIN);
     let classes = poem::resolve_classes(&plan).expect("every merge resolves");
-    let facts = row(KLEIN).generative().expect("facts");
-    let class_of = |name: &str, stream: Stream| {
-        let r = reading(&facts, name);
-        let request = Request::new(4, false).on_stream(stream).in_reading(&r.name);
+    let class_of = |name: &str, stream: &str| {
+        let request = Request::new(4, false)
+            .switched("stream", stream)
+            .switched("reading", name);
         let word = plan.facts.word(&request);
         classes
             .class_of(word & classes.mask)
             .unwrap_or_else(|| panic!("a {name} lane has no class"))
     };
     let seen: BTreeSet<usize> = [
-        class_of("text", Stream::Text),
-        class_of("denoise", Stream::Text),
-        class_of("denoise", Stream::Image),
-        class_of("denoise", Stream::Reference),
-        class_of("vae.decode", Stream::Image),
-        class_of("vae.encode", Stream::Image),
+        class_of("text", "text"),
+        class_of("denoise", "text"),
+        class_of("denoise", "image"),
+        class_of("denoise", "reference"),
+        class_of("vae.decode", "image"),
+        class_of("vae.encode", "image"),
     ]
     .into_iter()
     .collect();
@@ -379,7 +361,7 @@ fn the_import_reads_every_vae_tensor_of_the_real_snapshot_once() {
     let mut resolver = Resolver::new(&types, Partition::WHOLE);
     let mut kernels = 0;
     for tensor in &contract.tensors {
-        if tensor.name.starts_with("vae.") && tensor.name.ends_with("conv_in") {
+        if tensor.name.starts_with("vae.") && tensor.name.ends_with("conv_in.w") {
             kernels += 1;
         }
         if let Expr::Transmute { .. } = &tensor.expr {

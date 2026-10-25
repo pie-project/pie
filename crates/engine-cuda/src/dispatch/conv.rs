@@ -78,6 +78,7 @@ impl Run<'_> {
                         TimePad::Replicate => conv::TimePad::Replicate,
                     },
                 };
+                let bases = [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)];
                 let x = self.tensor(*x);
                 let grid = self.tensor(*grid);
                 let bias = bias.map(|b| self.tensor(b));
@@ -92,6 +93,7 @@ impl Run<'_> {
                         None,
                         &mut self.tensor(*y),
                         self.tensor(*y_grid),
+                        bases,
                     );
                 };
                 let frames = conv.pad[0];
@@ -131,6 +133,7 @@ impl Run<'_> {
                     Some(frame_cache),
                     &mut self.tensor(*y),
                     self.tensor(*y_grid),
+                    bases,
                 )?;
                 let mut slab = pool.slab;
                 conv::cache_store(
@@ -141,6 +144,7 @@ impl Run<'_> {
                     grid,
                     frames,
                     &mut slab,
+                    bases[0],
                 )
             }
             Conv::GroupNorm {
@@ -162,6 +166,7 @@ impl Run<'_> {
                 *eps,
                 *silu,
                 &mut self.tensor(*y),
+                self.grid_base(*grid, *x),
             ),
             Conv::Upsample {
                 x,
@@ -178,6 +183,7 @@ impl Run<'_> {
                 *keep_first_frame,
                 &mut self.tensor(*y),
                 self.tensor(*y_grid),
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
             ),
             Conv::PixelShuffle {
                 x,
@@ -194,6 +200,7 @@ impl Run<'_> {
                 *trim_t,
                 &mut self.tensor(*y),
                 self.tensor(*y_grid),
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
             ),
             Conv::PixelUnshuffle {
                 x,
@@ -208,6 +215,7 @@ impl Run<'_> {
                 *r,
                 &mut self.tensor(*y),
                 self.tensor(*y_grid),
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
             ),
             Conv::AvgDown {
                 x,
@@ -224,6 +232,7 @@ impl Run<'_> {
                 *group,
                 &mut self.tensor(*y),
                 self.tensor(*y_grid),
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
             ),
             Conv::CacheStore {
                 x,
@@ -232,6 +241,7 @@ impl Run<'_> {
                 cache,
                 x_out: _,
             } => {
+                let base = self.grid_base(*grid, *x);
                 let x = self.tensor(*x);
                 let grid = self.tensor(*grid);
                 let pool = self.recurrent(*cache);
@@ -244,7 +254,7 @@ impl Run<'_> {
                                 .to_string(),
                     })?;
                 let mut slab = pool.slab;
-                conv::cache_store(self.ctx(), x, x, slot_ids, grid, *frames, &mut slab)
+                conv::cache_store(self.ctx(), x, x, slot_ids, grid, *frames, &mut slab, base)
             }
             Conv::Patchify {
                 x,
@@ -259,6 +269,7 @@ impl Run<'_> {
                 *p,
                 &mut self.tensor(*y),
                 self.tensor(*tgrid),
+                [self.grid_base(*grid, *x), self.grid_base(*tgrid, *y)],
             ),
             Conv::Unpatchify {
                 x,
@@ -273,6 +284,20 @@ impl Run<'_> {
                 *p,
                 &mut self.tensor(*y),
                 self.tensor(*grid),
+                [self.grid_base(*tgrid, *x), self.grid_base(*grid, *y)],
+            ),
+            Conv::Cells {
+                tgrid,
+                positions,
+                axis,
+                y,
+            } => kernels_cuda::elemwise::posenc::cells(
+                self.ctx(),
+                self.tensor(*tgrid),
+                self.tensor(*positions),
+                *axis,
+                &mut self.tensor(*y),
+                self.grid_base(*tgrid, *y),
             ),
         }
     }

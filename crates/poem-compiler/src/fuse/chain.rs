@@ -712,6 +712,9 @@ impl Builder {
                 let id = self.push(match op {
                     BinaryOp::Add => Op::Binary(Binary::Add, x, y),
                     BinaryOp::Mul => Op::Binary(Binary::Mul, x, y),
+                    BinaryOp::Div => Op::Binary(Binary::Div, x, y),
+                    // floored, as Python's `%`: the region has no floor
+                    BinaryOp::Mod => return None,
                 });
                 self.set(*z, id);
             }
@@ -792,6 +795,7 @@ impl Builder {
                         self.push(Op::Binary(Binary::Mul, ht, up))
                     }
                     ActFn::Gelu { tanh: false } => return None,
+                    ActFn::Sqrt => self.push(Op::Unary(Unary::Sqrt, t)),
                 };
                 self.set(*x_out, out);
             }

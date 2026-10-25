@@ -19,6 +19,7 @@ fn every_frames_format_says_what_it_encoded_every_case() {
     a_still_round_trips_through_png_and_raw_and_reads_back_identical();
     a_clip_encodes_as_y4m_and_refuses_the_still_formats_by_name();
     a_handle_whose_bytes_do_not_match_its_extent_is_refused_at_construction();
+    clips_concatenate_in_order_and_refuse_a_mismatch_by_name();
     pcm_carries_its_own_rate_and_channels_into_the_wav_header();
 }
 
@@ -43,6 +44,33 @@ fn a_still_round_trips_through_png_and_raw_and_reads_back_identical() {
 
     let jpeg = still.encode(ImageFormat::Jpeg).expect("jpeg");
     assert_eq!(&jpeg[..2], b"\xff\xd8");
+}
+
+fn clips_concatenate_in_order_and_refuse_a_mismatch_by_name() {
+    let (w, h) = (8, 4);
+    let head = gradient(w, h, 1);
+    let tail = gradient(w, h, 2);
+    let a = Frames::from_rgb8(head.clone(), w, h, 1, 24.0).expect("build");
+    let b = Frames::from_rgb8(tail.clone(), w, h, 2, 24.0).expect("build");
+    let clip = Frames::concat(&[&a, &b]).expect("concat");
+    assert_eq!(
+        (clip.width, clip.height, clip.count, clip.fps),
+        (w, h, 3, 24.0)
+    );
+    assert_eq!(
+        clip.encode(ImageFormat::RawRgb8).expect("raw"),
+        [head, tail].concat(),
+        "parts land in the order they are given"
+    );
+
+    let wide = Frames::from_rgb8(gradient(16, h, 1), 16, h, 1, 24.0).expect("build");
+    let err = Frames::concat(&[&a, &wide]).expect_err("width mismatch");
+    assert!(err.contains("16x4") && err.contains("8x4"), "{err}");
+    let slow = Frames::from_rgb8(gradient(w, h, 1), w, h, 1, 12.0).expect("build");
+    let err = Frames::concat(&[&a, &slow]).expect_err("fps mismatch");
+    assert!(err.contains("12 fps") && err.contains("24 fps"), "{err}");
+    let err = Frames::concat(&[]).expect_err("no parts");
+    assert!(err.contains("no parts"), "{err}");
 }
 
 fn a_clip_encodes_as_y4m_and_refuses_the_still_formats_by_name() {

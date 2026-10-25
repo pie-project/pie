@@ -43,7 +43,7 @@ pub struct Weights {
     decoded: Vec<Buffer>,
 }
 
-fn decodes_at_load(param: &poem_ir::Param) -> bool {
+pub(crate) fn decodes_at_load(param: &poem_ir::Param) -> bool {
     param.dtype == Dtype::U8g64 && param.shape.len() == 2
 }
 

@@ -6,7 +6,6 @@ use common_dit::{
     HostRequest, Lcg, Rig, WIDTH, Weights, assert_close, attach, bf, frame, lane, reference,
 };
 use engine::Engine;
-use engine::fire::LaneStream;
 
 fn request(rng: &mut Lcg, text_rows: usize, image_rows: usize) -> HostRequest {
     let w = WIDTH as usize;
@@ -73,8 +72,8 @@ fn the_second_fire_lands_the_second_cells() {
         rig.publish(text.instance, 0, &req.text);
         rig.publish(image.instance, 0, &req.image);
         let lanes = vec![
-            lane(rig, 0, &text, LaneStream::Text, 0),
-            lane(rig, 1, &image, LaneStream::Image, 0),
+            lane(rig, 0, &text, "text", 0),
+            lane(rig, 1, &image, "image", 0),
         ];
         let attachments = vec![attach(0, &text), attach(1, &image)];
         let mut ticket = rig

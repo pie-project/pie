@@ -7,7 +7,9 @@ pub struct LaneMask<'a> {
     pub mask: Option<&'a Masking>,
     pub have: u32,
     pub rows: u32,
-    pub bidirectional: bool,
+    /// Attends both ways: each row reads every key the lane holds; enable flag 2, every bit kept
+    /// unless a mask is stated.
+    pub wide: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -18,7 +20,7 @@ pub struct Staged {
 }
 
 pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
-    if lanes.iter().all(|lane| lane.mask.is_none()) {
+    if lanes.iter().all(|lane| lane.mask.is_none() && !lane.wide) {
         return Ok(None);
     }
 
@@ -26,8 +28,12 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
     for (at, lane) in lanes.iter().enumerate() {
         let kv = u64::from(lane.have) + u64::from(lane.rows);
         let Some(masking) = lane.mask else {
+            if lane.wide {
+                widest = widest.max(kv);
+            }
             continue;
         };
+
         for mask in masking.masks() {
             if mask.total < kv {
                 return Err(Fault::Mask {
@@ -37,6 +43,7 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                 });
             }
         }
+
         if let Some(stated) = masking.stated_rows()
             && stated != lane.rows as usize
         {
@@ -69,14 +76,22 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
 
     let mut row = 0usize;
     for lane in lanes {
+        let kv = u64::from(lane.have) + u64::from(lane.rows);
+        let flag = if lane.wide { 2 } else { 1 };
         let Some(masking) = lane.mask else {
+            if lane.wide {
+                for q in 0..u64::from(lane.rows) {
+                    out.enabled[row + q as usize] = flag;
+                    for key in 0..kv {
+                        keep(&mut out.bytes, stride, row as u64 + q, key);
+                    }
+                }
+            }
             row += lane.rows as usize;
             continue;
         };
-        let kv = u64::from(lane.have) + u64::from(lane.rows);
-        let word = if lane.bidirectional { 2 } else { 1 };
         for q in 0..lane.rows as usize {
-            out.enabled[row + q] = word;
+            out.enabled[row + q] = flag;
         }
         let base = row as u64;
         match masking {
@@ -86,7 +101,7 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                     let end = at_position.saturating_add(u64::from(run)).min(kv);
                     if index % 2 == 1 {
                         for key in at_position..end {
-                            let first = if lane.bidirectional {
+                            let first = if lane.wide {
                                 0
                             } else {
                                 key.saturating_sub(u64::from(lane.have))
@@ -105,7 +120,8 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
             Masking::Rows(masks) => {
                 for (q, mask) in masks.iter().enumerate() {
                     let q = q as u64;
-                    let bound = if lane.bidirectional {
+
+                    let bound = if lane.wide {
                         kv
                     } else {
                         u64::from(lane.have) + q
@@ -145,20 +161,20 @@ mod tests {
 
     #[test]
     fn mask_every_case() {
-        a_bidirectional_lane_keeps_the_keys_after_the_row();
+        a_wide_lane_keeps_the_keys_after_the_row();
         a_per_row_mask_of_the_wrong_height_is_refused();
         a_short_per_row_mask_is_refused_for_its_extent_first();
         a_fire_with_no_masks_stages_nothing();
         a_mask_short_of_its_lanes_extent_is_refused();
     }
 
-    fn a_bidirectional_lane_keeps_the_keys_after_the_row() {
+    fn a_wide_lane_keeps_the_keys_after_the_row() {
         let all = Masking::Extent(Mask::new(vec![0, 3], 3));
         let causal = stage(&[LaneMask {
             mask: Some(&all),
             have: 1,
             rows: 2,
-            bidirectional: false,
+            wide: false,
         }])
         .unwrap()
         .unwrap();
@@ -168,7 +184,7 @@ mod tests {
             mask: Some(&all),
             have: 1,
             rows: 2,
-            bidirectional: true,
+            wide: true,
         }])
         .unwrap()
         .unwrap();
@@ -179,7 +195,7 @@ mod tests {
             mask: Some(&rows),
             have: 1,
             rows: 2,
-            bidirectional: true,
+            wide: true,
         }])
         .unwrap()
         .unwrap();
@@ -192,7 +208,7 @@ mod tests {
             mask: Some(&short),
             have: 0,
             rows: 3,
-            bidirectional: false,
+            wide: false,
         }]);
         assert!(
             matches!(
@@ -223,7 +239,7 @@ mod tests {
             mask: Some(&short),
             have: 1,
             rows: 3,
-            bidirectional: false,
+            wide: false,
         }]);
         assert!(
             matches!(
@@ -243,7 +259,7 @@ mod tests {
             mask: None,
             have: 4,
             rows: 1,
-            bidirectional: false,
+            wide: false,
         }])
         .expect("no mask is no error");
         assert_eq!(staged, None);
@@ -255,7 +271,7 @@ mod tests {
             mask: Some(&mask),
             have: 7,
             rows: 1,
-            bidirectional: false,
+            wide: false,
         }]);
         assert!(
             matches!(

@@ -8,9 +8,7 @@ use checkpoint::file::emit::{self, Object};
 use checkpoint::serving::Stamp;
 use engine::Engine;
 use engine::channel::ChannelRegistration;
-use engine::fire::{
-    Attachment, Boundary, FrameSubmission, Lane, LaneStream, PortFeed, PortKind, Readout, Step,
-};
+use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Loaded, Residency};
 use engine::program::{InstanceBinding, ProgramRegistration};
 use engine::{ChannelId, InstanceId, ProgramId};
@@ -19,13 +17,13 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::Op;
-use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
+use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
-use eta_ir::validate::bind;
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Trace, Value, Weight, ops, seam,
     trace_hybrid,
 };
+use poem_ir::InputAxis;
 
 pub const WIDTH: u32 = 32;
 pub const HEAD_DIM: u32 = 64;
@@ -46,7 +44,7 @@ impl ForwardHybrid for EncoderLayer {
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
-        let x = inputs.latents(0, WIDTH, Dtype::Bf16);
+        let x = inputs.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
         let table = ops::elemwise::relative_bucket_bias(
             inputs.recorder(),
             &Weight::sym(
@@ -281,6 +279,7 @@ pub fn epilogue(rows: u32) -> TraceContainer {
             ops: vec![Op::ChanTake(0), Op::ChanPut { chan: 1, value: 0 }],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
@@ -347,15 +346,23 @@ impl Rig {
         }
     }
 
-    pub fn profile(&self) -> &ModelProfile {
-        &self.loaded.caps.profile
+    pub fn reads_out(&self, kind: poem_ir::ReadoutKind) -> Option<u32> {
+        self.loaded
+            .caps
+            .classes
+            .classes
+            .iter()
+            .filter_map(|class| class.readout)
+            .find(|readout| readout.kind == kind)
+            .map(|readout| readout.width)
     }
 
     fn program(&mut self, rows: u32) -> ProgramId {
         if let Some(id) = self.programs.get(&rows) {
             return *id;
         }
-        let bound = bind(epilogue(rows), self.profile().clone()).expect("the epilogue binds");
+        let bound =
+            crate::bound::loaded(epilogue(rows), &self.loaded.caps).expect("the epilogue binds");
         let stages = compile_bound(&bound);
         let launch = eta_compiler::codegen::launch::build(&bound, &stages);
         let backend =
@@ -438,12 +445,10 @@ pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, group: u32) -> Lane {
         word: rig.facts.word(&Request::new(handles.rows, false)),
         tokens: vec![0; handles.rows as usize],
         readout: Readout::Rows((0..handles.rows).collect()),
-        stream: LaneStream::Text,
         group: Some(group),
-        reading: 0,
-        ports: vec![PortFeed {
-            kind: PortKind::Latents,
-            port: 0,
+        // `latents`, the plan's one input.
+        inputs: vec![InputFeed {
+            id: 0,
             channel: handles.latent,
         }],
         ..Lane::default()
@@ -453,8 +458,9 @@ pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, group: u32) -> Lane {
 pub fn attach(lane: u32, handles: &LaneHandles) -> Attachment {
     Attachment {
         lane,
+        lanes: 1,
         instance: handles.instance,
-        at: Boundary::Epilogue,
+        adapter_only: false,
     }
 }
 

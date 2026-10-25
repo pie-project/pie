@@ -21,46 +21,48 @@ fn logits_shape() -> Shape {
 }
 
 pub fn logits() -> Tensor {
-    let t = intrinsic_val(IntrinsicId::Logits, logits_shape(), Dtype::F32);
+    let t = intrinsic_val(IntrinsicId::Logits, 0, logits_shape(), Dtype::F32);
     single_row_reshape(t)
 }
 pub fn mtp_logits(k: u32) -> Tensor {
     intrinsic_val(
         IntrinsicId::MtpLogits,
+        0,
         Shape::matrix(k, vocab()),
         Dtype::F32,
     )
 }
 pub fn mtp_drafts(n: u32) -> Tensor {
-    intrinsic_val(IntrinsicId::MtpDrafts, Shape::vector(n.max(1)), Dtype::I32)
+    intrinsic_val(
+        IntrinsicId::MtpDrafts,
+        0,
+        Shape::vector(n.max(1)),
+        Dtype::I32,
+    )
 }
-pub fn hidden(width: u32) -> Tensor {
-    let rows = current_rows().max(1);
+/// Lane `lane`'s `rows` hidden rows, `width` wide.
+pub fn hidden(lane: u32, rows: u32, width: u32) -> Tensor {
     intrinsic_val(
         IntrinsicId::Hidden,
-        Shape::matrix(rows, width.max(1)),
+        lane,
+        Shape::matrix(rows.max(1), width.max(1)),
         activation_type,
     )
 }
-pub fn velocity(width: u32) -> Tensor {
-    let rows = current_rows().max(1);
+/// Lane `lane`'s velocity, `rows` rows `width` wide.
+pub fn velocity(lane: u32, rows: u32, width: u32) -> Tensor {
     intrinsic_val(
         IntrinsicId::Velocity,
-        Shape::matrix(rows, width.max(1)),
+        lane,
+        Shape::matrix(rows.max(1), width.max(1)),
         activation_type,
     )
 }
-pub fn peer_velocity(width: u32) -> Tensor {
-    let rows = current_rows().max(1);
-    intrinsic_val(
-        IntrinsicId::PeerVelocity,
-        Shape::matrix(rows, width.max(1)),
-        activation_type,
-    )
-}
-pub fn pixels(rows: u32, width: u32) -> Tensor {
+/// Lane `lane`'s `rows` pixel rows, `width` wide.
+pub fn pixels(lane: u32, rows: u32, width: u32) -> Tensor {
     intrinsic_val(
         IntrinsicId::Pixels,
+        lane,
         Shape::matrix(rows.max(1), width.max(1)),
         activation_type,
     )
@@ -68,23 +70,18 @@ pub fn pixels(rows: u32, width: u32) -> Tensor {
 pub fn query(width: u32) -> Tensor {
     intrinsic_val(
         IntrinsicId::Query,
+        0,
         Shape::vector(width.max(1)),
         activation_type,
     )
 }
-pub fn value_head() -> Tensor {
-    intrinsic_val(
-        IntrinsicId::ValueHead,
-        Shape::vector(current_rows().max(1)),
-        Dtype::F32,
-    )
-}
 pub fn layer() -> Tensor {
-    intrinsic_val(IntrinsicId::Layer, Shape::SCALAR, Dtype::U32)
+    intrinsic_val(IntrinsicId::Layer, 0, Shape::SCALAR, Dtype::U32)
 }
 pub fn attn_score(planes: u32) -> Tensor {
     intrinsic_val(
         IntrinsicId::AttnScore,
+        0,
         Shape::matrix(planes.max(1), eta_ir::registry::ATTN_SCORE_KV_MAX),
         Dtype::F32,
     )
@@ -119,6 +116,7 @@ pub mod kernel {
         let query = emit(
             Op::IntrinsicVal {
                 intr: IntrinsicId::Query,
+                lane: 0,
                 shape: query_ty.shape,
                 dtype: query_ty.dtype,
             },

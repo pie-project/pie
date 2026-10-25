@@ -12,7 +12,7 @@ import * as session from '../session.js';
 import * as chat from '../chat.js';
 import * as reasoning from '../reasoning.js';
 import * as inferlet from '../index.js';
-import { Channel, ForwardPass, InferletError, Port, WorkingSet, dtype } from '../eta/index.js';
+import { Channel, ForwardPass, Port, WorkingSet, dtype } from '../eta/index.js';
 import { ForwardPassStub, chatScript, reasoningScript, sessionSpy } from './stubs.js';
 
 describe('package surface', () => {
@@ -48,9 +48,10 @@ describe('model', () => {
     expect(model.defaultSystemSpeculation()).toBe(false);
   });
 
-  it('takes the one text interface whatever state the model keeps', () => {
-    expect(model.passKind()).toBe('text');
+  it('reports recurrent state and declared switches', () => {
     expect(model.rsStateSize()).toBeGreaterThan(0);
+    expect(model.switchDecl('mode')?.values).toEqual(['encode', 'denoise']);
+    expect(model.switchDecl('reading')).toBeUndefined();
   });
 
   it('exposes memory-shaping capabilities', () => {
@@ -62,7 +63,7 @@ describe('model', () => {
   });
 
   it('exposes diffusion and drafting facts', () => {
-    expect(model.canvas()).toEqual({ length: 32, hidden: 2560, selfCondTaps: 4 });
+    expect(model.lane([['mode', 'denoise']]).inputs.map((i) => i.name)).toEqual(['self_cond_ids']);
     expect(model.draftBlock()).toBeUndefined();
     expect(model.runAheadWindow()).toBe(4);
   });
@@ -249,10 +250,9 @@ describe('eta state binding', () => {
     expect(stub(fwd).stateArgs![1].fold).toBe(first);
   });
 
-  it('keeps checkpoints on the text pass', () => {
+  it('keeps checkpoints on the pass', () => {
     const fwd = new ForwardPass();
     fwd.checkpoints([16, 32]);
     expect(stub(fwd).checkpointSlots).toEqual([16, 32]);
-    expect(() => new ForwardPass('diffusion').checkpoints([16])).toThrow(InferletError);
   });
 });

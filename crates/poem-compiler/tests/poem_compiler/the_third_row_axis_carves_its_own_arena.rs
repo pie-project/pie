@@ -27,7 +27,7 @@ impl ForwardHybrid for Encoder {
     }
     fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
-        let x = inputs.voxels(0, C, Dtype::Bf16);
+        let x = inputs.input("voxels", Dtype::Bf16, poem_ir::InputAxis::Voxel, C, None);
         let (h, g1) = conv::conv3d(&x, &g, &conv("conv", C, C), None, ConvShape::same3(), None);
         let h = conv::group_norm(
             &h,
@@ -52,7 +52,7 @@ impl ForwardHybrid for Decoder {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
-        let latents = inputs.latents(0, C * 4, Dtype::Bf16);
+        let latents = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, C * 4, None);
         let w = Weight::sym("proj", [u64::from(C) * 4, u64::from(C) * 4], Dtype::Bf16);
         let tokens = ops::linear::matmul(&latents, &w);
         let g = inputs.grid();

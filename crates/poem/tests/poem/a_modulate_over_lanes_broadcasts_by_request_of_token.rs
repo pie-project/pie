@@ -20,13 +20,13 @@ impl ForwardHybrid for AdaLn {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
-        let x = inputs.latents(0, WIDTH, Dtype::Bf16);
+        let x = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, WIDTH, None);
         let ada = Weight::sym("ada", [2 * u64::from(WIDTH), u64::from(FREQ)], Dtype::Bf16);
         let gate = Weight::sym("gate", [u64::from(WIDTH), u64::from(FREQ)], Dtype::Bf16);
         let normed = ops::elemwise::layernorm_no_scale(&x, 1e-6);
         let (m, g, lanes) = match self.0 {
             By::Lane => {
-                let t = inputs.lane_vector(0, 1);
+                let t = inputs.input("lane", Dtype::F32, poem_ir::InputAxis::Lane, 1, None);
                 let emb = ops::elemwise::sinusoid(&t, FREQ, 10_000.0, true, 1.0);
                 let emb = ops::elemwise::silu(&emb);
                 (
@@ -36,7 +36,7 @@ impl ForwardHybrid for AdaLn {
                 )
             }
             By::Token => {
-                let t = inputs.latents(1, 1, Dtype::F32);
+                let t = inputs.input("latents1", Dtype::F32, poem_ir::InputAxis::Row, 1, None);
                 let emb = ops::elemwise::sinusoid(&t, FREQ, 10_000.0, false, 1000.0);
                 (
                     ops::linear::matmul(&emb, &ada),
@@ -209,8 +209,8 @@ impl ForwardHybrid for WrongWidth {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
-        let x = inputs.latents(0, WIDTH, Dtype::Bf16);
-        let m = inputs.lane_vector(0, WIDTH);
+        let x = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, WIDTH, None);
+        let m = inputs.input("lane", Dtype::F32, poem_ir::InputAxis::Lane, WIDTH, None);
         ops::elemwise::modulate(
             &x,
             &m,

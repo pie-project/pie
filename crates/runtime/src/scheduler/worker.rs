@@ -1551,14 +1551,6 @@ impl BatchScheduler {
                         ));
                     }
                     if let Some(stamp) = launch.frame {
-                        let cohort = launch
-                            .request
-                            .lanes
-                            .first()
-                            .and_then(|lane| {
-                                crate::pipeline::instance::cohort_key(lane.group, lane.peer)
-                            })
-                            .zip(launch.request.cohort);
                         frame_policy.on_fire_reading(
                             stamp,
                             launch.process_id,
@@ -1566,7 +1558,6 @@ impl BatchScheduler {
                             launch.request.tokens(),
                             launch.wire_row_count(),
                             launch.request.readouts(),
-                            cohort,
                         );
                     }
                     Self::queue_attempt(pending, launch);
@@ -2132,12 +2123,12 @@ impl BatchScheduler {
                     }
                     FramePlan::Park => break,
                     FramePlan::Terminate(doomed) => {
-                        for (pid, doom) in doomed {
-                            let reason = doom.to_string();
+                        for pid in doomed {
+                            let reason = super::frame::ABANDONED;
                             tracing::error!(pid = %pid, "scheduler: terminating pipeline: {reason}");
                             crate::inferlet::process::terminate_by(
                                 pid,
-                                Err(reason),
+                                Err(reason.to_string()),
                                 crate::policy::By::Host,
                             );
                         }

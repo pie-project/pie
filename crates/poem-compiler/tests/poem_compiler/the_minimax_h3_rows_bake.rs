@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
+use poem::generative::ScheduleKind;
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, Operation, Platform, RaggedMask, Request, RopeForm,
-    RuntimeInput, Stream, Trace, Ty, seam,
+    RuntimeInput, Trace, Ty, seam,
 };
+use poem_ir::InputAxis;
 
 use crate::minimax_h3_dims::{self as model, Dims};
 
@@ -53,9 +54,9 @@ fn seams(plan: &Trace) -> BTreeMap<&str, usize> {
 
 #[test]
 fn the_minimax_h3_rows_bake_every_case() {
+    the_video_and_reference_latents_are_patched_in_the_graph();
     every_row_traces_on_every_platform_with_the_encoder_it_declares();
     the_seams_are_the_two_float_readouts_and_never_logits();
-    the_ports_the_trace_reads_are_the_ports_the_facts_declare();
     every_lane_the_facts_list_lands_in_a_class_where_the_merges_resolve();
     one_joint_read_per_block_and_one_lane_read_per_refiner();
     the_trunk_turns_three_neox_axes_and_the_refiner_turns_nothing();
@@ -64,6 +65,48 @@ fn the_minimax_h3_rows_bake_every_case() {
     the_generative_facts_state_the_readings_the_latent_and_two_shifts();
     the_modulation_is_a_lane_vector_and_every_gated_fold_folds_its_residual();
     the_gather_merges_four_lane_shaped_arms_back_onto_the_reading();
+    the_positions_are_computed_in_the_graph_unless_given();
+}
+
+fn the_positions_are_computed_in_the_graph_unless_given() {
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let count = |f: &dyn Fn(&Operation) -> bool| plan.nodes.iter().filter(|n| f(&n.op)).count();
+        assert_eq!(
+            count(&|op| matches!(op, Operation::Conv(poem_ir::Conv::Cells { axis: 0, .. }))),
+            2,
+            "`{deployment}`: every row's cell, and the video lane's own for its peers"
+        );
+        assert_eq!(
+            count(&|op| matches!(op, Operation::Gather(poem_ir::Gather::GroupFirst { .. }))),
+            1,
+            "`{deployment}`: the audio pins to its group's video grid"
+        );
+        assert_eq!(
+            count(&|op| matches!(op, Operation::Gather(poem_ir::Gather::GroupRows { .. }))),
+            2,
+            "`{deployment}`: the text prefix and the audio ticks, read off the group"
+        );
+        assert_eq!(
+            plan.facts
+                .declared("positions")
+                .map(|s| s.values.clone())
+                .unwrap_or_default(),
+            vec!["computed", "given"],
+            "`{deployment}`: positions are computed unless a lane gives them"
+        );
+        let positions = plan
+            .inputs
+            .iter()
+            .position(|i| i.name == "positions")
+            .expect("a positions input");
+        assert!(
+            plan.values.iter().any(|v| matches!(v.def,
+                Def::Input(RuntimeInput::Guest { id, axis: InputAxis::Row, width, .. })
+                    if id as usize == positions && width == 3)),
+            "`{deployment}`: a `given` lane reads (t, h, w) a row"
+        );
+    }
 }
 
 fn every_row_traces_on_every_platform_with_the_encoder_it_declares() {
@@ -110,116 +153,16 @@ fn the_seams_are_the_two_float_readouts_and_never_logits() {
     }
 }
 
-fn kind_code(kind: PortKind) -> u8 {
-    match kind {
-        PortKind::Latents => 0,
-        PortKind::LaneVector => 1,
-        PortKind::Context => 2,
-        PortKind::AxisPositions => 3,
-        PortKind::Voxels => 4,
+fn lanes(deployment: &str) -> Vec<(&'static str, &'static str)> {
+    let mut lanes = Vec::new();
+    if is_flagship(deployment) {
+        lanes.push(("text", "text"));
     }
-}
-
-fn ports_read(plan: &Trace) -> BTreeSet<(u8, u8, u32)> {
-    let mut found = BTreeSet::new();
-    for value in &plan.values {
-        let Def::Input(input) = &value.def else {
-            continue;
-        };
-        let width = |ty: &Ty| match ty {
-            Ty::Tensor { shape, .. } => match shape.as_slice() {
-                [_, Dim::Const(width)] => u32::try_from(*width).unwrap_or(0),
-                _ => 1,
-            },
-            _ => 0,
-        };
-        let entry = match input {
-            RuntimeInput::Latents { port, .. } => {
-                Some((PortKind::Latents, *port, width(&value.ty)))
-            }
-            RuntimeInput::LaneVector { port, width } => Some((PortKind::LaneVector, *port, *width)),
-            RuntimeInput::Context { port, width } => Some((PortKind::Context, *port, *width)),
-            RuntimeInput::AxisPositions { port, axes } => {
-                Some((PortKind::AxisPositions, *port, u32::from(*axes)))
-            }
-            RuntimeInput::Voxels { port, channels } => Some((PortKind::Voxels, *port, *channels)),
-            _ => None,
-        };
-        if let Some((kind, port, width)) = entry {
-            found.insert((kind_code(kind), port, width));
-        }
+    lanes.push(("refine", "text"));
+    for stream in ["text", "video", "audio", "reference"] {
+        lanes.push(("denoise", stream));
     }
-    found
-}
-
-fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
-    for deployment in ROWS {
-        let facts = row(deployment).generative().expect("generative facts");
-        let declared: BTreeSet<(u8, u8, u32)> = facts
-            .readings
-            .iter()
-            .flat_map(|reading| {
-                reading
-                    .ports_indexed()
-                    .map(|(index, port)| (kind_code(port.kind), index, port.width))
-            })
-            .collect();
-        assert_eq!(
-            ports_read(&trace(deployment, Platform::Cuda)),
-            declared,
-            "`{deployment}`: the trace's runtime inputs and the readings' ports"
-        );
-        for reading in &facts.readings {
-            for (positional, port) in reading.ports_indexed() {
-                let (by_name, _) = reading.port(&port.name).expect("a declared port by name");
-                assert_eq!(
-                    by_name, positional,
-                    "`{deployment}` reading `{}` port `{}`: the positional index and the stated one",
-                    reading.name, port.name
-                );
-            }
-        }
-        let denoise = facts
-            .readings
-            .iter()
-            .find(|reading| reading.name == "denoise")
-            .expect("a denoise reading");
-        for (name, kind, index) in [
-            ("latents", PortKind::Latents, model::port::LATENTS),
-            ("reference", PortKind::Latents, model::port::REFERENCE),
-            ("audio", PortKind::Latents, model::port::AUDIO),
-            ("context", PortKind::Latents, model::port::CONTEXT),
-            ("timestep", PortKind::LaneVector, model::port::TIMESTEP),
-            ("positions", PortKind::AxisPositions, model::port::POSITIONS),
-        ] {
-            let (at, fact) = denoise.port(name).unwrap_or_else(|| {
-                panic!("`{deployment}`: the denoise reading declares no `{name}` port")
-            });
-            assert_eq!(
-                (fact.kind, at),
-                (kind, index),
-                "`{deployment}`: port `{name}`"
-            );
-        }
-    }
-}
-
-fn lanes(deployment: &str) -> Vec<(String, u8, Stream)> {
-    let facts = row(deployment).generative().expect("generative facts");
-    facts
-        .readings
-        .iter()
-        .flat_map(|reading| {
-            let streams = if reading.streams.is_empty() {
-                vec![Stream::Text]
-            } else {
-                reading.streams.clone()
-            };
-            streams
-                .into_iter()
-                .map(move |stream| (reading.name.clone(), reading.index, stream))
-        })
-        .collect()
+    lanes
 }
 
 fn every_lane_the_facts_list_lands_in_a_class_where_the_merges_resolve() {
@@ -227,9 +170,11 @@ fn every_lane_the_facts_list_lands_in_a_class_where_the_merges_resolve() {
         let plan = trace(deployment, Platform::Cuda);
         let classes = poem::resolve_classes(&plan).expect("every merge resolves");
         let _catalog = row(deployment);
-        let mut seen: Vec<((String, Stream), usize)> = Vec::new();
-        for (name, _index, stream) in lanes(deployment) {
-            let request = Request::new(4, false).on_stream(stream).in_reading(&name);
+        let mut seen: Vec<((&str, &str), usize)> = Vec::new();
+        for (name, stream) in lanes(deployment) {
+            let request = Request::new(4, false)
+                .switched("stream", stream)
+                .switched("reading", name);
             let word = plan.facts.word(&request);
             let class = classes
                 .class_of(word & classes.mask)
@@ -367,31 +312,37 @@ fn the_modality_gather_is_three_weight_blocks_and_one_column_slice() {
                 );
             }
         }
-        let pairs: BTreeSet<(u32, usize)> = [
-            Stream::Text,
-            Stream::Video,
-            Stream::Audio,
-            Stream::Reference,
-        ]
-        .into_iter()
-        .map(|s| (model::timestep_slot(s), model::modality(s)))
-        .collect();
+        let pairs: BTreeSet<(u32, usize)> = ["text", "video", "audio", "reference"]
+            .into_iter()
+            .map(|s| (model::timestep_slot(s), model::modality(s)))
+            .collect();
         assert_eq!(
             pairs.len(),
             4,
             "`{deployment}`: the four lanes gather four different modulation vectors"
         );
-        let facts = row(deployment).generative().expect("facts");
-        let denoise = facts
-            .readings
+        let timestep = plan
+            .inputs
             .iter()
-            .find(|reading| reading.name == "denoise")
-            .expect("a denoise reading");
-        let (_, timestep) = denoise.port("timestep").expect("a timestep port");
+            .position(|input| input.name == "timestep")
+            .expect("a timestep input") as u32;
+        let widths: BTreeSet<u32> = plan
+            .values
+            .iter()
+            .filter_map(|decl| match &decl.def {
+                Def::Input(RuntimeInput::Guest {
+                    id,
+                    axis: InputAxis::Lane,
+                    width,
+                    ..
+                }) if *id == timestep => Some(*width),
+                _ => None,
+            })
+            .collect();
         assert_eq!(
-            timestep.width,
-            model::TIMESTEP_SLOTS,
-            "`{deployment}`: the timestep port carries every unique timestep of the step"
+            widths,
+            BTreeSet::from([model::TIMESTEP_SLOTS]),
+            "`{deployment}`: the timestep input carries every unique timestep of the step"
         );
     }
 }
@@ -416,7 +367,13 @@ fn the_sharded_worlds_trace_and_bake() {
             model::TE_LAYERS as usize,
             "tp {tp}: one kv row per encoder layer"
         );
-        poem_compiler::compile(&plan, &budget(), &poem_compiler::DeviceProfile::default())
+        let budgets =
+            poem_compiler::Budgets::of(budget()).with_voxels(poem_compiler::VoxelLadder {
+                max_voxels: 16_384,
+                buckets: vec![1024, 16_384],
+                max_clips: 8,
+            });
+        poem_compiler::compile_axes(&plan, &budgets, &poem_compiler::DeviceProfile::default())
             .unwrap_or_else(|why| panic!("`{deployment}` does not bake: {why}"));
         for which in 0..model::MODALITIES {
             let name = format!("dit.blocks.0.adaln.{which}.w");
@@ -437,20 +394,11 @@ fn the_sharded_worlds_trace_and_bake() {
 fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
     for deployment in ROWS {
         let facts = row(deployment).generative().expect("facts");
-        for (at, reading) in facts.readings.iter().enumerate() {
-            assert_eq!(
-                usize::from(reading.index),
-                at,
-                "`{deployment}`: readings are dense from 0 in index order"
-            );
-            assert!(
-                reading.positions.is_none(),
-                "`{deployment}` reading `{}`: H3's shared audio-tick time axis is not a stated \
-                 convention",
-                reading.name
-            );
-        }
-        let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
+        let names = trace(deployment, Platform::Cuda)
+            .facts
+            .declared("reading")
+            .map(|s| s.values.clone())
+            .unwrap_or_default();
         assert_eq!(
             names,
             if is_flagship(deployment) {
@@ -464,32 +412,23 @@ fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
         assert_eq!(
             (
                 latent.channels,
-                latent.patch_t,
-                latent.patch_h,
-                latent.patch_w,
                 latent.spatial_compression,
                 latent.temporal_compression
             ),
-            (24, 1, 2, 2, 16, 4),
-            "`{deployment}`: the f16 t4 c24 latent under a (1, 2, 2) patch"
+            (24, 16, 4),
+            "`{deployment}`: the f16 t4 c24 latent"
         );
         let schedule = facts.schedule.as_ref().expect("a schedule");
         assert_eq!(schedule.kind, ScheduleKind::Flow);
         assert_eq!(schedule.shift, model::VIDEO_SHIFT);
         assert_eq!(
-            schedule
-                .stream_shifts
-                .iter()
-                .find(|(s, _)| *s == Stream::Video),
-            Some(&(Stream::Video, model::VIDEO_SHIFT)),
+            schedule.stream_shifts.iter().find(|(s, _)| s == "video"),
+            Some(&("video".to_string(), model::VIDEO_SHIFT)),
             "`{deployment}`: the video grid's shift"
         );
         assert_eq!(
-            schedule
-                .stream_shifts
-                .iter()
-                .find(|(s, _)| *s == Stream::Audio),
-            Some(&(Stream::Audio, model::AUDIO_SHIFT)),
+            schedule.stream_shifts.iter().find(|(s, _)| s == "audio"),
+            Some(&("audio".to_string(), model::AUDIO_SHIFT)),
             "`{deployment}`: the audio grid's shift, run in the same evaluation"
         );
         assert_eq!(
@@ -501,13 +440,6 @@ fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
             schedule.pinned_sigmas.windows(2).all(|w| w[0] > w[1]),
             "`{deployment}`: the sigma grid descends"
         );
-        let denoise = facts
-            .readings
-            .iter()
-            .find(|reading| reading.name == "denoise")
-            .expect("a denoise reading");
-        assert_eq!(denoise.readout, ReadoutKind::Velocity);
-        assert_eq!(denoise.readout_width, model::VIDEO_FEATURES);
     }
 }
 
@@ -590,8 +522,64 @@ fn the_gather_merges_four_lane_shaped_arms_back_onto_the_reading() {
             })
             .count();
         assert_eq!(
-            token_merges, 1,
-            "`{deployment}`: one packed row sequence, joined once"
+            token_merges, 2,
+            "`{deployment}`: the packed row sequence and its computed positions, each joined once"
+        );
+    }
+}
+
+fn the_video_and_reference_latents_are_patched_in_the_graph() {
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let voxel_inputs: BTreeSet<(String, u32)> = plan
+            .values
+            .iter()
+            .filter_map(|decl| match &decl.def {
+                Def::Input(RuntimeInput::Guest {
+                    id,
+                    axis: InputAxis::Voxel,
+                    width,
+                    ..
+                }) => Some((plan.inputs[*id as usize].name.clone(), *width)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            voxel_inputs,
+            BTreeSet::from([
+                ("latents".to_string(), model::LATENT_CHANNELS),
+                ("reference".to_string(), model::LATENT_CHANNELS),
+            ]),
+            "`{deployment}`: the video and reference clips share the voxel axis at one width"
+        );
+        let patch = [1, 2, 2];
+        let count = |f: &dyn Fn(&poem_ir::Conv) -> bool| {
+            plan.nodes
+                .iter()
+                .filter(|node| matches!(&node.op, Operation::Conv(op) if f(op)))
+                .count()
+        };
+        assert_eq!(
+            count(&|op| matches!(op, poem_ir::Conv::Patchify { p, .. } if *p == patch)),
+            2,
+            "`{deployment}`: the target and the reference patched in"
+        );
+        assert_eq!(
+            count(&|op| matches!(op, poem_ir::Conv::Unpatchify { p, .. } if *p == patch)),
+            1,
+            "`{deployment}`: the video velocity patched back out"
+        );
+        let velocity = plan
+            .seams
+            .iter()
+            .find(|s| s.seam == seam::VELOCITY.name)
+            .expect("a velocity seam")
+            .values[0];
+        assert!(
+            matches!(&plan.values[velocity.0 as usize].ty,
+                Ty::Tensor { shape, .. } if shape.as_slice()
+                    == [Dim::Voxels, Dim::Const(u64::from(model::LATENT_CHANNELS))]),
+            "`{deployment}`: the velocity reads out in the latent's own voxels"
         );
     }
 }

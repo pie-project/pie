@@ -144,8 +144,7 @@ async fn main(input: Input) -> Result<Output> {
             "prompt + max_tokens needs {kv_max} KV slots, past the published \
              attn_score ceiling of {}",
             intrinsics::attn_score_kv_max()
-        )
-        .into());
+        ));
     }
     let p_max = max_pages;
     let page_budget = input.page_budget.min(p_max);
@@ -232,14 +231,14 @@ async fn main(input: Input) -> Result<Output> {
 
             // `[planes, kv]` layer-major; dividing by `heads` averages heads and sums layers.
             let rect = intrinsics::attn_score(planes);
-            let fire_row = &reduce_sum(&transpose(&rect)) / heads_f;
+            let fire_row = &reduce_sum(transpose(&rect)) / heads_f;
             let prev = acc.take();
             let folded = &prev + &gather(&fire_row, iota(kv_max));
             scores_out.put(&folded);
             acc.put(&folded);
 
             // Exact: `kv_max = p_max * page_size`.
-            page_mass_out.put(&reduce_sum(&reshape(&folded, [p_max, page_size])));
+            page_mass_out.put(reduce_sum(reshape(&folded, [p_max, page_size])));
         });
 
         run_ahead(&pipe, &fwd, observe_fires, async || {
@@ -325,13 +324,8 @@ async fn main(input: Input) -> Result<Output> {
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
-        fwd.state(
-            &[&ws],
-            StateGeometry {
-                mask: Some(&mask),
-                ..StateGeometry::folding()
-            },
-        )?;
+        fwd.mask(&mask)?;
+        fwd.state(&[&ws], StateGeometry::folding())?;
         fwd.epilogue(move || {
             let length = fill.take();
             let r = rng.take();
@@ -344,7 +338,7 @@ async fn main(input: Input) -> Result<Output> {
             rng.put(&(&r + iota(2)));
 
             let k = keep.take();
-            mask.put(&and(&causal_mask(&length, kv_max), &k));
+            mask.put(and(causal_mask(&length, kv_max), &k));
             keep.put(&k);
         });
 

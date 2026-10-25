@@ -11,7 +11,7 @@
  * progress line or two and then sends its output as a file; what arrives is a
  * `ReceivedFile` -- a Buffer, with the name the inferlet suggested attached.
  * That name is the difference between writing `file-0000.bin` and writing
- * `image.latent.f32` (or `image.png`, on a model whose VAE decode reading the
+ * `image.latent.f32` (or `image.png`, on a model whose VAE decode the
  * guest can drive), so it is what this example is about.
  *
  * `text-to-image` must already be on the server: `pie inferlet install

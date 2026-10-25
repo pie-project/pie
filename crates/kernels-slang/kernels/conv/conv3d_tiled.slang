@@ -41,6 +41,9 @@ struct Params {
     int clips;
     int rows_out;
     uint has_bias;
+    // `x`'s and `o`'s row 0 in the grids' fire-wide rows (a segmented fire's window starts later).
+    int x_base;
+    int o_base;
 };
 PIE_PARAMS(6, Params, params);
 
@@ -88,10 +91,12 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         int4 box = int4(1, 1, 1, 0);
         if (row < params.rows_out) {
             Clip og;
-            int l = clip_of(o_grid, params.clips, row, og);
+            int fire_row = row + params.o_base;
+            int l = clip_of(o_grid, params.clips, fire_row, og);
             if (l >= 0) {
                 Clip in_ = clip_at(grid, l);
-                Voxel v = unravel(og, row - og.off);
+                in_.off -= params.x_base;
+                Voxel v = unravel(og, fire_row - og.off);
                 at = int4(v.t * params.st - params.pt, v.h * params.sh - params.ph, v.w * params.sw - params.pw, l);
                 box = int4(in_.t, in_.h, in_.w, in_.off);
             }

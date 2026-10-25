@@ -37,38 +37,10 @@ from enum import Enum
 # ---------------------------------------------------------------------------
 
 
-class ForwardKind(Enum):
-    TEXT = 0
-    DIFFUSION = 1
-
-
-class DiffusionMode(Enum):
-    ENCODE = 0
-    DENOISE = 1
-
-
-class AxisRole(Enum):
-    TIME = 0
-    HEIGHT = 1
-    WIDTH = 2
-    INDEX = 3
-
-
-class LaneStream(Enum):
-    TEXT = 0
-    IMAGE = 1
-    VIDEO = 2
-    AUDIO = 3
-    CONTEXT = 4
-    REFERENCE = 5
-
-
-class PortKind(Enum):
-    LATENTS = 0
-    LANE_VECTOR = 1
-    CONTEXT = 2
-    AXIS_POSITIONS = 3
-    VOXELS = 4
+class InputAxis(Enum):
+    LANE = 0
+    ROW = 1
+    VOXEL = 2
 
 
 class ReadoutKind(Enum):
@@ -86,18 +58,21 @@ class ScheduleKind(Enum):
 
 def _make_model() -> types.ModuleType:
     m = types.ModuleType("wit_world.imports.model")
-    m.ForwardKind = ForwardKind
-    m.AxisRole = AxisRole
-    m.LaneStream = LaneStream
-    m.PortKind = PortKind
+    m.InputAxis = InputAxis
+    m.InputDecl = InputDeclStub
+    m.LaneDecl = LaneDeclStub
+    m.Readout = ReadoutStub
     m.ReadoutKind = ReadoutKind
+    m.RowCount_Exact = RowCountExactStub
+    m.RowCount_Multiple = RowCountMultipleStub
+    m.RowCount = RowCountExactStub | RowCountMultipleStub
     m.ScheduleKind = ScheduleKind
+    m.SwitchDecl = SwitchDeclStub
     m.name = lambda: "mock-model"
     m.architecture = lambda: "qwen3_5"
     m.default_system_speculation = lambda: False
     m.mtp_depth = lambda: 0
     m.submit_deadline_us = lambda: 50_000
-    m.pass_kind = lambda: ForwardKind.TEXT
     m.output_vocab_size = lambda: 151936
     m.kv_page_size = lambda: 16
     m.frame_size = lambda: 1
@@ -106,9 +81,9 @@ def _make_model() -> types.ModuleType:
     m.rs_state_size = lambda: 4096
     m.run_ahead_window = lambda: 4
     m.BlockDrafter = BlockDrafterStub
-    m.CanvasShape = CanvasShapeStub
     m.draft_block = lambda: None
-    m.canvas = lambda: CanvasShapeStub(32, 2560, 4)
+    m.switches = lambda: [SwitchDeclStub("mode", ["encode", "denoise"])]
+    m.lane = _lane
     return m
 
 
@@ -116,15 +91,52 @@ def _make_model() -> types.ModuleType:
 class BlockDrafterStub:
     rows: int
     mask_token: int
-    bidirectional: bool
     proposals_from: int
 
 
 @dataclass
-class CanvasShapeStub:
-    length: int
-    hidden: int
-    self_cond_taps: int
+class RowCountExactStub:
+    value: int
+
+
+@dataclass
+class RowCountMultipleStub:
+    value: int
+
+
+@dataclass
+class SwitchDeclStub:
+    name: str
+    values: list[str]
+
+
+@dataclass
+class InputDeclStub:
+    name: str
+    axis: InputAxis
+    width: int
+    dtype: object
+    rows: int | None
+
+
+@dataclass
+class ReadoutStub:
+    kind: ReadoutKind
+    width: int
+
+
+@dataclass
+class LaneDeclStub:
+    inputs: list
+    state: bool
+    embeds: bool
+    readout: ReadoutStub | None
+
+
+def _lane(switches) -> LaneDeclStub:
+    denoise = ("mode", "denoise") in switches
+    inputs = [InputDeclStub("self_cond_ids", InputAxis.ROW, 4, "i32", None)] if denoise else []
+    return LaneDeclStub(inputs, True, True, ReadoutStub(ReadoutKind.LOGITS, 151936))
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +334,7 @@ def _make_reasoning() -> types.ModuleType:
 
 # ---------------------------------------------------------------------------
 # The forward-pass surface: pie:inferlet/{types, channel, pipeline,
-# working-set, forward, forward-diffusion} + the
+# working-set, forward} + the
 # componentize-py `Err` type. Enough for `inferlet.eta.bridge` to import and
 # for its host-side plumbing to be exercised without a device: a `Channel`
 # remembers what was put; `take()` hands it back.
@@ -429,7 +441,6 @@ class StateGeometry:
     positions: object
     slots: object
     kv_len: object
-    mask: object
     fold: object
 
 
@@ -444,6 +455,7 @@ class ForwardPassStub:
         self.checkpoint_slots = None
         self.program_bytes: bytes | None = None
         self.program_channels: list | None = None
+        self.switches: list[tuple[int, str, str]] = []
 
     def embed(self, tokens, indptr) -> None:
         self.embedded = (tokens, indptr)
@@ -457,33 +469,23 @@ class ForwardPassStub:
     def checkpoints(self, slots) -> None:
         self.checkpoint_slots = list(slots)
 
-    def set_max_layers(self, n: int) -> None:
-        self.max_layers = n
+    def media(self, lane: int, spans) -> None:
+        self.spans = (lane, spans)
 
-    def set_drafting_block(self, on: bool) -> None:
-        self.drafting = on
-
-    def media(self, spans) -> None:
-        self.spans = spans
-
-    def canvas(self, mode) -> None:
-        self.mode = mode
-
-    def self_conditioning(self, rows, weights) -> None:
-        self.self_cond = (list(rows), list(weights))
+    def switch(self, lane: int, name: str, value: str) -> None:
+        self.switches.append((lane, name, value))
 
     def program(self, container_bytes: bytes, channels) -> None:
         self.program_bytes = bytes(container_bytes)
         self.program_channels = list(channels)
 
 
-def _make_forward(name: str) -> types.ModuleType:
-    m = types.ModuleType(f"wit_world.imports.{name}")
+def _make_forward() -> types.ModuleType:
+    m = types.ModuleType("wit_world.imports.forward")
     m.ForwardPass = ForwardPassStub
     m.StateGeometry = StateGeometry
     m.MediaSpan_Image = lambda v: ("image", v)
     m.MediaSpan_Audio = lambda v: ("audio", v)
-    m.Mode = DiffusionMode
 
     def submit(on, slots) -> None:
         ForwardPassStub.submitted.append((on, list(slots)))
@@ -680,8 +682,7 @@ def install() -> None:
         "channel": _make_channel(),
         "pipeline": _make_pipeline(),
         "working_set": _make_working_set(),
-        "forward": _make_forward("forward"),
-        "forward_diffusion": _make_forward("forward_diffusion"),
+        "forward": _make_forward(),
         "grammar": _make_grammar(),
         "tools": _make_tools(),
         "media": _make_media(),

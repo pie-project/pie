@@ -368,7 +368,7 @@ fn check_mini(src: &ztensor::Source, index: &BTreeSet<String>) {
     let want: BTreeSet<&String> = index.iter().collect();
     assert_eq!(
         read, want,
-        "the miniature reads its whole state_dict and nothing else"
+        "the miniature reads its whole state_dict, and nothing else"
     );
     let twice: BTreeSet<String> = counts
         .iter()
@@ -525,8 +525,8 @@ fn the_derived_planes_are_stated_as_constants() {
         expr.visit(&mut |node| found |= matches!(node, Expr::Const { .. }));
         found
     };
-    for bank in ["dit.x_pad_mod", "dit.cap_pad_mod"] {
-        let bank = named(bank);
+    {
+        let bank = named("dit.cap_pad_mod");
         assert!(
             carries_a_constant(&bank.expr),
             "`{}`'s negative half is a constant the contract carries",

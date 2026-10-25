@@ -11,6 +11,9 @@
 use inferlet::eta::diffusion::prelude::*;
 use serde::{Deserialize, Serialize};
 
+/// Tokens per block's canvas.
+const CANVAS: u32 = 256;
+
 #[derive(Deserialize)]
 struct Input {
     /// `case.json`, as one string — for a case small enough to ride an
@@ -42,10 +45,6 @@ struct Input {
     /// Stop after the prefill rows (the trunk alone).
     #[serde(default)]
     only_prefill: bool,
-    /// Run only the first `max_layers` layers and take the head there —
-    /// the logit lens, against the reference's per-layer hidden states.
-    #[serde(default)]
-    max_layers: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -83,12 +82,20 @@ struct Output {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Diffusion {
-        return Err("this program reads a block-diffusion model; the bound model is not one".into());
+    if !model::switch("mode").is_some_and(|mode| mode.values.iter().any(|v| v == "denoise")) {
+        return Err(
+            "this program reads a block-diffusion model; the bound model is not one".into(),
+        );
     }
     let pieces: String = [
-        &input.case_0, &input.case_1, &input.case_2, &input.case_3,
-        &input.case_4, &input.case_5, &input.case_6, &input.case_7,
+        &input.case_0,
+        &input.case_1,
+        &input.case_2,
+        &input.case_3,
+        &input.case_4,
+        &input.case_5,
+        &input.case_6,
+        &input.case_7,
     ]
     .into_iter()
     .flatten()
@@ -103,19 +110,24 @@ async fn main(input: Input) -> Result<Output> {
             return Err("pass `case` (json), `case_0..7` (its pieces) or `case_file`".into());
         }
     };
-    let case: Case = inferlet::serde_json::from_str(&text)
-        .map_err(|why| format!("case json: {why}"))?;
-    let shape = model::canvas().ok_or("a diffusion model states its canvas")?;
-    let length = shape.length;
+    let case: Case =
+        inferlet::serde_json::from_str(&text).map_err(|why| format!("case json: {why}"))?;
+    let length = CANVAS;
     if case.canvas0.len() != length as usize || case.canvas1.len() != length as usize {
-        return Err(format!("the case's canvases are not {length} long").into());
+        return Err(format!("the case's canvases are not {length} long"));
     }
-    if case.taps != shape.self_cond_taps {
+    let lane = model::lane_of(&[("mode", "denoise")])?;
+    let taps = lane
+        .inputs
+        .iter()
+        .find(|input| input.name == "self_cond_ids")
+        .ok_or("the denoise lane reads no `self_cond_ids` input")?
+        .width;
+    if case.taps != taps {
         return Err(format!(
-            "the case carries {} taps per row and this model takes {}",
-            case.taps, shape.self_cond_taps
-        )
-        .into());
+            "the case carries {} taps per row and this model takes {taps}",
+            case.taps
+        ));
     }
     let n = u32::try_from(case.prompt_ids.len()).map_err(|_| "prompt is too long")?;
     let temperature = case.temperature;
@@ -140,10 +152,6 @@ async fn main(input: Input) -> Result<Output> {
         let probs_out = Channel::new([len, 8], dtype::f32).named(&format!("probs_{tag}"));
 
         let fwd = ForwardPass::new();
-        fwd.canvas(Mode::Encode)?;
-        if let Some(k) = input.max_layers {
-            fwd.set_max_layers(k)?;
-        }
         fwd.embed(&toks, &embed_indptr)?;
         fwd.state(
             &[&ws],
@@ -163,15 +171,38 @@ async fn main(input: Input) -> Result<Output> {
             ids_out.put(top_i);
             probs_out.put(top_p);
         });
-        fwd.submit(&pipe).with_context(|| format!("prefill submit @{base}"))?;
-        prefill_rows.argmax.extend(arg_out.take_host::<Vec<i32>>().await?);
-        prefill_rows.entropy.extend(ent_out.take_host::<Vec<f32>>().await?);
-        prefill_rows.top8_ids.extend(ids_out.take_host::<Vec<u32>>().await?);
-        prefill_rows.top8_probs.extend(probs_out.take_host::<Vec<f32>>().await?);
+        fwd.submit(&pipe)
+            .with_context(|| format!("prefill submit @{base}"))?;
+        prefill_rows
+            .argmax
+            .extend(arg_out.take_host::<Vec<i32>>().await?);
+        prefill_rows
+            .entropy
+            .extend(ent_out.take_host::<Vec<f32>>().await?);
+        prefill_rows
+            .top8_ids
+            .extend(ids_out.take_host::<Vec<u32>>().await?);
+        prefill_rows
+            .top8_probs
+            .extend(probs_out.take_host::<Vec<f32>>().await?);
     }
     let prefill_argmax = *prefill_rows.argmax.last().unwrap_or(&0);
-    let prefill_top8_ids = prefill_rows.top8_ids.iter().rev().take(8).rev().copied().collect::<Vec<_>>();
-    let prefill_top8_probs = prefill_rows.top8_probs.iter().rev().take(8).rev().copied().collect::<Vec<_>>();
+    let prefill_top8_ids = prefill_rows
+        .top8_ids
+        .iter()
+        .rev()
+        .take(8)
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
+    let prefill_top8_probs = prefill_rows
+        .top8_probs
+        .iter()
+        .rev()
+        .take(8)
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
 
     // ── two denoise steps over the two stated canvases, then canvas0 the
     //    encode way (last: an encode pass commits its rows) ─────────────────
@@ -194,7 +225,9 @@ async fn main(input: Input) -> Result<Output> {
 
         let fwd = ForwardPass::new();
         let commit = at == 2;
-        fwd.canvas(if commit { Mode::Encode } else { Mode::Denoise })?;
+        if !commit {
+            fwd.switch(0, "mode", "denoise")?;
+        }
         fwd.embed(&toks, &embed_indptr)?;
         // A committed canvas folds; one the next step rewrites does not.
         fwd.state(
@@ -216,11 +249,29 @@ async fn main(input: Input) -> Result<Output> {
             ids_out.put(top_i);
             probs_out.put(top_p);
         });
-        if at == 1 {
-            fwd.self_conditioning(&case.taps_ids, &case.taps_weights)
-                .context("stage self-conditioning")?;
+        // A denoise step reads the taps: zeros (no signal) on step 0, the
+        // case's on step 1.
+        if !commit {
+            let cells = (length * taps) as usize;
+            let (ids, weights) = if at == 1 {
+                (
+                    case.taps_ids.iter().map(|&id| id as i32).collect(),
+                    case.taps_weights.clone(),
+                )
+            } else {
+                (vec![0i32; cells], vec![0f32; cells])
+            };
+            let ids =
+                Channel::from_shaped([length, taps], ids).named(&format!("self_cond_ids_{tag}"));
+            let weights = Channel::from_shaped([length, taps], weights)
+                .named(&format!("self_cond_weights_{tag}"));
+            fwd.input(0, "self_cond_ids", &ids)
+                .context("bind self_cond_ids")?;
+            fwd.input(0, "self_cond_weights", &weights)
+                .context("bind self_cond_weights")?;
         }
-        fwd.submit(&pipe).with_context(|| format!("denoise submit {at}"))?;
+        fwd.submit(&pipe)
+            .with_context(|| format!("denoise submit {at}"))?;
         steps.push(Rows {
             argmax: arg_out.take_host::<Vec<i32>>().await?,
             entropy: ent_out.take_host::<Vec<f32>>().await?,
