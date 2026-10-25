@@ -49,6 +49,15 @@ public class PieServer private constructor(private val handle: Long) : AutoClose
         @SerialName("sandbox_memory_mb") public var sandboxMemoryMB: Int = 256
         @SerialName("max_concurrent_processes") public var maxConcurrentProcesses: Int? = 4
 
+        /** Steps a submitted frame carries; null keeps the runtime's. */
+        @SerialName("frame_size") public var frameSize: Int? = null
+        /**
+         * Frames the engine keeps on the GPU's queue before a submit waits for
+         * the oldest to land, at most 15 (null keeps the runtime's 2): deeper
+         * lets a chain of dependent passes run while the host readies the next.
+         */
+        @SerialName("frame_dispatch_depth") public var frameDispatchDepth: Int? = null
+
         /** The voxel-axis ceilings a VAE decode is carved for (an image model's decode); null keeps the model's own. */
         @SerialName("max_voxels") public var maxVoxels: Int? = null
         @SerialName("max_clips") public var maxClips: Int? = null
