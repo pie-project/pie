@@ -343,6 +343,11 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
             };
             let weighed = at.one("weight").is_some();
             match (pass.dist(x)?, cut) {
+                // Every rank holds the whole row (a head a group of ranks
+                // holds alike): each norms it as one rank would.
+                (Dist::Split(blocks), _) if blocks.iter().all(|b| b.parts == 1) => {
+                    return Ok((tree::op(at.tree), vec![Dist::Split(blocks); outs.len()]));
+                }
                 (Dist::Split(blocks), Some((0, _))) => {
                     let op = shared_norm(pass, op, x, &blocks)?;
                     return Ok((op, vec![Dist::Split(blocks); outs.len()]));

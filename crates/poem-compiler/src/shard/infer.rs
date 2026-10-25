@@ -500,7 +500,7 @@ impl<'r, 't> Walk<'r, 't> {
             }
             return;
         }
-        let held = match rules::rule_of(op, |v| self.width(v)) {
+        let held = match rules::rule(op) {
             Rule::Groups => {
                 // Group indices read no value; they follow whatever the
                 // grouped product groups.

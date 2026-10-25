@@ -280,8 +280,8 @@ fn inkling_splits_through_its_convolutions_and_biased_attention() {
 /// The diffusion transformers norm q and k across all their heads right
 /// after their products: split two ways, each such norm sums its share's
 /// squares, sums them across the ranks and norms its share by them, and
-/// every other op is the one-rank trace's. Each attention's q and k norms
-/// are cut with its heads.
+/// every other op is the one-rank trace's. Each denoiser attention's q and
+/// k norms are cut with its heads.
 #[test]
 fn a_diffusion_transformers_q_and_k_norm_their_shares() {
     for row in ["wan22-mini-d128-bf16-kv-bf16", "ltx25-mini-bf16-kv-bf16"] {
@@ -322,6 +322,7 @@ fn a_diffusion_transformers_q_and_k_norm_their_shares() {
             "{row}: every op but the collectives"
         );
         let norms: Vec<&poem_ir::Param> = (split.params.iter())
+            .filter(|p| p.name.starts_with("dit.blocks."))
             .filter(|p| p.name.ends_with("norm_q") || p.name.ends_with("q_norm"))
             .collect();
         assert!(!norms.is_empty(), "{row} norms its q");
