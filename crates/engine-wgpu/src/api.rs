@@ -576,20 +576,6 @@ impl Engine for Wgpu {
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        // An epilogue reads `velocity`, `hidden` and `pixels` of its pass's
-        // first lane alone here: the intrinsics bind one readout a pass.
-        if registration.launch.values.iter().any(|value| {
-            value.lane > 0
-                && value
-                    .intrinsic
-                    .is_some_and(eta_ir::op::IntrinsicId::per_lane)
-        }) {
-            return Err(Error::Unsupported {
-                verb: "an epilogue reading `velocity`, `hidden` or `pixels` of a pass's lane \
-                       past its first",
-                engine: "wgpu",
-            });
-        }
         self.programs.register(registration).map_err(refusal)
     }
 
@@ -1003,6 +989,35 @@ impl Wgpu {
             }
         }
 
+        let mut input_cells: Vec<Vec<(engine::fire::InputFeed, crate::program::InputCell)>> =
+            vec![Vec::new(); submission.lanes.len()];
+        for (at, lane) in submission.lanes.iter().enumerate() {
+            if lane.inputs.is_empty() {
+                continue;
+            }
+            let instance = submission
+                .attachments
+                .iter()
+                .find(|attachment| {
+                    (attachment.lane..attachment.lane + attachment.lanes.max(1))
+                        .contains(&(at as u32))
+                })
+                .map(|attachment| attachment.instance)
+                .ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "lane {at} feeds guest inputs and has no attachment; an input is read \
+                         through the instance the lane is attached to"
+                    ))
+                })?;
+            for feed in &lane.inputs {
+                let cell = self
+                    .programs
+                    .input_cell(instance, feed.channel)
+                    .map_err(refusal)?;
+                input_cells[at].push((*feed, cell));
+            }
+        }
+
         let guests = self.deferred_guests(submission)?;
 
         let sink = self.sink.clone();
@@ -1041,43 +1056,38 @@ impl Wgpu {
             .lanes
             .iter()
             .enumerate()
-            .map(|(at, lane)| {
-                if lane.kv_less && lane.mask.is_some() {
-                    return Err(Error::Unsupported {
-                        verb: "a mask over an attention group (masked group attention)",
-                        engine: "wgpu",
-                    });
-                }
-                Ok(Seated {
-                    lane: Lane {
-                        slot: lane.slot,
+            .map(|(at, lane)| Seated {
+                lane: Lane {
+                    slot: lane.slot,
 
-                        word: words[at],
-                        tokens: resolved[at].as_deref().unwrap_or(&lane.tokens),
-                    },
-                    pages: &lane.kv.pages,
-                    held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
-                    kv_less: lane.kv_less,
-                    captures_scores: lane.captures_scores,
+                    word: words[at],
+                    tokens: resolved[at].as_deref().unwrap_or(&lane.tokens),
+                },
+                pages: &lane.kv.pages,
+                held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                kv_less: lane.kv_less,
+                captures_scores: lane.captures_scores,
 
-                    mask: resolved_masks[at].as_ref().or(lane.mask.as_ref()),
+                mask: resolved_masks[at].as_ref().or(lane.mask.as_ref()),
 
-                    adapter: lane_adapters[at].or(lane.adapter),
-                    positions: &lane.positions,
+                adapter: lane_adapters[at].or(lane.adapter),
+                positions: &lane.positions,
 
-                    readout: match &lane.readout {
-                        Readout::Rows(rows) => Some(rows.as_slice()),
-                        Readout::Last | Readout::None => None,
-                    },
+                readout: match &lane.readout {
+                    Readout::Rows(rows) => Some(rows.as_slice()),
+                    Readout::Last | Readout::None => None,
+                },
 
-                    translation: &lane.kv.translation,
+                translation: &lane.kv.translation,
 
-                    rs: &verbs[at],
-                    rs_reset: lane.rs_reset,
-                    rs_slot: lane.rs_slot,
-                })
+                rs: &verbs[at],
+                rs_reset: lane.rs_reset,
+                rs_slot: lane.rs_slot,
+
+                group: lane.group,
+                inputs: &input_cells[at],
             })
-            .collect::<EngineResult<Vec<_>>>()?;
+            .collect();
 
         let landed = {
             use engine::frame::Shell as FrameShell;

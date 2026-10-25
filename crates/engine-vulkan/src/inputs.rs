@@ -254,6 +254,21 @@ pub struct Inputs {
     packings: Vec<PackingAt>,
     seats: Vec<SeatAt>,
     voxels: Option<VoxelAt>,
+    /// The custom masks the fire's group-packed attentions read, staged
+    /// apart from the store: their size is the groups', not the load's.
+    group_masks: Option<Buffer>,
+    /// Smaller ones it outgrew, kept: an earlier fire may still read them.
+    outgrown: Vec<Buffer>,
+}
+
+/// One ragged attention's custom mask on the device: over packings `q` and
+/// `kv`, the bits and each group's first byte.
+#[derive(Debug, Clone, Copy)]
+pub struct GroupMaskHandles {
+    pub q: poem_ir::Selection,
+    pub kv: poem_ir::Selection,
+    pub bits: Tensor,
+    pub indptr: Tensor,
 }
 
 impl Inputs {
@@ -386,7 +401,77 @@ impl Inputs {
             packings,
             seats,
             voxels,
+            group_masks: None,
+            outgrown: Vec::new(),
         })
+    }
+
+    /// Stages each ragged attention's custom mask in one buffer grown to
+    /// hold them.
+    pub fn stage_group_masks(
+        &mut self,
+        device: &Context,
+        handles: &crate::device::Handles,
+        masks: &[(
+            poem_ir::Selection,
+            poem_ir::Selection,
+            poem_exec::fire::GroupMask,
+        )],
+    ) -> Result<Vec<GroupMaskHandles>> {
+        if masks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut image: Vec<u8> = Vec::new();
+        let mut placed = Vec::with_capacity(masks.len());
+        for (_, _, mask) in masks {
+            let indptr = image.len();
+            image.extend_from_slice(bytes_of(&mask.indptr));
+            image.resize(image.len().next_multiple_of(ALIGN as usize), 0);
+            let bits = image.len();
+            // The kernel reads the bits a word at a time.
+            image.extend_from_slice(&mask.bits);
+            image.resize(image.len().next_multiple_of(ALIGN as usize), 0);
+            placed.push((indptr, bits));
+        }
+        if self
+            .group_masks
+            .as_ref()
+            .is_none_or(|held| held.bytes() < image.len() as u64)
+        {
+            let grown = Buffer::host(device, (image.len() as u64).next_power_of_two())?;
+            if let Some(old) = self.group_masks.replace(grown) {
+                self.outgrown.push(old);
+            }
+        }
+        let buffer = self
+            .group_masks
+            .as_mut()
+            .expect("the group mask buffer was just sized");
+        buffer.write(0, &image)?;
+        let buffer = &*buffer;
+        masks
+            .iter()
+            .zip(placed)
+            .map(|((q, kv, mask), (indptr, bits))| {
+                let words = mask.bits.len().div_ceil(4).max(1) as u64;
+                Ok(GroupMaskHandles {
+                    q: *q,
+                    kv: *kv,
+                    bits: Tensor::new(
+                        handles.bind(buffer, bits as u64, words * 4)?,
+                        u32::try_from(words * 4).unwrap_or(u32::MAX),
+                        1,
+                        Dtype::U8,
+                    ),
+                    indptr: i32s(
+                        handles,
+                        buffer,
+                        indptr as u64,
+                        u32::try_from(mask.indptr.len()).unwrap_or(u32::MAX),
+                    )?,
+                })
+            })
+            .collect()
     }
 
     #[must_use]

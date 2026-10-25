@@ -61,6 +61,13 @@ pub(crate) struct Tally {
     interpreted: AtomicU64,
 }
 
+/// A guest input's cell for a fire, in wire bytes.
+#[derive(Debug, Clone)]
+pub struct InputCell {
+    pub bytes: Vec<u8>,
+    pub dtype: eta_ir::types::Dtype,
+}
+
 #[cfg(feature = "wgpu")]
 pub(crate) struct Half {
     id: InstanceId,
@@ -79,7 +86,8 @@ pub(crate) struct Pass<'a> {
     pub mtp_logits: Option<&'a [f32]>,
     pub mtp_width: u32,
     pub readout: Option<crate::guest::run::Readout<'a>>,
-    pub pixels: Option<crate::guest::run::Readout<'a>>,
+    /// Each lane of the pass's pixels, lane `k` at `k`.
+    pub pixels: Vec<Option<crate::guest::run::Readout<'a>>>,
 }
 
 #[cfg(feature = "wgpu")]
@@ -243,7 +251,7 @@ impl Guests {
         layout: &[(u32, u32)],
         out_width: u32,
         mtp_width: u32,
-        pixels: Option<&(crate::device::Buffer, u32)>,
+        pixels: Option<&(crate::device::Buffer, Vec<(u64, u32)>)>,
     ) -> Vec<Job> {
         let Guests {
             device,
@@ -337,13 +345,18 @@ impl Guests {
                                 mtp_logits: mtp.as_deref(),
                                 mtp_width,
                                 readout,
-                                pixels: pixels.as_ref().map(|(plane, count)| {
-                                    crate::guest::run::Readout {
-                                        seat: plane,
-                                        at: 0,
-                                        width: *count,
-                                    }
-                                }),
+                                pixels: span
+                                    .clone()
+                                    .map(|lane| {
+                                        let (plane, spans) = pixels.as_ref()?;
+                                        let &(at, width) = spans.get(lane)?;
+                                        (width > 0).then_some(crate::guest::run::Readout {
+                                            seat: plane,
+                                            at,
+                                            width,
+                                        })
+                                    })
+                                    .collect(),
                             },
                         )
                     });
@@ -620,6 +633,44 @@ impl Plane {
             })
     }
 
+    /// The cell guest input channel `id` of `instance` holds for the next
+    /// fire: its oldest, in wire bytes.
+    pub fn input_cell(&self, instance: InstanceId, id: ChannelId) -> Result<InputCell, Refusal> {
+        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance.0,
+        })?;
+        let dense = seat
+            .channels
+            .iter()
+            .position(|&held| held == id)
+            .ok_or_else(|| {
+                Refusal::Program(format!(
+                    "a guest input feed names channel {id}, which instance {instance} does not carry"
+                ))
+            })?;
+        #[cfg(feature = "wgpu")]
+        seat.gate.settle(instance)?;
+        let ring = &seat.inst.channels[dense];
+        #[cfg(feature = "wgpu")]
+        if ring.is_empty() {
+            self.settle_writers(id)?;
+        }
+        if ring.is_empty() {
+            return Err(Refusal::Program(format!(
+                "guest input channel {id} of instance {instance} holds no cell; publish one before \
+                 the fire that reads it"
+            )));
+        }
+        let value = ring.front();
+        let mut bytes = vec![0u8; eta_exec::wire_cell_bytes(value.dtype(), value.len())];
+        eta_exec::encode_wire(&value, &mut bytes);
+        Ok(InputCell {
+            bytes,
+            dtype: eta_exec::concrete_dtype(seat.plan.package.channels[dense].dtype),
+        })
+    }
+
     pub fn envelope_fold(&self, instance: InstanceId) -> Result<Option<u32>, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",
@@ -884,7 +935,7 @@ impl Plane {
                 mtp_logits: None,
                 mtp_width: 0,
                 readout: None,
-                pixels: None,
+                pixels: Vec::new(),
             },
         )
     }

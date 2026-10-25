@@ -256,8 +256,12 @@ impl Plane {
             })?;
         let ring = &seat.inst.channels[dense];
         let dtype = eta_exec::concrete_dtype(seat.plan.package.channels[dense].dtype);
+        // The forward reads the oldest cell. The device's kept cell is the
+        // newest put, so it is the one read only when the ring holds no other.
         #[cfg(feature = "vulkan")]
-        if let Some(cell) = seat.session.kept_cell(dense as u32) {
+        if ring.size() <= 1
+            && let Some(cell) = seat.session.kept_cell(dense as u32)
+        {
             return Ok(InputCell::Device {
                 cell: cell.clone(),
                 dtype,
@@ -448,8 +452,8 @@ impl Plane {
         mtp_logits: Option<&[f32]>,
         mtp_width: u32,
         #[cfg(feature = "vulkan")] device: Option<&crate::device::Context>,
-        #[cfg(feature = "vulkan")] readout: Option<crate::guest::run::Readout<'_>>,
-        #[cfg(feature = "vulkan")] pixels: Option<crate::guest::run::Readout<'_>>,
+        #[cfg(feature = "vulkan")] readouts: Vec<Option<crate::guest::run::Readout<'_>>>,
+        #[cfg(feature = "vulkan")] pixels: Vec<Option<crate::guest::run::Readout<'_>>>,
     ) -> Result<(), Refusal> {
         let Plane {
             instances,
@@ -482,6 +486,8 @@ impl Plane {
         };
 
         #[cfg(feature = "vulkan")]
+        let readout = readouts.first().copied().flatten();
+        #[cfg(feature = "vulkan")]
         if seat.plan.needs_logits && readout.is_none() {
             return Err(Refusal::Program(format!(
                 "instance {instance} reads logits, but its lane offered no readout seat"
@@ -511,7 +517,7 @@ impl Plane {
             let widen = widen.as_ref().expect("the device arm checked for one");
             let session = &mut seat.session;
             let mut runner = crate::guest::run::OnDevice::new(device_half, session, widen, readout)
-                .with_pixels(pixels);
+                .with_lanes(readouts, pixels);
             let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut runner);
             let ran = runner.ran().len();
             widen.disarm();
@@ -587,8 +593,8 @@ impl Plane {
         &mut self,
         instance: InstanceId,
         device: &crate::device::Context,
-        readout: Option<crate::guest::run::Readout<'_>>,
-        pixels: Option<crate::guest::run::Readout<'_>>,
+        readouts: Vec<Option<crate::guest::run::Readout<'_>>>,
+        pixels: Vec<Option<crate::guest::run::Readout<'_>>>,
         done: Option<crate::settle::Done>,
     ) -> Result<(), Refusal> {
         let Plane {
@@ -606,6 +612,7 @@ impl Plane {
                 "instance {instance} has a device half, but the plane built no readout widen"
             ))
         })?;
+        let readout = readouts.first().copied().flatten();
         if seat.plan.needs_logits && readout.is_none() {
             return Err(Refusal::Program(format!(
                 "instance {instance} reads logits, but its lane offered no readout seat"
@@ -621,7 +628,7 @@ impl Plane {
         };
         let mut runner =
             crate::guest::run::OnDevice::new(device, &mut seat.session, widen, readout)
-                .with_pixels(pixels)
+                .with_lanes(readouts, pixels)
                 .deferred();
         let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut runner);
         let deferral = runner.take_deferral().unwrap_or_default();

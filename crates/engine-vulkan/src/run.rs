@@ -109,6 +109,9 @@ pub struct FireBindings {
 
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
+    /// The custom mask each group-packed `attention.ragged` applies, by its
+    /// query and key packings, when a lane stated one.
+    pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
     pub inputs: Vec<(u32, Tensor)>,
     pub voxels: Option<crate::inputs::VoxelHandles>,
 }
@@ -326,6 +329,29 @@ impl<'c> Run<'c> {
 
     pub(crate) fn uncut(&self, id: ValueId) -> Tensor {
         self.whole(id)
+    }
+
+    /// The custom mask a group-packed attention with query and key CSRs
+    /// `q_indptr` and `kv_indptr` applies, when a lane of the fire stated
+    /// one.
+    pub(crate) fn group_mask(
+        &self,
+        q_indptr: ValueId,
+        kv_indptr: ValueId,
+    ) -> Option<crate::inputs::GroupMaskHandles> {
+        let packing = |id: ValueId| match self.values.get(id.0 as usize).map(|decl| &decl.def) {
+            Some(Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::GroupIndptr { select },
+                ..
+            })) => Some(*select),
+            _ => None,
+        };
+        let (q, kv) = (packing(q_indptr)?, packing(kv_indptr)?);
+        self.fire
+            .group_masks
+            .iter()
+            .find(|mask| mask.q == q && mask.kv == kv)
+            .copied()
     }
 
     pub(crate) fn address(&self, handle: u32) -> Option<(u64, u64)> {

@@ -436,11 +436,11 @@ impl Dit {
         handles: &Handles,
     ) -> Result<Staged> {
         let mut staged = Staged::default();
-        if feeds.iter().any(|feed| feed.mask.is_some()) {
+        if feeds.iter().any(|feed| feed.mask.is_some()) && self.feeds.ragged.is_empty() {
             return Err(Fault::Program {
                 at: "serve::mask",
-                why: "a kv-less lane states an attention mask over its attention group, and \
-                      this engine runs no group-packed attention arm that applies one"
+                why: "a kv-less lane states an attention mask and this model packs no attention \
+                      group; the mask applies to group-packed `attention.ragged` only"
                     .to_string(),
             });
         }
@@ -615,6 +615,7 @@ impl Dit {
             let mut groups = poem_exec::fire::group_of_lane(lanes, &facts);
             groups.resize(lane_count as usize, -1);
             staged.bindings.group_of_lane = Some(inputs.i32s(handles, &groups, 1));
+            let mut packings = Vec::with_capacity(self.feeds.selections.len());
             for &select in &self.feeds.selections {
                 let packed = poem_exec::fire::pack(select, lanes, &groups, rows)
                     .map_err(poem_exec::Error::Fire)?;
@@ -635,11 +636,107 @@ impl Dit {
                     permutation: inputs.i32s(handles, &row_table(&packed.permutation), 1),
                 };
                 staged.bindings.packings.push((select, bindings));
+                packings.push(packed);
             }
             key.push_str(&format!("pk{};", self.feeds.selections.len()));
+            for (q, kv, keep) in self.group_masks(composition, feeds, &groups, &packings)? {
+                let at = self.feeds.ragged.iter().position(|pair| *pair == (q, kv));
+                key.push_str(&format!("gm{};", at.unwrap_or(usize::MAX)));
+                let keep = inputs.f32s(handles, &keep, rows);
+                staged.bindings.group_masks.push((q, kv, keep));
+            }
         }
 
         staged.key = key;
+        Ok(staged)
+    }
+
+    /// The keep plane (`[rows][rows]`, 1 keeps a pair) each group-packed
+    /// attention of this fire applies, out of the kv-less lanes' stated
+    /// masks (engine-cuda `serve/prepare.rs::group_masks_of`): none when no
+    /// lane states one.
+    fn group_masks(
+        &self,
+        composition: &Composition,
+        feeds: &[Feed<'_>],
+        groups: &[i32],
+        packings: &[poem_exec::fire::Packed],
+    ) -> Result<Vec<(poem_ir::Selection, poem_ir::Selection, Vec<f32>)>> {
+        let stated: Vec<Option<poem_exec::fire::LaneMask>> = feeds
+            .iter()
+            .map(|feed| {
+                feed.mask.map(|masking| poem_exec::fire::LaneMask {
+                    rows: masking
+                        .masks()
+                        .iter()
+                        .map(|mask| mask.admitted(0..mask.total).collect())
+                        .collect(),
+                })
+            })
+            .collect();
+        if stated.iter().all(Option::is_none) {
+            return Ok(Vec::new());
+        }
+        let patch = self.voxel.as_ref().and_then(|seat| seat.token_patch);
+        let mut guests = vec![poem_exec::fire::GuestRows::default(); feeds.len()];
+        for row in composition.lanes() {
+            let clips = feeds
+                .get(row.source as usize)
+                .and_then(|feed| feed.clips)
+                .map(|clips| clips.clips);
+            if let Some(guest) = guests.get_mut(row.source as usize) {
+                *guest = poem_exec::fire::guest_rows(row, clips, patch)
+                    .map_err(poem_exec::Error::Fire)?;
+            }
+        }
+        let masks: Vec<Option<&poem_exec::fire::LaneMask>> =
+            stated.iter().map(Option::as_ref).collect();
+        let packed = |select: poem_ir::Selection| {
+            packings
+                .iter()
+                .find(|packed| packed.select == select)
+                .ok_or_else(|| {
+                    program(format!(
+                        "no packing of selection {select:?} was staged for this fire"
+                    ))
+                })
+        };
+        let rows = composition.rows() as usize;
+        let mut staged = Vec::new();
+        for &(q, kv) in &self.feeds.ragged {
+            let (qp, kp) = (packed(q)?, packed(kv)?);
+            let Some(mask) =
+                poem_exec::fire::group_mask(composition.lanes(), groups, qp, kp, &masks, &guests)
+                    .map_err(poem_exec::Error::Fire)?
+            else {
+                continue;
+            };
+            // Group g's pair (i, j) (indexed within the group) is bit
+            // i * kv_len + j of its bits, from byte indptr[g]; the plane
+            // spells it at the packed rows.
+            let mut keep = vec![0f32; rows * rows];
+            for g in 0..mask.indptr.len().saturating_sub(1) {
+                let bound =
+                    |table: &[i32], at: usize| table.get(at).map_or(0, |&r| r.max(0) as usize);
+                let (q0, q1) = (bound(&qp.group_indptr, g), bound(&qp.group_indptr, g + 1));
+                let (k0, k1) = (bound(&kp.group_indptr, g), bound(&kp.group_indptr, g + 1));
+                let first = mask.indptr[g].max(0) as usize;
+                let kv_len = k1.saturating_sub(k0);
+                for i in 0..q1.saturating_sub(q0) {
+                    for j in 0..kv_len {
+                        let cell = i * kv_len + j;
+                        let kept = mask
+                            .bits
+                            .get(first + cell / 8)
+                            .is_some_and(|byte| (byte >> (cell % 8)) & 1 == 1);
+                        if kept && let Some(at) = keep.get_mut((q0 + i) * rows + k0 + j) {
+                            *at = 1.0;
+                        }
+                    }
+                }
+            }
+            staged.push((q, kv, keep));
+        }
         Ok(staged)
     }
 

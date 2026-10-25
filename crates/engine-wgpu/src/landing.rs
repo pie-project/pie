@@ -17,8 +17,9 @@ pub(crate) struct Seat {
     pub seat: Buffer,
     pub mirror: Buffer,
     pub draft: Option<(u32, Buffer)>,
-    /// The fire's pixel plane and its element count, where it wrote one.
-    pub pixels: Option<(Buffer, u32)>,
+    /// The fire's pixel plane and each lane's span of it (byte, element
+    /// count), where it wrote one.
+    pub pixels: Option<(Buffer, Vec<(u64, u32)>)>,
     pub guests: Option<Guests>,
 }
 
@@ -72,7 +73,7 @@ struct Landing {
     width: u32,
     seat: Buffer,
     mtp_width: u32,
-    pixels: Option<(Buffer, u32)>,
+    pixels: Option<(Buffer, Vec<(u64, u32)>)>,
     read: Result<Rows, String>,
     guests: Option<Guests>,
     mailbox: Mailbox,

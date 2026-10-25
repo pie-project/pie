@@ -4,7 +4,9 @@
 // Dense attention over segments, one workgroup a (query head, row): the row
 // attends every key of its segment, bidirectionally. The segment is the
 // row's own (`segments`, a patch window's images) or, with `PIE_RAGGED`, the
-// keys `kv_segments` names for it. Four strips of 32 lanes walk the keys,
+// keys `kv_segments` names for it. With `PIE_CUSTOM` too, segment `s`'s
+// (query, key) pair `(qo, kv)` (each within the segment) is kept where bit
+// `qo * kv_len + kv` of `mask_bits`, from byte `mask_indptr[s]`, is set. Four strips of 32 lanes walk the keys,
 // each keeping an online softmax; the strips fold at the end. Rows are
 // `PIE_ACT` (bf16, or f32); a lane lands two head columns. No subgroup
 // operation: the dot products reduce through workgroup memory.
@@ -24,7 +26,13 @@
 [[vk::binding(4)]] StructuredBuffer<int> segments;
 #ifdef PIE_RAGGED
 [[vk::binding(5)]] StructuredBuffer<int> kv_segments;
+#ifdef PIE_CUSTOM
+[[vk::binding(6)]] StructuredBuffer<uint> mask_bits;
+[[vk::binding(7)]] StructuredBuffer<int> mask_indptr;
+#define PIE_PARAMS_AT 8
+#else
 #define PIE_PARAMS_AT 6
+#endif
 #else
 #define PIE_PARAMS_AT 5
 #endif
@@ -45,6 +53,18 @@ groupshared float dense_m[PIE_STRIPS];
 groupshared float dense_l[PIE_STRIPS];
 groupshared int dense_begin;
 groupshared int dense_end;
+groupshared int dense_segment;
+
+#ifdef PIE_CUSTOM
+// Whether row `row` of segment `seg` keeps key `j`.
+bool mask_keeps(int seg, int row, int j) {
+    uint qo = uint(row - segments[uint(seg)]);
+    uint kv = uint(j - kv_segments[uint(seg)]);
+    uint kv_len = uint(kv_segments[uint(seg) + 1u] - kv_segments[uint(seg)]);
+    uint bit = uint(mask_indptr[uint(seg)]) * 8u + qo * kv_len + kv;
+    return ((mask_bits[bit >> 5u] >> (bit & 31u)) & 1u) != 0u;
+}
+#endif
 
 [shader("compute")]
 [numthreads(PIE_THREADS, 1, 1)]
@@ -60,6 +80,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     if (tid == 0u) {
         int begin = -1;
         int end = -1;
+        int seg = 0;
         if (row >= segments[0] && row < segments[uint(params.num_segments)]) {
             int lo = 0;
             int hi = params.num_segments - 1;
@@ -71,6 +92,7 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
                     hi = mid - 1;
                 }
             }
+            seg = lo;
 #ifdef PIE_RAGGED
             begin = kv_segments[uint(lo)];
             end = kv_segments[uint(lo + 1)];
@@ -81,12 +103,16 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         }
         dense_begin = begin;
         dense_end = end;
+        dense_segment = seg;
     }
     GroupMemoryBarrierWithGroupSync();
     // Read uniformly: WGSL lets a barrier follow only workgroup-uniform
     // control flow, and the span bounds the key loop.
     int begin = workgroupUniformLoad(dense_begin);
     int end = workgroupUniformLoad(dense_end);
+#ifdef PIE_CUSTOM
+    int segment = workgroupUniformLoad(dense_segment);
+#endif
 
     uint out_row = (uint(row) * uint(params.num_q_heads) + uint(head)) * head_dim;
     if (end <= begin) {
@@ -112,6 +138,11 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     for (int n = 0; n < steps; n++) {
         int j = begin + n * PIE_STRIPS + int(strip);
         bool live = j < end;
+#ifdef PIE_CUSTOM
+        if (live) {
+            live = mask_keeps(segment, row, j);
+        }
+#endif
         uint k_row = live ? (uint(j) * uint(params.num_kv_heads) + kv_head) * head_dim : 0u;
         float dot = 0.0;
         if (live) {
@@ -189,3 +220,9 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 // pie:instantiate attn_dense_ragged_f32_d_64 PIE_HEAD_DIM_MAX=64 PIE_RAGGED=1 PIE_ACT_F32=1
 // pie:instantiate attn_dense_ragged_f32_d_128 PIE_HEAD_DIM_MAX=128 PIE_RAGGED=1 PIE_ACT_F32=1
 // pie:instantiate attn_dense_ragged_f32_d_256 PIE_HEAD_DIM_MAX=256 PIE_RAGGED=1 PIE_ACT_F32=1
+// pie:instantiate attn_dense_ragged_custom_bf16_d_64 PIE_HEAD_DIM_MAX=64 PIE_RAGGED=1 PIE_CUSTOM=1
+// pie:instantiate attn_dense_ragged_custom_bf16_d_128 PIE_HEAD_DIM_MAX=128 PIE_RAGGED=1 PIE_CUSTOM=1
+// pie:instantiate attn_dense_ragged_custom_bf16_d_256 PIE_HEAD_DIM_MAX=256 PIE_RAGGED=1 PIE_CUSTOM=1
+// pie:instantiate attn_dense_ragged_custom_f32_d_64 PIE_HEAD_DIM_MAX=64 PIE_RAGGED=1 PIE_CUSTOM=1 PIE_ACT_F32=1
+// pie:instantiate attn_dense_ragged_custom_f32_d_128 PIE_HEAD_DIM_MAX=128 PIE_RAGGED=1 PIE_CUSTOM=1 PIE_ACT_F32=1
+// pie:instantiate attn_dense_ragged_custom_f32_d_256 PIE_HEAD_DIM_MAX=256 PIE_RAGGED=1 PIE_CUSTOM=1 PIE_ACT_F32=1

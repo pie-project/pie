@@ -4,8 +4,10 @@
 // Ragged dense attention, tiled: 32 query rows of one head a workgroup, four
 // lanes a row each holding a quarter of the head, keys streamed four at a
 // time through workgroup memory. Query row `r` of segment `s` attends keys
-// `kv_segments[s]..kv_segments[s + 1]`. bf16 rows; a lane's quarter is an
-// even number of columns, so it lands whole words.
+// `kv_segments[s]..kv_segments[s + 1]`; with `PIE_CUSTOM`, only where bit
+// `qo * kv_len + kv` (each within the segment) of `mask_bits`, from byte
+// `mask_indptr[s]`, is set. bf16 rows; a lane's quarter is an even number of
+// columns, so it lands whole words.
 
 #ifndef PIE_D
 #error "attn/dense_tiled.slang is compiled at a head width: -DPIE_D"
@@ -22,6 +24,13 @@
 [[vk::binding(3)]] RWStructuredBuffer<uint> o;
 [[vk::binding(4)]] StructuredBuffer<int> segments;
 [[vk::binding(5)]] StructuredBuffer<int> kv_segments;
+#ifdef PIE_CUSTOM
+[[vk::binding(6)]] StructuredBuffer<uint> mask_bits;
+[[vk::binding(7)]] StructuredBuffer<int> mask_indptr;
+#define PIE_PARAMS_AT 8
+#else
+#define PIE_PARAMS_AT 6
+#endif
 
 struct Params {
     int num_segments;
@@ -30,18 +39,20 @@ struct Params {
     int head_dim;
     float sm_scale;
 };
-PIE_PARAMS(6, Params, params);
+PIE_PARAMS(PIE_PARAMS_AT, Params, params);
 
 groupshared float kt[PIE_BKEY * PIE_D];
 groupshared float vt[PIE_BKEY * PIE_D];
 groupshared float partial[PIE_BQ * PIE_BKEY * PIE_PARTS];
 groupshared int2 spans[PIE_BQ];
+groupshared int segs[PIE_BQ];
 groupshared int tile_lo;
 groupshared int tile_hi;
 
-int2 span_of(int row) {
+// The segment row `row` stands in, or -1.
+int segment_of(int row) {
     if (row < segments[0] || row >= segments[uint(params.num_segments)]) {
-        return int2(0, 0);
+        return -1;
     }
     int lo = 0;
     int hi = params.num_segments - 1;
@@ -53,8 +64,19 @@ int2 span_of(int row) {
             hi = mid - 1;
         }
     }
-    return int2(kv_segments[uint(lo)], kv_segments[uint(lo + 1)]);
+    return lo;
 }
+
+#ifdef PIE_CUSTOM
+// Whether row `row` of segment `seg` keeps key `j`.
+bool mask_keeps(int seg, int row, int j) {
+    uint qo = uint(row - segments[uint(seg)]);
+    uint kv = uint(j - kv_segments[uint(seg)]);
+    uint kv_len = uint(kv_segments[uint(seg) + 1u] - kv_segments[uint(seg)]);
+    uint bit = uint(mask_indptr[uint(seg)]) * 8u + qo * kv_len + kv;
+    return ((mask_bits[bit >> 5u] >> (bit & 31u)) & 1u) != 0u;
+}
+#endif
 
 [shader("compute")]
 [numthreads(PIE_THREADS, 1, 1)]
@@ -69,7 +91,10 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     uint d0 = part * uint(PIE_DPT);
 
     if (part == 0u) {
-        spans[qi] = span_of(row);
+        int seg = segment_of(row);
+        segs[qi] = seg;
+        spans[qi] = seg < 0 ? int2(0, 0)
+                            : int2(kv_segments[uint(seg)], kv_segments[uint(seg + 1)]);
     }
     GroupMemoryBarrierWithGroupSync();
     // The keys any row of the tile reads, folded once and read uniformly:
@@ -89,6 +114,9 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     }
     GroupMemoryBarrierWithGroupSync();
     int2 span = spans[qi];
+#ifdef PIE_CUSTOM
+    int seg = segs[qi];
+#endif
     int lo = workgroupUniformLoad(tile_lo);
     int hi = workgroupUniformLoad(tile_hi);
 
@@ -129,6 +157,11 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
             uint at = (qi * uint(PIE_BKEY) + jj) * uint(PIE_PARTS);
             float sum = partial[at] + partial[at + 1u] + partial[at + 2u] + partial[at + 3u];
             bool in_ = live && j >= span.x && j < span.y;
+#ifdef PIE_CUSTOM
+            if (in_) {
+                in_ = mask_keeps(seg, row, j);
+            }
+#endif
             s[jj] = in_ ? sum : -3.0e38;
             top = max(top, s[jj]);
         }
@@ -164,3 +197,5 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
 
 // pie:instantiate attn_dense_tiled_ragged_bf16_d_64 PIE_D=64
 // pie:instantiate attn_dense_tiled_ragged_bf16_d_128 PIE_D=128
+// pie:instantiate attn_dense_tiled_ragged_custom_bf16_d_64 PIE_D=64 PIE_CUSTOM=1
+// pie:instantiate attn_dense_tiled_ragged_custom_bf16_d_128 PIE_D=128 PIE_CUSTOM=1

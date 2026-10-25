@@ -937,6 +937,7 @@ impl Metal {
             .iter()
             .map(|attachment| Attached {
                 lane: attachment.lane,
+                lanes: attachment.lanes,
                 instance: attachment.instance,
                 at: attachment.at,
             })
@@ -1055,12 +1056,6 @@ impl Metal {
             .iter()
             .enumerate()
             .map(|(at, lane)| {
-                if lane.kv_less && lane.mask.is_some() {
-                    return Err(Error::Unsupported {
-                        verb: "a mask over an attention group (masked group attention)",
-                        engine: "metal",
-                    });
-                }
                 Ok(Seated {
                     lane: Lane {
                         slot: lane.slot,
@@ -1073,6 +1068,7 @@ impl Metal {
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
                     captures_scores: lane.captures_scores,
                     mask: lane.mask.as_ref(),
+                    kv_less: lane.kv_less,
                     adapter: lane_adapters[at].or(lane.adapter),
                     positions: &lane.positions,
                     readout: match &lane.readout {

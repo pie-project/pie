@@ -122,7 +122,18 @@ pub fn bidirectional(
     )
 }
 
-/// A query row of segment `s` attends key rows `kv_indptr[s]..kv_indptr[s + 1]`.
+/// A custom mask over a ragged attention's segments: segment `s`'s (query,
+/// key) pair `(q, k)`, each within the segment, is kept where bit
+/// `q * kv_len + k` of `bits` (u8, bound whole words), from byte `indptr[s]`
+/// (i32), is set.
+#[derive(Clone, Copy, Debug)]
+pub struct CustomMask {
+    pub bits: Tensor,
+    pub indptr: Tensor,
+}
+
+/// A query row of segment `s` attends key rows `kv_indptr[s]..kv_indptr[s + 1]`,
+/// those `mask` keeps where one is stated.
 #[allow(clippy::too_many_arguments)]
 pub fn ragged(
     ctx: &Ctx<'_>,
@@ -134,6 +145,7 @@ pub fn ragged(
     head_dim: u32,
     kv_heads: u32,
     sm_scale: f32,
+    mask: Option<CustomMask>,
     o: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attn.ragged";
@@ -163,14 +175,32 @@ pub fn ragged(
         .checked_sub(1)
         .filter(|s| *s > 0)
         .ok_or_else(|| refuse(OP, format!("a CSR of {entries} entries names no segment")))?;
+    if let Some(mask) = mask
+        && (mask.bits.dtype != Dtype::U8
+            || mask.indptr.dtype != Dtype::I32
+            || mask.indptr.rows * mask.indptr.width < segments + 1)
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "a custom mask is u8 bits and an i32 byte offset a segment; this one is {:?} \
+                 bits and {} {:?} offsets for {segments} segments",
+                mask.bits.dtype,
+                mask.indptr.rows * mask.indptr.width,
+                mask.indptr.dtype
+            ),
+        ));
+    }
+    let custom = mask.is_some();
     let rows = nonzero(OP, "query rows", q.rows)?;
     let (file, entry, grid) = match (q.dtype, head_dim) {
         (Dtype::Bf16, 64 | 128) => (
             DENSE_TILED,
-            if head_dim == 64 {
-                "attn_dense_tiled_ragged_bf16_d_64"
-            } else {
-                "attn_dense_tiled_ragged_bf16_d_128"
+            match (head_dim, custom) {
+                (64, false) => "attn_dense_tiled_ragged_bf16_d_64",
+                (64, true) => "attn_dense_tiled_ragged_custom_bf16_d_64",
+                (_, false) => "attn_dense_tiled_ragged_bf16_d_128",
+                (_, true) => "attn_dense_tiled_ragged_custom_bf16_d_128",
             },
             Grid::of(
                 [q_heads * TILED_THREADS, rows.div_ceil(TILED_ROWS), 1],
@@ -179,18 +209,28 @@ pub fn ragged(
         ),
         (dtype, _) => {
             let at = stamp_for(OP, head_dim)?;
-            let entry = match dtype {
-                Dtype::Bf16 => [
+            let entry = match (dtype, custom) {
+                (Dtype::Bf16, false) => [
                     "attn_dense_ragged_bf16_d_64",
                     "attn_dense_ragged_bf16_d_128",
                     "attn_dense_ragged_bf16_d_256",
                 ][at],
-                Dtype::F32 => [
+                (Dtype::Bf16, true) => [
+                    "attn_dense_ragged_custom_bf16_d_64",
+                    "attn_dense_ragged_custom_bf16_d_128",
+                    "attn_dense_ragged_custom_bf16_d_256",
+                ][at],
+                (Dtype::F32, false) => [
                     "attn_dense_ragged_f32_d_64",
                     "attn_dense_ragged_f32_d_128",
                     "attn_dense_ragged_f32_d_256",
                 ][at],
-                other => {
+                (Dtype::F32, true) => [
+                    "attn_dense_ragged_custom_f32_d_64",
+                    "attn_dense_ragged_custom_f32_d_128",
+                    "attn_dense_ragged_custom_f32_d_256",
+                ][at],
+                (other, _) => {
                     return Err(Error::DtypeUnsupported {
                         op: OP,
                         dtype: other,
@@ -204,20 +244,23 @@ pub fn ragged(
             )
         }
     };
-    ctx.fire(
-        Fire::at(file, entry).apply(grid),
-        &[
-            q.arg(),
-            k.arg(),
-            v.arg(),
-            o.arg_mut(),
-            q_indptr.arg(),
-            kv_indptr.arg(),
-            stated(OP, segments)?.arg(),
-            stated(OP, q_heads)?.arg(),
-            stated(OP, kv_heads)?.arg(),
-            stated(OP, head_dim)?.arg(),
-            sm_scale.arg(),
-        ],
-    )
+    let mut args = vec![
+        q.arg(),
+        k.arg(),
+        v.arg(),
+        o.arg_mut(),
+        q_indptr.arg(),
+        kv_indptr.arg(),
+    ];
+    if let Some(mask) = mask {
+        args.extend([mask.bits.arg(), mask.indptr.arg()]);
+    }
+    args.extend([
+        stated(OP, segments)?.arg(),
+        stated(OP, q_heads)?.arg(),
+        stated(OP, kv_heads)?.arg(),
+        stated(OP, head_dim)?.arg(),
+        sm_scale.arg(),
+    ]);
+    ctx.fire(Fire::at(file, entry).apply(grid), &args)
 }

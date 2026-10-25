@@ -599,20 +599,6 @@ impl Engine for Vulkan {
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        // An epilogue reads `velocity`, `hidden` and `pixels` of its pass's
-        // first lane alone here: the intrinsics bind one readout a pass.
-        if registration.launch.values.iter().any(|value| {
-            value.lane > 0
-                && value
-                    .intrinsic
-                    .is_some_and(eta_ir::op::IntrinsicId::per_lane)
-        }) {
-            return Err(Error::Unsupported {
-                verb: "an epilogue reading `velocity`, `hidden` or `pixels` of a pass's lane \
-                       past its first",
-                engine: "vulkan",
-            });
-        }
         self.programs.register(registration).map_err(refusal)
     }
 
@@ -875,9 +861,9 @@ impl Vulkan {
                     #[cfg(feature = "vulkan")]
                     self.shell.as_ref().map(Shell::device),
                     #[cfg(feature = "vulkan")]
-                    None,
+                    Vec::new(),
                     #[cfg(feature = "vulkan")]
-                    None,
+                    Vec::new(),
                 )
                 .map_err(refusal)?;
         }
@@ -910,30 +896,12 @@ impl Vulkan {
                 .map(Vec::as_slice);
 
             #[cfg(feature = "vulkan")]
-            let pixels = shell.as_ref().and_then(|shell| {
-                shell
-                    .pixels_row(landed)
-                    .map(|(seat, at, width)| crate::guest::run::Readout {
-                        seat,
-                        at,
-                        width,
-                        f32: false,
-                    })
-            });
-            #[cfg(feature = "vulkan")]
-            let (device, seat) = match shell.as_ref() {
-                Some(shell) => (
-                    Some(shell.device()),
-                    shell
-                        .readout_row(landed, attachment.lane)
-                        .map(|(seat, at, width, dtype)| crate::guest::run::Readout {
-                            seat,
-                            at,
-                            width,
-                            f32: dtype == poem_ir::Dtype::F32,
-                        }),
-                ),
-                None => (None, None),
+            let (device, seat, pixels) = match shell.as_ref() {
+                Some(shell) => {
+                    let (seat, pixels) = lane_readouts(shell, landed, attachment);
+                    (Some(shell.device()), seat, pixels)
+                }
+                None => (None, Vec::new(), Vec::new()),
             };
             programs
                 .fire(
@@ -998,31 +966,10 @@ impl Vulkan {
                 .as_ref()
                 .ok_or_else(|| Error::Load("the vulkan engine has no model loaded".into()))?;
             let attachment = &step.attachments[0];
-            let seat =
-                shell
-                    .readout_row(landed, attachment.lane)
-                    .map(|(seat, at, width, dtype)| crate::guest::run::Readout {
-                        seat,
-                        at,
-                        width,
-                        f32: dtype == poem_ir::Dtype::F32,
-                    });
+            let (seat, pixels) = lane_readouts(shell, landed, attachment);
             let done = sink.clone().map(|sink| Done { at, sink });
             programs
-                .fire_deferred(
-                    attachment.instance,
-                    shell.device(),
-                    seat,
-                    shell
-                        .pixels_row(landed)
-                        .map(|(seat, at, width)| crate::guest::run::Readout {
-                            seat,
-                            at,
-                            width,
-                            f32: false,
-                        }),
-                    done,
-                )
+                .fire_deferred(attachment.instance, shell.device(), seat, pixels, done)
                 .map_err(refusal)
         }
         #[cfg(not(feature = "vulkan"))]
@@ -1156,7 +1103,10 @@ impl Vulkan {
             let instance = submission
                 .attachments
                 .iter()
-                .find(|attachment| attachment.lane as usize == at)
+                .find(|attachment| {
+                    (attachment.lane..attachment.lane + attachment.lanes.max(1))
+                        .contains(&(at as u32))
+                })
                 .map(|attachment| attachment.instance)
                 .ok_or_else(|| {
                     Error::Invalid(format!(
@@ -1209,51 +1159,43 @@ impl Vulkan {
             .lanes
             .iter()
             .enumerate()
-            .map(|(at, lane)| {
-                if lane.kv_less && lane.mask.is_some() {
-                    return Err(Error::Unsupported {
-                        verb: "a mask over an attention group (masked group attention)",
-                        engine: "vulkan",
-                    });
-                }
-                Ok(Seated {
-                    lane: Lane {
-                        slot: lane.slot,
+            .map(|(at, lane)| Seated {
+                lane: Lane {
+                    slot: lane.slot,
 
-                        word: words[at],
-                        tokens: resolved[at].as_deref().unwrap_or(&lane.tokens),
-                    },
-                    pages: &lane.kv.pages,
-                    held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
-                    kv_less: lane.kv_less,
-                    captures_scores: lane.captures_scores,
+                    word: words[at],
+                    tokens: resolved[at].as_deref().unwrap_or(&lane.tokens),
+                },
+                pages: &lane.kv.pages,
+                held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                kv_less: lane.kv_less,
+                captures_scores: lane.captures_scores,
 
-                    mask: lane.mask.as_ref(),
+                mask: lane.mask.as_ref(),
 
-                    adapter: lane_adapters[at].or(lane.adapter),
-                    positions: &lane.positions,
+                adapter: lane_adapters[at].or(lane.adapter),
+                positions: &lane.positions,
 
-                    readout: match &lane.readout {
-                        Readout::Rows(rows) => Some(rows.as_slice()),
-                        Readout::Last | Readout::None => None,
-                    },
+                readout: match &lane.readout {
+                    Readout::Rows(rows) => Some(rows.as_slice()),
+                    Readout::Last | Readout::None => None,
+                },
 
-                    translation: &lane.kv.translation,
+                translation: &lane.kv.translation,
 
-                    rs: &verbs[at],
-                    rs_reset: lane.rs_reset,
-                    rs_slot: lane.rs_slot,
+                rs: &verbs[at],
+                rs_reset: lane.rs_reset,
+                rs_slot: lane.rs_slot,
 
-                    #[cfg(feature = "vulkan")]
-                    feed: feeds[at].as_ref(),
-                    #[cfg(not(feature = "vulkan"))]
-                    feed: None,
+                #[cfg(feature = "vulkan")]
+                feed: feeds[at].as_ref(),
+                #[cfg(not(feature = "vulkan"))]
+                feed: None,
 
-                    group: lane.group,
-                    inputs: &input_cells[at],
-                })
+                group: lane.group,
+                inputs: &input_cells[at],
             })
-            .collect::<EngineResult<Vec<_>>>()?;
+            .collect();
 
         let landed = {
             use engine::frame::Shell as FrameShell;
@@ -1325,4 +1267,44 @@ fn epilogues(step: &Step) -> impl Iterator<Item = &engine::fire::Attachment> {
     step.attachments
         .iter()
         .filter(|attachment| attachment.at == Boundary::Epilogue)
+}
+
+/// Each lane of `attachment`'s pass's own readout rows and pixels, lane `k`
+/// of the pass at `k`: `velocity(k)`, `hidden(k)` and `pixels(k)` read them.
+#[cfg(feature = "vulkan")]
+fn lane_readouts<'a>(
+    shell: &'a Shell,
+    landed: &crate::serve::Landed,
+    attachment: &engine::fire::Attachment,
+) -> (
+    Vec<Option<crate::guest::run::Readout<'a>>>,
+    Vec<Option<crate::guest::run::Readout<'a>>>,
+) {
+    let lanes = attachment.lane..attachment.lane + attachment.lanes.max(1);
+    let readouts = lanes
+        .clone()
+        .map(|lane| {
+            shell
+                .readout_row(landed, lane)
+                .map(|(seat, at, width, dtype)| crate::guest::run::Readout {
+                    seat,
+                    at,
+                    width,
+                    f32: dtype == poem_ir::Dtype::F32,
+                })
+        })
+        .collect();
+    let pixels = lanes
+        .map(|lane| {
+            shell
+                .pixels_row(landed, lane)
+                .map(|(seat, at, width)| crate::guest::run::Readout {
+                    seat,
+                    at,
+                    width,
+                    f32: false,
+                })
+        })
+        .collect();
+    (readouts, pixels)
 }
