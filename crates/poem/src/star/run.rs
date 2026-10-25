@@ -261,7 +261,6 @@ impl Package {
         })
     }
 
-    /// The trace of `id`'s deployment `deploy`, named `name`, on `platform`.
     /// Whether the package leaves its weights' cuts to the compiler: its
     /// `CUTS` is `"inferred"`, else it states them (`"stated"`, the default
     /// of every package written before the compiler inferred them).
@@ -308,6 +307,7 @@ impl Package {
         Ok(())
     }
 
+    /// The trace of `id`'s deployment `deploy`, named `name`, on `platform`.
     pub fn trace(
         &self,
         id: &str,
