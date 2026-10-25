@@ -1103,7 +1103,10 @@ impl Vulkan {
             let instance = submission
                 .attachments
                 .iter()
-                .find(|attachment| attachment.lane as usize == at)
+                .find(|attachment| {
+                    (attachment.lane..attachment.lane + attachment.lanes.max(1))
+                        .contains(&(at as u32))
+                })
                 .map(|attachment| attachment.instance)
                 .ok_or_else(|| {
                     Error::Invalid(format!(
