@@ -7,7 +7,8 @@ use poem_compiler::{
     Budget, Budgets, CompiledModel, DeviceProfile, FireRows, PatchLadder, compile_axes,
 };
 use poem_exec::fire::{
-    At, Composition, Cursor, Filter, FireDescriptor, Lane as FireLane, compose_axes, fallback, walk,
+    At, Composition, Cursor, Filter, FireDescriptor, Lane as FireLane, LaneRow, compose_axes,
+    fallback, walk,
 };
 use poem_ir::{Dtype, Gather, Operation, RuntimeInput, Trace, Ty, ValueId};
 
@@ -355,12 +356,47 @@ pub struct Shell {
 
     feeds: poem_exec::feeds::Feeds,
     voxel_seat: Option<crate::inputs::VoxelSeat>,
-    pixels: Vec<(ValueId, u32, poem_ir::ClassSet)>,
+    pixels: Vec<PixelPlane>,
     pixel_out: Vec<Buffer>,
 
     mtp: Option<ValueId>,
 
     drafts_plane: Option<(ValueId, u32)>,
+}
+
+/// A `pixels` plane: its value, row width, writer classes, and the
+/// `conv.grid` chain from the port grid to its own (where each lane's clips
+/// start in it), when the load could walk one.
+struct PixelPlane {
+    plane: ValueId,
+    width: u32,
+    classes: poem_ir::ClassSet,
+    chain: Option<Vec<poem_ir::GridRule>>,
+}
+
+/// The `conv.grid` rules from the port grid to `grid`, in order.
+fn grid_chain(trace: &Trace, mut at: ValueId) -> Option<Vec<poem_ir::GridRule>> {
+    let mut rules = Vec::new();
+    loop {
+        if matches!(
+            trace.values.get(at.0 as usize).map(|decl| &decl.def),
+            Some(poem_ir::Def::Input(RuntimeInput::Grid))
+        ) {
+            rules.reverse();
+            return Some(rules);
+        }
+        let (grid, rule) = trace.nodes.iter().find_map(|node| match &node.op {
+            Operation::Conv(poem_ir::Conv::Grid { grid, rule, y }) if *y == at => {
+                Some((*grid, *rule))
+            }
+            _ => None,
+        })?;
+        if rules.len() > trace.nodes.len() {
+            return None;
+        }
+        rules.push(rule);
+        at = grid;
+    }
 }
 
 impl Shell {
@@ -619,13 +655,21 @@ impl Shell {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let pixel_planes: Vec<(ValueId, poem_ir::ClassSet)> = boot
+        let pixel_planes: Vec<(ValueId, poem_ir::ClassSet, Option<Vec<poem_ir::GridRule>>)> = boot
             .trace
             .seams
             .iter()
             .filter(|seam| seam.seam == PIXELS_SEAM)
-            .filter_map(|seam| seam.values.first().copied())
-            .map(|plane| (plane, writer_classes(&boot.trace, &compiled, plane)))
+            .filter_map(|seam| {
+                let plane = *seam.values.first()?;
+                Some((
+                    plane,
+                    writer_classes(&boot.trace, &compiled, plane),
+                    seam.values
+                        .get(1)
+                        .and_then(|grid| grid_chain(&boot.trace, *grid)),
+                ))
+            })
             .collect();
 
         // A plan reads out logits, pixels, or both; a decoder alone reads
@@ -792,7 +836,7 @@ impl Shell {
                 None => None,
             };
             let mut pixels = Vec::with_capacity(pixel_planes.len());
-            for (plane, classes) in &pixel_planes {
+            for (plane, classes, chain) in &pixel_planes {
                 let rect = carved.0[plane.0 as usize].ok_or_else(|| Fault::Unbound {
                     what: format!(
                         "value {}, a `{PIXELS_SEAM}` plane, which the carve gave no rectangle",
@@ -812,6 +856,7 @@ impl Shell {
                     rect.width,
                     classes.clone(),
                     u64::from(rect.rows) * u64::from(rect.width) * 2,
+                    chain.clone(),
                 ));
             }
             handles.rewind();
@@ -980,7 +1025,12 @@ impl Shell {
             voxel_seat,
             pixels: pixels
                 .into_iter()
-                .map(|(plane, width, classes, _)| (plane, width, classes))
+                .map(|(plane, width, classes, _, chain)| PixelPlane {
+                    plane,
+                    width,
+                    classes,
+                    chain,
+                })
                 .collect(),
             pixel_out,
             mtp,
@@ -1424,30 +1474,105 @@ impl Shell {
         ))
     }
 
-    fn pixel_rect(&self, p: &Prepared<'_>) -> Result<Option<(u64, u32, u32)>> {
-        let written = self.pixels.iter().find(|(plane, _, classes)| {
-            p.slots.0[plane.0 as usize].is_some()
-                && p.classes.iter().any(|&class| classes.contains(class))
+    fn pixel_rect(&self, p: &Prepared<'_>) -> Result<Option<(u64, u32, &PixelPlane)>> {
+        let written = self.pixels.iter().find(|pixels| {
+            p.slots.0[pixels.plane.0 as usize].is_some()
+                && p.classes
+                    .iter()
+                    .any(|&class| pixels.classes.contains(class))
         });
-        let Some((plane, width, _)) = written else {
+        let Some(pixels) = written else {
             return Ok(None);
         };
-        let rect = p.slots.0[plane.0 as usize].expect("checked just above");
+        let rect = p.slots.0[pixels.plane.0 as usize].expect("checked just above");
         let row = self.handles.get(rect.buf).ok_or_else(|| Fault::Unbound {
             what: format!(
                 "handle {}, a pixel plane's, which this fire minted no row for",
                 rect.buf
             ),
         })?;
-        Ok(Some((row.offset(), rect.rows, *width)))
+        Ok(Some((row.offset(), rect.rows, pixels)))
     }
 
-    fn copy_pixels(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<u32> {
-        let Some((at, rows, width)) = self.pixel_rect(p)? else {
-            return Ok(0);
+    /// Each lane's pixels in the read-back plane, by source lane: the byte it
+    /// starts at and its values. A lane reads pixels only where its class
+    /// writes them; its clips start where the plane's `conv.grid` chain,
+    /// replayed over the fire's port grid, puts its first clip.
+    fn pixel_spans(
+        &self,
+        p: &Prepared<'_>,
+        rows: u32,
+        pixels: &PixelPlane,
+    ) -> Result<Vec<(u64, u32)>> {
+        let table = match &pixels.chain {
+            Some(chain) => {
+                let mut table = p.voxel_grid.clone();
+                for rule in chain {
+                    table = rule.apply(&table).ok_or_else(|| Fault::Program {
+                        at: "serve::pixels",
+                        why: format!("a clip's box does not map through {rule:?}"),
+                    })?;
+                }
+                Some(table)
+            }
+            None => None,
+        };
+        let clips: u32 = p.rows.iter().map(|row| row.clips).sum();
+        let lanes = p.rows.iter().map(|row| row.source as usize + 1).max();
+        let mut spans = vec![(0u64, 0u32); lanes.unwrap_or(0)];
+        for row in &p.rows {
+            if row.clips == 0 || !pixels.classes.contains(row.class as usize) {
+                continue;
+            }
+            let (first, count) = match &table {
+                Some(table) => {
+                    let boxes = table.as_chunks::<4>().0;
+                    let first = row.clip_offset as usize;
+                    let Some(owned) = boxes.get(first..first + row.clips as usize) else {
+                        continue;
+                    };
+                    let count: u64 = owned
+                        .iter()
+                        .map(|clip| {
+                            u64::try_from(clip[0]).unwrap_or(0)
+                                * u64::try_from(clip[1]).unwrap_or(0)
+                                * u64::try_from(clip[2]).unwrap_or(0)
+                        })
+                        .sum();
+                    (u64::try_from(owned[0][3]).unwrap_or(0), count)
+                }
+                // Unwalked, a lane holding every clip owns the whole plane.
+                None if row.clips == clips => (0, u64::from(rows)),
+                None => continue,
+            };
+            if first + count > u64::from(rows) {
+                return Err(Fault::Program {
+                    at: "serve::pixels",
+                    why: format!(
+                        "lane {}'s pixels run to row {} and the plane holds {rows}",
+                        row.source,
+                        first + count
+                    ),
+                });
+            }
+            if let Some(span) = spans.get_mut(row.source as usize) {
+                *span = (
+                    first * u64::from(pixels.width) * 2,
+                    u32::try_from(count * u64::from(pixels.width)).unwrap_or(u32::MAX),
+                );
+            }
+        }
+        Ok(spans)
+    }
+
+    /// Copies the fire's pixel plane to its read-back seat: its element count
+    /// and each lane's span of it.
+    fn copy_pixels(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<(u32, Vec<(u64, u32)>)> {
+        let Some((at, rows, pixels)) = self.pixel_rect(p)? else {
+            return Ok((0, Vec::new()));
         };
         let into = &self.pixel_out[p.arm];
-        let bytes = u64::from(rows) * u64::from(width) * 2;
+        let bytes = u64::from(rows) * u64::from(pixels.width) * 2;
         if bytes > into.bytes() {
             return Err(Fault::Ceiling {
                 what: "pixel plane bytes",
@@ -1456,7 +1581,7 @@ impl Shell {
             });
         }
         frame.copy(self.arena.store(), at, into, 0, bytes)?;
-        Ok(rows * width)
+        Ok((rows * pixels.width, self.pixel_spans(p, rows, pixels)?))
     }
 
     /// The pixel plane `landed`'s fire wrote, bf16: its seat, the offset and
@@ -1469,7 +1594,7 @@ impl Shell {
 
     #[must_use]
     pub fn pixels_width(&self) -> Option<u32> {
-        self.pixels.iter().map(|(_, width, _)| *width).min()
+        self.pixels.iter().map(|pixels| pixels.width).min()
     }
 
     #[must_use]
@@ -2383,6 +2508,8 @@ impl Shell {
                 .iter()
                 .map(|row| row.class as usize)
                 .collect(),
+            rows: composition.lanes().to_vec(),
+            voxel_grid,
             arm,
             readout_rows,
             readout_layout,
@@ -2496,6 +2623,10 @@ pub struct Prepared<'a> {
     guests: Option<crate::landing::Guests>,
     merge_lands: Vec<MergeLand>,
     classes: Vec<usize>,
+    /// The fire's lanes as composed, and its port grid (`t, h, w, offset` a
+    /// clip): where each lane's pixels stand.
+    rows: Vec<LaneRow>,
+    voxel_grid: Vec<i32>,
 
     arm: usize,
     readout_rows: Vec<i32>,
@@ -2739,7 +2870,7 @@ impl engine::frame::Shell for Shell {
             }
         }
 
-        let pixels = self.copy_pixels(&mut frame, &prepared)?;
+        let (pixels, pixel_lanes) = self.copy_pixels(&mut frame, &prepared)?;
 
         {
             let rows = read_rows.len() as u64;
@@ -2776,7 +2907,7 @@ impl engine::frame::Shell for Shell {
                     .draft_mirror
                     .get(prepared.arm)
                     .map(|mirror| (self.mtp_width, mirror.clone())),
-                pixels: (pixels > 0).then(|| (self.pixel_out[prepared.arm].clone(), pixels)),
+                pixels: (pixels > 0).then(|| (self.pixel_out[prepared.arm].clone(), pixel_lanes)),
                 guests: prepared.guests.take(),
             },
             std::sync::Arc::clone(&self.mailbox),

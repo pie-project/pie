@@ -23,7 +23,8 @@ pub struct OnDevice<'a> {
     session: &'a mut Session,
     widen: &'a Widen,
     logits: Option<Readout<'a>>,
-    pixels: Option<Readout<'a>>,
+    /// Each lane of the pass's pixels (`pixels(k)`), lane `k` at `k`.
+    pixels: Vec<Option<Readout<'a>>>,
 
     ran: Vec<usize>,
 }
@@ -40,15 +41,15 @@ impl<'a> OnDevice<'a> {
             session,
             widen,
             logits,
-            pixels: None,
+            pixels: Vec::new(),
             ran: Vec::new(),
         }
     }
 
-    /// The fire's pixel plane, offered to a pass that reads the `pixels`
-    /// intrinsic.
+    /// Each lane of the pass's pixels, offered to a pass that reads the
+    /// `pixels` intrinsic of that lane.
     #[must_use]
-    pub fn with_pixels(mut self, pixels: Option<Readout<'a>>) -> OnDevice<'a> {
+    pub fn with_pixels(mut self, pixels: Vec<Option<Readout<'a>>>) -> OnDevice<'a> {
         self.pixels = pixels;
         self
     }
@@ -81,15 +82,15 @@ impl<'a> OnDevice<'a> {
                 )
             {
                 let offered = if root.intrinsic == Some(IntrinsicId::Pixels) {
-                    self.pixels
+                    self.pixels.get(root.lane as usize).copied().flatten()
                 } else {
                     self.logits
                 };
                 let seat = offered.ok_or_else(|| Fault::Program {
                     at: "guest::run",
                     why: format!(
-                        "this pass reads {:?} and the fire offered no such row",
-                        root.intrinsic
+                        "this pass reads {:?} of lane {} and the fire offered no such row",
+                        root.intrinsic, root.lane
                     ),
                 })?;
                 let (_, held) = self.session.span(at, local).ok_or_else(|| Fault::Program {
@@ -210,7 +211,7 @@ impl StageRunner for OnDevice<'_> {
 
     fn binds(&self, id: Option<IntrinsicId>) -> bool {
         (id == Some(IntrinsicId::Logits) && self.logits.is_some())
-            || (id == Some(IntrinsicId::Pixels) && self.pixels.is_some())
+            || (id == Some(IntrinsicId::Pixels) && self.pixels.iter().any(Option::is_some))
     }
 }
 

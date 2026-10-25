@@ -86,7 +86,8 @@ pub(crate) struct Pass<'a> {
     pub mtp_logits: Option<&'a [f32]>,
     pub mtp_width: u32,
     pub readout: Option<crate::guest::run::Readout<'a>>,
-    pub pixels: Option<crate::guest::run::Readout<'a>>,
+    /// Each lane of the pass's pixels, lane `k` at `k`.
+    pub pixels: Vec<Option<crate::guest::run::Readout<'a>>>,
 }
 
 #[cfg(feature = "wgpu")]
@@ -250,7 +251,7 @@ impl Guests {
         layout: &[(u32, u32)],
         out_width: u32,
         mtp_width: u32,
-        pixels: Option<&(crate::device::Buffer, u32)>,
+        pixels: Option<&(crate::device::Buffer, Vec<(u64, u32)>)>,
     ) -> Vec<Job> {
         let Guests {
             device,
@@ -344,13 +345,18 @@ impl Guests {
                                 mtp_logits: mtp.as_deref(),
                                 mtp_width,
                                 readout,
-                                pixels: pixels.as_ref().map(|(plane, count)| {
-                                    crate::guest::run::Readout {
-                                        seat: plane,
-                                        at: 0,
-                                        width: *count,
-                                    }
-                                }),
+                                pixels: span
+                                    .clone()
+                                    .map(|lane| {
+                                        let (plane, spans) = pixels.as_ref()?;
+                                        let &(at, width) = spans.get(lane)?;
+                                        (width > 0).then_some(crate::guest::run::Readout {
+                                            seat: plane,
+                                            at,
+                                            width,
+                                        })
+                                    })
+                                    .collect(),
                             },
                         )
                     });
@@ -929,7 +935,7 @@ impl Plane {
                 mtp_logits: None,
                 mtp_width: 0,
                 readout: None,
-                pixels: None,
+                pixels: Vec::new(),
             },
         )
     }
