@@ -115,13 +115,15 @@ fn per_row(f: &mut Func, v: Val, rows: i64) -> Result<Val, Error> {
 /// Each token row's cell, `[rows, max(3, axis + 1)]` f32
 /// (`ops::conv::cells`): a row of a clip of `tgrid` its patch's `(t, h, w)`
 /// there, any other row `positions[row]` in column `axis`; zeros
-/// elsewhere. kernels-cuda `elemwise::posenc::cells`.
+/// elsewhere. `base` is the row `tgrid` addresses `y`'s row 0 at.
+/// kernels-cuda `elemwise::posenc::cells`.
 pub fn cells(
     f: &mut Func,
     tgrid: Operand,
     positions: Operand,
     axis: u32,
     y: Landing,
+    base: u32,
 ) -> Result<Val, Error> {
     const OP: &str = "conv.cells";
     if y.width != axis.max(2) + 1 || positions.rows < y.rows {
@@ -135,6 +137,7 @@ pub fn cells(
         ));
     }
     let rows = i64::from(y.rows);
+    let tgrid = crate::conv::rebased(f, tgrid, base)?;
     let at = crate::conv::place(f, tgrid.val, rows)?;
     let pos = per_row(f, positions.val, rows)?;
     let zero = k(f, at.v.t, 0);
