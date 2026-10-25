@@ -194,7 +194,16 @@ pub fn boot(ordinal: i32) -> engine_cuda::DeviceBoot {
         ..engine_cuda::DeviceBoot::default()
     };
     boot.knobs.diagnostics = diagnostics();
+    boot.knobs.work_queues = Some(work_queues());
     boot
+}
+
+/// The work queues this binary's constructor started CUDA with.
+pub fn work_queues() -> u32 {
+    std::env::var("CUDA_DEVICE_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|word| word.trim().parse().ok())
+        .unwrap_or(engine_cuda::ep::DEFAULT_WORK_QUEUES)
 }
 
 /// `whole`'s checkpoint, every expert, in a directory of its own.

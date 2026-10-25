@@ -300,21 +300,9 @@ impl Seats {
     }
 }
 
-/// The work queues a device's context feeds its streams through:
-/// `CUDA_DEVICE_MAX_CONNECTIONS` as the process started, 8 unless set, at
-/// most 32. A stream with work pending holds a queue; once every queue is
-/// held, a further stream's work shares one and waits behind what is queued
-/// there. A rank's collective spins for its peers' launches with the rank's
-/// next kernels queued behind it, so a peer on the same device whose stream
-/// lands behind it never launches: the ranks a device carries, each with the
-/// streams it keeps busy beside its compute stream ([`QUEUES_A_RANK`]), must
-/// fit its queues.
-fn work_queues() -> u32 {
-    std::env::var("CUDA_DEVICE_MAX_CONNECTIONS")
-        .ok()
-        .and_then(|word| word.trim().parse::<u32>().ok())
-        .map_or(8, |queues| queues.clamp(1, 32))
-}
+/// The work queues a device's context feeds its streams through when the
+/// process does not say: CUDA's own count.
+pub const DEFAULT_WORK_QUEUES: u32 = 8;
 
 /// The work queues a rank may hold at once: its compute stream and the
 /// copy, tap and side streams that run beside it.
@@ -324,7 +312,16 @@ const QUEUES_A_RANK: u32 = 4;
 /// at `widest`. The ranks must reach one another as the peer collectives
 /// do ([`crate::comm::reach`] checks the path first); there is no fallback
 /// for a dispatch.
-pub fn wire(ordinals: &[i32], widest: Widest) -> Result<Vec<Wire>> {
+///
+/// `queues` is the work queues a device's context feeds its streams
+/// through (`Knobs::work_queues`). A stream with work pending holds a
+/// queue; once every queue is held, a further stream's work shares one and
+/// waits behind what is queued there. A rank's collective spins for its
+/// peers' launches with the rank's next kernels queued behind it, so a peer
+/// on the same device whose stream lands behind it never launches: the
+/// ranks a device carries, each with the streams it keeps busy beside its
+/// compute stream ([`QUEUES_A_RANK`]), must fit its queues.
+pub fn wire(ordinals: &[i32], widest: Widest, queues: u32) -> Result<Vec<Wire>> {
     let off = |why: String| Fault::program("ep::wire", why);
     let world = u32::try_from(ordinals.len()).unwrap_or(u32::MAX);
     if !(2..=EP_MAX_RANKS).contains(&world) {
@@ -336,7 +333,6 @@ pub fn wire(ordinals: &[i32], widest: Widest) -> Result<Vec<Wire>> {
         .map(|a| ordinals.iter().filter(|b| *b == a).count() as u32)
         .max()
         .unwrap_or(1);
-    let queues = work_queues();
     if sharing > 1 && sharing * QUEUES_A_RANK > queues {
         return Err(off(format!(
             "{sharing} ranks share a device, and its context has {queues} work queues: a \

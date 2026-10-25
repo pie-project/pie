@@ -221,6 +221,8 @@ type Fired = EngineResult<(FireTicket, PendingStep)>;
 struct Group {
     ranks: Vec<Arc<Mutex<Cuda>>>,
     ordinals: Vec<i32>,
+    /// The work queues each device's context has (`Knobs::work_queues`).
+    work_queues: u32,
     steps: Rendezvous<(Step, engine::StepDone), Fired>,
     /// Each rank's shape as it reaches arming, and the group's wires once
     /// the last has: every rank's load meets the others there.
@@ -388,8 +390,8 @@ impl Group {
                 .iter()
                 .all(|other| other.as_ref() == Some(&shape));
             wiring.wires = Some(if same {
-                let wired =
-                    crate::ep::wire(&self.ordinals, shape.widest).map_err(|f| f.to_string());
+                let wired = crate::ep::wire(&self.ordinals, shape.widest, self.work_queues)
+                    .map_err(|f| f.to_string());
                 crate::device::ctx::bind_thread(self.ordinals[rank]).map_err(|f| f.to_string())?;
                 wired
             } else {
@@ -567,6 +569,7 @@ pub fn open_lockstep(
     }
     let ordinals: Vec<i32> = boots.iter().map(|boot| boot.ordinal).collect();
     let knobs = &boots[0].knobs;
+    let work_queues = knobs.work_queues.unwrap_or(crate::ep::DEFAULT_WORK_QUEUES);
     let rebalance = (knobs.expert_rebalance_steps.filter(|&every| every > 0)).map(|every| {
         crate::ep::rebalance::Rebalance {
             every,
@@ -590,6 +593,7 @@ pub fn open_lockstep(
     let group = Arc::new(Group {
         ranks,
         ordinals,
+        work_queues,
         steps: Rendezvous::new(size, GATHER),
         wiring: Mutex::new(Wiring {
             shapes: vec![None; size],

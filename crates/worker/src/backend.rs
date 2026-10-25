@@ -233,6 +233,11 @@ fn device_boot(
     knobs.expert_load_window = opts.expert_load_window;
     knobs.expert_rebalance_moves = opts.expert_rebalance_moves;
     knobs.expert_rebalance_gain = opts.expert_rebalance_gain;
+    // The count CUDA read once, at its first call, from the environment the
+    // binary started it with: the shell reads no environment of its own.
+    knobs.work_queues = std::env::var("CUDA_DEVICE_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|word| word.trim().parse::<u32>().ok());
     if let Some(word) = opts.nccl_transport.as_deref() {
         knobs.nccl_transport = word
             .parse::<Transport>()

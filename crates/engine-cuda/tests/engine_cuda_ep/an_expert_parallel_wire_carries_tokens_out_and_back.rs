@@ -68,7 +68,8 @@ fn check(world: u32, ordinals: &[i32], [tokens, width, top_k, experts, widest]: 
         out_bytes: row_bytes,
         top_k,
     };
-    let wires = wire(ordinals, widest).expect("every rank reaches every other");
+    let wires = wire(ordinals, widest, crate::micro::work_queues())
+        .expect("every rank reaches every other");
     let devices: Vec<Context> = (ordinals.iter())
         .map(|&ordinal| Context::bind(ordinal, None).unwrap())
         .collect();

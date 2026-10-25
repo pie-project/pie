@@ -156,7 +156,8 @@ fn group(
         .shell
         .ep_shape()
         .expect("the lowered micro dispatches");
-    let wires = wire(ordinals, shape.widest).expect("every rank reaches every other");
+    let wires = wire(ordinals, shape.widest, crate::micro::work_queues())
+        .expect("every rank reaches every other");
     for (r, (staged, _)) in staged.iter_mut().enumerate() {
         engine_cuda::device::ctx::bind_thread(ordinals[r]).unwrap();
         let ep = EpRank::new(wires.clone(), r as u32, &shape.layers).expect("the placement");

@@ -79,6 +79,11 @@ pub struct Knobs {
     pub expert_load_window: Option<u32>,
     pub expert_rebalance_moves: Option<u32>,
     pub expert_rebalance_gain: Option<f64>,
+    /// The work queues a device's context feeds its streams through, as
+    /// the process started CUDA with them (`CUDA_DEVICE_MAX_CONNECTIONS`;
+    /// none, CUDA's default): an expert-parallel group whose ranks share a
+    /// device wires only when its ranks' streams fit them.
+    pub work_queues: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
