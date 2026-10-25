@@ -736,6 +736,23 @@ impl Plane {
             .host_resolved_rings(&program.plan, bound.geometry)
     }
 
+    /// Whether the host resolves one of instance `id`'s descriptor ports off
+    /// a channel its prologue puts.
+    #[must_use]
+    pub fn resolves_prologue_put(&self, id: InstanceId) -> bool {
+        let Some(bound) = self.instances.get(&id) else {
+            return false;
+        };
+        if bound.geometry == GeometryClass::Host {
+            return false;
+        }
+        self.programs.get(&bound.program_id).is_some_and(|program| {
+            bound
+                .session
+                .resolves_prologue_put(&program.plan, bound.geometry)
+        })
+    }
+
     pub fn shared_rings(&self, id: InstanceId) -> Vec<usize> {
         self.instances
             .get(&id)

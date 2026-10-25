@@ -143,6 +143,9 @@ impl FrameShell for Shell {
             self.reap_guests_at("prepare")?;
         }
         super::btrace::mark("reap");
+        // A prologue that moves a channel runs before the ports resolve.
+        self.prologue(attachments)?;
+        super::btrace::mark("prologue");
         let mut resolved: Vec<engine::ports::Envelope> = Vec::new();
         let mut token_src_of: Vec<Option<(u64, u32)>> = vec![None; lanes.len()];
         let mut envelope_of: Vec<Option<(usize, usize)>> = vec![None; lanes.len()];
