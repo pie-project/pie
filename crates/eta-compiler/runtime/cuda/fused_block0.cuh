@@ -97,6 +97,38 @@ __device__ __forceinline__ void ptir_parallel_intrinsic(
   }
 }
 
+// A keyed draw's seed from its state, a whole value `[key, counter]`: a
+// row-parallel region reads it through the state's whole descriptor and
+// storage, never through a row's narrowed view of it.
+__device__ __forceinline__ m1_u64 ptir_rng_state_seed(
+    const m1_u8* state,
+    const M1ValueDesc state_desc) {
+  const m1_u32 key = m1_load_u(state, 0u, state_desc.dtype);
+  const m1_u32 counter =
+      state_desc.len > 1u ? m1_load_u(state, 1u, state_desc.dtype) : 0u;
+  return ptir_rng_keyed_seed(key, counter);
+}
+
+__device__ __forceinline__ float ptir_rng_draw(
+    m1_u64 seed,
+    m1_u32 index,
+    m1_u32 kind) {
+  if (kind == 2u) return ptir_rng_hash_normal(seed, index);
+  const float uniform = ptir_rng_hash_uniform(seed, index);
+  return kind == 0u ? uniform : -logf(-logf(uniform));
+}
+
+__device__ __forceinline__ void ptir_parallel_rng_keyed(
+    const m1_u8* state,
+    const M1ValueDesc state_desc,
+    m1_u8* output,
+    const M1ValueDesc out,
+    const M1OpParams p) {
+  const m1_u64 seed = ptir_rng_state_seed(state, state_desc);
+  for (m1_u32 i = threadIdx.x; i < out.len; i += blockDim.x)
+    m1_store_f(output, i, ptir_rng_draw(seed, i + p.imm3, p.kind));
+}
+
 __device__ __forceinline__ void ptir_parallel_elementwise(
     m1_u32 tag,
     M1Status* status,
@@ -334,25 +366,11 @@ __device__ __forceinline__ void ptir_parallel_elementwise(
       continue;
     }
     if (tag == 0x70u || tag == 0x71u) {
-      m1_u64 seed;
-      if (tag == 0x70u) {
-        seed = ptir_rng_seed_eff_stream((m1_u32)p.rng_seed, p.imm);
-      } else {
-        const m1_u32 key = m1_load_u(a0, 0u, d0.dtype);
-        const m1_u32 counter =
-            d0.len > 1u ? m1_load_u(a0, 1u, d0.dtype) : 0u;
-        seed = ptir_rng_keyed_seed(key, counter);
-      }
-
-      if (p.kind == 2u) {
-        m1_store_f(o0, i, ptir_rng_hash_normal(seed, i + p.imm3));
-        continue;
-      }
-      const float uniform = ptir_rng_hash_uniform(seed, i + p.imm3);
-      m1_store_f(
-          o0,
-          i,
-          p.kind == 0u ? uniform : -logf(-logf(uniform)));
+      const m1_u64 seed =
+          tag == 0x70u
+              ? ptir_rng_seed_eff_stream((m1_u32)p.rng_seed, p.imm)
+              : ptir_rng_state_seed(a0, d0);
+      m1_store_f(o0, i, ptir_rng_draw(seed, i + p.imm3, p.kind));
       continue;
     }
   }
@@ -2073,10 +2091,7 @@ __device__ __forceinline__ void ptir_fast_gumbel_argmax_intrinsic(
   const m1_u32 lane = threadIdx.x & 31u;
   const m1_u32 warp = threadIdx.x >> 5u;
   const m1_u32 warps = blockDim.x >> 5u;
-  const m1_u32 key = m1_load_u(state, 0u, state_desc.dtype);
-  const m1_u32 counter =
-      state_desc.len > 1u ? m1_load_u(state, 1u, state_desc.dtype) : 0u;
-  const m1_u64 seed = ptir_rng_keyed_seed(key, counter);
+  const m1_u64 seed = ptir_rng_state_seed(state, state_desc);
   const bool scaled = divisor != nullptr;
   const float divide_by =
       scaled ? m1_load_f(divisor, 0u, divisor_desc.dtype) : 1.0f;

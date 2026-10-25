@@ -164,7 +164,16 @@ pub(crate) fn fused_partition(
             continue;
         }
         let (geometry, witness) = class(node);
-        if run.is_some_and(|(seen, _)| seen != geometry) {
+        // A keyed draw reads its state whole, every row of it: a state the
+        // run computes row by row is another block's until the run ends.
+        let reads_run_rows = matches!(geometry, Geometry::Rows { .. })
+            && match &stage.ops[node.index()] {
+                Op::RngKeyed { state, .. } => index
+                    .producer(*state)
+                    .is_some_and(|producer| generated.contains(&producer)),
+                _ => false,
+            };
+        if reads_run_rows || run.is_some_and(|(seen, _)| seen != geometry) {
             flush_generated_run(stage, index, &mut regions, &mut generated, &mut run, alias);
         }
         match run {
