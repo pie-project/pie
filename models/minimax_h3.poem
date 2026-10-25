@@ -191,6 +191,13 @@ def layout(id, deploy):
             audio_out = linear(AUDIO_CHANNELS, dim, banks),
         ),
         te = encoder(TE, TE_LAYERS, banks, sharded = True) if id == "minimax-h3-fl2va" else None,
+        rope = struct(
+            four = weight([1], dtype.f32, values = [4.0]),
+            five = weight([1], dtype.f32, values = [5.0]),
+            minus_four = weight([1], dtype.f32, values = [-4.0]),
+            minus_span = weight([1], dtype.f32, values = [-5.0 / 3.0]),
+            centre = weight([1], dtype.f32, values = [GRID_CENTRE]),
+        ),
     )
 
 def shifted_sigmas(shift, steps):
@@ -433,6 +440,7 @@ def caches(m, c):
 def forward(m, inputs):
     switch("reading", (["text"] if m.te != None else []) + ["refine", "denoise"])
     switch("stream", ["text", "video", "audio", "reference"])
+    switch("positions", ["computed", "given"])
     reading = lambda name: inputs.on(switch_is("reading", name))
     if m.te != None:
         qwen3_encode(reading("text"), m.te)
@@ -490,6 +498,95 @@ def patched(rows, name, grid, tgrid):
     cut into its patches' token rows (the TokenGrid order)."""
     return ops.conv.patchify(rows.input(name, dtype.bf16, "voxel", LATENT_CHANNELS), grid, PATCH, tgrid)
 
+# The rope positions (the reference's packed sequence): one timeline in
+# audio ticks (1/40 s) after a text prefix, and every spatial grid
+# aspect-normalised onto [0, 32) about 16.
+#
+# * a text row `j`: `(j, 0, 0)`;
+# * a video patch of latent frame `k` at cell `(i, j)` of an `nh × nw` grid:
+#   `L + 5/3 · Σ_{f<k} FRAMES[f mod 5]` (`L` its group's text rows, `FRAMES`
+#   = (1, 4, 4, 4, 4) frames a latent covers; in closed form
+#   `L + 17k/3 − 4 + (k + 4) mod 5`), at `16 + 16 · (2i − nh) / √(nh·nw)` and
+#   `16 + 16 · (2j − nw) / √(nh·nw)` (`linspace((1 − r)/2, (1 + r)/2, n,
+#   endpoint=False) · 32`, `r = n / √(nh·nw)`);
+# * an audio row: its lane carries each stereo channel's `n` ticks in turn,
+#   so row `j` is tick `j mod n` of channel `c = j div n`, at `(L + tick, 0,
+#   w)`, `w` the first (c = 0) or last (c = 1) column of its group's video
+#   grid;
+# * a reference (keyframe) patch on its own grid at the first video frame's
+#   time, its frame `f` past the first `f · (5/3 · Σ_all − 5/3)` on (the last
+#   keyframe at the video's end).
+#
+# A lane whose `positions` switch says `given` reads the guest's instead.
+GRID_CENTRE = 16.0
+FRAME_TICKS = 17.0 / 3.0
+
+# The in-place ops (a scale, a bias) are each the last read of what they
+# write; a value read again goes through `copy` first.
+fresh = ops.elemwise.copy
+
+def frames_time(k, m):
+    """`5/3 · Σ_{f<k} FRAMES[f mod 5]`, the ticks `k` latent frames cover."""
+    c = m.rope
+    five = ops.elemwise.add_bias(c.five, ops.elemwise.mul_scalar(0.0, fresh(k)))
+    tail = ops.elemwise.mod(ops.elemwise.add_bias(c.four, fresh(k)), five)
+    return ops.elemwise.add(ops.elemwise.mul_scalar(FRAME_TICKS, fresh(k)), ops.elemwise.add_bias(c.minus_four, tail))
+
+def grid_axis(cell, n, area, m):
+    """A cell on an aspect-normalised axis of `n` cells: `16 + 16 · (2·cell −
+    n) / √area`."""
+    span = ops.elemwise.add(ops.elemwise.mul_scalar(2.0, fresh(cell)), ops.elemwise.mul_scalar(-1.0, fresh(n)))
+    return ops.elemwise.add_bias(m.rope.centre, ops.elemwise.mul_scalar(GRID_CENTRE, ops.elemwise.div(span, area)))
+
+def turn_positions(arm, m, streams):
+    """Each denoise row's rope position (see above)."""
+    text, video, audio, reference = streams
+    lanes = arm.request_of_token()
+    groups = arm.group_of_lane()
+    cells, size = ops.gather.split_rows(ops.conv.cells(arm.token_grid(PATCH), arm.positions(), 0), ROPE_AXES)
+    k, i, j = [column(cells, a, ROPE_AXES) for a in range(ROPE_AXES)]
+    _, nh, nw = [column(size, a, ROPE_AXES) for a in range(ROPE_AXES)]
+    # The group's video grid and its text rows, read off the group structure.
+    _, video_size = ops.gather.split_rows(ops.conv.cells(video.token_grid(PATCH), video.positions(), 0), ROPE_AXES)
+    peer = ops.gather.group_first(
+        ops.gather.pack_rows(video_size, video.row_permutation()),
+        video.group_indptr(),
+        groups,
+        lanes,
+    )
+    v_frames, v_nh, v_nw = [column(peer, a, ROPE_AXES) for a in range(ROPE_AXES)]
+    text_rows = ops.gather.group_rows(text.group_indptr(), groups, lanes)
+    root = lambda a, b: ops.elemwise.sqrt(ops.elemwise.mul(a, b))
+
+    area = root(nh, nw)
+    h = grid_axis(i, nh, area, m)
+    w = grid_axis(j, nw, area, m)
+    video_rows = ops.gather.concat_cols([ops.elemwise.add(text_rows, frames_time(k, m)), h, w])
+
+    # The keyframe `f` rides `f · (5/3 · Σ_all − 5/3)` past the first frame.
+    last = ops.elemwise.add_bias(m.rope.minus_span, frames_time(v_frames, m))
+    reference_rows = ops.gather.concat_cols([ops.elemwise.add(text_rows, ops.elemwise.mul(k, last)), h, w])
+
+    # Audio row `k` (its row in the lane): tick `k mod n` of channel `k div n`.
+    ticks = ops.elemwise.mul_scalar(0.5, ops.gather.group_rows(audio.group_indptr(), groups, lanes))
+    tick = ops.elemwise.mod(k, ticks)
+    channel = ops.elemwise.div(ops.elemwise.add(k, ops.elemwise.mul_scalar(-1.0, fresh(tick))), ticks)
+    edge = ops.elemwise.add(ops.elemwise.mul(channel, v_nw), ops.elemwise.mul_scalar(-1.0, fresh(channel)))
+    a_w = grid_axis(edge, v_nw, root(v_nh, v_nw), m)
+    zero = ops.elemwise.mul_scalar(0.0, fresh(k))
+    audio_rows = ops.gather.concat_cols([ops.elemwise.add(text_rows, tick), zero, a_w])
+
+    # Split as the denoise splits its streams, so the rows merge back whole.
+    t, v, a = [switch_is("stream", name) for name in ["text", "video", "audio"]]
+    computed = merge([
+        cells.on(t),
+        video_rows.on(~t).on(v),
+        audio_rows.on(~t).on(~v).on(a),
+        reference_rows.on(~t).on(~v).on(~a),
+    ])
+    given = switch_is("positions", "given")
+    return merge([arm.on(given).input("positions", dtype.f32, "row", m.rope_axes), computed.on(~given)])
+
 def denoise(arm, m):
     d = m.dims
     dit = m.dit
@@ -498,7 +595,7 @@ def denoise(arm, m):
     audio, reference = rest.on(switch_is("stream", "audio")), rest.on(~switch_is("stream", "audio"))
 
     lanes = arm.request_of_token()
-    positions = arm.input("positions", dtype.f32, "row", m.rope_axes)
+    positions = turn_positions(arm, m, (text, video, audio, reference))
     joint = struct(perm = arm.row_permutation(), csr = arm.group_indptr(), mask = group_block_diagonal())
 
     def side(rows, stream):

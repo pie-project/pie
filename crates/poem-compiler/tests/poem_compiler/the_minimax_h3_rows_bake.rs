@@ -65,6 +65,48 @@ fn the_minimax_h3_rows_bake_every_case() {
     the_generative_facts_state_the_readings_the_latent_and_two_shifts();
     the_modulation_is_a_lane_vector_and_every_gated_fold_folds_its_residual();
     the_gather_merges_four_lane_shaped_arms_back_onto_the_reading();
+    the_positions_are_computed_in_the_graph_unless_given();
+}
+
+fn the_positions_are_computed_in_the_graph_unless_given() {
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let count = |f: &dyn Fn(&Operation) -> bool| plan.nodes.iter().filter(|n| f(&n.op)).count();
+        assert_eq!(
+            count(&|op| matches!(op, Operation::Conv(poem_ir::Conv::Cells { axis: 0, .. }))),
+            2,
+            "`{deployment}`: every row's cell, and the video lane's own for its peers"
+        );
+        assert_eq!(
+            count(&|op| matches!(op, Operation::Gather(poem_ir::Gather::GroupFirst { .. }))),
+            1,
+            "`{deployment}`: the audio pins to its group's video grid"
+        );
+        assert_eq!(
+            count(&|op| matches!(op, Operation::Gather(poem_ir::Gather::GroupRows { .. }))),
+            2,
+            "`{deployment}`: the text prefix and the audio ticks, read off the group"
+        );
+        assert_eq!(
+            plan.facts
+                .declared("positions")
+                .map(|s| s.values.clone())
+                .unwrap_or_default(),
+            vec!["computed", "given"],
+            "`{deployment}`: positions are computed unless a lane gives them"
+        );
+        let positions = plan
+            .inputs
+            .iter()
+            .position(|i| i.name == "positions")
+            .expect("a positions input");
+        assert!(
+            plan.values.iter().any(|v| matches!(v.def,
+                Def::Input(RuntimeInput::Guest { id, axis: InputAxis::Row, width, .. })
+                    if id as usize == positions && width == 3)),
+            "`{deployment}`: a `given` lane reads (t, h, w) a row"
+        );
+    }
 }
 
 fn every_row_traces_on_every_platform_with_the_encoder_it_declares() {
@@ -481,8 +523,8 @@ fn the_gather_merges_four_lane_shaped_arms_back_onto_the_reading() {
             })
             .count();
         assert_eq!(
-            token_merges, 1,
-            "`{deployment}`: one packed row sequence, joined once"
+            token_merges, 2,
+            "`{deployment}`: the packed row sequence and its computed positions, each joined once"
         );
     }
 }
