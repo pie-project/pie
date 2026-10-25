@@ -82,8 +82,6 @@ pub fn register(
     let generative = deployment.try_generative().map_err(|why| {
         anyhow!("`{model_id}` states generative facts this runtime refuses: {why}")
     })?;
-    velocity_width(&classes)
-        .map_err(|fault| anyhow!("`{model_id}` reads out what this runtime refuses: {fault}"))?;
 
     let model = Arc::new(Model {
         name,
@@ -164,45 +162,6 @@ pub(crate) fn template_of(model: &poem::star::Model) -> chat_template::Spec {
     }
 }
 
-/// The one velocity width the model's classes read out, if any reads one:
-/// the eta profile carries one.
-pub fn velocity_width(classes: &poem_ir::LaneClasses) -> Result<Option<u32>, String> {
-    let mut widths = readouts(classes, poem_ir::ReadoutKind::Velocity);
-    let Some(first) = widths.next() else {
-        return Ok(None);
-    };
-    match widths.find(|width| *width != first) {
-        Some(other) => Err(format!(
-            "one class reads a velocity {first} wide and another {other}; the eta profile \
-             carries one velocity width"
-        )),
-        None => Ok(Some(first)),
-    }
-}
-
-/// Whether some class reads pixels out, and their width when every such
-/// class agrees on it (0 when they do not).
-pub fn pixels_width(classes: &poem_ir::LaneClasses) -> Option<u32> {
-    let mut widths = readouts(classes, poem_ir::ReadoutKind::Pixels);
-    let first = widths.next()?;
-    Some(if widths.all(|width| width == first) {
-        first
-    } else {
-        0
-    })
-}
-
-fn readouts(
-    classes: &poem_ir::LaneClasses,
-    kind: poem_ir::ReadoutKind,
-) -> impl Iterator<Item = u32> + '_ {
-    classes
-        .classes
-        .iter()
-        .filter_map(move |class| class.readout.filter(|r| r.kind == kind))
-        .map(|readout| readout.width)
-}
-
 pub fn model() -> &'static Arc<Model> {
     MODEL.get().expect("model accessed before registration")
 }
@@ -257,6 +216,9 @@ pub struct Lane {
     pub embeds: bool,
     /// What it reads out: a float readout where some class reads one.
     pub readout: Option<poem_ir::Readout>,
+    /// The patch its token grid reads, where some class reads one: its
+    /// voxels attend as one token row a patch.
+    pub patch: Option<[u32; 3]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -282,8 +244,6 @@ pub struct EtaCaps {
     pub draft_block: u32,
     pub draft_mask_token: u32,
     pub draft_proposals_from: u32,
-    pub has_value_head: bool,
-    pub has_kv_envelopes: bool,
     pub has_attn_score: bool,
     pub has_attn_page_mask: bool,
     pub has_lora: bool,
@@ -464,6 +424,7 @@ impl Model {
             readout: readouts()
                 .find(|readout| readout.kind != poem_ir::ReadoutKind::Logits)
                 .or_else(|| readouts().next()),
+            patch: landed.iter().find_map(|class| class.patch),
         })
     }
 

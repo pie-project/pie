@@ -37,15 +37,32 @@ pub struct ForwardBindings {
     pub embed: Option<EmbedBinding>,
     pub state: Option<StateBinding>,
     pub readout: Option<u32>,
+    pub mask: Option<u32>,
     pub checkpoints: Vec<u32>,
-    pub media: Vec<std::sync::Arc<media::front::EncodedSpan>>,
-    /// The model's switches the pass set, each checked against its
+    /// What each lane binds, by lane: as many as the highest lane a verb
+    /// named, plus one.
+    pub lanes: Vec<LaneBinding>,
+}
+
+impl ForwardBindings {
+    /// Lane `lane`'s bindings, the lanes before it bound to nothing.
+    pub fn lane_mut(&mut self, lane: usize) -> &mut LaneBinding {
+        if self.lanes.len() <= lane {
+            self.lanes.resize_with(lane + 1, LaneBinding::default);
+        }
+        &mut self.lanes[lane]
+    }
+}
+
+/// What one lane of a pass binds.
+#[derive(Clone, Default)]
+pub struct LaneBinding {
+    /// The model's switches the lane set, each checked against its
     /// declaration.
     pub switches: Vec<(String, String)>,
     pub group: Option<u32>,
-    pub peer: Option<u32>,
     pub inputs: Vec<InputBinding>,
-    pub attn_classes: Option<::engine::fire::AttnClasses>,
+    pub media: Vec<std::sync::Arc<media::front::EncodedSpan>>,
 }
 
 /// A channel bound to the model's input `name` (id `id`): the rows it
@@ -70,57 +87,39 @@ impl InputBinding {
     }
 }
 
+/// What one lane of a bound pass carries to its fires.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LaneFacts {
-    /// The model's switches the pass set; its lanes' words are built from
-    /// them and the runtime switches.
+    /// The model's switches the lane set; its word is built from them and
+    /// the runtime switches.
     pub switches: Vec<(String, String)>,
     pub group: Option<u32>,
-    pub peer: Option<u32>,
     pub inputs: Vec<::engine::fire::InputFeed>,
-    pub attn_classes: Option<::engine::fire::AttnClasses>,
 }
 
 impl LaneFacts {
-    pub fn stamp(&self, req: &mut crate::engine::FireRequest) {
-        for lane in &mut req.lanes {
-            lane.group = self.group;
-            lane.peer = self.peer;
-            lane.inputs = self.inputs.clone();
-            lane.attn_classes = self.attn_classes.clone();
+    /// Stamps each lane of `req` with its own facts, `lanes[i]` on lane `i`.
+    pub fn stamp(lanes: &[LaneFacts], req: &mut crate::engine::FireRequest) {
+        for (lane, facts) in req.lanes.iter_mut().zip(lanes) {
+            lane.group = facts.group;
+            lane.inputs = facts.inputs.clone();
         }
     }
 }
 
-#[must_use]
-pub fn cohort_of(
-    table: &mut wasmtime::component::ResourceTable,
-    group: Option<u32>,
-    peer: Option<u32>,
-) -> Option<u32> {
-    let group = group?;
-    let members = table
-        .iter_mut()
-        .filter_map(|entry| entry.downcast_ref::<ForwardPass>())
-        .filter(|pass| {
-            pass.bindings.group == Some(group) || (peer.is_some() && pass.bindings.group == peer)
-        })
-        .count();
-    Some(u32::try_from(members).unwrap_or(u32::MAX).max(1))
-}
-
-#[must_use]
-pub fn cohort_key(group: Option<u32>, peer: Option<u32>) -> Option<u32> {
-    match (group, peer) {
-        (Some(group), Some(peer)) => Some(group.min(peer)),
-        (group, _) => group,
-    }
-}
-
+/// A lane of a pass whose lanes read no kv: the rows it carries and the
+/// clips its voxel inputs bind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FloatLane {
     pub rows: u32,
     pub clips: Vec<[u32; 3]>,
+}
+
+/// A pass whose lanes read no kv: each lane's rows, and whether its rows are
+/// embedded tokens.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FloatPass {
+    pub lanes: Vec<FloatLane>,
     pub embed: bool,
 }
 
@@ -136,7 +135,6 @@ pub struct StateBinding {
     pub positions: Option<u32>,
     pub slots: Option<u32>,
     pub kv_len: Option<u32>,
-    pub mask: Option<u32>,
     pub fold: Option<u32>,
 }
 
@@ -204,8 +202,9 @@ pub struct BoundForwardPass {
     pub devgeo: Option<Vec<u32>>,
     pub decode_envelope: Option<eta_ir::registry::PortMask>,
     pub host_shadow: crate::pipeline::fire::shadow::HostShadow,
-    pub lane: LaneFacts,
-    pub float: Option<FloatLane>,
+    /// Each lane's facts, in lane order.
+    pub facts: Vec<LaneFacts>,
+    pub float: Option<FloatPass>,
     pub(crate) closed: bool,
 }
 

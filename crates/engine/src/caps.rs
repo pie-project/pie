@@ -1,4 +1,4 @@
-use eta_ir::registry::{GeometryClass, ModelProfile, PortMask};
+use eta_ir::registry::{GeometryClass, PortMask};
 use serde::{Deserialize, Serialize};
 
 use crate::transfer::{KvHandle, MemoryDomain};
@@ -124,7 +124,6 @@ pub struct Capabilities {
     pub device: DeviceFacts,
     pub pools: PoolFacts,
     pub limits: FireLimits,
-    pub profile: ModelProfile,
     pub ports: PortMask,
     pub geometry: GeometryClass,
     pub kv_copy: KvCopyDomains,
@@ -147,6 +146,34 @@ pub struct Capabilities {
 
     #[serde(default)]
     pub adapter_attachments: bool,
+
+    /// The engine runs an adapter's `lora` sink.
+    #[serde(default)]
+    pub has_lora: bool,
+
+    /// The engine runs an `attn_page_mask` sink.
+    #[serde(default)]
+    pub has_attn_page_mask: bool,
+
+    /// The loaded graph drafts: a draft column `mtp_logits` reads, and the
+    /// `mtp_depth` ids it drafts a fire.
+    #[serde(default)]
+    pub has_mtp_logits: bool,
+    #[serde(default)]
+    pub mtp_depth: u32,
+
+    /// The loaded graph's block drafter: the rows it drafts, its mask token
+    /// and the row its proposals start from.
+    #[serde(default)]
+    pub draft_block: u32,
+    #[serde(default)]
+    pub draft_mask_token: u32,
+    #[serde(default)]
+    pub draft_proposals_from: u32,
+
+    /// The loaded graph exports attention scores.
+    #[serde(default)]
+    pub has_attn_score: bool,
 
     /// The facts the loaded trace's rows branch on, which a lane's word is
     /// classified by.
