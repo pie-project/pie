@@ -487,6 +487,10 @@ pub fn render(r: &Rendered) -> String {
                     "kind": "cells", "tgrid": tgrid, "positions": positions, "y": y,
                     "clips": clips, "rows": rows, "axis": axis, "width": width,
                 }),
+                HostOp::ConcatCols { x, y, rows, width, stride, at } => serde_json::json!({
+                    "kind": "concat_cols", "x": x, "y": y, "rows": rows, "width": width,
+                    "stride": stride, "at": at,
+                }),
                 HostOp::GroupRows { csr, groups, lanes, y, csr_len, lane_count, rows } => serde_json::json!({
                     "kind": "group_rows", "csr": csr, "groups": groups, "lanes": lanes, "y": y,
                     "csr_len": csr_len, "lane_count": lane_count, "rows": rows,
@@ -871,6 +875,14 @@ pub fn unrender(text: &str) -> Option<Rendered> {
                             rows: u("rows")?,
                             axis: u("axis")?,
                             width: u("width")?,
+                        },
+                        "concat_cols" => HostOp::ConcatCols {
+                            x: s("x")?,
+                            y: s("y")?,
+                            rows: u("rows")?,
+                            width: u("width")?,
+                            stride: u("stride")?,
+                            at: u("at")?,
                         },
                         "group_rows" => HostOp::GroupRows {
                             csr: s("csr")?,

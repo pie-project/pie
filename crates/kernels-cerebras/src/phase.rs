@@ -764,6 +764,16 @@ pub enum HostOp {
     },
     /// `y[r] = csr[g + 1] - csr[g]` (f32) for `g = groups[lanes[r]]`, 0 when
     /// the lane or group is out of the tables (`lane_count`, `csr_len`).
+    /// `y[r][at..at + width] = x[r]` for `rows` rows, `y` rows `stride`
+    /// wide: one input of a side-by-side concatenation.
+    ConcatCols {
+        x: String,
+        y: String,
+        rows: u32,
+        width: u32,
+        stride: u32,
+        at: u32,
+    },
     GroupRows {
         csr: String,
         groups: String,
@@ -933,6 +943,7 @@ impl HostOp {
                 y,
                 ..
             } => vec![csr, groups, lanes, y],
+            HostOp::ConcatCols { x, y, .. } => vec![x, y],
             HostOp::Patch {
                 x, grid, y, o_grid, ..
             } => vec![x, grid, y, o_grid],

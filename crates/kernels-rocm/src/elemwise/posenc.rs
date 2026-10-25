@@ -353,7 +353,11 @@ pub fn cells(
     y: &mut Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "conv.cells";
-    let clips = crate::voxels::lanes_of(OP, "token", tgrid)?;
+    if tgrid.dtype != Dtype::I32 || tgrid.width != 4 {
+        return Err(refuse(OP, "the token grid is a `[clips, 4]` i32 table"));
+    }
+    // A fire of no clips stages none: every row reads its position.
+    let clips = stated(OP, tgrid.rows)?;
     if positions.dtype != Dtype::I32 || y.dtype != Dtype::F32 || y.width != axis.max(2) + 1 {
         return Err(refuse(
             OP,

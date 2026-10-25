@@ -59,3 +59,32 @@ template <typename T>
 
 instantiate_select_slice(bfloat16, bfloat)
 instantiate_select_slice(float32, float)
+
+// One input of a side-by-side concatenation: `x`'s `width` columns land at
+// column `offset` of `y`'s `stride`-wide rows.
+template <typename T>
+[[kernel]] void place_cols(
+    const device T* x          [[buffer(0)]],
+    device T* y                [[buffer(1)]],
+    const constant int& stride [[buffer(2)]],
+    const constant int& offset [[buffer(3)]],
+    const constant int& width  [[buffer(4)]],
+    uint2 tid [[thread_position_in_grid]]) {
+  const int c = int(tid.x);
+  if (c >= width) {
+    return;
+  }
+  const size_t row = size_t(tid.y);
+  y[row * size_t(stride) + size_t(offset) + size_t(c)] =
+      x[row * size_t(width) + size_t(c)];
+}
+
+#define instantiate_place_cols(name, itype)                                 \
+  template [[host_name("place_cols_" #name)]]                               \
+  [[kernel]] void place_cols<itype>(                                        \
+      const device itype*, device itype*, const constant int&,              \
+      const constant int&, const constant int&, uint2);
+
+instantiate_place_cols(bfloat16, bfloat)
+
+instantiate_place_cols(float32, float)

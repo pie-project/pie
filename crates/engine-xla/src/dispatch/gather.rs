@@ -296,9 +296,16 @@ impl Run<'_> {
                 )?;
                 l.land(o_y, v)
             }),
-            Gather::ConcatCols { .. } | Gather::SplitQkvPadded { .. } => {
-                Err(kernels_xla::Error::Unsupported { op: op.name() })
-            }
+            Gather::ConcatCols { xs, y } => crate::lower::lower(self.ctx(), |l| {
+                let mut vals = Vec::with_capacity(xs.len());
+                for x in xs {
+                    vals.push(l.read(self.tensor(*x))?);
+                }
+                let o_y = self.tensor(*y);
+                let v = gather::concat_cols(l.f(), &vals, o_y.landing())?;
+                l.land(o_y, v)
+            }),
+            Gather::SplitQkvPadded { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Gather::GridTaps {
                 positions,
                 grids,

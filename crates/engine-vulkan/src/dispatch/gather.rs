@@ -236,10 +236,10 @@ impl Run<'_> {
                 self.tensor(*lanes),
                 self.tensor(*y),
             ),
-            // DSpark's taps side by side are DeepSeek-V4.1's, served on CUDA.
-            Gather::ConcatCols { .. } => Err(kernels_slang::Error::Unsupported {
-                op: "gather.concat_cols",
-            }),
+            Gather::ConcatCols { xs, y } => {
+                let xs: Vec<_> = xs.iter().map(|x| self.tensor(*x)).collect();
+                kernels_slang::gather::rows::concat_cols(self.ctx, &xs, self.tensor(*y))
+            }
             Gather::SplitQkvPadded { .. } => Err(kernels_slang::Error::Unsupported {
                 op: "gather.split_qkv_padded",
             }),

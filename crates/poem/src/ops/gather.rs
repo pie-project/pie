@@ -202,7 +202,9 @@ pub fn group_rows(csr: &Value, groups: &Value, lanes: &Value) -> Value {
             lanes: lanes.id(),
             y: y.id(),
         },
-        &[csr, groups, lanes],
+        // The indptr is a fire-wide table of its selection's groups: the
+        // count lands on `lanes`' rows, whichever selection it counts.
+        &[groups, lanes],
     );
     y
 }

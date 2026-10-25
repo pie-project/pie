@@ -189,3 +189,38 @@ pub fn unpatchify(
 ) -> Result<(), Error> {
     patch(ctx, "conv.unpatchify", x, tgrid, p, grid, y, false)
 }
+
+/// `xs` side by side into `y` (`ops::gather::concat_cols`), one host copy an
+/// input into its column range.
+pub fn concat_cols(ctx: &Ctx<'_>, xs: &[Tensor], y: Tensor) -> Result<(), Error> {
+    const OP: &str = "gather.concat_cols";
+    let mut at = 0u32;
+    let mut spans = Vec::new();
+    for x in xs {
+        if x.dtype != y.dtype || x.rows < y.rows {
+            return Err(refuse(OP, "the inputs share the output's element and rows"));
+        }
+        spans.push((*x, at));
+        at += x.width;
+    }
+    if at != y.width {
+        return Err(refuse(OP, "the inputs' widths sum to the output's"));
+    }
+    let rows = y.rows;
+    for (x, at) in spans {
+        ctx.emit(&mut |cx| {
+            let xb = cx.read(x)?;
+            let yb = cx.write(y)?;
+            cx.host(HostOp::ConcatCols {
+                x: xb.name,
+                y: yb.name,
+                rows,
+                width: x.width,
+                stride: y.width,
+                at,
+            });
+            Ok(())
+        })?;
+    }
+    Ok(())
+}

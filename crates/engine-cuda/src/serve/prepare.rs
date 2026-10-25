@@ -650,7 +650,17 @@ impl FrameShell for Shell {
             });
         }
         let voxel_tables = if composition.voxel_rows() == 0 {
-            crate::voxels::Tables::default()
+            // A plan whose token rows read their cells (`conv::cells`) reads
+            // the token grid on a fire of no clips too: one empty clip.
+            match self.voxels.as_ref() {
+                Some(store) if store.seat().token_patch.is_some() => crate::voxels::Tables {
+                    grid: vec![0; 4],
+                    token_grid: vec![0; 4],
+                    slots: vec![0],
+                    ..crate::voxels::Tables::default()
+                },
+                _ => crate::voxels::Tables::default(),
+            }
         } else {
             let Some(store) = self.voxels.as_ref() else {
                 return Err(Fault::VoxelPayload {

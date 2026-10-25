@@ -2549,6 +2549,31 @@ fn run_host(host: &HostPhase, state: &mut HashMap<String, Vec<u32>>, at: usize) 
             }
             put(state, y, out);
         }
+        HostOp::ConcatCols {
+            x,
+            y,
+            rows,
+            width,
+            stride,
+            at,
+        } => {
+            let (rows, width, stride, at) = (
+                *rows as usize,
+                *width as usize,
+                *stride as usize,
+                *at as usize,
+            );
+            let src = take(state, x)?;
+            let mut out = take(state, y)?;
+            out.resize(rows * stride, 0.0);
+            for r in 0..rows {
+                let Some(row) = src.get(r * width..(r + 1) * width) else {
+                    continue;
+                };
+                out[r * stride + at..r * stride + at + width].copy_from_slice(row);
+            }
+            put(state, y, out);
+        }
         HostOp::GroupRows {
             csr,
             groups,
