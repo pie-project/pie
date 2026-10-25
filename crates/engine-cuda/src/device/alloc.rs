@@ -51,6 +51,67 @@ pub(crate) fn out_of_room(fault: Fault, bytes: usize) -> Fault {
     }
 }
 
+/// The calling thread's own stream on its bound device
+/// (`cudaStreamPerThread`), where a copy or set that names no stream runs.
+/// Never the legacy stream: that one waits on, and is waited on by, every
+/// blocking stream of the context, a shell's compute stream that another
+/// thread is capturing into among them, and a copy there invalidates that
+/// capture (901, the copy itself refused with 906) where two loads overlap.
+/// Work here is ordered after nothing another stream holds: a read of what a
+/// stream wrote is made on that stream (`read_on`, `copy_d2h_on`), and a
+/// write to memory a stream may still read is ordered by its caller.
+#[cfg(feature = "device")]
+pub(crate) const OWN_STREAM: *mut core::ffi::c_void = core::ptr::without_provenance_mut(2);
+
+/// `len` bytes from `src` to `dst` on this thread's own stream, landed
+/// before this returns.
+///
+/// # Safety
+///
+/// Both spans are live for `len` bytes, of the kind `kind` names, on the
+/// device this thread is bound to.
+#[cfg(feature = "device")]
+unsafe fn landed_copy(
+    dst: *mut core::ffi::c_void,
+    src: *const core::ffi::c_void,
+    len: usize,
+    kind: crate::device::rt::cudaMemcpyKind,
+) -> Result<()> {
+    use crate::device::rt;
+
+    // SAFETY: the caller's span contract, forwarded; the stream is this
+    // thread's own.
+    unsafe {
+        crate::device::ctx::check(
+            "cudaMemcpyAsync",
+            rt::cudaMemcpyAsync(dst, src, len, kind, OWN_STREAM.cast()),
+        )?;
+    }
+    crate::device::ctx::sync(OWN_STREAM)
+}
+
+/// `len` bytes at `at` zeroed on this thread's own stream, landed before
+/// this returns.
+///
+/// # Safety
+///
+/// The span is live device memory of `len` bytes, on the device this
+/// thread is bound to.
+#[cfg(feature = "device")]
+unsafe fn landed_zero(at: *mut core::ffi::c_void, len: usize) -> Result<()> {
+    use crate::device::rt;
+
+    // SAFETY: the caller's span contract, forwarded; the stream is this
+    // thread's own.
+    unsafe {
+        crate::device::ctx::check(
+            "cudaMemsetAsync",
+            rt::cudaMemsetAsync(at, 0, len, OWN_STREAM.cast()),
+        )?;
+    }
+    crate::device::ctx::sync(OWN_STREAM)
+}
+
 impl Buffer {
     pub fn zeroed(bytes: usize) -> Result<Buffer> {
         if bytes == 0 {
@@ -62,13 +123,10 @@ impl Buffer {
         }
         #[cfg(feature = "device")]
         {
-            use crate::device::rt;
-
             let (base, carved) = alloc(bytes)?;
-            // SAFETY: `base` is the allocation just made, of `bytes` bytes.
-            unsafe {
-                crate::device::ctx::check("cudaMemset", rt::cudaMemset(base, 0, bytes))?;
-            }
+            // SAFETY: `base` is the allocation just made, of `bytes` bytes;
+            // the set lands before any stream is handed the buffer.
+            unsafe { landed_zero(base, bytes)? };
             Ok(Buffer {
                 ptr: base as u64,
                 bytes,
@@ -145,16 +203,14 @@ impl Buffer {
         {
             use crate::device::rt;
 
-            // SAFETY: the span was just checked against this allocation, and `bytes` is a live host slice for the duration of a synchronous copy.
+            // SAFETY: the span was just checked against this allocation, and
+            // `bytes` is a live host slice until the copy lands.
             unsafe {
-                crate::device::ctx::check(
-                    "cudaMemcpy",
-                    rt::cudaMemcpy(
-                        (self.ptr + offset) as *mut core::ffi::c_void,
-                        bytes.as_ptr().cast(),
-                        bytes.len(),
-                        rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
-                    ),
+                landed_copy(
+                    (self.ptr + offset) as *mut core::ffi::c_void,
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
                 )
             }
         }
@@ -171,15 +227,8 @@ impl Buffer {
         }
         #[cfg(feature = "device")]
         {
-            use crate::device::rt;
-
             // SAFETY: the span was just checked against this allocation.
-            unsafe {
-                crate::device::ctx::check(
-                    "cudaMemset",
-                    rt::cudaMemset((self.ptr + offset) as *mut core::ffi::c_void, 0, len),
-                )
-            }
+            unsafe { landed_zero((self.ptr + offset) as *mut core::ffi::c_void, len) }
         }
         #[cfg(not(feature = "device"))]
         {
@@ -417,7 +466,28 @@ impl Buffer {
         }
     }
 
+    /// Reads `into` from `offset` on the calling thread's own stream
+    /// ([`OWN_STREAM`]), ordered after no other: for what is already landed.
     pub fn read(&self, offset: u64, into: &mut [u8]) -> Result<()> {
+        #[cfg(feature = "device")]
+        {
+            self.read_on(OWN_STREAM, offset, into)
+        }
+        #[cfg(not(feature = "device"))]
+        {
+            let _ = (offset, into);
+            Err(Fault::Runtimeless)
+        }
+    }
+
+    /// Reads `into` from `offset` on `stream`, behind whatever it holds, and
+    /// waits for it to land.
+    pub fn read_on(
+        &self,
+        stream: *mut core::ffi::c_void,
+        offset: u64,
+        into: &mut [u8],
+    ) -> Result<()> {
         self.span(offset, into.len())?;
         if into.is_empty() {
             return Ok(());
@@ -426,21 +496,25 @@ impl Buffer {
         {
             use crate::device::rt;
 
-            // SAFETY: the span is checked and `into` is a live host slice.
+            // SAFETY: the span is checked and `into` is a live host slice
+            // until the copy lands, which the sync below waits for.
             unsafe {
                 crate::device::ctx::check(
-                    "cudaMemcpy",
-                    rt::cudaMemcpy(
+                    "cudaMemcpyAsync",
+                    rt::cudaMemcpyAsync(
                         into.as_mut_ptr().cast(),
                         (self.ptr + offset) as *const core::ffi::c_void,
                         into.len(),
                         rt::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                        stream.cast(),
                     ),
-                )
+                )?;
             }
+            crate::device::ctx::sync(stream)
         }
         #[cfg(not(feature = "device"))]
         {
+            let _ = stream;
             Err(Fault::Runtimeless)
         }
     }
@@ -1107,15 +1181,8 @@ pub fn zero_span(at: u64, len: usize) -> Result<()> {
     }
     #[cfg(feature = "device")]
     {
-        use crate::device::rt;
-
         // SAFETY: the address is a span the caller resolved against an allocation this shell owns.
-        unsafe {
-            crate::device::ctx::check(
-                "cudaMemset",
-                rt::cudaMemset(at as *mut core::ffi::c_void, 0, len),
-            )
-        }
+        unsafe { landed_zero(at as *mut core::ffi::c_void, len) }
     }
     #[cfg(not(feature = "device"))]
     {
@@ -1147,7 +1214,23 @@ pub fn zero_span_on(stream: *mut core::ffi::c_void, at: u64, len: usize) -> Resu
     }
 }
 
+/// Reads `into` from `at` on the calling thread's own stream
+/// ([`OWN_STREAM`]), ordered after no other: for what is already landed.
 pub fn copy_d2h(at: u64, into: &mut [u8]) -> Result<()> {
+    #[cfg(feature = "device")]
+    {
+        copy_d2h_on(OWN_STREAM, at, into)
+    }
+    #[cfg(not(feature = "device"))]
+    {
+        let _ = (at, into);
+        Err(Fault::Runtimeless)
+    }
+}
+
+/// Reads `into` from `at` on `stream`, behind whatever it holds, and waits
+/// for it to land.
+pub fn copy_d2h_on(stream: *mut core::ffi::c_void, at: u64, into: &mut [u8]) -> Result<()> {
     if into.is_empty() {
         return Ok(());
     }
@@ -1155,22 +1238,26 @@ pub fn copy_d2h(at: u64, into: &mut [u8]) -> Result<()> {
     {
         use crate::device::rt;
 
-        // SAFETY: the address is a checked span and `into` is a live host slice of exactly the length copied.
+        // SAFETY: the address is a checked span and `into` is a live host
+        // slice of exactly the length copied, until the copy lands, which
+        // the sync below waits for.
         unsafe {
             crate::device::ctx::check(
-                "cudaMemcpy",
-                rt::cudaMemcpy(
+                "cudaMemcpyAsync",
+                rt::cudaMemcpyAsync(
                     into.as_mut_ptr().cast(),
                     at as *const core::ffi::c_void,
                     into.len(),
                     rt::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                    stream.cast(),
                 ),
-            )
+            )?;
         }
+        crate::device::ctx::sync(stream)
     }
     #[cfg(not(feature = "device"))]
     {
-        let _ = at;
+        let _ = (stream, at);
         Err(Fault::Runtimeless)
     }
 }

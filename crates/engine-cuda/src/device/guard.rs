@@ -285,7 +285,9 @@ mod cupti {
     }
 
     /// Whether the stream-taking call `name` takes the legacy stream (null,
-    /// or `CU_STREAM_LEGACY`), its parameters as CUPTI lays them.
+    /// or `CU_STREAM_LEGACY`), its parameters as CUPTI lays them. The
+    /// per-thread stream (`CU_STREAM_PER_THREAD`, where a copy that names no
+    /// stream of its caller's runs) is a stream of its own, and not it.
     fn legacy(domain: CUpti_CallbackDomain, name: &str, params: *const c_void) -> bool {
         if params.is_null() || name.contains("_ptsz") || name.contains("_ptds") {
             return false;
@@ -312,6 +314,14 @@ mod cupti {
                     "cudaGraphLaunch" => field!(p::cudaGraphLaunch_v10000_params_st, stream),
                     "cudaEventRecord" => field!(p::cudaEventRecord_v3020_params_st, stream),
                     "cudaStreamWaitEvent" => field!(p::cudaStreamWaitEvent_v3020_params_st, stream),
+                    "cudaEventRecordWithFlags" => {
+                        field!(p::cudaEventRecordWithFlags_v11010_params_st, stream)
+                    }
+                    "cudaMemcpy2DAsync" => field!(p::cudaMemcpy2DAsync_v3020_params_st, stream),
+                    "cudaMallocAsync" => field!(p::cudaMallocAsync_v11020_params_st, hStream),
+                    "cudaFreeAsync" => field!(p::cudaFreeAsync_v11020_params_st, hStream),
+                    "cudaGraphUpload" => field!(p::cudaGraphUpload_v10000_params_st, stream),
+                    "cudaLaunchHostFunc" => field!(p::cudaLaunchHostFunc_v10000_params_st, stream),
                     _ => return false,
                 },
                 (CUpti_CallbackDomain::CUPTI_CB_DOMAIN_DRIVER_API, _) => match name {
@@ -333,6 +343,14 @@ mod cupti {
                     "cuMemsetD32Async" => field!(p::cuMemsetD32Async_params_st, hStream),
                     "cuEventRecord" => field!(p::cuEventRecord_params_st, hStream),
                     "cuStreamWaitEvent" => field!(p::cuStreamWaitEvent_params_st, hStream),
+                    "cuEventRecordWithFlags" => {
+                        field!(p::cuEventRecordWithFlags_params_st, hStream)
+                    }
+                    "cuMemcpy2DAsync_v2" => field!(p::cuMemcpy2DAsync_v2_params_st, hStream),
+                    "cuMemAllocAsync" => field!(p::cuMemAllocAsync_params_st, hStream),
+                    "cuMemFreeAsync" => field!(p::cuMemFreeAsync_params_st, hStream),
+                    "cuGraphUpload" => field!(p::cuGraphUpload_params_st, hStream),
+                    "cuLaunchHostFunc" => field!(p::cuLaunchHostFunc_params_st, hStream),
                     _ => return false,
                 },
                 _ => return false,
@@ -365,8 +383,8 @@ mod cupti {
 mod tests {
     use super::{arm, base, watched};
 
-    /// A copy without a stream and a set on the legacy stream are noted,
-    /// the first sighting with where it was called; a copy on a stream of
+    /// A read's wait for its copy and a set on the legacy stream are noted,
+    /// the first sighting with where it was called; a set on a stream of
     /// its own is not.
     #[cfg(feature = "cuda")]
     #[test]
@@ -387,12 +405,20 @@ mod tests {
         let stream = stream.cast::<core::ffi::c_void>();
         let mut host = [0u8; 256];
 
+        // A read waits for its own copy, on this thread's own stream, and
+        // never reaches the legacy stream.
         let ((), waits) = watched(|| held.read(0, &mut host).expect("the read"));
         assert!(
-            waits.iter().any(|w| w.call.starts_with("cudaMemcpy ")),
+            waits
+                .iter()
+                .any(|w| w.call.starts_with("cudaStreamSynchronize ")),
             "{waits:?}"
         );
         assert!(waits.iter().any(|w| w.from.is_some()), "{waits:?}");
+        assert!(
+            !waits.iter().any(|w| w.call.contains("legacy stream")),
+            "{waits:?}"
+        );
 
         // SAFETY: the span is the buffer's own.
         let ((), waits) = watched(|| unsafe {

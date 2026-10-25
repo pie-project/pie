@@ -1335,7 +1335,15 @@ impl Weights {
         Ok(hash)
     }
 
-    pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
+    /// Writes adapter `id`'s planes into its slots, once `stream` (the
+    /// stream the shell fires on) has drained: no fire airborne still reads
+    /// a slot this rewrites.
+    pub fn register_adapter(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        id: u32,
+        planes: &[AdapterPlane<'_>],
+    ) -> Result<()> {
         for plane in planes {
             let bank = self.banks.get(plane.bank).ok_or_else(|| Fault::Adapter {
                 bank: plane.bank.to_string(),
@@ -1366,6 +1374,7 @@ impl Weights {
                 });
             }
         }
+        crate::device::ctx::sync(stream)?;
         for plane in planes {
             let bank = self.banks[plane.bank];
             let at = bank.offset + u64::from(id) * bank.slot;

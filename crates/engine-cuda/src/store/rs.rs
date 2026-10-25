@@ -752,9 +752,11 @@ impl Predicate {
         })
     }
 
-    pub fn read_mask(&self, lanes: u32) -> Result<Vec<u8>> {
+    /// The fold predicate's mask for `lanes`, read on `stream` behind the
+    /// fire that wrote it.
+    pub fn read_mask(&self, stream: *mut core::ffi::c_void, lanes: u32) -> Result<Vec<u8>> {
         let mut out = vec![0u8; lanes as usize];
-        self.region.read(self.at_mask, &mut out)?;
+        self.region.read_on(stream, self.at_mask, &mut out)?;
         Ok(out)
     }
 }

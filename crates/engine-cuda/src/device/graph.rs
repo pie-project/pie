@@ -20,29 +20,35 @@ impl Graph {
         {
             use crate::device::rt;
 
-            // SAFETY: `stream` is the shell's, live for the whole call, and
-            // this thread is the one that bound the device.
-            unsafe {
-                crate::device::ctx::check(
-                    "cudaStreamBeginCapture",
-                    rt::cudaStreamBeginCapture(
-                        stream.cast(),
-                        rt::cudaStreamCaptureMode::cudaStreamCaptureModeThreadLocal,
-                    ),
-                )?;
-            }
+            // What the stream held before is marked for the fences kept
+            // memory waits on.
+            crate::device::held::begin_capture(stream, || {
+                // SAFETY: `stream` is the shell's, live for the whole call,
+                // and this thread is the one that bound the device.
+                unsafe {
+                    crate::device::ctx::check(
+                        "cudaStreamBeginCapture",
+                        rt::cudaStreamBeginCapture(
+                            stream.cast(),
+                            rt::cudaStreamCaptureMode::cudaStreamCaptureModeThreadLocal,
+                        ),
+                    )
+                }
+            })?;
 
             let walked = body();
 
             let mut raw: rt::cudaGraph_t = core::ptr::null_mut();
-            // SAFETY: `raw` is a live local; the capture was begun above and
-            // is ended here on every path.
-            let ended = unsafe {
-                crate::device::ctx::check(
-                    "cudaStreamEndCapture",
-                    rt::cudaStreamEndCapture(stream.cast(), &raw mut raw),
-                )
-            };
+            let ended = crate::device::held::end_capture(stream, || {
+                // SAFETY: `raw` is a live local; the capture was begun above
+                // and is ended here on every path.
+                unsafe {
+                    crate::device::ctx::check(
+                        "cudaStreamEndCapture",
+                        rt::cudaStreamEndCapture(stream.cast(), &raw mut raw),
+                    )
+                }
+            });
 
             let graph = (!raw.is_null()).then(|| Graph { raw: raw.cast() });
             walked?;
@@ -132,12 +138,20 @@ impl Graph {
     }
 
     /// Device bytes one instantiation of this graph holds, averaged over
-    /// `copies` held at once.
+    /// `copies` held at once. Each is uploaded on this thread's own stream
+    /// (the legacy one would wait on, and invalidate, a capture another
+    /// thread makes on a blocking stream), landed before it is weighed.
     pub fn instantiated_bytes(&self, copies: usize) -> Result<f64> {
+        #[cfg(feature = "device")]
+        let own = crate::device::alloc::OWN_STREAM;
+        #[cfg(not(feature = "device"))]
+        let own = core::ptr::null_mut();
         let before = crate::device::free_bytes().unwrap_or(0);
         let held = (0..copies)
-            .map(|_| self.instantiate(core::ptr::null_mut()))
+            .map(|_| self.instantiate(own))
             .collect::<Result<Vec<_>>>()?;
+        #[cfg(feature = "device")]
+        crate::device::ctx::sync(own)?;
         let after = crate::device::free_bytes().unwrap_or(0);
         drop(held);
         Ok(before.saturating_sub(after) as f64 / copies as f64)

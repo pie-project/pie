@@ -325,10 +325,7 @@ fn mapped(ordinals: &[i32], stage_bytes: u64) -> Result<Vec<kernels_cuda::collec
             let stage =
                 crate::device::elastic::shared(a, ordinals, stage_bytes + signal_bytes as u64)?;
             let signal = stage + stage_bytes;
-            check(
-                "cudaMemset",
-                rt::cudaMemset(signal as *mut c_void, 0, signal_bytes),
-            )?;
+            crate::device::zero_span(signal, signal_bytes)?;
             stages[rank] = stage;
             signals[rank] = signal;
             tables.push(signal + kernels_cuda::collective::SIGNAL_BYTES);
@@ -344,19 +341,27 @@ fn mapped(ordinals: &[i32], stage_bytes: u64) -> Result<Vec<kernels_cuda::collec
         // and the stage is at least a word.
         unsafe {
             check("cudaSetDevice", rt::cudaSetDevice(a))?;
+            let own = crate::device::alloc::OWN_STREAM;
             check(
-                "cudaMemcpy",
-                rt::cudaMemcpy(
+                "cudaMemcpyAsync",
+                rt::cudaMemcpyAsync(
                     tables[rank] as *mut c_void,
                     bytes.as_ptr().cast(),
                     table,
                     rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                    own.cast(),
                 ),
             )?;
             check(
-                "cudaMemset",
-                rt::cudaMemset(stages[rank] as *mut c_void, 0x40 + rank as i32, 4),
+                "cudaMemsetAsync",
+                rt::cudaMemsetAsync(
+                    stages[rank] as *mut c_void,
+                    0x40 + rank as i32,
+                    4,
+                    own.cast(),
+                ),
             )?;
+            crate::device::ctx::sync(own)?;
         }
         peers.push(kernels_cuda::collective::Peers {
             rank: rank as u32,
@@ -381,18 +386,17 @@ fn mapped(ordinals: &[i32], stage_bytes: u64) -> Result<Vec<kernels_cuda::collec
     for _ in 0..2 {
         for ((&a, peers), status) in ordinals.iter().zip(&peers).zip(&statuses) {
             crate::device::ctx::bind_thread(a)?;
-            // SAFETY: the device's legacy stream; the stages and tables are live.
-            let ctx = unsafe { kernels_cuda::Ctx::on(core::ptr::null_mut()) };
+            // SAFETY: this thread's own stream on the device; the stages and
+            // tables are live.
+            let ctx = unsafe { kernels_cuda::Ctx::on(crate::device::alloc::OWN_STREAM) };
             peers
                 .answer(&ctx, status.ptr())
                 .map_err(crate::error::kernel)?;
         }
         for &a in ordinals {
             crate::device::ctx::bind_thread(a)?;
-            // SAFETY: no arguments; waits for the rounds' kernels.
-            check("cudaDeviceSynchronize", unsafe {
-                rt::cudaDeviceSynchronize()
-            })?;
+            // The rounds' kernels, on this thread's own stream of the device.
+            crate::device::ctx::sync(crate::device::alloc::OWN_STREAM)?;
         }
     }
     for (&a, status) in ordinals.iter().zip(&statuses) {

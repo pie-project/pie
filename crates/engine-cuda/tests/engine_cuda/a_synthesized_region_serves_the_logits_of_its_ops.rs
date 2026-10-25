@@ -240,19 +240,13 @@ fn a_synthesized_region_serves_the_logits_of_its_ops() {
 /// server holding two models serves them: each answers, bit for bit, what
 /// it answers served alone. Their generated kernels are keyed apart (body,
 /// width, the planes they read) and each load arms and captures its own
-/// graphs while the other's fire.
-///
-/// Ignored beside the other device tests: a load's synchronous copies run
-/// on the legacy stream (`device::alloc`'s `Buffer::write`, `read`,
-/// `copy_d2h`), which waits on every blocking stream of the context, one
-/// another thread is capturing into among them, and so invalidates that
-/// capture (`cudaErrorStreamCaptureInvalidated`, 901; the copy itself
-/// `cudaErrorStreamCaptureImplicit`, 906). Two loads that overlap, one
-/// arming while the other uploads, meet it, and this test makes a load of
-/// its own overlap another test's arming. Run it alone:
-/// `cargo test --release ... -- --ignored two_models_served_at_once`.
+/// graphs while the other's fire. A load's synchronous copies run on its
+/// thread's own stream, not the legacy one, which waits on every blocking
+/// stream of the context, one the other thread is capturing into among
+/// them, and so would invalidate that capture
+/// (`cudaErrorStreamCaptureInvalidated`, 901; the copy itself
+/// `cudaErrorStreamCaptureImplicit`, 906).
 #[test]
-#[ignore = "its loads invalidate other tests' captures: -- --ignored two_models_served_at_once"]
 fn two_models_served_at_once_answer_what_each_answers_alone() {
     let _one = serialized();
     if !engine_cuda::device::present() {

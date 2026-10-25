@@ -409,19 +409,13 @@ fn carve(device: i32, readers: &[i32], parts: &[u64; PARTS]) -> Result<[u64; PAR
     for (i, c) in cut.iter_mut().enumerate() {
         *c = base + at(&parts[..i]);
     }
-    // SAFETY: the signal block is the first `EP_SIGNAL_BYTES` of the mapping
-    // just made on `device`.
+    // SAFETY: binds this thread to `device`.
     unsafe {
         check("cudaSetDevice", rt::cudaSetDevice(device))?;
-        check(
-            "cudaMemset",
-            rt::cudaMemset(
-                cut[0] as *mut core::ffi::c_void,
-                0,
-                EP_SIGNAL_BYTES as usize,
-            ),
-        )?;
     }
+    // The signal block is the first `EP_SIGNAL_BYTES` of the mapping just
+    // made on `device`.
+    crate::device::zero_span(cut[0], EP_SIGNAL_BYTES as usize)?;
     Ok(cut)
 }
 

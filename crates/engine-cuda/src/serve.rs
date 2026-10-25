@@ -655,7 +655,7 @@ impl Shell {
     }
 
     pub fn state_bytes(&mut self, slot: u32) -> Result<Vec<u8>> {
-        self.pools.state_bytes(slot)
+        self.pools.state_bytes(self.device.stream(), slot)
     }
 
     /// Whether this load lands recurrent-state snapshots inside a fire.
@@ -665,11 +665,12 @@ impl Shell {
     }
 
     pub fn fold_predicate(&self, lanes: u32) -> Result<Vec<u8>> {
-        self.predicate.read_mask(lanes)
+        self.predicate.read_mask(self.device.stream(), lanes)
     }
 
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
-        self.weights.register_adapter(id, planes)
+        self.weights
+            .register_adapter(self.device.stream(), id, planes)
     }
 
     pub fn mount_adapters(&mut self, root: Option<std::path::PathBuf>) {
@@ -682,8 +683,9 @@ impl Shell {
     ) -> Result<crate::blob::Binding> {
         let seats = self.weights.seats();
         let weights = &mut self.weights;
+        let stream = self.device.stream();
         self.adapters.bind(source, &seats, |slot, planes| {
-            weights.register_adapter(slot, planes)
+            weights.register_adapter(stream, slot, planes)
         })
     }
 
@@ -723,7 +725,9 @@ impl Shell {
     }
 
     pub fn open(&mut self, slot: u32) -> Result<()> {
-        self.pools.clear(slot)?;
+        // On the compute stream: behind any fire still airborne that held
+        // the slot, ahead of every fire that reads it fresh.
+        self.pools.clear_on(self.device.stream(), slot)?;
         let seats = self.held.len() as u64;
         let held = self.held.get_mut(slot as usize).ok_or(Fault::Ceiling {
             what: "slots",

@@ -12,20 +12,34 @@ pub(crate) const DISABLE_TIMING: u32 = 2;
 
 const ORDINALS: usize = 64;
 
+/// Each ordinal's latest adopted compute stream: whether it has one live.
 static STREAMS: [AtomicPtr<core::ffi::c_void>; ORDINALS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; ORDINALS];
 
-/// The live contexts' compute streams, by ordinal, in adoption order: a
-/// stream is recorded on only while this is read-held, and retired (and
-/// destroyed) only while it is write-held, so no event is recorded on a
-/// destroyed stream, whichever context of the process goes first.
-static LIVE: std::sync::RwLock<Vec<(i32, usize)>> = std::sync::RwLock::new(Vec::new());
+/// A live context's compute stream, and while a capture is open on it, the
+/// mark of what it held before the capture began.
+struct Live {
+    ordinal: i32,
+    stream: usize,
+    captured: Option<std::sync::Arc<Mark>>,
+}
+
+/// The live contexts' compute streams, in adoption order: a stream is
+/// recorded on only while this is read-held, and retired (and destroyed),
+/// or begins or ends a capture, only while it is write-held, so no event is
+/// recorded on a destroyed stream, or on one being captured, whichever
+/// context of the process goes first.
+static LIVE: std::sync::RwLock<Vec<Live>> = std::sync::RwLock::new(Vec::new());
 
 /// A context's compute stream, every fire of `ordinal` it runs launching on
-/// it; the latest live one is where kept memory is zeroed for reuse.
+/// it.
 pub fn adopt_stream(ordinal: i32, stream: *mut core::ffi::c_void) {
     let mut live = LIVE.write().expect("live lock poisoned");
-    live.push((ordinal, stream as usize));
+    live.push(Live {
+        ordinal,
+        stream: stream as usize,
+        captured: None,
+    });
     if let Some(slot) = usize::try_from(ordinal).ok().and_then(|at| STREAMS.get(at)) {
         slot.store(stream, Ordering::Release);
     }
@@ -38,21 +52,62 @@ pub fn retire_stream(ordinal: i32, stream: *mut core::ffi::c_void, destroy: impl
     let mut live = LIVE.write().expect("live lock poisoned");
     if let Some(at) = live
         .iter()
-        .position(|&entry| entry == (ordinal, stream as usize))
+        .position(|entry| (entry.ordinal, entry.stream) == (ordinal, stream as usize))
     {
         live.remove(at);
     }
     let next = live
         .iter()
         .rev()
-        .find(|entry| entry.0 == ordinal)
+        .find(|entry| entry.ordinal == ordinal)
         .map_or(core::ptr::null_mut(), |entry| {
-            entry.1 as *mut core::ffi::c_void
+            entry.stream as *mut core::ffi::c_void
         });
     if let Some(slot) = usize::try_from(ordinal).ok().and_then(|at| STREAMS.get(at)) {
         slot.store(next, Ordering::Release);
     }
     destroy();
+}
+
+/// Opens a capture on `stream` with `begin`, the work it holds before the
+/// capture marked first. Work captured does not run, so what a fence must
+/// wait for on a capturing stream is what came before the capture; and an
+/// event another thread recorded on it would join the capture, and its
+/// query (whether the fence landed) invalidate it, so a fence takes this
+/// mark instead (`cudaErrorStreamCaptureInvalidated`, 901, on a model's
+/// arming while another model on the device freed or allocated).
+pub(crate) fn begin_capture(
+    stream: *mut core::ffi::c_void,
+    begin: impl FnOnce() -> crate::error::Result<()>,
+) -> crate::error::Result<()> {
+    let mut live = LIVE.write().expect("live lock poisoned");
+    let Some(entry) = live
+        .iter_mut()
+        .find(|entry| entry.stream == stream as usize)
+    else {
+        return begin();
+    };
+    let mark = Mark::record(stream).ok_or(crate::error::Fault::Device {
+        call: "cudaEventRecord",
+        code: 0,
+    })?;
+    begin()?;
+    entry.captured = Some(std::sync::Arc::new(mark));
+    Ok(())
+}
+
+/// Ends the capture [`begin_capture`] opened on `stream` with `end`; fences
+/// record on the stream again from here.
+pub(crate) fn end_capture<R>(stream: *mut core::ffi::c_void, end: impl FnOnce() -> R) -> R {
+    let mut live = LIVE.write().expect("live lock poisoned");
+    let ended = end();
+    if let Some(entry) = live
+        .iter_mut()
+        .find(|entry| entry.stream == stream as usize)
+    {
+        entry.captured = None;
+    }
+    ended
 }
 
 /// The device `ptr`, an allocation of device memory, lives on.
@@ -73,36 +128,57 @@ pub(crate) fn current_device() -> Option<i32> {
     (code == rt::cudaError::cudaSuccess).then_some(device)
 }
 
-fn stream_of(device: i32) -> Option<*mut core::ffi::c_void> {
-    let stream = STREAMS
-        .get(usize::try_from(device).ok()?)?
-        .load(Ordering::Acquire);
-    (!stream.is_null()).then_some(stream)
-}
-
 /// Whether `device` has an adopted compute stream.
 pub(crate) fn adopted(device: i32) -> bool {
-    stream_of(device).is_some()
+    usize::try_from(device)
+        .ok()
+        .and_then(|at| STREAMS.get(at))
+        .is_some_and(|slot| !slot.load(Ordering::Acquire).is_null())
 }
 
-/// `use_stream` on `device`'s latest adopted compute stream, kept live for
-/// the call; none if it has none.
-pub(crate) fn with_stream<R>(
-    device: i32,
-    use_stream: impl FnOnce(*mut core::ffi::c_void) -> R,
-) -> Option<R> {
-    let _live = LIVE.read().expect("live lock poisoned");
-    stream_of(device).map(use_stream)
+/// An event recorded on a stream, destroyed once its last holder lets go.
+struct Mark(rt::cudaEvent_t);
+
+// SAFETY: the event is a process-wide device object, destroyed once.
+unsafe impl Send for Mark {}
+// SAFETY: as above; a query only reads it.
+unsafe impl Sync for Mark {}
+
+impl Mark {
+    /// A fresh event recorded on `stream`, which no capture holds.
+    fn record(stream: *mut core::ffi::c_void) -> Option<Mark> {
+        let mut event: rt::cudaEvent_t = core::ptr::null_mut();
+        // SAFETY: creates a fresh event, owned by the mark from here.
+        if unsafe { rt::cudaEventCreateWithFlags(&raw mut event, DISABLE_TIMING) }
+            != rt::cudaError::cudaSuccess
+        {
+            return None;
+        }
+        let mark = Mark(event);
+        // SAFETY: the event is the mark's own; the caller keeps `stream` live.
+        (unsafe { rt::cudaEventRecord(event, stream.cast()) } == rt::cudaError::cudaSuccess)
+            .then_some(mark)
+    }
+
+    fn landed(&self) -> bool {
+        // SAFETY: the event is this mark's own.
+        unsafe { rt::cudaEventQuery(self.0) == rt::cudaError::cudaSuccess }
+    }
 }
 
-/// An event on every live compute stream of a device, recorded at once:
+impl Drop for Mark {
+    fn drop(&mut self) {
+        // SAFETY: the event is this mark's own, destroyed once.
+        unsafe { rt::cudaEventDestroy(self.0) };
+    }
+}
+
+/// A mark on every live compute stream of a device, taken at once:
 /// whatever any of them had enqueued before is done once all have landed.
 /// One context's stream alone would not do while another context on the
-/// device may still read what is kept.
-pub(crate) struct Fence(Vec<rt::cudaEvent_t>);
-
-// SAFETY: the events are process-wide device objects, each destroyed once.
-unsafe impl Send for Fence {}
+/// device may still read what is kept. A stream being captured gives the
+/// mark of what it held before its capture began ([`begin_capture`]).
+pub(crate) struct Fence(Vec<std::sync::Arc<Mark>>);
 
 impl Fence {
     /// `None` where a stream would not record; an empty fence where the
@@ -110,40 +186,18 @@ impl Fence {
     pub(crate) fn record(device: i32) -> Option<Fence> {
         let live = LIVE.read().expect("live lock poisoned");
         let mut fence = Fence(Vec::new());
-        for &(_, stream) in live.iter().filter(|(ordinal, _)| *ordinal == device) {
-            let mut event: rt::cudaEvent_t = core::ptr::null_mut();
-            // SAFETY: creates a fresh event and records it on a stream the
-            // read-held list keeps live.
-            let recorded = unsafe {
-                rt::cudaEventCreateWithFlags(&raw mut event, DISABLE_TIMING)
-                    == rt::cudaError::cudaSuccess
-                    && {
-                        fence.0.push(event);
-                        rt::cudaEventRecord(event, stream as *mut core::ffi::c_void as _)
-                            == rt::cudaError::cudaSuccess
-                    }
+        for entry in live.iter().filter(|entry| entry.ordinal == device) {
+            let mark = match &entry.captured {
+                Some(before) => std::sync::Arc::clone(before),
+                None => std::sync::Arc::new(Mark::record(entry.stream as *mut core::ffi::c_void)?),
             };
-            if !recorded {
-                return None;
-            }
+            fence.0.push(mark);
         }
         Some(fence)
     }
 
     pub(crate) fn landed(&self) -> bool {
-        self.0.iter().all(|&event| {
-            // SAFETY: each event is this fence's own.
-            unsafe { rt::cudaEventQuery(event) == rt::cudaError::cudaSuccess }
-        })
-    }
-}
-
-impl Drop for Fence {
-    fn drop(&mut self) {
-        for &event in &self.0 {
-            // SAFETY: each event is this fence's own, destroyed once.
-            unsafe { rt::cudaEventDestroy(event) };
-        }
+        self.0.iter().all(|mark| mark.landed())
     }
 }
 
@@ -162,7 +216,7 @@ pub mod pool {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use super::{Fence, adopted, current_device, with_stream};
+    use super::{Fence, adopted, current_device};
     use crate::device::rt;
     use crate::device::{Buffer, Pinned};
 
@@ -220,32 +274,36 @@ pub mod pool {
     }
 
     /// A kept endpoint of `key`'s shape whose last reader has landed, its
-    /// memory zeroed (the device cells on the compute stream, ahead of any
-    /// fire that reads them).
-    pub fn take(key: PoolKey) -> Option<Held> {
+    /// memory zeroed: the device cells on `stream`, the taker's own, ahead
+    /// of any fire of it that reads them. With no stream, only an endpoint
+    /// with no device cells is handed out.
+    pub fn take(key: PoolKey, stream: Option<*mut core::ffi::c_void>) -> Option<Held> {
         if !adopted(key.device) {
             return None;
         }
         let mut pool = POOL.lock().expect("pool lock poisoned");
         let list = pool.as_mut()?.get_mut(&key)?;
-        let at = list.iter().position(|entry| entry.fence.landed())?;
+        let at = list.iter().position(|entry| {
+            entry.fence.landed() && (entry.held.2.is_none() || stream.is_some())
+        })?;
         let entry = list.swap_remove(at);
         drop(pool);
         let (words, mirror, cells) = entry.held;
         words.zero();
         mirror.zero();
-        if let Some(cells) = &cells {
+        if let (Some(cells), Some(stream)) = (&cells, stream) {
             // SAFETY: the buffer is the entry's, no airborne fire reads it,
-            // and the memset is ordered before every later fire.
-            let code = with_stream(key.device, |stream| unsafe {
+            // and the memset is ordered before every later fire of the
+            // taker's stream.
+            let code = unsafe {
                 rt::cudaMemsetAsync(
                     cells.ptr() as *mut core::ffi::c_void,
                     0,
                     cells.bytes(),
                     stream.cast(),
                 )
-            });
-            if code != Some(rt::cudaError::cudaSuccess) {
+            };
+            if code != rt::cudaError::cudaSuccess {
                 return None;
             }
         }

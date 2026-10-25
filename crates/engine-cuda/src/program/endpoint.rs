@@ -60,7 +60,7 @@ impl Endpoint {
         }
         let cells = (wire_bytes as usize).saturating_mul(cap1 as usize);
         let pooled = pool::key(matches!(role, HostRole::None), cells.max(1));
-        let held = pooled.and_then(pool::take);
+        let held = pooled.and_then(|key| pool::take(key, Some(stream)));
         let (words, mirror, device_cells) = match held {
             Some(held) => held,
             None => (
