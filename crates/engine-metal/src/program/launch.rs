@@ -204,7 +204,11 @@ pub struct Cursor {
     pub tail: u64,
 }
 
-const INTRINSIC_SLOTS: usize = IntrinsicId::SLOTS as usize;
+/// By slot ([`eta_ir::op::intrinsic_slot`]): each intrinsic of each lane.
+const INTRINSIC_SLOTS: usize = eta_ir::op::INTRINSIC_PITCH as usize;
+
+/// The bytes of one instance's address table: a `ulong` a slot.
+const TABLE_BYTES: u64 = INTRINSIC_SLOTS as u64 * 8;
 
 #[derive(Debug, Clone)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
@@ -492,6 +496,10 @@ pub struct Prepared {
     scratch: DeferredZeroBuffer,
     intrinsics: [Option<Slot>; INTRINSIC_SLOTS],
     declared: [Option<Declared>; INTRINSIC_SLOTS],
+    /// The address each per-lane slot reads at, as the kernels read it
+    /// ([`eta_compiler::codegen::metal::addressed_slot`]); 0 where unbound.
+    addresses: Buffer,
+    address_words: Vec<u64>,
     channel_count: u32,
     value_count: u32,
     scratch_stride: u32,
@@ -529,12 +537,6 @@ struct StreamedKnobs {
     repeat_kind: Option<StepKind>,
     limit: usize,
 }
-
-const READOUT_INTRINSICS: [IntrinsicId; 3] = [
-    IntrinsicId::Logits,
-    IntrinsicId::Velocity,
-    IntrinsicId::Hidden,
-];
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 fn streamed_knobs() -> StreamedKnobs {
@@ -778,7 +780,8 @@ impl Prepared {
                 })?;
             }
             if let Some(intrinsic) = op.intrinsic
-                && let Some(seat) = declared.get_mut(intrinsic as usize)
+                && let Some(seat) =
+                    declared.get_mut(eta_ir::op::intrinsic_slot(intrinsic, op.imm) as usize)
                 && let Some(out) = descriptors.get(record.o0 as usize)
                 && out.rank >= 2
             {
@@ -836,15 +839,9 @@ impl Prepared {
                     .is_some_and(|id| id as usize == wanted as usize)
             })
         };
-        let trunk_rows = READOUT_INTRINSICS
-            .iter()
-            .map(|id| {
-                declared[*id as usize]
-                    .map_or(0, |it| it.rows)
-                    .max(u32::from(reads(*id)))
-            })
-            .max()
-            .unwrap_or(0)
+        let trunk_rows = declared[IntrinsicId::Logits as usize]
+            .map_or(0, |it| it.rows)
+            .max(u32::from(reads(IntrinsicId::Logits)))
             .max(plan.drafts_len);
         let draft_rows = declared[IntrinsicId::MtpLogits as usize]
             .map_or(0, |it| it.rows)
@@ -884,6 +881,8 @@ impl Prepared {
             scratch,
             intrinsics: [const { None }; INTRINSIC_SLOTS],
             declared,
+            addresses: Buffer::zeroed(device, TABLE_BYTES)?,
+            address_words: vec![0; INTRINSIC_SLOTS],
             channel_count,
             value_count,
             scratch_stride,
@@ -977,9 +976,12 @@ impl Prepared {
         Ok(())
     }
 
+    /// Points `intrinsic` of the pass's lane `lane` at `offset` of `base`, rows
+    /// `width` wide.
     pub fn bind_intrinsic(
         &mut self,
         intrinsic: IntrinsicId,
+        lane: u32,
         base: &Buffer,
         offset: u64,
         width: u32,
@@ -994,7 +996,8 @@ impl Prepared {
                 ),
             ));
         }
-        let declared = *self.declared.get(intrinsic as usize).ok_or_else(|| {
+        let slot = eta_ir::op::intrinsic_slot(intrinsic, lane) as usize;
+        let declared = *self.declared.get(slot).ok_or_else(|| {
             Fault::program(
                 "program::launch",
                 format!("{intrinsic:?} is past the pitch the slot table is indexed with"),
@@ -1070,7 +1073,13 @@ impl Prepared {
         } else {
             self.strided &= !bit;
         }
-        self.intrinsics[intrinsic as usize] = Some(Slot {
+        if eta_compiler::codegen::metal::addressed(intrinsic as u16) {
+            let address = address_of(base, offset)?;
+            self.address_words[slot] = address;
+            self.addresses
+                .write(slot as u64 * 8, &address.to_le_bytes())?;
+        }
+        self.intrinsics[slot] = Some(Slot {
             base: base.clone(),
             offset,
             width,
@@ -1082,6 +1091,7 @@ impl Prepared {
     fn strideable(&self, intrinsic: IntrinsicId) -> bool {
         self.grouped.is_some()
             && eta_compiler::codegen::metal::m3_intrinsic_bindable(intrinsic as u16)
+            && !eta_compiler::codegen::metal::addressed(intrinsic as u16)
     }
 
     #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
@@ -1129,10 +1139,7 @@ impl Prepared {
             .as_mut()
             .expect("the seat was there one statement ago")
             .set_drafts(drafts_base, drafts_depth)?;
-        let Some(trunk) = READOUT_INTRINSICS
-            .iter()
-            .find_map(|id| self.intrinsics[*id as usize].as_ref())
-        else {
+        let Some(trunk) = self.intrinsics[IntrinsicId::Logits as usize].as_ref() else {
             return Ok(());
         };
         let width = trunk.width;
@@ -1206,6 +1213,11 @@ impl Prepared {
                 encoder.setBuffer_offset_atIndex(Some(grouped.lane_indices.raw()), 0, 8);
                 encoder.setBuffer_offset_atIndex(Some(grouped.row_meta.raw()), 0, 9);
                 encoder.setBuffer_offset_atIndex(Some(grouped.row_indices.raw()), 0, 10);
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.addresses.raw()),
+                    0,
+                    eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
+                );
             }
             let resident = |buffer: &Buffer, usage: MTLResourceUsage| {
                 let resource: &ProtocolObject<dyn MTLResource> =
@@ -1272,10 +1284,7 @@ impl Prepared {
                     scratch_at + self.temporary_offset as usize,
                     5,
                 );
-                let readout = READOUT_INTRINSICS
-                    .iter()
-                    .find_map(|id| self.intrinsics[*id as usize].as_ref());
-                match readout {
+                match self.intrinsics[IntrinsicId::Logits as usize].as_ref() {
                     Some(bound) => encoder.setBuffer_offset_atIndex(
                         Some(bound.base.raw()),
                         usize::try_from(bound.offset).unwrap_or(0),
@@ -1287,9 +1296,17 @@ impl Prepared {
                         eta_compiler::codegen::metal::M2_LOGITS_BUFFER,
                     ),
                 }
+                // The pass's intrinsics past the logits each at an argument
+                // of their own; the per-lane ones read through the table.
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.addresses.raw()),
+                    0,
+                    eta_compiler::codegen::metal::M2_INTRINSIC_TABLE_BUFFER,
+                );
                 for (slot, held) in self.intrinsics.iter().enumerate() {
                     let Some(at) = u16::try_from(slot)
                         .ok()
+                        .filter(|&intr| !eta_compiler::codegen::metal::addressed(intr))
                         .and_then(eta_compiler::codegen::metal::m2_intrinsic_buffer)
                         .filter(|at| *at != eta_compiler::codegen::metal::M2_LOGITS_BUFFER)
                     else {
@@ -1377,6 +1394,11 @@ impl Prepared {
                 encoder.setBuffer_offset_atIndex(Some(grouped.lane_indices.raw()), 0, 8);
                 encoder.setBuffer_offset_atIndex(Some(grouped.row_meta.raw()), 0, 9);
                 encoder.setBuffer_offset_atIndex(Some(grouped.row_indices.raw()), 0, 10);
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.addresses.raw()),
+                    0,
+                    eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
+                );
             }
 
             let resident = |buffer: &Buffer, usage: MTLResourceUsage| {
@@ -1496,6 +1518,8 @@ pub struct Batch {
     row_meta: Buffer,
     row_indices: Buffer,
     scratch: Buffer,
+    /// Each member's address table, dispatch lane by dispatch lane.
+    addresses: Buffer,
     layouts: Vec<Buffer>,
     layout_words: Vec<GroupLayout>,
     rows_per_lane: u32,
@@ -1588,6 +1612,7 @@ impl Batch {
             row_meta,
             row_indices,
             scratch,
+            addresses: Buffer::zeroed(device, u64::from(lanes) * TABLE_BYTES)?,
             layouts,
             layout_words: grouped.layout_words.clone(),
             rows_per_lane,
@@ -1689,6 +1714,14 @@ impl Batch {
                 })?;
                 self.table.write(at, &record_bytes(&slot))?;
             }
+            let words: Vec<u8> = member
+                .address_words
+                .iter()
+                .copied()
+                .flat_map(u64::to_le_bytes)
+                .collect();
+            self.addresses
+                .write(u64::from(lane) * TABLE_BYTES, &words)?;
             let row_base = lane * self.rows_per_lane;
             let meta = RowMeta {
                 offset: row_base,
@@ -1773,6 +1806,11 @@ impl Batch {
                 encoder.setBuffer_offset_atIndex(Some(self.lane_indices.raw()), 0, 8);
                 encoder.setBuffer_offset_atIndex(Some(self.row_meta.raw()), 0, 9);
                 encoder.setBuffer_offset_atIndex(Some(self.row_indices.raw()), 0, 10);
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.addresses.raw()),
+                    0,
+                    eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
+                );
             }
             let resident = |buffer: &Buffer, usage: MTLResourceUsage| {
                 let resource: &ProtocolObject<dyn MTLResource> =
@@ -1902,6 +1940,11 @@ impl Batch {
                 encoder.setBuffer_offset_atIndex(Some(self.lane_indices.raw()), 0, 8);
                 encoder.setBuffer_offset_atIndex(Some(self.row_meta.raw()), 0, 9);
                 encoder.setBuffer_offset_atIndex(Some(self.row_indices.raw()), 0, 10);
+                encoder.setBuffer_offset_atIndex(
+                    Some(self.addresses.raw()),
+                    0,
+                    eta_compiler::codegen::metal::M3_INTRINSIC_TABLE_BUFFER,
+                );
             }
             let resident = |buffer: &Buffer, usage: MTLResourceUsage| {
                 let resource: &ProtocolObject<dyn MTLResource> =

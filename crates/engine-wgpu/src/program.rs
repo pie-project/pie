@@ -86,6 +86,9 @@ pub(crate) struct Pass<'a> {
     pub mtp_logits: Option<&'a [f32]>,
     pub mtp_width: u32,
     pub readout: Option<crate::guest::run::Readout<'a>>,
+    /// Each lane of the pass's own readout rows (`velocity(k)`,
+    /// `hidden(k)`), lane `k` at `k`.
+    pub lanes: Vec<Option<crate::guest::run::Readout<'a>>>,
     /// Each lane of the pass's pixels, lane `k` at `k`.
     pub pixels: Vec<Option<crate::guest::run::Readout<'a>>>,
 }
@@ -128,7 +131,7 @@ impl Half {
         };
         let mut runner =
             crate::guest::run::OnDevice::new(device, &mut self.session, widen, pass.readout)
-                .with_pixels(pass.pixels);
+                .with_lanes(pass.lanes, pass.pixels);
         let outcome = eta_exec::step_with(&mut self.inst, &self.plan, &inputs, &mut runner);
         let ran = runner.ran().len();
         if self.inst.poisoned {
@@ -248,8 +251,7 @@ impl Guests {
         rows: &[Vec<f32>],
         drafts: &[Vec<f32>],
         seat: &crate::device::Buffer,
-        layout: &[(u32, u32)],
-        out_width: u32,
+        layout: &[crate::serve::ReadSpan],
         mtp_width: u32,
         pixels: Option<&(crate::device::Buffer, Vec<(u64, u32)>)>,
     ) -> Vec<Job> {
@@ -300,21 +302,16 @@ impl Guests {
                                 .collect::<Vec<f32>>()
                         })
                         .filter(|values| !values.is_empty());
+                    let entries: Vec<crate::serve::ReadSpan> = span
+                        .clone()
+                        .filter_map(|lane| layout.get(lane).copied())
+                        .collect();
                     let on_device = {
-                        let entries: Vec<(u32, u32)> = span
-                            .clone()
-                            .filter_map(|lane| layout.get(lane).copied())
-                            .collect();
-                        let contiguous = entries
-                            .windows(2)
-                            .all(|pair| pair[0].0 + pair[0].1 == pair[1].0);
-                        let count: u32 = entries.iter().map(|&(_, count)| count).sum();
-                        (contiguous && count > 0).then(|| {
-                            (
-                                u64::from(entries[0].0) * u64::from(out_width) * 2,
-                                count * out_width,
-                            )
-                        })
+                        let contiguous = entries.windows(2).all(|pair| {
+                            pair[0].at + pair[0].bytes() == pair[1].at && pair[0].f32 == pair[1].f32
+                        });
+                        let count: u32 = entries.iter().map(crate::serve::ReadSpan::values).sum();
+                        (contiguous && count > 0).then(|| (entries[0].at, count, entries[0].f32))
                     };
                     let seat = seat.clone();
                     let pixels = pixels.cloned();
@@ -329,11 +326,13 @@ impl Guests {
                             }
                             _ => (None, 0, 0),
                         };
-                        let readout = on_device.map(|(at, width)| crate::guest::run::Readout {
-                            seat: &seat,
-                            at,
-                            width,
-                        });
+                        let readout =
+                            on_device.map(|(at, width, f32)| crate::guest::run::Readout {
+                                seat: &seat,
+                                at,
+                                width,
+                                f32,
+                            });
                         half.lock().expect("half lock poisoned").fire(
                             &device,
                             &widen,
@@ -345,6 +344,17 @@ impl Guests {
                                 mtp_logits: mtp.as_deref(),
                                 mtp_width,
                                 readout,
+                                lanes: entries
+                                    .iter()
+                                    .map(|entry| {
+                                        (entry.rows > 0).then_some(crate::guest::run::Readout {
+                                            seat: &seat,
+                                            at: entry.at,
+                                            width: entry.values(),
+                                            f32: entry.f32,
+                                        })
+                                    })
+                                    .collect(),
                                 pixels: span
                                     .clone()
                                     .map(|lane| {
@@ -354,6 +364,7 @@ impl Guests {
                                             seat: plane,
                                             at,
                                             width,
+                                            f32: false,
                                         })
                                     })
                                     .collect(),
@@ -935,6 +946,7 @@ impl Plane {
                 mtp_logits: None,
                 mtp_width: 0,
                 readout: None,
+                lanes: Vec::new(),
                 pixels: Vec::new(),
             },
         )

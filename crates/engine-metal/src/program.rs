@@ -303,10 +303,13 @@ impl Plane {
         self.instances.get_mut(&id).map(|bound| &mut bound.session)
     }
 
+    /// Points `intrinsic` of the pass's lane `lane` at `offset` of `base`.
+    #[allow(clippy::too_many_arguments)]
     pub fn bind_intrinsic(
         &mut self,
         id: InstanceId,
         intrinsic: eta_ir::op::IntrinsicId,
+        lane: u32,
         base: &crate::device::Buffer,
         offset: u64,
         width: u32,
@@ -316,7 +319,7 @@ impl Plane {
             .get_mut(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
             .session
-            .bind_intrinsic(intrinsic, base, offset, width, dtype)
+            .bind_intrinsic(intrinsic, lane, base, offset, width, dtype)
     }
 
     pub fn ready(&self, id: InstanceId) -> Result<Option<session::Blocked>> {
@@ -507,7 +510,13 @@ impl Plane {
             .is_some_and(|bound| bound.session.is_airborne())
     }
 
-    pub fn needs_pixels(&self, id: InstanceId) -> Result<bool> {
+    /// Whether instance `id`'s program reads `intrinsic` of its pass's lane `lane`.
+    pub fn reads_lane(
+        &self,
+        id: InstanceId,
+        intrinsic: eta_ir::op::IntrinsicId,
+        lane: u32,
+    ) -> Result<bool> {
         let bound = self
             .instances
             .get(&id)
@@ -521,7 +530,12 @@ impl Plane {
                 ),
             )
         })?;
-        Ok(program.plan.needs_pixels)
+        Ok(program
+            .plan
+            .package
+            .values
+            .iter()
+            .any(|value| value.intrinsic == Some(intrinsic) && value.lane == lane))
     }
 
     pub fn needs_logits(&self, id: InstanceId) -> Result<bool> {
