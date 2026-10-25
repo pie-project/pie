@@ -100,6 +100,7 @@ fn check(gpu: &Gpu, case: &Case, path: ConvPath) {
         cache.then(|| gpu.tensor(&cache_vals, cache_rows as u32, c_in as u32, Dtype::Bf16)),
         &mut o,
         o_grid,
+        [0, 0],
     )
     .unwrap_or_else(|e| panic!("{name} on {path:?} fires: {e}"));
     let got = gpu.read(&o);
@@ -272,6 +273,7 @@ fn the_conv3d_answers_the_cpu_reference_every_case() {
         None,
         &mut o,
         o_grid,
+        [0, 0],
     );
     assert!(refused.is_err(), "three channels do not vectorise");
 }
@@ -292,7 +294,7 @@ fn the_voxel_reshapes_land_the_reference_ordering_every_case() {
     let (og, rows_out) = grid_of(&gpu, &[Box3::new(1, 2, 4)]);
     let mut o = gpu.zeros(rows_out as u32, 1, Dtype::Bf16);
     let x = gpu.tensor(&[0.0, 2.0, 4.0, 6.0, 1.0, 3.0, 5.0, 7.0], 2, 4, Dtype::Bf16);
-    pixel_shuffle(&ctx, x, g, [1, 2, 2], 0, &mut o, og).expect("the shuffle fires");
+    pixel_shuffle(&ctx, x, g, [1, 2, 2], 0, &mut o, og, [0, 0]).expect("the shuffle fires");
     assert_eq!(gpu.read(&o), [0.0, 2.0, 1.0, 3.0, 4.0, 6.0, 5.0, 7.0]);
 
     // A shuffle and its inverse.
@@ -303,9 +305,9 @@ fn the_voxel_reshapes_land_the_reference_ordering_every_case() {
     let (og, rows_up) = grid_of(&gpu, &up_boxes);
     let x_t = gpu.tensor(&x, rows as u32, (c * vol) as u32, Dtype::Bf16);
     let mut up = gpu.zeros(rows_up as u32, c as u32, Dtype::Bf16);
-    pixel_shuffle(&ctx, x_t, g, r, 0, &mut up, og).expect("the shuffle fires");
+    pixel_shuffle(&ctx, x_t, g, r, 0, &mut up, og, [0, 0]).expect("the shuffle fires");
     let mut back = gpu.zeros(rows as u32, (c * vol) as u32, Dtype::Bf16);
-    pixel_unshuffle(&ctx, up, og, r, &mut back, g).expect("the unshuffle fires");
+    pixel_unshuffle(&ctx, up, og, r, &mut back, g, [0, 0]).expect("the unshuffle fires");
     assert_eq!(gpu.read(&up), want_up, "the shuffle's ordering");
     assert_eq!(bits(&gpu, &back), bits(&gpu, &x_t), "the round trip");
 
@@ -316,9 +318,9 @@ fn the_voxel_reshapes_land_the_reference_ordering_every_case() {
     let (tg, tokens) = grid_of(&gpu, &token_boxes);
     let x_t = gpu.tensor(&x, rows as u32, c as u32, Dtype::Bf16);
     let mut tok = gpu.zeros(tokens as u32, (c * 4) as u32, Dtype::Bf16);
-    patchify(&ctx, x_t, g, p, &mut tok, tg).expect("patchify fires");
+    patchify(&ctx, x_t, g, p, &mut tok, tg, [0, 0]).expect("patchify fires");
     let mut back = gpu.zeros(rows as u32, c as u32, Dtype::Bf16);
-    unpatchify(&ctx, tok, tg, p, &mut back, g).expect("unpatchify fires");
+    unpatchify(&ctx, tok, tg, p, &mut back, g, [0, 0]).expect("unpatchify fires");
     assert_eq!(gpu.read(&tok), want_tok, "the token channels");
     assert_eq!(bits(&gpu, &back), bits(&gpu, &x_t), "the round trip");
 
@@ -337,6 +339,7 @@ fn the_voxel_reshapes_land_the_reference_ordering_every_case() {
             keep_first,
             &mut o,
             og,
+            [0, 0],
         )
         .expect("the upsample fires");
         assert_eq!(gpu.read(&o), want, "keep_first {keep_first}");
@@ -367,6 +370,7 @@ fn the_voxel_reshapes_land_the_reference_ordering_every_case() {
             group,
             &mut o,
             og,
+            [0, 0],
         )
         .expect("avg-down fires");
         for (i, (&got, &w)) in gpu.read(&o).iter().zip(&want).enumerate() {
@@ -417,6 +421,7 @@ fn a_trimmed_pixel_shuffle_drops_its_anchor_frames() {
         TRIM,
         &mut o,
         og,
+        [0, 0],
     )
     .expect("the shuffle fires");
     let got_grid: Vec<i32> = gpu.read_as::<i32>(&og)[..8].to_vec();
@@ -523,6 +528,7 @@ fn the_frame_cache_gathers_and_stores_each_lanes_window() {
         g,
         frames as u32,
         &mut out,
+        0,
     )
     .expect("the store fires");
     let mut want = slab_vals.clone();

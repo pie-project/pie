@@ -5,6 +5,10 @@ namespace pie::conv {
 
 using namespace ::pie::voxels;
 
+// `x_base` / `y_base`: the rows `grid` and `o_grid` address `x`'s and `y`'s
+// row 0 at. A window of a segmented fire starts its tensors at its own rows
+// while the fire's grids hold fire-wide ones.
+
 template <class T>
 __global__ __launch_bounds__(256) void upsample_nearest(
     const T* __restrict__ x,
@@ -17,12 +21,14 @@ __global__ __launch_bounds__(256) void upsample_nearest(
     int fh,
     int fw,
     int keep_first,
+    int x_base,
+    int y_base,
     long long total)
 {
     const long long e = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (e >= total) return;
-    const int row = static_cast<int>(e / c);
-    const int col = static_cast<int>(e - static_cast<long long>(row) * c);
+    const int row = static_cast<int>(e / c) + y_base;
+    const int col = static_cast<int>(e % c);
     Lane og;
     const int l = lane_of(o_grid, lanes, row, og);
     if (l < 0) {
@@ -32,7 +38,7 @@ __global__ __launch_bounds__(256) void upsample_nearest(
     const Lane ig = lane_at(grid, l);
     const Voxel o = unravel(og, row - og.off);
     const int ti = keep_first ? (o.t == 0 ? 0 : (o.t - 1) / ft + 1) : o.t / ft;
-    const int src = ravel(ig, ti, o.h / fh, o.w / fw);
+    const int src = ravel(ig, ti, o.h / fh, o.w / fw) - x_base;
     y[e] = x[static_cast<long long>(src) * c + col];
 }
 
@@ -54,8 +60,6 @@ __global__ __launch_bounds__(256) void pixel_shuffle(
 {
     const long long e = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (e >= total) return;
-    // `x_base` / `y_base`: the fire rows `x`'s and `y`'s row 0 stand at; the
-    // grids address fire rows.
     const int row = static_cast<int>(e / c) + y_base;
     const int col = static_cast<int>(e % c);
     Lane og;
@@ -92,8 +96,6 @@ __global__ __launch_bounds__(256) void pixel_unshuffle(
     const int c_out = c * r;
     const long long e = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (e >= total) return;
-    // `x_base` / `y_base`: the fire rows `x`'s and `y`'s row 0 stand at; the
-    // grids address fire rows.
     const int row = static_cast<int>(e / c_out) + y_base;
     const int col = static_cast<int>(e % c_out);
     Lane og;
@@ -125,14 +127,16 @@ __global__ __launch_bounds__(256) void avg_down(
     int r2,
     int r3,
     int group,
+    int x_base,
+    int y_base,
     long long total)
 {
     const int r = r1 * r2 * r3;
     const int c_out = c * r / group;
     const long long e = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (e >= total) return;
-    const int row = static_cast<int>(e / c_out);
-    const int n = static_cast<int>(e - static_cast<long long>(row) * c_out);
+    const int row = static_cast<int>(e / c_out) + y_base;
+    const int n = static_cast<int>(e % c_out);
     Lane og;
     const int l = lane_of(o_grid, lanes, row, og);
     if (l < 0) {
@@ -152,7 +156,7 @@ __global__ __launch_bounds__(256) void avg_down(
         const int i3 = block % r3;
         const int ti = o.t * r1 + i1 - pad_t;
         if (ti < 0) continue;
-        const int src = ravel(ig, ti, o.h * r2 + i2, o.w * r3 + i3);
+        const int src = ravel(ig, ti, o.h * r2 + i2, o.w * r3 + i3) - x_base;
         acc += Elem<T>::to_f32(x[static_cast<long long>(src) * c + cin]);
     }
     y[e] = Elem<T>::from_f32(acc / static_cast<float>(group));

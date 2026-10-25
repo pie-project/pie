@@ -182,6 +182,7 @@ __global__ __launch_bounds__(128) void attention(
     int lanes,
     int rows,
     int seg_frames,
+    int base,
     float scale_log2)
 {
     constexpr int CPL = C / 32;
@@ -219,10 +220,12 @@ __global__ __launch_bounds__(128) void attention(
 #pragma unroll
     for (int i = 0; i < QPW; ++i) {
         const int r = first + i;
-        owner[i] = r < rows ? lane_of(grid, lanes, r, box[i]) : -2;
+        // `base`: the row `grid` addresses row 0 at; segments land local.
+        owner[i] = r < rows ? lane_of(grid, lanes, r + base, box[i]) : -2;
         seg_begin[i] = 0;
         seg_end[i] = 0;
         if (owner[i] >= 0) {
+            box[i].off -= base;
             segment_of(box[i], r - box[i].off, seg_frames, seg_begin[i], seg_end[i]);
             read_slice(q, r, col, qreg[i]);
 #pragma unroll

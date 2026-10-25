@@ -76,6 +76,20 @@ REPO = P.REPO
 HUGE = 1e9
 VELOCITY_REL_TOL = 1e-5
 
+def pieces(text: str, n: int) -> list[str]:
+    """`n` argv pieces of `text`, none starting with `-`: `pie run` reads a
+    value that starts with `-` and is no number as the next flag, which
+    leaves the piece's `--case_i` a bare `true`."""
+    step = -(-len(text) // n)
+    cuts = [0]
+    for i in range(1, n):
+        at = max(cuts[-1], min(i * step, len(text)))
+        while at < len(text) and text[at] == "-":
+            at += 1
+        cuts.append(at)
+    cuts.append(len(text))
+    return [text[a:b] for a, b in zip(cuts, cuts[1:])]
+
 def run_cache(args, where: str, threshold: float | None) -> list[dict]:
     """Fire the cached loop once per batch element; answer the documents."""
     paths = P.numbered(args.out, "case", True)
@@ -97,10 +111,8 @@ def run_cache(args, where: str, threshold: float | None) -> list[dict]:
             cmd += ["--config", args.config]
         cmd += ["run", "--path", binary, "--"]
         text = open(case).read()
-        n = 8
-        step = -(-len(text) // n)
-        for i in range(n):
-            cmd += [f"--case_{i}", text[i * step:(i + 1) * step]]
+        for i, piece in enumerate(pieces(text, 8)):
+            cmd += [f"--case_{i}", piece]
         cmd += ["--cache", "true",
                 "--cache_steps", str(args.steps),
                 "--cache_seed", str(args.seed)]

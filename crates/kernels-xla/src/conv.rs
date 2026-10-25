@@ -29,7 +29,7 @@ use dtype::Dtype;
 
 use crate::error::{Error, refuse};
 use crate::hlo::{Cmp, Elem, Fold, Func, GatherDims, Val};
-use crate::tensor::Stored;
+use crate::tensor::{Operand, Stored};
 
 // ------------------------------------------------------------------ types
 
@@ -246,6 +246,25 @@ pub(crate) struct Boxes {
     pub(crate) h: Val,
     pub(crate) w: Val,
     pub(crate) off: Val,
+}
+
+/// `grid` with `base` taken off each lane's first row: the rows of a window
+/// of a segmented fire, whose tensors start at its own rows while the fire's
+/// grids hold fire-wide ones.
+pub(crate) fn rebased(f: &mut Func, grid: Operand, base: u32) -> Result<Operand, Error> {
+    if base == 0 {
+        return Ok(grid);
+    }
+    let dims = f.dims(grid.val).to_vec();
+    let col = f.iota(Elem::I32, &dims, 1);
+    let first = cmp_k(f, Cmp::Eq, col, 3)?;
+    let by = k(f, col, i64::from(base));
+    let zero = k(f, col, 0);
+    let by = f.select(first, by, zero)?;
+    Ok(Operand {
+        val: f.sub(grid.val, by)?,
+        ..grid
+    })
 }
 
 fn boxes(f: &mut Func, grid: Val) -> Result<Boxes, Error> {

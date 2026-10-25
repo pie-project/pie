@@ -409,7 +409,16 @@ impl Run<'_> {
                 let grid_v = l.read(self.tensor(*grid))?;
                 let x_v = l.read(self.tensor(*x))?;
                 let o_y = self.tensor(*y);
-                let v = conv::resample::patchify(l.f(), x_v, grid_v, *p, o_y.landing(), y_grid_v)?;
+                let bases = [self.grid_base(*grid, *x), self.grid_base(*tgrid, *y)];
+                let v = conv::resample::patchify(
+                    l.f(),
+                    x_v,
+                    grid_v,
+                    *p,
+                    o_y.landing(),
+                    y_grid_v,
+                    bases,
+                )?;
                 l.land(o_y, v)
             }),
             Conv::Unpatchify {
@@ -423,8 +432,16 @@ impl Run<'_> {
                 let grid_v = l.read(self.tensor(*tgrid))?;
                 let x_v = l.read(self.tensor(*x))?;
                 let o_y = self.tensor(*y);
-                let v =
-                    conv::resample::unpatchify(l.f(), x_v, grid_v, *p, o_y.landing(), y_grid_v)?;
+                let bases = [self.grid_base(*tgrid, *x), self.grid_base(*grid, *y)];
+                let v = conv::resample::unpatchify(
+                    l.f(),
+                    x_v,
+                    grid_v,
+                    *p,
+                    o_y.landing(),
+                    y_grid_v,
+                    bases,
+                )?;
                 l.land(o_y, v)
             }),
             Conv::Cells {
@@ -436,7 +453,8 @@ impl Run<'_> {
                 let tgrid_v = l.read(self.tensor(*tgrid))?;
                 let positions_v = l.read(self.tensor(*positions))?;
                 let o_y = self.tensor(*y);
-                let v = conv::rule::cells(l.f(), tgrid_v, positions_v, *axis, o_y.landing())?;
+                let base = self.grid_base(*tgrid, *y);
+                let v = conv::rule::cells(l.f(), tgrid_v, positions_v, *axis, o_y.landing(), base)?;
                 l.land(o_y, v)
             }),
         }

@@ -672,6 +672,8 @@ const MAX_SPLITS: u32 = 512;
 
 const ROWS_PER_SPLIT: u32 = 256;
 
+/// `base`: the row `grid` addresses `x`'s (and `o`'s) row 0 at, nonzero in a
+/// window of a segmented fire whose grid holds fire-wide rows.
 #[allow(clippy::too_many_arguments)]
 pub fn group_norm(
     ctx: &Ctx,
@@ -683,6 +685,7 @@ pub fn group_norm(
     eps: f32,
     silu: bool,
     o: &mut Tensor,
+    base: u32,
 ) -> Result<(), Error> {
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     debug_assert!(
@@ -725,6 +728,7 @@ pub fn group_norm(
     let partials = ctx.scratch(OP, "conv.group_norm.partials", cells * 16)? as u64;
     let stats = ctx.scratch(OP, "conv.group_norm.stats", cells * 8)? as u64;
     let splits = stated(OP, splits)?;
+    let base = stated(OP, base)?;
 
     ctx.fire(
         OP,
@@ -739,6 +743,7 @@ pub fn group_norm(
             c.arg(),
             groups.arg(),
             splits.arg(),
+            base.arg(),
         ],
     )?;
     ctx.fire(
@@ -777,6 +782,7 @@ pub fn group_norm(
             c.arg(),
             groups.arg(),
             lanes.arg(),
+            base.arg(),
             total.arg(),
         ],
     )

@@ -290,7 +290,7 @@ fn the_import_reads_every_vae_tensor_of_the_real_snapshot_once() {
     let mut resolver = Resolver::new(&types, Partition::WHOLE);
     let mut kernels = 0;
     for tensor in &contract.tensors {
-        if tensor.name.starts_with("vae.") && tensor.name.ends_with("conv_in") {
+        if tensor.name.starts_with("vae.") && tensor.name.ends_with("conv_in.w") {
             kernels += 1;
         }
         if let Expr::Transmute { .. } = &tensor.expr {

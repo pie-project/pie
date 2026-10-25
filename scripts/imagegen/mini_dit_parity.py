@@ -183,6 +183,20 @@ def wasm(inferlet: str) -> str:
         raise SystemExit(f"no wasm for {name}; tried {', '.join(candidates)}")
     return max(present, key=os.path.getmtime)
 
+def pieces(text: str, n: int) -> list[str]:
+    """`n` argv pieces of `text`, none starting with `-`: `pie run` reads a
+    value that starts with `-` and is no number as the next flag, which
+    leaves the piece's `--case_i` a bare `true`."""
+    step = -(-len(text) // n)
+    cuts = [0]
+    for i in range(1, n):
+        at = max(cuts[-1], min(i * step, len(text)))
+        while at < len(text) and text[at] == "-":
+            at += 1
+        cuts.append(at)
+    cuts.append(len(text))
+    return [text[a:b] for a, b in zip(cuts, cuts[1:])]
+
 def run(args) -> None:
     paths = numbered(args.out, "case", loop_of(args))
     if not paths:
@@ -204,10 +218,8 @@ def run(args) -> None:
             cmd += ["--case_file", os.path.basename(case)]
         else:
             text = open(case).read()
-            n = 8
-            step = -(-len(text) // n)
-            for i in range(n):
-                cmd += [f"--case_{i}", text[i * step:(i + 1) * step]]
+            for i, piece in enumerate(pieces(text, 8)):
+                cmd += [f"--case_{i}", piece]
         if args.solver:
             cmd += ["--solver", args.solver]
         elif args.euler:

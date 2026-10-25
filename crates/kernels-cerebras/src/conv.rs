@@ -25,13 +25,15 @@ fn table(op: &'static str, what: &str, grid: Tensor) -> Result<u32, Error> {
 
 /// Each token row's cell (`conv.cells`): a row of a clip of `tgrid` its
 /// patch's `(t, h, w)` there, any other row `positions[row]` in column
-/// `axis`; zeros elsewhere.
+/// `axis`; zeros elsewhere. `base` is the row `tgrid` addresses `y`'s row 0
+/// at, nonzero in a window of a segmented fire.
 pub fn cells(
     ctx: &Ctx<'_>,
     tgrid: Tensor,
     positions: Tensor,
     axis: u32,
     y: Tensor,
+    base: u32,
 ) -> Result<(), Error> {
     const OP: &str = "conv.cells";
     let clips = table(OP, "token", tgrid)?;
@@ -65,6 +67,7 @@ pub fn cells(
             rows,
             axis,
             width,
+            base,
         });
         Ok(())
     })
@@ -116,6 +119,7 @@ fn patch(
     o_grid: Tensor,
     y: Tensor,
     fold: bool,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     let clips = table(op, "input", grid)?;
     if table(op, "output", o_grid)? != clips {
@@ -159,13 +163,17 @@ fn patch(
             channels: narrow,
             p,
             fold,
+            bases,
         });
         Ok(())
     })
 }
 
 /// A clip's voxels folded into its token rows by `p` (`conv.patchify`):
-/// kernels-cuda's pixel unshuffle onto the token grid.
+/// kernels-cuda's pixel unshuffle onto the token grid. `bases`: the rows
+/// `grid` and `tgrid` address `x`'s and `y`'s row 0 at (`[x, y]`), nonzero
+/// in a window of a segmented fire whose grids hold fire-wide rows.
+#[allow(clippy::too_many_arguments)]
 pub fn patchify(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -173,12 +181,15 @@ pub fn patchify(
     p: [u32; 3],
     tgrid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
-    patch(ctx, "conv.patchify", x, grid, p, tgrid, y, true)
+    patch(ctx, "conv.patchify", x, grid, p, tgrid, y, true, bases)
 }
 
 /// Token rows spread back into their clip's voxels (`conv.unpatchify`):
-/// kernels-cuda's pixel shuffle from the token grid.
+/// kernels-cuda's pixel shuffle from the token grid; `bases` as
+/// [`patchify`]'s.
+#[allow(clippy::too_many_arguments)]
 pub fn unpatchify(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -186,8 +197,9 @@ pub fn unpatchify(
     p: [u32; 3],
     grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
-    patch(ctx, "conv.unpatchify", x, tgrid, p, grid, y, false)
+    patch(ctx, "conv.unpatchify", x, tgrid, p, grid, y, false, bases)
 }
 
 /// `xs` side by side into `y` (`ops::gather::concat_cols`), one host copy an

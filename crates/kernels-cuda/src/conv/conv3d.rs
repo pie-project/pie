@@ -97,6 +97,8 @@ struct Geom {
     replicate: i32,
     lanes: i32,
     rows_out: i32,
+    x_base: i32,
+    o_base: i32,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -110,6 +112,7 @@ pub fn conv3d(
     cache: Option<Tensor>,
     o: &mut Tensor,
     o_grid: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     conv3d_on(
         ctx,
@@ -122,6 +125,7 @@ pub fn conv3d(
         cache,
         o,
         o_grid,
+        bases,
     )
 }
 
@@ -137,6 +141,7 @@ pub fn conv3d_on(
     cache: Option<Tensor>,
     o: &mut Tensor,
     o_grid: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     dtype_dispatch!(OP, x.dtype, { Bf16 => () });
     debug_assert_eq!(w.dtype, Dtype::Bf16, "`{OP}` reads a bf16 weight");
@@ -209,6 +214,8 @@ pub fn conv3d_on(
         replicate: i32::from(conv.time_pad == TimePad::Replicate),
         lanes,
         rows_out,
+        x_base: stated(OP, bases[0])?,
+        o_base: stated(OP, bases[1])?,
     };
 
     let vectorised = x.width.is_multiple_of(8)

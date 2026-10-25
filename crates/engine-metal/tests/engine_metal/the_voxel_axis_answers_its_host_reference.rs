@@ -576,6 +576,7 @@ fn the_reshapes_land_the_reference_ordering() {
             [1, 2, 2],
             Tensor::new(hdg, 2, 4, Dtype::I32),
             Tensor::new(hd, down_rows as u32, (C * 4) as u32, Dtype::Bf16),
+            [0, 0],
         )
         .expect("unshuffle")
     });
@@ -589,6 +590,7 @@ fn the_reshapes_land_the_reference_ordering() {
             0,
             Tensor::new(hsg, 2, 4, Dtype::I32),
             Tensor::new(hback, small_rows as u32, C as u32, Dtype::Bf16),
+            [0, 0],
         )
         .expect("shuffle")
     });

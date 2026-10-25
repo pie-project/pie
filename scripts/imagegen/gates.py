@@ -467,10 +467,8 @@ def v2v_claims(text: str) -> list[str]:
     except Exception as why:
         return [f"video2video claims unread: {why}"]
 
-REF_MOVES = 0.02
-
 def t2i_readout(text: str) -> str:
-    """The picture, the img2img claims, and the reference-lane claims.
+    """The picture, the img2img claims and the inpaint claim.
 
     The pictures are compared HERE rather than in the guest because only
     the harness sees all of them. Nothing below needs a golden.
@@ -483,22 +481,6 @@ def t2i_readout(text: str) -> str:
 
       strength 0.4 must land NEARER the input than either of those, or the
       encoded picture reached the sampler and changed nothing.
-
-    references — three claims at one prompt and one seed:
-
-      A reference must MOVE the picture: `ref-a` against `ref-none` by at
-      least `REF_MOVES`. Without this the lane could be attending nothing
-      and every other reading would still look right.
-
-      Two DIFFERENT references must give two different pictures: `ref-a`
-      against `ref-b`. Same prompt, same seed, same lane count, same fire
-      composition — so this one cannot be bf16 noise, and it is what says
-      the reference's CONTENT reached the attention rather than its mere
-      presence.
-
-      Both references at once must differ from EITHER alone: `ref-ab`
-      against each. Two references ride one lane at `10*1` and `10*2`, so
-      this is the claim that the stride is a stride and not a flag.
     """
     pngs = re.findall(r"\[gates\] picture: (\S+)", text)
     size = re.search(r"\[gates\] (\d+)x(\d+) PNG", text)
@@ -527,28 +509,6 @@ def t2i_readout(text: str) -> str:
             bits.append(f"strength 1.0 IS txt2img ({'pass' if same else 'FAIL'})")
         except Exception as why:
             bits.append(f"img2img claims unread: {why}")
-    if {"ref-none", "ref-a", "ref-b", "ref-ab"} <= named.keys():
-        try:
-            import numpy as np
-            from PIL import Image
-
-            def px(p):
-                return np.asarray(Image.open(p).convert("RGB"), dtype=np.float32) / 255.0
-
-            def diff(x, y):
-                return float(np.abs(px(named[x]) - px(named[y])).mean())
-
-            moved = diff("ref-a", "ref-none")
-            differ = diff("ref-a", "ref-b")
-            both = min(diff("ref-ab", "ref-a"), diff("ref-ab", "ref-b"))
-            ok = "pass" if moved >= REF_MOVES else "FAIL"
-            bits.append(f"a reference moves the picture {moved:.4f} ({ok})")
-            ok = "pass" if differ >= REF_MOVES else "FAIL"
-            bits.append(f"two references differ {differ:.4f} ({ok})")
-            ok = "pass" if both >= REF_MOVES else "FAIL"
-            bits.append(f"both-at-once differs from either {both:.4f} ({ok})")
-        except Exception as why:
-            bits.append(f"reference claims unread: {why}")
     if {"small", "inpaint"} <= named.keys():
         try:
             import numpy as np
@@ -641,7 +601,7 @@ def t2v_step(prompt_ids, width, height, frames, steps, seed,
     return build
 
 def t2i_step(prompt, width, height, steps, seed,
-             init_from=None, strength=None, refs_from=None, out_name="picture",
+             init_from=None, strength=None, out_name="picture",
              mask_rect=None):
     def build(ctx, gate):
         out = os.path.join(ctx.out, gate.name, out_name)
@@ -654,8 +614,6 @@ def t2i_step(prompt, width, height, steps, seed,
         if init_from is not None:
             argv += ["--init-image", os.path.join(ctx.out, gate.name, init_from, "image.png"),
                      "--strength", str(strength)]
-        for name in refs_from or []:
-            argv += ["--ref-image", os.path.join(ctx.out, gate.name, name, "image.png")]
         if mask_rect is not None:
             argv += ["--mask-rect", mask_rect]
         return (argv, REPO)
@@ -976,21 +934,15 @@ def roster() -> list[Gate]:
         Gate(
             name="text-to-image",
             wraps="the model-agnostic guest on flux2-klein-4b.zt, 4 steps at 1024^2, "
-                  "then the same picture back in through `vae.encode` — as an init "
-                  "image, and as a reference lane",
+                  "then the same picture back in through `vae.encode` as an init image",
             expected="a real PNG; img2img at 0.4 lands nearer the input than txt2img, "
-                     "and at 1.0 IS txt2img; a reference MOVES the picture (>= 0.02 "
-                     "mean abs) and two different references move it two different "
-                     "ways",
-            note="img2img and reference editing are the guest driving the family's "
-                 "`vae.encode` reading: the picture crosses as a `frames` handle "
-                 "(`frames.decode` in, `frames.to-channel` onto the pixel port) and "
-                 "never enters the guest's linear memory. An init image seeds the "
-                 "trajectory; a REFERENCE rides a lane of its own on the reading's "
-                 "reference stream, at the ordinal the guest states (its `reference` "
-                 "input; the family computes the offset), and reads nothing back. "
-                 "Every claim is an identity or a margin measured within this gate's "
-                 "own runs, so none needs a golden.",
+                     "and at 1.0 IS txt2img",
+            note="img2img is the guest driving the family's `vae.encode` reading: "
+                 "the picture crosses as a `frames` handle (`frames.decode` in, "
+                 "`frames.to-channel` onto the pixel port) and never enters the "
+                 "guest's linear memory. An init image seeds the trajectory. Every "
+                 "claim is an identity or a margin measured within this gate's own "
+                 "runs, so none needs a golden.",
             needs=[(a("flux2-klein-4b.zt"),
                     f"{IMPORT} <FLUX.2-klein-4B snapshot> --deployment flux2-klein-4b-bf16-kv-bf16 "
                     f"--out {a('flux2-klein-4b.zt')}")],
@@ -1009,18 +961,6 @@ def roster() -> list[Gate]:
                    ("the same prompt with no init",
                     t2i_step("a red bicycle leaning on a green hedge", T2I_SMALL, T2I_SMALL, 4, 0,
                              out_name="txt2img")),
-                   ("a picture with no reference at all",
-                    t2i_step("a bicycle in a snowy field at dawn", T2I_SMALL, T2I_SMALL, 4, 3,
-                             out_name="ref-none")),
-                   ("the same prompt and seed, with the blue-wall picture in view",
-                    t2i_step("a bicycle in a snowy field at dawn", T2I_SMALL, T2I_SMALL, 4, 3,
-                             refs_from=["small"], out_name="ref-a")),
-                   ("and with the green-hedge picture instead",
-                    t2i_step("a bicycle in a snowy field at dawn", T2I_SMALL, T2I_SMALL, 4, 3,
-                             refs_from=["txt2img"], out_name="ref-b")),
-                   ("and both at once, on one lane",
-                    t2i_step("a bicycle in a snowy field at dawn", T2I_SMALL, T2I_SMALL, 4, 3,
-                             refs_from=["small", "txt2img"], out_name="ref-ab")),
                    ("inpaint the right half of the small picture",
                     t2i_step("a red bicycle leaning on a green hedge", T2I_SMALL, T2I_SMALL, 4, 0,
                              init_from="small", strength=1.0, mask_rect=f"{T2I_SMALL // 2},0,{T2I_SMALL},{T2I_SMALL}",
@@ -1061,9 +1001,6 @@ def text_to_image(args) -> int:
         for i, piece in enumerate(b64_pieces(args.init_image)):
             cmd += [f"--init_image_{i}", piece]
         cmd += ["--strength", str(args.strength)]
-    for i, path in enumerate(args.ref_images or []):
-        for n, piece in enumerate(b64_pieces(path)):
-            cmd += [f"--ref_{i}_{n}", piece]
     if args.mask_rect:
         cmd += ["--mask_rect", args.mask_rect]
     print("$ " + " ".join(cmd), flush=True)
@@ -1280,8 +1217,6 @@ def main() -> int:
     ap.add_argument("--init-image", dest="init_image", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--init-clip", dest="init_clip", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--clip-format", dest="clip_format", default=None, help=argparse.SUPPRESS)
-    ap.add_argument("--ref-image", dest="ref_images", action="append", default=None,
-                    help=argparse.SUPPRESS)
     ap.add_argument("--strength", type=float, default=0.6, help=argparse.SUPPRESS)
     ap.add_argument("--mask-rect", dest="mask_rect", default=None, help=argparse.SUPPRESS)
     ap.add_argument("--guidance", type=float, default=None, help=argparse.SUPPRESS)

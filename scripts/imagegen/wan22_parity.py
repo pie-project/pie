@@ -272,8 +272,15 @@ def run(args) -> None:
                     f"{case}: {len(text)} bytes is past what argv carries; "
                     f"write the case with `--compact`"
                 )
-            for i in range(-(-len(text) // PIECE)):
-                cmd += [f"--case_{i}", text[i * PIECE:(i + 1) * PIECE]]
+            # A piece that starts with `-` and is no number reads as the next
+            # flag in `pie run`, leaving its `--case_i` a bare `true`.
+            at, count = 0, 0
+            while at < len(text):
+                cut = min(at + PIECE, len(text))
+                while cut < len(text) and text[cut] == "-":
+                    cut += 1
+                cmd += [f"--case_{count}", text[at:cut]]
+                at, count = cut, count + 1
         print(f"[run] {' '.join(cmd[:8])} ... ({len(text)} bytes of case in "
               f"{-(-len(text) // PIECE)} piece(s))")
         done = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO,

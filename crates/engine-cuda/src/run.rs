@@ -1568,13 +1568,23 @@ impl<'c> Run<'c> {
     /// The fire row `tensor(id)`'s row 0 stands at: the window's first row
     /// on the value's axis, which a kernel that looks rows up in a fire-wide
     /// table (the clip and token grids) adds back.
-    pub(crate) fn row_base(&self, id: ValueId) -> u32 {
+    fn row_base(&self, id: ValueId) -> u32 {
         let (cut, whole) = (self.tensor(id), self.whole(id));
         let row = cut.dtype.row_bytes(cut.width).unwrap_or(0);
         if row == 0 || cut.ptr < whole.ptr {
             return 0;
         }
         u32::try_from((cut.ptr - whole.ptr) / row).unwrap_or(0)
+    }
+
+    /// The row `grid` addresses `rows`' row 0 at: the fire's clip and token
+    /// grids hold fire-wide rows ([`Self::row_base`]); a grid an op derived
+    /// counts from the window's first clip, so 0.
+    pub(crate) fn grid_base(&self, grid: ValueId, rows: ValueId) -> u32 {
+        match self.values[grid.0 as usize].def {
+            Def::Input(RuntimeInput::Grid | RuntimeInput::TokenGrid { .. }) => self.row_base(rows),
+            _ => 0,
+        }
     }
 
     /// The custom mask a group-packed attention over packings `q` and `kv`
@@ -2052,8 +2062,15 @@ impl<'c> Run<'c> {
         skip(handle, window.row_offset, window.rows)
     }
 
+    /// The fire's clip slot table cut to this window's clips, indexed as the
+    /// window's grids index their lanes.
     pub(crate) fn clip_slots(&self) -> Option<Tensor> {
-        self.fire.clip_slots
+        let slots = self.fire.clip_slots?;
+        if self.window().gathered.is_some() {
+            return Some(slots);
+        }
+        let span = self.window().on(poem_ir::RowAxis::Voxels);
+        Some(skip(slots, span.lane_offset, span.lanes))
     }
 
     pub(crate) fn recurrent(&self, id: ValueId) -> RecurrentPool {

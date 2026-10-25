@@ -57,15 +57,15 @@ fused#0: library=0 library_op=0 schedule=2 nodes=3 inputs=0 outputs=0 sinks=1
 === extended_hidden#0
 stage_tag: 0x03
 signature: 606306b9d45d7b17
-plan: lines=10 fnv1a64=0x98e39cc77f6a0adc
+plan: lines=10 fnv1a64=0x02f7e905ec000fa2
 fused#0: library=0 library_op=0 schedule=1 nodes=3 inputs=0 outputs=0 sinks=1
 === extended_on_attn#0
 stage_tag: 0x02
 signature: 1ebb08563ae4455c
-plan: lines=8 fnv1a64=0x53a4012d15326b84
+plan: lines=8 fnv1a64=0xc8d4331a50fc71a0
 fused#0: library=0 library_op=0 schedule=1 nodes=2 inputs=0 outputs=0 sinks=1
 === extended_attn_score#0
 stage_tag: 0x03
 signature: c6812e51185c4259
-plan: lines=10 fnv1a64=0xd802089d94880181
+plan: lines=10 fnv1a64=0x65ee76efc87e12f5
 fused#0: library=0 library_op=0 schedule=1 nodes=3 inputs=0 outputs=0 sinks=1

@@ -646,7 +646,15 @@ fn resamples_move_voxels_between_clip_layouts() {
                 let grid_v = l.read(g)?;
                 let x_v = l.read(xt)?;
                 let o_y = py;
-                let v = conv::resample::patchify(l.f(), x_v, grid_v, r, o_y.landing(), y_grid_v)?;
+                let v = conv::resample::patchify(
+                    l.f(),
+                    x_v,
+                    grid_v,
+                    r,
+                    o_y.landing(),
+                    y_grid_v,
+                    [0, 0],
+                )?;
                 l.land(o_y, v)
             })?;
             engine_xla::lower::lower(ctx, |l| {
@@ -670,7 +678,15 @@ fn resamples_move_voxels_between_clip_layouts() {
                 let grid_v = l.read(dg)?;
                 let x_v = l.read(pk4)?;
                 let o_y = ey;
-                let v = conv::resample::unpatchify(l.f(), x_v, grid_v, r, o_y.landing(), y_grid_v)?;
+                let v = conv::resample::unpatchify(
+                    l.f(),
+                    x_v,
+                    grid_v,
+                    r,
+                    o_y.landing(),
+                    y_grid_v,
+                    [0, 0],
+                )?;
                 l.land(o_y, v)
             })?;
             engine_xla::lower::lower(ctx, |l| {

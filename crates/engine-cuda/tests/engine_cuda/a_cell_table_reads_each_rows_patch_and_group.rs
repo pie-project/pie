@@ -168,7 +168,8 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
     let clips = [[2u32, 4, 6], [1, 2, 4]];
     let text_rows = [3u32, 5];
     let tokens = |clip: [u32; 3]| clip[0] * clip[1] * clip[2] / (P[0] * P[1] * P[2]);
-    let word = |stream: &str, rows: u32| facts.word(&Request::new(rows, false).switched("stream", stream));
+    let word =
+        |stream: &str, rows: u32| facts.word(&Request::new(rows, false).switched("stream", stream));
     let text = |slot: u32, group: u32| Lane {
         slot,
         word: word("text", text_rows[group as usize]),

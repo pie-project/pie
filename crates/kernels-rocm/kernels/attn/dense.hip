@@ -204,7 +204,7 @@ template <int C, int QPW>
 __global__ __launch_bounds__(128) void attention(const bf16* __restrict__ q, const bf16* __restrict__ k,
                                                  const bf16* __restrict__ v, const int* __restrict__ grid,
                                                  bf16* __restrict__ y, int lanes, int rows, int seg_frames,
-                                                 float scale_log2) {
+                                                 int base, float scale_log2) {
     constexpr int CPL = C / kWave;
     constexpr bool VEC = (CPL % 8 == 0);
     constexpr int PACKS = CPL / 8;
@@ -239,10 +239,12 @@ __global__ __launch_bounds__(128) void attention(const bf16* __restrict__ q, con
 #pragma unroll
     for (int i = 0; i < QPW; ++i) {
         const int r = first + i;
-        owner[i] = r < rows ? lane_of(grid, lanes, r, box[i]) : -2;
+        // `base`: the row `grid` addresses row 0 at; segments land local.
+        owner[i] = r < rows ? lane_of(grid, lanes, r + base, box[i]) : -2;
         seg_begin[i] = 0;
         seg_end[i] = 0;
         if (owner[i] >= 0) {
+            box[i].off -= base;
             segment_of(box[i], r - box[i].off, seg_frames, seg_begin[i], seg_end[i]);
             read_slice(q, r, col, qreg[i]);
 #pragma unroll

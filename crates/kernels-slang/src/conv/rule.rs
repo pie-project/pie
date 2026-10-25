@@ -144,13 +144,15 @@ const CELLS: &str = "conv/cells.slang";
 
 /// Each token row's cell (`ops::conv::cells`): a row of a clip of `tgrid`
 /// its patch's `(t, h, w)` there, any other row `positions[row]` in column
-/// `axis`; zeros elsewhere.
+/// `axis`; zeros elsewhere. `base` is the row `tgrid` addresses `y`'s row 0
+/// at, nonzero in a window of a segmented fire.
 pub fn cells(
     ctx: &Ctx<'_>,
     tgrid: Tensor,
     positions: Tensor,
     axis: u32,
     y: Tensor,
+    base: u32,
 ) -> Result<(), Error> {
     const OP: &str = "conv.cells";
     if tgrid.dtype != Dtype::I32
@@ -177,6 +179,7 @@ pub fn cells(
             axis.arg(),
             y.width.arg(),
             y.rows.arg(),
+            base.arg(),
         ],
     )
 }

@@ -1,5 +1,5 @@
 use crate::error::Error;
-use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse};
+use crate::jit::{Arg, Ctx, Fire, Launch, count, dtype_dispatch, kernel, refuse, stated};
 use crate::tensor::Tensor;
 use crate::voxels::{flat_elements, lanes_of};
 use dtype::Dtype;
@@ -75,6 +75,9 @@ pub fn cache_gather(
     )
 }
 
+/// `x_base`: the row `grid` addresses `x`'s row 0 at, nonzero in a window of
+/// a segmented fire whose grid holds fire-wide rows.
+#[allow(clippy::too_many_arguments)]
 pub fn cache_store(
     ctx: &Ctx,
     x: Tensor,
@@ -83,6 +86,7 @@ pub fn cache_store(
     grid: Tensor,
     frames: u32,
     slab: &mut Tensor,
+    x_base: u32,
 ) -> Result<(), Error> {
     const OP: &str = "conv.cache_store";
     let (lanes, frames, c, stride, total, blocks) =
@@ -104,6 +108,7 @@ pub fn cache_store(
             frames.arg(),
             c.arg(),
             stride.arg(),
+            stated(OP, x_base)?.arg(),
             total.arg(),
         ],
     )

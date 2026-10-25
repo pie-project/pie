@@ -397,6 +397,20 @@ impl<'c> Run<'c> {
         self.cut(id, self.whole(id))
     }
 
+    /// The row `grid` addresses `rows`' row 0 at: the fire's clip and token
+    /// grids hold fire-wide rows, so the window's first row on `rows`' axis;
+    /// a grid an op derived counts from the window's first clip, so 0.
+    pub(crate) fn grid_base(&self, grid: ValueId, rows: ValueId) -> u32 {
+        if !matches!(
+            self.values[grid.0 as usize].def,
+            Def::Input(RuntimeInput::Grid | RuntimeInput::TokenGrid { .. })
+        ) {
+            return 0;
+        }
+        let at = |t: Tensor| self.handles.locate(t.buf).map_or(0, |(_, row)| row);
+        at(self.tensor(rows)).saturating_sub(at(self.whole(rows)))
+    }
+
     fn whole(&self, id: ValueId) -> Tensor {
         let at = id.0 as usize;
         match &self.values[at].def {
