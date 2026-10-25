@@ -121,18 +121,21 @@ impl Shell {
             .copy_kv(self.device.stream(), &[], &window_copies)?;
         let seq = self.airborne.next_seq();
         self.cache.at_step(seq);
-        if p.rs.rows_ext > 0 {
+        let ext = p.rs.shape.as_ref().map_or(0, |shape| shape.ext);
+        if ext > 0 {
             // The scratch grows in place within its range; past it, it is
-            // reserved anew, and the fires holding the old one land first.
+            // reserved anew: the fires holding the old one land first, and
+            // the bodies that read it go with it.
             if self
                 .buffers
                 .as_ref()
-                .is_some_and(|buffers| !buffers.scratch_reaches(p.rs.rows_ext))
+                .is_some_and(|buffers| !buffers.scratch_reaches(ext))
             {
                 self.drain()?;
+                self.cache.forget_extended();
             }
             if let Some(buffers) = self.buffers.as_mut() {
-                buffers.ensure_scratch(&self.pools, p.rs.rows_ext)?;
+                buffers.ensure_scratch(&self.pools, ext)?;
             }
         }
         let rs_scratch = self.buffers.as_ref().map(Buffers::scratch);
@@ -160,6 +163,7 @@ impl Shell {
             held: &mut self.held,
             buffers: self.buffers.as_ref(),
             rs_scratch,
+            rs_tables: self.rs_tables.as_mut(),
             predicate: &mut self.predicate,
             readout_rows: &mut self.readout_rows,
             budget: &self.budget,
@@ -223,6 +227,7 @@ struct FireCtx<'a> {
     held: &'a mut [u32],
     buffers: Option<&'a Buffers>,
     rs_scratch: Option<(u64, u64)>,
+    rs_tables: Option<&'a mut crate::store::rs::RsTables>,
     predicate: &'a mut Predicate,
     readout_rows: &'a mut Buffer,
     budget: &'a Budget,
@@ -309,7 +314,6 @@ impl Shell {
 }
 
 impl FireCtx<'_> {
-    
     fn gate(&mut self, p: &Prepared<'_>) -> Result<()> {
         let lane_count = p.composition.lane_count();
         if p.rs.predicated || p.rs.truncates {
@@ -772,27 +776,33 @@ impl FireCtx<'_> {
         if let Some(body) = self.device.conditional_ctx() {
             run = run.conditional(body, &stream);
         }
-        let rs_scratch = (p.rs.rows_ext > 0)
+        let ext = p.rs.shape.as_ref().map_or(0, |shape| shape.ext);
+        let rs_scratch = (ext > 0)
             .then(|| {
                 self.rs_scratch
-                    .map(|(ptr, bytes)| crate::run::RsScratch::new(ptr, bytes))
+                    .map(|(ptr, bytes)| crate::run::RsScratch::new(ptr, bytes, ext))
             })
             .flatten();
         if p.rs.buffered
             && let Some(pool) = self.buffers
         {
+            let tables = self.rs_tables.as_mut().ok_or_else(|| Fault::Unbound {
+                what: "the tables a buffered fire's recurrent ops read, which this load \
+                       reserved none of"
+                    .to_string(),
+            })?;
+            let tables = tables.stage(self.device.stream(), &p.rs.staged)?;
             run = run.buffered(RsSeat {
                 buffers: pool,
                 lanes: &p.rs.moves,
                 reads: &p.rs.reads,
                 scratch: rs_scratch.as_ref(),
+                tables,
             });
         }
         super::btrace::mark("run_new");
-        let records = self.graphs.records()
-            && !p.rs.buffered
-            && !self.weights.rotating()
-            && !self.weights.hosts_experts();
+        let records =
+            self.graphs.records() && !self.weights.rotating() && !self.weights.hosts_experts();
         let walked = if records {
             if self.arming && !p.bodied {
                 Ok(())
@@ -816,6 +826,8 @@ impl FireCtx<'_> {
                     towered: p.towered,
                     ceilings,
                     islands: &p.islands,
+                    rs: p.rs.shape.as_ref(),
+                    arming: self.arming,
                 };
 
                 self.cache.fire_body(&fire, &mut run, &place)
@@ -833,10 +845,8 @@ impl FireCtx<'_> {
             }
         } else {
             if self.graphs.records() {
-                self.cache.eager_walk(
-                    self.weights.rotating() || self.weights.hosts_experts(),
-                    p.rs.buffered,
-                );
+                self.cache
+                    .eager_walk(self.weights.rotating() || self.weights.hosts_experts());
             }
             let mut cursor = Cursor::new(&place);
             if let Some(rotor) = self.weights.rotor() {
@@ -1100,7 +1110,7 @@ impl FireCtx<'_> {
             let consecutive = wanted
                 .windows(2)
                 .all(|pair| pair[1] == pair[0].wrapping_add(1));
-            
+
             for k in 0..attached.lanes {
                 let at = lane + k as usize;
                 let class = lane_class[at];

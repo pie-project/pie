@@ -578,6 +578,39 @@ impl Windows {
             .max(1)
     }
 
+    /// The slot run `run` of region `region` stands at among
+    /// [`Windows::all`] (`Slots::at`): windows alike share one.
+    #[must_use]
+    pub fn slot_of(&self, region: u32, run: u32) -> Option<usize> {
+        self.of_region
+            .get(region as usize)
+            .filter(|&&(_, runs)| run < runs)
+            .and_then(|&(start, _)| self.runs.get((start + run) as usize))
+            .map(|index| *index as usize)
+    }
+
+    /// The fire's windows, each once, in slot order.
+    #[must_use]
+    pub fn all(&self) -> &[Window] {
+        &self.windows
+    }
+
+    /// Every (region, run) with the word its four live words stand at in
+    /// [`Windows::live`].
+    pub fn seats(&self) -> impl Iterator<Item = (u32, u32, u64)> + '_ {
+        (0..self.of_region.len() as u32).flat_map(move |region| {
+            (0..self.runs(region))
+                .filter_map(move |run| self.seat.at(region, run).map(|at| (region, run, at)))
+        })
+    }
+
+    /// The byte run `run` of region `region` stages its live words at, past
+    /// the seats' base.
+    #[must_use]
+    pub fn seat_bytes(&self, region: u32, run: u32) -> Option<u64> {
+        self.seat.bytes_at(region, run)
+    }
+
     #[must_use]
     pub fn at(&self, region: u32, run: u32) -> &Window {
         self.of_region

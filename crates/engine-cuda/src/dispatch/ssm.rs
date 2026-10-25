@@ -140,10 +140,10 @@ impl Run<'_> {
             } => {
                 if self.rs_extended() {
                     const OP: &str = "ssm.gdn_gates";
-                    let ba_ext = self.rs_extend(OP, *ba, true)?;
+                    let ba_ext = self.rs_extend(OP, *ba)?;
                     let mut gates_ext = self.rs_out(OP, *gates)?;
                     kernels_cuda::ssm::gdn_gates(
-                        self.ctx(),
+                        self.rs_ctx(),
                         ba_ext,
                         self.tensor(*dt_bias),
                         self.tensor(*a_log),
@@ -474,12 +474,12 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         let bias = bias.map(|b| self.tensor(b));
-        let x_ext = self.rs_extend(op, x, true)?;
+        let x_ext = self.rs_extend(op, x)?;
         let csr = self.rs_ext_csr(op)?;
         let mut y_ext = self.rs_out(op, y)?;
         let tail = self.recurrent_tail_absolute(state);
         kernels_cuda::ssm::causal_conv1d_chunked(
-            self.ctx(),
+            self.rs_ctx(),
             RaggedTensor {
                 data: x_ext,
                 indptr: csr,
@@ -493,7 +493,7 @@ impl Run<'_> {
         )?;
         if let Some(tail) = tail {
             kernels_cuda::ssm::causal_conv1d_chunked(
-                self.ctx(),
+                self.rs_ctx(),
                 RaggedTensor {
                     data: x_ext,
                     indptr: csr,
@@ -525,17 +525,19 @@ impl Run<'_> {
     ) -> Result<(), kernels_cuda::Error> {
         let qkv_ext = self.rs_ext_of(op, qkv)?;
         let gates_ext = self.rs_ext_of(op, gates)?;
-        let z_ext = self.rs_extend(op, z, false)?;
+        // The recurrence reads no `z`; the gated norm after it does, over
+        // the fire's own rows.
+        let z = self.tensor(z);
         let csr = self.rs_ext_csr(op)?;
         let mut y_ext = self.rs_out(op, y)?;
         let tail = self.recurrent_tail_absolute(state);
         kernels_cuda::ssm::gated_delta_chunked(
-            self.ctx(),
+            self.rs_ctx(),
             RaggedTensor {
                 data: qkv_ext,
                 indptr: csr,
             },
-            z_ext,
+            z,
             gates_ext,
             &self.recurrent_absolute(state),
             k_heads,
@@ -546,12 +548,12 @@ impl Run<'_> {
         )?;
         if let Some(tail) = tail {
             kernels_cuda::ssm::gated_delta_chunked(
-                self.ctx(),
+                self.rs_ctx(),
                 RaggedTensor {
                     data: qkv_ext,
                     indptr: csr,
                 },
-                z_ext,
+                z,
                 gates_ext,
                 &tail,
                 k_heads,
@@ -583,13 +585,13 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         let mixed_ext = self.rs_ext_of(op, mixed)?;
-        let f_ext = self.rs_extend(op, f, true)?;
-        let b_ext = self.rs_extend(op, b, true)?;
+        let f_ext = self.rs_extend(op, f)?;
+        let b_ext = self.rs_extend(op, b)?;
         let csr = self.rs_ext_csr(op)?;
         let mut y_ext = self.rs_out(op, y)?;
         let tail = self.recurrent_tail_absolute(state);
         kernels_cuda::ssm::kda_chunked(
-            self.ctx(),
+            self.rs_ctx(),
             RaggedTensor {
                 data: mixed_ext,
                 indptr: csr,
@@ -607,7 +609,7 @@ impl Run<'_> {
         )?;
         if let Some(tail) = tail {
             kernels_cuda::ssm::kda_chunked(
-                self.ctx(),
+                self.rs_ctx(),
                 RaggedTensor {
                     data: mixed_ext,
                     indptr: csr,

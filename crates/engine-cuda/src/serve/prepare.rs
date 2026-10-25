@@ -1342,13 +1342,82 @@ impl FrameShell for Shell {
         let staged = crate::mask::stage(&masks)?;
         super::btrace::mark("mask");
 
+        let rs_replays: Vec<u32> = rs_reads
+            .iter()
+            .map(|reads| crate::run::replayed(reads))
+            .collect();
+        let rs_truncates = rs_lens
+            .iter()
+            .zip(&seats)
+            .zip(&rs_replays)
+            .any(|((len, seat), replay)| *len < narrow(u64::from(seat.rows) + u64::from(*replay)));
+        let rs_rows_ext = if rs_replays.iter().any(|replay| *replay > 0) {
+            rows.saturating_add(rs_replays.iter().sum::<u32>())
+        } else {
+            0
+        };
+        let rs_write_state = rs_moves
+            .iter()
+            .any(|verb| !matches!(verb, RsMove::Scatter { fold: 0, .. }));
+        let rs_predicated = {
+            let scatters = rs_moves
+                .iter()
+                .filter(|verb| matches!(verb, RsMove::Scatter { fold: 0, .. }))
+                .count();
+            let prologue = attachments.iter().any(|attached| {
+                !attached.adapter_only && self.programs.prologue_runs(attached.instance)
+            });
+            (scatters != 0 && scatters != rs_moves.len()) || prologue
+        };
+        let rs_buffered = rs_moves.iter().any(|verb| !matches!(verb, RsMove::None));
+        let (rs_shape, rs_staged) = match self.buffers.as_ref() {
+            Some(buffers) if rs_buffered => {
+                // The extended run takes the least rung of the row ladder
+                // that holds it, so the fires of a speculation replay a few
+                // bodies, not one a replay length.
+                let ext = if rs_rows_ext == 0 {
+                    0
+                } else {
+                    self.budget
+                        .buckets
+                        .iter()
+                        .copied()
+                        .filter(|&rung| rung >= rs_rows_ext)
+                        .min()
+                        .unwrap_or(rs_rows_ext)
+                };
+                let (bits, staged) = rs_movement(
+                    buffers,
+                    &windows,
+                    &composition,
+                    &rs_moves,
+                    &rs_reads,
+                    &rs_replays,
+                    ext,
+                )?;
+                (
+                    Some(record::RsShape {
+                        ext,
+                        write_state: rs_write_state,
+                        predicated: rs_predicated,
+                        truncates: rs_truncates,
+                        windows: bits,
+                    }),
+                    staged,
+                )
+            }
+            _ => (None, crate::store::rs::RsStaged::default()),
+        };
         let totals = poem_ir::PerAxis::from_fn(|axis| composition.axis(axis).rows);
         // The widened table, as `segmentation` holds it: what a body was
         // recorded under is what it replays under.
-        let key = key.with_islands(&record::widen(
-            &self.compiled,
-            &windows.admits_axes(totals, &self.shifted, &self.lane_shifted, self.staging()),
-        ));
+        let key = record::BodyKey {
+            rs: rs_shape.clone(),
+            ..key.with_islands(&record::widen(
+                &self.compiled,
+                &windows.admits_axes(totals, &self.shifted, &self.lane_shifted, self.staging()),
+            ))
+        };
         let ladder = key.classes.clone();
         let patch_ladder = key.patch.as_ref().map(|axis| axis.classes.clone());
         let records_bodies = self.records_bodies();
@@ -1362,7 +1431,6 @@ impl FrameShell for Shell {
         // ends on the stream.
         let bodied = records_bodies
             && !tapped
-            && !rs_moves.iter().any(|verb| !matches!(verb, RsMove::None))
             && snapshots.rows.len() <= crate::store::rs::SNAPSHOTS as usize
             && Self::keyable_units(&self.compiled)
             && world
@@ -1466,20 +1534,6 @@ impl FrameShell for Shell {
             },
         )?;
 
-        let rs_replays: Vec<u32> = rs_reads
-            .iter()
-            .map(|reads| crate::run::replayed(reads))
-            .collect();
-        let rs_truncates = rs_lens
-            .iter()
-            .zip(&seats)
-            .zip(&rs_replays)
-            .any(|((len, seat), replay)| *len < narrow(u64::from(seat.rows) + u64::from(*replay)));
-        let rs_rows_ext = if rs_replays.iter().any(|replay| *replay > 0) {
-            rows.saturating_add(rs_replays.iter().sum::<u32>())
-        } else {
-            0
-        };
         let placed = match geometries.as_slice() {
             [space] if !self.pools.windowed_space(0) => Some(space),
             _ => None,
@@ -1564,27 +1618,17 @@ impl FrameShell for Shell {
             fresh,
             demand,
             rs: RsFire {
-                write_state: rs_moves
-                    .iter()
-                    .any(|verb| !matches!(verb, RsMove::Scatter { fold: 0, .. })),
-                predicated: {
-                    let scatters = rs_moves
-                        .iter()
-                        .filter(|verb| matches!(verb, RsMove::Scatter { fold: 0, .. }))
-                        .count();
-                    let prologue = attachments.iter().any(|attached| {
-                        !attached.adapter_only && self.programs.prologue_runs(attached.instance)
-                    });
-                    (scatters != 0 && scatters != rs_moves.len()) || prologue
-                },
+                write_state: rs_write_state,
+                predicated: rs_predicated,
                 truncates: rs_truncates,
-                buffered: rs_moves.iter().any(|verb| !matches!(verb, RsMove::None)),
+                buffered: rs_buffered,
                 moves: rs_moves,
                 lens: rs_lens,
                 order: rs_order,
                 reads: rs_reads,
-                rows_ext: rs_rows_ext,
                 snapshots,
+                shape: rs_shape,
+                staged: rs_staged,
             },
         })
     }
@@ -1656,6 +1700,102 @@ fn stated_fold(len: FoldLen, lane: usize, port: Option<&[u32]>) -> Result<u32> {
     })
 }
 
+/// A buffered fire's movement as tables ([`crate::store::rs::RsStaged`]),
+/// and the two bits each window slot bakes into its launches
+/// ([`record::RsShape::windows`]). Each fire lane lays its replayed tokens
+/// and then its own rows in the extended run, behind the lanes before it;
+/// `ext` rows hold them all.
+fn rs_movement(
+    buffers: &crate::store::rs::Buffers,
+    windows: &Windows,
+    composition: &poem_exec::fire::Composition,
+    moves: &[RsMove<'_>],
+    reads: &[Vec<std::ops::Range<u32>>],
+    replays: &[u32],
+    ext: u32,
+) -> Result<(Box<[u8]>, crate::store::rs::RsStaged)> {
+    let lanes = composition.lanes();
+    let rows = composition.bucket().max(composition.rows());
+    let mut staged = crate::store::rs::RsStaged {
+        rows,
+        ext,
+        scatter: vec![-1; rows as usize],
+        ..Default::default()
+    };
+    for (lane, row) in lanes.iter().enumerate() {
+        let Some(RsMove::Scatter { pages, at, .. }) = moves.get(lane) else {
+            continue;
+        };
+        for r in 0..row.rows {
+            staged.scatter[(row.row_offset + r) as usize] = buffers.token(pages, at + r)?;
+        }
+    }
+    let mut begins: Vec<u32> = Vec::with_capacity(lanes.len() + 1);
+    let mut end = 0u32;
+    for (lane, row) in lanes.iter().enumerate() {
+        begins.push(end);
+        end += replays.get(lane).copied().unwrap_or(0) + row.rows;
+    }
+    begins.push(end);
+    if ext > 0 {
+        staged.own = vec![-1; rows as usize];
+        staged.replay = vec![-1; ext as usize];
+        for (lane, row) in lanes.iter().enumerate() {
+            let replay = replays.get(lane).copied().unwrap_or(0);
+            for r in 0..row.rows {
+                staged.own[(row.row_offset + r) as usize] =
+                    narrow(u64::from(begins[lane] + replay + r));
+            }
+            let Some(RsMove::Scatter { pages, .. }) = moves.get(lane) else {
+                continue;
+            };
+            let mut at = begins[lane] as usize;
+            for span in reads.get(lane).map_or(&[][..], Vec::as_slice) {
+                for token in span.clone() {
+                    staged.replay[at] = buffers.token(pages, token)?;
+                    at += 1;
+                }
+            }
+        }
+        let slots = windows.slots();
+        let stride = slots.stride() as usize;
+        for (slot, window) in windows.all().iter().enumerate() {
+            let span = window.span();
+            let lo = (span.lane_offset as usize).min(lanes.len());
+            let hi = (lo + span.lanes as usize).min(lanes.len());
+            let mut csr: Vec<i32> = begins[lo..=hi]
+                .iter()
+                .map(|&at| narrow(u64::from(at)))
+                .collect();
+            let last = csr.last().copied().unwrap_or(0);
+            csr.resize(stride.max(csr.len()), last);
+            staged.csr.push((slots.at(slot), csr));
+        }
+        staged.live = vec![0; windows.live().len()];
+        for (region, run, at) in windows.seats() {
+            let span = windows.at(region, run).span();
+            let hi = ((span.lane_offset + span.lanes) as usize).min(lanes.len());
+            let at = at as usize;
+            if let Some(words) = staged.live.get_mut(at..at + 4) {
+                words.copy_from_slice(&[begins[hi], 0, span.lanes, span.lane_offset]);
+            }
+        }
+    }
+    let bits = record::RsShape::pack(windows.all().iter().map(|window| {
+        let span = window.span();
+        let held = span.lane_offset as usize..(span.lane_offset + span.lanes) as usize;
+        let extended = ext > 0
+            && reads
+                .get(held.clone())
+                .is_some_and(|reads| reads.iter().any(|reads| !reads.is_empty()));
+        let whole = moves
+            .get(held)
+            .is_some_and(|moves| moves.iter().all(|verb| *verb == RsMove::None));
+        (extended, whole)
+    }));
+    Ok((bits, staged))
+}
+
 fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
 }
@@ -1674,7 +1814,6 @@ fn readout_extent(rows: u32, bucket: u32, readouts: usize) -> u64 {
 }
 
 impl Shell {
-    
     fn group_masks_of(
         &self,
         lanes: &[super::lanes::Seated<'_>],

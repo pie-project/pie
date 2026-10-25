@@ -866,6 +866,20 @@ impl Shell {
             &schedule_streams(&boot.trace, &compiled),
         )?;
 
+        // The tables a buffered fire's recurrent ops read its movement from,
+        // where every fire stages them.
+        let rs_tables = buffers
+            .as_ref()
+            .map(|buffers| {
+                crate::store::rs::RsTables::reserve(
+                    boot.budget.max_tokens,
+                    buffers.ext_reach(boot.budget.max_tokens),
+                    inputs.window_slots().tail(),
+                    inputs.live_words(),
+                )
+            })
+            .transpose()?;
+
         let exports = Exports::of(&boot.trace, &compiled)?;
 
         let score_heads = score_heads(&boot.trace, &exports);
@@ -921,6 +935,7 @@ impl Shell {
             arena,
             pools,
             buffers,
+            rs_tables,
             predicate,
             inputs,
             facts,

@@ -469,7 +469,49 @@ impl Buffers {
         })
     }
 
-    pub fn row(&self, plane: Plane, page_slot: u32, row: u32) -> Result<u64> {
+    /// `plane` as the table-driven copies read it: every layer's planes of a
+    /// page slot behind one another, `per_page` elements a layer.
+    #[must_use]
+    pub fn paged(&self, plane: Plane) -> kernels_cuda::gather::PagedPlane {
+        kernels_cuda::gather::PagedPlane {
+            base: self.arena.base(),
+            per_slot: self.per_page * u64::from(self.layers),
+            at: u64::from(plane.layer) * self.per_page + plane.at,
+            width: u32::try_from(plane.width).unwrap_or(u32::MAX),
+            page_tokens: self.page_tokens,
+            dtype: PLANE_DTYPE,
+        }
+    }
+
+    /// Buffered token `token` of a lane whose buffer is `pages`, as the
+    /// table-driven copies name it: its page slot times the page's tokens,
+    /// plus its token within the page. The slot is backed before the fire.
+    pub fn token(&self, pages: &[u32], token: u32) -> Result<i32> {
+        let page = token / self.page_tokens;
+        let in_page = token % self.page_tokens;
+        let slot = *pages.get(page as usize).ok_or(Fault::Ceiling {
+            what: "rs buffer pages",
+            need: u64::from(page) + 1,
+            have: pages.len() as u64,
+        })?;
+        self.backed(slot, in_page)?;
+        let named = u64::from(slot) * u64::from(self.page_tokens) + u64::from(in_page);
+        i32::try_from(named).map_err(|_| Fault::Ceiling {
+            what: "rs buffer tokens an i32 names",
+            need: named,
+            have: i32::MAX as u64,
+        })
+    }
+
+    /// The most rows an extended run takes: a fire's rows beside every page
+    /// slot replayed once.
+    #[must_use]
+    pub fn ext_reach(&self, max_rows: u32) -> u32 {
+        max_rows.saturating_add(self.slots.saturating_mul(self.page_tokens))
+    }
+
+    /// Whether token `row` of page slot `page_slot` is one this pool backs.
+    fn backed(&self, page_slot: u32, row: u32) -> Result<()> {
         if page_slot >= self.slots {
             return Err(Fault::Ceiling {
                 what: "rs buffer page slots",
@@ -491,9 +533,7 @@ impl Buffers {
                 have: u64::from(self.committed_pages),
             });
         }
-        let block = (u64::from(page_slot) * u64::from(self.layers) + u64::from(plane.layer))
-            * self.per_page;
-        Ok(self.arena.base() + (block + plane.at + u64::from(row) * plane.width) * ELEMENT)
+        Ok(())
     }
 }
 
@@ -758,6 +798,168 @@ impl Predicate {
         let mut out = vec![0u8; lanes as usize];
         self.region.read_on(stream, self.at_mask, &mut out)?;
         Ok(out)
+    }
+}
+
+/// A buffered fire's movement, as the tables its recurrent ops read in
+/// place of host-looped copies; every entry an `i32`.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RsStaged {
+    /// The fire rows the per-row tables span: the rows the fire carves, so
+    /// every fire of one body key lays its tables alike.
+    pub rows: u32,
+    /// The extended run's rows ([`crate::record::RsShape::ext`]); 0 when no
+    /// lane replays.
+    pub ext: u32,
+    /// Each fire row's buffered token ([`Buffers::token`]), -1 for a row of
+    /// a lane that folds.
+    pub scatter: Vec<i32>,
+    /// Each fire row's row of the extended run, -1 past the live rows;
+    /// empty when no lane replays.
+    pub own: Vec<i32>,
+    /// Each extended row's buffered token, -1 for a lane's own row (or one
+    /// past the last lane's).
+    pub replay: Vec<i32>,
+    /// Each window's lane boundaries in the extended run, at the word its
+    /// own boundaries stand at among the windows' slots (`Slots::at`).
+    pub csr: Vec<(u64, Vec<i32>)>,
+    /// Each window seat's stage word over the extended run (its rows to its
+    /// last lane's end, no row offset, its lanes and lane offset), laid as
+    /// `Windows::live` lays the seats' words over the fire's rows.
+    pub live: Vec<u32>,
+}
+
+/// Where a fire's [`RsTables`] stand on the device.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RsTableSeat {
+    pub scatter: u64,
+    pub own: u64,
+    pub replay: u64,
+    pub csr: u64,
+    pub live: u64,
+}
+
+/// The device region every buffered fire stages its [`RsStaged`] into, in
+/// one copy: the seats' stage words and the windows' boundaries at fixed
+/// words, then the per-row tables at offsets set by the fire's carved rows
+/// and extended rows alone, both of which its body key holds. Two fires of
+/// one key therefore read their tables where the body recorded them.
+#[derive(Debug)]
+pub struct RsTables {
+    region: Buffer,
+    live_words: u64,
+    csr_words: u64,
+    max_rows: u64,
+    max_ext: u64,
+}
+
+impl RsTables {
+    /// Tables for fires of up to `max_rows` rows and `max_ext` extended
+    /// rows, over windows whose slots take `csr_words` words and whose
+    /// seats' stage words take `live_words`.
+    pub fn reserve(
+        max_rows: u32,
+        max_ext: u32,
+        csr_words: u64,
+        live_words: u64,
+    ) -> Result<RsTables> {
+        let (max_rows, max_ext) = (u64::from(max_rows), u64::from(max_ext));
+        let words = live_words + csr_words + 2 * max_rows + max_ext + 16;
+        Ok(RsTables {
+            region: Buffer::zeroed(usize::try_from(words * 4).unwrap_or(usize::MAX))?,
+            live_words,
+            csr_words,
+            max_rows,
+            max_ext,
+        })
+    }
+
+    #[must_use]
+    pub fn bytes(&self) -> u64 {
+        self.region.bytes() as u64
+    }
+
+    /// The word offsets of `fire`'s sections: live, csr, scatter, own, replay.
+    fn layout(&self, rows: u64) -> [u64; 5] {
+        let live = 0;
+        let csr = self.live_words;
+        let scatter = csr + self.csr_words;
+        let own = scatter + rows.next_multiple_of(4);
+        let replay = own + rows.next_multiple_of(4);
+        [live, csr, scatter, own, replay]
+    }
+
+    /// Stages `fire`'s tables, one host-to-device copy behind the fires
+    /// before it on `stream`.
+    pub fn stage(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        fire: &RsStaged,
+    ) -> Result<RsTableSeat> {
+        let rows = u64::from(fire.rows);
+        let ext = u64::from(fire.ext);
+        for (what, need, have) in [
+            ("rs buffered fire rows", rows, self.max_rows),
+            ("rs extended rows", ext, self.max_ext),
+            (
+                "rs window seat words",
+                fire.live.len() as u64,
+                self.live_words,
+            ),
+            (
+                "rs fire rows the scatter names",
+                fire.scatter.len() as u64,
+                rows,
+            ),
+            (
+                "rs fire rows the own map names",
+                fire.own.len() as u64,
+                rows,
+            ),
+            (
+                "rs extended rows the replay names",
+                fire.replay.len() as u64,
+                ext,
+            ),
+        ] {
+            if need > have {
+                return Err(Fault::Ceiling { what, need, have });
+            }
+        }
+        let [live, csr, scatter, own, replay] = self.layout(rows);
+        let mut image = vec![0i32; usize::try_from(replay + ext).unwrap_or(usize::MAX)];
+        for (at, word) in fire.live.iter().enumerate() {
+            image[live as usize + at] = *word as i32;
+        }
+        for (at, bounds) in &fire.csr {
+            if at + bounds.len() as u64 > self.csr_words {
+                return Err(Fault::Ceiling {
+                    what: "rs extended window boundary words",
+                    need: at + bounds.len() as u64,
+                    have: self.csr_words,
+                });
+            }
+            let from = (csr + at) as usize;
+            image[from..from + bounds.len()].copy_from_slice(bounds);
+        }
+        for (from, values) in [
+            (scatter, &fire.scatter),
+            (own, &fire.own),
+            (replay, &fire.replay),
+        ] {
+            let from = from as usize;
+            image[from..from + values.len()].copy_from_slice(values);
+        }
+        let bytes: Vec<u8> = image.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.region.stage(stream, 0, &bytes)?;
+        let base = self.region.ptr();
+        Ok(RsTableSeat {
+            scatter: base + scatter * 4,
+            own: base + own * 4,
+            replay: base + replay * 4,
+            csr: base + csr * 4,
+            live: base + live * 4,
+        })
     }
 }
 

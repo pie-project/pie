@@ -28,6 +28,10 @@ pub struct Fire<'a> {
     pub ceilings: Ceilings<'a>,
     /// [`BodyKey::islands`] as prepared for this fire.
     pub islands: &'a [u8],
+    /// [`BodyKey::rs`] as prepared for this fire.
+    pub rs: Option<&'a RsShape>,
+    /// A synthetic fire of the arming pass, whose effects nothing reads.
+    pub arming: bool,
 }
 #[derive(Default)]
 pub struct Bodies {
@@ -88,8 +92,8 @@ impl Bodies {
         self.recorder.at_step(seq);
     }
 
-    pub fn eager_walk(&mut self, rotating: bool, buffered: bool) {
-        self.recorder.eager_walk(rotating, buffered);
+    pub fn eager_walk(&mut self, rotating: bool) {
+        self.recorder.eager_walk(rotating);
     }
 
     pub fn eager_copy_world(&mut self) {
@@ -115,12 +119,9 @@ impl Recorder {
         self.at_seq = seq;
     }
 
-    pub fn eager_walk(&mut self, rotating: bool, buffered: bool) {
+    pub fn eager_walk(&mut self, rotating: bool) {
         if rotating {
             self.bstats.eager_rotating += 1;
-        }
-        if buffered {
-            self.bstats.eager_buffered += 1;
         }
     }
 
@@ -376,6 +377,71 @@ pub struct BodyKey {
     /// a whole one at the same bucket and classes, and a body is only
     /// replayable for the admissibility it was recorded under.
     pub islands: Box<[u8]>,
+    /// How a fire that buffers recurrent state moves it ([`RsShape`]);
+    /// `None` for a fire whose lanes all fold.
+    pub rs: Option<RsShape>,
+}
+
+/// What a fire that buffers recurrent state bakes into its launches beyond
+/// its rows and classes: the extended run's rows, whether the state is
+/// written, whether the fold predicate and the commit lengths are bound,
+/// and, per window, whether it runs the extended recurrence and whether
+/// none of its lanes buffers. Every row, page and count the movement reads
+/// is a table staged before the fire (`store::rs::RsTables`), so the fires
+/// of one shape replay one body.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RsShape {
+    /// Rows of the extended run: the least rung of the row ladder holding
+    /// every lane's replayed and own rows; 0 when no lane replays.
+    pub ext: u32,
+    pub write_state: bool,
+    pub predicated: bool,
+    pub truncates: bool,
+    /// Two bits a window slot: it runs the extended recurrence
+    /// (`Run::rs_extended`), and none of its lanes buffers
+    /// (`Run::rs_window_folds_whole`).
+    pub windows: Box<[u8]>,
+}
+
+impl RsShape {
+    /// The two bits of each window slot, in slot order.
+    #[must_use]
+    pub fn pack(windows: impl Iterator<Item = (bool, bool)>) -> Box<[u8]> {
+        let mut bits: Vec<u8> = Vec::new();
+        for (at, (extended, whole)) in windows.enumerate() {
+            let bit = 2 * at;
+            if bits.len() <= bit / 8 {
+                bits.resize(bit / 8 + 1, 0);
+            }
+            bits[bit / 8] |= (u8::from(extended) | (u8::from(whole) << 1)) << (bit % 8);
+        }
+        while bits.last() == Some(&0) {
+            bits.pop();
+        }
+        bits.into()
+    }
+}
+
+impl core::fmt::Display for RsShape {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "~rs{}", self.ext)?;
+        for (on, name) in [
+            (self.write_state, 'w'),
+            (self.predicated, 'p'),
+            (self.truncates, 't'),
+        ] {
+            if on {
+                write!(f, "{name}")?;
+            }
+        }
+        if !self.windows.is_empty() {
+            f.write_str(":")?;
+            for byte in self.windows.iter().rev() {
+                write!(f, "{byte:02x}")?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl BodyKey {
@@ -393,6 +459,7 @@ impl BodyKey {
             classes: Ladder::of(classes, bucket, decoding, lane_ceiling, tiers),
             patch: None,
             islands: Box::default(),
+            rs: None,
         }
     }
 
@@ -410,6 +477,7 @@ impl BodyKey {
             classes: Ladder::of(classes, bucket, decoding, lane_ceiling, tiers),
             patch: patch.map(|(classes, bucket)| AxisKey::of(classes, bucket)),
             islands: Box::default(),
+            rs: None,
         }
     }
 
@@ -547,6 +615,9 @@ impl core::fmt::Display for BodyKey {
             for byte in self.islands.iter().rev() {
                 write!(f, "{byte:02x}")?;
             }
+        }
+        if let Some(rs) = &self.rs {
+            write!(f, "{rs}")?;
         }
         Ok(())
     }
@@ -705,7 +776,6 @@ pub struct BodyTally {
     pub sealed_declines: u64,
     pub sealed_short: u64,
     pub eager_rotating: u64,
-    pub eager_buffered: u64,
     pub eager_copy_world: u64,
 }
 
@@ -740,7 +810,7 @@ impl core::fmt::Display for BodyStats {
             f,
             "[body-stats] hits={} misses={} reshapes={} captures={} \
              declines={} refusals={} evictions={} armed_at_load={} \
-             sealed_declines={} sealed_short={} eager_rotating={} eager_buffered={} \
+             sealed_declines={} sealed_short={} eager_rotating={} \
              eager_copy_world={} | last-capture: nodes={} edges={} islands={} \
              | resident: bodies={} segmented={} bytes={}",
             tally.hits,
@@ -754,7 +824,6 @@ impl core::fmt::Display for BodyStats {
             tally.sealed_declines,
             tally.sealed_short,
             tally.eager_rotating,
-            tally.eager_buffered,
             tally.eager_copy_world,
             last.nodes,
             last.edges,
@@ -810,6 +879,13 @@ impl Bodies {
         self.map.seal();
     }
 
+    /// Drops every body whose extended recurrent run reads the scratch: it
+    /// moved. The caller drained the device, so none of them is airborne.
+    pub fn forget_extended(&mut self) {
+        self.map
+            .forget(|key| key.rs.as_ref().is_some_and(|rs| rs.ext > 0));
+    }
+
     #[must_use]
     pub fn body_refused(&self, key: &BodyKey) -> bool {
         self.map.refused(key)
@@ -846,6 +922,7 @@ impl Bodies {
             )),
         );
         key.islands = at.islands.into();
+        key.rs = at.rs.cloned();
 
         crate::serve::btrace::mark("key");
         let at_seq = self.recorder.at_seq;
@@ -929,7 +1006,10 @@ impl Bodies {
         // opens a conditional node.
         walk_capture(at, run, place, Streams::Warm)?;
 
-        if self.sealed_decline() {
+        // A buffered fire's shape follows the speculation its program runs,
+        // which no arming lattice enumerates: its body captures when it
+        // first fires, sealed or not, after the same warm fires.
+        if at.rs.is_none() && self.sealed_decline() {
             let declines = self.recorder.bstats.sealed_declines;
             if reports_decline(&mut self.recorder.sealed_seen, &key, declines) {
                 let why = if !self.map.bodies.contains_key(&key) {
@@ -1091,7 +1171,15 @@ impl Bodies {
                 pinned: false,
             },
         );
-        if seated && let Some(body) = self.map.bodies.get_mut(&key) {
+        // The warm walk above ran this fire. A synthetic fire of the arming
+        // pass launches its new body as well, so the load leaves every body
+        // launched once; a served fire must not run twice — it would fold a
+        // lane's recurrent state and push its epilogue's channels again —
+        // and the body serves its next fire.
+        if at.arming
+            && seated
+            && let Some(body) = self.map.bodies.get_mut(&key)
+        {
             for step in body.script.iter() {
                 match step {
                     Step::Exec { exec, .. } => exec.launch(at.stream)?,
@@ -1166,6 +1254,12 @@ impl BodyMap {
 
     fn seal(&mut self) {
         self.sealed = true;
+    }
+
+    fn forget(&mut self, drop: impl Fn(&BodyKey) -> bool) {
+        self.bodies.retain(|key, _| !drop(key));
+        self.body_order.retain(|key| !drop(key));
+        self.body_warm.retain(|key, _| !drop(key));
     }
 
     fn pin(&mut self, key: &BodyKey) -> bool {
@@ -1456,6 +1550,7 @@ mod tests {
             classes: Ladder::single(0, Ladder::rung(0, 8, &decoding, LANES)),
             patch: None,
             islands: Box::default(),
+            rs: None,
         };
         assert_eq!(armed, fired, "the armed key must be the fired key");
     }
@@ -1466,6 +1561,7 @@ mod tests {
             classes: Ladder::single(0, bucket),
             patch: None,
             islands: Box::default(),
+            rs: None,
         }
     }
 

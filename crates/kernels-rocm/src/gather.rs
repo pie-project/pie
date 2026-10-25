@@ -19,7 +19,8 @@ pub use fold::{merge_rows, pool_rows};
 pub use ngram::{ngram_ids, ngram_ids_chunked};
 pub use pixels::{grid_taps, pixels};
 pub use rows::{
-    embed, embed_scale_add, embed_scale_add_select, embed_vocab_shard, gather_rows, pack_rows,
-    scatter_rows, select, split_q_gate, split_qkv, split_qkv_padded, split_rows, unpack_rows,
+    PagedPlane, embed, embed_scale_add, embed_scale_add_select, embed_vocab_shard,
+    gather_live_rows, gather_rows, pack_rows, page_gather_rows, page_scatter_rows, scatter_rows,
+    select, split_q_gate, split_qkv, split_qkv_padded, split_rows, unpack_rows,
 };
 pub use scatter_live::scatter_live_rows;

@@ -149,28 +149,36 @@ pub(crate) fn replayed(reads: &[std::ops::Range<u32>]) -> u32 {
     reads.iter().map(|span| span.end - span.start).sum()
 }
 
+/// The extended recurrent run's scratch: a layer's extended operands, taken
+/// in the walk's order at `ext` rows each, so every fire of one
+/// [`crate::record::RsShape`] lands them where its body reads them.
 #[derive(Debug)]
 pub struct RsScratch {
     ptr: u64,
     bytes: u64,
+    ext: u32,
     cursor: Cell<u64>,
-    ext: std::cell::RefCell<std::collections::HashMap<u32, Tensor>>,
+    ext_of: std::cell::RefCell<std::collections::HashMap<u32, Tensor>>,
 }
 
 impl RsScratch {
     #[must_use]
-    pub fn new(ptr: u64, bytes: u64) -> Self {
+    pub fn new(ptr: u64, bytes: u64, ext: u32) -> Self {
         Self {
             ptr,
             bytes,
+            ext,
             cursor: Cell::new(0),
-            ext: std::cell::RefCell::new(std::collections::HashMap::new()),
+            ext_of: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
+    /// The bytes an extended run of `ext` rows takes: a row of every
+    /// operand of the widest recurrence, each operand's rectangle rounded
+    /// to the 256-byte line it is taken at.
     #[must_use]
-    pub fn need(rows_ext: u32, ext_row_bytes: u64) -> u64 {
-        u64::from(rows_ext.max(1)) * ext_row_bytes + 8 * 256 + 64 * 1024
+    pub fn need(ext: u32, ext_row_bytes: u64) -> u64 {
+        u64::from(ext.max(1)) * ext_row_bytes + 8 * 256
     }
 
     fn take(&self, bytes: u64) -> crate::error::Result<u64> {
@@ -189,7 +197,7 @@ impl RsScratch {
 
     fn reset(&self) {
         self.cursor.set(0);
-        self.ext.borrow_mut().clear();
+        self.ext_of.borrow_mut().clear();
     }
 }
 
@@ -199,106 +207,8 @@ pub struct RsSeat<'a> {
     pub lanes: &'a [RsMove<'a>],
     pub reads: &'a [Vec<std::ops::Range<u32>>],
     pub scratch: Option<&'a RsScratch>,
-}
-
-impl RsSeat<'_> {
-    fn scatter(
-        &self,
-        stream: *mut core::ffi::c_void,
-        plane: crate::store::rs::Plane,
-        lane_offset: u32,
-        bounds: &[i32],
-        rows: Tensor,
-    ) -> crate::error::Result<()> {
-        let page_tokens = self.buffers.page_tokens();
-        let elem = poem_compiler::arena::elem_bytes(crate::store::rs::PLANE_DTYPE)
-            .expect("the buffered planes are bf16, which has an element size");
-        if u64::from(rows.width) != plane.width {
-            return Err(crate::error::Fault::Unbound {
-                what: format!(
-                    "a buffered plane reserved at {} elements a token is bound {} wide this \
-                     fire",
-                    plane.width, rows.width
-                ),
-            });
-        }
-        for (at, pair) in bounds.windows(2).enumerate() {
-            let Some(&RsMove::Scatter {
-                pages, at: from, ..
-            }) = self.lanes.get(lane_offset as usize + at)
-            else {
-                continue;
-            };
-            let count = (pair[1] - pair[0]) as u32;
-            if count == 0 {
-                continue;
-            }
-            let capacity = pages.len() as u64 * u64::from(page_tokens);
-            if u64::from(from) + u64::from(count) > capacity {
-                return Err(crate::error::Fault::Ceiling {
-                    what: "rs buffer tokens",
-                    need: u64::from(from) + u64::from(count),
-                    have: capacity,
-                });
-            }
-            let mut done = 0u32;
-            while done < count {
-                let token = from + done;
-                let page = token / page_tokens;
-                let in_page = token % page_tokens;
-                let take = (page_tokens - in_page).min(count - done);
-                let page_slot = *pages
-                    .get(page as usize)
-                    .ok_or(crate::error::Fault::Ceiling {
-                        what: "rs buffer pages",
-                        need: u64::from(page) + 1,
-                        have: pages.len() as u64,
-                    })?;
-                let slab = self.buffers.row(plane, page_slot, in_page)?;
-                let rows_at =
-                    rows.ptr + (u64::from(pair[0] as u32) + u64::from(done)) * plane.width * elem;
-                let bytes =
-                    usize::try_from(u64::from(take) * plane.width * elem).unwrap_or(usize::MAX);
-                crate::device::copy_d2d(stream, slab, rows_at, bytes)?;
-                done += take;
-            }
-        }
-        Ok(())
-    }
-
-    fn pages_to_rows(
-        &self,
-        stream: *mut core::ffi::c_void,
-        plane: crate::store::rs::Plane,
-        pages: &[u32],
-        from: u32,
-        count: u32,
-        dst: u64,
-    ) -> crate::error::Result<()> {
-        let page_tokens = self.buffers.page_tokens();
-        let elem = poem_compiler::arena::elem_bytes(crate::store::rs::PLANE_DTYPE)
-            .expect("the buffered planes are bf16, which has an element size");
-        let row_bytes = plane.width * elem;
-        let mut done = 0u32;
-        while done < count {
-            let token = from + done;
-            let page = token / page_tokens;
-            let in_page = token % page_tokens;
-            let take = (page_tokens - in_page).min(count - done);
-            let page_slot = *pages
-                .get(page as usize)
-                .ok_or(crate::error::Fault::Ceiling {
-                    what: "rs buffer pages",
-                    need: u64::from(page) + 1,
-                    have: pages.len() as u64,
-                })?;
-            let slab = self.buffers.row(plane, page_slot, in_page)?;
-            let bytes = usize::try_from(u64::from(take) * row_bytes).unwrap_or(usize::MAX);
-            crate::device::copy_d2d(stream, dst + u64::from(done) * row_bytes, slab, bytes)?;
-            done += take;
-        }
-        Ok(())
-    }
+    /// Where the fire's movement tables stand (`store::rs::RsTables`).
+    pub tables: crate::store::rs::RsTableSeat,
 }
 
 #[derive(Clone, Debug)]
@@ -328,7 +238,7 @@ pub struct FireBindings {
     pub lane_of_row: Tensor,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
-    
+
     pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
     pub inputs: Vec<InputBinding>,
 
@@ -896,6 +806,45 @@ impl<'c> Run<'c> {
         self
     }
 
+    fn rs_fault(op: &'static str, fault: crate::error::Fault) -> kernels_cuda::Error {
+        kernels_cuda::Error::Backend {
+            op,
+            detail: fault.to_string(),
+        }
+    }
+
+    /// A per-fire-row table at `at` (`RsTables`), as this window's row ops
+    /// read it beside their rows: whole where they find their rows through
+    /// the stage word, from the window's first row where their rows start
+    /// there.
+    fn rs_rows_table(&self, at: u64, rows: u32) -> Tensor {
+        let skip = if self.plane_base() {
+            0
+        } else {
+            u64::from(self.window().span().row_offset)
+        };
+        Tensor::new(at + skip * 4, rows, 1, poem_ir::Dtype::I32)
+    }
+
+    fn rs_plane_width(
+        op: &'static str,
+        plane: crate::store::rs::Plane,
+        width: u32,
+    ) -> Result<(), kernels_cuda::Error> {
+        if plane.width == u64::from(width) {
+            return Ok(());
+        }
+        Err(kernels_cuda::Error::Backend {
+            op,
+            detail: format!(
+                "a buffered plane reserved at {} elements a token is bound {width} wide this fire",
+                plane.width
+            ),
+        })
+    }
+
+    /// Lands this window's rows of buffered plane `id` in the pages their
+    /// lanes buffer them in, through the fire's token table.
     pub(crate) fn rs_move(
         &self,
         op: &'static str,
@@ -908,14 +857,13 @@ impl<'c> Run<'c> {
         let Some(plane) = seat.buffers.planes().of(id) else {
             return Ok(());
         };
-        let span = self.window().span();
-        let bounds = self.qo_indptr_host();
-        let rows = self.windowed(rows);
-        seat.scatter(self.ctx.stream(), plane, span.lane_offset, bounds, rows)
-            .map_err(|fault| kernels_cuda::Error::Backend {
-                op,
-                detail: fault.to_string(),
-            })
+        // A window none of whose lanes buffers has no row to move.
+        if self.rs_window_folds_whole() {
+            return Ok(());
+        }
+        Self::rs_plane_width(op, plane, rows.width)?;
+        let tokens = self.rs_rows_table(seat.tables.scatter, rows.rows);
+        kernels_cuda::gather::page_scatter_rows(self.ctx(), rows, tokens, seat.buffers.paged(plane))
     }
 
     pub(crate) fn rs_extended(&self) -> bool {
@@ -938,7 +886,7 @@ impl<'c> Run<'c> {
     /// buffers, so a commit length the fire carries for another class's
     /// lanes says nothing about these, and a one-token arm (which has no
     /// seat for one) can run them.
-    fn rs_window_folds_whole(&self) -> bool {
+    pub(crate) fn rs_window_folds_whole(&self) -> bool {
         let Some(seat) = self.rs.as_ref() else {
             return false;
         };
@@ -949,30 +897,6 @@ impl<'c> Run<'c> {
             .skip(lane0)
             .take(lanes)
             .all(|lane| *lane == RsMove::None)
-    }
-
-    fn rs_ext_layout(&self, seat: &RsSeat<'_>) -> (Vec<(u32, u32, u32)>, Vec<i32>) {
-        let lane0 = self.window().span().lane_offset as usize;
-        let bounds = self.qo_indptr_host();
-        let mut lanes = Vec::with_capacity(bounds.len().saturating_sub(1));
-        let mut csr = Vec::with_capacity(bounds.len());
-        let mut begin = 0u32;
-        csr.push(0i32);
-        for (r, pair) in bounds.windows(2).enumerate() {
-            let rows = (pair[1] - pair[0]).max(0) as u32;
-            let replay = seat.reads.get(lane0 + r).map_or(0, |reads| replayed(reads));
-            lanes.push((begin, replay, rows));
-            begin += replay + rows;
-            csr.push(i32::try_from(begin).unwrap_or(i32::MAX));
-        }
-        (lanes, csr)
-    }
-
-    fn rs_fault(op: &'static str, fault: crate::error::Fault) -> kernels_cuda::Error {
-        kernels_cuda::Error::Backend {
-            op,
-            detail: fault.to_string(),
-        }
     }
 
     fn rs_seat_and_scratch(
@@ -994,96 +918,92 @@ impl<'c> Run<'c> {
         Ok((seat, scratch))
     }
 
-    pub(crate) fn rs_ext_csr(&self, op: &'static str) -> Result<Tensor, kernels_cuda::Error> {
-        let (seat, scratch) = self.rs_seat_and_scratch(op)?;
-        let (_, csr) = self.rs_ext_layout(seat);
-        let bytes: Vec<u8> = csr.iter().flat_map(|n| n.to_le_bytes()).collect();
-        let at = scratch
-            .take(bytes.len() as u64)
-            .map_err(|f| Self::rs_fault(op, f))?;
-        crate::device::stage_raw(self.ctx.stream(), at, &bytes)
-            .map_err(|f| Self::rs_fault(op, f))?;
-        Ok(Tensor::new(at, csr.len() as u32, 1, poem_ir::Dtype::I32))
+    /// The context an op over the extended run launches on: where the
+    /// window reads a stage word, it reads the run's (`RsStaged::live`),
+    /// which bounds the run's rows at this window's last lane's end and
+    /// finds its lanes as the window's own word does.
+    pub(crate) fn rs_ctx(&self) -> &'c Ctx {
+        let ctx = self.ctx();
+        if self.live_at() != 0
+            && let Some(seat) = self.rs.as_ref()
+            && let Some(at) = self
+                .windows
+                .seat_bytes(self.place.region.get(), self.place.run.get())
+        {
+            ctx.arm_stage(seat.tables.live + at);
+        }
+        ctx
     }
 
+    /// This window's lane boundaries in the extended run, at its slot.
+    pub(crate) fn rs_ext_csr(&self, op: &'static str) -> Result<Tensor, kernels_cuda::Error> {
+        let (seat, _) = self.rs_seat_and_scratch(op)?;
+        let slot = self
+            .windows
+            .slot_of(self.place.region.get(), self.place.run.get())
+            .ok_or_else(|| kernels_cuda::Error::Backend {
+                op,
+                detail: "the extended recurrent run of a window the fire did not cut".to_string(),
+            })?;
+        let indptr = self.ragged_indptr();
+        Ok(Tensor::new(
+            seat.tables.csr + self.windows.slots().at(slot) * 4,
+            indptr.rows,
+            1,
+            poem_ir::Dtype::I32,
+        ))
+    }
+
+    fn rs_ext_tensor(
+        op: &'static str,
+        scratch: &RsScratch,
+        like: Tensor,
+    ) -> Result<Tensor, kernels_cuda::Error> {
+        let elem = poem_compiler::arena::elem_bytes(like.dtype).ok_or_else(|| {
+            kernels_cuda::Error::Backend {
+                op,
+                detail: format!("{:?} has no element size", like.dtype),
+            }
+        })?;
+        let at = scratch
+            .take(u64::from(scratch.ext) * u64::from(like.width) * elem)
+            .map_err(|f| Self::rs_fault(op, f))?;
+        Ok(Tensor::new(at, scratch.ext, like.width, like.dtype))
+    }
+
+    /// Buffered plane `id` over the extended run: each lane's replayed
+    /// tokens out of their pages, then its own rows, which land in their
+    /// pages first.
     pub(crate) fn rs_extend(
         &self,
         op: &'static str,
         id: ValueId,
-        buffered: bool,
     ) -> Result<Tensor, kernels_cuda::Error> {
         let (seat, scratch) = self.rs_seat_and_scratch(op)?;
         let own = self.tensor(id);
         self.rs_move(op, id, own)?;
-        let own = self.windowed(own);
-        let plane = seat.buffers.planes().of(id);
-        if buffered && plane.is_none() {
-            return Err(kernels_cuda::Error::Backend {
+        let plane = seat
+            .buffers
+            .planes()
+            .of(id)
+            .ok_or_else(|| kernels_cuda::Error::Backend {
                 op,
                 detail: format!(
                     "value {} is no plane this load buffers, so a lane's replay has nowhere to \
-                     read its tokens from; the read path serves the chunked recurrence's class",
+                 read its tokens from; the read path serves the chunked recurrence's class",
                     id.0
                 ),
-            });
-        }
-        let (lanes, csr) = self.rs_ext_layout(seat);
-        let rows_ext = u32::try_from(csr.last().copied().unwrap_or(0)).unwrap_or(0);
-        let elem = poem_compiler::arena::elem_bytes(own.dtype).ok_or_else(|| {
-            kernels_cuda::Error::Backend {
-                op,
-                detail: format!("{:?} has no element size", own.dtype),
-            }
-        })?;
-        let row_bytes = u64::from(own.width) * elem;
-        let at = scratch
-            .take(u64::from(rows_ext) * row_bytes)
-            .map_err(|f| Self::rs_fault(op, f))?;
-        let ext = Tensor::new(at, rows_ext, own.width, own.dtype);
-        let lane0 = self.window().span().lane_offset as usize;
-        let bounds = self.qo_indptr_host();
-        let stream = self.ctx.stream();
-        for (r, &(begin, replay, rows)) in lanes.iter().enumerate() {
-            if replay > 0
-                && let Some(plane) = plane
-                && let Some(RsMove::Scatter { pages, .. }) = seat.lanes.get(lane0 + r)
-            {
-                if plane.width != u64::from(own.width) {
-                    return Err(kernels_cuda::Error::Backend {
-                        op,
-                        detail: format!(
-                            "a buffered plane reserved at {} elements a token is bound {} wide this fire",
-                            plane.width, own.width
-                        ),
-                    });
-                }
-                let mut done = 0u32;
-                for span in seat.reads.get(lane0 + r).map_or(&[][..], Vec::as_slice) {
-                    let count = span.end - span.start;
-                    seat.pages_to_rows(
-                        stream,
-                        plane,
-                        pages,
-                        span.start,
-                        count,
-                        at + u64::from(begin + done) * row_bytes,
-                    )
-                    .map_err(|f| Self::rs_fault(op, f))?;
-                    done += count;
-                }
-            }
-            if rows > 0 {
-                let src = own.ptr + u64::from(bounds[r].max(0) as u32) * row_bytes;
-                let dst = at + u64::from(begin + replay) * row_bytes;
-                crate::device::copy_d2d(
-                    stream,
-                    dst,
-                    src,
-                    usize::try_from(u64::from(rows) * row_bytes).unwrap_or(usize::MAX),
-                )
-                .map_err(|f| Self::rs_fault(op, f))?;
-            }
-        }
+            })?;
+        Self::rs_plane_width(op, plane, own.width)?;
+        let mut ext = Self::rs_ext_tensor(op, scratch, own)?;
+        kernels_cuda::gather::page_gather_rows(
+            self.ctx(),
+            seat.buffers.paged(plane),
+            Tensor::new(seat.tables.replay, scratch.ext, 1, poem_ir::Dtype::I32),
+            &mut ext,
+        )?;
+        let routes = self.rs_rows_table(seat.tables.own, own.rows);
+        kernels_cuda::gather::scatter_live_rows(self.ctx(), own, routes, &mut ext)?;
         Ok(ext)
     }
 
@@ -1092,21 +1012,9 @@ impl<'c> Run<'c> {
         op: &'static str,
         id: ValueId,
     ) -> Result<Tensor, kernels_cuda::Error> {
-        let (seat, scratch) = self.rs_seat_and_scratch(op)?;
-        let own = self.windowed(self.tensor(id));
-        let (_, csr) = self.rs_ext_layout(seat);
-        let rows_ext = u32::try_from(csr.last().copied().unwrap_or(0)).unwrap_or(0);
-        let elem = poem_compiler::arena::elem_bytes(own.dtype).ok_or_else(|| {
-            kernels_cuda::Error::Backend {
-                op,
-                detail: format!("{:?} has no element size", own.dtype),
-            }
-        })?;
-        let at = scratch
-            .take(u64::from(rows_ext) * u64::from(own.width) * elem)
-            .map_err(|f| Self::rs_fault(op, f))?;
-        let ext = Tensor::new(at, rows_ext, own.width, own.dtype);
-        scratch.ext.borrow_mut().insert(id.0, ext);
+        let (_, scratch) = self.rs_seat_and_scratch(op)?;
+        let ext = Self::rs_ext_tensor(op, scratch, self.tensor(id))?;
+        scratch.ext_of.borrow_mut().insert(id.0, ext);
         Ok(ext)
     }
 
@@ -1117,7 +1025,7 @@ impl<'c> Run<'c> {
     ) -> Result<Tensor, kernels_cuda::Error> {
         let (_, scratch) = self.rs_seat_and_scratch(op)?;
         scratch
-            .ext
+            .ext_of
             .borrow()
             .get(&id.0)
             .copied()
@@ -1130,6 +1038,7 @@ impl<'c> Run<'c> {
             })
     }
 
+    /// The fire's own rows of an extended operand, back into its plane.
     pub(crate) fn rs_land(
         &self,
         op: &'static str,
@@ -1137,32 +1046,9 @@ impl<'c> Run<'c> {
         id: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         let (seat, _) = self.rs_seat_and_scratch(op)?;
-        let target = self.windowed(self.tensor(id));
-        let elem = poem_compiler::arena::elem_bytes(ext.dtype).ok_or_else(|| {
-            kernels_cuda::Error::Backend {
-                op,
-                detail: format!("{:?} has no element size", ext.dtype),
-            }
-        })?;
-        let row_bytes = u64::from(ext.width) * elem;
-        let (lanes, _) = self.rs_ext_layout(seat);
-        let bounds = self.qo_indptr_host();
-        let stream = self.ctx.stream();
-        for (r, &(begin, replay, rows)) in lanes.iter().enumerate() {
-            if rows == 0 {
-                continue;
-            }
-            let src = ext.ptr + u64::from(begin + replay) * row_bytes;
-            let dst = target.ptr + u64::from(bounds[r].max(0) as u32) * row_bytes;
-            crate::device::copy_d2d(
-                stream,
-                dst,
-                src,
-                usize::try_from(u64::from(rows) * row_bytes).unwrap_or(usize::MAX),
-            )
-            .map_err(|f| Self::rs_fault(op, f))?;
-        }
-        Ok(())
+        let mut target = self.tensor(id);
+        let routes = self.rs_rows_table(seat.tables.own, target.rows);
+        kernels_cuda::gather::gather_live_rows(self.ctx(), ext, routes, &mut target)
     }
 
     pub(crate) fn rs_layer_done(&self) {
@@ -1677,7 +1563,6 @@ impl<'c> Run<'c> {
         }
     }
 
-    
     pub(crate) fn group_mask(
         &self,
         q: poem_ir::Selection,
@@ -1865,16 +1750,20 @@ impl<'c> Run<'c> {
     }
 
     pub(crate) fn ragged_lanes(&self, id: ValueId) -> RaggedTensor {
+        RaggedTensor {
+            data: self.tensor(id),
+            indptr: self.ragged_indptr(),
+        }
+    }
+
+    /// The window's qo boundaries, as many as its carved lanes read.
+    fn ragged_indptr(&self) -> Tensor {
         let indptr = self.qo_indptr();
-        let indptr = match self.carve_lanes() {
+        match self.carve_lanes() {
             Some(lanes) if lanes + 1 > indptr.rows => {
                 Tensor::new(indptr.ptr, lanes + 1, indptr.width, indptr.dtype)
             }
             _ => indptr,
-        };
-        RaggedTensor {
-            data: self.tensor(id),
-            indptr,
         }
     }
 

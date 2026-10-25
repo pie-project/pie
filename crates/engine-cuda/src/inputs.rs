@@ -478,7 +478,6 @@ pub struct Inputs {
     outgrown: Vec<Buffer>,
 }
 
-
 #[derive(Debug, Clone, Copy)]
 pub struct GroupMaskHandles {
     pub q: poem_ir::Selection,
@@ -722,6 +721,12 @@ impl Inputs {
     #[must_use]
     pub fn window_slots(&self) -> crate::window::Slots {
         self.window_slots
+    }
+
+    /// The words the windows' seats stage their live rows in (`Windows::live`).
+    #[must_use]
+    pub fn live_words(&self) -> u64 {
+        self.live_ints
     }
 
     pub fn write_host(&self, slot: &SlotGuard, fire: &Fire<'_>) -> Result<Staged> {

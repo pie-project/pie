@@ -670,3 +670,217 @@ pub fn pack_rows(ctx: &Ctx, x: Tensor, perm: Tensor, o: &mut Tensor) -> Result<(
 pub fn unpack_rows(ctx: &Ctx, x: Tensor, perm: Tensor, o: &mut Tensor) -> Result<(), Error> {
     permute_rows(ctx, "gather.unpack_rows", "unpack_rows", x, perm, o)
 }
+
+/// `tight[row] = wide[routes[row]]` for each live row whose route is not
+/// negative, the live rows read through the stage word as every row op
+/// reads them: [`scatter_live_rows`] the other way.
+pub fn gather_live_rows(
+    ctx: &Ctx,
+    wide: Tensor,
+    routes: Tensor,
+    tight: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "gather.gather_live_rows";
+    if routes.dtype != Dtype::I32 {
+        return Err(refuse(
+            OP,
+            format!(
+                "the source rows this gather is handed are {:?}, and it reads an i32 row map",
+                routes.dtype
+            ),
+        ));
+    }
+    if routes.rows != tight.rows {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} rows to fill and {} sources named",
+                tight.rows, routes.rows
+            ),
+        ));
+    }
+    if tight.dtype != wide.dtype || tight.width != wide.width {
+        return Err(refuse(
+            OP,
+            format!(
+                "the source rectangle is {} x {:?} and the destination {} x {:?}; a row copy \
+                 does not reshape",
+                wide.width, wide.dtype, tight.width, tight.dtype
+            ),
+        ));
+    }
+    let rows = nonzero(OP, "rows to fill", tight.rows)?;
+    let bytes = row_bytes(OP, *tight)?;
+    let (unit, width) = unit(bytes, wide.ptr, tight.ptr);
+    let per_row = u32::try_from(bytes / width).unwrap_or(u32::MAX);
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            FILE,
+            &format!("::pie::layout::gather_live_rows<{unit}>"),
+        ))
+        .apply(route_rows(rows, per_row)),
+        &[
+            wide.arg(),
+            tight.arg(),
+            routes.arg(),
+            stated(OP, per_row)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// One plane of a paged buffer: token `g` of it (its page slot times
+/// `page_tokens`, plus its token within the page) is the `width`-element row
+/// `g / page_tokens * per_slot + at + g % page_tokens * width` elements past
+/// `base`, every element `dtype`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PagedPlane {
+    pub base: u64,
+    pub per_slot: u64,
+    pub at: u64,
+    pub width: u32,
+    pub page_tokens: u32,
+    pub dtype: Dtype,
+}
+
+impl PagedPlane {
+    fn checked(&self, op: &'static str, rows: Tensor) -> Result<(), Error> {
+        if rows.dtype != self.dtype {
+            return Err(refuse(
+                op,
+                format!(
+                    "the paged plane holds {:?} and the rows are {:?}",
+                    self.dtype, rows.dtype
+                ),
+            ));
+        }
+        if rows.width != self.width {
+            return Err(refuse(
+                op,
+                format!(
+                    "the paged plane holds {}-element rows and the rows are {} wide",
+                    self.width, rows.width
+                ),
+            ));
+        }
+        if self.page_tokens == 0 {
+            return Err(refuse(op, "the paged plane's pages hold no tokens"));
+        }
+        Ok(())
+    }
+
+    /// The plane in the widest copy unit every row of it and of `rows` lands
+    /// on: `(unit, units a row, per_slot, at)`, the last two in units.
+    fn in_units(
+        &self,
+        op: &'static str,
+        rows: Tensor,
+    ) -> Result<(&'static str, u32, i64, i64), Error> {
+        let elem = row_bytes(op, Tensor::new(0, 1, 1, self.dtype))?;
+        let bytes = [u64::from(self.width), self.per_slot, self.at].map(|elems| elems * elem);
+        let fits = |unit: u64| {
+            bytes.iter().all(|b| b.is_multiple_of(unit))
+                && self.base.is_multiple_of(unit)
+                && rows.ptr.is_multiple_of(unit)
+        };
+        let (name, unit) = if fits(16) {
+            ("::pie::b128", 16)
+        } else if fits(4) {
+            ("::pie::i32", 4)
+        } else {
+            ("::pie::u8", 1)
+        };
+        let units = u32::try_from(bytes[0] / unit)
+            .map_err(|_| refuse(op, "a paged row wider than a u32 of copy units"))?;
+        let int = |v: u64| {
+            i64::try_from(v / unit).map_err(|_| refuse(op, "a paged plane offset past an i64"))
+        };
+        Ok((name, units, int(bytes[1])?, int(bytes[2])?))
+    }
+}
+
+fn token_map(op: &'static str, tokens: Tensor, rows: u32) -> Result<(), Error> {
+    if tokens.dtype != Dtype::I32 {
+        return Err(refuse(
+            op,
+            format!(
+                "the paged tokens this copy is handed are {:?}, and it reads an i32 token map",
+                tokens.dtype
+            ),
+        ));
+    }
+    if tokens.rows != rows {
+        return Err(refuse(
+            op,
+            format!("{rows} rows to move and {} tokens named", tokens.rows),
+        ));
+    }
+    Ok(())
+}
+
+/// `pages[tokens[row]] = rows[row]` for each live row whose token is not
+/// negative, the live rows read through the stage word as every row op
+/// reads them.
+pub fn page_scatter_rows(
+    ctx: &Ctx,
+    rows: Tensor,
+    tokens: Tensor,
+    pages: PagedPlane,
+) -> Result<(), Error> {
+    const OP: &str = "gather.page_scatter_rows";
+    pages.checked(OP, rows)?;
+    token_map(OP, tokens, rows.rows)?;
+    let count = nonzero(OP, "rows to page", rows.rows)?;
+    let (unit, units, per_slot, at) = pages.in_units(OP, rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            FILE,
+            &format!("::pie::layout::page_scatter_rows<{unit}>"),
+        ))
+        .apply(route_rows(count, units)),
+        &[
+            rows.arg(),
+            ArgValue::Ptr(pages.base),
+            tokens.arg(),
+            stated(OP, units)?.arg(),
+            per_slot.arg(),
+            at.arg(),
+            stated(OP, pages.page_tokens)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// `rows[e] = pages[tokens[e]]` for every row whose token is not negative;
+/// the rest are left as they were.
+pub fn page_gather_rows(
+    ctx: &Ctx,
+    pages: PagedPlane,
+    tokens: Tensor,
+    rows: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "gather.page_gather_rows";
+    pages.checked(OP, *rows)?;
+    token_map(OP, tokens, rows.rows)?;
+    let count = nonzero(OP, "rows to unpage", rows.rows)?;
+    let (unit, units, per_slot, at) = pages.in_units(OP, *rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            FILE,
+            &format!("::pie::layout::page_gather_rows<{unit}>"),
+        ))
+        .apply(route_rows(count, units)),
+        &[
+            ArgValue::Ptr(pages.base),
+            rows.arg(),
+            tokens.arg(),
+            stated(OP, units)?.arg(),
+            per_slot.arg(),
+            at.arg(),
+            stated(OP, pages.page_tokens)?.arg(),
+        ],
+    )
+}

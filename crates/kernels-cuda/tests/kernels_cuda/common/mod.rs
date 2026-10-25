@@ -266,6 +266,30 @@ impl Gpu {
         }
     }
 
+    /// Overwrites the device bytes at `at` with `values`, once the stream's
+    /// work before is done.
+    pub fn put<T: Copy>(&self, at: u64, values: &[T]) {
+        let bytes = core::mem::size_of_val(values);
+        if bytes == 0 {
+            return;
+        }
+        self.sync();
+        let _legacy = legacy();
+        // SAFETY: the caller names `bytes` of live device memory at `at`,
+        // and `values` is borrowed across the synchronous copy.
+        unsafe {
+            check(
+                rt::cudaMemcpy(
+                    at as *mut c_void,
+                    values.as_ptr().cast(),
+                    bytes,
+                    rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                ),
+                "cudaMemcpy H2D",
+            );
+        }
+    }
+
     pub fn down<T: Copy + Default>(&self, at: u64, count: usize) -> Vec<T> {
         let mut out = vec![T::default(); count];
         self.bind();

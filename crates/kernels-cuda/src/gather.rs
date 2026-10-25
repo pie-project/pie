@@ -13,6 +13,7 @@ pub use pixels::{grid_taps, pixels};
 #[cfg(feature = "cuda")]
 pub(crate) use rows::gather_width_concat;
 pub use rows::{
-    concat_cols, gather_rows, merge_rows, pack_rows, pool_rows, scatter_live_rows, scatter_rows,
-    select, split_q_gate, split_qkv, split_qkv_padded, split_rows, unpack_rows,
+    PagedPlane, concat_cols, gather_live_rows, gather_rows, merge_rows, pack_rows,
+    page_gather_rows, page_scatter_rows, pool_rows, scatter_live_rows, scatter_rows, select,
+    split_q_gate, split_qkv, split_qkv_padded, split_rows, unpack_rows,
 };

@@ -74,6 +74,7 @@ pub struct Shell {
     arena: Arena,
     pools: Pools,
     buffers: Option<Buffers>,
+    rs_tables: Option<crate::store::rs::RsTables>,
     predicate: crate::store::rs::Predicate,
     inputs: Inputs,
     facts: kv::Facts,
@@ -1016,8 +1017,12 @@ struct RsFire<'a> {
     truncates: bool,
     buffered: bool,
     reads: Vec<Vec<std::ops::Range<u32>>>,
-    rows_ext: u32,
     snapshots: crate::store::rs::SnapTable,
+    /// What the fire's buffered movement bakes into a body
+    /// ([`crate::record::BodyKey::rs`]).
+    shape: Option<crate::record::RsShape>,
+    /// The tables that movement reads, staged before the walk.
+    staged: crate::store::rs::RsStaged,
 }
 
 #[derive(Debug, Clone, Copy)]

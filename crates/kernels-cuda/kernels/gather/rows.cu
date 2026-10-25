@@ -377,6 +377,100 @@ __global__ void scatter_live_rows(
     }
 }
 
+// tight[row] = wide[index[row]] for the live rows whose index is not
+// negative: `scatter_live_rows` read the other way. One block per row.
+template <class U>
+__global__ void gather_live_rows(
+    const U* __restrict__ wide,
+    U* __restrict__ tight,
+    const i32* __restrict__ index,
+    int units,
+    const u32* __restrict__ win)
+{
+    const int n = static_cast<int>(blockIdx.x);
+
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
+    const i32 at = index[row];
+    if (at < 0) return;
+
+    const U* src = wide + static_cast<long long>(at) * units;
+    U* dst = tight + static_cast<long long>(row) * units;
+    for (int i = static_cast<int>(threadIdx.x); i < units;
+         i += static_cast<int>(blockDim.x)) {
+        dst[i] = src[i];
+    }
+}
+
+// Token `g` of a paged plane (its page slot times the page's tokens, plus
+// its token within the page) stands `slot * per_slot + plane_at + in_page *
+// units` units past the planes' base.
+__device__ __forceinline__ long long page_unit(
+    i32 g, int page_tokens, long long per_slot, long long plane_at, int units)
+{
+    const long long slot = g / page_tokens;
+    const long long in_page = g % page_tokens;
+    return slot * per_slot + plane_at + in_page * units;
+}
+
+// pages[tokens[row]] = rows[row] for the live rows whose token is not
+// negative: rows into the paged plane's tokens they land at. One block per
+// row.
+template <class U>
+__global__ void page_scatter_rows(
+    const U* __restrict__ rows,
+    U* __restrict__ pages,
+    const i32* __restrict__ tokens,
+    int units,
+    long long per_slot,
+    long long plane_at,
+    int page_tokens,
+    const u32* __restrict__ win)
+{
+    const int n = static_cast<int>(blockIdx.x);
+
+    if (win != nullptr && n >= static_cast<int>(win[0])) return;
+
+    const int row = win != nullptr ? n + static_cast<int>(win[1]) : n;
+
+    const i32 g = tokens[row];
+    if (g < 0) return;
+
+    const U* src = rows + static_cast<long long>(row) * units;
+    U* dst = pages + page_unit(g, page_tokens, per_slot, plane_at, units);
+    for (int i = static_cast<int>(threadIdx.x); i < units;
+         i += static_cast<int>(blockDim.x)) {
+        dst[i] = src[i];
+    }
+}
+
+// rows[e] = pages[tokens[e]] for every row whose token is not negative: a
+// paged plane's tokens out into rows. One block per row.
+template <class U>
+__global__ void page_gather_rows(
+    const U* __restrict__ pages,
+    U* __restrict__ rows,
+    const i32* __restrict__ tokens,
+    int units,
+    long long per_slot,
+    long long plane_at,
+    int page_tokens)
+{
+    const int e = static_cast<int>(blockIdx.x);
+
+    const i32 g = tokens[e];
+    if (g < 0) return;
+
+    const U* src = pages + page_unit(g, page_tokens, per_slot, plane_at, units);
+    U* dst = rows + static_cast<long long>(e) * units;
+    for (int i = static_cast<int>(threadIdx.x); i < units;
+         i += static_cast<int>(blockDim.x)) {
+        dst[i] = src[i];
+    }
+}
+
 template <class T>
 __global__ void pool_rows(
     const T* __restrict__ x,
