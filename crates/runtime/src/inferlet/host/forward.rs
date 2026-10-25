@@ -8,10 +8,10 @@ pub use crate::pipeline::channel::Channel;
 use crate::pipeline::channel::{BoundCells, ChannelCell, ChannelError};
 pub use crate::pipeline::instance::ForwardPass;
 use crate::pipeline::instance::Instance;
+use crate::store::kv::working_set::KvWorkingSet;
 use crate::pipeline::instance::{
     BoundForwardPass, EmbedBinding, FloatLane, FloatPass, InputBinding, LaneFacts, StateBinding,
 };
-use crate::store::kv::working_set::KvWorkingSet;
 
 use super::working_set::WorkingSet;
 
@@ -866,7 +866,21 @@ impl ProcessCtx {
                 }
                 (None, false) => None,
             };
-            let state = match (pass.bindings.state.clone(), reads_kv) {
+            // A float lane reading a recurrent state is a sequence of one
+            // slot a fire: it binds `state`, and states no geometry.
+            let reads_state = !reads_kv && decls[0].reads_state;
+            if let Some(at) = decls
+                .iter()
+                .position(|decl| !reads_kv && decl.reads_state != reads_state)
+            {
+                return Ok(Err(format!(
+                    "lane {at} {} a recurrent state and lane 0 {}; a pass's lanes all read one \
+                     or none",
+                    if reads_state { "reads no" } else { "reads" },
+                    if reads_state { "reads one" } else { "reads none" },
+                )));
+            }
+            let state = match (pass.bindings.state.clone(), reads_kv || reads_state) {
                 (Some(state), true) => Some(state),
                 (None, true) => {
                     return Ok(Err(
@@ -875,12 +889,25 @@ impl ProcessCtx {
                 }
                 (Some(_), false) => {
                     return Ok(Err(
-                        "this pass's lanes read no kv cache, but the pass bound `state`"
+                        "this pass's lanes read no kv cache and no recurrent state, but the pass \
+                         bound `state`"
                             .to_string(),
                     ));
                 }
                 (None, false) => None,
             };
+            if reads_state
+                && let Some(state) = &state
+                && [state.positions, state.slots, state.kv_len, state.fold]
+                    .iter()
+                    .any(Option::is_some)
+            {
+                return Ok(Err(
+                    "this pass's lanes read no kv cache: each fire folds one slot of their \
+                     recurrent state, so their `state` binds no geometry"
+                        .to_string(),
+                ));
+            }
             if reads_kv && !embeds {
                 return Ok(Err(
                     "this pass's lanes read a kv cache and embed no tokens; a sequence's rows \
@@ -1122,7 +1149,7 @@ impl ProcessCtx {
             } else {
                 (vec![self.mint_scratch_working_set()?], Vec::new())
             };
-            let (devgeo, decode_envelope, geometry_class) = if state.is_some() {
+            let (devgeo, decode_envelope, geometry_class) = if float.is_none() {
                 let engine = super::working_set::kv_of(self, kv_lanes[0])?.engine;
                 let device_port_mask = crate::engine::get_spec(engine)?.device_geometry_port_mask;
                 let needs_mask_port = prog.bound.container.ports.iter().any(|binding| {
@@ -1430,7 +1457,7 @@ impl ProcessCtx {
         let scratch = pass
             .bound()
             .ok()
-            .filter(|bound| bound.float.is_some())
+            .filter(|bound| bound.float.is_some() && bound.lanes.is_empty())
             .map(|bound| bound.kv_lanes[0]);
         if let Ok(bound) = pass.bound_mut() {
             bound.close_native();

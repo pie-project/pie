@@ -2,16 +2,37 @@ use wasmtime::component::Resource;
 
 use super::context::FireContext;
 use super::{
-    FireWs, PendingFire, PendingOp, Switched, TicketReservation, advance_shadow, every_lane,
-    hook_program_of, open_pipeline, record_submit_failure, seat_lane_slots,
-    settle_and_wait_resident, stamp_lane_facts, stamp_lane_words,
+    FireWs, PendingFire, PendingOp, Reserved, Switched, TicketReservation, advance_shadow,
+    bound_rs_working_sets, every_lane, hook_program_of, open_pipeline, record_submit_failure,
+    reserve, rs, seat_lane_slots, settle_and_wait_resident, stamp_lane_facts, stamp_lane_words,
 };
+use crate::inferlet::host::working_set::WorkingSet;
 use crate::pipeline::Pipeline;
 use crate::pipeline::instance::ForwardPass;
 use crate::store::kv::working_set::{FireLeaseError, KvWorkingSet};
 
 type Anyhow<T> = anyhow::Result<T>;
 
+/// Each working set's lanes fold one slot of its recurrent state: a fire is
+/// one element of the sequence, as a token is an LM's.
+fn fold_one_plan(ids: &[crate::store::rs::RsWorkingSetId]) -> rs::RsPlan {
+    let mut groups: Vec<rs::GroupPlan> = Vec::new();
+    for (lane, id) in ids.iter().enumerate() {
+        match groups.iter_mut().find(|group| ids[group.lanes[0]] == *id) {
+            Some(group) => group.lanes.push(lane),
+            None => groups.push(rs::GroupPlan {
+                lanes: vec![lane],
+                writes: None,
+                fold: rs::GroupFold::Host(1),
+                snapshots: Vec::new(),
+            }),
+        }
+    }
+    rs::RsPlan::Groups(groups)
+}
+
+/// A float pass: no kv. A lane reading a recurrent state binds a working set
+/// and folds one slot of it a fire, on the row its rs store assigns.
 pub(crate) async fn fire_float_lane<C: FireContext>(
     ctx: &mut C,
     this: Resource<Pipeline>,
@@ -24,7 +45,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
             Err(error) => return Ok(Err(error)),
         };
 
-    let (float, embed_ids, ws_rep, cells, accesses, instance_id, scheduler, fwd_rep) = {
+    let (float, embed_ids, lanes, kv_reps, rs_reps, cells, accesses, instance_id, scheduler, fwd_rep) = {
         let pass = ctx.resources().get(&fwd)?;
         if let Some(error) = &pass.failed {
             return Ok(Err(format!(
@@ -36,11 +57,6 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
                 "pipeline: fire_float_lane on a pass bound with a sequence".to_string(),
             ));
         };
-        if !pass.rs_ws.is_empty() {
-            return Ok(Err(
-                "pipeline: a float lane binds no recurrent state".to_string()
-            ));
-        }
         let port_words = |port: eta_ir::registry::Port| {
             let container = &pass.instance.program.bound.container;
             let values = pass.instance.channel_values();
@@ -71,7 +87,9 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
                     port_words(eta_ir::registry::Port::EmbedIndptr),
                 )
             }),
-            pass.kv_lanes[0],
+            pass.lanes.clone(),
+            pass.kv_lanes.clone(),
+            pass.rs_ws.clone(),
             pass.cells.clone(),
             pass.instance.program.channel_accesses.clone(),
             pass.bound_instance.instance_id,
@@ -80,27 +98,39 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         )
     };
 
-    let ws_res: Resource<KvWorkingSet> = Resource::new_borrow(ws_rep);
-    let ws = ctx.resources().get(&ws_res)?.clone();
-    let stores = crate::store::registry::get(ws.model, ws.engine);
+    let mut kvs: Vec<KvWorkingSet> = Vec::new();
+    for &rep in &kv_reps {
+        let res: Resource<KvWorkingSet> = Resource::new_borrow(rep);
+        let ws = ctx.resources().get(&res)?.clone();
+        if !kvs.iter().any(|seen| seen.id == ws.id) {
+            kvs.push(ws);
+        }
+    }
+    let (model, engine) = kvs.first().map_or((0, 0), |ws| (ws.model, ws.engine));
+    let stores = crate::store::registry::get(model, engine);
     let pid = ctx.process_id();
     let quorum_pipeline_id = pipeline_scope.scheduler_id();
-    if let Err(owner) = ws.claim_pipeline_scope(&pipeline_scope) {
-        return Ok(Err(format!(
-            "pipeline: float lane's working set is already scoped to pipeline {owner:032x}"
-        )));
-    }
-    let ws_guard = loop {
-        match ws.fire_lease() {
-            Ok(lease) => break lease,
-            Err(FireLeaseError::Fenced) => {
-                if let Err(error) = settle_and_wait_resident(ctx).await {
-                    return Ok(Err(error));
-                }
-            }
-            Err(error) => return Ok(Err(format!("pipeline: float lane: {error}"))),
+    for ws in &kvs {
+        if let Err(owner) = ws.claim_pipeline_scope(&pipeline_scope) {
+            return Ok(Err(format!(
+                "pipeline: float lane's working set is already scoped to pipeline {owner:032x}"
+            )));
         }
-    };
+    }
+    let mut leases = Vec::with_capacity(kvs.len());
+    for ws in &kvs {
+        leases.push(loop {
+            match ws.fire_lease() {
+                Ok(lease) => break lease,
+                Err(FireLeaseError::Fenced) => {
+                    if let Err(error) = settle_and_wait_resident(ctx).await {
+                        return Ok(Err(error));
+                    }
+                }
+                Err(error) => return Ok(Err(format!("pipeline: float lane: {error}"))),
+            }
+        });
+    }
 
     // Each lane's rows: its embedded tokens split by the indptr, or as many
     // placeholder rows as its row inputs carry.
@@ -223,9 +253,40 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         Switched::of(pass)
     };
     req.single_token_mode = false;
+    // The state each lane folds into, on the row its rs store assigns: fresh
+    // where the state holds nothing yet. A lane binding none touches no state
+    // row.
+    let rs_ids = match kvs.first().filter(|_| !rs_reps.is_empty()) {
+        Some(ws) => {
+            let qo_indptr: Vec<u32> = (0..=req.lanes.len() as u32).collect();
+            match bound_rs_working_sets(ctx, ws, &rs_reps, &qo_indptr, &pipeline_scope)? {
+                Ok(ids) => ids,
+                Err(error) => return Ok(Err(error)),
+            }
+        }
+        None => Vec::new(),
+    };
+    let plan = fold_one_plan(&rs_ids);
+    let rs_prepared = match reserve(
+        ctx,
+        &stores,
+        quorum_pipeline_id,
+        &[],
+        &rs_ids,
+        || Ok(plan.clone()),
+        false,
+    )
+    .await
+    {
+        Ok(Reserved { rs, .. }) => rs,
+        Err(error) => return Ok(Err(error)),
+    };
+    rs_prepared.apply_to(&mut req);
+    let rs_copy = rs_prepared.state_copy();
+    let rstxn = super::RsTxnsGuard::new(model, engine, rs_prepared.txn);
     let lanes_of = every_lane(&req);
     stamp_lane_words(&mut req, &switched, &lanes_of, false, None);
-    let groups = vec![(ws.id, (0..req.lanes.len()).collect())];
+    let groups = vec![(kvs[0].id, (0..req.lanes.len()).collect())];
     if let Err(refusal) = seat_lane_slots(&mut req, &stores, &groups).await {
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
         return Ok(Err(refusal));
@@ -248,7 +309,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         completion.clone(),
         Vec::new(),
         Vec::new(),
-        None,
+        rs_copy,
         frame,
         hook_program,
         lora_program,
@@ -262,24 +323,42 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
     }
     ticket_reservation.commit();
     advance_shadow(ctx, &fwd)?;
+    // The cursor counts the slots folded: one a fire.
+    let mut advanced: Vec<u32> = Vec::new();
+    for &rep in lanes.iter().filter(|_| !rs_ids.is_empty()) {
+        if advanced.contains(&rep) {
+            continue;
+        }
+        advanced.push(rep);
+        let res: Resource<WorkingSet> = Resource::new_borrow(rep);
+        let cursor = ctx.resources().get(&res)?.cursor.clone();
+        let mut cursor = cursor.lock().unwrap();
+        cursor.folded += 1;
+        cursor.tail = Some(cursor.folded);
+        cursor.reserved = cursor.reserved.max(cursor.folded);
+    }
     pipe_fires
         .lock()
         .unwrap()
         .push_back(PendingOp::Fire(PendingFire {
             completion,
             checkpoints: Vec::new(),
-            kv: vec![FireWs {
-                ws: ws.id,
-                kvtxn: None,
-                log: None,
-                lease: ws_guard,
-                fold: None,
-                reports: Vec::new(),
-            }],
+            kv: kvs
+                .iter()
+                .zip(leases)
+                .map(|(ws, lease)| FireWs {
+                    ws: ws.id,
+                    kvtxn: None,
+                    log: None,
+                    lease,
+                    fold: None,
+                    reports: Vec::new(),
+                })
+                .collect(),
             device_geometry: false,
-            rstxn: super::RsTxnsGuard::new(ws.model, ws.engine, None),
-            model: ws.model,
-            engine: ws.engine,
+            rstxn,
+            model,
+            engine,
             fwd_rep,
             cells,
             failure: pipeline_failure,

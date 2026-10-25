@@ -241,6 +241,10 @@ pub struct Readout {
 pub struct LaneClass {
     pub words: Vec<u64>,
     pub reads_kv: bool,
+    /// It reads a `CacheRow::State` row: a lane of it carries a recurrent
+    /// state.
+    #[serde(default)]
+    pub reads_state: bool,
     pub embeds: bool,
     pub wide: bool,
     pub readout: Option<Readout>,

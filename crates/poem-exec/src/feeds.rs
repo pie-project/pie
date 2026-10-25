@@ -229,7 +229,7 @@ pub fn reader_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -
 }
 
 /// Each class of the plan, as a lane landing in it is told of it: whether it
-/// reads a kv cache, embeds `tokens`, attends both ways, and the export seam
+/// reads a kv cache or a recurrent state, embeds `tokens`, attends both ways, and the export seam
 /// it reads out (`out` before `velocity`, `hidden` and `pixels`, as a fire
 /// reads it) and how wide one row of it is.
 #[must_use]
@@ -238,6 +238,12 @@ pub fn lane_classes(trace: &Trace, compiled: &CompiledModel) -> LaneClasses {
         matches!(def, Def::Cache(row) if matches!(
             trace.caches.get(*row as usize),
             Some(poem_ir::CacheRow::Kv { .. })
+        ))
+    });
+    let state = classes_reading(trace, compiled, |def| {
+        matches!(def, Def::Cache(row) if matches!(
+            trace.caches.get(*row as usize),
+            Some(poem_ir::CacheRow::State { .. })
         ))
     });
     let embeds = classes_reading(trace, compiled, |def| {
@@ -306,6 +312,7 @@ pub fn lane_classes(trace: &Trace, compiled: &CompiledModel) -> LaneClasses {
             .map(|(class, landed)| LaneClass {
                 words: landed.words.clone(),
                 reads_kv: kv.contains(class),
+                reads_state: state.contains(class),
                 embeds: embeds.contains(class),
                 wide: wide.contains(class),
                 readout: exports

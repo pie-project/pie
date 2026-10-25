@@ -212,6 +212,9 @@ pub struct Lane {
     pub inputs: Vec<u32>,
     /// Some class it lands in reads a kv cache: it binds `state`.
     pub reads_kv: bool,
+    /// Some class it lands in reads a recurrent state: a float lane of it
+    /// binds `state` too, its rows one slot of its sequence a fire.
+    pub reads_state: bool,
     /// Some class it lands in reads `tokens`: it binds `embed`.
     pub embeds: bool,
     /// What it reads out: a float readout where some class reads one.
@@ -420,6 +423,7 @@ impl Model {
             switches: switches.to_vec(),
             inputs,
             reads_kv: landed.iter().any(|class| class.reads_kv),
+            reads_state: landed.iter().any(|class| class.reads_state),
             embeds: landed.iter().any(|class| class.embeds),
             readout: readouts()
                 .find(|readout| readout.kind != poem_ir::ReadoutKind::Logits)
