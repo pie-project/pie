@@ -53,6 +53,8 @@ pub struct Quiet {
     world: u32,
     met: std::sync::Mutex<(u64, u32)>,
     all: std::sync::Condvar,
+    /// What [`Quiet::any`] gathers.
+    said: core::sync::atomic::AtomicBool,
 }
 
 /// How long a rank waits at [`Quiet::meet`] for a peer that never comes (a
@@ -66,7 +68,24 @@ impl Quiet {
             world,
             met: std::sync::Mutex::new((0, 0)),
             all: std::sync::Condvar::new(),
+            said: core::sync::atomic::AtomicBool::new(false),
         }))
+    }
+
+    /// Whether any rank of the group says `mine`, every rank asking: each
+    /// rank meets the others, so all of them take the one answer.
+    pub fn any(&self, mine: bool) -> Result<bool> {
+        if mine {
+            self.said.store(true, core::sync::atomic::Ordering::SeqCst);
+        }
+        self.meet()?;
+        let any = self.said.load(core::sync::atomic::Ordering::SeqCst);
+        // Every rank has read the answer before it is cleared, and it is
+        // cleared before any rank asks again.
+        self.meet()?;
+        self.said.store(false, core::sync::atomic::Ordering::SeqCst);
+        self.meet()?;
+        Ok(any)
     }
 
     /// Waits until every rank of the group has met here.
