@@ -202,3 +202,70 @@ fn a_packed_split_names_the_kv_head_a_group_of_ranks_holds() {
     }
     assert!(splits > 0, "the row splits q, k and v");
 }
+
+/// Inkling splits by its heads through ops that had no rule: its k and v
+/// convolved over time with their states, its relative bias projected a head
+/// at a time and the attention it biases, then a projection's partial sums
+/// summed before the convolution after it and the dense MLP's scale. Four
+/// ranks run every op one rank does, each relative bias and attention a
+/// quarter of the heads, and add one sum a sublayer and nothing else; its
+/// head, 200058 rows, is cut two ways and held whole four.
+#[test]
+fn inkling_splits_through_its_convolutions_and_biased_attention() {
+    const ROW: &str = "inkling-mini-l7-e8-bf16-kv-bf16";
+    const LAYERS: usize = 7;
+    let whole = crate::catalog::deployment(ROW)
+        .expect("the one-rank row")
+        .trace(Platform::Cuda);
+    let split = crate::catalog::deployment(&format!("{ROW}-tp4"))
+        .expect("the row splits four ways")
+        .trace(Platform::Cuda);
+    let ops = |trace: &poem_ir::Trace| {
+        let mut names: Vec<&str> = trace
+            .nodes
+            .iter()
+            .map(|node| poem_ir::Operands::name(&node.op))
+            .filter(|name| !name.starts_with("collective."))
+            .collect();
+        names.sort_unstable();
+        names
+    };
+    assert_eq!(ops(&split), ops(&whole), "every op but the collectives");
+    let count = |trace: &poem_ir::Trace, op: &str| {
+        (trace.nodes.iter())
+            .filter(|node| poem_ir::Operands::name(&node.op) == op)
+            .count()
+    };
+    assert_eq!(
+        count(&split, "collective.all_reduce"),
+        2 * LAYERS,
+        "one sum an attention and one an mlp"
+    );
+    assert_eq!(count(&split, "collective.all_gather"), 0, "the head is whole");
+    let heads = |trace: &poem_ir::Trace| -> Vec<u32> {
+        (trace.nodes.iter())
+            .filter_map(|node| match &node.op {
+                poem_ir::Operation::Linear(poem_ir::Linear::RelBias { heads, .. }) => Some(*heads),
+                _ => None,
+            })
+            .collect()
+    };
+    let (split_heads, whole_heads) = (heads(&split), heads(&whole));
+    assert!(!whole_heads.is_empty(), "the row biases its attention");
+    assert!(
+        split_heads.iter().zip(&whole_heads).all(|(s, w)| s * 4 == *w),
+        "a rank's quarter of the heads: {split_heads:?} of {whole_heads:?}"
+    );
+    let unembed = |trace: &poem_ir::Trace| {
+        (trace.params.iter())
+            .find(|p| p.name == "unembed")
+            .expect("the head")
+            .shard
+            .clone()
+    };
+    assert_eq!(unembed(&split), poem_ir::Shard::Replicated);
+    let two = crate::catalog::deployment(&format!("{ROW}-tp2"))
+        .expect("the row splits two ways")
+        .trace(Platform::Cuda);
+    assert!(matches!(unembed(&two), poem_ir::Shard::Cut { .. }));
+}
