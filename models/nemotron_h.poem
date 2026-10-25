@@ -17,8 +17,7 @@ TOKENIZER = tokenizer(markers = [STOP])
 # forward: the Mamba-2 mixer's packed projection, convolution and per-head
 # parameters by its heads and groups, q, k and v by their heads, the routed
 # and shared experts' ups by their channels, the output and down
-# projections by their rows. The head it holds whole, and Nano's every
-# projection, as the package always has.
+# projections by their rows, the head by its vocabulary.
 CUTS = "inferred"
 
 MODELS = [
@@ -231,7 +230,7 @@ def layout(id, deploy):
         eps = d.eps,
         kv = deploy.kv,
         embed = weight([d.vocab, hidden], w),
-        head = weight([d.vocab, hidden], w).replicated(),
+        head = weight([d.vocab, hidden], w),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
     )
@@ -260,7 +259,7 @@ def nano_layout(id, deploy):
         moe = None
         if kind == "M":
             mamba = struct(
-                in_proj = weight([inner + conv_dim + d.mamba_heads, hidden], at(l)).replicated(),
+                in_proj = weight([inner + conv_dim + d.mamba_heads, hidden], at(l)),
                 conv = weight([conv_dim, d.conv_kernel]),
                 conv_bias = weight([conv_dim]),
                 a_log = weight([d.mamba_heads], dtype.f32),
@@ -274,9 +273,9 @@ def nano_layout(id, deploy):
         elif kind == "*":
             hd = d.head_dim
             attn = struct(
-                q = weight([d.heads * hd, hidden], dtype.bf16).replicated(),
-                k = weight([d.kv_heads * hd, hidden], dtype.bf16).replicated(),
-                v = weight([d.kv_heads * hd, hidden], dtype.bf16).replicated(),
+                q = weight([d.heads * hd, hidden], dtype.bf16),
+                k = weight([d.kv_heads * hd, hidden], dtype.bf16),
+                v = weight([d.kv_heads * hd, hidden], dtype.bf16),
                 o = weight([hidden, d.heads * hd], dtype.bf16),
                 kv = "kv.{}".format(l),
             )
@@ -286,9 +285,9 @@ def nano_layout(id, deploy):
                 bias = weight([d.experts], dtype.f32),
                 down_latent = None,
                 up_latent = None,
-                up = weight([d.experts, d.moe_inter, hidden], experts).replicated(),
+                up = weight([d.experts, d.moe_inter, hidden], experts),
                 down = weight([d.experts, hidden, d.moe_inter], experts),
-                shared_up = weight([d.shared_inter, hidden], proj).replicated(),
+                shared_up = weight([d.shared_inter, hidden], proj),
                 shared_down = weight([hidden, d.shared_inter], proj),
             )
         return struct(
@@ -319,7 +318,7 @@ def nano_layout(id, deploy):
         eps = d.eps,
         kv = deploy.kv,
         embed = weight([d.vocab, hidden]),
-        head = weight([d.vocab, hidden]).replicated(),
+        head = weight([d.vocab, hidden]),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
     )

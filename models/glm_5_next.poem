@@ -16,9 +16,8 @@ TOKENIZER = tokenizer(
 # and output gates and its per-head parameters by their heads, the latent
 # attention's q and kv up-projections and gate by theirs, the dense, shared
 # and routed gates and ups by their channels, the output and down
-# projections by their rows. The head it holds whole, as the package always
-# has, and the tower's output, down and downsampling projections, which read
-# the shares before them gathered.
+# projections by their rows, the head by its vocabulary, and the tower's
+# mlp and merger as the trunk's.
 CUTS = "inferred"
 
 MODELS = [
@@ -360,7 +359,7 @@ def layout(id, deploy):
         hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn),
         # mlx stores its table and head at four bits; the release, unquantized.
         embed = weight([d.vocab, hidden], table),
-        head = weight([d.vocab, hidden], table).replicated(),
+        head = weight([d.vocab, hidden], table),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
         final_norm_eps = d.norm_eps,
@@ -394,12 +393,12 @@ def tower(d):
             qkv_bias = weight([3 * hidden], bf),
             q_norm = weight([head_dim], bf),
             k_norm = weight([head_dim], bf),
-            proj = weight([hidden, hidden], bf).replicated(),
+            proj = weight([hidden, hidden], bf),
             proj_bias = weight([hidden], bf),
             norm2 = weight([hidden], bf),
             gate_up = weight([2 * inter, hidden], bf),
             gate_up_bias = weight([2 * inter], bf),
-            down = weight([hidden, inter], bf).replicated(),
+            down = weight([hidden, inter], bf),
             down_bias = weight([hidden], bf),
         )
 
@@ -421,14 +420,14 @@ def tower(d):
         patch_embed_bias = weight([hidden], bf),
         blocks = [block(l) for l in range(depth)],
         post_norm = weight([hidden], bf),
-        downsample = weight([out, merge * merge * hidden], bf).replicated(),
+        downsample = weight([out, merge * merge * hidden], bf),
         downsample_bias = weight([out], bf),
         merger = struct(
             proj = weight([out, out], bf),
             norm = weight([out], bf),
             norm_bias = weight([out], bf),
             gate_up = weight([2 * merger_inter, out], bf),
-            down = weight([out, merger_inter], bf).replicated(),
+            down = weight([out, merger_inter], bf),
         ),
     )
 

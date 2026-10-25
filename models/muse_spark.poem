@@ -11,7 +11,7 @@ ATEM = template("atem")
 # The compiler reads how tensor-parallel ranks cut each weight off the
 # forward: the packed q, k, v and output gate by their heads, each expert's
 # gate and up by its channels, the output and down projections by their
-# rows. The head it holds whole, as the package always has.
+# rows, the head by its vocabulary.
 CUTS = "inferred"
 TOKENIZER = tokenizer(markers = [["<|eot|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start|>", "<|message|>", "<|eom|>"]])
 
@@ -142,7 +142,7 @@ def layout(id, deploy):
         top_k = d.top_k,
         inter = iw,
         embed = weight([d.vocab, hidden], w),
-        lm_head = weight([d.vocab, hidden], w).replicated(),
+        lm_head = weight([d.vocab, hidden], w),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
         final_norm_eps = d.norm_eps,

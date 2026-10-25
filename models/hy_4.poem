@@ -9,8 +9,8 @@ HY = template("hy", thinking = True)
 # The compiler reads how tensor-parallel ranks cut each weight off the
 # forward: the latent attention's q and kv up-projections, its gate and its
 # sinks by their heads, the dense, shared and routed gates and ups by their
-# channels, the output and down projections by their rows. The head it
-# holds whole, as the package always has.
+# channels, the output and down projections by their rows, the head by its
+# vocabulary.
 CUTS = "inferred"
 TOKENIZER = tokenizer(
     markers = [
@@ -297,7 +297,7 @@ def layout(id, deploy):
         kv = deploy.kv,
         hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha),
         embed = weight([d.vocab, hidden], weights),
-        head = weight([d.vocab, hidden], weights).replicated(),
+        head = weight([d.vocab, hidden], weights),
         hc_head = head("hc_head", streams, hidden),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
