@@ -96,11 +96,6 @@ impl Dims {
     }
 
     #[must_use]
-    pub const fn patch_in(&self) -> u32 {
-        self.in_channels * PATCH_VOL
-    }
-
-    #[must_use]
     pub const fn patch_out(&self) -> u32 {
         self.out_channels * PATCH_VOL
     }

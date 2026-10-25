@@ -233,8 +233,6 @@ pub enum InputAxis {
 }
 
 impl InputAxis {
-    pub const ALL: [InputAxis; 3] = [InputAxis::Lane, InputAxis::Row, InputAxis::Voxel];
-
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {

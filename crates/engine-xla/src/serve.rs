@@ -21,6 +21,7 @@ use checkpoint::contract::ModelContract;
 use engine::fire::Masking;
 use engine::frame::{Demand, Supply};
 use poem_compiler::{Budget, Budgets, CompiledModel, FireRows, compile_axes};
+use poem_exec::feeds::classes_running;
 use poem_exec::fire::{At, Cursor, Filter, FireDescriptor, Lane as FireLane, compose_axes, walk};
 use poem_ir::{Dtype, Trace, ValueId};
 
@@ -322,26 +323,6 @@ fn declared_width(trace: &Trace, want: poem_ir::RuntimeInput) -> u64 {
             )
         })
         .unwrap_or(0)
-}
-
-fn classes_running(
-    trace: &Trace,
-    compiled: &CompiledModel,
-    pick: impl Fn(&poem_ir::Operation) -> bool,
-) -> poem_ir::ClassSet {
-    let mut set = poem_ir::ClassSet::default();
-    for region in compiled.template() {
-        let runs = region
-            .nodes
-            .clone()
-            .any(|node| trace.nodes.get(node as usize).is_some_and(|n| pick(&n.op)));
-        if runs {
-            for class in region.mask.iter() {
-                set.insert(class);
-            }
-        }
-    }
-    set
 }
 
 /// The most pages a pool takes on a device that states no memory limit (a
@@ -806,18 +787,6 @@ impl Shell {
     #[must_use]
     pub fn readout_seam(&self) -> engine::fire::ReadoutSeam {
         self.readout_seam
-    }
-
-    /// The width of the plan's velocity export, when it plants one.
-    #[must_use]
-    pub fn velocity_width(&self) -> Option<u32> {
-        self.dit.velocity_width()
-    }
-
-    /// Whether the plan exports pixels, and the pixel row's width.
-    #[must_use]
-    pub fn pixels_facts(&self) -> (bool, u32) {
-        self.dit.pixels_facts()
     }
 
     /// The voxel input's element, when the plan reads one.

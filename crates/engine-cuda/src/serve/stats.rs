@@ -75,39 +75,6 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn velocity_width(&self) -> Option<u32> {
-        let export = self.exports.velocity.as_ref()?;
-        kv::width_of(&self.trace, export.value)
-            .ok()
-            .and_then(|width| u32::try_from(width).ok())
-    }
-
-    #[must_use]
-    pub fn pixels_facts(&self) -> (bool, u32) {
-        let mut widths = self.exports.pixels_widths(&self.trace);
-        let Some(first) = widths.next() else {
-            return (false, 0);
-        };
-        (
-            true,
-            if widths.all(|width| width == first) {
-                first
-            } else {
-                0
-            },
-        )
-    }
-
-    #[must_use]
-    pub fn readout_seam(&self) -> Option<(engine::fire::ReadoutSeam, u32)> {
-        let readout = self.exports.readout()?;
-        let width = kv::width_of(&self.trace, readout.value)
-            .ok()
-            .and_then(|width| u32::try_from(width).ok())?;
-        Some((readout.seam, width))
-    }
-
-    #[must_use]
     pub fn drafts(&self) -> bool {
         self.exports.mtp.is_some()
     }

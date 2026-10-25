@@ -65,14 +65,6 @@ impl Exports {
         )
     }
 
-    pub(crate) fn pixels_widths<'a>(&'a self, trace: &'a Trace) -> impl Iterator<Item = u32> + 'a {
-        self.pixels.iter().filter_map(move |(export, _)| {
-            crate::store::kv::width_of(trace, export.value)
-                .ok()
-                .and_then(|width| u32::try_from(width).ok())
-        })
-    }
-
     #[must_use]
     pub(crate) fn readout_for(&self, class: usize) -> Option<ReadoutSeam> {
         use engine::fire::ReadoutSeam as Seam;

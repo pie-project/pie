@@ -332,12 +332,10 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
         image_want(clips[1], group(1)),
         text_want(text_rows[1], group(1), grid_of(clips[1])),
     ];
-    let mut worst = 0f32;
     for (lane, (values, want)) in got.iter().zip(&want).enumerate() {
         assert_eq!(values.len(), want.len(), "lane {lane}: rows x width");
         for (i, (g, w)) in values.iter().zip(want).enumerate() {
             let err = (g - w).abs();
-            worst = worst.max(err);
             assert!(
                 err == 0.0,
                 "lane {lane} row {} col {}: device {g}, host {w}",
@@ -346,5 +344,4 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
             );
         }
     }
-    eprintln!("cells, group rows and group first: max |err| {worst}");
 }

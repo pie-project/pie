@@ -330,9 +330,6 @@ impl Instance {
     pub fn poison(&mut self) {
         self.poisoned = true;
     }
-    pub fn is_poisoned(&self) -> bool {
-        self.poisoned
-    }
 
     pub fn host_put(&mut self, bound: &BoundTrace, chan: u32, v: Value) -> Result<(), HostError> {
         if self.poisoned {
