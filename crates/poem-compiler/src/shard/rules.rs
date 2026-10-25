@@ -6,7 +6,7 @@ use poem_ir::{
     Attn, BinaryOp, Elemwise, Gather, Linear, NormAxis, Operands, Operation, Shard, ValueId,
 };
 
-use super::{Dist, Pass};
+use super::{Block, Dist, Pass};
 use crate::tree::{self, Tree};
 
 /// How an op meets the ranks.
@@ -95,6 +95,10 @@ impl Heads {
 /// The head count of kv a group of ranks may share.
 pub(super) const KV_HEADS: &str = "kv_heads";
 
+/// A pair of head counts, q's and then kv's, which a group of ranks may
+/// share as `KV_HEADS` it names.
+const HEAD_PAIR: &str = "heads";
+
 /// How op `name` splits by head or channel, if it does.
 fn heads(name: &str) -> Option<Heads> {
     Some(match name {
@@ -106,6 +110,8 @@ fn heads(name: &str) -> Option<Heads> {
         "elemwise.rope" => Heads::of(&["q", "k"], &[]),
         "elemwise.add_bias" => Heads::of(&["out"], &[]),
         "gather.split_qkv" => Heads::of(&["packed"], &["q_width", "kv_width"]),
+        // Its heads are q's and kv's, each rank's share of each.
+        "gather.split_qkv_padded" => Heads::of(&["packed"], &[HEAD_PAIR]),
         "gather.split_q_gate" => Heads::of(&["packed"], &[]),
         "gather.split_rows" => Heads::of(&["x"], &["width"]),
         "linear.matmul_grouped" => Heads::of(&["x", "routes"], &["groups"]),
@@ -501,6 +507,27 @@ impl At {
             if !names.contains(field) || *field == KV_HEADS && !kv_split {
                 continue;
             }
+            // A pair of counts: the query heads cut once per rank, the kv
+            // heads as a kv head count is.
+            if let Tree::Seq(pair) = value
+                && let [Tree::Int(q), Tree::Int(kv)] = &mut pair[..]
+            {
+                let unsplit = format!("`{op}`.{field} of [{q}, {kv}] does not split {world} ways");
+                let heads = u64::try_from(*kv).ok().filter(|h| *h > 0);
+                let kv_parts = if kv_split {
+                    Shard::parts(heads, u64::from(pass.world))
+                        .map(i128::from)
+                        .map_err(|_| unsplit.clone())?
+                } else {
+                    1
+                };
+                if *q % world != 0 || *kv % kv_parts != 0 {
+                    return Err(unsplit);
+                }
+                *q /= world;
+                *kv /= kv_parts;
+                continue;
+            }
             let Tree::Int(n) = value else {
                 return Err(format!("`{op}`.{field} is not a count"));
             };
@@ -584,9 +611,13 @@ fn held_like(
     }
     if let [Dist::Split(blocks)] = held
         && blocks.len() == count
-        && blocks[index].width == width
     {
-        return Ok(Dist::Split(vec![blocks[index]]));
+        // A lone packed input unpacked a block an output, the output cut as
+        // its block is however wide the op lays it (padding each head).
+        return Ok(Dist::Split(vec![Block {
+            width,
+            parts: blocks[index].parts,
+        }]));
     }
     if held.iter().all(|d| d.is_even(pass.world)) {
         return Ok(Dist::even(width, pass.world));

@@ -14,11 +14,15 @@
 //! vocab-split head gathers) puts its weights back whole, and the trace is
 //! read again until nothing changes. Where a share meets the partial sums of
 //! another, the product that contracted the other's share is the one put
-//! back whole, so a low-rank pair cuts its wide half by its columns.
+//! back whole, so a low-rank pair cuts its wide half by its columns. A
+//! product whose weight the model states whole reads the share before it
+//! gathered instead, where one gather puts the share back in order: the
+//! column cut is kept, and the projection after it runs whole on every rank.
 //!
 //! A packed product's segments are where the ops that read its share take
 //! it apart, and a segment's heads are what an op reading it `head_dim`
-//! wide, or packing heads it counts, says it holds.
+//! wide, or packing heads it counts, says it holds; a weight an op reads one
+//! row a group of (a norm over groups of heads) holds the op's groups.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -38,7 +42,11 @@ const PLANES: [&str; 4] = [
 
 /// Ops that unpack one packed share into the pieces their outputs are, in
 /// order.
-const UNPACKS: [&str; 2] = ["gather.split_qkv", "gather.split_rows"];
+const UNPACKS: [&str; 3] = [
+    "gather.split_qkv",
+    "gather.split_qkv_padded",
+    "gather.split_rows",
+];
 
 /// Per-head ops affine in what they follow, which a partial sum reaches
 /// as it does a sum: reduced first, no pair recut for it.
@@ -73,6 +81,13 @@ const PER_HEAD: [(&str, &str); 25] = [
     ("ssm.mamba2_chunked", "dt_bias"),
     ("ssm.mamba2_chunked", "d"),
     ("ssm.mamba2_chunked", "norm"),
+];
+
+/// The weights an op reads one row a group of its shares' heads, and the
+/// field that counts its groups: a rank holds whole groups of them.
+const GROUPED: [(&str, &str, &str); 2] = [
+    ("ssm.mamba2", "norm", "groups"),
+    ("ssm.mamba2_chunked", "norm", "groups"),
 ];
 
 /// Each param's cut, inferred from `trace`'s dataflow whatever the model
@@ -113,9 +128,9 @@ pub fn resolve(trace: &mut Trace) -> Vec<(String, Shard)> {
 /// param's cut over its logical shape.
 fn inferred(trace: &Trace, pinned: BTreeSet<usize>) -> (Vec<Shard>, Vec<Shard>) {
     let reading = Reading::of(trace);
-    let mut whole = pinned;
+    let mut whole = pinned.clone();
     loop {
-        let mut walk = Walk::new(&reading, &whole);
+        let mut walk = Walk::new(&reading, &whole, &pinned);
         walk.run();
         let rejected = std::mem::take(&mut walk.rejected);
         if rejected.is_subset(&whole) {
@@ -241,6 +256,8 @@ enum Cut {
 struct Walk<'r, 't> {
     reading: &'r Reading<'t>,
     whole: &'r BTreeSet<usize>,
+    /// The params the model states whole.
+    pinned: &'r BTreeSet<usize>,
     held: Vec<Option<Held>>,
     cuts: Vec<Option<Cut>>,
     /// Where the ops that read a column cut's share take it apart.
@@ -250,20 +267,28 @@ struct Walk<'r, 't> {
     rejected: BTreeSet<usize>,
     /// Group indices, which follow the row they group.
     groups: BTreeSet<ValueId>,
+    /// The groups a weight read one row a group holds.
+    grouped: BTreeMap<usize, u64>,
 }
 
 impl<'r, 't> Walk<'r, 't> {
-    fn new(reading: &'r Reading<'t>, whole: &'r BTreeSet<usize>) -> Walk<'r, 't> {
+    fn new(
+        reading: &'r Reading<'t>,
+        whole: &'r BTreeSet<usize>,
+        pinned: &'r BTreeSet<usize>,
+    ) -> Walk<'r, 't> {
         let trace = reading.trace;
         Walk {
             reading,
             whole,
+            pinned,
             held: vec![None; trace.values.len()],
             cuts: vec![None; trace.params.len()],
             bounds: BTreeMap::new(),
             heads: BTreeMap::new(),
             rejected: BTreeSet::new(),
             groups: BTreeSet::new(),
+            grouped: BTreeMap::new(),
         }
     }
 
@@ -366,6 +391,22 @@ impl<'r, 't> Walk<'r, 't> {
         {
             self.reject(&origins);
         }
+    }
+
+    /// Whether `v`, held as `share`, is one a gather puts back in order:
+    /// a share of column cuts' runs each as wide as every segment of them,
+    /// so each rank holds one block of it.
+    fn gathers(&self, v: ValueId, share: &Held) -> bool {
+        let Held::Split(os) = share else {
+            return false;
+        };
+        self.width(v).is_some_and(|w| {
+            !os.is_empty()
+                && os.iter().all(|o| {
+                    let (segments, _) = self.segments(o.param, o.lo, o.hi);
+                    segments.iter().all(|s| *s == w)
+                })
+        })
     }
 
     /// A value an op reads whole: a share's cuts put back, a weight kept
@@ -477,10 +518,15 @@ impl<'r, 't> Walk<'r, 't> {
                         self.read_whole(*v);
                     }
                 }
-                let one = match self.held(a) {
+                let share = self.held(a);
+                let one = match share.clone() {
                     Held::Split(origins) => {
                         if self.decide(p, Cut::Row(input)) {
                             Held::Partial(origins)
+                        } else if self.pinned.contains(&p) && self.gathers(a, &share) {
+                            // A weight the model states whole reads its
+                            // share gathered.
+                            Held::Whole
                         } else {
                             self.reject(&origins)
                         }
@@ -620,6 +666,16 @@ impl<'r, 't> Walk<'r, 't> {
                     .map_or("", |(n, _)| *n);
                 if PER_HEAD.contains(&(op.name(), name)) {
                     self.beside(p, like, &Held::Split(all.clone()), true);
+                    let count = GROUPED
+                        .iter()
+                        .find(|(o, w, _)| *o == op.name() && *w == name)
+                        .and_then(|(_, _, field)| match tree::field(t, field) {
+                            Some(Tree::Int(n)) => u64::try_from(*n).ok().filter(|n| *n > 0),
+                            _ => None,
+                        });
+                    if let Some(groups) = count {
+                        self.grouped.insert(p, groups);
+                    }
                 } else {
                     self.decide(p, Cut::Whole);
                 }
@@ -630,7 +686,13 @@ impl<'r, 't> Walk<'r, 't> {
             && let [(_, v)] = followed[..]
             && let Some(o) = self.whole_run(v)
         {
-            let widths: Option<Vec<u64>> = outs.iter().map(|o| self.width(*o)).collect();
+            let widths = padded_qkv(t)
+                .map(|pieces| pieces.iter().map(|(w, _)| *w).collect())
+                .or_else(|| {
+                    outs.iter()
+                        .map(|o| self.width(*o))
+                        .collect::<Option<Vec<u64>>>()
+                });
             if let Some(widths) = widths
                 && widths.iter().sum::<u64>() == o.hi - o.lo
             {
@@ -707,60 +769,95 @@ impl<'r, 't> Walk<'r, 't> {
             if !matches!(h, Held::Split(_)) {
                 continue;
             }
-            let Some(o) = self.whole_run(*v) else {
-                continue;
-            };
-            let width = o.hi - o.lo;
-            let pieces: Vec<(u64, Option<u64>)> = match (op.name(), *name) {
-                ("ssm.gated_delta" | "ssm.gated_delta_chunked", "qkv") => {
-                    match (int("k_heads"), int("v_heads"), int("k_dim"), int("v_dim")) {
-                        (Some(kh), Some(vh), Some(kd), Some(vd)) => {
-                            vec![(kh * kd, None), (kh * kd, None), (vh * vd, None)]
-                        }
-                        _ => Vec::new(),
+            // A share of several runs as wide as itself (the arms of a merge)
+            // holds what each of them does.
+            for o in self.whole_runs(*v) {
+                self.count_run(op, t, name, o, head_dim);
+            }
+        }
+    }
+
+    /// The runs `v` is all of: each column cut's output it is a share of,
+    /// if every one is as wide as `v`.
+    fn whole_runs(&self, v: ValueId) -> Vec<Origin> {
+        let Some(Held::Split(os)) = &self.held[v.0 as usize] else {
+            return Vec::new();
+        };
+        let width = self.width(v);
+        if os.iter().all(|o| Some(o.hi - o.lo) == width) {
+            os.iter().copied().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The heads and segments op `op` says run `o` of its `name` input holds.
+    fn count_run(
+        &mut self,
+        op: &Operation,
+        t: &Tree,
+        name: &str,
+        o: Origin,
+        head_dim: Option<u64>,
+    ) {
+        let int = |name: &str| match tree::field(t, name) {
+            Some(Tree::Int(n)) => u64::try_from(*n).ok().filter(|n| *n > 0),
+            _ => None,
+        };
+        let width = o.hi - o.lo;
+        let pieces: Vec<(u64, Option<u64>)> = match (op.name(), name) {
+            ("ssm.gated_delta" | "ssm.gated_delta_chunked", "qkv") => {
+                match (int("k_heads"), int("v_heads"), int("k_dim"), int("v_dim")) {
+                    (Some(kh), Some(vh), Some(kd), Some(vd)) => {
+                        vec![(kh * kd, None), (kh * kd, None), (vh * vd, None)]
                     }
-                }
-                ("ssm.kda" | "ssm.kda_chunked", "mixed") => vec![(width / 3, None); 3],
-                ("ssm.gdn_gates", "ba") => vec![(width / 2, None); 2],
-                ("ssm.mamba2" | "ssm.mamba2_chunked", "xbc") => {
-                    match (int("heads"), int("groups"), int("state_dim")) {
-                        (Some(heads), Some(groups), Some(state)) => {
-                            let bc = groups * state;
-                            vec![
-                                (width.saturating_sub(2 * bc), Some(heads)),
-                                (bc, Some(groups)),
-                                (bc, Some(groups)),
-                            ]
-                        }
-                        _ => Vec::new(),
-                    }
-                }
-                ("ssm.mamba2" | "ssm.mamba2_chunked", "z" | "dt") => {
-                    vec![(width, int("heads"))]
-                }
-                ("linear.glu", "packed") => vec![(width / 2, None); 2],
-                _ => match head_dim {
-                    Some(d) if width.is_multiple_of(d) => vec![(width, Some(width / d))],
                     _ => Vec::new(),
-                },
-            };
-            if pieces.iter().map(|(w, _)| w).sum::<u64>() != width {
-                continue;
-            }
-            let mut lo = o.lo;
-            for (w, heads) in pieces {
-                self.bounds.entry(o.param).or_default().insert(lo);
-                if let Some(h) = heads {
-                    self.heads
-                        .entry(Origin {
-                            param: o.param,
-                            lo,
-                            hi: lo + w,
-                        })
-                        .or_insert(h);
                 }
-                lo += w;
             }
+            ("ssm.kda" | "ssm.kda_chunked", "mixed") => vec![(width / 3, None); 3],
+            ("ssm.gdn_gates", "ba") => vec![(width / 2, None); 2],
+            ("ssm.mamba2" | "ssm.mamba2_chunked", "xbc") => {
+                match (int("heads"), int("groups"), int("state_dim")) {
+                    (Some(heads), Some(groups), Some(state)) => {
+                        let bc = groups * state;
+                        vec![
+                            (width.saturating_sub(2 * bc), Some(heads)),
+                            (bc, Some(groups)),
+                            (bc, Some(groups)),
+                        ]
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            ("ssm.mamba2" | "ssm.mamba2_chunked", "z" | "dt") => {
+                vec![(width, int("heads"))]
+            }
+            ("linear.glu", "packed") => vec![(width / 2, None); 2],
+            ("gather.split_qkv_padded", "packed") => padded_qkv(t)
+                .map_or_else(Vec::new, |pieces| {
+                    pieces.into_iter().map(|(w, h)| (w, Some(h))).collect()
+                }),
+            _ => match head_dim {
+                Some(d) if width.is_multiple_of(d) => vec![(width, Some(width / d))],
+                _ => Vec::new(),
+            },
+        };
+        if pieces.iter().map(|(w, _)| w).sum::<u64>() != width {
+            return;
+        }
+        let mut lo = o.lo;
+        for (w, heads) in pieces {
+            self.bounds.entry(o.param).or_default().insert(lo);
+            if let Some(h) = heads {
+                self.heads
+                    .entry(Origin {
+                        param: o.param,
+                        lo,
+                        hi: lo + w,
+                    })
+                    .or_insert(h);
+            }
+            lo += w;
         }
     }
 
@@ -841,10 +938,13 @@ impl<'r, 't> Walk<'r, 't> {
             }),
             Cut::Beside(axis, origins) => {
                 let extent = *shape.get(*axis as usize)?;
-                let (segments, heads) = match origins.iter().collect::<Vec<_>>()[..] {
+                let (segments, mut heads) = match origins.iter().collect::<Vec<_>>()[..] {
                     [o] if o.hi - o.lo == extent => self.segments(o.param, o.lo, o.hi),
                     _ => (vec![extent], Vec::new()),
                 };
+                if let (Some(groups), [_]) = (self.grouped.get(&p), &segments[..]) {
+                    heads = vec![*groups];
+                }
                 Some(Shard::Cut {
                     axis: *axis,
                     segments,
@@ -853,6 +953,27 @@ impl<'r, 't> Walk<'r, 't> {
             }
         }
     }
+}
+
+/// The runs a padded q, k and v split takes its packed input apart into, as
+/// stored (each head its own width, before the op pads it), and the heads
+/// of each: its `heads` are q's and kv's, its `widths` a q or k head's and a
+/// v head's.
+fn padded_qkv(t: &Tree) -> Option<Vec<(u64, u64)>> {
+    let pair = |name: &str| match tree::field(t, name) {
+        Some(Tree::Seq(items)) => match items[..] {
+            [Tree::Int(a), Tree::Int(b)] => Some((u64::try_from(a).ok()?, u64::try_from(b).ok()?)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let (q_heads, kv_heads) = pair("heads")?;
+    let (qk, v) = pair("widths")?;
+    Some(vec![
+        (q_heads * qk, q_heads),
+        (kv_heads * qk, kv_heads),
+        (kv_heads * v, kv_heads),
+    ])
 }
 
 /// The column cuts whose shares `helds` are.

@@ -35,27 +35,22 @@ fn a_kv_head_is_held_by_a_group_of_ranks() {
         }
     }
 
-    // k and v are one product, a kv head each a rank.
-    let kv = trace
+    // q and its gate, k and v are one product: two query heads and their
+    // gates, and a kv head each, a rank.
+    let qkv = trace
         .params
         .iter()
         .find(|p| p.name == JOINED)
         .unwrap_or_else(|| panic!("the row reads `{JOINED}`"));
-    assert_eq!(kv.shape, [256 + 256, 1024], "one k and one v head");
-    let q = trace
-        .params
-        .iter()
-        .find(|p| p.name == "layers.3.attn.qg_proj")
-        .expect("the row reads its query projection");
     assert_eq!(
-        q.shape,
-        [2 * 2 * 256, 1024],
-        "two query heads and their gates"
+        qkv.shape,
+        [2 * 2 * 256 + 256 + 256, 1024],
+        "two query heads and their gates, one k and one v head"
     );
 }
 
-/// The 0.8b's k and v, joined (its q states no heads, so stays apart).
-const JOINED: &str = "layers.3.attn.k_proj_v_proj";
+/// The 0.8b's q and gate, k and v, joined.
+const JOINED: &str = "layers.3.attn.qg_proj_k_proj_v_proj";
 
 /// A rank's k projection is the share of the whole one its group reads: the
 /// four ranks read it in two groups of two.
@@ -92,22 +87,21 @@ fn the_contract_reads_a_kv_head_once_per_group() {
             .expr
             .clone()
     };
-    // The one k and one v head each read by a group of two.
-    let kv = || Expr::src(JOINED);
+    // The query heads cut once per rank, the one k and one v head each
+    // read by a group of two.
+    let qkv = || Expr::src(JOINED);
     assert_eq!(
         read(JOINED),
         Expr::concat(
             0,
             vec![
-                kv().slice(0, 0, 2 * 256).shard_among(0, 2),
-                kv().slice(0, 2 * 256, 2 * 256).shard_among(0, 2),
+                qkv().slice(0, 0, 8 * 2 * 256).shard(0),
+                qkv().slice(0, 8 * 2 * 256, 2 * 256).shard_among(0, 2),
+                qkv()
+                    .slice(0, 8 * 2 * 256 + 2 * 256, 2 * 256)
+                    .shard_among(0, 2),
             ]
         ),
-    );
-    assert_eq!(
-        read("layers.3.attn.qg_proj"),
-        Expr::src("layers.3.attn.qg_proj").shard(0),
-        "the query heads are cut once per rank",
     );
     drop(src);
     let _ = std::fs::remove_dir_all(&dir);
