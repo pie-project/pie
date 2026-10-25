@@ -217,12 +217,12 @@ fn host_counter(history: &[i32], hlen: usize, context_width: u32) -> u32 {
 fn pack4(a: &Tensor, b: &Tensor, c: &Tensor, d: &Tensor) -> Tensor {
     let lane = iota(4);
     let cd = select(
-        &eq(&lane, broadcast(2u32, [4])),
+        eq(&lane, broadcast(2u32, [4])),
         broadcast(c, [4]),
         broadcast(d, [4]),
     );
-    let bcd = select(&eq(&lane, broadcast(1u32, [4])), broadcast(b, [4]), &cd);
-    select(&eq(&lane, broadcast(0u32, [4])), broadcast(a, [4]), &bcd)
+    let bcd = select(eq(&lane, broadcast(1u32, [4])), broadcast(b, [4]), &cd);
+    select(eq(&lane, broadcast(0u32, [4])), broadcast(a, [4]), &bcd)
 }
 
 /// Assembles the `[2]` u32 `[key, ctr]` rng state from two `[1]` parts.

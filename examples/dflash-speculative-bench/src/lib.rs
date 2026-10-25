@@ -569,7 +569,7 @@ async fn main(input: Input) -> Result<Output> {
         fwd.readout(&readout)?;
         fwd.state(&[&ws], StateGeometry::folding())?;
         fwd.epilogue(move || {
-            next.put(&reshape(reduce_argmax(intrinsics::logits()), [1]));
+            next.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
         });
         fwd.submit(&pipe).context("prefill submit")?;
         anchor = next
@@ -625,7 +625,7 @@ async fn main(input: Input) -> Result<Output> {
             fwd.embed(&toks, &indptr)?;
             fwd.state(&[&ws], StateGeometry::folding())?;
             fwd.epilogue(move || {
-                next.put(&reshape(reduce_argmax(intrinsics::logits()), [1]));
+                next.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
             });
             let fired_at = monotonic_now_ns();
             fwd.submit(&pipe).context("baseline submit")?;
@@ -731,13 +731,11 @@ async fn main(input: Input) -> Result<Output> {
                 },
             )?;
             {
-                let out = out.clone();
-                let conf = conf.clone();
                 fwd.epilogue(move || {
-                    out.put(&reshape(intrinsics::mtp_drafts(shown), [shown]));
+                    out.put(reshape(intrinsics::mtp_drafts(shown), [shown]));
                     if want_margin {
                         let (value, _) = top_k(intrinsics::logits(), 2);
-                        conf.put(&reshape(value, [shown * 2]));
+                        conf.put(reshape(value, [shown * 2]));
                     }
                     if want_sure {
                         // Each row's largest probability at temperature 1,
@@ -813,9 +811,8 @@ async fn main(input: Input) -> Result<Output> {
             },
         )?;
         {
-            let truth = truth.clone();
             fwd.epilogue(move || {
-                truth.put(&reshape(reduce_argmax(intrinsics::logits()), [verify]));
+                truth.put(reshape(reduce_argmax(intrinsics::logits()), [verify]));
             });
         }
         let verified_at = monotonic_now_ns();

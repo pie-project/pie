@@ -110,8 +110,7 @@ async fn main(_input: Input) -> Result<String> {
             argmax(&logits),
             at(&probabilities, argmax(&logits)),
             logits.len()
-        )
-        .into());
+        ));
     }
 
     if probabilities.len() != vocab as usize || log_probabilities.len() != vocab as usize {

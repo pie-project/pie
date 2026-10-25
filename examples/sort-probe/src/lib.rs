@@ -116,7 +116,7 @@ fn dry_penalty(hist: &Tensor, hlen: &Tensor, vocab: u32, cfg: DryCfg) -> (Tensor
         );
     }
     let count = reshape(
-        reduce_sum(cast(&gt(&penalty, &vocab_zero), dtype::f32)),
+        reduce_sum(cast(gt(&penalty, &vocab_zero), dtype::f32)),
         [1],
     );
     let peak = reshape(reduce_max(&penalty), [1]);
@@ -224,35 +224,35 @@ async fn main(input: Input) -> Result<String> {
         let logprobs = log_softmax(&logits);
         let probabilities = exp(&logprobs);
         let keep = pivot_threshold(&probabilities, cummass_le(TOP_P));
-        keep_out.put(&reshape(cast(&keep, dtype::i32), [vocab]));
-        cumsum_out.put(&reshape(cumsum(&probabilities), [vocab]));
+        keep_out.put(reshape(cast(&keep, dtype::i32), [vocab]));
+        cumsum_out.put(reshape(cumsum(&probabilities), [vocab]));
         let cand = broadcast(reshape(offs.take(), [2, 1]), [2, vocab])
             + broadcast(reshape(&logprobs, [1, vocab]), [2, vocab]);
-        bc_out.put(&reshape(
+        bc_out.put(reshape(
             gather(reshape(&cand, [2 * vocab]), bc_idx.take()),
             [5],
         ));
-        argmax2.put(&reshape(cast(reduce_argmax(&cand), dtype::i32), [2]));
+        argmax2.put(reshape(cast(reduce_argmax(&cand), dtype::i32), [2]));
         if !light {
             let (sorted, order) = sort_desc(&probabilities);
-            sorted_out.put(&reshape(&sorted, [vocab]));
-            order_out.put(&reshape(cast(&order, dtype::i32), [vocab]));
+            sorted_out.put(reshape(&sorted, [vocab]));
+            order_out.put(reshape(cast(&order, dtype::i32), [vocab]));
             let (v1, i1) = top_k(reshape(&logits, [vocab]), K);
-            top1_v.put(&reshape(&v1, [K]));
-            top1_i.put(&reshape(cast(&i1, dtype::i32), [K]));
+            top1_v.put(reshape(&v1, [K]));
+            top1_i.put(reshape(cast(&i1, dtype::i32), [K]));
             let (v2, i2) = top_k(reshape(&cand, [2 * vocab]), K);
-            top2_v.put(&reshape(&v2, [K]));
-            top2_i.put(&reshape(cast(&i2, dtype::i32), [K]));
+            top2_v.put(reshape(&v2, [K]));
+            top2_i.put(reshape(cast(&i2, dtype::i32), [K]));
         }
         let hist = hist_ch.take();
         let hlen = hlen_ch.take();
-        m_out.put(&reshape(suffix_match(&hist, &hlen, dry), [16]));
+        m_out.put(reshape(suffix_match(&hist, &hlen, dry), [16]));
         let (penalty, count, peak) = dry_penalty(&hist, &hlen, vocab, dry);
         cnt_out.put(&count);
         peak_out.put(&peak);
         let pen_tok = cast(reshape(reduce_argmax(&penalty), [1]), dtype::i32);
         argpen_out.put(&pen_tok);
-        histn_out.put(&reshape(scatter_set(&hist, &hlen, &pen_tok), [16]));
+        histn_out.put(reshape(scatter_set(&hist, &hlen, &pen_tok), [16]));
         logits_out.put(&logits);
         probs_out.put(&probabilities);
     });

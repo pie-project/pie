@@ -114,7 +114,7 @@ async fn main(input: Input) -> Result<Output> {
         inferlet::serde_json::from_str(&text).map_err(|why| format!("case json: {why}"))?;
     let length = CANVAS;
     if case.canvas0.len() != length as usize || case.canvas1.len() != length as usize {
-        return Err(format!("the case's canvases are not {length} long").into());
+        return Err(format!("the case's canvases are not {length} long"));
     }
     let lane = model::lane_of(&[("mode", "denoise")])?;
     let taps = lane
@@ -127,8 +127,7 @@ async fn main(input: Input) -> Result<Output> {
         return Err(format!(
             "the case carries {} taps per row and this model takes {taps}",
             case.taps
-        )
-        .into());
+        ));
     }
     let n = u32::try_from(case.prompt_ids.len()).map_err(|_| "prompt is too long")?;
     let temperature = case.temperature;
