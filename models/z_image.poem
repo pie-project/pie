@@ -312,6 +312,7 @@ def generative(m):
             channels = CHANNELS,
             spatial_compression = SPATIAL_COMPRESSION,
             temporal_compression = 1,
+            first_frames = 1,
         ),
         schedule = schedule(
             "flow",

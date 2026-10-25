@@ -343,6 +343,7 @@ def generative(m):
             channels = VAE_CHANNELS,
             spatial_compression = TOKEN_COMPRESSION // PACK,
             temporal_compression = 1,
+            first_frames = 1,
         ),
         schedule = schedule(
             "flow",

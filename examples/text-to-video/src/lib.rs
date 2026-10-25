@@ -1,36 +1,6 @@
-//! **THE MODEL-AGNOSTIC `text-to-video` INFERLET**: a prompt in, a clip
-//! out, with nothing about any family spelled here. The sibling of
-//! `text-to-image`, and built the same way: the guest knows MODEL FACTS (the
-//! readings, what each lane of them binds, the VAE's latent space, the
-//! schedule) and never ARCHITECTURE FACTS (patches, positions, padding).
-//!
-//! The latent it holds is the VAE's own `[t, h, w, C]` volume. Every pass of
-//! the denoise goes down one pipeline: the text encoder, whose rows stay on
-//! the device (padded there to the rows the `context` input states, Wan's
-//! 512), then `steps` denoise fires. The first denoise fire's prologue draws
-//! the latent from a keyed `normal` on the device (or noises the encoded
-//! init clip) and seeds the loop's clock, before its forward reads them;
-//! each denoise epilogue integrates one Euler step, guided `u + s (c - u)`
-//! when a negative prompt adds a second attention group to the pass.
-//!
-//! # THE DECODE
-//!
-//! A causal video VAE decodes one latent frame a fire on one working set:
-//! the first fire on it lands one frame, every later one
-//! `temporal-compression` (the model's own branch on its working set being
-//! fresh). So `T` latent frames are `1 + tc (T - 1)` output
-//! frames, and a `frames` off that lattice is refused with the two nearest.
-//! The decode fires are a sequence (the per-conv frame caches); they go down
-//! the denoise's pipeline, in order, and each one's prologue gathers its
-//! latent frame out of the denoised latent on the device: nothing of the
-//! latent comes back to the host.
-//!
-//! # THE PROMPT
-//!
-//! `--prompt` renders the bound model's template and tokenizes with its
-//! vocabulary. Wan 2.2's umT5 tokenizer is a Unigram model `crates/tokenizer`
-//! cannot spell, so `--prompt-ids` hands in ids tokenized elsewhere; the
-//! encoder still runs inside pie, and the report says which door was used.
+//! A model-agnostic text-to-video sampler, the sibling of `text-to-image`:
+//! it reads the model's switches, lanes, latent space and schedule, binds
+//! inputs by the standard names, and decodes one latent frame a fire.
 
 use inferlet::frames::{Frames, ImageFormat};
 use inferlet::latent::prelude::*;
@@ -40,6 +10,7 @@ use serde::{Deserialize, Serialize};
 struct Input {
     #[serde(default)]
     prompt: Option<String>,
+    /// Comma-separated token ids, for a model whose tokenizer pie lacks.
     #[serde(default)]
     prompt_ids: Option<String>,
     #[serde(default)]
@@ -64,37 +35,15 @@ struct Input {
     format: Option<String>,
     #[serde(default)]
     out: Option<String>,
-    /// VIDEO2VIDEO: how much of the schedule to run over the encoded clip,
-    /// in `(0, 1]`. `1.0` is every step, which is text-to-video from noise:
-    /// `(1 - 1)*x0 + 1*eps` IS the keyed draw, so the init washes out
-    /// entirely and the run is the one with no init at all. `0.6` keeps the
-    /// first 40% of the trajectory as the clip's own. Only read when an init
-    /// clip is given.
-    ///
-    /// That identity is exact in the arithmetic and only NEARLY exact in the
-    /// file, because a `pie run` of this row is not bit-reproducible: two
-    /// identical runs land clips a few ten-thousandths apart. What the gate
-    /// claims is the shape that survives it — see `gates.py`'s
-    /// `v2v_claims`.
     #[serde(default)]
     strength: Option<f32>,
-    /// THE INIT CLIP, frame by frame: `init_frame_<f>_<n>` is frame `f`'s
-    /// base64-encoded still (PNG, JPEG, GIF, WebP), piece `n`. Two indices
-    /// because a clip is a LIST of pictures and one argv argument is capped
-    /// at `MAX_ARG_STRLEN` well below a single still. A frame small enough
-    /// to travel whole may be `init_frame_<f>` with no piece index.
-    ///
-    /// The clip must be this run's own `width x height x frames`: a guest
-    /// has no resampler, in space or in time.
+    /// `init_frame_<f>_<n>` (or `init_frame_<f>`): base64 of init frame `f`,
+    /// piece `n` (video2video).
     #[serde(flatten)]
     rest: std::collections::BTreeMap<String, inferlet::serde_json::Value>,
 }
 
 impl Input {
-    /// **THE INIT CLIP'S FRAMES, IN FRAME ORDER**, each frame's pieces
-    /// concatenated in piece order. The `f`s are taken in sorted order and
-    /// renumbered densely: what matters is which frame is first, not the
-    /// label the caller gave it.
     fn init_frames(&self) -> Vec<String> {
         let mut found: std::collections::BTreeMap<u64, std::collections::BTreeMap<u64, &str>> =
             std::collections::BTreeMap::new();
@@ -102,7 +51,6 @@ impl Input {
             let Some(rest) = name.strip_prefix("init_frame_") else {
                 continue;
             };
-            // `<f>_<n>`, or a bare `<f>` for a frame that travelled whole.
             let (frame, piece) = rest.split_once('_').unwrap_or((rest, "0"));
             let (Ok(frame), Ok(piece), Some(text)) =
                 (frame.parse::<u64>(), piece.parse::<u64>(), value.as_str())
@@ -124,13 +72,11 @@ struct Output {
     architecture: String,
     reading: String,
     prompt: String,
-    /// `"prompt"` (the bound tokenizer) or `"prompt-ids"` (handed in).
     prompt_source: String,
     width: u32,
     height: u32,
     frames: u32,
     fps: f32,
-    /// The VAE latent this run denoised, `[latent_frames, latent_h, latent_w, channels]`.
     latent_frames: u32,
     latent_h: u32,
     latent_w: u32,
@@ -147,7 +93,6 @@ struct Output {
     guidance: f32,
     cfg: bool,
     sigmas: Vec<f32>,
-    /// The rows the context lane carries, and how many are the prompt's.
     context_rows: u32,
     prompt_rows: u32,
     file: String,
@@ -160,7 +105,6 @@ fn values(switch: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The switches of a lane: `reading`, and `stream` where the model has one.
 fn lane_switches<'a>(reading: &'a str, stream: Option<&'a str>) -> Vec<(&'a str, &'a str)> {
     let mut switches = vec![("reading", reading)];
     if let Some(stream) = stream {
@@ -193,11 +137,35 @@ fn streams() -> Vec<Option<String>> {
     }
 }
 
-/// The stream of `reading` whose lane reads `name`.
 fn stream_reading(reading: &str, name: &str) -> Option<Option<String>> {
     streams()
         .into_iter()
         .find(|stream| lane(reading, stream.as_deref()).is_ok_and(|l| input(&l, name).is_some()))
+}
+
+const STANDARD: [&str; 5] = ["latents", "timestep", "guidance", "context", "length"];
+
+fn bind(
+    pass: &ForwardPass,
+    at: u32,
+    lane: &model::LaneDecl,
+    have: &[(&str, &Channel)],
+    what: &str,
+) -> Result<()> {
+    for decl in &lane.inputs {
+        let (_, ch) = have
+            .iter()
+            .find(|(name, _)| *name == decl.name)
+            .ok_or_else(|| {
+                format!(
+                    "{what} reads `{}`; this sampler binds {}",
+                    decl.name,
+                    STANDARD.join(", ")
+                )
+            })?;
+        pass.input(at, &decl.name, ch)?;
+    }
+    Ok(())
 }
 
 struct Text {
@@ -213,7 +181,6 @@ struct Denoise {
     latents: model::InputDecl,
     context: model::InputDecl,
     guidance: bool,
-    velocity_width: u32,
 }
 
 fn text_reading() -> Result<Text> {
@@ -258,9 +225,16 @@ fn denoise_reading() -> Result<Denoise> {
         if input(&video, "timestep").is_none() {
             return Err(format!("reading `{reading}` reads no `timestep`").into());
         }
+        let velocity = video.readout.as_ref().map_or(0, |r| r.width);
+        if velocity != latents.width {
+            return Err(format!(
+                "reading `{reading}` reads out {velocity}-wide velocity rows over {}-wide latent cells",
+                latents.width
+            )
+            .into());
+        }
         return Ok(Denoise {
             context: input(&prompt, "context").cloned().expect("found by it"),
-            velocity_width: video.readout.as_ref().map_or(0, |r| r.width),
             guidance: input(&video, "guidance").is_some(),
             reading,
             latent_stream,
@@ -271,8 +245,6 @@ fn denoise_reading() -> Result<Denoise> {
     Err("this model declares no token-less reading of `latents` with a velocity readout".into())
 }
 
-/// The rows a lane of `len` rows of its own carries under the model's
-/// `input-decl.rows`, `None` when they do not fit.
 fn padded(rows: Option<model::RowCount>, len: u32) -> Option<u32> {
     match rows {
         None => Some(len),
@@ -281,8 +253,6 @@ fn padded(rows: Option<model::RowCount>, len: u32) -> Option<u32> {
     }
 }
 
-/// `rows` rows of `width` out of `h`'s first `len`, the rest zero: the
-/// context pad a model states with `input-decl.rows`, done on the device.
 fn pad_rows(h: &Tensor, len: u32, rows: u32, width: u32) -> Tensor {
     if rows == len {
         return h.clone();
@@ -293,22 +263,20 @@ fn pad_rows(h: &Tensor, len: u32, rows: u32, width: u32) -> Tensor {
     &gather(h, &src) * &broadcast(reshape(&keep, [rows, 1]), [rows, width])
 }
 
-/// All the passes of one job, kept alive until the denoise has landed.
 #[derive(Default)]
 struct Held {
     passes: Vec<ForwardPass>,
     sets: Vec<WorkingSet>,
 }
 
-/// Encode `ids` on `pipe` into a device channel the denoise `context`
-/// input takes.
+/// The prompt as the rows `context` takes, and their count before the pad.
 fn encode(
     pipe: &Pipeline,
     held: &mut Held,
     text: &Text,
     context: &model::InputDecl,
     ids: &[u32],
-) -> Result<(Channel, u32)> {
+) -> Result<(Channel, Channel)> {
     if text.width != context.width {
         return Err(format!(
             "the text reading hands back {}-wide rows and input `{}` takes {}",
@@ -357,28 +325,9 @@ fn encode(
     });
     pass.submit(pipe)?;
     held.passes.push(pass);
-    Ok((encoded, len))
+    Ok((encoded, Channel::from([len as f32]).named("length")))
 }
 
-/// What `reading`'s lane on `stream` reads out.
-fn readout(reading: &str, stream: &str) -> Option<model::Readout> {
-    model::lane_of(&[("reading", reading), ("stream", stream)])
-        .ok()?
-        .readout
-}
-
-/// How wide a row `reading`'s lane on `stream` reads out.
-fn readout_width(reading: &str, stream: &str) -> Result<u32> {
-    readout(reading, stream)
-        .map(|readout| readout.width)
-        .ok_or_else(|| format!("reading `{reading}` reads nothing out on its `{stream}` lane"))
-}
-
-/// Standard base64 (`+/`, `=` padded) into the bytes it spells. The one
-/// thing that travels this way is an init clip's frames: argv is text, an
-/// encoded still is not, and a scratch-file door would make the clip a path
-/// rather than a value — and the sandbox's `/scratch` is per PROCESS, so
-/// nothing outside could put a file there anyway.
 fn b64_decode(text: &str) -> Result<Vec<u8>> {
     let code = |c: u8| -> Option<u32> {
         Some(match c {
@@ -405,172 +354,51 @@ fn b64_decode(text: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// A VAE arm's lane, and the one input it reads: a clip on the voxel axis.
-fn vae_lane(reading: &str) -> Result<(model::LaneDecl, model::InputDecl)> {
-    let lane = model::lane_of(&[("reading", reading), ("stream", "video")])?;
-    match &lane.inputs[..] {
-        [input] if input.axis == model::InputAxis::Voxel => {
-            let input = input.clone();
-            Ok((lane, input))
-        }
-        other => Err(format!(
-            "reading `{reading}` reads {} input(s), and a VAE arm reads one clip on the voxel axis",
-            other.len()
-        )
-        .into()),
-    }
+struct Vae {
+    reading: String,
+    stream: Option<String>,
+    state: bool,
+    input: model::InputDecl,
+    width: u32,
 }
 
-/// Binds `state` to a VAE arm's pass when the model says its lane carries
-/// state across fires (a causal VAE's per-conv frame caches).
-fn bind_state(pass: &ForwardPass, lane: &model::LaneDecl, state: &WorkingSet) -> Result<()> {
-    if lane.state {
-        pass.state(&[state], StateGeometry::default())?;
-    }
-    Ok(())
-}
-
-/// Fire ONE encode arm over ONE PIXEL CHUNK and take the latent frame it
-/// lands: the mirror of [`decode_frame`], and the door video2video comes in
-/// through.
-///
-/// The chunk goes in as the input's CHANNEL, seeded straight from a host-held
-/// `frames` handle (`Channel::set_frames`, which is a `put` and so must
-/// happen after the pass has bound the input — a channel has no ring before
-/// that). Its shape IS the clip's box, `[t, H, W, 3]`, so the geometry the
-/// voxel axis needs travels with the numbers.
-///
-/// The answer comes back on the same `pixels` seam a decode uses. For an
-/// encoder that seam carries ONE LATENT FRAME — the posterior MEAN, already
-/// normalised into the denoiser's own space — whatever the number of pixel
-/// frames that went in.
-async fn encode_chunk(
-    reading: &str,
-    chunk: &Frames,
-    chunk_frames: u32,
-    pixel_h: u32,
-    pixel_w: u32,
-    clip_h: u32,
-    clip_w: u32,
-    state: &WorkingSet,
-    pipe: &Pipeline,
-) -> Result<Vec<f32>> {
-    let (lane, input) = vae_lane(reading)?;
-    let rows = clip_h * clip_w;
-    let width = readout_width(reading, "video")?;
-    let pass = ForwardPass::new();
-    pass.switch(0, "reading", reading)?;
-    pass.switch(0, "stream", "video")?;
-    bind_state(&pass, &lane, state)?;
-    // Empty, and SEEDED from the chunk below: the pixels are the host's, and
-    // the eta trace tracks readiness STATICALLY — a channel the host seeds
-    // has to be declared `seeded`, or the trace refuses it as consumed but
-    // never produced.
-    let cell = Channel::seeded([chunk_frames, pixel_h, pixel_w, input.width], dtype::f32)
-        .named("vae_pixels_in");
-    pass.input(0, &input.name, &cell)?;
-    let out = Channel::new([rows, width], dtype::f32).named("vae_latent_out");
-    let readback = out.clone();
-    pass.epilogue(move || {
-        readback.put(intrinsics::pixels(0, rows, width));
-    });
-    // THE PIXELS, seeded straight from the host's handle, after the bind.
-    cell.set_frames(chunk)?;
-    pass.submit(pipe)
-        .with_context(|| format!("the `{reading}` fire"))?;
-    let landed = out.take_host::<Vec<f32>>().await?;
-    let want = (rows * width) as usize;
-    if landed.len() != want {
-        return Err(format!(
-            "reading `{reading}` landed {} numbers over a {chunk_frames}-frame chunk and one \
-             latent frame is {clip_h}x{clip_w}x{width} = {want}",
-            landed.len()
-        )
-        .into());
-    }
-    Ok(landed)
-}
-
-/// ONE decode arm over ONE latent frame, and the channel its pixels land on.
-///
-/// The pass's prologue gathers latent frame `j` out of the denoised latent
-/// `x` (`[T, h, w, C]`) into the arm's input, on the device: the first arm
-/// takes frame 0 and starts the count `j`, every later one takes the frame
-/// `j` names and counts on. The epilogue takes the frame back off the input
-/// (each fire's prologue puts its own) and lands the pixels. `frames` is how
-/// many output frames the arm lands, which the caller knows from the
-/// family's `temporal-compression` and which arm this is.
-#[allow(clippy::too_many_arguments)]
-fn decode_frame(
-    reading: &str,
-    x: &Channel,
-    j: &Channel,
-    first: bool,
-    lat: [u32; 4],
-    frames: u32,
-    pixel_h: u32,
-    pixel_w: u32,
-    state: &WorkingSet,
-) -> Result<(ForwardPass, Channel)> {
-    let (lane, input) = vae_lane(reading)?;
-    let [lt, lh, lw, c] = lat;
-    if input.width != c {
-        return Err(format!(
-            "input `{}` reads {}-wide cells and the latent has {c} channels",
-            input.name, input.width
-        )
-        .into());
-    }
-    let rows = frames * pixel_h * pixel_w;
-    let width = readout_width(reading, "video")?;
-    let pass = ForwardPass::new();
-    pass.switch(0, "reading", reading)?;
-    pass.switch(0, "stream", "video")?;
-    bind_state(&pass, &lane, state)?;
-    // Queued: each fire's prologue puts the frame its forward reads, and
-    // its epilogue takes it.
-    let frame = Channel::new([lh, lw, c], dtype::f32)
-        .queued()
-        .named("vae_latent");
-    pass.input(0, &input.name, &frame)?;
-    let (x, j) = (*x, *j);
-    pass.prologue(move || {
-        let at = if first {
-            Tensor::constant([0u32])
-        } else {
-            j.take()
+fn vae_lane(reading: &str) -> Result<Vae> {
+    for stream in streams() {
+        let Ok(lane) = lane(reading, stream.as_deref()) else {
+            continue;
         };
-        let frames = reshape(x.read(), [lt, lh * lw * c]);
-        frame.put(reshape(gather(&frames, &at), [lh, lw, c]));
-        j.put(&at + 1u32);
-    });
-    let out = Channel::new([rows, width], dtype::f32).named("vae_pixels");
-    pass.epilogue(move || {
-        frame.take();
-        out.put(intrinsics::pixels(0, rows, width));
-    });
-    Ok((pass, out))
+        if let ([input], Some(readout)) = (&lane.inputs[..], &lane.readout)
+            && input.axis == model::InputAxis::Voxel
+        {
+            return Ok(Vae {
+                reading: reading.to_string(),
+                stream,
+                state: lane.state,
+                input: input.clone(),
+                width: readout.width,
+            });
+        }
+    }
+    Err(format!("reading `{reading}` reads no one clip on the voxel axis").into())
 }
 
-/// `[-1, 1]` f32 in `(t, h, w, 3)` order to interleaved RGB8, clamped.
-fn rgb8(pixels: &[f32]) -> Vec<u8> {
-    pixels
-        .iter()
-        .map(|v| (((v + 1.0) * 127.5).clamp(0.0, 255.0)) as u8)
-        .collect()
+impl Vae {
+    fn pass(&self, state: &WorkingSet) -> Result<ForwardPass> {
+        let pass = ForwardPass::new();
+        set_switches(&pass, 0, &self.reading, self.stream.as_deref())?;
+        if self.state {
+            pass.state(&[state], StateGeometry::default())?;
+        }
+        Ok(pass)
+    }
 }
 
-/// The prompt as ids, through the BOUND MODEL's own template and
-/// tokenizer: one user turn plus the generation cue, which is what every
-/// instruct-encoder pipeline renders before it tokenizes. Only reached on
-/// the `--prompt` door; `--prompt-ids` skips both.
 fn template_ids(prompt: &str) -> Vec<u32> {
     let mut ids = inferlet::chat::first_user(prompt);
     ids.extend(inferlet::chat::cue());
     ids
 }
 
-/// `"1,2,3"` to ids. Refuses a piece that is not a number, by name.
 fn ids_of(text: &str) -> Result<Vec<u32>> {
     let mut out = Vec::new();
     for piece in text.split(|c: char| c == ',' || c.is_whitespace()) {
@@ -594,20 +422,18 @@ async fn main(input: Input) -> Result<Output> {
     let text = text_reading()?;
     let denoise = denoise_reading()?;
     let readings = values("reading");
-    let decode = readings
-        .iter()
-        .find(|r| *r == "vae.decode")
-        .cloned()
-        .ok_or(
-            "this model declares no `vae.decode` reading, so its latent has no way out as frames",
-        )?;
-    let encode_reading = readings.iter().find(|r| *r == "vae.encode").cloned();
+    let decode = vae_lane(
+        readings
+            .iter()
+            .find(|r| *r == "vae.decode")
+            .ok_or("this model declares no `vae.decode` reading, so its latent has no way out")?,
+    )?;
 
-    // ---- the latent volume, the VAE's own -----------------------------------
     let space = model::latent().ok_or("this model states no latent space")?;
-    let (sc, tc, c) = (
+    let (sc, tc, first, c) = (
         space.spatial_compression.max(1),
         space.temporal_compression.max(1),
+        space.first_frames.max(1),
         space.channels,
     );
     if tc == 1 {
@@ -622,27 +448,33 @@ async fn main(input: Input) -> Result<Output> {
         )
         .into());
     }
+    if decode.input.width != c || decode.width != 3 {
+        return Err(format!(
+            "`{}` reads {}-wide cells into {}-wide pixels; the latent has {c} channels and a \
+             frame is RGB",
+            decode.reading, decode.input.width, decode.width
+        )
+        .into());
+    }
     let height = (input.height.unwrap_or(480) / sc).max(1) * sc;
     let width = (input.width.unwrap_or(832) / sc).max(1) * sc;
     let (lh, lw) = (height / sc, width / sc);
     let frames = input.frames.unwrap_or(17).max(1);
-    // A causal VAE's first fire on its working set lands one frame and every
-    // later one `tc`: `1 + tc (T - 1)` frames and no other count.
-    if (frames - 1) % tc != 0 {
-        let below = 1 + tc * ((frames - 1) / tc);
+    if frames < first || (frames - first) % tc != 0 {
+        let below = first + tc * (frames.saturating_sub(first) / tc);
         return Err(format!(
-            "this family's VAE lands 1 + {tc}*(T - 1) frames, so {frames} is not a clip it \
-             has: the nearest are {below} and {}",
+            "this model's latent frames stand for {first}, then {tc} each, so {frames} frames is \
+             not a clip it has: the nearest are {below} and {}",
             below + tc
         )
         .into());
     }
-    let lt = (frames - 1) / tc + 1;
+    let lt = (frames - first) / tc + 1;
+    let pixel_frames = |j: u32| if j == 0 { first } else { tc };
     let lat = [lt, lh, lw, c];
     let cells = lt * lh * lw;
-    let plane = (lh * lw * c) as usize;
+    let plane = lh * lw * c;
 
-    // ---- the schedule -------------------------------------------------------
     let fact = model::schedule().ok_or("this model states no schedule; nothing here denoises")?;
     let steps = match input.steps.filter(|s| *s > 0) {
         Some(steps) => steps,
@@ -651,7 +483,6 @@ async fn main(input: Input) -> Result<Output> {
         }
         None => 8,
     };
-    // No dynamic shift: a video row's stated shift is the shift itself.
     let full = FlowMatchEuler::from_schedule(&fact, steps, None)?;
     let init_b64 = input.init_frames();
     let has_init = !init_b64.is_empty();
@@ -673,7 +504,6 @@ async fn main(input: Input) -> Result<Output> {
     ts.push(0.0);
     let fps = input.fps.unwrap_or(24.0);
 
-    // ---- the prompt's ids, through whichever door the caller opened -------
     let (ids, prompt, prompt_source) = match (&input.prompt_ids, &input.prompt) {
         (Some(ids), _) => {
             let ids = ids_of(ids)?;
@@ -705,14 +535,21 @@ async fn main(input: Input) -> Result<Output> {
     }
     let cfg = negative.is_some() && guidance > 1.0;
 
-    // ---- video2video: the clip, encoded chunk by chunk ----------------------
     let pipe = Pipeline::new();
+    let mut held = Held::default();
     let init: Option<Channel> = if !has_init {
         None
     } else {
-        let reading = encode_reading.as_ref().ok_or(
-            "this model declares no `vae.encode` reading, so an init clip has no door to come in through",
-        )?;
+        let enc = vae_lane(readings.iter().find(|r| *r == "vae.encode").ok_or(
+            "this model declares no `vae.encode` reading, so an init clip has no way in",
+        )?)?;
+        if enc.width != c {
+            return Err(format!(
+                "`{}` reads out {}-wide cells, the latent has {c} channels",
+                enc.reading, enc.width
+            )
+            .into());
+        }
         if init_b64.len() as u32 != frames {
             return Err(format!(
                 "the init clip is {} frames and this run is {frames}",
@@ -720,7 +557,7 @@ async fn main(input: Input) -> Result<Output> {
             )
             .into());
         }
-        let mut rgb: Vec<Vec<u8>> = Vec::with_capacity(init_b64.len());
+        let mut stills = Vec::with_capacity(init_b64.len());
         for (f, b64) in init_b64.iter().enumerate() {
             let picture = Frames::decode(&b64_decode(b64)?)
                 .map_err(|why| format!("init frame {f} does not decode: {why}"))?;
@@ -733,47 +570,39 @@ async fn main(input: Input) -> Result<Output> {
                 )
                 .into());
             }
-            rgb.push(
-                picture
-                    .encode(ImageFormat::RawRgb8)
-                    .map_err(|why| format!("init frame {f} does not read back as RGB8: {why}"))?,
-            );
+            stills.push(picture);
         }
-        let mut chunks: Vec<u32> = vec![1];
-        while chunks.iter().sum::<u32>() < frames {
-            chunks.push(tc);
-        }
-        if chunks.iter().sum::<u32>() != frames || chunks.len() as u32 != lt {
-            return Err(format!(
-                "a {frames}-frame clip does not chunk into {lt} encode fires at tc = {tc}"
-            )
-            .into());
-        }
-        let mut clip: Vec<f32> = Vec::with_capacity(lt as usize * plane);
-        // One working set for the whole clip: the conv caches are its state.
+        let init = Channel::new([lt, plane], dtype::f32).queued().named("init");
         let enc_state = WorkingSet::new();
+        let rows = lh * lw;
         let mut at = 0usize;
-        for (k, take) in chunks.iter().copied().enumerate() {
-            let mut payload: Vec<u8> =
-                Vec::with_capacity(take as usize * (height * width * 3) as usize);
-            for f in at..at + take as usize {
-                payload.extend_from_slice(&rgb[f]);
-            }
+        for j in 0..lt {
+            let take = pixel_frames(j);
+            let parts: Vec<&Frames> = stills[at..at + take as usize].iter().collect();
             at += take as usize;
-            let handle = Frames::from_rgb8(&payload, width, height, take, fps)
-                .map_err(|why| format!("encode chunk {k}: frames.from-rgb8: {why}"))?;
-            let landed = encode_chunk(
-                reading, &handle, take, height, width, lh, lw, &enc_state, &pipe,
-            )
-            .await
-            .with_context(|| format!("encoding chunk {k}"))?;
-            clip.extend_from_slice(&landed);
+            let chunk = Frames::concat(&parts).map_err(|why| format!("encode chunk {j}: {why}"))?;
+            let pass = enc.pass(&enc_state)?;
+            let pixels = Channel::seeded([take, height, width, enc.input.width], dtype::f32)
+                .named("vae_pixels_in");
+            pass.input(0, &enc.input.name, &pixels)?;
+            pass.epilogue(move || {
+                let base = if j == 0 {
+                    broadcast(Tensor::constant([0f32]), [lt, plane])
+                } else {
+                    init.take()
+                };
+                let frame = reshape(intrinsics::pixels(0, rows, c), [1, plane]);
+                init.put(scatter_set(&base, Tensor::constant([j]), &frame));
+            });
+            pixels.set_frames(&chunk)?;
+            pass.submit(&pipe)
+                .with_context(|| format!("the `{}` fire on chunk {j}", enc.reading))?;
+            held.passes.push(pass);
         }
-        Some(Channel::from_shaped(lat, clip).named("init"))
+        held.sets.push(enc_state);
+        Some(init)
     };
 
-    // ---- the loop's state, all on the device ---------------------------------
-    let mut held = Held::default();
     let x = Channel::new(lat, dtype::f32).queued().named("x");
     let k = Channel::new([1], dtype::u32).queued().named("k");
     let t = Channel::new([1], dtype::f32).queued().named("t");
@@ -781,13 +610,12 @@ async fn main(input: Input) -> Result<Output> {
     let sigmas = Channel::from(sched.sigmas.clone()).named("sigmas");
     let seed = input.seed.unwrap_or(0);
     let draw = Channel::from(rng_state(seed)).named("draw");
-    // The first denoise fire's prologue: `x` and the clock at 0.
     let seed_loop = move || {
         let eps = normal(&draw.read(), lat);
         let x0 = match &init {
             None => eps,
             Some(init) => {
-                &(&init.read() * &broadcast(Tensor::constant([1.0 - sigma0]), lat))
+                &(&reshape(init.read(), lat) * &broadcast(Tensor::constant([1.0 - sigma0]), lat))
                     + &(&eps * &broadcast(Tensor::constant([sigma0]), lat))
             }
         };
@@ -796,17 +624,14 @@ async fn main(input: Input) -> Result<Output> {
         t.put(at(&ts.read(), &Tensor::constant([0u32])));
     };
 
-    // ---- the prompt, encoded on the device -----------------------------------
-    let (context, prompt_rows) = encode(&pipe, &mut held, &text, &denoise.context, &ids)?;
+    let context = encode(&pipe, &mut held, &text, &denoise.context, &ids)?;
     let uncond = match &negative {
-        Some(neg) if cfg => Some(encode(&pipe, &mut held, &text, &denoise.context, neg)?.0),
+        Some(neg) if cfg => Some(encode(&pipe, &mut held, &text, &denoise.context, neg)?),
         _ => None,
     };
 
-    // ---- the denoise passes: every fire the same step, the first one also
-    // drawing the latent in its prologue ------------------------------------
     let guidance_ch = Channel::from([guidance]).named("guidance");
-    let (n, vw) = (cells, denoise.velocity_width);
+    let n = cells;
     let denoise_pass = |first: bool| -> Result<ForwardPass> {
         let pass = ForwardPass::new();
         let mut lanes = 0u32;
@@ -815,31 +640,24 @@ async fn main(input: Input) -> Result<Output> {
             .flatten()
             .enumerate()
         {
-            for (stream, latent) in [
-                (&denoise.latent_stream, true),
-                (&denoise.context_stream, false),
-            ] {
+            for stream in [&denoise.latent_stream, &denoise.context_stream] {
                 let at = lanes;
                 lanes += 1;
                 set_switches(&pass, at, &denoise.reading, stream.as_deref())?;
                 pass.group(at, group as u32)?;
-                for decl in lane(&denoise.reading, stream.as_deref())?.inputs {
-                    let ch = match decl.name.as_str() {
-                        "latents" if latent => &x,
-                        "context" if !latent => ctx,
-                        "timestep" => &t,
-                        "guidance" => &guidance_ch,
-                        other => {
-                            return Err(format!(
-                                "reading `{}` reads `{other}` on lane {at}; this sampler binds \
-                                 latents, timestep, guidance and context",
-                                denoise.reading
-                            )
-                            .into());
-                        }
-                    };
-                    pass.input(at, &decl.name, ch)?;
-                }
+                bind(
+                    &pass,
+                    at,
+                    &lane(&denoise.reading, stream.as_deref())?,
+                    &[
+                        ("latents", &x),
+                        ("timestep", &t),
+                        ("guidance", &guidance_ch),
+                        ("context", &ctx.0),
+                        ("length", &ctx.1),
+                    ],
+                    &format!("reading `{}` on lane {at}", denoise.reading),
+                )?;
             }
         }
         if first {
@@ -849,12 +667,12 @@ async fn main(input: Input) -> Result<Output> {
             let step = k.take();
             let v = if cfg {
                 cfg_combine(
-                    &intrinsics::velocity(0, n, vw),
-                    &intrinsics::velocity(2, n, vw),
+                    &intrinsics::velocity(0, n, c),
+                    &intrinsics::velocity(2, n, c),
                     &Tensor::constant([guidance]),
                 )
             } else {
-                intrinsics::velocity(0, n, vw)
+                intrinsics::velocity(0, n, c)
             };
             let sig = sigmas.read();
             let next = &step + 1u32;
@@ -867,49 +685,53 @@ async fn main(input: Input) -> Result<Output> {
         });
         Ok(pass)
     };
-    let first = denoise_pass(true)?;
-    let step = denoise_pass(false)?;
+    let first_pass = denoise_pass(true)?;
+    let step_pass = denoise_pass(false)?;
     for fire in 0..sched.steps() {
-        let pass = if fire == 0 { &first } else { &step };
+        let pass = if fire == 0 { &first_pass } else { &step_pass };
         pass.submit(&pipe)
             .with_context(|| format!("denoise fire {fire}"))?;
     }
-    // The denoise passes go before the decode opens: they hold seats.
-    drop(first);
-    drop(step);
-    drop(held);
 
-    // ---- the decode: one fire per latent frame, in order, down the same
-    // pipeline, each reading its frame of `x` on the device -------------------
-    let mut pixels: Vec<f32> = Vec::with_capacity((frames * height * width * 3) as usize);
-    // One working set for the whole clip: the conv caches are its state.
     let vae_state = WorkingSet::new();
     let j = Channel::new([1], dtype::u32).queued().named("j");
-    let (head, head_px) = decode_frame(&decode, &x, &j, true, lat, 1, height, width, &vae_state)?;
-    let (tail, tail_px) = decode_frame(&decode, &x, &j, false, lat, tc, height, width, &vae_state)?;
+    let decode_pass = |head: bool| -> Result<(ForwardPass, Channel)> {
+        let pass = decode.pass(&vae_state)?;
+        let frame = Channel::new([lh, lw, c], dtype::f32)
+            .queued()
+            .named("vae_latent");
+        pass.input(0, &decode.input.name, &frame)?;
+        pass.prologue(move || {
+            let at = if head {
+                Tensor::constant([0u32])
+            } else {
+                j.take()
+            };
+            let frames = reshape(x.read(), [lt, lh * lw * c]);
+            frame.put(reshape(gather(&frames, &at), [lh, lw, c]));
+            j.put(&at + 1u32);
+        });
+        let rows = pixel_frames(u32::from(!head)) * height * width;
+        let out = Channel::new([rows, 3], dtype::f32).named("vae_pixels");
+        pass.epilogue(move || {
+            frame.take();
+            out.put(intrinsics::pixels(0, rows, 3));
+        });
+        Ok((pass, out))
+    };
+    let head = decode_pass(true)?;
+    let tail = decode_pass(false)?;
+    let mut clips = Vec::with_capacity(lt as usize);
     for fire in 0..lt {
-        let (pass, px) = if fire == 0 {
-            (&head, &head_px)
-        } else {
-            (&tail, &tail_px)
-        };
+        let (pass, px) = if fire == 0 { &head } else { &tail };
         pass.submit(&pipe)
-            .with_context(|| format!("the `{decode}` fire on latent frame {fire}"))?;
-        pixels.extend_from_slice(&px.take_host::<Vec<f32>>().await?);
+            .with_context(|| format!("the `{}` fire on latent frame {fire}", decode.reading))?;
+        clips.push(px.take_frames(width, height, pixel_frames(fire), fps)?);
     }
-    drop(head);
-    drop(tail);
     pipe.close();
-    let want = (frames * height * width * 3) as usize;
-    if pixels.len() != want {
-        return Err(format!(
-            "the decode landed {} values and a {frames}x{height}x{width} clip is {want}",
-            pixels.len()
-        )
-        .into());
-    }
+    let video = Frames::concat(&clips.iter().collect::<Vec<_>>())
+        .map_err(|why| format!("frames.concat: {why}"))?;
 
-    // ---- the way out ----------------------------------------------------------
     let name = input.out.clone().unwrap_or_else(|| "video".to_string());
     let asked_format = input.format.as_deref().unwrap_or("mp4");
     let (format, ext) = match asked_format {
@@ -922,10 +744,8 @@ async fn main(input: Input) -> Result<Output> {
             );
         }
     };
-    let handle = Frames::from_rgb8(&rgb8(&pixels), width, height, frames, fps)
-        .map_err(|why| format!("frames.from-rgb8: {why}"))?;
     let file = format!("{name}.{ext}");
-    inferlet::session::send_frames(&handle, format, &file)
+    inferlet::session::send_frames(&video, format, &file)
         .map_err(|why| format!("session.send-frames({asked_format}): {why}"))?;
 
     Ok(Output {
@@ -945,7 +765,7 @@ async fn main(input: Input) -> Result<Output> {
         spatial_compression: sc,
         temporal_compression: tc,
         decode_fires: lt,
-        decode_reading: decode,
+        decode_reading: decode.reading,
         init_frames: init_b64.len() as u32,
         encode_fires: if has_init { lt } else { 0 },
         strength: if has_init { strength } else { 1.0 },
@@ -954,8 +774,8 @@ async fn main(input: Input) -> Result<Output> {
         guidance,
         cfg,
         sigmas: sched.sigmas.clone(),
-        context_rows: context.shape().dims()[0],
-        prompt_rows,
+        context_rows: context.0.shape().dims()[0],
+        prompt_rows: ids.len() as u32,
         file,
         format: asked_format.to_string(),
     })

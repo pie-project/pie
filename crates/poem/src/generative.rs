@@ -12,6 +12,7 @@ pub struct LatentSpace {
     pub channels: u32,
     pub spatial_compression: u32,
     pub temporal_compression: u32,
+    pub first_frames: u32,
 }
 
 #[derive(Debug, Clone, PartialEq)]

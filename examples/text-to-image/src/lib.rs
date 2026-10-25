@@ -1,46 +1,6 @@
-//! **THE MODEL-AGNOSTIC `text-to-image` INFERLET**: a prompt in, an image
-//! out, with nothing about any family spelled here.
-//!
-//! What it knows are MODEL FACTS: the readings (the values of the `reading`
-//! switch) and what each lane of them binds (`model::lane_of`), the VAE's
-//! latent space (`model::latent()`: channels and spatial compression), and
-//! the schedule. What it never knows are ARCHITECTURE FACTS: patch sizes,
-//! rotary positions, padding, the order of a family's features. The latent
-//! it holds is the VAE's own `[h, w, C]`; the denoiser patchifies it and
-//! computes its positions in its own graph.
-//!
-//! # ROLES, BY WHAT THE LANES BIND
-//!
-//! | role | the fact that says so |
-//! |---|---|
-//! | text encoder | a lane that `embeds` and reads out `Hidden` |
-//! | denoiser | a token-less lane that reads `latents` and reads out `Velocity` |
-//! | the latent lane | the denoiser's `stream` whose lane reads `latents` |
-//! | the prompt lane | the denoiser's `stream` whose lane reads `context` |
-//! | a bridge | a token-less `Hidden` reading turning the encoder's rows into the width `context` takes (Z-Image's `refine`) |
-//! | VAE decode / encode | `vae.decode` / `vae.encode`, a `Pixels` readout |
-//!
-//! The standard input names are `latents`, `timestep`, `guidance` and
-//! `context`; a lane that reads any other required input is refused by
-//! name, never zero-filled.
-//!
-//! # ONE PIPELINE, NOTHING BACK
-//!
-//! Every pass of the job goes down one pipeline, in order: the text encoder
-//! (its rows stay on the device, padded there to the rows the `context`
-//! input states), the bridge if the model has one, the VAE encoder for
-//! img2img, `steps` denoise fires, and the VAE decode. A pipeline runs in
-//! submission order, so nothing waits on the host until the decoded picture
-//! is handed to the client.
-//!
-//! The latent `x` is a device-only channel. The first denoise pass's
-//! prologue draws it (`normal` on a keyed state) and seeds the loop's clock
-//! before its forward reads them; for img2img the VAE encoder's epilogue
-//! noises the encoded picture to the schedule's first sigma instead. The
-//! denoise epilogue
-//! is the sampler: `x <- x + (sigma' - sigma) v`, `v` the guided
-//! `u + s (c - u)` when a negative prompt adds a second attention group to
-//! the pass.
+//! A model-agnostic text-to-image sampler: it reads the model's switches,
+//! lanes, latent space and schedule, and binds inputs by the standard names
+//! `latents`, `timestep`, `guidance`, `context` and `length`.
 
 use inferlet::latent::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -63,18 +23,15 @@ struct Input {
     guidance: Option<f32>,
     #[serde(default)]
     out: Option<String>,
-    /// IMG2IMG: a picture to start from, base64 of an encoded still. It is
-    /// run through the family's `vae.encode` reading and noised to the
-    /// schedule's `strength` point.
+    /// Base64 of an encoded still to start from (img2img).
     #[serde(default)]
     init_image: Option<String>,
-    /// `init_image_<n>` / `mask_image_<n>`: the same in argv-sized pieces.
+    /// `init_image_<n>` / `mask_image_<n>`: base64 in argv-sized pieces.
     #[serde(flatten)]
     rest: std::collections::BTreeMap<String, inferlet::serde_json::Value>,
-    /// The fraction of the schedule to run over the encoded picture.
     #[serde(default)]
     strength: Option<f32>,
-    /// Inpainting: the region to repaint, `x0,y0,x1,y1` in pixels.
+    /// The region to repaint, `x0,y0,x1,y1` in pixels.
     #[serde(default)]
     mask_rect: Option<String>,
 }
@@ -102,7 +59,6 @@ struct Output {
     prompt: String,
     width: u32,
     height: u32,
-    /// The VAE latent this run denoised, `[latent_h, latent_w, channels]`.
     latent_h: u32,
     latent_w: u32,
     latent_channels: u32,
@@ -112,16 +68,13 @@ struct Output {
     guidance: f32,
     cfg: bool,
     sigmas: Vec<f32>,
-    /// The rows the prompt lane carried, and the readings that made them.
     context_rows: u32,
     context_readings: Vec<String>,
     decode_reading: String,
     file: String,
-    /// Inpainting: latent cells the mask touches.
     mask_cells: Option<u32>,
 }
 
-/// What a lane reads out.
 fn readout_kind(lane: &model::LaneDecl) -> Option<model::ReadoutKind> {
     lane.readout.as_ref().map(|readout| readout.kind)
 }
@@ -132,7 +85,6 @@ fn values(switch: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The switches of a lane: `reading`, and `stream` where the model has one.
 fn lane_switches<'a>(reading: &'a str, stream: Option<&'a str>) -> Vec<(&'a str, &'a str)> {
     let mut switches = vec![("reading", reading)];
     if let Some(stream) = stream {
@@ -156,8 +108,6 @@ fn input<'a>(lane: &'a model::LaneDecl, name: &str) -> Option<&'a model::InputDe
     lane.inputs.iter().find(|input| input.name == name)
 }
 
-/// The streams a reading's lanes may take: the `stream` switch's values, or
-/// the one default lane of a model without that switch.
 fn streams() -> Vec<Option<String>> {
     let streams = values("stream");
     if streams.is_empty() {
@@ -167,7 +117,6 @@ fn streams() -> Vec<Option<String>> {
     }
 }
 
-/// The stream of `reading` whose lane reads `name`.
 fn stream_reading(reading: &str, name: &str) -> Option<Option<String>> {
     streams()
         .into_iter()
@@ -180,14 +129,13 @@ struct Text {
     state: bool,
 }
 
-/// A token-less reading that turns `from`-wide rows into `to`-wide hidden
-/// rows: its stream, the one row input it reads them through, and whether
-/// it reads their own count (`length`) too.
+/// A token-less reading that turns the encoder's rows into the rows
+/// `context` takes, through its one row input of another name.
 struct Bridge {
     reading: String,
     stream: Option<String>,
+    lane: model::LaneDecl,
     input: String,
-    length: bool,
 }
 
 struct Denoise {
@@ -197,7 +145,31 @@ struct Denoise {
     latents: model::InputDecl,
     context: model::InputDecl,
     guidance: bool,
-    velocity_width: u32,
+}
+
+const STANDARD: [&str; 5] = ["latents", "timestep", "guidance", "context", "length"];
+
+fn bind(
+    pass: &ForwardPass,
+    at: u32,
+    lane: &model::LaneDecl,
+    have: &[(&str, &Channel)],
+    what: &str,
+) -> Result<()> {
+    for decl in &lane.inputs {
+        let (_, ch) = have
+            .iter()
+            .find(|(name, _)| *name == decl.name)
+            .ok_or_else(|| {
+                format!(
+                    "{what} reads `{}`; this sampler binds {}",
+                    decl.name,
+                    STANDARD.join(", ")
+                )
+            })?;
+        pass.input(at, &decl.name, ch)?;
+    }
+    Ok(())
 }
 
 fn text_reading() -> Result<Text> {
@@ -242,8 +214,15 @@ fn denoise_reading() -> Result<Denoise> {
         if input(&image, "timestep").is_none() {
             return Err(format!("reading `{reading}` reads no `timestep`").into());
         }
+        let velocity = image.readout.as_ref().map_or(0, |r| r.width);
+        if velocity != latents.width {
+            return Err(format!(
+                "reading `{reading}` reads out {velocity}-wide velocity rows over {}-wide latent cells",
+                latents.width
+            )
+            .into());
+        }
         return Ok(Denoise {
-            velocity_width: image.readout.as_ref().map_or(0, |r| r.width),
             guidance: input(&image, "guidance").is_some(),
             reading,
             latent_stream,
@@ -255,8 +234,6 @@ fn denoise_reading() -> Result<Denoise> {
     Err("this model declares no token-less reading of `latents` with a velocity readout, so nothing here denoises".into())
 }
 
-/// The reading that turns the encoder's `from`-wide rows into the `to`-wide
-/// rows `context` takes, when they differ.
 fn bridge_reading(from: u32, to: u32) -> Result<Bridge> {
     for reading in values("reading") {
         for stream in streams() {
@@ -270,9 +247,12 @@ fn bridge_reading(from: u32, to: u32) -> Result<Bridge> {
             if lane.embeds || lane.state || !hidden {
                 continue;
             }
-            let (length, rest): (Vec<_>, Vec<_>) =
-                lane.inputs.iter().partition(|input| input.name == "length");
-            if let [only] = &rest[..]
+            let rows: Vec<_> = lane
+                .inputs
+                .iter()
+                .filter(|input| !STANDARD.contains(&input.name.as_str()))
+                .collect();
+            if let [only] = &rows[..]
                 && only.axis == model::InputAxis::Row
                 && only.width == from
             {
@@ -280,7 +260,7 @@ fn bridge_reading(from: u32, to: u32) -> Result<Bridge> {
                     input: only.name.clone(),
                     reading,
                     stream,
-                    length: !length.is_empty(),
+                    lane,
                 });
             }
         }
@@ -292,8 +272,6 @@ fn bridge_reading(from: u32, to: u32) -> Result<Bridge> {
     .into())
 }
 
-/// The rows a lane of `len` rows of its own carries under the model's
-/// `input-decl.rows`, `None` when they do not fit.
 fn padded(rows: Option<model::RowCount>, len: u32) -> Option<u32> {
     match rows {
         None => Some(len),
@@ -302,8 +280,6 @@ fn padded(rows: Option<model::RowCount>, len: u32) -> Option<u32> {
     }
 }
 
-/// `rows` rows of `width` out of `h`'s first `len`, the rest zero: the
-/// context pad a model states with `input-decl.rows`, done on the device.
 fn pad_rows(h: &Tensor, len: u32, rows: u32, width: u32) -> Tensor {
     if rows == len {
         return h.clone();
@@ -314,16 +290,13 @@ fn pad_rows(h: &Tensor, len: u32, rows: u32, width: u32) -> Tensor {
     &gather(h, &src) * &broadcast(reshape(&keep, [rows, 1]), [rows, width])
 }
 
-/// All the passes of one job, kept alive until its picture is out.
 #[derive(Default)]
 struct Held {
     passes: Vec<ForwardPass>,
     sets: Vec<WorkingSet>,
 }
 
-/// Encode `prompt` on `pipe` into a device channel the denoise `context`
-/// input takes, and its own rows before the pad (the `length` input a
-/// padding model reads).
+/// The prompt as the rows `context` takes, and their count before the pad.
 fn encode(
     pipe: &Pipeline,
     held: &mut Held,
@@ -382,10 +355,13 @@ fn encode(
     let to = context.width;
     let pass = ForwardPass::new();
     set_switches(&pass, 0, &bridge.reading, bridge.stream.as_deref())?;
-    pass.input(0, &bridge.input, &encoded)?;
-    if bridge.length {
-        pass.input(0, "length", &length)?;
-    }
+    bind(
+        &pass,
+        0,
+        &bridge.lane,
+        &[(&bridge.input, &encoded), ("length", &length)],
+        &format!("reading `{}`", bridge.reading),
+    )?;
     let bridged = Channel::new([rows, to], dtype::f32).queued();
     pass.epilogue(move || {
         bridged.put(intrinsics::hidden(0, rows, to));
@@ -395,8 +371,6 @@ fn encode(
     Ok((bridged, length))
 }
 
-/// One weight per latent cell: the fraction of its `cell x cell` pixels the
-/// rectangle `(x0, y0, x1, y1)` or the gray mask covers.
 fn mask_cells(
     h: u32,
     w: u32,
@@ -466,7 +440,6 @@ fn b64_decode(text: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// The one voxel input a VAE reading's lane reads, and its stream.
 fn vae_lane(reading: &str) -> Result<(Option<String>, model::InputDecl, u32)> {
     for stream in streams() {
         let Ok(lane) = lane(reading, stream.as_deref()) else {
@@ -502,7 +475,6 @@ async fn main(input: Input) -> Result<Output> {
             "this model declares no `vae.decode` reading, so its latent has no way out as pixels",
         )?;
 
-    // ---- the latent, the VAE's own ----------------------------------------
     let space = model::latent().ok_or("this model states no latent space")?;
     if space.channels != denoise.latents.width {
         return Err(format!(
@@ -518,7 +490,6 @@ async fn main(input: Input) -> Result<Output> {
     let lat = [lh, lw, c];
     let cells = lh * lw;
 
-    // ---- the schedule -----------------------------------------------------
     let fact = model::schedule().ok_or("this model states no schedule; nothing here denoises")?;
     let steps = match input.steps.filter(|s| *s > 0) {
         Some(steps) => steps,
@@ -554,7 +525,6 @@ async fn main(input: Input) -> Result<Output> {
     let mut ts = sched.timesteps();
     ts.push(0.0);
 
-    // ---- guidance: an input, or a second attention group ------------------
     let guidance = input.guidance.unwrap_or(1.0);
     let negative = input
         .negative_prompt
@@ -570,7 +540,6 @@ async fn main(input: Input) -> Result<Output> {
     }
     let cfg = negative.is_some() && guidance > 1.0;
 
-    // ---- the mask -----------------------------------------------------------
     let mask_b64 = input.pieces("mask_image_");
     let mask: Option<Vec<f32>> = if input.mask_rect.is_none() && mask_b64.is_empty() {
         None
@@ -608,7 +577,6 @@ async fn main(input: Input) -> Result<Output> {
         Some(mask_cells(lh, lw, sc, rect, gray.as_deref()))
     };
 
-    // ---- the loop's state, all on the device -------------------------------
     let pipe = Pipeline::new();
     let mut held = Held::default();
     let x = Channel::new(lat, dtype::f32).queued().named("x");
@@ -618,14 +586,11 @@ async fn main(input: Input) -> Result<Output> {
     let sigmas = Channel::from(sched.sigmas.clone()).named("sigmas");
     let seed = input.seed.unwrap_or(0);
     let draw = Channel::from(rng_state(seed)).named("draw");
-    // The picture an inpainting step keeps, on the device.
     let known = mask
         .as_ref()
         .map(|_| Channel::new(lat, dtype::f32).queued().named("known"));
-    // The inpainting step's own noise stream, carried from step to step.
     let noise = Channel::new([2], dtype::u32).queued().named("noise");
     let noise0 = Channel::from(rng_state(seed ^ 0x5eed)).named("noise0");
-    // `x` from `start` (the encoded picture) or from noise alone, and the clock at 0.
     let seed_loop = move |start: Option<Tensor>| {
         let eps = normal(&draw.read(), lat);
         let x0 = match start {
@@ -645,7 +610,6 @@ async fn main(input: Input) -> Result<Output> {
         t.put(at(&ts.read(), &Tensor::constant([0u32])));
     };
 
-    // ---- the prompt, and the picture, encoded on the device ----------------
     let context = encode(
         &pipe,
         &mut held,
@@ -699,9 +663,8 @@ async fn main(input: Input) -> Result<Output> {
         held.passes.push(pass);
     }
 
-    // ---- the denoise passes: one a step --------------------------------------
     let guidance_ch = Channel::from([guidance]).named("guidance");
-    let (n, vw) = (cells, denoise.velocity_width);
+    let n = cells;
     let mask_ch = mask
         .as_ref()
         .map(|m| Channel::from_shaped([cells, 1], m.as_slice()).named("mask"));
@@ -709,20 +672,18 @@ async fn main(input: Input) -> Result<Output> {
         let step = k.take();
         let v = if cfg {
             cfg_combine(
-                &intrinsics::velocity(0, n, vw),
-                &intrinsics::velocity(2, n, vw),
+                &intrinsics::velocity(0, n, c),
+                &intrinsics::velocity(2, n, c),
                 &Tensor::constant([guidance]),
             )
         } else {
-            intrinsics::velocity(0, n, vw)
+            intrinsics::velocity(0, n, c)
         };
         let sig = sigmas.read();
         let next = &step + 1u32;
         let dt = &at(&sig, &next) - &at(&sig, &step);
         let mut stepped = euler_step(&reshape(x.take(), [n, c]), &v, &dt);
         if let (Some(m), Some(known)) = (&mask_ch, &known) {
-            // Inpainting: the kept cells are the picture noised to the sigma
-            // this step lands at, the rest the step.
             let state = noise.take();
             let shape = stepped.shape();
             let to = broadcast(reshape(at(&sig, &next), [1, 1]), shape);
@@ -738,8 +699,6 @@ async fn main(input: Input) -> Result<Output> {
         t.put(at(&ts.read(), &next));
         k.put(&next);
     };
-    // The first pass draws the latent in its prologue, before its forward
-    // reads it, unless the VAE encoder already put it.
     let denoise_pass = |seeds: bool| -> Result<ForwardPass> {
         let pass = ForwardPass::new();
         let mut lanes = 0u32;
@@ -749,32 +708,24 @@ async fn main(input: Input) -> Result<Output> {
             .enumerate()
         {
             let group = group as u32;
-            for (stream, latent) in [
-                (&denoise.latent_stream, true),
-                (&denoise.context_stream, false),
-            ] {
+            for stream in [&denoise.latent_stream, &denoise.context_stream] {
                 let at = lanes;
                 lanes += 1;
                 set_switches(&pass, at, &denoise.reading, stream.as_deref())?;
                 pass.group(at, group)?;
-                for decl in lane(&denoise.reading, stream.as_deref())?.inputs {
-                    let ch = match decl.name.as_str() {
-                        "latents" if latent => &x,
-                        "context" if !latent => &ctx.0,
-                        "length" if !latent => &ctx.1,
-                        "timestep" => &t,
-                        "guidance" => &guidance_ch,
-                        other => {
-                            return Err(format!(
-                                "reading `{}` reads `{other}` on lane {at}; this sampler binds \
-                                 latents, timestep, guidance, context and length",
-                                denoise.reading
-                            )
-                            .into());
-                        }
-                    };
-                    pass.input(at, &decl.name, ch)?;
-                }
+                bind(
+                    &pass,
+                    at,
+                    &lane(&denoise.reading, stream.as_deref())?,
+                    &[
+                        ("latents", &x),
+                        ("timestep", &t),
+                        ("guidance", &guidance_ch),
+                        ("context", &ctx.0),
+                        ("length", &ctx.1),
+                    ],
+                    &format!("reading `{}` on lane {at}", denoise.reading),
+                )?;
             }
         }
         if seeds {
@@ -790,13 +741,6 @@ async fn main(input: Input) -> Result<Output> {
         pass.submit(&pipe)
             .with_context(|| format!("denoise fire {fire}"))?;
     }
-    // Every pass so far is closed before the decode opens: a float pass
-    // holds a seat until it closes, and the decode needs it (until B3).
-    drop(first);
-    drop(rest);
-    drop(held);
-
-    // ---- the decode, down the same pipeline ---------------------------------
     let (stream, latent_in, rgb) = vae_lane(&decode)?;
     if latent_in.width != c {
         return Err(format!(
