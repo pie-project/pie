@@ -364,7 +364,6 @@ pub const MAX_BODIES: usize = 1024;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Tiers {
     pub plain: poem_ir::ClassSet,
-    pub wide: Box<[u32]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -465,7 +464,7 @@ impl Ladder {
         let listed: Vec<u32> = if plain {
             classes.present_in_order().collect()
         } else {
-            tiers.wide.to_vec()
+            Vec::new()
         };
         Ladder(
             listed
@@ -1370,7 +1369,6 @@ mod tests {
     fn plain_tiers() -> Tiers {
         Tiers {
             plain: poem_ir::ClassSet::of(0..8usize),
-            wide: Box::new([]),
         }
     }
 

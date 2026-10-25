@@ -535,9 +535,15 @@ impl Shell {
             crate::store::window_of(&boot.trace)?,
             boot.budget.max_tokens,
         );
-        // A class attending both ways runs its dense planes over a whole
-        // canvas, decoded once at load.
-        let decode_dense = !crate::exports::wide_classes(&boot.trace, &compiled).is_empty();
+        // A class attending both ways runs the planes it reads over a whole
+        // canvas: those are decoded once at load.
+        let decoding = poem_exec::feeds::classes_reading(&boot.trace, &compiled, |def| {
+            matches!(def, poem_ir::Def::Weight(w)
+                if crate::weights::decodes_at_load(&boot.trace.params[*w as usize]))
+        });
+        let decode_dense = crate::exports::wide_classes(&boot.trace, &compiled)
+            .iter()
+            .any(|class| decoding.contains(class));
         let decoded_dense = if decode_dense {
             crate::weights::decoded_dense_bytes(&boot.trace)
         } else {
@@ -670,24 +676,8 @@ impl Shell {
         // partials are sized for the lanes, not the widest fire's rows.
         facts.mark_rows_a_lane(&read_only_by_decoders(&boot.trace, &compiled, &decoding));
         let feeds = Feeds::of(&boot.trace, &compiled);
-        // A wide body is captured from representative lanes and keyed by the
-        // whole wide list, so only classes a synthetic lane can stand in for
-        // join it: every switch at its default, input-free.
         let tiers = crate::record::Tiers {
             plain: plain_of(&landing),
-            wide: landing
-                .iter()
-                .enumerate()
-                .filter(|(class, requests)| {
-                    !requests.is_empty()
-                        && requests.iter().all(|request| request.switches().is_empty())
-                        && !feeds
-                            .inputs
-                            .iter()
-                            .any(|(_, readers)| readers.contains(*class))
-                })
-                .map(|(class, _)| class as u32)
-                .collect(),
         };
         let media = media_classes(&boot.trace, &compiled);
         let shifted = regions_shifting(&boot.trace, &compiled);

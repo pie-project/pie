@@ -305,7 +305,8 @@ pub fn classes_running(
 
 /// The classes running a region one of whose nodes reads a value whose
 /// definition `wanted` holds of.
-fn classes_reading(
+#[must_use]
+pub fn classes_reading(
     trace: &Trace,
     compiled: &CompiledModel,
     wanted: impl Fn(&Def) -> bool,

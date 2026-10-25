@@ -603,10 +603,7 @@ fn separable_rows(req: &crate::engine::FireRequest) -> bool {
 /// No adapter, inputs or attention classes: a lane whose rows are its
 /// tokens' alone (its pass's switches are [`Switched::plain`]).
 fn plain_lane(lane: &::engine::Lane) -> bool {
-    lane.attn_classes.is_none()
-        && lane.adapter.is_none()
-        && lane.inputs.is_empty()
-        && !lane.kv_less
+    lane.attn_classes.is_none() && lane.adapter.is_none() && lane.inputs.is_empty() && !lane.kv_less
 }
 
 /// The first row the last piece must hold: what the readout names and what a
