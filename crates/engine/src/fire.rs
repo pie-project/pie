@@ -223,6 +223,8 @@ pub struct Lane {
     /// committed cell at every fire.
     #[serde(default)]
     pub inputs: Vec<InputFeed>,
+    /// The lane reads no kv: it takes no seat, and the state it carries, if
+    /// any, is the row `rs_slot` names.
     #[serde(default)]
     pub kv_less: bool,
     /// An engine that cannot report says nothing, and the step is plainly
@@ -572,7 +574,12 @@ impl Step {
         }
         for (index, lane) in self.lanes.iter().enumerate() {
             lane.validate_for(serves)?;
-            if self.lanes[..index].iter().any(|l| l.slot == lane.slot) {
+            // A kv-less lane takes no seat: its slot names nothing.
+            if !lane.kv_less
+                && self.lanes[..index]
+                    .iter()
+                    .any(|l| !l.kv_less && l.slot == lane.slot)
+            {
                 return Err(Error::Invalid(format!(
                     "slot {} appears twice in one fire, at lane {index}",
                     lane.slot
@@ -899,5 +906,25 @@ mod tests {
         let blind = mask(&[true, true, false, true, false, false, true]);
         let rows = Masking::Rows(vec![ancestry, blind]);
         assert!(buffered_reads(Some(&rows), 2, 5, 2).is_err());
+    }
+
+    #[test]
+    fn kv_less_lanes_take_no_seat() {
+        // A CFG denoise step: four float lanes, none seated, beside a
+        // decode in seat 0.
+        let float = |rs_slot| Lane {
+            tokens: vec![0; 4],
+            kv_less: true,
+            rs_slot,
+            ..Lane::default()
+        };
+        let mut step = Step {
+            lanes: vec![float(None), float(None), float(None), float(Some(2))],
+            ..Step::default()
+        };
+        step.lanes.push(Lane::decode(0, 0, 7, 3));
+        assert!(step.validate().is_ok(), "{:?}", step.validate());
+        step.lanes.push(Lane::decode(0, 0, 8, 4));
+        assert!(step.validate().is_err(), "two seated lanes share seat 0");
     }
 }

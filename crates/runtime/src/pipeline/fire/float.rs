@@ -4,7 +4,7 @@ use super::context::FireContext;
 use super::{
     FireWs, PendingFire, PendingOp, Reserved, Switched, TicketReservation, advance_shadow,
     bound_rs_working_sets, every_lane, hook_program_of, open_pipeline, record_submit_failure,
-    reserve, rs, seat_lane_slots, settle_and_wait_resident, stamp_lane_facts, stamp_lane_words,
+    reserve, rs, settle_and_wait_resident, stamp_lane_facts, stamp_lane_words,
 };
 use crate::inferlet::host::working_set::WorkingSet;
 use crate::pipeline::Pipeline;
@@ -32,7 +32,8 @@ fn fold_one_plan(ids: &[crate::store::rs::RsWorkingSetId]) -> rs::RsPlan {
 }
 
 /// A float pass: no kv. A lane reading a recurrent state binds a working set
-/// and folds one slot of it a fire, on the row its rs store assigns.
+/// and folds one slot of it a fire, on the row its rs store assigns; a lane
+/// reading none takes no seat and no state row.
 pub(crate) async fn fire_float_lane<C: FireContext>(
     ctx: &mut C,
     this: Resource<Pipeline>,
@@ -256,7 +257,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
     // The state each lane folds into, on the row its rs store assigns: fresh
     // where the state holds nothing yet. A lane binding none touches no state
     // row.
-    let rs_ids = match kvs.first().filter(|_| !rs_reps.is_empty()) {
+    let rs_ids = match kvs.first() {
         Some(ws) => {
             let qo_indptr: Vec<u32> = (0..=req.lanes.len() as u32).collect();
             match bound_rs_working_sets(ctx, ws, &rs_reps, &qo_indptr, &pipeline_scope)? {
@@ -281,16 +282,14 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         Ok(Reserved { rs, .. }) => rs,
         Err(error) => return Ok(Err(error)),
     };
+    for lane in &mut req.lanes {
+        lane.rs_reset = ::engine::RsReset::Held;
+    }
     rs_prepared.apply_to(&mut req);
     let rs_copy = rs_prepared.state_copy();
     let rstxn = super::RsTxnsGuard::new(model, engine, rs_prepared.txn);
     let lanes_of = every_lane(&req);
     stamp_lane_words(&mut req, &switched, &lanes_of, false, None);
-    let groups = vec![(kvs[0].id, (0..req.lanes.len()).collect())];
-    if let Err(refusal) = seat_lane_slots(&mut req, &stores, &groups).await {
-        record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);
-        return Ok(Err(refusal));
-    }
 
     let completion = ctx
         .resources()
@@ -364,4 +363,46 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
             failure: pipeline_failure,
         }));
     Ok(Ok(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fold_one_plan, rs};
+    use crate::store::rs::{RsGeometry, RsStore};
+
+    fn geom() -> RsGeometry {
+        RsGeometry {
+            state_size: 1024,
+            buffer_page_tokens: 4,
+        }
+    }
+
+    fn fire(store: &mut RsStore, ids: &[crate::store::rs::RsWorkingSetId]) -> rs::PreparedRs {
+        let mut out = rs::prepare_many(store, ids, &fold_one_plan(ids), None).unwrap();
+        rs::settle(store, out.txn.take());
+        out
+    }
+
+    #[test]
+    fn float_every_case() {
+        a_frame_folds_one_slot_fresh_then_held();
+    }
+
+    fn a_frame_folds_one_slot_fresh_then_held() {
+        let mut store = RsStore::new(4, 4, 0, 0);
+        let ws = store.create_working_set(geom());
+        let first = fire(&mut store, &[ws]);
+        assert_eq!(first.slot_flags, vec![crate::engine::RS_FLAG_RESET]);
+        let slot = first.slot_ids[0];
+        for frame in 2..=3 {
+            let next = fire(&mut store, &[ws]);
+            assert_eq!(next.slot_flags, vec![0], "frame {frame} reads what the last left");
+            assert_eq!(next.slot_ids, vec![slot], "in place, on the same row");
+            assert_eq!(store.frozen(ws), Ok(frame));
+        }
+        let other = store.create_working_set(geom());
+        let lanes = fire(&mut store, &[ws, other]);
+        assert_eq!(lanes.slot_flags, vec![0, crate::engine::RS_FLAG_RESET]);
+        assert_ne!(lanes.slot_ids[0], lanes.slot_ids[1], "a state a lane");
+    }
 }

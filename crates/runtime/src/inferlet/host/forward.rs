@@ -8,7 +8,6 @@ pub use crate::pipeline::channel::Channel;
 use crate::pipeline::channel::{BoundCells, ChannelCell, ChannelError};
 pub use crate::pipeline::instance::ForwardPass;
 use crate::pipeline::instance::Instance;
-use crate::store::kv::working_set::KvWorkingSet;
 use crate::pipeline::instance::{
     BoundForwardPass, EmbedBinding, FloatLane, FloatPass, InputBinding, LaneFacts, StateBinding,
 };
@@ -1144,11 +1143,7 @@ impl ProcessCtx {
                 .as_ref()
                 .map(|state| state.lanes.clone())
                 .unwrap_or_default();
-            let (kv_lanes, rs_reps) = if state.is_some() {
-                self.lane_parts(&lanes)?
-            } else {
-                (vec![self.mint_scratch_working_set()?], Vec::new())
-            };
+            let (kv_lanes, rs_reps) = self.lane_parts(&lanes)?;
             let (devgeo, decode_envelope, geometry_class) = if float.is_none() {
                 let engine = super::working_set::kv_of(self, kv_lanes[0])?.engine;
                 let device_port_mask = crate::engine::get_spec(engine)?.device_geometry_port_mask;
@@ -1423,24 +1418,6 @@ impl ProcessCtx {
         }
     }
 
-    fn mint_scratch_working_set(&mut self) -> Anyhow<u32> {
-        let stores = crate::store::registry::get(0, 0);
-        let id = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
-            kv.create_working_set()
-        });
-        let ws = KvWorkingSet::new(0, 0, id, stores.kv_page_size);
-        self.register_kv_working_set(&ws);
-        Ok(self.ctx().table.push(ws)?.rep())
-    }
-
-    fn release_scratch_working_set(&mut self, rep: u32) -> Anyhow<()> {
-        let resource: Resource<KvWorkingSet> = Resource::new_own(rep);
-        let ws = self.ctx().table.delete(resource)?;
-        self.unregister_kv_working_set(ws.model, ws.engine, ws.id);
-        ws.release();
-        Ok(())
-    }
-
     async fn core_drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {
         let fires = self
             .ctx()
@@ -1454,17 +1431,8 @@ impl ProcessCtx {
         }
 
         let mut pass = self.ctx().table.delete(this)?;
-        let scratch = pass
-            .bound()
-            .ok()
-            .filter(|bound| bound.float.is_some() && bound.lanes.is_empty())
-            .map(|bound| bound.kv_lanes[0]);
         if let Ok(bound) = pass.bound_mut() {
             bound.close_native();
-        }
-        drop(pass);
-        if let Some(rep) = scratch {
-            self.release_scratch_working_set(rep)?;
         }
         Ok(())
     }
