@@ -629,7 +629,12 @@ fn value_lifetimes(plan: &LaunchStagePlan, rows: &[u32]) -> Option<Vec<Lifetime>
     for (index, region) in plan.fused.iter().enumerate() {
         let per_node = region.kind == RegionKind::Generated;
         region_first.push(step);
-        for &node in &region.nodes {
+        let run = if region.order.is_empty() {
+            &region.nodes
+        } else {
+            &region.order
+        };
+        for &node in run {
             *step_of.get_mut(node as usize)? = step;
             *region_of.get_mut(node as usize)? = u32::try_from(index).ok()?;
             if per_node {
@@ -1562,6 +1567,67 @@ pub fn launch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A take its region runs after a constant cannot hand the constant its
+    /// slot: the scratch is laid out in the order the emitter runs the ops,
+    /// not the order the stage states them.
+    #[test]
+    fn a_region_lays_its_scratch_out_in_the_order_it_runs() {
+        let op =
+            |tag, result_count, args: Vec<u32>, channel| eta_compiler::codegen::launch::LaunchOp {
+                tag,
+                result_count,
+                args,
+                channel,
+                ..Default::default()
+            };
+        let mut plan = LaunchStagePlan {
+            ops: vec![
+                op(tags::CHAN_TAKE, 1, vec![], Some(1)),
+                op(tags::CONST, 1, vec![], None),
+                op(tags::CHAN_PUT, 0, vec![1], Some(0)),
+            ],
+            value_types: vec![
+                eta_compiler::codegen::launch::LaunchPlanValue {
+                    dtype: Dtype::U32,
+                    axes: vec![eta_compiler::plan::Dimension::Static(1)],
+                };
+                2
+            ],
+            fused: vec![LaunchRegion {
+                kind: RegionKind::Generated,
+                nodes: vec![0, 1, 2],
+                order: vec![1, 0, 2],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let one = ValueDesc {
+            len: 1,
+            rows: 1,
+            last: 1,
+            rank: 1,
+            dtype: 0,
+            dims: [0; MAX_RANK],
+        };
+        let offsets = |plan: &LaunchStagePlan| {
+            let lifetimes = value_lifetimes(plan, &[1]).expect("every node is in a region");
+            layout_reusing(&[one, one], &lifetimes, 0)
+                .expect("fits")
+                .values
+        };
+        let laid = offsets(&plan);
+        assert_ne!(
+            laid[0], laid[1],
+            "the take lands over the constant the put reads after it"
+        );
+        plan.fused[0].order.clear();
+        let stated = offsets(&plan);
+        assert_eq!(
+            stated[0], stated[1],
+            "in the stated order the constant may reuse the dead take's slot"
+        );
+    }
 
     #[test]
     fn only_bool_is_packed_and_the_round_trip_is_lossless() {

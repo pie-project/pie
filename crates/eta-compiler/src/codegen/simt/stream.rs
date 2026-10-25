@@ -1023,6 +1023,26 @@ pub(super) fn emit_stream(
     Some(members.len())
 }
 
+/// The order a generated region's ops run in: the streams' when its rows run
+/// in parallel, else the region's own. Its scratch is laid out over this
+/// order, so a value's slot is free only once the ops that run before it are
+/// done with it.
+#[must_use]
+pub fn emitted_order(stage: &CompiledStage, region: &Region) -> Vec<u32> {
+    if region.kind != crate::plan::RegionKind::Generated
+        || super::validate::validate_generated_region(stage, region).is_err()
+        || super::fused::stream_rows(stage, region).is_none()
+    {
+        return region.nodes.iter().map(|node| node.get()).collect();
+    }
+    let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
+    let bases = crate::codegen::op_view::result_bases(&ops);
+    emission_order(&ops, &bases, region)
+        .into_iter()
+        .map(|node| node as u32)
+        .collect()
+}
+
 #[must_use]
 pub fn spent_values(stage: &CompiledStage, region: &Region) -> Vec<u32> {
     if region.kind != crate::plan::RegionKind::Generated {

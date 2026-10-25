@@ -10,7 +10,7 @@ pub mod sampler;
 pub mod scan;
 pub mod singleton;
 mod stream;
-pub use stream::spent_values;
+pub use stream::{emitted_order, spent_values};
 pub mod validate;
 
 pub use fused::emit_fused_region;
