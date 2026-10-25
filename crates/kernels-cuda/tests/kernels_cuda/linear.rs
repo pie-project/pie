@@ -1,5 +1,6 @@
 mod act_quant;
 mod affine_tiled;
+mod decode_gemm;
 mod dequant_scratch;
 mod gemm;
 mod gemm_sm100;

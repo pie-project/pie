@@ -4,7 +4,10 @@ use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, kernel, refuse};
 
 const GEMV: &str = "linear/gemv.cu";
 
-pub(crate) fn gemv_bf16(
+/// `out[n] = act . weight[n]` (plus `bias[n]`, if not null) for one row: a
+/// warp a weight row, or a block a row split over K up to
+/// `kernel.gemv.splitk_max_n` columns. The GEMM tuner's `Gemv` tactic.
+pub fn gemv_bf16(
     ctx: &Ctx,
     weight: u64,
     act: u64,

@@ -642,7 +642,7 @@ fn median(runs: u32, mut run: impl FnMut()) -> f64 {
 #[test]
 #[ignore = "a rate bench: cargo test --release ... -- --ignored synthesized_rule_rate --nocapture"]
 fn synthesized_rule_rate() {
-    use super::frame::copy_rate;
+    use crate::common::copy_rate;
     // a set's five planes; a fire may touch several of them (an in-place
     // stream), so the sets span four times that of any card's L2
     const FOOTPRINT: usize = 1 << 30;

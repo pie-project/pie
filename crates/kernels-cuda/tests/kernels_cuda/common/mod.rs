@@ -694,6 +694,52 @@ pub fn close(got: f32, want: f32) -> bool {
     (got - want).abs() <= TOLERANCE * want.abs().max(1.0)
 }
 
+/// The device's copy rate in GB/s: bytes read plus bytes written by its
+/// fastest 1 GiB device-to-device copy.
+pub fn copy_rate() -> f64 {
+    const BYTES: usize = 1 << 30;
+    let mut gpu = Gpu::open();
+    let (src, dst) = (gpu.zeros(BYTES), gpu.zeros(BYTES));
+    let stream = gpu.ctx().stream();
+    let copy = || {
+        // SAFETY: both ends are `BYTES` long allocations `gpu` holds until
+        // its drop, which syncs the stream first.
+        let code = unsafe {
+            rt::cudaMemcpyAsync(
+                dst as *mut _,
+                src as *const _,
+                BYTES,
+                rt::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
+                stream.cast(),
+            )
+        };
+        assert_eq!(
+            code,
+            rt::cudaError::cudaSuccess,
+            "`cudaMemcpyAsync` answered {code:?}"
+        );
+    };
+    copy();
+    gpu.sync();
+    let us = fastest(10, || {
+        copy();
+        gpu.sync();
+    });
+    2.0 * BYTES as f64 / us / 1e3
+}
+
+/// The fewest microseconds of `runs` runs of `run`: other work on a shared
+/// card only ever slows one.
+pub fn fastest(runs: u32, mut run: impl FnMut()) -> f64 {
+    (0..runs)
+        .map(|_| {
+            let start = std::time::Instant::now();
+            run();
+            start.elapsed().as_secs_f64() * 1e6
+        })
+        .fold(f64::INFINITY, f64::min)
+}
+
 pub mod attn_ref;
 pub mod host;
 pub mod linear_ref;

@@ -425,7 +425,8 @@ fn a_kernel_never_loaded_is_refused_at_its_fire() {
 #[test]
 #[ignore = "a rate bench: cargo test ... -- --ignored synthesized_residual_norm_rate --nocapture"]
 fn synthesized_residual_norm_rate() {
-    use super::frame::{copy_rate, fastest, unfused};
+    use super::frame::unfused;
+    use crate::common::{copy_rate, fastest};
     const FOOTPRINT: usize = 256 << 20;
     const FIRES: usize = 256;
     const REPLAYS: u32 = 20;
