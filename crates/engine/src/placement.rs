@@ -83,10 +83,9 @@ impl Placement {
     /// another expert, one slot rewritten, or trades two experts between
     /// ranks, two. Each edit is the one that leaves the ranks' loads, busiest
     /// first, lowest; edits stop when none lowers them or `limits.moves`
-    /// slots are spent, and those past the lowest peak are dropped. Unless the peak
-    /// ([`Placement::balance`]) falls by more than `limits.gain`, `self` is
-    /// kept:
-    /// a replica stays where it is until moving it pays.
+    /// slots are spent, and those past the lowest peak are dropped. Unless
+    /// the peak ([`Placement::balance`]) falls by more than `limits.gain`,
+    /// `self` is kept: a replica stays where it is until moving it pays.
     #[must_use]
     pub fn rebalance(&self, loads: &[u64], limits: Limits) -> Placement {
         let experts = self.experts as usize;
