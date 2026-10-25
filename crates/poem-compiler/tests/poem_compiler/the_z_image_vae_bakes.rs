@@ -50,14 +50,16 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
             v.def,
             Def::Input(poem::RuntimeInput::Guest {
                 axis: InputAxis::Voxel,
+                id,
                 ..
-            })
+            }) if trace(MINI).inputs[id as usize].name != "latents"
         )),
-        "and reads no voxel port"
+        "and reads no voxel port but the denoiser's latent"
     );
 }
 
 fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
+    // The VAE's two, and the denoiser's VAE-native latent.
     let plan = trace(TURBO);
     let mut ports: Vec<(&str, u32, Dtype)> = plan
         .values
@@ -77,6 +79,7 @@ fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
         ports,
         vec![
             ("latent", model::CHANNELS, Dtype::Bf16),
+            ("latents", model::CHANNELS, Dtype::Bf16),
             ("pixels", vae::RGB, Dtype::Bf16)
         ]
     );
