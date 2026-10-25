@@ -59,6 +59,8 @@ pub fn conv3d_ref(
     let [kt, kh, kw] = conv.k.map(|v| v as usize);
     let [st, sh, sw] = conv.stride.map(|v| v as usize);
     let [pt, ph, pw] = conv.pad.map(|v| v as i64);
+    let [dt, dh, dw] = conv.dilation.map(|v| v as i64);
+    let per = if conv.depthwise { 1 } else { c_in };
     let outs = out_boxes(conv, boxes);
     let rows_out: usize = outs.iter().map(|b| b.voxels()).sum();
     let mut o = vec![0f32; rows_out * c_out];
@@ -74,7 +76,7 @@ pub fn conv3d_ref(
                     for n in 0..c_out {
                         let mut acc = bias.map_or(0.0, |b| b[n]);
                         for it in 0..kt {
-                            let mut ti = (to * st) as i64 - pt + it as i64;
+                            let mut ti = (to * st) as i64 - pt + it as i64 * dt;
                             let mut frame: Option<&[f32]> = None;
                             let replicate = conv.time_pad == TimePad::Replicate;
                             if ti < 0 {
@@ -100,19 +102,20 @@ pub fn conv3d_ref(
                             }
                             let frame = frame.expect("resolved");
                             for ih in 0..kh {
-                                let hi = (ho * sh) as i64 - ph + ih as i64;
+                                let hi = (ho * sh) as i64 - ph + ih as i64 * dh;
                                 if hi < 0 || hi as usize >= b.h {
                                     continue;
                                 }
                                 for iw in 0..kw {
-                                    let wi = (wo * sw) as i64 - pw + iw as i64;
+                                    let wi = (wo * sw) as i64 - pw + iw as i64 * dw;
                                     if wi < 0 || wi as usize >= b.w {
                                         continue;
                                     }
                                     let voxel = (hi as usize * b.w + wi as usize) * c_in;
-                                    for c in 0..c_in {
-                                        let wk = (((n * c_in + c) * kt + it) * kh + ih) * kw + iw;
-                                        acc += frame[voxel + c] * w_natural[wk];
+                                    for c in 0..per {
+                                        let wk = (((n * per + c) * kt + it) * kh + ih) * kw + iw;
+                                        let from = if conv.depthwise { n } else { c };
+                                        acc += frame[voxel + from] * w_natural[wk];
                                     }
                                 }
                             }

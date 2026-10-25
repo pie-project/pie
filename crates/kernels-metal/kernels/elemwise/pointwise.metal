@@ -91,6 +91,23 @@ template <typename T>
   o[gid] = static_cast<T>(precise::sqrt(float(x[gid])));
 }
 
+// erf to 1.5e-7 (Abramowitz & Stegun 7.1.26).
+inline float gelu_erf(float x) {
+  const float t = 1.0f / (1.0f + 0.3275911f * fabs(x));
+  const float y = 1.0f - ((((1.061405429f * t - 1.453152027f) * t + 1.421413741f) * t
+                           - 0.284496736f) * t + 0.254829592f) * t * precise::exp(-x * x);
+  return x < 0.0f ? -y : y;
+}
+
+template <typename T>
+[[kernel]] void act_gelu(
+    const device T* x  [[buffer(0)]],
+    device T* o        [[buffer(1)]],
+    uint gid           [[thread_position_in_grid]]) {
+  const float v = float(x[gid]);
+  o[gid] = static_cast<T>(0.5f * v * (1.0f + gelu_erf(v * 0.70710678118654752f)));
+}
+
 #define instantiate_activation(op, name, itype)                      \
   template [[host_name(#op "_" #name)]]                              \
   [[kernel]] void op<itype>(                                         \
@@ -104,6 +121,32 @@ instantiate_activation(act_gelu_tanh, bfloat16, bfloat)
 instantiate_activation(act_gelu_tanh, float32, float)
 instantiate_activation(act_sqrt, bfloat16, bfloat)
 instantiate_activation(act_sqrt, float32, float)
+instantiate_activation(act_gelu, bfloat16, bfloat)
+instantiate_activation(act_gelu, float32, float)
+
+// SnakeBeta in place, `x + sin²(x·e^alpha) / (e^beta + 1e-9)`; `alpha` and
+// `beta` are f32 logs, one a channel of the `width`-wide rows.
+template <typename T>
+[[kernel]] void act_snake(
+    device T* x                   [[buffer(0)]],
+    const device float* alpha     [[buffer(1)]],
+    const device float* beta      [[buffer(2)]],
+    const constant uint& width    [[buffer(3)]],
+    uint gid                      [[thread_position_in_grid]]) {
+  const uint c = gid % width;
+  const float v = float(x[gid]);
+  const float s = precise::sin(v * precise::exp(alpha[c]));
+  x[gid] = static_cast<T>(v + s * s / (precise::exp(beta[c]) + 1e-9f));
+}
+
+#define instantiate_snake(name, itype)                               \
+  template [[host_name("act_snake_" #name)]]                         \
+  [[kernel]] void act_snake<itype>(                                  \
+      device itype*, const device float*, const device float*,       \
+      const constant uint&, uint);
+
+instantiate_snake(bfloat16, bfloat)
+instantiate_snake(float32, float)
 
 // A blockwise butterfly FWHT over the last dim. The row is cut into contiguous
 // N-vectors (N a power of two) and each is turned by the normalized Sylvester

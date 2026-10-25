@@ -11,8 +11,10 @@
 // time padding either zero or the edge frame repeated. A row no clip holds
 // lands zero.
 //
-// The weight is `[c_out, taps * c_in]`, taps-major in `(t, h, w)` order;
-// the bias, when there is one, an f32 per output channel. `c_out` is even.
+// The weight is `[c_out, taps * c_in]`, taps-major in `(t, h, w)` order, or
+// `[c_out, taps]` for a depthwise one, each channel convolved alone; the
+// taps sit `dilation` apart along each axis. The bias, when there is one,
+// is an f32 per output channel. `c_out` is even.
 
 #define STRIPS 4
 #define LANES 32
@@ -46,6 +48,10 @@ struct Params {
     // `x`'s and `o`'s row 0 in the grids' fire-wide rows (a segmented fire's window starts later).
     int x_base;
     int o_base;
+    int dt;
+    int dh;
+    int dw;
+    int depthwise;
 };
 PIE_PARAMS(6, Params, params);
 
@@ -54,12 +60,12 @@ groupshared float conv_fold[STRIPS][LANES];
 // The input row tap `(it, ih, iw)` of output voxel `v` reads, or -1 for a
 // padded one.
 int tap_row(Clip in_, Voxel v, int it, int ih, int iw) {
-    int hi = v.h * params.sh - params.ph + ih;
-    int wi = v.w * params.sw - params.pw + iw;
+    int hi = v.h * params.sh - params.ph + ih * params.dh;
+    int wi = v.w * params.sw - params.pw + iw * params.dw;
     if (hi < 0 || hi >= in_.h || wi < 0 || wi >= in_.w) {
         return -1;
     }
-    int ti = v.t * params.st - params.pt + it;
+    int ti = v.t * params.st - params.pt + it * params.dt;
     if (ti < 0) {
         if (params.replicate == 0) {
             return -1;
@@ -97,21 +103,35 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
         in_.off -= params.x_base;
         Voxel v = unravel(og, fire_row - og.off);
         int taps = params.kt * params.kh * params.kw;
-        uint wrow = uint(n) * uint(taps) * uint(params.c_in);
         int plane = params.kh * params.kw;
-        for (int tap = 0; tap < taps; ++tap) {
-            int it = tap / plane;
-            int rest = tap - it * plane;
-            int ih = rest / params.kw;
-            int iw = rest - ih * params.kw;
-            int src = tap_row(in_, v, it, ih, iw);
-            if (src < 0) {
-                continue;
+        if (params.depthwise != 0) {
+            // Each output channel reads its own input channel alone.
+            for (int tap = lane; tap < taps; tap += LANES) {
+                int it = tap / plane;
+                int rest = tap - it * plane;
+                int ih = rest / params.kw;
+                int src = tap_row(in_, v, it, ih, rest - ih * params.kw);
+                if (src < 0) {
+                    continue;
+                }
+                acc = fma(bf16_at(x, uint(src) * uint(params.c_out) + uint(n)), bf16_at(w, uint(n) * uint(taps) + uint(tap)), acc);
             }
-            uint xr = uint(src) * uint(params.c_in);
-            uint wt = wrow + uint(tap) * uint(params.c_in);
-            for (int c = lane; c < params.c_in; c += LANES) {
-                acc = fma(bf16_at(x, xr + uint(c)), bf16_at(w, wt + uint(c)), acc);
+        } else {
+            uint wrow = uint(n) * uint(taps) * uint(params.c_in);
+            for (int tap = 0; tap < taps; ++tap) {
+                int it = tap / plane;
+                int rest = tap - it * plane;
+                int ih = rest / params.kw;
+                int iw = rest - ih * params.kw;
+                int src = tap_row(in_, v, it, ih, iw);
+                if (src < 0) {
+                    continue;
+                }
+                uint xr = uint(src) * uint(params.c_in);
+                uint wt = wrow + uint(tap) * uint(params.c_in);
+                for (int c = lane; c < params.c_in; c += LANES) {
+                    acc = fma(bf16_at(x, xr + uint(c)), bf16_at(w, wt + uint(c)), acc);
+                }
             }
         }
     }

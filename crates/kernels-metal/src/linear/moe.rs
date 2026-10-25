@@ -539,6 +539,8 @@ pub fn matmul_select(
 
 fn routed_point(op: &'static str, bank: Bank, biased: bool) -> Result<&'static str, Error> {
     match (bank.affine(), bank.group, bank.bits) {
+        (true, 64, 8) if biased => Ok("affine_qmv_routed_bias_bfloat16_gs_64_b_8"),
+        (true, 64, 8) => Ok("affine_qmv_routed_bfloat16_gs_64_b_8"),
         (true, 64, 4) if biased => Ok("affine_qmv_routed_bias_bfloat16_gs_64_b_4"),
         (true, 64, 4) => Ok("affine_qmv_routed_bfloat16_gs_64_b_4"),
         (true, 64, 2) if biased => Ok("affine_qmv_routed_bias_bfloat16_gs_64_b_2"),
@@ -553,7 +555,7 @@ fn routed_point(op: &'static str, bank: Bank, biased: bool) -> Result<&'static s
             op,
             format!(
                 "the bank is {} at {bits} bits in groups of {group}, and `qmv.metal` \
-                 instantiates the routed shapes at affine/{{32,64,128}}/2, affine/64/4 \
+                 instantiates the routed shapes at affine/{{32,64,128}}/2, affine/64/{{4,8}} \
                  and mxfp4/32/4 only",
                 if affine { "affine" } else { "symmetric" }
             ),

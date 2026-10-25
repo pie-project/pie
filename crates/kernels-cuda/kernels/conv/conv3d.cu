@@ -32,6 +32,9 @@ struct ConvGeom {
     // The rows the fire-wide grids address `x`'s and `o`'s row 0 at.
     int x_base;
     int o_base;
+    int dt;
+    int dh;
+    int dw;
 };
 
 struct OutRow {
@@ -75,10 +78,10 @@ __device__ __forceinline__ int tap_row(
     bool& from_cache)
 {
     from_cache = false;
-    const int hi = r.o.h * g.sh - g.ph + ih;
-    const int wi = r.o.w * g.sw - g.pw + iw;
+    const int hi = r.o.h * g.sh - g.ph + ih * g.dh;
+    const int wi = r.o.w * g.sw - g.pw + iw * g.dw;
     if (hi < 0 || hi >= r.in.h || wi < 0 || wi >= r.in.w) return -1;
-    int ti = r.o.t * g.st - g.pt + it;
+    int ti = r.o.t * g.st - g.pt + it * g.dt;
     if (ti < 0) {
         if (g.causal && has_cache) {
             from_cache = true;
@@ -439,6 +442,40 @@ __global__ __launch_bounds__(kMmaThreads) void conv3d_mma(
             }
         }
     }
+}
+
+// Each channel convolved alone, an output element a thread: the weight is
+// `[C, taps]`, and a row no lane holds lands zero.
+__global__ void conv3d_depthwise(
+    const bf16* __restrict__ x,
+    const int* __restrict__ grid,
+    const bf16* __restrict__ w,
+    const float* __restrict__ bias,
+    const bf16* __restrict__ cache,
+    bf16* __restrict__ o,
+    const int* __restrict__ o_grid,
+    ConvGeom g)
+{
+    const long long e = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (e >= static_cast<long long>(g.rows_out) * g.c_out) return;
+    const int m = static_cast<int>(e / g.c_out);
+    const int n = static_cast<int>(e - static_cast<long long>(m) * g.c_out);
+    const OutRow r = out_row(g, grid, o_grid, m);
+    float acc = 0.f;
+    if (r.live) {
+        const int taps = g.kt * g.kh * g.kw;
+        for (int tap = 0; tap < taps; ++tap) {
+            int it, ih, iw;
+            tap_of(g, tap, it, ih, iw);
+            bool from_cache = false;
+            const int src = tap_row(g, r, it, ih, iw, cache != nullptr, from_cache);
+            if (src < 0) continue;
+            const bf16* row = (from_cache ? cache : x) + static_cast<long long>(src) * g.c_in;
+            acc += bf16_to_f32(ldg(row + n)) * bf16_to_f32(ldg(w + static_cast<long long>(n) * taps + tap));
+        }
+        if (bias != nullptr) acc += bias[n];
+    }
+    o[e] = f32_to_bf16(acc);
 }
 
 __global__ void conv_weight_taps_major(

@@ -312,6 +312,8 @@ void main(uint3 group: SV_GroupID, uint3 local: SV_GroupThreadID) {
 // pie:instantiate linear_moe_select_mxfp4_bias_bf16_gs_32_b_4 PIE_MXFP4=1 PIE_BIASED=1
 // pie:instantiate linear_moe_select_affine_bf16_gs_64_b_4 PIE_GROUP=64 PIE_BITS=4
 // pie:instantiate linear_moe_select_affine_bias_bf16_gs_64_b_4 PIE_GROUP=64 PIE_BITS=4 PIE_BIASED=1
+// pie:instantiate linear_moe_select_affine_bf16_gs_64_b_8 PIE_GROUP=64 PIE_BITS=8
+// pie:instantiate linear_moe_select_affine_bias_bf16_gs_64_b_8 PIE_GROUP=64 PIE_BITS=8 PIE_BIASED=1
 // pie:instantiate linear_moe_select_affine_bf16_gs_64_b_2 PIE_GROUP=64 PIE_BITS=2
 // pie:instantiate linear_moe_select_affine_bias_bf16_gs_64_b_2 PIE_GROUP=64 PIE_BITS=2 PIE_BIASED=1
 // pie:instantiate linear_moe_select_affine_bf16_gs_32_b_2 PIE_GROUP=32 PIE_BITS=2
@@ -323,6 +325,8 @@ void main(uint3 group: SV_GroupID, uint3 local: SV_GroupThreadID) {
 // pie:instantiate linear_moe_select_mxfp4_bias_bf16_gs_32_b_4 PIE_MXFP4=1 PIE_BIASED=1 PIE_TIER=subgroup PIE_TARGET=wgsl
 // pie:instantiate linear_moe_select_affine_bf16_gs_64_b_4 PIE_GROUP=64 PIE_BITS=4 PIE_TIER=subgroup PIE_TARGET=wgsl
 // pie:instantiate linear_moe_select_affine_bias_bf16_gs_64_b_4 PIE_GROUP=64 PIE_BITS=4 PIE_BIASED=1 PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_moe_select_affine_bf16_gs_64_b_8 PIE_GROUP=64 PIE_BITS=8 PIE_TIER=subgroup PIE_TARGET=wgsl
+// pie:instantiate linear_moe_select_affine_bias_bf16_gs_64_b_8 PIE_GROUP=64 PIE_BITS=8 PIE_BIASED=1 PIE_TIER=subgroup PIE_TARGET=wgsl
 // pie:instantiate linear_moe_select_affine_bf16_gs_64_b_2 PIE_GROUP=64 PIE_BITS=2 PIE_TIER=subgroup PIE_TARGET=wgsl
 // pie:instantiate linear_moe_select_affine_bias_bf16_gs_64_b_2 PIE_GROUP=64 PIE_BITS=2 PIE_BIASED=1 PIE_TIER=subgroup PIE_TARGET=wgsl
 // pie:instantiate linear_moe_select_affine_bf16_gs_32_b_2 PIE_GROUP=32 PIE_BITS=2 PIE_TIER=subgroup PIE_TARGET=wgsl

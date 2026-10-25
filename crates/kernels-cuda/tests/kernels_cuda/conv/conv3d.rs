@@ -34,7 +34,8 @@ fn check(case: &Case, path: ConvPath) {
 
     let mut lcg = Lcg::seeded(0x5ea7 ^ rows as u64 ^ (c_out as u64) << 8);
     let (x_raw, x) = lcg.row(rows * c_in);
-    let (w_raw, w) = lcg.row(c_out * c_in * taps);
+    let per = if conv.depthwise { 1 } else { c_in };
+    let (w_raw, w) = lcg.row(c_out * per * taps);
     let bias_vals: Vec<f32> = (0..c_out).map(|_| lcg.unit()).collect();
     let cache_rows: usize = boxes.iter().map(|b| conv.pad[0] as usize * b.plane()).sum();
     let (cache_raw, cache_vals) = lcg.row(cache_rows * c_in);
@@ -62,11 +63,11 @@ fn check(case: &Case, path: ConvPath) {
     let o_at = gpu.up(&vec![0x7fc0u16; (rows_out + slack) * c_out]);
     let ctx = gpu.ctx();
 
-    let mut w_t = Tensor::new(w_at, c_out as u32, (c_in * taps) as u32, Dtype::Bf16);
+    let mut w_t = Tensor::new(w_at, c_out as u32, (per * taps) as u32, Dtype::Bf16);
     conv_weight_taps_major(
         &ctx,
-        Tensor::new(w_nat, c_out as u32, (c_in * taps) as u32, Dtype::Bf16),
-        c_in as u32,
+        Tensor::new(w_nat, c_out as u32, (per * taps) as u32, Dtype::Bf16),
+        per as u32,
         taps as u32,
         &mut w_t,
     )
@@ -98,7 +99,7 @@ fn check(case: &Case, path: ConvPath) {
         "{name} on {path:?}: a padded row past the lanes did not land zeros"
     );
 
-    let scale = (taps * c_in) as f32;
+    let scale = (taps * per) as f32;
     for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
         let g = from_bf16(g);
         assert!(
@@ -118,6 +119,8 @@ fn k3(stride: u32, pad: [u32; 3], causal_t: bool, time_pad: TimePad) -> Conv3d {
         pad_back: pad,
         causal_t,
         time_pad,
+        dilation: [1, 1, 1],
+        depthwise: false,
     }
 }
 
@@ -189,6 +192,8 @@ fn cases() -> Vec<Case> {
                 pad_back: [1, 0, 0],
                 causal_t: true,
                 time_pad: TimePad::Zero,
+                dilation: [1, 1, 1],
+                depthwise: false,
             },
             cache: true,
             bias: false,
@@ -219,6 +224,42 @@ fn cases() -> Vec<Case> {
             conv: Conv3d::conv2d([3, 3], [2, 2], [1, 1]),
             cache: false,
             bias: false,
+        },
+        Case {
+            name: "a codec's causal conv along time: k (7,1,1), taps three frames apart",
+            boxes: vec![Box3::new(30, 1, 1), Box3::new(11, 1, 1)],
+            c_in: 16,
+            c_out: 24,
+            conv: Conv3d {
+                k: [7, 1, 1],
+                stride: [1, 1, 1],
+                pad: [18, 0, 0],
+                pad_back: [0, 0, 0],
+                causal_t: true,
+                time_pad: TimePad::Zero,
+                dilation: [3, 1, 1],
+                depthwise: false,
+            },
+            cache: false,
+            bias: true,
+        },
+        Case {
+            name: "a depthwise causal conv: k (7,1,1), each channel alone",
+            boxes: vec![Box3::new(20, 1, 1), Box3::new(9, 1, 1)],
+            c_in: 24,
+            c_out: 24,
+            conv: Conv3d {
+                k: [7, 1, 1],
+                stride: [1, 1, 1],
+                pad: [6, 0, 0],
+                pad_back: [0, 0, 0],
+                causal_t: true,
+                time_pad: TimePad::Zero,
+                dilation: [1, 1, 1],
+                depthwise: true,
+            },
+            cache: false,
+            bias: true,
         },
     ]
 }
