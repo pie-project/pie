@@ -76,12 +76,6 @@ impl pie::inferlet::model::Host for ProcessCtx {
             .collect())
     }
 
-    async fn positions(&mut self) -> Result<Option<pie::inferlet::model::PositionConvention>> {
-        // Every model computes its positions in its graph (latent-path L2);
-        // no model states a convention. The WIT entry goes with B1's cleanup.
-        Ok(None)
-    }
-
     async fn lane(
         &mut self,
         switches: Vec<(String, String)>,
@@ -107,9 +101,6 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(model::model().generative().and_then(|g| g.latent).map(|l| {
             pie::inferlet::model::LatentSpace {
                 channels: l.channels,
-                patch_t: l.patch_t,
-                patch_h: l.patch_h,
-                patch_w: l.patch_w,
                 spatial_compression: l.spatial_compression,
                 temporal_compression: l.temporal_compression,
             }

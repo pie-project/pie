@@ -30,11 +30,6 @@ export function draftBlock(): BlockDrafter | undefined;
  */
 export function switches(): Array<SwitchDecl>;
 /**
- * How the bound model's lanes place their rows in the rotary space,
- * when it states a convention. `none` otherwise. Static.
- */
-export function positions(): PositionConvention | undefined;
-/**
  * The lane a pass of these switches is. Switches are `(name, value)`
  * pairs of `switches()`; one left unset takes its default.
  */
@@ -184,74 +179,6 @@ export interface SwitchDecl {
   values: Array<string>,
 }
 /**
- * ── Generative facts ────────────────────────────────────────────────
- * What a guest sizes an image/video job from, so it never parses
- * `architecture()`: how its positions are laid out, its latent space,
- * and the schedule it was trained under. A text model answers `none`
- * to each.
- * What one axis of a positions input means. The rotary space a
- * DiT was trained in is 1..=4 axes wide and every family orders them
- * differently; this names them so a guest can fill the grid without
- * knowing the family.
- * # Variants
- * 
- * ## `"time"`
- * 
- * Frame / reference / sequence index (FLUX's `T`, Z-Image's `t`).
- * ## `"height"`
- * 
- * The latent grid's row.
- * ## `"width"`
- * 
- * The latent grid's column.
- * ## `"index"`
- * 
- * A plain row-ordinal axis, carried by one lane's rows alone
- * (FLUX's fourth `L` axis, which numbers the text rows).
- */
-export type AxisRole = 'time' | 'height' | 'width' | 'index';
-/**
- * WHERE A MODEL'S LANES SIT IN THE ROTARY SPACE.
- * 
- * A denoiser's positions input takes one coordinate vector
- * per row, and which coordinate goes where is a family contract the
- * guest must not spell (`flux_2`'s `(0, h, w, j)`, `z_image`'s
- * `(L + 1, a, b)`). This fact states it, so `latent::positions_for`
- * builds both from the same code:
- * 
- *   * a TEXT or CONTEXT lane's row `j` sits at `text-origin + j` on
- *     axis `text-axis`, and at 0 on every other axis;
- *   * an IMAGE lane's patch `(a, b)` sits at `a` on the `height` axis
- *     and `b` on the `width` axis; on `text-axis` it sits at
- *     `text-origin + text-rows` when `image-follows-text`, else 0; on
- *     every remaining axis, 0.
- *   * a REFERENCE lane's patch `(a, b)` of reference `i` sits where an
- *     image lane's would, except on the `time` axis, where it sits at
- *     `reference-stride * (i + 1)` -- the offset that keeps each
- *     reference picture in a rotary neighbourhood of its own, clear of
- *     the target grid at 0.
- * 
- * `axes` has exactly the positions input's `width` entries. A family whose
- * positions do not fit this shape states `none` and its guests build
- * their own.
- */
-export interface PositionConvention {
-  axes: Array<AxisRole>,
-  textAxis: number,
-  textOrigin: number,
-  imageFollowsText: boolean,
-  /**
-   * WHERE REFERENCE `i` SITS ON THE `time` AXIS: at
-   * `reference-stride * (i + 1)`, so the first reference clears the
-   * target grid's `T = 0` and each further one clears the last
-   * (FLUX.2's `10*(i + 1)`). `none` -- the answer for every family
-   * that declares no `reference` stream -- means this row states no
-   * reference convention, and a guest that would bind a reference
-   * lane must refuse rather than invent an offset.
-   */
-  referenceStride?: number,
-}
-/**
  * Which export seam a lane's epilogue reads: `logits()` for a text
  * head, `velocity()` for a denoiser, `hidden()` for an encoder,
  * `pixels` for a VAE on the voxel axis (one row per output voxel of
@@ -318,16 +245,13 @@ export interface LaneDecl {
   readout?: Readout,
 }
 /**
- * The latent space a denoiser works in: one latent row is
- * `patch-t × patch-h × patch-w` cells of `channels` values, one cell
- * is `spatial-compression²` pixels by `temporal-compression` frames.
- * `none` for a model with no latent.
+ * The latent space a denoiser works in, the VAE's own: a `[t, h, w,
+ * channels]` volume, one cell `spatial-compression²` pixels by
+ * `temporal-compression` frames. How the denoiser patches it is the
+ * model's business, not the guest's. `none` for a model with no latent.
  */
 export interface LatentSpace {
   channels: number,
-  patchT: number,
-  patchH: number,
-  patchW: number,
   spatialCompression: number,
   temporalCompression: number,
 }

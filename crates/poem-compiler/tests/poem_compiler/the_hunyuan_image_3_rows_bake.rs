@@ -355,17 +355,11 @@ fn both_fact_columns_state_what_the_trace_does() {
         assert_eq!(
             (
                 latent.channels,
-                latent.patch_t,
-                latent.patch_h,
-                latent.patch_w,
                 latent.spatial_compression,
                 latent.temporal_compression
             ),
             (
                 model::LATENT_CHANNELS,
-                1,
-                1,
-                1,
                 model::SPATIAL_COMPRESSION,
                 1
             )

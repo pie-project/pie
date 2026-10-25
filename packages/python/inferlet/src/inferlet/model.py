@@ -20,7 +20,6 @@ from dataclasses import dataclass
 
 from wit_world.imports import model as _model
 
-AxisRole = _model.AxisRole
 InputAxis = _model.InputAxis
 InputDecl = _model.InputDecl
 LaneDecl = _model.LaneDecl
@@ -130,12 +129,6 @@ def switches() -> list[SwitchDecl]:
 def switch(name: str) -> SwitchDecl | None:
     """The switch `name` the model declares, or ``None``."""
     return next((d for d in _model.switches() if d.name == name), None)
-
-
-def positions():
-    """How the bound model's lanes place their rows in the rotary space
-    (`model.PositionConvention`), or ``None`` when it states no convention."""
-    return _model.positions()
 
 
 def lane(switches: list[tuple[str, str]]) -> LaneDecl:

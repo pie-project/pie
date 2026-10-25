@@ -433,8 +433,8 @@ fn the_schedule_is_the_goldens_and_the_mu_fit_reproduces_it() {
 
     let latent = facts.latent.unwrap();
     assert_eq!(
-        (latent.channels, latent.patch_h, latent.spatial_compression),
-        (model::VAE_CHANNELS, model::PACK, model::VAE_COMPRESSION)
+        (latent.channels, latent.spatial_compression),
+        (model::VAE_CHANNELS, model::VAE_COMPRESSION)
     );
     assert_eq!(
         model::VAE_CHANNELS * model::PACK * model::PACK,

@@ -445,22 +445,10 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
             assert_eq!(names, vec!["denoise"]);
         }
         let latent = facts.latent.expect("a latent space");
-        assert_eq!(
-            (
-                latent.channels,
-                latent.patch_t,
-                latent.patch_h,
-                latent.patch_w
-            ),
-            (d.in_channels, 1, 2, 2)
-        );
+        assert_eq!(latent.channels, d.in_channels);
         assert_eq!(
             (latent.spatial_compression, latent.temporal_compression),
             (16, 4)
-        );
-        assert_eq!(
-            latent.channels * latent.patch_t * latent.patch_h * latent.patch_w,
-            d.patch_in()
         );
         let schedule = facts.schedule.as_ref().expect("a schedule");
         assert_eq!(schedule.kind, ScheduleKind::Flow);

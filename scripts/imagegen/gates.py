@@ -998,8 +998,8 @@ def roster() -> list[Gate]:
                  "(`frames.decode` in, `frames.to-channel` onto the pixel port) and "
                  "never enters the guest's linear memory. An init image seeds the "
                  "trajectory; a REFERENCE rides a lane of its own on the reading's "
-                 "reference stream, at the offset the family states "
-                 "(`position-convention.reference-stride`), and reads nothing back. "
+                 "reference stream, at the ordinal the guest states (its `reference` "
+                 "input; the family computes the offset), and reads nothing back. "
                  "Every claim is an identity or a margin measured within this gate's "
                  "own runs, so none needs a golden.",
             needs=[(a("flux2-klein-4b.zt"),

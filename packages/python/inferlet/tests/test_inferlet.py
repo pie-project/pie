@@ -388,7 +388,6 @@ class TestDiffusionSurface:
     def test_model_facts(self):
         from inferlet import model
 
-        assert model.positions() is None
         assert [i.name for i in model.lane([("mode", "denoise")]).inputs] == ["self_cond_ids"]
         assert model.draft_block() is None
         assert model.run_ahead_window() == 4

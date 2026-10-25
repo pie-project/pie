@@ -37,13 +37,6 @@ from enum import Enum
 # ---------------------------------------------------------------------------
 
 
-class AxisRole(Enum):
-    TIME = 0
-    HEIGHT = 1
-    WIDTH = 2
-    INDEX = 3
-
-
 class InputAxis(Enum):
     LANE = 0
     ROW = 1
@@ -65,7 +58,6 @@ class ScheduleKind(Enum):
 
 def _make_model() -> types.ModuleType:
     m = types.ModuleType("wit_world.imports.model")
-    m.AxisRole = AxisRole
     m.InputAxis = InputAxis
     m.InputDecl = InputDeclStub
     m.LaneDecl = LaneDeclStub
@@ -88,7 +80,6 @@ def _make_model() -> types.ModuleType:
     m.BlockDrafter = BlockDrafterStub
     m.draft_block = lambda: None
     m.switches = lambda: [SwitchDeclStub("mode", ["encode", "denoise"])]
-    m.positions = lambda: None
     m.lane = _lane
     return m
 

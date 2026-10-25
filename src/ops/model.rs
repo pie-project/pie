@@ -468,11 +468,7 @@ impl crate::ui::Report for ModelInfo {
             let mut row =
                 |k: &str, v: String| table.push(Row::new(Mark::Plain, [k.to_string(), v]));
             if let Some(latent) = &generative.latent {
-                let (w, h) = latent.pixels_per_row();
-                row(
-                    "latent",
-                    format!("{} (one row is {w}x{h} pixels)", latent.line()),
-                );
+                row("latent", latent.line());
             }
             if let Some(schedule) = &generative.schedule {
                 row("schedule", schedule.line());

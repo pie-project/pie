@@ -12,9 +12,6 @@ pub struct GenerativeFacts {
 #[derive(serde::Serialize)]
 pub struct Latent {
     pub channels: u32,
-    pub patch_t: u32,
-    pub patch_h: u32,
-    pub patch_w: u32,
     pub spatial_compression: u32,
     pub temporal_compression: u32,
 }
@@ -34,9 +31,6 @@ pub fn of(deployment: Option<&str>) -> Option<GenerativeFacts> {
     Some(GenerativeFacts {
         latent: generative.latent.map(|l| Latent {
             channels: l.channels,
-            patch_t: l.patch_t,
-            patch_h: l.patch_h,
-            patch_w: l.patch_w,
             spatial_compression: l.spatial_compression,
             temporal_compression: l.temporal_compression,
         }),
@@ -114,26 +108,14 @@ impl GenerativeFacts {
 
 impl Latent {
     pub fn line(&self) -> String {
-        let patch = if self.patch_t > 1 {
-            format!("patch {}x{}x{}", self.patch_t, self.patch_h, self.patch_w)
-        } else {
-            format!("patch {}x{}", self.patch_h, self.patch_w)
-        };
         let temporal = if self.temporal_compression > 1 {
             format!(", /{} frames", self.temporal_compression)
         } else {
             String::new()
         };
         format!(
-            "{} ch, {}, /{} px{temporal}",
-            self.channels, patch, self.spatial_compression
-        )
-    }
-
-    pub fn pixels_per_row(&self) -> (u32, u32) {
-        (
-            self.patch_w * self.spatial_compression,
-            self.patch_h * self.spatial_compression,
+            "{} ch, /{} px{temporal}",
+            self.channels, self.spatial_compression
         )
     }
 }

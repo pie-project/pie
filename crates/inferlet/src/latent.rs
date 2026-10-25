@@ -2,14 +2,14 @@ use crate::eta::{
     Channel, ForwardPass, Pipeline, StateGeometry, WorkingSet, broadcast, eq, gather, intrinsics,
     max_elem, min_elem, normal, reduce_sum, reshape, select, sqrt,
 };
-use crate::model::{AxisRole, PositionConvention, ReadoutKind, ScheduleFact, ScheduleKind};
+use crate::model::{ReadoutKind, ScheduleFact, ScheduleKind};
 use eta_dsl::Tensor;
 
 pub mod prelude {
     pub use super::{
-        DenoiseLoop, Dpm2m, Dpm2mChannels, FlowMatchEuler, LaneRows, apg, at, cfg_combine,
+        DenoiseLoop, Dpm2m, Dpm2mChannels, FlowMatchEuler, apg, at, cfg_combine,
         dpm2m_step, dynamic_shift, encode_ids, encode_ids_rows, encode_text, euler_step,
-        host_noise, inpaint_step, noise, positions_for, positions_grid, resume_or_step, rng_state,
+        host_noise, inpaint_step, noise, resume_or_step, rng_state,
         seed_or_step, step,
     };
     pub use crate::eta::prelude::*;
@@ -203,75 +203,6 @@ pub fn noise(shape: impl eta_dsl::IntoShape, seed: &Tensor) -> Tensor {
 
 pub fn at(vector: &Tensor, index: &Tensor) -> Tensor {
     gather(vector, reshape(index, [1]))
-}
-
-#[must_use]
-pub fn positions_grid(t: u32, h: u32, w: u32, offsets: [f32; 3]) -> Vec<f32> {
-    let mut grid = Vec::with_capacity((t * h * w * 3) as usize);
-    for i in 0..t {
-        for j in 0..h {
-            for k in 0..w {
-                grid.push(i as f32 + offsets[0]);
-                grid.push(j as f32 + offsets[1]);
-                grid.push(k as f32 + offsets[2]);
-            }
-        }
-    }
-    grid
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LaneRows {
-    Sequence(u32),
-    Grid { h: u32, w: u32 },
-    Volume { t: u32, h: u32, w: u32 },
-    Reference { index: u32, h: u32, w: u32 },
-}
-
-#[must_use]
-pub fn positions_for(convention: &PositionConvention, lane: LaneRows, text_rows: u32) -> Vec<f32> {
-    let axes = convention.axes.len();
-    let text_axis = convention.text_axis as usize;
-    let origin = convention.text_origin as f32;
-    let mut time_offset = 0f32;
-    let (t, h, w) = match lane {
-        LaneRows::Sequence(rows) => {
-            let mut grid = vec![0f32; rows as usize * axes];
-            for j in 0..rows as usize {
-                if let Some(cell) = grid.get_mut(j * axes + text_axis) {
-                    *cell = origin + j as f32;
-                }
-            }
-            return grid;
-        }
-        LaneRows::Grid { h, w } => (1, h, w),
-        LaneRows::Volume { t, h, w } => (t, h, w),
-        LaneRows::Reference { index, h, w } => {
-            time_offset = (convention.reference_stride.unwrap_or(0) * (index + 1)) as f32;
-            (1, h, w)
-        }
-    };
-    let follow = origin + text_rows as f32;
-    let mut grid = Vec::with_capacity((t * h * w) as usize * axes);
-    for i in 0..t {
-        for a in 0..h {
-            for b in 0..w {
-                for (axis, role) in convention.axes.iter().enumerate() {
-                    grid.push(if axis == text_axis && convention.image_follows_text {
-                        follow
-                    } else {
-                        match role {
-                            AxisRole::Time => time_offset + i as f32,
-                            AxisRole::Height => a as f32,
-                            AxisRole::Width => b as f32,
-                            AxisRole::Index => 0.0,
-                        }
-                    });
-                }
-            }
-        }
-    }
-    grid
 }
 
 /// A denoising loop's clock: one pass a step, on one pipeline. The pass's
@@ -672,11 +603,6 @@ mod tests {
         a_shift_bends_the_sigmas_up();
         pinned_sigmas_are_taken_and_resampled();
         the_dynamic_shift_interpolates_mu();
-        a_positions_grid_is_t_major_with_offsets();
-        a_grid_then_index_convention_numbers_text_on_its_own_axis();
-        a_text_time_prefix_convention_stacks_the_image_behind_the_caption();
-        a_reference_grid_rides_its_own_time_offset();
-        a_grid_only_convention_leaves_the_time_axis_at_zero();
     }
 
     fn a_flow_schedule_ends_at_zero_and_steps_downhill() {
@@ -730,131 +656,5 @@ mod tests {
     fn the_dynamic_shift_interpolates_mu() {
         assert!((dynamic_shift(256, 0.5) - 0.5f32.exp()).abs() < 1e-5);
         assert!((dynamic_shift(4096, 0.5) - 1.15f32.exp()).abs() < 1e-5);
-    }
-
-    fn a_positions_grid_is_t_major_with_offsets() {
-        let grid = positions_grid(1, 2, 2, [10.0, 0.0, 0.0]);
-        assert_eq!(
-            grid,
-            vec![
-                10.0, 0.0, 0.0, 10.0, 0.0, 1.0, 10.0, 1.0, 0.0, 10.0, 1.0, 1.0
-            ]
-        );
-    }
-
-    fn a_grid_then_index_convention_numbers_text_on_its_own_axis() {
-        let flux = PositionConvention {
-            axes: vec![
-                AxisRole::Time,
-                AxisRole::Height,
-                AxisRole::Width,
-                AxisRole::Index,
-            ],
-            text_axis: 3,
-            text_origin: 0,
-            image_follows_text: false,
-            reference_stride: Some(10),
-        };
-        assert_eq!(
-            positions_for(&flux, LaneRows::Sequence(2), 2),
-            vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]
-        );
-        assert_eq!(
-            positions_for(&flux, LaneRows::Grid { h: 2, w: 2 }, 2),
-            vec![
-                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0,
-            ]
-        );
-    }
-
-    fn a_text_time_prefix_convention_stacks_the_image_behind_the_caption() {
-        let z = PositionConvention {
-            axes: vec![AxisRole::Time, AxisRole::Height, AxisRole::Width],
-            text_axis: 0,
-            text_origin: 1,
-            image_follows_text: true,
-            reference_stride: None,
-        };
-        assert_eq!(
-            positions_for(&z, LaneRows::Sequence(2), 2),
-            vec![1.0, 0.0, 0.0, 2.0, 0.0, 0.0]
-        );
-        assert_eq!(
-            positions_for(&z, LaneRows::Grid { h: 1, w: 2 }, 32),
-            vec![33.0, 0.0, 0.0, 33.0, 0.0, 1.0]
-        );
-    }
-
-    fn a_reference_grid_rides_its_own_time_offset() {
-        let flux = PositionConvention {
-            axes: vec![
-                AxisRole::Time,
-                AxisRole::Height,
-                AxisRole::Width,
-                AxisRole::Index,
-            ],
-            text_axis: 3,
-            text_origin: 0,
-            image_follows_text: false,
-            reference_stride: Some(10),
-        };
-        assert_eq!(
-            positions_for(
-                &flux,
-                LaneRows::Reference {
-                    index: 0,
-                    h: 1,
-                    w: 2
-                },
-                7
-            ),
-            vec![10.0, 0.0, 0.0, 0.0, 10.0, 0.0, 1.0, 0.0,]
-        );
-        assert_eq!(
-            positions_for(
-                &flux,
-                LaneRows::Reference {
-                    index: 1,
-                    h: 1,
-                    w: 2
-                },
-                7
-            ),
-            vec![20.0, 0.0, 0.0, 0.0, 20.0, 0.0, 1.0, 0.0,]
-        );
-        let silent = PositionConvention {
-            reference_stride: None,
-            ..flux.clone()
-        };
-        assert_eq!(
-            positions_for(
-                &silent,
-                LaneRows::Reference {
-                    index: 0,
-                    h: 1,
-                    w: 2
-                },
-                7
-            ),
-            positions_for(&silent, LaneRows::Grid { h: 1, w: 2 }, 7)
-        );
-    }
-
-    fn a_grid_only_convention_leaves_the_time_axis_at_zero() {
-        let mini = PositionConvention {
-            axes: vec![AxisRole::Time, AxisRole::Height, AxisRole::Width],
-            text_axis: 0,
-            text_origin: 0,
-            image_follows_text: false,
-            reference_stride: None,
-        };
-        assert_eq!(
-            positions_for(&mini, LaneRows::Sequence(2), 2),
-            vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.0]
-        );
-        assert_eq!(
-            positions_for(&mini, LaneRows::Grid { h: 2, w: 1 }, 2),
-            vec![0.0, 0.0, 0.0, 0.0, 1.0, 0.0]
-        );
     }
 }

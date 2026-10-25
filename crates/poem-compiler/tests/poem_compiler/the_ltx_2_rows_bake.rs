@@ -330,16 +330,7 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
             "{deployment}: the decode reading iff the row carries the VAE"
         );
         let latent = facts.latent.expect("a latent space");
-        assert_eq!(
-            (
-                latent.channels,
-                latent.patch_t,
-                latent.patch_h,
-                latent.patch_w
-            ),
-            (d.channels, 1, 1, 1),
-            "{deployment}: a token is one latent cell"
-        );
+        assert_eq!(latent.channels, d.channels, "{deployment}");
         assert_eq!(
             (latent.spatial_compression, latent.temporal_compression),
             (32, 8)
