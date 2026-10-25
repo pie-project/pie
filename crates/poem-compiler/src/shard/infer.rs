@@ -822,16 +822,17 @@ impl<'r, 't> Walk<'r, 't> {
             }
             // A share of several runs as wide as itself (the arms of a merge)
             // holds what each of them does.
-            for o in self.whole_runs(*v) {
+            for o in self.whole_runs(*v, h) {
                 self.count_run(op, t, name, o, head_dim);
             }
         }
     }
 
-    /// The runs `v` is all of: each column cut's output it is a share of,
-    /// if every one is as wide as `v`.
-    fn whole_runs(&self, v: ValueId) -> Vec<Origin> {
-        let Some(Held::Split(os)) = &self.held[v.0 as usize] else {
+    /// The runs `v`, held as `held` (a merge as its arms are), is all of:
+    /// each column cut's output it is a share of, if every one is as wide as
+    /// `v`.
+    fn whole_runs(&self, v: ValueId, held: &Held) -> Vec<Origin> {
+        let Held::Split(os) = held else {
             return Vec::new();
         };
         let width = self.width(v);
