@@ -33,10 +33,8 @@ struct Member {
 }
 
 /// What the stream core reads of the program it plans, and nothing more: the
-/// type of every value, the ops it may plan, and the values that leave. The
-/// guest path builds one from a compiled stage and a region of its plan
-/// ([`View::of_stage`]); a fused region (`crate::region::Region`) builds one
-/// from its function, its parameters the first values.
+/// type of every value, the ops it may plan, and the values that leave,
+/// built from a compiled stage and a region of its plan ([`View::of_stage`]).
 pub(crate) struct View<'a> {
     pub value_types: &'a [SymbolicType],
     /// The ops the core may plan, by index into the op list, in program order.

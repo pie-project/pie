@@ -73,19 +73,7 @@ pub struct BodyCtx<'a> {
 }
 
 pub fn body_types(ops: &[Op], ctx: &BodyCtx<'_>) -> Result<Vec<ValueType>, BodyError> {
-    body_types_after(&[], ops, ctx)
-}
-
-/// The types of a body whose first values are given rather than computed:
-/// `given` holds values `0..n`, and the ops' results are numbered from `n`.
-/// A function over its parameters (a fused region) is typed this way; a
-/// guest body gives none.
-pub fn body_types_after(
-    given: &[ValueType],
-    ops: &[Op],
-    ctx: &BodyCtx<'_>,
-) -> Result<Vec<ValueType>, BodyError> {
-    let mut types: Vec<ValueType> = given.to_vec();
+    let mut types: Vec<ValueType> = Vec::new();
     for (i, op) in ops.iter().enumerate() {
         let index = u32::try_from(i).unwrap_or(u32::MAX);
         let produced = types.len();

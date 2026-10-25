@@ -4,7 +4,7 @@
 //! unit of its own and fired over the region's planes.
 //!
 //! - **What the frame takes** ([`supports`]): a region of pure math that
-//!   the stream core writes whole, over one or more parameters and to one
+//!   the row core schedules (`kernels_ir::schedule`), over one or more parameters and to one
 //!   or more results, every one a bf16 row (a parameter may be one row
 //!   every row reads), the row whole vectors of 8 and at most
 //!   [`MAX_WIDTH`] wide.

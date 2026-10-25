@@ -632,7 +632,7 @@ impl Builder {
         self.push(Op::Unary(Unary::Recip, den))
     }
 
-    /// `1 - 2 / (e^2t + 1)`: eta has no tanh.
+    /// `1 - 2 / (e^2t + 1)`: a region has no tanh.
     fn tanh(&mut self, t: u32) -> u32 {
         let (one, two) = (self.konst(1.0), self.konst(2.0));
         let twice = self.push(Op::Binary(Binary::Mul, t, two));

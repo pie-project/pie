@@ -1,5 +1,5 @@
 //! Under `compiler.synth_regions`, a run of elementwise and row ops forms a
-//! chain, lowered to one eta region (`fuse::chain`): a function of one row
+//! chain, lowered to one region (`fuse::chain`): a function of one row
 //! the row core schedules into passes over the row, and folded into one
 //! `fused.region` op the plan is of. Off, nothing forms.
 
@@ -250,7 +250,7 @@ fn an_op_no_region_lowers_ends_the_chain() {
     assert_eq!(
         spans,
         [vec![0, 1], vec![3, 4]],
-        "erf's gelu has no eta form"
+        "erf's gelu has no region form"
     );
 }
 
@@ -411,7 +411,7 @@ fn every_folded_catalog_trace_checks() {
 }
 
 /// Every catalog deployment's chains, on CUDA: each lies in its trace, after
-/// the one before, and the stream core writes its body.
+/// the one before, and the row core schedules its region.
 #[test]
 fn every_catalog_chain_has_a_body() {
     let mut wrong: Vec<String> = Vec::new();

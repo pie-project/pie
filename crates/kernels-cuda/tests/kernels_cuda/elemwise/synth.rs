@@ -1,7 +1,7 @@
 #![cfg(feature = "cuda")]
 
 //! A generated row kernel (`kernels_cuda::synth`) lands what the region it
-//! was generated from states: eta's bodies for the chains poem lowers, and
+//! was generated from states: the printed bodies of the regions poem lowers, and
 //! the hand `residual_add_rmsnorm` body passed through the same path, each
 //! against the hand kernels.
 
@@ -194,14 +194,14 @@ fn the_hand_body_through_synth_lands_the_register_kernels_bits() {
     }
 }
 
-/// eta's residual norm against the hand register kernel. The stream is
+/// The residual norm's region against the hand register kernel. The stream is
 /// the same sum and lands the same bits, and the norm takes its squares two
 /// at a time as the hand kernel does (`a += h₀² + h₁²`); a sum whose
 /// threads split the row otherwise than the hand kernel's would differ in
 /// its last f32 bit and, through `rsqrt`, a normed element by one bf16 ulp,
 /// which is what this holds it to.
 #[test]
-fn etas_residual_norm_lands_the_hand_stream_and_its_norm_within_an_ulp() {
+fn a_residual_norms_region_lands_the_hand_stream_and_its_norm_within_an_ulp() {
     for width in WIDTHS {
         let body = body_of(&residual_norm(width), &[2]);
         let kernel = loaded(&body, 3, 2, width);
@@ -224,7 +224,7 @@ fn etas_residual_norm_lands_the_hand_stream_and_its_norm_within_an_ulp() {
                     &[plane(h), plane(out)],
                     rows as u32,
                 )
-                .expect("eta's body fires");
+                .expect("the printed body fires");
             gpu.sync();
             let (y_want, out_want) = hand_residual_norm(rows, width);
             let case = format!("{rows} rows of {width}");
@@ -256,7 +256,7 @@ fn etas_residual_norm_lands_the_hand_stream_and_its_norm_within_an_ulp() {
 /// `z = x + y` and `o = z * g`, both leaving: what the hand `add` and `mul`
 /// land, bit for bit, since the body multiplies the sum as stored.
 #[test]
-fn etas_add_then_mul_lands_the_hand_kernels_bits() {
+fn an_add_then_mul_region_lands_the_hand_kernels_bits() {
     for width in WIDTHS {
         let region = Region {
             width: w(width),
@@ -286,7 +286,7 @@ fn etas_add_then_mul_lands_the_hand_kernels_bits() {
                     &[Plane::rows(&t(z)), Plane::rows(&t(o))],
                     rows as u32,
                 )
-                .expect("eta's body fires");
+                .expect("the printed body fires");
             pointwise::add(&ctx, t(ins[0]), t(ins[1]), &mut t(z_hand)).expect("add fires");
             pointwise::mul(&ctx, t(z_hand), t(ins[2]), &mut t(o_hand)).expect("mul fires");
             gpu.sync();
@@ -308,7 +308,7 @@ fn etas_add_then_mul_lands_the_hand_kernels_bits() {
 /// kernel lands `bf16((y + x) + z)` in f32 bit for bit, which two hand
 /// `residual_add`s, rounding between, do not.
 #[test]
-fn etas_double_residual_rounds_once() {
+fn a_double_residual_region_rounds_once() {
     for width in WIDTHS {
         let region = Region {
             width: w(width),
@@ -332,7 +332,7 @@ fn etas_double_residual_rounds_once() {
                     &[t(out)],
                     rows as u32,
                 )
-                .expect("eta's body fires");
+                .expect("the printed body fires");
             gpu.sync();
             let want: Vec<u16> = (0..n)
                 .map(|e| {
@@ -415,7 +415,7 @@ fn a_kernel_never_loaded_is_refused_at_its_fire() {
     assert!(refused.to_string().contains("not loaded"), "{refused}");
 }
 
-/// eta's residual norm, generated, against the hand register kernel at a
+/// The residual norm's region, generated, against the hand register kernel at a
 /// decode's and a prefill's rows over the widths of 4096-, 7168- and
 /// 8192-wide models, each fire's bytes against the device's copy rate:
 /// `cargo test ... -- --ignored synthesized_residual_norm_rate --nocapture`.
