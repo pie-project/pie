@@ -1,16 +1,14 @@
 use crate::eta::{
-    Channel, ForwardPass, Pipeline, StateGeometry, WorkingSet, broadcast, eq, gather, intrinsics,
-    max_elem, min_elem, normal, reduce_sum, reshape, select, sqrt,
+    Channel, ForwardPass, Pipeline, broadcast, gather, max_elem, min_elem, normal, reduce_sum,
+    reshape, sqrt,
 };
-use crate::model::{ReadoutKind, ScheduleFact, ScheduleKind};
+use crate::model::{ScheduleFact, ScheduleKind};
 use eta_dsl::Tensor;
 
 pub mod prelude {
     pub use super::{
-        DenoiseLoop, Dpm2m, Dpm2mChannels, FlowMatchEuler, apg, at, cfg_combine,
-        dpm2m_step, dynamic_shift, encode_ids, encode_ids_rows, encode_text, euler_step,
-        host_noise, inpaint_step, noise, resume_or_step, rng_state,
-        seed_or_step, step,
+        DenoiseLoop, Dpm2m, Dpm2mChannels, FlowMatchEuler, apg, at, cfg_combine, dynamic_shift,
+        euler_step, noise, rng_state,
     };
     pub use crate::eta::prelude::*;
 }
@@ -214,7 +212,6 @@ pub struct DenoiseLoop {
     timestep: Channel,
     ts: Channel,
     dts: Channel,
-    sigmas: Channel,
     fires: u32,
 }
 
@@ -227,28 +224,13 @@ impl DenoiseLoop {
         let mut dts = vec![0.0];
         dts.extend(sched.dts());
         dts.push(0.0);
-        DenoiseLoop::of(sched, ts, dts, sched.steps() + 1)
-    }
-
-    /// One fire per step over a latent drawn up front by [`host_noise`].
-    #[must_use]
-    pub fn seeded(sched: &FlowMatchEuler) -> DenoiseLoop {
-        let mut ts = sched.timesteps();
-        ts.push(0.0);
-        let mut dts = sched.dts();
-        dts.push(0.0);
-        DenoiseLoop::of(sched, ts, dts, sched.steps())
-    }
-
-    fn of(sched: &FlowMatchEuler, ts: Vec<f32>, dts: Vec<f32>, fires: u32) -> DenoiseLoop {
         DenoiseLoop {
             pipe: Pipeline::new(),
             step: Channel::from([0u32]).named("step"),
             timestep: Channel::from([ts[0]]).named("t"),
             ts: Channel::from(ts).named("ts"),
             dts: Channel::from(dts).named("dts"),
-            sigmas: Channel::from(sched.sigmas.clone()).named("sigmas"),
-            fires,
+            fires: sched.steps() + 1,
         }
     }
 
@@ -269,12 +251,6 @@ impl DenoiseLoop {
         self.dts
     }
 
-    /// The sigma the latent sits at after fire `k`: fire 0 seeds at
-    /// `sigmas[0]`, fire `k` steps to `sigmas[k]`, and the last lands on 0.
-    #[must_use]
-    pub fn sigmas(&self) -> Channel {
-        self.sigmas
-    }
 
     /// `pass`'s epilogue: `body(k)` at fire `k`, then the clock moves on.
     pub fn drive(&self, pass: &ForwardPass, body: impl Fn(&Tensor) + 'static) {
@@ -296,124 +272,6 @@ impl DenoiseLoop {
     pub fn close(&self) {
         self.pipe.close();
     }
-}
-
-pub fn seed_or_step(
-    k: &Tensor,
-    x: &Channel,
-    velocity: &Tensor,
-    dts: &Channel,
-    rng: &Channel,
-    shape: [u32; 2],
-    out: Option<&Channel>,
-) {
-    let current = x.take();
-    let stepped = euler_step(&current, velocity, &at(&dts.read(), k));
-    let state = rng.take();
-    let fresh = noise(shape, &state);
-    let first = broadcast(reshape(eq(k, 0u32), [1, 1]), shape);
-    let next = select(&first, &fresh, &stepped);
-    x.put(&next);
-    if let Some(out) = out {
-        out.put(&next);
-    }
-    rng.put(&state + &Tensor::constant([0u32, 1u32]));
-}
-
-pub fn step(k: &Tensor, x: &Channel, velocity: &Tensor, dts: &Channel, out: Option<&Channel>) {
-    let next = euler_step(&x.take(), velocity, &at(&dts.read(), k));
-    x.put(&next);
-    if let Some(out) = out {
-        out.put(&next);
-    }
-}
-
-/// `len` standard normal draws for `seed`, the same on every host.
-#[must_use]
-pub fn host_noise(seed: u32, len: usize) -> Vec<f32> {
-    let mut state = u64::from(seed) ^ 0x9e37_79b9_7f4a_7c15;
-    let mut next = move || {
-        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = state;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^= z >> 31;
-        ((z >> 11) as f64 + 0.5) / (1u64 << 53) as f64
-    };
-    let mut out = Vec::with_capacity(len + 1);
-    while out.len() < len {
-        let (u, v) = (next(), next());
-        let r = (-2.0 * u.ln()).sqrt();
-        let angle = std::f64::consts::TAU * v;
-        out.push((r * angle.cos()) as f32);
-        out.push((r * angle.sin()) as f32);
-    }
-    out.truncate(len);
-    out
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn resume_or_step(
-    k: &Tensor,
-    x: &Channel,
-    init: &Channel,
-    sigma0: f32,
-    velocity: &Tensor,
-    dts: &Channel,
-    rng: &Channel,
-    shape: [u32; 2],
-    out: Option<&Channel>,
-) {
-    let current = x.take();
-    let stepped = euler_step(&current, velocity, &at(&dts.read(), k));
-    let state = rng.take();
-    let eps = noise(shape, &state);
-    let x0 = init.read();
-    let a = broadcast(Tensor::constant([1.0 - sigma0]), shape);
-    let b = broadcast(Tensor::constant([sigma0]), shape);
-    let noised = &(&x0 * &a) + &(&eps * &b);
-    let first = broadcast(reshape(eq(k, 0u32), [1, 1]), shape);
-    let next = select(&first, &noised, &stepped);
-    x.put(&next);
-    if let Some(out) = out {
-        out.put(&next);
-    }
-    rng.put(&state + &Tensor::constant([0u32, 1u32]));
-}
-
-/// One step of inpainting: rows with `mask` 1 take the Euler step, rows with
-/// `mask` 0 are `init` re-noised to the sigma this fire lands at, so the kept
-/// region is the init picture bit for bit once sigma reaches 0.
-#[allow(clippy::too_many_arguments)]
-pub fn inpaint_step(
-    k: &Tensor,
-    x: &Channel,
-    init: &Channel,
-    mask: &Channel,
-    sigmas: &Channel,
-    velocity: &Tensor,
-    dts: &Channel,
-    rng: &Channel,
-    shape: [u32; 2],
-    out: Option<&Channel>,
-) {
-    let current = x.take();
-    let stepped = euler_step(&current, velocity, &at(&dts.read(), k));
-    let state = rng.take();
-    let eps = noise(shape, &state);
-    let x0 = init.read();
-    let one = broadcast(Tensor::constant([1.0f32]), shape);
-    let sigma = broadcast(reshape(at(&sigmas.read(), k), [1, 1]), shape);
-    let kept = &(&x0 * &(&one - &sigma)) + &(&eps * &sigma);
-    let m = broadcast(reshape(mask.read(), [shape[0], 1]), shape);
-    let blended = &(&m * &stepped) + &(&(&one - &m) * &kept);
-    let first = broadcast(reshape(eq(k, 0u32), [1, 1]), shape);
-    let next = select(&first, &kept, &blended);
-    x.put(&next);
-    if let Some(out) = out {
-        out.put(&next);
-    }
-    rng.put(&state + &Tensor::constant([0u32, 1u32]));
 }
 
 /// DPM-Solver++ 2M over a flow schedule, as per-fire scalar tables indexed
@@ -482,115 +340,6 @@ pub struct Dpm2mChannels {
     pub ratio: Channel,
     pub gain: Channel,
     pub mix: Channel,
-}
-
-/// One DPM-Solver++ 2M fire: `x` is the loop-carried latent (seeded by the
-/// guest), `x0_prev` the previous fire's data prediction (seeded with zeros).
-/// Answers this fire's data prediction.
-pub fn dpm2m_step(
-    k: &Tensor,
-    x: &Channel,
-    x0_prev: &Channel,
-    tables: &Dpm2mChannels,
-    velocity: &Tensor,
-    shape: [u32; 2],
-    out: Option<&Channel>,
-) -> Tensor {
-    let scalar = |table: &Channel| broadcast(reshape(at(&table.read(), k), [1, 1]), shape);
-    let current = x.take();
-    let x0 = &current - &(velocity * &scalar(&tables.sigma_s));
-    let prev = x0_prev.take();
-    let mix = scalar(&tables.mix);
-    let one = broadcast(Tensor::constant([1.0f32]), shape);
-    let d = &(&x0 * &(&one + &mix)) - &(&prev * &mix);
-    let stepped = &(&current * &scalar(&tables.ratio)) + &(&d * &scalar(&tables.gain));
-    let first = broadcast(reshape(eq(k, 0u32), [1, 1]), shape);
-    let next = select(&first, &current, &stepped);
-    x.put(&next);
-    x0_prev.put(&x0);
-    if let Some(out) = out {
-        out.put(&next);
-    }
-    x0
-}
-
-/// The hidden rows the model's text encoder (its lane of `reading`) reads
-/// `prompt` out as.
-pub async fn encode_text(prompt: &str, reading: &str) -> Result<Channel, String> {
-    let lane = crate::model::lane_of(&[("reading", reading)])?;
-    if !lane.embeds {
-        return Err(format!(
-            "reading `{reading}` is not a text encoder (it embeds no tokens)"
-        ));
-    }
-    let mut ids = crate::chat::first_user(prompt);
-    ids.extend(crate::chat::cue());
-    if ids.is_empty() {
-        return Err("the prompt tokenizes to nothing".to_string());
-    }
-    encode_ids(&ids, reading).await
-}
-
-pub async fn encode_ids(ids: &[u32], reading: &str) -> Result<Channel, String> {
-    let (rows, width) = encode_ids_rows(ids, reading).await?;
-    let len = u32::try_from(rows.len() / width.max(1) as usize).unwrap_or(0);
-    Ok(Channel::from_shaped([len, width], rows))
-}
-
-pub async fn encode_ids_rows(ids: &[u32], reading: &str) -> Result<(Vec<f32>, u32), String> {
-    let lane = crate::model::lane_of(&[("reading", reading)])?;
-    if !lane.embeds {
-        return Err(format!(
-            "reading `{reading}` embeds no tokens, so there is nothing to hand ids to"
-        ));
-    }
-    let width = match lane.readout {
-        Some(readout) if readout.kind == ReadoutKind::Hidden => readout.width,
-        other => {
-            return Err(format!(
-                "reading `{reading}` reads out {other:?}, not the hidden rows an encoder hands \
-                 over"
-            ));
-        }
-    };
-    // Every row is read out, so a pass holds no more than one reads out.
-    let cap = crate::eta::max_readout_rows(ReadoutKind::Hidden);
-    if ids.len() > cap {
-        return Err(format!(
-            "{} ids read out as hidden rows exceed the {cap} one pass reads out",
-            ids.len()
-        ));
-    }
-    let ids: Vec<i32> = ids
-        .iter()
-        .map(|id| i32::try_from(*id).unwrap_or(0))
-        .collect();
-    let len = u32::try_from(ids.len()).map_err(|_| "the prompt is too long")?;
-    if len == 0 {
-        return Err("no ids to encode".to_string());
-    }
-    let pipe = Pipeline::new();
-    let toks = Channel::from(ids);
-    let embed_indptr = Channel::from([0u32, len]);
-    let readout = Channel::from_iter(0..len);
-    let out = Channel::new([len, width], crate::eta::Dtype::F32);
-
-    let pass = ForwardPass::new();
-    pass.switch(0, "reading", reading)?;
-    pass.embed(&toks, &embed_indptr)?;
-    pass.readout(&readout)?;
-    let ws = WorkingSet::new();
-    if lane.reads_kv {
-        pass.state(&[&ws], StateGeometry::default())?;
-    }
-    let readback = out;
-    pass.epilogue(move || {
-        readback.put(intrinsics::hidden(0, len, width));
-    });
-    pass.submit(&pipe)?;
-    let rows: Vec<f32> = out.take_host().await?;
-    pipe.close();
-    Ok((rows, width))
 }
 
 #[cfg(test)]
