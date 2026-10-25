@@ -15,6 +15,14 @@ load("//lib/spoken.poem", "QWEN_STOP", "QWEN_VISION", "QWEN_AUDIO")
 CHATML_QWEN38 = template("chatml", thinking = True, preserve_thinking = True, reasoning_effort = True, tools = True, xml_tools = True, generation_suffix = "<think>\n", stop = QWEN_STOP)
 TOKENIZER_38 = tokenizer(markers = [QWEN_STOP], pinned = QWEN_AUDIO, parts = {"vision": [QWEN_VISION]})
 
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: the attention's q and gate, k and v by their heads, the delta
+# nets' projections, convolutions and gates by their heads, the routed and
+# shared experts by their channels, the output and down projections by their
+# rows, and the n-gram table, which a host holds, by its rows. The indexer's
+# projection, four heads scored as one selection, stays whole.
+CUTS = "inferred"
+
 def flash(id, **kwargs):
     return model(id, template = CHATML_QWEN38, tokenizer = TOKENIZER_38, **kwargs)
 
@@ -58,10 +66,10 @@ def gated_attn(d, w, kv):
         rotary_dim = d.rotary_dim,
         theta = d.theta,
         sm_scale = f32(1.0 / f32(sqrt(hd))),
-        qg_proj = weight([2 * d.q_heads * hd, d.hidden], w).columns(),
-        k_proj = weight([d.kv_heads * hd, d.hidden], w).columns(heads = d.kv_heads),
-        v_proj = weight([d.kv_heads * hd, d.hidden], w).columns(heads = d.kv_heads),
-        o_proj = weight([d.hidden, d.q_heads * hd], w).rows(),
+        qg_proj = weight([2 * d.q_heads * hd, d.hidden], w),
+        k_proj = weight([d.kv_heads * hd, d.hidden], w),
+        v_proj = weight([d.kv_heads * hd, d.hidden], w),
+        o_proj = weight([d.hidden, d.q_heads * hd], w),
         q_norm = weight([hd]),
         q_norm_eps = d.norm_eps,
         k_norm = weight([hd]),
@@ -82,14 +90,14 @@ def gdn(d, proj, ba, dense, conv_state, delta_state):
         v_dim = d.v_dim,
         qkv_width = qkv,
         conv_kernel = d.conv_kernel,
-        in_qkvz = weight([qkv + v_w, d.hidden], proj).packed([k_w, k_w, v_w, v_w]),
-        in_ba = weight([2 * d.v_heads, d.hidden], ba).packed([d.v_heads, d.v_heads]),
-        conv = weight([qkv, d.conv_kernel]).packed([k_w, k_w, v_w]),
-        dt_bias = weight([d.v_heads]).columns(),
-        a_log = weight([d.v_heads], dtype.f32).columns(),
+        in_qkvz = weight([qkv + v_w, d.hidden], proj),
+        in_ba = weight([2 * d.v_heads, d.hidden], ba),
+        conv = weight([qkv, d.conv_kernel]),
+        dt_bias = weight([d.v_heads]),
+        a_log = weight([d.v_heads], dtype.f32),
         norm = weight([d.v_dim], dtype.f32),
         norm_eps = d.norm_eps,
-        out_proj = weight([d.hidden, v_w], proj).rows(),
+        out_proj = weight([d.hidden, v_w], proj),
         conv_state = conv_state,
         delta_state = delta_state,
     )
@@ -100,13 +108,13 @@ def routed(n, hidden, m, experts, proj, gate):
     return struct(
         routed = True,
         router = weight([m.experts, hidden], gate),
-        gate_up = weight([m.experts, 2 * m.inter, hidden], experts).bank([m.inter, m.inter]),
-        down = weight([m.experts, hidden, m.inter], experts).rows(),
+        gate_up = weight([m.experts, 2 * m.inter, hidden], experts),
+        down = weight([m.experts, hidden, m.inter], experts),
         shared = struct(
-            gate = weight([m.shared_inter, hidden], proj).columns(),
-            up = weight([m.shared_inter, hidden], proj).columns(),
+            gate = weight([m.shared_inter, hidden], proj),
+            up = weight([m.shared_inter, hidden], proj),
         ),
-        shared_down = weight([hidden, m.shared_inter], proj).rows(),
+        shared_down = weight([hidden, m.shared_inter], proj),
         shared_gate = weight([1, hidden], gate),
         experts = m.experts,
         top_k = m.top_k,
@@ -429,7 +437,7 @@ def build(mix, kv, rope, d, hashes, draft, vision):
             ratio = ix.ratio,
             top_k = ix.budget // ix.ratio,
             norm_eps = d.norm_eps,
-            qk_proj = weight([q_w + ix.head_dim, hidden], proj).packed([q_w, ix.head_dim]),
+            qk_proj = weight([q_w + ix.head_dim, hidden], proj),
             q_norm = weight([ix.head_dim]),
             k_norm = weight([ix.head_dim]),
             keys = keys,
@@ -474,8 +482,7 @@ def build(mix, kv, rope, d, hashes, draft, vision):
         shards = shards,
         # Read only by the n-gram gather, a few rows a token: a card whose
         # profile says so serves it from pinned host memory.
-        # one band a rank: the n-gram gather offsets an id by its rank's first row
-        table = weight([padded, hidden // heads], mix.table).packed([padded]).host(),
+        table = weight([padded, hidden // heads], mix.table).host(),
         key_proj = weight([sh, hidden], proj),
         value_proj = weight([hidden, hidden], proj),
         norm_key = weight([sh]),

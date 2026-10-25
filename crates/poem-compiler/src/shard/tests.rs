@@ -317,3 +317,40 @@ fn a_diffusion_transformers_q_and_k_norm_their_shares() {
         }
     }
 }
+
+/// Qwen 3.8 Flash Next's n-gram table, which a host holds, is cut by its
+/// rows (each rank looks up the rows it holds, the ranks' rows summed), and
+/// its attention's indexer, four heads scored as one selection, runs whole
+/// on every rank: split two ways it runs every op one rank does.
+#[test]
+fn a_host_table_is_cut_by_its_rows_and_the_indexer_runs_whole() {
+    const ROW: &str = "qwen38-flash-next-mini-bf16-kv-bf16";
+    let whole = crate::catalog::deployment(ROW)
+        .expect("the one-rank row")
+        .trace(Platform::Cuda);
+    let split = crate::catalog::deployment(&format!("{ROW}-tp2"))
+        .expect("the row splits two ways")
+        .trace(Platform::Cuda);
+    let ops = |trace: &poem_ir::Trace| {
+        let mut names: Vec<&str> = (trace.nodes.iter())
+            .map(|node| poem_ir::Operands::name(&node.op))
+            .filter(|name| !name.starts_with("collective."))
+            .collect();
+        names.sort_unstable();
+        names
+    };
+    assert_eq!(ops(&split), ops(&whole), "every op but the collectives");
+    let shard = |name: &str| {
+        &(split.params.iter())
+            .find(|p| p.name == name)
+            .unwrap_or_else(|| panic!("the row reads `{name}`"))
+            .shard
+    };
+    assert!(
+        matches!(shard("ple.table"), poem_ir::Shard::Cut { axis: 0, .. }),
+        "the host's table is cut by its rows"
+    );
+    for p in split.params.iter().filter(|p| p.name.contains(".indexer.")) {
+        assert_eq!(p.shard, poem_ir::Shard::Replicated, "`{}` is whole", p.name);
+    }
+}
