@@ -91,7 +91,7 @@ impl pie::inferlet::model::Host for ProcessCtx {
                 .iter()
                 .map(|&id| input_decl(&model.inputs()[id as usize]))
                 .collect(),
-            reads_kv: lane.reads_kv,
+            state: lane.reads_kv || lane.reads_state,
             embeds: lane.embeds,
             readout: lane.readout.map(readout),
         }))

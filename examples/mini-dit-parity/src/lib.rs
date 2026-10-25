@@ -331,9 +331,9 @@ impl Shared {
 fn velocity_width(reading: &str) -> Result<u32> {
     for stream in STREAMS {
         let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
-        if lane.reads_kv || lane.embeds {
+        if lane.state || lane.embeds {
             return Err(format!(
-                "reading `{reading}`'s `{stream}` lane binds a kv space or tokens; a denoise \
+                "reading `{reading}`'s `{stream}` lane binds a working set or tokens; a denoise \
                  pass binds neither"
             )
             .into());

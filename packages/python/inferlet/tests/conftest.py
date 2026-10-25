@@ -115,7 +115,7 @@ class ReadoutStub:
 @dataclass
 class LaneDeclStub:
     inputs: list
-    reads_kv: bool
+    state: bool
     embeds: bool
     readout: ReadoutStub | None
 

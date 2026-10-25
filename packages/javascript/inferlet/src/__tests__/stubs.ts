@@ -28,7 +28,7 @@ export const modelStub = {
     inputs: switches.some(([k, v]) => k === 'mode' && v === 'denoise')
       ? [{ name: 'self_cond_ids', axis: 'row', width: 4, dtype: 'i32' }]
       : [],
-    readsKv: true,
+    state: true,
     embeds: true,
     readout: { kind: 'logits', width: 151936 },
   }),

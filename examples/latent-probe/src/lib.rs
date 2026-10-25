@@ -105,7 +105,7 @@ async fn main(input: Input) -> Result<Output> {
         .ok_or(
             "this model declares no token-less lane with a velocity readout that reads `latents`",
         )?;
-    if lane.reads_kv || lane.embeds {
+    if lane.state || lane.embeds {
         return Err(format!(
             "reading `{reading}` is a sequence reading (tokens and KV); the probe drives a float lane"
         ));

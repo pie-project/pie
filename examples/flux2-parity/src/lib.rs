@@ -101,9 +101,9 @@ struct Dims {
 /// vocabulary instead of at `program`.
 fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::LaneDecl> {
     let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
-    if lane.reads_kv || lane.embeds {
+    if lane.state || lane.embeds {
         return Err(format!(
-            "reading `{reading}`'s `{stream}` lane binds a kv space or tokens; a denoise pass \
+            "reading `{reading}`'s `{stream}` lane binds a working set or tokens; a denoise pass \
              binds neither"
         ));
     }

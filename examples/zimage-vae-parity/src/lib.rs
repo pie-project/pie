@@ -176,9 +176,9 @@ fn decode_reading() -> Result<Decode> {
          a decoder takes a latent clip and lands RGB"
             .to_string()
     })?;
-    if lane.reads_kv {
+    if lane.state {
         return Err(format!(
-            "reading `{reading}` binds a kv space; a VAE tile binds none"
+            "reading `{reading}` binds a working set; a VAE tile binds none"
         ));
     }
     Ok(Decode {

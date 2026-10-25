@@ -233,14 +233,14 @@ export interface Readout {
  * Everything about a lane of the given switches, as the compiled graph
  * runs it: the inputs it must bind (exactly these, by
  * `forward-pass.input`), whether it binds `state` (some class it can
- * land in reads a kv cache) and `embed` (some class reads `tokens`), and
- * what it reads out (the export seam its classes read; a float readout
- * where some class reads one). `none` when no class it lands in reads
- * anything out.
+ * land in reads a kv cache or a recurrent state, a causal VAE's conv
+ * caches) and `embed` (some class reads `tokens`), and what it reads out
+ * (the export seam its classes read; a float readout where some class
+ * reads one). `none` when no class it lands in reads anything out.
  */
 export interface LaneDecl {
   inputs: Array<InputDecl>,
-  readsKv: boolean,
+  state: boolean,
   embeds: boolean,
   readout?: Readout,
 }
