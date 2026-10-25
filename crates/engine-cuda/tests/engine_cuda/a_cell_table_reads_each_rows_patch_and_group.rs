@@ -18,7 +18,7 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{GeometryClass, Stage};
+use eta_ir::registry::{EngineCaps, GeometryClass, Graph, ReadoutKind, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use eta_ir::validate::bind;
 
@@ -78,6 +78,7 @@ fn epilogue(rows: u32) -> TraceContainer {
             ops: vec![
                 Op::IntrinsicVal {
                     intr: IntrinsicId::Velocity,
+                    lane: 0,
                     shape: plane,
                     dtype: EtaDtype::F32,
                 },
@@ -141,7 +142,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
     let path = weights.write(dir.path());
     let mut engine = engine_cuda::open(engine_cuda::DeviceBoot::default(), contract_for)
         .expect("the engine opens");
-    let loaded = engine
+    engine
         .load(LoadRequest {
             trace,
             checkpoint: Checkpoint::Path(path),
@@ -208,7 +209,17 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
     let mut attachments = Vec::new();
     for (at, lane) in lanes.iter().enumerate() {
         let rows = lane.tokens.len() as u32;
-        let bound = bind(epilogue(rows), loaded.caps.profile.clone()).expect("the epilogue binds");
+        let velocity = eta_ir::registry::Readout {
+            kind: ReadoutKind::Velocity,
+            width: WIDTH,
+        };
+        let bound = bind(
+            epilogue(rows),
+            vec![Some(velocity)],
+            Graph::default(),
+            EngineCaps::default(),
+        )
+        .expect("the epilogue binds");
         let stages = compile_bound(&bound);
         let launch = eta_compiler::codegen::launch::build(&bound, &stages);
         let backend =
@@ -257,6 +268,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
             .id;
         attachments.push(Attachment {
             lane: at as u32,
+            lanes: 1,
             instance,
             at: Boundary::Epilogue,
         });

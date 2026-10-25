@@ -327,9 +327,12 @@ impl<'c> Run<'c> {
             .copied()
     }
 
-    /// The fire's clip slot table (one i32 slot per voxel lane).
+    /// The fire's clip slot table (one i32 slot per voxel lane) cut to this
+    /// window's clips, indexed as the window's grids index their lanes.
     pub(crate) fn clip_slots(&self) -> Option<Tensor> {
-        self.fire.clip_slots
+        let voxel = self.window().voxel;
+        let slots = self.fire.clip_slots?;
+        Some(self.slice(slots, voxel.lane_offset, voxel.lanes))
     }
 
     /// A fresh per-fire array of `rows × width` `dtype`, zeros until

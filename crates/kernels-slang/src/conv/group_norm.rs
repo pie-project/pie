@@ -30,7 +30,9 @@ pub fn scratch_floats(clips: u32, groups: u32) -> u64 {
 /// `y` the group norm of `x` (both bf16 `[rows, channels]`) over each clip
 /// of `grid`, by `groups` channel groups, then `weight` and `bias` (f32 a
 /// channel) and, with `silu`, a SiLU. `partials` and `stats` are the
-/// scratch planes `scratch_floats` sizes.
+/// scratch planes `scratch_floats` sizes. `base`: the row `grid` addresses
+/// `x`'s (and `y`'s) row 0 at, nonzero in a window of a segmented fire whose
+/// grid holds fire-wide rows.
 #[allow(clippy::too_many_arguments)]
 pub fn group_norm(
     ctx: &Ctx<'_>,
@@ -44,6 +46,7 @@ pub fn group_norm(
     partials: Tensor,
     stats: Tensor,
     y: Tensor,
+    base: u32,
 ) -> Result<(), Error> {
     if x.dtype != Dtype::Bf16 || y.dtype != Dtype::Bf16 {
         return Err(Error::DtypeUnsupported {
@@ -98,6 +101,7 @@ pub fn group_norm(
             channels.arg(),
             groups.arg(),
             SPLITS.arg(),
+            base.arg(),
         ],
     )?;
     ctx.fire(
@@ -127,6 +131,7 @@ pub fn group_norm(
             u32::from(silu).arg(),
             x.rows.arg(),
             span.arg(),
+            base.arg(),
         ],
     )
 }

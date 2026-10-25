@@ -213,7 +213,6 @@ pub struct PassInputs {
     pub hidden: Vec<Value>,
     pub velocity: Vec<Value>,
     pub pixels: Vec<Value>,
-    pub value_head: Option<Value>,
     pub query: Vec<Value>,
     pub attn_score: Option<Value>,
 }

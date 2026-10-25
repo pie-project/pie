@@ -247,12 +247,15 @@ def run_vae(d: str, device="cuda"):
     npz_keys(tap)
 
 def main():
+    global SIZE
     ap = argparse.ArgumentParser()
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--mini", action="store_true")
     ap.add_argument("--vae", action="store_true")
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--size", type=int, default=SIZE)
     a = ap.parse_args()
+    SIZE = a.size
     if not (a.full or a.mini or a.vae):
         a.full = a.mini = True
     d = outdir(MODEL)

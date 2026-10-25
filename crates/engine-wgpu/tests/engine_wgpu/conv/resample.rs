@@ -197,13 +197,15 @@ fn the_resamplers_answer_the_reference() {
                 let (x, grid, o_grid, y) = (x, grid, o_grid, y(o[0].0));
                 g.run(|c| match op {
                     Op::Upsample { keep_first } => {
-                        sr::upsample_nearest(c, x, grid, r, keep_first, o_grid, y)
+                        sr::upsample_nearest(c, x, grid, r, keep_first, o_grid, y, [0, 0])
                     }
                     Op::Shuffle { trim } => {
                         sr::pixel_shuffle(c, x, grid, r, trim as u32, o_grid, y, [0, 0])
                     }
                     Op::Unshuffle => sr::pixel_unshuffle(c, x, grid, r, o_grid, y, [0, 0]),
-                    Op::AvgDown { group } => sr::avg_down(c, x, grid, r, group as u32, o_grid, y),
+                    Op::AvgDown { group } => {
+                        sr::avg_down(c, x, grid, r, group as u32, o_grid, y, [0, 0])
+                    }
                 })
             },
         );

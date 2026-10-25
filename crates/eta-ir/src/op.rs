@@ -52,7 +52,6 @@ declare_intrinsics! {
     MtpLogits = 1, MTP_LOGITS, "mtp_logits";
     Hidden = 2, HIDDEN, "hidden";
     Query = 3, QUERY, "query";
-    ValueHead = 4, VALUE_HEAD, "value_head";
     Layer = 5, LAYER, "layer";
     MtpDrafts = 6, MTP_DRAFTS, "mtp_drafts";
     AttnScore = 7, ATTN_SCORE, "attn_score";

@@ -35,6 +35,9 @@ impl Conv3d {
     }
 }
 
+/// `bases`: the rows `grid` and `o_grid` address `x`'s and `y`'s row 0 at
+/// (`[x, y]`), nonzero in a window of a segmented fire whose grids hold
+/// fire-wide rows.
 #[allow(clippy::too_many_arguments)]
 pub fn conv3d(
     ctx: &Ctx<'_>,
@@ -46,6 +49,7 @@ pub fn conv3d(
     conv: Conv3d,
     o_grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     for (what, t) in [("input", x), ("weight", w), ("answer", y)] {
         if t.dtype != Dtype::Bf16 {
@@ -146,6 +150,8 @@ pub fn conv3d(
             stated(OP, rows_out)?.arg(),
             i32::from(cache.is_some()).arg(),
             u32::from(bias.is_some()).arg(),
+            stated(OP, bases[0])?.arg(),
+            stated(OP, bases[1])?.arg(),
         ],
     )
 }

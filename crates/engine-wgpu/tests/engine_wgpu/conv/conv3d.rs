@@ -196,6 +196,7 @@ fn the_conv3d_answers_the_reference() {
                         slang,
                         o_grid,
                         t(o[0].0, rows_out, C_OUT, Dtype::Bf16),
+                        [0, 0],
                     )
                 })
             },

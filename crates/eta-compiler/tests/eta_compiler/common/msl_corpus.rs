@@ -24,7 +24,6 @@ pub const GOLDEN_NAMES: &[&str] = &[
     "neg_spsc_second_producer",
     "neg_t10_nonreplayable",
     "nucleus_sample",
-    "pentathlon_iter",
     "pivot_predicates_multistage",
     "section3_masked_gumbel",
     "structured_masks",

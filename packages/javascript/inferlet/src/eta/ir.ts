@@ -124,7 +124,6 @@ export enum Intrinsic {
   MTP_LOGITS = 1,
   HIDDEN = 2,
   QUERY = 3,
-  VALUE_HEAD = 4,
   LAYER = 5,
   MTP_DRAFTS = 6,
   ATTN_SCORE = 7,

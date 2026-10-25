@@ -12,6 +12,7 @@ template <typename T, int C_MAX, int SIMDS>
     const constant uint& clips        [[buffer(6)]],
     const constant int& seg_frames    [[buffer(7)]],
     const constant float& sm_scale    [[buffer(8)]],
+    const constant int& base          [[buffer(9)]],
     uint tgid                         [[threadgroup_position_in_grid]],
     uint simd_gid                     [[simdgroup_index_in_threadgroup]],
     uint simd_lid                     [[thread_index_in_simdgroup]]) {
@@ -33,9 +34,13 @@ template <typename T, int C_MAX, int SIMDS>
 
   if (tid == 0) {
     SpatialClip g;
-    const int l = clip_of(grid, int(clips), row, g);
+    // `base`: the row `grid` addresses row 0 at; segments land local.
+    const int l = clip_of(grid, int(clips), row + base, g);
     int begin = 0, end = 0;
-    if (l >= 0) segment_of(g, row - g.off, seg_frames, begin, end);
+    if (l >= 0) {
+      g.off -= base;
+      segment_of(g, row - g.off, seg_frames, begin, end);
+    }
     span[0] = begin;
     span[1] = end;
   }
@@ -112,7 +117,7 @@ template <typename T, int C_MAX, int SIMDS>
       const device itype*, const device itype*, const device itype*,       \
       device itype*, const device int*, const constant uint&,              \
       const constant uint&, const constant int&, const constant float&,    \
-      uint, uint, uint);
+      const constant int&, uint, uint, uint);
 
 instantiate_voxel_attention(bfloat16, bfloat, 256)
 instantiate_voxel_attention(bfloat16, bfloat, 512)

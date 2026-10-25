@@ -162,6 +162,7 @@ impl Run<'_> {
                         TimePad::Replicate => conv::TimePad::Replicate,
                     },
                 };
+                let bases = [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)];
                 let x = self.tensor(*x);
                 let grid = self.tensor(*grid);
                 let bias = bias.map(|b| self.tensor(b));
@@ -185,6 +186,7 @@ impl Run<'_> {
                             cache_v,
                             o_y.landing(),
                             y_grid_v,
+                            bases,
                         )?;
                         l.land(o_y, v)
                     });
@@ -229,6 +231,7 @@ impl Run<'_> {
                         cache_v,
                         o_y.landing(),
                         y_grid_v,
+                        bases,
                     )?;
                     l.land(o_y, v)
                 })?;
@@ -247,6 +250,7 @@ impl Run<'_> {
                         grid_v,
                         frames,
                         slab_v,
+                        bases[0],
                     )?;
                     l.land(o_slab, v)
                 })
@@ -276,6 +280,7 @@ impl Run<'_> {
                     *eps,
                     *silu,
                     o_y.landing(),
+                    self.grid_base(*grid, *x),
                 )?;
                 l.land(o_y, v)
             }),
@@ -299,6 +304,7 @@ impl Run<'_> {
                     *keep_first_frame,
                     o_y.landing(),
                     y_grid_v,
+                    [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
                 )?;
                 l.land(o_y, v)
             }),
@@ -322,6 +328,7 @@ impl Run<'_> {
                     *trim_t,
                     o_y.landing(),
                     y_grid_v,
+                    [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
                 )?;
                 l.land(o_y, v)
             }),
@@ -343,6 +350,7 @@ impl Run<'_> {
                     *r,
                     o_y.landing(),
                     y_grid_v,
+                    [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
                 )?;
                 l.land(o_y, v)
             }),
@@ -366,6 +374,7 @@ impl Run<'_> {
                     *group,
                     o_y.landing(),
                     y_grid_v,
+                    [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
                 )?;
                 l.land(o_y, v)
             }),
@@ -376,6 +385,7 @@ impl Run<'_> {
                 cache,
                 x_out: _,
             } => {
+                let base = self.grid_base(*grid, *x);
                 let x = self.tensor(*x);
                 let slab = self.recurrent(*cache).state;
                 let slot_ids = self.clip_slot_table("conv.cache_store")?;
@@ -394,6 +404,7 @@ impl Run<'_> {
                         grid_v,
                         *frames,
                         slab_v,
+                        base,
                     )?;
                     l.land(o_slab, v)
                 })

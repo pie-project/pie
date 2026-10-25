@@ -93,6 +93,7 @@ impl Run<'_> {
                     },
                     t(*y_grid),
                     t(*y),
+                    [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
                 )
             }
             Conv::GroupNorm {
@@ -127,6 +128,7 @@ impl Run<'_> {
                     partials,
                     stats,
                     t(*y),
+                    self.grid_base(*grid, *x),
                 )
             }
             Conv::Upsample {
@@ -144,6 +146,7 @@ impl Run<'_> {
                 *keep_first_frame,
                 t(*y_grid),
                 t(*y),
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
             ),
             Conv::PixelShuffle {
                 x,
@@ -160,7 +163,7 @@ impl Run<'_> {
                 *trim_t,
                 t(*y_grid),
                 t(*y),
-                [0, 0],
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
             ),
             Conv::PixelUnshuffle {
                 x,
@@ -168,7 +171,15 @@ impl Run<'_> {
                 r,
                 y_grid,
                 y,
-            } => resample::pixel_unshuffle(ctx, t(*x), t(*grid), *r, t(*y_grid), t(*y), [0, 0]),
+            } => resample::pixel_unshuffle(
+                ctx,
+                t(*x),
+                t(*grid),
+                *r,
+                t(*y_grid),
+                t(*y),
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
+            ),
             Conv::AvgDown {
                 x,
                 grid,
@@ -176,7 +187,16 @@ impl Run<'_> {
                 group,
                 y_grid,
                 y,
-            } => resample::avg_down(ctx, t(*x), t(*grid), *factor, *group, t(*y_grid), t(*y)),
+            } => resample::avg_down(
+                ctx,
+                t(*x),
+                t(*grid),
+                *factor,
+                *group,
+                t(*y_grid),
+                t(*y),
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
+            ),
             Conv::Patchify {
                 x,
                 grid,

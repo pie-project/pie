@@ -76,14 +76,6 @@ pub fn query(width: u32) -> Tensor {
         activation_type,
     )
 }
-pub fn value_head() -> Tensor {
-    intrinsic_val(
-        IntrinsicId::ValueHead,
-        0,
-        Shape::vector(current_rows().max(1)),
-        Dtype::F32,
-    )
-}
 pub fn layer() -> Tensor {
     intrinsic_val(IntrinsicId::Layer, 0, Shape::SCALAR, Dtype::U32)
 }

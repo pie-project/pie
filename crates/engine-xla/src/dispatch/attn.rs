@@ -49,6 +49,7 @@ impl Run<'_> {
                     segment(*how),
                     *sm_scale,
                     o_y.landing(),
+                    self.grid_base(*grid, *q),
                 )?;
                 l.land(o_y, v)
             }),

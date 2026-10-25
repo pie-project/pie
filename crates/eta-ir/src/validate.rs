@@ -474,8 +474,7 @@ fn intrinsic_width(
         IntrinsicId::Hidden | IntrinsicId::Query | IntrinsicId::Layer => Some(None),
         IntrinsicId::MtpLogits
         | IntrinsicId::MtpDrafts
-        | IntrinsicId::AttnScore
-        | IntrinsicId::ValueHead => None,
+        | IntrinsicId::AttnScore => None,
     }
 }
 
@@ -621,7 +620,6 @@ fn intrinsic_type_ok(intr: IntrinsicId, shape: Shape, dtype: Dtype, width: Optio
         | IntrinsicId::Hidden
         | IntrinsicId::Velocity
         | IntrinsicId::Pixels => rows_of(width),
-        IntrinsicId::ValueHead => dtype == Dtype::F32 && shape.rank() == 1,
         IntrinsicId::Query => dtype == Dtype::F32 && shape.rank() >= 1,
         IntrinsicId::Layer => dtype == Dtype::U32 && shape.is_scalar(),
         IntrinsicId::MtpDrafts => dtype == Dtype::I32 && shape.rank() == 1 && shape.dims()[0] >= 1,

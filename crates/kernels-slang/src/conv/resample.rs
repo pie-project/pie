@@ -41,7 +41,9 @@ fn fire(
 }
 
 /// Nearest upsampling by `factor` in `(t, h, w)`; with
-/// `keep_first_frame`, the first frame is not repeated.
+/// `keep_first_frame`, the first frame is not repeated. `bases`: see
+/// [`fire`].
+#[allow(clippy::too_many_arguments)]
 pub fn upsample_nearest(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -50,6 +52,7 @@ pub fn upsample_nearest(
     keep_first_frame: bool,
     o_grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.upsample";
     let entry = dtype_dispatch!(OP, y.dtype, {
@@ -79,7 +82,7 @@ pub fn upsample_nearest(
             factor[2].arg(),
             u32::from(keep_first_frame).arg(),
         ],
-        [0, 0],
+        bases,
     )
 }
 
@@ -183,7 +186,8 @@ pub fn pixel_unshuffle(
 
 /// The unshuffle by `factor`, each output channel the mean of a run of
 /// `group` unshuffled ones; time is front-padded to a multiple of
-/// `factor[0]`.
+/// `factor[0]`. `bases`: see [`fire`].
+#[allow(clippy::too_many_arguments)]
 pub fn avg_down(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -192,6 +196,7 @@ pub fn avg_down(
     group: u32,
     o_grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.avg_down";
     if x.dtype != Dtype::Bf16 || y.dtype != Dtype::Bf16 {
@@ -229,6 +234,6 @@ pub fn avg_down(
             factor[2].arg(),
             group.arg(),
         ],
-        [0, 0],
+        bases,
     )
 }
