@@ -315,22 +315,20 @@ pub(crate) fn build_frame_submission(
         let mut attachments = Vec::new();
         let lanes = build.lanes;
         for (member, &instance) in build.instance_ids.iter().enumerate() {
-            // The fire that ends a pass runs its program; any other fire of
-            // an adapted pass still runs the adapter.
-            let at = if build.boundary_programs[member] {
-                ::engine::Boundary::Epilogue
-            } else if group[member].lora_program {
-                ::engine::Boundary::Adapter
-            } else {
+            // The fire that ends a pass runs its program, each stage at its
+            // own point; any other fire of an adapted pass carries the
+            // adapter alone.
+            let adapter_only = !build.boundary_programs[member];
+            if adapter_only && !group[member].lora_program {
                 continue;
-            };
+            }
             let lane = build.member_lane_indptr[member];
             let lanes = build.member_lane_indptr[member + 1] - lane;
             attachments.push(::engine::Attachment {
                 lane,
                 lanes,
                 instance,
-                at,
+                adapter_only,
             });
         }
         steps.push(StepFire {

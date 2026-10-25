@@ -1,10 +1,10 @@
 use std::collections::{BTreeSet, HashMap};
 
-use eta_compiler::codegen::launch::{LaunchPackage, ValueOrigin};
+use eta_compiler::codegen::launch::{LaunchPackage, LaunchStage, ValueOrigin};
 use eta_ir::Dtype;
 use eta_ir::op::IntrinsicId;
 use eta_ir::op::tags;
-use eta_ir::registry::Port;
+use eta_ir::registry::{Port, Stage};
 use eta_ir::validate::Direction;
 
 use super::value::{Value, decode_wire};
@@ -54,39 +54,93 @@ pub struct ExecPlan {
 }
 
 impl ExecPlan {
+    /// Whether the prologue takes or puts a channel: then it runs, and
+    /// commits, on its own before the forward, which reads what it put.
+    /// Every other stage, and the ports, run after the forward; so does a
+    /// prologue that moves nothing.
     #[must_use]
-    pub fn takes_channel(&self, c: u32) -> bool {
-        self.package.stages.iter().any(|s| s.takes.contains(&c))
-            || self
-                .package
-                .ports
-                .iter()
-                .any(|p| !p.is_const && p.channel == c && port_consumes(p.port))
-    }
-
-    #[must_use]
-    pub fn reads_channel(&self, c: u32) -> bool {
-        self.package.stages.iter().any(|s| s.reads.contains(&c))
-            || self.package.inputs.contains(&c)
-            || self
-                .package
-                .ports
-                .iter()
-                .any(|p| !p.is_const && p.channel == c && !port_consumes(p.port))
-    }
-
-    #[must_use]
-    pub fn puts_channel(&self, c: u32) -> bool {
+    pub fn prologue_runs(&self) -> bool {
         self.package
             .stages
             .iter()
-            .any(|s| s.puts.iter().any(|put| put.channel == c))
+            .any(|s| s.stage == Stage::Prologue && (!s.takes.is_empty() || !s.puts.is_empty()))
+    }
+
+    /// Whether stage `index` runs at `at`: [`Stage::Prologue`], before the
+    /// forward, or any other stage's point, after it.
+    #[must_use]
+    pub fn runs_at(&self, index: usize, at: Stage) -> bool {
+        let early = self
+            .package
+            .stages
+            .get(index)
+            .is_some_and(|s| s.stage == Stage::Prologue)
+            && self.prologue_runs();
+        early == (at == Stage::Prologue)
+    }
+
+    fn stages_at(&self, at: Stage) -> impl Iterator<Item = &LaunchStage> + '_ {
+        self.package
+            .stages
+            .iter()
+            .enumerate()
+            .filter(move |(index, _)| self.runs_at(*index, at))
+            .map(|(_, stage)| stage)
+    }
+
+    fn after_forward(at: Stage) -> bool {
+        at != Stage::Prologue
     }
 
     #[must_use]
-    pub fn requires_channel_input(&self, c: u32) -> bool {
-        (c as usize) < self.package.channels.len()
-            && self.package.channels[c as usize].readiness == Some(Direction::NeedsFull)
+    pub fn takes_channel(&self, c: u32, at: Stage) -> bool {
+        self.stages_at(at).any(|s| s.takes.contains(&c))
+            || (Self::after_forward(at)
+                && self
+                    .package
+                    .ports
+                    .iter()
+                    .any(|p| !p.is_const && p.channel == c && port_consumes(p.port)))
+    }
+
+    #[must_use]
+    pub fn reads_channel(&self, c: u32, at: Stage) -> bool {
+        self.stages_at(at).any(|s| s.reads.contains(&c))
+            || (Self::after_forward(at)
+                && (self.package.inputs.contains(&c)
+                    || self
+                        .package
+                        .ports
+                        .iter()
+                        .any(|p| !p.is_const && p.channel == c && !port_consumes(p.port))))
+    }
+
+    #[must_use]
+    pub fn puts_channel(&self, c: u32, at: Stage) -> bool {
+        self.stages_at(at)
+            .any(|s| s.puts.iter().any(|put| put.channel == c))
+    }
+
+    /// What channel `c` must hold for the stages at `at` to run: its
+    /// readiness, at the point of the stage that uses it first.
+    #[must_use]
+    pub fn readiness(&self, c: u32, at: Stage) -> Option<Direction> {
+        let early = self.prologue_runs()
+            && self.package.stages.iter().any(|s| {
+                s.stage == Stage::Prologue
+                    && (s.takes.contains(&c)
+                        || s.reads.contains(&c)
+                        || s.puts.iter().any(|put| put.channel == c))
+            });
+        if early != (at == Stage::Prologue) {
+            return None;
+        }
+        self.package.channels.get(c as usize)?.readiness
+    }
+
+    #[must_use]
+    pub fn requires_channel_input(&self, c: u32, at: Stage) -> bool {
+        self.readiness(c, at) == Some(Direction::NeedsFull)
     }
 
     #[must_use]

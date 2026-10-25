@@ -9,12 +9,12 @@ use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFac
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
-    Boundary, FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout, Step,
+    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout, Step,
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
-use eta_ir::registry::{GeometryClass, PortMask};
+use eta_ir::registry::{GeometryClass, PortMask, Stage};
 use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
 
@@ -841,18 +841,17 @@ impl Vulkan {
                 .all(|attachment| shell.readout_row(landed, attachment.lane).is_some())
     }
 
-    /// Runs the programs attached at `Boundary::Prologue`, each to its
-    /// commit, before the step resolves its inputs: the forward reads the
-    /// cells a prologue put.
+    /// Runs each program's prologue, to its commit, before the step
+    /// resolves its inputs: the forward reads the cells a prologue put.
     fn run_prologues(&mut self, step: &Step) -> EngineResult<()> {
-        for attachment in step
-            .attachments
-            .iter()
-            .filter(|attachment| attachment.at == Boundary::Prologue)
-        {
+        for attachment in epilogues(step) {
+            if !self.programs.prologue_runs(attachment.instance) {
+                continue;
+            }
             self.programs
                 .fire(
                     attachment.instance,
+                    Stage::Prologue,
                     None,
                     0,
                     0,
@@ -906,6 +905,7 @@ impl Vulkan {
             programs
                 .fire(
                     attachment.instance,
+                    Stage::Epilogue,
                     logits,
                     rows,
                     vocab,
@@ -934,7 +934,7 @@ impl Vulkan {
             self.sink.is_some()
                 && self.settles_asynchronously()
                 && step.attachments.len() == 1
-                && step.attachments[0].at == Boundary::Epilogue
+                && !step.attachments[0].adapter_only
                 && self
                     .shell
                     .as_ref()
@@ -1262,11 +1262,12 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
 // Vulkan handles are not tied to the thread that made them.
 unsafe impl Send for Vulkan {}
 
-/// The attachments that run behind the forward.
+/// The attachments whose program runs on this fire, each stage at its own
+/// point.
 fn epilogues(step: &Step) -> impl Iterator<Item = &engine::fire::Attachment> {
     step.attachments
         .iter()
-        .filter(|attachment| attachment.at == Boundary::Epilogue)
+        .filter(|attachment| !attachment.adapter_only)
 }
 
 /// Each lane of `attachment`'s pass's own readout rows and pixels, lane `k`

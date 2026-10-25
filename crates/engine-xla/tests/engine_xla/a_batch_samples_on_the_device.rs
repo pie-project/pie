@@ -365,7 +365,14 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
         let t1 = Instant::now();
         let attached: Vec<(InstanceId, u32)> = (0..lanes).map(|l| (ids[&l].0, l)).collect();
         let ran = device_plane
-            .fire_guests(shell.device(), &attached, Some(&kept), vocab, 0)
+            .fire_guests(
+                shell.device(),
+                &attached,
+                Some(&kept),
+                vocab,
+                0,
+                eta_ir::registry::Stage::Epilogue,
+            )
             .expect("the guest passes run");
         assert!(ran.iter().all(|&r| r), "every lane ran on the device");
         let device_tokens: Vec<(i32, i32)> = (0..lanes)
@@ -386,7 +393,15 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
             .map(|l| {
                 let h = ids[&l].1;
                 host_plane
-                    .fire_interpreted(h, Some(&rows[l as usize]), 1, vocab, None, 0)
+                    .fire_interpreted(
+                        h,
+                        Some(&rows[l as usize]),
+                        1,
+                        vocab,
+                        None,
+                        0,
+                        eta_ir::registry::Stage::Epilogue,
+                    )
                     .expect("the interpreter steps");
                 (
                     token(&mut host_plane, h, OUT),

@@ -925,7 +925,7 @@ impl Metal {
                 lane: attachment.lane,
                 lanes: attachment.lanes,
                 instance: attachment.instance,
-                at: attachment.at,
+                adapter_only: attachment.adapter_only,
             })
             .collect();
 
@@ -1001,7 +1001,7 @@ impl Metal {
             let listed = matches!(lane.readout, Readout::Rows(_));
             let served = attached
                 .iter()
-                .any(|a| a.lane as usize == index && a.at == engine::fire::Boundary::Epilogue);
+                .any(|a| a.lane as usize == index && !a.adapter_only);
             if listed && !served {
                 return Err(Error::unsupported("metal", "row-selected readout"));
             }

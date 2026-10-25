@@ -27,9 +27,10 @@ use crate::store::kv::{self, Paging, Seat};
 use crate::weights::{AdapterPlane, Weights};
 use crate::window::Windows;
 
-use engine::fire::{Boundary, Masking};
+use engine::fire::Masking;
 use engine::frame::{Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase, Supply};
 use engine::runahead::Runahead;
+use eta_ir::registry::Stage;
 
 const OUT_SEAM: &str = poem_compiler::EXPORT_SEAMS[0];
 
@@ -255,7 +256,8 @@ pub struct Attached {
     pub lane: u32,
     pub lanes: u32,
     pub instance: engine::InstanceId,
-    pub at: Boundary,
+    /// Carries the pass's adapter alone and runs none of its stages.
+    pub adapter_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1636,9 +1638,20 @@ impl Shell {
         self.programs.close_instance(instance_id)
     }
 
+    /// One whole pass with no forward between its points: the prologue, if
+    /// it runs on its own, then the rest.
     pub fn fire_program(&mut self, instance_id: engine::InstanceId) -> Result<crate::Fired> {
         self.fence_instances(&[instance_id])?;
-        self.programs.fire(&self.device, instance_id)
+        if self.programs.prologue_runs(instance_id) {
+            let fired = self
+                .programs
+                .fire(&self.device, instance_id, Stage::Prologue)?;
+            if fired != crate::Fired::Committed {
+                return Ok(fired);
+            }
+        }
+        self.programs
+            .fire(&self.device, instance_id, Stage::Epilogue)
     }
 
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
@@ -2150,11 +2163,7 @@ impl Shell {
         draft: Option<(u64, u64)>,
         drafts: Option<(u64, u64)>,
     ) -> Result<Vec<engine::InstanceId>> {
-        if !prepared
-            .attachments
-            .iter()
-            .any(|a| a.at == Boundary::Epilogue)
-        {
+        if !prepared.attachments.iter().any(|a| !a.adapter_only) {
             return Ok(Vec::new());
         }
 
@@ -2206,11 +2215,7 @@ impl Shell {
         owed: &mut Vec<engine::InstanceId>,
     ) -> Result<()> {
         let mut staged = Vec::with_capacity(prepared.attachments.len());
-        for attached in prepared
-            .attachments
-            .iter()
-            .filter(|a| a.at == Boundary::Epilogue)
-        {
+        for attached in prepared.attachments.iter().filter(|a| !a.adapter_only) {
             let lane = attached.lane as usize;
             // The readout row of a lane: its gathered first, else its first
             // named row, else its last.
@@ -2484,12 +2489,18 @@ impl Shell {
         Ok(())
     }
 
-    /// Fires the programs attached at `Boundary::Prologue`, each to its
-    /// commit, before the step is staged: the descriptor reads and the input
-    /// feeds then see the cells a prologue put, as the forward's inputs.
+    /// Fires each program's prologue to its commit before the step is
+    /// staged: the descriptor reads and the input feeds then see the cells
+    /// a prologue put, as the forward's inputs.
     fn fire_prologues(&mut self, attachments: &[Attached]) -> Result<()> {
-        for attached in attachments.iter().filter(|a| a.at == Boundary::Prologue) {
-            match self.programs.fire(&self.device, attached.instance)? {
+        for attached in attachments.iter().filter(|a| !a.adapter_only) {
+            if !self.programs.prologue_runs(attached.instance) {
+                continue;
+            }
+            match self
+                .programs
+                .fire(&self.device, attached.instance, Stage::Prologue)?
+            {
                 crate::Fired::Committed => {}
                 other => {
                     return Err(Fault::program(
@@ -4556,11 +4567,7 @@ impl engine::frame::Shell for Shell {
 
         let mut draft = None;
         let mut drafts = None;
-        if prepared
-            .attachments
-            .iter()
-            .any(|a| a.at == Boundary::Epilogue)
-        {
+        if prepared.attachments.iter().any(|a| !a.adapter_only) {
             let arena = crate::device::alloc::slab_id(self.arena.store().slab());
             if crate::device::alloc::slab_id(&source) != arena {
                 return Err(Fault::Unbound {

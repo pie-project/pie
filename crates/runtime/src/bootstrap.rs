@@ -154,7 +154,8 @@ pub struct EngineConfig {
     pub has_attn_page_mask: bool,
     pub has_lora: bool,
     /// The engine takes an attachment for an adapter alone
-    /// ([`::engine::fire::Boundary::Adapter`]): an adapted pass can be cut.
+    /// ([`::engine::fire::Attachment::adapter_only`]): an adapted pass can be
+    /// cut.
     pub adapter_attachments: bool,
     /// The rows inside a lane whose recurrent state one fire lands.
     pub rs_snapshots: u32,

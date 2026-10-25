@@ -5,7 +5,7 @@ use poem_compiler::{Budget, CompiledModel};
 use poem_exec::fire::{Filter, walk};
 use poem_ir::{Dtype, Trace};
 
-use engine::fire::Boundary;
+use eta_ir::registry::Stage as Attach;
 
 use crate::arena::Arena;
 use crate::device::{Buffer, Context, graph::Event};
@@ -256,10 +256,14 @@ struct Staged {
 impl FireCtx<'_> {
     fn prologue(&mut self, p: &Prepared<'_>) -> Result<()> {
         let mut verdicts: Vec<(usize, Fired)> = Vec::new();
-        let mut prologues = AirborneFires::default();
-        // A prologue mints against the cursors airborne fires predicted, as
-        // an epilogue does: only what has landed settles here.
-        if p.attachments.iter().any(|a| a.at == Boundary::Prologue) {
+        // A prologue runs, and commits, before the fire stages its inputs:
+        // the forward reads what it put. It mints against the cursors
+        // airborne fires predicted, as an epilogue does: only what has
+        // landed settles here.
+        let runs =
+            |a: &&super::Attached| !a.adapter_only && self.programs.prologue_runs(a.instance);
+        let prologues: Vec<super::Attached> = p.attachments.iter().filter(runs).copied().collect();
+        if !prologues.is_empty() {
             reap_guest_fires(
                 self.programs,
                 self.owed,
@@ -269,17 +273,22 @@ impl FireCtx<'_> {
                 Reap::Landed,
             )?;
         }
+        let mut launched = AirborneFires::default();
         for (at, attached) in p.attachments.iter().enumerate() {
-            if attached.at != Boundary::Prologue {
+            if !prologues.contains(attached) {
                 continue;
             }
-            if let Some(fired) =
-                prologues.stage(self.device, self.programs, at, attached.instance)?
-            {
+            if let Some(fired) = launched.stage(
+                self.device,
+                self.programs,
+                at,
+                attached.instance,
+                Attach::Prologue,
+            )? {
                 verdicts.push((at, fired));
             }
         }
-        prologues.fly(self.device, self.programs)?;
+        launched.fly(self.device, self.programs)?;
 
         let lane_count = p.composition.lane_count();
         if p.rs.predicated || p.rs.truncates {
@@ -289,7 +298,7 @@ impl FireCtx<'_> {
                     commits[at] = self.predicate.never();
                 }
             }
-            for attached in p.attachments.iter().filter(|a| a.at == Boundary::Prologue) {
+            for attached in &prologues {
                 let Some(&lane) = p.rs.order.get(attached.lane as usize) else {
                     continue;
                 };
@@ -317,7 +326,7 @@ impl FireCtx<'_> {
         // The lanes' commits gate the body on the device, so the host waits on
         // none of them: their verdicts settle with the step, ahead of its
         // epilogues'.
-        if let Some(batch) = prologues.defer(
+        if let Some(batch) = launched.defer(
             self.device,
             self.programs,
             self.spare_events,
@@ -1053,7 +1062,7 @@ impl FireCtx<'_> {
             }
         }
         let mut epilogues = AirborneFires::default();
-        for attached in p.attachments.iter().filter(|a| a.at == Boundary::Epilogue) {
+        for attached in p.attachments.iter().filter(|a| !a.adapter_only) {
             let lane = attached.lane as usize;
             let owned = lane_rows.get(lane).copied().unwrap_or(0);
             let stated = p.lanes.get(lane).and_then(|seated| seated.readout);
@@ -1264,6 +1273,7 @@ impl FireCtx<'_> {
                 self.programs,
                 attached.lane as usize,
                 attached.instance,
+                Attach::Epilogue,
             )? {
                 committed_or(fired, attached.instance, "epilogue")?;
             }
@@ -1285,7 +1295,7 @@ impl FireCtx<'_> {
             let attached = p
                 .attachments
                 .iter()
-                .find(|a| a.at == Boundary::Epilogue && a.lane as usize == lane)
+                .find(|a| !a.adapter_only && a.lane as usize == lane)
                 .ok_or_else(|| {
                     Fault::program(
                         "serve::enqueue",
@@ -1331,6 +1341,7 @@ impl AirborneFires {
         programs: &mut ProgramPlane,
         tag: usize,
         instance: engine::InstanceId,
+        at: Attach,
     ) -> Result<Option<Fired>> {
         if self.launched.is_empty() && !self.flown && programs.staged() != 0 {
             programs.abandon_wave();
@@ -1339,7 +1350,7 @@ impl AirborneFires {
         if rings.iter().any(|ring| self.rings.contains(ring)) {
             self.flush(device, programs)?;
         }
-        match programs.stage(instance)? {
+        match programs.stage(instance, at)? {
             crate::program::Launched::Airborne => {
                 self.rings.extend(rings);
                 self.launched.push((tag, instance));
@@ -1498,7 +1509,7 @@ fn committed_or(fired: Fired, instance: engine::InstanceId, at: &str) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::{Boundary, Fired, committed_or};
+    use super::{Fired, committed_or};
     use crate::serve::Attached;
 
     #[test]
@@ -1507,7 +1518,7 @@ mod tests {
             lane: 0,
             lanes: 1,
             instance: engine::InstanceId(77),
-            at: Boundary::Epilogue,
+            adapter_only: false,
         };
         committed_or(Fired::Committed, attached.instance, "epilogue")
             .expect("a committed pass is the ordinary answer");

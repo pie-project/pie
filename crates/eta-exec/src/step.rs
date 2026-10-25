@@ -334,6 +334,7 @@ pub fn step_many(
     plan: &ExecPlan,
     inputs: &PassInputs,
     runner: &mut dyn BatchRunner,
+    at: Stage,
 ) -> Vec<StepOutcome> {
     let n = insts.len();
     let mut outcomes: Vec<Option<StepOutcome>> = vec![None; n];
@@ -342,17 +343,8 @@ pub fn step_many(
             outcomes[l] = Some(StepOutcome::Faulted("instance is poisoned".to_string()));
             continue;
         }
-        for (channel, ring) in inst.channels.iter().enumerate() {
-            let readiness = plan.package.channels.get(channel).and_then(|c| c.readiness);
-            let ready = match readiness {
-                Some(Direction::NeedsFull) => !ring.is_empty(),
-                Some(Direction::NeedsEmpty) => !ring.is_full(),
-                None => true,
-            };
-            if !ready {
-                outcomes[l] = Some(StepOutcome::Blocked(channel as u32));
-                break;
-            }
+        if let Some(channel) = blocked(inst, plan, at) {
+            outcomes[l] = Some(StepOutcome::Blocked(channel));
         }
     }
     let mut overlays: Vec<Overlay> = insts
@@ -372,7 +364,7 @@ pub fn step_many(
         outcomes[l] = Some(StepOutcome::Faulted(why));
     }
     for kind in [Stage::Prologue, Stage::Epilogue] {
-        if kind == Stage::Epilogue {
+        if kind == Stage::Epilogue && at != Stage::Prologue {
             for (l, inst) in insts.iter().enumerate() {
                 if outcomes[l].is_some() {
                     continue;
@@ -388,7 +380,9 @@ pub fn step_many(
             }
         }
         for sp in &plan.stages {
-            if plan.package.stages[sp.stage_index].stage != kind {
+            if plan.package.stages[sp.stage_index].stage != kind
+                || !plan.runs_at(sp.stage_index, at)
+            {
                 continue;
             }
             for l in 0..n {
@@ -459,32 +453,35 @@ fn const_root_value(root: &LaunchValue) -> Value {
     }
 }
 
+/// One whole pass with no forward between its points: the prologue, if it
+/// runs on its own, then the rest.
 #[must_use]
 pub fn step(inst: &mut InterpInstance, plan: &ExecPlan, inputs: &PassInputs) -> StepOutcome {
-    step_with(inst, plan, inputs, &mut Interpreted)
+    if plan.prologue_runs() {
+        let outcome = step_with(inst, plan, inputs, &mut Interpreted, Stage::Prologue);
+        if outcome != StepOutcome::Committed {
+            return outcome;
+        }
+    }
+    step_with(inst, plan, inputs, &mut Interpreted, Stage::Epilogue)
 }
 
+/// The stages that run at `at` ([`ExecPlan::runs_at`]), gated and committed
+/// on their own: the prologue's point before the forward, the epilogue's
+/// after it.
 #[must_use]
 pub fn step_with(
     inst: &mut InterpInstance,
     plan: &ExecPlan,
     inputs: &PassInputs,
     runner: &mut dyn StageRunner,
+    at: Stage,
 ) -> StepOutcome {
     if inst.poisoned {
         return StepOutcome::Faulted("instance is poisoned".to_string());
     }
-
-    for (channel, ring) in inst.channels.iter().enumerate() {
-        let readiness = plan.package.channels.get(channel).and_then(|c| c.readiness);
-        let ready = match readiness {
-            Some(Direction::NeedsFull) => !ring.is_empty(),
-            Some(Direction::NeedsEmpty) => !ring.is_full(),
-            None => true,
-        };
-        if !ready {
-            return StepOutcome::Blocked(channel as u32);
-        }
+    if let Some(channel) = blocked(inst, plan, at) {
+        return StepOutcome::Blocked(channel);
     }
 
     let mut overlay = Overlay::new(inst.channels.len());
@@ -494,6 +491,7 @@ pub fn step_with(
         inst,
         plan,
         Stage::Prologue,
+        at,
         inputs,
         &mut overlay,
         &mut vals,
@@ -503,12 +501,14 @@ pub fn step_with(
         return StepOutcome::Faulted(reason.to_string());
     }
 
-    for port in &plan.package.ports {
-        if port.is_const {
-            continue;
-        }
-        if port_consumes(port.port) {
-            let _ = overlay.take(inst, port.channel);
+    if at != Stage::Prologue {
+        for port in &plan.package.ports {
+            if port.is_const {
+                continue;
+            }
+            if port_consumes(port.port) {
+                let _ = overlay.take(inst, port.channel);
+            }
         }
     }
 
@@ -516,6 +516,7 @@ pub fn step_with(
         inst,
         plan,
         Stage::Epilogue,
+        at,
         inputs,
         &mut overlay,
         &mut vals,
@@ -528,17 +529,34 @@ pub fn step_with(
     commit(inst, &overlay)
 }
 
+/// The first channel not as the stages at `at` need it.
+fn blocked(inst: &InterpInstance, plan: &ExecPlan, at: Stage) -> Option<u32> {
+    inst.channels
+        .iter()
+        .enumerate()
+        .find_map(|(channel, ring)| {
+            let ready = match plan.readiness(channel as u32, at) {
+                Some(Direction::NeedsFull) => !ring.is_empty(),
+                Some(Direction::NeedsEmpty) => !ring.is_full(),
+                None => true,
+            };
+            (!ready).then_some(channel as u32)
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_kind(
     inst: &InterpInstance,
     plan: &ExecPlan,
     kind: Stage,
+    at: Stage,
     inputs: &PassInputs,
     overlay: &mut Overlay,
     vals: &mut [Value],
     runner: &mut dyn StageRunner,
 ) -> Result<()> {
     for sp in &plan.stages {
-        if plan.package.stages[sp.stage_index].stage != kind {
+        if plan.package.stages[sp.stage_index].stage != kind || !plan.runs_at(sp.stage_index, at) {
             continue;
         }
         exec_stage(inst, plan, sp, inputs, overlay, vals, runner)?;

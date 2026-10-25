@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel, Ticket};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, PassInputs, StepOutcome, Value};
+#[cfg(feature = "wgpu")]
+use eta_ir::registry::Stage;
 use eta_ir::registry::{GeometryClass, Port};
 
 #[derive(Debug)]
@@ -91,6 +93,9 @@ pub(crate) struct Pass<'a> {
     pub lanes: Vec<Option<crate::guest::run::Readout<'a>>>,
     /// Each lane of the pass's pixels, lane `k` at `k`.
     pub pixels: Vec<Option<crate::guest::run::Readout<'a>>>,
+    /// The point whose stages run: the prologue's, before the forward, or
+    /// the epilogue's, after it.
+    pub at: Stage,
 }
 
 #[cfg(feature = "wgpu")]
@@ -132,7 +137,8 @@ impl Half {
         let mut runner =
             crate::guest::run::OnDevice::new(device, &mut self.session, widen, pass.readout)
                 .with_lanes(pass.lanes, pass.pixels);
-        let outcome = eta_exec::step_with(&mut self.inst, &self.plan, &inputs, &mut runner);
+        let outcome =
+            eta_exec::step_with(&mut self.inst, &self.plan, &inputs, &mut runner, pass.at);
         let ran = runner.ran().len();
         if self.inst.poisoned {
             self.poisoned.store(true, Ordering::Release);
@@ -368,6 +374,7 @@ impl Guests {
                                         })
                                     })
                                     .collect(),
+                                at: Stage::Epilogue,
                             },
                         )
                     });
@@ -913,9 +920,18 @@ impl Plane {
         }
     }
 
-    /// Runs `instance`'s pass to its commit before the forward, once every
-    /// pass airborne on its channels has run: the forward then reads the
-    /// cells it put.
+    /// Whether `instance`'s prologue runs on its own, before the forward
+    /// ([`ExecPlan::prologue_runs`]).
+    #[must_use]
+    pub fn prologue_runs(&self, instance: InstanceId) -> bool {
+        self.instances
+            .get(&instance)
+            .is_some_and(|seat| seat.plan.prologue_runs())
+    }
+
+    /// Runs `instance`'s prologue to its commit before the forward, once
+    /// every pass airborne on its channels has run: the forward then reads
+    /// the cells it put.
     #[cfg(feature = "wgpu")]
     pub(crate) fn fire_prologue(
         &self,
@@ -948,6 +964,7 @@ impl Plane {
                 readout: None,
                 lanes: Vec::new(),
                 pixels: Vec::new(),
+                at: Stage::Prologue,
             },
         )
     }

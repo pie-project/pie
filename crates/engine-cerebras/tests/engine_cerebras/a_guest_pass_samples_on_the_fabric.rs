@@ -283,7 +283,14 @@ fn a_guest_pass_samples_on_the_fabric_as_the_interpreter_does() {
         );
         let attached: Vec<(InstanceId, u32)> = (0..lanes).map(|l| (ids[&l].0, l)).collect();
         let ran = device_plane
-            .fire_guests(&device, &attached, Some(&kept), vocab, 0)
+            .fire_guests(
+                &device,
+                &attached,
+                Some(&kept),
+                vocab,
+                0,
+                eta_ir::registry::Stage::Epilogue,
+            )
             .expect("the guest passes run");
         assert!(
             ran.iter().all(|&r| r),
@@ -293,7 +300,15 @@ fn a_guest_pass_samples_on_the_fabric_as_the_interpreter_does() {
             let (d, h) = ids[&l];
             let row = kept.lane_rows(l as usize).expect("rows");
             host_plane
-                .fire_interpreted(h, Some(&row), 1, vocab, None, 0)
+                .fire_interpreted(
+                    h,
+                    Some(&row),
+                    1,
+                    vocab,
+                    None,
+                    0,
+                    eta_ir::registry::Stage::Epilogue,
+                )
                 .expect("the interpreter steps");
             let (dt, dg) = (
                 token(&mut device_plane, d, OUT),

@@ -207,7 +207,13 @@ fn on_device(
         }
     }
     let mut runner = OnDevice::new(device, stages, key_of(plan), cols, kept, seat);
-    let outcome = eta_exec::step_with(&mut inst, plan, &PassInputs::none(), &mut runner);
+    let outcome = eta_exec::step_with(
+        &mut inst,
+        plan,
+        &PassInputs::none(),
+        &mut runner,
+        eta_ir::registry::Stage::Epilogue,
+    );
     assert_eq!(outcome, StepOutcome::Committed, "the device pass commits");
     assert!(runner.ran() > 0, "a stage ran on the device");
     take_all(plan, &inst, channels)
@@ -1640,8 +1646,13 @@ fn several_lanes_share_one_program() {
                         kept,
                         shared,
                     };
-                    let outcome =
-                        eta_exec::step_with(&mut inst, plan, &PassInputs::none(), &mut runner);
+                    let outcome = eta_exec::step_with(
+                        &mut inst,
+                        plan,
+                        &PassInputs::none(),
+                        &mut runner,
+                        eta_ir::registry::Stage::Epilogue,
+                    );
                     assert_eq!(outcome, StepOutcome::Committed, "lane {me} commits");
                     take_all(plan, &inst, outs)
                 })

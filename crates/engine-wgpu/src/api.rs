@@ -9,7 +9,7 @@ use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFac
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
-    Boundary, FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout, Step,
+    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout, Step,
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
@@ -787,10 +787,8 @@ impl Engine for Wgpu {
 impl Wgpu {
     #[cfg(feature = "wgpu")]
     fn run_prologues(&mut self, submission: &Step) -> EngineResult<()> {
-        let mut prologues = submission
-            .attachments
-            .iter()
-            .filter(|attachment| attachment.at == Boundary::Prologue)
+        let mut prologues = epilogues(submission)
+            .filter(|attachment| self.programs.prologue_runs(attachment.instance))
             .peekable();
         if prologues.peek().is_none() {
             return Ok(());
@@ -806,10 +804,7 @@ impl Wgpu {
 
     #[cfg(not(feature = "wgpu"))]
     fn run_prologues(&mut self, submission: &Step) -> EngineResult<()> {
-        if submission
-            .attachments
-            .iter()
-            .any(|attachment| attachment.at == Boundary::Prologue)
+        if epilogues(submission).any(|attachment| self.programs.prologue_runs(attachment.instance))
         {
             return Err(Error::Program(
                 "this build carries no wgpu device, so a guest pass has nowhere to run".into(),
@@ -1152,9 +1147,10 @@ pub(crate) fn lane_readouts(policies: &[Readout], rows: &[Vec<f32>]) -> Vec<Lane
         .collect()
 }
 
-/// The attachments that run behind the forward.
+/// The attachments whose program runs on this fire, each stage at its own
+/// point.
 fn epilogues(step: &Step) -> impl Iterator<Item = &engine::fire::Attachment> {
     step.attachments
         .iter()
-        .filter(|attachment| attachment.at == Boundary::Epilogue)
+        .filter(|attachment| !attachment.adapter_only)
 }

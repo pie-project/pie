@@ -1,4 +1,4 @@
-use engine::fire::{Boundary, InputFeed, Masking, RsReset, RsSnapshot, RsVerb};
+use engine::fire::{InputFeed, Masking, RsReset, RsSnapshot, RsVerb};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Lane<'a> {
@@ -91,7 +91,8 @@ pub struct Attached {
     pub lane: u32,
     pub lanes: u32,
     pub instance: engine::InstanceId,
-    pub at: Boundary,
+    /// Carries the pass's adapter alone and runs none of its stages.
+    pub adapter_only: bool,
 }
 
 pub(crate) const MROPE_COORDS: usize = 3;
