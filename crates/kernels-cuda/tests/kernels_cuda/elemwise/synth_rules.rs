@@ -2,8 +2,7 @@
 
 //! The chains the fold forms as one generated row kernel on CUDA (a residual
 //! add and its RMS norm, either way round), each against its own ops fired
-//! unfused and against the kernels-ir interpreter: what each lands and how
-//! fast against the bandwidth roofline.
+//! unfused and against the kernels-ir interpreter: what each lands.
 //!
 //! Each region here is the one poem-compiler's `fuse::chain` lowers the
 //! chain's ops to on the catalog's models, op for op and in its parameters'
@@ -26,7 +25,7 @@
 //! weight of one element, is the region's scalar parameter.
 
 use crate::common::attn_ref::{ten, tuned};
-use crate::common::{Gpu, Lcg, captured, forget, from_bf16, replay, to_bf16};
+use crate::common::{Gpu, Lcg, from_bf16, to_bf16};
 use dtype::Dtype::Bf16;
 use kernels_cuda::elemwise::{norm, pointwise};
 use kernels_cuda::jit::Ctx;
@@ -115,14 +114,6 @@ impl Chain {
             Chain::NormResidual { post } => 1 + usize::from(post),
             Chain::ScaledNormResidual => 2,
         }
-    }
-
-    /// The bytes the chain must move over `rows` rows of `width`: each
-    /// parameter row read, each result row written, each weight once.
-    fn bytes(self, rows: usize, width: usize) -> usize {
-        let plane = rows * width * 2;
-        let rows_in = self.region(width).params.len() - self.shared().len() - self.ones().len();
-        (rows_in + self.outs()) * plane + self.shared().len() * width * 2 + self.ones().len() * 2
     }
 
     /// The region `fuse::chain` lowers the chain to.
@@ -315,18 +306,6 @@ struct Planes {
     /// The region's stream (the unfused add sums it into `y`).
     h: u64,
     out: u64,
-}
-
-impl Planes {
-    fn zeros(gpu: &mut Gpu, plane: usize) -> Planes {
-        Planes {
-            x: gpu.zeros(plane),
-            y: gpu.zeros(plane),
-            t: gpu.zeros(plane),
-            h: gpu.zeros(plane),
-            out: gpu.zeros(plane),
-        }
-    }
 }
 
 /// The weights a chain reads.
@@ -610,119 +589,6 @@ fn each_chains_region_lands_its_math_and_its_unfused_ops() {
                         );
                     }
                 }
-            }
-        }
-    }
-}
-
-/// The median of `runs` runs of `run`, in microseconds.
-fn median(runs: u32, mut run: impl FnMut()) -> f64 {
-    let mut us: Vec<f64> = (0..runs)
-        .map(|_| {
-            let start = std::time::Instant::now();
-            run();
-            start.elapsed().as_secs_f64() * 1e6
-        })
-        .collect();
-    us.sort_by(f64::total_cmp);
-    us[us.len() / 2]
-}
-
-/// Each chain's unfused ops, under the default knobs and the tuned ones,
-/// against its generated kernel, at a decode's and a prefill's rows over
-/// the widths of the catalog's models that form it; each fire's bytes (the
-/// chain's own: what its parameters read and its results write) against the
-/// device's copy rate, the roofline: `cargo test --release ... -- --ignored
-/// synthesized_rule_rate --nocapture`. A fire is a graph of its fires over
-/// planes rotating through at least 1 GiB, so a prefill's fire reads HBM,
-/// not the L2, even where it touches several planes of a set (the unfused
-/// ops land a normed row between them and sum the stream in place; a region
-/// writes its own plane): the median over
-/// rounds, each graph in turn, of each round's median replay.
-#[test]
-#[ignore = "a rate bench: cargo test --release ... -- --ignored synthesized_rule_rate --nocapture"]
-fn synthesized_rule_rate() {
-    use super::frame::copy_rate;
-    // a set's five planes; a fire may touch several of them (an in-place
-    // stream), so the sets span four times that of any card's L2
-    const FOOTPRINT: usize = 1 << 30;
-    const FIRES: usize = 256;
-    const REPLAYS: u32 = 11;
-    const ROUNDS: usize = 7;
-    let copy = copy_rate();
-    eprintln!("device copy: {copy:.0} GB/s");
-    eprintln!(
-        "{:<28}  rows  width  unfused us  %copy  tuned us  %copy  region us  %copy  region/best",
-        "chain"
-    );
-    for chain in Chain::TIMED {
-        for rows in [1usize, 8, 64, 512, 4096] {
-            for width in chain.widths() {
-                let kernel = generated(chain, width);
-                let mut gpu = Gpu::open();
-                let plane = rows * width * 2;
-                let copies = FOOTPRINT.div_ceil(5 * plane).clamp(1, FIRES);
-                let weights = Weights {
-                    w: gpu.zeros(width * 2),
-                    w1: gpu.zeros(width * 2),
-                    s: gpu.zeros(16),
-                };
-                let sets: Vec<Planes> = (0..copies)
-                    .map(|_| Planes::zeros(&mut gpu, plane))
-                    .collect();
-                let fires = FIRES.max(copies) / copies * copies;
-                let graph = |ctx: &Ctx, fire: &dyn Fn(Planes)| {
-                    let all = || {
-                        for i in 0..fires {
-                            fire(sets[i % copies]);
-                        }
-                    };
-                    all();
-                    gpu.sync();
-                    let exec = captured(ctx, all);
-                    replay(ctx, exec);
-                    gpu.sync();
-                    exec
-                };
-                let contexts = [Knobs::Default.ctx(&gpu), Knobs::Tuned.ctx(&gpu), gpu.ctx()];
-                let execs = [
-                    graph(&contexts[0], &|p| {
-                        fire_unfused(&contexts[0], chain, rows, width, p, weights);
-                    }),
-                    graph(&contexts[1], &|p| {
-                        fire_unfused(&contexts[1], chain, rows, width, p, weights);
-                    }),
-                    graph(&contexts[2], &|p| {
-                        fire_region(&contexts[2], kernel, chain, rows, width, p, weights);
-                    }),
-                ];
-                // rounds of each graph in turn, so a burst of another
-                // process's work on a shared card lands in a round of each
-                let mut rounds = [const { Vec::new() }; 3];
-                for _ in 0..ROUNDS {
-                    for (k, exec) in execs.iter().enumerate() {
-                        rounds[k].push(median(REPLAYS, || {
-                            replay(&contexts[k], *exec);
-                            gpu.sync();
-                        }));
-                    }
-                }
-                for exec in execs {
-                    forget(exec);
-                }
-                let [default_us, tuned_us, region_us] = rounds.map(|mut us| {
-                    us.sort_by(f64::total_cmp);
-                    us[us.len() / 2] / fires as f64
-                });
-                let share = |us: f64| 100.0 * chain.bytes(rows, width) as f64 / us / 1e3 / copy;
-                eprintln!(
-                    "{:<28}  {rows:>4}  {width:>5}  {default_us:>10.2}  {:>4.0}%  {tuned_us:>8.2}  {:>4.0}%  {region_us:>9.2}  {:>4.0}%  {:>11.3}",
-                    chain.name(),
-                    share(default_us),
-                    share(tuned_us),
-                    share(region_us),
-                    region_us / default_us.min(tuned_us),
-                );
             }
         }
     }

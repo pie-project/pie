@@ -7,9 +7,8 @@
 //! the weight taken as is or as `1 + weight`.
 
 use crate::common::attn_ref::{ten, tuned};
-use crate::common::{Gpu, Lcg, captured, forget, replay};
+use crate::common::{Gpu, Lcg};
 use dtype::Dtype::Bf16;
-use kernels_cuda::cudarc::runtime::sys as rt;
 use kernels_cuda::elemwise::{frame, norm, pointwise};
 use kernels_cuda::jit::Ctx;
 use kernels_cuda::tensor::Tensor;
@@ -100,123 +99,4 @@ fn the_framed_residual_norm_lands_its_unfused_ops() {
             }
         }
     }
-}
-
-/// The framed residual norm against its unfused ops (`residual_add`, then
-/// `rmsnorm`) at a decode's and a prefill's rows over the widths of 4096-,
-/// 7168- and 8192-wide models, each fire's bytes (the chain's own: x and y
-/// read, y and the normed row written, the weight read) against the device's
-/// copy rate, the roofline: `cargo test ... -- --ignored residual_norm_rate
-/// --nocapture`. A fire is its graph's fastest replay over
-/// its fires; the planes rotate over at least 256 MB so a fire reads HBM, not
-/// the L2.
-#[test]
-#[ignore = "a rate bench: cargo test ... -- --ignored residual_norm_rate --nocapture"]
-fn residual_norm_rate() {
-    const FOOTPRINT: usize = 256 << 20;
-    const FIRES: usize = 256;
-    const REPLAYS: u32 = 20;
-    let copy = copy_rate();
-    eprintln!("device copy: {copy:.0} GB/s");
-    eprintln!("rows  width  unfused us  GB/s  %copy  frame us  GB/s  %copy  frame/unfused");
-    for rows in [1usize, 8, 64, 512, 4096] {
-        for width in [4096usize, 7168, 8192] {
-            let mut gpu = Gpu::open();
-            let plane = rows * width * 2;
-            let copies = FOOTPRINT.div_ceil(3 * plane).clamp(1, FIRES);
-            let w = ten(gpu.zeros(width * 2), width, 1, Bf16);
-            let sets: Vec<[u64; 3]> = (0..copies)
-                .map(|_| [gpu.zeros(plane), gpu.zeros(plane), gpu.zeros(plane)])
-                .collect();
-            let fires = FIRES.max(copies) / copies * copies;
-            let ctx = rows_vec(&gpu);
-            let time = |fire: Fire| {
-                let all = || {
-                    for i in 0..fires {
-                        let [x, y, out] = sets[i % copies];
-                        fire(
-                            &ctx,
-                            ten(x, rows, width, Bf16),
-                            &mut ten(y, rows, width, Bf16),
-                            w,
-                            false,
-                            1e-6,
-                            &mut ten(out, rows, width, Bf16),
-                        )
-                        .expect("the residual norm fires");
-                    }
-                };
-                all();
-                gpu.sync();
-                let exec = captured(&ctx, all);
-                replay(&ctx, exec);
-                gpu.sync();
-                let us = fastest(REPLAYS, || {
-                    replay(&ctx, exec);
-                    gpu.sync();
-                });
-                forget(exec);
-                us / fires as f64
-            };
-            // x and y read, y and the normed row written, the weight read
-            let bytes = (4 * plane + width * 2) as f64;
-            let rate = |us: f64| bytes / us / 1e3;
-            let (unfused_us, frame_us) = (time(unfused), time(frame::residual_add_rmsnorm));
-            eprintln!(
-                "{rows:>4}  {width:>5}  {unfused_us:>10.2}  {:>4.0}  {:>4.0}%  {frame_us:>8.2}  {:>4.0}  {:>4.0}%  {:>13.3}",
-                rate(unfused_us),
-                100.0 * rate(unfused_us) / copy,
-                rate(frame_us),
-                100.0 * rate(frame_us) / copy,
-                frame_us / unfused_us,
-            );
-        }
-    }
-}
-
-/// The device's copy rate in GB/s: bytes read plus bytes written by its
-/// fastest 1 GiB device-to-device copy.
-#[allow(unsafe_code)]
-pub(super) fn copy_rate() -> f64 {
-    const BYTES: usize = 1 << 30;
-    let mut gpu = Gpu::open();
-    let (src, dst) = (gpu.zeros(BYTES), gpu.zeros(BYTES));
-    let stream = gpu.ctx().stream();
-    let copy = || {
-        // SAFETY: both ends are `BYTES` long allocations `gpu` holds until
-        // its drop, which syncs the stream first.
-        let code = unsafe {
-            rt::cudaMemcpyAsync(
-                dst as *mut _,
-                src as *const _,
-                BYTES,
-                rt::cudaMemcpyKind::cudaMemcpyDeviceToDevice,
-                stream.cast(),
-            )
-        };
-        assert_eq!(
-            code,
-            rt::cudaError::cudaSuccess,
-            "`cudaMemcpyAsync` answered {code:?}"
-        );
-    };
-    copy();
-    gpu.sync();
-    let us = fastest(10, || {
-        copy();
-        gpu.sync();
-    });
-    2.0 * BYTES as f64 / us / 1e3
-}
-
-/// The fewest microseconds of `runs` runs of `run`: other work on a shared
-/// card only ever slows one.
-pub(super) fn fastest(runs: u32, mut run: impl FnMut()) -> f64 {
-    (0..runs)
-        .map(|_| {
-            let start = std::time::Instant::now();
-            run();
-            start.elapsed().as_secs_f64() * 1e6
-        })
-        .fold(f64::INFINITY, f64::min)
 }

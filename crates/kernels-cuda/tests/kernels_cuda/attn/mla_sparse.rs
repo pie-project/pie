@@ -399,13 +399,13 @@ fn the_sparse_mla_lands_on_tcgen05() {
 
 /// GLM-5.3's decode at 8 rows: each request's one row selecting 2048 of its
 /// keys, the selected attention dealt over splits a row on tcgen05 and
-/// folded, against the warp-a-key form; then both paced.
-fn decode_bs8(tc: bool, iters: u32) -> (Vec<u16>, f64) {
-    decode_rows(8, tc, iters)
+/// folded, against the warp-a-key form.
+fn decode_bs8(tc: bool) -> Vec<u16> {
+    decode_rows(8, tc)
 }
 
 /// [`decode_bs8`] at `reqs` requests of one row each.
-fn decode_rows(reqs: usize, tc: bool, iters: u32) -> (Vec<u16>, f64) {
+fn decode_rows(reqs: usize, tc: bool) -> Vec<u16> {
     const PG: usize = 64;
     const K: usize = 2048;
     const ROPE: usize = 64;
@@ -519,23 +519,13 @@ fn decode_rows(reqs: usize, tc: bool, iters: u32) -> (Vec<u16>, f64) {
     };
     fire();
     gpu.sync();
-    let got: Vec<u16> = gpu.down(out, reqs * HEADS * RANK);
-    let mut us = 0.0;
-    if iters > 0 {
-        let t0 = std::time::Instant::now();
-        for _ in 0..iters {
-            fire();
-        }
-        gpu.sync();
-        us = t0.elapsed().as_secs_f64() * 1e6 / f64::from(iters);
-    }
-    (got, us)
+    gpu.down(out, reqs * HEADS * RANK)
 }
 
 #[test]
 fn glm_decodes_selected_attention_lands_split_over_the_multiprocessors() {
-    let (want, _) = decode_bs8(false, 0);
-    let (got, _) = decode_bs8(true, 0);
+    let want = decode_bs8(false);
+    let got = decode_bs8(true);
     for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
         let (g, w) = (from_bf16(g), from_bf16(w));
         assert!(

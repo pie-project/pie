@@ -376,37 +376,6 @@ impl Gpu {
             );
         }
     }
-
-    /// The device's microseconds a `fire` on this stream takes, the best of
-    /// 25 runs of `reps` (events either side of each run).
-    pub fn time(&self, reps: u32, mut fire: impl FnMut()) -> f64 {
-        let mut best = f64::INFINITY;
-        // SAFETY: the events are locals created and destroyed here, recorded
-        // on the stream `open` created.
-        unsafe {
-            let (mut a, mut b): (rt::cudaEvent_t, rt::cudaEvent_t) =
-                (core::ptr::null_mut(), core::ptr::null_mut());
-            check(rt::cudaEventCreate(&raw mut a), "cudaEventCreate");
-            check(rt::cudaEventCreate(&raw mut b), "cudaEventCreate");
-            for _ in 0..25 {
-                check(rt::cudaEventRecord(a, self.stream), "cudaEventRecord");
-                for _ in 0..reps {
-                    fire();
-                }
-                check(rt::cudaEventRecord(b, self.stream), "cudaEventRecord");
-                check(rt::cudaEventSynchronize(b), "cudaEventSynchronize");
-                let mut ms = 0f32;
-                check(
-                    rt::cudaEventElapsedTime(&raw mut ms, a, b),
-                    "cudaEventElapsedTime",
-                );
-                best = best.min(f64::from(ms) * 1e3 / f64::from(reps));
-            }
-            check(rt::cudaEventDestroy(a), "cudaEventDestroy");
-            check(rt::cudaEventDestroy(b), "cudaEventDestroy");
-        }
-        best
-    }
 }
 
 impl Drop for Gpu {
