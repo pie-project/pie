@@ -109,6 +109,7 @@ pub struct Dit {
 /// One lane's feeds, as the fire hands them to [`Dit::stage`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Feed<'a> {
+    /// The State row its clips' conv caches read: its recurrent-state row.
     pub slot: u32,
     pub group: Option<u32>,
     pub inputs: &'a [InputCell<'a>],
