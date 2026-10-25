@@ -622,6 +622,9 @@ async fn main(input: Input) -> Result<Output> {
     let known = mask
         .as_ref()
         .map(|_| Channel::new(lat, dtype::f32).queued().named("known"));
+    // The inpainting step's own noise stream, carried from step to step.
+    let noise = Channel::new([2], dtype::u32).queued().named("noise");
+    let noise0 = Channel::from(rng_state(seed ^ 0x5eed)).named("noise0");
     // `x` from `start` (the encoded picture) or from noise alone, and the clock at 0.
     let seed_loop = move |start: Option<Tensor>| {
         let eps = normal(&draw.read(), lat);
@@ -630,6 +633,7 @@ async fn main(input: Input) -> Result<Output> {
             Some(start) => {
                 if let Some(known) = &known {
                     known.put(&start);
+                    noise.put(noise0.read());
                 }
                 let shape = start.shape();
                 &(&start * &broadcast(Tensor::constant([1.0 - sigma0]), shape))
@@ -701,7 +705,6 @@ async fn main(input: Input) -> Result<Output> {
     let mask_ch = mask
         .as_ref()
         .map(|m| Channel::from_shaped([cells, 1], m.as_slice()).named("mask"));
-    let noise = Channel::from(rng_state(seed ^ 0x5eed)).named("noise");
     let step = move || {
         let step = k.take();
         let v = if cfg {
