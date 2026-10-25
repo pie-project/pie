@@ -75,7 +75,12 @@ fn the_vae_decodes_and_encodes_the_golden_clip() {
     let gold = golden("z-image/zimage_vae");
     let latent = f32s(&gold.join("latent.f32"));
     let pixels = f32s(&gold.join("pixels.f32"));
-    let mean = f32s(&gold.join("mean.f32"));
+    // The golden is diffusers' raw posterior mean; `vae.encode` lands it in
+    // the denoiser's latent, `(mean - shift_factor) * scaling_factor`.
+    let mean: Vec<f32> = f32s(&gold.join("mean.f32"))
+        .iter()
+        .map(|m| (m - 0.1159) * 0.3611)
+        .collect();
     let square = |len: usize, channels: usize| -> [u32; 3] {
         let side = ((len / channels) as f64).sqrt().round() as u32;
         assert_eq!(

@@ -106,6 +106,7 @@ impl pie::inferlet::model::Host for ProcessCtx {
                 channels: l.channels,
                 spatial_compression: l.spatial_compression,
                 temporal_compression: l.temporal_compression,
+                first_frames: l.first_frames,
             }
         }))
     }

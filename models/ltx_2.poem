@@ -312,6 +312,7 @@ def generative(m):
             channels = d.channels,
             spatial_compression = VAE_SPATIAL_COMPRESSION,
             temporal_compression = VAE_TEMPORAL_COMPRESSION,
+            first_frames = 1,
         ),
         schedule = schedule("flow", shift = 1.0, train_steps = TRAIN_STEPS, pinned_sigmas = DISTILLED_SIGMAS),
     )

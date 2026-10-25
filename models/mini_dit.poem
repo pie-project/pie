@@ -113,6 +113,7 @@ def generative(m):
             channels = CHANNELS,
             spatial_compression = 1,
             temporal_compression = 1,
+            first_frames = 1,
         ),
         schedule = schedule("flow", shift = 1.0, train_steps = 1000, pinned_sigmas = [1.0, 0.75, 0.5, 0.25]),
     )

@@ -21,42 +21,30 @@ context lane, times the submit depth.
 
 ## Standard input names
 
-Like `text-to-image`, this binds a model's inputs by name: `latents` (the
-VAE's own `[t, h, w, C]` latent, on the voxel axis), `timestep` and
-`guidance` (one value a lane) and `context` (the text encoder's hidden rows,
-on the prompt lane). They are a convention between a model and its
-model-agnostic guests, not runtime vocabulary. A lane binds exactly the
-inputs `model::lane_of` says it reads; one it reads by any other name is
-refused by name, never zero-filled. No positions: the model computes its own
-and patches its own latent.
+As `text-to-image`: `latents` (the VAE's own `[t, h, w, C]` latent, on the
+voxel axis), `timestep`, `guidance`, `context` and `length`. A lane binds
+exactly the inputs `model::lane_of` says it reads; any other name is refused.
 
 ## The path
 
-Text encoder, then `steps` denoise fires, down one pipeline. The encoder's
-rows stay on the device, zero-padded there by an ETA copy to the rows the
-`context` input states (`input-decl.rows`: Wan 2.2's `exact(512)`, whose reference
-zero-pads umT5's answer and attends every pad row). The encoder's epilogue
-draws the latent from a keyed `normal` on the device (or noises the encoded
-init clip to the schedule's first sigma) and seeds the loop's clock; each
-denoise epilogue integrates one Euler step, guided `u + s (c - u)` when a
-negative prompt adds a second attention group to the pass. The last fire also
-lands the latent on a host-read channel, because the decode below takes it
-frame by frame from the guest until the decode reads it on the device.
+Text encoder, `steps` denoise fires, then the decode, down one pipeline,
+with nothing read back but the decoded frames as host-side `frames` handles.
+The VAE readings are `vae.decode` / `vae.encode`; their stream is the one
+whose lane reads one clip on the voxel axis.
 
-### The frame lattice is refused, not rounded
+### Frames come from the latent space
 
-A causal video VAE decodes one latent frame a fire on one working set, and
-the first fire on it (the model's `fresh` switch) lands ONE output frame while
-each later one lands `temporal-compression`. So `T` latent frames are
-`1 + tc*(T - 1)` output frames and nothing else — 1, 5, 9, 13, 17, ..., 49 at
-`tc = 4`. A `--frames` off that lattice is refused with the two nearest values
-that are on it. The decode fires go down one pipeline on one working set (the
-conv caches are its state); video2video's encode is the same read backwards.
+The decode fires once per latent frame on one working set. `model::latent()`
+says how many pixel frames each latent frame stands for: `first-frames` for
+the first, `temporal-compression` for each later one. A `--frames` that is
+not `first + tc*(T - 1)` is refused with the two nearest values. Each fire's
+pixels are taken as a `frames` handle (`take_frames`) and the clip is their
+`frames.concat`. Video2video encodes the init clip in the same chunks, each
+fire scattering its latent frame into a device channel the first denoise
+fire reads.
 
-### The pixels do cross into WASM here
-
-A clip is several decode fires and each chunk is taken with `take_host` and
-assembled into one handle with `frames.from-rgb8`.
+The defaults (832x480, 17 frames, 24 fps) are plain CLI defaults; no model
+states them.
 
 ### `--prompt-ids`, and why the row that needs it needs it
 

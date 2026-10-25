@@ -29,14 +29,15 @@ refused by name.
 
 ## Standard input names
 
-The sampler binds a model's inputs by name, and knows four:
+The sampler binds a model's inputs by name, and knows five:
 
 | input | what this guest puts there |
 |---|---|
 | `latents` | the latent, the VAE's own `[h, w, C]`, on the voxel axis |
 | `timestep` | the step's timestep, one value a lane |
 | `guidance` | the guidance scale, one value a lane, when the model takes it |
-| `context` | the text encoder's hidden rows, on the prompt lane |
+| `context` | the text encoder's hidden rows, zero-padded to the rows the input states |
+| `length` | the prompt's own row count before that pad, one value a lane |
 
 These names are a convention between a model and the model-agnostic guests
 that drive it, not runtime vocabulary: the runtime checks a channel against
@@ -55,12 +56,13 @@ one is comes from what its lanes bind (`model::lane_of`):
 | text encoder | a lane that `embeds` and reads out `Hidden` |
 | denoiser | a token-less lane that reads `latents` and reads out `Velocity` |
 | the latent / prompt lane | the `stream` whose lane reads `latents` / `context` |
-| a bridge | a token-less `Hidden` reading that turns the encoder's rows into the width `context` takes (Z-Image's `refine`) |
+| a bridge | when the encoder's width is not `context`'s: a token-less `Hidden` reading of `context`'s width whose one non-standard input is a row input of the encoder's width |
 | VAE decode / encode | `vae.decode` / `vae.encode` |
 
 The latent's size comes from `model::latent()` (channels and spatial
-compression), the step count and trajectory from `model::schedule()`. A model
-with no text reading is refused BY NAME ("this model has no text reading"),
+compression), the step count and trajectory from `model::schedule()`, whose
+kind must be `flow`: the sampler is Euler on a rectified flow. The velocity
+readout must be as wide as the latent's channels. A model with no text reading is refused BY NAME ("this model has no text reading"),
 which is the right answer for the `mini-dit` fixture.
 
 ## One pipeline, nothing back

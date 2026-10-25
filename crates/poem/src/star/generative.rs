@@ -66,11 +66,13 @@ pub(crate) fn generative(builder: &mut GlobalsBuilder) {
         #[starlark(require = named)] channels: u32,
         #[starlark(require = named)] spatial_compression: u32,
         #[starlark(require = named)] temporal_compression: u32,
+        #[starlark(require = named)] first_frames: u32,
     ) -> anyhow::Result<Stated> {
         Ok(Stated(Fact::Latent(LatentSpace {
             channels,
             spatial_compression,
             temporal_compression,
+            first_frames,
         })))
     }
 

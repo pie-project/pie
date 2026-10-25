@@ -267,14 +267,17 @@ export interface LaneDecl {
  * `architecture()`: its latent space and the schedule it was trained
  * under. A text model answers `none` to each.
  * The latent space a denoiser works in, the VAE's own: a `[t, h, w,
- * channels]` volume, one cell `spatial-compression²` pixels by
- * `temporal-compression` frames. How the denoiser patches it is the
- * model's business, not the guest's. `none` for a model with no latent.
+ * channels]` volume, one cell `spatial-compression²` pixels. Latent
+ * frame 0 stands for `first-frames` pixel frames and every later one for
+ * `temporal-compression` (a causal VAE keeps its first frame alone: 1).
+ * How the denoiser patches it is the model's business, not the guest's.
+ * `none` for a model with no latent.
  */
 export interface LatentSpace {
   channels: number,
   spatialCompression: number,
   temporalCompression: number,
+  firstFrames: number,
 }
 /**
  * The prediction target a schedule's velocity is.
