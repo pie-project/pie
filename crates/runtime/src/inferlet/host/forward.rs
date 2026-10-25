@@ -765,6 +765,15 @@ impl ProcessCtx {
             };
             attached.push(encoded);
         }
+        // A span's tokens ride one fire.
+        let max_rows = crate::engine::get_spec(0)?.limits.max_forward_tokens;
+        if let Some(span) = attached.iter().find(|s| s.token_count as usize > max_rows) {
+            return Ok(Err(format!(
+                "lane {lane}'s media span is {} tokens and one fire carries at most {max_rows}; \
+                 a span rides one fire, so encode it smaller",
+                span.token_count
+            )));
+        }
         let pass = self.ctx().table.get_mut(&this)?;
         if pass.is_bound() {
             return Ok(Err("forward pass program is already attached".to_string()));
