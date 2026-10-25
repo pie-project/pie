@@ -46,27 +46,36 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
     let latent = facts.latent.as_ref().expect("a latent space");
     assert_eq!(
         (latent.channels, latent.spatial_compression),
-        (model::IN_CHANNELS, model::TOKEN_COMPRESSION)
+        (model::VAE_CHANNELS, model::VAE_COMPRESSION),
+        "the public latent is the VAE's own 32 channels at /8"
     );
     assert_eq!(
         model::VAE_CHANNELS * model::PACK * model::PACK,
         model::IN_CHANNELS,
-        "the port's 128 channels ARE the VAE's 32 packed 2x2"
+        "the denoiser's 128-wide rows are the VAE's 32 channels packed 2x2"
     );
 
     assert!(
         !readings(MINI).iter().any(|r| r.starts_with("vae.")),
         "the miniature has no VAE"
     );
-    assert!(
-        !trace(MINI).values.iter().any(|v| matches!(
-            v.def,
+    let mini = trace(MINI);
+    let voxel_ports: Vec<&str> = mini
+        .values
+        .iter()
+        .filter_map(|v| match &v.def {
             Def::Input(poem::RuntimeInput::Guest {
+                id,
                 axis: InputAxis::Voxel,
                 ..
-            })
-        )),
-        "and reads no voxel port"
+            }) => Some(mini.inputs[*id as usize].name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        voxel_ports,
+        vec!["latents"],
+        "and reads no voxel port but the denoiser's latent"
     );
 }
 
@@ -89,7 +98,8 @@ fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
     assert_eq!(
         ports,
         vec![
-            ("latent", model::IN_CHANNELS, Dtype::Bf16),
+            ("latent", model::VAE_CHANNELS, Dtype::Bf16),
+            ("latents", model::VAE_CHANNELS, Dtype::Bf16),
             ("pixels", vae::RGB, Dtype::Bf16)
         ]
     );
@@ -120,7 +130,7 @@ fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
     };
     let mut want = vec![
         plane(Dim::VoxelsTimes(256), u64::from(vae::RGB)),
-        plane(Dim::Voxels, u64::from(model::IN_CHANNELS)),
+        plane(Dim::VoxelsTimes(4), u64::from(model::VAE_CHANNELS)),
     ];
     want.sort_by_key(|ty| format!("{ty:?}"));
     assert_eq!(planes, want);
@@ -232,9 +242,13 @@ fn the_shapes_are_the_flux2_autoencoders() {
     }
     assert_eq!(attentions, 2, "one mid-block attention per reading");
     assert_eq!(upsamples, 3);
-    assert_eq!(copies, 1, "the decode arm's one fresh copy of the port");
+    assert_eq!(copies, 0, "the decode's pack is its fresh copy of the port");
     assert_eq!(strided, 3);
-    assert_eq!((shuffles, unshuffles), (1, 1), "the 2x2 packing, both ways");
+    assert_eq!(
+        (shuffles, unshuffles),
+        (2, 2),
+        "each reading packs 2x2 for the batch norm and unpacks after"
+    );
     assert_eq!(convs, 64);
     assert_eq!(norms, 52);
     assert_eq!(silu_off, 2, "only the attention's norm has no SiLU");
