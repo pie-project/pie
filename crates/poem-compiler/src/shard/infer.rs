@@ -8,8 +8,9 @@
 //! of the sum, which the shard pass reduces. A weight an op reads beside a
 //! share (a bias, a head's sink) is cut as that share is.
 //!
-//! A row norm with a gain over a share norms it where it is, each rank's
-//! sum of squares summed across the ranks, its gain cut as the share is.
+//! A row norm over a share no product reads norms it where it is, each
+//! rank's sum of squares summed across the ranks, its gain cut as the
+//! share is; a pre-norm, whose row a product reads, wants it whole.
 //!
 //! A column cut is kept only where its share reaches row cuts and nothing
 //! that wants it whole: a share that meets an op with no rule, a whole
@@ -186,6 +187,8 @@ struct Reading<'t> {
     tied: BTreeSet<usize>,
     /// Products whose output is the logits.
     logits: BTreeSet<usize>,
+    /// Values a product contracts as its activation.
+    contracted: BTreeSet<ValueId>,
 }
 
 impl<'t> Reading<'t> {
@@ -221,15 +224,17 @@ impl<'t> Reading<'t> {
             }
         }
         let mut looked = BTreeSet::new();
-        let mut contracted = BTreeSet::new();
+        let mut contracted_params = BTreeSet::new();
         let mut logits = BTreeSet::new();
+        let mut contracted = BTreeSet::new();
         for node in &trace.nodes {
             let t = tree::of(&node.op);
             match rules::rule(&node.op) {
                 Rule::Lookup { table } => looked.extend(param_of(trace, &t, table)),
-                Rule::Contract { w, .. } => {
+                Rule::Contract { act, w, .. } => {
+                    contracted.extend(tree::field(&t, act).map(tree::ids).unwrap_or_default());
                     let p = param_of(trace, &t, w);
-                    contracted.extend(p);
+                    contracted_params.extend(p);
                     if tree::field(&t, "logits") == Some(&Tree::Bool(true)) {
                         logits.extend(p);
                     }
@@ -241,8 +246,9 @@ impl<'t> Reading<'t> {
             trace,
             owner,
             logical,
-            tied: looked.intersection(&contracted).copied().collect(),
+            tied: looked.intersection(&contracted_params).copied().collect(),
             logits,
+            contracted,
         }
     }
 }
@@ -500,19 +506,19 @@ impl<'r, 't> Walk<'r, 't> {
             }
             return;
         }
-        let held = match rules::rule(op) {
+        let held = match rules::rule_of(op, |v| self.width(v)) {
             Rule::Groups => {
                 // Group indices read no value; they follow whatever the
                 // grouped product groups.
                 self.groups.extend(outs.iter().copied());
                 vec![Held::Whole; outs.len()]
             }
-            // A row norm with a gain over a share norms it there (q and k
-            // normed across their heads), its sum of squares summed across
-            // the ranks, its gain cut as the share is. One without a gain
-            // (a residual stream's pre-norm) wants its row whole.
+            // A row norm over a share norms it there (q and k normed across
+            // their heads), its sum of squares summed across the ranks, its
+            // gain cut as the share is. One whose row a product reads (a
+            // pre-norm) wants its row whole, as the product's activation.
             Rule::Norm
-                if !field("weight").is_empty()
+                if !outs.iter().any(|o| self.reading.contracted.contains(o))
                     && matches!(
                         field("x").first().map(|x| self.held(*x)),
                         Some(Held::Split(_))
