@@ -2173,10 +2173,9 @@ impl Shell {
             }
         }
 
+        // The epilogues read the forward's planes through their addresses.
         #[cfg(target_vendor = "apple")]
-        {
-            let _ = frame.next_pass()?;
-        }
+        frame.barrier(&self.device)?;
 
         let mut owed = Vec::with_capacity(prepared.attachments.len());
         match self.stage_epilogues(

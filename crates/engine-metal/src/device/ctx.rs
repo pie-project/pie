@@ -14,7 +14,7 @@ use objc2_foundation::NSString;
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
     MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState,
-    MTLCreateSystemDefaultDevice, MTLDevice, MTLGPUFamily, MTLResourceOptions, MTLSize,
+    MTLCreateSystemDefaultDevice, MTLDevice, MTLEvent, MTLGPUFamily, MTLResourceOptions, MTLSize,
 };
 
 static RESERVATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -108,6 +108,9 @@ pub struct Context {
     /// driver. `None` inside once opened means the device is not Metal 4.
     #[cfg(target_vendor = "apple")]
     sparse: std::cell::OnceCell<Option<std::sync::Arc<super::sparse::Sparse>>>,
+    /// What [`Frame::barrier`] signals and waits on, and the value it last set.
+    #[cfg(target_vendor = "apple")]
+    barrier: (Retained<ProtocolObject<dyn MTLEvent>>, std::cell::Cell<u64>),
 }
 
 // SAFETY: `MTLDevice` and `MTLCommandQueue` are documented thread-safe.
@@ -164,6 +167,10 @@ impl Context {
             });
             let working_set = device.recommendedMaxWorkingSetSize();
             let max_buffer = device.maxBufferLength() as u64;
+            let barrier = device.newEvent().ok_or(Fault::Device {
+                call: "newEvent",
+                why: "the device would not open an event".to_string(),
+            })?;
             Ok(Context {
                 device,
                 queue,
@@ -173,6 +180,7 @@ impl Context {
                 cores,
                 family,
                 sparse: std::cell::OnceCell::new(),
+                barrier: (barrier, std::cell::Cell::new(0)),
             })
         }
         #[cfg(not(target_vendor = "apple"))]
@@ -502,6 +510,26 @@ impl Frame {
             })?;
         *self.encoder.get_mut() = Some(encoder);
         Ok(self.encoder.get_mut().as_deref().expect("just opened"))
+    }
+
+    /// Ends the pass here and opens the next once the GPU has done all the
+    /// work before it: a pass that reads through an address, which Metal
+    /// tracks no hazard by, sees what the passes before it wrote.
+    #[cfg(target_vendor = "apple")]
+    pub(crate) fn barrier(&mut self, context: &Context) -> Result<()> {
+        self.end_pass();
+        let (event, last) = &context.barrier;
+        let value = last.get() + 1;
+        last.set(value);
+        let buffer = self.buffer.get_mut();
+        buffer.encodeSignalEvent_value(event, value);
+        buffer.encodeWaitForEvent_value(event, value);
+        let encoder = buffer.computeCommandEncoder().ok_or(Fault::Device {
+            call: "computeCommandEncoder",
+            why: "the command buffer would not open a compute pass after a barrier".to_string(),
+        })?;
+        *self.encoder.get_mut() = Some(encoder);
+        Ok(())
     }
 
     /// Ends the pass here and opens the next, with an event between them
