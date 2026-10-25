@@ -60,6 +60,25 @@ class InputAxis(Enum):
     ROW = 1
     VOXEL = 2
 
+
+@dataclass
+class RowCount_Exact:
+    value: int
+
+
+@dataclass
+class RowCount_Multiple:
+    value: int
+
+
+RowCount = Union[RowCount_Exact, RowCount_Multiple]
+"""
+The rows a lane binding an input carries, as the model states them:
+exactly `n`, or the fewest that are a multiple of `n` and hold the
+guest's own. The guest pads its rows to them with zeros, on device.
+"""
+
+
 @dataclass
 class InputDecl:
     """
@@ -68,14 +87,15 @@ class InputDecl:
     for an i32 one; the host marshals to the model's own element type).
     One name is one input wherever the model reads it. `rows` is the row
     count a lane binding it carries when the family fixes it (Wan 2.2's
-    512 context rows: its reference zero-pads umT5's answer to 512 and
-    attends every pad row), `none` nearly always.
+    `exact(512)` context rows: its reference zero-pads umT5's answer to
+    512 and attends every pad row; Z-Image's `multiple(32)` caption rows),
+    `none` nearly always.
     """
     name: str
     axis: InputAxis
     width: int
     dtype: pie_inferlet_types.Dtype
-    rows: Optional[int]
+    rows: Optional[RowCount]
 
 @dataclass
 class Readout:

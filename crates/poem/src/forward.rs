@@ -468,7 +468,9 @@ impl Input {
 
     /// The input `name` the guest binds: `width` values of `dtype` a lane,
     /// a row or a voxel of these rows (`axis`). One name is one input
-    /// wherever it is read; `rows` fixes the rows a lane binding it carries.
+    /// wherever it is read; `rows` states the rows a lane binding it carries
+    /// (exactly `n`, or the fewest that are a multiple of `n`), which its
+    /// guest pads to.
     #[must_use]
     pub fn input(
         &self,
@@ -476,7 +478,7 @@ impl Input {
         dtype: Dtype,
         axis: InputAxis,
         width: u32,
-        rows: Option<u32>,
+        rows: Option<poem_ir::RowCount>,
     ) -> Value {
         assert!(
             matches!(dtype, Dtype::F32 | Dtype::Bf16 | Dtype::I32),

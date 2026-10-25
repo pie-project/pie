@@ -103,13 +103,36 @@ fn the_latent_is_patched_in_the_graph_and_the_positions_follow_the_caption() {
             .collect();
         assert_eq!(
             cells,
-            vec![0, 0],
-            "{deployment}: a caption row runs down time, both readings"
+            vec![0, 0, 0],
+            "{deployment}: a caption row runs down time: the refine's, the context's and the image's"
         );
         assert_eq!(
             count(&|op| matches!(op, Operation::Gather(Gather::GroupRows { .. }))),
             1,
             "{deployment}: the image follows its group's caption rows"
+        );
+        for name in ["caption", "context"] {
+            let input = plan
+                .inputs
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap_or_else(|| panic!("{deployment}: no `{name}` input"));
+            assert_eq!(
+                input.rows,
+                Some(poem_ir::RowCount::Multiple(32)),
+                "{deployment}: `{name}` is padded to a multiple of 32 rows, as the reference pads"
+            );
+        }
+        let length = plan
+            .inputs
+            .iter()
+            .position(|i| i.name == "length")
+            .expect("a length input");
+        assert!(
+            plan.values.iter().any(|v| matches!(v.def,
+                Def::Input(RuntimeInput::Guest { id, axis: InputAxis::Lane, width: 1, .. })
+                    if id as usize == length)),
+            "{deployment}: a padded lane states its own rows, one value a lane"
         );
         let latents = plan
             .inputs
@@ -436,7 +459,7 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
         let plan = trace(deployment, Platform::Cuda);
         let d = dims(deployment);
         let ty = |id: ValueId| plan.values[id.0 as usize].ty.clone();
-        let mut lane_scales = 0usize;
+        let (mut lane_scales, mut row_pads) = (0usize, 0usize);
         for node in &plan.nodes {
             let Operation::Elemwise(Elemwise::Modulate {
                 x,
@@ -455,31 +478,44 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
                     dtype: Dtype::Bf16,
                 }
             );
-            let lanes = lane_of_row
-                .as_ref()
-                .expect("every modulation is per lane: nothing pads rows");
-            lane_scales += 1;
-            assert_eq!(*form, poem::ModulateForm::Scale);
-            assert_eq!(
-                ty(*m),
-                Ty::Tensor {
-                    shape: vec![Dim::Lanes, Dim::Const(u64::from(d.dim))],
-                    dtype: Dtype::F32,
+            match lane_of_row {
+                Some(lanes) => {
+                    lane_scales += 1;
+                    assert_eq!(*form, poem::ModulateForm::Scale);
+                    assert_eq!(
+                        ty(*m),
+                        Ty::Tensor {
+                            shape: vec![Dim::Lanes, Dim::Const(u64::from(d.dim))],
+                            dtype: Dtype::F32,
+                        }
+                    );
+                    assert_eq!(
+                        plan.values[lanes.0 as usize].def,
+                        Def::Input(RuntimeInput::Geometry {
+                            space: 0,
+                            kind: GeomKind::RequestOfToken
+                        })
+                    );
                 }
-            );
-            assert_eq!(
-                plan.values[lanes.0 as usize].def,
-                Def::Input(RuntimeInput::Geometry {
-                    space: 0,
-                    kind: GeomKind::RequestOfToken
-                })
-            );
+                None => {
+                    row_pads += 1;
+                    assert_eq!(*form, poem::ModulateForm::ScaleShift);
+                    assert_eq!(
+                        ty(*m),
+                        Ty::Tensor {
+                            shape: vec![Dim::Tokens, Dim::Const(u64::from(2 * d.dim))],
+                            dtype: Dtype::F32,
+                        },
+                        "{deployment}: the pad flag projects per row, in f32"
+                    );
+                }
+            }
         }
         let modulated = (d.refiner_layers + d.joint_layers) as usize;
         assert_eq!(
-            lane_scales,
-            2 * modulated + 1,
-            "{deployment}: the caption and the image carry their own rows, no pads"
+            (lane_scales, row_pads),
+            (2 * modulated + 1, 1),
+            "{deployment}: only the caption pads; an image lane carries its patches alone"
         );
 
         let mut folds = 0usize;

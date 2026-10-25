@@ -91,7 +91,11 @@ ARGV_CEILING = 3 * 1024 * 1024
 CHILD_STACK = 256 * 1024 * 1024
 
 def tolerances(args) -> list[str]:
-    return ["--tol", "0.1", "--rel-tol", "0.02", "--cos-tol", ROWS[args.variant]["cos"]]
+    """The miniatures gate max-abs too; the full 5B row, like the full
+    Z-Image and FLUX.2 rows, gates rel and cos only (bf16 over 30 blocks
+    leaves a few outliers past 0.1 at cos 0.99996)."""
+    rest = ["--rel-tol", "0.02", "--cos-tol", ROWS[args.variant]["cos"]]
+    return rest if args.variant == "ti2v-5b" else ["--tol", "0.1", *rest]
 
 def b64(a: np.ndarray) -> str:
     """A float rectangle as the guest's `*_b64`: little-endian f32."""

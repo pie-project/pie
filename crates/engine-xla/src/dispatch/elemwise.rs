@@ -322,32 +322,42 @@ impl Run<'_> {
                     l.land(o_o, v)
                 })
             }
+            Elemwise::Act {
+                x,
+                x_out: _,
+                s: None,
+                scale: None,
+                act: poem_ir::ActFn::Sqrt,
+                ..
+            } => {
+                let x = self.tensor(*x);
+                crate::lower::lower(self.ctx(), |l| {
+                    let x_v = l.read(x)?;
+                    let o_o = x;
+                    let v = elemwise::act::sqrt(l.f(), x_v, o_o.landing())?;
+                    l.land(o_o, v)
+                })
+            }
             Elemwise::Binary {
                 x,
                 y,
                 z,
-                op: poem_ir::BinaryOp::Mul,
-                ..
-            } => crate::lower::lower(self.ctx(), |l| {
-                let x_v = l.read(self.tensor(*x))?;
-                let y_v = l.read(self.tensor(*y))?;
-                let o_z = self.tensor(*z);
-                let v = elemwise::act::mul(l.f(), x_v, y_v, o_z.landing())?;
-                l.land(o_z, v)
-            }),
-            Elemwise::Binary {
-                x,
-                y,
-                z,
-                op: poem_ir::BinaryOp::Add,
-                ..
-            } => crate::lower::lower(self.ctx(), |l| {
-                let x_v = l.read(self.tensor(*x))?;
-                let y_v = l.read(self.tensor(*y))?;
-                let o_z = self.tensor(*z);
-                let v = elemwise::act::add(l.f(), x_v, y_v, o_z.landing())?;
-                l.land(o_z, v)
-            }),
+                op: binary,
+            } => {
+                let combine = match binary {
+                    poem_ir::BinaryOp::Add => elemwise::act::add,
+                    poem_ir::BinaryOp::Mul => elemwise::act::mul,
+                    poem_ir::BinaryOp::Div => elemwise::act::div,
+                    poem_ir::BinaryOp::Mod => elemwise::act::modulo,
+                };
+                crate::lower::lower(self.ctx(), |l| {
+                    let x_v = l.read(self.tensor(*x))?;
+                    let y_v = l.read(self.tensor(*y))?;
+                    let o_z = self.tensor(*z);
+                    let v = combine(l.f(), x_v, y_v, o_z.landing())?;
+                    l.land(o_z, v)
+                })
+            }
             Elemwise::RopeAxes {
                 x,
                 positions,

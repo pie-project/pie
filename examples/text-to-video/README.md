@@ -34,7 +34,7 @@ and patches its own latent.
 
 Text encoder, then `steps` denoise fires, down one pipeline. The encoder's
 rows stay on the device, zero-padded there by an ETA copy to the rows the
-`context` input states (`input-decl.rows`: Wan 2.2's 512, whose reference
+`context` input states (`input-decl.rows`: Wan 2.2's `exact(512)`, whose reference
 zero-pads umT5's answer and attends every pad row). The encoder's epilogue
 draws the latent from a keyed `normal` on the device (or noises the encoded
 init clip to the schedule's first sigma) and seeds the loop's clock; each

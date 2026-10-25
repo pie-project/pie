@@ -125,6 +125,8 @@ __global__ void add_bias(
 
 constexpr int kBinAdd = 0;
 constexpr int kBinMul = 1;
+constexpr int kBinDiv = 2;
+constexpr int kBinMod = 3;
 
 template <class T, int OP>
 __global__ void binary(
@@ -145,11 +147,17 @@ __global__ void binary(
 
     const float a = Elem<T>::to_f32(x[at]);
     const float b = Elem<T>::to_f32(y[at]);
-    o[at] = Elem<T>::from_f32(OP == kBinAdd ? a + b : a * b);
+    float r;
+    if (OP == kBinAdd) r = a + b;
+    else if (OP == kBinMul) r = a * b;
+    else if (OP == kBinDiv) r = a / b;
+    else r = a - b * floorf(a / b);
+    o[at] = Elem<T>::from_f32(r);
 }
 
 constexpr int kActSilu = 0;
 constexpr int kActTanh = 1;
+constexpr int kActSqrt = 2;
 
 template <class T, int ACT>
 __global__ void activation(
@@ -168,7 +176,8 @@ __global__ void activation(
 
     const float v = Elem<T>::to_f32(x[at]);
 
-    o[at] = Elem<T>::from_f32(ACT == kActSilu ? v / (1.f + __expf(-v)) : tanhf(v));
+    o[at] = Elem<T>::from_f32(ACT == kActSilu ? v / (1.f + __expf(-v))
+                              : ACT == kActTanh ? tanhf(v) : sqrtf(v));
 }
 
 template <class T>

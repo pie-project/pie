@@ -271,6 +271,16 @@ fn denoise_reading() -> Result<Denoise> {
     Err("this model declares no token-less reading of `latents` with a velocity readout".into())
 }
 
+/// The rows a lane of `len` rows of its own carries under the model's
+/// `input-decl.rows`, `None` when they do not fit.
+fn padded(rows: Option<model::RowCount>, len: u32) -> Option<u32> {
+    match rows {
+        None => Some(len),
+        Some(model::RowCount::Exact(n)) => (len <= n).then_some(n),
+        Some(model::RowCount::Multiple(n)) => len.checked_next_multiple_of(n),
+    }
+}
+
 /// `rows` rows of `width` out of `h`'s first `len`, the rest zero: the
 /// context pad a model states with `input-decl.rows`, done on the device.
 fn pad_rows(h: &Tensor, len: u32, rows: u32, width: u32) -> Tensor {
@@ -316,14 +326,12 @@ fn encode(
             format!("the prompt is {len} tokens and one pass reads out {cap} hidden rows").into(),
         );
     }
-    let rows = context.rows.unwrap_or(len);
-    if len > rows {
-        return Err(format!(
-            "input `{}` takes exactly {rows} context rows and the prompt is {len} tokens",
-            context.name
+    let rows = padded(context.rows, len).ok_or_else(|| {
+        format!(
+            "input `{}` takes {:?} context rows and the prompt is {len} tokens",
+            context.name, context.rows
         )
-        .into());
-    }
+    })?;
     let ids: Vec<i32> = ids
         .iter()
         .map(|&id| i32::try_from(id).unwrap_or(0))

@@ -252,6 +252,8 @@ HALF_PI = 1.5707963267948966
 PATCH = [PATCH_T, PATCH_H, PATCH_W]
 ROPE_BASE_T = 20.0
 ROPE_BASE_HW = 2048.0
+# The text connectors' rope base length (`connector_rope_base_seq_len`).
+CONN_ROPE_BASE = 4096.0
 CAUSAL_OFFSET = 1
 AUDIO_COMPRESSION = 4
 AUDIO_HOP_SECONDS = 160.0 / 16000.0
@@ -526,10 +528,9 @@ def forward(m, inputs):
     switch("stream", ["video", "audio", "context", "reference"])
     switch("positions", ["computed", "given"])
     reading = lambda name: inputs.on(switch_is("reading", name))
-    text_in = m.dims.text_in
     video, audio = m.connectors
-    refine(reading("refine.video"), video, text_in)
-    refine(reading("refine.audio"), audio, text_in)
+    refine(reading("refine.video"), video, m)
+    refine(reading("refine.audio"), audio, m)
     velocity = denoise(reading("denoise"), m)
     if m.vae != None:
         vae_decode(reading("vae.decode"), m.vae)
@@ -659,7 +660,7 @@ def causal_mid(index, k, start, end):
 
 def video_positions(rows, m):
     """Each video row's `(t, h, w)` rope position: its patch's pixel-space
-    midpoint (time in seconds, from the lane's `frame_period`, 1 / fps), as
+    midpoint (time in seconds, from the lane's `fps`), as
     `(2·coordinate / base - 1)·π/2`. A `given` lane reads the guest's."""
     given = switch_is("positions", "given")
     stated = rows.on(given).input("positions", dtype.f32, "row", m.rope_axes)
@@ -668,8 +669,8 @@ def video_positions(rows, m):
     t, hw = ops.gather.split_rows(cells, 1)
     c = m.rope
     span = causal_mid(t, VAE_TEMPORAL_COMPRESSION, c.video_start, c.video_end)
-    period = ops.gather.gather_rows(rows.input("frame_period", dtype.f32, "lane", 1), rows.request_of_token())
-    t = ops.elemwise.mul_scalar(f32(0.5 * HALF_PI * 2.0 / ROPE_BASE_T), ops.elemwise.mul(span, period))
+    fps = ops.gather.gather_rows(rows.input("fps", dtype.f32, "lane", 1), rows.request_of_token())
+    t = ops.elemwise.mul_scalar(f32(0.5 * HALF_PI * 2.0 / ROPE_BASE_T), ops.elemwise.div(span, fps))
     t = ops.elemwise.add_bias(c.minus_half_pi, t)
     scale = f32(HALF_PI * 2.0 * float(VAE_SPATIAL_COMPRESSION) / ROPE_BASE_HW)
     hw = ops.elemwise.add_bias(c.hw_bias, ops.elemwise.mul_scalar(scale, hw))
@@ -750,10 +751,22 @@ def denoise(arm, m):
     seam.at(seam.VELOCITY, [velocity])
     return velocity
 
-def refine(arm, conn, text_in):
+def text_positions(arm, m):
+    """Each prompt row's rope position: its row `j` over the connectors'
+    base length, as `(2·j / base - 1)·π/2`. A `given` lane reads the
+    guest's."""
+    given = switch_is("positions", "given")
+    stated = arm.on(given).input("text_positions", dtype.f32, "row", 1)
+    rows = arm.on(~given)
+    j, _ = ops.gather.split_rows(ops.conv.cells(rows.token_grid(PATCH), rows.positions(), 0), 1)
+    t = ops.elemwise.mul_scalar(f32(HALF_PI * 2.0 / CONN_ROPE_BASE), j)
+    return merge([stated, ops.elemwise.add_bias(m.rope.minus_half_pi, t)])
+
+def refine(arm, conn, m):
+    text_in = m.dims.text_in
     g = struct(
         lanes = arm.request_of_token(),
-        positions = arm.input("text_positions", dtype.f32, "row", 1),
+        positions = text_positions(arm, m),
         perm = arm.row_permutation(),
         csr = arm.lane_indptr(),
     )

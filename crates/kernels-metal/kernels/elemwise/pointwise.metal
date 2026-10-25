@@ -20,6 +20,27 @@ template <typename T>
   o[gid] = static_cast<T>(float(x[gid]) * float(y[gid]));
 }
 
+template <typename T>
+[[kernel]] void binary_div(
+    const device T* x  [[buffer(0)]],
+    const device T* y  [[buffer(1)]],
+    device T* o        [[buffer(2)]],
+    uint gid           [[thread_position_in_grid]]) {
+  o[gid] = static_cast<T>(float(x[gid]) / float(y[gid]));
+}
+
+// Floored: x - y·floor(x / y), as Python's `%`.
+template <typename T>
+[[kernel]] void binary_mod(
+    const device T* x  [[buffer(0)]],
+    const device T* y  [[buffer(1)]],
+    device T* o        [[buffer(2)]],
+    uint gid           [[thread_position_in_grid]]) {
+  const float a = float(x[gid]);
+  const float b = float(y[gid]);
+  o[gid] = static_cast<T>(a - b * floor(a / b));
+}
+
 #define instantiate_binary(op, name, itype)                          \
   template [[host_name(#op "_" #name)]]                              \
   [[kernel]] void op<itype>(                                         \
@@ -29,6 +50,10 @@ instantiate_binary(binary_add, bfloat16, bfloat)
 instantiate_binary(binary_add, float32, float)
 instantiate_binary(binary_mul, bfloat16, bfloat)
 instantiate_binary(binary_mul, float32, float)
+instantiate_binary(binary_div, bfloat16, bfloat)
+instantiate_binary(binary_div, float32, float)
+instantiate_binary(binary_mod, bfloat16, bfloat)
+instantiate_binary(binary_mod, float32, float)
 
 template <typename T>
 [[kernel]] void act_silu(
@@ -58,6 +83,14 @@ template <typename T>
   o[gid] = static_cast<T>(0.5f * v * (1.0f + precise::tanh(inner)));
 }
 
+template <typename T>
+[[kernel]] void act_sqrt(
+    const device T* x  [[buffer(0)]],
+    device T* o        [[buffer(1)]],
+    uint gid           [[thread_position_in_grid]]) {
+  o[gid] = static_cast<T>(precise::sqrt(float(x[gid])));
+}
+
 #define instantiate_activation(op, name, itype)                      \
   template [[host_name(#op "_" #name)]]                              \
   [[kernel]] void op<itype>(                                         \
@@ -69,6 +102,8 @@ instantiate_activation(act_tanh, bfloat16, bfloat)
 instantiate_activation(act_tanh, float32, float)
 instantiate_activation(act_gelu_tanh, bfloat16, bfloat)
 instantiate_activation(act_gelu_tanh, float32, float)
+instantiate_activation(act_sqrt, bfloat16, bfloat)
+instantiate_activation(act_sqrt, float32, float)
 
 // A blockwise butterfly FWHT over the last dim. The row is cut into contiguous
 // N-vectors (N a power of two) and each is turned by the normalized Sylvester
