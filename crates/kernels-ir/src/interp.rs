@@ -281,7 +281,9 @@ pub fn eval(region: &Region, args: &[Arg]) -> Result<Vec<Vec<f32>>, InterpError>
                     .map(|p| fold(reduce, (p * 8..p * 8 + 8).map(|e| at(&vals, input, e).f())))
                     .collect();
                 butterfly(reduce, size / 8, &mut partials);
-                (0..width).map(|e| V::F(narrowed(partials[e / 8]))).collect()
+                (0..width)
+                    .map(|e| V::F(narrowed(partials[e / 8])))
+                    .collect()
             }
             _ => (0..n)
                 .map(|e| match *op {

@@ -20,7 +20,13 @@
 //!   every printed kernel is held to.
 //! - **The builders** ([`build`]): a row's math (a norm, a head's norm, a
 //!   rotation) as region ops, in the order the hand kernels compute it.
+//! - **The anchored region** ([`anchor`]): a contraction (`y = a · wᵀ`)
+//!   with a region pointwise over its operand tile before it and one over
+//!   its product tile after it, verified to be pointwise there, and its
+//!   interpreter. A backend's contraction frames fill their hooks with the
+//!   regions' printed bodies.
 
+pub mod anchor;
 pub mod build;
 pub mod frame;
 pub mod interp;
@@ -28,6 +34,7 @@ pub mod kernel;
 pub mod region;
 pub mod schedule;
 
+pub use anchor::{Anchored, Contraction, Input, Layout, Pointwise, Quant, Space};
 pub use kernel::{
     Expr, HeadAssign, Kernel, Loop, Operand, Partial, Phase, RowAssign, Table, Total, Uniform,
 };
