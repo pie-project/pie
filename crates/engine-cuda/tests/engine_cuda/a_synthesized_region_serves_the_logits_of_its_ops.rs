@@ -196,37 +196,92 @@ fn bit_for_bit(got: &[Vec<f32>], want: &[Vec<f32>], against: &str) {
     }
 }
 
+const TOKENS: u32 = 256;
+const DECODES: usize = 4;
+
+/// The models served: Qwen3's residual norms, Gemma 4's sandwich norms.
+const MODELS: [&str; 2] = ["qwen3-micro-text", "gemma4-e4b-mini-l1"];
+
+/// `fixture` served under `overrides`: a prefill's logits, then each greedy
+/// decode step's after it; `generates` whether the load generates a kernel.
+fn served(fixture: &Fixture, overrides: &str, generates: bool) -> Vec<Vec<f32>> {
+    let model = fixture.model;
+    let mut shell = load(fixture, overrides, TOKENS);
+    assert_eq!(
+        !shell.regions().is_empty(),
+        generates,
+        "{model} under {overrides:?}: the load generates a kernel exactly where a chain folds"
+    );
+    shell.open(0).expect("slot 0 opens");
+    let mut steps = vec![step(&mut shell, &fixture.trace, &prompt(37)).0];
+    for _ in 0..DECODES {
+        let next = argmax(steps.last().expect("a step"));
+        steps.push(step(&mut shell, &fixture.trace, &[next]).0);
+    }
+    steps
+}
+
 #[test]
 fn a_synthesized_region_serves_the_logits_of_its_ops() {
-    const TOKENS: u32 = 256;
-    const DECODES: usize = 4;
     let _one = serialized();
     if !engine_cuda::device::present() {
         eprintln!("skipping: no CUDA device on this machine");
         return;
     }
-    for model in ["qwen3-micro-text", "gemma4-e4b-mini-l1"] {
+    for model in MODELS {
         let fixture = fixture(model);
-        // A prefill's logits, then each greedy decode step's after it.
-        let served = |overrides: &str, generates: bool| {
-            let mut shell = load(&fixture, overrides, TOKENS);
-            assert_eq!(
-                !shell.regions().is_empty(),
-                generates,
-                "{model} under {overrides:?}: the load generates a kernel exactly where a chain \
-                 folds"
-            );
-            shell.open(0).expect("slot 0 opens");
-            let mut steps = vec![step(&mut shell, &fixture.trace, &prompt(37)).0];
-            for _ in 0..DECODES {
-                let next = argmax(steps.last().expect("a step"));
-                steps.push(step(&mut shell, &fixture.trace, &[next]).0);
-            }
-            steps
-        };
-        let ops = served(OPS, false);
-        let synth = served("", true);
+        let ops = served(&fixture, OPS, false);
+        let synth = served(&fixture, "", true);
         bit_for_bit(&synth, &ops, &format!("{model}'s unfused ops"));
+    }
+}
+
+/// Two models loaded and served at once in one process, a thread each, as a
+/// server holding two models serves them: each answers, bit for bit, what
+/// it answers served alone. Their generated kernels are keyed apart (body,
+/// width, the planes they read) and each load arms and captures its own
+/// graphs while the other's fire.
+///
+/// Ignored beside the other device tests: a load's synchronous copies run
+/// on the legacy stream (`device::alloc`'s `Buffer::write`, `read`,
+/// `copy_d2h`), which waits on every blocking stream of the context, one
+/// another thread is capturing into among them, and so invalidates that
+/// capture (`cudaErrorStreamCaptureInvalidated`, 901; the copy itself
+/// `cudaErrorStreamCaptureImplicit`, 906). Two loads that overlap, one
+/// arming while the other uploads, meet it, and this test makes a load of
+/// its own overlap another test's arming. Run it alone:
+/// `cargo test --release ... -- --ignored two_models_served_at_once`.
+#[test]
+#[ignore = "its loads invalidate other tests' captures: -- --ignored two_models_served_at_once"]
+fn two_models_served_at_once_answer_what_each_answers_alone() {
+    let _one = serialized();
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let fixtures: Vec<Fixture> = MODELS.into_iter().map(fixture).collect();
+    let alone: Vec<Vec<Vec<f32>>> = fixtures.iter().map(|f| served(f, "", true)).collect();
+    // Each loaded and served again and again, so one's loads (its weights'
+    // uploads) land beside the other's arming (its captures) and its fires.
+    const ROUNDS: usize = 4;
+    let together: Vec<Vec<Vec<Vec<f32>>>> = std::thread::scope(|scope| {
+        let serving: Vec<_> = fixtures
+            .iter()
+            .map(|f| scope.spawn(move || (0..ROUNDS).map(|_| served(f, "", true)).collect()))
+            .collect();
+        serving
+            .into_iter()
+            .map(|thread| thread.join().expect("the model serves"))
+            .collect()
+    });
+    for ((fixture, alone), rounds) in fixtures.iter().zip(&alone).zip(&together) {
+        for (round, together) in rounds.iter().enumerate() {
+            bit_for_bit(
+                together,
+                alone,
+                &format!("{} served alone (round {round})", fixture.model),
+            );
+        }
     }
 }
 

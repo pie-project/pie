@@ -28,23 +28,32 @@ pub fn count() -> usize {
     }
 }
 
+/// Whether a CUDA device answers. Probed once a process: the probe quiets the
+/// panic hook while the runtime loads (a missing library panics), and two
+/// threads swapping the process's one hook at once could leave it quiet for
+/// good, every later panic's message lost; so the first caller probes and
+/// the rest read its answer.
 #[must_use]
 pub fn present() -> bool {
     #[cfg(feature = "device")]
     {
-        let hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let probe = std::panic::catch_unwind(|| {
-            let mut count: i32 = 0;
-            // SAFETY: count is a live local, and this is the process's first cudarc call.
-            let status = unsafe { crate::device::rt::cudaGetDeviceCount(&raw mut count) };
-            (status, count)
-        });
-        std::panic::set_hook(hook);
-        matches!(
-            probe,
-            Ok((crate::device::rt::cudaError::cudaSuccess, count)) if count > 0
-        )
+        static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *PRESENT.get_or_init(|| {
+            let hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let probe = std::panic::catch_unwind(|| {
+                let mut count: i32 = 0;
+                // SAFETY: count is a live local, and this is the process's
+                // first cudarc call.
+                let status = unsafe { crate::device::rt::cudaGetDeviceCount(&raw mut count) };
+                (status, count)
+            });
+            std::panic::set_hook(hook);
+            matches!(
+                probe,
+                Ok((crate::device::rt::cudaError::cudaSuccess, count)) if count > 0
+            )
+        })
     }
     #[cfg(not(feature = "device"))]
     {
