@@ -150,10 +150,11 @@ pub struct Epilogue {
 /// stored once to bf16. Its GELU is none of these: its GELU after a bias
 /// lands up to 6 bf16 ulps from the tanh GELU at a prefill's rows (a
 /// 14336-column bank over 5120), past the 3 an epilogue of one product is
-/// held to, and erf's has no cuBLASLt form. An anchored region whose epilogue is one of
-/// these (to within a bf16 rounding: the region rounds the product and the
-/// biased sum where the unfused ops store them) may run as a cuBLASLt
-/// product with it, one more fused candidate the GEMM tuner times.
+/// held to, and erf's has no cuBLASLt form. An anchored region whose
+/// epilogue is one of these over its products as they are summed (its
+/// contraction declares no rounding of them) lands exactly what cuBLASLt
+/// does, and may run as a cuBLASLt product with it: one more fused
+/// candidate the GEMM tuner times.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LtEpilogue {
     Bias,
@@ -179,11 +180,10 @@ impl LtEpilogue {
         }
     }
 
-    /// The one of these `region` lands over one product (and a bias where
-    /// `inputs` is a vector a column), probed by the interpreter across the
-    /// products a bf16 tile holds: each result within two bf16 roundings of
-    /// what cuBLASLt lands (at a half's scale near zero, as the frames'
-    /// tolerances count).
+    /// The one of these `region` lands over one f32 product (and a bias
+    /// where `inputs` is a vector a column), probed by the interpreter over
+    /// products off the bf16 grid: each result the bits cuBLASLt's sum and
+    /// one store land.
     fn matching(region: &Region, inputs: &[Input]) -> Option<LtEpilogue> {
         let biased = match inputs {
             [] => false,
@@ -200,7 +200,7 @@ impl LtEpilogue {
         };
         let bf16 = kernels_ir::frame::round_bf16;
         #[allow(clippy::cast_precision_loss)]
-        let y: Vec<f32> = (0..WIDTH).map(|i| bf16((i as f32 - 31.5) * 0.19)).collect();
+        let y: Vec<f32> = (0..WIDTH).map(|i| (i as f32 - 31.5) * 0.190_137).collect();
         #[allow(clippy::cast_precision_loss)]
         let b: Vec<f32> = (0..WIDTH)
             .map(|i| bf16(((i * 37) % 11) as f32 * 0.21 - 1.0))
@@ -214,12 +214,7 @@ impl LtEpilogue {
         LtEpilogue::ALL
             .into_iter()
             .filter(|lt| lt.biased() == biased)
-            .find(|lt| {
-                (0..WIDTH).all(|i| {
-                    let want = bf16(lt.of(y[i], b[i]));
-                    (landed[i] - want).abs() <= want.abs().max(0.5) / 64.0
-                })
-            })
+            .find(|lt| (0..WIDTH).all(|i| landed[i].to_bits() == bf16(lt.of(y[i], b[i])).to_bits()))
     }
 }
 
@@ -297,7 +292,7 @@ impl Epilogue {
         let body = Body::of(&region).map_err(|why| refuse(OP, why.to_string()))?;
         let plain = anchored.epilogue.is_none();
         let root = unit(&body)?;
-        let lt = if parts == 1 && round && !plain {
+        let lt = if parts == 1 && !round && !plain {
             LtEpilogue::matching(&region, &inputs)
         } else {
             None
@@ -369,6 +364,19 @@ impl Epilogue {
     #[must_use]
     pub const fn lt(&self) -> Option<LtEpilogue> {
         self.lt
+    }
+
+    /// Whether each product rounds to bf16 before the body reads it.
+    #[must_use]
+    pub const fn rounds(&self) -> bool {
+        self.round
+    }
+
+    /// The bytes of one product as the unfused leg lands it: bf16 where
+    /// it rounds, its f32 sum where it does not.
+    #[must_use]
+    pub const fn product_bytes(&self) -> usize {
+        if self.round { 2 } else { 4 }
     }
 
     /// Whether it is the plain store, no epilogue at all.
@@ -486,8 +494,9 @@ impl Epilogue {
             .find(|c| n.is_multiple_of(*c) && (n / c).is_multiple_of(8))?;
         let width = n / slices;
         let bf16 = Dtype::Bf16;
+        let product = if self.round { bf16 } else { Dtype::F32 };
         let ins: Vec<Form> = (0..self.parts)
-            .map(|_| Form::Rows(bf16))
+            .map(|_| Form::Rows(product))
             .chain(self.inputs.iter().map(|input| match input {
                 Input::Tile => Form::Rows(bf16),
                 Input::Column => Form::Shared(bf16),
@@ -751,6 +760,9 @@ impl Frame {
 pub(crate) struct RowLeg {
     kernel: crate::synth::Synthesized,
     parts: u32,
+    /// The products' dtype: bf16, or f32 where the epilogue reads them as
+    /// they are summed.
+    product: Dtype,
     width: u32,
     slices: u32,
 }
@@ -761,7 +773,8 @@ impl RowLeg {
     /// current device, or `None` where the row frame does not carry it
     /// ([`Epilogue::leg`]).
     pub(crate) fn of(epi: &Epilogue, n: u32) -> Option<RowLeg> {
-        /// Each epilogue's leg by body, parts and frame row width.
+        /// Each epilogue's leg by body, parts, the products' rounding and
+        /// frame row width.
         type Legs = HashMap<(u64, u32), Option<RowLeg>>;
         static LEGS: OnceLock<Mutex<Legs>> = OnceLock::new();
         let shape = epi.leg(n)?;
@@ -770,13 +783,17 @@ impl RowLeg {
             .lock()
             .expect("row leg table lock poisoned");
         *legs
-            .entry((epi.body.hash ^ u64::from(epi.parts), shape.width))
+            .entry((
+                epi.body.hash ^ u64::from(epi.parts) ^ (u64::from(epi.round) << 63),
+                shape.width,
+            ))
             .or_insert_with(|| {
                 let kernel = crate::synth::synth(&shape.region, &shape.ins, shape.outs).ok()?;
                 kernel.load().ok()?;
                 Some(RowLeg {
                     kernel,
                     parts: epi.parts,
+                    product: if epi.round { Dtype::Bf16 } else { Dtype::F32 },
                     width: shape.width,
                     slices: shape.slices,
                 })
@@ -797,6 +814,9 @@ impl RowLeg {
         use crate::synth::Plane;
         use crate::tensor::Tensor;
         let rows = |base: u64, stride: u32| Plane::rows(&Tensor::new(base, m, stride, Dtype::Bf16));
+        let products_of =
+            |base: u64, stride: u32| Plane::rows(&Tensor::new(base, m, stride, self.product));
+        let size = self.product.bits() / 8;
         // The leg covers every row its product landed, as the product and
         // the frames do: a staged window's live count would leave rows past
         // it unwritten.
@@ -809,7 +829,10 @@ impl RowLeg {
             // The slice's first column, in bytes.
             let at = u64::from(slice * self.width) * 2;
             let mut planes: Vec<Plane> = (0..self.parts)
-                .map(|p| rows(products + u64::from(p * n) * 2 + at, self.parts * n))
+                .map(|p| {
+                    let from = u64::from(p * n + slice * self.width) * size;
+                    products_of(products + from, self.parts * n)
+                })
                 .collect();
             for input in ins {
                 planes.push(match input.kind() {

@@ -2,7 +2,8 @@
 //! product form an anchor (`fuse::anchor`): one kernels-ir anchored region,
 //! its contraction the matmul and its epilogue the ops, verified pointwise
 //! over the product tile and folded into one `fused.anchored` op where the
-//! backend serves it. The interpreter lands what the ops do.
+//! backend serves it. The product keeps its accumulator through the
+//! epilogue, and the interpreter lands what the ops do over it.
 
 use kernels_ir::anchor::{Given, eval};
 use kernels_ir::frame::round_bf16;
@@ -35,8 +36,8 @@ fn values(count: usize, seed: usize) -> Vec<f32> {
         .collect()
 }
 
-/// `a · wᵀ` summed in f64 and rounded to bf16, as the unfused product
-/// stores it.
+/// `a · wᵀ` summed in f64 and rounded to f32 once, as the interpreter sums
+/// a contraction: the epilogue reads it so, no op between them rounding it.
 fn product(a: &[f32], w: &[f32], [m, n, k]: [usize; 3]) -> Vec<f32> {
     (0..m * n)
         .map(|i| {
@@ -44,7 +45,7 @@ fn product(a: &[f32], w: &[f32], [m, n, k]: [usize; 3]) -> Vec<f32> {
             let dot = (0..k).fold(0f64, |s, j| {
                 s + f64::from(a[row * k + j]) * f64::from(w[col * k + j])
             });
-            round_bf16(dot as f32)
+            dot as f32
         })
         .collect()
 }
@@ -62,6 +63,10 @@ fn a_bias_and_a_soft_cap_are_the_products_epilogue() {
     assert_eq!(anchor.nodes, [0, 1, 2]);
     let c = &anchor.anchored.contraction;
     assert_eq!((c.n, c.k, c.layout), (N as u32, K as u32, Layout::Dense));
+    assert_eq!(
+        c.acc, None,
+        "the product keeps its accumulator through the bias"
+    );
     let epi = anchor.anchored.epilogue.as_ref().expect("an epilogue");
     assert_eq!(epi.inputs, [Input::Column], "the bias a vector a column");
     assert_eq!(anchor.outs.len(), 1, "the capped logits alone leave");

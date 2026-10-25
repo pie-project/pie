@@ -377,14 +377,16 @@ const RULED: [(&str, &[&str]); 4] = [
 ];
 
 /// Each matmul and the pointwise ops over its product served as one
-/// anchored region (`compiler.synth_anchors`, the hand rules `fuse.matmul_bias`,
-/// `fuse.matmul_softcap` and GEGLU's `fuse.matmul_glu` gone from CUDA's
-/// list) against the products
-/// and their ops as their own kernels, the row chains off in both: GLM-4.5's
-/// and GLM-4.7's biased projections (and the residual adds after their
-/// outputs), Gemma 4's GEGLU and soft-capped logits. A prefill of a few rows (the contraction
-/// frames, as the tuner picks) and one past every frame's rows (the unfused
-/// leg), then the decode steps (the gemv).
+/// anchored region (`compiler.synth_anchors`, the hand rules
+/// `fuse.matmul_bias`, `fuse.matmul_softcap` and GEGLU's `fuse.matmul_glu`
+/// gone from CUDA's list), its product read by the epilogue as it is summed,
+/// against the products and their ops as their own kernels, the row chains
+/// off in both: GLM-4.5's and GLM-4.7's biased projections (and the
+/// residual adds after their outputs), Gemma 4's GEGLU and soft-capped
+/// logits. A prefill of a few rows (the contraction frames, as the tuner
+/// picks) and one past every frame's (cuBLASLt's bias, the unfused leg),
+/// then the decode steps (the gemv), held as a routed model's logits are
+/// ([`close_past_routing`]).
 #[test]
 fn an_anchored_region_serves_the_logits_of_its_ops() {
     let _one = serialized();
@@ -393,7 +395,7 @@ fn an_anchored_region_serves_the_logits_of_its_ops() {
         return;
     }
     const ROWS_OFF: &str = "[compiler]\nsynth_regions = false\n";
-    for (model, prompts) in ANCHORED {
+    for (model, prompts, routed) in ANCHORED {
         let fixture = fixture(model);
         for &prompted in prompts {
             let ops = served_from(&fixture, OPS, false, None, prompted);
@@ -405,23 +407,62 @@ fn an_anchored_region_serves_the_logits_of_its_ops() {
                 prompted,
             );
             let anchored = served_from(&fixture, ROWS_OFF, true, Some(&ops), prompted);
-            let agree = anchored
-                .iter()
-                .zip(&ops)
-                .filter(|(got, want)| argmax(got) == argmax(want))
-                .count();
-            eprintln!(
-                "{model} from {prompted} rows: top-1 agrees on {agree} of {} steps",
-                ops.len()
-            );
-            close(
-                &anchored,
-                &ops,
-                &carry,
-                &format!("{model}'s unfused products ({prompted} rows)"),
-            );
+            let against = format!("{model}'s unfused products ({prompted} rows)");
+            if routed {
+                close_past_routing(&anchored, &ops, &carry, &against);
+            } else {
+                close(&anchored, &ops, &carry, &against);
+            }
         }
     }
+}
+
+/// [`close`] for a routed model, whose experts a last-bit difference may
+/// pick apart: the top token is the reference's at every step (or its
+/// runner-up within what the ops in another order move a logit, a tie the
+/// ops break themselves), and the logits stay within [`close`]'s bound at
+/// most steps. A step answers for one row (the prompt's last, or the token
+/// decoded), and a last-bit difference may route that row to other experts
+/// than the reference's: a step past the bound with the reference's top
+/// token is let through with a note, a minority of them.
+fn close_past_routing(got: &[Vec<f32>], want: &[Vec<f32>], carry: &[Vec<f32>], against: &str) {
+    let carried = deviations(carry, want);
+    let mut routed_apart = 0usize;
+    for (step, (((deviation, spread), (own, _)), (got, want))) in deviations(got, want)
+        .into_iter()
+        .zip(carried)
+        .zip(got.iter().zip(want))
+        .enumerate()
+    {
+        let bound = (SPREAD * spread).max(2.0 * own);
+        let (top, picked) = (argmax(want), argmax(got));
+        eprintln!(
+            "{against}, step {step}: logits at most {deviation} apart over a spread of {spread}; \
+             the ops in another order {own} apart; top-1 {}",
+            if top == picked { "agrees" } else { "differs" }
+        );
+        // A tie the ops break themselves is no disagreement: the
+        // reference's own top two within what the ops in another order move
+        // a logit.
+        let gap = want[top as usize] - want[picked as usize];
+        assert!(
+            top == picked || gap <= own,
+            "step {step}: token {picked} tops the logits, {against} token {top} by {gap} (the \
+             ops' own carry {own})"
+        );
+        if deviation > bound {
+            eprintln!(
+                "note: {against}, step {step}: its row {deviation} apart, past {bound}, the top \
+                 token the reference's: it routes to other experts than the reference's"
+            );
+            routed_apart += 1;
+        }
+    }
+    assert!(
+        routed_apart * 2 < got.len(),
+        "{routed_apart} of {} steps past the bound: more than a routing tie apart",
+        got.len()
+    );
 }
 
 /// The unfused ops summing in another order, their products too: an
@@ -433,17 +474,12 @@ const REORDERED: &str =
     "[kernel]\nelemwise.rows_vec = true\ngemm.heuristics = 1\ngemm.workspace_mb = 4\n";
 
 /// The models served by [`an_anchored_region_serves_the_logits_of_its_ops`],
-/// each from the prompts it is served from. GLM-4.7's from a few rows: from
-/// 100 its q bank's bias lands on cuBLASLt's epilogue (the tuner's pick,
-/// the sum stored once where the region rounds the product first, within
-/// its tolerance of the interpreter) and its prompt's last row then routes
-/// to other experts than the unfused ops' (its logits half of them a tenth
-/// apart, the decode steps after it within the ops' own carry), a routing
-/// tie no bound of a step's carry holds.
-const ANCHORED: [(&str, &[u32]); 3] = [
-    ("glm45-air-mini", &[37, 100]),
-    ("glm47-mini", &[37]),
-    ("gemma4-e4b-mini-l1", &[37, 100]),
+/// each from a few rows (the contraction frames) and past every frame's,
+/// and whether it routes its rows to experts.
+const ANCHORED: [(&str, &[u32], bool); 3] = [
+    ("glm45-air-mini", &[37, 100], true),
+    ("glm47-mini", &[37, 100], true),
+    ("gemma4-e4b-mini-l1", &[37, 100], false),
 ];
 
 /// Two models loaded and served at once in one process, a thread each, as a

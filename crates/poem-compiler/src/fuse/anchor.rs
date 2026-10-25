@@ -20,10 +20,14 @@
 //! each value it reads and does not compute is an input, by how it is laid
 //! out: a tile of the product's rows ([`Input::Tile`], a residual), a
 //! vector a column ([`Input::Column`], a bias), one element a row
-//! ([`Input::Row`]) or one value ([`Input::One`]). Each value the run
-//! computes rounds to its dtype where it is defined, as a chain's do; one
-//! anything past the run may read is a result. The product itself is no
-//! value: nothing past the run reads it, or the run is no anchor.
+//! ([`Input::Row`]) or one value ([`Input::One`]). The product is no value
+//! (nothing past the run reads it, or the run is no anchor) and keeps its
+//! accumulator, f32, through the epilogue: a matmul's product and the bias
+//! or activation over it are one computation, as `nn.Linear` and every
+//! reference keep them, the bf16 the trace states of the product a store
+//! the fusion leaves out. Each value the epilogue's ops compute rounds to
+//! its dtype where it is defined, as a chain's do; one anything past the
+//! run may read is a result.
 //!
 //! **Folding** ([`fold`]) replaces each anchor's ops with one
 //! `fused.anchored` op, landed where its last op was, as a chain's region
@@ -377,7 +381,9 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
             k: product.k,
             layout,
             quant: Quant::Plain(Dtype::Bf16),
-            acc: Some(Dtype::Bf16),
+            // The product keeps its accumulator through the epilogue, as a
+            // matmul and its bias are one sum: no op between them rounds it.
+            acc: None,
         },
         prologue: None,
         epilogue: Some(Pointwise {

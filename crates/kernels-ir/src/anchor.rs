@@ -4,8 +4,9 @@
 //!   (`k` wide) and a weight of `n` rows (`k` wide), its layout (one bank,
 //!   or `parts` banks of `n` rows packed one after another, a GLU's
 //!   `[gate | up]`) and how its operands are stored ([`Quant`]). Each part
-//!   lands one product a row and column, summed in f32 and rounded to the
-//!   dtype it declares, if it declares one, before anything reads it.
+//!   lands one product a row and column, summed in f32 and read by the
+//!   epilogue as it is, or rounded first to the dtype it declares where it
+//!   declares one.
 //! - **The prologue** (optional, a [`Pointwise`]): a region over the
 //!   operand tile, a function of `a[m][k]` at each `(m, k)`: what feeds the
 //!   contraction (a dequantized operand, an activation's scale).
@@ -78,8 +79,11 @@ pub struct Contraction {
     pub k: u32,
     pub layout: Layout,
     pub quant: Quant,
-    /// The dtype each product rounds to before an epilogue reads it (the
-    /// unfused product's stored dtype), or `None` to read it in f32.
+    /// The dtype each product rounds to before an epilogue reads it, where
+    /// an op between them rounds it (a cast the program states), or `None`:
+    /// the epilogue reads the f32 accumulator, as a matmul and its bias are
+    /// one sum, and only the epilogue's own values round. The plain store
+    /// rounds the product to the dtype it lands.
     pub acc: Option<Dtype>,
 }
 

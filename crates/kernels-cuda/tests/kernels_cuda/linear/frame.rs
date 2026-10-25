@@ -288,15 +288,25 @@ fn each_frame_lands_each_epilogue_as_the_interpreter() {
 /// says so before anything fires.
 #[test]
 fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
-    for (case, m, n, k) in [
-        (Case::Softcap, 4, 512, 256),
-        (Case::Softcap, 1, 9216, 256),
-        (Case::Geglu, 8, 256, 512),
+    // Each over its products rounded to bf16 and over them as they are
+    // summed (the compiler's anchors: no op between the product and its
+    // epilogue rounds it), the unfused leg then landing them f32.
+    for (case, m, n, k, summed) in [
+        (Case::Softcap, 4, 512, 256, false),
+        (Case::Softcap, 1, 9216, 256, false),
+        (Case::Geglu, 8, 256, 512, false),
+        (Case::Softcap, 4, 512, 256, true),
+        (Case::Geglu, 8, 256, 512, true),
         // Past every frame's rows: the unfused leg, in place and in scratch.
-        (Case::Softcap, 100, 64, 128),
-        (Case::Geglu, 100, 64, 128),
+        (Case::Softcap, 100, 64, 128, false),
+        (Case::Geglu, 100, 64, 128, false),
+        (Case::Softcap, 100, 64, 128, true),
+        (Case::Geglu, 100, 64, 128, true),
     ] {
-        let anchored = case.anchored(n, k);
+        let mut anchored = case.anchored(n, k);
+        if summed {
+            anchored.contraction.acc = None;
+        }
         let epi = Epilogue::interned(&anchored).expect("the frames take it");
         assert!(frame::serves(&anchored, &[], &[Bf16]).is_ok(), "{case:?}");
         let parts = anchored.contraction.layout.parts() as usize;
@@ -311,7 +321,7 @@ fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
             t(w, parts * n, k, Bf16),
             t(y, m, n, Bf16),
         );
-        let what = format!("{case:?} {m}x{n}x{k}");
+        let what = format!("{case:?} {m}x{n}x{k}, summed {summed}");
         // Twice: the first call times the shape's candidates, the second
         // fires the pick.
         for _ in 0..2 {
@@ -438,24 +448,37 @@ fn lt_region(n: usize, gelu: bool, relu: bool, biased: bool) -> (Region, Vec<Inp
 }
 
 /// cuBLASLt's own epilogue, the fused candidate the tuner times beside the
-/// frames and the unfused leg, lands what the anchored region states: a
-/// bias, a ReLU and a bias then a ReLU, at a decode's rows and a prefill's,
-/// within a product's ulp and the epilogue's rounding; and GLM-4.7's
-/// biased banks (q, q and k and v, k and v) at a decode's rows and a
-/// prefill's. A region no cuBLASLt epilogue lands (a soft
-/// cap, a tanh GELU, a bias then one) is not offered to it. Through the
-/// tuner's entry a prefill's lands the same on whichever it picks.
+/// frames and the unfused leg, lands what the anchored region states over
+/// its products as they are summed: a bias, a ReLU and a bias then a ReLU,
+/// at a decode's rows and a prefill's, within the product's sum in another
+/// order (an ulp, two over a long cancelling K; the epilogue's one rounding
+/// is the IR's), and
+/// GLM-4.7's biased banks (q, q and k and v, k and v) so. A region no
+/// cuBLASLt epilogue lands (a soft cap, a tanh GELU, a bias then one, a bias
+/// over products rounded first) is not offered to it. Through the tuner's
+/// entry a prefill's lands the same on whichever it picks.
 #[test]
 fn cublaslts_own_epilogue_lands_the_anchored_region() {
     for gelu_biased in [false, true] {
         let (region, inputs) = lt_region(64, true, false, gelu_biased);
         let anchored = Anchored {
             epilogue: Some(Pointwise { region, inputs }),
-            ..Anchored::plain(contraction(64, 128, Layout::Dense, Some(Bf16)))
+            ..Anchored::plain(contraction(64, 128, Layout::Dense, None))
         };
         let epi = Epilogue::interned(&anchored).expect("the frames take it");
         assert!(epi.lt().is_none(), "a GELU is cuBLASLt's own approximation");
     }
+    // A bias over products rounded first is not cuBLASLt's one sum.
+    let (region, inputs) = lt_region(64, false, false, true);
+    let rounded = Anchored {
+        epilogue: Some(Pointwise { region, inputs }),
+        ..Anchored::plain(contraction(64, 128, Layout::Dense, Some(Bf16)))
+    };
+    let epi = Epilogue::interned(&rounded).expect("the frames take it");
+    assert!(
+        epi.lt().is_none(),
+        "cuBLASLt rounds no product before its bias"
+    );
     for (n, k, relu, biased, rows) in [
         (320usize, 256usize, false, true, &[1usize, 37, 300][..]),
         (320, 256, true, false, &[1, 37, 300]),
@@ -468,7 +491,7 @@ fn cublaslts_own_epilogue_lands_the_anchored_region() {
         let (region, inputs) = lt_region(n, gelu, relu, biased);
         let anchored = Anchored {
             epilogue: Some(Pointwise { region, inputs }),
-            ..Anchored::plain(contraction(n, k, Layout::Dense, Some(Bf16)))
+            ..Anchored::plain(contraction(n, k, Layout::Dense, None))
         };
         let epi = Epilogue::interned(&anchored).expect("the frames take it");
         assert!(epi.lt().is_some(), "relu {relu} bias {biased}");

@@ -381,11 +381,11 @@ pub(crate) fn anchored(
         // the plain product's own, then the row frame.
         let plan = device.plan_for(plain);
         anchor.leg = RowLeg::of(epi, n.unsigned_abs());
-        if anchor.leg.is_some() {
+        if anchor.leg.is_some() && epi.rounds() {
             anchor.inner = device.tactic_for(handle, stream, plan.as_deref(), plain, status);
         }
         let mut candidates = Vec::new();
-        if anchor.leg.is_some() && anchor.inner.is_some() {
+        if anchor.leg.is_some() && (anchor.inner.is_some() || !epi.rounds()) {
             candidates.push(Tactic::Unfused);
         }
         candidates.extend(frames.iter().map(|f| Tactic::Frame(*f)));
@@ -481,9 +481,9 @@ pub(crate) fn anchored(
             let Some(leg) = RowLeg::of(epi, n.unsigned_abs()) else {
                 return Ok(false);
             };
-            let bytes = (m as usize) * (n as usize) * (parts as usize) * 2;
+            let bytes = (m as usize) * (n as usize) * (parts as usize) * epi.product_bytes();
             let products = ctx.scratch_stream(op, ANCHOR_PRODUCTS, bytes)?.addr() as u64;
-            act_x_wt(ctx, op, act, w, products, m, n * parts, k)?;
+            product(ctx, op, epi, act, w, products, m, n * parts, k)?;
             leg.fire(ctx, products, ins, outs, m.unsigned_abs(), n.unsigned_abs())?;
             Ok(true)
         }
@@ -589,9 +589,10 @@ fn unfused(
         return Ok(false);
     };
     let wide = n as usize * epi.parts() as usize;
-    let run = (UNFUSED_BYTES / (wide * 2)).clamp(1, m as usize);
+    let row_bytes = wide * epi.product_bytes();
+    let run = (UNFUSED_BYTES / row_bytes).clamp(1, m as usize);
     let products = ctx
-        .scratch_stream(op, ANCHOR_PRODUCTS, run * wide * 2)?
+        .scratch_stream(op, ANCHOR_PRODUCTS, run * row_bytes)?
         .addr() as u64;
     let mut from = 0usize;
     while from < m as usize {
@@ -600,9 +601,10 @@ fn unfused(
         let ins: Vec<In> = ins.iter().map(|input| input.from_row(from)).collect();
         let outs: Vec<u64> = outs.iter().map(|&out| at(out, n as usize)).collect();
         let rows_i = i32::try_from(rows).unwrap_or(i32::MAX);
-        act_x_wt(
+        product(
             ctx,
             op,
+            epi,
             at(act, k as usize),
             w,
             products,
@@ -621,6 +623,27 @@ fn unfused(
         from += rows;
     }
     Ok(true)
+}
+
+/// `y = act . w^T` as `epi` reads its products: rounded to bf16 on the plain
+/// product's own tactic, or its f32 sums.
+#[allow(clippy::too_many_arguments)]
+fn product(
+    ctx: &Ctx,
+    op: &'static str,
+    epi: &Epilogue,
+    act: u64,
+    w: u64,
+    y: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<(), Error> {
+    if epi.rounds() {
+        act_x_wt(ctx, op, act, w, y, m, n, k)
+    } else {
+        act_x_wt_f32(ctx, op, act, w, y, m, n, k)
+    }
 }
 
 /// The most scratch the untimed unfused leg's products take at once.
@@ -709,7 +732,7 @@ fn run_tactic(
             let Some(a) = call.anchor else {
                 return false;
             };
-            let (Some(inner), Some(leg)) = (a.inner, a.leg) else {
+            let Some(leg) = a.leg else {
                 return false;
             };
             let plain = Call {
@@ -717,19 +740,29 @@ fn run_tactic(
                 anchor: None,
                 ..call
             };
-            run_tactic(
-                handle, stream, lt_handle, plan, inner, plain, ws, ws_bytes, tuning,
-            ) && leg
-                .fire(
-                    // SAFETY: as above.
-                    &unsafe { Ctx::on(stream) }.with_tuning(tuning),
-                    call.y,
-                    a.ins(),
-                    a.outs(),
-                    call.m.unsigned_abs(),
-                    call.n.unsigned_abs(),
-                )
-                .is_ok()
+            // The products as the epilogue reads them: rounded to bf16 by
+            // the plain product's own tactic, or its f32 sums.
+            let landed = if a.epi.rounds() {
+                a.inner.is_some_and(|inner| {
+                    run_tactic(
+                        handle, stream, lt_handle, plan, inner, plain, ws, ws_bytes, tuning,
+                    )
+                })
+            } else {
+                gemm_ex_f32(handle, plain) == cublasStatus_t::CUBLAS_STATUS_SUCCESS
+            };
+            landed
+                && leg
+                    .fire(
+                        // SAFETY: as above.
+                        &unsafe { Ctx::on(stream) }.with_tuning(tuning),
+                        call.y,
+                        a.ins(),
+                        a.outs(),
+                        call.m.unsigned_abs(),
+                        call.n.unsigned_abs(),
+                    )
+                    .is_ok()
         }
         Tactic::Narrow => gemm_narrow_bf16(
             // SAFETY: `stream` is a live `Ctx`'s stream or the tune arena's own; `Ctx::on`
@@ -834,32 +867,16 @@ pub(crate) fn act_x_wt_f32(
     k: i32,
 ) -> Result<(), Error> {
     let handle: cublasHandle_t = ctx.cublas(op)?.cast::<cublasContext>();
-    let (alpha, beta) = (1.0f32, 0.0f32);
-    // SAFETY: `handle` is this context's live cuBLAS handle; the operands are
-    // device rows of the stated extents.
-    let status = unsafe {
-        cublasGemmEx(
-            handle,
-            cublasOperation_t::CUBLAS_OP_T,
-            cublasOperation_t::CUBLAS_OP_N,
-            n,
-            m,
-            k,
-            std::ptr::from_ref(&alpha).cast(),
-            dev(w),
-            cudaDataType::CUDA_R_16BF,
-            k,
-            dev(act),
-            cudaDataType::CUDA_R_16BF,
-            k,
-            std::ptr::from_ref(&beta).cast(),
-            dev_mut(y),
-            cudaDataType::CUDA_R_32F,
-            n,
-            cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
-        )
+    let call = Call {
+        act,
+        w,
+        y,
+        m,
+        n,
+        k,
+        anchor: None,
     };
+    let status = gemm_ex_f32(handle, call);
     if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
         Ok(())
     } else {
@@ -867,6 +884,38 @@ pub(crate) fn act_x_wt_f32(
             op,
             format!("cuBLAS answered {status:?}"),
         ))
+    }
+}
+
+/// `call`'s product landing f32 (`call.y` an `m x n` f32 plane) on
+/// `handle`'s stream: an anchored region's products where it reads them as
+/// they are summed.
+fn gemm_ex_f32(handle: cublasHandle_t, call: Call) -> cublasStatus_t {
+    let (alpha, beta) = (1.0f32, 0.0f32);
+    // SAFETY: `handle` is a live cuBLAS handle bound to the caller's stream;
+    // the operands are device rows of the call's extents.
+    unsafe {
+        cublasGemmEx(
+            handle,
+            cublasOperation_t::CUBLAS_OP_T,
+            cublasOperation_t::CUBLAS_OP_N,
+            call.n,
+            call.m,
+            call.k,
+            std::ptr::from_ref(&alpha).cast(),
+            dev(call.w),
+            cudaDataType::CUDA_R_16BF,
+            call.k,
+            dev(call.act),
+            cudaDataType::CUDA_R_16BF,
+            call.k,
+            std::ptr::from_ref(&beta).cast(),
+            dev_mut(call.y),
+            cudaDataType::CUDA_R_32F,
+            call.n,
+            cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT,
+        )
     }
 }
 
@@ -1797,7 +1846,9 @@ impl TuneArena {
     ) -> bool {
         let act_bytes = ((call.m as usize) * (call.k as usize) * 2).max(1);
         // An anchored region's products, then its results.
-        let tiles = call.anchor.map_or(1, |a| a.epi.parts() as usize + a.n_outs);
+        let tiles = call.anchor.map_or(1, |a| {
+            a.epi.parts() as usize * a.epi.product_bytes() / 2 + a.n_outs
+        });
         let y_bytes = ((call.m as usize) * (call.n as usize) * 2 * tiles).max(1);
         self.workspace_bytes = workspace_bytes;
         self.caller_stream = caller_stream;
@@ -1883,7 +1934,7 @@ impl TuneArena {
         let y = self.y.addr() as u64;
         let tile = (call.m as u64) * (call.n as u64) * 2;
         let anchor = call.anchor.map(|mut a| {
-            let products = u64::from(a.epi.parts()) * tile;
+            let products = u64::from(a.epi.parts()) * tile * a.epi.product_bytes() as u64 / 2;
             for (r, out) in (0u64..).zip(a.outs.iter_mut().take(a.n_outs)) {
                 *out = y + products + r * tile;
             }
