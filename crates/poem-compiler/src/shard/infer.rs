@@ -64,10 +64,11 @@ const AFFINE: [&str; 3] = [
 /// The weights an op reads one row a head or channel of the shares it
 /// follows, cut along their rows with them; any other weight a per-head op
 /// reads (a head norm's, one row for every head) is whole.
-const PER_HEAD: [(&str, &str); 25] = [
+const PER_HEAD: [(&str, &str); 26] = [
     ("linear.matmul_grouped", "w"),
     ("elemwise.add_bias", "bias"),
     ("attn.sink", "sink"),
+    ("attn.window_sink", "sink"),
     ("attn.mla_absorb_q", "kv_b"),
     ("attn.mla_absorb_out", "kv_b"),
     ("ssm.gdn_gates", "a_log"),

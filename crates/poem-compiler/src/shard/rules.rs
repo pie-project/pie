@@ -126,6 +126,8 @@ fn heads(name: &str) -> Option<Heads> {
         "linear.matmul_grouped" => Heads::of(&["x", "routes"], &["groups"]),
         "attn.ragged" => Heads::of(&["q", "k", "v"], &[KV_HEADS]).kv(&["k", "v"]),
         "attn.sink" => Heads::of(&["o", "lse"], &[]),
+        // A window over a cache every head reads, each head with its sink.
+        "attn.window_sink" => Heads::of(&["q"], &[]).cache(Cache::SplitOrWhole),
         "attn.merge_lse" => Heads::of(&["o1", "lse1", "o2", "lse2"], &["heads"]),
         "attn.pool_lse" => Heads::of(&["q"], &["heads"]),
         // k and v, or the one plane a shared pool reads as both.
