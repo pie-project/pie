@@ -210,7 +210,9 @@ pub enum RuntimeInput {
     /// `[t / p0, h / p1, w / p2, first token row]`. The contract: a voxel
     /// lane's token rows are its clips' patches of `p`, each clip's in
     /// (t, h, w) row-major order from its first token row, the clips in
-    /// lane order; the lane carries no other row.
+    /// lane order; past them a lane carries only the pad rows its voxel
+    /// input's stated `rows` round it up to (`multiple_of(n)`), which read
+    /// as no clip's.
     ///
     /// One family is the exception, by decision: HunyuanImage 3
     /// (`models/hunyuan_image_3.poem`) denoises its canvas inside the

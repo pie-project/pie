@@ -218,14 +218,15 @@ impl Tables {
                     token_row += i64::from(tt) * i64::from(th) * i64::from(tw);
                 }
             }
-            // A lane whose class reads no token grid is one row (a VAE's).
+            // A lane whose class reads no token grid is one row (a VAE's);
+            // one that does carries its clips' patches, then any pad rows.
             if seat.token_patch.is_some()
                 && lane.rows != 1
-                && token_row != i64::from(lane.row_offset) + i64::from(lane.rows)
+                && token_row > i64::from(lane.row_offset) + i64::from(lane.rows)
             {
                 return Err(Fault::VoxelPayload {
                     lane: lane.source,
-                    what: "the lane's token rows are not its clips' token count",
+                    what: "the lane's clips have more patches than the lane has token rows",
                 });
             }
         }

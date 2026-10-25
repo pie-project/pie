@@ -470,7 +470,8 @@ impl Input {
     /// a row or a voxel of these rows (`axis`). One name is one input
     /// wherever it is read; `rows` states the rows a lane binding it carries
     /// (exactly `n`, or the fewest that are a multiple of `n`), which its
-    /// guest pads to.
+    /// guest pads to, or (a voxel input) the token rows its clips' patches
+    /// are padded to.
     #[must_use]
     pub fn input(
         &self,
@@ -494,9 +495,10 @@ impl Input {
     /// `[t / p0, h / p1, w / p2, first token row]`, the engine's fill from
     /// the clip boxes and the plan's patch. The contract a model reads it
     /// by: a voxel lane's token rows are its clips' patches, each clip's in
-    /// (t, h, w) row-major order from its first token row, and nothing
-    /// else; [`crate::ops::conv::patchify`] lands a clip's patches there,
-    /// [`crate::ops::conv::cells`] reads each row's cell back.
+    /// (t, h, w) row-major order from its first token row, then only the
+    /// pad rows its voxel input's `rows` round it up to;
+    /// [`crate::ops::conv::patchify`] lands a clip's patches there (a pad
+    /// row zeros), [`crate::ops::conv::cells`] reads each row's cell back.
     #[must_use]
     pub fn token_grid(&self, p: [u32; 3]) -> Value {
         assert!(p.iter().all(|&n| n > 0), "a patch of {p:?} is empty");

@@ -885,7 +885,11 @@ impl ProcessCtx {
                     "lane {at} {} a recurrent state and lane 0 {}; a pass's lanes all read one \
                      or none",
                     if reads_state { "reads no" } else { "reads" },
-                    if reads_state { "reads one" } else { "reads none" },
+                    if reads_state {
+                        "reads one"
+                    } else {
+                        "reads none"
+                    },
                 )));
             }
             let state = match (pass.bindings.state.clone(), reads_kv || reads_state) {
@@ -977,6 +981,7 @@ impl ProcessCtx {
                         .collect();
                     // A voxel lane's rows are its tokens: one a patch of its
                     // voxels where its graph patchifies (the token grid),
+                    // then the pad rows its voxel input states (`rows`),
                     // else one.
                     let tokens = |[pt, ph, pw]: [u32; 3]| {
                         clips
@@ -984,9 +989,30 @@ impl ProcessCtx {
                             .map(|[t, h, w]| (t / pt.max(1)) * (h / ph.max(1)) * (w / pw.max(1)))
                             .fold(0u32, u32::saturating_add)
                     };
+                    let stated = lane
+                        .inputs
+                        .iter()
+                        .filter(|binding| binding.clip.is_some())
+                        .find_map(|binding| model.inputs()[binding.id as usize].rows);
+                    let padded = |tokens: u32| match stated {
+                        None => Some(tokens),
+                        Some(poem_ir::RowCount::Exact(n)) => (tokens <= n).then_some(n),
+                        Some(poem_ir::RowCount::Multiple(n)) => tokens.checked_next_multiple_of(n),
+                    };
                     let rows = match input_rows(&lane.inputs) {
                         Ok(Some(rows)) => rows,
-                        Ok(None) if !clips.is_empty() => decls[at].patch.map_or(1, tokens),
+                        Ok(None) if !clips.is_empty() => {
+                            match decls[at].patch.map(tokens).map(padded) {
+                                None => 1,
+                                Some(Some(rows)) => rows,
+                                Some(None) => {
+                                    return Ok(Err(format!(
+                                        "lane {at}'s clips hold more patches than its voxel \
+                                         input's {stated:?} rows"
+                                    )));
+                                }
+                            }
+                        }
                         Ok(None) => {
                             return Ok(Err(format!(
                                 "lane {at} embeds no tokens and binds no row input; nothing \

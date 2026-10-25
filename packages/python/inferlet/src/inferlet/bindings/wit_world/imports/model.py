@@ -75,7 +75,9 @@ RowCount = Union[RowCount_Exact, RowCount_Multiple]
 """
 The rows a lane binding an input carries, as the model states them:
 exactly `n`, or the fewest that are a multiple of `n` and hold the
-guest's own. The guest pads its rows to them with zeros, on device.
+guest's own. The guest pads its rows to them with zeros, on device;
+a voxel input's are its lane's token rows, which the runtime pads
+past its clips' patches.
 """
 
 

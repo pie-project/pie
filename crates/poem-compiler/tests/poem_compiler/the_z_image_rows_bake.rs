@@ -111,7 +111,7 @@ fn the_latent_is_patched_in_the_graph_and_the_positions_follow_the_caption() {
             1,
             "{deployment}: the image follows its group's caption rows"
         );
-        for name in ["caption", "context"] {
+        for name in ["caption", "context", "latents"] {
             let input = plan
                 .inputs
                 .iter()
@@ -120,7 +120,7 @@ fn the_latent_is_patched_in_the_graph_and_the_positions_follow_the_caption() {
             assert_eq!(
                 input.rows,
                 Some(poem_ir::RowCount::Multiple(32)),
-                "{deployment}: `{name}` is padded to a multiple of 32 rows, as the reference pads"
+                "{deployment}: `{name}`'s lane is padded to a multiple of 32 rows, as the reference pads"
             );
         }
         let length = plan
@@ -514,8 +514,8 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
         let modulated = (d.refiner_layers + d.joint_layers) as usize;
         assert_eq!(
             (lane_scales, row_pads),
-            (2 * modulated + 1, 1),
-            "{deployment}: only the caption pads; an image lane carries its patches alone"
+            (2 * modulated + 1, 2),
+            "{deployment}: the caption and the image each turn their pad rows into their pad token"
         );
 
         let mut folds = 0usize;
