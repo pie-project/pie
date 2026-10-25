@@ -12,13 +12,16 @@ pub(crate) fn simplify_alias(
     result_type: &SymbolicType,
     literals: &[Option<Literal>],
 ) -> Option<u32> {
+    // A one-element scan is its identity combined with the element: `1 * x`
+    // is `x` in every dtype, but a float `0 + x` is not (`0 + -0` is `+0`).
     if result_type
         .dims
         .iter()
         .all(|dim| *dim == Dimension::Static(1))
     {
         match *op {
-            Op::CumSum(value) | Op::CumProd(value) => return Some(value),
+            Op::CumProd(value) => return Some(value),
+            Op::CumSum(value) if result_type.dtype != Dtype::F32 => return Some(value),
             _ => {}
         }
     }
