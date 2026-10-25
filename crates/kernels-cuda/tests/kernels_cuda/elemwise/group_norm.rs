@@ -42,6 +42,7 @@ fn check(boxes: &[Box3], c: usize, groups: usize, silu: bool) {
         eps,
         silu,
         &mut o,
+        0,
     )
     .expect("the norm fires");
     gpu.sync();

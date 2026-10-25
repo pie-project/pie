@@ -11,6 +11,9 @@ fn element(op: &'static str, dtype: dtype::Dtype) -> Result<&'static str, Error>
     Ok(dtype_dispatch!(op, dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" }))
 }
 
+/// `bases` (here and in the other resamplers): the rows `grid` and `o_grid`
+/// address `x`'s and `o`'s row 0 at (`[x, o]`), nonzero in a window of a
+/// segmented fire whose grids hold fire-wide rows.
 #[allow(clippy::too_many_arguments)]
 pub fn upsample_nearest(
     ctx: &Ctx,
@@ -20,6 +23,7 @@ pub fn upsample_nearest(
     keep_first_frame: bool,
     o: &mut Tensor,
     o_grid: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.upsample";
     let t = element(OP, x.dtype)?;
@@ -50,6 +54,8 @@ pub fn upsample_nearest(
             fh.arg(),
             fw.arg(),
             i32::from(keep_first_frame).arg(),
+            stated(OP, bases[0])?.arg(),
+            stated(OP, bases[1])?.arg(),
             total.arg(),
         ],
     )
@@ -71,22 +77,6 @@ fn block_of(op: &'static str, r: [u32; 3]) -> Result<([i32; 3], u32), Error> {
 
 #[allow(clippy::too_many_arguments)]
 pub fn pixel_shuffle(
-    ctx: &Ctx,
-    x: Tensor,
-    grid: Tensor,
-    r: [u32; 3],
-    trim_t: u32,
-    o: &mut Tensor,
-    o_grid: Tensor,
-) -> Result<(), Error> {
-    shuffle_at(ctx, x, grid, r, trim_t, o, o_grid, [0, 0])
-}
-
-/// `pixel_shuffle` over tensors whose row 0 stands at fire rows `bases`
-/// (`[x, o]`): the grids address fire rows, a window's tensors start at its
-/// own.
-#[allow(clippy::too_many_arguments)]
-fn shuffle_at(
     ctx: &Ctx,
     x: Tensor,
     grid: Tensor,
@@ -135,20 +125,8 @@ fn shuffle_at(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn pixel_unshuffle(
-    ctx: &Ctx,
-    x: Tensor,
-    grid: Tensor,
-    r: [u32; 3],
-    o: &mut Tensor,
-    o_grid: Tensor,
-) -> Result<(), Error> {
-    unshuffle_at(ctx, x, grid, r, o, o_grid, [0, 0])
-}
-
-/// `pixel_unshuffle` over tensors whose row 0 stands at fire rows `bases`
-/// (`[x, o]`), as [`shuffle_at`].
-fn unshuffle_at(
     ctx: &Ctx,
     x: Tensor,
     grid: Tensor,
@@ -203,6 +181,7 @@ pub fn avg_down(
     group: u32,
     o: &mut Tensor,
     o_grid: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.avg_down";
     let t = element(OP, x.dtype)?;
@@ -237,13 +216,13 @@ pub fn avg_down(
             r[1].arg(),
             r[2].arg(),
             g.arg(),
+            stated(OP, bases[0])?.arg(),
+            stated(OP, bases[1])?.arg(),
             total.arg(),
         ],
     )
 }
 
-/// `bases`: the fire rows `x`'s and `o`'s row 0 stand at (`[x, o]`), which
-/// a window of a segmented fire does not start at 0.
 #[allow(clippy::too_many_arguments)]
 pub fn patchify(
     ctx: &Ctx,
@@ -254,10 +233,9 @@ pub fn patchify(
     o_grid: Tensor,
     bases: [u32; 2],
 ) -> Result<(), Error> {
-    unshuffle_at(ctx, x, grid, p, o, o_grid, bases)
+    pixel_unshuffle(ctx, x, grid, p, o, o_grid, bases)
 }
 
-/// `bases` as [`patchify`]'s.
 #[allow(clippy::too_many_arguments)]
 pub fn unpatchify(
     ctx: &Ctx,
@@ -268,5 +246,5 @@ pub fn unpatchify(
     o_grid: Tensor,
     bases: [u32; 2],
 ) -> Result<(), Error> {
-    shuffle_at(ctx, x, grid, p, 0, o, o_grid, bases)
+    pixel_shuffle(ctx, x, grid, p, 0, o, o_grid, bases)
 }

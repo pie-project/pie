@@ -86,6 +86,7 @@ impl Run<'_> {
                 segment(*how),
                 *sm_scale,
                 &mut self.tensor(*o),
+                self.grid_base(*grid, *q),
             ),
             Attn::PlanDecode {
                 kv_indptr,

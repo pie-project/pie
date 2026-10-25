@@ -27,6 +27,7 @@ fn run(gpu: &mut Gpu, at: (u64, u64, u64, u64, u64), rows: usize, segment: Segme
         segment,
         scale,
         &mut o,
+        0,
     )
     .unwrap_or_else(|why| panic!("{segment:?}: {why}"));
     gpu.sync();

@@ -64,6 +64,7 @@ __global__ __launch_bounds__(256) void cache_store(
     int frames,
     int c,
     long long slot_stride,
+    int x_base,
     long long total)
 {
     const long long e = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -74,6 +75,8 @@ __global__ __launch_bounds__(256) void cache_store(
     Lane g;
     const int l = cache_lane_of(grid, lanes, frames, row, base, g);
     if (l < 0) return;
+    // `x_base`: the row `grid` addresses `x`'s row 0 at.
+    g.off -= x_base;
     const int local_row = row - base;
     const long long local = static_cast<long long>(local_row) * c + col;
     if (local >= slot_stride) return;
