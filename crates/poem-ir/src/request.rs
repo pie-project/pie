@@ -10,6 +10,7 @@ pub struct Request {
     captures_scores: bool,
     media: bool,
     encode: bool,
+    fresh: bool,
     /// The guest switches the inferlet set, by name; one it left unset takes
     /// its declared default.
     switches: Vec<(String, String)>,
@@ -28,6 +29,13 @@ impl Request {
     #[must_use]
     pub fn encoding(mut self, encode: bool) -> Request {
         self.encode = encode;
+        self
+    }
+
+    /// The lane's recurrent state holds nothing yet.
+    #[must_use]
+    pub fn starting(mut self, fresh: bool) -> Request {
+        self.fresh = fresh;
         self
     }
 
@@ -100,6 +108,11 @@ impl Request {
         self.encode
     }
 
+    #[must_use]
+    pub fn fresh(&self) -> bool {
+        self.fresh
+    }
+
     /// The value the inferlet set the guest switch `name` to, if it set it.
     #[must_use]
     pub fn switch(&self, name: &str) -> Option<&str> {
@@ -128,6 +141,7 @@ impl Request {
             self.captures_scores,
             self.media,
             self.encode,
+            self.fresh,
         ]
         .into_iter()
         .filter(|&on| on)

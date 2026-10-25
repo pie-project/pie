@@ -1585,7 +1585,8 @@ fn stamp_lane_words(
             .adapted(lane.adapter.is_some())
             .drafting(switched.drafts)
             .capturing_scores(lane.captures_scores)
-            .with_media(media.contains(&(at as u32)));
+            .with_media(media.contains(&(at as u32)))
+            .starting(starts(lane));
         let switches = of
             .get(at)
             .and_then(|&pass_lane| switched.lanes.get(pass_lane))
@@ -1594,6 +1595,17 @@ fn stamp_lane_words(
             request.switched(name, value)
         });
         lane.word = model.word(&request);
+    }
+}
+
+/// Whether a lane's recurrent state holds nothing yet, as the engine reads
+/// its reset: the rs store's when it stated one, else a seated lane holding
+/// no kv.
+fn starts(lane: &::engine::Lane) -> bool {
+    match lane.rs_reset {
+        ::engine::RsReset::Fresh => true,
+        ::engine::RsReset::Held => false,
+        ::engine::RsReset::Inferred => !lane.kv_less && lane.kv.held == 0,
     }
 }
 

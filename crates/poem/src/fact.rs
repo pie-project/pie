@@ -66,6 +66,13 @@ pub fn encode() -> Predicate {
     Predicate::Builtin(Builtin::Encode)
 }
 
+/// The rows of a lane whose recurrent state holds nothing yet: its cursor
+/// is 0, and this fire starts it from zeros.
+#[must_use]
+pub fn fresh() -> Predicate {
+    Predicate::Builtin(Builtin::Fresh)
+}
+
 /// The rows whose switch `name` is set to `value`.
 #[must_use]
 pub fn switch_is(name: &str, value: &str) -> Predicate {

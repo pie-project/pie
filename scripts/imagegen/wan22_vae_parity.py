@@ -9,17 +9,15 @@ diffusers reference.
 
 The engine gate `the_wan_2_vae_answers_the_reference` drives the shell from
 the host on lanes that keep their conv caches. This one goes through the real
-runtime (`examples/wan2-vae-parity`): one fire per latent frame, the `.head`
-arm first, one pipeline. Chunk k > 0 is only right if fire k read the caches
-fire k-1 left.
+runtime (`examples/wan2-vae-parity`): one `vae.decode` fire per latent frame,
+one working set (its recurrent state is the conv caches), one pipeline. Chunk
+k > 0 is only right if fire k read the caches fire k-1 left. The last chunk is
+decoded on a fork of the working set as well, and must match the parent's.
 
 THE GATE
 --------
 `cos >= 0.9999` PER CHUNK (bf16 device vs fp32 reference; the host gate lands
-0.99998). KNOWN TO FAIL on pm-improve until frame = token C1-C3 land
-(latent-path.md 7c): float lanes are kv_less, so every decode fire starts from
-zeroed caches and chunks 1.. decode cold (~cos 0.98). The failure is the
-point of this test. Do not loosen the bar.
+0.99998), and the fork's chunk equal to the parent's. Do not loosen the bar.
 
 The golden is `$PIE_IMAGEGEN_GOLDEN/wan22/wan22_vae_ref/{latent,pixels}.f32` +
 `shapes.json`. Nothing here imports torch.
@@ -47,8 +45,6 @@ WORKSPACE = os.path.join(REPO, "examples")
 
 COS_TOL = 0.9999
 FORK_TOL = 0.0
-KNOWN = ("KNOWN FAILURE until frame = token C1-C3 land (latent-path.md 7c): "
-         "later decode fires run on zeroed conv caches. Do not loosen the bar.")
 
 def shapes(golden: str) -> dict:
     path = os.path.join(golden, "shapes.json")
@@ -134,8 +130,6 @@ def compare(args) -> int:
     print(f"[compare] fork: the last chunk on a fork, max |diff| from the parent's {fork} "
           f"(<= {FORK_TOL})  --  {'PASS' if good else 'FAIL'}")
     print(f"[compare] {'PASS' if ok else 'FAIL'}")
-    if not ok:
-        print(f"[compare] {KNOWN}")
     return 0 if ok else 1
 
 def main() -> int:

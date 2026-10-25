@@ -384,7 +384,7 @@ impl Model {
     /// Everything about a lane of the guest switches `switches`, each
     /// checked against its declaration: the classes it can land in under
     /// any value of the runtime switches (query length, mask, adapter,
-    /// drafts, scores, media, encode), and so the inputs those read and
+    /// drafts, scores, media, encode, fresh), and so the inputs those read and
     /// whether any reads kv, embeds tokens or reads out.
     pub fn lane(&self, switches: &[(String, String)]) -> Result<Lane, String> {
         let mut guest = poem::Request::new(1, false);
@@ -395,14 +395,15 @@ impl Model {
             }
             guest = guest.switched(name, value);
         }
-        let words: Vec<u64> = (0..1u32 << 7)
+        let words: Vec<u64> = (0..1u32 << 8)
             .map(|bits| {
                 let request = poem::Request::new(if bits & 1 == 0 { 1 } else { 2 }, bits & 2 != 0)
                     .adapted(bits & 4 != 0)
                     .drafting(bits & 8 != 0)
                     .capturing_scores(bits & 16 != 0)
                     .with_media(bits & 32 != 0)
-                    .encoding(bits & 64 != 0);
+                    .encoding(bits & 64 != 0)
+                    .starting(bits & 128 != 0);
                 let request = switches
                     .iter()
                     .fold(request, |r, (name, value)| r.switched(name, value));
