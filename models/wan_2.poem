@@ -34,16 +34,6 @@ def linear(out, in_, banks, bias = True):
         bias = weight([out]) if bias else None,
     )
 
-def packed_linear(seams, in_, banks):
-    """A biased projection whose output is the `seams`-wide pieces end to end."""
-    out = 0
-    for s in seams:
-        out += s
-    return struct(
-        w = weight([out, in_], banks),
-        bias = weight([out]),
-    )
-
 def embedder(prefix, in_, dim, banks):
     """A two-layer timestep (or caption) embedder from `in_` to `dim`."""
     return struct(
@@ -112,7 +102,9 @@ def block(d, banks):
     return struct(
         table = weight([MOD_SLICES * dim], dtype.f32),
         self_attn = struct(
-            qkv = packed_linear([dim, dim, dim], dim, banks),
+            q = linear(dim, dim, banks),
+            k = linear(dim, dim, banks),
+            v = linear(dim, dim, banks),
             norm_q = gain("self.norm_q"),
             norm_k = gain("self.norm_k"),
             out = linear(dim, dim, banks),
@@ -121,7 +113,8 @@ def block(d, banks):
         norm2_bias = gain("norm2.bias"),
         cross = struct(
             q = linear(dim, dim, banks),
-            kv = packed_linear([dim, dim], dim, banks),
+            k = linear(dim, dim, banks),
+            v = linear(dim, dim, banks),
             norm_q = gain("cross.norm_q"),
             norm_k = gain("cross.norm_k"),
             out = linear(dim, dim, banks),
@@ -355,11 +348,6 @@ def biased(reads, w, stem):
     if w.bias != None:
         reads.read(w.bias, stem + ".bias")
 
-def packed(reads, w, stems):
-    """A packed biased projection, its pieces from each of `stems`."""
-    reads.read_concat(w.w, [s + ".weight" for s in stems])
-    reads.read_concat(w.bias, [s + ".bias" for s in stems])
-
 def adaln_order(slices):
     """The order a layout takes an adaLN projection's `slices` slices in
     from a checkpoint's: each (shift, scale) pair as (scale, shift), each
@@ -467,7 +455,9 @@ def transformer_block(reads, b, stem):
     table(reads, b.table, n("scale_shift_table"), MOD_SLICES)
 
     a = b.self_attn
-    packed(reads, a.qkv, [n("attn1.to_q"), n("attn1.to_k"), n("attn1.to_v")])
+    biased(reads, a.q, n("attn1.to_q"))
+    biased(reads, a.k, n("attn1.to_k"))
+    biased(reads, a.v, n("attn1.to_v"))
     reads.read(a.norm_q, n("attn1.norm_q.weight"))
     reads.read(a.norm_k, n("attn1.norm_k.weight"))
     biased(reads, a.out, n("attn1.to_out.0"))
@@ -477,7 +467,8 @@ def transformer_block(reads, b, stem):
 
     c = b.cross
     biased(reads, c.q, n("attn2.to_q"))
-    packed(reads, c.kv, [n("attn2.to_k"), n("attn2.to_v")])
+    biased(reads, c.k, n("attn2.to_k"))
+    biased(reads, c.v, n("attn2.to_v"))
     reads.read(c.norm_q, n("attn2.norm_q.weight"))
     reads.read(c.norm_k, n("attn2.norm_k.weight"))
     biased(reads, c.out, n("attn2.to_out.0"))
@@ -709,7 +700,8 @@ def run_block(x, c, b, e, d, vg, cg):
     attn_ss, attn_gate, ffn_ss, ffn_gate = chunks(e, [2 * dim, dim, 2 * dim, dim])
 
     h = norm_modulate(x, attn_ss, vg.lanes, NORM_EPS)
-    q, k, v = ops.gather.split_qkv(run_linear(b.self_attn.qkv, h), dim, dim)
+    a = b.self_attn
+    q, k, v = run_linear(a.q, h), run_linear(a.k, h), run_linear(a.v, h)
 
     def turn(x, gain):
         return ops.elemwise.rope_axes(
@@ -737,7 +729,7 @@ def run_block(x, c, b, e, d, vg, cg):
 
     hc = ops.elemwise.layernorm(x, b.norm2, b.norm2_bias, NORM_EPS)
     cq = ops.elemwise.rmsnorm(run_linear(b.cross.q, hc), b.cross.norm_q, NORM_EPS)
-    ck, cv = ops.gather.split_rows(run_linear(b.cross.kv, c), dim)
+    ck, cv = run_linear(b.cross.k, c), run_linear(b.cross.v, c)
     ck = ops.elemwise.rmsnorm(ck, b.cross.norm_k, NORM_EPS)
     ca = attend(cq, ck, cv, vg, cg, hd, d.sm_scale, group_block_diagonal())
     x = ops.elemwise.residual_add(run_linear(b.cross.out, ca), x)
