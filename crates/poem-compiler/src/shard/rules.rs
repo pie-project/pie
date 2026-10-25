@@ -4,7 +4,7 @@
 
 use poem_ir::{
     ActFn, Attn, BinaryOp, Collective, Dim, Dtype, Elemwise, Gather, Linear, NormAxis, Operands,
-    Operation, Shard, Ty, ValueId,
+    Operation, RaggedMask, Shard, Ty, ValueId,
 };
 
 use super::{Block, Dist, Pass};
@@ -261,6 +261,16 @@ pub(super) fn rule(op: &Operation) -> Rule {
     // A paged attention splits with its query heads, its cache split with
     // them or kept whole; a relative bias, a head's run of positions after
     // another, splits with them.
+    // A ragged attention under a bucketed relative bias reads its table a
+    // row a head, which no share of the last axis cuts: it reads its
+    // operands whole.
+    if let Operation::Attn(Attn::Ragged {
+        mask: RaggedMask::RelativeBias { .. },
+        ..
+    }) = op
+    {
+        return Rule::Whole;
+    }
     if let Operation::Attn(Attn::Decode { .. }) = op {
         return Rule::Heads(Heads::of(&["q", "bias"], &[]).cache(Cache::SplitOrWhole));
     }
