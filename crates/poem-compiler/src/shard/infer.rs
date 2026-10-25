@@ -97,14 +97,16 @@ const GROUPED: [(&str, &str, &str); 2] = [
 /// states.
 #[must_use]
 pub fn infer(trace: &Trace) -> Vec<Shard> {
-    inferred(trace, BTreeSet::new()).0
+    inferred(trace, BTreeSet::new(), 1).0
 }
 
 /// `trace` with each weight whose cut the model left to the compiler cut as
 /// its dataflow says, a weight it states whole kept whole; and the cut of
 /// each such weight over its logical shape, by name, for an import to read
-/// it by. A trace that leaves none to the compiler is as it was.
-pub fn resolve(trace: &mut Trace) -> Vec<(String, Shard)> {
+/// it by. A trace that leaves none to the compiler is as it was. A weight
+/// whose cut `world` ranks cannot split (a vocabulary of an odd count of
+/// rows, a block of scales fewer than the ranks) is whole.
+pub fn resolve(trace: &mut Trace, world: u32) -> Vec<(String, Shard)> {
     if !trace.params.iter().any(|p| p.shard == Shard::Inferred) {
         return Vec::new();
     }
@@ -112,7 +114,7 @@ pub fn resolve(trace: &mut Trace) -> Vec<(String, Shard)> {
     let pinned = (0..trace.params.len())
         .filter(|p| owner[*p].is_none() && trace.params[*p].shard == Shard::Replicated)
         .collect();
-    let (shards, lead) = inferred(trace, pinned);
+    let (shards, lead) = inferred(trace, pinned, world);
     let mut cuts = Vec::new();
     for (p, cut) in shards.into_iter().enumerate() {
         let param = &mut trace.params[p];
@@ -128,19 +130,42 @@ pub fn resolve(trace: &mut Trace) -> Vec<(String, Shard)> {
 }
 
 /// Each param's cut, `pinned` leading params kept whole, and each leading
-/// param's cut over its logical shape.
-fn inferred(trace: &Trace, pinned: BTreeSet<usize>) -> (Vec<Shard>, Vec<Shard>) {
+/// param's cut over its logical shape; a cut `world` ranks cannot split is
+/// put back whole.
+fn inferred(trace: &Trace, pinned: BTreeSet<usize>, world: u32) -> (Vec<Shard>, Vec<Shard>) {
     let reading = Reading::of(trace);
     let mut whole = pinned.clone();
     loop {
         let mut walk = Walk::new(&reading, &whole, &pinned);
         walk.run();
-        let rejected = std::mem::take(&mut walk.rejected);
+        let mut rejected = std::mem::take(&mut walk.rejected);
         if rejected.is_subset(&whole) {
-            return walk.shards();
+            let (shards, lead) = walk.shards();
+            rejected.extend(
+                (0..shards.len())
+                    .filter(|p| !splits(&shards[*p], world))
+                    .map(|p| reading.owner[p].unwrap_or(p)),
+            );
+            if rejected.is_subset(&whole) {
+                return (shards, lead);
+            }
         }
         whole.extend(rejected);
     }
+}
+
+/// Whether `world` ranks split `cut`: each segment into its parts.
+fn splits(cut: &Shard, world: u32) -> bool {
+    let Shard::Cut {
+        segments, heads, ..
+    } = cut
+    else {
+        return true;
+    };
+    segments.iter().enumerate().all(|(i, segment)| {
+        Shard::parts(heads.get(i).copied(), u64::from(world))
+            .is_ok_and(|parts| segment.is_multiple_of(parts))
+    })
 }
 
 /// What a walk reads of the trace that does not change between walks.

@@ -78,7 +78,7 @@ impl Deployment {
     pub fn lowering(&self, platform: Platform) -> poem::Lowering {
         self.package
             .trace(&self.model.id, &self.deploy, &self.name, platform)
-            .map(|trace| lowering_of(&trace))
+            .map(|trace| lowering_of(&trace, self.deploy.tp))
             .unwrap_or_default()
     }
 
@@ -142,17 +142,18 @@ pub fn lowered(trace: Trace, deploy: &Deploy) -> Result<Trace, String> {
 /// [`lowered`], each expert rank holding `replicas` slots past its share of
 /// a layer's experts.
 pub fn lowered_with(mut trace: Trace, deploy: &Deploy, replicas: u32) -> Result<Trace, String> {
-    crate::shard::infer::resolve(&mut trace);
+    crate::shard::infer::resolve(&mut trace, deploy.tp);
     let trace = crate::tile::tile(crate::pack::pack(trace));
     let trace = crate::shard::shard(trace, deploy.tp).map_err(|why| why.to_string())?;
     crate::expert::lower(trace, deploy.ep, replicas).map_err(|why| why.to_string())
 }
 
-/// What [`lowered`] decides of `trace`'s weights that an import stores so.
+/// What [`lowered`] decides of `trace`'s weights that an import across `tp`
+/// ranks stores so.
 #[must_use]
-pub fn lowering_of(trace: &Trace) -> poem::Lowering {
+pub fn lowering_of(trace: &Trace, tp: u32) -> poem::Lowering {
     let mut trace = trace.clone();
-    let cuts = crate::shard::infer::resolve(&mut trace);
+    let cuts = crate::shard::infer::resolve(&mut trace, tp);
     let joins = crate::pack::joins(&trace);
     let lowered = crate::tile::tile(crate::pack::pack(trace.clone()));
     let tiled = crate::tile::tiled(&crate::pack::pack(trace));
@@ -401,7 +402,7 @@ impl Catalog {
             .unwrap_or_else(|| panic!("no package holds `{id}`"));
         let lowering = package
             .trace(id, &one_rank(w, kv), id, platform)
-            .map(|trace| lowering_of(&trace))
+            .map(|trace| lowering_of(&trace, 1))
             .unwrap_or_default();
         package.import_lowered(id, &one_rank(w, kv), src, platform, &lowering)
     }
