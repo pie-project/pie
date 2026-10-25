@@ -559,8 +559,13 @@ mod tests {
             num_layers: 2,
             ..Graph::default()
         };
-        let bound = bind(traced.container().clone(), lanes, graph, EngineCaps::default())
-            .expect("the trace binds");
+        let bound = bind(
+            traced.container().clone(),
+            lanes,
+            graph,
+            EngineCaps::default(),
+        )
+        .expect("the trace binds");
         let names = traced.channel_names();
         let at = |name: &str| names.iter().position(|n| n == name).unwrap() as u32;
         let seeds = [
