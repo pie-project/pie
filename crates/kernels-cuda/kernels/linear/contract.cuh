@@ -17,8 +17,8 @@
 // A body's hooks are the row frame's (`elemwise/frame.cuh`), so one printer
 // serves both: `F::N` elements a call, `f.ld(k, e)` (a product where `k` is
 // below the parts, else an input's element), `f.one(k)` (an input's one
-// value a row), `f.st(k, e, v)`, `f.valid(e)`, `f.round_bf16(v)` and
-// `f.flush<k>()`. An epilogue reduces nothing (kernels-ir refuses one that
+// value a row), `f.st(k, e, v)`, `f.valid(e)`, `f.round_bf16(v)`,
+// `f.col(e)`, `f.sin(v)`, `f.cos(v)` and `f.flush<k>()`. An epilogue reduces nothing (kernels-ir refuses one that
 // does), so a frame offers no reduction.
 
 #include "prim/device.cuh"
@@ -60,25 +60,32 @@ struct TileHook {
 
     const Epi<IN, OUT>& epi;
     long long row;
-    int col;
+    int col_;
     int width;
     float acc[P][kN];
     __align__(16) bf16 res[OUT][kN];
 
     __device__ __forceinline__ TileHook(const Epi<IN, OUT>& epi, long long row, int col, int width)
-        : epi(epi), row(row), col(col), width(width) {}
+        : epi(epi), row(row), col_(col), width(width) {}
 
     // The frame's: part `p`'s product at element `e`.
     __device__ __forceinline__ void set(int p, int e, float v) {
         acc[p][e] = ROUND ? round_bf16(v) : v;
     }
 
-    __device__ __forceinline__ bool valid(int e) const { return col + e < width; }
+    __device__ __forceinline__ bool valid(int e) const { return col_ + e < width; }
+
+    // The product tile's column of element `e`.
+    __device__ __forceinline__ unsigned col(int e) const { return static_cast<unsigned>(col_ + e); }
+
+    // An angle's sine and cosine as the row frame turns one.
+    __device__ __forceinline__ float sin(float v) const { return __sinf(v); }
+    __device__ __forceinline__ float cos(float v) const { return __cosf(v); }
 
     __device__ __forceinline__ float ld(int k, int e) const {
         if (k < P) return acc[k < P ? k : 0][e];
         const EpiIn& in = epi.in[k - P];
-        return bf16_to_f32(in.base[row * in.row_stride + static_cast<long long>(col + e) * in.col_stride]);
+        return bf16_to_f32(in.base[row * in.row_stride + static_cast<long long>(col_ + e) * in.col_stride]);
     }
 
     __device__ __forceinline__ float one(int k) const {
@@ -99,11 +106,11 @@ struct TileHook {
     // aligned), else one by one.
     template <int K>
     __device__ __forceinline__ void flush() {
-        bf16* dst = epi.out[K] + row * epi.ld + col;
+        bf16* dst = epi.out[K] + row * epi.ld + col_;
         if constexpr (kN % 8 == 0) {
 #pragma unroll
             for (int v = 0; v < kN / 8; ++v) {
-                if (col + v * 8 < width) {
+                if (col_ + v * 8 < width) {
                     *reinterpret_cast<uint4*>(dst + v * 8) = *reinterpret_cast<const uint4*>(&res[K][v * 8]);
                 }
             }

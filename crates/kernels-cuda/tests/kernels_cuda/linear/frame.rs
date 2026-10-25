@@ -1,11 +1,24 @@
 //! The contraction frames (`linear::frame`) with an epilogue filled in land
 //! what the anchored region states: each frame and each epilogue against
-//! kernels-ir's interpreter (`anchor::eval`), within a bf16 product's
-//! tolerance, and the same bits on a second fire. The tuner's anchored
+//! kernels-ir's interpreter (`anchor::eval`), within the tolerances below
+//! (in bf16 ulps, as `elemwise::within` counts them), and the same bits on
+//! a second fire.
+//!
+//! - **The contraction's order is the frame's.** The interpreter sums a
+//!   product in f64 and rounds it to f32 once; a frame sums it in f32 in
+//!   its own order (a warp's lanes, a block's slices, mma.sync's tiles), off
+//!   by a few f32 ulps of the sum of its terms' magnitudes. That moves a
+//!   product rounded to bf16 only where it lies that close to a rounding
+//!   edge, by one ulp: [`PRODUCT`].
+//! - **Each rounding point after carries it on**, one ulp more each, and an
+//!   op that scales its input carries it scaled: a bias or a soft cap
+//!   (`expf` within 2 f32 ulps), [`ONE_MORE`]; GEGLU, two products each an
+//!   ulp off, its gate's through `gelu`'s slope (at most 1.13), [`GLU`]. The tuner's anchored
 //! entry (`gemm::anchored`) lands the same on whichever candidate it picks.
 
 use crate::common::linear_ref::t;
-use crate::common::{Gpu, Lcg, from_bf16};
+use crate::common::{Gpu, Lcg};
+use crate::elemwise::within::{assert_within, deterministic};
 use dtype::Dtype::{self, Bf16};
 use kernels_cuda::linear::frame::{
     Anchored, Contraction, Epilogue, Frame, In, Input, Layout, Pointwise, Quant,
@@ -13,6 +26,7 @@ use kernels_cuda::linear::frame::{
 use kernels_cuda::linear::gemm;
 use kernels_cuda::tuning::Tuning;
 use kernels_ir::anchor::{Given, eval};
+use kernels_ir::frame::round_bf16;
 use kernels_ir::{Binary, Literal, Op, Region, Shape, Unary};
 
 fn contraction(n: usize, k: usize, layout: Layout, acc: Option<Dtype>) -> Contraction {
@@ -150,18 +164,22 @@ impl Case {
     }
 }
 
-/// The worst distance of `got` from `want`, in units of a bf16 product's
-/// tolerance: each element's distance over 1/64 of its value plus the
-/// plane's RMS (a near-zero sum's terms are the RMS's size).
-fn off(got: &[f32], want: &[f32]) -> f64 {
-    let rms = (want.iter().map(|&v| f64::from(v).powi(2)).sum::<f64>() / want.len() as f64).sqrt();
-    got.iter()
-        .zip(want)
-        .map(|(&g, &w)| {
-            let (g, w) = (f64::from(g), f64::from(w));
-            (g - w).abs() / ((w.abs() + rms) / 64.0)
-        })
-        .fold(0.0, f64::max)
+/// A product rounded to bf16, its sum in the frame's order.
+const PRODUCT: f32 = 1.0;
+/// A product's ulp and one rounding point after it.
+const ONE_MORE: f32 = 2.0;
+/// Two products' ulps through GEGLU, and its rounding.
+const GLU: f32 = 3.0;
+
+impl Case {
+    /// How many bf16 ulps the case's results land from the interpreter.
+    fn tolerance(self) -> f32 {
+        match self {
+            Case::Store => PRODUCT,
+            Case::Bias | Case::Softcap | Case::Every => ONE_MORE,
+            Case::Geglu => GLU,
+        }
+    }
 }
 
 /// The case's inputs at `m x n`: on the device, as the frame reads them, and
@@ -246,19 +264,17 @@ fn each_frame_lands_each_epilogue_as_the_interpreter() {
             let want = eval(&anchored, m, &av, &wv, &[], &given).expect("the interpreter runs");
             let got: Vec<Vec<u16>> = outs.iter().map(|&at| gpu.down(at, m * n)).collect();
             for (r, (got, want)) in got.iter().zip(&want).enumerate() {
-                let got: Vec<f32> = got.iter().map(|&v| from_bf16(v)).collect();
-                let apart = off(&got, want);
-                assert!(
-                    apart <= 1.0,
-                    "{what}: result {r} is {apart:.2} tolerances off"
-                );
+                let want: Vec<f32> = want.iter().map(|&v| round_bf16(v)).collect();
+                assert_within(&format!("{what}: result {r}"), got, &want, case.tolerance());
             }
             // The products sum in a fixed order: a second fire lands the
             // same bits.
             fire();
             gpu.sync();
-            let again: Vec<Vec<u16>> = outs.iter().map(|&at| gpu.down(at, m * n)).collect();
-            assert_eq!(again, got, "{what} lands again");
+            for (r, (again, got)) in outs.iter().zip(&got).enumerate() {
+                let again: Vec<u16> = gpu.down(*again, m * n);
+                deterministic(&format!("{what}: result {r}"), got, &again);
+            }
         }
     }
 }
@@ -302,13 +318,8 @@ fn the_anchored_entry_lands_the_hand_rules_on_its_pick() {
         }
         gpu.sync();
         let want = eval(&anchored, m, &av, &wv, &[], &[]).expect("runs");
-        let got: Vec<f32> = gpu
-            .down::<u16>(y, m * n)
-            .into_iter()
-            .map(from_bf16)
-            .collect();
-        let apart = off(&got, &want[0]);
-        assert!(apart <= 1.0, "{what} is {apart:.2} tolerances off");
+        let want: Vec<f32> = want[0].iter().map(|&v| round_bf16(v)).collect();
+        assert_within(&what, &gpu.down::<u16>(y, m * n), &want, case.tolerance());
     }
     // Past every frame's rows: the caller's ops serve it.
     let mut gpu = Gpu::open();

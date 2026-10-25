@@ -506,6 +506,15 @@ mod tests {
                 ],
             ),
             (
+                "linear/contract.cu",
+                &[
+                    "::pie::linear::gemv_frame<::pie::linear::Store, 4, 4, 1, 0, 1, true>",
+                    "::pie::linear::gemv_splitk_frame<::pie::linear::Store, 8, 1, 1, 0, 1, true>",
+                    "::pie::linear::rows_frame<::pie::linear::Store, 4, 8, 1, 1, 0, 1, true>",
+                    "::pie::linear::skinny_frame<::pie::linear::Store, 4, 2, 128, 1, 0, 1, true>",
+                ],
+            ),
+            (
                 "linear/gemm_sm100.cu",
                 &["::pie::linear::tc5_gemm<0, 1, 1, 0, 0, 128, 4, 0, 1, 0, 0, 0, 0>"],
             ),

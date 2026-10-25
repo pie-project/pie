@@ -17,4 +17,4 @@ mod synth_embed;
 mod synth_modulate;
 mod synth_rope;
 mod synth_rules;
-mod within;
+pub(crate) mod within;

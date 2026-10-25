@@ -48,7 +48,7 @@ pub(super) const TURN: f32 = 4.0;
 /// the larger of them, or of a half where both are smaller: a row of order
 /// one counts a value near zero in a half's ulps, not its own far finer
 /// ones.
-pub(super) fn ulps(got: u16, want: f32) -> f32 {
+pub(crate) fn ulps(got: u16, want: f32) -> f32 {
     let got = from_bf16(got);
     let scale = got.abs().max(want.abs()).max(0.5);
     let spacing = 2f32.powi(scale.log2().floor() as i32 - 7);
@@ -56,7 +56,7 @@ pub(super) fn ulps(got: u16, want: f32) -> f32 {
 }
 
 /// The elements of `got` apart from `want`, and the most ulps one is.
-pub(super) fn apart(got: &[u16], want: &[f32]) -> (usize, f32) {
+pub(crate) fn apart(got: &[u16], want: &[f32]) -> (usize, f32) {
     assert_eq!(got.len(), want.len(), "the landed row and its reference");
     got.iter()
         .zip(want)
@@ -67,7 +67,7 @@ pub(super) fn apart(got: &[u16], want: &[f32]) -> (usize, f32) {
 }
 
 /// `got` within `tolerance` ulps of `want`, naming `case` where it is not.
-pub(super) fn assert_within(case: &str, got: &[u16], want: &[f32], tolerance: f32) {
+pub(crate) fn assert_within(case: &str, got: &[u16], want: &[f32], tolerance: f32) {
     let (n, most) = apart(got, want);
     assert!(
         most <= tolerance,
@@ -77,7 +77,7 @@ pub(super) fn assert_within(case: &str, got: &[u16], want: &[f32], tolerance: f3
 }
 
 /// Two fires of one kernel over one input land the same bits.
-pub(super) fn deterministic(case: &str, first: &[u16], second: &[u16]) {
+pub(crate) fn deterministic(case: &str, first: &[u16], second: &[u16]) {
     assert!(
         first == second,
         "{case}: two fires of the kernel land different bits"
