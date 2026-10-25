@@ -307,11 +307,11 @@ fn check_turbo(src: &ztensor::Source, index: &BTreeSet<String>) {
 
     let dit_index: BTreeSet<&String> = index.iter().filter(|n| n.starts_with("dit.")).collect();
     let dit_read: BTreeSet<&String> = counts.keys().filter(|n| n.starts_with("dit.")).collect();
-    // The image pad token pads no rows: a voxel lane carries only its
-    // patches (the TokenGrid contract).
+    // The pad tokens pad no rows: a voxel lane carries only its patches
+    // (the TokenGrid contract) and a caption lane only its own rows.
     let unread: Vec<&&String> = dit_index
         .difference(&dit_read)
-        .filter(|n| n.as_str() != "dit.x_pad_token")
+        .filter(|n| !n.ends_with("_pad_token"))
         .collect();
     assert!(
         unread.is_empty(),
@@ -372,11 +372,11 @@ fn check_mini(src: &ztensor::Source, index: &BTreeSet<String>) {
     let read: BTreeSet<&String> = counts.keys().collect();
     let want: BTreeSet<&String> = index
         .iter()
-        .filter(|n| !n.ends_with("x_pad_token"))
+        .filter(|n| !n.ends_with("_pad_token"))
         .collect();
     assert_eq!(
         read, want,
-        "the miniature reads its whole state_dict but the image pad token, and nothing else"
+        "the miniature reads its whole state_dict but the pad tokens, and nothing else"
     );
     let twice: BTreeSet<String> = counts
         .iter()
@@ -533,15 +533,6 @@ fn the_derived_planes_are_stated_as_constants() {
         expr.visit(&mut |node| found |= matches!(node, Expr::Const { .. }));
         found
     };
-    for bank in ["dit.x_pad_mod", "dit.cap_pad_mod"] {
-        let bank = named(bank);
-        assert!(
-            carries_a_constant(&bank.expr),
-            "`{}`'s negative half is a constant the contract carries",
-            bank.name
-        );
-        assert_eq!(bank.expr.sources().len(), 1, "the token itself, once");
-    }
     let flip = named("dit.t_flip");
     assert!(
         carries_a_constant(&flip.expr),

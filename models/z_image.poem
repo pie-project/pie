@@ -267,7 +267,6 @@ def layout(id, deploy):
             x_embed = linear(dim, PATCH_FEATURES, banks),
             cap_norm = weight([d.cap_width]),
             cap_embed = linear(dim, d.cap_width, banks),
-            cap_pad_mod = weight([2 * dim, 1]),
             t_mlp0 = linear(T_MID, T_FREQ_DIM, banks),
             t_mlp1 = linear(ADALN_DIM, T_MID, banks),
             t_flip = weight([1], dtype.f32, values = [T_FLIP]),
@@ -296,9 +295,6 @@ def generative(m):
     return generation(
         latent = latent_space(
             channels = CHANNELS,
-            patch_t = 1,
-            patch_h = PATCH,
-            patch_w = PATCH,
             spatial_compression = SPATIAL_COMPRESSION,
             temporal_compression = 1,
         ),
@@ -437,26 +433,11 @@ def read(m, reads, prefix):
     if m.vae != None:
         vae_read(reads, m.vae, 2 * m.vae.encoder.conv_out.c_out)
 
-def raw_of(w, name, what):
-    held = stored(name)
-    if held.raw == None:
-        fail("`{}`: `{}` is stored {}; {}".format(w.name, name, held, what))
-    return held.raw
-
-def pad_table(reads, w, token):
-    dt = raw_of(w, token, "a pad token is a raw float row")
-    dim = w.shape[0] // 2
-    reads.read_expr(w, concat(0, [
-        constant(w.name, [-1.0] * dim, [dim, 1], dt),
-        src(token).transmute([dim, 1], raw(dt)),
-    ]))
-
 def dit(reads, m, prefix):
     at = lambda tail: prefix + tail
     biased(reads, m.x_embed, at("all_x_embedder.2-1"))
     reads.read(m.cap_norm, at("cap_embedder.0.weight"))
     biased(reads, m.cap_embed, at("cap_embedder.1"))
-    pad_table(reads, m.cap_pad_mod, at("cap_pad_token"))
     biased(reads, m.t_mlp0, at("t_embedder.mlp.0"))
     biased(reads, m.t_mlp1, at("t_embedder.mlp.2"))
     for stem, blocks in [
@@ -669,15 +650,11 @@ def caption_positions(arm, dit):
     cells = ops.conv.cells(arm.token_grid(PATCH_BOX), arm.positions(), 0)
     return ops.elemwise.add_bias(dit.origin, cells)
 
-def pad_rows(x, flag, bank):
-    return ops.elemwise.modulate(x, ops.linear.matmul(flag, bank), None, "scale_shift")
-
 def refine(arm, m):
     d, dit = m.dims, m.dit
     c = arm.input("caption", dtype.bf16, "row", d.cap_width)
     c = ops.elemwise.rmsnorm(c, dit.cap_norm, NORM_EPS)
     c = run_linear(dit.cap_embed, c)
-    c = pad_rows(c, arm.input("pad", dtype.bf16, "row", 1), dit.cap_pad_mod)
     geom = struct(
         positions = turn_positions(arm, caption_positions(arm, dit)),
         perm = arm.row_permutation(),
