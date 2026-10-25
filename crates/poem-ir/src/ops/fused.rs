@@ -746,6 +746,27 @@ pub enum Fused {
         #[output]
         outs: Vec<ValueId>,
     },
+    /// A contraction and the pointwise math over its product tile, formed
+    /// by the compiler (poem-compiler's `fuse::anchor`): `act · wᵀ` over a
+    /// dense bank of `parts · n` rows (one product a part at each `(m, n)`,
+    /// `n` the width of every result), then the epilogue at each `(m, n)`,
+    /// `ins[k]` its input `k` (a tile of the product's rows, a vector a
+    /// column, one value a row or one value) and `outs[k]` its result `k`.
+    /// The product itself is no value. `key` is the anchored region's own
+    /// key (kernels-ir's `Anchored::key`), the one it is held under in the
+    /// compiled model; each backend fills its contraction's hooks from it.
+    /// No output lands over an input.
+    Anchored {
+        #[input]
+        act: ValueId,
+        #[input]
+        w: ValueId,
+        #[input]
+        ins: Vec<ValueId>,
+        key: u64,
+        #[output]
+        outs: Vec<ValueId>,
+    },
 }
 
 #[cfg(test)]
@@ -906,6 +927,15 @@ mod tests {
         };
         assert_eq!(operands(&op), (vec![1, 2, 3], vec![4, 5], vec![]));
         assert_eq!(op.name(), "fused.region");
+        let anchored = Fused::Anchored {
+            act: v(1),
+            w: v(2),
+            ins: vec![v(3)],
+            key: 0x5eed,
+            outs: vec![v(4)],
+        };
+        assert_eq!(operands(&anchored), (vec![1, 2, 3], vec![4], vec![]));
+        assert_eq!(anchored.name(), "fused.anchored");
     }
 
     /// The sinks scale the merged plane where it lies; a log-sum-exp

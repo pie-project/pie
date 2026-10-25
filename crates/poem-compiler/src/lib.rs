@@ -54,8 +54,10 @@ pub fn compile(
 }
 
 /// The plan of `trace` under `budgets` on `profile`'s device, the trace
-/// as it stands: a backend that runs chains as generated kernels folds
-/// them first ([`fuse::chain::fold`], under `compiler.synth_regions`).
+/// as it stands: a backend that runs products' epilogues and chains as
+/// generated kernels folds them first ([`fuse::anchor::fold`] under
+/// `compiler.synth_anchors`, then [`fuse::chain::fold`] under
+/// `compiler.synth_regions`).
 pub fn compile_axes(
     trace: &Trace,
     budgets: &Budgets,

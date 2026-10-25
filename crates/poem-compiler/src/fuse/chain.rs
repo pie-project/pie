@@ -41,8 +41,9 @@ use std::collections::BTreeMap;
 use kernels_ir::build::{self, Ops};
 use kernels_ir::{Binary, Op, Reduce, Region, Shape, Unary};
 use poem_ir::{
-    ActFn, BinaryOp, Bounds, Def, Dim, Dtype, Elemwise, Fused, Gather, ModulateForm, Node,
-    NormAxis, NormWeight, Operands, Operation, RegionRead, ResidualGate, Trace, Turn, Ty, ValueId,
+    ActFn, BinaryOp, Bounds, Def, Dim, Dtype, Elemwise, Fused, Gather, GluAct, Linear,
+    ModulateForm, Node, NormAxis, NormWeight, Operands, Operation, RegionRead, ResidualGate, Trace,
+    Turn, Ty, ValueId,
 };
 
 /// The most ops one chain holds.
@@ -219,7 +220,7 @@ fn heads_fit(region: &Region, width: u32) -> bool {
 /// `trace` with each run's ops replaced by its op, landed where the run's
 /// last op was, under the run's guard and in the layer of its last op that
 /// has one (a fuse rule's match lands so too); the runs are apart.
-fn replace(mut trace: Trace, runs: Vec<(Vec<u32>, Fused)>) -> Trace {
+pub(super) fn replace(mut trace: Trace, runs: Vec<(Vec<u32>, Fused)>) -> Trace {
     // Each node's run, and the run each run's last node lands.
     let mut run_of: Vec<Option<usize>> = vec![None; trace.nodes.len()];
     for (r, (nodes, _)) in runs.iter().enumerate() {
@@ -287,7 +288,7 @@ fn replace(mut trace: Trace, runs: Vec<(Vec<u32>, Fused)>) -> Trace {
 }
 
 /// How far past a chain's first op its run is looked for.
-const REACH: u32 = 64;
+pub(super) const REACH: u32 = 64;
 
 /// Every chain of `trace` the row frame holds, by its first op; ops outside
 /// them run as they are.
@@ -360,6 +361,12 @@ fn held(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
 /// merge's arms all land on. The ties the chain's own ops make in place
 /// are its op's to break, each result a plane of its own.
 fn lands_apart(trace: &Trace, chain: &Chain) -> bool {
+    lands_apart_of(trace, &chain.nodes, &chain.ins, &chain.outs)
+}
+
+/// [`lands_apart`] of the values `ins` and `outs` an op replacing `nodes`
+/// reads and writes.
+pub(super) fn lands_apart_of(trace: &Trace, nodes: &[u32], ins: &[In], outs: &[Out]) -> bool {
     let mut tied: Vec<u32> = (0..u32::try_from(trace.values.len()).unwrap_or(u32::MAX)).collect();
     fn find(tied: &mut [u32], mut v: u32) -> u32 {
         while tied[v as usize] != v {
@@ -381,7 +388,7 @@ fn lands_apart(trace: &Trace, chain: &Chain) -> bool {
     }
     let mut pairs = Vec::new();
     for (at, node) in (0u32..).zip(&trace.nodes) {
-        if chain.nodes.contains(&at) {
+        if nodes.contains(&at) {
             continue;
         }
         pairs.clear();
@@ -390,16 +397,14 @@ fn lands_apart(trace: &Trace, chain: &Chain) -> bool {
             tie(out, overwritten);
         }
     }
-    chain.outs.iter().all(|out| {
-        chain
-            .ins
-            .iter()
+    outs.iter().all(|out| {
+        ins.iter()
             .all(|input| find(&mut tied, out.value.0) != find(&mut tied, input.value.0))
     })
 }
 
 /// Whether `node` reads a value an op of `run` computes.
-fn reads_from(trace: &Trace, run: &[u32], node: u32) -> bool {
+pub(super) fn reads_from(trace: &Trace, run: &[u32], node: u32) -> bool {
     let mut ins = Vec::new();
     trace.nodes[node as usize].op.inputs(&mut ins);
     ins.iter()
@@ -409,7 +414,7 @@ fn reads_from(trace: &Trace, run: &[u32], node: u32) -> bool {
 /// Whether the ops between the first and the last of `run` keep their
 /// order once the run lands where its last op was: none reads what the run
 /// computes or a cache it reads, and none writes in place what it reads.
-fn keeps_order(trace: &Trace, run: &[u32]) -> bool {
+pub(super) fn keeps_order(trace: &Trace, run: &[u32]) -> bool {
     let (Some(&first), Some(&last)) = (run.first(), run.last()) else {
         return false;
     };
@@ -440,14 +445,14 @@ fn keeps_order(trace: &Trace, run: &[u32]) -> bool {
 
 /// The rows a lowerable op runs over: their leading dim and width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Rows {
-    dim: Dim,
-    width: u64,
+pub(super) struct Rows {
+    pub(super) dim: Dim,
+    pub(super) width: u64,
 }
 
 /// The rows `node` runs over, if this module lowers it: every value it
 /// reads or writes is a row of one width (or a weight that wide).
-fn row_of(trace: &Trace, node: u32) -> Option<Rows> {
+pub(super) fn row_of(trace: &Trace, node: u32) -> Option<Rows> {
     let op = &trace.nodes[node as usize].op;
     if !lowers(op) {
         return None;
@@ -520,11 +525,11 @@ fn ins_of(op: &Operation) -> Vec<ValueId> {
 /// One value an op reads, and how: as its own rows, or by id (`by`, one
 /// element a row) and from a column on; `half`, a part of a wider row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Read {
-    value: ValueId,
-    by: Option<ValueId>,
-    from: u32,
-    half: bool,
+pub(super) struct Read {
+    pub(super) value: ValueId,
+    pub(super) by: Option<ValueId>,
+    pub(super) from: u32,
+    pub(super) half: bool,
 }
 
 impl Read {
@@ -541,7 +546,7 @@ impl Read {
 /// What `op` reads, over rows of `width`: each input as its own rows, but a
 /// modulation's vectors (scale, then shift, of a row twice as wide) and a
 /// residual's gate, each its row's or picked by the row's lane.
-fn reads_of(op: &Operation, width: u32) -> Vec<Read> {
+pub(super) fn reads_of(op: &Operation, width: u32) -> Vec<Read> {
     let parted = |value: ValueId, by: Option<ValueId>, from: u32| Read {
         value,
         by,
@@ -604,7 +609,7 @@ fn joins(trace: &Trace, run: &[u32], node: u32, row: Rows) -> bool {
 }
 
 /// How a value a chain touches is laid out.
-enum Form {
+pub(super) enum Form {
     /// One row of `width` a row of `dim`.
     Rows { dim: Dim, width: u64 },
     /// One row of `width` every row reads: a weight (the row's width, or
@@ -619,7 +624,7 @@ enum Form {
     Table { width: u64 },
 }
 
-fn form(trace: &Trace, v: ValueId) -> Option<Form> {
+pub(super) fn form(trace: &Trace, v: ValueId) -> Option<Form> {
     let decl = &trace.values[v.0 as usize];
     let Ty::Tensor { shape, dtype } = &decl.ty else {
         return None;
@@ -651,7 +656,7 @@ fn form(trace: &Trace, v: ValueId) -> Option<Form> {
     }
 }
 
-fn dtype_of(trace: &Trace, v: ValueId) -> Dtype {
+pub(super) fn dtype_of(trace: &Trace, v: ValueId) -> Dtype {
     let decl = &trace.values[v.0 as usize];
     match (&decl.def, &decl.ty) {
         (Def::Weight(i), _) => trace.params[*i as usize].dtype,
@@ -803,13 +808,13 @@ fn ramp_bounds(
 }
 
 /// Who may read each value past a chain: another op, a seam or a merge.
-struct Escapes {
+pub(super) struct Escapes {
     readers: Vec<Vec<u32>>,
     held: Vec<bool>,
 }
 
 impl Escapes {
-    fn of(trace: &Trace) -> Escapes {
+    pub(super) fn of(trace: &Trace) -> Escapes {
         let mut readers = vec![Vec::new(); trace.values.len()];
         let mut held = vec![false; trace.values.len()];
         let mut ins = Vec::new();
@@ -837,7 +842,7 @@ impl Escapes {
 
     /// Whether `v`, computed inside `run`, may be read past it. A value
     /// nothing reads is the trace's to keep, so it leaves too.
-    fn leaves(&self, v: ValueId, run: &[u32]) -> bool {
+    pub(super) fn leaves(&self, v: ValueId, run: &[u32]) -> bool {
         let readers = &self.readers[v.0 as usize];
         self.held[v.0 as usize] || readers.is_empty() || readers.iter().any(|r| !run.contains(r))
     }
@@ -907,12 +912,7 @@ fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
         computed.extend_from_slice(&ids);
     }
 
-    let mut b = Builder {
-        b: Ops::new(u32::try_from(ins.len()).ok()?),
-        width,
-        of: BTreeMap::new(),
-        parts: BTreeMap::new(),
-    };
+    let mut b = Builder::new(u32::try_from(ins.len()).ok()?, width);
     for (k, input) in (0u32..).zip(&ins) {
         if input.by.is_some() || input.from > 0 || reads_parted(trace, run, input.value) {
             b.parts.insert((input.value, input.from), k);
@@ -1031,17 +1031,27 @@ fn reads_parted(trace: &Trace, run: &[u32], v: ValueId) -> bool {
 }
 
 /// A region's ops for a run, one trace op at a time.
-struct Builder {
-    b: Ops,
+pub(super) struct Builder {
+    pub(super) b: Ops,
     width: u32,
     /// The region's value each trace value is.
-    of: BTreeMap<ValueId, u32>,
+    pub(super) of: BTreeMap<ValueId, u32>,
     /// The parameter each part of a wider row is (a value and its first
     /// column).
-    parts: BTreeMap<(ValueId, u32), u32>,
+    pub(super) parts: BTreeMap<(ValueId, u32), u32>,
 }
 
 impl Builder {
+    /// A region's ops over rows `width` wide, of `params` parameters.
+    pub(super) fn new(params: u32, width: u32) -> Builder {
+        Builder {
+            b: Ops::new(params),
+            width,
+            of: BTreeMap::new(),
+            parts: BTreeMap::new(),
+        }
+    }
+
     fn push(&mut self, op: Op) -> u32 {
         self.b.push(op)
     }
@@ -1050,7 +1060,7 @@ impl Builder {
         self.b.f32(x)
     }
 
-    fn get(&self, v: ValueId) -> Option<u32> {
+    pub(super) fn get(&self, v: ValueId) -> Option<u32> {
         self.of.get(&v).copied()
     }
 
@@ -1072,14 +1082,24 @@ impl Builder {
         self.push(Op::Unary(Unary::Recip, den))
     }
 
-    /// `1 - 2 / (e^2t + 1)`: a region has no tanh.
+    /// `tanh(t)`, as the hand kernels' `tanhf`.
     fn tanh(&mut self, t: u32) -> u32 {
-        let (one, two) = (self.konst(1.0), self.konst(2.0));
-        let twice = self.push(Op::Binary(Binary::Mul, t, two));
-        let exp = self.push(Op::Unary(Unary::Exp, twice));
-        let den = self.push(Op::Binary(Binary::Add, exp, one));
-        let frac = self.push(Op::Binary(Binary::Div, two, den));
-        self.push(Op::Binary(Binary::Sub, one, frac))
+        self.push(Op::Unary(Unary::Tanh, t))
+    }
+
+    /// `0.5 t (1 + tanh(√(2/π) (t + 0.044715 t³)))`.
+    fn gelu_tanh(&mut self, t: u32) -> u32 {
+        let (half, one) = (self.konst(0.5), self.konst(1.0));
+        let (c, cubic) = (self.konst(GELU_SQRT_2_OVER_PI), self.konst(GELU_CUBIC));
+        let t2 = self.push(Op::Binary(Binary::Mul, t, t));
+        let t3 = self.push(Op::Binary(Binary::Mul, t2, t));
+        let k3 = self.push(Op::Binary(Binary::Mul, cubic, t3));
+        let inner = self.push(Op::Binary(Binary::Add, t, k3));
+        let arg = self.push(Op::Binary(Binary::Mul, c, inner));
+        let th = self.tanh(arg);
+        let up = self.push(Op::Binary(Binary::Add, one, th));
+        let ht = self.push(Op::Binary(Binary::Mul, half, t));
+        self.push(Op::Binary(Binary::Mul, ht, up))
     }
 
     /// The row's mean: its sum over the width.
@@ -1105,7 +1125,7 @@ impl Builder {
         self.push(Op::Binary(Binary::Mul, n, w))
     }
 
-    fn node(&mut self, trace: &Trace, op: &Operation) -> Option<()> {
+    pub(super) fn node(&mut self, trace: &Trace, op: &Operation) -> Option<()> {
         match op {
             Operation::Elemwise(e) => self.elemwise(trace, e),
             // the row an id picks of the table, a parameter read so
@@ -1124,6 +1144,7 @@ impl Builder {
                 self.set(*y, row);
                 Some(())
             }
+            Operation::Linear(linear) => self.linear(linear),
             Operation::Fused(Fused::ResidualAddRmsnorm {
                 x,
                 y,
@@ -1142,6 +1163,49 @@ impl Builder {
             }
             _ => None,
         }
+    }
+
+    /// A product's activations, each pointwise over its tile: a GLU of a
+    /// packed `[gate | up]` row's two halves (the row's parts, from column
+    /// 0 and from the width on), and the ungated ones. Only a contraction's
+    /// epilogue reads a product so (`fuse::anchor`); a chain lowers none.
+    fn linear(&mut self, op: &Linear) -> Option<()> {
+        match *op {
+            Linear::Glu {
+                packed: Some(packed),
+                gate: None,
+                up: None,
+                weights: None,
+                intermediate,
+                act,
+                limit: None,
+                y,
+            } if intermediate == self.width => {
+                let (gate, up) = (self.part(packed, 0)?, self.part(packed, self.width)?);
+                let gated = match act {
+                    GluAct::Swiglu => {
+                        let s = self.sigmoid(gate);
+                        self.push(Op::Binary(Binary::Mul, gate, s))
+                    }
+                    GluAct::GegluTanh => self.gelu_tanh(gate),
+                    _ => return None,
+                };
+                let out = self.push(Op::Binary(Binary::Mul, gated, up));
+                self.set(y, out);
+            }
+            Linear::GeluTanh { x, y } => {
+                let out = self.gelu_tanh(self.get(x)?);
+                self.set(y, out);
+            }
+            Linear::Relu2 { x, y } => {
+                let zero = self.konst(0.0);
+                let r = self.push(Op::Binary(Binary::Max, self.get(x)?, zero));
+                let out = self.push(Op::Binary(Binary::Mul, r, r));
+                self.set(y, out);
+            }
+            _ => return None,
+        }
+        Some(())
     }
 
     fn elemwise(&mut self, trace: &Trace, e: &Elemwise) -> Option<()> {
@@ -1329,19 +1393,7 @@ impl Builder {
                         self.push(Op::Binary(Binary::Mul, t, s))
                     }
                     ActFn::Tanh => self.tanh(t),
-                    ActFn::Gelu { tanh: true } => {
-                        let (half, one) = (self.konst(0.5), self.konst(1.0));
-                        let (c, cubic) = (self.konst(GELU_SQRT_2_OVER_PI), self.konst(GELU_CUBIC));
-                        let t2 = self.push(Op::Binary(Binary::Mul, t, t));
-                        let t3 = self.push(Op::Binary(Binary::Mul, t2, t));
-                        let k3 = self.push(Op::Binary(Binary::Mul, cubic, t3));
-                        let inner = self.push(Op::Binary(Binary::Add, t, k3));
-                        let arg = self.push(Op::Binary(Binary::Mul, c, inner));
-                        let th = self.tanh(arg);
-                        let up = self.push(Op::Binary(Binary::Add, one, th));
-                        let ht = self.push(Op::Binary(Binary::Mul, half, t));
-                        self.push(Op::Binary(Binary::Mul, ht, up))
-                    }
+                    ActFn::Gelu { tanh: true } => self.gelu_tanh(t),
                     ActFn::Gelu { tanh: false } => return None,
                     ActFn::Sqrt => self.push(Op::Unary(Unary::Sqrt, t)),
                 };
