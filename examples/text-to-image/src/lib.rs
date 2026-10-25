@@ -179,11 +179,13 @@ struct Text {
 }
 
 /// A token-less reading that turns `from`-wide rows into `to`-wide hidden
-/// rows: its stream and the one input it reads them through.
+/// rows: its stream, the one row input it reads them through, and whether
+/// it reads their own count (`length`) too.
 struct Bridge {
     reading: String,
     stream: Option<String>,
     input: String,
+    length: bool,
 }
 
 struct Denoise {
@@ -265,7 +267,9 @@ fn bridge_reading(from: u32, to: u32) -> Result<Bridge> {
             if lane.embeds || lane.reads_kv || !hidden {
                 continue;
             }
-            if let [only] = &lane.inputs[..]
+            let (length, rest): (Vec<_>, Vec<_>) =
+                lane.inputs.iter().partition(|input| input.name == "length");
+            if let [only] = &rest[..]
                 && only.axis == model::InputAxis::Row
                 && only.width == from
             {
@@ -273,6 +277,7 @@ fn bridge_reading(from: u32, to: u32) -> Result<Bridge> {
                     input: only.name.clone(),
                     reading,
                     stream,
+                    length: !length.is_empty(),
                 });
             }
         }
@@ -282,6 +287,16 @@ fn bridge_reading(from: u32, to: u32) -> Result<Bridge> {
          no reading turns one into the other"
     )
     .into())
+}
+
+/// The rows a lane of `len` rows of its own carries under the model's
+/// `input-decl.rows`, `None` when they do not fit.
+fn padded(rows: Option<model::RowCount>, len: u32) -> Option<u32> {
+    match rows {
+        None => Some(len),
+        Some(model::RowCount::Exact(n)) => (len <= n).then_some(n),
+        Some(model::RowCount::Multiple(n)) => len.checked_next_multiple_of(n),
+    }
 }
 
 /// `rows` rows of `width` out of `h`'s first `len`, the rest zero: the
@@ -304,7 +319,9 @@ struct Held {
 }
 
 /// Encode `prompt` on `pipe` into a device channel the denoise `context`
-/// input takes. `then` runs at the end of the last pass's epilogue.
+/// input takes, and its own rows before the pad (the `length` input a
+/// padding model reads). `then` runs at the end of the last pass's
+/// epilogue.
 fn encode(
     pipe: &Pipeline,
     held: &mut Held,
@@ -313,7 +330,7 @@ fn encode(
     context: &model::InputDecl,
     prompt: &str,
     then: Option<Box<dyn Fn()>>,
-) -> Result<Channel> {
+) -> Result<(Channel, Channel)> {
     let mut ids = inferlet::chat::first_user(prompt);
     ids.extend(inferlet::chat::cue());
     let len = u32::try_from(ids.len()).map_err(|_| "the prompt is too long")?;
@@ -326,14 +343,13 @@ fn encode(
             format!("the prompt is {len} tokens and one pass reads out {cap} hidden rows").into(),
         );
     }
-    let rows = context.rows.unwrap_or(len);
-    if len > rows {
-        return Err(format!(
-            "input `{}` takes {rows} rows and the prompt is {len} tokens",
-            context.name
+    let rows = padded(context.rows, len).ok_or_else(|| {
+        format!(
+            "input `{}` takes {:?} rows and the prompt is {len} tokens",
+            context.name, context.rows
         )
-        .into());
-    }
+    })?;
+    let length = Channel::from([len as f32]).named("length");
     let ids: Vec<i32> = ids
         .iter()
         .map(|&id| i32::try_from(id).unwrap_or(0))
@@ -367,12 +383,15 @@ fn encode(
     pass.submit(pipe)?;
     held.passes.push(pass);
     let Some(bridge) = bridge else {
-        return Ok(encoded);
+        return Ok((encoded, length));
     };
     let to = context.width;
     let pass = ForwardPass::new();
     set_switches(&pass, 0, &bridge.reading, bridge.stream.as_deref())?;
     pass.input(0, &bridge.input, &encoded)?;
+    if bridge.length {
+        pass.input(0, "length", &length)?;
+    }
     let bridged = Channel::new([rows, to], dtype::f32).queued();
     pass.epilogue(move || {
         bridged.put(intrinsics::hidden(0, rows, to));
@@ -382,7 +401,7 @@ fn encode(
     });
     pass.submit(pipe)?;
     held.passes.push(pass);
-    Ok(bridged)
+    Ok((bridged, length))
 }
 
 /// One weight per latent cell: the fraction of its `cell x cell` pixels the
@@ -711,13 +730,14 @@ async fn main(input: Input) -> Result<Output> {
             for decl in lane(&denoise.reading, stream.as_deref())?.inputs {
                 let ch = match decl.name.as_str() {
                     "latents" if latent => &x,
-                    "context" if !latent => ctx,
+                    "context" if !latent => &ctx.0,
+                    "length" if !latent => &ctx.1,
                     "timestep" => &t,
                     "guidance" => &guidance_ch,
                     other => {
                         return Err(format!(
                             "reading `{}` reads `{other}` on lane {at}; this sampler binds latents, \
-                             timestep, guidance and context",
+                             timestep, guidance, context and length",
                             denoise.reading
                         )
                         .into());
@@ -816,7 +836,7 @@ async fn main(input: Input) -> Result<Output> {
         guidance,
         cfg,
         sigmas: sched.sigmas.clone(),
-        context_rows: context.shape().dims()[0],
+        context_rows: context.0.shape().dims()[0],
         context_readings: std::iter::once(text.reading.clone())
             .chain(bridge.map(|b| b.reading))
             .collect(),

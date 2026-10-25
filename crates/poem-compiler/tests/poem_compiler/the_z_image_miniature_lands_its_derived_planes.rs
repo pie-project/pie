@@ -83,6 +83,22 @@ fn the_miniature_lands_its_derived_planes() {
             .unwrap_or_else(|| panic!("`{name}` was not published"))
     };
 
+    for (bank, token) in [("dit.cap_pad_mod", "cap_pad_token")] {
+        let got = bf16(landed(bank));
+        assert_eq!(got.len(), 2 * dim, "{bank} is [2·dim, 1]");
+        let (scale, shift) = got.split_at(dim);
+        assert!(
+            scale.iter().all(|&v| v == -1.0),
+            "{bank}: a pad row scales by −1"
+        );
+        let want: Vec<f32> = f32s(&stored(token)).into_iter().map(round_bf16).collect();
+        assert_eq!(
+            shift,
+            want.as_slice(),
+            "{bank}: a pad row shifts by the learned token"
+        );
+    }
+
     assert_eq!(f32s(landed("dit.t_flip")), vec![1000.0]);
 
     let qkv = bf16(landed("dit.layer.0.qkv"));
