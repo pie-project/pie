@@ -1,9 +1,8 @@
 //! The pie half of the FLUX.2 miniature golden. Hands the `flux2-mini` row
-//! exactly what `scripts/imagegen/flux2_golden.py --mini` handed diffusers'
-//! `Flux2Transformer2DModel` — the target tokens, the two references'
-//! tokens, the raw `[32, 192]` text stack, the timestep, the guidance scale
-//! and the four rotary coordinates of every row — and reads back the
-//! velocity the head predicts on the target rows, as JSON
+//! what `scripts/imagegen/flux2_golden.py --mini` handed diffusers'
+//! `Flux2Transformer2DModel` — the target latent, the references' latents,
+//! the raw `[32, 192]` text stack, the timestep and the guidance scale — and
+//! reads back the velocity the head predicts on the target rows, as JSON
 //! `scripts/imagegen/flux2_parity.py` turns into an `.npz` under the
 //! golden's own key names.
 //!
@@ -95,10 +94,7 @@ struct Dims {
     velocity_width: u32,
 }
 
-/// The lane `stream` of `reading`, checked to read exactly `binds`: what
-/// this guest binds on that lane, by the model's own input names. Checked
-/// up front so a model whose lane reads anything else fails here in its own
-/// vocabulary instead of at `program`.
+/// The lane `stream` of `reading`, checked to read exactly `binds`.
 fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::LaneDecl> {
     let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
     if lane.state || lane.embeds {
@@ -114,8 +110,7 @@ fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::La
     if reads != wants {
         return Err(format!(
             "reading `{reading}`'s `{stream}` lane reads {reads:?}; this pass binds {wants:?}"
-        )
-        .into());
+        ));
     }
     Ok(lane)
 }
@@ -148,8 +143,7 @@ fn dims(reading: &str, references: bool) -> Result<Dims> {
     })
 }
 
-/// The scalars every lane of the reading binds, on lane `lane`: the one
-/// timestep (and guidance) channel of the pass.
+/// Binds the pass's one timestep (and guidance) channel on `lane`.
 fn scalars(pass: &ForwardPass, lane: u32, t: &Channel, g: Option<&Channel>) -> Result<()> {
     pass.input(lane, "timestep", t)?;
     if let Some(g) = g {
@@ -167,8 +161,7 @@ fn latent(at: &Latent, channels: u32, name: &str) -> Result<Channel> {
             at.latents.len(),
             at.height,
             at.width
-        )
-        .into());
+        ));
     }
     Ok(Channel::from_shaped([at.height, at.width, channels], at.latents.as_slice()).named(name))
 }
@@ -224,7 +217,7 @@ async fn step(case: &Case, dims: &Dims, reading: &str, pipe: &Pipeline) -> Resul
         out.put(intrinsics::velocity(1, voxels, velocity_width));
     });
     pass.submit(pipe).context("the denoise step")?;
-    out.take_host::<Vec<f32>>().await.map_err(Into::into)
+    out.take_host::<Vec<f32>>().await
 }
 
 #[inferlet::main]
@@ -261,8 +254,7 @@ async fn main(input: Input) -> Result<Output> {
         return Err(format!(
             "the model reads a {}-wide velocity and the case's latent has {} channels",
             dims.velocity_width, case.channels
-        )
-        .into());
+        ));
     }
     if !dims.guidance && case.guidance != 0.0 {
         return Err("the case carries a guidance scale and this row reads no `guidance`".into());

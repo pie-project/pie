@@ -54,10 +54,8 @@ pub struct ExecPlan {
 }
 
 impl ExecPlan {
-    /// Whether the prologue takes or puts a channel: then it runs, and
-    /// commits, on its own before the forward, which reads what it put.
-    /// Every other stage, and the ports, run after the forward; so does a
-    /// prologue that moves nothing.
+    /// Whether the prologue takes or puts a channel, and so runs and commits
+    /// on its own before the forward.
     #[must_use]
     pub fn prologue_runs(&self) -> bool {
         self.package

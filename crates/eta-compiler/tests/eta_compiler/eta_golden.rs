@@ -1,4 +1,4 @@
-use crate::msl_corpus::{Served, golden_profile};
+use crate::msl_corpus::{Served, golden_served};
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer, encode};
 use eta_ir::container_hash;
 use eta_ir::op::{IntrinsicId, Op};
@@ -79,8 +79,8 @@ fn check(name: &str, report: Report) {
     );
 }
 
-fn neg_report(name: &str, c: TraceContainer, profile: Served) {
-    let verdict = profile.bind(c.clone());
+fn neg_report(name: &str, c: TraceContainer, served: Served) {
+    let verdict = served.bind(c.clone());
     let rep = Report::new(name, &c).verdict(&verdict);
     assert!(verdict.is_err(), "{name} must fail validation");
     check(name, rep);
@@ -232,7 +232,7 @@ fn golden_neg_model_gated_missing() {
     neg_report(
         "neg_model_gated_missing",
         c,
-        golden_profile("neg_model_gated_missing"),
+        golden_served("neg_model_gated_missing"),
     );
 }
 

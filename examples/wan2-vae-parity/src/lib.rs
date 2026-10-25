@@ -1,15 +1,10 @@
 //! **THE WAN 2.2 CAUSAL VAE, DECODED THROUGH THE RUNTIME.** The pie half of
 //! `scripts/imagegen/wan22_vae_parity.py`.
 //!
-//! The engine gate `the_wan_2_vae_answers_the_reference` drives the shell
-//! from the host; this guest decodes a `T`-frame latent the way
-//! `examples/text-to-video` does: ONE reading, one fire per latent frame
-//! down ONE pipeline, each binding ONE working set whose recurrent state is
-//! the conv caches. The model runs its head form where that state is empty
-//! (the first fire, one output frame) and the rest form after. Every chunk
-//! after the first reads the conv caches the fire before it left, so a
-//! runtime that hands a later fire cold caches shows up as a chunk that
-//! drifts.
+//! Decodes a `T`-frame latent the way `examples/text-to-video` does: one
+//! decode pass per latent frame down one pipeline, each binding one working
+//! set whose recurrent state is the conv caches. The derived `fresh` switch
+//! picks the head branch on the first pass (one output frame).
 //!
 //! The pixels go back to the client as one raw `[F*H*W, 3]` f32 file
 //! (`pie run -o DIR` writes it as `file-0000.bin`).
@@ -106,13 +101,11 @@ fn voxel_input(reading: &str) -> Result<model::InputDecl> {
         other => Err(format!(
             "reading `{reading}` reads {} input(s), and a VAE arm reads one clip on the voxel axis",
             other.len()
-        )
-        .into()),
+        )),
     }
 }
 
-/// Fire the decode over ONE latent frame into `state` and take its pixels
-/// back — `text-to-video`'s `decode_frame`, unchanged.
+/// Decodes one latent frame into `state` and takes its pixels back.
 #[allow(clippy::too_many_arguments)]
 async fn decode_frame(
     reading: &str,
@@ -138,13 +131,13 @@ async fn decode_frame(
         Channel::from_shaped([clip_h, clip_w, input.width], clip.to_vec()).named("vae_latent");
     pass.input(0, &input.name, &cell)?;
     let out = Channel::new([rows, width], dtype::f32).named("vae_pixels");
-    let readback = out.clone();
+    let readback = out;
     pass.epilogue(move || {
         readback.put(intrinsics::pixels(0, rows, width));
     });
     pass.submit(pipe)
         .with_context(|| format!("the `{reading}` fire"))?;
-    out.take_host::<Vec<f32>>().await.map_err(Into::into)
+    out.take_host::<Vec<f32>>().await
 }
 
 #[inferlet::main]
@@ -185,22 +178,19 @@ async fn main(input: Input) -> Result<Output> {
             case.h,
             case.w,
             case.channels
-        )
-        .into());
+        ));
     }
     let space = model::latent().ok_or("this model states no latent space")?;
     if space.channels != case.channels {
         return Err(format!(
             "the case is {} channels and the model's latent is {}",
             case.channels, space.channels
-        )
-        .into());
+        ));
     }
     let (tc, sc) = (space.temporal_compression, space.spatial_compression);
     let (pixel_h, pixel_w) = (case.h * sc, case.w * sc);
     let decode = decoder()?;
 
-    // ONE working set and ONE pipeline; the head fire first.
     let state = WorkingSet::new();
     let pipe = Pipeline::new();
     let mut pixels: Vec<f32> = Vec::new();
@@ -208,7 +198,7 @@ async fn main(input: Input) -> Result<Output> {
     let mut chunk_frames = Vec::new();
     let mut fork_max_abs_diff = 0.0f32;
     for k in 0..case.t {
-        // An empty state lands one frame, every later one `tc`.
+        // A fresh state lands one frame, every later one `tc`.
         let frames = if k == 0 { 1 } else { tc };
         let at = k as usize * plane;
         // The last chunk, first on a fork: it must decode on from the very

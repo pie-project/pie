@@ -37,15 +37,15 @@
 //! - `elide_commit`: the last block's causal encode is skipped — nothing
 //!   reads its KV.
 //! - `quality`: the commit encode reads every row out and reports the mean
-//!   log-probability of the committed tokens under the causal reading.
+//!   log-probability of the committed tokens under the `encode` mode.
 //! - `best_of`: K canvases per block, the lowest final entropy committed.
 //! - `clamp`: infilling — canvas positions held at given tokens.
 
 use inferlet::eta::diffusion::prelude::*;
-
-/// The tokens one block's canvas is.
-const CANVAS: u32 = 256;
 use serde::{Deserialize, Serialize};
+
+/// Tokens per block's canvas.
+const CANVAS: u32 = 256;
 
 #[derive(Deserialize)]
 struct Input {
@@ -169,7 +169,7 @@ struct Output {
     /// Final entropies of every candidate canvas per block (`best_of`).
     candidates: Vec<Vec<f32>>,
     /// Mean log-probability of each committed block's tokens under the
-    /// causal reading (`quality`), empty otherwise.
+    /// `encode` mode (`quality`), empty otherwise.
     self_logprob: Vec<f32>,
     denoise_fires: u32,
     encode_fires: u32,
@@ -578,8 +578,7 @@ impl Block<'_> {
     }
 }
 
-/// The self-conditioning taps per canvas row: the width of the denoise
-/// lane's `self_cond_ids` input.
+/// The width of the denoise lane's `self_cond_ids` input.
 fn self_cond_taps() -> Result<u32> {
     let lane = model::lane_of(&[("mode", "denoise")])?;
     let input = lane
@@ -742,7 +741,7 @@ async fn main(input: Input) -> Result<Output> {
     })
 }
 
-/// One `encode` pass over `tokens` at slots `base..`: the causal reading,
+/// One `encode` pass over `tokens` at slots `base..`: the default `encode` mode,
 /// whose K/V become the sequence and freeze. With `quality`, every row is read
 /// out and the mean log-probability of `tokens[1..]` under the rows that
 /// predict them comes back; otherwise only the last row is read (a pass

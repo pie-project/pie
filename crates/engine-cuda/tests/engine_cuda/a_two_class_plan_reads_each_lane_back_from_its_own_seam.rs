@@ -19,9 +19,9 @@ const HIDDEN: u32 = 48;
 const T_SCALE: f32 = 1000.0;
 const EMB_SCALE: f32 = 0.75;
 
-struct TwoReadings;
+struct TwoClasses;
 
-impl ForwardHybrid for TwoReadings {
+impl ForwardHybrid for TwoClasses {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
@@ -59,7 +59,7 @@ impl ForwardHybrid for TwoReadings {
 }
 
 fn plan() -> Trace {
-    trace_hybrid(NAME, &TwoReadings, Platform::Cuda)
+    trace_hybrid(NAME, &TwoClasses, Platform::Cuda)
 }
 
 fn hidden_reference(weights: &Weights, x: &[f32], rows: usize) -> Vec<f32> {

@@ -49,7 +49,7 @@ public class PieServer private constructor(private val handle: Long) : AutoClose
         @SerialName("sandbox_memory_mb") public var sandboxMemoryMB: Int = 256
         @SerialName("max_concurrent_processes") public var maxConcurrentProcesses: Int? = 4
 
-        /** The voxel-axis ceilings a VAE reading is carved for (an image model's decode); null keeps the model's own. */
+        /** The voxel-axis ceilings a VAE decode is carved for (an image model's decode); null keeps the model's own. */
         @SerialName("max_voxels") public var maxVoxels: Int? = null
         @SerialName("max_clips") public var maxClips: Int? = null
     }

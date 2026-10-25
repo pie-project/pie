@@ -76,7 +76,6 @@ impl<'a> OnDevice<'a> {
         }
     }
 
-    /// The pass's lanes' own readout rows and pixels, lane `k` at `k`.
     #[must_use]
     pub fn with_lanes(
         mut self,
@@ -88,7 +87,6 @@ impl<'a> OnDevice<'a> {
         self
     }
 
-    /// The readout a root of `intrinsic` at the pass's lane `lane` reads.
     fn offered(&self, intrinsic: Option<IntrinsicId>, lane: u32) -> Option<Readout<'a>> {
         let at = lane as usize;
         match intrinsic {

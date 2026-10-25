@@ -1,6 +1,6 @@
 //! The diffusion and video families: the voxel axis (clip grids, the voxel
 //! input, the clip slots a frame cache reads), the guest inputs a lane feeds
-//! from its channels (and those merged into a stream), the attention-group
+//! from its channels (and those landed in a merge), the attention-group
 //! packings, and the export seams besides logits (velocity, hidden, pixels).
 //!
 //! engine-cuda's `voxels.rs`, `exports.rs` (`Exports`) and the input half of
@@ -13,7 +13,7 @@ use engine::fire::ReadoutSeam;
 use poem_compiler::{CompiledModel, VoxelLadder};
 use poem_exec::feeds::{Feeds, Seat};
 use poem_exec::fire::{Composition, LaneFacts, LaneRow};
-use poem_ir::{ClassSet, Def, Dtype, Operands, RuntimeInput, Trace, Ty, ValueId};
+use poem_ir::{ClassSet, Def, Dtype, RuntimeInput, Trace, Ty, ValueId};
 
 use crate::error::{Fault, Result};
 use crate::inputs::Inputs;
@@ -172,46 +172,6 @@ fn width_of(trace: &Trace, value: ValueId) -> u32 {
     }
 }
 
-fn classes_where(
-    trace: &Trace,
-    compiled: &CompiledModel,
-    touches: impl Fn(&poem_ir::Operation) -> bool,
-) -> ClassSet {
-    let nodes: Vec<u32> = trace
-        .nodes
-        .iter()
-        .enumerate()
-        .filter(|(_, node)| touches(&node.op))
-        .map(|(at, _)| at as u32)
-        .collect();
-    let mut classes = ClassSet::default();
-    for region in compiled.template() {
-        if region.nodes.clone().any(|node| nodes.contains(&node)) {
-            for class in region.mask.iter() {
-                classes.insert(class);
-            }
-        }
-    }
-    classes
-}
-
-fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> ClassSet {
-    if let Some(Def::Merge(arms)) = trace.values.get(value.0 as usize).map(|decl| &decl.def) {
-        let mut classes = ClassSet::default();
-        for (arm, _) in arms {
-            for class in writer_classes(trace, compiled, *arm).iter() {
-                classes.insert(class);
-            }
-        }
-        return classes;
-    }
-    classes_where(trace, compiled, |op| {
-        let mut outputs = Vec::new();
-        op.outputs(&mut outputs);
-        outputs.contains(&value)
-    })
-}
-
 fn bf16_bits(value: f32) -> u16 {
     if value.is_nan() {
         return 0x7fc0;
@@ -334,7 +294,7 @@ impl Dit {
                 [plane, grid, ..] => Some(PixelsExport {
                     plane: *plane,
                     grid: *grid,
-                    classes: writer_classes(trace, compiled, *plane),
+                    classes: poem_exec::feeds::writer_classes(trace, compiled, *plane),
                     width: width_of(trace, *plane),
                 }),
                 _ => None,
@@ -350,11 +310,6 @@ impl Dit {
         self.velocity
             .map(|(value, _)| (ReadoutSeam::Velocity, value))
             .or_else(|| self.hidden.map(|(value, _)| (ReadoutSeam::Hidden, value)))
-    }
-
-    #[must_use]
-    pub fn velocity_width(&self) -> Option<u32> {
-        self.velocity.map(|(_, width)| width)
     }
 
     /// Whether the plan exports pixels, and the widest pixel row.

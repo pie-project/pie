@@ -406,8 +406,6 @@ impl Inputs {
         })
     }
 
-    /// Stages each ragged attention's custom mask in one buffer grown to
-    /// hold them.
     pub fn stage_group_masks(
         &mut self,
         device: &Context,

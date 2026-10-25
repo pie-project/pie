@@ -109,8 +109,7 @@ pub struct FireBindings {
 
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
-    /// The custom mask each group-packed `attention.ragged` applies, by its
-    /// query and key packings, when a lane stated one.
+    /// By query and key packing.
     pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
     pub inputs: Vec<(u32, Tensor)>,
     pub voxels: Option<crate::inputs::VoxelHandles>,
@@ -331,9 +330,6 @@ impl<'c> Run<'c> {
         self.whole(id)
     }
 
-    /// The custom mask a group-packed attention with query and key CSRs
-    /// `q_indptr` and `kv_indptr` applies, when a lane of the fire stated
-    /// one.
     pub(crate) fn group_mask(
         &self,
         q_indptr: ValueId,

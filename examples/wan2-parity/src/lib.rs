@@ -28,10 +28,8 @@ use inferlet::latent::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// The case arrives as `case` whole, as `case_file` (a name under
-/// `/scratch`), or — the usual way — cut into `case_0`, `case_1`, … argv
-/// pieces, because Linux caps ONE argument at 128 KiB. How MANY pieces is
-/// the harness's business: the real row needs a score of them, so they are
-/// read off the argument map by name rather than declared one field each.
+/// `/scratch`), or cut into `case_0`, `case_1`, … argv pieces, because Linux
+/// caps one argument at 128 KiB.
 #[derive(Deserialize)]
 struct Input {
     #[serde(default)]
@@ -124,10 +122,12 @@ fn floats_of_base64(text: &str, what: &str) -> Result<Vec<f32>> {
         }
     }
     if bytes.len() % 4 != 0 {
-        return Err(format!("{what}: {} bytes is not whole f32s", bytes.len()).into());
+        return Err(format!("{what}: {} bytes is not whole f32s", bytes.len()));
     }
     Ok(bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
         .collect())
 }
@@ -152,8 +152,7 @@ impl Case {
                 self.context.len(),
                 self.context_rows,
                 self.context_width
-            )
-            .into());
+            ));
         }
         self.context.resize(want, 0.0);
         Ok(())
@@ -176,11 +175,7 @@ struct Dims {
     velocity_width: u32,
 }
 
-/// The lane `stream` of `reading`, checked to bind no kv space and no
-/// tokens and to read exactly `binds`: what this guest binds on that lane,
-/// by the model's own input names. Checked up front so a model whose lane
-/// reads anything else fails here in its own vocabulary instead of at
-/// `program`.
+/// The lane `stream` of `reading`, checked to read exactly `binds`.
 fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::LaneDecl> {
     let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
     if lane.state || lane.embeds {
@@ -196,14 +191,12 @@ fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::La
     if reads != wants {
         return Err(format!(
             "reading `{reading}`'s `{stream}` lane reads {reads:?}; this pass binds {wants:?}"
-        )
-        .into());
+        ));
     }
     Ok(lane)
 }
 
-/// Checks the context lane and the video lanes against what this guest
-/// binds on each and reads the velocity width off them.
+/// Checks the context and video lanes and reads the velocity width.
 fn dims(reading: &str, given: bool) -> Result<Dims> {
     lane_reading(reading, "context", &["context"])?;
     let video = if given {
@@ -217,8 +210,7 @@ fn dims(reading: &str, given: bool) -> Result<Dims> {
         if reads != ["latents", "positions", "timestep"] {
             return Err(format!(
                 "reading `{reading}`'s video lane under `positions = given` reads {reads:?}"
-            )
-            .into());
+            ));
         }
         lane
     } else {
@@ -278,8 +270,7 @@ async fn step(case: &Case, dims: &Dims, reading: &str) -> Result<Vec<f32>> {
     let group = 0;
     let pass = ForwardPass::new();
 
-    // Lane 0, the context lane: the cross-attention keys and values, and
-    // nothing else.
+    // Lane 0, the context lane.
     pass.switch(0, "reading", reading)?;
     pass.switch(0, "stream", "context")?;
     pass.group(0, group)?;
@@ -294,7 +285,17 @@ async fn step(case: &Case, dims: &Dims, reading: &str) -> Result<Vec<f32>> {
     // case cuts one, and the main lane: each video lane's (lane, voxels).
     let mut videos: Vec<(u32, u32)> = Vec::new();
     if case.cond_frames > 0 {
-        let voxels = video_lane(&pass, 1, case, reading, group, "cond", 0, case.cond_frames, 0.0)?;
+        let voxels = video_lane(
+            &pass,
+            1,
+            case,
+            reading,
+            group,
+            "cond",
+            0,
+            case.cond_frames,
+            0.0,
+        )?;
         videos.push((1, voxels));
     }
     let main_lane = videos.len() as u32 + 1;
@@ -339,8 +340,6 @@ async fn step(case: &Case, dims: &Dims, reading: &str) -> Result<Vec<f32>> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    // What a denoise step needs is stated on its lanes, and is checked
-    // below: they bind no kv space and take no tokens.
     let pieces = input.pieces();
     let text = match (&input.case, &input.case_file) {
         (Some(text), _) => text.clone(),
@@ -355,7 +354,9 @@ async fn main(input: Input) -> Result<Output> {
         inferlet::serde_json::from_str(&text).map_err(|why| format!("case json: {why}"))?;
     case.rectangles()?;
     if case.cond_frames >= case.frames {
-        return Err("the conditioning frames must leave at least one frame for the main lane".into());
+        return Err(
+            "the conditioning frames must leave at least one frame for the main lane".into(),
+        );
     }
     let want = (case.frames * case.height * case.width * case.channels) as usize;
     if case.latents.len() != want {
@@ -366,10 +367,13 @@ async fn main(input: Input) -> Result<Output> {
             case.height,
             case.width,
             case.channels
-        )
-        .into());
+        ));
     }
-    if case.positions.len() % (3 * case.frames as usize) != 0 {
+    if !case
+        .positions
+        .len()
+        .is_multiple_of(3 * case.frames as usize)
+    {
         return Err("the case's positions are not whole (t, h, w) rows per frame".into());
     }
 
@@ -379,8 +383,7 @@ async fn main(input: Input) -> Result<Output> {
         return Err(format!(
             "the model reads a {}-wide velocity and the case's latent has {} channels",
             dims.velocity_width, case.channels
-        )
-        .into());
+        ));
     }
     let velocity = step(&case, &dims, reading).await?;
     Ok(Output {

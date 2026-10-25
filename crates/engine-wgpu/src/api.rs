@@ -1147,8 +1147,7 @@ pub(crate) fn lane_readouts(policies: &[Readout], rows: &[Vec<f32>]) -> Vec<Lane
         .collect()
 }
 
-/// The attachments whose program runs on this fire, each stage at its own
-/// point.
+/// The attachments whose program runs on this fire.
 fn epilogues(step: &Step) -> impl Iterator<Item = &engine::fire::Attachment> {
     step.attachments
         .iter()

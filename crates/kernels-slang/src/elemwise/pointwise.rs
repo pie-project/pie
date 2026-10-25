@@ -27,7 +27,6 @@ fn flat(op: &'static str, x: Tensor) -> Result<(u32, Grid), Error> {
     Ok((n, Grid::of([n.div_ceil(2), 1, 1], [GROUP, 1, 1])))
 }
 
-/// The operation of an `elemwise.binary`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinaryOp {
     Add,
@@ -160,7 +159,6 @@ fn silu_at(ctx: &Ctx<'_>, op: &'static str, s: f32, x: Tensor) -> Result<(), Err
     )
 }
 
-/// `x = sqrt(x)`.
 pub fn sqrt(ctx: &Ctx<'_>, x: Tensor) -> Result<(), Error> {
     const OP: &str = "elemwise.act";
     let entry = dtype_dispatch!(OP, x.dtype, {

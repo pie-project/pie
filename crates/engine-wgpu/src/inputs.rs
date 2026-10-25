@@ -415,7 +415,6 @@ impl Inputs {
         self.store.write(at, bytes)
     }
 
-    /// The store offset of guest input `id`'s rectangle.
     #[must_use]
     pub fn seat(&self, id: u32) -> Option<u64> {
         self.seats
@@ -424,8 +423,6 @@ impl Inputs {
             .map(|at| at.at)
     }
 
-    /// Stages each ragged attention's custom mask in one buffer grown to
-    /// hold them.
     pub fn stage_group_masks(
         &mut self,
         device: &Context,

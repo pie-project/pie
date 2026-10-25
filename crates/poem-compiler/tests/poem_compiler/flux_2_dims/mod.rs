@@ -5,7 +5,6 @@ pub const IN_CHANNELS: u32 = 128;
 pub const VAE_CHANNELS: u32 = 32;
 pub const PACK: u32 = 2;
 pub const VAE_COMPRESSION: u32 = 8;
-pub const TOKEN_COMPRESSION: u32 = VAE_COMPRESSION * PACK;
 
 pub const HEAD_DIM: u32 = 128;
 pub const ROPE_DIMS: [u32; 4] = [32, 32, 32, 32];

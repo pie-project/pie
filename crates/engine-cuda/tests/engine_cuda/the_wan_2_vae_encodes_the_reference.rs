@@ -10,12 +10,13 @@ use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Lane, Shell};
 use poem::{Platform, Request, Trace};
 
-/// The VAE's encode readings alone, by the package's own functions.
+/// The VAE's encode alone, by the package's own functions.
 const VAE_ONLY: &str = r#"
 def forward(m, inputs):
-    switch("reading", ["vae.encode.head", "vae.encode"])
-    vae_encode(inputs.on(switch_is("reading", "vae.encode.head")), m.vae.enc, True)
-    return vae_encode(inputs.on(switch_is("reading", "vae.encode")), m.vae.enc, False)
+    switch("reading", ["vae.encode"])
+    arm = inputs.on(switch_is("reading", "vae.encode"))
+    vae_encode(arm.on(fact.fresh()), m.vae.enc, True)
+    return vae_encode(arm.on(~fact.fresh()), m.vae.enc, False)
 "#;
 
 fn vae_only() -> Trace {
@@ -36,18 +37,14 @@ struct Encoder {
 
 impl Encoder {
     fn chunk(&mut self, first: bool, clip: [u32; 3], payload: &[f32]) -> (Vec<f32>, [u32; 3]) {
-        let reading = if first {
-            "vae.encode.head"
-        } else {
-            "vae.encode"
-        };
         let tokens = [0u32];
         let lanes = [Seated::of(Lane {
             slot: 0,
             word: self.shell.trace().facts.word(
                 &Request::new(1, false)
+                    .starting(first)
                     .switched("stream", "video")
-                    .switched("reading", reading),
+                    .switched("reading", "vae.encode"),
             ),
             tokens: &tokens,
         })];

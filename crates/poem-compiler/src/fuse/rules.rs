@@ -1216,9 +1216,7 @@ pub fn moe_experts() -> Rule {
                                      bank: &'static str,
                                      bias: &'static str,
                                      kind: u32| match kind {
-                        0 => {
-                            linear::select::plain(x, &p.weight(bank, [W, W, W]), &routes, top_k)
-                        }
+                        0 => linear::select::plain(x, &p.weight(bank, [W, W, W]), &routes, top_k),
                         1 => linear::select::biased(
                             x,
                             &p.weight(bank, [W, W, W]),

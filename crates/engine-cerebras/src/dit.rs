@@ -1,6 +1,6 @@
 //! The diffusion and video families: the voxel axis (clip grids, the voxel
 //! input, the clip slots a frame cache reads), the guest inputs a lane feeds
-//! from its channels (and those merged into a stream), the attention-group
+//! from its channels (and the merges over them), the attention-group
 //! packings, and the export seams besides logits (velocity, hidden, pixels).
 //!
 //! engine-cuda's `voxels.rs`, `exports.rs` (`Exports`) and the input half of

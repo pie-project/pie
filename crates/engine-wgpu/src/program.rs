@@ -93,8 +93,6 @@ pub(crate) struct Pass<'a> {
     pub lanes: Vec<Option<crate::guest::run::Readout<'a>>>,
     /// Each lane of the pass's pixels, lane `k` at `k`.
     pub pixels: Vec<Option<crate::guest::run::Readout<'a>>>,
-    /// The point whose stages run: the prologue's, before the forward, or
-    /// the epilogue's, after it.
     pub at: Stage,
 }
 
@@ -920,8 +918,6 @@ impl Plane {
         }
     }
 
-    /// Whether `instance`'s prologue runs on its own, before the forward
-    /// ([`ExecPlan::prologue_runs`]).
     #[must_use]
     pub fn prologue_runs(&self, instance: InstanceId) -> bool {
         self.instances
@@ -929,9 +925,7 @@ impl Plane {
             .is_some_and(|seat| seat.plan.prologue_runs())
     }
 
-    /// Runs `instance`'s prologue to its commit before the forward, once
-    /// every pass airborne on its channels has run: the forward then reads
-    /// the cells it put.
+    /// Waits for every pass airborne on `instance`'s channels before the prologue runs.
     #[cfg(feature = "wgpu")]
     pub(crate) fn fire_prologue(
         &self,

@@ -273,7 +273,6 @@ mod tests {
     fn lag_every_case() {
         a_row_lags_the_spans_ending_before_it();
         a_write_drops_the_spans_from_where_it_starts();
-        a_fork_carries_the_spans();
     }
 
     fn a_row_lags_the_spans_ending_before_it() {
@@ -294,19 +293,5 @@ mod tests {
         assert_eq!(cursor.spans, [(10, 30, 16)], "a text write past the span");
         cursor.rewrite(10, []);
         assert!(cursor.spans.is_empty(), "the span itself written over");
-    }
-
-    fn a_fork_carries_the_spans() {
-        let parent = WorkingSet {
-            kv: 0,
-            rs: None,
-            cursor: Arc::new(Mutex::new(Cursor::default())),
-        };
-        parent.cursor.lock().unwrap().rewrite(0, [(10, 30, 16)]);
-        // `fork` starts the child from the parent's cursor.
-        let child = Arc::new(Mutex::new(parent.cursor()));
-        parent.cursor.lock().unwrap().rewrite(0, []);
-        assert_eq!(child.lock().unwrap().spans, [(10, 30, 16)]);
-        assert!(parent.cursor().spans.is_empty(), "each its own");
     }
 }

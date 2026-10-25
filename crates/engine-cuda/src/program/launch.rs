@@ -377,7 +377,7 @@ impl Rings {
         if shape.dtype == Dtype::Bool {
             return Err(Fault::program(
                 "program::launch",
-                format!("channel {channel} is a bool ring, which no float port reads"),
+                format!("channel {channel} is a bool ring, which no float input reads"),
             ));
         }
         let at = (sequence % shape.ring()) * shape.cell_bytes() as u64;

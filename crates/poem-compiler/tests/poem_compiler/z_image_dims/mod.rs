@@ -3,7 +3,6 @@
 
 pub const CHANNELS: u32 = 16;
 pub const PATCH: u32 = 2;
-pub const PATCH_FEATURES: u32 = CHANNELS * PATCH * PATCH;
 pub const SPATIAL_COMPRESSION: u32 = 8;
 pub const T_FREQ_DIM: u32 = 256;
 pub const T_MAX_PERIOD: f32 = 10_000.0;

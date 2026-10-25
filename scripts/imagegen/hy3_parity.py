@@ -71,7 +71,7 @@ WHAT ELSE IS CLAIMED
 
 THE ROTARY POSITIONS
 --------------------
-The family's `positions` port is `(y, x')` with `x' = x * theta^(-2/d)`:
+The family's `positions` input is `(y, x')` with `x' = x * theta^(-2/d)`:
 `elementwise.rope_axes` gives each axis a contiguous channel block and
 restarts the frequency ladder inside it, while the reference interleaves the
 two axes over ONE ladder, so `x`'s rung offset is folded into the coordinate.

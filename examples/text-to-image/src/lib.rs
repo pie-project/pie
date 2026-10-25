@@ -94,7 +94,7 @@ fn lane_switches<'a>(reading: &'a str, stream: Option<&'a str>) -> Vec<(&'a str,
 }
 
 fn lane(reading: &str, stream: Option<&str>) -> Result<model::LaneDecl> {
-    model::lane_of(&lane_switches(reading, stream)).map_err(Into::into)
+    model::lane_of(&lane_switches(reading, stream))
 }
 
 fn set_switches(pass: &ForwardPass, at: u32, reading: &str, stream: Option<&str>) -> Result<()> {
@@ -199,8 +199,7 @@ fn denoise_reading() -> Result<Denoise> {
         if image.state {
             return Err(format!(
                 "reading `{reading}` binds a working set; a denoise pass binds none"
-            )
-            .into());
+            ));
         }
         let context_stream = stream_reading(&reading, "context").ok_or_else(|| {
             format!("reading `{reading}` reads no `context`; a text-conditioned sampler has nowhere to put the prompt")
@@ -208,19 +207,21 @@ fn denoise_reading() -> Result<Denoise> {
         let prompt = lane(&reading, context_stream.as_deref())?;
         let latents = input(&image, "latents").cloned().expect("found by it");
         if latents.axis != model::InputAxis::Voxel {
-            return Err(format!("reading `{reading}` reads `latents` per {:?}; this sampler holds the VAE's latent, on the voxel axis", latents.axis).into());
+            return Err(format!(
+                "reading `{reading}` reads `latents` per {:?}; this sampler holds the VAE's latent, on the voxel axis",
+                latents.axis
+            ));
         }
         let context = input(&prompt, "context").cloned().expect("found by it");
         if input(&image, "timestep").is_none() {
-            return Err(format!("reading `{reading}` reads no `timestep`").into());
+            return Err(format!("reading `{reading}` reads no `timestep`"));
         }
         let velocity = image.readout.as_ref().map_or(0, |r| r.width);
         if velocity != latents.width {
             return Err(format!(
                 "reading `{reading}` reads out {velocity}-wide velocity rows over {}-wide latent cells",
                 latents.width
-            )
-            .into());
+            ));
         }
         return Ok(Denoise {
             guidance: input(&image, "guidance").is_some(),
@@ -268,8 +269,7 @@ fn bridge_reading(from: u32, to: u32) -> Result<Bridge> {
     Err(format!(
         "the text reading hands back {from}-wide rows, the denoise `context` input takes {to}, and \
          no reading turns one into the other"
-    )
-    .into())
+    ))
 }
 
 fn padded(rows: Option<model::RowCount>, len: u32) -> Option<u32> {
@@ -313,9 +313,9 @@ fn encode(
     }
     let cap = max_readout_rows(model::ReadoutKind::Hidden);
     if len as usize > cap {
-        return Err(
-            format!("the prompt is {len} tokens and one pass reads out {cap} hidden rows").into(),
-        );
+        return Err(format!(
+            "the prompt is {len} tokens and one pass reads out {cap} hidden rows"
+        ));
     }
     let rows = padded(context.rows, len).ok_or_else(|| {
         format!(
@@ -407,9 +407,9 @@ fn parse_rect(text: &str) -> Result<(u32, u32, u32, u32)> {
         .collect::<std::result::Result<_, _>>()
         .map_err(|why| format!("`mask_rect` is `x0,y0,x1,y1` in pixels: {why}"))?;
     if parts.len() != 4 || parts[0] >= parts[2] || parts[1] >= parts[3] {
-        return Err(
-            format!("`mask_rect` is `x0,y0,x1,y1` with x0 < x1 and y0 < y1, not `{text}`").into(),
-        );
+        return Err(format!(
+            "`mask_rect` is `x0,y0,x1,y1` with x0 < x1 and y0 < y1, not `{text}`"
+        ));
     }
     Ok((parts[0], parts[1], parts[2], parts[3]))
 }
@@ -451,7 +451,9 @@ fn vae_lane(reading: &str) -> Result<(Option<String>, model::InputDecl, u32)> {
             return Ok((stream, input.clone(), readout.width));
         }
     }
-    Err(format!("reading `{reading}` reads no one clip on the voxel axis").into())
+    Err(format!(
+        "reading `{reading}` reads no one clip on the voxel axis"
+    ))
 }
 
 #[inferlet::main]
@@ -480,8 +482,7 @@ async fn main(input: Input) -> Result<Output> {
         return Err(format!(
             "the latent space has {} channels and `latents` reads {}",
             space.channels, denoise.latents.width
-        )
-        .into());
+        ));
     }
     let sc = space.spatial_compression.max(1);
     let height = (input.height.unwrap_or(1024) / sc).max(1) * sc;
@@ -509,7 +510,9 @@ async fn main(input: Input) -> Result<Output> {
     };
     let strength = input.strength.unwrap_or(0.6);
     if init_b64.is_some() && !(0.0 < strength && strength <= 1.0) {
-        return Err(format!("`strength` is {strength}; it is a fraction in (0, 1]").into());
+        return Err(format!(
+            "`strength` is {strength}; it is a fraction in (0, 1]"
+        ));
     }
     let sched = match &init_b64 {
         None => full,
@@ -535,8 +538,7 @@ async fn main(input: Input) -> Result<Output> {
             "reading `{}` reads a `guidance` input, so this row is guidance-distilled and a \
              negative prompt has no lane to ride; pass `guidance` alone",
             denoise.reading
-        )
-        .into());
+        ));
     }
     let cfg = negative.is_some() && guidance > 1.0;
 
@@ -561,8 +563,7 @@ async fn main(input: Input) -> Result<Output> {
                         "the mask is {}x{} and this run is {width}x{height}",
                         mask.width(),
                         mask.height()
-                    )
-                    .into());
+                    ));
                 }
                 let rgb = mask
                     .encode(inferlet::frames::ImageFormat::RawRgb8)
@@ -592,7 +593,7 @@ async fn main(input: Input) -> Result<Output> {
     let noise = Channel::new([2], dtype::u32).queued().named("noise");
     let noise0 = Channel::from(rng_state(seed ^ 0x5eed)).named("noise0");
     let seed_loop = move |start: Option<Tensor>| {
-        let eps = normal(&draw.read(), lat);
+        let eps = normal(draw.read(), lat);
         let x0 = match start {
             None => eps,
             Some(start) => {
@@ -641,15 +642,13 @@ async fn main(input: Input) -> Result<Output> {
                 "the init image is {}x{} and this run is {width}x{height}; resize it first",
                 picture.width(),
                 picture.height()
-            )
-            .into());
+            ));
         }
         let (stream, pixels_in, latent_width) = vae_lane(reading)?;
         if latent_width != c {
             return Err(format!(
                 "`{reading}` reads out {latent_width}-wide cells, the latent has {c} channels"
-            )
-            .into());
+            ));
         }
         let pass = ForwardPass::new();
         set_switches(&pass, 0, reading, stream.as_deref())?;
@@ -746,8 +745,7 @@ async fn main(input: Input) -> Result<Output> {
         return Err(format!(
             "`{decode}` reads {}-wide cells, the latent has {c} channels",
             latent_in.width
-        )
-        .into());
+        ));
     }
     let pass = ForwardPass::new();
     set_switches(&pass, 0, &decode, stream.as_deref())?;

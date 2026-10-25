@@ -171,7 +171,7 @@ pub struct Seated<'a> {
     pub pages: &'a [u32],
 
     pub held: Option<u32>,
-    /// The lane's reading declares no KV space: it neither reads nor extends its slot.
+    /// The lane binds no KV state: it neither reads nor extends its slot.
     pub kv_less: bool,
 
     pub mask: Option<&'a Masking>,
@@ -294,13 +294,11 @@ pub(crate) struct ReadSpan {
 }
 
 impl ReadSpan {
-    /// The values the span holds.
     #[must_use]
     pub fn values(&self) -> u32 {
         self.rows.saturating_mul(self.width)
     }
 
-    /// The bytes the span holds in the seat.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         u64::from(self.values()) * if self.f32 { 4 } else { 2 }
@@ -420,9 +418,8 @@ pub struct Shell {
     drafts_plane: Option<(ValueId, u32)>,
 }
 
-/// A `pixels` plane: its value, row width, writer classes, and the
-/// `conv.grid` chain from the port grid to its own (where each lane's clips
-/// start in it), when the load could walk one.
+/// A `pixels` plane and, when the load could walk one, its `conv.grid` chain
+/// from the fire's grid.
 struct PixelPlane {
     plane: ValueId,
     width: u32,
@@ -430,7 +427,7 @@ struct PixelPlane {
     chain: Option<Vec<poem_ir::GridRule>>,
 }
 
-/// The `conv.grid` rules from the port grid to `grid`, in order.
+/// The `conv.grid` rules from the fire's grid to `at`, in order.
 fn grid_chain(trace: &Trace, mut at: ValueId) -> Option<Vec<poem_ir::GridRule>> {
     let mut rules = Vec::new();
     loop {
@@ -1632,7 +1629,7 @@ impl Shell {
     /// Each lane's pixels in the read-back plane, by source lane: the byte it
     /// starts at and its values. A lane reads pixels only where its class
     /// writes them; its clips start where the plane's `conv.grid` chain,
-    /// replayed over the fire's port grid, puts its first clip.
+    /// replayed over the fire's grid, puts its first clip.
     fn pixel_spans(
         &self,
         p: &Prepared<'_>,
@@ -2769,8 +2766,7 @@ pub struct Prepared<'a> {
     guests: Option<crate::landing::Guests>,
     merge_lands: Vec<MergeLand>,
     classes: Vec<usize>,
-    /// The fire's lanes as composed, and its port grid (`t, h, w, offset` a
-    /// clip): where each lane's pixels stand.
+    /// The fire's lanes as composed; `voxel_grid` is its grid (`t, h, w, offset` a clip).
     rows: Vec<LaneRow>,
     voxel_grid: Vec<i32>,
 

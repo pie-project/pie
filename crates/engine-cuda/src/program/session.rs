@@ -460,10 +460,10 @@ impl Session {
                 continue;
             };
             let why = match intrinsic {
-                eta_ir::op::IntrinsicId::Velocity => "its reading plants no `velocity` export",
-                eta_ir::op::IntrinsicId::Hidden => "its reading plants no `hidden` export",
+                eta_ir::op::IntrinsicId::Velocity => "its class plants no `velocity` export",
+                eta_ir::op::IntrinsicId::Hidden => "its class plants no `hidden` export",
                 eta_ir::op::IntrinsicId::Pixels => {
-                    "its reading plants no `pixels` seam, or the fire submitted no clip"
+                    "its class plants no `pixels` seam, or the fire submitted no clip"
                 }
                 _ => continue,
             };

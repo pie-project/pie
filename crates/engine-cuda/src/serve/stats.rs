@@ -24,7 +24,6 @@ impl Shell {
         self.feeds.decls(&self.trace, &self.compiled)
     }
 
-    /// This load's classes and what each runs.
     #[must_use]
     pub fn classes(&self) -> poem_ir::LaneClasses {
         poem_exec::feeds::lane_classes(&self.trace, &self.compiled)
@@ -73,39 +72,6 @@ impl Shell {
                 what: "a plan with no `out` seam has no vocabulary width".to_string(),
             })?;
         kv::width_of(&self.trace, out)
-    }
-
-    #[must_use]
-    pub fn velocity_width(&self) -> Option<u32> {
-        let export = self.exports.velocity.as_ref()?;
-        kv::width_of(&self.trace, export.value)
-            .ok()
-            .and_then(|width| u32::try_from(width).ok())
-    }
-
-    #[must_use]
-    pub fn pixels_facts(&self) -> (bool, u32) {
-        let mut widths = self.exports.pixels_widths(&self.trace);
-        let Some(first) = widths.next() else {
-            return (false, 0);
-        };
-        (
-            true,
-            if widths.all(|width| width == first) {
-                first
-            } else {
-                0
-            },
-        )
-    }
-
-    #[must_use]
-    pub fn readout_seam(&self) -> Option<(engine::fire::ReadoutSeam, u32)> {
-        let readout = self.exports.readout()?;
-        let width = kv::width_of(&self.trace, readout.value)
-            .ok()
-            .and_then(|width| u32::try_from(width).ok())?;
-        Some((readout.seam, width))
     }
 
     #[must_use]

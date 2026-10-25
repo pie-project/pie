@@ -49,7 +49,6 @@ groupshared int segs[PIE_BQ];
 groupshared int tile_lo;
 groupshared int tile_hi;
 
-// The segment row `row` stands in, or -1.
 int segment_of(int row) {
     if (row < segments[0] || row >= segments[uint(params.num_segments)]) {
         return -1;
@@ -68,7 +67,6 @@ int segment_of(int row) {
 }
 
 #ifdef PIE_CUSTOM
-// Whether row `row` of segment `seg` keeps key `j`.
 bool mask_keeps(int seg, int row, int j) {
     uint qo = uint(row - segments[uint(seg)]);
     uint kv = uint(j - kv_segments[uint(seg)]);

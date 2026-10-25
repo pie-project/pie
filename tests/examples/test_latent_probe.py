@@ -1,4 +1,4 @@
-"""The float-port loop closes (imagegen design D1/D3/D4) — a skeleton.
+"""The latent loop closes — a skeleton.
 
 `latent-probe` drives one `forward` pass in a token-less, KV-less reading:
 a latent channel seeded on the device by a keyed Normal draw, bound as
@@ -48,7 +48,7 @@ async def _probe(client, args, **inputs) -> dict:
         if any(mark in str(error) for mark in LATENTLESS):
             # conftest reports FileNotFoundError as SKIPPED.
             raise FileNotFoundError(
-                f"the loaded model has no latent reading, so the float-port loop has "
+                f"the loaded model has no latent reading, so the latent loop has "
                 f"nothing to drive (wants `{REQUIRES_MODEL}`): {error}"
             ) from error
         raise
@@ -102,4 +102,4 @@ def tests():
 
 
 if __name__ == "__main__":
-    run_tests(tests(), description="Float-port loop probe (wants a latent reading)")
+    run_tests(tests(), description="Latent loop probe (wants a latent reading)")

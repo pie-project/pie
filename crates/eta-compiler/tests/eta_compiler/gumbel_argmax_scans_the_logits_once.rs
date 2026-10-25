@@ -166,8 +166,8 @@ fn decode_subject(divide: bool, vocab: u32) -> TraceContainer {
 }
 
 fn emitted(container: TraceContainer) -> String {
-    let profile = Served::of(VOCAB);
-    let bound = profile.bind(container).expect("the subject binds");
+    let served = Served::of(VOCAB);
+    let bound = served.bind(container).expect("the subject binds");
     let stages = compile_bound(&bound);
     let stage = stages.first().expect("one stage");
     let region = stage.fused.regions.first().expect("one fused region");
@@ -189,8 +189,8 @@ fn gumbel_argmax_scans_the_logits_once_every_case() {
 /// The region as each SIMT backend that serves it emits it, whichever kind
 /// of region it compiles to.
 fn emitted_by_each_backend(container: TraceContainer, vocab: u32) -> Vec<(&'static str, String)> {
-    let profile = Served::of(vocab);
-    let bound = profile.bind(container).expect("the subject binds");
+    let served = Served::of(vocab);
+    let bound = served.bind(container).expect("the subject binds");
     let stages = compile_bound(&bound);
     let stage = stages.first().expect("one stage");
     let region = stage.fused.regions.first().expect("one fused region");

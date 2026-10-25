@@ -169,7 +169,7 @@ pub struct Seated<'a> {
     pub pages: &'a [u32],
 
     pub held: Option<u32>,
-    /// The lane's reading declares no KV space: it neither reads nor extends its slot.
+    /// The lane binds no KV state: it neither reads nor extends its slot.
     pub kv_less: bool,
 
     pub mask: Option<&'a Masking>,
@@ -260,9 +260,8 @@ fn adapter_fact(classes: &poem_ir::ClassTable, corrected: &poem_ir::ClassSet) ->
     classes.adapter_fact(corrected)
 }
 
-/// A `pixels` plane: its value, row width, writer classes, and the
-/// `conv.grid` chain from the port grid to its own (where each lane's clips
-/// start in it), when the load could walk one.
+/// A `pixels` plane and, when the load could walk one, its `conv.grid` chain
+/// from the fire's grid.
 struct PixelPlane {
     plane: ValueId,
     width: u32,
@@ -270,7 +269,7 @@ struct PixelPlane {
     chain: Option<Vec<poem_ir::GridRule>>,
 }
 
-/// The `conv.grid` rules from the port grid to `grid`, in order.
+/// The `conv.grid` rules from the fire's grid to `at`, in order.
 fn grid_chain(trace: &Trace, mut at: ValueId) -> Option<Vec<poem_ir::GridRule>> {
     let mut rules = Vec::new();
     loop {
@@ -1298,7 +1297,6 @@ impl Shell {
         self.feeds.decls(&self.trace, &self.compiled)
     }
 
-    /// This load's classes and what each runs.
     #[must_use]
     pub fn classes(&self) -> poem_ir::LaneClasses {
         poem_exec::feeds::lane_classes(&self.trace, &self.compiled)
@@ -1747,7 +1745,7 @@ impl Shell {
     /// Each lane's pixels in the read-back plane, by source lane: the byte it
     /// starts at and its values. A lane reads pixels only where its class
     /// writes them; its clips start where the plane's `conv.grid` chain,
-    /// replayed over the fire's port grid, puts its first clip.
+    /// replayed over the fire's grid, puts its first clip.
     fn pixel_spans(&self, p: &Prepared<'_>) -> Result<Vec<(u64, u32)>> {
         let Some((_, rows, pixels)) = self.pixel_rect(p)? else {
             return Ok(Vec::new());
@@ -1827,7 +1825,6 @@ impl Shell {
         self.pixel_spans(p)
     }
 
-    /// Lane `lane`'s pixels in a step's read-back plane.
     pub fn pixels_row(&self, landed: &Landed, lane: u32) -> Option<(&Buffer, u64, u32)> {
         let flight = self.inflight.iter().find(|f| f.seq == landed.seq)?;
         let &(at, values) = flight.pixels.get(lane as usize)?;
@@ -3120,8 +3117,7 @@ pub struct Prepared<'a> {
     input_copies: Vec<InputCopy<'a>>,
     merge_lands: Vec<MergeLand>,
     classes: Vec<usize>,
-    /// The fire's lanes as composed, and its port grid (`t, h, w, offset` a
-    /// clip): where each lane's pixels stand.
+    /// The fire's lanes as composed; `voxel_grid` is its grid (`t, h, w, offset` a clip).
     rows: Vec<LaneRow>,
     voxel_grid: Vec<i32>,
 
@@ -3154,7 +3150,6 @@ pub struct Enqueued<'a> {
 
     rows: Vec<ReadSpan>,
     launches: u32,
-    /// Each lane's pixels in the read-back plane (byte, values).
     pixels: Vec<(u64, u32)>,
 
     step: PhantomData<&'a ()>,

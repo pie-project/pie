@@ -39,7 +39,7 @@ fn velocity_width(plan: &Trace) -> u64 {
     }
 }
 
-fn ports(plan: &Trace) -> BTreeSet<&str> {
+fn input_names(plan: &Trace) -> BTreeSet<&str> {
     plan.values
         .iter()
         .filter_map(|decl| match &decl.def {
@@ -98,16 +98,16 @@ fn a_tap_is_still_one_float_readout_and_no_logits() {
 
 fn a_tap_that_cuts_the_trace_short_still_reads_every_port() {
     let plan = traced(None);
-    let whole = ports(&plan);
+    let whole = input_names(&plan);
     assert!(
         whole.contains("context"),
-        "the model reads the context port: {whole:?}"
+        "the model reads the context input: {whole:?}"
     );
     for tap in ["x_embed", "b0.in", "b0.norm1_out", "b1.joint_attn_heads"] {
         assert_eq!(
-            ports(&traced(Some(tap))),
+            input_names(&traced(Some(tap))),
             whole,
-            "{tap}: the ports the plan declares"
+            "{tap}: the inputs the plan declares"
         );
     }
 }

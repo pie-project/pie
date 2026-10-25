@@ -839,7 +839,7 @@ def geometry(m, reading):
     return m.glob.head_dim, m.glob.kv_heads, None
 
 def plans(m, input, plan):
-    """`plan` over `input` for each reading, indexed by it."""
+    """`plan` over `input` for the sliding and the global layers, in that order."""
     return [
         plan(input, m.q_heads, m.sliding.kv_heads, m.sliding.head_dim, m.sliding.window),
         plan(input, m.q_heads, m.glob.kv_heads, m.glob.head_dim, None),

@@ -381,11 +381,8 @@ impl Model {
         &self.classes
     }
 
-    /// Everything about a lane of the guest switches `switches`, each
-    /// checked against its declaration: the classes it can land in under
-    /// any value of the runtime switches (query length, mask, adapter,
-    /// drafts, scores, media, encode, fresh), and so the inputs those read and
-    /// whether any reads kv, embeds tokens or reads out.
+    /// A lane of the guest `switches`, each checked against its declaration,
+    /// over the classes it can land in under any value of the runtime switches.
     pub fn lane(&self, switches: &[(String, String)]) -> Result<Lane, String> {
         let mut guest = poem::Request::new(1, false);
         for (name, value) in switches {

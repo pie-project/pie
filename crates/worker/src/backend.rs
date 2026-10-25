@@ -903,7 +903,7 @@ mod tests {
         assert_eq!(
             stated.max_voxels,
             Some(65_536),
-            "`[model] max_voxels` is the port ceiling the engine cuts against"
+            "`[model] max_voxels` is the input ceiling the engine cuts against"
         );
         assert_eq!(stated.max_clips, Some(4));
     }

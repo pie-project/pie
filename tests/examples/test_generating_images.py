@@ -38,31 +38,11 @@ the run still succeeds and hands back a plausible picture of the wrong model.
 The `max_model_len` default of 4096 kills a 1024**2 job on its second fire
 ("this fire wants 8192 kv tokens in one slot").
 
-**THE SUBMIT DEADLINE IS NOT A KNOB THIS SUITE TOUCHES**, and it used to be.
-A denoise frame composes an attention group out of the image lane and the
-context lane, and the group forms only when both are members of ONE step; that
-wait was once leashed by `[runtime] submit_deadline` (50 ms), and a 1024**2
-job's first submit carries megabytes of seeded `context` and `latents` across
-the guest boundary, so under load the leash fired first and the frame sealed
-with the IMAGE LANE ALONE -- an unconditioned denoise, reported as a success,
-decoding to exactly the textured field the note above says this suite cannot
-tell from a photograph. Measured on FLUX.2-klein-4B on 2026-09-06, 4 steps at
-1024**2, one prompt and seed, one GPU with no neighbours:
-    50 ms, before the fix   1 of 3 correct eager, 4 of 5 bodied, and the wrong
-                            ones bit-identical to each other per trajectory --
-                            a race, which reads exactly like a numerics
-                            non-determinism and is not one. `graphs = "off"`
-                            made it WORSE, not better, because the eager text
-                            fire is slower and misses the leash more often.
-    50 ms, after the fix    4 of 4 bit-identical and correct.
-
-The runtime now keeps the promise instead: a stated cohort fires whole or not
-at all (`crates/runtime/src/scheduler/frame.rs`, `group_short`). So this suite
-runs at the default -- if a partial group is ever sealed again, a run of this
-that comes back as a textured field is one of the things that says so.
-
-The PNG needs an interpreter with torch + diffusers (`--python`); without
-`--model-dir` the run proves the loop and the file name and says so.
+**THE SUBMIT DEADLINE IS NOT A KNOB THIS SUITE TOUCHES.** A denoise step is
+one pass whose lanes (image and context) are one attention group, so
+`[runtime] submit_deadline` cannot split it. This suite runs at the default:
+if a partial group is ever sealed, a run that comes back as a textured field
+is one of the things that says so.
 """
 
 from __future__ import annotations

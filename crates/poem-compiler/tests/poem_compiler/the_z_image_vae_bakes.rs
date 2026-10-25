@@ -31,7 +31,7 @@ fn readings(deployment: &str) -> Vec<String> {
 #[test]
 fn the_z_image_vae_bakes_every_case() {
     the_flagship_declares_the_two_vae_readings_and_the_miniature_neither();
-    the_trace_reads_two_voxel_ports_and_plants_pixels_twice();
+    the_trace_reads_its_voxel_inputs_and_plants_pixels_twice();
     the_shapes_are_the_flux_vaes();
     the_import_reads_every_vae_tensor_of_the_real_snapshot_once();
 }
@@ -54,14 +54,14 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
                 ..
             }) if trace(MINI).inputs[id as usize].name != "latents"
         )),
-        "and reads no voxel port but the denoiser's latent"
+        "and reads no voxel input but the denoiser's latent"
     );
 }
 
-fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
+fn the_trace_reads_its_voxel_inputs_and_plants_pixels_twice() {
     // The VAE's two, and the denoiser's VAE-native latent.
     let plan = trace(TURBO);
-    let mut ports: Vec<(&str, u32, Dtype)> = plan
+    let mut named: Vec<(&str, u32, Dtype)> = plan
         .values
         .iter()
         .filter_map(|v| match &v.def {
@@ -74,9 +74,9 @@ fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
             _ => None,
         })
         .collect();
-    ports.sort_unstable_by_key(|(name, ..)| *name);
+    named.sort_unstable_by_key(|(name, ..)| *name);
     assert_eq!(
-        ports,
+        named,
         vec![
             ("latent", model::CHANNELS, Dtype::Bf16),
             ("latents", model::CHANNELS, Dtype::Bf16),

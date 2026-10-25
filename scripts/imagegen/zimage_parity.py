@@ -81,7 +81,7 @@ WHAT THE HARNESS CONVERTS
   token rows, which the case states (`readout_rows`), in diffusers'
   `_patchify_image` feature order `(pf, ph, pw, c)`;
 * the golden holds the TRANSFORMER's `t` (multiplied by `t_scale = 1000`
-  inside the model); the family's port takes the SCHEDULER timestep and flips
+  inside the model); the family's `timestep` input takes the SCHEDULER timestep and flips
   it itself (`u = 1000 - t`), so the case carries `1000 - 1000 * t`;
 * the family hands back `-model_out` (the pipeline's `noise_pred = -noise_pred`
   folded in); the golden is the raw model output, so `collect` negates back.
@@ -208,7 +208,7 @@ def case(args) -> str:
     path = os.path.join(args.out, f"case_{mode}.json")
     dump_case(doc, path)
     print(f"[case] {mode}: {h}x{w}x{c} latent, {caption.shape[0]} caption rows x "
-          f"{caption.shape[1]}, t_model {t_model} -> port {timestep} "
+          f"{caption.shape[1]}, t_model {t_model} -> input {timestep} "
           f"({os.path.getsize(path)} bytes) -> {path}")
     return path
 

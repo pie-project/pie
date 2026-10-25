@@ -31,7 +31,7 @@ fn readings(deployment: &str) -> Vec<String> {
 #[test]
 fn the_flux_2_vae_bakes_every_case() {
     the_flagship_declares_the_two_vae_readings_and_the_miniature_neither();
-    the_trace_reads_two_voxel_ports_and_plants_pixels_twice();
+    the_trace_reads_its_voxel_inputs_and_plants_pixels_twice();
     the_shapes_are_the_flux2_autoencoders();
     each_vae_lane_has_a_class_of_its_own();
     the_import_reads_every_vae_tensor_of_the_real_snapshot_once();
@@ -60,7 +60,7 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
         "the miniature has no VAE"
     );
     let mini = trace(MINI);
-    let voxel_ports: Vec<&str> = mini
+    let voxel_inputs: Vec<&str> = mini
         .values
         .iter()
         .filter_map(|v| match &v.def {
@@ -73,15 +73,15 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
         })
         .collect();
     assert_eq!(
-        voxel_ports,
+        voxel_inputs,
         vec!["latents"],
-        "and reads no voxel port but the denoiser's latent"
+        "and reads no voxel input but the denoiser's latent"
     );
 }
 
-fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
+fn the_trace_reads_its_voxel_inputs_and_plants_pixels_twice() {
     let plan = trace(KLEIN);
-    let mut ports: Vec<(&str, u32, Dtype)> = plan
+    let mut named: Vec<(&str, u32, Dtype)> = plan
         .values
         .iter()
         .filter_map(|v| match &v.def {
@@ -94,9 +94,9 @@ fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
             _ => None,
         })
         .collect();
-    ports.sort_unstable_by_key(|(name, ..)| *name);
+    named.sort_unstable_by_key(|(name, ..)| *name);
     assert_eq!(
-        ports,
+        named,
         vec![
             ("latent", model::VAE_CHANNELS, Dtype::Bf16),
             ("latents", model::VAE_CHANNELS, Dtype::Bf16),
@@ -242,7 +242,10 @@ fn the_shapes_are_the_flux2_autoencoders() {
     }
     assert_eq!(attentions, 2, "one mid-block attention per reading");
     assert_eq!(upsamples, 3);
-    assert_eq!(copies, 0, "the decode's pack is its fresh copy of the port");
+    assert_eq!(
+        copies, 0,
+        "the decode's pack is its fresh copy of the input"
+    );
     assert_eq!(strided, 3);
     assert_eq!(
         (shuffles, unshuffles),

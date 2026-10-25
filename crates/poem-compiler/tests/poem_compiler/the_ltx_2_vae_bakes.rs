@@ -62,7 +62,7 @@ fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
         assert_eq!(
             voxels,
             want.into_iter().collect(),
-            "{deployment}: the denoiser's latents on the voxel axis, and the VAE's port iff \
+            "{deployment}: the denoiser's latents on the voxel axis, and the VAE's input iff \
              the row carries the VAE"
         );
     }
@@ -110,7 +110,9 @@ fn the_shapes_are_the_ltx_decoders() {
                 GridRule::Conv { .. } | GridRule::Shuffle { .. } => {}
                 other => panic!("a grid rule this decoder never states: {other:?}"),
             },
-            Operation::Conv(Conv::Patchify { .. } | Conv::Unpatchify { .. } | Conv::Cells { .. }) => {}
+            Operation::Conv(
+                Conv::Patchify { .. } | Conv::Unpatchify { .. } | Conv::Cells { .. },
+            ) => {}
             Operation::Conv(other) => {
                 panic!("a spatial member this decoder never states: {other:?}")
             }

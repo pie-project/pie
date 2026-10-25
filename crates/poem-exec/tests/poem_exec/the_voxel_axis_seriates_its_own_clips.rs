@@ -81,7 +81,7 @@ fn trunk_and_decoder() -> Trace {
         name: "latent".to_string(),
         rows: None,
     });
-    let port = b.value(
+    let latent = b.value(
         Def::Input(RuntimeInput::Guest {
             id: 0,
             axis: InputAxis::Voxel,
@@ -97,7 +97,7 @@ fn trunk_and_decoder() -> Trace {
         values: vec![y],
         layer: None,
     });
-    let h = b.op(port, voxel(Dim::Voxels), Guard::Fact(0));
+    let h = b.op(latent, voxel(Dim::Voxels), Guard::Fact(0));
     let pixels = b.op(h, voxel(Dim::VoxelsTimes(4)), Guard::Fact(0));
     b.trace.seams.push(Seam {
         seam: "pixels".to_string(),

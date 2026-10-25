@@ -16,13 +16,14 @@
 //! and the next submit reads them through the denoise lane's two inputs,
 //! `self_cond_ids` and `self_cond_weights` — the reference's
 //! `softmax(logits / T) · E`, truncated to those taps. The first step of
-//! every canvas reads zeros (no signal), as the reference does. Multi-canvas speculation is not attempted.
+//! every canvas reads zeros (no signal), as the reference does.
+//! Multi-canvas speculation is not attempted.
 
 use inferlet::eta::diffusion::prelude::*;
-
-/// The tokens one block's canvas is.
-const CANVAS: u32 = 256;
 use serde::{Deserialize, Serialize};
+
+/// Tokens per block's canvas.
+const CANVAS: u32 = 256;
 
 #[derive(Deserialize)]
 struct Input {
@@ -335,8 +336,7 @@ async fn main(input: Input) -> Result<Output> {
     })
 }
 
-/// The self-conditioning taps per canvas row: the width of the denoise
-/// lane's `self_cond_ids` input.
+/// The width of the denoise lane's `self_cond_ids` input.
 fn self_cond_taps() -> Result<u32> {
     let lane = model::lane_of(&[("mode", "denoise")])?;
     let input = lane
@@ -348,7 +348,7 @@ fn self_cond_taps() -> Result<u32> {
         .width)
 }
 
-/// One `encode` pass over `tokens` at slots `base..`: the causal reading,
+/// One `encode` pass over `tokens` at slots `base..`: the default `encode` mode,
 /// whose K/V become the sequence and freeze. Reads out its last row so the
 /// fire has a drained output (an epilogue put that is never taken fills the
 /// ring; a pass with nothing to say still says one word).

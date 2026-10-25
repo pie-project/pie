@@ -5,9 +5,8 @@
 //!
 //! # One whole denoise step, in three fires
 //!
-//! A denoise step of this family is THREE fires (`crates/models/src/
-//! hunyuan_image_3/forward.rs` says why the conv image head cannot share
-//! the trunk's plan unit), and this program runs all three end to end —
+//! A denoise step of this family is THREE fires (the conv image head cannot
+//! share the trunk's plan unit; see `models/hunyuan_image_3.poem`), and this program runs all three end to end —
 //! each one fed pie's OWN answer to the one before, so the velocity it
 //! lands is the step:
 //!
@@ -17,8 +16,8 @@
 //!            through `patch_embed`'s 3x3 convs and its adaptive group
 //!            norm                                        -> pixels [h*w, D]
 //! denoise    the canvas: those h*w rows through the `latents` input plus
-//!            ONE <timestep> row the plan lands from the lane's timestep
-//!            vector, bidirectional over [prefix | canvas] against the
+//!            ONE <timestep> row the plan lands from the lane's `timestep`
+//!            input, bidirectional over [prefix | canvas] against the
 //!            prefix `text` wrote and froze                -> hidden
 //! image.out  those rows back on the voxel axis through `final_layer`
 //!                                                        -> pixels [h*w, 32]
@@ -72,8 +71,7 @@
 //! every other row takes its `latents` row.
 //!
 //! The mask is the reference's generalized causal attention, built here as
-//! the dense `[rows, keys]` bool rectangle the engine's `AttnMask` port
-//! takes: an image row sees every key of `[prefix | <timestep> | canvas]`,
+//! the dense `[rows, keys]` bool rectangle `pass.mask` takes: an image row sees every key of `[prefix | <timestep> | canvas]`,
 //! the `<timestep>` row sees the prefix and itself. Nothing past the canvas
 //! is in the KV at all, so the reference's trailing `<eoi>` needs no
 //! masking off.
@@ -136,8 +134,7 @@ struct Case {
     latent_channels: u32,
     /// `timestep_embedding(t, 256)`, one row, replicated over the clip's
     /// voxels by this program: the two adaGN embedders read it there
-    /// because a voxel-axis lane vector has no broadcast (see
-    /// `model::port::TFREQ_VOXELS`).
+    /// because a voxel-axis input has no broadcast.
     tfreq: Vec<f32>,
     hidden: u32,
     /// The scheduler timestep `σ·1000` of step 0, and of the step the two
@@ -182,10 +179,7 @@ fn readout_width(reading: &str) -> Result<u32> {
         .ok_or_else(|| format!("reading `{reading}` reads nothing out"))
 }
 
-/// The lane of `reading`, checked to read exactly `binds`: what this guest
-/// binds on it, by the model's own input names. Checked up front so a model
-/// whose lane reads anything else fails here in its own vocabulary instead
-/// of at `program`.
+/// The lane of `reading`, checked to read exactly `binds`.
 fn lane_reading(reading: &str, binds: &[&str]) -> Result<model::LaneDecl> {
     let lane = model::lane_of(&[("reading", reading)])?;
     let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
@@ -195,8 +189,7 @@ fn lane_reading(reading: &str, binds: &[&str]) -> Result<model::LaneDecl> {
     if reads != wants {
         return Err(format!(
             "reading `{reading}`'s lane reads {reads:?}; this pass binds {wants:?}"
-        )
-        .into());
+        ));
     }
     Ok(lane)
 }
@@ -209,8 +202,7 @@ fn voxel_input(arm: &str) -> Result<String> {
         other => Err(format!(
             "reading `{arm}` reads {} input(s), and a voxel arm reads one clip on the voxel axis",
             other.len()
-        )
-        .into()),
+        )),
     }
 }
 
@@ -251,7 +243,7 @@ fn prefill(
     // Every row reads out: the default is the lane's LAST row, and the
     // golden's logits are the whole causal pass.
     pass.readout(&readout)?;
-    let (argmax_out, max_out) = (argmax.clone(), max.clone());
+    let (argmax_out, max_out) = (argmax, max);
     pass.epilogue(move || {
         let logits = intrinsics::logits();
         argmax_out.put(cast(reduce_argmax(&logits), dtype::i32));
@@ -324,7 +316,7 @@ fn denoise_step(
     )?;
     pass.readout(&readout)?;
     let hidden = case.hidden;
-    let readback = out.clone();
+    let readback = out;
     pass.epilogue(move || {
         readback.put(intrinsics::hidden(0, canvas_len, hidden));
     });
@@ -339,8 +331,7 @@ fn denoise_step(
 /// `clip` is `[h*w, channels]` in raster order and the timestep's sinusoid
 /// is appended to EVERY row, because the arm reads one packed rectangle:
 /// the CUDA shell seats one voxel width a fire and refuses a lane that
-/// feeds two. The model text splits the
-/// columns back apart (`super::model::port::LATENT_VOXELS`).
+/// feeds two. The model splits the columns back apart.
 fn voxel_arm(
     case: &Case,
     arm: &str,
@@ -365,7 +356,7 @@ fn voxel_arm(
     pass.input(0, &voxel_input(arm)?, &x)?;
     let width = readout_width(arm)?;
     let out = Channel::new([rows, width], dtype::f32).named(&format!("pixels_{tag}"));
-    let readback = out.clone();
+    let readback = out;
     pass.epilogue(move || {
         readback.put(intrinsics::pixels(0, rows, width));
     });
@@ -398,7 +389,7 @@ fn parse(input: &Input) -> Result<Case> {
             return Err("pass `case` (json), `case_0..7` (its pieces) or `case_file`".into());
         }
     };
-    inferlet::serde_json::from_str(&text).map_err(|why| format!("case json: {why}").into())
+    inferlet::serde_json::from_str(&text).map_err(|why| format!("case json: {why}"))
 }
 
 #[inferlet::main]
@@ -417,8 +408,7 @@ async fn main(input: Input) -> Result<Output> {
         return Err(format!(
             "the model reads a {canvas_width}-wide canvas row and the case carries {}",
             case.hidden
-        )
-        .into());
+        ));
     }
     if case.prefix.len() != case.prefix_alt.len() {
         return Err("the two prefixes must have one length, one mask and one rope".into());
@@ -457,8 +447,7 @@ async fn main(input: Input) -> Result<Output> {
         return Err(format!(
             "`image.in` lands {image_in_width}-wide rows and the case's trunk is {} wide",
             case.hidden
-        )
-        .into());
+        ));
     }
     let rows_channel = voxel_arm(
         &case,

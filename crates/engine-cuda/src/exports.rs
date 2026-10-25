@@ -51,28 +51,18 @@ impl Exports {
             .map(|(export, grid)| (export.value, *grid))
     }
 
-    /// Whether `class` writes the pixels seam.
     pub(crate) fn writes_pixels(&self, class: usize) -> bool {
         self.pixels
             .iter()
             .any(|(export, _)| export.classes.contains(class))
     }
 
-    /// Whether export `value`'s rows are voxels rather than tokens.
     pub(crate) fn on_voxels(&self, trace: &Trace, value: ValueId) -> bool {
         matches!(
             &trace.values[value.0 as usize].ty,
             poem_ir::Ty::Tensor { shape, .. }
                 if matches!(shape.first(), Some(poem_ir::Dim::Voxels | poem_ir::Dim::VoxelsTimes(_)))
         )
-    }
-
-    pub(crate) fn pixels_widths<'a>(&'a self, trace: &'a Trace) -> impl Iterator<Item = u32> + 'a {
-        self.pixels.iter().filter_map(move |(export, _)| {
-            crate::store::kv::width_of(trace, export.value)
-                .ok()
-                .and_then(|width| u32::try_from(width).ok())
-        })
     }
 
     #[must_use]
@@ -577,10 +567,7 @@ pub(crate) fn regions_launching_schedules(
 mod tests {
     use super::*;
 
-    /// A drafter head's non-causal block and its trunk's causal masked
-    /// layers sit in different classes; one masked layer turned non-causal
-    /// puts both directions under its class's one mask, and the load
-    /// refuses it.
+    /// A masked layer turned non-causal puts both directions under one class's mask.
     #[test]
     fn a_class_attending_both_ways_under_one_mask_is_refused() {
         let mut trace = poem_compiler::catalog::deployment("qwen35-d9b-dflash-u4g64-kv-bf16")

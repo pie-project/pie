@@ -82,7 +82,7 @@ fn the_latent_is_patched_in_the_graph_and_the_positions_are_its_cells() {
             vec![3],
             "{deployment}: a text row's position runs down the index axis"
         );
-        let ports: BTreeSet<String> = plan
+        let named: BTreeSet<String> = plan
             .values
             .iter()
             .filter_map(|decl| match &decl.def {
@@ -101,7 +101,7 @@ fn the_latent_is_patched_in_the_graph_and_the_positions_are_its_cells() {
             "reference:lane:1".to_string(),
             "positions:row:4".to_string(),
         ] {
-            assert!(ports.contains(&want), "{deployment}: {want} in {ports:?}");
+            assert!(named.contains(&want), "{deployment}: {want} in {named:?}");
         }
         let velocity = plan
             .seams
@@ -228,7 +228,7 @@ fn the_readings_state_their_streams_readouts_and_sinusoids() {
         .iter()
         .position(|i| i.name == "latent")
         .expect("the decoder's latent input") as u32;
-    let voxel_port = plan.values.iter().any(|decl| {
+    let voxel_input = plan.values.iter().any(|decl| {
         matches!(
             decl.def,
             Def::Input(RuntimeInput::Guest {
@@ -240,7 +240,7 @@ fn the_readings_state_their_streams_readouts_and_sinusoids() {
         )
     });
     assert!(
-        voxel_port,
+        voxel_input,
         "the decoder arm reads the VAE-native latent as voxels"
     );
 }

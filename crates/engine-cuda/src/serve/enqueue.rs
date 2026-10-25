@@ -252,12 +252,10 @@ struct Staged {
 }
 
 impl Shell {
-    /// Runs, and commits, the prologues of `attachments` before the fire
-    /// resolves its descriptor ports and stages its inputs: both read what
-    /// a prologue put. It mints against the cursors airborne fires
-    /// predicted, as an epilogue does: only what has landed settles here.
-    /// A port the host reads off a channel a prologue put waits for it to
-    /// land.
+    /// Runs and commits the prologues of `attachments` before the fire
+    /// resolves its descriptor ports and stages its inputs, which read what
+    /// a prologue put. Mints against the cursors airborne fires predicted; a
+    /// port read off a channel a prologue put waits for it to land.
     pub(super) fn prologue(&mut self, attachments: &[super::Attached]) -> Result<()> {
         let runs =
             |a: &&super::Attached| !a.adapter_only && self.programs.prologue_runs(a.instance);
@@ -409,7 +407,7 @@ impl FireCtx<'_> {
             for feed in &p.voxel_feeds {
                 let dest = handles.voxels.ok_or_else(|| Fault::Unbound {
                     what: format!(
-                        "lane {}'s voxel port payload, which this fire's tables reserved \
+                        "lane {}'s voxel input payload, which this fire's tables reserved \
                          no rectangle for",
                         feed.lane
                     ),

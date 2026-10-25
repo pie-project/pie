@@ -228,10 +228,8 @@ pub fn reader_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -
     classes
 }
 
-/// Each class of the plan, as a lane landing in it is told of it: whether it
-/// reads a kv cache or a recurrent state, embeds `tokens`, attends both ways, and the export seam
-/// it reads out (`out` before `velocity`, `hidden` and `pixels`, as a fire
-/// reads it) and how wide one row of it is.
+/// Each class of the plan as a lane landing in it is told of it; a class's
+/// readout is its first export seam of `out`, `velocity`, `hidden`, `pixels`.
 #[must_use]
 pub fn lane_classes(trace: &Trace, compiled: &CompiledModel) -> LaneClasses {
     let kv = classes_reading(trace, compiled, |def| {

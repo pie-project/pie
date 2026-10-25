@@ -549,7 +549,7 @@ describe('sampler golden', () => {
     check('latent_step', b.build());
   });
 
-  // `inferlet_goldens.rs::vae_readback` - a VAE reading's epilogue (design D8):
+  // `inferlet_goldens.rs::vae_readback` - a VAE decode's epilogue (design D8):
   // the one golden that carries `Intrinsic.PIXELS`, so a port that drifts on
   // the new intrinsic's wire id fails here. The rows are declared, not
   // hinted: a VAE lane's token rows are not its clip's voxels.

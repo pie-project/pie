@@ -688,8 +688,8 @@ def roster() -> list[Gate]:
             expected="an all-ones table IS the plain step; a split table moves it; "
                      "class-0 rows ignore class-1 text exactly",
             note="A STRUCTURED ATTENTION MASK STATED BY THE GUEST "
-                 "(`forward-pass.attention-classes`): one class per row and a "
-                 "count x count table, applied by the engine to the reading's "
+                 "(`forward-pass.mask`, built from one class per row and a "
+                 "count x count table), applied by the engine to the "
                  "group-packed `attention.ragged` with no family code involved. "
                  "Every claim is an identity within fires of one shape.",
             needs=[(a("mini-dit.zt"),
@@ -925,7 +925,7 @@ def roster() -> list[Gate]:
                   "the guest driving the family's TWO `vae.encode` arms, one chunk per fire "
                   "down one pipeline: the clip crosses as `frames` handles "
                   "(`frames.decode` per still, `frames.from-rgb8` per chunk, "
-                  "`frames.to-channel` onto the pixel port) and the encoder's rows go "
+                  "`frames.to-channel` onto the pixel input) and the encoder's rows go "
                   "STRAIGHT to `denoise` — the arm already answers `(mean - "
                   "latents_mean)/std`, the denoiser's own space. Both claims are "
                   "identities, so neither needs a golden; they are measured on `raw-rgb8`, "
@@ -939,7 +939,7 @@ def roster() -> list[Gate]:
                      "and at 1.0 IS txt2img",
             note="img2img is the guest driving the family's `vae.encode` reading: "
                  "the picture crosses as a `frames` handle (`frames.decode` in, "
-                 "`frames.to-channel` onto the pixel port) and never enters the "
+                 "`frames.to-channel` onto the pixel input) and never enters the "
                  "guest's linear memory. An init image seeds the trajectory. Every "
                  "claim is an identity or a margin measured within this gate's own "
                  "runs, so none needs a golden.",

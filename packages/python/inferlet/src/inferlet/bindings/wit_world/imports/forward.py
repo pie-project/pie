@@ -77,7 +77,7 @@ class ForwardPass:
     
     A pass holds every lane of one computation: a CFG denoising step's
     image and text lanes of both branches, a beam's rows, an LM CFG's two
-    streams. A verb taking `lane` binds that lane; the pass has as many
+    branches. A verb taking `lane` binds that lane; the pass has as many
     lanes as the highest index set plus one, or as `state` binds working
     sets. Row data the program computes (`embed`, `state-geometry`,
     `readout`, `mask`) is the pass's, lane after lane.

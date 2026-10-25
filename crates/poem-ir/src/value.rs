@@ -206,19 +206,9 @@ pub enum RuntimeInput {
         select: Selection,
     },
     Grid,
-    /// The clips' token-side grid, `[Clips, 4]` i32: each clip's cell
-    /// `[t / p0, h / p1, w / p2, first token row]`. The contract: a voxel
-    /// lane's token rows are its clips' patches of `p`, each clip's in
-    /// (t, h, w) row-major order from its first token row, the clips in
-    /// lane order; past them a lane carries only the pad rows its voxel
-    /// input's stated `rows` round it up to (`multiple_of(n)`), which read
-    /// as no clip's.
-    ///
-    /// One family is the exception, by decision: HunyuanImage 3
-    /// (`models/hunyuan_image_3.poem`) denoises its canvas inside the
-    /// language model's KV lane, a `<timestep>` row ahead of the patches,
-    /// so its canvas rows are guest-given (`latents`, `special`) and so are
-    /// its `positions`; it reads no token grid.
+    /// `[Clips, 4]` i32, each clip's `[t / p0, h / p1, w / p2, first token
+    /// row]`: a voxel lane's token rows are its clips' patches in (t, h, w)
+    /// row-major order, then only pad rows.
     TokenGrid {
         p: [u32; 3],
     },
@@ -243,8 +233,6 @@ pub enum InputAxis {
 }
 
 impl InputAxis {
-    pub const ALL: [InputAxis; 3] = [InputAxis::Lane, InputAxis::Row, InputAxis::Voxel];
-
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {

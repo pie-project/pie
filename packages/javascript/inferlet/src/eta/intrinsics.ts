@@ -43,7 +43,7 @@ export function hidden(lane: number, rows: number, width: number): Tensor {
 }
 
 /**
- * The pixels lane `lane`'s VAE reading lands, `[rows, width]` F32 at the
+ * The pixels lane `lane`'s VAE decode lands, `[rows, width]` F32 at the
  * epilogue: one row per OUTPUT voxel of the lane's clip.
  */
 export function pixels(lane: number, rows: number, width: number): Tensor {

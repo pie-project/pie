@@ -1,4 +1,4 @@
-//! What a layout may state of a generative model: its latent space,
+//! What a layout may state of a generative model: its latent space and
 //! schedule.
 
 use std::fmt;

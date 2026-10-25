@@ -839,7 +839,6 @@ impl Shell {
         compiled.units.len() <= 2
     }
 
-    /// Whether the class of `word` attends both ways.
     pub(crate) fn wide(&self, word: u64) -> bool {
         let classes = &self.compiled.classes;
         classes

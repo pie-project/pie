@@ -114,7 +114,7 @@ fn lane_switches<'a>(reading: &'a str, stream: Option<&'a str>) -> Vec<(&'a str,
 }
 
 fn lane(reading: &str, stream: Option<&str>) -> Result<model::LaneDecl> {
-    model::lane_of(&lane_switches(reading, stream)).map_err(Into::into)
+    model::lane_of(&lane_switches(reading, stream))
 }
 
 fn set_switches(pass: &ForwardPass, at: u32, reading: &str, stream: Option<&str>) -> Result<()> {
@@ -212,26 +212,27 @@ fn denoise_reading() -> Result<Denoise> {
         if video.state {
             return Err(format!(
                 "reading `{reading}` binds a working set; a denoise pass binds none"
-            )
-            .into());
+            ));
         }
         let context_stream = stream_reading(&reading, "context")
             .ok_or_else(|| format!("reading `{reading}` reads no `context` for the prompt rows"))?;
         let prompt = lane(&reading, context_stream.as_deref())?;
         let latents = input(&video, "latents").cloned().expect("found by it");
         if latents.axis != model::InputAxis::Voxel {
-            return Err(format!("reading `{reading}` reads `latents` per {:?}; this sampler holds the VAE's latent, on the voxel axis", latents.axis).into());
+            return Err(format!(
+                "reading `{reading}` reads `latents` per {:?}; this sampler holds the VAE's latent, on the voxel axis",
+                latents.axis
+            ));
         }
         if input(&video, "timestep").is_none() {
-            return Err(format!("reading `{reading}` reads no `timestep`").into());
+            return Err(format!("reading `{reading}` reads no `timestep`"));
         }
         let velocity = video.readout.as_ref().map_or(0, |r| r.width);
         if velocity != latents.width {
             return Err(format!(
                 "reading `{reading}` reads out {velocity}-wide velocity rows over {}-wide latent cells",
                 latents.width
-            )
-            .into());
+            ));
         }
         return Ok(Denoise {
             context: input(&prompt, "context").cloned().expect("found by it"),
@@ -281,8 +282,7 @@ fn encode(
         return Err(format!(
             "the text reading hands back {}-wide rows and input `{}` takes {}",
             text.width, context.name, context.width
-        )
-        .into());
+        ));
     }
     let len = u32::try_from(ids.len()).map_err(|_| "the prompt is too long")?;
     if len == 0 {
@@ -290,9 +290,9 @@ fn encode(
     }
     let cap = max_readout_rows(model::ReadoutKind::Hidden);
     if len as usize > cap {
-        return Err(
-            format!("the prompt is {len} tokens and one pass reads out {cap} hidden rows").into(),
-        );
+        return Err(format!(
+            "the prompt is {len} tokens and one pass reads out {cap} hidden rows"
+        ));
     }
     let rows = padded(context.rows, len).ok_or_else(|| {
         format!(
@@ -379,7 +379,9 @@ fn vae_lane(reading: &str) -> Result<Vae> {
             });
         }
     }
-    Err(format!("reading `{reading}` reads no one clip on the voxel axis").into())
+    Err(format!(
+        "reading `{reading}` reads no one clip on the voxel axis"
+    ))
 }
 
 impl Vae {
@@ -445,29 +447,26 @@ async fn main(input: Input) -> Result<Output> {
         return Err(format!(
             "the latent space has {c} channels and `latents` reads {}",
             denoise.latents.width
-        )
-        .into());
+        ));
     }
     if decode.input.width != c || decode.width != 3 {
         return Err(format!(
             "`{}` reads {}-wide cells into {}-wide pixels; the latent has {c} channels and a \
              frame is RGB",
             decode.reading, decode.input.width, decode.width
-        )
-        .into());
+        ));
     }
     let height = (input.height.unwrap_or(480) / sc).max(1) * sc;
     let width = (input.width.unwrap_or(832) / sc).max(1) * sc;
     let (lh, lw) = (height / sc, width / sc);
     let frames = input.frames.unwrap_or(17).max(1);
-    if frames < first || (frames - first) % tc != 0 {
+    if frames < first || !(frames - first).is_multiple_of(tc) {
         let below = first + tc * (frames.saturating_sub(first) / tc);
         return Err(format!(
             "this model's latent frames stand for {first}, then {tc} each, so {frames} frames is \
              not a clip it has: the nearest are {below} and {}",
             below + tc
-        )
-        .into());
+        ));
     }
     let lt = (frames - first) / tc + 1;
     let pixel_frames = |j: u32| if j == 0 { first } else { tc };
@@ -488,7 +487,9 @@ async fn main(input: Input) -> Result<Output> {
     let has_init = !init_b64.is_empty();
     let strength = input.strength.unwrap_or(0.6);
     if has_init && !(0.0 < strength && strength <= 1.0) {
-        return Err(format!("`strength` is {strength}; it is a fraction in (0, 1]").into());
+        return Err(format!(
+            "`strength` is {strength}; it is a fraction in (0, 1]"
+        ));
     }
     let sched = if has_init {
         let run = ((steps as f32 * strength).round() as u32).clamp(1, steps);
@@ -530,8 +531,7 @@ async fn main(input: Input) -> Result<Output> {
             "reading `{}` reads a `guidance` input, so this row is guidance-distilled and a \
              negative prompt has no lane to ride",
             denoise.reading
-        )
-        .into());
+        ));
     }
     let cfg = negative.is_some() && guidance > 1.0;
 
@@ -547,15 +547,13 @@ async fn main(input: Input) -> Result<Output> {
             return Err(format!(
                 "`{}` reads out {}-wide cells, the latent has {c} channels",
                 enc.reading, enc.width
-            )
-            .into());
+            ));
         }
         if init_b64.len() as u32 != frames {
             return Err(format!(
                 "the init clip is {} frames and this run is {frames}",
                 init_b64.len()
-            )
-            .into());
+            ));
         }
         let mut stills = Vec::with_capacity(init_b64.len());
         for (f, b64) in init_b64.iter().enumerate() {
@@ -567,8 +565,7 @@ async fn main(input: Input) -> Result<Output> {
                     picture.width(),
                     picture.height(),
                     picture.count()
-                )
-                .into());
+                ));
             }
             stills.push(picture);
         }
@@ -611,7 +608,7 @@ async fn main(input: Input) -> Result<Output> {
     let seed = input.seed.unwrap_or(0);
     let draw = Channel::from(rng_state(seed)).named("draw");
     let seed_loop = move || {
-        let eps = normal(&draw.read(), lat);
+        let eps = normal(draw.read(), lat);
         let x0 = match &init {
             None => eps,
             Some(init) => {
@@ -739,9 +736,9 @@ async fn main(input: Input) -> Result<Output> {
         "y4m" => (ImageFormat::Y4m, "y4m"),
         "rgb8" | "raw-rgb8" => (ImageFormat::RawRgb8, "rgb"),
         other => {
-            return Err(
-                format!("unknown video format {other:?}; try 'mp4', 'y4m' or 'rgb8'").into(),
-            );
+            return Err(format!(
+                "unknown video format {other:?}; try 'mp4', 'y4m' or 'rgb8'"
+            ));
         }
     };
     let file = format!("{name}.{ext}");

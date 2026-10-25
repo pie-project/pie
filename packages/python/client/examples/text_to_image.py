@@ -10,7 +10,7 @@ The whole point of this file is the FILE event. `text-to-image` streams a
 progress line or two and then sends its output as a file; what arrives is a
 `ReceivedFile` -- bytes, with the name the inferlet suggested attached. That
 name is what makes the difference between writing `file-0000.bin` and writing
-`image.latent.f32` (or `image.png`, on a model whose VAE decode reading the
+`image.latent.f32` (or `image.png`, on a model whose VAE decode the
 guest can drive), so it is what this example is about.
 
 `text-to-image` must already be on the server: `pie inferlet install

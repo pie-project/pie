@@ -125,7 +125,7 @@ fn epilogue(rows: u32, width: u32) -> TraceContainer {
 }
 
 #[test]
-fn the_token_reading_fires_alone() {
+fn the_token_class_fires_alone() {
     if !engine_cuda::device::present() {
         eprintln!("no CUDA device: skipping");
         return;
@@ -155,7 +155,7 @@ fn the_token_reading_fires_alone() {
     let mut ticket = rig
         .engine
         .submit(&frame(vec![text], vec![attach(0, &handles)]))
-        .expect("a plan whose token reading carries kv fires that reading alone");
+        .expect("a plan whose token class carries kv fires that class alone");
     rig.engine
         .settle_frame(&mut ticket)
         .expect("the frame settles");

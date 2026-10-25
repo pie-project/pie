@@ -36,9 +36,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use poem_ir::{
-    CacheRow, Def, Dim, Operands, Operation, ParamPlacement, Shard, Trace, Ty, ValueId,
-};
+use poem_ir::{CacheRow, Def, Dim, Operands, Operation, ParamPlacement, Shard, Trace, Ty, ValueId};
 
 use super::rules::{self, Rule};
 use crate::tree::{self, Tree};

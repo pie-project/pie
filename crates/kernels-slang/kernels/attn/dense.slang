@@ -56,7 +56,6 @@ groupshared int dense_end;
 groupshared int dense_segment;
 
 #ifdef PIE_CUSTOM
-// Whether row `row` of segment `seg` keeps key `j`.
 bool mask_keeps(int seg, int row, int j) {
     uint qo = uint(row - segments[uint(seg)]);
     uint kv = uint(j - kv_segments[uint(seg)]);

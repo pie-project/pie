@@ -674,6 +674,7 @@ impl Plane {
 
     /// `fire_guests`; `latch` is not held, every pass lands before this
     /// returns.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn fire_guests_with(
         &mut self,
         device: &crate::device::Device,
@@ -869,6 +870,7 @@ impl Plane {
     }
 
     #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
     pub fn fire_interpreted(
         &mut self,
         instance: InstanceId,

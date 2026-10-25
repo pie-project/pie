@@ -2,7 +2,7 @@ use eta_compiler::codegen::program::{Backend, EmittedKernel, emit_program};
 use eta_compiler::plan::compile_bound;
 
 use crate::msl_corpus::{
-    GOLDEN_NAMES, extended_traces, golden_container, golden_profile, synthetic_traces,
+    GOLDEN_NAMES, extended_traces, golden_container, golden_served, synthetic_traces,
 };
 
 fn every_emitted_kernel() -> Vec<(String, Backend, EmittedKernel)> {
@@ -12,17 +12,17 @@ fn every_emitted_kernel() -> Vec<(String, Backend, EmittedKernel)> {
             (
                 (*name).to_string(),
                 golden_container(name),
-                golden_profile(name),
+                golden_served(name),
             )
         })
         .collect();
-    for (name, container, profile) in synthetic_traces().into_iter().chain(extended_traces()) {
-        traces.push((name.to_string(), container, profile));
+    for (name, container, served) in synthetic_traces().into_iter().chain(extended_traces()) {
+        traces.push((name.to_string(), container, served));
     }
 
     let mut out = Vec::new();
-    for (name, container, profile) in traces {
-        let Ok(bound) = profile.bind(container) else {
+    for (name, container, served) in traces {
+        let Ok(bound) = served.bind(container) else {
             continue;
         };
         let stages = compile_bound(&bound);

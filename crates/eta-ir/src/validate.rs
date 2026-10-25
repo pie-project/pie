@@ -80,10 +80,6 @@ pub enum ValidateError {
         name: String,
         stage: Stage,
     },
-    SinkKernelKindMismatch {
-        name_index: u16,
-        name: String,
-    },
     KernelUnavailable {
         name_index: u16,
         name: String,
@@ -164,14 +160,6 @@ impl fmt::Display for ValidateError {
                  its consumption point",
                 stage.name()
             ),
-            SinkKernelKindMismatch { name_index, name } => {
-                write!(
-                    f,
-                    "`{name}` (name #{name_index}): sink/kernel kind mismatch with \
-                     the profile — the program calls it as one and the backend \
-                     declares it as the other"
-                )
-            }
             KernelUnavailable { name_index, name } => {
                 write!(
                     f,
