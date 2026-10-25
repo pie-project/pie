@@ -53,7 +53,11 @@ const UNPACKS: [&str; 3] = [
 
 /// Per-head ops affine in what they follow, which a partial sum reaches
 /// as it does a sum: reduced first, no pair recut for it.
-const AFFINE: [&str; 1] = ["elemwise.add_bias"];
+const AFFINE: [&str; 3] = [
+    "elemwise.add_bias",
+    "ssm.short_conv",
+    "ssm.short_conv_chunked",
+];
 
 /// The weights an op reads one row a head or channel of the shares it
 /// follows, cut along their rows with them; any other weight a per-head op

@@ -3,7 +3,7 @@
 //! weight or a cache the ranks split.
 
 use poem_ir::{
-    Attn, BinaryOp, Collective, Dim, Dtype, Elemwise, Gather, Linear, NormAxis, Operands,
+    ActFn, Attn, BinaryOp, Collective, Dim, Dtype, Elemwise, Gather, Linear, NormAxis, Operands,
     Operation, Shard, Ty, ValueId,
 };
 
@@ -140,6 +140,9 @@ fn heads(name: &str) -> Option<Heads> {
             Heads::of(&["x"], &[]).cache(Cache::Split)
         }
         "ssm.gdn_gates" => Heads::of(&["ba"], &[]),
+        "ssm.short_conv" | "ssm.short_conv_chunked" => Heads::of(&["x"], &[]).cache(Cache::Split),
+        // Each head's run of `x` against the one table every head reads.
+        "linear.rel_bias" => Heads::of(&["x"], &["heads"]),
         "ssm.mamba2" | "ssm.mamba2_chunked" => {
             Heads::of(&["xbc", "dt", "z"], &["heads", "groups"]).cache(Cache::Split)
         }
@@ -164,16 +167,21 @@ pub(super) fn rule(op: &Operation) -> Rule {
         };
     }
     // A gated unit splits with its columns, packed or as two planes; one of
-    // routed rows (each times its route's weight) reads them whole.
-    if let Operation::Linear(Linear::Glu {
-        packed, weights, ..
+    // routed rows scales each row by its route's weight, which every rank
+    // reads whole.
+    if let Operation::Linear(Linear::Glu { packed, .. }) = op {
+        return match packed {
+            Some(_) => Rule::Heads(Heads::of(&["packed"], &["intermediate"])),
+            None => Rule::Heads(Heads::of(&["gate", "up"], &["intermediate"])),
+        };
+    }
+    // A scale (the identity times a scalar) is linear in what it scales.
+    if let Operation::Elemwise(Elemwise::Act {
+        act: ActFn::Identity,
+        ..
     }) = op
     {
-        return match (packed, weights) {
-            (_, Some(_)) => Rule::Whole,
-            (Some(_), None) => Rule::Heads(Heads::of(&["packed"], &["intermediate"])),
-            (None, None) => Rule::Heads(Heads::of(&["gate", "up"], &["intermediate"])),
-        };
+        return Rule::Linear { follow: &["x"] };
     }
     // A product contracts with its weight's split, its activations quantized
     // or not: one that quantizes them does so on each rank's share.
@@ -223,30 +231,26 @@ pub(super) fn rule(op: &Operation) -> Rule {
             input: 2,
         };
     }
-    // A weighted sum of routed rows is linear in them; one that adds a shared
-    // row reads its operands whole.
+    // A weighted sum of routed rows is linear in them, and in a shared row
+    // it adds.
     if let Operation::Linear(Linear::MoeCombine { shared, .. }) = op {
         return match shared {
             None => Rule::Linear {
                 follow: &["routed"],
             },
-            Some(_) => Rule::Whole,
+            Some(_) => Rule::Linear {
+                follow: &["routed", "shared"],
+            },
         };
     }
     // A paged attention splits with its query heads, its cache split with
-    // them or kept whole; one under a relative bias reads its operands whole,
-    // as the biased ops did, which had no rule.
-    if let Operation::Attn(Attn::Decode { bias, .. }) = op {
-        return match bias {
-            Some(_) => Rule::Whole,
-            None => Rule::Heads(Heads::of(&["q"], &[]).cache(Cache::SplitOrWhole)),
-        };
+    // them or kept whole; a relative bias, a head's run of positions after
+    // another, splits with them.
+    if let Operation::Attn(Attn::Decode { .. }) = op {
+        return Rule::Heads(Heads::of(&["q", "bias"], &[]).cache(Cache::SplitOrWhole));
     }
-    if let Operation::Attn(Attn::Prefill { bias, .. }) = op {
-        return match bias {
-            Some(_) => Rule::Whole,
-            None => Rule::Heads(Heads::of(&["q"], &[KV_HEADS]).cache(Cache::SplitOrWhole)),
-        };
+    if let Operation::Attn(Attn::Prefill { .. }) = op {
+        return Rule::Heads(Heads::of(&["q", "bias"], &[KV_HEADS]).cache(Cache::SplitOrWhole));
     }
     let name = op.name();
     match name {
