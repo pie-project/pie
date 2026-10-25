@@ -269,3 +269,51 @@ fn inkling_splits_through_its_convolutions_and_biased_attention() {
         .trace(Platform::Cuda);
     assert!(matches!(unembed(&two), poem_ir::Shard::Cut { .. }));
 }
+
+/// The diffusion transformers norm q and k across all their heads right
+/// after their products: split two ways, each such norm sums its share's
+/// squares, sums them across the ranks and norms its share by them, and
+/// every other op is the one-rank trace's. Each attention's q and k norms
+/// are cut with its heads.
+#[test]
+fn a_diffusion_transformers_q_and_k_norm_their_shares() {
+    for row in ["wan22-mini-d128-bf16-kv-bf16", "ltx25-mini-bf16-kv-bf16"] {
+        let whole = crate::catalog::deployment(row)
+            .expect("the one-rank row")
+            .trace(Platform::Cuda);
+        let split = crate::catalog::deployment(&format!("{row}-tp2"))
+            .expect("the row splits two ways")
+            .trace(Platform::Cuda);
+        let count = |trace: &poem_ir::Trace, op: &str| {
+            (trace.nodes.iter())
+                .filter(|node| poem_ir::Operands::name(&node.op) == op)
+                .count()
+        };
+        let shared = count(&split, "elemwise.rmsnorm_by");
+        assert!(shared >= 4, "{row}: {shared} norms over a split row");
+        assert_eq!(count(&split, "elemwise.sum_squares"), shared, "{row}");
+        // Every op but the collectives, a split row's norm read as the norm
+        // it stands for.
+        let ops = |trace: &poem_ir::Trace| {
+            let mut names: Vec<&str> = (trace.nodes.iter())
+                .map(|node| poem_ir::Operands::name(&node.op))
+                .filter(|n| !n.starts_with("collective.") && *n != "elemwise.sum_squares")
+                .map(|n| if n == "elemwise.rmsnorm_by" { "elemwise.rmsnorm" } else { n })
+                .collect();
+            names.sort_unstable();
+            names
+        };
+        assert_eq!(ops(&split), ops(&whole), "{row}: every op but the collectives");
+        let norms: Vec<&poem_ir::Param> = (split.params.iter())
+            .filter(|p| p.name.ends_with("norm_q") || p.name.ends_with("q_norm"))
+            .collect();
+        assert!(!norms.is_empty(), "{row} norms its q");
+        for p in norms {
+            assert!(
+                matches!(p.shard, poem_ir::Shard::Cut { axis: 0, .. }),
+                "{row}: `{}` is cut with q's heads",
+                p.name
+            );
+        }
+    }
+}
