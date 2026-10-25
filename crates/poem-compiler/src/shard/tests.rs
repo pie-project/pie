@@ -165,3 +165,40 @@ fn a_padded_qkv_split_takes_apart_each_ranks_heads() {
         assert_eq!((widths, head_dim), (all_widths, all_dim));
     }
 }
+
+/// A packed q, k and v whose kv heads a group of ranks holds alike takes
+/// apart each rank's share: Qwen 3.5 0.8b's two kv heads split four ways
+/// leave a rank two query heads and their gates, and one kv head, which its
+/// split names.
+#[test]
+fn a_packed_split_names_the_kv_head_a_group_of_ranks_holds() {
+    let trace = crate::catalog::deployment("qwen35-d0.8b-bf16-kv-bf16-tp4")
+        .expect("the catalog ships the row")
+        .trace(Platform::Cuda);
+    let mut splits = 0;
+    for node in &trace.nodes {
+        if let poem_ir::Operation::Gather(poem_ir::Gather::SplitQkv {
+            packed,
+            q_width,
+            kv_width,
+            ..
+        }) = &node.op
+        {
+            splits += 1;
+            let width = match &trace.values[packed.0 as usize].ty {
+                poem_ir::Ty::Tensor { shape, .. } => match shape.last() {
+                    Some(poem_ir::Dim::Const(w)) => *w,
+                    _ => 0,
+                },
+                poem_ir::Ty::Struct(_) => 0,
+            };
+            assert_eq!((*q_width, *kv_width), (2 * 2 * 256, 256), "a rank's widths");
+            assert_eq!(
+                u64::from(q_width + 2 * kv_width),
+                width,
+                "the share it takes apart"
+            );
+        }
+    }
+    assert!(splits > 0, "the row splits q, k and v");
+}

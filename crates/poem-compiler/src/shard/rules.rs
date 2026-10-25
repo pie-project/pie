@@ -92,6 +92,13 @@ impl Heads {
     }
 }
 
+/// Unpacks whose widths name, in order, the blocks of the packed share
+/// they take apart.
+const UNPACK_WIDTHS: [(&str, &[&str]); 2] = [
+    ("gather.split_qkv", &["q_width", "kv_width"]),
+    ("gather.split_rows", &["width"]),
+];
+
 /// The head count of kv a group of ranks may share.
 pub(super) const KV_HEADS: &str = "kv_heads";
 
@@ -410,7 +417,9 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
             if split {
                 let whole_kv = heads.cache == Cache::SplitOrWhole && !at.reads_split_cache(pass);
                 at.check_kv_parts(pass, heads.kv)?;
+                let pieces = at.pieces(&held);
                 at.scale(pass, heads.scale, !whole_kv)?;
+                at.unpack(&pieces);
                 outs.iter()
                     .enumerate()
                     .map(|(i, o)| held_like(pass, *o, i, &followed, &held, outs.len()))
@@ -546,6 +555,45 @@ impl At {
             *n /= parts;
         }
         Ok(())
+    }
+
+    /// The widths an unpack names of the blocks of the one packed share it
+    /// takes apart, each with a rank's share of it: a block of kv heads a
+    /// group of ranks holds alike is cut fewer ways than the ranks.
+    fn pieces(&self, held: &[Dist]) -> Vec<(&'static str, i128, i128)> {
+        let Some((_, fields)) = UNPACK_WIDTHS.iter().find(|(op, _)| *op == self.name) else {
+            return Vec::new();
+        };
+        let [Dist::Split(blocks)] = held else {
+            return Vec::new();
+        };
+        if blocks.len() < 2 {
+            return Vec::new();
+        }
+        fields
+            .iter()
+            .zip(blocks)
+            .filter_map(|(field, b)| {
+                let parts = b.parts.max(1);
+                match tree::field(&self.tree, field) {
+                    Some(Tree::Int(n)) if *n == i128::from(b.width) => {
+                        Some((*field, *n, i128::from(b.width / parts)))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Each width `pieces` names set to a rank's share of its block.
+    fn unpack(&mut self, pieces: &[(&'static str, i128, i128)]) {
+        for (field, value) in tree::fields_mut(&mut self.tree) {
+            if let Some((_, _, share)) = pieces.iter().find(|(f, _, _)| f == field)
+                && let Tree::Int(n) = value
+            {
+                *n = *share;
+            }
+        }
     }
 
     /// The `kv` an op appends to a cache, or attends to without one, is cut
