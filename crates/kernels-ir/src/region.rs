@@ -53,6 +53,8 @@ pub enum Unary {
     Cos,
     Sqrt,
     Rsqrt,
+    /// `tanh(x)`, as `tanhf` computes it.
+    Tanh,
     Neg,
     Abs,
     Sign,

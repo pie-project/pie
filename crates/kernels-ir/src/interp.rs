@@ -115,6 +115,7 @@ fn unary(op: Unary, x: V) -> V {
                 Unary::Cos => x.cos(),
                 Unary::Sqrt => x.sqrt(),
                 Unary::Rsqrt => 1.0 / x.sqrt(),
+                Unary::Tanh => x.tanh(),
                 Unary::Neg => -x,
                 Unary::Abs => x.abs(),
                 Unary::Sign => {

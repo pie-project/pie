@@ -304,6 +304,7 @@ fn expr(e: &Expr, at: At, elem: Elem) -> String {
                 Unary::Cos => format!("f.cos({a})"),
                 Unary::Sqrt => format!("sqrtf({a})"),
                 Unary::Rsqrt => format!("rsqrtf({a})"),
+                Unary::Tanh => format!("tanhf({a})"),
                 Unary::Recip => format!("(1.0f / {a})"),
                 Unary::Neg => format!("(-{a})"),
                 Unary::Abs => format!("fabsf({a})"),

@@ -584,7 +584,13 @@ fn dear_values<'r>(
             op,
             Op::Binary(Binary::Pow, ..)
                 | Op::Unary(
-                    Unary::Exp | Unary::Log | Unary::Sin | Unary::Cos | Unary::Sqrt | Unary::Rsqrt,
+                    Unary::Exp
+                        | Unary::Log
+                        | Unary::Sin
+                        | Unary::Cos
+                        | Unary::Sqrt
+                        | Unary::Rsqrt
+                        | Unary::Tanh,
                     _
                 )
         );
