@@ -1,7 +1,9 @@
 //! Vertical fusion into generated kernels: the elementwise and row ops a
-//! trace runs back to back, formed into chains and each lowered to an eta
-//! region (`eta_compiler::region::Region`, a function of one row) that
-//! kernels-* `synth` builds one kernel for.
+//! trace runs back to back, formed into chains and each lowered to a
+//! region (kernels-ir's [`Region`], a function of one row) that kernels-*
+//! `synth` builds one kernel for. The compiler hands over the region alone:
+//! whether a chain is one the row core schedules is kernels-ir's question
+//! ([`kernels_ir::schedule`]), and each backend prints its own kernel.
 //!
 //! **Forming** is conservative, as the fuse rules are: a chain is a run of
 //! ops, each one this module lowers, each reading a value an earlier op of
@@ -15,7 +17,7 @@
 //! longest part the row frame holds is the chain. Nothing else is searched,
 //! so no unplanned combination forms.
 //!
-//! **Lowering** turns each op into the eta math it states, in f32. A value
+//! **Lowering** turns each op into the primitive math it states, in f32. A value
 //! the run reads but does not compute is a parameter; a value it computes
 //! that anything past the run may read (another op, a seam, a merge, or
 //! nothing at all, as the trace's last values) is a result, stored in its
@@ -36,10 +38,7 @@
 
 use std::collections::BTreeMap;
 
-use eta_compiler::plan::{Dimension, SymbolicType};
-use eta_compiler::region::{Body, Region};
-use eta_ir::op::Op;
-use eta_ir::types::Literal;
+use kernels_ir::{Binary, Literal, Op, Reduce, Region, Shape, Unary};
 use poem_ir::{
     ActFn, BinaryOp, Bounds, Def, Dim, Dtype, Elemwise, Fused, Node, NormAxis, NormWeight,
     Operands, Operation, Trace, Ty, ValueId,
@@ -86,28 +85,19 @@ pub struct Out {
     pub dtype: Dtype,
 }
 
-/// A generated kernel's region and the body the stream core wrote for it:
-/// what a `fused.region` op's `body` hash names.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Synth {
-    pub region: Region,
-    pub body: Body,
-}
-
-/// `trace` with each chain whose body the stream core writes replaced by
-/// one `fused.region` op, and the regions its ops name, by body hash. Two
-/// chains of one body (a layer's and the next's) share one entry.
+/// `trace` with each chain the row core schedules replaced by one
+/// `fused.region` op, and the regions its ops name, by key
+/// ([`Region::key`]). Two chains of one region (a layer's and the next's)
+/// share one entry.
 #[must_use]
-pub fn fold(trace: Trace) -> (Trace, BTreeMap<u64, Synth>) {
-    let mut bodies = BTreeMap::new();
+pub fn fold(trace: Trace) -> (Trace, BTreeMap<u64, Region>) {
+    let mut regions = BTreeMap::new();
     let mut folded: Vec<(Vec<u32>, Fused)> = Vec::new();
     for chain in chains(&trace) {
-        let Ok(body) = chain.region.body() else {
+        if kernels_ir::schedule(&chain.region).is_err() {
             continue;
-        };
-        let Ok(Some(width)) = chain.region.width() else {
-            continue;
-        };
+        }
+        let width = chain.region.width;
         if !frames(&trace, &chain, width) {
             continue;
         }
@@ -116,19 +106,16 @@ pub fn fold(trace: Trace) -> (Trace, BTreeMap<u64, Synth>) {
             Fused::Region {
                 ins: chain.ins.iter().map(|input| input.value).collect(),
                 width,
-                body: body.hash,
+                key: chain.region.key(),
                 outs: chain.outs.iter().map(|out| out.value).collect(),
             },
         ));
-        bodies.entry(body.hash).or_insert(Synth {
-            region: chain.region,
-            body,
-        });
+        regions.entry(chain.region.key()).or_insert(chain.region);
     }
     if folded.is_empty() {
-        return (trace, bodies);
+        return (trace, regions);
     }
-    (super::search::compact(replace(trace, folded)), bodies)
+    (super::search::compact(replace(trace, folded)), regions)
 }
 
 /// The widest row the frame holds in registers: a block of
@@ -300,8 +287,8 @@ fn held(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
             let Some(chain) = lower(trace, part, escapes) else {
                 continue;
             };
-            let framed = chain.region.body().is_ok()
-                && matches!(chain.region.width(), Ok(Some(w)) if frames(trace, &chain, w));
+            let framed = kernels_ir::schedule(&chain.region).is_ok()
+                && frames(trace, &chain, chain.region.width);
             if framed {
                 return Some(chain);
             }
@@ -578,36 +565,22 @@ fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
     // Every value an op of the run defines is rounded to its dtype where it
     // is defined, as the unfused ops store it, so the region lands what
     // they land; only what one op computes inside itself stays f32.
-    let mut rounds: Vec<(u32, eta_ir::Dtype)> = Vec::new();
+    let mut rounds: Vec<(u32, Dtype)> = Vec::new();
     for &v in &computed {
-        let narrow = match dtype_of(trace, v) {
-            Dtype::Bf16 => eta_ir::Dtype::Bf16,
-            Dtype::F16 => eta_ir::Dtype::F16,
-            _ => continue,
-        };
+        let narrow = dtype_of(trace, v);
+        if !matches!(narrow, Dtype::Bf16 | Dtype::F16) {
+            continue;
+        }
         let id = b.get(v)?;
         if id >= b.params && !rounds.iter().any(|(held, _)| *held == id) {
             rounds.push((id, narrow));
         }
     }
-    let row_type = SymbolicType {
-        dtype: eta_ir::Dtype::F32,
-        dims: vec![Dimension::Static(width)],
-    };
-    let one_type = SymbolicType {
-        dtype: eta_ir::Dtype::F32,
-        dims: Vec::new(),
-    };
     let region = Region {
+        width,
         params: ins
             .iter()
-            .map(|input| {
-                if input.one {
-                    one_type.clone()
-                } else {
-                    row_type.clone()
-                }
-            })
+            .map(|input| if input.one { Shape::Scalar } else { Shape::Row })
             .collect(),
         ops: b.ops,
         results,
@@ -622,12 +595,12 @@ fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
     })
 }
 
-/// Eta ops for a run, one trace op at a time.
+/// A region's ops for a run, one trace op at a time.
 struct Builder {
     params: u32,
     width: u32,
     ops: Vec<Op>,
-    /// The eta value each trace value is.
+    /// The region's value each trace value is.
     of: BTreeMap<ValueId, u32>,
 }
 
@@ -653,48 +626,48 @@ impl Builder {
     /// `1 / (1 + e^-t)`.
     fn sigmoid(&mut self, t: u32) -> u32 {
         let one = self.konst(1.0);
-        let neg = self.push(Op::Neg(t));
-        let exp = self.push(Op::Exp(neg));
-        let den = self.push(Op::Add(one, exp));
-        self.push(Op::Recip(den))
+        let neg = self.push(Op::Unary(Unary::Neg, t));
+        let exp = self.push(Op::Unary(Unary::Exp, neg));
+        let den = self.push(Op::Binary(Binary::Add, one, exp));
+        self.push(Op::Unary(Unary::Recip, den))
     }
 
     /// `1 - 2 / (e^2t + 1)`: eta has no tanh.
     fn tanh(&mut self, t: u32) -> u32 {
         let (one, two) = (self.konst(1.0), self.konst(2.0));
-        let twice = self.push(Op::Mul(t, two));
-        let exp = self.push(Op::Exp(twice));
-        let den = self.push(Op::Add(exp, one));
-        let frac = self.push(Op::Div(two, den));
-        self.push(Op::Sub(one, frac))
+        let twice = self.push(Op::Binary(Binary::Mul, t, two));
+        let exp = self.push(Op::Unary(Unary::Exp, twice));
+        let den = self.push(Op::Binary(Binary::Add, exp, one));
+        let frac = self.push(Op::Binary(Binary::Div, two, den));
+        self.push(Op::Binary(Binary::Sub, one, frac))
     }
 
     /// The row's mean: its sum over the width.
     fn mean(&mut self, x: u32) -> u32 {
-        let sum = self.push(Op::ReduceSum(x));
+        let sum = self.push(Op::Reduce(Reduce::Sum, x));
         let n = self.konst(self.width as f32);
-        self.push(Op::Div(sum, n))
+        self.push(Op::Binary(Binary::Div, sum, n))
     }
 
     /// `x · rsqrt(mean(x²) + eps)`, as the hand kernels compute it.
     fn rms_normed(&mut self, x: u32, eps: f32) -> u32 {
-        let sq = self.push(Op::Mul(x, x));
+        let sq = self.push(Op::Binary(Binary::Mul, x, x));
         let ms = self.mean(sq);
         let eps = self.konst(eps);
-        let shifted = self.push(Op::Add(ms, eps));
-        let r = self.push(Op::Rsqrt(shifted));
-        self.push(Op::Mul(x, r))
+        let shifted = self.push(Op::Binary(Binary::Add, ms, eps));
+        let r = self.push(Op::Unary(Unary::Rsqrt, shifted));
+        self.push(Op::Binary(Binary::Mul, x, r))
     }
 
     /// `n · w`, or `n · (w + 1)`.
     fn scaled(&mut self, n: u32, w: u32, plus_one: bool) -> u32 {
         let w = if plus_one {
             let one = self.konst(1.0);
-            self.push(Op::Add(w, one))
+            self.push(Op::Binary(Binary::Add, w, one))
         } else {
             w
         };
-        self.push(Op::Mul(n, w))
+        self.push(Op::Binary(Binary::Mul, n, w))
     }
 
     fn node(&mut self, op: &Operation) -> Option<()> {
@@ -709,7 +682,7 @@ impl Builder {
                 eps,
                 out,
             }) => {
-                let h = self.push(Op::Add(self.get(*y)?, self.get(*x)?));
+                let h = self.push(Op::Binary(Binary::Add, self.get(*y)?, self.get(*x)?));
                 self.set(*y_out, h);
                 let n = self.rms_normed(h, *eps);
                 let o = self.scaled(n, self.get(*weight)?, *plus_one);
@@ -728,18 +701,18 @@ impl Builder {
                 y,
                 y_out,
             } => {
-                let h = self.push(Op::Add(self.get(*y)?, self.get(*x)?));
+                let h = self.push(Op::Binary(Binary::Add, self.get(*y)?, self.get(*x)?));
                 self.set(*y_out, h);
             }
             Elemwise::AddBias { bias, out, out_out } => {
-                let z = self.push(Op::Add(self.get(*out)?, self.get(*bias)?));
+                let z = self.push(Op::Binary(Binary::Add, self.get(*out)?, self.get(*bias)?));
                 self.set(*out_out, z);
             }
             Elemwise::Binary { x, y, op, z } => {
                 let (x, y) = (self.get(*x)?, self.get(*y)?);
                 let id = self.push(match op {
-                    BinaryOp::Add => Op::Add(x, y),
-                    BinaryOp::Mul => Op::Mul(x, y),
+                    BinaryOp::Add => Op::Binary(Binary::Add, x, y),
+                    BinaryOp::Mul => Op::Binary(Binary::Mul, x, y),
                 });
                 self.set(*z, id);
             }
@@ -767,18 +740,18 @@ impl Builder {
             } => {
                 let x = self.get(*x)?;
                 let mean = self.mean(x);
-                let d = self.push(Op::Sub(x, mean));
-                let sq = self.push(Op::Mul(d, d));
+                let d = self.push(Op::Binary(Binary::Sub, x, mean));
+                let sq = self.push(Op::Binary(Binary::Mul, d, d));
                 let var = self.mean(sq);
                 let eps = self.konst(*eps);
-                let shifted = self.push(Op::Add(var, eps));
-                let r = self.push(Op::Rsqrt(shifted));
-                let mut out = self.push(Op::Mul(d, r));
+                let shifted = self.push(Op::Binary(Binary::Add, var, eps));
+                let r = self.push(Op::Unary(Unary::Rsqrt, shifted));
+                let mut out = self.push(Op::Binary(Binary::Mul, d, r));
                 if let Some(w) = weight {
-                    out = self.push(Op::Mul(out, self.get(*w)?));
+                    out = self.push(Op::Binary(Binary::Mul, out, self.get(*w)?));
                 }
                 if let Some(b) = bias {
-                    out = self.push(Op::Add(out, self.get(*b)?));
+                    out = self.push(Op::Binary(Binary::Add, out, self.get(*b)?));
                 }
                 self.set(*y, out);
             }
@@ -792,32 +765,32 @@ impl Builder {
                 let mut t = self.get(*x)?;
                 if let Some(k) = scale {
                     let k = self.konst(*k);
-                    t = self.push(Op::Mul(t, k));
+                    t = self.push(Op::Binary(Binary::Mul, t, k));
                 }
                 // a device scalar's first element: a weight of one element
                 // the region reads as a scalar parameter
                 if let Some(s) = s {
-                    t = self.push(Op::Mul(t, self.get(*s)?));
+                    t = self.push(Op::Binary(Binary::Mul, t, self.get(*s)?));
                 }
                 let out = match act {
                     ActFn::Identity => t,
                     ActFn::Silu => {
                         let s = self.sigmoid(t);
-                        self.push(Op::Mul(t, s))
+                        self.push(Op::Binary(Binary::Mul, t, s))
                     }
                     ActFn::Tanh => self.tanh(t),
                     ActFn::Gelu { tanh: true } => {
                         let (half, one) = (self.konst(0.5), self.konst(1.0));
                         let (c, cubic) = (self.konst(GELU_SQRT_2_OVER_PI), self.konst(GELU_CUBIC));
-                        let t2 = self.push(Op::Mul(t, t));
-                        let t3 = self.push(Op::Mul(t2, t));
-                        let k3 = self.push(Op::Mul(cubic, t3));
-                        let inner = self.push(Op::Add(t, k3));
-                        let arg = self.push(Op::Mul(c, inner));
+                        let t2 = self.push(Op::Binary(Binary::Mul, t, t));
+                        let t3 = self.push(Op::Binary(Binary::Mul, t2, t));
+                        let k3 = self.push(Op::Binary(Binary::Mul, cubic, t3));
+                        let inner = self.push(Op::Binary(Binary::Add, t, k3));
+                        let arg = self.push(Op::Binary(Binary::Mul, c, inner));
                         let th = self.tanh(arg);
-                        let up = self.push(Op::Add(one, th));
-                        let ht = self.push(Op::Mul(half, t));
-                        self.push(Op::Mul(ht, up))
+                        let up = self.push(Op::Binary(Binary::Add, one, th));
+                        let ht = self.push(Op::Binary(Binary::Mul, half, t));
+                        self.push(Op::Binary(Binary::Mul, ht, up))
                     }
                     ActFn::Gelu { tanh: false } => return None,
                 };
@@ -825,9 +798,9 @@ impl Builder {
             }
             Elemwise::Softcap { x, cap, x_out } => {
                 let cap = self.konst(*cap);
-                let t = self.push(Op::Div(self.get(*x)?, cap));
+                let t = self.push(Op::Binary(Binary::Div, self.get(*x)?, cap));
                 let th = self.tanh(t);
-                let out = self.push(Op::Mul(cap, th));
+                let out = self.push(Op::Binary(Binary::Mul, cap, th));
                 self.set(*x_out, out);
             }
             Elemwise::GateSigmoidMul {
@@ -837,7 +810,7 @@ impl Builder {
                 x_out,
             } => {
                 let s = self.sigmoid(self.get(*gate)?);
-                let out = self.push(Op::Mul(self.get(*x)?, s));
+                let out = self.push(Op::Binary(Binary::Mul, self.get(*x)?, s));
                 self.set(*x_out, out);
             }
             Elemwise::Clamp {
@@ -848,8 +821,8 @@ impl Builder {
                 x_out,
             } => {
                 let (lo, hi) = (self.konst(*lo), self.konst(*hi));
-                let up = self.push(Op::MaxElem(self.get(*x)?, lo));
-                let out = self.push(Op::MinElem(up, hi));
+                let up = self.push(Op::Binary(Binary::Max, self.get(*x)?, lo));
+                let out = self.push(Op::Binary(Binary::Min, up, hi));
                 self.set(*x_out, out);
             }
             _ => return None,
