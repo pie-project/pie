@@ -20,16 +20,16 @@ pub struct Readout<'a> {
 
     pub width: u32,
 
-    pub f32: bool,
+    /// Bf16 values widen; f32 and i32 copy as they are.
+    pub dtype: Dtype,
 }
 
 pub struct OnDevice<'a> {
     device: &'a Context,
     session: &'a mut Session,
     widen: &'a Widen,
-    logits: Option<Readout<'a>>,
-    lanes: Vec<Option<Readout<'a>>>,
-    pixels: Vec<Option<Readout<'a>>>,
+    /// What the fire read out for the pass's lane `k`, at `k`.
+    seats: Vec<Vec<Readout<'a>>>,
 
     ran: Vec<usize>,
 
@@ -62,39 +62,26 @@ impl<'a> OnDevice<'a> {
         device: &'a Context,
         session: &'a mut Session,
         widen: &'a Widen,
-        logits: Option<Readout<'a>>,
+        seats: Vec<Vec<Readout<'a>>>,
     ) -> OnDevice<'a> {
         OnDevice {
             device,
             session,
             widen,
-            logits,
-            lanes: Vec::new(),
-            pixels: Vec::new(),
+            seats,
             ran: Vec::new(),
             deferral: None,
         }
     }
 
-    #[must_use]
-    pub fn with_lanes(
-        mut self,
-        lanes: Vec<Option<Readout<'a>>>,
-        pixels: Vec<Option<Readout<'a>>>,
-    ) -> OnDevice<'a> {
-        self.lanes = lanes;
-        self.pixels = pixels;
-        self
-    }
-
     /// What this fire read out of output `root` reads, for its lane.
     fn offered(&self, root: &LaunchValue) -> Option<Readout<'a>> {
         let name = root.output.as_deref()?;
-        let at = root.lane as usize;
-        let named = |seat: Option<Readout<'a>>| seat.filter(|seat| seat.output == name);
-        named(self.lanes.get(at).copied().flatten())
-            .or_else(|| named(self.pixels.get(at).copied().flatten()))
-            .or_else(|| named(self.logits).filter(|_| root.lane == 0))
+        self.seats
+            .get(root.lane as usize)?
+            .iter()
+            .find(|seat| seat.output == name)
+            .copied()
     }
 
     /// Records the pass into a frame of its own for the caller to submit,
@@ -144,16 +131,16 @@ impl<'a> OnDevice<'a> {
                 })?;
                 let (_, held) = self.session.span(at, local).ok_or_else(|| Fault::Program {
                     at: "guest::run",
-                    why: format!("the logits root {local} is not stage {at}'s"),
+                    why: format!("the output root {local} is not stage {at}'s"),
                 })?;
-                let lanes = u32::try_from(held / 4).unwrap_or(0);
-                if lanes != seat.width {
+                let values = u32::try_from(held / 4).unwrap_or(0);
+                if values > seat.width {
                     return Err(Fault::Program {
                         at: "guest::run",
                         why: format!(
-                            "this pass reads a {lanes}-wide logits row and the fire read out \
-                             {} wide; the two are one rectangle or neither",
-                            seat.width
+                            "this pass reads {values} values of output {:?} and the fire read \
+                             out {}",
+                            root.output, seat.width
                         ),
                     });
                 }
@@ -165,12 +152,12 @@ impl<'a> OnDevice<'a> {
                     .session
                     .span(at, local)
                     .expect("the span was just read");
-                if seat.f32 {
+                if seat.dtype != Dtype::Bf16 {
                     let heap = heap.clone();
-                    frame.copy(seat.seat, seat.at, &heap, into, u64::from(seat.width) * 4)?;
+                    frame.copy(seat.seat, seat.at, &heap, into, u64::from(values) * 4)?;
                 } else {
                     self.widen
-                        .encode(&frame, seat.seat, seat.at, heap, into, seat.width)?;
+                        .encode(&frame, seat.seat, seat.at, heap, into, values)?;
                 }
                 continue;
             }

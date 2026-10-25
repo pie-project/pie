@@ -1,7 +1,7 @@
 //! Attention mass capture on the first wgpu adapter, against an f64 host
 //! reference: two requests over a paged pool with pages out of order, the
 //! mean causal softmax of each request's last query rows landed per key in
-//! its lane's planes of an f32 slab.
+//! its lane's f32 row, a `kv_max` run per query head.
 
 use kernels_slang::{KvPool, RaggedTensor, Tensor};
 use poem_ir::Dtype;
@@ -22,22 +22,22 @@ fn score_capture_answers_the_reference() {
     let page_indptr = [0u32, 2, 3];
     let qo_indptr = [0i32, 3, 4];
     let positions = [5i32, 6, 7, 2];
-    let (observe, kv_max, lane_offset, plane_stride) = (2usize, 8usize, 1usize, 4usize);
+    let (observe, kv_max, lane_offset) = (2usize, 8usize, 1usize);
     let slots = 3 * page;
     let row = kvh * hd;
     let (keys, kr) = gpu.up(&noise(1, slots * row));
     let (q, qr) = gpu.up(&noise(2, 4 * qh * hd));
     let kr: Vec<f64> = kr.iter().map(|v| f64::from(*v)).collect();
     let qr: Vec<f64> = qr.iter().map(|v| f64::from(*v)).collect();
-    let slab_rows = (lane_offset + 2) * plane_stride;
-    let mut want = vec![7.0; slab_rows * kv_max];
+    let lanes = lane_offset + 2;
+    let mut want = vec![7.0; lanes * qh * kv_max];
     for r in 0..2 {
         let pages = &page_indices[page_indptr[r] as usize..page_indptr[r + 1] as usize];
         let capacity = pages.len() * page;
         let (lo, hi) = (qo_indptr[r] as usize, qo_indptr[r + 1] as usize);
         let rows = observe.min(hi - lo);
         for h in 0..qh {
-            let base = ((lane_offset + r) * plane_stride + h) * kv_max;
+            let base = ((lane_offset + r) * qh + h) * kv_max;
             want[base..base + kv_max].fill(0.0);
             let kh = h / (qh / kvh);
             for w in 0..rows {
@@ -83,15 +83,14 @@ fn score_capture_answers_the_reference() {
         indptr: t(qp, 3, 1, Dtype::I32),
     };
     let post = t(pos, 4, 1, Dtype::I32);
-    let slab = gpu.up_f32(&vec![7.0; slab_rows * kv_max]);
-    let sl = t(slab, slab_rows, kv_max, Dtype::F32);
+    let slab = gpu.up_f32(&vec![7.0; lanes * qh * kv_max]);
+    let sl = t(slab, lanes, qh * kv_max, Dtype::F32);
     let args = (
         hd as u32,
         kvh as u32,
         scale as f32,
         observe as u32,
         lane_offset as u32,
-        plane_stride as u32,
     );
     gpu.run(|c| {
         kernels_slang::attn::score::capture(
@@ -99,23 +98,20 @@ fn score_capture_answers_the_reference() {
             qrag,
             post,
             &pool,
-            None,
             args.0,
             args.1,
             args.2,
             args.3,
             args.4,
-            args.5,
-            0,
             kv_max as u32,
             2,
             sl,
         )
     });
 
-    // Lane 0's planes are not this capture's and keep their sevens.
+    // Lane 0's row is not this capture's and keeps its sevens.
     close(
-        &gpu.down_f32(slab, slab_rows * kv_max),
+        &gpu.down_f32(slab, lanes * qh * kv_max),
         &want,
         "score capture",
     );
