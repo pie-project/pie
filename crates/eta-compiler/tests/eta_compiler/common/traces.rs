@@ -119,6 +119,7 @@ pub fn section3_trace() -> TraceContainer {
             ops: b.ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
@@ -417,6 +418,7 @@ pub fn beam_trace() -> TraceContainer {
             ops: b.ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 

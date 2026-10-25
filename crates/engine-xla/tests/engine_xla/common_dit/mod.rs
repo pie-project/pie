@@ -519,6 +519,7 @@ pub fn carrier(shapes: &[Shape], fed: u32) -> TraceContainer {
             ops: (0..fed).map(Op::ChanTake).collect(),
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 

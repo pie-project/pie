@@ -163,12 +163,6 @@ impl Session {
         code: Arc<Code>,
         extents: &Extents,
     ) -> Result<Session> {
-        if plans.is_empty() {
-            return Err(Fault::Program {
-                at: "guest::session",
-                why: "a guest package with no stages has nothing to run".into(),
-            });
-        }
         if code.stages() != plans.len() {
             return Err(Fault::Program {
                 at: "guest::session",

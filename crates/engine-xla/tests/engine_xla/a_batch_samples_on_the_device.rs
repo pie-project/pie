@@ -194,6 +194,7 @@ fn sampler(vocab: u32, top_k: bool, penalties: bool) -> TraceContainer {
             ops: p.ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 

@@ -406,6 +406,7 @@ pub fn epilogue(rows: u32) -> TraceContainer {
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 

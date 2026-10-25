@@ -67,6 +67,7 @@ impl ExecPlan {
     #[must_use]
     pub fn reads_channel(&self, c: u32) -> bool {
         self.package.stages.iter().any(|s| s.reads.contains(&c))
+            || self.package.inputs.contains(&c)
             || self
                 .package
                 .ports
@@ -274,11 +275,6 @@ pub fn adopt_launch_package_with(
     package: LaunchPackage,
     boundaries: Boundaries,
 ) -> Result<ExecPlan> {
-    if package.stages.is_empty() {
-        return Err(Error {
-            message: "launch package has no stages".to_owned(),
-        });
-    }
     if package.plans.len() != package.stages.len() {
         return Err(Error {
             message: "launch package plan/stage count mismatch".to_owned(),

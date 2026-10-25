@@ -177,6 +177,7 @@ class Traced:
 class Builder:
     def __init__(self, vocab: int, page_size: int) -> None:
         self.ports: list[tuple[Port, DslChannel]] = []
+        self.inputs: list[DslChannel] = []
         self.stages: list[tuple[Stage, Callable[[], None]]] = []
         self.vocab = vocab
         self.page_size = page_size
@@ -186,6 +187,12 @@ class Builder:
         claim per its consumption discipline."""
         source.note_desc_claim(port.consumes)
         self.ports.append((port, source))
+
+    def bind_input(self, source: DslChannel) -> None:
+        """List `source` as a channel the forward reads as a guest model
+        input, at the descriptor phase like a port."""
+        source.note_desc_claim(False)
+        self.inputs.append(source)
 
     def stage(self, stage: Stage, body: Callable[[], None]) -> None:
         for i, (s, _) in enumerate(self.stages):
@@ -209,10 +216,11 @@ class Builder:
             return max(min(numel(ch.shape), 0xFFFF_FFFF) - 1, 1)
         return 1
 
-    def _record(self, rows: int) -> tuple[list[StageResult], list[tuple[Port, int]]]:
+    def _record(self, rows: int) -> tuple[list[StageResult], list[tuple[Port, int]], list[int]]:
         ports: list[tuple[Port, int]] = []
         for port, source in self.ports:
             ports.append((port, intern_channel(source.state)))
+        inputs = [intern_channel(source.state) for source in self.inputs]
         results: list[StageResult] = []
         for stage in Stage:
             body = None
@@ -222,11 +230,11 @@ class Builder:
             if body is None:
                 continue
             results.append(trace_stage(stage, rows, body))
-        return results, ports
+        return results, ports, inputs
 
     def build(self) -> Traced:
         rows = self._rows()
-        (stage_results, ports), channels, names = with_constants(
+        (stage_results, ports, inputs), channels, names = with_constants(
             self.vocab, self.page_size, lambda: with_session(lambda: self._record(rows))
         )
 
@@ -241,6 +249,7 @@ class Builder:
                 if op.chan >= 0:
                     op.chan = remap[op.chan]
         ports = [(p, remap[ci]) for p, ci in ports]
+        inputs = sorted({remap[ci] for ci in inputs})
 
         # Name table: strictly sorted and unique.
         name_order = sorted(range(len(names)), key=lambda i: names[i])
@@ -287,7 +296,7 @@ class Builder:
 
         stages = [StageProgram(r.stage, r.ops) for r in stage_results]
         port_bindings = [PortBinding(p, ci) for p, ci in sorted(ports, key=lambda x: int(x[0]))]
-        container = TraceContainer(names=names, channels=decls, ports=port_bindings, stages=stages)
+        container = TraceContainer(names=names, channels=decls, ports=port_bindings, stages=stages, inputs=inputs)
 
         _lint(channels, sinks)
 

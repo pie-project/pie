@@ -128,6 +128,7 @@ fn golden_neg_spsc_second_producer() {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
     neg_report("neg_spsc_second_producer", c, ModelProfile::dummy());
 }
@@ -148,6 +149,7 @@ fn golden_neg_sink_at_epilogue() {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
     neg_report("neg_sink_at_epilogue", c, ModelProfile::dummy());
 }
@@ -176,6 +178,7 @@ fn golden_neg_t10_nonreplayable() {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
     let mut profile = ModelProfile::dummy();
     profile.kernels.push(eta_ir::registry::KernelInfo {
@@ -204,6 +207,7 @@ fn golden_neg_intrinsic_wrong_stage() {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
     neg_report("neg_intrinsic_wrong_stage", c, ModelProfile::dummy());
 }
@@ -226,6 +230,7 @@ fn golden_neg_model_gated_missing() {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
     let mut profile = ModelProfile::dummy();
     profile.has_mtp_logits = false;
@@ -246,6 +251,7 @@ fn golden_neg_body_type_error() {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
     neg_report("neg_body_type_error", c, ModelProfile::dummy());
 }
@@ -272,6 +278,7 @@ fn extern_v2_round_trip_and_v1_hashes_stable() {
             ],
         }],
         externs: vec![],
+        inputs: Vec::new(),
     };
     let b1 = encode(&c1);
     assert_eq!(
@@ -331,6 +338,7 @@ fn extern_direction_violations_rejected() {
             dir,
             chan: 0,
         }],
+        inputs: Vec::new(),
     };
     let put_on_import = mk(
         ExternDir::Import,

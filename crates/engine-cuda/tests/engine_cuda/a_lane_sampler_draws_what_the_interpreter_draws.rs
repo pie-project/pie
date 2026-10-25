@@ -107,6 +107,7 @@ fn sampler(rank: bool) -> TraceContainer {
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 

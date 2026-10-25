@@ -151,12 +151,6 @@ impl Session {
         extents: &Extents,
         built: &mut BuiltStages,
     ) -> Result<Session> {
-        if plans.is_empty() {
-            return Err(Fault::Program {
-                at: "guest::session",
-                why: "a guest package with no stages has nothing to run".into(),
-            });
-        }
         if code.len() != plans.len() {
             return Err(Fault::Program {
                 at: "guest::session",
@@ -193,17 +187,23 @@ impl Session {
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(stages.len() as u32),
         ];
-        // SAFETY: `core.device` is live and the create info and `sizes` outlive
-        // the call.
-        let pool = unsafe {
-            core.device
-                .create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default()
-                        .max_sets(stages.len() as u32)
-                        .pool_sizes(&sizes),
-                    None,
-                )
-                .map_err(|e| core.fault("vkCreateDescriptorPool", e))?
+        // A package with no stages (a pass that only binds inputs) holds no
+        // sets, and Vulkan has no empty pool.
+        let pool = if stages.is_empty() {
+            vk::DescriptorPool::null()
+        } else {
+            // SAFETY: `core.device` is live and the create info and `sizes`
+            // outlive the call.
+            unsafe {
+                core.device
+                    .create_descriptor_pool(
+                        &vk::DescriptorPoolCreateInfo::default()
+                            .max_sets(stages.len() as u32)
+                            .pool_sizes(&sizes),
+                        None,
+                    )
+                    .map_err(|e| core.fault("vkCreateDescriptorPool", e))?
+            }
         };
 
         let mut session = Session {

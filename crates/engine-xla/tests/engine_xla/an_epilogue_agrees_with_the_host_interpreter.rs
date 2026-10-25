@@ -85,6 +85,7 @@ impl Program {
                 ops: self.ops,
             }],
             externs: Vec::new(),
+            inputs: Vec::new(),
         }
     }
 }

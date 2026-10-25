@@ -222,6 +222,7 @@ mod tests {
         let container = TraceContainer {
             names: vec![],
             externs: vec![],
+            inputs: Vec::new(),
             channels: vec![
                 channel(Shape::vector(1), Dtype::I32),
                 channel(Shape::vector(1), Dtype::U32),

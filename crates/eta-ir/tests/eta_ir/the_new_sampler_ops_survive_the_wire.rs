@@ -21,6 +21,7 @@ fn container(ops: Vec<Op>) -> TraceContainer {
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 

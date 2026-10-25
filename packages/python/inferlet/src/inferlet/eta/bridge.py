@@ -532,6 +532,7 @@ class ForwardPass:
             raise ValueError(f"unknown forward kind {kind!r}")
         self.wit = self._mod.ForwardPass()
         self._ports: list[tuple[Port, Channel]] = []
+        self._inputs: list[Channel] = []
         self._stages: list[tuple[Stage, Callable[[], None]]] = []
         self._vocab = _wit_model.output_vocab_size()
         self._page_size = kv_page_size()
@@ -646,9 +647,11 @@ class ForwardPass:
     def input(self, name: str, ch: Channel) -> None:
         """Bind `ch` to the model's input `name` (`model.lane(...).inputs`),
         read at every submit from its committed cell. The host validates the
-        shape; the program must declare the channel, so a stage of the
-        author's must touch it."""
+        shape."""
+        if self._program_attached:
+            raise InferletError("forward pass program is already attached")
         _wit(self.wit.input, name, ch._wit(), what="input")
+        self._inputs.append(ch)
 
     def stream(self, s: "_wit_model.LaneStream") -> None:
         """Which lane stream this pass's rows are (`model.LaneStream`)."""
@@ -771,6 +774,8 @@ class ForwardPass:
         builder = Builder(self._vocab, self._page_size)
         for port, ch in self._ports:
             builder.bind_port(port, ch._dsl)
+        for ch in self._inputs:
+            builder.bind_input(ch._dsl)
         for stage, body in self._stages:
             builder.stage(stage, body)
         traced = builder.build()

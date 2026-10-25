@@ -492,6 +492,8 @@ export interface TraceContainer {
   ports: PortBinding[];
   stages: StageProgram[];
   externs: ExternDecl[];
+  /** The channels the forward reads as guest model inputs, sorted, unique. */
+  inputs: number[];
 }
 
 class Writer {
@@ -595,14 +597,17 @@ const utf8 = new TextEncoder();
 export function encode(c: TraceContainer): Uint8Array {
   const w = new Writer();
   w.bytes(ETA_MAGIC);
-  const v2 = c.externs.length > 0;
+  const v2 = c.externs.length > 0 || c.inputs.length > 0;
   w.u16(v2 ? ETA_VERSION_EXTERN : ETA_VERSION);
   w.u16(0);
   w.u32(c.names.length);
   w.u32(c.channels.length);
   w.u32(c.ports.length);
   w.u32(c.stages.length);
-  if (v2) w.u32(c.externs.length);
+  if (v2) {
+    w.u32(c.externs.length);
+    w.u32(c.inputs.length);
+  }
   for (const n of c.names) {
     const b = utf8.encode(n);
     w.u16(b.length);
@@ -630,6 +635,7 @@ export function encode(c: TraceContainer): Uint8Array {
     w.u8(e.direction);
     w.u32(e.chan);
   }
+  for (const chan of c.inputs) w.u32(chan);
   return w.finish();
 }
 

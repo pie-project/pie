@@ -815,6 +815,7 @@ mod tests {
         let mut container = TraceContainer {
             names: vec![],
             externs: vec![],
+            inputs: Vec::new(),
             channels: vec![chan(Shape::vector(lanes), Dtype::I32)],
             ports: vec![PortBinding {
                 port: Port::EmbedTokens,
@@ -879,6 +880,7 @@ mod tests {
         let mut container = TraceContainer {
             names: vec![],
             externs: vec![],
+            inputs: Vec::new(),
             channels: vec![],
             ports: vec![],
             stages: vec![StageProgram {

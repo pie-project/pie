@@ -90,6 +90,7 @@ pub(super) fn program(prefix_constant: u32, global_channel_offset: usize) -> Bou
         ],
         stages,
         externs: vec![],
+        inputs: Vec::new(),
     };
     let mut profile = ModelProfile::dummy();
     profile.vocab = vocab;

@@ -413,6 +413,7 @@ mod tests {
         TraceContainer {
             names: vec![],
             externs: vec![],
+            inputs: Vec::new(),
             channels: vec![
                 chan(Shape::vector(3), Dtype::I32, 2),
                 chan(Shape::vector(1), Dtype::U32, 2),

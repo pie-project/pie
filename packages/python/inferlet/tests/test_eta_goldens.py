@@ -606,3 +606,25 @@ def test_vae_readback_matches_rust():
     b.stage(Stage.EPILOGUE, epilogue)
     out.note_host_take()
     check("vae_readback", b.build())
+
+
+def test_noised_input_matches_rust():
+    """`inferlet_goldens.rs::noised_input` — two guest inputs, the first drawn
+    by the prologue from the device rng, the second touched by no stage: the
+    one golden that carries an input table."""
+    rows, width = 4, 8
+    rng_ch = ch_from([5, 0], dtype.u32, "rng")
+    latent = ch_new([rows, width], dtype.f32, "latent")
+    timestep = ch_from([0.5], dtype.f32, "timestep")
+
+    b = Builder(VOCAB, PAGE)
+    b.bind_input(latent)
+    b.bind_input(timestep)
+
+    def prologue():
+        r = rng_ch.take()
+        latent.put_tensor(normal(r, [rows, width]))
+        rng_ch.put_tensor(add(r, iota(2)))
+
+    b.stage(Stage.PROLOGUE, prologue)
+    check("noised_input", b.build())

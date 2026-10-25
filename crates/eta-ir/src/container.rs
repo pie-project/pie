@@ -122,6 +122,8 @@ pub struct TraceContainer {
     pub ports: Vec<PortBinding>,
     pub stages: Vec<StageProgram>,
     pub externs: Vec<ExternDecl>,
+    /// The channels the forward reads as guest model inputs, sorted, unique.
+    pub inputs: Vec<ChannelIndex>,
 }
 
 impl TraceContainer {
@@ -146,7 +148,7 @@ where
 pub fn encode(c: &TraceContainer) -> Vec<u8> {
     let mut w = Vec::new();
     w.extend_from_slice(&ETA_MAGIC);
-    let v2 = !c.externs.is_empty();
+    let v2 = !c.externs.is_empty() || !c.inputs.is_empty();
     put_u16(&mut w, if v2 { ETA_VERSION_EXTERN } else { ETA_VERSION });
     put_u16(&mut w, 0);
     put_u32(&mut w, wire_len(c.names.len(), "name"));
@@ -155,6 +157,7 @@ pub fn encode(c: &TraceContainer) -> Vec<u8> {
     put_u32(&mut w, wire_len(c.stages.len(), "stage"));
     if v2 {
         put_u32(&mut w, wire_len(c.externs.len(), "extern"));
+        put_u32(&mut w, wire_len(c.inputs.len(), "input"));
     }
     for n in &c.names {
         put_u16(&mut w, wire_len(n.len(), "name byte"));
@@ -196,6 +199,9 @@ pub fn encode(c: &TraceContainer) -> Vec<u8> {
         put_u16(&mut w, e.name);
         w.push(e.dir as u8);
         put_u32(&mut w, e.chan);
+    }
+    for &chan in &c.inputs {
+        put_u32(&mut w, chan);
     }
     w
 }
@@ -336,10 +342,10 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
     let n_channels = r.u32()?;
     let n_ports = r.u32()?;
     let n_stages = r.u32()?;
-    let n_externs = if version == ETA_VERSION_EXTERN {
-        r.u32()?
+    let (n_externs, n_inputs) = if version == ETA_VERSION_EXTERN {
+        (r.u32()?, r.u32()?)
     } else {
-        0
+        (0, 0)
     };
 
     let mut names = Vec::with_capacity(r.bounded_count(n_names, 2, MAX_NAMES, "name table")?);
@@ -434,6 +440,11 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
         let chan = r.u32()?;
         externs.push(ExternDecl { name, dir, chan });
     }
+    let mut inputs =
+        Vec::with_capacity(r.bounded_count(n_inputs, 4, MAX_CHANNELS, "input table")?);
+    for _ in 0..n_inputs {
+        inputs.push(r.u32()?);
+    }
     if r.offset() != bytes.len() {
         return Err(ContainerDecodeError::TrailingBytes);
     }
@@ -443,6 +454,7 @@ pub fn decode(bytes: &[u8]) -> Result<TraceContainer, ContainerDecodeError> {
         ports,
         stages,
         externs,
+        inputs,
     };
     if container.encode() != bytes {
         return Err(ContainerDecodeError::NonCanonical);
@@ -617,6 +629,7 @@ mod tests {
                 ],
             }],
             externs: Vec::new(),
+            inputs: Vec::new(),
         }
     }
 
@@ -670,6 +683,7 @@ mod tests {
                 ops,
             }],
             externs: alloc::vec::Vec::new(),
+            inputs: Vec::new(),
         };
         let bytes = encode(&c);
         assert_eq!(decode(&bytes).expect("decode"), c);
@@ -751,7 +765,7 @@ mod tests {
 
         let mut empty_v2 = minimal.encode();
         empty_v2[4..6].copy_from_slice(&ETA_VERSION_EXTERN.to_le_bytes());
-        empty_v2.splice(24..24, 0u32.to_le_bytes());
+        empty_v2.splice(24..24, [0u8; 8]);
         assert_eq!(decode(&empty_v2), Err(ContainerDecodeError::NonCanonical));
     }
 
