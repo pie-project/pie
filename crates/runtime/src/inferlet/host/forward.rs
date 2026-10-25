@@ -914,13 +914,6 @@ impl ProcessCtx {
                         .to_string(),
                 ));
             }
-            if reads_kv && !embeds {
-                return Ok(Err(
-                    "this pass's lanes read a kv cache and embed no tokens; a sequence's rows \
-                     are its tokens, and these lanes state none"
-                        .to_string(),
-                ));
-            }
             for (at, (lane, decl)) in lanes.iter().zip(&decls).enumerate() {
                 let reads = &decl.inputs;
                 if let Some(&missing) = reads
