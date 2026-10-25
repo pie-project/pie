@@ -274,6 +274,18 @@ impl Run<'_> {
                 &mut self.tensor(*y),
                 self.tensor(*grid),
             ),
+            Conv::Cells {
+                tgrid,
+                positions,
+                axis,
+                y,
+            } => kernels_cuda::elemwise::posenc::cells(
+                self.ctx(),
+                self.tensor(*tgrid),
+                self.tensor(*positions),
+                *axis,
+                &mut self.tensor(*y),
+            ),
         }
     }
 }

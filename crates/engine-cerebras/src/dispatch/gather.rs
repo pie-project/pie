@@ -101,6 +101,18 @@ impl Run<'_> {
                 self.tensor(*q),
                 self.tensor(*gate),
             ),
+            Gather::GroupRows {
+                csr,
+                groups,
+                lanes,
+                y,
+            } => kernels_cerebras::conv::group_rows(
+                self.ctx(),
+                self.tensor(*csr),
+                self.tensor(*groups),
+                self.tensor(*lanes),
+                self.tensor(*y),
+            ),
             Gather::SplitRows {
                 x,
                 width,

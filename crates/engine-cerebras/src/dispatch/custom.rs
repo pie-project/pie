@@ -12,8 +12,52 @@ impl DispatchFused for Run<'_> {
 
 impl DispatchConv for Run<'_> {
     fn dispatch(&mut self, op: &Conv) -> Result<(), KernelError> {
+        use kernels_cerebras::conv;
         self.ctx().scope(op.name());
-        Err(KernelError::Unsupported { op: op.name() })
+        match op {
+            Conv::Cells {
+                tgrid,
+                positions,
+                axis,
+                y,
+            } => conv::cells(
+                self.ctx(),
+                self.tensor(*tgrid),
+                self.tensor(*positions),
+                *axis,
+                self.tensor(*y),
+            ),
+            Conv::Patchify {
+                x,
+                grid,
+                p,
+                tgrid,
+                y,
+            } => conv::patchify(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*grid),
+                *p,
+                self.tensor(*tgrid),
+                self.tensor(*y),
+            ),
+            Conv::Unpatchify {
+                x,
+                tgrid,
+                p,
+                grid,
+                y,
+            } => conv::unpatchify(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*tgrid),
+                *p,
+                self.tensor(*grid),
+                self.tensor(*y),
+            ),
+            _ => return Err(KernelError::Unsupported { op: op.name() }),
+        }
+        .map_err(crate::error::kernel)
     }
 }
 

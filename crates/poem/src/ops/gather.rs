@@ -150,16 +150,17 @@ pub fn split_rows(x: &Value, width: u32) -> (Value, Value) {
     (left, right)
 }
 
-/// The rows of `x` at `rows`; a value of one axis (a row's token) gathers to
-/// one axis too.
+/// The rows of `x` at `rows`, one a row of `rows` (a readout's row, or a
+/// token's lane, say); a value of one axis (a row's token) gathers to one
+/// axis too.
 pub fn gather_rows(x: &Value, rows: &Value) -> Value {
     let r = x.rec();
     let y = r.fresh(match x.ty() {
         Ty::Tensor { shape, dtype } if shape.len() == 1 => Ty::Tensor {
-            shape: vec![Dim::Readouts],
+            shape: vec![rows.rows()],
             dtype: *dtype,
         },
-        _ => tensor(Dim::Readouts, x.width(), x.dtype()),
+        _ => tensor(rows.rows(), x.width(), x.dtype()),
     });
     r.push(
         Gather::Rows {
@@ -168,6 +169,40 @@ pub fn gather_rows(x: &Value, rows: &Value) -> Value {
             y: y.id(),
         },
         &[x, rows],
+    );
+    y
+}
+
+/// Each of `lanes`' rows' count of the rows `csr` (a selection's
+/// `group_indptr`) packs in its lane's group (`groups`, the
+/// `group_of_lane`), `[rows, 1]` f32: a peer lane's rows, read from the
+/// group structure.
+pub fn group_rows(csr: &Value, groups: &Value, lanes: &Value) -> Value {
+    for (what, v, rows) in [
+        ("csr", csr, Dim::LanesPlus(1)),
+        ("groups", groups, Dim::Lanes),
+    ] {
+        assert!(
+            v.rows() == rows && v.dtype() == Dtype::I32,
+            "`gather::group_rows`'s {what} is a {rows:?} i32 table, not {:?}",
+            v.ty()
+        );
+    }
+    assert!(
+        lanes.rows().axis() == Some(poem_ir::RowAxis::Tokens) && lanes.dtype() == Dtype::I32,
+        "`gather::group_rows` counts for each token row's lane, not {:?}",
+        lanes.ty()
+    );
+    let r = lanes.rec();
+    let y = r.fresh(tensor(lanes.rows(), 1u64, Dtype::F32));
+    r.push(
+        Gather::GroupRows {
+            csr: csr.id(),
+            groups: groups.id(),
+            lanes: lanes.id(),
+            y: y.id(),
+        },
+        &[csr, groups, lanes],
     );
     y
 }

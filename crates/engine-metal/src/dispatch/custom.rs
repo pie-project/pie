@@ -225,9 +225,47 @@ impl Run<'_> {
                 })?;
                 conv::resample::cache_store(self.ctx(), x, x, slots, grid, *frames, pool.state)
             }
-            Conv::Patchify { .. } | Conv::Unpatchify { .. } => {
-                Err(kernels_metal::Error::Unsupported { op: op.name() })
-            }
+            Conv::Patchify {
+                x,
+                grid,
+                p,
+                tgrid,
+                y,
+            } => conv::resample::pixel_unshuffle(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*grid),
+                *p,
+                self.tensor(*tgrid),
+                self.tensor(*y),
+            ),
+            Conv::Unpatchify {
+                x,
+                tgrid,
+                p,
+                grid,
+                y,
+            } => conv::resample::pixel_shuffle(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*tgrid),
+                *p,
+                0,
+                self.tensor(*grid),
+                self.tensor(*y),
+            ),
+            Conv::Cells {
+                tgrid,
+                positions,
+                axis,
+                y,
+            } => conv::rule::cells(
+                self.ctx(),
+                self.tensor(*tgrid),
+                self.tensor(*positions),
+                *axis,
+                self.tensor(*y),
+            ),
         }
     }
 }

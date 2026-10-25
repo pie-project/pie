@@ -224,6 +224,18 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
 
+            Gather::GroupRows {
+                csr,
+                groups,
+                lanes,
+                y,
+            } => kernels_slang::conv::rule::group_rows(
+                self.ctx,
+                self.tensor(*csr),
+                self.tensor(*groups),
+                self.tensor(*lanes),
+                self.tensor(*y),
+            ),
             // DSpark's taps side by side are DeepSeek-V4.1's, served on CUDA.
             Gather::ConcatCols { .. } => Err(kernels_slang::Error::Unsupported {
                 op: "gather.concat_cols",

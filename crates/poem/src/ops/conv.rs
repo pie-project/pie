@@ -451,3 +451,39 @@ pub fn unpatchify(x: &Value, tgrid: &Value, p: [u32; 3], grid: &Value) -> Value 
     );
     y
 }
+
+/// Each token row's cell, `[Tokens, max(3, axis + 1)]` f32: a row of a
+/// clip of the token grid `tgrid` reads its patch's `(t, h, w)` in that
+/// clip (a clip's rows are its patches in (t, h, w) row-major order from
+/// its first token row), zeros after; any other row reads its runtime
+/// position in column `axis`, zeros elsewhere.
+#[must_use]
+pub fn cells(tgrid: &Value, positions: &Value, axis: u32) -> Value {
+    expect_grid("`conv::cells`'s token grid", tgrid);
+    assert!(
+        matches!(positions.ty(), Ty::Tensor { shape, dtype: Dtype::I32 }
+            if shape.len() == 1 && shape[0].axis() == Some(RowAxis::Tokens)),
+        "`conv::cells` reads each token row's i32 runtime position, not {:?}",
+        positions.ty()
+    );
+    assert!(
+        axis < 4,
+        "a rope turns at most four axes, not column {axis}"
+    );
+    let r = tgrid.rec();
+    let y = r.fresh(tensor(
+        positions.rows(),
+        u64::from(axis.max(2) + 1),
+        Dtype::F32,
+    ));
+    r.push(
+        Conv::Cells {
+            tgrid: tgrid.id(),
+            positions: positions.id(),
+            axis,
+            y: y.id(),
+        },
+        &[tgrid, positions],
+    );
+    y
+}

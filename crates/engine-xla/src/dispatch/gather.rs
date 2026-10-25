@@ -277,6 +277,25 @@ impl Run<'_> {
                 Ok(())
             }),
 
+            Gather::GroupRows {
+                csr,
+                groups,
+                lanes,
+                y,
+            } => crate::lower::lower(self.ctx(), |l| {
+                let csr_v = l.read(self.tensor(*csr))?;
+                let groups_v = l.read(self.tensor(*groups))?;
+                let lanes_v = l.read(self.tensor(*lanes))?;
+                let o_y = self.tensor(*y);
+                let v = kernels_xla::conv::rule::group_rows(
+                    l.f(),
+                    csr_v,
+                    groups_v,
+                    lanes_v,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            }),
             Gather::ConcatCols { .. } | Gather::SplitQkvPadded { .. } => {
                 Err(kernels_xla::Error::Unsupported { op: op.name() })
             }

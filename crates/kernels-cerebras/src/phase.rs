@@ -749,6 +749,46 @@ pub enum HostOp {
         width: u32,
         limit: u32,
     },
+    /// Each of `rows` token rows' cell, `width` f32 columns: a row of one of
+    /// the `clips` boxes of `tgrid` (i32 `t, h, w, off`) its `(t, h, w)` in
+    /// the box, row-major; any other row `positions[row]` (i32) in column
+    /// `axis`; zeros elsewhere.
+    Cells {
+        tgrid: String,
+        positions: String,
+        y: String,
+        clips: u32,
+        rows: u32,
+        axis: u32,
+        width: u32,
+    },
+    /// `y[r] = csr[g + 1] - csr[g]` (f32) for `g = groups[lanes[r]]`, 0 when
+    /// the lane or group is out of the tables (`lane_count`, `csr_len`).
+    GroupRows {
+        csr: String,
+        groups: String,
+        lanes: String,
+        y: String,
+        csr_len: u32,
+        lane_count: u32,
+        rows: u32,
+    },
+    /// A patch move over clip tables (`clips` boxes in each): `fold` the
+    /// pixel unshuffle by `p` (`x`'s `channels` voxels of `grid` into `y`'s
+    /// rows of `o_grid`, `channels · |p|` wide), else the pixel shuffle
+    /// (`x`'s `channels · |p|`-wide rows of `grid` into `y`'s `channels`
+    /// voxels of `o_grid`); `y` has `rows` rows, a row no box holds zero.
+    Patch {
+        x: String,
+        grid: String,
+        y: String,
+        o_grid: String,
+        clips: u32,
+        rows: u32,
+        channels: u32,
+        p: [u32; 3],
+        fold: bool,
+    },
 }
 
 impl HostOp {
@@ -880,6 +920,22 @@ impl HostOp {
                 x, values, indices, ..
             } => vec![x, values, indices],
             HostOp::EmbedConcat { ids, table, y, .. } => vec![ids, table, y],
+            HostOp::Cells {
+                tgrid,
+                positions,
+                y,
+                ..
+            } => vec![tgrid, positions, y],
+            HostOp::GroupRows {
+                csr,
+                groups,
+                lanes,
+                y,
+                ..
+            } => vec![csr, groups, lanes, y],
+            HostOp::Patch {
+                x, grid, y, o_grid, ..
+            } => vec![x, grid, y, o_grid],
         }
     }
 }

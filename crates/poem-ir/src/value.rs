@@ -188,8 +188,13 @@ pub enum RuntimeInput {
     Tokens,
     Positions,
     MropePositions,
-    Mask { space: u32 },
-    Geometry { space: u32, kind: GeomKind },
+    Mask {
+        space: u32,
+    },
+    Geometry {
+        space: u32,
+        kind: GeomKind,
+    },
     ReadoutRows,
     AdapterRoutes,
     Patches,
@@ -197,9 +202,18 @@ pub enum RuntimeInput {
     PatchRoutes,
     PatchPositions,
     ImageGrids,
-    RowPermutation { select: Selection },
+    RowPermutation {
+        select: Selection,
+    },
     Grid,
-    TokenGrid { p: [u32; 3] },
+    /// The clips' token-side grid, `[Clips, 4]` i32: each clip's cell
+    /// `[t / p0, h / p1, w / p2, first token row]`. The contract: a voxel
+    /// lane's token rows are its clips' patches of `p`, each clip's in
+    /// (t, h, w) row-major order from its first token row, the clips in
+    /// lane order; the lane carries no other row.
+    TokenGrid {
+        p: [u32; 3],
+    },
     /// An input the model names and its guest binds: entry `id` of
     /// [`crate::Trace::inputs`], `width` values of `dtype` per lane, row or
     /// voxel of the fire.

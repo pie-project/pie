@@ -1598,6 +1598,36 @@ fn cell_of(indices: &[i32], indptr: &[i32], req: i32, pos: i64, ps: i64) -> Opti
     usize::try_from(page * ps + pos % ps).ok()
 }
 
+/// The first `clips` boxes `(t, h, w, off)` of the i32 clip table `name`.
+fn clip_boxes(state: &HashMap<String, Vec<u32>>, name: &str, clips: u32) -> Vec<[i64; 4]> {
+    let words = state.get(name).map(Vec::as_slice).unwrap_or(&[]);
+    (0..clips as usize)
+        .map(|l| {
+            let at = |j: usize| words.get(4 * l + j).map_or(0, |w| i64::from(*w as i32));
+            [at(0), at(1), at(2), at(3)]
+        })
+        .collect()
+}
+
+/// The index and box holding `row`, and the row's place in it.
+fn clip_of(boxes: &[[i64; 4]], row: i64) -> Option<(usize, [i64; 4], i64)> {
+    boxes.iter().enumerate().find_map(|(l, b)| {
+        let local = row - b[3];
+        (local >= 0 && local < b[0] * b[1] * b[2]).then_some((l, *b, local))
+    })
+}
+
+/// `local`'s `(t, h, w)` in box `b`, row-major.
+fn unravel(b: [i64; 4], local: i64) -> [i64; 3] {
+    let rest = local / b[2];
+    [rest / b[1], rest % b[1], local % b[2]]
+}
+
+/// The row of `(t, h, w)` in box `b`.
+fn ravel(b: [i64; 4], t: i64, h: i64, w: i64) -> i64 {
+    b[3] + (t * b[1] + h) * b[2] + w
+}
+
 /// Runs a host phase over the fire's buffers.
 fn run_host(host: &HostPhase, state: &mut HashMap<String, Vec<u32>>, at: usize) -> Result<()> {
     let take = |state: &HashMap<String, Vec<u32>>, name: &str| -> Result<Vec<f32>> {
@@ -2489,6 +2519,114 @@ fn run_host(host: &HostPhase, state: &mut HashMap<String, Vec<u32>>, at: usize) 
                     .get(id as usize * width..(id as usize + 1) * width)
                     .unwrap_or(&[]);
                 dst[..src.len()].copy_from_slice(src);
+            }
+            put(state, y, out);
+        }
+        HostOp::Cells {
+            tgrid,
+            positions,
+            y,
+            clips,
+            rows,
+            axis,
+            width,
+        } => {
+            let (rows, width, axis) = (*rows as usize, *width as usize, *axis as usize);
+            let boxes = clip_boxes(state, tgrid, *clips);
+            let pos = state.get(positions).cloned().unwrap_or_default();
+            let mut out = vec![0f32; rows * width];
+            for r in 0..rows {
+                let o = &mut out[r * width..(r + 1) * width];
+                match clip_of(&boxes, r as i64) {
+                    Some((_, b, local)) => {
+                        let [t, h, w] = unravel(b, local);
+                        o[0] = t as f32;
+                        o[1] = h as f32;
+                        o[2] = w as f32;
+                    }
+                    None => o[axis] = pos.get(r).map_or(0, |w| *w as i32) as f32,
+                }
+            }
+            put(state, y, out);
+        }
+        HostOp::GroupRows {
+            csr,
+            groups,
+            lanes,
+            y,
+            csr_len,
+            lane_count,
+            rows,
+        } => {
+            let word = |name: &str, at: i64| -> Option<i64> {
+                let at = usize::try_from(at).ok()?;
+                state.get(name)?.get(at).map(|w| i64::from(*w as i32))
+            };
+            let out: Vec<f32> = (0..*rows as i64)
+                .map(|r| {
+                    let l = word(lanes, r).unwrap_or(-1);
+                    let g = if (0..i64::from(*lane_count)).contains(&l) {
+                        word(groups, l).unwrap_or(-1)
+                    } else {
+                        -1
+                    };
+                    if !(0..i64::from(*csr_len) - 1).contains(&g) {
+                        return 0.0;
+                    }
+                    match (word(csr, g), word(csr, g + 1)) {
+                        (Some(a), Some(b)) => (b - a) as f32,
+                        _ => 0.0,
+                    }
+                })
+                .collect();
+            put(state, y, out);
+        }
+        HostOp::Patch {
+            x,
+            grid,
+            y,
+            o_grid,
+            clips,
+            rows,
+            channels,
+            p,
+            fold,
+        } => {
+            let (rows, c) = (*rows as usize, *channels as usize);
+            let [r1, r2, r3] = p.map(i64::from);
+            let vol = (r1 * r2 * r3) as usize;
+            let ins = clip_boxes(state, grid, *clips);
+            let outs = clip_boxes(state, o_grid, *clips);
+            let src = take(state, x)?;
+            let width = if *fold { c * vol } else { c };
+            let mut out = vec![0f32; rows * width];
+            for row in 0..rows {
+                let Some((lane, ob, local)) = clip_of(&outs, row as i64) else {
+                    continue;
+                };
+                let Some(&ib) = ins.get(lane) else { continue };
+                let [ot, oh, ow] = unravel(ob, local);
+                let dst = &mut out[row * width..(row + 1) * width];
+                if *fold {
+                    for (col, d) in dst.iter_mut().enumerate() {
+                        let (cin, blk) = ((col / vol) as i64, (col % vol) as i64);
+                        let (i1, i2, i3) = (blk / (r2 * r3), (blk / r3) % r2, blk % r3);
+                        let s = ravel(ib, ot * r1 + i1, oh * r2 + i2, ow * r3 + i3);
+                        *d = src
+                            .get(s as usize * c + cin as usize)
+                            .copied()
+                            .unwrap_or(0.0);
+                    }
+                } else {
+                    let s = ravel(ib, ot / r1, oh / r2, ow / r3) as usize;
+                    let blk = (((ot % r1) * r2 + oh % r2) * r3 + ow % r3) as usize;
+                    for (col, d) in dst.iter_mut().enumerate() {
+                        *d = src
+                            .get(s * c * vol + col * vol + blk)
+                            .copied()
+                            .unwrap_or(0.0);
+                    }
+                }
             }
             put(state, y, out);
         }

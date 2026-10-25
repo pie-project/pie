@@ -427,6 +427,18 @@ impl Run<'_> {
                     conv::resample::unpatchify(l.f(), x_v, grid_v, *p, o_y.landing(), y_grid_v)?;
                 l.land(o_y, v)
             }),
+            Conv::Cells {
+                tgrid,
+                positions,
+                axis,
+                y,
+            } => crate::lower::lower(self.ctx(), |l| {
+                let tgrid_v = l.read(self.tensor(*tgrid))?;
+                let positions_v = l.read(self.tensor(*positions))?;
+                let o_y = self.tensor(*y);
+                let v = conv::rule::cells(l.f(), tgrid_v, positions_v, *axis, o_y.landing())?;
+                l.land(o_y, v)
+            }),
         }
     }
 }

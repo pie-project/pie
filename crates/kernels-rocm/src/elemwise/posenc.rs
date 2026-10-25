@@ -341,3 +341,92 @@ pub fn derive_grid(
         &[grid.arg(), o_grid.arg(), ArgValue::of(&geom)],
     )
 }
+
+/// Each token row's cell (`ops::conv::cells`): a row of a clip of `tgrid`
+/// its patch's `(t, h, w)` there, any other row `positions[row]` in column
+/// `axis`; zeros elsewhere.
+pub fn cells(
+    ctx: &Ctx,
+    tgrid: Tensor,
+    positions: Tensor,
+    axis: u32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "conv.cells";
+    let clips = crate::voxels::lanes_of(OP, "token", tgrid)?;
+    if positions.dtype != Dtype::I32 || y.dtype != Dtype::F32 || y.width != axis.max(2) + 1 {
+        return Err(refuse(
+            OP,
+            format!(
+                "the positions are {:?} and the cells {} x {:?}; this reads i32 positions and \
+                 writes max(3, {axis} + 1) f32 columns",
+                positions.dtype, y.width, y.dtype
+            ),
+        ));
+    }
+    if positions.rows < y.rows {
+        return Err(refuse(
+            OP,
+            format!("{} positions for {} rows", positions.rows, y.rows),
+        ));
+    }
+    let rows = nonzero(OP, "rows", y.rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(POSENC_UNIT, "::pie::elemwise::cells")).apply(Launch::flat(rows, BLOCK)),
+        &[
+            tgrid.arg(),
+            positions.arg(),
+            y.arg(),
+            clips.arg(),
+            stated(OP, axis)?.arg(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, rows)?.arg(),
+        ],
+    )
+}
+
+/// Each row's count of `csr`'s rows in its lane's group
+/// (`ops::gather::group_rows`).
+pub fn group_rows(
+    ctx: &Ctx,
+    csr: Tensor,
+    groups: Tensor,
+    lanes: Tensor,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "gather.group_rows";
+    if [csr.dtype, groups.dtype, lanes.dtype] != [Dtype::I32; 3]
+        || y.dtype != Dtype::F32
+        || y.width != 1
+    {
+        return Err(refuse(
+            OP,
+            "the tables are i32 and the counts one f32 column",
+        ));
+    }
+    if lanes.rows < y.rows || csr.rows == 0 {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} row lanes for {} rows over a {}-entry indptr",
+                lanes.rows, y.rows, csr.rows
+            ),
+        ));
+    }
+    let rows = nonzero(OP, "rows", y.rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(POSENC_UNIT, "::pie::elemwise::group_rows"))
+            .apply(Launch::flat(rows, BLOCK)),
+        &[
+            csr.arg(),
+            groups.arg(),
+            lanes.arg(),
+            y.arg(),
+            stated(OP, groups.rows)?.arg(),
+            stated(OP, csr.rows - 1)?.arg(),
+            stated(OP, rows)?.arg(),
+        ],
+    )
+}

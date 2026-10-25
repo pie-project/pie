@@ -1260,6 +1260,20 @@ pub(crate) static OPS: &[Op] = &[
         },
     },
     Op {
+        module: "conv",
+        name: "cells",
+        params: &["tgrid", "positions", "axis"],
+        call: |a, heap| {
+            let tgrid: Value = a.next()?;
+            let positions: Value = a.next()?;
+            let axis: u32 = a.next()?;
+            result(
+                heap,
+                dsl("conv.cells", || ops::conv::cells(&tgrid, &positions, axis))?,
+            )
+        },
+    },
+    Op {
         module: "elemwise",
         name: "rmsnorm",
         params: &["x", "weight", "eps"],
@@ -2149,6 +2163,22 @@ pub(crate) static OPS: &[Op] = &[
             result(
                 heap,
                 dsl("gather.split_rows", || ops::gather::split_rows(&x, width))?,
+            )
+        },
+    },
+    Op {
+        module: "gather",
+        name: "group_rows",
+        params: &["csr", "groups", "lanes"],
+        call: |a, heap| {
+            let csr: Value = a.next()?;
+            let groups: Value = a.next()?;
+            let lanes: Value = a.next()?;
+            result(
+                heap,
+                dsl("gather.group_rows", || {
+                    ops::gather::group_rows(&csr, &groups, &lanes)
+                })?,
             )
         },
     },
