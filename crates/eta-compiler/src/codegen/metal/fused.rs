@@ -52,12 +52,12 @@ fn extra_intrinsics(ops: &[OpView], region: &Region) -> Vec<usize> {
 
 /// The address-table root of the grouped and streamed forms: the dispatch
 /// lane's own table.
-pub(super) fn emit_intrinsic_table(source: &mut String) {
+pub(super) fn emit_intrinsic_table(source: &mut String, stage: &CompiledStage) {
     let _ = writeln!(
         source,
         "  const device ulong* intrinsic_at = all_intrinsic_at + \
          dispatch_lane * {}u;",
-        eta_ir::op::INTRINSIC_PITCH
+        eta_ir::op::intrinsic_pitch(&stage.normalized.ops)
     );
 }
 
@@ -259,7 +259,7 @@ pub fn emit_grouped_fused_region(
         "  const device bfloat* logits = \
          reinterpret_cast<const device bfloat*>(lane.logits_base);\n",
     );
-    emit_intrinsic_table(&mut source);
+    emit_intrinsic_table(&mut source, stage);
     for channel in 0..channel_count {
         let _ = writeln!(
             source,

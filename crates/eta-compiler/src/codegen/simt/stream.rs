@@ -639,10 +639,9 @@ fn rematerialize(streams: &Streams<'_>, value: u32, pass: &mut Pass<'_>) -> Stri
 }
 
 fn intrinsic_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<'_>) {
-    let _ = streams;
     if !pass.intrinsics.contains(&node) {
         pass.intrinsics.push(node);
-        let slots = super::fused::PTIR_INTRINSIC_SLOTS;
+        let slots = super::fused::intrinsic_pitch(streams.stage);
         let p = &mut pass.prologue;
         let _ = writeln!(p, "    M1OpParams p{node} = params[{node}u];");
         let _ = writeln!(p, "    p{node}.rng_seed = 0u;");

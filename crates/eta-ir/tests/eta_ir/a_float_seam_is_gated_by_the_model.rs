@@ -2,11 +2,11 @@
 //! pixels, as one table: a pass whose lane reads the seam out binds a
 //! reading of it at that lane's width; a lane that reads another thing out
 //! refuses the program; a reading at another width, or not a float matrix,
-//! is refused; a lane past the pass's is refused; and either seam is an
-//! epilogue value.
+//! is refused; a lane past the pass's is refused, any lane within it binds;
+//! and either seam is an epilogue value.
 
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::{IntrinsicId, Op, intrinsic_pitch};
 use eta_ir::registry::{EngineCaps, Graph, Readout, ReadoutKind, Stage, intrinsic_stages};
 use eta_ir::types::{Dtype, Shape};
 use eta_ir::validate::{BoundTrace, ValidateError, bind};
@@ -119,6 +119,17 @@ fn a_float_seam_is_gated_by_the_model() {
         assert!(
             matches!(refusal, ValidateError::IntrinsicLane { intr: i, lane: 2, lanes: 2 } if i == intr),
             "{intr:?}: refused for the wrong reason: {refusal:?}"
+        );
+
+        // No lane cap: lane 20 of a pass of 21 binds, and the side table
+        // an instance binds is as wide as the lanes the program reads.
+        let mut lanes = vec![other; 21];
+        lanes[20] = reads;
+        let wide = bound(epilogue_reading(intr, 20, plane, Dtype::F32), lanes)
+            .unwrap_or_else(|why| panic!("{intr:?}: lane 20 reads the seam: {why:?}"));
+        assert_eq!(
+            intrinsic_pitch(&wide.container.stages[0].ops),
+            IntrinsicId::SLOTS * 21
         );
 
         assert_eq!(

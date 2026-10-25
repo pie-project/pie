@@ -734,7 +734,12 @@ impl Scheduler<'_> {
     }
 }
 
-pub(super) fn kernel_head(function_name: &str, channel_count: usize, extra: &str) -> String {
+pub(super) fn kernel_head(
+    function_name: &str,
+    stage: &CompiledStage,
+    channel_count: usize,
+    extra: &str,
+) -> String {
     let mut source = String::new();
     source.push_str(RUNTIME_TEMPLATE);
     source.push('\n');
@@ -815,7 +820,7 @@ pub(super) fn kernel_head(function_name: &str, channel_count: usize, extra: &str
         "  const device bfloat* logits = \
          reinterpret_cast<const device bfloat*>(lane.logits_base);\n",
     );
-    emit_intrinsic_table(&mut source);
+    emit_intrinsic_table(&mut source, stage);
     for channel in 0..channel_count {
         let _ = writeln!(
             source,
@@ -875,7 +880,7 @@ pub fn emit_streamed_region(
     } else {
         ""
     };
-    let mut source = kernel_head(function_name, channel_count, extra);
+    let mut source = kernel_head(function_name, stage, channel_count, extra);
 
     let escapes = crate::codegen::alias::escaping_values(region);
     let covers =

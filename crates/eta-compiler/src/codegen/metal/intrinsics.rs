@@ -5,8 +5,8 @@ pub const M2_LOGITS_BUFFER: usize = 6;
 pub const M2_INTRINSIC_TOP_BUFFER: usize = 30;
 
 /// The single-lane form's argument index of the instance's address table:
-/// one `ulong` a slot ([`eta_ir::op::intrinsic_slot`]), [`eta_ir::op::INTRINSIC_PITCH`]
-/// of them.
+/// one `ulong` a slot ([`eta_ir::op::intrinsic_slot`]), the stage's
+/// [`eta_ir::op::intrinsic_pitch`] of them.
 pub const M2_INTRINSIC_TABLE_BUFFER: usize = M2_INTRINSIC_TOP_BUFFER - 3;
 
 /// The grouped and streamed forms' argument index of the dispatch's address

@@ -204,12 +204,6 @@ pub struct Cursor {
     pub tail: u64,
 }
 
-/// By slot ([`eta_ir::op::intrinsic_slot`]): each intrinsic of each lane.
-const INTRINSIC_SLOTS: usize = eta_ir::op::INTRINSIC_PITCH as usize;
-
-/// The bytes of one instance's address table: a `ulong` a slot.
-const TABLE_BYTES: u64 = INTRINSIC_SLOTS as u64 * 8;
-
 #[derive(Debug, Clone)]
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 struct Slot {
@@ -494,8 +488,10 @@ pub struct Prepared {
     params: Buffer,
     offsets: Buffer,
     scratch: DeferredZeroBuffer,
-    intrinsics: [Option<Slot>; INTRINSIC_SLOTS],
-    declared: [Option<Declared>; INTRINSIC_SLOTS],
+    /// By slot ([`eta_ir::op::intrinsic_slot`]): each intrinsic of each
+    /// lane, the stage's [`eta_ir::op::intrinsic_pitch`] of them.
+    intrinsics: Vec<Option<Slot>>,
+    declared: Vec<Option<Declared>>,
     /// The address each per-lane slot reads at, as the kernels read it
     /// ([`eta_compiler::codegen::metal::addressed_slot`]); 0 where unbound.
     addresses: Buffer,
@@ -749,7 +745,8 @@ impl Prepared {
             .map_err(|_| Fault::program("program::launch", "a temporary offset past a u32"))?;
 
         let mut records = Vec::with_capacity(plan.ops.len());
-        let mut declared: [Option<Declared>; INTRINSIC_SLOTS] = [None; INTRINSIC_SLOTS];
+        let pitch = (plan.intrinsic_pitch.max(IntrinsicId::SLOTS)) as usize;
+        let mut declared: Vec<Option<Declared>> = vec![None; pitch];
         let mut result_base = 0u32;
         for op in &plan.ops {
             let mut record = OpParams::of(op, result_base, OpRuntime::default());
@@ -879,10 +876,10 @@ impl Prepared {
             params,
             offsets,
             scratch,
-            intrinsics: [const { None }; INTRINSIC_SLOTS],
+            intrinsics: vec![None; pitch],
             declared,
-            addresses: Buffer::zeroed(device, TABLE_BYTES)?,
-            address_words: vec![0; INTRINSIC_SLOTS],
+            addresses: Buffer::zeroed(device, pitch as u64 * 8)?,
+            address_words: vec![0; pitch],
             channel_count,
             value_count,
             scratch_stride,
@@ -1520,6 +1517,8 @@ pub struct Batch {
     scratch: Buffer,
     /// Each member's address table, dispatch lane by dispatch lane.
     addresses: Buffer,
+    /// The bytes of one member's address table: a `ulong` a slot.
+    table_bytes: u64,
     layouts: Vec<Buffer>,
     layout_words: Vec<GroupLayout>,
     rows_per_lane: u32,
@@ -1539,6 +1538,7 @@ impl Batch {
             .as_ref()
             .expect("the key was answered off this seat one statement ago");
         let lanes = lanes.max(1);
+        let table_bytes = template.address_words.len() as u64 * 8;
         let shape = LaneShape::of(lanes, grouped.shape.channel_slots_per_lane);
         let bytes = shape.bytes().ok_or_else(|| {
             Fault::program(
@@ -1612,7 +1612,8 @@ impl Batch {
             row_meta,
             row_indices,
             scratch,
-            addresses: Buffer::zeroed(device, u64::from(lanes) * TABLE_BYTES)?,
+            addresses: Buffer::zeroed(device, u64::from(lanes) * table_bytes)?,
+            table_bytes,
             layouts,
             layout_words: grouped.layout_words.clone(),
             rows_per_lane,
@@ -1721,7 +1722,7 @@ impl Batch {
                 .flat_map(u64::to_le_bytes)
                 .collect();
             self.addresses
-                .write(u64::from(lane) * TABLE_BYTES, &words)?;
+                .write(u64::from(lane) * self.table_bytes, &words)?;
             let row_base = lane * self.rows_per_lane;
             let meta = RowMeta {
                 offset: row_base,

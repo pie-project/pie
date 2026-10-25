@@ -70,11 +70,19 @@ impl IntrinsicId {
     }
 }
 
-/// The lanes of its pass an epilogue reads per-lane intrinsics of.
-pub const INTRINSIC_LANES: u32 = 16;
-
-/// The side-table slots one program instance binds intrinsics at.
-pub const INTRINSIC_PITCH: u32 = IntrinsicId::SLOTS * INTRINSIC_LANES;
+/// The side-table slots one instance of a stage binds intrinsics at:
+/// [`IntrinsicId::SLOTS`] for each lane up to the highest its `ops` read.
+pub fn intrinsic_pitch(ops: &[Op]) -> u32 {
+    let lanes = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::IntrinsicVal { lane, .. } => Some(lane.saturating_add(1)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(1);
+    IntrinsicId::SLOTS.saturating_mul(lanes)
+}
 
 /// The side-table slot an intrinsic of a pass's lane `lane` is bound at:
 /// [`IntrinsicId::SLOTS`] of them a lane, lane by lane.

@@ -107,7 +107,15 @@ impl Session {
             shapes,
             cursors,
             extents,
-            intrinsics: vec![None; super::launch::INTRINSIC_SLOTS],
+            intrinsics: vec![
+                None;
+                plan.package
+                    .plans
+                    .iter()
+                    .map(|plan| plan.intrinsic_pitch as usize)
+                    .max()
+                    .unwrap_or(0)
+            ],
             poisoned: false,
             fires: 0,
             commits: Vec::new(),
@@ -369,12 +377,10 @@ impl Session {
         row_offset: u32,
     ) -> Result<()> {
         let slot = eta_ir::op::intrinsic_slot(intrinsic, lane) as usize;
-        let seat = self.intrinsics.get_mut(slot).ok_or_else(|| {
-            Fault::program(
-                "program::session",
-                format!("intrinsic {slot} is past the pitch the side tables are indexed with"),
-            )
-        })?;
+        let Some(seat) = self.intrinsics.get_mut(slot) else {
+            // A lane no stage of the program reads an intrinsic of.
+            return Ok(());
+        };
         *seat = Some(Intrinsic {
             id: intrinsic,
             lane,
