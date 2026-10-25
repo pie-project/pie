@@ -254,13 +254,14 @@ impl Session {
     pub fn bind_intrinsic(
         &mut self,
         intrinsic: IntrinsicId,
+        lane: u32,
         base: &Buffer,
         offset: u64,
         width: u32,
         dtype: eta_ir::Dtype,
     ) -> Result<()> {
         for prepared in self.prepared.iter_mut().flatten() {
-            prepared.bind_intrinsic(intrinsic, base, offset, width, dtype)?;
+            prepared.bind_intrinsic(intrinsic, lane, base, offset, width, dtype)?;
         }
         self.bound |= 1u64 << (intrinsic as u32);
         Ok(())

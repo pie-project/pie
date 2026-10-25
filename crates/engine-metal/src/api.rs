@@ -745,20 +745,6 @@ impl Engine for Metal {
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
-        // An epilogue reads `velocity`, `hidden` and `pixels` of its pass's
-        // first lane alone here: the intrinsics bind one readout a pass.
-        if registration.launch.values.iter().any(|value| {
-            value.lane > 0
-                && value
-                    .intrinsic
-                    .is_some_and(eta_ir::op::IntrinsicId::per_lane)
-        }) {
-            return Err(Error::Unsupported {
-                verb: "an epilogue reading `velocity`, `hidden` or `pixels` of a pass's lane \
-                       past its first",
-                engine: "metal",
-            });
-        }
         self.loaded_mut()?
             .register_program(registration)
             .map_err(fault)
