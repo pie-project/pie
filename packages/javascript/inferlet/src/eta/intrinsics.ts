@@ -37,29 +37,22 @@ export function mtpDrafts(n: number): Tensor {
   return intrinsicVal(Intrinsic.MTP_DRAFTS, shapeOf([Math.max(n, 1)]), Dtype.I32);
 }
 
-export function hidden(width: number): Tensor {
-  const rows = Math.max(currentRows(), 1);
-  return intrinsicVal(Intrinsic.HIDDEN, shapeOf([rows, Math.max(width, 1)]), activationType);
+/** The `rows` hidden rows lane `lane` of the pass reads out, `width` wide. */
+export function hidden(lane: number, rows: number, width: number): Tensor {
+  return intrinsicVal(Intrinsic.HIDDEN, shapeOf([Math.max(rows, 1), Math.max(width, 1)]), activationType, lane);
 }
 
 /**
- * The flow-matching velocity a denoise reading predicts, `[n_out, width]` F32
- * at the epilogue. `width` is declared, as `hidden`'s is, but bind checks it
- * against the model's `velocity_width`.
+ * The pixels lane `lane`'s VAE reading lands, `[rows, width]` F32 at the
+ * epilogue: one row per OUTPUT voxel of the lane's clip.
  */
-/**
- * The pixels a VAE reading lands, `[rows, width]` F32 at the
- * epilogue: one row per OUTPUT voxel of the lane's clip. `rows` is declared
- * (a VAE lane has no token rows to derive it from); `width` is checked at
- * bind against the model's `pixels_width` when it states one.
- */
-export function pixels(rows: number, width: number): Tensor {
-  return intrinsicVal(Intrinsic.PIXELS, shapeOf([Math.max(rows, 1), Math.max(width, 1)]), activationType);
+export function pixels(lane: number, rows: number, width: number): Tensor {
+  return intrinsicVal(Intrinsic.PIXELS, shapeOf([Math.max(rows, 1), Math.max(width, 1)]), activationType, lane);
 }
 
-export function velocity(width: number): Tensor {
-  const rows = Math.max(currentRows(), 1);
-  return intrinsicVal(Intrinsic.VELOCITY, shapeOf([rows, Math.max(width, 1)]), activationType);
+/** The velocity lane `lane` of the pass predicts, one `width`-wide row per of its `rows`. */
+export function velocity(lane: number, rows: number, width: number): Tensor {
+  return intrinsicVal(Intrinsic.VELOCITY, shapeOf([Math.max(rows, 1), Math.max(width, 1)]), activationType, lane);
 }
 
 export function query(width: number): Tensor {

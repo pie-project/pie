@@ -5,7 +5,7 @@ use eta_dsl::{Channel, TraceError, Traced};
 const VOCAB: u32 = 32_000;
 const PAGE: u32 = 16;
 
-const GOLDEN_S3: u64 = 4213522552817221928;
+const GOLDEN_S3: u64 = 4138931922745078840;
 
 fn leak<T>(v: T) -> &'static T {
     Box::leak(Box::new(v))

@@ -120,7 +120,10 @@ impl OpParams {
             lit_dtype: u32::from(wire_dtype(op.lit_dtype)),
             lit_bits: op.lit_bits,
             channel_slot: op.channel.unwrap_or(NO_CHANNEL),
-            intr: op.intrinsic.map_or(0, |intrinsic| intrinsic as u32),
+            // The slot it is bound at; an intrinsic op's `imm` is its lane.
+            intr: op
+                .intrinsic
+                .map_or(0, |intrinsic| eta_ir::op::intrinsic_slot(intrinsic, op.imm)),
             sink_bytes: 0,
         }
     }

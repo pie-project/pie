@@ -31,6 +31,9 @@ pub struct LaunchValue {
     pub source: ValueOrigin,
     pub dtype: Dtype,
     pub intrinsic: Option<IntrinsicId>,
+    /// The pass's lane a per-lane intrinsic reads.
+    #[serde(default)]
+    pub lane: u32,
     pub channel: ChannelIndex,
     pub literal_bits: u32,
     pub shape: Vec<u32>,
@@ -43,6 +46,7 @@ impl Default for LaunchValue {
             source: ValueOrigin::OpResult,
             dtype: Dtype::F32,
             intrinsic: None,
+            lane: 0,
             channel: 0,
             literal_bits: 0,
             shape: Vec::new(),
@@ -339,6 +343,7 @@ fn lower_values(bound: &BoundTrace) -> Vec<LaunchValue> {
                         LaunchValue {
                             source: ValueOrigin::Intrinsic,
                             intrinsic: IntrinsicId::from_u16(view.intr),
+                            lane: view.imm,
                             ..LaunchValue::default()
                         },
                     );

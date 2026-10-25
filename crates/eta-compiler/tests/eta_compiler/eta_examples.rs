@@ -1,7 +1,6 @@
+use crate::msl_corpus::Served;
 use eta_ir::container::{decode, encode};
 use eta_ir::container_hash;
-use eta_ir::registry::ModelProfile;
-use eta_ir::validate::bind;
 
 use crate::traces::*;
 
@@ -18,7 +17,7 @@ fn section3_serializes_validates_hashes_stably() {
     let c2 = decode(&bytes).expect("decode");
     assert_eq!(c2, c);
     assert_eq!(container_hash(&encode(&c2)), h);
-    let bound = bind(c, ModelProfile::dummy()).expect("bind");
+    let bound = Served::of(32).bind(c).expect("bind");
     assert_eq!(bound.hash, h);
 }
 
@@ -27,7 +26,7 @@ fn beam_epilogue_serializes_validates_hashes_stably() {
     let bytes = encode(&c);
     let h = container_hash(&bytes);
     assert_eq!(decode(&bytes).expect("decode"), c);
-    let bound = bind(c.clone(), beam_profile()).expect("bind");
+    let bound = beam_profile().bind(c.clone()).expect("bind");
     assert_eq!(bound.hash, h);
     assert_eq!(container_hash(&encode(&decode(&bytes).unwrap())), h);
 }

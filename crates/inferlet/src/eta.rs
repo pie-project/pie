@@ -434,9 +434,6 @@ pub struct StateGeometry<'a> {
     pub slots: Option<&'a Channel>,
     /// Per lane, how many slots the lane reads.
     pub kv_len: Option<&'a Channel>,
-    /// Per row, the slots it may read; a recurrent layer needs the same mask
-    /// over buffered slots for every row of a lane.
-    pub mask: Option<&'a Channel>,
     pub fold: Fold<'a>,
 }
 
@@ -538,9 +535,9 @@ struct ForwardInner {
     program_attached: bool,
     adapter_lowrank_sites: u32,
     adapter_scale_sites: u32,
-    inputs: Vec<(String, DslChannel)>,
-    rows: Option<u32>,
-    switches: Vec<(String, String)>,
+    /// Each lane's bound inputs and set switches, by lane.
+    inputs: Vec<(u32, String, DslChannel)>,
+    switches: Vec<(u32, String, String)>,
 }
 
 impl ForwardPass {
@@ -561,7 +558,7 @@ impl ForwardPass {
             return false;
         }
         let declared = crate::model::switches();
-        inner.switches.iter().any(|(name, value)| {
+        inner.switches.iter().any(|(_, name, value)| {
             declared
                 .iter()
                 .find(|decl| decl.name == *name)
@@ -585,75 +582,69 @@ impl ForwardPass {
                 adapter_lowrank_sites: 0,
                 adapter_scale_sites: 0,
                 inputs: Vec::new(),
-                rows: None,
                 switches: Vec::new(),
             }),
         }
     }
 
-    /// Sets the model's switch `name` to `value` (`model::switches()`):
-    /// which path this pass's lanes run.
-    pub fn switch(&self, name: &str, value: &str) -> Result<(), String> {
+    /// Sets lane `lane`'s model switch `name` to `value`
+    /// (`model::switches()`): which path that lane runs.
+    pub fn switch(&self, lane: u32, name: &str, value: &str) -> Result<(), String> {
         if self.inner.borrow().program_attached {
             return Err("forward pass program is already attached".to_string());
         }
-        self.wit.switch(name, value)?;
+        self.wit.switch(lane, name, value)?;
         self.inner
             .borrow_mut()
             .switches
-            .push((name.to_string(), value.to_string()));
+            .push((lane, name.to_string(), value.to_string()));
         Ok(())
     }
 
-    /// Binds `ch` to the model's input `name`, its committed cell read at
-    /// every submit. A row input's channel (`[rows, width]`) states the
-    /// pass's rows.
-    pub fn input(&self, name: &str, ch: &Channel) -> Result<(), String> {
+    /// Binds `ch` to lane `lane`'s model input `name`, its committed cell
+    /// read at every submit.
+    pub fn input(&self, lane: u32, name: &str, ch: &Channel) -> Result<(), String> {
         {
             let inner = self.inner.borrow();
             if inner.program_attached {
                 return Err("forward pass program is already attached".to_string());
             }
-            if inner.inputs.iter().any(|(bound, _)| bound == name) {
-                return Err(format!("input `{name}` is already bound on this pass"));
+            if inner
+                .inputs
+                .iter()
+                .any(|(at, bound, _)| *at == lane && bound == name)
+            {
+                return Err(format!("input `{name}` is already bound on lane {lane}"));
             }
         }
         let wit = ch.wit();
-        self.wit.input(name, wit.as_ref())?;
-        let mut inner = self.inner.borrow_mut();
-        if let [rows, _] = ch.shape().dims()[..] {
-            inner.rows = Some(rows);
-        }
-        inner.inputs.push((name.to_string(), ch.dsl()));
+        self.wit.input(lane, name, wit.as_ref())?;
+        self.inner
+            .borrow_mut()
+            .inputs
+            .push((lane, name.to_string(), ch.dsl()));
         Ok(())
     }
 
-    pub fn group(&self, id: u32) -> Result<(), String> {
+    /// Puts lane `lane` in this pass's attention group `id`.
+    pub fn group(&self, lane: u32, id: u32) -> Result<(), String> {
         if self.inner.borrow().program_attached {
             return Err("forward pass program is already attached".to_string());
         }
-        self.wit.group(id)
+        self.wit.group(lane, id)
     }
 
-    pub fn peer(&self, ordinal: u32) -> Result<(), String> {
-        if self.inner.borrow().program_attached {
-            return Err("forward pass program is already attached".to_string());
-        }
-        self.wit.peer(ordinal)
-    }
-
-    /// A structured attention mask: one class per row of this pass (or -1),
-    /// and a `count x count` table of which q class attends which kv class.
-    pub fn attention_classes(
-        &self,
-        classes: &[i32],
-        table: &[u8],
-        count: u32,
-    ) -> Result<(), String> {
-        if self.inner.borrow().program_attached {
-            return Err("forward pass program is already attached".to_string());
-        }
-        self.wit.attention_classes(classes, table, count)
+    /// Per row of the pass, the rows it attends: kv slots on a pass whose
+    /// lanes read kv, its attention group's rows on one whose lanes do not.
+    pub fn mask(&self, rows: &Channel) -> Result<(), String> {
+        self.ensure_ports_available(&[Port::AttnMask])?;
+        let wit = rows.wit();
+        self.wit.mask(wit.as_ref())?;
+        self.inner
+            .borrow_mut()
+            .ports
+            .push((Port::AttnMask, claim_port(Port::AttnMask, rows)));
+        Ok(())
     }
 
     fn ensure_ports_available(&self, ports: &[Port]) -> Result<(), String> {
@@ -704,7 +695,6 @@ impl ForwardPass {
             (Port::Positions, geom.positions.copied()),
             (Port::Slots, geom.slots.copied()),
             (Port::KvLen, geom.kv_len.copied()),
-            (Port::AttnMask, geom.mask.copied()),
             (Port::Fold, fold),
         ];
         if !rebind {
@@ -727,8 +717,7 @@ impl ForwardPass {
                 positions: wits[0].as_deref(),
                 slots: wits[1].as_deref(),
                 kv_len: wits[2].as_deref(),
-                mask: wits[3].as_deref(),
-                fold: wits[4].as_deref(),
+                fold: wits[3].as_deref(),
             },
         )?;
         let mut inner = self.inner.borrow_mut();
@@ -754,8 +743,9 @@ impl ForwardPass {
         Ok(())
     }
 
-    pub fn media(&self, spans: &[wit_forward::MediaSpan<'_>]) -> Result<(), String> {
-        self.wit.media(spans)
+    /// The payloads of the media spans lane `lane`'s tokens carry.
+    pub fn media(&self, lane: u32, spans: &[wit_forward::MediaSpan<'_>]) -> Result<(), String> {
+        self.wit.media(lane, spans)
     }
 
     pub fn adapter(
@@ -886,14 +876,17 @@ impl ForwardPass {
         }
         let inner = self.inner.borrow();
         let mut builder = Builder::new(inner.vocab, inner.page_size);
-        if let Some(rows) = inner.rows {
-            builder.rows_hint(rows);
-        }
         for (port, channel) in &inner.ports {
             builder.bind_port_recorded(*port, channel.clone());
         }
-        for (_, channel) in &inner.inputs {
-            builder.bind_input(channel.clone());
+        // A channel several lanes read (a CFG step's one timestep) is one
+        // input of the program.
+        let mut listed: Vec<u64> = Vec::new();
+        for (_, _, channel) in &inner.inputs {
+            if !listed.contains(&channel.gid()) {
+                listed.push(channel.gid());
+                builder.bind_input(channel.clone());
+            }
         }
         for (stage, body) in &inner.stages {
             builder.stage(*stage, body);

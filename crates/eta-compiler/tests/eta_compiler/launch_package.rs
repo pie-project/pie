@@ -1,13 +1,12 @@
 use crate::msl_corpus::{GOLDEN_NAMES, golden_container, golden_profile, synthetic_traces};
 use eta_compiler::codegen::launch::LaunchStagePlan;
 use eta_compiler::plan::compile_bound;
-use eta_ir::validate::bind;
 
 fn bound_and_refused() -> (Vec<(String, Vec<LaunchStagePlan>)>, Vec<String>) {
     let mut out = Vec::new();
     let mut refused = Vec::new();
-    let mut push = |name: &str, container, profile| {
-        let Ok(bound) = bind(container, profile) else {
+    let mut push = |name: &str, container, profile: crate::msl_corpus::Served| {
+        let Ok(bound) = profile.bind(container) else {
             refused.push(name.to_string());
             return;
         };

@@ -6,7 +6,7 @@ use eta_ir::container::{
 };
 use eta_ir::expand;
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{ModelProfile, Port, Stage};
+use eta_ir::registry::{Port, Stage};
 use eta_ir::types::{Dtype, Literal, Shape};
 
 pub struct B {
@@ -66,6 +66,7 @@ pub fn section3_trace() -> TraceContainer {
     let mut b = B::new();
     let logits2 = b.p(Op::IntrinsicVal {
         intr: IntrinsicId::Logits,
+        lane: 0,
         shape: Shape::matrix(1, VOCAB),
         dtype: Dtype::F32,
     });
@@ -149,6 +150,7 @@ pub fn beam_trace() -> TraceContainer {
     let scores = b.p(Op::ChanTake(11));
     let logits = b.p(Op::IntrinsicVal {
         intr: IntrinsicId::Logits,
+        lane: 0,
         shape: Shape::matrix(BB, V),
         dtype: Dtype::F32,
     });
@@ -422,11 +424,6 @@ pub fn beam_trace() -> TraceContainer {
     }
 }
 
-pub fn beam_profile() -> ModelProfile {
-    ModelProfile {
-        vocab: V,
-        page_size: PAGE,
-        num_layers: 2,
-        ..ModelProfile::dummy()
-    }
+pub fn beam_profile() -> crate::msl_corpus::Served {
+    crate::msl_corpus::Served::of(V)
 }

@@ -1,11 +1,11 @@
+use crate::msl_corpus::Served;
 use eta_compiler::codegen::cuda::emit_fused_region;
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{ModelProfile, Stage};
+use eta_ir::registry::Stage;
 use eta_ir::types::RngKind;
 use eta_ir::types::{Dtype, Literal, Shape};
-use eta_ir::validate::bind;
 
 const ROWS: u32 = 256;
 const VOCAB: u32 = 4096;
@@ -39,6 +39,7 @@ fn subject() -> TraceContainer {
         },
         Op::IntrinsicVal {
             intr: IntrinsicId::Logits,
+            lane: 0,
             shape: Shape::matrix(ROWS, VOCAB),
             dtype: Dtype::F32,
         },
@@ -94,9 +95,8 @@ fn subject() -> TraceContainer {
     }
 }
 
-fn profile() -> ModelProfile {
-    let mut profile = ModelProfile::dummy();
-    profile.vocab = VOCAB;
+fn profile() -> Served {
+    let profile = Served::of(VOCAB);
     profile
 }
 
@@ -108,7 +108,7 @@ fn the_epilogue_streams_through_registers_every_case() {
 }
 
 fn the_row_parallel_epilogue_fuses_into_streams() {
-    let bound = bind(subject(), profile()).expect("the subject binds");
+    let bound = profile().bind(subject()).expect("the subject binds");
     let stages = compile_bound(&bound);
     let stage = stages.first().expect("one stage");
     let mut source = String::new();
@@ -164,6 +164,7 @@ fn a_reshaped_row_vector_broadcasts_through_the_stream() {
         },
         Op::IntrinsicVal {
             intr: IntrinsicId::Logits,
+            lane: 0,
             shape: Shape::matrix(ROWS, VOCAB),
             dtype: Dtype::F32,
         },
@@ -193,7 +194,7 @@ fn a_reshaped_row_vector_broadcasts_through_the_stream() {
         externs: Vec::new(),
         inputs: Vec::new(),
     };
-    let bound = bind(container, profile()).expect("binds");
+    let bound = profile().bind(container).expect("binds");
     let stages = compile_bound(&bound);
     let stage = stages.first().expect("one stage");
     assert!(
@@ -233,6 +234,7 @@ fn a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing() {
         },
         Op::IntrinsicVal {
             intr: IntrinsicId::Logits,
+            lane: 0,
             shape: Shape::matrix(ROWS, VOCAB),
             dtype: Dtype::F32,
         },
@@ -271,7 +273,7 @@ fn a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing() {
         externs: Vec::new(),
         inputs: Vec::new(),
     };
-    let bound = bind(container, profile()).expect("binds");
+    let bound = profile().bind(container).expect("binds");
     let stages = compile_bound(&bound);
     let stage = stages.first().expect("one stage");
     let mut generated = String::new();

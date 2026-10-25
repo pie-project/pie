@@ -5,13 +5,13 @@ The inferlet hands the host raw encoded bytes (:meth:`Image.from_bytes` for
 PNG/JPEG, :meth:`Video.from_bytes` for animated GIF, :meth:`Audio.from_bytes`
 for WAV) and the host decodes + preprocesses per the bound model. A span
 enters the sequence as the token run its handle answers, and the handle
-crosses again beside the tokens (``ForwardPass.media([img])``) to carry the
+crosses again beside the tokens (``ForwardPass.media(0, [img])``) to carry the
 payload::
 
     img = media.Image.from_bytes(png)
     toks = model.encode("Describe: ") + img.tokens() + model.encode(" briefly.")
     fwd.embed(tokens_ch, indptr_ch)
-    fwd.media([img])
+    fwd.media(0, [img])
 """
 
 from __future__ import annotations

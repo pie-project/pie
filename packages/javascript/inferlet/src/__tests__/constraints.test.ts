@@ -88,23 +88,24 @@ describe('media', () => {
     const img = media.Image.fromBytes(new Uint8Array([1]));
     const aud = media.Audio.fromBytes(new Uint8Array([2]));
     const fwd = new ForwardPass();
-    fwd.media([img, aud]);
+    fwd.media(0, [img, aud]);
+    expect((fwd.wit as unknown as { mediaLane: number }).mediaLane).toBe(0);
     expect((fwd.wit as unknown as { spans: unknown[] }).spans).toEqual([
       { tag: 'image', val: img.handle },
       { tag: 'audio', val: aud.handle },
     ]);
-    expect(() => fwd.media([new Uint8Array() as unknown as media.Image])).toThrow(TypeError);
+    expect(() => fwd.media(0, [new Uint8Array() as unknown as media.Image])).toThrow(TypeError);
   });
 });
 
 describe('pass switches', () => {
   it('sets a model switch, and a non-default value is off the default path', () => {
     const fwd = new ForwardPass();
-    fwd.switch('mode', 'encode');
+    fwd.switch(0, 'mode', 'encode');
     expect(fwd.switched()).toBe(false);
-    fwd.switch('mode', 'denoise');
-    const w = fwd.wit as unknown as { switches: [string, string][] };
-    expect(w.switches).toEqual([['mode', 'encode'], ['mode', 'denoise']]);
+    fwd.switch(1, 'mode', 'denoise');
+    const w = fwd.wit as unknown as { switches: [number, string, string][] };
+    expect(w.switches).toEqual([[0, 'mode', 'encode'], [1, 'mode', 'denoise']]);
     expect(fwd.switched()).toBe(true);
   });
 });

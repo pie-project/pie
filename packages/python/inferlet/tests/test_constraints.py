@@ -86,9 +86,9 @@ class TestMedia:
         img = media.Image.from_bytes(b"png")
         aud = media.Audio.from_bytes(b"wav")
         fwd = ForwardPass()
-        fwd.media([img, aud])
+        fwd.media(0, [img, aud])
         # The stub lowers `MediaSpan_*` to `(tag, resource)`: the pass must
         # hand over the WIT resource, not the inferlet library wrapper.
-        assert fwd.wit.spans == [("image", img.handle), ("audio", aud.handle)]
+        assert fwd.wit.spans == (0, [("image", img.handle), ("audio", aud.handle)])
         with pytest.raises(TypeError):
-            fwd.media([b"raw"])
+            fwd.media(0, [b"raw"])

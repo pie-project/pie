@@ -2,9 +2,32 @@ use super::numeric::*;
 use super::*;
 use eta_ir::container::{ChanDType, ChannelDecl, StageProgram, TraceContainer};
 use eta_ir::op::Op;
-use eta_ir::registry::ModelProfile;
+use eta_ir::registry::{EngineCaps, Graph, Readout, ReadoutKind};
 use eta_ir::types::{Literal, RngKind};
 use eta_ir::validate::bind;
+
+/// One lane reading 32-wide logits, on a two-layer model whose engine runs
+/// every sink.
+fn served(c: TraceContainer) -> BoundTrace {
+    bind(
+        c,
+        vec![Some(Readout {
+            kind: ReadoutKind::Logits,
+            width: 32,
+        })],
+        Graph {
+            num_layers: 2,
+            mtp_logits: true,
+            mtp_depth: 1,
+            attn_score: true,
+        },
+        EngineCaps {
+            lora: true,
+            attn_page_mask: true,
+        },
+    )
+    .unwrap()
+}
 
 fn chan(shape: Shape, dtype: Dtype, host_role: HostRole, seeded: bool) -> ChannelDecl {
     ChannelDecl {
@@ -47,12 +70,11 @@ fn tests_every_case() {
     dummy_run_on_late_host_edge_then_recover();
     rng_keyed_is_pure_function_of_state();
     per_layer_tap_accumulates_via_register_rule();
-    kernel_fault_poisons();
     numeric_contract_argmax_and_topk();
 }
 
 fn ping_pong_commits_and_back_pressures() {
-    let b = bind(counter_trace(), ModelProfile::dummy()).unwrap();
+    let b = served(counter_trace());
     let mut inst = Instance::new(&b, &[(0, Value::U32(vec![10]))]).unwrap();
     let r = inst
         .step(&b, &PassInputs::default(), &mut NoKernels)
@@ -77,7 +99,7 @@ fn ping_pong_commits_and_back_pressures() {
 }
 
 fn poison_makes_host_ops_error() {
-    let b = bind(counter_trace(), ModelProfile::dummy()).unwrap();
+    let b = served(counter_trace());
     let mut inst = Instance::new(&b, &[(0, Value::U32(vec![0]))]).unwrap();
     inst.poison();
     assert_eq!(inst.host_take(&b, 1), Err(HostError::Poisoned));
@@ -107,7 +129,7 @@ fn register_rule_put_then_take_reads_pending() {
         externs: alloc::vec::Vec::new(),
         inputs: Vec::new(),
     };
-    let b = bind(c, ModelProfile::dummy()).unwrap();
+    let b = served(c);
     let mut inst = Instance::new(&b, &[]).unwrap();
     let r = inst
         .step(&b, &PassInputs::default(), &mut NoKernels)
@@ -139,7 +161,7 @@ fn dummy_run_on_late_host_edge_then_recover() {
         externs: alloc::vec::Vec::new(),
         inputs: Vec::new(),
     };
-    let b = bind(c, ModelProfile::dummy()).unwrap();
+    let b = served(c);
     let mut inst = Instance::new(&b, &[(1, Value::U32(vec![100]))]).unwrap();
     let r = inst
         .step(&b, &PassInputs::default(), &mut NoKernels)
@@ -180,7 +202,7 @@ fn rng_keyed_is_pure_function_of_state() {
         externs: alloc::vec::Vec::new(),
         inputs: Vec::new(),
     };
-    let b = bind(mk(), ModelProfile::dummy()).unwrap();
+    let b = served(mk());
     let seeds = [(0u32, Value::U32(vec![42, 7]))];
     let mut a = Instance::new(&b, &seeds).unwrap();
     let mut c = Instance::new(&b, &seeds).unwrap();
@@ -200,6 +222,7 @@ fn per_layer_tap_accumulates_via_register_rule() {
                 Op::ChanTake(0),
                 Op::IntrinsicVal {
                     intr: IntrinsicId::Layer,
+                    lane: 0,
                     shape: Shape::SCALAR,
                     dtype: Dtype::U32,
                 },
@@ -218,48 +241,13 @@ fn per_layer_tap_accumulates_via_register_rule() {
         externs: alloc::vec::Vec::new(),
         inputs: Vec::new(),
     };
-    let b = bind(c, ModelProfile::dummy()).unwrap();
+    let b = served(c);
     let mut inst = Instance::new(&b, &[(0, Value::F32(vec![-1.0, -1.0]))]).unwrap();
     let r = inst
         .step(&b, &PassInputs::default(), &mut NoKernels)
         .unwrap();
     assert!(r.committed);
     assert_eq!(inst.peek_front(0).unwrap(), Value::F32(vec![0.0, 1.0]));
-}
-
-fn kernel_fault_poisons() {
-    let c = TraceContainer {
-        names: vec!["boom".into()],
-        channels: vec![chan(Shape::vector(1), Dtype::F32, HostRole::None, true)],
-        ports: vec![],
-        stages: vec![StageProgram {
-            stage: Stage::Epilogue,
-            ops: vec![
-                Op::KernelCall {
-                    name: 0,
-                    args: vec![],
-                    shape: Shape::vector(1),
-                    dtype: Dtype::F32,
-                },
-                Op::ChanTake(0),
-                Op::Add(0, 1),
-                Op::ChanPut { chan: 0, value: 2 },
-            ],
-        }],
-        externs: alloc::vec::Vec::new(),
-        inputs: Vec::new(),
-    };
-    let mut profile = ModelProfile::dummy();
-    profile.kernels.push(eta_ir::registry::KernelInfo {
-        name: "boom".into(),
-        sink_scope: None,
-        replayable: true,
-    });
-    let b = bind(c, profile).unwrap();
-    let mut inst = Instance::new(&b, &[(0, Value::F32(vec![0.0]))]).unwrap();
-    let e = inst.step(&b, &PassInputs::default(), &mut NoKernels);
-    assert!(matches!(e, Err(StepError::KernelFault { .. })));
-    assert!(inst.is_poisoned());
 }
 
 fn numeric_contract_argmax_and_topk() {

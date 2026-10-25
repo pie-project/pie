@@ -620,6 +620,7 @@ mod tests {
                 ops: vec![
                     Op::IntrinsicVal {
                         intr: IntrinsicId::Logits,
+                        lane: 0,
                         shape: Shape::matrix(1, vocab),
                         dtype: Dtype::F32,
                     },

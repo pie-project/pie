@@ -32,7 +32,6 @@ pub struct Builder<'a> {
     stages: Vec<(Stage, StageClosure<'a>)>,
     vocab: u32,
     page_size: u32,
-    rows: Option<u32>,
 }
 
 impl<'a> Builder<'a> {
@@ -43,12 +42,7 @@ impl<'a> Builder<'a> {
             stages: Vec::new(),
             vocab,
             page_size,
-            rows: None,
         }
-    }
-
-    pub fn rows_hint(&mut self, rows: u32) {
-        self.rows = Some(rows.max(1));
     }
 
     #[track_caller]
@@ -87,9 +81,6 @@ impl<'a> Builder<'a> {
     }
 
     fn rows(&self) -> u32 {
-        if let Some(rows) = self.rows {
-            return rows;
-        }
         if let Some(channel) = self.channel_port(Port::Readout) {
             return saturating_rows(channel.shape().numel()).max(1);
         }

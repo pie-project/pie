@@ -58,7 +58,29 @@ declare_intrinsics! {
     AttnScore = 7, ATTN_SCORE, "attn_score";
     Velocity = 8, VELOCITY, "velocity";
     Pixels = 9, PIXELS, "pixels";
-    PeerVelocity = 10, PEER_VELOCITY, "peer_velocity";
+}
+
+impl IntrinsicId {
+    /// Whether the intrinsic is one lane's of its pass (`velocity`, `hidden`
+    /// and `pixels` name the lane); the rest are the pass's.
+    pub fn per_lane(self) -> bool {
+        matches!(
+            self,
+            IntrinsicId::Velocity | IntrinsicId::Hidden | IntrinsicId::Pixels
+        )
+    }
+}
+
+/// The lanes of its pass an epilogue reads per-lane intrinsics of.
+pub const INTRINSIC_LANES: u32 = 16;
+
+/// The side-table slots one program instance binds intrinsics at.
+pub const INTRINSIC_PITCH: u32 = IntrinsicId::SLOTS * INTRINSIC_LANES;
+
+/// The side-table slot an intrinsic of a pass's lane `lane` is bound at:
+/// [`IntrinsicId::SLOTS`] of them a lane, lane by lane.
+pub const fn intrinsic_slot(intr: IntrinsicId, lane: u32) -> u32 {
+    intr as u32 + IntrinsicId::SLOTS * lane
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -192,8 +214,11 @@ pub enum Op {
         value: ValueId,
     },
 
+    /// `lane` is the pass's lane a per-lane intrinsic reads
+    /// ([`IntrinsicId::per_lane`]), 0 for the others.
     IntrinsicVal {
         intr: IntrinsicId,
+        lane: u32,
         shape: Shape,
         dtype: Dtype,
     },
@@ -662,8 +687,8 @@ declare_ops! {
     CHAN_PUT = 0x92, "chan_put", Channel, 1, 0,
         Op::ChanPut { chan: 0, value: 0 }, Op::ChanPut { .. }, [Chan, Value];
     INTRINSIC_VAL = 0xA0, "intrinsic_val", Intrinsic, 0, 1,
-        Op::IntrinsicVal { intr: IntrinsicId::Logits, shape: Shape::matrix(1, 8), dtype: Dtype::F32 },
-        Op::IntrinsicVal { .. }, [Intrinsic, Dtype, Shape];
+        Op::IntrinsicVal { intr: IntrinsicId::Logits, lane: 0, shape: Shape::matrix(1, 8), dtype: Dtype::F32 },
+        Op::IntrinsicVal { .. }, [Intrinsic, Imm, Dtype, Shape];
     KERNEL_CALL = 0xA1, "kernel_call", Intrinsic, VARIADIC, 1,
         Op::KernelCall { name: 0, args: vec![0, 1], shape: Shape::vector(4), dtype: Dtype::F32 },
         Op::KernelCall { .. }, [Name, Dtype, Shape, Args];

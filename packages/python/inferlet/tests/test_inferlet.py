@@ -357,7 +357,7 @@ class TestForwardPassState:
         lanes, geom = fwd.wit.state_args
         assert lanes == [a.ws, b.ws, a.ws]
         assert geom.slots is slots._wit()
-        assert (geom.positions, geom.kv_len, geom.mask, geom.fold) == (None, None, None, None)
+        assert (geom.positions, geom.kv_len, geom.fold) == (None, None, None)
         assert [p for p, _ in fwd._ports] == [Port.SLOTS]
 
     def test_fold_all_is_one_constant_channel_per_pass(self):
@@ -397,10 +397,10 @@ class TestDiffusionSurface:
         from inferlet.eta import ForwardPass
 
         fwd = ForwardPass()
-        fwd.switch("mode", "encode")
+        fwd.switch(0, "mode", "encode")
         assert not fwd.switched()
-        fwd.switch("mode", "denoise")
-        assert fwd.wit.switches == [("mode", "encode"), ("mode", "denoise")]
+        fwd.switch(1, "mode", "denoise")
+        assert fwd.wit.switches == [(0, "mode", "encode"), (1, "mode", "denoise")]
         assert fwd.switched()
 
     def test_linear_temperature_is_the_reference_schedule(self):

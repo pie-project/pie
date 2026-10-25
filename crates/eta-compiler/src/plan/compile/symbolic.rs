@@ -310,7 +310,7 @@ pub(crate) fn symbolic_intrinsic_type(
     let mut ty = SymbolicType::static_type(value_type);
     match intrinsic {
         IntrinsicId::Logits => {
-            if ty.rank() >= 2 && value_type.shape.last_len() == Some(bound.profile.vocab) {
+            if ty.rank() >= 2 && value_type.shape.last_len() == Some(bound.vocab()) {
                 ty.dims[0] = Dimension::Symbolic(SymbolicExtent::SampledRows);
             }
         }
@@ -318,7 +318,6 @@ pub(crate) fn symbolic_intrinsic_type(
         | IntrinsicId::MtpDrafts
         | IntrinsicId::Hidden
         | IntrinsicId::Velocity
-        | IntrinsicId::PeerVelocity
         | IntrinsicId::Pixels
         | IntrinsicId::Query
         | IntrinsicId::ValueHead

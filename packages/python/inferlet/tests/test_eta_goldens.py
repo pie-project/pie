@@ -153,7 +153,7 @@ def test_s3_matches_lowering_rs_golden():
     b.stage(Stage.EPILOGUE, epilogue)
     host_put(mask, [True] * vocab)
     traced = b.build()
-    assert traced.identity_hash() == 4213522552817221928
+    assert traced.identity_hash() == GOLDENS["s3"][0]
     check("s3", traced)
 
 
@@ -547,7 +547,7 @@ def test_latent_step_matches_rust():
 
     def epilogue():
         positions.put_tensor(positions.take())
-        v = intrinsics.velocity(channels)
+        v = intrinsics.velocity(0, rows, channels)
         x = latent.take()
         d = reshape(dsigma.read(), [])
 
@@ -598,7 +598,7 @@ def test_vae_readback_matches_rust():
     b = Builder(VOCAB, PAGE)
 
     def epilogue():
-        px = intrinsics.pixels(rows, rgb)
+        px = intrinsics.pixels(0, rows, rgb)
         shifted = add(px, 1.0)
         unit = mul(shifted, 0.5)
         out.put_tensor(unit)
