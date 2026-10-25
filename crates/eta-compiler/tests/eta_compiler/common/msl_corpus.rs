@@ -157,7 +157,7 @@ pub fn synthetic_traces() -> Vec<(&'static str, TraceContainer, Served)> {
                     Op::ChanPut { chan: 2, value: 2 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "synthetic_matmul",
@@ -174,7 +174,7 @@ pub fn synthetic_traces() -> Vec<(&'static str, TraceContainer, Served)> {
                     Op::ChanPut { chan: 2, value: 2 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "synthetic_mtp_drafts",
@@ -346,7 +346,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, Served)> {
                     Op::ChanPut { chan: 1, value: 4 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "extended_minmax",
@@ -363,7 +363,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, Served)> {
                     Op::ChanPut { chan: 3, value: 4 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "extended_predicates",
@@ -386,7 +386,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, Served)> {
                     Op::ChanPut { chan: 2, value: 7 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "extended_transpose_cumsum",
@@ -407,7 +407,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, Served)> {
                     Op::ChanPut { chan: 2, value: 3 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "extended_gather_scatter",
@@ -434,7 +434,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, Served)> {
                     Op::ChanPut { chan: 4, value: 4 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "extended_rng_stream",
@@ -450,7 +450,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, Served)> {
                     Op::ChanPut { chan: 0, value: 0 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "extended_hierarchical",
@@ -463,7 +463,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, Served)> {
                     Op::ChanPut { chan: 1, value: 1 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "extended_hidden",
@@ -481,7 +481,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, Served)> {
                     Op::ChanPut { chan: 0, value: 1 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "extended_on_attn",
@@ -503,7 +503,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, Served)> {
                     Op::ChanPut { chan: 0, value: 0 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "extended_attn_score",

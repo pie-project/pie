@@ -83,7 +83,8 @@ fn the_miniature_lands_its_derived_planes() {
             .unwrap_or_else(|| panic!("`{name}` was not published"))
     };
 
-    for (bank, token) in [("dit.cap_pad_mod", "cap_pad_token")] {
+    {
+        let (bank, token) = ("dit.cap_pad_mod", "cap_pad_token");
         let got = bf16(landed(bank));
         assert_eq!(got.len(), 2 * dim, "{bank} is [2·dim, 1]");
         let (scale, shift) = got.split_at(dim);

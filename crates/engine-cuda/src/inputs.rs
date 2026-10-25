@@ -945,16 +945,14 @@ impl Inputs {
                     lane_table.resize(space_lanes as usize + 1, last);
                     put(offset, bytes_of(&lane_table), what)?;
                 }
-                for (offset, table, what) in [(
+                row_table.clear();
+                row_table.extend_from_slice(packing.permutation);
+                row_table.resize(rows as usize, -1);
+                put(
                     at.permutation,
-                    packing.permutation,
+                    bytes_of(&row_table),
                     "staged row permutation",
-                )] {
-                    row_table.clear();
-                    row_table.extend_from_slice(table);
-                    row_table.resize(rows as usize, -1);
-                    put(offset, bytes_of(&row_table), what)?;
-                }
+                )?;
             }
         }
 

@@ -110,7 +110,9 @@ fn the_shapes_are_the_ltx_decoders() {
                 GridRule::Conv { .. } | GridRule::Shuffle { .. } => {}
                 other => panic!("a grid rule this decoder never states: {other:?}"),
             },
-            Operation::Conv(Conv::Patchify { .. } | Conv::Unpatchify { .. } | Conv::Cells { .. }) => {}
+            Operation::Conv(
+                Conv::Patchify { .. } | Conv::Unpatchify { .. } | Conv::Cells { .. },
+            ) => {}
             Operation::Conv(other) => {
                 panic!("a spatial member this decoder never states: {other:?}")
             }

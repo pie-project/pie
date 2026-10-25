@@ -101,8 +101,7 @@ fn voxel_input(reading: &str) -> Result<model::InputDecl> {
         other => Err(format!(
             "reading `{reading}` reads {} input(s), and a VAE arm reads one clip on the voxel axis",
             other.len()
-        )
-        .into()),
+        )),
     }
 }
 
@@ -132,13 +131,13 @@ async fn decode_frame(
         Channel::from_shaped([clip_h, clip_w, input.width], clip.to_vec()).named("vae_latent");
     pass.input(0, &input.name, &cell)?;
     let out = Channel::new([rows, width], dtype::f32).named("vae_pixels");
-    let readback = out.clone();
+    let readback = out;
     pass.epilogue(move || {
         readback.put(intrinsics::pixels(0, rows, width));
     });
     pass.submit(pipe)
         .with_context(|| format!("the `{reading}` fire"))?;
-    out.take_host::<Vec<f32>>().await.map_err(Into::into)
+    out.take_host::<Vec<f32>>().await
 }
 
 #[inferlet::main]
@@ -179,16 +178,14 @@ async fn main(input: Input) -> Result<Output> {
             case.h,
             case.w,
             case.channels
-        )
-        .into());
+        ));
     }
     let space = model::latent().ok_or("this model states no latent space")?;
     if space.channels != case.channels {
         return Err(format!(
             "the case is {} channels and the model's latent is {}",
             case.channels, space.channels
-        )
-        .into());
+        ));
     }
     let (tc, sc) = (space.temporal_compression, space.spatial_compression);
     let (pixel_h, pixel_w) = (case.h * sc, case.w * sc);

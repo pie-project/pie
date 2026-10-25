@@ -122,10 +122,12 @@ fn floats_of_base64(text: &str, what: &str) -> Result<Vec<f32>> {
         }
     }
     if bytes.len() % 4 != 0 {
-        return Err(format!("{what}: {} bytes is not whole f32s", bytes.len()).into());
+        return Err(format!("{what}: {} bytes is not whole f32s", bytes.len()));
     }
     Ok(bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
         .collect())
 }
@@ -150,8 +152,7 @@ impl Case {
                 self.context.len(),
                 self.context_rows,
                 self.context_width
-            )
-            .into());
+            ));
         }
         self.context.resize(want, 0.0);
         Ok(())
@@ -190,8 +191,7 @@ fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::La
     if reads != wants {
         return Err(format!(
             "reading `{reading}`'s `{stream}` lane reads {reads:?}; this pass binds {wants:?}"
-        )
-        .into());
+        ));
     }
     Ok(lane)
 }
@@ -210,8 +210,7 @@ fn dims(reading: &str, given: bool) -> Result<Dims> {
         if reads != ["latents", "positions", "timestep"] {
             return Err(format!(
                 "reading `{reading}`'s video lane under `positions = given` reads {reads:?}"
-            )
-            .into());
+            ));
         }
         lane
     } else {
@@ -286,7 +285,17 @@ async fn step(case: &Case, dims: &Dims, reading: &str) -> Result<Vec<f32>> {
     // case cuts one, and the main lane: each video lane's (lane, voxels).
     let mut videos: Vec<(u32, u32)> = Vec::new();
     if case.cond_frames > 0 {
-        let voxels = video_lane(&pass, 1, case, reading, group, "cond", 0, case.cond_frames, 0.0)?;
+        let voxels = video_lane(
+            &pass,
+            1,
+            case,
+            reading,
+            group,
+            "cond",
+            0,
+            case.cond_frames,
+            0.0,
+        )?;
         videos.push((1, voxels));
     }
     let main_lane = videos.len() as u32 + 1;
@@ -345,7 +354,9 @@ async fn main(input: Input) -> Result<Output> {
         inferlet::serde_json::from_str(&text).map_err(|why| format!("case json: {why}"))?;
     case.rectangles()?;
     if case.cond_frames >= case.frames {
-        return Err("the conditioning frames must leave at least one frame for the main lane".into());
+        return Err(
+            "the conditioning frames must leave at least one frame for the main lane".into(),
+        );
     }
     let want = (case.frames * case.height * case.width * case.channels) as usize;
     if case.latents.len() != want {
@@ -356,10 +367,13 @@ async fn main(input: Input) -> Result<Output> {
             case.height,
             case.width,
             case.channels
-        )
-        .into());
+        ));
     }
-    if case.positions.len() % (3 * case.frames as usize) != 0 {
+    if !case
+        .positions
+        .len()
+        .is_multiple_of(3 * case.frames as usize)
+    {
         return Err("the case's positions are not whole (t, h, w) rows per frame".into());
     }
 
@@ -369,8 +383,7 @@ async fn main(input: Input) -> Result<Output> {
         return Err(format!(
             "the model reads a {}-wide velocity and the case's latent has {} channels",
             dims.velocity_width, case.channels
-        )
-        .into());
+        ));
     }
     let velocity = step(&case, &dims, reading).await?;
     Ok(Output {

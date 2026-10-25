@@ -959,6 +959,7 @@ impl Plane {
     /// can read them where they are. Every pass still in flight lands
     /// before this one binds its roots.
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn fire_guests_with(
         &mut self,
         device: &crate::device::Device,
@@ -1224,6 +1225,7 @@ impl Plane {
     }
 
     #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
     pub fn fire_interpreted(
         &mut self,
         instance: InstanceId,

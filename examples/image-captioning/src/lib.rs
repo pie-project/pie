@@ -205,7 +205,7 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.media(0, &spans)?;
     fwd_p.state(&[&ws], StateGeometry::folding())?;
     fwd_p.epilogue(move || {
-        g0_ch.put(&sample_token());
+        g0_ch.put(sample_token());
     });
     fwd_p.submit(&pipe).context("prefill submit")?;
     let g0 = g0_ch.take_host::<i32>().await?;

@@ -121,8 +121,7 @@ fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::La
     if reads != wants {
         return Err(format!(
             "reading `{reading}`'s `{stream}` lane reads {reads:?}; this pass binds {wants:?}"
-        )
-        .into());
+        ));
     }
     Ok(lane)
 }
@@ -150,11 +149,12 @@ fn read_f32(name: &str, count: usize) -> Result<Vec<f32>> {
             "/scratch/{name}: {} bytes, expected {} ({count} f32)",
             bytes.len(),
             count * 4
-        )
-        .into());
+        ));
     }
     Ok(bytes
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect())
 }
@@ -185,7 +185,7 @@ async fn text_rows(ids: &[u32], width: u32, pipe: &Pipeline) -> Result<Vec<f32>>
     pass.embed(&toks, &embed_indptr)?;
     pass.readout(&readout)?;
     pass.state(&[&ws], StateGeometry::default())?;
-    let readback = out.clone();
+    let readback = out;
     pass.epilogue(move || {
         readback.put(intrinsics::hidden(0, len, width));
     });
@@ -291,7 +291,7 @@ async fn main(input: Input) -> Result<Output> {
             break text;
         }
         if inferlet::monotonic_now_ns() - start > deadline {
-            return Err(format!("{path}: not written within the wait").into());
+            return Err(format!("{path}: not written within the wait"));
         }
         inferlet::sleep(std::time::Duration::from_millis(200)).await;
     };
@@ -317,15 +317,13 @@ async fn main(input: Input) -> Result<Output> {
         return Err(format!(
             "the model reads a {}-wide velocity and the case's latent has {} channels",
             dims.velocity_width, case.channels
-        )
-        .into());
+        ));
     }
     if hidden_width != case.context_width {
         return Err(format!(
             "`text` reads out {hidden_width} wide and the case's context is {} wide",
             case.context_width
-        )
-        .into());
+        ));
     }
 
     let mut files = Vec::new();
@@ -349,8 +347,8 @@ async fn main(input: Input) -> Result<Output> {
     )?;
     // One conditioning channel: no pass writes it, so every trajectory's
     // pass reads the same one.
-    let golden = Channel::from_shaped([case.text_rows, case.context_width], context)
-        .named("context");
+    let golden =
+        Channel::from_shaped([case.text_rows, case.context_width], context).named("context");
     let (velocity0, latents) = trajectory(
         &golden,
         &noise,

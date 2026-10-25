@@ -189,8 +189,7 @@ fn lane_reading(reading: &str, binds: &[&str]) -> Result<model::LaneDecl> {
     if reads != wants {
         return Err(format!(
             "reading `{reading}`'s lane reads {reads:?}; this pass binds {wants:?}"
-        )
-        .into());
+        ));
     }
     Ok(lane)
 }
@@ -203,8 +202,7 @@ fn voxel_input(arm: &str) -> Result<String> {
         other => Err(format!(
             "reading `{arm}` reads {} input(s), and a voxel arm reads one clip on the voxel axis",
             other.len()
-        )
-        .into()),
+        )),
     }
 }
 
@@ -245,7 +243,7 @@ fn prefill(
     // Every row reads out: the default is the lane's LAST row, and the
     // golden's logits are the whole causal pass.
     pass.readout(&readout)?;
-    let (argmax_out, max_out) = (argmax.clone(), max.clone());
+    let (argmax_out, max_out) = (argmax, max);
     pass.epilogue(move || {
         let logits = intrinsics::logits();
         argmax_out.put(cast(reduce_argmax(&logits), dtype::i32));
@@ -318,7 +316,7 @@ fn denoise_step(
     )?;
     pass.readout(&readout)?;
     let hidden = case.hidden;
-    let readback = out.clone();
+    let readback = out;
     pass.epilogue(move || {
         readback.put(intrinsics::hidden(0, canvas_len, hidden));
     });
@@ -358,7 +356,7 @@ fn voxel_arm(
     pass.input(0, &voxel_input(arm)?, &x)?;
     let width = readout_width(arm)?;
     let out = Channel::new([rows, width], dtype::f32).named(&format!("pixels_{tag}"));
-    let readback = out.clone();
+    let readback = out;
     pass.epilogue(move || {
         readback.put(intrinsics::pixels(0, rows, width));
     });
@@ -391,7 +389,7 @@ fn parse(input: &Input) -> Result<Case> {
             return Err("pass `case` (json), `case_0..7` (its pieces) or `case_file`".into());
         }
     };
-    inferlet::serde_json::from_str(&text).map_err(|why| format!("case json: {why}").into())
+    inferlet::serde_json::from_str(&text).map_err(|why| format!("case json: {why}"))
 }
 
 #[inferlet::main]
@@ -410,8 +408,7 @@ async fn main(input: Input) -> Result<Output> {
         return Err(format!(
             "the model reads a {canvas_width}-wide canvas row and the case carries {}",
             case.hidden
-        )
-        .into());
+        ));
     }
     if case.prefix.len() != case.prefix_alt.len() {
         return Err("the two prefixes must have one length, one mask and one rope".into());
@@ -450,8 +447,7 @@ async fn main(input: Input) -> Result<Output> {
         return Err(format!(
             "`image.in` lands {image_in_width}-wide rows and the case's trunk is {} wide",
             case.hidden
-        )
-        .into());
+        ));
     }
     let rows_channel = voxel_arm(
         &case,

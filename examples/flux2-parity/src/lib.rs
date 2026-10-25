@@ -110,8 +110,7 @@ fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::La
     if reads != wants {
         return Err(format!(
             "reading `{reading}`'s `{stream}` lane reads {reads:?}; this pass binds {wants:?}"
-        )
-        .into());
+        ));
     }
     Ok(lane)
 }
@@ -162,8 +161,7 @@ fn latent(at: &Latent, channels: u32, name: &str) -> Result<Channel> {
             at.latents.len(),
             at.height,
             at.width
-        )
-        .into());
+        ));
     }
     Ok(Channel::from_shaped([at.height, at.width, channels], at.latents.as_slice()).named(name))
 }
@@ -219,7 +217,7 @@ async fn step(case: &Case, dims: &Dims, reading: &str, pipe: &Pipeline) -> Resul
         out.put(intrinsics::velocity(1, voxels, velocity_width));
     });
     pass.submit(pipe).context("the denoise step")?;
-    out.take_host::<Vec<f32>>().await.map_err(Into::into)
+    out.take_host::<Vec<f32>>().await
 }
 
 #[inferlet::main]
@@ -256,8 +254,7 @@ async fn main(input: Input) -> Result<Output> {
         return Err(format!(
             "the model reads a {}-wide velocity and the case's latent has {} channels",
             dims.velocity_width, case.channels
-        )
-        .into());
+        ));
     }
     if !dims.guidance && case.guidance != 0.0 {
         return Err("the case carries a guidance scale and this row reads no `guidance`".into());

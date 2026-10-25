@@ -46,7 +46,18 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
             Err(error) => return Ok(Err(error)),
         };
 
-    let (float, embed_ids, lanes, kv_reps, rs_reps, cells, accesses, instance_id, scheduler, fwd_rep) = {
+    let (
+        float,
+        embed_ids,
+        lanes,
+        kv_reps,
+        rs_reps,
+        cells,
+        accesses,
+        instance_id,
+        scheduler,
+        fwd_rep,
+    ) = {
         let pass = ctx.resources().get(&fwd)?;
         if let Some(error) = &pass.failed {
             return Ok(Err(format!(
@@ -397,7 +408,11 @@ mod tests {
         let slot = first.slot_ids[0];
         for frame in 2..=3 {
             let next = fire(&mut store, &[ws]);
-            assert_eq!(next.slot_flags, vec![0], "frame {frame} reads what the last left");
+            assert_eq!(
+                next.slot_flags,
+                vec![0],
+                "frame {frame} reads what the last left"
+            );
             assert_eq!(next.slot_ids, vec![slot], "in place, on the same row");
             assert_eq!(store.frozen(ws), Ok(frame));
         }

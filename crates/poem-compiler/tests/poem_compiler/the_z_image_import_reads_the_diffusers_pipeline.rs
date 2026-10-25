@@ -525,8 +525,8 @@ fn the_derived_planes_are_stated_as_constants() {
         expr.visit(&mut |node| found |= matches!(node, Expr::Const { .. }));
         found
     };
-    for bank in ["dit.cap_pad_mod"] {
-        let bank = named(bank);
+    {
+        let bank = named("dit.cap_pad_mod");
         assert!(
             carries_a_constant(&bank.expr),
             "`{}`'s negative half is a constant the contract carries",

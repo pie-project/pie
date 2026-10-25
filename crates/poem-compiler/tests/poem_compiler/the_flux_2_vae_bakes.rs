@@ -242,7 +242,10 @@ fn the_shapes_are_the_flux2_autoencoders() {
     }
     assert_eq!(attentions, 2, "one mid-block attention per reading");
     assert_eq!(upsamples, 3);
-    assert_eq!(copies, 0, "the decode's pack is its fresh copy of the input");
+    assert_eq!(
+        copies, 0,
+        "the decode's pack is its fresh copy of the input"
+    );
     assert_eq!(strided, 3);
     assert_eq!(
         (shuffles, unshuffles),

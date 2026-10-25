@@ -229,8 +229,7 @@ async fn main(input: Input) -> Result<Output> {
             "the case's latent is {} channels wide and reading `{}` reads a {}-channel \
              voxel input",
             case.channels, d.name, d.channels
-        )
-        .into());
+        ));
     }
     let want = (case.h as usize) * (case.w as usize) * (case.channels as usize);
     if case.latent.len() != want {
@@ -240,8 +239,7 @@ async fn main(input: Input) -> Result<Output> {
             case.h,
             case.w,
             case.channels
-        )
-        .into());
+        ));
     }
     // The family's own compression wins when it states one.
     let compression = match model::latent() {
@@ -267,7 +265,7 @@ async fn main(input: Input) -> Result<Output> {
 
     // The answer: one row per OUTPUT voxel, RGB in [-1, 1].
     let out = Channel::new([rows, width], dtype::f32).named("pixels");
-    let readback = out.clone();
+    let readback = out;
     pass.epilogue(move || {
         readback.put(intrinsics::pixels(0, rows, width));
     });

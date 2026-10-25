@@ -129,8 +129,7 @@ fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::La
     if reads != wants {
         return Err(format!(
             "reading `{reading}`'s `{stream}` lane reads {reads:?}; this pass binds {wants:?}"
-        )
-        .into());
+        ));
     }
     Ok(lane)
 }
@@ -186,7 +185,7 @@ fn padded(rows: Option<model::RowCount>, len: u32) -> Result<u32> {
         Some(model::RowCount::Exact(n)) => (len <= n).then_some(n),
         Some(model::RowCount::Multiple(n)) => len.checked_next_multiple_of(n),
     }
-    .ok_or_else(|| format!("{len} caption rows do not fit {rows:?}").into())
+    .ok_or_else(|| format!("{len} caption rows do not fit {rows:?}"))
 }
 
 /// The caption's own row count, as the `length` input reads it.
@@ -271,7 +270,6 @@ fn readout_rows(case: &Case, width: u32) -> Result<u32> {
              whose rows the case must state (`readout_rows`)",
             case.channels
         )
-        .into()
     })
 }
 
@@ -404,7 +402,7 @@ async fn text(prompt: &str, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
     pass.embed(&toks, &embed_indptr)?;
     pass.readout(&readout)?;
     pass.state(&[&ws], StateGeometry::default())?;
-    let readback = out.clone();
+    let readback = out;
     pass.epilogue(move || {
         readback.put(intrinsics::hidden(0, len, width));
     });
@@ -444,7 +442,7 @@ async fn main(input: Input) -> Result<Output> {
     for i in 0.. {
         match input.pieces.get(&format!("case_{i}")) {
             Some(inferlet::serde_json::Value::String(piece)) => pieces.push_str(piece),
-            Some(other) => return Err(format!("`case_{i}` is not a string: {other}").into()),
+            Some(other) => return Err(format!("`case_{i}` is not a string: {other}")),
             None => break,
         }
     }
@@ -461,9 +459,9 @@ async fn main(input: Input) -> Result<Output> {
         inferlet::serde_json::from_str(&json).map_err(|why| format!("case json: {why}"))?;
     let check = |what: &str, have: usize, want: u32| -> Result<()> {
         if have != want as usize {
-            return Err(
-                format!("`{what}` carries {have} numbers, the case's shape wants {want}").into(),
-            );
+            return Err(format!(
+                "`{what}` carries {have} numbers, the case's shape wants {want}"
+            ));
         }
         Ok(())
     };
@@ -489,15 +487,13 @@ async fn main(input: Input) -> Result<Output> {
                 return Err(format!(
                     "the encoder writes {width}-wide rows and the case's caption is {} wide",
                     case.caption_width
-                )
-                .into());
+                ));
             }
             if len != case.caption_rows {
                 return Err(format!(
                     "the prompt renders to {len} tokens and the case's caption is {} rows",
                     case.caption_rows
-                )
-                .into());
+                ));
             }
             case.caption.copy_from_slice(&rows);
             (rows, len, width)

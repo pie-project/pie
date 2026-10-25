@@ -231,7 +231,6 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
             payload: vec![0.25; (2 * 4 * C) as usize],
         },
     ];
-    let mut next = 1u64;
     let mut readers = Vec::new();
     let mut attachments = Vec::new();
     for (at, lane) in lanes.iter().enumerate() {
@@ -263,8 +262,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
                 ..Default::default()
             })
             .expect("the program registers");
-        let channel = engine::ChannelId(next);
-        next += 1;
+        let channel = engine::ChannelId(at as u64 + 1);
         engine
             .register_channel(&engine::channel::ChannelRegistration {
                 id: channel,

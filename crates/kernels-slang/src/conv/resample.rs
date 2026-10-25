@@ -88,6 +88,7 @@ pub fn upsample_nearest(
 
 /// Channel blocks of `r[0] r[1] r[2]` spread into time and space, the
 /// first `trim_t` frames dropped. `bases`: see [`fire`].
+#[allow(clippy::too_many_arguments)]
 pub fn pixel_shuffle(
     ctx: &Ctx<'_>,
     x: Tensor,

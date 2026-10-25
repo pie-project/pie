@@ -262,7 +262,8 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
                 lanes.push((vae, None, false));
             }
         }
-        let mut seen: Vec<((&str, Option<&str>, bool), usize)> = Vec::new();
+        type Lane<'a> = (&'a str, Option<&'a str>, bool);
+        let mut seen: Vec<(Lane, usize)> = Vec::new();
         for (reading, stream, fresh) in lanes {
             let w = fresh_word(&plan, reading, stream, fresh);
             let class = classes.class_of(w & classes.mask).unwrap_or_else(|| {
