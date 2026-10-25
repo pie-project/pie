@@ -665,7 +665,7 @@ def video_positions(rows, m):
     given = switch_is("positions", "given")
     stated = rows.on(given).input("positions", dtype.f32, "row", m.rope_axes)
     rows = rows.on(~given)
-    cells = ops.conv.cells(rows.token_grid(PATCH), rows.positions(), 0)
+    cells, _ = ops.gather.split_rows(ops.conv.cells(rows.token_grid(PATCH), rows.positions(), 0), 3)
     t, hw = ops.gather.split_rows(cells, 1)
     c = m.rope
     span = causal_mid(t, VAE_TEMPORAL_COMPRESSION, c.video_start, c.video_end)

@@ -861,10 +861,10 @@ impl Dit {
             // A lane whose class reads no token grid is one row (a VAE's).
             if seat.token_patch.is_some()
                 && row.rows != 1
-                && token_row != i64::from(row.row_offset) + i64::from(row.rows)
+                && token_row > i64::from(row.row_offset) + i64::from(row.rows)
             {
                 return Err(program(format!(
-                    "lane {}: its {} token rows are not its clips' token count",
+                    "lane {}: its {} token rows are fewer than its clips' patches",
                     row.source, row.rows
                 )));
             }

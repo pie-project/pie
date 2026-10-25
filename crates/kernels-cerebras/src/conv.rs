@@ -24,7 +24,8 @@ fn table(op: &'static str, what: &str, grid: Tensor) -> Result<u32, Error> {
 }
 
 /// Each token row's cell (`conv.cells`): a row of a clip of `tgrid` its
-/// patch's `(t, h, w)` there, any other row `positions[row]` in column
+/// patch's `(t, h, w)` there and the clip's size in the last three
+/// columns, any other row `positions[row]` in column
 /// `axis`; zeros elsewhere. `base` is the row `tgrid` addresses `y`'s row 0
 /// at, nonzero in a window of a segmented fire.
 pub fn cells(
@@ -39,13 +40,13 @@ pub fn cells(
     let clips = table(OP, "token", tgrid)?;
     expect(OP, positions, &[Dtype::I32])?;
     if y.dtype != Dtype::F32
-        || y.width != axis.max(2) + 1
+        || y.width != axis.max(2) + 4
         || positions.elements() < u64::from(y.rows)
     {
         return Err(refuse(
             OP,
             format!(
-                "the cells are {}x{} {:?} over {} positions; max(3, {axis} + 1) f32 columns, a \
+                "the cells are {}x{} {:?} over {} positions; max(3, {axis} + 1) + 3 f32 columns, a \
                  position a row",
                 y.rows,
                 y.width,
@@ -68,6 +69,51 @@ pub fn cells(
             axis,
             width,
             base,
+        });
+        Ok(())
+    })
+}
+
+/// Each row's peer value: `x`'s first packed row in its lane's group
+/// (`gather.group_first`).
+pub fn group_first(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    csr: Tensor,
+    groups: Tensor,
+    lanes: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "gather.group_first";
+    for t in [csr, groups, lanes] {
+        expect(OP, t, &[Dtype::I32])?;
+    }
+    expect(OP, x, &[Dtype::F32])?;
+    if y.dtype != Dtype::F32 || y.width != x.width || csr.elements() == 0 {
+        return Err(refuse(
+            OP,
+            "the rows are as many f32 columns as the packed rows, over an indptr",
+        ));
+    }
+    let (rows, width, x_rows) = (y.rows, y.width, x.rows);
+    let (csr_len, lane_count) = (csr.rows, groups.rows);
+    ctx.emit(&mut |cx| {
+        let xb = cx.read(x)?;
+        let cb = cx.read(csr)?;
+        let gb = cx.read(groups)?;
+        let lb = cx.read(lanes)?;
+        let yb = cx.write(y)?;
+        cx.host(HostOp::GroupFirst {
+            x: xb.name,
+            csr: cb.name,
+            groups: gb.name,
+            lanes: lb.name,
+            y: yb.name,
+            csr_len,
+            lane_count,
+            rows,
+            width,
+            x_rows,
         });
         Ok(())
     })

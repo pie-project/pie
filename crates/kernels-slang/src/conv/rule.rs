@@ -143,8 +143,9 @@ pub fn derive_grid(
 const CELLS: &str = "conv/cells.slang";
 
 /// Each token row's cell (`ops::conv::cells`): a row of a clip of `tgrid`
-/// its patch's `(t, h, w)` there, any other row `positions[row]` in column
-/// `axis`; zeros elsewhere. `base` is the row `tgrid` addresses `y`'s row 0
+/// its patch's `(t, h, w)` there and the clip's size in the last three
+/// columns, any other row `positions[row]` in column `axis`; zeros
+/// elsewhere. `base` is the row `tgrid` addresses `y`'s row 0
 /// at, nonzero in a window of a segmented fire.
 pub fn cells(
     ctx: &Ctx<'_>,
@@ -159,11 +160,12 @@ pub fn cells(
         || tgrid.width != 4
         || positions.dtype != Dtype::I32
         || y.dtype != Dtype::F32
-        || y.width != axis.max(2) + 1
+        || y.width != axis.max(2) + 4
     {
         return Err(refuse(
             OP,
-            "the token grid is [clips, 4] i32, the positions i32 and the cells three f32 columns",
+            "the token grid is [clips, 4] i32, the positions i32 and the cells max(3, axis + 1) \
+             + 3 f32 columns",
         ));
     }
     if y.rows == 0 {
@@ -180,6 +182,48 @@ pub fn cells(
             y.width.arg(),
             y.rows.arg(),
             base.arg(),
+        ],
+    )
+}
+
+/// Each row's peer value: `x`'s first packed row in its lane's group
+/// (`ops::gather::group_first`).
+pub fn group_first(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    csr: Tensor,
+    groups: Tensor,
+    lanes: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "gather.group_first";
+    if [csr.dtype, groups.dtype, lanes.dtype] != [Dtype::I32; 3]
+        || x.dtype != Dtype::F32
+        || y.dtype != Dtype::F32
+        || y.width != x.width
+        || csr.rows == 0
+    {
+        return Err(refuse(
+            OP,
+            "the tables are i32 and the rows as many f32 columns as the packed rows",
+        ));
+    }
+    if y.rows == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        Fire::at(CELLS, "conv_cells_group_first").apply(Grid::of([y.rows, 1, 1], [64, 1, 1])),
+        &[
+            x.arg(),
+            csr.arg(),
+            groups.arg(),
+            lanes.arg(),
+            y.arg_mut(),
+            y.width.arg(),
+            x.rows.arg(),
+            groups.rows.arg(),
+            (csr.rows - 1).arg(),
+            y.rows.arg(),
         ],
     )
 }

@@ -73,9 +73,10 @@ WHAT THE HARNESS CONVERTS
   its own row count as `length`; the family turns each pad row into
   `cap_pad_token` at rotary `(0, 0, 0)`, attended like any other, and the
   image follows at `L32 + 1`. The refined caption comes back over the padded
-  rows, as the golden's. An image whose patch count is not a multiple of 32
-  is still NOT padded (the reference pads it with `x_pad_token`), so such a
-  shape is a different forward from the reference's;
+  rows, as the golden's. An image lane's token rows are its patches rounded
+  up to the multiple of 32 its `latents` input states: the runtime adds the
+  pad rows, and the family turns them into `x_pad_token` at `(0, 0, 0)`
+  (`--mode mini_pad`: a 48-patch image and a 40-row caption, both padded);
 * a tapped mode (`full`, `crop`, `tiny`) reads an intermediate out on the
   token rows, which the case states (`readout_rows`), in diffusers'
   `_patchify_image` feature order `(pf, ph, pw, c)`;
@@ -125,6 +126,7 @@ MINI_DEPLOYMENT = "z-image-mini-bf16-kv-bf16"
 TURBO_DEPLOYMENT = "z-image-turbo-bf16-kv-bf16"
 MODES = {
     "mini": keyed("zimage_mini.npz", "mini.in.", "mini.out.0", MINI_DEPLOYMENT),
+    "mini_pad": keyed("zimage_mini_pad.npz", "mini_pad.in.", "mini_pad.out.0", MINI_DEPLOYMENT),
     "turbo": keyed("zimage_golden.npz", "dit.step0.in.", "dit.step0.out.0", TURBO_DEPLOYMENT),
     "text": keyed("zimage_golden.npz", "dit.step0.in.", PROMPT_KEY, TURBO_DEPLOYMENT),
     "chain": keyed("zimage_golden.npz", "dit.step0.in.", "dit.step0.out.0", TURBO_DEPLOYMENT),
@@ -138,7 +140,8 @@ MODES = {
 MODES["steps"] = keyed("zimage_golden.npz", "dit.step0.in.", "latent.final", TURBO_DEPLOYMENT)
 for _mode in ("turbo", "text", "chain", "steps"):
     MODES[_mode].update(x="dit.step0.in.arg0.0", cap="dit.step0.in.arg2.0", t="dit.step0.in.arg1")
-TOLERANCES.update(full=TOLERANCES["turbo"], crop=TOLERANCES["turbo"], tiny=TOLERANCES["turbo"])
+TOLERANCES.update(full=TOLERANCES["turbo"], crop=TOLERANCES["turbo"], tiny=TOLERANCES["turbo"],
+                  mini_pad=TOLERANCES["mini"])
 TOLERANCES["steps"] = ["--rel-tol", "0.15", "--cos-tol", "0.995"]
 
 def floats(arr: np.ndarray) -> list[str]:

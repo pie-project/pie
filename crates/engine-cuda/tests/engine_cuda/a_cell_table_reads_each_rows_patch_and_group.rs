@@ -1,8 +1,9 @@
 #![cfg(feature = "device")]
 
-//! `conv::cells` and `gather::group_rows` through the engine against a host
-//! reference: two requests, each a text lane of plain rows and an image lane
-//! of one clip patched `[1, 2, 2]`, read back off the velocity seam.
+//! `conv::cells`, `gather::group_rows` and `gather::group_first` through the
+//! engine against a host reference: two requests, each a text lane of plain
+//! rows and an image lane of one clip patched `[1, 2, 2]`, read back off the
+//! velocity seam.
 
 use engine::Engine;
 use engine::fire::{FrameSubmission, Lane, Readout, Step, StepVoxels};
@@ -24,7 +25,9 @@ use eta_ir::validate::bind;
 
 const C: u32 = 4;
 const P: [u32; 3] = [1, 2, 2];
-const WIDTH: u32 = 3 + 4 + 1 + 1;
+/// `[cells axis 0 (3 + size) | cells axis 3 (4 + size) | group rows | the
+/// group's image cell (3 + size)]`.
+const WIDTH: u32 = 6 + 7 + 1 + 6;
 
 struct Cells;
 
@@ -51,7 +54,14 @@ impl ForwardHybrid for Cells {
             &inputs.group_of_lane(),
             &inputs.request_of_token(),
         );
-        let out = ops::gather::concat_cols(&[&first, &fourth, &groups, &groups]);
+        let own = ops::conv::cells(&img.token_grid(P), &img.positions(), 0);
+        let peer = ops::gather::group_first(
+            &ops::gather::pack_rows(&own, &img.row_permutation()),
+            &img.group_indptr(),
+            &inputs.group_of_lane(),
+            &inputs.request_of_token(),
+        );
+        let out = ops::gather::concat_cols(&[&first, &fourth, &groups, &peer]);
         seam::at(seam::VELOCITY, &[&out]);
         let back = ops::conv::unpatchify(&patched, &img.token_grid(P), P, &grid);
         let (pixels, pixel_grid) = ops::conv::upsample_nearest(&back, &grid, [1, 1, 1], false);
@@ -90,42 +100,59 @@ fn epilogue(rows: u32) -> TraceContainer {
     }
 }
 
-/// One row's want: `[cells axis 0 | cells axis 3 | group rows | group rows]`.
-fn want_row(cell: Option<[u32; 3]>, position: u32, group_rows: u32) -> Vec<f32> {
+/// The token grid of `clip`.
+fn grid_of(clip: [u32; 3]) -> [u32; 3] {
+    [clip[0] / P[0], clip[1] / P[1], clip[2] / P[2]]
+}
+
+/// One row's want: its cell and clip size (a clip's row) or position, its
+/// group's rows and its group's image's first cell and size.
+fn want_row(
+    cell: Option<([u32; 3], [u32; 3])>,
+    position: u32,
+    group_rows: u32,
+    peer: [u32; 3],
+) -> Vec<f32> {
     let mut row = vec![0f32; WIDTH as usize];
     match cell {
-        Some([t, h, w]) => {
+        Some(([t, h, w], size)) => {
             for (at, v) in [t, h, w].into_iter().enumerate() {
                 row[at] = v as f32;
+                row[6 + at] = v as f32;
+            }
+            for (at, v) in size.into_iter().enumerate() {
                 row[3 + at] = v as f32;
+                row[6 + 4 + at] = v as f32;
             }
         }
         None => {
             row[0] = position as f32;
-            row[3 + 3] = position as f32;
+            row[6 + 3] = position as f32;
         }
     }
-    row[7] = group_rows as f32;
-    row[8] = group_rows as f32;
+    row[13] = group_rows as f32;
+    for (at, v) in peer.into_iter().enumerate() {
+        row[14 + 3 + at] = v as f32;
+    }
     row
 }
 
 fn image_want(clip: [u32; 3], group_rows: u32) -> Vec<f32> {
-    let [t, h, w] = [clip[0] / P[0], clip[1] / P[1], clip[2] / P[2]];
+    let size = grid_of(clip);
     let mut out = Vec::new();
-    for a in 0..t {
-        for b in 0..h {
-            for c in 0..w {
-                out.extend(want_row(Some([a, b, c]), 0, group_rows));
+    for a in 0..size[0] {
+        for b in 0..size[1] {
+            for c in 0..size[2] {
+                out.extend(want_row(Some(([a, b, c], size)), 0, group_rows, size));
             }
         }
     }
     out
 }
 
-fn text_want(rows: u32, group_rows: u32) -> Vec<f32> {
+fn text_want(rows: u32, group_rows: u32, peer: [u32; 3]) -> Vec<f32> {
     (0..rows)
-        .flat_map(|j| want_row(None, j, group_rows))
+        .flat_map(|j| want_row(None, j, group_rows, peer))
         .collect()
 }
 
@@ -300,10 +327,10 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
 
     let group = |g: usize| text_rows[g] + tokens(clips[g]);
     let want = [
-        text_want(text_rows[0], group(0)),
+        text_want(text_rows[0], group(0), grid_of(clips[0])),
         image_want(clips[0], group(0)),
         image_want(clips[1], group(1)),
-        text_want(text_rows[1], group(1)),
+        text_want(text_rows[1], group(1), grid_of(clips[1])),
     ];
     let mut worst = 0f32;
     for (lane, (values, want)) in got.iter().zip(&want).enumerate() {
@@ -319,5 +346,5 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
             );
         }
     }
-    eprintln!("cells and group rows: max |err| {worst}");
+    eprintln!("cells, group rows and group first: max |err| {worst}");
 }

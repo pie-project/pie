@@ -335,8 +335,9 @@ pub fn derive_grid(
 }
 
 /// Each token row's cell (`ops::conv::cells`): a row of a clip of `tgrid`
-/// its patch's `(t, h, w)` there, any other row `positions[row]` in column
-/// `axis`; zeros elsewhere. `base` is the fire row `y`'s row 0 stands at.
+/// its patch's `(t, h, w)` there and the clip's size in the last three
+/// columns, any other row `positions[row]` in column `axis`; zeros
+/// elsewhere. `base` is the fire row `y`'s row 0 stands at.
 pub fn cells(
     ctx: &Ctx,
     tgrid: Tensor,
@@ -351,12 +352,12 @@ pub fn cells(
     }
     // A fire of no clips stages none: every row reads its position.
     let clips = stated(OP, tgrid.rows)?;
-    if positions.dtype != Dtype::I32 || y.dtype != Dtype::F32 || y.width != axis.max(2) + 1 {
+    if positions.dtype != Dtype::I32 || y.dtype != Dtype::F32 || y.width != axis.max(2) + 4 {
         return Err(refuse(
             OP,
             format!(
                 "the positions are {:?} and the cells {} x {:?}; this reads i32 positions and \
-                 writes max(3, {axis} + 1) f32 columns",
+                 writes max(3, {axis} + 1) + 3 f32 columns",
                 positions.dtype, y.width, y.dtype
             ),
         ));
@@ -380,6 +381,55 @@ pub fn cells(
             stated(OP, y.width)?.arg(),
             stated(OP, rows)?.arg(),
             stated(OP, base)?.arg(),
+        ],
+    )
+}
+
+/// Each row's peer value: `x`'s first packed row in its lane's group
+/// (`ops::gather::group_first`).
+pub fn group_first(
+    ctx: &Ctx,
+    x: Tensor,
+    csr: Tensor,
+    groups: Tensor,
+    lanes: Tensor,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "gather.group_first";
+    if [csr.dtype, groups.dtype, lanes.dtype] != [Dtype::I32; 3]
+        || x.dtype != Dtype::F32
+        || y.dtype != Dtype::F32
+        || y.width != x.width
+    {
+        return Err(refuse(
+            OP,
+            "the tables are i32 and the rows as many f32 columns as the packed rows",
+        ));
+    }
+    if lanes.rows < y.rows || csr.rows == 0 {
+        return Err(refuse(
+            OP,
+            format!(
+                "{} row lanes for {} rows over a {}-entry indptr",
+                lanes.rows, y.rows, csr.rows
+            ),
+        ));
+    }
+    let rows = nonzero(OP, "rows", y.rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(POSENC, "::pie::elemwise::group_first")).apply(Launch::flat(rows, BLOCK)),
+        &[
+            x.arg(),
+            csr.arg(),
+            groups.arg(),
+            lanes.arg(),
+            y.arg(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, x.rows)?.arg(),
+            stated(OP, groups.rows)?.arg(),
+            stated(OP, csr.rows - 1)?.arg(),
+            stated(OP, rows)?.arg(),
         ],
     )
 }

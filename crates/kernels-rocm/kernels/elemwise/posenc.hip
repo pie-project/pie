@@ -180,6 +180,35 @@ __global__ __launch_bounds__(256) void cells(
     o[0] = static_cast<float>(v.t);
     o[1] = static_cast<float>(v.h);
     o[2] = static_cast<float>(v.w);
+    // The clip's size in patches, in the last three columns.
+    o[width - 3] = static_cast<float>(g.t);
+    o[width - 2] = static_cast<float>(g.h);
+    o[width - 1] = static_cast<float>(g.w);
+}
+
+// Each row's peer value: packed row `csr[g]` of `x` for its lane's group
+// `g`, zeros where the group packs none.
+__global__ __launch_bounds__(256) void group_first(
+    const float* __restrict__ x,
+    const int* __restrict__ csr,
+    const int* __restrict__ groups,
+    const int* __restrict__ lanes,
+    float* __restrict__ y,
+    int width,
+    int x_rows,
+    int lane_count,
+    int group_count,
+    int rows)
+{
+    const int row = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    const int l = lanes[row];
+    const int g = (l >= 0 && l < lane_count) ? groups[l] : -1;
+    const int at = (g >= 0 && g < group_count && csr[g + 1] > csr[g]) ? csr[g] : -1;
+    float* o = y + static_cast<long long>(width) * row;
+    for (int c = 0; c < width; ++c) {
+        o[c] = (at >= 0 && at < x_rows) ? x[static_cast<long long>(width) * at + c] : 0.0f;
+    }
 }
 
 // Each row's count of the rows `csr` packs in its lane's group.

@@ -2213,6 +2213,23 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "gather",
+        name: "group_first",
+        params: &["x", "csr", "groups", "lanes"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let csr: Value = a.next()?;
+            let groups: Value = a.next()?;
+            let lanes: Value = a.next()?;
+            result(
+                heap,
+                dsl("gather.group_first", || {
+                    ops::gather::group_first(&x, &csr, &groups, &lanes)
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "gather",
         name: "select",
         params: &["table", "layer", "width"],
         call: |a, heap| {

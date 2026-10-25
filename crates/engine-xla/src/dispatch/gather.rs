@@ -296,6 +296,28 @@ impl Run<'_> {
                 )?;
                 l.land(o_y, v)
             }),
+            Gather::GroupFirst {
+                x,
+                csr,
+                groups,
+                lanes,
+                y,
+            } => crate::lower::lower(self.ctx(), |l| {
+                let x_v = l.read(self.tensor(*x))?;
+                let csr_v = l.read(self.tensor(*csr))?;
+                let groups_v = l.read(self.tensor(*groups))?;
+                let lanes_v = l.read(self.tensor(*lanes))?;
+                let o_y = self.tensor(*y);
+                let v = kernels_xla::conv::rule::group_first(
+                    l.f(),
+                    x_v,
+                    csr_v,
+                    groups_v,
+                    lanes_v,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            }),
             Gather::ConcatCols { xs, y } => crate::lower::lower(self.ctx(), |l| {
                 let mut vals = Vec::with_capacity(xs.len());
                 for x in xs {

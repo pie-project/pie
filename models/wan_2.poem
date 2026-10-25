@@ -746,7 +746,7 @@ def turn_positions(arm, m):
     """Each row's rope position: a video row its patch's `(t, h, w)` in its
     clip. A lane whose `positions` switch says `given` reads the guest's."""
     given = switch_is("positions", "given")
-    computed = ops.conv.cells(arm.token_grid(PATCH), arm.positions(), 0)
+    computed, _ = ops.gather.split_rows(ops.conv.cells(arm.token_grid(PATCH), arm.positions(), 0), 3)
     return merge([arm.on(given).input("positions", dtype.f32, "row", m.rope_axes), computed.on(~given)])
 
 def denoise(arm, m):

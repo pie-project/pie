@@ -112,10 +112,10 @@ fn per_row(f: &mut Func, v: Val, rows: i64) -> Result<Val, Error> {
     Ok(f.slice_axis(flat, 0, 0, rows)?)
 }
 
-/// Each token row's cell, `[rows, max(3, axis + 1)]` f32
+/// Each token row's cell, `[rows, max(3, axis + 1) + 3]` f32
 /// (`ops::conv::cells`): a row of a clip of `tgrid` its patch's `(t, h, w)`
-/// there, any other row `positions[row]` in column `axis`; zeros
-/// elsewhere. `base` is the row `tgrid` addresses `y`'s row 0 at.
+/// there and the clip's size in the last three columns, any other row
+/// `positions[row]` in column `axis`; zeros elsewhere. `base` is the row `tgrid` addresses `y`'s row 0 at.
 /// kernels-cuda `elemwise::posenc::cells`.
 pub fn cells(
     f: &mut Func,
@@ -126,11 +126,11 @@ pub fn cells(
     base: u32,
 ) -> Result<Val, Error> {
     const OP: &str = "conv.cells";
-    if y.width != axis.max(2) + 1 || positions.rows < y.rows {
+    if y.width != axis.max(2) + 4 || positions.rows < y.rows {
         return Err(crate::error::refuse(
             OP,
             format!(
-                "{} cell columns over {} positions for {} rows; a cell is max(3, axis + 1) \
+                "{} cell columns over {} positions for {} rows; a cell is max(3, axis + 1) + 3 \
                  columns and each row reads its position",
                 y.width, positions.rows, y.rows
             ),
@@ -142,11 +142,15 @@ pub fn cells(
     let pos = per_row(f, positions.val, rows)?;
     let zero = k(f, at.v.t, 0);
     let mut cols = Vec::new();
+    let size = y.width - 3;
     for c in 0..y.width {
         let inside = match c {
             0 => at.v.t,
             1 => at.v.h,
             2 => at.v.w,
+            c if c == size => at.b.t,
+            c if c == size + 1 => at.b.h,
+            c if c == size + 2 => at.b.w,
             _ => zero,
         };
         let outside = if c == axis { pos } else { zero };
@@ -155,6 +159,64 @@ pub fn cells(
         cols.push(f.reshape(c, &[rows, 1])?);
     }
     Ok(f.concat(&cols, 1)?)
+}
+
+/// Each row's peer value, `[rows, x.width]` f32 (`ops::gather::group_first`):
+/// row `csr[g]` of the packed `x` for `g = groups[lanes[row]]`, zeros where
+/// the group packs none. kernels-cuda `elemwise::posenc::group_first`.
+pub fn group_first(
+    f: &mut Func,
+    x: Operand,
+    csr: Operand,
+    groups: Operand,
+    lanes: Operand,
+    y: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "gather.group_first";
+    if y.width != x.width || lanes.rows < y.rows || csr.rows == 0 {
+        return Err(crate::error::refuse(
+            OP,
+            "as many columns as the packed rows, a lane for each row and an indptr",
+        ));
+    }
+    let rows = i64::from(y.rows);
+    let width = i64::from(y.width);
+    let lane_count = i64::from(groups.rows);
+    let groups_v = per_row(f, groups.val, lane_count)?;
+    let csr_v = per_row(f, csr.val, i64::from(csr.rows))?;
+    let lane = per_row(f, lanes.val, rows)?;
+    let lo = cmp_k(f, Cmp::Ge, lane, 0)?;
+    let hi = cmp_k(f, Cmp::Lt, lane, lane_count)?;
+    let ok = f.and(lo, hi)?;
+    let zero = k(f, lane, 0);
+    let lane = f.select(ok, lane, zero)?;
+    let g = super::take1(f, groups_v, lane)?;
+    let glo = cmp_k(f, Cmp::Ge, g, 0)?;
+    let ghi = cmp_k(f, Cmp::Lt, g, i64::from(csr.rows) - 1)?;
+    let gok = f.and(glo, ghi)?;
+    let ok = f.and(ok, gok)?;
+    let gz = k(f, g, 0);
+    let g = f.select(ok, g, gz)?;
+    let g1 = add_k(f, g, 1)?;
+    let a = super::take1(f, csr_v, g)?;
+    let b = super::take1(f, csr_v, g1)?;
+    let some = f.compare(Cmp::Gt, b, a)?;
+    let ok = f.and(ok, some)?;
+    let x_rows = i64::from(x.rows);
+    let zeros = f.const_f(Elem::F32, 0.0, &[rows, width]);
+    if x_rows == 0 {
+        return Ok(zeros);
+    }
+    let inside = cmp_k(f, Cmp::Lt, a, x_rows)?;
+    let ok = f.and(ok, inside)?;
+    let az = k(f, a, 0);
+    let a = f.select(ok, a, az)?;
+    let table = f.reshape(x.val, &[x_rows, width])?;
+    let picked = f.take_rows(table, a)?;
+    let picked = f.convert(picked, Elem::F32);
+    let ok = f.reshape(ok, &[rows, 1])?;
+    let ok = f.broadcast(ok, &[rows, width], &[0, 1])?;
+    Ok(f.select(ok, picked, zeros)?)
 }
 
 /// Each row's count of the rows `csr` packs in its lane's group, `[rows,

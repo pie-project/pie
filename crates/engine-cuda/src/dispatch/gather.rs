@@ -302,6 +302,20 @@ impl Run<'_> {
                 self.tensor(*lanes),
                 &mut self.tensor(*y),
             ),
+            Gather::GroupFirst {
+                x,
+                csr,
+                groups,
+                lanes,
+                y,
+            } => kernels_cuda::elemwise::posenc::group_first(
+                self.ctx(),
+                self.tensor(*x),
+                self.tensor(*csr),
+                self.tensor(*groups),
+                self.tensor(*lanes),
+                &mut self.tensor(*y),
+            ),
             Gather::ConcatCols { xs, y } => {
                 let xs: Vec<_> = xs.iter().map(|x| self.tensor(*x)).collect();
                 kernels_cuda::gather::concat_cols(self.ctx(), &xs, &mut self.tensor(*y))

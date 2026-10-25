@@ -2760,7 +2760,7 @@ impl Shell {
                             .ok_or_else(|| token_refusal(row.source))?;
                     }
                 }
-                if seat.token_patch.is_some() && token_row != row.row_offset + row.rows {
+                if seat.token_patch.is_some() && token_row > row.row_offset + row.rows {
                     return Err(token_refusal(row.source));
                 }
                 if !tile.payload.is_empty() {

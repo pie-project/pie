@@ -495,6 +495,11 @@ pub fn render(r: &Rendered) -> String {
                     "kind": "group_rows", "csr": csr, "groups": groups, "lanes": lanes, "y": y,
                     "csr_len": csr_len, "lane_count": lane_count, "rows": rows,
                 }),
+                HostOp::GroupFirst { x, csr, groups, lanes, y, csr_len, lane_count, rows, width, x_rows } => serde_json::json!({
+                    "kind": "group_first", "x": x, "csr": csr, "groups": groups, "lanes": lanes,
+                    "y": y, "csr_len": csr_len, "lane_count": lane_count, "rows": rows,
+                    "width": width, "x_rows": x_rows,
+                }),
                 HostOp::Patch { x, grid, y, o_grid, clips, rows, channels, p, fold, bases } => serde_json::json!({
                     "kind": "patch", "x": x, "grid": grid, "y": y, "o_grid": o_grid,
                     "clips": clips, "rows": rows, "channels": channels,
@@ -894,6 +899,18 @@ pub fn unrender(text: &str) -> Option<Rendered> {
                             csr_len: u("csr_len")?,
                             lane_count: u("lane_count")?,
                             rows: u("rows")?,
+                        },
+                        "group_first" => HostOp::GroupFirst {
+                            x: s("x")?,
+                            csr: s("csr")?,
+                            groups: s("groups")?,
+                            lanes: s("lanes")?,
+                            y: s("y")?,
+                            csr_len: u("csr_len")?,
+                            lane_count: u("lane_count")?,
+                            rows: u("rows")?,
+                            width: u("width")?,
+                            x_rows: u("x_rows")?,
                         },
                         "patch" => HostOp::Patch {
                             x: s("x")?,

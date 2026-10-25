@@ -452,11 +452,12 @@ pub fn unpatchify(x: &Value, tgrid: &Value, p: [u32; 3], grid: &Value) -> Value 
     y
 }
 
-/// Each token row's cell, `[Tokens, max(3, axis + 1)]` f32: a row of a
-/// clip of the token grid `tgrid` reads its patch's `(t, h, w)` in that
+/// Each token row's cell, `[Tokens, max(3, axis + 1) + 3]` f32: a row of
+/// a clip of the token grid `tgrid` reads its patch's `(t, h, w)` in that
 /// clip (a clip's rows are its patches in (t, h, w) row-major order from
-/// its first token row), zeros after; any other row reads its runtime
-/// position in column `axis`, zeros elsewhere.
+/// its first token row), zeros after, and the clip's size `(t, h, w)` in
+/// patches in the last three columns; any other row reads its runtime
+/// position in column `axis`, zeros elsewhere (a size of zeros).
 #[must_use]
 pub fn cells(tgrid: &Value, positions: &Value, axis: u32) -> Value {
     expect_grid("`conv::cells`'s token grid", tgrid);
@@ -473,7 +474,7 @@ pub fn cells(tgrid: &Value, positions: &Value, axis: u32) -> Value {
     let r = tgrid.rec();
     let y = r.fresh(tensor(
         positions.rows(),
-        u64::from(axis.max(2) + 1),
+        u64::from(axis.max(2) + 1 + 3),
         Dtype::F32,
     ));
     r.push(

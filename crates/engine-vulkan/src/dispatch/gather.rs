@@ -224,6 +224,20 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
 
+            Gather::GroupFirst {
+                x,
+                csr,
+                groups,
+                lanes,
+                y,
+            } => kernels_slang::conv::rule::group_first(
+                self.ctx,
+                self.tensor(*x),
+                self.tensor(*csr),
+                self.tensor(*groups),
+                self.tensor(*lanes),
+                self.tensor(*y),
+            ),
             Gather::GroupRows {
                 csr,
                 groups,
