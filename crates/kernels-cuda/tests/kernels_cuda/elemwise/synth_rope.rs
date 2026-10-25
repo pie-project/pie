@@ -10,11 +10,11 @@
 //! each head (the row read as its heads, one head's weight across them, or
 //! a row one head wide normed as a row), its row rounded to bf16 as the
 //! norm's plane stores it, then each head turned as the rotation kernels
-//! turn it: `powf` frequencies, the frame's `__sincosf` angles, a column and
+//! turn it: `powf` frequencies, the skeleton's `__sincosf` angles, a column and
 //! its mate (read back through shared memory) landing `a cos ∓ b sin`.
 //!
 //! Each is held to its math by the interpreter (`super::within`): the norm
-//! sums a head in the frame's order, and the turn's angle is the frame's
+//! sums a head in the skeleton's order, and the turn's angle is the skeleton's
 //! `__sincosf`, within [`TURN`] ulps. The ops and the hand fused kernel are
 //! set beside it, not held to it: the hand kernel turns each pair from the
 //! norm's f32 values, not from its rounded row.
@@ -518,7 +518,7 @@ fn a_staged_window_lands_its_rows_alone() {
 
 /// Every case at a decode's, a ragged and a prefill's rows: the generated
 /// kernel against its math by the interpreter, within [`TURN`] (the angle
-/// through the frame's `__sincosf`, a norm's sum in its own order), its
+/// through the skeleton's `__sincosf`, a norm's sum in its own order), its
 /// heads cut from the row or held within it alike, and two fires the same
 /// bits. The ops and the hand fused kernel are shown beside it, not held
 /// to it.

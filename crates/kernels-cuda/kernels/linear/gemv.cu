@@ -4,7 +4,7 @@
 
 namespace pie::linear {
 
-// `gemv_frame`'s dot over a grouped plane at one row: weight row `row` is
+// `gemv_skeleton`'s dot over a grouped plane at one row: weight row `row` is
 // group `row / group_n`'s, against that group's K-wide slice of the row.
 template <int kWarps>
 __global__ void gemv_bf16_grouped_kernel(

@@ -20,8 +20,8 @@ use dtype::Dtype::{Bf16, I32};
 use kernels_cuda::gather;
 use kernels_cuda::jit::Ctx;
 use kernels_cuda::synth::{self, In, Out, Plane, Region, Synthesized};
-use kernels_ir::frame::round_bf16;
 use kernels_ir::interp::Arg;
+use kernels_ir::skeleton::round_bf16;
 use kernels_ir::{Binary, Literal, Op, Shape};
 
 use super::within::{EXACT, assert_within, reference, row_of};
@@ -52,7 +52,7 @@ fn region() -> Region {
 
 fn generated() -> Synthesized {
     let ins = [In::Gathered(Bf16), In::Each(I32), In::Rows(Bf16)];
-    synth::supports(&region(), &ins, &[Out::Rows(Bf16)]).expect("the frame takes the region");
+    synth::supports(&region(), &ins, &[Out::Rows(Bf16)]).expect("the skeleton takes the region");
     let kernel = synth::synth(&region(), &ins, 1).expect("synthesized");
     kernel
         .load()

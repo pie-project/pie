@@ -4,7 +4,7 @@
 
 namespace pie::elemwise {
 
-// A plane a row frame reads or writes: its first element, how far apart
+// A plane a row skeleton reads or writes: its first element, how far apart
 // its rows sit, in elements (0 for one row every row shares, as a norm's
 // weight), the ids its rows are picked by (each row `r` reads the plane's
 // row `ids[r]`, an embedding's; null for row `r`'s own), the vectors of 8
@@ -19,11 +19,11 @@ struct Plane {
     int bound;
 };
 
-// What a row frame fires over: its body's IN parameters and OUT results,
+// What a row skeleton fires over: its body's IN parameters and OUT results,
 // every row `width` wide, `rows` rows; each of the planes' rows cut into
-// `parts` of the frame's (a row of heads, each head its own row), and
+// `parts` of the skeleton's (a row of heads, each head its own row), and
 // `table` floats of shared memory the body tables what a column alone
-// computes in. `kernels_cuda::elemwise::frame` mirrors it.
+// computes in. `kernels_cuda::elemwise::skeleton` mirrors it.
 template <int IN, int OUT>
 struct Planes {
     Plane in[IN];
@@ -43,7 +43,7 @@ constexpr int kI32 = 2;
 // One row of planes held whole in registers: LANES threads a row (BLOCK /
 // LANES rows a block), each holding VECS vectors of 8 elements of each
 // parameter and each result. A body names an element by its index `e` in
-// [0, N), column (lane + (e / 8) * LANES) * 8 + e % 8, and asks the frame
+// [0, N), column (lane + (e / 8) * LANES) * 8 + e % 8, and asks the skeleton
 // for everything else: its parameters' values, where its results go, and
 // the row's sums. Every index a body passes is a constant once its loops
 // unroll, so the arrays live in registers. An element past the row
@@ -53,13 +53,13 @@ constexpr int kI32 = 2;
 // and named `one(k)`; its plane is never read as a row. With `READ_ONLY` no
 // result lands over a parameter, so the parameters are read through the
 // read-only path (`ld.global.nc`), as a hand kernel reads its `const
-// __restrict__` rows; a frame that sums a stream in place (a parameter's
+// __restrict__` rows; a skeleton that sums a stream in place (a parameter's
 // plane also a result's) reads them as plain loads. A row past the fire's
 // (`!live`) computes on garbage beside its block's live rows, through
 // every barrier they meet, and stores nothing.
 template <int BLOCK, int LANES, int VECS, int IN, int OUT, unsigned ONES, unsigned long long DT,
           bool READ_ONLY>
-struct RowFrame {
+struct RowSkeleton {
     static_assert((LANES & (LANES - 1)) == 0 && LANES <= BLOCK && (LANES <= 32 || LANES % 32 == 0),
                   "a row is a power-of-two run of a block's threads");
     static constexpr int PER = VECS;
@@ -85,7 +85,7 @@ struct RowFrame {
 
     __host__ __device__ static constexpr int dtype(int k) { return static_cast<int>((DT >> (2 * k)) & 3ull); }
 
-    // Where the frame's row, part `part` of the planes' row `of`, starts in
+    // Where the skeleton's row, part `part` of the planes' row `of`, starts in
     // `plane`: a row its own (`whole`), or one element.
     __device__ __forceinline__ static long long start_of(const Plane& plane, int of, int part, int width,
                                                          bool whole) {
@@ -99,8 +99,8 @@ struct RowFrame {
     }
 
     // Every parameter's vectors are issued up front, before any body math.
-    __device__ __forceinline__ RowFrame(const Planes<IN, OUT>& planes, int of, int part, bool live,
-                                        float* buf, float* shared)
+    __device__ __forceinline__ RowSkeleton(const Planes<IN, OUT>& planes, int of, int part,
+                                           bool live, float* buf, float* shared)
         : width(planes.width),
           lane(static_cast<int>(threadIdx.x) % LANES),
           group(static_cast<int>(threadIdx.x) / LANES),
@@ -300,14 +300,14 @@ struct RowFrame {
     }
 };
 
-// A row frame of LANES threads a row: `body(f)` computes the row in hooks
+// A row skeleton of LANES threads a row: `body(f)` computes the row in hooks
 // over `f`, its own fields (a norm's eps) passed by value. The rows past a
 // staged window's live count are left as they are. A body that tables its
 // columns' values is fired with `planes.table` floats of dynamic shared
 // memory, and one that shares its row BLOCK * VECS * 8 floats more.
 template <class Body, int BLOCK, int LANES, int VECS, int IN, int OUT, unsigned ONES = 0u,
           unsigned long long DT = 0ull, bool READ_ONLY = false>
-__global__ void __launch_bounds__(BLOCK) row_frame(
+__global__ void __launch_bounds__(BLOCK) row_skeleton(
     const Planes<IN, OUT> planes,
     const Body body,
     const u32* __restrict__ win)
@@ -317,7 +317,7 @@ __global__ void __launch_bounds__(BLOCK) row_frame(
     pdl_wait();
     pdl_launch();
     constexpr int ROWS = BLOCK / LANES;
-    // A staged window's rows are the planes' rows; the frame's are their
+    // A staged window's rows are the planes' rows; the skeleton's are their
     // parts.
     const int live_rows =
         win != nullptr ? min(planes.rows, static_cast<int>(win[0]) * planes.parts) : planes.rows;
@@ -335,8 +335,8 @@ __global__ void __launch_bounds__(BLOCK) row_frame(
 
     __shared__ float buf[VECS * (BLOCK / 32) + 1];
     extern __shared__ float shared[];
-    RowFrame<BLOCK, LANES, VECS, IN, OUT, ONES, DT, READ_ONLY> f(planes, of, part, row < live_rows, buf,
-                                                                 shared);
+    RowSkeleton<BLOCK, LANES, VECS, IN, OUT, ONES, DT, READ_ONLY> f(planes, of, part,
+                                                                    row < live_rows, buf, shared);
     body(f);
 }
 

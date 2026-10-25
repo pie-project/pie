@@ -12,9 +12,9 @@
 //!   Target-neutral: a backend prints it in its language.
 //! - **The schedule** ([`schedule`]): region to kernel, or why the row core
 //!   does not cover a region.
-//! - **The frame** ([`frame`]): the primitives a kernel runs over, a row's
+//! - **The skeleton** ([`skeleton`]): the primitives a kernel runs over, a row's
 //!   loads and stores, a scalar parameter, validity, the reductions over the
-//!   row's threads, the rounding to a narrow dtype. Each backend's frame
+//!   row's threads, the rounding to a narrow dtype. Each backend's skeleton
 //!   provides them; the printers name them.
 //! - **The interpreter** ([`interp`]): both forms on the host, the oracle
 //!   every printed kernel is held to.
@@ -23,16 +23,16 @@
 //! - **The anchored region** ([`anchor`]): a contraction (`y = a · wᵀ`)
 //!   with a region pointwise over its operand tile before it and one over
 //!   its product tile after it, verified to be pointwise there, and its
-//!   interpreter. A backend's contraction frames fill their hooks with the
+//!   interpreter. A backend's contraction skeletons fill their hooks with the
 //!   regions' printed bodies.
 
 pub mod anchor;
 pub mod build;
-pub mod frame;
 pub mod interp;
 pub mod kernel;
 pub mod region;
 pub mod schedule;
+pub mod skeleton;
 
 pub use anchor::{Anchored, Contraction, Input, Layout, Pointwise, Quant, Space};
 pub use kernel::{

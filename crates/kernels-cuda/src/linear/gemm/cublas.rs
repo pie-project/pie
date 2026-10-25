@@ -26,8 +26,10 @@ use cudarc::runtime::sys::{
 
 use crate::jit::device::capture_status;
 use crate::jit::{Ctx, refuse};
-use crate::linear::frame::{Epilogue, Frame, In, LtEpilogue, MAX_INS, MAX_OUTS, ROWS_M, RowLeg};
 use crate::linear::gemv::{gemm_narrow_bf16, gemm_rows_bf16, gemv_bf16, rows_cluster};
+use crate::linear::skeleton::{
+    Epilogue, In, LtEpilogue, MAX_INS, MAX_OUTS, ROWS_M, RowLeg, Skeleton,
+};
 use crate::linear::skinny;
 
 const fn dev(address: u64) -> *const c_void {
@@ -64,7 +66,7 @@ struct Call {
 }
 
 /// An anchored region's planes past the contraction's: its epilogue, its
-/// inputs and results, its unfused leg's row frame where one carries it,
+/// inputs and results, its unfused leg's row skeleton where one carries it,
 /// and the plain product's tactic that leg runs (its `n` every part's).
 #[derive(Clone, Copy, Debug)]
 struct Anchor {
@@ -101,14 +103,14 @@ enum Tactic {
     /// `gemm_rows_bf16`: a few rows in one launch, warps streaming the
     /// weight's rows.
     Rows,
-    /// The skinny frame: up to 64 rows on mma.sync, the weight streamed once
+    /// The skinny skeleton: up to 64 rows on mma.sync, the weight streamed once
     /// past the activation's rows in shared memory.
     Skinny,
-    /// An anchored region fused: a contraction frame with its epilogue
+    /// An anchored region fused: a contraction skeleton with its epilogue
     /// filled in.
-    Frame(Frame),
+    Skeleton(Skeleton),
     /// An anchored region unfused: the plain product's own tactic, then the
-    /// epilogue on the row frame.
+    /// epilogue on the row skeleton.
     Unfused,
     /// An anchored region on cuBLASLt's own epilogue (its
     /// [`Epilogue::lt`]): the plain product's heuristic `index` with it.
@@ -124,11 +126,11 @@ impl Tactic {
             Self::Narrow => (3, 0),
             Self::Rows => (4, 0),
             Self::Skinny => (5, 0),
-            Self::Frame(frame) => (
+            Self::Skeleton(skeleton) => (
                 6,
-                Frame::ALL
+                Skeleton::ALL
                     .iter()
-                    .position(|f| *f == frame)
+                    .position(|f| *f == skeleton)
                     .and_then(|i| i32::try_from(i).ok())
                     .unwrap_or(0),
             ),
@@ -147,8 +149,8 @@ impl Tactic {
             5 => Some(Self::Skinny),
             6 => usize::try_from(algo)
                 .ok()
-                .and_then(|i| Frame::ALL.get(i))
-                .map(|f| Self::Frame(*f)),
+                .and_then(|i| Skeleton::ALL.get(i))
+                .map(|f| Self::Skeleton(*f)),
             7 => Some(Self::Unfused),
             8 => usize::try_from(algo).ok().map(Self::LtEpilogue),
             _ => None,
@@ -275,11 +277,11 @@ pub(crate) fn act_x_wt(
 
 /// `outs = epi(act . w^T)`, an anchored region over a dense bf16 bank of
 /// `parts · n` rows, on whichever of its candidates the shape's timing
-/// picked: each contraction frame that covers it with the epilogue filled
+/// picked: each contraction skeleton that covers it with the epilogue filled
 /// in, and the plain product's own tactic followed by the epilogue on the
-/// row frame where the row frame carries it. Where no frame covers the
+/// row skeleton where the row skeleton carries it. Where no skeleton covers the
 /// shape, or a capture meets it untimed, the unfused leg serves it untimed;
-/// false, landing nothing, only where the row frame does not carry that
+/// false, landing nothing, only where the row skeleton does not carry that
 /// leg either: the caller's unfused ops then serve it.
 pub(crate) fn anchored(
     ctx: &Ctx,
@@ -297,11 +299,11 @@ pub(crate) fn anchored(
         return Ok(false);
     }
     let tuning = ctx.tuning();
-    let frames: Vec<Frame> = Frame::ALL
+    let skeletons: Vec<Skeleton> = Skeleton::ALL
         .into_iter()
         .filter(|f| f.covers(epi, m, n, k, &tuning))
         .collect();
-    if frames.is_empty() && epi.lt().is_none() {
+    if skeletons.is_empty() && epi.lt().is_none() {
         return unfused(ctx, op, epi, act, w, ins, outs, m, n, k);
     }
     let mut anchor = Anchor {
@@ -319,9 +321,9 @@ pub(crate) fn anchored(
     let handle: cublasHandle_t = ctx.cublas(op)?.cast::<cublasContext>();
     let stream = ctx.stream();
     let capturing = capture_status(stream);
-    let covering = frames
+    let covering = skeletons
         .iter()
-        .map(|f| Frame::ALL.iter().position(|g| g == f).unwrap_or(0))
+        .map(|f| Skeleton::ALL.iter().position(|g| g == f).unwrap_or(0))
         .fold(0u64, |mask, i| mask | 1 << i);
     let chosen = with_device(|device| {
         device.configure(
@@ -342,7 +344,7 @@ pub(crate) fn anchored(
             k,
             anchor: None,
         };
-        // The candidates key it: the frames that cover the shape, and
+        // The candidates key it: the skeletons that cover the shape, and
         // whether cuBLASLt's own epilogue is one.
         let key = shape_key(call, device.lt.workspace_bytes, device.heuristics, 0, 0)
             ^ epi.hash().rotate_left(17)
@@ -378,7 +380,7 @@ pub(crate) fn anchored(
             return (None, planned(device), lt);
         }
         // The unfused leg: the plain product's tactic, timed (or read) as
-        // the plain product's own, then the row frame.
+        // the plain product's own, then the row skeleton.
         let plan = device.plan_for(plain);
         anchor.leg = RowLeg::of(epi, n.unsigned_abs());
         if anchor.leg.is_some() && epi.rounds() {
@@ -388,7 +390,7 @@ pub(crate) fn anchored(
         if anchor.leg.is_some() && (anchor.inner.is_some() || !epi.rounds()) {
             candidates.push(Tactic::Unfused);
         }
-        candidates.extend(frames.iter().map(|f| Tactic::Frame(*f)));
+        candidates.extend(skeletons.iter().map(|f| Tactic::Skeleton(*f)));
         // cuBLASLt's own epilogue, at each of the plain product's heuristics.
         if let (Some(_), Some(plan)) = (epi.lt(), plan.as_deref()) {
             candidates.extend((0..plan.heuristics.len()).map(Tactic::LtEpilogue));
@@ -473,8 +475,8 @@ pub(crate) fn anchored(
             clear_error();
             unfused(ctx, op, epi, act, w, ins, outs, m, n, k)
         }
-        Some(Tactic::Frame(frame)) => {
-            frame.fire(ctx, epi, w, act, ins, outs, m, n, k)?;
+        Some(Tactic::Skeleton(skeleton)) => {
+            skeleton.fire(ctx, epi, w, act, ins, outs, m, n, k)?;
             Ok(true)
         }
         Some(Tactic::Unfused) => {
@@ -569,9 +571,9 @@ pub(crate) fn on_lt(
 
 /// `outs = epi(act . w^T)` untimed on the unfused leg: the plain product
 /// (its own tactic, as a bare product picks it) into scratch, then the
-/// epilogue over it on the row frame, a run of rows at a time so the
+/// epilogue over it on the row skeleton, a run of rows at a time so the
 /// scratch stays within [`UNFUSED_BYTES`]. False, landing nothing, where
-/// the row frame does not carry the leg.
+/// the row skeleton does not carry the leg.
 #[allow(clippy::too_many_arguments)]
 fn unfused(
     ctx: &Ctx,
@@ -711,8 +713,8 @@ fn run_tactic(
                 )
                 .is_ok()
         }
-        Tactic::Frame(frame) => call.anchor.is_some_and(|a| {
-            frame
+        Tactic::Skeleton(skeleton) => call.anchor.is_some_and(|a| {
+            skeleton
                 .fire(
                     // SAFETY: `stream` is a live `Ctx`'s stream or the tune arena's own; `Ctx::on`
                     // only records it.
@@ -1381,7 +1383,7 @@ struct Device {
     /// few-rows kernel.
     rows_m: u32,
     /// `kernel.gemm.skinny_rows`: products of 2 to this many rows may time
-    /// the skinny frame where it covers them.
+    /// the skinny skeleton where it covers them.
     skinny_rows: u32,
     plans: HashMap<(i32, i32, i32), Arc<LtPlan>>,
     chosen: HashMap<u64, Tactic>,
@@ -1507,7 +1509,7 @@ impl Device {
         } else {
             key
         };
-        // And one the skinny frame may serve apart from one it may not.
+        // And one the skinny skeleton may serve apart from one it may not.
         let key = if skinny_tried(call, self.skinny_rows) {
             key ^ 0x736b_696e_0000_0000 ^ (u64::from(self.skinny_rows) << 16)
         } else {
@@ -1563,7 +1565,7 @@ fn rows_tried(call: Call, rows_m: u32) -> bool {
     call.m >= 2 && call.m <= rows_m.min(ROWS_M) as i32 && call.k % 8 == 0
 }
 
-/// Whether the tuner times the skinny frame for `call`
+/// Whether the tuner times the skinny skeleton for `call`
 /// (`kernel.gemm.skinny_rows`): from 2 rows (the gemv serves one), where it
 /// covers the shape.
 fn skinny_tried(call: Call, skinny_rows: u32) -> bool {
@@ -1649,7 +1651,9 @@ fn charged(tactic: Tactic, plan: Option<&LtPlan>, call: Call) -> bool {
             .anchor
             .and_then(|a| a.inner)
             .is_some_and(|inner| charged(inner, plan, call)),
-        Tactic::Gemv | Tactic::Narrow | Tactic::Rows | Tactic::Skinny | Tactic::Frame(_) => false,
+        Tactic::Gemv | Tactic::Narrow | Tactic::Rows | Tactic::Skinny | Tactic::Skeleton(_) => {
+            false
+        }
     }
 }
 

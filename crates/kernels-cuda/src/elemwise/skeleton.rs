@@ -1,7 +1,7 @@
-//! The row frame (`elemwise/frame.cuh`): one row a block (or, narrower than
+//! The row skeleton (`elemwise/skeleton.cuh`): one row a block (or, narrower than
 //! a warp's vectors, a run of a warp's lanes a row), held whole in
-//! registers, around a body that computes it in hooks over the frame. The
-//! body here is written by hand (`elemwise/frame.cu`), the frame's own
+//! registers, around a body that computes it in hooks over the skeleton. The
+//! body here is written by hand (`elemwise/skeleton.cu`), the skeleton's own
 //! reference; generated ones ([`crate::synth`]) fire through the same
 //! launch.
 
@@ -11,7 +11,7 @@ use crate::jit::{Arg, ArgValue, Ctx, Fire, Kernel, Launch, aligned16, kernel, no
 use crate::tensor::Tensor;
 use dtype::Dtype;
 
-const FRAME: &str = "elemwise/frame.cu";
+const SKELETON: &str = "elemwise/skeleton.cu";
 
 /// The elements of one vector a thread loads: a row's width is whole
 /// vectors of it.
@@ -21,7 +21,7 @@ pub const VEC_WIDTH: u32 = 8;
 /// longer fits the registers.
 pub const MAX_PER: u32 = 4;
 
-/// The widest row the frame holds.
+/// The widest row the skeleton holds.
 pub const MAX_WIDTH: u32 = BLOCK * VEC_WIDTH * MAX_PER;
 
 /// `pie::elemwise::Plane`, field for field: a plane's first element, how
@@ -53,7 +53,7 @@ impl Plane {
     }
 
     /// One row every row reads (a norm's weight, its elements however `t`
-    /// holds them); one narrower than the frame's rows is repeated across
+    /// holds them); one narrower than the skeleton's rows is repeated across
     /// each (a head's weight, every head reading it).
     #[must_use]
     pub const fn shared(t: &Tensor) -> Self {
@@ -111,7 +111,7 @@ impl Plane {
     }
 }
 
-/// How a frame's parameter is stored, two bits of `DT` each
+/// How a skeleton's parameter is stored, two bits of `DT` each
 /// (`pie::elemwise::kBf16`, ...).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Stored {
@@ -132,7 +132,7 @@ pub fn lanes(width: u32) -> u32 {
         .min(BLOCK)
 }
 
-/// How a frame lays its rows over blocks.
+/// How a skeleton lays its rows over blocks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Schedule {
     /// Blocks of [`BLOCK`] threads, as many rows a block as it holds: a
@@ -173,7 +173,7 @@ pub fn block(width: u32, schedule: Schedule) -> u32 {
 }
 
 /// The vectors of 8 a thread holds of each plane of a `width`-wide row, or
-/// why the frame does not hold such a row.
+/// why the skeleton does not hold such a row.
 pub(crate) fn per(op: &'static str, width: u32) -> Result<u32, Error> {
     let width = nonzero(op, "the row's width", width)?;
     if !width.is_multiple_of(VEC_WIDTH) {
@@ -185,13 +185,13 @@ pub(crate) fn per(op: &'static str, width: u32) -> Result<u32, Error> {
     if width > MAX_WIDTH {
         return Err(refuse(
             op,
-            format!("a {width}-wide row is wider than the frame holds ({MAX_WIDTH})"),
+            format!("a {width}-wide row is wider than the skeleton holds ({MAX_WIDTH})"),
         ));
     }
     Ok((width / VEC_WIDTH).div_ceil(lanes(width)))
 }
 
-/// The floats of shared memory a frame of `width`-wide rows in blocks of
+/// The floats of shared memory a skeleton of `width`-wide rows in blocks of
 /// `block` threads whose body shares its row takes: a block's rows of f32.
 #[must_use]
 pub fn shared_floats(width: u32, block: u32) -> u32 {
@@ -199,10 +199,10 @@ pub fn shared_floats(width: u32, block: u32) -> u32 {
     block * (width / VEC_WIDTH).div_ceil(lanes) * VEC_WIDTH
 }
 
-/// The frame's kernel around `body` (a type the unit defines) for `ins`
+/// The skeleton's kernel around `body` (a type the unit defines) for `ins`
 /// parameters stored as `stored` and `outs` results, rows `width` wide in
 /// blocks as `schedule` lays them, the parameters `ones` sets (by bit) read
-/// as one element. A `read_only` frame's results land over none of its
+/// as one element. A `read_only` skeleton's results land over none of its
 /// parameters, so it reads them through the read-only path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn entrypoint(
@@ -219,14 +219,14 @@ pub(crate) fn entrypoint(
         .zip(stored)
         .fold(0u64, |dt, (k, form)| dt | (*form as u64) << (2 * k));
     format!(
-        "::pie::elemwise::row_frame<{body}, {}, {}, {per}, {}, {outs}, {ones}u, {dt}ull, {read_only}>",
+        "::pie::elemwise::row_skeleton<{body}, {}, {}, {per}, {}, {outs}, {ones}u, {dt}ull, {read_only}>",
         block(width, schedule),
         lanes(width),
         stored.len()
     )
 }
 
-/// The shared memory a body takes beside its frame: `table` floats of what
+/// The shared memory a body takes beside its skeleton: `table` floats of what
 /// its columns alone compute, and (`shares`) its row's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Shared {
@@ -234,9 +234,9 @@ pub(crate) struct Shared {
     pub shares: bool,
 }
 
-/// Fires `kernel`, a row frame of [`entrypoint`] under `schedule` (`fields`
+/// Fires `kernel`, a row skeleton of [`entrypoint`] under `schedule` (`fields`
 /// its body's members by value), over `rows` rows of planes, each row cut into
-/// `parts` of the frame's `width` wide: `ins[k]` is the body's parameter
+/// `parts` of the skeleton's `width` wide: `ins[k]` is the body's parameter
 /// `k` (stored as `stored[k]`) and `outs[k]` its result `k`, a parameter
 /// `ones` sets (by bit) one element (a row's, every part of it reading it),
 /// read as is.
@@ -256,7 +256,7 @@ pub(crate) fn fire(
 ) -> Result<(), Error> {
     let rows = nonzero(op, "rows", rows)?;
     let parts = nonzero(op, "a row's parts", parts)?;
-    let frame_rows = rows
+    let skeleton_rows = rows
         .checked_mul(parts)
         .ok_or_else(|| refuse(op, format!("{rows} rows of {parts} parts overflow a grid")))?;
     // a row plane's every row starts on 16 bytes: a whole number of 8 bf16
@@ -270,7 +270,7 @@ pub(crate) fn fire(
         return Err(refuse(op, "a plane is not 16-byte aligned at every row"));
     }
     // `pie::elemwise::Planes<IN, OUT>`: the planes, then the width and the
-    // frame's rows, the parts and the table's floats, two to an 8-byte
+    // skeleton's rows, the parts and the table's floats, two to an 8-byte
     // word.
     let planes: Vec<u64> = ins
         .iter()
@@ -284,12 +284,12 @@ pub(crate) fn fire(
             ]
         })
         .chain([
-            u64::from(width) | u64::from(frame_rows) << 32,
+            u64::from(width) | u64::from(skeleton_rows) << 32,
             u64::from(parts) | u64::from(shared.table) << 32,
         ])
         .collect();
     let threads = block(width, schedule);
-    let blocks = frame_rows.div_ceil(threads / lanes(width));
+    let blocks = skeleton_rows.div_ceil(threads / lanes(width));
     let floats = shared.table
         + if shared.shares {
             shared_floats(width, threads)
@@ -298,7 +298,7 @@ pub(crate) fn fire(
         };
     ctx.fire(
         op,
-        // The frame waits on its producer in-kernel (`kernel.pdl`).
+        // The skeleton waits on its producer in-kernel (`kernel.pdl`).
         Fire::at(kernel).apply(
             Launch::per_row(blocks, threads)
                 .smem(floats * 4)
@@ -308,7 +308,7 @@ pub(crate) fn fire(
     )
 }
 
-/// A residual norm as a row frame's body: `y += x` in place, then `out` the
+/// A residual norm as a row skeleton's body: `y += x` in place, then `out` the
 /// RMS norm of `y` by `weight` (by `1 + weight` with `plus_one`), its
 /// squares summed a pair at a time. Rows up to 8192 bf16 wide, every plane
 /// 16-byte aligned.
@@ -338,7 +338,7 @@ pub fn residual_add_rmsnorm(
         ctx,
         OP,
         kernel(
-            FRAME,
+            SKELETON,
             &entrypoint(
                 &body,
                 y.width,

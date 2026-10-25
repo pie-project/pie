@@ -92,7 +92,7 @@ fn whole(why: &'static str) -> Unscheduled {
 
 /// `region` scheduled into passes over the row, or why the row core does
 /// not cover it: every result an f32 row, every rounding of a value that
-/// does not leave one the frame rounds to (bf16), a gather's row shared once
+/// does not leave one the skeleton rounds to (bf16), a gather's row shared once
 /// a phase.
 pub fn schedule(region: &Region) -> Result<Kernel, Unscheduled> {
     let types = region

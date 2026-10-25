@@ -759,7 +759,7 @@ mod tests {
         );
         // The compiler's prices as before, but that CUDA folds each chain
         // into a generated row kernel and each product's epilogue into its
-        // contraction frame: its rules hold no residual norm, bias or soft
+        // contraction skeleton: its rules hold no residual norm, bias or soft
         // cap.
         assert_eq!(
             poem_compiler::DeviceProfile::of(&registry().defaults(), 132, &[], &[]),

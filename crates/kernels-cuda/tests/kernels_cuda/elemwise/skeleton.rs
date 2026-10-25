@@ -1,6 +1,6 @@
 #![cfg(feature = "cuda")]
 
-//! The row frame around a hand-written residual norm body lands the chain's
+//! The row skeleton around a hand-written residual norm body lands the chain's
 //! math (`super::within`): the stream `y` summed in place bit for bit and
 //! the normed row within a norm's ulp, for a row of one to four vectors a
 //! thread, a ragged last vector a thread, and the weight taken as is or as
@@ -9,7 +9,7 @@
 use crate::common::attn_ref::{ten, tuned};
 use crate::common::{Gpu, Lcg};
 use dtype::Dtype::Bf16;
-use kernels_cuda::elemwise::{frame, norm, pointwise};
+use kernels_cuda::elemwise::{norm, pointwise, skeleton};
 use kernels_cuda::jit::Ctx;
 use kernels_cuda::tensor::Tensor;
 
@@ -131,16 +131,16 @@ fn land(fire: Fire, rows: usize, width: usize, plus_one: bool) -> (Vec<u16>, Vec
 }
 
 #[test]
-fn the_framed_residual_norm_lands_its_math() {
+fn the_skeleton_residual_norm_lands_its_math() {
     for width in [4096usize, 7168, 8192, 2048, 1544, 6152] {
         for rows in [1usize, 7, 64] {
             for plus_one in [false, true] {
                 let case = format!("{rows} rows of {width}, plus one {plus_one}");
-                let (y, out) = land(frame::residual_add_rmsnorm, rows, width, plus_one);
+                let (y, out) = land(skeleton::residual_add_rmsnorm, rows, width, plus_one);
                 deterministic(
                     &case,
                     &out,
-                    &land(frame::residual_add_rmsnorm, rows, width, plus_one).1,
+                    &land(skeleton::residual_add_rmsnorm, rows, width, plus_one).1,
                 );
                 let want = math(rows, width, plus_one);
                 assert_within(&format!("{case}: the summed stream"), &y, &want[0], EXACT);

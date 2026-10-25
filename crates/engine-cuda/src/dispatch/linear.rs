@@ -385,16 +385,16 @@ impl Run<'_> {
                 w.0
             )));
         }
-        let planes: Vec<linear::frame::In> = ins
+        let planes: Vec<linear::skeleton::In> = ins
             .iter()
             .zip(epi.inputs())
             .map(|(&v, input)| {
                 let t = self.tensor(v);
                 match input {
-                    linear::frame::Input::Tile => linear::frame::In::tile(t.ptr, t.width),
-                    linear::frame::Input::Column => linear::frame::In::column(t.ptr),
-                    linear::frame::Input::Row => linear::frame::In::row(t.ptr),
-                    linear::frame::Input::One => linear::frame::In::one(t.ptr),
+                    linear::skeleton::Input::Tile => linear::skeleton::In::tile(t.ptr, t.width),
+                    linear::skeleton::Input::Column => linear::skeleton::In::column(t.ptr),
+                    linear::skeleton::Input::Row => linear::skeleton::In::row(t.ptr),
+                    linear::skeleton::Input::One => linear::skeleton::In::one(t.ptr),
                 }
             })
             .collect();
@@ -411,7 +411,7 @@ impl Run<'_> {
             Ok(())
         } else {
             Err(broken(
-                "neither a contraction frame nor the unfused leg landed it, and the fold forms \
+                "neither a contraction skeleton nor the unfused leg landed it, and the fold forms \
                  only what one does"
                     .into(),
             ))

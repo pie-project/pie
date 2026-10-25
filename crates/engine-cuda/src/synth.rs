@@ -1,15 +1,15 @@
 //! The generated row kernels a load fires: one for each `fused.region`
 //! region (kernels-ir's, as the compiler folded it) and width its trace
-//! holds (`compiler.synth_regions`), each held to the row frame's contract
+//! holds (`compiler.synth_regions`), each held to the row skeleton's contract
 //! ([`kernels_cuda::synth::supports`]), printed by kernels-cuda and loaded
 //! with the model, so that no fire compiles one or loads its module.
 //!
-//! And the contraction frames' epilogues a load fires: one for each
+//! And the contraction skeletons' epilogues a load fires: one for each
 //! `fused.anchored` anchored region (`compiler.synth_anchors`), formed only
-//! where kernels-cuda serves it ([`kernels_cuda::linear::frame::serves`])
+//! where kernels-cuda serves it ([`kernels_cuda::linear::skeleton::serves`])
 //! and its every kernel loaded with the model.
 //!
-//! The fold forms only regions the frame takes; one it does not is the
+//! The fold forms only regions the skeleton takes; one it does not is the
 //! compiler's bug, and the load fails naming it (`Fault::Region`) rather
 //! than running something else in its place.
 
@@ -23,7 +23,7 @@ use poem_ir::{Fused, Operation, RegionRead, Trace, ValueId};
 use crate::error::{Fault, Result};
 
 #[cfg(not(feature = "rocm"))]
-use kernels_cuda::linear::frame::Epilogue;
+use kernels_cuda::linear::skeleton::Epilogue;
 #[cfg(not(feature = "rocm"))]
 use kernels_cuda::synth::{In, Out, Synthesized};
 
@@ -47,13 +47,13 @@ pub(crate) static NONE: Regions = Regions {
 };
 
 /// `trace` with each matmul and the pointwise ops over its product folded
-/// into one `fused.anchored` op where the contraction frames serve it
+/// into one `fused.anchored` op where the contraction skeletons serve it
 /// (`compiler.synth_anchors`), and the anchored regions by key.
 #[cfg(not(feature = "rocm"))]
 #[must_use]
 pub fn fold_anchors(trace: Trace) -> (Trace, BTreeMap<u64, Anchored>) {
     poem_compiler::fuse::anchor::fold(trace, &|anchored, ins, outs| {
-        kernels_cuda::linear::frame::serves(anchored, ins, outs).is_ok()
+        kernels_cuda::linear::skeleton::serves(anchored, ins, outs).is_ok()
     })
 }
 
@@ -140,7 +140,7 @@ impl Regions {
                     })
                     .collect::<Result<Vec<Dtype>>>()
             };
-            kernels_cuda::linear::frame::serves(held, &stored(ins)?, &stored(outs)?)
+            kernels_cuda::linear::skeleton::serves(held, &stored(ins)?, &stored(outs)?)
                 .map_err(|why| broken(why.to_string()))?;
             let epi = Epilogue::interned(held)?;
             let c = &held.contraction;
@@ -206,7 +206,7 @@ impl Regions {
         }
         match anchored(trace).next() {
             Some((node, ..)) => Err(Fault::Unsupported(format!(
-                "the `fused.anchored` at node {node}: this backend has no contraction frames; \
+                "the `fused.anchored` at node {node}: this backend has no contraction skeletons; \
                  serve it with `compiler.synth_anchors` off"
             ))),
             None => Ok(Regions {}),
@@ -295,7 +295,7 @@ fn each(decl: &ValueDecl) -> bool {
 }
 
 /// Why a region's planes are not its own: a result twice, or over one of
-/// its parameters. The frame's blocks read their rows whole before writing,
+/// its parameters. The skeleton's blocks read their rows whole before writing,
 /// but a block's row is not another block's.
 #[cfg(not(feature = "rocm"))]
 fn aliased(ins: &[ValueId], outs: &[ValueId]) -> Option<String> {

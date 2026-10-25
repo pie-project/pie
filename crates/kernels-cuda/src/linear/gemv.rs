@@ -1,11 +1,11 @@
 use crate::error::Error;
 
 use crate::jit::{ArgValue, Ctx, Fire, Kernel, Launch, aligned16, kernel, refuse};
-use crate::linear::frame::{Epilogue, In};
+use crate::linear::skeleton::{Epilogue, In};
 
 const GEMV: &str = "linear/gemv.cu";
 
-/// `out[n] = act . weight[n]` for one row: the gemv frame with the plain
+/// `out[n] = act . weight[n]` for one row: the gemv skeleton with the plain
 /// store filled in. The GEMM tuner's `Gemv` tactic.
 pub(crate) fn gemv_bf16(
     ctx: &Ctx,
@@ -18,7 +18,7 @@ pub(crate) fn gemv_bf16(
     gemv(ctx, Epilogue::store(), weight, act, &[], &[out], n, k)
 }
 
-/// The gemv frame's kernel for `epi` over `n` columns, and whether it splits
+/// The gemv skeleton's kernel for `epi` over `n` columns, and whether it splits
 /// each column's K over a block (`kernel.gemv.splitk_max_n` columns at
 /// most) and its warps a block. `kernel.gemv.bf16`: Blackwell profiles pick
 /// `narrow`.
@@ -30,14 +30,14 @@ pub(crate) fn gemv_kernel(
     let narrow = tuning.gemv_narrow;
     if n.unsigned_abs() <= tuning.gemv_splitk_max_n {
         let (class, warps) = if narrow { ("4, 2", 4) } else { ("8, 1", 8) };
-        (epi.kernel("gemv_splitk_frame", class), true, warps)
+        (epi.kernel("gemv_splitk_skeleton", class), true, warps)
     } else {
         let class = if narrow { "4, 2" } else { "4, 4" };
-        (epi.kernel("gemv_frame", class), false, 4)
+        (epi.kernel("gemv_skeleton", class), false, 4)
     }
 }
 
-/// `outs = epi(act . weight^T)` for one row on the gemv frame: a warp a
+/// `outs = epi(act . weight^T)` for one row on the gemv skeleton: a warp a
 /// column (each part's weight row in turn), or a block a column split over
 /// K up to `kernel.gemv.splitk_max_n` columns; `ins` the epilogue's inputs
 /// and `outs` its results, each `n` wide.
@@ -120,20 +120,20 @@ pub(crate) fn rows_cluster(n: i32, k: i32) -> u32 {
     }
 }
 
-/// The few-rows frame's kernel for `epi` at `m x n x k`, its blocks and its
+/// The few-rows skeleton's kernel for `epi` at `m x n x k`, its blocks and its
 /// cluster.
 pub(crate) fn rows_kernel(epi: &Epilogue, m: i32, n: i32, k: i32) -> (&'static Kernel, u32, u32) {
     let split = rows_split(k);
     let rows = 16 / split;
     let cl = rows_cluster(n, k);
     (
-        epi.kernel("rows_frame", &format!("{m}, {split}, {cl}")),
+        epi.kernel("rows_skeleton", &format!("{m}, {split}, {cl}")),
         n.unsigned_abs().div_ceil(rows as u32),
         cl,
     )
 }
 
-/// `out[m][n] = act[m] . weight[n]` for a few rows: the few-rows frame with
+/// `out[m][n] = act[m] . weight[n]` for a few rows: the few-rows skeleton with
 /// the plain store filled in. The GEMM tuner's `Rows` tactic.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_rows_bf16(
@@ -179,7 +179,7 @@ pub fn gemm_rows(
     pdl: bool,
 ) -> Result<(), Error> {
     const OP: &str = "linear.gemm_rows";
-    let most = crate::linear::frame::ROWS_M as i32;
+    let most = crate::linear::skeleton::ROWS_M as i32;
     if !(1..=most).contains(&m) || n <= 0 || k <= 0 || k % 8 != 0 || epi.parts() != 1 {
         return Err(refuse(
             OP,

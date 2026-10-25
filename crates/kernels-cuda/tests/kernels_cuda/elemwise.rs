@@ -1,4 +1,3 @@
-mod frame;
 mod group_norm;
 mod hc;
 mod modulate;
@@ -12,6 +11,7 @@ mod rope_axes;
 mod rope_mrope;
 mod rope_partial;
 mod rope_table;
+mod skeleton;
 mod synth;
 mod synth_embed;
 mod synth_modulate;

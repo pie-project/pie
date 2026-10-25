@@ -1,4 +1,3 @@
-pub mod frame;
 pub mod gate;
 pub mod hc;
 pub mod hc_project;
@@ -8,6 +7,7 @@ pub mod norm_rope;
 pub mod pointwise;
 pub mod posenc;
 pub mod rope;
+pub mod skeleton;
 
 use dtype::Dtype;
 

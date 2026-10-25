@@ -1,4 +1,4 @@
-//! The skinny frame (`skinny_frame`, `linear/contract.cuh`): up to 64 rows
+//! The skinny skeleton (`skinny_skeleton`, `linear/contract.cuh`): up to 64 rows
 //! on mma.sync, the weight streamed once past the activation's rows in
 //! shared memory, its products handed to an epilogue body 8 columns of one
 //! row at a time. A packed bank's parts (a GLU's `[gate | up]`) share a
@@ -6,7 +6,7 @@
 
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Fire, Kernel, Launch, aligned16, refuse};
-use crate::linear::frame::{Epilogue, In};
+use crate::linear::skeleton::{Epilogue, In};
 
 pub const ROWS: u32 = 64;
 
@@ -21,7 +21,7 @@ const fn cols(parts: u32) -> u32 {
     WARPS * 16 / parts
 }
 
-/// Whether the skinny frame serves `m x n x k` over `parts` packed banks
+/// Whether the skinny skeleton serves `m x n x k` over `parts` packed banks
 /// with at most `rows` rows (`kernel.gemm.skinny_rows`, never past its
 /// 64-row tile).
 #[must_use]
@@ -33,15 +33,15 @@ pub fn covers(m: i32, n: i32, k: i32, parts: u32, rows: u32) -> bool {
     m >= 1 && m <= rows.min(ROWS) as i32 && n > 0 && n % cols == 0 && k > 0 && k % STEP as i32 == 0
 }
 
-/// The skinny frame's kernel with `epi` filled in.
+/// The skinny skeleton's kernel with `epi` filled in.
 pub(crate) fn kernel(epi: &Epilogue) -> &'static Kernel {
-    epi.kernel("skinny_frame", &format!("{WARPS}, {STAGES}, {STEP}"))
+    epi.kernel("skinny_skeleton", &format!("{WARPS}, {STAGES}, {STEP}"))
 }
 
 /// A generated body holds no fields; C++ gives the empty struct one byte.
 const NO_FIELDS: u8 = 0;
 
-/// `outs = epi(act . w^T)` over `m` rows (1..=64) on the skinny frame: `w`
+/// `outs = epi(act . w^T)` over `m` rows (1..=64) on the skinny skeleton: `w`
 /// the weight (`parts · n x k`), `ins` the epilogue's inputs and `outs` its
 /// results, each `m x n`, every plane 16-byte aligned.
 #[allow(clippy::too_many_arguments)]

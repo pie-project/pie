@@ -5,7 +5,7 @@
 use crate::error::Error;
 
 use crate::jit::{Ctx, count, dtype_dispatch, stated};
-use crate::linear::frame::{Epilogue, In};
+use crate::linear::skeleton::{Epilogue, In};
 use crate::tensor::Tensor;
 
 use dtype::Dtype;
@@ -52,14 +52,14 @@ pub fn matmul_f32(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(
 }
 
 /// `outs = epi(act . w^T)`: an anchored region (kernels-ir's, its epilogue
-/// printed for the contraction frames, [`Epilogue`]) over a dense bf16 bank
+/// printed for the contraction skeletons, [`Epilogue`]) over a dense bf16 bank
 /// of `parts · n` rows, `n` its results' width, `ins` its epilogue's inputs.
-/// The GEMM tuner times, per shape and epilogue, each contraction frame
+/// The GEMM tuner times, per shape and epilogue, each contraction skeleton
 /// that covers it fused against the plain product's own tactic followed by
-/// the epilogue on the row frame, and fires the fastest; a fusion never
-/// forces a slower product. A shape no frame covers (or one a capture meets
+/// the epilogue on the row skeleton, and fires the fastest; a fusion never
+/// forces a slower product. A shape no skeleton covers (or one a capture meets
 /// untimed) runs that unfused leg. False, landing nothing, only where the
-/// row frame does not carry the leg either ([`crate::linear::frame::serves`]
+/// row skeleton does not carry the leg either ([`crate::linear::skeleton::serves`]
 /// says which do): the caller's unfused ops serve it then.
 pub fn anchored(
     ctx: &Ctx,

@@ -124,8 +124,8 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
 /// head's region trails the hand kernel at a decode's rows. And the hand
 /// product rules CUDA's anchored regions replace (`fuse::anchor`): a
 /// product's bias, its soft cap and a packed bank's GEGLU, each the
-/// epilogue of its contraction frame, timed against the product and the
-/// epilogue on the row frame.
+/// epilogue of its contraction skeleton, timed against the product and the
+/// epilogue on the row skeleton.
 #[cfg(not(feature = "rocm"))]
 #[must_use]
 pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
@@ -237,7 +237,7 @@ mod tests {
     /// weight stored bf16 (its dispatch ran the product and its op apart over
     /// any other), so a site over another keeps its ops; so does one whose
     /// product is no whole runs of eight wide (a two-column head), which no
-    /// row frame carries and the rule ran apart past one row. A retired
+    /// row skeleton carries and the rule ran apart past one row. A retired
     /// rule's op may be another rule's too (`norm_rope`'s two turns), so its
     /// sites are what it forms past the backend's.
     #[cfg(not(feature = "rocm"))]
@@ -272,7 +272,7 @@ mod tests {
                 };
                 // The sites the rule forms in `t` that it fused (its product
                 // bf16 against a bf16 weight), and of those the ones too
-                // narrow for a row frame.
+                // narrow for a row skeleton.
                 let sites = |t: &Trace| {
                     let mut held = (0usize, 0usize);
                     for n in &t.nodes {

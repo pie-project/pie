@@ -1,7 +1,7 @@
 //! Generated row kernels, HIP's: a fused region (kernels-ir's [`Region`]),
 //! scheduled ([`kernels_ir::schedule`]) and printed as HIP C++ ([`print`])
-//! in the row frame's hooks (`elemwise/frame.hip`): the unit a generated
-//! kernel compiles from. Its own copy of kernels-cuda's printer and frame.
+//! in the row skeleton's hooks (`elemwise/skeleton.hip`): the unit a generated
+//! kernel compiles from. Its own copy of kernels-cuda's printer and skeleton.
 
 pub mod print;
 
@@ -11,10 +11,10 @@ pub use kernels_ir::Region;
 /// it in.
 pub const BODY: &str = "::pie::synth::Body";
 
-/// The threads of a row frame's block.
+/// The threads of a row skeleton's block.
 pub const BLOCK: u32 = 256;
 
-/// A region's body printed in the row frame's hook form ([`print`]).
+/// A region's body printed in the row skeleton's hook form ([`print`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Body {
     /// The struct's HIP C++ source.
@@ -25,7 +25,7 @@ pub struct Body {
     pub passes: u32,
 }
 
-/// Why the frame does not take a region.
+/// Why the skeleton does not take a region.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal(pub String);
 
@@ -43,11 +43,11 @@ impl Body {
     pub fn of(region: &Region) -> Result<Body, Refusal> {
         let kernel = kernels_ir::schedule(region)
             .map_err(|why| Refusal(format!("the row core does not schedule the region: {why}")))?;
-        // HIP's frame holds a row's elements and reductions; a head's
+        // HIP's skeleton holds a row's elements and reductions; a head's
         // values, a table and a shared row are kernels-cuda's alone so far.
         if !kernel.heads.is_empty() || !kernel.tables.is_empty() || kernel.shares {
             return Err(Refusal(
-                "a kernel over heads, a table or a gather within the row, which HIP's frame \
+                "a kernel over heads, a table or a gather within the row, which HIP's skeleton \
                  does not hold"
                     .into(),
             ));
@@ -64,22 +64,22 @@ impl Body {
         })
     }
 
-    /// The unit the kernel compiles from: the frame's header and the body.
+    /// The unit the kernel compiles from: the skeleton's header and the body.
     #[must_use]
     pub fn unit(&self) -> String {
         format!(
             "// A generated row kernel: region body {:016x}.\n\
-             #include \"elemwise/frame.hip\"\n\n\
+             #include \"elemwise/skeleton.hip\"\n\n\
              namespace pie::synth {{\n\n{}\n}}\n",
             self.hash, self.source
         )
     }
 }
 
-/// The frame's kernel around the body for `ins` parameters and `outs`
+/// The skeleton's kernel around the body for `ins` parameters and `outs`
 /// results, `per` vectors of 8 a thread, the parameters `ones` sets (by bit)
 /// read as one element.
 #[must_use]
 pub fn entrypoint(per: u32, ins: usize, outs: usize, ones: u32) -> String {
-    format!("::pie::elemwise::row_frame<{BODY}, {BLOCK}, {per}, {ins}, {outs}, {ones}u>")
+    format!("::pie::elemwise::row_skeleton<{BODY}, {BLOCK}, {per}, {ins}, {outs}, {ones}u>")
 }

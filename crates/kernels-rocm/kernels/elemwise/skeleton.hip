@@ -1,15 +1,15 @@
 #pragma once
 
-// The row frame, HIP's: one row of bf16 planes a block, held whole in
-// registers, around a body kernels-ir's schedule prints in the frame's
+// The row skeleton, HIP's: one row of bf16 planes a block, held whole in
+// registers, around a body kernels-ir's schedule prints in the skeleton's
 // hooks (`kernels_rocm::synth::print`). The same hooks as kernels-cuda's
-// `elemwise/frame.cuh`, over a wavefront's reductions.
+// `elemwise/skeleton.cuh`, over a wavefront's reductions.
 
 #include "prim/device.hip"
 
 namespace pie::elemwise {
 
-// A bf16 plane a row frame reads or writes: its first element and how far
+// A bf16 plane a row skeleton reads or writes: its first element and how far
 // apart its rows sit, in elements (0 for one row every row shares, as a
 // norm's weight).
 struct Plane {
@@ -17,7 +17,7 @@ struct Plane {
     long long row_stride;
 };
 
-// What a row frame fires over: its body's IN parameters and OUT results,
+// What a row skeleton fires over: its body's IN parameters and OUT results,
 // every row `width` wide.
 template <int IN, int OUT>
 struct Planes {
@@ -29,12 +29,12 @@ struct Planes {
 // One row of bf16 planes held whole in registers: a thread holds PER
 // vectors of 8 elements of each parameter and each result. A body names an
 // element by its index `e` in [0, N), column (tid + (e / 8) * BLOCK) * 8 +
-// e % 8, and asks the frame for everything else. An element past the row
+// e % 8, and asks the skeleton for everything else. An element past the row
 // (`!valid(e)`) reads garbage and is never stored; a body keeps it out of
 // its reductions. A parameter whose bit `ONES` sets is one element every
 // row reads (a layer's scale), read once and named `one(k)`.
 template <int BLOCK, int PER, int IN, int OUT, unsigned ONES = 0u>
-struct RowFrame {
+struct RowSkeleton {
     static constexpr int N = PER * 8;
 
     int width;
@@ -47,7 +47,7 @@ struct RowFrame {
     float ones[IN];
 
     // Every parameter's vectors are issued up front, before any body math.
-    __device__ __forceinline__ RowFrame(const Planes<IN, OUT>& planes, long long row, float* buf)
+    __device__ __forceinline__ RowSkeleton(const Planes<IN, OUT>& planes, long long row, float* buf)
         : width(planes.width),
           tid(static_cast<int>(threadIdx.x)),
           vectors(planes.width / 8),
@@ -115,10 +115,10 @@ struct RowFrame {
     }
 };
 
-// A row frame a block a row: `body(f)` computes the row in hooks over `f`.
+// A row skeleton a block a row: `body(f)` computes the row in hooks over `f`.
 // The rows past a staged window's live count are left as they are.
 template <class Body, int BLOCK, int PER, int IN, int OUT, unsigned ONES = 0u>
-__global__ void __launch_bounds__(BLOCK) row_frame(
+__global__ void __launch_bounds__(BLOCK) row_skeleton(
     const Planes<IN, OUT> planes,
     const Body body,
     const u32* __restrict__ win)
@@ -128,7 +128,7 @@ __global__ void __launch_bounds__(BLOCK) row_frame(
     const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
 
     __shared__ float buf[BLOCK / 32 + 1];
-    RowFrame<BLOCK, PER, IN, OUT, ONES> f(planes, plane_row, buf);
+    RowSkeleton<BLOCK, PER, IN, OUT, ONES> f(planes, plane_row, buf);
     body(f);
 }
 

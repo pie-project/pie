@@ -140,7 +140,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     }
     // `compiler.synth_anchors`: each matmul and the pointwise ops over its
     // product folded into one `fused.anchored`, before the chains fold, so
-    // a product's epilogue is its contraction frame's.
+    // a product's epilogue is its contraction skeleton's.
     #[cfg(not(feature = "rocm"))]
     let anchored = if profile.synth_anchors {
         let (folded, anchored) = crate::synth::fold_anchors(boot.trace.clone());

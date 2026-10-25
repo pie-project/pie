@@ -14,7 +14,7 @@
 //! the ops between them run before it, and none reads what the run computes
 //! or writes what it reads, so the region lands where the run's last op was,
 //! in its layer, as a fuse rule's match does. Of the run from an op, the
-//! longest part the row frame holds is the chain. Nothing else is searched,
+//! longest part the row skeleton holds is the chain. Nothing else is searched,
 //! so no unplanned combination forms.
 //!
 //! **Lowering** turns each op into the primitive math it states, in f32. A value
@@ -30,7 +30,7 @@
 //! **Folding** ([`fold`]) replaces each chain's ops with one
 //! `fused.region` op reading its parameters and landing its results, the
 //! values only the chain read gone from the trace. No result lands over a
-//! parameter, so the arena gives each its own plane: a row frame's threads
+//! parameter, so the arena gives each its own plane: a row skeleton's threads
 //! read their row whole before any writes it.
 //!
 //! Chains are formed and folded only under `compiler.synth_regions` (off by
@@ -107,7 +107,7 @@ pub fn fold(trace: Trace) -> (Trace, BTreeMap<u64, Region>) {
             continue;
         }
         let width = chain.region.width;
-        if !frames(&trace, &chain, width) {
+        if !skeleton_holds(&trace, &chain, width) {
             continue;
         }
         let reads: Vec<RegionRead> = chain
@@ -143,26 +143,26 @@ pub fn fold(trace: Trace) -> (Trace, BTreeMap<u64, Region>) {
     (super::search::compact(replace(trace, folded)), regions)
 }
 
-/// The widest row the frame holds in registers: a block of
-/// [`FRAME_BLOCK`] threads, [`FRAME_PER`] eight-wide runs a thread.
-pub const FRAME_BLOCK: u32 = 256;
-pub const FRAME_PER: u32 = 4;
-/// The planes a frame holds at most, read and written together, at its
-/// widest: each plane is [`FRAME_PER`] sixteen-byte runs a thread, and past
+/// The widest row the skeleton holds in registers: a block of
+/// [`SKELETON_BLOCK`] threads, [`SKELETON_PER`] eight-wide runs a thread.
+pub const SKELETON_BLOCK: u32 = 256;
+pub const SKELETON_PER: u32 = 4;
+/// The planes a skeleton holds at most, read and written together, at its
+/// widest: each plane is [`SKELETON_PER`] sixteen-byte runs a thread, and past
 /// five at the widest the row no longer stays in registers.
-pub const FRAME_PLANES: usize = 5;
+pub const SKELETON_PLANES: usize = 5;
 
-/// Whether the row frame a region's body runs in (`row_frame` in
-/// kernels-cuda's `elemwise/frame.cuh`) holds `chain`: every row it writes
+/// Whether the row skeleton a region's body runs in (`row_skeleton` in
+/// kernels-cuda's `elemwise/skeleton.cuh`) holds `chain`: every row it writes
 /// bf16 and every row it reads bf16 or f32 (an f32 row two planes' worth),
 /// a scalar parameter (one element, bf16, f32 or i32) holding none, the
 /// width a whole number of eight-wide runs within one block's registers,
-/// at most [`FRAME_PLANES`] planes each way, and each head it reduces over
-/// a power-of-two run of the threads a row takes ([`frame_lanes`]). A
-/// chain the frame does not hold is never folded, so an engine never meets
+/// at most [`SKELETON_PLANES`] planes each way, and each head it reduces over
+/// a power-of-two run of the threads a row takes ([`skeleton_lanes`]). A
+/// chain the skeleton does not hold is never folded, so an engine never meets
 /// a region it cannot launch.
 #[must_use]
-pub fn frames(trace: &Trace, chain: &Chain, width: u32) -> bool {
+pub fn skeleton_holds(trace: &Trace, chain: &Chain, width: u32) -> bool {
     let dtype = |v: poem_ir::ValueId| dtype_of(trace, v);
     let planes: usize = chain
         .ins
@@ -172,7 +172,7 @@ pub fn frames(trace: &Trace, chain: &Chain, width: u32) -> bool {
         .sum::<usize>()
         + chain.outs.len();
     width.is_multiple_of(8)
-        && width <= FRAME_BLOCK * FRAME_PER * 8
+        && width <= SKELETON_BLOCK * SKELETON_PER * 8
         && planes_fit(planes, width)
         && chain.ins.iter().all(|input| match dtype(input.value) {
             Dtype::Bf16 | Dtype::F32 => true,
@@ -183,31 +183,31 @@ pub fn frames(trace: &Trace, chain: &Chain, width: u32) -> bool {
         && heads_fit(&chain.region, width)
 }
 
-/// Whether `planes` rows of `width` stay in a frame's registers: as many
-/// planes as [`FRAME_PLANES`] at the widest, more as the row narrows (the
+/// Whether `planes` rows of `width` stay in a skeleton's registers: as many
+/// planes as [`SKELETON_PLANES`] at the widest, more as the row narrows (the
 /// runs a thread holds scale with the width).
 fn planes_fit(planes: usize, width: u32) -> bool {
-    let per = width.div_ceil(FRAME_BLOCK * 8).max(1) as usize;
-    planes * per <= FRAME_PLANES * FRAME_PER as usize
+    let per = width.div_ceil(SKELETON_BLOCK * 8).max(1) as usize;
+    planes * per <= SKELETON_PLANES * SKELETON_PER as usize
 }
 
-/// The threads a frame's row of `width` takes: a block, or the fewest
+/// The threads a skeleton's row of `width` takes: a block, or the fewest
 /// whole lanes of a warp that hold its runs of eight where they are 32 or
 /// fewer.
 #[must_use]
-pub fn frame_lanes(width: u32) -> u32 {
+pub fn skeleton_lanes(width: u32) -> u32 {
     let runs = width.div_ceil(8).max(1);
     if runs <= 32 {
         runs.next_power_of_two()
     } else {
-        FRAME_BLOCK
+        SKELETON_BLOCK
     }
 }
 
 /// Whether each head `region` reduces over is a power-of-two run of a
 /// row's threads.
 fn heads_fit(region: &Region, width: u32) -> bool {
-    let lanes = frame_lanes(width);
+    let lanes = skeleton_lanes(width);
     region.ops.iter().all(|op| match *op {
         Op::ReduceHeads(_, _, head) => {
             let runs = head / 8;
@@ -290,7 +290,7 @@ pub(super) fn replace(mut trace: Trace, runs: Vec<(Vec<u32>, Fused)>) -> Trace {
 /// How far past a chain's first op its run is looked for.
 pub(super) const REACH: u32 = 64;
 
-/// Every chain of `trace` the row frame holds, by its first op; ops outside
+/// Every chain of `trace` the row skeleton holds, by its first op; ops outside
 /// them run as they are.
 #[must_use]
 pub fn chains(trace: &Trace) -> Vec<Chain> {
@@ -332,8 +332,8 @@ pub fn chains(trace: &Trace) -> Vec<Chain> {
 
 /// The longest part of `run` (the latest of the longest, so a chain that
 /// ends in a norm keeps it, as the rules' matches do) that is a chain the
-/// row frame holds: its ops lower, the ops between them keep their order,
-/// and the frame takes its region.
+/// row skeleton holds: its ops lower, the ops between them keep their order,
+/// and the skeleton takes its region.
 fn held(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
     for len in (2..=run.len()).rev() {
         for from in (0..=run.len() - len).rev() {
@@ -344,10 +344,10 @@ fn held(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
             let Some(chain) = lower(trace, part, escapes) else {
                 continue;
             };
-            let framed = kernels_ir::schedule(&chain.region).is_ok()
-                && frames(trace, &chain, chain.region.width)
+            let fits = kernels_ir::schedule(&chain.region).is_ok()
+                && skeleton_holds(trace, &chain, chain.region.width)
                 && lands_apart(trace, &chain);
-            if framed {
+            if fits {
                 return Some(chain);
             }
         }
@@ -851,7 +851,7 @@ impl Escapes {
 /// The region `run` lowers to, or `None` where an op of it does not lower.
 fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
     // An embedding's table holds its whole vocabulary, so an id past it
-    // picks row 0 in the frame as in the gather (a table cut by its rows
+    // picks row 0 in the skeleton as in the gather (a table cut by its rows
     // gathers each rank's share).
     for &node in run {
         if let Operation::Gather(Gather::Embed { table, vocab, .. }) =
@@ -1374,7 +1374,7 @@ impl Builder {
                     // a bare scale multiplies by itself as x's dtype holds
                     // it (`mul_scalar`), a scaled silu by the f32
                     let k = if *act == ActFn::Identity && dtype_of(trace, *x) == Dtype::Bf16 {
-                        kernels_ir::frame::round_bf16(*k)
+                        kernels_ir::skeleton::round_bf16(*k)
                     } else {
                         *k
                     };

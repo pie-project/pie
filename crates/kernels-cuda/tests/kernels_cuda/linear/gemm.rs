@@ -47,8 +47,8 @@ fn the_few_rows_and_narrow_gemms_land_the_dot() {
 }
 
 #[test]
-fn the_skinny_frame_refuses_shapes_off_its_tile() {
-    use kernels_cuda::linear::frame::Epilogue;
+fn the_skinny_skeleton_refuses_shapes_off_its_tile() {
+    use kernels_cuda::linear::skeleton::Epilogue;
     use kernels_cuda::linear::skinny::{ROWS, covers, skinny};
     // Shapes off the tile are refused, without a launch.
     assert!(!covers(1, 96, 128, 1, ROWS) && !covers(65, 64, 128, 1, ROWS));

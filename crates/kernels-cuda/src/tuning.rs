@@ -548,7 +548,7 @@ pub struct GemmWorkspaceMb(pub u32);
 #[decision(id = "kernel.gemm.heuristics", constant(range(1..=32)), default = 8, tune = search)]
 pub struct GemmHeuristics(pub u32);
 
-/// The most rows the skinny bf16 frame serves: the most a fused hand rule
+/// The most rows the skinny bf16 skeleton serves: the most a fused hand rule
 /// (GEGLU, soft-capped heads) fires it at, and the most a dense bf16 product
 /// may time it for beside cuBLAS's algorithms. Its tile holds 64; 0 never
 /// takes it.

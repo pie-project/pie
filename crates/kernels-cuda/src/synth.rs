@@ -1,9 +1,9 @@
 //! Generated row kernels: a fused region (kernels-ir's [`Region`]),
 //! scheduled ([`kernels_ir::schedule`]) and printed as CUDA C++ ([`print`],
-//! a [`Body`]), compiled with the row frame (`elemwise/frame.cuh`) into a
+//! a [`Body`]), compiled with the row skeleton (`elemwise/skeleton.cuh`) into a
 //! unit of its own and fired over the region's planes.
 //!
-//! - **What the frame takes** ([`supports`]): a region of pure math that
+//! - **What the skeleton takes** ([`supports`]): a region of pure math that
 //!   the row core schedules (`kernels_ir::schedule`), over one or more
 //!   parameters and to one or more results, every result a bf16 row and
 //!   every parameter a bf16 or f32 row (its own, one every row reads, or
@@ -11,7 +11,7 @@
 //!   whole vectors of 8 and at most [`MAX_WIDTH`] wide, each head it
 //!   reduces over a power-of-two run of a row's threads.
 //! - **Identity.** One generated unit a body, `synth/<hash>.cu`: the
-//!   frame's header and the body's source. One kernel a shape of it: the
+//!   skeleton's header and the body's source. One kernel a shape of it: the
 //!   vectors a thread holds (from the width) and the plane counts. The disk
 //!   cache keys the unit's text, the headers and the instantiation, as it
 //!   does a carried unit's, so a warm start compiles nothing.
@@ -26,11 +26,11 @@ use std::sync::{Mutex, OnceLock};
 
 use dtype::Dtype;
 
-pub use crate::elemwise::frame::{MAX_WIDTH, Plane, lanes};
+pub use crate::elemwise::skeleton::{MAX_WIDTH, Plane, lanes};
 pub use kernels_ir::Region;
 use kernels_ir::{Op, Shape};
 
-/// A region's body printed in the row frame's hook form ([`print`]).
+/// A region's body printed in the row skeleton's hook form ([`print`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Body {
     /// The struct's C++ source.
@@ -66,8 +66,8 @@ impl Body {
     }
 }
 
-pub use crate::elemwise::frame::Schedule;
-use crate::elemwise::frame::{self, Shared, Stored};
+pub use crate::elemwise::skeleton::Schedule;
+use crate::elemwise::skeleton::{self, Shared, Stored};
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Kernel, Root, refuse};
 
@@ -110,7 +110,7 @@ impl In {
         matches!(self, In::One(_) | In::Each(_))
     }
 
-    /// How the frame reads it.
+    /// How the skeleton reads it.
     fn stored(self) -> Option<Stored> {
         match (self.scalar(), self.dtype()) {
             (_, Dtype::Bf16) => Some(Stored::Bf16),
@@ -128,7 +128,7 @@ pub enum Out {
     Rows(Dtype),
 }
 
-/// Why the frame does not take a region: the condition it breaks.
+/// Why the skeleton does not take a region: the condition it breaks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Refusal(String);
 
@@ -144,7 +144,7 @@ fn refusal(why: impl Into<String>) -> Refusal {
     Refusal(why.into())
 }
 
-/// Whether the row frame takes `region`, its parameters stored as `ins`
+/// Whether the row skeleton takes `region`, its parameters stored as `ins`
 /// and its results as `outs`; the condition it breaks where it does not.
 pub fn supports(region: &Region, ins: &[In], outs: &[Out]) -> Result<(), Refusal> {
     if ins.len() != region.params.len() || outs.len() != region.results.len() {
@@ -158,13 +158,13 @@ pub fn supports(region: &Region, ins: &[In], outs: &[Out]) -> Result<(), Refusal
     }
     if ins.is_empty() || outs.is_empty() {
         return Err(refusal(
-            "a region of no parameter or no result: the frame reads and writes planes",
+            "a region of no parameter or no result: the skeleton reads and writes planes",
         ));
     }
     for (k, form) in ins.iter().enumerate() {
         if form.stored().is_none() {
             return Err(refusal(format!(
-                "parameter {k} is stored {:?}, and the frame's rows are bf16 or f32 (a scalar's \
+                "parameter {k} is stored {:?}, and the skeleton's rows are bf16 or f32 (a scalar's \
                  also i32)",
                 form.dtype()
             )));
@@ -180,14 +180,14 @@ pub fn supports(region: &Region, ins: &[In], outs: &[Out]) -> Result<(), Refusal
     for (k, Out::Rows(dtype)) in outs.iter().enumerate() {
         if *dtype != Dtype::Bf16 {
             return Err(refusal(format!(
-                "result {k} is stored {dtype:?}, and the frame's results are bf16"
+                "result {k} is stored {dtype:?}, and the skeleton's results are bf16"
             )));
         }
     }
     if let Err(why) = region.types() {
         return Err(refusal(format!("the region is not one row: {why}")));
     }
-    frame::per(OP, region.width).map_err(|why| refusal(why.to_string()))?;
+    skeleton::per(OP, region.width).map_err(|why| refusal(why.to_string()))?;
     heads(region)?;
     Body::of(region).map(|_| ())
 }
@@ -196,7 +196,7 @@ pub fn supports(region: &Region, ins: &[In], outs: &[Out]) -> Result<(), Refusal
 /// threads a row of its width takes (`reduce_sum_heads`): its vectors of 8
 /// divide the row's lanes.
 fn heads(region: &Region) -> Result<(), Refusal> {
-    let lanes = frame::lanes(region.width);
+    let lanes = skeleton::lanes(region.width);
     for (at, op) in region.ops.iter().enumerate() {
         let Op::ReduceHeads(_, _, head) = *op else {
             continue;
@@ -213,7 +213,7 @@ fn heads(region: &Region) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// A generated kernel: `body` in the row frame over `ins` parameters and
+/// A generated kernel: `body` in the row skeleton over `ins` parameters and
 /// `outs` results, rows `width` wide, packed in blocks and (where a row is
 /// narrower than a block) spread a row a block, each fire taking the one
 /// its rows want ([`Schedule::of`]).
@@ -224,11 +224,11 @@ pub struct Synthesized {
     ins: usize,
     outs: usize,
     width: u32,
-    /// The parameters (by bit) the frame reads one element of.
+    /// The parameters (by bit) the skeleton reads one element of.
     ones: u32,
-    /// How the frame reads each parameter.
+    /// How the skeleton reads each parameter.
     stored: [Stored; MAX_PARAMS],
-    /// The shared memory its body takes beside the frame.
+    /// The shared memory its body takes beside the skeleton.
     shared: Shared,
 }
 
@@ -243,7 +243,7 @@ pub fn synth(region: &Region, ins: &[In], outs: usize) -> Result<Synthesized, Er
     synth_body(&body, ins, outs, region.width)
 }
 
-/// The kernel for `body` (a body in the row frame's hook form) over
+/// The kernel for `body` (a body in the row skeleton's hook form) over
 /// parameters stored as `ins` and `outs` results, rows `width` wide: the
 /// same one for every call with the same body and shape. Nothing compiles
 /// here; [`Synthesized::load`] does.
@@ -264,18 +264,18 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
             refuse(
                 OP,
                 format!(
-                    "parameter {k} is stored {:?}, which the frame does not read",
+                    "parameter {k} is stored {:?}, which the skeleton does not read",
                     form.dtype()
                 ),
             )
         })?;
     }
-    let per = frame::per(OP, width)?;
+    let per = skeleton::per(OP, width)?;
     let root = unit(body)?;
     let laid = |schedule| {
         crate::jit::generated(
             root,
-            &frame::entrypoint(
+            &skeleton::entrypoint(
                 BODY,
                 width,
                 per,
@@ -287,8 +287,9 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
             ),
         )
     };
-    let spread = (frame::block(width, Schedule::Spread) < frame::block(width, Schedule::Packed))
-        .then(|| laid(Schedule::Spread));
+    let spread = (skeleton::block(width, Schedule::Spread)
+        < skeleton::block(width, Schedule::Packed))
+    .then(|| laid(Schedule::Spread));
     Ok(Synthesized {
         kernel: laid(Schedule::Packed),
         spread,
@@ -310,7 +311,7 @@ fn unit(body: &Body) -> Result<Root, Error> {
     static UNITS: OnceLock<Mutex<HashMap<u64, Root>>> = OnceLock::new();
     let text = format!(
         "// A generated row kernel: region body {:016x}.\n\
-         #include \"elemwise/frame.cuh\"\n\n\
+         #include \"elemwise/skeleton.cuh\"\n\n\
          namespace pie::synth {{\n\n{}\n}}\n",
         body.hash, body.source
     );
@@ -410,7 +411,7 @@ impl Synthesized {
                 ),
             ));
         }
-        // The frame reads its parameters through the read-only path, so no
+        // The skeleton reads its parameters through the read-only path, so no
         // result may land over one.
         if outs
             .iter()
@@ -432,7 +433,7 @@ impl Synthesized {
                 ),
             ));
         }
-        frame::fire(
+        skeleton::fire(
             ctx,
             OP,
             kernel,
@@ -485,12 +486,12 @@ mod tests {
 
     fn refused(region: &Region, ins: &[In], outs: &[Out]) -> String {
         supports(region, ins, outs)
-            .expect_err("the frame refuses it")
+            .expect_err("the skeleton refuses it")
             .to_string()
     }
 
     #[test]
-    fn the_frame_takes_a_bf16_residual_norm_up_to_its_widest_row() {
+    fn the_skeleton_takes_a_bf16_residual_norm_up_to_its_widest_row() {
         for width in [8, 1544, 4096, MAX_WIDTH] {
             assert_eq!(
                 supports(&residual_norm(width), &INS, &OUTS),
@@ -511,9 +512,9 @@ mod tests {
     }
 
     #[test]
-    fn a_row_the_frame_does_not_hold_is_refused() {
+    fn a_row_the_skeleton_does_not_hold_is_refused() {
         let why = refused(&residual_norm(MAX_WIDTH + 8), &INS, &OUTS);
-        assert!(why.contains("wider than the frame holds"), "{why}");
+        assert!(why.contains("wider than the skeleton holds"), "{why}");
         let why = refused(&residual_norm(12), &INS, &OUTS);
         assert!(why.contains("not whole vectors of 8"), "{why}");
     }

@@ -1,9 +1,9 @@
-//! The frame: what a kernel runs over, as typed primitives. A backend's
-//! frame provides each over its threads and planes, and its printer names
-//! them; the interpreter's frame ([`crate::interp::OneRow`]) provides them
+//! The skeleton: what a kernel runs over, as typed primitives. A backend's
+//! skeleton provides each over its threads and planes, and its printer names
+//! them; the interpreter's skeleton ([`crate::interp::OneRow`]) provides them
 //! over one row on the host.
 //!
-//! A thread holds elements `0..N` of the row (which columns is the frame's);
+//! A thread holds elements `0..N` of the row (which columns is the skeleton's);
 //! a kernel names an element by that index alone.
 
 use dtype::Dtype;
@@ -11,7 +11,7 @@ use dtype::Dtype;
 use crate::region::Reduce;
 
 /// The primitives a kernel's body calls.
-pub trait Frame {
+pub trait Skeleton {
     /// The elements of the row a thread holds.
     fn elements(&self) -> usize;
     /// Element `e` lies inside the row (one past it reads garbage, and a
@@ -27,7 +27,7 @@ pub trait Frame {
     /// Result `k` is complete.
     fn flush(&mut self, k: u32);
     /// A thread's partial combined over the row's threads, the total to
-    /// every one, as f32. A device frame's partials are f32 in its own
+    /// every one, as f32. A device skeleton's partials are f32 in its own
     /// order; the interpreter's, f64.
     fn reduce(&mut self, op: Reduce, partial: f64) -> f32;
     /// `v` rounded to `dtype` and back: a value the region rounds where it

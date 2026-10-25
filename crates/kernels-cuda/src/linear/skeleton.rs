@@ -1,25 +1,25 @@
-//! The contraction frames: pie's own decode GEMMs (`gemv`, the few-rows
+//! The contraction skeletons: pie's own decode GEMMs (`gemv`, the few-rows
 //! kernel, `skinny`), each a hand-written parallel skeleton
 //! (`linear/contract.cuh`) that hands its products, a few elements of one
 //! row of the product tile at a time, to an epilogue body through the hooks
 //! of `TileHook`.
 //!
 //! - **The epilogue** ([`Epilogue`]): an anchored region's (kernels-ir's
-//!   [`Anchored`]) epilogue scheduled and printed by the row frame's printer
+//!   [`Anchored`]) epilogue scheduled and printed by the row skeleton's printer
 //!   ([`crate::synth::Body`]), whose hooks the tile hook provides, `f.ld(k,
 //!   e)` reading the parts' products below the parts and the inputs above.
 //!   No epilogue is the plain store: each product stored as it is. A region
 //!   over a tile is pointwise (kernels-ir refuses one that is not), so its
 //!   body is the same at every width, and one epilogue serves every `n`.
-//! - **The frames** ([`Frame`]): which shapes each covers, and its fire with
+//! - **The skeletons** ([`Skeleton`]): which shapes each covers, and its fire with
 //!   an epilogue filled in.
 //! - **Identity.** One generated unit a body, `linear/hooked/<hash>.cu`:
-//!   the frames' header and the body's source; one kernel a frame, its
+//!   the skeletons' header and the body's source; one kernel a skeleton, its
 //!   shape class (warps, rows, splits) and the body's planes. The disk cache
 //!   keys the unit's text, the headers and the instantiation, as it does a
 //!   carried unit's.
 //! - **Loading.** A kernel loads on its first fire, as the carried kernels
-//!   these frames replace did: the plain store's body is fixed, and the
+//!   these skeletons replace did: the plain store's body is fixed, and the
 //!   tuner fires it before a capture. An anchored region a load forms
 //!   loads with the model, every kernel a fire of it may take
 //!   ([`Epilogue::load_every`]).
@@ -36,7 +36,7 @@ use crate::jit::{Kernel, Root, refuse};
 use crate::synth::Body;
 use crate::tuning::Tuning;
 
-const OP: &str = "linear.frame";
+const OP: &str = "linear.skeleton";
 
 /// The struct every epilogue body defines, in the namespace its unit puts
 /// it in.
@@ -125,7 +125,7 @@ impl In {
     }
 }
 
-/// An anchored region's epilogue printed for the frames' hook: the body,
+/// An anchored region's epilogue printed for the skeletons' hook: the body,
 /// what its planes are, and whether each product rounds to bf16 before the
 /// body reads it.
 #[derive(Clone, Debug)]
@@ -198,7 +198,7 @@ impl LtEpilogue {
             width: WIDTH as u32,
             ..region.clone()
         };
-        let bf16 = kernels_ir::frame::round_bf16;
+        let bf16 = kernels_ir::skeleton::round_bf16;
         #[allow(clippy::cast_precision_loss)]
         let y: Vec<f32> = (0..WIDTH).map(|i| (i as f32 - 31.5) * 0.190_137).collect();
         #[allow(clippy::cast_precision_loss)]
@@ -231,8 +231,8 @@ impl PartialEq for Epilogue {
 impl Eq for Epilogue {}
 
 impl Epilogue {
-    /// `anchored`'s epilogue printed for the frames' hook, or why no frame
-    /// takes it: a frame reads bf16 operands as they are stored (a prologue
+    /// `anchored`'s epilogue printed for the skeletons' hook, or why no skeleton
+    /// takes it: a skeleton reads bf16 operands as they are stored (a prologue
     /// runs as a region of its own before the product), rounds a product to
     /// bf16 or not at all, and lands bf16 planes.
     pub fn of(anchored: &Anchored) -> Result<Epilogue, Error> {
@@ -243,7 +243,7 @@ impl Epilogue {
         if anchored.prologue.is_some() {
             return Err(refuse(
                 OP,
-                "a prologue: the frames read the operand as it is stored, and one runs as its \
+                "a prologue: the skeletons read the operand as it is stored, and one runs as its \
                  own region before the product",
             ));
         }
@@ -251,7 +251,7 @@ impl Epilogue {
             return Err(refuse(
                 OP,
                 format!(
-                    "the operands are stored {:?}, and the frames read bf16",
+                    "the operands are stored {:?}, and the skeletons read bf16",
                     c.quant
                 ),
             ));
@@ -262,7 +262,7 @@ impl Epilogue {
             Some(other) => {
                 return Err(refuse(
                     OP,
-                    format!("the products round to {other:?}, and the frames round to bf16"),
+                    format!("the products round to {other:?}, and the skeletons round to bf16"),
                 ));
             }
         };
@@ -275,7 +275,7 @@ impl Epilogue {
             return Err(refuse(
                 OP,
                 format!(
-                    "an epilogue of {} input(s) and {} result(s), past the frames' {MAX_INS} and \
+                    "an epilogue of {} input(s) and {} result(s), past the skeletons' {MAX_INS} and \
                      {MAX_OUTS}",
                     inputs.len(),
                     region.results.len()
@@ -338,7 +338,7 @@ impl Epilogue {
         static STORE: OnceLock<&'static Epilogue> = OnceLock::new();
         STORE.get_or_init(|| {
             Epilogue::interned(&Anchored::plain(rule(Layout::Dense)))
-                .expect("the plain store is an epilogue the frames take")
+                .expect("the plain store is an epilogue the skeletons take")
         })
     }
 
@@ -391,7 +391,7 @@ impl Epilogue {
         self.body.hash
     }
 
-    /// The kernel of frame template `template` (`::pie::linear::<template>`)
+    /// The kernel of skeleton template `template` (`::pie::linear::<template>`)
     /// at its shape class `class` with this body filled in.
     pub(crate) fn kernel(&self, template: &str, class: &str) -> &'static Kernel {
         crate::jit::generated(
@@ -449,26 +449,26 @@ impl Epilogue {
     }
 
     /// Compiles every kernel a fire of this body at `n x k` may take (each
-    /// frame at each count of rows it covers, and the unfused leg's row
+    /// skeleton at each count of rows it covers, and the unfused leg's row
     /// kernel) or reads it from the disk cache, and loads it on the current
     /// device: an anchored region a load forms is loaded with the model.
     pub fn load_every(&self, n: u32, k: u32, tuning: &Tuning) -> Result<(), Error> {
         let (ni, ki) = (count_of(n)?, count_of(k)?);
-        let mut frames = Vec::new();
-        for frame in Frame::ALL {
-            let rows: Vec<u32> = match frame {
-                Frame::Gemv => vec![1],
-                Frame::Rows => (1..=ROWS_M).collect(),
+        let mut skeletons = Vec::new();
+        for skeleton in Skeleton::ALL {
+            let rows: Vec<u32> = match skeleton {
+                Skeleton::Gemv => vec![1],
+                Skeleton::Rows => (1..=ROWS_M).collect(),
                 // one kernel at every count of rows
-                Frame::Skinny => vec![1],
+                Skeleton::Skinny => vec![1],
             };
             for m in rows {
-                if frame.covers(self, count_of(m)?, ni, ki, tuning) {
-                    frames.push((frame, m));
+                if skeleton.covers(self, count_of(m)?, ni, ki, tuning) {
+                    skeletons.push((skeleton, m));
                 }
             }
         }
-        self.load(&frames, n, k, tuning)?;
+        self.load(&skeletons, n, k, tuning)?;
         #[cfg(feature = "cuda")]
         if self.leg(n).is_some() && RowLeg::of(self, n).is_none() {
             return Err(refuse(
@@ -479,10 +479,10 @@ impl Epilogue {
         Ok(())
     }
 
-    /// The row frame's region, planes and slices of a row for this body's
-    /// unfused leg over `n` columns, or `None` where the row frame does not
+    /// The row skeleton's region, planes and slices of a row for this body's
+    /// unfused leg over `n` columns, or `None` where the row skeleton does not
     /// carry it: a row in no whole runs of eight, or a region it refuses. A
-    /// row wider than the frame holds is cut into slices of equal width,
+    /// row wider than the skeleton holds is cut into slices of equal width,
     /// each its own launch over every row, so every input reads as it does
     /// whole (a vector a column from the slice's column on).
     fn leg(&self, n: u32) -> Option<LegShape> {
@@ -519,34 +519,34 @@ impl Epilogue {
         })
     }
 
-    /// Compiles every kernel `frames` fires of this body at `n x k` (or
+    /// Compiles every kernel `skeletons` fires of this body at `n x k` (or
     /// reads it from the disk cache) and loads it on the current device: an
     /// epilogue a load forms is loaded with the model, before a fire.
     pub fn load(
         &self,
-        frames: &[(Frame, u32)],
+        skeletons: &[(Skeleton, u32)],
         n: u32,
         k: u32,
         tuning: &Tuning,
     ) -> Result<(), Error> {
-        for &(frame, m) in frames {
-            frame.kernel(self, m, n, k, tuning)?.load()?;
+        for &(skeleton, m) in skeletons {
+            skeleton.kernel(self, m, n, k, tuning)?.load()?;
         }
         Ok(())
     }
 }
 
-/// Whether the contraction frames serve `anchored` at every count of rows
+/// Whether the contraction skeletons serve `anchored` at every count of rows
 /// a fire may hand it, its inputs stored as `ins` and its results as
-/// `outs`, or why not: an epilogue the frames take (bf16 planes in and out)
-/// whose unfused leg the row frame carries, so that a shape no frame covers
+/// `outs`, or why not: an epilogue the skeletons take (bf16 planes in and out)
+/// whose unfused leg the row skeleton carries, so that a shape no skeleton covers
 /// lands all the same ([`crate::linear::gemm::anchored`]). What a compiler
 /// asks before it forms one.
 pub fn serves(anchored: &Anchored, ins: &[Dtype], outs: &[Dtype]) -> Result<(), Error> {
     if let Some(dtype) = ins.iter().chain(outs).find(|d| **d != Dtype::Bf16) {
         return Err(refuse(
             OP,
-            format!("a plane stored {dtype:?}, and the frames read and land bf16"),
+            format!("a plane stored {dtype:?}, and the skeletons read and land bf16"),
         ));
     }
     let epi = Epilogue::interned(anchored)?;
@@ -561,15 +561,15 @@ pub fn serves(anchored: &Anchored, ins: &[Dtype], outs: &[Dtype]) -> Result<(), 
         return Err(refuse(
             OP,
             format!(
-                "the row frame carries no unfused leg of this epilogue over {n} columns, so a \
-                 shape no frame covers would land nothing"
+                "the row skeleton carries no unfused leg of this epilogue over {n} columns, so a \
+                 shape no skeleton covers would land nothing"
             ),
         ));
     }
     Ok(())
 }
 
-/// An epilogue's unfused leg as the row frame takes it.
+/// An epilogue's unfused leg as the row skeleton takes it.
 #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 struct LegShape {
     region: Region,
@@ -615,7 +615,7 @@ fn store(width: u32, parts: u32) -> Region {
 fn unit(body: &Body) -> Result<Root, Error> {
     static UNITS: OnceLock<Mutex<HashMap<u64, Root>>> = OnceLock::new();
     let text = format!(
-        "// A contraction frame's epilogue: region body {:016x}.\n\
+        "// A contraction skeleton's epilogue: region body {:016x}.\n\
          #include \"linear/contract.cuh\"\n\n\
          namespace pie::linear::hooked {{\n\n{}\n}}\n",
         body.hash, body.source
@@ -644,9 +644,9 @@ fn unit(body: &Body) -> Result<Root, Error> {
     Ok(root)
 }
 
-/// A contraction frame.
+/// A contraction skeleton.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Frame {
+pub enum Skeleton {
     /// One row, a warp (or a block split over K) a column.
     Gemv,
     /// 1 to 16 rows, a block's eight warps streaming weight rows; one dense
@@ -656,10 +656,10 @@ pub enum Frame {
     Skinny,
 }
 
-impl Frame {
-    pub const ALL: [Frame; 3] = [Frame::Gemv, Frame::Rows, Frame::Skinny];
+impl Skeleton {
+    pub const ALL: [Skeleton; 3] = [Skeleton::Gemv, Skeleton::Rows, Skeleton::Skinny];
 
-    /// Whether the frame serves `m x n x k` with `epi` filled in under
+    /// Whether the skeleton serves `m x n x k` with `epi` filled in under
     /// `tuning`.
     #[must_use]
     pub fn covers(self, epi: &Epilogue, m: i32, n: i32, k: i32, tuning: &Tuning) -> bool {
@@ -667,15 +667,15 @@ impl Frame {
             return false;
         }
         match self {
-            Frame::Gemv => m == 1,
-            Frame::Rows => epi.parts == 1 && m <= ROWS_M as i32,
-            Frame::Skinny => {
+            Skeleton::Gemv => m == 1,
+            Skeleton::Rows => epi.parts == 1 && m <= ROWS_M as i32,
+            Skeleton::Skinny => {
                 crate::linear::skinny::covers(m, n, k, epi.parts, tuning.gemm_skinny_rows)
             }
         }
     }
 
-    /// The kernel this frame fires at `m x n x k` with `epi` filled in.
+    /// The kernel this skeleton fires at `m x n x k` with `epi` filled in.
     pub(crate) fn kernel(
         self,
         epi: &Epilogue,
@@ -688,9 +688,9 @@ impl Frame {
         {
             let (m, n, k) = (count_of(m)?, count_of(n)?, count_of(k)?);
             match self {
-                Frame::Gemv => Ok(crate::linear::gemv::gemv_kernel(epi, n, tuning).0),
-                Frame::Rows => Ok(crate::linear::gemv::rows_kernel(epi, m, n, k).0),
-                Frame::Skinny => Ok(crate::linear::skinny::kernel(epi)),
+                Skeleton::Gemv => Ok(crate::linear::gemv::gemv_kernel(epi, n, tuning).0),
+                Skeleton::Rows => Ok(crate::linear::gemv::rows_kernel(epi, m, n, k).0),
+                Skeleton::Skinny => Ok(crate::linear::skinny::kernel(epi)),
             }
         }
         #[cfg(not(feature = "cuda"))]
@@ -700,7 +700,7 @@ impl Frame {
         }
     }
 
-    /// `outs = epilogue(act . w^T)` over `m` rows on this frame: `w` the
+    /// `outs = epilogue(act . w^T)` over `m` rows on this skeleton: `w` the
     /// weight (`parts · n x k`), `act` the activation (`m x k`), `ins` the
     /// epilogue's inputs and `outs` its results, each `m x n`.
     #[allow(clippy::too_many_arguments)]
@@ -719,13 +719,13 @@ impl Frame {
         #[cfg(feature = "cuda")]
         {
             match self {
-                Frame::Gemv => {
+                Skeleton::Gemv => {
                     if m != 1 {
                         return Err(refuse(OP, format!("the gemv serves one row, not {m}")));
                     }
                     crate::linear::gemv::gemv(ctx, epi, w, act, ins, outs, n, k)
                 }
-                Frame::Rows => crate::linear::gemv::gemm_rows(
+                Skeleton::Rows => crate::linear::gemv::gemm_rows(
                     ctx,
                     epi,
                     w,
@@ -737,7 +737,7 @@ impl Frame {
                     k,
                     ctx.tuning().pdl,
                 ),
-                Frame::Skinny => {
+                Skeleton::Skinny => {
                     crate::linear::skinny::skinny(ctx, epi, w, act, ins, outs, m, n, k)
                 }
             }
@@ -752,9 +752,9 @@ impl Frame {
 
 /// An epilogue unfused: the products landed by the plain contraction in a
 /// plane of their own, then the epilogue's region over them on the row
-/// frame (`crate::synth`), a row of the product tile a row of the frame (or,
-/// for a row wider than the frame holds, a slice of one a launch). The
-/// candidate a fused frame is measured against.
+/// skeleton (`crate::synth`), a row of the product tile a row of the skeleton (or,
+/// for a row wider than the skeleton holds, a slice of one a launch). The
+/// candidate a fused skeleton is measured against.
 #[cfg(feature = "cuda")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RowLeg {
@@ -769,12 +769,12 @@ pub(crate) struct RowLeg {
 
 #[cfg(feature = "cuda")]
 impl RowLeg {
-    /// The row frame's kernel for `epi` over `n` columns, loaded on the
-    /// current device, or `None` where the row frame does not carry it
+    /// The row skeleton's kernel for `epi` over `n` columns, loaded on the
+    /// current device, or `None` where the row skeleton does not carry it
     /// ([`Epilogue::leg`]).
     pub(crate) fn of(epi: &Epilogue, n: u32) -> Option<RowLeg> {
         /// Each epilogue's leg by body, parts, the products' rounding and
-        /// frame row width.
+        /// skeleton row width.
         type Legs = HashMap<(u64, u32), Option<RowLeg>>;
         static LEGS: OnceLock<Mutex<Legs>> = OnceLock::new();
         let shape = epi.leg(n)?;
@@ -818,7 +818,7 @@ impl RowLeg {
             |base: u64, stride: u32| Plane::rows(&Tensor::new(base, m, stride, self.product));
         let size = self.product.bits() / 8;
         // The leg covers every row its product landed, as the product and
-        // the frames do: a staged window's live count would leave rows past
+        // the skeletons do: a staged window's live count would leave rows past
         // it unwritten.
         let crate::jit::ArgValue::Ptr(stage) = ctx.stage() else {
             unreachable!("a stage window is an address");
@@ -862,7 +862,7 @@ impl RowLeg {
     }
 }
 
-/// The most rows the few-rows frame holds.
+/// The most rows the few-rows skeleton holds.
 pub const ROWS_M: u32 = 16;
 
 #[cfg(test)]
@@ -876,11 +876,11 @@ mod tests {
             epilogue: Some(Pointwise { region, inputs }),
             ..Anchored::plain(rule(layout))
         })
-        .expect("a hand rule's epilogue is one the frames take")
+        .expect("a hand rule's epilogue is one the skeletons take")
     }
 
     #[test]
-    fn the_plain_store_is_an_epilogue_the_frames_take() {
+    fn the_plain_store_is_an_epilogue_the_skeletons_take() {
         let store = Epilogue::store();
         assert_eq!(
             (store.parts(), store.inputs(), store.results()),

@@ -1613,7 +1613,7 @@ impl<'c> Run<'c> {
     pub(crate) fn anchor_epilogue(
         &self,
         key: u64,
-    ) -> Option<&'static kernels_cuda::linear::frame::Epilogue> {
+    ) -> Option<&'static kernels_cuda::linear::skeleton::Epilogue> {
         self.regions.anchor(key)
     }
 

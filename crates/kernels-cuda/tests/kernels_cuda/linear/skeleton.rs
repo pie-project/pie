@@ -1,11 +1,11 @@
-//! The contraction frames (`linear::frame`) with an epilogue filled in land
-//! what the anchored region states: each frame and each epilogue against
+//! The contraction skeletons (`linear::skeleton`) with an epilogue filled in land
+//! what the anchored region states: each skeleton and each epilogue against
 //! kernels-ir's interpreter (`anchor::eval`), within the tolerances below
 //! (in bf16 ulps, as `elemwise::within` counts them), and the same bits on
 //! a second fire.
 //!
-//! - **The contraction's order is the frame's.** The interpreter sums a
-//!   product in f64 and rounds it to f32 once; a frame sums it in f32 in
+//! - **The contraction's order is the skeleton's.** The interpreter sums a
+//!   product in f64 and rounds it to f32 once; a skeleton sums it in f32 in
 //!   its own order (a warp's lanes, a block's slices, mma.sync's tiles), off
 //!   by a few f32 ulps of the sum of its terms' magnitudes. That moves a
 //!   product rounded to bf16 only where it lies that close to a rounding
@@ -20,13 +20,13 @@ use crate::common::linear_ref::t;
 use crate::common::{Gpu, Lcg};
 use crate::elemwise::within::{assert_within, deterministic};
 use dtype::Dtype::{self, Bf16};
-use kernels_cuda::linear::frame::{
-    self, Anchored, Contraction, Epilogue, Frame, In, Input, Layout, Pointwise, Quant,
-};
 use kernels_cuda::linear::gemm;
+use kernels_cuda::linear::skeleton::{
+    self, Anchored, Contraction, Epilogue, In, Input, Layout, Pointwise, Quant, Skeleton,
+};
 use kernels_cuda::tuning::Tuning;
 use kernels_ir::anchor::{Given, eval};
-use kernels_ir::frame::round_bf16;
+use kernels_ir::skeleton::round_bf16;
 use kernels_ir::{Binary, Literal, Op, Region, Shape, Unary};
 
 fn contraction(n: usize, k: usize, layout: Layout, acc: Option<Dtype>) -> Contraction {
@@ -39,7 +39,7 @@ fn contraction(n: usize, k: usize, layout: Layout, acc: Option<Dtype>) -> Contra
     }
 }
 
-/// What a frame is given and what the interpreter is: the epilogue's
+/// What a skeleton is given and what the interpreter is: the epilogue's
 /// region, its inputs, and the contraction's rounding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Case {
@@ -77,7 +77,7 @@ impl Case {
         }
     }
 
-    /// The anchored region at `n x k`, the region a frame's epilogue is
+    /// The anchored region at `n x k`, the region a skeleton's epilogue is
     /// printed from.
     fn anchored(self, n: usize, k: usize) -> Anchored {
         let acc = if self == Case::Every {
@@ -164,7 +164,7 @@ impl Case {
     }
 }
 
-/// A product rounded to bf16, its sum in the frame's order.
+/// A product rounded to bf16, its sum in the skeleton's order.
 const PRODUCT: f32 = 1.0;
 /// A product's ulp and one rounding point after it.
 const ONE_MORE: f32 = 2.0;
@@ -182,7 +182,7 @@ impl Case {
     }
 }
 
-/// The case's inputs at `m x n`: on the device, as the frame reads them, and
+/// The case's inputs at `m x n`: on the device, as the skeleton reads them, and
 /// on the host, as the interpreter does.
 fn inputs(gpu: &mut Gpu, lcg: &mut Lcg, case: Case, m: usize, n: usize) -> (Vec<In>, Vec<Given>) {
     let mut up = |count: usize| {
@@ -218,29 +218,29 @@ fn inputs(gpu: &mut Gpu, lcg: &mut Lcg, case: Case, m: usize, n: usize) -> (Vec<
     (ins, given)
 }
 
-/// Each frame at the rows it serves, each epilogue filled in, against the
+/// Each skeleton at the rows it serves, each epilogue filled in, against the
 /// interpreter.
 #[test]
-fn each_frame_lands_each_epilogue_as_the_interpreter() {
-    // (frame, rows, n, k): the gemv split over K and not (past
+fn each_skeleton_lands_each_epilogue_as_the_interpreter() {
+    // (skeleton, rows, n, k): the gemv split over K and not (past
     // `kernel.gemv.splitk_max_n` columns), the few rows at one, a ragged
     // few and sixteen, the skinny at a ragged few and a full tile.
     #[rustfmt::skip]
     let shapes = [
-        (Frame::Gemv, 1, 256, 512), (Frame::Gemv, 1, 4224, 256),
-        (Frame::Rows, 1, 192, 512), (Frame::Rows, 5, 320, 1024), (Frame::Rows, 16, 128, 256),
-        (Frame::Skinny, 3, 128, 256), (Frame::Skinny, 64, 256, 512),
+        (Skeleton::Gemv, 1, 256, 512), (Skeleton::Gemv, 1, 4224, 256),
+        (Skeleton::Rows, 1, 192, 512), (Skeleton::Rows, 5, 320, 1024), (Skeleton::Rows, 16, 128, 256),
+        (Skeleton::Skinny, 3, 128, 256), (Skeleton::Skinny, 64, 256, 512),
     ];
     let tuning = Tuning::DEFAULT;
-    for (frame, m, n, k) in shapes {
+    for (skeleton, m, n, k) in shapes {
         for case in Case::ALL {
             let anchored = case.anchored(n, k);
-            let epi = Epilogue::interned(&anchored).expect("an epilogue the frames take");
-            let what = format!("{frame:?} {case:?} {m}x{n}x{k}");
-            if !frame.covers(epi, m as i32, n as i32, k as i32, &tuning) {
+            let epi = Epilogue::interned(&anchored).expect("an epilogue the skeletons take");
+            let what = format!("{skeleton:?} {case:?} {m}x{n}x{k}");
+            if !skeleton.covers(epi, m as i32, n as i32, k as i32, &tuning) {
                 assert_eq!(
-                    (frame, case),
-                    (Frame::Rows, Case::Geglu),
+                    (skeleton, case),
+                    (Skeleton::Rows, Case::Geglu),
                     "{what} is covered"
                 );
                 continue;
@@ -255,7 +255,7 @@ fn each_frame_lands_each_epilogue_as_the_interpreter() {
             let outs: Vec<u64> = (0..epi.results()).map(|_| gpu.zeros(m * n * 2)).collect();
             let ctx = gpu.ctx();
             let fire = || {
-                frame
+                skeleton
                     .fire(&ctx, epi, w, act, &ins, &outs, m as i32, n as i32, k as i32)
                     .unwrap_or_else(|e| panic!("{what} fires: {e:?}"));
             };
@@ -280,11 +280,11 @@ fn each_frame_lands_each_epilogue_as_the_interpreter() {
 }
 
 /// A soft cap's and GEGLU's epilogues through the tuner's anchored entry,
-/// its fused frames timed against the product then the region on the row
-/// frame: whichever it picks lands the interpreter's result. A shape no
-/// frame covers lands it on the unfused leg, untimed, a vector a row read
-/// one value a row; one whose leg the row frame does not carry either (a row
-/// in no whole runs of eight) is left to the caller, and `frame::serves`
+/// its fused skeletons timed against the product then the region on the row
+/// skeleton: whichever it picks lands the interpreter's result. A shape no
+/// skeleton covers lands it on the unfused leg, untimed, a vector a row read
+/// one value a row; one whose leg the row skeleton does not carry either (a row
+/// in no whole runs of eight) is left to the caller, and `skeleton::serves`
 /// says so before anything fires.
 #[test]
 fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
@@ -297,7 +297,7 @@ fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
         (Case::Geglu, 8, 256, 512, false),
         (Case::Softcap, 4, 512, 256, true),
         (Case::Geglu, 8, 256, 512, true),
-        // Past every frame's rows: the unfused leg, in place and in scratch.
+        // Past every skeleton's rows: the unfused leg, in place and in scratch.
         (Case::Softcap, 100, 64, 128, false),
         (Case::Geglu, 100, 64, 128, false),
         (Case::Softcap, 100, 64, 128, true),
@@ -307,8 +307,11 @@ fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
         if summed {
             anchored.contraction.acc = None;
         }
-        let epi = Epilogue::interned(&anchored).expect("the frames take it");
-        assert!(frame::serves(&anchored, &[], &[Bf16]).is_ok(), "{case:?}");
+        let epi = Epilogue::interned(&anchored).expect("the skeletons take it");
+        assert!(
+            skeleton::serves(&anchored, &[], &[Bf16]).is_ok(),
+            "{case:?}"
+        );
         let parts = anchored.contraction.layout.parts() as usize;
         let mut gpu = Gpu::open();
         let mut lcg = Lcg::seeded((m + n + k) as u64);
@@ -334,7 +337,7 @@ fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
         let want: Vec<f32> = want[0].iter().map(|&v| round_bf16(v)).collect();
         assert_within(&what, &gpu.down::<u16>(y, m * n), &want, case.tolerance());
     }
-    // A row's scale past every frame's rows: the leg reads it one value a
+    // A row's scale past every skeleton's rows: the leg reads it one value a
     // row.
     let (m, n, k) = (100, 64, 128);
     let row_scaled = |n: usize| Anchored {
@@ -351,8 +354,8 @@ fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
         ..Anchored::plain(contraction(n, k, Layout::Dense, Some(Bf16)))
     };
     let anchored = row_scaled(n);
-    assert!(frame::serves(&anchored, &[Bf16], &[Bf16]).is_ok());
-    let epi = Epilogue::interned(&anchored).expect("the frames take it");
+    assert!(skeleton::serves(&anchored, &[Bf16], &[Bf16]).is_ok());
+    let epi = Epilogue::interned(&anchored).expect("the skeletons take it");
     let mut gpu = Gpu::open();
     let mut lcg = Lcg::seeded(41);
     let ((wr, wv), (ar, av), (sr, sv)) = (lcg.row(n * k), lcg.row(m * k), lcg.row(m));
@@ -372,10 +375,10 @@ fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
     let want = eval(&anchored, m, &av, &wv, &[], &[Given::Row(sv)]).expect("runs");
     let want: Vec<f32> = want[0].iter().map(|&v| round_bf16(v)).collect();
     assert_within("a row's scale", &gpu.down::<u16>(y, m * n), &want, ONE_MORE);
-    // A row in no whole runs of eight: no frame past a few rows, nor a leg.
+    // A row in no whole runs of eight: no skeleton past a few rows, nor a leg.
     let narrow = row_scaled(4);
-    assert!(frame::serves(&narrow, &[Bf16], &[Bf16]).is_err());
-    let epi = Epilogue::interned(&narrow).expect("the frames take it");
+    assert!(skeleton::serves(&narrow, &[Bf16], &[Bf16]).is_err());
+    let epi = Epilogue::interned(&narrow).expect("the skeletons take it");
     let y = gpu.zeros(m * 4 * 2);
     let served = gemm::anchored(
         &gpu.ctx(),
@@ -389,7 +392,7 @@ fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
     assert_eq!(
         served.ok(),
         Some(false),
-        "no frame covers {m} rows, nor a leg"
+        "no skeleton covers {m} rows, nor a leg"
     );
 }
 
@@ -448,7 +451,7 @@ fn lt_region(n: usize, gelu: bool, relu: bool, biased: bool) -> (Region, Vec<Inp
 }
 
 /// cuBLASLt's own epilogue, the fused candidate the tuner times beside the
-/// frames and the unfused leg, lands what the anchored region states over
+/// skeletons and the unfused leg, lands what the anchored region states over
 /// its products as they are summed: a bias, a ReLU and a bias then a ReLU,
 /// at a decode's rows and a prefill's, within the product's sum in another
 /// order (an ulp, two over a long cancelling K; the epilogue's one rounding
@@ -465,7 +468,7 @@ fn cublaslts_own_epilogue_lands_the_anchored_region() {
             epilogue: Some(Pointwise { region, inputs }),
             ..Anchored::plain(contraction(64, 128, Layout::Dense, None))
         };
-        let epi = Epilogue::interned(&anchored).expect("the frames take it");
+        let epi = Epilogue::interned(&anchored).expect("the skeletons take it");
         assert!(epi.lt().is_none(), "a GELU is cuBLASLt's own approximation");
     }
     // A bias over products rounded first is not cuBLASLt's one sum.
@@ -474,7 +477,7 @@ fn cublaslts_own_epilogue_lands_the_anchored_region() {
         epilogue: Some(Pointwise { region, inputs }),
         ..Anchored::plain(contraction(64, 128, Layout::Dense, Some(Bf16)))
     };
-    let epi = Epilogue::interned(&rounded).expect("the frames take it");
+    let epi = Epilogue::interned(&rounded).expect("the skeletons take it");
     assert!(
         epi.lt().is_none(),
         "cuBLASLt rounds no product before its bias"
@@ -493,7 +496,7 @@ fn cublaslts_own_epilogue_lands_the_anchored_region() {
             epilogue: Some(Pointwise { region, inputs }),
             ..Anchored::plain(contraction(n, k, Layout::Dense, None))
         };
-        let epi = Epilogue::interned(&anchored).expect("the frames take it");
+        let epi = Epilogue::interned(&anchored).expect("the skeletons take it");
         assert!(epi.lt().is_some(), "relu {relu} bias {biased}");
         for &m in rows {
             let what = format!("relu {relu} bias {biased}, {m}x{n}x{k}");
@@ -525,7 +528,7 @@ fn cublaslts_own_epilogue_lands_the_anchored_region() {
             let want = eval(&anchored, m, &av, &wv, &[], &given).expect("runs");
             let want: Vec<f32> = want[0].iter().map(|&v| round_bf16(v)).collect();
             assert_within(&what, &gpu.down::<u16>(y, m * n), &want, ONE_MORE);
-            // And through the tuner, a prefill's rows past every frame.
+            // And through the tuner, a prefill's rows past every skeleton.
             if m >= 100 {
                 let y2 = gpu.zeros(m * n * 2);
                 for _ in 0..2 {

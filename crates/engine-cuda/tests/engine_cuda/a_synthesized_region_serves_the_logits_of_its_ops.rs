@@ -383,8 +383,8 @@ const RULED: [(&str, &[&str]); 4] = [
 /// against the products and their ops as their own kernels, the row chains
 /// off in both: GLM-4.5's and GLM-4.7's biased projections (and the
 /// residual adds after their outputs), Gemma 4's GEGLU and soft-capped
-/// logits. A prefill of a few rows (the contraction frames, as the tuner
-/// picks) and one past every frame's (cuBLASLt's bias, the unfused leg),
+/// logits. A prefill of a few rows (the contraction skeletons, as the tuner
+/// picks) and one past every skeleton's (cuBLASLt's bias, the unfused leg),
 /// then the decode steps (the gemv), held as a routed model's logits are
 /// ([`close_past_routing`]).
 #[test]
@@ -466,7 +466,7 @@ fn close_past_routing(got: &[Vec<f32>], want: &[Vec<f32>], carry: &[Vec<f32>], a
 }
 
 /// The unfused ops summing in another order, their products too: an
-/// anchored region's product is a contraction frame's or cuBLASLt's own
+/// anchored region's product is a contraction skeleton's or cuBLASLt's own
 /// algorithm's, each its own order, so its carry is measured on the ops'
 /// products in another algorithm's (one cuBLASLt heuristic, a smaller
 /// workspace).
@@ -474,7 +474,7 @@ const REORDERED: &str =
     "[kernel]\nelemwise.rows_vec = true\ngemm.heuristics = 1\ngemm.workspace_mb = 4\n";
 
 /// The models served by [`an_anchored_region_serves_the_logits_of_its_ops`],
-/// each from a few rows (the contraction frames) and past every frame's,
+/// each from a few rows (the contraction skeletons) and past every skeleton's,
 /// and whether it routes its rows to experts.
 const ANCHORED: [(&str, &[u32], bool); 3] = [
     ("glm45-air-mini", &[37, 100], true),

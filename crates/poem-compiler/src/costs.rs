@@ -63,7 +63,7 @@ pub struct SynthRegions;
 
 /// Whether each matmul and the pointwise ops over its product are lowered
 /// to a kernels-ir anchored region (`fuse::anchor`), for a backend's
-/// contraction frames to fill their hooks with, and the trace folded with
+/// contraction skeletons to fill their hooks with, and the trace folded with
 /// each one `fused.anchored` op ([`crate::fuse::anchor::fold`]), before the
 /// row chains fold. Off unless the backend registers it on
 /// ([`register_regions`], CUDA) or a chip's profile turns it on.
@@ -100,7 +100,7 @@ pub fn register_for(registry: &mut Registry, side_streams: u32, conditionals: Co
 /// [`register`], `compiler.synth_regions` and `compiler.synth_anchors` on
 /// by default: a backend whose rule list leaves the residual norms to
 /// generated row kernels and a product's epilogue to its contraction
-/// frames.
+/// skeletons.
 pub fn register_regions(registry: &mut Registry, side_streams: u32) {
     register_all(registry, side_streams, Conditionals::Native, true);
 }

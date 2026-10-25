@@ -9,8 +9,8 @@
 //! across the passes; one only its own pass reads lives in that pass alone.
 //!
 //! A reduction accumulates each thread's partial over its elements, and its
-//! total is the frame's combine of the partials over the row's threads
-//! ([`crate::frame`]), in whatever order the frame's schedule takes: the
+//! total is the skeleton's combine of the partials over the row's threads
+//! ([`crate::skeleton`]), in whatever order the skeleton's schedule takes: the
 //! order is the kernel's to choose, the sum is the region's. Over heads, a
 //! partial is a vector of 8's (each lies in one head), combined over the
 //! head's vectors.
@@ -28,7 +28,7 @@ use crate::region::{Binary, Elem, Literal, Reduce, Unary, ValueId};
 /// How a kernel reads a value.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Operand {
-    /// Element `e` of row parameter `k` (the frame's load).
+    /// Element `e` of row parameter `k` (the skeleton's load).
     Param(u32),
     /// Scalar parameter `k`, one value a row.
     One(u32),

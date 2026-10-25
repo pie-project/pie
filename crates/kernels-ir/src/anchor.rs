@@ -20,7 +20,7 @@
 //! row (`m`), so it is pointwise in its index space exactly when nothing
 //! in it combines along the inner axis: no reduction (a sum over `n` in an
 //! epilogue is not a function of one `(m, n)`). [`Anchored::verify`] holds
-//! a region to that, so a frame that fills its hooks with one never has to
+//! a region to that, so a skeleton that fills its hooks with one never has to
 //! ask. Its parameters are, in order, the tile's own values (the operand;
 //! each part's product) and then its [`Input`]s, each a tile, a vector a
 //! column, a vector a row or one value.
@@ -37,9 +37,9 @@ use std::fmt;
 
 use dtype::Dtype;
 
-use crate::frame::round_bf16;
 use crate::interp::{self, Arg, InterpError};
 use crate::region::{Op, Region, RegionError, Shape};
+use crate::skeleton::round_bf16;
 
 /// How the weight's rows lay out.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

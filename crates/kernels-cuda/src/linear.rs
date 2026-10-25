@@ -3,7 +3,6 @@ pub mod act_quant;
 pub mod affine;
 pub mod cast;
 pub mod dequant;
-pub mod frame;
 pub mod gemm;
 #[cfg(feature = "cuda")]
 pub mod gemm_sm100;
@@ -16,6 +15,7 @@ pub mod kquant;
 pub mod lane_gemm;
 pub mod lora;
 pub mod moe;
+pub mod skeleton;
 pub mod skinny;
 #[cfg(feature = "cuda")]
 pub mod w8a16;

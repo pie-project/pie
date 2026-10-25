@@ -1,6 +1,6 @@
 //! Anchored regions: a matmul and the pointwise ops over its product tile,
 //! lowered to one kernels-ir [`Anchored`] (a contraction with an epilogue)
-//! that a backend's contraction frames fill their hooks with. The peer of
+//! that a backend's contraction skeletons fill their hooks with. The peer of
 //! the row chains ([`super::chain`]): the same forming, lowering and
 //! folding, anchored on a product instead of a row.
 //!

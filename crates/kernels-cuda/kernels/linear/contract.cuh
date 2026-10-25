@@ -1,25 +1,25 @@
 #pragma once
 
-// The contraction frames: `y = act . w^T` in bf16 over a decode's few rows,
+// The contraction skeletons: `y = act . w^T` in bf16 over a decode's few rows,
 // each a hand-written parallel skeleton that computes the products and hands
 // them, a few elements of one row of the product tile at a time, to an
 // epilogue body through the hooks of `TileHook`. The body is a kernels-ir
-// region over the product tile, printed by kernels-cuda (`linear::frame`);
+// region over the product tile, printed by kernels-cuda (`linear::skeleton`);
 // the plain store is the body that stores each product as it is.
 //
-// - `gemv_frame`, `gemv_splitk_frame`: one row, a warp (or a block split
+// - `gemv_skeleton`, `gemv_splitk_skeleton`: one row, a warp (or a block split
 //   over K) a column.
-// - `rows_frame`: a few rows (up to 16), a block's eight warps streaming
+// - `rows_skeleton`: a few rows (up to 16), a block's eight warps streaming
 //   weight rows.
-// - `skinny_frame`: up to 64 rows on mma.sync, the weight streamed once past
+// - `skinny_skeleton`: up to 64 rows on mma.sync, the weight streamed once past
 //   the activation's rows in shared memory.
 //
-// A body's hooks are the row frame's (`elemwise/frame.cuh`), so one printer
+// A body's hooks are the row skeleton's (`elemwise/skeleton.cuh`), so one printer
 // serves both: `F::N` elements a call, `f.ld(k, e)` (a product where `k` is
 // below the parts, else an input's element), `f.one(k)` (an input's one
 // value a row), `f.st(k, e, v)`, `f.valid(e)`, `f.round_bf16(v)`,
 // `f.col(e)`, `f.sin(v)`, `f.cos(v)` and `f.flush<k>()`. An epilogue reduces nothing (kernels-ir refuses one that
-// does), so a frame offers no reduction.
+// does), so a skeleton offers no reduction.
 
 #include "prim/device.cuh"
 #include "prim/mma_sm80.cuh"
@@ -32,7 +32,7 @@ namespace pie::linear {
 // One of an epilogue's inputs: its element `(row, col)` of the product tile
 // at `base[row * row_stride + col * col_stride]`. A tile is `(ld, 1)`, a
 // vector a column `(0, 1)`, a vector a row `(1, 0)`, one value `(0, 0)`.
-// `kernels_cuda::linear::frame::In` mirrors it.
+// `kernels_cuda::linear::skeleton::In` mirrors it.
 struct EpiIn {
     const bf16* base;
     long long row_stride;
@@ -50,7 +50,7 @@ struct Epi {
 };
 
 // `kN` consecutive elements of one row of the product tile, from column
-// `col`: each of the `P` parts' products, set by the frame (rounded to bf16
+// `col`: each of the `P` parts' products, set by the skeleton (rounded to bf16
 // first where the contraction declares it, `ROUND`), and the body's results
 // held until it flushes them. Every `k` and `e` a body passes is constant
 // once its loops unroll, so the arrays stay in registers.
@@ -68,7 +68,7 @@ struct TileHook {
     __device__ __forceinline__ TileHook(const Epi<IN, OUT>& epi, long long row, int col, int width)
         : epi(epi), row(row), col_(col), width(width) {}
 
-    // The frame's: part `p`'s product at element `e`.
+    // The skeleton's: part `p`'s product at element `e`.
     __device__ __forceinline__ void set(int p, int e, float v) {
         acc[p][e] = ROUND ? round_bf16(v) : v;
     }
@@ -78,7 +78,7 @@ struct TileHook {
     // The product tile's column of element `e`.
     __device__ __forceinline__ unsigned col(int e) const { return static_cast<unsigned>(col_ + e); }
 
-    // An angle's sine and cosine as the row frame turns one.
+    // An angle's sine and cosine as the row skeleton turns one.
     __device__ __forceinline__ float sin(float v) const { return __sinf(v); }
     __device__ __forceinline__ float cos(float v) const { return __cosf(v); }
 
@@ -101,7 +101,7 @@ struct TileHook {
 
     __device__ __forceinline__ float round_bf16(float v) const { return bf16_to_f32(f32_to_bf16(v)); }
 
-    // Result `K`'s elements to memory: whole vectors of 8 where the frame
+    // Result `K`'s elements to memory: whole vectors of 8 where the skeleton
     // holds them (its columns and `ld` whole eights, its planes 16-byte
     // aligned), else one by one.
     template <int K>
@@ -173,7 +173,7 @@ __device__ __forceinline__ float gemv_bf16_row(
 // One row: a warp a column, `kWarps` columns a block, each part's weight
 // row `col + p * N` in turn. Lane 0 hands the column's products to the body.
 template <class Body, int kWarps, int kUnroll, int P, int IN, int OUT, bool ROUND>
-__global__ void gemv_frame(
+__global__ void gemv_skeleton(
     const bf16* __restrict__ weight,
     const bf16* __restrict__ act,
     const Epi<IN, OUT> epi,
@@ -200,7 +200,7 @@ __global__ void gemv_frame(
 // One row, a block a column split over K across its `kWarps` warps: each
 // warp's slice folds across its lanes, and the slices add in warp order.
 template <class Body, int kWarps, int kUnrollP, int P, int IN, int OUT, bool ROUND>
-__global__ void gemv_splitk_frame(
+__global__ void gemv_splitk_skeleton(
     const bf16* __restrict__ weight,
     const bf16* __restrict__ act,
     const Epi<IN, OUT> epi,
@@ -284,7 +284,7 @@ __global__ void gemv_splitk_frame(
 // slice of K and the first adds the blocks' sums in rank order. Each
 // product goes to the body alone: one dense bank.
 template <class Body, int kM, int kSplit, int kCl, int P, int IN, int OUT, bool ROUND>
-__global__ void __launch_bounds__(256) rows_frame(
+__global__ void __launch_bounds__(256) rows_skeleton(
     const bf16* __restrict__ weight,
     const bf16* __restrict__ act,
     const Epi<IN, OUT> epi,
@@ -428,7 +428,7 @@ __device__ __forceinline__ void skinny_cp_async16(void* dst, const void* src, un
                  : "memory");
 }
 
-// The product tile as the skinny frame holds it: bf16 where the contraction
+// The product tile as the skinny skeleton holds it: bf16 where the contraction
 // rounds its products to bf16 (the same values), f32 where it reads them
 // unrounded.
 template <bool ROUND> struct SkinnyTile { using T = float; };
@@ -442,7 +442,7 @@ template <> struct SkinnyTile<true> { using T = bf16; };
 // The products land in a tile over the ring; each thread then hands the body
 // 8 columns of one row, every part's product at each.
 template <class Body, int kWarps, int kStages, int kBK, int P, int IN, int OUT, bool ROUND>
-__global__ __launch_bounds__(kWarps * 32) void skinny_frame(
+__global__ __launch_bounds__(kWarps * 32) void skinny_skeleton(
     const bf16* __restrict__ w,
     const bf16* __restrict__ act,
     const Epi<IN, OUT> epi,
@@ -624,10 +624,10 @@ __global__ __launch_bounds__(kWarps * 32) void skinny_frame(
     }
 }
 
-// The plain store as a contraction frame's body, written by hand: each
-// product stored as it is. The frames' own reference, as `elemwise/frame.cu`
-// is the row frame's; a generated epilogue (`linear::frame`) fires through
-// the same frames.
+// The plain store as a contraction skeleton's body, written by hand: each
+// product stored as it is. The skeletons' own reference, as `elemwise/skeleton.cu`
+// is the row skeleton's; a generated epilogue (`linear::skeleton`) fires through
+// the same skeletons.
 struct Store {
     template <class F>
     __device__ __forceinline__ void operator()(F& f) const {

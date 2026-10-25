@@ -20,7 +20,7 @@
 //!   unfused add does.
 //!
 //! So each region is held to its math by the interpreter (`super::within`):
-//! its sums of squares in the frame's own order, within a norm's ulp. Gemma
+//! its sums of squares in the skeleton's own order, within a norm's ulp. Gemma
 //! 4's layer scale, a weight of one element, is the region's scalar
 //! parameter. The unfused ops are set beside it, not held to it.
 
@@ -85,7 +85,7 @@ impl Chain {
     fn widths(self) -> [usize; 5] {
         match self {
             Chain::ResidualNorm { .. } => [2048, 4096, 5120, 6144, 8192],
-            // 8192 is past the frame with post's six planes; Gemma's widths
+            // 8192 is past the skeleton with post's six planes; Gemma's widths
             Chain::NormResidual { .. } | Chain::ScaledNormResidual => {
                 [1536, 2560, 2816, 3840, 5376]
             }
@@ -269,7 +269,7 @@ fn generated(chain: Chain, width: usize) -> Synthesized {
         })
         .collect();
     let outs = vec![Out::Rows(Bf16); region.results.len()];
-    synth::supports(&region, &ins, &outs).expect("the frame takes the region");
+    synth::supports(&region, &ins, &outs).expect("the skeleton takes the region");
     let kernel = synth::synth(&region, &ins, outs.len()).expect("synthesized");
     kernel
         .load()

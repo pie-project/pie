@@ -3,13 +3,13 @@
 //! A generated row kernel (`kernels_cuda::synth`) lands what the region it
 //! was generated from states (`super::within`'s contract): the printed
 //! bodies of the regions poem lowers against the interpreter, and the
-//! frame's hand residual norm body passed through the same path, against
-//! the frame's own fire of it.
+//! skeleton's hand residual norm body passed through the same path, against
+//! the skeleton's own fire of it.
 
 use crate::common::attn_ref::{ten, tuned};
 use crate::common::{Gpu, Lcg, captured, forget, from_bf16, replay, to_bf16};
 use dtype::Dtype::Bf16;
-use kernels_cuda::elemwise::frame;
+use kernels_cuda::elemwise::skeleton;
 use kernels_cuda::jit::Ctx;
 use kernels_cuda::synth::{self, Body, In, Out, Plane, Region};
 use kernels_ir::interp::Arg;
@@ -54,7 +54,7 @@ fn residual_norm(width: usize) -> Region {
     }
 }
 
-/// The Phase 1 hand body (`elemwise/frame.cu`), its eps a literal, in a
+/// The Phase 1 hand body (`elemwise/skeleton.cu`), its eps a literal, in a
 /// generated body's form: parameters x, y, w; results the normed row and
 /// the stream.
 fn hand_body() -> Body {
@@ -109,7 +109,7 @@ fn loaded(body: &Body, ins: usize, outs: usize, width: usize) -> synth::Synthesi
     kernel
 }
 
-/// `region`'s body, the frame taking it with every plane a bf16 row but
+/// `region`'s body, the skeleton taking it with every plane a bf16 row but
 /// those `shared` names.
 fn body_of(region: &Region, shared: &[usize]) -> Body {
     let ins: Vec<In> = (0..region.params.len())
@@ -122,7 +122,7 @@ fn body_of(region: &Region, shared: &[usize]) -> Body {
         })
         .collect();
     let outs = vec![Out::Rows(Bf16); region.results.len()];
-    synth::supports(region, &ins, &outs).expect("the frame takes the region");
+    synth::supports(region, &ins, &outs).expect("the skeleton takes the region");
     Body::of(region).expect("the row core schedules the region")
 }
 
@@ -134,8 +134,12 @@ fn draw(rows: usize, width: usize, planes: usize) -> (Vec<Vec<u16>>, Vec<u16>) {
 }
 
 /// The stream and normed row `fire` lands over the draw of `rows` rows of
-/// `width`: the frame's hand body or the chain's unfused ops.
-fn residual_norm_by(fire: super::frame::Fire, rows: usize, width: usize) -> (Vec<u16>, Vec<u16>) {
+/// `width`: the skeleton's hand body or the chain's unfused ops.
+fn residual_norm_by(
+    fire: super::skeleton::Fire,
+    rows: usize,
+    width: usize,
+) -> (Vec<u16>, Vec<u16>) {
     let n = rows * width;
     let (planes, w) = draw(rows, width, 2);
     let mut gpu = Gpu::open();
@@ -160,7 +164,7 @@ fn residual_norm_by(fire: super::frame::Fire, rows: usize, width: usize) -> (Vec
 }
 
 #[test]
-fn the_hand_body_through_synth_lands_the_frames_bits() {
+fn the_hand_body_through_synth_lands_the_skeletons_bits() {
     let body = hand_body();
     for width in WIDTHS {
         let kernel = loaded(&body, 3, 2, width);
@@ -190,7 +194,7 @@ fn the_hand_body_through_synth_lands_the_frames_bits() {
                 .fire(&gpu.ctx(), &ins, &[plane(out), plane(h)], rows as u32)
                 .expect("the hand body fires");
             gpu.sync();
-            let (y_want, out_want) = residual_norm_by(frame::residual_add_rmsnorm, rows, width);
+            let (y_want, out_want) = residual_norm_by(skeleton::residual_add_rmsnorm, rows, width);
             let case = format!("{rows} rows of {width}");
             assert!(gpu.down::<u16>(h, n) == y_want, "{case}: the summed stream");
             assert!(
@@ -203,7 +207,7 @@ fn the_hand_body_through_synth_lands_the_frames_bits() {
 
 /// The residual norm's region against the interpreter: the stream is IEEE
 /// adds and lands the reference's bits; the norm sums its squares in the
-/// frame's order, within [`NORM`] of the reference; two fires land the same
+/// skeleton's order, within [`NORM`] of the reference; two fires land the same
 /// bits. The unfused ops are shown beside it, not held to it.
 #[test]
 fn a_residual_norms_region_lands_its_math() {
@@ -246,7 +250,7 @@ fn a_residual_norms_region_lands_its_math() {
             });
             assert_within(&format!("{case}: the stream"), &h, &want[0], EXACT);
             assert_within(&format!("{case}: the normed row"), &out, &want[1], NORM);
-            let (_, unfused) = residual_norm_by(super::frame::unfused, rows, width);
+            let (_, unfused) = residual_norm_by(super::skeleton::unfused, rows, width);
             let apart = out.iter().zip(&unfused).filter(|(a, b)| a != b).count();
             eprintln!("{case}: {apart} of {n} normed elements apart from the unfused ops");
         }

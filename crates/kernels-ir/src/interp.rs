@@ -1,5 +1,5 @@
 //! The reference interpreter of both forms: a region op by op, and a
-//! kernel phase by phase over a frame. Each takes the same math (the host's
+//! kernel phase by phase over a skeleton. Each takes the same math (the host's
 //! f32, a reduction's sum in f64, rounded to f32 once), so a kernel run here
 //! lands its region's bits: the schedule moves where a value is computed
 //! and kept, never what it is. A device's kernel sums in its own order, in
@@ -10,11 +10,11 @@ use std::fmt;
 
 use dtype::Dtype;
 
-use crate::frame::{Frame, round_bf16};
 use crate::kernel::{Expr, Kernel, Operand, Table};
 use crate::region::{
     Binary, Elem, Literal, Op, Reduce, Region, RegionError, Shape, Unary, ValueId,
 };
+use crate::skeleton::{Skeleton, round_bf16};
 
 /// A parameter's value at one row.
 #[derive(Clone, Debug, PartialEq)]
@@ -328,7 +328,7 @@ pub fn eval(region: &Region, args: &[Arg]) -> Result<Vec<Vec<f32>>, InterpError>
         .collect())
 }
 
-/// The frame of one row on the host: one thread holding the whole row, its
+/// The skeleton of one row on the host: one thread holding the whole row, its
 /// results' planes each of the dtype the region rounds them to (f32 where
 /// it does not).
 #[derive(Clone, Debug)]
@@ -342,7 +342,7 @@ pub struct OneRow {
 }
 
 impl OneRow {
-    /// The frame over `args`, the results of `region`.
+    /// The skeleton over `args`, the results of `region`.
     pub fn of(region: &Region, args: &[Arg]) -> Result<OneRow, InterpError> {
         let width = region.width as usize;
         let mut rows = Vec::new();
@@ -371,7 +371,7 @@ impl OneRow {
     }
 }
 
-impl Frame for OneRow {
+impl Skeleton for OneRow {
     fn elements(&self) -> usize {
         self.width
     }
@@ -439,10 +439,10 @@ struct State {
     table: Vec<f32>,
 }
 
-/// `kernel` run over `frame`, phase by phase: what a printed kernel does on
+/// `kernel` run over `skeleton`, phase by phase: what a printed kernel does on
 /// a device, on the host.
-pub fn run(kernel: &Kernel, frame: &mut impl Frame) {
-    let n = frame.elements();
+pub fn run(kernel: &Kernel, skeleton: &mut impl Skeleton) {
+    let n = skeleton.elements();
     let mut st = State {
         kept: kernel
             .kept
@@ -460,22 +460,22 @@ pub fn run(kernel: &Kernel, frame: &mut impl Frame) {
     let none = BTreeMap::new();
     for (at, phase) in kernel.phases.iter().enumerate() {
         for u in &phase.uniforms {
-            let mut x = eval_expr(&u.expr, frame, &st, &none, 0);
+            let mut x = eval_expr(&u.expr, skeleton, &st, &none, 0);
             if let Some(dtype) = u.round {
-                x = V::F(frame.round(dtype, x.f()));
+                x = V::F(skeleton.round(dtype, x.f()));
             }
             st.uniforms.insert(u.value, x);
         }
         if at == 0 {
             for t in &kernel.tables {
-                fill(t, frame, &mut st);
+                fill(t, skeleton, &mut st);
             }
         }
         for h in &phase.heads {
             for p in 0..n.div_ceil(8) {
-                let mut x = eval_expr(&h.expr, frame, &st, &none, p * 8);
+                let mut x = eval_expr(&h.expr, skeleton, &st, &none, p * 8);
                 if let Some(dtype) = h.round {
-                    x = V::F(frame.round(dtype, x.f()));
+                    x = V::F(skeleton.round(dtype, x.f()));
                 }
                 st.heads.get_mut(&h.value).expect("a value one a head")[p] = x;
             }
@@ -491,15 +491,15 @@ pub fn run(kernel: &Kernel, frame: &mut impl Frame) {
         for e in 0..n {
             let mut local: BTreeMap<ValueId, V> = BTreeMap::new();
             for row in &pass.rows {
-                let mut x = eval_expr(&row.expr, frame, &st, &local, e);
+                let mut x = eval_expr(&row.expr, skeleton, &st, &local, e);
                 if let Some(dtype) = row.round {
-                    x = V::F(frame.round(dtype, x.f()));
+                    x = V::F(skeleton.round(dtype, x.f()));
                 }
                 if let Some(k) = row.store {
-                    x = V::F(frame.store(k, e, x.f()));
+                    x = V::F(skeleton.store(k, e, x.f()));
                 }
                 for &k in &row.also {
-                    frame.store(k, e, x.f());
+                    skeleton.store(k, e, x.f());
                 }
                 if row.kept {
                     st.kept.get_mut(&row.value).expect("a kept value")[e] = x;
@@ -507,38 +507,38 @@ pub fn run(kernel: &Kernel, frame: &mut impl Frame) {
                 local.insert(row.value, x);
             }
             for &(k, from) in &pass.copies {
-                let x = frame.load(from, e);
-                frame.store(k, e, x);
+                let x = skeleton.load(from, e);
+                skeleton.store(k, e, x);
             }
             for (i, p) in pass.partials.iter().enumerate() {
-                let x = operand(p.input, frame, &st, &local, e).f();
+                let x = operand(p.input, skeleton, &st, &local, e).f();
                 let slot = if p.seg.is_some() { e / 8 } else { 0 };
-                if frame.valid(e) {
+                if skeleton.valid(e) {
                     acc[i][slot] = combine(p.op, acc[i][slot], f64::from(x));
                 }
             }
             for &share in &pass.shares {
-                let x = operand(share, frame, &st, &local, e).f();
-                frame.share(e, x);
+                let x = operand(share, skeleton, &st, &local, e).f();
+                skeleton.share(e, x);
             }
         }
         for &k in &pass.flushes {
-            frame.flush(k);
+            skeleton.flush(k);
         }
         for (i, t) in pass.totals.iter().enumerate() {
             if let Some(seg) = t.seg {
-                frame.reduce_heads(t.op, seg, &mut acc[i]);
+                skeleton.reduce_heads(t.op, seg, &mut acc[i]);
                 let heads: Vec<V> = acc[i]
                     .iter()
                     .map(|&x| narrowed(x))
-                    .map(|x| V::F(t.round.map_or(x, |dtype| frame.round(dtype, x))))
+                    .map(|x| V::F(t.round.map_or(x, |dtype| skeleton.round(dtype, x))))
                     .collect();
                 st.heads.insert(t.value, heads);
                 continue;
             }
-            let mut x = frame.reduce(t.op, acc[i][0]);
+            let mut x = skeleton.reduce(t.op, acc[i][0]);
             if let Some(dtype) = t.round {
-                x = frame.round(dtype, x);
+                x = skeleton.round(dtype, x);
             }
             st.uniforms.insert(t.value, V::F(x));
         }
@@ -546,7 +546,7 @@ pub fn run(kernel: &Kernel, frame: &mut impl Frame) {
 }
 
 /// A table's entries, each computed from its column.
-fn fill(t: &Table, frame: &impl Frame, st: &mut State) {
+fn fill(t: &Table, skeleton: &impl Skeleton, st: &mut State) {
     for c in 0..t.period {
         let mut entries: BTreeMap<ValueId, V> = BTreeMap::new();
         for &(value, _, expr) in &t.entries {
@@ -555,7 +555,7 @@ fn fill(t: &Table, frame: &impl Frame, st: &mut State) {
         }
         st.table[(t.at + c) as usize] = entries[&t.value].f();
     }
-    let _ = frame;
+    let _ = skeleton;
 }
 
 fn entry_expr(expr: &Expr, st: &State, entries: &BTreeMap<ValueId, V>, c: u32) -> V {
@@ -592,17 +592,19 @@ fn apply(expr: &Expr, o: impl Fn(Operand) -> V) -> V {
 
 fn operand(
     o: Operand,
-    frame: &impl Frame,
+    skeleton: &impl Skeleton,
     st: &State,
     local: &BTreeMap<ValueId, V>,
     e: usize,
 ) -> V {
     match o {
-        Operand::Param(k) => V::F(frame.load(k, e)),
-        Operand::One(k) => V::F(frame.one(k)),
+        Operand::Param(k) => V::F(skeleton.load(k, e)),
+        Operand::One(k) => V::F(skeleton.one(k)),
         Operand::Kept(v) => st.kept[&v][e],
         Operand::Heads(v) => st.heads[&v][e / 8],
-        Operand::Table { at, period } => V::F(st.table[(at + frame.column(e) % period) as usize]),
+        Operand::Table { at, period } => {
+            V::F(st.table[(at + skeleton.column(e) % period) as usize])
+        }
         Operand::Local(v) | Operand::Entry(v) => local
             .get(&v)
             .or_else(|| st.uniforms.get(&v))
@@ -613,15 +615,15 @@ fn operand(
 
 fn eval_expr(
     expr: &Expr,
-    frame: &impl Frame,
+    skeleton: &impl Skeleton,
     st: &State,
     local: &BTreeMap<ValueId, V>,
     e: usize,
 ) -> V {
     match *expr {
-        Expr::Column => V::U(frame.column(e)),
-        Expr::Peer(at) => V::F(frame.peer(operand(at, frame, st, local, e).u())),
-        _ => apply(expr, |x| operand(x, frame, st, local, e)),
+        Expr::Column => V::U(skeleton.column(e)),
+        Expr::Peer(at) => V::F(skeleton.peer(operand(at, skeleton, st, local, e).u())),
+        _ => apply(expr, |x| operand(x, skeleton, st, local, e)),
     }
 }
 
@@ -662,9 +664,9 @@ mod tests {
     fn both(region: &Region, args: &[Arg]) -> (Vec<Vec<f32>>, Vec<Vec<f32>>) {
         let want = eval(region, args).expect("the region runs");
         let kernel = schedule(region).expect("the row core schedules it");
-        let mut frame = OneRow::of(region, args).expect("a frame of the arguments");
-        run(&kernel, &mut frame);
-        (frame.out, want)
+        let mut skeleton = OneRow::of(region, args).expect("a skeleton of the arguments");
+        run(&kernel, &mut skeleton);
+        (skeleton.out, want)
     }
 
     fn bits(rows: &[Vec<f32>]) -> Vec<Vec<u32>> {

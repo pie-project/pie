@@ -1,6 +1,6 @@
 #![cfg(feature = "cuda")]
 
-//! The contract a generated row kernel (and a hand body in the row frame)
+//! The contract a generated row kernel (and a hand body in the row skeleton)
 //! is held to, and its tolerances.
 //!
 //! - **The reference** is the kernels-ir interpreter (`interp::eval`): the
@@ -19,7 +19,7 @@
 //!   edge, by one ulp: [`NORM`]. Each rounding point between a norm and a
 //!   result can carry that ulp on, one more each: a norm's row rounded and
 //!   then scaled, [`NORM_SCALED`].
-//! - **A turn's angle is the frame's** (`__sincosf`, as the hand rotation
+//! - **A turn's angle is the skeleton's** (`__sincosf`, as the hand rotation
 //!   kernels turn one): within 2^-20.9 of the true sine on |x| <= 100π, and
 //!   coarser past it. Its frequency `powf` is within 2 f32 ulps, so at a
 //!   position `p` the angle is off by up to `p · 2^-22`, 0.008 rad at the
@@ -102,7 +102,7 @@ pub(super) fn reference(
         let results =
             kernels_ir::interp::eval(region, &args(r)).expect("the interpreter runs the region");
         for (k, row) in results.into_iter().enumerate() {
-            out[k].extend(row.into_iter().map(kernels_ir::frame::round_bf16));
+            out[k].extend(row.into_iter().map(kernels_ir::skeleton::round_bf16));
         }
     }
     out

@@ -6,7 +6,7 @@
 //! epilogue, and the interpreter lands what the ops do over it.
 
 use kernels_ir::anchor::{Given, eval};
-use kernels_ir::frame::round_bf16;
+use kernels_ir::skeleton::round_bf16;
 use kernels_ir::{Anchored, Input, Layout};
 use poem::ops::{attn, elemwise, linear};
 use poem::pattern::{Pattern, template};

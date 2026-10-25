@@ -462,9 +462,9 @@ mod tests {
                 ],
             ),
             (
-                "elemwise/frame.cu",
+                "elemwise/skeleton.cu",
                 &[
-                    "::pie::elemwise::row_frame<::pie::elemwise::ResidualAddRmsnorm<false>, 256, 256, 4, 3, 2>",
+                    "::pie::elemwise::row_skeleton<::pie::elemwise::ResidualAddRmsnorm<false>, 256, 256, 4, 3, 2>",
                 ],
             ),
             (
@@ -508,10 +508,10 @@ mod tests {
             (
                 "linear/contract.cu",
                 &[
-                    "::pie::linear::gemv_frame<::pie::linear::Store, 4, 4, 1, 0, 1, true>",
-                    "::pie::linear::gemv_splitk_frame<::pie::linear::Store, 8, 1, 1, 0, 1, true>",
-                    "::pie::linear::rows_frame<::pie::linear::Store, 4, 8, 1, 1, 0, 1, true>",
-                    "::pie::linear::skinny_frame<::pie::linear::Store, 4, 2, 128, 1, 0, 1, true>",
+                    "::pie::linear::gemv_skeleton<::pie::linear::Store, 4, 4, 1, 0, 1, true>",
+                    "::pie::linear::gemv_splitk_skeleton<::pie::linear::Store, 8, 1, 1, 0, 1, true>",
+                    "::pie::linear::rows_skeleton<::pie::linear::Store, 4, 8, 1, 1, 0, 1, true>",
+                    "::pie::linear::skinny_skeleton<::pie::linear::Store, 4, 2, 128, 1, 0, 1, true>",
                 ],
             ),
             (

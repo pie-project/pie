@@ -291,11 +291,11 @@ fn a_folded_trace_plans_as_it_stands() {
         !ops.is_empty(),
         "a qwen3 forward has a residual norm a layer"
     );
-    let framed = formed
+    let held = formed
         .iter()
-        .filter(|chain| poem_compiler::fuse::chain::frames(&t, chain, chain.region.width))
+        .filter(|chain| poem_compiler::fuse::chain::skeleton_holds(&t, chain, chain.region.width))
         .count();
-    assert_eq!(ops.len(), framed, "each chain the frame holds is one op");
+    assert_eq!(ops.len(), held, "each chain the skeleton holds is one op");
     for (ins, outs, key) in &ops {
         let region = bodies.get(key).expect("the op's region is held");
         assert_eq!(region.key(), *key);
@@ -350,7 +350,7 @@ fn a_residual_add_and_the_next_layers_norm_form_one_region() {
     );
 }
 
-/// The arena lands no region's output over one of its inputs: a row frame
+/// The arena lands no region's output over one of its inputs: a row skeleton
 /// reads its row whole before it writes any of it, but a block's row is
 /// not another block's.
 #[test]
@@ -381,7 +381,7 @@ fn no_region_lands_an_output_over_its_input() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// Every catalog deployment, on CUDA, folded: each chain the row frame holds
+/// Every catalog deployment, on CUDA, folded: each chain the row skeleton holds
 /// one op, and the trace still checks.
 #[test]
 fn every_folded_catalog_trace_checks() {
@@ -390,14 +390,14 @@ fn every_folded_catalog_trace_checks() {
         let t = row.trace(poem::Platform::Cuda);
         let (folded, bodies) = fold(t.clone());
         let ops = regions(&folded);
-        let framed = chains(&t)
+        let held = chains(&t)
             .into_iter()
             .filter(|chain| {
                 schedule(&chain.region).is_ok()
-                    && poem_compiler::fuse::chain::frames(&t, chain, chain.region.width)
+                    && poem_compiler::fuse::chain::skeleton_holds(&t, chain, chain.region.width)
             })
             .count();
-        if ops.len() != framed {
+        if ops.len() != held {
             wrong.push(format!("{}: a chain is not folded", row.name));
         }
         if ops.iter().any(|(_, _, body)| !bodies.contains_key(body)) {

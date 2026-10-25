@@ -1,5 +1,5 @@
 //! A kernel (kernels-ir's kernel form) printed as CUDA C++ over the row
-//! frame's hooks (`elemwise/frame.cuh`): one struct, pure computation.
+//! skeleton's hooks (`elemwise/skeleton.cuh`): one struct, pure computation.
 //!
 //! ```cpp
 //! struct Body {
@@ -7,8 +7,8 @@
 //! };
 //! ```
 //!
-//! fired as `::pie::elemwise::row_frame<Body, BLOCK, PER, IN, OUT, ...>`. The
-//! frame's primitives ([`kernels_ir::frame::Frame`]) are its hooks:
+//! fired as `::pie::elemwise::row_skeleton<Body, BLOCK, PER, IN, OUT, ...>`. The
+//! skeleton's primitives ([`kernels_ir::skeleton::Skeleton`]) are its hooks:
 //!
 //! | primitive | hook |
 //! |---|---|
@@ -26,11 +26,11 @@
 //! A table is `f.table()`, its entries written a column a thread
 //! (`f.thread()` on by `F::THREADS`) and complete for the block
 //! (`f.sync_block()`) before the first pass. A value one a head is an array
-//! of `F::PER`, one a vector of 8. Sines and cosines are the frame's
+//! of `F::PER`, one a vector of 8. Sines and cosines are the skeleton's
 //! (`f.sin`, `f.cos`: an angle as its kernels turn one).
 //!
 //! Every `k` and `e` the body passes is a constant once its loops unroll, so
-//! the frame's arrays stay in registers. The math is f32 through `expf`,
+//! the skeleton's arrays stay in registers. The math is f32 through `expf`,
 //! `logf`, `sinf`, `cosf`, `sqrtf`, `rsqrtf`, `fmaxf`, `fminf` and `fmodf`,
 //! each op as the kernel states it, in its order (the JIT compiles with
 //! `fmad=false`, so a product and a sum stay two roundings).
@@ -365,7 +365,7 @@ fn combine(op: Reduce, acc: &str, x: &str) -> String {
 }
 
 /// A reduction combined over the row: `reduce_sum` and `reduce_max` are the
-/// frame's; a minimum is the negated maximum of the negated partials.
+/// skeleton's; a minimum is the negated maximum of the negated partials.
 fn finish(op: Reduce, value: u32) -> String {
     match op {
         Reduce::Sum => format!("f.reduce_sum(a{value})"),
