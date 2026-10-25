@@ -23,6 +23,12 @@
 //! gathered instead, where one gather puts the share back in order: the
 //! column cut is kept, and the projection after it runs whole on every rank.
 //!
+//! A chain of cuts (the column cuts whose shares meet, and the row cuts and
+//! weights cut with them) is kept only where it saves what its collectives
+//! cost: one far lighter than the rows it reduces or gathers, which no
+//! attention or scan reads (a low-rank pair on a wide row), is put back
+//! whole, and the trace read again (`NARROW` says how light).
+//!
 //! A packed product's segments are where the ops that read its share take
 //! it apart, and a segment's heads are what an op reading it `head_dim`
 //! wide, or packing heads it counts, says it holds; a weight an op reads one
@@ -94,6 +100,25 @@ const PER_HEAD: [(&str, &str); 26] = [
     ("ssm.mamba2_chunked", "norm"),
 ];
 
+/// The op families whose work is not a product's: an attention or a scan,
+/// whose work grows with the context a sequence holds and whose cache or
+/// state a cut divides with its heads. A chain whose share one reads is cut
+/// whatever its weights weigh.
+const CONTEXT: [&str; 2] = ["attn.", "ssm."];
+
+/// How much lighter than the products its collectives pay for a chain may
+/// be before it stays whole. A collective moves a row `w` wide, as a
+/// Megatron pair's does: that pair (attention's q and o, an MLP's up and
+/// down) holds at least `w * w` a rank's cut divides by `tp`, and its saving
+/// is what pays for the collective, its latency and its `w` elements over
+/// the link. A chain holding under an eighth of `w * w` for each row it
+/// moves (a low-rank pair a few hundred wide on a row of thousands, a
+/// sixteenth) saves too little for the same collective, at any count of
+/// ranks, and stays whole; a layer's attention and MLP hold several times
+/// `w * w`. The cost is read in the model's own widths, not a machine's, so
+/// a row and its miniature cut alike, whatever their format or batch.
+const NARROW: u64 = 8;
+
 /// The weights an op reads one row a group of its shares' heads, and the
 /// field that counts its groups: a rank holds whole groups of them.
 const GROUPED: [(&str, &str, &str); 2] = [
@@ -154,6 +179,7 @@ fn inferred(trace: &Trace, pinned: BTreeSet<usize>, world: u32) -> (Vec<Shard>, 
                     .filter(|p| !splits(&shards[*p], world))
                     .map(|p| reading.owner[p].unwrap_or(p)),
             );
+            rejected.extend(walk.cheap());
             if rejected.is_subset(&whole) {
                 return (shards, lead);
             }
@@ -310,6 +336,19 @@ struct Walk<'r, 't> {
     groups: BTreeSet<ValueId>,
     /// The groups a weight read one row a group holds.
     grouped: BTreeMap<usize, u64>,
+    /// The column cuts each other cut weight is cut with: the shares a row
+    /// cut contracts, or a weight is read beside.
+    with: BTreeMap<usize, BTreeSet<usize>>,
+    /// Each cut weight's elements, once for every op that reads it cut.
+    work: Vec<(usize, u64)>,
+    /// The values a collective moves, and the column cuts whose shares they
+    /// are or sum: partial sums an op reduces, a share a whole product
+    /// gathers.
+    moved: BTreeMap<ValueId, BTreeSet<usize>>,
+    /// Column cuts whose shares an op reads together.
+    met: Vec<BTreeSet<usize>>,
+    /// Column cuts whose shares an attention or a scan reads.
+    context: BTreeSet<usize>,
 }
 
 impl<'r, 't> Walk<'r, 't> {
@@ -330,6 +369,11 @@ impl<'r, 't> Walk<'r, 't> {
             rejected: BTreeSet::new(),
             groups: BTreeSet::new(),
             grouped: BTreeMap::new(),
+            with: BTreeMap::new(),
+            work: Vec::new(),
+            moved: BTreeMap::new(),
+            met: Vec::new(),
+            context: BTreeSet::new(),
         }
     }
 
@@ -345,6 +389,7 @@ impl<'r, 't> Walk<'r, 't> {
         for seam in &trace.seams {
             if super::output(&seam.seam) {
                 for v in &seam.values {
+                    self.reduce(*v);
                     self.want_whole(*v);
                 }
             }
@@ -506,7 +551,14 @@ impl<'r, 't> Walk<'r, 't> {
             }
             return;
         }
-        let held = match rules::rule_of(op, |v| self.width(v)) {
+        let rule = rules::rule_of(op, |v| self.width(v));
+        // Partial sums any op but a sum reads are reduced first.
+        if !matches!(rule, Rule::Linear { .. }) {
+            for v in &ins {
+                self.reduce(*v);
+            }
+        }
+        let held = match rule {
             Rule::Groups => {
                 // Group indices read no value; they follow whatever the
                 // grouped product groups.
@@ -570,12 +622,16 @@ impl<'r, 't> Walk<'r, 't> {
                 for v in read(follow) {
                     self.read_whole(v);
                 }
-                let helds: Vec<Held> = follow
-                    .iter()
-                    .flat_map(|n| field(n))
-                    .map(|v| self.held(v))
-                    .collect();
-                vec![self.joined(&helds); outs.len()]
+                let followed: Vec<ValueId> = follow.iter().flat_map(|n| field(n)).collect();
+                let helds: Vec<Held> = followed.iter().map(|v| self.held(*v)).collect();
+                let held = self.joined(&helds);
+                // Partial sums added to what is not are reduced first.
+                if !matches!(held, Held::Partial(_)) {
+                    for v in followed {
+                        self.reduce(v);
+                    }
+                }
+                vec![held; outs.len()]
             }
             Rule::Contract { act, w, out, input } => {
                 let a = field(act)[0];
@@ -592,10 +648,13 @@ impl<'r, 't> Walk<'r, 't> {
                 let one = match share.clone() {
                     Held::Split(origins) => {
                         if self.decide(p, Cut::Row(input)) {
+                            self.cut_with(p, &origins);
                             Held::Partial(origins)
                         } else if self.pinned.contains(&p) && self.gathers(a, &share) {
                             // A weight the model states whole reads its
                             // share gathered.
+                            let from = origins.iter().map(|o| o.param).collect();
+                            self.moved.insert(a, from);
                             Held::Whole
                         } else {
                             self.reject(&origins)
@@ -607,6 +666,7 @@ impl<'r, 't> Walk<'r, 't> {
                             .and_then(|s| s.get(out as usize).copied());
                         match extent {
                             Some(hi) if self.decide(p, Cut::Column(out)) => {
+                                self.cut_with(p, &BTreeSet::new());
                                 Held::Split(BTreeSet::from([Origin {
                                     param: p,
                                     lo: 0,
@@ -640,6 +700,27 @@ impl<'r, 't> Walk<'r, 't> {
         }
     }
 
+    /// Weight `p` cut with the column cuts `origins` came from: weighed in
+    /// their chain.
+    fn cut_with(&mut self, p: usize, origins: &BTreeSet<Origin>) {
+        let elements = self.reading.logical[p]
+            .as_ref()
+            .map_or(0, |shape| shape.iter().product());
+        self.work.push((p, elements));
+        let from = origins.iter().map(|o| o.param);
+        self.with.entry(p).or_default().extend(from);
+    }
+
+    /// `v` reduced, if the ranks hold partial sums of it.
+    fn reduce(&mut self, v: ValueId) {
+        if let Held::Partial(origins) = self.held(v)
+            && !origins.is_empty()
+        {
+            self.moved
+                .insert(v, origins.iter().map(|o| o.param).collect());
+        }
+    }
+
     /// Weight `p`, read beside `like` (a value held as `share`): cut along
     /// its axis as wide as that share, its leading one if `rows` lets a
     /// narrower one hold a row a head, else whole.
@@ -663,7 +744,9 @@ impl<'r, 't> Walk<'r, 't> {
         match axis {
             Some(axis) => {
                 let cut = Cut::Beside(axis as u32, origins.clone());
-                if !self.decide(p, cut) {
+                if self.decide(p, cut) {
+                    self.cut_with(p, origins);
+                } else {
                     self.reject(origins);
                 }
             }
@@ -723,6 +806,10 @@ impl<'r, 't> Walk<'r, 't> {
             return vec![held; outs.len()];
         }
         let all = shares(&helds);
+        self.met.push(all.iter().map(|o| o.param).collect());
+        if CONTEXT.iter().any(|family| op.name().starts_with(family)) {
+            self.context.extend(all.iter().map(|o| o.param));
+        }
         self.count_heads(op, t, &followed, &helds, others);
         // Weights the op reads beside its shares are cut as they are.
         let like = followed.first().map(|(_, v)| *v);
@@ -932,7 +1019,67 @@ impl<'r, 't> Walk<'r, 't> {
         }
     }
 
-    /// Each param's cut, as the walk left them.
+    /// The column cuts of each chain that saves less than its collectives
+    /// cost, to be put back whole: a chain is the column cuts whose shares
+    /// meet, and the row cuts and weights cut with them; it stays whole when
+    /// it holds less than a [`NARROW`]th of the square of each row its
+    /// collectives move, and no attention or scan reads its share. A
+    /// product whose input arrives cut is weighed in the chain that cut it,
+    /// so a light one follows a heavy chain's cut.
+    fn cheap(&self) -> BTreeSet<usize> {
+        let mut chain: BTreeMap<usize, usize> = BTreeMap::new();
+        fn root(chain: &mut BTreeMap<usize, usize>, p: usize) -> usize {
+            let up = *chain.entry(p).or_insert(p);
+            if up == p {
+                return p;
+            }
+            let top = root(chain, up);
+            chain.insert(p, top);
+            top
+        }
+        let mut join = |a: usize, b: usize| {
+            let (a, b) = (root(&mut chain, a), root(&mut chain, b));
+            chain.insert(a.max(b), a.min(b));
+        };
+        for (p, from) in &self.with {
+            for o in from {
+                join(*p, *o);
+            }
+        }
+        for from in self.moved.values().chain(&self.met) {
+            for (a, b) in from.iter().zip(from.iter().skip(1)) {
+                join(*a, *b);
+            }
+        }
+        let mut work: BTreeMap<usize, u64> = BTreeMap::new();
+        for (p, elements) in &self.work {
+            *work.entry(root(&mut chain, *p)).or_default() += elements;
+        }
+        let mut moved: BTreeMap<usize, u64> = BTreeMap::new();
+        for (v, from) in &self.moved {
+            if let Some(o) = from.first() {
+                let w = self.width(*v).unwrap_or(0);
+                *moved.entry(root(&mut chain, *o)).or_default() += w * w;
+            }
+        }
+        let read: BTreeSet<usize> = self.context.iter().map(|p| root(&mut chain, *p)).collect();
+        let origins: BTreeSet<usize> = self
+            .with
+            .values()
+            .chain(self.moved.values())
+            .flatten()
+            .copied()
+            .collect();
+        origins
+            .into_iter()
+            .filter(|o| {
+                let at = root(&mut chain, *o);
+                let moved = moved.get(&at).copied().unwrap_or(0);
+                !read.contains(&at) && work.get(&at).copied().unwrap_or(0) * NARROW < moved
+            })
+            .collect()
+    }
+
     /// Each param's cut and each leading param's logical one: a weight one
     /// of whose planes cannot be stored cut so is whole.
     fn shards(&self) -> (Vec<Shard>, Vec<Shard>) {
