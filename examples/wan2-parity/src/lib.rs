@@ -8,11 +8,11 @@
 //!
 //! # TWO OR THREE LANES, ONE GROUP, ONE FIRE
 //!
-//! `wan_2`'s `denoise` reading declares two streams (D2): the context
-//! lane (`Stream::Context`, the `context` input — no positions, no
+//! `wan_2`'s `denoise` reading runs on two values of its `stream` switch
+//! (D2): the context lane (`context`, the `context` input — no positions, no
 //! timestep: its class runs the text embedder and the cross-attention
 //! keys, and modulates nothing) and one or more video lanes
-//! (`Stream::Video`: `latents`, `positions`, `timestep`). The golden's
+//! (`video`: `latents`, `positions`, `timestep`). The golden's
 //! scalar-timestep forward is one video lane; its TI2V per-token forward
 //! (`timestep_pertoken`: the first latent frame's tokens at 0, the rest
 //! at `t`) is TWO video lanes of one group — the conditioning rows at
@@ -184,20 +184,26 @@ struct Dims {
     velocity_width: u32,
 }
 
-/// The lane `stream` of `reading`, checked to read exactly `binds`: what
-/// this guest binds on that lane, by the model's own input names. Checked
-/// up front so a model whose lane reads anything else fails here in its own
-/// vocabulary instead of at `program`.
-fn lane_reading(reading: &str, stream: LaneStream, binds: &[&str]) -> Result<model::LaneDecl> {
-    let lane = model::lane_of(reading, stream)?;
+/// The lane `stream` of `reading`, checked to bind no kv space and no
+/// tokens and to read exactly `binds`: what this guest binds on that lane,
+/// by the model's own input names. Checked up front so a model whose lane
+/// reads anything else fails here in its own vocabulary instead of at
+/// `program`.
+fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::LaneDecl> {
+    let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
+    if lane.reads_kv || lane.embeds {
+        return Err(format!(
+            "reading `{reading}`'s `{stream}` lane binds a kv space or tokens; a denoise pass \
+             binds neither"
+        ));
+    }
     let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
     let mut wants = binds.to_vec();
     reads.sort_unstable();
     wants.sort_unstable();
     if reads != wants {
         return Err(format!(
-            "reading `{reading}`'s `{}` lane reads {reads:?}; this pass binds {wants:?}",
-            model::stream_name(stream)
+            "reading `{reading}`'s `{stream}` lane reads {reads:?}; this pass binds {wants:?}"
         )
         .into());
     }
@@ -215,16 +221,20 @@ fn width_of(lane: &model::LaneDecl, name: &str) -> Result<u32> {
 
 /// Checks the context lane and the video lanes against what this guest
 /// binds on each and reads the widths off them.
-fn dims(reading: &model::ReadingFact) -> Result<Dims> {
-    lane_reading(&reading.name, LaneStream::Context, &["context"])?;
-    let video = lane_reading(
-        &reading.name,
-        LaneStream::Video,
-        &["latents", "positions", "timestep"],
-    )?;
+fn dims(reading: &str) -> Result<Dims> {
+    lane_reading(reading, "context", &["context"])?;
+    let video = lane_reading(reading, "video", &["latents", "positions", "timestep"])?;
+    let velocity_width = match &video.readout {
+        Some(readout) if readout.kind == model::ReadoutKind::Velocity => readout.width,
+        other => {
+            return Err(format!(
+                "reading `{reading}`'s video lane reads out {other:?}, not a velocity"
+            ));
+        }
+    };
     Ok(Dims {
         axes: width_of(&video, "positions")?,
-        velocity_width: reading.readout_width,
+        velocity_width,
     })
 }
 
@@ -246,8 +256,8 @@ fn video_lane(
     let latents = &case.latents[f * w..(to as usize) * w];
     let positions = &case.positions[f * dims.axes as usize..(to as usize) * dims.axes as usize];
     let pass = ForwardPass::new();
-    pass.reading(reading)?;
-    pass.stream(LaneStream::Video)?;
+    pass.switch("reading", reading)?;
+    pass.switch("stream", "video")?;
     pass.group(group)?;
     let x = Channel::from_shaped([rows, width], latents).named(&format!("latents_{tag}"));
     let pos = Channel::from_shaped([rows, dims.axes], positions).named(&format!("positions_{tag}"));
@@ -275,8 +285,8 @@ async fn step(case: &Case, dims: &Dims, reading: &str) -> Result<Vec<f32>> {
     // The context lane: the cross-attention keys and values, and nothing
     // else.
     let context = ForwardPass::new();
-    context.reading(reading)?;
-    context.stream(LaneStream::Context)?;
+    context.switch("reading", reading)?;
+    context.switch("stream", "context")?;
     context.group(group)?;
     let ctx = Channel::from_shaped(
         [case.context_rows, case.context_width],
@@ -326,13 +336,8 @@ async fn step(case: &Case, dims: &Dims, reading: &str) -> Result<Vec<f32>> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    // NOT `pass_kind()`. That verb is derived from `rs_state_size() > 0`,
-    // and the flagship row carries a VAE whose causal convolutions each own
-    // a `CacheRow::State` slab, so `wan22-ti2v-5b` answers `recurrent` while
-    // the miniatures (transformer only) answer `attention` — a difference in
-    // the DECODER arms that says nothing about this pass. What a denoise
-    // step actually needs is stated on the reading, and is checked below:
-    // it binds no kv space and takes no tokens.
+    // What a denoise step needs is stated on its lanes, and is checked
+    // below: they bind no kv space and take no tokens.
     let pieces = input.pieces();
     let text = match (&input.case, &input.case_file) {
         (Some(text), _) => text.clone(),
@@ -350,21 +355,12 @@ async fn main(input: Input) -> Result<Output> {
         return Err("the conditioning rows must leave at least one row for the main lane".into());
     }
 
-    let reading = model::readings()
-        .into_iter()
-        .find(|reading| reading.name == "denoise")
-        .ok_or("this model declares no `denoise` reading")?;
-    if reading.has_kv || reading.takes_tokens {
-        return Err(format!(
-            "reading `{}` binds a kv space or tokens; a denoise pass binds neither",
-            reading.name
-        )
-        .into());
-    }
-    if reading.readout_width != case.patch_features {
+    let reading = "denoise";
+    let dims = dims(reading)?;
+    if dims.velocity_width != case.patch_features {
         return Err(format!(
             "the model reads a {}-wide velocity and the case carries {}-wide patch rows",
-            reading.readout_width, case.patch_features
+            dims.velocity_width, case.patch_features
         )
         .into());
     }
@@ -376,8 +372,7 @@ async fn main(input: Input) -> Result<Output> {
         )
         .into());
     }
-    let dims = dims(&reading)?;
-    let velocity = step(&case, &dims, &reading.name).await?;
+    let velocity = step(&case, &dims, reading).await?;
     Ok(Output {
         velocity,
         rows: case.rows,

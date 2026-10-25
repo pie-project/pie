@@ -39,12 +39,25 @@ class Decoder:
     def __init__(self) -> None:
         raise NotImplementedError
 
+    @classmethod
+    def for_cue(cls, cue: List[int]) -> Self:
+        """
+        A decoder for the turn `cue` began: inside a thinking block from
+        the first token when the cue left one open (a template that writes
+        `<think>` into its generation cue), so no `start` comes.
+        """
+        raise NotImplementedError
     def feed(self, tokens: List[int]) -> Event:
         """
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def reset(self) -> None:
+        raise NotImplementedError
+    def starts_inside(self) -> bool:
+        """
+        Whether the first token is already inside a thinking block.
+        """
         raise NotImplementedError
     def __enter__(self) -> Self:
         """Returns self"""

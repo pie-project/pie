@@ -21,14 +21,13 @@ from dataclasses import dataclass
 from wit_world.imports import model as _model
 
 AxisRole = _model.AxisRole
-ForwardKind = _model.ForwardKind
 InputAxis = _model.InputAxis
 InputDecl = _model.InputDecl
 LaneDecl = _model.LaneDecl
-LaneStream = _model.LaneStream
 Readout = _model.Readout
 ReadoutKind = _model.ReadoutKind
 ScheduleKind = _model.ScheduleKind
+SwitchDecl = _model.SwitchDecl
 
 from .tokenizer import (  # noqa: F401 — re-exported, as the Rust `model` module does
     encode,
@@ -81,29 +80,9 @@ def draft_block() -> BlockDrafter | None:
     return BlockDrafter(d.rows, d.mask_token, d.proposals_from) if d is not None else None
 
 
-@dataclass(frozen=True)
-class CanvasShape:
-    """The canvas a diffusion model denoises: tokens per block and the
-    trunk's hidden width."""
-
-    length: int
-    hidden: int
-
-
-def canvas() -> CanvasShape | None:
-    """The diffusion canvas; ``None`` for every other pass kind."""
-    c = _model.canvas()
-    return CanvasShape(c.length, c.hidden) if c is not None else None
-
-
 def run_ahead_window() -> int:
     """Fires one lane may have submitted and not yet taken."""
     return _model.run_ahead_window()
-
-
-def pass_kind() -> _model.ForwardKind:
-    """The bound model's forward-pass interface; never derive it from :func:`architecture`."""
-    return _model.pass_kind()
 
 
 def output_vocab_size() -> int:
@@ -141,24 +120,30 @@ def rs_state_size() -> int:
 # -- generative facts ----------------------------------------------------------
 
 
-def readings() -> list:
-    """Every reading the bound model declares (`model.ReadingFact`), in
-    index order; empty for a text row (one implicit reading)."""
-    return _model.readings()
+def switches() -> list[SwitchDecl]:
+    """Every switch the bound model declares (``ForwardPass.switch``), each
+    value list's first its default; empty for a model with one path (every
+    text model)."""
+    return _model.switches()
 
 
-def reading(name: str):
-    """The declared reading named `name`, or ``None``."""
-    return next((r for r in _model.readings() if r.name == name), None)
+def switch(name: str) -> SwitchDecl | None:
+    """The switch `name` the model declares, or ``None``."""
+    return next((d for d in _model.switches() if d.name == name), None)
+
+
+def positions():
+    """How the bound model's lanes place their rows in the rotary space
+    (`model.PositionConvention`), or ``None`` when it states no convention."""
+    return _model.positions()
 
 
 def lane(switches: list[tuple[str, str]]) -> LaneDecl:
     """The lane a pass of these switches is (`model.LaneDecl`): the inputs it
     binds (exactly these, by ``ForwardPass.input``), whether it binds
     ``state`` and ``embed``, and what it reads out. Switches are
-    ``(name, value)`` pairs — ``("reading", r)``, ``("stream", s)``, and on a
-    diffusion model ``("canvas", "encode" | "denoise")``; one left unset takes
-    its default."""
+    ``(name, value)`` pairs of :func:`switches`; one left unset takes its
+    default."""
     return _model.lane(list(switches))
 
 

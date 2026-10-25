@@ -5,7 +5,7 @@
 // around.
 
 import * as _model from 'pie:inferlet/model@0.3.0';
-import type { BlockDrafter, CanvasShape, LaneDecl, LatentSpace, ReadingFact, ScheduleFact } from 'pie:inferlet/model@0.3.0';
+import type { BlockDrafter, LaneDecl, LatentSpace, PositionConvention, ScheduleFact, SwitchDecl } from 'pie:inferlet/model@0.3.0';
 
 // The tokenizer surface lives in the sibling `tokenizer` module and is
 // re-exported here, so `model.encode`/`model.decode` read off `model` the way
@@ -42,21 +42,9 @@ export function draftBlock(): BlockDrafter | undefined {
   return _model.draftBlock();
 }
 
-/** The diffusion canvas; `undefined` for every other pass kind. */
-export function canvas(): CanvasShape | undefined {
-  return _model.canvas();
-}
-
 /** Fires one lane may have submitted and not yet taken. */
 export function runAheadWindow(): number {
   return _model.runAheadWindow();
-}
-
-/**
- * The bound model's forward-pass interface; never derive it by parsing `architecture()`.
- */
-export function passKind(): _model.ForwardKind {
-  return _model.passKind();
 }
 
 /** Logits/output dimension. May exceed the tokenizer's vocabulary size. */
@@ -94,21 +82,27 @@ export function rsStateSize(): number {
 
 // -- generative facts ---------------------------------------------------------
 
-/** Every reading the bound model declares, in index order; empty for a text
- *  row (one implicit reading). */
-export function readings(): ReadingFact[] {
-  return _model.readings();
+/** Every switch the bound model declares (`ForwardPass.switch`), each
+ *  value list's first its default; empty for a model with one path (every
+ *  text model). */
+export function switches(): SwitchDecl[] {
+  return _model.switches();
 }
 
-/** The declared reading named `name`, if any. */
-export function reading(name: string): ReadingFact | undefined {
-  return _model.readings().find((r) => r.name === name);
+/** The switch `name` the model declares, if any. */
+export function switchDecl(name: string): SwitchDecl | undefined {
+  return _model.switches().find((d) => d.name === name);
+}
+
+/** How the bound model's lanes place their rows in the rotary space;
+ *  `undefined` when it states no convention. */
+export function positions(): PositionConvention | undefined {
+  return _model.positions();
 }
 
 /** The lane a pass of these switches is: the inputs it binds (exactly
  *  these, by `ForwardPass.input`), whether it binds `state` and `embed`, and
- *  what it reads out. Switches are `[name, value]` pairs — `['reading', r]`,
- *  `['stream', s]`, and on a diffusion model `['canvas', 'encode' | 'denoise']`;
+ *  what it reads out. Switches are `[name, value]` pairs of `switches()`;
  *  one left unset takes its default. */
 export function lane(switches: Array<[string, string]>): LaneDecl {
   return _model.lane(switches);
@@ -133,17 +127,14 @@ export function maxLatentRows(): number {
 export type {
   AxisRole,
   BlockDrafter,
-  CanvasShape,
-  ForwardKind,
   InputAxis,
   InputDecl,
   LaneDecl,
-  LaneStream,
   LatentSpace,
   PositionConvention,
-  ReadingFact,
   Readout,
   ReadoutKind,
   ScheduleFact,
   ScheduleKind,
+  SwitchDecl,
 } from 'pie:inferlet/model@0.3.0';

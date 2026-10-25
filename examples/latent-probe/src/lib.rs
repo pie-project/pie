@@ -1,8 +1,8 @@
 //! A probe of the float-input loop (imagegen design D1/D3/D4), on a model
-//! whose `readings()` declare a token-less reading with a velocity readout
+//! whose `reading` switch declares a token-less reading with a velocity readout
 //! (the mini-DiT family, then every DiT).
 //!
-//! One `forward` pass in that reading, on the stream whose lane reads
+//! One `forward` pass in that reading, on the `stream` whose lane reads
 //! `latents`, with no `embed` and no `state`: a `[rows, width]` f32 latent
 //! channel bound as `input("latents")`, a `[1]` timestep channel bound as
 //! `input("timestep")`, every other input that lane reads bound to a
@@ -82,56 +82,55 @@ fn positions_for(rows: u32, axes: u32) -> Vec<f32> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Text {
-        return Err(
-            "this program drives a stateless `forward` reading; the bound model's pass kind is \
-             not text"
-                .into(),
-        );
+    let readings = model::switch("reading")
+        .ok_or("this model declares no `reading` switch; the latent probe wants a latent reading")?
+        .values;
+    if let Some(name) = &input.reading
+        && !readings.contains(name)
+    {
+        return Err(format!("this model declares no reading `{name}`"));
     }
-    let readings = model::readings();
-    if readings.is_empty() {
-        return Err(
-            "this model declares no readings; the latent probe wants a latent reading".into(),
-        );
-    }
-    let reading = match &input.reading {
-        Some(name) => readings
-            .iter()
-            .find(|reading| &reading.name == name)
-            .cloned()
-            .ok_or_else(|| format!("this model declares no reading `{name}`"))?,
-        None => readings
-            .iter()
-            .find(|reading| {
-                !reading.takes_tokens && reading.readout == model::ReadoutKind::Velocity
-            })
-            .cloned()
-            .ok_or("this model declares no token-less reading with a velocity readout")?,
+    let streams: Vec<Option<String>> = match model::switch("stream") {
+        Some(decl) => decl.values.into_iter().map(Some).collect(),
+        None => vec![None],
     };
-    if reading.has_kv || reading.takes_tokens {
-        return Err(format!(
-            "reading `{}` is a sequence reading (tokens and KV); the probe drives a float lane",
-            reading.name
-        ));
-    }
-    if reading.readout != model::ReadoutKind::Velocity {
-        return Err(format!(
-            "reading `{}` reads out {:?}; the probe integrates a velocity",
-            reading.name, reading.readout
-        ));
-    }
-    // The lane that carries the latent: the first of the reading's streams
-    // whose lane reads `latents`.
-    let (stream, lane, latents) = reading
-        .streams
+    // The lane that carries the latent: the first lane of the named reading
+    // (else of any token-less reading with a velocity readout) whose lane
+    // reads `latents`.
+    let (reading, stream, lane, latents) = readings
         .iter()
-        .find_map(|&stream| {
-            let lane = model::lane_of(&reading.name, stream).ok()?;
+        .filter(|reading| input.reading.as_ref().is_none_or(|name| name == *reading))
+        .flat_map(|reading| streams.iter().map(move |stream| (reading, stream)))
+        .find_map(|(reading, stream)| {
+            let mut switches = vec![("reading", reading.as_str())];
+            if let Some(stream) = stream {
+                switches.push(("stream", stream.as_str()));
+            }
+            let lane = model::lane_of(&switches).ok()?;
+            let velocity = lane.readout.as_ref().map(|readout| readout.kind)
+                == Some(model::ReadoutKind::Velocity);
+            if input.reading.is_none() && (lane.embeds || !velocity) {
+                return None;
+            }
             let latents = lane.inputs.iter().find(|i| i.name == "latents")?.clone();
-            Some((stream, lane, latents))
+            Some((reading.clone(), stream.clone(), lane, latents))
         })
-        .ok_or_else(|| format!("no lane of reading `{}` reads `latents`", reading.name))?;
+        .ok_or(
+            "this model declares no token-less lane with a velocity readout that reads `latents`",
+        )?;
+    if lane.reads_kv || lane.embeds {
+        return Err(format!(
+            "reading `{reading}` is a sequence reading (tokens and KV); the probe drives a float lane"
+        ));
+    }
+    let velocity_width = match &lane.readout {
+        Some(readout) if readout.kind == model::ReadoutKind::Velocity => readout.width,
+        other => {
+            return Err(format!(
+                "reading `{reading}` reads out {other:?}; the probe integrates a velocity"
+            ));
+        }
+    };
     let rows = input.rows.max(1);
     let max_rows = model::max_latent_rows();
     if max_rows > 0 && rows > max_rows {
@@ -140,7 +139,6 @@ async fn main(input: Input) -> Result<Output> {
         ));
     }
     let width = latents.width;
-    let velocity_width = reading.readout_width;
     let steps = input.steps.max(1);
 
     // The schedule: the model's when it states one, else a plain linspace.
@@ -178,16 +176,17 @@ async fn main(input: Input) -> Result<Output> {
         .named("out");
 
     let pass = ForwardPass::new();
-    pass.reading(&reading.name)?;
-    pass.stream(stream)?;
+    pass.switch("reading", &reading)?;
+    if let Some(stream) = &stream {
+        pass.switch("stream", stream)?;
+    }
     pass.input("latents", &x)?;
     let mut bound = vec![latents.name.clone()];
     let mut extras: Vec<Channel> = Vec::new();
     if !lane.inputs.iter().any(|i| i.name == "timestep") {
         return Err(format!(
-            "reading `{}`'s `{}` lane reads no `timestep`",
-            reading.name,
-            model::stream_name(stream)
+            "reading `{reading}`'s `{}` lane reads no `timestep`",
+            stream.as_deref().unwrap_or("default")
         ));
     }
     pass.input("timestep", &t)?;
@@ -214,7 +213,7 @@ async fn main(input: Input) -> Result<Output> {
                 return Err(format!(
                     "reading `{}` reads a voxel input `{}`; the latent probe drives rows, \
                      not a VAE tile",
-                    reading.name, decl.name
+                    reading, decl.name
                 ));
             }
         };
@@ -262,7 +261,7 @@ async fn main(input: Input) -> Result<Output> {
     let mean = last.iter().sum::<f32>() / n;
     let var = last.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
     Ok(Output {
-        reading: reading.name.clone(),
+        reading,
         rows,
         width,
         steps,

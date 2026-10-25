@@ -97,12 +97,14 @@ describe('media', () => {
   });
 });
 
-describe('diffusion pass surface', () => {
-  it('binds the canvas reading', () => {
-    const fwd = new ForwardPass('diffusion');
-    fwd.canvas('denoise');
-    const w = fwd.wit as unknown as { mode: string };
-    expect(w.mode).toBe('denoise');
-    expect(() => new ForwardPass('text').canvas('encode')).toThrow(/canvas binds/);
+describe('pass switches', () => {
+  it('sets a model switch, and a non-default value is off the default path', () => {
+    const fwd = new ForwardPass();
+    fwd.switch('mode', 'encode');
+    expect(fwd.switched()).toBe(false);
+    fwd.switch('mode', 'denoise');
+    const w = fwd.wit as unknown as { switches: [string, string][] };
+    expect(w.switches).toEqual([['mode', 'encode'], ['mode', 'denoise']]);
+    expect(fwd.switched()).toBe(true);
   });
 });

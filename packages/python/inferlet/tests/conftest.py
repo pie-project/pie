@@ -37,30 +37,11 @@ from enum import Enum
 # ---------------------------------------------------------------------------
 
 
-class ForwardKind(Enum):
-    TEXT = 0
-    DIFFUSION = 1
-
-
-class DiffusionMode(Enum):
-    ENCODE = 0
-    DENOISE = 1
-
-
 class AxisRole(Enum):
     TIME = 0
     HEIGHT = 1
     WIDTH = 2
     INDEX = 3
-
-
-class LaneStream(Enum):
-    TEXT = 0
-    IMAGE = 1
-    VIDEO = 2
-    AUDIO = 3
-    CONTEXT = 4
-    REFERENCE = 5
 
 
 class InputAxis(Enum):
@@ -84,21 +65,19 @@ class ScheduleKind(Enum):
 
 def _make_model() -> types.ModuleType:
     m = types.ModuleType("wit_world.imports.model")
-    m.ForwardKind = ForwardKind
     m.AxisRole = AxisRole
-    m.LaneStream = LaneStream
     m.InputAxis = InputAxis
     m.InputDecl = InputDeclStub
     m.LaneDecl = LaneDeclStub
     m.Readout = ReadoutStub
     m.ReadoutKind = ReadoutKind
     m.ScheduleKind = ScheduleKind
+    m.SwitchDecl = SwitchDeclStub
     m.name = lambda: "mock-model"
     m.architecture = lambda: "qwen3_5"
     m.default_system_speculation = lambda: False
     m.mtp_depth = lambda: 0
     m.submit_deadline_us = lambda: 50_000
-    m.pass_kind = lambda: ForwardKind.TEXT
     m.output_vocab_size = lambda: 151936
     m.kv_page_size = lambda: 16
     m.frame_size = lambda: 1
@@ -107,9 +86,9 @@ def _make_model() -> types.ModuleType:
     m.rs_state_size = lambda: 4096
     m.run_ahead_window = lambda: 4
     m.BlockDrafter = BlockDrafterStub
-    m.CanvasShape = CanvasShapeStub
     m.draft_block = lambda: None
-    m.canvas = lambda: CanvasShapeStub(32, 2560)
+    m.switches = lambda: [SwitchDeclStub("mode", ["encode", "denoise"])]
+    m.positions = lambda: None
     m.lane = _lane
     return m
 
@@ -122,9 +101,9 @@ class BlockDrafterStub:
 
 
 @dataclass
-class CanvasShapeStub:
-    length: int
-    hidden: int
+class SwitchDeclStub:
+    name: str
+    values: list[str]
 
 
 @dataclass
@@ -147,11 +126,11 @@ class LaneDeclStub:
     inputs: list
     reads_kv: bool
     embeds: bool
-    readout: ReadoutStub
+    readout: ReadoutStub | None
 
 
 def _lane(switches) -> LaneDeclStub:
-    denoise = ("canvas", "denoise") in switches
+    denoise = ("mode", "denoise") in switches
     inputs = [InputDeclStub("self_cond_ids", InputAxis.ROW, 4, "i32", None)] if denoise else []
     return LaneDeclStub(inputs, True, True, ReadoutStub(ReadoutKind.LOGITS, 151936))
 
@@ -351,7 +330,7 @@ def _make_reasoning() -> types.ModuleType:
 
 # ---------------------------------------------------------------------------
 # The forward-pass surface: pie:inferlet/{types, channel, pipeline,
-# working-set, forward, forward-diffusion} + the
+# working-set, forward} + the
 # componentize-py `Err` type. Enough for `inferlet.eta.bridge` to import and
 # for its host-side plumbing to be exercised without a device: a `Channel`
 # remembers what was put; `take()` hands it back.
@@ -473,6 +452,7 @@ class ForwardPassStub:
         self.checkpoint_slots = None
         self.program_bytes: bytes | None = None
         self.program_channels: list | None = None
+        self.switches: list[tuple[str, str]] = []
 
     def embed(self, tokens, indptr) -> None:
         self.embedded = (tokens, indptr)
@@ -486,27 +466,23 @@ class ForwardPassStub:
     def checkpoints(self, slots) -> None:
         self.checkpoint_slots = list(slots)
 
-    def set_drafting_block(self, on: bool) -> None:
-        self.drafting = on
-
     def media(self, spans) -> None:
         self.spans = spans
 
-    def canvas(self, mode) -> None:
-        self.mode = mode
+    def switch(self, name: str, value: str) -> None:
+        self.switches.append((name, value))
 
     def program(self, container_bytes: bytes, channels) -> None:
         self.program_bytes = bytes(container_bytes)
         self.program_channels = list(channels)
 
 
-def _make_forward(name: str) -> types.ModuleType:
-    m = types.ModuleType(f"wit_world.imports.{name}")
+def _make_forward() -> types.ModuleType:
+    m = types.ModuleType("wit_world.imports.forward")
     m.ForwardPass = ForwardPassStub
     m.StateGeometry = StateGeometry
     m.MediaSpan_Image = lambda v: ("image", v)
     m.MediaSpan_Audio = lambda v: ("audio", v)
-    m.Mode = DiffusionMode
 
     def submit(on, slots) -> None:
         ForwardPassStub.submitted.append((on, list(slots)))
@@ -703,8 +679,7 @@ def install() -> None:
         "channel": _make_channel(),
         "pipeline": _make_pipeline(),
         "working_set": _make_working_set(),
-        "forward": _make_forward("forward"),
-        "forward_diffusion": _make_forward("forward_diffusion"),
+        "forward": _make_forward(),
         "grammar": _make_grammar(),
         "tools": _make_tools(),
         "media": _make_media(),

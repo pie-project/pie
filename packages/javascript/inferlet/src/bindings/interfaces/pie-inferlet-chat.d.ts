@@ -14,6 +14,20 @@ export function user(message: string): Uint32Array;
 export function systemUser(system: string, user: string): Uint32Array;
 export function assistant(message: string): Uint32Array;
 /**
+ * The system turn of a request the model answers with thinking, as its
+ * template renders it: the template's reasoning-effort instruction ahead
+ * of `message`, in a system turn of its own when `message` is `none`.
+ * `system(message)` (or nothing) where the template has no instruction.
+ */
+export function systemThinking(message: string | undefined, effort: ReasoningEffort): Uint32Array;
+/**
+ * The system turn a conversation opens with, as the template writes it
+ * from the request's system message, its tools, and the reasoning effort
+ * of a request the model answers with thinking (`none` for one it
+ * answers without).
+ */
+export function open(system: string | undefined, tools: Array<string>, effort: ReasoningEffort | undefined): Uint32Array;
+/**
  * Cue the model to generate (fills generation header)
  */
 export function cue(): Uint32Array;
@@ -24,13 +38,6 @@ export function cue(): Uint32Array;
  */
 export function cueWithoutThinking(): Uint32Array;
 /**
- * The system turn of a request the model answers with thinking, as its
- * template renders it: the template's reasoning-effort instruction ahead
- * of `message`, in a system turn of its own when `message` is `none`.
- * `system(message)` (or nothing) where the template has no instruction.
- */
-export function systemThinking(message: string | undefined, effort: ReasoningEffort): Uint32Array;
-/**
  * Seal the current turn (insert stop token)
  */
 export function seal(): Uint32Array;
@@ -40,20 +47,6 @@ export function seal(): Uint32Array;
 export function stopTokens(): Uint32Array;
 export type Error = import('./pie-inferlet-types.js').Error;
 export type Event = EventDelta | EventInterrupt | EventDone;
-/**
- * The reasoning effort a thinking request names.
- * 
- * # Variants
- * 
- * ## `"xhigh"`
- * 
- * The template's default.
- * 
- * ## `"medium"`
- * 
- * ## `"low"`
- */
-export type ReasoningEffort = 'xhigh' | 'medium' | 'low';
 /**
  * Generated text chunk
  */
@@ -75,6 +68,18 @@ export interface EventDone {
   tag: 'done',
   val: string,
 }
+/**
+ * The reasoning effort a thinking request names.
+ * # Variants
+ * 
+ * ## `"xhigh"`
+ * 
+ * The template's default.
+ * ## `"medium"`
+ * 
+ * ## `"low"`
+ */
+export type ReasoningEffort = 'xhigh' | 'medium' | 'low';
 
 export class Decoder {
   constructor()

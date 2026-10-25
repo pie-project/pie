@@ -74,6 +74,20 @@ def answer(name: str, value: str) -> List[int]:
     Provide a tool result (after a tool-call reply)
     """
     raise NotImplementedError
+def answers(results: List[Tuple[str, str]]) -> List[int]:
+    """
+    Consecutive tool results (name, value), as the template writes them
+    together.
+    """
+    raise NotImplementedError
+def assistant_calls(message: str, calls: List[ToolCall], current: bool) -> List[int]:
+    """
+    An earlier assistant turn: `message`, then the calls it made in the
+    template's call syntax. `current` marks a turn after the
+    conversation's last user query, which some templates replay with its
+    reasoning.
+    """
+    raise NotImplementedError
 def format(tools: List[str]) -> Optional[grammar.Grammar]:
     """
     Returns the grammar that constrains well-formed tool-call output for

@@ -34,8 +34,8 @@
 //! # LANES
 //!
 //! `denoise` is two lanes here (no reference): the text lane
-//! (`Stream::Text`, the `context` input at width `dim`) and the target lane
-//! (`Stream::Image`, the `latents` input), one group, each on its own
+//! (stream `text`, the `context` input at width `dim`) and the target lane
+//! (stream `image`, the `latents` input), one group, each on its own
 //! pipeline, each binding the timestep as its own loop-carried cell. Only
 //! the image lane reads out. Each lane is one pass submitted once a step
 //! (`trajectory` on why); the latent channel is loop-carried by the
@@ -82,8 +82,8 @@ struct Case {
     #[serde(default)]
     native: bool,
     /// Submit the image lane before the text lane each step (default: text
-    /// first). The frame packs by stream, so the order should not matter;
-    /// a knob for the harness to prove it.
+    /// first). A group packs its lanes in submission order, so this packs
+    /// `[img ‖ txt]` instead of `[txt ‖ img]`.
     #[serde(default)]
     image_first: bool,
 }
@@ -113,16 +113,21 @@ struct Dims {
 /// this guest binds on that lane, by the model's own input names. Checked
 /// up front so a model whose lane reads anything else fails here in its own
 /// vocabulary instead of at `program`.
-fn lane_reading(reading: &str, stream: LaneStream, binds: &[&str]) -> Result<model::LaneDecl> {
-    let lane = model::lane_of(reading, stream)?;
+fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::LaneDecl> {
+    let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
+    if lane.reads_kv || lane.embeds {
+        return Err(format!(
+            "reading `{reading}`'s `{stream}` lane binds a kv space or tokens; a denoise pass \
+             binds neither"
+        ));
+    }
     let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
     let mut wants = binds.to_vec();
     reads.sort_unstable();
     wants.sort_unstable();
     if reads != wants {
         return Err(format!(
-            "reading `{reading}`'s `{}` lane reads {reads:?}; this pass binds {wants:?}",
-            model::stream_name(stream)
+            "reading `{reading}`'s `{stream}` lane reads {reads:?}; this pass binds {wants:?}"
         )
         .into());
     }
@@ -140,20 +145,20 @@ fn width_of(lane: &model::LaneDecl, name: &str) -> Result<u32> {
 
 /// Checks both lanes against what this guest binds — no `guidance`:
 /// klein-4B embeds none — and reads the widths off them.
-fn dims(reading: &model::ReadingFact) -> Result<Dims> {
-    let image = lane_reading(
-        &reading.name,
-        LaneStream::Image,
-        &["latents", "positions", "timestep"],
-    )?;
-    lane_reading(
-        &reading.name,
-        LaneStream::Text,
-        &["context", "positions", "timestep"],
-    )?;
+fn dims(reading: &str) -> Result<Dims> {
+    let image = lane_reading(reading, "image", &["latents", "positions", "timestep"])?;
+    lane_reading(reading, "text", &["context", "positions", "timestep"])?;
+    let velocity_width = match &image.readout {
+        Some(readout) if readout.kind == model::ReadoutKind::Velocity => readout.width,
+        other => {
+            return Err(format!(
+                "reading `{reading}`'s image lane reads out {other:?}, not a velocity"
+            ));
+        }
+    };
     Ok(Dims {
         axes: width_of(&image, "positions")?,
-        velocity_width: reading.readout_width,
+        velocity_width,
     })
 }
 
@@ -185,8 +190,7 @@ fn send_f32(files: &mut Vec<String>, name: &str, rows: &[f32]) {
 
 /// The `text` reading over `ids`: `encode_text`'s pass, with the ids
 /// chosen here so the harness can check them against the pipeline's.
-async fn text_rows(ids: &[u32], reading: &model::ReadingFact) -> Result<Vec<f32>> {
-    let width = reading.readout_width;
+async fn text_rows(ids: &[u32], width: u32) -> Result<Vec<f32>> {
     let len = u32::try_from(ids.len()).map_err(|_| "the prompt is too long")?;
     let toks: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
     let ws = WorkingSet::new();
@@ -198,7 +202,7 @@ async fn text_rows(ids: &[u32], reading: &model::ReadingFact) -> Result<Vec<f32>
     let out = Channel::new([len, width], dtype::f32).named("hidden");
 
     let pass = ForwardPass::new();
-    pass.reading(&reading.name)?;
+    pass.switch("reading", "text")?;
     pass.embed(&toks, &embed_indptr)?;
     pass.readout(&readout)?;
     pass.state(&[&ws], StateGeometry::default())?;
@@ -263,8 +267,8 @@ async fn trajectory(
     let t_txt = Channel::from([ts[0]]).named("t_txt");
     let k_txt = Channel::from([0u32]).named("k_txt");
     let txt = ForwardPass::new();
-    txt.reading(reading)?;
-    txt.stream(LaneStream::Text)?;
+    txt.switch("reading", reading)?;
+    txt.switch("stream", "text")?;
     txt.group(group)?;
     txt.input("context", &text.context)?;
     txt.input("positions", &text.positions)?;
@@ -284,8 +288,8 @@ async fn trajectory(
     let v_out = Channel::new([rows, velocity_width], dtype::f32).named("v_out");
     let x_out = Channel::new([rows, width], dtype::f32).named("x_out");
     let img = ForwardPass::new();
-    img.reading(reading)?;
-    img.stream(LaneStream::Image)?;
+    img.switch("reading", reading)?;
+    img.switch("stream", "image")?;
     img.group(group)?;
     img.input("latents", &x)?;
     img.input("positions", &img_pos)?;
@@ -344,9 +348,6 @@ async fn trajectory(
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Text {
-        return Err("flux_2 is a `forward` pass".into());
-    }
     let instance = inferlet::runtime::instance_id();
     inferlet::session::send(&format!("instance {instance}"));
 
@@ -367,17 +368,21 @@ async fn main(input: Input) -> Result<Output> {
     let case: Case =
         inferlet::serde_json::from_str(&text).map_err(|why| format!("case json: {why}"))?;
 
-    let text_reading = model::reading("text").ok_or("this model declares no `text` reading")?;
-    if !(text_reading.has_kv && text_reading.takes_tokens)
-        || text_reading.readout != model::ReadoutKind::Hidden
-    {
-        return Err("reading `text` is not a token + kv reading with a hidden readout".into());
-    }
-    let denoise = model::reading("denoise").ok_or("this model declares no `denoise` reading")?;
-    if denoise.has_kv || denoise.takes_tokens {
-        return Err("reading `denoise` binds a kv space or tokens".into());
-    }
-    let dims = dims(&denoise)?;
+    let text_lane = model::lane_of(&[("reading", "text")])?;
+    let hidden_width = match &text_lane.readout {
+        Some(readout)
+            if text_lane.reads_kv
+                && text_lane.embeds
+                && readout.kind == model::ReadoutKind::Hidden =>
+        {
+            readout.width
+        }
+        _ => {
+            return Err("reading `text` is not a token + kv reading with a hidden readout".into());
+        }
+    };
+    let denoise = "denoise";
+    let dims = dims(denoise)?;
     if dims.velocity_width != case.channels {
         return Err(format!(
             "the model reads a {}-wide velocity and the case carries {}-wide tokens",
@@ -385,7 +390,6 @@ async fn main(input: Input) -> Result<Output> {
         )
         .into());
     }
-    let hidden_width = text_reading.readout_width;
     if hidden_width != case.context_width {
         return Err(format!(
             "`text` reads out {hidden_width} wide and the case's context is {} wide",
@@ -400,7 +404,7 @@ async fn main(input: Input) -> Result<Output> {
     let mut ids = inferlet::chat::first_user(&case.prompt);
     ids.extend(inferlet::chat::cue());
     let len = u32::try_from(ids.len()).map_err(|_| "the prompt is too long")?;
-    let hidden = text_rows(&ids, &text_reading).await?;
+    let hidden = text_rows(&ids, hidden_width).await?;
     send_f32(&mut files, "hidden.f32", &hidden);
 
     // 2 + 3. The trajectory over the golden's conditioning.
@@ -436,7 +440,7 @@ async fn main(input: Input) -> Result<Output> {
         width,
         &case.sigmas,
         &dims,
-        &denoise.name,
+        denoise,
         0,
         case.image_first,
     )
@@ -460,7 +464,7 @@ async fn main(input: Input) -> Result<Output> {
                 width,
                 &[*sigma],
                 &dims,
-                &denoise.name,
+                denoise,
                 2 + k as u32,
                 case.image_first,
             )
@@ -491,7 +495,7 @@ async fn main(input: Input) -> Result<Output> {
             width,
             &case.sigmas,
             &dims,
-            &denoise.name,
+            denoise,
             1,
             case.image_first,
         )

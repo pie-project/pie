@@ -2,7 +2,7 @@
 The Pie inferlet library — Python bindings for the Pie runtime.
 
 An inferlet is a small program that runs next to the model. The forward-pass
-surface (`pie:inferlet/forward*`) takes a traced ETA program; this package
+surface (`pie:inferlet/forward`) takes a traced ETA program; this package
 traces it from ordinary Python and encodes the canonical container bytes —
 the same bytes the Rust `inferlet` crate's `eta-dsl` emits for the same program, so a
 Python inferlet and a Rust inferlet share the host's program cache.

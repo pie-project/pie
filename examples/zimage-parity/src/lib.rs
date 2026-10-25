@@ -139,16 +139,15 @@ struct Reading {
 /// this guest binds on that lane, by the model's own input names. Checked
 /// up front so a model whose lane reads anything else fails here in its own
 /// vocabulary instead of at `program`.
-fn lane_reading(reading: &str, stream: LaneStream, binds: &[&str]) -> Result<model::LaneDecl> {
-    let lane = model::lane_of(reading, stream)?;
+fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::LaneDecl> {
+    let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
     let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
     let mut wants = binds.to_vec();
     reads.sort_unstable();
     wants.sort_unstable();
     if reads != wants {
         return Err(format!(
-            "reading `{reading}`'s `{}` lane reads {reads:?}; this pass binds {wants:?}",
-            model::stream_name(stream)
+            "reading `{reading}`'s `{stream}` lane reads {reads:?}; this pass binds {wants:?}"
         )
         .into());
     }
@@ -166,29 +165,48 @@ fn width_of(lane: &model::LaneDecl, name: &str) -> Result<u32> {
 
 /// The token-less reading with `readout`, each of its `lanes` checked to
 /// read exactly the inputs this guest binds there.
-fn reading(readout: model::ReadoutKind, lanes: &[(LaneStream, &[&str])]) -> Result<Reading> {
-    let fact = model::readings()
+fn reading(readout: model::ReadoutKind, lanes: &[(&str, &[&str])]) -> Result<Reading> {
+    let readings = model::switch("reading")
+        .map(|decl| decl.values)
+        .unwrap_or_default();
+    let (name, readout_width) = readings
         .into_iter()
-        .find(|reading| !reading.takes_tokens && reading.readout == readout)
+        .find_map(|name| {
+            let decls = lanes
+                .iter()
+                .map(|(stream, _)| {
+                    model::lane_of(&[("reading", name.as_str()), ("stream", stream)])
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .ok()?;
+            if decls.iter().any(|lane| lane.embeds) {
+                return None;
+            }
+            let width = decls.iter().find_map(|lane| {
+                lane.readout
+                    .as_ref()
+                    .filter(|r| r.kind == readout)
+                    .map(|r| r.width)
+            })?;
+            Some((name, width))
+        })
         .ok_or_else(|| {
             format!("this model declares no token-less reading with a {readout:?} readout")
         })?;
-    if fact.has_kv {
-        return Err(format!(
-            "reading `{}` binds a kv space; the parity pass binds none",
-            fact.name
-        )
-        .into());
-    }
     let mut axes = None;
     for (stream, binds) in lanes {
-        let lane = lane_reading(&fact.name, *stream, binds)?;
+        let lane = lane_reading(&name, stream, binds)?;
+        if lane.reads_kv {
+            return Err(format!(
+                "reading `{name}` binds a kv space; the parity pass binds none"
+            ));
+        }
         axes.get_or_insert(width_of(&lane, "positions")?);
     }
     Ok(Reading {
-        name: fact.name.clone(),
+        name,
         axes: axes.ok_or("no lane to read")?,
-        readout_width: fact.readout_width,
+        readout_width,
     })
 }
 
@@ -196,12 +214,12 @@ fn reading(readout: model::ReadoutKind, lanes: &[(LaneStream, &[&str])]) -> Resu
 async fn refine(case: &Case, pipe: &Pipeline) -> Result<(Vec<f32>, u32)> {
     let r = reading(
         model::ReadoutKind::Hidden,
-        &[(LaneStream::Context, &["caption", "pad", "positions"])],
+        &[("context", &["caption", "pad", "positions"])],
     )?;
     let rows = case.caption_rows;
     let pass = ForwardPass::new();
-    pass.reading(&r.name)?;
-    pass.stream(LaneStream::Context)?;
+    pass.switch("reading", &r.name)?;
+    pass.switch("stream", "context")?;
     let caption =
         Channel::from_shaped([rows, case.caption_width], case.caption.as_slice()).named("caption");
     let pad = Channel::from_shaped([rows, 1], case.caption_pad.as_slice()).named("cap_pad");
@@ -237,11 +255,8 @@ async fn denoise(
     let r = reading(
         model::ReadoutKind::Velocity,
         &[
-            (LaneStream::Context, &["context", "positions", "timestep"]),
-            (
-                LaneStream::Image,
-                &["latents", "pad", "positions", "timestep"],
-            ),
+            ("context", &["context", "positions", "timestep"]),
+            ("image", &["latents", "pad", "positions", "timestep"]),
         ],
     )?;
     // The readout is the velocity, `patch_features` wide — unless the family
@@ -255,8 +270,8 @@ async fn denoise(
 
     // The caption lane: the refine readout, pads included, no `pad` input.
     let context = ForwardPass::new();
-    context.reading(&r.name)?;
-    context.stream(LaneStream::Context)?;
+    context.switch("reading", &r.name)?;
+    context.switch("stream", "context")?;
     context.group(group)?;
     let ctx = Channel::from_shaped([case.caption_rows, dim], refined).named("context");
     let ctx_pos = Channel::from_shaped(
@@ -279,8 +294,8 @@ async fn denoise(
     // The image lane: the latents in, the velocity out.
     let rows = case.image_rows;
     let image = ForwardPass::new();
-    image.reading(&r.name)?;
-    image.stream(LaneStream::Image)?;
+    image.switch("reading", &r.name)?;
+    image.switch("stream", "image")?;
     image.group(group)?;
     let x =
         Channel::from_shaped([rows, case.patch_features], case.latents.as_slice()).named("latents");
@@ -329,11 +344,8 @@ async fn trajectory(
     let r = reading(
         model::ReadoutKind::Velocity,
         &[
-            (LaneStream::Context, &["context", "positions", "timestep"]),
-            (
-                LaneStream::Image,
-                &["latents", "pad", "positions", "timestep"],
-            ),
+            ("context", &["context", "positions", "timestep"]),
+            ("image", &["latents", "pad", "positions", "timestep"]),
         ],
     )?;
     let width = r.readout_width;
@@ -345,8 +357,8 @@ async fn trajectory(
     let img_clock = loops.lane("traj_img");
 
     let context = ForwardPass::new();
-    context.reading(&r.name)?;
-    context.stream(LaneStream::Context)?;
+    context.switch("reading", &r.name)?;
+    context.switch("stream", "context")?;
     context.group(group)?;
     let ctx = Channel::from_shaped([case.caption_rows, dim], refined).named("traj_context");
     let ctx_pos = Channel::from_shaped(
@@ -359,8 +371,8 @@ async fn trajectory(
     context.input("timestep", &ctx_clock.timestep)?;
 
     let image = ForwardPass::new();
-    image.reading(&r.name)?;
-    image.stream(LaneStream::Image)?;
+    image.switch("reading", &r.name)?;
+    image.switch("stream", "image")?;
     image.group(group)?;
     let latent =
         Channel::from_shaped([rows, case.patch_features], case.latents.as_slice()).named("traj_x");
@@ -402,14 +414,23 @@ async fn trajectory(
 /// set, `hidden` at every row. `inferlet::latent::encode_text` with the
 /// template applied — that helper tokenizes plain text.
 async fn text(prompt: &str, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
-    let fact = model::readings()
+    let readings = model::switch("reading")
+        .map(|decl| decl.values)
+        .unwrap_or_default();
+    let (name, lane) = readings
         .into_iter()
-        .find(|reading| reading.takes_tokens && reading.readout == model::ReadoutKind::Hidden)
+        .find_map(|name| {
+            let lane = model::lane_of(&[("reading", name.as_str())]).ok()?;
+            let hidden = lane.readout.as_ref().map(|r| r.kind) == Some(model::ReadoutKind::Hidden);
+            (lane.embeds && hidden).then_some((name, lane))
+        })
         .ok_or("this row declares no token reading with a hidden readout (the miniature has no encoder)")?;
-    if !fact.has_kv {
-        return Err(format!("reading `{}` takes tokens but binds no kv space", fact.name).into());
+    if !lane.reads_kv {
+        return Err(format!(
+            "reading `{name}` takes tokens but binds no kv space"
+        ));
     }
-    let width = fact.readout_width;
+    let width = lane.readout.map_or(0, |r| r.width);
     let mut ids = inferlet::chat::prefix();
     ids.extend(inferlet::chat::user(prompt));
     ids.extend(inferlet::chat::cue());
@@ -429,7 +450,7 @@ async fn text(prompt: &str, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
     let out = Channel::new([len, width], dtype::f32).named("text");
 
     let pass = ForwardPass::new();
-    pass.reading(&fact.name)?;
+    pass.switch("reading", &name)?;
     pass.embed(&toks, &embed_indptr)?;
     pass.readout(&readout)?;
     // The encoder's state is scratch: nothing folds, and it goes with `ws`.
@@ -445,9 +466,6 @@ async fn text(prompt: &str, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Text {
-        return Err("z-image is a `forward` pass with no state bound".into());
-    }
     if input.text_only {
         let prompt = input
             .prompt
