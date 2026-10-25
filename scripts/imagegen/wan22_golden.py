@@ -314,6 +314,7 @@ def run_vae_encode(d, vae, x, mean, std):
           f"normalised [{float(normalised.min()):.3f}, {float(normalised.max()):.3f}]")
 
 def main():
+    global HEIGHT, WIDTH, FRAMES
     ap = argparse.ArgumentParser()
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--mini", action="store_true")
@@ -321,7 +322,11 @@ def main():
     ap.add_argument("--vae-ref", action="store_true")
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--repo", default=REPO, help="hub id or a local snapshot dir")
+    ap.add_argument("--height", type=int, default=HEIGHT)
+    ap.add_argument("--width", type=int, default=WIDTH)
+    ap.add_argument("--frames", type=int, default=FRAMES)
     a = ap.parse_args()
+    HEIGHT, WIDTH, FRAMES = a.height, a.width, a.frames
     if not (a.full or a.mini or a.vae or a.vae_ref):
         a.full = a.mini = a.vae = True
     d = outdir(MODEL)
