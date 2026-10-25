@@ -16,86 +16,65 @@ pie --config ~/.pie/config.<yours>.toml run text-to-image -o ./out -- \
     --width 1024 --height 1024 --steps 4 --seed 0 --out image
 ```
 
-The config must bind a generative row (`pie model info` says when one binds
-the inputs this sampler drives) and must set `[engine] max_model_len = 32768`: a 1024²
-job is 4096 latent rows a lane and the frame carries two fires, so the 4096
-default refuses the second fire by name.
+The config must bind a generative row whose `reading` switch has a
+`vae.decode` value (`pie model info` says when one binds the inputs this
+sampler drives), and `[engine] max_model_len` large enough for the image's
+latent tokens plus the prompt's rows.
 
-It does NOT need `[runtime] submit_deadline` touched, and that is worth
-saying because for a while it did. A denoise frame composes an attention group
-out of the image lane and the context lane, and the group forms only when both
-are members of one step; that wait used to be leashed by `submit_deadline`
-(50 ms), and a 1024² job's first submit carries megabytes of seeded `context`
-and `latents` across the guest boundary, so under load the leash fired first
-and the frame sealed with the IMAGE LANE ALONE. The model then attended its
-image rows with no caption and the run still SUCCEEDED, handing back a
-plausible textured field with nothing of the prompt in it — measured here on
-2026-09-06 at 1 of 3 correct on the eager path and 4 of 5 bodied, the wrong
-ones bit-identical per trajectory, which reads exactly like a numerics
-non-determinism and is not one. The runtime now keeps the promise instead (a
-stated cohort fires whole or not at all, `runtime::scheduler::frame`'s
-`group_short`), so this runs at the 50 ms default: 4 of 4 bit-identical and
-correct. If a picture ever comes back as that textured field again, a partial
-group is the first thing to check.
-
-Two exits, and which one a model gets is its own fact.
-
-A row that declares a drivable `vae.decode` reading gets `./out/image.png`:
-the guest fires the VAE on the voxel axis, reads the `pixels` seam with
+The picture arrives as `./out/image.png`: the guest fires the model's
+`vae.decode` reading on the voxel axis, reads the `pixels` seam with
 `intrinsics::pixels()`, and hands the channel's cell to `send_frames`, so the
-picture never enters WASM memory. The report says `"decoded": true`.
-
-A row whose VAE is traced but not declared as a reading (FLUX.2 today: its
-decoder's mid-block attention has no kernel arm) gets the final latent under
-the name the guest gave it, `./out/image.latent.f32`, plus the JSON report on
-stdout, which is its sidecar. `scripts/imagegen/decode_latent.py` finishes the
-job with the checkpoint's own diffusers VAE:
-
-```bash
-python scripts/imagegen/decode_latent.py --latent ./out/image.latent.f32 \
-    --sidecar ./out/image.json --model-dir <the diffusers folder> --out ./out/image.png
-```
+picture never enters WASM memory. A model with no `vae.decode` reading is
+refused by name.
 
 ## Standard input names
 
-The sampler binds a model's inputs by name, and knows five:
+The sampler binds a model's inputs by name, and knows four:
 
 | input | what this guest puts there |
 |---|---|
-| `latents` | the noised latent rows a denoise lane carries |
+| `latents` | the latent, the VAE's own `[h, w, C]`, on the voxel axis |
 | `timestep` | the step's timestep, one value a lane |
 | `guidance` | the guidance scale, one value a lane, when the model takes it |
 | `context` | the text encoder's hidden rows, on the prompt lane |
-| `positions` | each row's rotary coordinates, from `model::positions()` |
 
 These names are a convention between a model and the model-agnostic guests
 that drive it, not runtime vocabulary: the runtime checks a channel against
 the input's axis, width and dtype and never reads the name. A lane binds
 exactly the inputs `model::lane_of` says it reads, and an input it reads by
-any other name is refused by name instead of zero-filled: such a model is
-simply not one this guest drives.
+any other name is refused by name instead of zero-filled. Positions are not
+among them: the model computes its own, and patches its own latent.
 
 ## How it finds its way around
 
-The readings are the values of the model's `reading` switch
-(`model::switch("reading")`), and what each one is comes from its lane
-(`model::lane_of(&[("reading", r), ("stream", "image")])`):
+The readings are the values of the model's `reading` switch, and what each
+one is comes from what its lanes bind (`model::lane_of`):
 
 | role | the fact that says so |
 |---|---|
-| text encoder | `embeds && readout == Hidden` |
-| denoiser | `!embeds && readout == Velocity` |
-| VAE decode | `readout == Pixels`, and not the encoder |
+| text encoder | a lane that `embeds` and reads out `Hidden` |
+| denoiser | a token-less lane that reads `latents` and reads out `Velocity` |
+| the latent / prompt lane | the `stream` whose lane reads `latents` / `context` |
+| a bridge | a token-less `Hidden` reading that turns the encoder's rows into the width `context` takes (Z-Image's `refine`) |
+| VAE decode / encode | `vae.decode` / `vae.encode` |
 
-The latent grid comes from `model::latent()`, the step count and trajectory
-from `model::schedule()`, the row ceiling from `model::max_latent_rows()`, and
-the rotary coordinates from the model's `model::positions()` convention. A model
+The latent's size comes from `model::latent()` (channels and spatial
+compression), the step count and trajectory from `model::schedule()`. A model
 with no text reading is refused BY NAME ("this model has no text reading"),
 which is the right answer for the `mini-dit` fixture.
 
-The sampler is an eta epilogue: fire 0 seeds the latent with a keyed normal on
-the device, and every later fire integrates one Euler step over `velocity()`.
-Nothing large crosses into WASM.
+## One pipeline, nothing back
+
+Every pass goes down one pipeline, in submission order: the text encoder
+(its rows stay on the device, zero-padded there by an ETA copy to the rows
+`context` states, when it states some), the bridge, the VAE encoder for
+img2img, one denoise pass a step, and the decode. The last pass before the
+loop draws the latent on the device (`normal` on a keyed state, or the encoded
+picture noised to the schedule's first sigma) and seeds the loop's clock;
+the denoise epilogue is the sampler, `x <- x + (sigma' - sigma) v`, with `v`
+the guided `u + s (c - u)` when a negative prompt adds a second attention
+group to the pass. Nothing crosses into WASM until the decoded picture is
+handed to the client.
 
 ## Gates
 

@@ -1,13 +1,13 @@
 """A prompt goes in and an image comes out, with nothing about the family in the guest.
 
-`text-to-image` is the generic sampler of imagegen design D1/D4/D11/D12: it finds
-its text and denoise readings by ROLE (`takes_tokens && Hidden`,
-`!takes_tokens && Velocity`), sizes the latent grid from `model.latent()`, steps
-`model.schedule()`, places every lane's rotary coordinates from the reading's own
-`positions` convention, and exits either through a `vae.decode` reading or as the
-raw final latent. This gate drives it through the CLI a person actually types
-(`pie --config C run -o DIR`), because the latent leaves as a FILE and the file is
-half the claim.
+`text-to-image` is the generic sampler of the latent path: it finds its text and
+denoise readings by what their lanes bind (`embeds && Hidden`, a token-less lane
+reading `latents` with a `Velocity` readout), sizes the VAE's own latent from
+`model.latent()`, steps `model.schedule()`, and exits through the model's
+`vae.decode` reading as a PNG the runtime encodes. The model computes its own
+positions and patches its own latent. This gate drives it through the CLI a
+person actually types (`pie --config C run -o DIR`), because the picture leaves
+as a FILE and the file is half the claim.
 
 The half in FRONT of this -- that `pie model list` reports the row's
 generative facts, that `pie run text-to-image` resolves the guest by name with
@@ -16,8 +16,8 @@ no `--path`, and that what arrives is a named file -- is
 
 Two claims, one per row:
   * on a generative row with a text encoder (FLUX.2 klein-4B), four steps at 1024²
-    land a finite 64x64x128 latent whose sigmas are the model's own, and
-    `scripts/imagegen/decode_latent.py` turns it into a PNG of the stated size;
+    walk the model's own sigmas over a 128x128x32 latent and land a PNG of the
+    stated size;
   * on a row with NO text reading (`mini-dit`, whose caption rows are random
     embeddings), the guest refuses BY NAME -- "this model has no text reading" --
     rather than drawing something nobody asked for.
@@ -26,8 +26,7 @@ Two claims, one per row:
 denoise reading is reported as a skip, not a failure. The runs that mean to
 exercise the door name their config:
     CUDA_VISIBLE_DEVICES=3 uv run python tests/examples/test_text_to_image.py \\
-        --config ~/.pie/config.flux2.toml \\
-        --model-dir ~/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-4B/snapshots/*/
+        --config ~/.pie/config.flux2.toml
 
     CUDA_VISIBLE_DEVICES=3 uv run python tests/examples/test_text_to_image.py \\
         --config ~/.pie/config.minidit.toml --expect-refusal
@@ -40,7 +39,7 @@ under test includes `pie run -o`, so it runs the binary.
 **GIVE THIS RUN ITS OWN CONFIG FILE.** `~/.pie/config.flux2.toml` is shared,
 and a config another agent repoints at a different artifact (or a different
 port) is indistinguishable from a numerics regression: the run still succeeds
-and hands back a plausible latent that decodes to the wrong picture. Copy one
+and hands back a plausible picture of the wrong model. Copy one
 to a name only this suite uses.
 
 **TWO CONFIG KEYS THIS RUN NEEDS, AND WHY.** `[engine] max_model_len` is the
@@ -177,8 +176,8 @@ def check_png(path: Path, width: int, height: int) -> str:
 # the two claims
 # ---------------------------------------------------------------------------
 
-def a_prompt_becomes_a_latent_a_vae_can_decode(args) -> None:
-    """Four steps at 1024² land a finite latent, and its PNG is a picture."""
+def a_prompt_becomes_a_picture(args) -> None:
+    """Four steps at 1024² land a PNG that is a picture."""
     out_dir = Path(args.out) if args.out else Path(tempfile.mkdtemp(prefix="pie-t2i-"))
     out_dir.mkdir(parents=True, exist_ok=True)
     print(f"Out:    {out_dir}")
@@ -206,63 +205,23 @@ def a_prompt_becomes_a_latent_a_vae_can_decode(args) -> None:
     print(f"Sigmas: {[round(s, 4) for s in report['sigmas']]}")
 
     assert report["width"] == args.size and report["height"] == args.size, report
-    assert report["rows"] == report["grid_h"] * report["grid_w"], report
+    sc = report["spatial_compression"]
+    assert (report["latent_h"] * sc, report["latent_w"] * sc) == (args.size, args.size), report
     assert report["steps"] == args.steps, report
     assert len(report["sigmas"]) == args.steps + 1 and report["sigmas"][-1] == 0.0, report
     assert report["context_rows"] > 0, "the prompt encoded to no rows"
-    assert report["non_finite"] == 0, f"the latent carries non-finite values: {report}"
-    # A four-step flow lands a latent of roughly unit scale; an all-zero or
-    # exploded one is the loop having gone wrong in a way the shape hides.
-    assert 0.05 < report["std"] < 20.0, f"the final latent's scale is {report['std']}"
 
-    # THE DECODED EXIT (design D8/D11). A model that declares a `vae.decode`
-    # reading fires it in-guest and sends a PNG the runtime encoded: there is
-    # no latent blob, no sidecar and nothing for `decode_latent.py` to do,
-    # because the picture is already a picture.
-    if report.get("decoded"):
-        png = out_dir / report["file"]
-        assert png.exists(), f"the report says it sent {report['file']} and {out_dir} has it not"
-        how = check_png(png, args.size, args.size)
-        print(f"[OK] {png}  {png.stat().st_size:,} bytes  (checked by {how}) "
-              f"-- decoded in-guest by reading `{report['decode_reading']}`")
-        return
-
-    # The other exit goes out through `session.send-file-as`, so the latent
-    # arrives NAMED too and `pie run -o` writes it under that name -- no
-    # `file-0000.bin` to rename, and no need to read the report to find out
-    # which file is which.
-    latent = out_dir / report["file"]
-    assert latent.exists(), (
-        f"the report names {report['file']}, which is not in {out_dir}: "
-        f"{sorted(p.name for p in out_dir.iterdir())}"
-    )
+    # The one exit: the model's `vae.decode` reading, fired in-guest, the
+    # PNG encoded by the runtime under the name the report states.
+    png = out_dir / report["file"]
+    assert png.exists(), f"the report says it sent {report['file']} and {out_dir} has it not"
     assert not sorted(out_dir.glob("file-*.bin")), (
         "a numbered blob arrived beside the named one: something is still "
         "sending through the unnamed `session.send-file`"
     )
-    assert latent.stat().st_size == report["bytes"], (latent.stat().st_size, report["bytes"])
-    sidecar = latent.with_suffix("").with_suffix(".json")
-    sidecar.write_text(json.dumps(report, indent=2))
-    print(f"Latent: {latent}  ({latent.stat().st_size:,} bytes)")
-
-    if not args.model_dir:
-        print("⚠️  no --model-dir: the latent is not decoded, so this run proved the "
-              "loop and not the picture")
-        return
-    png = out_dir / "image.png"
-    decode = [args.python, str(REPO_ROOT / "scripts" / "imagegen" / "decode_latent.py"),
-              "--latent", str(latent), "--sidecar", str(sidecar),
-              "--model-dir", resolve(args.model_dir), "--out", str(png),
-              "--family", args.family]
-    print("Decode:", " ".join(decode))
-    done = subprocess.run(decode, cwd=REPO_ROOT, capture_output=True, text=True,
-                          timeout=args.timeout)
-    sys.stdout.write(done.stdout)
-    if done.returncode != 0:
-        sys.stderr.write(done.stderr)
-        raise AssertionError(f"decode_latent.py exited {done.returncode}")
     how = check_png(png, args.size, args.size)
-    print(f"✅ {png}  {png.stat().st_size:,} bytes  (checked by {how})")
+    print(f"✅ {png}  {png.stat().st_size:,} bytes  (checked by {how}) "
+          f"-- decoded in-guest by reading `{report['decode_reading']}`")
 
 
 def a_model_with_no_text_reading_refuses_by_name(args) -> None:
@@ -286,12 +245,6 @@ def main() -> int:
     ap.add_argument("--config", default=None,
                     help="the serving config; its `[model] source` is the imported artifact")
     ap.add_argument("--pie", default=None, help="the `pie` binary (default: target/{release,debug})")
-    ap.add_argument("--model-dir", default=None,
-                    help="the diffusers folder to decode with; without it the latent is "
-                         "checked but not decoded")
-    ap.add_argument("--family", default="flux2", help="decode_latent.py's --family")
-    ap.add_argument("--python", default=sys.executable,
-                    help="the interpreter that has torch + diffusers (the imagegen venv)")
     ap.add_argument("--prompt", default="a red bicycle leaning on a blue wall")
     ap.add_argument("--size", type=int, default=1024)
     ap.add_argument("--steps", type=int, default=4)
@@ -305,7 +258,7 @@ def main() -> int:
     args = ap.parse_args()
 
     claim = (a_model_with_no_text_reading_refuses_by_name if args.expect_refusal
-             else a_prompt_becomes_a_latent_a_vae_can_decode)
+             else a_prompt_becomes_a_picture)
     print(f"🔄 {claim.__name__}")
     try:
         claim(args)

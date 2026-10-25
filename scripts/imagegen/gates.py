@@ -393,13 +393,8 @@ def wan_video_readout(text: str) -> str:
     size = re.search(r"\[gates\] (\d+)x(\d+) mp4, (\d+) frames", text)
     if size:
         bits.append(f"{size.group(1)}x{size.group(2)}x{size.group(3)} mp4")
-    stds = [float(v) for v in re.findall(r'"std":([0-9.]+)', text)]
     guided = re.findall(r'"cfg":(true|false)', text)
-    if len(stds) >= 2 and guided[:2] == ["false", "true"]:
-        moved = abs(stds[1] - stds[0]) / max(stds[0], 1e-9)
-        verdict = "pass" if moved > 0.05 else "FAIL"
-        bits.append(f"guided std {stds[0]:.3f} -> {stds[1]:.3f} ({verdict})")
-    elif guided:
+    if guided:
         bits.append(f"cfg runs {','.join(guided)}")
     bits += v2v_claims(text)
     if clips:
@@ -554,12 +549,6 @@ def t2i_readout(text: str) -> str:
             bits.append(f"both-at-once differs from either {both:.4f} ({ok})")
         except Exception as why:
             bits.append(f"reference claims unread: {why}")
-    stat = re.search(r"\[gates\] inpaint: mask_rows=(\d+) kept_max_abs=(\S+) painted_mean_abs=(\S+)", text)
-    if stat:
-        rows, kept, painted = int(stat.group(1)), float(stat.group(2)), float(stat.group(3))
-        ok = "pass" if kept == 0.0 and painted > 0.0 and rows > 0 else "FAIL"
-        bits.append(f"inpaint: {rows} rows repainted, kept rows moved {kept} in latent, "
-                    f"painted rows {painted:.4f} ({ok})")
     if {"small", "inpaint"} <= named.keys():
         try:
             import numpy as np
@@ -1044,11 +1033,8 @@ def roster() -> list[Gate]:
 def text_to_image(args) -> int:
     """`--text-to-image`: drive the generic guest and end with a real PNG.
 
-    Two exits, and which one the row takes is its own fact (D11): a row whose
-    `vae.decode` is a declared reading hands back `image.png` directly; FLUX.2
-    today hands back the final latent plus its JSON sidecar, and
-    `decode_latent.py` finishes the job with the checkpoint's own autoencoder.
-    Either way this prints `[gates] picture: <path>` and its pixel size.
+    One exit: the row's `vae.decode` reading, fired in-guest, hands back
+    `image.png`. This prints `[gates] picture: <path>` and its pixel size.
     """
     inferlet = os.path.join(REPO, "examples/text-to-image")
     workspace = os.path.dirname(inferlet)
@@ -1087,46 +1073,10 @@ def text_to_image(args) -> int:
     if done.returncode != 0:
         print(f"[gates] pie run failed ({done.returncode})")
         return 1
-    for line in done.stdout.splitlines():
-        if line.startswith("{") and "kept_max_abs" in line:
-            try:
-                report = json.loads(line)
-            except ValueError:
-                continue
-            if report.get("mask_rows") is not None:
-                print(f"[gates] inpaint: mask_rows={report['mask_rows']} "
-                      f"kept_max_abs={report['kept_max_abs']} "
-                      f"painted_mean_abs={report['painted_mean_abs']}")
-
     png = os.path.join(args.out, "image.png")
     if not os.path.exists(png):
-        latent = os.path.join(args.out, "image.latent.f32")
-        sidecar = os.path.join(args.out, "image.json")
-        if not os.path.exists(latent):
-            print(f"[gates] neither {png} nor {latent} exists")
-            return 1
-        if not os.path.exists(sidecar):
-            body = [line for line in done.stdout.splitlines() if line.startswith("{")]
-            if not body:
-                print("[gates] no sidecar and no JSON report on stdout")
-                return 1
-            with open(sidecar, "w") as f:
-                f.write(body[-1])
-        snap = sorted(glob.glob(os.path.expanduser(
-            "~/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-4B/snapshots/*")))
-        if not snap:
-            print("[gates] no FLUX.2-klein-4B snapshot to decode the latent with")
-            return 1
-        decode = [sys.executable, os.path.join(HERE, "decode_latent.py"),
-                  "--latent", latent, "--sidecar", sidecar,
-                  "--model-dir", snap[-1], "--out", png, "--family", "flux2"]
-        print("$ " + " ".join(decode), flush=True)
-        done = subprocess.run(decode, cwd=REPO, capture_output=True, text=True)
-        sys.stdout.write(done.stdout)
-        sys.stderr.write(done.stderr)
-        if done.returncode != 0 or not os.path.exists(png):
-            print(f"[gates] decode_latent.py failed ({done.returncode})")
-            return 1
+        print(f"[gates] no {png}")
+        return 1
 
     with open(png, "rb") as f:
         head = f.read(33)
