@@ -19,7 +19,7 @@ fn readout(readout: poem_ir::Readout) -> pie::inferlet::model::Readout {
 /// An input as its guest binds it: an i32 input is fed i32, any float one
 /// f32.
 pub(crate) fn input_decl(input: &poem_ir::InputDecl) -> pie::inferlet::model::InputDecl {
-    use pie::inferlet::model::InputAxis;
+    use pie::inferlet::model::{InputAxis, RowCount};
     pie::inferlet::model::InputDecl {
         name: input.name.clone(),
         axis: match input.axis {
@@ -32,7 +32,10 @@ pub(crate) fn input_decl(input: &poem_ir::InputDecl) -> pie::inferlet::model::In
             poem_ir::Dtype::I32 => pie::inferlet::types::Dtype::I32,
             _ => pie::inferlet::types::Dtype::F32,
         },
-        rows: input.rows,
+        rows: input.rows.map(|rows| match rows {
+            poem_ir::RowCount::Exact(n) => RowCount::Exact(n),
+            poem_ir::RowCount::Multiple(n) => RowCount::Multiple(n),
+        }),
     }
 }
 

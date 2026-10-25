@@ -3248,7 +3248,7 @@ pub(crate) static INPUTS: &[Op] = &[
             let dtype: Dtype = a.next()?;
             let axis: poem_ir::InputAxis = a.next()?;
             let width: u32 = a.next()?;
-            let rows: Option<u32> = a.next()?;
+            let rows: Option<poem_ir::RowCount> = a.next()?;
             result(
                 heap,
                 dsl("inputs.input", || {

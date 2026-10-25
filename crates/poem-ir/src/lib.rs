@@ -28,7 +28,8 @@ pub use poem_ir_macros::Op;
 pub use request::Request;
 pub use trace::{
     BlockDrafter, CacheRow, GuestInput, InputDecl, LaneClass, LaneClasses, Node, Param,
-    ParamLayout, ParamPlacement, ParamSource, Platform, Readout, ReadoutKind, Seam, Shard, Trace,
+    ParamLayout, ParamPlacement, ParamSource, Platform, Readout, ReadoutKind, RowCount, Seam,
+    Shard, Trace,
 };
 pub use value::{
     BIASES, Def, Dim, Dtype, GLOBAL_SCALES, GeomKind, INPUT_SCALES, InputAxis, PerAxis, RowAxis,

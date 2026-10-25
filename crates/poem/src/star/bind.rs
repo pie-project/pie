@@ -272,6 +272,27 @@ impl<'v> Arg<'v> for poem_ir::InputAxis {
     }
 }
 
+/// A lane's stated rows: a count is exactly that many, `multiple_of(n)` the
+/// fewest that are a multiple of `n`.
+impl<'v> Arg<'v> for poem_ir::RowCount {
+    fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
+        let v = given(v)?;
+        if let Some(n) = v.unpack_i32() {
+            return u32::try_from(n)
+                .ok()
+                .filter(|&n| n > 0)
+                .map(poem_ir::RowCount::Exact)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("a lane carries a positive count of rows, not {n}")
+                });
+        }
+        match v.downcast_ref::<Whole>() {
+            Some(Whole(Held::Rows(rows))) => Ok(*rows),
+            _ => wanted("a row count or `multiple_of(n)`", v),
+        }
+    }
+}
+
 impl<'v> Arg<'v> for GateActivation {
     fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
         use GateActivation::*;
@@ -370,6 +391,7 @@ pub(crate) enum Held {
     Turn(Turn),
     Gating(GluAct),
     Routing(RouteScore),
+    Rows(poem_ir::RowCount),
 }
 
 starlark_simple_value!(Whole);
@@ -649,6 +671,13 @@ pub(crate) fn wholes(builder: &mut starlark::environment::GlobalsBuilder) {
     /// own group.
     fn group_block_diagonal() -> anyhow::Result<Whole> {
         Ok(Whole(Held::Mask(RaggedMask::GroupBlockDiagonal)))
+    }
+
+    /// The rows of an input's lane stated as the fewest that are a multiple
+    /// of `n` (`input(..., rows = multiple_of(32))`).
+    fn multiple_of(#[starlark(require = pos)] n: u32) -> anyhow::Result<Whole> {
+        anyhow::ensure!(n > 0, "rows are a multiple of a positive count, not 0");
+        Ok(Whole(Held::Rows(poem_ir::RowCount::Multiple(n))))
     }
 
     /// A ragged attention's mask that masks nothing.
