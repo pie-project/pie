@@ -1650,6 +1650,66 @@ __device__ __forceinline__ void ptir_scatter_updates(
   }
 }
 
+__device__ __forceinline__ float m1_reduce_identity(m1_u32 tag) {
+  return tag == 0x30u ? 0.0f : (tag == 0x31u ? m1_neg_inf() : m1_pos_inf());
+}
+
+__device__ __forceinline__ float m1_reduce_combine(
+    m1_u32 tag, float left, float right) {
+  return tag == 0x30u
+             ? left + right
+             : (tag == 0x31u ? m1_canonical_max(left, right)
+                             : m1_canonical_min(left, right));
+}
+
+// One chunk's fold, the interpreter's warp tree: lane `l` takes in lane
+// `l + offset` for `offset` 16, 8, 4, 2, 1; lane 0 holds the chunk's value.
+// Every lane of the chunk calls it.
+__device__ __forceinline__ float m1_reduce_chunk(m1_u32 tag, float value) {
+  const m1_u32 lane = threadIdx.x & 31u;
+  for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u) {
+    const float other = m1_chunk_down(value, offset);
+    if (lane < offset) value = m1_reduce_combine(tag, value, other);
+  }
+  return value;
+}
+
+// The canonical reduction of `count` floats at `level` — the interpreter's
+// `canonical_reduce`: while more than one value is left, each run of 32 folds
+// into one, the last run padded with the identity, into `out` and then
+// `spare` by turns. One value is the answer as it stands, never folded with
+// the identity (`-0` stays `-0`). The whole block calls it, and every thread
+// returns the answer.
+__device__ __forceinline__ float ptir_canonical_reduce(
+    m1_u32 tag,
+    const float* level,
+    m1_u32 count,
+    float* out,
+    float* spare) {
+  const m1_u32 lane = threadIdx.x & 31u;
+  const m1_u32 warp = threadIdx.x >> 5u;
+  const m1_u32 warps = blockDim.x >> 5u;
+  if (count == 0u) return m1_reduce_identity(tag);
+  while (count > 1u) {
+    const m1_u32 chunks = (count + 31u) / 32u;
+    for (m1_u32 chunk = warp; chunk < chunks; chunk += warps) {
+      const m1_u32 index = chunk * 32u + lane;
+      const float value = m1_reduce_chunk(
+          tag, index < count ? level[index] : m1_reduce_identity(tag));
+      if (lane == 0u) out[chunk] = value;
+    }
+    __syncthreads();
+    level = out;
+    float* const next = spare;
+    spare = out;
+    out = next;
+    count = chunks;
+  }
+  const float answer = level[0];
+  __syncthreads();
+  return answer;
+}
+
 __device__ __forceinline__ void ptir_parallel_reduce_f32(
     m1_u32 tag,
     const m1_u8* input,
@@ -1657,86 +1717,13 @@ __device__ __forceinline__ void ptir_parallel_reduce_f32(
     m1_u8* temporary,
     const M1ValueDesc input_desc) {
   float* work_a = reinterpret_cast<float*>(temporary);
-  const m1_u32 first_chunks = (input_desc.last + 31u) / 32u;
-  float* work_b = work_a + first_chunks;
+  float* work_b = work_a + (input_desc.last + 31u) / 32u;
   const float* values = reinterpret_cast<const float*>(input);
   float* result = reinterpret_cast<float*>(output);
-  const m1_u32 lane = threadIdx.x & 31u;
-  const m1_u32 warp = threadIdx.x >> 5u;
-  const m1_u32 warps = blockDim.x >> 5u;
   for (m1_u32 row = 0; row < input_desc.rows; ++row) {
-    const m1_u32 base = row * input_desc.last;
-    if (input_desc.last == 0u) {
-      if (threadIdx.x == 0u)
-        result[row] =
-            tag == 0x30u
-                ? 0.0f
-                : (tag == 0x31u ? m1_neg_inf() : m1_pos_inf());
-      __syncthreads();
-      continue;
-    }
-    for (m1_u32 chunk = warp;
-         chunk < first_chunks;
-         chunk += warps) {
-      const m1_u32 index = chunk * 32u + lane;
-      const float identity =
-          tag == 0x30u
-              ? 0.0f
-              : (tag == 0x31u ? m1_neg_inf() : m1_pos_inf());
-      float value =
-          index < input_desc.last ? values[base + index] : identity;
-      for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u) {
-        const float other = m1_chunk_down(value, offset);
-        if (lane < offset) {
-          value =
-              tag == 0x30u
-                  ? value + other
-                  : (tag == 0x31u
-                         ? m1_canonical_max(value, other)
-                         : m1_canonical_min(value, other));
-        }
-      }
-      if (lane == 0u) work_a[chunk] = value;
-    }
-    __syncthreads();
-    m1_u32 count = first_chunks;
-    float* reduction_input = work_a;
-    float* reduction_output = work_b;
-    while (count > 1u) {
-      const m1_u32 chunks = (count + 31u) / 32u;
-      for (m1_u32 chunk = warp;
-           chunk < chunks;
-           chunk += warps) {
-        const m1_u32 index = chunk * 32u + lane;
-        const float identity =
-            tag == 0x30u
-                ? 0.0f
-                : (tag == 0x31u ? m1_neg_inf() : m1_pos_inf());
-        float value =
-            index < count ? reduction_input[index] : identity;
-        for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u) {
-          const float other = m1_chunk_down(value, offset);
-          if (lane < offset) {
-            value =
-                tag == 0x30u
-                    ? value + other
-                    : (tag == 0x31u
-                           ? m1_canonical_max(
-                                 value, other)
-                           : m1_canonical_min(
-                                 value, other));
-          }
-        }
-        if (lane == 0u) reduction_output[chunk] = value;
-      }
-      __syncthreads();
-      float* swap = reduction_input;
-      reduction_input = reduction_output;
-      reduction_output = swap;
-      count = chunks;
-    }
-    if (threadIdx.x == 0u) result[row] = reduction_input[0];
-    __syncthreads();
+    const float answer = ptir_canonical_reduce(
+        tag, values + row * input_desc.last, input_desc.last, work_a, work_b);
+    if (threadIdx.x == 0u) result[row] = answer;
   }
 }
 
