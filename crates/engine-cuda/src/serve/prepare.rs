@@ -669,7 +669,11 @@ impl FrameShell for Shell {
                            runs over the whole voxel rectangle (M0: one voxel class per fire)",
                 });
             }
-            let slot_of: Vec<u32> = lanes.iter().map(|seated| seated.lane.slot).collect();
+            // A clip's conv caches are State rows: the lane's recurrent-state row.
+            let slot_of: Vec<u32> = lanes
+                .iter()
+                .map(|seated| seated.rs_slot.unwrap_or(seated.lane.slot))
+                .collect();
             crate::voxels::Tables::of(
                 &store.seat(),
                 composition.lanes(),

@@ -547,6 +547,10 @@ fn facts(builder: &mut GlobalsBuilder) {
     fn encode() -> anyhow::Result<PredicateValue> {
         Ok(PredicateValue(fact::encode()))
     }
+
+    fn fresh() -> anyhow::Result<PredicateValue> {
+        Ok(PredicateValue(fact::fresh()))
+    }
 }
 
 #[starlark_module]

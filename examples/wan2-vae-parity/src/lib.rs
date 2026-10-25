@@ -3,11 +3,13 @@
 //!
 //! The engine gate `the_wan_2_vae_answers_the_reference` drives the shell
 //! from the host; this guest decodes a `T`-frame latent the way
-//! `examples/text-to-video` does: one fire per latent frame down ONE
-//! pipeline, the `.head` arm first and closed before the later arm opens,
-//! the pipeline closed last. Every chunk after the head reads the conv
-//! caches the fire before it left, so a runtime that hands a later fire
-//! cold caches shows up as a chunk that drifts.
+//! `examples/text-to-video` does: ONE reading, one fire per latent frame
+//! down ONE pipeline, each binding ONE working set whose recurrent state is
+//! the conv caches. The model runs its head form where that state is empty
+//! (the first fire, one output frame) and the rest form after. Every chunk
+//! after the first reads the conv caches the fire before it left, so a
+//! runtime that hands a later fire cold caches shows up as a chunk that
+//! drifts.
 //!
 //! The pixels go back to the client as one raw `[F*H*W, 3]` f32 file
 //! (`pie run -o DIR` writes it as `file-0000.bin`).
@@ -64,20 +66,17 @@ struct Case {
 
 #[derive(Serialize)]
 struct Output {
-    /// The arm each fire used, in order.
+    /// The reading each fire used, in order.
     fires: Vec<String>,
     /// Output frames each fire landed.
     chunk_frames: Vec<u32>,
+    /// The last chunk decoded again on a FORK of the working set taken
+    /// before its fire, and the largest |difference| from the parent's.
+    fork_max_abs_diff: f32,
     pixel_h: u32,
     pixel_w: u32,
     /// Bytes of raw f32 sent as the file.
     pixels_bytes: u32,
-}
-
-/// The decode arms, found as `text-to-video` finds them.
-struct Arms {
-    head: String,
-    decode: String,
 }
 
 /// What `reading`'s video lane reads out.
@@ -87,24 +86,17 @@ fn readout(reading: &str) -> Option<model::Readout> {
         .readout
 }
 
-fn arms() -> Result<Arms> {
-    let decoders: Vec<String> = model::switch("reading")
+/// The decode reading: the one landing pixels that is not the encoder.
+fn decoder() -> Result<String> {
+    model::switch("reading")
         .map(|decl| decl.values)
         .unwrap_or_default()
         .into_iter()
-        .filter(|r| {
+        .find(|r| {
             !r.starts_with("vae.encode")
                 && readout(r).is_some_and(|readout| readout.kind == model::ReadoutKind::Pixels)
         })
-        .collect();
-    let head = decoders.iter().find(|r| r.ends_with(".head")).cloned();
-    let decode = decoders.iter().find(|r| !r.ends_with(".head")).cloned();
-    match (head, decode) {
-        (Some(head), Some(decode)) => Ok(Arms { head, decode }),
-        _ => Err(
-            "this model declares no causal `vae.decode` pair (a `.head` arm and the rest)".into(),
-        ),
-    }
+        .ok_or_else(|| "this model declares no `vae.decode` reading".into())
 }
 
 /// The one input a VAE arm's lane reads: a clip on the voxel axis.
@@ -119,8 +111,8 @@ fn voxel_input(reading: &str) -> Result<model::InputDecl> {
     }
 }
 
-/// Fire ONE decode arm over ONE latent frame and take its pixels back —
-/// `text-to-video`'s `decode_frame`, unchanged: the pass dies with the call.
+/// Fire the decode over ONE latent frame into `state` and take its pixels
+/// back — `text-to-video`'s `decode_frame`, unchanged.
 #[allow(clippy::too_many_arguments)]
 async fn decode_frame(
     reading: &str,
@@ -130,6 +122,7 @@ async fn decode_frame(
     frames: u32,
     pixel_h: u32,
     pixel_w: u32,
+    state: &WorkingSet,
     pipe: &Pipeline,
 ) -> Result<Vec<f32>> {
     let input = voxel_input(reading)?;
@@ -140,6 +133,7 @@ async fn decode_frame(
     let pass = ForwardPass::new();
     pass.switch(0, "reading", reading)?;
     pass.switch(0, "stream", "video")?;
+    pass.state(&[state], StateGeometry::default())?;
     let cell =
         Channel::from_shaped([clip_h, clip_w, input.width], clip.to_vec()).named("vae_latent");
     pass.input(0, &input.name, &cell)?;
@@ -204,33 +198,52 @@ async fn main(input: Input) -> Result<Output> {
     }
     let (tc, sc) = (space.temporal_compression, space.spatial_compression);
     let (pixel_h, pixel_w) = (case.h * sc, case.w * sc);
-    let a = arms()?;
+    let decode = decoder()?;
 
-    // ONE pipeline; the head fire first, its pass closed before the rest.
+    // ONE working set and ONE pipeline; the head fire first.
+    let state = WorkingSet::new();
     let pipe = Pipeline::new();
     let mut pixels: Vec<f32> = Vec::new();
     let mut fires = Vec::new();
     let mut chunk_frames = Vec::new();
+    let mut fork_max_abs_diff = 0.0f32;
     for k in 0..case.t {
-        let (arm, frames) = if k == 0 {
-            (&a.head, 1)
-        } else {
-            (&a.decode, tc)
-        };
+        // An empty state lands one frame, every later one `tc`.
+        let frames = if k == 0 { 1 } else { tc };
         let at = k as usize * plane;
-        let out = decode_frame(
-            arm,
-            &case.latent[at..at + plane],
-            case.h,
-            case.w,
-            frames,
-            pixel_h,
-            pixel_w,
-            &pipe,
-        )
-        .await?;
+        // The last chunk, first on a fork: it must decode on from the very
+        // state its parent holds.
+        let fork = (k + 1 == case.t && k > 0)
+            .then(|| state.fork(&pipe))
+            .transpose()?;
+        let mut outs = Vec::new();
+        for ws in fork.iter().chain(std::iter::once(&state)) {
+            outs.push(
+                decode_frame(
+                    &decode,
+                    &case.latent[at..at + plane],
+                    case.h,
+                    case.w,
+                    frames,
+                    pixel_h,
+                    pixel_w,
+                    ws,
+                    &pipe,
+                )
+                .await?,
+            );
+        }
+        let out = outs.pop().ok_or("no decode")?;
+        let forked = outs.pop();
+        if let Some(forked) = forked {
+            fork_max_abs_diff = forked
+                .iter()
+                .zip(&out)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+        }
         pixels.extend_from_slice(&out);
-        fires.push(arm.clone());
+        fires.push(decode.clone());
         chunk_frames.push(frames);
     }
     pipe.close();
@@ -240,6 +253,7 @@ async fn main(input: Input) -> Result<Output> {
     Ok(Output {
         fires,
         chunk_frames,
+        fork_max_abs_diff,
         pixel_h,
         pixel_w,
         pixels_bytes: raw.len() as u32,

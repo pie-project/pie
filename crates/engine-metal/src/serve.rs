@@ -3469,7 +3469,8 @@ impl Shell {
                         narrow(u64::from(boxed[2])),
                         narrow(u64::from(offset)),
                     ]);
-                    voxel_slots.push(lanes[row.source as usize].lane.slot as i32);
+                    let seated = &lanes[row.source as usize];
+                    voxel_slots.push(seated.rs_slot.unwrap_or(seated.lane.slot) as i32);
                     let voxels = boxed[0].saturating_mul(boxed[1]).saturating_mul(boxed[2]);
                     offset = offset.saturating_add(voxels);
                     if let Some(p) = token_patch {
