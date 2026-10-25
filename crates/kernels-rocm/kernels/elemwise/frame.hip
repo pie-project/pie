@@ -76,6 +76,14 @@ struct RowFrame {
 
     __device__ __forceinline__ float one(int k) const { return ones[k]; }
 
+    __device__ __forceinline__ unsigned col(int e) const {
+        return static_cast<unsigned>((tid + (e / 8) * BLOCK) * 8 + e % 8);
+    }
+
+    // An angle as the hand kernels turn one.
+    __device__ __forceinline__ float sin(float v) const { return __sinf(v); }
+    __device__ __forceinline__ float cos(float v) const { return __cosf(v); }
+
     __device__ __forceinline__ float ld(int k, int e) const {
         return to_f32(reinterpret_cast<const bf16*>(&in[k][e / 8])[e % 8]);
     }

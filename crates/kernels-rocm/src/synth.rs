@@ -43,6 +43,15 @@ impl Body {
     pub fn of(region: &Region) -> Result<Body, Refusal> {
         let kernel = kernels_ir::schedule(region)
             .map_err(|why| Refusal(format!("the row core does not schedule the region: {why}")))?;
+        // HIP's frame holds a row's elements and reductions; a head's
+        // values, a table and a shared row are kernels-cuda's alone so far.
+        if !kernel.heads.is_empty() || !kernel.tables.is_empty() || kernel.shares {
+            return Err(Refusal(
+                "a kernel over heads, a table or a gather within the row, which HIP's frame \
+                 does not hold"
+                    .into(),
+            ));
+        }
         let source = print::body(&kernel).map_err(|print::Unprinted(dtype)| {
             Refusal(format!(
                 "a value rounds to {dtype:?}, which no hook rounds to"

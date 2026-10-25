@@ -1611,8 +1611,9 @@ impl<'c> Run<'c> {
         &self,
         body: u64,
         width: u32,
+        forms: &[kernels_cuda::synth::In],
     ) -> Option<kernels_cuda::synth::Synthesized> {
-        self.regions.get(body, width)
+        self.regions.get(body, width, forms)
     }
 
     pub(crate) fn lane_shaped(&self, id: ValueId) -> bool {

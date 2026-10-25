@@ -20,7 +20,7 @@ pub use operands::{Operands, Part, Slot};
 pub use ops::{
     ActFn, ActQuant, Attn, BinaryOp, Blocks, Bounds, Collective, Conv, Elemwise, Fused,
     GateActivation, GateHeads, Gather, GluAct, GridRule, IndexScore, Linear, ModulateForm,
-    MropeForm, NormAxis, NormKind, NormNext, NormWeight, Operation, PixelOrder, RaggedMask,
+    MropeForm, NormAxis, NormKind, NormNext, NormWeight, Operation, PixelOrder, RaggedMask, RegionRead,
     Relative, ResidualGate, RopeForm, RopeFreqs, RouteScore, Sampling, Ssm, TapKind, TimePad, Turn,
     VoxelSegment, Yarn,
 };

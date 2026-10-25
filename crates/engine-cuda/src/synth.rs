@@ -13,18 +13,19 @@ use std::collections::BTreeMap;
 use kernels_ir::Region;
 #[cfg(not(feature = "rocm"))]
 use poem_ir::{Def, Dtype, Ty, ValueDecl};
-use poem_ir::{Fused, Operation, Trace, ValueId};
+use poem_ir::{Fused, Operation, RegionRead, Trace, ValueId};
 
 use crate::error::{Fault, Result};
 
 #[cfg(not(feature = "rocm"))]
 use kernels_cuda::synth::{In, Out, Synthesized};
 
-/// Each generated kernel of a load, by body hash and width.
+/// Each generated kernel of a load, by body hash and width, and by how
+/// its parameters are stored.
 #[derive(Debug, Default)]
 pub struct Regions {
     #[cfg(not(feature = "rocm"))]
-    kernels: BTreeMap<(u64, u32), Synthesized>,
+    kernels: BTreeMap<(u64, u32), Vec<(Vec<In>, Synthesized)>>,
 }
 
 /// A load's regions where its trace holds none.
@@ -33,18 +34,38 @@ pub(crate) static NONE: Regions = Regions {
     kernels: BTreeMap::new(),
 };
 
-/// Every `fused.region` of `trace`: its node, and its parameters, width,
-/// region key and results.
-fn regions(trace: &Trace) -> impl Iterator<Item = (u32, &[ValueId], u32, u64, &[ValueId])> {
+/// One `fused.region` of a trace: its node, parameters (and how each is
+/// read), width, region key and results. ROCm reads only where it lies
+/// (to refuse it).
+#[cfg_attr(feature = "rocm", allow(dead_code))]
+struct Site<'t> {
+    node: u32,
+    ins: &'t [ValueId],
+    reads: &'t [RegionRead],
+    width: u32,
+    body: u64,
+    outs: &'t [ValueId],
+}
+
+/// Every `fused.region` of `trace`.
+fn regions(trace: &Trace) -> impl Iterator<Item = Site<'_>> {
     (0u32..)
         .zip(&trace.nodes)
-        .filter_map(|(at, node)| match &node.op {
+        .filter_map(|(node, n)| match &n.op {
             Operation::Fused(Fused::Region {
                 ins,
+                reads,
                 width,
                 key,
                 outs,
-            }) => Some((at, ins.as_slice(), *width, *key, outs.as_slice())),
+            }) => Some(Site {
+                node,
+                ins,
+                reads,
+                width: *width,
+                body: *key,
+                outs,
+            }),
             _ => None,
         })
 }
@@ -55,7 +76,15 @@ impl Regions {
     #[cfg(not(feature = "rocm"))]
     pub(crate) fn load(trace: &Trace, regions_of: &BTreeMap<u64, Region>) -> Result<Regions> {
         let mut kernels = BTreeMap::new();
-        for (node, ins, width, body, outs) in regions(trace) {
+        for Site {
+            node,
+            ins,
+            reads,
+            width,
+            body,
+            outs,
+        } in regions(trace)
+        {
             let broken = |why: String| Fault::Region { node, body, why };
             let region = regions_of
                 .get(&body)
@@ -66,20 +95,7 @@ impl Regions {
             let stored = |v: ValueId| {
                 dtype_of(trace, v).ok_or_else(|| broken(format!("value {} is a struct", v.0)))
             };
-            let forms = ins
-                .iter()
-                .map(|&v| {
-                    let dtype = stored(v)?;
-                    let decl = &trace.values[v.0 as usize];
-                    Ok(if one(decl) {
-                        In::One(dtype)
-                    } else if shared(decl) {
-                        In::Shared(dtype)
-                    } else {
-                        In::Rows(dtype)
-                    })
-                })
-                .collect::<Result<Vec<In>>>()?;
+            let forms = forms(&trace.values, ins, reads, |v| dtype_of(trace, v)).map_err(broken)?;
             let results = outs
                 .iter()
                 .map(|&v| stored(v).map(Out::Rows))
@@ -91,10 +107,11 @@ impl Regions {
                     "the op states rows {width} wide and its region's are not"
                 )));
             }
-            if let std::collections::btree_map::Entry::Vacant(slot) = kernels.entry((body, width)) {
+            let held: &mut Vec<(Vec<In>, Synthesized)> = kernels.entry((body, width)).or_default();
+            if !held.iter().any(|(stored, _)| *stored == forms) {
                 let kernel = kernels_cuda::synth::synth(region, &forms, outs.len())?;
                 kernel.load()?;
-                slot.insert(kernel);
+                held.push((forms, kernel));
             }
         }
         Ok(Regions { kernels })
@@ -105,7 +122,7 @@ impl Regions {
     #[cfg(feature = "rocm")]
     pub(crate) fn load(trace: &Trace, _regions: &BTreeMap<u64, Region>) -> Result<Regions> {
         match regions(trace).next() {
-            Some((node, ..)) => Err(Fault::Unsupported(format!(
+            Some(Site { node, .. }) => Err(Fault::Unsupported(format!(
                 "the `fused.region` at node {node}: this backend generates no row kernel; \
                  serve it with `compiler.synth_regions` off"
             ))),
@@ -113,12 +130,12 @@ impl Regions {
         }
     }
 
-    /// How many kernels the load generated: one a region and width.
+    /// How many kernels the load generated: one a region, width and storage.
     #[must_use]
     pub fn len(&self) -> usize {
         #[cfg(not(feature = "rocm"))]
         {
-            self.kernels.len()
+            self.kernels.values().map(Vec::len).sum()
         }
         #[cfg(feature = "rocm")]
         {
@@ -131,11 +148,60 @@ impl Regions {
         self.len() == 0
     }
 
-    /// The kernel of the region of key `body` over rows `width` wide.
+    /// The kernel of the region of key `body` over rows `width` wide, its
+    /// parameters stored as `forms` says.
     #[cfg(not(feature = "rocm"))]
-    pub(crate) fn get(&self, body: u64, width: u32) -> Option<Synthesized> {
-        self.kernels.get(&(body, width)).copied()
+    pub(crate) fn get(&self, body: u64, width: u32, forms: &[In]) -> Option<Synthesized> {
+        self.kernels
+            .get(&(body, width))?
+            .iter()
+            .find(|(stored, _)| stored.as_slice() == forms)
+            .map(|(_, kernel)| *kernel)
     }
+}
+
+/// How each of a region's parameters `ins` is stored: a weight of one
+/// element, one row of a weight every row reads, rows picked by id (as
+/// `reads` says), one element a row (a position: a value one element a
+/// row), or each row its own; in the dtype its plane holds.
+#[cfg(not(feature = "rocm"))]
+pub(crate) fn forms(
+    values: &[ValueDecl],
+    ins: &[ValueId],
+    reads: &[RegionRead],
+    dtype: impl Fn(ValueId) -> Option<Dtype>,
+) -> std::result::Result<Vec<In>, String> {
+    (0..ins.len())
+        .map(|k| {
+            let v = ins[k];
+            let dtype = dtype(v).ok_or_else(|| format!("value {} is a struct", v.0))?;
+            let decl = &values[v.0 as usize];
+            let read = reads.get(k).copied().unwrap_or_default();
+            Ok(if read.by.is_some() {
+                In::Gathered(dtype)
+            } else if one(decl) {
+                In::One(dtype)
+            } else if shared(decl) {
+                In::Shared(dtype)
+            } else if each(decl) {
+                In::Each(dtype)
+            } else {
+                In::Rows(dtype)
+            })
+        })
+        .collect()
+}
+
+/// Whether `decl` is one element a row, its own: a value of rows one
+/// element wide (a position).
+#[cfg(not(feature = "rocm"))]
+fn each(decl: &ValueDecl) -> bool {
+    !matches!(decl.def, Def::Weight(_))
+        && matches!(
+            &decl.ty,
+            Ty::Tensor { shape, .. }
+                if matches!(shape.as_slice(), [d] | [d, poem_ir::Dim::Const(1)] if !matches!(d, poem_ir::Dim::Const(_)))
+        )
 }
 
 /// Why a region's planes are not its own: a result twice, or over one of

@@ -75,7 +75,6 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
             rules::gated_residual_norm_modulate(),
             rules::norm_modulate(),
             rules::norm_rope(Rotated::First),
-            rules::norm_rope(Rotated::Last),
             rules::norm_rope_last_append(),
             rules::split_rope_yarn_append(),
             rules::rope_yarn_append(),
@@ -118,6 +117,20 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
             rules::q_gate_norm_rope_append(Intermediates::Written),
         ]
     });
+
+/// The hand row rules CUDA's chains replace: each site one formed folds
+/// into a generated row kernel (`fuse::chain`) that lands its ops' bits
+/// and, at the default knobs, outruns the rule's hand kernel. A head's norm
+/// and the turn of its tail (`norm_rope`'s `Last`: dots3's k row,
+/// DeepSeek-V4's q). Its `First` (Gemma 4's split turn) stays: a 512-wide
+/// head's region trails the hand kernel at a decode's rows.
+#[cfg(not(feature = "rocm"))]
+#[must_use]
+pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
+    vec![poem_compiler::fuse::rules::norm_rope(
+        poem_compiler::fuse::rules::Rotated::Last,
+    )]
+}
 
 /// The fused kernels left on with `fuse-chains=off`.
 #[cfg(not(feature = "rocm"))]
@@ -207,6 +220,47 @@ mod tests {
             .filter(|name| !Operation::names_an_op(name))
             .collect();
         assert!(stale.is_empty(), "named by no op: {stale:?}");
+    }
+
+    /// The hand rules CUDA no longer holds, their chains generated row
+    /// kernels: on every catalog deployment, fused by this backend's rules
+    /// and folded, none of them finds a match left, so each site the rule
+    /// would form is a region (`fuse::chain`). A retired rule's op may be
+    /// another rule's too (`norm_rope`'s two turns), so its sites are what
+    /// it forms past the backend's.
+    #[cfg(not(feature = "rocm"))]
+    #[test]
+    fn every_site_a_retired_rule_formed_folds_into_a_region() {
+        let mut wrong = Vec::new();
+        let mut sites = 0usize;
+        for rule in super::retired() {
+            let kernel = rule.kernel();
+            let only = [rule];
+            for row in poem_compiler::catalog::deployments() {
+                let Ok(trace) = row.try_trace(poem_ir::Platform::Cuda) else {
+                    continue;
+                };
+                let count = |t: &poem_ir::Trace| {
+                    t.nodes
+                        .iter()
+                        .filter(|n| matches!(&n.op, Operation::Fused(op) if poem_ir::Operands::name(op) == kernel))
+                        .count()
+                };
+                let formed = |t: poem_ir::Trace| {
+                    let before = count(&t);
+                    count(&poem_compiler::fuse::fuse(t, only.iter())) - before
+                };
+                let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
+                sites += formed(fused.clone());
+                let (folded, _) = poem_compiler::fuse::chain::fold(fused);
+                let left = formed(folded);
+                if left > 0 {
+                    wrong.push(format!("{}: {left} `{kernel}` sites left", row.name));
+                }
+            }
+        }
+        assert!(sites > 0, "the retired rules matched somewhere");
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     /// Every fused op this backend's rules form on a catalog deployment is

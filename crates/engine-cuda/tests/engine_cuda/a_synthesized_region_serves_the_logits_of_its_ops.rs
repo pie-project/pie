@@ -7,11 +7,13 @@
 //! captured. Qwen3's residual norms, and Gemma 4's sandwich norms with
 //! their layer scale; CUDA forms no hand fused op for either.
 //!
-//! Bit for bit. A chain rounds every value it defines where the unfused
-//! ops store it, its stream among them (read on by the norm as stored,
-//! even where nothing past the chain reads it), and computes the norm in
-//! the hand kernels' order, its squares two at a time
-//! (`kernels_cuda`'s `elemwise::synth` tests hold it to their bits).
+//! Close, not bit for bit. A chain rounds every value it defines where the
+//! unfused ops store it, its stream among them (read on by the norm as
+//! stored, even where nothing past the chain reads it), and sums a norm in
+//! its own order (`kernels_cuda`'s `elemwise::synth` tests hold it to the
+//! kernels-ir interpreter within each op's tolerance). Both runs decode one
+//! sequence, the reference's greedy picks, and each step's logits stay
+//! within a share of their spread or of the ops' own carry ([`close`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -47,8 +49,8 @@ fn fnv(name: &str) -> u64 {
     })
 }
 
-/// A bf16 checkpoint of `trace`'s own planes, seeded by name: norms near
-/// one, the rest small.
+/// A bf16 (f32 where the plan states one) checkpoint of `trace`'s own
+/// planes, seeded by name: norms near one, the rest small.
 fn write_checkpoint(path: &Path, trace: &Trace) {
     let mut writer =
         ztensor::Writer::create(path).unwrap_or_else(|why| panic!("{}: {why}", path.display()));
@@ -59,22 +61,34 @@ fn write_checkpoint(path: &Path, trace: &Trace) {
         .collect();
     planes.sort_by(|a, b| a.name.cmp(&b.name));
     for param in planes {
-        assert_eq!(param.dtype, Dtype::Bf16, "`{}` is not bf16", param.name);
+        let wide = match param.dtype {
+            Dtype::Bf16 => false,
+            Dtype::F32 => true,
+            other => panic!("`{}` is {other:?}, neither bf16 nor f32", param.name),
+        };
         let count: usize = param.shape.iter().product::<u64>() as usize;
         let norm = param.name.ends_with("norm");
         let mut seed = fnv(&param.name);
-        let mut bytes = Vec::with_capacity(count * 2);
+        let mut bytes = Vec::with_capacity(count * if wide { 4 } else { 2 });
         for _ in 0..count {
             seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
             let unit = ((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5;
             let value = if norm { 1.0 + 0.05 * unit } else { 0.08 * unit };
-            bytes.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes());
+            if wide {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            } else {
+                bytes.extend_from_slice(&((value.to_bits() >> 16) as u16).to_le_bytes());
+            }
         }
         writer
             .add(
                 param.name.as_str(),
                 param.shape.clone(),
-                ztensor::Leaf::BF16,
+                if wide {
+                    ztensor::Leaf::F32
+                } else {
+                    ztensor::Leaf::BF16
+                },
                 &bytes,
             )
             .unwrap_or_else(|why| panic!("`{}`: {why}", param.name));
@@ -194,6 +208,72 @@ fn bit_for_bit(got: &[Vec<f32>], want: &[Vec<f32>], against: &str) {
     }
 }
 
+/// How far apart two runs' logits are at each step: the largest
+/// deviation of a logit, and the reference's spread (its largest logit
+/// less its least).
+fn deviations(got: &[Vec<f32>], want: &[Vec<f32>]) -> Vec<(f32, f32)> {
+    assert_eq!(got.len(), want.len());
+    got.iter()
+        .zip(want)
+        .map(|(got, want)| {
+            assert_eq!(got.len(), want.len(), "the logits' width");
+            let (lo, hi) = want
+                .iter()
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &v| {
+                    (lo.min(v), hi.max(v))
+                });
+            let deviation = got
+                .iter()
+                .zip(want)
+                .fold(0f32, |most, (g, w)| most.max((g - w).abs()));
+            (deviation, hi - lo)
+        })
+        .collect()
+}
+
+/// A generated kernel sums its rows in its own order, so its logits are
+/// the unfused ops' up to how the model carries a last-bit difference: a
+/// deep random-weight miniature, or a routed one picking an expert apart,
+/// carries one far. That carry is measured on the ops themselves, served
+/// again in another order of their own (the norms' register forms,
+/// `kernel.elemwise.rows_vec`). Each step's logits then stay within
+/// [`SPREAD`] of the reference's spread, or twice the ops' own carry where
+/// that is wider, and the top token is the reference's unless the
+/// reference's gap to it is within the deviation (a near tie either run
+/// may break).
+fn close(got: &[Vec<f32>], want: &[Vec<f32>], carry: &[Vec<f32>], against: &str) {
+    let carried = deviations(carry, want);
+    for (step, (((deviation, spread), (own, _)), (got, want))) in deviations(got, want)
+        .into_iter()
+        .zip(carried)
+        .zip(got.iter().zip(want))
+        .enumerate()
+    {
+        let bound = (SPREAD * spread).max(2.0 * own);
+        eprintln!(
+            "{against}, step {step}: logits at most {deviation} apart over a spread of {spread}; \
+             the ops in another order {own} apart"
+        );
+        assert!(
+            deviation <= bound,
+            "step {step}: a logit {deviation} from {against}'s (spread {spread}, the ops' own \
+             carry {own})"
+        );
+        let (top, picked) = (argmax(want), argmax(got));
+        let gap = want[top as usize] - want[picked as usize];
+        assert!(
+            top == picked || gap <= deviation,
+            "step {step}: token {picked} tops the logits, {against} token {top} by {gap}"
+        );
+    }
+}
+
+/// A step's logits within this share of their spread of the reference's.
+const SPREAD: f32 = 2e-2;
+
+/// The norms' register forms: the unfused ops summing in another order.
+const NUDGED: &str = "[kernel]\nelemwise.rows_vec = true\n";
+
 const TOKENS: u32 = 256;
 const DECODES: usize = 4;
 
@@ -203,6 +283,17 @@ const MODELS: [&str; 2] = ["qwen3-micro-text", "gemma4-e4b-mini-l1"];
 /// `fixture` served under `overrides`: a prefill's logits, then each greedy
 /// decode step's after it; `generates` whether the load generates a kernel.
 fn served(fixture: &Fixture, overrides: &str, generates: bool) -> Vec<Vec<f32>> {
+    served_along(fixture, overrides, generates, None)
+}
+
+/// [`served`], each decode step fed the token `along`'s step before it
+/// picks where given (a reference's, so two kernels decode one sequence).
+fn served_along(
+    fixture: &Fixture,
+    overrides: &str,
+    generates: bool,
+    along: Option<&[Vec<f32>]>,
+) -> Vec<Vec<f32>> {
     let model = fixture.model;
     let mut shell = load(fixture, overrides, TOKENS);
     assert_eq!(
@@ -212,8 +303,8 @@ fn served(fixture: &Fixture, overrides: &str, generates: bool) -> Vec<Vec<f32>> 
     );
     shell.open(0).expect("slot 0 opens");
     let mut steps = vec![step(&mut shell, &fixture.trace, &prompt(37))];
-    for _ in 0..DECODES {
-        let next = argmax(steps.last().expect("a step"));
+    for at in 0..DECODES {
+        let next = argmax(along.map_or_else(|| steps.last().expect("a step"), |along| &along[at]));
         steps.push(step(&mut shell, &fixture.trace, &[next]));
     }
     steps
@@ -229,10 +320,50 @@ fn a_synthesized_region_serves_the_logits_of_its_ops() {
     for model in MODELS {
         let fixture = fixture(model);
         let ops = served(&fixture, OPS, false);
-        let synth = served(&fixture, "", true);
-        bit_for_bit(&synth, &ops, &format!("{model}'s unfused ops"));
+        let carry = served_along(&fixture, &format!("{OPS}{NUDGED}"), false, Some(&ops));
+        let synth = served_along(&fixture, "", true, Some(&ops));
+        close(&synth, &ops, &carry, &format!("{model}'s unfused ops"));
     }
 }
+
+/// The chains hand rules form on CUDA served as generated kernels with the
+/// rules off, against the rules off and the chains' ops as their own
+/// kernels: a head's norm and its rotation (`fuse.norm_rope`), Gemma 4's
+/// scaled embedding and its per-layer rows (`fuse.embed_scale_add`,
+/// `embed_scale_add_select`).
+#[test]
+fn a_generated_kernel_for_a_hand_rules_chain_serves_the_logits_of_its_ops() {
+    let _one = serialized();
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    for (model, rules) in RULED {
+        let fixture = fixture(model);
+        let off: String = rules
+            .iter()
+            .map(|rule| format!("{rule} = false\n"))
+            .collect();
+        let off = format!("[fuse]\n{off}[compiler]\n");
+        let unfused = format!("{off}synth_regions = false\n");
+        let ops = served(&fixture, &unfused, false);
+        let carry = served_along(&fixture, &format!("{unfused}{NUDGED}"), false, Some(&ops));
+        let synth = served_along(&fixture, &off, true, Some(&ops));
+        close(&synth, &ops, &carry, &format!("{model}'s unfused ops"));
+    }
+}
+
+/// The models served by [`a_generated_kernel_for_a_hand_rules_chain_serves_the_logits_of_its_ops`],
+/// each with the rules whose chains it forms.
+const RULED: [(&str, &[&str]); 4] = [
+    ("dots3-note-mini", &["norm_rope"]),
+    ("gemma4-e4b-mini-l30", &["norm_rope"]),
+    ("gemma4-e4b-mini-l36", &["norm_rope"]),
+    (
+        "gemma4-e4b-mini-l6",
+        &["embed_scale_add", "embed_scale_add_select"],
+    ),
+];
 
 /// Two models loaded and served at once in one process, a thread each, as a
 /// server holding two models serves them: each answers, bit for bit, what

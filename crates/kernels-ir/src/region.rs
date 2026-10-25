@@ -1,10 +1,13 @@
 //! The region form: what a fused chain computes, a function of one row.
 //!
 //! Values `0..params.len()` are the parameters, each op's result the next
-//! value. Every value is the row's (one element a column, `width` of them)
-//! or one a row (a scalar: a mean, an `rsqrt`, a layer's scale). An op over a
-//! row and a scalar reads the scalar at every column. Values compute in f32
-//! (or are bools); `rounds` names the values rounded where they are defined,
+//! value. Every value is the row's (one element a column, `width` of them),
+//! one a row (a scalar: a mean, an `rsqrt`, a layer's scale or a row's
+//! position), or one a head (the row read as runs of `size` columns, its
+//! heads: a head's mean square). An op over a row and a scalar, or a head's
+//! value, reads the scalar at every column, the head's at each of its
+//! columns. Values compute in f32 (or are bools, or the u32 a column's index
+//! computes); `rounds` names the values rounded where they are defined,
 //! each to the narrower dtype the unfused ops store it in, and read on as
 //! rounded, so a fusion lands what the ops it replaces land. How a parameter
 //! is stored (a row of its own, one every row reads, one element) is the
@@ -17,11 +20,13 @@ use dtype::Dtype;
 /// A value of a region: a parameter, or an op's result.
 pub type ValueId = u32;
 
-/// What one value holds: the row's elements, or one value a row.
+/// What one value holds: the row's elements, one value a row, or one a
+/// head of `size` columns.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Shape {
     Row,
     Scalar,
+    Head(u32),
 }
 
 /// What a value's elements are.
@@ -29,12 +34,14 @@ pub enum Shape {
 pub enum Elem {
     F32,
     Bool,
+    U32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Literal {
     F32(f32),
     Bool(bool),
+    U32(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -69,6 +76,8 @@ pub enum Binary {
     Le,
     And,
     Or,
+    /// `a` raised to `b` (f32).
+    Pow,
 }
 
 impl Binary {
@@ -107,10 +116,19 @@ pub enum Op {
     /// The value as `Elem` (a bool as 0 or 1, a number as whether it is
     /// nonzero).
     Cast(ValueId, Elem),
-    /// A scalar across the row.
+    /// A scalar, or a head's value, across the row.
     Broadcast(ValueId),
     /// The row combined into one value.
     Reduce(Reduce, ValueId),
+    /// Each head of `size` columns of the row combined into one value.
+    ReduceHeads(Reduce, ValueId, u32),
+    /// `a * b + c`, rounded once (f32).
+    Fma(ValueId, ValueId, ValueId),
+    /// The column of each element (u32).
+    Column,
+    /// The row `src` at the column `at` names (u32), for each element: a
+    /// gather within the row (a rotation's mate).
+    Peer(ValueId, ValueId),
 }
 
 impl Op {
@@ -118,10 +136,14 @@ impl Op {
     #[must_use]
     pub fn args(&self) -> Vec<ValueId> {
         match *self {
-            Op::Const(_) => Vec::new(),
-            Op::Unary(_, a) | Op::Cast(a, _) | Op::Broadcast(a) | Op::Reduce(_, a) => vec![a],
-            Op::Binary(_, a, b) => vec![a, b],
-            Op::Select(c, a, b) => vec![c, a, b],
+            Op::Const(_) | Op::Column => Vec::new(),
+            Op::Unary(_, a)
+            | Op::Cast(a, _)
+            | Op::Broadcast(a)
+            | Op::Reduce(_, a)
+            | Op::ReduceHeads(_, a, _) => vec![a],
+            Op::Binary(_, a, b) | Op::Peer(a, b) => vec![a, b],
+            Op::Select(c, a, b) | Op::Fma(c, a, b) => vec![c, a, b],
         }
     }
 }
@@ -146,7 +168,7 @@ pub struct Region {
 }
 
 /// Why a region is not a function of one row.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RegionError {
     /// An op reads a value no earlier op defines.
@@ -207,56 +229,69 @@ impl Region {
                     .ok_or(RegionError::Undefined { op: at, value: v })
             };
             let mistyped = RegionError::Mistyped { op: at };
-            let joined = |a: Shape, b: Shape| {
-                if a == Shape::Row || b == Shape::Row {
-                    Shape::Row
-                } else {
-                    Shape::Scalar
-                }
+            // A row with anything is a row; a head's value with a scalar
+            // one a head (of one size).
+            let joined = |a: Shape, b: Shape| -> Result<Shape, RegionError> {
+                Ok(match (a, b) {
+                    (Shape::Row, _) | (_, Shape::Row) => Shape::Row,
+                    (Shape::Head(x), Shape::Head(y)) if x != y => return Err(mistyped.clone()),
+                    (Shape::Head(x), _) | (_, Shape::Head(x)) => Shape::Head(x),
+                    (Shape::Scalar, Shape::Scalar) => Shape::Scalar,
+                })
             };
             let ty = match *op {
                 Op::Const(Literal::F32(_)) => (Shape::Scalar, Elem::F32),
                 Op::Const(Literal::Bool(_)) => (Shape::Scalar, Elem::Bool),
+                Op::Const(Literal::U32(_)) => (Shape::Scalar, Elem::U32),
                 Op::Unary(unary, a) => {
                     let (shape, elem) = get(a)?;
-                    let wants = if unary == Unary::Not {
-                        Elem::Bool
-                    } else {
-                        Elem::F32
+                    let fits = match unary {
+                        Unary::Not => elem == Elem::Bool,
+                        Unary::Abs | Unary::Neg | Unary::Sign => elem != Elem::Bool,
+                        _ => elem == Elem::F32,
                     };
-                    if elem != wants {
+                    if !fits {
                         return Err(mistyped);
                     }
                     (shape, elem)
                 }
                 Op::Binary(binary, a, b) => {
                     let ((sa, ea), (sb, eb)) = (get(a)?, get(b)?);
-                    let wants = if binary.logic() {
-                        Elem::Bool
+                    let fits = if binary.logic() {
+                        ea == Elem::Bool && eb == Elem::Bool
+                    } else if binary == Binary::Pow {
+                        ea == Elem::F32 && eb == Elem::F32
                     } else {
-                        Elem::F32
+                        ea == eb && ea != Elem::Bool
                     };
-                    if ea != wants || eb != wants {
+                    if !fits {
                         return Err(mistyped);
                     }
                     let elem = if binary.compares() || binary.logic() {
                         Elem::Bool
                     } else {
-                        Elem::F32
+                        ea
                     };
-                    (joined(sa, sb), elem)
+                    (joined(sa, sb)?, elem)
                 }
                 Op::Select(c, a, b) => {
                     let ((sc, ec), (sa, ea), (sb, eb)) = (get(c)?, get(a)?, get(b)?);
                     if ec != Elem::Bool || ea != eb {
                         return Err(mistyped);
                     }
-                    (joined(sc, joined(sa, sb)), ea)
+                    (joined(sc, joined(sa, sb)?)?, ea)
+                }
+                Op::Fma(a, b, c) => {
+                    let ((sa, ea), (sb, eb), (sc, ec)) = (get(a)?, get(b)?, get(c)?);
+                    if ea != Elem::F32 || eb != Elem::F32 || ec != Elem::F32 {
+                        return Err(mistyped);
+                    }
+                    (joined(sa, joined(sb, sc)?)?, Elem::F32)
                 }
                 Op::Cast(a, elem) => (get(a)?.0, elem),
                 Op::Broadcast(a) => {
                     let (shape, elem) = get(a)?;
-                    if shape != Shape::Scalar {
+                    if shape == Shape::Row {
                         return Err(mistyped);
                     }
                     (Shape::Row, elem)
@@ -267,6 +302,27 @@ impl Region {
                         return Err(mistyped);
                     }
                     (Shape::Scalar, Elem::F32)
+                }
+                Op::ReduceHeads(_, a, size) => {
+                    let (shape, elem) = get(a)?;
+                    if shape != Shape::Row
+                        || elem != Elem::F32
+                        || size == 0
+                        || size % 8 != 0
+                        || !(size / 8).is_power_of_two()
+                        || self.width % size != 0
+                    {
+                        return Err(mistyped);
+                    }
+                    (Shape::Head(size), Elem::F32)
+                }
+                Op::Column => (Shape::Row, Elem::U32),
+                Op::Peer(src, at) => {
+                    let ((ss, es), (sa, ea)) = (get(src)?, get(at)?);
+                    if ss != Shape::Row || sa != Shape::Row || ea != Elem::U32 {
+                        return Err(mistyped);
+                    }
+                    (Shape::Row, es)
                 }
             };
             types.push(ty);
