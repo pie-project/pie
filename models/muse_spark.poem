@@ -9,7 +9,7 @@ load("//lib/adapters.poem", "banks")
 ATEM = template("atem")
 
 # The compiler reads how tensor-parallel ranks cut each weight off the
-# forward: the packed q, k, v and output gate by their heads, each expert's
+# forward: q, k, v and the output gate by their heads, each expert's
 # gate and up by its channels, the output and down projections by their
 # rows, the head by its vocabulary.
 CUTS = "inferred"
@@ -101,8 +101,12 @@ def layout(id, deploy):
         bank = w if l in d.dense_experts else routed
         return struct(
             full = full(l),
-            # q, k, v and the output gate, one projection of the normed row.
-            qkvg = weight([2 * q_w + 2 * kv_w, hidden], w),
+            # q, k, v and the output gate `g`, each a projection of the
+            # normed row.
+            q = weight([q_w, hidden], w),
+            k = weight([kv_w, hidden], w),
+            v = weight([kv_w, hidden], w),
+            g = weight([q_w, hidden], w),
             o_proj = weight([hidden, q_w], w),
             kv = "kv.{}".format(l),
             attn_norm = norm("attn_norm", hidden),
@@ -168,12 +172,10 @@ def huggingface(m, reads):
     for l, w in enumerate(m.layers):
         n = lambda leaf: "{}layers.{}.{}".format(TRUNK, l, leaf)
         reads.read(w.attn_norm, n("input_layernorm.weight"))
-        reads.read_concat(w.qkvg, [
-            n("self_attn.q_proj.weight"),
-            n("self_attn.k_proj.weight"),
-            n("self_attn.v_proj.weight"),
-            n("self_attn.gate_proj.weight"),
-        ])
+        reads.read(w.q, n("self_attn.q_proj.weight"))
+        reads.read(w.k, n("self_attn.k_proj.weight"))
+        reads.read(w.v, n("self_attn.v_proj.weight"))
+        reads.read(w.g, n("self_attn.gate_proj.weight"))
         reads.read(w.o_proj, n("self_attn.o_proj.weight"))
         reads.read(w.attn_gate, n("post_attention_residual_gate.gate"))
         reads.read(w.pre_ffw_norm, n("pre_feedforward_layernorm.weight"))
@@ -279,8 +281,8 @@ def forward(m, inputs):
         win = windows[reading]
         pages = inputs.kv(w.kv)
 
-        qkv, gate = ops.gather.split_rows(ops.linear.matmul(normed, w.qkvg), (m.q_heads + 2 * m.kv_heads) * d)
-        q, k, v = ops.gather.split_qkv(qkv, m.q_heads * d, m.kv_heads * d)
+        q, k, v = ops.linear.matmul(normed, w.q), ops.linear.matmul(normed, w.k), ops.linear.matmul(normed, w.v)
+        gate = ops.linear.matmul(normed, w.g)
         q = ops.elemwise.rmsnorm_no_scale(q, d, m.norm_eps)
         k = ops.elemwise.rmsnorm_no_scale(k, d, m.norm_eps)
         if not w.full:
