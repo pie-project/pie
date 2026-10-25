@@ -1,6 +1,3 @@
-//! What a generative model states of itself: the latent space it denoises
-//! in and the schedule it was trained on.
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct Generative {
     pub latent: Option<LatentSpace>,
@@ -22,8 +19,7 @@ pub struct ScheduleFact {
     pub train_steps: u32,
     pub boundary: Option<f32>,
     pub pinned_sigmas: Vec<f32>,
-    /// Each `(value, shift)`: the shift a lane whose `stream` switch takes
-    /// `value` advances at.
+    /// The shift a lane whose `stream` switch takes `value` advances at.
     pub stream_shifts: Vec<(String, f32)>,
 }
 

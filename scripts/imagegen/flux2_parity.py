@@ -80,8 +80,7 @@ def numbered(out: str, stem: str) -> list[str]:
 PACK = 2
 
 def pictures(ids: np.ndarray) -> list[tuple[int, int, int, int]]:
-    """The pictures `ids` lays out, in row order: `(first row, rows, h, w)`
-    for each run of one `T`, its rows a row-major `h x w` token grid."""
+    """`(first row, rows, h, w)` for each run of one `T` in `ids`, in row order."""
     out, start = [], 0
     while start < len(ids):
         t = ids[start, 0]
@@ -135,8 +134,6 @@ def cases(args) -> list[str]:
         laid = pictures(img_ids[b])
         (first, rows, th, tw), refs_laid = laid[0], laid[1:]
         assert (first, rows, th * tw) == (0, s_img, s_img), laid
-        # Reference `k` sits at `T = 10 (k + 1)`: the order the model's
-        # ordinal input recomputes.
         assert [int(img_ids[b, at, 0]) for at, *_ in refs_laid] == \
             [10 * (k + 1) for k in range(len(refs_laid))], refs_laid
         assert np.array_equal(txt_ids[b][:, 3], np.arange(ctx.shape[1])), "text ids are (0, 0, 0, j)"
@@ -180,9 +177,7 @@ def wasm(inferlet: str) -> str:
     return max(present, key=os.path.getmtime)
 
 def pieces(text: str, n: int) -> list[str]:
-    """`n` argv pieces of `text`, none starting with `-`: `pie run` reads a
-    value that starts with `-` and is no number as the next flag, which
-    leaves the piece's `--case_i` a bare `true`."""
+    """`n` argv pieces of `text`, none starting with `-` (`pie run` reads those as flags)."""
     step = -(-len(text) // n)
     cuts = [0]
     for i in range(1, n):

@@ -252,10 +252,7 @@ struct Staged {
 }
 
 impl Shell {
-    /// Runs and commits the prologues of `attachments` before the fire
-    /// resolves its descriptor ports and stages its inputs, which read what
-    /// a prologue put. Mints against the cursors airborne fires predicted; a
-    /// port read off a channel a prologue put waits for it to land.
+    /// Runs before the fire resolves its ports, which may read what a prologue put.
     pub(super) fn prologue(&mut self, attachments: &[super::Attached]) -> Result<()> {
         let runs =
             |a: &&super::Attached| !a.adapter_only && self.programs.prologue_runs(a.instance);
@@ -294,9 +291,7 @@ impl Shell {
         {
             self.device.synchronize()?;
         }
-        // The lanes' commits gate the body on the device, so the host waits on
-        // none of them: their verdicts settle with the step, ahead of its
-        // epilogues'.
+        // The lanes' commits gate the body on the device; the host waits on none.
         if let Some(batch) = launched.defer(
             &self.device,
             &mut self.programs,
@@ -314,8 +309,7 @@ impl Shell {
 }
 
 impl FireCtx<'_> {
-    /// Gates each lane of the fire on the commit of its prologue, which
-    /// [`Shell::prologue`] ran before the fire resolved its ports.
+    
     fn gate(&mut self, p: &Prepared<'_>) -> Result<()> {
         let lane_count = p.composition.lane_count();
         if p.rs.predicated || p.rs.truncates {
@@ -931,8 +925,7 @@ impl FireCtx<'_> {
             && let Some(table) = crate::voxels::host_grid(self.trace, &p.voxel_tables.grid, grid)
         {
             for (lane, &(first, count)) in seat.lane_clips.iter().enumerate() {
-                // A voxel lane reads pixels out only where its own class
-                // writes them: a denoise lane's voxels read out velocity.
+                // A denoise lane's voxels read out velocity, not pixels.
                 if count == 0 || !self.exports.writes_pixels(lane_class_of(lane)) {
                     continue;
                 }
@@ -1107,8 +1100,7 @@ impl FireCtx<'_> {
             let consecutive = wanted
                 .windows(2)
                 .all(|pair| pair[1] == pair[0].wrapping_add(1));
-            // `velocity(k)`, `hidden(k)` and `pixels(k)` read the pass's lane
-            // `k`: each at its own rows of its own class's plane.
+            
             for k in 0..attached.lanes {
                 let at = lane + k as usize;
                 let class = lane_class[at];
@@ -1124,8 +1116,7 @@ impl FireCtx<'_> {
                     None => None,
                 };
                 if let Some((plane, voxel)) = velocity {
-                    // A velocity on the voxel axis stands at the lane's
-                    // first voxel, one on the token axis at its first row.
+                    // Voxel-axis velocity starts at the lane's first voxel, token-axis at its first row.
                     self.programs.bind_intrinsic(
                         attached.instance,
                         eta_ir::op::IntrinsicId::Velocity,

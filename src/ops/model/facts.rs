@@ -2,9 +2,7 @@
 pub struct GenerativeFacts {
     pub latent: Option<Latent>,
     pub schedule: Option<Schedule>,
-    /// The inputs the deployment's guest binds, `name[axis, width]`, and
-    /// the switches it sets, `name = value|value|...`: traced, so only `pie
-    /// model info` fills them.
+    /// `inputs` and `switches` are traced, so only `pie model info` fills them.
     pub inputs: Vec<String>,
     pub switches: Vec<String>,
 }
@@ -51,14 +49,12 @@ pub fn of(deployment: Option<&str>) -> Option<GenerativeFacts> {
     })
 }
 
-/// `deployment`'s trace, to read what its guest binds and sets.
 pub fn traced(deployment: &str) -> Option<poem::Trace> {
     let deployment = runtime::catalog::catalog().parse(deployment)?;
     deployment.try_trace(poem::Platform::Cuda).ok()
 }
 
-/// The switches `trace`'s model declares, `name = value|value|...`, the
-/// first value its default.
+/// `name = value|value|...`, the first value the default.
 pub fn switches(trace: &poem::Trace) -> Vec<String> {
     trace
         .facts
@@ -68,7 +64,7 @@ pub fn switches(trace: &poem::Trace) -> Vec<String> {
         .collect()
 }
 
-/// The inputs `trace` reads from its guest, `name[axis, width]`.
+/// `name[axis, width]` each.
 pub fn inputs(trace: &poem::Trace) -> Vec<String> {
     trace
         .values
@@ -97,8 +93,7 @@ impl GenerativeFacts {
         parts.join(" · ")
     }
 
-    /// Whether the deployment binds the standard `latents` and `timestep`
-    /// inputs `text-to-image` drives (known once traced).
+    /// Whether it binds the `latents` and `timestep` inputs `text-to-image` drives.
     pub fn text_to_image(&self) -> bool {
         ["latents[", "timestep["]
             .iter()

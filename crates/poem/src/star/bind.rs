@@ -272,8 +272,7 @@ impl<'v> Arg<'v> for poem_ir::InputAxis {
     }
 }
 
-/// A lane's stated rows: a count is exactly that many, `multiple_of(n)` the
-/// fewest that are a multiple of `n`.
+/// A count is exactly that many rows; `multiple_of(n)` the fewest that are a multiple of `n`.
 impl<'v> Arg<'v> for poem_ir::RowCount {
     fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
         let v = given(v)?;
@@ -673,8 +672,6 @@ pub(crate) fn wholes(builder: &mut starlark::environment::GlobalsBuilder) {
         Ok(Whole(Held::Mask(RaggedMask::GroupBlockDiagonal)))
     }
 
-    /// The rows of an input's lane stated as the fewest that are a multiple
-    /// of `n` (`input(..., rows = multiple_of(32))`).
     fn multiple_of(#[starlark(require = pos)] n: u32) -> anyhow::Result<Whole> {
         anyhow::ensure!(n > 0, "rows are a multiple of a positive count, not 0");
         Ok(Whole(Held::Rows(poem_ir::RowCount::Multiple(n))))

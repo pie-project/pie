@@ -26,23 +26,19 @@ pub struct Cursor {
     pub unsettled: u32,
     pub tail: Option<u32>,
     pub reserved: u32,
-    /// The M-RoPE spans written, `(start_slot, end_slot, token_count -
-    /// position_span)`: the rotation of a row past one runs that far behind
-    /// its slot.
+    /// M-RoPE spans `(start_slot, end_slot, lag)`, `lag = token_count - position_span`.
     pub spans: Vec<(u32, u32, u32)>,
 }
 
 impl Cursor {
-    /// A write from `start` replaces the spans from there with its own: the
-    /// last write wins, as for `tail`.
+    /// The last write wins from `start` on.
     pub fn rewrite(&mut self, start: u32, spans: impl IntoIterator<Item = (u32, u32, u32)>) {
         self.spans.retain(|&(from, _, _)| from < start);
         self.spans.extend(spans);
     }
 }
 
-/// How far the rotation of the row at `slot` runs behind it: the lags of the
-/// spans ending at or before it. A row's default position is `slot - lag`.
+/// The summed lags of spans ending at or before `slot`: its position is `slot - lag`.
 pub fn lag(spans: &[(u32, u32, u32)], slot: u32) -> u32 {
     spans
         .iter()

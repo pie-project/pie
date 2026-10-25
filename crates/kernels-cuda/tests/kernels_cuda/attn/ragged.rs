@@ -43,8 +43,7 @@ fn check(heads: [usize; 3], q_sizes: &[u32], kv_sizes: &[u32], mask: Mask, extra
     });
     let mut gpu = Gpu::open();
     let o_at = gpu.up(&fill);
-    // Each group's bits, query-major, from a byte of its own: the classes'
-    // table spelled pair by pair.
+    // Each group's bits, query-major, from a byte of its own.
     let (mut bits, mut starts) = (Vec::<u8>::new(), Vec::<i32>::new());
     for g in 0..qt.len() - 1 {
         starts.push(bits.len() as i32);

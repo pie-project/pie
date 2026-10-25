@@ -415,8 +415,7 @@ impl Run<'_> {
                 *sm_scale,
                 &mut self.tensor(*o),
             ),
-            // `causal: false` marks a class attending both ways
-            // (`exports::wide_classes`): its staged mask bits are unclipped.
+            // `causal: false` marks a wide class: its staged mask bits are unclipped.
             Attn::Prefill {
                 kv_heads: _,
                 causal: _,

@@ -153,7 +153,6 @@ fn the_seams_are_the_two_float_readouts_and_never_logits() {
     }
 }
 
-/// Every (reading, stream) a lane of `deployment` may take.
 fn lanes(deployment: &str) -> Vec<(&'static str, &'static str)> {
     let mut lanes = Vec::new();
     if is_flagship(deployment) {

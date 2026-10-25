@@ -1,9 +1,6 @@
 #![cfg(feature = "device")]
 
-//! `conv::cells`, `gather::group_rows` and `gather::group_first` through the
-//! engine against a host reference: two requests, each a text lane of plain
-//! rows and an image lane of one clip patched `[1, 2, 2]`, read back off the
-//! velocity seam.
+//! `conv::cells`, `gather::group_rows` and `gather::group_first` against a host reference.
 
 use engine::Engine;
 use engine::fire::{FrameSubmission, Lane, Readout, Step, StepVoxels};
@@ -25,8 +22,7 @@ use eta_ir::validate::bind;
 
 const C: u32 = 4;
 const P: [u32; 3] = [1, 2, 2];
-/// `[cells axis 0 (3 + size) | cells axis 3 (4 + size) | group rows | the
-/// group's image cell (3 + size)]`.
+/// `[cells axis 0 | cells axis 3 | group rows | the group's image cell]`.
 const WIDTH: u32 = 6 + 7 + 1 + 6;
 
 struct Cells;
@@ -40,8 +36,7 @@ impl ForwardHybrid for Cells {
             .recorder()
             .declare_switch("stream", &["text", "image"]);
         let img = inputs.on(!fact::switch_is("stream", "text"));
-        // The voxel input, patched and back out as pixels: what stages the
-        // clips. Every lane's velocity is read by its epilogue.
+        
         let grid = img.grid();
         let latents = img.input("latents", Dtype::Bf16, InputAxis::Voxel, C, None);
         let patched = ops::conv::patchify(&latents, &grid, P, &img.token_grid(P));
@@ -70,7 +65,6 @@ impl ForwardHybrid for Cells {
     }
 }
 
-/// An epilogue putting the lane's `rows` velocity rows on its one channel.
 fn epilogue(rows: u32) -> TraceContainer {
     let plane = Shape::matrix(rows, WIDTH);
     TraceContainer {
@@ -100,13 +94,11 @@ fn epilogue(rows: u32) -> TraceContainer {
     }
 }
 
-/// The token grid of `clip`.
 fn grid_of(clip: [u32; 3]) -> [u32; 3] {
     [clip[0] / P[0], clip[1] / P[1], clip[2] / P[2]]
 }
 
-/// One row's want: its cell and clip size (a clip's row) or position, its
-/// group's rows and its group's image's first cell and size.
+
 fn want_row(
     cell: Option<([u32; 3], [u32; 3])>,
     position: u32,

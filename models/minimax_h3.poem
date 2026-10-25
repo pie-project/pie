@@ -500,35 +500,17 @@ def column(v, slot, total):
 PATCH = [PATCH_T, PATCH_H, PATCH_W]
 
 def patched(rows, name, grid, tgrid):
-    """The latent clip `name` these rows bind, VAE-native on the voxel axis,
-    cut into its patches' token rows (the TokenGrid order)."""
     return ops.conv.patchify(rows.input(name, dtype.bf16, "voxel", LATENT_CHANNELS), grid, PATCH, tgrid)
 
-# The rope positions (the reference's packed sequence): one timeline in
-# audio ticks (1/40 s) after a text prefix, and every spatial grid
-# aspect-normalised onto [0, 32) about 16.
-#
-# * a text row `j`: `(j, 0, 0)`;
-# * a video patch of latent frame `k` at cell `(i, j)` of an `nh × nw` grid:
-#   `L + 5/3 · Σ_{f<k} FRAMES[f mod 5]` (`L` its group's text rows, `FRAMES`
-#   = (1, 4, 4, 4, 4) frames a latent covers; in closed form
-#   `L + 17k/3 − 4 + (k + 4) mod 5`), at `16 + 16 · (2i − nh) / √(nh·nw)` and
-#   `16 + 16 · (2j − nw) / √(nh·nw)` (`linspace((1 − r)/2, (1 + r)/2, n,
-#   endpoint=False) · 32`, `r = n / √(nh·nw)`);
-# * an audio row: its lane carries each stereo channel's `n` ticks in turn,
-#   so row `j` is tick `j mod n` of channel `c = j div n`, at `(L + tick, 0,
-#   w)`, `w` the first (c = 0) or last (c = 1) column of its group's video
-#   grid;
-# * a reference (keyframe) patch on its own grid at the first video frame's
-#   time, its frame `f` past the first `f · (5/3 · Σ_all − 5/3)` on (the last
-#   keyframe at the video's end).
-#
-# A lane whose `positions` switch says `given` reads the guest's instead.
+# The reference's rope positions: one timeline in audio ticks (1/40 s) after
+# the text rows `L`, spatial grids aspect-normalised onto [0, 32) about 16.
+# text `(j, 0, 0)`; video frame `k` at `L + 17k/3 − 4 + (k + 4) mod 5`;
+# audio row `j` at tick `j mod n` of channel `j div n`, in the first or last
+# video column; keyframe `f` at `f · (5/3 · Σ_all − 5/3)` past the first frame.
 GRID_CENTRE = 16.0
 FRAME_TICKS = 17.0 / 3.0
 
-# The in-place ops (a scale, a bias) are each the last read of what they
-# write; a value read again goes through `copy` first.
+# In-place ops must be the last read of their operand; `fresh` copies first.
 fresh = ops.elemwise.copy
 
 def frames_time(k, m):
@@ -545,14 +527,12 @@ def grid_axis(cell, n, area, m):
     return ops.elemwise.add_bias(m.rope.centre, ops.elemwise.mul_scalar(GRID_CENTRE, ops.elemwise.div(span, area)))
 
 def turn_positions(arm, m, streams):
-    """Each denoise row's rope position (see above)."""
     text, video, audio, reference = streams
     lanes = arm.request_of_token()
     groups = arm.group_of_lane()
     cells, size = ops.gather.split_rows(ops.conv.cells(arm.token_grid(PATCH), arm.positions(), 0), ROPE_AXES)
     k, i, j = [column(cells, a, ROPE_AXES) for a in range(ROPE_AXES)]
     _, nh, nw = [column(size, a, ROPE_AXES) for a in range(ROPE_AXES)]
-    # The group's video grid and its text rows, read off the group structure.
     _, video_size = ops.gather.split_rows(ops.conv.cells(video.token_grid(PATCH), video.positions(), 0), ROPE_AXES)
     peer = ops.gather.group_first(
         ops.gather.pack_rows(video_size, video.row_permutation()),
@@ -569,11 +549,9 @@ def turn_positions(arm, m, streams):
     w = grid_axis(j, nw, area, m)
     video_rows = ops.gather.concat_cols([ops.elemwise.add(text_rows, frames_time(k, m)), h, w])
 
-    # The keyframe `f` rides `f · (5/3 · Σ_all − 5/3)` past the first frame.
     last = ops.elemwise.add_bias(m.rope.minus_span, frames_time(v_frames, m))
     reference_rows = ops.gather.concat_cols([ops.elemwise.add(text_rows, ops.elemwise.mul(k, last)), h, w])
 
-    # Audio row `k` (its row in the lane): tick `k mod n` of channel `k div n`.
     ticks = ops.elemwise.mul_scalar(0.5, ops.gather.group_rows(audio.group_indptr(), groups, lanes))
     tick = ops.elemwise.mod(k, ticks)
     channel = ops.elemwise.div(ops.elemwise.add(k, ops.elemwise.mul_scalar(-1.0, fresh(tick))), ticks)
@@ -620,9 +598,6 @@ def denoise(arm, m):
     ctx = text.input("context", dtype.bf16, "row", d.dim)
     ctx_perm = text.row_permutation()
     text_rows = ops.gather.unpack_rows(ops.gather.pack_rows(ctx, ctx_perm), ctx_perm)
-    # The video and reference latents ride the voxel axis in the VAE's own
-    # layout and are patched here; the audio rows are its latent already,
-    # each stereo channel's frames in turn.
     video_grid, video_tgrid = video.grid(), video.token_grid(PATCH)
     video_rows = run_linear(dit.video_patch, patched(video, "latents", video_grid, video_tgrid))
     audio_rows = run_linear(dit.audio_patch, audio.input("audio", dtype.bf16, "row", m.audio_channels))
@@ -646,8 +621,7 @@ def denoise(arm, m):
     h_audio = rest.on(switch_is("stream", "audio"))
     audio_velocity = run_linear(dit.audio_out, h_audio)
     seam.at(seam.HIDDEN, [audio_velocity])
-    # The video head last: its patches go back to voxels, the axis the
-    # forward ends on.
+    # The video head last: the forward ends on the voxel axis.
     video_tokens = run_linear(dit.video_out, h_video)
     velocity = ops.conv.unpatchify(video_tokens, video_tgrid, PATCH, video_grid)
     seam.at(seam.VELOCITY, [velocity])

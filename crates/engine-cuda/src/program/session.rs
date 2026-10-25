@@ -47,8 +47,7 @@ pub struct Session {
     shapes: Vec<ChannelShape>,
     cursors: Vec<Cursor>,
     extents: Extents,
-    /// By slot ([`eta_ir::op::intrinsic_slot`]): each intrinsic of each lane
-    /// of the pass a binding names.
+    /// Indexed by [`eta_ir::op::intrinsic_slot`].
     intrinsics: Vec<Option<Intrinsic>>,
     poisoned: bool,
     fires: u64,
@@ -407,8 +406,7 @@ impl Session {
         self.extents
     }
 
-    /// Mints the stages that run at `at` ([`ExecPlan::runs_at`]) as one
-    /// commit: the prologue's before the forward, the rest after it.
+    
     pub fn stage(
         &mut self,
         compiled: &Compiled,
@@ -442,8 +440,7 @@ impl Session {
         Ok(Launched::Airborne)
     }
 
-    /// Refuses a pass whose epilogue reads an intrinsic no buffer is bound
-    /// to: the emitted kernel would dereference the side table's zero.
+    /// An unbound intrinsic would make the emitted kernel dereference the side table's zero.
     fn intrinsics_bound(&self, plan: &ExecPlan) -> Result<()> {
         if plan.reads_intrinsic(eta_ir::op::IntrinsicId::Logits)
             && !self.bound(eta_ir::op::IntrinsicId::Logits, 0)
@@ -571,9 +568,7 @@ impl Session {
         })
     }
 
-    /// Channels whose cells the host reads to resolve descriptor ports under
-    /// `class` ([`Self::envelope`]); not the tokens' where the device copies
-    /// them ([`Self::token_device_source`]).
+    
     fn host_resolved_channels(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<u32> {
         let tokens_on_device = self.token_device_source(plan, class).is_some();
         plan.package
@@ -585,8 +580,7 @@ impl Session {
             .collect()
     }
 
-    /// Shared rings whose cells the host reads to resolve descriptor ports
-    /// under `class`.
+    
     pub fn host_resolved_rings(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<usize> {
         self.host_resolved_channels(plan, class)
             .into_iter()
@@ -599,8 +593,7 @@ impl Session {
             .collect()
     }
 
-    /// Whether the host resolves a descriptor port under `class` off a
-    /// channel the prologue puts: it reads that cell once the prologue lands.
+    
     #[must_use]
     pub fn resolves_prologue_put(&self, plan: &ExecPlan, class: GeometryClass) -> bool {
         self.host_resolved_channels(plan, class)
@@ -865,15 +858,13 @@ impl Session {
         None
     }
 
-    /// The first channel not as the whole pass needs it, each at the point
-    /// of the stage that uses it first.
+    
     #[must_use]
     pub fn blocked_channel(&self, plan: &ExecPlan) -> Option<u32> {
         self.blocked_at(plan, Attach::Prologue)
             .or_else(|| self.blocked_at(plan, Attach::Epilogue))
     }
 
-    /// The first channel not as the stages at `at` need it.
     #[must_use]
     pub fn blocked_at(&self, plan: &ExecPlan, at: Attach) -> Option<u32> {
         for channel in 0..self.shapes.len() {

@@ -171,7 +171,6 @@ pub struct Seated<'a> {
     pub pages: &'a [u32],
 
     pub held: Option<u32>,
-    /// The lane binds no KV state: it neither reads nor extends its slot.
     pub kv_less: bool,
 
     pub mask: Option<&'a Masking>,
@@ -257,19 +256,15 @@ fn adapter_fact(classes: &poem_ir::ClassTable, corrected: &poem_ir::ClassSet) ->
     classes.adapter_fact(corrected)
 }
 
-/// A readout plane: the `out` seam's logits, or a `velocity` or `hidden`
-/// seam's rows, with the classes that write it.
 struct ReadoutPlane {
     value: ValueId,
     seam: engine::fire::ReadoutSeam,
     classes: poem_ir::ClassSet,
     width: u32,
     dtype: Dtype,
-    /// Whether the plane stands on the voxel axis: a lane reads its voxels.
     voxels: bool,
 }
 
-/// Whether `value` stands on the voxel axis.
 fn on_voxels(trace: &Trace, value: ValueId) -> bool {
     matches!(
         &trace.values[value.0 as usize].ty,
@@ -278,8 +273,6 @@ fn on_voxels(trace: &Trace, value: ValueId) -> bool {
     )
 }
 
-/// A lane's readout: `rows` rows of plane `plane`, `width` values each (f32
-/// or bf16), at byte `at` of the seat; `first` its first readout table entry.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ReadSpan {
     pub first: u32,
@@ -288,8 +281,7 @@ pub(crate) struct ReadSpan {
     pub at: u64,
     pub width: u32,
     pub f32: bool,
-    /// On a voxel plane, the first of the lane's voxels: it reads them all,
-    /// in one run, and names no table entries.
+    /// On a voxel plane, the lane's first voxel: it reads all its voxels and no table entries.
     pub voxels: Option<u32>,
 }
 
@@ -418,8 +410,6 @@ pub struct Shell {
     drafts_plane: Option<(ValueId, u32)>,
 }
 
-/// A `pixels` plane and, when the load could walk one, its `conv.grid` chain
-/// from the fire's grid.
 struct PixelPlane {
     plane: ValueId,
     width: u32,
@@ -427,7 +417,6 @@ struct PixelPlane {
     chain: Option<Vec<poem_ir::GridRule>>,
 }
 
-/// The `conv.grid` rules from the fire's grid to `at`, in order.
 fn grid_chain(trace: &Trace, mut at: ValueId) -> Option<Vec<poem_ir::GridRule>> {
     let mut rules = Vec::new();
     loop {
@@ -725,8 +714,6 @@ impl Shell {
             })
             .collect();
 
-        // A plan reads out logits, velocity, hidden rows, pixels, or some of
-        // them; a decoder alone reads out pixels.
         let out = boot
             .trace
             .seams
@@ -1575,8 +1562,7 @@ impl Shell {
             })
     }
 
-    /// The readout plane a lane of `class` reads: its class's logits, else
-    /// its velocity, else its hidden rows, else the `out` seam's.
+    /// Its class's logits, else its velocity, else its hidden rows, else the `out` seam's.
     fn readout_for(&self, class: usize) -> Option<usize> {
         let mine = |want: engine::fire::ReadoutSeam| {
             self.readouts
@@ -1626,10 +1612,8 @@ impl Shell {
         Ok(Some((row.offset(), rect.rows, pixels)))
     }
 
-    /// Each lane's pixels in the read-back plane, by source lane: the byte it
-    /// starts at and its values. A lane reads pixels only where its class
-    /// writes them; its clips start where the plane's `conv.grid` chain,
-    /// replayed over the fire's grid, puts its first clip.
+    /// A lane's clips start where the plane's `conv.grid` chain, replayed over the fire's
+    /// grid, puts its first clip.
     fn pixel_spans(
         &self,
         p: &Prepared<'_>,
@@ -1697,8 +1681,6 @@ impl Shell {
         Ok(spans)
     }
 
-    /// Copies the fire's pixel plane to its read-back seat: its element count
-    /// and each lane's span of it.
     fn copy_pixels(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<(u32, Vec<(u64, u32)>)> {
         let Some((at, rows, pixels)) = self.pixel_rect(p)? else {
             return Ok((0, Vec::new()));
@@ -2066,8 +2048,7 @@ impl Shell {
 
             tables.push(std::borrow::Cow::Borrowed(seated.pages));
 
-            // A kv-less lane's mask is over its attention group's rows: the
-            // group-packed attention takes it, not the paged prefill's.
+            // A kv-less lane's mask goes to its group-packed attention, not the paged prefill.
             let masking = seated.mask.filter(|_| !seated.kv_less);
             let runs_masked_arm = self.masked.contains(row.class as usize);
             if masking.is_some() && self.masked.is_empty() {
@@ -2766,7 +2747,6 @@ pub struct Prepared<'a> {
     guests: Option<crate::landing::Guests>,
     merge_lands: Vec<MergeLand>,
     classes: Vec<usize>,
-    /// The fire's lanes as composed; `voxel_grid` is its grid (`t, h, w, offset` a clip).
     rows: Vec<LaneRow>,
     voxel_grid: Vec<i32>,
 
@@ -2822,10 +2802,6 @@ pub const READOUT_ROWS_PER_LANE: u32 = 8;
 
 type ReadoutTable = (Vec<i32>, Vec<ReadSpan>);
 
-/// `plane_of(class)` is the plane a lane reads (`None` where its class reads
-/// none out), whether it reads every row, a row's values and whether they
-/// are f32, and whether the plane's rows are voxels (a lane's rows there are
-/// its voxels).
 fn readout_table(
     composition: &Composition,
     lanes: &[Seated<'_>],
@@ -2895,8 +2871,8 @@ fn readout_rows(max_lanes: u32) -> u32 {
         .max(max_lanes)
 }
 
-/// A merge over a guest input: lanes' rows of the input's seat (or zeros,
-/// where the lane feeds none) land in the merge's column.
+/// Lanes' rows of a guest input's seat (zeros where a lane feeds none), landed in the
+/// merge's column.
 #[derive(Debug, Clone, Copy)]
 struct MergeLand {
     merge: ValueId,
@@ -2999,8 +2975,6 @@ impl engine::frame::Shell for Shell {
             _ => None,
         };
 
-        // Each lane's own rows of its own class's plane land at its span of
-        // the seat; a voxel plane's lane reads every voxel of its own.
         let layout = prepared.readout_layout.clone();
         let seat_bytes = self.readout[prepared.arm].bytes();
         for span in layout.iter().filter(|span| span.rows > 0) {
@@ -3184,7 +3158,6 @@ fn bf16(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
 }
 
-/// Each lane's readout values out of the read-back seat, by its span.
 pub(crate) fn rows_from(raw: &[u8], layout: &[ReadSpan]) -> Vec<Vec<f32>> {
     layout
         .iter()
@@ -3208,8 +3181,6 @@ pub(crate) fn rows_from(raw: &[u8], layout: &[ReadSpan]) -> Vec<Vec<f32>> {
         .collect()
 }
 
-/// Each lane's draft rows out of the read-back draft seat: its table entries,
-/// `width` bf16 values each.
 pub(crate) fn drafts_from(raw: &[u8], layout: &[ReadSpan], width: usize) -> Vec<Vec<f32>> {
     layout
         .iter()
@@ -3230,9 +3201,6 @@ fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
 }
 
-/// Appends the token side of a clip's cell (its box in tokens of patch `p`,
-/// then its first row) and returns the row past it, or `None` when the box
-/// does not divide by the patch.
 fn token_cell(grid: &mut Vec<i32>, boxed: [u32; 3], p: [u32; 3], row: u32) -> Option<u32> {
     if p.contains(&0) || (0..3).any(|k| !boxed[k].is_multiple_of(p[k])) {
         return None;
@@ -3296,9 +3264,6 @@ fn writer_classes(
 }
 
 impl Shell {
-    /// The custom mask each group-packed attention of this fire applies,
-    /// out of the kv-less lanes' stated masks: none when no lane states one
-    /// (engine-cuda `serve/prepare.rs::group_masks_of`).
     fn group_masks_of(
         &self,
         lanes: &[Seated<'_>],
@@ -3382,9 +3347,7 @@ impl Shell {
         Ok(staged)
     }
 
-    /// Writes each lane's guest input cells into the input seats this load
-    /// carved (a voxel input into the voxel payload), at the lane's rows. A
-    /// voxel lane that feeds no cell keeps the payload its clips carried.
+    /// A voxel lane that feeds no cell keeps the payload its clips carried.
     fn feed_inputs(
         &mut self,
         arm: usize,
@@ -3455,7 +3418,6 @@ impl Shell {
         Ok(())
     }
 
-    /// Each lane's rows of each merge over a guest input.
     fn merge_lands(&self, composition: &Composition, lanes: &[Seated<'_>]) -> Vec<MergeLand> {
         let mut lands = Vec::new();
         for (at_lane, row) in composition.lanes().iter().enumerate() {
@@ -3483,7 +3445,6 @@ impl Shell {
         lands
     }
 
-    /// Lands each merge's lanes' rows of its guest input in its column.
     fn land_merges(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
         for land in &p.merge_lands {
             let column = p.slots.0[land.merge.0 as usize].ok_or_else(|| Fault::Unbound {
@@ -3529,8 +3490,7 @@ impl Shell {
     }
 }
 
-/// A guest input cell's bytes as the seat's element: an f32 cell lands in a
-/// bf16 seat rounded, any other as it is.
+/// An f32 cell lands in a bf16 seat rounded; any other as it is.
 fn input_bytes(raw: &[u8], from: eta_ir::types::Dtype, to: Dtype, bytes: u64) -> Option<Vec<u8>> {
     let bytes = usize::try_from(bytes).ok()?;
     match (from, to) {

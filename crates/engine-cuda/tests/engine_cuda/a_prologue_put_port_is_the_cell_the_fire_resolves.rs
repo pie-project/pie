@@ -27,7 +27,6 @@ const KV_ROW: &str = "kv";
 const ROWS: u32 = 7;
 const FIRST_TOKEN: u32 = 5;
 
-/// One causal attention layer over a paged cache.
 struct Micro;
 
 impl ForwardHybrid for Micro {
@@ -96,9 +95,7 @@ fn shell(trace: poem::Trace, path: &Path) -> Shell {
     shell
 }
 
-/// A program whose prologue puts the lane's tokens and positions on the
-/// channels its `embed_tokens` and `positions` ports read; nothing else
-/// writes them.
+/// A prologue putting the lane's tokens and positions on its ports' channels.
 fn stating_prologue() -> TraceContainer {
     let decl = || ChannelDecl {
         shape: Shape::vector(ROWS),
@@ -191,8 +188,7 @@ fn fire(shell: &mut Shell, word: u64, tokens: &[u32], attachments: &[Attached]) 
     out.remove(0)
 }
 
-// A prologue that puts a descriptor port's channel commits before the fire
-// resolves its ports: the forward embeds and places the cells it put.
+
 #[test]
 fn the_forward_reads_the_ports_its_prologue_put() {
     if !engine_cuda::device::present() {
@@ -223,7 +219,6 @@ fn the_forward_reads_the_ports_its_prologue_put() {
         stale.iter().zip(&want).any(|(a, b)| (a - b).abs() > 1e-2),
         "the placeholder tokens answer what the stated ones do"
     );
-    // Twice: each fire's prologue puts the cells its epilogue takes back.
     for at in 0..2 {
         shell.open(0).expect("the slot reopens");
         let got = fire(&mut shell, word, &placeholder, &attached);

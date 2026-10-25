@@ -31,9 +31,7 @@ struct Params {
 #endif
     uint rows;
     uint row_span;
-    // The rows `grid` and `o_grid` address `x`'s and `y`'s row 0 at: a
-    // window of a segmented fire starts its tensors at its own rows while
-    // the fire's grids hold fire-wide ones.
+    // `x`'s and `y`'s row 0 in the grids' fire-wide rows (a segmented fire's window starts later).
     uint x_base;
     uint y_base;
 };

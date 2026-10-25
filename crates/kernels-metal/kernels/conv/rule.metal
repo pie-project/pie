@@ -74,12 +74,9 @@ inline int conv_axis(int n, int k, int s, int front, int back, thread bool& ok) 
   }
 }
 
-// Each token row's cell: a row of a clip of `tgrid` its patch's (t, h, w)
-// there and the clip's size in the last three columns, any other row
-// positions[row] in column `axis`; zeros elsewhere.
-// `base`: the row `tgrid` addresses `y`'s row 0 at (a window of a segmented
-// fire starts `y` at its own rows while the fire's grid holds fire-wide
-// ones).
+// A row of a `tgrid` clip gets its patch's (t, h, w) and the clip's size in the last three
+// columns, any other row positions[row] in column `axis`. `base`: `y`'s row 0 in `tgrid`'s
+// fire-wide rows (a segmented fire's window starts later).
 [[kernel]] void cells(
     const device int* tgrid           [[buffer(0)]],
     const device int* positions       [[buffer(1)]],
@@ -103,14 +100,12 @@ inline int conv_axis(int n, int k, int s, int front, int back, thread bool& ok) 
   o[0] = float(v.t);
   o[1] = float(v.h);
   o[2] = float(v.w);
-  // The clip's size in patches, in the last three columns.
   o[width - 3] = float(g.t);
   o[width - 2] = float(g.h);
   o[width - 1] = float(g.w);
 }
 
-// Each row's peer value: packed row csr[g] of `x` for its lane's group `g`,
-// zeros where the group packs none.
+// Packed row csr[g] of `x` for the row's lane's group `g`, zeros where the group packs none.
 [[kernel]] void group_first(
     const device float* x             [[buffer(0)]],
     const device int* csr             [[buffer(1)]],

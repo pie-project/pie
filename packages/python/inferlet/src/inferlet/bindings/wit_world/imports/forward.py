@@ -5,11 +5,8 @@ The forward-pass surface. A guest traces a pass into canonical ETA
 container bytes and binds the channels, working sets and pipeline it runs
 on as resources.
 
-`forward` serves every model: a text model, whatever state it keeps, and a
-generative family's every path (a DiT's text encoder, its denoise step, a
-VAE tile, a block-diffusion text's canvas), each picked by the model's own
-switches. What reaches inside attention (a mask over frozen slots, a
-`kv-len` past a row's own slot) is refused by name on a model without
+`forward` serves every model; the model's switches pick each lane's path.
+What reaches inside attention is refused by name on a model without
 attention layers.
 
 Legal stages: prologue, on_attn_proj, on_attn, epilogue.
@@ -74,13 +71,8 @@ class ForwardPass:
     """
     A forward-pass builder. Construction is empty; descriptor resources are
     attached explicitly, then `program` supplies the traced container.
-    
-    A pass holds every lane of one computation: a CFG denoising step's
-    image and text lanes of both branches, a beam's rows, an LM CFG's two
-    branches. A verb taking `lane` binds that lane; the pass has as many
-    lanes as the highest index set plus one, or as `state` binds working
-    sets. Row data the program computes (`embed`, `state-geometry`,
-    `readout`, `mask`) is the pass's, lane after lane.
+    A verb taking `lane` binds that lane; row data (`embed`,
+    `state-geometry`, `readout`, `mask`) is the pass's, lane after lane.
     """
     
     def __init__(self) -> None:
@@ -89,9 +81,7 @@ class ForwardPass:
     def state(self, lanes: List[working_set.WorkingSet], geom: StateGeometry) -> None:
         """
         One working set per lane, in lane order; lanes sharing one state
-        their slots. Required on a lane `model.lane` says binds `state`:
-        one that reads kv or a recurrent state (a causal VAE's conv
-        caches: each fire then folds one slot, and states no geometry);
+        their slots. Required on a lane `model.lane` says binds `state`,
         refused on any other.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
@@ -108,67 +98,44 @@ class ForwardPass:
     def embed(self, tokens: channel.Channel, indptr: channel.Channel) -> None:
         """
         Bind embedding token ids and CSR row indptr. Both are channels.
-        REQUIRED on a lane that embeds tokens (`model.lane`'s `embeds`,
-        every text model's), REFUSED on one that does not; the lane's row
-        count then comes from its row inputs.
+        Required on a lane that embeds tokens (`model.lane`'s `embeds`),
+        refused on one that does not.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def switch(self, lane: int, name: str, value: str) -> None:
         """
-        Set lane `lane`'s model switch `name` to `value`
-        (`model.switches()`): which path that lane runs. Names and values
-        are the model's (`reading`, `stream`, `mode`, ...); the host checks
-        `value` against the declaration and nothing else. A switch left
-        unset takes its first declared value. Set before `program`; a lane
-        keeps its switches for the pass's life.
+        Set lane `lane`'s model switch `name` (`model.switches()`) to
+        `value`; an unset switch takes its first declared value. Set
+        before `program`.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def input(self, lane: int, name: str, ch: channel.Channel) -> None:
         """
-        Bind a channel to lane `lane`'s model input `name` (`model.lane`'s
-        `inputs`), read at every submit: the channel's COMMITTED cell is
-        the input's value for that lane, so `set` or an epilogue `put`
-        advances it and a whole denoising loop runs without a host copy a
-        step. The channel is `[width]` for a `lane` input, `[rows, width]`
-        for a `row` input (every row input of a lane carries the same
-        rows, and states the lane's rows when nothing else does), and one
-        clip `[h, w, width]` or `[t, h, w, width]` for a `voxel` input; it
-        is `f32` for a float input and `i32` for an `i32` one. The
-        program lists the channel among its inputs, read where the
-        descriptor ports are, so a prologue `put` to it is the value the
-        forward reads. A lane binds exactly the inputs it reads before
-        `program`.
+        Bind lane `lane`'s model input `name` (`model.lane`) to `ch`, whose
+        committed cell is read at every submit: `[width]`, `[rows, width]`
+        or one `[t?, h, w, width]` clip. A lane binds exactly what it reads.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def group(self, lane: int, id: int) -> None:
         """
-        Put lane `lane` in attention group `id`: the lanes of this pass
-        naming one group attend each other's rows, and a lane naming none
-        attends its own. Group ids are this pass's: two passes' groups
-        never meet, whatever their ids. Classifier-free guidance's two
-        branches are two groups of one pass. Set before `program`.
+        Put lane `lane` in this pass's attention group `id`: lanes naming
+        one group attend each other's rows; a lane naming none attends its
+        own. Set before `program`.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
     def mask(self, rows: channel.Channel) -> None:
         """
-        Per row of the pass, which rows it attends, as bools: over the
-        slots `[0, kv-len)` on a pass whose lanes read kv (a recurrent
-        layer hides only slots past `folded`, the same ones for every row
-        of a lane); over its attention group's rows, in the pass's lane
-        order, on one whose lanes do not (a voxel lane's rows are its
-        voxels, and a token after the model's patchify attends as its
-        patch's first voxel). The channel is `[rows, n]`; a row of a group
-        of fewer than `n` rows reads its first ones. Regional prompting,
-        attention coupling and cross-frame restriction are each one mask.
-        Set before `program`.
+        `[rows, n]` bools: per row, the slots `[0, kv-len)` it attends when
+        lanes read kv, else its attention group's rows in lane order. Set
+        before `program`.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """

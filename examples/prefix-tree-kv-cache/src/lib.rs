@@ -35,7 +35,7 @@ async fn append_tokens(ws: &WorkingSet, pipeline: &Pipeline, tokens: &[u32]) -> 
         next_token.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
     });
     fwd.submit(pipeline).context("append shared prefix")?;
-    Ok(next_token.take_host::<i32>().await?)
+    next_token.take_host::<i32>().await
 }
 
 async fn generate(

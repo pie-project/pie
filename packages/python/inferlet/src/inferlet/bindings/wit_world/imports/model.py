@@ -30,21 +30,16 @@ class BlockDrafter:
 @dataclass
 class SwitchDecl:
     """
-    A switch the model declares: its name and the values a pass may set
-    it to (`forward-pass.switch`), the first its default. Names and values
-    are the model's own (`reading`, `stream`, `mode`, `block_draft`, ...);
-    a guest that knows a model by its switches reads them here rather than
-    parsing `architecture()`.
+    A switch the model declares and the values `forward-pass.switch` may
+    set it to, the first its default.
     """
     name: str
     values: List[str]
 
 class ReadoutKind(Enum):
     """
-    Which export seam a lane's epilogue reads: `logits()` for a text
-    head, `velocity()` for a denoiser, `hidden()` for an encoder,
-    `pixels` for a VAE on the voxel axis (one row per output voxel of
-    the pass's clip).
+    Which export seam a lane's epilogue reads; `pixels` is one row per
+    output voxel of the pass's clip.
     """
     LOGITS = 0
     VELOCITY = 1
@@ -53,8 +48,7 @@ class ReadoutKind(Enum):
 
 class InputAxis(Enum):
     """
-    What one entry of an input belongs to: its lane, each row of its
-    lane, or each voxel of its lane's clip.
+    Whether an input is one per lane, per row, or per voxel of the clip.
     """
     LANE = 0
     ROW = 1
@@ -73,25 +67,17 @@ class RowCount_Multiple:
 
 RowCount = Union[RowCount_Exact, RowCount_Multiple]
 """
-The rows a lane binding an input carries, as the model states them:
-exactly `n`, or the fewest that are a multiple of `n` and hold the
-guest's own. The guest pads its rows to them with zeros, on device;
-a voxel input's are its lane's token rows, which the runtime pads
-past its clips' patches.
+The rows a lane binding an input carries: exactly `n`, or the fewest
+multiple of `n` holding the guest's own; the guest zero-pads to them.
 """
 
 
 @dataclass
 class InputDecl:
     """
-    One input the model reads from its guest, by name: `width` values a
-    lane, a row or a voxel, as `dtype` (`f32` for a float input, `i32`
-    for an i32 one; the host marshals to the model's own element type).
-    One name is one input wherever the model reads it. `rows` is the row
-    count a lane binding it carries when the family fixes it (Wan 2.2's
-    `exact(512)` context rows: its reference zero-pads umT5's answer to
-    512 and attends every pad row; Z-Image's `multiple(32)` caption rows),
-    `none` nearly always.
+    One input the model reads from its guest: `width` values of `dtype`
+    per `axis` entry; `rows` is set when the family fixes the row count
+    (Wan 2.2 attends its reference's 512 zero-padded context rows).
     """
     name: str
     axis: InputAxis
@@ -110,13 +96,8 @@ class Readout:
 @dataclass
 class LaneDecl:
     """
-    Everything about a lane of the given switches, as the compiled graph
-    runs it: the inputs it must bind (exactly these, by
-    `forward-pass.input`), whether it binds `state` (some class it can
-    land in reads a kv cache or a recurrent state, a causal VAE's conv
-    caches) and `embed` (some class reads `tokens`), and what it reads out
-    (the export seam its classes read; a float readout where some class
-    reads one). `none` when no class it lands in reads anything out.
+    A lane of given switches: the inputs it binds (exactly these), whether
+    it binds `state` and `embed`, and its readout (`none` if nothing).
     """
     inputs: List[InputDecl]
     state: bool
@@ -127,15 +108,9 @@ class LaneDecl:
 class LatentSpace:
     """
     ── Generative facts ────────────────────────────────────────────────
-    What a guest sizes an image/video job from, so it never parses
-    `architecture()`: its latent space and the schedule it was trained
-    under. A text model answers `none` to each.
-    The latent space a denoiser works in, the VAE's own: a `[t, h, w,
-    channels]` volume, one cell `spatial-compression²` pixels. Latent
-    frame 0 stands for `first-frames` pixel frames and every later one for
-    `temporal-compression` (a causal VAE keeps its first frame alone: 1).
-    How the denoiser patches it is the model's business, not the guest's.
-    `none` for a model with no latent.
+    A text model answers `none` to each.
+    The VAE's `[t, h, w, channels]` latent; latent frame 0 covers
+    `first-frames` pixel frames, each later one `temporal-compression`.
     """
     channels: int
     spatial_compression: int
@@ -209,14 +184,12 @@ def draft_block() -> Optional[BlockDrafter]:
     raise NotImplementedError
 def switches() -> List[SwitchDecl]:
     """
-    Every switch the bound model declares. Empty for a model with one
-    path (every text model). Static.
+    Every switch the bound model declares; empty for a one-path model.
     """
     raise NotImplementedError
 def lane(switches: List[Tuple[str, str]]) -> LaneDecl:
     """
-    The lane a pass of these switches is. Switches are `(name, value)`
-    pairs of `switches()`; one left unset takes its default.
+    The lane of these `(name, value)` switches; unset ones take defaults.
     
     Raises: `componentize_py_types.Err(wit_world.imports.str)`
     """
@@ -227,9 +200,7 @@ def schedule() -> Optional[ScheduleFact]:
     raise NotImplementedError
 def max_latent_rows() -> int:
     """
-    The most rows one lane may carry: the guest sizes its row inputs
-    (`[rows, width]`) under this, the rows the engine's arena holds a
-    fire. Static.
+    The most rows one lane may carry. Static.
     """
     raise NotImplementedError
 def output_vocab_size() -> int:

@@ -159,8 +159,7 @@ export class Builder {
     this.ports.push([port, source]);
   }
 
-  /** List `source` as a channel the forward reads as a guest model input,
-   * at the descriptor phase like a port. */
+  /** List `source` as a guest model input, read at the descriptor phase. */
   bindInput(source: DslChannel): void {
     source.noteDescClaim(false);
     this.inputs.push(source);

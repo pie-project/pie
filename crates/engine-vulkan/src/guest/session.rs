@@ -187,8 +187,7 @@ impl Session {
                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
                 .descriptor_count(stages.len() as u32),
         ];
-        // A package with no stages (a pass that only binds inputs) holds no
-        // sets, and Vulkan has no empty pool.
+        // A package with no stages holds no sets, and Vulkan has no empty pool.
         let pool = if stages.is_empty() {
             vk::DescriptorPool::null()
         } else {

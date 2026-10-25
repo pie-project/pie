@@ -411,8 +411,7 @@ export class Op {
     op.chan = chan;
     return op;
   }
-  /** `lane` is the pass's lane a per-lane intrinsic reads (`velocity`,
-   * `hidden`, `pixels`), 0 for the others; it rides the op's imm. */
+  /** `lane` (0 for non-per-lane intrinsics) rides the op's imm. */
   static intrinsicVal(intr: Intrinsic, shape: Shape, dt: Dtype, lane = 0): Op {
     const op = new Op(tags.INTRINSIC_VAL);
     op.intr = intr;

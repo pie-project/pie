@@ -306,8 +306,6 @@ impl Run<'_> {
             } => {
                 let stated = self.group_mask(*q_indptr, *kv_indptr);
                 let mask = match (mask, stated) {
-                    // A mask a lane states over its group's rows (engine-cuda's
-                    // ragged custom-mask arm).
                     (
                         poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal,
                         Some(stated),

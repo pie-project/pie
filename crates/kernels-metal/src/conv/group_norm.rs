@@ -18,8 +18,7 @@ pub fn scratch_floats(clips: u32, groups: u32) -> u64 {
         + u64::from(clips) * u64::from(groups) * 2
 }
 
-/// `base`: the row `grid` addresses `x`'s (and `y`'s) row 0 at, nonzero in a
-/// window of a segmented fire whose grid holds fire-wide rows.
+/// `base`: `x`'s (and `y`'s) row 0 in `grid`'s fire-wide rows.
 #[allow(clippy::too_many_arguments)]
 pub fn group_norm(
     ctx: &Ctx<'_>,

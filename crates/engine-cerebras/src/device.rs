@@ -1609,9 +1609,7 @@ fn clip_boxes(state: &HashMap<String, Vec<u32>>, name: &str, clips: u32) -> Vec<
         .collect()
 }
 
-/// `boxes` with `base` taken off each first row: a window of a segmented
-/// fire starts its buffers at its own rows while the fire's grids hold
-/// fire-wide ones.
+/// `boxes` rebased to a segmented-fire window whose buffers start at its own rows.
 fn rebased(mut boxes: Vec<[i64; 4]>, base: u32) -> Vec<[i64; 4]> {
     for b in &mut boxes {
         b[3] -= i64::from(base);
@@ -1619,7 +1617,6 @@ fn rebased(mut boxes: Vec<[i64; 4]>, base: u32) -> Vec<[i64; 4]> {
     boxes
 }
 
-/// The index and box holding `row`, and the row's place in it.
 fn clip_of(boxes: &[[i64; 4]], row: i64) -> Option<(usize, [i64; 4], i64)> {
     boxes.iter().enumerate().find_map(|(l, b)| {
         let local = row - b[3];
@@ -1627,13 +1624,11 @@ fn clip_of(boxes: &[[i64; 4]], row: i64) -> Option<(usize, [i64; 4], i64)> {
     })
 }
 
-/// `local`'s `(t, h, w)` in box `b`, row-major.
 fn unravel(b: [i64; 4], local: i64) -> [i64; 3] {
     let rest = local / b[2];
     [rest / b[1], rest % b[1], local % b[2]]
 }
 
-/// The row of `(t, h, w)` in box `b`.
 fn ravel(b: [i64; 4], t: i64, h: i64, w: i64) -> i64 {
     b[3] + (t * b[1] + h) * b[2] + w
 }

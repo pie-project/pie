@@ -749,12 +749,8 @@ pub enum HostOp {
         width: u32,
         limit: u32,
     },
-    /// Each of `rows` token rows' cell, `width` f32 columns: a row of one of
-    /// the `clips` boxes of `tgrid` (i32 `t, h, w, off`) its `(t, h, w)` in
-    /// the box, row-major, and the box's `(t, h, w)` in the last three
-    /// columns; any other row `positions[row]` (i32) in column `axis`;
-    /// zeros elsewhere. `base`: the row `tgrid` addresses `y`'s row
-    /// 0 at.
+    /// Each token row's cell (`conv.cells`), `width` f32 columns; `base` is the row `tgrid`
+    /// addresses `y`'s row 0 at.
     Cells {
         tgrid: String,
         positions: String,
@@ -765,10 +761,7 @@ pub enum HostOp {
         width: u32,
         base: u32,
     },
-    /// `y[r] = csr[g + 1] - csr[g]` (f32) for `g = groups[lanes[r]]`, 0 when
-    /// the lane or group is out of the tables (`lane_count`, `csr_len`).
-    /// `y[r][at..at + width] = x[r]` for `rows` rows, `y` rows `stride`
-    /// wide: one input of a side-by-side concatenation.
+    /// `y[r][at..at + width] = x[r]` for `rows` rows, `y` rows `stride` wide.
     ConcatCols {
         x: String,
         y: String,
@@ -777,6 +770,7 @@ pub enum HostOp {
         stride: u32,
         at: u32,
     },
+    /// `y[r] = csr[g + 1] - csr[g]` for `g = groups[lanes[r]]`, 0 out of the tables.
     GroupRows {
         csr: String,
         groups: String,
@@ -786,9 +780,7 @@ pub enum HostOp {
         lane_count: u32,
         rows: u32,
     },
-    /// `y[r] = x[csr[g]]` (`width` f32 columns, `x` of `x_rows` rows) for
-    /// `g = groups[lanes[r]]`, zeros when the lane or group is out of the
-    /// tables or the group packs no row.
+    /// `y[r] = x[csr[g]]` for `g = groups[lanes[r]]`, zeros out of the tables or for an empty group.
     GroupFirst {
         x: String,
         csr: String,
@@ -801,12 +793,8 @@ pub enum HostOp {
         width: u32,
         x_rows: u32,
     },
-    /// A patch move over clip tables (`clips` boxes in each): `fold` the
-    /// pixel unshuffle by `p` (`x`'s `channels` voxels of `grid` into `y`'s
-    /// rows of `o_grid`, `channels · |p|` wide), else the pixel shuffle
-    /// (`x`'s `channels · |p|`-wide rows of `grid` into `y`'s `channels`
-    /// voxels of `o_grid`); `y` has `rows` rows, a row no box holds zero.
-    /// `bases`: the rows `grid` and `o_grid` address `x`'s and `y`'s row 0 at.
+    /// Pixel unshuffle by `p` when `fold`, else shuffle, over `clips` boxes; a row no box holds
+    /// is zero. `bases`: the rows `grid` and `o_grid` address `x`'s and `y`'s row 0 at.
     Patch {
         x: String,
         grid: String,

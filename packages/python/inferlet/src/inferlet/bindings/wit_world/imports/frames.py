@@ -171,10 +171,8 @@ class Frames:
     @classmethod
     def concat(cls, parts: List[Self]) -> Self:
         """
-        Join `parts`, in order, into one handle host-side: a clip decoded
-        a fire at a time is the concatenation of each fire's frames. Every
-        part must have the same width, height and fps; a mismatch, or no
-        parts at all, is refused by name with both figures.
+        Join `parts`, in order, into one handle host-side; parts must share
+        width, height and fps, and an empty list is refused.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """

@@ -215,16 +215,12 @@ pub struct Lane {
     #[serde(default)]
     pub channels: Vec<Ticket>,
     pub readout: Readout,
-    /// The attention group the lane's rows attend inside: unique to its
-    /// pass in a fire, so two passes' lanes never attend each other.
+    /// Unique to its pass in a fire, so two passes' lanes never attend each other.
     #[serde(default)]
     pub group: Option<u32>,
-    /// The guest inputs this lane binds, each read off its channel's
-    /// committed cell at every fire.
     #[serde(default)]
     pub inputs: Vec<InputFeed>,
-    /// The lane reads no kv: it takes no seat, and the state it carries, if
-    /// any, is the row `rs_slot` names.
+    /// The lane takes no seat; the state it carries, if any, is the row `rs_slot` names.
     #[serde(default)]
     pub kv_less: bool,
     /// An engine that cannot report says nothing, and the step is plainly
@@ -247,8 +243,7 @@ pub struct Tap {
     pub slots: Vec<u32>,
 }
 
-/// The channel a lane feeds guest input `id` (`poem_ir::RuntimeInput::Guest`)
-/// from.
+/// The channel a lane feeds guest input `id` from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InputFeed {
     pub id: u32,
@@ -297,8 +292,7 @@ impl Lane {
                 self.rows()
             )));
         }
-        // A kv-less lane's mask is over its attention group's rows, which
-        // the engine maps its own rows onto.
+        // A kv-less lane's mask is over its attention group's rows.
         if let Some(masking) = &self.mask
             && !self.kv_less
             && let Some(stated) = masking.stated_rows()
@@ -419,16 +413,14 @@ pub enum FoldLen {
     Device,
 }
 
-/// A pass's program on a fire: the prologue runs before the fire stages its
-/// inputs, the epilogue after the forward.
+/// A pass's program on a fire: the prologue before input staging, the epilogue after the forward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     /// The first of the pass's lanes, `lanes` of them in a row.
     pub lane: u32,
     pub lanes: u32,
     pub instance: InstanceId,
-    /// The fire carries the pass's adapter alone and runs none of its
-    /// stages (every fire but the last of a cut pass).
+    /// Every fire but the last of a cut pass: it carries the adapter and runs no stage.
     pub adapter_only: bool,
 }
 
@@ -906,8 +898,7 @@ mod tests {
 
     #[test]
     fn kv_less_lanes_take_no_seat() {
-        // A CFG denoise step: four float lanes, none seated, beside a
-        // decode in seat 0.
+        // A CFG step: four unseated float lanes beside a decode in seat 0.
         let float = |rs_slot| Lane {
             tokens: vec![0; 4],
             kv_less: true,

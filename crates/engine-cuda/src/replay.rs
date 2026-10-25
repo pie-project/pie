@@ -61,9 +61,7 @@ impl Replay {
 
     /// `step` as the encoder-only step to fire first and the step to fire
     /// after it, where a lane of it is a prompt longer than the window;
-    /// `None` where none is. `plain` says whether a word is a plain lane's
-    /// (no runtime switch on but a single token's, every switch at its
-    /// default) whose class attends one way.
+    /// `None` where none is. `plain` says whether a word is a plain lane's, attending one way.
     #[must_use]
     pub fn split(self, step: &Step, plain: impl Fn(u64) -> bool) -> Option<(Step, Step)> {
         let window = self.window as usize;
@@ -108,8 +106,7 @@ impl Replay {
         Some((head, tail))
     }
 
-    /// Whether lane `at` of `step` is a plain prompt longer than the window;
-    /// its program and channels ride the second fire.
+    /// A plain prompt longer than the window: its program rides the second fire.
     fn cuts(self, step: &Step, at: usize, plain: impl Fn(u64) -> bool) -> bool {
         let lane = &step.lanes[at];
         let window = self.window as usize;

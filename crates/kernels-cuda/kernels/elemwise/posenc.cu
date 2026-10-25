@@ -182,8 +182,7 @@ __global__ __launch_bounds__(256) void cells(
     if (row >= rows) return;
     float* o = y + static_cast<long long>(width) * row;
     for (int c = 0; c < width; ++c) o[c] = 0.0f;
-    // `base`: the fire row `y`'s row 0 stands at; the token grid addresses
-    // fire rows.
+    // The token grid addresses fire rows.
     ::pie::voxels::Lane g;
     if (::pie::voxels::lane_of(tgrid, clips, row + base, g) < 0) {
         o[axis] = static_cast<float>(positions[row]);
@@ -193,14 +192,12 @@ __global__ __launch_bounds__(256) void cells(
     o[0] = static_cast<float>(v.t);
     o[1] = static_cast<float>(v.h);
     o[2] = static_cast<float>(v.w);
-    // The clip's size in patches, in the last three columns.
     o[width - 3] = static_cast<float>(g.t);
     o[width - 2] = static_cast<float>(g.h);
     o[width - 1] = static_cast<float>(g.w);
 }
 
-// Each row's peer value: packed row `csr[g]` of `x` for its lane's group
-// `g`, zeros where the group packs none.
+// Zeros where the group packs none.
 __global__ __launch_bounds__(256) void group_first(
     const float* __restrict__ x,
     const int* __restrict__ csr,

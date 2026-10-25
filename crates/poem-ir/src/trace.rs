@@ -200,33 +200,27 @@ pub struct Trace {
     /// The facts the trace's guards branch on, and the bits each takes.
     #[serde(default)]
     pub facts: crate::Facts,
-    /// The inputs the model names, by [`crate::RuntimeInput::Guest`] id.
+    /// Indexed by [`crate::RuntimeInput::Guest`] id.
     #[serde(default)]
     pub inputs: Vec<GuestInput>,
 }
 
-/// An input a model names, which its guest binds a channel to.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GuestInput {
     pub name: String,
-    /// The rows a lane binding it carries, when the model fixes them.
     #[serde(default)]
     pub rows: Option<RowCount>,
 }
 
-/// The rows a lane binding an input carries, as its model states them: the
-/// guest pads its rows on device to them.
+/// The rows a lane binding an input carries; the guest pads its rows on device to them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RowCount {
-    /// Exactly this many (Wan 2.2's 512 context rows).
     Exact(u32),
-    /// The fewest rows, a multiple of this, that hold the guest's own
-    /// (Z-Image's caption, padded to 32).
+    /// The fewest rows, a multiple of this, that hold the guest's own.
     Multiple(u32),
 }
 
-/// A guest input as a loaded model reads it: its declaration, and the lane
-/// words (under `mask`) whose class reads it.
+/// `readers` are the lane words, under `mask`, whose class reads the input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputDecl {
     pub name: String,
@@ -239,15 +233,12 @@ pub struct InputDecl {
 }
 
 impl InputDecl {
-    /// Whether a lane of `word` runs a class that reads this input.
     #[must_use]
     pub fn read_by(&self, word: u64) -> bool {
         self.readers.contains(&(word & self.mask))
     }
 }
 
-/// Which export seam a class reads out: a text head's logits (`out`), a
-/// denoiser's `velocity`, an encoder's `hidden` rows, a VAE's `pixels`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ReadoutKind {
     Logits,
@@ -256,35 +247,28 @@ pub enum ReadoutKind {
     Pixels,
 }
 
-/// What a class reads out, and how wide one row is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Readout {
     pub kind: ReadoutKind,
     pub width: u32,
 }
 
-/// One class of a loaded model, as its graph runs it: the lane words (under
-/// [`LaneClasses::mask`]) landing in it, whether it reads a kv cache, embeds
-/// `tokens`, attends both ways, and what it reads out.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneClass {
     pub words: Vec<u64>,
     pub reads_kv: bool,
-    /// It reads a `CacheRow::State` row: a lane of it carries a recurrent
-    /// state.
+    /// A lane of it carries a recurrent state.
     #[serde(default)]
     pub reads_state: bool,
     pub embeds: bool,
     pub wide: bool,
     pub readout: Option<Readout>,
-    /// The patch its graph's token grid reads (`RuntimeInput::TokenGrid`):
-    /// a voxel lane of it attends as one token row a patch of its voxels.
+    /// A voxel lane of it attends as one token row per patch of its voxels.
     #[serde(default)]
     pub patch: Option<[u32; 3]>,
 }
 
-/// The classes of a loaded model, and the mask of the word bits that tell
-/// them apart.
+/// `mask` covers the word bits that tell the classes apart.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaneClasses {
     pub mask: u64,
@@ -292,7 +276,6 @@ pub struct LaneClasses {
 }
 
 impl LaneClasses {
-    /// The class a lane of `word` lands in.
     #[must_use]
     pub fn of(&self, word: u64) -> Option<&LaneClass> {
         let word = word & self.mask;

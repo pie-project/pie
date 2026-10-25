@@ -283,9 +283,8 @@ pub fn avg_down(
     Ok(s)
 }
 
-/// [`pixel_unshuffle`] by the patch size. `bases`: the rows `grid` and
-/// `y_grid` address `x`'s and `y`'s row 0 at (`[x, y]`), nonzero in a window
-/// of a segmented fire whose grids hold fire-wide rows.
+/// [`pixel_unshuffle`] by the patch size; `bases` are the rows `grid` and `y_grid` address
+/// `x`'s and `y`'s row 0 at.
 pub fn patchify(
     f: &mut Func,
     x: Operand,
@@ -298,8 +297,7 @@ pub fn patchify(
     pixel_unshuffle(f, x, grid, p, y, y_grid, bases)
 }
 
-/// [`pixel_shuffle`] by the patch size, untrimmed; `bases` as
-/// [`patchify`]'s.
+/// [`pixel_shuffle`] by the patch size, untrimmed; `bases` as [`patchify`]'s.
 pub fn unpatchify(
     f: &mut Func,
     x: Operand,

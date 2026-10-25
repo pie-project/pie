@@ -1,12 +1,10 @@
-//! What a test program is bound against: the lanes of its pass, the
-//! model's graph and the engine's sinks.
+//! What a test program is bound against.
 
 use eta_ir::container::TraceContainer;
 use eta_ir::op::{IntrinsicId, Op};
 use eta_ir::registry::{EngineCaps, Graph, Readout, ReadoutKind};
 use eta_ir::validate::{BoundTrace, ValidateError, bind};
 
-/// One lane reading `vocab`-wide logits.
 pub fn logits(container: TraceContainer, vocab: u32) -> Result<BoundTrace, ValidateError> {
     let lane = Readout {
         kind: ReadoutKind::Logits,
@@ -15,8 +13,7 @@ pub fn logits(container: TraceContainer, vocab: u32) -> Result<BoundTrace, Valid
     bind(container, vec![Some(lane)], graph(), caps())
 }
 
-/// As many lanes as `container` reads intrinsics of, each reading out what
-/// the loaded classes read out of the kind it reads there.
+/// One lane per lane `container` reads intrinsics of, reading what the loaded classes read out.
 #[allow(dead_code)]
 pub fn loaded(
     container: TraceContainer,

@@ -12,8 +12,7 @@
 // - `PIE_POOL`: bf16 rows averaged in blocks of `block` (a word a lane, two
 //   values).
 // - `PIE_SELECT`: a `width`-word slice at `offset` of each `stride`-word row.
-// - `PIE_PLACE`: a `width`-word row landed at `offset` of each `stride`-word
-//   row (one input of a side-by-side concatenation).
+// - `PIE_PLACE`: a `width`-word row landed at `offset` of each `stride`-word row.
 // - `PIE_SPLIT`: each row cut into a left and a right part; `PIE_SPLIT_QKV`:
 //   into q, k and v; `PIE_SPLIT_Q_GATE`: each `2 * head`-word head into its
 //   query half and its gate half.

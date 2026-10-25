@@ -34,7 +34,6 @@ template <typename T, int C_MAX, int SIMDS>
 
   if (tid == 0) {
     SpatialClip g;
-    // `base`: the row `grid` addresses row 0 at; segments land local.
     const int l = clip_of(grid, int(clips), row + base, g);
     int begin = 0, end = 0;
     if (l >= 0) {

@@ -334,10 +334,8 @@ pub fn derive_grid(
     )
 }
 
-/// Each token row's cell (`ops::conv::cells`): a row of a clip of `tgrid`
-/// its patch's `(t, h, w)` there and the clip's size in the last three
-/// columns, any other row `positions[row]` in column `axis`; zeros
-/// elsewhere. `base` is the fire row `y`'s row 0 stands at.
+/// `ops::conv::cells`: a clip row's patch `(t, h, w)` and clip size, any other row
+/// `positions[row]` in column `axis`. `base` is the fire row `y`'s row 0 stands at.
 pub fn cells(
     ctx: &Ctx,
     tgrid: Tensor,
@@ -385,8 +383,7 @@ pub fn cells(
     )
 }
 
-/// Each row's peer value: `x`'s first packed row in its lane's group
-/// (`ops::gather::group_first`).
+/// `ops::gather::group_first`.
 pub fn group_first(
     ctx: &Ctx,
     x: Tensor,
@@ -434,8 +431,7 @@ pub fn group_first(
     )
 }
 
-/// Each row's count of `csr`'s rows in its lane's group
-/// (`ops::gather::group_rows`).
+/// `ops::gather::group_rows`.
 pub fn group_rows(
     ctx: &Ctx,
     csr: Tensor,

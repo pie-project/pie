@@ -6,7 +6,6 @@ use eta_ir::registry::{EngineCaps, Graph, Port, Readout, ReadoutKind, Stage};
 use eta_ir::types::{Dtype, Literal, Shape};
 use eta_ir::validate::{BoundTrace, ValidateError, bind};
 
-/// One lane reading 32-wide logits, on an engine running every sink.
 fn served(c: TraceContainer, caps: EngineCaps) -> Result<BoundTrace, ValidateError> {
     let logits = Readout {
         kind: ReadoutKind::Logits,

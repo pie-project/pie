@@ -42,8 +42,7 @@ fn dims(deployment: &str) -> Dims {
     }
 }
 
-/// Every (reading, stream) a lane of `deployment` may take, its stream the
-/// declared default where none is given.
+/// Every (reading, stream) a lane of `deployment` may take; `None` is the default stream.
 fn lanes(deployment: &str) -> Vec<(&'static str, Option<&'static str>)> {
     let mut lanes = vec![
         ("refine", Some("context")),
@@ -56,8 +55,6 @@ fn lanes(deployment: &str) -> Vec<(&'static str, Option<&'static str>)> {
     lanes
 }
 
-/// The word of a lane in `reading`, on `stream` where given (its declared
-/// default otherwise).
 fn word(plan: &Trace, reading: &str, stream: Option<&str>) -> u64 {
     let mut request = Request::new(4, false).switched("reading", reading);
     if let Some(stream) = stream {

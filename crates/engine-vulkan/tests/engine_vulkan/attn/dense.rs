@@ -1,8 +1,7 @@
 //! Dense attention over segments on the first Vulkan device against an f64
 //! host reference: patch rows attending their own image (bidirectional), and
 //! ragged query segments attending the key span the CSR names, on the tiled
-//! kernel (bf16 at 64 and 128) and the scalar one, with and without a custom
-//! mask over each segment's (query, key) pairs.
+//! kernel (bf16 at 64 and 128) and the scalar one, with and without a custom mask.
 
 use kernels_slang::Tensor;
 use poem_ir::Dtype;
@@ -26,8 +25,7 @@ fn down(gpu: &Gpu, buf: u32, n: usize, dtype: Dtype) -> Vec<f32> {
     }
 }
 
-/// Query row `r` (of `qh` heads) attends key rows `span(r)` (of `kvh` heads)
-/// that `keeps(r, j)`.
+/// Query row `r` attends the key rows `span(r)` that `keeps(r, j)`.
 #[allow(clippy::too_many_arguments)]
 fn attend(
     q: &[f64],
@@ -150,9 +148,7 @@ fn dense_attention_answers_the_reference() {
         let s = segment(r);
         (kv_indptr[s] as usize, kv_indptr[s + 1] as usize)
     };
-    // A custom mask: segment `s`'s pair `(qo, kv)` is kept unless
-    // `(3 qo + kv) % 4 == 1`, each row keeping its first key; bit
-    // `qo * kv_len + kv` from byte `mask_indptr[s]`.
+    // Segment `s` keeps `(qo, kv)` unless `(3 qo + kv) % 4 == 1`; each row keeps its first key.
     let kept = |r: usize, j: usize| {
         let s = segment(r);
         let (qo, kv) = (r - q_indptr[s] as usize, j - kv_indptr[s] as usize);

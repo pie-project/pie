@@ -2123,12 +2123,12 @@ impl BatchScheduler {
                     }
                     FramePlan::Park => break,
                     FramePlan::Terminate(doomed) => {
-                        for (pid, doom) in doomed {
-                            let reason = doom.to_string();
+                        for pid in doomed {
+                            let reason = super::frame::ABANDONED;
                             tracing::error!(pid = %pid, "scheduler: terminating pipeline: {reason}");
                             crate::inferlet::process::terminate_by(
                                 pid,
-                                Err(reason),
+                                Err(reason.to_string()),
                                 crate::policy::By::Host,
                             );
                         }

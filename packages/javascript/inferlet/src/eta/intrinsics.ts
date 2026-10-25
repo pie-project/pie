@@ -42,15 +42,12 @@ export function hidden(lane: number, rows: number, width: number): Tensor {
   return intrinsicVal(Intrinsic.HIDDEN, shapeOf([Math.max(rows, 1), Math.max(width, 1)]), activationType, lane);
 }
 
-/**
- * The pixels lane `lane`'s VAE decode lands, `[rows, width]` F32 at the
- * epilogue: one row per OUTPUT voxel of the lane's clip.
- */
+/** The pixels lane `lane`'s VAE decode lands, one `[rows, width]` row per output voxel. */
 export function pixels(lane: number, rows: number, width: number): Tensor {
   return intrinsicVal(Intrinsic.PIXELS, shapeOf([Math.max(rows, 1), Math.max(width, 1)]), activationType, lane);
 }
 
-/** The velocity lane `lane` of the pass predicts, one `width`-wide row per of its `rows`. */
+/** The velocity lane `lane` predicts, `[rows, width]`. */
 export function velocity(lane: number, rows: number, width: number): Tensor {
   return intrinsicVal(Intrinsic.VELOCITY, shapeOf([Math.max(rows, 1), Math.max(width, 1)]), activationType, lane);
 }

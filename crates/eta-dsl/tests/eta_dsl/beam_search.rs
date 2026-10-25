@@ -79,8 +79,6 @@ fn build_designb() -> Traced {
     b.build().expect("design B beam epilogue binds")
 }
 
-/// What a pass reads out, its model and its engine: lanes as given, a
-/// model of `num_layers`, an engine running every sink.
 fn served(
     container: eta_ir::container::TraceContainer,
     lanes: Vec<Option<Readout>>,

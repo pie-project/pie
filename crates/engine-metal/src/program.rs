@@ -303,7 +303,6 @@ impl Plane {
         self.instances.get_mut(&id).map(|bound| &mut bound.session)
     }
 
-    /// Points `intrinsic` of the pass's lane `lane` at `offset` of `base`.
     #[allow(clippy::too_many_arguments)]
     pub fn bind_intrinsic(
         &mut self,
@@ -339,8 +338,6 @@ impl Plane {
         Ok(bound.session.readiness(&program.plan))
     }
 
-    /// Whether instance `id`'s prologue runs on its own, before the forward
-    /// ([`ExecPlan::prologue_runs`]).
     #[must_use]
     pub fn prologue_runs(&self, id: InstanceId) -> bool {
         self.instances
@@ -349,7 +346,6 @@ impl Plane {
             .is_some_and(|program| program.plan.prologue_runs())
     }
 
-    /// Runs instance `id`'s stages at `at` to their commit.
     pub fn fire(&mut self, context: &Context, id: InstanceId, at: Attach) -> Result<Fired> {
         let bound = self
             .instances
@@ -526,7 +522,6 @@ impl Plane {
             .is_some_and(|bound| bound.session.is_airborne())
     }
 
-    /// Whether instance `id`'s program reads `intrinsic` of its pass's lane `lane`.
     pub fn reads_lane(
         &self,
         id: InstanceId,

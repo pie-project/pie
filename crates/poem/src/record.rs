@@ -261,8 +261,7 @@ impl Recorder {
         }
     }
 
-    /// The guest input `name`, `width` values of `dtype` on `axis`: the same
-    /// input wherever it is read, so a second read states it alike.
+    /// The guest input `name`; a second read must state it alike.
     pub fn guest(
         &self,
         name: &str,
@@ -352,8 +351,6 @@ impl Recorder {
             .any(|seam| seam.seam == name && seam.values.contains(&value.id))
     }
 
-    /// Declares the model's switch `name` over `values`, the first its
-    /// default.
     pub fn declare_switch(&self, name: &str, values: &[&str]) {
         if let Err(why) = self.inner.borrow_mut().facts.declare(name, values) {
             panic!("{why}");
@@ -417,9 +414,7 @@ impl Recorder {
 }
 
 /// A node reading a buffer a lane may not carry, on rows whose lanes are not
-/// known to carry it. Which rows carry a mask or adapter routes is a runtime
-/// switch; a model's own switch an inferlet sets says nothing about them, so
-/// a kernel reading one runs only where its runtime switch holds.
+/// known to carry it: only a runtime switch says which lanes carry a mask or adapter routes.
 fn unguarded_read(plan: &Trace) -> Option<String> {
     let mut ins = Vec::new();
     for (j, node) in plan.nodes.iter().enumerate() {

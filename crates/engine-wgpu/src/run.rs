@@ -109,7 +109,6 @@ pub struct FireBindings {
 
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
-    /// By query and key packing.
     pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
 
     pub inputs: Vec<(u32, Tensor)>,
@@ -481,10 +480,8 @@ impl<'c> Run<'c> {
         self.cut(id, self.whole(id))
     }
 
-    /// The row `grid` addresses `rows`' row 0 at: the fire's clip and token
-    /// grids hold fire-wide rows, so the window's first row on `rows`' axis
-    /// (as [`Self::cut`] cuts it); a grid an op derived counts from the
-    /// window's first clip, so 0.
+    /// The row `grid` addresses `rows`' row 0 at: the fire's grids hold fire-wide rows, so the
+    /// window's first row; a grid an op derived counts from the window's first clip, so 0.
     pub(crate) fn grid_base(&self, grid: ValueId, rows: ValueId) -> u32 {
         let seated = self.window();
         if seated.gathered.is_some()

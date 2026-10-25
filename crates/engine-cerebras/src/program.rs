@@ -860,8 +860,6 @@ impl Plane {
         (self.stages.runs, self.stages.lanes)
     }
 
-    /// Whether `instance`'s prologue runs on its own, before the forward
-    /// ([`ExecPlan::prologue_runs`]).
     #[must_use]
     pub fn prologue_runs(&self, instance: InstanceId) -> bool {
         self.instances

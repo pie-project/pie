@@ -122,18 +122,14 @@ pub fn bidirectional(
     )
 }
 
-/// A custom mask over a ragged attention's segments: segment `s`'s (query,
-/// key) pair `(q, k)`, each within the segment, is kept where bit
-/// `q * kv_len + k` of `bits` (u8, bound whole words), from byte `indptr[s]`
-/// (i32), is set.
+/// Segment `s`'s pair `(q, k)` is kept where bit `q * kv_len + k` of `bits` (u8, bound
+/// whole words) from byte `indptr[s]` (i32) is set.
 #[derive(Clone, Copy, Debug)]
 pub struct CustomMask {
     pub bits: Tensor,
     pub indptr: Tensor,
 }
 
-/// A query row of segment `s` attends key rows `kv_indptr[s]..kv_indptr[s + 1]`,
-/// those `mask` keeps where one is stated.
 #[allow(clippy::too_many_arguments)]
 pub fn ragged(
     ctx: &Ctx<'_>,

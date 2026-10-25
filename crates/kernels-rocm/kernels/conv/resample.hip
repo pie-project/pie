@@ -12,9 +12,7 @@ namespace pie::conv {
 
 using namespace ::pie::voxels;
 
-// `x_base` / `y_base`: the rows `grid` and `o_grid` address `x`'s and `y`'s
-// row 0 at. A window of a segmented fire starts its tensors at its own rows
-// while the fire's grids hold fire-wide ones.
+// `x_base` / `y_base`: the rows the fire-wide grids address `x`'s and `y`'s row 0 at.
 
 template <class T>
 __global__ __launch_bounds__(256) void upsample_nearest(const T* __restrict__ x, const int* __restrict__ grid,

@@ -338,7 +338,7 @@ impl Block<'_> {
         fwd.input(0, "self_cond_weights", &self_cond_weights)
             .context("bind self_cond_weights")?;
         {
-            let (tap_ids_out, tap_weights_out) = (tap_ids_out.clone(), tap_weights_out.clone());
+            let (tap_ids_out, tap_weights_out) = (tap_ids_out, tap_weights_out);
             fwd.epilogue(move || {
                 slots.put(slots.take());
 
@@ -365,12 +365,12 @@ impl Block<'_> {
                 let top_by_conf = || {
                     let (_, order) = sort_desc(&conf);
                     let zeros = cast(lt(iota(length), 0u32), dtype::i32);
-                    let rank = scatter_set(&zeros, &order, &cast(iota(length), dtype::i32));
-                    lt(&rank, &reshape(count.read(), []))
+                    let rank = scatter_set(&zeros, &order, cast(iota(length), dtype::i32));
+                    lt(&rank, reshape(count.read(), []))
                 };
                 // The single most confident row, so a threshold rule always
                 // decodes something.
-                let most_confident = || eq(&conf, &reshape(reduce_max(&conf), []));
+                let most_confident = || eq(&conf, reshape(reduce_max(&conf), []));
 
                 // ── the acceptance rule ──
                 let mut release = lt(iota(length), 0u32); // rows to re-noise (remdm)
@@ -381,8 +381,8 @@ impl Block<'_> {
                         // first `count` of them, `count` the host's schedule.
                         let (_, order) = sort_desc(-&h);
                         let zeros = cast(lt(iota(length), 0u32), dtype::i32);
-                        let rank = scatter_set(&zeros, &order, &cast(iota(length), dtype::i32));
-                        lt(&rank, &reshape(count.read(), []))
+                        let rank = scatter_set(&zeros, &order, cast(iota(length), dtype::i32));
+                        lt(&rank, reshape(count.read(), []))
                     }
                     Rule::Margin => {
                         let (top2, _) = top_k(&probs, 2);
@@ -392,15 +392,15 @@ impl Block<'_> {
                         gt(&gap, margin)
                     }
                     Rule::Llada => top_by_conf(),
-                    Rule::Threshold => or(&gt(&conf, threshold), &most_confident()),
+                    Rule::Threshold => or(gt(&conf, threshold), most_confident()),
                     Rule::Remdm => {
                         // Remask: a kept row now read under `remask_conf`,
                         // with probability `remask_rate`, while the
                         // schedule is in its first four fifths.
                         let u = rng(&(&r + iota(2)), [length]);
                         let on = lt(&(&step * 5u32), max_steps * 4);
-                        let doubt = and(&lt(&conf, remask_conf), &lt(&u, remask_rate));
-                        release = and(&doubt, &reshape(on, []));
+                        let doubt = and(lt(&conf, remask_conf), lt(&u, remask_rate));
+                        release = and(&doubt, reshape(on, []));
                         top_by_conf()
                     }
                     Rule::Klass => {
@@ -411,22 +411,22 @@ impl Block<'_> {
                         );
                         // log p_t at the previous argmax, off the scaled row's max and partition sum.
                         let m = reduce_max(&scaled);
-                        let lz = log(&reduce_sum(&exp(
+                        let lz = log(reduce_sum(exp(
                             &scaled - &broadcast(reshape(&m, [length, 1]), [length, vocab])
                         )));
                         let id_before = prev_id.take();
                         let lp_at = &(&gather_row(&scaled, &id_before) - &m) - &lz; // [length]
-                        let p_before = max_elem(&prev_p.take(), 1e-30f32);
+                        let p_before = max_elem(prev_p.take(), 1e-30f32);
                         let kl = &p_before * &(&log(&p_before) - &lp_at);
-                        prev_id.put(&cast(&argmax, dtype::u32));
+                        prev_id.put(cast(&argmax, dtype::u32));
                         prev_p.put(&conf);
                         let kl_before = prev_kl.take();
                         prev_kl.put(&kl);
                         let warm = reshape(ge(&step, 2u32), []);
-                        let still = and(&and(&lt(&kl, kl_eps), &lt(&kl_before, kl_eps)), &warm);
-                        let stable = and(&still, &gt(&conf, klass_conf));
-                        let any = gt(&reduce_sum(cast(&stable, dtype::i32)), 0i32);
-                        or(&stable, &and(&most_confident(), &not(&reshape(any, []))))
+                        let still = and(and(lt(&kl, kl_eps), lt(&kl_before, kl_eps)), &warm);
+                        let stable = and(&still, gt(&conf, klass_conf));
+                        let any = gt(reduce_sum(cast(&stable, dtype::i32)), 0i32);
+                        or(&stable, and(most_confident(), not(reshape(any, []))))
                     }
                 };
 
@@ -435,13 +435,13 @@ impl Block<'_> {
 
                 // ── sticky: an accepted row keeps its token from then on ──
                 let (next, commit, all_frozen) = if sticky {
-                    let was = and(&frozen.take(), &not(&release));
+                    let was = and(frozen.take(), not(&release));
                     let ids = frozen_ids.take();
-                    let newly = and(&accept, &not(&was));
+                    let newly = and(&accept, not(&was));
                     let now = or(&was, &newly);
                     let kept = select(&was, &ids, &sampled);
                     let next = select(&now, &kept, &noise);
-                    frozen_ids.put(&select(&now, &next, -1i32));
+                    frozen_ids.put(select(&now, &next, -1i32));
                     let count_frozen = reduce_sum(cast(&now, dtype::i32));
                     frozen.put(&now);
                     let commit = select(&now, &next, &argmax);
@@ -464,14 +464,14 @@ impl Block<'_> {
                 stable_run.put(&run_next);
                 let mean = &reduce_sum(&h) / (length as f32);
                 let confident = reshape(lt(&mean, confidence), [1]);
-                let done = or(&and(&ge(&run_next, stability), &confident), &all_frozen);
+                let done = or(and(ge(&run_next, stability), &confident), &all_frozen);
 
                 if let (Some(ids_out), Some(weights_out)) = (&tap_ids_out, &tap_weights_out) {
                     // Top ids of the scaled row (the softmax's ids) and their
                     // probabilities off the row's max and partition sum, so
                     // `probs` need not be read by a library op here.
                     let m = reduce_max(&scaled);
-                    let z = reduce_sum(&exp(
+                    let z = reduce_sum(exp(
                         &scaled - &broadcast(reshape(&m, [length, 1]), [length, vocab])
                     ));
                     let (top_vals, tap_ids) = top_k(&scaled, taps_used);
@@ -578,7 +578,6 @@ impl Block<'_> {
     }
 }
 
-/// The width of the denoise lane's `self_cond_ids` input.
 fn self_cond_taps() -> Result<u32> {
     let lane = model::lane_of(&[("mode", "denoise")])?;
     let input = lane
@@ -784,7 +783,7 @@ async fn encode(
         let denom = (len - 1) as f32;
         fwd.epilogue(move || {
             let lp = log_softmax(intrinsics::logits()); // [len, vocab]
-            let picks = gather_row(&lp, &next.read()); // [len]
+            let picks = gather_row(&lp, next.read()); // [len]
             let mean = &reduce_sum(&(&picks * &weight.read())) / denom;
             q_out.put(reshape(&mean, [1]));
         });

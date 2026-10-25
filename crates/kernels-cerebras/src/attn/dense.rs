@@ -1,8 +1,5 @@
-//! Bidirectional attention inside segments: every row attends to the key
-//! rows of its own segment, `segments` an i32 `[images + 1]` boundary vector
-//! over the shared row numbering (vision encoders), or, ragged, the key rows
-//! a second CSR names for its segment, under a keep plane or a relative
-//! bias (group-packed attention); a row outside every segment answers zeros.
+//! Bidirectional attention inside segments (vision encoders), or ragged over a second CSR
+//! under a keep plane or relative bias; a row outside every segment answers zeros.
 //!
 //! Placement: a lane plan with the segments as ragged lanes (no banks), the
 //! key rows split over the block's `a` axis and the kv heads over `b`; k and
@@ -59,25 +56,20 @@ pub fn bidirectional(
     )
 }
 
-/// What a ragged attention applies beside its segments.
 #[derive(Clone, Copy, Debug)]
 pub enum RaggedMask {
     Segments,
-    /// `keep` is `[q rows][k rows]` (f32 or bf16): a pair of one segment is
-    /// kept where its cell is nonzero.
+    /// Keeps a pair of one segment where its `[q rows][k rows]` cell is nonzero.
     Custom {
         keep: Tensor,
     },
-    /// Adds `table[h, clamp(k − q + max_len − 1)]` (f32, `[q_heads, 2·max_len
-    /// − 1]`) to the scaled logit, `k`/`q` indexed within the segment.
+    /// Adds `table[h, clamp(k − q + max_len − 1)]` to the scaled logit, within the segment.
     RelativeBias {
         table: Tensor,
         max_len: u32,
     },
 }
 
-/// A query row of segment `s` (rows `q_indptr[s]..q_indptr[s + 1]`) attends
-/// key rows `kv_indptr[s]..kv_indptr[s + 1]`, under `mask`.
 pub fn ragged(
     ctx: &Ctx<'_>,
     q: Tensor,
@@ -350,7 +342,6 @@ fn attend(
                 heads(&ob, group * d, false),
                 heads(&lse, group, false),
             ];
-            // The keep plane: every window row, the PE's key columns.
             if let Some(keep) = &keep {
                 cols.push(ColPlane {
                     name: keep.name.clone(),

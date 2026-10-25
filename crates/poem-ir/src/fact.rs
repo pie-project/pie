@@ -2,28 +2,17 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Guard, Request};
 
-/// A runtime switch: a fact the runtime derives from what a lane carries and
-/// what its program reads, so an inferlet cannot state it apart from the
-/// buffers a kernel reads under it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Builtin {
-    /// The lane carries a custom attention mask (`has_mask`).
     Masked,
-    /// The lane carries adapter routes (`has_adapter`).
     Adapted,
-    /// The lane carries media patches (`has_media`).
     Media,
-    /// The lane queries one token (`single_token`).
     SingleToken,
-    /// The lane's program reads its drafts (`drafts`).
     Drafts,
-    /// The lane's program reads its attention scores (`scores`).
     Scores,
-    /// The lane's rows are a prompt only a causal encoder-decoder's encoder
-    /// reads (`encode`): a backend sets it on the leading rows it replays.
+    /// Set by a backend on the leading prompt rows it replays through an encoder.
     Encode,
-    /// The lane's recurrent state holds nothing yet: its cursor is 0, and
-    /// this fire starts it from zeros (`fresh`).
+    /// Cursor 0: this fire starts the recurrent state from zeros.
     Fresh,
 }
 
@@ -58,16 +47,13 @@ impl Builtin {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Fact {
     Builtin(Builtin),
-    /// The model's switch `name` is set to `value`. A switch's values are a
-    /// bit each, so the rows a value does not hold for are one literal too.
+    /// Each value of a switch is its own bit.
     Switch {
         name: String,
         value: String,
     },
 }
 
-/// A switch a model declares: its name and the values a lane may set it to,
-/// the first its default.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SwitchDecl {
     pub name: String,
@@ -81,9 +67,7 @@ impl SwitchDecl {
     }
 }
 
-/// The facts a trace branches on, in the order it first read them (the fact
-/// at `k` is bit `k` of a request's word), and the switches its model
-/// declares.
+/// The fact at `k` is bit `k` of a request's word.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Facts {
     pub table: Vec<Fact>,
@@ -98,8 +82,6 @@ impl Facts {
         self.bit_of(Fact::Builtin(builtin))
     }
 
-    /// Declares the switch `name` over `values`, the first its default.
-    /// Declaring it again over the same values is declaring it once.
     pub fn declare(&mut self, name: &str, values: &[&str]) -> Result<(), String> {
         if name.is_empty() {
             return Err("a switch is named".to_string());
@@ -138,13 +120,11 @@ impl Facts {
         }
     }
 
-    /// The switch `name` the model declares.
     #[must_use]
     pub fn declared(&self, name: &str) -> Option<&SwitchDecl> {
         self.switches.iter().find(|decl| decl.name == name)
     }
 
-    /// The guard over the rows whose switch `name` is set to `value`.
     pub fn switch(&mut self, name: &str, value: &str) -> Guard {
         let Some(decl) = self.declared(name) else {
             panic!("the switch `{name}` is read but not declared");
@@ -160,7 +140,6 @@ impl Facts {
         })
     }
 
-    /// Whether `value` is one the switch `name` declares.
     pub fn check(&self, name: &str, value: &str) -> Result<(), String> {
         let decl = self
             .declared(name)
@@ -214,8 +193,6 @@ impl Facts {
         })
     }
 
-    /// The value the switch `name` takes on `request`: the one it sets, else
-    /// the declared default.
     fn value_of<'a>(&'a self, request: &'a Request, name: &str) -> Option<&'a str> {
         request
             .switch(name)
@@ -234,8 +211,6 @@ impl Facts {
         })
     }
 
-    /// Whether `word` is a plain lane's: no runtime switch on but a single
-    /// token's, every switch at its default.
     #[must_use]
     pub fn plain(&self, word: u64) -> bool {
         self.defaults(word)
@@ -244,7 +219,6 @@ impl Facts {
                 .all(|builtin| builtin == Builtin::SingleToken || !self.holds(word, builtin))
     }
 
-    /// Whether `word` leaves every switch of the model at its default.
     #[must_use]
     pub fn defaults(&self, word: u64) -> bool {
         self.table.iter().enumerate().all(|(bit, fact)| match fact {
@@ -256,8 +230,6 @@ impl Facts {
         })
     }
 
-    /// Whether the runtime switch `builtin` is on in `word`; off where the
-    /// trace never reads it.
     #[must_use]
     pub fn holds(&self, word: u64, builtin: Builtin) -> bool {
         self.table
@@ -266,10 +238,7 @@ impl Facts {
             .is_some_and(|bit| word & (1 << bit) != 0)
     }
 
-    /// A request of every word a lane can be stamped with, the plainest
-    /// first: each runtime switch on and off, a query of one token and of
-    /// more, and each switch at its default, at each value the trace reads
-    /// and at one value it does not.
+    /// A request per reachable word, plainest first; each switch also at one value never read.
     #[must_use]
     pub fn requests(&self) -> Vec<Request> {
         let mut guests: Vec<Vec<(&str, &str)>> = vec![Vec::new()];

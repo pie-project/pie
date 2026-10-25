@@ -136,7 +136,7 @@ async fn main(input: Input) -> Result<String> {
         out_par.put(&parent);
         out_scr.put(&s);
         // Cross-check: at `beams == 1` the raw-logit argmax must equal the beam pick every step.
-        out_greedy.put(&reshape(reduce_argmax(&logits), [b]));
+        out_greedy.put(reshape(reduce_argmax(&logits), [b]));
 
         let base = fill.take(); // [1]
         let base_b = broadcast(reshape(&base, [1]), [b]); // [1] -> [B]

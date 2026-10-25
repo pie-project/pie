@@ -69,16 +69,13 @@ pub struct PackingBindings {
     pub permutation: Tensor,
 }
 
-/// A guest input's rectangle for this fire.
 #[derive(Clone, Copy, Debug)]
 pub struct InputBinding {
     pub id: u32,
     pub tensor: Tensor,
 }
 
-/// The inputs of the diffusion and video families: the voxel axis (clip
-/// grids, the voxel input), the guest inputs fed from channels, and the
-/// attention group packings. Empty for a text fire.
+/// The diffusion and video families' inputs; empty for a text fire.
 #[derive(Clone, Debug, Default)]
 pub struct DitBindings {
     pub grid: Option<Tensor>,
@@ -86,9 +83,7 @@ pub struct DitBindings {
     pub voxels: Option<Tensor>,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, PackingBindings)>,
-    /// The keep plane (`[rows][rows]` f32) each group-packed
-    /// `attention.ragged` applies, by its query and key packings, when a
-    /// lane stated a mask.
+    /// Each group-packed `attention.ragged`'s keep plane, by its query and key packings.
     pub group_masks: Vec<(poem_ir::Selection, poem_ir::Selection, Tensor)>,
     pub inputs: Vec<InputBinding>,
 }
@@ -282,8 +277,6 @@ impl<'c> Run<'c> {
         self.place.run.get()
     }
 
-    /// The keep plane a group-packed attention over the packings of `q_indptr`
-    /// and `kv_indptr` applies, when a lane of the fire stated a mask.
     pub(crate) fn group_mask(&self, q_indptr: ValueId, kv_indptr: ValueId) -> Option<Tensor> {
         let packing = |id: ValueId| match &self.values[id.0 as usize].def {
             Def::Input(RuntimeInput::Geometry {
@@ -387,8 +380,7 @@ impl<'c> Run<'c> {
         self.slice(handle, skip, keep)
     }
 
-    /// `mask`'s bits, or the fire's where a prefill that is not causal states
-    /// none (its lanes' classes stage every key they hold).
+    /// `mask`'s bits, or the fire's when a non-causal prefill states none.
     pub(crate) fn mask_bits(&self, mask: Option<ValueId>) -> Tensor {
         mask.map_or(self.fire.tables.mask, |mask| self.tensor(mask))
     }
@@ -397,9 +389,8 @@ impl<'c> Run<'c> {
         self.cut(id, self.whole(id))
     }
 
-    /// The row `grid` addresses `rows`' row 0 at: the fire's clip and token
-    /// grids hold fire-wide rows, so the window's first row on `rows`' axis;
-    /// a grid an op derived counts from the window's first clip, so 0.
+    /// The row `grid` addresses `rows`' row 0 at: the window's first row for the fire's
+    /// fire-wide grids, 0 for a grid an op derived.
     pub(crate) fn grid_base(&self, grid: ValueId, rows: ValueId) -> u32 {
         if !matches!(
             self.values[grid.0 as usize].def,

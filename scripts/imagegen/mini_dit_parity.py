@@ -184,9 +184,7 @@ def wasm(inferlet: str) -> str:
     return max(present, key=os.path.getmtime)
 
 def pieces(text: str, n: int) -> list[str]:
-    """`n` argv pieces of `text`, none starting with `-`: `pie run` reads a
-    value that starts with `-` and is no number as the next flag, which
-    leaves the piece's `--case_i` a bare `true`."""
+    """`n` argv pieces of `text`, none starting with `-` (`pie run` reads those as flags)."""
     step = -(-len(text) // n)
     cuts = [0]
     for i in range(1, n):
@@ -292,8 +290,6 @@ def classes(args) -> int:
         return 1
     for at in range(batches):
         v = {mode: np.asarray(answers[mode][at]["velocity"], dtype=np.float32) for mode in answers}
-        # The mask halves the token grid by column; on the voxel axis that is
-        # the left half of the latent's columns, the same cells.
         doc = answers["none"][at]
         rows = int(doc["image_rows"])
         width = int(doc["velocity_width"])

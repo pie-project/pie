@@ -1,9 +1,4 @@
-//! The two float seams a generative model lands, the velocity and the
-//! pixels, as one table: a pass whose lane reads the seam out binds a
-//! read of it at that lane's width; a lane that reads another thing out
-//! refuses the program; a read at another width, or not a float matrix,
-//! is refused; a lane past the pass's is refused, any lane within it binds;
-//! and either seam is an epilogue value.
+//! A float seam binds only at the width of a lane of the pass that reads it out.
 
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op, intrinsic_pitch};
@@ -104,8 +99,6 @@ fn a_float_seam_is_gated_by_the_model() {
             );
         }
 
-        // The lane named is the one gated: lane 1 of a pass whose second
-        // lane reads the seam binds, lane 2 of a pass of two is refused.
         bound(
             epilogue_read(intr, 1, plane, Dtype::F32),
             vec![other, reads],
@@ -121,8 +114,6 @@ fn a_float_seam_is_gated_by_the_model() {
             "{intr:?}: refused for the wrong reason: {refusal:?}"
         );
 
-        // No lane cap: lane 20 of a pass of 21 binds, and the side table
-        // an instance binds is as wide as the lanes the program reads.
         let mut lanes = vec![other; 21];
         lanes[20] = reads;
         let wide = bound(epilogue_read(intr, 20, plane, Dtype::F32), lanes)
@@ -139,7 +130,6 @@ fn a_float_seam_is_gated_by_the_model() {
         );
     }
 
-    // Logits read the pass, so they name lane 0.
     let refusal = bound(
         epilogue_read(IntrinsicId::Logits, 1, Shape::matrix(1, 32), Dtype::F32),
         vec![

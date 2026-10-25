@@ -1,33 +1,14 @@
-//! The pie half of the `z-image` goldens. Hands the family exactly what
-//! `scripts/imagegen/zimage_golden.py` handed diffusers — the caption rows,
-//! the latent (the VAE's own `[h, w, C]`, on the voxel axis) and the
-//! timestep — and reads back the refined caption and the velocity, as JSON
-//! `scripts/imagegen/zimage_parity.py` turns into an `.npz` under the
-//! golden's own key names. The family patchifies and computes every row's
-//! rotary position in its graph; the guest states neither. The caption is
-//! zero-padded to the rows the family states for it (`input-decl.rows`,
-//! a multiple of 32, as the reference pads), with its own row count bound
-//! as `length`; the family turns the pad rows into its pad token.
+//! The pie half of the `z-image` goldens: `scripts/imagegen/zimage_golden.py`'s
+//! inputs in, the refined caption and the velocity out as JSON for `zimage_parity.py`.
+//! The caption is zero-padded to the family's `input-decl.rows`, as the reference pads.
 //!
-//! Two fires per case, in the order the reference's forward runs them, down
-//! one pipeline:
-//!
-//! 1. **`refine`** — one `context` lane carrying `caption` (`[L32, cap]`,
-//!    zero past `L`) and `length` (`L`); its epilogue reads `hidden(dim)`,
-//!    the refined caption, pad rows included.
-//! 2. **`denoise`** — a `context` lane (`context` = the refine readout,
-//!    `timestep`) and an `image` lane (`latents`, `timestep`) in one group of
-//!    ONE pass — lane 0 the context, lane 1 the image; the epilogue reads
-//!    the image lane's `velocity` on the voxel axis.
+//! Two fires per case, in the reference's order: `refine` (one context lane), then
+//! `denoise` (lane 0 the refined caption, lane 1 the image, one group).
 //!
 //! Under `steps` the second fire becomes the whole TRAJECTORY: `steps`
 //! denoise fires over the family's pinned sigmas with the latent carried on
 //! the device by the image lane's Euler epilogue, started from the case's
 //! own latent (the golden's recorded `randn`, not a device draw).
-//!
-//! The timestep is the family's input convention — the scheduler's
-//! `σ·1000`, which the plan flips to the reference's `1000 − t` — so the
-//! harness converts the golden's transformer-side `t` first.
 use inferlet::latent::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -79,8 +60,7 @@ struct Case {
     caption_width: u32,
     /// The SCHEDULER timestep `σ·1000` the family's `timestep` input takes.
     timestep: f32,
-    /// The token rows a tapped deployment's intermediate reads out on; the
-    /// velocity is read on the latent's voxels.
+    /// The token rows a tapped deployment's intermediate reads out on.
     #[serde(default)]
     readout_rows: Option<u32>,
 }
@@ -96,9 +76,8 @@ struct Output {
     refined: Vec<f32>,
     caption_rows: u32,
     dim: u32,
-    /// `[height · width, readout]`: the velocity on the voxel axis, in the
-    /// family's sign (the reference's `-model_out`); a tapped deployment's
-    /// intermediate is `[readout_rows, readout]` instead.
+    /// `[height · width, readout]` in the family's sign (the reference's
+    /// `-model_out`); a tap's is `[readout_rows, readout]`.
     velocity: Vec<f32>,
     height: u32,
     width: u32,
@@ -106,9 +85,7 @@ struct Output {
     /// `[caption_rows, ·]`: the same readout off the context lane, under
     /// `ctx_tap`; empty otherwise.
     ctx: Vec<f32>,
-    /// `[height, width, channels]`: the trajectory's latent after its last
-    /// fire, under `steps`; empty otherwise. The sigmas it walked and the
-    /// timesteps it read, so the report says what schedule ran.
+    /// Under `steps`, the trajectory's last latent; empty otherwise.
     latent: Vec<f32>,
     sigmas: Vec<f32>,
     timesteps: Vec<f32>,
@@ -119,7 +96,6 @@ struct Reading {
     readout_width: u32,
 }
 
-/// The lane `stream` of `reading`, checked to read exactly `binds`.
 fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::LaneDecl> {
     let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
     let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
@@ -134,8 +110,6 @@ fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::La
     Ok(lane)
 }
 
-/// The token-less reading with `readout`, each of its `lanes` checked to
-/// read exactly the inputs this guest binds there.
 fn reading(readout: model::ReadoutKind, lanes: &[(&str, &[&str])]) -> Result<Reading> {
     let readings = model::switch("reading")
         .map(|decl| decl.values)
@@ -178,7 +152,6 @@ fn reading(readout: model::ReadoutKind, lanes: &[(&str, &[&str])]) -> Result<Rea
     })
 }
 
-/// The rows a lane of `len` rows of its own carries under `rows`.
 fn padded(rows: Option<model::RowCount>, len: u32) -> Result<u32> {
     match rows {
         None => Some(len),
@@ -188,13 +161,11 @@ fn padded(rows: Option<model::RowCount>, len: u32) -> Result<u32> {
     .ok_or_else(|| format!("{len} caption rows do not fit {rows:?}"))
 }
 
-/// The caption's own row count, as the `length` input reads it.
 fn length(case: &Case) -> Channel {
     Channel::from([case.caption_rows as f32]).named("length")
 }
 
-/// The `refine` reading: one context lane, the refined caption back, over
-/// the padded rows (returned too).
+/// The refined caption, its width and the padded caption rows.
 async fn refine(case: &Case, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
     let r = reading(
         model::ReadoutKind::Hidden,
@@ -226,7 +197,6 @@ async fn refine(case: &Case, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
     Ok((rows_out, width, rows))
 }
 
-/// The `denoise` reading, its two lanes checked.
 fn denoise_reading() -> Result<Reading> {
     reading(
         model::ReadoutKind::Velocity,
@@ -258,8 +228,6 @@ fn denoise_lanes(
     Ok(())
 }
 
-/// The rows the denoise readout carries: the latent's voxels for a
-/// `channels`-wide velocity, the case's `readout_rows` for a tap.
 fn readout_rows(case: &Case, width: u32) -> Result<u32> {
     if width == case.channels {
         return Ok(case.height * case.width);
@@ -281,8 +249,6 @@ fn latent_of(case: &Case, name: &str) -> Channel {
     .named(name)
 }
 
-/// One denoise step: the refined-caption lane and the image lane in one
-/// group of one pass, the velocity back off the image lane.
 async fn denoise(
     case: &Case,
     context: &Channel,
@@ -316,9 +282,7 @@ async fn denoise(
     Ok((velocity, ctx_rows))
 }
 
-/// The Euler trajectory over the family's pinned sigmas, from the case's
-/// latent, read back every fire. `DenoiseLoop`'s seed fire has `dt = 0`, so
-/// fire `k` integrates step `k - 1`.
+/// `DenoiseLoop`'s seed fire has `dt = 0`, so fire `k` integrates step `k - 1`.
 async fn trajectory(
     case: &Case,
     context: &Channel,
@@ -360,7 +324,6 @@ async fn trajectory(
     Ok((last, sched.sigmas.clone(), sched.timesteps()))
 }
 
-/// The `text` reading over the templated prompt, `hidden` at every row.
 async fn text(prompt: &str, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
     let readings = model::switch("reading")
         .map(|decl| decl.values)

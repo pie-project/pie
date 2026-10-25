@@ -411,8 +411,7 @@ pub(crate) struct Rows {
     pub mask: Option<Val>,
     /// `[R, qh · extent]` f32 relative-bias rows.
     pub rel: Option<Val>,
-    /// Per row, the custom-mask bit its first key of the segment stands at,
-    /// i32 (ragged custom mask).
+    /// Per row, the custom-mask bit its segment's first key stands at, i32.
     pub bit: Option<Val>,
     /// Row index within its segment, i32 (ragged bias).
     pub qi: Option<Val>,

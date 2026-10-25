@@ -131,9 +131,7 @@ impl ChannelCell {
         self.validate_attachment(decl, false, None)
     }
 
-    /// `writes`: the pass's program takes or puts this channel. A host-visible
-    /// or seeded channel no attached pass writes is read-only on the device,
-    /// so any number of passes may share it.
+    /// A channel no attached pass writes is read-only on the device, so passes may share it.
     pub fn validate_attachment(
         &self,
         decl: &ChannelDecl,
@@ -670,9 +668,7 @@ impl ChannelCell {
         Ok(seed)
     }
 
-    /// The seed every pass bound to this channel starts from: the one put
-    /// before the first bind, kept once committed so a later pass that
-    /// shares the channel binds the same value.
+    /// The seed every bound pass starts from, kept once committed so later sharers bind the same.
     pub fn peek_seed(&self) -> Result<Vec<u8>, ChannelError> {
         self.taken_seed
             .clone()

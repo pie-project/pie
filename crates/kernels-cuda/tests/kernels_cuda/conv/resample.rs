@@ -163,9 +163,7 @@ fn upsample(keep_first: bool) {
     let want: Vec<u16> = want.iter().map(|&v| to_bf16(v)).collect();
     assert_eq!(got, want, "keep_first {keep_first}");
 
-    // The second lane alone, as a later window of a segmented fire sees it:
-    // `x` cut to its rows, the fire's grid (fire-wide rows) cut to its lane,
-    // the derived output grid counting from the window.
+    // The second lane alone, as a later window of a segmented fire sees it.
     let (skip, skip_out) = (BOXES[0].voxels(), out_boxes[0].voxels());
     let (o_grid1, rows_out1) = table(&out_boxes[1..]);
     let o_grid1_at = gpu.up(&o_grid1);

@@ -23,8 +23,7 @@ const STAMPS: [u32; 5] = [64, 80, 96, 128, 256];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RaggedMask {
     None,
-    /// Group `g`'s (query, key) pair `(q, k)` is kept where bit
-    /// `q * kv_len + k` of `bits`, from byte `indptr[g]`, is set.
+    /// Keeps group `g`'s pair `(q, k)` where bit `q * kv_len + k` from byte `indptr[g]` is set.
     Custom {
         bits: Tensor,
         indptr: Tensor,

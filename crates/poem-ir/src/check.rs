@@ -193,8 +193,6 @@ pub enum Fault {
     },
 }
 
-/// Why the guest input `input` a value declares is not one input: past the
-/// trace's table, typed apart from its axis and width, or declared twice.
 fn guest_input(
     trace: &Trace,
     at: usize,

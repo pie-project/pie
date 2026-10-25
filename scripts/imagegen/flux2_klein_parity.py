@@ -337,8 +337,7 @@ def collect(args) -> None:
     mine, native = {}, {}
     steps = 0
     for i, name in enumerate(names):
-        # Velocities and latents come back as the VAE latent; the golden
-        # holds packed tokens.
+        # The golden holds packed tokens.
         if name == "hidden.f32":
             arr = blob(i, (text_rows, hidden_width))
         else:

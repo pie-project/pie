@@ -22,10 +22,7 @@ use super::pie;
 
 type Anyhow<T> = anyhow::Result<T>;
 
-/// The rows (a row input) or clip (a voxel input) a channel bound to
-/// `input` carries, once its shape and dtype are the input's: `[width]` for
-/// a lane input, `[rows, width]` for a row input, `[h, w, width]` or
-/// `[t, h, w, width]` for a voxel input; i32 for an i32 input, else f32.
+/// The rows or clip a channel bound to `input` carries, once its shape and dtype match it.
 pub(crate) fn validate_input_channel(
     input: &poem_ir::InputDecl,
     shape: &[u32],
@@ -64,7 +61,6 @@ pub(crate) fn validate_input_channel(
     }
 }
 
-/// The rows a lane's row inputs state: every one carries the same.
 pub(crate) fn input_rows(inputs: &[InputBinding]) -> Result<Option<u32>, String> {
     let mut rows: Option<(u32, &str)> = None;
     for input in inputs {
@@ -84,7 +80,6 @@ pub(crate) fn input_rows(inputs: &[InputBinding]) -> Result<Option<u32>, String>
     Ok(rows.map(|(rows, _)| rows))
 }
 
-/// The inputs this model reads, by name, for an error that names none.
 fn input_names(model: &crate::model::Model) -> String {
     if model.inputs().is_empty() {
         return "it reads none".to_string();
@@ -874,8 +869,7 @@ impl ProcessCtx {
                 }
                 (None, false) => None,
             };
-            // A float lane reading a recurrent state is a sequence of one
-            // slot a fire: it binds `state`, and states no geometry.
+            // A float lane reading a recurrent state binds `state` and states no geometry.
             let reads_state = !reads_kv && decls[0].reads_state;
             if let Some(at) = decls
                 .iter()
@@ -979,10 +973,7 @@ impl ProcessCtx {
                         .iter()
                         .filter_map(|binding| binding.clip)
                         .collect();
-                    // A voxel lane's rows are its tokens: one a patch of its
-                    // voxels where its graph patchifies (the token grid),
-                    // then the pad rows its voxel input states (`rows`),
-                    // else one.
+                    // One row per patch of each clip, padded to its input's `rows`.
                     let tokens = |[pt, ph, pw]: [u32; 3]| {
                         clips
                             .iter()
@@ -1179,8 +1170,7 @@ impl ProcessCtx {
                 .map(|state| state.lanes.clone())
                 .unwrap_or_default();
             let (kv_lanes, rs_reps) = self.lane_parts(&lanes)?;
-            // The pass binds on the engine its working sets live on; a
-            // seatless float pass binds on its process's engine.
+            // A seatless float pass binds on its process's engine.
             let engine = match kv_lanes.first() {
                 Some(&rep) => super::working_set::kv_of(self, rep)?.engine,
                 None => crate::planner::engine_of(self.id()),
@@ -1591,7 +1581,6 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
     }
 }
 
-/// A lane index a verb names: the lanes one fire carries bound it.
 fn lane_index(lane: u32) -> Result<usize, String> {
     let max = crate::engine::get_spec(0)
         .map_err(|error| error.to_string())?

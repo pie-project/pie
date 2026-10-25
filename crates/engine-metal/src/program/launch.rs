@@ -973,8 +973,6 @@ impl Prepared {
         Ok(())
     }
 
-    /// Points `intrinsic` of the pass's lane `lane` at `offset` of `base`, rows
-    /// `width` wide.
     pub fn bind_intrinsic(
         &mut self,
         intrinsic: IntrinsicId,
@@ -1293,8 +1291,8 @@ impl Prepared {
                         eta_compiler::codegen::metal::M2_LOGITS_BUFFER,
                     ),
                 }
-                // The pass's intrinsics past the logits each at an argument
-                // of their own; the per-lane ones read through the table.
+                // Past the logits, each intrinsic has its own argument; per-lane ones read
+                // through the table.
                 encoder.setBuffer_offset_atIndex(
                     Some(self.addresses.raw()),
                     0,
@@ -1515,9 +1513,7 @@ pub struct Batch {
     row_meta: Buffer,
     row_indices: Buffer,
     scratch: Buffer,
-    /// Each member's address table, dispatch lane by dispatch lane.
     addresses: Buffer,
-    /// The bytes of one member's address table: a `ulong` a slot.
     table_bytes: u64,
     layouts: Vec<Buffer>,
     layout_words: Vec<GroupLayout>,

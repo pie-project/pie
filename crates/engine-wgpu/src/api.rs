@@ -787,7 +787,7 @@ impl Engine for Wgpu {
 impl Wgpu {
     #[cfg(feature = "wgpu")]
     fn run_prologues(&mut self, submission: &Step) -> EngineResult<()> {
-        let mut prologues = epilogues(submission)
+        let mut prologues = program_attachments(submission)
             .filter(|attachment| self.programs.prologue_runs(attachment.instance))
             .peekable();
         if prologues.peek().is_none() {
@@ -804,7 +804,8 @@ impl Wgpu {
 
     #[cfg(not(feature = "wgpu"))]
     fn run_prologues(&mut self, submission: &Step) -> EngineResult<()> {
-        if epilogues(submission).any(|attachment| self.programs.prologue_runs(attachment.instance))
+        if program_attachments(submission)
+            .any(|attachment| self.programs.prologue_runs(attachment.instance))
         {
             return Err(Error::Program(
                 "this build carries no wgpu device, so a guest pass has nowhere to run".into(),
@@ -818,7 +819,7 @@ impl Wgpu {
         &mut self,
         submission: &Step,
     ) -> EngineResult<Option<crate::landing::Guests>> {
-        if epilogues(submission).next().is_none() {
+        if program_attachments(submission).next().is_none() {
             return Ok(None);
         }
         let device = self.loaded()?.device().clone();
@@ -830,7 +831,8 @@ impl Wgpu {
         self.programs
             .deferred(
                 &device,
-                epilogues(submission).map(|attachment| (attachment.instance, attachment.lane)),
+                program_attachments(submission)
+                    .map(|attachment| (attachment.instance, attachment.lane)),
                 policies,
             )
             .map(Some)
@@ -842,7 +844,7 @@ impl Wgpu {
         &mut self,
         submission: &Step,
     ) -> EngineResult<Option<crate::landing::Guests>> {
-        if epilogues(submission).next().is_none() {
+        if program_attachments(submission).next().is_none() {
             Ok(None)
         } else {
             Err(Error::Program(
@@ -856,8 +858,7 @@ impl Wgpu {
         submission: &Step,
         at: engine::StepDone,
     ) -> EngineResult<(FireTicket, PendingStep)> {
-        // The caller predicts the cursors a pass starts from: checked
-        // before a prologue moves them.
+        // Checked before a prologue moves the cursors the caller predicted.
         for attachment in &submission.attachments {
             if let Some(lane) = submission.lanes.get(attachment.lane as usize)
                 && !lane.channels.is_empty()
@@ -1148,7 +1149,7 @@ pub(crate) fn lane_readouts(policies: &[Readout], rows: &[Vec<f32>]) -> Vec<Lane
 }
 
 /// The attachments whose program runs on this fire.
-fn epilogues(step: &Step) -> impl Iterator<Item = &engine::fire::Attachment> {
+fn program_attachments(step: &Step) -> impl Iterator<Item = &engine::fire::Attachment> {
     step.attachments
         .iter()
         .filter(|attachment| !attachment.adapter_only)

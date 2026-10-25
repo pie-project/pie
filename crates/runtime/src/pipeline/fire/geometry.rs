@@ -346,9 +346,6 @@ pub struct Place {
     pub folded_exact: bool,
     pub tail: Option<u32>,
     pub shared: bool,
-    /// The working set's M-RoPE spans ([`Cursor::spans`]).
-    ///
-    /// [`Cursor::spans`]: crate::inferlet::host::working_set::Cursor::spans
     pub spans: Vec<(u32, u32, u32)>,
 }
 

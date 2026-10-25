@@ -6,8 +6,6 @@ use eta_ir::registry::{EngineCaps, Graph, Readout, ReadoutKind};
 use eta_ir::types::{Literal, RngKind};
 use eta_ir::validate::bind;
 
-/// One lane reading 32-wide logits, on a two-layer model whose engine runs
-/// every sink.
 fn served(c: TraceContainer) -> BoundTrace {
     bind(
         c,

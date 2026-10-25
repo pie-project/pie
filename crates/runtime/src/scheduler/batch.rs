@@ -171,8 +171,7 @@ pub(crate) fn build_batch_request(
         member_lane_indptr.push(0);
         let mut media: Vec<engine::fire::StepMedia> = Vec::new();
         let mut voxels: Vec<engine::fire::StepVoxels> = Vec::new();
-        // A pass's group ids are its own: each member's are renumbered past
-        // every member's before it, so two passes' groups never merge.
+        // Group ids renumber past earlier members', so two passes' groups never merge.
         let mut groups = 0u32;
         for req in requests {
             boundary_programs.push(req.request.boundary_program);
@@ -315,9 +314,7 @@ pub(crate) fn build_frame_submission(
         let mut attachments = Vec::new();
         let lanes = build.lanes;
         for (member, &instance) in build.instance_ids.iter().enumerate() {
-            // The fire that ends a pass runs its program, each stage at its
-            // own point; any other fire of an adapted pass carries the
-            // adapter alone.
+            // Only the fire ending a pass runs its program; earlier fires carry the adapter alone.
             let adapter_only = !build.boundary_programs[member];
             if adapter_only && !group[member].lora_program {
                 continue;
@@ -466,8 +463,6 @@ mod tests {
         );
     }
 
-    /// Two requests' passes both naming groups 0 and 1 land in four groups
-    /// of the fire: a pass's group ids are its own.
     fn two_passes_groups_never_meet() {
         let grouped = |first: u32| {
             let mut pass = FireRequest {

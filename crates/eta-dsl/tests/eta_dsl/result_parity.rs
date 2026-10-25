@@ -12,8 +12,6 @@ fn bound(traced: &Traced, vocab: u32, _page_size: u32, num_layers: u32) -> Bound
     served(traced.container().clone(), logits_lane(vocab), num_layers).expect("container binds")
 }
 
-/// What a pass reads out, its model and its engine: lanes as given, a
-/// model of `num_layers`, an engine running every sink.
 fn served(
     container: eta_ir::container::TraceContainer,
     lanes: Vec<Option<Readout>>,

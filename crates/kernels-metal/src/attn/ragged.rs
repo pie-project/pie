@@ -21,9 +21,8 @@ pub enum RaggedMask {
         table: Tensor,
         max_len: u32,
     },
-    /// Segment `s`'s pair `(q, k)`, each indexed within the segment, is kept
-    /// where bit `q * kv_len + k` of `bits` (u8), from byte `indptr[s]`
-    /// (i32), is set (kernels-cuda's fa2 custom-mask arm).
+    /// Segment `s`'s pair `(q, k)` is kept where bit `q * kv_len + k` of `bits` (u8) from
+    /// byte `indptr[s]` (i32) is set.
     Custom {
         bits: Tensor,
         indptr: Tensor,
@@ -164,8 +163,6 @@ fn shape(
     })
 }
 
-/// The mask's operands: the bias table and its reach, then the custom bits and
-/// their per-segment byte offsets; an arm reads only its own.
 fn mask_args(
     ctx: &Ctx<'_>,
     mask: &RaggedMask,

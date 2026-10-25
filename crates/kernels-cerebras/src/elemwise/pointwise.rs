@@ -10,17 +10,16 @@ use crate::phase::Shard;
 use crate::plan::Footprint;
 use crate::tensor::Tensor;
 
-/// The operation of an `elemwise.binary`, as `k_binary` numbers it.
+/// Discriminants are `k_binary`'s op codes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BinaryOp {
     Add = 0,
     Mul = 1,
     Div = 2,
-    /// `x - y·floor(x / y)`: floored, as Python's `%`.
+    /// Floored, as Python's `%`.
     Mod = 3,
 }
 
-/// `z = x op y`, the planes the same shape.
 pub fn binary(ctx: &Ctx<'_>, op: BinaryOp, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> {
     const OP: &str = "elemwise.binary";
     for t in [x, y, z] {
@@ -82,7 +81,6 @@ pub fn binary(ctx: &Ctx<'_>, op: BinaryOp, x: Tensor, y: Tensor, z: Tensor) -> R
     })
 }
 
-/// `x = √x`, in place.
 pub fn sqrt(ctx: &Ctx<'_>, x: Tensor) -> Result<(), Error> {
     const OP: &str = "elemwise.act";
     expect(OP, x, &[Dtype::Bf16, Dtype::F32])?;

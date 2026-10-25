@@ -1,7 +1,4 @@
-//! engine-cuda's twin gate, on the xla engine: a text lane's context input is
-//! merged straight into the stream beside an image lane's embedded latents, so
-//! the merge's rows for the text lane are landed from the input before the
-//! walk.
+//! engine-cuda's twin gate on xla: a merged context input lands its rows before the walk.
 
 use crate::common_dit;
 

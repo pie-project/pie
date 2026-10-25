@@ -4,8 +4,6 @@ use eta_ir::registry::{EngineCaps, Graph, Phase, Stage};
 use eta_ir::types::{Dtype, Literal, Shape};
 use eta_ir::validate::{Direction, ReadinessEntry, bind};
 
-/// Two guest inputs: the prologue puts the first before the forward reads
-/// it, nothing touches the second.
 #[test]
 fn an_input_the_prologue_puts_waits_for_room() {
     let latent = ChannelDecl {

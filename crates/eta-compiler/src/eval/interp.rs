@@ -208,8 +208,7 @@ pub struct PassInputs {
     pub logits: Option<Value>,
     pub mtp_logits: Option<Value>,
     pub mtp_drafts: Option<Value>,
-    /// Per lane of the pass, what `hidden(lane)`, `velocity(lane)` and
-    /// `pixels(lane)` read.
+    /// Per lane of the pass.
     pub hidden: Vec<Value>,
     pub velocity: Vec<Value>,
     pub pixels: Vec<Value>,

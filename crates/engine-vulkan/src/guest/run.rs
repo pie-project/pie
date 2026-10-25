@@ -26,9 +26,7 @@ pub struct OnDevice<'a> {
     session: &'a mut Session,
     widen: &'a Widen,
     logits: Option<Readout<'a>>,
-    /// Each lane of the pass's own readout rows (`velocity(k)`, `hidden(k)`).
     lanes: Vec<Option<Readout<'a>>>,
-    /// Each lane of the pass's pixels (`pixels(k)`).
     pixels: Vec<Option<Readout<'a>>>,
 
     ran: Vec<usize>,

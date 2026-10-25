@@ -55,7 +55,6 @@ pub fn tanh(f: &mut Func, x: Operand, o: Landing) -> Result<Val, Error> {
     unary(f, "elemwise.act", x, o, |f, v| Ok(f.tanh(v)))
 }
 
-/// `o = √x`. Reference: kernels-metal `act_sqrt`.
 pub fn sqrt(f: &mut Func, x: Operand, o: Landing) -> Result<Val, Error> {
     unary(f, "elemwise.act", x, o, |f, v| Ok(f.sqrt(v)))
 }
@@ -98,13 +97,11 @@ pub fn mul(f: &mut Func, x: Operand, y: Operand, z: Landing) -> Result<Val, Erro
     binary(f, "elemwise.binary", x, y, z, |f, a, b| Ok(f.mul(a, b)?))
 }
 
-/// `z = x / y`. Reference: kernels-metal `binary_div`.
 pub fn div(f: &mut Func, x: Operand, y: Operand, z: Landing) -> Result<Val, Error> {
     binary(f, "elemwise.binary", x, y, z, |f, a, b| Ok(f.div(a, b)?))
 }
 
-/// `z = x - y·floor(x / y)`: floored, as Python's `%`. Reference:
-/// kernels-metal `binary_mod`.
+/// Floored, as Python's `%`.
 pub fn modulo(f: &mut Func, x: Operand, y: Operand, z: Landing) -> Result<Val, Error> {
     binary(f, "elemwise.binary", x, y, z, |f, a, b| {
         let q = f.div(a, b)?;

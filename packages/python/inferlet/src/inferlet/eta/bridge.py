@@ -505,8 +505,7 @@ _SITE_BITS = {"q": 1, "k": 2, "v": 4, "o": 8, "gate_up": 16, "down": 32}
 
 
 class ForwardPass:
-    """The forward-pass builder over `pie:inferlet/forward`: what a model's
-    lanes bind, the switches they run under, and the program the fires run.
+    """The forward-pass builder over `pie:inferlet/forward`.
 
     Attach stage bodies with `epilogue(fn)` (also usable as a decorator),
     bind the lanes' working sets with `state([ws], geometry)`, and
@@ -517,7 +516,6 @@ class ForwardPass:
     def __init__(self) -> None:
         self.wit = _wit_forward.ForwardPass()
         self._ports: list[tuple[Port, Channel]] = []
-        # Each lane's bound inputs, by lane.
         self._inputs: list[tuple[int, str, Channel]] = []
         self._stages: list[tuple[Stage, Callable[[], None]]] = []
         self._vocab = _wit_model.output_vocab_size()
@@ -528,7 +526,6 @@ class ForwardPass:
         # Keeps the bound working sets alive while the pass is bound.
         self._lanes: list[WorkingSet] = []
         self._fold_all: Channel | None = None
-        # Each lane's set switches, by lane.
         self._switches: list[tuple[int, str, str]] = []
 
     # -- ports ----------------------------------------------------------------
@@ -564,8 +561,7 @@ class ForwardPass:
         self._ports.append((Port.READOUT, indices))
 
     def media(self, lane: int, spans: Sequence[Image | Audio]) -> None:
-        """Carry the payloads of the `media.Image` / `media.Audio` spans lane
-        `lane`'s tokens carry, order-matched to their placeholder token runs."""
+        """Lane `lane`'s media span payloads, in placeholder order."""
         wrapped = []
         for s in spans:
             if isinstance(s, Audio):
@@ -615,17 +611,14 @@ class ForwardPass:
     # -- switches and inputs ---------------------------------------------------
 
     def switch(self, lane: int, name: str, value: str) -> None:
-        """Set lane `lane`'s model switch `name` to `value`
-        (`model.switches()`): which path that lane runs. Before the program."""
+        """Set lane `lane`'s model switch `name` to `value`, before the program."""
         if self._program_attached:
             raise InferletError("forward pass program is already attached")
         _wit(self.wit.switch, int(lane), name, value, what="switch")
         self._switches.append((int(lane), name, value))
 
     def switched(self) -> bool:
-        """Whether a switch of this pass is off its model's default: a path a
-        model runs apart from its default one (a canvas a block-diffusion
-        text redraws whole) posts one fire at a time."""
+        """Whether a switch is off its default; such a pass posts one fire at a time."""
         if not self._switches:
             return False
         declared = {d.name: d.values for d in _wit_model.switches()}
@@ -634,9 +627,7 @@ class ForwardPass:
         )
 
     def input(self, lane: int, name: str, ch: Channel) -> None:
-        """Bind `ch` to lane `lane`'s model input `name`
-        (`model.lane(...).inputs`), read at every submit from its committed
-        cell. The host validates the shape."""
+        """Bind `ch` to lane `lane`'s model input `name`, read from its committed cell."""
         if self._program_attached:
             raise InferletError("forward pass program is already attached")
         if any(at == lane and bound == name for at, bound, _ in self._inputs):
@@ -651,8 +642,7 @@ class ForwardPass:
         _wit(self.wit.group, int(lane), int(id), what="group")
 
     def mask(self, rows: Channel) -> None:
-        """Per row of the pass, the rows it attends: kv slots on a pass whose
-        lanes read kv, its attention group's rows on one whose lanes do not."""
+        """Per row, the kv slots it attends, or its attention group's rows without kv."""
         self._ensure_ports_available([Port.ATTN_MASK])
         _wit(self.wit.mask, rows._wit(), what="mask")
         self._ports.append((Port.ATTN_MASK, rows))
@@ -762,8 +752,7 @@ class ForwardPass:
         builder = Builder(self._vocab, self._page_size)
         for port, ch in self._ports:
             builder.bind_port(port, ch._dsl)
-        # A channel several lanes read (a CFG step's one timestep) is one
-        # input of the program.
+        # A channel several lanes read is one program input.
         listed: list[Channel] = []
         for _, _, ch in self._inputs:
             if not any(seen is ch for seen in listed):

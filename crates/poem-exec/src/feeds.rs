@@ -1,15 +1,10 @@
-//! The inputs a model's guest feeds, as a loaded plan reads them: each guest
-//! input's seat and the classes that read it, the row selections its packings
-//! are cut by, and the merges whose arm is a guest input.
-
 use poem_compiler::CompiledModel;
 use poem_ir::{
     ClassSet, Def, Dtype, GeomKind, InputAxis, InputDecl, LaneClass, LaneClasses, Operands as _,
     Readout, ReadoutKind, RuntimeInput, Selection, Trace, ValueId,
 };
 
-/// A guest input as a fire lands it: `width` values of `dtype` a lane, a row
-/// or a voxel.
+/// A guest input as a fire lands it: `width` values of `dtype` per lane, row or voxel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Seat {
     pub id: u32,
@@ -35,8 +30,7 @@ impl Seat {
     }
 }
 
-/// A merge whose arm is a guest input, landed in the merge's column before the
-/// walk on the rows `select` admits.
+/// A merge over a guest input, landed in the merge's column before the walk.
 #[derive(Debug, Clone, Copy)]
 pub struct MergedInput {
     pub merge: ValueId,
@@ -46,11 +40,9 @@ pub struct MergedInput {
 
 #[derive(Debug, Clone, Default)]
 pub struct Feeds {
-    /// Each guest input the plan reads, and the classes reading it.
     pub inputs: Vec<(Seat, ClassSet)>,
     pub selections: Vec<Selection>,
-    /// The (query, key) packings each group-packed `attention.ragged` reads:
-    /// the pairs a stated attention mask is staged for.
+    /// The (query, key) packings a stated attention mask is staged for.
     pub ragged: Vec<(Selection, Selection)>,
     pub merged: Vec<MergedInput>,
     /// Merges over a runtime input no fire can land.
@@ -144,7 +136,6 @@ impl Feeds {
         feeds
     }
 
-    /// The seat of guest input `id`, if the plan reads it.
     #[must_use]
     pub fn seat(&self, id: u32) -> Option<Seat> {
         self.inputs
@@ -153,7 +144,6 @@ impl Feeds {
             .map(|(seat, _)| *seat)
     }
 
-    /// The classes reading guest input `id`.
     #[must_use]
     pub fn readers(&self, id: u32) -> Option<&ClassSet> {
         self.inputs
@@ -173,8 +163,6 @@ impl Feeds {
             .collect()
     }
 
-    /// Every guest input the trace names, in id order, with the lane words
-    /// whose class reads it.
     #[must_use]
     pub fn decls(&self, trace: &Trace, compiled: &CompiledModel) -> Vec<InputDecl> {
         let table = &compiled.classes;
@@ -204,7 +192,6 @@ impl Feeds {
     }
 }
 
-/// The classes running a region that reads `value`.
 #[must_use]
 pub fn reader_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> ClassSet {
     let mut inputs: Vec<ValueId> = Vec::new();
@@ -228,8 +215,7 @@ pub fn reader_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -
     classes
 }
 
-/// Each class of the plan as a lane landing in it is told of it; a class's
-/// readout is its first export seam of `out`, `velocity`, `hidden`, `pixels`.
+/// A class's readout is its first export seam of `out`, `velocity`, `hidden`, `pixels`.
 #[must_use]
 pub fn lane_classes(trace: &Trace, compiled: &CompiledModel) -> LaneClasses {
     let kv = classes_reading(trace, compiled, |def| {
@@ -326,7 +312,6 @@ pub fn lane_classes(trace: &Trace, compiled: &CompiledModel) -> LaneClasses {
     }
 }
 
-/// The classes running a region one of whose nodes `wanted` holds of.
 #[must_use]
 pub fn classes_running(
     trace: &Trace,
@@ -350,8 +335,6 @@ pub fn classes_running(
     classes
 }
 
-/// The classes running a region one of whose nodes reads a value whose
-/// definition `wanted` holds of.
 #[must_use]
 pub fn classes_reading(
     trace: &Trace,

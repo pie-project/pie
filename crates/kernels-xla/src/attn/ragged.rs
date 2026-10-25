@@ -18,9 +18,7 @@ use crate::tensor::{Landing, Operand, Stored};
 pub enum RaggedMask<T> {
     /// Segments only (poem_ir `None` and `GroupBlockDiagonal`).
     Segments,
-    /// Segment `s`'s pair `(q, k)` (indexed within the segment) is admitted
-    /// where bit `q · kv_len + k` of `bits` (u8), from byte `indptr[s]`
-    /// (i32), is set (kernels-cuda's custom-mask arm).
+    /// Segment `s`'s pair `(q, k)` is kept where bit `q · kv_len + k` from byte `indptr[s]` is set.
     Custom { bits: T, indptr: T },
     /// Adds `table[h, clamp(k − q + max_len − 1)]` (f32, `[q_heads, 2·max_len
     /// − 1]`) to the scaled logit, `k`/`q` indexed within the segment.

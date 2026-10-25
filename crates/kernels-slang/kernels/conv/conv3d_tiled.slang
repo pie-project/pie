@@ -41,9 +41,7 @@ struct Params {
     int clips;
     int rows_out;
     uint has_bias;
-    // The rows `grid` and `o_grid` address `x`'s and `o`'s row 0 at: a
-    // window of a segmented fire starts its tensors at its own rows while
-    // the fire's grids hold fire-wide ones.
+    // `x`'s and `o`'s row 0 in the grids' fire-wide rows (a segmented fire's window starts later).
     int x_base;
     int o_base;
 };

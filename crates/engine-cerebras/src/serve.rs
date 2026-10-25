@@ -154,11 +154,8 @@ pub struct Seated<'a> {
 
     pub media: Option<Media<'a>>,
 
-    /// The guest inputs this lane feeds, cells already read off its
-    /// channels.
     pub inputs: &'a [InputCell<'a>],
 
-    /// The lane's attention group, for grouped attention.
     pub group: Option<u32>,
 
     /// The lane keeps no KV (a denoiser or decoder lane): it holds no
@@ -505,9 +502,8 @@ impl Shell {
                 poem_ir::Operation::Attn(poem_ir::Attn::Prefill { causal: false, .. })
             )
         });
-        // Mask bits are staged once per lane with causality baked in, and a
-        // wide class stages them unclipped: a causal masked prefill there
-        // would see future keys.
+        // Mask bits are staged per lane with causality baked in, unclipped in a wide class:
+        // a causal masked prefill there would see future keys.
         let causal_masked = classes_running(&boot.trace, &compiled, |op| {
             matches!(
                 op,
@@ -835,37 +831,27 @@ impl Shell {
         self.readout_seam
     }
 
-    /// The width of the plan's velocity export, when it plants one.
-    #[must_use]
-    pub fn velocity_width(&self) -> Option<u32> {
-        self.dit.velocity_width()
-    }
-
     /// Whether the plan exports pixels, and the pixel row's width.
     #[must_use]
     pub fn pixels_facts(&self) -> (bool, u32) {
         self.dit.pixels_facts()
     }
 
-    /// The voxel input's element, when the plan reads one.
     #[must_use]
     pub fn voxel_element(&self) -> Option<Dtype> {
         self.dit.voxel_element()
     }
 
-    /// Guest input `id`'s seat, when the plan reads it.
     #[must_use]
     pub fn input_seat(&self, id: u32) -> Option<poem_exec::feeds::Seat> {
         self.dit.seat(id)
     }
 
-    /// Every guest input the trace names, and which lane words read it.
     #[must_use]
     pub fn input_decls(&self) -> Vec<poem_ir::InputDecl> {
         self.dit.feeds().decls(&self.trace, &self.compiled)
     }
 
-    /// This load's classes and what each runs.
     #[must_use]
     pub fn classes(&self) -> poem_ir::LaneClasses {
         poem_exec::feeds::lane_classes(&self.trace, &self.compiled)
@@ -1385,8 +1371,7 @@ impl Shell {
             });
             demand_slots = demand_slots.max(state_slot + 1);
 
-            // A kv-less lane's mask is over its attention group's rows: the
-            // group-packed attention takes it, not the paged prefill's.
+            // A kv-less lane's mask is over its attention group's rows, for the group-packed attention.
             let kv_mask = seated.mask.filter(|_| !seated.kv_less);
             let runs_masked_arm = self.masked.contains(row.class as usize);
             if kv_mask.is_some() && self.masked.is_empty() {
@@ -2183,7 +2168,7 @@ impl Shell {
             .with_pack(pack_len)
             .with_unified(self.unified.clone());
         let place = At::new();
-        crate::dit::land(&tracer, &self.handles, slots, lands)?;
+        crate::dit::land(lands)?;
         let probed = {
             let mut run = Run::new(
                 &tracer,

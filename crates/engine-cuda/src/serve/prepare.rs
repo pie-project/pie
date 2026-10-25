@@ -648,8 +648,7 @@ impl FrameShell for Shell {
             });
         }
         let voxel_tables = if composition.voxel_rows() == 0 {
-            // A plan whose token rows read their cells (`conv::cells`) reads
-            // the token grid on a fire of no clips too: one empty clip.
+            // Token rows reading their cells need a token grid even with no clips: one empty clip.
             match self.voxels.as_ref() {
                 Some(store) if store.seat().token_patch.is_some() => crate::voxels::Tables {
                     grid: vec![0; 4],
@@ -846,8 +845,7 @@ impl FrameShell for Shell {
                 (Some(_), None) => std::borrow::Cow::Borrowed(&[][..]),
                 (None, None) => std::borrow::Cow::Borrowed(seated.window),
             });
-            // A kv-less lane's mask is over its attention group's rows: the
-            // group-packed attention takes it, not the paged prefill's.
+            // A kv-less lane's mask goes to the group-packed attention, not the paged prefill.
             let masking = if seated.kv_less {
                 None
             } else {
@@ -1676,8 +1674,7 @@ fn readout_extent(rows: u32, bucket: u32, readouts: usize) -> u64 {
 }
 
 impl Shell {
-    /// The custom mask each group-packed attention of this fire applies,
-    /// out of the kv-less lanes' stated masks: none when no lane states one.
+    
     fn group_masks_of(
         &self,
         lanes: &[super::lanes::Seated<'_>],

@@ -1,7 +1,4 @@
-// `eta.diffusion` — a block-diffusion text's reference sampler pieces (which
-// canvas positions to accept, at what temperature), a port of
-// `inferlet::eta::diffusion`. The pass itself is an ordinary `ForwardPass`
-// set to the model's canvas path by `switch`.
+// `eta.diffusion` — a port of `inferlet::eta::diffusion`'s block-diffusion sampler pieces.
 
 import { Dtype } from './ir.js';
 import { Tensor, and, cast, cumsum, eq, iota, le, lt, neg, reduceSum, scatterSet, sortDesc } from './value.js';

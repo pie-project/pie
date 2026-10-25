@@ -136,16 +136,14 @@ fn chosen(select: Selection, lanes: &[LaneRow], group_of_lane: &[i32]) -> Vec<(i
     chosen
 }
 
-/// One lane's stated attention mask: per guest row of the lane, the columns
-/// of its attention group it attends, as ascending ranges. A group's columns
-/// are its lanes' guest rows, lane after lane in the pass's order.
+/// Per guest row, the ascending column ranges of the attention group it attends; a group's
+/// columns are its lanes' guest rows, lane after lane in the pass's order.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LaneMask {
     pub rows: Vec<Vec<std::ops::Range<u64>>>,
 }
 
-/// How a lane's rows stand in its mask: as many guest rows as it states,
-/// and, for a voxel lane, the guest row (voxel) each token row attends as.
+/// `of_token`: for a voxel lane, the guest row (voxel) each token row attends as.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GuestRows {
     pub count: u64,
@@ -161,10 +159,8 @@ impl GuestRows {
     }
 }
 
-/// A lane's guest rows. A voxel lane's token rows (after the model's
-/// patchify) are its clips' patches of `patch` voxels, in (t, h, w) row-major
-/// order from its first token row, clip after clip: each attends as its
-/// patch's first voxel. Any other lane's are its rows.
+/// A voxel lane's token rows are its clips' patches of `patch` voxels, (t, h, w) row-major,
+/// clip after clip; each attends as its patch's first voxel.
 pub fn guest_rows(
     lane: &LaneRow,
     clips: Option<&[[u32; 3]]>,
@@ -217,19 +213,14 @@ pub fn guest_rows(
     })
 }
 
-/// The custom mask one ragged attention over packings `q` (its queries) and
-/// `kv` (its keys) applies: for each attention group, a bit a (query, key)
-/// pair of its rows there, query-major, group `g`'s from byte `indptr[g]`.
+/// One bit per (query, key) pair of a group's rows, query-major, group `g` from byte `indptr[g]`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GroupMask {
     pub bits: Vec<u8>,
     pub indptr: Vec<i32>,
 }
 
-/// The mask the lanes' stated masks (`masks[source]`, each over its group's
-/// guest rows; `guests[source]` how its rows stand there) make of a ragged
-/// attention over packings `q` and `kv`: none when no lane in it states one.
-/// A lane stating none attends every row of its group.
+/// `None` when no lane states a mask; a lane stating none attends every row of its group.
 pub fn group_mask(
     lanes: &[LaneRow],
     group_of_lane: &[i32],
@@ -257,8 +248,7 @@ pub fn group_mask(
             }
         }
     }
-    // Where each lane's guest rows start among its group's: its group's
-    // lanes, in the pass's order (their sources'), before it.
+    // A lane's guest rows start after those of its group's earlier lanes.
     let offset = |at: usize| -> u64 {
         let group = group_of_lane.get(at).copied().unwrap_or(0);
         (0..lanes.len())
@@ -274,7 +264,6 @@ pub fn group_mask(
     let mut indptr = Vec::with_capacity(groups + 1);
     for g in 0..groups {
         indptr.push(i32::try_from(bits.len()).unwrap_or(i32::MAX));
-        // The group's key rows, as the columns of its guest rows they are.
         let keys: Vec<u64> = kv_chosen
             .iter()
             .filter(|&&(group, _)| group as usize == g)
@@ -352,7 +341,6 @@ mod tests {
     }
 
     fn a_group_mask_runs_over_its_group_in_lane_order() {
-        // Two groups (CFG): lanes 0, 1 in group 0, lanes 2, 3 in group 1.
         let lanes = [
             row(0, IMAGE, 0, 2),
             row(1, TEXT, 2, 1),
@@ -371,8 +359,6 @@ mod tests {
             .iter()
             .map(|lane| guest_rows(lane, None, None).unwrap())
             .collect();
-        // Lane 0's first row attends only the text row (column 2) of its
-        // group; its second attends everything.
         let image = LaneMask {
             rows: vec![vec![2..3], vec![0..3]],
         };

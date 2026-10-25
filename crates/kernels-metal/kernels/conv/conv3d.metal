@@ -90,9 +90,7 @@ template <typename T>
   const int n = int(tgid.x * simds + simd_gid);
   if (row >= g.rows_out || n >= g.c_out) return;
 
-  // `x_base` / `o_base`: the rows `grid` and `o_grid` address `x`'s and
-  // `o`'s row 0 at (a window of a segmented fire starts its tensors at its
-  // own rows while the fire's grids hold fire-wide ones).
+  // `x_base` / `o_base`: `x`'s and `o`'s row 0 in the grids' fire-wide rows.
   SpatialClip og;
   const int fire_row = row + o_base;
   const int l = clip_of(o_grid, g.clips, fire_row, og);

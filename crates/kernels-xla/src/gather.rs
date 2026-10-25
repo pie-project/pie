@@ -712,8 +712,6 @@ pub fn split_rows(
     Ok((l, r))
 }
 
-/// `xs` side by side, a row each's columns after the one before's.
-/// kernels-cuda `gather::concat_cols`.
 pub fn concat_cols(f: &mut Func, xs: &[Operand], y: Landing) -> Result<Val, Error> {
     const OP: &str = "gather.concat_cols";
     let mut width = 0u64;

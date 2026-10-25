@@ -53,8 +53,6 @@ pub fn golden_container(name: &str) -> TraceContainer {
     eta_ir::container::decode(&unhex(line)).unwrap_or_else(|e| panic!("{name}: {e:?}"))
 }
 
-/// What a program is bound against: the width its lane reads logits out
-/// at, the model's graph and the engine's sinks.
 #[derive(Clone, Copy, Debug)]
 pub struct Served {
     pub vocab: u32,

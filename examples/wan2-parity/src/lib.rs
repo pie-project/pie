@@ -1,29 +1,10 @@
-//! The pie half of the Wan 2.2 miniature golden. Hands a `wan22-mini-*`
-//! row exactly what `scripts/imagegen/wan22_golden.py --mini` handed
-//! diffusers' `WanTransformer3DModel` — the latent (the VAE's own
-//! `[t, h, w, C]`, on the voxel axis), the context rows and the timestep —
-//! and reads back the velocity the head predicts on the same voxels, as
-//! JSON `scripts/imagegen/wan22_parity.py` turns into an `.npz` under the
-//! golden's own key names. The model patchifies and computes each row's
-//! rotary position in its graph.
+//! The pie half of the Wan 2.2 miniature golden: `scripts/imagegen/wan22_golden.py --mini`'s
+//! inputs in, the velocity on the same voxels out as JSON for `wan22_parity.py`.
 //!
-//! # TWO OR THREE LANES, ONE GROUP, ONE PASS
-//!
-//! `wan_2`'s `denoise` reading runs on two values of its `stream` switch:
-//! the context lane (`context`, the `context` input) and one or more video
-//! lanes (`video`: `latents`, `timestep`). The golden's scalar-timestep
-//! forward is one video lane; its TI2V per-token forward (the first latent
-//! frame at timestep 0, the rest at `t`) is TWO video lanes of one group,
-//! one clip each: frame 0, and frames `1..`. A lane computes positions
-//! from its own clip, so the second lane's frames would restart at `t = 0`;
-//! the case then states the reference's positions and both video lanes take
-//! them (`positions = given`).
-//!
-//! The step is ONE pass: lane 0 is the context lane, then the conditioning
-//! video lane when the case cuts one, then the main video lane, all in
-//! attention group 0. Every video lane reads out, each into its own channel
-//! in the pass's one epilogue; the answer is the clip's voxels in frame
-//! order.
+//! One pass, attention group 0: lane 0 the context, then the conditioning video
+//! lane when the case cuts one (TI2V's frame 0 at timestep 0), then the main video
+//! lane. A lane's positions restart at its own clip, so with two video lanes the
+//! case states the reference's positions (`positions = given`).
 use inferlet::latent::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -56,14 +37,8 @@ impl Input {
     }
 }
 
-/// One batch element of the reference's fixed inputs, flattened row-major:
-/// the latent `[frames, height, width, channels]`, the context rows, one
-/// timestep, and how many leading frames are the conditioning frame's (0
-/// for the scalar-timestep forward).
-///
-/// Every float rectangle comes either as a JSON array or, when JSON's ten
-/// bytes a number would put the case past what argv carries, as `*_b64`:
-/// standard base64 of the same numbers as little-endian `f32`.
+/// The reference's inputs, row-major. A float rectangle too big for argv as JSON
+/// comes as `*_b64`: base64 of little-endian `f32`s.
 #[derive(Deserialize)]
 struct Case {
     #[serde(default)]
@@ -77,17 +52,14 @@ struct Case {
     /// The first `cond_frames` frames form a second video lane at timestep 0.
     #[serde(default)]
     cond_frames: u32,
-    /// `[context_rows, context_width]` — but only the LEADING rows need be
-    /// given: the rest are hard zeros this guest writes (the reference's
-    /// zero pad to 512).
+    /// `[context_rows, context_width]`; rows not given are the reference's zero pad.
     #[serde(default)]
     context: Vec<f32>,
     #[serde(default)]
     context_b64: Option<String>,
     context_rows: u32,
     context_width: u32,
-    /// With `cond_frames`: every patch row's `(t, h, w)`, `[rows, 3]` in the
-    /// clip's row-major patch order, which both video lanes take.
+    /// With `cond_frames`: every patch row's `(t, h, w)`, `[rows, 3]`.
     #[serde(default)]
     positions: Vec<f32>,
     #[serde(default)]
@@ -161,8 +133,7 @@ impl Case {
 
 #[derive(Serialize)]
 struct Output {
-    /// `[frames · height · width, channels]`: the velocity on the clip's
-    /// voxels, frame-major.
+    /// `[frames · height · width, channels]`, frame-major.
     velocity: Vec<f32>,
     frames: u32,
     height: u32,
@@ -170,12 +141,10 @@ struct Output {
     channels: u32,
 }
 
-/// The readout's velocity width.
 struct Dims {
     velocity_width: u32,
 }
 
-/// The lane `stream` of `reading`, checked to read exactly `binds`.
 fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::LaneDecl> {
     let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
     if lane.state || lane.embeds {
@@ -196,7 +165,6 @@ fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::La
     Ok(lane)
 }
 
-/// Checks the context and video lanes and reads the velocity width.
 fn dims(reading: &str, given: bool) -> Result<Dims> {
     lane_reading(reading, "context", &["context"])?;
     let video = if given {
@@ -227,8 +195,7 @@ fn dims(reading: &str, given: bool) -> Result<Dims> {
     Ok(Dims { velocity_width })
 }
 
-/// Binds lane `lane` of `pass` as one video lane over frames `[from, to)`
-/// of the case at `timestep`, and answers the voxels it carries.
+/// Binds `lane` as a video lane over frames `[from, to)`; answers its voxels.
 #[allow(clippy::too_many_arguments)]
 fn video_lane(
     pass: &ForwardPass,
@@ -253,7 +220,6 @@ fn video_lane(
     pass.input(lane, "latents", &x)?;
     pass.input(lane, "timestep", &t)?;
     if !case.positions.is_empty() {
-        // Patch rows per frame: the clip's patch grid over one frame.
         let rows = |frames: u32| (case.positions.len() as u32 / 3) / case.frames * frames;
         let (a, b) = (rows(from) as usize * 3, rows(to) as usize * 3);
         pass.switch(lane, "positions", "given")?;
@@ -264,13 +230,10 @@ fn video_lane(
     Ok((to - from) * plane)
 }
 
-/// One denoise step: the context lane and one or two video lanes, one
-/// group, one pass, the velocity of every video voxel.
 async fn step(case: &Case, dims: &Dims, reading: &str) -> Result<Vec<f32>> {
     let group = 0;
     let pass = ForwardPass::new();
 
-    // Lane 0, the context lane.
     pass.switch(0, "reading", reading)?;
     pass.switch(0, "stream", "context")?;
     pass.group(0, group)?;
@@ -281,8 +244,6 @@ async fn step(case: &Case, dims: &Dims, reading: &str) -> Result<Vec<f32>> {
     .named("context");
     pass.input(0, "context", &ctx)?;
 
-    // The conditioning lane (TI2V's clean first frame, timestep 0), if the
-    // case cuts one, and the main lane: each video lane's (lane, voxels).
     let mut videos: Vec<(u32, u32)> = Vec::new();
     if case.cond_frames > 0 {
         let voxels = video_lane(

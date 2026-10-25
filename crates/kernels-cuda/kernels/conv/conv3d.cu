@@ -29,9 +29,7 @@ struct ConvGeom {
     int lanes;
     int rows_out;
 
-    // The rows `grid` and `o_grid` address `x`'s and `o`'s row 0 at: a
-    // window of a segmented fire starts its tensors at its own rows while
-    // the fire's grids hold fire-wide ones.
+    // The rows the fire-wide grids address `x`'s and `o`'s row 0 at.
     int x_base;
     int o_base;
 };

@@ -34,8 +34,7 @@ impl Segment {
     }
 }
 
-/// `base`: the row `grid` addresses the rectangles' row 0 at, nonzero in a
-/// window of a segmented fire whose grid holds fire-wide rows.
+/// `base`: the row `grid` addresses the rectangles' row 0 at.
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
     ctx: &Ctx,

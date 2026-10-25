@@ -206,15 +206,12 @@ pub enum RuntimeInput {
         select: Selection,
     },
     Grid,
-    /// `[Clips, 4]` i32, each clip's `[t / p0, h / p1, w / p2, first token
-    /// row]`: a voxel lane's token rows are its clips' patches in (t, h, w)
-    /// row-major order, then only pad rows.
+    /// `[Clips, 4]` i32, each clip's `[t / p0, h / p1, w / p2, first token row]`; a voxel lane's
+    /// token rows are its clips' patches, (t, h, w) row-major, then pad rows.
     TokenGrid {
         p: [u32; 3],
     },
-    /// An input the model names and its guest binds: entry `id` of
-    /// [`crate::Trace::inputs`], `width` values of `dtype` per lane, row or
-    /// voxel of the fire.
+    /// Entry `id` of [`crate::Trace::inputs`].
     Guest {
         id: u32,
         axis: InputAxis,
@@ -223,8 +220,6 @@ pub enum RuntimeInput {
     },
 }
 
-/// What one entry of a guest input belongs to: its lane, a row of its lane,
-/// or a voxel of its lane's clip.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum InputAxis {
     Lane,
@@ -242,7 +237,6 @@ impl InputAxis {
         }
     }
 
-    /// The fire's extent this axis runs over.
     #[must_use]
     pub fn dim(self) -> Dim {
         match self {

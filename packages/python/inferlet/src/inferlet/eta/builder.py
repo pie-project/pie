@@ -189,8 +189,7 @@ class Builder:
         self.ports.append((port, source))
 
     def bind_input(self, source: DslChannel) -> None:
-        """List `source` as a channel the forward reads as a guest model
-        input, at the descriptor phase like a port."""
+        """List `source` as a guest model input, read at the descriptor phase."""
         source.note_desc_claim(False)
         self.inputs.append(source)
 

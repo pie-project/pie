@@ -305,9 +305,6 @@ def mlp_sublayer(m, at, stem, x, mlp, mods, gate, lanes):
     return ops.elemwise.gated_residual_add(x, gate, y, lanes)
 
 def turn_positions(arm):
-    """Each joint row's rope position: a text row `(j, 0, 0)`, `j` its row
-    in the lane; an image row its patch's `(t, h, w)`. A lane whose
-    `positions` switch says `given` reads the guest's instead."""
     given = switch_is("positions", "given")
     computed, _ = ops.gather.split_rows(ops.conv.cells(arm.token_grid([1, PATCH, PATCH]), arm.positions(), 0), ROPE_AXES)
     return merge([arm.on(given).input("positions", dtype.f32, "row", ROPE_AXES), computed.on(~given)])

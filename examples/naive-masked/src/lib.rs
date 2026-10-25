@@ -211,7 +211,7 @@ async fn main(input: Input) -> Result<Output> {
                 // (a seeded channel read — the causal half evolves, the
                 // document block is a constant of the request).
                 let new_mask = if doc_start > 0 {
-                    reshape(and(&reshape(new_mask, [span]), &doc_row.read()), [1, span])
+                    reshape(and(reshape(new_mask, [span]), doc_row.read()), [1, span])
                 } else {
                     new_mask
                 };

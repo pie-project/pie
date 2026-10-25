@@ -11,9 +11,7 @@ fn element(op: &'static str, dtype: dtype::Dtype) -> Result<&'static str, Error>
     Ok(dtype_dispatch!(op, dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" }))
 }
 
-/// `bases` (here and in the other resamplers): the rows `grid` and `o_grid`
-/// address `x`'s and `o`'s row 0 at (`[x, o]`), nonzero in a window of a
-/// segmented fire whose grids hold fire-wide rows.
+/// `bases`: the rows `grid` and `o_grid` address `x`'s and `o`'s row 0 at (`[x, o]`).
 #[allow(clippy::too_many_arguments)]
 pub fn upsample_nearest(
     ctx: &Ctx,

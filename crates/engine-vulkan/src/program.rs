@@ -256,8 +256,8 @@ impl Plane {
             })?;
         let ring = &seat.inst.channels[dense];
         let dtype = eta_exec::concrete_dtype(seat.plan.package.channels[dense].dtype);
-        // The forward reads the oldest cell. The device's kept cell is the
-        // newest put, so it is the one read only when the ring holds no other.
+        // The forward reads the oldest cell; the kept device cell is the newest, so it is
+        // read only when the ring holds no other.
         #[cfg(feature = "vulkan")]
         if ring.size() <= 1
             && let Some(cell) = seat.session.kept_cell(dense as u32)
@@ -449,7 +449,6 @@ impl Plane {
             .is_some_and(|seat| seat.plan.prologue_runs())
     }
 
-    /// Runs `instance`'s stages at `at`, to their commit.
     #[allow(clippy::too_many_arguments)]
     pub fn fire(
         &mut self,

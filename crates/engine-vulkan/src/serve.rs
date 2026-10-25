@@ -169,7 +169,6 @@ pub struct Seated<'a> {
     pub pages: &'a [u32],
 
     pub held: Option<u32>,
-    /// The lane binds no KV state: it neither reads nor extends its slot.
     pub kv_less: bool,
 
     pub mask: Option<&'a Masking>,
@@ -260,8 +259,6 @@ fn adapter_fact(classes: &poem_ir::ClassTable, corrected: &poem_ir::ClassSet) ->
     classes.adapter_fact(corrected)
 }
 
-/// A `pixels` plane and, when the load could walk one, its `conv.grid` chain
-/// from the fire's grid.
 struct PixelPlane {
     plane: ValueId,
     width: u32,
@@ -269,7 +266,6 @@ struct PixelPlane {
     chain: Option<Vec<poem_ir::GridRule>>,
 }
 
-/// The `conv.grid` rules from the fire's grid to `at`, in order.
 fn grid_chain(trace: &Trace, mut at: ValueId) -> Option<Vec<poem_ir::GridRule>> {
     let mut rules = Vec::new();
     loop {
@@ -300,11 +296,9 @@ struct ReadoutPlane {
     classes: poem_ir::ClassSet,
     width: u32,
     dtype: Dtype,
-    /// Whether the plane stands on the voxel axis: a lane reads its voxels.
     voxels: bool,
 }
 
-/// Whether `value` stands on the voxel axis.
 fn on_voxels(trace: &Trace, value: ValueId) -> bool {
     matches!(
         &trace.values[value.0 as usize].ty,
@@ -320,8 +314,7 @@ pub(crate) struct ReadSpan {
     rows: u32,
     plane: u32,
     at: u64,
-    /// On a voxel plane, the first of the lane's voxels: it reads them all,
-    /// in one run, and names no table entries.
+    /// On a voxel plane, the lane's first voxel: it reads all its voxels and no table entries.
     voxels: Option<u32>,
 }
 
@@ -1291,7 +1284,6 @@ impl Shell {
         &self.trace
     }
 
-    /// The guest inputs the loaded trace binds, by id (`Capabilities::inputs`).
     #[must_use]
     pub fn inputs(&self) -> Vec<poem_ir::InputDecl> {
         self.feeds.decls(&self.trace, &self.compiled)
@@ -1742,10 +1734,8 @@ impl Shell {
         Ok(Some((row.offset(), rect.rows, pixels)))
     }
 
-    /// Each lane's pixels in the read-back plane, by source lane: the byte it
-    /// starts at and its values. A lane reads pixels only where its class
-    /// writes them; its clips start where the plane's `conv.grid` chain,
-    /// replayed over the fire's grid, puts its first clip.
+    /// A lane's clips start where the plane's `conv.grid` chain, replayed over the fire's
+    /// grid, puts its first clip.
     fn pixel_spans(&self, p: &Prepared<'_>) -> Result<Vec<(u64, u32)>> {
         let Some((_, rows, pixels)) = self.pixel_rect(p)? else {
             return Ok(Vec::new());
@@ -2372,8 +2362,7 @@ impl Shell {
 
             tables.push(std::borrow::Cow::Borrowed(seated.pages));
 
-            // A kv-less lane's mask is over its attention group's rows: the
-            // group-packed attention takes it, not the paged prefill's.
+            // A kv-less lane's mask goes to its group-packed attention, not the paged prefill.
             let masking = seated.mask.filter(|_| !seated.kv_less);
             let runs_masked_arm = self.masked.contains(row.class as usize);
             if masking.is_some() && self.masked.is_empty() {
@@ -3117,7 +3106,6 @@ pub struct Prepared<'a> {
     input_copies: Vec<InputCopy<'a>>,
     merge_lands: Vec<MergeLand>,
     classes: Vec<usize>,
-    /// The fire's lanes as composed; `voxel_grid` is its grid (`t, h, w, offset` a clip).
     rows: Vec<LaneRow>,
     voxel_grid: Vec<i32>,
 
@@ -3174,9 +3162,6 @@ pub const READOUT_ROWS_PER_LANE: u32 = 8;
 
 type ReadoutTable = (Vec<i32>, Vec<ReadSpan>);
 
-/// `plane_of(class)` is the plane a lane reads, whether it reads every row, a
-/// row's bytes, and whether the plane's rows are voxels (a lane's rows there
-/// are its voxels).
 fn readout_table(
     composition: &Composition,
     lanes: &[Seated<'_>],
@@ -3298,8 +3283,7 @@ impl engine::frame::Shell for Shell {
         Self: 'a,
     {
         let fed = self.feed(&prepared)?;
-        // A fire's custom masks sit in a buffer that grows: a recording would
-        // keep the one it outgrew.
+        // The custom-mask buffer grows: a recording would keep the one it outgrew.
         let key = (self.recorder.records() && prepared.bindings.group_masks.is_empty())
             .then(|| self.record_key(&prepared));
 
@@ -3632,9 +3616,6 @@ fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
 }
 
-/// Appends the token side of a clip's cell (its box in tokens of patch `p`,
-/// then its first row) and returns the row past it, or `None` when the box
-/// does not divide by the patch.
 fn token_cell(grid: &mut Vec<i32>, boxed: [u32; 3], p: [u32; 3], row: u32) -> Option<u32> {
     if p.contains(&0) || (0..3).any(|k| !boxed[k].is_multiple_of(p[k])) {
         return None;
@@ -3659,9 +3640,6 @@ fn program(at: &'static str, why: String) -> Fault {
 }
 
 impl Shell {
-    /// The custom mask each group-packed attention of this fire applies,
-    /// out of the kv-less lanes' stated masks: none when no lane states one
-    /// (engine-cuda `serve/prepare.rs::group_masks_of`).
     fn group_masks_of(
         &self,
         lanes: &[Seated<'_>],

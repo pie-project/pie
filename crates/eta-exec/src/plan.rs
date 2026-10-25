@@ -54,8 +54,7 @@ pub struct ExecPlan {
 }
 
 impl ExecPlan {
-    /// Whether the prologue takes or puts a channel, and so runs and commits
-    /// on its own before the forward.
+    /// A prologue that takes or puts a channel runs and commits on its own.
     #[must_use]
     pub fn prologue_runs(&self) -> bool {
         self.package
@@ -64,8 +63,7 @@ impl ExecPlan {
             .any(|s| s.stage == Stage::Prologue && (!s.takes.is_empty() || !s.puts.is_empty()))
     }
 
-    /// Whether stage `index` runs at `at`: [`Stage::Prologue`], before the
-    /// forward, or any other stage's point, after it.
+    /// [`Stage::Prologue`] runs before the forward, every other stage after it.
     #[must_use]
     pub fn runs_at(&self, index: usize, at: Stage) -> bool {
         let early = self
@@ -119,8 +117,6 @@ impl ExecPlan {
             .any(|s| s.puts.iter().any(|put| put.channel == c))
     }
 
-    /// What channel `c` must hold for the stages at `at` to run: its
-    /// readiness, at the point of the stage that uses it first.
     #[must_use]
     pub fn readiness(&self, c: u32, at: Stage) -> Option<Direction> {
         let early = self.prologue_runs()

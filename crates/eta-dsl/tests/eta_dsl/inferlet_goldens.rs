@@ -450,9 +450,7 @@ fn vae_readback() -> Traced {
     b.build().unwrap()
 }
 
-/// Two guest inputs: the prologue draws the first from the device rng, the
-/// second (a host-written timestep) no stage touches. The one golden that
-/// carries an input table.
+/// The one golden that carries an input table.
 fn noised_input() -> Traced {
     let (rows, width) = (4u32, 8u32);
     let rng_ch: &'static Channel = leak(Channel::from([5u32, 0]).named("rng"));

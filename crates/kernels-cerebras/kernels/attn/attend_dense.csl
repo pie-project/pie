@@ -1,16 +1,9 @@
-// Bidirectional attention within segments: for each lane (segment) l in
-// [l0, l1) with query rows [indptr[l], indptr[l + 1]) and key rows
-// [kv_indptr[l], kv_indptr[l + 1]) (the same CSR for a dense attention),
-// each query row r of the window (rows [r0, r1) of the window, which starts
-// at global row w0) and each query head of kv heads [kh0, kh1) attends the
-// segment's keys within [a0, a1). Whole: q/o rows are all heads, k/v rows
-// all heads and all key rows. Sharded: q/o/lse rows hold just the kv heads'
-// query heads, k/v rows hold key rows [a0, a1) and heads [kh0, kh1); the
-// lse (base 2) of each row and head is written for the host to merge key
-// groups. `masked`: the pair (r, kr) is kept where keep[r * (a1 - a0) +
-// kr - a0] is nonzero (the window's rows over the PE's keys). `max_len > 0`:
-// the scaled logit adds bias[h * (2 max_len - 1) + clamp(kv - qo + max_len -
-// 1)], qo and kv indexed within the segment.
+// Bidirectional attention within segments: query rows [indptr[l], indptr[l + 1]) of lane l
+// in [l0, l1) attend key rows [kv_indptr[l], kv_indptr[l + 1]) within [a0, a1).
+// Sharded: q/o/lse rows hold just kv heads [kh0, kh1)'s query heads, k/v rows key rows
+// [a0, a1); the base-2 lse is written for the host to merge key groups.
+// `masked`: keep[r * (a1 - a0) + kr - a0] != 0 keeps (r, kr). `max_len > 0`: the scaled
+// logit adds bias[h * (2 max_len - 1) + clamp(kv - qo + max_len - 1)], within the segment.
 fn k_attend_dense(q: [*]f32, k: [*]f32, v: [*]f32, o: [*]f32, lse: [*]f32, indptr: [*]i32, kv_indptr: [*]i32,
                   keep: [*]f32, bias: [*]f32, acc: [*]f32,
                   l0: i32, l1: i32, a0: i32, a1: i32, kh0: i32, kh1: i32, r0: i32, r1: i32, w0: i32, group: i32, d: i32, scale: f32, sharded: bool,

@@ -1,11 +1,4 @@
-//! The diffusion and video families: the voxel axis (clip grids, the voxel
-//! input, the clip slots a frame cache reads), the guest inputs a lane feeds
-//! from its channels (and those landed in a merge), the attention-group
-//! packings, and the export seams besides logits (velocity, hidden, pixels).
-//!
-//! engine-cuda's `voxels.rs`, `exports.rs` (`Exports`) and the input half of
-//! `serve/prepare.rs`, staged as this shell stages everything else:
-//! host tables handed to the traced program as inputs.
+//! Voxel axis, guest inputs, group packings and float exports for the diffusion and video families.
 
 use crate::emit::Emit;
 use crate::handle::Tensor;
@@ -25,9 +18,6 @@ const VELOCITY_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[0];
 const HIDDEN_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[1];
 const PIXELS_SEAM: &str = poem_compiler::EXPORT_SEAMS[6];
 
-/// A lane's clips on the voxel axis: one `[t, h, w]` box per clip and, when
-/// the host feeds the voxel input, one input row per voxel in the input's
-/// element (engine-cuda `serve::Clips`).
 #[derive(Debug, Clone, Copy)]
 pub struct Clips<'a> {
     pub lane: u32,
@@ -45,8 +35,6 @@ impl Clips<'_> {
     }
 }
 
-/// One guest input's cell for one lane, in the input's element (the engine
-/// read it off the channel the lane's `InputFeed` names, [`cell_bytes`]).
 #[derive(Debug, Clone, Copy)]
 pub struct InputCell<'a> {
     pub id: u32,
@@ -101,26 +89,23 @@ struct PixelsExport {
 pub struct Dit {
     feeds: Feeds,
     voxel: Option<VoxelSeat>,
-    velocity: Option<(ValueId, u32)>,
-    hidden: Option<(ValueId, u32)>,
+    velocity: Option<ValueId>,
+    hidden: Option<ValueId>,
     pixels: Vec<PixelsExport>,
 }
 
 /// One lane's feeds, as the fire hands them to [`Dit::stage`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Feed<'a> {
-    /// The State row its clips' conv caches read: its recurrent-state row.
     pub slot: u32,
     pub group: Option<u32>,
     pub inputs: &'a [InputCell<'a>],
     pub clips: Option<Clips<'a>>,
-    /// A kv-less lane's stated mask: per row, over its attention group's
-    /// rows.
+    /// A kv-less lane's stated mask, over its attention group's rows.
     pub mask: Option<&'a engine::fire::Masking>,
 }
 
-/// A merge whose arm is a guest input: the input's rows land in the merge's
-/// slot before the walk (zeros for a lane that feeds none).
+/// A merge over a guest input; a lane that feeds none lands zeros.
 #[derive(Debug, Clone, Copy)]
 pub struct Land {
     pub merge: ValueId,
@@ -181,7 +166,6 @@ fn bf16_bits(value: f32) -> u16 {
     ((bits + rounding) >> 16) as u16
 }
 
-/// `values` in `dtype`'s bytes (the float inputs are bf16 or f32).
 fn float_bytes(values: &[f32], dtype: Dtype) -> Vec<u8> {
     match dtype {
         Dtype::Bf16 => values
@@ -192,7 +176,6 @@ fn float_bytes(values: &[f32], dtype: Dtype) -> Vec<u8> {
     }
 }
 
-/// `values` as a float input's (or the voxel input's) payload bytes.
 pub fn payload_bytes(values: &[f32], element: Dtype) -> std::result::Result<Vec<u8>, &'static str> {
     match element {
         Dtype::Bf16 | Dtype::F32 => Ok(float_bytes(values, element)),
@@ -200,8 +183,6 @@ pub fn payload_bytes(values: &[f32], element: Dtype) -> std::result::Result<Vec<
     }
 }
 
-/// A channel cell as a guest input's bytes in the input's element: an f32
-/// cell feeds a bf16 or f32 input, an i32 cell an i32 input.
 pub fn cell_bytes(
     cell: &eta_exec::Value,
     element: Dtype,
@@ -216,9 +197,6 @@ pub fn cell_bytes(
 }
 
 impl Dit {
-    /// Reads the plan: the guest inputs it declares and the classes that
-    /// read them, the group selections its packed attention reads, the
-    /// merges over inputs, the voxel input, and the float seams.
     pub fn of(trace: &Trace, compiled: &CompiledModel) -> Result<Dit> {
         let mut dit = Dit {
             feeds: Feeds::of(trace, compiled),
@@ -280,12 +258,8 @@ impl Dit {
                 .flat_map(|seam| seam.values.iter().copied())
                 .collect::<Vec<_>>()
         };
-        dit.velocity = first(VELOCITY_SEAM)
-            .first()
-            .map(|&value| (value, width_of(trace, value)));
-        dit.hidden = first(HIDDEN_SEAM)
-            .last()
-            .map(|&value| (value, width_of(trace, value)));
+        dit.velocity = first(VELOCITY_SEAM).first().copied();
+        dit.hidden = first(HIDDEN_SEAM).last().copied();
         dit.pixels = trace
             .seams
             .iter()
@@ -308,8 +282,8 @@ impl Dit {
     #[must_use]
     pub fn float_readout(&self) -> Option<(ReadoutSeam, ValueId)> {
         self.velocity
-            .map(|(value, _)| (ReadoutSeam::Velocity, value))
-            .or_else(|| self.hidden.map(|(value, _)| (ReadoutSeam::Hidden, value)))
+            .map(|value| (ReadoutSeam::Velocity, value))
+            .or_else(|| self.hidden.map(|value| (ReadoutSeam::Hidden, value)))
     }
 
     /// Whether the plan exports pixels, and the widest pixel row.
@@ -321,7 +295,6 @@ impl Dit {
         )
     }
 
-    /// The voxel input's element, when the plan declares one.
     #[must_use]
     pub fn voxel_element(&self) -> Option<Dtype> {
         self.voxel
@@ -330,21 +303,16 @@ impl Dit {
             .map(|seat| seat.dtype)
     }
 
-    /// Guest input `id`'s seat, if the plan reads it.
     #[must_use]
     pub fn seat(&self, id: u32) -> Option<Seat> {
         self.feeds.seat(id)
     }
 
-    /// The feeds the plan reads (`Capabilities::inputs` is their
-    /// `decls`).
     #[must_use]
     pub fn feeds(&self) -> &Feeds {
         &self.feeds
     }
 
-    /// The guest inputs (not the voxel input) `class` reads
-    /// (`crate::serve::dry`).
     pub(crate) fn dry_inputs(&self, class: usize) -> Vec<Seat> {
         self.feeds
             .inputs
@@ -354,15 +322,12 @@ impl Dit {
             .collect()
     }
 
-    /// The voxel input's widths, element and token patch, when the plan has
-    /// a voxel axis.
     pub(crate) fn dry_voxel(&self) -> Option<(Vec<u32>, Dtype, Option<[u32; 3]>)> {
         self.voxel
             .as_ref()
             .map(|seat| (seat.widths.clone(), seat.dtype, seat.token_patch))
     }
 
-    /// The width of the voxel input `class` reads, if it reads one.
     pub(crate) fn dry_voxel_width(&self, class: usize) -> Option<u32> {
         self.feeds
             .inputs
@@ -371,7 +336,6 @@ impl Dit {
             .map(|(seat, _)| seat.width)
     }
 
-    /// Whether a fire of this plan stages anything here at all.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.feeds.inputs.is_empty()
@@ -613,9 +577,7 @@ impl Dit {
         Ok(staged)
     }
 
-    /// The custom mask each group-packed attention of the fire applies, out
-    /// of the kv-less lanes' stated masks (engine-cuda
-    /// `serve/prepare.rs::group_masks_of`): none when no lane states one.
+    /// Each group-packed attention's custom mask, or none when no lane states one.
     fn group_masks_of(
         &self,
         lanes: &[LaneRow],
@@ -859,8 +821,6 @@ struct VoxelTables {
     slots: Vec<i32>,
 }
 
-/// Lands each merge-over-input's rows in its slot before the walk: the
-/// input's rows for a lane that fed it, zeros for one that did not.
 pub fn land(
     ctx: &dyn Emit,
     handles: &Handles,

@@ -566,8 +566,7 @@ impl Shell {
             crate::store::window_of(&boot.trace)?,
             boot.budget.max_tokens,
         );
-        // A class attending both ways reads its planes over all its rows:
-        // those are decoded once at load.
+        // A class attending both ways decodes its planes over all its rows once, at load.
         let decoding = poem_exec::feeds::classes_reading(&boot.trace, &compiled, |def| {
             matches!(def, poem_ir::Def::Weight(w)
                 if crate::weights::decodes_at_load(&boot.trace.params[*w as usize]))

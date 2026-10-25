@@ -47,7 +47,6 @@ template <typename T>
   float cnt = 0.0f, mean = 0.0f, m2 = 0.0f;
 
   for (uint v = begin; v < end; ++v) {
-    // `base`: the row `grid` addresses `x`'s row 0 at.
     const device T* row =
         x + (size_t(g.off - int(base)) + size_t(v)) * size_t(channels) + size_t(c0);
     for (uint c = lid; c < cg; c += tg_size) {

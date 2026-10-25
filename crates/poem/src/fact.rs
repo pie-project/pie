@@ -1,10 +1,3 @@
-//! The switches a program branches its rows on.
-//!
-//! A runtime switch is one the runtime derives from what a lane carries, so
-//! an inferlet cannot state it apart from the buffers a kernel reads under
-//! it. A model's own switch is one it declares with its values and an
-//! inferlet sets; its name and values are the model's.
-
 use std::ops::{BitAnd, Not};
 
 use poem_ir::{Builtin, Guard};
@@ -48,13 +41,11 @@ pub fn single_token() -> Predicate {
     Predicate::Builtin(Builtin::SingleToken)
 }
 
-/// The rows whose program reads their drafts.
 #[must_use]
 pub fn drafts() -> Predicate {
     Predicate::Builtin(Builtin::Drafts)
 }
 
-/// The rows whose program reads their attention scores.
 #[must_use]
 pub fn scores() -> Predicate {
     Predicate::Builtin(Builtin::Scores)
@@ -66,14 +57,12 @@ pub fn encode() -> Predicate {
     Predicate::Builtin(Builtin::Encode)
 }
 
-/// The rows of a lane whose recurrent state holds nothing yet: its cursor
-/// is 0, and this fire starts it from zeros.
+/// Cursor 0: this fire starts the recurrent state from zeros.
 #[must_use]
 pub fn fresh() -> Predicate {
     Predicate::Builtin(Builtin::Fresh)
 }
 
-/// The rows whose switch `name` is set to `value`.
 #[must_use]
 pub fn switch_is(name: &str, value: &str) -> Predicate {
     Predicate::Switch(name.to_string(), value.to_string())

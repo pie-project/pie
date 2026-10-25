@@ -59,8 +59,7 @@ struct Params {
     uint channels;
     uint groups;
     uint splits;
-    // The row `grid` addresses `x`'s row 0 at: a window of a segmented fire
-    // starts `x` at its own rows while the fire's grid holds fire-wide ones.
+    // `x`'s row 0 in `grid`'s fire-wide rows (a segmented fire's window starts later).
     uint base;
 };
 PIE_PARAMS(3, Params, params);

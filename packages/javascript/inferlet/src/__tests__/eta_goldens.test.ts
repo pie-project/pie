@@ -549,10 +549,7 @@ describe('sampler golden', () => {
     check('latent_step', b.build());
   });
 
-  // `inferlet_goldens.rs::vae_readback` - a VAE decode's epilogue (design D8):
-  // the one golden that carries `Intrinsic.PIXELS`, so a port that drifts on
-  // the new intrinsic's wire id fails here. The rows are declared, not
-  // hinted: a VAE lane's token rows are not its clip's voxels.
+  // `inferlet_goldens.rs::vae_readback`: the one golden carrying `Intrinsic.PIXELS`.
   it('vae_readback matches the Rust golden', () => {
     const rows = 16;
     const rgb = 3;
@@ -567,9 +564,7 @@ describe('sampler golden', () => {
     out.noteHostTake();
     check('vae_readback', b.build());
   });
-  // `inferlet_goldens.rs::noised_input` - two guest inputs, the first drawn
-  // by the prologue from the device rng, the second touched by no stage: the
-  // one golden that carries an input table.
+  // `inferlet_goldens.rs::noised_input`: the one golden carrying an input table.
   it('noised_input matches the Rust golden', () => {
     const rows = 4;
     const width = 8;

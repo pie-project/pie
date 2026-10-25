@@ -345,8 +345,7 @@ fn a_guest_pass_samples_on_the_fabric_as_the_interpreter_does() {
     );
 }
 
-/// Binds `container` as a pass of one lane reading `vocab`-wide logits, on a
-/// model that drafts, exports scores and serves both sinks.
+/// Binds `container` as a one-lane pass reading `vocab`-wide logits.
 fn bind_logits(
     container: eta_ir::container::TraceContainer,
     vocab: u32,

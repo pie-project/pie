@@ -379,11 +379,10 @@ async fn run_one(
         session::send("t0");
     }
     // The device arm stages its decode window now, with the first token out.
-    if build_decode.is_none() {
-        if let Some(fwd) = fwd_d.as_ref() {
+    if build_decode.is_none()
+        && let Some(fwd) = fwd_d.as_ref() {
             submitted = submit_ahead(fwd, submitted, 0)?;
         }
-    }
     if let Some(build_decode) = build_decode.take() {
         fwd_d = build_decode(Channel::from([g0]).named("tok_in"))?;
         if let Some(fwd) = fwd_d.as_ref() {

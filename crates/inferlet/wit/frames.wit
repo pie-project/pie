@@ -145,10 +145,8 @@ interface frames {
         // nothing. A picture that did not decode is not a black picture.
         decode: static func(bytes: blob) -> result<frames, error>;
 
-        // Join `parts`, in order, into one handle host-side: a clip decoded
-        // a fire at a time is the concatenation of each fire's frames. Every
-        // part must have the same width, height and fps; a mismatch, or no
-        // parts at all, is refused by name with both figures.
+        // Join `parts`, in order, into one handle host-side; parts must share
+        // width, height and fps, and an empty list is refused.
         concat: static func(parts: list<borrow<frames>>) -> result<frames, error>;
 
         // **THE VAE ROAD, RUN BACKWARDS**: put these pixels into `ch`'s

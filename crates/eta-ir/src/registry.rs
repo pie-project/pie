@@ -187,7 +187,6 @@ pub fn intrinsic_stages(intr: IntrinsicId) -> &'static [Stage] {
     }
 }
 
-/// What a lane reads out, as the model's graph runs the lane's switches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Readout {
@@ -204,9 +203,7 @@ pub enum ReadoutKind {
     Pixels,
 }
 
-/// The model's graph facts a program may read: its depth, its drafter (a
-/// draft column `mtp_logits` reads, `mtp_depth` ids `mtp_drafts` reads) and
-/// whether it exports attention scores.
+/// The model's graph facts a program may read.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Graph {
@@ -216,8 +213,6 @@ pub struct Graph {
     pub attn_score: bool,
 }
 
-/// What the serving engine runs beside the forward: an adapter's `lora`
-/// sink and an `attn_page_mask` sink.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct EngineCaps {

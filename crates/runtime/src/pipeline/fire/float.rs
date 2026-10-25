@@ -13,8 +13,7 @@ use crate::store::kv::working_set::{FireLeaseError, KvWorkingSet};
 
 type Anyhow<T> = anyhow::Result<T>;
 
-/// Each working set's lanes fold one slot of its recurrent state: a fire is
-/// one element of the sequence, as a token is an LM's.
+/// A fire is one element of a recurrent state's sequence, as a token is an LM's.
 fn fold_one_plan(ids: &[crate::store::rs::RsWorkingSetId]) -> rs::RsPlan {
     let mut groups: Vec<rs::GroupPlan> = Vec::new();
     for (lane, id) in ids.iter().enumerate() {
@@ -31,9 +30,7 @@ fn fold_one_plan(ids: &[crate::store::rs::RsWorkingSetId]) -> rs::RsPlan {
     rs::RsPlan::Groups(groups)
 }
 
-/// A float pass: no kv. A lane reading a recurrent state binds a working set
-/// and folds one slot of it a fire, on the row its rs store assigns; a lane
-/// reading none takes no seat and no state row.
+/// A float pass: no kv; a lane reading a recurrent state folds one slot of it a fire.
 pub(crate) async fn fire_float_lane<C: FireContext>(
     ctx: &mut C,
     this: Resource<Pipeline>,
@@ -144,8 +141,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         });
     }
 
-    // Each lane's rows: its embedded tokens split by the indptr, or as many
-    // placeholder rows as its row inputs carry.
+    // Each lane's rows: its embedded tokens, else as many placeholder rows as its row inputs carry.
     let lane_tokens: Vec<Vec<u32>> = match embed_ids {
         Some((Some(tokens), Some(indptr))) => {
             let lanes = float.lanes.len();
@@ -208,8 +204,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
             .collect(),
         ..crate::engine::FireRequest::default()
     };
-    // A stated mask is each row's over its attention group's rows: a voxel
-    // lane's rows there are its voxels.
+    // A stated mask is over each attention group's rows; a voxel lane's rows are its voxels.
     let guest_indptr: Vec<u32> = std::iter::once(0)
         .chain(
             req.lanes
@@ -265,9 +260,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         Switched::of(pass)
     };
     req.single_token_mode = false;
-    // The state each lane folds into, on the row its rs store assigns: fresh
-    // where the state holds nothing yet. A lane binding none touches no state
-    // row.
+    // A lane binding no state touches no state row.
     let rs_ids = match kvs.first() {
         Some(ws) => {
             let qo_indptr: Vec<u32> = (0..=req.lanes.len() as u32).collect();
@@ -333,7 +326,6 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
     }
     ticket_reservation.commit();
     advance_shadow(ctx, &fwd)?;
-    // The cursor counts the slots folded: one a fire.
     let mut advanced: Vec<u32> = Vec::new();
     for &rep in lanes.iter().filter(|_| !rs_ids.is_empty()) {
         if advanced.contains(&rep) {

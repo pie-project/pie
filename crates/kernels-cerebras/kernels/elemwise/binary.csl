@@ -1,5 +1,4 @@
-// z[i] = x[i] op y[i] for i < n: op 0 adds, 1 multiplies, 2 divides, 3 takes
-// the floored modulo (x - y * floor(x / y), as Python's `%`).
+// z = x op y: op 0 adds, 1 multiplies, 2 divides, 3 takes the floored modulo (Python's `%`).
 fn k_binary(x: [*]f32, y: [*]f32, z: [*]f32, n: i32, op: i32) void {
   var i: i32 = 0;
   while (i < n) : (i += 1) {

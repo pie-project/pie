@@ -336,7 +336,6 @@ async fn main(input: Input) -> Result<Output> {
     })
 }
 
-/// The width of the denoise lane's `self_cond_ids` input.
 fn self_cond_taps() -> Result<u32> {
     let lane = model::lane_of(&[("mode", "denoise")])?;
     let input = lane

@@ -9,7 +9,6 @@ use eta_dsl::{Channel, Traced};
 const ROWS: u32 = 16;
 const WIDTH: u32 = 8;
 
-/// One lane reading out a `WIDTH`-wide velocity, or 32-wide logits.
 fn lane(velocity: bool) -> Vec<Option<Readout>> {
     vec![Some(if velocity {
         Readout {

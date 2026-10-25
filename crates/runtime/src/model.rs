@@ -206,21 +206,16 @@ pub struct Model {
 /// A lane of a pass's switches, as the model's graph runs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lane {
-    /// The guest switches the pass set.
     pub switches: Vec<(String, String)>,
-    /// The ids of the inputs it must bind.
     pub inputs: Vec<u32>,
     /// Some class it lands in reads a kv cache: it binds `state`.
     pub reads_kv: bool,
-    /// Some class it lands in reads a recurrent state: a float lane of it
-    /// binds `state` too, its rows one slot of its sequence a fire.
+    /// Some class it lands in reads a recurrent state: it binds `state` too.
     pub reads_state: bool,
     /// Some class it lands in reads `tokens`: it binds `embed`.
     pub embeds: bool,
-    /// What it reads out: a float readout where some class reads one.
     pub readout: Option<poem_ir::Readout>,
-    /// The patch its token grid reads, where some class reads one: its
-    /// voxels attend as one token row a patch.
+    /// The patch its token grid reads: its voxels attend as one token row a patch.
     pub patch: Option<[u32; 3]>,
 }
 
@@ -342,32 +337,26 @@ impl Model {
         self.tokenizer.special_tokens()
     }
 
-    /// The switches the model's trace branches on, and those it declares.
     pub fn facts(&self) -> &poem_ir::Facts {
         &self.facts
     }
 
-    /// The word a lane of `request` is classified by.
     #[must_use]
     pub fn word(&self, request: &poem::Request) -> u64 {
         self.facts.word(request)
     }
 
-    /// Whether a lane of `word` lands in a class attending both ways: its
-    /// rows read one another, so it is never cut, keyed or logged by its
-    /// tokens.
+    /// A lane in a both-ways class is never cut, keyed or logged by its tokens.
     #[must_use]
     pub fn wide(&self, word: u64) -> bool {
         self.classes.of(word).is_some_and(|class| class.wide)
     }
 
-    /// The inputs the model reads from its guest; an input's id is its
-    /// place here.
+    /// An input's id is its index here.
     pub fn inputs(&self) -> &[poem_ir::InputDecl] {
         &self.inputs
     }
 
-    /// The input `name` and its id.
     pub fn input(&self, name: &str) -> Option<(u32, &poem_ir::InputDecl)> {
         self.inputs
             .iter()
@@ -376,13 +365,11 @@ impl Model {
             .map(|(id, input)| (id as u32, input))
     }
 
-    /// The model's classes and what each runs.
     pub fn classes(&self) -> &poem_ir::LaneClasses {
         &self.classes
     }
 
-    /// A lane of the guest `switches`, each checked against its declaration,
-    /// over the classes it can land in under any value of the runtime switches.
+    /// A lane of the guest `switches`, over the classes any runtime switch value lands it in.
     pub fn lane(&self, switches: &[(String, String)]) -> Result<Lane, String> {
         let mut guest = poem::Request::new(1, false);
         for (name, value) in switches {

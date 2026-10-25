@@ -248,9 +248,7 @@ pub(crate) struct Boxes {
     pub(crate) off: Val,
 }
 
-/// `grid` with `base` taken off each lane's first row: the rows of a window
-/// of a segmented fire, whose tensors start at its own rows while the fire's
-/// grids hold fire-wide ones.
+/// `grid` rebased to a segmented-fire window whose tensors start at its own rows.
 pub(crate) fn rebased(f: &mut Func, grid: Operand, base: u32) -> Result<Operand, Error> {
     if base == 0 {
         return Ok(grid);

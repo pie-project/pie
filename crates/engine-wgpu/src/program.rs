@@ -63,7 +63,6 @@ pub(crate) struct Tally {
     interpreted: AtomicU64,
 }
 
-/// A guest input's cell for a fire, in wire bytes.
 #[derive(Debug, Clone)]
 pub struct InputCell {
     pub bytes: Vec<u8>,
@@ -88,10 +87,8 @@ pub(crate) struct Pass<'a> {
     pub mtp_logits: Option<&'a [f32]>,
     pub mtp_width: u32,
     pub readout: Option<crate::guest::run::Readout<'a>>,
-    /// Each lane of the pass's own readout rows (`velocity(k)`,
-    /// `hidden(k)`), lane `k` at `k`.
+    /// The pass's own `velocity(k)` / `hidden(k)` readouts, lane `k` at `k`.
     pub lanes: Vec<Option<crate::guest::run::Readout<'a>>>,
-    /// Each lane of the pass's pixels, lane `k` at `k`.
     pub pixels: Vec<Option<crate::guest::run::Readout<'a>>>,
     pub at: Stage,
 }
@@ -649,8 +646,7 @@ impl Plane {
             })
     }
 
-    /// The cell guest input channel `id` of `instance` holds for the next
-    /// fire: its oldest, in wire bytes.
+    /// The oldest cell guest input channel `id` of `instance` holds, in wire bytes.
     pub fn input_cell(&self, instance: InstanceId, id: ChannelId) -> Result<InputCell, Refusal> {
         let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
             what: "instance",

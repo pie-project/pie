@@ -666,9 +666,7 @@ impl Engine for Xla {
     }
 }
 
-/// What a step's lanes feed the guest inputs, read off the host submission
-/// and the channels: per lane its input cells (guest input id, bytes in the
-/// input's element), per voxel row its payload in the voxel input's element.
+/// Per lane its input cells (id, bytes in the input's element); per voxel row its payload.
 struct LaneFeeds {
     cells: Vec<Vec<(u32, Vec<u8>)>>,
     voxels: Vec<Vec<u8>>,
@@ -867,8 +865,7 @@ impl Xla {
         Ok(out)
     }
 
-    /// Runs each attached prologue before the step reads its descriptor
-    /// ports and input cells, which a prologue may put.
+    /// Runs each attached prologue first: the forward reads the cells a prologue put.
     fn run_prologues(&mut self, submission: &engine::fire::Step) -> EngineResult<()> {
         let prologues: Vec<(InstanceId, u32)> = submission
             .attachments
@@ -892,8 +889,6 @@ impl Xla {
         Ok(())
     }
 
-    /// Reads every input cell and voxel payload a step's lanes feed
-    /// (engine-cuda's `serve::prepare` input feed, done on the host).
     fn lane_feeds(&self, submission: &engine::fire::Step) -> EngineResult<LaneFeeds> {
         let lanes = &submission.lanes;
         let instance_of = |lane: usize| {
@@ -986,8 +981,7 @@ impl Xla {
         latch: &std::sync::Arc<crate::program::Latch>,
     ) -> EngineResult<(FireTicket, StepSettle)> {
         capture(submission);
-        // The caller predicts the cursors a pass starts from: checked
-        // before a prologue moves them.
+        // Checked before a prologue moves the cursors the caller predicted.
         for attachment in &submission.attachments {
             if let Some(lane) = submission.lanes.get(attachment.lane as usize)
                 && !lane.channels.is_empty()

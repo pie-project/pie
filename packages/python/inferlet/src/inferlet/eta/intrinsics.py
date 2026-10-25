@@ -56,14 +56,12 @@ def hidden(lane: int, rows: int, width: int) -> Tensor:
 
 
 def velocity(lane: int, rows: int, width: int) -> Tensor:
-    """The velocity lane `lane` of the pass predicts, one `width`-wide row per
-    of its `rows`, F32 at the epilogue."""
+    """The velocity lane `lane` predicts, `[rows, width]`."""
     return intrinsic_val(Intrinsic.VELOCITY, shape_of([max(rows, 1), max(width, 1)]), activation_type, lane)
 
 
 def pixels(lane: int, rows: int, width: int) -> Tensor:
-    """The pixels lane `lane`'s VAE decode lands, `[rows, width]` F32 at the
-    epilogue: one row per OUTPUT voxel of the lane's clip."""
+    """The pixels lane `lane`'s VAE decode lands, one `[rows, width]` row per output voxel."""
     return intrinsic_val(Intrinsic.PIXELS, shape_of([max(rows, 1), max(width, 1)]), activation_type, lane)
 
 

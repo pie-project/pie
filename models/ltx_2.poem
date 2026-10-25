@@ -269,9 +269,6 @@ def constant(values):
     return weight([len(values)], dtype.f32, values = values)
 
 def rope_constants():
-    """The affine pieces of the rope positions (`turn_positions`): a
-    latent index's causal pixel start, `max(k·index + offset - k, 0)`, and
-    each axis's `(2·coordinate / base - 1)·π/2` offset."""
     video_t = VAE_TEMPORAL_COMPRESSION
     hw_bias = f32(HALF_PI * (float(VAE_SPATIAL_COMPRESSION) / ROPE_BASE_HW) - HALF_PI)
     return struct(
@@ -659,17 +656,13 @@ def run_block(xv, xa, b, d, mv, ma, ctx, actx, vg, ag, v_time, cg, acg):
     return (xv, xa)
 
 def causal_mid(index, k, start, end):
-    """The midpoint of a latent index's causal span `[max(k·i + 1 - k, 0),
-    k·(i + 1) + 1 - k)` in the encoder's input units: its first index spans
-    one input frame, the rest `k`."""
+    """Twice the midpoint of latent index `i`'s causal span `[max(k·i + 1 - k, 0), k·(i + 1) + 1 - k)`."""
     first = ops.elemwise.clamp(ops.elemwise.add_bias(start, ops.elemwise.mul_scalar(float(k), ops.elemwise.copy(index))), 0.0, 3.0e38)
     last = ops.elemwise.add_bias(end, ops.elemwise.mul_scalar(float(k), ops.elemwise.copy(index)))
     return ops.elemwise.add(first, last)
 
 def video_positions(rows, m):
-    """Each video row's `(t, h, w)` rope position: its patch's pixel-space
-    midpoint (time in seconds, from the lane's `fps`), as
-    `(2·coordinate / base - 1)·π/2`. A `given` lane reads the guest's."""
+    """The patch's pixel-space midpoint (time in seconds), as `(2·coordinate / base - 1)·π/2`."""
     given = switch_is("positions", "given")
     stated = rows.on(given).input("positions", dtype.f32, "row", m.rope_axes)
     rows = rows.on(~given)
@@ -685,8 +678,7 @@ def video_positions(rows, m):
     return merge([stated, ops.gather.concat_cols([t, hw])])
 
 def audio_positions(rows, m):
-    """Each audio row's rope time: its latent frame's midpoint in seconds
-    (the audio VAE's hop and compression), as `(2·s / base - 1)·π/2`."""
+    """The latent frame's midpoint in seconds, as `(2·s / base - 1)·π/2`."""
     given = switch_is("positions", "given")
     stated = rows.on(given).input("audio_positions", dtype.f32, "row", 1)
     rows = rows.on(~given)
@@ -697,8 +689,6 @@ def audio_positions(rows, m):
     return merge([stated, ops.elemwise.add_bias(c.minus_half_pi, t)])
 
 def patched(rows, d):
-    """The rows' latent clip, VAE-native on the voxel axis (a video
-    `[t, h, w, C]`, an audio `[t, 1, 1, C]`), as its patches' token rows."""
     latents = rows.input("latents", dtype.bf16, "voxel", d.channels)
     return ops.conv.patchify(latents, rows.grid(), PATCH, rows.token_grid(PATCH))
 
@@ -760,9 +750,7 @@ def denoise(arm, m):
     return velocity
 
 def text_positions(arm, m):
-    """Each prompt row's rope position: its row `j` over the connectors'
-    base length, as `(2·j / base - 1)·π/2`. A `given` lane reads the
-    guest's."""
+    """Prompt row `j` at `(2·j / base - 1)·π/2`."""
     given = switch_is("positions", "given")
     stated = arm.on(given).input("text_positions", dtype.f32, "row", 1)
     rows = arm.on(~given)

@@ -19,11 +19,6 @@
 //! is what the parity harness diffs against `pixels.f32`; the PNG path and
 //! the numbers path read the SAME channel cell, so a run that wants both
 //! asks for the numbers and lets this file re-encode them (see `main`).
-//!
-//! A lane of a VAE reading embeds no token and binds no `[rows, ·]` input: its
-//! rows are its clip's voxels, on the third axis. The library states that for the
-//! guest — `pass.input` on a voxel input is the only row-stating thing it
-//! needs — so nothing below mentions a row count the model did not.
 
 use inferlet::latent::prelude::*;
 use inferlet::{frames, session};
@@ -95,7 +90,6 @@ struct Case {
 struct Output {
     /// Which reading fired, by the family's own name.
     reading: String,
-    /// Which input carried the clip.
     input: String,
     /// The clip's box, and the pixels' box.
     latent_h: u32,

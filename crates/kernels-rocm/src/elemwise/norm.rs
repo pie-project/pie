@@ -649,8 +649,7 @@ const MAX_SPLITS: u32 = 512;
 
 const ROWS_PER_SPLIT: u32 = 256;
 
-/// `base`: the row `grid` addresses `x`'s (and `o`'s) row 0 at, nonzero in a
-/// window of a segmented fire whose grid holds fire-wide rows.
+/// `base`: the row `grid` addresses `x`'s (and `o`'s) row 0 at.
 #[allow(clippy::too_many_arguments)]
 pub fn group_norm(
     ctx: &Ctx,

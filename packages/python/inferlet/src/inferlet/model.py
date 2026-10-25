@@ -123,9 +123,7 @@ def rs_state_size() -> int:
 
 
 def switches() -> list[SwitchDecl]:
-    """Every switch the bound model declares (``ForwardPass.switch``), each
-    value list's first its default; empty for a model with one path (every
-    text model)."""
+    """Every switch the bound model declares; each value list's first is its default."""
     return _model.switches()
 
 
@@ -135,11 +133,7 @@ def switch(name: str) -> SwitchDecl | None:
 
 
 def lane(switches: list[tuple[str, str]]) -> LaneDecl:
-    """The lane a pass of these switches is (`model.LaneDecl`): the inputs it
-    binds (exactly these, by ``ForwardPass.input``), whether it binds
-    ``state`` and ``embed``, and what it reads out. Switches are
-    ``(name, value)`` pairs of :func:`switches`; one left unset takes its
-    default."""
+    """The lane of these ``(name, value)`` switches; unset ones take their defaults."""
     return _model.lane(list(switches))
 
 
@@ -154,5 +148,5 @@ def schedule():
 
 
 def max_latent_rows() -> int:
-    """The most rows one lane may carry: the guest sizes its row inputs under this."""
+    """The most rows one lane may carry."""
     return _model.max_latent_rows()

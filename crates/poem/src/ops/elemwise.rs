@@ -1030,7 +1030,6 @@ pub fn add(x: &Value, y: &Value) -> Value {
     binary(x, y, poem_ir::BinaryOp::Add)
 }
 
-/// `x / y`, element by element.
 pub fn div(x: &Value, y: &Value) -> Value {
     binary(x, y, poem_ir::BinaryOp::Div)
 }

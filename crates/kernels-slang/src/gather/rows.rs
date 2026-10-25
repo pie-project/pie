@@ -330,8 +330,6 @@ pub fn select(
     )
 }
 
-/// `xs` side by side into `y`, a row each's columns after the one before's
-/// (kernels-cuda `gather::concat_cols`): one placement an input.
 pub fn concat_cols(ctx: &Ctx<'_>, xs: &[Tensor], y: Tensor) -> Result<(), Error> {
     const OP: &str = "gather.concat_cols";
     let total: u32 = xs.iter().map(|x| x.width).sum();

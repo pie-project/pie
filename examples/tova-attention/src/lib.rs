@@ -123,8 +123,7 @@ async fn main(input: Input) -> Result<Output> {
             "prompt + max_tokens needs {kv_max} KV slots, past the published \
              attn_score ceiling of {}",
             intrinsics::attn_score_kv_max()
-        )
-        .into());
+        ));
     }
     let cache_size = input.cache_size.min(kv_max);
 
@@ -188,12 +187,12 @@ async fn main(input: Input) -> Result<Output> {
 
             // `[planes, kv]` layer-major; dividing by `heads` averages heads and sums layers.
             let rect = intrinsics::attn_score(planes);
-            let folded = &reduce_sum(&transpose(&rect)) / heads_f;
-            scores_out.put(&gather(&folded, iota(kv_max)));
+            let folded = &reduce_sum(transpose(&rect)) / heads_f;
+            scores_out.put(gather(&folded, iota(kv_max)));
         });
 
         let budget_n = max_tokens - 1;
-        run_ahead(&pipe, &fwd, budget_n as usize, async || {
+        run_ahead(&pipe, &fwd, budget_n, async || {
             let t = tok_out
                 .take_host::<i32>()
                 .await
