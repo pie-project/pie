@@ -22,63 +22,41 @@ context lane, times the submit depth.
 ## Standard input names
 
 Like `text-to-image`, this binds a model's inputs by name: `latents` (the
-noised latent volume's rows), `timestep` and `guidance` (one value a lane),
-`context` (the text encoder's hidden rows, on the prompt lane) and
-`positions` (each row's rotary coordinates, from `model::positions()`). They
-are a convention between a model and its model-agnostic guests, not runtime
-vocabulary: the runtime checks a channel against the input's axis, width and
-dtype and never reads the name. A lane binds exactly the inputs
-`model::lane_of` says it reads; one it reads by any other name is refused by
-name, never zero-filled.
+VAE's own `[t, h, w, C]` latent, on the voxel axis), `timestep` and
+`guidance` (one value a lane) and `context` (the text encoder's hidden rows,
+on the prompt lane). They are a convention between a model and its
+model-agnostic guests, not runtime vocabulary. A lane binds exactly the
+inputs `model::lane_of` says it reads; one it reads by any other name is
+refused by name, never zero-filled. No positions: the model computes its own
+and patches its own latent.
 
-## What differs from the image sampler
+## The path
 
-| | image | video |
-|---|---|---|
-| the latent | an `h x w` grid | a `t x h x w` VOLUME (`LaneRows::Volume`) |
-| the decode | one fire over one clip | ONE FIRE PER LATENT FRAME, in order, down one pipeline |
-| the way out | a still through `take_frames` | a clip assembled from the fires, `frames.from-rgb8`, `mp4-h264` |
+Text encoder, then `steps` denoise fires, down one pipeline. The encoder's
+rows stay on the device, zero-padded there by an ETA copy to the rows the
+`context` input states (`input-decl.rows`: Wan 2.2's 512, whose reference
+zero-pads umT5's answer and attends every pad row). The encoder's epilogue
+draws the latent from a keyed `normal` on the device (or noises the encoded
+init clip to the schedule's first sigma) and seeds the loop's clock; each
+denoise epilogue integrates one Euler step, guided `u + s (c - u)` when a
+negative prompt adds a second attention group to the pass. The last fire also
+lands the latent on a host-read channel, because the decode below takes it
+frame by frame from the guest until the decode reads it on the device.
 
 ### The frame lattice is refused, not rounded
 
-A causal video VAE decodes one latent frame at a time and treats the first
-apart: latent frame 0 lands ONE output frame and each later one lands
-`temporal-compression`. So `T` latent frames are `1 + tc*(T - 1)` output
-frames and nothing else — 1, 5, 9, 13, 17, ..., 49 at `tc = 4`. A `--frames`
-off that lattice is refused with the two nearest values that are on it.
+A causal video VAE decodes one latent frame a fire on one working set, and
+the first fire on it (the model's `fresh` switch) lands ONE output frame while
+each later one lands `temporal-compression`. So `T` latent frames are
+`1 + tc*(T - 1)` output frames and nothing else — 1, 5, 9, 13, 17, ..., 49 at
+`tc = 4`. A `--frames` off that lattice is refused with the two nearest values
+that are on it. The decode fires go down one pipeline on one working set (the
+conv caches are its state); video2video's encode is the same read backwards.
 
-### The decode fires are a sequence
+### The pixels do cross into WASM here
 
-Every causal convolution holds its last input frames in a `CacheRow::State`
-slab the SLOT carries between fires, so frame `k` depends on frame `k-1`
-having been fired into the same slot. The guest keeps two rules: one pipeline
-for the whole decode (a pipeline is serial — the opposite of the denoise loop,
-where one pipeline per lane is what lets a group compose), and the head arm's
-pass closed before the later arm's is opened, so the later arm binds onto the
-seat the head arm warmed. Firing them the other way round gives the later arm
-zeroed slabs, which is a decoder with no history: measured cos 0.98 and mean
-|err| 0.125 on `[-1, 1]` against the reference, versus 0.99999 warm
-(`engine-cuda`'s `the_wan_2_vae_answers_the_reference`, claim 2).
-
-### The pixels DO cross into WASM here
-
-`text-to-image` never lets its picture into linear memory. A clip is several
-fires and there is no host-side verb that concatenates their cells, so this
-takes each chunk with `take_host` and builds one handle with
-`frames.from-rgb8`. A 480x832x17 clip is 81 MB of f32 across the boundary and
-20 MB of RGB8 back. The fix is a seam that appends rather than replaces, not
-a change here.
-
-### The context pad is a fact now
-
-`input-decl.rows` (`model::lane`) says "my context lane is exactly this tall, whatever the
-prompt was". Wan 2.2 says 512: its reference truncates umT5's answer to the
-prompt's real length and zero-pads the EMBEDS back to 512, and the transformer
-attends every one of those keys — the pad rows go through `text_embedder` into
-a nonzero constant with real attention mass. Handing such a model a context
-lane of the prompt's own height is a different model, quietly. Where the fact
-is `none` (FLUX.2, Z-Image) the encoder's rows are the lane's rows and nothing
-is padded.
+A clip is several decode fires and each chunk is taken with `take_host` and
+assembled into one handle with `frames.from-rgb8`.
 
 ### `--prompt-ids`, and why the row that needs it needs it
 
@@ -110,15 +88,11 @@ passes `None`. Bending by a 1950-row volume instead put nineteen of twenty
 steps above sigma 0.58 and left the last one to do the denoising: it still
 produced a recognisable clip, which is exactly why it is written down.
 
-### CFG does not run yet
+### CFG
 
-A model with no `guidance` input takes a negative prompt as a second lane pair
-whose velocity the host combines. That path is written and refuses: four lanes
-on `wan22-ti2v-5b` die with `no cell available` at the first readback, because
-the two branches' `out` channels are taken in the same turn and one has no
-committed cell yet. Measured 2026-09-06. The clip in the gate is the
-single-branch path at `guidance: 1.0`, which is why it is more saturated and
-less faithful than the reference's UniPC-8-at-CFG-5.
+A model with no `guidance` input takes a negative prompt as a second
+attention group of the same pass; the epilogue reads both video lanes'
+velocities and steps the one latent.
 
 ## Gate
 

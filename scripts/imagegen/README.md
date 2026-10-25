@@ -863,7 +863,7 @@ file is the roster, the plumbing and the reaper.
 | `zimage-vae` | `zimage_vae_parity.py all`, then `the_z_image_vae_answers_the_reference` | 0.99998 | the same VAE reading twice: once fired FROM A GUEST through the real runtime, once from the host. The two roads must agree with the reference to the same distance. |
 | `wan-mini` | `wan22_parity.py all`, `all --pertoken` | 0.999982, and the conditioning must MOVE | the `d128` miniature under both timestep forms (scalar, and TI2V's per-token one), each followed by the `conditioning` claim: zeroing the umT5 context must move the velocity by more than the gate's own slack. |
 | `hy3-mini` | `hy3_parity.py all` | velocity 0.999997, plus two claims | HunyuanImage 3's whole denoise step in three fires, plus `the prefix conditions the canvas` and `the prefix K/V is reused exactly` (D10's claim: after step 0 the prefix is never recomputed). |
-| `text-to-image` | the model-agnostic guest on `flux2-klein-4b.zt` | a real PNG | 4 steps at 1024², seed 0. FLUX.2 hands back the final latent (its VAE is traced, not a declared reading), so the gate finishes with `decode_latent.py` and then checks the PNG magic, its box and its size. |
+| `text-to-image` | the model-agnostic guest on `flux2-klein-4b.zt` | a real PNG | 4 steps at 1024², seed 0. The guest decodes through the row's `vae.decode` reading in-guest; the gate checks the PNG magic, its box and its size. |
 
 **The endpoint gates for distilled trajectories are BELOW the bf16 floor by
 design, and are reported rather than gated.**  Both `zimage`'s eight-step

@@ -24,7 +24,6 @@ export const modelStub = {
   runAheadWindow: () => 4,
   draftBlock: () => undefined,
   switches: () => [{ name: 'mode', values: ['encode', 'denoise'] }],
-  positions: () => undefined,
   lane: (switches: Array<[string, string]>) => ({
     inputs: switches.some(([k, v]) => k === 'mode' && v === 'denoise')
       ? [{ name: 'self_cond_ids', axis: 'row', width: 4, dtype: 'i32' }]

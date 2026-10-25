@@ -436,30 +436,15 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
         let d = dims(deployment);
         let names = readings(&trace(deployment, Platform::Cuda));
         if is_flagship(deployment) {
-            assert_eq!(
-                names,
-                vec!["text", "denoise", "vae.decode", "vae.encode"]
-            );
+            assert_eq!(names, vec!["text", "denoise", "vae.decode", "vae.encode"]);
         } else {
             assert_eq!(names, vec!["denoise"]);
         }
         let latent = facts.latent.expect("a latent space");
-        assert_eq!(
-            (
-                latent.channels,
-                latent.patch_t,
-                latent.patch_h,
-                latent.patch_w
-            ),
-            (d.in_channels, 1, 2, 2)
-        );
+        assert_eq!(latent.channels, d.in_channels);
         assert_eq!(
             (latent.spatial_compression, latent.temporal_compression),
             (16, 4)
-        );
-        assert_eq!(
-            latent.channels * latent.patch_t * latent.patch_h * latent.patch_w,
-            d.patch_in()
         );
         let schedule = facts.schedule.as_ref().expect("a schedule");
         assert_eq!(schedule.kind, ScheduleKind::Flow);

@@ -63,7 +63,6 @@ describe('model', () => {
   });
 
   it('exposes diffusion and drafting facts', () => {
-    expect(model.positions()).toBeUndefined();
     expect(model.lane([['mode', 'denoise']]).inputs.map((i) => i.name)).toEqual(['self_cond_ids']);
     expect(model.draftBlock()).toBeUndefined();
     expect(model.runAheadWindow()).toBe(4);

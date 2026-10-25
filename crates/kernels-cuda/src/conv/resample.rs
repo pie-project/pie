@@ -79,6 +79,23 @@ pub fn pixel_shuffle(
     o: &mut Tensor,
     o_grid: Tensor,
 ) -> Result<(), Error> {
+    shuffle_at(ctx, x, grid, r, trim_t, o, o_grid, [0, 0])
+}
+
+/// `pixel_shuffle` over tensors whose row 0 stands at fire rows `bases`
+/// (`[x, o]`): the grids address fire rows, a window's tensors start at its
+/// own.
+#[allow(clippy::too_many_arguments)]
+fn shuffle_at(
+    ctx: &Ctx,
+    x: Tensor,
+    grid: Tensor,
+    r: [u32; 3],
+    trim_t: u32,
+    o: &mut Tensor,
+    o_grid: Tensor,
+    bases: [u32; 2],
+) -> Result<(), Error> {
     const OP: &str = "conv.pixel_shuffle";
     let t = element(OP, x.dtype)?;
     debug_assert_eq!(o.dtype, x.dtype, "`{OP}` keeps the element");
@@ -111,6 +128,8 @@ pub fn pixel_shuffle(
             r[1].arg(),
             r[2].arg(),
             trim.arg(),
+            stated(OP, bases[0])?.arg(),
+            stated(OP, bases[1])?.arg(),
             total.arg(),
         ],
     )
@@ -123,6 +142,20 @@ pub fn pixel_unshuffle(
     r: [u32; 3],
     o: &mut Tensor,
     o_grid: Tensor,
+) -> Result<(), Error> {
+    unshuffle_at(ctx, x, grid, r, o, o_grid, [0, 0])
+}
+
+/// `pixel_unshuffle` over tensors whose row 0 stands at fire rows `bases`
+/// (`[x, o]`), as [`shuffle_at`].
+fn unshuffle_at(
+    ctx: &Ctx,
+    x: Tensor,
+    grid: Tensor,
+    r: [u32; 3],
+    o: &mut Tensor,
+    o_grid: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.pixel_unshuffle";
     let t = element(OP, x.dtype)?;
@@ -154,6 +187,8 @@ pub fn pixel_unshuffle(
             r[0].arg(),
             r[1].arg(),
             r[2].arg(),
+            stated(OP, bases[0])?.arg(),
+            stated(OP, bases[1])?.arg(),
             total.arg(),
         ],
     )
@@ -207,6 +242,9 @@ pub fn avg_down(
     )
 }
 
+/// `bases`: the fire rows `x`'s and `o`'s row 0 stand at (`[x, o]`), which
+/// a window of a segmented fire does not start at 0.
+#[allow(clippy::too_many_arguments)]
 pub fn patchify(
     ctx: &Ctx,
     x: Tensor,
@@ -214,10 +252,13 @@ pub fn patchify(
     p: [u32; 3],
     o: &mut Tensor,
     o_grid: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
-    pixel_unshuffle(ctx, x, grid, p, o, o_grid)
+    unshuffle_at(ctx, x, grid, p, o, o_grid, bases)
 }
 
+/// `bases` as [`patchify`]'s.
+#[allow(clippy::too_many_arguments)]
 pub fn unpatchify(
     ctx: &Ctx,
     x: Tensor,
@@ -225,6 +266,7 @@ pub fn unpatchify(
     p: [u32; 3],
     o: &mut Tensor,
     o_grid: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
-    pixel_shuffle(ctx, x, grid, p, 0, o, o_grid)
+    shuffle_at(ctx, x, grid, p, 0, o, o_grid, bases)
 }

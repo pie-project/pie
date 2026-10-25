@@ -22,14 +22,17 @@ script is the other half: it turns the golden's *inputs* into the case JSON the
     # or all four
     python mini_dit_parity.py all --out /tmp/mini-dit-parity
 
-Nothing here imports torch: the reference numbers are already on disk, and
-patchify is a reshape.
+Nothing here imports torch: the reference numbers are already on disk.
 
 THE GUEST'S SHAPE
 -----------------
 One step is ONE pass of three lanes (caption, context, image) in one
 attention group: one logical computation is one pass, so its lanes always
-fire together.
+fire together. The latent goes in as the VAE holds it, `[H, W, C]`, and the
+velocity comes back on the same voxel axis, `[H*W, C]`: the model patchifies
+and computes its rotary positions in its own graph, so the case carries
+neither patches nor positions. `patchify` below exists only to check the
+golden's own `patches` and to land `final.tokens` for the diff.
 
 BISECTION
 ---------
@@ -69,11 +72,14 @@ def patchify(latent: np.ndarray, p: int) -> np.ndarray:
     x = x.transpose(0, 2, 4, 1, 3, 5)
     return np.ascontiguousarray(x.reshape(b, (hs // p) * (ws // p), c * p * p))
 
-def unpatchify(tokens: np.ndarray, c: int, hs: int, ws: int, p: int) -> np.ndarray:
-    b = tokens.shape[0]
-    x = tokens.reshape(b, hs // p, ws // p, c, p, p)
-    x = x.transpose(0, 3, 1, 4, 2, 5)
-    return np.ascontiguousarray(x.reshape(b, c, hs, ws))
+def hwc(latent: np.ndarray) -> np.ndarray:
+    """[B,C,H,W] -> [B,H,W,C]: the latent as the guest's voxel channel holds it."""
+    return np.ascontiguousarray(latent.transpose(0, 2, 3, 1))
+
+def chw(voxels: np.ndarray, c: int, hs: int, ws: int) -> np.ndarray:
+    """[B, H*W, C] (the voxel readout) -> [B,C,H,W]."""
+    b = voxels.shape[0]
+    return np.ascontiguousarray(voxels.reshape(b, hs, ws, c).transpose(0, 3, 1, 2))
 
 def loop_of(args) -> str | None:
     """The loop a run integrates: `euler`, a `--solver`, or none (one step)."""
@@ -110,17 +116,15 @@ def cases(args) -> list[str]:
     text = dump["in.text"]
     context = dump["in.context"]
     timestep = dump["in.timestep"]
-    txt_pos = dump["in.txt_pos"]
-    img_pos = dump["in.img_pos"]
     patches = patchify(dump["in.latent"], p)
     assert np.array_equal(patches, dump["patches"]), "patchify disagrees with the reference"
 
     if args.euler:
         euler = np.load(os.path.join(args.golden, f"mini_dit_euler_{args.policy}.npz"))
-        latents = patchify(euler["euler.x_init"], p)
+        latents = hwc(euler["euler.x_init"])
         sigmas = euler["euler.sigmas"].tolist()
     else:
-        latents = patches
+        latents = hwc(dump["in.latent"])
         sigmas = []
 
     os.makedirs(args.out, exist_ok=True)
@@ -128,16 +132,16 @@ def cases(args) -> list[str]:
     for b in range(latents.shape[0]):
         case = {
             "latents": latents[b].reshape(-1).astype(np.float32).tolist(),
-            "image_rows": int(latents.shape[1]),
-            "patch_features": int(latents.shape[2]),
+            "latent_h": int(hs),
+            "latent_w": int(ws),
+            "channels": int(c),
+            "image_tokens": int((hs // p) * (ws // p)),
             "text": text[b].reshape(-1).astype(np.float32).tolist(),
             "text_rows": int(text.shape[1]),
             "text_width": int(text.shape[2]),
             "context": context[b].reshape(-1).astype(np.float32).tolist(),
             "context_rows": int(context.shape[1]),
             "context_width": int(context.shape[2]),
-            "text_positions": txt_pos.reshape(-1).astype(np.float32).tolist(),
-            "image_positions": img_pos.reshape(-1).astype(np.float32).tolist(),
             "timestep": float(timestep[b]),
             "sigmas": [float(s) for s in sigmas],
             "t_scale": float(cfg["euler_t_scale"]),
@@ -147,7 +151,7 @@ def cases(args) -> list[str]:
         with open(path, "w") as f:
             json.dump(case, f)
         written.append(path)
-    print(f"[case] {len(written)} batch element(s), {latents.shape[1]} image rows -> {args.out}")
+    print(f"[case] {len(written)} batch element(s), a {hs}x{ws}x{c} latent -> {args.out}")
     return written
 
 def wasm(inferlet: str) -> str:
@@ -276,10 +280,13 @@ def classes(args) -> int:
         return 1
     for at in range(batches):
         v = {mode: np.asarray(answers[mode][at]["velocity"], dtype=np.float32) for mode in answers}
-        rows = int(answers["none"][at]["image_rows"])
-        width = int(answers["none"][at]["patch_features"])
-        side = int(round(rows ** 0.5))
-        left = np.array([(i % side) < side // 2 for i in range(rows)])
+        # The mask halves the token grid by column; on the voxel axis that is
+        # the left half of the latent's columns, the same cells.
+        doc = answers["none"][at]
+        rows = int(doc["image_rows"])
+        width = int(doc["velocity_width"])
+        cols = int(doc["latent_w"])
+        left = np.array([(i % cols) < cols // 2 for i in range(rows)])
         rel = lambda a, b: float(np.linalg.norm(a - b)) / max(float(np.linalg.norm(b)), 1e-30)
         if np.array_equal(v["all"], v["none"]):
             print(f"[classes] batch {at}: PASS an all-ones table is the plain step, exactly")
@@ -474,17 +481,17 @@ def collect(args) -> str:
     if not paths:
         raise SystemExit(f"{args.out}: no pie answer; run `run` first")
     docs = [document(path) for path in paths]
-    rows, width = docs[0]["image_rows"], docs[0]["patch_features"]
+    rows, width = docs[0]["image_rows"], docs[0]["velocity_width"]
 
     def stack(key: str, at: int | None = None) -> np.ndarray:
-        tokens = np.stack(
+        voxels = np.stack(
             [
                 np.asarray(doc[key] if at is None else doc[key][at], dtype=np.float32)
                 .reshape(rows, width)
                 for doc in docs
             ]
         )
-        return unpatchify(tokens, c, hs, ws, p)
+        return chw(voxels, c, hs, ws)
 
     out: dict[str, np.ndarray] = {}
     if loop_of(args):
@@ -500,9 +507,7 @@ def collect(args) -> str:
         out[args.tap] = np.stack([plane.reshape(-1, tw) for plane in planes]).squeeze()
     else:
         out["velocity"] = stack("velocity")
-        out["final.tokens"] = np.stack(
-            [np.asarray(doc["velocity"], dtype=np.float32).reshape(rows, width) for doc in docs]
-        )
+        out["final.tokens"] = patchify(out["velocity"], p)
 
     path = os.path.join(args.out, f"mini_dit_pie{'_' + loop_of(args) if loop_of(args) else ''}.npz")
     np.savez(path, **out)

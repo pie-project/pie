@@ -39,58 +39,12 @@ class SwitchDecl:
     name: str
     values: List[str]
 
-class AxisRole(Enum):
+class ReadoutKind(Enum):
     """
     ── Generative facts ────────────────────────────────────────────────
     What a guest sizes an image/video job from, so it never parses
-    `architecture()`: how its positions are laid out, its latent space,
-    and the schedule it was trained under. A text model answers `none`
-    to each.
-    What one axis of a positions input means. The rotary space a
-    DiT was trained in is 1..=4 axes wide and every family orders them
-    differently; this names them so a guest can fill the grid without
-    knowing the family.
-    """
-    TIME = 0
-    HEIGHT = 1
-    WIDTH = 2
-    INDEX = 3
-
-@dataclass
-class PositionConvention:
-    """
-    WHERE A MODEL'S LANES SIT IN THE ROTARY SPACE.
-    
-    A denoiser's positions input takes one coordinate vector
-    per row, and which coordinate goes where is a family contract the
-    guest must not spell (`flux_2`'s `(0, h, w, j)`, `z_image`'s
-    `(L + 1, a, b)`). This fact states it, so `latent::positions_for`
-    builds both from the same code:
-    
-      * a TEXT or CONTEXT lane's row `j` sits at `text-origin + j` on
-        axis `text-axis`, and at 0 on every other axis;
-      * an IMAGE lane's patch `(a, b)` sits at `a` on the `height` axis
-        and `b` on the `width` axis; on `text-axis` it sits at
-        `text-origin + text-rows` when `image-follows-text`, else 0; on
-        every remaining axis, 0.
-      * a REFERENCE lane's patch `(a, b)` of reference `i` sits where an
-        image lane's would, except on the `time` axis, where it sits at
-        `reference-stride * (i + 1)` -- the offset that keeps each
-        reference picture in a rotary neighbourhood of its own, clear of
-        the target grid at 0.
-    
-    `axes` has exactly the positions input's `width` entries. A family whose
-    positions do not fit this shape states `none` and its guests build
-    their own.
-    """
-    axes: List[AxisRole]
-    text_axis: int
-    text_origin: int
-    image_follows_text: bool
-    reference_stride: Optional[int]
-
-class ReadoutKind(Enum):
-    """
+    `architecture()`: its latent space and the schedule it was trained
+    under. A text model answers `none` to each.
     Which export seam a lane's epilogue reads: `logits()` for a text
     head, `velocity()` for a denoiser, `hidden()` for an encoder,
     `pixels` for a VAE on the voxel axis (one row per output voxel of
@@ -154,15 +108,12 @@ class LaneDecl:
 @dataclass
 class LatentSpace:
     """
-    The latent space a denoiser works in: one latent row is
-    `patch-t × patch-h × patch-w` cells of `channels` values, one cell
-    is `spatial-compression²` pixels by `temporal-compression` frames.
-    `none` for a model with no latent.
+    The latent space a denoiser works in, the VAE's own: a `[t, h, w,
+    channels]` volume, one cell `spatial-compression²` pixels by
+    `temporal-compression` frames. How the denoiser patches it is the
+    model's business, not the guest's. `none` for a model with no latent.
     """
     channels: int
-    patch_t: int
-    patch_h: int
-    patch_w: int
     spatial_compression: int
     temporal_compression: int
 
@@ -235,12 +186,6 @@ def switches() -> List[SwitchDecl]:
     """
     Every switch the bound model declares. Empty for a model with one
     path (every text model). Static.
-    """
-    raise NotImplementedError
-def positions() -> Optional[PositionConvention]:
-    """
-    How the bound model's lanes place their rows in the rotary space,
-    when it states a convention. `none` otherwise. Static.
     """
     raise NotImplementedError
 def lane(switches: List[Tuple[str, str]]) -> LaneDecl:

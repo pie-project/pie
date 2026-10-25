@@ -418,20 +418,7 @@ fn the_generative_facts_state_the_reading_its_latent_and_its_schedule() {
     );
 
     let latent = facts.latent.expect("a denoiser states its latent space");
-    assert_eq!(
-        (
-            latent.channels,
-            latent.patch_h,
-            latent.patch_w,
-            latent.patch_t
-        ),
-        (model::CHANNELS, model::PATCH, model::PATCH, 1)
-    );
-    assert_eq!(
-        latent.channels * latent.patch_t * latent.patch_h * latent.patch_w,
-        model::PATCH_FEATURES,
-        "a latent row is exactly the head's output row"
-    );
+    assert_eq!(latent.channels, model::CHANNELS);
     let schedule = facts.schedule.as_ref().expect("and its schedule");
     assert_eq!(schedule.kind, poem::generative::ScheduleKind::Flow);
     assert_eq!(schedule.pinned_sigmas, vec![1.0, 0.75, 0.5, 0.25]);

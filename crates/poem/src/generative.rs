@@ -10,9 +10,6 @@ pub struct Generative {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LatentSpace {
     pub channels: u32,
-    pub patch_t: u32,
-    pub patch_h: u32,
-    pub patch_w: u32,
     pub spatial_compression: u32,
     pub temporal_compression: u32,
 }

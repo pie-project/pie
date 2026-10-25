@@ -436,7 +436,7 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
         let plan = trace(deployment, Platform::Cuda);
         let d = dims(deployment);
         let ty = |id: ValueId| plan.values[id.0 as usize].ty.clone();
-        let (mut lane_scales, mut row_pads) = (0usize, 0usize);
+        let mut lane_scales = 0usize;
         for node in &plan.nodes {
             let Operation::Elemwise(Elemwise::Modulate {
                 x,
@@ -455,44 +455,31 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
                     dtype: Dtype::Bf16,
                 }
             );
-            match lane_of_row {
-                Some(lanes) => {
-                    lane_scales += 1;
-                    assert_eq!(*form, poem::ModulateForm::Scale);
-                    assert_eq!(
-                        ty(*m),
-                        Ty::Tensor {
-                            shape: vec![Dim::Lanes, Dim::Const(u64::from(d.dim))],
-                            dtype: Dtype::F32,
-                        }
-                    );
-                    assert_eq!(
-                        plan.values[lanes.0 as usize].def,
-                        Def::Input(RuntimeInput::Geometry {
-                            space: 0,
-                            kind: GeomKind::RequestOfToken
-                        })
-                    );
+            let lanes = lane_of_row
+                .as_ref()
+                .expect("every modulation is per lane: nothing pads rows");
+            lane_scales += 1;
+            assert_eq!(*form, poem::ModulateForm::Scale);
+            assert_eq!(
+                ty(*m),
+                Ty::Tensor {
+                    shape: vec![Dim::Lanes, Dim::Const(u64::from(d.dim))],
+                    dtype: Dtype::F32,
                 }
-                None => {
-                    row_pads += 1;
-                    assert_eq!(*form, poem::ModulateForm::ScaleShift);
-                    assert_eq!(
-                        ty(*m),
-                        Ty::Tensor {
-                            shape: vec![Dim::Tokens, Dim::Const(u64::from(2 * d.dim))],
-                            dtype: Dtype::Bf16,
-                        },
-                        "{deployment}: the pad flag projects per row in the trunk's dtype"
-                    );
-                }
-            }
+            );
+            assert_eq!(
+                plan.values[lanes.0 as usize].def,
+                Def::Input(RuntimeInput::Geometry {
+                    space: 0,
+                    kind: GeomKind::RequestOfToken
+                })
+            );
         }
         let modulated = (d.refiner_layers + d.joint_layers) as usize;
         assert_eq!(
-            (lane_scales, row_pads),
-            (2 * modulated + 1, 1),
-            "{deployment}: only the caption pads; an image lane carries its patches alone"
+            lane_scales,
+            2 * modulated + 1,
+            "{deployment}: the caption and the image carry their own rows, no pads"
         );
 
         let mut folds = 0usize;
@@ -527,21 +514,8 @@ fn the_generative_facts_state_the_readings_the_schedule_and_the_latent_space() {
         };
         assert_eq!(names, want, "{deployment}");
         let latent = facts.latent.expect("a denoiser states its latent space");
-        assert_eq!(
-            (
-                latent.channels,
-                latent.patch_t,
-                latent.patch_h,
-                latent.patch_w
-            ),
-            (model::CHANNELS, 1, model::PATCH, model::PATCH)
-        );
+        assert_eq!(latent.channels, model::CHANNELS);
         assert_eq!(latent.spatial_compression, model::SPATIAL_COMPRESSION);
-        assert_eq!(
-            latent.channels * latent.patch_h * latent.patch_w,
-            model::PATCH_FEATURES,
-            "a latent row is exactly the head's output row"
-        );
         let schedule = facts.schedule.as_ref().expect("and its schedule");
         assert_eq!(
             (schedule.kind, schedule.shift, schedule.train_steps),

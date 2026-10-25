@@ -5,7 +5,7 @@
 // around.
 
 import * as _model from 'pie:inferlet/model@0.3.0';
-import type { BlockDrafter, LaneDecl, LatentSpace, PositionConvention, ScheduleFact, SwitchDecl } from 'pie:inferlet/model@0.3.0';
+import type { BlockDrafter, LaneDecl, LatentSpace, ScheduleFact, SwitchDecl } from 'pie:inferlet/model@0.3.0';
 
 // The tokenizer surface lives in the sibling `tokenizer` module and is
 // re-exported here, so `model.encode`/`model.decode` read off `model` the way
@@ -94,12 +94,6 @@ export function switchDecl(name: string): SwitchDecl | undefined {
   return _model.switches().find((d) => d.name === name);
 }
 
-/** How the bound model's lanes place their rows in the rotary space;
- *  `undefined` when it states no convention. */
-export function positions(): PositionConvention | undefined {
-  return _model.positions();
-}
-
 /** The lane a pass of these switches is: the inputs it binds (exactly
  *  these, by `ForwardPass.input`), whether it binds `state` and `embed`, and
  *  what it reads out. Switches are `[name, value]` pairs of `switches()`;
@@ -125,13 +119,11 @@ export function maxLatentRows(): number {
 }
 
 export type {
-  AxisRole,
   BlockDrafter,
   InputAxis,
   InputDecl,
   LaneDecl,
   LatentSpace,
-  PositionConvention,
   Readout,
   ReadoutKind,
   ScheduleFact,

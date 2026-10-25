@@ -35,10 +35,13 @@
 //!
 //! `denoise` is two lanes here (no reference): the text lane
 //! (stream `text`, the `context` input at width `dim`) and the target lane
-//! (stream `image`, the `latents` input), one group, both lanes of ONE
-//! pass binding the one loop-carried timestep cell. Only the image lane
-//! reads out. The pass is submitted once a step (`trajectory` on why); the
-//! latent channel is loop-carried by the epilogue.
+//! (stream `image`, the `latents` input: the VAE-native latent `[h, w, C]`
+//! on the voxel axis), one group, both lanes of ONE pass binding the one
+//! loop-carried timestep cell. The model patchifies and computes every
+//! row's rotary position in its graph; the guest states neither. Only the
+//! image lane reads out, on the voxel axis. Every trajectory runs down ONE
+//! pipeline and reads the one conditioning channel: a channel no pass
+//! writes is shared by every pass that reads it.
 use inferlet::latent::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -59,16 +62,15 @@ struct Case {
     context_file: String,
     text_rows: u32,
     context_width: u32,
-    /// `[image_rows, channels]` f32 LE: the golden's initial noise.
+    /// `[height, width, channels]` f32 LE: the golden's initial noise in
+    /// the VAE's own latent space (unpacked by the harness).
     latents_file: String,
-    image_rows: u32,
+    height: u32,
+    width: u32,
     channels: u32,
-    /// `[rows, 4]` f32 LE each.
-    text_positions_file: String,
-    image_positions_file: String,
     /// Descending, without the trailing zero.
     sigmas: Vec<f32>,
-    /// `[sigmas.len(), image_rows, channels]` f32 LE: the reference's OWN
+    /// `[sigmas.len(), height, width, channels]` f32 LE: the reference's OWN
     /// input latent at every step. Given, the guest also runs one
     /// independent one-fire denoise per step off these — the velocity a
     /// step predicts under the reference's own state, which is the model
@@ -93,7 +95,10 @@ struct Output {
     token_ids: Vec<u32>,
     text_rows: u32,
     hidden_width: u32,
-    image_rows: u32,
+    /// The latent the velocities and latents are sent in, `[height, width,
+    /// channels]` (the velocity's voxels in the same row-major order).
+    height: u32,
+    width: u32,
     channels: u32,
     sigmas: Vec<f32>,
     /// What `session::send_file` sent, in order: `file-0000.bin` is
@@ -101,10 +106,8 @@ struct Output {
     files: Vec<String>,
 }
 
-/// The two widths this guest sizes channels from: the rotary axes of the
-/// `positions` input and the readout's velocity width.
+/// The velocity width the image lane reads out.
 struct Dims {
-    axes: u32,
     velocity_width: u32,
 }
 
@@ -133,20 +136,11 @@ fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::La
     Ok(lane)
 }
 
-/// The width of the input `name` a lane reads.
-fn width_of(lane: &model::LaneDecl, name: &str) -> Result<u32> {
-    lane.inputs
-        .iter()
-        .find(|i| i.name == name)
-        .map(|i| i.width)
-        .ok_or_else(|| format!("the lane reads no `{name}`").into())
-}
-
 /// Checks both lanes against what this guest binds — no `guidance`:
 /// klein-4B embeds none — and reads the widths off them.
 fn dims(reading: &str) -> Result<Dims> {
-    let image = lane_reading(reading, "image", &["latents", "positions", "timestep"])?;
-    lane_reading(reading, "text", &["context", "positions", "timestep"])?;
+    let image = lane_reading(reading, "image", &["latents", "timestep"])?;
+    lane_reading(reading, "text", &["context", "timestep"])?;
     let velocity_width = match &image.readout {
         Some(readout) if readout.kind == model::ReadoutKind::Velocity => readout.width,
         other => {
@@ -155,10 +149,7 @@ fn dims(reading: &str) -> Result<Dims> {
             ));
         }
     };
-    Ok(Dims {
-        axes: width_of(&image, "positions")?,
-        velocity_width,
-    })
+    Ok(Dims { velocity_width })
 }
 
 fn read_f32(name: &str, count: usize) -> Result<Vec<f32>> {
@@ -189,11 +180,10 @@ fn send_f32(files: &mut Vec<String>, name: &str, rows: &[f32]) {
 
 /// The `text` reading over `ids`: `encode_text`'s pass, with the ids
 /// chosen here so the harness can check them against the pipeline's.
-async fn text_rows(ids: &[u32], width: u32) -> Result<Vec<f32>> {
+async fn text_rows(ids: &[u32], width: u32, pipe: &Pipeline) -> Result<Vec<f32>> {
     let len = u32::try_from(ids.len()).map_err(|_| "the prompt is too long")?;
     let toks: Vec<i32> = ids.iter().map(|&id| id as i32).collect();
     let ws = WorkingSet::new();
-    let pipe = Pipeline::new();
 
     let toks = Channel::from(toks).named("ids");
     let embed_indptr = Channel::from([0u32, len]);
@@ -209,40 +199,29 @@ async fn text_rows(ids: &[u32], width: u32) -> Result<Vec<f32>> {
     pass.epilogue(move || {
         readback.put(intrinsics::hidden(0, len, width));
     });
-    pass.submit(&pipe).context("text pass")?;
+    pass.submit(pipe).context("text pass")?;
     let rows: Vec<f32> = out.take_host().await?;
-    pipe.close();
     Ok(rows)
 }
 
-/// The conditioning one trajectory runs under.
-struct Text {
-    rows: u32,
-    context: Channel,
-    positions: Channel,
-}
-
-/// `sigmas.len()` Euler steps from `noise`, the velocity at step 0 and the
-/// latent after every step read back to the host (one `[rows, channels]`
+/// `sigmas.len()` Euler steps from `noise` (`[h, w, C]`), the velocity at
+/// step 0 and the latent after every step read back to the host (one
 /// readback a fire; the loop-carried latent never crosses).
 ///
-/// Both lanes are ONE pass, submitted once a step: a seeded channel's seed
-/// rides with the first submit of the pass that binds it, so a fresh pass a
-/// step would find the context cell empty. The timestep is one loop-carried
-/// cell both lanes read (the epilogue advances it by the step index), the
-/// way `latent-probe` steps its schedule. `image_first` puts the image lane
-/// at lane 0, ahead of the text lane.
+/// Both lanes are ONE pass, submitted once a step. The timestep is one
+/// loop-carried cell both lanes read (the epilogue advances it by the step
+/// index). `image_first` puts the image lane at lane 0, ahead of the text
+/// lane.
+#[allow(clippy::too_many_arguments)]
 async fn trajectory(
-    text: &Text,
+    context: &Channel,
     noise: &[f32],
-    positions: &[f32],
-    rows: u32,
-    width: u32,
+    lat: [u32; 3],
     sigmas: &[f32],
     dims: &Dims,
     reading: &str,
-    group: u32,
     image_first: bool,
+    pipe: &Pipeline,
 ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
     let steps = u32::try_from(sigmas.len()).map_err(|_| "too many sigmas")?;
     // `ts[k]` is what fire `k` reads; one trailing 0 so the last advance
@@ -255,9 +234,9 @@ async fn trajectory(
     let ts_ch = Channel::from(ts.clone()).named("ts");
     let dts_ch = Channel::from(dts).named("dts");
 
-    let pipe = Pipeline::new();
-    let x = Channel::from_shaped([rows, width], noise).named("latents");
-    let img_pos = Channel::from_shaped([rows, dims.axes], positions).named("img_pos");
+    let voxels = lat[0] * lat[1];
+    let channels = lat[2];
+    let x = Channel::from_shaped(lat, noise).named("latents");
     let velocity_width = dims.velocity_width;
     let (img_lane, txt_lane) = if image_first { (0, 1) } else { (1, 0) };
 
@@ -266,42 +245,36 @@ async fn trajectory(
     let pass = ForwardPass::new();
     pass.switch(txt_lane, "reading", reading)?;
     pass.switch(txt_lane, "stream", "text")?;
-    pass.group(txt_lane, group)?;
-    pass.input(txt_lane, "context", &text.context)?;
-    pass.input(txt_lane, "positions", &text.positions)?;
+    pass.group(txt_lane, 0)?;
+    pass.input(txt_lane, "context", context)?;
     pass.input(txt_lane, "timestep", &t)?;
     pass.switch(img_lane, "reading", reading)?;
     pass.switch(img_lane, "stream", "image")?;
-    pass.group(img_lane, group)?;
+    pass.group(img_lane, 0)?;
     pass.input(img_lane, "latents", &x)?;
-    pass.input(img_lane, "positions", &img_pos)?;
     pass.input(img_lane, "timestep", &t)?;
 
-    let v_out = Channel::new([rows, velocity_width], dtype::f32).named("v_out");
-    let x_out = Channel::new([rows, width], dtype::f32).named("x_out");
-    {
-        let (xc, vo, xo) = (x.clone(), v_out.clone(), x_out.clone());
-        let (t, k) = (t.clone(), k.clone());
-        pass.epilogue(move || {
-            let k_cur = k.take();
-            let v = intrinsics::velocity(img_lane, rows, velocity_width);
-            let cur = xc.take();
-            let dt = gather(dts_ch.read(), &k_cur);
-            let next = euler_step(&cur, &v, &dt);
-            xc.put(&next);
-            vo.put(&v);
-            xo.put(&next);
-            let k_next = &k_cur + 1u32;
-            t.take();
-            t.put(gather(ts_ch.read(), &k_next));
-            k.put(&k_next);
-        });
-    }
+    let v_out = Channel::new([voxels, velocity_width], dtype::f32).named("v_out");
+    let x_out = Channel::new(lat, dtype::f32).named("x_out");
+    pass.epilogue(move || {
+        let k_cur = k.take();
+        let v = intrinsics::velocity(img_lane, voxels, velocity_width);
+        let cur = reshape(x.take(), [voxels, channels]);
+        let dt = gather(dts_ch.read(), &k_cur);
+        let next = reshape(euler_step(&cur, &v, &dt), lat);
+        x.put(&next);
+        v_out.put(&v);
+        x_out.put(&next);
+        let k_next = &k_cur + 1u32;
+        t.take();
+        t.put(gather(ts_ch.read(), &k_next));
+        k.put(&k_next);
+    });
 
     let mut velocity0 = Vec::new();
     let mut latents = Vec::with_capacity(sigmas.len());
     for i in 0..steps {
-        pass.submit(&pipe)
+        pass.submit(pipe)
             .with_context(|| format!("denoise step {i}"))?;
         let v: Vec<f32> = v_out
             .take_host()
@@ -316,8 +289,6 @@ async fn trajectory(
         }
         latents.push(xn);
     }
-    pipe.close();
-    let _ = text.rows;
     Ok((velocity0, latents))
 }
 
@@ -360,7 +331,7 @@ async fn main(input: Input) -> Result<Output> {
     let dims = dims(denoise)?;
     if dims.velocity_width != case.channels {
         return Err(format!(
-            "the model reads a {}-wide velocity and the case carries {}-wide tokens",
+            "the model reads a {}-wide velocity and the case's latent has {} channels",
             dims.velocity_width, case.channels
         )
         .into());
@@ -374,50 +345,37 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let mut files = Vec::new();
+    // Every pass of the job, in order, down one pipeline.
+    let pipe = Pipeline::new();
 
     // 1. The text reading.
     let mut ids = inferlet::chat::first_user(&case.prompt);
     ids.extend(inferlet::chat::cue());
     let len = u32::try_from(ids.len()).map_err(|_| "the prompt is too long")?;
-    let hidden = text_rows(&ids, hidden_width).await?;
+    let hidden = text_rows(&ids, hidden_width, &pipe).await?;
     send_f32(&mut files, "hidden.f32", &hidden);
 
     // 2 + 3. The trajectory over the golden's conditioning.
-    let rows = case.image_rows;
-    let width = case.channels;
-    let noise = read_f32(&case.latents_file, (rows * width) as usize)?;
-    let img_pos = read_f32(&case.image_positions_file, (rows * dims.axes) as usize)?;
+    let lat = [case.height, case.width, case.channels];
+    let cells = (case.height * case.width * case.channels) as usize;
+    let noise = read_f32(&case.latents_file, cells)?;
     let context = read_f32(
         &case.context_file,
         (case.text_rows * case.context_width) as usize,
     )?;
-    let txt_pos = read_f32(
-        &case.text_positions_file,
-        (case.text_rows * dims.axes) as usize,
-    )?;
-    // A SEEDED CHANNEL BINDS TO ONE PASS, so every trajectory below builds
-    // its own copy of the conditioning off the same host rows: sharing one
-    // `Text` across two trajectories is "seeded but no seed was put before
-    // the first fire" on the second one's text pass.
-    let conditioning = |tag: &str| Text {
-        rows: case.text_rows,
-        context: Channel::from_shaped([case.text_rows, case.context_width], context.clone())
-            .named(&format!("context_{tag}")),
-        positions: Channel::from_shaped([case.text_rows, dims.axes], txt_pos.clone())
-            .named(&format!("txt_pos_{tag}")),
-    };
-    let golden = conditioning("walk");
+    // One conditioning channel: no pass writes it, so every trajectory's
+    // pass reads the same one.
+    let golden = Channel::from_shaped([case.text_rows, case.context_width], context)
+        .named("context");
     let (velocity0, latents) = trajectory(
         &golden,
         &noise,
-        &img_pos,
-        rows,
-        width,
+        lat,
         &case.sigmas,
         &dims,
         denoise,
-        0,
         case.image_first,
+        &pipe,
     )
     .await?;
     send_f32(&mut files, "velocity0.f32", &velocity0);
@@ -428,20 +386,17 @@ async fn main(input: Input) -> Result<Output> {
     // One independent fire per step, from the reference's own state.
     if let Some(name) = &case.probe_latents_file {
         let steps = case.sigmas.len();
-        let stack = read_f32(name, steps * (rows * width) as usize)?;
-        let stride = (rows * width) as usize;
+        let stack = read_f32(name, steps * cells)?;
         for (k, sigma) in case.sigmas.iter().enumerate() {
             let (velocity, _) = trajectory(
-                &conditioning(&format!("probe{k}")),
-                &stack[k * stride..(k + 1) * stride],
-                &img_pos,
-                rows,
-                width,
+                &golden,
+                &stack[k * cells..(k + 1) * cells],
+                lat,
                 &[*sigma],
                 &dims,
                 denoise,
-                2 + k as u32,
                 case.image_first,
+                &pipe,
             )
             .await
             .with_context(|| format!("probe step {k}"))?;
@@ -449,30 +404,18 @@ async fn main(input: Input) -> Result<Output> {
         }
     }
 
-    // The same trajectory over pie's own text rows: `(0, 0, 0, j)`.
+    // The same trajectory over pie's own text rows.
     if case.native {
-        let mut pos = Vec::with_capacity((len * dims.axes) as usize);
-        for j in 0..len {
-            for axis in 0..dims.axes {
-                pos.push(if axis + 1 == dims.axes { j as f32 } else { 0.0 });
-            }
-        }
-        let native = Text {
-            rows: len,
-            context: Channel::from_shaped([len, hidden_width], hidden.clone()).named("native_ctx"),
-            positions: Channel::from_shaped([len, dims.axes], pos).named("native_pos"),
-        };
+        let native = Channel::from_shaped([len, hidden_width], hidden.clone()).named("native_ctx");
         let (velocity0, latents) = trajectory(
             &native,
             &noise,
-            &img_pos,
-            rows,
-            width,
+            lat,
             &case.sigmas,
             &dims,
             denoise,
-            1,
             case.image_first,
+            &pipe,
         )
         .await?;
         send_f32(&mut files, "native_velocity0.f32", &velocity0);
@@ -480,14 +423,16 @@ async fn main(input: Input) -> Result<Output> {
             send_f32(&mut files, &format!("native_latent{}.f32", i + 1), x);
         }
     }
+    pipe.close();
 
     Ok(Output {
         instance,
         token_ids: ids,
         text_rows: len,
         hidden_width,
-        image_rows: rows,
-        channels: width,
+        height: case.height,
+        width: case.width,
+        channels: case.channels,
         sigmas: case.sigmas,
         files,
     })

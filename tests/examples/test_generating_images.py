@@ -4,8 +4,7 @@ This is the USER PATH, not the sampler. `test_text_to_image.py` is the gate on
 the guest -- that it finds its readings by role, steps the family's own sigmas,
 refuses a model with no text encoder. This one asserts the half in front of
 that: that the facts are visible before the run, that the run needs no path,
-and that what comes back is a named file a decoder turns into a picture of the
-size that was asked for.
+and that what comes back is a named PNG of the size that was asked for.
 
 Three claims, in the order the guide teaches them:
   * `pie model list` / `pie model info` report the served row's GENERATIVE
@@ -14,10 +13,9 @@ Three claims, in the order the guide teaches them:
   * `pie run text-to-image -o DIR -- --prompt "..."` runs the guest BY NAME.
     No `--path`: the name resolves against the
     `examples` of the checkout the command runs in;
-  * the file that arrives is NAMED -- `image.png` where the row drives its own
-    `vae.decode` reading, `image.latent.f32` where it does not, never
-    `file-0000.bin` -- and it is a PNG of the size that was asked for, either
-    straight out of the run or through `scripts/imagegen/decode_latent.py`.
+  * the file that arrives is NAMED -- `image.png`, the row's own `vae.decode`
+    reading fired in-guest, never `file-0000.bin` -- and it is a PNG of the
+    size that was asked for.
 
 **WHAT THE PICTURE CHECK DOES NOT PROVE.** It proves the file decodes, that it
 is the size that was asked for, and that the decode was not a flat field. It
@@ -31,13 +29,12 @@ carry. A person looking at the PNG is still the check on fidelity.
 **WANTS A GENERATIVE MODEL.** A config bound to a text row has nothing to
 drive here and is reported as a skip, not a failure:
     CUDA_VISIBLE_DEVICES=3 uv run python tests/examples/test_generating_images.py \\
-        --config ~/.pie/config.t2i-client.toml \\
-        --model-dir ~/.cache/huggingface/hub/models--black-forest-labs--FLUX.2-klein-4B/snapshots/*/
+        --config ~/.pie/config.t2i-client.toml
 
 **GIVE THIS RUN ITS OWN CONFIG FILE**, with its own `[server] listen` and
 `[engine] max_model_len = 32768`. A shared config another process repoints at
 a different artifact mid-run is indistinguishable from a numerics regression:
-the run still succeeds and hands back a plausible latent for the wrong model.
+the run still succeeds and hands back a plausible picture of the wrong model.
 The `max_model_len` default of 4096 kills a 1024**2 job on its second fire
 ("this fire wants 8192 kv tokens in one slot").
 
@@ -214,11 +211,10 @@ def the_store_says_what_the_row_can_do(args) -> dict:
     assert schedule and schedule["kind"] in ("flow", "epsilon", "v-prediction"), facts
     assert facts["max_latent_rows"] > 0, facts
 
-    # One latent row covers this many pixels, which is what a size rounds to.
-    step_w = latent["patch_w"] * latent["spatial_compression"]
-    step_h = latent["patch_h"] * latent["spatial_compression"]
-    assert args.size % step_w == 0 and args.size % step_h == 0, (
-        f"{args.size} is not a multiple of this row's {step_w}x{step_h} pixel step"
+    # One latent cell covers this many pixels, which is what a size rounds to.
+    step = latent["spatial_compression"]
+    assert args.size % step == 0, (
+        f"{args.size} is not a multiple of this row's {step}-pixel latent cell"
     )
 
     # `info` is the same facts rendered for a person, and the readings are the
@@ -276,15 +272,13 @@ def a_bare_name_draws_a_named_file(args, out_dir: Path) -> dict:
     )
 
     assert report["width"] == args.size and report["height"] == args.size, report
-    assert report["rows"] == report["grid_h"] * report["grid_w"], report
+    sc = report["spatial_compression"]
+    assert (report["latent_h"] * sc, report["latent_w"] * sc) == (args.size, args.size), report
     assert report["steps"] == args.steps, report
     assert len(report["sigmas"]) == args.steps + 1, report
     assert report["context_rows"] > 0, "the prompt encoded to no rows"
-    assert report["non_finite"] == 0, f"the latent carries non-finite values: {report}"
-    assert 0.05 < report["std"] < 20.0, f"the final latent's scale is {report['std']}"
-    assert (out_dir / report["file"]).stat().st_size == report["bytes"], report
 
-    print(f"✅ {out_dir / report['file']}  ({report['bytes']:,} bytes), "
+    print(f"✅ {out_dir / report['file']}, "
           f"{report['steps']} steps at {report['width']}x{report['height']}")
     return report
 
@@ -310,40 +304,12 @@ def check_png(path: Path, width: int, height: int) -> str:
     return "Pillow"
 
 
-def the_file_decodes_to_a_picture(args, out_dir: Path, report: dict) -> None:
-    """The second half of the raw-latent exit: the sidecar plus the family's
-    own VAE."""
-    latent = out_dir / report["file"]
-    sidecar = out_dir / "image.json"
-    sidecar.write_text(json.dumps(report, indent=2))
-    png = out_dir / "image.png"
-    decode = [args.python, str(REPO_ROOT / "scripts" / "imagegen" / "decode_latent.py"),
-              "--latent", str(latent), "--sidecar", str(sidecar),
-              "--model-dir", resolve(args.model_dir), "--out", str(png),
-              "--family", args.family]
-    print("Decode:", " ".join(decode))
-    done = subprocess.run(decode, cwd=REPO_ROOT, capture_output=True, text=True,
-                          timeout=args.timeout)
-    sys.stdout.write(done.stdout)
-    if done.returncode != 0:
-        sys.stderr.write(done.stderr)
-        raise AssertionError(f"decode_latent.py exited {done.returncode}")
-    how = check_png(png, args.size, args.size)
-    print(f"✅ {png}  {png.stat().st_size:,} bytes  ({args.size}x{args.size}, checked by {how})")
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", required=True,
                     help="the serving config; give this run its own")
     ap.add_argument("--pie", default=None, help="the `pie` binary (default: target/{release,debug})")
-    ap.add_argument("--model-dir", default=None,
-                    help="the diffusers folder to decode with; without it the file is "
-                         "checked but not decoded")
-    ap.add_argument("--family", default="flux2", help="decode_latent.py's --family")
-    ap.add_argument("--python", default=sys.executable,
-                    help="the interpreter that has torch + diffusers (the imagegen venv)")
     ap.add_argument("--prompt", default="a red bicycle leaning on a blue wall")
     ap.add_argument("--size", type=int, default=1024)
     ap.add_argument("--steps", type=int, default=4)
@@ -362,22 +328,13 @@ def main() -> int:
         build_guest()
         print("🔄 a_bare_name_draws_a_named_file")
         report = a_bare_name_draws_a_named_file(args, out_dir)
-        if report.get("decoded"):
-            # The row drove its own `vae.decode` reading, so what arrived IS
-            # the picture (design D8/D11) and there is nothing left to decode.
-            png = out_dir / report["file"]
-            how = check_png(png, args.size, args.size)
-            print(f"✅ {png}  {png.stat().st_size:,} bytes  ({args.size}x{args.size}, "
-                  f"checked by {how}) -- decoded in-guest by reading "
-                  f"`{report['decode_reading']}`")
-            print("\n✅ every claim holds")
-            return 0
-        if not args.model_dir:
-            print("⚠️  no --model-dir: the latent is not decoded, so this run proved "
-                  "the commands and not the picture")
-            return 0
-        print("🔄 the_file_decodes_to_a_picture")
-        the_file_decodes_to_a_picture(args, out_dir, report)
+        # The row drove its own `vae.decode` reading, so what arrived IS the
+        # picture.
+        png = out_dir / report["file"]
+        how = check_png(png, args.size, args.size)
+        print(f"✅ {png}  {png.stat().st_size:,} bytes  ({args.size}x{args.size}, "
+              f"checked by {how}) -- decoded in-guest by reading "
+              f"`{report['decode_reading']}`")
     except FileNotFoundError as why:
         print(f"⏭️  SKIPPED: {why}")
         return 0

@@ -37,23 +37,24 @@ two with `compare.py`.
     python wan22_parity.py all --variant ti2v-5b --compact --out /tmp/wan22-full \
         --config ~/.pie/config.wan22-ti2v.toml
 
-Nothing here imports torch: the reference numbers are already on disk, and
-patchify is a reshape.
+Nothing here imports torch: the reference numbers are already on disk.
 
 THE GUEST'S SHAPE
 -----------------
-One step is a context lane plus one video lane (scalar timestep) or two
-video lanes (`--pertoken`: the first latent frame's tokens at timestep 0,
-the rest at `t` -- `wan_2`'s per-lane form of TI2V's per-token timestep),
-all in one attention group, each on ITS OWN pipeline.
+One step is ONE pass: a context lane plus one video lane (scalar timestep)
+or two video lanes (`--pertoken`: the first latent frame at timestep 0, the
+rest at `t` -- `wan_2`'s per-lane form of TI2V's per-token timestep), all in
+one attention group.
 
 LAYOUTS
 -------
-Patch rows are `(c, ph, pw)`, the transformer's `patch_embedding` input
-order, and the family hands its velocity back in the same order (`proj_out`
-is permuted at import), so `unpatchify` here is the inverse of `patchify`.
-Token order is `t * (H/2) * (W/2) + h * (W/2) + w`; positions are `(t, h, w)`
-in patch units.
+The guest takes the VAE's own latent, `[T, H, W, C]` (the golden's
+`[C, T, H, W]` transposed), and reads the velocity out on the same voxels;
+the model patchifies and computes positions in its graph. Only `--pertoken`
+states positions: its second video lane's clip starts at frame 1, which a
+lane's own computed positions would number 0, so the case carries the
+reference's `(t, h, w)` per patch (token order `t * (H/2) * (W/2) + h *
+(W/2) + w`) and the guest sets `positions = given`.
 """
 
 from __future__ import annotations
@@ -96,18 +97,7 @@ def b64(a: np.ndarray) -> str:
     """A float rectangle as the guest's `*_b64`: little-endian f32."""
     return base64.b64encode(np.ascontiguousarray(a, dtype="<f4").tobytes()).decode()
 
-def patchify(latent: np.ndarray, p: int) -> np.ndarray:
-    """[B,C,T,H,W] -> [B, T*(H/p)*(W/p), C*p*p], feature order (c, ph, pw)."""
-    b, c, t, h, w = latent.shape
-    x = latent.reshape(b, c, t, h // p, p, w // p, p)
-    x = x.transpose(0, 2, 3, 5, 1, 4, 6)
-    return np.ascontiguousarray(x.reshape(b, t * (h // p) * (w // p), c * p * p))
-
-def unpatchify(tokens: np.ndarray, c: int, t: int, h: int, w: int, p: int) -> np.ndarray:
-    b = tokens.shape[0]
-    x = tokens.reshape(b, t, h // p, w // p, c, p, p)
-    x = x.transpose(0, 4, 1, 2, 5, 3, 6)
-    return np.ascontiguousarray(x.reshape(b, c, t, h, w))
+PATCH = 2
 
 def positions(t: int, hp: int, wp: int) -> np.ndarray:
     """`(t, h, w)` per token, in token order."""
@@ -150,7 +140,7 @@ def timesteps(args, dump) -> np.ndarray:
 
 def lane_cut(pt: np.ndarray) -> tuple[int, float]:
     """A per-token timestep as the two lanes `wan_2` takes: how many leading
-    rows are the conditioning frame's (timestep 0), and the rest's timestep."""
+    tokens are the conditioning frame's (timestep 0), and the rest's timestep."""
     zeros = np.flatnonzero(pt == 0.0)
     cond_rows = int(zeros.size)
     assert np.array_equal(zeros, np.arange(cond_rows)), "the zeros are a prefix"
@@ -166,9 +156,9 @@ def cases(args) -> list[str]:
     ctx = dump[f"{r['stem']}.in.encoder_hidden_states"]
     ts = timesteps(args, dump)
     b, c, t, h, w = hs.shape
-    tokens = patchify(hs, 2)
-    pos = positions(t, h // 2, w // 2)
-    assert tokens.shape[1] == pos.shape[0]
+    latent = np.ascontiguousarray(hs.transpose(0, 2, 3, 4, 1))
+    pos = positions(t, h // PATCH, w // PATCH)
+    per_frame = (h // PATCH) * (w // PATCH)
 
     os.makedirs(args.out, exist_ok=True)
     written = []
@@ -177,17 +167,22 @@ def cases(args) -> list[str]:
         if ts.ndim == 1:
             timestep = float(ts[i])
         else:
-            assert ts.shape[1] == tokens.shape[1], (ts.shape, tokens.shape)
+            assert ts.shape[1] == pos.shape[0], (ts.shape, pos.shape)
             cond_rows, timestep = lane_cut(ts[i])
+            assert cond_rows % per_frame == 0, "the conditioning rows are whole frames"
         case = {
-            "rows": int(tokens.shape[1]),
-            "patch_features": int(tokens.shape[2]),
-            "cond_rows": cond_rows,
+            "frames": int(t),
+            "height": int(h),
+            "width": int(w),
+            "channels": int(c),
+            "cond_frames": cond_rows // per_frame,
             "context_rows": int(ctx.shape[1]),
             "context_width": int(ctx.shape[2]),
             "timestep": timestep,
         }
-        rows = {"latents": tokens[i], "context": ctx[i], "positions": pos}
+        rows = {"latents": latent[i], "context": ctx[i]}
+        if cond_rows:
+            rows["positions"] = pos
         if args.zero_context:
             rows["context"] = np.zeros_like(ctx[i])
         if args.compact:
@@ -201,9 +196,9 @@ def cases(args) -> list[str]:
         with open(path, "w") as f:
             json.dump(case, f)
         written.append(path)
-    lanes = f"cond {cond_rows} + rest" if cond_rows else "one lane"
+    lanes = f"cond {cond_rows // per_frame} frame(s) + rest" if cond_rows else "one lane"
     biggest = max(os.path.getsize(path) for path in written)
-    print(f"[case] {len(written)} batch element(s), {tokens.shape[1]} rows "
+    print(f"[case] {len(written)} batch element(s), {t}x{h}x{w} latent "
           f"({lanes}), {biggest / (1 << 20):.1f} MiB each -> {args.out}")
     return written
 
@@ -318,12 +313,11 @@ def collect(args) -> str:
     if not paths:
         raise SystemExit(f"{args.out}: no pie answer; run `run` first")
     docs = [document(path) for path in paths]
-    rows, width = docs[0]["rows"], docs[0]["patch_features"]
-    tokens = np.stack(
-        [np.asarray(doc["velocity"], dtype=np.float32).reshape(rows, width) for doc in docs]
+    voxels = np.stack(
+        [np.asarray(doc["velocity"], dtype=np.float32).reshape(t, h, w, c) for doc in docs]
     )
     key = out_key(args)
-    mine = unpatchify(tokens, c, t, h, w, 2)
+    mine = np.ascontiguousarray(voxels.transpose(0, 4, 1, 2, 3))
     path, target = answers(args)
     np.savez(path, **{key: mine})
     theirs = dump[key][: len(docs)]
@@ -349,13 +343,10 @@ def conditioning(args) -> int:
     velocity move by more than the gate could hide.
 
     A cross-attention context is a lane of its own, and it conditions the
-    video rows only if the two lanes are members of ONE fire. Put them on one
-    pipeline and the scheduler seats them in different steps: the model then
-    attends its video rows alone, reads whatever the context rectangle held,
-    and answers something that a miniature's tolerance will happily pass. So
-    the harness asks the question directly: drop the prompt, and if the answer
-    does not move, the lanes were never in one attention. Lanes seated apart
-    read the same context rectangle in both runs, so the move is EXACTLY zero.
+    video rows only if the two lanes attend together: a miniature's tolerance
+    would happily pass a velocity that ignored it. So the harness asks the
+    question directly: drop the prompt, and if the answer does not move, the
+    lanes were never in one attention.
     """
     move = args.conditioning_move
     if move is None:
@@ -379,9 +370,8 @@ def conditioning(args) -> int:
     print(f"[conditioning] dropping the prompt moves the velocity by {moved:.4f} "
           f"(needs > {move}) — {verdict}")
     if verdict == "FAIL":
-        print("[conditioning] the context lane is not in the video lanes' fire: "
-              "each lane needs its OWN pipeline (a pipeline is serial, and the "
-              "scheduler never seats two of its passes in one step).")
+        print("[conditioning] the context lane is not in the video lanes' attention: "
+              "they are lanes of one pass and one group, so the fire dropped it.")
         return 1
     return 0
 

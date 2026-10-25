@@ -301,9 +301,6 @@ def generative(m):
     return generation(
         latent = latent_space(
             channels = d.channels,
-            patch_t = PATCH_T,
-            patch_h = PATCH_H,
-            patch_w = PATCH_W,
             spatial_compression = VAE_SPATIAL_COMPRESSION,
             temporal_compression = VAE_TEMPORAL_COMPRESSION,
         ),

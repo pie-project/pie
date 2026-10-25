@@ -6,8 +6,7 @@
 //! `latents`, with no `embed` and no `state`: a `[rows, width]` f32 latent
 //! channel bound as `input("latents")`, a `[1]` timestep channel bound as
 //! `input("timestep")`, every other input that lane reads bound to a
-//! plausible constant (an axis-position grid for `positions`, ones for any
-//! other lane input, zeros for any other row input), and an epilogue
+//! plausible constant (ones for any lane input, zeros for any other row input), and an epilogue
 //! that does the whole step on the device: fire 0 SEEDS the latent with a
 //! keyed Normal draw (the model's velocity over the zero cell is ignored),
 //! and every fire `k >= 1` integrates step `k - 1` of a flow schedule,
@@ -66,18 +65,6 @@ struct Output {
     /// Mean absolute value of the latent after every fire, fire 0 (the
     /// seed) first.
     trace: Vec<f32>,
-}
-
-/// The `[rows, axes]` positions of a `1 × 1 × rows` grid, cut to `axes`.
-fn positions_for(rows: u32, axes: u32) -> Vec<f32> {
-    let grid = positions_grid(1, 1, rows, [0.0, 0.0, 0.0]);
-    let mut cut = Vec::with_capacity((rows * axes) as usize);
-    for row in grid.chunks(3) {
-        for axis in 0..axes as usize {
-            cut.push(row.get(axis).copied().unwrap_or(0.0));
-        }
-    }
-    cut
 }
 
 #[inferlet::main]
@@ -196,10 +183,6 @@ async fn main(input: Input) -> Result<Output> {
             continue;
         }
         let ch = match (decl.name.as_str(), decl.axis) {
-            ("positions", _) => {
-                Channel::from_shaped([rows, decl.width], positions_for(rows, decl.width))
-                    .named(&decl.name)
-            }
             (_, model::InputAxis::Lane) => {
                 Channel::from(vec![1.0f32; decl.width as usize]).named(&decl.name)
             }

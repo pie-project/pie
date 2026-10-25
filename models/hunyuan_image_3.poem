@@ -175,9 +175,6 @@ def generative(m):
     return generation(
         latent = latent_space(
             channels = LATENT_CHANNELS,
-            patch_t = 1,
-            patch_h = PATCH,
-            patch_w = PATCH,
             spatial_compression = SPATIAL_COMPRESSION,
             temporal_compression = 1,
         ),

@@ -371,14 +371,11 @@ fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
         assert_eq!(
             (
                 latent.channels,
-                latent.patch_t,
-                latent.patch_h,
-                latent.patch_w,
                 latent.spatial_compression,
                 latent.temporal_compression
             ),
-            (24, 1, 2, 2, 16, 4),
-            "`{deployment}`: the f16 t4 c24 latent under a (1, 2, 2) patch"
+            (24, 16, 4),
+            "`{deployment}`: the f16 t4 c24 latent"
         );
         let schedule = facts.schedule.as_ref().expect("a schedule");
         assert_eq!(schedule.kind, ScheduleKind::Flow);

@@ -259,6 +259,7 @@ impl Run<'_> {
                 *p,
                 &mut self.tensor(*y),
                 self.tensor(*tgrid),
+                [self.row_base(*x), self.row_base(*y)],
             ),
             Conv::Unpatchify {
                 x,
@@ -273,6 +274,7 @@ impl Run<'_> {
                 *p,
                 &mut self.tensor(*y),
                 self.tensor(*grid),
+                [self.row_base(*x), self.row_base(*y)],
             ),
             Conv::Cells {
                 tgrid,
@@ -285,6 +287,7 @@ impl Run<'_> {
                 self.tensor(*positions),
                 *axis,
                 &mut self.tensor(*y),
+                self.row_base(*y),
             ),
         }
     }

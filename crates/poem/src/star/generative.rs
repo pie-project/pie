@@ -64,17 +64,11 @@ pub(crate) fn generative(builder: &mut GlobalsBuilder) {
     /// The latent space a model denoises in.
     fn latent_space(
         #[starlark(require = named)] channels: u32,
-        #[starlark(require = named)] patch_t: u32,
-        #[starlark(require = named)] patch_h: u32,
-        #[starlark(require = named)] patch_w: u32,
         #[starlark(require = named)] spatial_compression: u32,
         #[starlark(require = named)] temporal_compression: u32,
     ) -> anyhow::Result<Stated> {
         Ok(Stated(Fact::Latent(LatentSpace {
             channels,
-            patch_t,
-            patch_h,
-            patch_w,
             spatial_compression,
             temporal_compression,
         })))
