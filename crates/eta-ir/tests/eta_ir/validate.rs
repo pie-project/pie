@@ -115,6 +115,7 @@ fn section3() -> TraceContainer {
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
@@ -174,6 +175,7 @@ fn sink_precedence_t11() {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
     assert!(bind(mk(Stage::Prologue), profile.clone()).is_ok());
     assert!(matches!(
@@ -199,6 +201,7 @@ fn sink_precedence_t11() {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
     let apm = {
         let mut c = apm;
@@ -257,6 +260,7 @@ fn lora_honour_gate_and_placement() {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
     assert!(bind(mk(Stage::Prologue), ModelProfile::dummy()).is_ok());
     let mut no_lora = ModelProfile::dummy();

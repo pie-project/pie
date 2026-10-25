@@ -135,10 +135,11 @@ class ForwardPass:
         for a `row` input (every row input of a lane carries the same
         rows, and states the lane's rows when nothing else does), and one
         clip `[h, w, width]` or `[t, h, w, width]` for a `voxel` input; it
-        is `f32` for a float input and `i32` for an `i32` one. It must be
-        bound into this pass's program (the Rust library reads it in the
-        prologue when nothing else does). A pass binds exactly the inputs
-        its lane reads before `program`.
+        is `f32` for a float input and `i32` for an `i32` one. The
+        program lists the channel among its inputs, read where the
+        descriptor ports are, so a prologue `put` to it is the value the
+        forward reads. A pass binds exactly the inputs its lane reads
+        before `program`.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """

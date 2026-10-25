@@ -66,6 +66,7 @@ fn epilogue_reading(intr: IntrinsicId, shape: Shape, dtype: Dtype) -> TraceConta
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 

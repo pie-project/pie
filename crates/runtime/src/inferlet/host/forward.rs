@@ -1268,14 +1268,29 @@ impl ProcessCtx {
             {
                 return Ok(Err(error));
             }
+            let listed: Vec<u32> = prog
+                .bound
+                .container
+                .inputs
+                .iter()
+                .filter_map(|&dense| channel_reps.get(dense as usize).copied())
+                .collect();
             if let Some(input) = input_bindings
                 .iter()
-                .find(|input| !channel_reps.contains(&input.channel_rep))
+                .find(|input| !listed.contains(&input.channel_rep))
             {
                 return Ok(Err(format!(
-                    "pipeline: input `{}`'s channel is not bound into this pass's program; \
-                     read it in a stage (the inferlet library's `input` does) so the program declares it",
+                    "pipeline: input `{}`'s channel is not listed as an input of this pass's program",
                     input.name
+                )));
+            }
+            if let Some(&dense) = prog.bound.container.inputs.iter().find(|&&dense| {
+                !input_bindings
+                    .iter()
+                    .any(|input| channel_reps.get(dense as usize) == Some(&input.channel_rep))
+            }) {
+                return Ok(Err(format!(
+                    "pipeline: the program lists channel {dense} as an input that no `input` binds"
                 )));
             }
             let writes = |dense: usize| prog.channel_accesses[dense] != (false, false);

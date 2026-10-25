@@ -298,6 +298,7 @@ pub fn pixel_epilogue(clip: [u32; 3], rows: u32) -> TraceContainer {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
@@ -338,6 +339,7 @@ pub fn velocity_epilogue(rows: u32) -> TraceContainer {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 

@@ -100,6 +100,10 @@ pub enum ValidateError {
         intr: IntrinsicId,
         stage: Stage,
     },
+    InputsUnsortedOrDup,
+    InputChannelOutOfRange {
+        chan: u32,
+    },
     ExternsUnsortedOrDup,
     ExternDeclConflict {
         chan: u32,
@@ -203,6 +207,10 @@ impl fmt::Display for ValidateError {
                 intr.name(),
                 stage.name()
             ),
+            InputsUnsortedOrDup => f.write_str("input table must be sorted by channel, unique"),
+            InputChannelOutOfRange { chan } => {
+                write!(f, "input: channel index {chan} out of range")
+            }
             ExternsUnsortedOrDup => f.write_str("extern table must be sorted by channel, unique"),
             ExternDeclConflict { chan } => write!(
                 f,
@@ -315,6 +323,16 @@ fn check_structure(container: &TraceContainer) -> Result<(), ValidateError> {
                 }
             }
         }
+    }
+    if container.inputs.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(ValidateError::InputsUnsortedOrDup);
+    }
+    if let Some(&chan) = container
+        .inputs
+        .iter()
+        .find(|&&chan| chan as usize >= container.channels.len())
+    {
+        return Err(ValidateError::InputChannelOutOfRange { chan });
     }
     Ok(())
 }
@@ -519,20 +537,22 @@ fn check_spsc_endpoints(container: &TraceContainer) -> Result<(), ValidateError>
             }
         }
     }
-    for p in &container.ports {
-        if let PortSource::Channel(c) = p.source
-            && extern_dir(c) == Some(ExternDir::Export)
-        {
+    let descriptor_reads = container
+        .ports
+        .iter()
+        .filter_map(|p| match p.source {
+            PortSource::Channel(c) => Some(c),
+            PortSource::Const { .. } => None,
+        })
+        .chain(container.inputs.iter().copied());
+    for c in descriptor_reads {
+        if extern_dir(c) == Some(ExternDir::Export) {
             return Err(ValidateError::ExternDirViolation {
                 chan: c,
                 stage: Stage::Prologue,
             });
         }
-    }
-    for p in &container.ports {
-        if let PortSource::Channel(c) = p.source
-            && channel_decl(container, c, Stage::Prologue, 0)?.host_role == HostRole::Reader
-        {
+        if channel_decl(container, c, Stage::Prologue, 0)?.host_role == HostRole::Reader {
             return Err(ValidateError::SecondConsumer {
                 chan: c,
                 stage: Stage::Prologue,
@@ -603,6 +623,9 @@ pub(crate) fn readiness_table(c: &TraceContainer) -> Vec<ReadinessEntry> {
                     if let PortSource::Channel(chan) = p.source {
                         visit(chan, phase, Direction::NeedsFull, &mut seen);
                     }
+                }
+                for &chan in &c.inputs {
+                    visit(chan, phase, Direction::NeedsFull, &mut seen);
                 }
             }
             _ => {
@@ -684,6 +707,9 @@ pub(crate) fn classify_channels(
             if matches!(p.source, PortSource::Channel(ch) if ch == ci) {
                 extra = true;
             }
+        }
+        if c.inputs.contains(&ci) {
+            extra = true;
         }
         let (Some((tsi, toi, tid)), Some((psi, poi, pval)), false) = (take, put, extra) else {
             classes.push(ChannelClass::FullRing);

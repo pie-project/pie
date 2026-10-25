@@ -90,6 +90,7 @@ fn subject() -> TraceContainer {
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
@@ -190,6 +191,7 @@ fn a_reshaped_row_vector_broadcasts_through_the_stream() {
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
     let bound = bind(container, profile()).expect("binds");
     let stages = compile_bound(&bound);
@@ -267,6 +269,7 @@ fn a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing() {
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
     let bound = bind(container, profile()).expect("binds");
     let stages = compile_bound(&bound);

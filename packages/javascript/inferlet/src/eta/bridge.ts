@@ -475,6 +475,7 @@ export class ForwardPass {
   readonly wit: AnyPass;
   private readonly mod: typeof witForward | typeof witDiffusion;
   private ports: [Port, Channel][] = [];
+  private inputs: Channel[] = [];
   private stages: [Stage, () => void][] = [];
   private readonly vocab: number;
   private readonly pageSize: number;
@@ -581,11 +582,11 @@ export class ForwardPass {
   }
 
   /** Bind `ch` to the model's input `name` (`model.lane(...).inputs`), read
-   * at every submit from its committed cell. The host validates the shape;
-   * the program must declare the channel (a stage of the author's must touch
-   * it). */
+   * at every submit from its committed cell. The host validates the shape. */
   input(name: string, ch: Channel): void {
+    if (this.programAttached) throw new InferletError('forward pass program is already attached');
     wit('input', () => this.wit.input(name, ch.wit()));
+    this.inputs.push(ch);
   }
 
   /** Which lane stream this pass's rows are. Default `'text'`. */
@@ -685,6 +686,7 @@ export class ForwardPass {
     if (this.programAttached) return;
     const builder = new Builder(this.vocab, this.pageSize);
     for (const [port, ch] of this.ports) builder.bindPort(port, ch.dsl);
+    for (const ch of this.inputs) builder.bindInput(ch.dsl);
     for (const [stage, body] of this.stages) builder.stage(stage, body);
     const traced = builder.build();
     const handles = traced.channels.map(hostChannel);

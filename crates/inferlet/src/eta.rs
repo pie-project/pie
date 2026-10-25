@@ -963,27 +963,10 @@ impl<W: PassWit> Pass<W> {
         for (port, channel) in &inner.ports {
             builder.bind_port_recorded(*port, channel.clone());
         }
-        let port_channels: Vec<DslChannel> =
-            inner.inputs.iter().map(|(_, ch)| ch.clone()).collect();
-        let author_prologue = inner
-            .stages
-            .iter()
-            .find(|(stage, _)| *stage == Stage::Prologue)
-            .map(|(_, body)| body);
-        if !port_channels.is_empty() {
-            builder.stage(Stage::Prologue, move || {
-                for ch in &port_channels {
-                    let _ = ch.read();
-                }
-                if let Some(body) = author_prologue {
-                    body();
-                }
-            });
+        for (_, channel) in &inner.inputs {
+            builder.bind_input(channel.clone());
         }
         for (stage, body) in &inner.stages {
-            if *stage == Stage::Prologue && !inner.inputs.is_empty() {
-                continue;
-            }
             builder.stage(*stage, body);
         }
         let traced = builder.build().map_err(|error| error.to_string())?;

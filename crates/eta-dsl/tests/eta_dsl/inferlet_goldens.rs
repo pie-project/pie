@@ -450,6 +450,25 @@ fn vae_readback() -> Traced {
     b.build().unwrap()
 }
 
+/// Two guest inputs: the prologue draws the first from the device rng, the
+/// second (a host-written timestep) no stage touches. The one golden that
+/// carries an input table.
+fn noised_input() -> Traced {
+    let (rows, width) = (4u32, 8u32);
+    let rng_ch: &'static Channel = leak(Channel::from([5u32, 0]).named("rng"));
+    let latent: &'static Channel = leak(Channel::new([rows, width], dtype::f32).named("latent"));
+    let timestep: &'static Channel = leak(Channel::from([0.5f32]).named("timestep"));
+    let mut b = Builder::new(VOCAB, PAGE);
+    b.bind_input(latent);
+    b.bind_input(timestep);
+    b.stage(Stage::Prologue, move || {
+        let r = rng_ch.take();
+        latent.put(normal(&r, [rows, width]));
+        rng_ch.put(add(&r, iota(2)));
+    });
+    b.build().unwrap()
+}
+
 fn programs() -> Vec<(&'static str, Traced)> {
     vec![
         ("s3", s3()),
@@ -461,6 +480,7 @@ fn programs() -> Vec<(&'static str, Traced)> {
         ("beam_step", beam_step()),
         ("latent_step", latent_step()),
         ("vae_readback", vae_readback()),
+        ("noised_input", noised_input()),
     ]
 }
 

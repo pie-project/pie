@@ -84,6 +84,7 @@ fn program(rows: u32, len: u32, cut: Cut) -> TraceContainer {
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 

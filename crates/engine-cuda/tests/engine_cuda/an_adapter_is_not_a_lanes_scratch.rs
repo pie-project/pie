@@ -48,6 +48,7 @@ fn lora_prologue(layers: u32, rank: u32, hidden: u32, also_read: bool) -> TraceC
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 

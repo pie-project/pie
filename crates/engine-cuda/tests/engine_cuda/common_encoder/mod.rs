@@ -282,6 +282,7 @@ pub fn epilogue(rows: u32) -> TraceContainer {
             ops: vec![Op::ChanTake(0), Op::ChanPut { chan: 1, value: 0 }],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 

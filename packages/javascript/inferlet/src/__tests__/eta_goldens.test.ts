@@ -567,4 +567,23 @@ describe('sampler golden', () => {
     out.noteHostTake();
     check('vae_readback', b.build());
   });
+  // `inferlet_goldens.rs::noised_input` - two guest inputs, the first drawn
+  // by the prologue from the device rng, the second touched by no stage: the
+  // one golden that carries an input table.
+  it('noised_input matches the Rust golden', () => {
+    const rows = 4;
+    const width = 8;
+    const rngCh = chFrom([5, 0], dtype.u32, 'rng');
+    const latent = chNew([rows, width], dtype.f32, 'latent');
+    const timestep = chFrom([0.5], dtype.f32, 'timestep');
+    const b = new Builder(VOCAB, PAGE);
+    b.bindInput(latent);
+    b.bindInput(timestep);
+    b.stage(Stage.PROLOGUE, () => {
+      const r = rngCh.take();
+      latent.putTensor(normal(r, [rows, width]));
+      rngCh.putTensor(add(r, iota(2)));
+    });
+    check('noised_input', b.build());
+  });
 });

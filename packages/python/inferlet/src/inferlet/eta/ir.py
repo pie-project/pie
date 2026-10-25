@@ -523,6 +523,8 @@ class TraceContainer:
     ports: list[PortBinding] = field(default_factory=list)
     stages: list[StageProgram] = field(default_factory=list)
     externs: list[ExternDecl] = field(default_factory=list)
+    # The channels the forward reads as guest model inputs, sorted, unique.
+    inputs: list[int] = field(default_factory=list)
 
     def encode(self) -> bytes:
         return encode(self)
@@ -599,7 +601,7 @@ def encode_op(w: bytearray, op: Op) -> None:
 def encode(c: TraceContainer) -> bytes:
     w = bytearray()
     w += ETA_MAGIC
-    v2 = bool(c.externs)
+    v2 = bool(c.externs) or bool(c.inputs)
     _u16(w, ETA_VERSION_EXTERN if v2 else ETA_VERSION)
     _u16(w, 0)  # flags
     _u32(w, len(c.names))
@@ -608,6 +610,7 @@ def encode(c: TraceContainer) -> bytes:
     _u32(w, len(c.stages))
     if v2:
         _u32(w, len(c.externs))
+        _u32(w, len(c.inputs))
     for n in c.names:
         b = n.encode("utf-8")
         _u16(w, len(b))
@@ -631,6 +634,8 @@ def encode(c: TraceContainer) -> bytes:
         _u16(w, e.name)
         _u8(w, e.direction)
         _u32(w, e.chan)
+    for chan in c.inputs:
+        _u32(w, chan)
     return bytes(w)
 
 

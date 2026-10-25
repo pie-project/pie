@@ -35,6 +35,7 @@ fn counter_trace() -> TraceContainer {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
@@ -104,6 +105,7 @@ fn register_rule_put_then_take_reads_pending() {
             ],
         }],
         externs: alloc::vec::Vec::new(),
+        inputs: Vec::new(),
     };
     let b = bind(c, ModelProfile::dummy()).unwrap();
     let mut inst = Instance::new(&b, &[]).unwrap();
@@ -135,6 +137,7 @@ fn dummy_run_on_late_host_edge_then_recover() {
             ],
         }],
         externs: alloc::vec::Vec::new(),
+        inputs: Vec::new(),
     };
     let b = bind(c, ModelProfile::dummy()).unwrap();
     let mut inst = Instance::new(&b, &[(1, Value::U32(vec![100]))]).unwrap();
@@ -175,6 +178,7 @@ fn rng_keyed_is_pure_function_of_state() {
             ],
         }],
         externs: alloc::vec::Vec::new(),
+        inputs: Vec::new(),
     };
     let b = bind(mk(), ModelProfile::dummy()).unwrap();
     let seeds = [(0u32, Value::U32(vec![42, 7]))];
@@ -212,6 +216,7 @@ fn per_layer_tap_accumulates_via_register_rule() {
             ],
         }],
         externs: alloc::vec::Vec::new(),
+        inputs: Vec::new(),
     };
     let b = bind(c, ModelProfile::dummy()).unwrap();
     let mut inst = Instance::new(&b, &[(0, Value::F32(vec![-1.0, -1.0]))]).unwrap();
@@ -242,6 +247,7 @@ fn kernel_fault_poisons() {
             ],
         }],
         externs: alloc::vec::Vec::new(),
+        inputs: Vec::new(),
     };
     let mut profile = ModelProfile::dummy();
     profile.kernels.push(eta_ir::registry::KernelInfo {

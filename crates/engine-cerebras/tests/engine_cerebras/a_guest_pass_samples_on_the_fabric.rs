@@ -177,6 +177,7 @@ fn sampler(vocab: u32) -> TraceContainer {
             ops: p.ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 

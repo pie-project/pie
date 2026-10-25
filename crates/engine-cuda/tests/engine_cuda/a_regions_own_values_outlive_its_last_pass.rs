@@ -57,6 +57,7 @@ fn softmax_epilogue() -> TraceContainer {
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 

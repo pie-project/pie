@@ -250,6 +250,8 @@ pub struct LaunchPackage {
     pub values: Vec<LaunchValue>,
     pub channels: Vec<LaunchChannel>,
     pub ports: Vec<LaunchPort>,
+    /// The channels the forward reads as guest model inputs.
+    pub inputs: Vec<ChannelIndex>,
     pub names: Vec<String>,
     pub stages: Vec<LaunchStage>,
     pub plans: Vec<LaunchStagePlan>,
@@ -278,6 +280,7 @@ pub fn build(bound: &BoundTrace, stages: &[CompiledStage]) -> LaunchPackage {
         values: lower_values(bound),
         channels: lower_channels(bound),
         ports: lower_ports(bound),
+        inputs: bound.container.inputs.clone(),
         names: bound.container.names.clone(),
         stages: lower_stages(bound),
         plans: stages.iter().map(lower_plan).collect(),
