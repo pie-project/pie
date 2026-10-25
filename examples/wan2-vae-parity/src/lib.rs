@@ -4,8 +4,8 @@
 //! The engine gate `the_wan_2_vae_answers_the_reference` drives the shell
 //! from the host; this guest decodes a `T`-frame latent the way
 //! `examples/text-to-video` does: one fire per latent frame down ONE
-//! pipeline, the `.head` arm first and closed before the later arm opens,
-//! the pipeline closed last. Every chunk after the head reads the conv
+//! pipeline, each binding ONE working set whose recurrent state is the conv
+//! caches, the `.head` arm first. Every chunk after the head reads the conv
 //! caches the fire before it left, so a runtime that hands a later fire
 //! cold caches shows up as a chunk that drifts.
 //!
@@ -119,8 +119,8 @@ fn voxel_input(reading: &str) -> Result<model::InputDecl> {
     }
 }
 
-/// Fire ONE decode arm over ONE latent frame and take its pixels back —
-/// `text-to-video`'s `decode_frame`, unchanged: the pass dies with the call.
+/// Fire ONE decode arm over ONE latent frame into `state` and take its
+/// pixels back — `text-to-video`'s `decode_frame`, unchanged.
 #[allow(clippy::too_many_arguments)]
 async fn decode_frame(
     reading: &str,
@@ -130,6 +130,7 @@ async fn decode_frame(
     frames: u32,
     pixel_h: u32,
     pixel_w: u32,
+    state: &WorkingSet,
     pipe: &Pipeline,
 ) -> Result<Vec<f32>> {
     let input = voxel_input(reading)?;
@@ -140,6 +141,7 @@ async fn decode_frame(
     let pass = ForwardPass::new();
     pass.switch(0, "reading", reading)?;
     pass.switch(0, "stream", "video")?;
+    pass.state(&[state], StateGeometry::default())?;
     let cell =
         Channel::from_shaped([clip_h, clip_w, input.width], clip.to_vec()).named("vae_latent");
     pass.input(0, &input.name, &cell)?;
@@ -206,7 +208,8 @@ async fn main(input: Input) -> Result<Output> {
     let (pixel_h, pixel_w) = (case.h * sc, case.w * sc);
     let a = arms()?;
 
-    // ONE pipeline; the head fire first, its pass closed before the rest.
+    // ONE working set and ONE pipeline; the head fire first.
+    let state = WorkingSet::new();
     let pipe = Pipeline::new();
     let mut pixels: Vec<f32> = Vec::new();
     let mut fires = Vec::new();
@@ -226,6 +229,7 @@ async fn main(input: Input) -> Result<Output> {
             frames,
             pixel_h,
             pixel_w,
+            &state,
             &pipe,
         )
         .await?;

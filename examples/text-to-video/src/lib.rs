@@ -41,22 +41,14 @@
 //! # THE DECODE FIRES ARE A SEQUENCE, AND THE ORDER IS LOAD-BEARING
 //!
 //! Every causal convolution of the decoder holds its last input frames in a
-//! `CacheRow::State` slab that the slot carries BETWEEN fires. So the fires
-//! are not independent: frame `k`'s pixels depend on frame `k-1`'s having
-//! been fired into the same slot first. Two rules follow, and this program
-//! keeps both:
-//!
-//! * ONE PIPELINE for the whole decode. A pipeline is serial, which here is
-//!   the point — the opposite of the denoise loop, where one pipeline per
-//!   lane is what lets a group compose.
-//! * The head arm's pass is closed BEFORE the later arm's is opened. A
-//!   float pass is seated on a scratch working set the host mints at bind,
-//!   and a seat comes back to the book when its pass closes — so closing
-//!   the head pass first is what puts the later arm on the slot the head
-//!   arm warmed. Firing them the other way round, or holding both open,
-//!   gives the later arm a slot whose slabs are zero, which is the pixels
-//!   of a decoder with no history (measured: cos 0.98 and mean |err| 0.125
-//!   on `[-1, 1]` against the reference, versus 0.99999 warm).
+//! `CacheRow::State` slab: the recurrent state of a WORKING SET this program
+//! holds, as an LM's is. One latent frame is one slot of that sequence, so
+//! the fires are not independent: frame `k`'s pixels depend on frame
+//! `k-1`'s having been fired into the same working set first. So: ONE
+//! working set and ONE PIPELINE for the whole decode, each fire binding it
+//! with `state`. A pipeline is serial, which here is the point — the
+//! opposite of the denoise loop, where one pipeline per lane is what lets a
+//! group compose.
 //!
 //! # THE PIXELS DO CROSS, AND THAT IS SAID RATHER THAN HIDDEN
 //!
@@ -651,6 +643,7 @@ async fn encode_chunk(
     pixel_w: u32,
     clip_h: u32,
     clip_w: u32,
+    state: &WorkingSet,
     pipe: &Pipeline,
 ) -> Result<Vec<f32>> {
     let input = voxel_input(reading)?;
@@ -659,6 +652,7 @@ async fn encode_chunk(
     let pass = ForwardPass::new();
     pass.switch(0, "reading", reading)?;
     pass.switch(0, "stream", "video")?;
+    pass.state(&[state], StateGeometry::default())?;
     // Empty, and SEEDED from the chunk below: the pixels are the host's, and
     // the eta trace tracks readiness STATICALLY — a channel the host seeds
     // has to be declared `seeded`, or the trace refuses it as consumed but
@@ -702,6 +696,7 @@ async fn decode_frame(
     frames: u32,
     pixel_h: u32,
     pixel_w: u32,
+    state: &WorkingSet,
     pipe: &Pipeline,
 ) -> Result<Vec<f32>> {
     let input = voxel_input(reading)?;
@@ -720,6 +715,7 @@ async fn decode_frame(
     let pass = ForwardPass::new();
     pass.switch(0, "reading", reading)?;
     pass.switch(0, "stream", "video")?;
+    pass.state(&[state], StateGeometry::default())?;
     let cell =
         Channel::from_shaped([clip_h, clip_w, input.width], clip.to_vec()).named("vae_latent");
     pass.input(0, &input.name, &cell)?;
@@ -984,8 +980,7 @@ async fn main(input: Input) -> Result<Output> {
 
     // ---- video2video: the clip, encoded chunk by chunk --------------------
     //
-    // Before the loop, on a pipeline of its own that closes: each encode
-    // pass holds a seat and the denoise lanes need it back.
+    // Before the loop, on a pipeline of its own that closes.
     //
     // The chunk lattice is the DECODE's read backwards. A family with a head
     // arm takes pixel frame 0 alone and then `tc` frames at a time; a
@@ -1064,9 +1059,10 @@ async fn main(input: Input) -> Result<Output> {
         let clip_w = grid_w * pw;
         let plane = (clip_h * clip_w * space.channels) as usize;
         let mut clip: Vec<f32> = Vec::with_capacity(latent_frames as usize * plane);
-        // ONE pipeline for the whole encode, and each arm's pass closed
-        // before the next opens: the causal convolutions' `CacheRow::State`
-        // slabs make these fires a sequence, exactly as the decode's are.
+        // ONE working set and ONE pipeline for the whole encode: the causal
+        // convolutions' `CacheRow::State` slabs are its state and make these
+        // fires a sequence, exactly as the decode's are.
+        let enc_state = WorkingSet::new();
         let enc_pipe = Pipeline::new();
         let mut at = 0usize;
         for (k, take) in chunks.iter().copied().enumerate() {
@@ -1083,7 +1079,7 @@ async fn main(input: Input) -> Result<Output> {
             let handle = Frames::from_rgb8(&payload, width, height, take, fps)
                 .map_err(|why| format!("encode chunk {k}: frames.from-rgb8: {why}"))?;
             let landed = encode_chunk(
-                reading, &handle, take, height, width, clip_h, clip_w, &enc_pipe,
+                reading, &handle, take, height, width, clip_h, clip_w, &enc_state, &enc_pipe,
             )
             .await
             .with_context(|| format!("encoding chunk {k}"))?;
@@ -1256,8 +1252,9 @@ async fn main(input: Input) -> Result<Output> {
     let mut pixels: Vec<f32> = Vec::with_capacity((frames * height * width * 3) as usize);
     let mut used: Vec<String> = Vec::new();
 
-    // ONE pipeline for the whole decode: a pipeline is serial, and the
-    // frame caches make these fires a sequence.
+    // ONE working set and ONE pipeline for the whole decode: the frame
+    // caches are its state, and make these fires a sequence.
+    let vae_state = WorkingSet::new();
     let vae_pipe = Pipeline::new();
     let mut first_frame = 0u32;
     if let Some(head) = &roles.head {
@@ -1269,6 +1266,7 @@ async fn main(input: Input) -> Result<Output> {
             1,
             height,
             width,
+            &vae_state,
             &vae_pipe,
         )
         .await?;
@@ -1276,8 +1274,6 @@ async fn main(input: Input) -> Result<Output> {
         used.push(head.clone());
         first_frame = 1;
     }
-    // The head arm's pass is closed by now (`decode_frame` owns it and it
-    // died with the call), so the later arm binds onto the seat it warmed.
     for k in first_frame..latent_frames {
         let at = k as usize * plane;
         let out = decode_frame(
@@ -1288,6 +1284,7 @@ async fn main(input: Input) -> Result<Output> {
             tc,
             height,
             width,
+            &vae_state,
             &vae_pipe,
         )
         .await?;
