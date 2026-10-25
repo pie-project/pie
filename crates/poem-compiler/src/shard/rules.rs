@@ -156,6 +156,21 @@ fn heads(name: &str) -> Option<Heads> {
     })
 }
 
+/// [`rule`], a norm over heads as wide as the row it reads (a row norm
+/// spelled a head the row wide) read as the row norm it is.
+pub(super) fn rule_of(op: &Operation, width: impl Fn(ValueId) -> Option<u64>) -> Rule {
+    if let Operation::Elemwise(Elemwise::Rmsnorm {
+        x,
+        axis: NormAxis::Head(d),
+        ..
+    }) = op
+        && width(*x) == Some(u64::from(*d))
+    {
+        return Rule::Norm;
+    }
+    rule(op)
+}
+
 pub(super) fn rule(op: &Operation) -> Rule {
     // A norm splits by its axis: a whole row's weight against the row's
     // blocks, a head's like any per-head op, a group's not at all.
@@ -277,7 +292,7 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
     };
     let mut outs = Vec::new();
     op.outputs(&mut outs);
-    let dists = match rule(op) {
+    let dists = match rule_of(op, |v| pass.width(v)) {
         Rule::Whole => {
             at.whole_except(pass, &[])?;
             at.check_state(pass, false, Cache::Whole)?;

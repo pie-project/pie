@@ -8,8 +8,8 @@
 //! of the sum, which the shard pass reduces. A weight an op reads beside a
 //! share (a bias, a head's sink) is cut as that share is.
 //!
-//! A row norm over a share norms it where it is, each rank's sum of
-//! squares summed across the ranks, its weight cut as the share is.
+//! A row norm with a gain over a share norms it where it is, each rank's
+//! sum of squares summed across the ranks, its gain cut as the share is.
 //!
 //! A column cut is kept only where its share reaches row cuts and nothing
 //! that wants it whole: a share that meets an op with no rule, a whole
@@ -497,20 +497,23 @@ impl<'r, 't> Walk<'r, 't> {
             }
             return;
         }
-        let held = match rules::rule(op) {
+        let held = match rules::rule_of(op, |v| self.width(v)) {
             Rule::Groups => {
                 // Group indices read no value; they follow whatever the
                 // grouped product groups.
                 self.groups.extend(outs.iter().copied());
                 vec![Held::Whole; outs.len()]
             }
-            // A row norm over a share norms it there, its sum of squares
-            // summed across the ranks; its weight is cut as the share is.
+            // A row norm with a gain over a share norms it there (q and k
+            // normed across their heads), its sum of squares summed across
+            // the ranks, its gain cut as the share is. One without a gain
+            // (a residual stream's pre-norm) wants its row whole.
             Rule::Norm
-                if matches!(
-                    field("x").first().map(|x| self.held(*x)),
-                    Some(Held::Split(_))
-                ) =>
+                if !field("weight").is_empty()
+                    && matches!(
+                        field("x").first().map(|x| self.held(*x)),
+                        Some(Held::Split(_))
+                    ) =>
             {
                 let x = field("x")[0];
                 let share = self.held(x);
