@@ -28,18 +28,17 @@
 //!
 //! # THE STEP LOOP
 //!
-//! Two lanes of one request (D2), each on its own pipeline, submitted back
-//! to back so the wait-all seal composes them into ONE fire: the prompt
-//! lane (the model's `text` stream when its `stream` switch has one —
-//! FLUX.2 — else `context`, Z-Image) carrying the encoder's rows, and the image lane
-//! carrying the latent. Neither `embed` nor `state` is called: a
-//! denoise reading declares no tokens and no KV space.
+//! ONE pass a step (D2), its lanes one attention group: the prompt lane
+//! (the model's `text` stream when its `stream` switch has one — FLUX.2 —
+//! else `context`, Z-Image) carrying the encoder's rows, and the image lane
+//! carrying the latent. Neither `embed` nor `state` is called: a denoise
+//! reading declares no tokens and no KV space.
 //!
 //! The sampler is an EPILOGUE (D4). Fire 0 seeds the latent with a keyed
 //! Normal draw on the device — no 2 MB `Channel::from` through WASM — and
 //! every later fire integrates one Euler step `x <- x + (sigma' - sigma).v`
 //! over `velocity()`, advancing the loop-carried timestep and step cells.
-//! `inferlet::latent::DenoiseLoop` owns the per-lane pipelines and clocks;
+//! `inferlet::latent::DenoiseLoop` owns the pipeline and the clock;
 //! `seed_or_step` is the epilogue body.
 //!
 //! # POSITIONS COME FROM A FACT, NOT FROM THE FAMILY
@@ -83,21 +82,15 @@
 //! When the denoiser reads a `guidance` input the model is guidance-
 //! distilled and the scale is just another lane input; `--negative-prompt`
 //! is then refused as meaningless. Without that input, a negative prompt at
-//! `guidance > 1` runs a second lane PAIR (its own group, its own prompt
-//! rows, its own latent), and the two velocities combine as
+//! `guidance > 1` adds a second lane PAIR to the pass (its own group, its
+//! own prompt rows, the same latent), and the two velocities combine as
 //! `u + s(c - u)` — ON THE DEVICE, inside the epilogue.
 //!
-//! The two branches are two attention GROUPS of one fire. They must not
-//! attend each other (they are independent denoisings), and each names the
-//! other with `ForwardPass::peer`, which is also what gathers them into one
-//! cohort so they seal into one fire — a peer in another fire is not on
-//! that fire's velocity plane at all. BOTH image lanes then compute the
-//! same combine from their own side: the conditional one reads
-//! `(own = c, peer = u)` and the unconditional one `(own = u, peer = c)`,
-//! and `u + s(c - u)` is the same number either way. So both latents step
-//! in lockstep without either crossing the host, and — unlike the old
-//! host-combining path, which had to draw its own noise — the seeded device
-//! draw is the same draw the ungated path makes.
+//! The two branches are two attention GROUPS of the pass: they must not
+//! attend each other (they are independent denoisings). The epilogue reads
+//! `velocity` of both image lanes and steps the one latent, so nothing
+//! crosses the host and the seeded device draw is the same draw the
+//! unguided path makes.
 //!
 //! Neither shipped row exercises the guided path: klein-4B and Z-Image
 //! Turbo are both guidance-distilled and take the scale as an input. What
@@ -508,45 +501,31 @@ fn inputs(reading: &str) -> Result<Inputs> {
     })
 }
 
-/// Everything one lane binds, kept alive for the loop's lifetime: a channel
-/// dropped while its pass is live is an input with nothing feeding it.
-struct Lane {
-    pass: ForwardPass,
-    #[allow(dead_code)]
-    held: Vec<Channel>,
-}
-
-/// Build one lane of a denoise group: state its stream and group, then bind
-/// EXACTLY the inputs its lane reads, by name. `latents` is the lane's own
-/// rows when it is the image lane; `context` is the encoder's rows when it
-/// is the prompt lane. An input this sampler does not know is refused by
-/// name, never fed zeros.
+/// Bind lane `at` of a denoise pass: its stream and group, then EXACTLY the
+/// inputs it reads, by name. `latents` is the latent when it is the image
+/// lane; `context` is the encoder's rows when it is the prompt lane. An
+/// input this sampler does not know is refused by name, never fed zeros. The
+/// channels it binds are kept in `held`: a channel dropped while its pass is
+/// live is an input with nothing feeding it.
 #[allow(clippy::too_many_arguments)]
-fn lane(
+fn bind_lane(
+    pass: &ForwardPass,
+    at: u32,
     reading: &str,
     stream: &str,
     group: u32,
-    // The OTHER guidance branch's group, on the CFG path. Named by EVERY
-    // lane of both branches, not only the ones that read: naming is what
-    // gathers the two groups into one cohort, and a peer in another fire is
-    // not on this fire's velocity plane at all.
-    peer: Option<u32>,
     rows: u32,
     latents: Option<&Channel>,
     context: Option<&Channel>,
     positions: &[f32],
-    clock: &LaneClock,
+    timestep: &Channel,
     guidance: f32,
     tag: &str,
-) -> Result<Lane> {
-    let pass = ForwardPass::new();
-    pass.switch("reading", reading)?;
-    pass.switch("stream", stream)?;
-    pass.group(group)?;
-    if let Some(peer) = peer {
-        pass.peer(peer)?;
-    }
-    let mut held = Vec::new();
+    held: &mut Vec<Channel>,
+) -> Result<()> {
+    pass.switch(at, "reading", reading)?;
+    pass.switch(at, "stream", stream)?;
+    pass.group(at, group)?;
     for input in model::lane_of(&[("reading", reading), ("stream", stream)])?.inputs {
         let name = format!("{tag}_{}", input.name);
         let ch = match input.name.as_str() {
@@ -559,7 +538,7 @@ fn lane(
             "positions" => {
                 Channel::from_shaped([rows, input.width], positions.to_vec()).named(&name)
             }
-            "timestep" => clock.timestep.clone(),
+            "timestep" => timestep.clone(),
             "guidance" => Channel::from(vec![guidance; input.width as usize]).named(&name),
             other => {
                 return Err(format!(
@@ -569,10 +548,10 @@ fn lane(
                 .into());
             }
         };
-        pass.input(&input.name, &ch)?;
+        pass.input(at, &input.name, &ch)?;
         held.push(ch);
     }
-    Ok(Lane { pass, held })
+    Ok(())
 }
 
 /// Unpatchify a denoise reading's final latent into the clip a `vae.decode`
@@ -718,17 +697,17 @@ async fn encode_from_frames(
     let rows = clip_h * clip_w;
     let width = readout_width(reading)?;
     let pass = ForwardPass::new();
-    pass.switch("reading", reading)?;
-    pass.switch("stream", "image")?;
+    pass.switch(0, "reading", reading)?;
+    pass.switch(0, "stream", "image")?;
     // Empty, and SEEDED from the picture below: the pixels are the host's
     // and never enter linear memory, which is the whole point of the
     // `frames` handle.
     let clip = Channel::seeded([pixel_h, pixel_w, input.width], dtype::f32).named("vae_pixels_in");
-    pass.input(&input.name, &clip)?;
+    pass.input(0, &input.name, &clip)?;
     let out = Channel::new([rows, width], dtype::f32).named("vae_latent_out");
     let readback = out.clone();
     pass.epilogue(move || {
-        readback.put(intrinsics::pixels(rows, width));
+        readback.put(intrinsics::pixels(0, rows, width));
     });
     // THE PICTURE, seeded straight from the host's handle.
     clip.set_frames(picture)?;
@@ -769,27 +748,18 @@ async fn decode_to_frames(
     let rows = pixel_h * pixel_w;
     let width = readout_width(reading)?;
     let pass = ForwardPass::new();
-    pass.switch("reading", reading)?;
-    pass.switch("stream", "image")?;
+    pass.switch(0, "reading", reading)?;
+    pass.switch(0, "stream", "image")?;
     let clip = Channel::from_shaped([clip_h, clip_w, input.width], latent).named("vae_latent");
-    pass.input(&input.name, &clip)?;
+    pass.input(0, &input.name, &clip)?;
     let out = Channel::new([rows, width], dtype::f32).named("vae_pixels");
     let readback = out.clone();
     pass.epilogue(move || {
-        readback.put(intrinsics::pixels(rows, width));
+        readback.put(intrinsics::pixels(0, rows, width));
     });
     pass.submit(pipe).context("the vae.decode lane")?;
     out.take_frames(pixel_w, pixel_h, 1, 0.0)
         .map_err(Into::into)
-}
-
-/// One prompt's two lanes: the encoder rows and the latent they condition.
-struct Branch {
-    context: Lane,
-    image: Lane,
-    /// `set` by the host on the CFG path).
-    /// the plain path, this fire's velocity on the CFG path.
-    out: Channel,
 }
 
 #[inferlet::main]
@@ -1024,7 +994,7 @@ async fn main(input: Input) -> Result<Output> {
     // An init picture keeps the seeding fire, which noises it on the device.
     let seeded = init_latent.is_none();
     let start = seeded.then(|| host_noise(input.seed.unwrap_or(0), cells));
-    let mut loops = if seeded {
+    let loops = if seeded {
         DenoiseLoop::seeded(&sched)
     } else {
         DenoiseLoop::new(&sched)
@@ -1034,8 +1004,8 @@ async fn main(input: Input) -> Result<Output> {
 
     let dts = loops.dts();
     let sigmas = loops.sigmas();
-    // IMG2IMG: the encoded picture, seeded once, read by every fire of both
-    // branches and used by fire 0.
+    // IMG2IMG: the encoded picture, seeded once, read by every fire and used
+    // by fire 0.
     let init = init_latent
         .as_ref()
         .map(|rows| Channel::from_shaped(shape, rows.as_slice()).named("init"));
@@ -1043,40 +1013,30 @@ async fn main(input: Input) -> Result<Output> {
         .as_ref()
         .map(|m| Channel::from_shaped([rows], m.as_slice()).named("mask"));
 
-    let mut branches: Vec<Branch> = Vec::new();
-    for (group, ctx) in [Some(&context), uncond.as_ref()]
+    // ONE pass a step: lanes `2b` and `2b + 1` are guidance branch `b`'s
+    // image and prompt lanes, a branch an attention group, and both image
+    // lanes read the one latent.
+    let pass = ForwardPass::new();
+    let mut held: Vec<Channel> = Vec::new();
+    let latent = match &start {
+        Some(noise) => Channel::from_shaped(shape, noise.as_slice()),
+        None => Channel::from_shaped(shape, vec![0f32; cells]),
+    }
+    .named("x");
+    for (branch, ctx) in [Some(&context), uncond.as_ref()]
         .into_iter()
         .flatten()
         .enumerate()
     {
-        let group = group as u32;
+        let group = branch as u32;
         let tag = if group == 0 { "cond" } else { "uncond" };
         let ctx_rows = ctx.shape().dims()[0];
-        let text_clock = loops.lane(&format!("{tag}_ctx"));
-        let image_clock = loops.lane(&format!("{tag}_img"));
-        let context_lane = lane(
-            &roles.denoise,
-            inputs.context_stream,
-            group,
-            cfg.then(|| 1 - group),
-            ctx_rows,
-            None,
-            Some(ctx),
-            &positions_for(&inputs.convention, LaneRows::Sequence(ctx_rows), ctx_rows),
-            &text_clock,
-            guidance,
-            &format!("{tag}_ctx"),
-        )?;
-        let latent = match &start {
-            Some(noise) => Channel::from_shaped(shape, noise.as_slice()),
-            None => Channel::from_shaped(shape, vec![0f32; cells]),
-        }
-        .named(&format!("{tag}_x"));
-        let image_lane = lane(
+        bind_lane(
+            &pass,
+            2 * group,
             &roles.denoise,
             inputs.image_stream,
             group,
-            cfg.then(|| 1 - group),
             rows,
             Some(&latent),
             None,
@@ -1088,88 +1048,80 @@ async fn main(input: Input) -> Result<Output> {
                 },
                 ctx_rows,
             ),
-            &image_clock,
+            &loops.timestep(),
             guidance,
             &format!("{tag}_img"),
+            &mut held,
         )?;
-        let out = Channel::new(shape, dtype::f32)
-            .capacity(channel_capacity() as u32)
-            .named(&format!("{tag}_out"));
-
-        // A lane that only modulates advances its clock and nothing else.
-        text_clock.drive(&context_lane.pass, |_| {});
-        let rng = Channel::from(rng_state(seed)).named(&format!("{tag}_rng"));
-        let x = latent.clone();
-        let readback = out.clone();
-        image_clock.drive(&image_lane.pass, move |k| {
-            // On the CFG path BOTH branches step with the SAME combine, each
-            // computed from its own side: the conditional lane reads
-            // `(own = c, peer = u)` and the unconditional one
-            // `(own = u, peer = c)`, and `u + s(c - u)` is the same number
-            // either way. So the two latents stay in step without either
-            // one crossing the host, and the seeded device draw is the same
-            // draw the ungated path makes.
-            let v = if cfg {
-                guided_velocity(velocity_width, guidance, group == 0)
-            } else {
-                intrinsics::velocity(velocity_width)
-            };
-            // Fire 0 either draws the latent from the keyed RNG, or —
-            // img2img — takes the encoded picture noised to the truncated
-            // schedule's first sigma. Every later fire is the same Euler
-            // step either way.
-            match (&init, &mask) {
-                (None, _) if seeded => step(k, &x, &v, &dts, Some(&readback)),
-                (None, _) => seed_or_step(k, &x, &v, &dts, &rng, shape, Some(&readback)),
-                (Some(init), None) => {
-                    resume_or_step(k, &x, init, sigma0, &v, &dts, &rng, shape, Some(&readback))
-                }
-                (Some(init), Some(mask)) => inpaint_step(
-                    k,
-                    &x,
-                    init,
-                    mask,
-                    &sigmas,
-                    &v,
-                    &dts,
-                    &rng,
-                    shape,
-                    Some(&readback),
-                ),
-            }
-        });
-        branches.push(Branch {
-            context: context_lane,
-            image: image_lane,
-            out,
-        });
+        bind_lane(
+            &pass,
+            2 * group + 1,
+            &roles.denoise,
+            inputs.context_stream,
+            group,
+            ctx_rows,
+            None,
+            Some(ctx),
+            &positions_for(&inputs.convention, LaneRows::Sequence(ctx_rows), ctx_rows),
+            &loops.timestep(),
+            guidance,
+            &format!("{tag}_ctx"),
+            &mut held,
+        )?;
     }
+    let out = Channel::new(shape, dtype::f32)
+        .capacity(channel_capacity() as u32)
+        .named("out");
+    let rng = Channel::from(rng_state(seed)).named("rng");
+    let (x, readback) = (latent.clone(), out.clone());
+    loops.drive(&pass, move |k| {
+        // The guided velocity `u + s(c - u)`, out of both image lanes.
+        let v = if cfg {
+            cfg_combine(
+                &intrinsics::velocity(0, rows, velocity_width),
+                &intrinsics::velocity(2, rows, velocity_width),
+                &Tensor::constant([guidance]),
+            )
+        } else {
+            intrinsics::velocity(0, rows, velocity_width)
+        };
+        // Fire 0 either draws the latent from the keyed RNG, or — img2img —
+        // takes the encoded picture noised to the truncated schedule's
+        // first sigma. Every later fire is the same Euler step either way.
+        match (&init, &mask) {
+            (None, _) if seeded => step(k, &x, &v, &dts, Some(&readback)),
+            (None, _) => seed_or_step(k, &x, &v, &dts, &rng, shape, Some(&readback)),
+            (Some(init), None) => {
+                resume_or_step(k, &x, init, sigma0, &v, &dts, &rng, shape, Some(&readback))
+            }
+            (Some(init), Some(mask)) => inpaint_step(
+                k,
+                &x,
+                init,
+                mask,
+                &sigmas,
+                &v,
+                &dts,
+                &rng,
+                shape,
+                Some(&readback),
+            ),
+        }
+    });
 
-    // Both paths are the same loop: the device integrates its own Euler step,
-    // guided or not, and the guided branches read each other's velocity off
-    // the fire's own plane, so nothing crosses the host between steps.
+    // The device integrates its own Euler step, guided or not, so nothing
+    // crosses the host between steps.
     let mut last: Vec<f32> = Vec::new();
     for fire in 0..loops.fires() {
-        let passes: Vec<&ForwardPass> = branches
-            .iter()
-            .flat_map(|b| [&b.context.pass, &b.image.pass])
-            .collect();
-        loops
-            .fire(&passes)
-            .with_context(|| format!("fire {fire}"))?;
-        // The conditional branch's latent is the answer; the unconditional
-        // one steps in lockstep with it (same combine, computed from its own
-        // side) and is read only to keep its channel's cursor moving.
-        last = branches[0]
-            .out
+        loops.fire(&pass).with_context(|| format!("fire {fire}"))?;
+        last = out
             .take_host::<Vec<f32>>()
             .await
             .with_context(|| format!("readback after fire {fire}"))?;
-        if cfg {
-            let _ = branches[1].out.take_host::<Vec<f32>>().await?;
-        }
     }
     loops.close();
+    drop(pass);
+    drop(held);
 
     // ---- the way out ------------------------------------------------------
     let n = last.len().max(1) as f32;

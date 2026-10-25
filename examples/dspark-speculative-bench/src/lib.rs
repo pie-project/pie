@@ -215,7 +215,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let draft = ForwardPass::new();
     draft
-        .switch("block_draft", "on")
+        .switch(0, "block_draft", "on")
         .map_err(|why| format!("stating the draft block: {why}"))?;
     draft.embed(&blk, &indptr_d)?;
     draft.readout(&readout_d)?;

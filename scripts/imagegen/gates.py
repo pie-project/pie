@@ -298,7 +298,7 @@ def guidance_readout(text: str) -> str:
 
     bits = []
     for pattern, label in (
-        (r"(PASS|FAIL) s=0 the combine (?:is|differs)", "peer is the other group:"),
+        (r"(PASS|FAIL) s=0 the combine (?:is|differs)", "the other group's lane:"),
         (r"(PASS|FAIL) guidance moves|(PASS|FAIL) s=0 and s=1 agree", "guidance moves:"),
         (r"(PASS|FAIL) s=2 is", "affine in s:"),
     ):
@@ -699,8 +699,8 @@ def roster() -> list[Gate]:
             expected="s=0 IS the unconditional branch of its own fire, guidance "
                      "moves the answer, and the combine is affine in s",
             note="classifier-free guidance ON THE DEVICE: six lanes, two attention "
-                 "groups, one fire, combined in the epilogue off "
-                 "`intrinsics::peer_velocity`. Needs no golden: every claim is "
+                 "groups, one pass, combined in the epilogue off "
+                 "`intrinsics::velocity(lane)` of both image lanes. Needs no golden: every claim is "
                  "checked WITHIN one fire's own answers, because a six-lane fire "
                  "and a three-lane one give the same lane different bf16 answers "
                  "(rel 0.0056) and a cross-fire identity is not one.",

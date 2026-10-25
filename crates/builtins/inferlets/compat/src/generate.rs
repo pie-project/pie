@@ -443,7 +443,7 @@ pub async fn generate(
     fwd.embed(&toks, &embed_indptr)?;
     if !images.is_empty() {
         let spans: Vec<media::Span> = images.iter().map(media::Span::Image).collect();
-        fwd.media(&spans)?;
+        fwd.media(0, &spans)?;
     }
     fwd.state(&[&ws], StateGeometry::folding())?;
     fwd.epilogue(move || {

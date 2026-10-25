@@ -319,11 +319,11 @@ impl Block<'_> {
         let cells = n * taps_width as usize;
         let self_cond_ids =
             Channel::from_shaped([length, taps_width], vec![0i32; cells]).named("self_cond_ids");
-        let self_cond_weights =
-            Channel::from_shaped([length, taps_width], vec![0f32; cells]).named("self_cond_weights");
+        let self_cond_weights = Channel::from_shaped([length, taps_width], vec![0f32; cells])
+            .named("self_cond_weights");
 
         let fwd = ForwardPass::new();
-        fwd.switch("mode", "denoise")?;
+        fwd.switch(0, "mode", "denoise")?;
         fwd.embed(&toks, &embed_indptr)?;
         fwd.state(
             &[ws],
@@ -333,9 +333,9 @@ impl Block<'_> {
             },
         )?;
         fwd.readout(&readout)?;
-        fwd.input("self_cond_ids", &self_cond_ids)
+        fwd.input(0, "self_cond_ids", &self_cond_ids)
             .context("bind self_cond_ids")?;
-        fwd.input("self_cond_weights", &self_cond_weights)
+        fwd.input(0, "self_cond_weights", &self_cond_weights)
             .context("bind self_cond_weights")?;
         {
             let (tap_ids_out, tap_weights_out) = (tap_ids_out.clone(), tap_weights_out.clone());
@@ -549,7 +549,9 @@ impl Block<'_> {
                 // narrower staging with zero-weight taps.
                 if taps_used == taps_width {
                     self_cond_ids.set(ids).context("set self_cond_ids")?;
-                    self_cond_weights.set(weights).context("set self_cond_weights")?;
+                    self_cond_weights
+                        .set(weights)
+                        .context("set self_cond_weights")?;
                 } else {
                     let (w, u) = (taps_width as usize, taps_used as usize);
                     let mut full_ids = vec![0i32; n * w];
@@ -580,8 +582,13 @@ impl Block<'_> {
 /// lane's `self_cond_ids` input.
 fn self_cond_taps() -> Result<u32> {
     let lane = model::lane_of(&[("mode", "denoise")])?;
-    let input = lane.inputs.iter().find(|input| input.name == "self_cond_ids");
-    Ok(input.ok_or("the denoise lane reads no `self_cond_ids` input")?.width)
+    let input = lane
+        .inputs
+        .iter()
+        .find(|input| input.name == "self_cond_ids");
+    Ok(input
+        .ok_or("the denoise lane reads no `self_cond_ids` input")?
+        .width)
 }
 
 #[inferlet::main]

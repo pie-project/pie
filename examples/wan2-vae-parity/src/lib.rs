@@ -76,31 +76,43 @@ struct Output {
 
 /// The decode arms, found as `text-to-video` finds them.
 struct Arms {
-    head: model::ReadingFact,
-    decode: model::ReadingFact,
+    head: String,
+    decode: String,
+}
+
+/// What `reading`'s video lane reads out.
+fn readout(reading: &str) -> Option<model::Readout> {
+    model::lane_of(&[("reading", reading), ("stream", "video")])
+        .ok()?
+        .readout
 }
 
 fn arms() -> Result<Arms> {
-    let decoders: Vec<model::ReadingFact> = model::readings()
+    let decoders: Vec<String> = model::switch("reading")
+        .map(|decl| decl.values)
+        .unwrap_or_default()
         .into_iter()
-        .filter(|r| r.readout == model::ReadoutKind::Pixels && !r.name.starts_with("vae.encode"))
+        .filter(|r| {
+            !r.starts_with("vae.encode")
+                && readout(r).is_some_and(|readout| readout.kind == model::ReadoutKind::Pixels)
+        })
         .collect();
-    let head = decoders.iter().find(|r| r.name.ends_with(".head")).cloned();
-    let decode = decoders.iter().find(|r| !r.name.ends_with(".head")).cloned();
+    let head = decoders.iter().find(|r| r.ends_with(".head")).cloned();
+    let decode = decoders.iter().find(|r| !r.ends_with(".head")).cloned();
     match (head, decode) {
         (Some(head), Some(decode)) => Ok(Arms { head, decode }),
-        _ => Err("this model declares no causal `vae.decode` pair (a `.head` arm and the rest)"
-            .into()),
+        _ => Err(
+            "this model declares no causal `vae.decode` pair (a `.head` arm and the rest)".into(),
+        ),
     }
 }
 
 /// The one input a VAE arm's lane reads: a clip on the voxel axis.
-fn voxel_input(reading: &model::ReadingFact) -> Result<model::InputDecl> {
-    match &model::lane_of(&reading.name, model::LaneStream::Video)?.inputs[..] {
+fn voxel_input(reading: &str) -> Result<model::InputDecl> {
+    match &model::lane_of(&[("reading", reading), ("stream", "video")])?.inputs[..] {
         [input] if input.axis == model::InputAxis::Voxel => Ok(input.clone()),
         other => Err(format!(
-            "reading `{}` reads {} input(s), and a VAE arm reads one clip on the voxel axis",
-            reading.name,
+            "reading `{reading}` reads {} input(s), and a VAE arm reads one clip on the voxel axis",
             other.len()
         )
         .into()),
@@ -111,7 +123,7 @@ fn voxel_input(reading: &model::ReadingFact) -> Result<model::InputDecl> {
 /// `text-to-video`'s `decode_frame`, unchanged: the pass dies with the call.
 #[allow(clippy::too_many_arguments)]
 async fn decode_frame(
-    reading: &model::ReadingFact,
+    reading: &str,
     clip: &[f32],
     clip_h: u32,
     clip_w: u32,
@@ -122,20 +134,22 @@ async fn decode_frame(
 ) -> Result<Vec<f32>> {
     let input = voxel_input(reading)?;
     let rows = frames * pixel_h * pixel_w;
-    let width = reading.readout_width;
+    let width = readout(reading)
+        .map(|readout| readout.width)
+        .ok_or_else(|| format!("reading `{reading}` reads nothing out on its `video` lane"))?;
     let pass = ForwardPass::new();
-    pass.reading(&reading.name)?;
-    pass.stream(model::LaneStream::Video)?;
+    pass.switch(0, "reading", reading)?;
+    pass.switch(0, "stream", "video")?;
     let cell =
         Channel::from_shaped([clip_h, clip_w, input.width], clip.to_vec()).named("vae_latent");
-    pass.input(&input.name, &cell)?;
+    pass.input(0, &input.name, &cell)?;
     let out = Channel::new([rows, width], dtype::f32).named("vae_pixels");
     let readback = out.clone();
     pass.epilogue(move || {
-        readback.put(intrinsics::pixels(rows, width));
+        readback.put(intrinsics::pixels(0, rows, width));
     });
     pass.submit(pipe)
-        .with_context(|| format!("the `{}` fire", reading.name))?;
+        .with_context(|| format!("the `{reading}` fire"))?;
     out.take_host::<Vec<f32>>().await.map_err(Into::into)
 }
 
@@ -198,7 +212,11 @@ async fn main(input: Input) -> Result<Output> {
     let mut fires = Vec::new();
     let mut chunk_frames = Vec::new();
     for k in 0..case.t {
-        let (arm, frames) = if k == 0 { (&a.head, 1) } else { (&a.decode, tc) };
+        let (arm, frames) = if k == 0 {
+            (&a.head, 1)
+        } else {
+            (&a.decode, tc)
+        };
         let at = k as usize * plane;
         let out = decode_frame(
             arm,
@@ -212,7 +230,7 @@ async fn main(input: Input) -> Result<Output> {
         )
         .await?;
         pixels.extend_from_slice(&out);
-        fires.push(arm.name.clone());
+        fires.push(arm.clone());
         chunk_frames.push(frames);
     }
     pipe.close();

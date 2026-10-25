@@ -35,11 +35,10 @@
 //!
 //! `denoise` is two lanes here (no reference): the text lane
 //! (stream `text`, the `context` input at width `dim`) and the target lane
-//! (stream `image`, the `latents` input), one group, each on its own
-//! pipeline, each binding the timestep as its own loop-carried cell. Only
-//! the image lane reads out. Each lane is one pass submitted once a step
-//! (`trajectory` on why); the latent channel is loop-carried by the
-//! epilogue.
+//! (stream `image`, the `latents` input), one group, both lanes of ONE
+//! pass binding the one loop-carried timestep cell. Only the image lane
+//! reads out. The pass is submitted once a step (`trajectory` on why); the
+//! latent channel is loop-carried by the epilogue.
 use inferlet::latent::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -202,13 +201,13 @@ async fn text_rows(ids: &[u32], width: u32) -> Result<Vec<f32>> {
     let out = Channel::new([len, width], dtype::f32).named("hidden");
 
     let pass = ForwardPass::new();
-    pass.switch("reading", "text")?;
+    pass.switch(0, "reading", "text")?;
     pass.embed(&toks, &embed_indptr)?;
     pass.readout(&readout)?;
     pass.state(&[&ws], StateGeometry::default())?;
     let readback = out.clone();
     pass.epilogue(move || {
-        readback.put(intrinsics::hidden(width));
+        readback.put(intrinsics::hidden(0, len, width));
     });
     pass.submit(&pipe).context("text pass")?;
     let rows: Vec<f32> = out.take_host().await?;
@@ -227,11 +226,12 @@ struct Text {
 /// latent after every step read back to the host (one `[rows, channels]`
 /// readback a fire; the loop-carried latent never crosses).
 ///
-/// Both lanes are ONE pass each, submitted once a step: a seeded channel's
-/// seed rides with the first submit of the pass that binds it, so a fresh
-/// pass a step would find the context cell empty. The timestep is a
-/// loop-carried cell per lane (each lane's epilogue advances its own by
-/// the step index), the way `latent-probe` steps its schedule.
+/// Both lanes are ONE pass, submitted once a step: a seeded channel's seed
+/// rides with the first submit of the pass that binds it, so a fresh pass a
+/// step would find the context cell empty. The timestep is one loop-carried
+/// cell both lanes read (the epilogue advances it by the step index), the
+/// way `latent-probe` steps its schedule. `image_first` puts the image lane
+/// at lane 0, ahead of the text lane.
 async fn trajectory(
     text: &Text,
     noise: &[f32],
@@ -252,54 +252,39 @@ async fn trajectory(
     let dts: Vec<f32> = (0..sigmas.len())
         .map(|i| sigmas.get(i + 1).copied().unwrap_or(0.0) - sigmas[i])
         .collect();
-    // A seeded channel attaches to one pass, so each lane gets its own
-    // copy of the schedule.
-    let ts_txt = Channel::from(ts.clone()).named("ts_txt");
-    let ts_img = Channel::from(ts.clone()).named("ts_img");
+    let ts_ch = Channel::from(ts.clone()).named("ts");
     let dts_ch = Channel::from(dts).named("dts");
 
-    let pipe_txt = Pipeline::new();
-    let pipe_img = Pipeline::new();
+    let pipe = Pipeline::new();
     let x = Channel::from_shaped([rows, width], noise).named("latents");
     let img_pos = Channel::from_shaped([rows, dims.axes], positions).named("img_pos");
     let velocity_width = dims.velocity_width;
+    let (img_lane, txt_lane) = if image_first { (0, 1) } else { (1, 0) };
 
-    let t_txt = Channel::from([ts[0]]).named("t_txt");
-    let k_txt = Channel::from([0u32]).named("k_txt");
-    let txt = ForwardPass::new();
-    txt.switch("reading", reading)?;
-    txt.switch("stream", "text")?;
-    txt.group(group)?;
-    txt.input("context", &text.context)?;
-    txt.input("positions", &text.positions)?;
-    txt.input("timestep", &t_txt)?;
-    {
-        let (t, k, ts_ch) = (t_txt.clone(), k_txt.clone(), ts_txt);
-        txt.epilogue(move || {
-            let k_next = &k.take() + 1u32;
-            t.take();
-            t.put(gather(ts_ch.read(), &k_next));
-            k.put(&k_next);
-        });
-    }
+    let t = Channel::from([ts[0]]).named("t");
+    let k = Channel::from([0u32]).named("k");
+    let pass = ForwardPass::new();
+    pass.switch(txt_lane, "reading", reading)?;
+    pass.switch(txt_lane, "stream", "text")?;
+    pass.group(txt_lane, group)?;
+    pass.input(txt_lane, "context", &text.context)?;
+    pass.input(txt_lane, "positions", &text.positions)?;
+    pass.input(txt_lane, "timestep", &t)?;
+    pass.switch(img_lane, "reading", reading)?;
+    pass.switch(img_lane, "stream", "image")?;
+    pass.group(img_lane, group)?;
+    pass.input(img_lane, "latents", &x)?;
+    pass.input(img_lane, "positions", &img_pos)?;
+    pass.input(img_lane, "timestep", &t)?;
 
-    let t_img = Channel::from([ts[0]]).named("t_img");
-    let k_img = Channel::from([0u32]).named("k_img");
     let v_out = Channel::new([rows, velocity_width], dtype::f32).named("v_out");
     let x_out = Channel::new([rows, width], dtype::f32).named("x_out");
-    let img = ForwardPass::new();
-    img.switch("reading", reading)?;
-    img.switch("stream", "image")?;
-    img.group(group)?;
-    img.input("latents", &x)?;
-    img.input("positions", &img_pos)?;
-    img.input("timestep", &t_img)?;
     {
         let (xc, vo, xo) = (x.clone(), v_out.clone(), x_out.clone());
-        let (t, k, ts_ch) = (t_img.clone(), k_img.clone(), ts_img);
-        img.epilogue(move || {
+        let (t, k) = (t.clone(), k.clone());
+        pass.epilogue(move || {
             let k_cur = k.take();
-            let v = intrinsics::velocity(velocity_width);
+            let v = intrinsics::velocity(img_lane, rows, velocity_width);
             let cur = xc.take();
             let dt = gather(dts_ch.read(), &k_cur);
             let next = euler_step(&cur, &v, &dt);
@@ -316,17 +301,8 @@ async fn trajectory(
     let mut velocity0 = Vec::new();
     let mut latents = Vec::with_capacity(sigmas.len());
     for i in 0..steps {
-        if image_first {
-            img.submit(&pipe_img)
-                .with_context(|| format!("image lane, step {i}"))?;
-            txt.submit(&pipe_txt)
-                .with_context(|| format!("text lane, step {i}"))?;
-        } else {
-            txt.submit(&pipe_txt)
-                .with_context(|| format!("text lane, step {i}"))?;
-            img.submit(&pipe_img)
-                .with_context(|| format!("image lane, step {i}"))?;
-        }
+        pass.submit(&pipe)
+            .with_context(|| format!("denoise step {i}"))?;
         let v: Vec<f32> = v_out
             .take_host()
             .await
@@ -340,8 +316,7 @@ async fn trajectory(
         }
         latents.push(xn);
     }
-    pipe_txt.close();
-    pipe_img.close();
+    pipe.close();
     let _ = text.rows;
     Ok((velocity0, latents))
 }

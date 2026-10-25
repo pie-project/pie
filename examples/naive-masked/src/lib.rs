@@ -134,13 +134,10 @@ async fn main(input: Input) -> Result<Output> {
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    fwd_p.state(
-        &[&ws],
-        StateGeometry {
-            mask: mask_p.as_ref(),
-            ..StateGeometry::folding()
-        },
-    )?;
+    if let Some(mask_p) = &mask_p {
+        fwd_p.mask(mask_p)?;
+    }
+    fwd_p.state(&[&ws], StateGeometry::folding())?;
     fwd_p.epilogue(move || {
         let r = rng_p.take();
         let logits = intrinsics::logits();
@@ -181,13 +178,10 @@ async fn main(input: Input) -> Result<Output> {
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
-        fwd.state(
-            &[&ws],
-            StateGeometry {
-                mask: if masked { Some(&mask) } else { None },
-                ..StateGeometry::folding()
-            },
-        )?;
+        if masked {
+            fwd.mask(&mask)?;
+        }
+        fwd.state(&[&ws], StateGeometry::folding())?;
         fwd.epilogue(move || {
             // TAKES + compute first, PUTS last (value-id discipline).
             let base = fill.take(); // [1] u32

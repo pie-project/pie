@@ -6,7 +6,7 @@
 //! `scripts/imagegen/wan22_parity.py` turns into an `.npz` under the
 //! golden's own key names.
 //!
-//! # TWO OR THREE LANES, ONE GROUP, ONE FIRE
+//! # TWO OR THREE LANES, ONE GROUP, ONE PASS
 //!
 //! `wan_2`'s `denoise` reading runs on two values of its `stream` switch
 //! (D2): the context lane (`context`, the `context` input — no positions, no
@@ -21,16 +21,13 @@
 //! case says where the cut is (`cond_rows`); every row's rotary
 //! coordinates travel with it, so the lane split changes nothing.
 //!
-//! **ONE PIPELINE PER LANE.** A group is a fact about a FIRE: the passes
-//! join one attention only when they are members of one step. The
-//! scheduler seals a frame when every live pipeline has submitted and
-//! never seats two passes of one pipeline in one step, so the lanes go
-//! down one pipeline each, submitted back to back; the runtime holds a
-//! fresh group's first frame for its cohort (`FireRequest::cohort`).
+//! The step is ONE pass: lane 0 is the context lane, then the conditioning
+//! video lane when the case cuts one, then the main video lane, all in
+//! attention group 0.
 //!
 //! Every video lane reads out (the head runs on every video row), each
-//! into its own channel; the answer is `[cond rows ‖ the rest]`, the
-//! case's row order.
+//! into its own channel in the pass's one epilogue; the answer is
+//! `[cond rows ‖ the rest]`, the case's row order.
 use inferlet::latent::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -238,9 +235,12 @@ fn dims(reading: &str) -> Result<Dims> {
     })
 }
 
-/// One video lane over rows `[from, to)` of the case at `timestep`: its
-/// pass, and the channel its velocity lands in.
+/// Binds lane `lane` of `pass` as one video lane over rows `[from, to)` of
+/// the case at `timestep`, and answers the rows it carries.
+#[allow(clippy::too_many_arguments)]
 fn video_lane(
+    pass: &ForwardPass,
+    lane: u32,
     case: &Case,
     dims: &Dims,
     reading: &str,
@@ -249,58 +249,64 @@ fn video_lane(
     from: u32,
     to: u32,
     timestep: f32,
-) -> Result<(ForwardPass, Channel)> {
+) -> Result<u32> {
     let rows = to - from;
     let width = case.patch_features;
     let (f, w) = (from as usize, width as usize);
     let latents = &case.latents[f * w..(to as usize) * w];
     let positions = &case.positions[f * dims.axes as usize..(to as usize) * dims.axes as usize];
-    let pass = ForwardPass::new();
-    pass.switch("reading", reading)?;
-    pass.switch("stream", "video")?;
-    pass.group(group)?;
+    pass.switch(lane, "reading", reading)?;
+    pass.switch(lane, "stream", "video")?;
+    pass.group(lane, group)?;
     let x = Channel::from_shaped([rows, width], latents).named(&format!("latents_{tag}"));
     let pos = Channel::from_shaped([rows, dims.axes], positions).named(&format!("positions_{tag}"));
-    // One timestep cell PER PASS: a seeded channel attaches to one pass
-    // only (the runtime's channel-role rule).
     let t = Channel::from([timestep]).named(&format!("t_{tag}"));
-    pass.input("latents", &x)?;
-    pass.input("positions", &pos)?;
-    pass.input("timestep", &t)?;
-    let out =
-        Channel::new([rows, dims.velocity_width], dtype::f32).named(&format!("velocity_{tag}"));
-    let readback = out.clone();
-    let velocity_width = dims.velocity_width;
-    pass.epilogue(move || {
-        readback.put(intrinsics::velocity(velocity_width));
-    });
-    Ok((pass, out))
+    pass.input(lane, "latents", &x)?;
+    pass.input(lane, "positions", &pos)?;
+    pass.input(lane, "timestep", &t)?;
+    Ok(rows)
 }
 
 /// One denoise step: the context lane and one or two video lanes, one
-/// group, one fire, the velocity of every video row.
+/// group, one pass, the velocity of every video row.
 async fn step(case: &Case, dims: &Dims, reading: &str) -> Result<Vec<f32>> {
     let group = 0;
+    let pass = ForwardPass::new();
 
-    // The context lane: the cross-attention keys and values, and nothing
-    // else.
-    let context = ForwardPass::new();
-    context.switch("reading", reading)?;
-    context.switch("stream", "context")?;
-    context.group(group)?;
+    // Lane 0, the context lane: the cross-attention keys and values, and
+    // nothing else.
+    pass.switch(0, "reading", reading)?;
+    pass.switch(0, "stream", "context")?;
+    pass.group(0, group)?;
     let ctx = Channel::from_shaped(
         [case.context_rows, case.context_width],
         case.context.as_slice(),
     )
     .named("context");
-    context.input("context", &ctx)?;
+    pass.input(0, "context", &ctx)?;
 
     // The conditioning lane (TI2V's clean first frame, timestep 0), if the
-    // case cuts one, and the main lane.
-    let cond = (case.cond_rows > 0)
-        .then(|| video_lane(case, dims, reading, group, "cond", 0, case.cond_rows, 0.0))
-        .transpose()?;
-    let (main, main_out) = video_lane(
+    // case cuts one, and the main lane: each video lane's (lane, rows).
+    let mut videos: Vec<(u32, u32)> = Vec::new();
+    if case.cond_rows > 0 {
+        let rows = video_lane(
+            &pass,
+            1,
+            case,
+            dims,
+            reading,
+            group,
+            "cond",
+            0,
+            case.cond_rows,
+            0.0,
+        )?;
+        videos.push((1, rows));
+    }
+    let main_lane = videos.len() as u32 + 1;
+    let rows = video_lane(
+        &pass,
+        main_lane,
         case,
         dims,
         reading,
@@ -310,27 +316,31 @@ async fn step(case: &Case, dims: &Dims, reading: &str) -> Result<Vec<f32>> {
         case.rows,
         case.timestep,
     )?;
+    videos.push((main_lane, rows));
 
-    // One pipeline per lane, submitted back to back.
-    let ctx_pipe = Pipeline::new();
-    let main_pipe = Pipeline::new();
-    let cond_pipe = cond.as_ref().map(|_| Pipeline::new());
-    context.submit(&ctx_pipe).context("context lane")?;
-    if let (Some((pass, _)), Some(pipe)) = (&cond, &cond_pipe) {
-        pass.submit(pipe).context("conditioning lane")?;
-    }
-    main.submit(&main_pipe).context("video lane")?;
+    let velocity_width = dims.velocity_width;
+    let outs: Vec<(u32, u32, Channel)> = videos
+        .iter()
+        .map(|&(lane, rows)| {
+            let out =
+                Channel::new([rows, velocity_width], dtype::f32).named(&format!("velocity_{lane}"));
+            (lane, rows, out)
+        })
+        .collect();
+    let readbacks = outs.clone();
+    pass.epilogue(move || {
+        for (lane, rows, out) in &readbacks {
+            out.put(intrinsics::velocity(*lane, *rows, velocity_width));
+        }
+    });
+    let pipe = Pipeline::new();
+    pass.submit(&pipe).context("the denoise step")?;
 
     let mut velocity = Vec::with_capacity(case.rows as usize * dims.velocity_width as usize);
-    if let Some((_, out)) = &cond {
+    for (_, _, out) in &outs {
         velocity.extend(out.take_host::<Vec<f32>>().await?);
     }
-    velocity.extend(main_out.take_host::<Vec<f32>>().await?);
-    ctx_pipe.close();
-    main_pipe.close();
-    if let Some(pipe) = cond_pipe {
-        pipe.close();
-    }
+    pipe.close();
     Ok(velocity)
 }
 

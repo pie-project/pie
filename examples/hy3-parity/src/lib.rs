@@ -26,7 +26,7 @@
 //!
 //! The two voxel arms bind their clip as a CHANNEL whose shape is the box
 //! (`[h, w, C + 256]`, design D8) and read their seam with
-//! `intrinsics::pixels(rows, width)`. The timestep's sinusoid rides in the
+//! `intrinsics::pixels(0, rows, width)`. The timestep's sinusoid rides in the
 //! SAME rectangle, appended to every voxel row: the CUDA shell seats one
 //! voxel width a fire and refuses a lane that feeds two, and a voxel-axis
 //! lane broadcast (which is what an adaGN vector wants) does not exist.
@@ -244,9 +244,9 @@ fn prefill(
     let max = Channel::new([n], dtype::f32).named(&format!("encode_max_{tag}"));
 
     let pass = ForwardPass::new();
-    pass.switch("reading", encode)?;
+    pass.switch(0, "reading", encode)?;
     pass.embed(&toks, &indptr)?;
-    pass.input("positions", &rope)?;
+    pass.input(0, "positions", &rope)?;
     pass.state(&[ws], StateGeometry::folding())?;
     // Every row reads out: the default is the lane's LAST row, and the
     // golden's logits are the whole causal pass.
@@ -308,17 +308,17 @@ fn denoise_step(
     let out = Channel::new([canvas_len, case.hidden], dtype::f32).named(&name("hidden"));
 
     let pass = ForwardPass::new();
-    pass.switch("reading", denoise)?;
+    pass.switch(0, "reading", denoise)?;
     pass.embed(&toks, &indptr)?;
-    pass.input("latents", &latents)?;
-    pass.input("special", &flag)?;
-    pass.input("timestep", &t)?;
-    pass.input("positions", &rope)?;
+    pass.input(0, "latents", &latents)?;
+    pass.input(0, "special", &flag)?;
+    pass.input(0, "timestep", &t)?;
+    pass.input(0, "positions", &rope)?;
+    pass.mask(&slab)?;
     pass.state(
         &[ws],
         StateGeometry {
             slots: Some(&slots),
-            mask: Some(&slab),
             ..StateGeometry::default()
         },
     )?;
@@ -326,7 +326,7 @@ fn denoise_step(
     let hidden = case.hidden;
     let readback = out.clone();
     pass.epilogue(move || {
-        readback.put(intrinsics::hidden(hidden));
+        readback.put(intrinsics::hidden(0, canvas_len, hidden));
     });
     pass.submit(pipe)
         .with_context(|| format!("the `{tag}` denoise step"))?;
@@ -359,15 +359,15 @@ fn voxel_arm(
         packed.extend_from_slice(&case.tfreq);
     }
     let pass = ForwardPass::new();
-    pass.switch("reading", arm)?;
+    pass.switch(0, "reading", arm)?;
     let x = Channel::from_shaped([case.token_h, case.token_w, width_in], packed.as_slice())
         .named(&format!("clip_{tag}"));
-    pass.input(&voxel_input(arm)?, &x)?;
+    pass.input(0, &voxel_input(arm)?, &x)?;
     let width = readout_width(arm)?;
     let out = Channel::new([rows, width], dtype::f32).named(&format!("pixels_{tag}"));
     let readback = out.clone();
     pass.epilogue(move || {
-        readback.put(intrinsics::pixels(rows, width));
+        readback.put(intrinsics::pixels(0, rows, width));
     });
     pass.submit(pipe)
         .with_context(|| format!("the `{arm}` lane"))?;

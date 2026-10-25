@@ -82,9 +82,8 @@ success (cos ~0.535 against the golden, cos 0.9999 against a reference run
 with no text at all). This script demanded `submit_deadline = "10s"` to
 paper over it.
 
-The runtime now keeps the promise instead: a STATED cohort fires whole or
-not at all, so the deadline cannot buy or cost correctness here (see
-`crates/runtime/src/scheduler/frame.rs`, `group_short` / `cohort_verdict`).
+The guest now runs the step as ONE pass whose lanes are the group, so the
+deadline cannot buy or cost correctness here.
 The demand is gone, and this harness runs at the 50 ms DEFAULT on purpose --
 if a partial group is ever sealed again, this parity is what says so.
 

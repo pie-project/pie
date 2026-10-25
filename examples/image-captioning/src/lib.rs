@@ -6,7 +6,7 @@
 //! let img = Image::from_bytes(&bytes)?;   // host decodes + preprocesses
 //! toks.extend(img.tokens());              // the span IS its token run
 //! fwd.embed(&toks)?;
-//! fwd.media(&[Span::Image(&img)])?;       // the payload, order-matched
+//! fwd.media(0, &[Span::Image(&img)])?;       // the payload, order-matched
 //! ```
 //!
 //! **ONE LEDGER.** The image enters the sequence as the token run its handle
@@ -202,7 +202,7 @@ async fn main(input: Input) -> Result<Output> {
     // host is what checks that — the guest states the correspondence by
     // ordering alone and can state nothing else.
     let spans: Vec<media::Span> = images.iter().map(media::Span::Image).collect();
-    fwd_p.media(&spans)?;
+    fwd_p.media(0, &spans)?;
     fwd_p.state(&[&ws], StateGeometry::folding())?;
     fwd_p.epilogue(move || {
         g0_ch.put(&sample_token());
