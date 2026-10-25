@@ -8,17 +8,17 @@ use eta_ir::Dtype;
 use eta_ir::op::{intrinsic_tags, tags};
 
 use crate::codegen::op_view::OpView;
-use crate::plan::{CompiledStage, Dimension, Region, SymbolicType};
+use crate::plan::{CompiledStage, Dimension, Region};
 
 #[derive(Clone, PartialEq, Eq)]
-pub(super) enum RowClass {
+enum RowClass {
     Full(Dimension),
     Scalar,
     Other,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum Role {
+enum Role {
     Map,
     Broadcast,
     Rng,
@@ -32,33 +32,9 @@ struct Member {
     role: Role,
 }
 
-/// What the stream core reads of the program it plans, and nothing more: the
-/// type of every value, the ops it may plan, and the values that leave,
-/// built from a compiled stage and a region of its plan ([`View::of_stage`]).
-pub(crate) struct View<'a> {
-    pub value_types: &'a [SymbolicType],
-    /// The ops the core may plan, by index into the op list, in program order.
-    pub nodes: Vec<usize>,
-    pub outputs: &'a [u32],
-}
-
-impl<'a> View<'a> {
-    /// The view of one region of a guest stage's plan.
-    pub fn of_stage(stage: &'a CompiledStage, region: &'a Region) -> Self {
-        Self {
-            value_types: &stage.normalized.value_types,
-            nodes: region.nodes.iter().map(|n| n.index()).collect(),
-            outputs: &region.outputs,
-        }
-    }
-
-    fn holds(&self, node: usize) -> bool {
-        self.nodes.contains(&node)
-    }
-}
-
-pub(crate) struct Streams<'a> {
-    pub view: View<'a>,
+pub(super) struct Streams<'a> {
+    pub stage: &'a CompiledStage,
+    pub region: &'a Region,
     pub ops: &'a [OpView],
     pub bases: &'a [u32],
     pub kinds: &'a [u8],
@@ -73,7 +49,8 @@ pub(crate) struct Streams<'a> {
 impl<'a> Streams<'a> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        view: View<'a>,
+        stage: &'a CompiledStage,
+        region: &'a Region,
         ops: &'a [OpView],
         bases: &'a [u32],
         kinds: &'a [u8],
@@ -81,8 +58,8 @@ impl<'a> Streams<'a> {
         skipped: &'a [u8],
         direct_topk: &'a [Option<super::fused::TopKDirect>],
     ) -> Self {
-        let mut readers = vec![Vec::new(); view.value_types.len()];
-        let mut producers = vec![u32::MAX; view.value_types.len()];
+        let mut readers = vec![Vec::new(); stage.normalized.value_types.len()];
+        let mut producers = vec![u32::MAX; stage.normalized.value_types.len()];
         for (node, op) in ops.iter().enumerate() {
             for &arg in &op.args {
                 if let Some(list) = readers.get_mut(arg as usize) {
@@ -95,9 +72,10 @@ impl<'a> Streams<'a> {
                 }
             }
         }
-        let order = emission_order(ops, bases, &view.nodes);
+        let order = emission_order(ops, bases, region);
         Self {
-            view,
+            stage,
+            region,
             ops,
             bases,
             kinds,
@@ -130,7 +108,7 @@ impl<'a> Streams<'a> {
             return false;
         }
         let node = node as usize;
-        if !self.view.holds(node) {
+        if !self.region.nodes.iter().any(|n| n.index() == node) {
             return false;
         }
         let op = &self.ops[node];
@@ -149,7 +127,9 @@ impl<'a> Streams<'a> {
     }
 
     fn stream_reader(&self, node: usize) -> bool {
-        self.view.holds(node) && self.skipped[node] == 0 && self.role(node, &mut None).is_some()
+        self.region.nodes.iter().any(|n| n.index() == node)
+            && self.skipped[node] == 0
+            && self.role(node, &mut None).is_some()
     }
 
     fn topk_reads_direct(&self, node: usize, value: u32) -> bool {
@@ -157,12 +137,12 @@ impl<'a> Streams<'a> {
             && self.ops[node].args.first() == Some(&value)
     }
 
-    pub(super) fn dtype(&self, value: u32) -> Dtype {
-        self.view.value_types[value as usize].dtype
+    fn dtype(&self, value: u32) -> Dtype {
+        self.stage.normalized.value_types[value as usize].dtype
     }
 
-    pub(super) fn class(&self, value: u32) -> RowClass {
-        let ty = &self.view.value_types[value as usize];
+    fn class(&self, value: u32) -> RowClass {
+        let ty = &self.stage.normalized.value_types[value as usize];
         match self.kinds.get(value as usize).copied().unwrap_or(0) {
             1 => ty
                 .dims
@@ -180,13 +160,13 @@ impl<'a> Streams<'a> {
         }
     }
 
-    pub(super) fn role(&self, node: usize, width: &mut Option<Dimension>) -> Option<Role> {
+    fn role(&self, node: usize, width: &mut Option<Dimension>) -> Option<Role> {
         if self.skipped[node] != 0 {
             return None;
         }
         let op = &self.ops[node];
         let out = self.bases[node];
-        if op.results != 1 || out as usize >= self.view.value_types.len() {
+        if op.results != 1 || out as usize >= self.stage.normalized.value_types.len() {
             return None;
         }
         let out_dtype = self.dtype(out);
@@ -418,13 +398,13 @@ impl<'a> Streams<'a> {
         if outside.iter().any(|node| !served(node)) {
             return true;
         }
-        self.view.outputs.contains(&value) && outside.is_empty()
+        self.region.outputs.contains(&value) && outside.is_empty()
     }
 }
 
-fn emission_order(ops: &[OpView], bases: &[u32], nodes: &[usize]) -> Vec<usize> {
+fn emission_order(ops: &[OpView], bases: &[u32], region: &Region) -> Vec<usize> {
     use eta_ir::op::tags;
-    let nodes: Vec<usize> = nodes.to_vec();
+    let nodes: Vec<usize> = region.nodes.iter().map(|n| n.index()).collect();
     let count = nodes.len();
     let producer = |value: u32| -> Option<usize> {
         nodes.iter().position(|&n| {
@@ -1061,7 +1041,8 @@ pub fn spent_values(stage: &CompiledStage, region: &Region) -> Vec<u32> {
     let direct_topk = super::fused::analyze_direct_topk(stage);
     let claimed = direct.claimed();
     let streams = Streams::new(
-        View::of_stage(stage, region),
+        stage,
+        region,
         &ops,
         &bases,
         &kinds,
