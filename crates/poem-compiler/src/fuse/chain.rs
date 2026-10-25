@@ -131,9 +131,8 @@ pub const FRAME_PLANES: usize = 5;
 /// kernels-cuda's `elemwise/frame.cuh`) holds `chain`: every row it reads
 /// and writes bf16, the width a whole number of eight-wide runs within one
 /// block's registers, at most [`FRAME_PLANES`] planes each way (a scalar
-/// parameter, one element, holds none). A chain the
-/// frame does not hold is never folded, so an engine never meets a region
-/// it cannot launch.
+/// parameter, one element, holds none). A chain the frame does not hold is
+/// never folded, so an engine never meets a region it cannot launch.
 #[must_use]
 pub fn frames(trace: &Trace, chain: &Chain, width: u32) -> bool {
     let bf16 = |v: poem_ir::ValueId| {
@@ -145,7 +144,7 @@ pub fn frames(trace: &Trace, chain: &Chain, width: u32) -> bool {
             }
         )
     };
-    width % 8 == 0
+    width.is_multiple_of(8)
         && width <= FRAME_BLOCK * FRAME_PER * 8
         && planes_fit(
             chain.ins.iter().filter(|input| !input.one).count() + chain.outs.len(),

@@ -133,8 +133,8 @@ pub fn whole(tp: u32) -> Result<(), poem::import::Error> {
 /// The trace each rank of `deploy` runs, from the one the package records:
 /// the cuts it leaves to the compiler inferred ([`crate::shard::infer`]),
 /// its products of one activation joined ([`crate::pack`]), its u4
-/// projections tiled where the platform reads them so ([`crate::tile`]), split across its
-/// tensor ranks, its experts across its expert ranks.
+/// projections tiled where the platform reads them so ([`crate::tile`]),
+/// split across its tensor ranks, its experts across its expert ranks.
 pub fn lowered(trace: Trace, deploy: &Deploy) -> Result<Trace, String> {
     lowered_with(trace, deploy, 0)
 }

@@ -53,19 +53,10 @@ pub fn compile(
     compile_axes(trace, &Budgets::of(budget.clone()), profile)
 }
 
-/// The plan of `trace` under `budgets` on `profile`'s device. A trace whose
-/// chains are to run as generated kernels is folded first, once, as a
-/// trace pass ([`fuse::chain::fold`], under `compiler.synth_regions`), and
-/// planned as it stands.
+/// The plan of `trace` under `budgets` on `profile`'s device, the trace
+/// as it stands: a backend that runs chains as generated kernels folds
+/// them first ([`fuse::chain::fold`], under `compiler.synth_regions`).
 pub fn compile_axes(
-    trace: &Trace,
-    budgets: &Budgets,
-    profile: &DeviceProfile,
-) -> Result<CompiledModel, Error> {
-    compile_over(trace, budgets, profile)
-}
-
-fn compile_over(
     trace: &Trace,
     budgets: &Budgets,
     profile: &DeviceProfile,

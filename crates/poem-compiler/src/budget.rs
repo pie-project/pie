@@ -197,8 +197,8 @@ pub struct DeviceProfile {
     /// side streams (0: every fire).
     pub dag_streams_until: u32,
 
-    /// Whether chains of elementwise and row ops are formed into regions
-    /// lowered to eta and folded into `fused.region` ops (`fuse::chain`,
+    /// Whether chains of elementwise and row ops are lowered to kernels-ir
+    /// regions and folded into `fused.region` ops (`fuse::chain`,
     /// `compiler.synth_regions`).
     pub synth_regions: bool,
 

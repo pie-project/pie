@@ -5,10 +5,10 @@
 //! weight a kernel reads at once, and [`joins`] is what an import reads them
 //! into, so the trace and the artifact agree.
 //!
-//! What joins: products with no input-scale operand and no logits head, each by a checkpoint weight of one
-//! segment cut along its rows that nothing else reads, under one guard and
-//! one layer, at one precision, the weights' planes alike, each stating the
-//! heads it holds or none of them.
+//! What joins: products with no input-scale operand and no logits head,
+//! each by a checkpoint weight of one segment cut along its rows that
+//! nothing else reads, under one guard and one layer, at one precision, the
+//! weights' planes alike, each stating the heads it holds or none of them.
 //! Two such products a gated unit reads as its gate and its up become one
 //! packed unit; three whose last two are as wide (q, k, v) a split into
 //! three; two others a split into two. Anything else runs as written. A

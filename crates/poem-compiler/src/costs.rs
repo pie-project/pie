@@ -51,12 +51,12 @@ pub struct Branches;
 #[decision(id = "compiler.dag_streams", flag, default = false, tune = engine)]
 pub struct DagStreams;
 
-/// Whether the compiler forms each chain of elementwise and row ops into a
-/// region lowered to eta (`fuse::chain`), for kernels-* to generate one
-/// kernel for, and plans the trace with each chain folded into one
-/// `fused.region` op (`CompiledModel::trace`). Off unless the backend
-/// registers it on ([`register_regions`], CUDA) or a chip's profile turns it
-/// on; an engine that does runs the folded trace.
+/// Whether each chain of elementwise and row ops is lowered to a kernels-ir
+/// region (`fuse::chain`), for kernels-* to generate one kernel for, and
+/// the trace folded with each chain one `fused.region` op
+/// ([`crate::fuse::chain::fold`]). Off unless the backend registers it on
+/// ([`register_regions`], CUDA) or a chip's profile turns it on; an engine
+/// that does folds its trace before it plans it and runs the folded trace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "compiler.synth_regions", flag, default = false, tune = engine)]
 pub struct SynthRegions;
