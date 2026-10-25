@@ -1,40 +1,38 @@
 #![cfg(feature = "cuda")]
 
-//! The hand fused kernels of two rules CUDA forms no more
-//! (`fuse.residual_add_rmsnorm`, `fuse.rmsnorm_residual_add`: the fold forms
-//! their chains as one generated row kernel), against that kernel: what
-//! each lands and how fast, the numbers the rules were deleted on.
+//! The chains the fold forms as one generated row kernel on CUDA (a residual
+//! add and its RMS norm, either way round), each against its own ops fired
+//! unfused and against the kernels-ir interpreter: what each lands and how
+//! fast against the bandwidth roofline.
 //!
 //! Each region here is the one poem-compiler's `fuse::chain` lowers the
-//! rule's ops to on the catalog's models, op for op and in its parameters'
+//! chain's ops to on the catalog's models, op for op and in its parameters'
 //! order (the first read first), its results the values read past the
 //! chain, and every value an op defines rounded to bf16 where it is
 //! defined, as the unfused ops store it:
 //!
-//! - `residual_add_rmsnorm`: `h = y + x`, `rmsnorm(h) · w`. The stream
-//!   leaves (a layer's residual norms), or only the normed row does (the
-//!   final norm: nothing reads the stream past it); either way the norm
-//!   reads the stream as stored.
-//! - `rmsnorm_residual_add`: `y + rmsnorm(x) · w` (Gemma's sandwich norm),
-//!   then optionally the next norm over the sum. The normed `t` is read by
-//!   the add alone, so it never leaves, but the add reads it rounded, as the
-//!   hand kernel does.
+//! - a residual norm: `h = y + x`, `rmsnorm(h) · w`. The stream leaves (a
+//!   layer's residual norms), or only the normed row does (the final norm:
+//!   nothing reads the stream past it); either way the norm reads the
+//!   stream as stored.
+//! - a norm and fold: `y + rmsnorm(x) · w` (Gemma's sandwich norm), then
+//!   optionally the next norm over the sum. The normed `t` is read by the
+//!   add alone, so it never leaves, but the add reads it rounded, as the
+//!   unfused add does.
 //!
-//! So each region lands the hand kernel's bits, its sums of squares taken
-//! two at a time as the hand kernels take them (`a += h₀² + h₁²`), but
-//! where a row's threads hold it otherwise than the hand kernel's: Gemma's
-//! norm-and-fold at 5376 splits the row over 512 threads, the frame over
-//! 256, so a sum's tree differs in its last bit and a normed element by an
-//! ulp, about once in a hundred thousand. Gemma 4's layer scale, a weight
-//! of one element, is the region's scalar parameter.
+//! So each region lands its unfused ops' bits but where a row's threads
+//! sum its squares otherwise than the unfused norm's: a sum's tree differs
+//! in its last bit and a normed element by an ulp. Gemma 4's layer scale, a
+//! weight of one element, is the region's scalar parameter.
 
 use crate::common::attn_ref::{ten, tuned};
 use crate::common::{Gpu, Lcg, captured, forget, from_bf16, replay, to_bf16};
 use dtype::Dtype::Bf16;
-use kernels_cuda::elemwise::norm_residual::{self, Keep, PostNorm};
+use kernels_cuda::elemwise::{norm, pointwise};
 use kernels_cuda::jit::Ctx;
 use kernels_cuda::synth::{self, In, Out, Plane, Region, Synthesized};
 use kernels_cuda::tuning::Tuning;
+use kernels_ir::interp::{self, Arg};
 use kernels_ir::{Binary, Literal, Op, Reduce, Shape, Unary};
 
 const EPS: f32 = 1e-6;
@@ -42,15 +40,17 @@ const EPS: f32 = 1e-6;
 /// Gemma 4's layer scale, as a bf16.
 const SCALE: f32 = 0.71875;
 
-/// One chain a hand rule forms and the fold forms as a region.
+/// One chain the fold forms as a region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Chain {
-    /// `residual_add_rmsnorm`; `stream` whether the sum is read past it.
+    /// A residual add, then the norm of the sum; `stream` whether the sum
+    /// is read past it.
     ResidualNorm { plus_one: bool, stream: bool },
-    /// `rmsnorm_residual_add`; `post` whether the sum is normed again.
+    /// A norm folded into the stream; `post` whether the sum is normed
+    /// again.
     NormResidual { post: bool },
-    /// `rmsnorm_residual_add` with Gemma 4's layer scale (a weight of one
-    /// element) on the sum, then the next norm.
+    /// A norm folded into the stream with Gemma 4's layer scale (a weight
+    /// of one element) on the sum, then the next norm.
     ScaledNormResidual,
 }
 
@@ -72,11 +72,11 @@ impl Chain {
 
     fn name(self) -> &'static str {
         match self {
-            Chain::ResidualNorm { stream: true, .. } => "residual_add_rmsnorm",
-            Chain::ResidualNorm { stream: false, .. } => "residual_add_rmsnorm (final)",
-            Chain::NormResidual { post: false } => "rmsnorm_residual_add",
-            Chain::NormResidual { post: true } => "rmsnorm_residual_add + post",
-            Chain::ScaledNormResidual => "rmsnorm_residual_add scaled",
+            Chain::ResidualNorm { stream: true, .. } => "residual, norm",
+            Chain::ResidualNorm { stream: false, .. } => "residual, norm (final)",
+            Chain::NormResidual { post: false } => "norm, residual",
+            Chain::NormResidual { post: true } => "norm, residual, norm",
+            Chain::ScaledNormResidual => "norm, residual, scale, norm",
         }
     }
 
@@ -284,11 +284,9 @@ fn generated(chain: Chain, width: usize) -> Synthesized {
     kernel
 }
 
-/// The knobs the hand kernels run under: none (the L40S's profile, and
-/// every chip's default), or the register forms and unread rows skipped
-/// (B200's and H200's profiles, `kernel.elemwise.{rows_vec,
-/// norm_fold_block}`, the rows nothing reads left unwritten as the engine
-/// left them when it fired the hand kernel).
+/// The knobs the unfused ops run under: none (the L40S's profile, and every
+/// chip's default), or their register forms (B200's and H200's profiles,
+/// `kernel.elemwise.rows_vec`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Knobs {
     Default,
@@ -301,34 +299,20 @@ impl Knobs {
     fn ctx(self, gpu: &Gpu) -> Ctx {
         match self {
             Knobs::Default => gpu.ctx().with_tuning(Tuning::DEFAULT),
-            Knobs::Tuned => gpu.ctx().with_tuning(tuned(|t| {
-                t.rows_vec = true;
-                t.norm_fold_block = 128;
-            })),
-        }
-    }
-
-    /// The rows the hand norm-and-fold lands: tuned, the
-    /// engine leaves the normed row it alone reads unwritten, and the sum
-    /// too where only its scaled copy goes on.
-    fn keep(self, chain: Chain) -> Keep {
-        match (self, chain) {
-            (Knobs::Default, _) => Keep::ALL,
-            (Knobs::Tuned, Chain::ScaledNormResidual) => Keep { t: false, y: false },
-            (Knobs::Tuned, _) => Keep { t: false, y: true },
+            Knobs::Tuned => gpu.ctx().with_tuning(tuned(|t| t.rows_vec = true)),
         }
     }
 }
 
 /// One set of a fire's planes: the chain's row parameters and results, and
-/// the hand kernel's scratch, each `rows` rows.
+/// the unfused ops' scratch, each `rows` rows.
 #[derive(Clone, Copy)]
 struct Planes {
     x: u64,
     y: u64,
-    /// The hand norm-and-fold's normed row.
+    /// The unfused norm's normed row.
     t: u64,
-    /// The region's stream (the hand kernels sum it into `y`).
+    /// The region's stream (the unfused add sums it into `y`).
     h: u64,
     out: u64,
 }
@@ -354,69 +338,38 @@ struct Weights {
     s: u64,
 }
 
-/// The hand kernel of `chain` over `p`: the stream summed into `y`.
-#[allow(clippy::too_many_arguments)]
-fn fire_hand(
-    ctx: &Ctx,
-    knobs: Knobs,
-    chain: Chain,
-    rows: usize,
-    width: usize,
-    p: Planes,
-    w: Weights,
-) {
+/// The ops of `chain` over `p`, unfused, as the engine fires them: the
+/// stream summed (and scaled) in place into `y`.
+fn fire_unfused(ctx: &Ctx, chain: Chain, rows: usize, width: usize, p: Planes, w: Weights) {
     let t = |at| ten(at, rows, width, Bf16);
     let weight = |at| ten(at, width, 1, Bf16);
-    match chain {
-        Chain::ResidualNorm { plus_one, .. } => norm_residual::residual_add_rmsnorm(
-            ctx,
-            t(p.x),
-            &mut t(p.y),
-            weight(w.w),
-            plus_one,
-            EPS,
-            &mut t(p.out),
-        ),
-        Chain::NormResidual { post } => {
-            let mut out = t(p.out);
-            norm_residual::rmsnorm_residual_add_keeping(
-                ctx,
-                t(p.x),
-                weight(w.w),
-                EPS,
-                &mut t(p.t),
-                &mut t(p.y),
-                None,
-                post.then(|| PostNorm {
-                    weight: weight(w.w1),
-                    plus_one: false,
-                    eps: EPS,
-                    out: &mut out,
-                }),
-                knobs.keep(chain),
-            )
+    let fired = || -> Result<(), kernels_cuda::error::Error> {
+        match chain {
+            Chain::ResidualNorm { plus_one, .. } => {
+                pointwise::residual_add(ctx, t(p.x), &mut t(p.y))?;
+                if plus_one {
+                    norm::rmsnorm_plus_one(ctx, t(p.y), weight(w.w), EPS, &mut t(p.out))
+                } else {
+                    norm::rmsnorm(ctx, t(p.y), weight(w.w), EPS, &mut t(p.out))
+                }
+            }
+            Chain::NormResidual { post } => {
+                norm::rmsnorm(ctx, t(p.x), weight(w.w), EPS, &mut t(p.t))?;
+                pointwise::residual_add(ctx, t(p.t), &mut t(p.y))?;
+                if post {
+                    norm::rmsnorm(ctx, t(p.y), weight(w.w1), EPS, &mut t(p.out))?;
+                }
+                Ok(())
+            }
+            Chain::ScaledNormResidual => {
+                norm::rmsnorm(ctx, t(p.x), weight(w.w), EPS, &mut t(p.t))?;
+                pointwise::residual_add(ctx, t(p.t), &mut t(p.y))?;
+                pointwise::scale(ctx, ten(w.s, 1, 1, Bf16), &mut t(p.y))?;
+                norm::rmsnorm(ctx, t(p.y), weight(w.w1), EPS, &mut t(p.out))
+            }
         }
-        Chain::ScaledNormResidual => {
-            let (mut out, mut scaled) = (t(p.out), t(p.h));
-            norm_residual::rmsnorm_residual_add_keeping(
-                ctx,
-                t(p.x),
-                weight(w.w),
-                EPS,
-                &mut t(p.t),
-                &mut t(p.y),
-                Some((ten(w.s, 1, 1, Bf16), &mut scaled)),
-                Some(PostNorm {
-                    weight: weight(w.w1),
-                    plus_one: false,
-                    eps: EPS,
-                    out: &mut out,
-                }),
-                knobs.keep(chain),
-            )
-        }
-    }
-    .expect("the hand kernel fires");
+    };
+    fired().expect("the unfused ops fire");
 }
 
 /// The generated kernel of `chain` over `p`: the stream into `h`.
@@ -504,7 +457,7 @@ fn draw(rows: usize, width: usize) -> (Vec<u16>, Vec<u16>, Vec<u16>, Vec<u16>) {
     (x, y, w, w1)
 }
 
-/// What `chain` lands over one draw, by its hand kernel under `knobs` or
+/// What `chain` lands over one draw, by its unfused ops under `knobs` or
 /// (`None`) by its generated kernel.
 fn land(chain: Chain, rows: usize, width: usize, by: Option<Knobs>) -> Landed {
     let n = rows * width;
@@ -524,14 +477,9 @@ fn land(chain: Chain, rows: usize, width: usize, by: Option<Knobs>) -> Landed {
     };
     let stream_at = match by {
         Some(knobs) => {
-            fire_hand(&knobs.ctx(&gpu), knobs, chain, rows, width, p, weights);
-            // the hand kernel sums the stream into `y`, and lands a scaled
-            // one in its own plane
-            if chain == Chain::ScaledNormResidual {
-                p.h
-            } else {
-                p.y
-            }
+            fire_unfused(&knobs.ctx(&gpu), chain, rows, width, p, weights);
+            // the unfused add sums the stream into `y`
+            p.y
         }
         None => {
             let kernel = generated(chain, width);
@@ -550,79 +498,55 @@ fn land(chain: Chain, rows: usize, width: usize, by: Option<Knobs>) -> Landed {
     Landed { stream, out }
 }
 
-/// The chain's own math on the host, in f32: values only the chain reads
-/// kept unrounded, each result rounded as stored and read on as rounded.
-fn host(chain: Chain, rows: usize, width: usize) -> Landed {
+/// The chain's region by the kernels-ir interpreter, row by row: the
+/// region's own math in f32, each value rounded where it is defined.
+fn math(chain: Chain, rows: usize, width: usize) -> Landed {
     let (x, y, w, w1) = draw(rows, width);
     let f = |v: &[u16]| -> Vec<f32> { v.iter().map(|&b| from_bf16(b)).collect() };
     let (x, y, w, w1) = (f(&x), f(&y), f(&w), f(&w1));
-    let inv = |row: &[f32]| {
-        let ss: f32 = row.iter().map(|v| v * v).sum();
-        1.0 / (ss / width as f32 + EPS).sqrt()
-    };
+    let region = chain.region(width);
+    let scale = from_bf16(to_bf16(SCALE));
     let (mut stream, mut out) = (Vec::new(), Vec::new());
     for r in 0..rows {
         let at = r * width..(r + 1) * width;
-        let (x, y) = (&x[at.clone()], &y[at]);
-        match chain {
-            Chain::ResidualNorm { plus_one, .. } => {
-                let h: Vec<f32> = (0..width)
-                    .map(|e| from_bf16(to_bf16(y[e] + x[e])))
-                    .collect();
-                let r = inv(&h);
-                stream.extend(h.iter().map(|&v| to_bf16(v)));
-                out.extend((0..width).map(|e| {
-                    let w = if plus_one { w[e] + 1.0 } else { w[e] };
-                    to_bf16(h[e] * r * w)
-                }));
+        let (x, y) = (Arg::Row(x[at.clone()].to_vec()), Arg::Row(y[at].to_vec()));
+        let args = match chain {
+            Chain::ResidualNorm { .. } => vec![x, y, Arg::Row(w.clone())],
+            Chain::NormResidual { post: false } => vec![x, Arg::Row(w.clone()), y],
+            Chain::NormResidual { post: true } => {
+                vec![x, Arg::Row(w.clone()), y, Arg::Row(w1.clone())]
             }
-            Chain::NormResidual { post } => {
-                let r = inv(x);
-                let sum: Vec<f32> = (0..width)
-                    .map(|e| from_bf16(to_bf16(y[e] + from_bf16(to_bf16(x[e] * r * w[e])))))
-                    .collect();
-                stream.extend(sum.iter().map(|&v| to_bf16(v)));
-                if post {
-                    let r = inv(&sum);
-                    out.extend((0..width).map(|e| to_bf16(sum[e] * r * w1[e])));
-                }
+            Chain::ScaledNormResidual => vec![
+                x,
+                Arg::Row(w.clone()),
+                y,
+                Arg::Scalar(scale),
+                Arg::Row(w1.clone()),
+            ],
+        };
+        let results = interp::eval(&region, &args).expect("the interpreter runs the region");
+        let bf16 = |row: &[f32]| row.iter().map(|&v| to_bf16(v)).collect::<Vec<u16>>();
+        match results.as_slice() {
+            [last] => out.extend(bf16(last)),
+            [sum, last] => {
+                stream.extend(bf16(sum));
+                out.extend(bf16(last));
             }
-            Chain::ScaledNormResidual => {
-                let r = inv(x);
-                let scaled: Vec<f32> = (0..width)
-                    .map(|e| {
-                        let t = from_bf16(to_bf16(x[e] * r * w[e]));
-                        let sum = from_bf16(to_bf16(y[e] + t));
-                        from_bf16(to_bf16(sum * from_bf16(to_bf16(SCALE))))
-                    })
-                    .collect();
-                stream.extend(scaled.iter().map(|&v| to_bf16(v)));
-                let r = inv(&scaled);
-                out.extend((0..width).map(|e| to_bf16(scaled[e] * r * w1[e])));
-            }
+            _ => unreachable!("a chain lands one or two results"),
         }
     }
-    match chain {
-        Chain::ResidualNorm { stream: true, .. }
-        | Chain::NormResidual { post: true }
-        | Chain::ScaledNormResidual => Landed {
-            stream: Some(stream),
-            out,
-        },
-        Chain::ResidualNorm { stream: false, .. } => Landed { stream: None, out },
-        Chain::NormResidual { post: false } => Landed {
-            stream: None,
-            out: stream,
-        },
+    Landed {
+        stream: (chain.outs() == 2).then_some(stream),
+        out,
     }
 }
 
 /// Every chain, at a decode's and a prefill's rows and a ragged count:
-/// each generated kernel lands its own math within an ulp (its sums of
-/// squares are added in another order than the host's), and is set
-/// against each hand kernel, element for element.
+/// each generated kernel lands its region's math by the interpreter within
+/// an ulp (its sums of squares are added in another order), and is set
+/// against the chain's unfused ops, element for element.
 #[test]
-fn each_rules_region_lands_its_math_and_is_set_against_the_hand_kernel() {
+fn each_chains_region_lands_its_math_and_its_unfused_ops() {
     let chains = Chain::TIMED.into_iter().chain([Chain::ResidualNorm {
         plus_one: true,
         stream: true,
@@ -632,7 +556,7 @@ fn each_rules_region_lands_its_math_and_is_set_against_the_hand_kernel() {
             for rows in [1usize, 7, 64] {
                 let case = format!("{} ({chain:?}): {rows} rows of {width}", chain.name());
                 let region = land(chain, rows, width, None);
-                let math = host(chain, rows, width);
+                let math = math(chain, rows, width);
                 for (what, got, want) in [
                     ("stream", region.stream.as_deref(), math.stream.as_deref()),
                     (
@@ -644,11 +568,11 @@ fn each_rules_region_lands_its_math_and_is_set_against_the_hand_kernel() {
                     let (Some(got), Some(want)) = (got, want) else {
                         continue;
                     };
-                    // `t` an ulp of itself apart (the host's `1 / sqrt` is
-                    // not `rsqrtf`) is a sum up to four of the sum's scale
-                    // apart where it cancels, and a post norm scales that
-                    // up again: a sanity bound; the hand kernel's bits are
-                    // the test
+                    // `t` an ulp of itself apart (the interpreter's
+                    // `1 / sqrt` is not `rsqrtf`) is a sum up to four of the
+                    // sum's scale apart where it cancels, and a post norm
+                    // scales that up again: a sanity bound; the unfused
+                    // ops' bits are the test
                     let within = match (chain, what) {
                         (Chain::NormResidual { .. } | Chain::ScaledNormResidual, _) => 8.0,
                         _ => 1.0,
@@ -660,19 +584,19 @@ fn each_rules_region_lands_its_math_and_is_set_against_the_hand_kernel() {
                     );
                 }
                 for knobs in Knobs::BOTH {
-                    let hand = land(chain, rows, width, Some(knobs));
+                    let unfused = land(chain, rows, width, Some(knobs));
                     let stream = region
                         .stream
                         .as_deref()
-                        .zip(hand.stream.as_deref())
+                        .zip(unfused.stream.as_deref())
                         .map(|(got, want)| apart(got, want));
-                    let (n, most) = apart(&region.out, &hand.out);
+                    let (n, most) = apart(&region.out, &unfused.out);
                     eprintln!(
-                        "{case}, hand {knobs:?}: stream (apart, ulps) {stream:?}, result {n} of {} \
+                        "{case}, unfused {knobs:?}: stream (apart, ulps) {stream:?}, result {n} of {} \
                          apart, {most} ulps at most",
                         rows * width
                     );
-                    // The hand kernel's bits but where a sum of squares
+                    // The unfused ops' bits but where a sum of squares
                     // lands in its last bit apart: a norm an ulp apart, and
                     // the sum a norm's row joins (or the norm after it) an
                     // ulp of its addends apart, about once in a million.
@@ -681,7 +605,7 @@ fn each_rules_region_lands_its_math_and_is_set_against_the_hand_kernel() {
                         let Some((n, most)) = apart else { continue };
                         assert!(
                             n * 10_000 <= total.max(10_000) && most <= 2.0,
-                            "{case}, hand {knobs:?}: {n} of {total} {what} elements apart, \
+                            "{case}, unfused {knobs:?}: {n} of {total} {what} elements apart, \
                              {most} ulps at most"
                         );
                     }
@@ -704,21 +628,22 @@ fn median(runs: u32, mut run: impl FnMut()) -> f64 {
     us[us.len() / 2]
 }
 
-/// Each chain's hand kernel, under the default knobs and the tuned ones,
+/// Each chain's unfused ops, under the default knobs and the tuned ones,
 /// against its generated kernel, at a decode's and a prefill's rows over
 /// the widths of the catalog's models that form it; each fire's bytes (the
 /// chain's own: what its parameters read and its results write) against the
-/// device's copy rate: `cargo test --release ... -- --ignored
+/// device's copy rate, the roofline: `cargo test --release ... -- --ignored
 /// synthesized_rule_rate --nocapture`. A fire is a graph of its fires over
 /// planes rotating through at least 1 GiB, so a prefill's fire reads HBM,
-/// not the L2, even where it touches two planes of a set (the hand kernels
-/// sum the stream in place; a region writes its own plane): the median over
+/// not the L2, even where it touches several planes of a set (the unfused
+/// ops land a normed row between them and sum the stream in place; a region
+/// writes its own plane): the median over
 /// rounds, each graph in turn, of each round's median replay.
 #[test]
 #[ignore = "a rate bench: cargo test --release ... -- --ignored synthesized_rule_rate --nocapture"]
 fn synthesized_rule_rate() {
     use super::frame::copy_rate;
-    // a set's five planes; a fire may touch two of them (an in-place
+    // a set's five planes; a fire may touch several of them (an in-place
     // stream), so the sets span four times that of any card's L2
     const FOOTPRINT: usize = 1 << 30;
     const FIRES: usize = 256;
@@ -727,7 +652,7 @@ fn synthesized_rule_rate() {
     let copy = copy_rate();
     eprintln!("device copy: {copy:.0} GB/s");
     eprintln!(
-        "{:<28}  rows  width  default us  %copy  tuned us  %copy  region us  %copy  region/best",
+        "{:<28}  rows  width  unfused us  %copy  tuned us  %copy  region us  %copy  region/best",
         "chain"
     );
     for chain in Chain::TIMED {
@@ -762,10 +687,10 @@ fn synthesized_rule_rate() {
                 let contexts = [Knobs::Default.ctx(&gpu), Knobs::Tuned.ctx(&gpu), gpu.ctx()];
                 let execs = [
                     graph(&contexts[0], &|p| {
-                        fire_hand(&contexts[0], Knobs::Default, chain, rows, width, p, weights);
+                        fire_unfused(&contexts[0], chain, rows, width, p, weights);
                     }),
                     graph(&contexts[1], &|p| {
-                        fire_hand(&contexts[1], Knobs::Tuned, chain, rows, width, p, weights);
+                        fire_unfused(&contexts[1], chain, rows, width, p, weights);
                     }),
                     graph(&contexts[2], &|p| {
                         fire_region(&contexts[2], kernel, chain, rows, width, p, weights);

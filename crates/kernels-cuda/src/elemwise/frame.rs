@@ -1,8 +1,8 @@
 //! The row frame (`elemwise/frame.cuh`): one row a block, held whole in
 //! registers, around a body that computes it in hooks over the frame. The
-//! bodies here are written by hand (`elemwise/frame.cu`), each landing what
-//! the hand kernel of its op lands; generated ones ([`crate::synth`]) fire
-//! through the same launch.
+//! body here is written by hand (`elemwise/frame.cu`), the frame's own
+//! reference; generated ones ([`crate::synth`]) fire through the same
+//! launch.
 
 use super::BLOCK;
 use crate::error::Error;
@@ -142,10 +142,10 @@ pub(crate) fn fire(
     )
 }
 
-/// `norm_residual::residual_add_rmsnorm` as a row frame's body: `y += x` in
-/// place, then `out` the RMS norm of `y` by `weight` (by `1 + weight` with
-/// `plus_one`), bit for bit as `residual_add_rmsnorm_reg`. Rows up to 8192
-/// bf16 wide, every plane 16-byte aligned.
+/// A residual norm as a row frame's body: `y += x` in place, then `out` the
+/// RMS norm of `y` by `weight` (by `1 + weight` with `plus_one`), its
+/// squares summed a pair at a time. Rows up to 8192 bf16 wide, every plane
+/// 16-byte aligned.
 pub fn residual_add_rmsnorm(
     ctx: &Ctx,
     x: Tensor,

@@ -1,14 +1,14 @@
 #![cfg(feature = "cuda")]
 
 //! A generated row kernel (`kernels_cuda::synth`) lands what the region it
-//! was generated from states: the printed bodies of the regions poem lowers, and
-//! the hand `residual_add_rmsnorm` body passed through the same path, each
-//! against the hand kernels.
+//! was generated from states: the printed bodies of the regions poem lowers,
+//! against the chain's own ops fired unfused, and the frame's hand residual
+//! norm body passed through the same path, against the frame.
 
 use crate::common::attn_ref::{ten, tuned};
 use crate::common::{Gpu, Lcg, captured, forget, from_bf16, replay, to_bf16};
 use dtype::Dtype::Bf16;
-use kernels_cuda::elemwise::{norm_residual, pointwise};
+use kernels_cuda::elemwise::{frame, pointwise};
 use kernels_cuda::jit::Ctx;
 use kernels_cuda::synth::{self, Body, In, Out, Plane, Region};
 use kernels_ir::{Binary, Literal, Op, Reduce, Shape, Unary};
@@ -18,7 +18,7 @@ const EPS: f32 = 1e-6;
 const WIDTHS: [usize; 6] = [4096, 7168, 8192, 2048, 1544, 6152];
 const ROWS: [usize; 3] = [1, 7, 64];
 
-/// The hand kernels' register forms (`kernel.elemwise.rows_vec`).
+/// The unfused kernels' register forms (`kernel.elemwise.rows_vec`).
 fn hand(gpu: &Gpu) -> Ctx {
     gpu.ctx().with_tuning(tuned(|t| t.rows_vec = true))
 }
@@ -127,8 +127,9 @@ fn draw(rows: usize, width: usize, planes: usize) -> (Vec<Vec<u16>>, Vec<u16>) {
     (rows, lcg.row(width).0)
 }
 
-/// The hand register kernel's stream and normed row.
-fn hand_residual_norm(rows: usize, width: usize) -> (Vec<u16>, Vec<u16>) {
+/// The stream and normed row `fire` lands over the draw of `rows` rows of
+/// `width`: the frame's hand body or the chain's unfused ops.
+fn residual_norm_by(fire: super::frame::Fire, rows: usize, width: usize) -> (Vec<u16>, Vec<u16>) {
     let n = rows * width;
     let (planes, w) = draw(rows, width, 2);
     let mut gpu = Gpu::open();
@@ -138,7 +139,7 @@ fn hand_residual_norm(rows: usize, width: usize) -> (Vec<u16>, Vec<u16>) {
         gpu.up(&w),
         gpu.zeros(n * 2),
     );
-    norm_residual::residual_add_rmsnorm(
+    fire(
         &hand(&gpu),
         ten(x, rows, width, Bf16),
         &mut ten(y, rows, width, Bf16),
@@ -147,13 +148,13 @@ fn hand_residual_norm(rows: usize, width: usize) -> (Vec<u16>, Vec<u16>) {
         EPS,
         &mut ten(out, rows, width, Bf16),
     )
-    .expect("the hand residual norm fires");
+    .expect("the residual norm fires");
     gpu.sync();
     (gpu.down(y, n), gpu.down(out, n))
 }
 
 #[test]
-fn the_hand_body_through_synth_lands_the_register_kernels_bits() {
+fn the_hand_body_through_synth_lands_the_frames_bits() {
     let body = hand_body();
     for width in WIDTHS {
         let kernel = loaded(&body, 3, 2, width);
@@ -183,7 +184,7 @@ fn the_hand_body_through_synth_lands_the_register_kernels_bits() {
                 .fire(&gpu.ctx(), &ins, &[plane(out), plane(h)], rows as u32)
                 .expect("the hand body fires");
             gpu.sync();
-            let (y_want, out_want) = hand_residual_norm(rows, width);
+            let (y_want, out_want) = residual_norm_by(frame::residual_add_rmsnorm, rows, width);
             let case = format!("{rows} rows of {width}");
             assert!(gpu.down::<u16>(h, n) == y_want, "{case}: the summed stream");
             assert!(
@@ -194,14 +195,13 @@ fn the_hand_body_through_synth_lands_the_register_kernels_bits() {
     }
 }
 
-/// The residual norm's region against the hand register kernel. The stream is
-/// the same sum and lands the same bits, and the norm takes its squares two
-/// at a time as the hand kernel does (`a += h₀² + h₁²`); a sum whose
-/// threads split the row otherwise than the hand kernel's would differ in
-/// its last f32 bit and, through `rsqrt`, a normed element by one bf16 ulp,
-/// which is what this holds it to.
+/// The residual norm's region against its ops unfused (`residual_add`, then
+/// `rmsnorm`). The stream is the same sum and lands the same bits; the norm's
+/// threads split the row otherwise than the unfused norm's, so a sum of
+/// squares may differ in its last f32 bit and, through `rsqrt`, a normed
+/// element by one bf16 ulp, which is what this holds it to.
 #[test]
-fn a_residual_norms_region_lands_the_hand_stream_and_its_norm_within_an_ulp() {
+fn a_residual_norms_region_lands_its_unfused_stream_and_their_norm_within_an_ulp() {
     for width in WIDTHS {
         let body = body_of(&residual_norm(width), &[2]);
         let kernel = loaded(&body, 3, 2, width);
@@ -226,7 +226,7 @@ fn a_residual_norms_region_lands_the_hand_stream_and_its_norm_within_an_ulp() {
                 )
                 .expect("the printed body fires");
             gpu.sync();
-            let (y_want, out_want) = hand_residual_norm(rows, width);
+            let (y_want, out_want) = residual_norm_by(super::frame::unfused, rows, width);
             let case = format!("{rows} rows of {width}");
             assert!(gpu.down::<u16>(h, n) == y_want, "{case}: the stream");
             let got = gpu.down::<u16>(out, n);
@@ -240,7 +240,7 @@ fn a_residual_norms_region_lands_the_hand_stream_and_its_norm_within_an_ulp() {
             for &(at, a, b) in &apart {
                 assert!(
                     a.abs_diff(b) <= 1,
-                    "{case}: normed element {at} is {} and the hand kernel's {}",
+                    "{case}: normed element {at} is {} and the unfused ops' {}",
                     from_bf16(a),
                     from_bf16(b)
                 );
@@ -415,22 +415,23 @@ fn a_kernel_never_loaded_is_refused_at_its_fire() {
     assert!(refused.to_string().contains("not loaded"), "{refused}");
 }
 
-/// The residual norm's region, generated, against the hand register kernel at a
-/// decode's and a prefill's rows over the widths of 4096-, 7168- and
-/// 8192-wide models, each fire's bytes against the device's copy rate:
+/// The residual norm's region, generated, against its ops unfused
+/// (`residual_add`, then `rmsnorm`) at a decode's and a prefill's rows over
+/// the widths of 4096-, 7168- and 8192-wide models, each fire's bytes (the
+/// chain's own) against the device's copy rate, the roofline:
 /// `cargo test ... -- --ignored synthesized_residual_norm_rate --nocapture`.
 /// A fire is its graph's fastest replay over its fires; the planes rotate
 /// over at least 256 MB so a fire reads HBM, not the L2.
 #[test]
 #[ignore = "a rate bench: cargo test ... -- --ignored synthesized_residual_norm_rate --nocapture"]
 fn synthesized_residual_norm_rate() {
-    use super::frame::{copy_rate, fastest};
+    use super::frame::{copy_rate, fastest, unfused};
     const FOOTPRINT: usize = 256 << 20;
     const FIRES: usize = 256;
     const REPLAYS: u32 = 20;
     let copy = copy_rate();
     eprintln!("device copy: {copy:.0} GB/s");
-    eprintln!("rows  width  hand us  %copy  synth us  %copy  synth/hand");
+    eprintln!("rows  width  unfused us  %copy  synth us  %copy  synth/unfused");
     for rows in [1usize, 8, 64, 512, 4096] {
         for width in [4096usize, 7168, 8192] {
             let kernel = loaded(&body_of(&residual_norm(width), &[2]), 3, 2, width);
@@ -469,17 +470,9 @@ fn synthesized_residual_norm_rate() {
                 forget(exec);
                 us / fires as f64
             };
-            let hand_us = time(&|[x, y, out, _]| {
-                norm_residual::residual_add_rmsnorm(
-                    &ctx,
-                    t(x),
-                    &mut t(y),
-                    w,
-                    false,
-                    EPS,
-                    &mut t(out),
-                )
-                .expect("the hand residual norm fires");
+            let unfused_us = time(&|[x, y, out, _]| {
+                unfused(&ctx, t(x), &mut t(y), w, false, EPS, &mut t(out))
+                    .expect("the unfused residual norm fires");
             });
             let synth_us = time(&|[x, y, out, h]| {
                 kernel
@@ -496,10 +489,10 @@ fn synthesized_residual_norm_rate() {
             let bytes = (4 * plane + width * 2) as f64;
             let share = |us: f64| 100.0 * bytes / us / 1e3 / copy;
             eprintln!(
-                "{rows:>4}  {width:>5}  {hand_us:>7.2}  {:>4.0}%  {synth_us:>8.2}  {:>4.0}%  {:>10.3}",
-                share(hand_us),
+                "{rows:>4}  {width:>5}  {unfused_us:>10.2}  {:>4.0}%  {synth_us:>8.2}  {:>4.0}%  {:>13.3}",
+                share(unfused_us),
                 share(synth_us),
-                synth_us / hand_us,
+                synth_us / unfused_us,
             );
         }
     }

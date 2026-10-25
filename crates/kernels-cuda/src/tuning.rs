@@ -630,14 +630,6 @@ pub struct ElemwiseRowsVec;
 #[decision(id = "kernel.elemwise.q_norm_rope_warp", flag, default = false, tune = search)]
 pub struct ElemwiseQNormRopeWarp;
 
-/// The threads a block of the 16-byte fused norm-and-fold takes a row with
-/// in a fire of 1024 rows or more: 0 is the row's runs rounded up to a power
-/// of two (at most 512), as always and as in every narrower fire; a smaller
-/// block takes the row in several runs a thread and seats more rows an SM.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.elemwise.norm_fold_block", constant(set(0, 32, 64, 128, 256)), default = 0, tune = search)]
-pub struct ElemwiseNormFoldBlock(pub u32);
-
 /// Whether the hyper-connection kernels run their tiled and 16-byte forms:
 /// the mix projection a block 64 rows of every column over shared-memory
 /// tiles, the fold and the gates' pre-mix eight columns a thread, and a
@@ -833,7 +825,6 @@ pub fn register(registry: &mut Registry) {
         .add::<SsmGdnScanUntil>()
         .add::<ElemwiseRowsVec>()
         .add::<ElemwiseQNormRopeWarp>()
-        .add::<ElemwiseNormFoldBlock>()
         .add::<ElemwiseHcTile>()
         .add::<ElemwiseHcMma>()
         .add::<ElemwiseHcMegaUntil>()
@@ -974,7 +965,6 @@ tuning! {
     ssm_gdn_scan_until: u32 = 32, get SsmGdnScanUntil;
     rows_vec: bool = false, on ElemwiseRowsVec;
     q_norm_rope_warp: bool = false, on ElemwiseQNormRopeWarp;
-    norm_fold_block: u32 = 0, get ElemwiseNormFoldBlock;
     hc_tile: bool = false, on ElemwiseHcTile;
     hc_mma: bool = false, on ElemwiseHcMma;
     hc_mega_until: u32 = 0, get ElemwiseHcMegaUntil;

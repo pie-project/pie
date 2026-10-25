@@ -4,7 +4,6 @@ pub mod hc;
 pub mod hc_project;
 pub mod modulate;
 pub mod norm;
-pub mod norm_residual;
 pub mod norm_rope;
 pub mod pointwise;
 pub mod posenc;
