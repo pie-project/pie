@@ -752,7 +752,8 @@ pub enum HostOp {
     /// Each of `rows` token rows' cell, `width` f32 columns: a row of one of
     /// the `clips` boxes of `tgrid` (i32 `t, h, w, off`) its `(t, h, w)` in
     /// the box, row-major; any other row `positions[row]` (i32) in column
-    /// `axis`; zeros elsewhere.
+    /// `axis`; zeros elsewhere. `base`: the row `tgrid` addresses `y`'s row
+    /// 0 at.
     Cells {
         tgrid: String,
         positions: String,
@@ -761,6 +762,7 @@ pub enum HostOp {
         rows: u32,
         axis: u32,
         width: u32,
+        base: u32,
     },
     /// `y[r] = csr[g + 1] - csr[g]` (f32) for `g = groups[lanes[r]]`, 0 when
     /// the lane or group is out of the tables (`lane_count`, `csr_len`).
@@ -788,6 +790,7 @@ pub enum HostOp {
     /// rows of `o_grid`, `channels · |p|` wide), else the pixel shuffle
     /// (`x`'s `channels · |p|`-wide rows of `grid` into `y`'s `channels`
     /// voxels of `o_grid`); `y` has `rows` rows, a row no box holds zero.
+    /// `bases`: the rows `grid` and `o_grid` address `x`'s and `y`'s row 0 at.
     Patch {
         x: String,
         grid: String,
@@ -798,6 +801,7 @@ pub enum HostOp {
         channels: u32,
         p: [u32; 3],
         fold: bool,
+        bases: [u32; 2],
     },
 }
 

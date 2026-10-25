@@ -1609,6 +1609,16 @@ fn clip_boxes(state: &HashMap<String, Vec<u32>>, name: &str, clips: u32) -> Vec<
         .collect()
 }
 
+/// `boxes` with `base` taken off each first row: a window of a segmented
+/// fire starts its buffers at its own rows while the fire's grids hold
+/// fire-wide ones.
+fn rebased(mut boxes: Vec<[i64; 4]>, base: u32) -> Vec<[i64; 4]> {
+    for b in &mut boxes {
+        b[3] -= i64::from(base);
+    }
+    boxes
+}
+
 /// The index and box holding `row`, and the row's place in it.
 fn clip_of(boxes: &[[i64; 4]], row: i64) -> Option<(usize, [i64; 4], i64)> {
     boxes.iter().enumerate().find_map(|(l, b)| {
@@ -2530,9 +2540,10 @@ fn run_host(host: &HostPhase, state: &mut HashMap<String, Vec<u32>>, at: usize) 
             rows,
             axis,
             width,
+            base,
         } => {
             let (rows, width, axis) = (*rows as usize, *width as usize, *axis as usize);
-            let boxes = clip_boxes(state, tgrid, *clips);
+            let boxes = rebased(clip_boxes(state, tgrid, *clips), *base);
             let pos = state.get(positions).cloned().unwrap_or_default();
             let mut out = vec![0f32; rows * width];
             for r in 0..rows {
@@ -2616,12 +2627,13 @@ fn run_host(host: &HostPhase, state: &mut HashMap<String, Vec<u32>>, at: usize) 
             channels,
             p,
             fold,
+            bases,
         } => {
             let (rows, c) = (*rows as usize, *channels as usize);
             let [r1, r2, r3] = p.map(i64::from);
             let vol = (r1 * r2 * r3) as usize;
-            let ins = clip_boxes(state, grid, *clips);
-            let outs = clip_boxes(state, o_grid, *clips);
+            let ins = rebased(clip_boxes(state, grid, *clips), bases[0]);
+            let outs = rebased(clip_boxes(state, o_grid, *clips), bases[1]);
             let src = take(state, x)?;
             let width = if *fold { c * vol } else { c };
             let mut out = vec![0f32; rows * width];

@@ -26,6 +26,7 @@ impl DispatchConv for Run<'_> {
                 self.tensor(*positions),
                 *axis,
                 self.tensor(*y),
+                self.grid_base(*tgrid, *y),
             ),
             Conv::Patchify {
                 x,
@@ -40,6 +41,7 @@ impl DispatchConv for Run<'_> {
                 *p,
                 self.tensor(*tgrid),
                 self.tensor(*y),
+                [self.grid_base(*grid, *x), self.grid_base(*tgrid, *y)],
             ),
             Conv::Unpatchify {
                 x,
@@ -54,6 +56,7 @@ impl DispatchConv for Run<'_> {
                 *p,
                 self.tensor(*grid),
                 self.tensor(*y),
+                [self.grid_base(*tgrid, *x), self.grid_base(*grid, *y)],
             ),
             _ => return Err(KernelError::Unsupported { op: op.name() }),
         }

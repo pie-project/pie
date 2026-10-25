@@ -483,9 +483,9 @@ pub fn render(r: &Rendered) -> String {
                     "kind": "embed_concat", "ids": ids, "table": table, "y": y,
                     "rows": rows, "heads": heads, "width": width, "limit": limit,
                 }),
-                HostOp::Cells { tgrid, positions, y, clips, rows, axis, width } => serde_json::json!({
+                HostOp::Cells { tgrid, positions, y, clips, rows, axis, width, base } => serde_json::json!({
                     "kind": "cells", "tgrid": tgrid, "positions": positions, "y": y,
-                    "clips": clips, "rows": rows, "axis": axis, "width": width,
+                    "clips": clips, "rows": rows, "axis": axis, "width": width, "base": base,
                 }),
                 HostOp::ConcatCols { x, y, rows, width, stride, at } => serde_json::json!({
                     "kind": "concat_cols", "x": x, "y": y, "rows": rows, "width": width,
@@ -495,10 +495,11 @@ pub fn render(r: &Rendered) -> String {
                     "kind": "group_rows", "csr": csr, "groups": groups, "lanes": lanes, "y": y,
                     "csr_len": csr_len, "lane_count": lane_count, "rows": rows,
                 }),
-                HostOp::Patch { x, grid, y, o_grid, clips, rows, channels, p, fold } => serde_json::json!({
+                HostOp::Patch { x, grid, y, o_grid, clips, rows, channels, p, fold, bases } => serde_json::json!({
                     "kind": "patch", "x": x, "grid": grid, "y": y, "o_grid": o_grid,
                     "clips": clips, "rows": rows, "channels": channels,
                     "p0": p[0], "p1": p[1], "p2": p[2], "fold": u32::from(*fold),
+                    "x_base": bases[0], "y_base": bases[1],
                 }),
             },
         })),
@@ -875,6 +876,7 @@ pub fn unrender(text: &str) -> Option<Rendered> {
                             rows: u("rows")?,
                             axis: u("axis")?,
                             width: u("width")?,
+                            base: u("base")?,
                         },
                         "concat_cols" => HostOp::ConcatCols {
                             x: s("x")?,
@@ -903,6 +905,7 @@ pub fn unrender(text: &str) -> Option<Rendered> {
                             channels: u("channels")?,
                             p: [u("p0")?, u("p1")?, u("p2")?],
                             fold: u("fold")? != 0,
+                            bases: [u("x_base")?, u("y_base")?],
                         },
                         _ => return None,
                     };
