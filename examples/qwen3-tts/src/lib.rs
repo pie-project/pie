@@ -170,7 +170,7 @@ impl Voice {
         let width = decode.input("frames")?.width;
         Ok(Voice {
             quantize: Lane::of("codec.quantize")?,
-            prenet: Kv::new(Lane::of("codec.prenet")?, 0, false)?,
+            prenet: Kv::new(Lane::of("codec.prenet")?, 0)?,
             decode,
             latents: Vec::new(),
             hidden: Vec::new(),
@@ -302,6 +302,7 @@ fn language(name: &str) -> Result<Option<u32>> {
 }
 
 /// A lane of reading `reading`.
+#[derive(Clone)]
 struct Lane {
     reading: &'static str,
     decl: model::LaneDecl,
@@ -344,30 +345,22 @@ fn one(text: &str) -> Result<u32> {
     }
 }
 
-/// A reading's KV, its slots reserved as its rows need them. A reading
-/// that writes its slots again (the predictor, a frame at a time) keeps them
-/// in the buffer; the rest freeze what they write.
+/// A reading's KV, its slots reserved as its rows need them.
 struct Kv {
     lane: Lane,
     ws: WorkingSet,
     reserved: u32,
-    rewrites: bool,
 }
 
 impl Kv {
-    fn new(lane: Lane, rows: u32, rewrites: bool) -> Result<Kv> {
+    fn new(lane: Lane, rows: u32) -> Result<Kv> {
         let mut kv = Kv {
             lane,
             ws: WorkingSet::new(),
             reserved: 0,
-            rewrites,
         };
         kv.grow(rows)?;
         Ok(kv)
-    }
-
-    fn fold(&self) -> Fold<'static> {
-        if self.rewrites { Fold::None } else { Fold::All }
     }
 
     /// Slots for `rows` rows in all.
@@ -403,7 +396,7 @@ impl Kv {
                 positions: Some(&slots),
                 slots: Some(&slots),
                 kv_len: Some(&kv_len),
-                fold: self.fold(),
+                fold: Fold::All,
             },
         )?;
         pass.readout(&Channel::from_iter(0..count))?;
@@ -489,6 +482,8 @@ struct Links {
     /// The first code, and the other fifteen.
     first: Channel,
     rest: Channel,
+    /// The KV the frame's predictor passes write, held until they land.
+    predicted: Option<Kv>,
 }
 
 impl Links {
@@ -499,6 +494,7 @@ impl Links {
             joined: Channel::new([1, BOOKS as u32], dtype::i32).queued(),
             first: Channel::new([1], dtype::i32),
             rest: Channel::new([1], dtype::i32).capacity(BOOKS as u32),
+            predicted: None,
         }
     }
 
@@ -592,10 +588,11 @@ impl Talk {
     }
 }
 
-/// A frame's predictor passes, drawing its other fifteen books on the
-/// device: one seeds the KV with the talker's hidden, the other runs fifteen
-/// times, each epilogue drawing the next code from its book's logits and
-/// feeding it straight back as the next row's token.
+/// A frame's predictor passes over a KV of the frame's own, drawing its
+/// other fifteen books on the device: one seeds the KV with the talker's
+/// hidden, the other runs fifteen times, each epilogue drawing the next code
+/// from its book's logits and feeding it straight back as the next row's
+/// token.
 fn draw_books(
     kv: &Kv,
     links: &Links,
@@ -631,7 +628,7 @@ fn draw_books(
             positions: Some(&pos),
             slots: Some(&pos),
             kv_len: Some(&kv_len),
-            fold: kv.fold(),
+            fold: Fold::All,
         },
     )?;
     pass.epilogue(move || {
@@ -741,8 +738,7 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let n = tokens.len() as u32;
-    let mut talk = Kv::new(talker, n, false)?;
-    let predict = Kv::new(predictor, BOOKS as u32 + 1, true)?;
+    let mut talk = Kv::new(talker, n)?;
     let mut voice = Voice::new()?;
     let mut audio: Vec<f32> = Vec::new();
     let mut pace = Pace::new(input.ahead);
@@ -758,7 +754,7 @@ async fn main(input: Input) -> Result<Output> {
     // few frames behind, and stops at the end of speech.
     let talk_out = Talk {
         width: talk.lane.width()?,
-        hidden: predict.lane.input("seed")?.width,
+        hidden: predictor.input("seed")?.width,
         greedy: input.greedy,
         seen: Channel::new([TALKER_CODES], dtype::f32).queued(),
         rng: Channel::new([2], dtype::u32).queued(),
@@ -790,6 +786,7 @@ async fn main(input: Input) -> Result<Output> {
     let mut inflight: std::collections::VecDeque<Links> = std::collections::VecDeque::new();
     let mut ended = false;
     for (f, at) in (0..input.max_frames).zip(n..) {
+        let predict = Kv::new(predictor.clone(), BOOKS as u32 + 1)?;
         let (seed, chain) = draw_books(
             &predict,
             &links,
@@ -815,6 +812,7 @@ async fn main(input: Input) -> Result<Output> {
         for slots in passes.chunks(frame_size()) {
             submit_frame(&pipe, slots).context("a frame's passes")?;
         }
+        links.predicted = Some(predict);
         inflight.push_back(std::mem::replace(&mut links, next));
         while inflight.len() > LOOKAHEAD || (f + 1 == input.max_frames && !inflight.is_empty()) {
             let done = inflight.pop_front().expect("a frame in flight");
