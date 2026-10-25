@@ -159,8 +159,8 @@ pub(crate) fn analyze_direct_argmax(
         for result in 0..op.results {
             producers[(bases[node] + result) as usize] = node as u32;
         }
-        for argument in &op.args {
-            consumers[*argument as usize].push(node as u32);
+        for argument in op.reads() {
+            consumers[argument as usize].push(node as u32);
         }
     }
     let mut analysis = ArgmaxScan {

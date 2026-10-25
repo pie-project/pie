@@ -74,6 +74,17 @@ pub struct LaunchOp {
     pub shape: Vec<u32>,
 }
 
+impl LaunchOp {
+    /// Every value the op reads: its arguments, and a pivot's predicate
+    /// operand, kept beside them in `pred_payload`.
+    pub fn reads(&self) -> impl Iterator<Item = u32> + '_ {
+        self.args
+            .iter()
+            .copied()
+            .chain((self.tag == tags::PIVOT_THRESHOLD).then_some(self.pred_payload))
+    }
+}
+
 impl Default for LaunchOp {
     fn default() -> LaunchOp {
         LaunchOp {
