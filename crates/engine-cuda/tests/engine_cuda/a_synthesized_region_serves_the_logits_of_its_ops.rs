@@ -154,14 +154,12 @@ fn argmax(logits: &[f32]) -> u32 {
     u32::try_from(at).expect("a vocab index")
 }
 
-/// `tokens` fired as slot 0's next step: its logits, and how long the fire
-/// took in microseconds.
-fn step(shell: &mut Shell, trace: &Trace, tokens: &[u32]) -> (Vec<f32>, f64) {
+/// `tokens` fired as slot 0's next step: its logits.
+fn step(shell: &mut Shell, trace: &Trace, tokens: &[u32]) -> Vec<f32> {
     let word = trace.facts.word(&Request::new(
         u32::try_from(tokens.len()).expect("a count"),
         false,
     ));
-    let start = std::time::Instant::now();
     let mut rows = shell
         .fire(&[Lane {
             slot: 0,
@@ -169,7 +167,7 @@ fn step(shell: &mut Shell, trace: &Trace, tokens: &[u32]) -> (Vec<f32>, f64) {
             tokens,
         }])
         .expect("the step fires");
-    (rows.swap_remove(0), start.elapsed().as_secs_f64() * 1e6)
+    rows.swap_remove(0)
 }
 
 fn prompt(tokens: u32) -> Vec<u32> {
@@ -213,10 +211,10 @@ fn served(fixture: &Fixture, overrides: &str, generates: bool) -> Vec<Vec<f32>> 
         "{model} under {overrides:?}: the load generates a kernel exactly where a chain folds"
     );
     shell.open(0).expect("slot 0 opens");
-    let mut steps = vec![step(&mut shell, &fixture.trace, &prompt(37)).0];
+    let mut steps = vec![step(&mut shell, &fixture.trace, &prompt(37))];
     for _ in 0..DECODES {
         let next = argmax(steps.last().expect("a step"));
-        steps.push(step(&mut shell, &fixture.trace, &[next]).0);
+        steps.push(step(&mut shell, &fixture.trace, &[next]));
     }
     steps
 }
@@ -276,50 +274,5 @@ fn two_models_served_at_once_answer_what_each_answers_alone() {
                 &format!("{} served alone (round {round})", fixture.model),
             );
         }
-    }
-}
-
-/// Qwen3-8B's shape (seeded weights): a prefill step and a decode step with
-/// its residual norms as their two ops and as one generated kernel each,
-/// the median of each fire's wall time:
-/// `cargo test --release ... -- --ignored synth_regions_step_rate --nocapture`.
-#[test]
-#[ignore = "a rate bench: --release -- --ignored synth_regions_step_rate --nocapture"]
-fn synth_regions_step_rate() {
-    const PREFILL: u32 = 2048;
-    const PREFILLS: usize = 8;
-    const DECODES: usize = 128;
-    let _one = serialized();
-    let fixture = fixture("qwen3-8b");
-    let median = |mut us: Vec<f64>| {
-        us.sort_by(f64::total_cmp);
-        us[us.len() / 2]
-    };
-    eprintln!("residual norm       prefill {PREFILL} ms  decode us  generated kernels");
-    for (what, overrides) in [
-        ("two hand kernels", OPS.to_owned()),
-        ("generated kernel", String::new()),
-    ] {
-        let mut shell = load(&fixture, &overrides, PREFILL);
-        let mut prefills = Vec::with_capacity(PREFILLS);
-        let mut next = 0;
-        for _ in 0..PREFILLS {
-            shell.open(0).expect("slot 0 opens");
-            let (logits, us) = step(&mut shell, &fixture.trace, &prompt(PREFILL));
-            prefills.push(us);
-            next = argmax(&logits);
-        }
-        let mut decodes = Vec::with_capacity(DECODES);
-        for _ in 0..DECODES {
-            let (logits, us) = step(&mut shell, &fixture.trace, &[next]);
-            decodes.push(us);
-            next = argmax(&logits);
-        }
-        eprintln!(
-            "{what:<18}  {:>15.3}  {:>9.1}  {:>17}",
-            median(prefills) / 1e3,
-            median(decodes),
-            shell.regions().len()
-        );
     }
 }

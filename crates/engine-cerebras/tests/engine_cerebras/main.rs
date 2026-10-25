@@ -23,5 +23,4 @@ mod kernels_ple;
 mod kernels_rope;
 mod kernels_ssm;
 mod pe_memory_probe;
-mod phase_cost_probe;
 mod sdk_runs_gemv_on_the_simulator;
