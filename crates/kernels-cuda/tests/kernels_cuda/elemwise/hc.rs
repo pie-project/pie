@@ -658,6 +658,7 @@ fn the_seam_replays_in_a_graph() {
 fn the_seam_rate() {
     use kernels_cuda::linear::act_quant;
     if !kernels_cuda::linear::gemm_sm100::supported() {
+        eprintln!("skipped: no tcgen05 on this device");
         return;
     }
     let mut lcg = Lcg::seeded(0x7a7e);
