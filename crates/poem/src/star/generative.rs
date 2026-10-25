@@ -1,5 +1,5 @@
 //! What a layout may state of a generative model: its latent space,
-//! schedule and how its positions are laid out.
+//! schedule.
 
 use std::fmt;
 
@@ -15,9 +15,7 @@ use starlark::values::tuple::UnpackTuple;
 use starlark::values::{NoSerialize, StarlarkValue, UnpackValue, Value};
 use starlark_derive::{starlark_module, starlark_value};
 
-use crate::generative::{
-    AxisRole, Generative, LatentSpace, PositionConvention, ScheduleFact, ScheduleKind,
-};
+use crate::generative::{Generative, LatentSpace, ScheduleFact, ScheduleKind};
 
 /// A fact of a generative model a layout states.
 #[derive(Debug, Clone, ProvidesStaticType, NoSerialize, Allocative)]
@@ -25,7 +23,6 @@ pub(crate) struct Stated(#[allocative(skip)] pub(crate) Fact);
 
 #[derive(Debug, Clone)]
 pub(crate) enum Fact {
-    Positions(PositionConvention),
     Latent(LatentSpace),
     Schedule(ScheduleFact),
     Generative(Generative),
@@ -56,12 +53,6 @@ macro_rules! fact_of {
     };
 }
 
-fact_of!(
-    positions_of,
-    Positions,
-    PositionConvention,
-    "a position convention"
-);
 fact_of!(latent_of, Latent, LatentSpace, "a latent space");
 fact_of!(schedule_of, Schedule, ScheduleFact, "a schedule");
 fact_of!(pub(crate) generative_of, Generative, Generative, "a generative model's facts");
@@ -70,39 +61,6 @@ use crate::star::bind::word as spelled;
 
 #[starlark_module]
 pub(crate) fn generative(builder: &mut GlobalsBuilder) {
-    /// How a model's positions are laid out over `axes`.
-    fn positions(
-        #[starlark(require = named)] axes: UnpackList<String>,
-        #[starlark(require = named)] text_axis: u32,
-        #[starlark(require = named)] text_origin: u32,
-        #[starlark(require = named)] image_follows_text: bool,
-        #[starlark(require = named, default = NoneOr::None)] reference_stride: NoneOr<u32>,
-    ) -> anyhow::Result<Stated> {
-        let axes = axes
-            .items
-            .iter()
-            .map(|a| {
-                spelled(
-                    a,
-                    "an axis",
-                    &[
-                        ("time", AxisRole::Time),
-                        ("height", AxisRole::Height),
-                        ("width", AxisRole::Width),
-                        ("index", AxisRole::Index),
-                    ],
-                )
-            })
-            .collect::<anyhow::Result<_>>()?;
-        Ok(Stated(Fact::Positions(PositionConvention {
-            axes,
-            text_axis,
-            text_origin,
-            image_follows_text,
-            reference_stride: reference_stride.into_option(),
-        })))
-    }
-
     /// The latent space a model denoises in.
     fn latent_space(
         #[starlark(require = named)] channels: u32,
@@ -173,16 +131,14 @@ pub(crate) fn generative(builder: &mut GlobalsBuilder) {
     }
 
     /// What a generative model states of itself: the latent space and
-    /// schedule it denoises by, and how its positions are laid out.
+    /// schedule it denoises by.
     fn generation(
         #[starlark(require = named, default = NoneOr::None)] latent: NoneOr<Value<'_>>,
         #[starlark(require = named, default = NoneOr::None)] schedule: NoneOr<Value<'_>>,
-        #[starlark(require = named, default = NoneOr::None)] positions: NoneOr<Value<'_>>,
     ) -> anyhow::Result<Stated> {
         Ok(Stated(Fact::Generative(Generative {
             latent: latent.into_option().map(latent_of).transpose()?,
             schedule: schedule.into_option().map(schedule_of).transpose()?,
-            positions: positions.into_option().map(positions_of).transpose()?,
         })))
     }
 }

@@ -3,9 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::z_image_dims::{self as model, Dims};
 use poem::generative::ScheduleKind;
 use poem::{
-    Attn, Def, Dim, Dtype, Elemwise, GeomKind, Operation, Platform, Request, RopeForm,
-    RuntimeInput, Selection, Trace, Ty, ValueId, seam,
+    Attn, Def, Dim, Dtype, Elemwise, Gather, GeomKind, InputAxis, Operation, Platform, Request,
+    RopeForm, RuntimeInput, Selection, Trace, Ty, ValueId, seam,
 };
+use poem_ir::Conv;
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
 
@@ -74,6 +75,91 @@ fn the_z_image_rows_bake_every_case() {
     the_dit_turns_three_interleaved_axes_and_the_encoder_the_whole_neox_head();
     the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk();
     the_generative_facts_state_the_readings_the_schedule_and_the_latent_space();
+    the_latent_is_patched_in_the_graph_and_the_positions_follow_the_caption();
+}
+
+fn the_latent_is_patched_in_the_graph_and_the_positions_follow_the_caption() {
+    let patch = [1, model::PATCH, model::PATCH];
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let count = |f: &dyn Fn(&Operation) -> bool| plan.nodes.iter().filter(|n| f(&n.op)).count();
+        assert_eq!(
+            count(&|op| matches!(op, Operation::Conv(Conv::Patchify { p, .. }) if *p == patch)),
+            1,
+            "{deployment}: the voxel latent patches in the graph"
+        );
+        assert_eq!(
+            count(&|op| matches!(op, Operation::Conv(Conv::Unpatchify { p, .. }) if *p == patch)),
+            1,
+            "{deployment}: the velocity reads out in the latent's voxels"
+        );
+        let cells: Vec<u32> = plan
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.op {
+                Operation::Conv(Conv::Cells { axis, .. }) => Some(*axis),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cells,
+            vec![0, 0],
+            "{deployment}: a caption row runs down time, both readings"
+        );
+        assert_eq!(
+            count(&|op| matches!(op, Operation::Gather(Gather::GroupRows { .. }))),
+            1,
+            "{deployment}: the image follows its group's caption rows"
+        );
+        let latents = plan
+            .inputs
+            .iter()
+            .position(|i| i.name == "latents")
+            .expect("a latents input");
+        assert!(
+            plan.values.iter().any(|v| matches!(v.def,
+                Def::Input(RuntimeInput::Guest { id, axis: InputAxis::Voxel, width, .. })
+                    if id as usize == latents && width == model::CHANNELS)),
+            "{deployment}: the latent is VAE-native, one voxel of {} channels",
+            model::CHANNELS
+        );
+        let velocity = plan
+            .seams
+            .iter()
+            .find(|s| s.seam == seam::VELOCITY.name)
+            .expect("a velocity seam")
+            .values[0];
+        assert_eq!(
+            plan.values[velocity.0 as usize].ty,
+            Ty::Tensor {
+                shape: vec![Dim::Voxels, Dim::Const(u64::from(model::CHANNELS))],
+                dtype: Dtype::Bf16,
+            },
+            "{deployment}"
+        );
+        assert_eq!(
+            plan.facts.declared("positions").map(|s| s.values.clone()),
+            Some(vec!["computed".to_string(), "given".to_string()])
+        );
+
+        let budgets = poem_compiler::Budgets::of(poem_compiler::Budget::new(4, 256)).with_voxels(
+            poem_compiler::VoxelLadder {
+                max_voxels: 1024,
+                buckets: vec![256, 1024],
+                max_clips: 4,
+            },
+        );
+        let compiled =
+            poem_compiler::compile_axes(&plan, &budgets, &poem_compiler::DeviceProfile::default())
+                .unwrap_or_else(|why| panic!("{deployment} bakes: {why}"));
+        assert!(
+            compiled.units.contains(&poem_compiler::RowAxis::Voxels)
+                && compiled.units.contains(&poem_compiler::RowAxis::Tokens),
+            "{deployment}: {:?}",
+            compiled.units
+        );
+        assert!(compiled.arena.clashes(&compiled.concurrency).is_empty());
+    }
 }
 
 fn every_row_traces_on_every_platform_with_the_caches_and_readouts_it_states() {
@@ -405,8 +491,8 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
         let modulated = (d.refiner_layers + d.joint_layers) as usize;
         assert_eq!(
             (lane_scales, row_pads),
-            (2 * modulated + 1, 2),
-            "{deployment}"
+            (2 * modulated + 1, 1),
+            "{deployment}: only the caption pads; an image lane carries its patches alone"
         );
 
         let mut folds = 0usize;

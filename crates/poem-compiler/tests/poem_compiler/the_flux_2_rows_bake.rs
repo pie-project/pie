@@ -8,7 +8,7 @@ use poem::{
     Attn, Def, Dim, Dtype, Elemwise, GeomKind, Operands, Operation, Platform, Request, RopeForm,
     RuntimeInput, Trace, Ty, ValueId, seam,
 };
-use poem_ir::InputAxis;
+use poem_ir::{Conv, InputAxis};
 
 const KLEIN: &str = "flux2-klein-4b-bf16-kv-bf16";
 const MINI: &str = "flux2-mini-bf16-kv-bf16";
@@ -46,6 +46,101 @@ fn the_flux_2_rows_bake_every_case() {
     every_rope_turns_four_axes_of_the_whole_head_interleaved();
     the_schedule_is_the_goldens_and_the_mu_fit_reproduces_it();
     the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk();
+    the_latent_is_patched_in_the_graph_and_the_positions_are_its_cells();
+}
+
+fn the_latent_is_patched_in_the_graph_and_the_positions_are_its_cells() {
+    let patch = [1, model::PACK, model::PACK];
+    for deployment in [KLEIN, MINI] {
+        let plan = trace(deployment, Platform::Cuda);
+        let convs: Vec<&Conv> = plan
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Operation::Conv(op) => Some(op),
+                _ => None,
+            })
+            .collect();
+        let count = |f: &dyn Fn(&Conv) -> bool| convs.iter().filter(|op| f(op)).count();
+        assert_eq!(
+            (
+                count(&|op| matches!(op, Conv::Patchify { p, .. } if *p == patch)),
+                count(&|op| matches!(op, Conv::Unpatchify { p, .. } if *p == patch)),
+            ),
+            (1, 1),
+            "{deployment}: the latent in, the velocity out"
+        );
+        let cells: Vec<u32> = convs
+            .iter()
+            .filter_map(|op| match op {
+                Conv::Cells { axis, .. } => Some(*axis),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cells,
+            vec![3],
+            "{deployment}: a text row's position runs down the index axis"
+        );
+        let ports: BTreeSet<String> = plan
+            .values
+            .iter()
+            .filter_map(|decl| match &decl.def {
+                Def::Input(RuntimeInput::Guest {
+                    id, axis, width, ..
+                }) => Some(format!(
+                    "{}:{}:{width}",
+                    plan.inputs[*id as usize].name,
+                    axis.name()
+                )),
+                _ => None,
+            })
+            .collect();
+        for want in [
+            format!("latents:voxel:{}", model::VAE_CHANNELS),
+            "reference:lane:1".to_string(),
+            "positions:row:4".to_string(),
+        ] {
+            assert!(ports.contains(&want), "{deployment}: {want} in {ports:?}");
+        }
+        let velocity = plan
+            .seams
+            .iter()
+            .find(|s| s.seam == seam::VELOCITY.name)
+            .expect("a velocity seam")
+            .values[0];
+        assert_eq!(
+            plan.values[velocity.0 as usize].ty,
+            Ty::Tensor {
+                shape: vec![Dim::Voxels, Dim::Const(u64::from(model::VAE_CHANNELS))],
+                dtype: Dtype::Bf16,
+            },
+            "{deployment}: the velocity reads out in the latent's own voxels"
+        );
+        assert_eq!(
+            plan.facts.declared("positions").map(|s| s.values.clone()),
+            Some(vec!["computed".to_string(), "given".to_string()])
+        );
+    }
+
+    let plan = trace(MINI, Platform::Cuda);
+    let budgets = poem_compiler::Budgets::of(poem_compiler::Budget::new(4, 256)).with_voxels(
+        poem_compiler::VoxelLadder {
+            max_voxels: 1024,
+            buckets: vec![256, 1024],
+            max_clips: 4,
+        },
+    );
+    let compiled =
+        poem_compiler::compile_axes(&plan, &budgets, &poem_compiler::DeviceProfile::default())
+            .expect("the voxel-in, voxel-out denoiser bakes");
+    assert!(
+        compiled.units.contains(&poem_compiler::RowAxis::Voxels)
+            && compiled.units.contains(&poem_compiler::RowAxis::Tokens),
+        "the latent's voxels and the tokens are two units: {:?}",
+        compiled.units
+    );
+    assert!(compiled.arena.clashes(&compiled.concurrency).is_empty());
 }
 
 fn both_rows_trace_on_every_platform_with_the_seams_and_caches_they_declare() {
@@ -139,14 +234,14 @@ fn the_readings_state_their_streams_readouts_and_sinusoids() {
             Def::Input(RuntimeInput::Guest {
                 id,
                 axis: InputAxis::Voxel,
-                width: model::IN_CHANNELS,
+                width: model::VAE_CHANNELS,
                 ..
             }) if id == latent
         )
     });
     assert!(
         voxel_port,
-        "the decoder arm reads the packed latent as voxels"
+        "the decoder arm reads the VAE-native latent as voxels"
     );
 }
 
@@ -339,7 +434,7 @@ fn the_schedule_is_the_goldens_and_the_mu_fit_reproduces_it() {
     let latent = facts.latent.unwrap();
     assert_eq!(
         (latent.channels, latent.patch_h, latent.spatial_compression),
-        (model::IN_CHANNELS, 1, model::TOKEN_COMPRESSION)
+        (model::VAE_CHANNELS, model::PACK, model::VAE_COMPRESSION)
     );
     assert_eq!(
         model::VAE_CHANNELS * model::PACK * model::PACK,

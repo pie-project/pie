@@ -2,9 +2,10 @@
 //! device from the one it reads, from `kernels/conv/rule.slang`.
 
 use super::clip_pair;
-use crate::encode::{Arg, Ctx, Fire, Grid, stated};
+use crate::encode::{Arg, Ctx, Fire, Grid, refuse, stated};
 use crate::error::Error;
 use crate::tensor::Tensor;
+use dtype::Dtype;
 
 const RULE: &str = "conv/rule.slang";
 
@@ -135,6 +136,84 @@ pub fn derive_grid(
             geom.d[2].arg(),
             geom.flag.arg(),
             geom.clips.arg(),
+        ],
+    )
+}
+
+const CELLS: &str = "conv/cells.slang";
+
+/// Each token row's cell (`ops::conv::cells`): a row of a clip of `tgrid`
+/// its patch's `(t, h, w)` there, any other row `positions[row]` in column
+/// `axis`; zeros elsewhere.
+pub fn cells(
+    ctx: &Ctx<'_>,
+    tgrid: Tensor,
+    positions: Tensor,
+    axis: u32,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "conv.cells";
+    if tgrid.dtype != Dtype::I32
+        || tgrid.width != 4
+        || positions.dtype != Dtype::I32
+        || y.dtype != Dtype::F32
+        || y.width != axis.max(2) + 1
+    {
+        return Err(refuse(
+            OP,
+            "the token grid is [clips, 4] i32, the positions i32 and the cells three f32 columns",
+        ));
+    }
+    if y.rows == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        Fire::at(CELLS, "conv_cells_rows").apply(Grid::of([y.rows, 1, 1], [64, 1, 1])),
+        &[
+            tgrid.arg(),
+            positions.arg(),
+            y.arg_mut(),
+            tgrid.rows.arg(),
+            axis.arg(),
+            y.width.arg(),
+            y.rows.arg(),
+        ],
+    )
+}
+
+/// Each row's count of `csr`'s rows in its lane's group
+/// (`ops::gather::group_rows`).
+pub fn group_rows(
+    ctx: &Ctx<'_>,
+    csr: Tensor,
+    groups: Tensor,
+    lanes: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "gather.group_rows";
+    if [csr.dtype, groups.dtype, lanes.dtype] != [Dtype::I32; 3]
+        || y.dtype != Dtype::F32
+        || y.width != 1
+        || csr.rows == 0
+    {
+        return Err(refuse(
+            OP,
+            "the tables are i32 and the counts one f32 column",
+        ));
+    }
+    if y.rows == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        Fire::at(CELLS, "conv_cells_group_rows").apply(Grid::of([y.rows, 1, 1], [64, 1, 1])),
+        &[
+            csr.arg(),
+            groups.arg(),
+            lanes.arg(),
+            y.arg_mut(),
+            groups.rows.arg(),
+            (csr.rows - 1).arg(),
+            y.rows.arg(),
         ],
     )
 }

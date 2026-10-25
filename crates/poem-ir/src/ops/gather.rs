@@ -73,6 +73,18 @@ pub enum Gather {
         #[output]
         right: ValueId,
     },
+    /// Each row's count of the rows `csr` packs in its lane's group,
+    /// `[rows, 1]` f32: `csr[g + 1] - csr[g]` for `g = groups[lanes[row]]`.
+    GroupRows {
+        #[input(I32)]
+        csr: ValueId,
+        #[input(I32)]
+        groups: ValueId,
+        #[input(I32)]
+        lanes: ValueId,
+        #[output]
+        y: ValueId,
+    },
     /// `xs` side by side, a row each's columns after the one before's.
     ConcatCols {
         #[input]

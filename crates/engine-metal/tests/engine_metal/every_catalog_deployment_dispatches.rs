@@ -33,12 +33,6 @@ const REFUSED: &[Refusal] = &[
         file: "../kernels-metal/src/collective.rs",
         needle: "op: \"collective.reduce_scatter\"",
     },
-    Refusal {
-        op: "conv.patchify",
-        why: "voxels to patch tokens has no arm here; no catalog row reaches it",
-        file: "src/dispatch/custom.rs",
-        needle: "Conv::Patchify { .. } | Conv::Unpatchify { .. }",
-    },
 ];
 
 fn ops_of(deployment: &str) -> BTreeSet<String> {

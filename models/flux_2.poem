@@ -278,6 +278,7 @@ def layout(id, deploy):
         # 1/sqrt(128) as the reference rounds it, an ulp above the f32 quotient.
         sm_scale = 0.08838835,
         rope_axes = ROPE_AXES,
+        reference_shift = weight([1], dtype.f32, values = [float(REFERENCE_TIME_STRIDE)]),
         t_freq_dim = T_FREQ_DIM,
         dit = struct(
             x_embed = weight([dim, IN_CHANNELS], banks),
@@ -332,19 +333,12 @@ def sigmas(image_rows, steps):
 
 def generative(m):
     return generation(
-        positions = positions(
-            axes = ["time", "height", "width", "index"],
-            text_axis = 3,
-            text_origin = 0,
-            image_follows_text = False,
-            reference_stride = REFERENCE_TIME_STRIDE,
-        ),
         latent = latent_space(
-            channels = IN_CHANNELS,
+            channels = VAE_CHANNELS,
             patch_t = 1,
-            patch_h = 1,
-            patch_w = 1,
-            spatial_compression = TOKEN_COMPRESSION,
+            patch_h = PACK,
+            patch_w = PACK,
+            spatial_compression = TOKEN_COMPRESSION // PACK,
             temporal_compression = 1,
         ),
         schedule = schedule(
@@ -747,6 +741,7 @@ def forward(m, inputs):
     vae_readings = ["vae.decode", "vae.encode"] if m.vae != None else []
     switch("reading", text_reading + ["denoise"] + vae_readings)
     switch("stream", ["text", "image", "reference"])
+    switch("positions", ["computed", "given"])
     reading = lambda name: inputs.on(switch_is("reading", name))
     if m.te != None:
         text(reading("text"), m)
@@ -796,6 +791,27 @@ def turn(x, gain, positions, hd):
         hd,
     )
 
+def turn_positions(arm, m):
+    """Each denoise row's rope position over (time, height, width, index):
+    a text row `(0, 0, 0, j)`, `j` its row in the lane; an image row its
+    patch's `(t, h, w, 0)`; the `k`th reference image's (input `reference`,
+    a lane's `k`) its patch's, `REFERENCE_TIME_STRIDE · (k + 1)` frames on.
+    A lane whose `positions` switch says `given` reads the guest's instead."""
+    given = switch_is("positions", "given")
+    reference = switch_is("stream", "reference")
+    cells = ops.conv.cells(arm.token_grid([1, m.pack, m.pack]), arm.positions(), m.rope_axes - 1)
+    ref = arm.on(reference)
+    k = ref.input("reference", dtype.f32, "lane", 1)
+    # 10 · (k + 1): `k + k` makes the value the scale owns.
+    shift = ops.elemwise.add_bias(
+        m.reference_shift,
+        ops.elemwise.mul_scalar(f32(REFERENCE_TIME_STRIDE / 2.0), ops.elemwise.add(k, k)),
+    )
+    t, rest = ops.gather.split_rows(cells.on(reference), 1)
+    t = ops.elemwise.add(t, ops.gather.gather_rows(shift, ref.request_of_token()))
+    computed = merge([cells.on(~reference), ops.gather.concat_cols([t, rest])])
+    return merge([arm.on(given).input("positions", dtype.f32, "row", m.rope_axes), computed.on(~given)])
+
 def denoise(arm, m):
     d, dit = m.dims, m.dit
     dim, hd = d.dim, m.head_dim
@@ -803,7 +819,7 @@ def denoise(arm, m):
     txt_in, img_in = arm.on(text), arm.on(~text)
 
     lanes = arm.request_of_token()
-    positions = arm.input("positions", dtype.f32, "row", m.rope_axes)
+    positions = turn_positions(arm, m)
     joint = struct(perm = arm.row_permutation(), csr = arm.group_indptr())
 
     def attention(q, k, v):
@@ -841,7 +857,10 @@ def denoise(arm, m):
         c = txt_in.input("context", dtype.bf16, "row", dim)
         perm = txt_in.row_permutation()
         txt = ops.gather.unpack_rows(ops.gather.pack_rows(c, perm), perm)
-    img = ops.linear.matmul(img_in.input("latents", dtype.bf16, "row", m.in_channels), dit.x_embed)
+    patch = [1, m.pack, m.pack]
+    grid, tgrid = img_in.grid(), img_in.token_grid(patch)
+    latents = img_in.input("latents", dtype.bf16, "voxel", VAE_CHANNELS)
+    img = ops.linear.matmul(ops.conv.patchify(latents, grid, patch, tgrid), dit.x_embed)
 
     def double(l, block, carried):
         txt, img = carried
@@ -885,17 +904,23 @@ def denoise(arm, m):
     mod_out = mod_out.on(image)
     lanes_target = lanes_img.on(image)
     h = norm_modulate(target, mod_out, lanes_target, NORM_EPS)
-    velocity = ops.linear.matmul(h, dit.proj_out)
+    image_in = img_in.on(image)
+    velocity = ops.conv.unpatchify(
+        ops.linear.matmul(h, dit.proj_out),
+        image_in.token_grid(patch),
+        patch,
+        image_in.grid(),
+    )
     seam.at(seam.VELOCITY, [velocity])
     return velocity
 
 def decode(arm, m):
     lat = m.vae.latent
     grid = arm.grid()
-    z = arm.input("latent", dtype.bf16, "voxel", m.in_channels)
-    # The standardize below folds in place, and may not write the input:
-    # a unit upsample is the decode's fresh copy of it.
-    z, grid = ops.conv.upsample_nearest(z, grid, [1, 1, 1], False)
+    z = arm.input("latent", dtype.bf16, "voxel", VAE_CHANNELS)
+    # The batch norm is per packed channel: the latent is packed for it and
+    # unpacked after, and the pack is the decode's fresh copy of the input.
+    z, grid = ops.conv.pixel_unshuffle(z, grid, [1, m.pack, m.pack])
     z = ops.elemwise.standardize(z, lat.bn_zero, lat.bn_scale)
     z = ops.elemwise.add_bias(lat.bn_mean, z)
     z, grid = ops.conv.pixel_shuffle(z, grid, [1, m.pack, m.pack])
@@ -908,5 +933,6 @@ def encode(arm, m):
     mean = convolve(h, grid, lat.quant_conv)
     packed, grid = ops.conv.pixel_unshuffle(mean, grid, [1, m.pack, m.pack])
     z = ops.elemwise.standardize(packed, lat.bn_mean, lat.bn_rscale)
+    z, grid = ops.conv.pixel_shuffle(z, grid, [1, m.pack, m.pack])
     seam.at(seam.PIXELS, [z, grid])
     return z

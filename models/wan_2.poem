@@ -328,12 +328,6 @@ def layout(id, deploy):
 def generative(m):
     d = m.dims
     return generation(
-        positions = positions(
-            axes = ["time", "height", "width"],
-            text_axis = 0,
-            text_origin = 0,
-            image_follows_text = False,
-        ),
         latent = latent_space(
             channels = d.channels,
             patch_t = PATCH_T,
@@ -666,6 +660,7 @@ def forward(m, inputs):
     vae_readings = ["vae.decode.head", "vae.decode", "vae.encode.head", "vae.encode"] if m.vae != None else []
     switch("reading", (["text"] if m.te != None else []) + ["denoise"] + vae_readings)
     switch("stream", ["video", "context"])
+    switch("positions", ["computed", "given"])
     reading = lambda name: inputs.on(switch_is("reading", name))
     if m.te != None:
         text_encode(reading("text"), m.te)
@@ -744,13 +739,22 @@ def run_block(x, c, b, e, d, vg, cg):
     f = run_linear(b.ffn.down, ops.elemwise.gelu(run_linear(b.ffn.up, hf), True))
     return ops.elemwise.gated_residual_add(x, ffn_gate, f, vg.lanes)
 
+PATCH = [PATCH_T, PATCH_H, PATCH_W]
+
+def turn_positions(arm, m):
+    """Each row's rope position: a video row its patch's `(t, h, w)` in its
+    clip. A lane whose `positions` switch says `given` reads the guest's."""
+    given = switch_is("positions", "given")
+    computed = ops.conv.cells(arm.token_grid(PATCH), arm.positions(), 0)
+    return merge([arm.on(given).input("positions", dtype.f32, "row", m.rope_axes), computed.on(~given)])
+
 def denoise(arm, m):
     d = m.dims
     dit = m.dit
     ctx, vid = arm.on(switch_is("stream", "context")), arm.on(~switch_is("stream", "context"))
     vg = struct(
         lanes = vid.request_of_token(),
-        positions = vid.input("positions", dtype.f32, "row", m.rope_axes),
+        positions = turn_positions(arm, m).on(~switch_is("stream", "context")),
         perm = vid.row_permutation(),
         csr = vid.group_indptr(),
     )
@@ -768,7 +772,9 @@ def denoise(arm, m):
     c = ctx.input("context", dtype.bf16, "row", d.text_dim, rows = CONTEXT_LEN if m.te != None else None)
     c = run_linear(dit.text_embed.linear_2, ops.elemwise.gelu(run_linear(dit.text_embed.linear_1, c), True))
 
-    x = run_linear(dit.patch_embed, vid.input("latents", dtype.bf16, "row", d.patch))
+    grid, tgrid = vid.grid(), vid.token_grid(PATCH)
+    latents = vid.input("latents", dtype.bf16, "voxel", d.channels)
+    x = run_linear(dit.patch_embed, ops.conv.patchify(latents, grid, PATCH, tgrid))
 
     def step(l, b, x):
         e = ops.elemwise.add_bias(b.table, ops.elemwise.copy(proj))
@@ -776,7 +782,7 @@ def denoise(arm, m):
 
     x = arm.fold_layers(dit.blocks, x, step)
     h = norm_modulate(x, head_mod, vg.lanes, NORM_EPS)
-    velocity = run_linear(dit.proj_out, h)
+    velocity = ops.conv.unpatchify(run_linear(dit.proj_out, h), tgrid, PATCH, grid)
     seam.at(seam.VELOCITY, [velocity])
     return velocity
 

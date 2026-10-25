@@ -337,10 +337,6 @@ fn both_fact_columns_state_what_the_trace_does() {
     for deployment in ROWS {
         let catalog = row(deployment);
         let facts = catalog.generative().expect("generative facts");
-        assert!(
-            facts.positions.is_none(),
-            "{deployment}: the 2-D nesting is the family's"
-        );
         let names = catalog
             .trace(Platform::Cuda)
             .facts

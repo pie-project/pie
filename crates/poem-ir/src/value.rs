@@ -206,6 +206,11 @@ pub enum RuntimeInput {
         select: Selection,
     },
     Grid,
+    /// The clips' token-side grid, `[Clips, 4]` i32: each clip's cell
+    /// `[t / p0, h / p1, w / p2, first token row]`. The contract: a voxel
+    /// lane's token rows are its clips' patches of `p`, each clip's in
+    /// (t, h, w) row-major order from its first token row, the clips in
+    /// lane order; the lane carries no other row.
     TokenGrid {
         p: [u32; 3],
     },

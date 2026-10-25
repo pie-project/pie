@@ -58,6 +58,7 @@ fn the_ltx_2_rows_bake_every_case() {
     the_generative_facts_state_the_readings_the_latent_and_the_schedule();
     every_block_table_folds_into_a_copy_of_the_vector_the_stack_shares();
     the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk();
+    the_latents_ride_the_voxels_and_the_positions_are_computed();
 }
 
 fn every_row_traces_on_every_platform_holding_nothing_between_fires() {
@@ -315,10 +316,6 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
     for deployment in ROWS {
         let facts = row(deployment).generative().expect("facts");
         let d = dims(deployment);
-        assert!(
-            facts.positions.is_none(),
-            "{deployment}: LTX turns physical coordinates, which no convention names"
-        );
         let names = trace(deployment, Platform::Cuda)
             .facts
             .declared("reading")
@@ -482,5 +479,90 @@ fn the_modulation_is_a_per_lane_f32_vector_over_a_bf16_trunk() {
             6 * d.layers as usize + 2 * d.conn_layers as usize,
             "{deployment}: every attention ends in a per-head gate"
         );
+    }
+}
+
+fn the_latents_ride_the_voxels_and_the_positions_are_computed() {
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let d = dims(deployment);
+        let inputs: BTreeSet<String> = plan
+            .values
+            .iter()
+            .filter_map(|decl| match &decl.def {
+                Def::Input(RuntimeInput::Guest {
+                    id, axis, width, ..
+                }) => Some(format!(
+                    "{}:{}:{width}",
+                    plan.inputs[*id as usize].name,
+                    axis.name()
+                )),
+                _ => None,
+            })
+            .collect();
+        for want in [
+            format!("latents:voxel:{}", d.channels),
+            "frame_period:lane:1".to_string(),
+            format!("positions:row:{}", model::ROPE_AXES),
+            format!("audio_positions:row:{}", model::AUDIO_ROPE_AXES),
+        ] {
+            assert!(inputs.contains(&want), "{deployment}: no `{want}` in {inputs:?}");
+        }
+        assert!(
+            !inputs.iter().any(|i| i.starts_with("latents:row")),
+            "{deployment}: the latent rides the voxel axis only"
+        );
+        let convs: Vec<&poem_ir::Conv> = plan
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Operation::Conv(op) => Some(op),
+                _ => None,
+            })
+            .collect();
+        let patch = [1, 1, 1];
+        let count = |f: &dyn Fn(&poem_ir::Conv) -> bool| convs.iter().filter(|op| f(op)).count();
+        assert_eq!(
+            count(&|op| matches!(op, poem_ir::Conv::Patchify { p, .. } if *p == patch)),
+            2,
+            "{deployment}: the video and the audio clip patched in"
+        );
+        assert_eq!(
+            count(&|op| matches!(op, poem_ir::Conv::Unpatchify { p, .. } if *p == patch)),
+            2,
+            "{deployment}: and their velocities patched back out"
+        );
+        assert_eq!(
+            count(&|op| matches!(op, poem_ir::Conv::Cells { axis: 0, .. })),
+            2,
+            "{deployment}: one cell table a medium"
+        );
+        assert_eq!(
+            plan.facts.declared("positions").map(|s| s.values.clone()),
+            Some(vec!["computed".to_string(), "given".to_string()])
+        );
+        let velocity = plan
+            .seams
+            .iter()
+            .find(|s| s.seam == seam::VELOCITY.name)
+            .expect("a velocity seam")
+            .values[0];
+        assert_eq!(
+            plan.values[velocity.0 as usize].ty,
+            Ty::Tensor {
+                shape: vec![Dim::Voxels, Dim::Const(u64::from(d.channels))],
+                dtype: Dtype::Bf16,
+            },
+            "{deployment}: the velocity reads out in the latents' own voxels"
+        );
+        let budgets = poem_compiler::Budgets::of(poem_compiler::Budget::new(8, 1024)).with_voxels(
+            poem_compiler::VoxelLadder {
+                max_voxels: 4096,
+                buckets: vec![1024, 4096],
+                max_clips: 8,
+            },
+        );
+        poem_compiler::compile_axes(&plan, &budgets, &poem_compiler::DeviceProfile::default())
+            .unwrap_or_else(|why| panic!("{deployment} does not bake: {why}"));
     }
 }

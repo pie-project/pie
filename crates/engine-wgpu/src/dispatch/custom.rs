@@ -168,9 +168,27 @@ impl Run<'_> {
                 y_grid,
                 y,
             } => resample::avg_down(ctx, t(*x), t(*grid), *factor, *group, t(*y_grid), t(*y)),
-            Conv::CacheStore { .. } | Conv::Patchify { .. } | Conv::Unpatchify { .. } => {
-                Err(kernels_slang::Error::Unsupported { op: op.name() })
-            }
+            Conv::Patchify {
+                x,
+                grid,
+                p,
+                tgrid,
+                y,
+            } => resample::pixel_unshuffle(ctx, t(*x), t(*grid), *p, t(*tgrid), t(*y)),
+            Conv::Unpatchify {
+                x,
+                tgrid,
+                p,
+                grid,
+                y,
+            } => resample::pixel_shuffle(ctx, t(*x), t(*tgrid), *p, 0, t(*grid), t(*y)),
+            Conv::Cells {
+                tgrid,
+                positions,
+                axis,
+                y,
+            } => rule::cells(ctx, t(*tgrid), t(*positions), *axis, t(*y)),
+            Conv::CacheStore { .. } => Err(kernels_slang::Error::Unsupported { op: op.name() }),
         }
     }
 }

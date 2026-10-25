@@ -104,3 +104,96 @@ pub fn derive_grid(f: &mut Func, grid: Operand, rule: GridRule, y: Landing) -> R
     let out = f.concat(&cols, 1)?;
     Ok(out)
 }
+
+/// The first `rows` entries of a one-per-row table, `[rows]`.
+fn per_row(f: &mut Func, v: Val, rows: i64) -> Result<Val, Error> {
+    let n: i64 = f.dims(v).iter().product();
+    let flat = f.reshape(v, &[n])?;
+    Ok(f.slice_axis(flat, 0, 0, rows)?)
+}
+
+/// Each token row's cell, `[rows, max(3, axis + 1)]` f32
+/// (`ops::conv::cells`): a row of a clip of `tgrid` its patch's `(t, h, w)`
+/// there, any other row `positions[row]` in column `axis`; zeros
+/// elsewhere. kernels-cuda `elemwise::posenc::cells`.
+pub fn cells(
+    f: &mut Func,
+    tgrid: Operand,
+    positions: Operand,
+    axis: u32,
+    y: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "conv.cells";
+    if y.width != axis.max(2) + 1 || positions.rows < y.rows {
+        return Err(crate::error::refuse(
+            OP,
+            format!(
+                "{} cell columns over {} positions for {} rows; a cell is max(3, axis + 1) \
+                 columns and each row reads its position",
+                y.width, positions.rows, y.rows
+            ),
+        ));
+    }
+    let rows = i64::from(y.rows);
+    let at = crate::conv::place(f, tgrid.val, rows)?;
+    let pos = per_row(f, positions.val, rows)?;
+    let zero = k(f, at.v.t, 0);
+    let mut cols = Vec::new();
+    for c in 0..y.width {
+        let inside = match c {
+            0 => at.v.t,
+            1 => at.v.h,
+            2 => at.v.w,
+            _ => zero,
+        };
+        let outside = if c == axis { pos } else { zero };
+        let c = f.select(at.valid, inside, outside)?;
+        let c = f.convert(c, Elem::F32);
+        cols.push(f.reshape(c, &[rows, 1])?);
+    }
+    Ok(f.concat(&cols, 1)?)
+}
+
+/// Each row's count of the rows `csr` packs in its lane's group, `[rows,
+/// 1]` f32 (`ops::gather::group_rows`): `csr[g + 1] - csr[g]` for `g =
+/// groups[lanes[row]]`. kernels-cuda `elemwise::posenc::group_rows`.
+pub fn group_rows(
+    f: &mut Func,
+    csr: Operand,
+    groups: Operand,
+    lanes: Operand,
+    y: Landing,
+) -> Result<Val, Error> {
+    const OP: &str = "gather.group_rows";
+    if y.width != 1 || lanes.rows < y.rows || csr.rows == 0 {
+        return Err(crate::error::refuse(
+            OP,
+            "one count column, a lane for each row and an indptr",
+        ));
+    }
+    let rows = i64::from(y.rows);
+    let lane_count = i64::from(groups.rows);
+    let groups_v = per_row(f, groups.val, lane_count)?;
+    let csr_v = per_row(f, csr.val, i64::from(csr.rows))?;
+    let lane = per_row(f, lanes.val, rows)?;
+    let lo = cmp_k(f, Cmp::Ge, lane, 0)?;
+    let hi = cmp_k(f, Cmp::Lt, lane, lane_count)?;
+    let ok = f.and(lo, hi)?;
+    let zero = k(f, lane, 0);
+    let lane = f.select(ok, lane, zero)?;
+    let g = super::take1(f, groups_v, lane)?;
+    let glo = cmp_k(f, Cmp::Ge, g, 0)?;
+    let ghi = cmp_k(f, Cmp::Lt, g, i64::from(csr.rows) - 1)?;
+    let gok = f.and(glo, ghi)?;
+    let ok = f.and(ok, gok)?;
+    let gz = k(f, g, 0);
+    let g = f.select(ok, g, gz)?;
+    let g1 = add_k(f, g, 1)?;
+    let a = super::take1(f, csr_v, g)?;
+    let b = super::take1(f, csr_v, g1)?;
+    let n = f.sub(b, a)?;
+    let nz = k(f, n, 0);
+    let n = f.select(ok, n, nz)?;
+    let n = f.convert(n, Elem::F32);
+    Ok(f.reshape(n, &[rows, 1])?)
+}

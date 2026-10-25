@@ -6,7 +6,7 @@ use poem::{
     Attn, CacheRow, Def, Dim, Dtype, Elemwise, GeomKind, Operands, Operation, Platform, RaggedMask,
     Request, RopeForm, RuntimeInput, Selection, Trace, Ty, ValueId, seam,
 };
-use poem_ir::InputAxis;
+use poem_ir::{Conv, InputAxis};
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
 
@@ -74,6 +74,79 @@ fn the_wan_2_rows_bake_every_case() {
     every_rope_turns_the_rows_three_axis_split_of_the_whole_head_interleaved();
     the_generative_facts_state_the_readings_the_latent_and_the_schedule();
     the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk();
+    the_latent_is_patched_in_the_graph_and_the_positions_are_its_cells();
+}
+
+fn the_latent_is_patched_in_the_graph_and_the_positions_are_its_cells() {
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let d = dims(deployment);
+        let patch = [1, 2, 2];
+        let convs: Vec<&Conv> = plan
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Operation::Conv(op) => Some(op),
+                _ => None,
+            })
+            .collect();
+        let count = |f: &dyn Fn(&Conv) -> bool| convs.iter().filter(|op| f(op)).count();
+        assert_eq!(
+            count(&|op| matches!(op, Conv::Patchify { p, .. } if *p == patch)),
+            1,
+            "{deployment}: the latent patched in"
+        );
+        assert_eq!(
+            count(&|op| matches!(op, Conv::Unpatchify { p, .. } if *p == patch)),
+            1,
+            "{deployment}: the velocity unpatched out"
+        );
+        assert_eq!(
+            count(&|op| matches!(op, Conv::Cells { axis: 0, .. })),
+            1,
+            "{deployment}: the video positions are the token grid's cells"
+        );
+        let velocity = plan
+            .seams
+            .iter()
+            .find(|s| s.seam == seam::VELOCITY.name)
+            .expect("a velocity seam")
+            .values[0];
+        assert_eq!(
+            plan.values[velocity.0 as usize].ty,
+            Ty::Tensor {
+                shape: vec![Dim::Voxels, Dim::Const(u64::from(d.in_channels))],
+                dtype: Dtype::Bf16,
+            },
+            "{deployment}: the velocity reads out in the latent's own voxels"
+        );
+        assert_eq!(
+            plan.facts.declared("positions").map(|s| s.values.clone()),
+            Some(vec!["computed".to_string(), "given".to_string()])
+        );
+        if is_flagship(deployment) {
+            continue;
+        }
+        let budgets = poem_compiler::Budgets::of(poem_compiler::Budget::new(4, 256)).with_voxels(
+            poem_compiler::VoxelLadder {
+                max_voxels: 1024,
+                buckets: vec![256, 1024],
+                max_clips: 4,
+            },
+        );
+        let compiled =
+            poem_compiler::compile_axes(&plan, &budgets, &poem_compiler::DeviceProfile::default())
+                .unwrap_or_else(|why| {
+                    panic!("{deployment}: the voxel-in, voxel-out denoiser bakes: {why:?}")
+                });
+        assert!(
+            compiled.units.contains(&poem_compiler::RowAxis::Voxels)
+                && compiled.units.contains(&poem_compiler::RowAxis::Tokens),
+            "{deployment}: the latent's voxels and the tokens are two units: {:?}",
+            compiled.units
+        );
+        assert!(compiled.arena.clashes(&compiled.concurrency).is_empty());
+    }
 }
 
 fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
@@ -159,8 +232,8 @@ fn each_reading_reads_out_what_its_facts_state() {
             .count();
         assert_eq!(
             voxels,
-            if is_flagship(deployment) { 2 } else { 0 },
-            "{deployment}: a voxel input per VAE clip width, and none without a VAE"
+            if is_flagship(deployment) { 3 } else { 1 },
+            "{deployment}: the denoiser's latent, and a voxel input per VAE clip width"
         );
     }
 }

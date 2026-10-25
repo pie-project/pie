@@ -712,6 +712,34 @@ pub fn split_rows(
     Ok((l, r))
 }
 
+/// `xs` side by side, a row each's columns after the one before's.
+/// kernels-cuda `gather::concat_cols`.
+pub fn concat_cols(f: &mut Func, xs: &[Operand], y: Landing) -> Result<Val, Error> {
+    const OP: &str = "gather.concat_cols";
+    let mut width = 0u64;
+    for x in xs {
+        same_dtype(OP, *x, y)?;
+        if x.rows != y.rows {
+            return Err(refuse(
+                OP,
+                format!("a {}-row input beside {} rows", x.rows, y.rows),
+            ));
+        }
+        width += u64::from(x.width);
+    }
+    if width != u64::from(y.width) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the inputs are {width} wide together and the output {}",
+                y.width
+            ),
+        ));
+    }
+    let vals: Vec<Val> = xs.iter().map(|x| x.val).collect();
+    Ok(f.concat(&vals, 1)?)
+}
+
 /// `y = table[:, layer * width .. (layer + 1) * width]` over `y`'s rows.
 pub fn select(
     f: &mut Func,

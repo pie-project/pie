@@ -486,6 +486,13 @@ def column(v, slot, total):
         return tail
     return ops.gather.split_rows(tail, 1)[0]
 
+PATCH = [PATCH_T, PATCH_H, PATCH_W]
+
+def patched(rows, name, grid, tgrid):
+    """The latent clip `name` these rows bind, VAE-native on the voxel axis,
+    cut into its patches' token rows (the TokenGrid order)."""
+    return ops.conv.patchify(rows.input(name, dtype.bf16, "voxel", LATENT_CHANNELS), grid, PATCH, tgrid)
+
 def denoise(arm, m):
     d = m.dims
     dit = m.dit
@@ -513,9 +520,13 @@ def denoise(arm, m):
     ctx = text.input("context", dtype.bf16, "row", d.dim)
     ctx_perm = text.row_permutation()
     text_rows = ops.gather.unpack_rows(ops.gather.pack_rows(ctx, ctx_perm), ctx_perm)
-    video_rows = run_linear(dit.video_patch, video.input("latents", dtype.bf16, "row", m.video_features))
+    # The video and reference latents ride the voxel axis in the VAE's own
+    # layout and are patched here; the audio rows are its latent already,
+    # each stereo channel's frames in turn.
+    video_grid, video_tgrid = video.grid(), video.token_grid(PATCH)
+    video_rows = run_linear(dit.video_patch, patched(video, "latents", video_grid, video_tgrid))
     audio_rows = run_linear(dit.audio_patch, audio.input("audio", dtype.bf16, "row", m.audio_channels))
-    reference_rows = run_linear(dit.video_patch, reference.input("reference", dtype.bf16, "row", m.video_features))
+    reference_rows = run_linear(dit.video_patch, patched(reference, "reference", reference.grid(), reference.token_grid(PATCH)))
     x = merge([text_rows, video_rows, audio_rows, reference_rows])
 
     def block(l, b, x):
@@ -533,8 +544,11 @@ def denoise(arm, m):
     rest = h.on(~switch_is("stream", "text"))
     h_video, rest = rest.on(switch_is("stream", "video")), rest.on(~switch_is("stream", "video"))
     h_audio = rest.on(switch_is("stream", "audio"))
-    velocity = run_linear(dit.video_out, h_video)
-    seam.at(seam.VELOCITY, [velocity])
     audio_velocity = run_linear(dit.audio_out, h_audio)
     seam.at(seam.HIDDEN, [audio_velocity])
+    # The video head last: its patches go back to voxels, the axis the
+    # forward ends on.
+    video_tokens = run_linear(dit.video_out, h_video)
+    velocity = ops.conv.unpatchify(video_tokens, video_tgrid, PATCH, video_grid)
+    seam.at(seam.VELOCITY, [velocity])
     return velocity

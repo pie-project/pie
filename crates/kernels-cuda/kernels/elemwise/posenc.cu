@@ -1,4 +1,5 @@
 #include "prim/device.cuh"
+#include "prim/voxels.cuh"
 
 namespace pie::elemwise {
 
@@ -165,6 +166,46 @@ __global__ void grid_rule(const int* __restrict__ grid, int* __restrict__ out, R
         out[4 * l + 3] = static_cast<int>(off);
         off += static_cast<long long>(ot) * oh * ow;
     }
+}
+
+__global__ __launch_bounds__(256) void cells(
+    const int* __restrict__ tgrid,
+    const int* __restrict__ positions,
+    float* __restrict__ y,
+    int clips,
+    int axis,
+    int width,
+    int rows)
+{
+    const int row = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    float* o = y + static_cast<long long>(width) * row;
+    for (int c = 0; c < width; ++c) o[c] = 0.0f;
+    ::pie::voxels::Lane g;
+    if (::pie::voxels::lane_of(tgrid, clips, row, g) < 0) {
+        o[axis] = static_cast<float>(positions[row]);
+        return;
+    }
+    const ::pie::voxels::Voxel v = ::pie::voxels::unravel(g, row - g.off);
+    o[0] = static_cast<float>(v.t);
+    o[1] = static_cast<float>(v.h);
+    o[2] = static_cast<float>(v.w);
+}
+
+__global__ __launch_bounds__(256) void group_rows(
+    const int* __restrict__ csr,
+    const int* __restrict__ groups,
+    const int* __restrict__ lanes,
+    float* __restrict__ y,
+    int lane_count,
+    int group_count,
+    int rows)
+{
+    const int row = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (row >= rows) return;
+    const int l = lanes[row];
+    const int g = (l >= 0 && l < lane_count) ? groups[l] : -1;
+    y[row] = (g >= 0 && g < group_count) ? static_cast<float>(csr[g + 1] - csr[g]) : 0.0f;
 }
 
 }
