@@ -27,8 +27,8 @@ TOKENIZER_38 = tokenizer(markers = [QWEN_STOP], pinned = QWEN_AUDIO, parts = {"v
 # forward: the gated attention's q and gate, k and v by their heads, the GDN
 # mixer's packed projections, convolution and per-head parameters by its
 # heads, the gates and ups, dense, shared and routed, by their channels, the
-# output and down projections by their rows, the head by its vocabulary. The
-# vision tower and a tied table it holds whole, as the package always has.
+# output and down projections by their rows, the head and a tied table by
+# their vocabulary, and the vision tower's mlp as the trunk's.
 CUTS = "inferred"
 
 def qwen(id, layers, vocab = 248320, template = CHATML, tokenizer = TOKENIZER, **kwargs):
@@ -285,7 +285,7 @@ def tower(size, out, dt):
     ti = size.inter
     merged = MERGE * MERGE * th
     head_dim = th // size.heads
-    plane = lambda s, dims: weight(dims, dt).replicated()
+    plane = lambda s, dims: weight(dims, dt)
     vec = lambda s, length: weight([length], dt)
 
     def block(l):
@@ -649,9 +649,7 @@ def layout(id, deploy):
     # kernel does: it is served decoded.
     embed = weight([d.vocab, hidden], dense if bonsai else table)
     head = None
-    if d.tied:
-        embed = embed.replicated()
-    else:
+    if not d.tied:
         head = weight([d.vocab, hidden], head_at)
     signs = None
     if bonsai:

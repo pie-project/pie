@@ -16,10 +16,8 @@ TOKENIZER = tokenizer(markers = [["<turn|>", "<eos>"]], parts = {"vision": [["<|
 # The compiler reads how tensor-parallel ranks cut each weight off the
 # forward: q, k and v by their heads, the gates and ups, dense and routed, by
 # their channels, the output and down projections by their rows, the tied
-# table by its vocabulary. The vision tower, the self-conditioned table and
-# the MTP assistant's q, table and down projection it holds whole, as the
-# package always has, so the assistant's gate and up are gathered for its
-# down.
+# table by its vocabulary; the vision tower's mlp and the MTP assistant as
+# the trunk's.
 CUTS = "inferred"
 
 MODELS = [
@@ -314,7 +312,7 @@ def layout(id, deploy):
         th = t.hidden
         ti = t.inter
         head_dim = t.hidden // t.heads
-        bank = lambda s, dims: weight(dims).replicated()
+        bank = lambda s, dims: weight(dims)
         vec1 = lambda s, length: weight([length])
 
         def clip(s, dims):
@@ -425,7 +423,7 @@ def layout(id, deploy):
                     q_norm = norm("q_norm", hd),
                     q_norm_eps = d.norm_eps,
                     kv = "kv.{}".format(last(reading == GLOBAL)),
-                    banks = struct(shared = True, q_proj = weight([q_w, ah], w).replicated()),
+                    banks = struct(shared = True, q_proj = weight([q_w, ah], w)),
                     reading = reading,
                 ),
                 o_proj = weight([ah, q_w], w),
@@ -436,7 +434,7 @@ def layout(id, deploy):
                 gate = weight([iw, ah], w),
                 up = weight([iw, ah], w),
                 inter = iw,
-                down = weight([ah, iw], w).replicated(),
+                down = weight([ah, iw], w),
                 scalar = norm("scalar", 1),
             )
 
@@ -444,15 +442,13 @@ def layout(id, deploy):
             pre_embed = weight([ah, hidden], w),
             pre_hidden = weight([ah, hidden], w),
             post = weight([hidden, ah], w),
-            embed = weight([d.vocab, ah], w).replicated(),
+            embed = weight([d.vocab, ah], w),
             norm = weight([ah]),
             norm_eps = d.norm_eps,
             layers = [assistant_layer(l, r) for l, r in enumerate(ASSISTANT_READINGS)],
         )
 
     embed = weight([d.vocab, hidden], dense if self_cond else w)
-    if self_cond:
-        embed = embed.replicated()
 
     ple = None
     if d.ple_dim != None:
@@ -925,7 +921,7 @@ def forward(m, inputs):
             plans = plan_r,
         )
 
-    def attend(l, w, y, whole):
+    def attend(l, w, y, all_rows):
         normed = ops.elemwise.rmsnorm(y, w.attn_norm, w.attn_norm_eps)
         at = w.attn
         d, kv_heads, win = geometry(m, at.reading)
@@ -937,7 +933,7 @@ def forward(m, inputs):
                             at.banks.k_norm, at.banks.k_norm_eps, pages)
         seam.at(seam.ATTN_Q, [q])
 
-        # Each lane by its kind (the tail's whole rows are lanes that mask or
+        # Each lane by its kind (the tail's `all_rows` are lanes that mask or
         # capture scores, so only those two); a global layer's scores go out
         # at their seam.
         causal = ~switch_is("mode", "denoise") if m.self_cond != None else None
@@ -956,11 +952,11 @@ def forward(m, inputs):
         a = ops.attn.decode(q, ro.plans[at.reading], inputs.kv(at.kv), win, d, at.sm_scale)
         return normed, a, ro.routes
 
-    def layer(l, w, y, readouts = False, whole = False):
+    def layer(l, w, y, readouts = False, all_rows = False):
         if readouts:
             normed, a, layer_routes = attend_readouts(l, w, y)
         else:
-            normed, a, layer_routes = attend(l, w, y, whole)
+            normed, a, layer_routes = attend(l, w, y, all_rows)
         o = ops.linear.matmul(a, w.o_proj)
         adapted = fact.has(fact.Adapter)
         o = ops.linear.lora_correct(normed.on(adapted), w.lora_a, w.lora_b, layer_routes, o.on(adapted))
@@ -1006,8 +1002,8 @@ def forward(m, inputs):
         y, tapped = carried
         if tail != None and l >= tail:
             if l == tail:
-                y = struct(whole = y.on(~read), readouts = gathered(y))
-            return (struct(whole = layer(l, w, y.whole, whole = True), readouts = layer(l, w, y.readouts, readouts = True)), tapped)
+                y = struct(all_rows = y.on(~read), readouts = gathered(y))
+            return (struct(all_rows = layer(l, w, y.all_rows, all_rows = True), readouts = layer(l, w, y.readouts, readouts = True)), tapped)
         y = layer(l, w, y)
         if dr != None:
             tapped = tap(dr, l, y, tapped)
@@ -1016,7 +1012,7 @@ def forward(m, inputs):
     y, tapped = inputs.fold_layers(m.layers, (y, None), block)
 
     if tail != None:
-        y = merge([ops.gather.gather_rows(y.whole, trunk_inputs.on(~read).readout_rows()), y.readouts])
+        y = merge([ops.gather.gather_rows(y.all_rows, trunk_inputs.on(~read).readout_rows()), y.readouts])
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.final_norm_eps)
     hb = None
     if dr != None:
