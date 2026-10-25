@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ltx_2_dims::{self as model, DENOISE, Dims, REFINE_AUDIO, REFINE_VIDEO, VAE_DECODE};
-use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
+use poem::generative::{ReadoutKind, ScheduleKind};
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, GeomKind, Operands, Operation, Platform, RaggedMask, Request,
     RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
@@ -47,7 +47,7 @@ fn word(plan: &Trace, reading: &str, stream: Stream) -> u64 {
 #[test]
 fn the_ltx_2_rows_bake_every_case() {
     every_row_traces_on_every_platform_holding_nothing_between_fires();
-    the_ports_the_trace_reads_are_the_ports_the_facts_declare();
+    each_reading_reads_out_what_its_facts_state();
     each_lane_the_facts_list_classifies_into_its_own_class();
     the_attentions_pair_as_the_architecture_says();
     every_rope_is_one_ladder_across_the_row();
@@ -100,132 +100,25 @@ fn is_flagship(deployment: &str) -> bool {
     deployment == FLAGSHIP
 }
 
-fn traced_ports(plan: &Trace) -> BTreeSet<(String, u8, u32)> {
-    let mut traced = BTreeSet::new();
-    for decl in &plan.values {
-        let (kind, port, width) = match &decl.def {
-            Def::Input(RuntimeInput::Latents { port, width }) => ("Latents", *port, *width),
-            Def::Input(RuntimeInput::Context { port, width }) => ("Context", *port, *width),
-            Def::Input(RuntimeInput::LaneVector { port, width }) => ("LaneVector", *port, *width),
-            Def::Input(RuntimeInput::AxisPositions { port, axes }) => {
-                ("AxisPositions", *port, u32::from(*axes))
-            }
-            Def::Input(RuntimeInput::Voxels { port, channels }) => ("Voxels", *port, *channels),
-            _ => continue,
-        };
-        traced.insert((kind.to_string(), port, width));
-    }
-    traced
-}
-
-fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
+fn each_reading_reads_out_what_its_facts_state() {
     for deployment in ROWS {
-        let plan = trace(deployment, Platform::Cuda);
         let facts = row(deployment).generative().expect("facts");
-        let mut declared: BTreeSet<(String, u8, u32)> = BTreeSet::new();
-        for reading in &facts.readings {
-            for (index, port) in reading.ports_indexed() {
-                declared.insert((format!("{:?}", port.kind), index, port.width));
-            }
-        }
-        assert_eq!(
-            traced_ports(&plan),
-            declared,
-            "{deployment}: the facts and the trace bind one list of ports"
-        );
-
         let d = dims(deployment);
         let denoise = facts
             .readings
             .iter()
             .find(|r| r.name == "denoise")
             .unwrap_or_else(|| panic!("{deployment} declares no `denoise`"));
-        let at = |name: &str| {
-            let (index, port) = denoise
-                .port(name)
-                .unwrap_or_else(|| panic!("{deployment}: `denoise` declares no port `{name}`"));
-            (index, port.kind, port.width, port.streams.clone())
-        };
-        assert_eq!(
-            at("latents"),
-            (
-                model::port::LATENTS,
-                PortKind::Latents,
-                d.channels,
-                vec![Stream::Video, Stream::Audio]
-            ),
-            "{deployment}: one latent rectangle for the two modalities"
-        );
-        assert_eq!(
-            at("context"),
-            (
-                model::port::CONTEXT,
-                PortKind::Context,
-                d.cross_dim,
-                vec![Stream::Context]
-            )
-        );
-        assert_eq!(
-            at("audio_context"),
-            (
-                model::port::AUDIO_CONTEXT,
-                PortKind::Context,
-                d.audio_cross_dim,
-                vec![Stream::Reference]
-            )
-        );
-        assert_eq!(
-            at("timestep"),
-            (model::port::TIMESTEP, PortKind::LaneVector, 1, vec![])
-        );
-        assert_eq!(
-            at("positions"),
-            (
-                model::port::POSITIONS,
-                PortKind::AxisPositions,
-                u32::from(model::ROPE_AXES),
-                vec![Stream::Video]
-            )
-        );
-        assert_eq!(
-            at("audio_positions"),
-            (
-                model::port::TIME_POSITIONS,
-                PortKind::AxisPositions,
-                1,
-                vec![Stream::Audio]
-            )
-        );
         assert_eq!(denoise.readout, ReadoutKind::Velocity);
         assert_eq!(denoise.readout_width, d.channels);
-        for name in ["refine.video", "refine.audio"] {
+        for (name, width) in [
+            ("refine.video", d.cross_dim),
+            ("refine.audio", d.audio_cross_dim),
+        ] {
             let refine = facts.readings.iter().find(|r| r.name == name).unwrap();
-            let (index, port) = refine.port("text").expect("the packed trunk rows");
-            assert_eq!(
-                (index, port.kind, port.width),
-                (model::port::TEXT, PortKind::Latents, d.text_in()),
-                "{deployment} {name}: a token-less reading states its rows through a latents port"
-            );
-            assert_eq!(refine.readout, ReadoutKind::Hidden);
+            assert_eq!(refine.readout, ReadoutKind::Hidden, "{deployment} {name}");
+            assert_eq!(refine.readout_width, width, "{deployment} {name}");
         }
-        assert_eq!(
-            facts
-                .readings
-                .iter()
-                .find(|r| r.name == "refine.video")
-                .unwrap()
-                .readout_width,
-            d.cross_dim
-        );
-        assert_eq!(
-            facts
-                .readings
-                .iter()
-                .find(|r| r.name == "refine.audio")
-                .unwrap()
-                .readout_width,
-            d.audio_cross_dim
-        );
     }
 }
 
@@ -488,7 +381,6 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
             model::DISTILLED_SIGMAS.to_vec(),
             "{deployment}: the distilled row pins eight sigmas for BOTH modalities"
         );
-        assert!(facts.max_rows >= 4096);
         validate(&facts);
     }
 }
@@ -496,15 +388,6 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
 fn validate(facts: &poem::generative::Generative) {
     for reading in &facts.readings {
         assert!(reading.readout_width > 0);
-        if !reading.takes_tokens {
-            assert!(
-                reading
-                    .ports
-                    .iter()
-                    .any(|port| matches!(port.kind, PortKind::Latents | PortKind::Voxels)),
-                "a token-less reading states its rows through a latents or voxels port"
-            );
-        }
     }
 }
 

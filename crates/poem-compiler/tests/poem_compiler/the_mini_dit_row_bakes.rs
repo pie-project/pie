@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use crate::mini_dit_dims;
 
 use mini_dit_dims as model;
-use poem::generative::{PortKind, ReadoutKind};
+use poem::generative::ReadoutKind;
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, GeomKind, Guard, Operands, Operation, Platform, Request,
     RopeForm, RuntimeInput, Stream, Trace, Ty, ValueId, seam,
@@ -31,12 +31,12 @@ fn trace(platform: Platform) -> Trace {
 #[test]
 fn the_mini_dit_row_bakes_every_case() {
     the_row_traces_on_every_platform_with_no_cache_and_a_velocity_readout();
-    the_row_reads_exactly_the_five_ports_it_declares();
+    the_row_reads_exactly_the_five_inputs_it_names();
     each_stream_classifies_into_its_own_class_and_every_merge_resolves();
     the_joint_attention_is_self_paired_and_the_cross_attention_is_not();
     every_rope_turns_three_axes_of_the_whole_head_interleaved();
     the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk();
-    the_generative_facts_are_the_ports_the_trace_reads();
+    the_generative_facts_state_the_reading_its_latent_and_its_schedule();
 }
 
 fn the_row_traces_on_every_platform_with_no_cache_and_a_velocity_readout() {
@@ -61,40 +61,28 @@ fn the_row_traces_on_every_platform_with_no_cache_and_a_velocity_readout() {
     }
 }
 
-fn the_row_reads_exactly_the_five_ports_it_declares() {
+fn the_row_reads_exactly_the_five_inputs_it_names() {
     let plan = trace(Platform::Cuda);
     let ports: BTreeSet<String> = plan
         .values
         .iter()
         .filter_map(|decl| match &decl.def {
-            Def::Input(input) => match input {
-                RuntimeInput::Latents { port, width } => Some(format!("latents[{port}]:{width}")),
-                RuntimeInput::Context { port, width } => Some(format!("context[{port}]:{width}")),
-                RuntimeInput::LaneVector { port, width } => {
-                    Some(format!("lane_vector[{port}]:{width}"))
-                }
-                RuntimeInput::AxisPositions { port, axes } => {
-                    Some(format!("axis_positions[{port}]:{axes}"))
-                }
-                _ => None,
-            },
+            Def::Input(RuntimeInput::Guest {
+                id, axis, width, ..
+            }) => Some(format!(
+                "{}:{}:{width}",
+                plan.inputs[*id as usize].name,
+                axis.name()
+            )),
             _ => None,
         })
         .collect();
     let want: BTreeSet<String> = [
-        format!(
-            "latents[{}]:{}",
-            model::port::LATENTS,
-            model::PATCH_FEATURES
-        ),
-        format!("context[{}]:{}", model::port::TEXT, model::TEXT_WIDTH),
-        format!("context[{}]:{}", model::port::CONTEXT, model::CONTEXT_WIDTH),
-        format!("lane_vector[{}]:1", model::port::TIMESTEP),
-        format!(
-            "axis_positions[{}]:{}",
-            model::port::POSITIONS,
-            model::ROPE_AXES
-        ),
+        format!("latents:row:{}", model::PATCH_FEATURES),
+        format!("text:row:{}", model::TEXT_WIDTH),
+        format!("context:row:{}", model::CONTEXT_WIDTH),
+        "timestep:lane:1".to_string(),
+        format!("positions:row:{}", model::ROPE_AXES),
     ]
     .into_iter()
     .collect();
@@ -329,7 +317,7 @@ fn the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk() {
     }
 }
 
-fn the_generative_facts_are_the_ports_the_trace_reads() {
+fn the_generative_facts_state_the_reading_its_latent_and_its_schedule() {
     let row = poem_compiler::catalog::deployment(DEPLOYMENT).expect("the row is in the catalog");
     let facts = row
         .generative()
@@ -346,76 +334,6 @@ fn the_generative_facts_are_the_ports_the_trace_reads() {
     );
     assert_eq!(reading.readout, ReadoutKind::Velocity);
     assert_eq!(reading.readout_width, model::PATCH_FEATURES);
-
-    let at = |name: &str| {
-        let (index, port) = reading.port(name).unwrap_or_else(|| {
-            panic!("the reading declares no port `{name}`");
-        });
-        (index, port.kind, port.width)
-    };
-    assert_eq!(
-        at("latents"),
-        (
-            model::port::LATENTS,
-            PortKind::Latents,
-            model::PATCH_FEATURES
-        )
-    );
-    assert_eq!(
-        at("text"),
-        (model::port::TEXT, PortKind::Context, model::TEXT_WIDTH)
-    );
-    assert_eq!(
-        at("context"),
-        (
-            model::port::CONTEXT,
-            PortKind::Context,
-            model::CONTEXT_WIDTH
-        )
-    );
-    assert_eq!(
-        at("timestep"),
-        (model::port::TIMESTEP, PortKind::LaneVector, 1)
-    );
-    assert_eq!(
-        at("positions"),
-        (
-            model::port::POSITIONS,
-            PortKind::AxisPositions,
-            u32::from(model::ROPE_AXES)
-        )
-    );
-
-    let plan = trace(Platform::Cuda);
-    let mut traced: Vec<(PortKind, u8, u32)> = plan
-        .values
-        .iter()
-        .filter_map(|decl| match &decl.def {
-            Def::Input(RuntimeInput::Latents { port, width }) => {
-                Some((PortKind::Latents, *port, *width))
-            }
-            Def::Input(RuntimeInput::Context { port, width }) => {
-                Some((PortKind::Context, *port, *width))
-            }
-            Def::Input(RuntimeInput::LaneVector { port, width }) => {
-                Some((PortKind::LaneVector, *port, *width))
-            }
-            Def::Input(RuntimeInput::AxisPositions { port, axes }) => {
-                Some((PortKind::AxisPositions, *port, u32::from(*axes)))
-            }
-            _ => None,
-        })
-        .collect();
-    traced.sort_by_key(|(kind, port, _)| (format!("{kind:?}"), *port));
-    let mut declared: Vec<(PortKind, u8, u32)> = reading
-        .ports_indexed()
-        .map(|(index, port)| (port.kind, index, port.width))
-        .collect();
-    declared.sort_by_key(|(kind, port, _)| (format!("{kind:?}"), *port));
-    assert_eq!(
-        traced, declared,
-        "the facts a guest binds by and the inputs the plan reads are one list"
-    );
 
     let latent = facts.latent.expect("a denoiser states its latent space");
     assert_eq!(

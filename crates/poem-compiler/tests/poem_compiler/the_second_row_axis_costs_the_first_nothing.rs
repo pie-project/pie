@@ -89,5 +89,6 @@ fn tower_and_trunk() -> Trace {
             layer: None,
         }],
         drafter: None,
+        inputs: Vec::new(),
     }
 }

@@ -113,13 +113,6 @@ def generative(m):
             "denoise",
             index = 0,
             streams = ["text", "image", "context"],
-            ports = [
-                port("latents", "latents", PATCH_FEATURES, ["image"]),
-                port("text", "context", TEXT_WIDTH, ["text"]),
-                port("context", "context", CONTEXT_WIDTH, ["context"]),
-                port("timestep", "lane_vector", 1, ["text", "image"]),
-                port("positions", "axis_positions", ROPE_AXES, ["text", "image"]),
-            ],
             positions = positions(
                 axes = ["time", "height", "width"],
                 text_axis = 0,
@@ -138,7 +131,6 @@ def generative(m):
             temporal_compression = 1,
         ),
         schedule = schedule("flow", shift = 1.0, train_steps = 1000, pinned_sigmas = [1.0, 0.75, 0.5, 0.25]),
-        max_rows = 4096,
     )
 
 # How a mini-dit checkpoint is laid out: the reference implementation's
@@ -332,17 +324,17 @@ def forward(m, inputs):
     txt_in, img_in = joint.on(fact.stream("text")), joint.on(~fact.stream("text"))
 
     lanes = inputs.request_of_token()
-    positions = inputs.axis_positions(0, m.rope_axes)
+    positions = inputs.input("positions", dtype.f32, "row", m.rope_axes)
 
-    t = inputs.lane_vector(0, 1)
+    t = inputs.input("timestep", dtype.f32, "lane", 1)
     temb = ops.elemwise.silu(ops.elemwise.sinusoid(t, TIMESTEP_DIM, 10000.0, False, 1.0))
 
     joint_rows = struct(perm = joint.row_permutation(), csr = joint.group_indptr())
     img_rows = struct(perm = img_in.row_permutation(), csr = img_in.group_indptr())
 
-    txt = txt_in.context(0, m.text_width)
-    patches = img_in.latents(0, m.patch_features, dtype.bf16)
-    ctx_rows = ctx.context(1, m.context_width)
+    txt = txt_in.input("text", dtype.bf16, "row", m.text_width)
+    patches = img_in.input("latents", dtype.bf16, "row", m.patch_features)
+    ctx_rows = ctx.input("context", dtype.bf16, "row", m.context_width)
 
     hit = []
 

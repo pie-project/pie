@@ -8,7 +8,7 @@ impl ForwardHybrid for PackThenUnpack {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
-        let x = inputs.latents(0, 24, Dtype::Bf16);
+        let x = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, 24, None);
         let perm = inputs.row_permutation();
         let packed = ops::gather::pack_rows(&x, &perm);
         let normed = ops::elemwise::rmsnorm_no_scale(&packed, 24, 1e-6);

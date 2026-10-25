@@ -19,9 +19,9 @@ impl ForwardHybrid for Stack {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
-        let x = inputs.latents(0, WIDTH, Dtype::Bf16);
+        let x = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, WIDTH, None);
         let lanes = inputs.request_of_token();
-        let t = inputs.lane_vector(0, 1);
+        let t = inputs.input("lane", Dtype::F32, poem_ir::InputAxis::Lane, 1, None);
         let proj = ops::elemwise::sinusoid(&t, WIDTH, 10_000.0, true, 1.0);
 
         let mut x = x;
@@ -47,7 +47,7 @@ impl ForwardHybrid for TwoArms {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
-        let x = inputs.latents(0, WIDTH, Dtype::Bf16);
+        let x = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, WIDTH, None);
         let (txt, img) = (x.on(text()), x.on(!text()));
         let bias = Weight::sym("bias", [u64::from(WIDTH)], Dtype::Bf16);
         let other = Weight::sym("other", [u64::from(WIDTH)], Dtype::Bf16);

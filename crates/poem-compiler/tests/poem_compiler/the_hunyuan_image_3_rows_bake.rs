@@ -1,10 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
-use poem::{
-    Attn, Def, Elemwise, Linear, Operation, Platform, Request, RopeForm, RuntimeInput, Stream,
-    Trace, seam,
-};
+use poem::generative::{ReadoutKind, ScheduleKind};
+use poem::{Attn, Elemwise, Linear, Operation, Platform, Request, RopeForm, Stream, Trace, seam};
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
 
@@ -50,7 +47,7 @@ fn ranks(deployment: &str) -> u32 {
 #[test]
 fn the_hunyuan_image_3_rows_bake_every_case() {
     every_row_traces_on_every_platform_with_the_caches_and_seams_it_states();
-    the_ports_the_trace_reads_are_the_ports_the_facts_declare();
+    each_reading_reads_out_what_its_facts_state();
     each_lane_the_facts_list_classifies_into_its_own_class();
     every_rope_turns_the_whole_head_as_two_equal_blocks_in_the_split_form();
     the_canvas_reads_a_bidirectional_masked_attention_over_the_frozen_prefix();
@@ -101,96 +98,20 @@ fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
     }
 }
 
-fn traced_ports(plan: &Trace) -> BTreeSet<(String, u8, u32)> {
-    let mut traced = BTreeSet::new();
-    for decl in &plan.values {
-        let (kind, port, width) = match &decl.def {
-            Def::Input(RuntimeInput::Latents { port, width }) => ("Latents", *port, *width),
-            Def::Input(RuntimeInput::Context { port, width }) => ("Context", *port, *width),
-            Def::Input(RuntimeInput::LaneVector { port, width }) => ("LaneVector", *port, *width),
-            Def::Input(RuntimeInput::AxisPositions { port, axes }) => {
-                ("AxisPositions", *port, u32::from(*axes))
-            }
-            Def::Input(RuntimeInput::Voxels { port, channels }) => ("Voxels", *port, *channels),
-            _ => continue,
-        };
-        traced.insert((kind.to_string(), port, width));
-    }
-    traced
-}
-
-fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
+fn each_reading_reads_out_what_its_facts_state() {
     for deployment in ROWS {
-        let plan = trace(deployment, Platform::Cuda);
         let facts = row(deployment).generative().expect("generative facts");
-        let mut declared: BTreeSet<(String, u8, u32)> = BTreeSet::new();
-        for reading in &facts.readings {
-            for (index, port) in reading.ports_indexed() {
-                declared.insert((format!("{:?}", port.kind), index, port.width));
-            }
-        }
-        assert_eq!(
-            traced_ports(&plan),
-            declared,
-            "{deployment}: the facts and the trace bind one list of ports"
-        );
-
         let d = dims(deployment);
         let denoise = facts
             .readings
             .iter()
             .find(|r| r.name == "denoise")
             .unwrap_or_else(|| panic!("{deployment} declares no `denoise`"));
-        let at = |reading: &poem::generative::ReadingFact, name: &str| {
-            let (index, port) = reading
-                .port(name)
-                .unwrap_or_else(|| panic!("{deployment}: `{}` declares no `{name}`", reading.name));
-            (index, port.kind, port.width)
-        };
-        assert_eq!(
-            at(denoise, "latents"),
-            (model::port::ROWS, PortKind::Latents, d.hidden)
-        );
-        assert_eq!(
-            at(denoise, "special"),
-            (model::port::SPECIAL, PortKind::Latents, 1)
-        );
-        assert_eq!(
-            at(denoise, "timestep"),
-            (model::port::TIMESTEP, PortKind::LaneVector, 1)
-        );
-        assert_eq!(
-            at(denoise, "positions"),
-            (
-                model::port::POSITIONS,
-                PortKind::AxisPositions,
-                u32::from(model::ROPE_AXES)
-            )
-        );
         assert_eq!(denoise.readout, ReadoutKind::Hidden);
         assert_eq!(denoise.readout_width, d.hidden);
-
         let image_in = &facts.readings[usize::from(IMAGE_IN)];
-        assert_eq!(
-            at(image_in, "latent"),
-            (
-                model::port::LATENT_VOXELS,
-                PortKind::Voxels,
-                model::LATENT_CHANNELS + model::T_FREQ_DIM
-            )
-        );
-        assert_eq!(image_in.ports.len(), 1);
         assert_eq!(image_in.readout_width, d.hidden);
         let image_out = &facts.readings[usize::from(IMAGE_OUT)];
-        assert_eq!(
-            at(image_out, "rows"),
-            (
-                model::port::ROW_VOXELS,
-                PortKind::Voxels,
-                d.hidden + model::T_FREQ_DIM
-            )
-        );
-        assert_eq!(image_out.ports.len(), 1);
         assert_eq!(image_out.readout, ReadoutKind::Pixels);
         assert_eq!(image_out.readout_width, model::LATENT_CHANNELS);
     }
@@ -457,10 +378,6 @@ fn both_fact_columns_state_what_the_trace_does() {
             canvas.canvas > 0 && canvas.canvas.is_multiple_of(16),
             "{deployment}"
         );
-        assert_eq!(
-            canvas.self_cond_taps, 0,
-            "{deployment}: the cross-step state is the KV cache, not a soft embedding"
-        );
 
         let facts = catalog.generative().expect("generative facts");
         for (at, reading) in facts.readings.iter().enumerate() {
@@ -516,7 +433,6 @@ fn both_fact_columns_state_what_the_trace_does() {
             schedule.pinned_sigmas.is_empty(),
             "{deployment}: nothing is pinned"
         );
-        assert!(facts.max_rows > canvas.canvas, "{deployment}");
         validate(&facts);
     }
 }
@@ -524,15 +440,6 @@ fn both_fact_columns_state_what_the_trace_does() {
 fn validate(facts: &poem::generative::Generative) {
     for reading in &facts.readings {
         assert!(reading.readout_width > 0);
-        if !reading.takes_tokens {
-            assert!(
-                reading
-                    .ports
-                    .iter()
-                    .any(|port| matches!(port.kind, PortKind::Latents | PortKind::Voxels)),
-                "a token-less reading states its rows through a latents or voxels port"
-            );
-        }
     }
 }
 

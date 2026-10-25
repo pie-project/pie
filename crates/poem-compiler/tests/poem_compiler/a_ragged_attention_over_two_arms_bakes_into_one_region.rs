@@ -27,8 +27,20 @@ impl ForwardHybrid for CrossAttention {
         let wk = Weight::sym("video.k", [inner, VIDEO], Dtype::Bf16);
         let wv = Weight::sym("video.v", [inner, VIDEO], Dtype::Bf16);
         let wo = Weight::sym("audio.o", [AUDIO, inner], Dtype::Bf16);
-        let xa = audio.latents(0, AUDIO as u32, Dtype::Bf16);
-        let xv = video.latents(1, VIDEO as u32, Dtype::Bf16);
+        let xa = audio.input(
+            "audio",
+            Dtype::Bf16,
+            poem_ir::InputAxis::Row,
+            AUDIO as u32,
+            None,
+        );
+        let xv = video.input(
+            "video",
+            Dtype::Bf16,
+            poem_ir::InputAxis::Row,
+            VIDEO as u32,
+            None,
+        );
         let q = ops::gather::pack_rows(&ops::linear::matmul(&xa, &wq), &audio.row_permutation());
         let k = ops::gather::pack_rows(&ops::linear::matmul(&xv, &wk), &video.row_permutation());
         let v = ops::gather::pack_rows(&ops::linear::matmul(&xv, &wv), &video.row_permutation());

@@ -1,6 +1,6 @@
-//! What a layout may state of a generative model: its readings, the ports
-//! each reads, its positions, latent space and schedule; and the canvas a
-//! text diffusion model denoises.
+//! What a layout may state of a generative model: its readings, their
+//! positions, latent space and schedule; and the canvas a text diffusion
+//! model denoises.
 
 use std::fmt;
 
@@ -18,8 +18,8 @@ use starlark_derive::{starlark_module, starlark_value};
 
 use crate::Stream;
 use crate::generative::{
-    AxisRole, Diffusion, Generative, LatentSpace, PortFact, PortKind, PositionConvention,
-    ReadingFact, ReadoutKind, ScheduleFact, ScheduleKind,
+    AxisRole, Diffusion, Generative, LatentSpace, PositionConvention, ReadingFact, ReadoutKind,
+    ScheduleFact, ScheduleKind,
 };
 
 /// A fact of a generative model a layout states.
@@ -29,7 +29,6 @@ pub(crate) struct Stated(#[allocative(skip)] pub(crate) Fact);
 #[derive(Debug, Clone)]
 pub(crate) enum Fact {
     Reading(ReadingFact),
-    Port(PortFact),
     Positions(PositionConvention),
     Latent(LatentSpace),
     Schedule(ScheduleFact),
@@ -63,7 +62,6 @@ macro_rules! fact_of {
 }
 
 fact_of!(reading_of, Reading, ReadingFact, "a reading");
-fact_of!(port_of, Port, PortFact, "a port");
 fact_of!(
     positions_of,
     Positions,
@@ -100,8 +98,8 @@ fn streams(words: UnpackList<String>) -> anyhow::Result<Vec<Stream>> {
 #[starlark_module]
 pub(crate) fn generative(builder: &mut GlobalsBuilder) {
     /// The reading `name`, run by passes of index `index`: the streams its
-    /// rows are of, the ports it reads, how its positions are laid out and
-    /// what it reads out, `readout_width` wide.
+    /// rows are of, how its positions are laid out and what it reads out,
+    /// `readout_width` wide.
     fn reading(
         #[starlark(require = pos)] name: &str,
         #[starlark(require = named)] index: u32,
@@ -110,7 +108,6 @@ pub(crate) fn generative(builder: &mut GlobalsBuilder) {
         #[starlark(require = named)] readout_width: u32,
         #[starlark(require = named, default = false)] has_kv: bool,
         #[starlark(require = named, default = false)] takes_tokens: bool,
-        #[starlark(require = named, default = UnpackList::default())] ports: UnpackList<Value<'_>>,
         #[starlark(require = named, default = NoneOr::None)] positions: NoneOr<Value<'_>>,
     ) -> anyhow::Result<Stated> {
         Ok(Stated(Fact::Reading(ReadingFact {
@@ -120,11 +117,6 @@ pub(crate) fn generative(builder: &mut GlobalsBuilder) {
             has_kv,
             takes_tokens,
             streams: self::streams(streams)?,
-            ports: ports
-                .items
-                .into_iter()
-                .map(port_of)
-                .collect::<anyhow::Result<_>>()?,
             positions: positions.into_option().map(positions_of).transpose()?,
             readout: spelled(
                 readout,
@@ -137,40 +129,6 @@ pub(crate) fn generative(builder: &mut GlobalsBuilder) {
                 ],
             )?,
             readout_width,
-        })))
-    }
-
-    /// The port `name`, of `kind`, `width` wide, its rows of `streams`; `at`
-    /// pins its index among the ports of its kind, `rows` its row count.
-    fn port(
-        #[starlark(require = pos)] name: &str,
-        #[starlark(require = pos)] kind: &str,
-        #[starlark(require = pos)] width: u32,
-        #[starlark(require = pos)] streams: UnpackList<String>,
-        #[starlark(require = named, default = NoneOr::None)] at: NoneOr<u32>,
-        #[starlark(require = named, default = NoneOr::None)] rows: NoneOr<u32>,
-    ) -> anyhow::Result<Stated> {
-        Ok(Stated(Fact::Port(PortFact {
-            name: name.to_string(),
-            kind: spelled(
-                kind,
-                "a port's kind",
-                &[
-                    ("latents", PortKind::Latents),
-                    ("lane_vector", PortKind::LaneVector),
-                    ("context", PortKind::Context),
-                    ("axis_positions", PortKind::AxisPositions),
-                    ("voxels", PortKind::Voxels),
-                ],
-            )?,
-            width,
-            streams: self::streams(streams)?,
-            at: at
-                .into_option()
-                .map(u8::try_from)
-                .transpose()
-                .map_err(|_| anyhow::anyhow!("a port's index is past a u8"))?,
-            rows: rows.into_option(),
         })))
     }
 
@@ -276,11 +234,10 @@ pub(crate) fn generative(builder: &mut GlobalsBuilder) {
         })))
     }
 
-    /// What a generative model states of itself: its readings, the latent
-    /// space and schedule it denoises by, and the rows a pass may hold.
+    /// What a generative model states of itself: its readings, and the
+    /// latent space and schedule it denoises by.
     fn generation(
         #[starlark(require = named)] readings: UnpackList<Value<'_>>,
-        #[starlark(require = named)] max_rows: u32,
         #[starlark(require = named, default = NoneOr::None)] latent: NoneOr<Value<'_>>,
         #[starlark(require = named, default = NoneOr::None)] schedule: NoneOr<Value<'_>>,
     ) -> anyhow::Result<Stated> {
@@ -292,21 +249,15 @@ pub(crate) fn generative(builder: &mut GlobalsBuilder) {
                 .collect::<anyhow::Result<_>>()?,
             latent: latent.into_option().map(latent_of).transpose()?,
             schedule: schedule.into_option().map(schedule_of).transpose()?,
-            max_rows,
         })))
     }
 
     /// The canvas a text diffusion model denoises: `canvas` rows of a
-    /// `hidden`-wide state, with `self_cond_taps` taps of self-conditioning.
+    /// `hidden`-wide state.
     fn canvas(
         #[starlark(require = named)] canvas: u32,
         #[starlark(require = named)] hidden: u32,
-        #[starlark(require = named)] self_cond_taps: u32,
     ) -> anyhow::Result<Stated> {
-        Ok(Stated(Fact::Diffusion(Diffusion {
-            canvas,
-            hidden,
-            self_cond_taps,
-        })))
+        Ok(Stated(Fact::Diffusion(Diffusion { canvas, hidden })))
     }
 }

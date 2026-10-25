@@ -3,8 +3,8 @@ use std::ops::Mul;
 use std::rc::Rc;
 
 use poem_ir::{
-    CacheRow, Def, Dim, Dtype, Guard, Node, Operands, Operation, Param, ParamLayout, ParamSource,
-    Platform, RuntimeInput, Seam, Shard, Trace, Ty, ValueDecl, ValueId,
+    CacheRow, Def, Dim, Dtype, Guard, InputAxis, Node, Operands, Operation, Param, ParamLayout,
+    ParamSource, Platform, RuntimeInput, Seam, Shard, Trace, Ty, ValueDecl, ValueId,
 };
 
 use crate::declare::Weight;
@@ -68,6 +68,7 @@ impl Recorder {
                 drafter: None,
                 seams: Vec::new(),
                 facts: poem_ir::Facts::default(),
+                inputs: Vec::new(),
             })),
             at: Rc::new(Cell::new(None)),
             once: Rc::default(),
@@ -258,6 +259,69 @@ impl Recorder {
             over: None,
             ty,
         }
+    }
+
+    /// The guest input `name`, `width` values of `dtype` on `axis`: the same
+    /// input wherever it is read, so a second read states it alike.
+    pub fn guest(
+        &self,
+        name: &str,
+        dtype: Dtype,
+        axis: InputAxis,
+        width: u32,
+        rows: Option<u32>,
+    ) -> Value {
+        let id = {
+            let mut p = self.inner.borrow_mut();
+            match p.inputs.iter().position(|input| input.name == name) {
+                Some(id) => {
+                    let stated = p
+                        .values
+                        .iter()
+                        .find_map(|v| match v.def {
+                            Def::Input(RuntimeInput::Guest { id: seen, .. })
+                                if seen as usize == id =>
+                            {
+                                Some(v.def.clone())
+                            }
+                            _ => None,
+                        })
+                        .expect("a named input has its value");
+                    let want = Def::Input(RuntimeInput::Guest {
+                        id: id as u32,
+                        axis,
+                        width,
+                        dtype,
+                    });
+                    assert!(
+                        stated == want && p.inputs[id].rows == rows,
+                        "input `{name}` is read as {stated:?} (rows {:?}) and as {want:?} (rows \
+                         {rows:?}); one name is one input",
+                        p.inputs[id].rows
+                    );
+                    id
+                }
+                None => {
+                    p.inputs.push(poem_ir::GuestInput {
+                        name: name.to_string(),
+                        rows,
+                    });
+                    p.inputs.len() - 1
+                }
+            }
+        };
+        self.input(
+            RuntimeInput::Guest {
+                id: u32::try_from(id).expect("fewer than 2^32 inputs"),
+                axis,
+                width,
+                dtype,
+            },
+            Ty::Tensor {
+                shape: vec![axis.dim(), Dim::Const(u64::from(width))],
+                dtype,
+            },
+        )
     }
 
     pub fn block_drafter(&self, facts: poem_ir::BlockDrafter) {

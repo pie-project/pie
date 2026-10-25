@@ -271,23 +271,11 @@ def layout(id, deploy):
 
 def generative(m):
     d = m.dims
-    refine_ports = [
-        port("text", "latents", d.text_in, ["text"], at = 1),
-        port("text_positions", "axis_positions", 1, ["text"], at = 1),
-    ]
     readings = [
         reading(
             "denoise",
             index = 0,
             streams = ["video", "audio", "context", "reference"],
-            ports = [
-                port("latents", "latents", d.channels, ["video", "audio"], at = 0),
-                port("context", "context", d.cross_dim, ["context"], at = 0),
-                port("audio_context", "context", d.audio_cross_dim, ["reference"], at = 1),
-                port("timestep", "lane_vector", 1, [], at = 0),
-                port("positions", "axis_positions", ROPE_AXES, ["video"], at = 0),
-                port("audio_positions", "axis_positions", 1, ["audio"], at = 1),
-            ],
             readout = "velocity",
             readout_width = d.channels,
         ),
@@ -295,7 +283,6 @@ def generative(m):
             "refine.video",
             index = 1,
             streams = ["text"],
-            ports = refine_ports,
             readout = "hidden",
             readout_width = d.cross_dim,
         ),
@@ -303,7 +290,6 @@ def generative(m):
             "refine.audio",
             index = 2,
             streams = ["text"],
-            ports = refine_ports,
             readout = "hidden",
             readout_width = d.audio_cross_dim,
         ),
@@ -313,7 +299,6 @@ def generative(m):
             "vae.decode",
             index = 3,
             streams = ["video"],
-            ports = [port("latent", "voxels", VAE_Z, ["video"], at = 0)],
             readout = "pixels",
             readout_width = VAE_RGB,
         ))
@@ -328,7 +313,6 @@ def generative(m):
             temporal_compression = VAE_TEMPORAL_COMPRESSION,
         ),
         schedule = schedule("flow", shift = 1.0, train_steps = TRAIN_STEPS, pinned_sigmas = DISTILLED_SIGMAS),
-        max_rows = 32768 + 2 * TEXT_LEN if d.layers == 48 else 4096,
     )
 
 # How an LTX-2.5 checkpoint is laid out: a diffusers pipeline, the
@@ -678,13 +662,13 @@ def denoise(arm, m):
 
     vg = struct(
         lanes = vid.request_of_token(),
-        positions = vid.axis_positions(0, m.rope_axes),
+        positions = vid.input("positions", dtype.f32, "row", m.rope_axes),
         perm = vid.row_permutation(),
         csr = vid.group_indptr(),
     )
     ag = struct(
         lanes = aud.request_of_token(),
-        positions = aud.axis_positions(1, 1),
+        positions = aud.input("audio_positions", dtype.f32, "row", 1),
         perm = aud.row_permutation(),
         csr = aud.group_indptr(),
     )
@@ -692,17 +676,17 @@ def denoise(arm, m):
     acg = struct(lanes = actx.request_of_token(), perm = actx.row_permutation(), csr = actx.group_indptr())
     v_time, _ = ops.gather.split_rows(vg.positions, 1)
 
-    vt = vid.lane_vector(0, 1)
-    at = aud.lane_vector(0, 1)
+    vt = vid.input("timestep", dtype.f32, "lane", 1)
+    at = aud.input("timestep", dtype.f32, "lane", 1)
     mods_v = stream_mods(dit.video, vt, m)
     mods_a = stream_mods(dit.audio, at, m)
-    prompt_v, _ = run_adaln(dit.prompt, sinusoid(ctx.lane_vector(0, 1), m))
-    prompt_a, _ = run_adaln(dit.audio_prompt, sinusoid(actx.lane_vector(0, 1), m))
+    prompt_v, _ = run_adaln(dit.prompt, sinusoid(ctx.input("timestep", dtype.f32, "lane", 1), m))
+    prompt_a, _ = run_adaln(dit.audio_prompt, sinusoid(actx.input("timestep", dtype.f32, "lane", 1), m))
 
-    xv = run_linear(dit.video.patchify, vid.latents(0, d.channels, dtype.bf16))
-    xa = run_linear(dit.audio.patchify, aud.latents(0, d.channels, dtype.bf16))
-    ctx_rows = ctx.context(0, d.cross_dim)
-    actx_rows = actx.context(1, d.audio_cross_dim)
+    xv = run_linear(dit.video.patchify, vid.input("latents", dtype.bf16, "row", d.channels))
+    xa = run_linear(dit.audio.patchify, aud.input("latents", dtype.bf16, "row", d.channels))
+    ctx_rows = ctx.input("context", dtype.bf16, "row", d.cross_dim)
+    actx_rows = actx.input("audio_context", dtype.bf16, "row", d.audio_cross_dim)
 
     def step(l, b, carried):
         xv, xa = carried
@@ -725,11 +709,11 @@ def denoise(arm, m):
 def refine(arm, conn, text_in):
     g = struct(
         lanes = arm.request_of_token(),
-        positions = arm.axis_positions(1, 1),
+        positions = arm.input("text_positions", dtype.f32, "row", 1),
         perm = arm.row_permutation(),
         csr = arm.lane_indptr(),
     )
-    x = arm.latents(1, text_in, dtype.bf16)
+    x = arm.input("text", dtype.bf16, "row", text_in)
     h = ops.elemwise.mul_scalar(conn.rescale, ops.linear.matmul(x, conn.aggregate.w))
     h = ops.elemwise.add_bias(conn.aggregate.bias, h)
 
@@ -759,7 +743,7 @@ def resnet(x, g, r):
 
 def vae_decode(arm, vae):
     g = arm.grid()
-    z = ops.elemwise.copy(arm.voxels(0, vae.z, dtype.bf16))
+    z = ops.elemwise.copy(arm.input("latent", dtype.bf16, "voxel", vae.z))
     z = ops.elemwise.standardize(z, vae.zero, vae.latents_std)
     z = ops.elemwise.add_bias(vae.latents_mean, z)
 

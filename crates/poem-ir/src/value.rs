@@ -197,16 +197,50 @@ pub enum RuntimeInput {
     PatchRoutes,
     PatchPositions,
     ImageGrids,
-    SelfCondRows,
-    SelfCondWeights,
     RowPermutation { select: Selection },
-    Latents { port: u8, width: u32 },
-    LaneVector { port: u8, width: u32 },
-    Context { port: u8, width: u32 },
-    AxisPositions { port: u8, axes: u8 },
     Grid,
-    Voxels { port: u8, channels: u32 },
     TokenGrid { p: [u32; 3] },
+    /// An input the model names and its guest binds: entry `id` of
+    /// [`crate::Trace::inputs`], `width` values of `dtype` per lane, row or
+    /// voxel of the fire.
+    Guest {
+        id: u32,
+        axis: InputAxis,
+        width: u32,
+        dtype: Dtype,
+    },
+}
+
+/// What one entry of a guest input belongs to: its lane, a row of its lane,
+/// or a voxel of its lane's clip.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum InputAxis {
+    Lane,
+    Row,
+    Voxel,
+}
+
+impl InputAxis {
+    pub const ALL: [InputAxis; 3] = [InputAxis::Lane, InputAxis::Row, InputAxis::Voxel];
+
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            InputAxis::Lane => "lane",
+            InputAxis::Row => "row",
+            InputAxis::Voxel => "voxel",
+        }
+    }
+
+    /// The fire's extent this axis runs over.
+    #[must_use]
+    pub fn dim(self) -> Dim {
+        match self {
+            InputAxis::Lane => Dim::Lanes,
+            InputAxis::Row => Dim::Tokens,
+            InputAxis::Voxel => Dim::Voxels,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

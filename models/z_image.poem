@@ -321,11 +321,6 @@ def generative(m):
         "refine",
         index = refine,
         streams = ["context"],
-        ports = [
-            port("pad", "latents", 1, ["context"]),
-            port("caption", "context", d.cap_width, ["context"]),
-            port("positions", "axis_positions", ROPE_AXES, ["context"]),
-        ],
         positions = positions(
             axes = ["time", "height", "width"],
             text_axis = 0,
@@ -339,13 +334,6 @@ def generative(m):
         "denoise",
         index = denoise,
         streams = ["image", "context"],
-        ports = [
-            port("pad", "latents", 1, ["image"]),
-            port("latents", "latents", PATCH_FEATURES, ["image"]),
-            port("context", "latents", d.dim, ["context"]),
-            port("timestep", "lane_vector", 1, ["image", "context"]),
-            port("positions", "axis_positions", ROPE_AXES, ["image", "context"]),
-        ],
         positions = positions(
             axes = ["time", "height", "width"],
             text_axis = 0,
@@ -360,7 +348,6 @@ def generative(m):
             "vae.decode",
             index = vae_decode,
             streams = ["image"],
-            ports = [port("latent", "voxels", CHANNELS, ["image"])],
             readout = "pixels",
             readout_width = RGB,
         ))
@@ -368,7 +355,6 @@ def generative(m):
             "vae.encode",
             index = vae_encode,
             streams = ["image"],
-            ports = [port("pixels", "voxels", RGB, ["image"], at = 1)],
             readout = "pixels",
             readout_width = CHANNELS,
         ))
@@ -388,7 +374,6 @@ def generative(m):
             train_steps = TRAIN_STEPS,
             pinned_sigmas = turbo_sigmas(m.shift),
         ),
-        max_rows = 16384 + TE_MAX_TOKENS if m.te != None else 4096,
     )
 
 # How a Z-Image checkpoint is laid out: a diffusers pipeline, its components
@@ -658,7 +643,7 @@ def vae_encode(vae, arm):
     """The encoder's output over `arm`'s pixels, and its grid."""
     e = vae.encoder
     grid = arm.grid()
-    x = arm.voxels(1, RGB, dtype.bf16)
+    x = arm.input("pixels", dtype.bf16, "voxel", RGB)
     h = convolve(x, grid, e.conv_in)
     for block in e.down:
         for res in block.resnets:
@@ -738,12 +723,12 @@ def pad_rows(x, flag, bank):
 
 def refine(arm, m):
     d, dit = m.dims, m.dit
-    c = arm.context(0, d.cap_width)
+    c = arm.input("caption", dtype.bf16, "row", d.cap_width)
     c = ops.elemwise.rmsnorm(c, dit.cap_norm, NORM_EPS)
     c = run_linear(dit.cap_embed, c)
-    c = pad_rows(c, arm.latents(0, 1, dtype.bf16), dit.cap_pad_mod)
+    c = pad_rows(c, arm.input("pad", dtype.bf16, "row", 1), dit.cap_pad_mod)
     geom = struct(
-        positions = arm.axis_positions(0, m.rope_axes),
+        positions = arm.input("positions", dtype.f32, "row", m.rope_axes),
         perm = arm.row_permutation(),
         csr = arm.lane_indptr(),
         mask = unmasked(),
@@ -783,7 +768,7 @@ def denoise(arm, m):
     img, ctx = arm.on(image), arm.on(~image)
 
     lanes = arm.request_of_token()
-    positions = arm.axis_positions(0, m.rope_axes)
+    positions = arm.input("positions", dtype.f32, "row", m.rope_axes)
     joint = struct(
         positions = positions,
         perm = arm.row_permutation(),
@@ -793,7 +778,7 @@ def denoise(arm, m):
 
     # 1000 - t. An in-place op cannot write a runtime input, so `t + t`
     # makes the value the scale owns, the scale halving it back.
-    t = arm.lane_vector(0, 1)
+    t = arm.input("timestep", dtype.f32, "lane", 1)
     u = ops.elemwise.add_bias(dit.t_flip, ops.elemwise.mul_scalar(-0.5, ops.elemwise.add(t, t)))
     temb = ops.elemwise.sinusoid(u, m.t_freq_dim, T_MAX_PERIOD, True, 1.0)
     temb = run_linear(dit.t_mlp1, ops.elemwise.silu(run_linear(dit.t_mlp0, temb)))
@@ -807,19 +792,19 @@ def denoise(arm, m):
         csr = img.lane_indptr(),
         mask = unmasked(),
     )
-    x = img.latents(1, m.patch_features, dtype.bf16)
+    x = img.input("latents", dtype.bf16, "row", m.patch_features)
 
     # A tap reads the context in first, and ends the forward at its
     # intermediate; a fold carries `struct(tapped = ...)` past its rest.
     tap = m.tap
-    context = ctx.latents(2, d.dim, dtype.bf16) if tap else None
+    context = ctx.input("context", dtype.bf16, "row", d.dim) if tap else None
     stop = lambda v: struct(tapped = seam_tapped(v, context))
     if tap == "latents":
         return seam_tapped(x, context)
     x = run_linear(dit.x_embed, x)
     if tap == "x_linear":
         return seam_tapped(x, context)
-    x = pad_rows(x, img.latents(0, 1, dtype.bf16), dit.x_pad_mod)
+    x = pad_rows(x, img.input("pad", dtype.bf16, "row", 1), dit.x_pad_mod)
     if tap == "x_embed":
         return seam_tapped(x, context)
 
@@ -844,7 +829,7 @@ def denoise(arm, m):
         return x.tapped
     if tap == "x_refined":
         return seam_tapped(x, context)
-    c = context if context != None else ctx.latents(2, d.dim, dtype.bf16)
+    c = context if context != None else ctx.input("context", dtype.bf16, "row", d.dim)
 
     def layer(l, b, u):
         if type(u) == "struct":
@@ -936,7 +921,7 @@ def run_block(x, b, mods, m, g, tap):
 
 def decode(arm, m):
     grid = arm.grid()
-    z = arm.voxels(0, m.channels, dtype.bf16)
+    z = arm.input("latent", dtype.bf16, "voxel", m.channels)
     # z / s + shift, `z + z` owned (as above) and its halving folded into 1 / s.
     scale = f32(0.5 * f32(1.0 / f32(SCALING_FACTOR)))
     z = ops.elemwise.add_bias(m.vae.latent.shift, ops.elemwise.mul_scalar(scale, ops.elemwise.add(z, z)))

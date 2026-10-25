@@ -27,10 +27,10 @@ pub use ops::{
 pub use poem_ir_macros::Op;
 pub use request::{Request, Stream};
 pub use trace::{
-    BlockDrafter, CacheRow, Node, Param, ParamLayout, ParamPlacement, ParamSource, Platform, Seam,
+    BlockDrafter, CacheRow, GuestInput, InputDecl, Node, Param, ParamLayout, ParamPlacement, ParamSource, Platform, Seam,
     Shard, Trace,
 };
 pub use value::{
-    BIASES, Def, Dim, Dtype, GLOBAL_SCALES, GeomKind, INPUT_SCALES, PerAxis, RowAxis, RuntimeInput,
+    BIASES, Def, Dim, Dtype, GLOBAL_SCALES, GeomKind, INPUT_SCALES, InputAxis, PerAxis, RowAxis, RuntimeInput,
     SCALES, Selection, StructKind, TILED_BAND, TILED_STEP, Ty, ValueDecl, ValueId,
 };

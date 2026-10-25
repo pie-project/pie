@@ -3099,34 +3099,6 @@ pub(crate) static INPUTS: &[Op] = &[
     },
     Op {
         module: "inputs",
-        name: "self_cond_rows",
-        params: &["inputs", "taps"],
-        call: |a, heap| {
-            let inputs: Input = a.next()?;
-            let taps: u32 = a.next()?;
-            result(
-                heap,
-                dsl("inputs.self_cond_rows", || inputs.self_cond_rows(taps))?,
-            )
-        },
-    },
-    Op {
-        module: "inputs",
-        name: "self_cond_weights",
-        params: &["inputs", "taps"],
-        call: |a, heap| {
-            let inputs: Input = a.next()?;
-            let taps: u32 = a.next()?;
-            result(
-                heap,
-                dsl("inputs.self_cond_weights", || {
-                    inputs.self_cond_weights(taps)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "inputs",
         name: "kv_indptr",
         params: &["inputs"],
         call: |a, heap| {
@@ -3229,62 +3201,6 @@ pub(crate) static INPUTS: &[Op] = &[
     },
     Op {
         module: "inputs",
-        name: "latents",
-        params: &["inputs", "port", "width", "dtype"],
-        call: |a, heap| {
-            let inputs: Input = a.next()?;
-            let port: u8 = a.next()?;
-            let width: u32 = a.next()?;
-            let dtype: Dtype = a.next()?;
-            result(
-                heap,
-                dsl("inputs.latents", || inputs.latents(port, width, dtype))?,
-            )
-        },
-    },
-    Op {
-        module: "inputs",
-        name: "lane_vector",
-        params: &["inputs", "port", "width"],
-        call: |a, heap| {
-            let inputs: Input = a.next()?;
-            let port: u8 = a.next()?;
-            let width: u32 = a.next()?;
-            result(
-                heap,
-                dsl("inputs.lane_vector", || inputs.lane_vector(port, width))?,
-            )
-        },
-    },
-    Op {
-        module: "inputs",
-        name: "context",
-        params: &["inputs", "port", "width"],
-        call: |a, heap| {
-            let inputs: Input = a.next()?;
-            let port: u8 = a.next()?;
-            let width: u32 = a.next()?;
-            result(heap, dsl("inputs.context", || inputs.context(port, width))?)
-        },
-    },
-    Op {
-        module: "inputs",
-        name: "axis_positions",
-        params: &["inputs", "port", "axes"],
-        call: |a, heap| {
-            let inputs: Input = a.next()?;
-            let port: u8 = a.next()?;
-            let axes: u8 = a.next()?;
-            result(
-                heap,
-                dsl("inputs.axis_positions", || {
-                    inputs.axis_positions(port, axes)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "inputs",
         name: "grid",
         params: &["inputs"],
         call: |a, heap| {
@@ -3294,16 +3210,20 @@ pub(crate) static INPUTS: &[Op] = &[
     },
     Op {
         module: "inputs",
-        name: "voxels",
-        params: &["inputs", "port", "channels", "dtype"],
+        name: "input",
+        params: &["inputs", "name", "dtype", "axis", "width", "rows"],
         call: |a, heap| {
             let inputs: Input = a.next()?;
-            let port: u8 = a.next()?;
-            let channels: u32 = a.next()?;
+            let name: String = a.next()?;
             let dtype: Dtype = a.next()?;
+            let axis: poem_ir::InputAxis = a.next()?;
+            let width: u32 = a.next()?;
+            let rows: Option<u32> = a.next()?;
             result(
                 heap,
-                dsl("inputs.voxels", || inputs.voxels(port, channels, dtype))?,
+                dsl("inputs.input", || {
+                    inputs.input(&name, dtype, axis, width, rows)
+                })?,
             )
         },
     },
