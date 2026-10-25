@@ -320,6 +320,9 @@ pub(crate) struct ReadSpan {
     rows: u32,
     plane: u32,
     at: u64,
+    /// On a voxel plane, the first of the lane's voxels: it reads them all,
+    /// in one run, and names no table entries.
+    voxels: Option<u32>,
 }
 
 struct LandedSeat {
@@ -3196,6 +3199,17 @@ fn readout_table(
         if owned == 0 {
             continue;
         }
+        if voxels {
+            layout[source] = ReadSpan {
+                first: u32::try_from(table.len()).unwrap_or(u32::MAX),
+                rows: owned,
+                plane,
+                at,
+                voxels: Some(first),
+            };
+            at += u64::from(owned) * row_bytes;
+            continue;
+        }
         let named = lanes.get(source).and_then(|seated| seated.readout);
         let picks: Vec<u32> = match named {
             Some(list) if !list.is_empty() => {
@@ -3218,6 +3232,7 @@ fn readout_table(
             rows: u32::try_from(picks.len()).unwrap_or(u32::MAX),
             plane,
             at,
+            voxels: None,
         };
         at += picks.len() as u64 * row_bytes;
         table.extend(
@@ -3429,6 +3444,16 @@ impl engine::frame::Shell for Shell {
                     need: end,
                     have: seat_bytes,
                 });
+            }
+            if let Some(first) = span.voxels {
+                frame.copy(
+                    self.arena.store(),
+                    base + u64::from(first) * row_bytes,
+                    &self.readout[prepared.arm],
+                    span.at,
+                    u64::from(span.rows) * row_bytes,
+                )?;
+                continue;
             }
             let gathered = self.gathers_readout && plane.seam == engine::fire::ReadoutSeam::Logits;
             for k in 0..span.rows {
