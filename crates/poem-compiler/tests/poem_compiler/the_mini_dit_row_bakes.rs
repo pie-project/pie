@@ -3,11 +3,11 @@ use std::collections::BTreeSet;
 use crate::mini_dit_dims;
 
 use mini_dit_dims as model;
-use poem_ir::Conv;
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, GeomKind, Guard, Operands, Operation, Platform, Request,
     RopeForm, RuntimeInput, Trace, Ty, ValueId, seam,
 };
+use poem_ir::Conv;
 
 const DEPLOYMENT: &str = "mini-dit-bf16-kv-bf16";
 
@@ -59,7 +59,11 @@ fn the_latent_is_patched_in_the_graph_and_the_positions_are_its_cells() {
         .iter()
         .filter(|op| matches!(op, Conv::Unpatchify { p, .. } if *p == patch))
         .count();
-    assert_eq!((patched, unpatched), (1, 1), "the latent in, the velocity out");
+    assert_eq!(
+        (patched, unpatched),
+        (1, 1),
+        "the latent in, the velocity out"
+    );
     let cells: Vec<u32> = ops
         .iter()
         .filter_map(|op| match op {
@@ -67,7 +71,11 @@ fn the_latent_is_patched_in_the_graph_and_the_positions_are_its_cells() {
             _ => None,
         })
         .collect();
-    assert_eq!(cells, vec![0], "a text row's position runs down the time axis");
+    assert_eq!(
+        cells,
+        vec![0],
+        "a text row's position runs down the time axis"
+    );
 
     let velocity = plan
         .seams

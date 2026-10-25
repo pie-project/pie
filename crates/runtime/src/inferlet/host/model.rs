@@ -3,16 +3,6 @@ use crate::inferlet::host::pie;
 use crate::model;
 use anyhow::Result;
 
-fn axis_role(role: poem::generative::AxisRole) -> pie::inferlet::model::AxisRole {
-    use pie::inferlet::model::AxisRole;
-    match role {
-        poem::generative::AxisRole::Time => AxisRole::Time,
-        poem::generative::AxisRole::Height => AxisRole::Height,
-        poem::generative::AxisRole::Width => AxisRole::Width,
-        poem::generative::AxisRole::Index => AxisRole::Index,
-    }
-}
-
 fn readout(readout: poem_ir::Readout) -> pie::inferlet::model::Readout {
     use pie::inferlet::model::ReadoutKind;
     pie::inferlet::model::Readout {
@@ -43,18 +33,6 @@ pub(crate) fn input_decl(input: &poem_ir::InputDecl) -> pie::inferlet::model::In
             _ => pie::inferlet::types::Dtype::F32,
         },
         rows: input.rows,
-    }
-}
-
-fn position_convention(
-    convention: &poem::generative::PositionConvention,
-) -> pie::inferlet::model::PositionConvention {
-    pie::inferlet::model::PositionConvention {
-        axes: convention.axes.iter().copied().map(axis_role).collect(),
-        text_axis: convention.text_axis,
-        text_origin: convention.text_origin,
-        image_follows_text: convention.image_follows_text,
-        reference_stride: convention.reference_stride,
     }
 }
 
@@ -99,10 +77,9 @@ impl pie::inferlet::model::Host for ProcessCtx {
     }
 
     async fn positions(&mut self) -> Result<Option<pie::inferlet::model::PositionConvention>> {
-        Ok(model::model()
-            .generative()
-            .and_then(|g| g.positions.as_ref())
-            .map(position_convention))
+        // Every model computes its positions in its graph (latent-path L2);
+        // no model states a convention. The WIT entry goes with B1's cleanup.
+        Ok(None)
     }
 
     async fn lane(

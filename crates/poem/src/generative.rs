@@ -1,28 +1,10 @@
 //! What a generative model states of itself: the latent space it denoises
-//! in, the schedule it was trained on, and how its positions are laid out.
+//! in and the schedule it was trained on.
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Generative {
     pub latent: Option<LatentSpace>,
     pub schedule: Option<ScheduleFact>,
-    pub positions: Option<PositionConvention>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AxisRole {
-    Time,
-    Height,
-    Width,
-    Index,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PositionConvention {
-    pub axes: Vec<AxisRole>,
-    pub text_axis: u32,
-    pub text_origin: u32,
-    pub image_follows_text: bool,
-    pub reference_stride: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
