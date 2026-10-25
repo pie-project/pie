@@ -17,7 +17,17 @@ const SCALAR_THREADS: u32 = 128;
 #[derive(Clone, Copy, Debug)]
 pub enum RaggedMask {
     Segments,
-    RelativeBias { table: Tensor, max_len: u32 },
+    RelativeBias {
+        table: Tensor,
+        max_len: u32,
+    },
+    /// Segment `s`'s pair `(q, k)`, each indexed within the segment, is kept
+    /// where bit `q * kv_len + k` of `bits` (u8), from byte `indptr[s]`
+    /// (i32), is set (kernels-cuda's fa2 custom-mask arm).
+    Custom {
+        bits: Tensor,
+        indptr: Tensor,
+    },
 }
 
 impl RaggedMask {
@@ -25,6 +35,7 @@ impl RaggedMask {
         match self {
             Self::Segments => "none",
             Self::RelativeBias { .. } => "bias",
+            Self::Custom { .. } => "custom",
         }
     }
 }
@@ -153,9 +164,34 @@ fn shape(
     })
 }
 
-fn mask_args(ctx: &Ctx<'_>, mask: &RaggedMask, q_heads: u32) -> Result<[ArgValue; 2], Error> {
+/// The mask's operands: the bias table and its reach, then the custom bits and
+/// their per-segment byte offsets; an arm reads only its own.
+fn mask_args(
+    ctx: &Ctx<'_>,
+    mask: &RaggedMask,
+    q_heads: u32,
+    segments: u32,
+) -> Result<[ArgValue; 4], Error> {
     match mask {
-        RaggedMask::Segments => Ok([ctx.absent()?, 0i32.arg()]),
+        RaggedMask::Segments => Ok([ctx.absent()?, 0i32.arg(), ctx.absent()?, ctx.absent()?]),
+        RaggedMask::Custom { bits, indptr } => {
+            if bits.dtype != Dtype::U8
+                || indptr.dtype != Dtype::I32
+                || u64::from(indptr.rows) * u64::from(indptr.width) < u64::from(segments) + 1
+            {
+                return Err(refuse(
+                    OP,
+                    format!(
+                        "a custom mask is u8 bits and an i32 byte offset a segment; this one \
+                         is {:?} bits and {} {:?} offsets for {segments} segments",
+                        bits.dtype,
+                        u64::from(indptr.rows) * u64::from(indptr.width),
+                        indptr.dtype
+                    ),
+                ));
+            }
+            Ok([ctx.absent()?, 0i32.arg(), bits.arg(), indptr.arg()])
+        }
         RaggedMask::RelativeBias { table, max_len } => {
             let max_len = nonzero(OP, "the bias table's reach", *max_len)?;
             let span = 2 * max_len - 1;
@@ -181,7 +217,7 @@ fn mask_args(ctx: &Ctx<'_>, mask: &RaggedMask, q_heads: u32) -> Result<[ArgValue
             }
             let stated = i32::try_from(max_len)
                 .map_err(|_| refuse(OP, format!("a reach of {max_len} does not fit an int")))?;
-            Ok([table.arg(), stated.arg()])
+            Ok([table.arg(), stated.arg(), ctx.absent()?, ctx.absent()?])
         }
     }
 }
@@ -227,7 +263,7 @@ pub fn fire(
 ) -> Result<(), Error> {
     let s = shape(q, k, v, q_indptr, kv_indptr, head_dim, kv_heads, o)?;
     let width = stamp(arm, head_dim)?;
-    let m = mask_args(ctx, mask, s.q_heads)?;
+    let m = mask_args(ctx, mask, s.q_heads, s.segments)?;
     let segments = i32::try_from(s.segments)
         .map_err(|_| refuse(OP, format!("{} segments do not fit an int", s.segments)))?;
     let kv_heads = i32::try_from(s.kv_heads).expect("a checked head count");
@@ -260,6 +296,8 @@ pub fn fire(
                     m[0],
                     m[1],
                     rows.arg(),
+                    m[2],
+                    m[3],
                 ],
             )
         }
@@ -292,6 +330,8 @@ pub fn fire(
                     sm_scale.arg(),
                     m[0],
                     m[1],
+                    m[2],
+                    m[3],
                 ],
             )
         }

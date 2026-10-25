@@ -804,11 +804,28 @@ impl Run<'_> {
                 if self.run_index() > 0 {
                     return Ok(());
                 }
-                let mask = match mask {
-                    RaggedMask::None | RaggedMask::GroupBlockDiagonal => {
+                // A mask a lane states is over its group's rows: it is staged
+                // for this attention's query and key packings.
+                let mask = match (mask, self.group_mask(*q_indptr, *kv_indptr)) {
+                    (RaggedMask::None | RaggedMask::GroupBlockDiagonal, Some(stated)) => {
+                        attn::ragged::RaggedMask::Custom {
+                            bits: stated.bits,
+                            indptr: stated.indptr,
+                        }
+                    }
+                    (RaggedMask::None | RaggedMask::GroupBlockDiagonal, None) => {
                         attn::ragged::RaggedMask::Segments
                     }
-                    RaggedMask::RelativeBias { table, max_len } => {
+                    (RaggedMask::RelativeBias { .. }, Some(_)) => {
+                        return Err(kernels_metal::Error::Backend {
+                            op: "attn.ragged",
+                            detail: "a lane states an attention mask over an attention the \
+                                     model already biases (a relative bias); the two do not \
+                                     compose"
+                                .to_string(),
+                        });
+                    }
+                    (RaggedMask::RelativeBias { table, max_len }, None) => {
                         attn::ragged::RaggedMask::RelativeBias {
                             table: self.tensor(*table),
                             max_len: *max_len,
