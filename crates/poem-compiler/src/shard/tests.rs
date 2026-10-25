@@ -241,7 +241,11 @@ fn inkling_splits_through_its_convolutions_and_biased_attention() {
         2 * LAYERS,
         "one sum an attention and one an mlp"
     );
-    assert_eq!(count(&split, "collective.all_gather"), 0, "the head is whole");
+    assert_eq!(
+        count(&split, "collective.all_gather"),
+        0,
+        "the head is whole"
+    );
     let heads = |trace: &poem_ir::Trace| -> Vec<u32> {
         (trace.nodes.iter())
             .filter_map(|node| match &node.op {
@@ -253,7 +257,10 @@ fn inkling_splits_through_its_convolutions_and_biased_attention() {
     let (split_heads, whole_heads) = (heads(&split), heads(&whole));
     assert!(!whole_heads.is_empty(), "the row biases its attention");
     assert!(
-        split_heads.iter().zip(&whole_heads).all(|(s, w)| s * 4 == *w),
+        split_heads
+            .iter()
+            .zip(&whole_heads)
+            .all(|(s, w)| s * 4 == *w),
         "a rank's quarter of the heads: {split_heads:?} of {whole_heads:?}"
     );
     let unembed = |trace: &poem_ir::Trace| {
@@ -298,12 +305,22 @@ fn a_diffusion_transformers_q_and_k_norm_their_shares() {
             let mut names: Vec<&str> = (trace.nodes.iter())
                 .map(|node| poem_ir::Operands::name(&node.op))
                 .filter(|n| !n.starts_with("collective.") && *n != "elemwise.sum_squares")
-                .map(|n| if n == "elemwise.rmsnorm_by" { "elemwise.rmsnorm" } else { n })
+                .map(|n| {
+                    if n == "elemwise.rmsnorm_by" {
+                        "elemwise.rmsnorm"
+                    } else {
+                        n
+                    }
+                })
                 .collect();
             names.sort_unstable();
             names
         };
-        assert_eq!(ops(&split), ops(&whole), "{row}: every op but the collectives");
+        assert_eq!(
+            ops(&split),
+            ops(&whole),
+            "{row}: every op but the collectives"
+        );
         let norms: Vec<&poem_ir::Param> = (split.params.iter())
             .filter(|p| p.name.ends_with("norm_q") || p.name.ends_with("q_norm"))
             .collect();
@@ -352,5 +369,71 @@ fn a_host_table_is_cut_by_its_rows_and_the_indexer_runs_whole() {
     );
     for p in split.params.iter().filter(|p| p.name.contains(".indexer.")) {
         assert_eq!(p.shard, poem_ir::Shard::Replicated, "`{}` is whole", p.name);
+    }
+}
+
+/// DeepSeek-V4 splits through what held it back: V4.1's routed experts
+/// weigh their rows inside the gated unit, its DSpark stages attend through
+/// a window with sinks, and its grouped output projection follows the
+/// heads; the small base's per-head kv is normed across all its heads. Two
+/// ways, each runs every op one rank does (a norm over a split row read as
+/// the norm it stands for).
+#[test]
+fn deepseek_v4_splits_its_weighted_experts_dspark_and_kv_norm() {
+    for row in [
+        "dsv41-flash-mini-dspark-fp8b32a8g32-mxfp4a8g32-kv-nvfp4",
+        "dsv4-base-bf16-kv-bf16",
+    ] {
+        let whole = crate::catalog::deployment(row)
+            .expect("the one-rank row")
+            .trace(Platform::Cuda);
+        let split = crate::catalog::deployment(&format!("{row}-tp2"))
+            .expect("the row splits two ways")
+            .trace(Platform::Cuda);
+        let ops = |trace: &poem_ir::Trace| {
+            let mut names: Vec<&str> = (trace.nodes.iter())
+                .map(|node| poem_ir::Operands::name(&node.op))
+                .filter(|n| !n.starts_with("collective.") && *n != "elemwise.sum_squares")
+                .map(|n| {
+                    if n == "elemwise.rmsnorm_by" {
+                        "elemwise.rmsnorm"
+                    } else {
+                        n
+                    }
+                })
+                .collect();
+            names.sort_unstable();
+            names
+        };
+        assert_eq!(
+            ops(&split),
+            ops(&whole),
+            "{row}: every op but the collectives"
+        );
+        let cut = |name: &str| {
+            (split.params.iter())
+                .filter(|p| p.name == name)
+                .all(|p| matches!(p.shard, poem_ir::Shard::Cut { .. }))
+        };
+        assert!(
+            cut("layers.1.attn.q_up"),
+            "{row}: q's up projection by its heads"
+        );
+        if row.starts_with("dsv41") {
+            assert!(cut("dspark.stages.0.attn.q_up"), "a DSpark stage's heads");
+            assert!(
+                cut("layers.1.attn.o_down"),
+                "the grouped output by its heads"
+            );
+            assert!(
+                cut("layers.1.mlp.gate_up.gate"),
+                "the weighted experts' channels"
+            );
+        } else {
+            assert!(
+                cut("layers.3.attn.kv_norm"),
+                "the base's kv norm with its heads"
+            );
+        }
     }
 }
