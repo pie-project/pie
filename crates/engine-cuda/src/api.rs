@@ -16,8 +16,7 @@ use engine::program::{
     BindExtents, BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration,
 };
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy, StateDirection};
-use eta_ir::registry::{GeometryClass, ModelProfile, Port, PortMask};
-use eta_ir::types::Dtype;
+use eta_ir::registry::{GeometryClass, Port, PortMask};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder, VoxelLadder};
 use poem_ir::Trace;
 
@@ -395,42 +394,6 @@ pub fn voxel_ladder(trace: &Trace, budgets: &LoadBudgets) -> Option<VoxelLadder>
     })
 }
 
-fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
-    let trace = shell.trace();
-    let layers = trace
-        .nodes
-        .iter()
-        .filter_map(|node| node.layer)
-        .max()
-        .map_or(0, |top| top + 1);
-    let vocab = match shell.out_width() {
-        Ok(width) => u32::try_from(width).unwrap_or(u32::MAX),
-        Err(_) if shell.readout_seam().is_some() => 0,
-        Err(why) => return Err(fault(why)),
-    };
-    let (has_pixels, pixels_width) = shell.pixels_facts();
-    Ok(ModelProfile {
-        vocab,
-        page_size: budgets.page_size,
-        num_layers: layers,
-        activation: Dtype::F32,
-        has_mtp_logits: shell.drafts(),
-        mtp_depth: shell.mtp_depth(),
-        draft_block: trace.drafter.map_or(0, |d| d.rows),
-        draft_mask_token: trace.drafter.map_or(0, |d| d.mask_token),
-        draft_proposals_from: trace.drafter.map_or(1, |d| d.proposals_from),
-        has_value_head: false,
-        has_attn_score: shell.observes_scores(),
-        has_attn_page_mask: false,
-        has_lora: true,
-        has_velocity: shell.velocity_width().is_some(),
-        velocity_width: shell.velocity_width().unwrap_or(0),
-        has_pixels,
-        pixels_width,
-        kernels: Vec::new(),
-    })
-}
-
 fn adapter_of(
     shell: &mut Shell,
     program: engine::program::ProgramId,
@@ -623,7 +586,8 @@ impl Engine for Cuda {
             .caches
             .iter()
             .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
-        let profile = profile(&shell, &budgets)?;
+        let trace = shell.trace();
+        let drafter = trace.drafter;
 
         let caps = Capabilities {
             device: DeviceFacts {
@@ -677,7 +641,14 @@ impl Engine for Cuda {
                     .unwrap_or(u32::MAX),
                 max_scoring_lanes: shell.scoring_lanes(),
             },
-            profile,
+            has_lora: true,
+            has_attn_page_mask: false,
+            has_mtp_logits: shell.drafts(),
+            mtp_depth: shell.mtp_depth(),
+            draft_block: drafter.map_or(0, |d| d.rows),
+            draft_mask_token: drafter.map_or(0, |d| d.mask_token),
+            draft_proposals_from: drafter.map_or(1, |d| d.proposals_from),
+            has_attn_score: shell.observes_scores(),
             ports: PortMask::DEVICE_GEOMETRY
                 .with(Port::AttnMask)
                 .with(Port::Fold),
@@ -1188,9 +1159,7 @@ impl Cuda {
                         Readout::Last | Readout::None => None,
                     },
                     group: lane.group,
-                    peer: lane.peer,
                     inputs: &lane.inputs,
-                    attn_classes: lane.attn_classes.as_ref(),
                     reports: lane.reports,
                     tap: lane.tap.as_ref(),
                 })
@@ -1218,6 +1187,7 @@ impl Cuda {
             .iter()
             .map(|attachment| Attached {
                 lane: attachment.lane,
+                lanes: attachment.lanes,
                 instance: attachment.instance,
                 at: attachment.at,
             })

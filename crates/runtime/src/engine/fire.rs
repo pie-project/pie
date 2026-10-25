@@ -12,7 +12,6 @@ pub struct FireRequest {
     pub boundary_program: bool,
     pub voxels: Vec<engine::fire::StepVoxels>,
     pub media: Vec<engine::fire::StepMedia>,
-    pub cohort: Option<u32>,
 }
 
 impl FireRequest {

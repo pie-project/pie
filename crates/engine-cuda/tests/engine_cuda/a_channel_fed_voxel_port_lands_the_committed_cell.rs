@@ -22,7 +22,7 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
     let weights = Weights::random(&trace(), 0x5a);
     let mut rig = Rig::load(&weights, 32, vec![16, 32], voxels() + 8);
     assert!(
-        rig.profile().has_pixels,
+        rig.reads_out(poem_ir::ReadoutKind::Pixels).is_some(),
         "a plan planting `seam::PIXELS` states the `pixels()` gate"
     );
 

@@ -1,53 +1,45 @@
 //! The two float seams a generative model lands, the velocity and the
-//! pixels, as one table: a model that has the seam binds a reading of it at
-//! its width; one without refuses the program; a reading at another width,
-//! or not a float matrix, is refused; and either seam is an epilogue value.
+//! pixels, as one table: a pass whose lane reads the seam out binds a
+//! reading of it at that lane's width; a lane that reads another thing out
+//! refuses the program; a reading at another width, or not a float matrix,
+//! is refused; a lane past the pass's is refused; and either seam is an
+//! epilogue value.
 
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{ModelProfile, Stage, intrinsic_available, intrinsic_stages};
+use eta_ir::registry::{EngineCaps, Graph, Readout, ReadoutKind, Stage, intrinsic_stages};
 use eta_ir::types::{Dtype, Shape};
-use eta_ir::validate::{ValidateError, bind};
+use eta_ir::validate::{BoundTrace, ValidateError, bind};
 
 const ROWS: u32 = 4;
 
 struct Seam {
     intr: IntrinsicId,
+    kind: ReadoutKind,
     width: u32,
-    with: fn(width: u32) -> ModelProfile,
-    without: fn() -> ModelProfile,
 }
 
 const SEAMS: [Seam; 2] = [
     Seam {
         intr: IntrinsicId::Velocity,
+        kind: ReadoutKind::Velocity,
         width: 16,
-        with: |width| ModelProfile {
-            has_velocity: true,
-            velocity_width: width,
-            ..ModelProfile::dummy()
-        },
-        without: || ModelProfile {
-            has_velocity: false,
-            ..ModelProfile::dummy()
-        },
     },
     Seam {
         intr: IntrinsicId::Pixels,
+        kind: ReadoutKind::Pixels,
         width: 3,
-        with: |width| ModelProfile {
-            has_pixels: true,
-            pixels_width: width,
-            ..ModelProfile::dummy()
-        },
-        without: || ModelProfile {
-            has_pixels: false,
-            ..ModelProfile::dummy()
-        },
     },
 ];
 
-fn epilogue_reading(intr: IntrinsicId, shape: Shape, dtype: Dtype) -> TraceContainer {
+fn bound(
+    container: TraceContainer,
+    lanes: Vec<Option<Readout>>,
+) -> Result<BoundTrace, ValidateError> {
+    bind(container, lanes, Graph::default(), EngineCaps::default())
+}
+
+fn epilogue_reading(intr: IntrinsicId, lane: u32, shape: Shape, dtype: Dtype) -> TraceContainer {
     TraceContainer {
         names: Vec::new(),
         channels: vec![ChannelDecl {
@@ -61,7 +53,12 @@ fn epilogue_reading(intr: IntrinsicId, shape: Shape, dtype: Dtype) -> TraceConta
         stages: vec![StageProgram {
             stage: Stage::Epilogue,
             ops: vec![
-                Op::IntrinsicVal { intr, shape, dtype },
+                Op::IntrinsicVal {
+                    intr,
+                    lane,
+                    shape,
+                    dtype,
+                },
                 Op::ChanPut { chan: 0, value: 0 },
             ],
         }],
@@ -73,56 +70,75 @@ fn epilogue_reading(intr: IntrinsicId, shape: Shape, dtype: Dtype) -> TraceConta
 #[test]
 fn a_float_seam_is_gated_by_the_model() {
     for seam in &SEAMS {
-        let Seam { intr, width, .. } = *seam;
-        let read = |shape, dtype| epilogue_reading(intr, shape, dtype);
+        let Seam { intr, kind, width } = *seam;
+        let read = |shape, dtype| epilogue_reading(intr, 0, shape, dtype);
         let plane = Shape::matrix(ROWS, width);
+        let reads = Some(Readout { kind, width });
+        let other = Some(Readout {
+            kind: ReadoutKind::Logits,
+            width: 32,
+        });
 
-        bind(read(plane, Dtype::F32), (seam.with)(width))
-            .unwrap_or_else(|why| panic!("{intr:?}: a model with the seam binds it: {why:?}"));
-        let refusal = bind(read(plane, Dtype::F32), (seam.without)())
-            .expect_err("a model without the seam refuses the program");
+        bound(read(plane, Dtype::F32), vec![reads])
+            .unwrap_or_else(|why| panic!("{intr:?}: a lane reading the seam binds it: {why:?}"));
+        let refusal = bound(read(plane, Dtype::F32), vec![other])
+            .expect_err("a lane reading something else refuses the program");
         assert!(
             matches!(refusal, ValidateError::IntrinsicUnavailable { intr: i } if i == intr),
             "{intr:?}: refused for the wrong reason: {refusal:?}"
         );
 
-        let refusal = bind(
+        let refusal = bound(
             read(Shape::matrix(ROWS, width + 1), Dtype::F32),
-            (seam.with)(width),
+            vec![reads],
         )
-        .expect_err("a width that is not the model's is refused");
+        .expect_err("a width that is not the lane's is refused");
         assert!(
             matches!(refusal, ValidateError::IntrinsicTypeRule { intr: i, .. } if i == intr),
             "{intr:?}: refused for the wrong reason: {refusal:?}"
         );
         for (shape, dtype) in [(Shape::vector(width), Dtype::F32), (plane, Dtype::I32)] {
             assert!(
-                bind(read(shape, dtype), (seam.with)(width)).is_err(),
+                bound(read(shape, dtype), vec![reads]).is_err(),
                 "{intr:?}: bound a reading of shape {shape:?} dtype {dtype:?}"
             );
         }
+
+        // The lane named is the one gated: lane 1 of a pass whose second
+        // lane reads the seam binds, lane 2 of a pass of two is refused.
+        bound(
+            epilogue_reading(intr, 1, plane, Dtype::F32),
+            vec![other, reads],
+        )
+        .unwrap_or_else(|why| panic!("{intr:?}: lane 1 reads the seam: {why:?}"));
+        let refusal = bound(
+            epilogue_reading(intr, 2, plane, Dtype::F32),
+            vec![other, reads],
+        )
+        .expect_err("a lane past the pass's is refused");
+        assert!(
+            matches!(refusal, ValidateError::IntrinsicLane { intr: i, lane: 2, lanes: 2 } if i == intr),
+            "{intr:?}: refused for the wrong reason: {refusal:?}"
+        );
 
         assert_eq!(
             intrinsic_stages(intr),
             &[Stage::Epilogue],
             "{intr:?} is the fire's answer"
         );
-        assert!(intrinsic_available(intr, &(seam.with)(width)));
-        assert!(!intrinsic_available(intr, &(seam.without)()));
     }
 
-    // A model that states no pixel width takes a plane of any width.
-    let unstated = (SEAMS[1].with)(0);
-    for width in [3, 16] {
-        bind(
-            epilogue_reading(IntrinsicId::Pixels, Shape::matrix(ROWS, width), Dtype::F32),
-            unstated.clone(),
-        )
-        .unwrap_or_else(|why| panic!("a {width}-wide plane against an unstated width: {why:?}"));
-    }
-    // The hidden seam is not the velocity's to gate.
-    assert!(intrinsic_available(
-        IntrinsicId::Hidden,
-        &(SEAMS[0].without)()
-    ));
+    // Logits read the pass, so they name lane 0.
+    let refusal = bound(
+        epilogue_reading(IntrinsicId::Logits, 1, Shape::matrix(1, 32), Dtype::F32),
+        vec![
+            Some(Readout {
+                kind: ReadoutKind::Logits,
+                width: 32
+            });
+            2
+        ],
+    )
+    .expect_err("logits name no lane");
+    assert!(matches!(refusal, ValidateError::IntrinsicLane { .. }));
 }

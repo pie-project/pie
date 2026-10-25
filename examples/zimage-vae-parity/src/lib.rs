@@ -261,17 +261,17 @@ async fn main(input: Input) -> Result<Output> {
     // shell reads the committed cell straight into the voxel payload.
     let pipe = Pipeline::new();
     let pass = ForwardPass::new();
-    pass.switch("reading", &d.name)?;
-    pass.switch("stream", "image")?;
+    pass.switch(0, "reading", &d.name)?;
+    pass.switch(0, "stream", "image")?;
     let clip = Channel::from_shaped([case.h, case.w, case.channels], case.latent.as_slice())
         .named("latent");
-    pass.input(&d.input, &clip)?;
+    pass.input(0, &d.input, &clip)?;
 
     // The answer: one row per OUTPUT voxel, RGB in [-1, 1].
     let out = Channel::new([rows, width], dtype::f32).named("pixels");
     let readback = out.clone();
     pass.epilogue(move || {
-        readback.put(intrinsics::pixels(rows, width));
+        readback.put(intrinsics::pixels(0, rows, width));
     });
     pass.submit(&pipe).context("the vae.decode lane")?;
 

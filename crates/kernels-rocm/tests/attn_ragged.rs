@@ -14,7 +14,7 @@ use kernels_rocm::attn::ragged::{RaggedMask, ragged};
 enum Mask {
     None,
     Bias,
-    Class,
+    Custom,
 }
 
 const MAX_LEN: usize = 130;
@@ -108,7 +108,7 @@ fn check(
             let (qo, kv) = (r - qt[g] as usize, j - kt[g] as usize);
             let keep = match mask {
                 Mask::None | Mask::Bias => true,
-                Mask::Class => allowed[(classes[r] * 3 + classes[j]) as usize] == 1,
+                Mask::Custom => allowed[(classes[r] * 3 + classes[j]) as usize] == 1,
             };
             let d = (kv + MAX_LEN - 1).saturating_sub(qo).min(span - 1);
             let b = if mask == Mask::Bias {
@@ -126,18 +126,35 @@ fn check(
     let kp = gpu.tensor(&k, kr.max(1) as u32, (kvh * hd) as u32, Bf16);
     let vp = gpu.tensor(&v, kr.max(1) as u32, (kvh * hd) as u32, Bf16);
     let (qtab, ktab) = (gpu.column(&qt), gpu.column(&kt));
-    let class_t = gpu.column(&classes);
+    // Each group's bits, query-major, from a byte of its own: the classes'
+    // table spelled pair by pair.
+    let (mut bits, mut starts) = (Vec::<u8>::new(), Vec::<i32>::new());
+    for g in 0..qt.len() - 1 {
+        starts.push(bits.len() as i32);
+        let (q0, q1) = (qt[g] as usize, qt[g + 1] as usize);
+        let (k0, k1) = (kt[g] as usize, kt[g + 1] as usize);
+        let base = bits.len();
+        bits.resize(base + ((q1 - q0) * (k1 - k0)).div_ceil(8), 0);
+        for (qo, r) in (q0..q1).enumerate() {
+            for (kv, j) in (k0..k1).enumerate() {
+                if allowed[(classes[r] * 3 + classes[j]) as usize] == 1 {
+                    let cell = qo * (k1 - k0) + kv;
+                    bits[base + cell / 8] |= 1 << (cell % 8);
+                }
+            }
+        }
+    }
+    starts.push(bits.len() as i32);
+    bits.push(0);
     let arm = match mask {
         Mask::None => RaggedMask::None,
         Mask::Bias => RaggedMask::RelativeBias {
             table: gpu.tensor(&bias, qh as u32, span as u32, F32),
             max_len: MAX_LEN as u32,
         },
-        Mask::Class => RaggedMask::ClassTable {
-            q_classes: class_t,
-            kv_classes: class_t,
-            table: gpu.upload(&allowed, 9, 1, U8),
-            count: 3,
+        Mask::Custom => RaggedMask::Custom {
+            bits: gpu.upload(&bits, bits.len() as u32, 1, U8),
+            indptr: gpu.column(&starts),
         },
     };
     let mut out = o;
@@ -173,8 +190,8 @@ fn the_ragged_arm_answers_the_reference() {
     check(&gpu, [4, 2, 64], q_cross, kv_cross, Mask::None, [0, 0]);
     check(&gpu, [4, 2, 128], q_cross, kv_cross, Mask::None, [0, 0]);
     check(&gpu, [64, 16, 64], bias, bias, Mask::Bias, [0, 0]);
-    check(&gpu, [2, 1, 256], lanes, lanes, Mask::Class, [0, 0]);
-    check(&gpu, [4, 2, 64], lanes, lanes, Mask::Class, [0, 0]);
+    check(&gpu, [2, 1, 256], lanes, lanes, Mask::Custom, [0, 0]);
+    check(&gpu, [4, 2, 64], lanes, lanes, Mask::Custom, [0, 0]);
     check(
         &gpu,
         [2, 2, 256],

@@ -18,9 +18,8 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
+use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
-use eta_ir::validate::bind;
 use poem::fact;
 use poem::ops::conv::{self, ConvShape};
 use poem::{
@@ -294,6 +293,7 @@ pub fn pixel_epilogue(clip: [u32; 3], rows: u32) -> TraceContainer {
                 Op::ChanTake(0),
                 Op::IntrinsicVal {
                     intr: IntrinsicId::Pixels,
+                    lane: 0,
                     shape: plane,
                     dtype: EtaDtype::F32,
                 },
@@ -335,6 +335,7 @@ pub fn velocity_epilogue(rows: u32) -> TraceContainer {
                 Op::ChanTake(0),
                 Op::IntrinsicVal {
                     intr: IntrinsicId::Velocity,
+                    lane: 0,
                     shape: Shape::matrix(rows, WIDTH),
                     dtype: EtaDtype::F32,
                 },
@@ -413,11 +414,6 @@ impl Rig {
         u32::try_from(id).expect("fewer than 2^32 inputs")
     }
 
-    #[must_use]
-    pub fn profile(&self) -> &ModelProfile {
-        &self.loaded.caps.profile
-    }
-
     /// The word of a one-row lane running `reading`, or the plan's token
     /// reading when `None`.
     #[must_use]
@@ -478,8 +474,20 @@ impl Rig {
         }
     }
 
+    /// How wide a row the loaded classes read out of `kind`, if one does.
+    pub fn reads_out(&self, kind: poem_ir::ReadoutKind) -> Option<u32> {
+        self.loaded
+            .caps
+            .classes
+            .classes
+            .iter()
+            .filter_map(|class| class.readout)
+            .find(|readout| readout.kind == kind)
+            .map(|readout| readout.width)
+    }
+
     pub fn register(&mut self, container: TraceContainer, salt: u64) -> ProgramId {
-        let bound = bind(container, self.profile().clone()).expect("the epilogue binds");
+        let bound = crate::bound::loaded(container, &self.loaded.caps).expect("the epilogue binds");
         let stages = compile_bound(&bound);
         let launch = eta_compiler::codegen::launch::build(&bound, &stages);
         let backend =
@@ -562,6 +570,7 @@ impl Rig {
 pub fn attach(lane: u32, instance: InstanceId) -> Attachment {
     Attachment {
         lane,
+        lanes: 1,
         instance,
         at: Boundary::Epilogue,
     }

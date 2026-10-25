@@ -1,6 +1,5 @@
 use eta_compiler::codegen::program::{Backend, EmittedKernel, emit_program};
 use eta_compiler::plan::compile_bound;
-use eta_ir::validate::bind;
 
 use crate::msl_corpus::{
     GOLDEN_NAMES, extended_traces, golden_container, golden_profile, synthetic_traces,
@@ -23,7 +22,7 @@ fn every_emitted_kernel() -> Vec<(String, Backend, EmittedKernel)> {
 
     let mut out = Vec::new();
     for (name, container, profile) in traces {
-        let Ok(bound) = bind(container, profile) else {
+        let Ok(bound) = profile.bind(container) else {
             continue;
         };
         let stages = compile_bound(&bound);

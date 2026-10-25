@@ -95,7 +95,8 @@ export function main(input) {
   const pos = Channel.from(new Array(B).fill(0), dtype.u32).named('pos');
   const fill = Channel.from([1], dtype.u32).named('fill');
   const kvLen = Channel.from(new Array(B).fill(1), dtype.u32).named('kv_len');
-  fwd.state(pool, { positions: pos, slots, kvLen, mask });
+  fwd.state(pool, { positions: pos, slots, kvLen });
+  fwd.mask(mask);
   fwd.epilogue(() => {
     const parent = step();
 

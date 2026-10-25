@@ -151,7 +151,7 @@ describe('eta goldens', () => {
     });
     hostPut(mask, new Array(vocab).fill(true));
     const traced = b.build();
-    expect(traced.identityHash()).toBe(4213522552817221928n);
+    expect(traced.identityHash()).toBe(GOLDENS.get('s3')!.hash);
     check('s3', traced);
   });
 
@@ -510,7 +510,7 @@ describe('sampler golden', () => {
     ]);
     b.stage(Stage.EPILOGUE, () => {
       positions.putTensor(positions.take());
-      const v = intrinsics.velocity(channels);
+      const v = intrinsics.velocity(0, rows, channels);
       const x = latent.take();
       const d = reshape(dsigma.read(), []);
 
@@ -559,7 +559,7 @@ describe('sampler golden', () => {
     const out = chNew([rows, rgb], dtype.f32, 'pixels_out');
     const b = new Builder(VOCAB, PAGE);
     b.stage(Stage.EPILOGUE, () => {
-      const px = intrinsics.pixels(rows, rgb);
+      const px = intrinsics.pixels(0, rows, rgb);
       const shifted = add(px, 1.0);
       const unit = mul(shifted, 0.5);
       out.putTensor(unit);

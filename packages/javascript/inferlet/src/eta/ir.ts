@@ -289,7 +289,7 @@ export const OP_TABLE: ReadonlyMap<number, Row> = new Map<number, Row>([
   [tags.CHAN_TAKE, ['chan_take', 1, [Field.CHAN]]],
   [tags.CHAN_READ, ['chan_read', 1, [Field.CHAN]]],
   [tags.CHAN_PUT, ['chan_put', 0, [Field.CHAN, V]]],
-  [tags.INTRINSIC_VAL, ['intrinsic_val', 1, [Field.INTRINSIC, Field.DTYPE, Field.SHAPE]]],
+  [tags.INTRINSIC_VAL, ['intrinsic_val', 1, [Field.INTRINSIC, Field.IMM, Field.DTYPE, Field.SHAPE]]],
   [tags.KERNEL_CALL, ['kernel_call', 1, [Field.NAME, Field.DTYPE, Field.SHAPE, Field.ARGS]]],
   [tags.SINK_CALL, ['sink_call', 0, [Field.NAME, Field.ARGS]]],
 ]);
@@ -412,9 +412,12 @@ export class Op {
     op.chan = chan;
     return op;
   }
-  static intrinsicVal(intr: Intrinsic, shape: Shape, dt: Dtype): Op {
+  /** `lane` is the pass's lane a per-lane intrinsic reads (`velocity`,
+   * `hidden`, `pixels`), 0 for the others; it rides the op's imm. */
+  static intrinsicVal(intr: Intrinsic, shape: Shape, dt: Dtype, lane = 0): Op {
     const op = new Op(tags.INTRINSIC_VAL);
     op.intr = intr;
+    op.imms = [lane];
     op.shape = shape;
     op.dtype = dt;
     return op;

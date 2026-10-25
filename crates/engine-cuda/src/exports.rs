@@ -51,6 +51,22 @@ impl Exports {
             .map(|(export, grid)| (export.value, *grid))
     }
 
+    /// Whether `class` writes the pixels seam.
+    pub(crate) fn writes_pixels(&self, class: usize) -> bool {
+        self.pixels
+            .iter()
+            .any(|(export, _)| export.classes.contains(class))
+    }
+
+    /// Whether export `value`'s rows are voxels rather than tokens.
+    pub(crate) fn on_voxels(&self, trace: &Trace, value: ValueId) -> bool {
+        matches!(
+            &trace.values[value.0 as usize].ty,
+            poem_ir::Ty::Tensor { shape, .. }
+                if matches!(shape.first(), Some(poem_ir::Dim::Voxels | poem_ir::Dim::VoxelsTimes(_)))
+        )
+    }
+
     pub(crate) fn pixels_widths<'a>(&'a self, trace: &'a Trace) -> impl Iterator<Item = u32> + 'a {
         self.pixels.iter().filter_map(move |(export, _)| {
             crate::store::kv::width_of(trace, export.value)

@@ -7,10 +7,10 @@ use eta_dsl::Tensor;
 
 pub mod prelude {
     pub use super::{
-        DenoiseLoop, Dpm2m, Dpm2mChannels, FlowMatchEuler, LaneClock, LaneRows, apg, at,
-        cfg_combine, dpm2m_step, dynamic_shift, encode_ids, encode_ids_rows, encode_text,
-        euler_step, guided_velocity, host_noise, inpaint_step, noise, positions_for,
-        positions_grid, resume_or_step, rng_state, seed_or_step, step,
+        DenoiseLoop, Dpm2m, Dpm2mChannels, FlowMatchEuler, LaneRows, apg, at, cfg_combine,
+        dpm2m_step, dynamic_shift, encode_ids, encode_ids_rows, encode_text, euler_step,
+        host_noise, inpaint_step, noise, positions_for, positions_grid, resume_or_step, rng_state,
+        seed_or_step, step,
     };
     pub use crate::eta::prelude::*;
 }
@@ -171,18 +171,6 @@ pub fn cfg_combine(cond: &Tensor, uncond: &Tensor, s: &Tensor) -> Tensor {
     uncond + &(&(cond - uncond) * &broadcast(s, shape))
 }
 
-#[must_use]
-pub fn guided_velocity(width: u32, s: f32, conditional: bool) -> Tensor {
-    let own = intrinsics::velocity(width);
-    let peer = intrinsics::peer_velocity(width);
-    let scale = Tensor::constant([s]);
-    if conditional {
-        cfg_combine(&own, &peer, &scale)
-    } else {
-        cfg_combine(&peer, &own, &scale)
-    }
-}
-
 pub fn apg(cond: &Tensor, uncond: &Tensor, s: f32, eta: f32, norm_threshold: f32) -> Tensor {
     let shape = cond.shape();
     let rows = shape.dims()[0];
@@ -286,30 +274,13 @@ pub fn positions_for(convention: &PositionConvention, lane: LaneRows, text_rows:
     grid
 }
 
-#[derive(Clone)]
-pub struct LaneClock {
-    pub step: Channel,
-    pub timestep: Channel,
-    ts: Channel,
-}
-
-impl LaneClock {
-    pub fn drive(&self, pass: &ForwardPass, body: impl Fn(&Tensor) + 'static) {
-        let (step, timestep, ts) = (self.step, self.timestep, self.ts);
-        pass.epilogue(move || {
-            let k = step.take();
-            body(&k);
-            let next = &k + 1u32;
-            timestep.take();
-            timestep.put(at(&ts.read(), &next));
-            step.put(&next);
-        });
-    }
-}
-
+/// A denoising loop's clock: one pass a step, on one pipeline. The pass's
+/// lanes read [`DenoiseLoop::timestep`]; [`DenoiseLoop::drive`] is its
+/// epilogue, which runs the step and moves the clock on.
 pub struct DenoiseLoop {
-    pipes: Vec<Pipeline>,
-    t0: f32,
+    pipe: Pipeline,
+    step: Channel,
+    timestep: Channel,
     ts: Channel,
     dts: Channel,
     sigmas: Channel,
@@ -340,8 +311,9 @@ impl DenoiseLoop {
 
     fn of(sched: &FlowMatchEuler, ts: Vec<f32>, dts: Vec<f32>, fires: u32) -> DenoiseLoop {
         DenoiseLoop {
-            pipes: Vec::new(),
-            t0: ts[0],
+            pipe: Pipeline::new(),
+            step: Channel::from([0u32]).named("step"),
+            timestep: Channel::from([ts[0]]).named("t"),
             ts: Channel::from(ts).named("ts"),
             dts: Channel::from(dts).named("dts"),
             sigmas: Channel::from(sched.sigmas.clone()).named("sigmas"),
@@ -354,16 +326,13 @@ impl DenoiseLoop {
         self.fires
     }
 
-    pub fn lane(&mut self, tag: &str) -> LaneClock {
-        self.pipes.push(Pipeline::new());
-        LaneClock {
-            step: Channel::from([0u32]).named(&format!("{tag}_step")),
-            timestep: Channel::from([self.t0]).named(&format!("{tag}_t")),
-            ts: self.ts,
-        }
+    /// The timestep this fire runs at, the `timestep` input of every lane.
+    #[must_use]
+    pub fn timestep(&self) -> Channel {
+        self.timestep
     }
 
-    /// The step each fire takes; every lane reads the same channel.
+    /// The step each fire takes.
     #[must_use]
     pub fn dts(&self) -> Channel {
         self.dts
@@ -376,26 +345,25 @@ impl DenoiseLoop {
         self.sigmas
     }
 
-    pub fn fire(&self, passes: &[&ForwardPass]) -> Result<(), String> {
-        if passes.len() != self.pipes.len() {
-            return Err(format!(
-                "this loop has {} lanes and {} passes were submitted; every lane of a group must \
-                 fire in the same step",
-                self.pipes.len(),
-                passes.len()
-            ));
-        }
-        for (i, pass) in passes.iter().enumerate() {
-            pass.submit(&self.pipes[i])
-                .map_err(|why| format!("lane {i}: {why}"))?;
-        }
-        Ok(())
+    /// `pass`'s epilogue: `body(k)` at fire `k`, then the clock moves on.
+    pub fn drive(&self, pass: &ForwardPass, body: impl Fn(&Tensor) + 'static) {
+        let (step, timestep, ts) = (self.step, self.timestep, self.ts);
+        pass.epilogue(move || {
+            let k = step.take();
+            body(&k);
+            let next = &k + 1u32;
+            timestep.take();
+            timestep.put(at(&ts.read(), &next));
+            step.put(&next);
+        });
+    }
+
+    pub fn fire(&self, pass: &ForwardPass) -> Result<(), String> {
+        pass.submit(&self.pipe)
     }
 
     pub fn close(&self) {
-        for pipe in &self.pipes {
-            pipe.close();
-        }
+        self.pipe.close();
     }
 }
 
@@ -677,7 +645,7 @@ pub async fn encode_ids_rows(ids: &[u32], reading: &str) -> Result<(Vec<f32>, u3
     let out = Channel::new([len, width], crate::eta::Dtype::F32);
 
     let pass = ForwardPass::new();
-    pass.switch("reading", reading)?;
+    pass.switch(0, "reading", reading)?;
     pass.embed(&toks, &embed_indptr)?;
     pass.readout(&readout)?;
     let ws = WorkingSet::new();
@@ -686,7 +654,7 @@ pub async fn encode_ids_rows(ids: &[u32], reading: &str) -> Result<(Vec<f32>, u3
     }
     let readback = out;
     pass.epilogue(move || {
-        readback.put(intrinsics::hidden(width));
+        readback.put(intrinsics::hidden(0, len, width));
     });
     pass.submit(&pipe)?;
     let rows: Vec<f32> = out.take_host().await?;

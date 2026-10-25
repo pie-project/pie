@@ -437,7 +437,6 @@ class StateGeometry:
     positions: object
     slots: object
     kv_len: object
-    mask: object
     fold: object
 
 
@@ -452,7 +451,7 @@ class ForwardPassStub:
         self.checkpoint_slots = None
         self.program_bytes: bytes | None = None
         self.program_channels: list | None = None
-        self.switches: list[tuple[str, str]] = []
+        self.switches: list[tuple[int, str, str]] = []
 
     def embed(self, tokens, indptr) -> None:
         self.embedded = (tokens, indptr)
@@ -466,11 +465,11 @@ class ForwardPassStub:
     def checkpoints(self, slots) -> None:
         self.checkpoint_slots = list(slots)
 
-    def media(self, spans) -> None:
-        self.spans = spans
+    def media(self, lane: int, spans) -> None:
+        self.spans = (lane, spans)
 
-    def switch(self, name: str, value: str) -> None:
-        self.switches.append((name, value))
+    def switch(self, lane: int, name: str, value: str) -> None:
+        self.switches.append((lane, name, value))
 
     def program(self, container_bytes: bytes, channels) -> None:
         self.program_bytes = bytes(container_bytes)

@@ -717,7 +717,7 @@ async fn main(input: Input) -> Result<Output> {
             let want_sure = input.verify_budget;
 
             let fwd = ForwardPass::new();
-            fwd.switch("block_draft", "on")
+            fwd.switch(0, "block_draft", "on")
                 .map_err(|why| format!("stating the draft block: {why}"))?;
             fwd.embed(&toks, &indptr)?;
             fwd.readout(&readout)?;

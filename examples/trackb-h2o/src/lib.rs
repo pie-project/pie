@@ -325,13 +325,8 @@ async fn main(input: Input) -> Result<Output> {
 
         let fwd = ForwardPass::new();
         fwd.embed(&tok_in, &lane1)?;
-        fwd.state(
-            &[&ws],
-            StateGeometry {
-                mask: Some(&mask),
-                ..StateGeometry::folding()
-            },
-        )?;
+        fwd.mask(&mask)?;
+        fwd.state(&[&ws], StateGeometry::folding())?;
         fwd.epilogue(move || {
             let length = fill.take();
             let r = rng.take();

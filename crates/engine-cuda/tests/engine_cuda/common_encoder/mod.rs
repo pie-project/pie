@@ -17,9 +17,8 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::Op;
-use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
+use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
-use eta_ir::validate::bind;
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Trace, Value, Weight, ops, seam,
     trace_hybrid,
@@ -347,15 +346,24 @@ impl Rig {
         }
     }
 
-    pub fn profile(&self) -> &ModelProfile {
-        &self.loaded.caps.profile
+    /// How wide a row the loaded classes read out of `kind`, if one does.
+    pub fn reads_out(&self, kind: poem_ir::ReadoutKind) -> Option<u32> {
+        self.loaded
+            .caps
+            .classes
+            .classes
+            .iter()
+            .filter_map(|class| class.readout)
+            .find(|readout| readout.kind == kind)
+            .map(|readout| readout.width)
     }
 
     fn program(&mut self, rows: u32) -> ProgramId {
         if let Some(id) = self.programs.get(&rows) {
             return *id;
         }
-        let bound = bind(epilogue(rows), self.profile().clone()).expect("the epilogue binds");
+        let bound =
+            crate::bound::loaded(epilogue(rows), &self.loaded.caps).expect("the epilogue binds");
         let stages = compile_bound(&bound);
         let launch = eta_compiler::codegen::launch::build(&bound, &stages);
         let backend =
@@ -451,6 +459,7 @@ pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, group: u32) -> Lane {
 pub fn attach(lane: u32, handles: &LaneHandles) -> Attachment {
     Attachment {
         lane,
+        lanes: 1,
         instance: handles.instance,
         at: Boundary::Epilogue,
     }

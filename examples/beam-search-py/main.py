@@ -109,7 +109,8 @@ async def main(input: dict) -> str:
     pos = Channel.from_([0] * B, dtype.u32).named("pos")
     fill = Channel.from_([1], dtype.u32).named("fill")
     kv_len = Channel.from_([1] * B, dtype.u32).named("kv_len")
-    fwd.state(pool, StateGeometry(positions=pos, slots=slots, kv_len=kv_len, mask=mask))
+    fwd.state(pool, StateGeometry(positions=pos, slots=slots, kv_len=kv_len))
+    fwd.mask(mask)
 
     @fwd.epilogue
     def _pool_step():

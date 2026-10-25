@@ -6,7 +6,8 @@ use super::container::{ChannelDecl, ExternDir, HostRole, PortSource, TraceContai
 use super::infer::{BodyCtx, BodyError, BodyErrorKind, body_types};
 use super::op::{ChannelUse, IntrinsicId, Op};
 use super::registry::{
-    KNOWN_SINKS, ModelProfile, Phase, Port, SinkScope, Stage, intrinsic_available, intrinsic_stages,
+    EngineCaps, Graph, KNOWN_SINKS, Phase, Port, Readout, ReadoutKind, SinkScope, Stage,
+    intrinsic_stages,
 };
 use crate::types::{Dtype, Shape, ValueType};
 
@@ -34,7 +35,9 @@ pub enum ChannelClass {
 #[derive(Clone, Debug)]
 pub struct BoundTrace {
     pub container: TraceContainer,
-    pub profile: ModelProfile,
+    /// What each lane of the pass reads out.
+    pub lanes: Vec<Option<Readout>>,
+    pub graph: Graph,
     pub hash: u64,
     pub channel_types: Vec<ValueType>,
     pub stage_types: Vec<Vec<ValueType>>,
@@ -99,6 +102,11 @@ pub enum ValidateError {
     IntrinsicTypeRule {
         intr: IntrinsicId,
         stage: Stage,
+    },
+    IntrinsicLane {
+        intr: IntrinsicId,
+        lane: u32,
+        lanes: u32,
     },
     InputsUnsortedOrDup,
     InputChannelOutOfRange {
@@ -167,16 +175,9 @@ impl fmt::Display for ValidateError {
             KernelUnavailable { name_index, name } => {
                 write!(
                     f,
-                    "`{name}` (name #{name_index}): the backend's model profile does \
-                     not advertise this kernel/sink, so binding it would either \
-                     fail mid-fire or — far worse — run as a silent no-op. This is \
-                     the ENGINE's answer, not the checkpoint's: `ModelProfile` is \
-                     built by copying the engine's `EtaCaps` field for field, so \
-                     the bit to look at is the one that engine's `load_model` \
-                     reports (`has_kv_envelopes` for `envelope_dot`, \
-                     `has_attn_page_mask`, `has_attn_score`). No environment \
-                     variable moves it — every shader and CUDA engine in this \
-                     tree states all three as literal `false`"
+                    "`{name}` (name #{name_index}): the engine serving this model runs \
+                     no such kernel or sink, so binding it would either fail mid-fire \
+                     or run as a silent no-op"
                 )
             }
             NotReplayable { name_index, name } => write!(
@@ -195,12 +196,19 @@ impl fmt::Display for ValidateError {
             IntrinsicUnavailable { intr } => {
                 write!(
                     f,
-                    "intrinsic {} is not advertised by the engine serving this \
-                     model (`ModelProfile` copies the engine's `EtaCaps`, so \
-                     this says nothing about the checkpoint)",
+                    "intrinsic {} reads what no lane of this pass reads out and the \
+                     model's graph does not export",
                     intr.name()
                 )
             }
+            IntrinsicLane { intr, lane, lanes } => write!(
+                f,
+                "intrinsic {} reads lane {lane} of a pass of {lanes}; `velocity`, \
+                 `hidden` and `pixels` name one of their pass's first {} lanes, the \
+                 others read the pass and name lane 0",
+                intr.name(),
+                crate::op::INTRINSIC_LANES
+            ),
             IntrinsicTypeRule { intr, stage } => write!(
                 f,
                 "intrinsic {} at stage {}: declared type violates the registry rule",
@@ -232,17 +240,33 @@ impl fmt::Display for ValidateError {
 #[cfg(feature = "std")]
 impl std::error::Error for ValidateError {}
 
+impl BoundTrace {
+    /// How wide a logits row of the pass is, 0 where no lane reads logits.
+    #[must_use]
+    pub fn vocab(&self) -> u32 {
+        logits_width(&self.lanes).unwrap_or(0)
+    }
+}
+
 pub(crate) fn channel_value_type(decl: &ChannelDecl) -> ValueType {
     ValueType::new(decl.shape, decl.dtype.program_dtype())
 }
 
-pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTrace, ValidateError> {
+/// Validates `container` as the program of a pass whose lanes read out
+/// `lanes` (one entry a lane, in lane order), on a model of `graph`, served
+/// by an engine of `caps`.
+pub fn bind(
+    container: TraceContainer,
+    lanes: Vec<Option<Readout>>,
+    graph: Graph,
+    caps: EngineCaps,
+) -> Result<BoundTrace, ValidateError> {
     check_structure(&container)?;
     check_externs(&container)?;
     let channel_types: Vec<ValueType> = container.channels.iter().map(channel_value_type).collect();
     let stage_types = check_bodies(&container, &channel_types)?;
-    check_intrinsics(&container, &profile)?;
-    check_second_party_names(&container, &profile)?;
+    check_intrinsics(&container, &lanes, graph)?;
+    check_second_party_names(&container, caps)?;
     check_spsc_endpoints(&container)?;
 
     let readiness = readiness_table(&container);
@@ -251,7 +275,8 @@ pub fn bind(container: TraceContainer, profile: ModelProfile) -> Result<BoundTra
     let hash = container.hash();
     Ok(BoundTrace {
         container,
-        profile,
+        lanes,
+        graph,
         hash,
         channel_types,
         stage_types,
@@ -376,23 +401,46 @@ fn check_bodies(
     Ok(stage_types)
 }
 
-fn check_intrinsics(
+/// Checks every intrinsic `container` reads against what the lanes of its pass
+/// read out and what the model exports: a cached program bound for one pass is
+/// checked again for the next.
+pub fn check_intrinsics(
     container: &TraceContainer,
-    profile: &ModelProfile,
+    lanes: &[Option<Readout>],
+    graph: Graph,
 ) -> Result<(), ValidateError> {
     for sp in &container.stages {
         for op in &sp.ops {
-            if let Op::IntrinsicVal { intr, shape, dtype } = *op {
+            if let Op::IntrinsicVal {
+                intr,
+                lane,
+                shape,
+                dtype,
+            } = *op
+            {
                 if !intrinsic_stages(intr).contains(&sp.stage) {
                     return Err(ValidateError::IntrinsicWrongStage {
                         intr,
                         stage: sp.stage,
                     });
                 }
-                if !intrinsic_available(intr, profile) {
-                    return Err(ValidateError::IntrinsicUnavailable { intr });
+                let count = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
+                if (lane != 0 && !intr.per_lane())
+                    || lane >= count.max(1)
+                    || lane >= crate::op::INTRINSIC_LANES
+                {
+                    return Err(ValidateError::IntrinsicLane {
+                        intr,
+                        lane,
+                        lanes: count,
+                    });
                 }
-                if !intrinsic_type_ok(intr, shape, dtype, profile) {
+                let read = lanes.get(lane as usize).copied().flatten();
+                let width = match intrinsic_width(intr, read, lanes, graph) {
+                    Some(width) => width,
+                    None => return Err(ValidateError::IntrinsicUnavailable { intr }),
+                };
+                if !intrinsic_type_ok(intr, shape, dtype, width) {
                     return Err(ValidateError::IntrinsicTypeRule {
                         intr,
                         stage: sp.stage,
@@ -404,74 +452,68 @@ fn check_intrinsics(
     Ok(())
 }
 
+/// The width a row of `intr` is, `Some(None)` where any is, or `None` when
+/// the pass reads no such thing: `read` is what its lane reads out.
+fn intrinsic_width(
+    intr: IntrinsicId,
+    read: Option<Readout>,
+    lanes: &[Option<Readout>],
+    graph: Graph,
+) -> Option<Option<u32>> {
+    let lane_reads = |kind: ReadoutKind| {
+        read.filter(|readout| readout.kind == kind)
+            .map(|readout| Some(readout.width))
+    };
+    match intr {
+        IntrinsicId::Logits => logits_width(lanes).map(Some),
+        IntrinsicId::MtpLogits if graph.mtp_logits => logits_width(lanes).map(Some),
+        IntrinsicId::MtpDrafts if graph.mtp_depth > 0 => Some(None),
+        IntrinsicId::AttnScore if graph.attn_score => Some(None),
+        IntrinsicId::Velocity => lane_reads(ReadoutKind::Velocity),
+        IntrinsicId::Pixels => lane_reads(ReadoutKind::Pixels),
+        IntrinsicId::Hidden | IntrinsicId::Query | IntrinsicId::Layer => Some(None),
+        IntrinsicId::MtpLogits
+        | IntrinsicId::MtpDrafts
+        | IntrinsicId::AttnScore
+        | IntrinsicId::ValueHead => None,
+    }
+}
+
+/// How wide a logits row of the pass is: the width its lanes reading logits
+/// read out.
+fn logits_width(lanes: &[Option<Readout>]) -> Option<u32> {
+    lanes
+        .iter()
+        .flatten()
+        .find(|readout| readout.kind == ReadoutKind::Logits)
+        .map(|readout| readout.width)
+}
+
 fn check_second_party_names(
     container: &TraceContainer,
-    profile: &ModelProfile,
+    caps: EngineCaps,
 ) -> Result<(), ValidateError> {
     for sp in &container.stages {
         for op in &sp.ops {
+            let unavailable = |name: &u16| ValidateError::KernelUnavailable {
+                name_index: *name,
+                name: resolve_name(container, *name).into(),
+            };
             match op {
-                Op::KernelCall { name, .. } => {
-                    let n = resolve_name(container, *name);
-                    let info =
-                        profile
-                            .kernel(n)
-                            .ok_or_else(|| ValidateError::KernelUnavailable {
-                                name_index: *name,
-                                name: n.into(),
-                            })?;
-                    if info.sink_scope.is_some() {
-                        return Err(ValidateError::SinkKernelKindMismatch {
-                            name_index: *name,
-                            name: n.into(),
-                        });
-                    }
-                    if !info.replayable {
-                        return Err(ValidateError::NotReplayable {
-                            name_index: *name,
-                            name: n.into(),
-                        });
-                    }
-                }
+                Op::KernelCall { name, .. } => return Err(unavailable(name)),
                 Op::SinkCall { name, .. } => {
                     let n = resolve_name(container, *name);
-                    if n == "attn_page_mask" && !profile.has_attn_page_mask {
-                        return Err(ValidateError::KernelUnavailable {
-                            name_index: *name,
-                            name: n.into(),
-                        });
-                    }
-                    if n == "lora" && !profile.has_lora {
-                        return Err(ValidateError::KernelUnavailable {
-                            name_index: *name,
-                            name: n.into(),
-                        });
-                    }
+                    let served = match n {
+                        "attn_page_mask" => caps.attn_page_mask,
+                        "lora" => caps.lora,
+                        _ => true,
+                    };
                     let scope = KNOWN_SINKS
                         .iter()
                         .find(|(k, _)| *k == n)
                         .map(|(_, s)| *s)
-                        .or_else(|| profile.kernel(n).and_then(|i| i.sink_scope));
-                    let scope = match scope {
-                        Some(s) => s,
-                        None => {
-                            let info = profile.kernel(n).ok_or_else(|| {
-                                ValidateError::KernelUnavailable {
-                                    name_index: *name,
-                                    name: n.into(),
-                                }
-                            })?;
-                            match info.sink_scope {
-                                Some(s) => s,
-                                None => {
-                                    return Err(ValidateError::SinkKernelKindMismatch {
-                                        name_index: *name,
-                                        name: n.into(),
-                                    });
-                                }
-                            }
-                        }
-                    };
+                        .filter(|_| served)
+                        .ok_or_else(|| unavailable(name))?;
                     let ok = match scope {
                         SinkScope::PassWide => sp.stage == Stage::Prologue,
                         SinkScope::Attention => {
@@ -566,32 +608,19 @@ fn resolve_name(c: &TraceContainer, idx: u16) -> &str {
     c.names.get(idx as usize).map(|s| s.as_str()).unwrap_or("")
 }
 
-fn intrinsic_type_ok(
-    intr: IntrinsicId,
-    shape: Shape,
-    dtype: Dtype,
-    profile: &ModelProfile,
-) -> bool {
+fn intrinsic_type_ok(intr: IntrinsicId, shape: Shape, dtype: Dtype, width: Option<u32>) -> bool {
+    let rows_of = |width: Option<u32>| {
+        dtype == Dtype::F32
+            && shape.rank() == 2
+            && shape.dims()[0] >= 1
+            && width.is_none_or(|width| shape.dims()[1] == width)
+    };
     match intr {
-        IntrinsicId::Logits | IntrinsicId::MtpLogits => {
-            dtype == Dtype::F32
-                && shape.rank() == 2
-                && shape.dims()[1] == profile.vocab
-                && shape.dims()[0] >= 1
-        }
-        IntrinsicId::Hidden => dtype == Dtype::F32 && shape.rank() == 2 && shape.dims()[0] >= 1,
-        IntrinsicId::Velocity | IntrinsicId::PeerVelocity => {
-            dtype == Dtype::F32
-                && shape.rank() == 2
-                && shape.dims()[0] >= 1
-                && shape.dims()[1] == profile.velocity_width
-        }
-        IntrinsicId::Pixels => {
-            dtype == Dtype::F32
-                && shape.rank() == 2
-                && shape.dims()[0] >= 1
-                && (profile.pixels_width == 0 || shape.dims()[1] == profile.pixels_width)
-        }
+        IntrinsicId::Logits
+        | IntrinsicId::MtpLogits
+        | IntrinsicId::Hidden
+        | IntrinsicId::Velocity
+        | IntrinsicId::Pixels => rows_of(width),
         IntrinsicId::ValueHead => dtype == Dtype::F32 && shape.rank() == 1,
         IntrinsicId::Query => dtype == Dtype::F32 && shape.rank() >= 1,
         IntrinsicId::Layer => dtype == Dtype::U32 && shape.is_scalar(),

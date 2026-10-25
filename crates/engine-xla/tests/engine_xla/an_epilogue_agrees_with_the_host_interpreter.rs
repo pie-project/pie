@@ -19,7 +19,7 @@ use eta_compiler::plan::compile_bound;
 use eta_exec::{ExecPlan, InterpInstance, PassInputs, StepOutcome, Value};
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{ModelProfile, Stage};
+use eta_ir::registry::{EngineCaps, Graph, Readout, ReadoutKind, Stage};
 use eta_ir::types::{Dtype, Literal, Predicate, RngKind, Shape};
 
 // ------------------------------------------------------------------ builder
@@ -91,11 +91,24 @@ impl Program {
 }
 
 fn plan_of(container: TraceContainer, vocab: u32) -> ExecPlan {
-    let profile = ModelProfile {
-        vocab,
-        ..ModelProfile::dummy()
-    };
-    let bound = eta_ir::validate::bind(container, profile).expect("the program binds");
+    let bound = eta_ir::validate::bind(
+        container,
+        vec![Some(Readout {
+            kind: ReadoutKind::Logits,
+            width: vocab,
+        })],
+        Graph {
+            num_layers: 2,
+            mtp_logits: true,
+            mtp_depth: 1,
+            attn_score: true,
+        },
+        EngineCaps {
+            lora: true,
+            attn_page_mask: true,
+        },
+    )
+    .expect("the program binds");
     let stages = compile_bound(&bound);
     let launch = eta_compiler::codegen::launch::build(&bound, &stages);
     let plan = eta_exec::adopt_launch_package(launch).expect("the package adopts");
@@ -268,6 +281,7 @@ fn statistics() -> (TraceContainer, Vec<u32>) {
     let (_, index) = p.input(Shape::vector(ROWS), Dtype::I32);
     let logits = p.op(Op::IntrinsicVal {
         intr: IntrinsicId::Logits,
+        lane: 0,
         shape: Shape::matrix(ROWS, VOCAB),
         dtype: Dtype::F32,
     });
@@ -335,6 +349,7 @@ fn sampler(vocab: u32) -> (TraceContainer, Vec<u32>, [u32; 5]) {
     let (c_words, words) = p.input(Shape::vector(vocab.div_ceil(32)), Dtype::U32);
     let raw = p.op(Op::IntrinsicVal {
         intr: IntrinsicId::Logits,
+        lane: 0,
         shape: Shape::matrix(1, vocab),
         dtype: Dtype::F32,
     });
@@ -507,6 +522,7 @@ fn rowwise(rows: u32, vocab: u32) -> (TraceContainer, Vec<u32>) {
     let (_, floor) = p.input(Shape::vector(rows), Dtype::F32);
     let logits = p.op(Op::IntrinsicVal {
         intr: IntrinsicId::Logits,
+        lane: 0,
         shape: grid,
         dtype: Dtype::F32,
     });
@@ -1211,6 +1227,7 @@ fn carrying(vocab: u32) -> (TraceContainer, u32) {
     let counts = p.op(Op::ChanTake(counts_chan));
     let raw = p.op(Op::IntrinsicVal {
         intr: IntrinsicId::Logits,
+        lane: 0,
         shape: Shape::matrix(1, vocab),
         dtype: Dtype::F32,
     });

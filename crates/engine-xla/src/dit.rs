@@ -17,7 +17,7 @@ use poem_ir::{ClassSet, Def, Dtype, Operands, RuntimeInput, Trace, Ty, ValueId};
 
 use crate::error::{Fault, Result};
 use crate::inputs::Inputs;
-use crate::run::{DitBindings, InputBinding, PackingBindings};
+use crate::run::{DitBindings, GroupMask, InputBinding, PackingBindings};
 use crate::trace::Handles;
 
 /// The seams a denoiser or a decoder exports instead of logits.
@@ -113,7 +113,9 @@ pub struct Feed<'a> {
     pub group: Option<u32>,
     pub inputs: &'a [InputCell<'a>],
     pub clips: Option<Clips<'a>>,
-    pub attn_classes: Option<&'a engine::fire::AttnClasses>,
+    /// A kv-less lane's stated mask: per row, over its attention group's
+    /// rows.
+    pub mask: Option<&'a engine::fire::Masking>,
 }
 
 /// A merge whose arm is a guest input: the input's rows land in the merge's
@@ -434,7 +436,6 @@ impl Dit {
         handles: &Handles,
     ) -> Result<Staged> {
         let mut staged = Staged::default();
-        let class_table = self.class_table_of(composition.lanes(), feeds)?;
         if self.is_empty() && composition.voxel_rows() == 0 {
             return Ok(staged);
         }
@@ -606,22 +607,10 @@ impl Dit {
             let mut groups = poem_exec::fire::group_of_lane(lanes, &facts);
             groups.resize(lane_count as usize, -1);
             staged.bindings.group_of_lane = Some(inputs.i32s(handles, &groups, 1));
-            let lane_classes: Vec<Option<&[i32]>> = feeds
-                .iter()
-                .map(|feed| feed.attn_classes.map(|stated| stated.classes.as_slice()))
-                .collect();
-            if let Some(stated) = class_table {
-                let count = stated.count;
-                staged.bindings.class_table = Some((
-                    inputs.raw(handles, Dtype::U8, count, count, stated.table.clone()),
-                    count,
-                ));
-                key.push_str(&format!("ct{count};"));
-            }
+            let mut packings = Vec::with_capacity(self.feeds.selections.len());
             for &select in &self.feeds.selections {
-                let packed =
-                    poem_exec::fire::pack_with_classes(select, lanes, &groups, rows, &lane_classes)
-                        .map_err(poem_exec::Error::Fire)?;
+                let packed = poem_exec::fire::pack(select, lanes, &groups, rows)
+                    .map_err(poem_exec::Error::Fire)?;
                 let lane_table = |table: &[i32]| -> Vec<i32> {
                     let mut out = table.to_vec();
                     let last = table.last().copied().unwrap_or(0);
@@ -637,88 +626,109 @@ impl Dit {
                     group_indptr: inputs.i32s(handles, &lane_table(&packed.group_indptr), 1),
                     lane_indptr: inputs.i32s(handles, &lane_table(&packed.lane_indptr), 1),
                     permutation: inputs.i32s(handles, &row_table(&packed.permutation), 1),
-                    attn_class: inputs.i32s(handles, &row_table(&packed.attn_class), 1),
                 };
                 staged.bindings.packings.push((select, bindings));
+                packings.push(packed);
             }
             key.push_str(&format!("pk{};", self.feeds.selections.len()));
+            for (q, kv, mask) in self.group_masks_of(lanes, &groups, &packings, feeds)? {
+                let len = u32::try_from(mask.bits.len().max(1)).unwrap_or(u32::MAX);
+                let mut bits = mask.bits;
+                bits.resize(len as usize, 0);
+                key.push_str(&format!("gm{len};"));
+                staged.bindings.group_masks.push(GroupMask {
+                    q,
+                    kv,
+                    bits: inputs.raw(handles, Dtype::U8, len, 1, bits),
+                    indptr: inputs.i32s(handles, &mask.indptr, 1),
+                });
+            }
+        } else if feeds.iter().any(|feed| feed.mask.is_some()) {
+            return Err(Fault::Program {
+                at: "serve::mask",
+                why: "a kv-less lane states an attention mask and this model packs no \
+                      attention group; the mask applies to group-packed `attention.ragged` \
+                      only"
+                    .to_string(),
+            });
         }
 
         staged.key = key;
         Ok(staged)
     }
 
-    /// The one attention class table a fire's lanes state, checked
-    /// (engine-cuda `serve/prepare.rs::class_table_of`).
-    fn class_table_of<'a>(
+    /// The custom mask each group-packed attention of the fire applies, out
+    /// of the kv-less lanes' stated masks (engine-cuda
+    /// `serve/prepare.rs::group_masks_of`): none when no lane states one.
+    fn group_masks_of(
         &self,
-        rows: &[LaneRow],
-        feeds: &[Feed<'a>],
-    ) -> Result<Option<&'a engine::fire::AttnClasses>> {
-        let classes = |why: String| Fault::Program {
-            at: "serve::classes",
-            why,
-        };
-        let mut table: Option<&'a engine::fire::AttnClasses> = None;
-        for (source, feed) in feeds.iter().enumerate() {
-            let Some(stated) = feed.attn_classes else {
+        lanes: &[LaneRow],
+        group_of_lane: &[i32],
+        packings: &[poem_exec::fire::Packed],
+        feeds: &[Feed<'_>],
+    ) -> Result<
+        Vec<(
+            poem_ir::Selection,
+            poem_ir::Selection,
+            poem_exec::fire::GroupMask,
+        )>,
+    > {
+        let stated: Vec<Option<poem_exec::fire::LaneMask>> = feeds
+            .iter()
+            .map(|feed| {
+                feed.mask.map(|masking| poem_exec::fire::LaneMask {
+                    rows: masking
+                        .masks()
+                        .iter()
+                        .map(|mask| mask.admitted(0..mask.total).collect())
+                        .collect(),
+                })
+            })
+            .collect();
+        if stated.iter().all(Option::is_none) {
+            return Ok(Vec::new());
+        }
+        let patch = self.voxel.as_ref().and_then(|seat| seat.token_patch);
+        let mut guests = vec![poem_exec::fire::GuestRows::default(); feeds.len()];
+        for row in lanes {
+            let Some(guest) = guests.get_mut(row.source as usize) else {
                 continue;
             };
-            if self.feeds.selections.is_empty() {
-                return Err(classes(
-                    "a lane states attention classes and this model packs no attention \
-                     group; the mask applies to group-packed `attention.ragged` only"
-                        .to_string(),
-                ));
-            }
-            let owned = rows
+            let clips = feeds
+                .get(row.source as usize)
+                .and_then(|feed| feed.clips)
+                .map(|clips| clips.clips);
+            *guest =
+                poem_exec::fire::guest_rows(row, clips, patch).map_err(poem_exec::Error::Fire)?;
+        }
+        let masks: Vec<Option<&poem_exec::fire::LaneMask>> =
+            stated.iter().map(Option::as_ref).collect();
+        let packed = |select: poem_ir::Selection| {
+            packings
                 .iter()
-                .find(|r| r.source as usize == source)
-                .map_or(0, |r| r.rows);
-            if stated.classes.len() as u32 != owned {
-                return Err(classes(format!(
-                    "a lane states {} attention classes and carries {owned} rows; one \
-                     class per row",
-                    stated.classes.len()
-                )));
-            }
-            if stated.count == 0 || stated.count > engine::fire::ATTN_CLASSES_MAX {
-                return Err(classes(format!(
-                    "a lane states {} attention classes; the table holds 1..={}",
-                    stated.count,
-                    engine::fire::ATTN_CLASSES_MAX
-                )));
-            }
-            if stated.table.len() as u64 != u64::from(stated.count) * u64::from(stated.count) {
-                return Err(classes(format!(
-                    "a lane's class table is {} bytes for {} classes; it is count x count",
-                    stated.table.len(),
-                    stated.count
-                )));
-            }
-            if let Some(bad) = stated
-                .classes
-                .iter()
-                .find(|c| **c >= 0 && **c as u32 >= stated.count)
+                .find(|packed| packed.select == select)
+                .ok_or_else(|| {
+                    program(format!(
+                        "no packing of selection {select:?} was staged for this fire"
+                    ))
+                })
+        };
+        let mut staged = Vec::new();
+        for &(q, kv) in &self.feeds.ragged {
+            if let Some(mask) = poem_exec::fire::group_mask(
+                lanes,
+                group_of_lane,
+                packed(q)?,
+                packed(kv)?,
+                &masks,
+                &guests,
+            )
+            .map_err(poem_exec::Error::Fire)?
             {
-                return Err(classes(format!(
-                    "a lane's row names attention class {bad} and the table holds {}",
-                    stated.count
-                )));
-            }
-            match table {
-                None => table = Some(stated),
-                Some(have) if have.count == stated.count && have.table == stated.table => {}
-                Some(_) => {
-                    return Err(classes(
-                        "two lanes of one fire state different attention class tables; a \
-                         fire reads one"
-                            .to_string(),
-                    ));
-                }
+                staged.push((q, kv, mask));
             }
         }
-        Ok(table)
+        Ok(staged)
     }
 
     /// The clip tables (engine-cuda `voxels::Tables::of`).

@@ -112,6 +112,7 @@ fn epilogue(rows: u32, width: u32) -> TraceContainer {
                 Op::ChanTake(0),
                 Op::IntrinsicVal {
                     intr: IntrinsicId::Hidden,
+                    lane: 0,
                     shape: Shape::matrix(rows, width),
                     dtype: EtaDtype::F32,
                 },

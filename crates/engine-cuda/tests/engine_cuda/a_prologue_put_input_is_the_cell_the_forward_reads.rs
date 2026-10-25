@@ -89,6 +89,7 @@ fn the_forward_reads_the_latent_its_prologue_put() {
             vec![rig.dit_lane(0, ROWS, latent_cell, timestep, position_cell)],
             vec![Attachment {
                 lane: 0,
+                lanes: 1,
                 instance: noised,
                 at: Boundary::Prologue,
             }],

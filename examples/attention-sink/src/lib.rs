@@ -139,13 +139,8 @@ async fn main(input: Input) -> Result<Output> {
 
     let prefill = ForwardPass::new();
     prefill.embed(&tokens, &embed_indptr)?;
-    prefill.state(
-        &[&ws],
-        StateGeometry {
-            mask: Some(&causal),
-            ..StateGeometry::folding()
-        },
-    )?;
+    prefill.mask(&causal)?;
+    prefill.state(&[&ws], StateGeometry::folding())?;
     prefill.epilogue(move || {
         first_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
     });
@@ -173,13 +168,8 @@ async fn main(input: Input) -> Result<Output> {
     let decode = ForwardPass::new();
     let decode_indptr = Channel::from([0u32, 1]).named("decode_indptr");
     decode.embed(&token_in, &decode_indptr)?;
-    decode.state(
-        &[&ws],
-        StateGeometry {
-            mask: Some(&mask),
-            ..StateGeometry::folding()
-        },
-    )?;
+    decode.mask(&mask)?;
+    decode.state(&[&ws], StateGeometry::folding())?;
     decode.epilogue(move || {
         let base = fill.take();
         let token = reshape(reduce_argmax(intrinsics::logits()), [1]);

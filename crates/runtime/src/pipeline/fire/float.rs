@@ -2,9 +2,9 @@ use wasmtime::component::Resource;
 
 use super::context::FireContext;
 use super::{
-    FireWs, PendingFire, PendingOp, Switched, TicketReservation, advance_shadow, hook_program_of,
-    open_pipeline, record_submit_failure, seat_lane_slots, settle_and_wait_resident,
-    stamp_lane_facts, stamp_lane_words,
+    FireWs, PendingFire, PendingOp, Switched, TicketReservation, advance_shadow, every_lane,
+    hook_program_of, open_pipeline, record_submit_failure, seat_lane_slots,
+    settle_and_wait_resident, stamp_lane_facts, stamp_lane_words,
 };
 use crate::pipeline::Pipeline;
 use crate::pipeline::instance::ForwardPass;
@@ -24,7 +24,7 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
             Err(error) => return Ok(Err(error)),
         };
 
-    let (rows, clips, embed_ids, ws_rep, cells, accesses, instance_id, scheduler, fwd_rep) = {
+    let (float, embed_ids, ws_rep, cells, accesses, instance_id, scheduler, fwd_rep) = {
         let pass = ctx.resources().get(&fwd)?;
         if let Some(error) = &pass.failed {
             return Ok(Err(format!(
@@ -41,22 +41,35 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
                 "pipeline: a float lane binds no recurrent state".to_string()
             ));
         }
+        let port_words = |port: eta_ir::registry::Port| {
+            let container = &pass.instance.program.bound.container;
+            let values = pass.instance.channel_values();
+            container
+                .ports
+                .iter()
+                .find(|binding| binding.port == port)
+                .and_then(|binding| match &binding.source {
+                    eta_ir::container::PortSource::Const { data, .. } => Some(data.clone()),
+                    eta_ir::container::PortSource::Channel(chan) => {
+                        values.get(*chan as usize).cloned().flatten()
+                    }
+                })
+                .map(|bytes| {
+                    bytes
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|word| u32::from_le_bytes(*word))
+                        .collect::<Vec<u32>>()
+                })
+        };
         (
-            float.rows,
-            float.clips.clone(),
+            float.clone(),
             float.embed.then(|| {
-                let container = &pass.instance.program.bound.container;
-                let values = pass.instance.channel_values();
-                container
-                    .ports
-                    .iter()
-                    .find(|binding| binding.port == eta_ir::registry::Port::EmbedTokens)
-                    .and_then(|binding| match &binding.source {
-                        eta_ir::container::PortSource::Const { data, .. } => Some(data.clone()),
-                        eta_ir::container::PortSource::Channel(chan) => {
-                            values.get(*chan as usize).cloned().flatten()
-                        }
-                    })
+                (
+                    port_words(eta_ir::registry::Port::EmbedTokens),
+                    port_words(eta_ir::registry::Port::EmbedIndptr),
+                )
             }),
             pass.kv_lanes[0],
             pass.cells.clone(),
@@ -89,49 +102,117 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         }
     };
 
-    let tokens: Vec<u32> = match embed_ids {
-        Some(Some(bytes)) => bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|word| u32::from_le_bytes(*word))
-            .collect(),
-        Some(None) => {
+    // Each lane's rows: its embedded tokens split by the indptr, or as many
+    // placeholder rows as its row inputs carry.
+    let lane_tokens: Vec<Vec<u32>> = match embed_ids {
+        Some((Some(tokens), Some(indptr))) => {
+            let lanes = float.lanes.len();
+            let bounds_ok = indptr.len() == lanes + 1
+                && indptr.first() == Some(&0)
+                && indptr.last().copied() == u32::try_from(tokens.len()).ok()
+                && indptr.windows(2).all(|pair| pair[0] < pair[1]);
+            if !bounds_ok {
+                return Ok(Err(format!(
+                    "pipeline: this pass's {lanes} lane(s) embed {} tokens and its indptr is \
+                     {indptr:?}; one ascending entry a lane past a leading 0, ending at the \
+                     token count",
+                    tokens.len()
+                )));
+            }
+            indptr
+                .windows(2)
+                .map(|pair| tokens[pair[0] as usize..pair[1] as usize].to_vec())
+                .collect()
+        }
+        Some(_) => {
             return Ok(Err(
-                "pipeline: this lane embeds tokens and its `embed_tokens` port binds a \
-                 channel with no host-known value; a cacheless encoder's ids are a seeded \
-                 channel's"
+                "pipeline: this pass's lanes embed tokens and its `embed` ports bind a channel \
+                 with no host-known value; a cacheless encoder's ids and indptr are seeded \
+                 channels'"
                     .to_string(),
             ));
         }
-        None => vec![0; rows as usize],
+        None => float
+            .lanes
+            .iter()
+            .map(|lane| vec![0; lane.rows as usize])
+            .collect(),
     };
-    if tokens.len() != rows as usize {
-        return Ok(Err(format!(
-            "pipeline: this lane was bound for {rows} row(s) and its token channel holds {}",
-            tokens.len()
-        )));
-    }
 
     let mut req = crate::engine::FireRequest {
         boundary_program: true,
-        lanes: vec![::engine::Lane {
-            tokens,
-            readout: ::engine::Readout::Rows((0..rows).collect()),
-            kv_less: true,
-            ..::engine::Lane::default()
-        }],
-        voxels: if clips.is_empty() {
-            Vec::new()
-        } else {
-            vec![::engine::fire::StepVoxels {
-                lane: 0,
-                clips,
+        lanes: lane_tokens
+            .into_iter()
+            .map(|tokens| {
+                let rows = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+                ::engine::Lane {
+                    tokens,
+                    readout: ::engine::Readout::Rows((0..rows).collect()),
+                    kv_less: true,
+                    ..::engine::Lane::default()
+                }
+            })
+            .collect(),
+        voxels: float
+            .lanes
+            .iter()
+            .enumerate()
+            .filter(|(_, lane)| !lane.clips.is_empty())
+            .map(|(lane, float)| ::engine::fire::StepVoxels {
+                lane: lane as u32,
+                clips: float.clips.clone(),
                 payload: Vec::new(),
-            }]
-        },
+            })
+            .collect(),
         ..crate::engine::FireRequest::default()
     };
+    // A stated mask is each row's over its attention group's rows: a voxel
+    // lane's rows there are its voxels.
+    let guest_indptr: Vec<u32> = std::iter::once(0)
+        .chain(
+            req.lanes
+                .iter()
+                .enumerate()
+                .scan(0u32, |at, (lane, fired)| {
+                    let rows = match float.lanes.get(lane).filter(|lane| !lane.clips.is_empty()) {
+                        Some(voxel) => voxel
+                            .clips
+                            .iter()
+                            .map(|[t, h, w]| t * h * w)
+                            .fold(0u32, u32::saturating_add),
+                        None => fired.rows(),
+                    };
+                    *at = at.saturating_add(rows);
+                    Some(*at)
+                }),
+        )
+        .collect();
+    let masks = {
+        let pass = ctx.resources().get(&fwd)?;
+        let bound = &pass.instance.program.bound;
+        let (shadow, shadow_cells) = (&pass.host_shadow, &pass.cells);
+        let mut known = |chan: u32| shadow.fire_value(bound, shadow_cells, chan);
+        super::geometry::evaluate_attn_mask(bound, &mut known, &guest_indptr)
+    };
+    match masks {
+        Ok(super::geometry::FireAttnMask::Omitted) => {}
+        Ok(super::geometry::FireAttnMask::Host { masks, mask_indptr }) => {
+            for (lane, fired) in req.lanes.iter_mut().enumerate() {
+                let rows = &masks[mask_indptr[lane] as usize..mask_indptr[lane + 1] as usize];
+                fired.mask = Some(::engine::Masking::Rows(rows.to_vec()));
+            }
+            req.has_user_mask = true;
+        }
+        Ok(super::geometry::FireAttnMask::Device) => {
+            return Ok(Err(
+                "pipeline: this pass's lanes read no kv and its mask is computed on the \
+                 device; a mask over attention groups is host-known (a seeded or host-set \
+                 channel)"
+                    .to_string(),
+            ));
+        }
+        Err(error) => return Ok(Err(format!("pipeline: fire attention mask: {error}"))),
+    }
     stamp_lane_facts(ctx, &fwd, &mut req)?;
     let switched = {
         let pass = ctx.resources().get(&fwd)?;
@@ -142,7 +223,8 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         Switched::of(pass)
     };
     req.single_token_mode = false;
-    stamp_lane_words(&mut req, &switched, false, false, None);
+    let lanes_of = every_lane(&req);
+    stamp_lane_words(&mut req, &switched, &lanes_of, false, None);
     let groups = vec![(ws.id, (0..req.lanes.len()).collect())];
     if let Err(refusal) = seat_lane_slots(&mut req, &stores, &groups).await {
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);

@@ -27,14 +27,9 @@ patchify is a reshape.
 
 THE GUEST'S SHAPE
 -----------------
-One step is three passes (caption, image, context) in one attention group,
-each on ITS OWN pipeline: the scheduler seals a frame from every live
-pipeline and never seats two passes of one pipeline in one step, so three
-passes down one pipeline would be three fires, each lane attending alone.
-The runtime holds a fresh group's first frame for its cohort (`FireRequest::
-cohort`), so the three seal together from the first step -- and keeps holding
-it: a stated cohort is sealed whole or the request dies by name, never as a
-fire over whichever lanes were quick enough.
+One step is ONE pass of three lanes (caption, context, image) in one
+attention group: one logical computation is one pass, so its lanes always
+fire together.
 
 BISECTION
 ---------
@@ -391,10 +386,9 @@ def sweep(args) -> int:
 def guidance(args) -> int:
     """CLASSIFIER-FREE GUIDANCE, ON THE DEVICE — does it run, and is it right?
 
-    Six lanes, two attention groups, one fire: group 0 holds the case's
-    context, group 1 a zeroed one, and group 0's image lane names group 1 as
-    its peer, so its epilogue holds BOTH branches' velocities and combines
-    them. That combine is what every guest did on the host until now.
+    Six lanes of one pass, two attention groups: group 0 holds the case's
+    context, group 1 a zeroed one, and the pass's epilogue reads both image
+    lanes' velocities and combines them. That combine is what every guest did on the host until now.
 
     Checked with three claims, all WITHIN one fire's own answers and needing
     no golden. Same-fire matters: a six-lane fire and a three-lane one give
@@ -406,8 +400,8 @@ def guidance(args) -> int:
 
       s = 0  ->  the combine IS the unconditional branch, exactly. That
                  branch publishes its own velocity from the SAME fire, so
-                 this is bit-for-bit. It is the claim that proves the peer
-                 bind pointed at the OTHER group and not at its own rows —
+                 this is bit-for-bit. It is the claim that proves
+                 `velocity(lane)` read the OTHER group's lane and not at its own rows —
                  the one failure a plausible-looking picture would hide.
       s = 1 vs 0  ->  the two must differ by a real margin. Without this the
                  other two claims hold trivially: a lane guided by itself
@@ -445,7 +439,7 @@ def guidance(args) -> int:
 
         if np.array_equal(g0, unc):
             print(f"[guidance] batch {at}: PASS s=0 the combine is the unconditional "
-                  f"branch, exactly — the peer is the other group")
+                  f"branch, exactly — velocity(lane) read the other group")
         else:
             off = float(np.linalg.norm(g0 - unc)) / max(float(np.linalg.norm(unc)), 1e-30)
             print(f"[guidance] batch {at}: FAIL s=0 the combine differs from the "

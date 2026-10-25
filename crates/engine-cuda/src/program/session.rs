@@ -33,6 +33,7 @@ pub enum Launched {
 #[derive(Clone, Copy, Debug)]
 struct Intrinsic {
     id: eta_ir::op::IntrinsicId,
+    lane: u32,
     base: u64,
     storage: u32,
     width: u32,
@@ -46,8 +47,9 @@ pub struct Session {
     shapes: Vec<ChannelShape>,
     cursors: Vec<Cursor>,
     extents: Extents,
+    /// By slot ([`eta_ir::op::intrinsic_slot`]): each intrinsic of each lane
+    /// of the pass a binding names.
     intrinsics: Vec<Option<Intrinsic>>,
-    bound: u64,
     poisoned: bool,
     fires: u64,
     /// A commit slot (two words the device writes) for each fire airborne
@@ -106,7 +108,6 @@ impl Session {
             cursors,
             extents,
             intrinsics: vec![None; super::launch::INTRINSIC_SLOTS],
-            bound: 0,
             poisoned: false,
             fires: 0,
             commits: Vec::new(),
@@ -356,16 +357,18 @@ impl Session {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn bind_intrinsic(
         &mut self,
         intrinsic: eta_ir::op::IntrinsicId,
+        lane: u32,
         base: u64,
         storage: u32,
         width: u32,
         row_stride: u32,
         row_offset: u32,
     ) -> Result<()> {
-        let slot = intrinsic as usize;
+        let slot = eta_ir::op::intrinsic_slot(intrinsic, lane) as usize;
         let seat = self.intrinsics.get_mut(slot).ok_or_else(|| {
             Fault::program(
                 "program::session",
@@ -374,14 +377,20 @@ impl Session {
         })?;
         *seat = Some(Intrinsic {
             id: intrinsic,
+            lane,
             base,
             storage,
             width,
             row_stride,
             row_offset,
         });
-        self.bound |= 1u64 << (intrinsic as u32);
         Ok(())
+    }
+
+    fn bound(&self, intrinsic: eta_ir::op::IntrinsicId, lane: u32) -> bool {
+        self.intrinsics
+            .get(eta_ir::op::intrinsic_slot(intrinsic, lane) as usize)
+            .is_some_and(Option::is_some)
     }
 
     #[must_use]
@@ -402,36 +411,40 @@ impl Session {
         }
         stages_and_plans_agree(compiled)?;
 
-        for (intrinsic, name, why) in [
-            (
-                eta_ir::op::IntrinsicId::Logits,
-                "logits",
-                "the emitted kernel dereferences the side table's zero, which is address zero",
-            ),
-            (
-                eta_ir::op::IntrinsicId::Velocity,
-                "velocity",
-                "the lane's reading plants no `velocity` export",
-            ),
-            (
-                eta_ir::op::IntrinsicId::Hidden,
-                "hidden",
-                "the lane's reading plants no `hidden` export",
-            ),
-        ] {
-            if plan.reads_intrinsic(intrinsic) && self.bound & (1u64 << (intrinsic as u32)) == 0 {
+        if plan.reads_intrinsic(eta_ir::op::IntrinsicId::Logits)
+            && !self.bound(eta_ir::op::IntrinsicId::Logits, 0)
+        {
+            return Err(Fault::program(
+                "program::session",
+                "this program reads the `logits` intrinsic and no buffer has been bound to \
+                 it; the emitted kernel dereferences the side table's zero, which is address \
+                 zero",
+            ));
+        }
+        for value in &plan.package.values {
+            let (Some(intrinsic), lane) = (value.intrinsic, value.lane) else {
+                continue;
+            };
+            let why = match intrinsic {
+                eta_ir::op::IntrinsicId::Velocity => "its reading plants no `velocity` export",
+                eta_ir::op::IntrinsicId::Hidden => "its reading plants no `hidden` export",
+                eta_ir::op::IntrinsicId::Pixels => {
+                    "its reading plants no `pixels` seam, or the fire submitted no clip"
+                }
+                _ => continue,
+            };
+            if !self.bound(intrinsic, lane) {
                 return Err(Fault::program(
                     "program::session",
                     format!(
-                        "this program reads the `{name}` intrinsic and no buffer has been bound \
-                         to it; {why}"
+                        "this program reads the `{}` intrinsic of its pass's lane {lane} and no \
+                         buffer has been bound to it: the pass has no such lane, or {why}",
+                        intrinsic.name()
                     ),
                 ));
             }
         }
-        if plan.needs_mtp_logits
-            && self.bound & (1u64 << (eta_ir::op::IntrinsicId::MtpLogits as u32)) == 0
-        {
+        if plan.needs_mtp_logits && !self.bound(eta_ir::op::IntrinsicId::MtpLogits, 0) {
             return Err(Fault::program(
                 "program::session",
                 "this program reads the `mtp_logits` intrinsic and no buffer has \
@@ -440,9 +453,7 @@ impl Session {
             ));
         }
 
-        if plan.needs_mtp_drafts
-            && self.bound & (1u64 << (eta_ir::op::IntrinsicId::MtpDrafts as u32)) == 0
-        {
+        if plan.needs_mtp_drafts && !self.bound(eta_ir::op::IntrinsicId::MtpDrafts, 0) {
             return Err(Fault::program(
                 "program::session",
                 "this program reads the `mtp_drafts` intrinsic and no buffer has \
@@ -451,42 +462,12 @@ impl Session {
             ));
         }
 
-        if plan.needs_attn_scores
-            && self.bound & (1u64 << (eta_ir::op::IntrinsicId::AttnScore as u32)) == 0
-        {
+        if plan.needs_attn_scores && !self.bound(eta_ir::op::IntrinsicId::AttnScore, 0) {
             return Err(Fault::program(
                 "program::session",
                 "this program reads the `attn_score` intrinsic and no buffer has been \
                  bound to it; a lane that did not ask to capture its attention has no \
                  block of the observability slab for it to point at",
-            ));
-        }
-
-        if self.bound & (1u64 << (eta_ir::op::IntrinsicId::Pixels as u32)) == 0
-            && plan
-                .package
-                .values
-                .iter()
-                .any(|value| value.intrinsic == Some(eta_ir::op::IntrinsicId::Pixels))
-        {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the `pixels` intrinsic and no buffer has been                  bound to it; a lane whose reading plants no `pixels` seam — or a                  fire that submitted no clip — has no pixel plane for it to point at",
-            ));
-        }
-
-        if self.bound & (1u64 << (eta_ir::op::IntrinsicId::PeerVelocity as u32)) == 0
-            && plan
-                .package
-                .values
-                .iter()
-                .any(|value| value.intrinsic == Some(eta_ir::op::IntrinsicId::PeerVelocity))
-        {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the `peer_velocity` intrinsic and no buffer has \
-                 been bound to it; the pass named no peer group (`forward-pass.peer`), \
-                 so there is no second denoising in this fire to guide with",
             ));
         }
 
@@ -517,7 +498,7 @@ impl Session {
             for intrinsic in self.intrinsics.iter().flatten() {
                 prepared.bind_intrinsic(
                     lane,
-                    intrinsic.id,
+                    eta_ir::op::intrinsic_slot(intrinsic.id, intrinsic.lane),
                     intrinsic.base,
                     intrinsic.storage,
                     intrinsic.width,

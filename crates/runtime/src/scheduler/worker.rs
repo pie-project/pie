@@ -1551,14 +1551,6 @@ impl BatchScheduler {
                         ));
                     }
                     if let Some(stamp) = launch.frame {
-                        let cohort = launch
-                            .request
-                            .lanes
-                            .first()
-                            .and_then(|lane| {
-                                crate::pipeline::instance::cohort_key(lane.group, lane.peer)
-                            })
-                            .zip(launch.request.cohort);
                         frame_policy.on_fire_reading(
                             stamp,
                             launch.process_id,
@@ -1566,7 +1558,6 @@ impl BatchScheduler {
                             launch.request.tokens(),
                             launch.wire_row_count(),
                             launch.request.readouts(),
-                            cohort,
                         );
                     }
                     Self::queue_attempt(pending, launch);

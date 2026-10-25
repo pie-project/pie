@@ -7,21 +7,23 @@
 //! `scripts/imagegen/flux2_parity.py` turns into an `.npz` under the
 //! golden's own key names.
 //!
-//! # THREE LANES, ONE GROUP, ONE FIRE
+//! # THREE LANES, ONE GROUP, ONE PASS
 //!
 //! `flux_2`'s `denoise` reading runs on three values of its `stream` switch
 //! (D2): the text lane (`text`, the `context` input), the target lane
 //! (`image`, the `latents` input) and the reference lane (`reference`, the
 //! same `latents` input — a reference is more of the same tokens, at rotary
-//! `T = 10·(i+1)`). One step is three passes, each stating its stream and
+//! `T = 10·(i+1)`). One step is one pass of three lanes — lane 0 the text,
+//! lane 1 the target, lane 2 the references — each stating its stream and
 //! all in one group, which packs them `[txt ‖ target ‖ refs]` — the
 //! reference's own layout. Every lane binds the timestep (and the guidance
 //! scale: the miniature has `guidance_embeds`), because the shared
-//! modulation is per lane. Neither `state` nor `embed` is called: a
-//! denoise reading declares no kv space and no tokens.
+//! modulation is per lane; the lanes read one channel of each. Neither
+//! `state` nor `embed` is called: a denoise reading declares no kv space
+//! and no tokens.
 //!
 //! Only the target lane reads out: the head runs on `image` rows
-//! alone (`pred[:, :S_img]`), so only it carries an epilogue.
+//! alone (`pred[:, :S_img]`), so the epilogue reads its velocity.
 //!
 //! One step only: the miniature golden is one transformer call at
 //! `timestep = 0.5`, not a trajectory.
@@ -163,45 +165,32 @@ fn dims(reading: &str, references: bool) -> Result<Dims> {
     })
 }
 
-/// The per-lane scalars every lane of the reading binds: one cell PER PASS,
-/// since a seeded channel attaches to one pass only (the runtime's
-/// channel-role rule).
-fn scalars(pass: &ForwardPass, dims: &Dims, case: &Case, tag: &str) -> Result<()> {
-    let t = Channel::from([case.timestep]).named(&format!("t_{tag}"));
-    pass.input("timestep", &t)?;
-    if dims.guidance {
-        let g = Channel::from([case.guidance]).named(&format!("g_{tag}"));
-        pass.input("guidance", &g)?;
+/// The scalars every lane of the reading binds, on lane `lane`: the one
+/// timestep (and guidance) channel of the pass.
+fn scalars(pass: &ForwardPass, lane: u32, t: &Channel, g: Option<&Channel>) -> Result<()> {
+    pass.input(lane, "timestep", t)?;
+    if let Some(g) = g {
+        pass.input(lane, "guidance", g)?;
     }
     Ok(())
 }
 
-/// One denoise step: three lanes, one group, one fire, one velocity.
-/// One pipeline per lane of the group (see [`step`]).
-struct Pipes {
-    text: Pipeline,
-    reference: Pipeline,
-    image: Pipeline,
-}
-
-/// ONE PIPELINE PER LANE. A pipeline is serial — the scheduler never seats
-/// two of its passes in one step — so three passes down one pipeline are
-/// three fires of one lane each, the attention group never forms, and the
-/// image lane denoises with no caption and no reference. That reads as a
-/// plausible answer: on a miniature whose random-init caption is small, it
-/// even passed this file's own tolerance, which is how it went unnoticed
-/// until the frame gate began refusing a group that could not compose.
-async fn step(case: &Case, dims: &Dims, reading: &str, pipes: &Pipes) -> Result<Vec<f32>> {
+/// One denoise step: three lanes, one group, one pass, one velocity.
+async fn step(case: &Case, dims: &Dims, reading: &str, pipe: &Pipeline) -> Result<Vec<f32>> {
     let group = 0;
     let rows = case.image_rows;
     let width = case.channels;
+    let pass = ForwardPass::new();
+    let t = Channel::from([case.timestep]).named("t");
+    let g = dims
+        .guidance
+        .then(|| Channel::from([case.guidance]).named("g"));
 
-    // The text lane: the raw `[L, joint_attention_dim]` stack, embedded by
-    // the plan (the miniature has no encoder).
-    let text = ForwardPass::new();
-    text.switch("reading", reading)?;
-    text.switch("stream", "text")?;
-    text.group(group)?;
+    // Lane 0, the text lane: the raw `[L, joint_attention_dim]` stack,
+    // embedded by the plan (the miniature has no encoder).
+    pass.switch(0, "reading", reading)?;
+    pass.switch(0, "stream", "text")?;
+    pass.group(0, group)?;
     let ctx = Channel::from_shaped(
         [case.text_rows, case.context_width],
         case.context.as_slice(),
@@ -209,17 +198,28 @@ async fn step(case: &Case, dims: &Dims, reading: &str, pipes: &Pipes) -> Result<
     .named("context");
     let txt_pos = Channel::from_shaped([case.text_rows, dims.axes], case.text_positions.as_slice())
         .named("txt_pos");
-    text.input("context", &ctx)?;
-    text.input("positions", &txt_pos)?;
-    scalars(&text, dims, case, "txt")?;
+    pass.input(0, "context", &ctx)?;
+    pass.input(0, "positions", &txt_pos)?;
+    scalars(&pass, 0, &t, g.as_ref())?;
 
-    // The reference lane: every reference's tokens concatenated, at their
-    // own `T` offsets. Same input, same weights as the target; no readout.
-    let reference = (case.reference_rows > 0).then(|| ForwardPass::new());
-    if let Some(reference) = &reference {
-        reference.switch("reading", reading)?;
-        reference.switch("stream", "reference")?;
-        reference.group(group)?;
+    // Lane 1, the target lane: the latents in, the velocity out.
+    pass.switch(1, "reading", reading)?;
+    pass.switch(1, "stream", "image")?;
+    pass.group(1, group)?;
+    let x = Channel::from_shaped([rows, width], case.latents.as_slice()).named("latents");
+    let img_pos =
+        Channel::from_shaped([rows, dims.axes], case.image_positions.as_slice()).named("img_pos");
+    pass.input(1, "latents", &x)?;
+    pass.input(1, "positions", &img_pos)?;
+    scalars(&pass, 1, &t, g.as_ref())?;
+
+    // Lane 2, the reference lane: every reference's tokens concatenated, at
+    // their own `T` offsets. Same input, same weights as the target; no
+    // readout.
+    if case.reference_rows > 0 {
+        pass.switch(2, "reading", reading)?;
+        pass.switch(2, "stream", "reference")?;
+        pass.group(2, group)?;
         let r = Channel::from_shaped([case.reference_rows, width], case.reference.as_slice())
             .named("reference");
         let ref_pos = Channel::from_shaped(
@@ -227,36 +227,18 @@ async fn step(case: &Case, dims: &Dims, reading: &str, pipes: &Pipes) -> Result<
             case.reference_positions.as_slice(),
         )
         .named("ref_pos");
-        reference.input("latents", &r)?;
-        reference.input("positions", &ref_pos)?;
-        scalars(reference, dims, case, "ref")?;
+        pass.input(2, "latents", &r)?;
+        pass.input(2, "positions", &ref_pos)?;
+        scalars(&pass, 2, &t, g.as_ref())?;
     }
 
-    // The target lane: the latents in, the velocity out.
     let out = Channel::new([rows, width], dtype::f32).named("velocity");
-    let image = ForwardPass::new();
-    image.switch("reading", reading)?;
-    image.switch("stream", "image")?;
-    image.group(group)?;
-    let x = Channel::from_shaped([rows, width], case.latents.as_slice()).named("latents");
-    let img_pos =
-        Channel::from_shaped([rows, dims.axes], case.image_positions.as_slice()).named("img_pos");
-    image.input("latents", &x)?;
-    image.input("positions", &img_pos)?;
-    scalars(&image, dims, case, "img")?;
     let velocity_width = dims.velocity_width;
     let readback = out.clone();
-    image.epilogue(move || {
-        readback.put(intrinsics::velocity(velocity_width));
+    pass.epilogue(move || {
+        readback.put(intrinsics::velocity(1, rows, velocity_width));
     });
-
-    text.submit(&pipes.text).context("text lane")?;
-    if let Some(reference) = &reference {
-        reference
-            .submit(&pipes.reference)
-            .context("reference lane")?;
-    }
-    image.submit(&pipes.image).context("image lane")?;
+    pass.submit(pipe).context("the denoise step")?;
     out.take_host::<Vec<f32>>().await.map_err(Into::into)
 }
 
@@ -300,15 +282,9 @@ async fn main(input: Input) -> Result<Output> {
     if !dims.guidance && case.guidance != 0.0 {
         return Err("the case carries a guidance scale and this row reads no `guidance`".into());
     }
-    let pipes = Pipes {
-        text: Pipeline::new(),
-        reference: Pipeline::new(),
-        image: Pipeline::new(),
-    };
-    let velocity = step(&case, &dims, reading, &pipes).await?;
-    pipes.text.close();
-    pipes.reference.close();
-    pipes.image.close();
+    let pipe = Pipeline::new();
+    let velocity = step(&case, &dims, reading, &pipe).await?;
+    pipe.close();
     Ok(Output {
         velocity,
         image_rows: case.image_rows,

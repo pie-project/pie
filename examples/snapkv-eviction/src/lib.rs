@@ -251,11 +251,11 @@ async fn main(input: Input) -> Result<Output> {
 
     let fwd_q = ForwardPass::new();
     fwd_q.embed(&toks_q, &embed_indptr_q)?;
+    fwd_q.mask(&mask_q)?;
     fwd_q.state(
         &[&ws],
         StateGeometry {
             slots: Some(&slots_q),
-            mask: Some(&mask_q),
             ..StateGeometry::folding()
         },
     )?;

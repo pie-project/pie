@@ -111,13 +111,13 @@ async fn main(input: Input) -> Result<String> {
     let pos = Channel::from(vec![0u32; b as usize]).named("pos");
     let fill = Channel::from([1u32]).named("fill");
     let kv_len = Channel::from(vec![1u32; b as usize]).named("kv_len");
+    fwd.mask(&mask)?;
     fwd.state(
         &pool,
         StateGeometry {
             positions: Some(&pos),
             slots: Some(&slots),
             kv_len: Some(&kv_len),
-            mask: Some(&mask),
             fold: Fold::None,
         },
     )

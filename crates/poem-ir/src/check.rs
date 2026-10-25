@@ -6,7 +6,9 @@ use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 
 use crate::ops::Elemwise;
-use crate::{Def, Dim, Dtype, InputAxis, Operands, Operation, RuntimeInput, StructKind, Trace, Ty, ValueId};
+use crate::{
+    Def, Dim, Dtype, InputAxis, Operands, Operation, RuntimeInput, StructKind, Trace, Ty, ValueId,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Site {
@@ -210,7 +212,9 @@ fn guest_input(
     };
     let name = &named.name;
     if !matches!(dtype, Dtype::F32 | Dtype::Bf16 | Dtype::I32) {
-        return Some(format!("declares input `{name}` as {dtype:?}, not f32, bf16 or i32"));
+        return Some(format!(
+            "declares input `{name}` as {dtype:?}, not f32, bf16 or i32"
+        ));
     }
     let want = Ty::Tensor {
         shape: vec![axis.dim(), Dim::Const(u64::from(width))],
@@ -223,8 +227,7 @@ fn guest_input(
         ));
     }
     let again = trace.values.iter().enumerate().any(|(other, decl)| {
-        other != at
-            && matches!(decl.def, Def::Input(RuntimeInput::Guest { id, .. }) if id == input)
+        other != at && matches!(decl.def, Def::Input(RuntimeInput::Guest { id, .. }) if id == input)
     });
     again.then(|| format!("declares input `{name}`, which another value declares too"))
 }

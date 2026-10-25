@@ -339,7 +339,7 @@ OP_TABLE: dict[int, tuple[str, int, tuple[str, ...]]] = {
     tags.CHAN_TAKE: ("chan_take", 1, (CHAN,)),
     tags.CHAN_READ: ("chan_read", 1, (CHAN,)),
     tags.CHAN_PUT: ("chan_put", 0, (CHAN, VALUE)),
-    tags.INTRINSIC_VAL: ("intrinsic_val", 1, (INTRINSIC, DTYPE, SHAPE)),
+    tags.INTRINSIC_VAL: ("intrinsic_val", 1, (INTRINSIC, IMM, DTYPE, SHAPE)),
     tags.KERNEL_CALL: ("kernel_call", 1, (NAME, DTYPE, SHAPE, ARGS)),
     tags.SINK_CALL: ("sink_call", 0, (NAME, ARGS)),
 }
@@ -447,8 +447,10 @@ class Op:
         return Op(tags.CHAN_PUT, [value], chan=chan)
 
     @staticmethod
-    def intrinsic_val(intr: Intrinsic, shape: Shape, dt: Dtype) -> "Op":
-        return Op(tags.INTRINSIC_VAL, intr=int(intr), shape=shape, dtype=int(dt))
+    def intrinsic_val(intr: Intrinsic, shape: Shape, dt: Dtype, lane: int = 0) -> "Op":
+        # `lane` is the pass's lane a per-lane intrinsic reads (`velocity`,
+        # `hidden`, `pixels`), 0 for the others; it rides the op's imm.
+        return Op(tags.INTRINSIC_VAL, intr=int(intr), imms=(lane,), shape=shape, dtype=int(dt))
 
     @staticmethod
     def kernel_call(name: int, args: list[int], shape: Shape, dt: Dtype) -> "Op":

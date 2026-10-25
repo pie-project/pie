@@ -32,10 +32,10 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
     let weights = Weights::random(&common_dit::trace(), 7);
     let mut rig = Rig::load(&weights, 64, vec![16, 32, 64]);
     assert!(
-        rig.profile().has_velocity,
+        rig.reads_out(poem_ir::ReadoutKind::Velocity).is_some(),
         "the plan plants a velocity seam"
     );
-    assert_eq!(rig.profile().velocity_width, WIDTH);
+    assert_eq!(rig.reads_out(poem_ir::ReadoutKind::Velocity), Some(WIDTH));
 
     let mut rng = Lcg::seeded(3);
     let requests = [request(&mut rng, 3, 5), request(&mut rng, 4, 6)];

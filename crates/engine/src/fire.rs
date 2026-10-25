@@ -190,19 +190,6 @@ pub enum Readout {
     None,
 }
 
-/// A structured attention mask over a lane's rows: `classes[row]` in
-/// `0..count`, or -1 for a row that attends and is attended by every row;
-/// `table[q * count + kv] != 0` lets a q-class row attend a kv-class row.
-/// Every lane of one attention group states the same table.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct AttnClasses {
-    pub classes: Vec<i32>,
-    pub table: Vec<u8>,
-    pub count: u32,
-}
-
-pub const ATTN_CLASSES_MAX: u32 = 64;
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lane {
     pub slot: u32,
@@ -228,18 +215,16 @@ pub struct Lane {
     #[serde(default)]
     pub channels: Vec<Ticket>,
     pub readout: Readout,
+    /// The attention group the lane's rows attend inside: unique to its
+    /// pass in a fire, so two passes' lanes never attend each other.
     #[serde(default)]
     pub group: Option<u32>,
-    #[serde(default)]
-    pub peer: Option<u32>,
     /// The guest inputs this lane binds, each read off its channel's
     /// committed cell at every fire.
     #[serde(default)]
     pub inputs: Vec<InputFeed>,
     #[serde(default)]
     pub kv_less: bool,
-    #[serde(default)]
-    pub attn_classes: Option<AttnClasses>,
     /// An engine that cannot report says nothing, and the step is plainly
     /// committed.
     #[serde(default)]
@@ -310,7 +295,10 @@ impl Lane {
                 self.rows()
             )));
         }
+        // A kv-less lane's mask is over its attention group's rows, which
+        // the engine maps its own rows onto.
         if let Some(masking) = &self.mask
+            && !self.kv_less
             && let Some(stated) = masking.stated_rows()
             && stated != self.tokens.len()
         {
@@ -439,7 +427,9 @@ pub enum Boundary {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
+    /// The first of the pass's lanes, `lanes` of them in a row.
     pub lane: u32,
+    pub lanes: u32,
     pub instance: InstanceId,
     pub at: Boundary,
 }

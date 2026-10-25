@@ -303,44 +303,30 @@ impl Run<'_> {
                 mask,
                 o,
             } => {
-                let mask = match mask {
-                    // A lane's attention class table (engine-cuda's ragged
-                    // `ClassTable` arm): each packed row's class, the table.
-                    poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal
-                        if self.class_table().is_some() =>
-                    {
-                        let (table, count) = self.class_table().expect("checked above");
-                        let classes_of = |id: poem_ir::ValueId, what: &str| {
-                            self.packed_classes(id)
-                                .ok_or_else(|| kernels_xla::Error::Backend {
-                                    op: "attn.ragged",
-                                    detail: format!(
-                                        "a lane states attention classes and this attention's \
-                                     {what} rows are not packed by a group selection, so no \
-                                     class table applies to them"
-                                    ),
-                                })
-                        };
-                        attn::ragged::RaggedMask::ClassTable {
-                            q_classes: classes_of(*q_indptr, "query")?,
-                            kv_classes: classes_of(*kv_indptr, "key")?,
-                            table,
-                            count,
-                        }
-                    }
-                    poem_ir::RaggedMask::RelativeBias { .. } if self.class_table().is_some() => {
+                let stated = self.group_mask(*q_indptr, *kv_indptr);
+                let mask = match (mask, stated) {
+                    // A mask a lane states over its group's rows (engine-cuda's
+                    // ragged custom-mask arm).
+                    (
+                        poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal,
+                        Some(stated),
+                    ) => attn::ragged::RaggedMask::Custom {
+                        bits: stated.bits,
+                        indptr: stated.indptr,
+                    },
+                    (poem_ir::RaggedMask::RelativeBias { .. }, Some(_)) => {
                         return Err(kernels_xla::Error::Backend {
                             op: "attn.ragged",
-                            detail: "a lane states attention classes over an attention the \
-                                     model already masks (a relative bias); the two do not \
+                            detail: "a lane states an attention mask over an attention the \
+                                     model already biases (a relative bias); the two do not \
                                      compose"
                                 .to_string(),
                         });
                     }
-                    poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal => {
+                    (poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal, None) => {
                         attn::ragged::RaggedMask::Segments
                     }
-                    poem_ir::RaggedMask::RelativeBias { table, max_len } => {
+                    (poem_ir::RaggedMask::RelativeBias { table, max_len }, None) => {
                         attn::ragged::RaggedMask::RelativeBias {
                             table: self.tensor(*table),
                             max_len: *max_len,

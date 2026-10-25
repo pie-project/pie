@@ -45,12 +45,15 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
     };
     let weights = Weights::random(&two_axis(), 0x5a);
     let mut rig = Rig::load(two_axis(), &weights, 32, vec![16, 32], Some(voxels() + 8));
+    let pixels = rig.readout_widths(poem_ir::ReadoutKind::Pixels);
     assert!(
-        rig.profile().has_pixels,
-        "a plan planting `seam::PIXELS` states the `pixels()` gate"
+        !pixels.is_empty() && pixels.iter().all(|&width| width == C_OUT),
+        "a plan planting `seam::PIXELS` reads pixels out of its decode class"
     );
-    assert_eq!(rig.profile().pixels_width, C_OUT);
-    assert!(rig.profile().has_velocity);
+    assert!(
+        !rig.readout_widths(poem_ir::ReadoutKind::Velocity)
+            .is_empty()
+    );
 
     let program = rig.register(carrier(
         &[Shape::new(&[CLIP[1], CLIP[2], C_IN]).expect("a box")],

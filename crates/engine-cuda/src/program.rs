@@ -341,6 +341,7 @@ impl Plane {
         &mut self,
         id: InstanceId,
         intrinsic: eta_ir::op::IntrinsicId,
+        lane: u32,
         base: u64,
         storage: u32,
         width: u32,
@@ -351,7 +352,9 @@ impl Plane {
             .get_mut(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
             .session
-            .bind_intrinsic(intrinsic, base, storage, width, row_stride, row_offset)
+            .bind_intrinsic(
+                intrinsic, lane, base, storage, width, row_stride, row_offset,
+            )
     }
 
     pub fn needs_mtp_drafts(&self, id: InstanceId) -> Result<bool> {

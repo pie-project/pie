@@ -600,10 +600,10 @@ fn separable_rows(req: &crate::engine::FireRequest) -> bool {
     matches!(req.lanes.as_slice(), [lane] if plain_lane(lane)) && req.voxels.is_empty()
 }
 
-/// No adapter, inputs or attention classes: a lane whose rows are its
-/// tokens' alone (its pass's switches are [`Switched::plain`]).
+/// No adapter or inputs: a lane whose rows are its tokens' alone (its pass's
+/// switches are [`Switched::plain`]).
 fn plain_lane(lane: &::engine::Lane) -> bool {
-    lane.attn_classes.is_none() && lane.adapter.is_none() && lane.inputs.is_empty() && !lane.kv_less
+    lane.adapter.is_none() && lane.inputs.is_empty() && !lane.kv_less
 }
 
 /// The first row the last piece must hold: what the readout names and what a
@@ -741,13 +741,10 @@ fn pass_pieces(
 }
 
 fn separable_lanes(req: &crate::engine::FireRequest) -> bool {
-    req.cohort.is_none()
-        && req.media.is_empty()
+    req.media.is_empty()
         && req.voxels.is_empty()
         && req.lanes.iter().all(|lane| {
-            lane.group.is_none()
-                && lane.peer.is_none()
-                && separable_rows(&crate::engine::FireRequest::one(lane.clone()))
+            lane.group.is_none() && separable_rows(&crate::engine::FireRequest::one(lane.clone()))
         })
 }
 
@@ -1534,27 +1531,32 @@ pub(crate) async fn drain_pipeline_fires<C: FireContext>(
 }
 
 /// What a pass's lanes' words are built from beside what each lane
-/// carries: the guest switches it set and whether its program reads drafts.
+/// carries: the guest switches each lane set and whether its program reads
+/// drafts.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Switched {
-    pub(crate) switches: Vec<(String, String)>,
+    pub(crate) lanes: Vec<Vec<(String, String)>>,
     pub(crate) drafts: bool,
 }
 
 impl Switched {
     pub(crate) fn of(pass: &ForwardPass) -> Switched {
         Switched {
-            switches: pass.lane.switches.clone(),
+            lanes: pass
+                .facts
+                .iter()
+                .map(|lane| lane.switches.clone())
+                .collect(),
             drafts: pass.instance.program.reads_mtp_logits,
         }
     }
 
-    /// No drafts read and every switch at its default: a pass whose rows
-    /// may be cut, keyed and logged by their tokens.
+    /// No drafts read and every lane's every switch at its default: a pass
+    /// whose rows may be cut, keyed and logged by their tokens.
     pub(crate) fn plain(&self) -> bool {
         let facts = crate::model::model().facts();
         !self.drafts
-            && self.switches.iter().all(|(name, value)| {
+            && self.lanes.iter().flatten().all(|(name, value)| {
                 facts
                     .declared(name)
                     .is_some_and(|decl| decl.default_value() == value)
@@ -1562,17 +1564,19 @@ impl Switched {
     }
 }
 
+/// Stamps each lane's word: lane `at` of `req` is the pass's lane `of[at]`.
 /// `device_rows`, when given, are the rows each lane carries on the device:
 /// a pooled pass stages no host tokens, and its words still state its rows,
 /// so a single-token lane takes the decode branch.
 fn stamp_lane_words(
     req: &mut crate::engine::FireRequest,
     switched: &Switched,
+    of: &[usize],
     fire_wide_mask: bool,
-    carries_media: bool,
     device_rows: Option<&[u32]>,
 ) {
     let model = crate::model::model();
+    let media: Vec<u32> = req.media.iter().map(|media| media.lane).collect();
     for (at, lane) in req.lanes.iter_mut().enumerate() {
         let rows = device_rows
             .and_then(|rows| rows.get(at).copied())
@@ -1581,15 +1585,21 @@ fn stamp_lane_words(
             .adapted(lane.adapter.is_some())
             .drafting(switched.drafts)
             .capturing_scores(lane.captures_scores)
-            .with_media(carries_media);
-        let request = switched
-            .switches
-            .iter()
-            .fold(request, |request, (name, value)| {
-                request.switched(name, value)
-            });
+            .with_media(media.contains(&(at as u32)));
+        let switches = of
+            .get(at)
+            .and_then(|&pass_lane| switched.lanes.get(pass_lane))
+            .map_or(&[][..], Vec::as_slice);
+        let request = switches.iter().fold(request, |request, (name, value)| {
+            request.switched(name, value)
+        });
         lane.word = model.word(&request);
     }
+}
+
+/// Every lane of a request, as the pass's lanes in order.
+fn every_lane(req: &crate::engine::FireRequest) -> Vec<usize> {
+    (0..req.lanes.len()).collect()
 }
 
 /// Whether a lane of `req` lands in a class attending both ways: its rows
@@ -2124,13 +2134,32 @@ fn stamp_lane_facts<C: FireContext>(
     fwd: &Resource<ForwardPass>,
     req: &mut crate::engine::FireRequest,
 ) -> Anyhow<()> {
-    let (group, peer) = {
-        let lane = &ctx.resources().get(fwd)?.lane;
-        lane.stamp(req);
-        (lane.group, lane.peer)
-    };
-    req.cohort = crate::pipeline::instance::cohort_of(ctx.resources(), group, peer);
+    let pass = ctx.resources().get(fwd)?;
+    crate::pipeline::instance::LaneFacts::stamp(&pass.facts, req);
     Ok(())
+}
+
+/// The media runs each lane's tokens carry, matched to the spans that lane
+/// bound; a lane binding none carries no run of the model's placeholder.
+fn scan_lane_media(
+    lane_tokens: &[&[u32]],
+    spans: &[Vec<Arc<media::front::EncodedSpan>>],
+) -> Result<Vec<crate::pipeline::media::MatchedRun>, crate::pipeline::media::Refusal> {
+    let mut matched = Vec::new();
+    for (lane, tokens) in lane_tokens.iter().enumerate() {
+        match spans.get(lane).filter(|spans| !spans.is_empty()) {
+            Some(spans) => {
+                for mut run in crate::pipeline::media::scan(&[tokens], spans)? {
+                    run.lane = lane as u32;
+                    matched.push(run);
+                }
+            }
+            None => {
+                crate::pipeline::media::refuse_orphan_runs(&[tokens], crate::model::media_pad())?
+            }
+        }
+    }
+    Ok(matched)
 }
 
 fn advance_shadow<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyhow<()> {
@@ -2262,6 +2291,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             }
         }
         let switched = Switched::of(ctx.resources().get(&fwd)?);
+        let lanes_of = every_lane(&req);
         req.geometry = if decode_envelope.is_some() {
             GeometryClass::DecodeEnvelope
         } else {
@@ -2274,21 +2304,22 @@ pub async fn submit_pass_stamped<C: FireContext>(
             "fire geometry resolved on host path"
         );
         req.single_token_mode = req.lanes.iter().all(|lane| lane.tokens.len() == 1);
-        let media_spans = ctx.resources().get(&fwd)?.bindings.media.clone();
-        let carries_media = !media_spans.is_empty();
+        let media_spans: Vec<Vec<Arc<media::front::EncodedSpan>>> = ctx
+            .resources()
+            .get(&fwd)?
+            .bindings
+            .lanes
+            .iter()
+            .map(|lane| lane.media.clone())
+            .collect();
+        let carries_media = media_spans.iter().any(|spans| !spans.is_empty());
         let matched = {
             let lane_tokens: Vec<&[u32]> = req
                 .lanes
                 .iter()
                 .map(|lane| lane.tokens.as_slice())
                 .collect();
-            let scanned = if carries_media {
-                crate::pipeline::media::scan(&lane_tokens, &media_spans)
-            } else {
-                crate::pipeline::media::refuse_orphan_runs(&lane_tokens, crate::model::media_pad())
-                    .map(|()| Vec::new())
-            };
-            match scanned {
+            match scan_lane_media(&lane_tokens, &media_spans) {
                 Ok(matched) => matched,
                 Err(refusal) => return Ok(Err(format!("pipeline: {refusal}"))),
             }
@@ -2297,8 +2328,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
         if let Err(error) = attn_mask.apply_to(&mut req) {
             return Ok(Err(format!("pipeline: fire attention mask: {error}")));
         }
-        stamp_lane_words(&mut req, &switched, fire_wide_mask, carries_media, None);
-        let wide = reads_each_other(&req);
         if !matched.is_empty() {
             let lane_rows: Vec<u32> = req
                 .lanes
@@ -2312,6 +2341,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 .collect();
             req.media = crate::pipeline::media::lane_media(&matched, &lane_rows, &lane_base);
         }
+        stamp_lane_words(&mut req, &switched, &lanes_of, fire_wide_mask, None);
+        let wide = reads_each_other(&req);
         let kv_clock = crate::scheduler::probe::ProbeClock::start();
         let groups = lane_groups(&pass_lanes.kv.iter().map(|ws| ws.id).collect::<Vec<_>>());
         let group_sets: Vec<KvWorkingSet> = groups
@@ -2465,8 +2496,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             // What was mapped in is skipped: the pass runs from there.
             let rows = u32::try_from(full.lanes[0].tokens.len()).unwrap_or(u32::MAX);
             full = rows_of_lanes(&full, &[Some((supplied, rows))], true, page_size);
-            let media = !full.media.is_empty();
-            stamp_lane_words(&mut full, &switched, false, media, None);
+            stamp_lane_words(&mut full, &switched, &lanes_of, false, None);
             pass_slots = pass_slots.map(|slots| slots[supplied as usize..].to_vec());
             let total = crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
                 kv.supplied_tokens(ws.id)
@@ -2583,8 +2613,13 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 full.clone()
             } else {
                 let mut rows = rows_of_lanes(&full, piece, last, page_size);
-                let media = !rows.media.is_empty();
-                stamp_lane_words(&mut rows, &switched, false, media, None);
+                let kept: Vec<usize> = piece
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, cut)| cut.is_some())
+                    .map(|(lane, _)| lane)
+                    .collect();
+                stamp_lane_words(&mut rows, &switched, &kept, false, None);
                 rows
             };
             let spans: Vec<(std::ops::Range<u64>, std::ops::Range<u64>)> = groups
@@ -3446,7 +3481,14 @@ async fn fire_device_geometry<C: FireContext>(
     fwd: Resource<ForwardPass>,
     frame: Option<crate::scheduler::FrameStamp>,
 ) -> Anyhow<Result<(), String>> {
-    if !ctx.resources().get(&fwd)?.bindings.media.is_empty() {
+    if ctx
+        .resources()
+        .get(&fwd)?
+        .bindings
+        .lanes
+        .iter()
+        .any(|lane| !lane.media.is_empty())
+    {
         return Ok(Err(
             "pipeline: MediaDeviceGeometry: this pass attached media spans \
              and resolves its token ids on the device, so the host has no \
@@ -3710,11 +3752,12 @@ async fn fire_device_geometry<C: FireContext>(
     // rows; its words carry them.
     let device_rows: Option<Vec<u32>> =
         (!wide).then(|| split.windows(2).map(|lane| lane[1] - lane[0]).collect());
+    let lanes_of = every_lane(&req);
     stamp_lane_words(
         &mut req,
         &switched,
+        &lanes_of,
         fire_wide_mask,
-        false,
         device_rows.as_deref(),
     );
     let reads_each_other = reads_each_other(&req);
@@ -3847,12 +3890,7 @@ fn wire_channels_to_pipeline<C: FireContext>(
         let cres: Resource<Channel> = Resource::new_borrow(rep);
         if let Ok(ch) = ctx.resources().get_mut(&cres) {
             match &ch.fires {
-                // No pass takes or puts it, so no fire lands in it: the
-                // passes reading it may submit on pipelines of their own.
                 Some(existing) if !Arc::ptr_eq(existing, pipe_fires) => {
-                    if !ch.cell.lock().unwrap().written() {
-                        continue;
-                    }
                     return Ok(Err("pipeline: a channel is shared across pipelines \
                          (all passes binding a channel must submit on the same \
                          pipeline)"

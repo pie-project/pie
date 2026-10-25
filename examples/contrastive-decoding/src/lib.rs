@@ -109,13 +109,8 @@ async fn main(input: Input) -> Result<String> {
 
     let amateur_prefill = ForwardPass::new();
     amateur_prefill.embed(&amateur_prompt, &amateur_prefill_embed_indptr)?;
-    amateur_prefill.state(
-        &[&amateur_ws],
-        StateGeometry {
-            mask: Some(&amateur_prefill_mask),
-            ..StateGeometry::folding()
-        },
-    )?;
+    amateur_prefill.mask(&amateur_prefill_mask)?;
+    amateur_prefill.state(&[&amateur_ws], StateGeometry::folding())?;
     amateur_prefill.epilogue(move || {
         amateur_prefill_out.put(intrinsics::logits());
     });
@@ -171,13 +166,8 @@ async fn main(input: Input) -> Result<String> {
     let amateur_decode = ForwardPass::new();
     let amateur_embed_indptr = Channel::from([0u32, 1]).named("amateur_embed_indptr");
     amateur_decode.embed(&amateur_token, &amateur_embed_indptr)?;
-    amateur_decode.state(
-        &[&amateur_ws],
-        StateGeometry {
-            mask: Some(&amateur_mask),
-            ..StateGeometry::folding()
-        },
-    )?;
+    amateur_decode.mask(&amateur_mask)?;
+    amateur_decode.state(&[&amateur_ws], StateGeometry::folding())?;
     amateur_decode.epilogue(move || {
         let base = amateur_fill.take();
         let columns = iota(span);

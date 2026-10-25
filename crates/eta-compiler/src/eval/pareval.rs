@@ -66,10 +66,9 @@ pub fn fold_stage(
         logits: None,
         mtp_logits: None,
         mtp_drafts: None,
-        hidden: None,
-        velocity: None,
-        peer_velocity: None,
-        pixels: None,
+        hidden: Vec::new(),
+        velocity: Vec::new(),
+        pixels: Vec::new(),
         value_head: None,
         query: Vec::new(),
         attn_score: None,
@@ -387,9 +386,26 @@ mod tests {
         ChanDType, ChannelDecl, HostRole, PortBinding, StageProgram, TraceContainer,
     };
 
-    use eta_ir::registry::ModelProfile;
+    use eta_ir::registry::{EngineCaps, Graph, Readout, ReadoutKind};
     use eta_ir::types::{Dtype, Literal, RngKind, Shape};
-    use eta_ir::validate::bind;
+    use eta_ir::validate::{BoundTrace, bind};
+
+    /// A lane reading `vocab`-wide logits, on a two-layer model.
+    fn served(c: TraceContainer, vocab: u32) -> BoundTrace {
+        bind(
+            c,
+            vec![Some(Readout {
+                kind: ReadoutKind::Logits,
+                width: vocab,
+            })],
+            Graph {
+                num_layers: 2,
+                ..Graph::default()
+            },
+            EngineCaps::default(),
+        )
+        .unwrap()
+    }
 
     fn chan(shape: Shape, dtype: Dtype, capacity: u32) -> ChannelDecl {
         ChannelDecl {
@@ -541,7 +557,7 @@ mod tests {
     }
 
     fn unknown_tokens_block_derived_ports_only() {
-        let bound = bind(sdk_geometry_trace(), ModelProfile::dummy()).unwrap();
+        let bound = served(sdk_geometry_trace(), 32);
         let seeds: Vec<(u32, Value)> = seeds()
             .into_iter()
             .filter(|(c, _)| *c != 0 && *c != 1)
@@ -583,13 +599,13 @@ mod tests {
                 ChanPut { chan: 0, value: 2 },
             ],
         });
-        let bound = bind(trace, ModelProfile::dummy()).unwrap();
+        let bound = served(trace, 32);
         let taint = geometry_taint(&bound);
         assert!(taint.host_derivable(), "keyed noise is replayable");
     }
 
     fn seeded_prefill_is_host_derivable() {
-        let bound = bind(sdk_geometry_trace(), ModelProfile::dummy()).unwrap();
+        let bound = served(sdk_geometry_trace(), 32);
         let taint = geometry_taint(&bound);
         assert!(taint.device_decided.is_empty());
         assert!(taint.host_derivable());

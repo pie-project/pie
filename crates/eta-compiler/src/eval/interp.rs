@@ -208,10 +208,11 @@ pub struct PassInputs {
     pub logits: Option<Value>,
     pub mtp_logits: Option<Value>,
     pub mtp_drafts: Option<Value>,
-    pub hidden: Option<Value>,
-    pub velocity: Option<Value>,
-    pub peer_velocity: Option<Value>,
-    pub pixels: Option<Value>,
+    /// Per lane of the pass, what `hidden(lane)`, `velocity(lane)` and
+    /// `pixels(lane)` read.
+    pub hidden: Vec<Value>,
+    pub velocity: Vec<Value>,
+    pub pixels: Vec<Value>,
     pub value_head: Option<Value>,
     pub query: Vec<Value>,
     pub attn_score: Option<Value>,
@@ -462,7 +463,7 @@ impl Instance {
             .iter()
             .any(|s| taps.contains(&s.stage))
         {
-            for l in 0..bound.profile.num_layers {
+            for l in 0..bound.graph.num_layers {
                 for &stage in &taps {
                     exec_body(self, bound, &mut effects, stage, l, inputs, host)?;
                 }

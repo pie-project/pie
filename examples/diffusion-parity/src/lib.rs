@@ -83,11 +83,19 @@ struct Output {
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
     if !model::switch("mode").is_some_and(|mode| mode.values.iter().any(|v| v == "denoise")) {
-        return Err("this program reads a block-diffusion model; the bound model is not one".into());
+        return Err(
+            "this program reads a block-diffusion model; the bound model is not one".into(),
+        );
     }
     let pieces: String = [
-        &input.case_0, &input.case_1, &input.case_2, &input.case_3,
-        &input.case_4, &input.case_5, &input.case_6, &input.case_7,
+        &input.case_0,
+        &input.case_1,
+        &input.case_2,
+        &input.case_3,
+        &input.case_4,
+        &input.case_5,
+        &input.case_6,
+        &input.case_7,
     ]
     .into_iter()
     .flatten()
@@ -102,8 +110,8 @@ async fn main(input: Input) -> Result<Output> {
             return Err("pass `case` (json), `case_0..7` (its pieces) or `case_file`".into());
         }
     };
-    let case: Case = inferlet::serde_json::from_str(&text)
-        .map_err(|why| format!("case json: {why}"))?;
+    let case: Case =
+        inferlet::serde_json::from_str(&text).map_err(|why| format!("case json: {why}"))?;
     let length = CANVAS;
     if case.canvas0.len() != length as usize || case.canvas1.len() != length as usize {
         return Err(format!("the case's canvases are not {length} long").into());
@@ -164,15 +172,38 @@ async fn main(input: Input) -> Result<Output> {
             ids_out.put(top_i);
             probs_out.put(top_p);
         });
-        fwd.submit(&pipe).with_context(|| format!("prefill submit @{base}"))?;
-        prefill_rows.argmax.extend(arg_out.take_host::<Vec<i32>>().await?);
-        prefill_rows.entropy.extend(ent_out.take_host::<Vec<f32>>().await?);
-        prefill_rows.top8_ids.extend(ids_out.take_host::<Vec<u32>>().await?);
-        prefill_rows.top8_probs.extend(probs_out.take_host::<Vec<f32>>().await?);
+        fwd.submit(&pipe)
+            .with_context(|| format!("prefill submit @{base}"))?;
+        prefill_rows
+            .argmax
+            .extend(arg_out.take_host::<Vec<i32>>().await?);
+        prefill_rows
+            .entropy
+            .extend(ent_out.take_host::<Vec<f32>>().await?);
+        prefill_rows
+            .top8_ids
+            .extend(ids_out.take_host::<Vec<u32>>().await?);
+        prefill_rows
+            .top8_probs
+            .extend(probs_out.take_host::<Vec<f32>>().await?);
     }
     let prefill_argmax = *prefill_rows.argmax.last().unwrap_or(&0);
-    let prefill_top8_ids = prefill_rows.top8_ids.iter().rev().take(8).rev().copied().collect::<Vec<_>>();
-    let prefill_top8_probs = prefill_rows.top8_probs.iter().rev().take(8).rev().copied().collect::<Vec<_>>();
+    let prefill_top8_ids = prefill_rows
+        .top8_ids
+        .iter()
+        .rev()
+        .take(8)
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
+    let prefill_top8_probs = prefill_rows
+        .top8_probs
+        .iter()
+        .rev()
+        .take(8)
+        .rev()
+        .copied()
+        .collect::<Vec<_>>();
 
     // ── two denoise steps over the two stated canvases, then canvas0 the
     //    encode way (last: an encode pass commits its rows) ─────────────────
@@ -196,7 +227,7 @@ async fn main(input: Input) -> Result<Output> {
         let fwd = ForwardPass::new();
         let commit = at == 2;
         if !commit {
-            fwd.switch("mode", "denoise")?;
+            fwd.switch(0, "mode", "denoise")?;
         }
         fwd.embed(&toks, &embed_indptr)?;
         // A committed canvas folds; one the next step rewrites does not.
@@ -231,14 +262,17 @@ async fn main(input: Input) -> Result<Output> {
             } else {
                 (vec![0i32; cells], vec![0f32; cells])
             };
-            let ids = Channel::from_shaped([length, taps], ids).named(&format!("self_cond_ids_{tag}"));
-            let weights =
-                Channel::from_shaped([length, taps], weights).named(&format!("self_cond_weights_{tag}"));
-            fwd.input("self_cond_ids", &ids).context("bind self_cond_ids")?;
-            fwd.input("self_cond_weights", &weights)
+            let ids =
+                Channel::from_shaped([length, taps], ids).named(&format!("self_cond_ids_{tag}"));
+            let weights = Channel::from_shaped([length, taps], weights)
+                .named(&format!("self_cond_weights_{tag}"));
+            fwd.input(0, "self_cond_ids", &ids)
+                .context("bind self_cond_ids")?;
+            fwd.input(0, "self_cond_weights", &weights)
                 .context("bind self_cond_weights")?;
         }
-        fwd.submit(&pipe).with_context(|| format!("denoise submit {at}"))?;
+        fwd.submit(&pipe)
+            .with_context(|| format!("denoise submit {at}"))?;
         steps.push(Rows {
             argmax: arg_out.take_host::<Vec<i32>>().await?,
             entropy: ent_out.take_host::<Vec<f32>>().await?,

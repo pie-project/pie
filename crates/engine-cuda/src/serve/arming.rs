@@ -530,9 +530,7 @@ impl Shell {
                 rs_slot: None,
                 rs_snapshots: &[],
                 group: None,
-                peer: None,
                 inputs: &[],
-                attn_classes: None,
                 reports: 0,
                 tap: None,
             })

@@ -1,10 +1,10 @@
+use crate::msl_corpus::Served;
 use eta_compiler::codegen::cuda::emit_fused_region;
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{ModelProfile, Stage};
+use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype, Literal, RngKind, Shape};
-use eta_ir::validate::bind;
 
 const VOCAB: u32 = 16;
 
@@ -31,6 +31,7 @@ fn subject(divide: bool, kind: RngKind) -> TraceContainer {
     let mut ops = vec![
         Op::IntrinsicVal {
             intr: IntrinsicId::Logits,
+            lane: 0,
             shape: Shape::matrix(1, VOCAB),
             dtype: Dtype::F32,
         },
@@ -83,6 +84,7 @@ fn decode_subject(divide: bool, vocab: u32) -> TraceContainer {
     let mut ops = vec![
         Op::IntrinsicVal {
             intr: IntrinsicId::Logits,
+            lane: 0,
             shape: Shape::matrix(1, vocab),
             dtype: Dtype::F32,
         },
@@ -164,9 +166,8 @@ fn decode_subject(divide: bool, vocab: u32) -> TraceContainer {
 }
 
 fn emitted(container: TraceContainer) -> String {
-    let mut profile = ModelProfile::dummy();
-    profile.vocab = VOCAB;
-    let bound = bind(container, profile).expect("the subject binds");
+    let profile = Served::of(VOCAB);
+    let bound = profile.bind(container).expect("the subject binds");
     let stages = compile_bound(&bound);
     let stage = stages.first().expect("one stage");
     let region = stage.fused.regions.first().expect("one fused region");
@@ -188,9 +189,8 @@ fn gumbel_argmax_scans_the_logits_once_every_case() {
 /// The region as each SIMT backend that serves it emits it, whichever kind
 /// of region it compiles to.
 fn emitted_by_each_backend(container: TraceContainer, vocab: u32) -> Vec<(&'static str, String)> {
-    let mut profile = ModelProfile::dummy();
-    profile.vocab = vocab;
-    let bound = bind(container, profile).expect("the subject binds");
+    let profile = Served::of(vocab);
+    let bound = profile.bind(container).expect("the subject binds");
     let stages = compile_bound(&bound);
     let stage = stages.first().expect("one stage");
     let region = stage.fused.regions.first().expect("one fused region");

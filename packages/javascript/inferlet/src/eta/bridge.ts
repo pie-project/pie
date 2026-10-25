@@ -405,8 +405,6 @@ export interface StateGeometry {
   slots?: Channel;
   /** Per lane, how many slots the lane reads. */
   kvLen?: Channel;
-  /** Per row, bool over the slots it may read. */
-  mask?: Channel;
   fold?: Fold;
 }
 
@@ -469,7 +467,8 @@ const SITE_BITS: Record<string, number> = { q: 1, k: 2, v: 4, o: 8, gate_up: 16,
 export class ForwardPass {
   readonly wit: witForward.ForwardPass;
   private ports: [Port, Channel][] = [];
-  private inputs: Channel[] = [];
+  /** Each lane's bound inputs, by lane. */
+  private inputs: [number, string, Channel][] = [];
   private stages: [Stage, () => void][] = [];
   private readonly vocab: number;
   private readonly pageSize: number;
@@ -479,7 +478,8 @@ export class ForwardPass {
   /** Keeps the bound working sets alive while the pass is bound. */
   private lanes: WorkingSet[] = [];
   private foldAll: Channel | undefined;
-  private switches: [string, string][] = [];
+  /** Each lane's set switches, by lane. */
+  private switches: [number, string, string][] = [];
 
   constructor() {
     this.wit = new witForward.ForwardPass();
@@ -515,15 +515,15 @@ export class ForwardPass {
     this.ports.push([Port.READOUT, indices]);
   }
 
-  /** Carry the payloads of `media.Image` / `media.Audio` spans, order-matched
-   * to their placeholder token runs in the embed. */
-  media(spans: (Image | Audio)[]): void {
+  /** Carry the payloads of the `media.Image` / `media.Audio` spans lane
+   * `lane`'s tokens carry, order-matched to their placeholder token runs. */
+  media(lane: number, spans: (Image | Audio)[]): void {
     const wrapped: witForward.MediaSpan[] = spans.map((s) => {
       if (s instanceof Audio) return { tag: 'audio', val: s.handle };
       if (s instanceof Image) return { tag: 'image', val: s.handle };
       throw new TypeError('media span must be a media.Image or media.Audio');
     });
-    wit('media', () => this.wit.media(wrapped));
+    wit('media', () => this.wit.media(lane, wrapped));
   }
 
   /** Bind one working set per lane, in lane order; lanes sharing a set must state `slots`. */
@@ -534,7 +534,6 @@ export class ForwardPass {
       [Port.POSITIONS, geom.positions],
       [Port.SLOTS, geom.slots],
       [Port.KV_LEN, geom.kvLen],
-      [Port.ATTN_MASK, geom.mask],
       [Port.FOLD, fold],
     ];
     if (!rebind) this.ensurePortsAvailable(stated.filter(([, ch]) => ch !== undefined).map(([port]) => port));
@@ -542,7 +541,6 @@ export class ForwardPass {
     if (geom.positions) g.positions = geom.positions.wit();
     if (geom.slots) g.slots = geom.slots.wit();
     if (geom.kvLen) g.kvLen = geom.kvLen.wit();
-    if (geom.mask) g.mask = geom.mask.wit();
     if (fold) g.fold = fold.wit();
     wit('state', () => this.wit.state(lanes.map((l) => l.ws), g));
     this.lanes = [...lanes];
@@ -554,12 +552,12 @@ export class ForwardPass {
     wit('checkpoints', () => this.wit.checkpoints(Uint32Array.from(slots)));
   }
 
-  /** Set the model's switch `name` to `value` (`model.switches()`): which
-   * path this pass's lanes run. Before the program. */
-  switch(name: string, value: string): void {
+  /** Set lane `lane`'s model switch `name` to `value` (`model.switches()`):
+   * which path that lane runs. Before the program. */
+  switch(lane: number, name: string, value: string): void {
     if (this.programAttached) throw new InferletError('forward pass program is already attached');
-    wit('switch', () => this.wit.switch(name, value));
-    this.switches.push([name, value]);
+    wit('switch', () => this.wit.switch(lane, name, value));
+    this.switches.push([lane, name, value]);
   }
 
   /** Whether a switch of this pass is off its model's default: a path a
@@ -568,23 +566,35 @@ export class ForwardPass {
   switched(): boolean {
     if (!this.switches.length) return false;
     const declared = witModel.switches();
-    return this.switches.some(([name, value]) => {
+    return this.switches.some(([, name, value]) => {
       const decl = declared.find((d) => d.name === name);
       return decl !== undefined && decl.values[0] !== value;
     });
   }
 
-  /** Bind `ch` to the model's input `name` (`model.lane(...).inputs`), read
-   * at every submit from its committed cell. The host validates the shape. */
-  input(name: string, ch: Channel): void {
+  /** Bind `ch` to lane `lane`'s model input `name` (`model.lane(...).inputs`),
+   * read at every submit from its committed cell. The host validates the shape. */
+  input(lane: number, name: string, ch: Channel): void {
     if (this.programAttached) throw new InferletError('forward pass program is already attached');
-    wit('input', () => this.wit.input(name, ch.wit()));
-    this.inputs.push(ch);
+    if (this.inputs.some(([at, bound]) => at === lane && bound === name)) {
+      throw new InferletError(`input \`${name}\` is already bound on lane ${lane}`);
+    }
+    wit('input', () => this.wit.input(lane, name, ch.wit()));
+    this.inputs.push([lane, name, ch]);
   }
 
-  /** Put this pass's lanes in attention group `id` within a frame. */
-  group(id: number): void {
-    wit('group', () => this.wit.group(id));
+  /** Put lane `lane` in this pass's attention group `id`. */
+  group(lane: number, id: number): void {
+    if (this.programAttached) throw new InferletError('forward pass program is already attached');
+    wit('group', () => this.wit.group(lane, id));
+  }
+
+  /** Per row of the pass, the rows it attends: kv slots on a pass whose lanes
+   * read kv, its attention group's rows on one whose lanes do not. */
+  mask(rows: Channel): void {
+    this.ensurePortsAvailable([Port.ATTN_MASK]);
+    wit('mask', () => this.wit.mask(rows.wit()));
+    this.ports.push([Port.ATTN_MASK, rows]);
   }
 
   /** Attach a PEFT adapter at `site` ("q"|"k"|"v"|"o"|"gate_up"|"down"). */
@@ -667,7 +677,15 @@ export class ForwardPass {
     if (this.programAttached) return;
     const builder = new Builder(this.vocab, this.pageSize);
     for (const [port, ch] of this.ports) builder.bindPort(port, ch.dsl);
-    for (const ch of this.inputs) builder.bindInput(ch.dsl);
+    // A channel several lanes read (a CFG step's one timestep) is one input
+    // of the program.
+    const listed: Channel[] = [];
+    for (const [, , ch] of this.inputs) {
+      if (!listed.includes(ch)) {
+        listed.push(ch);
+        builder.bindInput(ch.dsl);
+      }
+    }
     for (const [stage, body] of this.stages) builder.stage(stage, body);
     const traced = builder.build();
     const handles = traced.channels.map(hostChannel);

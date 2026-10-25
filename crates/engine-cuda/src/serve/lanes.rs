@@ -1,4 +1,4 @@
-use engine::fire::{AttnClasses, Boundary, InputFeed, Masking, RsReset, RsSnapshot, RsVerb};
+use engine::fire::{Boundary, InputFeed, Masking, RsReset, RsSnapshot, RsVerb};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Lane<'a> {
@@ -28,9 +28,7 @@ pub struct Seated<'a> {
     pub rs_snapshots: &'a [RsSnapshot],
     pub readout: Option<&'a [u32]>,
     pub group: Option<u32>,
-    pub peer: Option<u32>,
     pub inputs: &'a [InputFeed],
-    pub attn_classes: Option<&'a AttnClasses>,
     pub reports: u64,
     pub tap: Option<&'a engine::fire::Tap>,
 }
@@ -56,9 +54,7 @@ impl<'a> Seated<'a> {
             rs_snapshots: &[],
             readout: None,
             group: None,
-            peer: None,
             inputs: &[],
-            attn_classes: None,
             reports: 0,
             tap: None,
         }
@@ -91,7 +87,9 @@ impl<'a> Seated<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Attached {
+    /// The first of its pass's lanes, `lanes` of them in a row.
     pub lane: u32,
+    pub lanes: u32,
     pub instance: engine::InstanceId,
     pub at: Boundary,
 }

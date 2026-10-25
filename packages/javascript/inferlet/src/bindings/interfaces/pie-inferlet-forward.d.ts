@@ -97,8 +97,6 @@ export interface MediaSpanAudio {
  *   Writing a slot again replaces it.
  * - `kv-len`: per lane, the lane reads slots `[0, kv-len)`. Default:
  *   causal.
- * - `mask`: per row, bool over `[0, kv-len)`. A recurrent layer hides
- *   only slots past `folded`, the same ones for every row of a lane.
  * - `fold`: per lane, how many more slots freeze after this fire;
  *   `u32::MAX` folds everything. Default: none. May be computed on the
  *   device; lanes sharing a working set fold by the first one's count.
@@ -107,10 +105,20 @@ export interface StateGeometry {
   positions?: Channel,
   slots?: Channel,
   kvLen?: Channel,
-  mask?: Channel,
   fold?: Channel,
 }
 
+/**
+ * A forward-pass builder. Construction is empty; descriptor resources are
+ * attached explicitly, then `program` supplies the traced container.
+ * 
+ * A pass holds every lane of one computation: a CFG denoising step's
+ * image and text lanes of both branches, a beam's rows, an LM CFG's two
+ * streams. A verb taking `lane` binds that lane; the pass has as many
+ * lanes as the highest index set plus one, or as `state` binds working
+ * sets. Row data the program computes (`embed`, `state-geometry`,
+ * `readout`, `mask`) is the pass's, lane after lane.
+ */
 export class ForwardPass {
   constructor()
   /**
@@ -132,18 +140,18 @@ export class ForwardPass {
   */
   embed(tokens: Channel, indptr: Channel): void;
   /**
-  * Set the model's switch `name` to `value` (`model.switches()`):
-  * which path this pass's lanes run. Names and values are the
-  * model's (`reading`, `stream`, `mode`, ...); the host checks
+  * Set lane `lane`'s model switch `name` to `value`
+  * (`model.switches()`): which path that lane runs. Names and values
+  * are the model's (`reading`, `stream`, `mode`, ...); the host checks
   * `value` against the declaration and nothing else. A switch left
-  * unset takes its first declared value. Set before `program`; a
-  * pass keeps its switches for its life.
+  * unset takes its first declared value. Set before `program`; a lane
+  * keeps its switches for the pass's life.
   */
-  'switch'(name: string, value: string): void;
+  'switch'(lane: number, name: string, value: string): void;
   /**
-  * Bind a channel to the model's input `name` (`model.lane`'s
+  * Bind a channel to lane `lane`'s model input `name` (`model.lane`'s
   * `inputs`), read at every submit: the channel's COMMITTED cell is
-  * the input's value for this lane, so `set` or an epilogue `put`
+  * the input's value for that lane, so `set` or an epilogue `put`
   * advances it and a whole denoising loop runs without a host copy a
   * step. The channel is `[width]` for a `lane` input, `[rows, width]`
   * for a `row` input (every row input of a lane carries the same
@@ -152,72 +160,45 @@ export class ForwardPass {
   * is `f32` for a float input and `i32` for an `i32` one. The
   * program lists the channel among its inputs, read where the
   * descriptor ports are, so a prologue `put` to it is the value the
-  * forward reads. A pass binds exactly the inputs its lane reads
-  * before `program`.
+  * forward reads. A lane binds exactly the inputs it reads before
+  * `program`.
   */
-  input(name: string, ch: Channel): void;
+  input(lane: number, name: string, ch: Channel): void;
   /**
-  * Put this pass's lanes in attention group `id`: the lanes of every
-  * pass in one frame naming the same group attend each other's rows.
+  * Put lane `lane` in attention group `id`: the lanes of this pass
+  * naming one group attend each other's rows, and a lane naming none
+  * attends its own. Group ids are this pass's: two passes' groups
+  * never meet, whatever their ids. Classifier-free guidance's two
+  * branches are two groups of one pass. Set before `program`.
+  */
+  group(lane: number, id: number): void;
+  /**
+  * Per row of the pass, which rows it attends, as bools: over the
+  * slots `[0, kv-len)` on a pass whose lanes read kv (a recurrent
+  * layer hides only slots past `folded`, the same ones for every row
+  * of a lane); over its attention group's rows, in the pass's lane
+  * order, on one whose lanes do not (a voxel lane's rows are its
+  * voxels, and a token after the model's patchify attends as its
+  * patch's first voxel). The channel is `[rows, n]`; a row of a group
+  * of fewer than `n` rows reads its first ones. Regional prompting,
+  * attention coupling and cross-frame restriction are each one mask.
   * Set before `program`.
   */
-  group(id: number): void;
-  /**
-  * Name the attention group whose lane of this lane's switches is
-  * its PEER: the lane whose velocity this one's epilogue reads with
-  * `intrinsics::peer_velocity(width)`.
-  * 
-  * This is the classifier-free guidance verb, and it names a group
-  * rather than a lane of one's own because guidance's two branches
-  * must NOT attend each other — they are two independent denoisings
-  * of the same canvas, one holding the prompt and one the negative
-  * one, and putting them in one attention group would make each see
-  * the other's rows. So they are two groups of ONE fire, and this
-  * says which of them is the other.
-  * 
-  * The peer is the lane of that group with THIS pass's switches;
-  * a group seating no such lane, or more than one, is refused by
-  * name at submit rather than guessed at. Naming one's own group is
-  * refused too: a lane is not its own peer, and `u + s(u - u)` is a
-  * picture that looks fine and is not guided.
-  * 
-  * It costs a row offset and nothing else. The velocity plane is
-  * fire-wide and written by the forward walk before any epilogue
-  * block runs, so both branches' predictions are already sitting in
-  * one rectangle by the time either epilogue reads. A pass that
-  * reads `peer_velocity` without naming a peer is refused, so
-  * guidance cannot silently degrade into a lane reading its own
-  * rows twice.
-  * 
-  * Set before `program`, and after `group`. A model that predicts
-  * no velocity refuses the whole program at bind.
-  */
-  peer(group: number): void;
-  /**
-  * A structured attention mask over this pass's rows, applied to the
-  * reading's group-packed attention: `classes` names one class in
-  * `0..count` per row (or -1: the row attends, and is attended by,
-  * every row); `table[q * count + kv]` non-zero lets a q-class row
-  * attend a kv-class row. `count` is at most 64. Every lane of one
-  * attention group states the same table; rows of lanes that state
-  * nothing are class -1. Regional prompting, attention coupling and
-  * cross-frame restriction are all one table. Set before `program`.
-  */
-  attentionClasses(classes: Int32Array, table: Uint8Array, count: number): void;
+  mask(rows: Channel): void;
   /**
   * Bind an optional readout-index channel separately from embedding.
   */
   readout(indices: Channel): void;
   /**
-  * The payloads of the media spans this pass's tokens carry, in
+  * The payloads of the media spans lane `lane`'s tokens carry, in
   * placeholder order; a count or run length that disagrees is refused
   * at `submit`.
   */
-  media(spans: Array<MediaSpan>): void;
+  media(lane: number, spans: Array<MediaSpan>): void;
   /**
   * Attach canonical ETA bytes and channel handles in dense declaration
-  * order. Validation uses the engine-owned ModelProfile and rejects
-  * any stage this interface does not admit.
+  * order. Validation checks the program against what each lane reads
+  * out and rejects any stage this interface does not admit.
   */
   program(containerBytes: Data, channels: Array<Channel>): void;
 }

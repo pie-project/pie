@@ -15,9 +15,9 @@ use eta_compiler::plan::compile_bound;
 use eta_exec::Extents;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::Op;
-use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
+use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype, Predicate, Shape};
-use eta_ir::validate::{BoundTrace, bind};
+use eta_ir::validate::BoundTrace;
 
 const INPUT: u32 = 0;
 const THRESHOLD: u32 = 1;
@@ -261,11 +261,7 @@ fn compare_rank(rows: u32, len: u32, data: Vec<f32>, ks: &[i32], what: &[&str]) 
 }
 
 fn compare_cut(cut: Cut, rows: u32, len: u32, data: Vec<f32>, thresholds: &[f32], what: &[&str]) {
-    let profile = ModelProfile {
-        vocab: len,
-        ..ModelProfile::dummy()
-    };
-    let bound = bind(program(rows, len, cut), profile).expect("the cut binds");
+    let bound = crate::bound::logits(program(rows, len, cut), len).expect("the cut binds");
     let threshold = match cut {
         Cut::Rank => Value::I32(thresholds.iter().map(|&k| k as i32).collect()),
         _ => Value::F32(thresholds.to_vec()),
@@ -317,14 +313,7 @@ fn a_cut_keeps_the_same_elements_every_fire() {
     let count = rows.len() as u32;
     let thresholds: Vec<f32> = rows.iter().map(|r| r.2).collect();
     let data: Vec<f32> = rows.into_iter().flat_map(|r| r.1).collect();
-    let bound = bind(
-        program(count, len, Cut::Mass),
-        ModelProfile {
-            vocab: len,
-            ..ModelProfile::dummy()
-        },
-    )
-    .expect("the cut binds");
+    let bound = crate::bound::logits(program(count, len, Cut::Mass), len).expect("the cut binds");
     let seeds = vec![
         (INPUT, Value::F32(data)),
         (THRESHOLD, Value::F32(thresholds)),

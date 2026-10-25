@@ -27,7 +27,7 @@ use engine_xla::{DeviceBoot, Xla};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::Op;
-use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
+use eta_ir::registry::{EngineCaps, GeometryClass, Graph, ReadoutKind, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use eta_ir::validate::bind;
 use poem::fact;
@@ -632,8 +632,33 @@ impl Rig {
         }
     }
 
-    pub fn profile(&self) -> &ModelProfile {
-        &self.loaded.caps.profile
+    /// The widths the loaded plan's classes read out of `kind`.
+    pub fn readout_widths(&self, kind: poem_ir::ReadoutKind) -> Vec<u32> {
+        self.loaded
+            .caps
+            .classes
+            .classes
+            .iter()
+            .filter_map(|class| class.readout.filter(|readout| readout.kind == kind))
+            .map(|readout| readout.width)
+            .collect()
+    }
+
+    /// What the loaded model's graph and engine state for a program's bind.
+    pub fn graph(&self) -> (Graph, EngineCaps) {
+        let caps = &self.loaded.caps;
+        (
+            Graph {
+                num_layers: 0,
+                mtp_logits: caps.has_mtp_logits,
+                mtp_depth: caps.mtp_depth,
+                attn_score: caps.has_attn_score,
+            },
+            EngineCaps {
+                lora: caps.has_lora,
+                attn_page_mask: caps.has_attn_page_mask,
+            },
+        )
     }
 
     /// The word of a one-row lane running `reading`, or the plan's token
@@ -648,7 +673,9 @@ impl Rig {
     }
 
     pub fn register(&mut self, container: TraceContainer) -> ProgramId {
-        let bound = bind(container, self.profile().clone()).expect("the program binds");
+        let (graph, caps) = self.graph();
+        let lanes = lanes_read(&container);
+        let bound = bind(container, lanes, graph, caps).expect("the program binds");
         let launch = eta_compiler::codegen::launch::build(&bound, &compile_bound(&bound));
         self.engine
             .register_program(&ProgramRegistration {
@@ -808,9 +835,40 @@ pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, stream: &str, group: u3
     }
 }
 
+/// What each lane of a fixture's pass reads out, as its program reads it:
+/// the widths of the intrinsics it reads of each lane.
+pub fn lanes_read(container: &TraceContainer) -> Vec<Option<eta_ir::registry::Readout>> {
+    let mut lanes: Vec<Option<eta_ir::registry::Readout>> = vec![None];
+    for op in container.stages.iter().flat_map(|stage| &stage.ops) {
+        let eta_ir::op::Op::IntrinsicVal {
+            intr, lane, shape, ..
+        } = *op
+        else {
+            continue;
+        };
+        let kind = match intr {
+            eta_ir::op::IntrinsicId::Logits => ReadoutKind::Logits,
+            eta_ir::op::IntrinsicId::Velocity => ReadoutKind::Velocity,
+            eta_ir::op::IntrinsicId::Hidden => ReadoutKind::Hidden,
+            eta_ir::op::IntrinsicId::Pixels => ReadoutKind::Pixels,
+            _ => continue,
+        };
+        let at = lane as usize;
+        if lanes.len() <= at {
+            lanes.resize(at + 1, None);
+        }
+        lanes[at] = Some(eta_ir::registry::Readout {
+            kind,
+            width: shape.dims().last().copied().unwrap_or(0),
+        });
+    }
+    lanes
+}
+
 pub fn attach(lane: u32, instance: InstanceId) -> Attachment {
     Attachment {
         lane,
+        lanes: 1,
         instance,
         at: Boundary::Epilogue,
     }

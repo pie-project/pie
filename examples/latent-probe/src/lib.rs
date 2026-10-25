@@ -176,11 +176,11 @@ async fn main(input: Input) -> Result<Output> {
         .named("out");
 
     let pass = ForwardPass::new();
-    pass.switch("reading", &reading)?;
+    pass.switch(0, "reading", &reading)?;
     if let Some(stream) = &stream {
-        pass.switch("stream", stream)?;
+        pass.switch(0, "stream", stream)?;
     }
-    pass.input("latents", &x)?;
+    pass.input(0, "latents", &x)?;
     let mut bound = vec![latents.name.clone()];
     let mut extras: Vec<Channel> = Vec::new();
     if !lane.inputs.iter().any(|i| i.name == "timestep") {
@@ -189,7 +189,7 @@ async fn main(input: Input) -> Result<Output> {
             stream.as_deref().unwrap_or("default")
         ));
     }
-    pass.input("timestep", &t)?;
+    pass.input(0, "timestep", &t)?;
     bound.push("timestep".to_string());
     for decl in &lane.inputs {
         if decl.name == "latents" || decl.name == "timestep" {
@@ -217,7 +217,7 @@ async fn main(input: Input) -> Result<Output> {
                 ));
             }
         };
-        pass.input(&decl.name, &ch)?;
+        pass.input(0, &decl.name, &ch)?;
         bound.push(decl.name.clone());
         extras.push(ch);
     }
@@ -225,7 +225,7 @@ async fn main(input: Input) -> Result<Output> {
     pass.epilogue(move || {
         let k = step.take();
         let x_cur = x.take();
-        let v = intrinsics::velocity(velocity_width);
+        let v = intrinsics::velocity(0, rows, velocity_width);
         let dt = gather(dts_ch.read(), &k);
         let next = euler_step(&x_cur, &v, &dt);
         let r = rng.take();

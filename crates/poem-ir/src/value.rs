@@ -188,8 +188,13 @@ pub enum RuntimeInput {
     Tokens,
     Positions,
     MropePositions,
-    Mask { space: u32 },
-    Geometry { space: u32, kind: GeomKind },
+    Mask {
+        space: u32,
+    },
+    Geometry {
+        space: u32,
+        kind: GeomKind,
+    },
     ReadoutRows,
     AdapterRoutes,
     Patches,
@@ -197,9 +202,13 @@ pub enum RuntimeInput {
     PatchRoutes,
     PatchPositions,
     ImageGrids,
-    RowPermutation { select: Selection },
+    RowPermutation {
+        select: Selection,
+    },
     Grid,
-    TokenGrid { p: [u32; 3] },
+    TokenGrid {
+        p: [u32; 3],
+    },
     /// An input the model names and its guest binds: entry `id` of
     /// [`crate::Trace::inputs`], `width` values of `dtype` per lane, row or
     /// voxel of the fire.

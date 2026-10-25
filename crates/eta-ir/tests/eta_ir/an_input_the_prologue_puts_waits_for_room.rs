@@ -1,6 +1,6 @@
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer, decode};
 use eta_ir::op::Op;
-use eta_ir::registry::{ModelProfile, Phase, Stage};
+use eta_ir::registry::{EngineCaps, Graph, Phase, Stage};
 use eta_ir::types::{Dtype, Literal, Shape};
 use eta_ir::validate::{Direction, ReadinessEntry, bind};
 
@@ -33,7 +33,13 @@ fn an_input_the_prologue_puts_waits_for_room() {
     };
     assert_eq!(decode(&container.encode()).as_ref(), Ok(&container));
 
-    let bound = bind(container, ModelProfile::dummy()).expect("binds");
+    let bound = bind(
+        container,
+        vec![None],
+        Graph::default(),
+        EngineCaps::default(),
+    )
+    .expect("binds");
     assert_eq!(
         bound.readiness,
         vec![

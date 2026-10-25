@@ -13,7 +13,7 @@ use kernels_cuda::attn::ragged::{RaggedMask, ragged};
 enum Mask {
     None,
     Bias,
-    Class,
+    Custom,
 }
 
 const MAX_LEN: usize = 130;
@@ -35,7 +35,7 @@ fn check(heads: [usize; 3], q_sizes: &[u32], kv_sizes: &[u32], mask: Mask, extra
     let mut want = ragged_attention([&q, &k, &v], &qt, &kt, heads, scale, |_, h, r, j| {
         let keep = match mask {
             Mask::None | Mask::Bias => true,
-            Mask::Class => allowed[(classes[r] * 3 + classes[j]) as usize] == 1,
+            Mask::Custom => allowed[(classes[r] * 3 + classes[j]) as usize] == 1,
         };
         let d = (j + MAX_LEN - 1).saturating_sub(r).min(span - 1);
         let bias = bias[h * span + d] * f32::from(u8::from(mask == Mask::Bias));
@@ -43,17 +43,43 @@ fn check(heads: [usize; 3], q_sizes: &[u32], kv_sizes: &[u32], mask: Mask, extra
     });
     let mut gpu = Gpu::open();
     let o_at = gpu.up(&fill);
+    // Each group's bits, query-major, from a byte of its own: the classes'
+    // table spelled pair by pair.
+    let (mut bits, mut starts) = (Vec::<u8>::new(), Vec::<i32>::new());
+    for g in 0..qt.len() - 1 {
+        starts.push(bits.len() as i32);
+        let (q0, q1, k0, k1) = (
+            qt[g] as usize,
+            qt[g + 1] as usize,
+            kt[g] as usize,
+            kt[g + 1] as usize,
+        );
+        let base = bits.len();
+        bits.resize(base + ((q1 - q0) * (k1 - k0)).div_ceil(8), 0);
+        for (q, r) in (q0..q1).enumerate() {
+            for (k, j) in (k0..k1).enumerate() {
+                if allowed[(classes[r] * 3 + classes[j]) as usize] == 1 {
+                    let cell = q * (k1 - k0) + k;
+                    bits[base + cell / 8] |= 1 << (cell % 8);
+                }
+            }
+        }
+    }
+    starts.push(bits.len() as i32);
+    bits.push(0);
     // Every table ends where mapped memory ends: a padded query tile's read
     // past one faults, as it once read a neighbour's bytes.
     let mut edge = |v: &[i32]| ten(gpu.up_at_edge(v), v.len(), 1, I32);
-    let (qtab, ktab, class_t) = (edge(&qt), edge(&kt), edge(&classes));
+    let (qtab, ktab, starts) = (edge(&qt), edge(&kt), edge(&starts));
     let (table, max_len) = (ten(gpu.up(&bias), qh, span, F32), MAX_LEN as u32);
-    let allowed = ten(gpu.up_at_edge(&allowed), 9, 1, U8);
+    let custom = RaggedMask::Custom {
+        bits: ten(gpu.up_at_edge(&bits), bits.len(), 1, U8),
+        indptr: starts,
+    };
     let arm = match mask {
         Mask::None => RaggedMask::None,
         Mask::Bias => RaggedMask::RelativeBias { table, max_len },
-        #[rustfmt::skip]
-        Mask::Class => RaggedMask::ClassTable { q_classes: class_t, kv_classes: class_t, table: allowed, count: 3 },
+        Mask::Custom => custom,
     };
     let qp = ten(gpu.up(&q_raw), qr, qh * hd, Bf16);
     let kp = ten(gpu.up(&k_raw), kr, kvh * hd, Bf16);
@@ -79,8 +105,8 @@ fn the_ragged_arm_answers_the_reference() {
     check([4, 2, 64], q_cross, kv_cross, Mask::None, 0);
     check([4, 2, 128], q_cross, kv_cross, Mask::None, 0);
     check([64, 16, 64], bias, bias, Mask::Bias, 0);
-    check([2, 1, 256], lanes, lanes, Mask::Class, 0);
-    check([4, 2, 64], lanes, lanes, Mask::Class, 0);
+    check([2, 1, 256], lanes, lanes, Mask::Custom, 0);
+    check([4, 2, 64], lanes, lanes, Mask::Custom, 0);
     check([2, 2, 256], seat, seat, Mask::None, 96);
 }
 

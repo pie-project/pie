@@ -5,7 +5,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 use eta_ir::Dtype;
-use eta_ir::op::{IntrinsicId, intrinsic_tags, tags};
+use eta_ir::op::{intrinsic_tags, tags};
 
 use crate::plan::{CompiledStage, Dimension, LANE_TABLE_ABI_VERSION, Region};
 
@@ -20,7 +20,7 @@ pub(super) const PROLOGUE: &str = include_str!("../../../runtime/cuda/fused_bloc
 pub(super) const SIGNATURE: &str = include_str!("../../../runtime/cuda/fused_block1.cuh");
 pub(super) const PREAMBLE: &str = include_str!("../../../runtime/cuda/fused_block2.cuh");
 
-pub const PTIR_INTRINSIC_SLOTS: u32 = IntrinsicId::SLOTS;
+pub const PTIR_INTRINSIC_SLOTS: u32 = eta_ir::op::INTRINSIC_PITCH;
 
 fn parallel_elementwise(tag: u8) -> bool {
     matches!(

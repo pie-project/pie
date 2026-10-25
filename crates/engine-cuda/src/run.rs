@@ -328,9 +328,9 @@ pub struct FireBindings {
     pub lane_of_row: Tensor,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
-    /// The fire's attention class table (`[count * count] u8`) when a lane
-    /// stated classes: group-packed `attention.ragged` reads it.
-    pub class_table: Option<(Tensor, u32)>,
+    /// The custom mask each group-packed `attention.ragged` applies, by its
+    /// query and key packings, when a lane stated one.
+    pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
     pub inputs: Vec<InputBinding>,
 
     pub geometry: Vec<CacheGeometry>,
@@ -1565,8 +1565,18 @@ impl<'c> Run<'c> {
         self.whole(id)
     }
 
-    pub(crate) fn class_table(&self) -> Option<(Tensor, u32)> {
-        self.fire.class_table
+    /// The custom mask a group-packed attention over packings `q` and `kv`
+    /// applies, when a lane of the fire stated one.
+    pub(crate) fn group_mask(
+        &self,
+        q: poem_ir::Selection,
+        kv: poem_ir::Selection,
+    ) -> Option<crate::inputs::GroupMaskHandles> {
+        self.fire
+            .group_masks
+            .iter()
+            .find(|mask| mask.q == q && mask.kv == kv)
+            .copied()
     }
 
     fn whole(&self, id: ValueId) -> Tensor {

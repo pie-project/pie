@@ -151,7 +151,7 @@ pub(crate) fn normalize_stage(bound: &BoundTrace, stage_index: usize) -> Normali
         let normalized_op_index = normalized_ops.len() as u32;
         for (result, symbolic_type) in result_types.into_iter().enumerate() {
             value_map[base + result] = new_base + result as u32;
-            normalized_domains.push(value_domain(bound.profile.vocab, &op, &symbolic_type));
+            normalized_domains.push(value_domain(bound.vocab(), &op, &symbolic_type));
             let literal = match &op {
                 Op::Const(literal) => Some(*literal),
                 _ => None,
@@ -433,7 +433,7 @@ mod value_domain_tests {
             Op::Add(0, 0),
         ] {
             assert_eq!(
-                value_domain(bound.profile.vocab, &op, &per_row),
+                value_domain(bound.vocab(), &op, &per_row),
                 ValueDomain::PerRow,
                 "{op:?}"
             );
