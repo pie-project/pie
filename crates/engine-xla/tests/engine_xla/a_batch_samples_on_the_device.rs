@@ -251,7 +251,7 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
         patches: None,
     })
     .expect("the shell loads");
-    let vocab = shell.out_width();
+    let vocab = shell.readout_width().expect("the plan reads out logits");
 
     // One program, registered with both planes; an instance per lane.
     let bound = eta_ir::validate::bind(
@@ -372,8 +372,6 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
                 shell.device(),
                 &attached,
                 Some(&kept),
-                vocab,
-                0,
                 eta_ir::registry::Stage::Epilogue,
             )
             .expect("the guest passes run");
@@ -389,7 +387,12 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
         let t2 = Instant::now();
         // The old path: every lane's rows to the host, then the interpreter.
         let rows: Vec<Vec<f32>> = (0..lanes as usize)
-            .map(|l| kept.lane_rows(l).expect("rows"))
+            .map(|l| {
+                kept.lane_rows(l)
+                    .expect("rows")
+                    .expect("the lane reads back")
+                    .2
+            })
             .collect();
         let t3 = Instant::now();
         let host_tokens: Vec<(i32, i32)> = (0..lanes)
@@ -398,11 +401,11 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
                 host_plane
                     .fire_interpreted(
                         h,
-                        Some(&rows[l as usize]),
-                        1,
-                        vocab,
-                        None,
-                        0,
+                        &[(
+                            "logits".to_string(),
+                            0,
+                            Value::F32(rows[l as usize].clone()),
+                        )],
                         eta_ir::registry::Stage::Epilogue,
                     )
                     .expect("the interpreter steps");

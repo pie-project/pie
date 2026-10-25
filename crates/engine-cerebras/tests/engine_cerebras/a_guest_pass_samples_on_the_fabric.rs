@@ -11,7 +11,7 @@ use engine::channel::{ChannelId, ChannelSeed};
 use engine::program::{InstanceBinding, InstanceId, ProgramRegistration};
 use engine_cerebras::device::{Buffer, Device, Platform};
 use engine_cerebras::program::Plane;
-use engine_cerebras::readout::Kept;
+use engine_cerebras::readout::{Kept, Seat};
 use engine_cerebras::sdk::Target;
 use eta_compiler::plan::compile_bound;
 use eta_exec::Value;
@@ -274,21 +274,29 @@ fn a_guest_pass_samples_on_the_fabric_as_the_interpreter_does() {
         let plane = logits_plane(lanes, vocab, 100 + step as u64);
         let words: Vec<u32> = plane.iter().map(|x| x.to_bits()).collect();
         let buffer = Buffer::new(dtype::Dtype::F32, lanes, vocab, words).expect("a plane");
-        let kept = Kept::new(
-            buffer,
-            lanes,
-            vocab,
-            None,
-            (0..lanes).map(|l| (l, 1)).collect(),
-        );
+        let kept = Kept {
+            planes: vec![engine_cerebras::readout::Plane {
+                name: "logits".to_string(),
+                axis: poem_ir::InputAxis::Row,
+                readout: true,
+                buffer,
+                rows: lanes,
+                width: vocab,
+                layers: 0,
+                dtype: dtype::Dtype::F32,
+            }],
+            seats: (0..lanes)
+                .map(|l| vec![Some(Seat { first: l, count: 1 })])
+                .collect(),
+            readback: (0..lanes).map(|l| Some((0, vec![l]))).collect(),
+            pixels: (String::new(), Vec::new()),
+        };
         let attached: Vec<(InstanceId, u32)> = (0..lanes).map(|l| (ids[&l].0, l)).collect();
         let ran = device_plane
             .fire_guests(
                 &device,
                 &attached,
                 Some(&kept),
-                vocab,
-                0,
                 eta_ir::registry::Stage::Epilogue,
             )
             .expect("the guest passes run");
@@ -298,15 +306,11 @@ fn a_guest_pass_samples_on_the_fabric_as_the_interpreter_does() {
         );
         for l in 0..lanes {
             let (d, h) = ids[&l];
-            let row = kept.lane_rows(l as usize).expect("rows");
+            let row = kept.lane_value(l as usize, "logits").expect("rows");
             host_plane
                 .fire_interpreted(
                     h,
-                    Some(&row),
-                    1,
-                    vocab,
-                    None,
-                    0,
+                    &[("logits".to_string(), 0, row.expect("the lane reads logits"))],
                     eta_ir::registry::Stage::Epilogue,
                 )
                 .expect("the interpreter steps");

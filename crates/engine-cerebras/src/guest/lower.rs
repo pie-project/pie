@@ -56,14 +56,25 @@ fn refuse<T>(why: impl Into<String>) -> Lowering<T> {
     Err(Refused(why.into()))
 }
 
+/// Output `name` of the pass's lane `lane`, cut by the host from a fire's
+/// plane `layers` deep (0: one), `width` of `dtype` wide.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Read {
+    pub name: String,
+    pub lane: u32,
+    pub layers: u32,
+    pub width: u32,
+    pub dtype: Dtype,
+}
+
 /// The shape of one lowering: how many lanes, how many PEs each lane
-/// spreads over, and the width of the readout planes the host cuts rows
-/// from (`None`: the intrinsic is fed as a value).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// spreads over, and the outputs the host cuts rows of (any other output
+/// is fed as a value).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Batch {
     pub lanes: u32,
     pub cols: u32,
-    pub logits: Option<u32>,
+    pub reads: Vec<Read>,
 }
 
 /// What a packed slot carries.
@@ -72,10 +83,10 @@ pub enum Feed {
     /// The value itself: `dtype` over `numel` elements (a wide value: the
     /// PE's block of them).
     Value(Dtype, usize),
-    /// `rows` rows of `width` f32 words the host cuts from the readout,
-    /// starting at the lane's first row (a wide feed: the PE's block of
-    /// each row).
-    Rows { rows: u32, width: u32 },
+    /// `rows` rows of `width` words the host cuts from `Layout::reads[read]`,
+    /// each layer's from the lane's first row (a wide feed: the PE's block
+    /// of each row).
+    Rows { read: usize, rows: u32, width: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -114,6 +125,8 @@ pub struct Layout {
     pub out_words: usize,
     /// PEs a lane spreads over.
     pub cols: u32,
+    /// The outputs the host cuts rows of.
+    pub reads: Vec<Read>,
     /// The wide axis (the vocabulary), when the stage has one.
     pub wide: Option<u32>,
     /// Elements of the wide axis each PE holds (`block_len`): PE `x` holds
@@ -261,15 +274,16 @@ pub fn roots(package: &LaunchPackage, at: usize) -> Vec<u32> {
     roots
 }
 
-/// Whether stage `at` reads the readout rows (a float output).
+/// The outputs stage `at` reads, by name and the pass's lane.
 #[must_use]
-pub fn reads(package: &LaunchPackage, at: usize) -> bool {
-    roots(package, at).iter().any(|&id| {
-        package
-            .values
-            .get(id as usize)
-            .is_some_and(|v| v.output.is_some() && v.dtype == Dtype::F32)
-    })
+pub fn outputs(package: &LaunchPackage, at: usize) -> Vec<(String, u32)> {
+    roots(package, at)
+        .iter()
+        .filter_map(|&id| {
+            let value = package.values.get(id as usize)?;
+            Some((value.output.clone()?, value.lane))
+        })
+        .collect()
 }
 
 /// The wide axis of `package`: the last dimension of a float output it
@@ -533,21 +547,35 @@ pub fn lower(package: &LaunchPackage, at: usize, batch: Batch) -> Lowering<Lower
             ValueOrigin::ChannelTake | ValueOrigin::ChannelRead => Feed::Value(value.dtype, n),
             ValueOrigin::Output => {
                 let name = value.output.as_deref().unwrap_or("");
-                if value.dtype != Dtype::F32 {
-                    return refuse(format!(
-                        "output `{name}` is read as {:?}; the fabric reads float readout rows",
-                        value.dtype
-                    ));
-                }
-                match batch.logits {
+                let found =
+                    (batch.reads.iter()).find(|read| read.name == name && read.lane == value.lane);
+                match found {
                     None => Feed::Value(value.dtype, n),
-                    Some(width) => {
-                        if width == 0 || !n.is_multiple_of(width as usize) {
+                    Some(read) => {
+                        if read.dtype != value.dtype {
                             return refuse(format!(
-                                "output `{name}` holds {n} values, not whole {width}-wide rows"
+                                "output `{name}` is read as {:?} and lands as {:?}",
+                                value.dtype, read.dtype
                             ));
                         }
+                        let width = read.width;
+                        let per = width as usize * read.layers.max(1) as usize;
+                        if per == 0 || !n.is_multiple_of(per) {
+                            return refuse(format!(
+                                "output `{name}` holds {n} values, not whole {width}-wide rows \
+                                 of {} layer(s)",
+                                read.layers.max(1)
+                            ));
+                        }
+                        let at = match layout.reads.iter().position(|seen| seen == read) {
+                            Some(at) => at,
+                            None => {
+                                layout.reads.push(read.clone());
+                                layout.reads.len() - 1
+                            }
+                        };
                         Feed::Rows {
+                            read: at,
                             rows: (n / width as usize) as u32,
                             width,
                         }
@@ -563,16 +591,13 @@ pub fn lower(package: &LaunchPackage, at: usize, batch: Batch) -> Lowering<Lower
         let (per_pe, wide_slot) = match feed {
             Feed::Value(dtype, _) => (block_of(dtype, id), w),
             Feed::Rows { rows, width, .. } => {
-                if cols > 1 && Some(width) != wide {
+                if w && Some(width) != wide {
                     return refuse(format!(
-                        "a {width}-wide readout beside a {}-wide axis",
+                        "a {width}-wide output beside a {}-wide axis",
                         wide.unwrap_or(0)
                     ));
                 }
-                (
-                    rows as usize * if cols > 1 { block } else { width as usize },
-                    cols > 1,
-                )
+                (rows as usize * if w { block } else { width as usize }, w)
             }
         };
         let direct = !matches!(feed, Feed::Value(Dtype::Bool, _));
@@ -1199,11 +1224,9 @@ impl Gen<'_> {
             }
             Feed::Rows { .. } => {
                 // The rows land in the value's array itself.
-                if ty != Ty::F32 {
-                    return refuse("a readout is f32");
-                }
-                let v = self.fresh(Ty::F32, n, slot.wide, id);
-                self.exports.push((v.name.clone(), "f32", format!("in{k}")));
+                let v = self.fresh(ty, n, slot.wide, id);
+                self.exports
+                    .push((v.name.clone(), ty.elem(), format!("in{k}")));
                 self.bind(id, v);
             }
         }

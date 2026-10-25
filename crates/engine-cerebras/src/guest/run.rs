@@ -2,7 +2,7 @@
 //!
 //! [`OnDevice`] is an `eta_exec::StageRunner`: `eta_exec::step_with` drives
 //! one instance's pass and hands each stage here, which packs the stage's
-//! roots (and the readout rows the stage reads) into one upload, one row
+//! roots (and the output rows the stage reads) into one upload, one row
 //! per PE, runs the stage's program and unpacks the one download of what
 //! the stage puts.
 
@@ -13,9 +13,42 @@ use eta_compiler::codegen::launch::{LaunchPackage, LaunchValue};
 use eta_exec::{BatchRunner, ExecPlan, Lane, StagePlan, StageRunner, Value};
 use eta_ir::Dtype;
 
-use super::lower::{self, Batch, Feed, Layout};
+use super::lower::{self, Batch, Feed, Layout, Read};
 use crate::device::{Arg, Buffer, Device, Program};
 use crate::readout::{Kept, Seat};
+
+/// Where a pass reads output `name` of its lane `lane`: plane `plane` of
+/// the fire's, at `seat`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bound {
+    pub name: String,
+    pub lane: u32,
+    pub plane: usize,
+    pub seat: Seat,
+}
+
+/// Where an instance attached at the fire's lane `lane` reads every output
+/// `plan` reads, when each binds on the fabric.
+#[must_use]
+pub fn bound(plan: &ExecPlan, kept: Option<&Kept>, lane: u32) -> Option<Vec<Bound>> {
+    let kept = kept?;
+    let bound: Vec<Bound> = (plan.outputs().into_iter())
+        .map(|(name, k)| {
+            let (plane, seat) = kept.bound(lane as usize + k as usize, name)?;
+            Some(Bound {
+                name: name.to_string(),
+                lane: k,
+                plane,
+                seat,
+            })
+        })
+        .collect::<Option<_>>()?;
+    let binds = plan.package.values.iter().all(|v| {
+        v.source != eta_compiler::codegen::launch::ValueOrigin::Output
+            || device_binds(v, Some(kept), &bound)
+    });
+    binds.then_some(bound)
+}
 use crate::trace::{Signature, Source};
 
 /// A lowered stage, compiled; `program` is `None` for a stage that puts
@@ -47,7 +80,7 @@ impl Stages {
         at: usize,
         batch: Batch,
     ) -> Result<Arc<Staged>, String> {
-        let slot = (key, at, batch);
+        let slot = (key, at, batch.clone());
         if let Some(hit) = self.map.get(&slot) {
             return Ok(Arc::clone(hit));
         }
@@ -95,7 +128,7 @@ impl Stages {
 }
 
 /// The batch shape of stage `at` for `lanes` lanes over `cols` PEs each,
-/// reading `kept`.
+/// its outputs read off `kept` where `bound` says.
 #[must_use]
 pub fn batch_of(
     package: &LaunchPackage,
@@ -103,13 +136,24 @@ pub fn batch_of(
     lanes: u32,
     cols: u32,
     kept: Option<&Kept>,
+    bound: &[Bound],
 ) -> Batch {
-    let logits = lower::reads(package, at);
-    Batch {
-        lanes,
-        cols,
-        logits: kept.filter(|_| logits).map(|k| k.width),
-    }
+    let reads = kept.map_or_else(Vec::new, |kept| {
+        (lower::outputs(package, at).into_iter())
+            .filter_map(|(name, lane)| {
+                let b = bound.iter().find(|b| b.name == name && b.lane == lane)?;
+                let plane = &kept.planes[b.plane];
+                Some(Read {
+                    name,
+                    lane,
+                    layers: plane.layers,
+                    width: plane.width,
+                    dtype: plane.dtype,
+                })
+            })
+            .collect()
+    });
+    Batch { lanes, cols, reads }
 }
 
 /// The fewest PEs a lane of `package` spreads over so that every stage
@@ -131,7 +175,7 @@ pub fn columns_above(package: &LaunchPackage, above: u32) -> Option<u32> {
                 Batch {
                     lanes: 1,
                     cols,
-                    logits: None,
+                    reads: Vec::new(),
                 },
             )
             .is_ok()
@@ -150,7 +194,9 @@ pub enum Unfit {
 }
 
 /// Compiles every stage of `package` for a batch of `lanes` lanes over
-/// `cols` PEs each (reading `kept`), so a pass finds them ready.
+/// `cols` PEs each (reading `kept` where `bound` says), so a pass finds
+/// them ready.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare(
     device: &Device,
     stages: &mut Stages,
@@ -159,9 +205,10 @@ pub fn prepare(
     cols: u32,
     lanes: u32,
     kept: Option<&Kept>,
+    bound: &[Bound],
 ) -> Result<(), Unfit> {
     for at in 0..package.stages.len() {
-        let batch = batch_of(package, at, lanes, cols, kept);
+        let batch = batch_of(package, at, lanes, cols, kept, bound);
         if let Err(why) = stages.get(device, package, key, at, batch) {
             return Err(if why.contains("ran out of PE memory") {
                 Unfit::Memory(format!("stage {at}: {why}"))
@@ -311,10 +358,10 @@ fn stitch(parts: &[Value], v: usize, block: usize, rows: usize) -> Value {
 }
 
 /// One lane's feed for a stage: its values (by package-global id; only the
-/// stage's roots are read) and where its readout rows sit.
+/// stage's roots are read) and where its outputs sit.
 pub struct Feeding<'a> {
     pub vals: &'a [Value],
-    pub seat: Option<Seat>,
+    pub bound: &'a [Bound],
 }
 
 /// Packs `lanes`' roots (padded to the staged batch by repeating lane 0),
@@ -364,28 +411,39 @@ pub fn run_stage(
                             encode(value, dtype, n, words)?;
                         }
                     }
-                    Feed::Rows { rows, width } => {
-                        let seat = lane.seat.ok_or_else(|| {
-                            "this pass reads readout rows and its lane offered none".to_owned()
-                        })?;
-                        if rows > seat.count {
-                            return Err("an output's row range exceeds the forward's readout rows"
-                                .to_owned());
-                        }
+                    Feed::Rows { read, rows, width } => {
+                        let read = &layout.reads[read];
+                        let b = (lane.bound.iter())
+                            .find(|b| b.name == read.name && b.lane == read.lane)
+                            .ok_or_else(|| {
+                                format!(
+                                    "this pass reads output `{}` and its lane binds none",
+                                    read.name
+                                )
+                            })?;
                         let kept =
-                            kept.ok_or("this stage reads a readout and the fire kept none")?;
-                        let plane: &Buffer = &kept.logits;
+                            kept.ok_or("this stage reads an output and the fire kept none")?;
+                        let plane = &kept.planes[b.plane];
+                        let per = rows / read.layers.max(1);
+                        if per > b.seat.count {
+                            return Err(format!(
+                                "this pass reads {per} rows of output `{}` and its lane holds {}",
+                                read.name, b.seat.count
+                            ));
+                        }
                         let width = width as usize;
                         let (block, held) = if slot.wide {
                             (block, width.saturating_sub(x * block).min(block))
                         } else {
                             (width, width)
                         };
-                        for r in 0..rows as usize {
-                            let from = (seat.first as usize + r) * width + (x * block).min(width);
-                            let cut = plane.words().get(from..from + held).ok_or(
-                                "the readout rows the stage reads are past the kept plane",
-                            )?;
+                        for r in 0..rows {
+                            let row = b.seat.first + r % per.max(1) + r / per.max(1) * plane.rows;
+                            let from = row as usize * width + (x * block).min(width);
+                            let cut =
+                                plane.buffer.words().get(from..from + held).ok_or(
+                                    "the output rows the stage reads are past the kept plane",
+                                )?;
                             words.extend_from_slice(cut);
                             words.resize(words.len() + block - held, 0);
                         }
@@ -503,8 +561,8 @@ pub struct OnDeviceMany<'a> {
     /// PEs a lane spreads over.
     cols: u32,
     kept: Option<&'a Kept>,
-    /// Each lane's seat in the readout.
-    seats: Vec<Option<Seat>>,
+    /// Where each lane reads its outputs; every lane reads the same planes.
+    bound: Vec<Vec<Bound>>,
     ran: usize,
 }
 
@@ -515,7 +573,7 @@ impl<'a> OnDeviceMany<'a> {
         key: [u8; 32],
         cols: u32,
         kept: Option<&'a Kept>,
-        seats: Vec<Option<Seat>>,
+        bound: Vec<Vec<Bound>>,
     ) -> OnDeviceMany<'a> {
         OnDeviceMany {
             device,
@@ -523,7 +581,7 @@ impl<'a> OnDeviceMany<'a> {
             key,
             cols,
             kept,
-            seats,
+            bound,
             ran: 0,
         }
     }
@@ -544,7 +602,15 @@ impl BatchRunner for OnDeviceMany<'_> {
     ) -> eta_exec::Result<()> {
         let at = sp.stage_index;
         let fail = |message: String| eta_exec::Error { message };
-        let batch = batch_of(&plan.package, at, lanes.len() as u32, self.cols, self.kept);
+        let first = self.bound.first().map_or(&[][..], Vec::as_slice);
+        let batch = batch_of(
+            &plan.package,
+            at,
+            lanes.len() as u32,
+            self.cols,
+            self.kept,
+            first,
+        );
         let staged = self
             .stages
             .get(self.device, &plan.package, self.key, at, batch)
@@ -553,7 +619,7 @@ impl BatchRunner for OnDeviceMany<'_> {
             .iter()
             .map(|lane| Feeding {
                 vals: lane.vals,
-                seat: self.seats.get(lane.index).copied().flatten(),
+                bound: self.bound.get(lane.index).map_or(&[][..], Vec::as_slice),
             })
             .collect();
         let outs = run_stage(self.device, &staged, self.kept, &feedings).map_err(fail)?;
@@ -569,18 +635,24 @@ impl BatchRunner for OnDeviceMany<'_> {
     }
 
     fn binds(&self, lane: usize, root: &LaunchValue) -> bool {
-        device_binds(root, self.kept, self.seats.get(lane).copied().flatten())
+        device_binds(
+            root,
+            self.kept,
+            self.bound.get(lane).map_or(&[][..], Vec::as_slice),
+        )
     }
 }
 
-/// Whether the device binds the output `root` reads for a lane seated at
-/// `seat` in `kept`: a float output, from the readout rows.
+/// Whether the device binds the output `root` reads where `bound` says: a
+/// plane of `kept` landed as the dtype the program reads.
 #[must_use]
-pub fn device_binds(root: &LaunchValue, kept: Option<&Kept>, seat: Option<Seat>) -> bool {
-    root.output.is_some()
-        && root.dtype == Dtype::F32
-        && kept.is_some_and(|k| k.f32)
-        && seat.is_some()
+pub fn device_binds(root: &LaunchValue, kept: Option<&Kept>, bound: &[Bound]) -> bool {
+    let (Some(kept), Some(name)) = (kept, root.output.as_deref()) else {
+        return false;
+    };
+    (bound.iter())
+        .find(|b| b.name == name && b.lane == root.lane)
+        .is_some_and(|b| kept.planes[b.plane].dtype == root.dtype)
 }
 
 /// One instance's stages on the fabric, as `step_with`'s runner.
@@ -591,7 +663,7 @@ pub struct OnDevice<'a> {
     /// PEs the lane spreads over.
     cols: u32,
     kept: Option<&'a Kept>,
-    seat: Option<Seat>,
+    bound: Vec<Bound>,
     ran: usize,
 }
 
@@ -602,7 +674,7 @@ impl<'a> OnDevice<'a> {
         key: [u8; 32],
         cols: u32,
         kept: Option<&'a Kept>,
-        seat: Option<Seat>,
+        bound: Vec<Bound>,
     ) -> OnDevice<'a> {
         OnDevice {
             device,
@@ -610,7 +682,7 @@ impl<'a> OnDevice<'a> {
             key,
             cols,
             kept,
-            seat,
+            bound,
             ran: 0,
         }
     }
@@ -633,7 +705,7 @@ impl StageRunner for OnDevice<'_> {
     ) -> eta_exec::Result<()> {
         let at = sp.stage_index;
         let fail = |message: String| eta_exec::Error { message };
-        let batch = batch_of(&plan.package, at, 1, self.cols, self.seat.and(self.kept));
+        let batch = batch_of(&plan.package, at, 1, self.cols, self.kept, &self.bound);
         let staged = self
             .stages
             .get(self.device, &plan.package, self.key, at, batch)
@@ -644,7 +716,7 @@ impl StageRunner for OnDevice<'_> {
             self.kept,
             &[Feeding {
                 vals,
-                seat: self.seat,
+                bound: &self.bound,
             }],
         )
         .map_err(fail)?;
@@ -658,6 +730,6 @@ impl StageRunner for OnDevice<'_> {
     }
 
     fn binds(&self, root: &LaunchValue) -> bool {
-        device_binds(root, self.kept, self.seat)
+        device_binds(root, self.kept, &self.bound)
     }
 }

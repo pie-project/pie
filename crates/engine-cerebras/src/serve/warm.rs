@@ -45,7 +45,6 @@ impl Shell {
                 !shell.masked.contains(class)
                     && !shell.wide.contains(class)
                     && !shell.corrected.contains(class)
-                    && !shell.capturing.contains(class)
             })
         };
         if !plain(self, decode) || !plain(self, prefill) || self.patch_seat.is_some() {

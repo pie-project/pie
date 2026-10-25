@@ -54,7 +54,7 @@ pub fn admits(package: &LaunchPackage) -> Result<u32, Refused> {
             lower::Batch {
                 lanes: 1,
                 cols: widest,
-                logits: None,
+                reads: Vec::new(),
             },
         )?;
     }

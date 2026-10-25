@@ -13,8 +13,8 @@
 use std::collections::BTreeMap;
 
 use engine_xla::device::Device;
-use engine_xla::guest::run::{Member, OnDevice, Stages, step_group};
-use engine_xla::readout::{Kept, Seat};
+use engine_xla::guest::run::{Bound, Member, OnDevice, Stages, step_group};
+use engine_xla::readout::{Kept, Plane, Seat};
 use eta_compiler::plan::compile_bound;
 use eta_exec::{ExecPlan, InterpInstance, PassInputs, StepOutcome, Value};
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
@@ -187,21 +187,43 @@ fn kept(device: &Device, plane: &[f32], rows: u32, layout: Vec<(u32, u32)>) -> K
     let buffer = device
         .upload(Dtype::F32, rows, width, &bytes)
         .expect("the plane uploads");
-    Kept::new(buffer, rows, width, None, layout)
+    let plane = Plane::new(
+        "logits".to_string(),
+        poem_ir::InputAxis::Row,
+        true,
+        buffer,
+        rows,
+        width,
+        0,
+        Dtype::F32,
+    );
+    Kept {
+        planes: vec![plane],
+        seats: (layout.iter())
+            .map(|&(first, count)| vec![Some(Seat { first, count })])
+            .collect(),
+        readback: vec![None; layout.len()],
+        pixels: (String::new(), Vec::new()),
+    }
 }
 
-/// The device's answer for one lane seated at `seat` of `kept`.
+/// Where the program reads its outputs for the fire's lane `lane`.
+fn bound(plan: &ExecPlan, kept: &Kept, lane: usize) -> Vec<Bound> {
+    engine_xla::guest::run::bound(plan, Some(kept), lane as u32).expect("the lane binds")
+}
+
+/// The device's answer for one lane reading its outputs where `bound` says.
 fn on_device(
     device: &Device,
     stages: &mut Stages,
     plan: &ExecPlan,
     seeds: &[(u32, Value)],
     kept: Option<&Kept>,
-    seat: Option<Seat>,
+    bound: Vec<Bound>,
     channels: &[u32],
 ) -> Vec<Value> {
     let mut inst = instance(plan, seeds);
-    let mut runner = OnDevice::new(device, stages, key_of(plan), kept, seat);
+    let mut runner = OnDevice::new(device, stages, key_of(plan), kept, bound);
     let outcome = eta_exec::step_with(
         &mut inst,
         plan,
@@ -1037,8 +1059,15 @@ fn the_statistics_agree(device: &Device, stages: &mut Stages) {
     let mut shared = logits_plane(2, VOCAB, 99);
     shared.extend_from_slice(&plane);
     let kept = kept(device, &shared, ROWS + 2, vec![(0, 2), (2, ROWS)]);
-    let seat = kept.seat(1, 1);
-    let got = on_device(device, stages, &plan, &seeds, Some(&kept), seat, &outs);
+    let got = on_device(
+        device,
+        stages,
+        &plan,
+        &seeds,
+        Some(&kept),
+        bound(&plan, &kept, 1),
+        &outs,
+    );
     close(&got[0], &want[0], 1e-5, "gather_row of the scaled logits");
     exact(&got[1], &want[1], "argmax per row");
     exact(&got[2], &want[2], "top-4 ids per row");
@@ -1070,7 +1099,7 @@ fn the_acceptance_rule_agrees(device: &Device, stages: &mut Stages) {
         ),
     ];
     let want = host(&plan, &seeds, &[], 0, &outs);
-    let got = on_device(device, stages, &plan, &seeds, None, None, &outs);
+    let got = on_device(device, stages, &plan, &seeds, None, Vec::new(), &outs);
     for i in 0..5 {
         exact(&got[i], &want[i], &format!("acceptance output {i}"));
     }
@@ -1082,7 +1111,7 @@ fn the_corners_agree(device: &Device, stages: &mut Stages) {
     let plan = plan_of(container, VOCAB);
     let seeds = corner_seeds();
     let want = host(&plan, &seeds, &[], 0, &outs);
-    let got = on_device(device, stages, &plan, &seeds, None, None, &outs);
+    let got = on_device(device, stages, &plan, &seeds, None, Vec::new(), &outs);
     let mut floats = 0;
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
         match w {
@@ -1115,7 +1144,7 @@ fn the_sampler_agrees(device: &Device, stages: &mut Stages, vocab: u32) {
             &plan,
             &seeds,
             Some(&kept),
-            kept.seat(0, 1),
+            bound(&plan, &kept, 0),
             &outs,
         );
         exact(&got[0], &want[0], "the sampled token");
@@ -1148,7 +1177,7 @@ fn the_rowwise_sampler_agrees(device: &Device, stages: &mut Stages) {
         &plan,
         &seeds,
         Some(&kept),
-        kept.seat(0, 1),
+        bound(&plan, &kept, 0),
         &outs,
     );
     exact(&got[0], &want[0], "the sampled tokens");
@@ -1173,7 +1202,7 @@ fn a_group_answers_what_each_lane_answers_alone(device: &Device, stages: &mut St
         .zip(seated)
         .map(|(inst, lane)| Member {
             inst,
-            seat: kept.seat(lane, 1),
+            bound: bound(&plan, &kept, lane),
         })
         .collect();
     let (outcomes, _) = step_group(
@@ -1303,7 +1332,7 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
             .enumerate()
             .map(|(l, inst)| Member {
                 inst,
-                seat: kept.seat(l, 1),
+                bound: bound(&plan, &kept, l),
             })
             .collect();
         let (outcomes, next) = step_group(

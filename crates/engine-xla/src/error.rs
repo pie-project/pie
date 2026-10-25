@@ -170,10 +170,6 @@ pub enum Fault {
 
     Residency(String),
 
-    Scoreless {
-        lane: u32,
-    },
-
     Backing {
         step: &'static str,
 
@@ -321,11 +317,6 @@ impl fmt::Display for Fault {
                     )
                 }
             }
-            Self::Scoreless { lane } => write!(
-                f,
-                "lane {lane} lands in a class capturing attention scores, which this \
-                 shell does not run (`attn.score_capture` is not ported to XLA)"
-            ),
             Self::Backing { step, bytes, why } => write!(
                 f,
                 "this load streams {bytes} bytes of routed experts and the temporary file \

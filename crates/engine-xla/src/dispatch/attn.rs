@@ -26,7 +26,71 @@ impl Run<'_> {
 
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_xla::Error> {
         match op {
-            Attn::ScoreCapture { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
+            Attn::ScoreCapture {
+                q,
+                plan,
+                cache,
+                head_dim,
+                kv_heads,
+                sm_scale,
+                observe,
+                kv_max,
+                scores,
+            } => {
+                let pool = *self.pool(*cache);
+                let span = self.window().span;
+                let page_indptr =
+                    (self.handles()).cut(pool.page_indptr, span.lane_offset, span.lanes + 1);
+                let q = self.ragged(*q);
+                let positions = self.prefill_plan(*plan).positions;
+                let scores = self.tensor(*scores);
+                let requests = self.requests();
+                let (head_dim, kv_heads, sm_scale, observe, kv_max) =
+                    (*head_dim, *kv_heads, *sm_scale, *observe, *kv_max);
+                crate::lower::lower(self.ctx(), |l| {
+                    let page_indptr = l.read(page_indptr)?;
+                    let page_indices = l.read(pool.page_indices)?;
+                    let indptr = l.read(q.indptr)?;
+                    let positions = l.read(positions)?;
+                    let data = l.read(q.data)?;
+                    let keys = l.read(pool.keys)?;
+                    let slab = l.read(scores)?;
+                    let heads = data.width / head_dim.max(1);
+                    // The slab as a `kv_max` row per lane and head.
+                    let slab = kernels_xla::tensor::Operand {
+                        val: l.f().reshape(
+                            slab.val,
+                            &[i64::from(scores.rows * heads), i64::from(kv_max)],
+                        )?,
+                        rows: scores.rows * heads,
+                        width: kv_max,
+                        dtype: slab.dtype,
+                    };
+                    let tuning = l.tuning();
+                    let v = attn::score::capture(
+                        l.f(),
+                        kernels_xla::tensor::RaggedTensor { data, indptr },
+                        positions,
+                        keys,
+                        page_indptr,
+                        page_indices,
+                        &pool,
+                        None,
+                        head_dim,
+                        kv_heads,
+                        sm_scale,
+                        observe,
+                        0,
+                        heads,
+                        0,
+                        kv_max,
+                        requests,
+                        slab,
+                        tuning,
+                    )?;
+                    l.land(scores, v)
+                })
+            }
             Attn::Voxel {
                 q,
                 k,

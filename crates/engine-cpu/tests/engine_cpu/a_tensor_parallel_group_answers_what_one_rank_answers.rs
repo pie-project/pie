@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use engine_cpu::forward::{Output, Values};
 use engine_cpu::{Exchange, Forward, Group};
 use poem::star::{Deploy, Package};
 use poem_ir::{Dtype, Platform, Request, Trace};
@@ -102,14 +103,28 @@ fn plane(name: &str, count: usize) -> Vec<f32> {
 }
 
 fn word(trace: &Trace, tokens: usize) -> u64 {
-    trace.facts.word(&Request::new(tokens as u32, false))
+    (trace.facts).word(&Request::new(tokens as u32, false).capturing_scores(true))
 }
 
 const PROMPT: [u32; 9] = [7, 300, 41, 511, 2, 96, 257, 13, 404];
 const NEXT: u32 = 77;
 
-/// The prefill's and the decode's logits of one forward, `group` its rank.
-fn steps(trace: &Trace, group: Option<Group>) -> [Vec<f32>; 2] {
+/// A step's logits and its attention scores, a layer after another.
+type Read = [Vec<f32>; 2];
+
+fn read(outs: Vec<Output>) -> Read {
+    let floats = |name: &str| match outs.iter().find(|out| out.name == name) {
+        Some(Output {
+            values: Values::F32(v),
+            ..
+        }) => v.clone(),
+        _ => panic!("the step reads out no `{name}`"),
+    };
+    [floats("logits"), floats("attn.scores")]
+}
+
+/// The prefill's and the decode's reads of one forward, `group` its rank.
+fn steps(trace: &Trace, group: Option<Group>) -> [Read; 2] {
     let mut me = Forward::new(trace.clone(), group, &plane).expect("the micro loads");
     let first = me
         .step(&PROMPT, 0, word(trace, PROMPT.len()))
@@ -117,10 +132,10 @@ fn steps(trace: &Trace, group: Option<Group>) -> [Vec<f32>; 2] {
     let second = me
         .step(&[NEXT], PROMPT.len() as u32, word(trace, 1))
         .expect("the decode runs");
-    [first, second]
+    [read(first), read(second)]
 }
 
-fn group(trace: &Trace, ranks: usize) -> Vec<[Vec<f32>; 2]> {
+fn group(trace: &Trace, ranks: usize) -> Vec<[Read; 2]> {
     let exchange = Exchange::new(ranks);
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..ranks)
@@ -149,9 +164,18 @@ fn a_tensor_parallel_group_answers_what_one_rank_answers() {
     let package = micro();
     let whole = lowered(&package, 1);
     let want = steps(&whole, None);
-    for logits in &want {
+    for (s, [logits, scores]) in want.iter().enumerate() {
         assert_eq!(logits.len(), 512, "a micro's vocabulary");
         assert!(logits.iter().all(|v| v.is_finite()), "one rank's logits");
+        let keys = PROMPT.len() + s;
+        assert_eq!(scores.len(), 4 * 8 * 2048, "a run per layer and head");
+        for run in scores.chunks(2048) {
+            let mass: f32 = run[..keys].iter().sum();
+            assert!(
+                (mass - 1.0).abs() < 1e-4 && run[keys..].iter().all(|&v| v == 0.0),
+                "a head's mass is over the keys it holds: {mass}"
+            );
+        }
     }
     for ranks in [2u32, 4, 8] {
         let split = lowered(&package, ranks);
@@ -175,11 +199,13 @@ fn a_tensor_parallel_group_answers_what_one_rank_answers() {
         let got = group(&split, ranks as usize);
         for (r, got) in got.iter().enumerate() {
             for (s, step) in ["prefill", "decode"].iter().enumerate() {
-                let off = apart(&got[s], &want[s]);
-                assert!(
-                    off < 1e-4,
-                    "{ranks} ranks: rank {r}'s {step} logits are {off} apart from one rank's"
-                );
+                for (k, what) in ["logits", "scores"].iter().enumerate() {
+                    let off = apart(&got[s][k], &want[s][k]);
+                    assert!(
+                        off < 1e-4,
+                        "{ranks} ranks: rank {r}'s {step} {what} are {off} apart from one rank's"
+                    );
+                }
             }
         }
     }

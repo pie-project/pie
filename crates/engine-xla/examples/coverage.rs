@@ -9,8 +9,8 @@
 //! cargo run --release -p engine-xla --example coverage -- [--compile] [--lean] [--dump DIR] [-v] [filter...]
 //! ```
 //!
-//! `--lean` skips the classes that run a custom-mask, adapter or score
-//! capture arm. `--compile` also compiles every emitted program on the PJRT device
+//! `--lean` skips the classes that run a custom-mask or adapter arm.
+//! `--compile` also compiles every emitted program on the PJRT device
 //! (under the device lock, `PIE_XLA_PLUGIN`); `--dump DIR` writes each
 //! deployment's programs as `DIR/<deployment>.<n>.mlir`; `-v` prints every fire.
 

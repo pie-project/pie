@@ -100,9 +100,6 @@ struct StepSettle {
     pixels: Vec<crate::serve::Pixels>,
     on_device: Vec<bool>,
     policies: Vec<Readout>,
-    seam: crate::serve::Readback,
-    /// The outputs a lane's rows and its pixels are read back under.
-    names: (String, String),
 }
 
 /// `PIE_XLA_SYNC=1`: every frame settles inside `submit`.
@@ -204,7 +201,6 @@ pub(crate) fn fault(fault: Fault) -> Error {
         | Fault::Positions { .. }
         | Fault::Adapterless { .. }
         | Fault::AdapterWord { .. }
-        | Fault::Scoreless { .. }
         | Fault::Fire(_) => Error::Invalid(fault.to_string()),
         Fault::AdapterSlots { .. } => Error::Exhausted {
             resource: "adapter slots",
@@ -441,7 +437,6 @@ impl Engine for Xla {
             inputs: shell.input_decls(),
             classes: shell.classes(),
         };
-        self.programs.set_readouts(shell.readout_names());
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -881,7 +876,7 @@ impl Xla {
             .ok_or_else(|| Error::Load("the xla engine has no model loaded".into()))?
             .device();
         self.programs
-            .fire_guests(device, &prologues, None, 0, 0, Stage::Prologue)
+            .fire_guests(device, &prologues, None, Stage::Prologue)
             .map_err(refusal)?;
         Ok(())
     }
@@ -1217,14 +1212,10 @@ impl Xla {
         // the host copy is made only for a row something on the host reads.
         shell.feed_tokens(token_feeds);
         let fired = shell.fire_kept_with(&seated, &clips).map_err(fault)?;
-        let seam = shell.readout_seam();
-        let names = shell.readback_names();
-        let vocab = shell.out_width();
-        let mtp_width = shell.mtp_width().unwrap_or(0);
         let kept = fired.kept.clone();
         // The step waits on its fire too, so a fault on the device reaches it.
-        if let Some(kept) = &kept
-            && let Ok(ready) = kept.logits.ready()
+        if let Some(plane) = kept.as_ref().and_then(|kept| kept.planes.first())
+            && let Ok(ready) = plane.buffer.ready()
         {
             latch.hold();
             let hold = std::sync::Arc::clone(latch);
@@ -1258,8 +1249,6 @@ impl Xla {
                     device,
                     &attached,
                     kept.as_deref(),
-                    vocab,
-                    mtp_width,
                     Some(latch),
                     Stage::Epilogue,
                 )
@@ -1276,8 +1265,6 @@ impl Xla {
             pixels: fired.pixels,
             on_device,
             policies: submission.lanes.iter().map(|l| l.readout.clone()).collect(),
-            seam,
-            names,
         };
         Ok((
             FireTicket {
@@ -1289,18 +1276,16 @@ impl Xla {
     }
 }
 
-/// A settled step's readouts: per lane, its pixels, its logits rows (copied
-/// out of the kept readout now), or nothing when a device guest read them.
+/// A settled step's readouts: per lane, its pixels, or the rows of its
+/// read-back output (copied out of the kept planes now), or nothing when a
+/// device guest read its readout rows.
 fn readouts_of(settle: &StepSettle) -> EngineResult<Vec<LaneReadout>> {
     let StepSettle {
         kept,
         pixels,
         on_device,
         policies,
-        seam,
-        names,
     } = settle;
-    let seam = *seam;
     policies
         .iter()
         .enumerate()
@@ -1315,35 +1300,31 @@ fn readouts_of(settle: &StepSettle) -> EngineResult<Vec<LaneReadout>> {
                     rows: u32::try_from(voxels).unwrap_or(u32::MAX),
                     width: u32::try_from(values.len() / voxels.max(1)).unwrap_or(u32::MAX),
                     values: values.clone(),
-                    output: names.1.clone(),
+                    output: kept
+                        .as_ref()
+                        .map(|kept| kept.pixels.0.clone())
+                        .unwrap_or_default(),
                     clips: boxes.clone(),
                 });
             }
-            if seam == crate::serve::Readback::Pixels {
+            let Some(kept) = kept else {
                 return Ok(LaneReadout::default());
-            }
-            let count = match policy {
-                Readout::None => return Ok(LaneReadout::default()),
-                Readout::Last => 1,
-                Readout::Rows(list) => list.len().max(1),
             };
             // A lane whose guest ran on the device carries its answer in
-            // its program's channels; its logits are not copied out. A
-            // row output's readout is the lane's answer itself.
-            if on_device.get(lane).copied().unwrap_or(false)
-                && seam == crate::serve::Readback::Readout
+            // its program's channels; its readout rows are not copied out.
+            if matches!(policy, Readout::None)
+                || on_device.get(lane).copied().unwrap_or(false) && kept.reads_readout(lane)
             {
                 return Ok(LaneReadout::default());
             }
-            let values = match kept {
-                Some(kept) => kept.lane_rows(lane).map_err(Error::Device)?,
-                None => Vec::new(),
+            let Some((output, rows, values)) = kept.lane_rows(lane).map_err(Error::Device)? else {
+                return Ok(LaneReadout::default());
             };
             Ok(LaneReadout {
-                rows: u32::try_from(count).unwrap_or(u32::MAX),
-                width: u32::try_from(values.len() / count).unwrap_or(u32::MAX),
+                output: output.to_string(),
+                rows,
+                width: u32::try_from(values.len() / rows.max(1) as usize).unwrap_or(u32::MAX),
                 values,
-                output: names.0.clone(),
                 ..LaneReadout::default()
             })
         })
