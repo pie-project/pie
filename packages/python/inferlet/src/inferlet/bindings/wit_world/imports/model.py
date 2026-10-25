@@ -42,13 +42,11 @@ class ForwardKind(Enum):
 class CanvasShape:
     """
     The canvas a diffusion model denoises: how many tokens one block is,
-    and the trunk's hidden width (the row width of a self-conditioning
-    signal). `none` for every other kind — the same fact as
-    `pass-kind() == diffusion`, stated once with its numbers.
+    and the trunk's hidden width. `none` for every other kind — the same
+    fact as `pass-kind() == diffusion`, stated once with its numbers.
     """
     length: int
     hidden: int
-    self_cond_taps: int
 
 class LaneStream(Enum):
     """
@@ -70,43 +68,9 @@ class LaneStream(Enum):
     CONTEXT = 4
     REFERENCE = 5
 
-class PortKind(Enum):
-    """
-    Which runtime input a float port feeds, and so what shape its channel
-    is. `latents`: `[rows, width]`, the lane's own rows, fed
-    from the channel's COMMITTED cell at every submit. `lane-vector`: one
-    `[width]` (or `[1, width]`) row per lane — a timestep, a guidance
-    scale. `context`: `[rows, width]`, an encoder's output, the rows of a
-    `context` lane. `axis-positions`: `[rows, width]` with `width` the
-    axis count (1..=4), the per-row RoPE coordinates. `voxels`: a VAE's
-    tile on the voxel axis — the channel is `[h, w, width]`
-    for a still or `[t, h, w, width]` for a clip, one clip per pass, its
-    shape being the clip's box.
-    """
-    LATENTS = 0
-    LANE_VECTOR = 1
-    CONTEXT = 2
-    AXIS_POSITIONS = 3
-    VOXELS = 4
-
-@dataclass
-class PortFact:
-    """
-    One float input port a reading declares. `dtype` is the CHANNEL's
-    element type the guest must declare (always `f32` today: the WIT
-    dtype set has no bf16; the model's own element type is the engine's
-    marshal). `width` is the trailing extent.
-    """
-    name: str
-    kind: PortKind
-    width: int
-    dtype: pie_inferlet_types.Dtype
-    streams: List[LaneStream]
-    rows: Optional[int]
-
 class AxisRole(Enum):
     """
-    What one axis of an `axis-positions` port means. The rotary space a
+    What one axis of a positions input means. The rotary space a
     DiT was trained in is 1..=4 axes wide and every family orders them
     differently; this names them so a guest can fill the grid without
     knowing the family.
@@ -121,7 +85,7 @@ class PositionConvention:
     """
     WHERE A READING'S LANES SIT IN THE ROTARY SPACE.
     
-    A denoise reading's `axis-positions` port takes one coordinate vector
+    A denoise reading's positions input takes one coordinate vector
     per row, and which coordinate goes where is a family contract the
     guest must not spell (`flux_2`'s `(0, h, w, j)`, `z_image`'s
     `(L + 1, a, b)`). This fact states it, so `latent::positions_for`
@@ -139,7 +103,7 @@ class PositionConvention:
         reference picture in a rotary neighbourhood of its own, clear of
         the target grid at 0.
     
-    `axes` has exactly the port's `width` entries. A family whose
+    `axes` has exactly the positions input's `width` entries. A family whose
     positions do not fit this shape states `none` and its guests build
     their own.
     """
@@ -151,7 +115,7 @@ class PositionConvention:
 
 class ReadoutKind(Enum):
     """
-    Which export seam a reading's epilogue reads: `logits()` for a text
+    Which export seam a lane's epilogue reads: `logits()` for a text
     head, `velocity()` for a denoiser, `hidden()` for an encoder,
     `pixels` for a VAE reading on the voxel axis (one row per output
     voxel of the pass's clip, `readout-width` wide).
@@ -169,21 +133,66 @@ class ReadingFact:
     lane is stamped with; `has-kv` says whether `state` is required
     (else refused) on its pass, `takes-tokens` the same for `embed`;
     `streams` are the lane streams a request submits (one pass per
-    stream, `forward-pass.stream`; empty means text only); `ports` are
-    the float ports `forward-pass.input` binds; `positions` says where
-    its lanes' rows sit in the rotary space; `readout`/`readout-width`
-    say what the epilogue may read and how wide one row is (the
-    `velocity(width)` / `hidden(width)` declaration to make).
+    stream, `forward-pass.stream`; empty means text only); `positions`
+    says where its lanes' rows sit in the rotary space;
+    `readout`/`readout-width` say what the epilogue may read and how wide
+    one row is (the `velocity(width)` / `hidden(width)` declaration to
+    make).
     """
     name: str
     index: int
     has_kv: bool
     takes_tokens: bool
     streams: List[LaneStream]
-    ports: List[PortFact]
     positions: Optional[PositionConvention]
     readout: ReadoutKind
     readout_width: int
+
+class InputAxis(Enum):
+    """
+    What one entry of an input belongs to: its lane, each row of its
+    lane, or each voxel of its lane's clip.
+    """
+    LANE = 0
+    ROW = 1
+    VOXEL = 2
+
+@dataclass
+class InputDecl:
+    """
+    One input the model reads from its guest, by name: `width` values a
+    lane, a row or a voxel, as `dtype` (`f32` for a float input, `i32`
+    for an i32 one; the host marshals to the model's own element type).
+    One name is one input wherever the model reads it. `rows` is the row
+    count a lane binding it carries when the family fixes it (Wan 2.2's
+    512 context rows: its reference zero-pads umT5's answer to 512 and
+    attends every pad row), `none` nearly always.
+    """
+    name: str
+    axis: InputAxis
+    width: int
+    dtype: pie_inferlet_types.Dtype
+    rows: Optional[int]
+
+@dataclass
+class Readout:
+    """
+    What a lane's epilogue reads out, and how wide one row is.
+    """
+    kind: ReadoutKind
+    width: int
+
+@dataclass
+class LaneDecl:
+    """
+    Everything about a lane of the given switches: the inputs it must
+    bind (exactly these, by `forward-pass.input`), whether it binds
+    `state` and `embed`, and what it reads out.
+    """
+    inputs: List[InputDecl]
+    reads_kv: bool
+    embeds: bool
+    readout: Readout
 
 @dataclass
 class LatentSpace:
@@ -276,15 +285,25 @@ def readings() -> List[ReadingFact]:
     `forward-pass.reading` is refused. Static.
     """
     raise NotImplementedError
+def lane(switches: List[Tuple[str, str]]) -> LaneDecl:
+    """
+    The lane a pass of these switches is. Switches are `(name, value)`
+    pairs: `("reading", name)`, `("stream", name)` and, on a diffusion
+    model, `("canvas", "encode" | "denoise")`; one left unset takes its
+    default (the model's one reading, the `text` stream, `encode`).
+    
+    Raises: `componentize_py_types.Err(wit_world.imports.str)`
+    """
+    raise NotImplementedError
 def latent() -> Optional[LatentSpace]:
     raise NotImplementedError
 def schedule() -> Optional[ScheduleFact]:
     raise NotImplementedError
 def max_latent_rows() -> int:
     """
-    The most latent rows one pass may carry: the guest sizes its latent
-    channels (`[rows, width]`) under this. 0 for a model with no float
-    lane. Static.
+    The most rows one lane may carry: the guest sizes its row inputs
+    (`[rows, width]`) under this, the rows the engine's arena holds a
+    fire. Static.
     """
     raise NotImplementedError
 def output_vocab_size() -> int:

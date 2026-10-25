@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
+use poem::generative::{ReadoutKind, ScheduleKind};
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, Operation, Platform, RaggedMask, Request, RopeForm,
     RuntimeInput, Stream, Trace, Ty, seam,
 };
+use poem_ir::InputAxis;
 
 use crate::minimax_h3_dims::{self as model, Dims};
 
@@ -55,7 +56,6 @@ fn seams(plan: &Trace) -> BTreeMap<&str, usize> {
 fn the_minimax_h3_rows_bake_every_case() {
     every_row_traces_on_every_platform_with_the_encoder_it_declares();
     the_seams_are_the_two_float_readouts_and_never_logits();
-    the_ports_the_trace_reads_are_the_ports_the_facts_declare();
     every_lane_the_facts_list_lands_in_a_class_where_the_merges_resolve();
     one_joint_read_per_block_and_one_lane_read_per_refiner();
     the_trunk_turns_three_neox_axes_and_the_refiner_turns_nothing();
@@ -107,100 +107,6 @@ fn the_seams_are_the_two_float_readouts_and_never_logits() {
             Some(&if is_flagship(deployment) { 3 } else { 2 }),
             "`{deployment}`: hidden plantings; found {found:?}"
         );
-    }
-}
-
-fn kind_code(kind: PortKind) -> u8 {
-    match kind {
-        PortKind::Latents => 0,
-        PortKind::LaneVector => 1,
-        PortKind::Context => 2,
-        PortKind::AxisPositions => 3,
-        PortKind::Voxels => 4,
-    }
-}
-
-fn ports_read(plan: &Trace) -> BTreeSet<(u8, u8, u32)> {
-    let mut found = BTreeSet::new();
-    for value in &plan.values {
-        let Def::Input(input) = &value.def else {
-            continue;
-        };
-        let width = |ty: &Ty| match ty {
-            Ty::Tensor { shape, .. } => match shape.as_slice() {
-                [_, Dim::Const(width)] => u32::try_from(*width).unwrap_or(0),
-                _ => 1,
-            },
-            _ => 0,
-        };
-        let entry = match input {
-            RuntimeInput::Latents { port, .. } => {
-                Some((PortKind::Latents, *port, width(&value.ty)))
-            }
-            RuntimeInput::LaneVector { port, width } => Some((PortKind::LaneVector, *port, *width)),
-            RuntimeInput::Context { port, width } => Some((PortKind::Context, *port, *width)),
-            RuntimeInput::AxisPositions { port, axes } => {
-                Some((PortKind::AxisPositions, *port, u32::from(*axes)))
-            }
-            RuntimeInput::Voxels { port, channels } => Some((PortKind::Voxels, *port, *channels)),
-            _ => None,
-        };
-        if let Some((kind, port, width)) = entry {
-            found.insert((kind_code(kind), port, width));
-        }
-    }
-    found
-}
-
-fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
-    for deployment in ROWS {
-        let facts = row(deployment).generative().expect("generative facts");
-        let declared: BTreeSet<(u8, u8, u32)> = facts
-            .readings
-            .iter()
-            .flat_map(|reading| {
-                reading
-                    .ports_indexed()
-                    .map(|(index, port)| (kind_code(port.kind), index, port.width))
-            })
-            .collect();
-        assert_eq!(
-            ports_read(&trace(deployment, Platform::Cuda)),
-            declared,
-            "`{deployment}`: the trace's runtime inputs and the readings' ports"
-        );
-        for reading in &facts.readings {
-            for (positional, port) in reading.ports_indexed() {
-                let (by_name, _) = reading.port(&port.name).expect("a declared port by name");
-                assert_eq!(
-                    by_name, positional,
-                    "`{deployment}` reading `{}` port `{}`: the positional index and the stated one",
-                    reading.name, port.name
-                );
-            }
-        }
-        let denoise = facts
-            .readings
-            .iter()
-            .find(|reading| reading.name == "denoise")
-            .expect("a denoise reading");
-        for (name, kind, index) in [
-            ("latents", PortKind::Latents, model::port::LATENTS),
-            ("reference", PortKind::Latents, model::port::REFERENCE),
-            ("audio", PortKind::Latents, model::port::AUDIO),
-            ("context", PortKind::Latents, model::port::CONTEXT),
-            ("timestep", PortKind::LaneVector, model::port::TIMESTEP),
-            ("positions", PortKind::AxisPositions, model::port::POSITIONS),
-        ] {
-            let (at, fact) = denoise.port(name).unwrap_or_else(|| {
-                panic!("`{deployment}`: the denoise reading declares no `{name}` port")
-            });
-            assert_eq!(
-                (fact.kind, at),
-                (kind, index),
-                "`{deployment}`: port `{name}`"
-            );
-        }
     }
 }
 
@@ -381,17 +287,28 @@ fn the_modality_gather_is_three_weight_blocks_and_one_column_slice() {
             4,
             "`{deployment}`: the four lanes gather four different modulation vectors"
         );
-        let facts = row(deployment).generative().expect("facts");
-        let denoise = facts
-            .readings
+        let timestep = plan
+            .inputs
             .iter()
-            .find(|reading| reading.name == "denoise")
-            .expect("a denoise reading");
-        let (_, timestep) = denoise.port("timestep").expect("a timestep port");
+            .position(|input| input.name == "timestep")
+            .expect("a timestep input") as u32;
+        let widths: BTreeSet<u32> = plan
+            .values
+            .iter()
+            .filter_map(|decl| match &decl.def {
+                Def::Input(RuntimeInput::Guest {
+                    id,
+                    axis: InputAxis::Lane,
+                    width,
+                    ..
+                }) if *id == timestep => Some(*width),
+                _ => None,
+            })
+            .collect();
         assert_eq!(
-            timestep.width,
-            model::TIMESTEP_SLOTS,
-            "`{deployment}`: the timestep port carries every unique timestep of the step"
+            widths,
+            BTreeSet::from([model::TIMESTEP_SLOTS]),
+            "`{deployment}`: the timestep input carries every unique timestep of the step"
         );
     }
 }

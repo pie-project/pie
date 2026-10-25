@@ -261,6 +261,17 @@ pub(crate) fn word<T: Copy>(word: &str, what: &str, words: &[(&str, T)]) -> anyh
         })
 }
 
+impl<'v> Arg<'v> for poem_ir::InputAxis {
+    fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
+        use poem_ir::InputAxis::*;
+        spelled(
+            v,
+            "an input's axis",
+            &[("lane", Lane), ("row", Row), ("voxel", Voxel)],
+        )
+    }
+}
+
 impl<'v> Arg<'v> for GateActivation {
     fn arg(v: Option<Star<'v>>) -> anyhow::Result<Self> {
         use GateActivation::*;

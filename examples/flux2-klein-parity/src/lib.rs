@@ -34,8 +34,8 @@
 //! # LANES
 //!
 //! `denoise` is two lanes here (no reference): the text lane
-//! (`Stream::Text`, the `context` port at width `dim`) and the target lane
-//! (`Stream::Image`, the `latents` port), one group, each on its own
+//! (`Stream::Text`, the `context` input at width `dim`) and the target lane
+//! (`Stream::Image`, the `latents` input), one group, each on its own
 //! pipeline, each binding the timestep as its own loop-carried cell. Only
 //! the image lane reads out. Each lane is one pass submitted once a step
 //! (`trajectory` on why); the latent channel is loop-carried by the
@@ -56,7 +56,7 @@ struct Input {
 struct Case {
     prompt: String,
     /// `[text_rows, context_width]` f32 LE: the golden's prompt embeds
-    /// through `context_embedder` (the `context` port's width).
+    /// through `context_embedder` (the `context` input's width).
     context_file: String,
     text_rows: u32,
     context_width: u32,
@@ -102,32 +102,57 @@ struct Output {
     files: Vec<String>,
 }
 
-struct Ports {
-    latents: String,
-    context: String,
-    timestep: String,
-    positions: String,
+/// The two widths this guest sizes channels from: the rotary axes of the
+/// `positions` input and the readout's velocity width.
+struct Dims {
     axes: u32,
     velocity_width: u32,
 }
 
-fn ports(reading: &model::ReadingFact) -> Result<Ports> {
-    let named = |name: &str| -> Result<&model::PortFact> {
-        reading
-            .ports
-            .iter()
-            .find(|port| port.name == name)
-            .ok_or_else(|| format!("reading `{}` declares no port `{name}`", reading.name).into())
-    };
-    if reading.ports.iter().any(|port| port.name == "guidance") {
-        return Err("this row declares a guidance port; klein-4B embeds no guidance".into());
+/// The lane `stream` of `reading`, checked to read exactly `binds`: what
+/// this guest binds on that lane, by the model's own input names. Checked
+/// up front so a model whose lane reads anything else fails here in its own
+/// vocabulary instead of at `program`.
+fn lane_reading(reading: &str, stream: LaneStream, binds: &[&str]) -> Result<model::LaneDecl> {
+    let lane = model::lane_of(reading, stream)?;
+    let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
+    let mut wants = binds.to_vec();
+    reads.sort_unstable();
+    wants.sort_unstable();
+    if reads != wants {
+        return Err(format!(
+            "reading `{reading}`'s `{}` lane reads {reads:?}; this pass binds {wants:?}",
+            model::stream_name(stream)
+        )
+        .into());
     }
-    Ok(Ports {
-        latents: named("latents")?.name.clone(),
-        context: named("context")?.name.clone(),
-        timestep: named("timestep")?.name.clone(),
-        positions: named("positions")?.name.clone(),
-        axes: named("positions")?.width,
+    Ok(lane)
+}
+
+/// The width of the input `name` a lane reads.
+fn width_of(lane: &model::LaneDecl, name: &str) -> Result<u32> {
+    lane.inputs
+        .iter()
+        .find(|i| i.name == name)
+        .map(|i| i.width)
+        .ok_or_else(|| format!("the lane reads no `{name}`").into())
+}
+
+/// Checks both lanes against what this guest binds — no `guidance`:
+/// klein-4B embeds none — and reads the widths off them.
+fn dims(reading: &model::ReadingFact) -> Result<Dims> {
+    let image = lane_reading(
+        &reading.name,
+        LaneStream::Image,
+        &["latents", "positions", "timestep"],
+    )?;
+    lane_reading(
+        &reading.name,
+        LaneStream::Text,
+        &["context", "positions", "timestep"],
+    )?;
+    Ok(Dims {
+        axes: width_of(&image, "positions")?,
         velocity_width: reading.readout_width,
     })
 }
@@ -210,7 +235,7 @@ async fn trajectory(
     rows: u32,
     width: u32,
     sigmas: &[f32],
-    ports: &Ports,
+    dims: &Dims,
     reading: &str,
     group: u32,
     image_first: bool,
@@ -232,8 +257,8 @@ async fn trajectory(
     let pipe_txt = Pipeline::new();
     let pipe_img = Pipeline::new();
     let x = Channel::from_shaped([rows, width], noise).named("latents");
-    let img_pos = Channel::from_shaped([rows, ports.axes], positions).named("img_pos");
-    let velocity_width = ports.velocity_width;
+    let img_pos = Channel::from_shaped([rows, dims.axes], positions).named("img_pos");
+    let velocity_width = dims.velocity_width;
 
     let t_txt = Channel::from([ts[0]]).named("t_txt");
     let k_txt = Channel::from([0u32]).named("k_txt");
@@ -241,9 +266,9 @@ async fn trajectory(
     txt.reading(reading)?;
     txt.stream(LaneStream::Text)?;
     txt.group(group)?;
-    txt.input(&ports.context, &text.context)?;
-    txt.input(&ports.positions, &text.positions)?;
-    txt.input(&ports.timestep, &t_txt)?;
+    txt.input("context", &text.context)?;
+    txt.input("positions", &text.positions)?;
+    txt.input("timestep", &t_txt)?;
     {
         let (t, k, ts_ch) = (t_txt.clone(), k_txt.clone(), ts_txt);
         txt.epilogue(move || {
@@ -262,9 +287,9 @@ async fn trajectory(
     img.reading(reading)?;
     img.stream(LaneStream::Image)?;
     img.group(group)?;
-    img.input(&ports.latents, &x)?;
-    img.input(&ports.positions, &img_pos)?;
-    img.input(&ports.timestep, &t_img)?;
+    img.input("latents", &x)?;
+    img.input("positions", &img_pos)?;
+    img.input("timestep", &t_img)?;
     {
         let (xc, vo, xo) = (x.clone(), v_out.clone(), x_out.clone());
         let (t, k, ts_ch) = (t_img.clone(), k_img.clone(), ts_img);
@@ -352,11 +377,11 @@ async fn main(input: Input) -> Result<Output> {
     if denoise.has_kv || denoise.takes_tokens {
         return Err("reading `denoise` binds a kv space or tokens".into());
     }
-    let ports = ports(&denoise)?;
-    if ports.velocity_width != case.channels {
+    let dims = dims(&denoise)?;
+    if dims.velocity_width != case.channels {
         return Err(format!(
             "the model reads a {}-wide velocity and the case carries {}-wide tokens",
-            ports.velocity_width, case.channels
+            dims.velocity_width, case.channels
         )
         .into());
     }
@@ -382,14 +407,14 @@ async fn main(input: Input) -> Result<Output> {
     let rows = case.image_rows;
     let width = case.channels;
     let noise = read_f32(&case.latents_file, (rows * width) as usize)?;
-    let img_pos = read_f32(&case.image_positions_file, (rows * ports.axes) as usize)?;
+    let img_pos = read_f32(&case.image_positions_file, (rows * dims.axes) as usize)?;
     let context = read_f32(
         &case.context_file,
         (case.text_rows * case.context_width) as usize,
     )?;
     let txt_pos = read_f32(
         &case.text_positions_file,
-        (case.text_rows * ports.axes) as usize,
+        (case.text_rows * dims.axes) as usize,
     )?;
     // A SEEDED CHANNEL BINDS TO ONE PASS, so every trajectory below builds
     // its own copy of the conditioning off the same host rows: sharing one
@@ -399,7 +424,7 @@ async fn main(input: Input) -> Result<Output> {
         rows: case.text_rows,
         context: Channel::from_shaped([case.text_rows, case.context_width], context.clone())
             .named(&format!("context_{tag}")),
-        positions: Channel::from_shaped([case.text_rows, ports.axes], txt_pos.clone())
+        positions: Channel::from_shaped([case.text_rows, dims.axes], txt_pos.clone())
             .named(&format!("txt_pos_{tag}")),
     };
     let golden = conditioning("walk");
@@ -410,7 +435,7 @@ async fn main(input: Input) -> Result<Output> {
         rows,
         width,
         &case.sigmas,
-        &ports,
+        &dims,
         &denoise.name,
         0,
         case.image_first,
@@ -434,7 +459,7 @@ async fn main(input: Input) -> Result<Output> {
                 rows,
                 width,
                 &[*sigma],
-                &ports,
+                &dims,
                 &denoise.name,
                 2 + k as u32,
                 case.image_first,
@@ -447,20 +472,16 @@ async fn main(input: Input) -> Result<Output> {
 
     // The same trajectory over pie's own text rows: `(0, 0, 0, j)`.
     if case.native {
-        let mut pos = Vec::with_capacity((len * ports.axes) as usize);
+        let mut pos = Vec::with_capacity((len * dims.axes) as usize);
         for j in 0..len {
-            for axis in 0..ports.axes {
-                pos.push(if axis + 1 == ports.axes {
-                    j as f32
-                } else {
-                    0.0
-                });
+            for axis in 0..dims.axes {
+                pos.push(if axis + 1 == dims.axes { j as f32 } else { 0.0 });
             }
         }
         let native = Text {
             rows: len,
             context: Channel::from_shaped([len, hidden_width], hidden.clone()).named("native_ctx"),
-            positions: Channel::from_shaped([len, ports.axes], pos).named("native_pos"),
+            positions: Channel::from_shaped([len, dims.axes], pos).named("native_pos"),
         };
         let (velocity0, latents) = trajectory(
             &native,
@@ -469,7 +490,7 @@ async fn main(input: Input) -> Result<Output> {
             rows,
             width,
             &case.sigmas,
-            &ports,
+            &dims,
             &denoise.name,
             1,
             case.image_first,

@@ -38,7 +38,7 @@
 //! grow a lane, so the harness pads to the 32-row multiple and states the
 //! reference's own coordinates (caption row `j` at `(1 + j, 0, 0)`, pads
 //! included; image patch `(a, b)` at `(L32 + 1, a, b)`; image pads at
-//! `(0, 0, 0)`). The timestep is the family's port convention — the
+//! `(0, 0, 0)`). The timestep is the family's input convention — the
 //! scheduler's `σ·1000`, which the plan flips to the reference's `1000 −
 //! t` — so the harness converts the golden's transformer-side `t` first.
 use inferlet::latent::prelude::*;
@@ -98,7 +98,7 @@ struct Case {
     caption_pad: Vec<f32>,
     /// `[caption_rows, 3]`.
     caption_positions: Vec<f32>,
-    /// The SCHEDULER timestep `σ·1000` the family's port takes.
+    /// The SCHEDULER timestep `σ·1000` the family's `timestep` input takes.
     timestep: f32,
 }
 
@@ -131,14 +131,42 @@ struct Output {
 
 struct Reading {
     name: String,
-    ports: Vec<String>,
     axes: u32,
     readout_width: u32,
 }
 
-/// The reading's port names read off `model::readings()`, so a renamed port
-/// fails here with the model's own vocabulary instead of at the host.
-fn reading(readout: model::ReadoutKind, wants: &[&str]) -> Result<Reading> {
+/// The lane `stream` of `reading`, checked to read exactly `binds`: what
+/// this guest binds on that lane, by the model's own input names. Checked
+/// up front so a model whose lane reads anything else fails here in its own
+/// vocabulary instead of at `program`.
+fn lane_reading(reading: &str, stream: LaneStream, binds: &[&str]) -> Result<model::LaneDecl> {
+    let lane = model::lane_of(reading, stream)?;
+    let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
+    let mut wants = binds.to_vec();
+    reads.sort_unstable();
+    wants.sort_unstable();
+    if reads != wants {
+        return Err(format!(
+            "reading `{reading}`'s `{}` lane reads {reads:?}; this pass binds {wants:?}",
+            model::stream_name(stream)
+        )
+        .into());
+    }
+    Ok(lane)
+}
+
+/// The width of the input `name` a lane reads.
+fn width_of(lane: &model::LaneDecl, name: &str) -> Result<u32> {
+    lane.inputs
+        .iter()
+        .find(|i| i.name == name)
+        .map(|i| i.width)
+        .ok_or_else(|| format!("the lane reads no `{name}`").into())
+}
+
+/// The token-less reading with `readout`, each of its `lanes` checked to
+/// read exactly the inputs this guest binds there.
+fn reading(readout: model::ReadoutKind, lanes: &[(LaneStream, &[&str])]) -> Result<Reading> {
     let fact = model::readings()
         .into_iter()
         .find(|reading| !reading.takes_tokens && reading.readout == readout)
@@ -152,32 +180,24 @@ fn reading(readout: model::ReadoutKind, wants: &[&str]) -> Result<Reading> {
         )
         .into());
     }
-    let mut ports = Vec::new();
-    for want in wants {
-        let port = fact
-            .ports
-            .iter()
-            .find(|port| port.name == *want)
-            .ok_or_else(|| format!("reading `{}` declares no port `{want}`", fact.name))?;
-        ports.push(port.name.clone());
+    let mut axes = None;
+    for (stream, binds) in lanes {
+        let lane = lane_reading(&fact.name, *stream, binds)?;
+        axes.get_or_insert(width_of(&lane, "positions")?);
     }
-    let axes = fact
-        .ports
-        .iter()
-        .find(|port| port.name == "positions")
-        .map(|port| port.width)
-        .unwrap_or(3);
     Ok(Reading {
         name: fact.name.clone(),
-        ports,
-        axes,
+        axes: axes.ok_or("no lane to read")?,
         readout_width: fact.readout_width,
     })
 }
 
 /// The `refine` reading: one context lane, the refined caption back.
 async fn refine(case: &Case, pipe: &Pipeline) -> Result<(Vec<f32>, u32)> {
-    let r = reading(model::ReadoutKind::Hidden, &["caption", "pad", "positions"])?;
+    let r = reading(
+        model::ReadoutKind::Hidden,
+        &[(LaneStream::Context, &["caption", "pad", "positions"])],
+    )?;
     let rows = case.caption_rows;
     let pass = ForwardPass::new();
     pass.reading(&r.name)?;
@@ -187,9 +207,9 @@ async fn refine(case: &Case, pipe: &Pipeline) -> Result<(Vec<f32>, u32)> {
     let pad = Channel::from_shaped([rows, 1], case.caption_pad.as_slice()).named("cap_pad");
     let positions =
         Channel::from_shaped([rows, r.axes], case.caption_positions.as_slice()).named("cap_pos");
-    pass.input(&r.ports[0], &caption)?;
-    pass.input(&r.ports[1], &pad)?;
-    pass.input(&r.ports[2], &positions)?;
+    pass.input("caption", &caption)?;
+    pass.input("pad", &pad)?;
+    pass.input("positions", &positions)?;
     let width = r.readout_width;
     let out = Channel::new([rows, width], dtype::f32).named("refined");
     let readback = out.clone();
@@ -216,25 +236,24 @@ async fn denoise(
 ) -> Result<(Vec<f32>, Vec<f32>)> {
     let r = reading(
         model::ReadoutKind::Velocity,
-        &["latents", "pad", "context", "timestep", "positions"],
+        &[
+            (LaneStream::Context, &["context", "positions", "timestep"]),
+            (
+                LaneStream::Image,
+                &["latents", "pad", "positions", "timestep"],
+            ),
+        ],
     )?;
     // The readout is the velocity, `patch_features` wide — unless the family
     // is tapped on an intermediate (a bisect), which is `readout_width` wide.
     let width = r.readout_width;
-    let (p_latents, p_pad, p_context, p_timestep, p_positions) = (
-        &r.ports[0],
-        &r.ports[1],
-        &r.ports[2],
-        &r.ports[3],
-        &r.ports[4],
-    );
     let group = 0;
 
     // One timestep cell PER PASS: a seeded channel attaches to one pass only.
     let t_img = Channel::from([case.timestep]).named("t_img");
     let t_ctx = Channel::from([case.timestep]).named("t_ctx");
 
-    // The caption lane: the refine readout, pads included, no pad port.
+    // The caption lane: the refine readout, pads included, no `pad` input.
     let context = ForwardPass::new();
     context.reading(&r.name)?;
     context.stream(LaneStream::Context)?;
@@ -245,9 +264,9 @@ async fn denoise(
         case.caption_positions.as_slice(),
     )
     .named("ctx_pos");
-    context.input(p_context, &ctx)?;
-    context.input(p_positions, &ctx_pos)?;
-    context.input(p_timestep, &t_ctx)?;
+    context.input("context", &ctx)?;
+    context.input("positions", &ctx_pos)?;
+    context.input("timestep", &t_ctx)?;
     let ctx_out = ctx_tap.then(|| {
         let out = Channel::new([case.caption_rows, width], dtype::f32).named("ctx_tap");
         let readback = out.clone();
@@ -268,10 +287,10 @@ async fn denoise(
     let pad = Channel::from_shaped([rows, 1], case.image_pad.as_slice()).named("img_pad");
     let img_pos =
         Channel::from_shaped([rows, r.axes], case.image_positions.as_slice()).named("img_pos");
-    image.input(p_latents, &x)?;
-    image.input(p_pad, &pad)?;
-    image.input(p_positions, &img_pos)?;
-    image.input(p_timestep, &t_img)?;
+    image.input("latents", &x)?;
+    image.input("pad", &pad)?;
+    image.input("positions", &img_pos)?;
+    image.input("timestep", &t_img)?;
     let out = Channel::new([rows, width], dtype::f32).named("velocity");
     let readback = out.clone();
     image.epilogue(move || {
@@ -309,16 +328,15 @@ async fn trajectory(
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
     let r = reading(
         model::ReadoutKind::Velocity,
-        &["latents", "pad", "context", "timestep", "positions"],
+        &[
+            (LaneStream::Context, &["context", "positions", "timestep"]),
+            (
+                LaneStream::Image,
+                &["latents", "pad", "positions", "timestep"],
+            ),
+        ],
     )?;
     let width = r.readout_width;
-    let (p_latents, p_pad, p_context, p_timestep, p_positions) = (
-        &r.ports[0],
-        &r.ports[1],
-        &r.ports[2],
-        &r.ports[3],
-        &r.ports[4],
-    );
     let group = 0;
     let rows = case.image_rows;
     let sched = FlowMatchEuler::from_model(steps, None)?;
@@ -336,9 +354,9 @@ async fn trajectory(
         case.caption_positions.as_slice(),
     )
     .named("traj_ctx_pos");
-    context.input(p_context, &ctx)?;
-    context.input(p_positions, &ctx_pos)?;
-    context.input(p_timestep, &ctx_clock.timestep)?;
+    context.input("context", &ctx)?;
+    context.input("positions", &ctx_pos)?;
+    context.input("timestep", &ctx_clock.timestep)?;
 
     let image = ForwardPass::new();
     image.reading(&r.name)?;
@@ -349,10 +367,10 @@ async fn trajectory(
     let pad = Channel::from_shaped([rows, 1], case.image_pad.as_slice()).named("traj_pad");
     let img_pos =
         Channel::from_shaped([rows, r.axes], case.image_positions.as_slice()).named("traj_pos");
-    image.input(p_latents, &latent)?;
-    image.input(p_pad, &pad)?;
-    image.input(p_positions, &img_pos)?;
-    image.input(p_timestep, &img_clock.timestep)?;
+    image.input("latents", &latent)?;
+    image.input("pad", &pad)?;
+    image.input("positions", &img_pos)?;
+    image.input("timestep", &img_clock.timestep)?;
 
     let out = Channel::new([rows, width], dtype::f32).named("traj_out");
     // The caption lane only modulates: its clock advances and nothing else.

@@ -55,6 +55,7 @@ pub fn register(
     name: String,
     model_id: &str,
     facts: poem_ir::Facts,
+    inputs: Vec<poem_ir::InputDecl>,
     kv_page_size: u32,
     rs: RsCaps,
     eta: EtaCaps,
@@ -100,6 +101,7 @@ pub fn register(
         deployment: deployment.clone(),
         instruct,
         facts,
+        inputs,
         kv_page_size,
         rs_caps: rs,
         eta_caps: eta,
@@ -205,76 +207,6 @@ pub fn validate_generative(generative: &poem::generative::Generative) -> Result<
                 Some(_) => {}
             }
         }
-        for (i, port) in reading.ports.iter().enumerate() {
-            if port.name.is_empty() {
-                return Err(format!(
-                    "reading `{}` port {i} has an empty name",
-                    reading.name
-                ));
-            }
-            if reading.ports[..i].iter().any(|p| p.name == port.name) {
-                return Err(format!(
-                    "reading `{}` declares port `{}` twice",
-                    reading.name, port.name
-                ));
-            }
-            if port.width == 0 {
-                return Err(format!(
-                    "reading `{}` port `{}` states a zero width",
-                    reading.name, port.name
-                ));
-            }
-            if port.kind == poem::generative::PortKind::AxisPositions && port.width > 4 {
-                return Err(format!(
-                    "reading `{}` port `{}` states {} axes; a positions port carries 1..=4",
-                    reading.name, port.name, port.width
-                ));
-            }
-        }
-        if let Some(convention) = &reading.positions {
-            let axes = reading
-                .ports
-                .iter()
-                .find(|port| port.kind == poem::generative::PortKind::AxisPositions)
-                .map(|port| port.width);
-            let Some(axes) = axes else {
-                return Err(format!(
-                    "reading `{}` states a position convention but declares no \
-                     axis-positions port",
-                    reading.name
-                ));
-            };
-            if convention.axes.len() != axes as usize {
-                return Err(format!(
-                    "reading `{}` states {} axis roles for a {axes}-wide positions port",
-                    reading.name,
-                    convention.axes.len()
-                ));
-            }
-            if convention.text_axis >= axes {
-                return Err(format!(
-                    "reading `{}` numbers its text rows on axis {} of a {axes}-axis \
-                     positions port",
-                    reading.name, convention.text_axis
-                ));
-            }
-        }
-        if !reading.takes_tokens
-            && !reading.ports.iter().any(|port| {
-                matches!(
-                    port.kind,
-                    poem::generative::PortKind::Latents
-                        | poem::generative::PortKind::Voxels
-                        | poem::generative::PortKind::Context
-                )
-            })
-        {
-            return Err(format!(
-                "reading `{}` embeds no tokens and declares no latents, context or voxels port; \
-                 nothing states its lane's row count",
-                reading.name
-            ));
-        }
     }
     Ok(())
 }
@@ -332,6 +264,7 @@ pub struct Model {
     image: Option<poem::star::ImageSpec>,
     instruct: Arc<dyn Instruct>,
     facts: poem_ir::Facts,
+    inputs: Vec<poem_ir::InputDecl>,
     kv_page_size: u32,
     rs_caps: RsCaps,
     eta_caps: EtaCaps,
@@ -492,6 +425,58 @@ impl Model {
             None => request,
         };
         self.facts.word(&request)
+    }
+
+    /// The inputs the model reads from its guest; an input's id is its
+    /// place here.
+    pub fn inputs(&self) -> &[poem_ir::InputDecl] {
+        &self.inputs
+    }
+
+    /// The input `name` and its id.
+    pub fn input(&self, name: &str) -> Option<(u32, &poem_ir::InputDecl)> {
+        self.inputs
+            .iter()
+            .enumerate()
+            .find(|(_, input)| input.name == name)
+            .map(|(id, input)| (id as u32, input))
+    }
+
+    /// The ids of the inputs a lane of these guest switches reads: those a
+    /// class it can land in reads, under any value of the switches the
+    /// runtime derives (query length, mask, adapter, drafts, scores, media,
+    /// encode).
+    pub fn lane_inputs(
+        &self,
+        reading: Option<&str>,
+        stream: poem::Stream,
+        denoise: bool,
+        block_draft: bool,
+    ) -> Vec<u32> {
+        const RUNTIME_SWITCHES: u32 = 7;
+        let words: Vec<u64> = (0..1u32 << RUNTIME_SWITCHES)
+            .map(|bits| {
+                let request = poem::Request::new(if bits & 1 == 0 { 1 } else { 2 }, bits & 2 != 0)
+                    .adapted(bits & 4 != 0)
+                    .drafting(bits & 8 != 0)
+                    .capturing_scores(bits & 16 != 0)
+                    .with_media(bits & 32 != 0)
+                    .encoding(bits & 64 != 0)
+                    .denoising(denoise)
+                    .drafting_a_block(block_draft)
+                    .on_stream(stream);
+                let request = match reading {
+                    Some(name) => request.in_reading(name),
+                    None => request,
+                };
+                self.facts.word(&request)
+            })
+            .collect();
+        (0u32..)
+            .zip(&self.inputs)
+            .filter(|(_, input)| words.iter().any(|&word| input.read_by(word)))
+            .map(|(id, _)| id)
+            .collect()
     }
 
     pub fn diffusion(&self) -> Option<poem::generative::Diffusion> {

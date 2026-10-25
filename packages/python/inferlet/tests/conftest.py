@@ -63,12 +63,10 @@ class LaneStream(Enum):
     REFERENCE = 5
 
 
-class PortKind(Enum):
-    LATENTS = 0
-    LANE_VECTOR = 1
-    CONTEXT = 2
-    AXIS_POSITIONS = 3
-    VOXELS = 4
+class InputAxis(Enum):
+    LANE = 0
+    ROW = 1
+    VOXEL = 2
 
 
 class ReadoutKind(Enum):
@@ -89,7 +87,10 @@ def _make_model() -> types.ModuleType:
     m.ForwardKind = ForwardKind
     m.AxisRole = AxisRole
     m.LaneStream = LaneStream
-    m.PortKind = PortKind
+    m.InputAxis = InputAxis
+    m.InputDecl = InputDeclStub
+    m.LaneDecl = LaneDeclStub
+    m.Readout = ReadoutStub
     m.ReadoutKind = ReadoutKind
     m.ScheduleKind = ScheduleKind
     m.name = lambda: "mock-model"
@@ -108,7 +109,8 @@ def _make_model() -> types.ModuleType:
     m.BlockDrafter = BlockDrafterStub
     m.CanvasShape = CanvasShapeStub
     m.draft_block = lambda: None
-    m.canvas = lambda: CanvasShapeStub(32, 2560, 4)
+    m.canvas = lambda: CanvasShapeStub(32, 2560)
+    m.lane = _lane
     return m
 
 
@@ -123,7 +125,35 @@ class BlockDrafterStub:
 class CanvasShapeStub:
     length: int
     hidden: int
-    self_cond_taps: int
+
+
+@dataclass
+class InputDeclStub:
+    name: str
+    axis: InputAxis
+    width: int
+    dtype: object
+    rows: int | None
+
+
+@dataclass
+class ReadoutStub:
+    kind: ReadoutKind
+    width: int
+
+
+@dataclass
+class LaneDeclStub:
+    inputs: list
+    reads_kv: bool
+    embeds: bool
+    readout: ReadoutStub
+
+
+def _lane(switches) -> LaneDeclStub:
+    denoise = ("canvas", "denoise") in switches
+    inputs = [InputDeclStub("self_cond_ids", InputAxis.ROW, 4, "i32", None)] if denoise else []
+    return LaneDeclStub(inputs, True, True, ReadoutStub(ReadoutKind.LOGITS, 151936))
 
 
 # ---------------------------------------------------------------------------
@@ -464,9 +494,6 @@ class ForwardPassStub:
 
     def canvas(self, mode) -> None:
         self.mode = mode
-
-    def self_conditioning(self, rows, weights) -> None:
-        self.self_cond = (list(rows), list(weights))
 
     def program(self, container_bytes: bytes, channels) -> None:
         self.program_bytes = bytes(container_bytes)

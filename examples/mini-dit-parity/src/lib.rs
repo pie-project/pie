@@ -268,34 +268,58 @@ struct Output {
     sweep_velocity: Vec<Vec<f32>>,
 }
 
-/// The port names this family's `denoise` reading declares. Read off
-/// `model::readings()` rather than typed in, so a renamed port fails here
-/// with the model's own vocabulary instead of at the host.
-struct Ports {
-    latents: String,
-    text: String,
-    context: String,
-    timestep: String,
-    positions: String,
+/// The two widths this guest sizes channels from: the rotary axes of the
+/// `positions` input and the readout's velocity width.
+struct Dims {
     axes: u32,
     velocity_width: u32,
 }
 
-fn ports(reading: &model::ReadingFact) -> Result<Ports> {
-    let named = |name: &str| -> Result<&model::PortFact> {
-        reading
-            .ports
-            .iter()
-            .find(|port| port.name == name)
-            .ok_or_else(|| format!("reading `{}` declares no port `{name}`", reading.name).into())
-    };
-    Ok(Ports {
-        latents: named("latents")?.name.clone(),
-        text: named("text")?.name.clone(),
-        context: named("context")?.name.clone(),
-        timestep: named("timestep")?.name.clone(),
-        positions: named("positions")?.name.clone(),
-        axes: named("positions")?.width,
+/// The lane `stream` of `reading`, checked to read exactly `binds`: what
+/// this guest binds on that lane, by the model's own input names. Checked
+/// up front so a model whose lane reads anything else fails here in its own
+/// vocabulary instead of at `program`.
+fn lane_reading(reading: &str, stream: LaneStream, binds: &[&str]) -> Result<model::LaneDecl> {
+    let lane = model::lane_of(reading, stream)?;
+    let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
+    let mut wants = binds.to_vec();
+    reads.sort_unstable();
+    wants.sort_unstable();
+    if reads != wants {
+        return Err(format!(
+            "reading `{reading}`'s `{}` lane reads {reads:?}; this pass binds {wants:?}",
+            model::stream_name(stream)
+        )
+        .into());
+    }
+    Ok(lane)
+}
+
+/// The width of the input `name` a lane reads.
+fn width_of(lane: &model::LaneDecl, name: &str) -> Result<u32> {
+    lane.inputs
+        .iter()
+        .find(|i| i.name == name)
+        .map(|i| i.width)
+        .ok_or_else(|| format!("the lane reads no `{name}`").into())
+}
+
+/// Checks the three lanes against what this guest binds on each and reads
+/// the widths off them.
+fn dims(reading: &model::ReadingFact) -> Result<Dims> {
+    lane_reading(
+        &reading.name,
+        LaneStream::Text,
+        &["text", "positions", "timestep"],
+    )?;
+    lane_reading(&reading.name, LaneStream::Context, &["context"])?;
+    let image = lane_reading(
+        &reading.name,
+        LaneStream::Image,
+        &["latents", "positions", "timestep"],
+    )?;
+    Ok(Dims {
+        axes: width_of(&image, "positions")?,
         velocity_width: reading.readout_width,
     })
 }
@@ -332,7 +356,7 @@ impl Pipes {
 #[allow(clippy::too_many_arguments)]
 fn branch(
     case: &Case,
-    ports: &Ports,
+    dims: &Dims,
     reading: &str,
     group: u32,
     context: &[f32],
@@ -343,7 +367,7 @@ fn branch(
 ) -> Result<(ForwardPass, ForwardPass, ForwardPass, Channel)> {
     let tag = |what: &str| format!("{what}_b{group}");
     let rows = case.image_rows;
-    let width = ports.velocity_width;
+    let width = dims.velocity_width;
 
     // GUIDANCE IS MUTUAL. Every lane of a branch names the other branch, so
     // the two groups gather under one cohort key and seal into ONE fire — a
@@ -357,13 +381,12 @@ fn branch(
     caption.peer(partner)?;
     let txt = Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice())
         .named(&tag("text"));
-    let txt_pos =
-        Channel::from_shaped([case.text_rows, ports.axes], case.text_positions.as_slice())
-            .named(&tag("txt_pos"));
+    let txt_pos = Channel::from_shaped([case.text_rows, dims.axes], case.text_positions.as_slice())
+        .named(&tag("txt_pos"));
     let t_txt = Channel::from([timestep]).named(&tag("t_txt"));
-    caption.input(&ports.text, &txt)?;
-    caption.input(&ports.positions, &txt_pos)?;
-    caption.input(&ports.timestep, &t_txt)?;
+    caption.input("text", &txt)?;
+    caption.input("positions", &txt_pos)?;
+    caption.input("timestep", &t_txt)?;
 
     // The branch's own context: the case's rows for the conditional branch,
     // zeros for the unconditional one. This is the ONLY difference between
@@ -376,7 +399,7 @@ fn branch(
     ctx_pass.peer(partner)?;
     let ctx =
         Channel::from_shaped([case.context_rows, case.context_width], context).named(&tag("ctx"));
-    ctx_pass.input(&ports.context, &ctx)?;
+    ctx_pass.input("context", &ctx)?;
 
     let image = ForwardPass::new();
     image.reading(reading)?;
@@ -384,12 +407,12 @@ fn branch(
     image.group(group)?;
     image.peer(partner)?;
     let x = Channel::from_shaped([rows, case.patch_features], latents).named(&tag("latents"));
-    let img_pos = Channel::from_shaped([rows, ports.axes], case.image_positions.as_slice())
+    let img_pos = Channel::from_shaped([rows, dims.axes], case.image_positions.as_slice())
         .named(&tag("img_pos"));
     let t_img = Channel::from([timestep]).named(&tag("t_img"));
-    image.input(&ports.latents, &x)?;
-    image.input(&ports.positions, &img_pos)?;
-    image.input(&ports.timestep, &t_img)?;
+    image.input("latents", &x)?;
+    image.input("positions", &img_pos)?;
+    image.input("timestep", &t_img)?;
     let out = Channel::new([rows, width], dtype::f32).named(&tag("velocity"));
     let readback = out.clone();
     match guide {
@@ -417,14 +440,9 @@ fn branch(
 /// Also publishes each branch's own velocity, so the caller can check the
 /// two identities that need no golden: `s = 1` is the conditional branch
 /// exactly, `s = 0` is the unconditional one exactly.
-async fn sweep_fire(
-    case: &Case,
-    ports: &Ports,
-    reading: &str,
-    groups: u32,
-) -> Result<Vec<Vec<f32>>> {
+async fn sweep_fire(case: &Case, dims: &Dims, reading: &str, groups: u32) -> Result<Vec<Vec<f32>>> {
     let rows = case.image_rows;
-    let width = ports.velocity_width;
+    let width = dims.velocity_width;
     let mut pipes: Vec<Pipeline> = Vec::new();
     let mut passes: Vec<(ForwardPass, ForwardPass, ForwardPass)> = Vec::new();
     let mut outs: Vec<Channel> = Vec::new();
@@ -443,12 +461,12 @@ async fn sweep_fire(
         let txt = Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice())
             .named(&tag("text"));
         let txt_pos =
-            Channel::from_shaped([case.text_rows, ports.axes], case.text_positions.as_slice())
+            Channel::from_shaped([case.text_rows, dims.axes], case.text_positions.as_slice())
                 .named(&tag("txt_pos"));
-        caption.input(&ports.text, &txt)?;
-        caption.input(&ports.positions, &txt_pos)?;
+        caption.input("text", &txt)?;
+        caption.input("positions", &txt_pos)?;
         caption.input(
-            &ports.timestep,
+            "timestep",
             &Channel::from([case.timestep]).named(&tag("t_txt")),
         )?;
 
@@ -461,7 +479,7 @@ async fn sweep_fire(
             case.context.as_slice(),
         )
         .named(&tag("ctx"));
-        context.input(&ports.context, &ctx)?;
+        context.input("context", &ctx)?;
 
         let image = ForwardPass::new();
         image.reading(reading)?;
@@ -469,12 +487,12 @@ async fn sweep_fire(
         image.group(group)?;
         let x = Channel::from_shaped([rows, case.patch_features], latents.as_slice())
             .named(&tag("latents"));
-        let img_pos = Channel::from_shaped([rows, ports.axes], case.image_positions.as_slice())
+        let img_pos = Channel::from_shaped([rows, dims.axes], case.image_positions.as_slice())
             .named(&tag("img_pos"));
-        image.input(&ports.latents, &x)?;
-        image.input(&ports.positions, &img_pos)?;
+        image.input("latents", &x)?;
+        image.input("positions", &img_pos)?;
         image.input(
-            &ports.timestep,
+            "timestep",
             &Channel::from([case.timestep]).named(&tag("t_img")),
         )?;
         let out = Channel::new([rows, width], dtype::f32).named(&tag("velocity"));
@@ -515,14 +533,14 @@ async fn sweep_fire(
 
 async fn guided_step(
     case: &Case,
-    ports: &Ports,
+    dims: &Dims,
     reading: &str,
     scale: f32,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
     let zeros = vec![0.0f32; case.context.len()];
     let (c_txt, c_ctx, c_img, guided) = branch(
         case,
-        ports,
+        dims,
         reading,
         0,
         case.context.as_slice(),
@@ -533,7 +551,7 @@ async fn guided_step(
     )?;
     let (u_txt, u_ctx, u_img, uncond) = branch(
         case,
-        ports,
+        dims,
         reading,
         1,
         zeros.as_slice(),
@@ -597,13 +615,13 @@ async fn guided_step(
 /// which is the trajectory a cached run is compared against bit for bit.
 async fn dpm2m_loop(
     case: &Case,
-    ports: &Ports,
+    dims: &Dims,
     reading: &str,
     steps: u32,
 ) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f32>)> {
     let rows = case.image_rows;
     let feats = case.patch_features;
-    let width = ports.velocity_width;
+    let width = dims.velocity_width;
     if width != feats {
         return Err(format!(
             "the solver integrates the latent it predicts: the model reads a {width}-wide \
@@ -633,12 +651,11 @@ async fn dpm2m_loop(
     caption.group(0)?;
     let txt = Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice())
         .named("dpm_text");
-    let txt_pos =
-        Channel::from_shaped([case.text_rows, ports.axes], case.text_positions.as_slice())
-            .named("dpm_txt_pos");
-    caption.input(&ports.text, &txt)?;
-    caption.input(&ports.positions, &txt_pos)?;
-    caption.input(&ports.timestep, &caption_clock.timestep)?;
+    let txt_pos = Channel::from_shaped([case.text_rows, dims.axes], case.text_positions.as_slice())
+        .named("dpm_txt_pos");
+    caption.input("text", &txt)?;
+    caption.input("positions", &txt_pos)?;
+    caption.input("timestep", &caption_clock.timestep)?;
 
     let context = ForwardPass::new();
     context.reading(reading)?;
@@ -649,7 +666,7 @@ async fn dpm2m_loop(
         case.context.as_slice(),
     )
     .named("dpm_ctx_rows");
-    context.input(&ports.context, &ctx)?;
+    context.input("context", &ctx)?;
 
     let image = ForwardPass::new();
     image.reading(reading)?;
@@ -657,11 +674,11 @@ async fn dpm2m_loop(
     image.group(0)?;
     let x = Channel::from_shaped(shape, case.latents.as_slice()).named("dpm_latents");
     let x0_prev = Channel::from_shaped(shape, vec![0f32; cells]).named("dpm_x0_prev");
-    let img_pos = Channel::from_shaped([rows, ports.axes], case.image_positions.as_slice())
+    let img_pos = Channel::from_shaped([rows, dims.axes], case.image_positions.as_slice())
         .named("dpm_img_pos");
-    image.input(&ports.latents, &x)?;
-    image.input(&ports.positions, &img_pos)?;
-    image.input(&ports.timestep, &image_clock.timestep)?;
+    image.input("latents", &x)?;
+    image.input("positions", &img_pos)?;
+    image.input("timestep", &image_clock.timestep)?;
 
     let out_x = Channel::new(shape, dtype::f32)
         .capacity(channel_capacity() as u32)
@@ -701,7 +718,7 @@ async fn dpm2m_loop(
 
 async fn cached_loop(
     case: &Case,
-    ports: &Ports,
+    dims: &Dims,
     reading: &str,
     steps: u32,
     seed: u32,
@@ -709,7 +726,7 @@ async fn cached_loop(
 ) -> Result<(Vec<Vec<f32>>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
     let rows = case.image_rows;
     let feats = case.patch_features;
-    let width = ports.velocity_width;
+    let width = dims.velocity_width;
     if width != feats {
         return Err(format!(
             "the cached loop integrates the latent it predicts: the model reads a {width}-wide \
@@ -744,12 +761,11 @@ async fn cached_loop(
     caption.group(0)?;
     let txt = Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice())
         .named("cache_text");
-    let txt_pos =
-        Channel::from_shaped([case.text_rows, ports.axes], case.text_positions.as_slice())
-            .named("cache_txt_pos");
-    caption.input(&ports.text, &txt)?;
-    caption.input(&ports.positions, &txt_pos)?;
-    caption.input(&ports.timestep, &caption_clock.timestep)?;
+    let txt_pos = Channel::from_shaped([case.text_rows, dims.axes], case.text_positions.as_slice())
+        .named("cache_txt_pos");
+    caption.input("text", &txt)?;
+    caption.input("positions", &txt_pos)?;
+    caption.input("timestep", &caption_clock.timestep)?;
 
     // The context lane: block 2's cross-attention keys. No timestep, no
     // positions, no epilogue — nothing about it advances.
@@ -762,21 +778,21 @@ async fn cached_loop(
         case.context.as_slice(),
     )
     .named("cache_ctx_rows");
-    context.input(&ports.context, &ctx)?;
+    context.input("context", &ctx)?;
 
-    // The image lane. `x` is bound as the latents port AND loop-carried by
-    // the epilogue: the port feed reads the committed cell, the epilogue
+    // The image lane. `x` is bound as the `latents` input AND loop-carried by
+    // the epilogue: the input feed reads the committed cell, the epilogue
     // takes it and puts the next one.
     let image = ForwardPass::new();
     image.reading(reading)?;
     image.stream(LaneStream::Image)?;
     image.group(0)?;
     let x = Channel::from_shaped(shape, vec![0f32; cells]).named("cache_latents");
-    let img_pos = Channel::from_shaped([rows, ports.axes], case.image_positions.as_slice())
+    let img_pos = Channel::from_shaped([rows, dims.axes], case.image_positions.as_slice())
         .named("cache_img_pos");
-    image.input(&ports.latents, &x)?;
-    image.input(&ports.positions, &img_pos)?;
-    image.input(&ports.timestep, &image_clock.timestep)?;
+    image.input("latents", &x)?;
+    image.input("positions", &img_pos)?;
+    image.input("timestep", &image_clock.timestep)?;
 
     let rng = Channel::from(rng_state(seed)).named("cache_rng");
     let out = Channel::new(shape, dtype::f32)
@@ -894,7 +910,7 @@ async fn cached_loop(
 /// One denoise step: three lanes, one group, one fire, one velocity.
 async fn step(
     case: &Case,
-    ports: &Ports,
+    dims: &Dims,
     reading: &str,
     pipes: &Pipes,
     group: u32,
@@ -907,7 +923,7 @@ async fn step(
     let rows = case.image_rows;
     // The readout's width is the reading's, which is the patch features —
     // or, under the family's tap knob, the tapped rectangle's.
-    let width = ports.velocity_width;
+    let width = dims.velocity_width;
     // One timestep cell PER PASS: a seeded channel attaches to one pass
     // only (the runtime's channel-role rule), so the two modulating lanes
     // each carry their own copy of the same scalar.
@@ -937,19 +953,18 @@ async fn step(
     }
     let txt = Channel::from_shaped([case.text_rows, case.text_width], text_rows.as_slice())
         .named(&tag("text"));
-    let txt_pos =
-        Channel::from_shaped([case.text_rows, ports.axes], case.text_positions.as_slice())
-            .named(&tag("txt_pos"));
-    caption.input(&ports.text, &txt)?;
-    caption.input(&ports.positions, &txt_pos)?;
-    caption.input(&ports.timestep, &t_txt)?;
+    let txt_pos = Channel::from_shaped([case.text_rows, dims.axes], case.text_positions.as_slice())
+        .named(&tag("txt_pos"));
+    caption.input("text", &txt)?;
+    caption.input("positions", &txt_pos)?;
+    caption.input("timestep", &t_txt)?;
     // The bisection knob's caption readout: the same intrinsic, off the
     // caption lane's own rows of the tapped rectangle.
     let text_out = text_tap.as_ref().map(|_| {
-        let out = Channel::new([case.text_rows, ports.velocity_width], dtype::f32)
-            .named(&tag("text_tap"));
+        let out =
+            Channel::new([case.text_rows, dims.velocity_width], dtype::f32).named(&tag("text_tap"));
         let readback = out.clone();
-        let width = ports.velocity_width;
+        let width = dims.velocity_width;
         caption.epilogue(move || {
             readback.put(intrinsics::velocity(width));
         });
@@ -968,7 +983,7 @@ async fn step(
         case.context.as_slice(),
     )
     .named(&tag("ctx"));
-    context.input(&ports.context, &ctx)?;
+    context.input("context", &ctx)?;
 
     // The image lane: the latents in, the velocity out.
     let out = Channel::new([rows, width], dtype::f32).named(&tag("velocity"));
@@ -980,12 +995,12 @@ async fn step(
         image.attention_classes(&plan.image, &plan.table, plan.count)?;
     }
     let x = Channel::from_shaped([rows, case.patch_features], latents).named(&tag("latents"));
-    let img_pos = Channel::from_shaped([rows, ports.axes], case.image_positions.as_slice())
+    let img_pos = Channel::from_shaped([rows, dims.axes], case.image_positions.as_slice())
         .named(&tag("img_pos"));
-    image.input(&ports.latents, &x)?;
-    image.input(&ports.positions, &img_pos)?;
-    image.input(&ports.timestep, &t_img)?;
-    let velocity_width = ports.velocity_width;
+    image.input("latents", &x)?;
+    image.input("positions", &img_pos)?;
+    image.input("timestep", &t_img)?;
+    let velocity_width = dims.velocity_width;
     let readback = out.clone();
     image.epilogue(move || {
         // The denoise reading's `logits()`: `[image rows, C·p²]`.
@@ -1059,7 +1074,7 @@ async fn main(input: Input) -> Result<Output> {
         )
         .into());
     }
-    let ports = ports(&reading)?;
+    let dims = dims(&reading)?;
     let class_plan = match input.classes.as_deref() {
         Some(mode) => ClassPlan::of(mode, &case)?,
         None => None,
@@ -1089,7 +1104,7 @@ async fn main(input: Input) -> Result<Output> {
 
     // Step caching runs the whole schedule on the device — never one step.
     if let Some(groups) = input.sweep.filter(|n| *n > 0) {
-        let velocities = sweep_fire(&case, &ports, &reading.name, groups).await?;
+        let velocities = sweep_fire(&case, &dims, &reading.name, groups).await?;
         out.velocity = velocities.first().cloned().unwrap_or_default();
         out.sweep_velocity = velocities;
         pipes.close();
@@ -1100,7 +1115,7 @@ async fn main(input: Input) -> Result<Output> {
         if solver != "dpm2m" {
             return Err(format!("unknown solver `{solver}`; this guest runs `dpm2m`").into());
         }
-        let (vs, xs, sigmas) = dpm2m_loop(&case, &ports, &reading.name, case.steps.max(1)).await?;
+        let (vs, xs, sigmas) = dpm2m_loop(&case, &dims, &reading.name, case.steps.max(1)).await?;
         out.velocity = vs.last().cloned().unwrap_or_default();
         out.sigmas = sigmas;
         out.euler_v = vs;
@@ -1114,7 +1129,7 @@ async fn main(input: Input) -> Result<Output> {
         let seed = input.cache_seed.unwrap_or(7);
         let (trace, rel, did, count, dts) = cached_loop(
             &case,
-            &ports,
+            &dims,
             &reading.name,
             steps,
             seed,
@@ -1147,7 +1162,7 @@ async fn main(input: Input) -> Result<Output> {
         let mut text_tap = Vec::new();
         let cond = step(
             &case,
-            &ports,
+            &dims,
             &reading.name,
             &pipes,
             0,
@@ -1158,7 +1173,7 @@ async fn main(input: Input) -> Result<Output> {
         )
         .await?;
         pipes.close();
-        let (guided, _, uncond) = guided_step(&case, &ports, &reading.name, scale).await?;
+        let (guided, _, uncond) = guided_step(&case, &dims, &reading.name, scale).await?;
         out.velocity = cond.clone();
         out.cfg_guided = guided;
         out.cfg_cond = cond;
@@ -1171,7 +1186,7 @@ async fn main(input: Input) -> Result<Output> {
         let mut text_tap = Vec::new();
         out.velocity = step(
             &case,
-            &ports,
+            &dims,
             &reading.name,
             &pipes,
             0,
@@ -1215,7 +1230,7 @@ async fn main(input: Input) -> Result<Output> {
     for i in 0..steps {
         let v = step(
             &case,
-            &ports,
+            &dims,
             &reading.name,
             &pipes,
             i,

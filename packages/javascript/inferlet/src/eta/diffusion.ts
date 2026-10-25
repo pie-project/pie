@@ -1,7 +1,6 @@
 // `eta.diffusion` — the diffusion pass's reading (`Mode`) and the reference
 // sampler pieces, a port of `inferlet::eta::diffusion`. The pass itself is
-// `new ForwardPass('diffusion')` with `canvas('denoise')` and
-// `selfConditioning(rows, weights)`.
+// `new ForwardPass('diffusion')` with `canvas('denoise')`.
 
 import { Dtype } from './ir.js';
 import { Tensor, and, cast, cumsum, eq, iota, le, lt, neg, reduceSum, scatterSet, sortDesc } from './value.js';

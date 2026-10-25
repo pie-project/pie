@@ -9,7 +9,7 @@
 //! # TWO OR THREE LANES, ONE GROUP, ONE FIRE
 //!
 //! `wan_2`'s `denoise` reading declares two streams (D2): the context
-//! lane (`Stream::Context`, the `context` port — no positions, no
+//! lane (`Stream::Context`, the `context` input — no positions, no
 //! timestep: its class runs the text embedder and the cross-attention
 //! keys, and modulates nothing) and one or more video lanes
 //! (`Stream::Video`: `latents`, `positions`, `timestep`). The golden's
@@ -88,7 +88,7 @@ struct Case {
     #[serde(default)]
     cond_rows: u32,
     /// `[context_rows, context_width]` — but only the LEADING rows need be
-    /// given: `wan_2`'s context port takes exactly what the reference hands
+    /// given: `wan_2`'s `context` input takes exactly what the reference hands
     /// the transformer, 512 rows of which the prompt fills the front and
     /// the rest are hard zeros this guest writes (`wan_2/forward.rs`).
     #[serde(default)]
@@ -177,32 +177,53 @@ struct Output {
     patch_features: u32,
 }
 
-/// The port names this family's `denoise` reading declares, read off
-/// `model::readings()` rather than typed in, so a renamed port fails here
-/// with the model's own vocabulary instead of at the host.
-struct Ports {
-    latents: String,
-    context: String,
-    timestep: String,
-    positions: String,
+/// The two widths this guest sizes channels from: the rotary axes of the
+/// `positions` input and the readout's velocity width.
+struct Dims {
     axes: u32,
     velocity_width: u32,
 }
 
-fn ports(reading: &model::ReadingFact) -> Result<Ports> {
-    let named = |name: &str| -> Result<&model::PortFact> {
-        reading
-            .ports
-            .iter()
-            .find(|port| port.name == name)
-            .ok_or_else(|| format!("reading `{}` declares no port `{name}`", reading.name).into())
-    };
-    Ok(Ports {
-        latents: named("latents")?.name.clone(),
-        context: named("context")?.name.clone(),
-        timestep: named("timestep")?.name.clone(),
-        positions: named("positions")?.name.clone(),
-        axes: named("positions")?.width,
+/// The lane `stream` of `reading`, checked to read exactly `binds`: what
+/// this guest binds on that lane, by the model's own input names. Checked
+/// up front so a model whose lane reads anything else fails here in its own
+/// vocabulary instead of at `program`.
+fn lane_reading(reading: &str, stream: LaneStream, binds: &[&str]) -> Result<model::LaneDecl> {
+    let lane = model::lane_of(reading, stream)?;
+    let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
+    let mut wants = binds.to_vec();
+    reads.sort_unstable();
+    wants.sort_unstable();
+    if reads != wants {
+        return Err(format!(
+            "reading `{reading}`'s `{}` lane reads {reads:?}; this pass binds {wants:?}",
+            model::stream_name(stream)
+        )
+        .into());
+    }
+    Ok(lane)
+}
+
+/// The width of the input `name` a lane reads.
+fn width_of(lane: &model::LaneDecl, name: &str) -> Result<u32> {
+    lane.inputs
+        .iter()
+        .find(|i| i.name == name)
+        .map(|i| i.width)
+        .ok_or_else(|| format!("the lane reads no `{name}`").into())
+}
+
+/// Checks the context lane and the video lanes against what this guest
+/// binds on each and reads the widths off them.
+fn dims(reading: &model::ReadingFact) -> Result<Dims> {
+    lane_reading(&reading.name, LaneStream::Context, &["context"])?;
+    let video = lane_reading(
+        &reading.name,
+        LaneStream::Video,
+        &["latents", "positions", "timestep"],
+    )?;
+    Ok(Dims {
+        axes: width_of(&video, "positions")?,
         velocity_width: reading.readout_width,
     })
 }
@@ -211,7 +232,7 @@ fn ports(reading: &model::ReadingFact) -> Result<Ports> {
 /// pass, and the channel its velocity lands in.
 fn video_lane(
     case: &Case,
-    ports: &Ports,
+    dims: &Dims,
     reading: &str,
     group: u32,
     tag: &str,
@@ -223,24 +244,23 @@ fn video_lane(
     let width = case.patch_features;
     let (f, w) = (from as usize, width as usize);
     let latents = &case.latents[f * w..(to as usize) * w];
-    let positions = &case.positions[f * ports.axes as usize..(to as usize) * ports.axes as usize];
+    let positions = &case.positions[f * dims.axes as usize..(to as usize) * dims.axes as usize];
     let pass = ForwardPass::new();
     pass.reading(reading)?;
     pass.stream(LaneStream::Video)?;
     pass.group(group)?;
     let x = Channel::from_shaped([rows, width], latents).named(&format!("latents_{tag}"));
-    let pos =
-        Channel::from_shaped([rows, ports.axes], positions).named(&format!("positions_{tag}"));
+    let pos = Channel::from_shaped([rows, dims.axes], positions).named(&format!("positions_{tag}"));
     // One timestep cell PER PASS: a seeded channel attaches to one pass
     // only (the runtime's channel-role rule).
     let t = Channel::from([timestep]).named(&format!("t_{tag}"));
-    pass.input(&ports.latents, &x)?;
-    pass.input(&ports.positions, &pos)?;
-    pass.input(&ports.timestep, &t)?;
+    pass.input("latents", &x)?;
+    pass.input("positions", &pos)?;
+    pass.input("timestep", &t)?;
     let out =
-        Channel::new([rows, ports.velocity_width], dtype::f32).named(&format!("velocity_{tag}"));
+        Channel::new([rows, dims.velocity_width], dtype::f32).named(&format!("velocity_{tag}"));
     let readback = out.clone();
-    let velocity_width = ports.velocity_width;
+    let velocity_width = dims.velocity_width;
     pass.epilogue(move || {
         readback.put(intrinsics::velocity(velocity_width));
     });
@@ -249,7 +269,7 @@ fn video_lane(
 
 /// One denoise step: the context lane and one or two video lanes, one
 /// group, one fire, the velocity of every video row.
-async fn step(case: &Case, ports: &Ports, reading: &str) -> Result<Vec<f32>> {
+async fn step(case: &Case, dims: &Dims, reading: &str) -> Result<Vec<f32>> {
     let group = 0;
 
     // The context lane: the cross-attention keys and values, and nothing
@@ -263,16 +283,16 @@ async fn step(case: &Case, ports: &Ports, reading: &str) -> Result<Vec<f32>> {
         case.context.as_slice(),
     )
     .named("context");
-    context.input(&ports.context, &ctx)?;
+    context.input("context", &ctx)?;
 
     // The conditioning lane (TI2V's clean first frame, timestep 0), if the
     // case cuts one, and the main lane.
     let cond = (case.cond_rows > 0)
-        .then(|| video_lane(case, ports, reading, group, "cond", 0, case.cond_rows, 0.0))
+        .then(|| video_lane(case, dims, reading, group, "cond", 0, case.cond_rows, 0.0))
         .transpose()?;
     let (main, main_out) = video_lane(
         case,
-        ports,
+        dims,
         reading,
         group,
         "main",
@@ -291,7 +311,7 @@ async fn step(case: &Case, ports: &Ports, reading: &str) -> Result<Vec<f32>> {
     }
     main.submit(&main_pipe).context("video lane")?;
 
-    let mut velocity = Vec::with_capacity(case.rows as usize * ports.velocity_width as usize);
+    let mut velocity = Vec::with_capacity(case.rows as usize * dims.velocity_width as usize);
     if let Some((_, out)) = &cond {
         velocity.extend(out.take_host::<Vec<f32>>().await?);
     }
@@ -356,8 +376,8 @@ async fn main(input: Input) -> Result<Output> {
         )
         .into());
     }
-    let ports = ports(&reading)?;
-    let velocity = step(&case, &ports, &reading.name).await?;
+    let dims = dims(&reading)?;
+    let velocity = step(&case, &dims, &reading.name).await?;
     Ok(Output {
         velocity,
         rows: case.rows,

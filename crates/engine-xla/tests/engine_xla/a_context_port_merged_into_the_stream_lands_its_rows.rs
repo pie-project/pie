@@ -6,12 +6,13 @@
 use crate::common_dit;
 
 use common_dit::{Lcg, Rig, WIDTH, Weights, assert_close, attach, bf, lane};
-use engine::fire::{LaneStream, PortKind};
+use engine::fire::LaneStream;
 use poem::fact;
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Stream, Trace, Value, Weight,
     ops, seam, trace_hybrid,
 };
+use poem_ir::InputAxis;
 
 const FREQ: u32 = 16;
 
@@ -26,11 +27,14 @@ impl ForwardHybrid for MergedBlock {
             inputs.on(fact::stream(Stream::Text)),
             inputs.on(!fact::stream(Stream::Text)),
         );
-        let x_txt = txt.context(0, WIDTH);
+        let x_txt = txt.input("context", Dtype::Bf16, InputAxis::Row, WIDTH, None);
         let embed = Weight::sym("embed", [u64::from(WIDTH), u64::from(WIDTH)], Dtype::Bf16);
-        let x_img = ops::linear::matmul(&img.latents(0, WIDTH, Dtype::Bf16), &embed);
+        let x_img = ops::linear::matmul(
+            &img.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None),
+            &embed,
+        );
         let x = Value::merge(vec![x_txt, x_img]);
-        let t = inputs.lane_vector(0, 1);
+        let t = inputs.input("timestep", Dtype::F32, InputAxis::Lane, 1, None);
         let emb = ops::elemwise::silu(&ops::elemwise::sinusoid(&t, FREQ, 10_000.0, true, 1.0));
         let ada = Weight::sym("ada", [3 * u64::from(WIDTH), u64::from(FREQ)], Dtype::Bf16);
         let ada_bias = Weight::sym("ada_bias", [3 * u64::from(WIDTH)], Dtype::Bf16);
@@ -134,24 +138,8 @@ fn the_merged_context_rows_and_the_f32_lane_chain_land_the_reference() {
             rig.publish(handles.instance, 2, &vec![0.0; rows * 2]);
         }
         let slot = 2 * req;
-        let mut text_lane = lane(&rig, slot, &t, LaneStream::Text, req);
-        for feed in &mut text_lane.ports {
-            if feed.kind == PortKind::Latents {
-                feed.kind = PortKind::Context;
-            }
-        }
-        let mut image_lane = lane(&rig, slot + 1, &i, LaneStream::Image, req);
-        for feed in &mut image_lane.ports {
-            if feed.kind == PortKind::Latents {
-                feed.port = 0;
-            }
-        }
-        text_lane
-            .ports
-            .retain(|f| f.kind != PortKind::AxisPositions);
-        image_lane
-            .ports
-            .retain(|f| f.kind != PortKind::AxisPositions);
+        let text_lane = lane(&rig, slot, &t, LaneStream::Text, req);
+        let image_lane = lane(&rig, slot + 1, &i, LaneStream::Image, req);
         attachments.push(attach(lanes.len() as u32, t.instance));
         lanes.push(text_lane);
         attachments.push(attach(lanes.len() as u32, i.instance));

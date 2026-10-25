@@ -59,7 +59,7 @@ a change here.
 
 ### The context pad is a fact now
 
-`port-fact.rows` says "my context lane is exactly this tall, whatever the
+`input-decl.rows` (`model::lane`) says "my context lane is exactly this tall, whatever the
 prompt was". Wan 2.2 says 512: its reference truncates umT5's answer to the
 prompt's real length and zero-pads the EMBEDS back to 512, and the transformer
 attends every one of those keys — the pad rows go through `text_embedder` into
@@ -100,7 +100,7 @@ produced a recognisable clip, which is exactly why it is written down.
 
 ### CFG does not run yet
 
-A model with no `guidance` port takes a negative prompt as a second lane pair
+A model with no `guidance` input takes a negative prompt as a second lane pair
 whose velocity the host combines. That path is written and refuses: four lanes
 on `wan22-ti2v-5b` die with `no cell available` at the first readback, because
 the two branches' `out` channels are taken in the same turn and one has no

@@ -703,6 +703,7 @@ impl Engine for Cuda {
             bidirectional_attention: true,
             adapter_attachments: true,
             facts: shell.trace().facts.clone(),
+            inputs: shell.inputs(),
         };
 
         self.replay = crate::replay::Replay::of(&shell);
@@ -1177,7 +1178,6 @@ impl Cuda {
                     adapter: lane_adapters[at].or(lane.adapter),
                     drafts: lane.drafts,
                     captures_scores: lane.captures_scores,
-                    self_cond: lane.self_cond.as_ref(),
                     rs: lane.rs.clone(),
                     rs_reset: lane.rs_reset,
                     rs_slot: lane.rs_slot,
@@ -1189,7 +1189,7 @@ impl Cuda {
                     stream: lane.stream as u8,
                     group: lane.group,
                     peer: lane.peer,
-                    ports: &lane.ports,
+                    inputs: &lane.inputs,
                     attn_classes: lane.attn_classes.as_ref(),
                     reports: lane.reports,
                     tap: lane.tap.as_ref(),
@@ -1448,6 +1448,7 @@ mod tests {
             nodes: Vec::new(),
             seams: Vec::new(),
             drafter: None,
+            inputs: Vec::new(),
         }
     }
 

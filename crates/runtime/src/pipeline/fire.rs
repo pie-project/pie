@@ -605,8 +605,7 @@ fn plain_lane(lane: &::engine::Lane) -> bool {
         && lane.adapter.is_none()
         && !lane.drafts
         && !lane.block_draft
-        && lane.self_cond.is_none()
-        && lane.ports.is_empty()
+        && lane.inputs.is_empty()
         && !lane.kv_less
 }
 
@@ -1537,52 +1536,6 @@ pub(crate) async fn drain_pipeline_fires<C: FireContext>(
     }
 }
 
-fn stamp_self_cond(
-    req: &mut crate::engine::FireRequest,
-    payload: Option<crate::pipeline::instance::SelfCondPayload>,
-) -> Result<(), String> {
-    let wanted: usize = req.lanes.iter().map(|lane| lane.tokens.len()).sum();
-    let mut cursor = 0usize;
-    for lane in &mut req.lanes {
-        if let Some(payload) = &payload
-            && let Some((rows_channel, weights_channel)) = payload.channels
-        {
-            lane.self_cond = Some(::engine::fire::SelfCondInput::from_channels(
-                payload.taps,
-                rows_channel,
-                weights_channel,
-            ));
-            continue;
-        }
-        if let Some(payload) = &payload {
-            let cells = lane.tokens.len() * payload.taps as usize;
-            let end = cursor + cells;
-            if end > payload.rows.len() {
-                return Err(format!(
-                    "the staged payload holds {} taps and this fire's {wanted} rows want {}",
-                    payload.rows.len(),
-                    wanted * payload.taps as usize
-                ));
-            }
-            lane.self_cond = Some(::engine::fire::SelfCondInput::new(
-                payload.taps,
-                payload.rows[cursor..end].to_vec(),
-                &payload.weights[cursor..end],
-            ));
-            cursor = end;
-        }
-    }
-    if let Some(payload) = &payload
-        && cursor != payload.rows.len()
-    {
-        return Err(format!(
-            "the staged payload holds {} taps and this fire's {wanted} rows want {cursor}",
-            payload.rows.len()
-        ));
-    }
-    Ok(())
-}
-
 /// `device_rows`, when given, are the rows each lane carries on the device:
 /// a pooled pass stages no host tokens, and its words still state its rows,
 /// so a single-token lane takes the decode branch.
@@ -2322,27 +2275,8 @@ pub async fn submit_pass_stamped<C: FireContext>(
         }
         // A denoise pass's rows read one another: it is never cut, keyed or
         // logged by its tokens.
-        let denoise = {
-            let pass = ctx.resources().get_mut(&fwd)?;
-            let denoise =
-                pass.bindings.canvas == Some(crate::pipeline::instance::CanvasMode::Denoise);
-            if denoise {
-                let payload = if pass
-                    .bindings
-                    .self_cond
-                    .as_ref()
-                    .is_some_and(|p| p.channels.is_some())
-                {
-                    pass.bindings.self_cond.clone()
-                } else {
-                    pass.bindings.self_cond.take()
-                };
-                if let Err(error) = stamp_self_cond(&mut req, payload) {
-                    return Ok(Err(format!("pipeline: self-conditioning: {error}")));
-                }
-            }
-            denoise
-        };
+        let denoise = ctx.resources().get(&fwd)?.bindings.canvas
+            == Some(crate::pipeline::instance::CanvasMode::Denoise);
         stamp_lane_words(&mut req, fire_wide_mask, carries_media, denoise, None);
         if !matched.is_empty() {
             let lane_rows: Vec<u32> = req
@@ -2599,7 +2533,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 why.push("its lanes carry recurrent state");
             }
             if why.is_empty() {
-                why.push("its rows read one another (attention both ways, a block draft, an attention group, ports or voxels)");
+                why.push("its rows read one another (attention both ways, a block draft, an attention group, inputs or voxels)");
             }
             return Ok(Err(format!(
                 "pipeline: a pass of {rows_total} rows would run {last_rows} in one fire, \
@@ -3739,28 +3673,8 @@ async fn fire_device_geometry<C: FireContext>(
         record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
         return Ok(Err(reason));
     }
-    let denoise = {
-        let pass = ctx.resources().get_mut(&fwd)?;
-        let denoise = pass.bindings.canvas == Some(crate::pipeline::instance::CanvasMode::Denoise);
-        if denoise {
-            let payload = if pass
-                .bindings
-                .self_cond
-                .as_ref()
-                .is_some_and(|p| p.channels.is_some())
-            {
-                pass.bindings.self_cond.clone()
-            } else {
-                pass.bindings.self_cond.take()
-            };
-            if let Err(error) = stamp_self_cond(&mut req, payload) {
-                let reason = format!("pipeline: self-conditioning: {error}");
-                record_submit_failure(ctx, &fwd, &pipeline_failure, &reason);
-                return Ok(Err(reason));
-            }
-        }
-        denoise
-    };
+    let denoise = ctx.resources().get(&fwd)?.bindings.canvas
+        == Some(crate::pipeline::instance::CanvasMode::Denoise);
     {
         let program = &ctx.resources().get(&fwd)?.instance.program;
         let (drafts, captures) = (program.reads_mtp_logits, program.reads_attn_score);

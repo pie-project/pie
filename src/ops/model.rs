@@ -381,7 +381,10 @@ fn info(name: String) -> Result<Answer> {
                 runtime_quant: r.runtime_quant.clone(),
             })
             .collect(),
-        generative: facts::of(entry.deployment.as_deref()),
+        generative: facts::of(entry.deployment.as_deref()).map(|mut generative| {
+            generative.inputs = entry.deployment.as_deref().map_or_else(Vec::new, facts::inputs);
+            generative
+        }),
         name: entry.name,
         root: entry.root,
         files: entry.files,
@@ -483,7 +486,9 @@ impl crate::ui::Report for ModelInfo {
                 }
                 row("train steps", schedule.train_steps.to_string());
             }
-            row("max latent rows", generative.max_latent_rows.to_string());
+            if !generative.inputs.is_empty() {
+                row("inputs", generative.inputs.join(", "));
+            }
             table.print(palette);
 
             println!("\n{}", palette.bold("Readings"));
@@ -522,14 +527,6 @@ impl crate::ui::Report for ModelInfo {
                     reading.readout,
                     reading.readout_width,
                 );
-                if !reading.ports.is_empty() {
-                    println!(
-                        "  {}      {}  {}",
-                        " ".repeat(name_width),
-                        " ".repeat(binds_width),
-                        palette.dim(format!("<- {}", reading.ports.join(", "))),
-                    );
-                }
             }
             if generative.text_to_image() {
                 println!(

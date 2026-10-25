@@ -4,7 +4,7 @@ use crate::common_dit;
 
 use common_dit::{Rig, WIDTH, Weights, attach, frame, lane};
 use engine::Engine;
-use engine::fire::{LaneStream, PortKind};
+use engine::fire::{InputFeed, LaneStream};
 
 #[test]
 fn a_missing_feed_and_a_wrong_cell_are_refused_by_name() {
@@ -20,16 +20,18 @@ fn a_missing_feed_and_a_wrong_cell_are_refused_by_name() {
     rig.publish(handles.instance, 1, &[0.3]);
     rig.publish(handles.instance, 2, &vec![0.0; rows as usize * 2]);
 
+    let latents = rig.input("latents");
     let mut bare = lane(&rig, 0, &handles, LaneStream::Text, 0);
-    bare.ports.retain(|feed| feed.kind != PortKind::Latents);
+    bare.inputs.retain(|feed| feed.id != latents);
     let refusal = rig
         .engine
         .submit(&frame(vec![bare], vec![attach(0, &handles)]))
         .expect_err("a lane feeding no latents is refused")
         .to_string();
     assert!(
-        refusal.contains("Latents port 0") && refusal.contains("feeds it no channel"),
-        "the refusal names the port: {refusal}"
+        refusal.contains(&format!("guest input {latents}"))
+            && refusal.contains("feeds it no channel"),
+        "the refusal names the input: {refusal}"
     );
 
     let wide = rig.lane(rows + 1);
@@ -45,26 +47,27 @@ fn a_missing_feed_and_a_wrong_cell_are_refused_by_name() {
         .expect_err("a cell of the wrong shape is refused")
         .to_string();
     assert!(
-        refusal.contains("Latents port 0")
+        refusal.contains(&format!("guest input {latents}"))
             && refusal.contains("whose cell is")
             && refusal.contains(&format!("{rows} row(s) x {WIDTH}")),
-        "the refusal names the port and the shapes: {refusal}"
+        "the refusal names the input and the shapes: {refusal}"
     );
 
     let mut stray = lane(&rig, 0, &handles, LaneStream::Text, 0);
     rig.publish(handles.instance, 0, &vec![0.0; rows as usize * w]);
-    stray.ports.push(engine::fire::PortFeed {
-        kind: PortKind::Context,
-        port: 0,
+    let undeclared = rig.inputs.len() as u32;
+    stray.inputs.push(InputFeed {
+        id: undeclared,
         channel: handles.latent,
     });
     let refusal = rig
         .engine
         .submit(&frame(vec![stray], vec![attach(0, &handles)]))
-        .expect_err("a feed for an undeclared port is refused")
+        .expect_err("a feed for an undeclared input is refused")
         .to_string();
     assert!(
-        refusal.contains("Context port 0") && refusal.contains("declares no such port"),
-        "the refusal names the port: {refusal}"
+        refusal.contains(&format!("guest input {undeclared}"))
+            && refusal.contains("reads no such input"),
+        "the refusal names the input: {refusal}"
     );
 }

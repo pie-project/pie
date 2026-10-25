@@ -20,8 +20,8 @@ impl ForwardHybrid for LastJointBlock {
             inputs.on(!fact::stream(Stream::Text)),
         );
         let w = |name: &str| Weight::sym(name, [u64::from(WIDTH), u64::from(WIDTH)], Dtype::Bf16);
-        let x_txt = txt.latents(0, WIDTH, Dtype::Bf16);
-        let x_img = img.latents(1, WIDTH, Dtype::Bf16);
+        let x_txt = txt.input("text", Dtype::Bf16, poem_ir::InputAxis::Row, WIDTH, None);
+        let x_img = img.input("image", Dtype::Bf16, poem_ir::InputAxis::Row, WIDTH, None);
         let project = |x: &Value, prefix: &str| {
             (
                 ops::linear::matmul(x, &w(&format!("{prefix}.q"))),

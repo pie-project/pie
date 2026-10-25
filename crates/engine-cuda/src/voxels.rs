@@ -35,7 +35,11 @@ impl Seat {
         for decl in &trace.values {
             match (&decl.def, &decl.ty) {
                 (
-                    poem_ir::Def::Input(poem_ir::RuntimeInput::Voxels { channels: c, .. }),
+                    poem_ir::Def::Input(poem_ir::RuntimeInput::Guest {
+                        axis: poem_ir::InputAxis::Voxel,
+                        width: c,
+                        ..
+                    }),
                     poem_ir::Ty::Tensor { dtype: d, .. },
                 ) => {
                     channels = channels.max(*c);

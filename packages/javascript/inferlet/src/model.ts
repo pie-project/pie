@@ -5,7 +5,7 @@
 // around.
 
 import * as _model from 'pie:inferlet/model@0.3.0';
-import type { BlockDrafter, CanvasShape, LatentSpace, ReadingFact, ScheduleFact } from 'pie:inferlet/model@0.3.0';
+import type { BlockDrafter, CanvasShape, LaneDecl, LatentSpace, ReadingFact, ScheduleFact } from 'pie:inferlet/model@0.3.0';
 
 // The tokenizer surface lives in the sibling `tokenizer` module and is
 // re-exported here, so `model.encode`/`model.decode` read off `model` the way
@@ -105,6 +105,15 @@ export function reading(name: string): ReadingFact | undefined {
   return _model.readings().find((r) => r.name === name);
 }
 
+/** The lane a pass of these switches is: the inputs it binds (exactly
+ *  these, by `ForwardPass.input`), whether it binds `state` and `embed`, and
+ *  what it reads out. Switches are `[name, value]` pairs — `['reading', r]`,
+ *  `['stream', s]`, and on a diffusion model `['canvas', 'encode' | 'denoise']`;
+ *  one left unset takes its default. */
+export function lane(switches: Array<[string, string]>): LaneDecl {
+  return _model.lane(switches);
+}
+
 /** The latent space a denoiser works in; `undefined` without one. */
 export function latent(): LatentSpace | undefined {
   return _model.latent();
@@ -116,7 +125,7 @@ export function schedule(): ScheduleFact | undefined {
   return _model.schedule();
 }
 
-/** The most latent rows one pass carries; 0 without a float lane. */
+/** The most rows one lane may carry: the guest sizes its row inputs under this. */
 export function maxLatentRows(): number {
   return _model.maxLatentRows();
 }
@@ -126,12 +135,14 @@ export type {
   BlockDrafter,
   CanvasShape,
   ForwardKind,
+  InputAxis,
+  InputDecl,
+  LaneDecl,
   LaneStream,
   LatentSpace,
-  PortFact,
-  PortKind,
   PositionConvention,
   ReadingFact,
+  Readout,
   ReadoutKind,
   ScheduleFact,
   ScheduleKind,

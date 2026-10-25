@@ -109,7 +109,7 @@ pub struct FireBindings {
 
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
-    pub ports: Vec<(engine::fire::PortKind, u8, Tensor)>,
+    pub inputs: Vec<(u32, Tensor)>,
     pub voxels: Option<crate::inputs::VoxelHandles>,
 }
 
@@ -527,12 +527,6 @@ impl<'c> Run<'c> {
             Def::Input(RuntimeInput::ImageGrids) => self.fire.patch_grids.unwrap_or_else(|| {
                 panic!("value {at} reads this fire's image grids, which no lane of it submitted")
             }),
-            Def::Input(RuntimeInput::SelfCondRows | RuntimeInput::SelfCondWeights) => {
-                panic!(
-                    "value {at} reads a self-conditioning input, which this shell stages none \
-                     of; the load refuses such a plan"
-                )
-            }
             Def::Input(RuntimeInput::MropePositions) => {
                 self.fire.mrope_positions.unwrap_or_else(|| {
                     panic!(
@@ -540,18 +534,6 @@ impl<'c> Run<'c> {
                          load reserved no triple — the plan declares no multimodal rotation"
                     )
                 })
-            }
-            Def::Input(RuntimeInput::Latents { port, .. }) => {
-                self.port(at, engine::fire::PortKind::Latents, *port)
-            }
-            Def::Input(RuntimeInput::LaneVector { port, .. }) => {
-                self.port(at, engine::fire::PortKind::LaneVector, *port)
-            }
-            Def::Input(RuntimeInput::Context { port, .. }) => {
-                self.port(at, engine::fire::PortKind::Context, *port)
-            }
-            Def::Input(RuntimeInput::AxisPositions { port, .. }) => {
-                self.port(at, engine::fire::PortKind::AxisPositions, *port)
             }
             Def::Input(RuntimeInput::RowPermutation { select }) => {
                 self.packing(at, *select).permutation
@@ -575,7 +557,11 @@ impl<'c> Run<'c> {
                 ..
             }) if self.fire.geometry.is_empty() => self.fire.tables.request_of_token,
             Def::Input(RuntimeInput::Grid) => self.voxel_seat(at).grid,
-            Def::Input(RuntimeInput::Voxels { .. }) => self.voxel_seat(at).payload,
+            Def::Input(RuntimeInput::Guest {
+                axis: poem_ir::InputAxis::Voxel,
+                ..
+            }) => self.voxel_seat(at).payload,
+            Def::Input(RuntimeInput::Guest { id, .. }) => self.guest(at, *id),
             Def::Input(RuntimeInput::TokenGrid { .. }) => {
                 self.voxel_seat(at).token_grid.unwrap_or_else(|| {
                     panic!("value {at} reads the token side of the patchify pair, which this load carved none of")
@@ -651,14 +637,14 @@ impl<'c> Run<'c> {
         })
     }
 
-    fn port(&self, at: usize, kind: engine::fire::PortKind, port: u8) -> Tensor {
+    fn guest(&self, at: usize, id: u32) -> Tensor {
         self.fire
-            .ports
+            .inputs
             .iter()
-            .find(|(k, p, _)| *k == kind && *p == port)
-            .map(|(_, _, tensor)| *tensor)
+            .find(|(seat, _)| *seat == id)
+            .map(|(_, tensor)| *tensor)
             .unwrap_or_else(|| {
-                panic!("value {at} reads the {kind:?} port {port}, which this load carved none of")
+                panic!("value {at} reads guest input {id}, which this load carved no rectangle for")
             })
     }
 

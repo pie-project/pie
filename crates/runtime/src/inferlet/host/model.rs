@@ -37,32 +37,97 @@ fn axis_role(role: poem::generative::AxisRole) -> pie::inferlet::model::AxisRole
     }
 }
 
+fn readout_kind(kind: poem::generative::ReadoutKind) -> pie::inferlet::model::ReadoutKind {
+    use pie::inferlet::model::ReadoutKind;
+    match kind {
+        poem::generative::ReadoutKind::Logits => ReadoutKind::Logits,
+        poem::generative::ReadoutKind::Velocity => ReadoutKind::Velocity,
+        poem::generative::ReadoutKind::Hidden => ReadoutKind::Hidden,
+        poem::generative::ReadoutKind::Pixels => ReadoutKind::Pixels,
+    }
+}
+
+/// An input as its guest binds it: an i32 input is fed i32, any float one
+/// f32.
+pub(crate) fn input_decl(input: &poem_ir::InputDecl) -> pie::inferlet::model::InputDecl {
+    use pie::inferlet::model::InputAxis;
+    pie::inferlet::model::InputDecl {
+        name: input.name.clone(),
+        axis: match input.axis {
+            poem_ir::InputAxis::Lane => InputAxis::Lane,
+            poem_ir::InputAxis::Row => InputAxis::Row,
+            poem_ir::InputAxis::Voxel => InputAxis::Voxel,
+        },
+        width: input.width,
+        dtype: match input.dtype {
+            poem_ir::Dtype::I32 => pie::inferlet::types::Dtype::I32,
+            _ => pie::inferlet::types::Dtype::F32,
+        },
+        rows: input.rows,
+    }
+}
+
+/// The lane `switches` name: its reading (the model's one when unnamed),
+/// stream (`text` when unnamed) and, on a diffusion model, whether its canvas
+/// denoises (`encode` when unnamed).
+pub(crate) type LaneOf = (
+    Option<&'static poem::generative::ReadingFact>,
+    poem::Stream,
+    bool,
+);
+
+pub(crate) fn lane_of(switches: &[(String, String)]) -> Result<LaneOf, String> {
+    let model = model::model();
+    let mut reading = None;
+    let mut stream = None;
+    let mut denoise = false;
+    for (name, value) in switches {
+        match name.as_str() {
+            "canvas" if model.diffusion().is_some() => {
+                denoise = match value.as_str() {
+                    "encode" => false,
+                    "denoise" => true,
+                    other => return Err(format!("a canvas is `encode` or `denoise`, not `{other}`")),
+                };
+            }
+            poem::Request::READING => {
+                let found = model
+                    .readings()
+                    .iter()
+                    .find(|r| r.name == *value)
+                    .ok_or_else(|| format!("this model declares no reading `{value}`"))?;
+                reading = Some(found);
+            }
+            poem::Request::STREAM => {
+                let found = poem::Stream::ALL
+                    .into_iter()
+                    .find(|s| s.name() == value)
+                    .ok_or_else(|| format!("no lane is of a stream `{value}`"))?;
+                stream = Some(found);
+            }
+            other => return Err(format!("no lane switch is named `{other}`")),
+        }
+    }
+    let reading = match reading {
+        Some(reading) => Some(reading),
+        None if model.readings().len() > 1 => {
+            return Err(format!(
+                "this model declares {} readings and the switches name none",
+                model.readings().len()
+            ));
+        }
+        None => model.sole_reading(),
+    };
+    Ok((reading, stream.unwrap_or_default(), denoise))
+}
+
 fn reading_fact(reading: &poem::generative::ReadingFact) -> pie::inferlet::model::ReadingFact {
-    use pie::inferlet::model::{PortKind, ReadoutKind};
     pie::inferlet::model::ReadingFact {
         name: reading.name.to_string(),
         index: reading.index,
         has_kv: reading.has_kv,
         takes_tokens: reading.takes_tokens,
         streams: reading.streams.iter().copied().map(lane_stream).collect(),
-        ports: reading
-            .ports
-            .iter()
-            .map(|port| pie::inferlet::model::PortFact {
-                name: port.name.to_string(),
-                kind: match port.kind {
-                    poem::generative::PortKind::Latents => PortKind::Latents,
-                    poem::generative::PortKind::LaneVector => PortKind::LaneVector,
-                    poem::generative::PortKind::Context => PortKind::Context,
-                    poem::generative::PortKind::AxisPositions => PortKind::AxisPositions,
-                    poem::generative::PortKind::Voxels => PortKind::Voxels,
-                },
-                width: port.width,
-                dtype: pie::inferlet::types::Dtype::F32,
-                streams: port.streams.iter().copied().map(lane_stream).collect(),
-                rows: port.rows,
-            })
-            .collect(),
         positions: reading.positions.as_ref().map(|convention| {
             pie::inferlet::model::PositionConvention {
                 axes: convention.axes.iter().copied().map(axis_role).collect(),
@@ -72,12 +137,7 @@ fn reading_fact(reading: &poem::generative::ReadingFact) -> pie::inferlet::model
                 reference_stride: convention.reference_stride,
             }
         }),
-        readout: match reading.readout {
-            poem::generative::ReadoutKind::Logits => ReadoutKind::Logits,
-            poem::generative::ReadoutKind::Velocity => ReadoutKind::Velocity,
-            poem::generative::ReadoutKind::Hidden => ReadoutKind::Hidden,
-            poem::generative::ReadoutKind::Pixels => ReadoutKind::Pixels,
-        },
+        readout: readout_kind(reading.readout),
         readout_width: reading.readout_width,
     }
 }
@@ -125,12 +185,42 @@ impl pie::inferlet::model::Host for ProcessCtx {
             .map(|d| pie::inferlet::model::CanvasShape {
                 length: d.canvas,
                 hidden: d.hidden,
-                self_cond_taps: d.self_cond_taps,
             }))
     }
 
     async fn readings(&mut self) -> Result<Vec<pie::inferlet::model::ReadingFact>> {
         Ok(model::model().readings().iter().map(reading_fact).collect())
+    }
+
+    async fn lane(
+        &mut self,
+        switches: Vec<(String, String)>,
+    ) -> Result<std::result::Result<pie::inferlet::model::LaneDecl, String>> {
+        let (reading, stream, denoise) = match lane_of(&switches) {
+            Ok(lane) => lane,
+            Err(error) => return Ok(Err(error)),
+        };
+        let model = model::model();
+        let inputs = model
+            .lane_inputs(reading.map(|r| r.name.as_str()), stream, denoise, false)
+            .into_iter()
+            .map(|id| input_decl(&model.inputs()[id as usize]))
+            .collect();
+        Ok(Ok(pie::inferlet::model::LaneDecl {
+            inputs,
+            reads_kv: reading.is_none_or(|r| r.has_kv),
+            embeds: reading.is_none_or(|r| r.takes_tokens),
+            readout: match reading {
+                Some(r) => pie::inferlet::model::Readout {
+                    kind: readout_kind(r.readout),
+                    width: r.readout_width,
+                },
+                None => pie::inferlet::model::Readout {
+                    kind: pie::inferlet::model::ReadoutKind::Logits,
+                    width: model.vocab_size(),
+                },
+            },
+        }))
     }
 
     async fn latent(&mut self) -> Result<Option<pie::inferlet::model::LatentSpace>> {
@@ -173,7 +263,8 @@ impl pie::inferlet::model::Host for ProcessCtx {
     }
 
     async fn max_latent_rows(&mut self) -> Result<u32> {
-        Ok(model::model().generative().map_or(0, |g| g.max_rows))
+        let limits = crate::engine::get_spec(0)?.limits;
+        Ok(u32::try_from(limits.max_forward_tokens).unwrap_or(u32::MAX))
     }
 
     async fn output_vocab_size(&mut self) -> Result<u32> {

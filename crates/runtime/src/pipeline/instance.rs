@@ -69,32 +69,31 @@ pub struct ForwardBindings {
     pub checkpoints: Vec<u32>,
     pub media: Vec<std::sync::Arc<media::front::EncodedSpan>>,
     pub canvas: Option<CanvasMode>,
-    pub self_cond: Option<SelfCondPayload>,
     pub reading: Option<u8>,
     pub stream: Option<poem::Stream>,
     pub group: Option<u32>,
     pub peer: Option<u32>,
-    pub ports: Vec<PortBinding>,
+    pub inputs: Vec<InputBinding>,
     pub attn_classes: Option<::engine::fire::AttnClasses>,
 }
 
+/// A channel bound to the model's input `name` (id `id`): the rows it
+/// carries when a row input, the clip when a voxel one.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PortBinding {
+pub struct InputBinding {
     pub name: String,
-    pub kind: ::engine::fire::PortKind,
-    pub port: u8,
+    pub id: u32,
     pub channel_rep: u32,
     pub channel_id: ::engine::ChannelId,
     pub rows: Option<u32>,
     pub clip: Option<[u32; 3]>,
 }
 
-impl PortBinding {
+impl InputBinding {
     #[must_use]
-    pub fn feed(&self) -> ::engine::fire::PortFeed {
-        ::engine::fire::PortFeed {
-            kind: self.kind,
-            port: self.port,
+    pub fn feed(&self) -> ::engine::fire::InputFeed {
+        ::engine::fire::InputFeed {
+            id: self.id,
             channel: self.channel_id,
         }
     }
@@ -106,7 +105,7 @@ pub struct LaneFacts {
     pub stream: ::engine::fire::LaneStream,
     pub group: Option<u32>,
     pub peer: Option<u32>,
-    pub ports: Vec<::engine::fire::PortFeed>,
+    pub inputs: Vec<::engine::fire::InputFeed>,
     pub attn_classes: Option<::engine::fire::AttnClasses>,
 }
 
@@ -117,7 +116,7 @@ impl LaneFacts {
             lane.stream = self.stream;
             lane.group = self.group;
             lane.peer = self.peer;
-            lane.ports = self.ports.clone();
+            lane.inputs = self.inputs.clone();
             lane.attn_classes = self.attn_classes.clone();
         }
     }
@@ -179,14 +178,6 @@ pub struct FloatLane {
     pub rows: u32,
     pub clips: Vec<[u32; 3]>,
     pub embed: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct SelfCondPayload {
-    pub taps: u32,
-    pub rows: Vec<u32>,
-    pub weights: Vec<f32>,
-    pub channels: Option<(::engine::ChannelId, ::engine::ChannelId)>,
 }
 
 #[derive(Clone, Copy)]

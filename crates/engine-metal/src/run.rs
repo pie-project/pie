@@ -111,13 +111,11 @@ pub struct FireBindings {
 
     pub mrope_positions: Option<Tensor>,
 
-    pub self_cond_rows: Option<Tensor>,
-    pub self_cond_weights: Option<Tensor>,
-
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
 
-    pub ports: Vec<(engine::fire::PortKind, u8, Tensor)>,
+    /// Each staged guest input's rectangle, by id.
+    pub inputs: Vec<(u32, Tensor)>,
 
     pub voxels: Option<crate::inputs::VoxelHandles>,
 
@@ -1248,18 +1246,14 @@ impl<'c> Run<'c> {
         })
     }
 
-    fn port(&self, at: usize, kind: engine::fire::PortKind, port: u8) -> Tensor {
+    fn guest(&self, at: usize, id: u32) -> Tensor {
         self.fire
-            .ports
+            .inputs
             .iter()
-            .find(|(have, index, _)| *have == kind && *index == port)
-            .map(|(_, _, plane)| *plane)
+            .find(|(have, _)| *have == id)
+            .map(|(_, plane)| *plane)
             .unwrap_or_else(|| {
-                panic!(
-                    "value {at} reads the {kind:?} port {port}, and this load carved \
-                     {} float port(s)",
-                    self.fire.ports.len()
-                )
+                panic!("value {at} reads guest input {id}, which this load carved no rectangle for")
             })
     }
 
@@ -1518,22 +1512,6 @@ impl<'c> Run<'c> {
             Def::Input(RuntimeInput::ImageGrids) => self.fire.patch_grids.unwrap_or_else(|| {
                 panic!("value {at} reads this fire's image grids, which no lane of it submitted")
             }),
-            Def::Input(RuntimeInput::SelfCondRows) => {
-                self.fire.self_cond_rows.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads this fire's self-conditioning taps, which this load \
-                         reserved no seat for"
-                    )
-                })
-            }
-            Def::Input(RuntimeInput::SelfCondWeights) => {
-                self.fire.self_cond_weights.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads this fire's self-conditioning weights, which this \
-                         load reserved no seat for"
-                    )
-                })
-            }
             Def::Input(RuntimeInput::MropePositions) => {
                 self.fire.mrope_positions.unwrap_or_else(|| {
                     panic!(
@@ -1541,18 +1519,6 @@ impl<'c> Run<'c> {
                          load reserved no triple — the plan declares no multimodal rotation"
                     )
                 })
-            }
-            Def::Input(RuntimeInput::Latents { port, .. }) => {
-                self.port(at, engine::fire::PortKind::Latents, *port)
-            }
-            Def::Input(RuntimeInput::LaneVector { port, .. }) => {
-                self.port(at, engine::fire::PortKind::LaneVector, *port)
-            }
-            Def::Input(RuntimeInput::Context { port, .. }) => {
-                self.port(at, engine::fire::PortKind::Context, *port)
-            }
-            Def::Input(RuntimeInput::AxisPositions { port, .. }) => {
-                self.port(at, engine::fire::PortKind::AxisPositions, *port)
             }
             Def::Input(RuntimeInput::RowPermutation { select }) => {
                 self.packing(at, *select).permutation
@@ -1566,7 +1532,11 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            Def::Input(RuntimeInput::Voxels { .. }) => self.voxel_seat(at).payload,
+            Def::Input(RuntimeInput::Guest {
+                axis: poem_ir::InputAxis::Voxel,
+                ..
+            }) => self.voxel_seat(at).payload,
+            Def::Input(RuntimeInput::Guest { id, .. }) => self.guest(at, *id),
             Def::Input(RuntimeInput::Geometry {
                 kind: GeomKind::GroupOfLane,
                 ..

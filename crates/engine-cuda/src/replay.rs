@@ -124,9 +124,8 @@ impl Replay {
             && !lane.captures_scores
             && !lane.block_draft
             && !wide(lane.word)
-            && lane.self_cond.is_none()
             && matches!(lane.rs, RsVerb::Fold)
-            && lane.ports.is_empty()
+            && lane.inputs.is_empty()
             && lane.attn_classes.is_none()
             && !lane.kv_less
             && !lane.kv.pages.is_empty()

@@ -23,15 +23,6 @@ pub const TE_INTER: u32 = 25_600;
 pub const TE_DEPTH: u32 = 64;
 pub const TE_LAYERS: u32 = 50;
 
-pub mod port {
-    pub const LATENTS: u8 = 0;
-    pub const REFERENCE: u8 = 1;
-    pub const AUDIO: u8 = 2;
-    pub const CONTEXT: u8 = 3;
-    pub const TIMESTEP: u8 = 0;
-    pub const POSITIONS: u8 = 0;
-}
-
 #[must_use]
 pub const fn modality(stream: Stream) -> usize {
     match stream {

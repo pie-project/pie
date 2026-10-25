@@ -390,18 +390,17 @@ class TestDiffusionSurface:
     def test_model_facts(self):
         from inferlet import model
 
-        assert model.canvas() == model.CanvasShape(32, 2560, 4)
+        assert model.canvas() == model.CanvasShape(32, 2560)
+        assert [i.name for i in model.lane([("canvas", "denoise")]).inputs] == ["self_cond_ids"]
         assert model.draft_block() is None
         assert model.run_ahead_window() == 4
 
-    def test_diffusion_pass_binds_canvas_and_taps(self):
+    def test_diffusion_pass_binds_canvas(self):
         from inferlet.eta import ForwardKind, ForwardPass, InferletError, diffusion
 
         fwd = ForwardPass(ForwardKind.DIFFUSION)
         fwd.canvas(diffusion.Mode.DENOISE)
-        fwd.self_conditioning([1, 2, 3, 4], [0.4, 0.3, 0.2, 0.1])
         assert fwd.wit.mode is diffusion.Mode.DENOISE
-        assert fwd.wit.self_cond == ([1, 2, 3, 4], [0.4, 0.3, 0.2, 0.1])
         with pytest.raises(InferletError, match="canvas binds"):
             ForwardPass(ForwardKind.TEXT).canvas(diffusion.Mode.ENCODE)
 

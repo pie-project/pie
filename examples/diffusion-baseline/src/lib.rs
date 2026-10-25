@@ -13,10 +13,10 @@
 //!
 //! Self-conditioning rides as the guest's taps: each step's epilogue also
 //! emits the top-`taps` of the temperature-scaled softmax per canvas row,
-//! and the host hands them to the next submit through `self_conditioning`
-//! — the reference's `softmax(logits / T) · E`, truncated to those taps.
-//! The first step of every canvas runs with no signal, as the reference
-//! does. Multi-canvas speculation is not attempted.
+//! and the next submit reads them through the denoise lane's two inputs,
+//! `self_cond_ids` and `self_cond_weights` — the reference's
+//! `softmax(logits / T) · E`, truncated to those taps. The first step of
+//! every canvas reads zeros (no signal), as the reference does. Multi-canvas speculation is not attempted.
 
 use inferlet::eta::diffusion::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -96,7 +96,7 @@ async fn main(input: Input) -> Result<Output> {
     }
     let shape = model::canvas().ok_or("a diffusion model states its canvas")?;
     let length = shape.length;
-    let taps = shape.self_cond_taps;
+    let taps = self_cond_taps()?;
     // The canvas attends both ways, so the runtime cannot cut it: one fire reads every row.
     let readable = max_readout_rows(model::ReadoutKind::Logits);
     if readable < length as usize {
@@ -175,10 +175,10 @@ async fn main(input: Input) -> Result<Output> {
         // this step's distribution and their probabilities. Loop-carried on
         // the device (the epilogue takes the previous step's and puts this
         // step's), read by the model straight off the channel at every
-        // submit (`self_conditioning_from`); seeded with zeros, which is
+        // submit (the `self_cond_*` inputs); seeded with zeros, which is
         // the reference's "no signal" first step. The host never sees them.
         let tap_ids_out =
-            Channel::from_shaped([length, taps], vec![0u32; (length * taps) as usize]).named("tap_ids");
+            Channel::from_shaped([length, taps], vec![0i32; (length * taps) as usize]).named("tap_ids");
         let tap_weights_out =
             Channel::from_shaped([length, taps], vec![0f32; (length * taps) as usize]).named("tap_weights");
 
@@ -193,8 +193,10 @@ async fn main(input: Input) -> Result<Output> {
             },
         )?;
         fwd.readout(&readout)?;
-        fwd.self_conditioning_from(&tap_ids_out, &tap_weights_out)
-            .context("bind self-conditioning to the tap channels")?;
+        fwd.input("self_cond_ids", &tap_ids_out)
+            .context("bind self_cond_ids to the tap channel")?;
+        fwd.input("self_cond_weights", &tap_weights_out)
+            .context("bind self_cond_weights to the tap channel")?;
         fwd.epilogue(move || {
             // Re-put unchanged: every step writes the same canvas slots.
             slots.put(slots.take());
@@ -246,7 +248,7 @@ async fn main(input: Input) -> Result<Output> {
             // Loop-carried: this step's taps replace the previous step's.
             let _ = tap_ids_out.take();
             let _ = tap_weights_out.take();
-            tap_ids_out.put(&tap_ids);
+            tap_ids_out.put(cast(&tap_ids, dtype::i32));
             tap_weights_out.put(&tap_weights);
 
             // The canvas the next step embeds — on the device, never drained.
@@ -310,6 +312,14 @@ async fn main(input: Input) -> Result<Output> {
         final_entropy,
         entropy_trace,
     })
+}
+
+/// The self-conditioning taps per canvas row: the width of the denoise
+/// lane's `self_cond_ids` input.
+fn self_cond_taps() -> Result<u32> {
+    let lane = model::lane(&[("canvas".into(), "denoise".into())])?;
+    let input = lane.inputs.iter().find(|input| input.name == "self_cond_ids");
+    Ok(input.ok_or("the denoise lane reads no `self_cond_ids` input")?.width)
 }
 
 /// One `encode` pass over `tokens` at slots `base..`: the causal reading,

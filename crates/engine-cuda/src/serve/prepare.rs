@@ -9,7 +9,7 @@ use crate::store::kv::{self, Seat};
 use crate::window::Windows;
 
 use super::{
-    Enqueued, FireCost, MROPE_COORDS, Media, MergeLand, PATCH_ROUTE_DROP, PortFeedPlan, Prepared,
+    Enqueued, FireCost, MROPE_COORDS, Media, MergeLand, PATCH_ROUTE_DROP, InputFeedPlan, Prepared,
     RsFire, Settled, Shell, StepView, VoxelFeedPlan,
 };
 
@@ -521,10 +521,7 @@ impl FrameShell for Shell {
                 if !merged.select.holds(row.word) {
                     continue;
                 }
-                let fed = seated
-                    .ports
-                    .iter()
-                    .any(|feed| feed.kind == merged.seat.kind && feed.port == merged.seat.port);
+                let fed = seated.inputs.iter().any(|feed| feed.id == merged.seat.id);
                 merge_lands.push(MergeLand {
                     merge: merged.merge,
                     seat: merged.seat,
@@ -539,39 +536,30 @@ impl FrameShell for Shell {
             }
         }
 
-        let mut port_feeds: Vec<PortFeedPlan> = Vec::new();
+        let mut input_feeds: Vec<InputFeedPlan> = Vec::new();
         let mut voxel_feeds: Vec<VoxelFeedPlan> = Vec::new();
         for (fire_lane, row) in composition.lanes().iter().enumerate() {
             let seated = &lanes[row.source as usize];
-            for feed in seated.ports {
-                if !self
-                    .feeds
-                    .ports
-                    .iter()
-                    .any(|(seat, _)| seat.kind == feed.kind && seat.port == feed.port)
-                {
+            for feed in seated.inputs {
+                if self.feeds.seat(feed.id).is_none() {
                     return Err(Fault::program(
-                        "serve::ports",
+                        "serve::inputs",
                         format!(
-                            "lane {} feeds {:?} port {} and this plan declares no such port",
-                            row.source, feed.kind, feed.port
+                            "lane {} feeds guest input {} and this plan reads no such input",
+                            row.source, feed.id
                         ),
                     ));
                 }
             }
-            for (seat, readers) in &self.feeds.ports {
+            for (seat, readers) in &self.feeds.inputs {
                 if !readers.contains(row.class as usize) {
                     continue;
                 }
-                let Some(feed) = seated
-                    .ports
-                    .iter()
-                    .find(|feed| feed.kind == seat.kind && feed.port == seat.port)
-                else {
+                let Some(feed) = seated.inputs.iter().find(|feed| feed.id == seat.id) else {
                     if arming {
                         continue;
                     }
-                    if seat.kind == engine::fire::PortKind::Voxels
+                    if seat.voxel()
                         && clips_of
                             .get(row.source as usize)
                             .and_then(Option::as_ref)
@@ -580,12 +568,12 @@ impl FrameShell for Shell {
                         continue;
                     }
                     return Err(Fault::program(
-                        "serve::ports",
+                        "serve::inputs",
                         format!(
-                            "lane {} runs a class that reads {:?} port {} and feeds it no \
-                             channel; a declared port is fed from a channel cell at every \
-                             submit (`Lane::ports`)",
-                            row.source, seat.kind, seat.port
+                            "lane {} runs a class that reads guest input {} and feeds it no \
+                             channel; a lane feeds every input its class reads from a channel \
+                             cell at every submit (`Lane::inputs`)",
+                            row.source, seat.id
                         ),
                     ));
                 };
@@ -595,17 +583,16 @@ impl FrameShell for Shell {
                     .map(|attached| attached.instance)
                     .ok_or_else(|| {
                         Fault::program(
-                            "serve::ports",
+                            "serve::inputs",
                             format!(
-                                "lane {} feeds {:?} port {} off channel {} but attaches no \
-                                 instance; a port cell is read through the instance that \
+                                "lane {} feeds guest input {} off channel {} but attaches no \
+                                 instance; an input's cell is read through the instance that \
                                  carries the channel",
-                                row.source, seat.kind, seat.port, feed.channel
+                                row.source, seat.id, feed.channel
                             ),
                         )
                     })?;
-                let voxel = seat.kind == engine::fire::PortKind::Voxels;
-                let rows = if voxel {
+                let rows = if seat.voxel() {
                     row.voxels
                 } else if seat.per_lane() {
                     1
@@ -618,17 +605,17 @@ impl FrameShell for Shell {
                 let cast = cell != bytes && seat.dtype == poem_ir::Dtype::Bf16 && cell == f32_bytes;
                 if cell != bytes && !cast {
                     return Err(Fault::program(
-                        "serve::ports",
+                        "serve::inputs",
                         format!(
-                            "lane {} feeds {:?} port {} off channel {} whose cell is {cell} \
-                             bytes, and the port wants {rows} row(s) x {} {:?} = {bytes} \
-                             bytes (the lane's rows by the port's width; an f32 cell of \
+                            "lane {} feeds guest input {} off channel {} whose cell is {cell} \
+                             bytes, and the input wants {rows} row(s) x {} {:?} = {bytes} \
+                             bytes (the lane's rows by the input's width; an f32 cell of \
                              {f32_bytes} bytes would be cast)",
-                            row.source, seat.kind, seat.port, feed.channel, seat.width, seat.dtype
+                            row.source, seat.id, feed.channel, seat.width, seat.dtype
                         ),
                     ));
                 }
-                if voxel {
+                if seat.voxel() {
                     voxel_feeds.push(VoxelFeedPlan {
                         lane: row.source,
                         first: row.voxel_offset,
@@ -641,7 +628,7 @@ impl FrameShell for Shell {
                     });
                     continue;
                 }
-                port_feeds.push(PortFeedPlan {
+                input_feeds.push(InputFeedPlan {
                     seat: *seat,
                     first: if seat.per_lane() {
                         fire_lane as u32
@@ -660,7 +647,7 @@ impl FrameShell for Shell {
         if voxel_feeds.iter().any(|feed| feed.width != fed_width) {
             return Err(Fault::VoxelPayload {
                 lane: voxel_feeds[0].lane,
-                what: "two lanes feed voxel ports of two widths in one fire (M0: one voxel \
+                what: "two lanes feed voxel inputs of two widths in one fire (M0: one voxel \
                        class per fire)",
             });
         }
@@ -1123,86 +1110,6 @@ impl FrameShell for Shell {
             }
             triples
         };
-        let taps = self.self_cond_taps as usize;
-        let mut self_cond_feeds: Vec<(
-            usize,
-            usize,
-            engine::ChannelId,
-            engine::ChannelId,
-            engine::InstanceId,
-        )> = Vec::new();
-        let (mut self_cond_rows, mut self_cond_weights) = if taps == 0 {
-            (Vec::new(), Vec::new())
-        } else {
-            let mut ids: Vec<i32> = Vec::with_capacity(positions.len() * taps);
-            let mut ws: Vec<f32> = Vec::with_capacity(positions.len() * taps);
-            for row in composition.lanes() {
-                let seated = &lanes[row.source as usize];
-                let cells = row.rows as usize * taps;
-                match seated.self_cond {
-                    Some(sc) if sc.channels.is_some() => {
-                        let (rows_channel, weights_channel) = sc.channels.unwrap_or_default();
-                        let instance = attachments
-                            .iter()
-                            .find(|attached| attached.lane == row.source)
-                            .map(|attached| attached.instance)
-                            .ok_or_else(|| {
-                                Fault::program(
-                                    "serve::prepare",
-                                    format!(
-                                        "lane {} reads its self-conditioning taps off channels but attaches no instance",
-                                        row.source
-                                    ),
-                                )
-                            })?;
-                        if sc.taps as usize != taps {
-                            return Err(Fault::program(
-                                "serve::prepare",
-                                format!(
-                                    "lane {} states {} taps and this plan reads {taps}",
-                                    row.source, sc.taps
-                                ),
-                            ));
-                        }
-                        self_cond_feeds.push((
-                            ids.len(),
-                            cells,
-                            rows_channel,
-                            weights_channel,
-                            instance,
-                        ));
-                        ids.extend(std::iter::repeat_n(0, cells));
-                        ws.extend(std::iter::repeat_n(0.0, cells));
-                    }
-                    Some(sc) => {
-                        if sc.taps as usize != taps
-                            || sc.rows.len() != cells
-                            || sc.weight_bits.len() != cells
-                        {
-                            return Err(Fault::program(
-                                "serve::prepare",
-                                format!(
-                                    "lane {} states self-conditioning taps of width {} over {} \
-                                     ids, and this plan reads {taps} taps over the lane's {} rows",
-                                    row.source,
-                                    sc.taps,
-                                    sc.rows.len(),
-                                    row.rows
-                                ),
-                            ));
-                        }
-                        ids.extend(sc.rows.iter().map(|&id| i32::try_from(id).unwrap_or(0)));
-                        ws.extend(sc.weights());
-                    }
-                    None => {
-                        ids.extend(std::iter::repeat_n(0, cells));
-                        ws.extend(std::iter::repeat_n(0.0, cells));
-                    }
-                }
-            }
-            (ids, ws)
-        };
-
         super::btrace::mark("lanes");
         let page_size = u64::from(self.pools.paging().page_size).max(1);
         let kv_less = self.spaces == 0;
@@ -1505,10 +1412,6 @@ impl FrameShell for Shell {
             if !mrope_positions.is_empty() {
                 mrope_positions.resize(carve_rows as usize * MROPE_COORDS, 0);
             }
-            if taps > 0 {
-                self_cond_rows.resize(carve_rows as usize * taps, 0);
-                self_cond_weights.resize(carve_rows as usize * taps, 0.0);
-            }
             if any_adapter {
                 adapter_routes.resize(carve_rows as usize, -1);
             }
@@ -1652,11 +1555,8 @@ impl FrameShell for Shell {
             patch_positions,
             patch_grids,
             mrope_positions,
-            self_cond_rows,
-            self_cond_weights,
-            self_cond_feeds,
             packings,
-            port_feeds,
+            input_feeds,
             voxel_feeds,
             merge_lands,
             lane_carve,

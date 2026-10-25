@@ -4,11 +4,12 @@ use crate::flux_2_dims;
 
 use flux_2_dims as forward;
 use flux_2_dims as model;
-use poem::generative::{PortKind, ReadoutKind};
+use poem::generative::ReadoutKind;
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, GeomKind, Operands, Operation, Platform, Request, RopeForm,
     RuntimeInput, Stream, Trace, Ty, ValueId, seam,
 };
+use poem_ir::InputAxis;
 
 const KLEIN: &str = "flux2-klein-4b-bf16-kv-bf16";
 const MINI: &str = "flux2-mini-bf16-kv-bf16";
@@ -40,7 +41,7 @@ fn seams(plan: &Trace) -> BTreeSet<&str> {
 #[test]
 fn the_flux_2_rows_bake_every_case() {
     both_rows_trace_on_every_platform_with_the_seams_and_caches_they_declare();
-    the_denoise_ports_are_the_ones_the_facts_declare();
+    the_readings_state_their_streams_readouts_and_sinusoids();
     each_stream_of_the_denoise_reading_classifies_into_its_own_class();
     every_ragged_read_is_self_paired_over_the_group_csr();
     every_rope_turns_four_axes_of_the_whole_head_interleaved();
@@ -87,36 +88,8 @@ fn both_rows_trace_on_every_platform_with_the_seams_and_caches_they_declare() {
     }
 }
 
-fn traced_ports(plan: &Trace) -> Vec<(PortKind, u8, u32)> {
-    let mut traced: Vec<(PortKind, u8, u32)> = plan
-        .values
-        .iter()
-        .filter_map(|decl| match &decl.def {
-            Def::Input(RuntimeInput::Latents { port, width }) => {
-                Some((PortKind::Latents, *port, *width))
-            }
-            Def::Input(RuntimeInput::Context { port, width }) => {
-                Some((PortKind::Context, *port, *width))
-            }
-            Def::Input(RuntimeInput::LaneVector { port, width }) => {
-                Some((PortKind::LaneVector, *port, *width))
-            }
-            Def::Input(RuntimeInput::AxisPositions { port, axes }) => {
-                Some((PortKind::AxisPositions, *port, u32::from(*axes)))
-            }
-            _ => None,
-        })
-        .collect();
-    traced.sort_by_key(|(kind, port, _)| (format!("{kind:?}"), *port));
-    traced.dedup();
-    traced
-}
-
-fn the_denoise_ports_are_the_ones_the_facts_declare() {
-    for (deployment, guidance, context_width) in [
-        (KLEIN, false, model::Dims::klein_4b().dim),
-        (MINI, true, model::Dims::mini().context_in),
-    ] {
+fn the_readings_state_their_streams_readouts_and_sinusoids() {
+    for (deployment, guidance) in [(KLEIN, false), (MINI, true)] {
         let facts = row(deployment)
             .generative()
             .expect("a generative row states its readings");
@@ -133,52 +106,8 @@ fn the_denoise_ports_are_the_ones_the_facts_declare() {
         );
         assert_eq!(denoise.readout, ReadoutKind::Velocity);
         assert_eq!(denoise.readout_width, model::IN_CHANNELS);
-        let names: Vec<&str> = denoise.ports.iter().map(|p| p.name.as_str()).collect();
-        let want: Vec<&str> = if guidance {
-            vec!["latents", "context", "timestep", "guidance", "positions"]
-        } else {
-            vec!["latents", "context", "timestep", "positions"]
-        };
-        assert_eq!(names, want, "{deployment}");
-        let at = |name: &str| {
-            let (index, port) = denoise.port(name).unwrap();
-            (index, port.kind, port.width)
-        };
-        assert_eq!(
-            at("latents"),
-            (model::port::LATENTS, PortKind::Latents, model::IN_CHANNELS)
-        );
-        assert_eq!(
-            at("context"),
-            (model::port::CONTEXT, PortKind::Context, context_width)
-        );
-        assert_eq!(
-            at("timestep"),
-            (model::port::TIMESTEP, PortKind::LaneVector, 1)
-        );
-        if guidance {
-            assert_eq!(
-                at("guidance"),
-                (model::port::GUIDANCE, PortKind::LaneVector, 1)
-            );
-        }
-        assert_eq!(
-            at("positions"),
-            (
-                model::port::POSITIONS,
-                PortKind::AxisPositions,
-                u32::from(model::ROPE_AXES)
-            )
-        );
 
         let plan = trace(deployment, Platform::Cuda);
-        let mut declared: Vec<(PortKind, u8, u32)> = denoise
-            .ports_indexed()
-            .map(|(index, port)| (port.kind, index, port.width))
-            .collect();
-        declared.sort_by_key(|(kind, port, _)| (format!("{kind:?}"), *port));
-        assert_eq!(traced_ports(&plan), declared, "{deployment}");
-
         let mut sinusoids: Vec<(u32, f32, bool, f32)> = plan
             .nodes
             .iter()
@@ -227,16 +156,24 @@ fn the_denoise_ports_are_the_ones_the_facts_declare() {
         ]
     );
     let text = &klein.readings[0];
-    assert!(text.has_kv && text.takes_tokens && text.ports.is_empty());
+    assert!(text.has_kv && text.takes_tokens);
     assert_eq!(text.readout, ReadoutKind::Hidden);
     assert_eq!(text.readout_width, model::Dims::klein_4b().dim);
-    let voxel_port = trace(KLEIN, Platform::Cuda).values.iter().any(|decl| {
+    let plan = trace(KLEIN, Platform::Cuda);
+    let latent = plan
+        .inputs
+        .iter()
+        .position(|i| i.name == "latent")
+        .expect("the decoder's latent input") as u32;
+    let voxel_port = plan.values.iter().any(|decl| {
         matches!(
             decl.def,
-            Def::Input(RuntimeInput::Voxels {
-                port: model::port::VOXELS,
-                channels: model::IN_CHANNELS
-            })
+            Def::Input(RuntimeInput::Guest {
+                id,
+                axis: InputAxis::Voxel,
+                width: model::IN_CHANNELS,
+                ..
+            }) if id == latent
         )
     });
     assert!(

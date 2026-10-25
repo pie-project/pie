@@ -41,8 +41,20 @@ impl ForwardHybrid for CrossAttention {
             Dtype::Bf16,
         );
 
-        let xa = audio.latents(0, AUDIO_WIDTH, Dtype::Bf16);
-        let xv = video.latents(1, VIDEO_WIDTH, Dtype::Bf16);
+        let xa = audio.input(
+            "audio",
+            Dtype::Bf16,
+            poem_ir::InputAxis::Row,
+            AUDIO_WIDTH,
+            None,
+        );
+        let xv = video.input(
+            "video",
+            Dtype::Bf16,
+            poem_ir::InputAxis::Row,
+            VIDEO_WIDTH,
+            None,
+        );
         let q = ops::gather::pack_rows(&ops::linear::matmul(&xa, &wq), &audio.row_permutation());
         let k = ops::gather::pack_rows(&ops::linear::matmul(&xv, &wk), &video.row_permutation());
         let v = ops::gather::pack_rows(&ops::linear::matmul(&xv, &wv), &video.row_permutation());
@@ -159,8 +171,14 @@ impl ForwardHybrid for TwoArmsIntoOneAdd {
             inputs.on(!fact::stream(Stream::Audio)),
         );
         let w = Weight::sym("w", [8, 8], Dtype::Bf16);
-        let a = ops::linear::matmul(&audio.latents(0, 8, Dtype::Bf16), &w);
-        let b = ops::linear::matmul(&video.latents(0, 8, Dtype::Bf16), &w);
+        let a = ops::linear::matmul(
+            &audio.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, 8, None),
+            &w,
+        );
+        let b = ops::linear::matmul(
+            &video.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, 8, None),
+            &w,
+        );
         ops::elemwise::add(&a, &b)
     }
 }

@@ -18,6 +18,12 @@ impl Shell {
         &self.compiled
     }
 
+    /// The inputs this load's guest binds, and the lane words reading each.
+    #[must_use]
+    pub fn inputs(&self) -> Vec<poem_ir::InputDecl> {
+        self.feeds.decls(&self.trace, &self.compiled)
+    }
+
     /// The regions whose attention stages at a prefill's width, and the
     /// width (`crate::window::Staging`).
     pub(crate) fn staging(&self) -> crate::window::Staging<'_> {

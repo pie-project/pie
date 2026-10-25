@@ -10,6 +10,7 @@ use engine_xla::{Boot, DeviceBoot, Lane, Shell};
 use poem::ops::conv::{self, ConvShape};
 use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, seam, trace_hybrid};
 use poem_compiler::{Budget, VoxelLadder};
+use poem_ir::InputAxis;
 
 const C_IN: usize = 8;
 const C_MID: usize = 16;
@@ -61,7 +62,7 @@ impl ForwardHybrid for Decoder {
     }
     fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
-        let x = inputs.voxels(0, C_IN as u32, Dtype::Bf16);
+        let x = inputs.input("voxels", Dtype::Bf16, InputAxis::Voxel, C_IN as u32, None);
         let (h, g1) = conv::conv3d(
             &x,
             &g,
@@ -556,7 +557,7 @@ impl ForwardHybrid for Causal {
     }
     fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
-        let x = inputs.voxels(0, C_IN as u32, Dtype::Bf16);
+        let x = inputs.input("voxels", Dtype::Bf16, InputAxis::Voxel, C_IN as u32, None);
         let cache = inputs.state("conv.cache");
         let (y, g1) = conv::conv3d(
             &x,

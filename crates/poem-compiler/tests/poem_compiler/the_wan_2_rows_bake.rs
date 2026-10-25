@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::wan_2_dims::{self as model, Dims};
-use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
+use poem::generative::{ReadoutKind, ScheduleKind};
 use poem::{
     Attn, CacheRow, Def, Dim, Dtype, Elemwise, GeomKind, Operands, Operation, Platform, RaggedMask,
     Request, RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
 };
+use poem_ir::InputAxis;
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
 
@@ -55,7 +56,7 @@ fn word(plan: &Trace, reading: &str, stream: Stream) -> u64 {
 #[test]
 fn the_wan_2_rows_bake_every_case() {
     every_row_traces_on_every_platform_with_the_caches_and_seams_it_states();
-    the_ports_the_trace_reads_are_the_ports_the_facts_declare();
+    each_reading_reads_out_what_its_facts_state();
     each_lane_the_facts_list_classifies_into_its_own_class();
     the_attentions_pair_as_the_architecture_says();
     every_rope_turns_the_rows_three_axis_split_of_the_whole_head_interleaved();
@@ -120,88 +121,16 @@ fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
     }
 }
 
-fn traced_ports(plan: &Trace) -> BTreeSet<(String, u8, u32)> {
-    let mut traced = BTreeSet::new();
-    for decl in &plan.values {
-        let (kind, port, width) = match &decl.def {
-            Def::Input(RuntimeInput::Latents { port, width }) => ("Latents", *port, *width),
-            Def::Input(RuntimeInput::Context { port, width }) => ("Context", *port, *width),
-            Def::Input(RuntimeInput::LaneVector { port, width }) => ("LaneVector", *port, *width),
-            Def::Input(RuntimeInput::AxisPositions { port, axes }) => {
-                ("AxisPositions", *port, u32::from(*axes))
-            }
-            Def::Input(RuntimeInput::Voxels { port, channels }) => ("Voxels", *port, *channels),
-            _ => continue,
-        };
-        traced.insert((kind.to_string(), port, width));
-    }
-    traced
-}
-
-fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
+fn each_reading_reads_out_what_its_facts_state() {
     for deployment in ROWS {
         let plan = trace(deployment, Platform::Cuda);
         let facts = row(deployment).generative().expect("facts");
-        let mut declared: BTreeSet<(String, u8, u32)> = BTreeSet::new();
-        for reading in &facts.readings {
-            for (index, port) in reading.ports_indexed() {
-                declared.insert((format!("{:?}", port.kind), index, port.width));
-            }
-        }
-        assert_eq!(
-            traced_ports(&plan),
-            declared,
-            "{deployment}: the facts and the trace bind one list of ports"
-        );
-
         let d = dims(deployment);
         let denoise = facts
             .readings
             .iter()
             .find(|r| r.name == "denoise")
             .unwrap_or_else(|| panic!("{deployment} declares no `denoise`"));
-        let at = |name: &str| {
-            let (index, port) = denoise
-                .port(name)
-                .unwrap_or_else(|| panic!("{deployment}: `denoise` declares no port `{name}`"));
-            (index, port.kind, port.width, port.streams.clone())
-        };
-        assert_eq!(
-            at("latents"),
-            (
-                model::port::LATENTS,
-                PortKind::Latents,
-                d.patch_in(),
-                vec![Stream::Video]
-            )
-        );
-        assert_eq!(
-            at("context"),
-            (
-                model::port::CONTEXT,
-                PortKind::Context,
-                d.text_dim,
-                vec![Stream::Context]
-            )
-        );
-        assert_eq!(
-            at("timestep"),
-            (
-                model::port::TIMESTEP,
-                PortKind::LaneVector,
-                1,
-                vec![Stream::Video]
-            )
-        );
-        assert_eq!(
-            at("positions"),
-            (
-                model::port::POSITIONS,
-                PortKind::AxisPositions,
-                u32::from(model::ROPE_AXES),
-                vec![Stream::Video]
-            )
-        );
         assert_eq!(denoise.readout, ReadoutKind::Velocity);
         assert_eq!(denoise.readout_width, d.patch_out());
         for name in ["vae.decode.head", "vae.decode"] {
@@ -217,26 +146,24 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
             assert_eq!(arm.readout, ReadoutKind::Pixels);
             assert_eq!(arm.readout_width, model::VAE_RGB);
             assert_eq!(arm.positions, None, "a VAE tile sits in no rotary space");
-            let (index, port) = arm.port("latent").expect("the voxel port");
-            assert_eq!(
-                (index, port.kind, port.width, port.streams.clone()),
-                (
-                    model::port::VOXELS,
-                    PortKind::Voxels,
-                    model::VAE_Z,
-                    vec![Stream::Video]
-                )
-            );
         }
         let voxels = plan
             .values
             .iter()
-            .filter(|decl| matches!(decl.def, Def::Input(RuntimeInput::Voxels { .. })))
+            .filter(|decl| {
+                matches!(
+                    decl.def,
+                    Def::Input(RuntimeInput::Guest {
+                        axis: InputAxis::Voxel,
+                        ..
+                    })
+                )
+            })
             .count();
         assert_eq!(
             voxels,
             if is_flagship(deployment) { 2 } else { 0 },
-            "{deployment}: a voxel port per VAE clip width, and none without a VAE"
+            "{deployment}: a voxel input per VAE clip width, and none without a VAE"
         );
     }
 }
@@ -449,7 +376,6 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
             assert_eq!(text.readout, ReadoutKind::Hidden);
             assert_eq!(text.readout_width, model::TE_HIDDEN);
             assert_eq!(text.streams, vec![Stream::Text]);
-            assert!(text.ports.is_empty());
         } else {
             assert_eq!(names, vec!["denoise"]);
         }
@@ -479,7 +405,6 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
         assert_eq!(schedule.shift, model::SHIFT_TI2V);
         assert_eq!(schedule.train_steps, model::TRAIN_STEPS);
         assert!(schedule.pinned_sigmas.is_empty(), "nothing is pinned");
-        assert!(facts.max_rows >= 4096);
         crate::the_wan_2_rows_bake::validate(&facts);
     }
 }
@@ -487,15 +412,6 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
 fn validate(facts: &poem::generative::Generative) {
     for reading in &facts.readings {
         assert!(reading.readout_width > 0);
-        if !reading.takes_tokens {
-            assert!(
-                reading.ports.iter().any(|port| matches!(
-                    port.kind,
-                    PortKind::Latents | PortKind::Voxels | PortKind::Context
-                )),
-                "a token-less reading states its rows through a row port"
-            );
-        }
     }
 }
 

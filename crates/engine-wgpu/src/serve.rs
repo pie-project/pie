@@ -549,12 +549,24 @@ impl Shell {
             .values
             .iter()
             .any(|decl| matches!(&decl.def, poem_ir::Def::Input(RuntimeInput::ReadoutRows)));
-        if declared_width(&boot.trace, RuntimeInput::SelfCondRows) > 0 {
+        if let Some(id) = boot.trace.values.iter().find_map(|decl| match decl.def {
+            poem_ir::Def::Input(RuntimeInput::Guest { id, axis, .. })
+                if axis != poem_ir::InputAxis::Voxel =>
+            {
+                Some(id)
+            }
+            _ => None,
+        }) {
+            let name = boot
+                .trace
+                .inputs
+                .get(id as usize)
+                .map_or_else(|| id.to_string(), |input| input.name.clone());
             return Err(Fault::Program {
                 at: "serve::load",
-                why: "this plan reads a self-conditioning input (a block-diffusion text), \
-                      which this shell stages no seat for"
-                    .to_string(),
+                why: format!(
+                    "this plan reads guest input `{name}`, which this shell stages no seat for"
+                ),
             });
         }
 
@@ -569,11 +581,15 @@ impl Shell {
             let mut channels = 0u64;
             let mut dtype = None;
             for decl in &boot.trace.values {
-                let poem_ir::Def::Input(RuntimeInput::Voxels { channels: c, .. }) = &decl.def
+                let poem_ir::Def::Input(RuntimeInput::Guest {
+                    axis: poem_ir::InputAxis::Voxel,
+                    width,
+                    ..
+                }) = &decl.def
                 else {
                     continue;
                 };
-                channels = channels.max(u64::from(*c));
+                channels = channels.max(u64::from(*width));
                 if let Ty::Tensor { dtype: d, .. } = &decl.ty {
                     dtype = Some(*d);
                 }

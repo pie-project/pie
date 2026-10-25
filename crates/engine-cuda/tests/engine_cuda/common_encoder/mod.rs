@@ -9,7 +9,7 @@ use checkpoint::serving::Stamp;
 use engine::Engine;
 use engine::channel::ChannelRegistration;
 use engine::fire::{
-    Attachment, Boundary, FrameSubmission, Lane, LaneStream, PortFeed, PortKind, Readout, Step,
+    Attachment, Boundary, FrameSubmission, InputFeed, Lane, LaneStream, Readout, Step,
 };
 use engine::load::{Budgets, Checkpoint, LoadRequest, Loaded, Residency};
 use engine::program::{InstanceBinding, ProgramRegistration};
@@ -26,6 +26,7 @@ use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Trace, Value, Weight, ops, seam,
     trace_hybrid,
 };
+use poem_ir::InputAxis;
 
 pub const WIDTH: u32 = 32;
 pub const HEAD_DIM: u32 = 64;
@@ -46,7 +47,7 @@ impl ForwardHybrid for EncoderLayer {
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
-        let x = inputs.latents(0, WIDTH, Dtype::Bf16);
+        let x = inputs.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
         let table = ops::elemwise::relative_bucket_bias(
             inputs.recorder(),
             &Weight::sym(
@@ -441,9 +442,9 @@ pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, group: u32) -> Lane {
         stream: LaneStream::Text,
         group: Some(group),
         reading: 0,
-        ports: vec![PortFeed {
-            kind: PortKind::Latents,
-            port: 0,
+        // `latents`, the plan's one input.
+        inputs: vec![InputFeed {
+            id: 0,
             channel: handles.latent,
         }],
         ..Lane::default()

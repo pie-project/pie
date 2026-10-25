@@ -3,7 +3,9 @@ pub struct GenerativeFacts {
     pub readings: Vec<Reading>,
     pub latent: Option<Latent>,
     pub schedule: Option<Schedule>,
-    pub max_latent_rows: u32,
+    /// The inputs the deployment's guest binds, `name[axis, width]`: traced,
+    /// so only `pie model info` fills them.
+    pub inputs: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -13,7 +15,6 @@ pub struct Reading {
     pub kv: bool,
     pub tokens: bool,
     pub streams: Vec<String>,
-    pub ports: Vec<String>,
     pub readout: String,
     pub readout_width: u32,
 }
@@ -62,8 +63,31 @@ pub fn of(deployment: Option<&str>) -> Option<GenerativeFacts> {
             boundary: s.boundary,
             pinned_sigmas: s.pinned_sigmas.clone(),
         }),
-        max_latent_rows: generative.max_rows,
+        inputs: Vec::new(),
     })
+}
+
+/// The inputs `deployment`'s trace reads from its guest, `name[axis, width]`.
+pub fn inputs(deployment: &str) -> Vec<String> {
+    let Some(deployment) = runtime::catalog::catalog().parse(deployment) else {
+        return Vec::new();
+    };
+    let Ok(trace) = deployment.try_trace(poem::Platform::Cuda) else {
+        return Vec::new();
+    };
+    trace
+        .values
+        .iter()
+        .filter_map(|decl| match decl.def {
+            poem::Def::Input(poem::RuntimeInput::Guest {
+                id, axis, width, ..
+            }) => trace
+                .inputs
+                .get(id as usize)
+                .map(|input| format!("{}[{}, {width}]", input.name, axis.name())),
+            _ => None,
+        })
+        .collect()
 }
 
 fn reading(fact: &poem::generative::ReadingFact) -> Reading {
@@ -76,11 +100,6 @@ fn reading(fact: &poem::generative::ReadingFact) -> Reading {
             .streams
             .iter()
             .map(|s| stream(*s).to_string())
-            .collect(),
-        ports: fact
-            .ports
-            .iter()
-            .map(|port| format!("{}[{}]", port.name, port.width))
             .collect(),
         readout: match fact.readout {
             poem::generative::ReadoutKind::Logits => "logits",
@@ -193,7 +212,11 @@ mod tests {
         assert_eq!(latent.pixels_per_row(), (16, 16));
         let schedule = facts.schedule.expect("a denoiser has a schedule");
         assert_eq!(schedule.kind, "flow");
-        assert!(facts.max_latent_rows > 0);
+        assert!(
+            inputs(FLUX2_KLEIN).contains(&"latents[row, 128]".to_string()),
+            "{:?}",
+            inputs(FLUX2_KLEIN)
+        );
     }
 
     fn a_text_row_reports_nothing_here() {

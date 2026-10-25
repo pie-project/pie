@@ -5,9 +5,9 @@ use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, Partition, TensorType};
 
 use crate::flux_2_dims::{self as model, vae};
-use poem::generative::{PortKind, ReadoutKind};
+use poem::generative::ReadoutKind;
 use poem::{Def, Dim, Dtype, Operation, Platform, Request, Stream, Trace, Ty, seam};
-use poem_ir::{Attn, Conv, GridRule, ParamLayout, Seam};
+use poem_ir::{Attn, Conv, GridRule, InputAxis, ParamLayout, Seam};
 
 const KLEIN: &str = "flux2-klein-4b-bf16-kv-bf16";
 const MINI: &str = "flux2-mini-bf16-kv-bf16";
@@ -51,35 +51,10 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
         assert!(!r.has_kv && !r.takes_tokens, "a voxel lane");
         assert_eq!(r.streams, vec![Stream::Image]);
         assert_eq!(r.readout, ReadoutKind::Pixels);
-        assert_eq!(r.ports.len(), 1);
-        assert_eq!(r.ports[0].kind, PortKind::Voxels);
-        assert_eq!(r.ports[0].streams, vec![Stream::Image]);
     }
     assert_eq!(
-        (
-            decode.ports[0].name.as_str(),
-            decode.ports[0].width,
-            decode.readout_width
-        ),
-        ("latent", model::IN_CHANNELS, vae::RGB)
-    );
-    assert_eq!(
-        (
-            encode.ports[0].name.as_str(),
-            encode.ports[0].width,
-            encode.readout_width
-        ),
-        ("pixels", vae::RGB, model::IN_CHANNELS)
-    );
-    assert_eq!(decode.port("latent").map(|(index, _)| index), Some(0));
-    assert_eq!(
-        encode.port("pixels").map(|(index, _)| index),
-        Some(model::port::PIXEL_VOXELS)
-    );
-    assert_eq!(
-        (decode.ports[0].at, encode.ports[0].at),
-        (None, Some(model::port::PIXEL_VOXELS)),
-        "the pixel clip is seated at its own voxel index"
+        (decode.readout_width, encode.readout_width),
+        (vae::RGB, model::IN_CHANNELS)
     );
     assert_eq!((decode.index, encode.index), (2, 3));
     let latent = facts.latent.as_ref().expect("a latent space");
@@ -99,33 +74,38 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
         "the miniature has no VAE"
     );
     assert!(
-        !trace(MINI)
-            .values
-            .iter()
-            .any(|v| matches!(v.def, Def::Input(poem::RuntimeInput::Voxels { .. }))),
+        !trace(MINI).values.iter().any(|v| matches!(
+            v.def,
+            Def::Input(poem::RuntimeInput::Guest {
+                axis: InputAxis::Voxel,
+                ..
+            })
+        )),
         "and reads no voxel port"
     );
 }
 
 fn the_trace_reads_two_voxel_ports_and_plants_pixels_twice() {
     let plan = trace(KLEIN);
-    let mut ports: Vec<(u8, u32, String)> = plan
+    let mut ports: Vec<(&str, u32, Dtype)> = plan
         .values
         .iter()
-        .filter_map(|v| match (&v.def, &v.ty) {
-            (
-                Def::Input(poem::RuntimeInput::Voxels { port, channels }),
-                Ty::Tensor { dtype, .. },
-            ) => Some((*port, *channels, format!("{dtype:?}"))),
+        .filter_map(|v| match &v.def {
+            Def::Input(poem::RuntimeInput::Guest {
+                id,
+                axis: InputAxis::Voxel,
+                width,
+                dtype,
+            }) => Some((plan.inputs[*id as usize].name.as_str(), *width, *dtype)),
             _ => None,
         })
         .collect();
-    ports.sort_unstable();
+    ports.sort_unstable_by_key(|(name, ..)| *name);
     assert_eq!(
         ports,
         vec![
-            (model::port::VOXELS, model::IN_CHANNELS, "Bf16".to_string()),
-            (model::port::PIXEL_VOXELS, vae::RGB, "Bf16".to_string())
+            ("latent", model::IN_CHANNELS, Dtype::Bf16),
+            ("pixels", vae::RGB, Dtype::Bf16)
         ]
     );
     let pixels: Vec<&Seam> = plan

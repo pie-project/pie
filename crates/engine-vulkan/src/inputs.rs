@@ -57,29 +57,11 @@ pub struct VoxelFire<'a> {
     pub payload: &'a [u8],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PortSeat {
-    pub kind: engine::fire::PortKind,
-    pub port: u8,
-    pub width: u32,
-    pub dtype: Dtype,
-}
-
-impl PortSeat {
-    #[must_use]
-    pub fn per_lane(&self) -> bool {
-        self.kind == engine::fire::PortKind::LaneVector
-    }
-
-    #[must_use]
-    pub fn row_bytes(&self) -> u64 {
-        u64::from(self.width) * poem_compiler::arena::elem_bytes(self.dtype).unwrap_or(0)
-    }
-}
+pub use poem_exec::feeds::Seat;
 
 #[derive(Debug, Clone, Copy)]
-struct PortAt {
-    seat: PortSeat,
+struct SeatAt {
+    seat: Seat,
     at: u64,
     bytes: u64,
 }
@@ -162,7 +144,7 @@ pub struct Handles {
 
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
-    pub ports: Vec<Tensor>,
+    pub inputs: Vec<(u32, Tensor)>,
     pub voxels: Option<VoxelHandles>,
 }
 
@@ -270,7 +252,7 @@ pub struct Inputs {
 
     group_of_lane: u64,
     packings: Vec<PackingAt>,
-    ports: Vec<PortAt>,
+    seats: Vec<SeatAt>,
     voxels: Option<VoxelAt>,
 }
 
@@ -285,7 +267,7 @@ impl Inputs {
         gathered: usize,
         patch: Option<PatchSeat>,
         mrope: bool,
-        ports: &[PortSeat],
+        seats: &[Seat],
         selections: usize,
         voxel: Option<VoxelSeat>,
     ) -> Result<Inputs> {
@@ -351,11 +333,11 @@ impl Inputs {
                 permutation: take(rows * 4),
             })
             .collect();
-        let ports: Vec<PortAt> = ports
+        let seats: Vec<SeatAt> = seats
             .iter()
             .map(|seat| {
                 let bytes = if seat.per_lane() { lanes } else { rows } * seat.row_bytes();
-                PortAt {
+                SeatAt {
                     seat: *seat,
                     at: take(bytes),
                     bytes,
@@ -402,7 +384,7 @@ impl Inputs {
             rs_commit,
             group_of_lane,
             packings,
-            ports,
+            seats,
             voxels,
         })
     }
@@ -412,13 +394,16 @@ impl Inputs {
         self.voxels.map(|at| (&self.store, at.payload))
     }
 
-    pub fn write_port(&mut self, at: u64, bytes: &[u8]) -> Result<()> {
+    pub fn write_input(&mut self, at: u64, bytes: &[u8]) -> Result<()> {
         self.store.write(at, bytes)
     }
 
     #[must_use]
-    pub fn port_seat(&self, port: usize) -> Option<(&Buffer, u64)> {
-        self.ports.get(port).map(|at| (&self.store, at.at))
+    pub fn seat(&self, id: u32) -> Option<(&Buffer, u64)> {
+        self.seats
+            .iter()
+            .find(|at| at.seat.id == id)
+            .map(|at| (&self.store, at.at))
     }
 
     #[must_use]
@@ -685,14 +670,17 @@ impl Inputs {
                 permutation: i32s(handles, &self.store, at.permutation, rows)?,
             });
         }
-        let mut ports = Vec::with_capacity(self.ports.len());
-        for at in &self.ports {
+        let mut inputs = Vec::with_capacity(self.seats.len());
+        for at in &self.seats {
             let carved = if at.seat.per_lane() { lanes } else { rows };
-            ports.push(Tensor::new(
-                handles.bind(&self.store, at.at, at.bytes)?,
-                carved,
-                at.seat.width,
-                at.seat.dtype,
+            inputs.push((
+                at.seat.id,
+                Tensor::new(
+                    handles.bind(&self.store, at.at, at.bytes)?,
+                    carved,
+                    at.seat.width,
+                    at.seat.dtype,
+                ),
             ));
         }
 
@@ -865,7 +853,7 @@ impl Inputs {
             },
             group_of_lane,
             packings,
-            ports,
+            inputs,
             voxels,
         })
     }

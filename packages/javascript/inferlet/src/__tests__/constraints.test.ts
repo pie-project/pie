@@ -98,13 +98,11 @@ describe('media', () => {
 });
 
 describe('diffusion pass surface', () => {
-  it('binds the canvas reading and stages self-conditioning taps', () => {
+  it('binds the canvas reading', () => {
     const fwd = new ForwardPass('diffusion');
     fwd.canvas('denoise');
-    fwd.selfConditioning([1, 2, 3, 4], [0.5, 0.25, 0.125, 0.125]);
-    const w = fwd.wit as unknown as { mode: string; selfCond: [number[], number[]] };
+    const w = fwd.wit as unknown as { mode: string };
     expect(w.mode).toBe('denoise');
-    expect(w.selfCond).toEqual([[1, 2, 3, 4], [0.5, 0.25, 0.125, 0.125]]);
     expect(() => new ForwardPass('text').canvas('encode')).toThrow(/canvas binds/);
   });
 });

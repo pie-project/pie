@@ -160,11 +160,10 @@ pub struct Seated<'a> {
     pub lane: Lane<'a>,
     pub stream: u8,
     pub group: Option<u32>,
-    pub ports: &'a [engine::fire::PortFeed],
+    pub inputs: &'a [engine::fire::InputFeed],
     pub pages: &'a [u32],
     pub held: Option<u32>,
     pub mask: Option<&'a Masking>,
-    pub self_cond: Option<&'a engine::fire::SelfCondInput>,
     pub adapter: Option<u32>,
     pub positions: &'a [u32],
     pub readout: Option<&'a [u32]>,
@@ -186,11 +185,10 @@ impl<'a> Seated<'a> {
             lane,
             stream: 0,
             group: None,
-            ports: &[],
+            inputs: &[],
             pages: &[],
             held: None,
             mask: None,
-            self_cond: None,
             adapter: None,
             positions: &[],
             readout: None,
@@ -223,16 +221,15 @@ impl<'a> Seated<'a> {
 #[derive(Debug, Clone, Copy)]
 struct MergeLand {
     merge: ValueId,
-    seat: crate::inputs::PortSeat,
-    port: usize,
+    seat: crate::inputs::Seat,
     first: u32,
     rows: u32,
     fed: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PortFeedPlan {
-    port: usize,
+struct InputFeedPlan {
+    id: u32,
     voxel: bool,
     at: u64,
     bytes: u64,
@@ -306,7 +303,6 @@ pub struct Shell {
     states_mrope: bool,
     gathers_readout: bool,
     feeds: crate::feeds::Feeds,
-    self_cond_taps: u32,
 
     copies: bool,
     last: FireCost,
@@ -344,17 +340,11 @@ impl Shell {
     /// it chooses which weights stay resident.
     pub fn prepare(boot: Boot<'_>) -> Result<PreparedLoad<'_>> {
         // Diffusion and conditioning activations leave the fp16 range.
-        let wide_range = boot.trace.values.iter().any(|decl| {
-            matches!(
-                &decl.def,
-                poem_ir::Def::Input(
-                    RuntimeInput::Latents { .. }
-                        | RuntimeInput::LaneVector { .. }
-                        | RuntimeInput::Context { .. }
-                        | RuntimeInput::Voxels { .. }
-                )
-            )
-        });
+        let wide_range = boot
+            .trace
+            .values
+            .iter()
+            .any(|decl| matches!(&decl.def, poem_ir::Def::Input(RuntimeInput::Guest { .. })));
         let device = Context::bind()?;
         let perf_cores = crate::chip::perf_cores();
         let measured = crate::chip::measured(&device, perf_cores);
@@ -823,11 +813,6 @@ impl PreparedLoad<'_> {
             .values
             .iter()
             .any(|decl| matches!(&decl.def, poem_ir::Def::Input(RuntimeInput::ReadoutRows)));
-        let self_cond_taps = u32::try_from(declared_width(&boot.trace, RuntimeInput::SelfCondRows))
-            .map_err(|_| Fault::Program {
-                at: "serve::load",
-                why: "the self-conditioning tap width does not fit u32".to_string(),
-            })?;
         let patch_fold = patch_fold(&boot.trace);
         let drops_patch_rows = boot
             .trace
@@ -839,26 +824,20 @@ impl PreparedLoad<'_> {
             return Err(Fault::Program {
                 at: "serve::load",
                 why: format!(
-                    "value {} merges an arm this shell cannot land — a non-port input, or a \
-                     guard that is not a conjunction of facts — and the merged column would \
+                    "value {} merges an arm this shell cannot land — not a lane or row guest \
+                     input, or a guard that is not a conjunction of facts — and the merged column would \
                      carry the last fire's bytes for that arm's lanes",
                     unlanded.0
                 ),
             });
         }
-        let port_seats: Vec<crate::inputs::PortSeat> = feeds.seats();
+        let seats = feeds.seats();
         let voxel_seat = boot.voxels.as_ref().map(|ladder| {
             let mut channels = 0u64;
             let mut dtype = None;
-            for decl in &boot.trace.values {
-                let poem_ir::Def::Input(RuntimeInput::Voxels { channels: c, .. }) = &decl.def
-                else {
-                    continue;
-                };
-                channels = channels.max(u64::from(*c));
-                if let poem_ir::Ty::Tensor { dtype: d, .. } = &decl.ty {
-                    dtype = Some(*d);
-                }
+            for (seat, _) in feeds.inputs.iter().filter(|(seat, _)| seat.voxel()) {
+                channels = channels.max(u64::from(seat.width));
+                dtype = Some(seat.dtype);
             }
             let dtype = dtype.unwrap_or(Dtype::Bf16);
             crate::inputs::VoxelSeat {
@@ -886,8 +865,7 @@ impl PreparedLoad<'_> {
                     patch_seat,
                     voxel_seat,
                     states_mrope,
-                    self_cond_taps,
-                    &port_seats,
+                    &seats,
                     selections,
                     &run_caps,
                     &run_passes,
@@ -1168,7 +1146,6 @@ impl PreparedLoad<'_> {
             states_mrope,
             gathers_readout,
             feeds,
-            self_cond_taps,
             facts,
             spaces,
             copies: false,
@@ -1352,6 +1329,12 @@ impl Shell {
     #[must_use]
     pub fn trace(&self) -> &Trace {
         &self.trace
+    }
+
+    /// The inputs this load's guest binds, and the lane words reading each.
+    #[must_use]
+    pub fn inputs(&self) -> Vec<poem_ir::InputDecl> {
+        self.feeds.decls(&self.trace, &self.compiled)
     }
 
     #[must_use]
@@ -3326,60 +3309,6 @@ impl Shell {
             }
         }
 
-        let taps = self.self_cond_taps as usize;
-        let mut self_cond_rows = vec![0i32; rows as usize * taps];
-        let mut self_cond_weights = vec![0f32; rows as usize * taps];
-        let mut self_cond_feeds: Vec<(u64, u64, engine::ChannelId, engine::ChannelId)> = Vec::new();
-        if taps > 0 {
-            for row in composition.lanes() {
-                let Some(sc) = lanes[row.source as usize].self_cond else {
-                    continue;
-                };
-                let cells = row.rows as usize * taps;
-                if let Some((rows_channel, weights_channel)) = sc.channels {
-                    if sc.taps as usize != taps {
-                        return Err(Fault::Program {
-                            at: "serve::prepare",
-                            why: format!(
-                                "lane {} states {} taps and this plan reads {taps}",
-                                row.source, sc.taps
-                            ),
-                        });
-                    }
-                    self_cond_feeds.push((
-                        u64::from(row.row_offset) * taps as u64 * 4,
-                        cells as u64 * 4,
-                        rows_channel,
-                        weights_channel,
-                    ));
-                    continue;
-                }
-                if sc.taps as usize != taps
-                    || sc.rows.len() != cells
-                    || sc.weight_bits.len() != cells
-                {
-                    return Err(Fault::Program {
-                        at: "serve::prepare",
-                        why: format!(
-                            "lane {} states self-conditioning taps of width {} over {} ids, and \
-                             this plan reads {taps} taps over the lane's {} rows",
-                            row.source,
-                            sc.taps,
-                            sc.rows.len(),
-                            row.rows
-                        ),
-                    });
-                }
-                let at = row.row_offset as usize * taps;
-                for (i, &id) in sc.rows.iter().enumerate() {
-                    self_cond_rows[at + i] = id as i32;
-                }
-                for (i, &bits) in sc.weight_bits.iter().enumerate() {
-                    self_cond_weights[at + i] = f32::from_bits(bits);
-                }
-            }
-        }
-
         let rs_replay: Vec<i32> = rs_plans.iter().map(|plan| plan.replay as i32).collect();
         let rs_commit: Vec<i32> = rs_plans.iter().map(|plan| plan.commit as i32).collect();
         let rows_ext = rows.saturating_add(rs_plans.iter().map(|plan| plan.replay).sum::<u32>());
@@ -3413,10 +3342,7 @@ impl Shell {
                 if !merged.select.holds(row.word) {
                     continue;
                 }
-                let fed = seated
-                    .ports
-                    .iter()
-                    .any(|feed| feed.kind == merged.seat.kind && feed.port == merged.seat.port);
+                let fed = seated.inputs.iter().any(|feed| feed.id == merged.seat.id);
                 merge_lands.push(MergeLand {
                     merge: merged.merge,
                     seat: merged.seat,
@@ -3426,42 +3352,30 @@ impl Shell {
                         row.row_offset
                     },
                     rows: if merged.seat.per_lane() { 1 } else { row.rows },
-                    port: self
-                        .feeds
-                        .ports
-                        .iter()
-                        .position(|(seat, _)| {
-                            seat.kind == merged.seat.kind && seat.port == merged.seat.port
-                        })
-                        .unwrap_or(usize::MAX),
                     fed,
                 });
             }
         }
 
-        let mut port_feeds: Vec<PortFeedPlan> = Vec::new();
+        let mut input_feeds: Vec<InputFeedPlan> = Vec::new();
         for (at_lane, row) in composition.lanes().iter().enumerate() {
             let seated = &lanes[row.source as usize];
-            for (index, (seat, readers)) in self.feeds.ports.iter().enumerate() {
+            for (seat, readers) in &self.feeds.inputs {
                 if !readers.contains(row.class as usize) {
                     continue;
                 }
-                let Some(feed) = seated
-                    .ports
-                    .iter()
-                    .find(|feed| feed.kind == seat.kind && feed.port == seat.port)
-                else {
+                let Some(feed) = seated.inputs.iter().find(|feed| feed.id == seat.id) else {
                     return Err(Fault::Program {
                         at: "serve::prepare",
                         why: format!(
-                            "lane {} runs in a class that reads the {:?} port {}, and the \
-                             lane feeds no channel for it — the port rectangle would carry \
-                             the last fire's rows",
-                            row.source, seat.kind, seat.port
+                            "lane {} runs in a class that reads guest input {}, and the \
+                             lane feeds no channel for it — the input's rectangle would \
+                             carry the last fire's rows",
+                            row.source, seat.id
                         ),
                     });
                 };
-                let voxel = seat.kind == engine::fire::PortKind::Voxels;
+                let voxel = seat.voxel();
                 let cells = if seat.per_lane() {
                     1
                 } else if voxel {
@@ -3483,14 +3397,14 @@ impl Shell {
                     return Err(Fault::Program {
                         at: "serve::prepare",
                         why: format!(
-                            "lane {} feeds the {:?} port {} and has no attachment; a port \
+                            "lane {} feeds guest input {} and has no attachment; an input \
                              is read through the instance the lane is attached to",
-                            row.source, seat.kind, seat.port
+                            row.source, seat.id
                         ),
                     });
                 };
-                port_feeds.push(PortFeedPlan {
-                    port: index,
+                input_feeds.push(InputFeedPlan {
+                    id: seat.id,
                     voxel,
                     at: offset * seat.row_bytes(),
                     bytes: cells * seat.row_bytes(),
@@ -3500,19 +3414,13 @@ impl Shell {
                     lane: row.source,
                 });
             }
-            for feed in seated.ports {
-                if !self
-                    .feeds
-                    .ports
-                    .iter()
-                    .any(|(seat, _)| seat.kind == feed.kind && seat.port == feed.port)
-                {
+            for feed in seated.inputs {
+                if self.feeds.seat(feed.id).is_none() {
                     return Err(Fault::Program {
                         at: "serve::prepare",
                         why: format!(
-                            "lane {} feeds the {:?} port {}, and this plan declares no such \
-                             port",
-                            row.source, feed.kind, feed.port
+                            "lane {} feeds guest input {}, and this plan reads no such input",
+                            row.source, feed.id
                         ),
                     });
                 }
@@ -3679,8 +3587,6 @@ impl Shell {
                     payload: &voxel_payload,
                 }),
                 mrope_positions: self.states_mrope.then_some(mrope_positions.as_slice()),
-                self_cond_rows: (taps > 0).then_some(self_cond_rows.as_slice()),
-                self_cond_weights: (taps > 0).then_some(self_cond_weights.as_slice()),
                 group_of_lane: &group_of_lane,
                 packings: &packing_fires,
             },
@@ -3746,8 +3652,6 @@ impl Shell {
             patch_positions: patch_seats.map(|seats| seats.positions),
             patch_grids: patch_seats.map(|seats| seats.grids),
             mrope_positions: bound.mrope_positions,
-            self_cond_rows: bound.self_cond_rows,
-            self_cond_weights: bound.self_cond_weights,
             group_of_lane: bound.group_of_lane,
             packings: self
                 .feeds
@@ -3757,14 +3661,7 @@ impl Shell {
                 .zip(bound.packings.iter().copied())
                 .collect(),
             voxels: bound.voxels,
-            ports: self
-                .feeds
-                .ports
-                .iter()
-                .map(|(seat, _)| (seat.kind, seat.port))
-                .zip(bound.ports.iter().copied())
-                .map(|((kind, port), plane)| (kind, port, plane))
-                .collect(),
+            inputs: bound.inputs,
             geometry,
             tables: FireTables {
                 request_of_token: bound.request_of_token,
@@ -3814,8 +3711,7 @@ impl Shell {
 
         Ok(Prepared {
             lanes,
-            self_cond_feeds,
-            port_feeds,
+            input_feeds,
             merge_lands,
             attachments,
             done,
@@ -3835,70 +3731,32 @@ impl Shell {
         })
     }
 
-    fn feed_self_cond(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
-        if p.self_cond_feeds.is_empty() {
-            return Ok(());
-        }
-        let (store, at_ids, at_ws) =
-            self.inputs[p.arm]
-                .self_cond_seat()
-                .ok_or_else(|| Fault::Program {
-                    at: "serve::feed_self_cond",
-                    why: "a lane feeds self-conditioning taps and this plan reserved no seat"
-                        .to_string(),
-                })?;
-        for &(first, bytes, rows_channel, weights_channel) in &p.self_cond_feeds {
-            for (channel, at) in [(rows_channel, at_ids), (weights_channel, at_ws)] {
-                let ring = self
-                    .programs
-                    .channel(channel)
-                    .ok_or_else(|| Fault::Program {
-                        at: "serve::feed_self_cond",
-                        why: format!("channel {channel} is not a ring this plane registered"),
-                    })?;
-                if (ring.cell_bytes() as u64) < bytes {
-                    return Err(Fault::Program {
-                        at: "serve::feed_self_cond",
-                        why: format!(
-                            "channel {channel} holds {} bytes a cell and the lane's taps take {bytes}",
-                            ring.cell_bytes()
-                        ),
-                    });
-                }
-                let slab = ring.slab();
-                let committed = ring.cell_offset(ring.cursor().head);
-                frame.copy(slab.slab(), committed, store.slab(), at + first, bytes)?;
-            }
-        }
-        #[cfg(target_vendor = "apple")]
-        frame.next_pass()?;
-        Ok(())
-    }
-
-    fn feed_ports(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
-        if p.port_feeds.is_empty() {
+    fn feed_inputs(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
+        if p.input_feeds.is_empty() {
             return Ok(());
         }
         let mut casts: Vec<(u32, u32, u32)> = Vec::new();
-        for feed in &p.port_feeds {
+        for feed in &p.input_feeds {
             let (store, at) = if feed.voxel {
                 self.inputs[p.arm]
                     .voxel_payload()
                     .ok_or_else(|| Fault::Program {
-                        at: "serve::feed_ports",
+                        at: "serve::feed_inputs",
                         why: format!(
-                            "lane {} feeds a voxel port and this load carved no voxel payload",
-                            feed.lane
+                            "lane {} feeds voxel guest input {} and this load carved no voxel \
+                             payload",
+                            feed.lane, feed.id
                         ),
                     })?
             } else {
                 self.inputs[p.arm]
-                    .port_seat(feed.port)
+                    .input_seat(feed.id)
                     .ok_or_else(|| Fault::Program {
-                        at: "serve::feed_ports",
+                        at: "serve::feed_inputs",
                         why: format!(
-                            "lane {} feeds port index {}, and this load carved fewer",
-                            feed.lane, feed.port
+                            "lane {} feeds guest input {}, and this load carved no rectangle \
+                             for it",
+                            feed.lane, feed.id
                         ),
                     })?
             };
@@ -3908,11 +3766,11 @@ impl Shell {
             if element == feed.dtype {
                 if cell_bytes < feed.bytes {
                     return Err(Fault::Program {
-                        at: "serve::feed_ports",
+                        at: "serve::feed_inputs",
                         why: format!(
-                            "lane {} feeds a port needing {} bytes off channel {}, whose \
-                             cell holds {cell_bytes}",
-                            feed.lane, feed.bytes, feed.channel
+                            "lane {} feeds guest input {} needing {} bytes off channel {}, \
+                             whose cell holds {cell_bytes}",
+                            feed.lane, feed.id, feed.bytes, feed.channel
                         ),
                     });
                 }
@@ -3927,22 +3785,23 @@ impl Shell {
             }
             if element != Dtype::F32 || feed.dtype != Dtype::Bf16 {
                 return Err(Fault::Program {
-                    at: "serve::feed_ports",
+                    at: "serve::feed_inputs",
                     why: format!(
-                        "lane {} feeds a {:?} port off channel {}, whose cell is {element:?}; \
-                         a cell rides the port's element or arrives f32 and is cast",
-                        feed.lane, feed.dtype, feed.channel
+                        "lane {} feeds {:?} guest input {} off channel {}, whose cell is \
+                         {element:?}; a cell rides the input's element or arrives f32 and is \
+                         cast",
+                        feed.lane, feed.dtype, feed.id, feed.channel
                     ),
                 });
             }
             let values = feed.bytes / 2;
             if cell_bytes < values * 4 {
                 return Err(Fault::Program {
-                    at: "serve::feed_ports",
+                    at: "serve::feed_inputs",
                     why: format!(
-                        "lane {} feeds a port of {values} value(s) off channel {}, whose \
-                         f32 cell holds {cell_bytes} bytes",
-                        feed.lane, feed.channel
+                        "lane {} feeds guest input {} of {values} value(s) off channel {}, \
+                         whose f32 cell holds {cell_bytes} bytes",
+                        feed.lane, feed.id, feed.channel
                     ),
                 });
             }
@@ -3975,7 +3834,7 @@ impl Shell {
         for land in &p.merge_lands {
             let column = p.slots.0[land.merge.0 as usize].ok_or_else(|| Fault::Unbound {
                 what: format!(
-                    "value {}, a merge over a port, which the carve gave no rectangle",
+                    "value {}, a merge over a guest input, which the carve gave no rectangle",
                     land.merge.0
                 ),
             })?;
@@ -3999,11 +3858,11 @@ impl Shell {
             }
             let (store, at) =
                 self.inputs[p.arm]
-                    .port_seat(land.port)
+                    .input_seat(land.seat.id)
                     .ok_or_else(|| Fault::Unbound {
                         what: format!(
-                            "the {:?} port {} rectangle, which this load carved none of",
-                            land.seat.kind, land.seat.port
+                            "guest input {}'s rectangle, which this load carved none of",
+                            land.seat.id
                         ),
                     })?;
             frame.copy(
@@ -4031,8 +3890,7 @@ impl Shell {
                 #[cfg(target_vendor = "apple")]
                 frame.next_pass()?;
             }
-            self.feed_self_cond(frame, p)?;
-            self.feed_ports(frame, p)?;
+            self.feed_inputs(frame, p)?;
             self.land_merges(frame, p)?;
         }
         let sink = match mode {
@@ -4142,7 +4000,8 @@ impl Shell {
 
         let place = At::new();
         let mut frame = self.device.frame()?;
-        self.feed_self_cond(&mut frame, p)?;
+        self.feed_inputs(&mut frame, p)?;
+        self.land_merges(&mut frame, p)?;
         let sink = Encoded::Live(Sink::streaming(
             &self.device,
             frame,
@@ -4376,8 +4235,7 @@ pub struct Clips<'a> {
 
 pub struct Prepared<'a> {
     lanes: &'a [Seated<'a>],
-    self_cond_feeds: Vec<(u64, u64, engine::ChannelId, engine::ChannelId)>,
-    port_feeds: Vec<PortFeedPlan>,
+    input_feeds: Vec<InputFeedPlan>,
     merge_lands: Vec<MergeLand>,
     attachments: &'a [Attached],
     done: Option<Done>,

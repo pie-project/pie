@@ -56,7 +56,6 @@ pub struct Shell {
     budget: Budget,
     patch_seat: Option<crate::inputs::PatchSeat>,
     mrope_seat: bool,
-    self_cond_taps: u32,
     drops_patch_rows: bool,
     towered: bool,
     patch_fold: u32,
@@ -825,8 +824,8 @@ struct RsFire<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct PortFeedPlan {
-    pub(crate) seat: crate::inputs::PortSeat,
+pub(crate) struct InputFeedPlan {
+    pub(crate) seat: crate::inputs::Seat,
     pub(crate) first: u32,
     pub(crate) rows: u32,
     pub(crate) bytes: u64,
@@ -850,7 +849,7 @@ pub(crate) struct VoxelFeedPlan {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct MergeLand {
     pub(crate) merge: poem_ir::ValueId,
-    pub(crate) seat: crate::inputs::PortSeat,
+    pub(crate) seat: crate::inputs::Seat,
     pub(crate) first: u32,
     pub(crate) rows: u32,
     pub(crate) fed: bool,
@@ -873,17 +872,8 @@ pub struct Prepared<'a> {
     patch_positions: Vec<i32>,
     patch_grids: Vec<i32>,
     mrope_positions: Vec<i32>,
-    self_cond_rows: Vec<i32>,
-    self_cond_weights: Vec<f32>,
-    self_cond_feeds: Vec<(
-        usize,
-        usize,
-        engine::ChannelId,
-        engine::ChannelId,
-        engine::InstanceId,
-    )>,
     packings: Vec<poem_exec::fire::Packed>,
-    port_feeds: Vec<PortFeedPlan>,
+    input_feeds: Vec<InputFeedPlan>,
     voxel_feeds: Vec<VoxelFeedPlan>,
     merge_lands: Vec<MergeLand>,
     lane_carve: u32,

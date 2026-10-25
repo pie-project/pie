@@ -11,7 +11,7 @@ use common_dit::{
     conv_reference, matmul, modulation, two_axis,
 };
 use engine::channel::ChannelId;
-use engine::fire::{Lane, LaneStream, PortFeed, PortKind, Readout, ReadoutSeam, StepVoxels};
+use engine::fire::{InputFeed, Lane, LaneStream, Readout, ReadoutSeam, StepVoxels};
 use eta_ir::container::HostRole;
 use eta_ir::types::Shape;
 
@@ -28,10 +28,9 @@ fn vae_lane(rig: &Rig, slot: u32, channel: Option<ChannelId>) -> Lane {
         tokens: vec![0],
         readout: Readout::None,
         stream: LaneStream::Image,
-        ports: channel
-            .map(|channel| PortFeed {
-                kind: PortKind::Voxels,
-                port: 0,
+        inputs: channel
+            .map(|channel| InputFeed {
+                id: rig.input("voxels"),
                 channel,
             })
             .into_iter()
@@ -150,15 +149,13 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
         readout: Readout::Rows((0..rows).collect()),
         stream: LaneStream::Image,
         group: Some(0),
-        ports: vec![
-            PortFeed {
-                kind: PortKind::Latents,
-                port: 0,
+        inputs: vec![
+            InputFeed {
+                id: rig.input("latents"),
                 channel: latent_ch,
             },
-            PortFeed {
-                kind: PortKind::LaneVector,
-                port: 0,
+            InputFeed {
+                id: rig.input("timestep"),
                 channel: time_ch,
             },
         ],

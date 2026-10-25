@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::z_image_dims::{self as model, Dims};
-use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
+use poem::generative::{ReadoutKind, ScheduleKind};
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, GeomKind, Operation, Platform, Request, RopeForm,
     RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
@@ -65,7 +65,7 @@ fn word(plan: &Trace, reading: &str, stream: Stream) -> u64 {
 #[test]
 fn the_z_image_rows_bake_every_case() {
     every_row_traces_on_every_platform_with_the_caches_and_readouts_it_states();
-    the_ports_the_trace_reads_are_the_ports_the_facts_declare();
+    the_readings_state_their_readouts_and_the_sinusoid();
     every_declared_lane_classifies_into_its_own_class_where_every_merge_resolves();
     the_refiners_attend_within_a_lane_and_the_trunk_within_the_group();
     the_dit_turns_three_interleaved_axes_and_the_encoder_the_whole_neox_head();
@@ -128,37 +128,10 @@ fn every_row_traces_on_every_platform_with_the_caches_and_readouts_it_states() {
     }
 }
 
-fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
+fn the_readings_state_their_readouts_and_the_sinusoid() {
     for deployment in ROWS {
         let plan = trace(deployment, Platform::Cuda);
         let facts = row(deployment).generative().expect("facts");
-        let mut traced: BTreeSet<(String, u8, u32)> = BTreeSet::new();
-        for decl in &plan.values {
-            let (kind, port, width) = match &decl.def {
-                Def::Input(RuntimeInput::Latents { port, width }) => ("Latents", *port, *width),
-                Def::Input(RuntimeInput::Context { port, width }) => ("Context", *port, *width),
-                Def::Input(RuntimeInput::LaneVector { port, width }) => {
-                    ("LaneVector", *port, *width)
-                }
-                Def::Input(RuntimeInput::AxisPositions { port, axes }) => {
-                    ("AxisPositions", *port, u32::from(*axes))
-                }
-                Def::Input(RuntimeInput::Voxels { port, channels }) => ("Voxels", *port, *channels),
-                _ => continue,
-            };
-            traced.insert((kind.to_string(), port, width));
-        }
-        let mut declared: BTreeSet<(String, u8, u32)> = BTreeSet::new();
-        for reading in &facts.readings {
-            for (index, port) in reading.ports_indexed() {
-                declared.insert((format!("{:?}", port.kind), index, port.width));
-            }
-        }
-        assert_eq!(
-            traced, declared,
-            "{deployment}: the facts and the trace bind one list of ports"
-        );
-
         let reading = |name: &str| {
             facts
                 .readings
@@ -166,81 +139,9 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
                 .find(|r| r.name == name)
                 .unwrap_or_else(|| panic!("{deployment} declares no reading `{name}`"))
         };
-        let at = |reading: &poem::generative::ReadingFact, name: &str| {
-            let (index, port) = reading.port(name).unwrap_or_else(|| {
-                panic!(
-                    "{deployment}: reading `{}` declares no port `{name}`",
-                    reading.name
-                )
-            });
-            (index, port.kind, port.width)
-        };
         let d = dims(deployment);
-        let axes = u32::from(model::ROPE_AXES);
         let denoise = reading("denoise");
-        assert_eq!(
-            at(denoise, "latents"),
-            (
-                model::port::LATENTS,
-                PortKind::Latents,
-                model::PATCH_FEATURES
-            )
-        );
-        assert_eq!(
-            at(denoise, "pad"),
-            (model::port::PAD_IMAGE, PortKind::Latents, 1)
-        );
-        assert_eq!(
-            at(denoise, "context"),
-            (model::port::CONTEXT_REFINED, PortKind::Latents, d.dim)
-        );
-        assert_eq!(
-            at(denoise, "timestep"),
-            (model::port::TIMESTEP, PortKind::LaneVector, 1)
-        );
-        assert_eq!(
-            at(denoise, "positions"),
-            (model::port::POSITIONS, PortKind::AxisPositions, axes)
-        );
         let refine = reading("refine");
-        assert_eq!(
-            at(refine, "pad"),
-            (model::port::PAD_CAPTION, PortKind::Latents, 1)
-        );
-        assert_eq!(
-            at(refine, "caption"),
-            (model::port::CAPTION, PortKind::Context, d.cap_width)
-        );
-
-        let mut widths: std::collections::BTreeMap<(String, u8), u32> =
-            std::collections::BTreeMap::new();
-        for (kind, index, width) in &traced {
-            if let Some(have) = widths.insert((kind.clone(), *index), *width) {
-                assert_eq!(
-                    have, *width,
-                    "{deployment}: {kind} port {index} is read at two widths ({have} and {width}); \
-                     the engine seats one rectangle per (kind, index)"
-                );
-            }
-        }
-        assert_eq!(
-            at(refine, "positions"),
-            (model::port::POSITIONS, PortKind::AxisPositions, axes)
-        );
-        let streams = |reading: &poem::generative::ReadingFact, name: &str| {
-            reading.port(name).unwrap().1.streams.clone()
-        };
-        assert_eq!(streams(denoise, "latents"), vec![Stream::Image]);
-        assert_eq!(streams(denoise, "pad"), vec![Stream::Image]);
-        assert_eq!(streams(denoise, "context"), vec![Stream::Context]);
-        assert_eq!(
-            streams(denoise, "timestep"),
-            vec![Stream::Image, Stream::Context]
-        );
-        assert_eq!(
-            streams(denoise, "positions"),
-            vec![Stream::Image, Stream::Context]
-        );
         assert!(!refine.has_kv && !refine.takes_tokens, "a float lane");
         assert!(!denoise.has_kv && !denoise.takes_tokens, "float lanes");
         assert_eq!(refine.readout, ReadoutKind::Hidden);
@@ -249,7 +150,7 @@ fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
         assert_eq!(denoise.readout_width, model::PATCH_FEATURES);
         if deployment == TURBO {
             let text = reading("text");
-            assert!(text.has_kv && text.takes_tokens && text.ports.is_empty());
+            assert!(text.has_kv && text.takes_tokens);
             assert_eq!(
                 (text.readout, text.readout_width),
                 (ReadoutKind::Hidden, model::TE_HIDDEN)
@@ -604,6 +505,5 @@ fn the_generative_facts_state_the_readings_the_schedule_and_the_latent_space() {
                 "{deployment}: sigma {got} is not {want}"
             );
         }
-        assert!(facts.max_rows >= 4096);
     }
 }

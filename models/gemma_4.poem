@@ -492,7 +492,7 @@ def layout(id, deploy):
 def diffusion(m):
     if m.self_cond == None:
         return None
-    return canvas(canvas = CANVAS, hidden = m.hidden, self_cond_taps = SELF_COND_TAPS)
+    return canvas(canvas = CANVAS, hidden = m.hidden)
 
 # How a Gemma 4 checkpoint is laid out: transformers', mlx_lm's and GGUF's
 # spellings, and DiffusionGemma's own.
@@ -861,8 +861,8 @@ def forward(m, inputs):
         den, enc = y.on(fact.denoise()), y.on(~fact.denoise())
         input_den = inputs.on(fact.denoise())
         soft = ops.gather.embed_weighted(
-            input_den.self_cond_rows(sc.taps),
-            input_den.self_cond_weights(sc.taps),
+            input_den.input("self_cond_ids", dtype.i32, "row", sc.taps),
+            input_den.input("self_cond_weights", dtype.f32, "row", sc.taps),
             m.embed,
             m.vocab,
         ) * root

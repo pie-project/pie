@@ -19,7 +19,13 @@ impl ForwardHybrid for Probe {
     }
 
     fn forward(&self, inputs: Input) -> Value {
-        let x = inputs.latents(0, WIDTH as u32, Dtype::Bf16);
+        let x = inputs.input(
+            "latents",
+            Dtype::Bf16,
+            poem_ir::InputAxis::Row,
+            WIDTH as u32,
+            None,
+        );
         let y = ops::linear::matmul(&x, &Weight::sym("w", [WIDTH, WIDTH], Dtype::Bf16));
         let (a, b) = banks("w", 2, 8, WIDTH, Dtype::Bf16);
         let routes = inputs.adapter_routes();

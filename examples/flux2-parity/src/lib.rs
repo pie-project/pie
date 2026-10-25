@@ -10,9 +10,9 @@
 //! # THREE LANES, ONE GROUP, ONE FIRE
 //!
 //! `flux_2`'s `denoise` reading declares three streams (D2): the text lane
-//! (`Stream::Text`, the `context` port), the target lane (`Stream::Image`,
-//! the `latents` port) and the reference lane (`Stream::Reference`, the
-//! same `latents` port — a reference is more of the same tokens, at rotary
+//! (`Stream::Text`, the `context` input), the target lane (`Stream::Image`,
+//! the `latents` input) and the reference lane (`Stream::Reference`, the
+//! same `latents` input — a reference is more of the same tokens, at rotary
 //! `T = 10·(i+1)`). One step is three passes, each stating its stream and
 //! all in one group, which packs them `[txt ‖ target ‖ refs]` — the
 //! reference's own layout. Every lane binds the timestep (and the guidance
@@ -78,7 +78,7 @@ struct Case {
     reference_positions: Vec<f32>,
     /// `σ · 1000`.
     timestep: f32,
-    /// The raw guidance scale; bound only where the model declares the port.
+    /// The raw guidance scale; bound only where the model reads `guidance`.
     #[serde(default)]
     guidance: f32,
 }
@@ -91,38 +91,61 @@ struct Output {
     channels: u32,
 }
 
-/// The port names this family's `denoise` reading declares, read off
-/// `model::readings()` rather than typed in, so a renamed port fails here
-/// with the model's own vocabulary instead of at the host.
-struct Ports {
-    latents: String,
-    context: String,
-    timestep: String,
-    guidance: Option<String>,
-    positions: String,
+/// What this guest sizes and binds off the model's own lane facts: the
+/// rotary axes of `positions`, whether the lanes read `guidance`, and the
+/// velocity width.
+struct Dims {
     axes: u32,
+    guidance: bool,
     velocity_width: u32,
 }
 
-fn ports(reading: &model::ReadingFact) -> Result<Ports> {
-    let named = |name: &str| -> Result<&model::PortFact> {
-        reading
-            .ports
-            .iter()
-            .find(|port| port.name == name)
-            .ok_or_else(|| format!("reading `{}` declares no port `{name}`", reading.name).into())
+/// The lane `stream` of `reading`, checked to read exactly `binds`: what
+/// this guest binds on that lane, by the model's own input names. Checked
+/// up front so a model whose lane reads anything else fails here in its own
+/// vocabulary instead of at `program`.
+fn lane_reading(reading: &str, stream: LaneStream, binds: &[&str]) -> Result<model::LaneDecl> {
+    let lane = model::lane_of(reading, stream)?;
+    let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
+    let mut wants = binds.to_vec();
+    reads.sort_unstable();
+    wants.sort_unstable();
+    if reads != wants {
+        return Err(format!(
+            "reading `{reading}`'s `{}` lane reads {reads:?}; this pass binds {wants:?}",
+            model::stream_name(stream)
+        )
+        .into());
+    }
+    Ok(lane)
+}
+
+/// The width of the input `name` a lane reads.
+fn width_of(lane: &model::LaneDecl, name: &str) -> Result<u32> {
+    lane.inputs
+        .iter()
+        .find(|i| i.name == name)
+        .map(|i| i.width)
+        .ok_or_else(|| format!("the lane reads no `{name}`").into())
+}
+
+fn dims(reading: &model::ReadingFact, references: bool) -> Result<Dims> {
+    let image = model::lane_of(&reading.name, LaneStream::Image)?;
+    let guidance = image.inputs.iter().any(|i| i.name == "guidance");
+    let scalars: &[&'static str] = if guidance {
+        &["timestep", "guidance"]
+    } else {
+        &["timestep"]
     };
-    Ok(Ports {
-        latents: named("latents")?.name.clone(),
-        context: named("context")?.name.clone(),
-        timestep: named("timestep")?.name.clone(),
-        guidance: reading
-            .ports
-            .iter()
-            .find(|port| port.name == "guidance")
-            .map(|port| port.name.clone()),
-        positions: named("positions")?.name.clone(),
-        axes: named("positions")?.width,
+    let with = |rows: &'static str| [&[rows, "positions"][..], scalars].concat();
+    let image = lane_reading(&reading.name, LaneStream::Image, &with("latents"))?;
+    lane_reading(&reading.name, LaneStream::Text, &with("context"))?;
+    if references {
+        lane_reading(&reading.name, LaneStream::Reference, &with("latents"))?;
+    }
+    Ok(Dims {
+        axes: width_of(&image, "positions")?,
+        guidance,
         velocity_width: reading.readout_width,
     })
 }
@@ -130,12 +153,12 @@ fn ports(reading: &model::ReadingFact) -> Result<Ports> {
 /// The per-lane scalars every lane of the reading binds: one cell PER PASS,
 /// since a seeded channel attaches to one pass only (the runtime's
 /// channel-role rule).
-fn scalars(pass: &ForwardPass, ports: &Ports, case: &Case, tag: &str) -> Result<()> {
+fn scalars(pass: &ForwardPass, dims: &Dims, case: &Case, tag: &str) -> Result<()> {
     let t = Channel::from([case.timestep]).named(&format!("t_{tag}"));
-    pass.input(&ports.timestep, &t)?;
-    if let Some(guidance) = &ports.guidance {
+    pass.input("timestep", &t)?;
+    if dims.guidance {
         let g = Channel::from([case.guidance]).named(&format!("g_{tag}"));
-        pass.input(guidance, &g)?;
+        pass.input("guidance", &g)?;
     }
     Ok(())
 }
@@ -155,7 +178,7 @@ struct Pipes {
 /// plausible answer: on a miniature whose random-init caption is small, it
 /// even passed this file's own tolerance, which is how it went unnoticed
 /// until the frame gate began refusing a group that could not compose.
-async fn step(case: &Case, ports: &Ports, reading: &str, pipes: &Pipes) -> Result<Vec<f32>> {
+async fn step(case: &Case, dims: &Dims, reading: &str, pipes: &Pipes) -> Result<Vec<f32>> {
     let group = 0;
     let rows = case.image_rows;
     let width = case.channels;
@@ -171,15 +194,14 @@ async fn step(case: &Case, ports: &Ports, reading: &str, pipes: &Pipes) -> Resul
         case.context.as_slice(),
     )
     .named("context");
-    let txt_pos =
-        Channel::from_shaped([case.text_rows, ports.axes], case.text_positions.as_slice())
-            .named("txt_pos");
-    text.input(&ports.context, &ctx)?;
-    text.input(&ports.positions, &txt_pos)?;
-    scalars(&text, ports, case, "txt")?;
+    let txt_pos = Channel::from_shaped([case.text_rows, dims.axes], case.text_positions.as_slice())
+        .named("txt_pos");
+    text.input("context", &ctx)?;
+    text.input("positions", &txt_pos)?;
+    scalars(&text, dims, case, "txt")?;
 
     // The reference lane: every reference's tokens concatenated, at their
-    // own `T` offsets. Same port, same weights as the target; no readout.
+    // own `T` offsets. Same input, same weights as the target; no readout.
     let reference = (case.reference_rows > 0).then(|| ForwardPass::new());
     if let Some(reference) = &reference {
         reference.reading(reading)?;
@@ -188,13 +210,13 @@ async fn step(case: &Case, ports: &Ports, reading: &str, pipes: &Pipes) -> Resul
         let r = Channel::from_shaped([case.reference_rows, width], case.reference.as_slice())
             .named("reference");
         let ref_pos = Channel::from_shaped(
-            [case.reference_rows, ports.axes],
+            [case.reference_rows, dims.axes],
             case.reference_positions.as_slice(),
         )
         .named("ref_pos");
-        reference.input(&ports.latents, &r)?;
-        reference.input(&ports.positions, &ref_pos)?;
-        scalars(reference, ports, case, "ref")?;
+        reference.input("latents", &r)?;
+        reference.input("positions", &ref_pos)?;
+        scalars(reference, dims, case, "ref")?;
     }
 
     // The target lane: the latents in, the velocity out.
@@ -205,11 +227,11 @@ async fn step(case: &Case, ports: &Ports, reading: &str, pipes: &Pipes) -> Resul
     image.group(group)?;
     let x = Channel::from_shaped([rows, width], case.latents.as_slice()).named("latents");
     let img_pos =
-        Channel::from_shaped([rows, ports.axes], case.image_positions.as_slice()).named("img_pos");
-    image.input(&ports.latents, &x)?;
-    image.input(&ports.positions, &img_pos)?;
-    scalars(&image, ports, case, "img")?;
-    let velocity_width = ports.velocity_width;
+        Channel::from_shaped([rows, dims.axes], case.image_positions.as_slice()).named("img_pos");
+    image.input("latents", &x)?;
+    image.input("positions", &img_pos)?;
+    scalars(&image, dims, case, "img")?;
+    let velocity_width = dims.velocity_width;
     let readback = out.clone();
     image.epilogue(move || {
         readback.put(intrinsics::velocity(velocity_width));
@@ -274,18 +296,16 @@ async fn main(input: Input) -> Result<Output> {
         )
         .into());
     }
-    let ports = ports(&reading)?;
-    if ports.guidance.is_none() && case.guidance != 0.0 {
-        return Err(
-            "the case carries a guidance scale and this row declares no guidance port".into(),
-        );
+    let dims = dims(&reading, case.reference_rows > 0)?;
+    if !dims.guidance && case.guidance != 0.0 {
+        return Err("the case carries a guidance scale and this row reads no `guidance`".into());
     }
     let pipes = Pipes {
         text: Pipeline::new(),
         reference: Pipeline::new(),
         image: Pipeline::new(),
     };
-    let velocity = step(&case, &ports, &reading.name, &pipes).await?;
+    let velocity = step(&case, &dims, &reading.name, &pipes).await?;
     pipes.text.close();
     pipes.reference.close();
     pipes.image.close();

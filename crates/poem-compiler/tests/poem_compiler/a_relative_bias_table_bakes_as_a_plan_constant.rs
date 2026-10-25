@@ -21,7 +21,7 @@ impl ForwardHybrid for Encoder {
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
-        let mut x = inputs.latents(0, WIDTH, Dtype::Bf16);
+        let mut x = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, WIDTH, None);
         let perm = inputs.row_permutation();
         let indptr = inputs.lane_indptr();
         let layers: Vec<u32> = (0..LAYERS).collect();

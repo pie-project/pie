@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use crate::ltx_2_dims::{self as model, VAE_DECODE};
-use poem::generative::{PortKind, ReadoutKind};
+use poem::generative::ReadoutKind;
 use poem::{Def, Dtype, Operation, Platform, RuntimeInput, Trace};
-use poem_ir::{Conv, GridRule, TimePad};
+use poem_ir::{Conv, GridRule, InputAxis, TimePad};
 
 const FLAGSHIP: &str = "ltx25-bf16-kv-bf16";
 const MINI: &str = "ltx25-mini-bf16-kv-bf16";
@@ -41,12 +41,6 @@ fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
     );
     assert!(!decode.has_kv && !decode.takes_tokens);
     assert_eq!(decode.streams, vec![poem::Stream::Video]);
-    assert_eq!(decode.ports.len(), 1);
-    let (index, port) = decode.port("latent").expect("the latent port");
-    assert_eq!(
-        (index, port.kind, port.width),
-        (model::port::VOXELS, PortKind::Voxels, model::VAE_Z)
-    );
     assert!(decode.positions.is_none(), "a VAE tile takes no positions");
     assert_eq!(decode.readout, ReadoutKind::Pixels);
     assert_eq!(decode.readout_width, model::VAE_RGB);
@@ -60,7 +54,15 @@ fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
         let voxels = trace(deployment)
             .values
             .iter()
-            .filter(|decl| matches!(decl.def, Def::Input(RuntimeInput::Voxels { .. })))
+            .filter(|decl| {
+                matches!(
+                    decl.def,
+                    Def::Input(RuntimeInput::Guest {
+                        axis: InputAxis::Voxel,
+                        ..
+                    })
+                )
+            })
             .count();
         assert_eq!(
             voxels, want,

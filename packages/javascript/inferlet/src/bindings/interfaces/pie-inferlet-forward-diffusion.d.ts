@@ -37,10 +37,11 @@ export class ForwardPass {
   */
   reading(name: string): void;
   /**
-  * `forward.input`, unchanged: bind a channel to one of the
-  * reading's float ports, read (committed cell) at every submit.
+  * `forward.input`, unchanged: bind a channel to the model's input
+  * `name`, read (committed cell) at every submit. A denoiser's
+  * self-conditioning taps are two such inputs.
   */
-  input(port: string, ch: Channel): void;
+  input(name: string, ch: Channel): void;
   /**
   * `forward.stream`, unchanged: which lane stream this pass is.
   */
@@ -69,37 +70,6 @@ export class ForwardPass {
   * causal bound is refused by name at submit, never read causally.
   */
   canvas(mode: Mode): void;
-  /**
-  * **THE SELF-CONDITIONING SIGNAL, AS THE GUEST'S TAPS.** The
-  * reference denoiser feeds each step the previous step's
-  * distribution, as `softmax(logits / T) · E`. Whose distribution
-  * that is — which temperature, how much of the tail — is the
-  * sampler's business, so the guest hands the model the
-  * distribution's TAPS: per canvas row, `self-cond-taps` token ids
-  * and their probabilities (`model.canvas().self-cond-taps`, row
-  * major, `rows.len() == weights.len() == length * taps`). The
-  * model gathers those rows of its embedding table with those
-  * weights and runs its self-conditioning block over the sum. Zero
-  * weights are "no signal" — the reference's first step.
-  * 
-  * A payload beside the ledger, like `media`: staged for the NEXT
-  * submit of this pass and consumed by it, one at a time. A denoise
-  * pass submitted with nothing staged runs with no signal. Staging
-  * twice without a submit between is refused (the first payload
-  * would be silently lost); so is staging on an `encode` pass.
-  */
-  selfConditioning(rows: Uint32Array, weights: Float32Array): void;
-  /**
-  * The same taps, read off two of this pass's own channels at every
-  * submit instead of staged from the host: `rows` a `[length, taps]`
-  * u32 channel of ids, `weights` a `[length, taps]` f32 channel. A
-  * persistent binding, set once before the loop; each submit reads
-  * the channels' COMMITTED cells, so an epilogue that writes the
-  * next step's taps keeps them loop-carried (`take` then `put`) and
-  * the guest seeds them with zeros for the first step. The whole
-  * denoising loop then runs without a host copy a step.
-  */
-  selfConditioningFrom(rows: Channel, weights: Channel): void;
   /**
   * Bind embedding token ids and CSR row indptr. Both are channels.
   * On a `denoise` pass the tokens are the canvas — random ids on the

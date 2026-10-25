@@ -2,8 +2,11 @@
 //! D11, D12): a prompt in, an image out, with nothing about any family
 //! spelled here. Everything this program needs to size and drive the job is
 //! a host-answered fact — `model::readings()`, `model::latent()`,
-//! `model::schedule()`, `model::max_latent_rows()` — and every port and
-//! reading is found by ROLE, never by name and never by `architecture()`.
+//! `model::schedule()`, `model::max_latent_rows()` — and every reading is
+//! found by ROLE, never by `architecture()`. The denoiser's inputs are bound
+//! by the standard names (`latents`, `timestep`, `guidance`, `context`,
+//! `positions`, `model::lane`); a required input of any other name is
+//! refused, never zero-filled.
 //!
 //! # HOW IT FINDS ITS THREE READINGS
 //!
@@ -22,8 +25,8 @@
 //!
 //! Two lanes of one request (D2), each on its own pipeline, submitted back
 //! to back so the wait-all seal composes them into ONE fire: the prompt
-//! lane (the stream the reading's `Context` port lists — `Text` for FLUX.2,
-//! `Context` for Z-Image) carrying the encoder's rows, and the image lane
+//! lane (the reading's `text` stream when it lists one — FLUX.2 — else
+//! `context`, Z-Image) carrying the encoder's rows, and the image lane
 //! carrying the latent. Neither `embed` nor `state` is called: a
 //! denoise reading declares no tokens and no KV space.
 //!
@@ -50,8 +53,8 @@
 //! Two exits, and which one a model gets is its own fact.
 //!
 //! The intended one is D11, and it is wired: a model that declares a
-//! `vae.decode` reading — a `Voxels` port and a `Pixels` readout — gets its
-//! final latent unpatchified into the clip that port takes, fired on the
+//! `vae.decode` reading — a voxel input and a `Pixels` readout — gets its
+//! final latent unpatchified into the clip that input takes, fired on the
 //! voxel axis, and read back off the `pixels` seam with
 //! `intrinsics::pixels()`. `Channel::take_frames` turns that channel's cell
 //! into a host-held `frames` handle and `session::send_frames` encodes and
@@ -72,9 +75,9 @@
 //!
 //! # CFG
 //!
-//! When the reading declares a `guidance` port the model is guidance-
-//! distilled and the scale is just another lane vector; `--negative-prompt`
-//! is then refused as meaningless. Without that port, a negative prompt at
+//! When the denoiser reads a `guidance` input the model is guidance-
+//! distilled and the scale is just another lane input; `--negative-prompt`
+//! is then refused as meaningless. Without that input, a negative prompt at
 //! `guidance > 1` runs a second lane PAIR (its own group, its own prompt
 //! rows, its own latent), and the two velocities combine as
 //! `u + s(c - u)` — ON THE DEVICE, inside the epilogue.
@@ -92,7 +95,7 @@
 //! draw is the same draw the ungated path makes.
 //!
 //! Neither shipped row exercises the guided path: klein-4B and Z-Image
-//! Turbo are both guidance-distilled and take the scale as a port. What
+//! Turbo are both guidance-distilled and take the scale as an input. What
 //! proves the combine is `gates.py --only guidance`, on `mini-dit`.
 
 use inferlet::latent::prelude::*;
@@ -146,7 +149,7 @@ struct Input {
     #[serde(default)]
     mask_rect: Option<String>,
     /// Diagnostic: scale the encoded prompt rows before they reach the
-    /// context port (0 = the prompt's shape with none of its content).
+    /// `context` input (0 = the prompt's shape with none of its content).
     #[serde(default)]
     context_scale: Option<f32>,
 }
@@ -305,7 +308,7 @@ struct Output {
     decoded: bool,
     /// The decode reading this model declares, if any. Present with
     /// `decoded: false` means the model states a pixels reading this run
-    /// could not drive — no voxel port to hand the clip to, or a latent the
+    /// could not drive — no voxel input to hand the clip to, or a latent the
     /// loop left non-finite.
     decode_reading: Option<String>,
     /// The name the client should give what was sent.
@@ -383,14 +386,18 @@ fn roles() -> Result<Roles> {
         })
         .cloned();
     // And the ENCODER: the reading whose pixels are its INPUT, which is
-    // what a voxel port beside a non-pixels readout says. img2img comes in
+    // what a voxel input beside a non-pixels readout says. img2img comes in
     // through it.
     let encode = readings
         .iter()
         .find(|r| {
             r.name == "vae.encode"
                 || (r.readout != model::ReadoutKind::Pixels
-                    && r.ports.iter().any(|p| p.kind == model::PortKind::Voxels))
+                    && model::lane_of(&r.name, model::LaneStream::Image).is_ok_and(|lane| {
+                        lane.inputs
+                            .iter()
+                            .any(|input| input.axis == model::InputAxis::Voxel)
+                    }))
         })
         .cloned();
     Ok(Roles {
@@ -401,16 +408,14 @@ fn roles() -> Result<Roles> {
     })
 }
 
-/// The denoise reading's ports, sorted into the roles a sampler binds. Kind
-/// is what says which is which (`PortKind` is the facts vocabulary); the
-/// one name read here is `guidance`, which the design lists as a port role
-/// of its own and which decides whether the model wants a scale or a second
-/// lane pair.
-struct Ports {
-    latents: model::PortFact,
-    context: model::PortFact,
-    timestep: String,
-    guidance: Option<String>,
+/// The denoise reading's inputs, by the standard names a model-agnostic
+/// sampler binds (`latents`, `timestep`, `guidance`, `context`,
+/// `positions`), and the two lanes that read them. Whether the model reads
+/// `guidance` decides whether it wants a scale or a second lane pair.
+struct Inputs {
+    latents: model::InputDecl,
+    context: model::InputDecl,
+    guidance: bool,
     /// The convention `positions_for` fills the grids from.
     convention: model::PositionConvention,
     /// Which stream carries the latent, and which carries the prompt rows.
@@ -418,31 +423,42 @@ struct Ports {
     context_stream: model::LaneStream,
 }
 
-/// The first stream of `streams`, preferring `want` when it is listed;
-/// `fallback` when the port lists none (a port every lane binds).
+/// `want` when the reading lists it, else `fallback`.
 fn stream_of(
-    streams: &[model::LaneStream],
+    reading: &model::ReadingFact,
     want: model::LaneStream,
     fallback: model::LaneStream,
 ) -> model::LaneStream {
-    if streams.contains(&want) {
-        return want;
+    if reading.streams.contains(&want) {
+        want
+    } else {
+        fallback
     }
-    streams.first().copied().unwrap_or(fallback)
 }
 
-fn ports(reading: &model::ReadingFact) -> Result<Ports> {
-    let of_kind = |kind: model::PortKind| reading.ports.iter().find(|p| p.kind == kind).cloned();
-    let latents = of_kind(model::PortKind::Latents)
-        .ok_or("this denoise reading declares no latents port; there is nothing to denoise")?;
-    let context = of_kind(model::PortKind::Context).ok_or(
-        "this denoise reading declares no context port; a text-conditioned sampler has nowhere \
-         to put the prompt",
+/// The input `name` a lane reads.
+fn lane_input(lane: &model::LaneDecl, name: &str) -> Option<model::InputDecl> {
+    lane.inputs.iter().find(|input| input.name == name).cloned()
+}
+
+fn inputs(reading: &model::ReadingFact) -> Result<Inputs> {
+    let image_stream = stream_of(reading, model::LaneStream::Image, model::LaneStream::Image);
+    let context_stream = stream_of(reading, model::LaneStream::Text, model::LaneStream::Context);
+    let image = model::lane_of(&reading.name, image_stream)?;
+    let prompt = model::lane_of(&reading.name, context_stream)?;
+    let latents = lane_input(&image, "latents")
+        .ok_or("this denoise reading reads no `latents`; there is nothing to denoise")?;
+    let context = lane_input(&prompt, "context").ok_or(
+        "this denoise reading reads no `context`; a text-conditioned sampler has nowhere to \
+         put the prompt",
     )?;
-    let positions = of_kind(model::PortKind::AxisPositions).ok_or(
-        "this denoise reading declares no axis-positions port; this sampler builds rotary \
-         coordinates and the model takes none",
+    let positions = lane_input(&image, "positions").ok_or(
+        "this denoise reading reads no `positions`; this sampler builds rotary coordinates and \
+         the model takes none",
     )?;
+    if lane_input(&image, "timestep").is_none() {
+        return Err(format!("reading `{}` reads no `timestep`", reading.name).into());
+    }
     let convention = reading.positions.clone().ok_or_else(|| {
         format!(
             "reading `{}` takes positions but states no position convention, so a \
@@ -452,44 +468,17 @@ fn ports(reading: &model::ReadingFact) -> Result<Ports> {
     })?;
     if convention.axes.len() as u32 != positions.width {
         return Err(format!(
-            "reading `{}` states {} axis roles for a {}-wide positions port",
+            "reading `{}` states {} axis roles for a {}-wide positions input",
             reading.name,
             convention.axes.len(),
             positions.width
         )
         .into());
     }
-    let guidance = reading
-        .ports
-        .iter()
-        .find(|p| p.kind == model::PortKind::LaneVector && p.name == "guidance")
-        .map(|p| p.name.clone());
-    let timestep = reading
-        .ports
-        .iter()
-        .find(|p| p.kind == model::PortKind::LaneVector && Some(&p.name) != guidance.as_ref())
-        .map(|p| p.name.clone())
-        .ok_or_else(|| {
-            format!(
-                "reading `{}` declares no lane-vector port for the timestep",
-                reading.name
-            )
-        })?;
-    let image_stream = stream_of(
-        &latents.streams,
-        model::LaneStream::Image,
-        model::LaneStream::Image,
-    );
-    let context_stream = stream_of(
-        &context.streams,
-        model::LaneStream::Text,
-        model::LaneStream::Context,
-    );
-    Ok(Ports {
+    Ok(Inputs {
         latents,
         context,
-        timestep,
-        guidance,
+        guidance: lane_input(&image, "guidance").is_some(),
         convention,
         image_stream,
         context_stream,
@@ -497,7 +486,7 @@ fn ports(reading: &model::ReadingFact) -> Result<Ports> {
 }
 
 /// Everything one lane binds, kept alive for the loop's lifetime: a channel
-/// dropped while its pass is live is a port with nothing feeding it.
+/// dropped while its pass is live is an input with nothing feeding it.
 struct Lane {
     pass: ForwardPass,
     #[allow(dead_code)]
@@ -505,16 +494,13 @@ struct Lane {
 }
 
 /// Build one lane of a denoise group: state its stream and group, then bind
-/// EXACTLY the ports that list its stream (or list none), each from its
-/// kind. `latents` is the lane's own rows when it is the image lane;
-/// `context` is the encoder's rows when it is the prompt lane. A port of a
-/// kind this lane has no value for — Z-Image's `pad` flags, a second
-/// context — is bound to zeros of its declared width, which is what "no
-/// pad rows / no extra conditioning" means.
+/// EXACTLY the inputs its lane reads, by name. `latents` is the lane's own
+/// rows when it is the image lane; `context` is the encoder's rows when it
+/// is the prompt lane. An input this sampler does not know is refused by
+/// name, never fed zeros.
 #[allow(clippy::too_many_arguments)]
 fn lane(
     reading: &model::ReadingFact,
-    ports: &Ports,
     stream: model::LaneStream,
     group: u32,
     // The OTHER guidance branch's group, on the CFG path. Named by EVERY
@@ -538,63 +524,39 @@ fn lane(
         pass.peer(peer)?;
     }
     let mut held = Vec::new();
-    let mut latents_bound = false;
-    let mut context_bound = false;
-    let mut timestep_bound = false;
-    for port in &reading.ports {
-        if !(port.streams.is_empty() || port.streams.iter().any(|s| *s == stream)) {
-            continue;
-        }
-        let name = format!("{tag}_{}", port.name);
-        let ch = match port.kind {
-            model::PortKind::Latents if !latents_bound && latents.is_some() => {
-                latents_bound = true;
-                latents.unwrap().clone()
+    for input in model::lane_of(&reading.name, stream)?.inputs {
+        let name = format!("{tag}_{}", input.name);
+        let ch = match input.name.as_str() {
+            "latents" => latents
+                .ok_or_else(|| format!("the `{tag}` lane reads `latents` and has none"))?
+                .clone(),
+            "context" => context
+                .ok_or_else(|| format!("the `{tag}` lane reads `context` and has none"))?
+                .clone(),
+            "positions" => {
+                Channel::from_shaped([rows, input.width], positions.to_vec()).named(&name)
             }
-            model::PortKind::Context if !context_bound && context.is_some() => {
-                context_bound = true;
-                context.unwrap().clone()
-            }
-            model::PortKind::Latents | model::PortKind::Context => {
-                Channel::from_shaped([rows, port.width], vec![0f32; (rows * port.width) as usize])
-                    .named(&name)
-            }
-            model::PortKind::AxisPositions => {
-                Channel::from_shaped([rows, port.width], positions.to_vec()).named(&name)
-            }
-            model::PortKind::LaneVector if port.name == ports.timestep && !timestep_bound => {
-                timestep_bound = true;
-                clock.timestep.clone()
-            }
-            model::PortKind::LaneVector if Some(&port.name) == ports.guidance.as_ref() => {
-                Channel::from(vec![guidance; port.width as usize]).named(&name)
-            }
-            model::PortKind::LaneVector => {
-                Channel::from(vec![1.0f32; port.width as usize]).named(&name)
-            }
-            // A voxel port is a VAE tile's box on the third row axis
-            // (D8), not something a denoise lane carries. If a denoise
-            // reading ever declares one, this program is the wrong driver
-            // for it and says so rather than feeding it zeros.
-            model::PortKind::Voxels => {
+            "timestep" => clock.timestep.clone(),
+            "guidance" => Channel::from(vec![guidance; input.width as usize]).named(&name),
+            other => {
                 return Err(format!(
-                    "reading `{}` declares a voxel port `{}`; this sampler drives latent rows, \
-                     not a VAE tile",
-                    reading.name, port.name
+                    "reading `{}` reads `{other}` on its `{tag}` lane; this sampler binds \
+                     latents, timestep, guidance, context and positions",
+                    reading.name
                 )
                 .into());
             }
         };
-        pass.input(&port.name, &ch)?;
+        pass.input(&input.name, &ch)?;
         held.push(ch);
     }
     Ok(Lane { pass, held })
 }
 
 /// Unpatchify a denoise reading's final latent into the clip a `vae.decode`
-/// port takes: `[rows, C·ph·pw]` in `(c, ph, pw)` feature order becomes
+/// input takes: `[rows, C·ph·pw]` in `(c, ph, pw)` feature order becomes
 /// `[grid_h·ph, grid_w·pw, C]` row-major, which is the `[h, w, C]` shape a
-/// `Voxels` port channel declares (design D8).
+/// voxel input's channel declares (design D8).
 ///
 /// The inverse of the patchify every DiT does at its embed, written out
 /// rather than called, because the guest is the only place both halves of
@@ -662,7 +624,7 @@ fn b64_decode(text: &str) -> Result<Vec<u8>> {
 }
 
 /// The inverse: a `[h, w, C]` clip back into the `[rows, C.ph.pw]` rows a
-/// denoise reading's latent port takes, in `(c, ph, pw)` feature order.
+/// denoise reading's `latents` input takes, in `(c, ph, pw)` feature order.
 ///
 /// The pair to [`unpatchify`], and here for the same reason: img2img starts
 /// from a picture, so the clip a `vae.encode` reading LANDS has to become
@@ -699,11 +661,24 @@ fn patchify(
     out
 }
 
+/// The one input a VAE arm's lane reads: a clip on the voxel axis.
+fn voxel_input(reading: &model::ReadingFact) -> Result<model::InputDecl> {
+    match &model::lane_of(&reading.name, model::LaneStream::Image)?.inputs[..] {
+        [input] if input.axis == model::InputAxis::Voxel => Ok(input.clone()),
+        other => Err(format!(
+            "reading `{}` reads {} input(s), and a VAE arm reads one clip on the voxel axis",
+            reading.name,
+            other.len()
+        )
+        .into()),
+    }
+}
+
 /// Fire the family's `vae.encode` reading over one picture and hand back the
 /// latent clip it lands: the mirror of [`decode_to_frames`], and the door
 /// img2img comes in through.
 ///
-/// The picture goes in as the port's CHANNEL, seeded straight from the
+/// The picture goes in as the input's CHANNEL, seeded straight from the
 /// host's `frames` handle (`Channel::set_frames`) so the pixels never enter
 /// this module's address space, and the answer comes back on the same
 /// `pixels` seam a decode uses — for an encoder that seam carries the
@@ -718,17 +693,7 @@ async fn encode_from_frames(
     clip_w: u32,
     pipe: &Pipeline,
 ) -> Result<Vec<f32>> {
-    let port = reading
-        .ports
-        .iter()
-        .find(|p| p.kind == model::PortKind::Voxels)
-        .ok_or_else(|| {
-            format!(
-                "reading `{}` takes pixels but declares no voxel port; there is no \
-                 picture to hand it",
-                reading.name
-            )
-        })?;
+    let input = voxel_input(reading)?;
     let rows = clip_h * clip_w;
     let width = reading.readout_width;
     let pass = ForwardPass::new();
@@ -737,8 +702,8 @@ async fn encode_from_frames(
     // Empty, and SEEDED from the picture below: the pixels are the host's
     // and never enter linear memory, which is the whole point of the
     // `frames` handle.
-    let clip = Channel::seeded([pixel_h, pixel_w, port.width], dtype::f32).named("vae_pixels_in");
-    pass.input(&port.name, &clip)?;
+    let clip = Channel::seeded([pixel_h, pixel_w, input.width], dtype::f32).named("vae_pixels_in");
+    pass.input(&input.name, &clip)?;
     let out = Channel::new([rows, width], dtype::f32).named("vae_latent_out");
     let readback = out.clone();
     pass.epilogue(move || {
@@ -753,7 +718,7 @@ async fn encode_from_frames(
 /// Fire the family's `vae.decode` reading over one clip and hand the pixels
 /// straight to the host's encoders (design D8 into D11).
 ///
-/// The latent goes in as the port's CHANNEL — whose shape IS the clip's box,
+/// The latent goes in as the input's CHANNEL — whose shape IS the clip's box,
 /// so the geometry the voxel axis needs travels with the numbers — and the
 /// answer comes back on the `pixels` seam, which the epilogue reads with
 /// `intrinsics::pixels()` and puts on one channel. `Channel::take_frames`
@@ -768,24 +733,15 @@ async fn decode_to_frames(
     pixel_w: u32,
     pipe: &Pipeline,
 ) -> Result<inferlet::frames::Frames> {
-    let port = reading
-        .ports
-        .iter()
-        .find(|p| p.kind == model::PortKind::Voxels)
-        .ok_or_else(|| {
-            format!(
-                "reading `{}` lands pixels but reads no voxel port; there is no clip to hand it",
-                reading.name
-            )
-        })?;
-    let want = (clip_h as usize) * (clip_w as usize) * (port.width as usize);
+    let input = voxel_input(reading)?;
+    let want = (clip_h as usize) * (clip_w as usize) * (input.width as usize);
     if latent.len() != want {
         return Err(format!(
-            "the unpatchified latent is {} numbers and port `{}` wants {clip_h}x{clip_w}x{} \
+            "the unpatchified latent is {} numbers and input `{}` wants {clip_h}x{clip_w}x{} \
              = {want}",
             latent.len(),
-            port.name,
-            port.width
+            input.name,
+            input.width
         )
         .into());
     }
@@ -794,8 +750,8 @@ async fn decode_to_frames(
     let pass = ForwardPass::new();
     pass.reading(&reading.name)?;
     pass.stream(model::LaneStream::Image)?;
-    let clip = Channel::from_shaped([clip_h, clip_w, port.width], latent).named("vae_latent");
-    pass.input(&port.name, &clip)?;
+    let clip = Channel::from_shaped([clip_h, clip_w, input.width], latent).named("vae_latent");
+    pass.input(&input.name, &clip)?;
     let out = Channel::new([rows, width], dtype::f32).named("vae_pixels");
     let readback = out.clone();
     pass.epilogue(move || {
@@ -823,7 +779,7 @@ async fn main(input: Input) -> Result<Output> {
         .filter(|p| !p.trim().is_empty())
         .ok_or("pass `prompt`: this program draws what it is told to")?;
     let roles = roles()?;
-    let ports = ports(&roles.denoise)?;
+    let inputs = inputs(&roles.denoise)?;
 
     // ---- the latent grid, out of `model::latent()` ------------------------
     let space = model::latent().ok_or(
@@ -836,7 +792,7 @@ async fn main(input: Input) -> Result<Output> {
     let grid_h = height / cell_h;
     let grid_w = width / cell_w;
     let rows = grid_h * grid_w;
-    let row_width = ports.latents.width;
+    let row_width = inputs.latents.width;
     let max_rows = model::max_latent_rows();
     if max_rows > 0 && rows > max_rows {
         return Err(format!(
@@ -863,7 +819,7 @@ async fn main(input: Input) -> Result<Output> {
     //
     // The picture comes in as an encoded still and goes out to the host's
     // decoder without entering this module's address space: `Frames::decode`
-    // holds it, `Channel::set_frames` seeds the pixel port from it, and the
+    // holds it, `Channel::set_frames` seeds the pixel input from it, and the
     // encode lane's epilogue lands the posterior mean. `strength` is the
     // FRACTION OF THE TRAJECTORY still to run, so the schedule is truncated
     // to its tail and the picture is noised to that tail's first sigma.
@@ -888,15 +844,15 @@ async fn main(input: Input) -> Result<Output> {
     };
     let sigma0 = *sched.sigmas.first().unwrap_or(&1.0);
 
-    // ---- guidance: a port, or a second lane pair --------------------------
+    // ---- guidance: an input, or a second lane pair ------------------------
     let guidance = input.guidance.unwrap_or(1.0);
     let negative = input
         .negative_prompt
         .clone()
         .filter(|p| !p.trim().is_empty());
-    if negative.is_some() && ports.guidance.is_some() {
+    if negative.is_some() && inputs.guidance {
         return Err(format!(
-            "reading `{}` declares a `guidance` port, so this row is guidance-distilled and a \
+            "reading `{}` reads a `guidance` input, so this row is guidance-distilled and a \
              negative prompt has no lane to ride; pass `guidance` alone",
             roles.denoise.name
         )
@@ -931,11 +887,11 @@ async fn main(input: Input) -> Result<Output> {
         None => None,
     };
     let context_rows = context.shape().dims()[0];
-    if context.shape().dims()[1] != ports.context.width {
+    if context.shape().dims()[1] != inputs.context.width {
         return Err(format!(
-            "the text reading hands back {}-wide rows and the denoise context port takes {}",
+            "the text reading hands back {}-wide rows and the denoise `context` input takes {}",
             context.shape().dims()[1],
-            ports.context.width
+            inputs.context.width
         )
         .into());
     }
@@ -1081,14 +1037,13 @@ async fn main(input: Input) -> Result<Output> {
         let image_clock = loops.lane(&format!("{tag}_img"));
         let context_lane = lane(
             &roles.denoise,
-            &ports,
-            ports.context_stream,
+            inputs.context_stream,
             group,
             cfg.then(|| 1 - group),
             ctx_rows,
             None,
             Some(ctx),
-            &positions_for(&ports.convention, LaneRows::Sequence(ctx_rows), ctx_rows),
+            &positions_for(&inputs.convention, LaneRows::Sequence(ctx_rows), ctx_rows),
             &text_clock,
             guidance,
             &format!("{tag}_ctx"),
@@ -1100,15 +1055,14 @@ async fn main(input: Input) -> Result<Output> {
         .named(&format!("{tag}_x"));
         let image_lane = lane(
             &roles.denoise,
-            &ports,
-            ports.image_stream,
+            inputs.image_stream,
             group,
             cfg.then(|| 1 - group),
             rows,
             Some(&latent),
             None,
             &positions_for(
-                &ports.convention,
+                &inputs.convention,
                 LaneRows::Grid {
                     h: grid_h,
                     w: grid_w,
@@ -1204,8 +1158,8 @@ async fn main(input: Input) -> Result<Output> {
     let var = last.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / n;
     let name = input.out.unwrap_or_else(|| "image".to_string());
     // THE DECODE BRANCH IS A BRANCH, NOT A REFUSAL. A model that declares a
-    // `vae.decode` reading with a voxel port and a pixels readout gets D11's
-    // exit: the latent is unpatchified into the clip the port takes, the
+    // `vae.decode` reading with a voxel input and a pixels readout gets D11's
+    // exit: the latent is unpatchified into the clip the input takes, the
     // reading fires on the voxel axis, and the pixels go from the `pixels`
     // seam into the host's PNG encoder without ever entering linear memory.
     // A model that declares no such reading — because its VAE is traced but
@@ -1213,12 +1167,7 @@ async fn main(input: Input) -> Result<Output> {
     // exit as before, and the report says which reading it saw.
     let decode_reading = roles.decode.as_ref().map(|r| r.name.clone());
     let (file, decoded, bytes) = match roles.decode.as_ref() {
-        Some(reading)
-            if reading
-                .ports
-                .iter()
-                .any(|p| p.kind == model::PortKind::Voxels)
-                && last.iter().all(|v| v.is_finite()) =>
+        Some(reading) if voxel_input(reading).is_ok() && last.iter().all(|v| v.is_finite()) =>
         {
             let clip = unpatchify(
                 &last,

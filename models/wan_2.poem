@@ -343,12 +343,6 @@ def generative(m):
         "denoise",
         index = index,
         streams = ["video", "context"],
-        ports = [
-            port("latents", "latents", d.patch, ["video"]),
-            port("context", "context", d.text_dim, ["context"], rows = CONTEXT_LEN if m.te != None else None),
-            port("timestep", "lane_vector", 1, ["video"]),
-            port("positions", "axis_positions", ROPE_AXES, ["video"]),
-        ],
         positions = positions(
             axes = ["time", "height", "width"],
             text_axis = 0,
@@ -365,7 +359,6 @@ def generative(m):
                 name,
                 index = index,
                 streams = ["video"],
-                ports = [port("latent", "voxels", VAE_Z, ["video"])],
                 readout = "pixels",
                 readout_width = VAE_RGB,
             ))
@@ -375,7 +368,6 @@ def generative(m):
                 name,
                 index = index,
                 streams = ["video"],
-                ports = [port("pixels", "voxels", VAE_RGB, ["video"], at = 1)],
                 readout = "pixels",
                 readout_width = VAE_Z,
             ))
@@ -391,7 +383,6 @@ def generative(m):
             temporal_compression = VAE_TEMPORAL_COMPRESSION,
         ),
         schedule = schedule("flow", shift = m.shift, train_steps = TRAIN_STEPS),
-        max_rows = 32768 + CONTEXT_LEN if m.te != None else 4096,
     )
 
 # How a Wan 2.2 checkpoint is laid out: a diffusers pipeline, its
@@ -795,13 +786,13 @@ def denoise(arm, m):
     ctx, vid = arm.on(fact.stream("context")), arm.on(~fact.stream("context"))
     vg = struct(
         lanes = vid.request_of_token(),
-        positions = vid.axis_positions(0, m.rope_axes),
+        positions = vid.input("positions", dtype.f32, "row", m.rope_axes),
         perm = vid.row_permutation(),
         csr = vid.group_indptr(),
     )
     cg = struct(perm = ctx.row_permutation(), csr = ctx.group_indptr())
 
-    t = vid.lane_vector(0, 1)
+    t = vid.input("timestep", dtype.f32, "lane", 1)
     h_t = ops.elemwise.silu(run_linear(
         dit.time_embed.linear_1,
         ops.elemwise.sinusoid(t, d.freq_dim, T_MAX_PERIOD, True, 1.0),
@@ -810,10 +801,10 @@ def denoise(arm, m):
     proj = run_linear(dit.time_proj, ops.elemwise.silu(temb))
     head_mod = ops.elemwise.add_bias(dit.head_table, run_linear(dit.head_proj, h_t))
 
-    c = ctx.context(0, d.text_dim)
+    c = ctx.input("context", dtype.bf16, "row", d.text_dim, rows = CONTEXT_LEN if m.te != None else None)
     c = run_linear(dit.text_embed.linear_2, ops.elemwise.gelu(run_linear(dit.text_embed.linear_1, c), True))
 
-    x = run_linear(dit.patch_embed, vid.latents(0, d.patch, dtype.bf16))
+    x = run_linear(dit.patch_embed, vid.input("latents", dtype.bf16, "row", d.patch))
 
     def step(l, b, x):
         e = ops.elemwise.add_bias(b.table, ops.elemwise.copy(proj))
@@ -854,7 +845,7 @@ def run_mid_attention(x, g, a):
 
 def vae_decode(arm, vae, first):
     g0 = arm.grid()
-    z = ops.elemwise.copy(arm.voxels(0, vae.z, dtype.bf16))
+    z = ops.elemwise.copy(arm.input("latent", dtype.bf16, "voxel", vae.z))
     z = ops.elemwise.standardize(z, vae.denorm_bias, vae.denorm_scale)
     z, g = vconv(z, g0, vae.post_quant, arm)
     x, _ = vconv(z, g, vae.conv_in, arm)
@@ -901,7 +892,7 @@ def downsample_time(x, g, c, arm):
 def vae_encode(arm, vae, first):
     e = vae.enc
     g0 = arm.grid()
-    px = arm.voxels(1, vae.rgb, dtype.bf16)
+    px = arm.input("pixels", dtype.bf16, "voxel", vae.rgb)
     x, g = ops.conv.pixel_unshuffle(px, g0, [1, vae.patch, vae.patch])
     x, g = vconv(x, g, e.conv_in, arm)
 

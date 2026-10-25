@@ -16,7 +16,7 @@
 //! image.in   the noisy latent as a `[h, w, 32]` CLIP on the voxel axis,
 //!            through `patch_embed`'s 3x3 convs and its adaptive group
 //!            norm                                        -> pixels [h*w, D]
-//! denoise    the canvas: those h*w rows through the `latents` port plus
+//! denoise    the canvas: those h*w rows through the `latents` input plus
 //!            ONE <timestep> row the plan lands from the lane's timestep
 //!            vector, bidirectional over [prefix | canvas] against the
 //!            prefix `encode` wrote and froze              -> hidden
@@ -68,7 +68,7 @@
 //! `h*w + 1` rows, the `<timestep>` row FIRST: a lane's rows write
 //! consecutive slots, so the lane's rows must BE the sequence's own run,
 //! rewritten in place on every step (the canvas is buffer, never folded). The
-//! `special` port flags the row the plan overwrites with `timestep_emb(t)`;
+//! `special` input flags the row the plan overwrites with `timestep_emb(t)`;
 //! every other row takes its `latents` row.
 //!
 //! The mask is the reference's generalized causal attention, built here as
@@ -181,13 +181,52 @@ fn reading(name: &'static str) -> Result<model::ReadingFact> {
         .ok_or_else(|| format!("this model declares no `{name}` reading").into())
 }
 
-fn port_of(reading: &model::ReadingFact, name: &str) -> Result<String> {
-    reading
-        .ports
-        .iter()
-        .find(|port| port.name == name)
-        .map(|port| port.name.clone())
-        .ok_or_else(|| format!("reading `{}` declares no port `{name}`", reading.name).into())
+/// The lane of `reading` on `stream` under `canvas` (`encode` or
+/// `denoise`), checked to read exactly `binds`: what this guest binds on
+/// it, by the model's own input names. Checked up front so a model whose
+/// lane reads anything else fails here in its own vocabulary instead of at
+/// `program`.
+fn lane_reading(
+    reading: &str,
+    stream: LaneStream,
+    canvas: &str,
+    binds: &[&str],
+) -> Result<model::LaneDecl> {
+    let lane = model::lane(&[
+        ("reading".to_string(), reading.to_string()),
+        ("stream".to_string(), model::stream_name(stream).to_string()),
+        ("canvas".to_string(), canvas.to_string()),
+    ])?;
+    let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
+    let mut wants = binds.to_vec();
+    reads.sort_unstable();
+    wants.sort_unstable();
+    if reads != wants {
+        return Err(format!(
+            "reading `{reading}`'s `{}` lane reads {reads:?}; this pass binds {wants:?}",
+            model::stream_name(stream)
+        )
+        .into());
+    }
+    Ok(lane)
+}
+
+/// The one input a voxel arm's lane reads: the clip, on the voxel axis.
+fn voxel_input(arm: &model::ReadingFact) -> Result<String> {
+    let lane = model::lane(&[
+        ("reading".to_string(), arm.name.clone()),
+        ("stream".to_string(), "image".to_string()),
+        ("canvas".to_string(), "encode".to_string()),
+    ])?;
+    match &lane.inputs[..] {
+        [input] if input.axis == model::InputAxis::Voxel => Ok(input.name.clone()),
+        other => Err(format!(
+            "reading `{}` reads {} input(s), and a voxel arm reads one clip on the voxel axis",
+            arm.name,
+            other.len()
+        )
+        .into()),
+    }
 }
 
 /// The geometry every fire of this program shares.
@@ -223,7 +262,7 @@ fn prefill(
     pass.reading(&encode.name)?;
     pass.canvas(Mode::Encode)?;
     pass.embed(&toks, &indptr)?;
-    pass.input(&port_of(encode, "positions")?, &rope)?;
+    pass.input("positions", &rope)?;
     pass.state(&[ws], StateGeometry::folding())?;
     // Every row reads out: the default is the lane's LAST row, and the
     // golden's logits are the whole causal pass.
@@ -289,10 +328,10 @@ fn denoise_step(
     pass.canvas(Mode::Denoise)?;
     pass.stream(LaneStream::Image)?;
     pass.embed(&toks, &indptr)?;
-    pass.input(&port_of(denoise, "latents")?, &latents)?;
-    pass.input(&port_of(denoise, "special")?, &flag)?;
-    pass.input(&port_of(denoise, "timestep")?, &t)?;
-    pass.input(&port_of(denoise, "positions")?, &rope)?;
+    pass.input("latents", &latents)?;
+    pass.input("special", &flag)?;
+    pass.input("timestep", &t)?;
+    pass.input("positions", &rope)?;
     pass.state(
         &[ws],
         StateGeometry {
@@ -312,7 +351,7 @@ fn denoise_step(
     Ok(out)
 }
 
-/// One fire of a VOXEL arm: the clip bound as the port's channel, whose
+/// One fire of a VOXEL arm: the clip bound as its one input's channel, whose
 /// shape IS the box (design D8), read back on the `pixels` seam.
 ///
 /// `clip` is `[h*w, channels]` in raster order and the timestep's sinusoid
@@ -324,7 +363,6 @@ fn voxel_arm(
     case: &Case,
     arm: &model::ReadingFact,
     pipe: &Pipeline,
-    clip_port: &str,
     clip: &[f32],
     channels: u32,
     tag: &str,
@@ -346,7 +384,7 @@ fn voxel_arm(
     pass.stream(LaneStream::Image)?;
     let x = Channel::from_shaped([case.token_h, case.token_w, width_in], packed.as_slice())
         .named(&format!("clip_{tag}"));
-    pass.input(clip_port, &x)?;
+    pass.input(&voxel_input(arm)?, &x)?;
     let width = arm.readout_width;
     let out = Channel::new([rows, width], dtype::f32).named(&format!("pixels_{tag}"));
     let readback = out.clone();
@@ -397,6 +435,12 @@ async fn main(input: Input) -> Result<Output> {
     if !(encode.has_kv && denoise.has_kv) {
         return Err("both token-axis readings of this family bind a kv space".into());
     }
+    lane_reading(
+        &denoise.name,
+        LaneStream::Image,
+        "denoise",
+        &["latents", "special", "timestep", "positions"],
+    )?;
     if denoise.readout_width != case.hidden {
         return Err(format!(
             "the model reads a {}-wide canvas row and the case carries {}",
@@ -424,12 +468,8 @@ async fn main(input: Input) -> Result<Output> {
         .ok_or("an empty canvas")?
         + 1;
     let shape = Shape {
-        axes: encode
-            .ports
-            .iter()
-            .find(|port| port.name == "positions")
-            .map(|port| port.width)
-            .ok_or("the `encode` reading declares no `positions` port")?,
+        axes: lane_reading(&encode.name, LaneStream::Text, "encode", &["positions"])?.inputs[0]
+            .width,
         prefix_len,
         canvas_len,
         kv_len,
@@ -452,7 +492,6 @@ async fn main(input: Input) -> Result<Output> {
         &case,
         &image_in,
         &pipe,
-        &port_of(&image_in, "latent")?,
         &case.latent,
         case.latent_channels,
         "in",
@@ -526,7 +565,6 @@ async fn main(input: Input) -> Result<Output> {
         &case,
         &image_out,
         &pipe,
-        &port_of(&image_out, "rows")?,
         &canvas_hidden[case.hidden as usize..],
         case.hidden,
         "out",

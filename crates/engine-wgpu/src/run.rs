@@ -496,12 +496,6 @@ impl<'c> Run<'c> {
             Def::Input(RuntimeInput::ImageGrids) => self.fire.patch_grids.unwrap_or_else(|| {
                 panic!("value {at} reads this fire's image grids, which no lane of it submitted")
             }),
-            Def::Input(RuntimeInput::SelfCondRows | RuntimeInput::SelfCondWeights) => {
-                panic!(
-                    "value {at} reads a self-conditioning input, which this shell stages none \
-                     of; the load refuses such a plan"
-                )
-            }
             Def::Input(RuntimeInput::MropePositions) => {
                 self.fire.mrope_positions.unwrap_or_else(|| {
                     panic!(
@@ -510,15 +504,17 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            Def::Input(
-                which @ (RuntimeInput::RowPermutation { .. }
-                | RuntimeInput::Latents { .. }
-                | RuntimeInput::LaneVector { .. }
-                | RuntimeInput::Context { .. }
-                | RuntimeInput::AxisPositions { .. }),
-            ) => panic!("value {at} reads {which:?}, which this shell does not stage"),
             Def::Input(RuntimeInput::Grid) => self.voxel_seat(at).grid,
-            Def::Input(RuntimeInput::Voxels { .. }) => self.voxel_seat(at).payload,
+            Def::Input(RuntimeInput::Guest {
+                axis: poem_ir::InputAxis::Voxel,
+                ..
+            }) => self.voxel_seat(at).payload,
+            Def::Input(which @ RuntimeInput::RowPermutation { .. }) => {
+                panic!("value {at} reads {which:?}, which this shell does not stage")
+            }
+            Def::Input(RuntimeInput::Guest { id, .. }) => {
+                panic!("value {at} reads guest input {id}, which this shell does not stage")
+            }
             Def::Input(RuntimeInput::TokenGrid { .. }) => {
                 self.voxel_seat(at).token_grid.unwrap_or_else(|| {
                     panic!("value {at} reads the token side of the patchify pair, which this load carved none of")

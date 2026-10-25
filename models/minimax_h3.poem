@@ -220,23 +220,13 @@ def generative(m):
         "refine",
         index = index,
         streams = ["text"],
-        ports = [port("caption", "context", d.text_dim, ["text"], at = 0)],
         readout = "hidden",
         readout_width = d.dim,
     ))
-    every = ["text", "video", "audio", "reference"]
     readings.append(reading(
         "denoise",
         index = index + 1,
-        streams = every,
-        ports = [
-            port("latents", "latents", VIDEO_FEATURES, ["video"], at = 0),
-            port("reference", "latents", VIDEO_FEATURES, ["reference"], at = 1),
-            port("audio", "latents", AUDIO_CHANNELS, ["audio"], at = 2),
-            port("context", "latents", d.dim, ["text"], at = 3),
-            port("timestep", "lane_vector", TIMESTEP_SLOTS, every, at = 0),
-            port("positions", "axis_positions", ROPE_AXES, every, at = 0),
-        ],
+        streams = ["text", "video", "audio", "reference"],
         readout = "velocity",
         readout_width = VIDEO_FEATURES,
     ))
@@ -257,7 +247,6 @@ def generative(m):
             pinned_sigmas = shifted_sigmas(VIDEO_SHIFT, STEPS),
             stream_shifts = [("video", VIDEO_SHIFT), ("audio", AUDIO_SHIFT), ("reference", 1.0)],
         ),
-        max_rows = 131072 if m.te != None else 4096,
     )
 
 # How a MiniMax H3 checkpoint is laid out: a pipeline's components under
@@ -501,7 +490,7 @@ def run_mlp(x, f, d):
 
 def refine(arm, m):
     d = m.dims
-    x = run_linear(m.dit.condition, arm.context(0, d.text_dim))
+    x = run_linear(m.dit.condition, arm.input("caption", dtype.bf16, "row", d.text_dim))
     geom = struct(perm = arm.row_permutation(), csr = arm.lane_indptr(), mask = unmasked())
     last = len(m.dit.refine) - 1
 
@@ -531,11 +520,11 @@ def denoise(arm, m):
     audio, reference = rest.on(fact.stream("audio")), rest.on(~fact.stream("audio"))
 
     lanes = arm.request_of_token()
-    positions = arm.axis_positions(0, m.rope_axes)
+    positions = arm.input("positions", dtype.f32, "row", m.rope_axes)
     joint = struct(perm = arm.row_permutation(), csr = arm.group_indptr(), mask = group_block_diagonal())
 
     def side(rows, stream):
-        t = column(rows.lane_vector(0, m.timestep_slots), SLOT[stream], m.timestep_slots)
+        t = column(rows.input("timestep", dtype.f32, "lane", m.timestep_slots), SLOT[stream], m.timestep_slots)
         e = ops.elemwise.sinusoid(t, d.t_freq, T_MAX_PERIOD, True, 1.0)
         e = run_linear(dit.t_out, ops.elemwise.silu(run_linear(dit.t_in, e)))
         return struct(stream = stream, stemb = ops.elemwise.silu(e))
@@ -547,12 +536,12 @@ def denoise(arm, m):
         side(reference, "reference"),
     ]
 
-    ctx = text.latents(3, d.dim, dtype.bf16)
+    ctx = text.input("context", dtype.bf16, "row", d.dim)
     ctx_perm = text.row_permutation()
     text_rows = ops.gather.unpack_rows(ops.gather.pack_rows(ctx, ctx_perm), ctx_perm)
-    video_rows = run_linear(dit.video_patch, video.latents(0, m.video_features, dtype.bf16))
-    audio_rows = run_linear(dit.audio_patch, audio.latents(2, m.audio_channels, dtype.bf16))
-    reference_rows = run_linear(dit.video_patch, reference.latents(1, m.video_features, dtype.bf16))
+    video_rows = run_linear(dit.video_patch, video.input("latents", dtype.bf16, "row", m.video_features))
+    audio_rows = run_linear(dit.audio_patch, audio.input("audio", dtype.bf16, "row", m.audio_channels))
+    reference_rows = run_linear(dit.video_patch, reference.input("reference", dtype.bf16, "row", m.video_features))
     x = merge([text_rows, video_rows, audio_rows, reference_rows])
 
     def block(l, b, x):

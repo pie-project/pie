@@ -9,14 +9,14 @@
 //! A class's lanes are synthetic as engine-cuda's arming lanes are
 //! (`serve/arming.rs`): a representative request of the class (its word,
 //! mask, adapter, drafts, score capture), zero tokens, fresh pages; a class
-//! that reads float ports is fed zero cells of each port's width, a class
+//! that reads guest inputs is fed zero cells of each input's width, a class
 //! over the voxel axis one clip, a class that lands media one image.
 
 use engine::fire::{Mask, Masking};
 use poem_ir::{Facts, Request, Stream};
 
 use super::{Lane, Media, PATCH_ROUTE_DROP, Seated, Shell};
-use crate::dit::{Clips, PortCell, SelfCond};
+use crate::dit::{Clips, InputCell};
 use crate::error::Result;
 
 /// One dry fire: which class, at how many rows, and what came of it.
@@ -92,8 +92,7 @@ struct Owned {
     adapter: Option<u32>,
     captures: bool,
     stream: u8,
-    ports: Vec<(engine::fire::PortKind, u8, Vec<f32>)>,
-    self_cond: Option<(u32, Vec<i32>, Vec<f32>)>,
+    inputs: Vec<(u32, Vec<u8>)>,
     clip: Option<([u32; 3], Vec<u8>)>,
     media: Option<OwnedMedia>,
     kv_less: bool,
@@ -198,16 +197,12 @@ impl Shell {
         let owned: Vec<Owned> = (0..lanes)
             .map(|at| self.dry_lane(class, request, word, rows, at))
             .collect::<Result<_>>()?;
-        let cells: Vec<Vec<PortCell<'_>>> = owned
+        let cells: Vec<Vec<InputCell<'_>>> = owned
             .iter()
             .map(|lane| {
-                lane.ports
+                lane.inputs
                     .iter()
-                    .map(|(kind, port, values)| PortCell {
-                        kind: *kind,
-                        port: *port,
-                        values,
-                    })
+                    .map(|(id, bytes)| InputCell { id: *id, bytes })
                     .collect()
             })
             .collect();
@@ -225,18 +220,9 @@ impl Shell {
             seated.adapter = lane_owned.adapter;
             seated.captures_scores = lane_owned.captures;
             seated.stream = lane_owned.stream;
-            seated.ports = &cells[at];
+            seated.inputs = &cells[at];
             seated.kv_less = lane_owned.kv_less;
             seated.readout = lane_owned.readout.as_deref();
-            seated.self_cond =
-                lane_owned
-                    .self_cond
-                    .as_ref()
-                    .map(|(taps, rows, weights)| SelfCond {
-                        taps: *taps,
-                        rows,
-                        weights,
-                    });
             seated.media = lane_owned.media.as_ref().map(|m| Media {
                 rows: &m.rows,
                 patches: &m.patches,
@@ -302,19 +288,14 @@ impl Shell {
         } else {
             Vec::new()
         };
-        let ports = dit
-            .dry_ports(class)
+        let inputs = dit
+            .dry_inputs(class)
             .into_iter()
-            .map(|(kind, port, width, per_lane)| {
-                let n = if per_lane { 1 } else { rows } as usize * width as usize;
-                (kind, port, vec![0f32; n])
+            .map(|seat| {
+                let n = if seat.per_lane() { 1 } else { rows } as usize;
+                (seat.id, vec![0u8; n * seat.row_bytes() as usize])
             })
             .collect();
-        let taps = dit.dry_self_cond_taps();
-        let self_cond = (taps > 0 && request.denoise()).then(|| {
-            let n = rows as usize * taps as usize;
-            (taps, vec![0i32; n], vec![0f32; n])
-        });
         let media = if request.has_media() {
             self.dry_media(rows)
         } else {
@@ -334,8 +315,7 @@ impl Shell {
             captures: self.capturing.contains(class),
             readout: request.drafts_a_block().then(|| (0..rows).collect()),
             stream: request.stream().code(),
-            ports,
-            self_cond,
+            inputs,
             clip,
             media,
             kv_less: !self.dry_class_has_kv(class),

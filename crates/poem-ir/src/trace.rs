@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::guard::Guard;
 use crate::ops::Operation;
-use crate::value::{Dtype, ValueDecl, ValueId};
+use crate::value::{Dtype, InputAxis, ValueDecl, ValueId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Platform {
@@ -182,6 +182,39 @@ pub struct Trace {
     /// The facts the trace's guards branch on, and the bits each takes.
     #[serde(default)]
     pub facts: crate::Facts,
+    /// The inputs the model names, by [`crate::RuntimeInput::Guest`] id.
+    #[serde(default)]
+    pub inputs: Vec<GuestInput>,
+}
+
+/// An input a model names, which its guest binds a channel to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuestInput {
+    pub name: String,
+    /// The rows a lane binding it carries, when the model fixes them.
+    #[serde(default)]
+    pub rows: Option<u32>,
+}
+
+/// A guest input as a loaded model reads it: its declaration, and the lane
+/// words (under `mask`) whose class reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputDecl {
+    pub name: String,
+    pub axis: InputAxis,
+    pub width: u32,
+    pub dtype: Dtype,
+    pub rows: Option<u32>,
+    pub mask: u64,
+    pub readers: Vec<u64>,
+}
+
+impl InputDecl {
+    /// Whether a lane of `word` runs a class that reads this input.
+    #[must_use]
+    pub fn read_by(&self, word: u64) -> bool {
+        self.readers.contains(&(word & self.mask))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

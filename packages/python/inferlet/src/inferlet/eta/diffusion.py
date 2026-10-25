@@ -1,8 +1,7 @@
 """
 `inferlet.eta.diffusion` — the diffusion pass's reading (`Mode`) and the
 reference sampler pieces, a port of `inferlet::eta::diffusion`. The pass
-itself is `ForwardPass(ForwardKind.DIFFUSION)` with `canvas(Mode.DENOISE)`
-and `self_conditioning(rows, weights)`.
+itself is `ForwardPass(ForwardKind.DIFFUSION)` with `canvas(Mode.DENOISE)`.
 """
 
 from __future__ import annotations

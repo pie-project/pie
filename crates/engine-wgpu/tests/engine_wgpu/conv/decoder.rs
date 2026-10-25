@@ -69,7 +69,13 @@ impl ForwardHybrid for Decoder {
 
     fn forward(&self, inputs: Input) -> Value {
         let g = inputs.grid();
-        let x = inputs.voxels(0, C_IN as u32, Dtype::Bf16);
+        let x = inputs.input(
+            "voxels",
+            Dtype::Bf16,
+            poem_ir::InputAxis::Voxel,
+            C_IN as u32,
+            None,
+        );
         let (h, g1) = conv::conv3d(
             &x,
             &g,
