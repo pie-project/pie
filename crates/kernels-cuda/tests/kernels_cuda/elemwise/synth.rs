@@ -1,17 +1,21 @@
 #![cfg(feature = "cuda")]
 
 //! A generated row kernel (`kernels_cuda::synth`) lands what the region it
-//! was generated from states: the printed bodies of the regions poem lowers,
-//! against the chain's own ops fired unfused, and the frame's hand residual
-//! norm body passed through the same path, against the frame.
+//! was generated from states (`super::within`'s contract): the printed
+//! bodies of the regions poem lowers against the interpreter, and the
+//! frame's hand residual norm body passed through the same path, against
+//! the frame's own fire of it.
 
 use crate::common::attn_ref::{ten, tuned};
 use crate::common::{Gpu, Lcg, captured, forget, from_bf16, replay, to_bf16};
 use dtype::Dtype::Bf16;
-use kernels_cuda::elemwise::{frame, pointwise};
+use kernels_cuda::elemwise::frame;
 use kernels_cuda::jit::Ctx;
 use kernels_cuda::synth::{self, Body, In, Out, Plane, Region};
+use kernels_ir::interp::Arg;
 use kernels_ir::{Binary, Literal, Op, Reduce, Shape, Unary};
+
+use super::within::{EXACT, NORM, assert_within, deterministic, reference, row_of, widened};
 
 const EPS: f32 = 1e-6;
 
@@ -46,7 +50,7 @@ fn residual_norm(width: usize) -> Region {
             Op::Binary(Binary::Mul, 11, 2),
         ],
         results: vec![3, 12],
-        rounds: vec![],
+        rounds: vec![(3, Bf16), (12, Bf16)],
     }
 }
 
@@ -79,6 +83,8 @@ fn hand_body() -> Body {
         hash: fnv1a64(source.as_bytes()),
         source,
         passes: 2,
+        shares: false,
+        table: 0,
     }
 }
 
@@ -195,75 +201,69 @@ fn the_hand_body_through_synth_lands_the_frames_bits() {
     }
 }
 
-/// The residual norm's region against its ops unfused (`residual_add`, then
-/// `rmsnorm`). The stream is the same sum and lands the same bits; the norm's
-/// threads split the row otherwise than the unfused norm's, so a sum of
-/// squares may differ in its last f32 bit and, through `rsqrt`, a normed
-/// element by one bf16 ulp, which is what this holds it to.
+/// The residual norm's region against the interpreter: the stream is IEEE
+/// adds and lands the reference's bits; the norm sums its squares in the
+/// frame's order, within [`NORM`] of the reference; two fires land the same
+/// bits. The unfused ops are shown beside it, not held to it.
 #[test]
-fn a_residual_norms_region_lands_its_unfused_stream_and_their_norm_within_an_ulp() {
+fn a_residual_norms_region_lands_its_math() {
     for width in WIDTHS {
-        let body = body_of(&residual_norm(width), &[2]);
-        let kernel = loaded(&body, 3, 2, width);
+        let region = residual_norm(width);
+        let kernel = loaded(&body_of(&region, &[2]), 3, 2, width);
         for rows in ROWS {
             let n = rows * width;
             let (planes, w) = draw(rows, width, 2);
-            let mut gpu = Gpu::open();
-            let (x, y, w, h, out) = (
-                gpu.up(&planes[0]),
-                gpu.up(&planes[1]),
-                gpu.up(&w),
-                gpu.zeros(n * 2),
-                gpu.zeros(n * 2),
-            );
-            let plane = |at| Plane::rows(&ten(at, rows, width, Bf16));
-            kernel
-                .fire(
-                    &gpu.ctx(),
-                    &[plane(x), plane(y), Plane::shared(&ten(w, 1, width, Bf16))],
-                    &[plane(h), plane(out)],
-                    rows as u32,
-                )
-                .expect("the printed body fires");
-            gpu.sync();
-            let (y_want, out_want) = residual_norm_by(super::frame::unfused, rows, width);
-            let case = format!("{rows} rows of {width}");
-            assert!(gpu.down::<u16>(h, n) == y_want, "{case}: the stream");
-            let got = gpu.down::<u16>(out, n);
-            let apart: Vec<(usize, u16, u16)> = got
-                .iter()
-                .zip(&out_want)
-                .enumerate()
-                .filter(|(_, (a, b))| a != b)
-                .map(|(at, (a, b))| (at, *a, *b))
-                .collect();
-            for &(at, a, b) in &apart {
-                assert!(
-                    a.abs_diff(b) <= 1,
-                    "{case}: normed element {at} is {} and the unfused ops' {}",
-                    from_bf16(a),
-                    from_bf16(b)
+            let fire = || {
+                let mut gpu = Gpu::open();
+                let (x, y, w, h, out) = (
+                    gpu.up(&planes[0]),
+                    gpu.up(&planes[1]),
+                    gpu.up(&w),
+                    gpu.zeros(n * 2),
+                    gpu.zeros(n * 2),
                 );
-            }
-            eprintln!(
-                "{case}: {} of {n} normed elements an ulp apart",
-                apart.len()
-            );
+                let plane = |at| Plane::rows(&ten(at, rows, width, Bf16));
+                kernel
+                    .fire(
+                        &gpu.ctx(),
+                        &[plane(x), plane(y), Plane::shared(&ten(w, 1, width, Bf16))],
+                        &[plane(h), plane(out)],
+                        rows as u32,
+                    )
+                    .expect("the printed body fires");
+                gpu.sync();
+                (gpu.down::<u16>(h, n), gpu.down::<u16>(out, n))
+            };
+            let (h, out) = fire();
+            let case = format!("{rows} rows of {width}");
+            deterministic(&case, &out, &fire().1);
+            let want = reference(&region, rows, |r| {
+                vec![
+                    row_of(&planes[0], r, width),
+                    row_of(&planes[1], r, width),
+                    Arg::Row(widened(&w)),
+                ]
+            });
+            assert_within(&format!("{case}: the stream"), &h, &want[0], EXACT);
+            assert_within(&format!("{case}: the normed row"), &out, &want[1], NORM);
+            let (_, unfused) = residual_norm_by(super::frame::unfused, rows, width);
+            let apart = out.iter().zip(&unfused).filter(|(a, b)| a != b).count();
+            eprintln!("{case}: {apart} of {n} normed elements apart from the unfused ops");
         }
     }
 }
 
-/// `z = x + y` and `o = z * g`, both leaving: what the hand `add` and `mul`
-/// land, bit for bit, since the body multiplies the sum as stored.
+/// `z = x + y` and `o = z * g`, both leaving: IEEE ops, the reference's
+/// bits, the product of the sum as stored.
 #[test]
-fn an_add_then_mul_region_lands_the_hand_kernels_bits() {
+fn an_add_then_mul_region_lands_its_math() {
     for width in WIDTHS {
         let region = Region {
             width: w(width),
             params: vec![Shape::Row; 3],
             ops: vec![Op::Binary(Binary::Add, 0, 1), Op::Binary(Binary::Mul, 3, 2)],
             results: vec![3, 4],
-            rounds: vec![],
+            rounds: vec![(3, Bf16)],
         };
         let kernel = loaded(&body_of(&region, &[]), 3, 2, width);
         for rows in ROWS {
@@ -272,12 +272,10 @@ fn an_add_then_mul_region_lands_the_hand_kernels_bits() {
             let mut gpu = Gpu::open();
             let ins: Vec<u64> = planes.iter().map(|p| gpu.up(p)).collect();
             let (z, o) = (gpu.zeros(n * 2), gpu.zeros(n * 2));
-            let (z_hand, o_hand) = (gpu.zeros(n * 2), gpu.zeros(n * 2));
             let t = |at| ten(at, rows, width, Bf16);
-            let ctx = hand(&gpu);
             kernel
                 .fire(
-                    &ctx,
+                    &gpu.ctx(),
                     &[
                         Plane::rows(&t(ins[0])),
                         Plane::rows(&t(ins[1])),
@@ -287,17 +285,22 @@ fn an_add_then_mul_region_lands_the_hand_kernels_bits() {
                     rows as u32,
                 )
                 .expect("the printed body fires");
-            pointwise::add(&ctx, t(ins[0]), t(ins[1]), &mut t(z_hand)).expect("add fires");
-            pointwise::mul(&ctx, t(z_hand), t(ins[2]), &mut t(o_hand)).expect("mul fires");
             gpu.sync();
+            let want = reference(&region, rows, |r| {
+                (0..3).map(|k| row_of(&planes[k], r, width)).collect()
+            });
             let case = format!("{rows} rows of {width}");
-            assert!(
-                gpu.down::<u16>(z, n) == gpu.down::<u16>(z_hand, n),
-                "{case}: the sum"
+            assert_within(
+                &format!("{case}: the sum"),
+                &gpu.down::<u16>(z, n),
+                &want[0],
+                EXACT,
             );
-            assert!(
-                gpu.down::<u16>(o, n) == gpu.down::<u16>(o_hand, n),
-                "{case}: the product"
+            assert_within(
+                &format!("{case}: the product"),
+                &gpu.down::<u16>(o, n),
+                &want[1],
+                EXACT,
             );
         }
     }

@@ -20,10 +20,10 @@
 //!   add alone, so it never leaves, but the add reads it rounded, as the
 //!   unfused add does.
 //!
-//! So each region lands its unfused ops' bits but where a row's threads
-//! sum its squares otherwise than the unfused norm's: a sum's tree differs
-//! in its last bit and a normed element by an ulp. Gemma 4's layer scale, a
-//! weight of one element, is the region's scalar parameter.
+//! So each region is held to its math by the interpreter (`super::within`):
+//! its sums of squares in the frame's own order, within a norm's ulp. Gemma
+//! 4's layer scale, a weight of one element, is the region's scalar
+//! parameter. The unfused ops are set beside it, not held to it.
 
 use crate::common::attn_ref::{ten, tuned};
 use crate::common::{Gpu, Lcg, captured, forget, from_bf16, replay, to_bf16};
@@ -34,6 +34,8 @@ use kernels_cuda::synth::{self, In, Out, Plane, Region, Synthesized};
 use kernels_cuda::tuning::Tuning;
 use kernels_ir::interp::{self, Arg};
 use kernels_ir::{Binary, Literal, Op, Reduce, Shape, Unary};
+
+use super::within::{EXACT, NORM, apart, assert_within, deterministic, widened};
 
 const EPS: f32 = 1e-6;
 
@@ -415,27 +417,6 @@ fn fire_region(
         .expect("the generated kernel fires");
 }
 
-/// How far apart `a` and `b` are, in bf16 ulps at the scale of the larger
-/// of them, or of a half where both are smaller: the chain's rows are of
-/// order one, and a sum that cancels to near zero would count a rounding of
-/// its addends in the sum's own, far finer, ulps.
-fn ulps(a: u16, b: u16) -> f32 {
-    let (a, b) = (from_bf16(a), from_bf16(b));
-    let scale = a.abs().max(b.abs()).max(0.5);
-    let spacing = 2f32.powi(scale.log2().floor() as i32 - 7);
-    (a - b).abs() / spacing
-}
-
-/// The elements of `got` not `want`, and the most ulps apart one is.
-fn apart(got: &[u16], want: &[u16]) -> (usize, f32) {
-    got.iter()
-        .zip(want)
-        .filter(|(a, b)| a != b)
-        .fold((0, 0.0), |(n, most), (a, b)| {
-            (n + 1, most.max(ulps(*a, *b)))
-        })
-}
-
 /// What one draw lands: the stream and the chain's last result.
 struct Landed {
     stream: Option<Vec<u16>>,
@@ -543,10 +524,10 @@ fn math(chain: Chain, rows: usize, width: usize) -> Landed {
 
 /// Every chain, at a decode's and a prefill's rows and a ragged count:
 /// each generated kernel lands its region's math by the interpreter within
-/// an ulp (its sums of squares are added in another order), and is set
-/// against the chain's unfused ops, element for element.
+/// its tolerance (`super::within`), and two fires land the same bits. The
+/// chain's unfused ops are shown beside it, not held to it.
 #[test]
-fn each_chains_region_lands_its_math_and_its_unfused_ops() {
+fn each_chains_region_lands_its_math() {
     let chains = Chain::TIMED.into_iter().chain([Chain::ResidualNorm {
         plus_one: true,
         stream: true,
@@ -556,6 +537,8 @@ fn each_chains_region_lands_its_math_and_its_unfused_ops() {
             for rows in [1usize, 7, 64] {
                 let case = format!("{} ({chain:?}): {rows} rows of {width}", chain.name());
                 let region = land(chain, rows, width, None);
+                let again = land(chain, rows, width, None);
+                deterministic(&case, &region.out, &again.out);
                 let math = math(chain, rows, width);
                 for (what, got, want) in [
                     ("stream", region.stream.as_deref(), math.stream.as_deref()),
@@ -568,47 +551,24 @@ fn each_chains_region_lands_its_math_and_its_unfused_ops() {
                     let (Some(got), Some(want)) = (got, want) else {
                         continue;
                     };
-                    // `t` an ulp of itself apart (the interpreter's
-                    // `1 / sqrt` is not `rsqrtf`) is a sum up to four of the
-                    // sum's scale apart where it cancels, and a post norm
-                    // scales that up again: a sanity bound; the unfused
-                    // ops' bits are the test
+                    // The stream of a residual norm is IEEE adds; a norm and
+                    // fold's sum joins a normed row an ulp of itself apart
+                    // (`NORM`), up to four of the sum's own ulps where it
+                    // cancels, and a post norm scales that up again.
                     let within = match (chain, what) {
+                        (Chain::ResidualNorm { .. }, "stream") => EXACT,
                         (Chain::NormResidual { .. } | Chain::ScaledNormResidual, _) => 8.0,
-                        _ => 1.0,
+                        _ => NORM,
                     };
-                    let (_, most) = apart(got, want);
-                    assert!(
-                        most <= within,
-                        "{case}: the {what} is {most} ulps from its math at worst"
-                    );
+                    assert_within(&format!("{case}: the {what}"), got, &widened(want), within);
                 }
                 for knobs in Knobs::BOTH {
                     let unfused = land(chain, rows, width, Some(knobs));
-                    let stream = region
-                        .stream
-                        .as_deref()
-                        .zip(unfused.stream.as_deref())
-                        .map(|(got, want)| apart(got, want));
-                    let (n, most) = apart(&region.out, &unfused.out);
+                    let (n, most) = apart(&region.out, &widened(&unfused.out));
                     eprintln!(
-                        "{case}, unfused {knobs:?}: stream (apart, ulps) {stream:?}, result {n} of {} \
-                         apart, {most} ulps at most",
+                        "{case}, unfused {knobs:?}: the result {n} of {} apart, {most} ulps at most",
                         rows * width
                     );
-                    // The unfused ops' bits but where a sum of squares
-                    // lands in its last bit apart: a norm an ulp apart, and
-                    // the sum a norm's row joins (or the norm after it) an
-                    // ulp of its addends apart, about once in a million.
-                    let total = rows * width;
-                    for (what, apart) in [("stream", stream), ("result", Some((n, most)))] {
-                        let Some((n, most)) = apart else { continue };
-                        assert!(
-                            n * 10_000 <= total.max(10_000) && most <= 2.0,
-                            "{case}, unfused {knobs:?}: {n} of {total} {what} elements apart, \
-                             {most} ulps at most"
-                        );
-                    }
                 }
             }
         }
