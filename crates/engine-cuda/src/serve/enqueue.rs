@@ -178,8 +178,8 @@ impl Shell {
             seq,
         };
         super::btrace::mark("prepare_tail");
-        fire.prologue(p)?;
-        super::btrace::mark("prologue");
+        fire.gate(p)?;
+        super::btrace::mark("gate");
         let staged = fire.stage(p, slot)?;
         super::btrace::mark("stage");
         fire.route(p, &staged)?;
@@ -253,34 +253,37 @@ struct Staged {
     paging: Paging,
 }
 
-impl FireCtx<'_> {
-    fn prologue(&mut self, p: &Prepared<'_>) -> Result<()> {
-        let mut verdicts: Vec<(usize, Fired)> = Vec::new();
-        // A prologue runs, and commits, before the fire stages its inputs:
-        // the forward reads what it put. It mints against the cursors
-        // airborne fires predicted, as an epilogue does: only what has
-        // landed settles here.
+impl Shell {
+    /// Runs, and commits, the prologues of `attachments` before the fire
+    /// resolves its descriptor ports and stages its inputs: both read what
+    /// a prologue put. It mints against the cursors airborne fires
+    /// predicted, as an epilogue does: only what has landed settles here.
+    /// A port the host reads off a channel a prologue put waits for it to
+    /// land.
+    pub(super) fn prologue(&mut self, attachments: &[super::Attached]) -> Result<()> {
         let runs =
             |a: &&super::Attached| !a.adapter_only && self.programs.prologue_runs(a.instance);
-        let prologues: Vec<super::Attached> = p.attachments.iter().filter(runs).copied().collect();
-        if !prologues.is_empty() {
-            reap_guest_fires(
-                self.programs,
-                self.owed,
-                self.airborne,
-                self.spare_events,
-                "enqueue.prologue",
-                Reap::Landed,
-            )?;
+        let prologues: Vec<super::Attached> = attachments.iter().filter(runs).copied().collect();
+        if prologues.is_empty() {
+            return Ok(());
         }
+        reap_guest_fires(
+            &mut self.programs,
+            &mut self.owed,
+            &self.airborne,
+            &mut self.spare_events,
+            "prepare.prologue",
+            Reap::Landed,
+        )?;
+        let mut verdicts: Vec<(usize, Fired)> = Vec::new();
         let mut launched = AirborneFires::default();
-        for (at, attached) in p.attachments.iter().enumerate() {
+        for (at, attached) in attachments.iter().enumerate() {
             if !prologues.contains(attached) {
                 continue;
             }
             if let Some(fired) = launched.stage(
-                self.device,
-                self.programs,
+                &self.device,
+                &mut self.programs,
                 at,
                 attached.instance,
                 Attach::Prologue,
@@ -288,8 +291,36 @@ impl FireCtx<'_> {
                 verdicts.push((at, fired));
             }
         }
-        launched.fly(self.device, self.programs)?;
+        launched.fly(&self.device, &mut self.programs)?;
+        if prologues
+            .iter()
+            .any(|attached| self.programs.resolves_prologue_put(attached.instance))
+        {
+            self.device.synchronize()?;
+        }
+        // The lanes' commits gate the body on the device, so the host waits on
+        // none of them: their verdicts settle with the step, ahead of its
+        // epilogues'.
+        if let Some(batch) = launched.defer(
+            &self.device,
+            &mut self.programs,
+            &mut self.spare_events,
+            self.airborne.next_seq(),
+            &mut verdicts,
+        )? {
+            self.owed.push_back(batch);
+        }
+        for (at, fired) in verdicts {
+            committed_or(fired, attachments[at].instance, "prologue")?;
+        }
+        Ok(())
+    }
+}
 
+impl FireCtx<'_> {
+    /// Gates each lane of the fire on the commit of its prologue, which
+    /// [`Shell::prologue`] ran before the fire resolved its ports.
+    fn gate(&mut self, p: &Prepared<'_>) -> Result<()> {
         let lane_count = p.composition.lane_count();
         if p.rs.predicated || p.rs.truncates {
             let mut commits: Vec<u64> = vec![self.predicate.always(); lane_count as usize];
@@ -298,7 +329,10 @@ impl FireCtx<'_> {
                     commits[at] = self.predicate.never();
                 }
             }
-            for attached in &prologues {
+            for attached in p.attachments {
+                if attached.adapter_only || !self.programs.prologue_runs(attached.instance) {
+                    continue;
+                }
                 let Some(&lane) = p.rs.order.get(attached.lane as usize) else {
                     continue;
                 };
@@ -321,22 +355,6 @@ impl FireCtx<'_> {
                 )
                 .map_err(Fault::from)?;
             }
-        }
-
-        // The lanes' commits gate the body on the device, so the host waits on
-        // none of them: their verdicts settle with the step, ahead of its
-        // epilogues'.
-        if let Some(batch) = launched.defer(
-            self.device,
-            self.programs,
-            self.spare_events,
-            self.seq,
-            &mut verdicts,
-        )? {
-            self.owed.push_back(batch);
-        }
-        for (at, fired) in verdicts {
-            committed_or(fired, p.attachments[at].instance, "prologue")?;
         }
         Ok(())
     }

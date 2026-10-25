@@ -568,23 +568,41 @@ impl Session {
         })
     }
 
-    /// Shared rings whose cells the host reads to resolve descriptor ports under
-    /// `class` ([`Self::envelope`]); not the tokens' ring where the device copies
+    /// Channels whose cells the host reads to resolve descriptor ports under
+    /// `class` ([`Self::envelope`]); not the tokens' where the device copies
     /// them ([`Self::token_device_source`]).
-    pub fn host_resolved_rings(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<usize> {
+    fn host_resolved_channels(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<u32> {
         let tokens_on_device = self.token_device_source(plan, class).is_some();
         plan.package
             .ports
             .iter()
             .filter(|binding| !binding.is_const && engine::ports::resolves(class, binding.port))
             .filter(|binding| !(binding.port == Port::EmbedTokens && tokens_on_device))
-            .filter_map(|binding| {
+            .map(|binding| binding.channel)
+            .collect()
+    }
+
+    /// Shared rings whose cells the host reads to resolve descriptor ports
+    /// under `class`.
+    pub fn host_resolved_rings(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<usize> {
+        self.host_resolved_channels(plan, class)
+            .into_iter()
+            .filter_map(|channel| {
                 self.rings
-                    .endpoint(binding.channel as usize)
+                    .endpoint(channel as usize)
                     .filter(|endpoint| endpoint.role() == HostRole::None)
                     .map(|endpoint| Arc::as_ptr(endpoint) as usize)
             })
             .collect()
+    }
+
+    /// Whether the host resolves a descriptor port under `class` off a
+    /// channel the prologue puts: it reads that cell once the prologue lands.
+    #[must_use]
+    pub fn resolves_prologue_put(&self, plan: &ExecPlan, class: GeometryClass) -> bool {
+        self.host_resolved_channels(plan, class)
+            .into_iter()
+            .any(|channel| plan.puts_channel(channel, Attach::Prologue))
     }
 
     fn mint(
