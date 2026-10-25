@@ -308,9 +308,16 @@ impl Block<'_> {
         let stop = Channel::new([1], dtype::bool).named("stop");
         let mean_out = Channel::new([1], dtype::f32).named("mean_entropy");
         let tap_ids_out =
-            (taps_used > 0).then(|| Channel::new([length, taps_used], dtype::u32).named("tap_ids"));
+            (taps_used > 0).then(|| Channel::new([length, taps_used], dtype::i32).named("tap_ids"));
         let tap_weights_out = (taps_used > 0)
             .then(|| Channel::new([length, taps_used], dtype::f32).named("tap_weights"));
+        // The model's self-conditioning inputs, at its full tap width:
+        // zeros (no signal) until the host `set`s a step's taps.
+        let cells = n * taps_width as usize;
+        let self_cond_ids =
+            Channel::from_shaped([length, taps_width], vec![0i32; cells]).named("self_cond_ids");
+        let self_cond_weights =
+            Channel::from_shaped([length, taps_width], vec![0f32; cells]).named("self_cond_weights");
 
         let fwd = ForwardPass::new();
         fwd.canvas(Mode::Denoise)?;
@@ -323,6 +330,10 @@ impl Block<'_> {
             },
         )?;
         fwd.readout(&readout)?;
+        fwd.input("self_cond_ids", &self_cond_ids)
+            .context("bind self_cond_ids")?;
+        fwd.input("self_cond_weights", &self_cond_weights)
+            .context("bind self_cond_weights")?;
         {
             let (tap_ids_out, tap_weights_out) = (tap_ids_out.clone(), tap_weights_out.clone());
             fwd.epilogue(move || {
@@ -464,7 +475,7 @@ impl Block<'_> {
                     let tap_weights =
                         &exp(&top_vals - &broadcast(reshape(&m, [length, 1]), [length, taps_used]))
                             / &broadcast(reshape(&z, [length, 1]), [length, taps_used]);
-                    ids_out.put(&tap_ids);
+                    ids_out.put(cast(&tap_ids, dtype::i32));
                     weights_out.put(&tap_weights);
                 }
                 canvas_out.put(&next);
@@ -514,7 +525,7 @@ impl Block<'_> {
             mean = mean_out.take_host::<f32>().await.context("entropy drain")?;
             let taps_data = match (&tap_ids_out, &tap_weights_out) {
                 (Some(ids), Some(weights)) => Some((
-                    ids.take_host::<Vec<u32>>().await.context("tap ids drain")?,
+                    ids.take_host::<Vec<i32>>().await.context("tap ids drain")?,
                     weights
                         .take_host::<Vec<f32>>()
                         .await
@@ -534,11 +545,11 @@ impl Block<'_> {
                 // The host wants the model's full width per row; pad the
                 // narrower staging with zero-weight taps.
                 if taps_used == taps_width {
-                    fwd.self_conditioning(&ids, &weights)
-                        .context("stage self-conditioning")?;
+                    self_cond_ids.set(ids).context("set self_cond_ids")?;
+                    self_cond_weights.set(weights).context("set self_cond_weights")?;
                 } else {
                     let (w, u) = (taps_width as usize, taps_used as usize);
-                    let mut full_ids = vec![0u32; n * w];
+                    let mut full_ids = vec![0i32; n * w];
                     let mut full_weights = vec![0f32; n * w];
                     for row in 0..n {
                         full_ids[row * w..row * w + u]
@@ -546,8 +557,10 @@ impl Block<'_> {
                         full_weights[row * w..row * w + u]
                             .copy_from_slice(&weights[row * u..(row + 1) * u]);
                     }
-                    fwd.self_conditioning(&full_ids, &full_weights)
-                        .context("stage self-conditioning")?;
+                    self_cond_ids.set(full_ids).context("set self_cond_ids")?;
+                    self_cond_weights
+                        .set(full_weights)
+                        .context("set self_cond_weights")?;
                 }
             }
         }
@@ -560,6 +573,14 @@ impl Block<'_> {
     }
 }
 
+/// The self-conditioning taps per canvas row: the width of the denoise
+/// lane's `self_cond_ids` input.
+fn self_cond_taps() -> Result<u32> {
+    let lane = model::lane(&[("canvas".into(), "denoise".into())])?;
+    let input = lane.inputs.iter().find(|input| input.name == "self_cond_ids");
+    Ok(input.ok_or("the denoise lane reads no `self_cond_ids` input")?.width)
+}
+
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
     if model::pass_kind() != model::ForwardKind::Diffusion {
@@ -569,7 +590,7 @@ async fn main(input: Input) -> Result<Output> {
     }
     let shape = model::canvas().ok_or("a diffusion model states its canvas")?;
     let length = shape.length;
-    let taps_width = shape.self_cond_taps;
+    let taps_width = self_cond_taps()?;
     let taps_used = input.taps.unwrap_or(taps_width).min(taps_width);
     // The canvas attends both ways, so the runtime cannot cut it: one fire reads every row.
     let readable = max_readout_rows(model::ReadoutKind::Logits);

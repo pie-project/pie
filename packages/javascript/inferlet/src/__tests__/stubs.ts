@@ -26,7 +26,15 @@ export const modelStub = {
   submitDeadlineUs: () => 50_000n,
   runAheadWindow: () => 4,
   draftBlock: () => undefined,
-  canvas: () => ({ length: 32, hidden: 2560, selfCondTaps: 4 }),
+  canvas: () => ({ length: 32, hidden: 2560 }),
+  lane: (switches: Array<[string, string]>) => ({
+    inputs: switches.some(([k, v]) => k === 'canvas' && v === 'denoise')
+      ? [{ name: 'self_cond_ids', axis: 'row', width: 4, dtype: 'i32' }]
+      : [],
+    readsKv: true,
+    embeds: true,
+    readout: { kind: 'logits', width: 151936 },
+  }),
 };
 
 // ── pie:inferlet/tokenizer ──────────────────────────────────────────────────
@@ -153,12 +161,8 @@ export class ForwardPassStub {
     this.spans = [...spans];
   }
   mode: string | null = null;
-  selfCond: [number[], number[]] | null = null;
   canvas(mode: string) {
     this.mode = mode;
-  }
-  selfConditioning(rows: Uint32Array, weights: Float32Array) {
-    this.selfCond = [Array.from(rows), Array.from(weights)];
   }
   program(bytes: Uint8Array, channels: unknown[]) {
     this.programBytes = new Uint8Array(bytes);

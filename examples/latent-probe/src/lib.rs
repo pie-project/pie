@@ -1,12 +1,13 @@
-//! A probe of the float-port loop (imagegen design D1/D3/D4), on a model
+//! A probe of the float-input loop (imagegen design D1/D3/D4), on a model
 //! whose `readings()` declare a token-less reading with a velocity readout
 //! (the mini-DiT family, then every DiT).
 //!
-//! One `forward` pass in that reading, with no `embed` and no `state`:
-//! a `[rows, width]` f32 latent channel bound as `input("latents")`, a
-//! `[1]` timestep channel bound as `input("timestep")`, every other port
-//! the reading declares bound to a plausible constant (an axis-position
-//! grid, an encoded or zero context, unit lane vectors), and an epilogue
+//! One `forward` pass in that reading, on the stream whose lane reads
+//! `latents`, with no `embed` and no `state`: a `[rows, width]` f32 latent
+//! channel bound as `input("latents")`, a `[1]` timestep channel bound as
+//! `input("timestep")`, every other input that lane reads bound to a
+//! plausible constant (an axis-position grid for `positions`, ones for any
+//! other lane input, zeros for any other row input), and an epilogue
 //! that does the whole step on the device: fire 0 SEEDS the latent with a
 //! keyed Normal draw (the model's velocity over the zero cell is ignored),
 //! and every fire `k >= 1` integrates step `k - 1` of a flow schedule,
@@ -16,7 +17,7 @@
 //! one is the answer.
 //!
 //! It cannot check the model's arithmetic (that is the family's parity
-//! harness); it checks that the loop closes: the port feeds land, the
+//! harness); it checks that the loop closes: the input feeds land, the
 //! velocity comes back at the declared width, the loop-carried cells
 //! advance, and the final latent is finite.
 
@@ -33,8 +34,6 @@ struct Input {
     rows: u32,
     #[serde(default = "default_seed")]
     seed: u32,
-    #[serde(default)]
-    prompt: Option<String>,
 }
 
 fn default_steps() -> u32 {
@@ -55,8 +54,8 @@ struct Output {
     steps: u32,
     /// The schedule stepped, `steps + 1` sigmas ending in 0.
     sigmas: Vec<f32>,
-    /// Which ports were bound, in the reading's order.
-    ports: Vec<String>,
+    /// Which inputs were bound, `latents` first.
+    inputs: Vec<String>,
     /// Mean and standard deviation of the final latent.
     mean: f32,
     std: f32,
@@ -122,11 +121,17 @@ async fn main(input: Input) -> Result<Output> {
             reading.name, reading.readout
         ));
     }
-    let latents = reading
-        .ports
+    // The lane that carries the latent: the first of the reading's streams
+    // whose lane reads `latents`.
+    let (stream, lane, latents) = reading
+        .streams
         .iter()
-        .find(|port| port.kind == model::PortKind::Latents)
-        .ok_or("a token-less reading declares a latents port")?;
+        .find_map(|&stream| {
+            let lane = model::lane_of(&reading.name, stream).ok()?;
+            let latents = lane.inputs.iter().find(|i| i.name == "latents")?.clone();
+            Some((stream, lane, latents))
+        })
+        .ok_or_else(|| format!("no lane of reading `{}` reads `latents`", reading.name))?;
     let rows = input.rows.max(1);
     let max_rows = model::max_latent_rows();
     if max_rows > 0 && rows > max_rows {
@@ -174,58 +179,48 @@ async fn main(input: Input) -> Result<Output> {
 
     let pass = ForwardPass::new();
     pass.reading(&reading.name)?;
-    pass.input(&latents.name, &x)?;
+    pass.stream(stream)?;
+    pass.input("latents", &x)?;
     let mut bound = vec![latents.name.clone()];
-    let mut timestep_bound = false;
     let mut extras: Vec<Channel> = Vec::new();
-    for port in &reading.ports {
-        if port.name == latents.name {
+    if !lane.inputs.iter().any(|i| i.name == "timestep") {
+        return Err(format!(
+            "reading `{}`'s `{}` lane reads no `timestep`",
+            reading.name,
+            model::stream_name(stream)
+        ));
+    }
+    pass.input("timestep", &t)?;
+    bound.push("timestep".to_string());
+    for decl in &lane.inputs {
+        if decl.name == "latents" || decl.name == "timestep" {
             continue;
         }
-        let ch = match port.kind {
-            model::PortKind::LaneVector if !timestep_bound && port.width == 1 => {
-                // The first lane vector is the timestep; the schedule
-                // advances it.
-                timestep_bound = true;
-                t
+        let ch = match (decl.name.as_str(), decl.axis) {
+            ("positions", _) => {
+                Channel::from_shaped([rows, decl.width], positions_for(rows, decl.width))
+                    .named(&decl.name)
             }
-            model::PortKind::LaneVector => {
-                Channel::from(vec![1.0f32; port.width as usize]).named(&port.name)
+            (_, model::InputAxis::Lane) => {
+                Channel::from(vec![1.0f32; decl.width as usize]).named(&decl.name)
             }
-            model::PortKind::AxisPositions => {
-                Channel::from_shaped([rows, port.width], positions_for(rows, port.width))
-                    .named(&port.name)
+            (_, model::InputAxis::Row) => {
+                Channel::from_shaped([rows, decl.width], vec![0f32; (rows * decl.width) as usize])
+                    .named(&decl.name)
             }
-            model::PortKind::Context => match (&input.prompt, model::reading("text")) {
-                (Some(prompt), Some(text)) if text.readout_width == port.width => {
-                    encode_text(prompt, "text").await?
-                }
-                _ => Channel::from_shaped([8, port.width], vec![0f32; 8 * port.width as usize])
-                    .named(&port.name),
-            },
-            model::PortKind::Latents => {
-                Channel::from_shaped([rows, port.width], vec![0f32; (rows * port.width) as usize])
-                    .named(&port.name)
-            }
-            // A voxel port is a VAE tile's box on the third row axis (D8),
+            // A voxel input is a VAE tile's box on the third row axis (D8),
             // which is not a float lane this probe can plausibly fill.
-            model::PortKind::Voxels => {
+            (_, model::InputAxis::Voxel) => {
                 return Err(format!(
-                    "reading `{}` declares a voxel port `{}`; the latent probe drives rows, \
+                    "reading `{}` reads a voxel input `{}`; the latent probe drives rows, \
                      not a VAE tile",
-                    reading.name, port.name
+                    reading.name, decl.name
                 ));
             }
         };
-        pass.input(&port.name, &ch)?;
-        bound.push(port.name.clone());
+        pass.input(&decl.name, &ch)?;
+        bound.push(decl.name.clone());
         extras.push(ch);
-    }
-    if !timestep_bound {
-        return Err(format!(
-            "reading `{}` declares no lane-vector port for the timestep",
-            reading.name
-        ));
     }
 
     pass.epilogue(move || {
@@ -272,7 +267,7 @@ async fn main(input: Input) -> Result<Output> {
         width,
         steps,
         sigmas: sched.sigmas.clone(),
-        ports: bound,
+        inputs: bound,
         mean,
         std: var.sqrt(),
         non_finite: last.iter().filter(|v| !v.is_finite()).count() as u32,

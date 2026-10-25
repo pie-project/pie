@@ -635,7 +635,7 @@ class ForwardPass:
             names = " / ".join(k.name.lower() for k in kinds)
             raise InferletError(f"{what} binds a {names} pass; this pass is {self.kind.name.lower()}")
 
-    # -- readings and float ports ---------------------------------------------
+    # -- readings and inputs ---------------------------------------------------
 
     def reading(self, name: str) -> None:
         """Which of the family's declared readings (`model.readings()`) this
@@ -643,11 +643,12 @@ class ForwardPass:
         the model declares at most one; before the program."""
         _wit(self.wit.reading, name, what="reading")
 
-    def input(self, port: str, ch: Channel) -> None:
-        """Bind `ch` to the reading's float port `port`, read at every submit
-        from its committed cell. The host validates the shape; the program
-        must declare the channel, so a stage of the author's must touch it."""
-        _wit(self.wit.input, port, ch._wit(), what="input")
+    def input(self, name: str, ch: Channel) -> None:
+        """Bind `ch` to the model's input `name` (`model.lane(...).inputs`),
+        read at every submit from its committed cell. The host validates the
+        shape; the program must declare the channel, so a stage of the
+        author's must touch it."""
+        _wit(self.wit.input, name, ch._wit(), what="input")
 
     def stream(self, s: "_wit_model.LaneStream") -> None:
         """Which lane stream this pass's rows are (`model.LaneStream`)."""
@@ -664,13 +665,6 @@ class ForwardPass:
         `DENOISE`). REQUIRED, once, before the first submit."""
         self._require_kind((ForwardKind.DIFFUSION,), "canvas")
         _wit(self.wit.canvas, mode, what="canvas")
-
-    def self_conditioning(self, rows: Sequence[int], weights: Sequence[float]) -> None:
-        """The previous step's distribution as taps — `model.canvas().self_cond_taps`
-        `(id, weight)` pairs per canvas row, row major — staged for this
-        pass's next submit."""
-        self._require_kind((ForwardKind.DIFFUSION,), "self_conditioning")
-        _wit(self.wit.self_conditioning, [int(r) for r in rows], [float(w) for w in weights], what="self_conditioning")
 
     # -- adapters ------------------------------------------------------------
 

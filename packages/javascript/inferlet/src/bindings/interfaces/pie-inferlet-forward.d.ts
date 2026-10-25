@@ -129,8 +129,7 @@ export class ForwardPass {
   * Bind embedding token ids and CSR row indptr. Both are channels.
   * REQUIRED on a reading that embeds tokens (`reading-fact.
   * takes-tokens`, every text model's), REFUSED on one that does
-  * not; the lane's row count then comes from the `latents` port's
-  * channel shape.
+  * not; the lane's row count then comes from its row inputs.
   */
   embed(tokens: Channel, indptr: Channel): void;
   /**
@@ -147,19 +146,20 @@ export class ForwardPass {
   */
   reading(name: string): void;
   /**
-  * Bind a channel to one of the reading's declared float input
-  * ports (`reading-fact.ports`, by name), read at every submit:
-  * the channel's COMMITTED cell is the port's value for this lane's
-  * rows, so `set` or an epilogue `put` advances it and the whole
-  * denoising loop runs without a host copy a step. Generalizes
-  * `self-conditioning-from`. The channel's shape is validated
-  * against the port here (`[rows, width]` for latents / context /
-  * axis-positions, `[width]` or `[1, width]` for a lane vector),
-  * and it must be bound into this pass's program (the Rust library
-  * reads it in the prologue when nothing else does). Every port the
-  * reading declares must be bound before `program`.
+  * Bind a channel to the model's input `name` (`model.lane`'s
+  * `inputs`), read at every submit: the channel's COMMITTED cell is
+  * the input's value for this lane, so `set` or an epilogue `put`
+  * advances it and a whole denoising loop runs without a host copy a
+  * step. The channel is `[width]` for a `lane` input, `[rows, width]`
+  * for a `row` input (every row input of a lane carries the same
+  * rows, and states the lane's rows when nothing else does), and one
+  * clip `[h, w, width]` or `[t, h, w, width]` for a `voxel` input; it
+  * is `f32` for a float input and `i32` for an `i32` one. It must be
+  * bound into this pass's program (the Rust library reads it in the
+  * prologue when nothing else does). A pass binds exactly the inputs
+  * its lane reads before `program`.
   */
-  input(port: string, ch: Channel): void;
+  input(name: string, ch: Channel): void;
   /**
   * Which lane stream this pass's rows are; default `text`. Set before
   * `program`.

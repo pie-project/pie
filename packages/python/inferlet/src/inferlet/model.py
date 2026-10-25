@@ -22,8 +22,11 @@ from wit_world.imports import model as _model
 
 AxisRole = _model.AxisRole
 ForwardKind = _model.ForwardKind
+InputAxis = _model.InputAxis
+InputDecl = _model.InputDecl
+LaneDecl = _model.LaneDecl
 LaneStream = _model.LaneStream
-PortKind = _model.PortKind
+Readout = _model.Readout
 ReadoutKind = _model.ReadoutKind
 ScheduleKind = _model.ScheduleKind
 
@@ -80,19 +83,17 @@ def draft_block() -> BlockDrafter | None:
 
 @dataclass(frozen=True)
 class CanvasShape:
-    """The canvas a diffusion model denoises: tokens per block, the trunk's
-    hidden width, and how many ``(id, weight)`` self-conditioning taps a
-    canvas row takes."""
+    """The canvas a diffusion model denoises: tokens per block and the
+    trunk's hidden width."""
 
     length: int
     hidden: int
-    self_cond_taps: int
 
 
 def canvas() -> CanvasShape | None:
     """The diffusion canvas; ``None`` for every other pass kind."""
     c = _model.canvas()
-    return CanvasShape(c.length, c.hidden, c.self_cond_taps) if c is not None else None
+    return CanvasShape(c.length, c.hidden) if c is not None else None
 
 
 def run_ahead_window() -> int:
@@ -151,6 +152,16 @@ def reading(name: str):
     return next((r for r in _model.readings() if r.name == name), None)
 
 
+def lane(switches: list[tuple[str, str]]) -> LaneDecl:
+    """The lane a pass of these switches is (`model.LaneDecl`): the inputs it
+    binds (exactly these, by ``ForwardPass.input``), whether it binds
+    ``state`` and ``embed``, and what it reads out. Switches are
+    ``(name, value)`` pairs — ``("reading", r)``, ``("stream", s)``, and on a
+    diffusion model ``("canvas", "encode" | "denoise")``; one left unset takes
+    its default."""
+    return _model.lane(list(switches))
+
+
 def latent():
     """The latent space a denoiser works in (`model.LatentSpace`), or ``None``."""
     return _model.latent()
@@ -162,5 +173,5 @@ def schedule():
 
 
 def max_latent_rows() -> int:
-    """The most latent rows one pass carries; 0 without a float lane."""
+    """The most rows one lane may carry: the guest sizes its row inputs under this."""
     return _model.max_latent_rows()

@@ -3,10 +3,10 @@
 //! that walks the whole of design D8's guest road:
 //!
 //! 1. the model's own catalog says which reading decodes (`readings()`, the
-//!    one with a `Voxels` port and a `Pixels` readout) and how wide its port
-//!    is — nothing here hardcodes `z-image`;
-//! 2. the golden latent is bound as that port's CHANNEL, whose shape IS the
-//!    clip's box (`[h, w, 16]`), so the geometry the port needs and the
+//!    one whose lane reads a voxel input and lands a `Pixels` readout) and
+//!    how wide that input is — nothing here hardcodes `z-image`;
+//! 2. the golden latent is bound as that input's CHANNEL, whose shape IS the
+//!    clip's box (`[h, w, 16]`), so the geometry the input needs and the
 //!    numbers it reads travel together and neither is a payload the guest
 //!    hands the shell;
 //! 3. the epilogue reads the `pixels` seam through `intrinsics::pixels(rows,
@@ -20,9 +20,9 @@
 //! the numbers path read the SAME channel cell, so a run that wants both
 //! asks for the numbers and lets this file re-encode them (see `main`).
 //!
-//! A lane of a VAE reading embeds no token and binds no `[rows, ·]` port: its
+//! A lane of a VAE reading embeds no token and binds no `[rows, ·]` input: its
 //! rows are its clip's voxels, on the third axis. The library states that for the
-//! guest — `pass.input` on a voxel port is the only row-stating thing it
+//! guest — `pass.input` on a voxel input is the only row-stating thing it
 //! needs — so nothing below mentions a row count the model did not.
 
 use inferlet::latent::prelude::*;
@@ -79,7 +79,7 @@ struct Input {
 /// the decoder's answer is expected at.
 #[derive(Deserialize)]
 struct Case {
-    /// `[h * w * channels]`, `w` fastest then `channels` — the port
+    /// `[h * w * channels]`, `w` fastest then `channels` — the input
     /// channel's own order.
     latent: Vec<f32>,
     h: u32,
@@ -95,8 +95,8 @@ struct Case {
 struct Output {
     /// Which reading fired, by the family's own name.
     reading: String,
-    /// Which port carried the clip.
-    port: String,
+    /// Which input carried the clip.
+    input: String,
     /// The clip's box, and the pixels' box.
     latent_h: u32,
     latent_w: u32,
@@ -124,11 +124,11 @@ struct Output {
 }
 
 /// The family's `vae.decode`: the token-less reading whose readout is
-/// `Pixels` and whose input port is a `Voxels` one. Read off the catalog so
+/// `Pixels` and whose lane reads one voxel input. Read off the catalog so
 /// a family that renames either fails here with its own vocabulary.
 struct Decode {
     name: String,
-    port: String,
+    input: String,
     channels: u32,
     readout_width: u32,
 }
@@ -144,25 +144,25 @@ fn decode_reading() -> Result<Decode> {
             .into());
     }
     // A VAE states two pixel readings — decode and encode. The DECODER is
-    // the one whose voxel port is WIDER than its answer: it reads a latent
+    // the one whose voxel input is WIDER than its answer: it reads a latent
     // and lands RGB, where the encoder reads RGB and lands a latent.
-    let mut best: Option<(model::ReadingFact, model::PortFact)> = None;
+    let mut best: Option<(model::ReadingFact, model::InputDecl)> = None;
     for reading in candidates {
-        let Some(port) = reading
-            .ports
-            .iter()
-            .find(|p| p.kind == model::PortKind::Voxels)
-            .cloned()
-        else {
+        // A VAE arm's lane reads one clip on the voxel axis, and nothing
+        // else.
+        let Ok(lane) = model::lane_of(&reading.name, LaneStream::Image) else {
             continue;
         };
-        if port.width > reading.readout_width {
-            best = Some((reading, port));
+        let [input] = &lane.inputs[..] else {
+            continue;
+        };
+        if input.axis == model::InputAxis::Voxel && input.width > reading.readout_width {
+            best = Some((reading, input.clone()));
             break;
         }
     }
-    let (reading, port) = best.ok_or_else(|| {
-        "no pixels reading of this model reads a voxel port wider than its answer; \
+    let (reading, input) = best.ok_or_else(|| {
+        "no pixels reading of this model reads one voxel input wider than its answer; \
          a decoder takes a latent clip and lands RGB"
             .to_string()
     })?;
@@ -175,8 +175,8 @@ fn decode_reading() -> Result<Decode> {
     }
     Ok(Decode {
         name: reading.name.clone(),
-        port: port.name.clone(),
-        channels: port.width,
+        input: input.name.clone(),
+        channels: input.width,
         readout_width: reading.readout_width,
     })
 }
@@ -221,7 +221,7 @@ async fn main(input: Input) -> Result<Output> {
     if case.channels != d.channels {
         return Err(format!(
             "the case's latent is {} channels wide and reading `{}` reads a {}-channel \
-             voxel port",
+             voxel input",
             case.channels, d.name, d.channels
         )
         .into());
@@ -249,7 +249,7 @@ async fn main(input: Input) -> Result<Output> {
     let rows = pixel_h * pixel_w;
     let width = d.readout_width;
 
-    // The port channel IS the clip: its shape is the box (design D8), and the
+    // The input's channel IS the clip: its shape is the box (design D8), and the
     // shell reads the committed cell straight into the voxel payload.
     let pipe = Pipeline::new();
     let pass = ForwardPass::new();
@@ -257,7 +257,7 @@ async fn main(input: Input) -> Result<Output> {
     pass.stream(LaneStream::Image)?;
     let clip = Channel::from_shaped([case.h, case.w, case.channels], case.latent.as_slice())
         .named("latent");
-    pass.input(&d.port, &clip)?;
+    pass.input(&d.input, &clip)?;
 
     // The answer: one row per OUTPUT voxel, RGB in [-1, 1].
     let out = Channel::new([rows, width], dtype::f32).named("pixels");
@@ -320,7 +320,7 @@ async fn main(input: Input) -> Result<Output> {
     let (mean, std, min, max, non_finite) = stats(&pixels);
     Ok(Output {
         reading: d.name,
-        port: d.port,
+        input: d.input,
         latent_h: case.h,
         latent_w: case.w,
         latent_channels: case.channels,

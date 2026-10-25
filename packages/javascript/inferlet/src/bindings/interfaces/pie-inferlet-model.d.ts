@@ -32,12 +32,19 @@ export function canvas(): CanvasShape | undefined;
  * `forward-pass.reading` is refused. Static.
  */
 export function readings(): Array<ReadingFact>;
+/**
+ * The lane a pass of these switches is. Switches are `(name, value)`
+ * pairs: `("reading", name)`, `("stream", name)` and, on a diffusion
+ * model, `("canvas", "encode" | "denoise")`; one left unset takes its
+ * default (the model's one reading, the `text` stream, `encode`).
+ */
+export function lane(switches: Array<[string, string]>): LaneDecl;
 export function latent(): LatentSpace | undefined;
 export function schedule(): ScheduleFact | undefined;
 /**
- * The most latent rows one pass may carry: the guest sizes its latent
- * channels (`[rows, width]`) under this. 0 for a model with no float
- * lane. Static.
+ * The most rows one lane may carry: the guest sizes its row inputs
+ * (`[rows, width]`) under this, the rows the engine's arena holds a
+ * fire. Static.
  */
 export function maxLatentRows(): number;
 /**
@@ -146,6 +153,7 @@ export function maxReadoutRows(kind: ReadoutKind): number;
  */
 export function rsStateSize(): bigint;
 export type Dtype = import('./pie-inferlet-types.js').Dtype;
+export type Error = import('./pie-inferlet-types.js').Error;
 /**
  * What a guest needs to seed a BLOCK drafter's draft pass: the rows one
  * pass carries (the anchor and `rows - 1` mask slots) and the id every
@@ -183,18 +191,12 @@ export interface BlockDrafter {
 export type ForwardKind = 'text' | 'diffusion';
 /**
  * The canvas a diffusion model denoises: how many tokens one block is,
- * and the trunk's hidden width (the row width of a self-conditioning
- * signal). `none` for every other kind — the same fact as
- * `pass-kind() == diffusion`, stated once with its numbers.
+ * and the trunk's hidden width. `none` for every other kind — the same
+ * fact as `pass-kind() == diffusion`, stated once with its numbers.
  */
 export interface CanvasShape {
   length: number,
   hidden: number,
-  /**
-   * How many `(id, weight)` taps per canvas row
-   * `forward-diffusion.self-conditioning` takes.
-   */
-  selfCondTaps: number,
 }
 /**
  * ── Generative facts ────────────────────────────────────────────────
@@ -223,64 +225,7 @@ export interface CanvasShape {
  */
 export type LaneStream = 'text' | 'image' | 'video' | 'audio' | 'context' | 'reference';
 /**
- * Which runtime input a float port feeds, and so what shape its channel
- * is. `latents`: `[rows, width]`, the lane's own rows, fed
- * from the channel's COMMITTED cell at every submit. `lane-vector`: one
- * `[width]` (or `[1, width]`) row per lane — a timestep, a guidance
- * scale. `context`: `[rows, width]`, an encoder's output, the rows of a
- * `context` lane. `axis-positions`: `[rows, width]` with `width` the
- * axis count (1..=4), the per-row RoPE coordinates. `voxels`: a VAE's
- * tile on the voxel axis — the channel is `[h, w, width]`
- * for a still or `[t, h, w, width]` for a clip, one clip per pass, its
- * shape being the clip's box.
- * # Variants
- * 
- * ## `"latents"`
- * 
- * ## `"lane-vector"`
- * 
- * ## `"context"`
- * 
- * ## `"axis-positions"`
- * 
- * ## `"voxels"`
- */
-export type PortKind = 'latents' | 'lane-vector' | 'context' | 'axis-positions' | 'voxels';
-/**
- * One float input port a reading declares. `dtype` is the CHANNEL's
- * element type the guest must declare (always `f32` today: the WIT
- * dtype set has no bf16; the model's own element type is the engine's
- * marshal). `width` is the trailing extent.
- */
-export interface PortFact {
-  name: string,
-  kind: PortKind,
-  width: number,
-  dtype: Dtype,
-  /**
-   * Which streams' lanes carry this port; empty means every lane of
-   * the reading. A pass on stream `s` binds exactly the ports that
-   * list `s` (or list nothing).
-   */
-  streams: Array<LaneStream>,
-  /**
-   * THE ROW COUNT THIS PORT'S CHANNEL MUST CARRY, when the family
-   * fixes it. `none` -- nearly always -- means the lane's own rows: a
-   * latents port is as tall as the picture's grid, a context port as
-   * tall as the prompt.
-   * 
-   * A few families PAD instead. Wan 2.2 zero-pads its umT5 rows to
-   * 512 and the transformer attends every one of the 512 keys, so a
-   * context lane of the prompt's real length is a different model:
-   * the pad rows go through the text embedder into a nonzero constant
-   * that carries real attention mass. The IR cannot grow a lane, so
-   * the pad is the guest's, and this is the fact that lets a
-   * family-blind guest build it without spelling 512.
-   */
-  rows?: number,
-}
-/**
- * What one axis of an `axis-positions` port means. The rotary space a
+ * What one axis of a positions input means. The rotary space a
  * DiT was trained in is 1..=4 axes wide and every family orders them
  * differently; this names them so a guest can fill the grid without
  * knowing the family.
@@ -304,7 +249,7 @@ export type AxisRole = 'time' | 'height' | 'width' | 'index';
 /**
  * WHERE A READING'S LANES SIT IN THE ROTARY SPACE.
  * 
- * A denoise reading's `axis-positions` port takes one coordinate vector
+ * A denoise reading's positions input takes one coordinate vector
  * per row, and which coordinate goes where is a family contract the
  * guest must not spell (`flux_2`'s `(0, h, w, j)`, `z_image`'s
  * `(L + 1, a, b)`). This fact states it, so `latent::positions_for`
@@ -322,7 +267,7 @@ export type AxisRole = 'time' | 'height' | 'width' | 'index';
  *     reference picture in a rotary neighbourhood of its own, clear of
  *     the target grid at 0.
  * 
- * `axes` has exactly the port's `width` entries. A family whose
+ * `axes` has exactly the positions input's `width` entries. A family whose
  * positions do not fit this shape states `none` and its guests build
  * their own.
  */
@@ -343,7 +288,7 @@ export interface PositionConvention {
   referenceStride?: number,
 }
 /**
- * Which export seam a reading's epilogue reads: `logits()` for a text
+ * Which export seam a lane's epilogue reads: `logits()` for a text
  * head, `velocity()` for a denoiser, `hidden()` for an encoder,
  * `pixels` for a VAE reading on the voxel axis (one row per output
  * voxel of the pass's clip, `readout-width` wide).
@@ -364,11 +309,11 @@ export type ReadoutKind = 'logits' | 'velocity' | 'hidden' | 'pixels';
  * lane is stamped with; `has-kv` says whether `state` is required
  * (else refused) on its pass, `takes-tokens` the same for `embed`;
  * `streams` are the lane streams a request submits (one pass per
- * stream, `forward-pass.stream`; empty means text only); `ports` are
- * the float ports `forward-pass.input` binds; `positions` says where
- * its lanes' rows sit in the rotary space; `readout`/`readout-width`
- * say what the epilogue may read and how wide one row is (the
- * `velocity(width)` / `hidden(width)` declaration to make).
+ * stream, `forward-pass.stream`; empty means text only); `positions`
+ * says where its lanes' rows sit in the rotary space;
+ * `readout`/`readout-width` say what the epilogue may read and how wide
+ * one row is (the `velocity(width)` / `hidden(width)` declaration to
+ * make).
  */
 export interface ReadingFact {
   name: string,
@@ -376,15 +321,59 @@ export interface ReadingFact {
   hasKv: boolean,
   takesTokens: boolean,
   streams: Array<LaneStream>,
-  ports: Array<PortFact>,
   /**
    * How this reading's lanes place their rows in the rotary space,
-   * when it declares an `axis-positions` port and states a
-   * convention for it. `none` otherwise.
+   * when it states a convention. `none` otherwise.
    */
   positions?: PositionConvention,
   readout: ReadoutKind,
   readoutWidth: number,
+}
+/**
+ * What one entry of an input belongs to: its lane, each row of its
+ * lane, or each voxel of its lane's clip.
+ * # Variants
+ * 
+ * ## `"lane"`
+ * 
+ * ## `"row"`
+ * 
+ * ## `"voxel"`
+ */
+export type InputAxis = 'lane' | 'row' | 'voxel';
+/**
+ * One input the model reads from its guest, by name: `width` values a
+ * lane, a row or a voxel, as `dtype` (`f32` for a float input, `i32`
+ * for an i32 one; the host marshals to the model's own element type).
+ * One name is one input wherever the model reads it. `rows` is the row
+ * count a lane binding it carries when the family fixes it (Wan 2.2's
+ * 512 context rows: its reference zero-pads umT5's answer to 512 and
+ * attends every pad row), `none` nearly always.
+ */
+export interface InputDecl {
+  name: string,
+  axis: InputAxis,
+  width: number,
+  dtype: Dtype,
+  rows?: number,
+}
+/**
+ * What a lane's epilogue reads out, and how wide one row is.
+ */
+export interface Readout {
+  kind: ReadoutKind,
+  width: number,
+}
+/**
+ * Everything about a lane of the given switches: the inputs it must
+ * bind (exactly these, by `forward-pass.input`), whether it binds
+ * `state` and `embed`, and what it reads out.
+ */
+export interface LaneDecl {
+  inputs: Array<InputDecl>,
+  readsKv: boolean,
+  embeds: boolean,
+  readout: Readout,
 }
 /**
  * The latent space a denoiser works in: one latent row is

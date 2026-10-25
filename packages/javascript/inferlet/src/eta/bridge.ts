@@ -580,11 +580,12 @@ export class ForwardPass {
     wit('reading', () => this.wit.reading(name));
   }
 
-  /** Bind `ch` to the reading's float port `port`, read at every submit from
-   * its committed cell. The host validates the shape; the program must
-   * declare the channel (a stage of the author's must touch it). */
-  input(port: string, ch: Channel): void {
-    wit('input', () => this.wit.input(port, ch.wit()));
+  /** Bind `ch` to the model's input `name` (`model.lane(...).inputs`), read
+   * at every submit from its committed cell. The host validates the shape;
+   * the program must declare the channel (a stage of the author's must touch
+   * it). */
+  input(name: string, ch: Channel): void {
+    wit('input', () => this.wit.input(name, ch.wit()));
   }
 
   /** Which lane stream this pass's rows are. Default `'text'`. */
@@ -602,14 +603,6 @@ export class ForwardPass {
   canvas(mode: witDiffusion.Mode): void {
     this.requireKind(['diffusion'], 'canvas');
     wit('canvas', () => (this.wit as witDiffusion.ForwardPass).canvas(mode));
-  }
-
-  /** The previous step's distribution as taps — `model.canvas().selfCondTaps`
-   * `(id, weight)` pairs per canvas row, row major — staged for this pass's
-   * next submit. */
-  selfConditioning(rows: ArrayLike<number>, weights: ArrayLike<number>): void {
-    this.requireKind(['diffusion'], 'selfConditioning');
-    wit('selfConditioning', () => (this.wit as witDiffusion.ForwardPass).selfConditioning(Uint32Array.from(rows), Float32Array.from(weights)));
   }
 
   /** Attach a PEFT adapter at `site` ("q"|"k"|"v"|"o"|"gate_up"|"down"). */

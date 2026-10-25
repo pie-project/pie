@@ -241,7 +241,7 @@ def compare(args) -> int:
             )
         got = f32s(dump)
     print(
-        f"[compare] reading `{doc.get('reading')}` port `{doc.get('port')}`: "
+        f"[compare] reading `{doc.get('reading')}` input `{doc.get('input')}`: "
         f"{doc.get('latent_h')}x{doc.get('latent_w')}x{doc.get('latent_channels')} -> "
         f"{doc.get('pixel_h')}x{doc.get('pixel_w')}x{doc.get('pixel_channels')}, "
         f"{doc.get('rows')} rows"

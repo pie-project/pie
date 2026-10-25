@@ -106,10 +106,17 @@ async fn main(input: Input) -> Result<Output> {
     if case.canvas0.len() != length as usize || case.canvas1.len() != length as usize {
         return Err(format!("the case's canvases are not {length} long").into());
     }
-    if case.taps != shape.self_cond_taps {
+    let lane = model::lane(&[("canvas".into(), "denoise".into())])?;
+    let taps = lane
+        .inputs
+        .iter()
+        .find(|input| input.name == "self_cond_ids")
+        .ok_or("the denoise lane reads no `self_cond_ids` input")?
+        .width;
+    if case.taps != taps {
         return Err(format!(
-            "the case carries {} taps per row and this model takes {}",
-            case.taps, shape.self_cond_taps
+            "the case carries {} taps per row and this model takes {taps}",
+            case.taps
         )
         .into());
     }
@@ -209,9 +216,24 @@ async fn main(input: Input) -> Result<Output> {
             ids_out.put(top_i);
             probs_out.put(top_p);
         });
-        if at == 1 {
-            fwd.self_conditioning(&case.taps_ids, &case.taps_weights)
-                .context("stage self-conditioning")?;
+        // A denoise step reads the taps: zeros (no signal) on step 0, the
+        // case's on step 1.
+        if !commit {
+            let cells = (length * taps) as usize;
+            let (ids, weights) = if at == 1 {
+                (
+                    case.taps_ids.iter().map(|&id| id as i32).collect(),
+                    case.taps_weights.clone(),
+                )
+            } else {
+                (vec![0i32; cells], vec![0f32; cells])
+            };
+            let ids = Channel::from_shaped([length, taps], ids).named(&format!("self_cond_ids_{tag}"));
+            let weights =
+                Channel::from_shaped([length, taps], weights).named(&format!("self_cond_weights_{tag}"));
+            fwd.input("self_cond_ids", &ids).context("bind self_cond_ids")?;
+            fwd.input("self_cond_weights", &weights)
+                .context("bind self_cond_weights")?;
         }
         fwd.submit(&pipe).with_context(|| format!("denoise submit {at}"))?;
         steps.push(Rows {
