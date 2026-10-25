@@ -1051,16 +1051,19 @@ mod tests {
             assert_eq!(
                 kernels_cuda::tuning::Tuning {
                     ssm_gdn_fused_scan: false,
+                    gemm_rows_m: defaults.gemm_rows_m,
                     mxfp4_mma_from: defaults.mxfp4_mma_from,
                     mxfp4_mma_until: defaults.mxfp4_mma_until,
                     mxfp4_mma_per_from: defaults.mxfp4_mma_per_from,
                     ..kernels_cuda::tuning::Tuning::of(p)
                 },
                 defaults,
-                "what an Ada GPU ran before its family file, past the gated delta scan and the MXFP4 selects"
+                "what an Ada GPU ran before its family file, past the gated delta scan, the MXFP4 selects \
+                 and the few-rows GEMM's reach"
             );
             for (spec, rungs, _) in p.entries() {
                 if spec.id == "kernel.ssm.gdn_fused_scan"
+                    || (spec.id == "kernel.gemm.rows_m" && std::ptr::eq(p, &l40s))
                     || spec.id.starts_with("kernel.moe.mxfp4_mma_")
                     || spec.id.starts_with("engine.prefill_lattice_")
                 {

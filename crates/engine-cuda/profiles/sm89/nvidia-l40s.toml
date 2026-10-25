@@ -3,9 +3,17 @@ api = 1
 [target]
 device = "NVIDIA L40S"
 
+# Bf16 products of 2 to 16 rows may time the few-rows kernel beside
+# cuBLAS's algorithms: a decode's projections of 2 to 8 rows over the
+# catalog's dense models 2-8% faster on it where the tuner picks it
+# (`decode_gemm_rate`).
+[kernel]
+gemm.rows_m = 16
+
 [provenance]
 measured = [
   "kernel.gemm.heuristics",
+  "kernel.gemm.rows_m",
   "kernel.gemm.skinny_rows",
   "kernel.gemm.workspace_mb",
   "kernel.gemv.bf16",
