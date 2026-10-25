@@ -823,17 +823,19 @@ fn temporary_floor(plan: &LaunchStagePlan, descriptors: &[ValueDesc], rows: &[u3
         .iter()
         .zip(rows)
         .map(|(region, &blocks)| {
-            if blocks <= 1 {
-                return 0;
-            }
             let per_block = match region.kind {
-                RegionKind::Generated => align(2 * widest.div_ceil(32) * 4 + 4096),
+                // Each block of a generated region, a lone one too, keeps
+                // its reductions' levels here.
+                RegionKind::Generated => align(
+                    eta_compiler::codegen::launch::generated_temporary_bytes(plan, region, widest),
+                ),
+                _ if blocks <= 1 => 0,
                 kind if lane_sampler(kind) => align(LANE_SAMPLER_ARENA),
                 RegionKind::Library(LibraryOp::TopK) if selects(plan, region) => 0,
                 RegionKind::Library(LibraryOp::TopK | LibraryOp::Sort) => align(8 * widest + 256),
                 RegionKind::Library(_) => 0,
             };
-            per_block * u64::from(blocks)
+            per_block * u64::from(blocks.max(1))
         })
         .max()
         .unwrap_or(0)
