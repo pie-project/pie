@@ -252,8 +252,13 @@ impl Voice {
             "frames",
             &Channel::from_shaped([t, 1, 1, self.width], &self.hidden[from * w..to * w]),
         )?;
+        // The audio is the decoder's first channel.
+        let channels = self.decode.width()?;
         let out = Channel::new([samples, 1], dtype::f32);
-        pass.epilogue(move || out.put(intrinsics::pixels(0, samples, 1)));
+        pass.epilogue(move || {
+            let all = reshape(intrinsics::pixels(0, samples, channels), [samples * channels]);
+            out.put(reshape(gather(&all, iota(samples) * channels), [samples, 1]));
+        });
         pass.submit(pipe).context("the codec decode")?;
         let wave: Vec<f32> = out.take_host::<Vec<f32>>().await?;
         let skip = (self.heard - from) * 1920;

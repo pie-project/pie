@@ -61,6 +61,10 @@ CODEC = struct(
 )
 CODES = struct(talker = 3072, books = 15, book = 2048)
 
+# The predictor's heads, one a book and a last none routes to: a route row
+# is even, as a bf16 row lands in whole words on Vulkan.
+HEADS = 16
+
 def stack(c, banks, kv):
     """A dense Qwen3 stack of config `c`, its caches named under `kv`:
     pre-norm attention with q and k normed per head, a SwiGLU MLP, and the
@@ -180,7 +184,9 @@ def codec_decoder():
         first = causal_conv(c.width, c.pre, 7),
         blocks = [block(i) for i in range(len(c.rates))],
         snake = snake(last),
-        last = causal_conv(1, last, 7),
+        # The audio and a zero channel beside it: a bf16 row lands in whole
+        # words on Vulkan.
+        last = causal_conv(2, last, 7),
         heads = c.heads,
         head_dim = hd,
         hidden = c.hidden,
@@ -196,7 +202,7 @@ def codec_decoder():
 
 def route(codes):
     """Each code's row of the head that reads out the book after its own, a
-    one-hot over the fifteen: the talker's codes the first, book b's the
+    one-hot over the heads: the talker's codes the first, book b's the
     (b+1)th, the zero row the first."""
     books = CODES.books
     book_of = [0] * CODES.talker
@@ -205,7 +211,7 @@ def route(codes):
     book_of += [0] * (codes - len(book_of))
     values = []
     for b in book_of:
-        values += [1.0 if j == b else 0.0 for j in range(books)]
+        values += [1.0 if j == b else 0.0 for j in range(HEADS)]
     return values
 
 def layout(id, deploy):
@@ -226,8 +232,8 @@ def layout(id, deploy):
         talker = stack(TALKER, banks, "talker"),
         predictor = stack(PREDICTOR, per_book, "predictor"),
         talker_head = weight([CODES.talker, TALKER.hidden]),
-        books_head = weight([CODES.books, CODES.book, PREDICTOR.hidden], per_book),
-        route = weight([codes, CODES.books], values = route(codes)),
+        books_head = weight([HEADS, CODES.book, PREDICTOR.hidden], per_book),
+        route = weight([codes, HEADS], values = route(codes)),
         codec = codec_decoder(),
     )
 
@@ -286,7 +292,9 @@ def read(m, reads):
     reads.read_expr(m.codec_embed, concat(0, [src(name) for name in table] + [fill(0.0, [1, hidden], held)]))
     reads.read(m.talker_head, "talker.codec_head.weight")
     heads = ["talker.code_predictor.lm_head.{}.weight".format(j) for j in range(BOOKS)]
-    reads.read_expr(m.books_head, concat(0, [as_plane(name, [1, m.book, hidden]) for name in heads]))
+    planes = [as_plane(name, [1, m.book, hidden]) for name in heads]
+    planes.append(fill(0.0, [1, m.book, hidden], stored(heads[0])))
+    reads.read_expr(m.books_head, concat(0, planes))
     mapped(reads, m.talker, under("talker.model.", STACK))
     mapped(reads, m.predictor, under("talker.code_predictor.model.", STACK))
     read_codec(reads, m.codec)
@@ -404,7 +412,10 @@ def read_codec(reads, d):
             reads.read(unit.conv2_bias, at("conv2.conv.bias"))
         c_in = c_out
     read_snake(reads, d.snake, DEC + "decoder.5")
-    read_causal_conv(reads, d.last, DEC + "decoder.6.conv", [1, c_in * 7])
+    last = DEC + "decoder.6.conv"
+    held = stored(last + ".weight")
+    reads.read_expr(d.last.w, concat(0, [as_plane(last + ".weight", [1, c_in * 7]), fill(0.0, [1, c_in * 7], held)]))
+    reads.read_expr(d.last.bias, concat(0, [src(last + ".bias"), fill(0.0, [1], stored(last + ".bias"))]))
 
 # The forward of Qwen3-TTS: the talker, the code predictor, the codec's
 # quantizer, prenet and decoder, each its own reading.
