@@ -29,6 +29,7 @@ PARAMS = {
     "f32": ("f32", "{}"),
     "bool": ("bool", "{}"),
     "Dtype": ("Dtype", "{}"),
+    "InputAxis": ("poem_ir::InputAxis", "{}"),
     "Option<u32>": ("Option<u32>", "{}"),
     "Option<f32>": ("Option<f32>", "{}"),
     "Option<bool>": ("Option<bool>", "{}"),
@@ -125,7 +126,7 @@ def input_methods():
         if depth == 0 and ch == "}":
             break
     pattern = re.compile(
-        r"^    pub fn (\w+)(<[^>]*>)?\(&self,?(.*?)\)\s*(?:->\s*([^{]*?))?\s*\{", re.S | re.M
+        r"^    pub fn (\w+)(<[^>]*>)?\(\s*&self,?(.*?)\)\s*(?:->\s*([^{]*?))?\s*\{", re.S | re.M
     )
     for m in pattern.finditer(text[start:end]):
         yield "inputs", m.group(1), m.group(2), split(m.group(3)), (m.group(4) or "()").strip()
