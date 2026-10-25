@@ -328,7 +328,7 @@ pub struct FireBindings {
     pub lane_of_row: Tensor,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
-    
+
     pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
     pub inputs: Vec<InputBinding>,
 
@@ -1608,6 +1608,15 @@ impl<'c> Run<'c> {
         })
     }
 
+    /// The epilogue the load loaded for the anchored region of `key`.
+    #[cfg(not(feature = "rocm"))]
+    pub(crate) fn anchor_epilogue(
+        &self,
+        key: u64,
+    ) -> Option<&'static kernels_cuda::linear::frame::Epilogue> {
+        self.regions.anchor(key)
+    }
+
     /// The kernel the load generated for the region of `body` over rows
     /// `width` wide.
     #[cfg(not(feature = "rocm"))]
@@ -1678,7 +1687,6 @@ impl<'c> Run<'c> {
         }
     }
 
-    
     pub(crate) fn group_mask(
         &self,
         q: poem_ir::Selection,

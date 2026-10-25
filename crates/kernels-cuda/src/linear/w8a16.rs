@@ -122,7 +122,7 @@ pub fn matmul(
         let bytes = (n as usize).saturating_mul(k as usize).saturating_mul(2);
         let tile = ctx.scratch_stream(op, DECODED_WEIGHT, bytes)? as usize as u64;
         widen(ctx, op, codes, atoms, gran, n, k, tile)?;
-        gemm::act_x_wt(ctx, op, act, Tensor::new(tile, n, k, Dtype::Bf16), None, y)?;
+        gemm::act_x_wt(ctx, op, act, Tensor::new(tile, n, k, Dtype::Bf16), y)?;
         return Ok(true);
     }
     let args = [

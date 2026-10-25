@@ -4,19 +4,26 @@
 //! ([`kernels_cuda::synth::supports`]), printed by kernels-cuda and loaded
 //! with the model, so that no fire compiles one or loads its module.
 //!
+//! And the contraction frames' epilogues a load fires: one for each
+//! `fused.anchored` anchored region (`compiler.synth_anchors`), formed only
+//! where kernels-cuda serves it ([`kernels_cuda::linear::frame::serves`])
+//! and its every kernel loaded with the model.
+//!
 //! The fold forms only regions the frame takes; one it does not is the
 //! compiler's bug, and the load fails naming it (`Fault::Region`) rather
 //! than running something else in its place.
 
 use std::collections::BTreeMap;
 
-use kernels_ir::Region;
+use kernels_ir::{Anchored, Region};
 #[cfg(not(feature = "rocm"))]
 use poem_ir::{Def, Dtype, Ty, ValueDecl};
 use poem_ir::{Fused, Operation, RegionRead, Trace, ValueId};
 
 use crate::error::{Fault, Result};
 
+#[cfg(not(feature = "rocm"))]
+use kernels_cuda::linear::frame::Epilogue;
 #[cfg(not(feature = "rocm"))]
 use kernels_cuda::synth::{In, Out, Synthesized};
 
@@ -26,13 +33,42 @@ use kernels_cuda::synth::{In, Out, Synthesized};
 pub struct Regions {
     #[cfg(not(feature = "rocm"))]
     kernels: BTreeMap<(u64, u32), Vec<(Vec<In>, Synthesized)>>,
+    /// Each anchored region's epilogue, by the region's key.
+    #[cfg(not(feature = "rocm"))]
+    anchors: BTreeMap<u64, &'static Epilogue>,
 }
 
 /// A load's regions where its trace holds none.
 pub(crate) static NONE: Regions = Regions {
     #[cfg(not(feature = "rocm"))]
     kernels: BTreeMap::new(),
+    #[cfg(not(feature = "rocm"))]
+    anchors: BTreeMap::new(),
 };
+
+/// `trace` with each matmul and the pointwise ops over its product folded
+/// into one `fused.anchored` op where the contraction frames serve it
+/// (`compiler.synth_anchors`), and the anchored regions by key.
+#[cfg(not(feature = "rocm"))]
+#[must_use]
+pub fn fold_anchors(trace: Trace) -> (Trace, BTreeMap<u64, Anchored>) {
+    poem_compiler::fuse::anchor::fold(trace, &|anchored, ins, outs| {
+        kernels_cuda::linear::frame::serves(anchored, ins, outs).is_ok()
+    })
+}
+
+/// Every `fused.anchored` of `trace`: its node, key and the values it
+/// reads and lands.
+fn anchored(trace: &Trace) -> impl Iterator<Item = (u32, u64, &[ValueId], &[ValueId])> {
+    (0u32..)
+        .zip(&trace.nodes)
+        .filter_map(|(node, n)| match &n.op {
+            Operation::Fused(Fused::Anchored { ins, key, outs, .. }) => {
+                Some((node, *key, ins.as_slice(), outs.as_slice()))
+            }
+            _ => None,
+        })
+}
 
 /// One `fused.region` of a trace: its node, parameters (and how each is
 /// read), width, region key and results. ROCm reads only where it lies
@@ -74,7 +110,43 @@ impl Regions {
     /// The kernels `trace`'s regions fire, compiled (or read from the disk
     /// cache) and loaded on the current device, `regions` the compiler's.
     #[cfg(not(feature = "rocm"))]
-    pub(crate) fn load(trace: &Trace, regions_of: &BTreeMap<u64, Region>) -> Result<Regions> {
+    pub(crate) fn load(
+        trace: &Trace,
+        regions_of: &BTreeMap<u64, Region>,
+        anchored_of: &BTreeMap<u64, Anchored>,
+        tuning: &kernels_cuda::tuning::Tuning,
+    ) -> Result<Regions> {
+        let mut anchors = BTreeMap::new();
+        for (node, key, ins, outs) in anchored(trace) {
+            let broken = |why: String| Fault::Region {
+                node,
+                body: key,
+                why,
+            };
+            if anchors.contains_key(&key) {
+                continue;
+            }
+            let held = anchored_of.get(&key).ok_or_else(|| {
+                broken("the compiled model holds no anchored region by its key".into())
+            })?;
+            if let Some(why) = aliased(ins, outs) {
+                return Err(broken(why));
+            }
+            let stored = |vs: &[ValueId]| {
+                vs.iter()
+                    .map(|&v| {
+                        dtype_of(trace, v)
+                            .ok_or_else(|| broken(format!("value {} is a struct", v.0)))
+                    })
+                    .collect::<Result<Vec<Dtype>>>()
+            };
+            kernels_cuda::linear::frame::serves(held, &stored(ins)?, &stored(outs)?)
+                .map_err(|why| broken(why.to_string()))?;
+            let epi = Epilogue::interned(held)?;
+            let c = &held.contraction;
+            epi.load_every(c.n, c.k, tuning)?;
+            anchors.insert(key, epi);
+        }
         let mut kernels = BTreeMap::new();
         for Site {
             node,
@@ -114,28 +186,40 @@ impl Regions {
                 held.push((forms, kernel));
             }
         }
-        Ok(Regions { kernels })
+        Ok(Regions { kernels, anchors })
     }
 
     /// This backend generates no row kernel: a trace with a region is not
     /// served.
     #[cfg(feature = "rocm")]
-    pub(crate) fn load(trace: &Trace, _regions: &BTreeMap<u64, Region>) -> Result<Regions> {
-        match regions(trace).next() {
-            Some(Site { node, .. }) => Err(Fault::Unsupported(format!(
+    pub(crate) fn load(
+        trace: &Trace,
+        _regions: &BTreeMap<u64, Region>,
+        _anchored: &BTreeMap<u64, Anchored>,
+        _tuning: &kernels_cuda::tuning::Tuning,
+    ) -> Result<Regions> {
+        if let Some(Site { node, .. }) = regions(trace).next() {
+            return Err(Fault::Unsupported(format!(
                 "the `fused.region` at node {node}: this backend generates no row kernel; \
                  serve it with `compiler.synth_regions` off"
+            )));
+        }
+        match anchored(trace).next() {
+            Some((node, ..)) => Err(Fault::Unsupported(format!(
+                "the `fused.anchored` at node {node}: this backend has no contraction frames; \
+                 serve it with `compiler.synth_anchors` off"
             ))),
             None => Ok(Regions {}),
         }
     }
 
-    /// How many kernels the load generated: one a region, width and storage.
+    /// How many kernels the load generated: one a region, width and
+    /// storage, and one epilogue an anchored region.
     #[must_use]
     pub fn len(&self) -> usize {
         #[cfg(not(feature = "rocm"))]
         {
-            self.kernels.values().map(Vec::len).sum()
+            self.kernels.values().map(Vec::len).sum::<usize>() + self.anchors.len()
         }
         #[cfg(feature = "rocm")]
         {
@@ -146,6 +230,12 @@ impl Regions {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// The epilogue of the anchored region of key `key`.
+    #[cfg(not(feature = "rocm"))]
+    pub(crate) fn anchor(&self, key: u64) -> Option<&'static Epilogue> {
+        self.anchors.get(&key).copied()
     }
 
     /// The kernel of the region of key `body` over rows `width` wide, its

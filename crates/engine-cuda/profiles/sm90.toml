@@ -32,8 +32,6 @@ sdpa.mla_dense_short = true
 # DeepSeek-V4's attention: pool on mma.sync, decode up to 64 in one launch.
 sdpa.pool_mma = true
 sdpa.compressed_decode_until = 64
-# A dense bias from the cuBLASLt epilogue.
-gemm.bias_epilogue = true
 # Bf16 products of 2 to 8 rows may time the few-rows kernel.
 gemm.rows_m = 8
 # cuBLAS, not the fused skinny GEMM, for Gemma's GEGLU and soft-capped

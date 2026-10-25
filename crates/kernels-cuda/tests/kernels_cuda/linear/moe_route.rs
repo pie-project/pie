@@ -223,7 +223,6 @@ fn sm100() -> Tuning {
         gemm_rows_m: 8,
         gemm_split_launch_ns: 2000,
         gemv_narrow: true,
-        gemm_bias_epilogue: true,
         gemm_tc5_split_tickets: 8,
         rows_vec: true,
         gate_tc5_until: 65_536,

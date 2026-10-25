@@ -176,56 +176,6 @@ impl Run<'_> {
                     up: None,
                 })
             }
-            Fused::MatmulGlu {
-                act,
-                w,
-                intermediate,
-                glu: poem_ir::GluAct::GegluTanh,
-                packed,
-                y,
-            } => {
-                // The fused leg reads the weight as one dense handle; a split-plane
-                // bank resolves only through the matmul below. Where the tuner
-                // picks it (a contraction frame with GEGLU filled in, or the
-                // product then the region on the row frame) it serves the op.
-                if self.dense_weight(*w) {
-                    let a = self.tensor(*act);
-                    let weight = self.tensor(*w);
-                    let out = self.tensor(*y);
-                    if weight.rows == 2 * *intermediate
-                        && linear::gemm::anchored(
-                            self.ctx(),
-                            "fused.matmul_glu",
-                            linear::frame::Epilogue::geglu_tanh(),
-                            a,
-                            weight,
-                            &[],
-                            &[out],
-                        )?
-                    {
-                        return Ok(());
-                    }
-                }
-                self.linear(&Linear::Matmul {
-                    act: *act,
-                    w: *w,
-                    y: *packed,
-                    input_scales: None,
-                    scales: None,
-                    quant: None,
-                    logits: false,
-                })?;
-                self.linear(&Linear::Glu {
-                    packed: Some(*packed),
-                    intermediate: *intermediate,
-                    y: *y,
-                    gate: None,
-                    weights: None,
-                    limit: None,
-                    act: poem_ir::GluAct::GegluTanh,
-                    up: None,
-                })
-            }
             // Not in `FUSIONS`, so never formed here; whole, it is its three
             // primitives.
             Fused::MatmulSwigluMatmul {
@@ -265,37 +215,6 @@ impl Run<'_> {
                     quant: None,
                     logits: false,
                 })
-            }
-            Fused::MatmulBias {
-                act,
-                w,
-                bias,
-                y,
-                y_out: _,
-            } => {
-                if self.tensor(*act).dtype == Dtype::Bf16 && self.dense_weight(*w) {
-                    return linear::gemm::matmul_bias(
-                        self.ctx(),
-                        self.tensor(*act),
-                        self.tensor(*w),
-                        self.tensor(*bias),
-                        &mut self.tensor(*y),
-                    );
-                }
-                self.linear(&Linear::Matmul {
-                    act: *act,
-                    w: *w,
-                    y: *y,
-                    input_scales: None,
-                    scales: None,
-                    quant: None,
-                    logits: false,
-                })?;
-                kernels_cuda::elemwise::pointwise::add_bias(
-                    self.ctx(),
-                    self.tensor(*bias),
-                    &mut self.tensor(*y),
-                )
             }
             Fused::MatmulMoeRoute {
                 act,
@@ -432,38 +351,70 @@ impl Run<'_> {
                     &mut self.tensor(*right),
                 )
             }
-            Fused::MatmulSoftcap {
+            Fused::Anchored {
                 act,
                 w,
-                cap,
-                y,
-                y_out: _,
-            } => {
-                if self.dense_weight(*w)
-                    && linear::gemm::anchored(
-                        self.ctx(),
-                        "fused.matmul_softcap",
-                        linear::frame::Epilogue::softcap(*cap)?,
-                        self.tensor(*act),
-                        self.tensor(*w),
-                        &[],
-                        &[self.tensor(*y)],
-                    )?
-                {
-                    return Ok(());
-                }
-                self.linear(&Linear::Matmul {
-                    act: *act,
-                    w: *w,
-                    y: *y,
-                    input_scales: None,
-                    scales: None,
-                    quant: None,
-                    logits: true,
-                })?;
-                kernels_cuda::attn::merge::logit_softcap(self.ctx(), &mut self.tensor(*y), *cap)
-            }
+                ins,
+                key,
+                outs,
+            } => self.anchored(*act, *w, ins, *key, outs),
             _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+        }
+    }
+
+    /// A `fused.anchored`: the contraction of `act` and the dense bank `w`
+    /// with the epilogue the load loaded for `key` filled in, its inputs'
+    /// planes read as the epilogue's kinds say, on whichever candidate the
+    /// GEMM tuner picks for the shape.
+    fn anchored(
+        &mut self,
+        act: ValueId,
+        w: ValueId,
+        ins: &[ValueId],
+        key: u64,
+        outs: &[ValueId],
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "fused.anchored";
+        let broken = |detail: String| kernels_cuda::Error::Backend { op: OP, detail };
+        let epi = self
+            .anchor_epilogue(key)
+            .ok_or_else(|| broken(format!("the load loaded no epilogue for {key:016x}")))?;
+        if !self.dense_weight(w) {
+            return Err(broken(format!(
+                "the weight {} is not one dense bf16 plane, and an anchored region's is",
+                w.0
+            )));
+        }
+        let planes: Vec<linear::frame::In> = ins
+            .iter()
+            .zip(epi.inputs())
+            .map(|(&v, input)| {
+                let t = self.tensor(v);
+                match input {
+                    linear::frame::Input::Tile => linear::frame::In::tile(t.ptr, t.width),
+                    linear::frame::Input::Column => linear::frame::In::column(t.ptr),
+                    linear::frame::Input::Row => linear::frame::In::row(t.ptr),
+                    linear::frame::Input::One => linear::frame::In::one(t.ptr),
+                }
+            })
+            .collect();
+        let landed: Vec<Tensor> = outs.iter().map(|&v| self.tensor(v)).collect();
+        if linear::gemm::anchored(
+            self.ctx(),
+            OP,
+            epi,
+            self.tensor(act),
+            self.tensor(w),
+            &planes,
+            &landed,
+        )? {
+            Ok(())
+        } else {
+            Err(broken(
+                "neither a contraction frame nor the unfused leg landed it, and the fold forms \
+                 only what one does"
+                    .into(),
+            ))
         }
     }
 
@@ -2197,7 +2148,7 @@ impl Run<'_> {
         if act.rows > linear::w8a16::MMA_UNTIL
             && let Some(shadow) = self.fp8_shadow(w)
         {
-            linear::gemm::act_x_wt(self.ctx(), op, act, shadow, None, &mut out)?;
+            linear::gemm::act_x_wt(self.ctx(), op, act, shadow, &mut out)?;
             return Ok(());
         }
         let k = act.width;

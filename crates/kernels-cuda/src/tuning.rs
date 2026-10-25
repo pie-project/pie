@@ -242,13 +242,6 @@ pub struct GemmFp8MmaKUntil(pub u32);
 #[decision(id = "kernel.attn_res.fused_norm", flag, default = false, tune = search)]
 pub struct AttnResFusedNorm;
 
-/// Whether a dense projection's bias lands from the cuBLASLt epilogue of the
-/// algorithm its shape chose, instead of a separate add. Off but where a
-/// chip's profile turns it on (B200's).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.gemm.bias_epilogue", flag, default = false, tune = search)]
-pub struct GemmBiasEpilogue;
-
 /// The fewest routes a routed mxfp4 select runs on the register-dequant MMA
 /// kernel with (up to `kernel.moe.mxfp4_mma_until`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -848,7 +841,6 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmFp8ODown>()
         .add::<MoeMxfp4A8Until>()
         .add::<MoeMxfp4A8From>()
-        .add::<GemmBiasEpilogue>()
         .add::<MoeW4a4FusedFrom>()
         .add::<MoeW4a8FusedFrom>()
         .add::<MoeMegaUntil>()
@@ -988,7 +980,6 @@ tuning! {
     fp8_o_down: bool = false, on GemmFp8ODown;
     mxfp4_a8_until: u32 = 0, get MoeMxfp4A8Until;
     mxfp4_a8_from: u32 = 0, get MoeMxfp4A8From;
-    gemm_bias_epilogue: bool = false, on GemmBiasEpilogue;
     moe_w4a4_fused_from: u32 = 65_536, get MoeW4a4FusedFrom;
     moe_w4a8_fused_from: u32 = 65_536, get MoeW4a8FusedFrom;
     moe_mega_until: u32 = 0, get MoeMegaUntil;

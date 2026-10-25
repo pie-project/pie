@@ -13,33 +13,31 @@ use kernels_cuda::tuning::Tuning;
 #[rustfmt::skip]
 const GEMV: Tuning = Tuning { gemm_fp8_gemv_until: 8, ..SM100 };
 
-/// The dot of `x` (`[m][k]`) and `w` (`[n][k]`), with `bias[c]` added.
-fn dense(x: &[f64], w: &[f64], [m, n, k]: [usize; 3], bias: Option<&[f64]>) -> Vec<Want> {
-    let want = dot([m, n, k], |r, i| x[r * k + i], |_, c, i| w[c * k + i]);
-    let add = |i: usize| bias.map_or(0.0, |b| b[i % n]);
-    tab(want.len(), |i| (want[i].0 + add(i), want[i].1))
+/// The dot of `x` (`[m][k]`) and `w` (`[n][k]`).
+fn dense(x: &[f64], w: &[f64], [m, n, k]: [usize; 3]) -> Vec<Want> {
+    dot([m, n, k], |r, i| x[r * k + i], |_, c, i| w[c * k + i])
 }
 
 #[test]
 fn the_few_rows_and_narrow_gemms_land_the_dot() {
     use kernels_cuda::linear::gemv::{gemm_narrow_bf16, gemm_rows_bf16};
-    // (few rows, m, n, k, bias): the rows kernel at each K split (8, 4, 2,
-    // 1 warps a row) and over a cluster (a router's few columns), the narrow
+    // (few rows, m, n, k): the rows kernel at each K split (8, 4, 2, 1
+    // warps a row) and over a cluster (a router's few columns), the narrow
     // one at column counts of its template.
     #[rustfmt::skip]
-    let cases = [(true, 8, 512, 4096, false), (true, 5, 300, 96, true), (true, 2, 64, 48, true),
-        (true, 3, 7, 1032, false), (true, 8, 16, 8192, true), (false, 64, 4, 10240, false), (false, 7, 1, 264, true)];
-    for (rows, m, n, k, bias) in cases {
+    let cases = [(true, 8, 512, 4096), (true, 5, 300, 96), (true, 2, 64, 48),
+        (true, 3, 7, 1032), (true, 8, 16, 8192), (false, 64, 4, 10240), (false, 7, 1, 264)];
+    for (rows, m, n, k) in cases {
         let mut b = Bench::new((m * 31 + n * 7 + k) as u64);
-        let ((x, xv), (w, wv), (bias_at, bv)) = (b.bf16(m * k), b.bf16(n * k), b.bf16(n));
-        let (bias_at, y, ctx) = (if bias { bias_at } else { 0 }, b.zeros(m * n * 2), b.ctx());
+        let ((x, xv), (w, wv)) = (b.bf16(m * k), b.bf16(n * k));
+        let (y, ctx) = (b.zeros(m * n * 2), b.ctx());
         let s = (m as i32, n as i32, k as i32);
         let fire = || match rows {
-            true => gemm_rows_bf16(&ctx, w, x, bias_at, y, s.0, s.1, s.2, false),
-            false => gemm_narrow_bf16(&ctx, w, x, bias_at, y, s.0, s.1, s.2),
+            true => gemm_rows_bf16(&ctx, w, x, y, s.0, s.1, s.2, false),
+            false => gemm_narrow_bf16(&ctx, w, x, y, s.0, s.1, s.2),
         };
         fire().expect("fires");
-        let want = dense(&xv, &wv, [m, n, k], bias.then_some(&bv[..]));
+        let want = dense(&xv, &wv, [m, n, k]);
         b.check(y, &want, TOL, &format!("{m}x{n}x{k}"));
         // The slices add in a fixed order: a second launch lands the same bits.
         let first = b.read(y, m * n);
@@ -59,29 +57,6 @@ fn the_skinny_frame_refuses_shapes_off_its_tile() {
     let (w, a, y) = (b.zeros(96 * 256), b.zeros(256), b.zeros(192));
     let fired = skinny(&b.ctx(), Epilogue::store(), w, a, &[], &[y], 1, 96, 128);
     assert!(fired.is_err());
-}
-
-#[test]
-fn the_biased_projection_lands_the_dot_and_its_bias() {
-    use kernels_cuda::linear::gemm::matmul_bias;
-    // The bias folded into the gemv's store, and on cuBLASLt's epilogue.
-    #[rustfmt::skip]
-    let cases = [(1, 512, 256, false), (3, 4104, 256, false), (64, 640, 2880, true)];
-    for (m, n, k, lt) in cases {
-        let mut b = Bench::new(0x5b ^ n as u64);
-        let ((w, wv), (x, xv), (bias, bv)) = (b.bf16(n * k), b.bf16(m * k), b.bf16(n));
-        let mut y = b.out(m, n);
-        let mut tuning = b.ctx().tuning();
-        tuning.gemm_bias_epilogue = lt;
-        let ctx = b.ctx().with_tuning(tuning);
-        let (xt, wt, bt) = (t(x, m, k, Bf16), t(w, n, k, Bf16), t(bias, 1, n, Bf16));
-        // Twice: the first call picks the shape's tactic, the second runs it.
-        for _ in 0..2 {
-            matmul_bias(&ctx, xt, wt, bt, &mut y).expect("the biased projection fires");
-        }
-        let want = dense(&xv, &wv, [m, n, k], Some(&bv));
-        b.check(y.ptr, &want, TOL, &format!("{m}x{n}x{k}"));
-    }
 }
 
 #[test]
@@ -105,7 +80,7 @@ fn the_lane_projection_and_the_scalar_multiply_land_each_dtype() {
         // The scalar multiply scales the plane in place, to the rounded product.
         mul_scalar(&ctx, s, &mut t(x, rows, k, dtype)).expect("the multiply fires");
         b.sync();
-        let (want, got) = (dense(&xv, &wv, [rows, n, k], None), read(&b, y, rows * n));
+        let (want, got) = (dense(&xv, &wv, [rows, n, k]), read(&b, y, rows * n));
         check(&got, &want, pick(f, 1e-5, TOL), &format!("{dtype:?}"));
         let round = |v: f32| pick(f, v, from_bf16(to_bf16(v)));
         let scaled = tab(rows * k, |i| f64::from(round(f32s[i] * round(s))));
@@ -166,7 +141,7 @@ fn the_quantized_dense_projections_answer_the_dequantized_dot() {
             affine::matmul(&ctx, xt, c, f, post, Some(z), Bf16, &mut y, seat).expect("fires");
             tab(n * k, |i| f64::from(s.values[i]))
         };
-        let want = dense(&xv, &w, [rows, n, k], None);
+        let want = dense(&xv, &w, [rows, n, k]);
         let what = format!("NVFP4 {nv}, {bits} bits, {rows} rows");
         b.check(y.ptr, &want, TOL, &what);
     }
@@ -199,7 +174,7 @@ fn the_affine_gemv_on_the_tensor_cores_answers_the_dequantized_dot() {
         let post = affine::OffsetKind::Post;
         affine::matmul(&ctx, xt, c, f, post, Some(z), Bf16, &mut y, seat).expect("fires");
         let w = tab(n * k, |i| f64::from(s.values[i]));
-        let want = dense(&xv, &w, [rows, n, k], None);
+        let want = dense(&xv, &w, [rows, n, k]);
         b.check(y.ptr, &want, TOL, &format!("{rows} rows, {n} x {k}"));
     }
 }

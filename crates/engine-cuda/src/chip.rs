@@ -517,7 +517,6 @@ mod tests {
                 assert_eq!(tuning.ssm_gdn_out_bf16, b200, "{gpu}");
                 assert_eq!(tuning.qg_prologue_until, if b200 { 64 } else { 0 }, "{gpu}");
                 assert_eq!(tuning.merge_warp, b200, "{gpu}");
-                assert_eq!(tuning.gemm_bias_epilogue, b200, "{gpu}");
                 assert_eq!(tuning.decode_gqa, b200, "{gpu}");
                 assert_eq!(tuning.pool_mma, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(tuning.index_radix, major == 10 && minor == 0, "{gpu}");
@@ -601,7 +600,6 @@ mod tests {
                         prefill_tc5: false,
                         prefill_wide_sliding: false,
                         decode_grouped_prefill_from: 0,
-                        gemm_bias_epilogue: false,
                         moe_w4a4_fused_from: 65_536,
                         moe_w4a4_fused_layout: defaults.moe_w4a4_fused_layout,
                         moe_even_waves_from: defaults.moe_even_waves_from,
@@ -669,7 +667,6 @@ mod tests {
                         merge_warp: false,
                         pool_mma: false,
                         compressed_decode_until: 0,
-                        gemm_bias_epilogue: false,
                         gemm_rows_m: 0,
                         attn_res_fused_norm: false,
                         mxfp4_mma_from: defaults.mxfp4_mma_from,
@@ -761,11 +758,14 @@ mod tests {
             }
         );
         // The compiler's prices as before, but that CUDA folds each chain
-        // into a generated row kernel: its rules hold no residual norm.
+        // into a generated row kernel and each product's epilogue into its
+        // contraction frame: its rules hold no residual norm, bias or soft
+        // cap.
         assert_eq!(
             poem_compiler::DeviceProfile::of(&registry().defaults(), 132, &[], &[]),
             poem_compiler::DeviceProfile {
                 synth_regions: cfg!(not(feature = "rocm")),
+                synth_anchors: cfg!(not(feature = "rocm")),
                 ..poem_compiler::DeviceProfile::default()
             }
         );

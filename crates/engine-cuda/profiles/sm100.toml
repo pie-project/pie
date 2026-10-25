@@ -91,8 +91,6 @@ sdpa.decode.gqa_cluster = 8
 # Muse Spark's bs64 decode attention 328 -> 288 us a step, gpt-oss-120b's
 # 7-8 us a step at bs1/8/64 (bs8 Muse even).
 sdpa.decode.gqa_deep_64 = true
-# A dense bias from the cuBLASLt epilogue.
-gemm.bias_epilogue = true
 # Routed MLPs kept by expert with the GLU in the gate-up epilogue: W4A4
 # always, W4A8 from 512 tokens.
 moe.w4a4_fused_from = 1

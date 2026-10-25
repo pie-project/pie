@@ -64,12 +64,10 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
             rules::qkv_fused_qknorm_rope_vnorm_write(),
             rules::embed_scale_add_select(),
             rules::embed_scale_add(),
-            rules::matmul_glu(&[GluAct::GegluTanh, GluAct::Swiglu]),
+            rules::matmul_glu(&[GluAct::Swiglu]),
             rules::moe_mega(),
             rules::moe_experts(),
             rules::moe_select_glu(),
-            rules::matmul_softcap(),
-            rules::matmul_bias(),
             rules::matmul_moe_route(),
             rules::matmul_split_rows(),
             rules::gated_residual_norm_modulate(),
@@ -123,13 +121,21 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
 /// and, at the default knobs, outruns the rule's hand kernel. A head's norm
 /// and the turn of its tail (`norm_rope`'s `Last`: dots3's k row,
 /// DeepSeek-V4's q). Its `First` (Gemma 4's split turn) stays: a 512-wide
-/// head's region trails the hand kernel at a decode's rows.
+/// head's region trails the hand kernel at a decode's rows. And the hand
+/// product rules CUDA's anchored regions replace (`fuse::anchor`): a
+/// product's bias, its soft cap and a packed bank's GEGLU, each the
+/// epilogue of its contraction frame, timed against the product and the
+/// epilogue on the row frame.
 #[cfg(not(feature = "rocm"))]
 #[must_use]
 pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
-    vec![poem_compiler::fuse::rules::norm_rope(
-        poem_compiler::fuse::rules::Rotated::Last,
-    )]
+    use poem_compiler::fuse::rules;
+    vec![
+        rules::norm_rope(rules::Rotated::Last),
+        rules::matmul_glu(&[poem_ir::GluAct::GegluTanh]),
+        rules::matmul_softcap(),
+        rules::matmul_bias(),
+    ]
 }
 
 /// The fused kernels left on with `fuse-chains=off`.
@@ -223,16 +229,40 @@ mod tests {
     }
 
     /// The hand rules CUDA no longer holds, their chains generated row
-    /// kernels: on every catalog deployment, fused by this backend's rules
-    /// and folded, none of them finds a match left, so each site the rule
-    /// would form is a region (`fuse::chain`). A retired rule's op may be
-    /// another rule's too (`norm_rope`'s two turns), so its sites are what
-    /// it forms past the backend's.
+    /// kernels and their products' epilogues anchored regions: on every
+    /// catalog deployment, fused by this backend's rules and folded (the
+    /// anchors, then the chains), none of them finds a match left that it
+    /// fused, so each such site is a region (`fuse::chain`) or an anchored
+    /// one (`fuse::anchor`). A product's rule fused only bf16 rows against a
+    /// weight stored bf16 (its dispatch ran the product and its op apart over
+    /// any other), so a site over another keeps its ops; so does one whose
+    /// product is no whole runs of eight wide (a two-column head), which no
+    /// row frame carries and the rule ran apart past one row. A retired
+    /// rule's op may be another rule's too (`norm_rope`'s two turns), so its
+    /// sites are what it forms past the backend's.
     #[cfg(not(feature = "rocm"))]
     #[test]
-    fn every_site_a_retired_rule_formed_folds_into_a_region() {
+    fn every_site_a_retired_rule_fused_folds_into_a_region() {
+        use poem_ir::{Def, Dim, Dtype, Fused, Trace, Ty, ValueId};
         let mut wrong = Vec::new();
-        let mut sites = 0usize;
+        let mut census = std::collections::BTreeMap::<&str, (usize, usize, usize)>::new();
+        let bf16 = |t: &Trace, v: &ValueId| {
+            let decl = &t.values[v.0 as usize];
+            match decl.def {
+                Def::Weight(p) => t.params[p as usize].dtype == Dtype::Bf16,
+                _ => matches!(
+                    decl.ty,
+                    Ty::Tensor {
+                        dtype: Dtype::Bf16,
+                        ..
+                    }
+                ),
+            }
+        };
+        let narrow = |t: &Trace, v: &ValueId| {
+            matches!(&t.values[v.0 as usize].ty,
+                Ty::Tensor { shape, .. } if matches!(shape.last(), Some(Dim::Const(n)) if n % 8 != 0))
+        };
         for rule in super::retired() {
             let kernel = rule.kernel();
             let only = [rule];
@@ -240,26 +270,63 @@ mod tests {
                 let Ok(trace) = row.try_trace(poem_ir::Platform::Cuda) else {
                     continue;
                 };
-                let count = |t: &poem_ir::Trace| {
-                    t.nodes
-                        .iter()
-                        .filter(|n| matches!(&n.op, Operation::Fused(op) if poem_ir::Operands::name(op) == kernel))
-                        .count()
+                // The sites the rule forms in `t` that it fused (its product
+                // bf16 against a bf16 weight), and of those the ones too
+                // narrow for a row frame.
+                let sites = |t: &Trace| {
+                    let mut held = (0usize, 0usize);
+                    for n in &t.nodes {
+                        let Operation::Fused(op) = &n.op else {
+                            continue;
+                        };
+                        if poem_ir::Operands::name(op) != kernel {
+                            continue;
+                        }
+                        let (fused, thin) = match op {
+                            Fused::MatmulBias { act, w, y, .. }
+                            | Fused::MatmulSoftcap { act, w, y, .. } => {
+                                (bf16(t, act) && bf16(t, w), narrow(t, y))
+                            }
+                            Fused::MatmulGlu { act, w, y, .. } => {
+                                (bf16(t, act) && bf16(t, w), narrow(t, y))
+                            }
+                            _ => (true, false),
+                        };
+                        if fused {
+                            held.0 += 1;
+                            held.1 += usize::from(thin);
+                        }
+                    }
+                    held
                 };
-                let formed = |t: poem_ir::Trace| {
-                    let before = count(&t);
-                    count(&poem_compiler::fuse::fuse(t, only.iter())) - before
+                let formed = |t: Trace| {
+                    let before = sites(&t);
+                    let after = sites(&poem_compiler::fuse::fuse(t, only.iter()));
+                    (after.0 - before.0, after.1 - before.1)
                 };
                 let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
-                sites += formed(fused.clone());
-                let (folded, _) = poem_compiler::fuse::chain::fold(fused);
-                let left = formed(folded);
-                if left > 0 {
-                    wrong.push(format!("{}: {left} `{kernel}` sites left", row.name));
+                let (here, _) = formed(fused.clone());
+                let (anchored, _) = crate::synth::fold_anchors(fused);
+                let (folded, _) = poem_compiler::fuse::chain::fold(anchored);
+                let (left, thin) = formed(folded);
+                let held = census.entry(kernel).or_default();
+                held.0 += here;
+                held.1 += usize::from(here > 0);
+                held.2 += thin;
+                if left > thin {
+                    wrong.push(format!(
+                        "{}: {} of {here} `{kernel}` sites left",
+                        row.name,
+                        left - thin
+                    ));
                 }
             }
         }
-        assert!(sites > 0, "the retired rules matched somewhere");
+        eprintln!("retired sites (fused, deployments, too narrow to fold): {census:?}");
+        assert!(
+            census.values().all(|(sites, ..)| *sites > 0),
+            "each retired rule fused somewhere: {census:?}"
+        );
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
@@ -287,9 +354,10 @@ mod tests {
         assert!(refused.is_empty(), "formed, then refused: {refused:?}");
     }
 
-    /// No `fused.region` of a catalog deployment, fused by this backend's
-    /// rules, folded and planned, lands an output over one of its inputs: a
-    /// generated kernel reads its parameters read-only on that. The arena
+    /// No `fused.region` or `fused.anchored` of a catalog deployment, fused
+    /// by this backend's rules, folded and planned, lands an output over one
+    /// of its inputs: a generated kernel reads its parameters read-only on
+    /// that. The arena
     /// holds a value over every node that reads or writes it, both ends
     /// included, so an input the region reads last and an output it writes
     /// first are live together at its node; and a region aliases no output
@@ -306,7 +374,8 @@ mod tests {
                 continue;
             };
             let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
-            let (folded, _) = poem_compiler::fuse::chain::fold(fused);
+            let (anchored, _) = crate::synth::fold_anchors(fused);
+            let (folded, _) = poem_compiler::fuse::chain::fold(anchored);
             let regions: Vec<(Vec<poem_ir::ValueId>, Vec<poem_ir::ValueId>)> = folded
                 .nodes
                 .iter()
@@ -314,6 +383,10 @@ mod tests {
                     Operation::Fused(Fused::Region { ins, outs, .. }) => {
                         Some((ins.clone(), outs.clone()))
                     }
+                    Operation::Fused(Fused::Anchored { act, ins, outs, .. }) => Some((
+                        [*act].into_iter().chain(ins.iter().copied()).collect(),
+                        outs.clone(),
+                    )),
                     _ => None,
                 })
                 .collect();

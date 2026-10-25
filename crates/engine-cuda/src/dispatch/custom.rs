@@ -10,19 +10,21 @@ use crate::run::Run;
 
 /// The fused ops this backend's dispatch turns away. Its rules form none of
 /// them (`every_fused_op_its_rules_form_is_one_dispatch_fires`): the residual
-/// norms run as generated regions here, their fused ops ROCm's and Metal's.
+/// norms run as generated regions here, a product's bias, soft cap and
+/// GEGLU as anchored ones (`fused.anchored`), their fused ops ROCm's and
+/// Metal's.
 pub(crate) fn refuses(op: &Fused) -> bool {
     match op {
         Fused::GdnStep { .. }
+        | Fused::MatmulBias { .. }
+        | Fused::MatmulSoftcap { .. }
         | Fused::ResidualAddRmsnorm { .. }
         | Fused::RmsnormResidualAdd { .. }
         | Fused::QGateNormRopeAppend {
             intermediates: Intermediates::Written,
             ..
         } => true,
-        Fused::MatmulGlu { glu, .. } => {
-            !matches!(glu, poem_ir::GluAct::Swiglu | poem_ir::GluAct::GegluTanh)
-        }
+        Fused::MatmulGlu { glu, .. } => !matches!(glu, poem_ir::GluAct::Swiglu),
         Fused::NormRope { weight, turn, .. } => match turn {
             poem_ir::Turn::Partial { .. } => weight.is_none(),
             poem_ir::Turn::Last { .. } => false,
@@ -50,6 +52,8 @@ impl DispatchFused for Run<'_> {
                 }
             }
             Fused::GdnStep { .. }
+            | Fused::MatmulBias { .. }
+            | Fused::MatmulSoftcap { .. }
             | Fused::ResidualAddRmsnorm { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::QGateNormRopeAppend {
@@ -76,10 +80,9 @@ impl DispatchFused for Run<'_> {
             Fused::ResBlendRmsnorm { .. } => self.res_blend_rmsnorm(op),
             Fused::HcFoldPre { .. } => self.hc_fold_pre(op),
             Fused::HcPre { .. } => self.hc_pre(op),
-            Fused::MatmulGlu { .. }
+            Fused::Anchored { .. }
+            | Fused::MatmulGlu { .. }
             | Fused::MatmulSwigluMatmul { .. }
-            | Fused::MatmulSoftcap { .. }
-            | Fused::MatmulBias { .. }
             | Fused::MatmulMoeRoute { .. }
             | Fused::MatmulSplitRows { .. }
             | Fused::MoeSelectGlu { .. }

@@ -21,7 +21,7 @@ use crate::common::{Gpu, Lcg};
 use crate::elemwise::within::{assert_within, deterministic};
 use dtype::Dtype::{self, Bf16};
 use kernels_cuda::linear::frame::{
-    Anchored, Contraction, Epilogue, Frame, In, Input, Layout, Pointwise, Quant,
+    self, Anchored, Contraction, Epilogue, Frame, In, Input, Layout, Pointwise, Quant,
 };
 use kernels_cuda::linear::gemm;
 use kernels_cuda::tuning::Tuning;
@@ -279,23 +279,25 @@ fn each_frame_lands_each_epilogue_as_the_interpreter() {
     }
 }
 
-/// The hand rules' epilogues (`fused.matmul_softcap`'s, `fused.matmul_glu`'s
-/// GEGLU) through the tuner's anchored entry, its fused frames timed
-/// against the product then the region on the row frame: whichever it
-/// picks lands the interpreter's result, and a shape no frame covers is
-/// left to the caller.
+/// A soft cap's and GEGLU's epilogues through the tuner's anchored entry,
+/// its fused frames timed against the product then the region on the row
+/// frame: whichever it picks lands the interpreter's result. A shape no
+/// frame covers lands it on the unfused leg, untimed; one whose leg the row
+/// frame does not carry either (a vector a row) is left to the caller, and
+/// `frame::serves` says so before anything fires.
 #[test]
-fn the_anchored_entry_lands_the_hand_rules_on_its_pick() {
+fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
     for (case, m, n, k) in [
         (Case::Softcap, 4, 512, 256),
         (Case::Softcap, 1, 9216, 256),
         (Case::Geglu, 8, 256, 512),
+        // Past every frame's rows: the unfused leg, in place and in scratch.
+        (Case::Softcap, 100, 64, 128),
+        (Case::Geglu, 100, 64, 128),
     ] {
-        let epi = match case {
-            Case::Softcap => Epilogue::softcap(30.0).expect("a cap"),
-            _ => Epilogue::geglu_tanh(),
-        };
         let anchored = case.anchored(n, k);
+        let epi = Epilogue::interned(&anchored).expect("the frames take it");
+        assert!(frame::serves(&anchored, &[], &[Bf16]).is_ok(), "{case:?}");
         let parts = anchored.contraction.layout.parts() as usize;
         let mut gpu = Gpu::open();
         let mut lcg = Lcg::seeded((m + n + k) as u64);
@@ -321,16 +323,43 @@ fn the_anchored_entry_lands_the_hand_rules_on_its_pick() {
         let want: Vec<f32> = want[0].iter().map(|&v| round_bf16(v)).collect();
         assert_within(&what, &gpu.down::<u16>(y, m * n), &want, case.tolerance());
     }
-    // Past every frame's rows: the caller's ops serve it.
-    let mut gpu = Gpu::open();
+    // A row's scale past every frame's rows: no leg carries it.
     let (m, n, k) = (100, 64, 128);
-    let (w, act, y) = (
+    let anchored = Anchored {
+        epilogue: Some(Pointwise {
+            region: Region {
+                width: n as u32,
+                params: vec![Shape::Row, Shape::Scalar],
+                ops: vec![Op::Binary(Binary::Mul, 0, 1)],
+                results: vec![2],
+                rounds: vec![(2, Bf16)],
+            },
+            inputs: vec![Input::Row],
+        }),
+        ..Anchored::plain(contraction(n, k, Layout::Dense, Some(Bf16)))
+    };
+    assert!(frame::serves(&anchored, &[Bf16], &[Bf16]).is_err());
+    let epi = Epilogue::interned(&anchored).expect("the frames take it");
+    let mut gpu = Gpu::open();
+    let (w, act, s, y) = (
         gpu.zeros(n * k * 2),
         gpu.zeros(m * k * 2),
+        gpu.zeros(m * 2),
         gpu.zeros(m * n * 2),
     );
-    let epi = Epilogue::softcap(30.0).expect("a cap");
     let (a, wt, yt) = (t(act, m, k, Bf16), t(w, n, k, Bf16), t(y, m, n, Bf16));
-    let served = gemm::anchored(&gpu.ctx(), "test.anchored", epi, a, wt, &[], &[yt]);
-    assert_eq!(served.ok(), Some(false), "no frame covers {m} rows");
+    let served = gemm::anchored(
+        &gpu.ctx(),
+        "test.anchored",
+        epi,
+        a,
+        wt,
+        &[In::row(s)],
+        &[yt],
+    );
+    assert_eq!(
+        served.ok(),
+        Some(false),
+        "no frame covers {m} rows, nor a leg"
+    );
 }

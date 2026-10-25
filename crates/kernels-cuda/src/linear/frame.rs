@@ -19,17 +19,17 @@
 //!   keys the unit's text, the headers and the instantiation, as it does a
 //!   carried unit's.
 //! - **Loading.** A kernel loads on its first fire, as the carried kernels
-//!   these frames replace did: the fused hand rules' bodies (the store, a
-//!   bias, a soft cap, GEGLU) are fixed, and the tuner fires each before a
-//!   capture. An epilogue a load forms loads with the model
-//!   ([`Epilogue::load`]).
+//!   these frames replace did: the plain store's body is fixed, and the
+//!   tuner fires it before a capture. An anchored region a load forms
+//!   loads with the model, every kernel a fire of it may take
+//!   ([`Epilogue::load_every`]).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use dtype::Dtype;
 pub use kernels_ir::anchor::{Anchored, Contraction, Input, Layout, Pointwise, Quant};
-use kernels_ir::{Binary, Literal, Op, Region, Shape, Unary};
+use kernels_ir::{Region, Shape};
 
 use crate::error::Error;
 use crate::jit::{Kernel, Root, refuse};
@@ -94,6 +94,17 @@ impl In {
             base,
             row_stride: 0,
             col_stride: 0,
+        }
+    }
+
+    /// The same input read from tile row `row` on: a run of the tile's rows
+    /// served apart.
+    #[cfg(feature = "cuda")]
+    #[must_use]
+    pub(crate) const fn from_row(self, row: usize) -> In {
+        In {
+            base: self.base + (row as i64 * self.row_stride * 2) as u64,
+            ..self
         }
     }
 
@@ -244,95 +255,6 @@ impl Epilogue {
         })
     }
 
-    /// `y + bias[n]`, the product rounded first and the sum after: what
-    /// `fused.matmul_bias` lands.
-    #[must_use]
-    pub fn bias() -> &'static Epilogue {
-        static BIAS: OnceLock<&'static Epilogue> = OnceLock::new();
-        BIAS.get_or_init(|| {
-            let region = Region {
-                width: RULE_WIDTH,
-                params: vec![Shape::Row, Shape::Row],
-                ops: vec![Op::Binary(Binary::Add, 0, 1)],
-                results: vec![2],
-                rounds: vec![(2, Dtype::Bf16)],
-            };
-            ruled(Layout::Dense, region, vec![Input::Column])
-        })
-    }
-
-    /// `cap · tanh(y / cap)` over the rounded product: what
-    /// `fused.matmul_softcap` lands. kernels-ir has no `tanh`, so it is
-    /// `2 / (1 + e^(-2x)) - 1`, within an f32 rounding or two of `tanhf`
-    /// but where `x` is so small that the bf16 product rounds it away.
-    pub fn softcap(cap: f32) -> Result<&'static Epilogue, Error> {
-        if !(cap.is_finite() && cap > 0.0) {
-            return Err(refuse(
-                OP,
-                format!("a softcap of {cap} is not a positive number"),
-            ));
-        }
-        let region = Region {
-            width: RULE_WIDTH,
-            params: vec![Shape::Row],
-            ops: vec![
-                Op::Const(Literal::F32(-2.0 / cap)), // 1
-                Op::Binary(Binary::Mul, 0, 1),       // 2: -2y / cap
-                Op::Unary(Unary::Exp, 2),            // 3
-                Op::Const(Literal::F32(1.0)),        // 4
-                Op::Binary(Binary::Add, 4, 3),       // 5
-                Op::Const(Literal::F32(2.0)),        // 6
-                Op::Binary(Binary::Div, 6, 5),       // 7
-                Op::Binary(Binary::Sub, 7, 4),       // 8: tanh(y / cap)
-                Op::Const(Literal::F32(cap)),        // 9
-                Op::Binary(Binary::Mul, 9, 8),       // 10
-            ],
-            results: vec![10],
-            rounds: vec![(10, Dtype::Bf16)],
-        };
-        Epilogue::interned(&Anchored {
-            epilogue: Some(Pointwise {
-                region,
-                inputs: Vec::new(),
-            }),
-            ..Anchored::plain(rule(Layout::Dense))
-        })
-    }
-
-    /// `gelu_tanh(gate) · up` over a packed `[gate | up]` bank's two rounded
-    /// products, each `(m, n)` its gate and its up: what `fused.matmul_glu`
-    /// (GEGLU) lands. `0.5 g (1 + tanh(z))` is `g / (1 + e^(-2z))`, `z =
-    /// √(2/π) (g + 0.044715 g³)`.
-    #[must_use]
-    pub fn geglu_tanh() -> &'static Epilogue {
-        static GEGLU: OnceLock<&'static Epilogue> = OnceLock::new();
-        GEGLU.get_or_init(|| {
-            const ALPHA: f32 = 0.797_884_6;
-            const BETA: f32 = 0.044_715;
-            let region = Region {
-                width: RULE_WIDTH,
-                params: vec![Shape::Row, Shape::Row],
-                ops: vec![
-                    Op::Binary(Binary::Mul, 0, 0),         // 2: g²
-                    Op::Binary(Binary::Mul, 2, 0),         // 3: g³
-                    Op::Const(Literal::F32(BETA)),         // 4
-                    Op::Binary(Binary::Mul, 4, 3),         // 5
-                    Op::Binary(Binary::Add, 0, 5),         // 6
-                    Op::Const(Literal::F32(-2.0 * ALPHA)), // 7
-                    Op::Binary(Binary::Mul, 7, 6),         // 8: -2z
-                    Op::Unary(Unary::Exp, 8),              // 9
-                    Op::Const(Literal::F32(1.0)),          // 10
-                    Op::Binary(Binary::Add, 10, 9),        // 11
-                    Op::Binary(Binary::Div, 0, 11),        // 12: gelu(g)
-                    Op::Binary(Binary::Mul, 12, 1),        // 13
-                ],
-                results: vec![13],
-                rounds: vec![(13, Dtype::Bf16)],
-            };
-            ruled(Layout::Packed(2), region, Vec::new())
-        })
-    }
-
     /// The products each `(m, n)` has, one a packed part.
     #[must_use]
     pub const fn parts(&self) -> u32 {
@@ -420,6 +342,76 @@ impl Epilogue {
         Ok(words)
     }
 
+    /// Compiles every kernel a fire of this body at `n x k` may take (each
+    /// frame at each count of rows it covers, and the unfused leg's row
+    /// kernel) or reads it from the disk cache, and loads it on the current
+    /// device: an anchored region a load forms is loaded with the model.
+    pub fn load_every(&self, n: u32, k: u32, tuning: &Tuning) -> Result<(), Error> {
+        let (ni, ki) = (count_of(n)?, count_of(k)?);
+        let mut frames = Vec::new();
+        for frame in Frame::ALL {
+            let rows: Vec<u32> = match frame {
+                Frame::Gemv => vec![1],
+                Frame::Rows => (1..=ROWS_M).collect(),
+                // one kernel at every count of rows
+                Frame::Skinny => vec![1],
+            };
+            for m in rows {
+                if frame.covers(self, count_of(m)?, ni, ki, tuning) {
+                    frames.push((frame, m));
+                }
+            }
+        }
+        self.load(&frames, n, k, tuning)?;
+        #[cfg(feature = "cuda")]
+        if self.leg(n).is_some() && RowLeg::of(self, n).is_none() {
+            return Err(refuse(
+                OP,
+                format!("the unfused leg's row kernel over {n} columns did not load"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The row frame's region, planes and slices of a row for this body's
+    /// unfused leg over `n` columns, or `None` where the row frame does not
+    /// carry it: a row in no whole runs of eight, or a region it refuses. A
+    /// row wider than the frame holds is cut into slices of equal width,
+    /// each its own launch over every row, so every input reads as it does
+    /// whole (a vector a column from the slice's column on).
+    fn leg(&self, n: u32) -> Option<LegShape> {
+        use crate::synth::{In as Form, MAX_WIDTH, Out};
+        if self.plain || n == 0 || !n.is_multiple_of(8) {
+            return None;
+        }
+        let slices = (n.div_ceil(MAX_WIDTH)..=n / 8)
+            .find(|c| n.is_multiple_of(*c) && (n / c).is_multiple_of(8))?;
+        let width = n / slices;
+        let bf16 = Dtype::Bf16;
+        let ins: Vec<Form> = (0..self.parts)
+            .map(|_| Form::Rows(bf16))
+            .chain(self.inputs.iter().map(|input| match input {
+                Input::Tile => Form::Rows(bf16),
+                Input::Column => Form::Shared(bf16),
+                Input::Row => Form::Each(bf16),
+                Input::One => Form::One(bf16),
+            }))
+            .collect();
+        let outs = vec![Out::Rows(bf16); self.results];
+        let region = Region {
+            width,
+            ..self.region.clone()
+        };
+        crate::synth::supports(&region, &ins, &outs).ok()?;
+        Some(LegShape {
+            region,
+            ins,
+            outs: outs.len(),
+            width,
+            slices,
+        })
+    }
+
     /// Compiles every kernel `frames` fires of this body at `n x k` (or
     /// reads it from the disk cache) and loads it on the current device: an
     /// epilogue a load forms is loaded with the model, before a fire.
@@ -437,12 +429,59 @@ impl Epilogue {
     }
 }
 
-/// The width the hand rules' regions are stated at: a pointwise region's
+/// Whether the contraction frames serve `anchored` at every count of rows
+/// a fire may hand it, its inputs stored as `ins` and its results as
+/// `outs`, or why not: an epilogue the frames take (bf16 planes in and out)
+/// whose unfused leg the row frame carries, so that a shape no frame covers
+/// lands all the same ([`crate::linear::gemm::anchored`]). What a compiler
+/// asks before it forms one.
+pub fn serves(anchored: &Anchored, ins: &[Dtype], outs: &[Dtype]) -> Result<(), Error> {
+    if let Some(dtype) = ins.iter().chain(outs).find(|d| **d != Dtype::Bf16) {
+        return Err(refuse(
+            OP,
+            format!("a plane stored {dtype:?}, and the frames read and land bf16"),
+        ));
+    }
+    let epi = Epilogue::interned(anchored)?;
+    if ins.len() != epi.inputs.len() || outs.len() != epi.results {
+        return Err(refuse(
+            OP,
+            "the planes given are not the epilogue's inputs and results",
+        ));
+    }
+    let n = anchored.contraction.n;
+    if epi.leg(n).is_none() {
+        return Err(refuse(
+            OP,
+            format!(
+                "the row frame carries no unfused leg of this epilogue over {n} columns, so a \
+                 shape no frame covers would land nothing"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// An epilogue's unfused leg as the row frame takes it.
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+struct LegShape {
+    region: Region,
+    ins: Vec<crate::synth::In>,
+    outs: usize,
+    width: u32,
+    slices: u32,
+}
+
+fn count_of(x: u32) -> Result<i32, Error> {
+    i32::try_from(x).map_err(|_| refuse(OP, format!("an extent of {x} is past an i32")))
+}
+
+/// The width the plain store's region is stated at: a pointwise region's
 /// body is the same at every width.
 const RULE_WIDTH: u32 = 8;
 
-/// A hand rule's contraction: bf16 operands, each product rounded to bf16
-/// as the unfused product stores it.
+/// The plain store's contraction: bf16 operands, each product rounded to
+/// bf16 as the unfused product stores it.
 const fn rule(layout: Layout) -> Contraction {
     Contraction {
         n: RULE_WIDTH,
@@ -451,14 +490,6 @@ const fn rule(layout: Layout) -> Contraction {
         quant: Quant::Plain(Dtype::Bf16),
         acc: Some(Dtype::Bf16),
     }
-}
-
-fn ruled(layout: Layout, region: Region, inputs: Vec<Input>) -> &'static Epilogue {
-    Epilogue::interned(&Anchored {
-        epilogue: Some(Pointwise { region, inputs }),
-        ..Anchored::plain(rule(layout))
-    })
-    .expect("a hand rule's epilogue is one the frames take")
 }
 
 /// The plain store's region: each part's product, as it is.
@@ -548,7 +579,7 @@ impl Frame {
     ) -> Result<&'static Kernel, Error> {
         #[cfg(feature = "cuda")]
         {
-            let (m, n, k) = (count(m)?, count(n)?, count(k)?);
+            let (m, n, k) = (count_of(m)?, count_of(n)?, count_of(k)?);
             match self {
                 Frame::Gemv => Ok(crate::linear::gemv::gemv_kernel(epi, n, tuning).0),
                 Frame::Rows => Ok(crate::linear::gemv::rows_kernel(epi, m, n, k).0),
@@ -615,8 +646,8 @@ impl Frame {
 /// An epilogue unfused: the products landed by the plain contraction in a
 /// plane of their own, then the epilogue's region over them on the row
 /// frame (`crate::synth`), a row of the product tile a row of the frame (or,
-/// for a row wider than the frame holds, a slice of one). The candidate a
-/// fused frame is measured against.
+/// for a row wider than the frame holds, a slice of one a launch). The
+/// candidate a fused frame is measured against.
 #[cfg(feature = "cuda")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RowLeg {
@@ -629,55 +660,27 @@ pub(crate) struct RowLeg {
 #[cfg(feature = "cuda")]
 impl RowLeg {
     /// The row frame's kernel for `epi` over `n` columns, loaded on the
-    /// current device, or `None` where the row frame does not carry it: a
-    /// vector a row (the row frame reads one value for every row), a packed
-    /// bank or a vector a column past one frame row, or a region it refuses.
+    /// current device, or `None` where the row frame does not carry it
+    /// ([`Epilogue::leg`]).
     pub(crate) fn of(epi: &Epilogue, n: u32) -> Option<RowLeg> {
-        use crate::synth::{In as Form, MAX_WIDTH, Out};
-        if epi.plain || n == 0 || !n.is_multiple_of(8) || epi.inputs.contains(&Input::Row) {
-            return None;
-        }
-        let slices = if n <= MAX_WIDTH {
-            1
-        } else if epi.parts == 1 && !epi.inputs.contains(&Input::Column) {
-            (n.div_ceil(MAX_WIDTH)..=n / 8)
-                .find(|c| n.is_multiple_of(*c) && (n / c).is_multiple_of(8))?
-        } else {
-            return None;
-        };
-        let width = n / slices;
-        let bf16 = Dtype::Bf16;
-        let ins: Vec<Form> = (0..epi.parts)
-            .map(|_| Form::Rows(bf16))
-            .chain(epi.inputs.iter().map(|input| match input {
-                Input::Tile => Form::Rows(bf16),
-                Input::Column => Form::Shared(bf16),
-                Input::Row | Input::One => Form::One(bf16),
-            }))
-            .collect();
-        let outs = vec![Out::Rows(bf16); epi.results];
-        let region = Region {
-            width,
-            ..epi.region.clone()
-        };
         /// Each epilogue's leg by body, parts and frame row width.
         type Legs = HashMap<(u64, u32), Option<RowLeg>>;
         static LEGS: OnceLock<Mutex<Legs>> = OnceLock::new();
+        let shape = epi.leg(n)?;
         let mut legs = LEGS
             .get_or_init(|| Mutex::new(HashMap::new()))
             .lock()
             .expect("row leg table lock poisoned");
         *legs
-            .entry((epi.body.hash ^ u64::from(epi.parts), width))
+            .entry((epi.body.hash ^ u64::from(epi.parts), shape.width))
             .or_insert_with(|| {
-                crate::synth::supports(&region, &ins, &outs).ok()?;
-                let kernel = crate::synth::synth(&region, &ins, outs.len()).ok()?;
+                let kernel = crate::synth::synth(&shape.region, &shape.ins, shape.outs).ok()?;
                 kernel.load().ok()?;
                 Some(RowLeg {
                     kernel,
                     parts: epi.parts,
-                    width,
-                    slices,
+                    width: shape.width,
+                    slices: shape.slices,
                 })
             })
     }
@@ -695,47 +698,42 @@ impl RowLeg {
     ) -> Result<(), Error> {
         use crate::synth::Plane;
         use crate::tensor::Tensor;
-        let rows = m * self.slices;
-        let plane =
-            |base: u64, stride: u32| Plane::rows(&Tensor::new(base, rows, stride, Dtype::Bf16));
-        // A slice's rows are `width` apart; a whole row's, the bank's.
-        let stride = if self.slices > 1 {
-            self.width
-        } else {
-            self.parts * n
-        };
-        let mut planes: Vec<Plane> = (0..self.parts)
-            .map(|p| plane(products + u64::from(p * n) * 2, stride))
-            .collect();
-        for input in ins {
-            planes.push(match input.kind() {
-                Input::Tile => {
-                    let ld = u32::try_from(input.row_stride).unwrap_or(0);
-                    if self.slices > 1 && ld != n {
-                        return Err(refuse(
-                            OP,
-                            "a tile input to a sliced row frame is not one contiguous plane",
-                        ));
-                    }
-                    plane(input.base, if self.slices > 1 { self.width } else { ld })
-                }
-                Input::Column | Input::One | Input::Row => {
-                    Plane::shared(&Tensor::new(input.base, 1, self.width, Dtype::Bf16))
-                }
-            });
-        }
-        let results: Vec<Plane> = outs
-            .iter()
-            .map(|&out| plane(out, if self.slices > 1 { self.width } else { n }))
-            .collect();
+        let rows = |base: u64, stride: u32| Plane::rows(&Tensor::new(base, m, stride, Dtype::Bf16));
         // The leg covers every row its product landed, as the product and
-        // the frames do: a staged window's live count would leave a sliced
-        // row's slices past it unwritten.
+        // the frames do: a staged window's live count would leave rows past
+        // it unwritten.
         let crate::jit::ArgValue::Ptr(stage) = ctx.stage() else {
             unreachable!("a stage window is an address");
         };
         ctx.disarm_stage();
-        let fired = self.kernel.fire(ctx, &planes, &results, rows);
+        let mut fired = Ok(());
+        for slice in 0..self.slices {
+            // The slice's first column, in bytes.
+            let at = u64::from(slice * self.width) * 2;
+            let mut planes: Vec<Plane> = (0..self.parts)
+                .map(|p| rows(products + u64::from(p * n) * 2 + at, self.parts * n))
+                .collect();
+            for input in ins {
+                planes.push(match input.kind() {
+                    Input::Tile => {
+                        let ld = u32::try_from(input.row_stride).unwrap_or(0);
+                        rows(input.base + at, ld)
+                    }
+                    Input::Column => {
+                        Plane::shared(&Tensor::new(input.base + at, 1, self.width, Dtype::Bf16))
+                    }
+                    Input::Row => Plane::each(&Tensor::new(input.base, m, 1, Dtype::Bf16)),
+                    Input::One => {
+                        Plane::shared(&Tensor::new(input.base, 1, self.width, Dtype::Bf16))
+                    }
+                });
+            }
+            let results: Vec<Plane> = outs.iter().map(|&out| rows(out + at, n)).collect();
+            fired = self.kernel.fire(ctx, &planes, &results, m);
+            if fired.is_err() {
+                break;
+            }
+        }
         if stage != 0 {
             ctx.arm_stage(stage);
         }
@@ -746,27 +744,31 @@ impl RowLeg {
 /// The most rows the few-rows frame holds.
 pub const ROWS_M: u32 = 16;
 
-#[cfg(feature = "cuda")]
-fn count(x: u32) -> Result<i32, Error> {
-    i32::try_from(x).map_err(|_| refuse(OP, format!("an extent of {x} is past an i32")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use kernels_ir::{Binary, Op};
+
+    fn ruled(layout: Layout, region: Region, inputs: Vec<Input>) -> &'static Epilogue {
+        Epilogue::interned(&Anchored {
+            epilogue: Some(Pointwise { region, inputs }),
+            ..Anchored::plain(rule(layout))
+        })
+        .expect("a hand rule's epilogue is one the frames take")
+    }
+
     #[test]
-    fn the_hand_rules_bodies_are_epilogues_the_frames_take() {
+    fn the_plain_store_is_an_epilogue_the_frames_take() {
         let store = Epilogue::store();
         assert_eq!(
             (store.parts(), store.inputs(), store.results()),
             (1, &[][..], 1)
         );
-        assert_eq!(Epilogue::bias().inputs(), &[Input::Column]);
-        assert_eq!(Epilogue::geglu_tanh().parts(), 2);
-        let cap = Epilogue::softcap(30.0).expect("a positive cap");
-        assert!(std::ptr::eq(cap, Epilogue::softcap(30.0).expect("again")));
-        assert!(Epilogue::softcap(0.0).is_err());
+        assert!(std::ptr::eq(
+            Epilogue::interned(&Anchored::plain(rule(Layout::Dense))).expect("the store"),
+            store
+        ));
         // The plain store copies each product through its store.
         assert!(
             store.body.source.contains("f.st(0, e, f.ld(0, e))"),
@@ -789,7 +791,17 @@ mod tests {
 
     #[test]
     fn planes_not_of_the_epilogues_kinds_are_refused() {
-        let bias = Epilogue::bias();
+        let bias = ruled(
+            Layout::Dense,
+            Region {
+                width: RULE_WIDTH,
+                params: vec![Shape::Row, Shape::Row],
+                ops: vec![Op::Binary(Binary::Add, 0, 1)],
+                results: vec![2],
+                rounds: vec![(2, Dtype::Bf16)],
+            },
+            vec![Input::Column],
+        );
         assert!(bias.planes(&[In::row(64)], &[128], 8).is_err());
         assert!(bias.planes(&[], &[128], 8).is_err());
         let words = bias.planes(&[In::column(64)], &[128], 8).expect("a bias");

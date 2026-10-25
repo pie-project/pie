@@ -16,7 +16,7 @@ pub(crate) mod cublas;
 pub mod cublas_lt_fp8;
 
 pub fn matmul(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.matmul", act, w, None, y)
+    act_x_wt(ctx, "linear.matmul", act, w, y)
 }
 
 /// `act . w^T` over bf16 operands landing f32 (a router's logits).
@@ -57,9 +57,10 @@ pub fn matmul_f32(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(
 /// The GEMM tuner times, per shape and epilogue, each contraction frame
 /// that covers it fused against the plain product's own tactic followed by
 /// the epilogue on the row frame, and fires the fastest; a fusion never
-/// forces a slower product. False, landing nothing, where no frame covers
-/// the shape (or a capture meets it untimed): the caller's unfused ops serve
-/// it then.
+/// forces a slower product. A shape no frame covers (or one a capture meets
+/// untimed) runs that unfused leg. False, landing nothing, only where the
+/// row frame does not carry the leg either ([`crate::linear::frame::serves`]
+/// says which do): the caller's unfused ops serve it then.
 pub fn anchored(
     ctx: &Ctx,
     op: &'static str,
@@ -107,18 +108,8 @@ pub fn anchored(
     }
 }
 
-pub fn matmul_bias(
-    ctx: &Ctx,
-    act: Tensor,
-    w: Tensor,
-    bias: Tensor,
-    y: &mut Tensor,
-) -> Result<(), Error> {
-    act_x_wt(ctx, "fused.matmul_bias", act, w, Some(bias), y)
-}
-
 pub fn lm_head(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.matmul", act, w, None, y)
+    act_x_wt(ctx, "linear.matmul", act, w, y)
 }
 
 pub fn act_x_wt(
@@ -126,7 +117,6 @@ pub fn act_x_wt(
     op: &'static str,
     act: Tensor,
     w: Tensor,
-    bias: Option<Tensor>,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, act.dtype, { Bf16 => () });
@@ -143,22 +133,11 @@ pub fn act_x_wt(
 
     #[cfg(feature = "cuda")]
     {
-        // The gemv folds a bf16 bias into its store; any other tactic leaves it
-        // to the add.
-        let folded = bias
-            .filter(|bias| bias.dtype == Dtype::Bf16)
-            .map_or(0, |bias| bias.ptr);
-        if cublas::act_x_wt(ctx, op, act.ptr, w.ptr, folded, y.ptr, m, n, k)? {
-            return Ok(());
-        }
-        match bias {
-            Some(bias) => crate::elemwise::pointwise::add_bias(ctx, bias, y),
-            None => Ok(()),
-        }
+        cublas::act_x_wt(ctx, op, act.ptr, w.ptr, y.ptr, m, n, k)
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (ctx, w, bias, m, n, k);
+        let _ = (ctx, w, m, n, k);
         Err(crate::jit::runtimeless(op))
     }
 }

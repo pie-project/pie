@@ -54,7 +54,6 @@ fn current_device() -> i32 {
 struct Call {
     act: u64,
     w: u64,
-    bias: u64,
     y: u64,
     m: i32,
     n: i32,
@@ -157,21 +156,19 @@ pub(crate) fn act_x_wt(
     op: &'static str,
     act: u64,
     w: u64,
-    bias: u64,
     y: u64,
     m: i32,
     n: i32,
     k: i32,
-) -> Result<bool, Error> {
+) -> Result<(), Error> {
     if m <= 0 || n <= 0 || k <= 0 {
-        return Ok(false);
+        return Ok(());
     }
     let handle: cublasHandle_t = ctx.cublas(op)?.cast::<cublasContext>();
     let stream = ctx.stream();
     let call = Call {
         act,
         w,
-        bias,
         y,
         m,
         n,
@@ -204,19 +201,6 @@ pub(crate) fn act_x_wt(
     unsafe {
         cublasSetWorkspace_v2(handle, ws, ws_bytes);
     }
-    // A cuBLASLt tactic lands the bias from its epilogue where the profile
-    // says (`kernel.gemm.bias_epilogue`); one it refuses runs bare and the
-    // bias is added after.
-    if let (Some(Tactic::Lt(index)), true, Some(plan)) = (
-        tactic,
-        bias != 0 && tuning.gemm_bias_epilogue,
-        plan.as_deref(),
-    ) && let Some(heuristic) = plan.heuristics.get(index)
-        && !lt_handle.is_null()
-        && run_lt_bias(lt_handle, plan, &heuristic.algo, stream, call, ws, ws_bytes)
-    {
-        return Ok(true);
-    }
     if let Some(tactic) = tactic
         && run_tactic(
             handle,
@@ -230,7 +214,7 @@ pub(crate) fn act_x_wt(
             tuning,
         )
     {
-        return Ok(matches!(tactic, Tactic::Gemv | Tactic::Rows | Tactic::Skinny) && bias != 0);
+        return Ok(());
     }
     clear_error();
 
@@ -240,14 +224,13 @@ pub(crate) fn act_x_wt(
             &unsafe { Ctx::on(stream) }.with_tuning(tuning),
             w,
             act,
-            bias,
             y,
             n,
             k,
         )
         .is_ok()
     {
-        return Ok(bias != 0);
+        return Ok(());
     }
     if gemm_ex(
         handle,
@@ -255,11 +238,11 @@ pub(crate) fn act_x_wt(
         cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
     ) == cublasStatus_t::CUBLAS_STATUS_SUCCESS
     {
-        return Ok(false);
+        return Ok(());
     }
     let status = gemm_ex(handle, call, cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT);
     if status == cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-        return Ok(false);
+        return Ok(());
     }
     if let Some(plan) = plan {
         for heuristic in &plan.heuristics {
@@ -272,7 +255,7 @@ pub(crate) fn act_x_wt(
                 ws,
                 ws_bytes,
             ) {
-                return Ok(false);
+                return Ok(());
             }
         }
     }
@@ -289,9 +272,10 @@ pub(crate) fn act_x_wt(
 /// `parts · n` rows, on whichever of its candidates the shape's timing
 /// picked: each contraction frame that covers it with the epilogue filled
 /// in, and the plain product's own tactic followed by the epilogue on the
-/// row frame where the row frame carries it. False, landing nothing, where
-/// no frame covers the shape or a capture meets it untimed: the caller's
-/// unfused ops then serve it.
+/// row frame where the row frame carries it. Where no frame covers the
+/// shape, or a capture meets it untimed, the unfused leg serves it untimed;
+/// false, landing nothing, only where the row frame does not carry that
+/// leg either: the caller's unfused ops then serve it.
 pub(crate) fn anchored(
     ctx: &Ctx,
     op: &'static str,
@@ -313,7 +297,7 @@ pub(crate) fn anchored(
         .filter(|f| f.covers(epi, m, n, k, &tuning))
         .collect();
     if frames.is_empty() {
-        return Ok(false);
+        return unfused(ctx, op, epi, act, w, ins, outs, m, n, k);
     }
     let mut anchor = Anchor {
         epi,
@@ -348,7 +332,6 @@ pub(crate) fn anchored(
         let call = Call {
             act,
             w,
-            bias: 0,
             y: 0,
             m,
             n,
@@ -430,13 +413,72 @@ pub(crate) fn anchored(
             };
             let bytes = (m as usize) * (n as usize) * (parts as usize) * 2;
             let products = ctx.scratch_stream(op, ANCHOR_PRODUCTS, bytes)?.addr() as u64;
-            act_x_wt(ctx, op, act, w, 0, products, m, n * parts, k)?;
+            act_x_wt(ctx, op, act, w, products, m, n * parts, k)?;
             leg.fire(ctx, products, ins, outs, m.unsigned_abs(), n.unsigned_abs())?;
             Ok(true)
         }
-        _ => Ok(false),
+        _ => unfused(ctx, op, epi, act, w, ins, outs, m, n, k),
     }
 }
+
+/// `outs = epi(act . w^T)` untimed on the unfused leg: the plain product
+/// (its own tactic, as a bare product picks it) into scratch, then the
+/// epilogue over it on the row frame, a run of rows at a time so the
+/// scratch stays within [`UNFUSED_BYTES`]. False, landing nothing, where
+/// the row frame does not carry the leg.
+#[allow(clippy::too_many_arguments)]
+fn unfused(
+    ctx: &Ctx,
+    op: &'static str,
+    epi: &'static Epilogue,
+    act: u64,
+    w: u64,
+    ins: &[In],
+    outs: &[u64],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<bool, Error> {
+    let Some(leg) = RowLeg::of(epi, n.unsigned_abs()) else {
+        return Ok(false);
+    };
+    let wide = n as usize * epi.parts() as usize;
+    let run = (UNFUSED_BYTES / (wide * 2)).clamp(1, m as usize);
+    let products = ctx
+        .scratch_stream(op, ANCHOR_PRODUCTS, run * wide * 2)?
+        .addr() as u64;
+    let mut from = 0usize;
+    while from < m as usize {
+        let rows = run.min(m as usize - from);
+        let at = |base: u64, width: usize| base + (from * width * 2) as u64;
+        let ins: Vec<In> = ins.iter().map(|input| input.from_row(from)).collect();
+        let outs: Vec<u64> = outs.iter().map(|&out| at(out, n as usize)).collect();
+        let rows_i = i32::try_from(rows).unwrap_or(i32::MAX);
+        act_x_wt(
+            ctx,
+            op,
+            at(act, k as usize),
+            w,
+            products,
+            rows_i,
+            wide as i32,
+            k,
+        )?;
+        leg.fire(
+            ctx,
+            products,
+            &ins,
+            &outs,
+            rows_i.unsigned_abs(),
+            n.unsigned_abs(),
+        )?;
+        from += rows;
+    }
+    Ok(true)
+}
+
+/// The most scratch the untimed unfused leg's products take at once.
+const UNFUSED_BYTES: usize = 64 << 20;
 
 /// The plane an anchored region's unfused leg lands its products in.
 const ANCHOR_PRODUCTS: &str = "linear.anchor_products";
@@ -464,7 +506,6 @@ fn run_tactic(
                     &unsafe { Ctx::on(stream) }.with_tuning(tuning),
                     call.w,
                     call.act,
-                    call.bias,
                     call.y,
                     call.n,
                     call.k,
@@ -477,7 +518,6 @@ fn run_tactic(
             &unsafe { Ctx::on(stream) }.with_tuning(tuning),
             call.w,
             call.act,
-            call.bias,
             call.y,
             call.m,
             call.n,
@@ -486,21 +526,15 @@ fn run_tactic(
         )
         .is_ok(),
         Tactic::Skinny => {
-            let column = [In::column(call.bias)];
-            let (epi, ins): (&Epilogue, &[In]) = if call.bias == 0 {
-                (Epilogue::store(), &[])
-            } else {
-                (Epilogue::bias(), &column)
-            };
             skinny::covers(call.m, call.n, call.k, 1, skinny::ROWS)
                 && skinny::skinny(
                     // SAFETY: `stream` is a live `Ctx`'s stream or the tune arena's own; `Ctx::on`
                     // only records it.
                     &unsafe { Ctx::on(stream) }.with_tuning(tuning),
-                    epi,
+                    Epilogue::store(),
                     call.w,
                     call.act,
-                    ins,
+                    &[],
                     &[call.y],
                     call.m,
                     call.n,
@@ -534,7 +568,6 @@ fn run_tactic(
             };
             let plain = Call {
                 n: call.n * a.parts(),
-                bias: 0,
                 anchor: None,
                 ..call
             };
@@ -558,7 +591,6 @@ fn run_tactic(
             &unsafe { Ctx::on(stream) }.with_tuning(tuning),
             call.w,
             call.act,
-            call.bias,
             call.y,
             call.m,
             call.n,
@@ -705,8 +737,7 @@ struct LtPlan {
 unsafe impl Send for LtPlan {}
 
 // SAFETY: after `build_lt_plan` returns nothing writes a plan's
-// descriptors: `run_lt` and `cublasLtMatmulAlgoCheck` only read them,
-// and `run_lt_bias` sets its epilogue on a descriptor of its own.
+// descriptors: `run_lt` and `cublasLtMatmulAlgoCheck` only read them.
 unsafe impl Sync for LtPlan {}
 
 impl Drop for LtPlan {
@@ -993,111 +1024,6 @@ fn run_lt(
         )
     };
     status == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
-}
-
-/// [`run_lt`] with the bias (bf16, one a column of `y`) added in the
-/// epilogue, through a descriptor of its own for the call. False where the
-/// algorithm refuses the epilogue.
-fn run_lt_bias(
-    lt_handle: lt::cublasLtHandle_t,
-    plan: &LtPlan,
-    algo: &lt::cublasLtMatmulAlgo_t,
-    stream: *mut c_void,
-    call: Call,
-    ws: *mut c_void,
-    ws_bytes: usize,
-) -> bool {
-    struct Desc(lt::cublasLtMatmulDesc_t);
-    impl Drop for Desc {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                // SAFETY: a non-null descriptor this guard alone owns, freed once.
-                let _ = unsafe { lt::cublasLtMatmulDescDestroy(self.0) };
-            }
-        }
-    }
-    let ok = lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS;
-    let mut desc = Desc(std::ptr::null_mut());
-    // SAFETY: `desc.0` is a local out-pointer, freed by the guard.
-    if unsafe {
-        lt::cublasLtMatmulDescCreate(
-            &raw mut desc.0,
-            lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
-            lt::cudaDataType::CUDA_R_32F,
-        )
-    } != ok
-    {
-        return false;
-    }
-    let set = |attribute: lt::cublasLtMatmulDescAttributes_t,
-               value: *const c_void,
-               // SAFETY: `desc.0` was just created; every caller below passes a
-               // pointer to a local of exactly `bytes` bytes, of the attribute's type,
-               // which cuBLASLt copies.
-               bytes: usize| unsafe {
-        lt::cublasLtMatmulDescSetAttribute(desc.0, attribute, value, bytes) == ok
-    };
-    let (ta, tb) = (
-        cublasOperation_t::CUBLAS_OP_T,
-        cublasOperation_t::CUBLAS_OP_N,
-    );
-    let epilogue = lt::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS;
-    let bias_ptr = dev(call.bias);
-    let bias_type = lt::cudaDataType::CUDA_R_16BF;
-    let size = std::mem::size_of::<cublasOperation_t>();
-    if !(set(
-        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
-        std::ptr::from_ref(&ta).cast(),
-        size,
-    ) && set(
-        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
-        std::ptr::from_ref(&tb).cast(),
-        size,
-    ) && set(
-        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE,
-        std::ptr::from_ref(&epilogue).cast(),
-        std::mem::size_of::<lt::cublasLtEpilogue_t>(),
-    ) && set(
-        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
-        std::ptr::from_ref(&bias_ptr).cast(),
-        std::mem::size_of::<*const c_void>(),
-    ) && set(
-        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
-        std::ptr::from_ref(&bias_type).cast(),
-        std::mem::size_of::<lt::cudaDataType>(),
-    )) {
-        return false;
-    }
-    let alpha = 1.0f32;
-    let beta = 0.0f32;
-    // SAFETY: as in `run_lt`, with `desc.0` the descriptor just set up;
-    // `call.bias` is the caller's `n`-long bf16 bias, non-zero by the caller's
-    // test.
-    let status = unsafe {
-        lt::cublasLtMatmul(
-            lt_handle,
-            desc.0,
-            std::ptr::from_ref(&alpha).cast(),
-            dev(call.w),
-            plan.a_desc,
-            dev(call.act),
-            plan.b_desc,
-            std::ptr::from_ref(&beta).cast(),
-            dev(call.y),
-            plan.c_desc,
-            dev_mut(call.y),
-            plan.c_desc,
-            std::ptr::from_ref(algo),
-            ws,
-            ws_bytes,
-            stream.cast(),
-        )
-    };
-    if status != ok {
-        clear_error();
-        return false;
-    }
-    true
 }
 
 struct Device {
@@ -1645,7 +1571,6 @@ impl TuneArena {
         let call = Call {
             act: at,
             w: at,
-            bias: 0,
             y: at + (rows * 2 * K) as u64,
             m: 1,
             n: rows as i32,
@@ -1660,7 +1585,7 @@ impl TuneArena {
     }
 
     /// `call` on the arena's planes: its activation, its product (an
-    /// anchored region's products, then its results) and no bias.
+    /// anchored region's products, then its results).
     fn bench(&self, call: Call) -> Call {
         let y = self.y.addr() as u64;
         let tile = (call.m as u64) * (call.n as u64) * 2;
@@ -1673,7 +1598,6 @@ impl TuneArena {
         });
         Call {
             act: self.act.addr() as u64,
-            bias: 0,
             y,
             anchor,
             ..call

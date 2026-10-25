@@ -5,25 +5,17 @@ use crate::linear::frame::{Epilogue, In};
 
 const GEMV: &str = "linear/gemv.cu";
 
-/// `out[n] = act . weight[n]` (plus `bias[n]`, if not null) for one row: the
-/// gemv frame with the plain store, or the bias, filled in. The GEMM tuner's
-/// `Gemv` tactic.
+/// `out[n] = act . weight[n]` for one row: the gemv frame with the plain
+/// store filled in. The GEMM tuner's `Gemv` tactic.
 pub(crate) fn gemv_bf16(
     ctx: &Ctx,
     weight: u64,
     act: u64,
-    bias: u64,
     out: u64,
     n: i32,
     k: i32,
 ) -> Result<(), Error> {
-    let column = [In::column(bias)];
-    let (epi, ins): (&Epilogue, &[In]) = if bias == 0 {
-        (Epilogue::store(), &[])
-    } else {
-        (Epilogue::bias(), &column)
-    };
-    gemv(ctx, epi, weight, act, ins, &[out], n, k)
+    gemv(ctx, Epilogue::store(), weight, act, &[], &[out], n, k)
 }
 
 /// The gemv frame's kernel for `epi` over `n` columns, and whether it splits
@@ -141,28 +133,31 @@ pub(crate) fn rows_kernel(epi: &Epilogue, m: i32, n: i32, k: i32) -> (&'static K
     )
 }
 
-/// `out[m][n] = act[m] . weight[n]` (plus `bias[n]`, if not null) for a few
-/// rows: the few-rows frame with the plain store, or the bias, filled in.
-/// The GEMM tuner's `Rows` tactic.
+/// `out[m][n] = act[m] . weight[n]` for a few rows: the few-rows frame with
+/// the plain store filled in. The GEMM tuner's `Rows` tactic.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_rows_bf16(
     ctx: &Ctx,
     weight: u64,
     act: u64,
-    bias: u64,
     out: u64,
     m: i32,
     n: i32,
     k: i32,
     pdl: bool,
 ) -> Result<(), Error> {
-    let column = [In::column(bias)];
-    let (epi, ins): (&Epilogue, &[In]) = if bias == 0 {
-        (Epilogue::store(), &[])
-    } else {
-        (Epilogue::bias(), &column)
-    };
-    gemm_rows(ctx, epi, weight, act, ins, &[out], m, n, k, pdl)
+    gemm_rows(
+        ctx,
+        Epilogue::store(),
+        weight,
+        act,
+        &[],
+        &[out],
+        m,
+        n,
+        k,
+        pdl,
+    )
 }
 
 /// `outs = epi(act . weight^T)` for a few rows (1..=16, a decode's) in one
@@ -228,7 +223,6 @@ pub fn gemm_narrow_bf16(
     ctx: &Ctx,
     weight: u64,
     act: u64,
-    bias: u64,
     out: u64,
     m: i32,
     n: i32,
@@ -257,11 +251,6 @@ pub fn gemm_narrow_bf16(
         &[
             ArgValue::Ptr(weight),
             ArgValue::Ptr(act),
-            if bias == 0 {
-                ArgValue::ABSENT
-            } else {
-                ArgValue::Ptr(bias)
-            },
             ArgValue::Ptr(out),
             ArgValue::I32(k),
         ],

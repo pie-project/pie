@@ -22,12 +22,11 @@ __global__ void gemv_bf16_grouped_kernel(
 // `out[row][n] = act[row] . weight[n]` for a product a few columns wide
 // (`N` <= 8): a block a row, its threads striding the contraction eight
 // elements at a time with every column's sum in registers, folded across
-// the block. The bias, if any, lands as the gemv lands it.
+// the block.
 template <int N>
 __global__ void __launch_bounds__(256) gemm_narrow_bf16_kernel(
     const bf16* __restrict__ weight,
     const bf16* __restrict__ act,
-    const bf16* __restrict__ bias,
     bf16* __restrict__ out,
     int k)
 {
@@ -64,9 +63,7 @@ __global__ void __launch_bounds__(256) gemm_narrow_bf16_kernel(
         float v = 0.f;
 #pragma unroll
         for (int w = 0; w < kThreads / 32; ++w) v += part[w][tid];
-        bf16 o = f32_to_bf16(v);
-        if (bias != nullptr) o = f32_to_bf16(bf16_to_f32(o) + bf16_to_f32(bias[tid]));
-        out[static_cast<long long>(row) * N + tid] = o;
+        out[static_cast<long long>(row) * N + tid] = f32_to_bf16(v);
     }
 }
 

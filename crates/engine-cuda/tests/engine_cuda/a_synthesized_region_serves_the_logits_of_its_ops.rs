@@ -26,8 +26,8 @@ use poem_ir::{ParamSource, Trace};
 
 const PAGE: u32 = 16;
 
-/// Each chain's ops as their own kernels.
-const OPS: &str = "[compiler]\nsynth_regions = false\n";
+/// Each chain's ops as their own kernels, and each matmul's epilogue.
+const OPS: &str = "[compiler]\nsynth_regions = false\nsynth_anchors = false\n";
 
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
@@ -294,6 +294,17 @@ fn served_along(
     generates: bool,
     along: Option<&[Vec<f32>]>,
 ) -> Vec<Vec<f32>> {
+    served_from(fixture, overrides, generates, along, 37)
+}
+
+/// [`served_along`] from a prompt of `prompted` tokens.
+fn served_from(
+    fixture: &Fixture,
+    overrides: &str,
+    generates: bool,
+    along: Option<&[Vec<f32>]>,
+    prompted: u32,
+) -> Vec<Vec<f32>> {
     let model = fixture.model;
     let mut shell = load(fixture, overrides, TOKENS);
     assert_eq!(
@@ -302,7 +313,7 @@ fn served_along(
         "{model} under {overrides:?}: the load generates a kernel exactly where a chain folds"
     );
     shell.open(0).expect("slot 0 opens");
-    let mut steps = vec![step(&mut shell, &fixture.trace, &prompt(37))];
+    let mut steps = vec![step(&mut shell, &fixture.trace, &prompt(prompted))];
     for at in 0..DECODES {
         let next = argmax(along.map_or_else(|| steps.last().expect("a step"), |along| &along[at]));
         steps.push(step(&mut shell, &fixture.trace, &[next]));
@@ -345,7 +356,7 @@ fn a_generated_kernel_for_a_hand_rules_chain_serves_the_logits_of_its_ops() {
             .map(|rule| format!("{rule} = false\n"))
             .collect();
         let off = format!("[fuse]\n{off}[compiler]\n");
-        let unfused = format!("{off}synth_regions = false\n");
+        let unfused = format!("{off}synth_regions = false\nsynth_anchors = false\n");
         let ops = served(&fixture, &unfused, false);
         let carry = served_along(&fixture, &format!("{unfused}{NUDGED}"), false, Some(&ops));
         let synth = served_along(&fixture, &off, true, Some(&ops));
@@ -364,6 +375,57 @@ const RULED: [(&str, &[&str]); 4] = [
         &["embed_scale_add", "embed_scale_add_select"],
     ),
 ];
+
+/// Each matmul and the pointwise ops over its product served as one
+/// anchored region (`compiler.synth_anchors`, the hand rules `fuse.matmul_bias`,
+/// `fuse.matmul_softcap` and GEGLU's `fuse.matmul_glu` gone from CUDA's
+/// list) against the products
+/// and their ops as their own kernels, the row chains off in both: GLM-4.5's
+/// and GLM-4.7's biased projections (and the residual adds after their
+/// outputs), Gemma 4's GEGLU and soft-capped logits. A prefill of a few rows (the contraction
+/// frames, as the tuner picks) and one past every frame's rows (the unfused
+/// leg), then the decode steps (the gemv).
+#[test]
+fn an_anchored_region_serves_the_logits_of_its_ops() {
+    let _one = serialized();
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    const ROWS_OFF: &str = "[compiler]\nsynth_regions = false\n";
+    for model in ANCHORED {
+        let fixture = fixture(model);
+        for prompted in [37, 100] {
+            let ops = served_from(&fixture, OPS, false, None, prompted);
+            let carry = served_from(
+                &fixture,
+                &format!("{OPS}{NUDGED}"),
+                false,
+                Some(&ops),
+                prompted,
+            );
+            let anchored = served_from(&fixture, ROWS_OFF, true, Some(&ops), prompted);
+            let agree = anchored
+                .iter()
+                .zip(&ops)
+                .filter(|(got, want)| argmax(got) == argmax(want))
+                .count();
+            eprintln!(
+                "{model} from {prompted} rows: top-1 agrees on {agree} of {} steps",
+                ops.len()
+            );
+            close(
+                &anchored,
+                &ops,
+                &carry,
+                &format!("{model}'s unfused products ({prompted} rows)"),
+            );
+        }
+    }
+}
+
+/// The models served by [`an_anchored_region_serves_the_logits_of_its_ops`].
+const ANCHORED: [&str; 3] = ["glm45-air-mini", "glm47-mini", "gemma4-e4b-mini-l1"];
 
 /// Two models loaded and served at once in one process, a thread each, as a
 /// server holding two models serves them: each answers, bit for bit, what
