@@ -1,0 +1,338 @@
+# Qwen3-ASR: a Whisper-style audio encoder in front of a dense Qwen3 that
+# writes the transcript.
+
+load("//pie/codec.poem", "mapped")
+load("//lib/spoken.poem", "QWEN_STOP")
+
+CHATML = template("chatml", stop = QWEN_STOP)
+TOKENIZER = tokenizer(markers = [QWEN_STOP, ["<|audio_start|>", "<|audio_pad|>", "<|audio_end|>", "<asr_text>"]])
+
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward; the encoder it holds whole.
+CUTS = "inferred"
+
+MODELS = [
+    model("qwen3-asr-0.6b", template = CHATML, tokenizer = TOKENIZER, arch = "qwen3_asr", layers = 28, vocab = 151936),
+]
+
+DEPLOYMENTS = [
+    deployment("qwen3-asr-0.6b", weights = dtype.bf16, kv = dtype.bf16),
+    deployment("qwen3-asr-0.6b", weights = dtype.u8g64, kv = dtype.bf16),
+]
+
+# The weights of Qwen3-ASR: three strided convolutions over the log-mel,
+# eighteen pre-norm encoder layers attending within windows, and the dense
+# Qwen3 the encoder's rows are spoken into.
+
+def linear(out, in_, banks, bias = True):
+    return struct(
+        w = weight([out, in_], banks),
+        bias = weight([out]) if bias else None,
+    )
+
+def norm(c):
+    return struct(
+        weight = weight([c], dtype.bf16),
+        bias = weight([c], dtype.bf16),
+    )
+
+TAPS3 = 9
+
+def strided_conv(c_out, c_in):
+    return struct(
+        w = weight([c_out, c_in * TAPS3], dtype.bf16),
+        bias = weight([c_out], dtype.f32),
+    )
+
+AUDIO = struct(
+    mels = 128,
+    chunk = 100,
+    channels = 480,
+    bands = 16,
+    width = 896,
+    heads = 14,
+    inter = 3584,
+    layers = 18,
+    out = 1024,
+    window = 104,
+    eps = 1e-5,
+)
+
+TEXT = struct(
+    hidden = 1024,
+    vocab = 151936,
+    q_heads = 16,
+    kv_heads = 8,
+    head_dim = 128,
+    inter = 3072,
+    theta = 1000000.0,
+    eps = 1e-6,
+    layers = 28,
+)
+
+def tower(a):
+    w = a.width
+    dense = dtype.bf16
+
+    def layer(l):
+        return struct(
+            attn_norm = norm(w),
+            q = linear(w, w, dense),
+            k = linear(w, w, dense),
+            v = linear(w, w, dense),
+            out = [weight([w, w // a.heads], dense) for h in range(a.heads)],
+            out_bias = weight([w], dense),
+            mlp_norm = norm(w),
+            fc1 = linear(a.inter, w, dense),
+            fc2 = linear(w, a.inter, dense),
+        )
+
+    return struct(
+        conv1 = strided_conv(a.channels, 1),
+        conv2 = strided_conv(a.channels, a.channels),
+        conv3 = strided_conv(a.channels, a.channels),
+        conv_out = weight([w, a.channels * a.bands], dense),
+        layers = [layer(l) for l in range(a.layers)],
+        norm_out = norm(w),
+        proj1 = linear(w, w, dense),
+        proj2 = linear(a.out, w, dense),
+        head_dim = w // a.heads,
+        heads = a.heads,
+        width = w,
+        channels = a.channels,
+        bands = a.bands,
+        eps = a.eps,
+        sm_scale = f32(1.0 / f32(sqrt(w // a.heads))),
+    )
+
+def thinker(c, banks):
+    """The dense Qwen3 the transcript is written by: pre-norm attention with
+    q and k normed per head, a SwiGLU MLP, the final norm and its head."""
+    hidden, hd, inter = c.hidden, c.head_dim, c.inter
+
+    def layer(l):
+        return struct(
+            attn_norm = weight([hidden]),
+            q = weight([c.q_heads * hd, hidden], banks),
+            k = weight([c.kv_heads * hd, hidden], banks),
+            v = weight([c.kv_heads * hd, hidden], banks),
+            o = weight([hidden, c.q_heads * hd], banks),
+            q_norm = weight([hd]),
+            k_norm = weight([hd]),
+            mlp_norm = weight([hidden]),
+            gate = weight([inter, hidden], banks),
+            up = weight([inter, hidden], banks),
+            down = weight([hidden, inter], banks),
+            kv = "kv.{}".format(l),
+        )
+
+    return struct(
+        hidden = hidden,
+        vocab = c.vocab,
+        q_heads = c.q_heads,
+        kv_heads = c.kv_heads,
+        head_dim = hd,
+        inter = inter,
+        theta = c.theta,
+        eps = c.eps,
+        sm_scale = f32(1.0 / f32(sqrt(hd))),
+        embed = weight([c.vocab, hidden], banks),
+        layers = [layer(l) for l in range(c.layers)],
+        norm = weight([hidden]),
+        head = weight([c.vocab, hidden], banks),
+    )
+
+def layout(id, deploy):
+    return struct(
+        kv = dtype.bf16,
+        audio_out = AUDIO.out,
+        audio = tower(AUDIO),
+        text = thinker(TEXT, roles(deploy, "text").text),
+    )
+
+# How a Qwen3-ASR checkpoint is laid out: transformers' state_dict, the
+# encoder under `thinker.audio_tower.`, the language model under
+# `thinker.model.` and its head at `thinker.lm_head`.
+
+TOWER = "thinker.audio_tower."
+
+def read_strided_conv(reads, c, stem):
+    name = stem + ".weight"
+    reads.read_expr(c.w, src(name).transmute(c.w.shape, stored(name)))
+    reads.read(c.bias, stem + ".bias")
+
+# The encoder, but for the out projection it reads a head at a time.
+TOWER_ROWS = [
+    ("conv_out.weight", "conv_out"),
+    ("ln_post.weight", "norm_out.weight"),
+    ("ln_post.bias", "norm_out.bias"),
+    ("proj1.weight", "proj1.w"),
+    ("proj1.bias", "proj1.bias"),
+    ("proj2.weight", "proj2.w"),
+    ("proj2.bias", "proj2.bias"),
+    ("layers.{l}.self_attn_layer_norm.weight", "layers.{l}.attn_norm.weight"),
+    ("layers.{l}.self_attn_layer_norm.bias", "layers.{l}.attn_norm.bias"),
+    ("layers.{l}.self_attn.q_proj.weight", "layers.{l}.q.w"),
+    ("layers.{l}.self_attn.q_proj.bias", "layers.{l}.q.bias"),
+    ("layers.{l}.self_attn.k_proj.weight", "layers.{l}.k.w"),
+    ("layers.{l}.self_attn.k_proj.bias", "layers.{l}.k.bias"),
+    ("layers.{l}.self_attn.v_proj.weight", "layers.{l}.v.w"),
+    ("layers.{l}.self_attn.v_proj.bias", "layers.{l}.v.bias"),
+    ("layers.{l}.self_attn.out_proj.bias", "layers.{l}.out_bias"),
+    ("layers.{l}.final_layer_norm.weight", "layers.{l}.mlp_norm.weight"),
+    ("layers.{l}.final_layer_norm.bias", "layers.{l}.mlp_norm.bias"),
+    ("layers.{l}.fc1.weight", "layers.{l}.fc1.w"),
+    ("layers.{l}.fc1.bias", "layers.{l}.fc1.bias"),
+    ("layers.{l}.fc2.weight", "layers.{l}.fc2.w"),
+    ("layers.{l}.fc2.bias", "layers.{l}.fc2.bias"),
+]
+
+THINKER_ROWS = [
+    ("model.embed_tokens.weight", "embed"),
+    ("model.norm.weight", "norm"),
+    ("lm_head.weight", "head"),
+    ("model.layers.{l}.input_layernorm.weight", "layers.{l}.attn_norm"),
+    ("model.layers.{l}.self_attn.q_proj.weight", "layers.{l}.q"),
+    ("model.layers.{l}.self_attn.k_proj.weight", "layers.{l}.k"),
+    ("model.layers.{l}.self_attn.v_proj.weight", "layers.{l}.v"),
+    ("model.layers.{l}.self_attn.o_proj.weight", "layers.{l}.o"),
+    ("model.layers.{l}.self_attn.q_norm.weight", "layers.{l}.q_norm"),
+    ("model.layers.{l}.self_attn.k_norm.weight", "layers.{l}.k_norm"),
+    ("model.layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
+    ("model.layers.{l}.mlp.gate_proj.weight", "layers.{l}.gate"),
+    ("model.layers.{l}.mlp.up_proj.weight", "layers.{l}.up"),
+    ("model.layers.{l}.mlp.down_proj.weight", "layers.{l}.down"),
+]
+
+def under(prefix, rows):
+    """`rows` with each checkpoint name under `prefix`."""
+    out = []
+    for names, path in rows:
+        names = [prefix + n for n in names] if type(names) == "list" else prefix + names
+        out.append((names, path))
+    return out
+
+def read_tower(reads, a):
+    for i, c in enumerate([a.conv1, a.conv2, a.conv3]):
+        read_strided_conv(reads, c, TOWER + "conv2d{}".format(i + 1))
+    mapped(reads, a, under(TOWER, TOWER_ROWS))
+    hd = a.head_dim
+    for l, w in enumerate(a.layers):
+        out = TOWER + "layers.{}.self_attn.out_proj.weight".format(l)
+        for h, part in enumerate(w.out):
+            reads.read_expr(part, src(out).slice(1, h * hd, hd))
+
+def formats(m):
+    return [format(
+        "transformers",
+        recognizes = lambda checkpoint: has(TOWER + "conv_out.weight"),
+        read = lambda reads: read(m, reads),
+    )]
+
+def read(m, reads):
+    read_tower(reads, m.audio)
+    mapped(reads, m.text, under("thinker.", THINKER_ROWS))
+
+# The forward of Qwen3-ASR, three readings: the convolutions over one clip
+# of log-mel frames, the encoder over windows of their rows, and the Qwen3
+# that reads the encoder's rows in place of its audio tokens' embeddings.
+
+def run_linear(w, x):
+    y = ops.linear.matmul(x, w.w)
+    if w.bias == None:
+        return y
+    return ops.elemwise.add_bias(w.bias, y)
+
+def run_norm(x, n, eps):
+    return ops.elemwise.layernorm(x, n.weight, n.bias, eps)
+
+def heads(x, width, count):
+    out = []
+    for _ in range(count - 1):
+        head, x = ops.gather.split_rows(x, width)
+        out.append(head)
+    out.append(x)
+    return out
+
+def caches(m, c):
+    t = m.text
+    space = c.kv_space(m.kv)
+    plane = t.kv_heads * t.head_dim
+    for layer in t.layers:
+        c.kv(space, layer.kv, [plane, plane], t.head_dim, heads = True)
+
+def forward(m, inputs):
+    switch("reading", ["text", "audio.conv", "audio.encode"])
+    switch("stream", ["text", "audio"])
+    reading = lambda name: inputs.on(switch_is("reading", name))
+    convolve(reading("audio.conv"), m.audio)
+    encode(reading("audio.encode"), m.audio)
+    return text(reading("text"), m)
+
+def convolve(arm, a):
+    """A clip of log-mel chunks, the bands down each and time across, through
+    the three strided convolutions; then each time step's bands, projected,
+    as one row."""
+    grid = arm.grid()
+    x = arm.input("mel", dtype.bf16, "voxel", 1)
+    for c in [a.conv1, a.conv2, a.conv3]:
+        x, grid = ops.conv.conv3d(x, grid, c.w, c.bias, conv([3, 3], [2, 2], [1, 1]), None)
+        x = ops.elemwise.gelu(x, False)
+    x, grid = ops.conv.pixel_unshuffle(x, grid, [1, a.bands, 1])
+    y = ops.linear.matmul(x, a.conv_out)
+    seam.at(seam.PIXELS, [y, grid])
+    return y
+
+def encode(arm, a):
+    """Windows of time steps, one a frame of the clip, through the encoder."""
+    grid = arm.grid()
+    y = arm.input("rows", dtype.bf16, "voxel", a.width)
+    for w in a.layers:
+        n = run_norm(y, w.attn_norm, a.eps)
+        q = heads(run_linear(w.q, n), a.head_dim, a.heads)
+        k = heads(run_linear(w.k, n), a.head_dim, a.heads)
+        v = heads(run_linear(w.v, n), a.head_dim, a.heads)
+        o = None
+        for h in range(a.heads):
+            each = ops.attn.voxel_over(q[h], k[h], v[h], grid, segment(frames = 1), a.sm_scale)
+            part = ops.linear.matmul(each, w.out[h])
+            o = part if o == None else ops.elemwise.residual_add(part, o)
+        y = ops.elemwise.add(ops.elemwise.add_bias(w.out_bias, o), y)
+        n = run_norm(y, w.mlp_norm, a.eps)
+        f = run_linear(w.fc2, ops.elemwise.gelu(run_linear(w.fc1, n), False))
+        y = ops.elemwise.add(f, y)
+    y = run_norm(y, a.norm_out, a.eps)
+    y = run_linear(a.proj2, ops.elemwise.gelu(run_linear(a.proj1, y), False))
+    seam.at(seam.PIXELS, [y, grid])
+    return y
+
+def text(arm, m):
+    """The transcript's Qwen3: the encoder's rows in place of the audio
+    tokens' embeddings, pre-norm layers of full attention, the head."""
+    t = m.text
+    hd = t.head_dim
+    positions = arm.positions()
+    audio = switch_is("stream", "audio")
+    y = ops.gather.embed(arm.tokens(), t.embed, t.vocab)
+    y = merge([arm.on(audio).input("audio", dtype.bf16, "row", m.audio_out), y.on(~audio)])
+
+    def layer(l, w, y):
+        x = ops.elemwise.rmsnorm(y, w.attn_norm, t.eps)
+        q = ops.elemwise.rmsnorm_per_head(ops.linear.matmul(x, w.q), w.q_norm, hd, t.eps)
+        k = ops.elemwise.rmsnorm_per_head(ops.linear.matmul(x, w.k), w.k_norm, hd, t.eps)
+        v = ops.linear.matmul(x, w.v)
+        q, k = ops.elemwise.rope(q, positions, hd, t.theta, rotary.full(), k = k)
+        ops.attn.kv_append(k, v, arm.kv(w.kv), arm.write_page(w.kv), arm.write_offset(w.kv))
+        o = ops.attn.attend(q, arm, w.kv, t.q_heads, t.kv_heads, hd, t.sm_scale)
+        y = ops.elemwise.residual_add(ops.linear.matmul(o, w.o), y)
+        x = ops.elemwise.rmsnorm(y, w.mlp_norm, t.eps)
+        gate, up = ops.linear.matmul(x, w.gate), ops.linear.matmul(x, w.up)
+        f = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), w.down)
+        return ops.elemwise.residual_add(f, y)
+
+    y = arm.fold_layers(t.layers, y, layer)
+    x = ops.elemwise.rmsnorm(y, t.norm, t.eps)
+    x = ops.gather.gather_rows(x, arm.readout_rows())
+    logits = ops.linear.lm_head(x, t.head)
+    seam.at(seam.OUT, [logits])
+    return logits

@@ -38,6 +38,7 @@ members = [
     "mini-dit-parity",
     "flux2-parity",
     "hy3-parity",
+    "qwen3-asr",
     "text-to-image",
     "text-to-video",
     "zimage-parity",
