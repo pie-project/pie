@@ -63,6 +63,9 @@ def _make_model() -> types.ModuleType:
     m.LaneDecl = LaneDeclStub
     m.Readout = ReadoutStub
     m.ReadoutKind = ReadoutKind
+    m.RowCount_Exact = RowCountExactStub
+    m.RowCount_Multiple = RowCountMultipleStub
+    m.RowCount = RowCountExactStub | RowCountMultipleStub
     m.ScheduleKind = ScheduleKind
     m.SwitchDecl = SwitchDeclStub
     m.name = lambda: "mock-model"
@@ -89,6 +92,16 @@ class BlockDrafterStub:
     rows: int
     mask_token: int
     proposals_from: int
+
+
+@dataclass
+class RowCountExactStub:
+    value: int
+
+
+@dataclass
+class RowCountMultipleStub:
+    value: int
 
 
 @dataclass
