@@ -576,7 +576,9 @@ def encoder(reads, v):
     reads.read_over(e.quant.bias, at("quant_conv.bias"), lambda x: x.slice(0, 0, v.z))
 
 # The forward of Wan 2.2: the text encoder's reading, the denoiser's, and
-# the VAE's decode and encode, each in a head (first chunk) and a rest form.
+# the VAE's decode and encode. A VAE lane is a sequence, one latent frame a
+# fire, its conv caches the state: the first chunk (`fact.fresh()`, the
+# state empty) runs the head form, every later one the rest.
 
 def run_linear(w, x):
     """`x` through the projection `w`, plus its bias if it has one."""
@@ -654,7 +656,7 @@ def caches(m, c):
             c.state(cv.cache, slab(cv), dtype.bf16)
 
 def forward(m, inputs):
-    vae_readings = ["vae.decode.head", "vae.decode", "vae.encode.head", "vae.encode"] if m.vae != None else []
+    vae_readings = ["vae.decode", "vae.encode"] if m.vae != None else []
     switch("reading", (["text"] if m.te != None else []) + ["denoise"] + vae_readings)
     switch("stream", ["video", "context"])
     switch("positions", ["computed", "given"])
@@ -663,10 +665,12 @@ def forward(m, inputs):
         text_encode(reading("text"), m.te)
     velocity = denoise(reading("denoise"), m)
     if m.vae != None:
-        vae_decode(reading("vae.decode.head"), m.vae, True)
-        vae_decode(reading("vae.decode"), m.vae, False)
-        vae_encode(reading("vae.encode.head"), m.vae, True)
-        vae_encode(reading("vae.encode"), m.vae, False)
+        head = fact.fresh()
+        decode, encode = reading("vae.decode"), reading("vae.encode")
+        vae_decode(decode.on(head), m.vae, True)
+        vae_decode(decode.on(~head), m.vae, False)
+        vae_encode(encode.on(head), m.vae, True)
+        vae_encode(encode.on(~head), m.vae, False)
     return velocity
 
 def text_encode(arm, te):

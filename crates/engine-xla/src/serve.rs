@@ -1670,7 +1670,7 @@ impl Shell {
             .iter()
             .zip(&clips_of)
             .map(|(s, shot)| crate::dit::Feed {
-                slot: s.lane.slot,
+                slot: s.rs_slot.unwrap_or(s.lane.slot),
                 group: s.group,
                 inputs: s.inputs,
                 clips: *shot,

@@ -22,10 +22,13 @@ pub enum Builtin {
     /// The lane's rows are a prompt only a causal encoder-decoder's encoder
     /// reads (`encode`): a backend sets it on the leading rows it replays.
     Encode,
+    /// The lane's recurrent state holds nothing yet: its cursor is 0, and
+    /// this fire starts it from zeros (`fresh`).
+    Fresh,
 }
 
 impl Builtin {
-    pub const ALL: [Builtin; 7] = [
+    pub const ALL: [Builtin; 8] = [
         Builtin::Masked,
         Builtin::Adapted,
         Builtin::Media,
@@ -33,6 +36,7 @@ impl Builtin {
         Builtin::Drafts,
         Builtin::Scores,
         Builtin::Encode,
+        Builtin::Fresh,
     ];
 
     #[must_use]
@@ -45,6 +49,7 @@ impl Builtin {
             Builtin::Drafts => request.drafts(),
             Builtin::Scores => request.captures_scores(),
             Builtin::Encode => request.encodes(),
+            Builtin::Fresh => request.fresh(),
         }
     }
 }
@@ -292,15 +297,16 @@ impl Facts {
                 })
                 .collect();
         }
-        let mut requests = Vec::with_capacity(guests.len() << 7);
+        let mut requests = Vec::with_capacity(guests.len() << 8);
         for guest in &guests {
-            for bits in 0..1u32 << 7 {
+            for bits in 0..1u32 << 8 {
                 let request = Request::new(if bits & 1 == 0 { 1 } else { 2 }, bits & 2 != 0)
                     .adapted(bits & 4 != 0)
                     .drafting(bits & 8 != 0)
                     .capturing_scores(bits & 16 != 0)
                     .with_media(bits & 32 != 0)
-                    .encoding(bits & 64 != 0);
+                    .encoding(bits & 64 != 0)
+                    .starting(bits & 128 != 0);
                 requests.push(
                     guest
                         .iter()
@@ -370,7 +376,7 @@ mod tests {
         assert!(requests[0].plain());
         assert_eq!(
             requests.len(),
-            3 << 7,
+            3 << 8,
             "default, `image`, and `video` unread"
         );
     }

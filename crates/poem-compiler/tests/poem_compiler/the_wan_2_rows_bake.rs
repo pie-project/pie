@@ -51,7 +51,14 @@ fn is_flagship(deployment: &str) -> bool {
 /// The word of a lane in `reading`, on `stream` where given (its declared
 /// default otherwise).
 fn word(plan: &Trace, reading: &str, stream: Option<&str>) -> u64 {
-    let mut request = Request::new(4, false).switched("reading", reading);
+    fresh_word(plan, reading, stream, false)
+}
+
+/// A lane's word, its state empty or not.
+fn fresh_word(plan: &Trace, reading: &str, stream: Option<&str>, fresh: bool) -> u64 {
+    let mut request = Request::new(4, false)
+        .starting(fresh)
+        .switched("reading", reading);
     if let Some(stream) = stream {
         request = request.switched("stream", stream);
     }
@@ -192,7 +199,8 @@ fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
                 assert_eq!(
                     seams.get(seam::PIXELS.name),
                     Some(&4),
-                    "{deployment}: the voxel-axis readout on all four VAE arms"
+                    "{deployment}: the voxel-axis readout on all four VAE arms (decode and \
+                     encode, each fresh and held)"
                 );
             } else {
                 for other in [seam::HIDDEN.name, seam::PIXELS.name] {
@@ -210,7 +218,7 @@ fn each_reading_reads_out_what_its_facts_state() {
     for deployment in ROWS {
         let plan = trace(deployment, Platform::Cuda);
         let declared = readings(&plan);
-        for name in ["vae.decode.head", "vae.decode"] {
+        for name in ["vae.decode", "vae.encode"] {
             assert_eq!(
                 declared.iter().any(|r| r == name),
                 is_flagship(deployment),
@@ -243,26 +251,24 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
         let plan = trace(deployment, Platform::Cuda);
         let classes = poem::resolve_classes(&plan)
             .unwrap_or_else(|why| panic!("{deployment}: a merge does not resolve: {why:?}"));
-        let mut lanes: Vec<(&str, Option<&str>)> =
-            vec![("denoise", Some("video")), ("denoise", Some("context"))];
+        let mut lanes: Vec<(&str, Option<&str>, bool)> = vec![
+            ("denoise", Some("video"), false),
+            ("denoise", Some("context"), false),
+        ];
         if is_flagship(deployment) {
-            lanes.push(("text", None));
-            for vae in [
-                "vae.decode.head",
-                "vae.decode",
-                "vae.encode.head",
-                "vae.encode",
-            ] {
-                lanes.push((vae, None));
+            lanes.push(("text", None, false));
+            for vae in ["vae.decode", "vae.encode"] {
+                lanes.push((vae, None, true));
+                lanes.push((vae, None, false));
             }
         }
-        let mut seen: Vec<((&str, Option<&str>), usize)> = Vec::new();
-        for (reading, stream) in lanes {
-            let w = word(&plan, reading, stream);
-            let class = classes
-                .class_of(w & classes.mask)
-                .unwrap_or_else(|| panic!("{deployment}: `{reading}`/{stream:?} has no class"));
-            seen.push(((reading, stream), class));
+        let mut seen: Vec<((&str, Option<&str>, bool), usize)> = Vec::new();
+        for (reading, stream, fresh) in lanes {
+            let w = fresh_word(&plan, reading, stream, fresh);
+            let class = classes.class_of(w & classes.mask).unwrap_or_else(|| {
+                panic!("{deployment}: `{reading}`/{stream:?} (fresh {fresh}) has no class")
+            });
+            seen.push(((reading, stream, fresh), class));
         }
         let distinct: BTreeSet<usize> = seen.iter().map(|(_, class)| *class).collect();
         assert_eq!(
@@ -432,14 +438,7 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
         if is_flagship(deployment) {
             assert_eq!(
                 names,
-                vec![
-                    "text",
-                    "denoise",
-                    "vae.decode.head",
-                    "vae.decode",
-                    "vae.encode.head",
-                    "vae.encode"
-                ]
+                vec!["text", "denoise", "vae.decode", "vae.encode"]
             );
         } else {
             assert_eq!(names, vec!["denoise"]);

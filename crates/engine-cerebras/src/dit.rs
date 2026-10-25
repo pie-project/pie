@@ -108,6 +108,7 @@ pub struct Dit {
 /// One lane's feeds, as the fire hands them to [`Dit::stage`].
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Feed<'a> {
+    /// The State row its clips' conv caches read: its recurrent-state row.
     pub slot: u32,
     pub group: Option<u32>,
     pub inputs: &'a [InputCell<'a>],
@@ -760,7 +761,9 @@ impl Dit {
                     token_row += i64::from(tt) * i64::from(th) * i64::from(tw);
                 }
             }
+            // A lane whose class reads no token grid is one row (a VAE's).
             if seat.token_patch.is_some()
+                && row.rows != 1
                 && token_row != i64::from(row.row_offset) + i64::from(row.rows)
             {
                 return Err(program(format!(

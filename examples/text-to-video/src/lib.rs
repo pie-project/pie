@@ -16,12 +16,13 @@
 //!
 //! # THE DECODE
 //!
-//! A causal video VAE decodes one latent frame a fire, the first through its
-//! head arm (`vae.decode.head`) landing one frame, every later one
-//! `temporal-compression`. So `T` latent frames are `1 + tc (T - 1)` output
+//! A causal video VAE decodes one latent frame a fire on one working set:
+//! the first fire on it lands one frame, every later one
+//! `temporal-compression` (the model's own branch on its working set being
+//! fresh). So `T` latent frames are `1 + tc (T - 1)` output
 //! frames, and a `frames` off that lattice is refused with the two nearest.
 //! The decode fires are a sequence (the per-conv frame caches); they go down
-//! one pipeline, head arm first.
+//! one pipeline, in order.
 //!
 //! # THE PROMPT
 //!
@@ -137,10 +138,9 @@ struct Output {
     spatial_compression: u32,
     temporal_compression: u32,
     decode_fires: u32,
-    decode_readings: Vec<String>,
+    decode_reading: String,
     init_frames: u32,
     encode_fires: u32,
-    encode_readings: Vec<String>,
     strength: f32,
     steps: u32,
     seed: u32,
@@ -419,6 +419,7 @@ async fn encode_chunk(
     pixel_w: u32,
     clip_h: u32,
     clip_w: u32,
+    state: &WorkingSet,
     pipe: &Pipeline,
 ) -> Result<Vec<f32>> {
     let input = voxel_input(reading)?;
@@ -427,6 +428,7 @@ async fn encode_chunk(
     let pass = ForwardPass::new();
     pass.switch(0, "reading", reading)?;
     pass.switch(0, "stream", "video")?;
+    pass.state(&[state], StateGeometry::default())?;
     // Empty, and SEEDED from the chunk below: the pixels are the host's, and
     // the eta trace tracks readiness STATICALLY — a channel the host seeds
     // has to be declared `seeded`, or the trace refuses it as consumed but
@@ -470,6 +472,7 @@ async fn decode_frame(
     frames: u32,
     pixel_h: u32,
     pixel_w: u32,
+    state: &WorkingSet,
     pipe: &Pipeline,
 ) -> Result<Vec<f32>> {
     let input = voxel_input(reading)?;
@@ -488,6 +491,7 @@ async fn decode_frame(
     let pass = ForwardPass::new();
     pass.switch(0, "reading", reading)?;
     pass.switch(0, "stream", "video")?;
+    pass.state(&[state], StateGeometry::default())?;
     let cell =
         Channel::from_shaped([clip_h, clip_w, input.width], clip.to_vec()).named("vae_latent");
     pass.input(0, &input.name, &cell)?;
@@ -544,22 +548,13 @@ fn ids_of(text: &str) -> Result<Vec<u32>> {
 async fn main(input: Input) -> Result<Output> {
     let text = text_reading()?;
     let denoise = denoise_reading()?;
-    // The VAE arms, by their `Pixels` readout; `vae.encode*` names the
-    // encoder's, a `.head` suffix the first-frame arm.
-    let pixels: Vec<String> = values("reading")
-        .into_iter()
-        .filter(|r| readout(r, "video").is_some_and(|o| o.kind == model::ReadoutKind::Pixels))
-        .collect();
-    let (encoders, decoders): (Vec<_>, Vec<_>) =
-        pixels.into_iter().partition(|r| r.starts_with("vae.encode"));
-    let head = decoders.iter().find(|r| r.ends_with(".head")).cloned();
-    let body = decoders
+    let readings = values("reading");
+    let decode = readings
         .iter()
-        .find(|r| !r.ends_with(".head"))
+        .find(|r| *r == "vae.decode")
         .cloned()
         .ok_or("this model declares no `vae.decode` reading, so its latent has no way out as frames")?;
-    let encode_head = encoders.iter().find(|r| r.ends_with(".head")).cloned();
-    let encode_body = encoders.iter().find(|r| !r.ends_with(".head")).cloned();
+    let encode_reading = readings.iter().find(|r| *r == "vae.encode").cloned();
 
     // ---- the latent volume, the VAE's own -----------------------------------
     let space = model::latent().ok_or("this model states no latent space")?;
@@ -578,29 +573,18 @@ async fn main(input: Input) -> Result<Output> {
     let width = (input.width.unwrap_or(832) / sc).max(1) * sc;
     let (lh, lw) = (height / sc, width / sc);
     let frames = input.frames.unwrap_or(17).max(1);
-    let lt = if head.is_some() {
-        if (frames - 1) % tc != 0 {
-            let below = 1 + tc * ((frames - 1) / tc);
-            return Err(format!(
-                "this family's VAE lands 1 + {tc}*(T - 1) frames, so {frames} is not a clip it \
-                 has: the nearest are {below} and {}",
-                below + tc
-            )
-            .into());
-        }
-        (frames - 1) / tc + 1
-    } else {
-        if frames % tc != 0 {
-            return Err(format!(
-                "this family's VAE lands {tc}*T frames, so {frames} is not a clip it has: the \
-                 nearest are {} and {}",
-                (frames / tc).max(1) * tc,
-                (frames / tc + 1) * tc
-            )
-            .into());
-        }
-        frames / tc
-    };
+    // A causal VAE's first fire on its working set lands one frame and every
+    // later one `tc`: `1 + tc (T - 1)` frames and no other count.
+    if (frames - 1) % tc != 0 {
+        let below = 1 + tc * ((frames - 1) / tc);
+        return Err(format!(
+            "this family's VAE lands 1 + {tc}*(T - 1) frames, so {frames} is not a clip it \
+             has: the nearest are {below} and {}",
+            below + tc
+        )
+        .into());
+    }
+    let lt = (frames - 1) / tc + 1;
     let lat = [lt, lh, lw, c];
     let cells = lt * lh * lw;
     let plane = (lh * lw * c) as usize;
@@ -658,12 +642,11 @@ async fn main(input: Input) -> Result<Output> {
     let cfg = negative.is_some() && guidance > 1.0;
 
     // ---- video2video: the clip, encoded chunk by chunk ----------------------
-    let mut encode_used: Vec<String> = Vec::new();
     let pipe = Pipeline::new();
     let init: Option<Channel> = if !has_init {
         None
     } else {
-        let body = encode_body.as_ref().ok_or(
+        let reading = encode_reading.as_ref().ok_or(
             "this model declares no `vae.encode` reading, so an init clip has no door to come in through",
         )?;
         if init_b64.len() as u32 != frames {
@@ -688,10 +671,7 @@ async fn main(input: Input) -> Result<Output> {
                     .map_err(|why| format!("init frame {f} does not read back as RGB8: {why}"))?,
             );
         }
-        let mut chunks: Vec<u32> = Vec::new();
-        if encode_head.is_some() {
-            chunks.push(1);
-        }
+        let mut chunks: Vec<u32> = vec![1];
         while chunks.iter().sum::<u32>() < frames {
             chunks.push(tc);
         }
@@ -699,12 +679,10 @@ async fn main(input: Input) -> Result<Output> {
             return Err(format!("a {frames}-frame clip does not chunk into {lt} encode fires at tc = {tc}").into());
         }
         let mut clip: Vec<f32> = Vec::with_capacity(lt as usize * plane);
+        // One working set for the whole clip: the conv caches are its state.
+        let enc_state = WorkingSet::new();
         let mut at = 0usize;
         for (k, take) in chunks.iter().copied().enumerate() {
-            let reading = match (k, encode_head.as_ref()) {
-                (0, Some(head)) => head,
-                _ => body,
-            };
             let mut payload: Vec<u8> = Vec::with_capacity(take as usize * (height * width * 3) as usize);
             for f in at..at + take as usize {
                 payload.extend_from_slice(&rgb[f]);
@@ -712,13 +690,10 @@ async fn main(input: Input) -> Result<Output> {
             at += take as usize;
             let handle = Frames::from_rgb8(&payload, width, height, take, fps)
                 .map_err(|why| format!("encode chunk {k}: frames.from-rgb8: {why}"))?;
-            let landed = encode_chunk(reading, &handle, take, height, width, lh, lw, &pipe)
+            let landed = encode_chunk(reading, &handle, take, height, width, lh, lw, &enc_state, &pipe)
                 .await
                 .with_context(|| format!("encoding chunk {k}"))?;
             clip.extend_from_slice(&landed);
-            if !encode_used.iter().any(|name| name == reading) {
-                encode_used.push(reading.clone());
-            }
         }
         Some(Channel::from_shaped(lat, clip).named("init"))
     };
@@ -825,20 +800,13 @@ async fn main(input: Input) -> Result<Output> {
 
     // ---- the decode: one fire per latent frame, in order ---------------------
     let mut pixels: Vec<f32> = Vec::with_capacity((frames * height * width * 3) as usize);
-    let mut used: Vec<String> = Vec::new();
-    let mut first = 0u32;
-    if let Some(head) = &head {
-        let landed = decode_frame(head, &latent[..plane], lh, lw, 1, height, width, &pipe).await?;
-        pixels.extend_from_slice(&landed);
-        used.push(head.clone());
-        first = 1;
-    }
-    for j in first..lt {
+    // One working set for the whole clip: the conv caches are its state.
+    let vae_state = WorkingSet::new();
+    for j in 0..lt {
         let at = j as usize * plane;
-        let landed = decode_frame(&body, &latent[at..at + plane], lh, lw, tc, height, width, &pipe).await?;
+        let landed = decode_frame(&decode, &latent[at..at + plane], lh, lw, if j == 0 { 1 } else { tc }, height, width, &vae_state, &pipe).await?;
         pixels.extend_from_slice(&landed);
     }
-    used.push(body.clone());
     pipe.close();
     let want = (frames * height * width * 3) as usize;
     if pixels.len() != want {
@@ -877,10 +845,9 @@ async fn main(input: Input) -> Result<Output> {
         spatial_compression: sc,
         temporal_compression: tc,
         decode_fires: lt,
-        decode_readings: used,
+        decode_reading: decode,
         init_frames: init_b64.len() as u32,
         encode_fires: if has_init { lt } else { 0 },
-        encode_readings: encode_used,
         strength: if has_init { strength } else { 1.0 },
         steps: sched.steps(),
         seed,
