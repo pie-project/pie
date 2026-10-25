@@ -381,7 +381,7 @@ mod cupti {
 
 #[cfg(test)]
 mod tests {
-    use super::{arm, base, watched};
+    use super::base;
 
     /// A read's wait for its copy and a set on the legacy stream are noted,
     /// the first sighting with where it was called; a set on a stream of
@@ -389,6 +389,7 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn a_watched_fire_notes_what_waits_for_the_device() {
+        use super::{arm, watched};
         use crate::device::{Buffer, rt};
 
         if !crate::device::present() {
