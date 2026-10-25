@@ -145,12 +145,9 @@ pub struct EngineConfig {
     pub rs_host_slots: usize,
     pub rs_buffer_pages: u32,
     pub rs_host_buffer_pages: u32,
-    pub has_mtp_logits: bool,
-    pub mtp_depth: u32,
     pub draft_block: u32,
     pub draft_mask_token: u32,
     pub draft_proposals_from: u32,
-    pub has_attn_score: bool,
     pub has_attn_page_mask: bool,
     pub has_lora: bool,
     /// The engine takes an attachment for an adapter alone
@@ -342,18 +339,12 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
     };
     let eta_caps = model::EtaCaps {
         has_lora: all(|d| d.has_lora),
-        has_mtp_logits: all(|d| d.has_mtp_logits),
-        mtp_depth: match engine_configs.first().map(|d| d.mtp_depth) {
-            Some(depth) if engine_configs.iter().all(|d| d.mtp_depth == depth) => depth,
-            _ => 0,
-        },
         draft_block: match engine_configs.first().map(|d| d.draft_block) {
             Some(rows) if engine_configs.iter().all(|d| d.draft_block == rows) => rows,
             _ => 0,
         },
         draft_mask_token: engine_configs.first().map_or(0, |d| d.draft_mask_token),
         draft_proposals_from: engine_configs.first().map_or(1, |d| d.draft_proposals_from),
-        has_attn_score: all(|d| d.has_attn_score),
         has_attn_page_mask: all(|d| d.has_attn_page_mask),
         adapter_attachments: all(|d| d.adapter_attachments),
         rs_snapshots: engine_configs

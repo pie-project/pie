@@ -60,7 +60,7 @@ export function main(input) {
   fwdP.state([ws], { fold: 'all' });
   fwdP.epilogue(() => {
     const r = rngP.take();
-    const logits = intrinsics.logits();
+    const logits = intrinsics.output(0, 'logits');
     const token = step(logits, temperature, r);
     const rNext = r.add(iota(2));
     tokOutP.put(token);
@@ -94,7 +94,7 @@ export function main(input) {
     fwd.state([ws], { fold: 'all' });
     fwd.epilogue(() => {
       const r = rng.take();
-      const logits = intrinsics.logits();
+      const logits = intrinsics.output(0, 'logits');
       const token = step(logits, temperature, r);
 
       const rNext = r.add(iota(2));

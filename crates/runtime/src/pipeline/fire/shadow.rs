@@ -68,10 +68,8 @@ impl ShadowPlan {
             }
             Some(Phase::Fold(stage))
         };
-        let layers = bound.graph.num_layers;
-        let phases = core::iter::once(Stage::Prologue)
-            .chain((0..layers).flat_map(|_| [Stage::OnAttnProj, Stage::OnAttn]))
-            .chain(core::iter::once(Stage::Epilogue))
+        let phases = [Stage::Prologue, Stage::Epilogue]
+            .into_iter()
             .filter_map(phase_of)
             .collect();
 
@@ -80,9 +78,8 @@ impl ShadowPlan {
             phases,
         };
         tracing::info!(
-            "shadow plan: {} phase(s) of {} stage kinds: {:?}",
+            "shadow plan: {} phase(s): {:?}",
             plan.phases.len(),
-            1 + 2 * layers + 1,
             plan.phases
         );
         plan
@@ -202,8 +199,8 @@ mod tests {
     use eta_ir::container::{
         ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
     };
-    use eta_ir::op::{IntrinsicId, Op};
-    use eta_ir::registry::{EngineCaps, Graph, Port, Readout, ReadoutKind, Stage};
+    use eta_ir::op::Op;
+    use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Port, Stage};
     use eta_ir::types::{Dtype, Shape};
 
     fn channel(shape: Shape, dtype: Dtype) -> ChannelDecl {
@@ -218,7 +215,7 @@ mod tests {
 
     fn trace(epilogue: Vec<Op>) -> eta_ir::validate::BoundTrace {
         let container = TraceContainer {
-            names: vec![],
+            names: vec!["logits".into()],
             externs: vec![],
             inputs: Vec::new(),
             channels: vec![
@@ -261,21 +258,21 @@ mod tests {
                 ops: epilogue,
             }],
         };
-        let logits = Readout {
-            kind: ReadoutKind::Logits,
+        let logits = OutputDecl {
+            name: "logits".into(),
+            axis: Axis::Row,
             width: 4,
+            dtype: Dtype::F32,
+            layers: 0,
+            readout: true,
         };
-        let graph = Graph {
-            num_layers: 2,
-            ..Graph::default()
-        };
-        eta_ir::validate::bind(container, vec![Some(logits)], graph, EngineCaps::default()).unwrap()
+        eta_ir::validate::bind(container, vec![vec![logits]], EngineCaps::default()).unwrap()
     }
 
     fn device_put_trace() -> eta_ir::validate::BoundTrace {
         trace(vec![
-            Op::IntrinsicVal {
-                intr: IntrinsicId::Logits,
+            Op::Output {
+                index: 0,
                 lane: 0,
                 shape: Shape::matrix(1, 4),
                 dtype: Dtype::F32,

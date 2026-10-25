@@ -1,7 +1,7 @@
+use crate::seam::Intrinsic;
 use engine::ports::Envelope;
 use eta_compiler::codegen::launch::LaunchPackage;
 use eta_exec::{ExecPlan, Extents};
-use eta_ir::op::IntrinsicId;
 use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::name_or_unknown;
 use eta_ir::validate::Direction;
@@ -253,7 +253,7 @@ impl Session {
 
     pub fn bind_intrinsic(
         &mut self,
-        intrinsic: IntrinsicId,
+        intrinsic: Intrinsic,
         lane: u32,
         base: &Buffer,
         offset: u64,
@@ -416,51 +416,25 @@ impl Session {
         Ok(None)
     }
 
-    /// The emitted kernel reads an intrinsic's argument slot regardless: refuse one left unbound.
+    /// The emitted kernel reads an output's argument slot regardless: refuse one left unbound.
     fn intrinsics_bound(&self, plan: &ExecPlan) -> Result<()> {
-        let readout_bound = [
-            IntrinsicId::Logits,
-            IntrinsicId::Velocity,
-            IntrinsicId::Hidden,
-        ]
-        .iter()
-        .any(|id| self.bound & (1u64 << (*id as u32)) != 0);
-        if plan.needs_logits && !readout_bound {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the fire's readout (`logits`, `velocity` or \
-                 `hidden`) and no buffer has been bound to it; the emitted kernel \
-                 reads the argument slot regardless of whether anything was ever \
-                 encoded into it",
-            ));
+        for value in &plan.package.values {
+            let Some(name) = value.output.as_deref() else {
+                continue;
+            };
+            let bound = Intrinsic::of_name(name)
+                .is_some_and(|intrinsic| self.bound & (1u64 << (intrinsic as u32)) != 0);
+            if !bound {
+                return Err(Fault::program(
+                    "program::session",
+                    format!(
+                        "this program reads output `{name}` and no buffer has been bound to \
+                         it; the emitted kernel reads the argument slot regardless of \
+                         whether anything was ever encoded into it"
+                    ),
+                ));
+            }
         }
-        if plan.needs_mtp_logits && self.bound & (1u64 << (IntrinsicId::MtpLogits as u32)) == 0 {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the `mtp_logits` intrinsic and no buffer has \
-                 been bound to it; a model whose text declares no `mtp` export has \
-                 no draft column for it to point at",
-            ));
-        }
-
-        if plan.needs_mtp_drafts && self.bound & (1u64 << (IntrinsicId::MtpDrafts as u32)) == 0 {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the `mtp_drafts` intrinsic and no buffer has \
-                 been bound to it; a model whose text declares no `mtp.drafts` export \
-                 has no token plane for it to point at",
-            ));
-        }
-
-        if plan.needs_attn_scores && self.bound & (1u64 << (IntrinsicId::AttnScore as u32)) == 0 {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the `attn_score` intrinsic and no buffer has been \
-                 bound to it; a lane that did not ask to capture its attention has no \
-                 block of the observability slab for it to point at",
-            ));
-        }
-
         Ok(())
     }
 

@@ -308,7 +308,6 @@ def forward(m, inputs):
         q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, d, m.norm_eps)
         k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, d, m.norm_eps)
         ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
-        seam.at(seam.ATTN_Q, [q])
 
         bias = ops.linear.rel_bias(r, w.rel_proj, m.heads, m.d_rel, w.extent)
         log_scaling = m.log_scaling if reading == GLOBAL else None
@@ -337,7 +336,6 @@ def forward(m, inputs):
                 log_scaling = log_scaling,
             ),
         ])
-        seam.at(seam.ATTN_OUT, [a])
         o = ops.linear.matmul(a, w.o_proj)
         adapted = fact.has(fact.Adapter)
         o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
@@ -351,7 +349,7 @@ def forward(m, inputs):
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.norm_eps) * m.head_scale
     x = ops.gather.gather_rows(x, inputs.readout_rows())
-    return ops.linear.lm_head(x, m.unembed)
+    output("logits", ops.linear.lm_head(x, m.unembed))
 
 def mlp(x, f):
     if not f.routed:

@@ -6,7 +6,7 @@ use flux_2_dims as forward;
 use flux_2_dims as model;
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, GeomKind, Operands, Operation, Platform, Request, RopeForm,
-    RuntimeInput, Trace, Ty, ValueId, seam,
+    RuntimeInput, Trace, Ty, ValueId,
 };
 use poem_ir::{Conv, InputAxis};
 
@@ -34,7 +34,7 @@ fn trace(deployment: &str, platform: Platform) -> Trace {
 }
 
 fn seams(plan: &Trace) -> BTreeSet<&str> {
-    plan.seams.iter().map(|s| s.seam.as_str()).collect()
+    plan.outputs.iter().map(|s| s.name.as_str()).collect()
 }
 
 #[test]
@@ -104,11 +104,11 @@ fn the_latent_is_patched_in_the_graph_and_the_positions_are_its_cells() {
             assert!(named.contains(&want), "{deployment}: {want} in {named:?}");
         }
         let velocity = plan
-            .seams
+            .outputs
             .iter()
-            .find(|s| s.seam == seam::VELOCITY.name)
+            .find(|s| s.name == "velocity")
             .expect("a velocity seam")
-            .values[0];
+            .value;
         assert_eq!(
             plan.values[velocity.0 as usize].ty,
             Ty::Tensor {
@@ -152,14 +152,14 @@ fn both_rows_trace_on_every_platform_with_the_seams_and_caches_they_declare() {
             "{platform:?}: the encoder's kv rows, one per layer it runs"
         );
         let klein_seams = seams(&klein);
-        for want in [seam::HIDDEN.name, seam::VELOCITY.name, seam::PIXELS.name] {
+        for want in ["hidden", "velocity", "pixels"] {
             assert!(
                 klein_seams.contains(want),
                 "{platform:?}: the flagship reads out `{want}`; seams are {klein_seams:?}"
             );
         }
         assert!(
-            !klein_seams.contains(seam::OUT.name),
+            !klein_seams.contains("logits"),
             "{platform:?}: nothing here has logits, and `out` was planted anyway"
         );
 
@@ -170,10 +170,10 @@ fn both_rows_trace_on_every_platform_with_the_seams_and_caches_they_declare() {
         );
         let mini_seams = seams(&mini);
         assert!(
-            mini_seams.contains(seam::VELOCITY.name),
+            mini_seams.contains("velocity"),
             "{platform:?}: {mini_seams:?}"
         );
-        for absent in [seam::OUT.name, seam::HIDDEN.name, seam::PIXELS.name] {
+        for absent in ["logits", "hidden", "pixels"] {
             assert!(
                 !mini_seams.contains(absent),
                 "{platform:?}: a denoiser alone, and `{absent}` was planted"

@@ -32,18 +32,10 @@ use engine::frame::{Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase
 use engine::runahead::Runahead;
 use eta_ir::registry::Stage;
 
-const OUT_SEAM: &str = poem_compiler::EXPORT_SEAMS[0];
-
-const MTP_SEAM: &str = poem_compiler::EXPORT_SEAMS[1];
-const DRAFTS_SEAM: &str = poem_compiler::EXPORT_SEAMS[3];
-
-const VELOCITY_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[0];
-
-const HIDDEN_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[1];
-
-const PIXELS_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[2];
-
-const SCORES_SEAM: &str = poem_compiler::EXPORT_SEAMS[2];
+use crate::seam::{
+    HIDDEN as HIDDEN_SEAM, OUT as OUT_SEAM, PIXELS as PIXELS_SEAM, SCORES as SCORES_SEAM,
+    VELOCITY as VELOCITY_SEAM,
+};
 
 pub struct Boot<'a> {
     pub trace: Trace,
@@ -287,9 +279,9 @@ pub struct Shell {
     readout: Vec<Buffer>,
     out_width: u32,
     readout_bytes: u64,
-    readout_seam: engine::fire::ReadoutSeam,
+    readout_seam: crate::seam::Seam,
     readout_value: ValueId,
-    readouts: Vec<(ValueId, engine::fire::ReadoutSeam, poem_ir::ClassSet)>,
+    readouts: Vec<(ValueId, crate::seam::Seam, poem_ir::ClassSet)>,
     pixels: Vec<(
         ValueId,
         ValueId,
@@ -330,8 +322,6 @@ pub struct Shell {
     run_passes: Vec<u32>,
     held: Vec<u32>,
     out: Option<ValueId>,
-    mtp: Option<ValueId>,
-    drafts_plane: Option<(ValueId, u32)>,
     scores: Option<crate::scores::Scores>,
     capturing: poem_ir::ClassSet,
     programs: crate::program::Plane,
@@ -554,10 +544,10 @@ impl PreparedLoad<'_> {
 
         let score_values: Vec<ValueId> = boot
             .trace
-            .seams
+            .outputs
             .iter()
-            .filter(|seam| seam.seam == SCORES_SEAM)
-            .flat_map(|seam| seam.values.iter().copied())
+            .filter(|output| output.name == SCORES_SEAM)
+            .map(|output| output.value)
             .collect();
         let mut capturing = poem_ir::ClassSet::default();
         {
@@ -915,39 +905,28 @@ impl PreparedLoad<'_> {
             Option<Vec<poem_ir::GridRule>>,
         )> = boot
             .trace
-            .seams
+            .outputs
             .iter()
-            .filter(|seam| seam.seam == PIXELS_SEAM)
-            .filter_map(|seam| match seam.values.as_slice() {
-                [plane, grid, ..] => Some((
-                    *plane,
-                    *grid,
-                    crate::feeds::writer_classes(&boot.trace, &compiled, *plane),
-                    grid_chain(*grid),
-                )),
-                _ => None,
+            .filter(|output| output.name == crate::seam::PIXELS)
+            .filter_map(|output| {
+                let grid = output.grid?;
+                Some((
+                    output.value,
+                    grid,
+                    crate::feeds::writer_classes(&boot.trace, &compiled, output.value),
+                    grid_chain(grid),
+                ))
             })
             .collect();
 
-        let out = boot
-            .trace
-            .seams
-            .iter()
-            .find(|seam| seam.seam == OUT_SEAM)
-            .and_then(|seam| seam.values.first().copied());
-        let last_of = |name: &str| {
-            boot.trace
-                .seams
-                .iter()
-                .rfind(|seam| seam.seam == name)
-                .and_then(|seam| seam.values.first().copied())
-        };
+        let out = crate::seam::named(&boot.trace, OUT_SEAM).next();
+        let last_of = |name: &str| crate::seam::named(&boot.trace, name).last();
         let (readout_value, readout_seam) = match out {
-            Some(out) => (out, engine::fire::ReadoutSeam::Logits),
+            Some(out) => (out, crate::seam::Seam::Logits),
             None => match last_of(VELOCITY_SEAM) {
-                Some(v) => (v, engine::fire::ReadoutSeam::Velocity),
+                Some(v) => (v, crate::seam::Seam::Velocity),
                 None => match last_of(HIDDEN_SEAM) {
-                    Some(h) => (h, engine::fire::ReadoutSeam::Hidden),
+                    Some(h) => (h, crate::seam::Seam::Hidden),
                     None => {
                         return Err(Fault::Unbound {
                             what: format!(
@@ -959,29 +938,29 @@ impl PreparedLoad<'_> {
                 },
             },
         };
-        let readouts: Vec<(ValueId, engine::fire::ReadoutSeam, poem_ir::ClassSet)> = {
+        let readouts: Vec<(ValueId, crate::seam::Seam, poem_ir::ClassSet)> = {
             let mut rows = Vec::new();
             if let Some(out) = out {
                 rows.push((
                     out,
-                    engine::fire::ReadoutSeam::Logits,
+                    crate::seam::Seam::Logits,
                     crate::feeds::writer_classes(&boot.trace, &compiled, out),
                 ));
             }
-            for seam in boot.trace.seams.iter().filter(|s| s.seam == VELOCITY_SEAM) {
-                if let Some(&value) = seam.values.first() {
+            for value in crate::seam::named(&boot.trace, VELOCITY_SEAM) {
+                {
                     rows.push((
                         value,
-                        engine::fire::ReadoutSeam::Velocity,
+                        crate::seam::Seam::Velocity,
                         crate::feeds::writer_classes(&boot.trace, &compiled, value),
                     ));
                 }
             }
-            for seam in boot.trace.seams.iter().filter(|s| s.seam == HIDDEN_SEAM) {
-                if let Some(&value) = seam.values.first() {
+            for value in crate::seam::named(&boot.trace, HIDDEN_SEAM) {
+                {
                     rows.push((
                         value,
-                        engine::fire::ReadoutSeam::Hidden,
+                        crate::seam::Seam::Hidden,
                         crate::feeds::writer_classes(&boot.trace, &compiled, value),
                     ));
                 }
@@ -989,19 +968,7 @@ impl PreparedLoad<'_> {
             rows
         };
 
-        let mtp = boot
-            .trace
-            .seams
-            .iter()
-            .find(|seam| seam.seam == MTP_SEAM)
-            .and_then(|seam| seam.values.first().copied());
-        let drafts_seam = boot
-            .trace
-            .seams
-            .iter()
-            .find(|seam| seam.seam == DRAFTS_SEAM)
-            .and_then(|seam| seam.values.first().copied());
-        let (out_width, readout_bytes, drafts_plane) = {
+        let (out_width, readout_bytes) = {
             let carved = arena.slots(&handles, &compiled.arena, FireRows::ceilings(&budgets))?;
             let logits = carved.0[readout_value.0 as usize].ok_or_else(|| Fault::Unbound {
                 what: format!(
@@ -1022,7 +989,7 @@ impl PreparedLoad<'_> {
                     });
                 }
             };
-            if readout_seam == engine::fire::ReadoutSeam::Logits && logits.dtype != Dtype::Bf16 {
+            if readout_seam == crate::seam::Seam::Logits && logits.dtype != Dtype::Bf16 {
                 return Err(Fault::Unbound {
                     what: format!(
                         "an out seam landed as {:?}, which this shell cannot read back",
@@ -1030,53 +997,8 @@ impl PreparedLoad<'_> {
                     ),
                 });
             }
-            if let Some(mtp) = mtp {
-                let column = carved.0[mtp.0 as usize].ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "value {}, the `{MTP_SEAM}` export, which the carve gave no rectangle",
-                        mtp.0
-                    ),
-                })?;
-                if column.dtype != Dtype::Bf16 {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "an `{MTP_SEAM}` export landed as {:?}, which this shell cannot \
-                             point an intrinsic at",
-                            column.dtype
-                        ),
-                    });
-                }
-            }
-            let drafts_plane = match drafts_seam {
-                Some(value) => {
-                    let plane = carved.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
-                        what: format!(
-                            "value {}, the `{DRAFTS_SEAM}` export, which the carve gave no \
-                             rectangle",
-                            value.0
-                        ),
-                    })?;
-                    if plane.dtype != Dtype::I32 {
-                        return Err(Fault::Unbound {
-                            what: format!(
-                                "a `{DRAFTS_SEAM}` export landed as {:?}, and the draft ids \
-                                 are read as i32",
-                                plane.dtype
-                            ),
-                        });
-                    }
-                    let depth = plane.width;
-                    if depth == 0 {
-                        return Err(Fault::Unbound {
-                            what: format!("a `{DRAFTS_SEAM}` export of width zero drafts nothing"),
-                        });
-                    }
-                    Some((value, depth))
-                }
-                None => None,
-            };
             handles.rewind();
-            (logits.width, readout_bytes, drafts_plane)
+            (logits.width, readout_bytes)
         };
 
         let readout = (0..arms)
@@ -1171,8 +1093,6 @@ impl PreparedLoad<'_> {
             run_passes,
             held: vec![0; paging.slots as usize],
             out,
-            mtp,
-            drafts_plane,
             scores,
             capturing,
             programs: crate::program::Plane::new(),
@@ -1347,7 +1267,9 @@ impl Shell {
 
     #[must_use]
     pub fn classes(&self) -> poem_ir::LaneClasses {
-        poem_exec::feeds::lane_classes(&self.trace, &self.compiled)
+        let outputs =
+            poem_exec::feeds::class_outputs(&self.trace, &self.compiled).unwrap_or_default();
+        poem_exec::feeds::lane_classes(&self.trace, &self.compiled, &outputs)
     }
 
     #[must_use]
@@ -1419,7 +1341,7 @@ impl Shell {
     }
 
     /// The `seam` plane `class` writes, or the load's one `seam` plane.
-    fn plane_for(&self, seam: engine::fire::ReadoutSeam, class: Option<usize>) -> Option<ValueId> {
+    fn plane_for(&self, seam: crate::seam::Seam, class: Option<usize>) -> Option<ValueId> {
         let planes = || self.readouts.iter().filter(move |(_, at, _)| *at == seam);
         planes()
             .rfind(|(_, _, classes)| class.is_some_and(|class| classes.contains(class)))
@@ -1435,7 +1357,7 @@ impl Shell {
         &self,
         prepared: &Prepared<'_>,
         value: ValueId,
-        seam: engine::fire::ReadoutSeam,
+        seam: crate::seam::Seam,
     ) -> Result<(u64, u32, Dtype)> {
         let rect = prepared.slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
             what: format!(
@@ -1452,8 +1374,8 @@ impl Shell {
         Ok((row.offset(), rect.width, rect.dtype))
     }
 
-    fn readout_for(&self, class: Option<usize>) -> (ValueId, engine::fire::ReadoutSeam) {
-        let mine = |want: engine::fire::ReadoutSeam| {
+    fn readout_for(&self, class: Option<usize>) -> (ValueId, crate::seam::Seam) {
+        let mine = |want: crate::seam::Seam| {
             class.and_then(|class| {
                 self.readouts
                     .iter()
@@ -1461,9 +1383,9 @@ impl Shell {
                     .map(|(value, seam, _)| (*value, *seam))
             })
         };
-        mine(engine::fire::ReadoutSeam::Logits)
-            .or_else(|| mine(engine::fire::ReadoutSeam::Velocity))
-            .or_else(|| mine(engine::fire::ReadoutSeam::Hidden))
+        mine(crate::seam::Seam::Logits)
+            .or_else(|| mine(crate::seam::Seam::Velocity))
+            .or_else(|| mine(crate::seam::Seam::Hidden))
             .unwrap_or((self.readout_value, self.readout_seam))
     }
 
@@ -1488,18 +1410,8 @@ impl Shell {
     }
 
     #[must_use]
-    pub fn readout_seam(&self) -> engine::fire::ReadoutSeam {
+    pub fn readout_seam(&self) -> crate::seam::Seam {
         self.readout_seam
-    }
-
-    #[must_use]
-    pub const fn drafts(&self) -> bool {
-        self.mtp.is_some()
-    }
-
-    #[must_use]
-    pub fn mtp_depth(&self) -> u32 {
-        self.drafts_plane.map_or(0, |(_, depth)| depth)
     }
 
     #[must_use]
@@ -2153,8 +2065,6 @@ impl Shell {
         prepared: &Prepared<'_>,
         base: u64,
         width: u64,
-        draft: Option<(u64, u64)>,
-        drafts: Option<(u64, u64)>,
     ) -> Result<Vec<engine::InstanceId>> {
         if !prepared.attachments.iter().any(|a| !a.adapter_only) {
             return Ok(Vec::new());
@@ -2163,13 +2073,11 @@ impl Shell {
         let count = prepared.lanes.len();
         let mut first_row = vec![0u32; count];
         let mut lane_rows = vec![0u32; count];
-        let mut fire_lane = vec![0u32; count];
-        for (at_fire, row) in prepared.composition.lanes().iter().enumerate() {
+        for row in prepared.composition.lanes() {
             let at = row.source as usize;
             if at < count {
                 first_row[at] = row.row_offset;
                 lane_rows[at] = row.rows;
-                fire_lane[at] = u32::try_from(at_fire).unwrap_or(u32::MAX);
             }
         }
 
@@ -2180,8 +2088,7 @@ impl Shell {
 
         let mut owed = Vec::with_capacity(prepared.attachments.len());
         match self.stage_epilogues(
-            frame, prepared, base, width, draft, drafts, &first_row, &lane_rows, &fire_lane,
-            &mut owed,
+            frame, prepared, base, width, &first_row, &lane_rows, &mut owed,
         ) {
             Ok(()) => Ok(owed),
             Err(fault) => {
@@ -2200,11 +2107,8 @@ impl Shell {
         prepared: &Prepared<'_>,
         base: u64,
         width: u64,
-        draft: Option<(u64, u64)>,
-        drafts: Option<(u64, u64)>,
         first_row: &[u32],
         lane_rows: &[u32],
-        fire_lane: &[u32],
         owed: &mut Vec<engine::InstanceId>,
     ) -> Result<()> {
         let mut staged = Vec::with_capacity(prepared.attachments.len());
@@ -2258,7 +2162,7 @@ impl Shell {
             };
 
             let (value, seam) = self.readout_for(class_of(lane));
-            if seam == engine::fire::ReadoutSeam::Logits {
+            if seam == crate::seam::Seam::Logits {
                 let (base, width) = if value == self.readout_value {
                     (base, width)
                 } else {
@@ -2267,7 +2171,7 @@ impl Shell {
                 };
                 self.programs.bind_intrinsic(
                     attached.instance,
-                    eta_ir::op::IntrinsicId::Logits,
+                    crate::seam::Intrinsic::Logits,
                     0,
                     self.arena.store(),
                     base + u64::from(at) * width * self.readout_bytes,
@@ -2282,13 +2186,10 @@ impl Shell {
                 let at = lane + k as usize;
                 for (intrinsic, seam) in [
                     (
-                        eta_ir::op::IntrinsicId::Velocity,
-                        engine::fire::ReadoutSeam::Velocity,
+                        crate::seam::Intrinsic::Velocity,
+                        crate::seam::Seam::Velocity,
                     ),
-                    (
-                        eta_ir::op::IntrinsicId::Hidden,
-                        engine::fire::ReadoutSeam::Hidden,
-                    ),
+                    (crate::seam::Intrinsic::Hidden, crate::seam::Seam::Hidden),
                 ] {
                     if !self.programs.reads_lane(attached.instance, intrinsic, k)? {
                         continue;
@@ -2320,15 +2221,14 @@ impl Shell {
                         dtype,
                     )?;
                 }
-                if self.programs.reads_lane(
-                    attached.instance,
-                    eta_ir::op::IntrinsicId::Pixels,
-                    k,
-                )? {
+                if self
+                    .programs
+                    .reads_lane(attached.instance, crate::seam::Intrinsic::Pixels, k)?
+                {
                     let (plane, offset) = self.pixels_seat(prepared, at)?;
                     self.programs.bind_intrinsic(
                         attached.instance,
-                        eta_ir::op::IntrinsicId::Pixels,
+                        crate::seam::Intrinsic::Pixels,
                         k,
                         self.arena.store(),
                         plane.0 + offset,
@@ -2336,108 +2236,6 @@ impl Shell {
                         Dtype::Bf16,
                     )?;
                 }
-            }
-
-            if self.programs.needs_mtp_logits(attached.instance)? {
-                let (column, mtp_width) = draft.ok_or_else(|| {
-                    Fault::program(
-                        "serve::enqueue",
-                        format!(
-                            "instance {} reads the `mtp_logits` intrinsic and this load \
-                             carved no `{MTP_SEAM}` rectangle; the attachment gate was \
-                             supposed to have refused it",
-                            attached.instance
-                        ),
-                    )
-                })?;
-                self.programs.bind_intrinsic(
-                    attached.instance,
-                    eta_ir::op::IntrinsicId::MtpLogits,
-                    0,
-                    self.arena.store(),
-                    column + u64::from(first_row[lane]) * mtp_width * 2,
-                    u32::try_from(mtp_width).unwrap_or(u32::MAX),
-                    Dtype::Bf16,
-                )?;
-            }
-
-            if self.programs.needs_mtp_drafts(attached.instance)? {
-                let (plane, depth) = drafts.ok_or_else(|| {
-                    Fault::program(
-                        "serve::enqueue",
-                        format!(
-                            "instance {} reads the `mtp_drafts` intrinsic and this load \
-                             carved no `{DRAFTS_SEAM}` rectangle; the attachment gate was \
-                             supposed to have refused it",
-                            attached.instance
-                        ),
-                    )
-                })?;
-                self.programs.bind_intrinsic(
-                    attached.instance,
-                    eta_ir::op::IntrinsicId::MtpDrafts,
-                    0,
-                    self.arena.store(),
-                    plane + u64::from(at) * depth * 4,
-                    u32::try_from(depth).unwrap_or(u32::MAX),
-                    Dtype::I32,
-                )?;
-            }
-
-            if self.programs.needs_attn_scores(attached.instance)? {
-                let slab = self.scores.as_ref().ok_or_else(|| {
-                    Fault::program(
-                        "serve::enqueue",
-                        format!(
-                            "instance {} reads the `attn_score` intrinsic and this load carved \
-                             no observability slab; the attachment gate was supposed to have \
-                             refused it",
-                            attached.instance
-                        ),
-                    )
-                })?;
-                if !prepared
-                    .lanes
-                    .get(lane)
-                    .is_some_and(|seated| seated.captures_scores)
-                {
-                    return Err(Fault::program(
-                        "serve::enqueue",
-                        format!(
-                            "instance {} reads the `attn_score` intrinsic at lane {lane}, which \
-                             did not ask to capture its attention: nothing wrote that lane's \
-                             block of the slab this fire, so the program would read the last \
-                             fire's mass",
-                            attached.instance
-                        ),
-                    ));
-                }
-                let at = fire_lane.get(lane).copied().unwrap_or(u32::MAX);
-                if at >= slab.lanes() {
-                    return Err(Fault::Ceiling {
-                        what: "fire lanes the score slab seats",
-                        need: u64::from(at) + 1,
-                        have: u64::from(slab.lanes()),
-                    });
-                }
-                if let Some(declared) = self.programs.declared_score_planes(attached.instance)
-                    && declared > slab.planes()
-                {
-                    return Err(Fault::Ceiling {
-                        what: "attention-score planes this load exports",
-                        need: u64::from(declared),
-                        have: u64::from(slab.planes()),
-                    });
-                }
-                self.programs.bind_intrinsic(
-                    attached.instance,
-                    eta_ir::op::IntrinsicId::AttnScore,
-                    0,
-                    slab.store(),
-                    slab.lane_base(at),
-                    crate::scores::KV_MAX,
-                    Dtype::F32,
-                )?;
             }
 
             staged.push(attached.instance);
@@ -2550,35 +2348,17 @@ impl Shell {
                     ),
                 ));
             }
-            if self.mtp.is_none() && self.programs.needs_mtp_logits(attached.instance)? {
+            let unbound = self.programs.unbound_outputs(attached.instance)?;
+            if !unbound.is_empty() {
                 return Err(Fault::program(
                     "serve::prepare",
                     format!(
-                        "instance {} reads the `mtp_logits` intrinsic and this load's \
-                         model text declares no `{MTP_SEAM}` seam, so there is no draft \
-                         column to point it at",
-                        attached.instance
-                    ),
-                ));
-            }
-            if self.drafts_plane.is_none() && self.programs.needs_mtp_drafts(attached.instance)? {
-                return Err(Fault::program(
-                    "serve::prepare",
-                    format!(
-                        "instance {} reads the `mtp_drafts` intrinsic and this load's \
-                         model text declares no `{DRAFTS_SEAM}` seam, so there is no token \
-                         plane to point it at",
-                        attached.instance
-                    ),
-                ));
-            }
-            if self.scores.is_none() && self.programs.needs_attn_scores(attached.instance)? {
-                return Err(Fault::program(
-                    "serve::prepare",
-                    format!(
-                        "instance {} reads the `attn_score` intrinsic and this load carves no \
-                         observability slab, so there is no per-key rectangle to point it at",
-                        attached.instance
+                        "instance {} reads {unbound:?}, and engine-metal does not bind those \
+                         outputs yet: it binds `{OUT_SEAM}`, `{}`, `{}` and `{}` alone",
+                        attached.instance,
+                        crate::seam::VELOCITY,
+                        crate::seam::HIDDEN,
+                        crate::seam::PIXELS
                     ),
                 ));
             }
@@ -4552,8 +4332,6 @@ impl engine::frame::Shell for Shell {
             }
         }
 
-        let mut draft = None;
-        let mut drafts = None;
         if prepared.attachments.iter().any(|a| !a.adapter_only) {
             let arena = crate::device::alloc::slab_id(self.arena.store().slab());
             if crate::device::alloc::slab_id(&source) != arena {
@@ -4564,58 +4342,8 @@ impl engine::frame::Shell for Shell {
                         .to_string(),
                 });
             }
-            if let Some(mtp) = self.mtp {
-                let column = prepared.slots.0[mtp.0 as usize].ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "value {}, the `{MTP_SEAM}` export, which the carve gave no rectangle",
-                        mtp.0
-                    ),
-                })?;
-                let row = self.handles.get(column.buf).ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "handle {}, the `{MTP_SEAM}` export's, which this load minted no \
-                         row for",
-                        column.buf
-                    ),
-                })?;
-                if crate::device::alloc::slab_id(row.slab()) != arena {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "the `{MTP_SEAM}` export, which this carve did not put in the \
-                             arena; an attached epilogue is bound against the arena's own \
-                             reservation"
-                        ),
-                    });
-                }
-                draft = Some((row.offset(), u64::from(column.width)));
-            }
-            if let Some((value, depth)) = self.drafts_plane {
-                let plane = prepared.slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "value {}, the `{DRAFTS_SEAM}` export, which the carve gave no rectangle",
-                        value.0
-                    ),
-                })?;
-                let row = self.handles.get(plane.buf).ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "handle {}, the `{DRAFTS_SEAM}` export's, which this load minted no \
-                         row for",
-                        plane.buf
-                    ),
-                })?;
-                if crate::device::alloc::slab_id(row.slab()) != arena {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "the `{DRAFTS_SEAM}` export, which this carve did not put in the \
-                             arena; an attached epilogue is bound against the arena's own \
-                             reservation"
-                        ),
-                    });
-                }
-                drafts = Some((row.offset(), u64::from(depth)));
-            }
         }
-        let attached = self.encode_epilogues(&mut frame, &prepared, base, width, draft, drafts)?;
+        let attached = self.encode_epilogues(&mut frame, &prepared, base, width)?;
         fire_trace(|| "epilogues-encoded".to_string());
 
         self.advance(&prepared);

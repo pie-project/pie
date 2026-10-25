@@ -3,7 +3,7 @@ export * from '../stubs.js';
 import { modelStub } from '../stubs.js';
 export const {
   name, architecture, defaultSystemSpeculation,
-  outputVocabSize, kvPageSize, frameSize, channelCapacity, maxReadoutRows,
+  outputVocabSize, kvPageSize, frameSize, channelCapacity,
   rsStateSize,
-  mtpDepth, submitDeadlineUs, runAheadWindow, draftBlock, switches, lane,
+  submitDeadlineUs, runAheadWindow, draftBlock, switches, lane,
 } = modelStub;

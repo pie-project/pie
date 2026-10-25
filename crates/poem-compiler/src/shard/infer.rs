@@ -14,8 +14,8 @@
 //!
 //! A column cut is kept only where its share reaches row cuts and nothing
 //! that wants it whole: a share that meets an op with no rule, a whole
-//! operand or an answer the runtime reads (but the logits, which a
-//! vocab-split head gathers) puts its weights back whole, and the trace is
+//! operand or an output (but the logits, which a vocab-split head gathers,
+//! and an output a row a lane) puts its weights back whole, and the trace is
 //! read again until nothing changes. Where a share meets the partial sums of
 //! another, the product that contracted the other's share is the one put
 //! back whole, so a low-rank pair cuts its wide half by its columns. A
@@ -384,11 +384,17 @@ impl<'r, 't> Walk<'r, 't> {
         for node in &trace.nodes {
             self.node(&node.op);
         }
-        for seam in &trace.seams {
-            if super::output(&seam.seam) {
-                for v in &seam.values {
-                    self.reduce(*v);
-                    self.want_whole(*v);
+        // An output read a row a lane is gathered whole cheaply; the rest
+        // want their shares back whole before they are read.
+        for output in &trace.outputs {
+            let per_lane = matches!(
+                &trace.values[output.value.0 as usize].ty,
+                Ty::Tensor { shape, .. } if matches!(shape.first(), Some(Dim::Lanes | Dim::LanesPlus(_)))
+            );
+            for v in output.values() {
+                self.reduce(v);
+                if !per_lane {
+                    self.want_whole(v);
                 }
             }
         }

@@ -118,7 +118,7 @@ fn an_expert_parallel_rank_dispatches_its_tokens_to_the_experts() {
             kinds(&whole),
             "`{row}`: the same ops in the same order"
         );
-        assert_eq!(trace.seams.len(), whole.seams.len());
+        assert_eq!(trace.outputs.len(), whole.outputs.len());
     }
 }
 

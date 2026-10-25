@@ -307,7 +307,7 @@ impl Plane {
     pub fn bind_intrinsic(
         &mut self,
         id: InstanceId,
-        intrinsic: eta_ir::op::IntrinsicId,
+        intrinsic: crate::seam::Intrinsic,
         lane: u32,
         base: &crate::device::Buffer,
         offset: u64,
@@ -525,7 +525,7 @@ impl Plane {
     pub fn reads_lane(
         &self,
         id: InstanceId,
-        intrinsic: eta_ir::op::IntrinsicId,
+        intrinsic: crate::seam::Intrinsic,
         lane: u32,
     ) -> Result<bool> {
         let bound = self
@@ -541,12 +541,9 @@ impl Plane {
                 ),
             )
         })?;
-        Ok(program
-            .plan
-            .package
-            .values
-            .iter()
-            .any(|value| value.intrinsic == Some(intrinsic) && value.lane == lane))
+        Ok(program.plan.package.values.iter().any(|value| {
+            crate::seam::value_intrinsic(value) == Some(intrinsic) && value.lane == lane
+        }))
     }
 
     pub fn needs_logits(&self, id: InstanceId) -> Result<bool> {
@@ -563,12 +560,13 @@ impl Plane {
                 ),
             )
         })?;
-        Ok(program
-            .plan
-            .reads_intrinsic(eta_ir::op::IntrinsicId::Logits))
+        Ok(program.plan.package.values.iter().any(|value| {
+            crate::seam::value_intrinsic(value) == Some(crate::seam::Intrinsic::Logits)
+        }))
     }
 
-    pub fn needs_mtp_logits(&self, id: InstanceId) -> Result<bool> {
+    /// The outputs instance `id`'s program reads that this shell binds none of.
+    pub fn unbound_outputs(&self, id: InstanceId) -> Result<Vec<String>> {
         let bound = self
             .instances
             .get(&id)
@@ -582,55 +580,10 @@ impl Plane {
                 ),
             )
         })?;
-        Ok(program.plan.needs_mtp_logits)
-    }
-
-    pub fn needs_mtp_drafts(&self, id: InstanceId) -> Result<bool> {
-        let bound = self
-            .instances
-            .get(&id)
-            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
-        let program = self.programs.get(&bound.program_id).ok_or_else(|| {
-            Fault::program(
-                "program::plane",
-                format!(
-                    "instance {id} names program {}, which is gone",
-                    bound.program_id
-                ),
-            )
-        })?;
-        Ok(program.plan.needs_mtp_drafts)
-    }
-
-    pub fn needs_attn_scores(&self, id: InstanceId) -> Result<bool> {
-        let bound = self
-            .instances
-            .get(&id)
-            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
-        let program = self.programs.get(&bound.program_id).ok_or_else(|| {
-            Fault::program(
-                "program::plane",
-                format!(
-                    "instance {id} names program {}, which is gone",
-                    bound.program_id
-                ),
-            )
-        })?;
-        Ok(program.plan.needs_attn_scores)
-    }
-
-    #[must_use]
-    pub fn declared_score_planes(&self, id: InstanceId) -> Option<u32> {
-        let bound = self.instances.get(&id)?;
-        let program = self.programs.get(&bound.program_id)?;
-        program
-            .plan
-            .package
-            .values
-            .iter()
-            .filter(|value| value.intrinsic == Some(eta_ir::op::IntrinsicId::AttnScore))
-            .filter_map(|value| value.shape.first().copied())
-            .max()
+        Ok(crate::seam::unbound(&program.plan.package)
+            .into_iter()
+            .map(str::to_string)
+            .collect())
     }
 
     pub fn close_instance(&mut self, id: InstanceId) -> Result<()> {

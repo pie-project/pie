@@ -1333,12 +1333,11 @@ def forward(m, inputs):
     if dr != None:
         switch("block_draft", ["off", "on"])
     trunk_inputs = inputs.on(~block_rows(dr)) if dr != None else inputs
-    ([input_m, input_s, input_d], input_p) = trunk_inputs.partition([fact.has(fact.Mask), fact.scores(), fact.single_token()])
+    ([input_m, input_d], input_p) = trunk_inputs.partition([fact.has(fact.Mask), fact.single_token()])
     plans = struct(
         m = ops.attn.plan_prefill(input_m, m.q_heads, m.kv_heads, m.head_dim, None),
         d = ops.attn.plan_decode(input_d, m.q_heads, m.kv_heads, m.head_dim, None),
         p = ops.attn.plan_prefill(input_p, m.q_heads, m.kv_heads, m.head_dim, None),
-        s = ops.attn.plan_prefill(input_s, m.q_heads, m.kv_heads, m.head_dim, None),
     )
     mask = inputs.mask()
 
@@ -1398,7 +1397,7 @@ def forward(m, inputs):
         plant_readout(dr, logits, inputs, x, block_rows(dr))
     if m.mtp != None:
         draft(m, inputs, x, logits, head)
-    return logits
+    output("logits", logits)
 
 def mlp(x, f, bonsai):
     if not f.routed:
@@ -1435,8 +1434,8 @@ def draft(m, inputs, x, logits, head):
 
     read = ops.elemwise.rmsnorm_plus_one(dy, mtp.norm, mtp.norm_eps) if mtp.norm != None else dy
     proposal = ops.linear.lm_head(read, head)
-    seam.at(seam.MTP, [proposal])
-    seam.at(seam.MTP_DRAFTS, [ops.sampling.argmax([proposal])])
+    output("mtp.logits", proposal)
+    output("mtp.drafts", ops.sampling.argmax([proposal]))
 
 def rotate(q, k, inputs, m, a):
     vision = m.tower != None
@@ -1453,7 +1452,6 @@ def attn_mixer(x, inputs, m, plans, mask, a):
     q, gate = ops.gather.split_q_gate(ops.linear.matmul(qkv_in, a.qg_proj), d)
     k = ops.linear.matmul(qkv_in, a.k_proj)
     v = ops.linear.matmul(qkv_in, a.v_proj)
-    seam.at(seam.ATTN_QV, [q, v])
     q = ops.elemwise.rmsnorm_per_head_plus_one(q, a.q_norm, d, a.q_norm_eps)
     k = ops.elemwise.rmsnorm_per_head_plus_one(k, a.k_norm, d, a.k_norm_eps)
     q, k = rotate(q, k, inputs, m, a)
@@ -1464,12 +1462,6 @@ def attn_mixer(x, inputs, m, plans, mask, a):
         k = ops.elemwise.hadamard_plain(k, d)
         v = ops.elemwise.hadamard_plain(v, d)
     ops.attn.kv_append(k, v, pages, write_page, write_offset)
-    seam.at(seam.ATTN_Q, [q])
-
-    def scored(q):
-        o, lse = ops.attn.prefill(q, plans.s, pages, None, d, m.kv_heads, a.sm_scale, lse = True)
-        seam.at(seam.SCORES, [lse])
-        return o
 
     o = branch(q, [
         (fact.has(fact.Mask), lambda q: ops.attn.prefill(
@@ -1482,10 +1474,10 @@ def attn_mixer(x, inputs, m, plans, mask, a):
             a.sm_scale,
             mask = mask,
         )),
-        (fact.scores(), scored),
         (fact.single_token(), lambda q: ops.attn.decode(q, plans.d, pages, None, d, a.sm_scale)),
     ], otherwise = lambda q: ops.attn.prefill(q, plans.p, pages, None, d, m.kv_heads, a.sm_scale))
-    seam.at(seam.ATTN_OUT, [o])
+    scores = ops.attn.score_capture(q, inputs, a.kv, m.q_heads, m.kv_heads, d, a.sm_scale, observe = 32, kv_max = 2048)
+    output("attn.scores", scores)
     if m.rotate_kv:
         o = ops.elemwise.hadamard_plain(o, d)
     # Bonsai: the gated output rotates by the 6144-wide signs, as `ssm_out`'s.
@@ -1500,7 +1492,6 @@ def gdn_mixer(x, inputs, g, bonsai):
     qkvz_in = rot_copy(x, bonsai.hidden) if bonsai != None else x
     qkvz = ops.linear.matmul(qkvz_in, g.in_qkvz)
     ba = ops.linear.matmul(x, g.in_ba)
-    seam.at(seam.RECURRENT, [qkvz])
     width = g.qkv_width
 
     # The cut before the switch: a backend may land qkv and z from the

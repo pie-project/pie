@@ -7,7 +7,7 @@ use common_dit::{
     conv_reference, matmul, modulation, two_axis,
 };
 use engine::channel::ChannelId;
-use engine::fire::{InputFeed, Lane, Readout, ReadoutSeam, StepVoxels};
+use engine::fire::{InputFeed, Lane, Readout, StepVoxels};
 use eta_ir::container::HostRole;
 use eta_ir::types::Shape;
 
@@ -41,15 +41,12 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
     };
     let weights = Weights::random(&two_axis(), 0x5a);
     let mut rig = Rig::load(two_axis(), &weights, 32, vec![16, 32], Some(voxels() + 8));
-    let pixels = rig.readout_widths(poem_ir::ReadoutKind::Pixels);
+    let pixels = rig.readout_widths("pixels");
     assert!(
         !pixels.is_empty() && pixels.iter().all(|&width| width == C_OUT),
         "a plan planting `seam::PIXELS` reads pixels out of its decode class"
     );
-    assert!(
-        !rig.readout_widths(poem_ir::ReadoutKind::Velocity)
-            .is_empty()
-    );
+    assert!(!rig.readout_widths("velocity").is_empty());
 
     let program = rig.register(carrier(
         &[Shape::new(&[CLIP[1], CLIP[2], C_IN]).expect("a box")],
@@ -80,11 +77,7 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
             }],
         );
         let readout = readouts[0].clone();
-        assert_eq!(
-            readout.seam,
-            ReadoutSeam::Pixels,
-            "a VAE lane answers pixels"
-        );
+        assert_eq!(readout.output, "pixels", "a VAE lane answers pixels");
         assert_eq!(readout.width, C_OUT);
         (readout.values, readout.clips)
     };
@@ -158,7 +151,7 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
         ..Lane::default()
     };
     let readouts = rig.fire(vec![lane], vec![attach(0, dit_instance)], Vec::new());
-    assert_eq!(readouts[0].seam, ReadoutSeam::Velocity);
+    assert_eq!(readouts[0].output, "velocity");
     let w = WIDTH as usize;
     let m = modulation(&weights, timestep);
     let h = condition(&latent, rows as usize, &m);

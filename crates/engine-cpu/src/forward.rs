@@ -354,10 +354,15 @@ impl Forward {
             run.op(&node.op)
                 .map_err(|why| format!("node {at}: {why}"))?;
         }
-        let out = (self.trace.seams.iter())
-            .find(|s| s.seam == "out")
-            .and_then(|s| s.values.first().copied())
-            .ok_or("the trace has no out seam")?;
+        let out = (self.trace.outputs.iter())
+            .map(|output| output.value)
+            .find(|value| {
+                matches!(
+                    &self.trace.values[value.0 as usize].ty,
+                    poem_ir::Ty::Tensor { shape, .. } if shape.first() == Some(&poem_ir::Dim::Readouts)
+                )
+            })
+            .ok_or("the trace reads out no readout rows")?;
         let logits = run.floats(out)?;
         Ok(if logits.rows == 0 {
             Vec::new()

@@ -142,7 +142,7 @@ async fn main(input: Input) -> Result<Output> {
     prefill.mask(&causal)?;
     prefill.state(&[&ws], StateGeometry::folding())?;
     prefill.epilogue(move || {
-        first_out.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
+        first_out.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
     });
     prefill
         .submit(&pipeline)
@@ -172,7 +172,7 @@ async fn main(input: Input) -> Result<Output> {
     decode.state(&[&ws], StateGeometry::folding())?;
     decode.epilogue(move || {
         let base = fill.take();
-        let token = reshape(reduce_argmax(intrinsics::logits()), [1]);
+        let token = reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]);
         let next_mask = reshape(sink_window_mask(&base, span, sink, window), [1, span]);
 
         token_in.put(&token);

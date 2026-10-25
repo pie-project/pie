@@ -5,8 +5,8 @@ use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, Partition, TensorType};
 
 use crate::flux_2_dims::{self as model, vae};
-use poem::{Def, Dim, Dtype, Operation, Platform, Request, Trace, Ty, seam};
-use poem_ir::{Attn, Conv, GridRule, InputAxis, ParamLayout, Seam};
+use poem::{Def, Dim, Dtype, Operation, Platform, Request, Trace, Ty};
+use poem_ir::{Attn, Conv, GridRule, InputAxis, Output, ParamLayout};
 
 const KLEIN: &str = "flux2-klein-4b-bf16-kv-bf16";
 const MINI: &str = "flux2-mini-bf16-kv-bf16";
@@ -103,24 +103,19 @@ fn the_trace_reads_its_voxel_inputs_and_plants_pixels_twice() {
             ("pixels", vae::RGB, Dtype::Bf16)
         ]
     );
-    let pixels: Vec<&Seam> = plan
-        .seams
-        .iter()
-        .filter(|s| s.seam == seam::PIXELS.name)
-        .collect();
+    let pixels: Vec<&Output> = plan.outputs.iter().filter(|s| s.name == "pixels").collect();
     assert_eq!(pixels.len(), 2, "one pixels seam per VAE reading");
     let mut planes: Vec<Ty> = pixels
         .iter()
         .map(|s| {
-            assert_eq!(s.values.len(), 2, "the plane and its grid");
             assert_eq!(
-                plan.values[s.values[1].0 as usize].ty,
+                plan.values[s.grid.expect("the pixels name their grid").0 as usize].ty,
                 Ty::Tensor {
                     shape: vec![Dim::Clips, Dim::Const(4)],
                     dtype: Dtype::I32
                 }
             );
-            plan.values[s.values[0].0 as usize].ty.clone()
+            plan.values[s.value.0 as usize].ty.clone()
         })
         .collect();
     planes.sort_by_key(|ty| format!("{ty:?}"));
@@ -135,10 +130,7 @@ fn the_trace_reads_its_voxel_inputs_and_plants_pixels_twice() {
     want.sort_by_key(|ty| format!("{ty:?}"));
     assert_eq!(planes, want);
     assert_eq!(
-        plan.seams
-            .iter()
-            .filter(|s| s.seam == seam::VELOCITY.name)
-            .count(),
+        plan.outputs.iter().filter(|s| s.name == "velocity").count(),
         1,
         "the denoise reading's seam is untouched"
     );

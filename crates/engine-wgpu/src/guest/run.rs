@@ -1,7 +1,6 @@
 use eta_compiler::codegen::launch::{LaunchPackage, LaunchValue, ValueOrigin};
 use eta_exec::{ExecPlan, StagePlan, StageRunner, Value};
 use eta_ir::Dtype;
-use eta_ir::op::IntrinsicId;
 
 use super::session::Session;
 use super::widen::Widen;
@@ -11,6 +10,9 @@ use crate::error::{Fault, Result};
 
 #[derive(Clone, Copy)]
 pub struct Readout<'a> {
+    /// The output it holds.
+    pub output: &'a str,
+
     pub seat: &'a Buffer,
 
     pub at: u64,
@@ -61,13 +63,14 @@ impl<'a> OnDevice<'a> {
         self
     }
 
-    fn offered(&self, intrinsic: Option<IntrinsicId>, lane: u32) -> Option<Readout<'a>> {
-        let at = lane as usize;
-        match intrinsic {
-            Some(IntrinsicId::Logits) => self.logits,
-            Some(IntrinsicId::Pixels) => self.pixels.get(at).copied().flatten(),
-            _ => self.lanes.get(at).copied().flatten(),
-        }
+    /// What this fire read out of output `root` reads, for its lane.
+    fn offered(&self, root: &LaunchValue) -> Option<Readout<'a>> {
+        let name = root.output.as_deref()?;
+        let at = root.lane as usize;
+        let named = |seat: Option<Readout<'a>>| seat.filter(|seat| seat.output == name);
+        named(self.lanes.get(at).copied().flatten())
+            .or_else(|| named(self.pixels.get(at).copied().flatten()))
+            .or_else(|| named(self.logits).filter(|_| root.lane == 0))
     }
 
     #[must_use]
@@ -91,26 +94,14 @@ impl<'a> OnDevice<'a> {
                 continue;
             };
             let root = &package.values[global as usize];
-            if root.source == ValueOrigin::Intrinsic
-                && matches!(
-                    root.intrinsic,
-                    Some(
-                        IntrinsicId::Logits
-                            | IntrinsicId::Velocity
-                            | IntrinsicId::Hidden
-                            | IntrinsicId::Pixels
-                    )
-                )
-            {
-                let seat =
-                    self.offered(root.intrinsic, root.lane)
-                        .ok_or_else(|| Fault::Program {
-                            at: "guest::run",
-                            why: format!(
-                                "this pass reads {:?} of lane {} and the fire offered no such row",
-                                root.intrinsic, root.lane
-                            ),
-                        })?;
+            if root.source == ValueOrigin::Output {
+                let seat = self.offered(root).ok_or_else(|| Fault::Program {
+                    at: "guest::run",
+                    why: format!(
+                        "this pass reads output {:?} of lane {} and the fire offered no such row",
+                        root.output, root.lane
+                    ),
+                })?;
                 let (_, held) = self.session.span(at, local).ok_or_else(|| Fault::Program {
                     at: "guest::run",
                     why: format!("the logits root {local} is not stage {at}'s"),
@@ -232,15 +223,8 @@ impl StageRunner for OnDevice<'_> {
             })
     }
 
-    fn binds(&self, id: Option<IntrinsicId>) -> bool {
-        match id {
-            Some(IntrinsicId::Logits) => self.logits.is_some(),
-            Some(IntrinsicId::Pixels) => self.pixels.iter().any(Option::is_some),
-            Some(IntrinsicId::Velocity | IntrinsicId::Hidden) => {
-                self.lanes.iter().any(Option::is_some)
-            }
-            _ => false,
-        }
+    fn binds(&self, root: &LaunchValue) -> bool {
+        self.offered(root).is_some()
     }
 }
 

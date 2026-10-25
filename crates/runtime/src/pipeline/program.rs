@@ -10,8 +10,8 @@ use eta_compiler::plan::CompiledStage;
 use eta_ir::container::{self, ContainerDecodeError, PortSource, TraceContainer};
 use eta_ir::container_hash;
 use eta_ir::op::Op;
-use eta_ir::registry::{EngineCaps, Graph, Port, Readout};
-use eta_ir::validate::{BoundTrace, ValidateError, bind, check_intrinsics};
+use eta_ir::registry::{EngineCaps, OutputDecl, Port};
+use eta_ir::validate::{BoundTrace, ValidateError, bind, check_outputs};
 use lru::LruCache;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,8 +29,8 @@ pub struct RegisteredProgram {
     pub compiled_stages: Vec<CompiledStage>,
     emitted: Mutex<HashMap<Backend, Arc<EmittedProgram>>>,
     pub channel_accesses: Vec<(bool, bool)>,
-    pub reads_attn_score: bool,
-    pub reads_mtp_logits: bool,
+    /// The outputs it reads, by name and the lane reading each.
+    pub reads: Vec<(String, u32)>,
     launch: std::sync::OnceLock<LaunchPackage>,
     geometry_taint: std::sync::OnceLock<eta_compiler::eval::pareval::GeometryTaint>,
     shadow_plan: std::sync::OnceLock<Arc<crate::pipeline::fire::shadow::ShadowPlan>>,
@@ -116,8 +116,7 @@ impl Registry {
     pub fn register(
         &mut self,
         bytes: Vec<u8>,
-        lanes: Vec<Option<Readout>>,
-        graph: Graph,
+        lanes: Vec<Vec<OutputDecl>>,
         caps: EngineCaps,
     ) -> Result<Arc<RegisteredProgram>, RegisterError> {
         let hash = container_hash(&bytes);
@@ -125,15 +124,14 @@ impl Registry {
             if hit.bytes != bytes {
                 return Err(RegisterError::HashCollision(hash));
             }
-            check_intrinsics(&hit.bound.container, &lanes, graph).map_err(RegisterError::Bind)?;
+            check_outputs(&hit.bound.container, &lanes).map_err(RegisterError::Bind)?;
             return Ok(hit.clone());
         }
         let decoded = container::decode(&bytes).map_err(RegisterError::Decode)?;
         let pricing = price(&decoded);
         let channel_accesses = Self::channel_accesses(&decoded);
-        let reads_attn_score = Self::reads_attn_score(&decoded);
-        let reads_mtp_logits = Self::reads_mtp_logits(&decoded);
-        let bound = bind(decoded, lanes, graph, caps).map_err(RegisterError::Bind)?;
+        let reads = Self::reads(&decoded);
+        let bound = bind(decoded, lanes, caps).map_err(RegisterError::Bind)?;
         let compiled_stages = eta_compiler::plan::compile_bound(&bound);
         let launch = std::sync::OnceLock::new();
         let entry = Arc::new(RegisteredProgram {
@@ -142,8 +140,7 @@ impl Registry {
             bound,
             compiled_stages,
             channel_accesses,
-            reads_attn_score,
-            reads_mtp_logits,
+            reads,
             launch,
             geometry_taint: std::sync::OnceLock::new(),
             shadow_plan: std::sync::OnceLock::new(),
@@ -154,33 +151,21 @@ impl Registry {
         Ok(entry)
     }
 
-    fn reads_attn_score(container: &TraceContainer) -> bool {
-        container.stages.iter().any(|stage| {
-            stage.ops.iter().any(|op| {
-                matches!(
-                    op,
-                    Op::IntrinsicVal {
-                        intr: eta_ir::op::IntrinsicId::AttnScore,
-                        ..
-                    }
-                )
+    fn reads(container: &TraceContainer) -> Vec<(String, u32)> {
+        let mut reads: Vec<(String, u32)> = container
+            .stages
+            .iter()
+            .flat_map(|stage| stage.ops.iter())
+            .filter_map(|op| match *op {
+                Op::Output { index, lane, .. } => {
+                    Some((container.names.get(index as usize)?.clone(), lane))
+                }
+                _ => None,
             })
-        })
-    }
-
-    fn reads_mtp_logits(container: &TraceContainer) -> bool {
-        container.stages.iter().any(|stage| {
-            stage.ops.iter().any(|op| {
-                matches!(
-                    op,
-                    Op::IntrinsicVal {
-                        intr: eta_ir::op::IntrinsicId::MtpLogits
-                            | eta_ir::op::IntrinsicId::MtpDrafts,
-                        ..
-                    }
-                )
-            })
-        })
+            .collect();
+        reads.sort_unstable();
+        reads.dedup();
+        reads
     }
 
     fn channel_accesses(container: &TraceContainer) -> Vec<(bool, bool)> {
@@ -235,20 +220,12 @@ fn price(c: &TraceContainer) -> Pricing {
                     .map(|decl| decl.shape.numel() as u32),
             })
     };
-    let intrinsic_rows = || {
+    let output_rows = || {
         c.stages
             .iter()
             .flat_map(|stage| stage.ops.iter())
             .filter_map(|op| match op {
-                Op::IntrinsicVal {
-                    intr:
-                        eta_ir::op::IntrinsicId::Velocity
-                        | eta_ir::op::IntrinsicId::Hidden
-                        | eta_ir::op::IntrinsicId::Pixels
-                        | eta_ir::op::IntrinsicId::Logits,
-                    shape,
-                    ..
-                } => shape.dims().first().copied(),
+                Op::Output { shape, .. } => shape.dims().first().copied(),
                 _ => None,
             })
             .max()
@@ -259,7 +236,7 @@ fn price(c: &TraceContainer) -> Pricing {
             port_len(eta_ir::registry::Port::EmbedIndptr)
                 .map(|indptr| indptr.saturating_sub(1).max(1))
         })
-        .or_else(intrinsic_rows)
+        .or_else(output_rows)
         .unwrap_or(1);
     Pricing {
         channel_bytes,
@@ -282,21 +259,14 @@ fn global() -> MutexGuard<'static, Registry> {
 
 pub fn register(
     bytes: Vec<u8>,
-    lanes: Vec<Option<Readout>>,
+    lanes: Vec<Vec<OutputDecl>>,
 ) -> Result<Arc<RegisteredProgram>, RegisterError> {
-    let m = crate::model::model();
-    let eta = m.eta_caps();
-    let graph = Graph {
-        num_layers: m.num_layers(),
-        mtp_logits: eta.has_mtp_logits,
-        mtp_depth: eta.mtp_depth,
-        attn_score: eta.has_attn_score,
-    };
+    let eta = crate::model::model().eta_caps();
     let caps = EngineCaps {
         lora: eta.has_lora,
         attn_page_mask: eta.has_attn_page_mask,
     };
-    global().register(bytes, lanes, graph, caps)
+    global().register(bytes, lanes, caps)
 }
 
 pub fn lookup(hash: u64) -> Option<Arc<RegisteredProgram>> {
@@ -347,17 +317,17 @@ pub fn with_host_codegen<'a>(
 mod pricing_tests {
     use super::price;
     use eta_ir::container::{StageProgram, TraceContainer};
-    use eta_ir::op::{IntrinsicId, Op};
+    use eta_ir::op::Op;
     use eta_ir::registry::Stage;
     use eta_ir::types::{Dtype, Shape};
 
     #[test]
-    fn a_float_lane_is_priced_by_its_velocity_rows() {
+    fn a_float_lane_is_priced_by_its_output_rows() {
         let container = TraceContainer {
             stages: vec![StageProgram {
                 stage: Stage::Epilogue,
-                ops: vec![Op::IntrinsicVal {
-                    intr: IntrinsicId::Velocity,
+                ops: vec![Op::Output {
+                    index: 0,
                     lane: 0,
                     shape: Shape::matrix(256, 64),
                     dtype: Dtype::F32,

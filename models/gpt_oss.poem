@@ -346,7 +346,6 @@ def forward(m, inputs):
         q = ops.elemwise.add_bias(at.q_bias, ops.linear.matmul(x, at.q))
         k = ops.elemwise.add_bias(at.k_bias, ops.linear.matmul(x, at.k))
         v = ops.elemwise.add_bias(at.v_bias, ops.linear.matmul(x, at.v))
-        seam.at(seam.ATTN_QV, [q, v])
 
         rope = m.rope
         q, k = ops.elemwise.rope(
@@ -366,15 +365,16 @@ def forward(m, inputs):
             k = k,
         )
         ops.attn.kv_append(k, v, pages, write_page, write_offset)
-        seam.at(seam.ATTN_Q, [q])
 
         r = at.reading
         win = m.window if r == WINDOWED else None
         # Each lane by its kind, the sinks folded in; a full layer's scores
-        # go out at their seam.
+        # are read out.
         a = ops.attn.attend(q, trunk_inputs, at.kv, m.q_heads, m.kv_heads, d, m.sm_scale, window = win,
-                            sinks = at.sinks, mask = True, scores = True, scores_seam = r == FULL)
-        seam.at(seam.ATTN_OUT, [a])
+                            sinks = at.sinks, mask = True)
+        if r == FULL:
+            scores = ops.attn.score_capture(q, trunk_inputs, at.kv, m.q_heads, m.kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048)
+            output("attn.scores", scores)
 
         o = ops.elemwise.add_bias(at.o_bias, ops.linear.matmul(a, at.o_proj))
         adapted = fact.has(fact.Adapter)
@@ -410,4 +410,4 @@ def forward(m, inputs):
     logits = ops.linear.lm_head(x, m.head)
     if dr != None:
         plant_readout(dr, logits, inputs, x, block_rows(dr))
-    return logits
+    output("logits", logits)

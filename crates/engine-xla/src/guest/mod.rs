@@ -83,7 +83,6 @@ pub fn admits(package: &LaunchPackage) -> Result<(), Refused> {
             lower::Batch {
                 lanes: 1,
                 logits: None,
-                mtp: None,
             },
             &carried_channels(package),
         )?;

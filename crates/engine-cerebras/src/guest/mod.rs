@@ -55,7 +55,6 @@ pub fn admits(package: &LaunchPackage) -> Result<u32, Refused> {
                 lanes: 1,
                 cols: widest,
                 logits: None,
-                mtp: None,
             },
         )?;
     }

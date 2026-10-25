@@ -12,7 +12,6 @@
 
 import {
   Dtype,
-  Intrinsic,
   MAX_RANK,
   Op,
   PRED_CUMMASS_LE,
@@ -752,9 +751,9 @@ export function nucleusSample(logits: Operand, topP: Operand, state: Operand): T
 
 // -- intrinsic leaf / internal helpers ------------------------------------------
 
-export function intrinsicVal(intr: Intrinsic, shape: Shape, dt: Dtype, lane = 0): Tensor {
+export function outputVal(index: number, lane: number, shape: Shape, dt: Dtype): Tensor {
   const ty = vt(shape, dt);
-  return Tensor.node(emit(Op.intrinsicVal(intr, shape, dt, lane), [ty]), ty);
+  return Tensor.node(emit(Op.output(index, lane, shape, dt), [ty]), ty);
 }
 
 /** Reshape a value id to `target` if it differs (a `put` fitting a scalar into a `[1]` cell). */

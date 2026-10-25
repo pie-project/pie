@@ -14,7 +14,7 @@
 //!
 //! **WHY THE HEAD'S CHAIN AT ROW `m` IS THE RIGHT ONE.** The head is fed
 //! `(hidden_i, argmax_i)` and drafts what follows — the model text's
-//! contract, `mtp_drafts` — so row `m`'s chain is conditioned on exactly the
+//! contract, its `mtp.drafts` output — so row `m`'s chain is conditioned on exactly the
 //! token the next window starts with. That is what lets one fire both verify
 //! this window and draft the next; a head fed the row's own token could not
 //! (see `.wiki/big/dsv4.md` §3.4).
@@ -37,7 +37,7 @@ struct Input {
     prompt: String,
     #[serde(default = "default_max_tokens")]
     max_tokens: usize,
-    /// Draft tokens per round, capped at the model's `mtp_depth`. **`k = 0`
+    /// Draft tokens per round, capped at the width of the model's `mtp.drafts`. **`k = 0`
     /// IS THE CONTROLLED A/B**: the window is one row, nothing is drafted or
     /// verified, and the loop is sequential greedy decoding through the same
     /// geometry, fire and commit arithmetic.
@@ -137,7 +137,9 @@ const NONE: i32 = -1;
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    let depth = model::mtp_depth();
+    let lane = model::lane_of(&[])?;
+    let output = |name: &str| lane.outputs.iter().find(|output| output.name == name);
+    let depth = output("mtp.drafts").map_or(0, |drafts| drafts.width);
     let k = input.k.min(depth);
     if input.max_tokens == 0 {
         return Ok(Output::empty(k, depth));
@@ -164,9 +166,9 @@ async fn main(input: Input) -> Result<Output> {
         .context("reserve the decode's slots")?;
     let pipe = Pipeline::new();
 
-    // The `mtp_drafts` pass is not cut by the runtime, so it is no wider than a fire reads out.
+    // The drafting pass is not cut by the runtime, so it is no wider than a fire reads out.
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
-    let tail = u32::try_from(max_readout_rows(model::ReadoutKind::Logits)).unwrap_or(u32::MAX);
+    let tail = output("logits").map_or(1, |logits| logits.max_rows);
     let spans = if k > 0 && n > tail {
         vec![(0, n - tail), (n - tail, n)]
     } else {
@@ -189,13 +191,13 @@ async fn main(input: Input) -> Result<Output> {
         fwd_p.state(&[&ws], StateGeometry::folding())?;
         fwd_p.epilogue(move || {
             // One readout row: `logits()` is `[vocab]`, its argmax a scalar.
-            let t = reshape(reduce_argmax(intrinsics::logits()), [1]);
+            let t = reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]);
             let i = iota(w);
             let first = eq(&i, Tensor::constant(0u32));
             let window = if drafting {
                 // The head's chain at the readout row, `[depth]`; the window
                 // takes its first `k`, and any pad lane carries `t` again.
-                let chain = intrinsics::mtp_drafts(depth);
+                let chain = intrinsics::output(0, "mtp.drafts");
                 let j = min_elem(
                     max_elem(&i, Tensor::constant(1u32)) - Tensor::constant(1u32),
                     Tensor::constant(depth - 1),
@@ -267,7 +269,7 @@ async fn main(input: Input) -> Result<Output> {
             let window = win.take(); // [w] i32
             let b = base.take(); // [1] u32
             // One readout row per lane: `[w, vocab]`, or `[vocab]` at w = 1.
-            let logits = intrinsics::logits();
+            let logits = intrinsics::output(0, "logits");
             let truth = reshape(reduce_argmax(&logits), [w]); // [w] i32
             if tracing {
                 let j = iota(2 * w);
@@ -317,7 +319,7 @@ async fn main(input: Input) -> Result<Output> {
             // ── the next window: the correction, then row m's chain
             let first = eq(&i, Tensor::constant(0u32));
             let next = if k > 0 {
-                let chains = intrinsics::mtp_drafts(w * depth); // [w·depth]
+                let chains = reshape(intrinsics::output(0, "mtp.drafts"), [w * depth]);
                 let j = min_elem(max_elem(&i, &one) - &one, Tensor::constant(depth - 1));
                 let at = &mb * Tensor::constant(depth) + &j;
                 let drafted = and(not(&first), le(&i, Tensor::constant(k)));

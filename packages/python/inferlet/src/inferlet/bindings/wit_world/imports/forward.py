@@ -9,7 +9,7 @@ on as resources.
 What reaches inside attention is refused by name on a model without
 attention layers.
 
-Legal stages: prologue, on_attn_proj, on_attn, epilogue.
+Legal stages: prologue, epilogue.
 """
 from typing import TypeVar, Generic, Union, Optional, Protocol, Tuple, List, Any, Self, Callable
 from types import TracebackType

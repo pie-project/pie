@@ -75,8 +75,9 @@ struct Output {
     mask_cells: Option<u32>,
 }
 
-fn readout_kind(lane: &model::LaneDecl) -> Option<model::ReadoutKind> {
-    lane.readout.as_ref().map(|readout| readout.kind)
+/// The output `name` a lane reads out, if it reads it.
+fn output<'a>(lane: &'a model::LaneDecl, name: &str) -> Option<&'a model::OutputDecl> {
+    lane.outputs.iter().find(|output| output.name == name)
 }
 
 fn values(switch: &str) -> Vec<String> {
@@ -126,6 +127,8 @@ fn stream_reading(reading: &str, name: &str) -> Option<Option<String>> {
 struct Text {
     reading: String,
     width: u32,
+    /// The most hidden rows one pass reads out.
+    rows: u32,
     state: bool,
 }
 
@@ -177,9 +180,10 @@ fn text_reading() -> Result<Text> {
         .into_iter()
         .find_map(|r| {
             let lane = lane(&r, None).ok()?;
-            let readout = lane.readout.as_ref()?;
-            (lane.embeds && readout.kind == model::ReadoutKind::Hidden).then(|| Text {
-                width: readout.width,
+            let hidden = output(&lane, "hidden")?;
+            lane.embeds.then(|| Text {
+                width: hidden.width,
+                rows: hidden.max_rows,
                 state: lane.state,
                 reading: r.clone(),
             })
@@ -193,7 +197,10 @@ fn denoise_reading() -> Result<Denoise> {
             continue;
         };
         let image = lane(&reading, latent_stream.as_deref())?;
-        if image.embeds || readout_kind(&image) != Some(model::ReadoutKind::Velocity) {
+        let Some(velocity) = output(&image, "velocity").map(|velocity| velocity.width) else {
+            continue;
+        };
+        if image.embeds {
             continue;
         }
         if image.state {
@@ -216,7 +223,6 @@ fn denoise_reading() -> Result<Denoise> {
         if input(&image, "timestep").is_none() {
             return Err(format!("reading `{reading}` reads no `timestep`"));
         }
-        let velocity = image.readout.as_ref().map_or(0, |r| r.width);
         if velocity != latents.width {
             return Err(format!(
                 "reading `{reading}` reads out {velocity}-wide velocity rows over {}-wide latent cells",
@@ -232,7 +238,7 @@ fn denoise_reading() -> Result<Denoise> {
             context,
         });
     }
-    Err("this model declares no token-less reading of `latents` with a velocity readout, so nothing here denoises".into())
+    Err("this model declares no token-less reading of `latents` reading out a velocity, so nothing here denoises".into())
 }
 
 fn bridge_reading(from: u32, to: u32) -> Result<Bridge> {
@@ -241,10 +247,7 @@ fn bridge_reading(from: u32, to: u32) -> Result<Bridge> {
             let Ok(lane) = lane(&reading, stream.as_deref()) else {
                 continue;
             };
-            let hidden = lane
-                .readout
-                .as_ref()
-                .is_some_and(|r| r.kind == model::ReadoutKind::Hidden && r.width == to);
+            let hidden = output(&lane, "hidden").is_some_and(|hidden| hidden.width == to);
             if lane.embeds || lane.state || !hidden {
                 continue;
             }
@@ -311,8 +314,8 @@ fn encode(
     if len == 0 {
         return Err("the prompt tokenizes to nothing".into());
     }
-    let cap = max_readout_rows(model::ReadoutKind::Hidden);
-    if len as usize > cap {
+    let cap = text.rows;
+    if len > cap {
         return Err(format!(
             "the prompt is {len} tokens and one pass reads out {cap} hidden rows"
         ));
@@ -341,7 +344,7 @@ fn encode(
     let encoded = Channel::new([rows, width], dtype::f32).queued();
     pass.epilogue(move || {
         encoded.put(pad_rows(
-            &intrinsics::hidden(0, len, width),
+            &intrinsics::output_rows(0, "hidden", len),
             len,
             rows,
             width,
@@ -364,7 +367,7 @@ fn encode(
     )?;
     let bridged = Channel::new([rows, to], dtype::f32).queued();
     pass.epilogue(move || {
-        bridged.put(intrinsics::hidden(0, rows, to));
+        bridged.put(intrinsics::output_rows(0, "hidden", rows));
     });
     pass.submit(pipe)?;
     held.passes.push(pass);
@@ -445,10 +448,10 @@ fn vae_lane(reading: &str) -> Result<(Option<String>, model::InputDecl, u32)> {
         let Ok(lane) = lane(reading, stream.as_deref()) else {
             continue;
         };
-        if let ([input], Some(readout)) = (&lane.inputs[..], &lane.readout)
+        if let ([input], Some(pixels)) = (&lane.inputs[..], output(&lane, "pixels"))
             && input.axis == model::InputAxis::Voxel
         {
-            return Ok((stream, input.clone(), readout.width));
+            return Ok((stream, input.clone(), pixels.width));
         }
     }
     Err(format!(
@@ -655,7 +658,10 @@ async fn main(input: Input) -> Result<Output> {
         let clip = Channel::seeded([height, width, pixels_in.width], dtype::f32).named("pixels_in");
         pass.input(0, &pixels_in.name, &clip)?;
         pass.epilogue(move || {
-            seed_loop(Some(reshape(intrinsics::pixels(0, cells, c), lat)));
+            seed_loop(Some(reshape(
+                intrinsics::output_rows(0, "pixels", cells),
+                lat,
+            )));
         });
         clip.set_frames(&picture)?;
         pass.submit(&pipe)?;
@@ -671,12 +677,12 @@ async fn main(input: Input) -> Result<Output> {
         let step = k.take();
         let v = if cfg {
             cfg_combine(
-                &intrinsics::velocity(0, n, c),
-                &intrinsics::velocity(2, n, c),
+                &intrinsics::output_rows(0, "velocity", n),
+                &intrinsics::output_rows(2, "velocity", n),
                 &Tensor::constant([guidance]),
             )
         } else {
-            intrinsics::velocity(0, n, c)
+            intrinsics::output_rows(0, "velocity", n)
         };
         let sig = sigmas.read();
         let next = &step + 1u32;
@@ -753,7 +759,7 @@ async fn main(input: Input) -> Result<Output> {
     let px = Channel::new([height * width, rgb], dtype::f32).named("pixels");
     let pixels = height * width;
     pass.epilogue(move || {
-        px.put(intrinsics::pixels(0, pixels, rgb));
+        px.put(intrinsics::output_rows(0, "pixels", pixels));
     });
     pass.submit(&pipe).context("the decode")?;
     let picture = px.take_frames(width, height, 1, 0.0)?;

@@ -670,7 +670,7 @@ def vae_decode(vae, z, grid):
             h = convolve(up, grid, block.upsample)
     h = run_group_norm(h, grid, d.norm_out, True)
     y = convolve(h, grid, d.conv_out)
-    seam.at(seam.PIXELS, [y, grid])
+    output("pixels", y, grid = grid)
     return y
 
 def vae_encode(vae, arm):
@@ -725,7 +725,7 @@ def qwen3_encode(arm, te, tap = None):
         if tap != None:
             tap(l, y)
         elif l == last:
-            seam.at(seam.HIDDEN, [y])
+            output("hidden", y)
         return y
 
     arm.fold_layers(te.layers, y, layer)
@@ -749,11 +749,10 @@ def forward(m, inputs):
     reading = lambda name: inputs.on(switch_is("reading", name))
     if m.te != None:
         text(reading("text"), m)
-    velocity = denoise(reading("denoise"), m)
+    denoise(reading("denoise"), m)
     if m.vae != None:
         decode(reading("vae.decode"), m)
         encode(reading("vae.encode"), m)
-    return velocity
 
 def text(arm, m):
     """The context: the encoder's tapped layers, each projected and summed."""
@@ -766,7 +765,7 @@ def text(arm, m):
         part = ops.linear.matmul(y, m.te_context[i])
         total[0] = part if total[0] == None else ops.elemwise.residual_add(part, total[0])
         if i + 1 == len(m.te_taps):
-            seam.at(seam.HIDDEN, [total[0]])
+            output("hidden", total[0])
 
     qwen3_encode(arm, m.te, tap)
 
@@ -911,7 +910,7 @@ def denoise(arm, m):
         patch,
         image_in.grid(),
     )
-    seam.at(seam.VELOCITY, [velocity])
+    output("velocity", velocity)
     return velocity
 
 def decode(arm, m):
@@ -933,5 +932,5 @@ def encode(arm, m):
     packed, grid = ops.conv.pixel_unshuffle(mean, grid, [1, m.pack, m.pack])
     z = ops.elemwise.standardize(packed, lat.bn_mean, lat.bn_rscale)
     z, grid = ops.conv.pixel_shuffle(z, grid, [1, m.pack, m.pack])
-    seam.at(seam.PIXELS, [z, grid])
+    output("pixels", z, grid = grid)
     return z

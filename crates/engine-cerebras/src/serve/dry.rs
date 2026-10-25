@@ -57,7 +57,6 @@ struct Owned {
     window: Vec<u32>,
     mask: Option<Masking>,
     adapter: Option<u32>,
-    captures: bool,
     inputs: Vec<(u32, Vec<u8>)>,
     clip: Option<([u32; 3], Vec<u8>)>,
     media: Option<OwnedMedia>,
@@ -79,17 +78,16 @@ impl Shell {
     /// class whose tokens a clip sets fires at the clip's), one fire per
     /// class and shape; runs nothing. The shell must be dry.
     ///
-    /// `lean` skips the classes that run a custom-mask, adapter or score
-    /// capture arm (a compile check keeps the device briefly).
+    /// `lean` skips the classes that run a custom-mask or adapter arm (a
+    /// compile check keeps the device briefly).
     pub fn synthetic_fires(&mut self, prefill: u32, lean: bool) -> Vec<Probe> {
         let facts = self.trace().facts.clone();
         let landing = landing(&facts, &self.compiled_model().classes);
         let mut probes = Vec::new();
         for (class, requests) in landing.iter().enumerate() {
-            if lean
-                && (self.masked.contains(class)
-                    || self.corrected.contains(class)
-                    || self.capturing.contains(class))
+            // A score capture this shell does not serve.
+            if self.capturing.contains(class)
+                || lean && (self.masked.contains(class) || self.corrected.contains(class))
             {
                 continue;
             }
@@ -189,7 +187,6 @@ impl Shell {
             seated.held = Some(0);
             seated.mask = lane_owned.mask.as_ref();
             seated.adapter = lane_owned.adapter;
-            seated.captures_scores = lane_owned.captures;
             seated.inputs = &cells[at];
             seated.kv_less = lane_owned.kv_less;
             seated.readout = lane_owned.readout.as_deref();
@@ -282,7 +279,6 @@ impl Shell {
                 .contains(class)
                 .then(|| Masking::Extent(Mask::new(vec![0, rows], u64::from(rows)))),
             adapter: self.corrected.contains(class).then_some(0),
-            captures: self.capturing.contains(class),
             readout: (self.trace().drafter.is_some() && !request.switches().is_empty())
                 .then(|| (0..rows).collect()),
             inputs,

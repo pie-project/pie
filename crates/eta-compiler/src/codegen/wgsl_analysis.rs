@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use eta_ir::op::{IntrinsicId, intrinsic_tags, tags};
+use eta_ir::op::tags;
 
 use crate::codegen::alias::{AliasTable, covers};
 use crate::codegen::launch::{LaunchPlanValue, LaunchStagePlan};
@@ -10,7 +10,8 @@ use crate::plan::{Dimension, SymbolicType};
 pub struct DirectArgmax {
     pub node: u32,
     pub source_value: u32,
-    pub intrinsic: IntrinsicId,
+    /// The output it scans, by its index in the stage's names.
+    pub output: u32,
     pub requires_single_row: bool,
 }
 
@@ -183,20 +184,20 @@ fn direct_argmax(
                 value = source.args[0];
                 continue;
             }
-            if source.tag != tags::INTRINSIC_VAL {
-                break;
-            }
-            let Some(intrinsic) = source.intrinsic else {
-                break;
-            };
-            let wire = intrinsic as u16;
-            if wire != intrinsic_tags::LOGITS && wire != intrinsic_tags::MTP_LOGITS {
+            if source.tag != tags::OUTPUT {
                 break;
             }
             let source_dims = plan
                 .value_types
                 .get(bases[producer as usize] as usize)
                 .map(|value| value.axes.as_slice());
+            if source_dims.and_then(<[Dimension]>::first)
+                != Some(&Dimension::Symbolic(
+                    crate::plan::SymbolicExtent::SampledRows,
+                ))
+            {
+                break;
+            }
             let reduced_dims = plan
                 .value_types
                 .get(op.args[0] as usize)
@@ -221,7 +222,7 @@ fn direct_argmax(
                 found.push(DirectArgmax {
                     node: node as u32,
                     source_value: table.resolve(op.args[0]),
-                    intrinsic,
+                    output: source.name_index,
                     requires_single_row: single_row,
                 });
             }
@@ -238,7 +239,7 @@ mod tests {
     use crate::plan::Dimension;
     use alloc::vec;
     use alloc::vec::Vec;
-    use eta_ir::op::{IntrinsicId, tags};
+    use eta_ir::op::tags;
     use eta_ir::types::Dtype;
 
     fn value(dims: &[Dimension]) -> LaunchPlanValue {
@@ -278,8 +279,7 @@ mod tests {
     }
 
     fn a_plan_that_numbers_no_result_is_numbered_by_position() {
-        let mut logits = op(tags::INTRINSIC_VAL, 0, &[]);
-        logits.intrinsic = Some(IntrinsicId::Logits);
+        let logits = op(tags::OUTPUT, 0, &[]);
         let mut stage = plan(
             vec![
                 logits,
@@ -394,8 +394,7 @@ mod tests {
     }
 
     fn an_argmax_of_the_logits_is_reported() {
-        let mut logits = op(tags::INTRINSIC_VAL, 0, &[]);
-        logits.intrinsic = Some(IntrinsicId::Logits);
+        let logits = op(tags::OUTPUT, 0, &[]);
         let stage = plan(
             vec![
                 logits,
@@ -403,7 +402,10 @@ mod tests {
                 op(tags::REDUCE_ARGMAX, 2, &[1]),
             ],
             vec![
-                value(&[Dimension::Static(128)]),
+                value(&[
+                    Dimension::Symbolic(crate::plan::SymbolicExtent::SampledRows),
+                    Dimension::Static(128),
+                ]),
                 value(&[Dimension::Static(128)]),
                 value(&[Dimension::Static(1)]),
             ],
@@ -414,16 +416,15 @@ mod tests {
             [DirectArgmax {
                 node: 2,
                 source_value: 0,
-                intrinsic: IntrinsicId::Logits,
-                requires_single_row: false,
+                output: 0,
+                requires_single_row: true,
             }],
             "the argmax reads the staged logits value, not the elided reshape"
         );
     }
 
     fn an_argmax_through_an_op_that_is_not_a_reshape_is_refused() {
-        let mut logits = op(tags::INTRINSIC_VAL, 0, &[]);
-        logits.intrinsic = Some(IntrinsicId::Logits);
+        let logits = op(tags::OUTPUT, 0, &[]);
         let stage = plan(
             vec![
                 logits,
@@ -443,8 +444,7 @@ mod tests {
     }
 
     fn a_reshape_read_twice_breaks_the_chain() {
-        let mut logits = op(tags::INTRINSIC_VAL, 0, &[]);
-        logits.intrinsic = Some(IntrinsicId::Logits);
+        let logits = op(tags::OUTPUT, 0, &[]);
         let stage = plan(
             vec![
                 logits,

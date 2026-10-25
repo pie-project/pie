@@ -15,14 +15,6 @@ export function architecture(): string;
  * Whether the bound model enables system speculation by default
  */
 export function defaultSystemSpeculation(): boolean;
-/**
- * The draft head's chain depth: how many tokens past each readout row
- * the `mtp_drafts` intrinsic carries (`[n_out × depth]`, row-major,
- * each row's chain conditioned on the trunk's argmax at that row). Zero
- * for a model with no draft head, in which case `mtp_drafts` and
- * `mtp_logits` are unavailable. Static, like `frame-size`.
- */
-export function mtpDepth(): number;
 export function draftBlock(): BlockDrafter | undefined;
 /**
  * Every switch the bound model declares; empty for a one-path model.
@@ -133,12 +125,6 @@ export function channelCapacity(): number;
  */
 export function runAheadWindow(): number;
 /**
- * The most rows one pass may read out through `kind`: what a pass returns,
- * not how long it is. A pass whose rows cannot run in pieces is refused
- * past one fire.
- */
-export function maxReadoutRows(kind: ReadoutKind): number;
-/**
  * Size in bytes of one folded recurrent state. 0 if the model keeps
  * none (attention only, windowed or not).
  */
@@ -151,7 +137,7 @@ export type Error = import('./pie-inferlet-types.js').Error;
  * row but the first carries in. Facts the head was trained
  * at, not policy: which rows to verify, and whether to draft at all, stay
  * the guest's. `none` for a model with no block drafter (a chained head
- * is `mtp-depth`). Static, like `mtp-depth`.
+ * reads its drafts out as an output). Static.
  */
 export interface BlockDrafter {
   rows: number,
@@ -172,21 +158,7 @@ export interface SwitchDecl {
   values: Array<string>,
 }
 /**
- * Which export seam a lane's epilogue reads; `pixels` is one row per
- * output voxel of the pass's clip.
- * # Variants
- * 
- * ## `"logits"`
- * 
- * ## `"velocity"`
- * 
- * ## `"hidden"`
- * 
- * ## `"pixels"`
- */
-export type ReadoutKind = 'logits' | 'velocity' | 'hidden' | 'pixels';
-/**
- * Whether an input is one per lane, per row, or per voxel of the clip.
+ * Whether an input or output is one per lane, per row, or per voxel of the clip.
  * # Variants
  * 
  * ## `"lane"`
@@ -222,21 +194,30 @@ export interface InputDecl {
   rows?: RowCount,
 }
 /**
- * What a lane's epilogue reads out, and how wide one row is.
+ * One output a lane's epilogue may read, by the name the model gives it:
+ * `width` values of `dtype` per `axis` entry, stacked `layers` deep when
+ * the model writes it per layer (0 when it does not); at most `max-rows`
+ * rows a pass. `readout`: its rows are the lane's readout rows, which
+ * `forward-pass.readout` chooses.
  */
-export interface Readout {
-  kind: ReadoutKind,
+export interface OutputDecl {
+  name: string,
+  axis: InputAxis,
   width: number,
+  dtype: Dtype,
+  layers: number,
+  maxRows: number,
+  readout: boolean,
 }
 /**
  * A lane of given switches: the inputs it binds (exactly these), whether
- * it binds `state` and `embed`, and its readout (`none` if nothing).
+ * it binds `state` and `embed`, and the outputs it may read.
  */
 export interface LaneDecl {
   inputs: Array<InputDecl>,
   state: boolean,
   embeds: boolean,
-  readout?: Readout,
+  outputs: Array<OutputDecl>,
 }
 /**
  * ── Generative facts ────────────────────────────────────────────────

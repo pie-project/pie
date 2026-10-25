@@ -935,15 +935,16 @@ def forward(m, inputs):
         else:
             q = qkv_unfused(normed, positions, inputs, m, at, d, kv_heads, at.banks,
                             at.banks.k_norm, at.banks.k_norm_eps, pages)
-        seam.at(seam.ATTN_Q, [q])
 
-        # Each lane by its kind (the tail's whole rows are lanes that mask or
-        # capture scores, so only those two); a global layer's scores go out
-        # at their seam.
+        # Each lane by its kind (the tail's whole rows are the lanes that mask
+        # or capture scores); a global layer's scores are read out.
+        lanes = trunk_inputs.on(~read) if whole else trunk_inputs
         causal = ~switch_is("mode", "denoise") if m.self_cond != None else None
-        a = ops.attn.attend(q, trunk_inputs, at.kv, m.q_heads, kv_heads, d, at.sm_scale, window = win,
-                            causal = causal, mask = True, scores = True, scores_seam = at.reading != SLIDING)
-        seam.at(seam.ATTN_OUT, [a])
+        a = ops.attn.attend(q, lanes, at.kv, m.q_heads, kv_heads, d, at.sm_scale, window = win,
+                            causal = causal, mask = True)
+        if at.reading != SLIDING:
+            scores = ops.attn.score_capture(q, lanes, at.kv, m.q_heads, kv_heads, d, at.sm_scale, observe = 32, kv_max = 2048)
+            output("attn.scores", scores)
         return normed, a, routes
 
     def attend_readouts(l, w, y):
@@ -1032,7 +1033,7 @@ def forward(m, inputs):
         eagle_draft(m, inputs, x, logits, root)
     if m.assistant != None:
         assistant_draft(m, inputs, positions, x, logits, root)
-    return logits
+    output("logits", logits)
 
 def eagle_draft(m, inputs, x, logits, root):
     """E4B's EAGLE head (`m.draft`) proposes one token from the trunk's last
@@ -1062,8 +1063,8 @@ def eagle_draft(m, inputs, x, logits, root):
     dy = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, a.post_ffw_norm, a.norm_eps), dy)
 
     draft = ops.attn.logit_softcap(ops.linear.lm_head(ops.elemwise.rmsnorm(dy, m.final_norm, m.final_norm_eps), m.embed), m.softcap)
-    seam.at(seam.MTP, [draft])
-    seam.at(seam.MTP_DRAFTS, [ops.sampling.argmax([draft])])
+    output("mtp.logits", draft)
+    output("mtp.drafts", ops.sampling.argmax([draft]))
 
 def assistant_draft(m, inputs, positions, x, logits, root):
     """The MTP assistant (`m.assistant`) proposes one token from the trunk's
@@ -1094,8 +1095,8 @@ def assistant_draft(m, inputs, positions, x, logits, root):
         y = ops.elemwise.residual_add(ops.elemwise.rmsnorm(f, w.post_ffw_norm, a.norm_eps), y)
         y = ops.elemwise.scale(w.scalar, y)
     draft = ops.linear.lm_head(ops.elemwise.rmsnorm(y, a.norm, a.norm_eps), a.embed)
-    seam.at(seam.MTP, [draft])
-    seam.at(seam.MTP_DRAFTS, [ops.sampling.argmax([draft])])
+    output("mtp.logits", draft)
+    output("mtp.drafts", ops.sampling.argmax([draft]))
 
 def clipped(x, c):
     if c.clip == None:

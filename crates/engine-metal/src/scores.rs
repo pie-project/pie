@@ -4,11 +4,11 @@ use poem_ir::{Dtype, ValueId};
 use crate::device::{Buffer, Context, Handles};
 use crate::error::{Fault, Result};
 
-pub(crate) const KV_MAX: u32 = eta_ir::registry::ATTN_SCORE_KV_MAX;
+pub(crate) const KV_MAX: u32 = 2048;
 
 const SLOT: u64 = 4;
 
-pub(crate) const OBSERVE: u32 = eta_ir::registry::ATTN_SCORE_OBSERVE;
+pub(crate) const OBSERVE: u32 = 32;
 
 #[derive(Debug)]
 pub(crate) struct Scores {
@@ -50,10 +50,6 @@ impl Scores {
         }))
     }
 
-    pub(crate) fn store(&self) -> &Buffer {
-        &self.store
-    }
-
     #[must_use]
     pub(crate) fn planes(&self) -> u32 {
         self.planes
@@ -62,11 +58,6 @@ impl Scores {
     #[must_use]
     pub(crate) fn heads(&self) -> u32 {
         self.heads
-    }
-
-    #[must_use]
-    pub(crate) fn lanes(&self) -> u32 {
-        self.lanes
     }
 
     #[must_use]

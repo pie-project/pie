@@ -199,7 +199,6 @@ pub struct Lane {
     pub kv: KvDelta,
     pub mask: Option<Masking>,
     pub adapter: Option<u32>,
-    pub captures_scores: bool,
     #[serde(default)]
     pub rs: RsVerb,
     #[serde(default)]
@@ -677,34 +676,17 @@ pub struct FrameTicket {
     pub steps: Vec<FireTicket>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct LayerScores {
-    pub layer: u32,
-    pub rows: u32,
-    pub heads: u32,
-    pub lse: Vec<f32>,
-}
-
+/// The rows a lane read back of `output`, the last row or voxel output its
+/// class writes.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LaneReadout {
+    #[serde(default)]
+    pub output: String,
     pub rows: u32,
     pub width: u32,
-    #[serde(default)]
-    pub seam: ReadoutSeam,
     pub values: Vec<f32>,
-    #[serde(default)]
-    pub scores: Vec<LayerScores>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clips: Vec<[u32; 3]>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum ReadoutSeam {
-    #[default]
-    Logits,
-    Velocity,
-    Hidden,
-    Pixels,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]

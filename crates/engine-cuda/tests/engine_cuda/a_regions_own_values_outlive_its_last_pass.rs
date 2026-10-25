@@ -3,7 +3,7 @@ use eta_compiler::codegen::launch::LaunchPackage;
 use eta_compiler::plan::compile_bound;
 use eta_exec::Extents;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::{IntrinsicId, Op, tags};
+use eta_ir::op::{Op, tags};
 use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype, Shape};
 
@@ -12,8 +12,8 @@ const VOCAB: u32 = 4096;
 
 fn softmax_epilogue() -> TraceContainer {
     let ops = vec![
-        Op::IntrinsicVal {
-            intr: IntrinsicId::Logits,
+        Op::Output {
+            index: 0,
             lane: 0,
             shape: Shape::matrix(ROWS, VOCAB),
             dtype: Dtype::F32,
@@ -49,7 +49,7 @@ fn softmax_epilogue() -> TraceContainer {
         seeded: false,
     };
     TraceContainer {
-        names: Vec::new(),
+        names: vec!["logits".to_string()],
         channels: vec![probs_out],
         ports: Vec::new(),
         stages: vec![StageProgram {

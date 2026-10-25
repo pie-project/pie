@@ -42,7 +42,7 @@ async def fire(ws, pipe, tokens, fold):
 
     @fwd.epilogue
     def _():
-        out.put(reshape(reduce_argmax(intrinsics.logits()), [1]))
+        out.put(reshape(reduce_argmax(intrinsics.output(0, "logits")), [1]))
 
     pipe.submit(fwd)
     return await out.take_scalar()

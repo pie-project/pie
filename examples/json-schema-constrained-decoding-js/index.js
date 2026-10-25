@@ -51,7 +51,7 @@ export function main(input) {
   prefill.state([ws], { fold: 'all' });
   prefill.epilogue(() => {
     const allowed = prefillMask.take();
-    firstOut.put(reshape(maskedArgmax(intrinsics.logits(), allowed), [1]));
+    firstOut.put(reshape(maskedArgmax(intrinsics.output(0, 'logits'), allowed), [1]));
   });
 
   prefillMask.put(mask.unpackMask(constraint.mask(), vocab));
@@ -73,7 +73,7 @@ export function main(input) {
     decode.state([ws], { fold: 'all' });
     decode.epilogue(() => {
       const allowed = grammarMask.take();
-      const token = reshape(maskedArgmax(intrinsics.logits(), allowed), [1]);
+      const token = reshape(maskedArgmax(intrinsics.output(0, 'logits'), allowed), [1]);
       tokenIn.put(token);
       tokenOut.put(token);
     });

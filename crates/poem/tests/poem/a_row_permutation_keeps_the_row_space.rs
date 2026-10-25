@@ -1,4 +1,4 @@
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, ops, seam, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, ops, trace_hybrid};
 use poem_ir::{Def, Dim, Gather, Operands, Operation, RuntimeInput, Selection, Ty};
 
 struct PackThenUnpack;
@@ -7,14 +7,13 @@ impl ForwardHybrid for PackThenUnpack {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let x = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, 24, None);
         let perm = inputs.row_permutation();
         let packed = ops::gather::pack_rows(&x, &perm);
         let normed = ops::elemwise::rmsnorm_no_scale(&packed, 24, 1e-6);
         let back = ops::gather::unpack_rows(&normed, &perm);
-        seam::at(seam::VELOCITY, &[&back]);
-        back
+        poem::output("velocity", &back, None);
     }
 }
 

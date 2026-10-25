@@ -15,7 +15,7 @@ use eta_ir::container::{
 use eta_ir::op::Op;
 use eta_ir::registry::{GeometryClass, Port, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Literal, Shape};
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, Weight, ops};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Weight, ops};
 use poem_compiler::Budget;
 
 const VOCAB: u32 = 64;
@@ -38,7 +38,7 @@ impl ForwardHybrid for Micro {
         spec
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let w = |name: &str, out: u64, inner: u64| Weight::sym(name, [out, inner], Dtype::Bf16);
         let plane = u64::from(HEADS) * u64::from(HEAD_DIM);
         let table = w("embed", u64::from(VOCAB), WIDTH);
@@ -55,11 +55,12 @@ impl ForwardHybrid for Micro {
             &inputs.write_offset(KV_ROW),
         );
         let a = ops::attn::attend(
-            &q, &inputs, KV_ROW, HEADS, HEADS, HEAD_DIM, SM_SCALE, None, None, None, false, false,
-            None, None, None, false,
+            &q, &inputs, KV_ROW, HEADS, HEADS, HEAD_DIM, SM_SCALE, None, None, None, false, None,
+            None, false,
         );
         let h = ops::linear::matmul(&a, &w("o", WIDTH, plane));
-        ops::linear::lm_head(&h, &table)
+        let logits = ops::linear::lm_head(&h, &table);
+        poem::output("logits", &logits, None);
     }
 }
 
@@ -181,13 +182,11 @@ fn fire(shell: &mut Shell, word: u64, tokens: &[u32], attachments: &[Attached]) 
             tokens,
         })
     };
-    let mut scores = Vec::new();
     let mut out = shell
-        .fire_media(&[seated], attachments, &[], &mut scores)
+        .fire_media(&[seated], attachments, &[])
         .expect("the fire runs");
     out.remove(0)
 }
-
 
 #[test]
 fn the_forward_reads_the_ports_its_prologue_put() {

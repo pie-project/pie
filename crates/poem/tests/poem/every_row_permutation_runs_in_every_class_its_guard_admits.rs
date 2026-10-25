@@ -1,7 +1,7 @@
 use poem::fact;
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Request, Value, Weight, ops,
-    seam, trace_hybrid,
+    trace_hybrid,
 };
 use poem_ir::{Gather, Operation};
 
@@ -14,7 +14,7 @@ impl ForwardHybrid for LastJointBlock {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         inputs
             .recorder()
             .declare_switch("stream", &["text", "image", "video", "audio"]);
@@ -49,8 +49,7 @@ impl ForwardHybrid for LastJointBlock {
         let o = ops::gather::unpack_rows(&o, &perm);
         let o_img = o.on(!fact::switch_is("stream", "text"));
         let out = ops::linear::matmul(&o_img, &w("img.o"));
-        seam::at(seam::VELOCITY, &[&out]);
-        out
+        poem::output("velocity", &out, None);
     }
 }
 

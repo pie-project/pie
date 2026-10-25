@@ -477,16 +477,12 @@ impl Engine for Wgpu {
                     &budgets,
                 )))
                 .unwrap_or(u32::MAX),
-                max_scoring_lanes: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,
-            has_mtp_logits: shell.drafts(),
-            mtp_depth: shell.mtp_depth(),
             draft_block: shell.trace().drafter.map_or(0, |d| d.rows),
             draft_mask_token: shell.trace().drafter.map_or(0, |d| d.mask_token),
             draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
-            has_attn_score: false,
 
             ports: PortMask::DECODE_ENVELOPE
                 .with(eta_ir::registry::Port::Fold)
@@ -509,7 +505,12 @@ impl Engine for Wgpu {
             facts: shell.trace().facts.clone(),
             inputs: poem_exec::feeds::Feeds::of(shell.trace(), shell.compiled_model())
                 .decls(shell.trace(), shell.compiled_model()),
-            classes: poem_exec::feeds::lane_classes(shell.trace(), shell.compiled_model()),
+            classes: poem_exec::feeds::lane_classes(
+                shell.trace(),
+                shell.compiled_model(),
+                &poem_exec::feeds::class_outputs(shell.trace(), shell.compiled_model())
+                    .unwrap_or_default(),
+            ),
         };
 
         self.shell = Some(shell);
@@ -834,6 +835,7 @@ impl Wgpu {
                 program_attachments(submission)
                     .map(|attachment| (attachment.instance, attachment.lane)),
                 policies,
+                self.loaded()?.output_names(),
             )
             .map(Some)
             .map_err(refusal)
@@ -1062,7 +1064,6 @@ impl Wgpu {
                 pages: &lane.kv.pages,
                 held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
                 kv_less: lane.kv_less,
-                captures_scores: lane.captures_scores,
 
                 mask: resolved_masks[at].as_ref().or(lane.mask.as_ref()),
 

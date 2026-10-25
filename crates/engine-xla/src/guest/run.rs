@@ -13,10 +13,9 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use eta_compiler::codegen::launch::{LaunchPackage, ValueOrigin};
+use eta_compiler::codegen::launch::{LaunchPackage, LaunchValue, ValueOrigin};
 use eta_exec::{ExecPlan, InterpInstance, StagePlan, StageRunner, StepOutcome, Value};
 use eta_ir::Dtype;
-use eta_ir::op::IntrinsicId;
 use eta_ir::registry::Stage;
 use eta_ir::validate::Direction;
 
@@ -95,13 +94,10 @@ impl Stages {
 /// The batch shape stage `at` runs at for `lanes` lanes against `kept`.
 #[must_use]
 pub fn batch_of(package: &LaunchPackage, at: usize, lanes: u32, kept: Option<&Kept>) -> Batch {
-    let (logits, mtp) = lower::reads(package, at);
+    let logits = lower::reads(package, at);
     Batch {
         lanes,
         logits: kept.filter(|_| logits).map(|k| (k.rows, k.width)),
-        mtp: kept
-            .filter(|_| mtp)
-            .and_then(|k| k.mtp.as_ref().map(|(_, w)| (k.rows, *w))),
     }
 }
 
@@ -216,18 +212,13 @@ pub fn launch_stage(
                 Feed::Value(dtype, n) => {
                     encode(&lane.vals[slot.value as usize], dtype, n, &mut words)?;
                 }
-                Feed::Row { intrinsic, rows } => {
+                Feed::Row { rows } => {
                     let seat = lane.seat.ok_or_else(|| {
-                        format!(
-                            "this pass reads the `{}` intrinsic and its lane offered no \
-                             readout rows",
-                            intrinsic.name()
-                        )
+                        "this pass reads readout rows and its lane offered none".to_owned()
                     })?;
                     if rows > seat.count {
                         return Err(
-                            "logits intrinsic row range exceeds the forward's readout rows"
-                                .to_owned(),
+                            "an output's row range exceeds the forward's readout rows".to_owned()
                         );
                     }
                     words.push(seat.first);
@@ -262,12 +253,6 @@ pub fn launch_stage(
     if layout.logits {
         let kept = kept.ok_or("this stage reads the logits and the fire kept no readout")?;
         args.push(Arg::Keep(&kept.logits));
-    }
-    if layout.mtp {
-        let (mtp, _) = kept
-            .and_then(|k| k.mtp.as_ref())
-            .ok_or("this stage reads the draft head and the fire kept none")?;
-        args.push(Arg::Keep(mtp));
     }
     let mut fresh = fresh.iter();
     for (chan, _) in &layout.carried_in {
@@ -384,15 +369,13 @@ pub fn run_stage(
     Ok((values, launched.carried))
 }
 
-/// Whether the device binds `id` for a lane seated at `seat` in `kept`.
-fn device_binds(id: Option<IntrinsicId>, kept: Option<&Kept>, seat: Option<Seat>) -> bool {
-    match id {
-        Some(IntrinsicId::Logits) => kept.is_some_and(|k| k.f32) && seat.is_some(),
-        Some(IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts) => {
-            kept.is_some_and(|k| k.f32 && k.mtp.is_some()) && seat.is_some()
-        }
-        _ => false,
-    }
+/// Whether the device binds the output `root` reads for a lane seated at
+/// `seat` in `kept`: a float output, from the readout rows.
+fn device_binds(root: &LaunchValue, kept: Option<&Kept>, seat: Option<Seat>) -> bool {
+    root.output.is_some()
+        && root.dtype == Dtype::F32
+        && kept.is_some_and(|k| k.f32)
+        && seat.is_some()
 }
 
 /// One instance's stages on the device, as `step_with`'s runner.
@@ -466,18 +449,17 @@ impl StageRunner for OnDevice<'_> {
         Ok(())
     }
 
-    fn binds(&self, id: Option<IntrinsicId>) -> bool {
-        device_binds(id, self.kept, self.seat)
+    fn binds(&self, root: &LaunchValue) -> bool {
+        device_binds(root, self.kept, self.seat)
     }
 }
 
-/// Whether every intrinsic `plan` reads binds on the device for lanes that
+/// Whether every output `plan` reads binds on the device for lanes that
 /// have readout seats in `kept` (so a group needs no host-side binding).
 #[must_use]
 pub fn groups(plan: &ExecPlan, kept: Option<&Kept>) -> bool {
     plan.package.values.iter().all(|v| {
-        v.source != ValueOrigin::Intrinsic
-            || device_binds(v.intrinsic, kept, Some(Seat { first: 0, count: 1 }))
+        v.source != ValueOrigin::Output || device_binds(v, kept, Some(Seat { first: 0, count: 1 }))
     })
 }
 
@@ -905,10 +887,10 @@ fn bind_roots(
             ValueOrigin::Const => const_root(root),
             ValueOrigin::ChannelTake => overlay.take(inst, root.channel),
             ValueOrigin::ChannelRead => overlay.resolve(inst, root.channel),
-            ValueOrigin::Intrinsic => Value::F32(Vec::new()),
+            ValueOrigin::Output => Value::F32(Vec::new()),
             ValueOrigin::OpResult => {
                 return Err(
-                    "unresolved value root (intrinsic/host input) reached execution".to_owned(),
+                    "unresolved value root (output/host input) reached execution".to_owned(),
                 );
             }
         };

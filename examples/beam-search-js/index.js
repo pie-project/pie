@@ -47,7 +47,7 @@ export function main(input) {
 
   const step = () => {
     // `logits()` squeezes to `[v]` for a single read-out row, so reshape back.
-    const logits = reshape(intrinsics.logits(), [B, v]);
+    const logits = reshape(intrinsics.output(0, 'logits'), [B, v]);
     const cand = broadcast(reshape(scores.take(), [B, 1]), [B, v]).add(logSoftmax(logits));
     const [s, i] = topK(reshape(cand, [B * v]), B);
     const parent = i.div(v);

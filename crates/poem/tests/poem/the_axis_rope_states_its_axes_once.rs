@@ -1,6 +1,4 @@
-use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, RopeForm, Value, ops, seam, trace_hybrid,
-};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, RopeForm, ops, trace_hybrid};
 use poem_ir::{Def, Dim, Elemwise, InputAxis, Operands, Operation, RuntimeInput, Ty};
 
 struct OneRope {
@@ -17,7 +15,7 @@ impl ForwardHybrid for OneRope {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let q = inputs.input(
             "latents",
             Dtype::Bf16,
@@ -41,8 +39,7 @@ impl ForwardHybrid for OneRope {
             self.rotary_dim,
             self.head_dim,
         );
-        seam::at(seam::VELOCITY, &[&q]);
-        q
+        poem::output("velocity", &q, None);
     }
 }
 

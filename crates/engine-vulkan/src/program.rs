@@ -454,11 +454,7 @@ impl Plane {
         &mut self,
         instance: InstanceId,
         at: Stage,
-        logits: Option<&[f32]>,
-        rows: u32,
-        vocab: u32,
-        mtp_logits: Option<&[f32]>,
-        mtp_width: u32,
+        outputs: &[(String, u32, eta_exec::Value)],
         #[cfg(feature = "vulkan")] device: Option<&crate::device::Context>,
         #[cfg(feature = "vulkan")] readouts: Vec<Option<crate::guest::run::Readout<'_>>>,
         #[cfg(feature = "vulkan")] pixels: Vec<Option<crate::guest::run::Readout<'_>>>,
@@ -495,30 +491,7 @@ impl Plane {
 
         #[cfg(feature = "vulkan")]
         let readout = readouts.first().copied().flatten();
-        #[cfg(feature = "vulkan")]
-        if seat.plan.needs_logits && readout.is_none() {
-            return Err(Refusal::Program(format!(
-                "instance {instance} reads logits, but its lane offered no readout seat"
-            )));
-        }
-
-        if let Some(values) = mtp_logits
-            && mtp_width != vocab
-        {
-            return Err(Refusal::Program(format!(
-                "instance {instance} reads a draft column {mtp_width} wide against a                  {vocab}-wide trunk readout ({} draft values); this shell reads both at                  one pitch",
-                values.len()
-            )));
-        }
-        let inputs = PassInputs {
-            logits,
-            mtp_logits,
-            rows,
-            vocab,
-
-            mtp_draft_row: mtp_logits.map(|_| 0),
-            attn_score: None,
-        };
+        let inputs = PassInputs { outputs };
 
         #[cfg(feature = "vulkan")]
         let (outcome, ran) = {
@@ -621,19 +594,7 @@ impl Plane {
             ))
         })?;
         let readout = readouts.first().copied().flatten();
-        if seat.plan.needs_logits && readout.is_none() {
-            return Err(Refusal::Program(format!(
-                "instance {instance} reads logits, but its lane offered no readout seat"
-            )));
-        }
-        let inputs = PassInputs {
-            logits: None,
-            mtp_logits: None,
-            rows: 0,
-            vocab: 0,
-            mtp_draft_row: None,
-            attn_score: None,
-        };
+        let inputs = PassInputs::none();
         let mut runner =
             crate::guest::run::OnDevice::new(device, &mut seat.session, widen, readout)
                 .with_lanes(readouts, pixels)
@@ -752,22 +713,13 @@ impl Plane {
     pub fn fire_interpreted(
         &mut self,
         instance: InstanceId,
-        logits: Option<&[f32]>,
-        rows: u32,
-        vocab: u32,
+        outputs: &[(String, u32, eta_exec::Value)],
     ) -> Result<(), Refusal> {
         let seat = self.instances.get_mut(&instance).ok_or(Refusal::Closed {
             what: "instance",
             id: instance.0,
         })?;
-        let inputs = PassInputs {
-            logits,
-            mtp_logits: None,
-            rows,
-            vocab,
-            mtp_draft_row: None,
-            attn_score: None,
-        };
+        let inputs = PassInputs { outputs };
         let outcome = eta_exec::step(&mut seat.inst, &seat.plan, &inputs);
         self.tally.1 += 1;
         let program = seat.program;

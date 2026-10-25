@@ -72,13 +72,6 @@ pub struct Grouped;
 #[decision(id = "engine.working_set_percent", constant(range(10..=90)), default = 50, tune = engine)]
 pub struct WorkingSetPercent(pub u32);
 
-/// The lanes of one fire that may capture attention scores: the score slab
-/// seats this many lanes' planes, each the whole model's heads by the kv
-/// ceiling, and the scheduler holds a fire's capturing lanes to it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "engine.scoring_lanes", constant(range(1..=256)), default = 8, tune = engine)]
-pub struct ScoringLanes(pub u32);
-
 /// Row buckets per doubling of the default lattice: 1 is powers of two, 2
 /// adds a bucket between each, which pads less and records more bodies.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
@@ -148,7 +141,6 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<Copies>()
         .add::<Grouped>()
         .add::<WorkingSetPercent>()
-        .add::<ScoringLanes>()
         .add::<LatticeSteps>()
         .add::<StateSlotsPerLane>()
         .add::<OneFrameWhenShort>()
@@ -232,7 +224,6 @@ pub struct Engine {
     pub copies: bool,
     pub grouped: bool,
     pub working_set_percent: u32,
-    pub scoring_lanes: u32,
     pub lattice_steps: u32,
     pub state_slots_per_lane: u32,
     pub one_frame_when_short: bool,
@@ -263,7 +254,6 @@ impl Engine {
             copies: profile.on::<Copies>(&Anywhere),
             grouped: profile.on::<Grouped>(&Anywhere),
             working_set_percent: profile.get::<WorkingSetPercent>().0,
-            scoring_lanes: profile.get::<ScoringLanes>().0,
             lattice_steps: profile.get::<LatticeSteps>().0,
             state_slots_per_lane: profile.get::<StateSlotsPerLane>().0,
             one_frame_when_short: profile.on::<OneFrameWhenShort>(&Anywhere),
@@ -748,7 +738,6 @@ mod tests {
                 copies: true,
                 grouped: true,
                 working_set_percent: 50,
-                scoring_lanes: 8,
                 lattice_steps: 1,
                 state_slots_per_lane: 0,
                 one_frame_when_short: false,

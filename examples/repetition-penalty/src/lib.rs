@@ -259,7 +259,7 @@ async fn main(input: Input) -> Result<Output> {
         let r = rng_p.take();
         let counts = counts_p.take();
         let present = present_p.take();
-        let logits = intrinsics::logits();
+        let logits = intrinsics::output(0, "logits");
         let (token, counts_next, n_pen, peak) = step(logits, vocab, cfg, &counts, &present, &r);
         let r_next = &r + iota(2);
         tok_out_p.put(&token);
@@ -312,7 +312,7 @@ async fn main(input: Input) -> Result<Output> {
             let r = rng.take();
             let counts = counts_c.take();
             let present = present_c.take();
-            let logits = intrinsics::logits();
+            let logits = intrinsics::output(0, "logits");
             let (token, counts_next, n_pen, peak) = step(logits, vocab, cfg, &counts, &present, &r);
 
             let r_next = &r + iota(2);

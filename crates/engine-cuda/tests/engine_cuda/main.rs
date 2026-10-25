@@ -83,6 +83,7 @@ mod an_adapter_is_not_a_lanes_scratch;
 mod an_epilogue_agrees_with_the_host_interpreter;
 mod an_exported_kv_stays_mapped;
 mod an_mla_body_appends_only_its_window;
+mod an_output_of_ids_reads_as_stored;
 mod every_armed_body_answers_its_eager_walk;
 mod every_catalog_deployment_dispatches;
 mod every_diagnostic_is_a_word_the_boot_states;

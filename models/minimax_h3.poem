@@ -426,7 +426,7 @@ def qwen3_encode(arm, te, tap = None):
         if tap != None:
             tap(l, y)
         elif l == last:
-            seam.at(seam.HIDDEN, [y])
+            output("hidden", y)
         return y
 
     arm.fold_layers(te.layers, y, layer)
@@ -451,7 +451,7 @@ def forward(m, inputs):
     if m.te != None:
         qwen3_encode(reading("text"), m.te)
     refine(reading("refine"), m)
-    return denoise(reading("denoise"), m)
+    denoise(reading("denoise"), m)
 
 def run_attention(x, a, m, g, positions):
     """Self-attention over `g`'s rows; with `positions`, its q and k turned."""
@@ -486,7 +486,7 @@ def refine(arm, m):
         x = ops.elemwise.residual_add(run_mlp(h, b.mlp, d), x)
         if l == last:
             y = ops.elemwise.rmsnorm(x, m.dit.refine_norm, NORM_EPS)
-            seam.at(seam.HIDDEN, [y])
+            output("hidden", y)
         return x
 
     arm.fold_layers(m.dit.refine, x, block)
@@ -620,9 +620,9 @@ def denoise(arm, m):
     h_video, rest = rest.on(switch_is("stream", "video")), rest.on(~switch_is("stream", "video"))
     h_audio = rest.on(switch_is("stream", "audio"))
     audio_velocity = run_linear(dit.audio_out, h_audio)
-    seam.at(seam.HIDDEN, [audio_velocity])
+    output("audio.velocity", audio_velocity)
     # The video head last: the forward ends on the voxel axis.
     video_tokens = run_linear(dit.video_out, h_video)
     velocity = ops.conv.unpatchify(video_tokens, video_tgrid, PATCH, video_grid)
-    seam.at(seam.VELOCITY, [velocity])
+    output("velocity", velocity)
     return velocity

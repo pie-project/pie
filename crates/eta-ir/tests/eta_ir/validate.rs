@@ -1,23 +1,21 @@
 use eta_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
-use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{EngineCaps, Graph, Port, Readout, ReadoutKind, Stage};
+use eta_ir::op::Op;
+use eta_ir::registry::{Axis, EngineCaps, OutputDecl, Port, Stage};
 use eta_ir::types::{Dtype, Literal, Shape};
 use eta_ir::validate::{BoundTrace, ValidateError, bind};
 
 fn served(c: TraceContainer, caps: EngineCaps) -> Result<BoundTrace, ValidateError> {
-    let logits = Readout {
-        kind: ReadoutKind::Logits,
+    let logits = OutputDecl {
+        name: "logits".into(),
+        axis: Axis::Row,
         width: 32,
+        dtype: Dtype::F32,
+        layers: 0,
+        readout: true,
     };
-    let graph = Graph {
-        num_layers: 2,
-        mtp_logits: true,
-        mtp_depth: 1,
-        attn_score: true,
-    };
-    bind(c, vec![Some(logits)], graph, caps)
+    bind(c, vec![vec![logits]], caps)
 }
 
 const EVERY: EngineCaps = EngineCaps {
@@ -59,8 +57,8 @@ fn section3() -> TraceContainer {
         chan(Shape::vector(2), Dtype::U32, HostRole::None, true),
     ];
     let mut ops: Vec<Op> = vec![
-        Op::IntrinsicVal {
-            intr: IntrinsicId::Logits,
+        Op::Output {
+            index: 0,
             lane: 0,
             shape: Shape::matrix(1, vocab),
             dtype: Dtype::F32,
@@ -109,7 +107,7 @@ fn section3() -> TraceContainer {
     });
 
     TraceContainer {
-        names: vec![],
+        names: vec!["logits".into()],
         channels,
         ports: vec![
             PortBinding {
@@ -201,7 +199,7 @@ fn sink_precedence_t11() {
         channels: vec![chan(Shape::vector(4), Dtype::F32, HostRole::None, true)],
         ports: vec![],
         stages: vec![StageProgram {
-            stage: Stage::OnAttnProj,
+            stage: Stage::Prologue,
             ops: vec![
                 Op::ChanRead(0),
                 Op::PivotThreshold {
@@ -235,7 +233,7 @@ fn sink_precedence_t11() {
     };
     assert!(served(apm.clone(), EVERY).is_ok());
     let mut late = apm;
-    late.stages[0].stage = Stage::OnAttn;
+    late.stages[0].stage = Stage::Epilogue;
     assert!(matches!(
         served(late, EVERY),
         Err(ValidateError::SinkMisplaced { .. })
@@ -284,10 +282,6 @@ fn lora_honour_gate_and_placement() {
     assert!(matches!(
         served(mk(Stage::Prologue), no_lora),
         Err(ValidateError::KernelUnavailable { name, .. }) if name == "lora"
-    ));
-    assert!(matches!(
-        served(mk(Stage::OnAttnProj), EVERY),
-        Err(ValidateError::SinkMisplaced { .. })
     ));
     assert!(matches!(
         served(mk(Stage::Epilogue), EVERY),

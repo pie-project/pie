@@ -43,13 +43,6 @@ class InputAxis(Enum):
     VOXEL = 2
 
 
-class ReadoutKind(Enum):
-    LOGITS = 0
-    VELOCITY = 1
-    HIDDEN = 2
-    PIXELS = 3
-
-
 class ScheduleKind(Enum):
     FLOW = 0
     EPSILON = 1
@@ -61,8 +54,7 @@ def _make_model() -> types.ModuleType:
     m.InputAxis = InputAxis
     m.InputDecl = InputDeclStub
     m.LaneDecl = LaneDeclStub
-    m.Readout = ReadoutStub
-    m.ReadoutKind = ReadoutKind
+    m.OutputDecl = OutputDeclStub
     m.RowCount_Exact = RowCountExactStub
     m.RowCount_Multiple = RowCountMultipleStub
     m.RowCount = RowCountExactStub | RowCountMultipleStub
@@ -71,13 +63,11 @@ def _make_model() -> types.ModuleType:
     m.name = lambda: "mock-model"
     m.architecture = lambda: "qwen3_5"
     m.default_system_speculation = lambda: False
-    m.mtp_depth = lambda: 0
     m.submit_deadline_us = lambda: 50_000
     m.output_vocab_size = lambda: 151936
     m.kv_page_size = lambda: 16
     m.frame_size = lambda: 1
     m.channel_capacity = lambda: 8
-    m.max_readout_rows = lambda kind: 256 if kind == ReadoutKind.LOGITS else 2048
     m.rs_state_size = lambda: 4096
     m.run_ahead_window = lambda: 4
     m.BlockDrafter = BlockDrafterStub
@@ -120,9 +110,14 @@ class InputDeclStub:
 
 
 @dataclass
-class ReadoutStub:
-    kind: ReadoutKind
+class OutputDeclStub:
+    name: str
+    axis: InputAxis
     width: int
+    dtype: object
+    layers: int
+    max_rows: int
+    readout: bool
 
 
 @dataclass
@@ -130,13 +125,14 @@ class LaneDeclStub:
     inputs: list
     state: bool
     embeds: bool
-    readout: ReadoutStub | None
+    outputs: list[OutputDeclStub]
 
 
 def _lane(switches) -> LaneDeclStub:
     denoise = ("mode", "denoise") in switches
     inputs = [InputDeclStub("self_cond_ids", InputAxis.ROW, 4, "i32", None)] if denoise else []
-    return LaneDeclStub(inputs, True, True, ReadoutStub(ReadoutKind.LOGITS, 151936))
+    logits = OutputDeclStub("logits", InputAxis.ROW, 151936, Dtype.F32, 0, 256, True)
+    return LaneDeclStub(inputs, True, True, [logits])
 
 
 # ---------------------------------------------------------------------------

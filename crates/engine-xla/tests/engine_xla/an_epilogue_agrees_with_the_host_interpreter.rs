@@ -18,8 +18,8 @@ use engine_xla::readout::{Kept, Seat};
 use eta_compiler::plan::compile_bound;
 use eta_exec::{ExecPlan, InterpInstance, PassInputs, StepOutcome, Value};
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{EngineCaps, Graph, Readout, ReadoutKind, Stage};
+use eta_ir::op::Op;
+use eta_ir::registry::{EngineCaps, Stage};
 use eta_ir::types::{Dtype, Literal, Predicate, RngKind, Shape};
 
 // ------------------------------------------------------------------ builder
@@ -77,7 +77,7 @@ impl Program {
 
     fn container(self) -> TraceContainer {
         TraceContainer {
-            names: Vec::new(),
+            names: vec!["logits".to_string()],
             channels: self.channels,
             ports: Vec::new(),
             stages: vec![StageProgram {
@@ -93,16 +93,14 @@ impl Program {
 fn plan_of(container: TraceContainer, vocab: u32) -> ExecPlan {
     let bound = eta_ir::validate::bind(
         container,
-        vec![Some(Readout {
-            kind: ReadoutKind::Logits,
+        vec![vec![eta_ir::registry::OutputDecl {
+            name: "logits".to_string(),
+            axis: eta_ir::registry::Axis::Row,
             width: vocab,
-        })],
-        Graph {
-            num_layers: 2,
-            mtp_logits: true,
-            mtp_depth: 1,
-            attn_score: true,
-        },
+            dtype: eta_ir::types::Dtype::F32,
+            layers: 0,
+            readout: true,
+        }]],
         EngineCaps {
             lora: true,
             attn_page_mask: true,
@@ -143,21 +141,16 @@ fn host(
     plan: &ExecPlan,
     seeds: &[(u32, Value)],
     logits: &[f32],
-    rows: u32,
+    _rows: u32,
     channels: &[u32],
 ) -> Vec<Value> {
     let mut inst = instance(plan, seeds);
-    let vocab = if rows == 0 {
-        0
+    let outputs: Vec<(String, u32, Value)> = if logits.is_empty() {
+        Vec::new()
     } else {
-        (logits.len() / rows as usize) as u32
+        vec![("logits".to_string(), 0, Value::F32(logits.to_vec()))]
     };
-    let inputs = PassInputs {
-        logits: (!logits.is_empty()).then_some(logits),
-        rows,
-        vocab,
-        ..PassInputs::none()
-    };
+    let inputs = PassInputs { outputs: &outputs };
     let outcome = eta_exec::step(&mut inst, plan, &inputs);
     assert_eq!(outcome, StepOutcome::Committed, "the interpreter commits");
     take_all(plan, &inst, channels)
@@ -285,8 +278,8 @@ fn statistics() -> (TraceContainer, Vec<u32>) {
         shape: Shape::new(&[]).unwrap(),
     });
     let (_, index) = p.input(Shape::vector(ROWS), Dtype::I32);
-    let logits = p.op(Op::IntrinsicVal {
-        intr: IntrinsicId::Logits,
+    let logits = p.op(Op::Output {
+        index: 0,
         lane: 0,
         shape: Shape::matrix(ROWS, VOCAB),
         dtype: Dtype::F32,
@@ -353,8 +346,8 @@ fn sampler(vocab: u32) -> (TraceContainer, Vec<u32>, [u32; 5]) {
     let (c_present, present) = p.input(v, Dtype::F32);
     let (c_mask, mask) = p.input(v, Dtype::Bool);
     let (c_words, words) = p.input(Shape::vector(vocab.div_ceil(32)), Dtype::U32);
-    let raw = p.op(Op::IntrinsicVal {
-        intr: IntrinsicId::Logits,
+    let raw = p.op(Op::Output {
+        index: 0,
         lane: 0,
         shape: Shape::matrix(1, vocab),
         dtype: Dtype::F32,
@@ -526,8 +519,8 @@ fn rowwise(rows: u32, vocab: u32) -> (TraceContainer, Vec<u32>) {
     let (_, k) = p.input(Shape::vector(rows), Dtype::I32);
     let (_, top_p) = p.input(Shape::vector(rows), Dtype::F32);
     let (_, floor) = p.input(Shape::vector(rows), Dtype::F32);
-    let logits = p.op(Op::IntrinsicVal {
-        intr: IntrinsicId::Logits,
+    let logits = p.op(Op::Output {
+        index: 0,
         lane: 0,
         shape: grid,
         dtype: Dtype::F32,
@@ -1232,8 +1225,8 @@ fn carrying(vocab: u32) -> (TraceContainer, u32) {
     });
     let r = p.op(Op::ChanTake(rng_chan));
     let counts = p.op(Op::ChanTake(counts_chan));
-    let raw = p.op(Op::IntrinsicVal {
-        intr: IntrinsicId::Logits,
+    let raw = p.op(Op::Output {
+        index: 0,
         lane: 0,
         shape: Shape::matrix(1, vocab),
         dtype: Dtype::F32,
@@ -1332,12 +1325,8 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
         cells = next;
         for (l, inst) in host_insts.iter_mut().enumerate() {
             let row = &plane[l * VOCAB as usize..(l + 1) * VOCAB as usize];
-            let inputs = PassInputs {
-                logits: Some(row),
-                rows: 1,
-                vocab: VOCAB,
-                ..PassInputs::none()
-            };
+            let outputs = [("logits".to_string(), 0, Value::F32(row.to_vec()))];
+            let inputs = PassInputs { outputs: &outputs };
             assert_eq!(eta_exec::step(inst, &plan, &inputs), StepOutcome::Committed);
             let want = take_all(&plan, inst, &[out]);
             let got = take_all(&plan, &device_insts[l], &[out]);

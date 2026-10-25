@@ -56,6 +56,9 @@ impl Run<'_> {
 
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_metal::Error> {
         match op {
+            Attn::ScoreCapture { .. } => Err(kernels_metal::Error::Unsupported {
+                op: "attn.score_capture",
+            }),
             Attn::Voxel {
                 q,
                 k,

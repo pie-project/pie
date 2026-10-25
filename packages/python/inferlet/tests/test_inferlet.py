@@ -98,8 +98,8 @@ class TestModel:
         assert model.kv_page_size() == 16
         assert model.frame_size() == 1
         assert model.channel_capacity() == 8
-        assert model.max_readout_rows(model.ReadoutKind.LOGITS) == 256
-        assert model.max_readout_rows(model.ReadoutKind.HIDDEN) == 2048
+        logits = model.lane([]).outputs[0]
+        assert (logits.name, logits.max_rows, logits.readout) == ("logits", 256, True)
 
     def test_output_vocab_may_exceed_tokenizer_vocab(self):
         """These are different numbers on purpose -- logits are padded. Use

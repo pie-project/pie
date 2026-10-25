@@ -80,13 +80,13 @@ fn split_one(trace: &mut Trace, at: usize) -> Option<usize> {
     let (mine, rest): (Vec<usize>, Vec<usize>) =
         readers.iter().partition(|&&i| trace.nodes[i].guard == arm);
     let other = rest.first().map(|&i| trace.nodes[i].guard.clone());
-    // The values a merge or a seam reads stay the first split's.
+    // The values a merge or an output reads stay the first split's.
     let merged = trace.values.iter().any(|decl| {
         matches!(&decl.def, Def::Merge(arms) if arms.iter().any(|(v, _)| *v == left || *v == right))
     }) || trace
-        .seams
+        .outputs
         .iter()
-        .any(|seam| seam.values.contains(&left) || seam.values.contains(&right));
+        .any(|output| output.values().any(|v| v == left || v == right));
     if merged
         || rest
             .iter()

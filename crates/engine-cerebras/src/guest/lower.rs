@@ -33,7 +33,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 
 use eta_compiler::codegen::launch::{LaunchOp, LaunchPackage, LaunchStage, ValueOrigin};
-use eta_ir::op::{IntrinsicId, tags};
+use eta_ir::op::tags;
 use eta_ir::{Dtype, RngKind, rng};
 use kernels_cerebras::csl::Block;
 use kernels_cerebras::phase::Shard;
@@ -64,7 +64,6 @@ pub struct Batch {
     pub lanes: u32,
     pub cols: u32,
     pub logits: Option<u32>,
-    pub mtp: Option<u32>,
 }
 
 /// What a packed slot carries.
@@ -73,14 +72,10 @@ pub enum Feed {
     /// The value itself: `dtype` over `numel` elements (a wide value: the
     /// PE's block of them).
     Value(Dtype, usize),
-    /// `rows` rows of `width` f32 words the host cuts from the readout
-    /// `intrinsic` reads, starting at the lane's first row (a wide feed:
-    /// the PE's block of each row).
-    Rows {
-        intrinsic: IntrinsicId,
-        rows: u32,
-        width: u32,
-    },
+    /// `rows` rows of `width` f32 words the host cuts from the readout,
+    /// starting at the lane's first row (a wide feed: the PE's block of
+    /// each row).
+    Rows { rows: u32, width: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -266,35 +261,25 @@ pub fn roots(package: &LaunchPackage, at: usize) -> Vec<u32> {
     roots
 }
 
-/// Which readouts stage `at` reads: the logits, the draft head's.
+/// Whether stage `at` reads the readout rows (a float output).
 #[must_use]
-pub fn reads(package: &LaunchPackage, at: usize) -> (bool, bool) {
-    let mut logits = false;
-    let mut mtp = false;
-    for id in roots(package, at) {
-        match package.values.get(id as usize).and_then(|v| v.intrinsic) {
-            Some(IntrinsicId::Logits) => logits = true,
-            Some(IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts) => mtp = true,
-            _ => {}
-        }
-    }
-    (logits, mtp)
+pub fn reads(package: &LaunchPackage, at: usize) -> bool {
+    roots(package, at).iter().any(|&id| {
+        package
+            .values
+            .get(id as usize)
+            .is_some_and(|v| v.output.is_some() && v.dtype == Dtype::F32)
+    })
 }
 
-/// The wide axis of `package`: the last dimension of its logits intrinsic
-/// (the vocabulary), when it reads one.
+/// The wide axis of `package`: the last dimension of a float output it
+/// reads (the vocabulary), when it reads one.
 #[must_use]
 pub fn wide_axis(package: &LaunchPackage) -> Option<u32> {
     package
         .values
         .iter()
-        .filter(|v| {
-            v.source == ValueOrigin::Intrinsic
-                && matches!(
-                    v.intrinsic,
-                    Some(IntrinsicId::Logits | IntrinsicId::MtpLogits)
-                )
-        })
+        .filter(|v| v.source == ValueOrigin::Output && v.dtype == Dtype::F32)
         .filter_map(|v| v.shape.last().copied())
         .max()
 }
@@ -546,32 +531,24 @@ pub fn lower(package: &LaunchPackage, at: usize, batch: Batch) -> Lowering<Lower
         let feed = match value.source {
             ValueOrigin::Const => continue,
             ValueOrigin::ChannelTake | ValueOrigin::ChannelRead => Feed::Value(value.dtype, n),
-            ValueOrigin::Intrinsic => {
-                let intrinsic = value
-                    .intrinsic
-                    .ok_or_else(|| Refused(format!("intrinsic root {id} names no intrinsic")))?;
-                let read = match intrinsic {
-                    IntrinsicId::Logits => batch.logits,
-                    IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts => batch.mtp,
-                    _ => None,
-                };
-                match read {
+            ValueOrigin::Output => {
+                let name = value.output.as_deref().unwrap_or("");
+                if value.dtype != Dtype::F32 {
+                    return refuse(format!(
+                        "output `{name}` is read as {:?}; the fabric reads float readout rows",
+                        value.dtype
+                    ));
+                }
+                match batch.logits {
                     None => Feed::Value(value.dtype, n),
                     Some(width) => {
-                        let rows = if intrinsic == IntrinsicId::MtpDrafts {
-                            n as u32
-                        } else {
-                            if width == 0 || !n.is_multiple_of(width as usize) {
-                                return refuse(format!(
-                                    "the `{}` root holds {n} values, not whole {width}-wide rows",
-                                    intrinsic.name()
-                                ));
-                            }
-                            (n / width as usize) as u32
-                        };
+                        if width == 0 || !n.is_multiple_of(width as usize) {
+                            return refuse(format!(
+                                "output `{name}` holds {n} values, not whole {width}-wide rows"
+                            ));
+                        }
                         Feed::Rows {
-                            intrinsic,
-                            rows,
+                            rows: (n / width as usize) as u32,
                             width,
                         }
                     }
@@ -1220,42 +1197,14 @@ impl Gen<'_> {
                 });
                 self.bind(id, v);
             }
-            Feed::Rows {
-                intrinsic,
-                rows,
-                width,
-            } => {
-                let (rows, width) = (
-                    rows as usize,
-                    if slot.wide {
-                        self.block()
-                    } else {
-                        width as usize
-                    },
-                );
+            Feed::Rows { .. } => {
                 // The rows land in the value's array itself.
-                if intrinsic == IntrinsicId::MtpDrafts {
-                    if ty != Ty::I32 {
-                        return refuse("the draft tokens are i32");
-                    }
-                    // Each row's argmax, as the interpreter binds the drafts:
-                    // the rows as a (wide) f32 value, then the argmax.
-                    let plane = self.fresh(Ty::F32, rows * width, slot.wide, id);
-                    self.exports
-                        .push((plane.name.clone(), "f32", format!("in{k}")));
-                    let v = self.fresh(Ty::I32, n, false, id);
-                    self.argmax_rows(&plane, rows, width, &v);
-                    // The rows were this op's own.
-                    self.op_temps.push(plane.name);
-                    self.bind(id, v);
-                } else {
-                    if ty != Ty::F32 {
-                        return refuse("a readout is f32");
-                    }
-                    let v = self.fresh(Ty::F32, n, slot.wide, id);
-                    self.exports.push((v.name.clone(), "f32", format!("in{k}")));
-                    self.bind(id, v);
+                if ty != Ty::F32 {
+                    return refuse("a readout is f32");
                 }
+                let v = self.fresh(Ty::F32, n, slot.wide, id);
+                self.exports.push((v.name.clone(), "f32", format!("in{k}")));
+                self.bind(id, v);
             }
         }
         Ok(())

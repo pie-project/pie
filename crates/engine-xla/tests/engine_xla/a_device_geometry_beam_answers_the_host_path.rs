@@ -15,12 +15,11 @@ use engine::fire::{Lane, Readout};
 use eta_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::Op;
 use eta_ir::registry::{GeometryClass, Port, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Trace, Value, Weight, ops, seam,
-    trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Trace, Value, Weight, ops, trace_hybrid,
 };
 use poem_ir::Turn;
 
@@ -44,7 +43,7 @@ impl ForwardHybrid for Tiny {
         spec
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
@@ -78,8 +77,7 @@ impl ForwardHybrid for Tiny {
         .0;
         let h = ops::linear::matmul(&o, &w("o", WIDTH, HEAD_DIM));
         let logits = ops::linear::matmul(&h, &w("head", VOCAB, WIDTH));
-        seam::at(seam::OUT, &[&logits]);
-        logits
+        poem::output("logits", &logits, None);
     }
 }
 
@@ -114,7 +112,7 @@ fn beam_program() -> TraceContainer {
         source: PortSource::Channel(chan),
     };
     TraceContainer {
-        names: Vec::new(),
+        names: vec!["logits".to_string()],
         channels: vec![
             channel(Shape::vector(BEAMS), EtaDtype::I32, HostRole::Writer),
             channel(Shape::vector(BEAMS), EtaDtype::U32, HostRole::Writer),
@@ -136,8 +134,8 @@ fn beam_program() -> TraceContainer {
                 Op::ChanTake(1),
                 Op::ChanTake(2),
                 Op::ChanTake(3),
-                Op::IntrinsicVal {
-                    intr: IntrinsicId::Logits,
+                Op::Output {
+                    index: 0,
                     lane: 0,
                     shape: Shape::matrix(BEAMS, VOCAB),
                     dtype: EtaDtype::F32,

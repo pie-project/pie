@@ -26,6 +26,7 @@ impl Run<'_> {
 
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_xla::Error> {
         match op {
+            Attn::ScoreCapture { .. } => Err(kernels_xla::Error::Unsupported { op: op.name() }),
             Attn::Voxel {
                 q,
                 k,

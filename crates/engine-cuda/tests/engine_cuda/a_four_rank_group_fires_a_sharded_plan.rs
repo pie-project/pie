@@ -13,12 +13,11 @@ use engine::program::{BindExtents, InstanceBinding, ProgramRegistration};
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::Op;
 use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Trace, Value, Weight, ops, seam,
-    trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Trace, Weight, ops, trace_hybrid,
 };
 use poem_ir::InputAxis;
 
@@ -33,7 +32,7 @@ impl ForwardHybrid for Sharded {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let mine = u64::from(HEADS * HEAD_DIM / self.tp);
         let x = inputs.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
         let h = ops::elemwise::layernorm_no_scale(&x, 1e-6);
@@ -64,8 +63,7 @@ impl ForwardHybrid for Sharded {
             y
         };
         let out = ops::elemwise::residual_add(&x, &y);
-        seam::at(seam::VELOCITY, &[&out]);
-        out
+        poem::output("velocity", &out, None);
     }
 }
 
@@ -164,7 +162,7 @@ fn epilogue(rows: u32) -> TraceContainer {
         seeded: false,
     };
     TraceContainer {
-        names: Vec::new(),
+        names: vec!["velocity".to_string()],
         channels: vec![
             decl(Shape::matrix(rows, WIDTH), HostRole::Writer),
             decl(Shape::matrix(rows, WIDTH), HostRole::Reader),
@@ -174,8 +172,8 @@ fn epilogue(rows: u32) -> TraceContainer {
             stage: Stage::Epilogue,
             ops: vec![
                 Op::ChanTake(0),
-                Op::IntrinsicVal {
-                    intr: IntrinsicId::Velocity,
+                Op::Output {
+                    index: 0,
                     lane: 0,
                     shape: Shape::matrix(rows, WIDTH),
                     dtype: EtaDtype::F32,
@@ -235,11 +233,14 @@ fn four_ranks_land_what_one_rank_lands() {
             frames_in_flight: 1,
         })
         .expect("the sharded plan loads on four ranks");
-    assert!(loaded.caps.classes.classes.iter().any(|class| {
-        class
-            .readout
-            .is_some_and(|r| r.kind == poem_ir::ReadoutKind::Velocity)
-    }));
+    assert!(
+        loaded
+            .caps
+            .classes
+            .classes
+            .iter()
+            .any(|class| { class.outputs.iter().any(|decl| decl.name == "velocity") })
+    );
 
     let rows = [5u32, 11];
     let mut rng = Lcg::seeded(59);

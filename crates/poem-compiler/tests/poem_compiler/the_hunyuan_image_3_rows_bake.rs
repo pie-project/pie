@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use poem::generative::ScheduleKind;
-use poem::{Attn, Elemwise, Linear, Operation, Platform, Request, RopeForm, Trace, seam};
+use poem::{Attn, Elemwise, Linear, Operation, Platform, Request, RopeForm, Trace};
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
 
@@ -70,27 +70,27 @@ fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
                 "{deployment} {platform:?}: one kv row a layer and no state slab"
             );
             let seams: BTreeMap<&str, usize> =
-                plan.seams.iter().fold(BTreeMap::new(), |mut acc, s| {
-                    *acc.entry(s.seam.as_str()).or_default() += 1;
+                plan.outputs.iter().fold(BTreeMap::new(), |mut acc, s| {
+                    *acc.entry(s.name.as_str()).or_default() += 1;
                     acc
                 });
             assert_eq!(
-                seams.get(seam::OUT.name),
+                seams.get("logits"),
                 Some(&1),
                 "{deployment}: the AR phases read logits"
             );
             assert_eq!(
-                seams.get(seam::HIDDEN.name),
+                seams.get("hidden"),
                 Some(&1),
                 "{deployment}: the canvas reads its trunk rows back"
             );
             assert_eq!(
-                seams.get(seam::PIXELS.name),
+                seams.get("pixels"),
                 Some(&2),
                 "{deployment}: one pixels seam per image-head arm"
             );
             assert!(
-                !seams.contains_key(seam::VELOCITY.name),
+                !seams.contains_key("velocity"),
                 "{deployment}: the velocity is the `image.out` arm's PIXELS plane on the voxel axis"
             );
         }

@@ -9,10 +9,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use eta_compiler::codegen::launch::LaunchPackage;
+use eta_compiler::codegen::launch::{LaunchPackage, LaunchValue};
 use eta_exec::{BatchRunner, ExecPlan, Lane, StagePlan, StageRunner, Value};
 use eta_ir::Dtype;
-use eta_ir::op::IntrinsicId;
 
 use super::lower::{self, Batch, Feed, Layout};
 use crate::device::{Arg, Buffer, Device, Program};
@@ -105,14 +104,11 @@ pub fn batch_of(
     cols: u32,
     kept: Option<&Kept>,
 ) -> Batch {
-    let (logits, mtp) = lower::reads(package, at);
+    let logits = lower::reads(package, at);
     Batch {
         lanes,
         cols,
         logits: kept.filter(|_| logits).map(|k| k.width),
-        mtp: kept
-            .filter(|_| mtp)
-            .and_then(|k| k.mtp.as_ref().map(|(_, w)| *w)),
     }
 }
 
@@ -136,7 +132,6 @@ pub fn columns_above(package: &LaunchPackage, above: u32) -> Option<u32> {
                     lanes: 1,
                     cols,
                     logits: None,
-                    mtp: None,
                 },
             )
             .is_ok()
@@ -369,35 +364,17 @@ pub fn run_stage(
                             encode(value, dtype, n, words)?;
                         }
                     }
-                    Feed::Rows {
-                        intrinsic,
-                        rows,
-                        width,
-                    } => {
+                    Feed::Rows { rows, width } => {
                         let seat = lane.seat.ok_or_else(|| {
-                            format!(
-                                "this pass reads the `{}` intrinsic and its lane offered no \
-                                 readout rows",
-                                intrinsic.name()
-                            )
+                            "this pass reads readout rows and its lane offered none".to_owned()
                         })?;
                         if rows > seat.count {
-                            return Err(
-                                "logits intrinsic row range exceeds the forward's readout rows"
-                                    .to_owned(),
-                            );
+                            return Err("an output's row range exceeds the forward's readout rows"
+                                .to_owned());
                         }
                         let kept =
                             kept.ok_or("this stage reads a readout and the fire kept none")?;
-                        let plane: &Buffer = if intrinsic == IntrinsicId::Logits {
-                            &kept.logits
-                        } else {
-                            &kept
-                                .mtp
-                                .as_ref()
-                                .ok_or("this stage reads the draft head and the fire kept none")?
-                                .0
-                        };
+                        let plane: &Buffer = &kept.logits;
                         let width = width as usize;
                         let (block, held) = if slot.wide {
                             (block, width.saturating_sub(x * block).min(block))
@@ -591,21 +568,19 @@ impl BatchRunner for OnDeviceMany<'_> {
         Ok(())
     }
 
-    fn binds(&self, lane: usize, id: Option<IntrinsicId>) -> bool {
-        device_binds(id, self.kept, self.seats.get(lane).copied().flatten())
+    fn binds(&self, lane: usize, root: &LaunchValue) -> bool {
+        device_binds(root, self.kept, self.seats.get(lane).copied().flatten())
     }
 }
 
-/// Whether the device binds `id` for a lane seated at `seat` in `kept`.
+/// Whether the device binds the output `root` reads for a lane seated at
+/// `seat` in `kept`: a float output, from the readout rows.
 #[must_use]
-pub fn device_binds(id: Option<IntrinsicId>, kept: Option<&Kept>, seat: Option<Seat>) -> bool {
-    match id {
-        Some(IntrinsicId::Logits) => kept.is_some_and(|k| k.f32) && seat.is_some(),
-        Some(IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts) => {
-            kept.is_some_and(|k| k.f32 && k.mtp.is_some()) && seat.is_some()
-        }
-        _ => false,
-    }
+pub fn device_binds(root: &LaunchValue, kept: Option<&Kept>, seat: Option<Seat>) -> bool {
+    root.output.is_some()
+        && root.dtype == Dtype::F32
+        && kept.is_some_and(|k| k.f32)
+        && seat.is_some()
 }
 
 /// One instance's stages on the fabric, as `step_with`'s runner.
@@ -682,7 +657,7 @@ impl StageRunner for OnDevice<'_> {
         Ok(())
     }
 
-    fn binds(&self, id: Option<IntrinsicId>) -> bool {
-        device_binds(id, self.kept, self.seat)
+    fn binds(&self, root: &LaunchValue) -> bool {
+        device_binds(root, self.kept, self.seat)
     }
 }

@@ -27,46 +27,8 @@ pub use poem_ir::{
 };
 pub use record::{Arm, Primitive, Recorder, Refine, Switch, Value, restate, switch};
 
-pub mod seam {
-
-    use crate::record::Value;
-
-    pub struct Def {
-        pub name: &'static str,
-    }
-
-    pub const ATTN_Q: Def = Def { name: "attn.q" };
-
-    pub const ATTN_OUT: Def = Def { name: "attn.out" };
-
-    pub const ATTN_QV: Def = Def { name: "attn.qv" };
-
-    pub const RECURRENT: Def = Def { name: "recurrent" };
-
-    pub const IN: Def = Def { name: "in" };
-
-    pub const OUT: Def = Def { name: "out" };
-
-    pub const MTP: Def = Def { name: "mtp" };
-
-    pub const MTP_DRAFTS: Def = Def { name: "mtp.drafts" };
-
-    pub const SCORES: Def = Def {
-        name: "attn.scores",
-    };
-
-    pub const VELOCITY: Def = Def { name: "velocity" };
-
-    pub const HIDDEN: Def = Def { name: "hidden" };
-
-    pub const PIXELS: Def = Def { name: "pixels" };
-
-    pub const FLOAT_READOUTS: [&str; 3] = [VELOCITY.name, HIDDEN.name, PIXELS.name];
-
-    pub fn at(def: Def, values: &[&Value]) {
-        let first = values
-            .first()
-            .unwrap_or_else(|| panic!("seam `{}` names no value", def.name));
-        first.rec().seam(def.name, values);
-    }
+/// Reads `value` out to the guest as `name`; a voxel `value` laid out by
+/// clips of its own names their `grid`.
+pub fn output(name: &str, value: &Value, grid: Option<&Value>) {
+    value.rec().output(name, value, grid);
 }

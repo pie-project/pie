@@ -571,16 +571,12 @@ impl Engine for Metal {
                     &budgets,
                 )))
                 .unwrap_or(u32::MAX),
-                max_scoring_lanes: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,
-            has_mtp_logits: shell.drafts(),
-            mtp_depth: shell.mtp_depth(),
             draft_block: shell.trace().drafter.map_or(0, |d| d.rows),
             draft_mask_token: shell.trace().drafter.map_or(0, |d| d.mask_token),
             draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
-            has_attn_score: shell.observes_scores(),
             ports: PortMask::DEVICE_GEOMETRY
                 .with(Port::AttnMask)
                 .with(Port::Fold),
@@ -729,7 +725,7 @@ impl Engine for Metal {
         let seam = self
             .shell
             .as_ref()
-            .map_or(engine::fire::ReadoutSeam::Logits, Shell::readout_seam);
+            .map_or(crate::seam::Seam::Logits, Shell::readout_seam);
         let (_, pending) = self.pending.as_ref().expect("just put back");
         for (receipt, step) in ticket.steps.iter_mut().zip(pending) {
             receipt.readouts = readouts_of(step, seam);
@@ -1052,7 +1048,7 @@ impl Metal {
                     inputs: &lane.inputs,
                     pages: &lane.kv.pages,
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
-                    captures_scores: lane.captures_scores,
+                    captures_scores: false,
                     mask: lane.mask.as_ref(),
                     kv_less: lane.kv_less,
                     adapter: lane_adapters[at].or(lane.adapter),
@@ -1107,7 +1103,7 @@ impl Metal {
     }
 }
 
-fn readouts_of(step: &PendingStep, seam: engine::fire::ReadoutSeam) -> Vec<LaneReadout> {
+fn readouts_of(step: &PendingStep, seam: crate::seam::Seam) -> Vec<LaneReadout> {
     let rows: &[Vec<f32>] = step.rows.as_deref().unwrap_or(&[]);
     step.readout
         .iter()
@@ -1119,7 +1115,7 @@ fn readouts_of(step: &PendingStep, seam: engine::fire::ReadoutSeam) -> Vec<LaneR
                 LaneReadout {
                     rows: 1,
                     width: u32::try_from(values.len()).unwrap_or(u32::MAX),
-                    seam,
+                    output: seam.name().to_string(),
                     values,
                     ..LaneReadout::default()
                 }

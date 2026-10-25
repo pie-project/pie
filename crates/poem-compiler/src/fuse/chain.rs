@@ -19,7 +19,7 @@
 //!
 //! **Lowering** turns each op into the primitive math it states, in f32. A value
 //! the run reads but does not compute is a parameter; a value it computes
-//! that anything past the run may read (another op, a seam, a merge, or
+//! that anything past the run may read (another op, an output, a merge, or
 //! nothing at all, as the trace's last values) is a result, stored in its
 //! own dtype. A value only the run reads never leaves the registers, but it
 //! is rounded to its dtype where it is defined, as the ops it replaces
@@ -466,7 +466,7 @@ fn lowers(op: &Operation) -> bool {
     }
 }
 
-/// Who may read each value past a chain: another op, a seam or a merge.
+/// Who may read each value past a chain: another op, an output or a merge.
 struct Escapes {
     readers: Vec<Vec<u32>>,
     held: Vec<bool>,
@@ -491,8 +491,8 @@ impl Escapes {
                 }
             }
         }
-        for seam in &trace.seams {
-            for v in &seam.values {
+        for output in &trace.outputs {
+            for v in output.values() {
                 held[v.0 as usize] = true;
             }
         }

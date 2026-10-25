@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use engine_xla::serve::{Clips, Seated};
 use engine_xla::{Boot, DeviceBoot, Lane, Shell};
 use poem::ops::conv::{self, ConvShape};
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, seam, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, trace_hybrid};
 use poem_compiler::{Budget, VoxelLadder};
 use poem_ir::InputAxis;
 
@@ -60,7 +60,7 @@ impl ForwardHybrid for Decoder {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let g = inputs.grid();
         let x = inputs.input("voxels", Dtype::Bf16, InputAxis::Voxel, C_IN as u32, None);
         let (h, g1) = conv::conv3d(
@@ -82,8 +82,7 @@ impl ForwardHybrid for Decoder {
             None,
         );
         let (y, g4) = conv::pixel_shuffle(&h, &g3, [1, 2, 2]);
-        seam::at(seam::PIXELS, &[&y, &g4]);
-        y
+        poem::output("pixels", &y, Some(&g4));
     }
 }
 
@@ -555,7 +554,7 @@ impl ForwardHybrid for Causal {
         );
         spec
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let g = inputs.grid();
         let x = inputs.input("voxels", Dtype::Bf16, InputAxis::Voxel, C_IN as u32, None);
         let cache = inputs.state("conv.cache");
@@ -567,8 +566,7 @@ impl ForwardHybrid for Causal {
             ConvShape::same3().causal(poem_ir::TimePad::Zero),
             Some(cache),
         );
-        seam::at(seam::PIXELS, &[&y, &g1]);
-        y
+        poem::output("pixels", &y, Some(&g1));
     }
 }
 

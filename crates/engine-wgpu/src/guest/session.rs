@@ -524,11 +524,7 @@ fn build_stage(
     let mut records = Vec::with_capacity(plan.ops.len());
     let mut result_base = 0u32;
     for op in &plan.ops {
-        records.push(OpParams::of(
-            op,
-            result_base,
-            eta_exec::OpRuntime::default(),
-        ));
+        records.push(OpParams::of(op, result_base, plan.output_slots));
         result_base += u32::from(op.result_count);
     }
     let config = Cfg {

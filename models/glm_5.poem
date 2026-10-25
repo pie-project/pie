@@ -459,7 +459,6 @@ def run_attention(x, inputs, a, positions = None, select = None, whole = False):
     q_a = ops.elemwise.rmsnorm(q_a, a.q_a_norm, a.q_a_norm_eps)
     q_b = ops.linear.matmul(q_a, a.q_b_proj)
     kv_a = ops.linear.matmul(x, a.kv_a_proj)
-    seam.at(seam.ATTN_QV, [q_b, kv_a])
 
     selection = select(q_a) if select != None else None
 
@@ -510,14 +509,12 @@ def attend(x, inputs, q_nope, q_pe, a, selection = None, whole = False):
     latent kv (or the `selection` of it), through `a`'s output projection;
     `whole` rows read their keys whole, as the draft head's do."""
     q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
-    seam.at(seam.ATTN_Q, [q])
     scored = ops.attn.attend_mla(q, q_pe, inputs, a.kv, a.heads, a.kv_lora_rank, a.sm_scale,
                                  selection = selection, whole = whole)
 
     o = ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
     if a.gate != None:
         o = ops.elemwise.gate_sigmoid_mul(o, ops.linear.matmul(x, a.gate))
-    seam.at(seam.ATTN_OUT, [o])
     return ops.linear.matmul(o, a.o_proj)
 
 def caches(m, c):
@@ -563,7 +560,7 @@ def forward(m, inputs):
     logits = ops.linear.lm_head(x, m.head)
     if m.mtp != None:
         draft(m, inputs, y, positions, logits)
-    return logits
+    output("logits", logits)
 
 def draft(m, inputs, y, positions, logits):
     """The MTP head's drafted token, from the trunk's last hidden rows `y`
@@ -589,8 +586,8 @@ def draft(m, inputs, y, positions, logits):
     x = ops.elemwise.rmsnorm(r, mtp.mlp_norm, mtp.norm_eps)
     r = ops.elemwise.residual_add(mlp(x, mtp.mlp), r)
     proposal = ops.linear.lm_head(ops.elemwise.rmsnorm(r, mtp.norm, mtp.norm_eps), m.head)
-    seam.at(seam.MTP, [proposal])
-    seam.at(seam.MTP_DRAFTS, [ops.sampling.argmax([proposal])])
+    output("mtp.logits", proposal)
+    output("mtp.drafts", ops.sampling.argmax([proposal]))
 
 def mlp(x, f):
     if not f.routed:

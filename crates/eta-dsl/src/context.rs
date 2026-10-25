@@ -49,7 +49,6 @@ pub type ChannelRef = Rc<RefCell<ChannelState>>;
 pub(crate) struct SinkCall {
     pub name: String,
     pub span: Span,
-    pub scope: eta_ir::registry::SinkScope,
 }
 
 pub(crate) struct Recorder {
@@ -280,12 +279,12 @@ pub(crate) fn intern_name(name: &str) -> u16 {
     })
 }
 
-pub(crate) fn record_sink(name: String, span: Span, scope: eta_ir::registry::SinkScope) {
+pub(crate) fn record_sink(name: String, span: Span) {
     SESSION.with_borrow_mut(|s| {
         s.as_mut()
             .and_then(|s| s.current.as_mut())
             .expect("sink outside a traced stage")
             .sinks
-            .push(SinkCall { name, span, scope });
+            .push(SinkCall { name, span });
     })
 }

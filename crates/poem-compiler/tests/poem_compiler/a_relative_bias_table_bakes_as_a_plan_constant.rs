@@ -1,6 +1,6 @@
 use crate::common;
 
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Value, Weight, ops, seam, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Weight, ops, trace_hybrid};
 use poem_compiler::Placement;
 use poem_ir::{Attn, Elemwise, Operation, RaggedMask};
 
@@ -17,7 +17,7 @@ impl ForwardHybrid for Encoder {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
@@ -57,8 +57,7 @@ impl ForwardHybrid for Encoder {
             let y = ops::linear::matmul(&o, &w(&format!("l{l}.o"), WIDTH, HEADS * HEAD_DIM));
             x = ops::elemwise::residual_add(&x, &y);
         }
-        seam::at(seam::HIDDEN, &[&x]);
-        x
+        poem::output("hidden", &x, None);
     }
 }
 

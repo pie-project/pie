@@ -271,7 +271,7 @@ fn run(
         }
     }
     let mut line = format!("load {loaded:.1}s, {fires} synthetic fires finite ({fired:.1}s)");
-    if shell.readout_seam() == engine::fire::ReadoutSeam::Logits {
+    if shell.readout_seam() == engine_cerebras::serve::Readback::Readout {
         match agree(&mut shell) {
             Ok(said) => line.push_str(&format!("; {said}")),
             // A plan whose token lanes read float ports (positions, a

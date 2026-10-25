@@ -4,7 +4,7 @@
 // are plain objects the author holds; a trace interns the ones it touches.
 // Single-threaded by construction (wasm inferlets).
 
-import { Dtype, Op, Shape, SinkScope, Stage } from './ir.js';
+import { Dtype, Op, OutputDecl, Shape, Stage } from './ir.js';
 
 /** An authoring mistake found while tracing. */
 export class TraceError extends Error {
@@ -50,7 +50,6 @@ export function elemTy(st: ChannelState): ValueType {
 
 export interface SinkCall {
   name: string;
-  scope: SinkScope;
 }
 
 class Recorder {
@@ -102,6 +101,7 @@ let nextGidCounter = 1;
 
 let modelVocab = 32_000;
 let modelPageSize = 16;
+let modelOutputs: OutputDecl[][] = [];
 
 export function nextGid(): number {
   return nextGidCounter++;
@@ -199,19 +199,25 @@ export function internName(name: string): number {
   return s.names.length - 1;
 }
 
-export function recordSink(name: string, scope: SinkScope): void {
-  rec().sinks.push({ name, scope });
+export function recordSink(name: string): void {
+  rec().sinks.push({ name });
 }
 
-export function withConstants<R>(vocab: number, pageSize: number, f: () => R): R {
-  const prev = [modelVocab, modelPageSize];
+export function withConstants<R>(vocab: number, pageSize: number, outputs: OutputDecl[][], f: () => R): R {
+  const prev: [number, number, OutputDecl[][]] = [modelVocab, modelPageSize, modelOutputs];
   modelVocab = vocab;
   modelPageSize = pageSize;
+  modelOutputs = outputs;
   try {
     return f();
   } finally {
-    [modelVocab, modelPageSize] = prev;
+    [modelVocab, modelPageSize, modelOutputs] = prev;
   }
+}
+
+/** Lane `lane`'s output `name`, as the model declares it. */
+export function declaredOutput(lane: number, name: string): OutputDecl | undefined {
+  return modelOutputs[lane]?.find((decl) => decl.name === name);
 }
 
 export function vocab(): number {

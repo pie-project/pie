@@ -1,6 +1,4 @@
-use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, seam, trace_hybrid,
-};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, ops, trace_hybrid};
 use poem_ir::GluAct;
 use poem_ir::{Attn, Def, Dim, Elemwise, Guard, Operands, Operation, RaggedMask, Ty};
 
@@ -19,7 +17,7 @@ impl ForwardHybrid for Encoder {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
@@ -71,8 +69,7 @@ impl ForwardHybrid for Encoder {
             &Weight::sym("final_norm", [u64::from(WIDTH)], Dtype::Bf16),
             1e-6,
         );
-        seam::at(seam::HIDDEN, &[&out]);
-        out
+        poem::output("hidden", &out, None);
     }
 }
 
@@ -85,11 +82,8 @@ fn a_bidirectional_encoder_adds_a_relative_bias_per_layer_every_case() {
 fn two_layers_trace_with_one_table_each_and_the_attention_names_it() {
     let trace = trace_hybrid("encoder", &Encoder, Platform::Cuda);
     assert!(trace.caches.is_empty(), "an encoder declares no kv space");
-    assert!(
-        !trace.seams.iter().any(|s| s.seam == seam::OUT.name),
-        "no logits: the hidden seam is the readout"
-    );
-    assert!(trace.seams.iter().any(|s| s.seam == seam::HIDDEN.name));
+    let names: Vec<&str> = trace.outputs.iter().map(|o| o.name.as_str()).collect();
+    assert_eq!(names, ["hidden"], "the hidden rows are its one output");
 
     let tables: Vec<(usize, &poem_ir::Node)> = trace
         .nodes
@@ -203,7 +197,7 @@ fn a_table_that_disagrees_with_its_max_len_or_is_not_f32_is_refused() {
         fn caches(&self) -> HybridSpec {
             HybridSpec::new()
         }
-        fn forward(&self, inputs: Input) -> Value {
+        fn forward(&self, inputs: Input) {
             let x = inputs.input(
                 "latents",
                 Dtype::Bf16,
@@ -226,8 +220,7 @@ fn a_table_that_disagrees_with_its_max_len_or_is_not_f32_is_refused() {
                 1.0,
                 ops::attn::relative_bias(&table, MAX_LEN),
             );
-            seam::at(seam::HIDDEN, &[&o]);
-            o
+            poem::output("hidden", &o, None);
         }
     }
     let narrow = refusal(|| {

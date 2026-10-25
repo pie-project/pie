@@ -5,7 +5,7 @@ use eta_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
 use eta_ir::expand;
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::Op;
 use eta_ir::registry::{Port, Stage};
 use eta_ir::types::{Dtype, Literal, Shape};
 
@@ -64,8 +64,8 @@ pub const VOCAB: u32 = 32;
 
 pub fn section3_trace() -> TraceContainer {
     let mut b = B::new();
-    let logits2 = b.p(Op::IntrinsicVal {
-        intr: IntrinsicId::Logits,
+    let logits2 = b.p(Op::Output {
+        index: 0,
         lane: 0,
         shape: Shape::matrix(1, VOCAB),
         dtype: Dtype::F32,
@@ -95,7 +95,7 @@ pub fn section3_trace() -> TraceContainer {
     b.p(Op::ChanPut { chan: 1, value: t1 });
 
     TraceContainer {
-        names: vec![],
+        names: vec!["logits".into()],
         channels: vec![
             chan(Shape::vector(1), Dtype::I32, HostRole::None, true),
             chan(Shape::vector(1), Dtype::I32, HostRole::Reader, false),
@@ -148,8 +148,8 @@ pub const PAGE: u32 = 4;
 pub fn beam_trace() -> TraceContainer {
     let mut b = B::new();
     let scores = b.p(Op::ChanTake(11));
-    let logits = b.p(Op::IntrinsicVal {
-        intr: IntrinsicId::Logits,
+    let logits = b.p(Op::Output {
+        index: 0,
         lane: 0,
         shape: Shape::matrix(BB, V),
         dtype: Dtype::F32,
@@ -363,7 +363,7 @@ pub fn beam_trace() -> TraceContainer {
 
     let u32c = |shape: Shape, role, seeded| chan(shape, Dtype::U32, role, seeded);
     TraceContainer {
-        names: vec![],
+        names: vec!["logits".into()],
         channels: vec![
             u32c(Shape::matrix(BB, P), HostRole::None, true),
             u32c(Shape::matrix(BB, P), HostRole::None, true),

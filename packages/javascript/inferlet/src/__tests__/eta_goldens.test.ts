@@ -15,7 +15,7 @@ import { describe, expect, it } from 'vitest';
 import { Builder, DslChannel, Traced } from '../eta/builder.js';
 import * as intrinsics from '../eta/intrinsics.js';
 import { entropyBoundAccept, stableAndConfident } from '../eta/diffusion.js';
-import { Dtype, Port, Stage, dtype, fnv1a64, shapeOf } from '../eta/ir.js';
+import { Axis, Dtype, OutputDecl, Port, Stage, dtype, fnv1a64, shapeOf } from '../eta/ir.js';
 import { TraceError } from '../eta/trace.js';
 import {
   ConstData,
@@ -90,6 +90,16 @@ import {
 const VOCAB = 151_936;
 const PAGE = 32;
 
+const decl = (name: string, axis: Axis, width: number, readout: boolean): OutputDecl => ({
+  name,
+  axis,
+  width,
+  dtype: Dtype.F32,
+  layers: 0,
+  readout,
+});
+const logitsDecl = (vocab: number): OutputDecl[][] => [[decl('logits', Axis.ROW, vocab, true)]];
+
 const here = dirname(fileURLToPath(import.meta.url));
 const goldensPath = join(here, '..', '..', '..', '..', 'python', 'inferlet', 'tests', 'goldens', 'eta_containers.txt');
 const GOLDENS = new Map<string, { hash: bigint; bytes: Uint8Array }>();
@@ -136,11 +146,12 @@ describe('eta goldens', () => {
     const rngCh = chFrom([7, 0], dtype.u32, 'rng');
     hostPut(tok, [1], dtype.i32);
     const b = new Builder(vocab, 16);
+    b.setOutputs(logitsDecl(vocab));
     b.bindPort(Port.EMBED_TOKENS, tok);
     b.bindPort(Port.EMBED_INDPTR, ind);
     b.bindPort(Port.KV_LEN, len);
     b.stage(Stage.EPILOGUE, () => {
-      const logits = intrinsics.logits();
+      const logits = intrinsics.output(0, 'logits');
       const r = rngCh.take();
       const g = gumbel(r, [intrinsics.vocab()]);
       const t = reduceArgmax(maskApply(logits, mask.take()).add(g));
@@ -161,13 +172,14 @@ describe('eta goldens', () => {
     const fold = chFrom([0xffff_ffff], dtype.u32, 'fold');
     const tokOut = chNew([1], dtype.i32, 'tok_out');
     const b = new Builder(VOCAB, PAGE);
+    b.setOutputs(logitsDecl(VOCAB));
     bindGeometry(b, [
       [Port.EMBED_TOKENS, tokIn],
       [Port.EMBED_INDPTR, embedIndptr],
       [Port.FOLD, fold],
     ]);
     b.stage(Stage.EPILOGUE, () => {
-      tokOut.putTensor(reshape(reduceArgmax(intrinsics.logits()), [1]));
+      tokOut.putTensor(reshape(reduceArgmax(intrinsics.output(0, 'logits')), [1]));
     });
     tokOut.noteHostTake();
     check('text_completion_decode', b.build());
@@ -184,6 +196,7 @@ describe('eta goldens', () => {
     const lane1 = chFrom([0, 1], dtype.u32, 'embed_indptr');
     const fold = chFrom([0xffff_ffff], dtype.u32, 'fold');
     const b = new Builder(VOCAB, PAGE);
+    b.setOutputs(logitsDecl(VOCAB));
     bindGeometry(b, [
       [Port.EMBED_TOKENS, tokIn],
       [Port.EMBED_INDPTR, lane1],
@@ -191,7 +204,7 @@ describe('eta goldens', () => {
     ]);
     b.stage(Stage.EPILOGUE, () => {
       const r = rngCh.take();
-      const logits = intrinsics.logits();
+      const logits = intrinsics.output(0, 'logits');
       const scaled = logits.div(temperature);
       const token = gumbelMax(scaled, r);
       const rNext = r.add(iota(2));
@@ -220,10 +233,11 @@ describe('eta goldens', () => {
     const stat2 = chNew([4], dtype.f32, 'stat2');
     const flag = chNew([1], dtype.bool, 'flag');
     const b = new Builder(VOCAB, PAGE);
+    b.setOutputs(logitsDecl(VOCAB));
     b.bindPort(Port.EMBED_TOKENS, tok);
     b.bindPort(Port.EMBED_INDPTR, ind);
     b.stage(Stage.EPILOGUE, () => {
-      const logits = intrinsics.logits();
+      const logits = intrinsics.output(0, 'logits');
       const r = rngCh.take();
       const p = softmax(logits);
       const lp = logSoftmax(logits);
@@ -300,19 +314,15 @@ describe('eta goldens', () => {
     hostPut(a, new Array(64).fill(0.0), dtype.f32);
     hostPut(bch, new Array(64).fill(0.0), dtype.f32);
     const b = new Builder(VOCAB, PAGE);
+    b.setOutputs(logitsDecl(VOCAB));
     b.bindPort(Port.EMBED_TOKENS, tok);
     b.bindPort(Port.EMBED_INDPTR, ind);
     b.stage(Stage.PROLOGUE, () => {
       intrinsics.kernel.lora(a.read(), bch.read(), Tensor.constant(1 | 4, Dtype.U32));
       intrinsics.kernel.attnPageMask(iota(4));
     });
-    b.stage(Stage.ON_ATTN_PROJ, () => {
-      intrinsics.query(16);
-      intrinsics.kernel.envelopeDot(4);
-      intrinsics.kernel.attnPageMask(cast(gt(intrinsics.kernel.envelopeDot(4), 0.0), dtype.u32).add(intrinsics.layer()));
-    });
     b.stage(Stage.EPILOGUE, () => {
-      out.putTensor(reshape(reduceArgmax(intrinsics.logits()), [1]));
+      out.putTensor(reshape(reduceArgmax(intrinsics.output(0, 'logits')), [1]));
     });
     out.noteHostTake();
     check('sinks', b.build());
@@ -323,6 +333,7 @@ describe('eta goldens', () => {
     const ind = chFrom([0, 1], dtype.u32, 'indptr');
     const out = chNew([4], dtype.f32, 'out');
     const b = new Builder(VOCAB, PAGE);
+    b.setOutputs(logitsDecl(VOCAB));
     b.bindPort(Port.EMBED_TOKENS, tok);
     b.bindPort(Port.EMBED_INDPTR, ind);
     b.stage(Stage.EPILOGUE, () => out.putTensor(Tensor.constant([1.0, 2.0, 5.0, 7.0], dtype.f32).add(0.0)));
@@ -336,6 +347,7 @@ describe('eta goldens', () => {
     const never = chNew([1], dtype.f32, 'never');
     const out = chNew([1], dtype.f32, 'out');
     const b = new Builder(VOCAB, PAGE);
+    b.setOutputs(logitsDecl(VOCAB));
     b.bindPort(Port.EMBED_TOKENS, tok);
     b.bindPort(Port.EMBED_INDPTR, ind);
     b.stage(Stage.EPILOGUE, () => out.putTensor(never.take().add(1.0)));
@@ -352,9 +364,10 @@ describe('comparison methods', () => {
     const out = chNew([vocab], dtype.bool, 'out');
     hostPut(tok, [1], dtype.i32);
     const b = new Builder(vocab, 16);
+    b.setOutputs(logitsDecl(vocab));
     b.bindPort(Port.EMBED_TOKENS, tok);
     b.bindPort(Port.EMBED_INDPTR, ind);
-    b.stage(Stage.EPILOGUE, () => out.putTensor(body(intrinsics.logits())));
+    b.stage(Stage.EPILOGUE, () => out.putTensor(body(intrinsics.output(0, 'logits'))));
     return Buffer.from(b.build().encode()).toString('hex');
   };
 
@@ -392,6 +405,7 @@ describe('diffusion golden', () => {
     const tapWeightsOut = chNew([length, taps], dtype.f32, 'tap_weights');
 
     const b = new Builder(VOCAB, PAGE);
+    b.setOutputs(logitsDecl(VOCAB));
     bindGeometry(b, [
       [Port.EMBED_TOKENS, toks], [Port.EMBED_INDPTR, embedIndptr], [Port.KV_LEN, kvLen],
       [Port.POSITIONS, positions], [Port.READOUT, readout],
@@ -400,7 +414,7 @@ describe('diffusion golden', () => {
       positions.putTensor(positions.take());
       const r = rngState.take();
       const t = reshape(temp.read(), []);
-      const logits = intrinsics.logits();
+      const logits = intrinsics.output(0, 'logits');
       const scaled = logits.div(t);
       const probs = softmax(scaled);
       const h = entropy(probs);
@@ -448,12 +462,13 @@ describe('beam golden', () => {
     const outGreedy = chNew([B], dtype.i32, 'out_greedy').capacity(8);
 
     const b = new Builder(VOCAB, PAGE);
+    b.setOutputs(logitsDecl(VOCAB));
     bindGeometry(b, [
       [Port.KV_LEN, klen], [Port.POSITIONS, pos], [Port.SLOTS, slots], [Port.ATTN_MASK, mask],
       [Port.EMBED_TOKENS, toks], [Port.EMBED_INDPTR, lanesB],
     ]);
     b.stage(Stage.EPILOGUE, () => {
-      const logits = reshape(intrinsics.logits(), [B, v]);
+      const logits = reshape(intrinsics.output(0, 'logits'), [B, v]);
       const cand = broadcast(reshape(scores.take(), [B, 1]), [B, v]).add(logSoftmax(logits));
       const [s, i] = topK(reshape(cand, [B * v]), B);
       const parent = i.div(v);
@@ -485,9 +500,9 @@ describe('beam golden', () => {
 
 describe('sampler golden', () => {
   // `inferlet_goldens.rs::latent_step` — the image sampler's epilogue: the
-  // `velocity()` seam, an `N(0, 1)` draw, and the `sin`/`cos`/`sqrt`/`rsqrt`
+  // `velocity` output, an `N(0, 1)` draw, and the `sin`/`cos`/`sqrt`/`rsqrt`
   // ops. The one golden carrying tags 0x08..0x0b, `RngKind.NORMAL` and
-  // `Intrinsic.VELOCITY`, so a port that drifts on any of them fails here.
+  // the `velocity` output, so a port that drifts on any of them fails here.
   it('latent_step', () => {
     const rows = 8;
     const channels = 16;
@@ -504,13 +519,14 @@ describe('sampler golden', () => {
     hostPut(latent, new Array(rows * channels).fill(0), dtype.f32);
 
     const b = new Builder(VOCAB, PAGE);
+    b.setOutputs([[decl('velocity', Axis.ROW, channels, false)]]);
     bindGeometry(b, [
       [Port.EMBED_TOKENS, tok], [Port.EMBED_INDPTR, indptrCh], [Port.KV_LEN, kvLen],
       [Port.POSITIONS, positions], [Port.READOUT, readout],
     ]);
     b.stage(Stage.EPILOGUE, () => {
       positions.putTensor(positions.take());
-      const v = intrinsics.velocity(0, rows, channels);
+      const v = intrinsics.outputRows(0, 'velocity', rows);
       const x = latent.take();
       const d = reshape(dsigma.read(), []);
 
@@ -549,14 +565,15 @@ describe('sampler golden', () => {
     check('latent_step', b.build());
   });
 
-  // `inferlet_goldens.rs::vae_readback`: the one golden carrying `Intrinsic.PIXELS`.
+  // `inferlet_goldens.rs::vae_readback`: the one golden reading a voxel output.
   it('vae_readback matches the Rust golden', () => {
     const rows = 16;
     const rgb = 3;
     const out = chNew([rows, rgb], dtype.f32, 'pixels_out');
     const b = new Builder(VOCAB, PAGE);
+    b.setOutputs([[decl('pixels', Axis.VOXEL, rgb, false)]]);
     b.stage(Stage.EPILOGUE, () => {
-      const px = intrinsics.pixels(0, rows, rgb);
+      const px = intrinsics.outputRows(0, 'pixels', rows);
       const shifted = add(px, 1.0);
       const unit = mul(shifted, 0.5);
       out.putTensor(unit);
@@ -572,6 +589,7 @@ describe('sampler golden', () => {
     const latent = chNew([rows, width], dtype.f32, 'latent');
     const timestep = chFrom([0.5], dtype.f32, 'timestep');
     const b = new Builder(VOCAB, PAGE);
+    b.setOutputs(logitsDecl(VOCAB));
     b.bindInput(latent);
     b.bindInput(timestep);
     b.stage(Stage.PROLOGUE, () => {

@@ -226,8 +226,7 @@ impl Weights {
 fn attach(fwd: &ForwardPass, w: &Weights, surface: &str, form: &str) -> Result<()> {
     if form == "scale" {
         let l = w.scale_channel();
-        return fwd
-            .adapter(Site::O, |_x, y| inferlet::eta::adapter::scale(y, &l));
+        return fwd.adapter(Site::O, |_x, y| inferlet::eta::adapter::scale(y, &l));
     }
     let (a, b) = w.channels();
     if surface == "sink" {
@@ -306,7 +305,7 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.state(&[&ws], StateGeometry::folding())?;
     fwd_p.epilogue(move || {
         let r = rng_p.take();
-        let logits = intrinsics::logits();
+        let logits = intrinsics::output(0, "logits");
         let token = step(logits, temperature, &r);
         let r_next = &r + iota(2);
         tok_out_p.put(&token);
@@ -340,7 +339,7 @@ async fn main(input: Input) -> Result<Output> {
         fwd.state(&[&ws], StateGeometry::folding())?;
         fwd.epilogue(move || {
             let r = rng.take();
-            let logits = intrinsics::logits();
+            let logits = intrinsics::output(0, "logits");
             let token = step(logits, temperature, &r);
 
             let r_next = &r + iota(2);

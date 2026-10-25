@@ -110,8 +110,8 @@ fn reads(trace: &Trace) -> Vec<u32> {
             count[v.0 as usize] += 1;
         }
     }
-    for seam in &trace.seams {
-        for v in &seam.values {
+    for output in &trace.outputs {
+        for v in output.values() {
             count[v.0 as usize] += 1;
         }
     }
@@ -793,8 +793,8 @@ fn compact(mut trace: Trace) -> Trace {
         node.op.outputs(&mut ids);
     }
     live.extend(ids.drain(..));
-    for seam in &trace.seams {
-        live.extend(seam.values.iter().copied());
+    for output in &trace.outputs {
+        live.extend(output.values());
     }
     // A merge's arms are live with it; inputs and caches are kept as they are.
     for (v, decl) in trace.values.iter().enumerate() {
@@ -830,8 +830,8 @@ fn compact(mut trace: Trace) -> Trace {
     for node in &mut trace.nodes {
         node.op = crate::tree::remap(&node.op, &at);
     }
-    for seam in &mut trace.seams {
-        for v in &mut seam.values {
+    for output in &mut trace.outputs {
+        for v in output.values_mut() {
             *v = at(*v);
         }
     }

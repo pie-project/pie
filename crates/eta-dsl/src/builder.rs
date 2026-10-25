@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use eta_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
-use eta_ir::registry::{Port, Stage};
+use eta_ir::registry::{OutputDecl, Port, Stage};
 
 use crate::channel::Channel;
 use crate::context::{self, ChannelRef, SinkCall};
@@ -32,6 +32,7 @@ pub struct Builder<'a> {
     stages: Vec<(Stage, StageClosure<'a>)>,
     vocab: u32,
     page_size: u32,
+    outputs: Vec<Vec<OutputDecl>>,
 }
 
 impl<'a> Builder<'a> {
@@ -42,7 +43,13 @@ impl<'a> Builder<'a> {
             stages: Vec::new(),
             vocab,
             page_size,
+            outputs: Vec::new(),
         }
+    }
+
+    /// The outputs each lane of the pass reads out, in lane order.
+    pub fn outputs(&mut self, lanes: Vec<Vec<OutputDecl>>) {
+        self.outputs = lanes;
     }
 
     #[track_caller]
@@ -100,7 +107,7 @@ impl<'a> Builder<'a> {
     pub fn build(&self) -> Result<Traced, TraceErrors> {
         let rows = self.rows();
         let (result, channels, names, authoring) =
-            crate::model::with_constants(self.vocab, self.page_size, || {
+            crate::model::with_constants(self.vocab, self.page_size, self.outputs.clone(), || {
                 context::with_session(|| self.record(rows))
             });
         if !authoring.is_empty() {

@@ -1,7 +1,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::Op;
 use eta_ir::rng;
 use eta_ir::types::{Dtype, Literal, Predicate, RngKind, Shape, ValueId, ValueType};
 
@@ -13,7 +13,7 @@ pub(crate) fn eval_op(
     vals: &[Value],
     ty_of: &dyn Fn(ValueId) -> ValueType,
     inputs: &PassInputs,
-    layer: u32,
+    names: &[String],
 ) -> Result<Evaled, StepError> {
     use Evaled::One;
     let v = |id: ValueId| &vals[id as usize];
@@ -617,33 +617,27 @@ pub(crate) fn eval_op(
         Op::ChanRead(c) => Evaled::Chan(ChanEffect::Read(c)),
         Op::ChanPut { chan, value } => Evaled::Chan(ChanEffect::Put(chan, value)),
 
-        Op::IntrinsicVal {
-            intr,
+        Op::Output {
+            index,
             lane,
             shape,
             dtype,
         } => {
             let want = ValueType::new(shape, dtype);
-            let got = match intr {
-                IntrinsicId::Logits => inputs.logits.clone(),
-                IntrinsicId::MtpLogits => inputs.mtp_logits.clone(),
-                IntrinsicId::Hidden => inputs.hidden.get(lane as usize).cloned(),
-                IntrinsicId::Velocity => inputs.velocity.get(lane as usize).cloned(),
-                IntrinsicId::Pixels => inputs.pixels.get(lane as usize).cloned(),
-                IntrinsicId::Query => inputs.query.get(layer as usize).cloned(),
-                IntrinsicId::Layer => Some(Value::U32(vec![layer])),
-                IntrinsicId::MtpDrafts => inputs.mtp_drafts.clone(),
-                IntrinsicId::AttnScore => inputs.attn_score.clone(),
-            };
-            match got {
-                Some(val) if value_matches(&val, want) => One(val),
+            let name = names.get(index as usize).map_or("", String::as_str);
+            match inputs.output(name, lane) {
+                Some(val) if value_matches(val, want) => One(val.clone()),
                 Some(_) => {
                     return Err(StepError::Fault(format!(
-                        "intrinsic {} input violates its declared type",
-                        intr.name()
+                        "output `{name}` of lane {lane} violates its declared type"
                     )));
                 }
-                None => return Err(StepError::MissingIntrinsic(intr)),
+                None => {
+                    return Err(StepError::MissingOutput {
+                        name: name.into(),
+                        lane,
+                    });
+                }
             }
         }
         Op::KernelCall {

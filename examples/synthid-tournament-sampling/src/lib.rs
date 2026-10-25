@@ -402,7 +402,7 @@ async fn main(input: Input) -> Result<Output> {
         let hist = hist_p.take();
         let hlen = hlen_p.take();
         let chist = chist_p.take();
-        let logits = intrinsics::logits();
+        let logits = intrinsics::output(0, "logits");
         let (token, hist_next, chist_next, score, null, _repeated) =
             step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
         let r_next = &r + iota(2);
@@ -464,7 +464,7 @@ async fn main(input: Input) -> Result<Output> {
             let score_so_far = kept_score.take();
             let null_so_far = kept_null.take();
             let count_so_far = kept_count.take();
-            let logits = intrinsics::logits();
+            let logits = intrinsics::output(0, "logits");
             let (token, hist_next, chist_next, score, null, repeated) =
                 step(logits, vocab, cfg, &hist, &hlen, &chist, &r);
             let zero = broadcast(0.0f32, [1]);

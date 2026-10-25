@@ -2,7 +2,7 @@ use crate::msl_corpus::Served;
 use eta_compiler::codegen::cuda::emit_fused_region;
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::Op;
 use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype, Literal, RngKind, Shape};
 
@@ -29,8 +29,8 @@ fn channels() -> Vec<ChannelDecl> {
 
 fn subject(divide: bool, kind: RngKind) -> TraceContainer {
     let mut ops = vec![
-        Op::IntrinsicVal {
-            intr: IntrinsicId::Logits,
+        Op::Output {
+            index: 0,
             lane: 0,
             shape: Shape::matrix(1, VOCAB),
             dtype: Dtype::F32,
@@ -63,7 +63,7 @@ fn subject(divide: bool, kind: RngKind) -> TraceContainer {
         value: token,
     });
     TraceContainer {
-        names: Vec::new(),
+        names: vec!["logits".into()],
         channels: channels(),
         ports: Vec::new(),
         stages: vec![StageProgram {
@@ -82,8 +82,8 @@ fn decode_subject(divide: bool, vocab: u32) -> TraceContainer {
     let row = Shape::vector(vocab);
     let one = Shape::vector(1);
     let mut ops = vec![
-        Op::IntrinsicVal {
-            intr: IntrinsicId::Logits,
+        Op::Output {
+            index: 0,
             lane: 0,
             shape: Shape::matrix(1, vocab),
             dtype: Dtype::F32,
@@ -141,7 +141,7 @@ fn decode_subject(divide: bool, vocab: u32) -> TraceContainer {
         seeded,
     };
     TraceContainer {
-        names: Vec::new(),
+        names: vec!["logits".into()],
         channels: vec![
             channels().remove(0),
             // Seeded once by the host; the device carries it from there.

@@ -218,24 +218,6 @@ impl Plane {
             Versions::from_compiler(registration.emitter_version),
             Target::of(context)?,
         )?;
-        // A stage at attention runs in no layer here: only its sinks reach the forward.
-        if let Some(kind) = compiled
-            .kinds
-            .iter()
-            .zip(compiled.stages.iter())
-            .find(|(kind, stage)| kind.per_layer() && !stage.regions.is_empty())
-            .map(|(kind, _)| *kind)
-        {
-            return Err(Fault::program(
-                "program::plane",
-                format!(
-                    "its `{}` stage computes, and this shell runs a stage at attention \
-                     only through its sinks: nothing would run it inside the layers",
-                    kind.name()
-                ),
-            ));
-        }
-
         let id = ProgramId(self.next_program);
         self.next_program += 1;
         self.programs.insert(
@@ -365,10 +347,10 @@ impl Plane {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn bind_intrinsic(
+    pub fn bind_output(
         &mut self,
         id: InstanceId,
-        intrinsic: eta_ir::op::IntrinsicId,
+        name: &str,
         lane: u32,
         base: u64,
         storage: u32,
@@ -380,12 +362,11 @@ impl Plane {
             .get_mut(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
             .session
-            .bind_intrinsic(
-                intrinsic, lane, base, storage, width, row_stride, row_offset,
-            )
+            .bind_output(name, lane, base, storage, width, row_stride, row_offset)
     }
 
-    pub fn needs_mtp_drafts(&self, id: InstanceId) -> Result<bool> {
+    /// The outputs instance `id`'s program reads, by name and lane.
+    pub fn reads(&self, id: InstanceId) -> Result<Vec<(String, u32)>> {
         let bound = self
             .instances
             .get(&id)
@@ -399,21 +380,12 @@ impl Plane {
                 ),
             )
         })?;
-        Ok(program.plan.needs_mtp_drafts)
-    }
-
-    #[must_use]
-    pub fn declared_score_planes(&self, id: InstanceId) -> Option<u32> {
-        let bound = self.instances.get(&id)?;
-        let program = self.programs.get(&bound.program_id)?;
-        program
+        Ok(program
             .plan
-            .package
-            .values
-            .iter()
-            .filter(|value| value.intrinsic == Some(eta_ir::op::IntrinsicId::AttnScore))
-            .filter_map(|value| value.shape.first().copied())
-            .max()
+            .outputs()
+            .into_iter()
+            .map(|(name, lane)| (name.to_string(), lane))
+            .collect())
     }
 
     pub fn ready(&self, id: InstanceId) -> Result<Option<u32>> {
@@ -463,7 +435,6 @@ impl Plane {
         None
     }
 
-    
     pub fn fire(&mut self, context: &Context, id: InstanceId) -> Result<Fired> {
         if self.prologue_runs(id) {
             let fired = self.fire_at(context, id, Attach::Prologue)?;
@@ -486,7 +457,6 @@ impl Plane {
         }
     }
 
-    
     #[must_use]
     pub fn prologue_runs(&self, id: InstanceId) -> bool {
         self.instances
@@ -730,7 +700,6 @@ impl Plane {
             .host_resolved_rings(&program.plan, bound.geometry)
     }
 
-    
     #[must_use]
     pub fn resolves_prologue_put(&self, id: InstanceId) -> bool {
         let Some(bound) = self.instances.get(&id) else {

@@ -6,7 +6,7 @@
 // What reaches inside attention is refused by name on a model without
 // attention layers.
 //
-// Legal stages: prologue, on_attn_proj, on_attn, epilogue.
+// Legal stages: prologue, epilogue.
 
 interface forward {
     use types.{error, data};

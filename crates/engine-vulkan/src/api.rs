@@ -450,16 +450,12 @@ impl Engine for Vulkan {
                     &budgets,
                 )))
                 .unwrap_or(u32::MAX),
-                max_scoring_lanes: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,
-            has_mtp_logits: shell.drafts(),
-            mtp_depth: shell.mtp_depth(),
             draft_block: shell.trace().drafter.map_or(0, |d| d.rows),
             draft_mask_token: shell.trace().drafter.map_or(0, |d| d.mask_token),
             draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
-            has_attn_score: false,
 
             ports: PortMask::DECODE_ENVELOPE.with(eta_ir::registry::Port::Fold),
             geometry: GeometryClass::DecodeEnvelope,
@@ -851,11 +847,7 @@ impl Vulkan {
                 .fire(
                     attachment.instance,
                     Stage::Prologue,
-                    None,
-                    0,
-                    0,
-                    None,
-                    0,
+                    &[],
                     #[cfg(feature = "vulkan")]
                     self.shell.as_ref().map(Shell::device),
                     #[cfg(feature = "vulkan")]
@@ -880,18 +872,27 @@ impl Vulkan {
             shell, programs, ..
         } = self;
         for attachment in program_attachments(step) {
-            let readout = readouts.get(attachment.lane as usize);
-            let (logits, rows, vocab) = match readout {
-                Some(lane) if lane.rows > 0 => {
-                    (Some(lane.values.as_slice()), lane.rows, lane.width)
+            let mut outputs: Vec<(String, u32, eta_exec::Value)> = Vec::new();
+            if let (Some(lane), Some(shell)) =
+                (readouts.get(attachment.lane as usize), shell.as_ref())
+                && lane.rows > 0
+            {
+                outputs.push((
+                    shell.out_name().to_string(),
+                    0,
+                    eta_exec::Value::F32(lane.values.clone()),
+                ));
+                if let Some(values) = drafts
+                    .and_then(|lanes| lanes.get(attachment.lane as usize))
+                    .filter(|values| !values.is_empty() && mtp_width > 0)
+                {
+                    outputs.push((
+                        shell.mtp_name().to_string(),
+                        0,
+                        eta_exec::Value::F32(values.clone()),
+                    ));
                 }
-                _ => (None, 0, 0),
-            };
-
-            let mtp_logits = drafts
-                .and_then(|lanes| lanes.get(attachment.lane as usize))
-                .filter(|values| !values.is_empty() && mtp_width > 0)
-                .map(Vec::as_slice);
+            }
 
             #[cfg(feature = "vulkan")]
             let (device, seat, pixels) = match shell.as_ref() {
@@ -905,11 +906,7 @@ impl Vulkan {
                 .fire(
                     attachment.instance,
                     Stage::Epilogue,
-                    logits,
-                    rows,
-                    vocab,
-                    mtp_logits,
-                    mtp_width,
+                    &outputs,
                     #[cfg(feature = "vulkan")]
                     device,
                     #[cfg(feature = "vulkan")]
@@ -1168,7 +1165,6 @@ impl Vulkan {
                 pages: &lane.kv.pages,
                 held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
                 kv_less: lane.kv_less,
-                captures_scores: lane.captures_scores,
 
                 mask: lane.mask.as_ref(),
 
@@ -1283,19 +1279,23 @@ fn lane_readouts<'a>(
         .map(|lane| {
             shell
                 .readout_row(landed, lane)
-                .map(|(seat, at, width, dtype)| crate::guest::run::Readout {
-                    seat,
-                    at,
-                    width,
-                    f32: dtype == poem_ir::Dtype::F32,
-                })
+                .map(
+                    |(seat, at, width, dtype, output)| crate::guest::run::Readout {
+                        output,
+                        seat,
+                        at,
+                        width,
+                        f32: dtype == poem_ir::Dtype::F32,
+                    },
+                )
         })
         .collect();
     let pixels = lanes
         .map(|lane| {
             shell
                 .pixels_row(landed, lane)
-                .map(|(seat, at, width)| crate::guest::run::Readout {
+                .map(|(seat, at, width, output)| crate::guest::run::Readout {
+                    output,
                     seat,
                     at,
                     width,

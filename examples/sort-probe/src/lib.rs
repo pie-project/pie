@@ -115,10 +115,7 @@ fn dry_penalty(hist: &Tensor, hlen: &Tensor, vocab: u32, cfg: DryCfg) -> (Tensor
             &penalty,
         );
     }
-    let count = reshape(
-        reduce_sum(cast(gt(&penalty, &vocab_zero), dtype::f32)),
-        [1],
-    );
+    let count = reshape(reduce_sum(cast(gt(&penalty, &vocab_zero), dtype::f32)), [1]);
     let peak = reshape(reduce_max(&penalty), [1]);
     (penalty, count, peak)
 }
@@ -220,7 +217,7 @@ async fn main(input: Input) -> Result<String> {
     fwd.embed(&toks, &embed_indptr)?;
     fwd.state(&[&ws], StateGeometry::folding())?;
     fwd.epilogue(move || {
-        let logits = intrinsics::logits();
+        let logits = intrinsics::output(0, "logits");
         let logprobs = log_softmax(&logits);
         let probabilities = exp(&logprobs);
         let keep = pivot_threshold(&probabilities, cummass_le(TOP_P));

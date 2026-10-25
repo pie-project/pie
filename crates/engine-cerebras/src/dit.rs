@@ -1,6 +1,5 @@
 //! Voxel axis, guest inputs, group packings and float exports for the diffusion and video families.
 
-use engine::fire::ReadoutSeam;
 use kernels_cerebras::Tensor;
 use poem_compiler::{CompiledModel, VoxelLadder};
 use poem_exec::feeds::{Feeds, Seat};
@@ -11,11 +10,6 @@ use crate::error::{Fault, Result};
 use crate::inputs::Inputs;
 use crate::run::{DitBindings, InputBinding, PackingBindings};
 use crate::trace::Handles;
-
-/// The seams a denoiser or a decoder exports instead of logits.
-const VELOCITY_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[0];
-const HIDDEN_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[1];
-const PIXELS_SEAM: &str = poem_compiler::EXPORT_SEAMS[6];
 
 #[derive(Debug, Clone, Copy)]
 pub struct Clips<'a> {
@@ -88,8 +82,9 @@ struct PixelsExport {
 pub struct Dit {
     feeds: Feeds,
     voxel: Option<VoxelSeat>,
-    velocity: Option<ValueId>,
-    hidden: Option<ValueId>,
+    /// The last float row or voxel output a plan reads out, its clips
+    /// laid out as the fire's.
+    rows: Option<ValueId>,
     pixels: Vec<PixelsExport>,
 }
 
@@ -289,40 +284,42 @@ impl Dit {
         }
         dit.voxel = voxel;
 
-        let first = |name: &str| {
-            trace
-                .seams
-                .iter()
-                .filter(|seam| seam.seam == name)
-                .flat_map(|seam| seam.values.iter().copied())
-                .collect::<Vec<_>>()
+        let float_rows = |value: ValueId| {
+            matches!(
+                &trace.values[value.0 as usize].ty,
+                Ty::Tensor { shape, dtype }
+                    if matches!(dtype, Dtype::Bf16 | Dtype::F32)
+                        && !matches!(
+                            shape.first(),
+                            Some(poem_ir::Dim::Readouts | poem_ir::Dim::Lanes | poem_ir::Dim::LanesPlus(_))
+                        )
+            )
         };
-        dit.velocity = first(VELOCITY_SEAM).first().copied();
-        dit.hidden = first(HIDDEN_SEAM).last().copied();
-        dit.pixels = trace
-            .seams
+        dit.rows = trace
+            .outputs
             .iter()
-            .filter(|seam| seam.seam == PIXELS_SEAM)
-            .filter_map(|seam| match seam.values.as_slice() {
-                [plane, grid, ..] => Some(PixelsExport {
-                    plane: *plane,
-                    grid: *grid,
-                    classes: writer_classes(trace, compiled, *plane),
-                    width: width_of(trace, *plane),
-                }),
-                _ => None,
+            .filter(|output| output.grid.is_none() && float_rows(output.value))
+            .map(|output| output.value)
+            .last();
+        dit.pixels = trace
+            .outputs
+            .iter()
+            .filter_map(|output| {
+                Some(PixelsExport {
+                    plane: output.value,
+                    grid: output.grid?,
+                    classes: writer_classes(trace, compiled, output.value),
+                    width: width_of(trace, output.value),
+                })
             })
             .collect();
         Ok(dit)
     }
 
-    /// The float readout a plan with no `out` seam reads back per token row:
-    /// velocity, else the last hidden export.
+    /// The float rows a plan with no readout rows reads back per token row.
     #[must_use]
-    pub fn float_readout(&self) -> Option<(ReadoutSeam, ValueId)> {
-        self.velocity
-            .map(|value| (ReadoutSeam::Velocity, value))
-            .or_else(|| self.hidden.map(|value| (ReadoutSeam::Hidden, value)))
+    pub fn float_readout(&self) -> Option<ValueId> {
+        self.rows
     }
 
     /// Whether the plan exports pixels, and the widest pixel row.

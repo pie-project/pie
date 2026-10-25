@@ -115,11 +115,15 @@ fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::La
 fn dims(reading: &str) -> Result<Dims> {
     let image = lane_reading(reading, "image", &["latents", "timestep"])?;
     lane_reading(reading, "text", &["context", "timestep"])?;
-    let velocity_width = match &image.readout {
-        Some(readout) if readout.kind == model::ReadoutKind::Velocity => readout.width,
-        other => {
+    let velocity_width = match image
+        .outputs
+        .iter()
+        .find(|output| output.name == "velocity")
+    {
+        Some(output) => output.width,
+        None => {
             return Err(format!(
-                "reading `{reading}`'s image lane reads out {other:?}, not a velocity"
+                "reading `{reading}`'s image lane reads out no velocity"
             ));
         }
     };
@@ -172,7 +176,7 @@ async fn text_rows(ids: &[u32], width: u32, pipe: &Pipeline) -> Result<Vec<f32>>
     pass.state(&[&ws], StateGeometry::default())?;
     let readback = out;
     pass.epilogue(move || {
-        readback.put(intrinsics::hidden(0, len, width));
+        readback.put(intrinsics::output_rows(0, "hidden", len));
     });
     pass.submit(pipe).context("text pass")?;
     let rows: Vec<f32> = out.take_host().await?;
@@ -226,7 +230,7 @@ async fn trajectory(
     let x_out = Channel::new(lat, dtype::f32).named("x_out");
     pass.epilogue(move || {
         let k_cur = k.take();
-        let v = intrinsics::velocity(img_lane, voxels, velocity_width);
+        let v = intrinsics::output_rows(img_lane, "velocity", voxels);
         let cur = reshape(x.take(), [voxels, channels]);
         let dt = gather(dts_ch.read(), &k_cur);
         let next = reshape(euler_step(&cur, &v, &dt), lat);
@@ -283,16 +287,14 @@ async fn main(input: Input) -> Result<Output> {
         inferlet::serde_json::from_str(&text).map_err(|why| format!("case json: {why}"))?;
 
     let text_lane = model::lane_of(&[("reading", "text")])?;
-    let hidden_width = match &text_lane.readout {
-        Some(readout)
-            if text_lane.state
-                && text_lane.embeds
-                && readout.kind == model::ReadoutKind::Hidden =>
-        {
-            readout.width
-        }
+    let hidden = text_lane
+        .outputs
+        .iter()
+        .find(|output| output.name == "hidden");
+    let hidden_width = match hidden {
+        Some(hidden) if text_lane.state && text_lane.embeds => hidden.width,
         _ => {
-            return Err("reading `text` is not a token + kv reading with a hidden readout".into());
+            return Err("reading `text` is not a token + kv reading with a hidden output".into());
         }
     };
     let denoise = "denoise";

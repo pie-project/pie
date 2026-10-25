@@ -16,8 +16,7 @@ pub use effects::{
 pub use fused::{emit_fused_region, emit_grouped_fused_region};
 pub use intrinsics::{
     M2_INTRINSIC_TABLE_BUFFER, M2_INTRINSIC_TOP_BUFFER, M2_LOGITS_BUFFER,
-    M3_INTRINSIC_TABLE_BUFFER, addressed, addressed_slot, fused_channel_ceiling,
-    m2_intrinsic_buffer, m2_intrinsic_element_bytes, m3_intrinsic_bindable,
+    M3_INTRINSIC_TABLE_BUFFER, addressed_slot, fused_channel_ceiling, m2_output_buffer,
 };
 pub use nucleus::emit_grouped_nucleus;
 pub use preamble::RUNTIME_TEMPLATE;
@@ -30,7 +29,7 @@ pub use streamed_topk::emit_streamed_topk;
 pub use topk::emit_grouped_topk;
 pub use validate::validate_singleton_plan;
 
-pub const METAL_M1_EMITTER_VERSION: u16 = 58;
+pub const METAL_M1_EMITTER_VERSION: u16 = 59;
 
 pub const METAL_M1_MAX_CHANNELS: usize = 29;
 

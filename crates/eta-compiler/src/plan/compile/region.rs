@@ -2,12 +2,12 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use eta_ir::op::{Family, IntrinsicId, Op};
+use eta_ir::op::{Family, Op};
 use eta_ir::types::ValueId;
 
 use super::normalize::{ChannelSlot, NodeIndex, NormalizedStage, result_layout};
 use super::nucleus::LibraryMatch;
-use super::symbolic::Dimension;
+use super::symbolic::{Dimension, readout_plane};
 
 eta_ir::declare_tagged_enum! {
     pub enum ScheduleTemplate {
@@ -114,10 +114,7 @@ pub(crate) fn fused_partition(
         .filter_map(|((geometry, witness), op)| match geometry {
             Geometry::Rows { fixed, extent }
                 if witness.is_some()
-                    && !matches!(
-                        op.tag(),
-                        eta_ir::op::tags::INTRINSIC_VAL | eta_ir::op::tags::CONST
-                    ) =>
+                    && !matches!(op.tag(), eta_ir::op::tags::OUTPUT | eta_ir::op::tags::CONST) =>
             {
                 Some((*fixed, *extent))
             }
@@ -448,10 +445,9 @@ pub(crate) fn direct_topk(
         value = through_reshapes(numerator);
     }
     let intrinsic = index.producer(value)?;
-    let Op::IntrinsicVal { intr, .. } = stage.ops[intrinsic.index()] else {
-        return None;
-    };
-    if !matches!(intr, IntrinsicId::Logits | IntrinsicId::MtpLogits) {
+    if !matches!(stage.ops[intrinsic.index()], Op::Output { .. })
+        || !readout_plane(stage.value_types.get(index.base(intrinsic)? as usize)?)
+    {
         return None;
     }
     let plane = &stage.value_types.get(index.base(intrinsic)? as usize)?.dims;
@@ -578,7 +574,7 @@ fn row_parallel_tag(tag: u8) -> bool {
             | tags::REDUCE_ARGMAX
             | tags::BROADCAST
             | tags::CONST
-            | tags::INTRINSIC_VAL
+            | tags::OUTPUT
             | tags::GATHER_ROW
     )
 }
@@ -638,7 +634,7 @@ pub(crate) fn node_geometry(
                     | tags::REDUCE_MIN
                     | tags::REDUCE_ARGMAX
                     | tags::GATHER_ROW
-                    | tags::INTRINSIC_VAL
+                    | tags::OUTPUT
                     | tags::CONST
             )
             && !vectors.is_empty()

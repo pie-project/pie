@@ -16,7 +16,7 @@ use engine_cerebras::sdk::Target;
 use eta_compiler::plan::compile_bound;
 use eta_exec::Value;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::Op;
 use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype, Literal, Predicate, RngKind, Shape};
 
@@ -48,8 +48,8 @@ fn sampler(vocab: u32) -> TraceContainer {
         next: 0,
     };
     let r = p.op(Op::ChanTake(RNG));
-    let raw = p.op(Op::IntrinsicVal {
-        intr: IntrinsicId::Logits,
+    let raw = p.op(Op::Output {
+        index: 0,
         lane: 0,
         shape: Shape::matrix(1, vocab),
         dtype: Dtype::F32,
@@ -165,7 +165,7 @@ fn sampler(vocab: u32) -> TraceContainer {
             seeded,
         };
     TraceContainer {
-        names: Vec::new(),
+        names: vec!["logits".to_string()],
         channels: vec![
             chan(Shape::vector(2), Dtype::U32, HostRole::None, true, 1),
             chan(v, Dtype::F32, HostRole::None, true, 1),
@@ -352,16 +352,14 @@ fn bind_logits(
 ) -> Result<eta_ir::validate::BoundTrace, eta_ir::validate::ValidateError> {
     eta_ir::validate::bind(
         container,
-        vec![Some(eta_ir::registry::Readout {
-            kind: eta_ir::registry::ReadoutKind::Logits,
+        vec![vec![eta_ir::registry::OutputDecl {
+            name: "logits".to_string(),
+            axis: eta_ir::registry::Axis::Row,
             width: vocab,
-        })],
-        eta_ir::registry::Graph {
-            num_layers: 2,
-            mtp_logits: true,
-            mtp_depth: 1,
-            attn_score: true,
-        },
+            dtype: eta_ir::types::Dtype::F32,
+            layers: 0,
+            readout: true,
+        }]],
         eta_ir::registry::EngineCaps {
             lora: true,
             attn_page_mask: true,

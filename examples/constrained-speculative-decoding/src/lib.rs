@@ -234,7 +234,10 @@ impl Target {
             },
         )?;
         fwd.epilogue(move || {
-            target_out.put(masked_argmax(intrinsics::logits(), allowed.take()));
+            target_out.put(masked_argmax(
+                intrinsics::output(0, "logits"),
+                allowed.take(),
+            ));
         });
 
         allowed.put(masks.concat());

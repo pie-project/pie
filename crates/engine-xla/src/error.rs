@@ -174,14 +174,6 @@ pub enum Fault {
         lane: u32,
     },
 
-    ScoreWord {
-        lane: u32,
-
-        word: u64,
-
-        runs_capture_arm: bool,
-    },
-
     Backing {
         step: &'static str,
 
@@ -331,32 +323,9 @@ impl fmt::Display for Fault {
             }
             Self::Scoreless { lane } => write!(
                 f,
-                "lane {lane} asks to capture its attention mass and this load's artifact \
-                 declares no capture arm: a score axis is a fact the MODEL states and \
-                 this plan carries no `attn.scores` export to read"
+                "lane {lane} lands in a class capturing attention scores, which this \
+                 shell does not run (`attn.score_capture` is not ported to XLA)"
             ),
-            Self::ScoreWord {
-                lane,
-                word,
-                runs_capture_arm,
-            } => {
-                if *runs_capture_arm {
-                    write!(
-                        f,
-                        "lane {lane}'s word {word:#x} puts it in a class that writes a \
-                         capture column, and it did not ask to be observed, so the mass \
-                         would be computed into a plane no epilogue is pointed at"
-                    )
-                } else {
-                    write!(
-                        f,
-                        "lane {lane} asks to capture its attention mass and its word \
-                         {word:#x} puts it in a class outside the capture window, so no \
-                         mass would be computed and a row of zeros would be \
-                         indistinguishable from a capture of nothing"
-                    )
-                }
-            }
             Self::Backing { step, bytes, why } => write!(
                 f,
                 "this load streams {bytes} bytes of routed experts and the temporary file \

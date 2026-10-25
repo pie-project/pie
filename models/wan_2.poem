@@ -669,7 +669,7 @@ def forward(m, inputs):
     reading = lambda name: inputs.on(switch_is("reading", name))
     if m.te != None:
         text_encode(reading("text"), m.te)
-    velocity = denoise(reading("denoise"), m)
+    denoise(reading("denoise"), m)
     if m.vae != None:
         head = fact.fresh()
         decode, encode = reading("vae.decode"), reading("vae.encode")
@@ -677,7 +677,6 @@ def forward(m, inputs):
         vae_decode(decode.on(~head), m.vae, False)
         vae_encode(encode.on(head), m.vae, True)
         vae_encode(encode.on(~head), m.vae, False)
-    return velocity
 
 def text_encode(arm, te):
     ids = arm.tokens()
@@ -701,7 +700,7 @@ def text_encode(arm, te):
 
     y = arm.fold_layers(te.layers, y, layer)
     out = ops.elemwise.rmsnorm(y, te.final_norm, TE_EPS)
-    seam.at(seam.HIDDEN, [out])
+    output("hidden", out)
 
 def run_block(x, c, b, e, d, vg, cg):
     dim = d.dim
@@ -788,7 +787,7 @@ def denoise(arm, m):
     x = arm.fold_layers(dit.blocks, x, step)
     h = norm_modulate(x, head_mod, vg.lanes, NORM_EPS)
     velocity = ops.conv.unpatchify(run_linear(dit.proj_out, h), tgrid, PATCH, grid)
-    seam.at(seam.VELOCITY, [velocity])
+    output("velocity", velocity)
     return velocity
 
 def vconv(x, g, c, arm):
@@ -853,7 +852,7 @@ def vae_decode(arm, vae, first):
     y, gy = vconv(x, g, vae.conv_out, arm)
     pixels, gp = ops.conv.pixel_shuffle(y, gy, [1, vae.patch, vae.patch])
     pixels = ops.elemwise.clamp(pixels, -1.0, 1.0)
-    seam.at(seam.PIXELS, [pixels, gp])
+    output("pixels", pixels, grid = gp)
     return pixels
 
 def downsample2d(x, g, c):
@@ -895,5 +894,5 @@ def vae_encode(arm, vae, first):
     h, gh = vconv(x, g, e.conv_out, arm)
     z, gz = vconv(h, gh, e.quant, arm)
     z = ops.elemwise.standardize(z, e.norm_bias, e.norm_scale)
-    seam.at(seam.PIXELS, [z, gz])
+    output("pixels", z, grid = gz)
     return z

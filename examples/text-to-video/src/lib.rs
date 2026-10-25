@@ -128,6 +128,11 @@ fn input<'a>(lane: &'a model::LaneDecl, name: &str) -> Option<&'a model::InputDe
     lane.inputs.iter().find(|input| input.name == name)
 }
 
+/// The output `name` a lane reads out, if it reads it.
+fn output<'a>(lane: &'a model::LaneDecl, name: &str) -> Option<&'a model::OutputDecl> {
+    lane.outputs.iter().find(|output| output.name == name)
+}
+
 fn streams() -> Vec<Option<String>> {
     let streams = values("stream");
     if streams.is_empty() {
@@ -171,6 +176,8 @@ fn bind(
 struct Text {
     reading: String,
     width: u32,
+    /// The most hidden rows one pass reads out.
+    rows: u32,
     state: bool,
 }
 
@@ -188,9 +195,10 @@ fn text_reading() -> Result<Text> {
         .into_iter()
         .find_map(|r| {
             let lane = lane(&r, None).ok()?;
-            let readout = lane.readout.as_ref()?;
-            (lane.embeds && readout.kind == model::ReadoutKind::Hidden).then(|| Text {
-                width: readout.width,
+            let hidden = output(&lane, "hidden")?;
+            lane.embeds.then(|| Text {
+                width: hidden.width,
+                rows: hidden.max_rows,
                 state: lane.state,
                 reading: r.clone(),
             })
@@ -204,9 +212,10 @@ fn denoise_reading() -> Result<Denoise> {
             continue;
         };
         let video = lane(&reading, latent_stream.as_deref())?;
-        if video.embeds
-            || video.readout.as_ref().map(|r| r.kind) != Some(model::ReadoutKind::Velocity)
-        {
+        let Some(velocity) = output(&video, "velocity").map(|velocity| velocity.width) else {
+            continue;
+        };
+        if video.embeds {
             continue;
         }
         if video.state {
@@ -227,7 +236,6 @@ fn denoise_reading() -> Result<Denoise> {
         if input(&video, "timestep").is_none() {
             return Err(format!("reading `{reading}` reads no `timestep`"));
         }
-        let velocity = video.readout.as_ref().map_or(0, |r| r.width);
         if velocity != latents.width {
             return Err(format!(
                 "reading `{reading}` reads out {velocity}-wide velocity rows over {}-wide latent cells",
@@ -243,7 +251,7 @@ fn denoise_reading() -> Result<Denoise> {
             latents,
         });
     }
-    Err("this model declares no token-less reading of `latents` with a velocity readout".into())
+    Err("this model declares no token-less reading of `latents` reading out a velocity".into())
 }
 
 fn padded(rows: Option<model::RowCount>, len: u32) -> Option<u32> {
@@ -288,8 +296,8 @@ fn encode(
     if len == 0 {
         return Err("the prompt tokenizes to nothing".into());
     }
-    let cap = max_readout_rows(model::ReadoutKind::Hidden);
-    if len as usize > cap {
+    let cap = text.rows;
+    if len > cap {
         return Err(format!(
             "the prompt is {len} tokens and one pass reads out {cap} hidden rows"
         ));
@@ -317,7 +325,7 @@ fn encode(
     let encoded = Channel::new([rows, width], dtype::f32).queued();
     pass.epilogue(move || {
         encoded.put(pad_rows(
-            &intrinsics::hidden(0, len, width),
+            &intrinsics::output_rows(0, "hidden", len),
             len,
             rows,
             width,
@@ -367,7 +375,7 @@ fn vae_lane(reading: &str) -> Result<Vae> {
         let Ok(lane) = lane(reading, stream.as_deref()) else {
             continue;
         };
-        if let ([input], Some(readout)) = (&lane.inputs[..], &lane.readout)
+        if let ([input], Some(pixels)) = (&lane.inputs[..], output(&lane, "pixels"))
             && input.axis == model::InputAxis::Voxel
         {
             return Ok(Vae {
@@ -375,7 +383,7 @@ fn vae_lane(reading: &str) -> Result<Vae> {
                 stream,
                 state: lane.state,
                 input: input.clone(),
-                width: readout.width,
+                width: pixels.width,
             });
         }
     }
@@ -588,7 +596,7 @@ async fn main(input: Input) -> Result<Output> {
                 } else {
                     init.take()
                 };
-                let frame = reshape(intrinsics::pixels(0, rows, c), [1, plane]);
+                let frame = reshape(intrinsics::output_rows(0, "pixels", rows), [1, plane]);
                 init.put(scatter_set(&base, Tensor::constant([j]), &frame));
             });
             pixels.set_frames(&chunk)?;
@@ -664,12 +672,12 @@ async fn main(input: Input) -> Result<Output> {
             let step = k.take();
             let v = if cfg {
                 cfg_combine(
-                    &intrinsics::velocity(0, n, c),
-                    &intrinsics::velocity(2, n, c),
+                    &intrinsics::output_rows(0, "velocity", n),
+                    &intrinsics::output_rows(2, "velocity", n),
                     &Tensor::constant([guidance]),
                 )
             } else {
-                intrinsics::velocity(0, n, c)
+                intrinsics::output_rows(0, "velocity", n)
             };
             let sig = sigmas.read();
             let next = &step + 1u32;
@@ -712,7 +720,7 @@ async fn main(input: Input) -> Result<Output> {
         let out = Channel::new([rows, 3], dtype::f32).named("vae_pixels");
         pass.epilogue(move || {
             frame.take();
-            out.put(intrinsics::pixels(0, rows, 3));
+            out.put(intrinsics::output_rows(0, "pixels", rows));
         });
         Ok((pass, out))
     };

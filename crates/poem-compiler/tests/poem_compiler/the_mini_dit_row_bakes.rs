@@ -5,7 +5,7 @@ use crate::mini_dit_dims;
 use mini_dit_dims as model;
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, GeomKind, Guard, Operands, Operation, Platform, Request,
-    RopeForm, RuntimeInput, Trace, Ty, ValueId, seam,
+    RopeForm, RuntimeInput, Trace, Ty, ValueId,
 };
 use poem_ir::Conv;
 
@@ -78,11 +78,11 @@ fn the_latent_is_patched_in_the_graph_and_the_positions_are_its_cells() {
     );
 
     let velocity = plan
-        .seams
+        .outputs
         .iter()
-        .find(|s| s.seam == seam::VELOCITY.name)
+        .find(|s| s.name == "velocity")
         .expect("a velocity seam")
-        .values[0];
+        .value;
     assert_eq!(
         plan.values[velocity.0 as usize].ty,
         Ty::Tensor {
@@ -125,13 +125,13 @@ fn the_row_traces_on_every_platform_with_no_cache_and_a_velocity_readout() {
              declared {:?}",
             plan.caches,
         );
-        let seams: BTreeSet<&str> = plan.seams.iter().map(|s| s.seam.as_str()).collect();
+        let seams: BTreeSet<&str> = plan.outputs.iter().map(|s| s.name.as_str()).collect();
         assert!(
-            seams.contains(seam::VELOCITY.name),
+            seams.contains("velocity"),
             "{platform:?}: no velocity readout; seams are {seams:?}"
         );
         assert!(
-            !seams.contains(seam::OUT.name),
+            !seams.contains("logits"),
             "{platform:?}: a denoiser has no logits, and `out` was planted anyway"
         );
     }

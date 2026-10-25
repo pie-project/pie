@@ -26,49 +26,35 @@ impl DispatchAttn for Run<'_> {
 }
 
 impl Run<'_> {
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn capture_scores(
-        &mut self,
-        q: poem_ir::ValueId,
-        plan: poem_ir::ValueId,
-        cache: poem_ir::ValueId,
-        window: Option<u32>,
-        head_dim: u32,
-        kv_heads: u32,
-        sm_scale: f32,
-        lse: poem_ir::ValueId,
-    ) -> Result<(), kernels_cuda::Error> {
-        let Some(seat) = self.bindings().scores.clone() else {
-            return Ok(());
-        };
-        let Some(plane) = seat.plane_of(lse) else {
-            return Ok(());
-        };
-        let lane_offset = self.window().span().lane_offset;
-        let mut slab = seat.slab;
-        let mut q_rows = self.ragged(q);
-        q_rows.data = self.windowed(q_rows.data);
-        kernels_cuda::attn::score::capture(
-            self.ctx(),
-            q_rows,
-            self.prefill_plan(plan),
-            &self.pool(cache),
-            window,
-            head_dim,
-            kv_heads,
-            sm_scale,
-            seat.observe,
-            lane_offset,
-            seat.plane_stride,
-            plane,
-            crate::scores::KV_MAX,
-            &mut slab,
-            &seat.seat_of,
-        )
-    }
-
     pub(super) fn attention(&mut self, op: &Attn) -> Result<(), kernels_cuda::Error> {
         match op {
+            Attn::ScoreCapture {
+                q,
+                plan,
+                cache,
+                head_dim,
+                kv_heads,
+                sm_scale,
+                observe,
+                kv_max,
+                scores,
+            } => {
+                let mut q_rows = self.ragged(*q);
+                q_rows.data = self.windowed(q_rows.data);
+                kernels_cuda::attn::score::capture(
+                    self.ctx(),
+                    q_rows,
+                    self.prefill_plan(*plan),
+                    &self.pool(*cache),
+                    *head_dim,
+                    *kv_heads,
+                    *sm_scale,
+                    *observe,
+                    self.window().span().lane_offset,
+                    *kv_max,
+                    &mut self.tensor(*scores),
+                )
+            }
             Attn::Voxel {
                 q,
                 k,
@@ -619,9 +605,6 @@ impl Run<'_> {
                     *sm_scale,
                     &mut self.tensor(*o),
                     &mut self.tensor(*lse),
-                )?;
-                self.capture_scores(
-                    *q, *plan, *cache, *window, *head_dim, *kv_heads, *sm_scale, *lse,
                 )
             }
             Attn::Sink {

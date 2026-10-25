@@ -1,69 +1,82 @@
 //! What a test program is bound against.
 
 use eta_ir::container::TraceContainer;
-use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{EngineCaps, Graph, Readout, ReadoutKind};
+use eta_ir::op::Op;
+use eta_ir::registry::{Axis, EngineCaps, OutputDecl};
 use eta_ir::validate::{BoundTrace, ValidateError, bind};
 
-pub fn logits(container: TraceContainer, vocab: u32) -> Result<BoundTrace, ValidateError> {
-    let lane = Readout {
-        kind: ReadoutKind::Logits,
+/// Logits a lane reads out, `vocab` wide.
+pub fn logits_decl(vocab: u32) -> OutputDecl {
+    OutputDecl {
+        name: "logits".into(),
+        axis: Axis::Row,
         width: vocab,
-    };
-    bind(container, vec![Some(lane)], graph(), caps())
+        dtype: eta_ir::Dtype::F32,
+        layers: 0,
+        readout: true,
+    }
 }
 
-/// One lane per lane `container` reads intrinsics of, reading what the loaded classes read out.
+/// A loaded class's output as a program reads it.
+#[allow(dead_code)]
+pub fn eta_decl(decl: &poem_ir::OutputDecl) -> OutputDecl {
+    OutputDecl {
+        name: decl.name.clone(),
+        axis: match decl.axis {
+            poem_ir::InputAxis::Lane => Axis::Lane,
+            poem_ir::InputAxis::Row => Axis::Row,
+            poem_ir::InputAxis::Voxel => Axis::Voxel,
+        },
+        width: decl.width,
+        dtype: match decl.dtype {
+            poem_ir::Dtype::I32 => eta_ir::Dtype::I32,
+            _ => eta_ir::Dtype::F32,
+        },
+        layers: decl.layers,
+        readout: decl.readout,
+    }
+}
+
+/// Every output the loaded classes write, as one lane reads them.
+#[allow(dead_code)]
+pub fn loaded_decls(loaded: &engine::Capabilities) -> Vec<OutputDecl> {
+    let mut decls: Vec<OutputDecl> = Vec::new();
+    for decl in loaded
+        .classes
+        .classes
+        .iter()
+        .flat_map(|class| &class.outputs)
+    {
+        if !decls.iter().any(|seen| seen.name == decl.name) {
+            decls.push(eta_decl(decl));
+        }
+    }
+    decls
+}
+
+#[allow(dead_code)]
+pub fn logits(container: TraceContainer, vocab: u32) -> Result<BoundTrace, ValidateError> {
+    bind(container, vec![vec![logits_decl(vocab)]], caps())
+}
+
+/// One lane per lane `container` reads outputs of, reading what the loaded classes read out.
 #[allow(dead_code)]
 pub fn loaded(
     container: TraceContainer,
     loaded: &engine::Capabilities,
 ) -> Result<BoundTrace, ValidateError> {
-    let kind_of = |intr: IntrinsicId| match intr {
-        IntrinsicId::Velocity => Some(poem_ir::ReadoutKind::Velocity),
-        IntrinsicId::Hidden => Some(poem_ir::ReadoutKind::Hidden),
-        IntrinsicId::Pixels => Some(poem_ir::ReadoutKind::Pixels),
-        IntrinsicId::Logits => Some(poem_ir::ReadoutKind::Logits),
-        _ => None,
-    };
-    let mut lanes: Vec<Option<Readout>> = vec![None];
-    for op in container.stages.iter().flat_map(|stage| &stage.ops) {
-        let Op::IntrinsicVal { intr, lane, .. } = *op else {
-            continue;
-        };
-        let Some(kind) = kind_of(intr) else { continue };
-        let Some(read) = loaded
-            .classes
-            .classes
-            .iter()
-            .filter_map(|class| class.readout)
-            .find(|readout| readout.kind == kind)
-        else {
-            continue;
-        };
-        if lanes.len() <= lane as usize {
-            lanes.resize(lane as usize + 1, None);
-        }
-        lanes[lane as usize] = Some(Readout {
-            kind: match read.kind {
-                poem_ir::ReadoutKind::Logits => ReadoutKind::Logits,
-                poem_ir::ReadoutKind::Velocity => ReadoutKind::Velocity,
-                poem_ir::ReadoutKind::Hidden => ReadoutKind::Hidden,
-                poem_ir::ReadoutKind::Pixels => ReadoutKind::Pixels,
-            },
-            width: read.width,
-        });
-    }
-    bind(container, lanes, graph(), caps())
-}
-
-fn graph() -> Graph {
-    Graph {
-        num_layers: 2,
-        mtp_logits: true,
-        mtp_depth: 1,
-        attn_score: true,
-    }
+    let lanes = container
+        .stages
+        .iter()
+        .flat_map(|stage| &stage.ops)
+        .filter_map(|op| match *op {
+            Op::Output { lane, .. } => Some(lane + 1),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(1);
+    let decls = loaded_decls(loaded);
+    bind(container, vec![decls; lanes as usize], caps())
 }
 
 fn caps() -> EngineCaps {

@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple
 
-from .ir import Dtype, Op, Shape, SinkScope, Stage
+from .ir import Dtype, Op, OutputDecl, Shape, Stage
 
 
 class TraceError(Exception):
@@ -57,7 +57,6 @@ class ChannelState:
 @dataclass
 class SinkCall:
     name: str
-    scope: SinkScope
 
 
 class Recorder:
@@ -113,6 +112,7 @@ _next_gid = 1
 # builder for the duration of one build.
 _vocab = 32_000
 _page_size = 16
+_outputs: list[list[OutputDecl]] = []
 
 
 def next_gid() -> int:
@@ -229,18 +229,26 @@ def intern_name(name: str) -> int:
         return len(s.names) - 1
 
 
-def record_sink(name: str, scope: SinkScope) -> None:
-    _rec().sinks.append(SinkCall(name, scope))
+def record_sink(name: str) -> None:
+    _rec().sinks.append(SinkCall(name))
 
 
-def with_constants(vocab: int, page_size: int, f: Callable[[], object]) -> object:
-    global _vocab, _page_size
-    prev = (_vocab, _page_size)
-    _vocab, _page_size = vocab, page_size
+def with_constants(
+    vocab: int, page_size: int, outputs: list[list[OutputDecl]], f: Callable[[], object]
+) -> object:
+    global _vocab, _page_size, _outputs
+    prev = (_vocab, _page_size, _outputs)
+    _vocab, _page_size, _outputs = vocab, page_size, outputs
     try:
         return f()
     finally:
-        _vocab, _page_size = prev
+        _vocab, _page_size, _outputs = prev
+
+
+def declared_output(lane: int, name: str) -> OutputDecl | None:
+    """Lane `lane`'s output `name`, as the model declares it."""
+    lanes = _outputs[lane] if lane < len(_outputs) else []
+    return next((decl for decl in lanes if decl.name == name), None)
 
 
 def vocab() -> int:

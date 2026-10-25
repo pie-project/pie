@@ -138,7 +138,7 @@ fn replaying(at: u32, fold: u32, replay: u32) -> RsVerb {
 }
 
 fn fire(shell: &mut Shell, lanes: &[Seated<'_>]) -> engine_cuda::Result<Vec<Vec<f32>>> {
-    shell.fire_media(lanes, &[], &[], &mut Vec::new())
+    shell.fire_media(lanes, &[], &[])
 }
 
 fn seated<'a>(slot: u32, tokens: &'a [u32], rs: RsVerb, reset: RsReset) -> Seated<'a> {

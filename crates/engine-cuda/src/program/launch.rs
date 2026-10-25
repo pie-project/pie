@@ -3,8 +3,8 @@ use eta_compiler::codegen::launch::{LaunchRegion, LaunchStagePlan};
 use eta_compiler::plan::{LibraryOp, RegionKind};
 use eta_exec::{
     Extents, LANE_HEADER_BYTES, LANE_RECORD_BYTES, LaneChannelSlot, LaneHeader, LaneRecord,
-    LaneShape, Layout, Lifetime, NO_TICKET, OpParams, OpRuntime, SCRATCH_ALIGN, ValueDesc,
-    describe, layout, layout_reusing,
+    LaneShape, Layout, Lifetime, NO_TICKET, OpParams, SCRATCH_ALIGN, ValueDesc, describe, layout,
+    layout_reusing,
 };
 use eta_ir::Dtype;
 use eta_ir::container::HostRole;
@@ -506,7 +506,7 @@ pub struct Prepared {
     intrinsic_widths_host: Vec<u32>,
     intrinsic_strides_host: Vec<u32>,
     intrinsic_offsets_host: Vec<u32>,
-    /// The side-table slots a lane binds ([`eta_ir::op::intrinsic_pitch`]).
+    /// The side-table slots a lane binds ([`eta_ir::op::output_pitch`]).
     pitch: usize,
     channel_count: u32,
     value_count: u32,
@@ -898,8 +898,7 @@ impl Prepared {
         let mut records = Vec::with_capacity(plan.ops.len());
         let mut result_base = 0u32;
         for op in &plan.ops {
-            let mut record =
-                CudaOpParams::widen(OpParams::of(op, result_base, OpRuntime::default()));
+            let mut record = CudaOpParams::widen(OpParams::of(op, result_base, plan.output_slots));
             if let (true, Some(channel)) = (op.tag == tags::CHAN_PUT, op.channel) {
                 let dense = plan
                     .channel_bindings
@@ -963,7 +962,7 @@ impl Prepared {
             intrinsic_widths_host: Vec::new(),
             intrinsic_strides_host: Vec::new(),
             intrinsic_offsets_host: Vec::new(),
-            pitch: plan.intrinsic_pitch as usize,
+            pitch: plan.output_pitch as usize,
             channel_count,
             value_count,
             scratch_stride,

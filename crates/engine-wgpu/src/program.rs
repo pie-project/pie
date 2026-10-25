@@ -81,13 +81,10 @@ pub(crate) struct Half {
 
 #[cfg(feature = "wgpu")]
 pub(crate) struct Pass<'a> {
-    pub logits: Option<&'a [f32]>,
-    pub rows: u32,
-    pub vocab: u32,
-    pub mtp_logits: Option<&'a [f32]>,
-    pub mtp_width: u32,
+    /// What the host read back, by output name and lane.
+    pub outputs: Vec<(String, u32, eta_exec::Value)>,
     pub readout: Option<crate::guest::run::Readout<'a>>,
-    /// The pass's own `velocity(k)` / `hidden(k)` readouts, lane `k` at `k`.
+    /// The pass's row and voxel outputs, lane `k` at `k`.
     pub lanes: Vec<Option<crate::guest::run::Readout<'a>>>,
     pub pixels: Vec<Option<crate::guest::run::Readout<'a>>>,
     pub at: Stage,
@@ -103,31 +100,8 @@ impl Half {
         pass: Pass<'_>,
     ) -> Result<(), Refusal> {
         let instance = self.id;
-        if self.plan.needs_logits && pass.readout.is_none() {
-            return Err(Refusal::Program(format!(
-                "instance {instance} reads logits, but its lane offered no readout seat"
-            )));
-        }
-        if let Some(values) = pass.mtp_logits
-            && pass.mtp_width != pass.vocab
-        {
-            return Err(Refusal::Program(format!(
-                "instance {instance} reads a draft column {} wide against a \
-                 {}-wide trunk readout ({} draft values); this shell reads both at \
-                 one pitch",
-                pass.mtp_width,
-                pass.vocab,
-                values.len()
-            )));
-        }
         let inputs = PassInputs {
-            logits: pass.logits,
-            mtp_logits: pass.mtp_logits,
-            rows: pass.rows,
-            vocab: pass.vocab,
-
-            mtp_draft_row: pass.mtp_logits.map(|_| 0),
-            attn_score: None,
+            outputs: &pass.outputs,
         };
         let mut runner =
             crate::guest::run::OnDevice::new(device, &mut self.session, widen, pass.readout)
@@ -230,6 +204,7 @@ pub struct Guests {
     widen: Arc<crate::guest::widen::Widen>,
     tally: Arc<Tally>,
     policies: Vec<engine::fire::Readout>,
+    names: crate::serve::OutputNames,
     attached: Vec<Attached>,
 }
 
@@ -261,6 +236,7 @@ impl Guests {
             widen,
             tally,
             policies,
+            names,
             attached,
         } = self;
         let mut readouts: Vec<Option<engine::fire::LaneReadout>> =
@@ -319,16 +295,19 @@ impl Guests {
                     let device = device.clone();
                     let widen = Arc::clone(&widen);
                     let tally = Arc::clone(&tally);
+                    let names = names.clone();
                     let job: Job = Box::new(move || {
                         let _held = held;
-                        let (logits, rows, vocab) = match &readout {
-                            Some(lane) if lane.rows > 0 => {
-                                (Some(lane.values.as_slice()), lane.rows, lane.width)
+                        let mut outputs: Vec<(String, u32, eta_exec::Value)> = Vec::new();
+                        if let Some(lane) = readout.filter(|lane| lane.rows > 0) {
+                            outputs.push((names.out.clone(), 0, eta_exec::Value::F32(lane.values)));
+                            if let Some(values) = mtp {
+                                outputs.push((names.mtp.clone(), 0, eta_exec::Value::F32(values)));
                             }
-                            _ => (None, 0, 0),
-                        };
+                        }
                         let readout =
                             on_device.map(|(at, width, f32)| crate::guest::run::Readout {
+                                output: &names.out,
                                 seat: &seat,
                                 at,
                                 width,
@@ -339,16 +318,16 @@ impl Guests {
                             &widen,
                             &tally,
                             Pass {
-                                logits,
-                                rows,
-                                vocab,
-                                mtp_logits: mtp.as_deref(),
-                                mtp_width,
+                                outputs,
                                 readout,
                                 lanes: entries
                                     .iter()
                                     .map(|entry| {
                                         (entry.rows > 0).then_some(crate::guest::run::Readout {
+                                            output: names
+                                                .planes
+                                                .get(entry.plane as usize)
+                                                .map_or("", String::as_str),
                                             seat: &seat,
                                             at: entry.at,
                                             width: entry.values(),
@@ -362,6 +341,7 @@ impl Guests {
                                         let (plane, spans) = pixels.as_ref()?;
                                         let &(at, width) = spans.get(lane)?;
                                         (width > 0).then_some(crate::guest::run::Readout {
+                                            output: &names.pixels,
                                             seat: plane,
                                             at,
                                             width,
@@ -946,11 +926,7 @@ impl Plane {
             widen,
             &self.tally,
             Pass {
-                logits: None,
-                rows: 0,
-                vocab: 0,
-                mtp_logits: None,
-                mtp_width: 0,
+                outputs: Vec::new(),
                 readout: None,
                 lanes: Vec::new(),
                 pixels: Vec::new(),
@@ -965,6 +941,7 @@ impl Plane {
         device: &crate::device::Context,
         attachments: impl IntoIterator<Item = (InstanceId, u32)>,
         policies: Vec<engine::fire::Readout>,
+        names: crate::serve::OutputNames,
     ) -> Result<Guests, Refusal> {
         let mut attached = Vec::new();
         for (instance, lane) in attachments {
@@ -989,6 +966,7 @@ impl Plane {
             widen: Arc::clone(widen),
             tally: Arc::clone(&self.tally),
             policies,
+            names,
             attached,
         })
     }
@@ -1068,34 +1046,13 @@ impl Plane {
     pub fn fire_interpreted(
         &mut self,
         instance: InstanceId,
-        logits: Option<&[f32]>,
-        rows: u32,
-        vocab: u32,
-        mtp_logits: Option<&[f32]>,
-        mtp_width: u32,
+        outputs: &[(String, u32, eta_exec::Value)],
     ) -> Result<(), Refusal> {
         let seat = self.instances.get_mut(&instance).ok_or(Refusal::Closed {
             what: "instance",
             id: instance.0,
         })?;
-        if let Some(values) = mtp_logits
-            && mtp_width != vocab
-        {
-            return Err(Refusal::Program(format!(
-                "instance {instance} reads a draft column {mtp_width} wide against a \
-                 {vocab}-wide trunk readout ({} draft values); this shell reads both at \
-                 one pitch",
-                values.len()
-            )));
-        }
-        let inputs = PassInputs {
-            logits,
-            mtp_logits,
-            rows,
-            vocab,
-            mtp_draft_row: mtp_logits.map(|_| 0),
-            attn_score: None,
-        };
+        let inputs = PassInputs { outputs };
         let outcome = eta_exec::step(&mut seat.inst, &seat.plan, &inputs);
         self.tally.interpreted.fetch_add(1, Ordering::AcqRel);
         let program = seat.program;

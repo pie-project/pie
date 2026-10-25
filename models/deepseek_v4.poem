@@ -1527,7 +1527,7 @@ def forward(m, inputs):
         draft(m, rows, streams, logits)
     if ds != None:
         logits = dspark_readout(m, inputs, logits, ends)
-    return logits
+    output("logits", logits)
 
 def dspark_keys(m, rows, taps):
     """Each DSpark stage's window keys at the trunk's rows: its key
@@ -1591,8 +1591,8 @@ def dspark_readout(m, inputs, logits, ends):
     read = lambda x: ops.gather.gather_rows(x, inputs.readout_rows()).on(drafting)
     biased, picks = ops.sampling.markov_walk(logits.on(drafting), read(inputs.tokens()), read(inputs.positions()),
                                          read(ends), ds.markov_embed, ds.markov_head, ds.block)
-    seam.at(seam.MTP, [biased])
-    seam.at(seam.MTP_DRAFTS, [picks])
+    output("mtp.logits", biased)
+    output("mtp.drafts", picks)
     return merge([biased, logits.on(~drafting)])
 
 def draft(m, rows, streams, logits):
@@ -1628,8 +1628,8 @@ def draft(m, rows, streams, logits):
     out, _ = layer(m, draft_rows, mtp.block, fused, NO_TRAIL)
     y = ops.elemwise.rmsnorm(collapse(out, mtp.hc_head, hy), mtp.norm, mtp.norm_eps)
     proposal = ops.linear.lm_head(y, m.head)
-    seam.at(seam.MTP, [proposal])
-    seam.at(seam.MTP_DRAFTS, [ops.sampling.argmax([proposal])])
+    output("mtp.logits", proposal)
+    output("mtp.drafts", ops.sampling.argmax([proposal]))
 
 def rope(x, pos, rope_dim, head_dim, theta, scaling, inverse = False):
     if scaling != None:
@@ -1692,7 +1692,6 @@ def layer(m, rows, w, streams, trail, following = None, narrow = False, replays 
     if at.q_head_norm:
         q = ops.elemwise.rmsnorm_no_scale(q, m.head_dim, at.q_norm_eps)
     q = rope(q, pos, at.rope_dim, m.head_dim, at.theta, at.yarn)
-    seam.at(seam.ATTN_Q, [q])
 
     plane = ops.linear.matmul(x, at.kv_down)
     plane = ops.elemwise.rmsnorm(plane, at.kv_norm, at.kv_norm_eps)
@@ -1775,7 +1774,6 @@ def layer(m, rows, w, streams, trail, following = None, narrow = False, replays 
     if at.window_sink == None:
         o = ops.attn.sink(o, lse, at.sink, m.head_dim)
     o = rope(o, pos, at.rope_dim, m.head_dim, at.theta, at.yarn, inverse = True)
-    seam.at(seam.ATTN_OUT, [o])
 
     if at.o_groups > 1:
         routes = ops.linear.group_routes(o, at.o_groups)

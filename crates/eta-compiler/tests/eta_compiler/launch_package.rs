@@ -89,12 +89,6 @@ fn every_plan_the_engine_receives_is_well_formed() {
                     "{id}: an unbound channel slot reached the engine"
                 );
             }
-            if plan.needs.mtp_rows {
-                assert!(
-                    plan.mtp_rows > 0,
-                    "{id}: asks the engine for MTP rows and then names zero of them"
-                );
-            }
         }
     }
     assert!(

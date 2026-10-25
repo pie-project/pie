@@ -3,7 +3,7 @@ use poem_exec::fire::{Fault, FireDescriptor, Lane, compose_axes};
 use poem_ir::ops::Elemwise;
 use poem_ir::{
     CacheRow, Def, Dim, Dtype, Guard, GuestInput, InputAxis, Node, Platform, RowAxis, RuntimeInput,
-    Seam, Trace, Ty, ValueDecl, ValueId,
+    Trace, Ty, ValueDecl, ValueId,
 };
 use poem_ir::{NormAxis, NormWeight};
 
@@ -43,7 +43,7 @@ impl Build {
                 }],
                 values: Vec::new(),
                 nodes: Vec::new(),
-                seams: Vec::new(),
+                outputs: Vec::new(),
                 drafter: None,
                 inputs: Vec::new(),
             },
@@ -92,17 +92,19 @@ fn trunk_and_decoder() -> Trace {
     );
     let seeded = b.op(tokens, act(), Guard::Always);
     let y = b.op(seeded, act(), Guard::Always);
-    b.trace.seams.push(Seam {
-        seam: "out".to_string(),
-        values: vec![y],
+    b.trace.outputs.push(poem_ir::Output {
+        name: "logits".to_string(),
+        value: y,
         layer: None,
+        grid: None,
     });
     let h = b.op(latent, voxel(Dim::Voxels), Guard::Fact(0));
     let pixels = b.op(h, voxel(Dim::VoxelsTimes(4)), Guard::Fact(0));
-    b.trace.seams.push(Seam {
-        seam: "pixels".to_string(),
-        values: vec![pixels],
+    b.trace.outputs.push(poem_ir::Output {
+        name: "pixels".to_string(),
+        value: pixels,
         layer: None,
+        grid: None,
     });
     b.trace
 }

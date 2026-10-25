@@ -1,5 +1,5 @@
 //! The `kernel.ssm.gdn_out_bf16` rewrite: a chunked gated delta walk whose only
-//! reader is a gated norm (the gate not its own output, no seam holding it)
+//! reader is a gated norm (the gate not its own output, no output holding it)
 //! lands that output in bf16. Every other walk keeps f32.
 
 use poem_ir::{Dtype, Elemwise, Operands, Operation, Ssm, Trace, Ty};
@@ -26,8 +26,8 @@ pub fn gdn_out_bf16(mut trace: Trace, on: bool) -> Trace {
         }
     }
     let mut held = vec![false; trace.values.len()];
-    for seam in &trace.seams {
-        for v in &seam.values {
+    for output in &trace.outputs {
+        for v in output.values() {
             held[v.0 as usize] = true;
         }
     }

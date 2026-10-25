@@ -148,7 +148,7 @@ fn a_tapped_fire_reads_each_layer_out_as_the_pool_holds_it() {
         ..Seated::of(lane)
     };
     shell
-        .fire_media(&[seated], &[], &[], &mut Vec::new())
+        .fire_media(&[seated], &[], &[])
         .expect("the tapped prefill fires");
 
     let started = std::time::Instant::now();

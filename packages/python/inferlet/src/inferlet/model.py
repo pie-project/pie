@@ -23,8 +23,7 @@ from wit_world.imports import model as _model
 InputAxis = _model.InputAxis
 InputDecl = _model.InputDecl
 LaneDecl = _model.LaneDecl
-Readout = _model.Readout
-ReadoutKind = _model.ReadoutKind
+OutputDecl = _model.OutputDecl
 RowCount = _model.RowCount
 RowCount_Exact = _model.RowCount_Exact
 RowCount_Multiple = _model.RowCount_Multiple
@@ -55,11 +54,6 @@ def architecture() -> str:
 def default_system_speculation() -> bool:
     """Whether greedy generation should use the system drafter by default."""
     return _model.default_system_speculation()
-
-
-def mtp_depth() -> int:
-    """The draft head's chain depth; 0 for a model with no draft head."""
-    return _model.mtp_depth()
 
 
 def submit_deadline_us() -> int:
@@ -107,11 +101,6 @@ def channel_capacity() -> int:
     run-ahead. Read it per run — unlike :func:`frame_size` it is not
     promised static."""
     return _model.channel_capacity()
-
-
-def max_readout_rows(kind: ReadoutKind) -> int:
-    """The most rows one pass may read out through `kind`; the pass itself may be any length."""
-    return _model.max_readout_rows(kind)
 
 
 def rs_state_size() -> int:

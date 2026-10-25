@@ -281,6 +281,10 @@ pub(super) fn rule(op: &Operation) -> Rule {
     if let Operation::Attn(Attn::Prefill { .. }) = op {
         return Rule::Heads(Heads::of(&["q", "bias"], &[KV_HEADS]).cache(Cache::SplitOrWhole));
     }
+    // Each rank captures its query heads' runs, a band of the row.
+    if let Operation::Attn(Attn::ScoreCapture { .. }) = op {
+        return Rule::Heads(Heads::of(&["q"], &[KV_HEADS]).cache(Cache::SplitOrWhole));
+    }
     let name = op.name();
     match name {
         "linear.moe_sigmoid_gate_add" => Rule::Linear {

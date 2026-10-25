@@ -40,12 +40,6 @@ struct Input {
     return_text: bool,
     #[serde(default)]
     wait_for_start: bool,
-    /// Attach a per-attention-layer `on_attn` counter tap to the decode pass
-    /// (a genuine hook program, numerics untouched) and return the final
-    /// count — layers-that-fired x fires. On hybrid models this is the direct
-    /// probe that the engine executes hook stages on attention layers only.
-    #[serde(default)]
-    hook_fold: bool,
     #[serde(default)]
     batch_concurrency: Option<usize>,
     /// Report first-token and inter-token timing: send a `t0` session
@@ -119,10 +113,6 @@ struct Output {
     /// reserve, build_submit] (report_timing only) — locates pre-bind time.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     prologue_us: Vec<u64>,
-    /// Final `on_attn` tap count (hook_fold only): attention-layer stage
-    /// executions summed over every settled decode fire.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    hook_fold_final: Option<u32>,
 }
 
 /// In-graph sample from `logits`: argmax at `temperature <= 0`, otherwise
@@ -160,7 +150,6 @@ struct RunResult {
     intertoken_us: Vec<u32>,
     token_monotonic_ns: Vec<u64>,
     prologue_us: Vec<u64>,
-    hook_fold_final: Option<u32>,
 }
 
 async fn run_one(
@@ -251,19 +240,6 @@ async fn run_one(
     let out = Channel::new([1], dtype::i32)
         .capacity(out_capacity as u32)
         .named("out");
-    // The tap's running count lives in a stage-only ring (`acc` —
-    // SPSC forbids a host take on a stage-taken channel), so the
-    // epilogue mirrors it into a host-Reader channel drained once
-    // per fire alongside `out`.
-    let hook_fold_chans = input.hook_fold.then(|| {
-        (
-            Channel::from([0u32]).named("hook_fold_acc"),
-            Channel::new([1], dtype::u32)
-                .capacity(out_capacity as u32)
-                .named("hook_fold_out"),
-        )
-    });
-
     let pipe = Pipeline::new();
 
     let fwd_p = ForwardPass::new();
@@ -274,7 +250,13 @@ async fn run_one(
     fwd_p.checkpoints(&checkpoints)?;
     fwd_p.epilogue(move || {
         let t = reshape(
-            sample(intrinsics::logits(), vocab, temperature, top_p, prefill_rng),
+            sample(
+                intrinsics::output(0, "logits"),
+                vocab,
+                temperature,
+                top_p,
+                prefill_rng,
+            ),
             [1],
         );
         if let Some(tok_in) = tok_in {
@@ -292,28 +274,19 @@ async fn run_one(
             fwd.embed(&tok_in, &embed_indptr)?;
             fwd.state(&[ws_ref], StateGeometry::folding())
                 .context("bind decode state")?;
-            if let Some((acc, _)) = hook_fold_chans {
-                // Take/put per attention layer: the fold keeps the stage
-                // classifiable (a publish-only body reads as Unknown) and
-                // the running count is the evidence the stage EXECUTED —
-                // attention layers x fires.
-                fwd.on_attn(move || {
-                    let prev = acc.take();
-                    acc.put(&prev + 1u32);
-                });
-            }
             fwd.epilogue(move || {
                 let t = reshape(
-                    sample(intrinsics::logits(), vocab, temperature, top_p, sampled_rng),
+                    sample(
+                        intrinsics::output(0, "logits"),
+                        vocab,
+                        temperature,
+                        top_p,
+                        sampled_rng,
+                    ),
                     [1],
                 );
                 tok_in.put(&t);
                 out.put(&t);
-                if let Some((acc, fold_out)) = hook_fold_chans {
-                    let count = acc.take();
-                    acc.put(&count);
-                    fold_out.put(&count);
-                }
             });
             Some(fwd)
         } else {
@@ -380,9 +353,10 @@ async fn run_one(
     }
     // The device arm stages its decode window now, with the first token out.
     if build_decode.is_none()
-        && let Some(fwd) = fwd_d.as_ref() {
-            submitted = submit_ahead(fwd, submitted, 0)?;
-        }
+        && let Some(fwd) = fwd_d.as_ref()
+    {
+        submitted = submit_ahead(fwd, submitted, 0)?;
+    }
     if let Some(build_decode) = build_decode.take() {
         fwd_d = build_decode(Channel::from([g0]).named("tok_in"))?;
         if let Some(fwd) = fwd_d.as_ref() {
@@ -414,12 +388,8 @@ async fn run_one(
         closed = true;
     }
     let mut taken = 0usize;
-    let mut hook_fold_final: Option<u32> = None;
     while taken < submitted {
         let t = out.take_host::<Vec<i32>>().await?;
-        if let Some((_, fold_out)) = hook_fold_chans {
-            hook_fold_final = Some(fold_out.take_host::<u32>().await.context("fold drain")?);
-        }
         taken += 1;
         let Some(&t0) = t.first() else {
             return Err("out.take: empty tensor".into());
@@ -476,7 +446,6 @@ async fn run_one(
         intertoken_us,
         token_monotonic_ns,
         prologue_us,
-        hook_fold_final,
     })
 }
 
@@ -585,7 +554,6 @@ async fn main(input: Input) -> Result<Output> {
             intertoken_us: Vec::new(),
             token_monotonic_ns: Vec::new(),
             prologue_us: Vec::new(),
-            hook_fold_final: None,
         });
     }
 
@@ -616,6 +584,5 @@ async fn main(input: Input) -> Result<Output> {
         intertoken_us: result.intertoken_us,
         token_monotonic_ns: result.token_monotonic_ns,
         prologue_us: result.prologue_us,
-        hook_fold_final: result.hook_fold_final,
     })
 }

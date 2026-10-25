@@ -17,9 +17,7 @@ export const modelStub = {
   kvPageSize: () => 16,
   frameSize: () => 1,
   channelCapacity: () => 8,
-  maxReadoutRows: (kind: string) => (kind === 'logits' ? 256 : 2048),
   rsStateSize: () => 4096n,
-  mtpDepth: () => 0,
   submitDeadlineUs: () => 50_000n,
   runAheadWindow: () => 4,
   draftBlock: () => undefined,
@@ -30,7 +28,7 @@ export const modelStub = {
       : [],
     state: true,
     embeds: true,
-    readout: { kind: 'logits', width: 151936 },
+    outputs: [{ name: 'logits', axis: 'row', width: 151936, dtype: 'f32', layers: 0, maxRows: 256, readout: true }],
   }),
 };
 

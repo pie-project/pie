@@ -405,9 +405,18 @@ pub struct Plane {
 
     /// Guest passes whose last stage is still on the device.
     flights: Arc<Flights>,
+
+    /// The outputs the readout and the draft head's rows are, by name.
+    readouts: (Option<String>, Option<String>),
 }
 
 impl Plane {
+    /// Names the outputs a program reads as the readout and the draft
+    /// head's rows.
+    pub fn set_readouts(&mut self, readouts: (Option<String>, Option<String>)) {
+        self.readouts = readouts;
+    }
+
     pub fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
         let plan = eta_exec::adopt_launch_package(registration.launch.clone())
             .map_err(|error| Refusal::Program(error.to_string()))?;
@@ -997,16 +1006,8 @@ impl Plane {
                 carried_of.insert(c.key, c.carried.clone());
             }
             let binds = seat.plan.package.values.iter().all(|v| {
-                v.source != eta_compiler::codegen::launch::ValueOrigin::Intrinsic
-                    || match v.intrinsic {
-                        Some(eta_ir::op::IntrinsicId::Logits) => {
-                            kept.is_some_and(|k| k.f32) && at.is_some()
-                        }
-                        Some(
-                            eta_ir::op::IntrinsicId::MtpLogits | eta_ir::op::IntrinsicId::MtpDrafts,
-                        ) => kept.is_some_and(|k| k.f32 && k.mtp.is_some()) && at.is_some(),
-                        _ => false,
-                    }
+                v.source != eta_compiler::codegen::launch::ValueOrigin::Output
+                    || v.dtype == eta_ir::Dtype::F32 && kept.is_some_and(|k| k.f32) && at.is_some()
             });
             plans.push(match form {
                 Some(key) if binds => Some((Arc::clone(&seat.plan), key, at)),
@@ -1228,7 +1229,7 @@ impl Plane {
         &mut self,
         instance: InstanceId,
         logits: Option<&[f32]>,
-        rows: u32,
+        _rows: u32,
         vocab: u32,
         mtp_logits: Option<&[f32]>,
         mtp_width: u32,
@@ -1248,14 +1249,24 @@ impl Plane {
                 values.len()
             )));
         }
-        let inputs = PassInputs {
-            logits,
-            mtp_logits,
-            rows,
-            vocab,
-            mtp_draft_row: mtp_logits.map(|_| 0),
-            attn_score: None,
-        };
+        let read = |values: Option<&[f32]>| values.map(|v| Value::F32(v.to_vec()));
+        let outputs: Vec<(String, u32, Value)> = seat
+            .plan
+            .outputs()
+            .into_iter()
+            .filter(|(_, lane)| *lane == 0)
+            .filter_map(|(name, lane)| {
+                let value = if Some(name) == self.readouts.0.as_deref() {
+                    read(logits)
+                } else if Some(name) == self.readouts.1.as_deref() {
+                    read(mtp_logits)
+                } else {
+                    None
+                }?;
+                Some((name.to_string(), lane, value))
+            })
+            .collect();
+        let inputs = PassInputs { outputs: &outputs };
         let outcome =
             eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut Interpreted, at);
         self.tally.interpreted.fetch_add(1, Ordering::AcqRel);

@@ -48,7 +48,7 @@ pub use lane::{
 };
 pub use meta::{Malformed, channel_effects};
 pub use op::eval_op;
-pub use params::{OpParams, Runtime as OpRuntime};
+pub use params::OpParams;
 pub use plan::{Boundaries, ExecPlan, StagePlan, adopt_launch_package, adopt_launch_package_with};
 pub use readiness::{NO_TICKET, Readiness, Ticket, Words, check};
 pub use registry::{

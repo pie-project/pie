@@ -214,7 +214,8 @@ pub struct Lane {
     pub reads_state: bool,
     /// Some class it lands in reads `tokens`: it binds `embed`.
     pub embeds: bool,
-    pub readout: Option<poem_ir::Readout>,
+    /// The outputs some class it lands in writes.
+    pub outputs: Vec<poem_ir::OutputDecl>,
     /// The patch its token grid reads: its voxels attend as one token row a patch.
     pub patch: Option<[u32; 3]>,
 }
@@ -237,12 +238,9 @@ impl RsCaps {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EtaCaps {
-    pub has_mtp_logits: bool,
-    pub mtp_depth: u32,
     pub draft_block: u32,
     pub draft_mask_token: u32,
     pub draft_proposals_from: u32,
-    pub has_attn_score: bool,
     pub has_attn_page_mask: bool,
     pub has_lora: bool,
     pub adapter_attachments: bool,
@@ -403,18 +401,55 @@ impl Model {
             .iter()
             .filter_map(|&word| self.classes.of(word))
             .collect();
-        let readouts = || landed.iter().filter_map(|class| class.readout);
+        let mut outputs: Vec<poem_ir::OutputDecl> = Vec::new();
+        for decl in landed.iter().flat_map(|class| &class.outputs) {
+            if !outputs.iter().any(|seen| seen.name == decl.name) {
+                outputs.push(decl.clone());
+            }
+        }
         Ok(Lane {
             switches: switches.to_vec(),
             inputs,
             reads_kv: landed.iter().any(|class| class.reads_kv),
             reads_state: landed.iter().any(|class| class.reads_state),
             embeds: landed.iter().any(|class| class.embeds),
-            readout: readouts()
-                .find(|readout| readout.kind != poem_ir::ReadoutKind::Logits)
-                .or_else(|| readouts().next()),
+            outputs,
             patch: landed.iter().find_map(|class| class.patch),
         })
+    }
+
+    /// What reading output `name` asks of a fire: the runtime switches every
+    /// class writing it has on, which the reading lane's word then carries.
+    #[must_use]
+    pub fn output_switches(&self, name: &str) -> Vec<poem_ir::Builtin> {
+        let writers: Vec<&poem_ir::LaneClass> = self
+            .classes
+            .classes
+            .iter()
+            .filter(|class| class.outputs.iter().any(|decl| decl.name == name))
+            .collect();
+        [poem_ir::Builtin::Drafts, poem_ir::Builtin::Scores]
+            .into_iter()
+            .filter(|&builtin| {
+                !writers.is_empty()
+                    && writers.iter().all(|class| {
+                        class
+                            .words
+                            .iter()
+                            .all(|&word| self.facts.holds(word, builtin))
+                    })
+            })
+            .collect()
+    }
+
+    /// Output `name` as the classes writing it declare it.
+    #[must_use]
+    pub fn output(&self, name: &str) -> Option<&poem_ir::OutputDecl> {
+        self.classes
+            .classes
+            .iter()
+            .flat_map(|class| &class.outputs)
+            .find(|decl| decl.name == name)
     }
 
     pub fn generative(&self) -> Option<&poem::generative::Generative> {

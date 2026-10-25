@@ -117,10 +117,11 @@ pub struct Cerebras {
 struct StepSettle {
     kept: Option<std::sync::Arc<crate::readout::Kept>>,
     pixels: Vec<crate::serve::Pixels>,
-    scores: Vec<Vec<engine::fire::LayerScores>>,
     on_device: Vec<bool>,
     policies: Vec<Readout>,
-    seam: engine::fire::ReadoutSeam,
+    seam: crate::serve::Readback,
+    /// The outputs a lane's rows and its pixels are read back under.
+    names: (String, String),
 }
 
 /// `PIE_CEREBRAS_SYNC=1`: every frame settles inside `submit`.
@@ -215,7 +216,6 @@ pub(crate) fn fault(fault: Fault) -> Error {
         | Fault::Positions { .. }
         | Fault::Adapterless { .. }
         | Fault::Scoreless { .. }
-        | Fault::ScoreWord { .. }
         | Fault::Fire(_) => Error::Invalid(fault.to_string()),
         Fault::AdapterSlots { .. } => Error::Exhausted {
             resource: "adapter slots",
@@ -428,16 +428,12 @@ impl Engine for Cerebras {
                     &budgets,
                 )))
                 .unwrap_or(u32::MAX),
-                max_scoring_lanes: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,
-            has_mtp_logits: shell.mtp_width().is_some(),
-            mtp_depth: 0,
             draft_block: drafter.map_or(0, |d| d.rows),
             draft_mask_token: drafter.map_or(0, |d| d.mask_token),
             draft_proposals_from: drafter.map_or(1, |d| d.proposals_from),
-            has_attn_score: shell.observes_scores(),
             ports: PortMask::DEVICE_GEOMETRY
                 .with(eta_ir::registry::Port::AttnMask)
                 .with(eta_ir::registry::Port::Fold),
@@ -459,6 +455,7 @@ impl Engine for Cerebras {
             inputs: shell.input_decls(),
             classes: shell.classes(),
         };
+        self.programs.set_readouts(shell.readout_names());
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
         Ok(Loaded {
@@ -1187,7 +1184,6 @@ impl Cerebras {
                 },
                 rs_reset: lane.rs_reset,
                 rs_slot: lane.rs_slot,
-                captures_scores: lane.captures_scores,
                 rs: &verbs[at],
                 media: media_of[at],
                 inputs: &input_cells[at],
@@ -1224,6 +1220,7 @@ impl Cerebras {
         shell.feed_tokens(token_feeds);
         let fired = shell.fire_kept_with(&seated, &clips).map_err(fault)?;
         let seam = shell.readout_seam();
+        let names = shell.readback_names();
         let vocab = shell.out_width();
         let mtp_width = shell.mtp_width().unwrap_or(0);
         let kept = fired.kept.clone();
@@ -1263,10 +1260,10 @@ impl Cerebras {
         let settle = StepSettle {
             kept,
             pixels: fired.pixels,
-            scores: fired.scores,
             on_device,
             policies: submission.lanes.iter().map(|l| l.readout.clone()).collect(),
             seam,
+            names,
         };
         Ok((
             FireTicket {
@@ -1284,10 +1281,10 @@ fn readouts_of(settle: &StepSettle) -> EngineResult<Vec<LaneReadout>> {
     let StepSettle {
         kept,
         pixels,
-        scores,
         on_device,
         policies,
         seam,
+        names,
     } = settle;
     let seam = *seam;
     policies
@@ -1304,12 +1301,11 @@ fn readouts_of(settle: &StepSettle) -> EngineResult<Vec<LaneReadout>> {
                     rows: u32::try_from(voxels).unwrap_or(u32::MAX),
                     width: u32::try_from(values.len() / voxels.max(1)).unwrap_or(u32::MAX),
                     values: values.clone(),
-                    scores: scores.get(lane).cloned().unwrap_or_default(),
-                    seam: engine::fire::ReadoutSeam::Pixels,
+                    output: names.1.clone(),
                     clips: boxes.clone(),
                 });
             }
-            if seam == engine::fire::ReadoutSeam::Pixels {
+            if seam == crate::serve::Readback::Pixels {
                 return Ok(LaneReadout::default());
             }
             let count = match policy {
@@ -1319,9 +1315,9 @@ fn readouts_of(settle: &StepSettle) -> EngineResult<Vec<LaneReadout>> {
             };
             // A lane whose guest ran on the device carries its answer in
             // its program's channels; its logits are not copied out. A
-            // velocity or hidden readout is the lane's answer itself.
+            // row output's readout is the lane's answer itself.
             if on_device.get(lane).copied().unwrap_or(false)
-                && seam == engine::fire::ReadoutSeam::Logits
+                && seam == crate::serve::Readback::Readout
             {
                 return Ok(LaneReadout::default());
             }
@@ -1333,8 +1329,7 @@ fn readouts_of(settle: &StepSettle) -> EngineResult<Vec<LaneReadout>> {
                 rows: u32::try_from(count).unwrap_or(u32::MAX),
                 width: u32::try_from(values.len() / count).unwrap_or(u32::MAX),
                 values,
-                scores: scores.get(lane).cloned().unwrap_or_default(),
-                seam,
+                output: names.0.clone(),
                 ..LaneReadout::default()
             })
         })

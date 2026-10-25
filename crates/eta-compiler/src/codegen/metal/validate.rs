@@ -7,7 +7,7 @@ use crate::plan::{
     CompiledStage, Dimension, LibraryOp, PartitionKind, Region, RegionKind, RegionPartition,
     ScheduleTemplate,
 };
-use eta_ir::op::{intrinsic_tags, tags};
+use eta_ir::op::tags;
 use eta_ir::types::Dtype;
 
 use super::M1OpMeta;
@@ -24,38 +24,16 @@ pub(crate) fn is_library(region: &Region) -> bool {
     matches!(region.kind, RegionKind::Library(_))
 }
 
-pub fn metal_intrinsic_supported(intr: u16) -> bool {
-    matches!(
-        intr,
-        intrinsic_tags::LOGITS
-            | intrinsic_tags::VELOCITY
-            | intrinsic_tags::HIDDEN
-            | intrinsic_tags::MTP_LOGITS
-            | intrinsic_tags::MTP_DRAFTS
-            | intrinsic_tags::ATTN_SCORE
-            | intrinsic_tags::PIXELS
-    )
-}
-
-pub fn intrinsics_bindable(ops: &[OpView], region: &Region) -> Result<(), EmitError> {
-    unbindable_intrinsic(ops, region, metal_intrinsic_supported)
-}
-
-pub fn grouped_intrinsics_bindable(ops: &[OpView], region: &Region) -> Result<(), EmitError> {
-    unbindable_intrinsic(ops, region, super::intrinsics::m3_intrinsic_bindable)
-}
-
-fn unbindable_intrinsic(
-    ops: &[OpView],
-    region: &Region,
-    bindable: fn(u16) -> bool,
-) -> Result<(), EmitError> {
+/// Metal reads a float output; an output of ids it has no gather for.
+pub fn outputs_bindable(ops: &[OpView], region: &Region) -> Result<(), EmitError> {
     for &node in &region.nodes {
         let Some(op) = ops.get(node.index()) else {
             continue;
         };
-        if op.tag == tags::INTRINSIC_VAL && !bindable(op.intr) {
-            return Err(EmitError::UnbindableIntrinsic { intrinsic: op.intr });
+        if op.tag == tags::OUTPUT && op.dtype != eta_ir::types::wire_dtype(eta_ir::Dtype::F32) {
+            return Err(EmitError::UnbindableOutput {
+                name_index: op.name_idx,
+            });
         }
     }
     Ok(())
@@ -215,8 +193,13 @@ fn validate_into(stage: &CompiledStage, operations: &mut Vec<M1OpMeta>) -> Resul
             && names.get(op.name_idx as usize).map(String::as_str) != Some("metal.discard")
         {
             return Err(EmitError::UnsupportedSinkBoundary);
-        } else if op.tag == tags::INTRINSIC_VAL && !metal_intrinsic_supported(op.intr) {
-            return Err(EmitError::UnbindableIntrinsic { intrinsic: op.intr });
+        } else if op.tag == tags::OUTPUT
+            && (op.dtype != eta_ir::types::wire_dtype(eta_ir::Dtype::F32)
+                || names.get(op.name_idx as usize).is_none())
+        {
+            return Err(EmitError::UnbindableOutput {
+                name_index: op.name_idx,
+            });
         }
         op_valid(op, result_base, stage)?;
         operations.push(M1OpMeta {

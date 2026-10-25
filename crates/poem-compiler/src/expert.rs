@@ -218,10 +218,10 @@ impl Pass {
                 }
             }
         }
-        for seam in &self.trace.seams {
-            for v in &seam.values {
-                if made.contains(v) && !exits.contains(v) {
-                    exits.push(*v);
+        for output in &self.trace.outputs {
+            for v in output.values() {
+                if made.contains(&v) && !exits.contains(&v) {
+                    exits.push(v);
                 }
             }
         }
@@ -361,8 +361,8 @@ impl Pass {
                     crate::tree::remap(op, &|v| back.get(&v).copied().unwrap_or(v));
             }
         }
-        for seam in &mut self.trace.seams {
-            for v in &mut seam.values {
+        for output in &mut self.trace.outputs {
+            for v in output.values_mut() {
                 if let Some(routed) = back.get(v) {
                     *v = *routed;
                 }

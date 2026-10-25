@@ -42,6 +42,7 @@ pub mod rs;
 pub mod run;
 pub mod scores;
 mod scratch;
+pub mod seam;
 pub mod serve;
 pub mod settle;
 pub mod store;

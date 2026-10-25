@@ -286,12 +286,12 @@ def forward(m, inputs):
         if not w.full:
             q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.full(), k = k)
         ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
-        seam.at(seam.ATTN_Q, [q])
 
-        # Each lane by its kind; a full layer's scores go out at their seam.
-        a = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, window = win,
-                            mask = True, scores = True, scores_seam = w.full)
-        seam.at(seam.ATTN_OUT, [a])
+        # Each lane by its kind; a full layer's scores are read out.
+        a = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, window = win, mask = True)
+        if w.full:
+            scores = ops.attn.score_capture(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048)
+            output("attn.scores", scores)
 
         # Each head normed, then gated, in one pass.
         a = ops.elemwise.rmsnorm_gated(a, gate, None, d, m.norm_eps, "sigmoid")
@@ -308,4 +308,4 @@ def forward(m, inputs):
     first = ops.elemwise.rmsnorm_plus_one(y, m.layers[0].attn_norm, m.norm_eps)
     _, x = inputs.fold_layers(m.layers, (y, first), block)
     x = ops.gather.gather_rows(x, inputs.readout_rows())
-    return ops.attn.logit_softcap(ops.linear.lm_head(x, m.lm_head), m.softcap)
+    output("logits", ops.attn.logit_softcap(ops.linear.lm_head(x, m.lm_head), m.softcap))

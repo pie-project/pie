@@ -5,7 +5,7 @@ use crate::common_two_axis::{
     pixel_epilogue, trace,
 };
 use engine::Engine;
-use engine::fire::{ReadoutSeam, StepVoxels};
+use engine::fire::StepVoxels;
 
 const CLIP: [u32; 3] = [1, 5, 7];
 
@@ -22,8 +22,8 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
     let weights = Weights::random(&trace(), 0x5a);
     let mut rig = Rig::load(&weights, 32, vec![16, 32], voxels() + 8);
     assert!(
-        rig.reads_out(poem_ir::ReadoutKind::Pixels).is_some(),
-        "a plan planting `seam::PIXELS` states the `pixels()` gate"
+        rig.reads_out("pixels").is_some(),
+        "a plan reading out `pixels` states the `pixels()` gate"
     );
 
     let program = rig.register(pixel_epilogue(CLIP, voxels()), 1);
@@ -61,11 +61,7 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
             .settle_frame(&mut ticket)
             .expect("the frame settles");
         let readout = ticket.steps[0].readouts[0].clone();
-        assert_eq!(
-            readout.seam,
-            ReadoutSeam::Pixels,
-            "a VAE lane answers pixels"
-        );
+        assert_eq!(readout.output, "pixels", "a VAE lane answers pixels");
         (readout.values, readout.clips, rig.take(instance, 1))
     };
 

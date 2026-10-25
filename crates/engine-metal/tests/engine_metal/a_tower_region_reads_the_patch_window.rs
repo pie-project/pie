@@ -6,7 +6,7 @@ use poem_exec::fire::{Lane, compose_axes};
 use poem_exec::store::arena::rect;
 use poem_ir::ops::Elemwise;
 use poem_ir::{
-    CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Seam, Trace, Ty, ValueDecl,
+    CacheRow, Def, Dim, Dtype, Guard, Node, Output, Platform, RuntimeInput, Trace, Ty, ValueDecl,
     ValueId,
 };
 use poem_ir::{NormAxis, NormWeight};
@@ -47,7 +47,7 @@ impl Build {
                 }],
                 values: Vec::new(),
                 nodes: Vec::new(),
-                seams: Vec::new(),
+                outputs: Vec::new(),
                 drafter: None,
                 inputs: Vec::new(),
             },
@@ -94,10 +94,11 @@ fn tower_and_trunk() -> Trace {
         act(),
     );
     let y = b.op(o, act(), Guard::Always);
-    b.trace.seams.push(Seam {
-        seam: "out".to_string(),
-        values: vec![y],
+    b.trace.outputs.push(Output {
+        name: "logits".to_string(),
+        value: y,
         layer: None,
+        grid: None,
     });
     b.trace
 }
