@@ -152,7 +152,13 @@ fn load(trace: &Trace, joins: &[Join], unjoined: &Trace, tag: &str) -> (Shell, S
         kv_budget: None,
         memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
         ordinal: 0,
-        knobs: engine_cuda::Knobs::default(),
+        // Eager: what a joined weight answers is the question, not how a
+        // body records it, and capturing every composition of eleven rows
+        // twice was most of this test's time.
+        knobs: engine_cuda::Knobs {
+            chip: Some(engine_cuda::chip::profile("[engine]\ngraphs = \"off\"\n")),
+            ..engine_cuda::Knobs::default()
+        },
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         residency: engine_cuda::experts::Plan::default(),
