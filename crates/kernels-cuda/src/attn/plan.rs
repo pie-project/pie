@@ -698,19 +698,25 @@ mod pinned {
     // handles any thread may use; it is reached only under its lock.
     unsafe impl Send for Ring {}
 
-    /// Every stream's ring, by its handle: each its own lock, so a stage
-    /// waiting out its stream's oldest copy holds back no other stream's.
-    static RINGS: Mutex<BTreeMap<usize, &'static Mutex<Ring>>> = Mutex::new(BTreeMap::new());
+    /// Every stream's ring, by its device and handle (a handle a destroyed
+    /// stream held may name another device's next): each its own lock, so
+    /// a stage waiting out its stream's oldest copy holds back no other
+    /// stream's.
+    static RINGS: Mutex<BTreeMap<(usize, usize), &'static Mutex<Ring>>> =
+        Mutex::new(BTreeMap::new());
 
     /// `f` on `stream`'s ring.
     fn on_ring<R>(
+        op: &'static str,
         stream: rt::cudaStream_t,
         f: impl FnOnce(&mut Ring) -> Result<R, Error>,
     ) -> Result<R, Error> {
+        let device = crate::jit::cache::current_device()
+            .map_err(|fault| refuse(op, format!("staging the plan: {fault}")))?;
         let ring: &'static Mutex<Ring> = RINGS
             .lock()
             .expect("plan rings lock poisoned")
-            .entry(stream as usize)
+            .entry((device, stream as usize))
             .or_insert_with(|| {
                 Box::leak(Box::new(Mutex::new(Ring {
                     slots: Vec::new(),
@@ -738,7 +744,7 @@ mod pinned {
         stream: rt::cudaStream_t,
         bytes: &[u8],
     ) -> Result<*const u8, Error> {
-        on_ring(stream, |ring| {
+        on_ring(op, stream, |ring| {
             let at = ring.next;
             // The slot at `at` is the oldest a copy read; one still queued
             // gets a new slot before it, which keeps it the oldest.
@@ -796,7 +802,7 @@ mod pinned {
 
     /// The slot `stage` handed out is read once `stream` runs to here.
     pub(super) fn sent(op: &'static str, stream: rt::cudaStream_t) -> Result<(), Error> {
-        on_ring(stream, |ring| {
+        on_ring(op, stream, |ring| {
             let at = ring.next;
             ring.next = (at + 1) % ring.slots.len();
             // SAFETY: an event this ring created, on the caller's stream.
