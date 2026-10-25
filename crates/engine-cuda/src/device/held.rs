@@ -359,6 +359,52 @@ pub(crate) mod recycle {
         let _ = unsafe { rt::cudaFree(ptr as *mut core::ffi::c_void) };
     }
 
+    /// Frees every kept buffer whose last reader has landed; the bytes
+    /// given back. A buffer kept is held for the next of its size, and is
+    /// idle until then: at a load, and once a shell is down, nothing is
+    /// served that would ask for it before the driver could hand it out
+    /// again, so the device's word on what is free is the process's own.
+    /// Each free is of memory no frame reads, made where the engine's
+    /// thread already allocates and frees: never mid-step, where a free
+    /// could wait on a peer spinning for this rank.
+    pub(crate) fn trim() -> usize {
+        let idle: Vec<(u64, usize)> = {
+            let mut kept = kept();
+            let Some(map) = kept.as_mut() else {
+                return 0;
+            };
+            let mut idle = Vec::new();
+            for (&(_, bytes), list) in map.iter_mut() {
+                list.retain(|entry| {
+                    let landed = entry.fence.landed();
+                    if landed {
+                        idle.push((entry.ptr, bytes));
+                    }
+                    !landed
+                });
+            }
+            map.retain(|_, list| !list.is_empty());
+            idle
+        };
+        let mut freed = 0;
+        for (ptr, bytes) in idle {
+            HELD.fetch_sub(bytes, Ordering::Relaxed);
+            freed += bytes;
+            // SAFETY: the pointer came from `alloc` and left the shelf
+            // above, so it is freed exactly once; its fence has landed, so
+            // no reader is left.
+            unsafe {
+                let _ = rt::cudaFree(ptr as *mut core::ffi::c_void);
+            }
+        }
+        freed
+    }
+
+    /// The bytes kept now, across every device.
+    pub(crate) fn kept_bytes() -> usize {
+        HELD.load(Ordering::Relaxed)
+    }
+
     /// Frees every kept buffer; whether there was any.
     fn drain() -> bool {
         let Some(map) = kept().take() else {
@@ -376,6 +422,22 @@ pub(crate) mod recycle {
         HELD.store(0, Ordering::Relaxed);
         any
     }
+}
+
+/// Gives the driver back the device memory the process keeps idle
+/// ([`recycle`]'s dropped buffers whose last reader has landed); the bytes
+/// freed. A load calls it before it measures the card, and a shell once it
+/// is down, so a model loaded after another was dropped fits as it would in
+/// a fresh process.
+pub fn release_idle() -> usize {
+    recycle::trim()
+}
+
+/// The device bytes the process keeps from dropped buffers, for the next
+/// of their size ([`recycle`]).
+#[must_use]
+pub fn kept_bytes() -> usize {
+    recycle::kept_bytes()
 }
 
 /// Small memory carved from chunks made ahead and kept: pinned (a channel's

@@ -18,7 +18,7 @@ use crate::store::kv::{self, Paging};
 use crate::store::rs::Buffers;
 use crate::weights::Weights;
 
-use super::{Boot, FireCost, Golden, Graphs, Shell};
+use super::{Boot, FireCost, Golden, Graphs, Released, Shell};
 
 /// The least `max_forward_tokens` is served at when the card is short: one
 /// prefill chunk a frame, which serves, and under it the halving stops.
@@ -994,6 +994,7 @@ impl Shell {
             owed: super::Owed::new(),
             spare_events: Vec::new(),
             rs_ahead: std::collections::HashMap::new(),
+            _released: Released,
         };
         if shell.weights.rotating() && shell.graphs.records() {
             eprintln!(

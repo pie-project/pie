@@ -133,6 +133,23 @@ pub struct Shell {
     /// Where a device-counted fold left each recurrent slot, ahead of the
     /// runtime's settled length until that fold settles.
     rs_ahead: std::collections::HashMap<u32, u32>,
+    /// Last, so it drops after everything else the shell holds.
+    _released: Released,
+}
+
+/// Gives the driver back, once a shell is down, what its dropped buffers
+/// left kept for reuse ([`crate::device::held::release_idle`]): nothing of
+/// the shell will ask for them again, and another process on the card, or a
+/// model loaded next, should find the room free. A shell drops outside any
+/// fire, its device synchronized; a poisoned expert-parallel group, whose
+/// peers may still spin, forgets its ranks rather than dropping them.
+#[derive(Debug, Default)]
+struct Released;
+
+impl Drop for Released {
+    fn drop(&mut self) {
+        crate::device::held::release_idle();
+    }
 }
 
 #[derive(Debug)]

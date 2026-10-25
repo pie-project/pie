@@ -34,6 +34,15 @@ pub mod held {
 
         pub fn give(_key: PoolKey, _held: Held) {}
     }
+
+    pub fn release_idle() -> usize {
+        0
+    }
+
+    #[must_use]
+    pub fn kept_bytes() -> usize {
+        0
+    }
 }
 #[cfg(feature = "rocm")]
 pub mod hip;

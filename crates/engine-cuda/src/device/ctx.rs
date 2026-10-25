@@ -102,6 +102,10 @@ impl Context {
             // the prior calls produced. cudaSetDevice binds this thread.
             unsafe {
                 check("cudaSetDevice", rt::cudaSetDevice(ordinal))?;
+                // What the process keeps idle (an earlier shell's dropped
+                // buffers) goes back first: the load measures the card from
+                // here, and fits as it would in a fresh process.
+                crate::device::held::release_idle();
                 let mut stream: rt::cudaStream_t = core::ptr::null_mut();
                 check("cudaStreamCreate", rt::cudaStreamCreate(&raw mut stream))?;
                 crate::device::held::adopt_stream(ordinal, stream.cast());
