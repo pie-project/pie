@@ -1481,8 +1481,15 @@ impl<'c> Run<'c> {
         ) && self.arena.0.get(id.0 as usize).copied().flatten().is_some()
     }
 
+    /// The fire's clip slot table cut to this window's clips, indexed as the
+    /// window's grids index their lanes.
     pub(crate) fn clip_slots(&self) -> Option<Tensor> {
-        self.fire.voxels.map(|voxels| voxels.slots)
+        let slots = self.fire.voxels.map(|voxels| voxels.slots)?;
+        let seated = self.window();
+        if seated.gathered.is_some() {
+            return Some(slots);
+        }
+        Some(self.slice(slots, seated.voxel.lane_offset, seated.voxel.lanes))
     }
 
     /// `mask`'s bits, or the fire's where a prefill that is not causal states

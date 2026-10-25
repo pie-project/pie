@@ -76,6 +76,7 @@ impl Run<'_> {
                 },
                 *sm_scale,
                 self.tensor(*o),
+                self.grid_base(*grid, *q),
             ),
             Attn::PlanDecode {
                 kv_indptr: _,

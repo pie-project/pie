@@ -1,5 +1,9 @@
 #include "grid.h"
 
+// `x_base` / `y_base`: the rows `grid` and `o_grid` address `x`'s and `y`'s
+// row 0 at. A window of a segmented fire starts its tensors at its own rows
+// while the fire's grids hold fire-wide ones.
+
 
 template <typename T>
 [[kernel]] void upsample_nearest(
@@ -13,19 +17,23 @@ template <typename T>
     const constant uint& fh           [[buffer(7)]],
     const constant uint& fw           [[buffer(8)]],
     const constant uint& keep_first   [[buffer(9)]],
+    const constant uint& x_base       [[buffer(10)]],
+    const constant uint& y_base       [[buffer(11)]],
     uint2 tid                         [[thread_position_in_grid]]) {
   const uint col = tid.x;
   const uint row = tid.y;
   if (col >= channels) return;
   const size_t e = size_t(row) * size_t(channels) + size_t(col);
   SpatialClip og;
-  const int l = clip_of(o_grid, int(clips), int(row), og);
+  const int fire_row = int(row) + int(y_base);
+  const int l = clip_of(o_grid, int(clips), fire_row, og);
   if (l < 0) {
     y[e] = static_cast<T>(0.0f);
     return;
   }
-  const SpatialClip ig = clip_at(grid, l);
-  const SpatialVoxel o = unravel(og, int(row) - og.off);
+  SpatialClip ig = clip_at(grid, l);
+  ig.off -= int(x_base);
+  const SpatialVoxel o = unravel(og, fire_row - og.off);
   const int ti = keep_first != 0
       ? (o.t == 0 ? 0 : (o.t - 1) / int(ft) + 1)
       : o.t / int(ft);
@@ -39,7 +47,8 @@ template <typename T>
       const device itype*, const device int*, device itype*,               \
       const device int*, const constant uint&, const constant uint&,       \
       const constant uint&, const constant uint&, const constant uint&,    \
-      const constant uint&, uint2);
+      const constant uint&, const constant uint&, const constant uint&,    \
+      uint2);
 
 instantiate_upsample(bfloat16, bfloat)
 instantiate_upsample(float32, float)
@@ -156,6 +165,8 @@ template <typename T>
     const constant uint& r2           [[buffer(7)]],
     const constant uint& r3           [[buffer(8)]],
     const constant uint& group        [[buffer(9)]],
+    const constant uint& x_base       [[buffer(10)]],
+    const constant uint& y_base       [[buffer(11)]],
     uint2 tid                         [[thread_position_in_grid]]) {
   const uint r = r1 * r2 * r3;
   const uint c_out = channels * r / group;
@@ -164,13 +175,15 @@ template <typename T>
   if (n >= c_out) return;
   const size_t e = size_t(row) * size_t(c_out) + size_t(n);
   SpatialClip og;
-  const int l = clip_of(o_grid, int(clips), int(row), og);
+  const int fire_row = int(row) + int(y_base);
+  const int l = clip_of(o_grid, int(clips), fire_row, og);
   if (l < 0) {
     y[e] = static_cast<T>(0.0f);
     return;
   }
-  const SpatialClip ig = clip_at(grid, l);
-  const SpatialVoxel o = unravel(og, int(row) - og.off);
+  SpatialClip ig = clip_at(grid, l);
+  ig.off -= int(x_base);
+  const SpatialVoxel o = unravel(og, fire_row - og.off);
   const int pad_t = (int(r1) - ig.t % int(r1)) % int(r1);
   float acc = 0.0f;
   for (uint j = 0; j < group; ++j) {
@@ -194,7 +207,8 @@ template <typename T>
       const device itype*, const device int*, device itype*,               \
       const device int*, const constant uint&, const constant uint&,       \
       const constant uint&, const constant uint&, const constant uint&,    \
-      const constant uint&, uint2);
+      const constant uint&, const constant uint&, const constant uint&,    \
+      uint2);
 
 instantiate_avg_down(bfloat16, bfloat)
 
@@ -250,6 +264,7 @@ template <typename T>
     const constant uint& frames       [[buffer(6)]],
     const constant uint& channels     [[buffer(7)]],
     const constant uint& slot_stride  [[buffer(8)]],
+    const constant uint& x_base       [[buffer(9)]],
     uint2 tid                         [[thread_position_in_grid]]) {
   const uint col = tid.x;
   const uint row = tid.y;
@@ -271,6 +286,7 @@ template <typename T>
     at += rows;
   }
   if (found < 0) return;
+  g.off -= int(x_base);
   const int local_row = int(row) - base;
   const size_t local = size_t(local_row) * size_t(channels) + size_t(col);
   if (local >= size_t(slot_stride)) return;
@@ -306,6 +322,6 @@ instantiate_cache_gather(bfloat16, bfloat)
       const device itype*, const device itype*, const device int*,         \
       const device int*, device itype*, const constant uint&,              \
       const constant uint&, const constant uint&, const constant uint&,    \
-      uint2);
+      const constant uint&, uint2);
 
 instantiate_cache_store(bfloat16, bfloat)

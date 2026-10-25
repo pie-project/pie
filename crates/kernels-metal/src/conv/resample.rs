@@ -11,6 +11,8 @@ fn grid_of(op: &'static str, columns: u32, rows: u32) -> Result<Grid, Error> {
     Ok(Grid::of([columns, rows, 1], [256.min(columns), 1, 1]))
 }
 
+/// `bases` as [`pixel_shuffle`]'s.
+#[allow(clippy::too_many_arguments)]
 pub fn upsample_nearest(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -19,6 +21,7 @@ pub fn upsample_nearest(
     keep_first_frame: bool,
     o_grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.upsample";
     let entry = dtype_dispatch!(OP, y.dtype, {
@@ -48,6 +51,8 @@ pub fn upsample_nearest(
             factor[1].arg(),
             factor[2].arg(),
             u32::from(keep_first_frame).arg(),
+            bases[0].arg(),
+            bases[1].arg(),
         ],
     )
 }
@@ -158,6 +163,8 @@ pub fn pixel_unshuffle(
     )
 }
 
+/// `bases` as [`pixel_shuffle`]'s.
+#[allow(clippy::too_many_arguments)]
 pub fn avg_down(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -166,6 +173,7 @@ pub fn avg_down(
     group: u32,
     o_grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.avg_down";
     if x.dtype != Dtype::Bf16 || y.dtype != Dtype::Bf16 {
@@ -206,6 +214,8 @@ pub fn avg_down(
             factor[1].arg(),
             factor[2].arg(),
             group.arg(),
+            bases[0].arg(),
+            bases[1].arg(),
         ],
     )
 }
@@ -270,6 +280,9 @@ pub fn cache_gather(
     )
 }
 
+/// `x_base`: the row `grid` addresses `x`'s row 0 at, nonzero in a window of
+/// a segmented fire whose grid holds fire-wide rows.
+#[allow(clippy::too_many_arguments)]
 pub fn cache_store(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -278,6 +291,7 @@ pub fn cache_store(
     grid: Tensor,
     frames: u32,
     slab: Tensor,
+    x_base: u32,
 ) -> Result<(), Error> {
     const OP: &str = "conv.cache_store";
     for t in [x, cache, slab] {
@@ -328,6 +342,7 @@ pub fn cache_store(
             frames.arg(),
             channels.arg(),
             stride.arg(),
+            x_base.arg(),
         ],
     )
 }

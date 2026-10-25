@@ -22,6 +22,7 @@ template <typename T>
     const constant uint& channels     [[buffer(3)]],
     const constant uint& groups       [[buffer(4)]],
     const constant uint& splits       [[buffer(5)]],
+    const constant uint& base         [[buffer(6)]],
     uint3 tgid                        [[threadgroup_position_in_grid]],
     uint3 lid3                        [[thread_position_in_threadgroup]],
     uint3 tg3                         [[threads_per_threadgroup]],
@@ -46,7 +47,9 @@ template <typename T>
   float cnt = 0.0f, mean = 0.0f, m2 = 0.0f;
 
   for (uint v = begin; v < end; ++v) {
-    const device T* row = x + (size_t(g.off) + size_t(v)) * size_t(channels) + size_t(c0);
+    // `base`: the row `grid` addresses `x`'s row 0 at.
+    const device T* row =
+        x + (size_t(g.off - int(base)) + size_t(v)) * size_t(channels) + size_t(c0);
     for (uint c = lid; c < cg; c += tg_size) {
       const float value = float(row[c]);
       cnt += 1.0f;
@@ -83,7 +86,7 @@ template <typename T>
   [[kernel]] void group_norm_stats<itype>(                         \
       const device itype*, const device int*, device float4*,              \
       const constant uint&, const constant uint&, const constant uint&,    \
-      uint3, uint3, uint3, uint, uint);
+      const constant uint&, uint3, uint3, uint3, uint, uint);
 
 instantiate_gn_stats(bfloat16, bfloat)
 
@@ -128,13 +131,14 @@ template <typename T>
     const constant uint& groups       [[buffer(7)]],
     const constant uint& clips        [[buffer(8)]],
     const constant uint& silu         [[buffer(9)]],
+    const constant uint& base         [[buffer(10)]],
     uint2 tid                         [[thread_position_in_grid]]) {
   const uint col = tid.x;
   const uint row = tid.y;
   if (col >= channels) return;
   const size_t e = size_t(row) * size_t(channels) + size_t(col);
   SpatialClip box;
-  const int l = clip_of(grid, int(clips), int(row), box);
+  const int l = clip_of(grid, int(clips), int(row + base), box);
   float v = 0.0f;
   if (l >= 0) {
     const uint group = col / (channels / groups);
@@ -151,6 +155,6 @@ template <typename T>
       const device itype*, const device int*, const device float2*,        \
       const device float*, const device float*, device itype*,             \
       const constant uint&, const constant uint&, const constant uint&,    \
-      const constant uint&, uint2);
+      const constant uint&, const constant uint&, uint2);
 
 instantiate_gn_apply(bfloat16, bfloat)

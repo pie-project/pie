@@ -109,6 +109,7 @@ impl Run<'_> {
                     },
                     self.tensor(*y_grid),
                     self.tensor(*y),
+                    [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
                 )
             }
             Conv::GroupNorm {
@@ -143,6 +144,7 @@ impl Run<'_> {
                     partials,
                     stats,
                     self.tensor(*y),
+                    self.grid_base(*grid, *x),
                 )
             }
             Conv::Upsample {
@@ -160,6 +162,7 @@ impl Run<'_> {
                 *keep_first_frame,
                 self.tensor(*y_grid),
                 self.tensor(*y),
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
             ),
             Conv::PixelShuffle {
                 x,
@@ -176,7 +179,7 @@ impl Run<'_> {
                 *trim_t,
                 self.tensor(*y_grid),
                 self.tensor(*y),
-                [0, 0],
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
             ),
             Conv::PixelUnshuffle {
                 x,
@@ -191,7 +194,7 @@ impl Run<'_> {
                 *r,
                 self.tensor(*y_grid),
                 self.tensor(*y),
-                [0, 0],
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
             ),
             Conv::AvgDown {
                 x,
@@ -208,6 +211,7 @@ impl Run<'_> {
                 *group,
                 self.tensor(*y_grid),
                 self.tensor(*y),
+                [self.grid_base(*grid, *x), self.grid_base(*y_grid, *y)],
             ),
             Conv::CacheStore {
                 x,
@@ -216,6 +220,7 @@ impl Run<'_> {
                 cache,
                 x_out: _,
             } => {
+                let base = self.grid_base(*grid, *x);
                 let x = self.tensor(*x);
                 let grid = self.tensor(*grid);
                 let pool = self.recurrent(*cache);
@@ -225,7 +230,16 @@ impl Run<'_> {
                              lane of it staged"
                         .to_string(),
                 })?;
-                conv::resample::cache_store(self.ctx(), x, x, slots, grid, *frames, pool.state)
+                conv::resample::cache_store(
+                    self.ctx(),
+                    x,
+                    x,
+                    slots,
+                    grid,
+                    *frames,
+                    pool.state,
+                    base,
+                )
             }
             Conv::Patchify {
                 x,
