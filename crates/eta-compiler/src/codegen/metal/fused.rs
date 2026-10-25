@@ -310,7 +310,7 @@ pub fn emit_grouped_fused_region(
             continue;
         }
         if let Some(op) = ops.get(node.index()) {
-            for &arg in &op.args {
+            for arg in op.reads() {
                 *consumers.entry(alias.resolve(arg)).or_insert(0) += 1;
             }
         }

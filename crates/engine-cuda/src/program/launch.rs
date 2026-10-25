@@ -549,12 +549,12 @@ fn read_only_by_skipped_regions(plan: &LaunchStagePlan) -> Vec<bool> {
                 *node = true;
             }
         }
-        for &value in region.inputs.iter().chain(
+        for value in region.inputs.iter().copied().chain(
             region
                 .nodes
                 .iter()
                 .filter_map(|&node| plan.ops.get(node as usize))
-                .flat_map(|op| op.args.iter()),
+                .flat_map(|op| op.reads()),
         ) {
             if let Some(value) = unread.get_mut(value as usize) {
                 *value = true;
@@ -566,8 +566,7 @@ fn read_only_by_skipped_regions(plan: &LaunchStagePlan) -> Vec<bool> {
         if skipped.get(node).copied().unwrap_or(false) {
             continue;
         }
-        let predicate = (op.tag == tags::PIVOT_THRESHOLD).then_some(op.pred_payload);
-        for value in op.args.iter().copied().chain(predicate) {
+        for value in op.reads() {
             if let Some(value) = unread.get_mut(value as usize) {
                 *value = false;
             }
@@ -732,13 +731,12 @@ fn value_lifetimes(plan: &LaunchStagePlan, rows: &[u32]) -> Option<Vec<Lifetime>
             *slot = source;
         }
         result_base += u32::from(op.result_count);
-        let predicate = (op.tag == tags::PIVOT_THRESHOLD).then_some(op.pred_payload);
         let region = region_of[node];
         let generated = plan
             .fused
             .get(region as usize)
             .is_some_and(|fused| fused.kind == RegionKind::Generated);
-        for value in op.args.iter().copied().chain(predicate) {
+        for value in op.reads() {
             bump(&mut lifetimes, &alias_of, value, step);
             if generated
                 && lifetimes

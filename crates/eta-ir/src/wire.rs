@@ -160,6 +160,15 @@ impl OpWire {
         u32::try_from(self.chan).ok()
     }
 
+    /// Every value the op reads: its arguments, and a pivot's predicate
+    /// operand, which the wire keeps beside them in `pred_payload`.
+    pub fn reads(&self) -> impl Iterator<Item = ValueId> + '_ {
+        self.args
+            .iter()
+            .copied()
+            .chain((self.tag == tags::PIVOT_THRESHOLD).then_some(self.pred_payload))
+    }
+
     fn shape(&self) -> Option<Shape> {
         Shape::new(&self.shape)
     }
