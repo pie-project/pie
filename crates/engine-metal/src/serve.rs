@@ -2108,7 +2108,9 @@ impl Shell {
                     * u64::try_from(clip[2]).unwrap_or(0)
             })
             .sum();
-        if out_voxels != u64::from(rect.rows) {
+        // The carve sizes a plane past a downsampling rule at the port's
+        // rows, its voxels at their head.
+        if out_voxels > u64::from(rect.rows) {
             return Err(Fault::Program {
                 at: "serve::enqueue",
                 why: format!(
