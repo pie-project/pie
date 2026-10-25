@@ -256,8 +256,12 @@ impl Plane {
             })?;
         let ring = &seat.inst.channels[dense];
         let dtype = eta_exec::concrete_dtype(seat.plan.package.channels[dense].dtype);
+        // The forward reads the oldest cell. The device's kept cell is the
+        // newest put, so it is the one read only when the ring holds no other.
         #[cfg(feature = "vulkan")]
-        if let Some(cell) = seat.session.kept_cell(dense as u32) {
+        if ring.size() <= 1
+            && let Some(cell) = seat.session.kept_cell(dense as u32)
+        {
             return Ok(InputCell::Device {
                 cell: cell.clone(),
                 dtype,
