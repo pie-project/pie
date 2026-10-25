@@ -1091,6 +1091,18 @@ __device__ void m1_cut_phase(
     const m1_u8* input, m1_u32 base, m1_u32 len, m1_u32 dtype,
     float cutoff, M1CutShared& cut, G& g) {
   const float mass = cut.mass;
+  // The next element's exclusive mass is the mass walked so far: once that
+  // reaches the cutoff (a chunk can end exactly on it) the cut stops at the
+  // cursor, every element past it dropped.
+  if (!(mass < cutoff)) {
+    __syncthreads();
+    if (threadIdx.x == 0u) {
+      cut.stage = M1_CUT_STOPPED;
+      cut.pivot = cut.cursor;
+    }
+    __syncthreads();
+    return;
+  }
   const m1_u32 mass_bits = __float_as_uint(mass);
   const m1_u32 biased = mass_bits >> 23;
   const int eu = biased == 0u ? -149 : (int)biased - 150;
