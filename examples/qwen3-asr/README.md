@@ -19,5 +19,4 @@ three seconds of 16-bit audio; a longer clip goes through a client. It
 answers the transcript and the language Qwen3-ASR names.
 
 The engine's voxel ceiling (`max_voxels`) must hold a convolution pass's
-clip: two chunks of 100 frames by 128 bands. It runs on Vulkan, Metal and
-CUDA.
+clip: two chunks of 100 frames by 128 bands. It runs on Metal and CUDA.

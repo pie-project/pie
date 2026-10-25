@@ -36,5 +36,5 @@ which runs fifteen times a frame, at 4.
 It answers the frames made, the seconds of audio and the time spent making
 and decoding them, and sends the audio as `speech.wav`.
 
-It runs on Vulkan. Metal and CUDA run the codec (`--frames`); a frame's
-loop on the device is Vulkan's alone so far.
+It runs on Metal. CUDA decodes given frames (`--frames`); its frame loop
+does not yet draw the predictor's codes right.
