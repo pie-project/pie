@@ -17,7 +17,7 @@ use eta_compiler::plan::compile_bound;
 use eta_exec::Value;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
+use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype, Literal, Predicate, RngKind, Shape};
 
 const RNG: u32 = 0;
@@ -50,6 +50,7 @@ fn sampler(vocab: u32) -> TraceContainer {
     let r = p.op(Op::ChanTake(RNG));
     let raw = p.op(Op::IntrinsicVal {
         intr: IntrinsicId::Logits,
+        lane: 0,
         shape: Shape::matrix(1, vocab),
         dtype: Dtype::F32,
     });
@@ -177,6 +178,7 @@ fn sampler(vocab: u32) -> TraceContainer {
             ops: p.ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
@@ -227,11 +229,7 @@ fn a_guest_pass_samples_on_the_fabric_as_the_interpreter_does() {
     let vocab = 64u32;
     let lanes = 3u32;
     let steps = 4usize;
-    let profile = ModelProfile {
-        vocab,
-        ..ModelProfile::dummy()
-    };
-    let bound = eta_ir::validate::bind(sampler(vocab), profile).expect("the sampler binds");
+    let bound = bind_logits(sampler(vocab), vocab).expect("the sampler binds");
     let launch = eta_compiler::codegen::launch::build(&bound, &compile_bound(&bound));
     let registration = ProgramRegistration {
         launch,
@@ -285,7 +283,14 @@ fn a_guest_pass_samples_on_the_fabric_as_the_interpreter_does() {
         );
         let attached: Vec<(InstanceId, u32)> = (0..lanes).map(|l| (ids[&l].0, l)).collect();
         let ran = device_plane
-            .fire_guests(&device, &attached, Some(&kept), vocab, 0)
+            .fire_guests(
+                &device,
+                &attached,
+                Some(&kept),
+                vocab,
+                0,
+                eta_ir::registry::Stage::Epilogue,
+            )
             .expect("the guest passes run");
         assert!(
             ran.iter().all(|&r| r),
@@ -295,7 +300,15 @@ fn a_guest_pass_samples_on_the_fabric_as_the_interpreter_does() {
             let (d, h) = ids[&l];
             let row = kept.lane_rows(l as usize).expect("rows");
             host_plane
-                .fire_interpreted(h, Some(&row), 1, vocab, None, 0)
+                .fire_interpreted(
+                    h,
+                    Some(&row),
+                    1,
+                    vocab,
+                    None,
+                    0,
+                    eta_ir::registry::Stage::Epilogue,
+                )
                 .expect("the interpreter steps");
             let (dt, dg) = (
                 token(&mut device_plane, d, OUT),
@@ -330,4 +343,28 @@ fn a_guest_pass_samples_on_the_fabric_as_the_interpreter_does() {
         agreed * 10 >= total * 9,
         "sampled tokens agree ({agreed}/{total})"
     );
+}
+
+/// Binds `container` as a one-lane pass reading `vocab`-wide logits.
+fn bind_logits(
+    container: eta_ir::container::TraceContainer,
+    vocab: u32,
+) -> Result<eta_ir::validate::BoundTrace, eta_ir::validate::ValidateError> {
+    eta_ir::validate::bind(
+        container,
+        vec![Some(eta_ir::registry::Readout {
+            kind: eta_ir::registry::ReadoutKind::Logits,
+            width: vocab,
+        })],
+        eta_ir::registry::Graph {
+            num_layers: 2,
+            mtp_logits: true,
+            mtp_depth: 1,
+            attn_score: true,
+        },
+        eta_ir::registry::EngineCaps {
+            lora: true,
+            attn_page_mask: true,
+        },
+    )
 }

@@ -1,9 +1,4 @@
-//! engine-cuda's `a_double_block_fires_two_streams_through_the_engine` and
-//! `a_second_fire_reads_the_port_cells_it_was_handed`, on the xla engine:
-//! two requests of a text lane and an image lane each, fed latents, a
-//! timestep and axis positions off their channels, attend within their
-//! group through a row permutation, and read back the velocity seam; a
-//! second fire lands the second cells.
+//! engine-cuda's double-block and second-fire gates, on the xla engine.
 
 use crate::common_dit;
 
@@ -11,7 +6,7 @@ use common_dit::{
     HostRequest, Lcg, Rig, WIDTH, Weights, assert_close, attach, bf, lane, reference,
     reference_with, trace,
 };
-use engine::fire::{LaneStream, ReadoutSeam};
+use engine::fire::ReadoutSeam;
 
 fn request(rng: &mut Lcg, text_rows: usize, image_rows: usize) -> HostRequest {
     let w = WIDTH as usize;
@@ -51,12 +46,15 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
     };
     let weights = Weights::random(&trace(), 7);
     let mut rig = Rig::load(trace(), &weights, 64, vec![16, 32, 64], None);
+    let velocity = rig.readout_widths(poem_ir::ReadoutKind::Velocity);
     assert!(
-        rig.profile().has_velocity,
+        !velocity.is_empty() && velocity.iter().all(|&width| width == WIDTH),
         "the plan plants a velocity seam"
     );
-    assert_eq!(rig.profile().velocity_width, WIDTH);
-    assert_eq!(rig.profile().vocab, 0, "a denoiser has no vocabulary");
+    assert!(
+        rig.readout_widths(poem_ir::ReadoutKind::Logits).is_empty(),
+        "a denoiser has no vocabulary"
+    );
 
     let mut rng = Lcg::seeded(3);
     let requests = [request(&mut rng, 3, 5), request(&mut rng, 4, 6)];
@@ -103,16 +101,15 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
             &req.positions[req.text_rows..],
         );
         let slot = (2 * at) as u32;
-        // Request 0 submits its image lane first: the packing, not the
-        // submission order, puts a group's rows together.
+        // The packing keeps a group's rows together, in submission order.
         if at == 0 {
-            lanes.push(lane(&rig, slot, &image, LaneStream::Image, at as u32));
-            lanes.push(lane(&rig, slot + 1, &text, LaneStream::Text, at as u32));
+            lanes.push(lane(&rig, slot, &image, "image", at as u32));
+            lanes.push(lane(&rig, slot + 1, &text, "text", at as u32));
             attachments.push(attach(lanes.len() as u32 - 2, image.instance));
             attachments.push(attach(lanes.len() as u32 - 1, text.instance));
         } else {
-            lanes.push(lane(&rig, slot, &text, LaneStream::Text, at as u32));
-            lanes.push(lane(&rig, slot + 1, &image, LaneStream::Image, at as u32));
+            lanes.push(lane(&rig, slot, &text, "text", at as u32));
+            lanes.push(lane(&rig, slot + 1, &image, "image", at as u32));
             attachments.push(attach(lanes.len() as u32 - 2, text.instance));
             attachments.push(attach(lanes.len() as u32 - 1, image.instance));
         }
@@ -168,9 +165,7 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
         "second fire, request 1 image",
     );
 
-    // Attn classes: text rows class 0, image rows class 1, and a table
-    // that keeps each class to itself, so each stream attends only within
-    // itself (engine-cuda's ragged `ClassTable`).
+    // A stated mask that keeps each stream to itself.
     let apart = [request(&mut rng, 3, 5), request(&mut rng, 4, 6)];
     let want_apart: Vec<(Vec<f32>, Vec<f32>)> = requests
         .iter()
@@ -206,14 +201,22 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
             &first.positions[first.text_rows..],
         );
     }
+    // Each lane attends only its own rows.
     let mut classed = lanes;
-    for lane in &mut classed {
-        let class = i32::from(lane.stream != LaneStream::Text);
-        lane.attn_classes = Some(engine::fire::AttnClasses {
-            classes: vec![class; lane.tokens.len()],
-            table: vec![1, 0, 0, 1],
-            count: 2,
-        });
+    let rows: Vec<u32> = classed
+        .iter()
+        .map(|lane| lane.tokens.len() as u32)
+        .collect();
+    for (at, lane) in classed.iter_mut().enumerate() {
+        let first = at - at % 2;
+        let total = rows[first] + rows[first + 1];
+        let before = if at == first { 0 } else { rows[first] };
+        let own = engine::fire::Mask::new(
+            vec![before, rows[at], total - before - rows[at]],
+            u64::from(total),
+        );
+        lane.kv_less = true;
+        lane.mask = Some(engine::fire::Masking::Rows(vec![own; rows[at] as usize]));
     }
     let readouts = rig.fire(classed, attachments, Vec::new());
     assert_close(

@@ -64,7 +64,7 @@ jobs:
 
           class Run(RunBase):
               async def run(self, input: str) -> str:
-                  _ = (model.name(), model.pass_kind(), model.frame_size(), model.rs_state_size(),
+                  _ = (model.name(), model.switches(), model.frame_size(), model.rs_state_size(),
                        tokenizer.encode("hi"), chat.stop_tokens(), chat.Decoder(), reasoning.Decoder())
                   session.send(input)
                   return "ok"

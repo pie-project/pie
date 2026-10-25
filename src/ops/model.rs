@@ -381,7 +381,13 @@ fn info(name: String) -> Result<Answer> {
                 runtime_quant: r.runtime_quant.clone(),
             })
             .collect(),
-        generative: facts::of(entry.deployment.as_deref()),
+        generative: facts::of(entry.deployment.as_deref()).map(|mut generative| {
+            if let Some(trace) = entry.deployment.as_deref().and_then(facts::traced) {
+                generative.inputs = facts::inputs(&trace);
+                generative.switches = facts::switches(&trace);
+            }
+            generative
+        }),
         name: entry.name,
         root: entry.root,
         files: entry.files,
@@ -462,11 +468,7 @@ impl crate::ui::Report for ModelInfo {
             let mut row =
                 |k: &str, v: String| table.push(Row::new(Mark::Plain, [k.to_string(), v]));
             if let Some(latent) = &generative.latent {
-                let (w, h) = latent.pixels_per_row();
-                row(
-                    "latent",
-                    format!("{} (one row is {w}x{h} pixels)", latent.line()),
-                );
+                row("latent", latent.line());
             }
             if let Some(schedule) = &generative.schedule {
                 row("schedule", schedule.line());
@@ -483,59 +485,19 @@ impl crate::ui::Report for ModelInfo {
                 }
                 row("train steps", schedule.train_steps.to_string());
             }
-            row("max latent rows", generative.max_latent_rows.to_string());
+            if !generative.inputs.is_empty() {
+                row("inputs", generative.inputs.join(", "));
+            }
+            if !generative.switches.is_empty() {
+                row("switches", generative.switches.join("; "));
+            }
             table.print(palette);
 
-            println!("\n{}", palette.bold("Readings"));
-            let name_width = generative
-                .readings
-                .iter()
-                .map(|r| r.name.chars().count())
-                .max()
-                .unwrap_or(0);
-            let binds_of = |reading: &facts::Reading| {
-                let mut binds = Vec::new();
-                if reading.tokens {
-                    binds.push("tokens");
-                }
-                if reading.kv {
-                    binds.push("kv");
-                }
-                if binds.is_empty() {
-                    "no tokens, no kv".to_string()
-                } else {
-                    binds.join(" + ")
-                }
-            };
-            let binds_width = generative
-                .readings
-                .iter()
-                .map(|r| binds_of(r).chars().count())
-                .max()
-                .unwrap_or(0);
-            for reading in &generative.readings {
-                println!(
-                    "  {}  {}  {:<binds_width$}  -> {} {}",
-                    palette.accent(format!("{:<name_width$}", reading.name)),
-                    palette.dim(format!("#{}", reading.index)),
-                    binds_of(reading),
-                    reading.readout,
-                    reading.readout_width,
-                );
-                if !reading.ports.is_empty() {
-                    println!(
-                        "  {}      {}  {}",
-                        " ".repeat(name_width),
-                        " ".repeat(binds_width),
-                        palette.dim(format!("<- {}", reading.ports.join(", "))),
-                    );
-                }
-            }
             if generative.text_to_image() {
                 println!(
                     "  {}",
                     palette.dim(
-                        "this deployment has a text reading and a denoise reading: \
+                        "this deployment binds the standard `latents` and `timestep` inputs: \
                          `pie run text-to-image -- --prompt \"...\"` drives it."
                     )
                 );

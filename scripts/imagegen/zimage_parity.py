@@ -12,9 +12,6 @@ Two modes, one per row:
     --mini  (default)  the miniature `z-image-mini-bf16-kv-bf16` row against
                        `zimage_mini.npz` (one forward of the random-init
                        transformer at dim 256: `mini.in.*` -> `mini.out.0`)
-    --pad              the same row against `zimage_mini_pad.npz`: rows that
-                       NEED padding (48 -> 64 image rows, 40 -> 64 caption
-                       rows) at a pipeline-realistic `t = 0.5`
     --turbo            the flagship `z-image-turbo-bf16-kv-bf16` row against
                        `zimage_golden.npz`'s step-0 transformer call
                        (`dit.step0.in.*` -> `dit.step0.out.0`; the prompt
@@ -42,10 +39,8 @@ for argv — `[sandbox] allow_fs = true` with `scratch_dir` equal to `--out`,
 since the case is then read as `/scratch/<name>` inside the sandbox.
 
 Nothing here imports torch EXCEPT `decode`, the last command: turning two
-latents into two pictures needs the checkpoint's own autoencoder, and the
-family's `vae.decode` reading has no guest verbs yet (a sibling port owns
-the channel-fed voxel path). Everything else reads numbers off disk, and
-patchify is a reshape.
+latents into two pictures needs the checkpoint's own autoencoder. Everything
+else reads numbers off disk.
 
     python zimage_parity.py decode --out /tmp/zimage-parity   # PNGs + PSNR
 
@@ -70,14 +65,15 @@ lane:
 
 WHAT THE HARNESS CONVERTS
 -------------------------
-* patchify is diffusers' `_patchify_image` exactly (feature order
-  `(pf, ph, pw, c)`, NOT mini-dit's `(c, ph, pw)`), and its inverse;
-* the caption is padded to a multiple of 32 rows and flagged; caption row `j`
-  sits at rotary `(1 + j, 0, 0)` — pads included, which is what diffusers'
-  `_pad_with_ids` does for a caption (its grid spans the padded length);
-  image patch `(a, b)` sits at `(L32 + 1, a, b)`, image pads at `(0, 0, 0)`;
+* the latent goes over as the VAE's own `[H, W, C]` (the golden's `[C, 1, H,
+  W]` transposed); the family patchifies and ropes it;
+* the guest zero-pads the caption to a multiple of 32 rows and binds its own
+  row count as `length`; the family turns pad rows into the reference's pad
+  tokens (`--mode mini_pad` pads both caption and image);
+* a tapped mode (`full`, `crop`, `tiny`) reads out on the token rows, in
+  diffusers' `_patchify_image` feature order `(pf, ph, pw, c)`;
 * the golden holds the TRANSFORMER's `t` (multiplied by `t_scale = 1000`
-  inside the model); the family's port takes the SCHEDULER timestep and flips
+  inside the model); the family's `timestep` input takes the SCHEDULER timestep and flips
   it itself (`u = 1000 - t`), so the case carries `1000 - 1000 * t`;
 * the family hands back `-model_out` (the pipeline's `noise_pred = -noise_pred`
   folded in); the golden is the raw model output, so `collect` negates back.
@@ -99,14 +95,12 @@ DEFAULT_GOLDEN = os.path.join(
 )
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
-SEQ_MULTIPLE = 32
 PATCH = 2
 T_SCALE = 1000.0
 T_FLIP = 1000.0
 
 TOLERANCES = {
     "mini": ["--tol", "0.1", "--rel-tol", "0.02", "--cos-tol", "0.9999"],
-    "mini_pad": ["--tol", "0.1", "--rel-tol", "0.02", "--cos-tol", "0.9999"],
     "turbo": ["--rel-tol", "0.05", "--cos-tol", "0.999"],
     "text": ["--rel-tol", "0.05", "--cos-tol", "0.999"],
     "chain": ["--rel-tol", "0.05", "--cos-tol", "0.999"],
@@ -138,7 +132,8 @@ MODES = {
 MODES["steps"] = keyed("zimage_golden.npz", "dit.step0.in.", "latent.final", TURBO_DEPLOYMENT)
 for _mode in ("turbo", "text", "chain", "steps"):
     MODES[_mode].update(x="dit.step0.in.arg0.0", cap="dit.step0.in.arg2.0", t="dit.step0.in.arg1")
-TOLERANCES.update(full=TOLERANCES["turbo"], crop=TOLERANCES["turbo"], tiny=TOLERANCES["turbo"])
+TOLERANCES.update(full=TOLERANCES["turbo"], crop=TOLERANCES["turbo"], tiny=TOLERANCES["turbo"],
+                  mini_pad=TOLERANCES["mini"])
 TOLERANCES["steps"] = ["--rel-tol", "0.15", "--cos-tol", "0.995"]
 
 def floats(arr: np.ndarray) -> list[str]:
@@ -158,24 +153,6 @@ def dump_case(doc: dict, path: str) -> None:
     with open(path, "w") as f:
         f.write("{" + ",".join(parts) + "}")
 
-def patchify(image: np.ndarray, p: int = PATCH, pf: int = 1) -> tuple[np.ndarray, tuple]:
-    """`[C, F, H, W]` -> `[(F/pf)(H/p)(W/p), pf*p*p*C]`, feature order (pf, ph, pw, c)."""
-    c, f, h, w = image.shape
-    ft, ht, wt = f // pf, h // p, w // p
-    x = image.reshape(c, ft, pf, ht, p, wt, p)
-    x = x.transpose(1, 3, 5, 2, 4, 6, 0)
-    return np.ascontiguousarray(x.reshape(ft * ht * wt, pf * p * p * c)), (ft, ht, wt)
-
-def unpatchify(tokens: np.ndarray, c: int, f: int, h: int, w: int, p: int = PATCH, pf: int = 1) -> np.ndarray:
-    ft, ht, wt = f // pf, h // p, w // p
-    n = ft * ht * wt
-    x = tokens[:n].reshape(ft, ht, wt, pf, p, p, c)
-    x = x.transpose(6, 0, 3, 1, 4, 2, 5)
-    return np.ascontiguousarray(x.reshape(c, f, h, w))
-
-def padded(n: int) -> int:
-    return n + (-n) % SEQ_MULTIPLE
-
 def mode_of(args) -> str:
     if args.mode:
         return args.mode
@@ -187,7 +164,7 @@ def mode_of(args) -> str:
         return "steps"
     if args.turbo:
         return "turbo"
-    return "mini_pad" if args.pad else "mini"
+    return "mini"
 
 def golden_of(args) -> np.lib.npyio.NpzFile:
     return np.load(os.path.join(args.golden, MODES[mode_of(args)]["file"]))
@@ -203,45 +180,27 @@ def case(args) -> str:
     caption = dump[keys["cap"]].astype(np.float32)
     t_model = float(np.asarray(dump[keys["t"]]).reshape(-1)[0])
 
-    l_real = caption.shape[0]
-    l32 = padded(l_real)
-    cap_rows = np.concatenate([caption, np.repeat(caption[-1:], l32 - l_real, axis=0)], axis=0)
-    cap_pad = np.zeros(l32, np.float32)
-    cap_pad[l_real:] = 1.0
-    cap_pos = np.zeros((l32, 3), np.float32)
-    cap_pos[:, 0] = 1.0 + np.arange(l32)
-
-    patches, (ft, ht, wt) = patchify(image)
-    n_real = patches.shape[0]
-    n32 = padded(n_real)
-    img_rows = np.concatenate([patches, np.repeat(patches[-1:], n32 - n_real, axis=0)], axis=0)
-    img_pad = np.zeros(n32, np.float32)
-    img_pad[n_real:] = 1.0
-    grid = np.stack(np.meshgrid(np.arange(ft), np.arange(ht), np.arange(wt), indexing="ij"), axis=-1)
-    img_pos = np.zeros((n32, 3), np.float32)
-    img_pos[:n_real] = grid.reshape(-1, 3).astype(np.float32)
-    img_pos[:n_real, 0] += l32 + 1
-
+    c, f, h, w = image.shape
+    assert f == 1, "an image latent is one frame"
+    latent = np.ascontiguousarray(image[:, 0].transpose(1, 2, 0))
     timestep = T_FLIP - T_SCALE * t_model
     doc = {
-        "latents": img_rows,
-        "image_rows": int(n32),
-        "patch_features": int(img_rows.shape[1]),
-        "image_pad": img_pad,
-        "image_positions": img_pos,
-        "caption": cap_rows,
-        "caption_rows": int(l32),
-        "caption_width": int(cap_rows.shape[1]),
-        "caption_pad": cap_pad,
-        "caption_positions": cap_pos,
+        "latents": latent,
+        "height": int(h),
+        "width": int(w),
+        "channels": int(c),
+        "caption": caption,
+        "caption_rows": int(caption.shape[0]),
+        "caption_width": int(caption.shape[1]),
         "timestep": float(timestep),
     }
+    doc["readout_rows"] = int((h // PATCH) * (w // PATCH))
     os.makedirs(args.out, exist_ok=True)
     path = os.path.join(args.out, f"case_{mode}.json")
     dump_case(doc, path)
-    print(f"[case] {mode}: {n_real}->{n32} image rows x {img_rows.shape[1]}, "
-          f"{l_real}->{l32} caption rows x {cap_rows.shape[1]}, t_model {t_model} -> "
-          f"port {timestep} ({os.path.getsize(path)} bytes) -> {path}")
+    print(f"[case] {mode}: {h}x{w}x{c} latent, {caption.shape[0]} caption rows x "
+          f"{caption.shape[1]}, t_model {t_model} -> input {timestep} "
+          f"({os.path.getsize(path)} bytes) -> {path}")
     return path
 
 def prompt_of(args) -> str:
@@ -374,18 +333,18 @@ def collect(args) -> str:
         out[PROMPT_KEY] = np.asarray(doc["text"], np.float32).reshape(doc["text_rows"], doc["text_width"])
     if doc["refined"]:
         out["refined"] = np.asarray(doc["refined"], np.float32).reshape(doc["caption_rows"], doc["dim"])
-        if keys["refined"]:
+        if keys["refined"] and dump[keys["refined"]].shape[-2] == doc["caption_rows"]:
             out[keys["refined"]] = out["refined"]
     if doc["velocity"]:
-        rows = np.asarray(doc["velocity"], np.float32).reshape(doc["image_rows"], doc["patch_features"])
+        rows = np.asarray(doc["velocity"], np.float32).reshape(-1, doc["readout"])
         out["velocity.rows"] = rows
-        if rows.shape[1] == c * PATCH * PATCH:
-            out[keys["out"]] = unpatchify(-rows, c, f, h, w)
+        if rows.shape[1] == c:
+            # The family's sign flipped back.
+            out[keys["out"]] = np.ascontiguousarray((-rows).reshape(h, w, c).transpose(2, 0, 1))[:, None]
     if doc.get("latent"):
-        rows = np.asarray(doc["latent"], np.float32).reshape(doc["image_rows"], doc["patch_features"])
-        out["latent.rows"] = rows
+        x = np.asarray(doc["latent"], np.float32).reshape(h, w, c)
         key = MODES[mode]["out"] if args.stop is None else f"sched.x{args.stop}"
-        out[key] = unpatchify(rows, c, f, h, w)[None, :, 0]
+        out[key] = np.ascontiguousarray(x.transpose(2, 0, 1))[None]
         print(f"[collect] sigmas {doc['sigmas']}")
     if doc.get("ctx"):
         rows = len(doc["ctx"]) // max(int(doc["caption_rows"]), 1)
@@ -508,8 +467,6 @@ def main() -> int:
                     help="the case by name (the flags below are shortcuts; `full`/`crop` "
                          "are the tapped Turbo goldens of `zimage_golden.py --taps`)")
     ap.add_argument("--mini", action="store_true", help="the miniature row (default)")
-    ap.add_argument("--pad", action="store_true",
-                    help="the miniature row over rows that need padding (zimage_mini_pad.npz)")
     ap.add_argument("--turbo", action="store_true", help="the Turbo row's step-0 denoise instead")
     ap.add_argument("--trajectory", action="store_true",
                     help="the Turbo row's whole 8-step Euler run from noise.init, against latent.final")

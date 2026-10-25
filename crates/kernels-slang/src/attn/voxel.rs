@@ -4,7 +4,7 @@
 use dtype::Dtype;
 
 use crate::conv::{clips_of, even_row, row_grid};
-use crate::encode::{Arg, Ctx, Fire, refuse};
+use crate::encode::{Arg, Ctx, Fire, refuse, stated};
 use crate::error::Error;
 use crate::tensor::Tensor;
 
@@ -40,7 +40,7 @@ fn entry(channels: u32) -> Result<&'static str, Error> {
 }
 
 /// `y` each row of `q` (bf16, the clips of `grid`) attended over the keys
-/// and values of its segment.
+/// and values of its segment. `base`: the rectangles' row 0 in `grid`'s fire-wide rows.
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
     ctx: &Ctx<'_>,
@@ -51,6 +51,7 @@ pub fn attention(
     segment: Segment,
     sm_scale: f32,
     y: Tensor,
+    base: u32,
 ) -> Result<(), Error> {
     for t in [q, k, v, y] {
         if t.dtype != Dtype::Bf16 {
@@ -109,6 +110,7 @@ pub fn attention(
             sm_scale.arg(),
             q.rows.arg(),
             span.arg(),
+            stated(OP, base)?.arg(),
         ],
     )
 }

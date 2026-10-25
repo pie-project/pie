@@ -4,7 +4,7 @@
 // PNG/JPEG, `Video.fromBytes` for animated GIF, `Audio.fromBytes` for WAV)
 // and the host decodes + preprocesses per the bound model. A span enters the
 // sequence as the token run its handle answers, and the handle crosses again
-// beside the tokens (`fwd.media([{ tag: 'image', val: img.handle }])`).
+// beside the tokens (`fwd.media(0, [img])`).
 
 import * as _media from 'pie:inferlet/media@0.3.0';
 

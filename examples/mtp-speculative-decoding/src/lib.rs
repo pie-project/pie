@@ -49,10 +49,6 @@ struct Input {
     /// window moves the answer" from "the draft head does".
     #[serde(default)]
     pad: u32,
-    /// DIAGNOSTIC: run only the first `max_layers` layers (the layerskip
-    /// door), to bisect a divergence by depth.
-    #[serde(default)]
-    max_layers: Option<u32>,
     /// DIAGNOSTIC: record the first rounds' proposals and answers
     /// (`proposed_trace`/`truth_trace`) instead of the per-round margin — a
     /// pass binds at most twelve channels, and this is the twelfth.
@@ -188,9 +184,6 @@ async fn main(input: Input) -> Result<Output> {
         let drafting = at == last_span && k > 0;
 
         let fwd_p = ForwardPass::new();
-        if let Some(layers) = input.max_layers {
-            fwd_p.set_max_layers(layers)?;
-        }
         fwd_p.embed(&toks_p, &indptr_p)?;
         fwd_p.readout(&readout_p)?;
         fwd_p.state(&[&ws], StateGeometry::folding())?;
@@ -259,9 +252,6 @@ async fn main(input: Input) -> Result<Output> {
             .named("aux");
 
         let fwd = ForwardPass::new();
-        if let Some(layers) = input.max_layers {
-            fwd.set_max_layers(layers)?;
-        }
         fwd.embed(&win, &indptr_d)?;
         let lanes: Vec<&WorkingSet> = (0..w).map(|_| &ws).collect();
         fwd.state(
@@ -283,7 +273,7 @@ async fn main(input: Input) -> Result<Output> {
                 let j = iota(2 * w);
                 let lower = lt(&j, Tensor::constant(w));
                 let at = &j % Tensor::constant(w);
-                aux.put(&cast(
+                aux.put(cast(
                     select(&lower, gather(&window, &at), gather(&truth, &at)),
                     dtype::f32,
                 ));
@@ -291,13 +281,13 @@ async fn main(input: Input) -> Result<Output> {
                 let vocab = intrinsics::vocab();
                 let row0 = reshape(gather(reshape(&logits, [w, vocab]), iota(1)), [vocab]);
                 let (top, _) = top_k(&row0, 2);
-                aux.put(&reshape(
+                aux.put(reshape(
                     gather(&top, iota(1)) - gather(&top, iota(1) + Tensor::constant(1u32)),
                     [1],
                 ));
             } else {
                 // A declared channel takes a reader cell every fire.
-                aux.put(&broadcast(Tensor::constant(0f32), [1]));
+                aux.put(broadcast(Tensor::constant(0f32), [1]));
             }
             let i = iota(w); // [w] u32
             let one = Tensor::constant(1u32);
@@ -310,7 +300,7 @@ async fn main(input: Input) -> Result<Output> {
                 let hit = cast(eq(&proposed, &said), dtype::u32);
                 reshape(reduce_sum(cumprod(&hit)), [1])
             } else {
-                &b - &b
+                broadcast(Tensor::constant(0u32), [1])
             };
             let mb = broadcast(&m, [w]);
 

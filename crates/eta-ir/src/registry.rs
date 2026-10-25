@@ -1,8 +1,4 @@
-use alloc::string::String;
-use alloc::vec::Vec;
-
 use super::op::IntrinsicId;
-use crate::types::Dtype;
 
 crate::declare_tagged_enum! {
     #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -184,89 +180,42 @@ pub fn intrinsic_stages(intr: IntrinsicId) -> &'static [Stage] {
         | IntrinsicId::MtpLogits
         | IntrinsicId::Hidden
         | IntrinsicId::Velocity
-        | IntrinsicId::PeerVelocity
-        | IntrinsicId::Pixels
-        | IntrinsicId::ValueHead => &[Stage::Epilogue],
+        | IntrinsicId::Pixels => &[Stage::Epilogue],
         IntrinsicId::MtpDrafts => &[Stage::Epilogue],
         IntrinsicId::AttnScore => &[Stage::Epilogue],
         IntrinsicId::Query | IntrinsicId::Layer => &[Stage::OnAttnProj, Stage::OnAttn],
     }
 }
 
-pub fn intrinsic_available(intr: IntrinsicId, profile: &ModelProfile) -> bool {
-    match intr {
-        IntrinsicId::MtpLogits => profile.has_mtp_logits,
-        IntrinsicId::MtpDrafts => profile.mtp_depth > 0,
-        IntrinsicId::ValueHead => profile.has_value_head,
-        IntrinsicId::AttnScore => profile.has_attn_score,
-        IntrinsicId::Velocity | IntrinsicId::PeerVelocity => profile.has_velocity,
-        IntrinsicId::Pixels => profile.has_pixels,
-        IntrinsicId::Logits | IntrinsicId::Hidden | IntrinsicId::Query | IntrinsicId::Layer => true,
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Readout {
+    pub kind: ReadoutKind,
+    pub width: u32,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct KernelInfo {
-    pub name: String,
-    pub sink_scope: Option<SinkScope>,
-    pub replayable: bool,
+pub enum ReadoutKind {
+    Logits,
+    Velocity,
+    Hidden,
+    Pixels,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+/// The model's graph facts a program may read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct ModelProfile {
-    pub vocab: u32,
-    pub page_size: u32,
+pub struct Graph {
     pub num_layers: u32,
-    pub activation: Dtype,
-    pub has_mtp_logits: bool,
+    pub mtp_logits: bool,
     pub mtp_depth: u32,
-    pub draft_block: u32,
-    pub draft_mask_token: u32,
-    pub draft_bidirectional: bool,
-    pub draft_proposals_from: u32,
-    pub has_value_head: bool,
-    pub has_attn_score: bool,
-    pub has_attn_page_mask: bool,
-    pub has_velocity: bool,
-    pub velocity_width: u32,
-    pub has_pixels: bool,
-    pub pixels_width: u32,
-    pub has_lora: bool,
-    pub kernels: Vec<KernelInfo>,
+    pub attn_score: bool,
 }
 
-impl ModelProfile {
-    pub fn activation_name(&self) -> &'static str {
-        crate::types::name_or_unknown(self.activation)
-    }
-
-    pub fn kernel(&self, name: &str) -> Option<&KernelInfo> {
-        self.kernels.iter().find(|k| k.name == name)
-    }
-
-    pub fn dummy() -> Self {
-        ModelProfile {
-            vocab: 32,
-            page_size: 4,
-            num_layers: 2,
-            activation: Dtype::F32,
-            has_mtp_logits: true,
-            mtp_depth: 1,
-            draft_block: 0,
-            draft_mask_token: 0,
-            draft_bidirectional: false,
-            draft_proposals_from: 1,
-            has_value_head: true,
-            has_attn_score: true,
-            has_velocity: true,
-            velocity_width: 8,
-            has_pixels: true,
-            pixels_width: 3,
-            has_attn_page_mask: true,
-            has_lora: true,
-            kernels: Vec::new(),
-        }
-    }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct EngineCaps {
+    pub lora: bool,
+    pub attn_page_mask: bool,
 }

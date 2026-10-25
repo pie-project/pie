@@ -22,10 +22,6 @@ fn traced(tap: Option<&str>) -> Trace {
     row(tap).trace(Platform::Cuda)
 }
 
-fn generative(tap: Option<&str>) -> poem::generative::Generative {
-    row(tap).generative().expect("mini-dit is generative")
-}
-
 fn velocity_width(plan: &Trace) -> u64 {
     let seams: Vec<_> = plan
         .seams
@@ -36,24 +32,19 @@ fn velocity_width(plan: &Trace) -> u64 {
     let value = seams[0].values[0];
     match &plan.values[value.0 as usize].ty {
         Ty::Tensor { shape, .. } => match shape.as_slice() {
-            [Dim::Tokens, Dim::Const(width)] => *width,
-            other => panic!("the velocity seam is a `[Tokens, width]` rectangle, not {other:?}"),
+            [Dim::Tokens | Dim::Voxels, Dim::Const(width)] => *width,
+            other => panic!("the velocity seam is a `[rows, width]` rectangle, not {other:?}"),
         },
         other => panic!("the velocity seam is a tensor, not {other:?}"),
     }
 }
 
-fn ports(plan: &Trace) -> BTreeSet<String> {
+fn input_names(plan: &Trace) -> BTreeSet<&str> {
     plan.values
         .iter()
         .filter_map(|decl| match &decl.def {
-            Def::Input(RuntimeInput::Latents { port, .. }) => Some(format!("latents[{port}]")),
-            Def::Input(RuntimeInput::Context { port, .. }) => Some(format!("context[{port}]")),
-            Def::Input(RuntimeInput::LaneVector { port, .. }) => {
-                Some(format!("lane_vector[{port}]"))
-            }
-            Def::Input(RuntimeInput::AxisPositions { port, .. }) => {
-                Some(format!("axis_positions[{port}]"))
+            Def::Input(RuntimeInput::Guest { id, .. }) => {
+                Some(plan.inputs[*id as usize].name.as_str())
             }
             _ => None,
         })
@@ -70,8 +61,9 @@ fn the_mini_dit_tap_exports_an_intermediate_every_case() {
 }
 
 fn a_tap_moves_the_velocity_seam_to_the_intermediate_at_its_width() {
+    assert_eq!(velocity_width(&traced(None)), u64::from(model::CHANNELS));
     assert_eq!(
-        velocity_width(&traced(None)),
+        velocity_width(&traced(Some("final.tokens"))),
         u64::from(model::PATCH_FEATURES)
     );
     assert_eq!(
@@ -86,17 +78,6 @@ fn a_tap_moves_the_velocity_seam_to_the_intermediate_at_its_width() {
         velocity_width(&traced(Some("final.norm_out"))),
         u64::from(model::HIDDEN)
     );
-    for (tap, width) in [
-        (None, model::PATCH_FEATURES),
-        (Some("b0.norm1_out"), model::HIDDEN),
-        (Some("final.tokens"), model::PATCH_FEATURES),
-    ] {
-        assert_eq!(
-            generative(tap).readings[0].readout_width,
-            width,
-            "the reading's readout width under {tap:?}"
-        );
-    }
 }
 
 fn a_tap_is_still_one_float_readout_and_no_logits() {
@@ -116,16 +97,17 @@ fn a_tap_is_still_one_float_readout_and_no_logits() {
 }
 
 fn a_tap_that_cuts_the_trace_short_still_reads_every_port() {
-    let whole = ports(&traced(None));
+    let plan = traced(None);
+    let whole = input_names(&plan);
     assert!(
-        whole.contains("context[1]"),
-        "the model reads the context port: {whole:?}"
+        whole.contains("context"),
+        "the model reads the context input: {whole:?}"
     );
     for tap in ["x_embed", "b0.in", "b0.norm1_out", "b1.joint_attn_heads"] {
         assert_eq!(
-            ports(&traced(Some(tap))),
+            input_names(&traced(Some(tap))),
             whole,
-            "{tap}: the ports the plan declares"
+            "{tap}: the inputs the plan declares"
         );
     }
 }

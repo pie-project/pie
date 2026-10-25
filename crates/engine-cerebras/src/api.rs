@@ -34,8 +34,7 @@ use engine::fire::{
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
-use eta_ir::registry::{GeometryClass, ModelProfile, PortMask};
-use eta_ir::types::Dtype;
+use eta_ir::registry::{GeometryClass, PortMask, Stage};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
 
@@ -281,42 +280,6 @@ fn patch_bytes(
     }
 }
 
-fn profile(shell: &Shell, budgets: &LoadBudgets) -> ModelProfile {
-    let trace = shell.trace();
-    let layers = trace
-        .nodes
-        .iter()
-        .filter_map(|node| node.layer)
-        .max()
-        .map_or(0, |top| top + 1);
-    let (has_pixels, pixels_width) = shell.pixels_facts();
-    ModelProfile {
-        vocab: if shell.readout_seam() == engine::fire::ReadoutSeam::Logits {
-            shell.out_width()
-        } else {
-            0
-        },
-        page_size: budgets.page_size,
-        num_layers: layers,
-        activation: Dtype::F32,
-        has_mtp_logits: shell.mtp_width().is_some(),
-        mtp_depth: 0,
-        draft_block: trace.drafter.map_or(0, |d| d.rows),
-        draft_mask_token: trace.drafter.map_or(0, |d| d.mask_token),
-        draft_bidirectional: trace.drafter.is_some_and(|d| d.bidirectional),
-        draft_proposals_from: trace.drafter.map_or(1, |d| d.proposals_from),
-        has_value_head: false,
-        has_attn_score: shell.observes_scores(),
-        has_attn_page_mask: false,
-        has_lora: true,
-        has_velocity: shell.velocity_width().is_some(),
-        velocity_width: shell.velocity_width().unwrap_or(0),
-        has_pixels,
-        pixels_width,
-        kernels: Vec::new(),
-    }
-}
-
 fn adapter_of(
     shell: &mut Shell,
     package: &eta_compiler::codegen::launch::LaunchPackage,
@@ -424,7 +387,7 @@ impl Engine for Cerebras {
         let (weight_bytes, pool_bytes) = shell.footprint();
         let paging = shell.paging();
         let state_rows = shell.has_state();
-        let profile = profile(&shell, &budgets);
+        let drafter = shell.trace().drafter;
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "cerebras".to_string(),
@@ -467,7 +430,14 @@ impl Engine for Cerebras {
                 .unwrap_or(u32::MAX),
                 max_scoring_lanes: 0,
             },
-            profile,
+            has_lora: true,
+            has_attn_page_mask: false,
+            has_mtp_logits: shell.mtp_width().is_some(),
+            mtp_depth: 0,
+            draft_block: drafter.map_or(0, |d| d.rows),
+            draft_mask_token: drafter.map_or(0, |d| d.mask_token),
+            draft_proposals_from: drafter.map_or(1, |d| d.proposals_from),
+            has_attn_score: shell.observes_scores(),
             ports: PortMask::DEVICE_GEOMETRY
                 .with(eta_ir::registry::Port::AttnMask)
                 .with(eta_ir::registry::Port::Fold),
@@ -486,6 +456,8 @@ impl Engine for Cerebras {
             bidirectional_attention: true,
             adapter_attachments: false,
             facts: shell.trace().facts.clone(),
+            inputs: shell.input_decls(),
+            classes: shell.classes(),
         };
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
@@ -708,28 +680,10 @@ impl Engine for Cerebras {
     }
 }
 
-/// What a step's lanes feed the diffusion and video inputs, read off the
-/// host submission and the channels: per lane its port cells and
-/// self-conditioning taps, per voxel row its payload in the port's element.
-/// A port cell read off a channel: its kind, its channel index, its values.
-type PortCell = (engine::fire::PortKind, u8, Vec<f32>);
-/// A lane's self-conditioning feed: taps, rows, weights.
-type SelfCondFeed = (u32, Vec<i32>, Vec<f32>);
-
+/// Per lane its input cells (id, bytes in the input's element); per voxel row its payload.
 struct LaneFeeds {
-    cells: Vec<Vec<PortCell>>,
-    self_cond: Vec<Option<SelfCondFeed>>,
+    cells: Vec<Vec<(u32, Vec<u8>)>>,
     voxels: Vec<Vec<u8>>,
-}
-
-fn f32_cell(value: eta_exec::Value, what: &str) -> EngineResult<Vec<f32>> {
-    match value {
-        eta_exec::Value::F32(values) => Ok(values),
-        other => Err(Error::Program(format!(
-            "{what} holds a {:?} cell; a float port is fed f32 cells",
-            other.dtype()
-        ))),
-    }
 }
 
 /// `PIE_CEREBRAS_CAPTURE=<dir>` writes every submitted step there as JSON
@@ -925,119 +879,114 @@ impl Cerebras {
         Ok(out)
     }
 
-    /// Reads every port cell, self-conditioning tap and voxel payload a
-    /// step's lanes feed (engine-cuda's `serve::ports` and
-    /// `self_cond_cells`, done on the host).
+    /// Runs each attached prologue first: the forward reads the cells a prologue put.
+    fn run_prologues(&mut self, submission: &engine::fire::Step) -> EngineResult<()> {
+        let prologues: Vec<(InstanceId, u32)> = submission
+            .attachments
+            .iter()
+            .filter(|attachment| {
+                !attachment.adapter_only && self.programs.prologue_runs(attachment.instance)
+            })
+            .map(|attachment| (attachment.instance, attachment.lane))
+            .collect();
+        if prologues.is_empty() {
+            return Ok(());
+        }
+        let device = self
+            .shell
+            .as_ref()
+            .ok_or_else(|| Error::Load("the cerebras engine has no model loaded".into()))?
+            .device();
+        self.programs
+            .fire_guests(device, &prologues, None, 0, 0, Stage::Prologue)
+            .map_err(refusal)?;
+        Ok(())
+    }
+
     fn lane_feeds(&self, submission: &engine::fire::Step) -> EngineResult<LaneFeeds> {
         let lanes = &submission.lanes;
         let instance_of = |lane: usize| {
             submission
                 .attachments
                 .iter()
-                .find(|attached| attached.lane as usize == lane)
+                .find(|attached| {
+                    (attached.lane as usize..(attached.lane + attached.lanes) as usize)
+                        .contains(&lane)
+                })
                 .map(|attached| attached.instance)
         };
         let shell = self.shell.as_ref();
-        let mut cells: Vec<Vec<(engine::fire::PortKind, u8, Vec<f32>)>> =
-            vec![Vec::new(); lanes.len()];
-        let mut self_cond = vec![None; lanes.len()];
+        let mut cells: Vec<Vec<(u32, Vec<u8>)>> = vec![Vec::new(); lanes.len()];
+        let mut voxel_cells: Vec<Option<Vec<u8>>> = vec![None; lanes.len()];
         for (at, lane) in lanes.iter().enumerate() {
-            for feed in &lane.ports {
+            for feed in &lane.inputs {
+                let seat = shell
+                    .and_then(|shell| shell.input_seat(feed.id))
+                    .ok_or_else(|| {
+                        Error::Invalid(format!(
+                            "lane {at} feeds guest input {} and this plan reads no such input",
+                            feed.id
+                        ))
+                    })?;
                 let instance = instance_of(at).ok_or_else(|| {
                     Error::Program(format!(
-                        "lane {at} feeds {:?} port {} off channel {} but attaches no \
-                         instance; a port cell is read through the instance that carries the \
+                        "lane {at} feeds guest input {} off channel {} but attaches no \
+                         instance; an input cell is read through the instance that carries the \
                          channel",
-                        feed.kind, feed.port, feed.channel
+                        feed.id, feed.channel
                     ))
                 })?;
-                let what = format!(
-                    "channel {} (lane {at}'s {:?} port {})",
-                    feed.channel, feed.kind, feed.port
-                );
                 let cell = self
                     .programs
                     .feed_cell(instance, feed.channel)
                     .map_err(refusal)?;
-                cells[at].push((feed.kind, feed.port, f32_cell(cell, &what)?));
-            }
-            if let Some(sc) = &lane.self_cond {
-                let (rows, weights) = match sc.channels {
-                    Some((rows, weights)) => {
-                        let instance = instance_of(at).ok_or_else(|| {
-                            Error::Program(format!(
-                                "lane {at} reads its self-conditioning taps off channels but \
-                                 attaches no instance"
-                            ))
-                        })?;
-                        let ids = match self.programs.feed_cell(instance, rows).map_err(refusal)? {
-                            eta_exec::Value::I32(ids) => ids,
-                            eta_exec::Value::U32(ids) => {
-                                ids.into_iter().map(|id| id as i32).collect()
-                            }
-                            other => {
-                                return Err(Error::Program(format!(
-                                    "lane {at}'s self-conditioning rows channel holds a {:?} \
-                                     cell, not row ids",
-                                    other.dtype()
-                                )));
-                            }
-                        };
-                        let weights = f32_cell(
-                            self.programs
-                                .feed_cell(instance, weights)
-                                .map_err(refusal)?,
-                            "the self-conditioning weights channel",
-                        )?;
-                        (ids, weights)
-                    }
-                    None => (
-                        sc.rows.iter().map(|&id| id as i32).collect(),
-                        sc.weights().collect(),
-                    ),
-                };
-                self_cond[at] = Some((sc.taps, rows, weights));
+                let bytes = crate::dit::cell_bytes(&cell, seat.dtype).map_err(|why| {
+                    Error::Program(format!(
+                        "channel {} (lane {at}'s guest input {}) holds a {:?} cell for a {:?} \
+                         input: {why}",
+                        feed.channel,
+                        feed.id,
+                        cell.dtype(),
+                        seat.dtype
+                    ))
+                })?;
+                if seat.voxel() {
+                    voxel_cells[at] = Some(bytes);
+                } else {
+                    cells[at].push((feed.id, bytes));
+                }
             }
         }
 
         let mut voxels = Vec::with_capacity(submission.voxels.len());
         for row in &submission.voxels {
-            let element = shell.and_then(Shell::voxel_element);
-            let fed = cells
-                .get(row.lane as usize)
-                .and_then(|lane| {
-                    lane.iter()
-                        .find(|(kind, _, _)| *kind == engine::fire::PortKind::Voxels)
-                })
-                .map(|(_, _, values)| values.as_slice());
-            let values = if row.payload.is_empty() {
-                fed.unwrap_or(&[])
-            } else {
-                row.payload.as_slice()
-            };
-            if values.is_empty() {
-                voxels.push(Vec::new());
+            if row.payload.is_empty() {
+                voxels.push(
+                    voxel_cells
+                        .get(row.lane as usize)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or_default(),
+                );
                 continue;
             }
-            let Some(element) = element else {
+            let Some(element) = shell.and_then(Shell::voxel_element) else {
                 return Err(Error::Invalid(format!(
-                    "lane {} carries a voxel payload and this plan reads no voxel port",
+                    "lane {} carries a voxel payload and this plan reads no voxel input",
                     row.lane
                 )));
             };
-            voxels.push(crate::dit::port_bytes(values, element).map_err(|why| {
-                Error::Unsupported {
-                    verb: why,
-                    engine: "cerebras",
-                }
-            })?);
+            voxels.push(
+                crate::dit::payload_bytes(&row.payload, element).map_err(|why| {
+                    Error::Unsupported {
+                        verb: why,
+                        engine: "cerebras",
+                    }
+                })?,
+            );
         }
 
-        Ok(LaneFeeds {
-            cells,
-            self_cond,
-            voxels,
-        })
+        Ok(LaneFeeds { cells, voxels })
     }
 
     fn fire_step(
@@ -1046,18 +995,27 @@ impl Cerebras {
         latch: &std::sync::Arc<crate::program::Latch>,
     ) -> EngineResult<(FireTicket, StepSettle)> {
         capture(submission);
+        // Checked before a prologue moves the cursors the caller predicted.
+        for attachment in &submission.attachments {
+            if let Some(lane) = submission.lanes.get(attachment.lane as usize)
+                && !lane.channels.is_empty()
+                && let Some(why) = self
+                    .programs
+                    .disagreeing_ticket(attachment.instance, &lane.channels)
+            {
+                return Err(Error::Program(format!(
+                    "this fire's channel predictions and the engine's disagree: {why}"
+                )));
+            }
+        }
+        self.run_prologues(submission)?;
         let fed = self.lane_feeds(submission)?;
-        let port_cells: Vec<Vec<crate::serve::PortCell<'_>>> = fed
+        let input_cells: Vec<Vec<crate::serve::InputCell<'_>>> = fed
             .cells
             .iter()
             .map(|lane| {
                 lane.iter()
-                    .filter(|(kind, _, _)| *kind != engine::fire::PortKind::Voxels)
-                    .map(|(kind, port, values)| crate::serve::PortCell {
-                        kind: *kind,
-                        port: *port,
-                        values,
-                    })
+                    .map(|(id, bytes)| crate::serve::InputCell { id: *id, bytes })
                     .collect()
             })
             .collect();
@@ -1130,16 +1088,6 @@ impl Cerebras {
                         submission.lanes.len()
                     )));
                 };
-                if lane_at == 0
-                    && !lane.channels.is_empty()
-                    && let Some(why) = self
-                        .programs
-                        .disagreeing_ticket(attachment.instance, &lane.channels)
-                {
-                    return Err(Error::Program(format!(
-                        "this fire's channel predictions and the engine's disagree: {why}"
-                    )));
-                }
                 if device_resolved {
                     continue;
                 }
@@ -1242,24 +1190,14 @@ impl Cerebras {
                 captures_scores: lane.captures_scores,
                 rs: &verbs[at],
                 media: media_of[at],
-                bidirectional: lane.bidirectional,
-                ports: &port_cells[at],
-                stream: lane.stream as u8,
+                inputs: &input_cells[at],
                 group: lane.group,
-                self_cond: fed.self_cond[at].as_ref().map(|(taps, rows, weights)| {
-                    crate::serve::SelfCond {
-                        taps: *taps,
-                        rows,
-                        weights,
-                    }
-                }),
                 kv_less: lane.kv_less,
                 writes: device[at]
                     .as_ref()
                     .and_then(|resolved| resolved.writes.as_ref())
                     .map(|(pages, offsets)| (pages.as_slice(), offsets.as_slice())),
                 first: device[at].as_ref().and_then(|resolved| resolved.first),
-                attn_classes: lane.attn_classes.as_ref(),
                 window: match &device[at] {
                     Some(DeviceLane {
                         window: Some(window),
@@ -1293,6 +1231,7 @@ impl Cerebras {
         let attached: Vec<(InstanceId, u32)> = submission
             .attachments
             .iter()
+            .filter(|attachment| !attachment.adapter_only)
             .map(|attachment| (attachment.instance, attachment.lane))
             .collect();
         let mut on_device = vec![false; submission.lanes.len()];
@@ -1311,6 +1250,7 @@ impl Cerebras {
                     vocab,
                     mtp_width,
                     Some(latch),
+                    Stage::Epilogue,
                 )
                 .map_err(refusal)?;
             for (&(_, lane), ran) in attached.iter().zip(ran) {

@@ -1,27 +1,8 @@
-//! The pie half of the FLUX.2 miniature golden. Hands the `flux2-mini` row
-//! exactly what `scripts/imagegen/flux2_golden.py --mini` handed diffusers'
-//! `Flux2Transformer2DModel` — the target tokens, the two references'
-//! tokens, the raw `[32, 192]` text stack, the timestep, the guidance scale
-//! and the four rotary coordinates of every row — and reads back the
-//! velocity the head predicts on the target rows, as JSON
-//! `scripts/imagegen/flux2_parity.py` turns into an `.npz` under the
-//! golden's own key names.
+//! The pie half of the FLUX.2 miniature golden: `scripts/imagegen/flux2_golden.py --mini`'s
+//! inputs in, the target's velocity out as JSON for `flux2_parity.py`.
 //!
-//! # THREE LANES, ONE GROUP, ONE FIRE
-//!
-//! `flux_2`'s `denoise` reading declares three streams (D2): the text lane
-//! (`Stream::Text`, the `context` port), the target lane (`Stream::Image`,
-//! the `latents` port) and the reference lane (`Stream::Reference`, the
-//! same `latents` port — a reference is more of the same tokens, at rotary
-//! `T = 10·(i+1)`). One step is three passes, each stating its stream and
-//! all in one group, which packs them `[txt ‖ target ‖ refs]` — the
-//! reference's own layout. Every lane binds the timestep (and the guidance
-//! scale: the miniature has `guidance_embeds`), because the shared
-//! modulation is per lane. Neither `state` nor `embed` is called: a
-//! denoise reading declares no kv space and no tokens.
-//!
-//! Only the target lane reads out: the head runs on `Stream::Image` rows
-//! alone (`pred[:, :S_img]`), so only it carries an epilogue.
+//! One pass, one group, packed `[txt ‖ target ‖ refs]` as the reference packs:
+//! lane 0 the text, lane 1 the target (the only readout), lanes 2.. the references.
 //!
 //! One step only: the miniature golden is one transformer call at
 //! `timestep = 0.5`, not a trajectory.
@@ -52,184 +33,164 @@ struct Input {
     case_7: Option<String>,
 }
 
-/// One batch element of the reference's fixed inputs, flattened row-major:
-/// the target tokens (`hidden_states[:, :S_img]`), the reference tokens
-/// (`hidden_states[:, S_img:]`), the text stack, the ids as f32 rows, the
-/// timestep as the scheduler holds it (`σ·1000`), the raw guidance scale.
+/// `[height, width, channels]`, flattened.
+#[derive(Deserialize)]
+struct Latent {
+    latents: Vec<f32>,
+    height: u32,
+    width: u32,
+}
+
 #[derive(Deserialize)]
 struct Case {
-    /// `[image_rows, channels]`.
-    latents: Vec<f32>,
-    image_rows: u32,
+    target: Latent,
     channels: u32,
-    /// `[reference_rows, channels]`; `reference_rows` may be 0.
     #[serde(default)]
-    reference: Vec<f32>,
-    #[serde(default)]
-    reference_rows: u32,
+    references: Vec<Latent>,
     /// `[text_rows, context_width]`.
     context: Vec<f32>,
     text_rows: u32,
     context_width: u32,
-    /// `[rows, 4]` each.
-    text_positions: Vec<f32>,
-    image_positions: Vec<f32>,
-    #[serde(default)]
-    reference_positions: Vec<f32>,
     /// `σ · 1000`.
     timestep: f32,
-    /// The raw guidance scale; bound only where the model declares the port.
     #[serde(default)]
     guidance: f32,
 }
 
 #[derive(Serialize)]
 struct Output {
-    /// `[image_rows, channels]` — the reference's `mini.out.0[:, :S_img]`.
+    /// `[height · width, channels]`.
     velocity: Vec<f32>,
-    image_rows: u32,
+    height: u32,
+    width: u32,
     channels: u32,
 }
 
-/// The port names this family's `denoise` reading declares, read off
-/// `model::readings()` rather than typed in, so a renamed port fails here
-/// with the model's own vocabulary instead of at the host.
-struct Ports {
-    latents: String,
-    context: String,
-    timestep: String,
-    guidance: Option<String>,
-    positions: String,
-    axes: u32,
+struct Dims {
+    guidance: bool,
     velocity_width: u32,
 }
 
-fn ports(reading: &model::ReadingFact) -> Result<Ports> {
-    let named = |name: &str| -> Result<&model::PortFact> {
-        reading
-            .ports
-            .iter()
-            .find(|port| port.name == name)
-            .ok_or_else(|| format!("reading `{}` declares no port `{name}`", reading.name).into())
+fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::LaneDecl> {
+    let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
+    if lane.state || lane.embeds {
+        return Err(format!(
+            "reading `{reading}`'s `{stream}` lane binds a working set or tokens; a denoise pass \
+             binds neither"
+        ));
+    }
+    let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
+    let mut wants = binds.to_vec();
+    reads.sort_unstable();
+    wants.sort_unstable();
+    if reads != wants {
+        return Err(format!(
+            "reading `{reading}`'s `{stream}` lane reads {reads:?}; this pass binds {wants:?}"
+        ));
+    }
+    Ok(lane)
+}
+
+fn dims(reading: &str, references: bool) -> Result<Dims> {
+    let image = model::lane_of(&[("reading", reading), ("stream", "image")])?;
+    let guidance = image.inputs.iter().any(|i| i.name == "guidance");
+    let scalars: &[&'static str] = if guidance {
+        &["timestep", "guidance"]
+    } else {
+        &["timestep"]
     };
-    Ok(Ports {
-        latents: named("latents")?.name.clone(),
-        context: named("context")?.name.clone(),
-        timestep: named("timestep")?.name.clone(),
-        guidance: reading
-            .ports
-            .iter()
-            .find(|port| port.name == "guidance")
-            .map(|port| port.name.clone()),
-        positions: named("positions")?.name.clone(),
-        axes: named("positions")?.width,
-        velocity_width: reading.readout_width,
+    let with = |rows: &[&'static str]| [rows, scalars].concat();
+    let image = lane_reading(reading, "image", &with(&["latents"]))?;
+    lane_reading(reading, "text", &with(&["context"]))?;
+    if references {
+        lane_reading(reading, "reference", &with(&["latents", "reference"]))?;
+    }
+    let velocity_width = match &image.readout {
+        Some(readout) if readout.kind == model::ReadoutKind::Velocity => readout.width,
+        other => {
+            return Err(format!(
+                "reading `{reading}`'s image lane reads out {other:?}, not a velocity"
+            ));
+        }
+    };
+    Ok(Dims {
+        guidance,
+        velocity_width,
     })
 }
 
-/// The per-lane scalars every lane of the reading binds: one cell PER PASS,
-/// since a seeded channel attaches to one pass only (the runtime's
-/// channel-role rule).
-fn scalars(pass: &ForwardPass, ports: &Ports, case: &Case, tag: &str) -> Result<()> {
-    let t = Channel::from([case.timestep]).named(&format!("t_{tag}"));
-    pass.input(&ports.timestep, &t)?;
-    if let Some(guidance) = &ports.guidance {
-        let g = Channel::from([case.guidance]).named(&format!("g_{tag}"));
-        pass.input(guidance, &g)?;
+fn scalars(pass: &ForwardPass, lane: u32, t: &Channel, g: Option<&Channel>) -> Result<()> {
+    pass.input(lane, "timestep", t)?;
+    if let Some(g) = g {
+        pass.input(lane, "guidance", g)?;
     }
     Ok(())
 }
 
-/// One denoise step: three lanes, one group, one fire, one velocity.
-/// One pipeline per lane of the group (see [`step`]).
-struct Pipes {
-    text: Pipeline,
-    reference: Pipeline,
-    image: Pipeline,
+fn latent(at: &Latent, channels: u32, name: &str) -> Result<Channel> {
+    let want = (at.height * at.width * channels) as usize;
+    if at.latents.len() != want {
+        return Err(format!(
+            "`{name}` carries {} numbers and {}x{}x{channels} is {want}",
+            at.latents.len(),
+            at.height,
+            at.width
+        ));
+    }
+    Ok(Channel::from_shaped([at.height, at.width, channels], at.latents.as_slice()).named(name))
 }
 
-/// ONE PIPELINE PER LANE. A pipeline is serial — the scheduler never seats
-/// two of its passes in one step — so three passes down one pipeline are
-/// three fires of one lane each, the attention group never forms, and the
-/// image lane denoises with no caption and no reference. That reads as a
-/// plausible answer: on a miniature whose random-init caption is small, it
-/// even passed this file's own tolerance, which is how it went unnoticed
-/// until the frame gate began refusing a group that could not compose.
-async fn step(case: &Case, ports: &Ports, reading: &str, pipes: &Pipes) -> Result<Vec<f32>> {
+async fn step(case: &Case, dims: &Dims, reading: &str, pipe: &Pipeline) -> Result<Vec<f32>> {
     let group = 0;
-    let rows = case.image_rows;
-    let width = case.channels;
+    let pass = ForwardPass::new();
+    let t = Channel::from([case.timestep]).named("t");
+    let g = dims
+        .guidance
+        .then(|| Channel::from([case.guidance]).named("g"));
 
-    // The text lane: the raw `[L, joint_attention_dim]` stack, embedded by
-    // the plan (the miniature has no encoder).
-    let text = ForwardPass::new();
-    text.reading(reading)?;
-    text.stream(LaneStream::Text)?;
-    text.group(group)?;
+    // The raw `[L, joint_attention_dim]` stack: the miniature has no encoder.
+    pass.switch(0, "reading", reading)?;
+    pass.switch(0, "stream", "text")?;
+    pass.group(0, group)?;
     let ctx = Channel::from_shaped(
         [case.text_rows, case.context_width],
         case.context.as_slice(),
     )
     .named("context");
-    let txt_pos =
-        Channel::from_shaped([case.text_rows, ports.axes], case.text_positions.as_slice())
-            .named("txt_pos");
-    text.input(&ports.context, &ctx)?;
-    text.input(&ports.positions, &txt_pos)?;
-    scalars(&text, ports, case, "txt")?;
+    pass.input(0, "context", &ctx)?;
+    scalars(&pass, 0, &t, g.as_ref())?;
 
-    // The reference lane: every reference's tokens concatenated, at their
-    // own `T` offsets. Same port, same weights as the target; no readout.
-    let reference = (case.reference_rows > 0).then(|| ForwardPass::new());
-    if let Some(reference) = &reference {
-        reference.reading(reading)?;
-        reference.stream(LaneStream::Reference)?;
-        reference.group(group)?;
-        let r = Channel::from_shaped([case.reference_rows, width], case.reference.as_slice())
-            .named("reference");
-        let ref_pos = Channel::from_shaped(
-            [case.reference_rows, ports.axes],
-            case.reference_positions.as_slice(),
-        )
-        .named("ref_pos");
-        reference.input(&ports.latents, &r)?;
-        reference.input(&ports.positions, &ref_pos)?;
-        scalars(reference, ports, case, "ref")?;
+    pass.switch(1, "reading", reading)?;
+    pass.switch(1, "stream", "image")?;
+    pass.group(1, group)?;
+    let x = latent(&case.target, case.channels, "latents")?;
+    pass.input(1, "latents", &x)?;
+    scalars(&pass, 1, &t, g.as_ref())?;
+
+    for (k, reference) in case.references.iter().enumerate() {
+        let lane = 2 + k as u32;
+        pass.switch(lane, "reading", reading)?;
+        pass.switch(lane, "stream", "reference")?;
+        pass.group(lane, group)?;
+        let r = latent(reference, case.channels, &format!("reference{k}"))?;
+        let ordinal = Channel::from([k as f32]).named(&format!("ordinal{k}"));
+        pass.input(lane, "latents", &r)?;
+        pass.input(lane, "reference", &ordinal)?;
+        scalars(&pass, lane, &t, g.as_ref())?;
     }
 
-    // The target lane: the latents in, the velocity out.
-    let out = Channel::new([rows, width], dtype::f32).named("velocity");
-    let image = ForwardPass::new();
-    image.reading(reading)?;
-    image.stream(LaneStream::Image)?;
-    image.group(group)?;
-    let x = Channel::from_shaped([rows, width], case.latents.as_slice()).named("latents");
-    let img_pos =
-        Channel::from_shaped([rows, ports.axes], case.image_positions.as_slice()).named("img_pos");
-    image.input(&ports.latents, &x)?;
-    image.input(&ports.positions, &img_pos)?;
-    scalars(&image, ports, case, "img")?;
-    let velocity_width = ports.velocity_width;
-    let readback = out.clone();
-    image.epilogue(move || {
-        readback.put(intrinsics::velocity(velocity_width));
+    let voxels = case.target.height * case.target.width;
+    let velocity_width = dims.velocity_width;
+    let out = Channel::new([voxels, velocity_width], dtype::f32).named("velocity");
+    pass.epilogue(move || {
+        out.put(intrinsics::velocity(1, voxels, velocity_width));
     });
-
-    text.submit(&pipes.text).context("text lane")?;
-    if let Some(reference) = &reference {
-        reference
-            .submit(&pipes.reference)
-            .context("reference lane")?;
-    }
-    image.submit(&pipes.image).context("image lane")?;
-    out.take_host::<Vec<f32>>().await.map_err(Into::into)
+    pass.submit(pipe).context("the denoise step")?;
+    out.take_host::<Vec<f32>>().await
 }
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Text {
-        return Err("flux_2 is a `forward` pass with no state bound on its denoise reading".into());
-    }
     let pieces: String = [
         &input.case_0,
         &input.case_1,
@@ -256,42 +217,24 @@ async fn main(input: Input) -> Result<Output> {
     let case: Case =
         inferlet::serde_json::from_str(&text).map_err(|why| format!("case json: {why}"))?;
 
-    let reading = model::readings()
-        .into_iter()
-        .find(|reading| reading.name == "denoise")
-        .ok_or("this model declares no `denoise` reading")?;
-    if reading.has_kv || reading.takes_tokens {
+    let reading = "denoise";
+    let dims = dims(reading, !case.references.is_empty())?;
+    if dims.velocity_width != case.channels {
         return Err(format!(
-            "reading `{}` binds a kv space or tokens; a denoise pass binds neither",
-            reading.name
-        )
-        .into());
+            "the model reads a {}-wide velocity and the case's latent has {} channels",
+            dims.velocity_width, case.channels
+        ));
     }
-    if reading.readout_width != case.channels {
-        return Err(format!(
-            "the model reads a {}-wide velocity and the case carries {}-wide tokens",
-            reading.readout_width, case.channels
-        )
-        .into());
+    if !dims.guidance && case.guidance != 0.0 {
+        return Err("the case carries a guidance scale and this row reads no `guidance`".into());
     }
-    let ports = ports(&reading)?;
-    if ports.guidance.is_none() && case.guidance != 0.0 {
-        return Err(
-            "the case carries a guidance scale and this row declares no guidance port".into(),
-        );
-    }
-    let pipes = Pipes {
-        text: Pipeline::new(),
-        reference: Pipeline::new(),
-        image: Pipeline::new(),
-    };
-    let velocity = step(&case, &ports, &reading.name, &pipes).await?;
-    pipes.text.close();
-    pipes.reference.close();
-    pipes.image.close();
+    let pipe = Pipeline::new();
+    let velocity = step(&case, &dims, reading, &pipe).await?;
+    pipe.close();
     Ok(Output {
         velocity,
-        image_rows: case.image_rows,
+        height: case.target.height,
+        width: case.target.width,
         channels: case.channels,
     })
 }

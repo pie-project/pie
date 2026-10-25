@@ -9,8 +9,6 @@ use eta_dsl::{Channel as DslChannel, IntoConst, IntoPut, IntoShape, Port, Shape,
 
 use crate::pie::inferlet::channel as wit_channel;
 use crate::pie::inferlet::forward as wit_forward;
-use crate::pie::inferlet::forward_diffusion as wit_diffusion;
-pub use crate::pie::inferlet::model::LaneStream;
 use crate::pie::inferlet::pipeline as wit_pipeline;
 use crate::pie::inferlet::types::Dtype as WitDtype;
 use crate::pie::inferlet::working_set as wit_ws;
@@ -436,9 +434,6 @@ pub struct StateGeometry<'a> {
     pub slots: Option<&'a Channel>,
     /// Per lane, how many slots the lane reads.
     pub kv_len: Option<&'a Channel>,
-    /// Per row, the slots it may read; a recurrent layer needs the same mask
-    /// over buffered slots for every row of a lane.
-    pub mask: Option<&'a Channel>,
     pub fold: Fold<'a>,
 }
 
@@ -453,100 +448,6 @@ impl StateGeometry<'_> {
 }
 
 type StageClosure = Box<dyn Fn()>;
-
-pub trait PassWit: Sized + 'static {
-    fn new() -> Self;
-    fn state(
-        &self,
-        lanes: &[&wit_ws::WorkingSet],
-        geom: &wit_forward::StateGeometry<'_>,
-    ) -> Result<(), String>;
-    fn embed(
-        &self,
-        tokens: &wit_channel::Channel,
-        indptr: &wit_channel::Channel,
-    ) -> Result<(), String>;
-    fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String>;
-    fn set_max_layers(&self, max_layers: u32) -> Result<(), String>;
-    fn media(&self, spans: &[wit_forward::MediaSpan<'_>]) -> Result<(), String>;
-    fn reading(&self, name: &str) -> Result<(), String>;
-    fn input(&self, port: &str, ch: &wit_channel::Channel) -> Result<(), String>;
-    fn stream(&self, s: LaneStream) -> Result<(), String>;
-    fn group(&self, id: u32) -> Result<(), String>;
-    fn peer(&self, group: u32) -> Result<(), String>;
-    fn attention_classes(&self, classes: &[i32], table: &[u8], count: u32) -> Result<(), String>;
-    fn program(&self, bytes: &[u8], channels: &[&wit_channel::Channel]) -> Result<(), String>;
-    fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String>;
-}
-
-macro_rules! pass_wit {
-    ($wit:ident) => {
-        impl PassWit for $wit::ForwardPass {
-            fn new() -> Self {
-                $wit::ForwardPass::new()
-            }
-            fn state(
-                &self,
-                lanes: &[&wit_ws::WorkingSet],
-                geom: &wit_forward::StateGeometry<'_>,
-            ) -> Result<(), String> {
-                $wit::ForwardPass::state(self, lanes, geom)
-            }
-            fn embed(
-                &self,
-                tokens: &wit_channel::Channel,
-                indptr: &wit_channel::Channel,
-            ) -> Result<(), String> {
-                $wit::ForwardPass::embed(self, tokens, indptr)
-            }
-            fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
-                $wit::ForwardPass::readout(self, indices)
-            }
-            fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
-                $wit::ForwardPass::set_max_layers(self, max_layers)
-            }
-            fn media(&self, spans: &[wit_forward::MediaSpan<'_>]) -> Result<(), String> {
-                $wit::ForwardPass::media(self, spans)
-            }
-            fn reading(&self, name: &str) -> Result<(), String> {
-                $wit::ForwardPass::reading(self, name)
-            }
-            fn input(&self, port: &str, ch: &wit_channel::Channel) -> Result<(), String> {
-                $wit::ForwardPass::input(self, port, ch)
-            }
-            fn stream(&self, s: LaneStream) -> Result<(), String> {
-                $wit::ForwardPass::stream(self, s)
-            }
-            fn group(&self, id: u32) -> Result<(), String> {
-                $wit::ForwardPass::group(self, id)
-            }
-            fn peer(&self, group: u32) -> Result<(), String> {
-                $wit::ForwardPass::peer(self, group)
-            }
-            fn attention_classes(
-                &self,
-                classes: &[i32],
-                table: &[u8],
-                count: u32,
-            ) -> Result<(), String> {
-                $wit::ForwardPass::attention_classes(self, classes, table, count)
-            }
-            fn program(
-                &self,
-                bytes: &[u8],
-                channels: &[&wit_channel::Channel],
-            ) -> Result<(), String> {
-                $wit::ForwardPass::program(self, bytes, channels)
-            }
-            fn submit(on: &wit_pipeline::Pipeline, slots: &[Option<&Self>]) -> Result<(), String> {
-                $wit::submit(on, slots)
-            }
-        }
-    };
-}
-
-pass_wit!(wit_forward);
-pass_wit!(wit_diffusion);
 
 pub mod adapter {
     use super::Channel;
@@ -617,8 +518,9 @@ pub mod adapter {
     }
 }
 
-pub struct Pass<W: PassWit> {
-    wit: W,
+/// A forward pass: its lanes' bindings and switches, and the program its fires run.
+pub struct ForwardPass {
+    wit: wit_forward::ForwardPass,
     inner: RefCell<ForwardInner>,
 }
 
@@ -632,11 +534,11 @@ struct ForwardInner {
     program_attached: bool,
     adapter_lowrank_sites: u32,
     adapter_scale_sites: u32,
-    port_inputs: Vec<(String, DslChannel)>,
-    latent_rows: Option<u32>,
+    inputs: Vec<(u32, String, DslChannel)>,
+    switches: Vec<(u32, String, String)>,
 }
 
-impl<W: PassWit> Pass<W> {
+impl ForwardPass {
     fn binds_device_mask(&self) -> bool {
         self.inner
             .borrow()
@@ -645,11 +547,26 @@ impl<W: PassWit> Pass<W> {
             .any(|(port, _)| *port == Port::AttnMask)
     }
 
-    pub fn new() -> Pass<W> {
+    /// Whether a switch is off its model's default; such a pass posts one fire at a time.
+    fn switched(&self) -> bool {
+        let inner = self.inner.borrow();
+        if inner.switches.is_empty() {
+            return false;
+        }
+        let declared = crate::model::switches();
+        inner.switches.iter().any(|(_, name, value)| {
+            declared
+                .iter()
+                .find(|decl| decl.name == *name)
+                .is_some_and(|decl| decl.values.first() != Some(value))
+        })
+    }
+
+    pub fn new() -> ForwardPass {
         let vocab = crate::model::output_vocab_size();
         let page_size = kv_page_size();
-        Pass {
-            wit: W::new(),
+        ForwardPass {
+            wit: wit_forward::ForwardPass::new(),
             inner: RefCell::new(ForwardInner {
                 ports: Vec::new(),
                 stages: Vec::new(),
@@ -660,81 +577,67 @@ impl<W: PassWit> Pass<W> {
                 program_attached: false,
                 adapter_lowrank_sites: 0,
                 adapter_scale_sites: 0,
-                port_inputs: Vec::new(),
-                latent_rows: None,
+                inputs: Vec::new(),
+                switches: Vec::new(),
             }),
         }
     }
 
-    pub fn reading(&self, name: &str) -> Result<(), String> {
+    /// Sets lane `lane`'s model switch `name` (`model::switches()`) to `value`.
+    pub fn switch(&self, lane: u32, name: &str, value: &str) -> Result<(), String> {
         if self.inner.borrow().program_attached {
             return Err("forward pass program is already attached".to_string());
         }
-        self.wit.reading(name)
+        self.wit.switch(lane, name, value)?;
+        self.inner
+            .borrow_mut()
+            .switches
+            .push((lane, name.to_string(), value.to_string()));
+        Ok(())
     }
 
-    pub fn input(&self, port: &str, ch: &Channel) -> Result<(), String> {
+    /// Binds `ch` to lane `lane`'s model input `name`, its committed cell read every submit.
+    pub fn input(&self, lane: u32, name: &str, ch: &Channel) -> Result<(), String> {
         {
             let inner = self.inner.borrow();
             if inner.program_attached {
                 return Err("forward pass program is already attached".to_string());
             }
-            if inner.port_inputs.iter().any(|(bound, _)| bound == port) {
-                return Err(format!("port `{port}` is already bound on this pass"));
+            if inner
+                .inputs
+                .iter()
+                .any(|(at, bound, _)| *at == lane && bound == name)
+            {
+                return Err(format!("input `{name}` is already bound on lane {lane}"));
             }
         }
         let wit = ch.wit();
-        self.wit.input(port, wit.as_ref())?;
-        let row_port = crate::model::readings().iter().any(|reading| {
-            reading.ports.iter().any(|fact| {
-                fact.name == port
-                    && matches!(
-                        fact.kind,
-                        crate::model::PortKind::Latents | crate::model::PortKind::Context
-                    )
-            })
-        });
-        let mut inner = self.inner.borrow_mut();
-        if row_port && let Some(&rows) = ch.shape().dims().first() {
-            inner.latent_rows = Some(rows);
-        }
-        inner.port_inputs.push((port.to_string(), ch.dsl()));
+        self.wit.input(lane, name, wit.as_ref())?;
+        self.inner
+            .borrow_mut()
+            .inputs
+            .push((lane, name.to_string(), ch.dsl()));
         Ok(())
     }
 
-    pub fn stream(&self, stream: LaneStream) -> Result<(), String> {
+    /// Puts lane `lane` in attention group `id`.
+    pub fn group(&self, lane: u32, id: u32) -> Result<(), String> {
         if self.inner.borrow().program_attached {
             return Err("forward pass program is already attached".to_string());
         }
-        self.wit.stream(stream)
+        self.wit.group(lane, id)
     }
 
-    pub fn group(&self, id: u32) -> Result<(), String> {
-        if self.inner.borrow().program_attached {
-            return Err("forward pass program is already attached".to_string());
-        }
-        self.wit.group(id)
-    }
-
-    pub fn peer(&self, ordinal: u32) -> Result<(), String> {
-        if self.inner.borrow().program_attached {
-            return Err("forward pass program is already attached".to_string());
-        }
-        self.wit.peer(ordinal)
-    }
-
-    /// A structured attention mask: one class per row of this pass (or -1),
-    /// and a `count x count` table of which q class attends which kv class.
-    pub fn attention_classes(
-        &self,
-        classes: &[i32],
-        table: &[u8],
-        count: u32,
-    ) -> Result<(), String> {
-        if self.inner.borrow().program_attached {
-            return Err("forward pass program is already attached".to_string());
-        }
-        self.wit.attention_classes(classes, table, count)
+    /// Per row, the rows it attends: kv slots if the lanes read kv, else its group's rows.
+    pub fn mask(&self, rows: &Channel) -> Result<(), String> {
+        self.ensure_ports_available(&[Port::AttnMask])?;
+        let wit = rows.wit();
+        self.wit.mask(wit.as_ref())?;
+        self.inner
+            .borrow_mut()
+            .ports
+            .push((Port::AttnMask, claim_port(Port::AttnMask, rows)));
+        Ok(())
     }
 
     fn ensure_ports_available(&self, ports: &[Port]) -> Result<(), String> {
@@ -785,7 +688,6 @@ impl<W: PassWit> Pass<W> {
             (Port::Positions, geom.positions.copied()),
             (Port::Slots, geom.slots.copied()),
             (Port::KvLen, geom.kv_len.copied()),
-            (Port::AttnMask, geom.mask.copied()),
             (Port::Fold, fold),
         ];
         if !rebind {
@@ -808,8 +710,7 @@ impl<W: PassWit> Pass<W> {
                 positions: wits[0].as_deref(),
                 slots: wits[1].as_deref(),
                 kv_len: wits[2].as_deref(),
-                mask: wits[3].as_deref(),
-                fold: wits[4].as_deref(),
+                fold: wits[3].as_deref(),
             },
         )?;
         let mut inner = self.inner.borrow_mut();
@@ -835,12 +736,8 @@ impl<W: PassWit> Pass<W> {
         Ok(())
     }
 
-    pub fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
-        self.wit.set_max_layers(max_layers)
-    }
-
-    pub fn media(&self, spans: &[wit_forward::MediaSpan<'_>]) -> Result<(), String> {
-        self.wit.media(spans)
+    pub fn media(&self, lane: u32, spans: &[wit_forward::MediaSpan<'_>]) -> Result<(), String> {
+        self.wit.media(lane, spans)
     }
 
     pub fn adapter(
@@ -971,33 +868,18 @@ impl<W: PassWit> Pass<W> {
         }
         let inner = self.inner.borrow();
         let mut builder = Builder::new(inner.vocab, inner.page_size);
-        if let Some(rows) = inner.latent_rows {
-            builder.rows_hint(rows);
-        }
         for (port, channel) in &inner.ports {
             builder.bind_port_recorded(*port, channel.clone());
         }
-        let port_channels: Vec<DslChannel> =
-            inner.port_inputs.iter().map(|(_, ch)| ch.clone()).collect();
-        let author_prologue = inner
-            .stages
-            .iter()
-            .find(|(stage, _)| *stage == Stage::Prologue)
-            .map(|(_, body)| body);
-        if !port_channels.is_empty() {
-            builder.stage(Stage::Prologue, move || {
-                for ch in &port_channels {
-                    let _ = ch.read();
-                }
-                if let Some(body) = author_prologue {
-                    body();
-                }
-            });
+        // A channel several lanes read is one input of the program.
+        let mut listed: Vec<u64> = Vec::new();
+        for (_, _, channel) in &inner.inputs {
+            if !listed.contains(&channel.gid()) {
+                listed.push(channel.gid());
+                builder.bind_input(channel.clone());
+            }
         }
         for (stage, body) in &inner.stages {
-            if *stage == Stage::Prologue && !inner.port_inputs.is_empty() {
-                continue;
-            }
             builder.stage(*stage, body);
         }
         let traced = builder.build().map_err(|error| error.to_string())?;
@@ -1016,9 +898,9 @@ impl<W: PassWit> Pass<W> {
     }
 }
 
-impl<W: PassWit> Default for Pass<W> {
+impl Default for ForwardPass {
     fn default() -> Self {
-        Pass::new()
+        ForwardPass::new()
     }
 }
 
@@ -1079,7 +961,7 @@ fn even_spans(n: u32, cap: u32) -> Vec<(u32, u32)> {
     out
 }
 
-pub fn submit_frame<W: PassWit>(on: &Pipeline, slots: &[Option<&Pass<W>>]) -> Result<(), String> {
+pub fn submit_frame(on: &Pipeline, slots: &[Option<&ForwardPass>]) -> Result<(), String> {
     let k = frame_size();
     if slots.len() > k {
         return Err(format!(
@@ -1093,14 +975,15 @@ pub fn submit_frame<W: PassWit>(on: &Pipeline, slots: &[Option<&Pass<W>>]) -> Re
     if slots.iter().flatten().next().is_none() {
         return Ok(());
     }
-    let mut borrows: Vec<Option<&W>> = slots.iter().map(|slot| slot.map(|p| &p.wit)).collect();
+    let mut borrows: Vec<Option<&wit_forward::ForwardPass>> =
+        slots.iter().map(|slot| slot.map(|p| &p.wit)).collect();
     borrows.resize(k, None);
-    W::submit(&on.wit, &borrows)
+    wit_forward::submit(&on.wit, &borrows)
 }
 
-pub async fn run_ahead<W: PassWit>(
+pub async fn run_ahead(
     on: &Pipeline,
-    pass: &Pass<W>,
+    pass: &ForwardPass,
     budget: usize,
     mut on_token: impl AsyncFnMut() -> Result<std::ops::ControlFlow<()>, String>,
 ) -> Result<usize, String> {
@@ -1109,13 +992,8 @@ pub async fn run_ahead<W: PassWit>(
     if budget == 0 {
         return Ok(0);
     }
-    // A recurrent state holds one slot per posted frame and a canvas is
-    // redrawn whole, so those post one pass at a time; a window's ring
-    // takes its pages pass by pass, as kv does.
-    let r = if pass.binds_device_mask()
-        || crate::model::rs_state_size() > 0
-        || crate::model::pass_kind() == crate::model::ForwardKind::Diffusion
-    {
+    // A recurrent state, an off-default path and a ring all post one pass at a time.
+    let r = if pass.binds_device_mask() || crate::model::rs_state_size() > 0 || pass.switched() {
         1
     } else {
         frame_size()
@@ -1131,7 +1009,7 @@ pub async fn run_ahead<W: PassWit>(
         if live == 0 {
             return Ok(());
         }
-        let slots: Vec<Option<&Pass<W>>> = vec![Some(pass); live];
+        let slots: Vec<Option<&ForwardPass>> = vec![Some(pass); live];
         submit_frame(on, &slots)?;
         *submitted += live;
         Ok(())
@@ -1206,8 +1084,8 @@ impl Default for Pipeline {
 
 pub mod shared_prelude {
     pub use super::{
-        Channel, Fold, LaneStream, Pipeline, StateGeometry, TOKEN_PAD, WorkingSet,
-        channel_capacity, frame_size, kv_page_size, max_readout_rows, readout_spans,
+        Channel, Fold, Pipeline, StateGeometry, TOKEN_PAD, WorkingSet, channel_capacity,
+        frame_size, kv_page_size, max_readout_rows, readout_spans,
     };
     pub use crate::{Context, Result, model};
     pub use eta_dsl::Stage;
@@ -1225,35 +1103,13 @@ pub mod shared_prelude {
     pub use std::ops::ControlFlow;
 }
 
-impl Pass<wit_forward::ForwardPass> {
+impl ForwardPass {
     /// Slots at which the runtime keeps a recurrent state, so a later pass over
     /// the same tokens resumes there.
     pub fn checkpoints(&self, slots: &[u32]) -> Result<(), String> {
-        wit_forward::ForwardPass::checkpoints(&self.wit, slots)
-    }
-
-    /// These rows are a block drafter's proposal, not the sequence's own.
-    pub fn set_drafting_block(&self, on: bool) -> Result<(), String> {
-        wit_forward::ForwardPass::set_drafting_block(&self.wit, on)
+        self.wit.checkpoints(slots)
     }
 }
-
-impl Pass<wit_diffusion::ForwardPass> {
-    pub fn canvas(&self, mode: wit_diffusion::Mode) -> Result<(), String> {
-        wit_diffusion::ForwardPass::canvas(&self.wit, mode)
-    }
-
-    pub fn self_conditioning(&self, rows: &[u32], weights: &[f32]) -> Result<(), String> {
-        wit_diffusion::ForwardPass::self_conditioning(&self.wit, rows, weights)
-    }
-
-    pub fn self_conditioning_from(&self, rows: &Channel, weights: &Channel) -> Result<(), String> {
-        wit_diffusion::ForwardPass::self_conditioning_from(&self.wit, &rows.wit(), &weights.wit())
-    }
-}
-
-/// Every text model's pass, whatever state the model keeps.
-pub type ForwardPass = Pass<wit_forward::ForwardPass>;
 
 pub mod prelude {
     pub use super::{ForwardPass, run_ahead, submit_frame};
@@ -1261,16 +1117,9 @@ pub mod prelude {
 }
 
 pub mod diffusion {
-    pub type ForwardPass = super::Pass<super::wit_diffusion::ForwardPass>;
-    pub use super::wit_diffusion::Mode;
-    pub use super::{run_ahead, submit_frame};
-
     pub mod prelude {
-        pub use super::{
-            ForwardPass, Mode, entropy_bound_accept, linear_temperature, run_ahead,
-            stable_and_confident, submit_frame,
-        };
-        pub use crate::eta::shared_prelude::*;
+        pub use super::{entropy_bound_accept, linear_temperature, stable_and_confident};
+        pub use crate::eta::prelude::*;
     }
 
     use super::{

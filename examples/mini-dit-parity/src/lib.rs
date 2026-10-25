@@ -1,9 +1,5 @@
-//! The pie half of the `mini-dit` golden. Hands the model exactly what
-//! `scripts/imagegen/mini_dit_ref.py` handed PyTorch — the patch rows, the
-//! caption rows, the cross-attention context, the timestep and the three
-//! rotary coordinates per row — and reads back the velocity the head
-//! predicts, as JSON `scripts/imagegen/mini_dit_parity.py` turns into an
-//! `.npz` under the golden's own key names.
+//! The pie half of the `mini-dit` golden: `scripts/imagegen/mini_dit_ref.py`'s
+//! inputs in, the velocity `[h·w, C]` out as JSON for `mini_dit_parity.py`.
 //!
 //! Two parity modes: one step against `mini_dit_dump_bf16.npz`'s `velocity`,
 //! and the four-step Euler schedule against `mini_dit_euler_bf16.npz`'s
@@ -11,33 +7,14 @@
 //!
 //! And two modes that need no golden because every claim they make is
 //! WITHIN one fire's own answers: `--cfg` (classifier-free guidance on the
-//! device, six lanes and two groups in one fire — `prototype.md` §1.1) and
+//! device, six lanes and two groups in one pass) and
 //! `--cache` (step caching on the device, the whole Euler schedule as fires
 //! with the cache decision carried in a channel from one fire to the next —
 //! `.wiki/imagegen/conditional-fire.md`). Their harnesses are
 //! `mini_dit_parity.py guidance` and `mini_dit_cache.py`.
 //!
-//! # THREE LANES, ONE GROUP, ONE FIRE
-//!
-//! `mini-dit`'s `denoise` reading declares three streams (D2), so one step
-//! is three passes — caption, image, context — each stating its
-//! [`stream`](inferlet::eta::ForwardPass::stream) and all in one
-//! [`group`](inferlet::eta::ForwardPass::group), which is what
-//! lets the caption rows join the image rows' attention and the context
-//! rows serve as block 2's keys. Neither `state` nor `embed` is called
-//! on any of them: a denoise reading declares no kv space and no tokens,
-//! and the image lane's row count comes from its latents channel.
-//!
-//! **ONE PIPELINE PER LANE.** A group is a fact about a FIRE: the three
-//! passes join one attention only when they are members of one step. The
-//! scheduler seals a frame when every live pipeline has submitted and never
-//! seats two passes of one pipeline in one step, so three passes down one
-//! pipeline are three fires — each lane attending alone, the context lane's
-//! keys never seen. Three pipelines, one pass each, submitted back to back,
-//! are what the wait-all seal composes into one fire.
-//!
-//! Only the image lane reads out — the caption stream ends after block 1,
-//! and the head is image-only — so only it carries an epilogue.
+//! A step is one pass; attention group `g` is lanes `3g` (caption), `3g + 1`
+//! (context) and `3g + 2` (image), and only the image lane reads out.
 //!
 //! # WHY THE EULER LOOP IS ON THE HOST
 //!
@@ -85,10 +62,10 @@ struct Input {
     #[serde(default)]
     tap_text: bool,
     /// Classifier-free guidance, ON THE DEVICE. Runs the step as SIX lanes
-    /// in one fire — two attention groups of three, group 0 holding the
+    /// of one pass — two attention groups of three, group 0 holding the
     /// case's context and group 1 holding a zeroed one — and combines the
-    /// two branches' velocities inside group 0's epilogue with
-    /// `intrinsics::peer_velocity`. Reports the combine at `cfg_scale`
+    /// two branches' velocities inside the pass's epilogue with
+    /// `cfg_combine`. Reports the combine at `cfg_scale`
     /// alongside each branch's own answer, so the caller can check the two
     /// identities that need no golden: at `s = 1` the combine IS the
     /// conditional branch, at `s = 0` it IS the unconditional one.
@@ -121,17 +98,12 @@ struct Input {
     /// case's latent, answering `euler_v` / `euler_x` per step.
     #[serde(default)]
     solver: Option<String>,
-    /// `--classes none|all|split|split-swap`: one step under a structured
-    /// attention mask (`forward-pass.attention-classes`). `all` states two
-    /// classes that both see everything; `split` halves the image grid by
-    /// column and the text rows by index into classes 0 and 1 that see only
-    /// themselves; `split-swap` is `split` with the class-1 text rows negated.
+    /// `--classes none|all|split|split-swap`: one step under a two-class
+    /// attention mask; `split-swap` also negates the class-1 caption rows.
     #[serde(default)]
     classes: Option<String>,
-    /// `--sweep N`: N independent attention groups (N requests' worth of
-    /// lanes) submitted together, each on pipelines of its own, so the
-    /// runtime seals them into ONE fire. Group 1 repeats group 0's inputs;
-    /// group g >= 2 scales the latent by `1 + g/4`.
+    /// `--sweep N`: N independent attention groups in ONE pass; group g >= 2
+    /// scales the latent by `1 + g/4`.
     #[serde(default)]
     sweep: Option<u32>,
 }
@@ -146,7 +118,8 @@ struct ClassPlan {
 
 impl ClassPlan {
     fn of(mode: &str, case: &Case) -> Result<Option<ClassPlan>> {
-        let rows = case.image_rows as usize;
+        // The mask addresses token rows: the image lane's patches, in grid order.
+        let rows = case.image_tokens as usize;
         let side = (rows as f64).sqrt() as usize;
         if side * side != rows {
             return Err(format!("{rows} image rows are not a square grid"));
@@ -177,16 +150,39 @@ impl ClassPlan {
     }
 }
 
-/// One batch element of the reference's fixed inputs, flattened row-major.
-/// The harness writes the same numbers `mini_dit_ref.py` fed torch: the
-/// patchified latent (never the `[C, H, W]` array), the caption rows, the
-/// context rows, one timestep, and the `(t, h, w)` coordinates of every row.
+impl ClassPlan {
+    /// Context rows have no class: they attend, and are attended by, every row.
+    fn mask(&self, context_rows: u32) -> (u32, Vec<bool>) {
+        let classes: Vec<Option<i32>> = self
+            .text
+            .iter()
+            .map(|&c| Some(c))
+            .chain((0..context_rows).map(|_| None))
+            .chain(self.image.iter().map(|&c| Some(c)))
+            .collect();
+        let n = classes.len();
+        let count = self.count as usize;
+        let mut cells = Vec::with_capacity(n * n);
+        for q in &classes {
+            for k in &classes {
+                cells.push(match (q, k) {
+                    (Some(q), Some(k)) => self.table[*q as usize * count + *k as usize] != 0,
+                    _ => true,
+                });
+            }
+        }
+        (n as u32, cells)
+    }
+}
+
+/// The reference's inputs, row-major; the latent unpatched `[latent_h, latent_w, channels]`.
 #[derive(Deserialize)]
 struct Case {
-    /// `[image_rows, patch_features]`, row-major. The reference's `patches`.
     latents: Vec<f32>,
-    image_rows: u32,
-    patch_features: u32,
+    latent_h: u32,
+    latent_w: u32,
+    channels: u32,
+    image_tokens: u32,
     /// `[text_rows, text_width]`.
     text: Vec<f32>,
     text_rows: u32,
@@ -195,10 +191,6 @@ struct Case {
     context: Vec<f32>,
     context_rows: u32,
     context_width: u32,
-    /// `[rows, 3]` each, in the packed order the plan reads (`Stream::Text`
-    /// before `Stream::Image`).
-    text_positions: Vec<f32>,
-    image_positions: Vec<f32>,
     /// One step's timestep, or — under `--euler` — the schedule.
     timestep: f32,
     #[serde(default)]
@@ -209,47 +201,51 @@ struct Case {
     steps: u32,
 }
 
+impl Case {
+    fn voxels(&self) -> u32 {
+        self.latent_h * self.latent_w
+    }
+    fn lat(&self) -> [u32; 3] {
+        [self.latent_h, self.latent_w, self.channels]
+    }
+}
+
 #[derive(Serialize)]
 struct Output {
-    /// `[image_rows, patch_features]` — the reference's `final.tokens`
-    /// before its unpatchify. The harness unpatchifies.
+    /// `[h·w, C]`, or under a tap the intermediate on the image lane's token rows.
     velocity: Vec<f32>,
     image_rows: u32,
-    patch_features: u32,
+    velocity_width: u32,
+    latent_h: u32,
+    latent_w: u32,
+    channels: u32,
     /// The sigmas actually stepped, so a schedule mismatch reads as one.
     #[serde(default)]
     sigmas: Vec<f32>,
-    /// `--euler`: the velocity of every step, and the latent after each.
+    /// `--euler` / `--solver`: every step's velocity, and the latent after it.
     #[serde(default)]
     euler_v: Vec<Vec<f32>>,
     #[serde(default)]
     euler_x: Vec<Vec<f32>>,
-    /// `--tap_text`: the caption lane's rows of the tapped rectangle,
-    /// `[text_rows, width]`.
+    /// `--tap_text`: the caption lane's rows of the tapped rectangle.
     #[serde(default)]
     text_tap: Vec<f32>,
     #[serde(default)]
     text_rows: u32,
-    /// `--cfg`: the guided velocity group 0's epilogue computed on the
-    /// device, `[image_rows, patch_features]`.
+    /// `--cfg`: the guided velocity the epilogue computed on the device.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     cfg_guided: Vec<f32>,
-    /// `--cfg`: the conditional branch's own velocity (group 0), for the
-    /// `s = 1` identity.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     cfg_cond: Vec<f32>,
-    /// `--cfg`: the unconditional branch's own velocity (group 1), for the
-    /// `s = 0` identity.
+    /// `--cfg`: the unconditional branch's own velocity (group 1).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     cfg_uncond: Vec<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     cfg_scale: Option<f32>,
     /// `--cache`: the latent after every fire, fire 0 (the seed) first.
-    /// `[fires][rows * patch_features]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     cache_x: Vec<Vec<f32>>,
-    /// `--cache`: per fire, the relative change the epilogue measured —
-    /// the metric it decides the NEXT fire on.
+    /// `--cache`: per fire, the relative change the epilogue measured.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     cache_rel: Vec<f32>,
     /// `--cache`: per fire, 1.0 if THIS fire reused the cached velocity.
@@ -258,8 +254,7 @@ struct Output {
     /// `--cache`: the running skip count the DEVICE kept, after every fire.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     cache_count: Vec<f32>,
-    /// `--cache`: fire `k`'s Euler `dt` (0 on the seed fire), so the host can
-    /// recover each step's used velocity from the trajectory.
+    /// `--cache`: fire `k`'s Euler `dt` (0 on the seed fire).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     cache_dts: Vec<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -268,419 +263,236 @@ struct Output {
     sweep_velocity: Vec<Vec<f32>>,
 }
 
-/// The port names this family's `denoise` reading declares. Read off
-/// `model::readings()` rather than typed in, so a renamed port fails here
-/// with the model's own vocabulary instead of at the host.
-struct Ports {
-    latents: String,
-    text: String,
-    context: String,
-    timestep: String,
-    positions: String,
-    axes: u32,
-    velocity_width: u32,
+const STREAMS: [&str; 3] = ["text", "context", "image"];
+
+struct Shared {
+    text: Channel,
+    context: Channel,
+    blank: Channel,
 }
 
-fn ports(reading: &model::ReadingFact) -> Result<Ports> {
-    let named = |name: &str| -> Result<&model::PortFact> {
-        reading
-            .ports
-            .iter()
-            .find(|port| port.name == name)
-            .ok_or_else(|| format!("reading `{}` declares no port `{name}`", reading.name).into())
-    };
-    Ok(Ports {
-        latents: named("latents")?.name.clone(),
-        text: named("text")?.name.clone(),
-        context: named("context")?.name.clone(),
-        timestep: named("timestep")?.name.clone(),
-        positions: named("positions")?.name.clone(),
-        axes: named("positions")?.width,
-        velocity_width: reading.readout_width,
-    })
-}
-
-/// The three lanes' pipelines, one each, so the three passes of a step seal
-/// into one fire.
-struct Pipes {
-    caption: Pipeline,
-    context: Pipeline,
-    image: Pipeline,
-}
-
-impl Pipes {
-    fn new() -> Pipes {
-        Pipes {
-            caption: Pipeline::new(),
-            context: Pipeline::new(),
-            image: Pipeline::new(),
+impl Shared {
+    fn of(case: &Case) -> Shared {
+        Shared {
+            text: Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice())
+                .named("text"),
+            context: Channel::from_shaped(
+                [case.context_rows, case.context_width],
+                case.context.as_slice(),
+            )
+            .named("context"),
+            blank: Channel::from_shaped(
+                [case.context_rows, case.context_width],
+                vec![0f32; case.context.len()],
+            )
+            .named("blank_context"),
         }
     }
+}
 
-    fn close(&self) {
-        self.caption.close();
-        self.context.close();
-        self.image.close();
+fn velocity_width(reading: &str) -> Result<u32> {
+    for stream in STREAMS {
+        let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
+        if lane.state || lane.embeds {
+            return Err(format!(
+                "reading `{reading}`'s `{stream}` lane binds a working set or tokens; a denoise \
+                 pass binds neither"
+            ));
+        }
+        for input in &lane.inputs {
+            if !["text", "context", "latents", "timestep"].contains(&input.name.as_str()) {
+                return Err(format!(
+                    "reading `{reading}`'s `{stream}` lane reads `{}`; this pass binds text, \
+                     context, latents and timestep",
+                    input.name
+                ));
+            }
+        }
+    }
+    let image = model::lane_of(&[("reading", reading), ("stream", "image")])?;
+    match &image.readout {
+        Some(readout) if readout.kind == model::ReadoutKind::Velocity => Ok(readout.width),
+        other => Err(format!(
+            "reading `{reading}`'s image lane reads out {other:?}, not a velocity"
+        )),
     }
 }
 
-/// One BRANCH of a guided step: the three lanes of one attention group,
-/// built like `step`'s but with the group's own context rows. Returns the
-/// three passes and the channel the image lane's epilogue publishes into —
-/// `None` for a branch whose velocity is only ever read by its peer, which
-/// needs no epilogue of its own.
-#[allow(clippy::too_many_arguments)]
-fn branch(
-    case: &Case,
-    ports: &Ports,
+/// Binds attention group `group`'s three lanes; answers the image lane.
+fn bind_group(
+    pass: &ForwardPass,
     reading: &str,
     group: u32,
-    context: &[f32],
-    latents: &[f32],
-    timestep: f32,
-    other: u32,
-    guide: Option<(u32, f32, bool)>,
-) -> Result<(ForwardPass, ForwardPass, ForwardPass, Channel)> {
-    let tag = |what: &str| format!("{what}_b{group}");
-    let rows = case.image_rows;
-    let width = ports.velocity_width;
-
-    // GUIDANCE IS MUTUAL. Every lane of a branch names the other branch, so
-    // the two groups gather under one cohort key and seal into ONE fire — a
-    // peer in another fire is not on this fire's velocity plane at all. Only
-    // the guided lane READS its peer; naming is what makes them one step.
-    let partner = other;
-    let caption = ForwardPass::new();
-    caption.reading(reading)?;
-    caption.stream(LaneStream::Text)?;
-    caption.group(group)?;
-    caption.peer(partner)?;
-    let txt = Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice())
-        .named(&tag("text"));
-    let txt_pos =
-        Channel::from_shaped([case.text_rows, ports.axes], case.text_positions.as_slice())
-            .named(&tag("txt_pos"));
-    let t_txt = Channel::from([timestep]).named(&tag("t_txt"));
-    caption.input(&ports.text, &txt)?;
-    caption.input(&ports.positions, &txt_pos)?;
-    caption.input(&ports.timestep, &t_txt)?;
-
-    // The branch's own context: the case's rows for the conditional branch,
-    // zeros for the unconditional one. This is the ONLY difference between
-    // the two branches, which is what makes the guidance real rather than a
-    // combine of one answer with itself.
-    let ctx_pass = ForwardPass::new();
-    ctx_pass.reading(reading)?;
-    ctx_pass.stream(LaneStream::Context)?;
-    ctx_pass.group(group)?;
-    ctx_pass.peer(partner)?;
-    let ctx =
-        Channel::from_shaped([case.context_rows, case.context_width], context).named(&tag("ctx"));
-    ctx_pass.input(&ports.context, &ctx)?;
-
-    let image = ForwardPass::new();
-    image.reading(reading)?;
-    image.stream(LaneStream::Image)?;
-    image.group(group)?;
-    image.peer(partner)?;
-    let x = Channel::from_shaped([rows, case.patch_features], latents).named(&tag("latents"));
-    let img_pos = Channel::from_shaped([rows, ports.axes], case.image_positions.as_slice())
-        .named(&tag("img_pos"));
-    let t_img = Channel::from([timestep]).named(&tag("t_img"));
-    image.input(&ports.latents, &x)?;
-    image.input(&ports.positions, &img_pos)?;
-    image.input(&ports.timestep, &t_img)?;
-    let out = Channel::new([rows, width], dtype::f32).named(&tag("velocity"));
-    let readback = out.clone();
-    match guide {
-        // The guided branch: its epilogue holds BOTH predictions — its own
-        // off `velocity()`, its peer's off `peer_velocity()` — and publishes
-        // the combine. No host round trip, no second fire.
-        Some((_, scale, conditional)) => image.epilogue(move || {
-            readback.put(&guided_velocity(width, scale, conditional));
-        }),
-        None => image.epilogue(move || {
-            readback.put(intrinsics::velocity(width));
-        }),
+    text: &Channel,
+    context: &Channel,
+    x: &Channel,
+    t: &Channel,
+) -> Result<u32> {
+    for (i, stream) in STREAMS.into_iter().enumerate() {
+        let lane = 3 * group + i as u32;
+        pass.switch(lane, "reading", reading)?;
+        pass.switch(lane, "stream", stream)?;
+        pass.group(lane, group)?;
+        for input in model::lane_of(&[("reading", reading), ("stream", stream)])?.inputs {
+            let ch = match input.name.as_str() {
+                "text" => text,
+                "context" => context,
+                "latents" => x,
+                "timestep" => t,
+                other => return Err(format!("the `{stream}` lane reads `{other}`")),
+            };
+            pass.input(lane, &input.name, ch)?;
+        }
     }
-    Ok((caption, ctx_pass, image, out))
+    Ok(3 * group + 2)
 }
 
-/// One guided denoise step: SIX lanes, two attention groups, ONE fire.
-///
-/// Group 0 carries the case's context, group 1 a zeroed one, and group 0's
-/// image lane names group 1 as its peer — so its epilogue reads both
-/// branches' velocities off the fire-wide velocity plane and combines them
-/// at `scale`. The two groups do not attend each other, which is what makes
-/// them two independent denoisings rather than one wider one.
-///
-/// Also publishes each branch's own velocity, so the caller can check the
-/// two identities that need no golden: `s = 1` is the conditional branch
-/// exactly, `s = 0` is the unconditional one exactly.
 async fn sweep_fire(
     case: &Case,
-    ports: &Ports,
+    shared: &Shared,
+    width: u32,
     reading: &str,
     groups: u32,
 ) -> Result<Vec<Vec<f32>>> {
-    let rows = case.image_rows;
-    let width = ports.velocity_width;
-    let mut pipes: Vec<Pipeline> = Vec::new();
-    let mut passes: Vec<(ForwardPass, ForwardPass, ForwardPass)> = Vec::new();
-    let mut outs: Vec<Channel> = Vec::new();
+    let rows = case.voxels();
+    let pass = ForwardPass::new();
+    let t = Channel::from([case.timestep]).named("sweep_t");
+    let mut outs: Vec<(u32, Channel)> = Vec::new();
     for group in 0..groups {
-        let tag = |what: &str| format!("sweep_{what}_g{group}");
         let scale = if group <= 1 {
             1.0
         } else {
             1.0 + group as f32 / 4.0
         };
         let latents: Vec<f32> = case.latents.iter().map(|v| v * scale).collect();
-        let caption = ForwardPass::new();
-        caption.reading(reading)?;
-        caption.stream(LaneStream::Text)?;
-        caption.group(group)?;
-        let txt = Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice())
-            .named(&tag("text"));
-        let txt_pos =
-            Channel::from_shaped([case.text_rows, ports.axes], case.text_positions.as_slice())
-                .named(&tag("txt_pos"));
-        caption.input(&ports.text, &txt)?;
-        caption.input(&ports.positions, &txt_pos)?;
-        caption.input(
-            &ports.timestep,
-            &Channel::from([case.timestep]).named(&tag("t_txt")),
-        )?;
-
-        let context = ForwardPass::new();
-        context.reading(reading)?;
-        context.stream(LaneStream::Context)?;
-        context.group(group)?;
-        let ctx = Channel::from_shaped(
-            [case.context_rows, case.context_width],
-            case.context.as_slice(),
-        )
-        .named(&tag("ctx"));
-        context.input(&ports.context, &ctx)?;
-
-        let image = ForwardPass::new();
-        image.reading(reading)?;
-        image.stream(LaneStream::Image)?;
-        image.group(group)?;
-        let x = Channel::from_shaped([rows, case.patch_features], latents.as_slice())
-            .named(&tag("latents"));
-        let img_pos = Channel::from_shaped([rows, ports.axes], case.image_positions.as_slice())
-            .named(&tag("img_pos"));
-        image.input(&ports.latents, &x)?;
-        image.input(&ports.positions, &img_pos)?;
-        image.input(
-            &ports.timestep,
-            &Channel::from([case.timestep]).named(&tag("t_img")),
-        )?;
-        let out = Channel::new([rows, width], dtype::f32).named(&tag("velocity"));
-        let readback = out.clone();
-        image.epilogue(move || {
-            readback.put(intrinsics::velocity(width));
-        });
-        passes.push((caption, context, image));
-        outs.push(out);
-        for _ in 0..3 {
-            pipes.push(Pipeline::new());
+        let x = Channel::from_shaped(case.lat(), latents.as_slice())
+            .named(&format!("sweep_latents_g{group}"));
+        let image = bind_group(&pass, reading, group, &shared.text, &shared.context, &x, &t)?;
+        let out =
+            Channel::new([rows, width], dtype::f32).named(&format!("sweep_velocity_g{group}"));
+        outs.push((image, out));
+    }
+    let readbacks = outs.clone();
+    pass.epilogue(move || {
+        for (image, out) in &readbacks {
+            out.put(intrinsics::velocity(*image, rows, width));
         }
-    }
-    for (g, (caption, context, image)) in passes.iter().enumerate() {
-        caption
-            .submit(&pipes[3 * g])
-            .with_context(|| format!("sweep group {g} caption lane"))?;
-        context
-            .submit(&pipes[3 * g + 1])
-            .with_context(|| format!("sweep group {g} context lane"))?;
-        image
-            .submit(&pipes[3 * g + 2])
-            .with_context(|| format!("sweep group {g} image lane"))?;
-    }
+    });
+    let pipe = Pipeline::new();
+    pass.submit(&pipe).context("the sweep pass")?;
     let mut velocities = Vec::with_capacity(groups as usize);
-    for (g, out) in outs.iter().enumerate() {
+    for (g, (_, out)) in outs.iter().enumerate() {
         velocities.push(
             out.take_host::<Vec<f32>>()
                 .await
                 .with_context(|| format!("sweep group {g} readback"))?,
         );
     }
-    for pipe in &pipes {
-        pipe.close();
-    }
+    pipe.close();
     Ok(velocities)
 }
 
+/// One CFG step: group 0 reads the context, group 1 a zeroed one; answers (guided, uncond).
 async fn guided_step(
     case: &Case,
-    ports: &Ports,
+    shared: &Shared,
+    width: u32,
     reading: &str,
     scale: f32,
-) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-    let zeros = vec![0.0f32; case.context.len()];
-    let (c_txt, c_ctx, c_img, guided) = branch(
-        case,
-        ports,
-        reading,
-        0,
-        case.context.as_slice(),
-        &case.latents,
-        case.timestep,
-        1,
-        Some((1, scale, true)),
-    )?;
-    let (u_txt, u_ctx, u_img, uncond) = branch(
-        case,
-        ports,
-        reading,
-        1,
-        zeros.as_slice(),
-        &case.latents,
-        case.timestep,
-        0,
-        None,
-    )?;
-    // A seventh lane would be cheaper, but the conditional branch's own
-    // velocity is not readable beside its combine — one epilogue publishes
-    // one thing. So the unguided answer comes from `step`, which is the
-    // same three lanes at the same timestep, and the identity it proves is
-    // the stronger one for it.
-    let pipes: Vec<Pipeline> = (0..6).map(|_| Pipeline::new()).collect();
-    // ONE PIPELINE PER LANE, all six submitted before any fires: a pipeline
-    // is serial, and the frame seals when every live one has submitted.
-    c_txt.submit(&pipes[0]).context("cond caption")?;
-    c_ctx.submit(&pipes[1]).context("cond context")?;
-    c_img.submit(&pipes[2]).context("cond image")?;
-    u_txt.submit(&pipes[3]).context("uncond caption")?;
-    u_ctx.submit(&pipes[4]).context("uncond context")?;
-    u_img.submit(&pipes[5]).context("uncond image")?;
-    let guided = guided.take_host::<Vec<f32>>().await?;
-    let uncond = uncond.take_host::<Vec<f32>>().await?;
-    for pipe in &pipes {
-        pipe.close();
-    }
-    Ok((guided, Vec::new(), uncond))
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let rows = case.voxels();
+    let pass = ForwardPass::new();
+    let t = Channel::from([case.timestep]).named("cfg_t");
+    let x = Channel::from_shaped(case.lat(), case.latents.as_slice()).named("cfg_latents");
+    let cond = bind_group(&pass, reading, 0, &shared.text, &shared.context, &x, &t)?;
+    let uncond = bind_group(&pass, reading, 1, &shared.text, &shared.blank, &x, &t)?;
+    let guided = Channel::new([rows, width], dtype::f32).named("cfg_guided");
+    let unguided = Channel::new([rows, width], dtype::f32).named("cfg_uncond");
+    pass.epilogue(move || {
+        let v_u = intrinsics::velocity(uncond, rows, width);
+        guided.put(cfg_combine(
+            &intrinsics::velocity(cond, rows, width),
+            &v_u,
+            &Tensor::constant([scale]),
+        ));
+        unguided.put(&v_u);
+    });
+    let pipe = Pipeline::new();
+    pass.submit(&pipe).context("the guided pass")?;
+    let g = guided.take_host::<Vec<f32>>().await?;
+    let u = unguided.take_host::<Vec<f32>>().await?;
+    pipe.close();
+    Ok((g, u))
 }
 
-/// **STEP CACHING, ON THE DEVICE** — the proof of
-/// `.wiki/imagegen/conditional-fire.md` §9.
-///
-/// The whole Euler loop runs on the device: `steps + 1` fires down three
-/// pipelines, and nothing per step crosses the host except the readback the
-/// harness wants. What is new is five lines inside the image lane's epilogue:
-///
-/// ```text
-/// skip_now = skip.take()                       // decided by the LAST fire
-/// v_use    = select(skip_now, cache, velocity())
-/// x        = x + dt(k) * v_use                 // the step, unchanged
-/// cache.put(v_use)                             // the cache holds what was USED
-/// skip.put(and(k >= 1, rel(v_use, cache) < threshold))   // decided FOR the NEXT fire
-/// ```
-///
-/// **The decision is made a fire early on purpose.** A predicate that is to
-/// gate a fire has to be written before that fire is armed, so it is computed
-/// in the previous fire's epilogue and carried in a channel. That channel is
-/// exactly the artifact a conditional fire would fan out into a per-lane byte
-/// plane and a `graph::set_conditional_byte` would read (design §6.2/§6.3) —
-/// so **this guest does not change when the engine half lands**.
-///
-/// **The cache is a CHANNEL, never the velocity plane.** A skipped fire's
-/// plane holds whatever the last fire left there, at row offsets that belong
-/// to whichever lanes that fire seated — the stale-rectangle failure
-/// `graph/conditional.cuh` already paid for once. Reading `velocity()` and
-/// then discarding it under `select` is what makes the arithmetic independent
-/// of whether the trunk actually ran.
-///
-/// `threshold` absent installs no cache ops at all: the plain device loop,
-/// which is the trajectory a cached run is compared against bit for bit.
+fn schedule(case: &Case, steps: u32) -> Result<FlowMatchEuler> {
+    match model::schedule() {
+        Some(fact) => FlowMatchEuler::from_schedule(&fact, steps, Some(case.image_tokens)),
+        None if !case.sigmas.is_empty() => Ok(FlowMatchEuler::from_sigmas(
+            case.sigmas.clone(),
+            case.t_scale.max(1.0) as u32,
+        )),
+        None => Err("this model states no schedule; nothing here denoises".into()),
+    }
+}
+
+/// DPM-Solver++ 2M as a device loop; fire 0 seeds and steps nowhere.
 async fn dpm2m_loop(
     case: &Case,
-    ports: &Ports,
+    shared: &Shared,
+    width: u32,
     reading: &str,
     steps: u32,
 ) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f32>)> {
-    let rows = case.image_rows;
-    let feats = case.patch_features;
-    let width = ports.velocity_width;
-    if width != feats {
-        return Err(format!(
-            "the solver integrates the latent it predicts: the model reads a {width}-wide \
-             velocity and the case carries {feats}-wide patch rows"
-        )
-        .into());
-    }
-    let shape = [rows, feats];
-    let cells = (rows * feats) as usize;
-    let sched = match model::schedule() {
-        Some(fact) => FlowMatchEuler::from_schedule(&fact, steps, Some(rows))?,
-        None if !case.sigmas.is_empty() => {
-            FlowMatchEuler::from_sigmas(case.sigmas.clone(), case.t_scale.max(1.0) as u32)
-        }
-        None => return Err("this model states no schedule; nothing here denoises".into()),
-    };
-    let tables = Dpm2m::of(&sched).channels("dpm");
-    let mut loops = DenoiseLoop::new(&sched);
-    let caption_clock = loops.lane("dpm_txt");
-    let _context_clock = loops.lane("dpm_ctx");
-    let image_clock = loops.lane("dpm_img");
+    let (n, c, lat) = (case.voxels(), case.channels, case.lat());
+    let flat = [n, c];
+    let sched = schedule(case, steps)?;
+    let tables = Dpm2m::of(&sched).channels();
+    let loops = DenoiseLoop::new(&sched);
     let fires = loops.fires();
 
-    let caption = ForwardPass::new();
-    caption.reading(reading)?;
-    caption.stream(LaneStream::Text)?;
-    caption.group(0)?;
-    let txt = Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice())
-        .named("dpm_text");
-    let txt_pos =
-        Channel::from_shaped([case.text_rows, ports.axes], case.text_positions.as_slice())
-            .named("dpm_txt_pos");
-    caption.input(&ports.text, &txt)?;
-    caption.input(&ports.positions, &txt_pos)?;
-    caption.input(&ports.timestep, &caption_clock.timestep)?;
-
-    let context = ForwardPass::new();
-    context.reading(reading)?;
-    context.stream(LaneStream::Context)?;
-    context.group(0)?;
-    let ctx = Channel::from_shaped(
-        [case.context_rows, case.context_width],
-        case.context.as_slice(),
-    )
-    .named("dpm_ctx_rows");
-    context.input(&ports.context, &ctx)?;
-
-    let image = ForwardPass::new();
-    image.reading(reading)?;
-    image.stream(LaneStream::Image)?;
-    image.group(0)?;
-    let x = Channel::from_shaped(shape, case.latents.as_slice()).named("dpm_latents");
-    let x0_prev = Channel::from_shaped(shape, vec![0f32; cells]).named("dpm_x0_prev");
-    let img_pos = Channel::from_shaped([rows, ports.axes], case.image_positions.as_slice())
-        .named("dpm_img_pos");
-    image.input(&ports.latents, &x)?;
-    image.input(&ports.positions, &img_pos)?;
-    image.input(&ports.timestep, &image_clock.timestep)?;
-
-    let out_x = Channel::new(shape, dtype::f32)
+    let pass = ForwardPass::new();
+    let x = Channel::from_shaped(lat, case.latents.as_slice()).named("dpm_latents");
+    let x0_prev = Channel::from_shaped(flat, vec![0f32; (n * c) as usize]).named("dpm_x0_prev");
+    let image = bind_group(
+        &pass,
+        reading,
+        0,
+        &shared.text,
+        &shared.context,
+        &x,
+        &loops.timestep(),
+    )?;
+    let out_x = Channel::new(flat, dtype::f32)
         .capacity(channel_capacity() as u32)
         .named("dpm_out_x");
-    let out_v = Channel::new(shape, dtype::f32)
+    let out_v = Channel::new(flat, dtype::f32)
         .capacity(channel_capacity() as u32)
         .named("dpm_out_v");
-    caption_clock.drive(&caption, |_| {});
-    image_clock.drive(&image, move |k| {
-        let v = intrinsics::velocity(width);
-        dpm2m_step(k, &x, &x0_prev, &tables, &v, shape, Some(&out_x));
+    loops.drive(&pass, move |k| {
+        let v = intrinsics::velocity(image, n, width);
+        // `dpm2m_step`'s arithmetic over the flattened latent.
+        let scalar = |table: &Channel| broadcast(reshape(at(&table.read(), k), [1, 1]), flat);
+        let current = reshape(x.take(), flat);
+        let x0 = &current - &(&v * &scalar(&tables.sigma_s));
+        let prev = x0_prev.take();
+        let mix = scalar(&tables.mix);
+        let one = broadcast(Tensor::constant([1.0f32]), flat);
+        let d = &(&x0 * &(&one + &mix)) - &(&prev * &mix);
+        let stepped = &(&current * &scalar(&tables.ratio)) + &(&d * &scalar(&tables.gain));
+        let first = broadcast(reshape(eq(k, 0u32), [1, 1]), flat);
+        let next = select(&first, &current, &stepped);
+        x.put(reshape(&next, lat));
+        x0_prev.put(&x0);
+        out_x.put(&next);
         out_v.put(&v);
     });
 
-    let mut xs: Vec<Vec<f32>> = Vec::with_capacity(fires as usize);
-    let mut vs: Vec<Vec<f32>> = Vec::with_capacity(fires as usize);
+    let mut xs = Vec::with_capacity(fires as usize);
+    let mut vs = Vec::with_capacity(fires as usize);
     for fire in 0..fires {
         loops
-            .fire(&[&caption, &context, &image])
+            .fire(&pass)
             .map_err(|why| format!("dpm2m fire {fire}: {why}"))?;
         let landed = out_x
             .take_host::<Vec<f32>>()
@@ -699,180 +511,122 @@ async fn dpm2m_loop(
     Ok((vs, xs, sched.sigmas.clone()))
 }
 
+/// Fire `k`'s latent: fire 0 a fresh keyed draw, later fires one Euler step over `v`.
+#[allow(clippy::too_many_arguments)]
+fn seed_or_euler(
+    k: &Tensor,
+    x: &Channel,
+    v: &Tensor,
+    dts: &Channel,
+    rng: &Channel,
+    flat: [u32; 2],
+    lat: [u32; 3],
+    out: &Channel,
+) {
+    let current = reshape(x.take(), flat);
+    let stepped = euler_step(&current, v, &at(&dts.read(), k));
+    let state = rng.take();
+    let fresh = noise(flat, &state);
+    let first = broadcast(reshape(eq(k, 0u32), [1, 1]), flat);
+    let next = select(&first, &fresh, &stepped);
+    x.put(reshape(&next, lat));
+    out.put(&next);
+    rng.put(&state + &Tensor::constant([0u32, 1u32]));
+}
+
+/// Step caching on the device; `threshold` absent is the plain loop, with no cache ops.
 async fn cached_loop(
     case: &Case,
-    ports: &Ports,
+    shared: &Shared,
+    width: u32,
     reading: &str,
     steps: u32,
     seed: u32,
     threshold: Option<f32>,
 ) -> Result<(Vec<Vec<f32>>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)> {
-    let rows = case.image_rows;
-    let feats = case.patch_features;
-    let width = ports.velocity_width;
-    if width != feats {
-        return Err(format!(
-            "the cached loop integrates the latent it predicts: the model reads a {width}-wide \
-             velocity and the case carries {feats}-wide patch rows"
-        )
-        .into());
-    }
-    let shape = [rows, feats];
-    let cells = (rows * feats) as usize;
-
-    let sched = match model::schedule() {
-        Some(fact) => FlowMatchEuler::from_schedule(&fact, steps, Some(rows))?,
-        None if !case.sigmas.is_empty() => {
-            FlowMatchEuler::from_sigmas(case.sigmas.clone(), case.t_scale.max(1.0) as u32)
-        }
-        None => return Err("this model states no schedule; nothing here denoises".into()),
-    };
-    let mut loops = DenoiseLoop::new(&sched);
-    // Lane order is submit order: caption, context, image.
-    let caption_clock = loops.lane("cache_txt");
-    let _context_clock = loops.lane("cache_ctx");
-    let image_clock = loops.lane("cache_img");
-    let dts = loops.dts("cache_img");
+    let (n, c, lat) = (case.voxels(), case.channels, case.lat());
+    let flat = [n, c];
+    let cells = (n * c) as usize;
+    let sched = schedule(case, steps)?;
+    let loops = DenoiseLoop::new(&sched);
+    let dts = loops.dts();
     let fires = loops.fires();
 
-    // The caption lane. It modulates, so it carries a timestep of its own —
-    // one seeded cell per pass is the channel-role rule — and therefore its
-    // own clock, whose epilogue body does nothing but advance it.
-    let caption = ForwardPass::new();
-    caption.reading(reading)?;
-    caption.stream(LaneStream::Text)?;
-    caption.group(0)?;
-    let txt = Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice())
-        .named("cache_text");
-    let txt_pos =
-        Channel::from_shaped([case.text_rows, ports.axes], case.text_positions.as_slice())
-            .named("cache_txt_pos");
-    caption.input(&ports.text, &txt)?;
-    caption.input(&ports.positions, &txt_pos)?;
-    caption.input(&ports.timestep, &caption_clock.timestep)?;
-
-    // The context lane: block 2's cross-attention keys. No timestep, no
-    // positions, no epilogue — nothing about it advances.
-    let context = ForwardPass::new();
-    context.reading(reading)?;
-    context.stream(LaneStream::Context)?;
-    context.group(0)?;
-    let ctx = Channel::from_shaped(
-        [case.context_rows, case.context_width],
-        case.context.as_slice(),
-    )
-    .named("cache_ctx_rows");
-    context.input(&ports.context, &ctx)?;
-
-    // The image lane. `x` is bound as the latents port AND loop-carried by
-    // the epilogue: the port feed reads the committed cell, the epilogue
-    // takes it and puts the next one.
-    let image = ForwardPass::new();
-    image.reading(reading)?;
-    image.stream(LaneStream::Image)?;
-    image.group(0)?;
-    let x = Channel::from_shaped(shape, vec![0f32; cells]).named("cache_latents");
-    let img_pos = Channel::from_shaped([rows, ports.axes], case.image_positions.as_slice())
-        .named("cache_img_pos");
-    image.input(&ports.latents, &x)?;
-    image.input(&ports.positions, &img_pos)?;
-    image.input(&ports.timestep, &image_clock.timestep)?;
-
+    // `x` is both the image lane's `latents` input and the epilogue's loop state.
+    let pass = ForwardPass::new();
+    let x = Channel::from_shaped(lat, vec![0f32; cells]).named("cache_latents");
+    let image = bind_group(
+        &pass,
+        reading,
+        0,
+        &shared.text,
+        &shared.context,
+        &x,
+        &loops.timestep(),
+    )?;
     let rng = Channel::from(rng_state(seed)).named("cache_rng");
-    let out = Channel::new(shape, dtype::f32)
+    let out = Channel::new(flat, dtype::f32)
         .capacity(channel_capacity() as u32)
         .named("cache_out");
     // `[rel this fire, did this fire skip, the device's running skip count]`.
-    // One channel rather than three: a probe is one row of three numbers.
-    // `new`, not `from`: a seeded channel is USED at construction and
-    // `.capacity()` must come first.
     let probe = Channel::new([3u32], dtype::f32)
         .capacity(channel_capacity() as u32)
         .named("cache_probe");
 
-    caption_clock.drive(&caption, |_| {});
-
     match threshold {
-        // ── THE CACHED LOOP ────────────────────────────────────────────────
         Some(thr) => {
-            let cache = Channel::from_shaped(shape, vec![0f32; cells]).named("cache_velocity");
+            let cache = Channel::from_shaped(flat, vec![0f32; cells]).named("cache_velocity");
             let skip = Channel::from([0f32]).named("cache_skip");
             let count = Channel::from([0f32]).named("cache_count");
-            image_clock.drive(&image, move |k| {
-                let v_now = intrinsics::velocity(width);
+            loops.drive(&pass, move |k| {
+                let v_now = intrinsics::velocity(image, n, width);
                 let v_prev = cache.take();
                 // The flag THIS fire acts on was written by the last one.
-                let skipping = gt(&skip.take(), 0.5f32);
-                let take_cache = broadcast(reshape(&skipping, [1, 1]), shape);
-                let v_use = select(&take_cache, &v_prev, &v_now);
-
-                // `seed_or_step`'s arithmetic, unchanged, over `v_use`.
-                let current = x.take();
-                let stepped = euler_step(&current, &v_use, &at(&dts.read(), k));
-                let state = rng.take();
-                let fresh = noise(shape, &state);
-                let first = broadcast(reshape(eq(k, 0u32), [1, 1]), shape);
-                let next = select(&first, &fresh, &stepped);
-                x.put(&next);
-                out.put(&next);
-                rng.put(&state + &Tensor::constant([0u32, 1u32]));
-                // The cache holds what was USED, not what the trunk answered:
-                // a run of skips must reuse ONE velocity, not chase the plane.
+                let skipping = gt(skip.take(), 0.5f32);
+                let v_use = select(broadcast(reshape(&skipping, [1, 1]), flat), &v_prev, &v_now);
+                seed_or_euler(k, &x, &v_use, &dts, &rng, flat, lat, &out);
                 cache.put(&v_use);
 
-                // The metric, and the decision for the NEXT fire. `k >= 1`
-                // because fire 0 seeds and fire 1 has no cache to compare to.
-                let flat = |t: &Tensor| reshape(t, [1, rows * feats]);
-                let num = reduce_sum(flat(&abs(&(&v_use - &v_prev))));
-                let den = max_elem(reduce_sum(flat(&abs(&v_prev))), 1e-12f32);
+                let row = |t: &Tensor| reshape(t, [1, n * c]);
+                let num = reduce_sum(row(&abs(&(&v_use - &v_prev))));
+                let den = max_elem(reduce_sum(row(&abs(&v_prev))), 1e-12f32);
                 let one = Tensor::constant([1.0f32]);
                 let zero = Tensor::constant([0.0f32]);
-                // Fire 0's cache is the seeded zero cell, so the ratio there
-                // is `|v| / 1e-12` — a number, and a meaningless one. It
-                // feeds no decision (`k >= 1` is false), so report 0 rather
-                // than publish 1e15 into a series a reader has to squint at.
-                let rel = select(&eq(k, 0u32), &zero, &(&num / &den));
+                let rel = select(eq(k, 0u32), &zero, &(&num / &den));
                 let ahead = and(ge(k, 1u32), lt(&rel, thr));
-                skip.put(&select(&ahead, &one, &zero));
+                skip.put(select(&ahead, &one, &zero));
 
                 let did = select(&skipping, &one, &zero);
                 let total = &count.take() + &did;
                 count.put(&total);
-                let mut row = broadcast(&zero, [3]);
-                row = scatter_set(&row, &Tensor::constant([0u32]), &rel);
-                row = scatter_set(&row, &Tensor::constant([1u32]), &did);
-                row = scatter_set(&row, &Tensor::constant([2u32]), &total);
-                probe.put(&row);
+                let mut probed = broadcast(&zero, [3]);
+                probed = scatter_set(&probed, Tensor::constant([0u32]), &rel);
+                probed = scatter_set(&probed, Tensor::constant([1u32]), &did);
+                probed = scatter_set(&probed, Tensor::constant([2u32]), &total);
+                probe.put(&probed);
             });
         }
-        // ── THE BASELINE ───────────────────────────────────────────────────
-        // No cache ops in the trace at all. `seed_or_step` itself, so what a
-        // threshold-0 run is compared against is the SHIPPED loop body and
-        // not a rearrangement of it.
         None => {
-            image_clock.drive(&image, move |k| {
-                seed_or_step(
+            loops.drive(&pass, move |k| {
+                seed_or_euler(
                     k,
                     &x,
-                    &intrinsics::velocity(width),
+                    &intrinsics::velocity(image, n, width),
                     &dts,
                     &rng,
-                    shape,
-                    Some(&out),
+                    flat,
+                    lat,
+                    &out,
                 );
-                let zero = Tensor::constant([0.0f32]);
-                probe.put(&broadcast(&zero, [3]));
+                probe.put(broadcast(Tensor::constant([0.0f32]), [3]));
             });
         }
     }
 
-    let mut trace: Vec<Vec<f32>> = Vec::with_capacity(fires as usize);
-    let mut rel: Vec<f32> = Vec::with_capacity(fires as usize);
-    let mut did: Vec<f32> = Vec::with_capacity(fires as usize);
-    let mut count: Vec<f32> = Vec::with_capacity(fires as usize);
+    let (mut trace, mut rel, mut did, mut count) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for fire in 0..fires {
         loops
-            .fire(&[&caption, &context, &image])
+            .fire(&pass)
             .map_err(|why| format!("cached fire {fire}: {why}"))?;
         trace.push(
             out.take_host::<Vec<f32>>()
@@ -891,110 +645,63 @@ async fn cached_loop(
     Ok((trace, rel, did, count, sched.dts()))
 }
 
-/// One denoise step: three lanes, one group, one fire, one velocity.
+#[allow(clippy::too_many_arguments)]
 async fn step(
     case: &Case,
-    ports: &Ports,
+    shared: &Shared,
+    width: u32,
+    rows: u32,
     reading: &str,
-    pipes: &Pipes,
-    group: u32,
+    pipe: &Pipeline,
+    index: u32,
     latents: &[f32],
     timestep: f32,
     text_tap: Option<&mut Vec<f32>>,
     plan: Option<&ClassPlan>,
 ) -> Result<Vec<f32>> {
-    let tag = |what: &str| format!("{what}_g{group}");
-    let rows = case.image_rows;
-    // The readout's width is the reading's, which is the patch features —
-    // or, under the family's tap knob, the tapped rectangle's.
-    let width = ports.velocity_width;
-    // One timestep cell PER PASS: a seeded channel attaches to one pass
-    // only (the runtime's channel-role rule), so the two modulating lanes
-    // each carry their own copy of the same scalar.
-    let t_txt = Channel::from([timestep]).named(&tag("t_txt"));
-    let t_img = Channel::from([timestep]).named(&tag("t_img"));
-
-    // The caption lane. Its rows are fixed random 256-wide embeddings —
-    // this family has no text encoder, which is what makes it an M0 fixture
-    // and not a model. It modulates, so it carries the timestep too.
-    let caption = ForwardPass::new();
-    caption.reading(reading)?;
-    caption.stream(LaneStream::Text)?;
-    caption.group(group)?;
-    if let Some(plan) = plan {
-        caption.attention_classes(&plan.text, &plan.table, plan.count)?;
-    }
-    let mut text_rows = case.text.clone();
-    if let Some(plan) = plan.filter(|plan| plan.swap_text) {
+    let tag = format!("s{index}_");
+    let text_rows = case.text_rows;
+    let t = Channel::from([timestep]).named(&format!("{tag}t"));
+    let swapped = plan.filter(|plan| plan.swap_text).map(|plan| {
         let w = case.text_width as usize;
+        let mut text = case.text.clone();
         for (i, class) in plan.text.iter().enumerate() {
             if *class == 1 {
-                for v in &mut text_rows[i * w..(i + 1) * w] {
+                for v in &mut text[i * w..(i + 1) * w] {
                     *v = -*v;
                 }
             }
         }
-    }
-    let txt = Channel::from_shaped([case.text_rows, case.text_width], text_rows.as_slice())
-        .named(&tag("text"));
-    let txt_pos =
-        Channel::from_shaped([case.text_rows, ports.axes], case.text_positions.as_slice())
-            .named(&tag("txt_pos"));
-    caption.input(&ports.text, &txt)?;
-    caption.input(&ports.positions, &txt_pos)?;
-    caption.input(&ports.timestep, &t_txt)?;
-    // The bisection knob's caption readout: the same intrinsic, off the
-    // caption lane's own rows of the tapped rectangle.
-    let text_out = text_tap.as_ref().map(|_| {
-        let out = Channel::new([case.text_rows, ports.velocity_width], dtype::f32)
-            .named(&tag("text_tap"));
-        let readback = out.clone();
-        let width = ports.velocity_width;
-        caption.epilogue(move || {
-            readback.put(intrinsics::velocity(width));
-        });
-        out
+        Channel::from_shaped([case.text_rows, case.text_width], text).named(&format!("{tag}text"))
     });
-
-    // The context lane: block 2's cross-attention keys and values, and
-    // nothing else. No positions — the Wan contract gives cross-attention
-    // no rope — and no timestep, since its class never modulates.
-    let context = ForwardPass::new();
-    context.reading(reading)?;
-    context.stream(LaneStream::Context)?;
-    context.group(group)?;
-    let ctx = Channel::from_shaped(
-        [case.context_rows, case.context_width],
-        case.context.as_slice(),
-    )
-    .named(&tag("ctx"));
-    context.input(&ports.context, &ctx)?;
-
-    // The image lane: the latents in, the velocity out.
-    let out = Channel::new([rows, width], dtype::f32).named(&tag("velocity"));
-    let image = ForwardPass::new();
-    image.reading(reading)?;
-    image.stream(LaneStream::Image)?;
-    image.group(group)?;
+    let x = Channel::from_shaped(case.lat(), latents).named(&format!("{tag}latents"));
+    let pass = ForwardPass::new();
+    let image = bind_group(
+        &pass,
+        reading,
+        0,
+        swapped.as_ref().unwrap_or(&shared.text),
+        &shared.context,
+        &x,
+        &t,
+    )?;
     if let Some(plan) = plan {
-        image.attention_classes(&plan.image, &plan.table, plan.count)?;
+        let (n, cells) = plan.mask(case.context_rows);
+        let mask = Channel::from_shaped([n, n], cells).named(&format!("{tag}mask"));
+        pass.mask(&mask)?;
     }
-    let x = Channel::from_shaped([rows, case.patch_features], latents).named(&tag("latents"));
-    let img_pos = Channel::from_shaped([rows, ports.axes], case.image_positions.as_slice())
-        .named(&tag("img_pos"));
-    image.input(&ports.latents, &x)?;
-    image.input(&ports.positions, &img_pos)?;
-    image.input(&ports.timestep, &t_img)?;
-    let velocity_width = ports.velocity_width;
-    let readback = out.clone();
-    image.epilogue(move || {
-        // The denoise reading's `logits()`: `[image rows, C·p²]`.
-        readback.put(intrinsics::velocity(velocity_width));
+    let out = Channel::new([rows, width], dtype::f32).named(&format!("{tag}velocity"));
+    let text_out = text_tap
+        .as_ref()
+        .map(|_| Channel::new([text_rows, width], dtype::f32).named(&format!("{tag}text_tap")));
+    let tapped = text_out;
+    pass.epilogue(move || {
+        out.put(intrinsics::velocity(image, rows, width));
+        if let Some(tapped) = &tapped {
+            tapped.put(intrinsics::velocity(0, text_rows, width));
+        }
     });
-
-    caption.submit(&pipes.caption).context("caption lane")?;
-    context.submit(&pipes.context).context("context lane")?;
-    image.submit(&pipes.image).context("image lane")?;
+    pass.submit(pipe).context("the denoise step")?;
     let velocity = out.take_host::<Vec<f32>>().await?;
     if let (Some(sink), Some(text_out)) = (text_tap, text_out) {
         *sink = text_out.take_host::<Vec<f32>>().await?;
@@ -1004,9 +711,6 @@ async fn step(
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Text {
-        return Err("mini-dit is a `forward` pass with no state bound".into());
-    }
     let pieces: String = [
         &input.case_0,
         &input.case_1,
@@ -1032,43 +736,45 @@ async fn main(input: Input) -> Result<Output> {
     };
     let case: Case =
         inferlet::serde_json::from_str(&text).map_err(|why| format!("case json: {why}"))?;
+    if case.latents.len() != (case.voxels() * case.channels) as usize {
+        return Err(format!(
+            "`latents` carries {} numbers and a {}x{}x{} latent is {}",
+            case.latents.len(),
+            case.latent_h,
+            case.latent_w,
+            case.channels,
+            case.voxels() * case.channels
+        ));
+    }
 
-    let reading = model::readings()
-        .into_iter()
-        .find(|reading| !reading.takes_tokens && reading.readout == model::ReadoutKind::Velocity)
-        .ok_or("this model declares no token-less reading with a velocity readout")?;
-    if reading.has_kv {
+    let reading = "denoise";
+    let width = velocity_width(reading)?;
+    let tapped = input.tap || input.tap_text;
+    if !tapped && width != case.channels {
         return Err(format!(
-            "reading `{}` binds a kv space; the parity pass binds none",
-            reading.name
-        )
-        .into());
+            "the model reads out a {width}-wide velocity and the case's latent has {} channels",
+            case.channels
+        ));
     }
-    if !(input.tap || input.tap_text) && reading.readout_width != case.patch_features {
-        return Err(format!(
-            "the model reads a {}-wide velocity and the case carries {}-wide patch rows",
-            reading.readout_width, case.patch_features
-        )
-        .into());
-    }
-    let max_rows = model::max_latent_rows();
-    if max_rows > 0 && case.image_rows > max_rows {
-        return Err(format!(
-            "{} rows exceed the model's {max_rows} latent rows a pass",
-            case.image_rows
-        )
-        .into());
-    }
-    let ports = ports(&reading)?;
+    // A velocity is one row a voxel; a tapped intermediate one row a token.
+    let rows = if tapped {
+        case.image_tokens
+    } else {
+        case.voxels()
+    };
     let class_plan = match input.classes.as_deref() {
         Some(mode) => ClassPlan::of(mode, &case)?,
         None => None,
     };
-    let pipes = Pipes::new();
+    let shared = Shared::of(&case);
+    let pipe = Pipeline::new();
     let mut out = Output {
         velocity: Vec::new(),
-        image_rows: case.image_rows,
-        patch_features: case.patch_features,
+        image_rows: rows,
+        velocity_width: width,
+        latent_h: case.latent_h,
+        latent_w: case.latent_w,
+        channels: case.channels,
         sigmas: Vec::new(),
         euler_v: Vec::new(),
         euler_x: Vec::new(),
@@ -1087,25 +793,27 @@ async fn main(input: Input) -> Result<Output> {
         sweep_velocity: Vec::new(),
     };
 
-    // Step caching runs the whole schedule on the device — never one step.
     if let Some(groups) = input.sweep.filter(|n| *n > 0) {
-        let velocities = sweep_fire(&case, &ports, &reading.name, groups).await?;
+        let velocities = sweep_fire(&case, &shared, width, reading, groups).await?;
         out.velocity = velocities.first().cloned().unwrap_or_default();
         out.sweep_velocity = velocities;
-        pipes.close();
+        pipe.close();
         return Ok(out);
     }
 
     if let Some(solver) = input.solver.as_deref() {
         if solver != "dpm2m" {
-            return Err(format!("unknown solver `{solver}`; this guest runs `dpm2m`").into());
+            return Err(format!(
+                "unknown solver `{solver}`; this guest runs `dpm2m`"
+            ));
         }
-        let (vs, xs, sigmas) = dpm2m_loop(&case, &ports, &reading.name, case.steps.max(1)).await?;
+        let (vs, xs, sigmas) =
+            dpm2m_loop(&case, &shared, width, reading, case.steps.max(1)).await?;
         out.velocity = vs.last().cloned().unwrap_or_default();
         out.sigmas = sigmas;
         out.euler_v = vs;
         out.euler_x = xs;
-        pipes.close();
+        pipe.close();
         return Ok(out);
     }
 
@@ -1114,14 +822,14 @@ async fn main(input: Input) -> Result<Output> {
         let seed = input.cache_seed.unwrap_or(7);
         let (trace, rel, did, count, dts) = cached_loop(
             &case,
-            &ports,
-            &reading.name,
+            &shared,
+            width,
+            reading,
             steps,
             seed,
             input.cache_threshold,
         )
         .await?;
-        // Fire `k` integrates `dts[k]`: 0 on the seed fire.
         let mut fire_dts = vec![0.0f32];
         fire_dts.extend(dts);
         out.velocity = trace.last().cloned().unwrap_or_default();
@@ -1130,26 +838,21 @@ async fn main(input: Input) -> Result<Output> {
         out.cache_did = did;
         out.cache_count = count;
         out.cache_dts = fire_dts;
-        out.cache_rows = Some(case.image_rows);
-        pipes.close();
+        out.cache_rows = Some(case.voxels());
+        pipe.close();
         return Ok(out);
     }
 
-    // Guidance runs one step, six lanes, two groups — never a schedule.
     if input.cfg {
         let scale = input.cfg_scale.unwrap_or(1.0);
-        // The conditional branch alone FIRST, as the unguided three-lane
-        // step: the same rows at the same timestep with the same context.
-        // Before the guided step, and with its pipelines closed, because a
-        // frame seals over the pipelines that are LIVE — three idle ones
-        // would seal a six-lane fire down to whichever group was ready, and
-        // the peer would not be in it.
         let mut text_tap = Vec::new();
         let cond = step(
             &case,
-            &ports,
-            &reading.name,
-            &pipes,
+            &shared,
+            width,
+            rows,
+            reading,
+            &pipe,
             0,
             &case.latents,
             case.timestep,
@@ -1157,8 +860,8 @@ async fn main(input: Input) -> Result<Output> {
             None,
         )
         .await?;
-        pipes.close();
-        let (guided, _, uncond) = guided_step(&case, &ports, &reading.name, scale).await?;
+        pipe.close();
+        let (guided, uncond) = guided_step(&case, &shared, width, reading, scale).await?;
         out.velocity = cond.clone();
         out.cfg_guided = guided;
         out.cfg_cond = cond;
@@ -1171,9 +874,11 @@ async fn main(input: Input) -> Result<Output> {
         let mut text_tap = Vec::new();
         out.velocity = step(
             &case,
-            &ports,
-            &reading.name,
-            &pipes,
+            &shared,
+            width,
+            rows,
+            reading,
+            &pipe,
             0,
             &case.latents,
             case.timestep,
@@ -1182,18 +887,12 @@ async fn main(input: Input) -> Result<Output> {
         )
         .await?;
         out.text_tap = text_tap;
-        pipes.close();
+        pipe.close();
         return Ok(out);
     }
 
-    // The schedule the model declares, checked against the one the golden
-    // was generated under: a silent disagreement here would look like a
-    // numerics bug in the trunk.
     let steps = case.steps.max(1);
-    let sched = match model::schedule() {
-        Some(fact) => FlowMatchEuler::from_schedule(&fact, steps, Some(case.image_rows))?,
-        None => FlowMatchEuler::from_sigmas(case.sigmas.clone(), case.t_scale.max(1.0) as u32),
-    };
+    let sched = schedule(&case, steps)?;
     if !case.sigmas.is_empty() {
         let drift = sched
             .sigmas
@@ -1205,8 +904,7 @@ async fn main(input: Input) -> Result<Output> {
             return Err(format!(
                 "the model's schedule is {:?} and the golden's is {:?}",
                 sched.sigmas, case.sigmas
-            )
-            .into());
+            ));
         }
     }
     out.sigmas = sched.sigmas.clone();
@@ -1215,9 +913,11 @@ async fn main(input: Input) -> Result<Output> {
     for i in 0..steps {
         let v = step(
             &case,
-            &ports,
-            &reading.name,
-            &pipes,
+            &shared,
+            width,
+            rows,
+            reading,
+            &pipe,
             i,
             &x,
             sched.timestep(i),
@@ -1233,6 +933,6 @@ async fn main(input: Input) -> Result<Output> {
         out.euler_x.push(x.clone());
     }
     out.velocity = out.euler_v.last().cloned().unwrap_or_default();
-    pipes.close();
+    pipe.close();
     Ok(out)
 }

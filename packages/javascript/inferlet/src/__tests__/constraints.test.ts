@@ -88,23 +88,24 @@ describe('media', () => {
     const img = media.Image.fromBytes(new Uint8Array([1]));
     const aud = media.Audio.fromBytes(new Uint8Array([2]));
     const fwd = new ForwardPass();
-    fwd.media([img, aud]);
+    fwd.media(0, [img, aud]);
+    expect((fwd.wit as unknown as { mediaLane: number }).mediaLane).toBe(0);
     expect((fwd.wit as unknown as { spans: unknown[] }).spans).toEqual([
       { tag: 'image', val: img.handle },
       { tag: 'audio', val: aud.handle },
     ]);
-    expect(() => fwd.media([new Uint8Array() as unknown as media.Image])).toThrow(TypeError);
+    expect(() => fwd.media(0, [new Uint8Array() as unknown as media.Image])).toThrow(TypeError);
   });
 });
 
-describe('diffusion pass surface', () => {
-  it('binds the canvas reading and stages self-conditioning taps', () => {
-    const fwd = new ForwardPass('diffusion');
-    fwd.canvas('denoise');
-    fwd.selfConditioning([1, 2, 3, 4], [0.5, 0.25, 0.125, 0.125]);
-    const w = fwd.wit as unknown as { mode: string; selfCond: [number[], number[]] };
-    expect(w.mode).toBe('denoise');
-    expect(w.selfCond).toEqual([[1, 2, 3, 4], [0.5, 0.25, 0.125, 0.125]]);
-    expect(() => new ForwardPass('text').canvas('encode')).toThrow(/canvas binds/);
+describe('pass switches', () => {
+  it('sets a model switch, and a non-default value is off the default path', () => {
+    const fwd = new ForwardPass();
+    fwd.switch(0, 'mode', 'encode');
+    expect(fwd.switched()).toBe(false);
+    fwd.switch(1, 'mode', 'denoise');
+    const w = fwd.wit as unknown as { switches: [number, string, string][] };
+    expect(w.switches).toEqual([[0, 'mode', 'encode'], [1, 'mode', 'denoise']]);
+    expect(fwd.switched()).toBe(true);
   });
 });

@@ -494,6 +494,9 @@ pub struct GateHeads {
 pub enum BinaryOp {
     Add,
     Mul,
+    Div,
+    /// `x - y·floor(x / y)`: floored, the sign of `y`, as Python's `%`.
+    Mod,
 }
 
 /// The function an [`Elemwise::Act`] applies.
@@ -503,6 +506,7 @@ pub enum ActFn {
     Silu,
     Gelu { tanh: bool },
     Tanh,
+    Sqrt,
 }
 
 /// Where a [`Elemwise::Clamp`]'s bounds come from.

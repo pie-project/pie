@@ -18,7 +18,7 @@ use eta_compiler::plan::compile_bound;
 use eta_exec::{ExecPlan, InterpInstance, PassInputs, StepOutcome, Value};
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{ModelProfile, Stage};
+use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype, Literal, Predicate, RngKind, Shape};
 
 // ------------------------------------------------------------------ builder
@@ -84,16 +84,13 @@ impl Program {
                 ops: self.ops,
             }],
             externs: Vec::new(),
+            inputs: Vec::new(),
         }
     }
 }
 
 fn plan_of(container: TraceContainer, vocab: u32) -> ExecPlan {
-    let profile = ModelProfile {
-        vocab,
-        ..ModelProfile::dummy()
-    };
-    let bound = eta_ir::validate::bind(container, profile).expect("the program binds");
+    let bound = bind_logits(container, vocab).expect("the program binds");
     let stages = compile_bound(&bound);
     let launch = eta_compiler::codegen::launch::build(&bound, &stages);
     let plan = eta_exec::adopt_launch_package(launch).expect("the package adopts");
@@ -210,7 +207,13 @@ fn on_device(
         }
     }
     let mut runner = OnDevice::new(device, stages, key_of(plan), cols, kept, seat);
-    let outcome = eta_exec::step_with(&mut inst, plan, &PassInputs::none(), &mut runner);
+    let outcome = eta_exec::step_with(
+        &mut inst,
+        plan,
+        &PassInputs::none(),
+        &mut runner,
+        eta_ir::registry::Stage::Epilogue,
+    );
     assert_eq!(outcome, StepOutcome::Committed, "the device pass commits");
     assert!(runner.ran() > 0, "a stage ran on the device");
     take_all(plan, &inst, channels)
@@ -282,6 +285,7 @@ fn statistics(vocab: u32) -> (TraceContainer, Vec<u32>) {
     let (_, index) = p.input(Shape::vector(ROWS), Dtype::I32);
     let logits = p.op(Op::IntrinsicVal {
         intr: IntrinsicId::Logits,
+        lane: 0,
         shape: Shape::matrix(ROWS, vocab),
         dtype: Dtype::F32,
     });
@@ -349,6 +353,7 @@ fn sampler(vocab: u32) -> (TraceContainer, Vec<u32>, [u32; 5]) {
     let (c_words, words) = p.input(Shape::vector(vocab.div_ceil(32)), Dtype::U32);
     let raw = p.op(Op::IntrinsicVal {
         intr: IntrinsicId::Logits,
+        lane: 0,
         shape: Shape::matrix(1, vocab),
         dtype: Dtype::F32,
     });
@@ -521,6 +526,7 @@ fn rowwise(rows: u32, vocab: u32) -> (TraceContainer, Vec<u32>) {
     let (_, floor) = p.input(Shape::vector(rows), Dtype::F32);
     let logits = p.op(Op::IntrinsicVal {
         intr: IntrinsicId::Logits,
+        lane: 0,
         shape: grid,
         dtype: Dtype::F32,
     });
@@ -581,6 +587,7 @@ fn pivot_only(rows: u32, vocab: u32, which: u8) -> (TraceContainer, Vec<u32>) {
     let (_, top_p) = p.input(Shape::vector(rows), Dtype::F32);
     let logits = p.op(Op::IntrinsicVal {
         intr: IntrinsicId::Logits,
+        lane: 0,
         shape: grid,
         dtype: Dtype::F32,
     });
@@ -1471,11 +1478,7 @@ fn footprints_of_the_programs() {
         ("sampler 151936", sampler(151_936).0, 151_936),
     ];
     for (name, container, vocab) in named {
-        let profile = ModelProfile {
-            vocab,
-            ..ModelProfile::dummy()
-        };
-        let bound = eta_ir::validate::bind(container, profile).expect("binds");
+        let bound = bind_logits(container, vocab).expect("binds");
         let stages = compile_bound(&bound);
         let launch = eta_compiler::codegen::launch::build(&bound, &stages);
         let plan = eta_exec::adopt_launch_package(launch).expect("adopts");
@@ -1643,8 +1646,13 @@ fn several_lanes_share_one_program() {
                         kept,
                         shared,
                     };
-                    let outcome =
-                        eta_exec::step_with(&mut inst, plan, &PassInputs::none(), &mut runner);
+                    let outcome = eta_exec::step_with(
+                        &mut inst,
+                        plan,
+                        &PassInputs::none(),
+                        &mut runner,
+                        eta_ir::registry::Stage::Epilogue,
+                    );
                     assert_eq!(outcome, StepOutcome::Committed, "lane {me} commits");
                     take_all(plan, &inst, outs)
                 })
@@ -1666,4 +1674,28 @@ fn several_lanes_share_one_program() {
         close(&got[6], &want[6], 1e-5, &tag("the probabilities"));
         close(&got[7], &want[7], 1e-5, &tag("the Gumbel draw"));
     }
+}
+
+/// Binds `container` as a one-lane pass reading `vocab`-wide logits.
+fn bind_logits(
+    container: eta_ir::container::TraceContainer,
+    vocab: u32,
+) -> Result<eta_ir::validate::BoundTrace, eta_ir::validate::ValidateError> {
+    eta_ir::validate::bind(
+        container,
+        vec![Some(eta_ir::registry::Readout {
+            kind: eta_ir::registry::ReadoutKind::Logits,
+            width: vocab,
+        })],
+        eta_ir::registry::Graph {
+            num_layers: 2,
+            mtp_logits: true,
+            mtp_depth: 1,
+            attn_score: true,
+        },
+        eta_ir::registry::EngineCaps {
+            lora: true,
+            attn_page_mask: true,
+        },
+    )
 }

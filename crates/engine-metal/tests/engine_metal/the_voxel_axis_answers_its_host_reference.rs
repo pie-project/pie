@@ -305,6 +305,7 @@ fn the_convolution_answers_the_tap_walk() {
             conv3d,
             Tensor::new(hog, 2, 4, Dtype::I32),
             Tensor::new(hy, rows as u32, C_OUT as u32, Dtype::Bf16),
+            [0, 0],
         )
         .expect("the launch")
     });
@@ -384,6 +385,7 @@ fn the_group_norm_answers_the_two_pass_reference() {
             Tensor::new(hp, (partials_floats / 4) as u32, 4, Dtype::F32),
             Tensor::new(hs, (2 * GROUPS) as u32, 2, Dtype::F32),
             Tensor::new(hy, rows as u32, C as u32, Dtype::Bf16),
+            0,
         )
         .expect("the launch")
     });
@@ -455,6 +457,7 @@ fn the_mid_block_attention_answers_the_plain_softmax() {
                 segment,
                 scale,
                 plane(hy),
+                0,
             )
             .expect("the launch")
         });
@@ -530,6 +533,7 @@ fn the_reshapes_land_the_reference_ordering() {
             false,
             Tensor::new(hu, 2, 4, Dtype::I32),
             Tensor::new(hy, up_rows as u32, C as u32, Dtype::Bf16),
+            [0, 0],
         )
         .expect("upsample")
     });
@@ -576,6 +580,7 @@ fn the_reshapes_land_the_reference_ordering() {
             [1, 2, 2],
             Tensor::new(hdg, 2, 4, Dtype::I32),
             Tensor::new(hd, down_rows as u32, (C * 4) as u32, Dtype::Bf16),
+            [0, 0],
         )
         .expect("unshuffle")
     });
@@ -589,6 +594,7 @@ fn the_reshapes_land_the_reference_ordering() {
             0,
             Tensor::new(hsg, 2, 4, Dtype::I32),
             Tensor::new(hback, small_rows as u32, C as u32, Dtype::Bf16),
+            [0, 0],
         )
         .expect("shuffle")
     });
@@ -642,6 +648,7 @@ fn the_frame_cache_stores_the_frames_its_next_chunk_pads_with() {
             Tensor::new(hg, CLIPS.len() as u32, 4, Dtype::I32),
             FRAMES as u32,
             Tensor::new(hslab, stride as u32, C as u32, Dtype::Bf16),
+            0,
         )
         .expect("cache store")
     });

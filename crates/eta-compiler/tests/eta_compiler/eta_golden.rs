@@ -1,9 +1,10 @@
+use crate::msl_corpus::{Served, golden_served};
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer, encode};
 use eta_ir::container_hash;
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{ModelProfile, Stage};
+use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype, Literal, Shape};
-use eta_ir::validate::{BoundTrace, bind};
+use eta_ir::validate::BoundTrace;
 use std::fmt::Write as _;
 
 fn hex(bytes: &[u8]) -> String {
@@ -78,8 +79,8 @@ fn check(name: &str, report: Report) {
     );
 }
 
-fn neg_report(name: &str, c: TraceContainer, profile: ModelProfile) {
-    let verdict = bind(c.clone(), profile);
+fn neg_report(name: &str, c: TraceContainer, served: Served) {
+    let verdict = served.bind(c.clone());
     let rep = Report::new(name, &c).verdict(&verdict);
     assert!(verdict.is_err(), "{name} must fail validation");
     check(name, rep);
@@ -128,8 +129,9 @@ fn golden_neg_spsc_second_producer() {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
-    neg_report("neg_spsc_second_producer", c, ModelProfile::dummy());
+    neg_report("neg_spsc_second_producer", c, Served::of(32));
 }
 
 fn golden_neg_sink_at_epilogue() {
@@ -148,8 +150,9 @@ fn golden_neg_sink_at_epilogue() {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
-    neg_report("neg_sink_at_epilogue", c, ModelProfile::dummy());
+    neg_report("neg_sink_at_epilogue", c, Served::of(32));
 }
 
 fn golden_neg_t10_nonreplayable() {
@@ -176,14 +179,9 @@ fn golden_neg_t10_nonreplayable() {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
-    let mut profile = ModelProfile::dummy();
-    profile.kernels.push(eta_ir::registry::KernelInfo {
-        name: "gpu_load".into(),
-        sink_scope: None,
-        replayable: false,
-    });
-    neg_report("neg_t10_nonreplayable", c, profile);
+    neg_report("neg_t10_nonreplayable", c, Served::of(32));
 }
 
 fn golden_neg_intrinsic_wrong_stage() {
@@ -196,6 +194,7 @@ fn golden_neg_intrinsic_wrong_stage() {
             ops: vec![
                 Op::IntrinsicVal {
                     intr: IntrinsicId::Logits,
+                    lane: 0,
                     shape: Shape::matrix(1, 32),
                     dtype: Dtype::F32,
                 },
@@ -204,8 +203,9 @@ fn golden_neg_intrinsic_wrong_stage() {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
-    neg_report("neg_intrinsic_wrong_stage", c, ModelProfile::dummy());
+    neg_report("neg_intrinsic_wrong_stage", c, Served::of(32));
 }
 
 fn golden_neg_model_gated_missing() {
@@ -218,6 +218,7 @@ fn golden_neg_model_gated_missing() {
             ops: vec![
                 Op::IntrinsicVal {
                     intr: IntrinsicId::MtpLogits,
+                    lane: 0,
                     shape: Shape::matrix(4, 32),
                     dtype: Dtype::F32,
                 },
@@ -226,10 +227,13 @@ fn golden_neg_model_gated_missing() {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
-    let mut profile = ModelProfile::dummy();
-    profile.has_mtp_logits = false;
-    neg_report("neg_model_gated_missing", c, profile);
+    neg_report(
+        "neg_model_gated_missing",
+        c,
+        golden_served("neg_model_gated_missing"),
+    );
 }
 
 fn golden_neg_body_type_error() {
@@ -246,8 +250,9 @@ fn golden_neg_body_type_error() {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
-    neg_report("neg_body_type_error", c, ModelProfile::dummy());
+    neg_report("neg_body_type_error", c, Served::of(32));
 }
 
 fn extern_v2_round_trip_and_v1_hashes_stable() {
@@ -272,6 +277,7 @@ fn extern_v2_round_trip_and_v1_hashes_stable() {
             ],
         }],
         externs: vec![],
+        inputs: Vec::new(),
     };
     let b1 = encode(&c1);
     assert_eq!(
@@ -331,6 +337,7 @@ fn extern_direction_violations_rejected() {
             dir,
             chan: 0,
         }],
+        inputs: Vec::new(),
     };
     let put_on_import = mk(
         ExternDir::Import,
@@ -344,7 +351,7 @@ fn extern_direction_violations_rejected() {
         ],
     );
     assert!(matches!(
-        bind(put_on_import, ModelProfile::dummy()),
+        Served::of(32).bind(put_on_import),
         Err(ValidateError::ExternDirViolation { chan: 0, .. })
     ));
     let read_own_export = mk(
@@ -352,7 +359,7 @@ fn extern_direction_violations_rejected() {
         vec![Op::ChanTake(0), Op::ChanPut { chan: 1, value: 0 }],
     );
     assert!(matches!(
-        bind(read_own_export, ModelProfile::dummy()),
+        Served::of(32).bind(read_own_export),
         Err(ValidateError::ExternDirViolation { chan: 0, .. })
     ));
 }

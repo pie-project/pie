@@ -1,7 +1,7 @@
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, RopeForm, Value, ops, seam, trace_hybrid,
 };
-use poem_ir::{Def, Dim, Elemwise, Operands, Operation, RuntimeInput, Ty};
+use poem_ir::{Def, Dim, Elemwise, InputAxis, Operands, Operation, RuntimeInput, Ty};
 
 struct OneRope {
     axes: u8,
@@ -18,8 +18,20 @@ impl ForwardHybrid for OneRope {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
-        let q = inputs.latents(0, HEADS * self.head_dim, Dtype::Bf16);
-        let positions = inputs.axis_positions(0, self.axes);
+        let q = inputs.input(
+            "latents",
+            Dtype::Bf16,
+            poem_ir::InputAxis::Row,
+            HEADS * self.head_dim,
+            None,
+        );
+        let positions = inputs.input(
+            "positions",
+            Dtype::F32,
+            poem_ir::InputAxis::Row,
+            u32::from(self.axes),
+            None,
+        );
         let q = ops::elemwise::rope_axes(
             &q,
             &positions,
@@ -91,7 +103,16 @@ fn three_axes_over_a_whole_head_trace_in_place() {
     assert_eq!(pairs, vec![(*x_out, *x)], "rotated in place");
     assert_eq!(
         trace.values[positions.0 as usize].def,
-        Def::Input(RuntimeInput::AxisPositions { port: 0, axes: 3 })
+        Def::Input(RuntimeInput::Guest {
+            id: trace
+                .inputs
+                .iter()
+                .position(|i| i.name == "positions")
+                .expect("a positions input") as u32,
+            axis: InputAxis::Row,
+            width: 3,
+            dtype: Dtype::F32,
+        })
     );
     assert_eq!(
         trace.values[positions.0 as usize].ty,

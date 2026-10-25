@@ -7,9 +7,7 @@ use crate::common_dit::{HEAD_DIM, Lcg, NAME, SM_SCALE, WIDTH, Weights, assert_cl
 use checkpoint::contract::ModelContract;
 use engine::Engine;
 use engine::channel::{ChannelId, ChannelRegistration};
-use engine::fire::{
-    Attachment, Boundary, FrameSubmission, Lane, PortFeed, PortKind, Readout, Step,
-};
+use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
 use engine::program::{BindExtents, InstanceBinding, ProgramRegistration};
 use eta_compiler::codegen::program::{Backend, emit_program};
@@ -18,11 +16,11 @@ use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceCon
 use eta_ir::op::{IntrinsicId, Op};
 use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
-use eta_ir::validate::bind;
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Trace, Value, Weight, ops, seam,
     trace_hybrid,
 };
+use poem_ir::InputAxis;
 
 const HEADS: u32 = 4;
 const RANKS: usize = 4;
@@ -37,7 +35,7 @@ impl ForwardHybrid for Sharded {
     }
     fn forward(&self, inputs: Input) -> Value {
         let mine = u64::from(HEADS * HEAD_DIM / self.tp);
-        let x = inputs.latents(0, WIDTH, Dtype::Bf16);
+        let x = inputs.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
         let h = ops::elemwise::layernorm_no_scale(&x, 1e-6);
         let heads = |name: &str| Weight::sym(name, [mine, u64::from(WIDTH)], Dtype::Bf16).columns();
         let q = ops::linear::matmul(&h, &heads("q"));
@@ -178,6 +176,7 @@ fn epilogue(rows: u32) -> TraceContainer {
                 Op::ChanTake(0),
                 Op::IntrinsicVal {
                     intr: IntrinsicId::Velocity,
+                    lane: 0,
                     shape: Shape::matrix(rows, WIDTH),
                     dtype: EtaDtype::F32,
                 },
@@ -185,6 +184,7 @@ fn epilogue(rows: u32) -> TraceContainer {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
@@ -235,7 +235,11 @@ fn four_ranks_land_what_one_rank_lands() {
             frames_in_flight: 1,
         })
         .expect("the sharded plan loads on four ranks");
-    assert!(loaded.caps.profile.has_velocity);
+    assert!(loaded.caps.classes.classes.iter().any(|class| {
+        class
+            .readout
+            .is_some_and(|r| r.kind == poem_ir::ReadoutKind::Velocity)
+    }));
 
     let rows = [5u32, 11];
     let mut rng = Lcg::seeded(59);
@@ -254,7 +258,7 @@ fn four_ranks_land_what_one_rank_lands() {
     let mut instances = Vec::new();
     let mut next_channel = 1u64;
     for (at, &n) in rows.iter().enumerate() {
-        let bound = bind(epilogue(n), loaded.caps.profile.clone()).expect("the epilogue binds");
+        let bound = crate::bound::loaded(epilogue(n), &loaded.caps).expect("the epilogue binds");
         let stages = compile_bound(&bound);
         let launch = eta_compiler::codegen::launch::build(&bound, &stages);
         let backend =
@@ -317,17 +321,18 @@ fn four_ranks_land_what_one_rank_lands() {
             word: 0,
             tokens: vec![0; n as usize],
             readout: Readout::Rows((0..n).collect()),
-            ports: vec![PortFeed {
-                kind: PortKind::Latents,
-                port: 0,
+            // `latents`, the plan's one input.
+            inputs: vec![InputFeed {
+                id: 0,
                 channel: latent,
             }],
             ..Lane::default()
         });
         attachments.push(Attachment {
             lane: at as u32,
+            lanes: 1,
             instance,
-            at: Boundary::Epilogue,
+            adapter_only: false,
         });
         instances.push(instance);
     }

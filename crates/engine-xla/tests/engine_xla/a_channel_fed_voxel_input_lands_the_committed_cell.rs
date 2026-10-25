@@ -1,8 +1,4 @@
-//! engine-cuda's `a_channel_fed_voxel_port_lands_the_committed_cell`, on the
-//! xla engine: a two-axis plan whose VAE reading convolves a voxel port into
-//! a pixels seam. The port is fed off a channel (and, beside it, off the
-//! step's own payload); each fire reads the cell committed for it, and the
-//! plan's token reading still answers its velocity.
+//! engine-cuda's twin gate on xla: a channel-fed voxel input lands the committed cell.
 
 use crate::common_dit;
 
@@ -11,7 +7,7 @@ use common_dit::{
     conv_reference, matmul, modulation, two_axis,
 };
 use engine::channel::ChannelId;
-use engine::fire::{Lane, LaneStream, PortFeed, PortKind, Readout, ReadoutSeam, StepVoxels};
+use engine::fire::{InputFeed, Lane, Readout, ReadoutSeam, StepVoxels};
 use eta_ir::container::HostRole;
 use eta_ir::types::Shape;
 
@@ -27,11 +23,9 @@ fn vae_lane(rig: &Rig, slot: u32, channel: Option<ChannelId>) -> Lane {
         word: rig.word(Some("vae")),
         tokens: vec![0],
         readout: Readout::None,
-        stream: LaneStream::Image,
-        ports: channel
-            .map(|channel| PortFeed {
-                kind: PortKind::Voxels,
-                port: 0,
+        inputs: channel
+            .map(|channel| InputFeed {
+                id: rig.input("voxels"),
                 channel,
             })
             .into_iter()
@@ -47,12 +41,15 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
     };
     let weights = Weights::random(&two_axis(), 0x5a);
     let mut rig = Rig::load(two_axis(), &weights, 32, vec![16, 32], Some(voxels() + 8));
+    let pixels = rig.readout_widths(poem_ir::ReadoutKind::Pixels);
     assert!(
-        rig.profile().has_pixels,
-        "a plan planting `seam::PIXELS` states the `pixels()` gate"
+        !pixels.is_empty() && pixels.iter().all(|&width| width == C_OUT),
+        "a plan planting `seam::PIXELS` reads pixels out of its decode class"
     );
-    assert_eq!(rig.profile().pixels_width, C_OUT);
-    assert!(rig.profile().has_velocity);
+    assert!(
+        !rig.readout_widths(poem_ir::ReadoutKind::Velocity)
+            .is_empty()
+    );
 
     let program = rig.register(carrier(
         &[Shape::new(&[CLIP[1], CLIP[2], C_IN]).expect("a box")],
@@ -130,7 +127,6 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
         "the host payload's pixels",
     );
 
-    // The plan's token reading: a velocity off its latent and timestep ports.
     let rows = 5u32;
     let shapes = [Shape::matrix(rows, WIDTH), Shape::matrix(1, 1)];
     let dit = rig.register(carrier(&shapes, 2));
@@ -148,17 +144,14 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
         word: rig.word(None),
         tokens: vec![0; rows as usize],
         readout: Readout::Rows((0..rows).collect()),
-        stream: LaneStream::Image,
         group: Some(0),
-        ports: vec![
-            PortFeed {
-                kind: PortKind::Latents,
-                port: 0,
+        inputs: vec![
+            InputFeed {
+                id: rig.input("latents"),
                 channel: latent_ch,
             },
-            PortFeed {
-                kind: PortKind::LaneVector,
-                port: 0,
+            InputFeed {
+                id: rig.input("timestep"),
                 channel: time_ch,
             },
         ],

@@ -42,6 +42,7 @@ members = [
     "text-to-video",
     "zimage-parity",
     "zimage-vae-parity",
+    "wan2-vae-parity",
     "wan2-parity",
     "flux2-klein-parity",
     "prefill-rows",

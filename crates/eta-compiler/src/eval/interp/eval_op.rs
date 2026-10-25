@@ -617,16 +617,19 @@ pub(crate) fn eval_op(
         Op::ChanRead(c) => Evaled::Chan(ChanEffect::Read(c)),
         Op::ChanPut { chan, value } => Evaled::Chan(ChanEffect::Put(chan, value)),
 
-        Op::IntrinsicVal { intr, shape, dtype } => {
+        Op::IntrinsicVal {
+            intr,
+            lane,
+            shape,
+            dtype,
+        } => {
             let want = ValueType::new(shape, dtype);
             let got = match intr {
                 IntrinsicId::Logits => inputs.logits.clone(),
                 IntrinsicId::MtpLogits => inputs.mtp_logits.clone(),
-                IntrinsicId::Hidden => inputs.hidden.clone(),
-                IntrinsicId::Velocity => inputs.velocity.clone(),
-                IntrinsicId::PeerVelocity => inputs.peer_velocity.clone(),
-                IntrinsicId::Pixels => inputs.pixels.clone(),
-                IntrinsicId::ValueHead => inputs.value_head.clone(),
+                IntrinsicId::Hidden => inputs.hidden.get(lane as usize).cloned(),
+                IntrinsicId::Velocity => inputs.velocity.get(lane as usize).cloned(),
+                IntrinsicId::Pixels => inputs.pixels.get(lane as usize).cloned(),
                 IntrinsicId::Query => inputs.query.get(layer as usize).cloned(),
                 IntrinsicId::Layer => Some(Value::U32(vec![layer])),
                 IntrinsicId::MtpDrafts => inputs.mtp_drafts.clone(),

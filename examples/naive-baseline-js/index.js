@@ -34,7 +34,6 @@ export function main(input) {
   const maxTokens = Number(input.max_tokens ?? 32);
   const seed = Number(input.seed ?? 0x7ce1);
   const wantStats = Boolean(input.stats ?? false);
-  const maxLayers = input.max_layers;
 
   if (!(temperature > 0) || !Number.isFinite(temperature)) throw new Error('temperature must be finite and greater than 0');
 
@@ -57,7 +56,6 @@ export function main(input) {
   const s2OutP = new Channel([1], dtype.f32).named('s2_out_p');
 
   const fwdP = new ForwardPass();
-  if (maxLayers != null) fwdP.setMaxLayers(Number(maxLayers));
   fwdP.embed(toksP, embedIndptrP);
   fwdP.state([ws], { fold: 'all' });
   fwdP.epilogue(() => {
@@ -92,7 +90,6 @@ export function main(input) {
     const lane1 = Channel.from([0, 1], dtype.u32).named('embed_indptr');
 
     const fwd = new ForwardPass();
-    if (maxLayers != null) fwd.setMaxLayers(Number(maxLayers));
     fwd.embed(tokIn, lane1);
     fwd.state([ws], { fold: 'all' });
     fwd.epilogue(() => {

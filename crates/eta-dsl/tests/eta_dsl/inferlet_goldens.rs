@@ -397,7 +397,7 @@ fn latent_step() -> Traced {
     b.bind_port(Port::Readout, readout);
     b.stage(Stage::Epilogue, move || {
         positions.put(positions.take());
-        let v = intrinsics::velocity(channels);
+        let v = intrinsics::velocity(0, rows, channels);
         let x = latent.take();
         let d = reshape(dsigma.read(), []);
 
@@ -441,12 +441,29 @@ fn vae_readback() -> Traced {
     let out: &'static Channel = leak(Channel::new([rows, rgb], dtype::f32).named("pixels_out"));
     let mut b = Builder::new(VOCAB, PAGE);
     b.stage(Stage::Epilogue, move || {
-        let px = intrinsics::pixels(rows, rgb);
+        let px = intrinsics::pixels(0, rows, rgb);
         let shifted = add(&px, 1.0f32);
         let unit = mul(&shifted, 0.5f32);
         out.put(&unit);
     });
     out.note_host_take();
+    b.build().unwrap()
+}
+
+/// The one golden that carries an input table.
+fn noised_input() -> Traced {
+    let (rows, width) = (4u32, 8u32);
+    let rng_ch: &'static Channel = leak(Channel::from([5u32, 0]).named("rng"));
+    let latent: &'static Channel = leak(Channel::new([rows, width], dtype::f32).named("latent"));
+    let timestep: &'static Channel = leak(Channel::from([0.5f32]).named("timestep"));
+    let mut b = Builder::new(VOCAB, PAGE);
+    b.bind_input(latent);
+    b.bind_input(timestep);
+    b.stage(Stage::Prologue, move || {
+        let r = rng_ch.take();
+        latent.put(normal(&r, [rows, width]));
+        rng_ch.put(add(&r, iota(2)));
+    });
     b.build().unwrap()
 }
 
@@ -461,6 +478,7 @@ fn programs() -> Vec<(&'static str, Traced)> {
         ("beam_step", beam_step()),
         ("latent_step", latent_step()),
         ("vae_readback", vae_readback()),
+        ("noised_input", noised_input()),
     ]
 }
 
@@ -497,32 +515,38 @@ fn sdk_port_goldens_are_pinned() {
     assert_eq!(pinned.lines().count(), rendered.lines().count());
 }
 
+fn bind_lanes(
+    container: eta_ir::container::TraceContainer,
+    lanes: Vec<Option<eta_ir::registry::Readout>>,
+) -> Result<eta_ir::validate::BoundTrace, eta_ir::validate::ValidateError> {
+    eta_ir::validate::bind(
+        container,
+        lanes,
+        eta_ir::registry::Graph::default(),
+        eta_ir::registry::EngineCaps::default(),
+    )
+}
+
 fn the_latent_step_binds_against_a_denoising_model() {
-    let profile = eta_ir::registry::ModelProfile {
-        vocab: VOCAB,
-        page_size: PAGE,
-        has_velocity: true,
-        velocity_width: 16,
-        ..eta_ir::registry::ModelProfile::dummy()
+    let velocity = eta_ir::registry::Readout {
+        kind: eta_ir::registry::ReadoutKind::Velocity,
+        width: 16,
     };
-    eta_ir::validate::bind(latent_step().container().clone(), profile)
-        .expect("the latent step binds against a model that predicts a velocity");
+    bind_lanes(latent_step().container().clone(), vec![Some(velocity)])
+        .expect("the latent step binds against a lane that predicts a velocity");
 }
 
 fn the_vae_readback_binds_against_a_model_that_lands_pixels() {
-    let profile = eta_ir::registry::ModelProfile {
-        vocab: VOCAB,
-        page_size: PAGE,
-        has_pixels: true,
-        pixels_width: 0,
-        ..eta_ir::registry::ModelProfile::dummy()
+    let pixels = eta_ir::registry::Readout {
+        kind: eta_ir::registry::ReadoutKind::Pixels,
+        width: 3,
     };
-    eta_ir::validate::bind(vae_readback().container().clone(), profile.clone())
-        .expect("the readback binds against a model whose VAE lands pixels");
-    let vaeless = eta_ir::registry::ModelProfile {
-        has_pixels: false,
-        ..profile
+    bind_lanes(vae_readback().container().clone(), vec![Some(pixels)])
+        .expect("the readback binds against a lane whose VAE lands pixels");
+    let logits = eta_ir::registry::Readout {
+        kind: eta_ir::registry::ReadoutKind::Logits,
+        width: VOCAB,
     };
-    eta_ir::validate::bind(vae_readback().container().clone(), vaeless)
-        .expect_err("a model with no VAE refuses the readback at bind");
+    bind_lanes(vae_readback().container().clone(), vec![Some(logits)])
+        .expect_err("a lane that lands no pixels refuses the readback at bind");
 }

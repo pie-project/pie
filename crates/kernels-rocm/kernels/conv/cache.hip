@@ -52,7 +52,7 @@ template <class T>
 __global__ __launch_bounds__(256) void cache_store(const T* __restrict__ x, const T* __restrict__ cache,
                                                    const int* __restrict__ slot_ids, const int* __restrict__ grid,
                                                    T* __restrict__ slab, int lanes, int frames, int c,
-                                                   long long slot_stride, long long total) {
+                                                   long long slot_stride, int x_base, long long total) {
     const long long e = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (e >= total) return;
     const int row = static_cast<int>(e / c);
@@ -61,6 +61,8 @@ __global__ __launch_bounds__(256) void cache_store(const T* __restrict__ x, cons
     Lane g;
     const int l = cache_lane_of(grid, lanes, frames, row, base, g);
     if (l < 0) return;
+    // `x_base`: the row `grid` addresses `x`'s row 0 at.
+    g.off -= x_base;
     const int local_row = row - base;
     const long long local = static_cast<long long>(local_row) * c + col;
     if (local >= slot_stride) return;

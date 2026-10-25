@@ -236,7 +236,7 @@ fn dry_penalty(hist: &Tensor, hlen: &Tensor, vocab: u32, cfg: Cfg) -> (Tensor, T
     }
 
     let count = reshape(
-        reduce_sum(cast(&gt(&penalty, &vocab_zero), dtype::f32)),
+        reduce_sum(cast(gt(&penalty, &vocab_zero), dtype::f32)),
         [1],
     );
     let peak = reshape(reduce_max(&penalty), [1]);
@@ -272,10 +272,10 @@ fn step(
 fn pack3(a: &Tensor, b: &Tensor, c: &Tensor) -> Tensor {
     let lane = iota(3);
     select(
-        &eq(&lane, broadcast(0u32, [3])),
+        eq(&lane, broadcast(0u32, [3])),
         broadcast(a, [3]),
         select(
-            &eq(&lane, broadcast(1u32, [3])),
+            eq(&lane, broadcast(1u32, [3])),
             broadcast(b, [3]),
             broadcast(c, [3]),
         ),

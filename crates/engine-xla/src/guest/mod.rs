@@ -26,8 +26,8 @@ pub struct Compiled {
 }
 
 /// The channels a pass carries to the next one and nobody else sees: a
-/// one-cell ring the host neither reads nor writes, bound to no port and
-/// no extern, taken and put by one stage and touched by no other. Their
+/// one-cell ring the host neither reads nor writes, bound to no port, input
+/// or extern, taken and put by one stage and touched by no other. Their
 /// cells can stay on the device between passes (`Plane::fire_guests`).
 #[must_use]
 pub fn carried_channels(package: &LaunchPackage) -> Vec<u32> {
@@ -38,6 +38,7 @@ pub fn carried_channels(package: &LaunchPackage) -> Vec<u32> {
             || decl.host_role != eta_ir::container::HostRole::None
             || decl.extern_dir.is_some()
             || package.ports.iter().any(|p| !p.is_const && p.channel == c)
+            || package.inputs.contains(&c)
         {
             continue;
         }

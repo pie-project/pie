@@ -86,6 +86,37 @@ impl Frames {
         })
     }
 
+    pub fn concat(parts: &[&Frames]) -> Result<Self, String> {
+        let Some(first) = parts.first() else {
+            return Err("frames.concat: no parts to join".to_string());
+        };
+        let mut bytes = Vec::new();
+        let mut count = 0u32;
+        for (i, part) in parts.iter().enumerate() {
+            if (part.width, part.height) != (first.width, first.height) {
+                return Err(format!(
+                    "frames.concat: part {i} is {}x{} and part 0 is {}x{}",
+                    part.width, part.height, first.width, first.height
+                ));
+            }
+            if part.fps != first.fps {
+                return Err(format!(
+                    "frames.concat: part {i} runs at {} fps and part 0 at {} fps",
+                    part.fps, first.fps
+                ));
+            }
+            bytes.extend_from_slice(part.rgb8()?);
+            count += part.count;
+        }
+        Ok(Self {
+            store: FrameStore::Host(bytes),
+            width: first.width,
+            height: first.height,
+            count,
+            fps: first.fps,
+        })
+    }
+
     pub fn to_pixels(&self) -> Result<Vec<f32>, String> {
         Ok(self
             .rgb8()?
@@ -321,6 +352,21 @@ impl pie::inferlet::frames::HostFrames for ProcessCtx {
 
     async fn decode(&mut self, bytes: Vec<u8>) -> Result<Result<Resource<Frames>, String>> {
         match Frames::decode(&bytes) {
+            Ok(f) => Ok(Ok(self.ctx().table.push(f)?)),
+            Err(why) => Ok(Err(why)),
+        }
+    }
+
+    async fn concat(
+        &mut self,
+        parts: Vec<Resource<Frames>>,
+    ) -> Result<Result<Resource<Frames>, String>> {
+        let table = &self.ctx().table;
+        let parts = parts
+            .iter()
+            .map(|part| table.get(part))
+            .collect::<Result<Vec<_>, _>>()?;
+        match Frames::concat(&parts) {
             Ok(f) => Ok(Ok(self.ctx().table.push(f)?)),
             Err(why) => Ok(Err(why)),
         }

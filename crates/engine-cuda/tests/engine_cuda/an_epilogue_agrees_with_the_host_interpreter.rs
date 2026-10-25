@@ -10,9 +10,8 @@ use eta_compiler::plan::compile_bound;
 use eta_exec::Extents;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
+use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype, Shape};
-use eta_ir::validate::bind;
 
 const ROWS: u32 = 8;
 const VOCAB: u32 = 4096;
@@ -57,6 +56,7 @@ fn epilogue() -> TraceContainer {
         Op::ChanTake(INDEX),
         Op::IntrinsicVal {
             intr: IntrinsicId::Logits,
+            lane: 0,
             shape: Shape::matrix(ROWS, VOCAB),
             dtype: Dtype::F32,
         },
@@ -134,6 +134,7 @@ fn epilogue() -> TraceContainer {
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
@@ -224,6 +225,7 @@ fn device_outputs(
             .bind_intrinsic(
                 instance,
                 IntrinsicId::Logits,
+                0,
                 buffer.ptr(),
                 INTRINSIC_STORAGE_F32,
                 width,
@@ -311,11 +313,7 @@ fn the_device_answers_what_the_interpreter_answers() {
         eprintln!("no CUDA device: skipping");
         return;
     }
-    let profile = ModelProfile {
-        vocab: VOCAB,
-        ..ModelProfile::dummy()
-    };
-    let bound = bind(epilogue(), profile).expect("the epilogue binds");
+    let bound = crate::bound::logits(epilogue(), VOCAB).expect("the epilogue binds");
     let seeds = vec![
         (TEMP, Value::F32(vec![0.7])),
         (
@@ -370,6 +368,7 @@ fn shared_row() -> TraceContainer {
     let ops = vec![
         Op::IntrinsicVal {
             intr: IntrinsicId::Logits,
+            lane: 0,
             shape: Shape::matrix(ROWS, VOCAB),
             dtype: Dtype::F32,
         },
@@ -423,6 +422,7 @@ fn shared_row() -> TraceContainer {
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
@@ -431,11 +431,7 @@ fn a_row_every_row_shares_broadcasts_to_each_row() {
         eprintln!("no CUDA device: skipping");
         return;
     }
-    let profile = ModelProfile {
-        vocab: VOCAB,
-        ..ModelProfile::dummy()
-    };
-    let bound = bind(shared_row(), profile).expect("the shared row binds");
+    let bound = crate::bound::logits(shared_row(), VOCAB).expect("the shared row binds");
     let plane = logits();
     let channels = [COLUMNS, HITS];
     let want = host_outputs(&bound, &[], Some(&plane), &channels);
@@ -556,6 +552,7 @@ fn acceptance() -> TraceContainer {
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
@@ -564,11 +561,7 @@ fn the_acceptance_rule_agrees_with_the_interpreter() {
         eprintln!("no CUDA device: skipping");
         return;
     }
-    let profile = ModelProfile {
-        vocab: VOCAB,
-        ..ModelProfile::dummy()
-    };
-    let bound = bind(acceptance(), profile).expect("the acceptance rule binds");
+    let bound = crate::bound::logits(acceptance(), VOCAB).expect("the acceptance rule binds");
     let entropy: Vec<f32> = vec![0.9, 0.05, 2.5, 0.4, 1.7, 0.01, 0.6, 3.2];
     let sampled: Vec<i32> = (0..ROWS as i32).map(|r| 100 + r).collect();
     let noise: Vec<i32> = (0..ROWS as i32).map(|r| 900 + 7 * r).collect();
@@ -686,6 +679,7 @@ fn sampler_arithmetic() -> TraceContainer {
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
@@ -700,11 +694,8 @@ fn the_gaussian_draw_and_the_transcendentals_agree_with_the_interpreter() {
         eprintln!("no CUDA device: skipping");
         return;
     }
-    let profile = ModelProfile {
-        vocab: VOCAB,
-        ..ModelProfile::dummy()
-    };
-    let bound = bind(sampler_arithmetic(), profile).expect("the sampler epilogue binds");
+    let bound =
+        crate::bound::logits(sampler_arithmetic(), VOCAB).expect("the sampler epilogue binds");
     let x = latent();
     let (key, counter) = (0x7ce1u32, 5u32);
     let seeds = vec![

@@ -2,9 +2,28 @@ use eta_ir::container::{
     ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
 };
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{ModelProfile, Port, SinkScope, Stage};
+use eta_ir::registry::{EngineCaps, Graph, Port, Readout, ReadoutKind, Stage};
 use eta_ir::types::{Dtype, Literal, Shape};
-use eta_ir::validate::{ValidateError, bind};
+use eta_ir::validate::{BoundTrace, ValidateError, bind};
+
+fn served(c: TraceContainer, caps: EngineCaps) -> Result<BoundTrace, ValidateError> {
+    let logits = Readout {
+        kind: ReadoutKind::Logits,
+        width: 32,
+    };
+    let graph = Graph {
+        num_layers: 2,
+        mtp_logits: true,
+        mtp_depth: 1,
+        attn_score: true,
+    };
+    bind(c, vec![Some(logits)], graph, caps)
+}
+
+const EVERY: EngineCaps = EngineCaps {
+    lora: true,
+    attn_page_mask: true,
+};
 
 fn chan(shape: Shape, dtype: Dtype, host_role: HostRole, seeded: bool) -> ChannelDecl {
     ChannelDecl {
@@ -42,6 +61,7 @@ fn section3() -> TraceContainer {
     let mut ops: Vec<Op> = vec![
         Op::IntrinsicVal {
             intr: IntrinsicId::Logits,
+            lane: 0,
             shape: Shape::matrix(1, vocab),
             dtype: Dtype::F32,
         },
@@ -115,6 +135,7 @@ fn section3() -> TraceContainer {
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
@@ -131,7 +152,7 @@ fn geometry_ports_are_optional() {
     let mut c = section3();
     c.ports
         .retain(|binding| !matches!(binding.port, Port::KvLen | Port::Positions));
-    assert!(bind(c, ModelProfile::dummy()).is_ok());
+    assert!(served(c, EVERY).is_ok());
 }
 
 fn spsc_second_producer_rejected() {
@@ -147,18 +168,12 @@ fn spsc_second_producer_rejected() {
         value: id + 1,
     });
     assert!(matches!(
-        bind(c, ModelProfile::dummy()),
+        served(c, EVERY),
         Err(ValidateError::SecondProducer { chan: 2, .. })
     ));
 }
 
 fn sink_precedence_t11() {
-    let mut profile = ModelProfile::dummy();
-    profile.kernels.push(eta_ir::registry::KernelInfo {
-        name: "lora".to_string(),
-        sink_scope: Some(SinkScope::PassWide),
-        replayable: true,
-    });
     let mk = |stage: Stage| TraceContainer {
         names: vec!["lora".to_string()],
         channels: vec![chan(Shape::vector(4), Dtype::F32, HostRole::None, true)],
@@ -174,10 +189,11 @@ fn sink_precedence_t11() {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
-    assert!(bind(mk(Stage::Prologue), profile.clone()).is_ok());
+    assert!(served(mk(Stage::Prologue), EVERY).is_ok());
     assert!(matches!(
-        bind(mk(Stage::Epilogue), profile),
+        served(mk(Stage::Epilogue), EVERY),
         Err(ValidateError::SinkMisplaced { .. })
     ));
     let apm = TraceContainer {
@@ -199,6 +215,7 @@ fn sink_precedence_t11() {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
     let apm = {
         let mut c = apm;
@@ -216,11 +233,11 @@ fn sink_precedence_t11() {
         ];
         c
     };
-    assert!(bind(apm.clone(), ModelProfile::dummy()).is_ok());
+    assert!(served(apm.clone(), EVERY).is_ok());
     let mut late = apm;
     late.stages[0].stage = Stage::OnAttn;
     assert!(matches!(
-        bind(late, ModelProfile::dummy()),
+        served(late, EVERY),
         Err(ValidateError::SinkMisplaced { .. })
     ));
 }
@@ -257,20 +274,23 @@ fn lora_honour_gate_and_placement() {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     };
-    assert!(bind(mk(Stage::Prologue), ModelProfile::dummy()).is_ok());
-    let mut no_lora = ModelProfile::dummy();
-    no_lora.has_lora = false;
+    assert!(served(mk(Stage::Prologue), EVERY).is_ok());
+    let no_lora = EngineCaps {
+        lora: false,
+        ..EVERY
+    };
     assert!(matches!(
-        bind(mk(Stage::Prologue), no_lora),
+        served(mk(Stage::Prologue), no_lora),
         Err(ValidateError::KernelUnavailable { name, .. }) if name == "lora"
     ));
     assert!(matches!(
-        bind(mk(Stage::OnAttnProj), ModelProfile::dummy()),
+        served(mk(Stage::OnAttnProj), EVERY),
         Err(ValidateError::SinkMisplaced { .. })
     ));
     assert!(matches!(
-        bind(mk(Stage::Epilogue), ModelProfile::dummy()),
+        served(mk(Stage::Epilogue), EVERY),
         Err(ValidateError::SinkMisplaced { .. })
     ));
 }
@@ -281,7 +301,7 @@ fn name_table_must_be_strictly_sorted_and_unique() {
         ..TraceContainer::default()
     };
     assert!(matches!(
-        bind(unsorted, ModelProfile::dummy()),
+        served(unsorted, EVERY),
         Err(ValidateError::NamesUnsortedOrDuplicate)
     ));
 
@@ -290,7 +310,7 @@ fn name_table_must_be_strictly_sorted_and_unique() {
         ..TraceContainer::default()
     };
     assert!(matches!(
-        bind(duplicate, ModelProfile::dummy()),
+        served(duplicate, EVERY),
         Err(ValidateError::NamesUnsortedOrDuplicate)
     ));
 }

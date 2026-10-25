@@ -1,11 +1,10 @@
-use poem_ir::{Selection, Stream};
+use poem_ir::Selection;
 
 use super::Fault;
 use super::compose::LaneRow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct LaneFacts {
-    pub stream: u8,
     pub group: Option<u32>,
 }
 
@@ -17,12 +16,7 @@ pub struct Packed {
     pub lanes: u32,
     pub group_indptr: Vec<i32>,
     pub lane_indptr: Vec<i32>,
-    pub reference_tag: Vec<i32>,
     pub permutation: Vec<i32>,
-    pub reference_start: Vec<i32>,
-    pub references: Vec<u32>,
-    /// One attention class per packed row (-1 where the lane states none).
-    pub attn_class: Vec<i32>,
 }
 
 #[must_use]
@@ -65,40 +59,15 @@ pub fn groups_of(group_of_lane: &[i32]) -> u32 {
 pub fn pack(
     select: Selection,
     lanes: &[LaneRow],
-    facts: &[LaneFacts],
     group_of_lane: &[i32],
     fire_rows: u32,
-) -> Result<Packed, Fault> {
-    pack_with_classes(select, lanes, facts, group_of_lane, fire_rows, &[])
-}
-
-/// `pack`, with `classes[source]` the attention classes a source lane
-/// states (one per row), packed beside the reference tags.
-pub fn pack_with_classes(
-    select: Selection,
-    lanes: &[LaneRow],
-    facts: &[LaneFacts],
-    group_of_lane: &[i32],
-    fire_rows: u32,
-    classes: &[Option<&[i32]>],
 ) -> Result<Packed, Fault> {
     let groups = groups_of(group_of_lane) as usize;
-    let mut chosen: Vec<(i32, u8, usize)> = lanes
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| select.holds(row.word))
-        .map(|(at, row)| {
-            let stream = facts
-                .get(row.source as usize)
-                .map_or(0, |facts| facts.stream);
-            (group_of_lane.get(at).copied().unwrap_or(0), stream, at)
-        })
-        .collect();
-    chosen.sort_unstable();
+    let chosen = chosen(select, lanes, group_of_lane);
 
     let mut by_row: Vec<(u32, u32)> = chosen
         .iter()
-        .map(|&(_, _, at)| (lanes[at].row_offset, lanes[at].rows))
+        .map(|&(_, at)| (lanes[at].row_offset, lanes[at].rows))
         .collect();
     by_row.sort_unstable();
     let origin = by_row.first().map_or(0, |(offset, _)| *offset);
@@ -118,57 +87,26 @@ pub fn pack_with_classes(
 
     let mut group_indptr = vec![0i32; groups + 1];
     let mut lane_indptr = Vec::with_capacity(chosen.len() + 1);
-    let mut reference_tag = vec![-1i32; fire_rows as usize];
-    let mut attn_class = vec![-1i32; fire_rows as usize];
     let mut permutation = vec![-1i32; fire_rows as usize];
-    let mut reference_start = vec![0i32; groups];
-    let mut references = vec![0u32; groups];
-    let mut seen_reference = vec![false; groups];
 
     let mut packed = origin;
     lane_indptr.push(packed as i32);
-    let mut group_first = vec![origin; groups];
-    let mut cursor_group: Option<i32> = None;
-    for &(group, stream, at) in &chosen {
+    for &(_, at) in &chosen {
         let row = &lanes[at];
-        let g = group as usize;
-        if cursor_group != Some(group) {
-            cursor_group = Some(group);
-            group_first[g] = packed;
-        }
-        let reference = stream == Stream::Reference.code();
-        if reference {
-            references[g] += 1;
-            if !seen_reference[g] {
-                seen_reference[g] = true;
-                reference_start[g] = (packed - group_first[g]) as i32;
-            }
-        }
-        let stated = classes.get(row.source as usize).copied().flatten();
         for j in 0..row.rows {
-            let fire_row = row.row_offset + j;
-            let here = (packed + j) as usize;
-            permutation[here] = fire_row as i32;
-            reference_tag[here] = if reference { at as i32 } else { -1 };
-            attn_class[here] = stated
-                .and_then(|c| c.get(j as usize))
-                .copied()
-                .unwrap_or(-1);
+            permutation[(packed + j) as usize] = (row.row_offset + j) as i32;
         }
         packed += row.rows;
         lane_indptr.push(packed as i32);
     }
     let mut bound = origin as i32;
     let mut run = 0usize;
-    for g in 0..groups {
-        group_indptr[g] = bound;
+    for (g, start) in group_indptr.iter_mut().take(groups).enumerate() {
+        *start = bound;
         let mut count = 0u32;
         while run < chosen.len() && chosen[run].0 as usize == g {
-            count += lanes[chosen[run].2].rows;
+            count += lanes[chosen[run].1].rows;
             run += 1;
-        }
-        if !seen_reference[g] {
-            reference_start[g] = count as i32;
         }
         bound += count as i32;
     }
@@ -182,12 +120,192 @@ pub fn pack_with_classes(
         lanes: chosen.len() as u32,
         group_indptr,
         lane_indptr,
-        reference_tag,
         permutation,
-        reference_start,
-        references,
-        attn_class,
     })
+}
+
+/// The lanes `select` holds, as (group, composition index), in packing order.
+fn chosen(select: Selection, lanes: &[LaneRow], group_of_lane: &[i32]) -> Vec<(i32, usize)> {
+    let mut chosen: Vec<(i32, usize)> = lanes
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| select.holds(row.word))
+        .map(|(at, _)| (group_of_lane.get(at).copied().unwrap_or(0), at))
+        .collect();
+    chosen.sort_unstable();
+    chosen
+}
+
+/// Per guest row, the ascending column ranges of the attention group it attends; a group's
+/// columns are its lanes' guest rows, lane after lane in the pass's order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaneMask {
+    pub rows: Vec<Vec<std::ops::Range<u64>>>,
+}
+
+/// `of_token`: for a voxel lane, the guest row (voxel) each token row attends as.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GuestRows {
+    pub count: u64,
+    pub of_token: Option<Vec<u64>>,
+}
+
+impl GuestRows {
+    fn of(&self, token: u32) -> u64 {
+        match &self.of_token {
+            Some(rows) => rows.get(token as usize).copied().unwrap_or(u64::MAX),
+            None => u64::from(token),
+        }
+    }
+}
+
+/// A voxel lane's token rows are its clips' patches of `patch` voxels, (t, h, w) row-major,
+/// clip after clip; each attends as its patch's first voxel.
+pub fn guest_rows(
+    lane: &LaneRow,
+    clips: Option<&[[u32; 3]]>,
+    patch: Option<[u32; 3]>,
+) -> Result<GuestRows, Fault> {
+    let Some(clips) = clips.filter(|clips| !clips.is_empty()) else {
+        return Ok(GuestRows {
+            count: u64::from(lane.rows),
+            of_token: None,
+        });
+    };
+    let refused = || Fault::MaskPatches {
+        lane: lane.source,
+        tokens: lane.rows,
+        clips: clips.len() as u32,
+    };
+    let [pt, ph, pw] = patch.ok_or_else(refused)?;
+    let mut of_token = Vec::with_capacity(lane.rows as usize);
+    let mut base = 0u64;
+    for &[t, h, w] in clips {
+        if pt == 0
+            || ph == 0
+            || pw == 0
+            || !t.is_multiple_of(pt)
+            || !h.is_multiple_of(ph)
+            || !w.is_multiple_of(pw)
+        {
+            return Err(refused());
+        }
+        let (h64, w64) = (u64::from(h), u64::from(w));
+        for i in 0..t / pt {
+            for j in 0..h / ph {
+                for k in 0..w / pw {
+                    of_token.push(
+                        base + u64::from(i * pt) * h64 * w64
+                            + u64::from(j * ph) * w64
+                            + u64::from(k * pw),
+                    );
+                }
+            }
+        }
+        base += u64::from(t) * h64 * w64;
+    }
+    if of_token.len() != lane.rows as usize {
+        return Err(refused());
+    }
+    Ok(GuestRows {
+        count: base,
+        of_token: Some(of_token),
+    })
+}
+
+/// One bit per (query, key) pair of a group's rows, query-major, group `g` from byte `indptr[g]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GroupMask {
+    pub bits: Vec<u8>,
+    pub indptr: Vec<i32>,
+}
+
+/// `None` when no lane states a mask; a lane stating none attends every row of its group.
+pub fn group_mask(
+    lanes: &[LaneRow],
+    group_of_lane: &[i32],
+    q: &Packed,
+    kv: &Packed,
+    masks: &[Option<&LaneMask>],
+    guests: &[GuestRows],
+) -> Result<Option<GroupMask>, Fault> {
+    let source = |at: usize| lanes[at].source as usize;
+    let stated = |at: usize| masks.get(source(at)).copied().flatten();
+    let q_chosen = chosen(q.select, lanes, group_of_lane);
+    let kv_chosen = chosen(kv.select, lanes, group_of_lane);
+    if !q_chosen.iter().any(|&(_, at)| stated(at).is_some()) {
+        return Ok(None);
+    }
+    for &(_, at) in &q_chosen {
+        if let Some(mask) = stated(at) {
+            let rows = guests.get(source(at)).map_or(0, |guest| guest.count);
+            if mask.rows.len() as u64 != rows {
+                return Err(Fault::MaskRows {
+                    lane: lanes[at].source,
+                    stated: mask.rows.len(),
+                    rows,
+                });
+            }
+        }
+    }
+    // A lane's guest rows start after those of its group's earlier lanes.
+    let offset = |at: usize| -> u64 {
+        let group = group_of_lane.get(at).copied().unwrap_or(0);
+        (0..lanes.len())
+            .filter(|&other| {
+                group_of_lane.get(other).copied().unwrap_or(0) == group
+                    && lanes[other].source < lanes[at].source
+            })
+            .map(|other| guests.get(source(other)).map_or(0, |guest| guest.count))
+            .sum()
+    };
+    let groups = groups_of(group_of_lane) as usize;
+    let mut bits: Vec<u8> = Vec::new();
+    let mut indptr = Vec::with_capacity(groups + 1);
+    for g in 0..groups {
+        indptr.push(i32::try_from(bits.len()).unwrap_or(i32::MAX));
+        let keys: Vec<u64> = kv_chosen
+            .iter()
+            .filter(|&&(group, _)| group as usize == g)
+            .flat_map(|&(_, at)| {
+                let base = offset(at);
+                let guest = &guests[source(at)];
+                (0..lanes[at].rows).map(move |token| base + guest.of(token))
+            })
+            .collect();
+        let queries: Vec<(usize, u32)> = q_chosen
+            .iter()
+            .filter(|&&(group, _)| group as usize == g)
+            .flat_map(|&(_, at)| (0..lanes[at].rows).map(move |token| (at, token)))
+            .collect();
+        let cells = queries.len() as u64 * keys.len() as u64;
+        let base = bits.len();
+        bits.resize(
+            base + usize::try_from(cells.div_ceil(8)).unwrap_or(usize::MAX),
+            0,
+        );
+        for (row, &(at, token)) in queries.iter().enumerate() {
+            let first = row as u64 * keys.len() as u64;
+            let mut set = |key: usize| {
+                let cell = first + key as u64;
+                bits[base + (cell / 8) as usize] |= 1 << (cell % 8);
+            };
+            match stated(at) {
+                None => (0..keys.len()).for_each(&mut set),
+                Some(mask) => {
+                    let ranges = &mask.rows[guests[source(at)].of(token) as usize];
+                    for (key, &column) in keys.iter().enumerate() {
+                        let next = ranges.partition_point(|span| span.end <= column);
+                        if ranges.get(next).is_some_and(|span| span.start <= column) {
+                            set(key);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    indptr.push(i32::try_from(bits.len()).unwrap_or(i32::MAX));
+    Ok(Some(GroupMask { bits, indptr }))
 }
 
 #[cfg(test)]
@@ -207,17 +325,70 @@ mod tests {
 
     const TEXT: u64 = 1;
     const IMAGE: u64 = 2;
-    const REFERENCE: u64 = 32;
 
     #[test]
     fn packing_every_case() {
-        a_joint_selection_packs_by_group_then_stream();
+        a_joint_selection_packs_by_group_then_lane();
         a_class_selection_packs_at_its_own_window();
-        a_reference_lane_packs_last_and_is_tagged();
         a_scattered_selection_is_refused();
+        a_group_mask_runs_over_its_group_in_lane_order();
+        a_voxel_lanes_tokens_attend_as_their_patches_first_voxel();
     }
 
-    fn a_joint_selection_packs_by_group_then_stream() {
+    fn keeps(mask: &GroupMask, group: usize, keys: u64, q: u64, k: u64) -> bool {
+        let cell = q * keys + k;
+        (mask.bits[mask.indptr[group] as usize + (cell / 8) as usize] >> (cell % 8)) & 1 == 1
+    }
+
+    fn a_group_mask_runs_over_its_group_in_lane_order() {
+        let lanes = [
+            row(0, IMAGE, 0, 2),
+            row(1, TEXT, 2, 1),
+            row(2, IMAGE, 3, 2),
+            row(3, TEXT, 5, 1),
+        ];
+        let facts = [
+            LaneFacts { group: Some(0) },
+            LaneFacts { group: Some(0) },
+            LaneFacts { group: Some(1) },
+            LaneFacts { group: Some(1) },
+        ];
+        let groups = group_of_lane(&lanes, &facts);
+        let packed = pack(Selection::ALL, &lanes, &groups, 6).unwrap();
+        let guests: Vec<GuestRows> = lanes
+            .iter()
+            .map(|lane| guest_rows(lane, None, None).unwrap())
+            .collect();
+        let image = LaneMask {
+            rows: vec![vec![2..3], vec![0..3]],
+        };
+        let masks = [Some(&image), None, None, None];
+        let mask = group_mask(&lanes, &groups, &packed, &packed, &masks, &guests)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mask.indptr.len(), 3);
+        assert!(!keeps(&mask, 0, 3, 0, 0));
+        assert!(!keeps(&mask, 0, 3, 0, 1));
+        assert!(keeps(&mask, 0, 3, 0, 2));
+        assert!((0..3).all(|k| keeps(&mask, 0, 3, 1, k)));
+        assert!((0..3).all(|k| keeps(&mask, 0, 3, 2, k)));
+        assert!((0..3).all(|q| (0..3).all(|k| keeps(&mask, 1, 3, q, k))));
+        let unmasked = [None, None, None, None];
+        assert_eq!(
+            group_mask(&lanes, &groups, &packed, &packed, &unmasked, &guests).unwrap(),
+            None
+        );
+    }
+
+    fn a_voxel_lanes_tokens_attend_as_their_patches_first_voxel() {
+        let lane = row(0, IMAGE, 0, 4);
+        let guest = guest_rows(&lane, Some(&[[1, 4, 4]]), Some([1, 2, 2])).unwrap();
+        assert_eq!(guest.count, 16);
+        assert_eq!(guest.of_token, Some(vec![0, 2, 8, 10]));
+        assert!(guest_rows(&lane, Some(&[[1, 4, 4]]), Some([1, 4, 4])).is_err());
+    }
+
+    fn a_joint_selection_packs_by_group_then_lane() {
         let lanes = [
             row(0, TEXT, 0, 3),
             row(2, TEXT, 3, 2),
@@ -225,56 +396,33 @@ mod tests {
             row(3, IMAGE, 9, 5),
         ];
         let facts = [
-            LaneFacts {
-                stream: 0,
-                group: Some(7),
-            },
-            LaneFacts {
-                stream: 1,
-                group: Some(7),
-            },
-            LaneFacts {
-                stream: 0,
-                group: Some(9),
-            },
-            LaneFacts {
-                stream: 1,
-                group: Some(9),
-            },
+            LaneFacts { group: Some(7) },
+            LaneFacts { group: Some(7) },
+            LaneFacts { group: Some(9) },
+            LaneFacts { group: Some(9) },
         ];
         let groups = group_of_lane(&lanes, &facts);
         assert_eq!(groups, vec![0, 1, 0, 1]);
-        let packed = pack(Selection::ALL, &lanes, &facts, &groups, 14).unwrap();
+        let packed = pack(Selection::ALL, &lanes, &groups, 14).unwrap();
         assert_eq!(packed.origin, 0);
         assert_eq!(packed.rows, 14);
         assert_eq!(packed.group_indptr, vec![0, 7, 14]);
         assert_eq!(packed.lane_indptr, vec![0, 3, 7, 9, 14]);
         let expected: Vec<i32> = (0..3).chain(5..9).chain(3..5).chain(9..14).collect();
         assert_eq!(packed.permutation, expected);
-        assert!(packed.reference_tag.iter().all(|&tag| tag == -1));
-        assert_eq!(packed.reference_start, vec![7, 7]);
     }
 
     fn a_class_selection_packs_at_its_own_window() {
         let lanes = [row(0, TEXT, 0, 3), row(2, TEXT, 3, 2), row(1, IMAGE, 5, 4)];
         let facts = [
-            LaneFacts {
-                stream: 0,
-                group: Some(1),
-            },
-            LaneFacts {
-                stream: 1,
-                group: Some(1),
-            },
-            LaneFacts {
-                stream: 0,
-                group: None,
-            },
+            LaneFacts { group: Some(1) },
+            LaneFacts { group: Some(1) },
+            LaneFacts { group: None },
         ];
         let groups = group_of_lane(&lanes, &facts);
         assert_eq!(groups, vec![0, 1, 0]);
         let image = Selection { mask: 2, value: 2 };
-        let packed = pack(image, &lanes, &facts, &groups, 9).unwrap();
+        let packed = pack(image, &lanes, &groups, 9).unwrap();
         assert_eq!(packed.origin, 5);
         assert_eq!(packed.rows, 4);
         assert_eq!(packed.group_indptr, vec![5, 9, 9]);
@@ -282,40 +430,12 @@ mod tests {
         assert_eq!(packed.permutation, vec![-1, -1, -1, -1, -1, 5, 6, 7, 8]);
     }
 
-    fn a_reference_lane_packs_last_and_is_tagged() {
-        let lanes = [
-            row(0, TEXT, 0, 2),
-            row(1, IMAGE, 2, 3),
-            row(2, REFERENCE, 5, 2),
-        ];
-        let facts = [
-            LaneFacts {
-                stream: 0,
-                group: Some(0),
-            },
-            LaneFacts {
-                stream: 1,
-                group: Some(0),
-            },
-            LaneFacts {
-                stream: 5,
-                group: Some(0),
-            },
-        ];
-        let groups = group_of_lane(&lanes, &facts);
-        let packed = pack(Selection::ALL, &lanes, &facts, &groups, 7).unwrap();
-        assert_eq!(packed.group_indptr, vec![0, 7]);
-        assert_eq!(packed.reference_tag, vec![-1, -1, -1, -1, -1, 2, 2]);
-        assert_eq!(packed.reference_start, vec![5]);
-        assert_eq!(packed.references, vec![1]);
-    }
-
     fn a_scattered_selection_is_refused() {
         let lanes = [row(0, TEXT, 0, 2), row(1, IMAGE, 2, 3), row(2, TEXT, 5, 2)];
         let facts = [LaneFacts::default(); 3];
         let groups = group_of_lane(&lanes, &facts);
         let text = Selection { mask: 1, value: 1 };
-        let fault = pack(text, &lanes, &facts, &groups, 7).unwrap_err();
+        let fault = pack(text, &lanes, &groups, 7).unwrap_err();
         assert!(matches!(fault, Fault::ScatteredSelection { .. }), "{fault}");
     }
 }

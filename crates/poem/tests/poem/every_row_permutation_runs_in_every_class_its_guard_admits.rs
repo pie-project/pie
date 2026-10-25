@@ -1,7 +1,7 @@
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Request, Stream, Value, Weight,
-    ops, seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Request, Value, Weight, ops,
+    seam, trace_hybrid,
 };
 use poem_ir::{Gather, Operation};
 
@@ -15,13 +15,16 @@ impl ForwardHybrid for LastJointBlock {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
+        inputs
+            .recorder()
+            .declare_switch("stream", &["text", "image", "video", "audio"]);
         let (txt, img) = (
-            inputs.on(fact::stream(Stream::Text)),
-            inputs.on(!fact::stream(Stream::Text)),
+            inputs.on(fact::switch_is("stream", "text")),
+            inputs.on(!fact::switch_is("stream", "text")),
         );
         let w = |name: &str| Weight::sym(name, [u64::from(WIDTH), u64::from(WIDTH)], Dtype::Bf16);
-        let x_txt = txt.latents(0, WIDTH, Dtype::Bf16);
-        let x_img = img.latents(1, WIDTH, Dtype::Bf16);
+        let x_txt = txt.input("text", Dtype::Bf16, poem_ir::InputAxis::Row, WIDTH, None);
+        let x_img = img.input("image", Dtype::Bf16, poem_ir::InputAxis::Row, WIDTH, None);
         let project = |x: &Value, prefix: &str| {
             (
                 ops::linear::matmul(x, &w(&format!("{prefix}.q"))),
@@ -44,7 +47,7 @@ impl ForwardHybrid for LastJointBlock {
             RaggedMask::GroupBlockDiagonal,
         );
         let o = ops::gather::unpack_rows(&o, &perm);
-        let o_img = o.on(!fact::stream(Stream::Text));
+        let o_img = o.on(!fact::switch_is("stream", "text"));
         let out = ops::linear::matmul(&o_img, &w("img.o"));
         seam::at(seam::VELOCITY, &[&out]);
         out
@@ -59,7 +62,7 @@ fn the_pack_and_unpack_of_a_head_only_block_are_demanded_in_both_streams() {
         .class_of(
             trace
                 .facts
-                .word(&Request::new(1, false).on_stream(Stream::Text))
+                .word(&Request::new(1, false).switched("stream", "text"))
                 & classes.mask,
         )
         .expect("a text lane has a class");
@@ -67,7 +70,7 @@ fn the_pack_and_unpack_of_a_head_only_block_are_demanded_in_both_streams() {
         .class_of(
             trace
                 .facts
-                .word(&Request::new(1, false).on_stream(Stream::Image))
+                .word(&Request::new(1, false).switched("stream", "image"))
                 & classes.mask,
         )
         .expect("an image lane has a class");

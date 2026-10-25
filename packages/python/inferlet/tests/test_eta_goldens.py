@@ -153,7 +153,7 @@ def test_s3_matches_lowering_rs_golden():
     b.stage(Stage.EPILOGUE, epilogue)
     host_put(mask, [True] * vocab)
     traced = b.build()
-    assert traced.identity_hash() == 4213522552817221928
+    assert traced.identity_hash() == GOLDENS["s3"][0]
     check("s3", traced)
 
 
@@ -547,7 +547,7 @@ def test_latent_step_matches_rust():
 
     def epilogue():
         positions.put_tensor(positions.take())
-        v = intrinsics.velocity(channels)
+        v = intrinsics.velocity(0, rows, channels)
         x = latent.take()
         d = reshape(dsigma.read(), [])
 
@@ -588,17 +588,14 @@ def test_latent_step_matches_rust():
 
 
 def test_vae_readback_matches_rust():
-    """`inferlet_goldens.rs::vae_readback` — a VAE reading's epilogue (design D8):
-    the one golden that carries `Intrinsic.PIXELS`, so a port that drifts on
-    the new intrinsic's wire id fails here. The rows are declared, not
-    hinted: a VAE lane's token rows are not its clip's voxels."""
+    """`inferlet_goldens.rs::vae_readback`: the one golden carrying `Intrinsic.PIXELS`."""
     rows, rgb = 16, 3
     out = ch_new([rows, rgb], dtype.f32, "pixels_out")
 
     b = Builder(VOCAB, PAGE)
 
     def epilogue():
-        px = intrinsics.pixels(rows, rgb)
+        px = intrinsics.pixels(0, rows, rgb)
         shifted = add(px, 1.0)
         unit = mul(shifted, 0.5)
         out.put_tensor(unit)
@@ -606,3 +603,23 @@ def test_vae_readback_matches_rust():
     b.stage(Stage.EPILOGUE, epilogue)
     out.note_host_take()
     check("vae_readback", b.build())
+
+
+def test_noised_input_matches_rust():
+    """`inferlet_goldens.rs::noised_input`: the one golden carrying an input table."""
+    rows, width = 4, 8
+    rng_ch = ch_from([5, 0], dtype.u32, "rng")
+    latent = ch_new([rows, width], dtype.f32, "latent")
+    timestep = ch_from([0.5], dtype.f32, "timestep")
+
+    b = Builder(VOCAB, PAGE)
+    b.bind_input(latent)
+    b.bind_input(timestep)
+
+    def prologue():
+        r = rng_ch.take()
+        latent.put_tensor(normal(r, [rows, width]))
+        rng_ch.put_tensor(add(r, iota(2)))
+
+    b.stage(Stage.PROLOGUE, prologue)
+    check("noised_input", b.build())

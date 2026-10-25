@@ -1,5 +1,5 @@
 //! DiffusionGemma's reference sampler, as transformers' `generate` spells it
-//! (`generation_diffusion_gemma.py`), written against `forward-diffusion`.
+//! (`generation_diffusion_gemma.py`), written against the model's `mode` switch.
 //!
 //! One canvas at a time. An `encode` pass prefills the prompt; then, per
 //! block, a `denoise` pass over a canvas of uniform-random ids is resubmitted
@@ -13,13 +13,17 @@
 //!
 //! Self-conditioning rides as the guest's taps: each step's epilogue also
 //! emits the top-`taps` of the temperature-scaled softmax per canvas row,
-//! and the host hands them to the next submit through `self_conditioning`
-//! — the reference's `softmax(logits / T) · E`, truncated to those taps.
-//! The first step of every canvas runs with no signal, as the reference
-//! does. Multi-canvas speculation is not attempted.
+//! and the next submit reads them through the denoise lane's two inputs,
+//! `self_cond_ids` and `self_cond_weights` — the reference's
+//! `softmax(logits / T) · E`, truncated to those taps. The first step of
+//! every canvas reads zeros (no signal), as the reference does.
+//! Multi-canvas speculation is not attempted.
 
 use inferlet::eta::diffusion::prelude::*;
 use serde::{Deserialize, Serialize};
+
+/// Tokens per block's canvas.
+const CANVAS: u32 = 256;
 
 #[derive(Deserialize)]
 struct Input {
@@ -91,12 +95,13 @@ fn noise_canvas(seed: u32, length: u32, vocab: u32) -> Vec<i32> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Diffusion {
-        return Err("this program drives a block-diffusion model; the bound model is not one".into());
+    if !model::switch("mode").is_some_and(|mode| mode.values.iter().any(|v| v == "denoise")) {
+        return Err(
+            "this program drives a block-diffusion model; the bound model is not one".into(),
+        );
     }
-    let shape = model::canvas().ok_or("a diffusion model states its canvas")?;
-    let length = shape.length;
-    let taps = shape.self_cond_taps;
+    let length = CANVAS;
+    let taps = self_cond_taps()?;
     // The canvas attends both ways, so the runtime cannot cut it: one fire reads every row.
     let readable = max_readout_rows(model::ReadoutKind::Logits);
     if readable < length as usize {
@@ -175,15 +180,17 @@ async fn main(input: Input) -> Result<Output> {
         // this step's distribution and their probabilities. Loop-carried on
         // the device (the epilogue takes the previous step's and puts this
         // step's), read by the model straight off the channel at every
-        // submit (`self_conditioning_from`); seeded with zeros, which is
+        // submit (the `self_cond_*` inputs); seeded with zeros, which is
         // the reference's "no signal" first step. The host never sees them.
         let tap_ids_out =
-            Channel::from_shaped([length, taps], vec![0u32; (length * taps) as usize]).named("tap_ids");
+            Channel::from_shaped([length, taps], vec![0i32; (length * taps) as usize])
+                .named("tap_ids");
         let tap_weights_out =
-            Channel::from_shaped([length, taps], vec![0f32; (length * taps) as usize]).named("tap_weights");
+            Channel::from_shaped([length, taps], vec![0f32; (length * taps) as usize])
+                .named("tap_weights");
 
         let fwd = ForwardPass::new();
-        fwd.canvas(Mode::Denoise)?;
+        fwd.switch(0, "mode", "denoise")?;
         fwd.embed(&toks, &embed_indptr)?;
         fwd.state(
             &[&ws],
@@ -193,8 +200,10 @@ async fn main(input: Input) -> Result<Output> {
             },
         )?;
         fwd.readout(&readout)?;
-        fwd.self_conditioning_from(&tap_ids_out, &tap_weights_out)
-            .context("bind self-conditioning to the tap channels")?;
+        fwd.input(0, "self_cond_ids", &tap_ids_out)
+            .context("bind self_cond_ids to the tap channel")?;
+        fwd.input(0, "self_cond_weights", &tap_weights_out)
+            .context("bind self_cond_weights to the tap channel")?;
         fwd.epilogue(move || {
             // Re-put unchanged: every step writes the same canvas slots.
             slots.put(slots.take());
@@ -205,7 +214,10 @@ async fn main(input: Input) -> Result<Output> {
             // order so the schedule is the same numbers it would have set.
             let i = step_index.take();
             let remaining = cast(&(max_steps - &i), dtype::f32);
-            let t = reshape(&(&(&remaining / (max_steps as f32)) * (t_max - t_min)) + t_min, []);
+            let t = reshape(
+                &(&(&remaining / (max_steps as f32)) * (t_max - t_min)) + t_min,
+                [],
+            );
             step_index.put(&(&i + 1u32));
             let logits = intrinsics::logits(); // [length, vocab]
             let scaled = &logits / &t;
@@ -246,14 +258,22 @@ async fn main(input: Input) -> Result<Output> {
             // Loop-carried: this step's taps replace the previous step's.
             let _ = tap_ids_out.take();
             let _ = tap_weights_out.take();
-            tap_ids_out.put(&tap_ids);
+            tap_ids_out.put(cast(&tap_ids, dtype::i32));
             tap_weights_out.put(&tap_weights);
 
             // The canvas the next step embeds — on the device, never drained.
             toks.put(&next);
             let mean = reshape(&reduce_sum(&h) / (length as f32), [1]);
-            let word = scatter_set(broadcast(0f32, [length + 2]), iota(length), cast(&argmax, dtype::f32));
-            let word = scatter_set(&word, &(&iota(1) + length), cast(reshape(&done, [1]), dtype::f32));
+            let word = scatter_set(
+                broadcast(0f32, [length + 2]),
+                iota(length),
+                cast(&argmax, dtype::f32),
+            );
+            let word = scatter_set(
+                &word,
+                &(&iota(1) + length),
+                cast(reshape(&done, [1]), dtype::f32),
+            );
             let word = scatter_set(&word, &(&iota(1) + (length + 1)), &mean);
             step_out.put(&word);
             rng_state.put(&(&r_noise + iota(2)));
@@ -264,12 +284,16 @@ async fn main(input: Input) -> Result<Output> {
         let mut mean = f32::NAN;
         let mut trace: Vec<f32> = Vec::new();
         for remaining in (1..=input.max_steps).rev() {
-            fwd.submit(&pipe).with_context(|| format!("denoise submit block {block} step {steps}"))?;
+            fwd.submit(&pipe)
+                .with_context(|| format!("denoise submit block {block} step {steps}"))?;
             steps += 1;
             // The one host read a step. The canvas and the taps stay on the
             // device; the argmax ids ride as exact f32 (the vocab is under
             // 2^24).
-            let word = step_out.take_host::<Vec<f32>>().await.context("step drain")?;
+            let word = step_out
+                .take_host::<Vec<f32>>()
+                .await
+                .context("step drain")?;
             argmax_canvas = word[..length as usize].iter().map(|&v| v as i32).collect();
             let done = word[length as usize] != 0.0;
             mean = word[length as usize + 1];
@@ -312,7 +336,18 @@ async fn main(input: Input) -> Result<Output> {
     })
 }
 
-/// One `encode` pass over `tokens` at slots `base..`: the causal reading,
+fn self_cond_taps() -> Result<u32> {
+    let lane = model::lane_of(&[("mode", "denoise")])?;
+    let input = lane
+        .inputs
+        .iter()
+        .find(|input| input.name == "self_cond_ids");
+    Ok(input
+        .ok_or("the denoise lane reads no `self_cond_ids` input")?
+        .width)
+}
+
+/// One `encode` pass over `tokens` at slots `base..`: the default `encode` mode,
 /// whose K/V become the sequence and freeze. Reads out its last row so the
 /// fire has a drained output (an epilogue put that is never taken fills the
 /// ring; a pass with nothing to say still says one word).
@@ -325,7 +360,6 @@ async fn encode(ws: &WorkingSet, pipe: &Pipeline, tokens: &[i32], base: u32) -> 
     let last = Channel::new([1], dtype::i32).named("last_e");
 
     let fwd = ForwardPass::new();
-    fwd.canvas(Mode::Encode)?;
     fwd.embed(&toks, &embed_indptr)?;
     fwd.state(
         &[ws],
@@ -335,7 +369,10 @@ async fn encode(ws: &WorkingSet, pipe: &Pipeline, tokens: &[i32], base: u32) -> 
         },
     )?;
     fwd.epilogue(move || {
-        last.put(reshape(cast(reduce_argmax(intrinsics::logits()), dtype::i32), [1]));
+        last.put(reshape(
+            cast(reduce_argmax(intrinsics::logits()), dtype::i32),
+            [1],
+        ));
     });
     fwd.submit(pipe)?;
     last.take_host::<i32>().await?;

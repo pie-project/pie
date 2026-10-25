@@ -2,6 +2,7 @@ use poem_compiler::CompiledModel;
 use poem_ir::{Operands, Trace, ValueId};
 
 use crate::error::{Fault, Result};
+use poem_exec::feeds::{classes_running, writer_classes};
 
 pub(crate) const OUT_SEAM: &str = poem_compiler::EXPORT_SEAMS[0];
 pub(crate) const MTP_SEAM: &str = poem_compiler::EXPORT_SEAMS[1];
@@ -50,12 +51,18 @@ impl Exports {
             .map(|(export, grid)| (export.value, *grid))
     }
 
-    pub(crate) fn pixels_widths<'a>(&'a self, trace: &'a Trace) -> impl Iterator<Item = u32> + 'a {
-        self.pixels.iter().filter_map(move |(export, _)| {
-            crate::store::kv::width_of(trace, export.value)
-                .ok()
-                .and_then(|width| u32::try_from(width).ok())
-        })
+    pub(crate) fn writes_pixels(&self, class: usize) -> bool {
+        self.pixels
+            .iter()
+            .any(|(export, _)| export.classes.contains(class))
+    }
+
+    pub(crate) fn on_voxels(&self, trace: &Trace, value: ValueId) -> bool {
+        matches!(
+            &trace.values[value.0 as usize].ty,
+            poem_ir::Ty::Tensor { shape, .. }
+                if matches!(shape.first(), Some(poem_ir::Dim::Voxels | poem_ir::Dim::VoxelsTimes(_)))
+        )
     }
 
     #[must_use]
@@ -215,39 +222,6 @@ impl Exports {
     }
 }
 
-fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> poem_ir::ClassSet {
-    if let Some(poem_ir::Def::Merge(arms)) =
-        trace.values.get(value.0 as usize).map(|decl| &decl.def)
-    {
-        let mut classes = poem_ir::ClassSet::default();
-        for (arm, _) in arms {
-            for class in writer_classes(trace, compiled, *arm).iter() {
-                classes.insert(class);
-            }
-        }
-        return classes;
-    }
-    let mut outputs: Vec<ValueId> = Vec::new();
-    let mut writers: Vec<u32> = Vec::new();
-    for (at, node) in trace.nodes.iter().enumerate() {
-        outputs.clear();
-        node.op.outputs(&mut outputs);
-        if outputs.contains(&value) {
-            writers.push(u32::try_from(at).unwrap_or(u32::MAX));
-        }
-    }
-    let mut classes = poem_ir::ClassSet::default();
-    for region in compiled.template() {
-        if !region.nodes.clone().any(|node| writers.contains(&node)) {
-            continue;
-        }
-        for class in region.mask.iter() {
-            classes.insert(class);
-        }
-    }
-    classes
-}
-
 #[must_use]
 pub(crate) fn masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
     classes_running(trace, compiled, |op| {
@@ -273,6 +247,40 @@ pub(crate) fn masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir
 }
 
 #[must_use]
+pub(crate) fn wide_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
+    classes_running(trace, compiled, |op| {
+        matches!(
+            op,
+            poem_ir::Operation::Attn(poem_ir::Attn::Prefill { causal: false, .. })
+        )
+    })
+}
+
+/// Mask bits are staged once per lane with causality baked in, unclipped in a wide
+/// class: a causal masked prefill there would see future keys.
+pub(crate) fn one_direction_per_mask(trace: &Trace, compiled: &CompiledModel) -> Result<()> {
+    let causal_masked = classes_running(trace, compiled, |op| {
+        matches!(
+            op,
+            poem_ir::Operation::Attn(poem_ir::Attn::Prefill {
+                mask: Some(_),
+                causal: true,
+                ..
+            })
+        )
+    });
+    match wide_classes(trace, compiled)
+        .iter()
+        .find(|&class| causal_masked.contains(class))
+    {
+        Some(class) => Err(Fault::Recipe(format!(
+            "class {class} attends both ways under one mask"
+        ))),
+        None => Ok(()),
+    }
+}
+
+#[must_use]
 pub(crate) fn corrected_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
     classes_running(trace, compiled, |op| {
         matches!(
@@ -294,53 +302,20 @@ pub(crate) fn media_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir:
     })
 }
 
+/// Each class's requests, the plainest first.
 #[must_use]
 pub(crate) fn landing_requests(
     facts: &poem_ir::Facts,
     classes: &poem_ir::ClassTable,
 ) -> Vec<Vec<poem_ir::Request>> {
     let mut landing = vec![Vec::new(); classes.classes.len()];
-    let readings: Vec<Option<&str>> = std::iter::once(None)
-        .chain(facts.values(poem_ir::Request::READING).map(Some))
-        .collect();
-    for reading in readings {
-        for stream in poem_ir::Stream::ALL {
-            for bits in 0..128u32 {
-                let request =
-                    poem_ir::Request::new(if bits & 1 == 0 { 1 } else { 2 }, bits & 2 != 0)
-                        .adapted(bits & 4 != 0)
-                        .drafting(bits & 8 != 0)
-                        .capturing_scores(bits & 16 != 0)
-                        .with_media(bits & 32 != 0)
-                        .denoising(bits & 64 != 0)
-                        .on_stream(stream);
-                let request = match reading {
-                    Some(name) => request.in_reading(name),
-                    None => request,
-                };
-                let word = facts.word(&request) & classes.mask;
-                if let Some(class) = classes.class_of(word) {
-                    landing[class].push(request);
-                }
-            }
+    for request in facts.requests() {
+        let word = facts.word(&request) & classes.mask;
+        if let Some(class) = classes.class_of(word) {
+            landing[class].push(request);
         }
     }
-    for requests in &mut landing {
-        requests.sort_by_key(request_flags);
-    }
     landing
-}
-
-fn request_flags(request: &poem_ir::Request) -> u32 {
-    u32::from(request.query_len() != 1)
-        + u32::from(request.has_custom_mask())
-        + u32::from(request.has_adapter())
-        + u32::from(request.drafts())
-        + u32::from(request.captures_scores())
-        + u32::from(request.has_media())
-        + u32::from(request.denoise())
-        + u32::from(request.stream() != poem_ir::Stream::Text)
-        + u32::from(request.reading().is_some())
 }
 
 #[must_use]
@@ -349,11 +324,7 @@ pub(crate) fn plain_of(landing: &[Vec<poem_ir::Request>]) -> poem_ir::ClassSet {
         landing
             .iter()
             .enumerate()
-            .filter(|(_, requests)| {
-                requests
-                    .iter()
-                    .any(|request| request_flags(request) == u32::from(request.query_len() != 1))
-            })
+            .filter(|(_, requests)| requests.iter().any(poem_ir::Request::plain))
             .map(|(class, _)| class),
     )
 }
@@ -476,206 +447,7 @@ fn lane_shifting_node(trace: &Trace, node: u32) -> bool {
     })
 }
 
-fn classes_running(
-    trace: &Trace,
-    compiled: &CompiledModel,
-    wanted: impl Fn(&poem_ir::Operation) -> bool,
-) -> poem_ir::ClassSet {
-    let mut classes = poem_ir::ClassSet::default();
-    for region in compiled.template() {
-        let runs = region.nodes.clone().any(|node| {
-            trace
-                .nodes
-                .get(node as usize)
-                .is_some_and(|node| wanted(&node.op))
-        });
-        if runs {
-            for class in region.mask.iter() {
-                classes.insert(class);
-            }
-        }
-    }
-    classes
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct Feeds {
-    pub(crate) ports: Vec<(crate::inputs::PortSeat, poem_ir::ClassSet)>,
-    pub(crate) selections: Vec<poem_ir::Selection>,
-    pub(crate) merged: Vec<MergedPort>,
-    pub(crate) unlanded: Vec<ValueId>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct MergedPort {
-    pub(crate) merge: ValueId,
-    pub(crate) seat: crate::inputs::PortSeat,
-    pub(crate) select: poem_ir::Selection,
-}
-
-impl Feeds {
-    #[must_use]
-    pub(crate) fn of(trace: &Trace, compiled: &CompiledModel) -> Feeds {
-        use poem_ir::{Def, GeomKind, RuntimeInput, Ty};
-        let mut feeds = Feeds::default();
-        for (at, decl) in trace.values.iter().enumerate() {
-            let Def::Input(input) = &decl.def else {
-                continue;
-            };
-            let dtype = match &decl.ty {
-                Ty::Tensor { dtype, .. } => *dtype,
-                Ty::Struct(_) => continue,
-            };
-            let seat = match *input {
-                RuntimeInput::Latents { port, width } => Some(crate::inputs::PortSeat {
-                    kind: engine::fire::PortKind::Latents,
-                    port,
-                    width,
-                    dtype,
-                }),
-                RuntimeInput::LaneVector { port, width } => Some(crate::inputs::PortSeat {
-                    kind: engine::fire::PortKind::LaneVector,
-                    port,
-                    width,
-                    dtype,
-                }),
-                RuntimeInput::Context { port, width } => Some(crate::inputs::PortSeat {
-                    kind: engine::fire::PortKind::Context,
-                    port,
-                    width,
-                    dtype,
-                }),
-                RuntimeInput::AxisPositions { port, axes } => Some(crate::inputs::PortSeat {
-                    kind: engine::fire::PortKind::AxisPositions,
-                    port,
-                    width: u32::from(axes),
-                    dtype,
-                }),
-                RuntimeInput::Voxels { port, channels } => Some(crate::inputs::PortSeat {
-                    kind: engine::fire::PortKind::Voxels,
-                    port,
-                    width: channels,
-                    dtype,
-                }),
-                RuntimeInput::RowPermutation { select }
-                | RuntimeInput::Geometry {
-                    kind:
-                        GeomKind::GroupIndptr { select }
-                        | GeomKind::LaneIndptr { select }
-                        | GeomKind::ReferenceTag { select },
-                    ..
-                } => {
-                    if !feeds.selections.contains(&select) {
-                        feeds.selections.push(select);
-                    }
-                    None
-                }
-                _ => None,
-            };
-            if let Some(seat) = seat {
-                let readers = reader_classes(trace, compiled, ValueId(at as u32));
-                match feeds
-                    .ports
-                    .iter_mut()
-                    .find(|(have, _)| have.kind == seat.kind && have.port == seat.port)
-                {
-                    Some((_, classes)) => {
-                        for class in readers.iter() {
-                            classes.insert(class);
-                        }
-                    }
-                    None => feeds.ports.push((seat, readers)),
-                }
-            }
-        }
-        for (at, decl) in trace.values.iter().enumerate() {
-            let Def::Merge(arms) = &decl.def else {
-                continue;
-            };
-            for (arm, guard) in arms {
-                let Def::Input(input) = &trace.values[arm.0 as usize].def else {
-                    continue;
-                };
-                let seat = feeds
-                    .ports
-                    .iter()
-                    .find(|(seat, _)| {
-                        let (kind, port) = match *input {
-                            RuntimeInput::Latents { port, .. } => {
-                                (engine::fire::PortKind::Latents, port)
-                            }
-                            RuntimeInput::LaneVector { port, .. } => {
-                                (engine::fire::PortKind::LaneVector, port)
-                            }
-                            RuntimeInput::Context { port, .. } => {
-                                (engine::fire::PortKind::Context, port)
-                            }
-                            RuntimeInput::AxisPositions { port, .. } => {
-                                (engine::fire::PortKind::AxisPositions, port)
-                            }
-                            _ => return false,
-                        };
-                        seat.kind == kind && seat.port == port
-                    })
-                    .map(|(seat, _)| *seat);
-                let (Some(seat), Some(select)) = (seat, poem_ir::Selection::of(guard)) else {
-                    feeds.unlanded.push(ValueId(at as u32));
-                    continue;
-                };
-                let readers = reader_classes(trace, compiled, ValueId(at as u32));
-                if let Some((_, classes)) = feeds
-                    .ports
-                    .iter_mut()
-                    .find(|(have, _)| have.kind == seat.kind && have.port == seat.port)
-                {
-                    for class in readers.iter() {
-                        let word = compiled.classes.classes[class].word();
-                        if select.holds(word) {
-                            classes.insert(class);
-                        }
-                    }
-                }
-                feeds.merged.push(MergedPort {
-                    merge: ValueId(at as u32),
-                    seat,
-                    select,
-                });
-            }
-        }
-        feeds
-    }
-
-    #[must_use]
-    pub(crate) fn seats(&self) -> Vec<crate::inputs::PortSeat> {
-        self.ports
-            .iter()
-            .map(|(seat, _)| *seat)
-            .filter(|seat| seat.kind != engine::fire::PortKind::Voxels)
-            .collect()
-    }
-}
-
-fn reader_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> poem_ir::ClassSet {
-    let mut inputs: Vec<ValueId> = Vec::new();
-    let mut readers: Vec<u32> = Vec::new();
-    for (at, node) in trace.nodes.iter().enumerate() {
-        inputs.clear();
-        node.op.inputs(&mut inputs);
-        if inputs.contains(&value) {
-            readers.push(u32::try_from(at).unwrap_or(u32::MAX));
-        }
-    }
-    let mut classes = poem_ir::ClassSet::default();
-    for region in compiled.template() {
-        if !region.nodes.clone().any(|node| readers.contains(&node)) {
-            continue;
-        }
-        for class in region.mask.iter() {
-            classes.insert(class);
-        }
-    }
-    classes
-}
+pub(crate) use poem_exec::feeds::Feeds;
 
 /// For each value, whether it is a schedule read only in regions every class
 /// of which is `decoding` (one query row a lane): a grouped decode read
@@ -786,4 +558,87 @@ pub(crate) fn regions_launching_schedules(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_class_attending_both_ways_under_one_mask_is_refused() {
+        let mut trace = poem_compiler::catalog::deployment("qwen35-d9b-dflash-u4g64-kv-bf16")
+            .expect("the catalog ships the drafter row")
+            .trace(poem::Platform::Cuda);
+        let compile = |trace: &Trace| {
+            poem_compiler::compile_axes(
+                trace,
+                &poem_compiler::Budgets {
+                    tokens: poem_compiler::Budget::new(4, 256),
+                    patches: None,
+                    voxels: None,
+                },
+                &poem_compiler::DeviceProfile::default(),
+            )
+            .expect("the plan bakes")
+        };
+        one_direction_per_mask(&trace, &compile(&trace)).expect("the row loads");
+        let causal = trace
+            .nodes
+            .iter_mut()
+            .find_map(|node| match &mut node.op {
+                poem_ir::Operation::Attn(poem_ir::Attn::Prefill {
+                    mask: Some(_),
+                    causal,
+                    ..
+                }) if *causal => Some(causal),
+                _ => None,
+            })
+            .expect("the trunk runs a causal masked prefill");
+        *causal = false;
+        let refusal = one_direction_per_mask(&trace, &compile(&trace))
+            .expect_err("one class now attends both ways under one mask");
+        assert!(
+            refusal
+                .to_string()
+                .ends_with("attends both ways under one mask"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn every_switch_a_request_carries_lands_in_its_class() {
+        let mut facts = poem_ir::Facts::default();
+        facts.declare("mode", &["plain", "wide"]).unwrap();
+        for builtin in [
+            poem_ir::Builtin::Drafts,
+            poem_ir::Builtin::Scores,
+            poem_ir::Builtin::Encode,
+        ] {
+            let _ = facts.builtin(builtin);
+        }
+        let _ = facts.switch("mode", "wide");
+        let bits = facts.table.len();
+        let classes = poem_ir::ClassTable {
+            classes: (0..bits)
+                .map(|bit| poem_ir::Class {
+                    words: vec![1 << bit],
+                    live: Vec::new(),
+                })
+                .collect(),
+            node_mask: Vec::new(),
+            merges: Vec::new(),
+            merge_arm: Vec::new(),
+            mask: (1 << bits) - 1,
+            dead: Vec::new(),
+        };
+        let landing = landing_requests(&facts, &classes);
+        for (class, requests) in landing.iter().enumerate() {
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| facts.word(request) == 1 << class),
+                "no request lands in class {class}"
+            );
+        }
+    }
 }

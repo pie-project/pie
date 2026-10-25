@@ -39,6 +39,7 @@ fn run(gpu: &Gpu, boxes: &[Box3], c: usize, segment: Segment, seed: u64) -> (Vec
         segment,
         scale,
         &mut y,
+        0,
     )
     .unwrap_or_else(|why| panic!("C {c} {segment:?}: {why}"));
     let got = gpu.read(&y);

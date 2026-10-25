@@ -67,36 +67,34 @@ pub struct PatchBindings {
 pub struct PackingBindings {
     pub group_indptr: Tensor,
     pub lane_indptr: Tensor,
-    pub reference_tag: Tensor,
     pub permutation: Tensor,
-    /// One attention class per packed row (-1 where the lane states none).
-    pub attn_class: Tensor,
 }
 
-/// A float port's rectangle for this fire.
+/// A group-packed attention's custom mask: u8 bits, an i32 byte offset a group.
 #[derive(Clone, Copy, Debug)]
-pub struct PortBinding {
-    pub kind: engine::fire::PortKind,
-    pub port: u8,
+pub struct GroupMask {
+    pub q: poem_ir::Selection,
+    pub kv: poem_ir::Selection,
+    pub bits: Tensor,
+    pub indptr: Tensor,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct InputBinding {
+    pub id: u32,
     pub tensor: Tensor,
 }
 
-/// The inputs of the diffusion and video families: the voxel axis (clip
-/// grids, the voxel port), float ports fed from channels, the attention
-/// group packings, and self-conditioning taps. Empty for a text fire.
+/// The diffusion and video families' inputs; empty for a text fire.
 #[derive(Clone, Debug, Default)]
 pub struct DitBindings {
     pub grid: Option<Tensor>,
     pub token_grid: Option<Tensor>,
     pub voxels: Option<Tensor>,
-    pub self_cond_rows: Option<Tensor>,
-    pub self_cond_weights: Option<Tensor>,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, PackingBindings)>,
-    pub ports: Vec<PortBinding>,
-    /// The fire's attention class table (`count x count` u8) and its count,
-    /// when a lane states classes.
-    pub class_table: Option<(Tensor, u32)>,
+    pub inputs: Vec<InputBinding>,
+    pub group_masks: Vec<GroupMask>,
 }
 
 #[derive(Clone, Debug)]
@@ -303,33 +301,28 @@ impl<'c> Run<'c> {
         0
     }
 
-    /// The fire's attention class table and its count, when a lane states
-    /// classes.
-    pub(crate) fn class_table(&self) -> Option<(Tensor, u32)> {
-        self.fire.dit.class_table
-    }
-
-    /// The packed attention classes of the rows `indptr` (a group-packed
-    /// `GroupIndptr` input) bounds.
-    pub(crate) fn packed_classes(&self, indptr: ValueId) -> Option<Tensor> {
-        match &self.values[indptr.0 as usize].def {
+    pub(crate) fn group_mask(&self, q_indptr: ValueId, kv_indptr: ValueId) -> Option<GroupMask> {
+        let select = |indptr: ValueId| match &self.values[indptr.0 as usize].def {
             Def::Input(RuntimeInput::Geometry {
                 kind: GeomKind::GroupIndptr { select },
                 ..
-            }) => self
-                .fire
-                .dit
-                .packings
-                .iter()
-                .find(|(have, _)| have == select)
-                .map(|(_, tables)| tables.attn_class),
+            }) => Some(*select),
             _ => None,
-        }
+        };
+        let (q, kv) = (select(q_indptr)?, select(kv_indptr)?);
+        self.fire
+            .dit
+            .group_masks
+            .iter()
+            .find(|mask| mask.q == q && mask.kv == kv)
+            .copied()
     }
 
-    /// The fire's clip slot table (one i32 slot per voxel lane).
+    /// The fire's clip slot table cut to this window's clips.
     pub(crate) fn clip_slots(&self) -> Option<Tensor> {
-        self.fire.clip_slots
+        let voxel = self.window().voxel;
+        let slots = self.fire.clip_slots?;
+        Some(self.slice(slots, voxel.lane_offset, voxel.lanes))
     }
 
     /// A fresh per-fire array of `rows × width` `dtype`, zeros until
@@ -394,8 +387,26 @@ impl<'c> Run<'c> {
         self.slice(handle, skip, keep)
     }
 
+    /// `mask`'s bits, or the fire's when a non-causal prefill states none.
+    pub(crate) fn mask_bits(&self, mask: Option<ValueId>) -> Tensor {
+        mask.map_or(self.fire.tables.mask, |mask| self.tensor(mask))
+    }
+
     pub(crate) fn tensor(&self, id: ValueId) -> Tensor {
         self.cut(id, self.whole(id))
+    }
+
+    /// The row `grid` addresses `rows`' row 0 at: the window's first row for the fire's
+    /// fire-wide grids, 0 for a grid an op derived.
+    pub(crate) fn grid_base(&self, grid: ValueId, rows: ValueId) -> u32 {
+        if !matches!(
+            self.values[grid.0 as usize].def,
+            Def::Input(RuntimeInput::Grid | RuntimeInput::TokenGrid { .. })
+        ) {
+            return 0;
+        }
+        let at = |t: Tensor| self.handles.locate(t.buf).map_or(0, |(_, row)| row);
+        at(self.tensor(rows)).saturating_sub(at(self.whole(rows)))
     }
 
     fn whole(&self, id: ValueId) -> Tensor {
@@ -424,20 +435,13 @@ impl<'c> Run<'c> {
             Def::Input(
                 which @ (RuntimeInput::Grid
                 | RuntimeInput::TokenGrid { .. }
-                | RuntimeInput::Voxels { .. }
+                | RuntimeInput::Guest { .. }
                 | RuntimeInput::RowPermutation { .. }
-                | RuntimeInput::Latents { .. }
-                | RuntimeInput::LaneVector { .. }
-                | RuntimeInput::Context { .. }
-                | RuntimeInput::AxisPositions { .. }
-                | RuntimeInput::SelfCondRows
-                | RuntimeInput::SelfCondWeights
                 | RuntimeInput::Geometry {
                     kind:
                         GeomKind::GroupOfLane
                         | GeomKind::GroupIndptr { .. }
-                        | GeomKind::LaneIndptr { .. }
-                        | GeomKind::ReferenceTag { .. },
+                        | GeomKind::LaneIndptr { .. },
                     ..
                 }),
             ) => self.dit_input(at, which),
@@ -462,8 +466,7 @@ impl<'c> Run<'c> {
                     GeomKind::WriteOffset => seat.write_offset,
                     GeomKind::GroupOfLane
                     | GeomKind::GroupIndptr { .. }
-                    | GeomKind::LaneIndptr { .. }
-                    | GeomKind::ReferenceTag { .. } => None,
+                    | GeomKind::LaneIndptr { .. } => None,
                 };
                 bound.unwrap_or_else(|| {
                     panic!(
@@ -526,48 +529,48 @@ impl<'c> Run<'c> {
                 .map(|(_, tables)| *tables)
                 .unwrap_or_else(|| missing("the packing of its selection"))
         };
-        let port = |kind: engine::fire::PortKind, port: u8| -> Tensor {
-            dit.ports
-                .iter()
-                .find(|bound| bound.kind == kind && bound.port == port)
-                .map(|bound| bound.tensor)
-                .unwrap_or_else(|| missing("a float port"))
-        };
         match *which {
             RuntimeInput::Grid => dit.grid.unwrap_or_else(|| missing("the clip grid")),
             RuntimeInput::TokenGrid { .. } => dit
                 .token_grid
                 .unwrap_or_else(|| missing("the token-side clip grid")),
-            RuntimeInput::Voxels { channels, .. } => {
-                let port = dit.voxels.unwrap_or_else(|| missing("the voxel port"));
+            RuntimeInput::Guest {
+                id,
+                axis: poem_ir::InputAxis::Voxel,
+                width,
+                ..
+            } => {
+                let voxels = dit.voxels.unwrap_or_else(|| missing("the voxel input"));
                 assert_eq!(
-                    port.width, channels,
-                    "value {at} reads a {channels}-wide voxel port and this fire fed a {}-wide \
-                     one: the clips ran in another reading's class",
-                    port.width
+                    voxels.width, width,
+                    "value {at} reads a {width}-wide voxel input (guest input {id}) and this \
+                     fire fed a {}-wide one: the clips ran in another class",
+                    voxels.width
                 );
-                port
+                voxels
+            }
+            RuntimeInput::Guest { id, width, .. } => {
+                let tensor = dit
+                    .inputs
+                    .iter()
+                    .find(|bound| bound.id == id)
+                    .map(|bound| bound.tensor)
+                    .unwrap_or_else(|| missing("a guest input"));
+                assert_eq!(
+                    tensor.width, width,
+                    "value {at} reads guest input {id} {width} wide and this fire staged it {} \
+                     wide",
+                    tensor.width
+                );
+                tensor
             }
             RuntimeInput::RowPermutation { select } => packing(select).permutation,
-            RuntimeInput::Latents { port: p, .. } => port(engine::fire::PortKind::Latents, p),
-            RuntimeInput::LaneVector { port: p, .. } => port(engine::fire::PortKind::LaneVector, p),
-            RuntimeInput::Context { port: p, .. } => port(engine::fire::PortKind::Context, p),
-            RuntimeInput::AxisPositions { port: p, .. } => {
-                port(engine::fire::PortKind::AxisPositions, p)
-            }
-            RuntimeInput::SelfCondRows => dit
-                .self_cond_rows
-                .unwrap_or_else(|| missing("self-conditioning taps")),
-            RuntimeInput::SelfCondWeights => dit
-                .self_cond_weights
-                .unwrap_or_else(|| missing("self-conditioning weights")),
             RuntimeInput::Geometry { kind, .. } => match kind {
                 GeomKind::GroupOfLane => dit
                     .group_of_lane
                     .unwrap_or_else(|| missing("the group table")),
                 GeomKind::GroupIndptr { select } => packing(select).group_indptr,
                 GeomKind::LaneIndptr { select } => packing(select).lane_indptr,
-                GeomKind::ReferenceTag { select } => packing(select).reference_tag,
                 _ => missing("a geometry table"),
             },
             _ => missing("an input"),

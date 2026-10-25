@@ -2,7 +2,7 @@
 
 use crate::common_dit::{Lcg, NAME, Rig, WIDTH, Weights, attach, bf, frame, lane};
 use engine::Engine;
-use engine::fire::{LaneStream, ReadoutSeam};
+use engine::fire::ReadoutSeam;
 use engine_cuda::Recording;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
@@ -10,9 +10,10 @@ use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Stream, Trace, Value, Weight,
-    ops, seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Trace, Value, Weight, ops,
+    seam, trace_hybrid,
 };
+use poem_ir::InputAxis;
 
 const VOCAB: u32 = 64;
 const HEAD_DIM: u32 = 64;
@@ -34,9 +35,13 @@ impl ForwardHybrid for TokensAndLatents {
     }
 
     fn forward(&self, inputs: Input) -> Value {
+        inputs.recorder().declare_switch(
+            "stream",
+            &["text", "image", "video", "audio", "context", "reference"],
+        );
         let (txt, img) = (
-            inputs.on(fact::stream(Stream::Text)),
-            inputs.on(!fact::stream(Stream::Text)),
+            inputs.on(fact::switch_is("stream", "text")),
+            inputs.on(!fact::switch_is("stream", "text")),
         );
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
@@ -64,8 +69,8 @@ impl ForwardHybrid for TokensAndLatents {
         let h = ops::linear::matmul(&o, &w("txt.o", WIDTH, HEAD_DIM));
         seam::at(seam::HIDDEN, &[&h]);
 
-        let x_img = img.latents(1, WIDTH, Dtype::Bf16);
-        let t = img.lane_vector(0, 1);
+        let x_img = img.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
+        let t = img.input("timestep", Dtype::F32, InputAxis::Lane, 1, None);
         let emb = ops::elemwise::silu(&ops::elemwise::sinusoid(&t, FREQ, 10_000.0, true, 1.0));
         let m = ops::linear::matmul(&emb, &w("ada", 2 * WIDTH, FREQ));
         let hm = ops::elemwise::modulate(
@@ -107,6 +112,7 @@ fn epilogue(rows: u32, width: u32) -> TraceContainer {
                 Op::ChanTake(0),
                 Op::IntrinsicVal {
                     intr: IntrinsicId::Hidden,
+                    lane: 0,
                     shape: Shape::matrix(rows, width),
                     dtype: EtaDtype::F32,
                 },
@@ -114,11 +120,12 @@ fn epilogue(rows: u32, width: u32) -> TraceContainer {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
 #[test]
-fn the_token_reading_fires_alone() {
+fn the_token_class_fires_alone() {
     if !engine_cuda::device::present() {
         eprintln!("no CUDA device: skipping");
         return;
@@ -141,14 +148,14 @@ fn the_token_reading_fires_alone() {
         .collect();
     rig.publish(handles.instance, 0, &cell);
 
-    let mut text = lane(&rig, 0, &handles, LaneStream::Text, 0);
+    let mut text = lane(&rig, 0, &handles, "text", 0);
     text.tokens = (0..TEXT_ROWS).map(|r| r % VOCAB).collect();
-    text.ports.clear();
+    text.inputs.clear();
 
     let mut ticket = rig
         .engine
         .submit(&frame(vec![text], vec![attach(0, &handles)]))
-        .expect("a plan whose token reading carries kv fires that reading alone");
+        .expect("a plan whose token class carries kv fires that class alone");
     rig.engine
         .settle_frame(&mut ticket)
         .expect("the frame settles");

@@ -3,82 +3,38 @@ use crate::inferlet::host::pie;
 use crate::model;
 use anyhow::Result;
 
-pub fn lane_stream(stream: poem::Stream) -> pie::inferlet::model::LaneStream {
-    use pie::inferlet::model::LaneStream;
-    match stream {
-        poem::Stream::Text => LaneStream::Text,
-        poem::Stream::Image => LaneStream::Image,
-        poem::Stream::Video => LaneStream::Video,
-        poem::Stream::Audio => LaneStream::Audio,
-        poem::Stream::Context => LaneStream::Context,
-        poem::Stream::Reference => LaneStream::Reference,
-    }
-}
-
-pub fn catalog_stream(stream: pie::inferlet::model::LaneStream) -> poem::Stream {
-    use pie::inferlet::model::LaneStream;
-    match stream {
-        LaneStream::Text => poem::Stream::Text,
-        LaneStream::Image => poem::Stream::Image,
-        LaneStream::Video => poem::Stream::Video,
-        LaneStream::Audio => poem::Stream::Audio,
-        LaneStream::Context => poem::Stream::Context,
-        LaneStream::Reference => poem::Stream::Reference,
-    }
-}
-
-fn axis_role(role: poem::generative::AxisRole) -> pie::inferlet::model::AxisRole {
-    use pie::inferlet::model::AxisRole;
-    match role {
-        poem::generative::AxisRole::Time => AxisRole::Time,
-        poem::generative::AxisRole::Height => AxisRole::Height,
-        poem::generative::AxisRole::Width => AxisRole::Width,
-        poem::generative::AxisRole::Index => AxisRole::Index,
-    }
-}
-
-fn reading_fact(reading: &poem::generative::ReadingFact) -> pie::inferlet::model::ReadingFact {
-    use pie::inferlet::model::{PortKind, ReadoutKind};
-    pie::inferlet::model::ReadingFact {
-        name: reading.name.to_string(),
-        index: reading.index,
-        has_kv: reading.has_kv,
-        takes_tokens: reading.takes_tokens,
-        streams: reading.streams.iter().copied().map(lane_stream).collect(),
-        ports: reading
-            .ports
-            .iter()
-            .map(|port| pie::inferlet::model::PortFact {
-                name: port.name.to_string(),
-                kind: match port.kind {
-                    poem::generative::PortKind::Latents => PortKind::Latents,
-                    poem::generative::PortKind::LaneVector => PortKind::LaneVector,
-                    poem::generative::PortKind::Context => PortKind::Context,
-                    poem::generative::PortKind::AxisPositions => PortKind::AxisPositions,
-                    poem::generative::PortKind::Voxels => PortKind::Voxels,
-                },
-                width: port.width,
-                dtype: pie::inferlet::types::Dtype::F32,
-                streams: port.streams.iter().copied().map(lane_stream).collect(),
-                rows: port.rows,
-            })
-            .collect(),
-        positions: reading.positions.as_ref().map(|convention| {
-            pie::inferlet::model::PositionConvention {
-                axes: convention.axes.iter().copied().map(axis_role).collect(),
-                text_axis: convention.text_axis,
-                text_origin: convention.text_origin,
-                image_follows_text: convention.image_follows_text,
-                reference_stride: convention.reference_stride,
-            }
-        }),
-        readout: match reading.readout {
-            poem::generative::ReadoutKind::Logits => ReadoutKind::Logits,
-            poem::generative::ReadoutKind::Velocity => ReadoutKind::Velocity,
-            poem::generative::ReadoutKind::Hidden => ReadoutKind::Hidden,
-            poem::generative::ReadoutKind::Pixels => ReadoutKind::Pixels,
+fn readout(readout: poem_ir::Readout) -> pie::inferlet::model::Readout {
+    use pie::inferlet::model::ReadoutKind;
+    pie::inferlet::model::Readout {
+        kind: match readout.kind {
+            poem_ir::ReadoutKind::Logits => ReadoutKind::Logits,
+            poem_ir::ReadoutKind::Velocity => ReadoutKind::Velocity,
+            poem_ir::ReadoutKind::Hidden => ReadoutKind::Hidden,
+            poem_ir::ReadoutKind::Pixels => ReadoutKind::Pixels,
         },
-        readout_width: reading.readout_width,
+        width: readout.width,
+    }
+}
+
+/// An i32 input is fed i32, any float one f32.
+pub(crate) fn input_decl(input: &poem_ir::InputDecl) -> pie::inferlet::model::InputDecl {
+    use pie::inferlet::model::{InputAxis, RowCount};
+    pie::inferlet::model::InputDecl {
+        name: input.name.clone(),
+        axis: match input.axis {
+            poem_ir::InputAxis::Lane => InputAxis::Lane,
+            poem_ir::InputAxis::Row => InputAxis::Row,
+            poem_ir::InputAxis::Voxel => InputAxis::Voxel,
+        },
+        width: input.width,
+        dtype: match input.dtype {
+            poem_ir::Dtype::I32 => pie::inferlet::types::Dtype::I32,
+            _ => pie::inferlet::types::Dtype::F32,
+        },
+        rows: input.rows.map(|rows| match rows {
+            poem_ir::RowCount::Exact(n) => RowCount::Exact(n),
+            poem_ir::RowCount::Multiple(n) => RowCount::Multiple(n),
+        }),
     }
 }
 
@@ -105,44 +61,51 @@ impl pie::inferlet::model::Host for ProcessCtx {
             (caps.draft_block > 0).then_some(pie::inferlet::model::BlockDrafter {
                 rows: caps.draft_block,
                 mask_token: caps.draft_mask_token,
-                bidirectional: caps.draft_bidirectional,
                 proposals_from: caps.draft_proposals_from,
             }),
         )
     }
 
-    async fn pass_kind(&mut self) -> Result<pie::inferlet::model::ForwardKind> {
-        use crate::pipeline::instance::PassKind;
-        use pie::inferlet::model::ForwardKind;
-        Ok(match model::model().pass_kind() {
-            PassKind::Text => ForwardKind::Text,
-            PassKind::Diffusion => ForwardKind::Diffusion,
-        })
-    }
-
-    async fn canvas(&mut self) -> Result<Option<pie::inferlet::model::CanvasShape>> {
+    async fn switches(&mut self) -> Result<Vec<pie::inferlet::model::SwitchDecl>> {
         Ok(model::model()
-            .diffusion()
-            .map(|d| pie::inferlet::model::CanvasShape {
-                length: d.canvas,
-                hidden: d.hidden,
-                self_cond_taps: d.self_cond_taps,
-            }))
+            .facts()
+            .switches
+            .iter()
+            .map(|decl| pie::inferlet::model::SwitchDecl {
+                name: decl.name.clone(),
+                values: decl.values.clone(),
+            })
+            .collect())
     }
 
-    async fn readings(&mut self) -> Result<Vec<pie::inferlet::model::ReadingFact>> {
-        Ok(model::model().readings().iter().map(reading_fact).collect())
+    async fn lane(
+        &mut self,
+        switches: Vec<(String, String)>,
+    ) -> Result<std::result::Result<pie::inferlet::model::LaneDecl, String>> {
+        let model = model::model();
+        let lane = match model.lane(&switches) {
+            Ok(lane) => lane,
+            Err(error) => return Ok(Err(error)),
+        };
+        Ok(Ok(pie::inferlet::model::LaneDecl {
+            inputs: lane
+                .inputs
+                .iter()
+                .map(|&id| input_decl(&model.inputs()[id as usize]))
+                .collect(),
+            state: lane.reads_kv || lane.reads_state,
+            embeds: lane.embeds,
+            readout: lane.readout.map(readout),
+        }))
     }
 
     async fn latent(&mut self) -> Result<Option<pie::inferlet::model::LatentSpace>> {
         Ok(model::model().generative().and_then(|g| g.latent).map(|l| {
             pie::inferlet::model::LatentSpace {
                 channels: l.channels,
-                patch_t: l.patch_t,
-                patch_h: l.patch_h,
-                patch_w: l.patch_w,
                 spatial_compression: l.spatial_compression,
                 temporal_compression: l.temporal_compression,
+                first_frames: l.first_frames,
             }
         }))
     }
@@ -165,16 +128,17 @@ impl pie::inferlet::model::Host for ProcessCtx {
                 stream_shifts: s
                     .stream_shifts
                     .iter()
-                    .map(|&(stream, shift)| pie::inferlet::model::StreamShift {
-                        lane: lane_stream(stream),
-                        shift,
+                    .map(|(stream, shift)| pie::inferlet::model::StreamShift {
+                        lane: stream.clone(),
+                        shift: *shift,
                     })
                     .collect(),
             }))
     }
 
     async fn max_latent_rows(&mut self) -> Result<u32> {
-        Ok(model::model().generative().map_or(0, |g| g.max_rows))
+        let limits = crate::engine::get_spec(0)?.limits;
+        Ok(u32::try_from(limits.max_forward_tokens).unwrap_or(u32::MAX))
     }
 
     async fn output_vocab_size(&mut self) -> Result<u32> {

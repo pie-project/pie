@@ -68,7 +68,7 @@ impl ShadowPlan {
             }
             Some(Phase::Fold(stage))
         };
-        let layers = bound.profile.num_layers;
+        let layers = bound.graph.num_layers;
         let phases = core::iter::once(Stage::Prologue)
             .chain((0..layers).flat_map(|_| [Stage::OnAttnProj, Stage::OnAttn]))
             .chain(core::iter::once(Stage::Epilogue))
@@ -203,7 +203,7 @@ mod tests {
         ChanDType, ChannelDecl, HostRole, PortBinding, PortSource, StageProgram, TraceContainer,
     };
     use eta_ir::op::{IntrinsicId, Op};
-    use eta_ir::registry::{ModelProfile, Port, Stage};
+    use eta_ir::registry::{EngineCaps, Graph, Port, Readout, ReadoutKind, Stage};
     use eta_ir::types::{Dtype, Shape};
 
     fn channel(shape: Shape, dtype: Dtype) -> ChannelDecl {
@@ -217,11 +217,10 @@ mod tests {
     }
 
     fn trace(epilogue: Vec<Op>) -> eta_ir::validate::BoundTrace {
-        let mut profile = ModelProfile::dummy();
-        profile.vocab = 4;
         let container = TraceContainer {
             names: vec![],
             externs: vec![],
+            inputs: Vec::new(),
             channels: vec![
                 channel(Shape::vector(1), Dtype::I32),
                 channel(Shape::vector(1), Dtype::U32),
@@ -262,13 +261,22 @@ mod tests {
                 ops: epilogue,
             }],
         };
-        eta_ir::validate::bind(container, profile).unwrap()
+        let logits = Readout {
+            kind: ReadoutKind::Logits,
+            width: 4,
+        };
+        let graph = Graph {
+            num_layers: 2,
+            ..Graph::default()
+        };
+        eta_ir::validate::bind(container, vec![Some(logits)], graph, EngineCaps::default()).unwrap()
     }
 
     fn device_put_trace() -> eta_ir::validate::BoundTrace {
         trace(vec![
             Op::IntrinsicVal {
                 intr: IntrinsicId::Logits,
+                lane: 0,
                 shape: Shape::matrix(1, 4),
                 dtype: Dtype::F32,
             },

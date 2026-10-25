@@ -126,9 +126,8 @@ pub(crate) fn prefill_symbol(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RaggedArm {
     Full,
-    ReferenceSelfOnly,
-    ReferenceTags,
-    ClassTable,
+    /// One bit per (query, key) pair of each group, from byte `maybe_mask_indptr[group]`.
+    Custom,
     RelativeBias,
 }
 
@@ -140,9 +139,7 @@ pub(crate) fn prefill_ragged_symbol(
     instantiated(op, g.head_dim)?;
     let (mask, variant, params) = match arm {
         RaggedArm::Full => ("kNone", "VariantFull", "RaggedParams"),
-        RaggedArm::ReferenceSelfOnly => ("kCustom", "ReferenceSelfOnly", "RaggedRefParams"),
-        RaggedArm::ReferenceTags => ("kCustom", "ReferenceTags", "RaggedTagParams"),
-        RaggedArm::ClassTable => ("kCustom", "ClassTable", "RaggedClassParams"),
+        RaggedArm::Custom => ("kCustom", "VariantCustom", "RaggedParams"),
         RaggedArm::RelativeBias => ("kNone", "RelativeBias", "RaggedBiasParams"),
     };
     Ok(format!(

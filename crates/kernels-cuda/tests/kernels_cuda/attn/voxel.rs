@@ -38,6 +38,7 @@ fn check(c: usize) {
         Segment::Lane,
         scale * 4.0,
         &mut y,
+        0,
     )
     .unwrap_or_else(|why| panic!("C {c}: {why}"));
     gpu.sync();

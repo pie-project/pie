@@ -29,6 +29,7 @@ impl Segment {
     }
 }
 
+/// `base`: the row `grid` addresses the rectangles' row 0 at.
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
     ctx: &Ctx,
@@ -39,6 +40,7 @@ pub fn attention(
     segment: Segment,
     sm_scale: f32,
     o: &mut Tensor,
+    base: u32,
 ) -> Result<(), Error> {
     dtype_dispatch!(OP, q.dtype, { Bf16 => () });
     for (what, t) in [("key", k), ("value", v), ("output", *o)] {
@@ -90,6 +92,7 @@ pub fn attention(
             lanes.arg(),
             rows.arg(),
             seg.arg(),
+            stated(OP, base)?.arg(),
             scale_log2.arg(),
         ],
     )

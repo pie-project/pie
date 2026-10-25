@@ -11,6 +11,7 @@ fn element(op: &'static str, dtype: dtype::Dtype) -> Result<&'static str, Error>
     Ok(dtype_dispatch!(op, dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" }))
 }
 
+/// `bases`: the rows `grid` and `o_grid` address `x`'s and `o`'s row 0 at (`[x, o]`).
 #[allow(clippy::too_many_arguments)]
 pub fn upsample_nearest(
     ctx: &Ctx,
@@ -20,6 +21,7 @@ pub fn upsample_nearest(
     keep_first_frame: bool,
     o: &mut Tensor,
     o_grid: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.upsample";
     let t = element(OP, x.dtype)?;
@@ -50,6 +52,8 @@ pub fn upsample_nearest(
             fh.arg(),
             fw.arg(),
             i32::from(keep_first_frame).arg(),
+            stated(OP, bases[0])?.arg(),
+            stated(OP, bases[1])?.arg(),
             total.arg(),
         ],
     )
@@ -78,6 +82,7 @@ pub fn pixel_shuffle(
     trim_t: u32,
     o: &mut Tensor,
     o_grid: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.pixel_shuffle";
     let t = element(OP, x.dtype)?;
@@ -111,11 +116,14 @@ pub fn pixel_shuffle(
             r[1].arg(),
             r[2].arg(),
             trim.arg(),
+            stated(OP, bases[0])?.arg(),
+            stated(OP, bases[1])?.arg(),
             total.arg(),
         ],
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn pixel_unshuffle(
     ctx: &Ctx,
     x: Tensor,
@@ -123,6 +131,7 @@ pub fn pixel_unshuffle(
     r: [u32; 3],
     o: &mut Tensor,
     o_grid: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.pixel_unshuffle";
     let t = element(OP, x.dtype)?;
@@ -154,6 +163,8 @@ pub fn pixel_unshuffle(
             r[0].arg(),
             r[1].arg(),
             r[2].arg(),
+            stated(OP, bases[0])?.arg(),
+            stated(OP, bases[1])?.arg(),
             total.arg(),
         ],
     )
@@ -168,6 +179,7 @@ pub fn avg_down(
     group: u32,
     o: &mut Tensor,
     o_grid: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.avg_down";
     let t = element(OP, x.dtype)?;
@@ -202,11 +214,14 @@ pub fn avg_down(
             r[1].arg(),
             r[2].arg(),
             g.arg(),
+            stated(OP, bases[0])?.arg(),
+            stated(OP, bases[1])?.arg(),
             total.arg(),
         ],
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn patchify(
     ctx: &Ctx,
     x: Tensor,
@@ -214,10 +229,12 @@ pub fn patchify(
     p: [u32; 3],
     o: &mut Tensor,
     o_grid: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
-    pixel_unshuffle(ctx, x, grid, p, o, o_grid)
+    pixel_unshuffle(ctx, x, grid, p, o, o_grid, bases)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn unpatchify(
     ctx: &Ctx,
     x: Tensor,
@@ -225,6 +242,7 @@ pub fn unpatchify(
     p: [u32; 3],
     o: &mut Tensor,
     o_grid: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
-    pixel_shuffle(ctx, x, grid, p, 0, o, o_grid)
+    pixel_shuffle(ctx, x, grid, p, 0, o, o_grid, bases)
 }

@@ -223,8 +223,37 @@ impl Run<'_> {
                 self.tensor(*y),
             ),
 
-            // DSpark's taps side by side are DeepSeek-V4.1's, served on CUDA.
-            Gather::ConcatCols { .. } | Gather::SplitQkvPadded { .. } => {
+            Gather::GroupFirst {
+                x,
+                csr,
+                groups,
+                lanes,
+                y,
+            } => kernels_slang::conv::rule::group_first(
+                self.ctx,
+                self.tensor(*x),
+                self.tensor(*csr),
+                self.tensor(*groups),
+                self.tensor(*lanes),
+                self.tensor(*y),
+            ),
+            Gather::GroupRows {
+                csr,
+                groups,
+                lanes,
+                y,
+            } => kernels_slang::conv::rule::group_rows(
+                self.ctx,
+                self.tensor(*csr),
+                self.tensor(*groups),
+                self.tensor(*lanes),
+                self.tensor(*y),
+            ),
+            Gather::ConcatCols { xs, y } => {
+                let xs: Vec<_> = xs.iter().map(|x| self.tensor(*x)).collect();
+                kernels_slang::gather::rows::concat_cols(self.ctx, &xs, self.tensor(*y))
+            }
+            Gather::SplitQkvPadded { .. } => {
                 Err(kernels_slang::Error::Unsupported { op: op.name() })
             }
             Gather::GridTaps {

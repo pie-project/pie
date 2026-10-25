@@ -1101,6 +1101,14 @@ impl Run<'_> {
                 act: poem_ir::ActFn::Tanh,
                 ..
             } => elemwise::pointwise::tanh(self.ctx(), self.tensor(*x), &mut self.tensor(*x)),
+            Elemwise::Act {
+                x,
+                x_out: _,
+                s: None,
+                scale: None,
+                act: poem_ir::ActFn::Sqrt,
+                ..
+            } => elemwise::pointwise::sqrt(self.ctx(), self.tensor(*x), &mut self.tensor(*x)),
             // The forms no builder makes.
             Elemwise::Act { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             Elemwise::Hadamard { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
@@ -1108,26 +1116,21 @@ impl Run<'_> {
                 x,
                 y,
                 z,
-                op: poem_ir::BinaryOp::Mul,
-                ..
-            } => elemwise::pointwise::mul(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*y),
-                &mut self.tensor(*z),
-            ),
-            Elemwise::Binary {
-                x,
-                y,
-                z,
-                op: poem_ir::BinaryOp::Add,
-                ..
-            } => elemwise::pointwise::add(
-                self.ctx(),
-                self.tensor(*x),
-                self.tensor(*y),
-                &mut self.tensor(*z),
-            ),
+                op: binary,
+            } => {
+                let f = match binary {
+                    poem_ir::BinaryOp::Add => elemwise::pointwise::add,
+                    poem_ir::BinaryOp::Mul => elemwise::pointwise::mul,
+                    poem_ir::BinaryOp::Div => elemwise::pointwise::div,
+                    poem_ir::BinaryOp::Mod => elemwise::pointwise::modulo,
+                };
+                f(
+                    self.ctx(),
+                    self.tensor(*x),
+                    self.tensor(*y),
+                    &mut self.tensor(*z),
+                )
+            }
             Elemwise::RopeAxes {
                 x,
                 positions,

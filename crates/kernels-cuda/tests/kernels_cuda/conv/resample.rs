@@ -44,6 +44,7 @@ fn pixel_shuffle_lands_torchs_ordering_on_the_hand_computed_example() {
         0,
         &mut o,
         Tensor::new(o_grid_at, 1, 4, Dtype::I32),
+        [0, 0],
     )
     .expect("the shuffle fires");
     gpu.sync();
@@ -82,9 +83,9 @@ fn pixel_unshuffle_inverts_pixel_shuffle_and_both_match_the_reference() {
     let g = Tensor::new(grid_at, 2, 4, Dtype::I32);
     let og = Tensor::new(o_grid_at, 2, 4, Dtype::I32);
     let mut up = Tensor::new(up_at, rows_up as u32, c as u32, Dtype::Bf16);
-    pixel_shuffle(&ctx, x_t, g, R, 0, &mut up, og).expect("the shuffle fires");
+    pixel_shuffle(&ctx, x_t, g, R, 0, &mut up, og, [0, 0]).expect("the shuffle fires");
     let mut back = Tensor::new(back_at, rows as u32, (c * vol) as u32, Dtype::Bf16);
-    pixel_unshuffle(&ctx, up, og, R, &mut back, g).expect("the unshuffle fires");
+    pixel_unshuffle(&ctx, up, og, R, &mut back, g, [0, 0]).expect("the unshuffle fires");
     gpu.sync();
     let got_up: Vec<u16> = gpu.down(up_at, rows_up * c);
     let got_back: Vec<u16> = gpu.down(back_at, rows * c * vol);
@@ -118,10 +119,11 @@ fn patchify_and_unpatchify_round_trip_over_the_token_box() {
         p,
         &mut tok,
         tg,
+        [0, 0],
     )
     .expect("patchify fires");
     let mut back = Tensor::new(back_at, rows as u32, c as u32, Dtype::Bf16);
-    unpatchify(&ctx, tok, tg, p, &mut back, g).expect("unpatchify fires");
+    unpatchify(&ctx, tok, tg, p, &mut back, g, [0, 0]).expect("unpatchify fires");
     gpu.sync();
     let got_tok: Vec<u16> = gpu.down(tok_at, tokens * c * 4);
     let got_back: Vec<u16> = gpu.down(back_at, rows * c);
@@ -153,12 +155,44 @@ fn upsample(keep_first: bool) {
         keep_first,
         &mut o,
         Tensor::new(o_grid_at, 2, 4, Dtype::I32),
+        [0, 0],
     )
     .expect("the upsample fires");
     gpu.sync();
     let got: Vec<u16> = gpu.down(o_at, rows_out * c);
     let want: Vec<u16> = want.iter().map(|&v| to_bf16(v)).collect();
     assert_eq!(got, want, "keep_first {keep_first}");
+
+    // The second lane alone, as a later window of a segmented fire sees it.
+    let (skip, skip_out) = (BOXES[0].voxels(), out_boxes[0].voxels());
+    let (o_grid1, rows_out1) = table(&out_boxes[1..]);
+    let o_grid1_at = gpu.up(&o_grid1);
+    let o1_at = gpu.zeros(rows_out1 * c * 2);
+    let ctx = gpu.ctx();
+    let mut o1 = Tensor::new(o1_at, rows_out1 as u32, c as u32, Dtype::Bf16);
+    upsample_nearest(
+        &ctx,
+        Tensor::new(
+            x_at + (skip * c * 2) as u64,
+            (rows - skip) as u32,
+            c as u32,
+            Dtype::Bf16,
+        ),
+        Tensor::new(grid_at + 16, 1, 4, Dtype::I32),
+        [2, 2, 3],
+        keep_first,
+        &mut o1,
+        Tensor::new(o_grid1_at, 1, 4, Dtype::I32),
+        [skip as u32, 0],
+    )
+    .expect("the windowed upsample fires");
+    gpu.sync();
+    let got1: Vec<u16> = gpu.down(o1_at, rows_out1 * c);
+    assert_eq!(
+        got1,
+        want[skip_out * c..],
+        "keep_first {keep_first}, window"
+    );
 }
 
 fn avg_down_case(boxes: &[Box3], c: usize, r: [u32; 3], group: u32) {
@@ -186,6 +220,7 @@ fn avg_down_case(boxes: &[Box3], c: usize, r: [u32; 3], group: u32) {
         group,
         &mut o,
         Tensor::new(o_grid_at, lanes, 4, Dtype::I32),
+        [0, 0],
     )
     .unwrap_or_else(|why| panic!("{r:?} group {group}: {why}"));
     gpu.sync();
@@ -239,6 +274,7 @@ fn avg_down_pads_a_short_chunks_time_axis_in_front() {
         4,
         &mut o,
         Tensor::new(o_grid_at, 1, 4, Dtype::I32),
+        [0, 0],
     )
     .expect("the avg-down fires");
     gpu.sync();

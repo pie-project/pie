@@ -5,11 +5,9 @@ The forward-pass surface. A guest traces a pass into canonical ETA
 container bytes and binds the channels, working sets and pipeline it runs
 on as resources.
 
-`forward` serves every text model, whatever state it keeps, and the
-generative families' readings (a DiT's text encoder, its denoise step, a
-VAE tile); `forward-diffusion` serves a block-diffusion text. What reaches
-inside attention (a mask over frozen slots, a `kv-len` past a row's own
-slot) is refused by name on a model without attention layers.
+`forward` serves every model; the model's switches pick each lane's path.
+What reaches inside attention is refused by name on a model without
+attention layers.
 
 Legal stages: prologue, on_attn_proj, on_attn, epilogue.
 """
@@ -24,7 +22,6 @@ from componentize_py_types import Result, Ok, Err, Some
 from ..imports import pipeline
 from ..imports import channel
 from ..imports import media
-from ..imports import model
 from ..imports import working_set
 import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
@@ -61,8 +58,6 @@ class StateGeometry:
       Writing a slot again replaces it.
     - `kv-len`: per lane, the lane reads slots `[0, kv-len)`. Default:
       causal.
-    - `mask`: per row, bool over `[0, kv-len)`. A recurrent layer hides
-      only slots past `folded`, the same ones for every row of a lane.
     - `fold`: per lane, how many more slots freeze after this fire;
       `u32::MAX` folds everything. Default: none. May be computed on the
       device; lanes sharing a working set fold by the first one's count.
@@ -70,13 +65,14 @@ class StateGeometry:
     positions: Optional[channel.Channel]
     slots: Optional[channel.Channel]
     kv_len: Optional[channel.Channel]
-    mask: Optional[channel.Channel]
     fold: Optional[channel.Channel]
 
 class ForwardPass:
     """
     A forward-pass builder. Construction is empty; descriptor resources are
     attached explicitly, then `program` supplies the traced container.
+    A verb taking `lane` binds that lane; row data (`embed`,
+    `state-geometry`, `readout`, `mask`) is the pass's, lane after lane.
     """
     
     def __init__(self) -> None:
@@ -85,8 +81,8 @@ class ForwardPass:
     def state(self, lanes: List[working_set.WorkingSet], geom: StateGeometry) -> None:
         """
         One working set per lane, in lane order; lanes sharing one state
-        their slots. Required on a reading with a KV space, refused on one
-        without.
+        their slots. Required on a lane `model.lane` says binds `state`,
+        refused on any other.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
@@ -102,108 +98,44 @@ class ForwardPass:
     def embed(self, tokens: channel.Channel, indptr: channel.Channel) -> None:
         """
         Bind embedding token ids and CSR row indptr. Both are channels.
-        REQUIRED on a reading that embeds tokens (`reading-fact.
-        takes-tokens`, every text model's), REFUSED on one that does
-        not; the lane's row count then comes from the `latents` port's
-        channel shape.
+        Required on a lane that embeds tokens (`model.lane`'s `embeds`),
+        refused on one that does not.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def reading(self, name: str) -> None:
+    def switch(self, lane: int, name: str, value: str) -> None:
         """
-        Which of the family's declared readings this pass runs
-        (`model.readings()`) -- the arm its lanes are stamped with.
-        Generalizes `forward-diffusion.canvas(mode)`: the set of
-        readings is open across the zoo (`"text"`, `"denoise"`,
-        `"denoise.low"`, `"refine"`, `"vae.encode"`, `"vae.decode"`,
-        `"upsample"`), while the set of state kinds stays closed.
-        Optional when the model declares one reading (or none: a text
-        model's implicit reading); refused by name for a name the model
-        does not declare. Set before `program`; one reading per pass
-        for its life.
+        Set lane `lane`'s model switch `name` (`model.switches()`) to
+        `value`; an unset switch takes its first declared value. Set
+        before `program`.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def input(self, port: str, ch: channel.Channel) -> None:
+    def input(self, lane: int, name: str, ch: channel.Channel) -> None:
         """
-        Bind a channel to one of the reading's declared float input
-        ports (`reading-fact.ports`, by name), read at every submit:
-        the channel's COMMITTED cell is the port's value for this lane's
-        rows, so `set` or an epilogue `put` advances it and the whole
-        denoising loop runs without a host copy a step. Generalizes
-        `self-conditioning-from`. The channel's shape is validated
-        against the port here (`[rows, width]` for latents / context /
-        axis-positions, `[width]` or `[1, width]` for a lane vector),
-        and it must be bound into this pass's program (the Rust library
-        reads it in the prologue when nothing else does). Every port the
-        reading declares must be bound before `program`.
+        Bind lane `lane`'s model input `name` (`model.lane`) to `ch`, whose
+        committed cell is read at every submit: `[width]`, `[rows, width]`
+        or one `[t?, h, w, width]` clip. A lane binds exactly what it reads.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def stream(self, s: model.LaneStream) -> None:
+    def group(self, lane: int, id: int) -> None:
         """
-        Which lane stream this pass's rows are; default `text`. Set before
-        `program`.
+        Put lane `lane` in this pass's attention group `id`: lanes naming
+        one group attend each other's rows; a lane naming none attends its
+        own. Set before `program`.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def group(self, id: int) -> None:
+    def mask(self, rows: channel.Channel) -> None:
         """
-        Put this pass's lanes in attention group `id`: the lanes of every
-        pass in one frame naming the same group attend each other's rows.
-        Set before `program`.
-        
-        Raises: `componentize_py_types.Err(wit_world.imports.str)`
-        """
-        raise NotImplementedError
-    def peer(self, group: int) -> None:
-        """
-        Name the attention group whose same-stream lane is this lane's
-        PEER: the lane whose velocity this one's epilogue reads with
-        `intrinsics::peer_velocity(width)`.
-        
-        This is the classifier-free guidance verb, and it names a group
-        rather than a lane of one's own because guidance's two branches
-        must NOT attend each other — they are two independent denoisings
-        of the same canvas, one holding the prompt and one the negative
-        one, and putting them in one attention group would make each see
-        the other's rows. So they are two groups of ONE fire, and this
-        says which of them is the other.
-        
-        The peer is the lane of that group carrying THIS pass's stream;
-        a group seating no such lane, or more than one, is refused by
-        name at submit rather than guessed at. Naming one's own group is
-        refused too: a lane is not its own peer, and `u + s(u - u)` is a
-        picture that looks fine and is not guided.
-        
-        It costs a row offset and nothing else. The velocity plane is
-        fire-wide and written by the forward walk before any epilogue
-        block runs, so both branches' predictions are already sitting in
-        one rectangle by the time either epilogue reads. A pass that
-        reads `peer_velocity` without naming a peer is refused, so
-        guidance cannot silently degrade into a lane reading its own
-        rows twice.
-        
-        Set before `program`, and after `group`. A model that predicts
-        no velocity refuses the whole program at bind.
-        
-        Raises: `componentize_py_types.Err(wit_world.imports.str)`
-        """
-        raise NotImplementedError
-    def attention_classes(self, classes: List[int], table: bytes, count: int) -> None:
-        """
-        A structured attention mask over this pass's rows, applied to the
-        reading's group-packed attention: `classes` names one class in
-        `0..count` per row (or -1: the row attends, and is attended by,
-        every row); `table[q * count + kv]` non-zero lets a q-class row
-        attend a kv-class row. `count` is at most 64. Every lane of one
-        attention group states the same table; rows of lanes that state
-        nothing are class -1. Regional prompting, attention coupling and
-        cross-frame restriction are all one table. Set before `program`.
+        `[rows, n]` bools: per row, the slots `[0, kv-len)` it attends when
+        lanes read kv, else its attention group's rows in lane order. Set
+        before `program`.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
@@ -215,33 +147,9 @@ class ForwardPass:
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def set_max_layers(self, max_layers: int) -> None:
+    def media(self, lane: int, spans: List[MediaSpan]) -> None:
         """
-        Run only the first `max-layers` layers and take the head there.
-        Unset = the full model; zero is rejected.
-        
-        Raises: `componentize_py_types.Err(wit_world.imports.str)`
-        """
-        raise NotImplementedError
-    def set_drafting_block(self, on: bool) -> None:
-        """
-        **THESE ROWS ARE A BLOCK DRAFTER'S PROPOSAL, NOT THE SEQUENCE'S.**
-        A block drafter proposes many tokens in one pass over a block
-        whose first row is the correction the target just made and whose
-        rest is the model's mask token; the trunk must not run over them,
-        and a plan that carries such a drafter guards itself on this.
-        
-        It cannot be inferred from what the pass reads, the way drafting
-        is: what makes a fire a draft is the anchor chosen from the
-        accepted prefix, which only the guest knows. Unset = an ordinary
-        pass.
-        
-        Raises: `componentize_py_types.Err(wit_world.imports.str)`
-        """
-        raise NotImplementedError
-    def media(self, spans: List[MediaSpan]) -> None:
-        """
-        The payloads of the media spans this pass's tokens carry, in
+        The payloads of the media spans lane `lane`'s tokens carry, in
         placeholder order; a count or run length that disagrees is refused
         at `submit`.
         
@@ -251,8 +159,8 @@ class ForwardPass:
     def program(self, container_bytes: bytes, channels: List[channel.Channel]) -> None:
         """
         Attach canonical ETA bytes and channel handles in dense declaration
-        order. Validation uses the engine-owned ModelProfile and rejects
-        any stage this interface does not admit.
+        order. Validation checks the program against what each lane reads
+        out and rejects any stage this interface does not admit.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """

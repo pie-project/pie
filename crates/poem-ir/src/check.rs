@@ -6,7 +6,9 @@ use std::collections::HashSet;
 use std::fmt::{self, Display, Formatter};
 
 use crate::ops::Elemwise;
-use crate::{Def, Dim, Dtype, Operands, Operation, StructKind, Trace, Ty, ValueId};
+use crate::{
+    Def, Dim, Dtype, InputAxis, Operands, Operation, RuntimeInput, StructKind, Trace, Ty, ValueId,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Site {
@@ -93,6 +95,13 @@ pub enum Fault {
         id: ValueId,
         index: u32,
         len: usize,
+    },
+    GuestInput {
+        id: ValueId,
+        why: String,
+    },
+    UndeclaredInput {
+        name: String,
     },
     SymbolicWeight {
         id: ValueId,
@@ -182,6 +191,43 @@ pub enum Fault {
         act: Dtype,
         sign: Dtype,
     },
+}
+
+fn guest_input(
+    trace: &Trace,
+    at: usize,
+    input: u32,
+    axis: InputAxis,
+    width: u32,
+    dtype: Dtype,
+    ty: &Ty,
+) -> Option<String> {
+    let Some(named) = trace.inputs.get(input as usize) else {
+        return Some(format!(
+            "reads guest input {input}, and the trace names {}",
+            trace.inputs.len()
+        ));
+    };
+    let name = &named.name;
+    if !matches!(dtype, Dtype::F32 | Dtype::Bf16 | Dtype::I32) {
+        return Some(format!(
+            "declares input `{name}` as {dtype:?}, not f32, bf16 or i32"
+        ));
+    }
+    let want = Ty::Tensor {
+        shape: vec![axis.dim(), Dim::Const(u64::from(width))],
+        dtype,
+    };
+    if *ty != want {
+        return Some(format!(
+            "declares input `{name}` as {ty:?}, which is not {} by {width} {dtype:?}",
+            axis.name()
+        ));
+    }
+    let again = trace.values.iter().enumerate().any(|(other, decl)| {
+        other != at && matches!(decl.def, Def::Input(RuntimeInput::Guest { id, .. }) if id == input)
+    });
+    again.then(|| format!("declares input `{name}`, which another value declares too"))
 }
 
 /// The smallest and largest Hadamard block the Metal butterfly instantiates.
@@ -423,6 +469,17 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
         }
     }
 
+    for (input, named) in trace.inputs.iter().enumerate() {
+        let declared = trace.values.iter().any(|decl| {
+            matches!(decl.def, Def::Input(RuntimeInput::Guest { id, .. }) if id as usize == input)
+        });
+        if !declared {
+            faults.push(Fault::UndeclaredInput {
+                name: named.name.clone(),
+            });
+        }
+    }
+
     for (idx, decl) in trace.values.iter().enumerate() {
         let id = ValueId(idx as u32);
         let struct_kind = match &decl.ty {
@@ -437,6 +494,17 @@ pub fn check(trace: &Trace) -> Result<(), Vec<Fault>> {
             });
         }
         match &decl.def {
+            Def::Input(RuntimeInput::Guest {
+                id: input,
+                axis,
+                width,
+                dtype,
+            }) => {
+                let why = guest_input(trace, idx, *input, *axis, *width, *dtype, &decl.ty);
+                if let Some(why) = why {
+                    faults.push(Fault::GuestInput { id, why });
+                }
+            }
             Def::Input(_) => {}
             Def::Weight(k) => {
                 if *k as usize >= trace.params.len() {
@@ -798,6 +866,10 @@ impl Display for Fault {
                     "{} names weight {index}, but the plan declares {len} params",
                     V(*id)
                 )
+            }
+            Fault::GuestInput { id, why } => write!(f, "{} {why}", V(*id)),
+            Fault::UndeclaredInput { name } => {
+                write!(f, "the trace names input `{name}`, which no value declares")
             }
             Fault::CacheOutOfRange { id, index, len } => {
                 write!(

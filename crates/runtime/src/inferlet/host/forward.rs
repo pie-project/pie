@@ -9,10 +9,8 @@ use crate::pipeline::channel::{BoundCells, ChannelCell, ChannelError};
 pub use crate::pipeline::instance::ForwardPass;
 use crate::pipeline::instance::Instance;
 use crate::pipeline::instance::{
-    BoundForwardPass, CanvasMode, EmbedBinding, FloatLane, LaneFacts, PassKind, PortBinding,
-    StateBinding, lane_stream_of,
+    BoundForwardPass, EmbedBinding, FloatLane, FloatPass, InputBinding, LaneFacts, StateBinding,
 };
-use crate::store::kv::working_set::KvWorkingSet;
 
 use super::working_set::WorkingSet;
 
@@ -24,144 +22,74 @@ use super::pie;
 
 type Anyhow<T> = anyhow::Result<T>;
 
-fn reading_of(
-    pass: &ForwardPass,
-) -> Result<Option<&'static poem::generative::ReadingFact>, String> {
-    let model = crate::model::model();
-    if let Some(index) = pass.bindings.reading {
-        return Ok(model.readings().get(usize::from(index)));
-    }
-    if let Some(only) = model.sole_reading() {
-        return Ok(Some(only));
-    }
-    if model.readings().is_empty() {
-        return Ok(None);
-    }
-    Err(format!(
-        "this model declares {} readings ({}) and the pass named none; call `reading(name)` \
-         before `program`",
-        model.readings().len(),
-        reading_names(model.readings())
-    ))
-}
-
-fn reading_names(readings: &[poem::generative::ReadingFact]) -> String {
-    readings
-        .iter()
-        .map(|reading| format!("`{}`", reading.name))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn reading_lists_stream(reading: &poem::generative::ReadingFact, stream: poem::Stream) -> bool {
-    if reading.streams.is_empty() {
-        return stream == poem::Stream::Text;
-    }
-    reading.streams.contains(&stream)
-}
-
-fn stream_names(reading: &poem::generative::ReadingFact) -> String {
-    if reading.streams.is_empty() {
-        return "`text`".to_string();
-    }
-    reading
-        .streams
-        .iter()
-        .map(|stream| format!("`{}`", stream.name()))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn engine_port_kind(kind: poem::generative::PortKind) -> ::engine::fire::PortKind {
-    use ::engine::fire::PortKind;
-    match kind {
-        poem::generative::PortKind::Latents => PortKind::Latents,
-        poem::generative::PortKind::LaneVector => PortKind::LaneVector,
-        poem::generative::PortKind::Context => PortKind::Context,
-        poem::generative::PortKind::AxisPositions => PortKind::AxisPositions,
-        poem::generative::PortKind::Voxels => PortKind::Voxels,
-    }
-}
-
-pub(crate) fn validate_port_channel(
-    port: &poem::generative::PortFact,
+/// The rows or clip a channel bound to `input` carries, once its shape and dtype match it.
+pub(crate) fn validate_input_channel(
+    input: &poem_ir::InputDecl,
     shape: &[u32],
     dtype: Dtype,
-) -> Result<Option<u32>, String> {
-    if dtype != Dtype::F32 {
+) -> Result<(Option<u32>, Option<[u32; 3]>), String> {
+    let name = &input.name;
+    let want = match input.dtype {
+        poem_ir::Dtype::I32 => Dtype::I32,
+        _ => Dtype::F32,
+    };
+    if dtype != want {
         return Err(format!(
-            "port `{}` reads an f32 channel; this one is {dtype:?}",
-            port.name
+            "input `{name}` reads a {want:?} channel; this one is {dtype:?}"
         ));
     }
-    match port.kind {
-        poem::generative::PortKind::LaneVector => match shape {
-            [width] | [1, width] if *width == port.width => Ok(None),
-            _ => Err(format!(
-                "port `{}` is a lane vector of width {}: its channel must be `[{}]` or `[1, {}]` \
-                 f32; this one is {shape:?}",
-                port.name, port.width, port.width, port.width
-            )),
-        },
-        poem::generative::PortKind::Latents
-        | poem::generative::PortKind::Context
-        | poem::generative::PortKind::AxisPositions => match shape {
-            [rows, width] if *width == port.width && *rows > 0 => Ok(Some(*rows)),
-            _ => Err(format!(
-                "port `{}` reads `[rows, {}]` f32; this channel is {shape:?}",
-                port.name, port.width
-            )),
-        },
-        poem::generative::PortKind::Voxels => match shape {
-            [h, w, width] if *width == port.width && *h > 0 && *w > 0 => Ok(Some(h * w)),
-            [t, h, w, width] if *width == port.width && *t > 0 && *h > 0 && *w > 0 => {
-                Ok(Some(t * h * w))
-            }
-            _ => Err(format!(
-                "port `{}` reads one clip `[h, w, {}]` (or `[t, h, w, {}]`) f32 on the voxel \
-                 axis; this channel is {shape:?}",
-                port.name, port.width, port.width
-            )),
-        },
+    let width = input.width;
+    match (input.axis, shape) {
+        (poem_ir::InputAxis::Lane, [w]) if *w == width => Ok((None, None)),
+        (poem_ir::InputAxis::Lane, _) => Err(format!(
+            "input `{name}` is one `[{width}]` row a lane; this channel is {shape:?}"
+        )),
+        (poem_ir::InputAxis::Row, [rows, w]) if *w == width && *rows > 0 => Ok((Some(*rows), None)),
+        (poem_ir::InputAxis::Row, _) => Err(format!(
+            "input `{name}` reads `[rows, {width}]`; this channel is {shape:?}"
+        )),
+        (poem_ir::InputAxis::Voxel, [h, w, c]) if *c == width && *h > 0 && *w > 0 => {
+            Ok((None, Some([1, *h, *w])))
+        }
+        (poem_ir::InputAxis::Voxel, [t, h, w, c]) if *c == width && *t > 0 && *h > 0 && *w > 0 => {
+            Ok((None, Some([*t, *h, *w])))
+        }
+        (poem_ir::InputAxis::Voxel, _) => Err(format!(
+            "input `{name}` reads one clip `[h, w, {width}]` (or `[t, h, w, {width}]`) on the \
+             voxel axis; this channel is {shape:?}"
+        )),
     }
 }
 
-pub(crate) fn port_clip(port: &poem::generative::PortFact, shape: &[u32]) -> Option<[u32; 3]> {
-    if port.kind != poem::generative::PortKind::Voxels {
-        return None;
-    }
-    match *shape {
-        [h, w, width] if width == port.width && h > 0 && w > 0 => Some([1, h, w]),
-        [t, h, w, width] if width == port.width && t > 0 && h > 0 && w > 0 => Some([t, h, w]),
-        _ => None,
-    }
-}
-
-pub(crate) fn port_rows(ports: &[PortBinding]) -> Result<Option<u32>, String> {
+pub(crate) fn input_rows(inputs: &[InputBinding]) -> Result<Option<u32>, String> {
     let mut rows: Option<(u32, &str)> = None;
-    let mut context_rows: Option<u32> = None;
-    for port in ports {
-        let Some(these) = port.rows else { continue };
-        if port.kind == ::engine::fire::PortKind::Voxels {
-            continue;
-        }
-        if port.kind == ::engine::fire::PortKind::Context {
-            context_rows = context_rows.or(Some(these));
-            continue;
-        }
+    for input in inputs {
+        let Some(these) = input.rows else { continue };
         match rows {
-            None => rows = Some((these, &port.name)),
+            None => rows = Some((these, &input.name)),
             Some((agreed, name)) if agreed != these => {
                 return Err(format!(
-                    "port `{}` binds {these} rows but port `{name}` binds {agreed}; a pass's \
-                     latents and positions ports carry the same rows",
-                    port.name
+                    "input `{}` binds {these} rows but input `{name}` binds {agreed}; a lane's \
+                     row inputs carry the same rows",
+                    input.name
                 ));
             }
             Some(_) => {}
         }
     }
-    Ok(rows.map(|(rows, _)| rows).or(context_rows))
+    Ok(rows.map(|(rows, _)| rows))
+}
+
+fn input_names(model: &crate::model::Model) -> String {
+    if model.inputs().is_empty() {
+        return "it reads none".to_string();
+    }
+    let names: Vec<String> = model
+        .inputs()
+        .iter()
+        .map(|input| format!("`{}`", input.name))
+        .collect();
+    format!("it reads {}", names.join(", "))
 }
 
 /// After attach a pass may bind other working sets, never other channels.
@@ -177,9 +105,6 @@ fn state_rebind_diff(existing: &StateBinding, next: &StateBinding) -> Option<&'s
     }
     if existing.kv_len != next.kv_len {
         return Some("kv-len");
-    }
-    if existing.mask != next.mask {
-        return Some("mask");
     }
     if existing.fold != next.fold {
         return Some("fold");
@@ -536,39 +461,9 @@ impl pie::inferlet::channel::HostChannelWithStore<ProcessCtx> for HasSelf<Proces
 }
 
 impl ProcessCtx {
-    async fn core_new(&mut self, kind: PassKind) -> Anyhow<Resource<ForwardPass>> {
+    async fn core_new(&mut self) -> Anyhow<Resource<ForwardPass>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        Ok(self.ctx().table.push(ForwardPass::new(kind))?)
-    }
-
-    fn core_gate(
-        &mut self,
-        this: &Resource<ForwardPass>,
-        named: Option<&'static poem::generative::ReadingFact>,
-    ) -> Anyhow<Result<(), String>> {
-        let kind = self.ctx().table.get(this)?.kind;
-        let actual = crate::model::model().pass_kind();
-        if kind == PassKind::Text {
-            let reading = match named {
-                Some(reading) => Ok(Some(reading)),
-                None => reading_of(self.ctx().table.get(this)?),
-            };
-            if let Ok(Some(reading)) = reading
-                && !reading.has_kv
-            {
-                return Ok(Ok(()));
-            }
-        }
-        if kind != actual {
-            return Ok(Err(format!(
-                "this model's forward pass is `{}`, but the pass was built through the `{}` \
-                 interface; use `{}` instead",
-                actual.name(),
-                kind.interface(),
-                actual.interface(),
-            )));
-        }
-        Ok(Ok(()))
+        Ok(self.ctx().table.push(ForwardPass::default())?)
     }
 
     async fn core_embed(
@@ -588,15 +483,6 @@ impl ProcessCtx {
                 "forward pass embed binding is already attached".to_string()
             ));
         }
-        if let Ok(Some(reading)) = reading_of(pass)
-            && !reading.takes_tokens
-        {
-            return Ok(Err(format!(
-                "reading `{}` embeds no tokens; `embed` is refused on its pass (its rows are \
-                 the latents port's)",
-                reading.name
-            )));
-        }
         pass.bindings.embed = Some(EmbedBinding {
             tokens: tokens.rep(),
             indptr: indptr.rep(),
@@ -614,12 +500,8 @@ impl ProcessCtx {
             positions,
             slots,
             kv_len,
-            mask,
             fold,
         } = geom;
-        if let Err(error) = self.core_gate(&this, None)? {
-            return Ok(Err(error));
-        }
         if lanes.is_empty() {
             return Ok(Err(
                 "forward pass state binding names no working set; give one per lane".to_string(),
@@ -628,10 +510,7 @@ impl ProcessCtx {
         for lane in &lanes {
             let _ = self.ctx().table.get(lane)?;
         }
-        for channel in [&positions, &slots, &kv_len, &mask, &fold]
-            .into_iter()
-            .flatten()
-        {
+        for channel in [&positions, &slots, &kv_len, &fold].into_iter().flatten() {
             let _ = self.ctx().table.get(channel)?;
         }
         let reps: Vec<u32> = lanes.iter().map(Resource::rep).collect();
@@ -648,7 +527,6 @@ impl ProcessCtx {
             positions: positions.map(|resource| resource.rep()),
             slots: slots.map(|resource| resource.rep()),
             kv_len: kv_len.map(|resource| resource.rep()),
-            mask: mask.map(|resource| resource.rep()),
             fold: fold.map(|resource| resource.rep()),
         };
         let pass = self.ctx().table.get(&this)?;
@@ -679,15 +557,6 @@ impl ProcessCtx {
             return Ok(Err(
                 "forward pass state binding is already attached".to_string()
             ));
-        }
-        if let Ok(Some(reading)) = reading_of(pass)
-            && !reading.has_kv
-        {
-            return Ok(Err(format!(
-                "reading `{}` declares no KV space; `state` is refused on its pass (nothing \
-                 there is a sequence)",
-                reading.name
-            )));
         }
         self.ctx().table.get_mut(&this)?.bindings.state = Some(binding);
         Ok(Ok(()))
@@ -722,83 +591,46 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
-    async fn core_reading(
+    async fn core_switch(
         &mut self,
         this: Resource<ForwardPass>,
+        lane: u32,
         name: String,
+        value: String,
     ) -> Anyhow<Result<(), String>> {
-        let model = crate::model::model();
-        let Some(reading) = model.readings().iter().find(|reading| reading.name == name) else {
-            return Ok(Err(if model.readings().is_empty() {
-                format!(
-                    "this model declares no readings (one implicit reading); `reading(\"{name}\")` \
-                     has nothing to name"
-                )
-            } else {
-                format!(
-                    "this model declares no reading `{name}`; it declares {}",
-                    reading_names(model.readings())
-                )
-            }));
-        };
-        if let Err(error) = self.core_gate(&this, Some(reading))? {
+        if let Err(error) = crate::model::model().facts().check(&name, &value) {
             return Ok(Err(error));
         }
+        let lane = match lane_index(lane) {
+            Ok(lane) => lane,
+            Err(error) => return Ok(Err(error)),
+        };
         let pass = self.ctx().table.get_mut(&this)?;
         if pass.is_bound() {
             return Ok(Err("forward pass program is already attached".to_string()));
         }
-        if pass.bindings.reading.is_some() {
-            return Ok(Err(
-                "forward pass reading is already set; a pass keeps one reading for its life"
-                    .to_string(),
-            ));
-        }
-        if !reading.takes_tokens && pass.bindings.embed.is_some() {
+        let switches = &mut pass.bindings.lane_mut(lane).switches;
+        if switches.iter().any(|(set, _)| *set == name) {
             return Ok(Err(format!(
-                "reading `{}` embeds no tokens, but this pass already bound `embed`",
-                reading.name
+                "lane {lane}'s switch `{name}` is already set; a lane keeps its switches for \
+                 its pass's life"
             )));
         }
-        if !reading.has_kv && pass.bindings.state.is_some() {
-            return Ok(Err(format!(
-                "reading `{}` declares no KV space, but this pass already bound `state`",
-                reading.name
-            )));
-        }
-        if let Some(port) = pass
-            .bindings
-            .ports
-            .iter()
-            .find(|port| reading.port(&port.name).is_none())
-        {
-            return Ok(Err(format!(
-                "reading `{}` declares no port `{}`, but this pass already bound one",
-                reading.name, port.name
-            )));
-        }
-        if let Some(stream) = pass.bindings.stream
-            && !reading_lists_stream(reading, stream)
-        {
-            return Ok(Err(format!(
-                "reading `{}` lists no `{}` stream, but this pass already stated it",
-                reading.name,
-                stream.name()
-            )));
-        }
-        pass.bindings.reading = Some(reading.index);
+        switches.push((name, value));
         Ok(Ok(()))
     }
 
     async fn core_input(
         &mut self,
         this: Resource<ForwardPass>,
-        port: String,
+        lane: u32,
+        name: String,
         channel: Resource<Channel>,
     ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this, None)? {
-            return Ok(Err(error));
-        }
+        let lane = match lane_index(lane) {
+            Ok(lane) => lane,
+            Err(error) => return Ok(Err(error)),
+        };
         let (shape, dtype, global_id) = {
             let resource = self.ctx().table.get(&channel)?;
             let cell = resource.cell.lock().unwrap();
@@ -809,345 +641,76 @@ impl ProcessCtx {
             return Ok(Err("forward pass program is already attached".to_string()));
         }
         let model = crate::model::model();
-        let candidates: Vec<&poem::generative::ReadingFact> = match reading_of(pass) {
-            Ok(Some(reading)) => vec![reading],
-            Ok(None) => Vec::new(),
-            Err(_) => model.readings().iter().collect(),
-        };
-        if candidates.is_empty() {
+        let Some((id, input)) = model.input(&name) else {
             return Ok(Err(format!(
-                "this model declares no float ports; `input(\"{port}\")` has nothing to bind"
-            )));
-        }
-        let Some((reading, (index, fact))) = candidates
-            .iter()
-            .find_map(|reading| reading.port(&port).map(|found| (*reading, found)))
-        else {
-            return Ok(Err(format!(
-                "no reading of this model declares a port `{port}`; {}",
-                candidates
-                    .iter()
-                    .map(|reading| format!(
-                        "`{}` declares {}",
-                        reading.name,
-                        if reading.ports.is_empty() {
-                            "none".to_string()
-                        } else {
-                            reading
-                                .ports
-                                .iter()
-                                .map(|p| format!("`{}`", p.name))
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        }
-                    ))
-                    .collect::<Vec<_>>()
-                    .join("; ")
+                "this model reads no input `{name}`; {}",
+                input_names(model)
             )));
         };
-        let rows = match validate_port_channel(fact, &shape, dtype) {
-            Ok(rows) => rows,
+        let (rows, clip) = match validate_input_channel(input, &shape, dtype) {
+            Ok(carried) => carried,
             Err(error) => return Ok(Err(error)),
         };
-        if let Some(rows) = rows
-            && fact.kind == poem::generative::PortKind::Latents
-            && let Some(generative) = model.generative()
-            && rows > generative.max_rows
-        {
-            return Ok(Err(format!(
-                "port `{port}` binds {rows} latent rows; this model carries at most {} \
-                 (`model.max-latent-rows()`)",
-                generative.max_rows
-            )));
-        }
-        let binding = PortBinding {
-            name: port.clone(),
-            kind: engine_port_kind(fact.kind),
-            port: index,
+        let binding = InputBinding {
+            name: name.clone(),
+            id,
             channel_rep: channel.rep(),
             channel_id: global_id,
             rows,
-            clip: port_clip(fact, &shape),
+            clip,
         };
         let pass = self.ctx().table.get_mut(&this)?;
-        if pass.bindings.ports.iter().any(|bound| bound.name == port) {
+        let inputs = &mut pass.bindings.lane_mut(lane).inputs;
+        if inputs.iter().any(|bound| bound.id == id) {
             return Ok(Err(format!(
-                "port `{port}` is already bound on this pass (reading `{}`)",
-                reading.name
+                "input `{name}` is already bound on lane {lane}"
             )));
         }
-        let mut ports = pass.bindings.ports.clone();
-        ports.push(binding.clone());
-        if let Err(error) = port_rows(&ports) {
-            return Ok(Err(error));
+        let mut next = inputs.clone();
+        next.push(binding.clone());
+        if let Err(error) = input_rows(&next) {
+            return Ok(Err(format!("lane {lane}: {error}")));
         }
-        pass.bindings.ports.push(binding);
-        Ok(Ok(()))
-    }
-
-    async fn core_stream(
-        &mut self,
-        this: Resource<ForwardPass>,
-        stream: pie::inferlet::model::LaneStream,
-    ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this, None)? {
-            return Ok(Err(error));
-        }
-        let stream = super::model::catalog_stream(stream);
-        let pass = self.ctx().table.get_mut(&this)?;
-        if pass.is_bound() {
-            return Ok(Err("forward pass program is already attached".to_string()));
-        }
-        if pass.bindings.stream.is_some() {
-            return Ok(Err(
-                "forward pass stream is already set; a pass is one lane of one stream".to_string(),
-            ));
-        }
-        if let Ok(Some(reading)) = reading_of(pass)
-            && !reading_lists_stream(reading, stream)
-        {
-            return Ok(Err(format!(
-                "reading `{}` lists no `{}` stream; it lists {}",
-                reading.name,
-                stream.name(),
-                stream_names(reading)
-            )));
-        }
-        pass.bindings.stream = Some(stream);
+        inputs.push(binding);
         Ok(Ok(()))
     }
 
     async fn core_group(
         &mut self,
         this: Resource<ForwardPass>,
+        lane: u32,
         id: u32,
     ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this, None)? {
-            return Ok(Err(error));
-        }
-        let pass = self.ctx().table.get_mut(&this)?;
-        if pass.is_bound() {
-            return Ok(Err("forward pass program is already attached".to_string()));
-        }
-        if pass.bindings.group.is_some() {
-            return Ok(Err("forward pass group is already set".to_string()));
-        }
-        pass.bindings.group = Some(id);
-        Ok(Ok(()))
-    }
-
-    async fn core_peer(
-        &mut self,
-        this: Resource<ForwardPass>,
-        group: u32,
-    ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this, None)? {
-            return Ok(Err(error));
-        }
-        let pass = self.ctx().table.get_mut(&this)?;
-        if pass.is_bound() {
-            return Ok(Err("forward pass program is already attached".to_string()));
-        }
-        if pass.bindings.peer.is_some() {
-            return Ok(Err("forward pass peer is already set".to_string()));
-        }
-        let Some(own) = pass.bindings.group else {
-            return Ok(Err(
-                "a peer is a lane of ANOTHER attention group, and this pass names \
-                 no group of its own: call `group` first"
-                    .to_string(),
-            ));
+        let lane = match lane_index(lane) {
+            Ok(lane) => lane,
+            Err(error) => return Ok(Err(error)),
         };
-        if own == group {
-            return Ok(Err(format!(
-                "this pass names attention group {group} as its own peer group; \
-                 guidance combines two INDEPENDENT denoisings, and a lane guided \
-                 by itself is not guided"
-            )));
-        }
-        pass.bindings.peer = Some(group);
-        Ok(Ok(()))
-    }
-
-    async fn core_attention_classes(
-        &mut self,
-        this: Resource<ForwardPass>,
-        classes: Vec<i32>,
-        table: Vec<u8>,
-        count: u32,
-    ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this, None)? {
-            return Ok(Err(error));
-        }
         let pass = self.ctx().table.get_mut(&this)?;
         if pass.is_bound() {
             return Ok(Err("forward pass program is already attached".to_string()));
         }
-        if pass.bindings.attn_classes.is_some() {
-            return Ok(Err(
-                "forward pass attention classes are already set".to_string()
-            ));
+        let group = &mut pass.bindings.lane_mut(lane).group;
+        if group.is_some() {
+            return Ok(Err(format!("lane {lane}'s group is already set")));
         }
-        let max = ::engine::fire::ATTN_CLASSES_MAX;
-        if count == 0 || count > max {
-            return Ok(Err(format!(
-                "attention classes: `count` is {count}; the table holds 1..={max} classes"
-            )));
-        }
-        if table.len() as u64 != u64::from(count) * u64::from(count) {
-            return Ok(Err(format!(
-                "attention classes: the table is {} bytes for {count} classes; it is \
-                 count x count, row-major, q class by kv class",
-                table.len()
-            )));
-        }
-        if let Some(bad) = classes.iter().find(|c| **c >= 0 && **c as u32 >= count) {
-            return Ok(Err(format!(
-                "attention classes: a row names class {bad} and the table holds {count}; \
-                 a class is in 0..count, or -1 for an unconstrained row"
-            )));
-        }
-        pass.bindings.attn_classes = Some(::engine::fire::AttnClasses {
-            classes,
-            table,
-            count,
-        });
+        *group = Some(id);
         Ok(Ok(()))
     }
 
-    async fn core_canvas(
-        &mut self,
-        this: Resource<ForwardPass>,
-        mode: CanvasMode,
-    ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this, None)? {
-            return Ok(Err(error));
-        }
-        let pass = self.ctx().table.get_mut(&this)?;
-        if pass.is_bound() {
-            return Ok(Err("forward pass program is already attached".to_string()));
-        }
-        if pass.bindings.canvas.is_some() {
-            return Ok(Err(
-                "forward pass canvas mode is already set; a pass keeps one reading for its life"
-                    .to_string(),
-            ));
-        }
-        pass.bindings.canvas = Some(mode);
-        Ok(Ok(()))
-    }
-
-    async fn core_self_conditioning(
-        &mut self,
-        this: Resource<ForwardPass>,
-        rows: Vec<u32>,
-        weights: Vec<f32>,
-    ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this, None)? {
-            return Ok(Err(error));
-        }
-        let Some(shape) = crate::model::model().diffusion() else {
-            return Ok(Err(
-                "self-conditioning is a diffusion model's input; this model states no canvas"
-                    .to_string(),
-            ));
-        };
-        let vocab = crate::model::model().vocab_size();
-        let cells = shape.canvas as usize * shape.self_cond_taps as usize;
-        if rows.len() != cells || weights.len() != cells {
-            return Ok(Err(format!(
-                "self-conditioning takes {cells} ids and {cells} weights ({} canvas rows x {} \
-                 taps, row major); {} ids and {} weights were staged",
-                shape.canvas,
-                shape.self_cond_taps,
-                rows.len(),
-                weights.len()
-            )));
-        }
-        if let Some(bad) = rows.iter().find(|&&id| id >= vocab) {
-            return Ok(Err(format!(
-                "self-conditioning tap id {bad} is outside the model's {vocab}-wide table"
-            )));
-        }
-        if weights.iter().any(|w| !w.is_finite()) {
-            return Ok(Err("self-conditioning weights must be finite".to_string()));
-        }
-        let pass = self.ctx().table.get_mut(&this)?;
-        if pass.bindings.canvas != Some(CanvasMode::Denoise) {
-            return Ok(Err(
-                "self-conditioning is a denoise pass's input; set `canvas(denoise)` first, and \
-                 never stage it on an encode pass"
-                    .to_string(),
-            ));
-        }
-        if pass.bindings.self_cond.is_some() {
-            return Ok(Err(
-                "a self-conditioning payload is already staged for this pass's next submit; \
-                 staging another would lose it"
-                    .to_string(),
-            ));
-        }
-        pass.bindings.self_cond = Some(crate::pipeline::instance::SelfCondPayload {
-            taps: shape.self_cond_taps,
-            rows,
-            weights,
-            channels: None,
-        });
-        Ok(Ok(()))
-    }
-
-    async fn core_self_conditioning_from(
+    async fn core_mask(
         &mut self,
         this: Resource<ForwardPass>,
         rows: Resource<Channel>,
-        weights: Resource<Channel>,
     ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this, None)? {
-            return Ok(Err(error));
-        }
-        let Some(shape) = crate::model::model().diffusion() else {
-            return Ok(Err(
-                "self-conditioning is a diffusion model's input; this model states no canvas"
-                    .to_string(),
-            ));
-        };
-        let want = vec![shape.canvas, shape.self_cond_taps];
-        let mut ids = [::engine::ChannelId::default(); 2];
-        for (slot, (channel, dtype, what)) in [
-            (&rows, eta_ir::types::Dtype::U32, "ids"),
-            (&weights, eta_ir::types::Dtype::F32, "weights"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let resource = self.ctx().table.get(channel)?;
-            let cell = resource.cell.lock().unwrap();
-            if cell.shape != want || cell.dtype != dtype {
-                return Ok(Err(format!(
-                    "self-conditioning {what} channel must be `[{}, {}]` {dtype:?}; this one is {:?} {:?}",
-                    shape.canvas, shape.self_cond_taps, cell.shape, cell.dtype
-                )));
-            }
-            ids[slot] = cell.global_id;
-        }
+        let _ = self.ctx().table.get(&rows)?;
         let pass = self.ctx().table.get_mut(&this)?;
-        if pass.bindings.canvas != Some(CanvasMode::Denoise) {
-            return Ok(Err(
-                "self-conditioning is a denoise pass's input; set `canvas(denoise)` first"
-                    .to_string(),
-            ));
+        if pass.is_bound() {
+            return Ok(Err("forward pass program is already attached".to_string()));
         }
-        if pass.bindings.self_cond.is_some() {
-            return Ok(Err(
-                "a self-conditioning payload or binding is already on this pass".to_string(),
-            ));
+        if pass.bindings.mask.is_some() {
+            return Ok(Err("forward pass mask is already attached".to_string()));
         }
-        pass.bindings.self_cond = Some(crate::pipeline::instance::SelfCondPayload {
-            taps: shape.self_cond_taps,
-            rows: Vec::new(),
-            weights: Vec::new(),
-            channels: Some((ids[0], ids[1])),
-        });
+        pass.bindings.mask = Some(rows.rep());
         Ok(Ok(()))
     }
 
@@ -1170,41 +733,17 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
-    async fn core_set_max_layers(
-        &mut self,
-        this: Resource<ForwardPass>,
-        max_layers: u32,
-    ) -> Anyhow<Result<(), String>> {
-        let pass = self.ctx().table.get_mut(&this)?;
-        if pass.is_bound() {
-            return Ok(Err("forward pass program is already attached".to_string()));
-        }
-        if max_layers == 0 {
-            return Ok(Err("max-layers must be at least 1".to_string()));
-        }
-        pass.bindings.max_layers = Some(max_layers);
-        Ok(Ok(()))
-    }
-
-    async fn core_set_drafting_block(
-        &mut self,
-        this: Resource<ForwardPass>,
-        on: bool,
-    ) -> Anyhow<Result<(), String>> {
-        let pass = self.ctx().table.get_mut(&this)?;
-        if pass.is_bound() {
-            return Ok(Err("forward pass program is already attached".to_string()));
-        }
-        pass.bindings.block_draft = on;
-        Ok(Ok(()))
-    }
-
     async fn core_media(
         &mut self,
         this: Resource<ForwardPass>,
+        lane: u32,
         spans: Vec<pie::inferlet::forward::MediaSpan>,
     ) -> Anyhow<Result<(), String>> {
         use pie::inferlet::forward::MediaSpan;
+        let lane = match lane_index(lane) {
+            Ok(lane) => lane,
+            Err(error) => return Ok(Err(error)),
+        };
         let mut attached = Vec::with_capacity(spans.len());
         for span in &spans {
             let encoded = match span {
@@ -1221,16 +760,26 @@ impl ProcessCtx {
             };
             attached.push(encoded);
         }
+        // A span's tokens ride one fire.
+        let max_rows = crate::engine::get_spec(0)?.limits.max_forward_tokens;
+        if let Some(span) = attached.iter().find(|s| s.token_count as usize > max_rows) {
+            return Ok(Err(format!(
+                "lane {lane}'s media span is {} tokens and one fire carries at most {max_rows}; \
+                 a span rides one fire, so encode it smaller",
+                span.token_count
+            )));
+        }
         let pass = self.ctx().table.get_mut(&this)?;
         if pass.is_bound() {
             return Ok(Err("forward pass program is already attached".to_string()));
         }
-        if !pass.bindings.media.is_empty() {
-            return Ok(Err(
-                "forward pass media spans are already attached".to_string()
-            ));
+        let media = &mut pass.bindings.lane_mut(lane).media;
+        if !media.is_empty() {
+            return Ok(Err(format!(
+                "lane {lane}'s media spans are already attached"
+            )));
         }
-        pass.bindings.media = attached;
+        *media = attached;
         Ok(Ok(()))
     }
 
@@ -1240,32 +789,7 @@ impl ProcessCtx {
         container_bytes: Vec<u8>,
         channels: Vec<Resource<Channel>>,
     ) -> Anyhow<Result<(), String>> {
-        let (
-            embed,
-            state,
-            readout,
-            pass_max_layers,
-            pass_block_draft,
-            lane_facts,
-            port_bindings,
-            float_rows,
-        ) = {
-            let port_cells: Vec<(String, Vec<u32>, Dtype)> = {
-                let pass = self.ctx().table.get(&this)?;
-                pass.bindings
-                    .ports
-                    .iter()
-                    .map(|port| (port.name.clone(), port.channel_rep))
-                    .collect::<Vec<_>>()
-            }
-            .into_iter()
-            .map(|(name, rep)| {
-                let resource: Resource<Channel> = Resource::new_borrow(rep);
-                let cell = self.ctx().table.get(&resource)?.cell.clone();
-                let cell = cell.lock().unwrap();
-                Ok::<_, anyhow::Error>((name, cell.shape.clone(), cell.dtype))
-            })
-            .collect::<Result<_, _>>()?;
+        let (embed, state, readout, mask, facts, input_bindings, float, readouts) = {
             let embed_ids: Option<usize> = {
                 let rep = self
                     .ctx()
@@ -1288,13 +812,50 @@ impl ProcessCtx {
             if pass.is_bound() {
                 return Ok(Err("forward pass program is already attached".to_string()));
             }
-            let reading = match reading_of(pass) {
-                Ok(reading) => reading,
-                Err(error) => return Ok(Err(error)),
+            let model = crate::model::model();
+            let count = match &pass.bindings.state {
+                Some(state) => state.lanes.len(),
+                None => pass.bindings.lanes.len().max(1),
             };
-            let wants_tokens = reading.is_none_or(|reading| reading.takes_tokens);
-            let wants_kv = reading.is_none_or(|reading| reading.has_kv);
-            let embed = match (pass.bindings.embed, wants_tokens) {
+            if pass.bindings.lanes.len() > count {
+                return Ok(Err(format!(
+                    "lane {} binds a switch, an input, a group or media, and the pass's \
+                     `state` binds {count} working set(s): one a lane",
+                    pass.bindings.lanes.len() - 1
+                )));
+            }
+            let mut lanes = pass.bindings.lanes.clone();
+            lanes.resize_with(count, Default::default);
+            let mut decls = Vec::with_capacity(count);
+            for (at, lane) in lanes.iter().enumerate() {
+                match model.lane(&lane.switches) {
+                    Ok(decl) => decls.push(decl),
+                    Err(error) => return Ok(Err(format!("lane {at}: {error}"))),
+                }
+            }
+            let (reads_kv, embeds) = (decls[0].reads_kv, decls[0].embeds);
+            if let Some(at) = decls
+                .iter()
+                .position(|decl| decl.reads_kv != reads_kv || decl.embeds != embeds)
+            {
+                return Ok(Err(format!(
+                    "lane {at} {} a kv cache and {} tokens, and lane 0 {} and {}; a pass's \
+                     lanes all read kv or none, and all embed or none",
+                    if decls[at].reads_kv {
+                        "reads"
+                    } else {
+                        "reads no"
+                    },
+                    if decls[at].embeds {
+                        "embeds"
+                    } else {
+                        "embeds no"
+                    },
+                    if reads_kv { "reads one" } else { "reads none" },
+                    if embeds { "embeds" } else { "embeds none" },
+                )));
+            }
+            let embed = match (pass.bindings.embed, embeds) {
                 (Some(embed), true) => Some(embed),
                 (None, true) => {
                     return Ok(Err(
@@ -1302,14 +863,30 @@ impl ProcessCtx {
                     ));
                 }
                 (Some(_), false) => {
-                    return Ok(Err(format!(
-                        "reading `{}` embeds no tokens, but this pass bound `embed`",
-                        reading.map_or("", |reading| reading.name.as_str())
-                    )));
+                    return Ok(Err(
+                        "this pass's lanes embed no tokens, but the pass bound `embed`".to_string(),
+                    ));
                 }
                 (None, false) => None,
             };
-            let state = match (pass.bindings.state.clone(), wants_kv) {
+            // A float lane reading a recurrent state binds `state` and states no geometry.
+            let reads_state = !reads_kv && decls[0].reads_state;
+            if let Some(at) = decls
+                .iter()
+                .position(|decl| !reads_kv && decl.reads_state != reads_state)
+            {
+                return Ok(Err(format!(
+                    "lane {at} {} a recurrent state and lane 0 {}; a pass's lanes all read one \
+                     or none",
+                    if reads_state { "reads no" } else { "reads" },
+                    if reads_state {
+                        "reads one"
+                    } else {
+                        "reads none"
+                    },
+                )));
+            }
+            let state = match (pass.bindings.state.clone(), reads_kv || reads_state) {
                 (Some(state), true) => Some(state),
                 (None, true) => {
                     return Ok(Err(
@@ -1317,170 +894,166 @@ impl ProcessCtx {
                     ));
                 }
                 (Some(_), false) => {
-                    return Ok(Err(format!(
-                        "reading `{}` declares no KV space, but this pass bound `state`",
-                        reading.map_or("", |reading| reading.name.as_str())
-                    )));
+                    return Ok(Err(
+                        "this pass's lanes read no kv cache and no recurrent state, but the pass \
+                         bound `state`"
+                            .to_string(),
+                    ));
                 }
                 (None, false) => None,
             };
-            let pass_stream = pass.bindings.stream.unwrap_or_default();
-            let carried = |port: &poem::generative::PortFact| {
-                port.streams.is_empty() || port.streams.contains(&pass_stream)
-            };
-            if let Some(reading) = reading {
-                if let Some((_, port)) = reading.ports_indexed().find(|(_, port)| {
-                    carried(port)
-                        && !pass
-                            .bindings
-                            .ports
-                            .iter()
-                            .any(|bound| bound.name == port.name)
-                }) {
-                    return Ok(Err(format!(
-                        "reading `{}` declares port `{}` for this pass's stream and this pass \
-                         bound no channel to it; call `input(\"{}\", channel)` before `program`",
-                        reading.name, port.name, port.name
-                    )));
-                }
-                if let Some(bound) = pass.bindings.ports.iter().find(|bound| {
-                    reading
-                        .port(&bound.name)
-                        .is_none_or(|(_, port)| !carried(port))
-                }) {
-                    return Ok(Err(format!(
-                        "reading `{}` declares no port `{}` for this pass's stream, but this \
-                         pass bound one",
-                        reading.name, bound.name
-                    )));
-                }
-            } else if let Some(bound) = pass.bindings.ports.first() {
-                return Ok(Err(format!(
-                    "this model declares no float ports, but this pass bound `{}`",
-                    bound.name
-                )));
-            }
-            let stream = pass.bindings.stream.unwrap_or_default();
-            if let Some(reading) = reading
-                && !reading_lists_stream(reading, stream)
+            if reads_state
+                && let Some(state) = &state
+                && [state.positions, state.slots, state.kv_len, state.fold]
+                    .iter()
+                    .any(Option::is_some)
             {
-                return Ok(Err(format!(
-                    "reading `{}` lists no `{}` stream; it lists {}",
-                    reading.name,
-                    stream.name(),
-                    stream_names(reading)
-                )));
-            }
-            if wants_kv && !wants_tokens {
-                return Ok(Err(format!(
-                    "reading `{}` embeds no tokens but declares a KV space; a sequence's rows \
-                     are its tokens, and this reading states none",
-                    reading.map_or("", |reading| reading.name.as_str())
-                )));
-            }
-            if pass.kind == PassKind::Diffusion && pass.bindings.canvas.is_none() {
                 return Ok(Err(
-                    "forward pass canvas mode must be set before program on a diffusion pass"
+                    "this pass's lanes read no kv cache: each fire folds one slot of their \
+                     recurrent state, so their `state` binds no geometry"
                         .to_string(),
                 ));
             }
-            let mut port_bindings = pass.bindings.ports.clone();
-            if let Some(reading) = reading {
-                for binding in &mut port_bindings {
-                    let Some((index, fact)) = reading.port(&binding.name) else {
-                        continue;
-                    };
-                    let Some((_, shape, dtype)) =
-                        port_cells.iter().find(|(name, _, _)| *name == binding.name)
-                    else {
-                        continue;
-                    };
-                    match validate_port_channel(fact, shape, *dtype) {
-                        Ok(rows) => binding.rows = rows,
-                        Err(error) => {
-                            return Ok(Err(format!("reading `{}`: {error}", reading.name)));
-                        }
-                    }
-                    binding.clip = port_clip(fact, shape);
-                    if fact.kind == poem::generative::PortKind::Latents
-                        && let Some(rows) = binding.rows
-                        && let Some(generative) = crate::model::model().generative()
-                        && rows > generative.max_rows
-                    {
-                        return Ok(Err(format!(
-                            "port `{}` binds {rows} latent rows; this model carries at most {} \
-                             (`model.max-latent-rows()`)",
-                            binding.name, generative.max_rows
-                        )));
-                    }
-                    binding.kind = engine_port_kind(fact.kind);
-                    binding.port = index;
+            if reads_kv && !embeds {
+                return Ok(Err(
+                    "this pass's lanes read a kv cache and embed no tokens; a sequence's rows \
+                     are its tokens, and these lanes state none"
+                        .to_string(),
+                ));
+            }
+            for (at, (lane, decl)) in lanes.iter().zip(&decls).enumerate() {
+                let reads = &decl.inputs;
+                if let Some(&missing) = reads
+                    .iter()
+                    .find(|&&id| !lane.inputs.iter().any(|bound| bound.id == id))
+                {
+                    let name = &model.inputs()[missing as usize].name;
+                    return Ok(Err(format!(
+                        "lane {at} reads input `{name}` and the pass bound no channel to it; \
+                         call `input({at}, \"{name}\", channel)` before `program`"
+                    )));
                 }
-                if let Err(error) = port_rows(&port_bindings) {
-                    return Ok(Err(error));
+                if let Some(bound) = lane.inputs.iter().find(|bound| !reads.contains(&bound.id)) {
+                    return Ok(Err(format!(
+                        "lane {at} reads no input `{}`, but the pass bound one",
+                        bound.name
+                    )));
                 }
             }
-            let clips: Vec<[u32; 3]> = port_bindings
-                .iter()
-                .filter(|binding| binding.kind == ::engine::fire::PortKind::Voxels)
-                .filter_map(|binding| binding.clip)
-                .collect();
-            let float_rows = if wants_tokens && wants_kv {
+            let max_rows = crate::engine::get_spec(0)?.limits.max_forward_tokens;
+            let float = if reads_kv {
                 None
-            } else if wants_tokens {
+            } else if embeds {
                 let Some(ids) = embed_ids else {
                     return Ok(Err(
                         "a cacheless encoder pass binds `embed`; this one bound none".to_string(),
                     ));
                 };
-                match u32::try_from(ids).ok().filter(|rows| *rows > 0) {
-                    Some(rows) => Some(rows),
-                    None => {
-                        return Ok(Err(format!(
-                            "reading `{}` embeds tokens and the channel bound to `embed` holds \
-                             {ids} of them",
-                            reading.map_or("", |reading| reading.name.as_str())
-                        )));
-                    }
+                if ids == 0 || ids > max_rows {
+                    return Ok(Err(format!(
+                        "this pass's lanes embed tokens and the channel bound to `embed` holds \
+                         {ids} of them; one fire carries 1..={max_rows}"
+                    )));
                 }
+                Some(FloatPass {
+                    lanes: vec![
+                        FloatLane {
+                            rows: 0,
+                            clips: Vec::new(),
+                        };
+                        count
+                    ],
+                    embed: true,
+                })
             } else {
-                match port_rows(&port_bindings) {
-                    Ok(Some(rows)) => Some(rows),
-                    Ok(None) if !clips.is_empty() => Some(1),
-                    Ok(None) => {
-                        return Ok(Err(format!(
-                            "reading `{}` embeds no tokens and this pass bound no `[rows, ·]` \
-                             port; nothing states its lane's row count",
-                            reading.map_or("", |reading| reading.name.as_str())
-                        )));
-                    }
-                    Err(error) => return Ok(Err(error)),
+                let mut floats = Vec::with_capacity(count);
+                for (at, lane) in lanes.iter().enumerate() {
+                    let clips: Vec<[u32; 3]> = lane
+                        .inputs
+                        .iter()
+                        .filter_map(|binding| binding.clip)
+                        .collect();
+                    // One row per patch of each clip, padded to its input's `rows`.
+                    let tokens = |[pt, ph, pw]: [u32; 3]| {
+                        clips
+                            .iter()
+                            .map(|[t, h, w]| (t / pt.max(1)) * (h / ph.max(1)) * (w / pw.max(1)))
+                            .fold(0u32, u32::saturating_add)
+                    };
+                    let stated = lane
+                        .inputs
+                        .iter()
+                        .filter(|binding| binding.clip.is_some())
+                        .find_map(|binding| model.inputs()[binding.id as usize].rows);
+                    let padded = |tokens: u32| match stated {
+                        None => Some(tokens),
+                        Some(poem_ir::RowCount::Exact(n)) => (tokens <= n).then_some(n),
+                        Some(poem_ir::RowCount::Multiple(n)) => tokens.checked_next_multiple_of(n),
+                    };
+                    let rows = match input_rows(&lane.inputs) {
+                        Ok(Some(rows)) => rows,
+                        Ok(None) if !clips.is_empty() => {
+                            match decls[at].patch.map(tokens).map(padded) {
+                                None => 1,
+                                Some(Some(rows)) => rows,
+                                Some(None) => {
+                                    return Ok(Err(format!(
+                                        "lane {at}'s clips hold more patches than its voxel \
+                                         input's {stated:?} rows"
+                                    )));
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            return Ok(Err(format!(
+                                "lane {at} embeds no tokens and binds no row input; nothing \
+                                 states its row count"
+                            )));
+                        }
+                        Err(error) => return Ok(Err(format!("lane {at}: {error}"))),
+                    };
+                    floats.push(FloatLane { rows, clips });
                 }
+                let total: u64 = floats.iter().map(|lane| u64::from(lane.rows)).sum();
+                if total > max_rows as u64 {
+                    return Ok(Err(format!(
+                        "this pass's lanes bind {total} rows; one fire carries at most \
+                         {max_rows} (`model.max-latent-rows()`)"
+                    )));
+                }
+                Some(FloatPass {
+                    lanes: floats,
+                    embed: false,
+                })
             };
-            let lane_facts = LaneFacts {
-                reading: reading.map_or(0, |reading| reading.index),
-                stream: lane_stream_of(stream),
-                group: pass.bindings.group,
-                peer: pass.bindings.peer,
-                ports: port_bindings.iter().map(PortBinding::feed).collect(),
-                attn_classes: pass.bindings.attn_classes.clone(),
-            };
+            let facts: Vec<LaneFacts> = lanes
+                .iter()
+                .zip(&decls)
+                .map(|(lane, decl)| LaneFacts {
+                    switches: decl.switches.clone(),
+                    group: lane.group,
+                    inputs: lane.inputs.iter().map(InputBinding::feed).collect(),
+                })
+                .collect();
+            let readouts: Vec<Option<eta_ir::registry::Readout>> = decls
+                .iter()
+                .map(|decl| decl.readout.map(eta_readout))
+                .collect();
+            let input_bindings: Vec<InputBinding> =
+                lanes.iter().flat_map(|lane| lane.inputs.clone()).collect();
             (
                 embed,
                 state,
                 pass.bindings.readout,
-                pass.bindings.max_layers,
-                pass.bindings.block_draft,
-                lane_facts,
-                port_bindings,
-                float_rows,
+                pass.bindings.mask,
+                facts,
+                input_bindings,
+                float,
+                readouts,
             )
         };
         {
-            let prog = match crate::pipeline::program::register(
-                container_bytes,
-                &crate::pipeline::program::model_profile(),
-            ) {
+            let prog = match crate::pipeline::program::register(container_bytes, readouts) {
                 Ok(p) => p,
                 Err(e) => return Ok(Err(e.to_string())),
             };
@@ -1519,7 +1092,7 @@ impl ProcessCtx {
                 (Port::Positions, geometry(|state| state.positions)),
                 (Port::Slots, geometry(|state| state.slots)),
                 (Port::KvLen, geometry(|state| state.kv_len)),
-                (Port::AttnMask, geometry(|state| state.mask)),
+                (Port::AttnMask, mask),
                 (Port::Fold, geometry(|state| state.fold)),
                 (Port::Readout, readout),
             ];
@@ -1528,16 +1101,32 @@ impl ProcessCtx {
             {
                 return Ok(Err(error));
             }
-            if let Some(port) = port_bindings
+            let listed: Vec<u32> = prog
+                .bound
+                .container
+                .inputs
                 .iter()
-                .find(|port| !channel_reps.contains(&port.channel_rep))
+                .filter_map(|&dense| channel_reps.get(dense as usize).copied())
+                .collect();
+            if let Some(input) = input_bindings
+                .iter()
+                .find(|input| !listed.contains(&input.channel_rep))
             {
                 return Ok(Err(format!(
-                    "pipeline: port `{}`'s channel is not bound into this pass's program; \
-                     read it in a stage (the inferlet library's `input` does) so the program declares it",
-                    port.name
+                    "pipeline: input `{}`'s channel is not listed as an input of this pass's program",
+                    input.name
                 )));
             }
+            if let Some(&dense) = prog.bound.container.inputs.iter().find(|&&dense| {
+                !input_bindings
+                    .iter()
+                    .any(|input| channel_reps.get(dense as usize) == Some(&input.channel_rep))
+            }) {
+                return Ok(Err(format!(
+                    "pipeline: the program lists channel {dense} as an input that no `input` binds"
+                )));
+            }
+            let writes = |dense: usize| prog.channel_accesses[dense] != (false, false);
             let mut cells: BoundCells = Vec::with_capacity(channels.len());
             for (i, ch) in channels.iter().enumerate() {
                 let cell = self.ctx().table.get(ch)?.cell.clone();
@@ -1551,7 +1140,7 @@ impl ProcessCtx {
                     let extern_binding = extern_bindings[i]
                         .as_ref()
                         .map(|(name, dir)| (name.as_str(), *dir));
-                    if let Err(e) = c.validate_attachment(&decls[i], extern_binding) {
+                    if let Err(e) = c.validate_attachment(&decls[i], writes(i), extern_binding) {
                         return Ok(Err(format!(
                             "pipeline: channel {i} (id {}): {e}",
                             c.global_id
@@ -1580,14 +1169,13 @@ impl ProcessCtx {
                 .as_ref()
                 .map(|state| state.lanes.clone())
                 .unwrap_or_default();
-            let (kv_lanes, rs_reps) = if state.is_some() {
-                self.lane_parts(&lanes)?
-            } else {
-                (vec![self.mint_scratch_working_set()?], Vec::new())
+            let (kv_lanes, rs_reps) = self.lane_parts(&lanes)?;
+            // A seatless float pass binds on its process's engine.
+            let engine = match kv_lanes.first() {
+                Some(&rep) => super::working_set::kv_of(self, rep)?.engine,
+                None => crate::planner::engine_of(self.id()),
             };
-            // The pass binds on the engine its working sets live on.
-            let engine = super::working_set::kv_of(self, kv_lanes[0])?.engine;
-            let (devgeo, decode_envelope, geometry_class) = if state.is_some() {
+            let (devgeo, decode_envelope, geometry_class) = if float.is_none() {
                 let device_port_mask = crate::engine::get_spec(engine)?.device_geometry_port_mask;
                 let needs_mask_port = prog.bound.container.ports.iter().any(|binding| {
                     matches!(binding.port, eta_ir::registry::Port::AttnMask)
@@ -1693,11 +1281,12 @@ impl ProcessCtx {
                 let extern_binding = extern_bindings[dense]
                     .as_ref()
                     .map(|(name, dir)| (name.as_str(), *dir));
-                if let Err(error) =
-                    cell.lock()
-                        .unwrap()
-                        .attach(instance_id, &decls[dense], extern_binding)
-                {
+                if let Err(error) = cell.lock().unwrap().attach(
+                    instance_id,
+                    &decls[dense],
+                    writes(dense),
+                    extern_binding,
+                ) {
                     for attached in &cells {
                         attached.lock().unwrap().detach(instance_id);
                     }
@@ -1843,23 +1432,13 @@ impl ProcessCtx {
                 fires: None,
                 lanes,
                 kv_lanes,
-                max_layers: pass_max_layers,
-                block_draft: pass_block_draft,
                 rs_ws: rs_reps,
                 failed: None,
                 devgeo,
                 decode_envelope,
                 host_shadow,
-                lane: lane_facts,
-                float: float_rows.map(|rows| FloatLane {
-                    rows,
-                    clips: port_bindings
-                        .iter()
-                        .filter(|binding| binding.kind == ::engine::fire::PortKind::Voxels)
-                        .filter_map(|binding| binding.clip)
-                        .collect(),
-                    embed: embed.is_some(),
-                }),
+                facts,
+                float,
                 closed: false,
             };
             if let Err(error) = self.ctx().table.get_mut(&this)?.attach_bound(bound) {
@@ -1867,25 +1446,6 @@ impl ProcessCtx {
             }
             Ok(Ok(()))
         }
-    }
-
-    fn mint_scratch_working_set(&mut self) -> Anyhow<u32> {
-        let engine = crate::planner::engine_of(self.id());
-        let stores = crate::store::registry::get(0, engine);
-        let id = crate::store::registry::with_kv_lock(&stores.kv, "host-working-set", |kv| {
-            kv.create_working_set()
-        });
-        let ws = KvWorkingSet::new(0, engine, id, stores.kv_page_size);
-        self.register_kv_working_set(&ws);
-        Ok(self.ctx().table.push(ws)?.rep())
-    }
-
-    fn release_scratch_working_set(&mut self, rep: u32) -> Anyhow<()> {
-        let resource: Resource<KvWorkingSet> = Resource::new_own(rep);
-        let ws = self.ctx().table.delete(resource)?;
-        self.unregister_kv_working_set(ws.model, ws.engine, ws.id);
-        ws.release();
-        Ok(())
     }
 
     async fn core_drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {
@@ -1901,135 +1461,11 @@ impl ProcessCtx {
         }
 
         let mut pass = self.ctx().table.delete(this)?;
-        let scratch = pass
-            .bound()
-            .ok()
-            .filter(|bound| bound.float.is_some())
-            .map(|bound| bound.kv_lanes[0]);
         if let Ok(bound) = pass.bound_mut() {
             bound.close_native();
         }
-        drop(pass);
-        if let Some(rep) = scratch {
-            self.release_scratch_working_set(rep)?;
-        }
         Ok(())
     }
-}
-
-macro_rules! forward_pass_common {
-    ($kind:expr) => {
-        async fn new(&mut self) -> Anyhow<Resource<ForwardPass>> {
-            self.core_new($kind).await
-        }
-
-        async fn state(
-            &mut self,
-            this: Resource<ForwardPass>,
-            lanes: Vec<Resource<WorkingSet>>,
-            geom: pie::inferlet::forward::StateGeometry,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_state(this, lanes, geom).await
-        }
-
-        async fn media(
-            &mut self,
-            this: Resource<ForwardPass>,
-            spans: Vec<pie::inferlet::forward::MediaSpan>,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_media(this, spans).await
-        }
-
-        async fn embed(
-            &mut self,
-            this: Resource<ForwardPass>,
-            tokens: Resource<Channel>,
-            indptr: Resource<Channel>,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_embed(this, tokens, indptr).await
-        }
-
-        async fn readout(
-            &mut self,
-            this: Resource<ForwardPass>,
-            indices: Resource<Channel>,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_readout(this, indices).await
-        }
-
-        async fn set_max_layers(
-            &mut self,
-            this: Resource<ForwardPass>,
-            max_layers: u32,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_set_max_layers(this, max_layers).await
-        }
-
-        async fn program(
-            &mut self,
-            this: Resource<ForwardPass>,
-            container_bytes: Vec<u8>,
-            channels: Vec<Resource<Channel>>,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_program(this, container_bytes, channels).await
-        }
-
-        async fn drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {
-            self.core_drop(this).await
-        }
-
-        async fn reading(
-            &mut self,
-            this: Resource<ForwardPass>,
-            name: String,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_reading(this, name).await
-        }
-
-        async fn input(
-            &mut self,
-            this: Resource<ForwardPass>,
-            port: String,
-            ch: Resource<Channel>,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_input(this, port, ch).await
-        }
-
-        async fn stream(
-            &mut self,
-            this: Resource<ForwardPass>,
-            s: pie::inferlet::model::LaneStream,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_stream(this, s).await
-        }
-
-        async fn group(
-            &mut self,
-            this: Resource<ForwardPass>,
-            id: u32,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_group(this, id).await
-        }
-
-        async fn peer(
-            &mut self,
-            this: Resource<ForwardPass>,
-            group: u32,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_peer(this, group).await
-        }
-
-        async fn attention_classes(
-            &mut self,
-            this: Resource<ForwardPass>,
-            classes: Vec<i32>,
-            table: Vec<u8>,
-            count: u32,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_attention_classes(this, classes, table, count)
-                .await
-        }
-    };
 }
 
 impl pie::inferlet::forward::Host for ProcessCtx {
@@ -2047,7 +1483,18 @@ impl pie::inferlet::forward::Host for ProcessCtx {
 }
 
 impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
-    forward_pass_common!(PassKind::Text);
+    async fn new(&mut self) -> Anyhow<Resource<ForwardPass>> {
+        self.core_new().await
+    }
+
+    async fn state(
+        &mut self,
+        this: Resource<ForwardPass>,
+        lanes: Vec<Resource<WorkingSet>>,
+        geom: pie::inferlet::forward::StateGeometry,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_state(this, lanes, geom).await
+    }
 
     async fn checkpoints(
         &mut self,
@@ -2057,57 +1504,106 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         self.core_checkpoints(this, slots).await
     }
 
-    async fn set_drafting_block(
+    async fn media(
         &mut self,
         this: Resource<ForwardPass>,
-        on: bool,
+        lane: u32,
+        spans: Vec<pie::inferlet::forward::MediaSpan>,
     ) -> Anyhow<Result<(), String>> {
-        self.core_set_drafting_block(this, on).await
+        self.core_media(this, lane, spans).await
     }
-}
 
-impl pie::inferlet::forward_diffusion::Host for ProcessCtx {
-    async fn submit(
-        &mut self,
-        on: Resource<crate::pipeline::Pipeline>,
-        slots: Vec<Option<Resource<ForwardPass>>>,
-    ) -> Anyhow<Result<(), String>> {
-        self.core_submit(on, slots).await
-    }
-}
-
-impl pie::inferlet::forward_diffusion::HostForwardPass for ProcessCtx {
-    forward_pass_common!(PassKind::Diffusion);
-
-    async fn self_conditioning(
+    async fn embed(
         &mut self,
         this: Resource<ForwardPass>,
-        rows: Vec<u32>,
-        weights: Vec<f32>,
+        tokens: Resource<Channel>,
+        indptr: Resource<Channel>,
     ) -> Anyhow<Result<(), String>> {
-        self.core_self_conditioning(this, rows, weights).await
+        self.core_embed(this, tokens, indptr).await
     }
 
-    async fn self_conditioning_from(
+    async fn readout(
+        &mut self,
+        this: Resource<ForwardPass>,
+        indices: Resource<Channel>,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_readout(this, indices).await
+    }
+
+    async fn program(
+        &mut self,
+        this: Resource<ForwardPass>,
+        container_bytes: Vec<u8>,
+        channels: Vec<Resource<Channel>>,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_program(this, container_bytes, channels).await
+    }
+
+    async fn drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {
+        self.core_drop(this).await
+    }
+
+    async fn switch(
+        &mut self,
+        this: Resource<ForwardPass>,
+        lane: u32,
+        name: String,
+        value: String,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_switch(this, lane, name, value).await
+    }
+
+    async fn input(
+        &mut self,
+        this: Resource<ForwardPass>,
+        lane: u32,
+        name: String,
+        ch: Resource<Channel>,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_input(this, lane, name, ch).await
+    }
+
+    async fn group(
+        &mut self,
+        this: Resource<ForwardPass>,
+        lane: u32,
+        id: u32,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_group(this, lane, id).await
+    }
+
+    async fn mask(
         &mut self,
         this: Resource<ForwardPass>,
         rows: Resource<Channel>,
-        weights: Resource<Channel>,
     ) -> Anyhow<Result<(), String>> {
-        self.core_self_conditioning_from(this, rows, weights).await
+        self.core_mask(this, rows).await
     }
+}
 
-    async fn canvas(
-        &mut self,
-        this: Resource<ForwardPass>,
-        mode: pie::inferlet::forward_diffusion::Mode,
-    ) -> Anyhow<Result<(), String>> {
-        use pie::inferlet::forward_diffusion::Mode;
-        let mode = match mode {
-            Mode::Encode => CanvasMode::Encode,
-            Mode::Denoise => CanvasMode::Denoise,
-        };
-        self.core_canvas(this, mode).await
+fn lane_index(lane: u32) -> Result<usize, String> {
+    let max = crate::engine::get_spec(0)
+        .map_err(|error| error.to_string())?
+        .limits
+        .max_forward_requests;
+    match usize::try_from(lane) {
+        Ok(lane) if lane < max => Ok(lane),
+        _ => Err(format!(
+            "lane {lane} is past the {max} lanes one fire carries"
+        )),
+    }
+}
+
+fn eta_readout(readout: poem_ir::Readout) -> eta_ir::registry::Readout {
+    use eta_ir::registry::ReadoutKind as Kind;
+    eta_ir::registry::Readout {
+        kind: match readout.kind {
+            poem_ir::ReadoutKind::Logits => Kind::Logits,
+            poem_ir::ReadoutKind::Velocity => Kind::Velocity,
+            poem_ir::ReadoutKind::Hidden => Kind::Hidden,
+            poem_ir::ReadoutKind::Pixels => Kind::Pixels,
+        },
+        width: readout.width,
     }
 }
 
@@ -2128,30 +1624,31 @@ fn envelope_runs_ahead(
 
 #[cfg(test)]
 mod tests {
-    use super::{port_rows, state_rebind_diff, validate_port_channel};
-    use crate::pipeline::instance::{PortBinding, StateBinding};
+    use super::{input_rows, state_rebind_diff, validate_input_channel};
+    use crate::pipeline::instance::{InputBinding, StateBinding};
     use eta_ir::types::Dtype;
 
-    fn port(
+    fn input(
         name: &'static str,
-        kind: poem::generative::PortKind,
+        axis: poem_ir::InputAxis,
         width: u32,
-    ) -> poem::generative::PortFact {
-        poem::generative::PortFact {
+        dtype: poem_ir::Dtype,
+    ) -> poem_ir::InputDecl {
+        poem_ir::InputDecl {
             name: name.to_string(),
-            kind,
+            axis,
             width,
-            streams: Vec::new(),
-            at: None,
+            dtype,
             rows: None,
+            mask: 0,
+            readers: Vec::new(),
         }
     }
 
-    fn bound(name: &str, kind: ::engine::fire::PortKind, rows: Option<u32>) -> PortBinding {
-        PortBinding {
+    fn bound(name: &str, rows: Option<u32>) -> InputBinding {
+        InputBinding {
             name: name.to_string(),
-            kind,
-            port: 0,
+            id: 0,
             channel_rep: 1,
             channel_id: ::engine::ChannelId(1),
             rows,
@@ -2161,63 +1658,67 @@ mod tests {
 
     #[test]
     fn forward_every_case() {
-        a_port_channel_is_validated_against_its_fact();
-        a_pass_s_row_ports_agree_on_their_rows();
+        an_input_channel_is_validated_against_its_declaration();
+        a_lane_s_row_inputs_agree_on_their_rows();
         a_rebind_changes_working_sets_not_geometry();
     }
 
-    fn a_port_channel_is_validated_against_its_fact() {
-        let latents = port("latents", poem::generative::PortKind::Latents, 64);
+    fn an_input_channel_is_validated_against_its_declaration() {
+        use poem_ir::InputAxis::{Lane, Row, Voxel};
+        let latents = input("latents", Row, 64, poem_ir::Dtype::Bf16);
         assert_eq!(
-            validate_port_channel(&latents, &[256, 64], Dtype::F32),
-            Ok(Some(256))
+            validate_input_channel(&latents, &[256, 64], Dtype::F32),
+            Ok((Some(256), None))
         );
         assert!(
-            validate_port_channel(&latents, &[256, 32], Dtype::F32)
+            validate_input_channel(&latents, &[256, 32], Dtype::F32)
                 .unwrap_err()
                 .contains("`latents`")
         );
-        assert!(validate_port_channel(&latents, &[256 * 64], Dtype::F32).is_err());
-        assert!(validate_port_channel(&latents, &[0, 64], Dtype::F32).is_err());
+        assert!(validate_input_channel(&latents, &[256 * 64], Dtype::F32).is_err());
+        assert!(validate_input_channel(&latents, &[0, 64], Dtype::F32).is_err());
         assert!(
-            validate_port_channel(&latents, &[256, 64], Dtype::I32)
+            validate_input_channel(&latents, &[256, 64], Dtype::I32)
                 .unwrap_err()
-                .contains("f32")
+                .contains("F32")
         );
 
-        let timestep = port("timestep", poem::generative::PortKind::LaneVector, 1);
-        assert_eq!(validate_port_channel(&timestep, &[1], Dtype::F32), Ok(None));
+        let timestep = input("timestep", Lane, 1, poem_ir::Dtype::F32);
         assert_eq!(
-            validate_port_channel(&timestep, &[1, 1], Dtype::F32),
-            Ok(None)
+            validate_input_channel(&timestep, &[1], Dtype::F32),
+            Ok((None, None))
         );
-        assert!(validate_port_channel(&timestep, &[2], Dtype::F32).is_err());
+        assert!(validate_input_channel(&timestep, &[1, 1], Dtype::F32).is_err());
+        assert!(validate_input_channel(&timestep, &[2], Dtype::F32).is_err());
 
-        let positions = port("positions", poem::generative::PortKind::AxisPositions, 3);
+        let ids = input("self_cond_ids", Row, 4, poem_ir::Dtype::I32);
         assert_eq!(
-            validate_port_channel(&positions, &[256, 3], Dtype::F32),
-            Ok(Some(256))
+            validate_input_channel(&ids, &[16, 4], Dtype::I32),
+            Ok((Some(16), None))
+        );
+        assert!(validate_input_channel(&ids, &[16, 4], Dtype::F32).is_err());
+
+        let latent = input("latent", Voxel, 16, poem_ir::Dtype::Bf16);
+        assert_eq!(
+            validate_input_channel(&latent, &[3, 4, 16], Dtype::F32),
+            Ok((None, Some([1, 3, 4])))
+        );
+        assert_eq!(
+            validate_input_channel(&latent, &[2, 3, 4, 16], Dtype::F32),
+            Ok((None, Some([2, 3, 4])))
         );
     }
 
-    fn a_pass_s_row_ports_agree_on_their_rows() {
-        use ::engine::fire::PortKind;
+    fn a_lane_s_row_inputs_agree_on_their_rows() {
         let agree = [
-            bound("latents", PortKind::Latents, Some(256)),
-            bound("positions", PortKind::AxisPositions, Some(256)),
-            bound("timestep", PortKind::LaneVector, None),
-            bound("context", PortKind::Context, Some(77)),
+            bound("latents", Some(256)),
+            bound("positions", Some(256)),
+            bound("timestep", None),
         ];
-        assert_eq!(port_rows(&agree), Ok(Some(256)));
-        let disagree = [
-            bound("latents", PortKind::Latents, Some(256)),
-            bound("positions", PortKind::AxisPositions, Some(128)),
-        ];
-        assert!(port_rows(&disagree).unwrap_err().contains("`positions`"));
-        assert_eq!(
-            port_rows(&[bound("timestep", PortKind::LaneVector, None)]),
-            Ok(None)
-        );
+        assert_eq!(input_rows(&agree), Ok(Some(256)));
+        let disagree = [bound("latents", Some(256)), bound("positions", Some(128))];
+        assert!(input_rows(&disagree).unwrap_err().contains("`positions`"));
+        assert_eq!(input_rows(&[bound("timestep", None)]), Ok(None));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2322,7 +1823,6 @@ mod tests {
             positions: Some(3),
             slots: None,
             kv_len: Some(4),
-            mask: Some(5),
             fold: Some(6),
         };
         let forks = StateBinding {

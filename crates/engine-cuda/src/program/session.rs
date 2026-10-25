@@ -3,7 +3,7 @@ use std::sync::Arc;
 use engine::ports::Envelope;
 use eta_exec::{ExecPlan, Extents};
 use eta_ir::container::HostRole;
-use eta_ir::registry::{GeometryClass, Port};
+use eta_ir::registry::{GeometryClass, Port, Stage as Attach};
 use eta_ir::validate::Direction;
 use kernels_cuda::runtime::channel::{self, PublishLane, PullLane, SettleLane, Ticket};
 
@@ -33,6 +33,7 @@ pub enum Launched {
 #[derive(Clone, Copy, Debug)]
 struct Intrinsic {
     id: eta_ir::op::IntrinsicId,
+    lane: u32,
     base: u64,
     storage: u32,
     width: u32,
@@ -46,8 +47,8 @@ pub struct Session {
     shapes: Vec<ChannelShape>,
     cursors: Vec<Cursor>,
     extents: Extents,
+    /// Indexed by [`eta_ir::op::intrinsic_slot`].
     intrinsics: Vec<Option<Intrinsic>>,
-    bound: u64,
     poisoned: bool,
     fires: u64,
     /// A commit slot (two words the device writes) for each fire airborne
@@ -105,8 +106,15 @@ impl Session {
             shapes,
             cursors,
             extents,
-            intrinsics: vec![None; super::launch::INTRINSIC_SLOTS],
-            bound: 0,
+            intrinsics: vec![
+                None;
+                plan.package
+                    .plans
+                    .iter()
+                    .map(|plan| plan.intrinsic_pitch as usize)
+                    .max()
+                    .unwrap_or(0)
+            ],
             poisoned: false,
             fires: 0,
             commits: Vec::new(),
@@ -125,11 +133,7 @@ impl Session {
                 }
                 continue;
             }
-            let shared = session
-                .rings
-                .endpoint(*channel as usize)
-                .filter(|endpoint| endpoint.role() == HostRole::None);
-            if let Some(endpoint) = shared
+            if let Some(endpoint) = session.rings.endpoint(*channel as usize)
                 && !endpoint.claim_seeding()
             {
                 continue;
@@ -363,32 +367,38 @@ impl Session {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn bind_intrinsic(
         &mut self,
         intrinsic: eta_ir::op::IntrinsicId,
+        lane: u32,
         base: u64,
         storage: u32,
         width: u32,
         row_stride: u32,
         row_offset: u32,
     ) -> Result<()> {
-        let slot = intrinsic as usize;
-        let seat = self.intrinsics.get_mut(slot).ok_or_else(|| {
-            Fault::program(
-                "program::session",
-                format!("intrinsic {slot} is past the pitch the side tables are indexed with"),
-            )
-        })?;
+        let slot = eta_ir::op::intrinsic_slot(intrinsic, lane) as usize;
+        let Some(seat) = self.intrinsics.get_mut(slot) else {
+            // A lane no stage of the program reads an intrinsic of.
+            return Ok(());
+        };
         *seat = Some(Intrinsic {
             id: intrinsic,
+            lane,
             base,
             storage,
             width,
             row_stride,
             row_offset,
         });
-        self.bound |= 1u64 << (intrinsic as u32);
         Ok(())
+    }
+
+    fn bound(&self, intrinsic: eta_ir::op::IntrinsicId, lane: u32) -> bool {
+        self.intrinsics
+            .get(eta_ir::op::intrinsic_slot(intrinsic, lane) as usize)
+            .is_some_and(Option::is_some)
     }
 
     #[must_use]
@@ -396,11 +406,13 @@ impl Session {
         self.extents
     }
 
+    
     pub fn stage(
         &mut self,
         compiled: &Compiled,
         plan: &ExecPlan,
         wave: &mut Wave,
+        at: Attach,
     ) -> Result<Launched> {
         if self.poisoned {
             return Ok(Launched::Refused(Fired::Faulted(
@@ -408,101 +420,15 @@ impl Session {
             )));
         }
         stages_and_plans_agree(compiled)?;
-
-        for (intrinsic, name, why) in [
-            (
-                eta_ir::op::IntrinsicId::Logits,
-                "logits",
-                "the emitted kernel dereferences the side table's zero, which is address zero",
-            ),
-            (
-                eta_ir::op::IntrinsicId::Velocity,
-                "velocity",
-                "the lane's reading plants no `velocity` export",
-            ),
-            (
-                eta_ir::op::IntrinsicId::Hidden,
-                "hidden",
-                "the lane's reading plants no `hidden` export",
-            ),
-        ] {
-            if plan.reads_intrinsic(intrinsic) && self.bound & (1u64 << (intrinsic as u32)) == 0 {
-                return Err(Fault::program(
-                    "program::session",
-                    format!(
-                        "this program reads the `{name}` intrinsic and no buffer has been bound \
-                         to it; {why}"
-                    ),
-                ));
-            }
+        if at != Attach::Prologue {
+            self.intrinsics_bound(plan)?;
         }
-        if plan.needs_mtp_logits
-            && self.bound & (1u64 << (eta_ir::op::IntrinsicId::MtpLogits as u32)) == 0
-        {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the `mtp_logits` intrinsic and no buffer has \
-                 been bound to it; a model whose text declares no `mtp` export has \
-                 no draft column for it to point at",
-            ));
-        }
-
-        if plan.needs_mtp_drafts
-            && self.bound & (1u64 << (eta_ir::op::IntrinsicId::MtpDrafts as u32)) == 0
-        {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the `mtp_drafts` intrinsic and no buffer has \
-                 been bound to it; a model whose text plants no `mtp.drafts` export \
-                 has no token plane for it to point at",
-            ));
-        }
-
-        if plan.needs_attn_scores
-            && self.bound & (1u64 << (eta_ir::op::IntrinsicId::AttnScore as u32)) == 0
-        {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the `attn_score` intrinsic and no buffer has been \
-                 bound to it; a lane that did not ask to capture its attention has no \
-                 block of the observability slab for it to point at",
-            ));
-        }
-
-        if self.bound & (1u64 << (eta_ir::op::IntrinsicId::Pixels as u32)) == 0
-            && plan
-                .package
-                .values
-                .iter()
-                .any(|value| value.intrinsic == Some(eta_ir::op::IntrinsicId::Pixels))
-        {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the `pixels` intrinsic and no buffer has been                  bound to it; a lane whose reading plants no `pixels` seam — or a                  fire that submitted no clip — has no pixel plane for it to point at",
-            ));
-        }
-
-        if self.bound & (1u64 << (eta_ir::op::IntrinsicId::PeerVelocity as u32)) == 0
-            && plan
-                .package
-                .values
-                .iter()
-                .any(|value| value.intrinsic == Some(eta_ir::op::IntrinsicId::PeerVelocity))
-        {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the `peer_velocity` intrinsic and no buffer has \
-                 been bound to it; the pass named no peer group (`forward-pass.peer`), \
-                 so there is no second denoising in this fire to guide with",
-            ));
-        }
-
-        if let Some(blocked) = self.blocked_channel(plan) {
+        if let Some(blocked) = self.blocked_at(plan, at) {
             return Ok(Launched::Refused(Fired::Blocked(blocked)));
         }
 
         let slot = self.free_commit()?;
-        let minted = match self.mint(plan, wave, slot) {
+        let minted = match self.mint(plan, wave, slot, at) {
             Ok(minted) => minted,
             Err(why) => {
                 self.poisoned = true;
@@ -514,17 +440,82 @@ impl Session {
         Ok(Launched::Airborne)
     }
 
-    pub fn take_lane(&mut self, stages: &mut [Option<Prepared>]) -> Result<()> {
+    /// An unbound intrinsic would make the emitted kernel dereference the side table's zero.
+    fn intrinsics_bound(&self, plan: &ExecPlan) -> Result<()> {
+        if plan.reads_intrinsic(eta_ir::op::IntrinsicId::Logits)
+            && !self.bound(eta_ir::op::IntrinsicId::Logits, 0)
+        {
+            return Err(Fault::program(
+                "program::session",
+                "this program reads the `logits` intrinsic and no buffer has been bound to \
+                 it; the emitted kernel dereferences the side table's zero, which is address \
+                 zero",
+            ));
+        }
+        for value in &plan.package.values {
+            let (Some(intrinsic), lane) = (value.intrinsic, value.lane) else {
+                continue;
+            };
+            let why = match intrinsic {
+                eta_ir::op::IntrinsicId::Velocity => "its class plants no `velocity` export",
+                eta_ir::op::IntrinsicId::Hidden => "its class plants no `hidden` export",
+                eta_ir::op::IntrinsicId::Pixels => {
+                    "its class plants no `pixels` seam, or the fire submitted no clip"
+                }
+                _ => continue,
+            };
+            if !self.bound(intrinsic, lane) {
+                return Err(Fault::program(
+                    "program::session",
+                    format!(
+                        "this program reads the `{}` intrinsic of its pass's lane {lane} and no \
+                         buffer has been bound to it: the pass has no such lane, or {why}",
+                        intrinsic.name()
+                    ),
+                ));
+            }
+        }
+        if plan.needs_mtp_logits && !self.bound(eta_ir::op::IntrinsicId::MtpLogits, 0) {
+            return Err(Fault::program(
+                "program::session",
+                "this program reads the `mtp_logits` intrinsic and no buffer has \
+                 been bound to it; a model whose text declares no `mtp` export has \
+                 no draft column for it to point at",
+            ));
+        }
+
+        if plan.needs_mtp_drafts && !self.bound(eta_ir::op::IntrinsicId::MtpDrafts, 0) {
+            return Err(Fault::program(
+                "program::session",
+                "this program reads the `mtp_drafts` intrinsic and no buffer has \
+                 been bound to it; a model whose text plants no `mtp.drafts` export \
+                 has no token plane for it to point at",
+            ));
+        }
+
+        if plan.needs_attn_scores && !self.bound(eta_ir::op::IntrinsicId::AttnScore, 0) {
+            return Err(Fault::program(
+                "program::session",
+                "this program reads the `attn_score` intrinsic and no buffer has been \
+                 bound to it; a lane that did not ask to capture its attention has no \
+                 block of the observability slab for it to point at",
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn take_lane(&mut self, stages: Vec<&mut Prepared>) -> Result<()> {
         let Some(minted) = self.pending.back() else {
             return Ok(());
         };
         let commit = self.commits[minted.slot].device();
-        for prepared in stages.iter_mut().flatten() {
+        for prepared in stages {
             let lane = prepared.stage_lane(&self.rings, &minted.before, commit)?;
             for intrinsic in self.intrinsics.iter().flatten() {
                 prepared.bind_intrinsic(
                     lane,
-                    intrinsic.id,
+                    eta_ir::op::intrinsic_slot(intrinsic.id, intrinsic.lane),
                     intrinsic.base,
                     intrinsic.storage,
                     intrinsic.width,
@@ -565,7 +556,9 @@ impl Session {
     /// The shared rings this instance's stages put.
     pub fn shared_puts<'p>(&'p self, plan: &'p ExecPlan) -> impl Iterator<Item = usize> + 'p {
         (0..self.shapes.len()).filter_map(move |channel| {
-            if !plan.puts_channel(channel as u32) {
+            if !plan.puts_channel(channel as u32, Attach::Prologue)
+                && !plan.puts_channel(channel as u32, Attach::Epilogue)
+            {
                 return None;
             }
             self.rings
@@ -575,23 +568,37 @@ impl Session {
         })
     }
 
-    /// Shared rings whose cells the host reads to resolve descriptor ports under
-    /// `class` ([`Self::envelope`]); not the tokens' ring where the device copies
-    /// them ([`Self::token_device_source`]).
-    pub fn host_resolved_rings(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<usize> {
+    
+    fn host_resolved_channels(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<u32> {
         let tokens_on_device = self.token_device_source(plan, class).is_some();
         plan.package
             .ports
             .iter()
             .filter(|binding| !binding.is_const && engine::ports::resolves(class, binding.port))
             .filter(|binding| !(binding.port == Port::EmbedTokens && tokens_on_device))
-            .filter_map(|binding| {
+            .map(|binding| binding.channel)
+            .collect()
+    }
+
+    
+    pub fn host_resolved_rings(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<usize> {
+        self.host_resolved_channels(plan, class)
+            .into_iter()
+            .filter_map(|channel| {
                 self.rings
-                    .endpoint(binding.channel as usize)
+                    .endpoint(channel as usize)
                     .filter(|endpoint| endpoint.role() == HostRole::None)
                     .map(|endpoint| Arc::as_ptr(endpoint) as usize)
             })
             .collect()
+    }
+
+    
+    #[must_use]
+    pub fn resolves_prologue_put(&self, plan: &ExecPlan, class: GeometryClass) -> bool {
+        self.host_resolved_channels(plan, class)
+            .into_iter()
+            .any(|channel| plan.puts_channel(channel, Attach::Prologue))
     }
 
     fn mint(
@@ -599,6 +606,7 @@ impl Session {
         plan: &ExecPlan,
         wave: &mut Wave,
         slot: usize,
+        at: Attach,
     ) -> std::result::Result<Minted, String> {
         let before = self.cursors_now();
         let mut next = before.clone();
@@ -624,9 +632,9 @@ impl Session {
             if cursor.tail < cursor.head {
                 return Err(format!("channel {channel}: tail precedes head at mint"));
             }
-            let takes = plan.takes_channel(slot);
-            let puts = plan.puts_channel(slot);
-            let addresses_head = takes || plan.reads_channel(slot);
+            let takes = plan.takes_channel(slot, at);
+            let puts = plan.puts_channel(slot, at);
+            let addresses_head = takes || plan.reads_channel(slot, at);
 
             let shared = self
                 .rings
@@ -684,7 +692,7 @@ impl Session {
                     flags |= Ticket::HOST_READER;
                 }
             }
-            if plan.requires_channel_input(slot) {
+            if plan.requires_channel_input(slot, at) {
                 flags |= Ticket::REQUIRE_INPUT;
             }
             if moved_head && endpoint.engine_owns_head() {
@@ -850,14 +858,17 @@ impl Session {
         None
     }
 
+    
     #[must_use]
     pub fn blocked_channel(&self, plan: &ExecPlan) -> Option<u32> {
+        self.blocked_at(plan, Attach::Prologue)
+            .or_else(|| self.blocked_at(plan, Attach::Epilogue))
+    }
+
+    #[must_use]
+    pub fn blocked_at(&self, plan: &ExecPlan, at: Attach) -> Option<u32> {
         for channel in 0..self.shapes.len() {
-            let readiness = plan
-                .package
-                .channels
-                .get(channel)
-                .and_then(|declared| declared.readiness);
+            let readiness = plan.readiness(channel as u32, at);
             let live = self.depth(channel as u32);
             let capacity = u64::from(self.shapes[channel].capacity);
             let ready = match readiness {

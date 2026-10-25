@@ -1,22 +1,16 @@
 """
-`inferlet.eta.diffusion` — the diffusion pass's reading (`Mode`) and the
-reference sampler pieces, a port of `inferlet::eta::diffusion`. The pass
-itself is `ForwardPass(ForwardKind.DIFFUSION)` with `canvas(Mode.DENOISE)`
-and `self_conditioning(rows, weights)`.
+`inferlet.eta.diffusion` — a block-diffusion text's reference sampler
+pieces (which canvas positions to accept, at what temperature), a port of
+`inferlet::eta::diffusion`. The pass itself is an ordinary `ForwardPass` set
+to the model's canvas path by `switch`.
 """
 
 from __future__ import annotations
 
-from wit_world.imports import forward_diffusion as _wit_diffusion
-
 from .value import Tensor, and_, cast, cumsum, eq, iota, le, lt, neg, reduce_sum, scatter_set, sort_desc
 from .ir import Dtype
 
-Mode = _wit_diffusion.Mode
-"""`ENCODE` (causal, writes the sequence) or `DENOISE` (bidirectional over
-the canvas, scratch KV)."""
-
-__all__ = ["Mode", "linear_temperature", "entropy_bound_accept", "stable_and_confident"]
+__all__ = ["linear_temperature", "entropy_bound_accept", "stable_and_confident"]
 
 
 def linear_temperature(remaining: int, max_steps: int, t_max: float, t_min: float) -> float:

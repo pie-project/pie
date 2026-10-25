@@ -150,16 +150,15 @@ pub fn split_rows(x: &Value, width: u32) -> (Value, Value) {
     (left, right)
 }
 
-/// The rows of `x` at `rows`; a value of one axis (a row's token) gathers to
-/// one axis too.
+/// The rows of `x` at `rows`; a one-axis `rows` (a row's token) gathers to one axis.
 pub fn gather_rows(x: &Value, rows: &Value) -> Value {
     let r = x.rec();
     let y = r.fresh(match x.ty() {
         Ty::Tensor { shape, dtype } if shape.len() == 1 => Ty::Tensor {
-            shape: vec![Dim::Readouts],
+            shape: vec![rows.rows()],
             dtype: *dtype,
         },
-        _ => tensor(Dim::Readouts, x.width(), x.dtype()),
+        _ => tensor(rows.rows(), x.width(), x.dtype()),
     });
     r.push(
         Gather::Rows {
@@ -168,6 +167,77 @@ pub fn gather_rows(x: &Value, rows: &Value) -> Value {
             y: y.id(),
         },
         &[x, rows],
+    );
+    y
+}
+
+/// Per row of `lanes`, how many rows `csr` packs in its lane's group, `[rows, 1]` f32.
+pub fn group_rows(csr: &Value, groups: &Value, lanes: &Value) -> Value {
+    for (what, v, rows) in [
+        ("csr", csr, Dim::LanesPlus(1)),
+        ("groups", groups, Dim::Lanes),
+    ] {
+        assert!(
+            v.rows() == rows && v.dtype() == Dtype::I32,
+            "`gather::group_rows`'s {what} is a {rows:?} i32 table, not {:?}",
+            v.ty()
+        );
+    }
+    assert!(
+        lanes.rows().axis() == Some(poem_ir::RowAxis::Tokens) && lanes.dtype() == Dtype::I32,
+        "`gather::group_rows` counts for each token row's lane, not {:?}",
+        lanes.ty()
+    );
+    let r = lanes.rec();
+    let y = r.fresh(tensor(lanes.rows(), 1u64, Dtype::F32));
+    r.push(
+        Gather::GroupRows {
+            csr: csr.id(),
+            groups: groups.id(),
+            lanes: lanes.id(),
+            y: y.id(),
+        },
+        // The indptr is fire-wide: the count lands on `lanes`' rows.
+        &[groups, lanes],
+    );
+    y
+}
+
+/// Per row of `lanes`, the first row of `x` packed in its lane's group, `[rows, x.width]` f32;
+/// zeros where the group packs none.
+pub fn group_first(x: &Value, csr: &Value, groups: &Value, lanes: &Value) -> Value {
+    for (what, v, rows) in [
+        ("csr", csr, Dim::LanesPlus(1)),
+        ("groups", groups, Dim::Lanes),
+    ] {
+        assert!(
+            v.rows() == rows && v.dtype() == Dtype::I32,
+            "`gather::group_first`'s {what} is a {rows:?} i32 table, not {:?}",
+            v.ty()
+        );
+    }
+    assert!(
+        lanes.rows().axis() == Some(poem_ir::RowAxis::Tokens) && lanes.dtype() == Dtype::I32,
+        "`gather::group_first` reads for each token row's lane, not {:?}",
+        lanes.ty()
+    );
+    assert!(
+        x.dtype() == Dtype::F32 && matches!(x.ty(), Ty::Tensor { shape, .. } if shape.len() == 2),
+        "`gather::group_first` reads f32 rows, not {:?}",
+        x.ty()
+    );
+    let r = lanes.rec();
+    let y = r.fresh(tensor(lanes.rows(), x.width(), Dtype::F32));
+    r.push(
+        Gather::GroupFirst {
+            x: x.id(),
+            csr: csr.id(),
+            groups: groups.id(),
+            lanes: lanes.id(),
+            y: y.id(),
+        },
+        // Fire-wide tables: the value lands on `lanes`' rows.
+        &[groups, lanes],
     );
     y
 }

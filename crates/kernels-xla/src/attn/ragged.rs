@@ -18,17 +18,8 @@ use crate::tensor::{Landing, Operand, Stored};
 pub enum RaggedMask<T> {
     /// Segments only (poem_ir `None` and `GroupBlockDiagonal`).
     Segments,
-    /// A row with tag `t >= 0` reads only keys tagged `t`; a negative tag
-    /// reads its whole segment. One i32 per query row / key row.
-    ReferenceTags { q_tags: T, kv_tags: T },
-    /// `q_classes[q] < 0 || kv_classes[k] < 0 || table[q_class · count +
-    /// kv_class] != 0` admits a pair (kernels-cuda's lane class table).
-    ClassTable {
-        q_classes: T,
-        kv_classes: T,
-        table: T,
-        count: u32,
-    },
+    /// Segment `s`'s pair `(q, k)` is kept where bit `q · kv_len + k` from byte `indptr[s]` is set.
+    Custom { bits: T, indptr: T },
     /// Adds `table[h, clamp(k − q + max_len − 1)]` (f32, `[q_heads, 2·max_len
     /// − 1]`) to the scaled logit, `k`/`q` indexed within the segment.
     RelativeBias { table: T, max_len: u32 },
@@ -40,20 +31,9 @@ impl<T> RaggedMask<T> {
     pub fn try_map<U, E>(self, mut f: impl FnMut(T) -> Result<U, E>) -> Result<RaggedMask<U>, E> {
         Ok(match self {
             Self::Segments => RaggedMask::Segments,
-            Self::ReferenceTags { q_tags, kv_tags } => RaggedMask::ReferenceTags {
-                q_tags: f(q_tags)?,
-                kv_tags: f(kv_tags)?,
-            },
-            Self::ClassTable {
-                q_classes,
-                kv_classes,
-                table,
-                count,
-            } => RaggedMask::ClassTable {
-                q_classes: f(q_classes)?,
-                kv_classes: f(kv_classes)?,
-                table: f(table)?,
-                count,
+            Self::Custom { bits, indptr } => RaggedMask::Custom {
+                bits: f(bits)?,
+                indptr: f(indptr)?,
             },
             Self::RelativeBias { table, max_len } => RaggedMask::RelativeBias {
                 table: f(table)?,
@@ -127,30 +107,15 @@ pub fn forward(
             }
             span as i64
         }
-        RaggedMask::ReferenceTags { q_tags, kv_tags } => {
-            for (t, n) in [(q_tags, q.rows), (kv_tags, k.rows)] {
-                if t.dtype != Dtype::I32 || t.elements() < u64::from(n) {
-                    return Err(refuse(OP, "a tag table is one i32 per row"));
-                }
+        RaggedMask::Custom { bits, indptr } => {
+            if !matches!(bits.dtype, Dtype::U8 | Dtype::Bool) || bits.elements() == 0 {
+                return Err(refuse(OP, "a custom mask's bits are u8"));
             }
-            0
-        }
-        RaggedMask::ClassTable {
-            q_classes,
-            kv_classes,
-            table,
-            count,
-        } => {
-            for (t, n) in [(q_classes, q.rows), (kv_classes, k.rows)] {
-                if t.dtype != Dtype::I32 || t.elements() < u64::from(n) {
-                    return Err(refuse(OP, "a class table is one i32 per row"));
-                }
-            }
-            nonzero(OP, "the class count", count)?;
-            if !matches!(table.dtype, Dtype::U8 | Dtype::Bool)
-                || table.elements() < u64::from(count) * u64::from(count)
-            {
-                return Err(refuse(OP, "the class table is count x count u8"));
+            if indptr.dtype != Dtype::I32 || indptr.elements() < entries {
+                return Err(refuse(
+                    OP,
+                    "a custom mask states one i32 byte offset per segment",
+                ));
             }
             0
         }
@@ -171,33 +136,15 @@ pub fn forward(
     let ki = flat_i32(f, ki)?;
     let ki = head(f, ki, segments + 1)?;
     let mut rule = Rule::default();
-    let mut tags = None;
-    let mut classes = None;
+    let mut starts = None;
     match mask {
         RaggedMask::Segments => {}
-        RaggedMask::ReferenceTags { q_tags, kv_tags } => {
-            let a = q_tags.val;
-            let a = flat_i32(f, a)?;
-            tags = Some(head(f, a, r)?);
-            let b = kv_tags.val;
-            let b = flat_i32(f, b)?;
-            rule.kv_tags = Some(head(f, b, nk)?);
-        }
-        RaggedMask::ClassTable {
-            q_classes,
-            kv_classes,
-            table,
-            count,
-        } => {
-            let a = q_classes.val;
-            let a = flat_i32(f, a)?;
-            classes = Some(head(f, a, r)?);
-            let b = kv_classes.val;
-            let b = flat_i32(f, b)?;
-            let b = head(f, b, nk)?;
-            let t = table.val;
-            let t = flat_i32(f, t)?;
-            rule.classes = Some((b, t, i64::from(count)));
+        RaggedMask::Custom { bits, indptr } => {
+            let b = bits.val;
+            rule.bits = Some(flat_i32(f, b)?);
+            let m = indptr.val;
+            let m = flat_i32(f, m)?;
+            starts = Some(head(f, m, segments + 1)?);
         }
         RaggedMask::RelativeBias { table, max_len } => {
             let t = table.val;
@@ -223,11 +170,20 @@ pub fn forward(
     let hi = fq.select(inside, hi, z)?;
     let q4 = fq.reshape(qv, &[r, heads.kvh, heads.g, heads.d])?;
     let mut rows = Rows::new(q4, lo, hi);
-    rows.tag = tags;
-    rows.class = classes;
     if rule.rbias.is_some() {
         let io = fq.iota(Elem::I32, &[r], 0);
         rows.qi = Some(fq.sub(io, qlo)?);
+        rows.begin = Some(lo);
+    }
+    if let Some(starts) = starts {
+        // A row's first key stands at bit `8 · indptr[s] + qo · kv_len`.
+        let io = fq.iota(Elem::I32, &[r], 0);
+        let qo = fq.sub(io, qlo)?;
+        let len = fq.sub(hi, lo)?;
+        let at = fq.mul(qo, len)?;
+        let byte = super::paged::take(fq, starts, sc)?;
+        let byte = super::paged::with_i(fq, byte, 8, Func::mul)?;
+        rows.bit = Some(fq.add(byte, at)?);
         rows.begin = Some(lo);
     }
     let planes = Planes::Plain { k: kv, v: vv };

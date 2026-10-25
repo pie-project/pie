@@ -1,6 +1,6 @@
 use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
-use eta_ir::registry::{ModelProfile, Port};
-use eta_ir::validate::{BoundTrace, bind};
+use eta_ir::registry::{EngineCaps, Graph, Port, Readout, ReadoutKind};
+use eta_ir::validate::BoundTrace;
 
 use eta_dsl::builder::Builder;
 use eta_dsl::prelude::*;
@@ -79,13 +79,30 @@ fn build_designb() -> Traced {
     b.build().expect("design B beam epilogue binds")
 }
 
-fn beam_profile() -> ModelProfile {
-    ModelProfile {
-        vocab: V,
-        page_size: PAGE_T,
-        num_layers: 2,
-        ..ModelProfile::dummy()
-    }
+fn served(
+    container: eta_ir::container::TraceContainer,
+    lanes: Vec<Option<Readout>>,
+    num_layers: u32,
+) -> Result<eta_ir::validate::BoundTrace, eta_ir::validate::ValidateError> {
+    eta_ir::validate::bind(
+        container,
+        lanes,
+        Graph {
+            num_layers,
+            ..Graph::default()
+        },
+        EngineCaps {
+            lora: true,
+            attn_page_mask: true,
+        },
+    )
+}
+
+fn logits_lane(vocab: u32) -> Vec<Option<Readout>> {
+    vec![Some(Readout {
+        kind: ReadoutKind::Logits,
+        width: vocab,
+    })]
 }
 
 fn u32s(v: &[u32]) -> Value {
@@ -137,7 +154,7 @@ fn harvest(inst: &mut Instance, bound: &BoundTrace) -> Harvest {
 #[test]
 fn golden_designb_fork_from_shared_prefix() {
     let traced = build_designb();
-    let bound = bind(traced.container().clone(), beam_profile()).unwrap();
+    let bound = served(traced.container().clone(), logits_lane(V), 2).unwrap();
 
     let seeds: Vec<(u32, Value)> = vec![
         (0, mask_of(&[&[0, 1], &[0, 1]])),

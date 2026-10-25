@@ -13,6 +13,7 @@
 //! write, refuse rather than approximate.
 
 pub mod attn;
+pub mod conv;
 pub mod csl;
 pub mod cx;
 pub mod elemwise;

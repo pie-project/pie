@@ -31,6 +31,9 @@ struct Params {
 #endif
     uint rows;
     uint row_span;
+    // `x`'s and `y`'s row 0 in the grids' fire-wide rows (a segmented fire's window starts later).
+    uint x_base;
+    uint y_base;
 };
 PIE_PARAMS(4, Params, params);
 
@@ -100,11 +103,13 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 group : SV_GroupID) {
     }
     bool both = col + 1u < width;
     Clip og;
-    int l = clip_of(o_grid, int(params.clips), int(row), og);
+    int fire_row = int(row) + int(params.y_base);
+    int l = clip_of(o_grid, int(params.clips), fire_row, og);
     float2 v = float2(0.0);
     if (l >= 0) {
         Clip ig = clip_at(grid, l);
-        Voxel o = unravel(og, int(row) - og.off);
+        ig.off -= int(params.x_base);
+        Voxel o = unravel(og, fire_row - og.off);
         v = float2(sample(ig, o, col), both ? sample(ig, o, col + 1u) : 0.0);
     }
     pair_put(y, row * width + col, both, v);

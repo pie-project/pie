@@ -130,7 +130,8 @@ fn every_probe_is_dumped() {
             .drafter
             .expect("PIE_PARITY_DSPARK reads a deployment that drafts a block")
     });
-    let block_word = |rows: u32| facts.word(&Request::new(rows, false).drafting_a_block(true));
+    let block_word =
+        |rows: u32| facts.word(&Request::new(rows, false).switched("block_draft", "on"));
     let budget = |key: &str| -> Option<u64> {
         let text = std::env::var(key).ok()?;
         let text = text.trim();

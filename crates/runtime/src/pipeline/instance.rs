@@ -32,70 +32,50 @@ impl Instance {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PassKind {
-    Text,
-    Diffusion,
-}
-
-impl PassKind {
-    pub fn name(self) -> &'static str {
-        match self {
-            PassKind::Text => "text",
-            PassKind::Diffusion => "diffusion",
-        }
-    }
-
-    pub fn interface(self) -> &'static str {
-        match self {
-            PassKind::Text => "pie:inferlet/forward",
-            PassKind::Diffusion => "pie:inferlet/forward-diffusion",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CanvasMode {
-    Encode,
-    Denoise,
-}
-
 #[derive(Default)]
 pub struct ForwardBindings {
     pub embed: Option<EmbedBinding>,
     pub state: Option<StateBinding>,
     pub readout: Option<u32>,
-    pub max_layers: Option<u32>,
-    pub block_draft: bool,
+    pub mask: Option<u32>,
     pub checkpoints: Vec<u32>,
-    pub media: Vec<std::sync::Arc<media::front::EncodedSpan>>,
-    pub canvas: Option<CanvasMode>,
-    pub self_cond: Option<SelfCondPayload>,
-    pub reading: Option<u8>,
-    pub stream: Option<poem::Stream>,
-    pub group: Option<u32>,
-    pub peer: Option<u32>,
-    pub ports: Vec<PortBinding>,
-    pub attn_classes: Option<::engine::fire::AttnClasses>,
+    /// By lane, up to the highest lane a verb named.
+    pub lanes: Vec<LaneBinding>,
 }
 
+impl ForwardBindings {
+    pub fn lane_mut(&mut self, lane: usize) -> &mut LaneBinding {
+        if self.lanes.len() <= lane {
+            self.lanes.resize_with(lane + 1, LaneBinding::default);
+        }
+        &mut self.lanes[lane]
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct LaneBinding {
+    pub switches: Vec<(String, String)>,
+    pub group: Option<u32>,
+    pub inputs: Vec<InputBinding>,
+    pub media: Vec<std::sync::Arc<media::front::EncodedSpan>>,
+}
+
+/// A channel bound to model input `id`: its rows (row input) or clip (voxel input).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PortBinding {
+pub struct InputBinding {
     pub name: String,
-    pub kind: ::engine::fire::PortKind,
-    pub port: u8,
+    pub id: u32,
     pub channel_rep: u32,
     pub channel_id: ::engine::ChannelId,
     pub rows: Option<u32>,
     pub clip: Option<[u32; 3]>,
 }
 
-impl PortBinding {
+impl InputBinding {
     #[must_use]
-    pub fn feed(&self) -> ::engine::fire::PortFeed {
-        ::engine::fire::PortFeed {
-            kind: self.kind,
-            port: self.port,
+    pub fn feed(&self) -> ::engine::fire::InputFeed {
+        ::engine::fire::InputFeed {
+            id: self.id,
             channel: self.channel_id,
         }
     }
@@ -103,75 +83,17 @@ impl PortBinding {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LaneFacts {
-    pub reading: u8,
-    pub stream: ::engine::fire::LaneStream,
+    pub switches: Vec<(String, String)>,
     pub group: Option<u32>,
-    pub peer: Option<u32>,
-    pub ports: Vec<::engine::fire::PortFeed>,
-    pub attn_classes: Option<::engine::fire::AttnClasses>,
+    pub inputs: Vec<::engine::fire::InputFeed>,
 }
 
 impl LaneFacts {
-    pub fn stamp(&self, req: &mut crate::engine::FireRequest) {
-        for lane in &mut req.lanes {
-            lane.reading = self.reading;
-            lane.stream = self.stream;
-            lane.group = self.group;
-            lane.peer = self.peer;
-            lane.ports = self.ports.clone();
-            lane.attn_classes = self.attn_classes.clone();
+    pub fn stamp(lanes: &[LaneFacts], req: &mut crate::engine::FireRequest) {
+        for (lane, facts) in req.lanes.iter_mut().zip(lanes) {
+            lane.group = facts.group;
+            lane.inputs = facts.inputs.clone();
         }
-    }
-}
-
-#[must_use]
-pub fn cohort_of(
-    table: &mut wasmtime::component::ResourceTable,
-    group: Option<u32>,
-    peer: Option<u32>,
-) -> Option<u32> {
-    let group = group?;
-    let members = table
-        .iter_mut()
-        .filter_map(|entry| entry.downcast_ref::<ForwardPass>())
-        .filter(|pass| {
-            pass.bindings.group == Some(group) || (peer.is_some() && pass.bindings.group == peer)
-        })
-        .count();
-    Some(u32::try_from(members).unwrap_or(u32::MAX).max(1))
-}
-
-#[must_use]
-pub fn cohort_key(group: Option<u32>, peer: Option<u32>) -> Option<u32> {
-    match (group, peer) {
-        (Some(group), Some(peer)) => Some(group.min(peer)),
-        (group, _) => group,
-    }
-}
-
-#[must_use]
-pub fn lane_stream_of(stream: poem::Stream) -> ::engine::fire::LaneStream {
-    use ::engine::fire::LaneStream;
-    match stream {
-        poem::Stream::Text => LaneStream::Text,
-        poem::Stream::Image => LaneStream::Image,
-        poem::Stream::Video => LaneStream::Video,
-        poem::Stream::Audio => LaneStream::Audio,
-        poem::Stream::Context => LaneStream::Context,
-        poem::Stream::Reference => LaneStream::Reference,
-    }
-}
-
-#[must_use]
-pub fn stream_of_lane(stream: ::engine::fire::LaneStream) -> poem::Stream {
-    use ::engine::fire::LaneStream;
-    match stream {
-        LaneStream::Text => poem::Stream::Text,
-        LaneStream::Image => poem::Stream::Image,
-        LaneStream::Video => poem::Stream::Video,
-        LaneStream::Audio => poem::Stream::Audio,
-        LaneStream::Context => poem::Stream::Context,
-        LaneStream::Reference => poem::Stream::Reference,
     }
 }
 
@@ -179,15 +101,12 @@ pub fn stream_of_lane(stream: ::engine::fire::LaneStream) -> poem::Stream {
 pub struct FloatLane {
     pub rows: u32,
     pub clips: Vec<[u32; 3]>,
-    pub embed: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct SelfCondPayload {
-    pub taps: u32,
-    pub rows: Vec<u32>,
-    pub weights: Vec<f32>,
-    pub channels: Option<(::engine::ChannelId, ::engine::ChannelId)>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FloatPass {
+    pub lanes: Vec<FloatLane>,
+    pub embed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -202,25 +121,16 @@ pub struct StateBinding {
     pub positions: Option<u32>,
     pub slots: Option<u32>,
     pub kv_len: Option<u32>,
-    pub mask: Option<u32>,
     pub fold: Option<u32>,
 }
 
+#[derive(Default)]
 pub struct ForwardPass {
-    pub kind: PassKind,
     pub bindings: ForwardBindings,
     bound: Option<Box<BoundForwardPass>>,
 }
 
 impl ForwardPass {
-    pub fn new(kind: PassKind) -> Self {
-        Self {
-            kind,
-            bindings: ForwardBindings::default(),
-            bound: None,
-        }
-    }
-
     pub fn is_bound(&self) -> bool {
         self.bound.is_some()
     }
@@ -273,15 +183,13 @@ pub struct BoundForwardPass {
     pub fires: Option<crate::pipeline::fire::PendingFires>,
     pub lanes: Vec<u32>,
     pub kv_lanes: Vec<u32>,
-    pub max_layers: Option<u32>,
-    pub block_draft: bool,
     pub rs_ws: Vec<u32>,
     pub failed: Option<String>,
     pub devgeo: Option<Vec<u32>>,
     pub decode_envelope: Option<eta_ir::registry::PortMask>,
     pub host_shadow: crate::pipeline::fire::shadow::HostShadow,
-    pub lane: LaneFacts,
-    pub float: Option<FloatLane>,
+    pub facts: Vec<LaneFacts>,
+    pub float: Option<FloatPass>,
     pub(crate) closed: bool,
 }
 

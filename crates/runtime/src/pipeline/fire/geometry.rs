@@ -340,12 +340,13 @@ impl Fold {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Place {
     pub folded: u32,
     pub folded_exact: bool,
     pub tail: Option<u32>,
     pub shared: bool,
+    pub spans: Vec<(u32, u32, u32)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -446,20 +447,21 @@ impl ReqGeometry {
                 }
                 None => end,
             };
+            // Unstated, a row rotates the working set's lag behind its slot.
+            let lag = crate::inferlet::host::working_set::lag(&place.spans, start);
             let positions = match &self.positions {
-                Some(positions) => {
-                    let positions = cut(positions, lane);
-                    if positions
-                        .iter()
-                        .enumerate()
-                        .all(|(at, &position)| position == start + at as u32)
-                    {
-                        Vec::new()
-                    } else {
-                        positions
-                    }
-                }
-                None => Vec::new(),
+                Some(positions) => cut(positions, lane),
+                None if lag == 0 => Vec::new(),
+                None => (start - lag..end - lag).collect(),
+            };
+            let positions = if positions
+                .iter()
+                .enumerate()
+                .all(|(at, &position)| position == start + at as u32)
+            {
+                Vec::new()
+            } else {
+                positions
             };
             let readout = cut_by(&self.sampling_indices, &self.sampling_indptr, lane);
             lanes.push(::engine::Lane {
@@ -477,7 +479,6 @@ impl ReqGeometry {
                     [only] if *only + 1 == rows => ::engine::Readout::Last,
                     rows => ::engine::Readout::Rows(rows.to_vec()),
                 },
-                stream: engine::fire::LaneStream::Text,
                 ..::engine::Lane::default()
             });
             landings.push(Landing { start, rows });
@@ -810,6 +811,7 @@ mod tests {
         let mut container = TraceContainer {
             names: vec![],
             externs: vec![],
+            inputs: Vec::new(),
             channels: vec![chan(Shape::vector(lanes), Dtype::I32)],
             ports: vec![PortBinding {
                 port: Port::EmbedTokens,
@@ -844,6 +846,7 @@ mod tests {
             folded_exact: true,
             tail: Some(tail),
             shared: false,
+            spans: Vec::new(),
         }
     }
 
@@ -873,6 +876,7 @@ mod tests {
         let mut container = TraceContainer {
             names: vec![],
             externs: vec![],
+            inputs: Vec::new(),
             channels: vec![],
             ports: vec![],
             stages: vec![StageProgram {
@@ -913,6 +917,7 @@ mod tests {
         slots_computed_on_the_device_leave_the_envelope();
         device_positions_ride_only_beside_stated_slots();
         a_lane_appends_after_its_tail();
+        rows_past_a_span_rotate_behind_their_slots();
         stated_slots_land_where_they_say();
         a_write_inside_the_frozen_prefix_is_refused();
         lanes_sharing_a_working_set_state_their_slots();
@@ -1018,6 +1023,29 @@ mod tests {
         assert_eq!(lanes[0].readout, ::engine::Readout::Last);
     }
 
+    fn rows_past_a_span_rotate_behind_their_slots() {
+        // A span over slots 10..30 rotates them as 4: the rows after lag 16.
+        let past = Place {
+            spans: vec![(10, 30, 16)],
+            ..place(40)
+        };
+        let (lanes, _) = geometry(&[3])
+            .lanes(std::slice::from_ref(&past), 16)
+            .unwrap();
+        assert_eq!(lanes[0].positions, vec![24, 25, 26]);
+        let mut g = geometry(&[2]);
+        g.slots = Some(vec![20, 21]);
+        let (lanes, _) = g.lanes(std::slice::from_ref(&past), 16).unwrap();
+        assert!(
+            lanes[0].positions.is_empty(),
+            "a row inside the span is not past it"
+        );
+        let mut g = geometry(&[1]);
+        g.positions = Some(vec![40]);
+        let (lanes, _) = g.lanes(&[past], 16).unwrap();
+        assert!(lanes[0].positions.is_empty(), "stated positions win");
+    }
+
     fn stated_slots_land_where_they_say() {
         let mut g = geometry(&[2, 1]);
         g.slots = Some(vec![5, 6, 9]);
@@ -1049,7 +1077,7 @@ mod tests {
             ..place(8)
         };
         assert!(
-            g.lanes(&[frozen], 16)
+            g.lanes(std::slice::from_ref(&frozen), 16)
                 .unwrap_err()
                 .contains("frozen prefix")
         );
@@ -1070,7 +1098,7 @@ mod tests {
         };
         assert!(
             geometry(&[1, 1])
-                .lanes(&[shared, shared], 16)
+                .lanes(&[shared.clone(), shared], 16)
                 .unwrap_err()
                 .contains("state where their rows land")
         );

@@ -75,7 +75,7 @@ impl Conv3d {
 /// `y` (bf16, `[rows_out, c_out]`) the convolution of `x` (bf16, `[rows,
 /// c_in]`) over the clips of `grid`, the output voxels those of `o_grid`;
 /// `w` is `[c_out, taps * c_in]`, taps-major, `bias` an f32 per output
-/// channel.
+/// channel. `bases` (`[x, y]`): `x`'s and `y`'s row 0 in the grids' fire-wide rows.
 #[allow(clippy::too_many_arguments)]
 pub fn conv3d(
     ctx: &Ctx<'_>,
@@ -86,6 +86,7 @@ pub fn conv3d(
     conv: Conv3d,
     o_grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     for t in [x, w, y] {
         if t.dtype != Dtype::Bf16 {
@@ -146,7 +147,9 @@ pub fn conv3d(
     ];
     args.extend(conv.scalars(c_in, c_out, clips, rows_out)?);
     args.push(u32::from(bias.is_some()).arg());
+    let bases = [stated(OP, bases[0])?.arg(), stated(OP, bases[1])?.arg()];
     if c_in.is_multiple_of(STEP) {
+        args.extend(bases);
         let tiles = rows_out.div_ceil(TILE);
         if tiles > 65_535 {
             return Err(refuse(
@@ -171,5 +174,6 @@ pub fn conv3d(
     })?;
     let (shape, span) = row_grid(lanes, rows_out, THREADS);
     args.push(span.arg());
+    args.extend(bases);
     ctx.fire(Fire::at(CONV3D, "conv_conv3d_bf16").apply(shape), &args)
 }

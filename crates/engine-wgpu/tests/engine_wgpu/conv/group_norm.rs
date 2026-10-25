@@ -98,6 +98,7 @@ fn the_group_norm_answers_the_reference() {
                         p,
                         s,
                         t(o[0].0, rows, C, Dtype::Bf16),
+                        0,
                     )
                 })
             },

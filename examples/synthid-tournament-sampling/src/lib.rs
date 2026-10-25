@@ -216,9 +216,13 @@ fn host_counter(history: &[i32], hlen: usize, context_width: u32) -> u32 {
 /// Four `[1]` f32 values as one `[4]` cell.
 fn pack4(a: &Tensor, b: &Tensor, c: &Tensor, d: &Tensor) -> Tensor {
     let lane = iota(4);
-    let cd = select(&eq(&lane, broadcast(2u32, [4])), broadcast(c, [4]), broadcast(d, [4]));
-    let bcd = select(&eq(&lane, broadcast(1u32, [4])), broadcast(b, [4]), &cd);
-    select(&eq(&lane, broadcast(0u32, [4])), broadcast(a, [4]), &bcd)
+    let cd = select(
+        eq(&lane, broadcast(2u32, [4])),
+        broadcast(c, [4]),
+        broadcast(d, [4]),
+    );
+    let bcd = select(eq(&lane, broadcast(1u32, [4])), broadcast(b, [4]), &cd);
+    select(eq(&lane, broadcast(0u32, [4])), broadcast(a, [4]), &bcd)
 }
 
 /// Assembles the `[2]` u32 `[key, ctr]` rng state from two `[1]` parts.
@@ -304,7 +308,14 @@ fn step(
 
     let hist_next = scatter_set(hist, hlen, &token);
     let chist_next = scatter_set(chist, hlen % cfg.history_size, &counter);
-    (token, hist_next, chist_next, score, null_score, reshape(repeated, [1]))
+    (
+        token,
+        hist_next,
+        chist_next,
+        score,
+        null_score,
+        reshape(repeated, [1]),
+    )
 }
 
 #[inferlet::main]

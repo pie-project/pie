@@ -1,14 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
-use poem::{
-    Attn, Def, Elemwise, Linear, Operation, Platform, Request, RopeForm, RuntimeInput, Stream,
-    Trace, seam,
-};
+use poem::generative::ScheduleKind;
+use poem::{Attn, Elemwise, Linear, Operation, Platform, Request, RopeForm, Trace, seam};
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
 
-use crate::hunyuan_image_3_dims::{self as model, DENOISE, Dims, ENCODE, IMAGE_IN, IMAGE_OUT};
+use crate::hunyuan_image_3_dims::{self as model, Dims};
 const TP1: &str = "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16";
 const TP4: &str = "hunyuanimage3-80b-a13b-bf16-u8g64-kv-bf16-tp4";
 const TP4_U4: &str = "hunyuanimage3-80b-a13b-bf16-u4g64-kv-bf16-tp4";
@@ -50,7 +47,6 @@ fn ranks(deployment: &str) -> u32 {
 #[test]
 fn the_hunyuan_image_3_rows_bake_every_case() {
     every_row_traces_on_every_platform_with_the_caches_and_seams_it_states();
-    the_ports_the_trace_reads_are_the_ports_the_facts_declare();
     each_lane_the_facts_list_classifies_into_its_own_class();
     every_rope_turns_the_whole_head_as_two_equal_blocks_in_the_split_form();
     the_canvas_reads_a_bidirectional_masked_attention_over_the_frozen_prefix();
@@ -101,138 +97,28 @@ fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
     }
 }
 
-fn traced_ports(plan: &Trace) -> BTreeSet<(String, u8, u32)> {
-    let mut traced = BTreeSet::new();
-    for decl in &plan.values {
-        let (kind, port, width) = match &decl.def {
-            Def::Input(RuntimeInput::Latents { port, width }) => ("Latents", *port, *width),
-            Def::Input(RuntimeInput::Context { port, width }) => ("Context", *port, *width),
-            Def::Input(RuntimeInput::LaneVector { port, width }) => ("LaneVector", *port, *width),
-            Def::Input(RuntimeInput::AxisPositions { port, axes }) => {
-                ("AxisPositions", *port, u32::from(*axes))
-            }
-            Def::Input(RuntimeInput::Voxels { port, channels }) => ("Voxels", *port, *channels),
-            _ => continue,
-        };
-        traced.insert((kind.to_string(), port, width));
-    }
-    traced
-}
-
-fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
-    for deployment in ROWS {
-        let plan = trace(deployment, Platform::Cuda);
-        let facts = row(deployment).generative().expect("generative facts");
-        let mut declared: BTreeSet<(String, u8, u32)> = BTreeSet::new();
-        for reading in &facts.readings {
-            for (index, port) in reading.ports_indexed() {
-                declared.insert((format!("{:?}", port.kind), index, port.width));
-            }
-        }
-        assert_eq!(
-            traced_ports(&plan),
-            declared,
-            "{deployment}: the facts and the trace bind one list of ports"
-        );
-
-        let d = dims(deployment);
-        let denoise = facts
-            .readings
-            .iter()
-            .find(|r| r.name == "denoise")
-            .unwrap_or_else(|| panic!("{deployment} declares no `denoise`"));
-        let at = |reading: &poem::generative::ReadingFact, name: &str| {
-            let (index, port) = reading
-                .port(name)
-                .unwrap_or_else(|| panic!("{deployment}: `{}` declares no `{name}`", reading.name));
-            (index, port.kind, port.width)
-        };
-        assert_eq!(
-            at(denoise, "latents"),
-            (model::port::ROWS, PortKind::Latents, d.hidden)
-        );
-        assert_eq!(
-            at(denoise, "special"),
-            (model::port::SPECIAL, PortKind::Latents, 1)
-        );
-        assert_eq!(
-            at(denoise, "timestep"),
-            (model::port::TIMESTEP, PortKind::LaneVector, 1)
-        );
-        assert_eq!(
-            at(denoise, "positions"),
-            (
-                model::port::POSITIONS,
-                PortKind::AxisPositions,
-                u32::from(model::ROPE_AXES)
-            )
-        );
-        assert_eq!(denoise.readout, ReadoutKind::Hidden);
-        assert_eq!(denoise.readout_width, d.hidden);
-
-        let image_in = &facts.readings[usize::from(IMAGE_IN)];
-        assert_eq!(
-            at(image_in, "latent"),
-            (
-                model::port::LATENT_VOXELS,
-                PortKind::Voxels,
-                model::LATENT_CHANNELS + model::T_FREQ_DIM
-            )
-        );
-        assert_eq!(image_in.ports.len(), 1);
-        assert_eq!(image_in.readout_width, d.hidden);
-        let image_out = &facts.readings[usize::from(IMAGE_OUT)];
-        assert_eq!(
-            at(image_out, "rows"),
-            (
-                model::port::ROW_VOXELS,
-                PortKind::Voxels,
-                d.hidden + model::T_FREQ_DIM
-            )
-        );
-        assert_eq!(image_out.ports.len(), 1);
-        assert_eq!(image_out.readout, ReadoutKind::Pixels);
-        assert_eq!(image_out.readout_width, model::LATENT_CHANNELS);
-    }
-}
-
 fn each_lane_the_facts_list_classifies_into_its_own_class() {
     for deployment in ROWS {
         let plan = trace(deployment, Platform::Cuda);
         let classes = poem::resolve_classes(&plan)
             .unwrap_or_else(|why| panic!("{deployment}: a merge does not resolve: {why:?}"));
-        let facts = row(deployment).generative().expect("generative facts");
-        let _catalog = row(deployment);
         let mut seen: Vec<(String, usize)> = Vec::new();
-        let lanes: Vec<(String, u8, Stream, u32)> = facts
-            .readings
-            .iter()
-            .map(|r| {
-                (
-                    r.name.to_string(),
-                    r.index,
-                    *r.streams.first().expect("every reading names a stream"),
-                    8,
-                )
-            })
-            .chain(std::iter::once((
-                "encode/decode".to_string(),
-                ENCODE,
-                Stream::Text,
-                1,
-            )))
-            .collect();
-        for (name, reading, stream, rows) in lanes {
+        let lanes = [
+            ("text", "text", 8),
+            ("denoise", "denoise", 8),
+            ("image.in", "image.in", 8),
+            ("image.out", "image.out", 8),
+            ("encode/decode", "text", 1),
+        ];
+        for (name, reading, rows) in lanes {
             // A denoise lane attends its canvas through the mask its inferlet
             // sends with it.
-            let request = Request::new(rows, reading == DENOISE)
-                .on_stream(stream)
-                .in_reading(reading_name(reading));
+            let request = Request::new(rows, reading == "denoise").switched("reading", reading);
             let w = plan.facts.word(&request);
             let class = classes
                 .class_of(w & classes.mask)
                 .unwrap_or_else(|| panic!("{deployment}: `{name}` has no class"));
-            seen.push((name, class));
+            seen.push((name.to_string(), class));
         }
         let distinct: BTreeSet<usize> = seen.iter().map(|(_, class)| *class).collect();
         assert_eq!(
@@ -450,63 +336,29 @@ fn the_mixture_is_a_renormalised_top_k_over_the_whole_bank_beside_a_shared_exper
 fn both_fact_columns_state_what_the_trace_does() {
     for deployment in ROWS {
         let catalog = row(deployment);
-        let d = dims(deployment);
-        let canvas = catalog.diffusion().expect("a forward-diffusion row");
-        assert_eq!(canvas.hidden, d.hidden, "{deployment}");
-        assert!(
-            canvas.canvas > 0 && canvas.canvas.is_multiple_of(16),
+        let facts = catalog.generative().expect("generative facts");
+        let names = catalog
+            .trace(Platform::Cuda)
+            .facts
+            .declared("reading")
+            .map(|s| s.values.clone());
+        assert_eq!(
+            names,
+            Some(
+                ["text", "denoise", "image.in", "image.out"]
+                    .map(String::from)
+                    .to_vec()
+            ),
             "{deployment}"
         );
-        assert_eq!(
-            canvas.self_cond_taps, 0,
-            "{deployment}: the cross-step state is the KV cache, not a soft embedding"
-        );
-
-        let facts = catalog.generative().expect("generative facts");
-        for (at, reading) in facts.readings.iter().enumerate() {
-            assert_eq!(usize::from(reading.index), at, "{deployment}: dense from 0");
-            assert!(
-                reading.positions.is_none(),
-                "{deployment}: the 2-D nesting is the family's"
-            );
-        }
-        let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["encode", "denoise", "image.in", "image.out"]);
-        let encode = &facts.readings[usize::from(ENCODE)];
-        assert!(encode.has_kv && encode.takes_tokens, "{deployment}");
-        assert_eq!(encode.readout, ReadoutKind::Logits);
-        assert_eq!(encode.readout_width, d.vocab);
-        let denoise = &facts.readings[usize::from(DENOISE)];
-        assert!(
-            denoise.has_kv && denoise.takes_tokens,
-            "{deployment}: the canvas is a sequence AND a float lane (design D10)"
-        );
-        for voxel in [IMAGE_IN, IMAGE_OUT] {
-            let arm = &facts.readings[usize::from(voxel)];
-            assert!(
-                !arm.has_kv && !arm.takes_tokens,
-                "{deployment}: {}",
-                arm.name
-            );
-        }
         let latent = facts.latent.expect("a latent space");
         assert_eq!(
             (
                 latent.channels,
-                latent.patch_t,
-                latent.patch_h,
-                latent.patch_w,
                 latent.spatial_compression,
                 latent.temporal_compression
             ),
-            (
-                model::LATENT_CHANNELS,
-                1,
-                1,
-                1,
-                model::SPATIAL_COMPRESSION,
-                1
-            )
+            (model::LATENT_CHANNELS, model::SPATIAL_COMPRESSION, 1)
         );
         let schedule = facts.schedule.as_ref().expect("a schedule");
         assert_eq!(schedule.kind, ScheduleKind::Flow);
@@ -516,23 +368,6 @@ fn both_fact_columns_state_what_the_trace_does() {
             schedule.pinned_sigmas.is_empty(),
             "{deployment}: nothing is pinned"
         );
-        assert!(facts.max_rows > canvas.canvas, "{deployment}");
-        validate(&facts);
-    }
-}
-
-fn validate(facts: &poem::generative::Generative) {
-    for reading in &facts.readings {
-        assert!(reading.readout_width > 0);
-        if !reading.takes_tokens {
-            assert!(
-                reading
-                    .ports
-                    .iter()
-                    .any(|port| matches!(port.kind, PortKind::Latents | PortKind::Voxels)),
-                "a token-less reading states its rows through a latents or voxels port"
-            );
-        }
     }
 }
 
@@ -554,16 +389,5 @@ fn a_sharded_row_reduces_once_per_cut_projection() {
             reduces, want,
             "{deployment}: one all-reduce per cut projection"
         );
-    }
-}
-
-/// The name of the reading the forward's code `reading` stands for.
-fn reading_name(reading: u8) -> &'static str {
-    match reading {
-        ENCODE => "encode",
-        DENOISE => "denoise",
-        IMAGE_IN => "image.in",
-        IMAGE_OUT => "image.out",
-        other => panic!("no reading has code {other}"),
     }
 }

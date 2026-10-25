@@ -23,7 +23,6 @@ from conftest import (  # noqa: E402
     ChatDelta,
     ChatDone,
     ChatInterrupt,
-    ForwardKind,
     ReasoningComplete,
     ReasoningDecoderStub,
     ReasoningDelta,
@@ -86,11 +85,12 @@ class TestModel:
         assert model.architecture() == "qwen3_5"
         assert model.default_system_speculation() is False
 
-    def test_pass_kind(self):
+    def test_state_and_switches(self):
         from inferlet import model
 
-        assert model.pass_kind() is ForwardKind.TEXT
         assert model.rs_state_size() > 0
+        assert model.switch("mode").values == ["encode", "denoise"]
+        assert model.switch("reading") is None
 
     def test_memory_shaping_capabilities(self):
         from inferlet import model
@@ -357,7 +357,7 @@ class TestForwardPassState:
         lanes, geom = fwd.wit.state_args
         assert lanes == [a.ws, b.ws, a.ws]
         assert geom.slots is slots._wit()
-        assert (geom.positions, geom.kv_len, geom.mask, geom.fold) == (None, None, None, None)
+        assert (geom.positions, geom.kv_len, geom.fold) == (None, None, None)
         assert [p for p, _ in fwd._ports] == [Port.SLOTS]
 
     def test_fold_all_is_one_constant_channel_per_pass(self):
@@ -376,34 +376,31 @@ class TestForwardPassState:
         with pytest.raises(ValueError):
             ForwardPass().state([WorkingSet()], StateGeometry(fold="some"))  # type: ignore[arg-type]
 
-    def test_checkpoints_are_a_text_pass_verb(self):
-        from inferlet.eta import ForwardKind, ForwardPass, InferletError
+    def test_checkpoints(self):
+        from inferlet.eta import ForwardPass
 
         fwd = ForwardPass()
         fwd.checkpoints([16, 32])
         assert fwd.wit.checkpoint_slots == [16, 32]
-        with pytest.raises(InferletError, match="checkpoints binds"):
-            ForwardPass(ForwardKind.DIFFUSION).checkpoints([16])
 
 
 class TestDiffusionSurface:
     def test_model_facts(self):
         from inferlet import model
 
-        assert model.canvas() == model.CanvasShape(32, 2560, 4)
+        assert [i.name for i in model.lane([("mode", "denoise")]).inputs] == ["self_cond_ids"]
         assert model.draft_block() is None
         assert model.run_ahead_window() == 4
 
-    def test_diffusion_pass_binds_canvas_and_taps(self):
-        from inferlet.eta import ForwardKind, ForwardPass, InferletError, diffusion
+    def test_pass_sets_a_model_switch(self):
+        from inferlet.eta import ForwardPass
 
-        fwd = ForwardPass(ForwardKind.DIFFUSION)
-        fwd.canvas(diffusion.Mode.DENOISE)
-        fwd.self_conditioning([1, 2, 3, 4], [0.4, 0.3, 0.2, 0.1])
-        assert fwd.wit.mode is diffusion.Mode.DENOISE
-        assert fwd.wit.self_cond == ([1, 2, 3, 4], [0.4, 0.3, 0.2, 0.1])
-        with pytest.raises(InferletError, match="canvas binds"):
-            ForwardPass(ForwardKind.TEXT).canvas(diffusion.Mode.ENCODE)
+        fwd = ForwardPass()
+        fwd.switch(0, "mode", "encode")
+        assert not fwd.switched()
+        fwd.switch(1, "mode", "denoise")
+        assert fwd.wit.switches == [(0, "mode", "encode"), (1, "mode", "denoise")]
+        assert fwd.switched()
 
     def test_linear_temperature_is_the_reference_schedule(self):
         from inferlet.eta.diffusion import linear_temperature

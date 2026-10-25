@@ -118,7 +118,9 @@ pub fn cache_store(
     grid: Operand,
     frames: u32,
     slab: Operand,
+    x_base: u32,
 ) -> Result<Val, Error> {
+    let grid = crate::conv::rebased(f, grid, x_base)?;
     const OP: &str = "conv.cache_store";
     let lanes = cache_checks(OP, slab, slot_ids, grid, cache, frames)?;
     if x.dtype != Dtype::Bf16 || x.width != cache.width {

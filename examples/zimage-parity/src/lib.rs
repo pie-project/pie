@@ -1,46 +1,14 @@
-//! The pie half of the `z-image` goldens. Hands the family exactly what
-//! `scripts/imagegen/zimage_golden.py` handed diffusers — the caption rows,
-//! the patchified latent, the timestep and the three rotary coordinates of
-//! every row — and reads back the refined caption and the velocity, as
-//! JSON `scripts/imagegen/zimage_parity.py` turns into an `.npz` under the
-//! golden's own key names.
+//! The pie half of the `z-image` goldens: `scripts/imagegen/zimage_golden.py`'s
+//! inputs in, the refined caption and the velocity out as JSON for `zimage_parity.py`.
+//! The caption is zero-padded to the family's `input-decl.rows`, as the reference pads.
 //!
-//! Two fires per case, in the order the reference's forward runs them:
-//!
-//! 1. **`refine`** — one `Context` lane carrying `caption` (`[L32, cap]`),
-//!    `pad` (`[L32, 1]`) and `positions` (`[L32, 3]`); its epilogue reads
-//!    `hidden(dim)`, the refined caption with its pad rows.
-//! 2. **`denoise`** — an `Image` lane (`latents`, `pad`, `positions`,
-//!    `timestep`) and a `Context` lane (`context` = the refine readout,
-//!    `positions`, `timestep`) in one group; the image lane's epilogue
-//!    reads `velocity(64)`.
-//!
-//! **THE TWO DENOISE LANES GO DOWN TWO PIPELINES.** A pipeline is serial —
-//! the scheduler never seats two of its passes in one step — so a group
-//! whose lanes share a pipeline is two fires of one lane each, the joint
-//! trunk attends the image rows alone, and the caption is silently
-//! invisible: the velocity does not move at all when the caption changes,
-//! and the step-0 answer lands at cos 0.56 instead of 0.9997. One pipeline
-//! per lane, as `latent::DenoiseLoop` owns for a sampler and `Pipes` does
-//! in `mini-dit-parity`.
-//!
-//! The refine readout goes through the host between the two: a parity
-//! harness wants both numbers on disk anyway (the refined caption is the
-//! first thing to diff when the velocity disagrees), and a seeded channel
-//! attaches to one pass only, so the second fire seeds its own.
+//! Two fires per case, in the reference's order: `refine` (one context lane), then
+//! `denoise` (lane 0 the refined caption, lane 1 the image, one group).
 //!
 //! Under `steps` the second fire becomes the whole TRAJECTORY: `steps`
 //! denoise fires over the family's pinned sigmas with the latent carried on
 //! the device by the image lane's Euler epilogue, started from the case's
 //! own latent (the golden's recorded `randn`, not a device draw).
-//!
-//! Row counts, pad flags and positions are the CASE's: the family cannot
-//! grow a lane, so the harness pads to the 32-row multiple and states the
-//! reference's own coordinates (caption row `j` at `(1 + j, 0, 0)`, pads
-//! included; image patch `(a, b)` at `(L32 + 1, a, b)`; image pads at
-//! `(0, 0, 0)`). The timestep is the family's port convention — the
-//! scheduler's `σ·1000`, which the plan flips to the reference's `1000 −
-//! t` — so the harness converts the golden's transformer-side `t` first.
 use inferlet::latent::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -78,28 +46,23 @@ struct Input {
     stop: Option<u32>,
 }
 
-/// The reference's fixed inputs, flattened row-major and already padded.
+/// The reference's fixed inputs, flattened row-major.
 #[derive(Deserialize)]
 struct Case {
-    /// `[image_rows, patch_features]`: the patchified latent, pad rows
-    /// appended (their content is irrelevant; the plan overwrites them).
+    /// `[height, width, channels]`: the VAE latent.
     latents: Vec<f32>,
-    image_rows: u32,
-    patch_features: u32,
-    /// `[image_rows]`: `0.0` real, `1.0` pad.
-    image_pad: Vec<f32>,
-    /// `[image_rows, 3]`.
-    image_positions: Vec<f32>,
-    /// `[caption_rows, caption_width]`, pad rows appended.
+    height: u32,
+    width: u32,
+    channels: u32,
+    /// `[caption_rows, caption_width]`.
     caption: Vec<f32>,
     caption_rows: u32,
     caption_width: u32,
-    /// `[caption_rows]`.
-    caption_pad: Vec<f32>,
-    /// `[caption_rows, 3]`.
-    caption_positions: Vec<f32>,
-    /// The SCHEDULER timestep `σ·1000` the family's port takes.
+    /// The SCHEDULER timestep `σ·1000` the family's `timestep` input takes.
     timestep: f32,
+    /// The token rows a tapped deployment's intermediate reads out on.
+    #[serde(default)]
+    readout_rows: Option<u32>,
 }
 
 #[derive(Serialize)]
@@ -109,21 +72,20 @@ struct Output {
     text: Vec<f32>,
     text_rows: u32,
     text_width: u32,
-    /// `[caption_rows, dim]`: the refine readout, pads included.
+    /// `[caption_rows, dim]`: the refine readout.
     refined: Vec<f32>,
     caption_rows: u32,
     dim: u32,
-    /// `[image_rows, patch_features]`: the velocity, pads included, in the
-    /// family's sign (the reference's `-model_out`).
+    /// `[height · width, readout]` in the family's sign (the reference's
+    /// `-model_out`); a tap's is `[readout_rows, readout]`.
     velocity: Vec<f32>,
-    image_rows: u32,
-    patch_features: u32,
+    height: u32,
+    width: u32,
+    readout: u32,
     /// `[caption_rows, ·]`: the same readout off the context lane, under
     /// `ctx_tap`; empty otherwise.
     ctx: Vec<f32>,
-    /// `[image_rows, patch_features]`: the trajectory's latent after its
-    /// last fire, under `steps`; empty otherwise. The sigmas it walked and
-    /// the timesteps it read, so the report says what schedule ran.
+    /// Under `steps`, the trajectory's last latent; empty otherwise.
     latent: Vec<f32>,
     sigmas: Vec<f32>,
     timesteps: Vec<f32>,
@@ -131,155 +93,187 @@ struct Output {
 
 struct Reading {
     name: String,
-    ports: Vec<String>,
-    axes: u32,
     readout_width: u32,
 }
 
-/// The reading's port names read off `model::readings()`, so a renamed port
-/// fails here with the model's own vocabulary instead of at the host.
-fn reading(readout: model::ReadoutKind, wants: &[&str]) -> Result<Reading> {
-    let fact = model::readings()
+fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::LaneDecl> {
+    let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
+    let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
+    let mut wants = binds.to_vec();
+    reads.sort_unstable();
+    wants.sort_unstable();
+    if reads != wants {
+        return Err(format!(
+            "reading `{reading}`'s `{stream}` lane reads {reads:?}; this pass binds {wants:?}"
+        ));
+    }
+    Ok(lane)
+}
+
+fn reading(readout: model::ReadoutKind, lanes: &[(&str, &[&str])]) -> Result<Reading> {
+    let readings = model::switch("reading")
+        .map(|decl| decl.values)
+        .unwrap_or_default();
+    let (name, readout_width) = readings
         .into_iter()
-        .find(|reading| !reading.takes_tokens && reading.readout == readout)
+        .find_map(|name| {
+            let decls = lanes
+                .iter()
+                .map(|(stream, _)| {
+                    model::lane_of(&[("reading", name.as_str()), ("stream", stream)])
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .ok()?;
+            if decls.iter().any(|lane| lane.embeds) {
+                return None;
+            }
+            let width = decls.iter().find_map(|lane| {
+                lane.readout
+                    .as_ref()
+                    .filter(|r| r.kind == readout)
+                    .map(|r| r.width)
+            })?;
+            Some((name, width))
+        })
         .ok_or_else(|| {
             format!("this model declares no token-less reading with a {readout:?} readout")
         })?;
-    if fact.has_kv {
-        return Err(format!(
-            "reading `{}` binds a kv space; the parity pass binds none",
-            fact.name
-        )
-        .into());
+    for (stream, binds) in lanes {
+        let lane = lane_reading(&name, stream, binds)?;
+        if lane.state {
+            return Err(format!(
+                "reading `{name}` binds a working set; the parity pass binds none"
+            ));
+        }
     }
-    let mut ports = Vec::new();
-    for want in wants {
-        let port = fact
-            .ports
-            .iter()
-            .find(|port| port.name == *want)
-            .ok_or_else(|| format!("reading `{}` declares no port `{want}`", fact.name))?;
-        ports.push(port.name.clone());
-    }
-    let axes = fact
-        .ports
-        .iter()
-        .find(|port| port.name == "positions")
-        .map(|port| port.width)
-        .unwrap_or(3);
     Ok(Reading {
-        name: fact.name.clone(),
-        ports,
-        axes,
-        readout_width: fact.readout_width,
+        name,
+        readout_width,
     })
 }
 
-/// The `refine` reading: one context lane, the refined caption back.
-async fn refine(case: &Case, pipe: &Pipeline) -> Result<(Vec<f32>, u32)> {
-    let r = reading(model::ReadoutKind::Hidden, &["caption", "pad", "positions"])?;
-    let rows = case.caption_rows;
+fn padded(rows: Option<model::RowCount>, len: u32) -> Result<u32> {
+    match rows {
+        None => Some(len),
+        Some(model::RowCount::Exact(n)) => (len <= n).then_some(n),
+        Some(model::RowCount::Multiple(n)) => len.checked_next_multiple_of(n),
+    }
+    .ok_or_else(|| format!("{len} caption rows do not fit {rows:?}"))
+}
+
+fn length(case: &Case) -> Channel {
+    Channel::from([case.caption_rows as f32]).named("length")
+}
+
+/// The refined caption, its width and the padded caption rows.
+async fn refine(case: &Case, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
+    let r = reading(
+        model::ReadoutKind::Hidden,
+        &[("context", &["caption", "length"])],
+    )?;
+    let lane = model::lane_of(&[("reading", r.name.as_str()), ("stream", "context")])?;
+    let decl = lane
+        .inputs
+        .iter()
+        .find(|i| i.name == "caption")
+        .ok_or("the refine lane reads no caption")?;
+    let rows = padded(decl.rows, case.caption_rows)?;
+    let mut rows_in = case.caption.clone();
+    rows_in.resize((rows * case.caption_width) as usize, 0.0);
     let pass = ForwardPass::new();
-    pass.reading(&r.name)?;
-    pass.stream(LaneStream::Context)?;
+    pass.switch(0, "reading", &r.name)?;
+    pass.switch(0, "stream", "context")?;
     let caption =
-        Channel::from_shaped([rows, case.caption_width], case.caption.as_slice()).named("caption");
-    let pad = Channel::from_shaped([rows, 1], case.caption_pad.as_slice()).named("cap_pad");
-    let positions =
-        Channel::from_shaped([rows, r.axes], case.caption_positions.as_slice()).named("cap_pos");
-    pass.input(&r.ports[0], &caption)?;
-    pass.input(&r.ports[1], &pad)?;
-    pass.input(&r.ports[2], &positions)?;
+        Channel::from_shaped([rows, case.caption_width], rows_in.as_slice()).named("caption");
+    pass.input(0, "caption", &caption)?;
+    pass.input(0, "length", &length(case))?;
     let width = r.readout_width;
     let out = Channel::new([rows, width], dtype::f32).named("refined");
-    let readback = out.clone();
     pass.epilogue(move || {
-        readback.put(intrinsics::hidden(width));
+        out.put(intrinsics::hidden(0, rows, width));
     });
     pass.submit(pipe).context("refine lane")?;
     let rows_out: Vec<f32> = out.take_host().await?;
-    Ok((rows_out, width))
+    Ok((rows_out, width, rows))
 }
 
-/// The `denoise` reading: the image lane and the refined-caption lane in
-/// one group, the velocity back off the image lane. The two lanes go down
-/// SEPARATE pipelines — a pipeline is serial, so two passes submitted to
-/// one seal into two fires and the group never forms (the joint trunk then
-/// attends the image rows alone).
+fn denoise_reading() -> Result<Reading> {
+    reading(
+        model::ReadoutKind::Velocity,
+        &[
+            ("context", &["context", "timestep", "length"]),
+            ("image", &["latents", "timestep"]),
+        ],
+    )
+}
+
+/// Binds lane 0 (the refined caption) and lane 1 (the image) in one group.
+fn denoise_lanes(
+    pass: &ForwardPass,
+    r: &Reading,
+    case: &Case,
+    context: &Channel,
+    latent: &Channel,
+    timestep: &Channel,
+) -> Result<()> {
+    for (lane, stream) in [(0, "context"), (1, "image")] {
+        pass.switch(lane, "reading", &r.name)?;
+        pass.switch(lane, "stream", stream)?;
+        pass.group(lane, 0)?;
+        pass.input(lane, "timestep", timestep)?;
+    }
+    pass.input(0, "context", context)?;
+    pass.input(0, "length", &length(case))?;
+    pass.input(1, "latents", latent)?;
+    Ok(())
+}
+
+fn readout_rows(case: &Case, width: u32) -> Result<u32> {
+    if width == case.channels {
+        return Ok(case.height * case.width);
+    }
+    case.readout_rows.ok_or_else(|| {
+        format!(
+            "the denoise reading reads out {width} wide, not the latent's {} channels: a tap, \
+             whose rows the case must state (`readout_rows`)",
+            case.channels
+        )
+    })
+}
+
+fn latent_of(case: &Case, name: &str) -> Channel {
+    Channel::from_shaped(
+        [case.height, case.width, case.channels],
+        case.latents.as_slice(),
+    )
+    .named(name)
+}
+
 async fn denoise(
     case: &Case,
-    refined: &[f32],
-    dim: u32,
+    context: &Channel,
     ctx_tap: bool,
-    ctx_pipe: &Pipeline,
-    img_pipe: &Pipeline,
+    pipe: &Pipeline,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
-    let r = reading(
-        model::ReadoutKind::Velocity,
-        &["latents", "pad", "context", "timestep", "positions"],
-    )?;
-    // The readout is the velocity, `patch_features` wide — unless the family
-    // is tapped on an intermediate (a bisect), which is `readout_width` wide.
+    let r = denoise_reading()?;
     let width = r.readout_width;
-    let (p_latents, p_pad, p_context, p_timestep, p_positions) = (
-        &r.ports[0],
-        &r.ports[1],
-        &r.ports[2],
-        &r.ports[3],
-        &r.ports[4],
-    );
-    let group = 0;
+    let voxels = readout_rows(case, width)?;
+    let caption_rows = context.shape().dims()[0];
+    let t = Channel::from([case.timestep]).named("t");
+    let x = latent_of(case, "latents");
+    let pass = ForwardPass::new();
+    denoise_lanes(&pass, &r, case, context, &x, &t)?;
 
-    // One timestep cell PER PASS: a seeded channel attaches to one pass only.
-    let t_img = Channel::from([case.timestep]).named("t_img");
-    let t_ctx = Channel::from([case.timestep]).named("t_ctx");
-
-    // The caption lane: the refine readout, pads included, no pad port.
-    let context = ForwardPass::new();
-    context.reading(&r.name)?;
-    context.stream(LaneStream::Context)?;
-    context.group(group)?;
-    let ctx = Channel::from_shaped([case.caption_rows, dim], refined).named("context");
-    let ctx_pos = Channel::from_shaped(
-        [case.caption_rows, r.axes],
-        case.caption_positions.as_slice(),
-    )
-    .named("ctx_pos");
-    context.input(p_context, &ctx)?;
-    context.input(p_positions, &ctx_pos)?;
-    context.input(p_timestep, &t_ctx)?;
-    let ctx_out = ctx_tap.then(|| {
-        let out = Channel::new([case.caption_rows, width], dtype::f32).named("ctx_tap");
-        let readback = out.clone();
-        context.epilogue(move || {
-            readback.put(intrinsics::velocity(width));
-        });
-        out
+    let out = Channel::new([voxels, width], dtype::f32).named("velocity");
+    let ctx_out = ctx_tap.then(|| Channel::new([caption_rows, width], dtype::f32).named("ctx_tap"));
+    pass.epilogue(move || {
+        out.put(intrinsics::velocity(1, voxels, width));
+        if let Some(tapped) = &ctx_out {
+            tapped.put(intrinsics::velocity(0, caption_rows, width));
+        }
     });
 
-    // The image lane: the latents in, the velocity out.
-    let rows = case.image_rows;
-    let image = ForwardPass::new();
-    image.reading(&r.name)?;
-    image.stream(LaneStream::Image)?;
-    image.group(group)?;
-    let x =
-        Channel::from_shaped([rows, case.patch_features], case.latents.as_slice()).named("latents");
-    let pad = Channel::from_shaped([rows, 1], case.image_pad.as_slice()).named("img_pad");
-    let img_pos =
-        Channel::from_shaped([rows, r.axes], case.image_positions.as_slice()).named("img_pos");
-    image.input(p_latents, &x)?;
-    image.input(p_pad, &pad)?;
-    image.input(p_positions, &img_pos)?;
-    image.input(p_timestep, &t_img)?;
-    let out = Channel::new([rows, width], dtype::f32).named("velocity");
-    let readback = out.clone();
-    image.epilogue(move || {
-        readback.put(intrinsics::velocity(width));
-    });
-
-    context.submit(ctx_pipe).context("context lane")?;
-    image.submit(img_pipe).context("image lane")?;
+    pass.submit(pipe).context("the denoise step")?;
     let velocity: Vec<f32> = out.take_host().await?;
     let ctx_rows = match ctx_out {
         Some(out) => out.take_host::<Vec<f32>>().await?,
@@ -288,89 +282,41 @@ async fn denoise(
     Ok((velocity, ctx_rows))
 }
 
-/// The whole Euler trajectory in one job: `steps` denoise fires over the
-/// family's own pinned sigmas ([`FlowMatchEuler::from_model`] — Turbo's
-/// eight), the latent carried on the DEVICE between them by the image
-/// lane's epilogue (`x <- x + (sigma' - sigma) . velocity`, design D4) and
-/// read back once per fire so a partial run can be diffed against the
-/// reference's own `sched.x{n}`.
-///
-/// The initial latent is the CASE's, not a device draw: this is a parity
-/// harness, and the reference's trajectory starts from a `randn` the golden
-/// recorded. `DenoiseLoop` puts a seed fire ahead of the steps whose `dt`
-/// is 0, so fire 0 leaves that latent alone and fire `k` integrates step
-/// `k - 1`.
+/// `DenoiseLoop`'s seed fire has `dt = 0`, so fire `k` integrates step `k - 1`.
 async fn trajectory(
     case: &Case,
-    refined: &[f32],
-    dim: u32,
+    context: &Channel,
     steps: u32,
     stop: Option<u32>,
 ) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>)> {
-    let r = reading(
-        model::ReadoutKind::Velocity,
-        &["latents", "pad", "context", "timestep", "positions"],
-    )?;
+    let r = denoise_reading()?;
     let width = r.readout_width;
-    let (p_latents, p_pad, p_context, p_timestep, p_positions) = (
-        &r.ports[0],
-        &r.ports[1],
-        &r.ports[2],
-        &r.ports[3],
-        &r.ports[4],
-    );
-    let group = 0;
-    let rows = case.image_rows;
+    let voxels = case.height * case.width;
+    let lat = [case.height, case.width, case.channels];
     let sched = FlowMatchEuler::from_model(steps, None)?;
-    let mut loops = DenoiseLoop::new(&sched);
-    let ctx_clock = loops.lane("traj_ctx");
-    let img_clock = loops.lane("traj_img");
+    let loops = DenoiseLoop::new(&sched);
+    let latent = latent_of(case, "traj_x");
+    let pass = ForwardPass::new();
+    denoise_lanes(&pass, &r, case, context, &latent, &loops.timestep())?;
 
-    let context = ForwardPass::new();
-    context.reading(&r.name)?;
-    context.stream(LaneStream::Context)?;
-    context.group(group)?;
-    let ctx = Channel::from_shaped([case.caption_rows, dim], refined).named("traj_context");
-    let ctx_pos = Channel::from_shaped(
-        [case.caption_rows, r.axes],
-        case.caption_positions.as_slice(),
-    )
-    .named("traj_ctx_pos");
-    context.input(p_context, &ctx)?;
-    context.input(p_positions, &ctx_pos)?;
-    context.input(p_timestep, &ctx_clock.timestep)?;
-
-    let image = ForwardPass::new();
-    image.reading(&r.name)?;
-    image.stream(LaneStream::Image)?;
-    image.group(group)?;
-    let latent =
-        Channel::from_shaped([rows, case.patch_features], case.latents.as_slice()).named("traj_x");
-    let pad = Channel::from_shaped([rows, 1], case.image_pad.as_slice()).named("traj_pad");
-    let img_pos =
-        Channel::from_shaped([rows, r.axes], case.image_positions.as_slice()).named("traj_pos");
-    image.input(p_latents, &latent)?;
-    image.input(p_pad, &pad)?;
-    image.input(p_positions, &img_pos)?;
-    image.input(p_timestep, &img_clock.timestep)?;
-
-    let out = Channel::new([rows, width], dtype::f32).named("traj_out");
-    // The caption lane only modulates: its clock advances and nothing else.
-    ctx_clock.drive(&context, |_| {});
-    let dts = loops.dts("traj_img");
-    let x = latent.clone();
-    let readback = out.clone();
-    img_clock.drive(&image, move |k| {
-        let next = euler_step(&x.take(), &intrinsics::velocity(width), &at(&dts.read(), k));
-        x.put(&next);
-        readback.put(&next);
+    let out = Channel::new(lat, dtype::f32).named("traj_out");
+    let dts = loops.dts();
+    loops.drive(&pass, move |k| {
+        let next = euler_step(
+            &reshape(latent.take(), [voxels, lat[2]]),
+            &intrinsics::velocity(1, voxels, width),
+            &at(&dts.read(), k),
+        );
+        let next = reshape(&next, lat);
+        latent.put(&next);
+        out.put(&next);
     });
 
     let fires = stop.map_or(loops.fires(), |n| n.min(sched.steps()) + 1);
     let mut last = Vec::new();
     for fire in 0..fires {
         loops
-            .fire(&[&context, &image])
+            .fire(&pass)
             .map_err(|why| format!("fire {fire}: {why}"))?;
         last = out.take_host::<Vec<f32>>().await?;
     }
@@ -378,20 +324,24 @@ async fn trajectory(
     Ok((last, sched.sigmas.clone(), sched.timesteps()))
 }
 
-/// The `text` reading: the prompt through the family's template
-/// (`user(prompt) ++ cue()`, what the reference's `apply_chat_template(
-/// add_generation_prompt=True)` renders), one prefill over a fresh working
-/// set, `hidden` at every row. `inferlet::latent::encode_text` with the
-/// template applied — that helper tokenizes plain text.
 async fn text(prompt: &str, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
-    let fact = model::readings()
+    let readings = model::switch("reading")
+        .map(|decl| decl.values)
+        .unwrap_or_default();
+    let (name, lane) = readings
         .into_iter()
-        .find(|reading| reading.takes_tokens && reading.readout == model::ReadoutKind::Hidden)
+        .find_map(|name| {
+            let lane = model::lane_of(&[("reading", name.as_str())]).ok()?;
+            let hidden = lane.readout.as_ref().map(|r| r.kind) == Some(model::ReadoutKind::Hidden);
+            (lane.embeds && hidden).then_some((name, lane))
+        })
         .ok_or("this row declares no token reading with a hidden readout (the miniature has no encoder)")?;
-    if !fact.has_kv {
-        return Err(format!("reading `{}` takes tokens but binds no kv space", fact.name).into());
+    if !lane.state {
+        return Err(format!(
+            "reading `{name}` takes tokens but binds no kv space"
+        ));
     }
-    let width = fact.readout_width;
+    let width = lane.readout.map_or(0, |r| r.width);
     let mut ids = inferlet::chat::prefix();
     ids.extend(inferlet::chat::user(prompt));
     ids.extend(inferlet::chat::cue());
@@ -411,14 +361,13 @@ async fn text(prompt: &str, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
     let out = Channel::new([len, width], dtype::f32).named("text");
 
     let pass = ForwardPass::new();
-    pass.reading(&fact.name)?;
+    pass.switch(0, "reading", &name)?;
     pass.embed(&toks, &embed_indptr)?;
     pass.readout(&readout)?;
-    // The encoder's state is scratch: nothing folds, and it goes with `ws`.
     pass.state(&[&ws], StateGeometry::default())?;
-    let readback = out.clone();
+    let readback = out;
     pass.epilogue(move || {
-        readback.put(intrinsics::hidden(width));
+        readback.put(intrinsics::hidden(0, len, width));
     });
     pass.submit(pipe).context("text lane")?;
     let rows: Vec<f32> = out.take_host().await?;
@@ -427,9 +376,6 @@ async fn text(prompt: &str, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Text {
-        return Err("z-image is a `forward` pass with no state bound".into());
-    }
     if input.text_only {
         let prompt = input
             .prompt
@@ -446,8 +392,9 @@ async fn main(input: Input) -> Result<Output> {
             caption_rows: 0,
             dim: 0,
             velocity: Vec::new(),
-            image_rows: 0,
-            patch_features: 0,
+            height: 0,
+            width: 0,
+            readout: 0,
             ctx: Vec::new(),
             latent: Vec::new(),
             sigmas: Vec::new(),
@@ -458,7 +405,7 @@ async fn main(input: Input) -> Result<Output> {
     for i in 0.. {
         match input.pieces.get(&format!("case_{i}")) {
             Some(inferlet::serde_json::Value::String(piece)) => pieces.push_str(piece),
-            Some(other) => return Err(format!("`case_{i}` is not a string: {other}").into()),
+            Some(other) => return Err(format!("`case_{i}` is not a string: {other}")),
             None => break,
         }
     }
@@ -475,49 +422,26 @@ async fn main(input: Input) -> Result<Output> {
         inferlet::serde_json::from_str(&json).map_err(|why| format!("case json: {why}"))?;
     let check = |what: &str, have: usize, want: u32| -> Result<()> {
         if have != want as usize {
-            return Err(
-                format!("`{what}` carries {have} numbers, the case's shape wants {want}").into(),
-            );
+            return Err(format!(
+                "`{what}` carries {have} numbers, the case's shape wants {want}"
+            ));
         }
         Ok(())
     };
     check(
         "latents",
         case.latents.len(),
-        case.image_rows * case.patch_features,
-    )?;
-    check("image_pad", case.image_pad.len(), case.image_rows)?;
-    check(
-        "image_positions",
-        case.image_positions.len(),
-        case.image_rows * 3,
+        case.height * case.width * case.channels,
     )?;
     check(
         "caption",
         case.caption.len(),
         case.caption_rows * case.caption_width,
     )?;
-    check("caption_pad", case.caption_pad.len(), case.caption_rows)?;
-    check(
-        "caption_positions",
-        case.caption_positions.len(),
-        case.caption_rows * 3,
-    )?;
-    let max_rows = model::max_latent_rows();
-    if max_rows > 0 && case.image_rows + case.caption_rows > max_rows {
-        return Err(format!(
-            "{} rows exceed the model's {max_rows} rows a pass",
-            case.image_rows + case.caption_rows
-        )
-        .into());
-    }
 
     let pipe = Pipeline::new();
-    // The denoise context lane's own pipeline: its pass and the image
-    // lane's must reach the runtime together to seal into one fire.
-    let ctx_pipe = Pipeline::new();
     // The chained check: the encoder's own rows stand in for the golden's
-    // caption (the case's pads and positions must already fit them).
+    // caption.
     let mut case = case;
     let (text_rows, text_len, text_width) = match &input.prompt {
         Some(prompt) => {
@@ -526,53 +450,54 @@ async fn main(input: Input) -> Result<Output> {
                 return Err(format!(
                     "the encoder writes {width}-wide rows and the case's caption is {} wide",
                     case.caption_width
-                )
-                .into());
+                ));
             }
-            let real = case.caption_pad.iter().filter(|flag| **flag == 0.0).count();
-            if real != len as usize {
+            if len != case.caption_rows {
                 return Err(format!(
-                    "the prompt renders to {len} tokens and the case flags {real} real caption rows"
-                )
-                .into());
+                    "the prompt renders to {len} tokens and the case's caption is {} rows",
+                    case.caption_rows
+                ));
             }
-            case.caption[..rows.len()].copy_from_slice(&rows);
+            case.caption.copy_from_slice(&rows);
             (rows, len, width)
         }
         None => (Vec::new(), 0, 0),
     };
-    let (refined, dim) = refine(&case, &pipe).await?;
+    let (refined, dim, caption_rows) = refine(&case, &pipe).await?;
+    // The refined caption: no pass writes it, so every denoise pass reads it.
+    let context = Channel::from_shaped([caption_rows, dim], refined.as_slice()).named("context");
     let (mut latent, mut sigmas, mut timesteps) = (Vec::new(), Vec::new(), Vec::new());
     let (velocity, ctx_rows) = if input.refine_only {
         (Vec::new(), Vec::new())
     } else if input.steps > 0 {
-        let (rows, s, t) = trajectory(&case, &refined, dim, input.steps, input.stop).await?;
+        let (rows, s, t) = trajectory(&case, &context, input.steps, input.stop).await?;
         latent = rows;
         sigmas = s;
         timesteps = t;
         (Vec::new(), Vec::new())
     } else {
-        denoise(&case, &refined, dim, input.ctx_tap, &ctx_pipe, &pipe).await?
+        denoise(&case, &context, input.ctx_tap, &pipe).await?
     };
-    // The readout's width: `patch_features` for the velocity, the tapped
-    // intermediate's when the family is being bisected.
-    let patch_features = if velocity.is_empty() {
-        case.patch_features
+    let voxels = velocity.len() / (case.height * case.width).max(1) as usize;
+    let readout = if voxels == case.channels as usize {
+        case.channels
     } else {
-        u32::try_from(velocity.len() / case.image_rows.max(1) as usize).unwrap_or(0)
+        case.readout_rows
+            .and_then(|rows| u32::try_from(velocity.len() / rows.max(1) as usize).ok())
+            .unwrap_or(0)
     };
-    ctx_pipe.close();
     pipe.close();
     Ok(Output {
         text: text_rows,
         text_rows: text_len,
         text_width,
         refined,
-        caption_rows: case.caption_rows,
+        caption_rows,
         dim,
+        readout,
         velocity,
-        image_rows: case.image_rows,
-        patch_features,
+        height: case.height,
+        width: case.width,
         ctx: ctx_rows,
         latent,
         sigmas,

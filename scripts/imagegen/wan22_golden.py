@@ -5,6 +5,7 @@ wan22_golden.py -- reference dump for Wan 2.2 TI2V-5B (M3).
     CUDA_VISIBLE_DEVICES=0 python wan22_golden.py --full     # ~30 GB VRAM, minutes
     python wan22_golden.py --mini                            # CPU, seconds
     CUDA_VISIBLE_DEVICES=0 python wan22_golden.py --vae      # the VAE alone, fp32
+    python wan22_golden.py --vae-ref                         # a seeded 3x16x16 latent, vae/* only
 
 Outputs -> $PIE_IMAGEGEN_GOLDEN/wan22/
     wan22_golden.npz   umT5 prompt embeds (truncate-then-zero-pad to 512), initial noise,
@@ -19,6 +20,8 @@ Outputs -> $PIE_IMAGEGEN_GOLDEN/wan22/
                        little-endian f32 in the row-per-voxel `(t, h, w)` layout pie's
                        voxel axis reads, PLUS the per-chunk boundaries the decoder's own
                        frame-by-frame loop produces (`shapes.json`)
+    wan22_vae_ref/     --vae-ref: the same dump over a seeded 3x16x16 latent
+                       (`wan22_vae_parity.py` drives it through the runtime)
     wan22_vae_encode/  --vae: that decode back IN through `_encode`, chunk by chunk --
       *.f32            the pixels, the posterior MEAN, and the mean normalised into the
                        denoiser's latent space (what pie's `vae.encode` arm answers)
@@ -58,6 +61,7 @@ MINI_CFGS = {
                  eps=1e-6, image_dim=None, added_kv_proj_dim=None, rope_max_seq_len=1024),
 }
 MINI_LATENT = (16, 5, 16, 16)
+VAE_REF_LATENT = (3, 16, 16)  # (T, h, w) for --vae-ref
 MINI_CTX_LEN = 32
 
 def run_full(d: str, dtype=torch.bfloat16):
@@ -173,34 +177,9 @@ def run_mini(d: str, device="cpu", dtype=torch.float32):
     tap.save(os.path.join(d, "wan22_mini.npz"))
     npz_keys(tap)
 
-def run_vae(d: str, device="cuda"):
-    """`AutoencoderKLWan` alone, fp32, over the full run's final latent.
-
-    The DiT works in a NORMALISED latent space and the pipeline undoes that
-    before the decode (`latents * latents_std + latents_mean`); pie's
-    `vae.decode` arms undo it themselves, so what is dumped as `latent.f32`
-    is the DiT-space latent — exactly the rows the denoise reading answers —
-    and `denorm.f32` is the decoder's own input beside it, for a bisect.
-
-    `_decode` is a LOOP: it clears the per-conv frame caches, runs
-    `post_quant_conv` over the whole latent, and then calls the decoder once
-    per latent frame carrying the caches across. Latent frame 0 lands ONE
-    output frame, every later one lands FOUR, so `F = 4*T - 3`. Both halves
-    are dumped: the whole clip's pixels, and the frame boundary each chunk
-    ends at, so a port can be scored chunk by chunk and say WHICH fire drifted.
-    """
-    from diffusers import AutoencoderKLWan
-
-    vae = AutoencoderKLWan.from_pretrained(REPO, subfolder="vae",
-                                           torch_dtype=torch.float32).to(device).eval()
+def dump_decode(raw: str, vae, z, source: str, device: str):
+    """Decode the DiT-space latent `z` in fp32 and dump it, row per voxel, to `raw`."""
     cfg = vae.config
-    full = os.path.join(d, "wan22_golden.npz")
-    if not os.path.exists(full):
-        raise SystemExit(f"{full} is missing; run `--full` first (the latent is a real one)")
-    z = np.load(full)["latent.final"]
-    z = torch.from_numpy(np.ascontiguousarray(z.reshape(z.shape[-4:]))).to(
-        device=device, dtype=torch.float32)[None]
-
     mean = torch.tensor(cfg.latents_mean, device=device, dtype=torch.float32).view(1, -1, 1, 1, 1)
     std = torch.tensor(cfg.latents_std, device=device, dtype=torch.float32).view(1, -1, 1, 1, 1)
     denorm = z * std + mean
@@ -212,7 +191,6 @@ def run_vae(d: str, device="cuda"):
     frames = int(x.shape[2])
     assert frames == 4 * t_lat - 3, f"{t_lat} latent frames should land {4 * t_lat - 3}, not {frames}"
 
-    raw = os.path.join(d, "wan22_vae")
     os.makedirs(raw, exist_ok=True)
     shapes = {}
     for key, t in (("latent", z[0]), ("denorm", denorm[0]), ("pixels", x[0])):
@@ -225,7 +203,7 @@ def run_vae(d: str, device="cuda"):
     shapes["latents_mean"] = [float(v) for v in cfg.latents_mean]
     shapes["latents_std"] = [float(v) for v in cfg.latents_std]
     shapes["clip_output"] = bool(cfg.clip_output)
-    shapes["source"] = "latent.final of wan22_golden.npz"
+    shapes["source"] = source
     with open(os.path.join(raw, "shapes.json"), "w") as f:
         json.dump(shapes, f, indent=2)
 
@@ -236,7 +214,36 @@ def run_vae(d: str, device="cuda"):
     print(f"  vae: latent {tuple(z.shape)} -> pixels {tuple(x.shape)} "
           f"[{float(x.min()):.3f}, {float(x.max()):.3f}]; chunks {shapes['chunks']}")
 
+    return x, mean, std
+
+def run_vae(d: str, device="cuda", repo=REPO):
+    """`AutoencoderKLWan` alone, fp32, over the full run's final latent."""
+    from diffusers import AutoencoderKLWan
+
+    vae = AutoencoderKLWan.from_pretrained(repo, subfolder="vae",
+                                           torch_dtype=torch.float32).to(device).eval()
+    full = os.path.join(d, "wan22_golden.npz")
+    if not os.path.exists(full):
+        raise SystemExit(f"{full} is missing; run `--full` first (the latent is a real one)")
+    z = np.load(full)["latent.final"]
+    z = torch.from_numpy(np.ascontiguousarray(z.reshape(z.shape[-4:]))).to(
+        device=device, dtype=torch.float32)[None]
+
+    x, mean, std = dump_decode(os.path.join(d, "wan22_vae"), vae, z,
+                               "latent.final of wan22_golden.npz", device)
+
     run_vae_encode(d, vae, x, mean, std)
+
+def run_vae_seeded(d: str, device="cuda", repo=REPO):
+    """`dump_decode` over a seeded `VAE_REF_LATENT`; needs only `vae/*`, not `--full`."""
+    from diffusers import AutoencoderKLWan
+
+    vae = AutoencoderKLWan.from_pretrained(repo, subfolder="vae",
+                                           torch_dtype=torch.float32).to(device).eval()
+    g = torch.Generator().manual_seed(SEED)
+    z = torch.randn((1, vae.config.z_dim, *VAE_REF_LATENT), generator=g).to(device)
+    dump_decode(os.path.join(d, "wan22_vae_ref"), vae, z,
+                f"torch.randn seed {SEED}, [1, {vae.config.z_dim}, {VAE_REF_LATENT}]", device)
 
 def run_vae_encode(d, vae, x, mean, std):
     """The same clip back IN: `AutoencoderKLWan._encode` over the decoded pixels.
@@ -283,13 +290,20 @@ def run_vae_encode(d, vae, x, mean, std):
           f"normalised [{float(normalised.min()):.3f}, {float(normalised.max()):.3f}]")
 
 def main():
+    global HEIGHT, WIDTH, FRAMES
     ap = argparse.ArgumentParser()
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--mini", action="store_true")
     ap.add_argument("--vae", action="store_true")
+    ap.add_argument("--vae-ref", action="store_true")
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--repo", default=REPO, help="hub id or a local snapshot dir")
+    ap.add_argument("--height", type=int, default=HEIGHT)
+    ap.add_argument("--width", type=int, default=WIDTH)
+    ap.add_argument("--frames", type=int, default=FRAMES)
     a = ap.parse_args()
-    if not (a.full or a.mini or a.vae):
+    HEIGHT, WIDTH, FRAMES = a.height, a.width, a.frames
+    if not (a.full or a.mini or a.vae or a.vae_ref):
         a.full = a.mini = a.vae = True
     d = outdir(MODEL)
     torch.set_grad_enabled(False)
@@ -298,7 +312,10 @@ def main():
     if a.full:
         print("== full =="); run_full(d)
     if a.vae:
-        print("== vae =="); run_vae(d, "cuda" if torch.cuda.is_available() else "cpu")
+        print("== vae =="); run_vae(d, "cuda" if torch.cuda.is_available() else "cpu", a.repo)
+    if a.vae_ref:
+        print("== vae-ref =="); run_vae_seeded(d, "cuda" if torch.cuda.is_available() else "cpu",
+                                               a.repo)
     manifest(d, {"repo": REPO, "prompt": PROMPT, "seed": SEED, "steps": STEPS,
                  "height": HEIGHT, "width": WIDTH, "frames": FRAMES})
 

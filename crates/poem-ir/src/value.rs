@@ -133,7 +133,6 @@ pub enum GeomKind {
     GroupOfLane,
     GroupIndptr { select: Selection },
     LaneIndptr { select: Selection },
-    ReferenceTag { select: Selection },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -189,8 +188,13 @@ pub enum RuntimeInput {
     Tokens,
     Positions,
     MropePositions,
-    Mask { space: u32 },
-    Geometry { space: u32, kind: GeomKind },
+    Mask {
+        space: u32,
+    },
+    Geometry {
+        space: u32,
+        kind: GeomKind,
+    },
     ReadoutRows,
     AdapterRoutes,
     Patches,
@@ -198,16 +202,49 @@ pub enum RuntimeInput {
     PatchRoutes,
     PatchPositions,
     ImageGrids,
-    SelfCondRows,
-    SelfCondWeights,
-    RowPermutation { select: Selection },
-    Latents { port: u8, width: u32 },
-    LaneVector { port: u8, width: u32 },
-    Context { port: u8, width: u32 },
-    AxisPositions { port: u8, axes: u8 },
+    RowPermutation {
+        select: Selection,
+    },
     Grid,
-    Voxels { port: u8, channels: u32 },
-    TokenGrid { p: [u32; 3] },
+    /// `[Clips, 4]` i32, each clip's `[t / p0, h / p1, w / p2, first token row]`; a voxel lane's
+    /// token rows are its clips' patches, (t, h, w) row-major, then pad rows.
+    TokenGrid {
+        p: [u32; 3],
+    },
+    /// Entry `id` of [`crate::Trace::inputs`].
+    Guest {
+        id: u32,
+        axis: InputAxis,
+        width: u32,
+        dtype: Dtype,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum InputAxis {
+    Lane,
+    Row,
+    Voxel,
+}
+
+impl InputAxis {
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            InputAxis::Lane => "lane",
+            InputAxis::Row => "row",
+            InputAxis::Voxel => "voxel",
+        }
+    }
+
+    #[must_use]
+    pub fn dim(self) -> Dim {
+        match self {
+            InputAxis::Lane => Dim::Lanes,
+            InputAxis::Row => Dim::Tokens,
+            InputAxis::Voxel => Dim::Voxels,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -129,7 +129,10 @@ pub fn conv3d(
     cache: Option<Operand>,
     y: Landing,
     y_grid: Operand,
+    bases: [u32; 2],
 ) -> Result<Val, Error> {
+    let grid = crate::conv::rebased(f, grid, bases[0])?;
+    let y_grid = crate::conv::rebased(f, y_grid, bases[1])?;
     const OP: &str = "conv.conv3d";
     lane_pair(OP, grid, y_grid)?;
     conv_checks(OP, x, w, bias, &conv, cache, y)?;

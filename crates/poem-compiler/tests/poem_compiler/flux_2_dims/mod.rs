@@ -5,12 +5,10 @@ pub const IN_CHANNELS: u32 = 128;
 pub const VAE_CHANNELS: u32 = 32;
 pub const PACK: u32 = 2;
 pub const VAE_COMPRESSION: u32 = 8;
-pub const TOKEN_COMPRESSION: u32 = VAE_COMPRESSION * PACK;
 
 pub const HEAD_DIM: u32 = 128;
 pub const ROPE_DIMS: [u32; 4] = [32, 32, 32, 32];
 pub const ROPE_THETA: f32 = 2000.0;
-pub const ROPE_AXES: u8 = 4;
 
 pub const T_FREQ_DIM: u32 = 256;
 pub const T_MAX_PERIOD: f32 = 10_000.0;
@@ -25,16 +23,6 @@ pub const TE_HIDDEN: u32 = 2560;
 pub const TE_HEAD_DIM: u32 = 128;
 pub const TE_LAYERS: u32 = 27;
 pub const TE_CONTEXT_WIDTH: u32 = 3 * TE_HIDDEN;
-
-pub mod port {
-    pub const LATENTS: u8 = 0;
-    pub const CONTEXT: u8 = 0;
-    pub const TIMESTEP: u8 = 0;
-    pub const GUIDANCE: u8 = 1;
-    pub const POSITIONS: u8 = 0;
-    pub const VOXELS: u8 = 0;
-    pub const PIXEL_VOXELS: u8 = 1;
-}
 
 pub mod vae {
     pub const GN_GROUPS: u32 = 32;
@@ -79,28 +67,6 @@ impl Dims {
             guidance_embeds: true,
         }
     }
-}
-
-/// The reading each of a row's passes runs, by name, as its generative facts
-/// number them: (text, denoise, vae.decode, vae.encode).
-#[must_use]
-pub fn readings(row: &str) -> (Option<u8>, u8, Option<u8>, Option<u8>) {
-    let facts = poem_compiler::catalog::deployment(row)
-        .and_then(|d| d.generative().clone())
-        .unwrap_or_else(|| panic!("`{row}` is a generative row"));
-    let index = |name: &str| {
-        facts
-            .readings
-            .iter()
-            .find(|r| r.name == name)
-            .map(|r| r.index)
-    };
-    (
-        index("text"),
-        index("denoise").expect("a denoise reading"),
-        index("vae.decode"),
-        index("vae.encode"),
-    )
 }
 
 /// The flow schedule's shift for `image_rows` and `steps`, as the reference

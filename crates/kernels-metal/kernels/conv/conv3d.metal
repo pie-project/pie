@@ -73,6 +73,8 @@ template <typename T>
     const constant int& rows_out      [[buffer(21)]],
     const constant int& has_cache     [[buffer(22)]],
     const constant uint& has_bias     [[buffer(23)]],
+    const constant int& x_base        [[buffer(24)]],
+    const constant int& o_base        [[buffer(25)]],
     uint2 tgid                        [[threadgroup_position_in_grid]],
     uint simd_gid                     [[simdgroup_index_in_threadgroup]],
     uint simd_lid                     [[thread_index_in_simdgroup]],
@@ -88,15 +90,18 @@ template <typename T>
   const int n = int(tgid.x * simds + simd_gid);
   if (row >= g.rows_out || n >= g.c_out) return;
 
+  // `x_base` / `o_base`: `x`'s and `o`'s row 0 in the grids' fire-wide rows.
   SpatialClip og;
-  const int l = clip_of(o_grid, g.clips, row, og);
+  const int fire_row = row + o_base;
+  const int l = clip_of(o_grid, g.clips, fire_row, og);
   device T* out = o + size_t(row) * size_t(g.c_out) + size_t(n);
   if (l < 0) {
     if (simd_lid == 0) *out = static_cast<T>(0.0f);
     return;
   }
-  const SpatialClip in = clip_at(grid, l);
-  const SpatialVoxel v = unravel(og, row - og.off);
+  SpatialClip in = clip_at(grid, l);
+  in.off -= x_base;
+  const SpatialVoxel v = unravel(og, fire_row - og.off);
 
   int planes = 0;
   for (int j = 0; j < l; ++j) planes += clip_plane(clip_at(grid, j));
@@ -139,6 +144,7 @@ template <typename T>
       const constant int&, const constant int&, const constant int&,       \
       const constant int&, const constant int&, const constant int&,       \
       const constant int&, const constant uint&,                           \
+      const constant int&, const constant int&,                            \
       uint2, uint, uint, uint);
 
 instantiate_conv3d(bfloat16, bfloat)

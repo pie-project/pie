@@ -124,7 +124,6 @@ export enum Intrinsic {
   MTP_LOGITS = 1,
   HIDDEN = 2,
   QUERY = 3,
-  VALUE_HEAD = 4,
   LAYER = 5,
   MTP_DRAFTS = 6,
   ATTN_SCORE = 7,
@@ -289,7 +288,7 @@ export const OP_TABLE: ReadonlyMap<number, Row> = new Map<number, Row>([
   [tags.CHAN_TAKE, ['chan_take', 1, [Field.CHAN]]],
   [tags.CHAN_READ, ['chan_read', 1, [Field.CHAN]]],
   [tags.CHAN_PUT, ['chan_put', 0, [Field.CHAN, V]]],
-  [tags.INTRINSIC_VAL, ['intrinsic_val', 1, [Field.INTRINSIC, Field.DTYPE, Field.SHAPE]]],
+  [tags.INTRINSIC_VAL, ['intrinsic_val', 1, [Field.INTRINSIC, Field.IMM, Field.DTYPE, Field.SHAPE]]],
   [tags.KERNEL_CALL, ['kernel_call', 1, [Field.NAME, Field.DTYPE, Field.SHAPE, Field.ARGS]]],
   [tags.SINK_CALL, ['sink_call', 0, [Field.NAME, Field.ARGS]]],
 ]);
@@ -412,9 +411,11 @@ export class Op {
     op.chan = chan;
     return op;
   }
-  static intrinsicVal(intr: Intrinsic, shape: Shape, dt: Dtype): Op {
+  /** `lane` (0 for non-per-lane intrinsics) rides the op's imm. */
+  static intrinsicVal(intr: Intrinsic, shape: Shape, dt: Dtype, lane = 0): Op {
     const op = new Op(tags.INTRINSIC_VAL);
     op.intr = intr;
+    op.imms = [lane];
     op.shape = shape;
     op.dtype = dt;
     return op;
@@ -492,6 +493,8 @@ export interface TraceContainer {
   ports: PortBinding[];
   stages: StageProgram[];
   externs: ExternDecl[];
+  /** The channels the forward reads as guest model inputs, sorted, unique. */
+  inputs: number[];
 }
 
 class Writer {
@@ -595,14 +598,17 @@ const utf8 = new TextEncoder();
 export function encode(c: TraceContainer): Uint8Array {
   const w = new Writer();
   w.bytes(ETA_MAGIC);
-  const v2 = c.externs.length > 0;
+  const v2 = c.externs.length > 0 || c.inputs.length > 0;
   w.u16(v2 ? ETA_VERSION_EXTERN : ETA_VERSION);
   w.u16(0);
   w.u32(c.names.length);
   w.u32(c.channels.length);
   w.u32(c.ports.length);
   w.u32(c.stages.length);
-  if (v2) w.u32(c.externs.length);
+  if (v2) {
+    w.u32(c.externs.length);
+    w.u32(c.inputs.length);
+  }
   for (const n of c.names) {
     const b = utf8.encode(n);
     w.u16(b.length);
@@ -630,6 +636,7 @@ export function encode(c: TraceContainer): Uint8Array {
     w.u8(e.direction);
     w.u32(e.chan);
   }
+  for (const chan of c.inputs) w.u32(chan);
   return w.finish();
 }
 

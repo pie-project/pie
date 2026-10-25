@@ -20,12 +20,16 @@ from dataclasses import dataclass
 
 from wit_world.imports import model as _model
 
-AxisRole = _model.AxisRole
-ForwardKind = _model.ForwardKind
-LaneStream = _model.LaneStream
-PortKind = _model.PortKind
+InputAxis = _model.InputAxis
+InputDecl = _model.InputDecl
+LaneDecl = _model.LaneDecl
+Readout = _model.Readout
 ReadoutKind = _model.ReadoutKind
+RowCount = _model.RowCount
+RowCount_Exact = _model.RowCount_Exact
+RowCount_Multiple = _model.RowCount_Multiple
 ScheduleKind = _model.ScheduleKind
+SwitchDecl = _model.SwitchDecl
 
 from .tokenizer import (  # noqa: F401 — re-exported, as the Rust `model` module does
     encode,
@@ -69,41 +73,18 @@ class BlockDrafter:
 
     rows: int
     mask_token: int
-    bidirectional: bool
     proposals_from: int
 
 
 def draft_block() -> BlockDrafter | None:
     """The bound model's block drafter, if it carries one."""
     d = _model.draft_block()
-    return BlockDrafter(d.rows, d.mask_token, d.bidirectional, d.proposals_from) if d is not None else None
-
-
-@dataclass(frozen=True)
-class CanvasShape:
-    """The canvas a diffusion model denoises: tokens per block, the trunk's
-    hidden width, and how many ``(id, weight)`` self-conditioning taps a
-    canvas row takes."""
-
-    length: int
-    hidden: int
-    self_cond_taps: int
-
-
-def canvas() -> CanvasShape | None:
-    """The diffusion canvas; ``None`` for every other pass kind."""
-    c = _model.canvas()
-    return CanvasShape(c.length, c.hidden, c.self_cond_taps) if c is not None else None
+    return BlockDrafter(d.rows, d.mask_token, d.proposals_from) if d is not None else None
 
 
 def run_ahead_window() -> int:
     """Fires one lane may have submitted and not yet taken."""
     return _model.run_ahead_window()
-
-
-def pass_kind() -> _model.ForwardKind:
-    """The bound model's forward-pass interface; never derive it from :func:`architecture`."""
-    return _model.pass_kind()
 
 
 def output_vocab_size() -> int:
@@ -141,15 +122,19 @@ def rs_state_size() -> int:
 # -- generative facts ----------------------------------------------------------
 
 
-def readings() -> list:
-    """Every reading the bound model declares (`model.ReadingFact`), in
-    index order; empty for a text row (one implicit reading)."""
-    return _model.readings()
+def switches() -> list[SwitchDecl]:
+    """Every switch the bound model declares; each value list's first is its default."""
+    return _model.switches()
 
 
-def reading(name: str):
-    """The declared reading named `name`, or ``None``."""
-    return next((r for r in _model.readings() if r.name == name), None)
+def switch(name: str) -> SwitchDecl | None:
+    """The switch `name` the model declares, or ``None``."""
+    return next((d for d in _model.switches() if d.name == name), None)
+
+
+def lane(switches: list[tuple[str, str]]) -> LaneDecl:
+    """The lane of these ``(name, value)`` switches; unset ones take their defaults."""
+    return _model.lane(list(switches))
 
 
 def latent():
@@ -163,5 +148,5 @@ def schedule():
 
 
 def max_latent_rows() -> int:
-    """The most latent rows one pass carries; 0 without a float lane."""
+    """The most rows one lane may carry."""
     return _model.max_latent_rows()

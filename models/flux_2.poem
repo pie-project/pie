@@ -284,6 +284,7 @@ def layout(id, deploy):
         # 1/sqrt(128) as the reference rounds it, an ulp above the f32 quotient.
         sm_scale = 0.08838835,
         rope_axes = ROPE_AXES,
+        reference_shift = weight([1], dtype.f32, values = [float(REFERENCE_TIME_STRIDE)]),
         t_freq_dim = T_FREQ_DIM,
         dit = struct(
             x_embed = weight([dim, IN_CHANNELS], banks),
@@ -337,79 +338,12 @@ def sigmas(image_rows, steps):
     return out
 
 def generative(m):
-    d = m.dims
-    next = [0]
-
-    def take():
-        next[0] += 1
-        return next[0] - 1
-
-    text = take() if m.te != None else None
-    denoise = take()
-    vae_decode = take() if m.vae != None else None
-    vae_encode = take() if m.vae != None else None
-    readings = []
-    if text != None:
-        readings.append(reading(
-            "text",
-            index = text,
-            has_kv = True,
-            takes_tokens = True,
-            streams = ["text"],
-            readout = "hidden",
-            readout_width = d.dim,
-        ))
-    image_side = ["image", "reference"]
-    every = ["text", "image", "reference"]
-    ports = [
-        port("latents", "latents", IN_CHANNELS, image_side),
-        port("context", "context", d.dim if m.te != None else d.context_in, ["text"]),
-        port("timestep", "lane_vector", 1, every),
-    ]
-    if d.guidance_embeds:
-        ports.append(port("guidance", "lane_vector", 1, every))
-    ports.append(port("positions", "axis_positions", ROPE_AXES, every))
-    readings.append(reading(
-        "denoise",
-        index = denoise,
-        streams = every,
-        ports = ports,
-        positions = positions(
-            axes = ["time", "height", "width", "index"],
-            text_axis = 3,
-            text_origin = 0,
-            image_follows_text = False,
-            reference_stride = REFERENCE_TIME_STRIDE,
-        ),
-        readout = "velocity",
-        readout_width = IN_CHANNELS,
-    ))
-    if vae_decode != None and vae_encode != None:
-        readings.append(reading(
-            "vae.decode",
-            index = vae_decode,
-            streams = ["image"],
-            ports = [port("latent", "voxels", IN_CHANNELS, ["image"])],
-            readout = "pixels",
-            readout_width = RGB,
-        ))
-        readings.append(reading(
-            "vae.encode",
-            index = vae_encode,
-            streams = ["image"],
-            ports = [port("pixels", "voxels", RGB, ["image"], at = 1)],
-            readout = "pixels",
-            readout_width = IN_CHANNELS,
-        ))
     return generation(
-        readings = readings,
         latent = latent_space(
-            channels = IN_CHANNELS,
-            patch_t = 1,
-            patch_h = 1,
-            patch_w = 1,
-            spatial_compression = TOKEN_COMPRESSION,
+            channels = VAE_CHANNELS,
+            spatial_compression = TOKEN_COMPRESSION // PACK,
             temporal_compression = 1,
+            first_frames = 1,
         ),
         schedule = schedule(
             "flow",
@@ -417,7 +351,6 @@ def generative(m):
             train_steps = TRAIN_STEPS,
             pinned_sigmas = sigmas(4096, 4),
         ),
-        max_rows = 5 * 4096 + TE_MAX_TOKENS if m.te != None else 4096,
     )
 
 # How a FLUX.2 checkpoint is laid out: a diffusers pipeline, its components
@@ -744,7 +677,7 @@ def vae_encode(vae, arm):
     """The encoder's output over `arm`'s pixels, and its grid."""
     e = vae.encoder
     grid = arm.grid()
-    x = arm.voxels(1, RGB, dtype.bf16)
+    x = arm.input("pixels", dtype.bf16, "voxel", RGB)
     h = convolve(x, grid, e.conv_in)
     for block in e.down:
         for res in block.resnets:
@@ -808,12 +741,18 @@ def caches(m, c):
         qwen3_caches(m.te, c, m.kv)
 
 def forward(m, inputs):
+    text_reading = ["text"] if m.te != None else []
+    vae_readings = ["vae.decode", "vae.encode"] if m.vae != None else []
+    switch("reading", text_reading + ["denoise"] + vae_readings)
+    switch("stream", ["text", "image", "reference"])
+    switch("positions", ["computed", "given"])
+    reading = lambda name: inputs.on(switch_is("reading", name))
     if m.te != None:
-        inputs.reading("text", lambda rows: text(rows, m))
-    velocity = inputs.reading("denoise", lambda rows: denoise(rows, m))
+        text(reading("text"), m)
+    velocity = denoise(reading("denoise"), m)
     if m.vae != None:
-        inputs.reading("vae.decode", lambda rows: decode(rows, m))
-        inputs.reading("vae.encode", lambda rows: encode(rows, m))
+        decode(reading("vae.decode"), m)
+        encode(reading("vae.encode"), m)
     return velocity
 
 def text(arm, m):
@@ -856,14 +795,31 @@ def turn(x, gain, positions, hd):
         hd,
     )
 
+def turn_positions(arm, m):
+    """Reference image `k`'s patches sit `REFERENCE_TIME_STRIDE · (k + 1)` frames on."""
+    given = switch_is("positions", "given")
+    reference = switch_is("stream", "reference")
+    cells, _ = ops.gather.split_rows(ops.conv.cells(arm.token_grid([1, m.pack, m.pack]), arm.positions(), m.rope_axes - 1), m.rope_axes)
+    ref = arm.on(reference)
+    k = ref.input("reference", dtype.f32, "lane", 1)
+    # 10 · (k + 1): `k + k` makes the value the scale owns.
+    shift = ops.elemwise.add_bias(
+        m.reference_shift,
+        ops.elemwise.mul_scalar(f32(REFERENCE_TIME_STRIDE / 2.0), ops.elemwise.add(k, k)),
+    )
+    t, rest = ops.gather.split_rows(cells.on(reference), 1)
+    t = ops.elemwise.add(t, ops.gather.gather_rows(shift, ref.request_of_token()))
+    computed = merge([cells.on(~reference), ops.gather.concat_cols([t, rest])])
+    return merge([arm.on(given).input("positions", dtype.f32, "row", m.rope_axes), computed.on(~given)])
+
 def denoise(arm, m):
     d, dit = m.dims, m.dit
     dim, hd = d.dim, m.head_dim
-    text, image = fact.stream("text"), fact.stream("image")
+    text, image = switch_is("stream", "text"), switch_is("stream", "image")
     txt_in, img_in = arm.on(text), arm.on(~text)
 
     lanes = arm.request_of_token()
-    positions = arm.axis_positions(0, m.rope_axes)
+    positions = turn_positions(arm, m)
     joint = struct(perm = arm.row_permutation(), csr = arm.group_indptr())
 
     def attention(q, k, v):
@@ -879,10 +835,10 @@ def denoise(arm, m):
         h = ops.linear.glu(ops.linear.matmul(h, ff.linear_in), gating.swiglu(), d.inter)
         return ops.elemwise.gated_residual_add(x, mods.gate, ops.linear.matmul(h, ff.linear_out), lanes)
 
-    t = arm.lane_vector(0, 1)
+    t = arm.input("timestep", dtype.f32, "lane", 1)
     temb = embed(dit.t_embed, ops.elemwise.sinusoid(t, m.t_freq_dim, T_MAX_PERIOD, True, 1.0))
     if dit.g_embed != None:
-        g = arm.lane_vector(1, 1)
+        g = arm.input("guidance", dtype.f32, "lane", 1)
         gemb = embed(dit.g_embed, ops.elemwise.sinusoid(g, m.t_freq_dim, T_MAX_PERIOD, True, GUIDANCE_SCALE))
         temb = ops.elemwise.add(temb, gemb)
     stemb = ops.elemwise.silu(temb)
@@ -896,12 +852,15 @@ def denoise(arm, m):
     pos_txt, pos_img = positions.on(text), positions.on(~text)
 
     if dit.context_embed != None:
-        txt = ops.linear.matmul(txt_in.context(0, d.context_in), dit.context_embed)
+        txt = ops.linear.matmul(txt_in.input("context", dtype.bf16, "row", d.context_in), dit.context_embed)
     else:
-        c = txt_in.context(0, dim)
+        c = txt_in.input("context", dtype.bf16, "row", dim)
         perm = txt_in.row_permutation()
         txt = ops.gather.unpack_rows(ops.gather.pack_rows(c, perm), perm)
-    img = ops.linear.matmul(img_in.latents(0, m.in_channels, dtype.bf16), dit.x_embed)
+    patch = [1, m.pack, m.pack]
+    grid, tgrid = img_in.grid(), img_in.token_grid(patch)
+    latents = img_in.input("latents", dtype.bf16, "voxel", VAE_CHANNELS)
+    img = ops.linear.matmul(ops.conv.patchify(latents, grid, patch, tgrid), dit.x_embed)
 
     def double(l, block, carried):
         txt, img = carried
@@ -945,17 +904,22 @@ def denoise(arm, m):
     mod_out = mod_out.on(image)
     lanes_target = lanes_img.on(image)
     h = norm_modulate(target, mod_out, lanes_target, NORM_EPS)
-    velocity = ops.linear.matmul(h, dit.proj_out)
+    image_in = img_in.on(image)
+    velocity = ops.conv.unpatchify(
+        ops.linear.matmul(h, dit.proj_out),
+        image_in.token_grid(patch),
+        patch,
+        image_in.grid(),
+    )
     seam.at(seam.VELOCITY, [velocity])
     return velocity
 
 def decode(arm, m):
     lat = m.vae.latent
     grid = arm.grid()
-    z = arm.voxels(0, m.in_channels, dtype.bf16)
-    # The standardize below folds in place, and may not write the input:
-    # a unit upsample is the decode's fresh copy of it.
-    z, grid = ops.conv.upsample_nearest(z, grid, [1, 1, 1], False)
+    z = arm.input("latent", dtype.bf16, "voxel", VAE_CHANNELS)
+    # The batch norm is per packed channel; the pack is also the input's fresh copy.
+    z, grid = ops.conv.pixel_unshuffle(z, grid, [1, m.pack, m.pack])
     z = ops.elemwise.standardize(z, lat.bn_zero, lat.bn_scale)
     z = ops.elemwise.add_bias(lat.bn_mean, z)
     z, grid = ops.conv.pixel_shuffle(z, grid, [1, m.pack, m.pack])
@@ -968,5 +932,6 @@ def encode(arm, m):
     mean = convolve(h, grid, lat.quant_conv)
     packed, grid = ops.conv.pixel_unshuffle(mean, grid, [1, m.pack, m.pack])
     z = ops.elemwise.standardize(packed, lat.bn_mean, lat.bn_rscale)
+    z, grid = ops.conv.pixel_shuffle(z, grid, [1, m.pack, m.pack])
     seam.at(seam.PIXELS, [z, grid])
     return z

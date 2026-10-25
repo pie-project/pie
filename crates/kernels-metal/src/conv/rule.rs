@@ -1,6 +1,7 @@
-use crate::encode::{Arg, Ctx, Fire, Grid, stated};
+use crate::encode::{Arg, Ctx, Fire, Grid, refuse, stated};
 use crate::error::Error;
 use crate::tensor::Tensor;
+use dtype::Dtype;
 
 const FILE: &str = "conv/rule.metal";
 
@@ -130,6 +131,116 @@ pub fn derive_grid(
             geom.d[2].arg(),
             geom.flag.arg(),
             geom.clips.arg(),
+        ],
+    )
+}
+
+/// `ops::conv::cells`; `base` is `y`'s row 0 in `tgrid`'s fire-wide rows.
+pub fn cells(
+    ctx: &Ctx<'_>,
+    tgrid: Tensor,
+    positions: Tensor,
+    axis: u32,
+    y: Tensor,
+    base: u32,
+) -> Result<(), Error> {
+    const OP: &str = "conv.cells";
+    let clips = super::clips_of(OP, tgrid)?;
+    if positions.dtype != Dtype::I32 || y.dtype != Dtype::F32 || y.width != axis.max(2) + 4 {
+        return Err(refuse(
+            OP,
+            "the positions are i32 and the cells max(3, axis + 1) + 3 f32 columns",
+        ));
+    }
+    if y.rows == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        Fire::at(FILE, "cells").apply(Grid::of([y.rows, 1, 1], [256.min(y.rows), 1, 1])),
+        &[
+            tgrid.arg(),
+            positions.arg(),
+            y.arg_mut(),
+            stated(OP, clips)?.arg(),
+            stated(OP, axis)?.arg(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, y.rows)?.arg(),
+            stated(OP, base)?.arg(),
+        ],
+    )
+}
+
+pub fn group_first(
+    ctx: &Ctx<'_>,
+    x: Tensor,
+    csr: Tensor,
+    groups: Tensor,
+    lanes: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "gather.group_first";
+    if [csr.dtype, groups.dtype, lanes.dtype] != [Dtype::I32; 3]
+        || x.dtype != Dtype::F32
+        || y.dtype != Dtype::F32
+        || y.width != x.width
+        || csr.rows == 0
+    {
+        return Err(refuse(
+            OP,
+            "the tables are i32 and the rows as many f32 columns as the packed rows",
+        ));
+    }
+    if y.rows == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        Fire::at(FILE, "group_first").apply(Grid::of([y.rows, 1, 1], [256.min(y.rows), 1, 1])),
+        &[
+            x.arg(),
+            csr.arg(),
+            groups.arg(),
+            lanes.arg(),
+            y.arg_mut(),
+            stated(OP, y.width)?.arg(),
+            stated(OP, x.rows)?.arg(),
+            stated(OP, groups.rows)?.arg(),
+            stated(OP, csr.rows - 1)?.arg(),
+            stated(OP, y.rows)?.arg(),
+        ],
+    )
+}
+
+pub fn group_rows(
+    ctx: &Ctx<'_>,
+    csr: Tensor,
+    groups: Tensor,
+    lanes: Tensor,
+    y: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "gather.group_rows";
+    if [csr.dtype, groups.dtype, lanes.dtype] != [Dtype::I32; 3]
+        || y.dtype != Dtype::F32
+        || y.width != 1
+        || csr.rows == 0
+    {
+        return Err(refuse(
+            OP,
+            "the tables are i32 and the counts one f32 column",
+        ));
+    }
+    if y.rows == 0 {
+        return Ok(());
+    }
+    ctx.fire(
+        Fire::at(FILE, "group_rows").apply(Grid::of([y.rows, 1, 1], [256.min(y.rows), 1, 1])),
+        &[
+            csr.arg(),
+            groups.arg(),
+            lanes.arg(),
+            y.arg_mut(),
+            stated(OP, groups.rows)?.arg(),
+            stated(OP, csr.rows - 1)?.arg(),
+            stated(OP, y.rows)?.arg(),
         ],
     )
 }

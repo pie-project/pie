@@ -29,6 +29,7 @@ fn close(got: f32, want: f32, what: &str, at: usize) {
 fn the_bare_binary_and_activation_ops_answer_the_reference_every_case() {
     the_bare_ops_answer_the_reference();
     each_may_write_the_rectangle_it_read();
+    div_mod_and_sqrt_answer_the_reference_in_f32();
 }
 
 fn the_bare_ops_answer_the_reference() {
@@ -86,5 +87,45 @@ fn each_may_write_the_rectangle_it_read() {
     for at in 0..N {
         assert_eq!(got_sum[at], to_bf16(x[at] + y[at]), "add in place at {at}");
         assert_eq!(got_tanh[at], to_bf16(x[at].tanh()), "tanh in place at {at}");
+    }
+}
+
+/// Position arithmetic: f32 quotients, floored moduli and square roots.
+fn div_mod_and_sqrt_answer_the_reference_in_f32() {
+    let x: Vec<f32> = (0..N).map(|i| i as f32 * 0.75 - 200.0).collect();
+    let y: Vec<f32> = (0..N)
+        .map(|i| {
+            let m = (i % 7) as f32 + 1.0;
+            if i % 3 == 0 { -m } else { m }
+        })
+        .collect();
+    let mut gpu = Gpu::open();
+    let x_at = gpu.up(&x);
+    let y_at = gpu.up(&y);
+    let out = [(); 3].map(|()| gpu.zeros(N * 4));
+    let sq = gpu.up(&x.iter().map(|v| v.abs()).collect::<Vec<f32>>());
+    let ctx = gpu.ctx();
+    let rect = |at: u64| Tensor::new(at, ROWS as u32, WIDTH as u32, Dtype::F32);
+
+    pointwise::div(&ctx, rect(x_at), rect(y_at), &mut rect(out[0])).expect("fires");
+    pointwise::modulo(&ctx, rect(x_at), rect(y_at), &mut rect(out[1])).expect("fires");
+    pointwise::sqrt(&ctx, rect(sq), &mut rect(out[2])).expect("fires");
+    gpu.sync();
+
+    let got: Vec<Vec<f32>> = out.iter().map(|&at| gpu.down(at, N)).collect();
+    for at in 0..N {
+        let (a, b) = (x[at], y[at]);
+        close(got[0][at], a / b, "div", at);
+        let want = a - b * (a / b).floor();
+        assert!(
+            (got[1][at] - want).abs() <= 1e-4,
+            "mod at {at}: {} against {want}",
+            got[1][at]
+        );
+        assert!(
+            want == 0.0 || want.signum() == b.signum(),
+            "the floored modulo takes the divisor's sign"
+        );
+        close(got[2][at], a.abs().sqrt(), "sqrt", at);
     }
 }

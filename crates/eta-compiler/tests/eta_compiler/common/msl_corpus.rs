@@ -3,7 +3,7 @@
 use eta_compiler::plan::{CompiledStage, compile_bound, debug_stage_plan};
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{KernelInfo, ModelProfile, SinkScope, Stage};
+use eta_ir::registry::{EngineCaps, Graph, Readout, ReadoutKind, Stage};
 use eta_ir::types::{Dtype, RngKind, Shape};
 use eta_ir::validate::bind;
 
@@ -24,7 +24,6 @@ pub const GOLDEN_NAMES: &[&str] = &[
     "neg_spsc_second_producer",
     "neg_t10_nonreplayable",
     "nucleus_sample",
-    "pentathlon_iter",
     "pivot_predicates_multistage",
     "section3_masked_gumbel",
     "structured_masks",
@@ -54,8 +53,43 @@ pub fn golden_container(name: &str) -> TraceContainer {
     eta_ir::container::decode(&unhex(line)).unwrap_or_else(|e| panic!("{name}: {e:?}"))
 }
 
-pub fn golden_profile(name: &str) -> ModelProfile {
-    let mut profile = ModelProfile::dummy();
+#[derive(Clone, Copy, Debug)]
+pub struct Served {
+    pub vocab: u32,
+    pub graph: Graph,
+    pub caps: EngineCaps,
+}
+
+impl Served {
+    pub fn of(vocab: u32) -> Served {
+        Served {
+            vocab,
+            graph: Graph {
+                num_layers: 2,
+                mtp_logits: true,
+                mtp_depth: 1,
+                attn_score: true,
+            },
+            caps: EngineCaps {
+                lora: true,
+                attn_page_mask: true,
+            },
+        }
+    }
+
+    pub fn bind(
+        &self,
+        container: TraceContainer,
+    ) -> Result<eta_ir::validate::BoundTrace, eta_ir::validate::ValidateError> {
+        let logits = Readout {
+            kind: ReadoutKind::Logits,
+            width: self.vocab,
+        };
+        bind(container, vec![Some(logits)], self.graph, self.caps)
+    }
+}
+
+pub fn golden_served(name: &str) -> Served {
     match name {
         "counter_pingpong"
         | "lora_prologue"
@@ -64,29 +98,18 @@ pub fn golden_profile(name: &str) -> ModelProfile {
         | "neg_sink_at_epilogue"
         | "neg_spsc_second_producer"
         | "section3_masked_gumbel"
-        | "structured_masks" => {}
-        "staged_dispatch" => profile.vocab = 4,
-        "beam_epilogue" => {
-            profile.vocab = 8;
-            profile.page_size = 4;
-        }
-        "neg_model_gated_missing" => profile.has_mtp_logits = false,
-        "neg_t10_nonreplayable" => profile.kernels.push(KernelInfo {
-            name: "envelope_dot".into(),
-            sink_scope: None,
-            replayable: false,
-        }),
-        "pentathlon_iter" => {
-            profile.vocab = 8;
-            profile.kernels.push(KernelInfo {
-                name: "envelope_dot".into(),
-                sink_scope: None,
-                replayable: true,
-            });
-        }
-        _ => profile.vocab = 8,
+        | "structured_masks"
+        | "neg_t10_nonreplayable" => Served::of(32),
+        "staged_dispatch" => Served::of(4),
+        "neg_model_gated_missing" => Served {
+            graph: Graph {
+                mtp_logits: false,
+                ..Served::of(32).graph
+            },
+            ..Served::of(32)
+        },
+        _ => Served::of(8),
     }
-    profile
 }
 
 fn chan(shape: Shape, dtype: Dtype, host_role: HostRole, seeded: bool) -> ChannelDecl {
@@ -109,18 +132,13 @@ fn epilogue(channels: Vec<ChannelDecl>, ops: Vec<Op>) -> TraceContainer {
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
-pub fn synthetic_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
-    let mut small = ModelProfile::dummy();
-    small.vocab = 8;
-    let mut with_sink = small.clone();
-    with_sink.kernels.push(KernelInfo {
-        name: "lora".into(),
-        sink_scope: Some(SinkScope::PassWide),
-        replayable: true,
-    });
+pub fn synthetic_traces() -> Vec<(&'static str, TraceContainer, Served)> {
+    let small = Served::of(8);
+    let with_sink = small;
     vec![
         (
             "synthetic_sort_desc",
@@ -137,7 +155,7 @@ pub fn synthetic_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
                     Op::ChanPut { chan: 2, value: 2 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "synthetic_matmul",
@@ -154,7 +172,7 @@ pub fn synthetic_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
                     Op::ChanPut { chan: 2, value: 2 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "synthetic_mtp_drafts",
@@ -163,11 +181,13 @@ pub fn synthetic_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
                 vec![
                     Op::IntrinsicVal {
                         intr: IntrinsicId::MtpDrafts,
+                        lane: 0,
                         shape: Shape::vector(3),
                         dtype: Dtype::I32,
                     },
                     Op::IntrinsicVal {
                         intr: IntrinsicId::MtpLogits,
+                        lane: 0,
                         shape: Shape::matrix(3, 8),
                         dtype: Dtype::F32,
                     },
@@ -199,6 +219,7 @@ pub fn synthetic_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
                     ],
                 }],
                 externs: Vec::new(),
+                inputs: Vec::new(),
             },
             with_sink,
         ),
@@ -221,8 +242,8 @@ impl CorpusStage {
 
 pub fn corpus_stages() -> Vec<CorpusStage> {
     let mut stages = Vec::new();
-    let mut push = |name: &str, container: TraceContainer, profile: ModelProfile| {
-        let Ok(bound) = bind(container, profile) else {
+    let mut push = |name: &str, container: TraceContainer, served: Served| {
+        let Ok(bound) = served.bind(container) else {
             return;
         };
         for (stage_index, plan) in compile_bound(&bound).into_iter().enumerate() {
@@ -237,10 +258,10 @@ pub fn corpus_stages() -> Vec<CorpusStage> {
         }
     };
     for name in GOLDEN_NAMES {
-        push(name, golden_container(name), golden_profile(name));
+        push(name, golden_container(name), golden_served(name));
     }
-    for (name, container, profile) in synthetic_traces() {
-        push(name, container, profile);
+    for (name, container, served) in synthetic_traces() {
+        push(name, container, served);
     }
     stages
 }
@@ -275,7 +296,9 @@ pub fn region_shape(region: &eta_compiler::plan::Region) -> String {
 
 pub fn corpus_bound() -> eta_ir::validate::BoundTrace {
     let name = GOLDEN_NAMES[0];
-    bind(golden_container(name), golden_profile(name)).expect("first golden binds")
+    golden_served(name)
+        .bind(golden_container(name))
+        .expect("first golden binds")
 }
 
 fn staged(stage: Stage, channels: Vec<ChannelDecl>, ops: Vec<Op>) -> TraceContainer {
@@ -285,26 +308,13 @@ fn staged(stage: Stage, channels: Vec<ChannelDecl>, ops: Vec<Op>) -> TraceContai
         ports: Vec::new(),
         stages: vec![StageProgram { stage, ops }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
-pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
-    let mut small = ModelProfile::dummy();
-    small.vocab = 8;
-    let mut attn = small.clone();
-    attn.has_attn_score = true;
-    let mut identity_kernel = small.clone();
-    identity_kernel.kernels.push(KernelInfo {
-        name: "metal.identity".into(),
-        sink_scope: None,
-        replayable: true,
-    });
-    let mut discard_sink = small.clone();
-    discard_sink.kernels.push(KernelInfo {
-        name: "metal.discard".into(),
-        sink_scope: Some(SinkScope::PassWide),
-        replayable: true,
-    });
+pub fn extended_traces() -> Vec<(&'static str, TraceContainer, Served)> {
+    let small = Served::of(8);
+    let attn = small;
 
     let f32v =
         |n: u32, role: HostRole, seeded: bool| chan(Shape::vector(n), Dtype::F32, role, seeded);
@@ -334,7 +344,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
                     Op::ChanPut { chan: 1, value: 4 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "extended_minmax",
@@ -351,7 +361,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
                     Op::ChanPut { chan: 3, value: 4 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "extended_predicates",
@@ -374,7 +384,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
                     Op::ChanPut { chan: 2, value: 7 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "extended_transpose_cumsum",
@@ -395,7 +405,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
                     Op::ChanPut { chan: 2, value: 3 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "extended_gather_scatter",
@@ -422,7 +432,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
                     Op::ChanPut { chan: 4, value: 4 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "extended_rng_stream",
@@ -438,7 +448,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
                     Op::ChanPut { chan: 0, value: 0 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "extended_hierarchical",
@@ -451,7 +461,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
                     Op::ChanPut { chan: 1, value: 1 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "extended_hidden",
@@ -461,6 +471,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
                 vec![
                     Op::IntrinsicVal {
                         intr: IntrinsicId::Hidden,
+                        lane: 0,
                         shape: Shape::matrix(1, 8),
                         dtype: Dtype::F32,
                     },
@@ -468,7 +479,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
                     Op::ChanPut { chan: 0, value: 1 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "extended_on_attn",
@@ -483,13 +494,14 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
                 vec![
                     Op::IntrinsicVal {
                         intr: IntrinsicId::Layer,
+                        lane: 0,
                         shape: Shape::new(&[]).unwrap(),
                         dtype: Dtype::U32,
                     },
                     Op::ChanPut { chan: 0, value: 0 },
                 ],
             ),
-            small.clone(),
+            small,
         ),
         (
             "extended_attn_score",
@@ -499,6 +511,7 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
                 vec![
                     Op::IntrinsicVal {
                         intr: IntrinsicId::AttnScore,
+                        lane: 0,
                         shape: Shape::matrix(1, eta_ir::registry::ATTN_SCORE_KV_MAX),
                         dtype: Dtype::F32,
                     },
@@ -508,56 +521,14 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, ModelProfile)> {
             ),
             attn,
         ),
-        (
-            "extended_metal_identity",
-            TraceContainer {
-                names: vec!["metal.identity".into()],
-                channels: vec![read(4), write(4)],
-                ports: Vec::new(),
-                stages: vec![StageProgram {
-                    stage: Stage::Epilogue,
-                    ops: vec![
-                        Op::ChanRead(0),
-                        Op::KernelCall {
-                            name: 0,
-                            args: vec![0],
-                            shape: Shape::vector(4),
-                            dtype: Dtype::F32,
-                        },
-                        Op::ChanPut { chan: 1, value: 1 },
-                    ],
-                }],
-                externs: Vec::new(),
-            },
-            identity_kernel,
-        ),
-        (
-            "extended_metal_discard",
-            TraceContainer {
-                names: vec!["metal.discard".into()],
-                channels: vec![read(4)],
-                ports: Vec::new(),
-                stages: vec![StageProgram {
-                    stage: Stage::Prologue,
-                    ops: vec![
-                        Op::ChanRead(0),
-                        Op::SinkCall {
-                            name: 0,
-                            args: vec![0],
-                        },
-                    ],
-                }],
-                externs: Vec::new(),
-            },
-            discard_sink,
-        ),
     ]
 }
 
 pub fn extended_stages() -> Vec<CorpusStage> {
     let mut stages = Vec::new();
-    for (name, container, profile) in extended_traces() {
-        let bound = bind(container, profile)
+    for (name, container, served) in extended_traces() {
+        let bound = served
+            .bind(container)
             .unwrap_or_else(|error| panic!("extended trace `{name}` must bind: {error:?}"));
         for (stage_index, plan) in compile_bound(&bound).into_iter().enumerate() {
             let debug = debug_stage_plan(&plan);

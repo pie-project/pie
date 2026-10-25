@@ -36,7 +36,6 @@ async def main(input: dict) -> dict:
     max_tokens = int(input.get("max_tokens", 32))
     seed = int(input.get("seed", 0x7CE1))
     want_stats = bool(input.get("stats", False))
-    max_layers = input.get("max_layers")
 
     if not (temperature > 0.0) or temperature == float("inf"):
         raise ValueError("temperature must be finite and greater than 0")
@@ -63,8 +62,6 @@ async def main(input: dict) -> dict:
     s2_out_p = Channel([1], dtype.f32).named("s2_out_p")
 
     fwd_p = ForwardPass()
-    if max_layers is not None:
-        fwd_p.set_max_layers(int(max_layers))
     fwd_p.embed(toks_p, embed_indptr_p)
     fwd_p.state([ws], StateGeometry.folding())
 
@@ -99,8 +96,6 @@ async def main(input: dict) -> dict:
         lane1 = Channel.from_([0, 1], dtype.u32).named("embed_indptr")
 
         fwd = ForwardPass()
-        if max_layers is not None:
-            fwd.set_max_layers(int(max_layers))
         fwd.embed(tok_in, lane1)
         fwd.state([ws], StateGeometry.folding())
 

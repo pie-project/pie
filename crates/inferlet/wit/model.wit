@@ -1,5 +1,5 @@
 interface model {
-    use types.{dtype};
+    use types.{dtype, error};
 
     // The engine serves exactly one model; these are global functions over
     // that single bound model (no `model` resource handle). Identity + memory-
@@ -23,16 +23,14 @@ interface model {
     mtp-depth: func() -> u32;
 
     // What a guest needs to seed a BLOCK drafter's draft pass: the rows one
-    // pass carries (the anchor and `rows - 1` mask slots), the id every row
-    // but the first carries in, and whether the block sees itself — in which
-    // case the guest states the mask that says so. Facts the head was trained
+    // pass carries (the anchor and `rows - 1` mask slots) and the id every
+    // row but the first carries in. Facts the head was trained
     // at, not policy: which rows to verify, and whether to draft at all, stay
     // the guest's. `none` for a model with no block drafter (a chained head
     // is `mtp-depth`). Static, like `mtp-depth`.
     record block-drafter {
         rows: u32,
         mask-token: u32,
-        bidirectional: bool,
         // The first row whose readout is a proposal: 1 when the anchor row
         // proposes nothing, 0 when every row does (the anchor's row then
         // predicts the token after it).
@@ -40,157 +38,17 @@ interface model {
     }
     draft-block: func() -> option<block-drafter>;
 
-    // Which forward-pass interface the bound model takes: `forward` for every
-    // text model, whatever state it keeps; `forward-diffusion` for a
-    // block-diffusion text.
-    //
-    // Do NOT derive this by parsing `architecture()` -- that is an open set.
-    enum forward-kind {
-        // Tokens one by one -> `forward`
-        text,
-        // A canvas the model denoises in place, one trunk read causally or
-        // bidirectionally per pass -> `forward-diffusion`
-        diffusion,
-    }
-    pass-kind: func() -> forward-kind;
-
-    // The canvas a diffusion model denoises: how many tokens one block is,
-    // and the trunk's hidden width (the row width of a self-conditioning
-    // signal). `none` for every other kind — the same fact as
-    // `pass-kind() == diffusion`, stated once with its numbers.
-    record canvas-shape {
-        length: u32,
-        hidden: u32,
-        // How many `(id, weight)` taps per canvas row
-        // `forward-diffusion.self-conditioning` takes.
-        self-cond-taps: u32,
-    }
-    canvas: func() -> option<canvas-shape>;
-
-    // ── Generative facts ────────────────────────────────────────────────
-    // What a guest sizes an image/video job from, so it never parses
-    // `architecture()`: the family's readings (the arms a pass can run),
-    // its latent space, the schedule it was trained under, and the widest
-    // float lane one pass carries. A text model answers an empty list,
-    // `none`, `none` and 0: it has one implicit reading and no latent.
-
-    // A lane's stream — which of the model's rectangles its rows belong to
-    // (a lane is one request's rows of ONE stream; a request with text and
-    // image rows submits one pass per stream, both in one attention group).
-    // Codes agree with `poem_ir::Stream`.
-    enum lane-stream {
-        text,
-        image,
-        video,
-        audio,
-        context,
-        reference,
-    }
-
-    // Which runtime input a float port feeds, and so what shape its channel
-    // is. `latents`: `[rows, width]`, the lane's own rows, fed
-    // from the channel's COMMITTED cell at every submit. `lane-vector`: one
-    // `[width]` (or `[1, width]`) row per lane — a timestep, a guidance
-    // scale. `context`: `[rows, width]`, an encoder's output, the rows of a
-    // `context` lane. `axis-positions`: `[rows, width]` with `width` the
-    // axis count (1..=4), the per-row RoPE coordinates. `voxels`: a VAE's
-    // tile on the voxel axis — the channel is `[h, w, width]`
-    // for a still or `[t, h, w, width]` for a clip, one clip per pass, its
-    // shape being the clip's box.
-    enum port-kind {
-        latents,
-        lane-vector,
-        context,
-        axis-positions,
-        voxels,
-    }
-
-    // One float input port a reading declares. `dtype` is the CHANNEL's
-    // element type the guest must declare (always `f32` today: the WIT
-    // dtype set has no bf16; the model's own element type is the engine's
-    // marshal). `width` is the trailing extent.
-    record port-fact {
+    // A switch the model declares and the values `forward-pass.switch` may
+    // set it to, the first its default.
+    record switch-decl {
         name: string,
-        kind: port-kind,
-        width: u32,
-        dtype: dtype,
-        // Which streams' lanes carry this port; empty means every lane of
-        // the reading. A pass on stream `s` binds exactly the ports that
-        // list `s` (or list nothing).
-        streams: list<lane-stream>,
-        // THE ROW COUNT THIS PORT'S CHANNEL MUST CARRY, when the family
-        // fixes it. `none` -- nearly always -- means the lane's own rows: a
-        // latents port is as tall as the picture's grid, a context port as
-        // tall as the prompt.
-        //
-        // A few families PAD instead. Wan 2.2 zero-pads its umT5 rows to
-        // 512 and the transformer attends every one of the 512 keys, so a
-        // context lane of the prompt's real length is a different model:
-        // the pad rows go through the text embedder into a nonzero constant
-        // that carries real attention mass. The IR cannot grow a lane, so
-        // the pad is the guest's, and this is the fact that lets a
-        // family-blind guest build it without spelling 512.
-        rows: option<u32>,
+        values: list<string>,
     }
+    // Every switch the bound model declares; empty for a one-path model.
+    switches: func() -> list<switch-decl>;
 
-    // What one axis of an `axis-positions` port means. The rotary space a
-    // DiT was trained in is 1..=4 axes wide and every family orders them
-    // differently; this names them so a guest can fill the grid without
-    // knowing the family.
-    enum axis-role {
-        // Frame / reference / sequence index (FLUX's `T`, Z-Image's `t`).
-        time,
-        // The latent grid's row.
-        height,
-        // The latent grid's column.
-        width,
-        // A plain row-ordinal axis, carried by one lane's rows alone
-        // (FLUX's fourth `L` axis, which numbers the text rows).
-        index,
-    }
-
-    // WHERE A READING'S LANES SIT IN THE ROTARY SPACE.
-    //
-    // A denoise reading's `axis-positions` port takes one coordinate vector
-    // per row, and which coordinate goes where is a family contract the
-    // guest must not spell (`flux_2`'s `(0, h, w, j)`, `z_image`'s
-    // `(L + 1, a, b)`). This fact states it, so `latent::positions_for`
-    // builds both from the same code:
-    //
-    //   * a TEXT or CONTEXT lane's row `j` sits at `text-origin + j` on
-    //     axis `text-axis`, and at 0 on every other axis;
-    //   * an IMAGE lane's patch `(a, b)` sits at `a` on the `height` axis
-    //     and `b` on the `width` axis; on `text-axis` it sits at
-    //     `text-origin + text-rows` when `image-follows-text`, else 0; on
-    //     every remaining axis, 0.
-    //   * a REFERENCE lane's patch `(a, b)` of reference `i` sits where an
-    //     image lane's would, except on the `time` axis, where it sits at
-    //     `reference-stride * (i + 1)` -- the offset that keeps each
-    //     reference picture in a rotary neighbourhood of its own, clear of
-    //     the target grid at 0.
-    //
-    // `axes` has exactly the port's `width` entries. A family whose
-    // positions do not fit this shape states `none` and its guests build
-    // their own.
-    record position-convention {
-        axes: list<axis-role>,
-        text-axis: u32,
-        text-origin: u32,
-        image-follows-text: bool,
-        // WHERE REFERENCE `i` SITS ON THE `time` AXIS: at
-        // `reference-stride * (i + 1)`, so the first reference clears the
-        // target grid's `T = 0` and each further one clears the last
-        // (FLUX.2's `10*(i + 1)`). `none` -- the answer for every family
-        // that declares no `reference` stream -- means this row states no
-        // reference convention, and a guest that would bind a reference
-        // lane must refuse rather than invent an offset.
-        reference-stride: option<u32>,
-    }
-
-    // Which export seam a reading's epilogue reads: `logits()` for a text
-    // head, `velocity()` for a denoiser, `hidden()` for an encoder,
-    // `pixels` for a VAE reading on the voxel axis (one row per output
-    // voxel of the pass's clip, `readout-width` wide).
+    // Which export seam a lane's epilogue reads; `pixels` is one row per
+    // output voxel of the pass's clip.
     enum readout-kind {
         logits,
         velocity,
@@ -198,46 +56,59 @@ interface model {
         pixels,
     }
 
-    // One reading of the bound model: the arm a pass runs when it names
-    // this reading (`forward-pass.reading`). `index` is the fact value a
-    // lane is stamped with; `has-kv` says whether `state` is required
-    // (else refused) on its pass, `takes-tokens` the same for `embed`;
-    // `streams` are the lane streams a request submits (one pass per
-    // stream, `forward-pass.stream`; empty means text only); `ports` are
-    // the float ports `forward-pass.input` binds; `positions` says where
-    // its lanes' rows sit in the rotary space; `readout`/`readout-width`
-    // say what the epilogue may read and how wide one row is (the
-    // `velocity(width)` / `hidden(width)` declaration to make).
-    record reading-fact {
-        name: string,
-        index: u8,
-        has-kv: bool,
-        takes-tokens: bool,
-        streams: list<lane-stream>,
-        ports: list<port-fact>,
-        // How this reading's lanes place their rows in the rotary space,
-        // when it declares an `axis-positions` port and states a
-        // convention for it. `none` otherwise.
-        positions: option<position-convention>,
-        readout: readout-kind,
-        readout-width: u32,
+    // Whether an input is one per lane, per row, or per voxel of the clip.
+    enum input-axis {
+        lane,
+        row,
+        voxel,
     }
-    // Every reading the bound model declares, in index order. Empty for a
-    // model with one implicit reading (every text row), on which
-    // `forward-pass.reading` is refused. Static.
-    readings: func() -> list<reading-fact>;
 
-    // The latent space a denoiser works in: one latent row is
-    // `patch-t × patch-h × patch-w` cells of `channels` values, one cell
-    // is `spatial-compression²` pixels by `temporal-compression` frames.
-    // `none` for a model with no latent.
+    // The rows a lane binding an input carries: exactly `n`, or the fewest
+    // multiple of `n` holding the guest's own; the guest zero-pads to them.
+    variant row-count {
+        exact(u32),
+        multiple(u32),
+    }
+
+    // One input the model reads from its guest: `width` values of `dtype`
+    // per `axis` entry; `rows` is set when the family fixes the row count
+    // (Wan 2.2 attends its reference's 512 zero-padded context rows).
+    record input-decl {
+        name: string,
+        axis: input-axis,
+        width: u32,
+        dtype: dtype,
+        rows: option<row-count>,
+    }
+
+    // What a lane's epilogue reads out, and how wide one row is.
+    record readout {
+        kind: readout-kind,
+        width: u32,
+    }
+
+    // A lane of given switches: the inputs it binds (exactly these), whether
+    // it binds `state` and `embed`, and its readout (`none` if nothing).
+    record lane-decl {
+        inputs: list<input-decl>,
+        state: bool,
+        embeds: bool,
+        readout: option<readout>,
+    }
+
+    // The lane of these `(name, value)` switches; unset ones take defaults.
+    lane: func(switches: list<tuple<string, string>>) -> result<lane-decl, error>;
+
+    // ── Generative facts ────────────────────────────────────────────────
+    // A text model answers `none` to each.
+
+    // The VAE's `[t, h, w, channels]` latent; latent frame 0 covers
+    // `first-frames` pixel frames, each later one `temporal-compression`.
     record latent-space {
         channels: u32,
-        patch-t: u32,
-        patch-h: u32,
-        patch-w: u32,
         spatial-compression: u32,
         temporal-compression: u32,
+        first-frames: u32,
     }
     latent: func() -> option<latent-space>;
 
@@ -260,10 +131,10 @@ interface model {
     // its own), and `stream-shifts` names the per-modality shifts of a
     // family that runs several schedules at once. The library's
     // `latent::FlowMatchEuler` is built from this.
-    // `none` when no reading denoises.
+    // `none` when the model does not denoise.
     record stream-shift {
-        // `stream` is a WIT keyword, so the lane's stream is spelled `lane`.
-        lane: lane-stream,
+        // A `stream` switch value (`stream` is a WIT keyword).
+        lane: string,
         shift: f32,
     }
 
@@ -282,9 +153,7 @@ interface model {
     }
     schedule: func() -> option<schedule-fact>;
 
-    // The most latent rows one pass may carry: the guest sizes its latent
-    // channels (`[rows, width]`) under this. 0 for a model with no float
-    // lane. Static.
+    // The most rows one lane may carry. Static.
     max-latent-rows: func() -> u32;
 
     // Logits/output dimension (= hf_config.vocab_size). May EXCEED the

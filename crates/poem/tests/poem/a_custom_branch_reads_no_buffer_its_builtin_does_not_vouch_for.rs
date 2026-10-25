@@ -1,6 +1,4 @@
-//! A buffer a lane may not carry is read only on rows a builtin fact says
-//! carry it: an inferlet sets a custom fact, so a branch on one alone says
-//! nothing about which lanes hold adapter routes or a mask.
+//! A buffer a lane may not carry is read only on rows a runtime switch says carry it.
 
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, Value, Weight, fact, ops, switch,
@@ -19,7 +17,13 @@ impl ForwardHybrid for Probe {
     }
 
     fn forward(&self, inputs: Input) -> Value {
-        let x = inputs.latents(0, WIDTH as u32, Dtype::Bf16);
+        let x = inputs.input(
+            "latents",
+            Dtype::Bf16,
+            poem_ir::InputAxis::Row,
+            WIDTH as u32,
+            None,
+        );
         let y = ops::linear::matmul(&x, &Weight::sym("w", [WIDTH, WIDTH], Dtype::Bf16));
         let (a, b) = banks("w", 2, 8, WIDTH, Dtype::Bf16);
         let routes = inputs.adapter_routes();

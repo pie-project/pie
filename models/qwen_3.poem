@@ -276,6 +276,7 @@ def media(id, deploy):
     return struct(image = struct(
         patch = PATCH, block = MERGE, mrope = True,
         prefix = "<|vision_start|>", placeholder = "<|image_pad|>", suffix = "<|vision_end|>",
+        frame = lambda h, w, budget: smart_resize(h, w, PATCH * MERGE, 65536, 16777216),
     ))
 
 def tower(size, out, dt):
@@ -1329,6 +1330,8 @@ def caches(m, c):
 
 def forward(m, inputs):
     dr = m.dflash
+    if dr != None:
+        switch("block_draft", ["off", "on"])
     trunk_inputs = inputs.on(~block_rows(dr)) if dr != None else inputs
     ([input_m, input_s, input_d], input_p) = trunk_inputs.partition([fact.has(fact.Mask), fact.scores(), fact.single_token()])
     plans = struct(
@@ -1385,7 +1388,7 @@ def forward(m, inputs):
     head = m.embed if m.head == None else m.head
     hb = None
     if dr != None:
-        hb = arm(dr, inputs, fused, h_block, mask, block_rows(dr))
+        hb = arm(dr, inputs, fused, h_block, block_rows(dr))
         x = merge([hb, x])
     x = ops.gather.gather_rows(x, inputs.readout_rows())
     # Bonsai's output head is stored rotated: its input turns with it.
@@ -1468,7 +1471,7 @@ def attn_mixer(x, inputs, m, plans, mask, a):
         seam.at(seam.SCORES, [lse])
         return o
 
-    o = switch(q, [
+    o = branch(q, [
         (fact.has(fact.Mask), lambda q: ops.attn.prefill(
             q,
             plans.m,
@@ -1520,6 +1523,6 @@ def gdn_mixer(x, inputs, g, bonsai):
         # output narrower for it.
         return ops.elemwise.rmsnorm_gated(core, zc, g.norm, g.v_dim, g.norm_eps, "silu")
 
-    o = switch(qkv, [(fact.single_token(), step)], otherwise = chunked)
+    o = branch(qkv, [(fact.single_token(), step)], otherwise = chunked)
     o_in = rot_take(o, bonsai.ssm) if bonsai != None else o
     return ops.linear.matmul(o_in, g.out_proj)

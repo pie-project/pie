@@ -170,7 +170,7 @@ def run_vae(d: str, device="cuda"):
     the frozen `bn` (`_patchify_latents`, then
     `(x - running_mean)/sqrt(running_var + eps)`), which is what the transformer
     holds.  So this dump cuts at the 128-wide /16 grid on both sides -- the same
-    boundary `models::flux_2::vae` puts its port at:
+    boundary `models::flux_2::vae` puts its input at:
 
         decode: latent * bn_std + bn_mean -> _unpatchify_latents -> vae.decode
         encode: vae.encode(...).mean -> _patchify_latents -> (x - bn_mean)/bn_std
@@ -247,12 +247,15 @@ def run_vae(d: str, device="cuda"):
     npz_keys(tap)
 
 def main():
+    global SIZE
     ap = argparse.ArgumentParser()
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--mini", action="store_true")
     ap.add_argument("--vae", action="store_true")
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--size", type=int, default=SIZE)
     a = ap.parse_args()
+    SIZE = a.size
     if not (a.full or a.mini or a.vae):
         a.full = a.mini = True
     d = outdir(MODEL)

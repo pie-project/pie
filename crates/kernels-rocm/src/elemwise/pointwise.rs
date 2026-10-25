@@ -129,6 +129,10 @@ pub fn gelu_tanh(ctx: &Ctx, x: Tensor, o: &mut Tensor) -> Result<(), Error> {
     crate::linear::glu::gelu_tanh(ctx, x, 1, o)
 }
 
+pub fn sqrt(ctx: &Ctx, x: Tensor, o: &mut Tensor) -> Result<(), Error> {
+    fire_unary(ctx, "elemwise.act", "2", x, o)
+}
+
 fn fire_unary(
     ctx: &Ctx,
     op: &'static str,
@@ -182,6 +186,15 @@ pub fn mul(ctx: &Ctx, x: Tensor, y: Tensor, o: &mut Tensor) -> Result<(), Error>
     fire_binary(ctx, "elemwise.binary", "1", x, y, o)
 }
 
+pub fn div(ctx: &Ctx, x: Tensor, y: Tensor, o: &mut Tensor) -> Result<(), Error> {
+    fire_binary(ctx, "elemwise.binary", "2", x, y, o)
+}
+
+/// `x - y·floor(x / y)`: floored, as Python's `%`.
+pub fn modulo(ctx: &Ctx, x: Tensor, y: Tensor, o: &mut Tensor) -> Result<(), Error> {
+    fire_binary(ctx, "elemwise.binary", "3", x, y, o)
+}
+
 fn fire_binary(
     ctx: &Ctx,
     op: &'static str,
@@ -233,7 +246,7 @@ const CLIP_UNIT: &str = "elemwise/clip.hip";
 
 pub fn clamp(ctx: &Ctx, lo: f32, hi: f32, x: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elemwise.clamp";
-    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(lo <= hi) {
         return Err(refuse(
@@ -268,7 +281,7 @@ pub fn clamp(ctx: &Ctx, lo: f32, hi: f32, x: &mut Tensor) -> Result<(), Error> {
 
 pub fn clamp_learned(ctx: &Ctx, lo: Tensor, hi: Tensor, x: &mut Tensor) -> Result<(), Error> {
     const OP: &str = "elemwise.clamp";
-    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16", F32 => "float" });
     for (what, bound) in [("lower", lo), ("upper", hi)] {
         if bound.dtype != x.dtype {
             return Err(refuse(

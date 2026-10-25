@@ -102,7 +102,7 @@ fn the_target_keeps_a_measured_prefix_of_every_block() {
     let mask_token = drafter.mask_token;
     let drafting = |len: u32| facts_of(DEPLOYMENT).word(&Request::new(len, false).drafting(true));
     let block_word =
-        facts_of(DEPLOYMENT).word(&Request::new(block as u32, true).drafting_a_block(true));
+        facts_of(DEPLOYMENT).word(&Request::new(block as u32, true).switched("block_draft", "on"));
 
     const ANCHORS: usize = 4;
 

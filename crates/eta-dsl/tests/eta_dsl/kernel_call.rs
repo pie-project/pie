@@ -1,6 +1,5 @@
 use eta_ir::op::Op;
-use eta_ir::registry::{KernelInfo, ModelProfile};
-use eta_ir::validate::bind;
+use eta_ir::registry::{EngineCaps, Graph, Readout, ReadoutKind};
 
 use eta_dsl::builder::Builder;
 use eta_dsl::prelude::*;
@@ -10,21 +9,30 @@ const V: u32 = 8;
 const PAGES: u32 = 4;
 const PAGE_T: u32 = 2;
 
-fn quest_profile(with_kernel: bool) -> ModelProfile {
-    let mut p = ModelProfile {
-        vocab: V,
-        page_size: PAGE_T,
-        num_layers: 2,
-        ..ModelProfile::dummy()
-    };
-    if with_kernel {
-        p.kernels.push(KernelInfo {
-            name: "envelope_dot".into(),
-            sink_scope: None,
-            replayable: true,
-        });
-    }
-    p
+fn served(
+    container: eta_ir::container::TraceContainer,
+    lanes: Vec<Option<Readout>>,
+    num_layers: u32,
+) -> Result<eta_ir::validate::BoundTrace, eta_ir::validate::ValidateError> {
+    eta_ir::validate::bind(
+        container,
+        lanes,
+        Graph {
+            num_layers,
+            ..Graph::default()
+        },
+        EngineCaps {
+            lora: true,
+            attn_page_mask: true,
+        },
+    )
+}
+
+fn logits_lane(vocab: u32) -> Vec<Option<Readout>> {
+    vec![Some(Readout {
+        kind: ReadoutKind::Logits,
+        width: vocab,
+    })]
 }
 
 fn quest_tap() -> Traced {
@@ -48,7 +56,7 @@ fn quest_tap() -> Traced {
 #[test]
 fn kernel_call_every_case() {
     repeated_kernel_names_intern_once();
-    the_tap_is_refused_without_the_kernel_in_the_profile();
+    a_kernel_call_is_refused_at_bind();
     the_name_table_is_sorted_and_indices_are_remapped();
 }
 
@@ -78,15 +86,14 @@ fn repeated_kernel_names_intern_once() {
     assert_eq!(calls, vec![0, 0, 0], "one name, one index");
 }
 
-fn the_tap_is_refused_without_the_kernel_in_the_profile() {
+fn a_kernel_call_is_refused_at_bind() {
     let t = quest_tap();
-    let err = bind(t.container().clone(), quest_profile(false)).expect_err("must not bind");
+    let err = served(t.container().clone(), logits_lane(V), 2).expect_err("must not bind");
     let msg = format!("{err:?}").to_lowercase();
     assert!(
         msg.contains("envelope_dot") || msg.contains("kernel"),
         "error should name the missing kernel, got: {msg}"
     );
-    bind(t.container().clone(), quest_profile(true)).expect("binds once the profile advertises it");
 }
 
 fn the_name_table_is_sorted_and_indices_are_remapped() {

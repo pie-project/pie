@@ -218,6 +218,7 @@ fn the_kv_write_round_trips() {
         let width = (HEADS * HEAD_DIM) as u64;
         let kv_trace = |dtype: Dtype| Trace {
             facts: Default::default(),
+            inputs: Vec::new(),
             name: String::from("kv_size_probe"),
             platform: Platform::Metal,
             params: Vec::new(),
@@ -412,6 +413,7 @@ fn the_pre_estimate_sizes_packed_kv_exactly_at_any_head_dim() {
         let width = u64::from(kv_heads) * u64::from(head_dim);
         Trace {
             facts: Default::default(),
+            inputs: Vec::new(),
             name: String::from("kv_estimate_probe"),
             platform: Platform::Metal,
             params: Vec::new(),

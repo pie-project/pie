@@ -1,19 +1,36 @@
-use eta_ir::op::intrinsic_tags;
+use eta_ir::op::{IntrinsicId, intrinsic_tags};
 
 pub const M2_LOGITS_BUFFER: usize = 6;
 
 pub const M2_INTRINSIC_TOP_BUFFER: usize = 30;
 
+/// The single-lane form's address table: one `ulong` a slot, [`eta_ir::op::intrinsic_pitch`] of them.
+pub const M2_INTRINSIC_TABLE_BUFFER: usize = M2_INTRINSIC_TOP_BUFFER - 3;
+
+/// The grouped and streamed forms' address tables, one an instance, by dispatch lane.
+pub const M3_INTRINSIC_TABLE_BUFFER: usize = 12;
+
+#[must_use]
+pub fn addressed(intr: u16) -> bool {
+    addressed_slot(intr, 0).is_some()
+}
+
+/// `None` for the pass's intrinsics, each at an argument of its own.
+#[must_use]
+pub fn addressed_slot(intr: u16, lane: u32) -> Option<u32> {
+    IntrinsicId::from_u16(intr)
+        .filter(|id| id.per_lane())
+        .map(|id| eta_ir::op::intrinsic_slot(id, lane))
+}
+
 #[must_use]
 pub fn m2_intrinsic_buffer(intr: u16) -> Option<usize> {
     match intr {
-        intrinsic_tags::LOGITS | intrinsic_tags::VELOCITY | intrinsic_tags::HIDDEN => {
-            Some(M2_LOGITS_BUFFER)
-        }
+        intrinsic_tags::LOGITS => Some(M2_LOGITS_BUFFER),
         intrinsic_tags::MTP_LOGITS => Some(M2_INTRINSIC_TOP_BUFFER),
         intrinsic_tags::MTP_DRAFTS => Some(M2_INTRINSIC_TOP_BUFFER - 1),
         intrinsic_tags::ATTN_SCORE => Some(M2_INTRINSIC_TOP_BUFFER - 2),
-        intrinsic_tags::PIXELS => Some(M2_INTRINSIC_TOP_BUFFER - 3),
+        _ if addressed(intr) => Some(M2_INTRINSIC_TABLE_BUFFER),
         _ => None,
     }
 }
@@ -31,11 +48,12 @@ pub fn m3_intrinsic_bindable(intr: u16) -> bool {
     m2_intrinsic_buffer(intr).is_some()
 }
 
+/// The intrinsic argument indices a region binds sit above the channels.
 #[must_use]
-pub fn fused_channel_ceiling(used: &[u16]) -> usize {
+pub fn fused_channel_ceiling(used: &[usize]) -> usize {
     let lowest = used
         .iter()
-        .filter_map(|&intr| m2_intrinsic_buffer(intr))
+        .copied()
         .filter(|&at| at > M2_LOGITS_BUFFER)
         .min();
     match lowest {
@@ -47,8 +65,6 @@ pub fn fused_channel_ceiling(used: &[u16]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use eta_ir::op::IntrinsicId;
 
     #[test]
     fn the_grouped_path_binds_every_rectangle_the_single_lane_form_does() {

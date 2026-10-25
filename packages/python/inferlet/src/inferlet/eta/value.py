@@ -1025,9 +1025,9 @@ def nucleus_sample(logits, top_p, state) -> Tensor:
 # -- intrinsic leaf / internal helpers -------------------------------------------
 
 
-def intrinsic_val(intr: Intrinsic, shape: Shape, dt: Dtype) -> Tensor:
+def intrinsic_val(intr: Intrinsic, shape: Shape, dt: Dtype, lane: int = 0) -> Tensor:
     ty = ValueType(shape, dt)
-    return Tensor.node(emit(Op.intrinsic_val(intr, shape, dt), (ty,)), ty)
+    return Tensor.node(emit(Op.intrinsic_val(intr, shape, dt, lane), (ty,)), ty)
 
 
 def reshape_id_to(vid: int, frm: ValueType, target: Shape) -> int:

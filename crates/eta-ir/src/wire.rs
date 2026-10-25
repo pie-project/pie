@@ -124,10 +124,12 @@ impl OpWire {
             }
             Op::IntrinsicVal {
                 intr,
+                lane,
                 ref shape,
                 dtype,
             } => {
                 wire.intr = intr as u16;
+                wire.imm = lane;
                 wire.shape = wire_shape(shape);
                 wire.dtype = wire_dtype(dtype);
             }
@@ -321,6 +323,7 @@ impl OpWire {
             },
             tags::INTRINSIC_VAL => Op::IntrinsicVal {
                 intr: IntrinsicId::from_u16(self.intr)?,
+                lane: self.imm,
                 shape: self.shape()?,
                 dtype: self.dtype()?,
             },

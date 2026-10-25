@@ -149,15 +149,12 @@ pub struct EngineConfig {
     pub mtp_depth: u32,
     pub draft_block: u32,
     pub draft_mask_token: u32,
-    pub draft_bidirectional: bool,
     pub draft_proposals_from: u32,
-    pub has_value_head: bool,
-    pub has_kv_envelopes: bool,
     pub has_attn_score: bool,
     pub has_attn_page_mask: bool,
     pub has_lora: bool,
     /// The engine takes an attachment for an adapter alone
-    /// ([`::engine::fire::Boundary::Adapter`]): an adapted pass can be cut.
+    /// ([`::engine::fire::Attachment::adapter_only`]): an adapted pass can be cut.
     pub adapter_attachments: bool,
     /// The rows inside a lane whose recurrent state one fire lands.
     pub rs_snapshots: u32,
@@ -165,6 +162,8 @@ pub struct EngineConfig {
     pub limits: crate::engine::SchedulerLimits,
     /// The facts the engine's trace branches on.
     pub facts: poem_ir::Facts,
+    pub inputs: Vec<poem_ir::InputDecl>,
+    pub classes: poem_ir::LaneClasses,
     pub engine_backend: crate::engine::EngineBox,
 }
 
@@ -353,10 +352,7 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             _ => 0,
         },
         draft_mask_token: engine_configs.first().map_or(0, |d| d.draft_mask_token),
-        draft_bidirectional: all(|d| d.draft_bidirectional),
         draft_proposals_from: engine_configs.first().map_or(1, |d| d.draft_proposals_from),
-        has_value_head: all(|d| d.has_value_head),
-        has_kv_envelopes: all(|d| d.has_kv_envelopes),
         has_attn_score: all(|d| d.has_attn_score),
         has_attn_page_mask: all(|d| d.has_attn_page_mask),
         adapter_attachments: all(|d| d.adapter_attachments),
@@ -378,10 +374,31 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             other.facts.table
         );
     }
+    let inputs = engine_configs
+        .first()
+        .map(|engine| engine.inputs.clone())
+        .unwrap_or_default();
+    if engine_configs.iter().any(|engine| engine.inputs != inputs) {
+        anyhow::bail!(
+            "the engines of one model read different guest inputs; they run different traces"
+        );
+    }
+    let classes = engine_configs
+        .first()
+        .map(|engine| engine.classes.clone())
+        .unwrap_or_default();
+    if engine_configs
+        .iter()
+        .any(|engine| engine.classes != classes)
+    {
+        anyhow::bail!("the engines of one model run different classes; they run different traces");
+    }
     model::register(
         name.clone(),
         &model_id,
         facts,
+        inputs,
+        classes,
         kv_page_size as u32,
         rs_caps,
         eta_caps,

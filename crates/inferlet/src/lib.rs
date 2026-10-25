@@ -52,16 +52,26 @@ pub mod latent;
 
 pub mod model {
     pub use crate::pie::inferlet::model::{
-        AxisRole, BlockDrafter, CanvasShape, ForwardKind, LaneStream, LatentSpace, PortFact,
-        PortKind, PositionConvention, ReadingFact, ReadoutKind, ScheduleFact, ScheduleKind,
-        architecture, canvas, channel_capacity, default_system_speculation, draft_block,
-        frame_size, kv_page_size, latent, max_latent_rows, max_readout_rows, mtp_depth, name,
-        output_vocab_size, pass_kind, readings, rs_state_size, run_ahead_window, schedule,
-        submit_deadline_us,
+        BlockDrafter, InputAxis, InputDecl, LaneDecl, LatentSpace, Readout, ReadoutKind, RowCount,
+        ScheduleFact, ScheduleKind, SwitchDecl, architecture, channel_capacity,
+        default_system_speculation, draft_block, frame_size, kv_page_size, lane, latent,
+        max_latent_rows, max_readout_rows, mtp_depth, name, output_vocab_size, rs_state_size,
+        run_ahead_window, schedule, submit_deadline_us, switches,
     };
 
-    pub fn reading(name: &str) -> Option<ReadingFact> {
-        readings().into_iter().find(|reading| reading.name == name)
+    /// What a lane under these `(name, value)` switches binds.
+    pub fn lane_of(switches: &[(&str, &str)]) -> Result<LaneDecl, String> {
+        let pairs: Vec<(String, String)> = switches
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect();
+        lane(&pairs)
+    }
+
+    /// The switch `name` the model declares.
+    #[must_use]
+    pub fn switch(name: &str) -> Option<SwitchDecl> {
+        switches().into_iter().find(|decl| decl.name == name)
     }
     pub use crate::pie::inferlet::tokenizer::{
         Token, decode, encode, special_tokens, split_regex, token_bytes, tokens_with_prefix, vocabs,

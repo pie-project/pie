@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::z_image_dims::{self as model, Dims};
-use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
+use poem::generative::ScheduleKind;
 use poem::{
-    Attn, Def, Dim, Dtype, Elemwise, GeomKind, Operation, Platform, Request, RopeForm,
-    RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
+    Attn, Def, Dim, Dtype, Elemwise, Gather, GeomKind, InputAxis, Operation, Platform, Request,
+    RopeForm, RuntimeInput, Selection, Trace, Ty, ValueId, seam,
 };
+use poem_ir::Conv;
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
 
@@ -41,36 +42,144 @@ fn dims(deployment: &str) -> Dims {
     }
 }
 
-fn lanes(deployment: &str) -> Vec<(String, u8, Stream)> {
-    let facts = row(deployment)
-        .generative()
-        .expect("a generative row states its facts");
-    facts
-        .readings
-        .iter()
-        .flat_map(|reading| {
-            reading
-                .streams
-                .iter()
-                .map(move |stream| (reading.name.clone(), reading.index, *stream))
-        })
-        .collect()
+/// Every (reading, stream) a lane of `deployment` may take; `None` is the default stream.
+fn lanes(deployment: &str) -> Vec<(&'static str, Option<&'static str>)> {
+    let mut lanes = vec![
+        ("refine", Some("context")),
+        ("denoise", Some("image")),
+        ("denoise", Some("context")),
+    ];
+    if deployment == TURBO {
+        lanes.extend([("text", None), ("vae.decode", None), ("vae.encode", None)]);
+    }
+    lanes
 }
 
-fn word(plan: &Trace, reading: &str, stream: Stream) -> u64 {
-    let request = Request::new(4, false).on_stream(stream).in_reading(reading);
+fn word(plan: &Trace, reading: &str, stream: Option<&str>) -> u64 {
+    let mut request = Request::new(4, false).switched("reading", reading);
+    if let Some(stream) = stream {
+        request = request.switched("stream", stream);
+    }
     plan.facts.word(&request)
 }
 
 #[test]
 fn the_z_image_rows_bake_every_case() {
     every_row_traces_on_every_platform_with_the_caches_and_readouts_it_states();
-    the_ports_the_trace_reads_are_the_ports_the_facts_declare();
+    the_readings_state_their_readouts_and_the_sinusoid();
     every_declared_lane_classifies_into_its_own_class_where_every_merge_resolves();
     the_refiners_attend_within_a_lane_and_the_trunk_within_the_group();
     the_dit_turns_three_interleaved_axes_and_the_encoder_the_whole_neox_head();
     the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk();
     the_generative_facts_state_the_readings_the_schedule_and_the_latent_space();
+    the_latent_is_patched_in_the_graph_and_the_positions_follow_the_caption();
+}
+
+fn the_latent_is_patched_in_the_graph_and_the_positions_follow_the_caption() {
+    let patch = [1, model::PATCH, model::PATCH];
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let count = |f: &dyn Fn(&Operation) -> bool| plan.nodes.iter().filter(|n| f(&n.op)).count();
+        assert_eq!(
+            count(&|op| matches!(op, Operation::Conv(Conv::Patchify { p, .. }) if *p == patch)),
+            1,
+            "{deployment}: the voxel latent patches in the graph"
+        );
+        assert_eq!(
+            count(&|op| matches!(op, Operation::Conv(Conv::Unpatchify { p, .. }) if *p == patch)),
+            1,
+            "{deployment}: the velocity reads out in the latent's voxels"
+        );
+        let cells: Vec<u32> = plan
+            .nodes
+            .iter()
+            .filter_map(|n| match &n.op {
+                Operation::Conv(Conv::Cells { axis, .. }) => Some(*axis),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cells,
+            vec![0, 0, 0],
+            "{deployment}: a caption row runs down time: the refine's, the context's and the image's"
+        );
+        assert_eq!(
+            count(&|op| matches!(op, Operation::Gather(Gather::GroupRows { .. }))),
+            1,
+            "{deployment}: the image follows its group's caption rows"
+        );
+        for name in ["caption", "context", "latents"] {
+            let input = plan
+                .inputs
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap_or_else(|| panic!("{deployment}: no `{name}` input"));
+            assert_eq!(
+                input.rows,
+                Some(poem_ir::RowCount::Multiple(32)),
+                "{deployment}: `{name}`'s lane is padded to a multiple of 32 rows, as the reference pads"
+            );
+        }
+        let length = plan
+            .inputs
+            .iter()
+            .position(|i| i.name == "length")
+            .expect("a length input");
+        assert!(
+            plan.values.iter().any(|v| matches!(v.def,
+                Def::Input(RuntimeInput::Guest { id, axis: InputAxis::Lane, width: 1, .. })
+                    if id as usize == length)),
+            "{deployment}: a padded lane states its own rows, one value a lane"
+        );
+        let latents = plan
+            .inputs
+            .iter()
+            .position(|i| i.name == "latents")
+            .expect("a latents input");
+        assert!(
+            plan.values.iter().any(|v| matches!(v.def,
+                Def::Input(RuntimeInput::Guest { id, axis: InputAxis::Voxel, width, .. })
+                    if id as usize == latents && width == model::CHANNELS)),
+            "{deployment}: the latent is VAE-native, one voxel of {} channels",
+            model::CHANNELS
+        );
+        let velocity = plan
+            .seams
+            .iter()
+            .find(|s| s.seam == seam::VELOCITY.name)
+            .expect("a velocity seam")
+            .values[0];
+        assert_eq!(
+            plan.values[velocity.0 as usize].ty,
+            Ty::Tensor {
+                shape: vec![Dim::Voxels, Dim::Const(u64::from(model::CHANNELS))],
+                dtype: Dtype::Bf16,
+            },
+            "{deployment}"
+        );
+        assert_eq!(
+            plan.facts.declared("positions").map(|s| s.values.clone()),
+            Some(vec!["computed".to_string(), "given".to_string()])
+        );
+
+        let budgets = poem_compiler::Budgets::of(poem_compiler::Budget::new(4, 256)).with_voxels(
+            poem_compiler::VoxelLadder {
+                max_voxels: 1024,
+                buckets: vec![256, 1024],
+                max_clips: 4,
+            },
+        );
+        let compiled =
+            poem_compiler::compile_axes(&plan, &budgets, &poem_compiler::DeviceProfile::default())
+                .unwrap_or_else(|why| panic!("{deployment} bakes: {why}"));
+        assert!(
+            compiled.units.contains(&poem_compiler::RowAxis::Voxels)
+                && compiled.units.contains(&poem_compiler::RowAxis::Tokens),
+            "{deployment}: {:?}",
+            compiled.units
+        );
+        assert!(compiled.arena.clashes(&compiled.concurrency).is_empty());
+    }
 }
 
 fn every_row_traces_on_every_platform_with_the_caches_and_readouts_it_states() {
@@ -128,134 +237,9 @@ fn every_row_traces_on_every_platform_with_the_caches_and_readouts_it_states() {
     }
 }
 
-fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
+fn the_readings_state_their_readouts_and_the_sinusoid() {
     for deployment in ROWS {
         let plan = trace(deployment, Platform::Cuda);
-        let facts = row(deployment).generative().expect("facts");
-        let mut traced: BTreeSet<(String, u8, u32)> = BTreeSet::new();
-        for decl in &plan.values {
-            let (kind, port, width) = match &decl.def {
-                Def::Input(RuntimeInput::Latents { port, width }) => ("Latents", *port, *width),
-                Def::Input(RuntimeInput::Context { port, width }) => ("Context", *port, *width),
-                Def::Input(RuntimeInput::LaneVector { port, width }) => {
-                    ("LaneVector", *port, *width)
-                }
-                Def::Input(RuntimeInput::AxisPositions { port, axes }) => {
-                    ("AxisPositions", *port, u32::from(*axes))
-                }
-                Def::Input(RuntimeInput::Voxels { port, channels }) => ("Voxels", *port, *channels),
-                _ => continue,
-            };
-            traced.insert((kind.to_string(), port, width));
-        }
-        let mut declared: BTreeSet<(String, u8, u32)> = BTreeSet::new();
-        for reading in &facts.readings {
-            for (index, port) in reading.ports_indexed() {
-                declared.insert((format!("{:?}", port.kind), index, port.width));
-            }
-        }
-        assert_eq!(
-            traced, declared,
-            "{deployment}: the facts and the trace bind one list of ports"
-        );
-
-        let reading = |name: &str| {
-            facts
-                .readings
-                .iter()
-                .find(|r| r.name == name)
-                .unwrap_or_else(|| panic!("{deployment} declares no reading `{name}`"))
-        };
-        let at = |reading: &poem::generative::ReadingFact, name: &str| {
-            let (index, port) = reading.port(name).unwrap_or_else(|| {
-                panic!(
-                    "{deployment}: reading `{}` declares no port `{name}`",
-                    reading.name
-                )
-            });
-            (index, port.kind, port.width)
-        };
-        let d = dims(deployment);
-        let axes = u32::from(model::ROPE_AXES);
-        let denoise = reading("denoise");
-        assert_eq!(
-            at(denoise, "latents"),
-            (
-                model::port::LATENTS,
-                PortKind::Latents,
-                model::PATCH_FEATURES
-            )
-        );
-        assert_eq!(
-            at(denoise, "pad"),
-            (model::port::PAD_IMAGE, PortKind::Latents, 1)
-        );
-        assert_eq!(
-            at(denoise, "context"),
-            (model::port::CONTEXT_REFINED, PortKind::Latents, d.dim)
-        );
-        assert_eq!(
-            at(denoise, "timestep"),
-            (model::port::TIMESTEP, PortKind::LaneVector, 1)
-        );
-        assert_eq!(
-            at(denoise, "positions"),
-            (model::port::POSITIONS, PortKind::AxisPositions, axes)
-        );
-        let refine = reading("refine");
-        assert_eq!(
-            at(refine, "pad"),
-            (model::port::PAD_CAPTION, PortKind::Latents, 1)
-        );
-        assert_eq!(
-            at(refine, "caption"),
-            (model::port::CAPTION, PortKind::Context, d.cap_width)
-        );
-
-        let mut widths: std::collections::BTreeMap<(String, u8), u32> =
-            std::collections::BTreeMap::new();
-        for (kind, index, width) in &traced {
-            if let Some(have) = widths.insert((kind.clone(), *index), *width) {
-                assert_eq!(
-                    have, *width,
-                    "{deployment}: {kind} port {index} is read at two widths ({have} and {width}); \
-                     the engine seats one rectangle per (kind, index)"
-                );
-            }
-        }
-        assert_eq!(
-            at(refine, "positions"),
-            (model::port::POSITIONS, PortKind::AxisPositions, axes)
-        );
-        let streams = |reading: &poem::generative::ReadingFact, name: &str| {
-            reading.port(name).unwrap().1.streams.clone()
-        };
-        assert_eq!(streams(denoise, "latents"), vec![Stream::Image]);
-        assert_eq!(streams(denoise, "pad"), vec![Stream::Image]);
-        assert_eq!(streams(denoise, "context"), vec![Stream::Context]);
-        assert_eq!(
-            streams(denoise, "timestep"),
-            vec![Stream::Image, Stream::Context]
-        );
-        assert_eq!(
-            streams(denoise, "positions"),
-            vec![Stream::Image, Stream::Context]
-        );
-        assert!(!refine.has_kv && !refine.takes_tokens, "a float lane");
-        assert!(!denoise.has_kv && !denoise.takes_tokens, "float lanes");
-        assert_eq!(refine.readout, ReadoutKind::Hidden);
-        assert_eq!(refine.readout_width, d.dim);
-        assert_eq!(denoise.readout, ReadoutKind::Velocity);
-        assert_eq!(denoise.readout_width, model::PATCH_FEATURES);
-        if deployment == TURBO {
-            let text = reading("text");
-            assert!(text.has_kv && text.takes_tokens && text.ports.is_empty());
-            assert_eq!(
-                (text.readout, text.readout_width),
-                (ReadoutKind::Hidden, model::TE_HIDDEN)
-            );
-        }
-
         let sinusoids: Vec<(u32, f32, bool, f32)> = plan
             .nodes
             .iter()
@@ -287,10 +271,9 @@ fn every_declared_lane_classifies_into_its_own_class_where_every_merge_resolves(
         let plan = trace(deployment, Platform::Cuda);
         let classes = poem::resolve_classes(&plan).expect("every merge resolves");
         let _catalog = row(deployment);
-        let mut seen: Vec<((String, Stream), usize)> = Vec::new();
-        for (name, _index, stream) in lanes(deployment) {
-            let request = Request::new(4, false).on_stream(stream).in_reading(&name);
-            let word = plan.facts.word(&request);
+        let mut seen: Vec<((&str, Option<&str>), usize)> = Vec::new();
+        for (name, stream) in lanes(deployment) {
+            let word = word(&plan, name, stream);
             let class = classes
                 .class_of(word & classes.mask)
                 .unwrap_or_else(|| panic!("{deployment}: a {name}/{stream:?} lane has no class"));
@@ -357,11 +340,11 @@ fn the_refiners_attend_within_a_lane_and_the_trunk_within_the_group() {
 
         let (text, refine, denoise) = ("text", "refine", "denoise");
         let (_, joint, _) = ragged.iter().find(|(kind, _, _)| *kind == "group").unwrap();
-        assert!(joint.holds(word(&plan, denoise, Stream::Image)));
-        assert!(joint.holds(word(&plan, denoise, Stream::Context)));
-        assert!(!joint.holds(word(&plan, refine, Stream::Context)));
+        assert!(joint.holds(word(&plan, denoise, Some("image"))));
+        assert!(joint.holds(word(&plan, denoise, Some("context"))));
+        assert!(!joint.holds(word(&plan, refine, Some("context"))));
         if deployment == TURBO {
-            assert!(!joint.holds(word(&plan, text, Stream::Text)));
+            assert!(!joint.holds(word(&plan, text, None)));
         }
         let mut lane_selects: Vec<Selection> = Vec::new();
         for (_, select, _) in ragged.iter().filter(|(kind, _, _)| *kind == "lane") {
@@ -375,14 +358,14 @@ fn the_refiners_attend_within_a_lane_and_the_trunk_within_the_group() {
             "{deployment}: two refiner selections"
         );
         assert!(lane_selects.iter().any(|s| {
-            s.holds(word(&plan, refine, Stream::Context))
-                && !s.holds(word(&plan, denoise, Stream::Image))
-                && !s.holds(word(&plan, denoise, Stream::Context))
+            s.holds(word(&plan, refine, Some("context")))
+                && !s.holds(word(&plan, denoise, Some("image")))
+                && !s.holds(word(&plan, denoise, Some("context")))
         }));
         assert!(lane_selects.iter().any(|s| {
-            s.holds(word(&plan, denoise, Stream::Image))
-                && !s.holds(word(&plan, denoise, Stream::Context))
-                && !s.holds(word(&plan, refine, Stream::Context))
+            s.holds(word(&plan, denoise, Some("image")))
+                && !s.holds(word(&plan, denoise, Some("context")))
+                && !s.holds(word(&plan, refine, Some("context")))
         }));
 
         let prefills = plan
@@ -518,9 +501,9 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
                         ty(*m),
                         Ty::Tensor {
                             shape: vec![Dim::Tokens, Dim::Const(u64::from(2 * d.dim))],
-                            dtype: Dtype::Bf16,
+                            dtype: Dtype::F32,
                         },
-                        "{deployment}: the pad flag projects per row in the trunk's dtype"
+                        "{deployment}: the pad flag projects per row, in f32"
                     );
                 }
             }
@@ -529,7 +512,7 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
         assert_eq!(
             (lane_scales, row_pads),
             (2 * modulated + 1, 2),
-            "{deployment}"
+            "{deployment}: the caption and the image each turn their pad rows into their pad token"
         );
 
         let mut folds = 0usize;
@@ -552,36 +535,20 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
 fn the_generative_facts_state_the_readings_the_schedule_and_the_latent_space() {
     for deployment in ROWS {
         let facts = row(deployment).generative().expect("facts");
-        let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
+        let names = trace(deployment, Platform::Cuda)
+            .facts
+            .declared("reading")
+            .map(|s| s.values.clone())
+            .unwrap_or_default();
         let want: Vec<&str> = if deployment == TURBO {
             vec!["text", "refine", "denoise", "vae.decode", "vae.encode"]
         } else {
             vec!["refine", "denoise"]
         };
         assert_eq!(names, want, "{deployment}");
-        for (at, reading) in facts.readings.iter().enumerate() {
-            assert_eq!(
-                usize::from(reading.index),
-                at,
-                "{deployment}: indices dense from 0"
-            );
-        }
         let latent = facts.latent.expect("a denoiser states its latent space");
-        assert_eq!(
-            (
-                latent.channels,
-                latent.patch_t,
-                latent.patch_h,
-                latent.patch_w
-            ),
-            (model::CHANNELS, 1, model::PATCH, model::PATCH)
-        );
+        assert_eq!(latent.channels, model::CHANNELS);
         assert_eq!(latent.spatial_compression, model::SPATIAL_COMPRESSION);
-        assert_eq!(
-            latent.channels * latent.patch_h * latent.patch_w,
-            model::PATCH_FEATURES,
-            "a latent row is exactly the head's output row"
-        );
         let schedule = facts.schedule.as_ref().expect("and its schedule");
         assert_eq!(
             (schedule.kind, schedule.shift, schedule.train_steps),
@@ -604,6 +571,5 @@ fn the_generative_facts_state_the_readings_the_schedule_and_the_latent_space() {
                 "{deployment}: sigma {got} is not {want}"
             );
         }
-        assert!(facts.max_rows >= 4096);
     }
 }

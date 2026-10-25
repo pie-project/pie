@@ -834,6 +834,7 @@ mod tests {
                 .collect(),
             seams: Vec::new(),
             drafter: None,
+            inputs: Vec::new(),
         }
     }
 

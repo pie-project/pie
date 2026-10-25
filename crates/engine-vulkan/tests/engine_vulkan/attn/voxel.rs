@@ -98,6 +98,7 @@ fn the_voxel_attention_answers_the_reference() {
                             segment,
                             scale,
                             t(o[0].0, rows, c, Dtype::Bf16),
+                            0,
                         )
                     })
                 },

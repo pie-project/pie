@@ -149,8 +149,7 @@ async fn main(input: Input) -> Result<Output> {
             "this haystack needs {kv_max} KV slots, past the published attn_score \
              ceiling of {}",
             intrinsics::attn_score_kv_max()
-        )
-        .into());
+        ));
     }
     let p_max = max_pages;
     let last_prompt_page = (n - 1) / page_size;
@@ -181,15 +180,15 @@ async fn main(input: Input) -> Result<Output> {
     )?;
     fwd_p.epilogue(move || {
         let logits = intrinsics::logits();
-        tok_out_p.put(&reduce_argmax(logits));
+        tok_out_p.put(reduce_argmax(logits));
 
         // `[planes, kv]` layer-major; dividing by `heads` averages heads and sums layers.
         let rect = intrinsics::attn_score(planes);
-        let folded = gather(&(&reduce_sum(&transpose(&rect)) / heads_f), iota(kv_max));
+        let folded = gather(&(&reduce_sum(transpose(&rect)) / heads_f), iota(kv_max));
         // Exact: `kv_max = p_max * page_size`.
-        let per_page = reduce_sum(&reshape(&folded, [p_max, page_size]));
+        let per_page = reduce_sum(reshape(&folded, [p_max, page_size]));
         page_mass_out.put(&per_page);
-        total_out.put(&reshape(&reduce_sum(&per_page), [1]));
+        total_out.put(reshape(reduce_sum(&per_page), [1]));
     });
     fwd_p.submit(&pipe).context("prefill submit")?;
 
@@ -251,17 +250,17 @@ async fn main(input: Input) -> Result<Output> {
 
     let fwd_q = ForwardPass::new();
     fwd_q.embed(&toks_q, &embed_indptr_q)?;
+    fwd_q.mask(&mask_q)?;
     fwd_q.state(
         &[&ws],
         StateGeometry {
             slots: Some(&slots_q),
-            mask: Some(&mask_q),
             ..StateGeometry::folding()
         },
     )?;
     fwd_q.epilogue(move || {
         let logits = intrinsics::logits();
-        tok_out_q.put(&reduce_argmax(logits));
+        tok_out_q.put(reduce_argmax(logits));
     });
     fwd_q.submit(&pipe).context("answer submit")?;
     let answer = tok_out_q.take_host::<i32>().await.context("answer take")?;

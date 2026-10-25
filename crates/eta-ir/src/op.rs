@@ -52,13 +52,37 @@ declare_intrinsics! {
     MtpLogits = 1, MTP_LOGITS, "mtp_logits";
     Hidden = 2, HIDDEN, "hidden";
     Query = 3, QUERY, "query";
-    ValueHead = 4, VALUE_HEAD, "value_head";
     Layer = 5, LAYER, "layer";
     MtpDrafts = 6, MTP_DRAFTS, "mtp_drafts";
     AttnScore = 7, ATTN_SCORE, "attn_score";
     Velocity = 8, VELOCITY, "velocity";
     Pixels = 9, PIXELS, "pixels";
-    PeerVelocity = 10, PEER_VELOCITY, "peer_velocity";
+}
+
+impl IntrinsicId {
+    pub fn per_lane(self) -> bool {
+        matches!(
+            self,
+            IntrinsicId::Velocity | IntrinsicId::Hidden | IntrinsicId::Pixels
+        )
+    }
+}
+
+/// [`IntrinsicId::SLOTS`] slots for each lane up to the highest `ops` read.
+pub fn intrinsic_pitch(ops: &[Op]) -> u32 {
+    let lanes = ops
+        .iter()
+        .filter_map(|op| match op {
+            Op::IntrinsicVal { lane, .. } => Some(lane.saturating_add(1)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(1);
+    IntrinsicId::SLOTS.saturating_mul(lanes)
+}
+
+pub const fn intrinsic_slot(intr: IntrinsicId, lane: u32) -> u32 {
+    intr as u32 + IntrinsicId::SLOTS * lane
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -192,8 +216,10 @@ pub enum Op {
         value: ValueId,
     },
 
+    /// `lane` is the pass's lane for a per-lane intrinsic, 0 for the others.
     IntrinsicVal {
         intr: IntrinsicId,
+        lane: u32,
         shape: Shape,
         dtype: Dtype,
     },
@@ -662,8 +688,8 @@ declare_ops! {
     CHAN_PUT = 0x92, "chan_put", Channel, 1, 0,
         Op::ChanPut { chan: 0, value: 0 }, Op::ChanPut { .. }, [Chan, Value];
     INTRINSIC_VAL = 0xA0, "intrinsic_val", Intrinsic, 0, 1,
-        Op::IntrinsicVal { intr: IntrinsicId::Logits, shape: Shape::matrix(1, 8), dtype: Dtype::F32 },
-        Op::IntrinsicVal { .. }, [Intrinsic, Dtype, Shape];
+        Op::IntrinsicVal { intr: IntrinsicId::Logits, lane: 0, shape: Shape::matrix(1, 8), dtype: Dtype::F32 },
+        Op::IntrinsicVal { .. }, [Intrinsic, Imm, Dtype, Shape];
     KERNEL_CALL = 0xA1, "kernel_call", Intrinsic, VARIADIC, 1,
         Op::KernelCall { name: 0, args: vec![0, 1], shape: Shape::vector(4), dtype: Dtype::F32 },
         Op::KernelCall { .. }, [Name, Dtype, Shape, Args];

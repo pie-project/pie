@@ -66,7 +66,7 @@ def attention_by_hand(x, inputs, m, plans, mask, positions, scaling, w):
         seam.at(seam.SCORES, [lse])
         return o
 
-    o = switch(q, [
+    o = branch(q, [
         (fact.has(fact.Mask), lambda q: ops.attn.prefill(q, plans.m, pages, None, d, m.kv_heads, m.sm_scale, mask = mask)),
         (fact.scores(), scored),
         (fact.single_token(), lambda q: ops.attn.decode(q, plans.d, pages, None, d, m.sm_scale)),

@@ -246,6 +246,7 @@ impl Run<'_> {
                 },
                 *sm_scale,
                 self.tensor(*o),
+                self.grid_base(*grid, *q),
             ),
             Attn::PlanDecode {
                 kv_indptr: _,
@@ -489,6 +490,12 @@ impl Run<'_> {
                     poem_ir::RaggedMask::None | poem_ir::RaggedMask::GroupBlockDiagonal => {}
                     _ => return Err(kernels_slang::Error::Unsupported { op: op.name() }),
                 }
+                let stated = self.group_mask(*q_indptr, *kv_indptr).map(|stated| {
+                    kernels_slang::attn::dense::CustomMask {
+                        bits: stated.bits,
+                        indptr: stated.indptr,
+                    }
+                });
                 kernels_slang::attn::dense::ragged(
                     self.ctx,
                     self.uncut(*q),
@@ -499,6 +506,7 @@ impl Run<'_> {
                     *head_dim,
                     *kv_heads,
                     *sm_scale,
+                    stated,
                     self.uncut(*o),
                 )
             }

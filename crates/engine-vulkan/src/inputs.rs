@@ -29,7 +29,7 @@ pub struct VoxelSeat {
     pub clips: u64,
     pub channels: u64,
     pub dtype: Dtype,
-    pub token_grid: bool,
+    pub token_patch: Option<[u32; 3]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -57,29 +57,11 @@ pub struct VoxelFire<'a> {
     pub payload: &'a [u8],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PortSeat {
-    pub kind: engine::fire::PortKind,
-    pub port: u8,
-    pub width: u32,
-    pub dtype: Dtype,
-}
-
-impl PortSeat {
-    #[must_use]
-    pub fn per_lane(&self) -> bool {
-        self.kind == engine::fire::PortKind::LaneVector
-    }
-
-    #[must_use]
-    pub fn row_bytes(&self) -> u64 {
-        u64::from(self.width) * poem_compiler::arena::elem_bytes(self.dtype).unwrap_or(0)
-    }
-}
+pub use poem_exec::feeds::Seat;
 
 #[derive(Debug, Clone, Copy)]
-struct PortAt {
-    seat: PortSeat,
+struct SeatAt {
+    seat: Seat,
     at: u64,
     bytes: u64,
 }
@@ -88,7 +70,6 @@ struct PortAt {
 struct PackingAt {
     group_indptr: u64,
     lane_indptr: u64,
-    reference_tag: u64,
     permutation: u64,
 }
 
@@ -96,7 +77,6 @@ struct PackingAt {
 pub struct PackingHandles {
     pub group_indptr: Tensor,
     pub lane_indptr: Tensor,
-    pub reference_tag: Tensor,
     pub permutation: Tensor,
 }
 
@@ -104,7 +84,6 @@ pub struct PackingHandles {
 pub struct PackingFire<'a> {
     pub group_indptr: &'a [i32],
     pub lane_indptr: &'a [i32],
-    pub reference_tag: &'a [i32],
     pub permutation: &'a [i32],
 }
 
@@ -165,7 +144,7 @@ pub struct Handles {
 
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
-    pub ports: Vec<Tensor>,
+    pub inputs: Vec<(u32, Tensor)>,
     pub voxels: Option<VoxelHandles>,
 }
 
@@ -273,8 +252,20 @@ pub struct Inputs {
 
     group_of_lane: u64,
     packings: Vec<PackingAt>,
-    ports: Vec<PortAt>,
+    seats: Vec<SeatAt>,
     voxels: Option<VoxelAt>,
+    /// Staged apart from the store: their size is the groups', not the load's.
+    group_masks: Option<Buffer>,
+    /// Smaller ones it outgrew, kept: an earlier fire may still read them.
+    outgrown: Vec<Buffer>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct GroupMaskHandles {
+    pub q: poem_ir::Selection,
+    pub kv: poem_ir::Selection,
+    pub bits: Tensor,
+    pub indptr: Tensor,
 }
 
 impl Inputs {
@@ -288,7 +279,7 @@ impl Inputs {
         gathered: usize,
         patch: Option<PatchSeat>,
         mrope: bool,
-        ports: &[PortSeat],
+        seats: &[Seat],
         selections: usize,
         voxel: Option<VoxelSeat>,
     ) -> Result<Inputs> {
@@ -351,15 +342,14 @@ impl Inputs {
             .map(|_| PackingAt {
                 group_indptr: take((lanes + 1) * 4),
                 lane_indptr: take((lanes + 1) * 4),
-                reference_tag: take(rows * 4),
                 permutation: take(rows * 4),
             })
             .collect();
-        let ports: Vec<PortAt> = ports
+        let seats: Vec<SeatAt> = seats
             .iter()
             .map(|seat| {
                 let bytes = if seat.per_lane() { lanes } else { rows } * seat.row_bytes();
-                PortAt {
+                SeatAt {
                     seat: *seat,
                     at: take(bytes),
                     bytes,
@@ -371,7 +361,7 @@ impl Inputs {
             VoxelAt {
                 payload: take(seat.rows * seat.channels * element),
                 grid: take(seat.clips * 4 * 4),
-                token_grid: if seat.token_grid {
+                token_grid: if seat.token_patch.is_some() {
                     take(seat.clips * 4 * 4)
                 } else {
                     0
@@ -406,9 +396,77 @@ impl Inputs {
             rs_commit,
             group_of_lane,
             packings,
-            ports,
+            seats,
             voxels,
+            group_masks: None,
+            outgrown: Vec::new(),
         })
+    }
+
+    pub fn stage_group_masks(
+        &mut self,
+        device: &Context,
+        handles: &crate::device::Handles,
+        masks: &[(
+            poem_ir::Selection,
+            poem_ir::Selection,
+            poem_exec::fire::GroupMask,
+        )],
+    ) -> Result<Vec<GroupMaskHandles>> {
+        if masks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut image: Vec<u8> = Vec::new();
+        let mut placed = Vec::with_capacity(masks.len());
+        for (_, _, mask) in masks {
+            let indptr = image.len();
+            image.extend_from_slice(bytes_of(&mask.indptr));
+            image.resize(image.len().next_multiple_of(ALIGN as usize), 0);
+            let bits = image.len();
+            // The kernel reads the bits a word at a time.
+            image.extend_from_slice(&mask.bits);
+            image.resize(image.len().next_multiple_of(ALIGN as usize), 0);
+            placed.push((indptr, bits));
+        }
+        if self
+            .group_masks
+            .as_ref()
+            .is_none_or(|held| held.bytes() < image.len() as u64)
+        {
+            let grown = Buffer::host(device, (image.len() as u64).next_power_of_two())?;
+            if let Some(old) = self.group_masks.replace(grown) {
+                self.outgrown.push(old);
+            }
+        }
+        let buffer = self
+            .group_masks
+            .as_mut()
+            .expect("the group mask buffer was just sized");
+        buffer.write(0, &image)?;
+        let buffer = &*buffer;
+        masks
+            .iter()
+            .zip(placed)
+            .map(|((q, kv, mask), (indptr, bits))| {
+                let words = mask.bits.len().div_ceil(4).max(1) as u64;
+                Ok(GroupMaskHandles {
+                    q: *q,
+                    kv: *kv,
+                    bits: Tensor::new(
+                        handles.bind(buffer, bits as u64, words * 4)?,
+                        u32::try_from(words * 4).unwrap_or(u32::MAX),
+                        1,
+                        Dtype::U8,
+                    ),
+                    indptr: i32s(
+                        handles,
+                        buffer,
+                        indptr as u64,
+                        u32::try_from(mask.indptr.len()).unwrap_or(u32::MAX),
+                    )?,
+                })
+            })
+            .collect()
     }
 
     #[must_use]
@@ -416,13 +474,16 @@ impl Inputs {
         self.voxels.map(|at| (&self.store, at.payload))
     }
 
-    pub fn write_port(&mut self, at: u64, bytes: &[u8]) -> Result<()> {
+    pub fn write_input(&mut self, at: u64, bytes: &[u8]) -> Result<()> {
         self.store.write(at, bytes)
     }
 
     #[must_use]
-    pub fn port_seat(&self, port: usize) -> Option<(&Buffer, u64)> {
-        self.ports.get(port).map(|at| (&self.store, at.at))
+    pub fn seat(&self, id: u32) -> Option<(&Buffer, u64)> {
+        self.seats
+            .iter()
+            .find(|at| at.seat.id == id)
+            .map(|at| (&self.store, at.at))
     }
 
     #[must_use]
@@ -664,11 +725,6 @@ impl Inputs {
                     u64::from(lanes) + 1,
                 ),
                 (
-                    "reference tags",
-                    staged.reference_tag.len() as u64,
-                    u64::from(rows),
-                ),
-                (
                     "packed row permutation",
                     staged.permutation.len() as u64,
                     u64::from(rows),
@@ -686,25 +742,25 @@ impl Inputs {
             self.store.write(at.group_indptr, bytes_of(&scratch))?;
             csr(&mut scratch, staged.lane_indptr, lanes + 1);
             self.store.write(at.lane_indptr, bytes_of(&scratch))?;
-            rows_table(&mut scratch, staged.reference_tag, rows);
-            self.store.write(at.reference_tag, bytes_of(&scratch))?;
             rows_table(&mut scratch, staged.permutation, rows);
             self.store.write(at.permutation, bytes_of(&scratch))?;
             packings.push(PackingHandles {
                 group_indptr: i32s(handles, &self.store, at.group_indptr, lanes + 1)?,
                 lane_indptr: i32s(handles, &self.store, at.lane_indptr, lanes + 1)?,
-                reference_tag: i32s(handles, &self.store, at.reference_tag, rows)?,
                 permutation: i32s(handles, &self.store, at.permutation, rows)?,
             });
         }
-        let mut ports = Vec::with_capacity(self.ports.len());
-        for at in &self.ports {
+        let mut inputs = Vec::with_capacity(self.seats.len());
+        for at in &self.seats {
             let carved = if at.seat.per_lane() { lanes } else { rows };
-            ports.push(Tensor::new(
-                handles.bind(&self.store, at.at, at.bytes)?,
-                carved,
-                at.seat.width,
-                at.seat.dtype,
+            inputs.push((
+                at.seat.id,
+                Tensor::new(
+                    handles.bind(&self.store, at.at, at.bytes)?,
+                    carved,
+                    at.seat.width,
+                    at.seat.dtype,
+                ),
             ));
         }
 
@@ -731,7 +787,11 @@ impl Inputs {
                     (
                         "voxel token grid",
                         (staged.token_grid.len() / 4) as u64,
-                        if seat.token_grid { seat.clips } else { 0 },
+                        if seat.token_patch.is_some() {
+                            seat.clips
+                        } else {
+                            0
+                        },
                     ),
                     ("voxel clip slots", staged.slots.len() as u64, seat.clips),
                 ] {
@@ -770,7 +830,7 @@ impl Inputs {
                         4,
                         Dtype::I32,
                     ),
-                    token_grid: if seat.token_grid {
+                    token_grid: if seat.token_patch.is_some() {
                         Some(Tensor::new(
                             handles.bind(&self.store, at.token_grid, clips * 16)?,
                             clips32,
@@ -873,7 +933,7 @@ impl Inputs {
             },
             group_of_lane,
             packings,
-            ports,
+            inputs,
             voxels,
         })
     }

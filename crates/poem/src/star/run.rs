@@ -160,21 +160,6 @@ impl Package {
         )
     }
 
-    /// The canvas `id`'s deployment `deploy` denoises as a text diffusion
-    /// model, if its package states one (`diffusion(m)`).
-    pub fn diffusion(
-        &self,
-        id: &str,
-        deploy: &Deploy,
-    ) -> anyhow::Result<Option<crate::generative::Diffusion>> {
-        self.stated(
-            id,
-            deploy,
-            "diffusion",
-            crate::star::generative::diffusion_of,
-        )
-    }
-
     fn stated<T>(
         &self,
         id: &str,

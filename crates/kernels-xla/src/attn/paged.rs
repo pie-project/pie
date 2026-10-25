@@ -411,10 +411,8 @@ pub(crate) struct Rows {
     pub mask: Option<Val>,
     /// `[R, qh · extent]` f32 relative-bias rows.
     pub rel: Option<Val>,
-    /// Reference tag per row, i32.
-    pub tag: Option<Val>,
-    /// Attn class per row, i32.
-    pub class: Option<Val>,
+    /// Per row, the custom-mask bit its segment's first key stands at, i32.
+    pub bit: Option<Val>,
     /// Row index within its segment, i32 (ragged bias).
     pub qi: Option<Val>,
     /// The segment's first key row, i32 (ragged bias).
@@ -432,8 +430,7 @@ impl Rows {
             enabled: None,
             mask: None,
             rel: None,
-            tag: None,
-            class: None,
+            bit: None,
             qi: None,
             begin: None,
         }
@@ -450,8 +447,7 @@ impl Rows {
             enabled: o(f, self.enabled)?,
             mask: o(f, self.mask)?,
             rel: o(f, self.rel)?,
-            tag: o(f, self.tag)?,
-            class: o(f, self.class)?,
+            bit: o(f, self.bit)?,
             qi: o(f, self.qi)?,
             begin: o(f, self.begin)?,
         })
@@ -469,10 +465,9 @@ pub(crate) struct Rule {
     pub kp_span: Option<i64>,
     /// Relative bias rows: `(extent, log_floor, log_alpha)`.
     pub rel: Option<(i64, u32, f32)>,
-    /// Per-key reference tags `[n]`.
-    pub kv_tags: Option<Val>,
-    /// `(kv_classes [n], table [count²] i32, count)`.
-    pub classes: Option<(Val, Val, i64)>,
+    /// The custom mask's bytes, flat i32: a row's key `x` is kept where bit
+    /// `bit + (x − begin)` is set.
+    pub bits: Option<Val>,
     /// `(table [qh · (2·max_len − 1)] f32, max_len)`.
     pub rbias: Option<(Val, i64)>,
     /// The most keys one row admits (a sliding window), when bounded: the
@@ -536,32 +531,20 @@ fn logits(
         let ok = f.or(off, keep)?;
         valid = f.and(valid, ok)?;
     }
-    if let (Some(kv_tags), Some(tag)) = (rule.kv_tags, rows.tag) {
-        let n = f.dims(kv_tags)[0];
-        let xc = clamp_i(f, x, 0, n - 1)?;
-        let kt = take(f, kv_tags, xc)?;
-        let qt = f.broadcast(tag, &dims, &[0])?;
-        let untagged = cmp_i(f, Cmp::Lt, qt, 0)?;
-        let same = f.compare(Cmp::Eq, kt, qt)?;
-        let ok = f.or(untagged, same)?;
-        valid = f.and(valid, ok)?;
-    }
-    if let (Some((kv_classes, table, count)), Some(class)) = (rule.classes, rows.class) {
-        let n = f.dims(kv_classes)[0];
-        let xc = clamp_i(f, x, 0, n - 1)?;
-        let kc = take(f, kv_classes, xc)?;
-        let qc = f.broadcast(class, &dims, &[0])?;
-        let at = with_i(f, qc, count, Func::mul)?;
-        let at = f.add(at, kc)?;
-        let cells = f.dims(table)[0];
-        let at = clamp_i(f, at, 0, cells - 1)?;
-        let cell = take(f, table, at)?;
-        let q_free = cmp_i(f, Cmp::Lt, qc, 0)?;
-        let k_free = cmp_i(f, Cmp::Lt, kc, 0)?;
-        let allowed = cmp_i(f, Cmp::Ne, cell, 0)?;
-        let ok = f.or(q_free, k_free)?;
-        let ok = f.or(ok, allowed)?;
-        valid = f.and(valid, ok)?;
+    if let (Some(bits), Some(bit), Some(begin)) = (rule.bits, rows.bit, rows.begin) {
+        let bit = f.broadcast(bit, &dims, &[0])?;
+        let b = f.broadcast(begin, &dims, &[0])?;
+        let at = f.sub(x, b)?;
+        let at = f.add(bit, at)?;
+        let byte = with_i(f, at, 3, Func::shr)?;
+        let n = f.dims(bits)[0];
+        let byte = clamp_i(f, byte, 0, n - 1)?;
+        let cell = take(f, bits, byte)?;
+        let shift = with_i(f, at, 7, Func::and)?;
+        let cell = f.shr(cell, shift)?;
+        let cell = with_i(f, cell, 1, Func::and)?;
+        let kept = cmp_i(f, Cmp::Ne, cell, 0)?;
+        valid = f.and(valid, kept)?;
     }
     let qh = h.qh();
     let d3 = [rb, qh, c];

@@ -138,6 +138,7 @@ fn beam_program() -> TraceContainer {
                 Op::ChanTake(3),
                 Op::IntrinsicVal {
                     intr: IntrinsicId::Logits,
+                    lane: 0,
                     shape: Shape::matrix(BEAMS, VOCAB),
                     dtype: EtaDtype::F32,
                 },
@@ -145,6 +146,7 @@ fn beam_program() -> TraceContainer {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 

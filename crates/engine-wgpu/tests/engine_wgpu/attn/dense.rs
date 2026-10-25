@@ -163,6 +163,7 @@ fn dense_attention_answers_the_reference() {
                 hd as u32,
                 kvh as u32,
                 scale as f32,
+                None,
                 ot(y),
             )
         });

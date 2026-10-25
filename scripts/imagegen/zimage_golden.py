@@ -274,6 +274,7 @@ def run_taps(d: str, dtype=torch.bfloat16):
     npz_keys(tap)
 
 def main():
+    global SIZE, PROMPT
     ap = argparse.ArgumentParser()
     ap.add_argument("--full", action="store_true")
     ap.add_argument("--mini", action="store_true")
@@ -283,7 +284,10 @@ def main():
     ap.add_argument("--taps", action="store_true",
                     help="the Turbo transformer's stages over the step-0 inputs (zimage_taps.npz; CUDA, ~13 GB)")
     ap.add_argument("--device", default="cpu")
+    ap.add_argument("--size", type=int, default=SIZE)
+    ap.add_argument("--prompt", default=PROMPT)
     a = ap.parse_args()
+    SIZE, PROMPT = a.size, a.prompt
     if not (a.full or a.mini or a.vae or a.mini_pad or a.taps):
         a.full = a.mini = a.vae = a.mini_pad = True
     d = outdir(MODEL)

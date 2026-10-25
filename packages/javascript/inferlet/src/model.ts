@@ -5,7 +5,7 @@
 // around.
 
 import * as _model from 'pie:inferlet/model@0.3.0';
-import type { BlockDrafter, CanvasShape, LatentSpace, ReadingFact, ScheduleFact } from 'pie:inferlet/model@0.3.0';
+import type { BlockDrafter, LaneDecl, LatentSpace, ScheduleFact, SwitchDecl } from 'pie:inferlet/model@0.3.0';
 
 // The tokenizer surface lives in the sibling `tokenizer` module and is
 // re-exported here, so `model.encode`/`model.decode` read off `model` the way
@@ -42,21 +42,9 @@ export function draftBlock(): BlockDrafter | undefined {
   return _model.draftBlock();
 }
 
-/** The diffusion canvas; `undefined` for every other pass kind. */
-export function canvas(): CanvasShape | undefined {
-  return _model.canvas();
-}
-
 /** Fires one lane may have submitted and not yet taken. */
 export function runAheadWindow(): number {
   return _model.runAheadWindow();
-}
-
-/**
- * The bound model's forward-pass interface; never derive it by parsing `architecture()`.
- */
-export function passKind(): _model.ForwardKind {
-  return _model.passKind();
 }
 
 /** Logits/output dimension. May exceed the tokenizer's vocabulary size. */
@@ -94,15 +82,19 @@ export function rsStateSize(): number {
 
 // -- generative facts ---------------------------------------------------------
 
-/** Every reading the bound model declares, in index order; empty for a text
- *  row (one implicit reading). */
-export function readings(): ReadingFact[] {
-  return _model.readings();
+/** Every switch the bound model declares; each value list's first is its default. */
+export function switches(): SwitchDecl[] {
+  return _model.switches();
 }
 
-/** The declared reading named `name`, if any. */
-export function reading(name: string): ReadingFact | undefined {
-  return _model.readings().find((r) => r.name === name);
+/** The switch `name` the model declares, if any. */
+export function switchDecl(name: string): SwitchDecl | undefined {
+  return _model.switches().find((d) => d.name === name);
+}
+
+/** The lane of these `[name, value]` switches; unset ones take their defaults. */
+export function lane(switches: Array<[string, string]>): LaneDecl {
+  return _model.lane(switches);
 }
 
 /** The latent space a denoiser works in; `undefined` without one. */
@@ -116,23 +108,21 @@ export function schedule(): ScheduleFact | undefined {
   return _model.schedule();
 }
 
-/** The most latent rows one pass carries; 0 without a float lane. */
+/** The most rows one lane may carry. */
 export function maxLatentRows(): number {
   return _model.maxLatentRows();
 }
 
 export type {
-  AxisRole,
   BlockDrafter,
-  CanvasShape,
-  ForwardKind,
-  LaneStream,
+  InputAxis,
+  InputDecl,
+  LaneDecl,
   LatentSpace,
-  PortFact,
-  PortKind,
-  PositionConvention,
-  ReadingFact,
+  Readout,
   ReadoutKind,
+  RowCount,
   ScheduleFact,
   ScheduleKind,
+  SwitchDecl,
 } from 'pie:inferlet/model@0.3.0';

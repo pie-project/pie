@@ -14,8 +14,7 @@ use engine::fire::{
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
-use eta_ir::registry::{GeometryClass, ModelProfile, PortMask};
-use eta_ir::types::Dtype;
+use eta_ir::registry::{GeometryClass, PortMask};
 use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
 
@@ -317,40 +316,6 @@ fn voxel_bytes(
     }
 }
 
-fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
-    let trace = shell.trace();
-    let layers = trace
-        .nodes
-        .iter()
-        .filter_map(|node| node.layer)
-        .max()
-        .map_or(0, |top| top + 1);
-    let vocab = u32::try_from(shell.out_width().map_err(fault)?).unwrap_or(u32::MAX);
-    Ok(ModelProfile {
-        vocab,
-        page_size: budgets.page_size,
-        num_layers: layers,
-
-        activation: Dtype::F32,
-        has_mtp_logits: shell.drafts(),
-        mtp_depth: shell.mtp_depth(),
-        draft_block: shell.trace().drafter.map_or(0, |d| d.rows),
-        draft_mask_token: shell.trace().drafter.map_or(0, |d| d.mask_token),
-        draft_bidirectional: shell.trace().drafter.is_some_and(|d| d.bidirectional),
-        draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
-        has_value_head: false,
-        has_attn_score: false,
-        has_attn_page_mask: false,
-
-        has_lora: true,
-        has_velocity: false,
-        velocity_width: 0,
-        has_pixels: shell.pixels_width().is_some(),
-        pixels_width: shell.pixels_width().unwrap_or(0),
-        kernels: Vec::new(),
-    })
-}
-
 fn adapter_of(
     shell: &mut Shell,
     package: &eta_compiler::codegen::launch::LaunchPackage,
@@ -473,7 +438,6 @@ impl Engine for Wgpu {
             .caches
             .iter()
             .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
-        let profile = profile(&shell, &budgets)?;
 
         let caps = Capabilities {
             device: DeviceFacts {
@@ -515,7 +479,14 @@ impl Engine for Wgpu {
                 .unwrap_or(u32::MAX),
                 max_scoring_lanes: 0,
             },
-            profile,
+            has_lora: true,
+            has_attn_page_mask: false,
+            has_mtp_logits: shell.drafts(),
+            mtp_depth: shell.mtp_depth(),
+            draft_block: shell.trace().drafter.map_or(0, |d| d.rows),
+            draft_mask_token: shell.trace().drafter.map_or(0, |d| d.mask_token),
+            draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
+            has_attn_score: false,
 
             ports: PortMask::DECODE_ENVELOPE
                 .with(eta_ir::registry::Port::Fold)
@@ -536,6 +507,9 @@ impl Engine for Wgpu {
             bidirectional_attention: false,
             adapter_attachments: false,
             facts: shell.trace().facts.clone(),
+            inputs: poem_exec::feeds::Feeds::of(shell.trace(), shell.compiled_model())
+                .decls(shell.trace(), shell.compiled_model()),
+            classes: poem_exec::feeds::lane_classes(shell.trace(), shell.compiled_model()),
         };
 
         self.shell = Some(shell);
@@ -812,11 +786,40 @@ impl Engine for Wgpu {
 
 impl Wgpu {
     #[cfg(feature = "wgpu")]
+    fn run_prologues(&mut self, submission: &Step) -> EngineResult<()> {
+        let mut prologues = program_attachments(submission)
+            .filter(|attachment| self.programs.prologue_runs(attachment.instance))
+            .peekable();
+        if prologues.peek().is_none() {
+            return Ok(());
+        }
+        let device = self.loaded()?.device().clone();
+        for attachment in prologues {
+            self.programs
+                .fire_prologue(&device, attachment.instance)
+                .map_err(refusal)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    fn run_prologues(&mut self, submission: &Step) -> EngineResult<()> {
+        if program_attachments(submission)
+            .any(|attachment| self.programs.prologue_runs(attachment.instance))
+        {
+            return Err(Error::Program(
+                "this build carries no wgpu device, so a guest pass has nowhere to run".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "wgpu")]
     fn deferred_guests(
         &mut self,
         submission: &Step,
     ) -> EngineResult<Option<crate::landing::Guests>> {
-        if submission.attachments.is_empty() {
+        if program_attachments(submission).next().is_none() {
             return Ok(None);
         }
         let device = self.loaded()?.device().clone();
@@ -828,9 +831,7 @@ impl Wgpu {
         self.programs
             .deferred(
                 &device,
-                submission
-                    .attachments
-                    .iter()
+                program_attachments(submission)
                     .map(|attachment| (attachment.instance, attachment.lane)),
                 policies,
             )
@@ -843,7 +844,7 @@ impl Wgpu {
         &mut self,
         submission: &Step,
     ) -> EngineResult<Option<crate::landing::Guests>> {
-        if submission.attachments.is_empty() {
+        if program_attachments(submission).next().is_none() {
             Ok(None)
         } else {
             Err(Error::Program(
@@ -857,6 +858,20 @@ impl Wgpu {
         submission: &Step,
         at: engine::StepDone,
     ) -> EngineResult<(FireTicket, PendingStep)> {
+        // Checked before a prologue moves the cursors the caller predicted.
+        for attachment in &submission.attachments {
+            if let Some(lane) = submission.lanes.get(attachment.lane as usize)
+                && !lane.channels.is_empty()
+                && let Some(why) = self
+                    .programs
+                    .disagreeing_ticket(attachment.instance, &lane.channels)
+            {
+                return Err(Error::Program(format!(
+                    "this fire's channel predictions and the engine's disagree: {why}"
+                )));
+            }
+        }
+        self.run_prologues(submission)?;
         let mut staged: Vec<Vec<u8>> = Vec::new();
         if !submission.media.is_empty() {
             let Some(element) = self.loaded()?.patch_element() else {
@@ -940,16 +955,6 @@ impl Wgpu {
                         submission.lanes.len()
                     )));
                 };
-                if lane_at == 0
-                    && !lane.channels.is_empty()
-                    && let Some(why) = self
-                        .programs
-                        .disagreeing_ticket(attachment.instance, &lane.channels)
-                {
-                    return Err(Error::Program(format!(
-                        "this fire's channel predictions and the engine's disagree: {why}"
-                    )));
-                }
                 resolved[lane_index] = self
                     .programs
                     .envelope_tokens(attachment.instance, lane.tokens.len(), lane_at)
@@ -977,6 +982,35 @@ impl Wgpu {
                     .map_err(refusal)?
             {
                 *fold = engine::fire::FoldLen::Host(n);
+            }
+        }
+
+        let mut input_cells: Vec<Vec<(engine::fire::InputFeed, crate::program::InputCell)>> =
+            vec![Vec::new(); submission.lanes.len()];
+        for (at, lane) in submission.lanes.iter().enumerate() {
+            if lane.inputs.is_empty() {
+                continue;
+            }
+            let instance = submission
+                .attachments
+                .iter()
+                .find(|attachment| {
+                    (attachment.lane..attachment.lane + attachment.lanes.max(1))
+                        .contains(&(at as u32))
+                })
+                .map(|attachment| attachment.instance)
+                .ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "lane {at} feeds guest inputs and has no attachment; an input is read \
+                         through the instance the lane is attached to"
+                    ))
+                })?;
+            for feed in &lane.inputs {
+                let cell = self
+                    .programs
+                    .input_cell(instance, feed.channel)
+                    .map_err(refusal)?;
+                input_cells[at].push((*feed, cell));
             }
         }
 
@@ -1018,37 +1052,38 @@ impl Wgpu {
             .lanes
             .iter()
             .enumerate()
-            .map(|(at, lane)| {
-                Ok(Seated {
-                    lane: Lane {
-                        slot: lane.slot,
+            .map(|(at, lane)| Seated {
+                lane: Lane {
+                    slot: lane.slot,
 
-                        word: words[at],
-                        tokens: resolved[at].as_deref().unwrap_or(&lane.tokens),
-                    },
-                    pages: &lane.kv.pages,
-                    held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
-                    kv_less: lane.kv_less,
-                    captures_scores: lane.captures_scores,
+                    word: words[at],
+                    tokens: resolved[at].as_deref().unwrap_or(&lane.tokens),
+                },
+                pages: &lane.kv.pages,
+                held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
+                kv_less: lane.kv_less,
+                captures_scores: lane.captures_scores,
 
-                    mask: resolved_masks[at].as_ref().or(lane.mask.as_ref()),
+                mask: resolved_masks[at].as_ref().or(lane.mask.as_ref()),
 
-                    adapter: lane_adapters[at].or(lane.adapter),
-                    positions: &lane.positions,
+                adapter: lane_adapters[at].or(lane.adapter),
+                positions: &lane.positions,
 
-                    readout: match &lane.readout {
-                        Readout::Rows(rows) => Some(rows.as_slice()),
-                        Readout::Last | Readout::None => None,
-                    },
+                readout: match &lane.readout {
+                    Readout::Rows(rows) => Some(rows.as_slice()),
+                    Readout::Last | Readout::None => None,
+                },
 
-                    translation: &lane.kv.translation,
+                translation: &lane.kv.translation,
 
-                    rs: &verbs[at],
-                    rs_reset: lane.rs_reset,
-                    rs_slot: lane.rs_slot,
-                })
+                rs: &verbs[at],
+                rs_reset: lane.rs_reset,
+                rs_slot: lane.rs_slot,
+
+                group: lane.group,
+                inputs: &input_cells[at],
             })
-            .collect::<EngineResult<Vec<_>>>()?;
+            .collect();
 
         let landed = {
             use engine::frame::Shell as FrameShell;
@@ -1111,4 +1146,11 @@ pub(crate) fn lane_readouts(policies: &[Readout], rows: &[Vec<f32>]) -> Vec<Lane
             }
         })
         .collect()
+}
+
+/// The attachments whose program runs on this fire.
+fn program_attachments(step: &Step) -> impl Iterator<Item = &engine::fire::Attachment> {
+    step.attachments
+        .iter()
+        .filter(|attachment| !attachment.adapter_only)
 }

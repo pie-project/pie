@@ -23,7 +23,7 @@ impl ForwardHybrid for Encoder {
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
-        let mut x = inputs.latents(0, WIDTH, Dtype::Bf16);
+        let mut x = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, WIDTH, None);
         let perm = inputs.row_permutation();
         let indptr = inputs.lane_indptr();
         let layers: Vec<u32> = (0..LAYERS).collect();
@@ -204,7 +204,13 @@ fn a_table_that_disagrees_with_its_max_len_or_is_not_f32_is_refused() {
             HybridSpec::new()
         }
         fn forward(&self, inputs: Input) -> Value {
-            let x = inputs.latents(0, HEADS * HEAD_DIM, Dtype::Bf16);
+            let x = inputs.input(
+                "latents",
+                Dtype::Bf16,
+                poem_ir::InputAxis::Row,
+                HEADS * HEAD_DIM,
+                None,
+            );
             let table = inputs.recorder().fresh(Ty::Tensor {
                 shape: vec![Dim::Const(u64::from(HEADS)), Dim::Const(u64::from(self.0))],
                 dtype: self.1,

@@ -175,6 +175,7 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
     // carrying the head_dim so the store sizes it per head.
     let trace = Trace {
         facts: Default::default(),
+        inputs: Vec::new(),
         name: String::from("kv_migrate_probe"),
         platform: Platform::Metal,
         params: Vec::new(),

@@ -165,6 +165,44 @@ pub fn split_rows(
     )
 }
 
+pub fn concat_cols(ctx: &Ctx<'_>, xs: &[Tensor], y: Tensor) -> Result<(), Error> {
+    const OP: &str = "gather.concat_cols";
+    let entry = dtype_dispatch!(OP, y.dtype, {
+        Bf16 => "place_cols_bfloat16",
+        F32 => "place_cols_float32",
+    });
+    let total: u32 = xs.iter().map(|x| x.width).sum();
+    if total != y.width || xs.iter().any(|x| x.dtype != y.dtype || x.rows < y.rows) {
+        return Err(refuse(
+            OP,
+            "the inputs share the output's element and rows, and their widths sum to its",
+        ));
+    }
+    if y.rows == 0 {
+        return Ok(());
+    }
+    let mut at = 0u32;
+    for x in xs {
+        if x.width > 0 {
+            ctx.fire(
+                Fire::at("gather/deinterleave.metal", entry).apply(Grid::of(
+                    elementwise_rows(OP, x.width, y.rows)?,
+                    [256, 1, 1],
+                )),
+                &[
+                    x.arg(),
+                    y.arg_mut(),
+                    stated(OP, y.width)?.arg(),
+                    stated(OP, at)?.arg(),
+                    stated(OP, x.width)?.arg(),
+                ],
+            )?;
+        }
+        at += x.width;
+    }
+    Ok(())
+}
+
 pub fn select(
     ctx: &Ctx<'_>,
     table: Tensor,

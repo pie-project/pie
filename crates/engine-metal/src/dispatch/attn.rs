@@ -76,6 +76,7 @@ impl Run<'_> {
                 },
                 *sm_scale,
                 self.tensor(*o),
+                self.grid_base(*grid, *q),
             ),
             Attn::PlanDecode {
                 kv_indptr: _,
@@ -317,7 +318,7 @@ impl Run<'_> {
                 causal,
                 q,
                 plan,
-                mask: Some(mask),
+                mask,
                 cache,
                 window,
                 head_dim,
@@ -329,11 +330,11 @@ impl Run<'_> {
                 selected: None,
                 rel: None,
                 lse: None,
-            } => attn::arbiter::masked_with_scratch(
+            } if mask.is_some() || !*causal => attn::arbiter::masked_with_scratch(
                 self.ctx(),
                 self.ragged(*q),
                 self.prefill_plan(*plan),
-                self.cut_rows(self.tensor(*mask)),
+                self.cut_rows(self.mask_bits(*mask)),
                 self.pool(*cache),
                 *window,
                 *causal,
@@ -349,7 +350,7 @@ impl Run<'_> {
                 causal,
                 q,
                 plan,
-                mask: Some(mask),
+                mask,
                 cache,
                 window,
                 head_dim,
@@ -361,11 +362,11 @@ impl Run<'_> {
                 floor: None,
                 selected: None,
                 rel: None,
-            } => attn::arbiter::masked_lse(
+            } if mask.is_some() || !*causal => attn::arbiter::masked_lse(
                 self.ctx(),
                 self.ragged(*q),
                 self.prefill_plan(*plan),
-                self.cut_rows(self.tensor(*mask)),
+                self.cut_rows(self.mask_bits(*mask)),
                 self.pool(*cache),
                 *window,
                 *causal,
@@ -804,17 +805,26 @@ impl Run<'_> {
                 if self.run_index() > 0 {
                     return Ok(());
                 }
-                let mask = match mask {
-                    RaggedMask::None | RaggedMask::GroupBlockDiagonal => {
-                        attn::ragged::RaggedMask::Segments
-                    }
-                    RaggedMask::ReferenceSelfOnly { q_tags, kv_tags } => {
-                        attn::ragged::RaggedMask::ReferenceTags {
-                            q_tags: self.uncut(*q_tags),
-                            kv_tags: self.uncut(*kv_tags),
+                let mask = match (mask, self.group_mask(*q_indptr, *kv_indptr)) {
+                    (RaggedMask::None | RaggedMask::GroupBlockDiagonal, Some(stated)) => {
+                        attn::ragged::RaggedMask::Custom {
+                            bits: stated.bits,
+                            indptr: stated.indptr,
                         }
                     }
-                    RaggedMask::RelativeBias { table, max_len } => {
+                    (RaggedMask::None | RaggedMask::GroupBlockDiagonal, None) => {
+                        attn::ragged::RaggedMask::Segments
+                    }
+                    (RaggedMask::RelativeBias { .. }, Some(_)) => {
+                        return Err(kernels_metal::Error::Backend {
+                            op: "attn.ragged",
+                            detail: "a lane states an attention mask over an attention the \
+                                     model already biases (a relative bias); the two do not \
+                                     compose"
+                                .to_string(),
+                        });
+                    }
+                    (RaggedMask::RelativeBias { table, max_len }, None) => {
                         attn::ragged::RaggedMask::RelativeBias {
                             table: self.tensor(*table),
                             max_len: *max_len,

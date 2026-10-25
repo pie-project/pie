@@ -10,10 +10,8 @@ pub struct LaneMask<'a> {
 
     pub rows: u32,
 
-    /// Every row reads every key the lane holds (its own rows included):
-    /// the row's enable flag is 2 and, without a stated mask, every bit is
-    /// kept.
-    pub bidirectional: bool,
+    /// The class attends both ways: the enable flag is 2 and, with no stated mask, every bit is kept.
+    pub wide: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -26,10 +24,7 @@ pub struct Staged {
 }
 
 pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
-    if lanes
-        .iter()
-        .all(|lane| lane.mask.is_none() && !lane.bidirectional)
-    {
+    if lanes.iter().all(|lane| lane.mask.is_none() && !lane.wide) {
         return Ok(None);
     }
 
@@ -37,7 +32,7 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
     for (at, lane) in lanes.iter().enumerate() {
         let kv = u64::from(lane.have) + u64::from(lane.rows);
         let Some(masking) = lane.mask else {
-            if lane.bidirectional {
+            if lane.wide {
                 widest = widest.max(kv);
             }
             continue;
@@ -86,9 +81,9 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
     let mut row = 0usize;
     for lane in lanes {
         let kv = u64::from(lane.have) + u64::from(lane.rows);
-        let flag = if lane.bidirectional { 2 } else { 1 };
+        let flag = if lane.wide { 2 } else { 1 };
         let Some(masking) = lane.mask else {
-            if lane.bidirectional {
+            if lane.wide {
                 for q in 0..u64::from(lane.rows) {
                     out.enabled[row + q as usize] = flag;
                     for key in 0..kv {
@@ -110,7 +105,7 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                     let end = at_position.saturating_add(u64::from(run)).min(kv);
                     if index % 2 == 1 {
                         for key in at_position..end {
-                            let first = if lane.bidirectional {
+                            let first = if lane.wide {
                                 0
                             } else {
                                 key.saturating_sub(u64::from(lane.have))
@@ -130,7 +125,7 @@ pub fn stage(lanes: &[LaneMask<'_>]) -> Result<Option<Staged>> {
                 for (q, mask) in masks.iter().enumerate() {
                     let q = q as u64;
 
-                    let bound = if lane.bidirectional {
+                    let bound = if lane.wide {
                         kv
                     } else {
                         u64::from(lane.have) + q

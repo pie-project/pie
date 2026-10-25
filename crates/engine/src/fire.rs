@@ -190,19 +190,6 @@ pub enum Readout {
     None,
 }
 
-/// A structured attention mask over a lane's rows: `classes[row]` in
-/// `0..count`, or -1 for a row that attends and is attended by every row;
-/// `table[q * count + kv] != 0` lets a q-class row attend a kv-class row.
-/// Every lane of one attention group states the same table.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct AttnClasses {
-    pub classes: Vec<i32>,
-    pub table: Vec<u8>,
-    pub count: u32,
-}
-
-pub const ATTN_CLASSES_MAX: u32 = 64;
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lane {
     pub slot: u32,
@@ -212,14 +199,7 @@ pub struct Lane {
     pub kv: KvDelta,
     pub mask: Option<Masking>,
     pub adapter: Option<u32>,
-    pub drafts: bool,
     pub captures_scores: bool,
-    #[serde(default)]
-    pub block_draft: bool,
-    #[serde(default)]
-    pub bidirectional: bool,
-    #[serde(default)]
-    pub self_cond: Option<SelfCondInput>,
     #[serde(default)]
     pub rs: RsVerb,
     #[serde(default)]
@@ -235,20 +215,14 @@ pub struct Lane {
     #[serde(default)]
     pub channels: Vec<Ticket>,
     pub readout: Readout,
-    #[serde(default)]
-    pub stream: LaneStream,
+    /// Unique to its pass in a fire, so two passes' lanes never attend each other.
     #[serde(default)]
     pub group: Option<u32>,
     #[serde(default)]
-    pub peer: Option<u32>,
-    #[serde(default)]
-    pub reading: u8,
-    #[serde(default)]
-    pub ports: Vec<PortFeed>,
+    pub inputs: Vec<InputFeed>,
+    /// The lane takes no seat; the state it carries, if any, is the row `rs_slot` names.
     #[serde(default)]
     pub kv_less: bool,
-    #[serde(default)]
-    pub attn_classes: Option<AttnClasses>,
     /// An engine that cannot report says nothing, and the step is plainly
     /// committed.
     #[serde(default)]
@@ -269,30 +243,10 @@ pub struct Tap {
     pub slots: Vec<u32>,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum LaneStream {
-    #[default]
-    Text = 0,
-    Image = 1,
-    Video = 2,
-    Audio = 3,
-    Context = 4,
-    Reference = 5,
-}
-
+/// The channel a lane feeds guest input `id` from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum PortKind {
-    Latents,
-    LaneVector,
-    Context,
-    AxisPositions,
-    Voxels,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct PortFeed {
-    pub kind: PortKind,
-    pub port: u8,
+pub struct InputFeed {
+    pub id: u32,
     pub channel: ChannelId,
 }
 
@@ -338,7 +292,9 @@ impl Lane {
                 self.rows()
             )));
         }
+        // A kv-less lane's mask is over its attention group's rows.
         if let Some(masking) = &self.mask
+            && !self.kv_less
             && let Some(stated) = masking.stated_rows()
             && stated != self.tokens.len()
         {
@@ -350,31 +306,6 @@ impl Lane {
         }
         if !self.channels.is_empty() && !serves.device_channel_commit {
             return Err(Error::unsupported("engine", F3_CHANNEL_TICKETS));
-        }
-        if self.bidirectional && self.mask.is_none() {
-            return Err(Error::Invalid(format!(
-                "lane in slot {} attends bidirectionally and states no mask; the custom-mask \
-                 arm is where the causal bound is lifted, so the lane must carry one",
-                self.slot
-            )));
-        }
-        if self.bidirectional && !serves.bidirectional {
-            return Err(Error::unsupported("engine", BIDIRECTIONAL_WITHOUT_ARM));
-        }
-        if let Some(sc) = &self.self_cond {
-            let cells = self.rows() as usize * sc.taps as usize;
-            let fed = sc.channels.is_some() && sc.rows.is_empty() && sc.weight_bits.is_empty();
-            if sc.taps == 0 || (!fed && (sc.rows.len() != cells || sc.weight_bits.len() != cells)) {
-                return Err(Error::Invalid(format!(
-                    "lane in slot {} states a self-conditioning input of {} taps as {} ids and \
-                     {} weights for its {} rows",
-                    self.slot,
-                    sc.taps,
-                    sc.rows.len(),
-                    sc.weight_bits.len(),
-                    self.rows()
-                )));
-            }
         }
         if !matches!(self.rs, RsVerb::Fold) && !serves.rs_verbs {
             return Err(Error::unsupported("engine", RS_VERBS_WITHOUT_DEVICE_HALF));
@@ -417,14 +348,11 @@ const F3_CHANNEL_TICKETS: &str =
 
 const RS_VERBS_WITHOUT_DEVICE_HALF: &str =
     "Lane::rs beyond RsVerb::Fold: this engine has no device half for it";
-const BIDIRECTIONAL_WITHOUT_ARM: &str =
-    "Lane::bidirectional: this engine's attention applies its own causal bound and cannot lift it";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Serves {
     pub device_channel_commit: bool,
     pub rs_verbs: bool,
-    pub bidirectional: bool,
     pub adapter_attachments: bool,
     pub rs_snapshots: u32,
 }
@@ -433,7 +361,6 @@ impl Serves {
     pub const NONE: Serves = Serves {
         device_channel_commit: false,
         rs_verbs: false,
-        bidirectional: false,
         adapter_attachments: false,
         rs_snapshots: 0,
     };
@@ -443,45 +370,9 @@ impl Serves {
         Serves {
             device_channel_commit: caps.device_channel_commit,
             rs_verbs: caps.rs_verbs,
-            bidirectional: caps.bidirectional_attention,
             adapter_attachments: caps.adapter_attachments,
             rs_snapshots: caps.rs_snapshots,
         }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SelfCondInput {
-    pub taps: u32,
-    pub rows: Vec<u32>,
-    pub weight_bits: Vec<u32>,
-    #[serde(default)]
-    pub channels: Option<(ChannelId, ChannelId)>,
-}
-
-impl SelfCondInput {
-    #[must_use]
-    pub fn from_channels(taps: u32, rows: ChannelId, weights: ChannelId) -> Self {
-        Self {
-            taps,
-            rows: Vec::new(),
-            weight_bits: Vec::new(),
-            channels: Some((rows, weights)),
-        }
-    }
-
-    #[must_use]
-    pub fn new(taps: u32, rows: Vec<u32>, weights: &[f32]) -> SelfCondInput {
-        SelfCondInput {
-            taps,
-            rows,
-            weight_bits: weights.iter().map(|w| w.to_bits()).collect(),
-            channels: None,
-        }
-    }
-
-    pub fn weights(&self) -> impl Iterator<Item = f32> + '_ {
-        self.weight_bits.iter().map(|&bits| f32::from_bits(bits))
     }
 }
 
@@ -522,19 +413,15 @@ pub enum FoldLen {
     Device,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Boundary {
-    Prologue,
-    Epilogue,
-    /// A pass cut into several fires sends it on every one but the last.
-    Adapter,
-}
-
+/// A pass's program on a fire: the prologue before input staging, the epilogue after the forward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
+    /// The first of the pass's lanes, `lanes` of them in a row.
     pub lane: u32,
+    pub lanes: u32,
     pub instance: InstanceId,
-    pub at: Boundary,
+    /// Every fire but the last of a cut pass: it carries the adapter and runs no stage.
+    pub adapter_only: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -675,7 +562,12 @@ impl Step {
         }
         for (index, lane) in self.lanes.iter().enumerate() {
             lane.validate_for(serves)?;
-            if self.lanes[..index].iter().any(|l| l.slot == lane.slot) {
+            // A kv-less lane takes no seat: its slot names nothing.
+            if !lane.kv_less
+                && self.lanes[..index]
+                    .iter()
+                    .any(|l| !l.kv_less && l.slot == lane.slot)
+            {
                 return Err(Error::Invalid(format!(
                     "slot {} appears twice in one fire, at lane {index}",
                     lane.slot
@@ -684,7 +576,7 @@ impl Step {
         }
         let lanes = u32::try_from(self.lanes.len()).unwrap_or(u32::MAX);
         for (index, attachment) in self.attachments.iter().enumerate() {
-            if attachment.at == Boundary::Adapter && !serves.adapter_attachments {
+            if attachment.adapter_only && !serves.adapter_attachments {
                 return Err(Error::Invalid(format!(
                     "attachment {index} is for an adapter alone, which this engine does not serve"
                 )));
@@ -701,7 +593,7 @@ impl Step {
             {
                 return Err(Error::Invalid(format!(
                     "instance {} is attached twice to one fire, at attachment {index}; a \
-                     program's stages are one pass with one commit",
+                     program runs once a fire",
                     attachment.instance
                 )));
             }
@@ -1002,5 +894,24 @@ mod tests {
         let blind = mask(&[true, true, false, true, false, false, true]);
         let rows = Masking::Rows(vec![ancestry, blind]);
         assert!(buffered_reads(Some(&rows), 2, 5, 2).is_err());
+    }
+
+    #[test]
+    fn kv_less_lanes_take_no_seat() {
+        // A CFG step: four unseated float lanes beside a decode in seat 0.
+        let float = |rs_slot| Lane {
+            tokens: vec![0; 4],
+            kv_less: true,
+            rs_slot,
+            ..Lane::default()
+        };
+        let mut step = Step {
+            lanes: vec![float(None), float(None), float(None), float(Some(2))],
+            ..Step::default()
+        };
+        step.lanes.push(Lane::decode(0, 0, 7, 3));
+        assert!(step.validate().is_ok(), "{:?}", step.validate());
+        step.lanes.push(Lane::decode(0, 0, 8, 4));
+        assert!(step.validate().is_err(), "two seated lanes share seat 0");
     }
 }

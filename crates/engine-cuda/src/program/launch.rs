@@ -8,7 +8,7 @@ use eta_exec::{
 };
 use eta_ir::Dtype;
 use eta_ir::container::HostRole;
-use eta_ir::op::{IntrinsicId, tags};
+use eta_ir::op::tags;
 use eta_ir::types::{MAX_RANK, name_or_unknown};
 
 use std::sync::Arc;
@@ -40,8 +40,6 @@ pub fn lane_sampler(kind: RegionKind) -> bool {
         RegionKind::Library(LibraryOp::NucleusSample | LibraryOp::RankSample | LibraryOp::LaneCut)
     )
 }
-
-pub const INTRINSIC_SLOTS: usize = IntrinsicId::SLOTS as usize;
 
 pub const INTRINSIC_STORAGE_F32: u32 = 0;
 
@@ -379,7 +377,7 @@ impl Rings {
         if shape.dtype == Dtype::Bool {
             return Err(Fault::program(
                 "program::launch",
-                format!("channel {channel} is a bool ring, which no float port reads"),
+                format!("channel {channel} is a bool ring, which no float input reads"),
             ));
         }
         let at = (sequence % shape.ring()) * shape.cell_bytes() as u64;
@@ -508,6 +506,8 @@ pub struct Prepared {
     intrinsic_widths_host: Vec<u32>,
     intrinsic_strides_host: Vec<u32>,
     intrinsic_offsets_host: Vec<u32>,
+    /// The side-table slots a lane binds ([`eta_ir::op::intrinsic_pitch`]).
+    pitch: usize,
     channel_count: u32,
     value_count: u32,
     scratch_stride: u32,
@@ -963,6 +963,7 @@ impl Prepared {
             intrinsic_widths_host: Vec::new(),
             intrinsic_strides_host: Vec::new(),
             intrinsic_offsets_host: Vec::new(),
+            pitch: plan.intrinsic_pitch as usize,
             channel_count,
             value_count,
             scratch_stride,
@@ -1096,7 +1097,7 @@ impl Prepared {
         };
         self.retired
             .push(std::mem::replace(&mut self.scratch, scratch));
-        let words = INTRINSIC_SLOTS * lanes as usize;
+        let words = self.pitch * lanes as usize;
         self.intrinsic_bases_host.resize(words, 0u64);
         self.intrinsic_modes_host.resize(words, 0u32);
         self.intrinsic_widths_host.resize(words, 0u32);
@@ -1186,12 +1187,12 @@ impl Prepared {
                 },
             );
         }
-        let row = lane as usize * INTRINSIC_SLOTS;
-        self.intrinsic_bases_host[row..row + INTRINSIC_SLOTS].fill(0);
-        self.intrinsic_modes_host[row..row + INTRINSIC_SLOTS].fill(0);
-        self.intrinsic_widths_host[row..row + INTRINSIC_SLOTS].fill(0);
-        self.intrinsic_strides_host[row..row + INTRINSIC_SLOTS].fill(0);
-        self.intrinsic_offsets_host[row..row + INTRINSIC_SLOTS].fill(0);
+        let row = lane as usize * self.pitch;
+        self.intrinsic_bases_host[row..row + self.pitch].fill(0);
+        self.intrinsic_modes_host[row..row + self.pitch].fill(0);
+        self.intrinsic_widths_host[row..row + self.pitch].fill(0);
+        self.intrinsic_strides_host[row..row + self.pitch].fill(0);
+        self.intrinsic_offsets_host[row..row + self.pitch].fill(0);
         self.filled += 1;
         Ok(lane)
     }
@@ -1236,22 +1237,17 @@ impl Prepared {
     pub fn bind_intrinsic(
         &mut self,
         lane: u32,
-        intrinsic: IntrinsicId,
+        slot: u32,
         base: u64,
         storage: u32,
         width: u32,
         row_stride: u32,
         row_offset: u32,
     ) -> Result<()> {
-        let slot = intrinsic as usize;
-        if slot >= INTRINSIC_SLOTS {
-            return Err(Fault::program(
-                "program::launch",
-                format!(
-                    "intrinsic {slot} is past the {INTRINSIC_SLOTS}-slot pitch the side \
-                     tables are indexed with"
-                ),
-            ));
+        let slot = slot as usize;
+        if slot >= self.pitch {
+            // A lane this stage reads no intrinsic of.
+            return Ok(());
         }
         if lane >= self.lanes {
             return Err(Fault::program(
@@ -1259,7 +1255,7 @@ impl Prepared {
                 format!("lane {lane} is past a batch cut for {}", self.lanes),
             ));
         }
-        let at = lane as usize * INTRINSIC_SLOTS + slot;
+        let at = lane as usize * self.pitch + slot;
         self.intrinsic_bases_host[at] = base;
         self.intrinsic_modes_host[at] = storage;
         self.intrinsic_widths_host[at] = width;

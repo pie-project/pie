@@ -46,6 +46,25 @@ pub fn mul(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> 
     binary(ctx, OP, entry, x, y, z)
 }
 
+pub fn div(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.binary";
+    let entry = dtype_dispatch!(OP, z.dtype, {
+        Bf16 => "binary_div_bfloat16",
+        F32 => "binary_div_float32",
+    });
+    binary(ctx, OP, entry, x, y, z)
+}
+
+/// `x - y·floor(x / y)`: floored, as Python's `%`.
+pub fn modulo(ctx: &Ctx<'_>, x: Tensor, y: Tensor, z: Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.binary";
+    let entry = dtype_dispatch!(OP, z.dtype, {
+        Bf16 => "binary_mod_bfloat16",
+        F32 => "binary_mod_float32",
+    });
+    binary(ctx, OP, entry, x, y, z)
+}
+
 fn activation(
     ctx: &Ctx<'_>,
     op: &'static str,
@@ -77,6 +96,15 @@ pub fn tanh(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
     let entry = dtype_dispatch!(OP, o.dtype, {
         Bf16 => "act_tanh_bfloat16",
         F32 => "act_tanh_float32",
+    });
+    activation(ctx, OP, entry, x, o)
+}
+
+pub fn sqrt(ctx: &Ctx<'_>, x: Tensor, o: Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.act";
+    let entry = dtype_dispatch!(OP, o.dtype, {
+        Bf16 => "act_sqrt_bfloat16",
+        F32 => "act_sqrt_float32",
     });
     activation(ctx, OP, entry, x, o)
 }

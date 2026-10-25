@@ -25,7 +25,9 @@ pub fn attention(
     segment: Segment,
     sm_scale: f32,
     y: Landing,
+    base: u32,
 ) -> Result<Val, Error> {
+    let grid = crate::conv::rebased(f, grid, base)?;
     const OP: &str = "attn.voxel";
     if q.dtype != Dtype::Bf16 {
         return Err(Error::DtypeUnsupported {

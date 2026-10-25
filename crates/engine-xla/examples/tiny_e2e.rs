@@ -136,11 +136,11 @@ fn run(
     if shell.readout_seam() == engine::fire::ReadoutSeam::Logits {
         match agree(&mut shell, deployment) {
             Ok(said) => line.push_str(&format!("; {said}")),
-            // A plan whose token lanes read float ports (positions, a
+            // A plan whose token lanes read guest inputs (positions, a
             // timestep) has no plain prompt to walk; its synthetic fires
             // above fed them.
             Err(why) if why.contains("feeds it no channel") => {
-                line.push_str("; its token lanes read ports, no prompt walk");
+                line.push_str("; its token lanes read guest inputs, no prompt walk");
             }
             Err(why) => return Err(why),
         }

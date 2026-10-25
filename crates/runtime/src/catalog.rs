@@ -217,8 +217,14 @@ impl Place {
     fn held(&self) -> std::io::Result<Option<Vec<(String, String)>>> {
         match self {
             Place::File { path, .. } if path.is_file() => {
-                let file = path.file_name().and_then(|f| f.to_str()).unwrap_or_default();
-                Ok(Some(vec![(file.to_string(), std::fs::read_to_string(path)?)]))
+                let file = path
+                    .file_name()
+                    .and_then(|f| f.to_str())
+                    .unwrap_or_default();
+                Ok(Some(vec![(
+                    file.to_string(),
+                    std::fs::read_to_string(path)?,
+                )]))
             }
             Place::Dir(dir) if dir.is_dir() => on_disk(dir).map(Some),
             _ => Ok(None),
@@ -391,7 +397,10 @@ mod tests {
                 .any(|(n, s)| n == "qwen_3" && *s == Seeded::Updated),
             "{updated:?}"
         );
-        assert_ne!(std::fs::read_to_string(&qwen).unwrap(), "# an older build's\n");
+        assert_ne!(
+            std::fs::read_to_string(&qwen).unwrap(),
+            "# an older build's\n"
+        );
 
         std::fs::write(&qwen, "# mine\n").unwrap();
         let edited = seed(&models).unwrap();
@@ -446,10 +455,15 @@ mod tests {
         }
         std::fs::write(models.join("mimo_v2").join("model.poem"), "# mine\n").unwrap();
         let outcome = seed(&models).unwrap();
-        assert!(!models.join("glm_4").exists(), "the untouched directory is gone");
+        assert!(
+            !models.join("glm_4").exists(),
+            "the untouched directory is gone"
+        );
         assert!(models.join("glm_4.poem").is_file());
         assert!(
-            outcome.iter().any(|(n, s)| n == "mimo_v2" && *s == Seeded::Edited { behind: true }),
+            outcome
+                .iter()
+                .any(|(n, s)| n == "mimo_v2" && *s == Seeded::Edited { behind: true }),
             "{outcome:?}"
         );
         assert!(models.join("mimo_v2").is_dir() && !models.join("mimo_v2.poem").exists());

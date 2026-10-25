@@ -1,21 +1,41 @@
 use eta_compiler::eval::interp::Value;
 use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs};
 use eta_ir::container;
-use eta_ir::registry::ModelProfile;
-use eta_ir::validate::{BoundTrace, bind};
+use eta_ir::registry::{EngineCaps, Graph, Readout, ReadoutKind};
+use eta_ir::validate::BoundTrace;
 
 use eta_dsl::builder::Builder;
 use eta_dsl::prelude::*;
 use eta_dsl::{Channel, Traced};
 
-fn bound(traced: &Traced, vocab: u32, page_size: u32, num_layers: u32) -> BoundTrace {
-    let profile = ModelProfile {
-        vocab,
-        page_size,
-        num_layers,
-        ..ModelProfile::dummy()
-    };
-    bind(traced.container().clone(), profile).expect("container binds")
+fn bound(traced: &Traced, vocab: u32, _page_size: u32, num_layers: u32) -> BoundTrace {
+    served(traced.container().clone(), logits_lane(vocab), num_layers).expect("container binds")
+}
+
+fn served(
+    container: eta_ir::container::TraceContainer,
+    lanes: Vec<Option<Readout>>,
+    num_layers: u32,
+) -> Result<eta_ir::validate::BoundTrace, eta_ir::validate::ValidateError> {
+    eta_ir::validate::bind(
+        container,
+        lanes,
+        Graph {
+            num_layers,
+            ..Graph::default()
+        },
+        EngineCaps {
+            lora: true,
+            attn_page_mask: true,
+        },
+    )
+}
+
+fn logits_lane(vocab: u32) -> Vec<Option<Readout>> {
+    vec![Some(Readout {
+        kind: ReadoutKind::Logits,
+        width: vocab,
+    })]
 }
 
 fn idx(names: &[String], name: &str) -> u32 {

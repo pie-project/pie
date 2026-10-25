@@ -11,7 +11,7 @@ use engine::channel::ChannelId;
 use engine::ports::Envelope;
 use engine::program::{InstanceId, ProgramId, ProgramRegistration};
 use eta_exec::{Boundaries, ExecPlan, Extents, Versions, adopt_launch_package_with};
-use eta_ir::registry::GeometryClass;
+use eta_ir::registry::{GeometryClass, Stage as Attach};
 
 use crate::device::Context;
 use crate::error::{Fault, Result};
@@ -80,44 +80,13 @@ impl Program {
     }
 }
 
-impl Plane {
-    pub fn self_cond_cells(
-        &self,
-        instance: InstanceId,
-        rows: ChannelId,
-        weights: ChannelId,
-        bytes: u64,
-    ) -> Result<(u64, u64)> {
-        let bound = self.instances.get(&instance).ok_or_else(|| {
-            Fault::program(
-                "program::plane",
-                format!("self-conditioning feed of unbound instance {instance}"),
-            )
-        })?;
-        let mut out = [0u64; 2];
-        for (slot, id) in [rows, weights].into_iter().enumerate() {
-            let dense = bound.ids.iter().position(|&held| held == id).ok_or_else(|| {
-                Fault::program(
-                    "program::plane",
-                    format!("self-conditioning feed names channel {id}, which instance {instance} does not carry"),
-                )
-            })?;
-            let cursor = bound.session.cursor(dense as u32).ok_or_else(|| {
-                Fault::program("program::plane", format!("channel {dense} has no cursor"))
-            })?;
-            let (address, width) = bound.session.cell(dense, cursor.head)?;
-            if width < bytes {
-                return Err(Fault::program(
-                    "program::plane",
-                    format!(
-                        "self-conditioning feed channel {id}'s cell holds {width} bytes; the taps want {bytes}"
-                    ),
-                ));
-            }
-            out[slot] = address;
-        }
-        Ok((out[0], out[1]))
-    }
+fn at_point<'a>(stages: &'a mut [Option<Prepared>], runs: &[bool]) -> Vec<&'a mut Prepared> {
+    stages
+        .iter_mut()
+        .zip(runs)
+        .filter(|(_, runs)| **runs)
+        .filter_map(|(prepared, _)| prepared.as_mut())
+        .collect()
 }
 
 impl Plane {
@@ -147,18 +116,18 @@ impl Plane {
     }
 
     pub fn feed_cell_bytes(&self, instance: InstanceId, id: ChannelId) -> Result<u64> {
-        let (bound, dense) = self.dense_channel(instance, id, "float-port feed")?;
+        let (bound, dense) = self.dense_channel(instance, id, "float-input feed")?;
         bound.session.cell_bytes(dense)
     }
 
     pub fn feed_cell(&self, instance: InstanceId, id: ChannelId) -> Result<(u64, u64)> {
-        let (bound, dense) = self.dense_channel(instance, id, "float-port feed")?;
+        let (bound, dense) = self.dense_channel(instance, id, "float-input feed")?;
         bound.session.feed_cell(dense)?.ok_or_else(|| {
             Fault::program(
                 "program::plane",
                 format!(
-                    "float-port feed channel {id} of instance {instance} holds no committed \
-                     cell; a port is fed from the cell the instance's own `take` would read \
+                    "float-input feed channel {id} of instance {instance} holds no committed \
+                     cell; an input is fed from the cell the instance's own `take` would read \
                      this fire, so publish (or `put`) one before submitting"
                 ),
             )
@@ -175,6 +144,7 @@ pub struct Plane {
     next_program: u64,
     next_instance: u64,
     staged: Vec<(ProgramId, Extents, InstanceId)>,
+    at: Attach,
     wave: Wave,
     shadow: bool,
     flight: u32,
@@ -200,6 +170,7 @@ impl Plane {
             next_program: 1,
             next_instance: 1,
             staged: Vec::new(),
+            at: Attach::Epilogue,
             wave: Wave::default(),
             shadow: false,
             flight: u32::MAX,
@@ -247,6 +218,23 @@ impl Plane {
             Versions::from_compiler(registration.emitter_version),
             Target::of(context)?,
         )?;
+        // A stage at attention runs in no layer here: only its sinks reach the forward.
+        if let Some(kind) = compiled
+            .kinds
+            .iter()
+            .zip(compiled.stages.iter())
+            .find(|(kind, stage)| kind.per_layer() && !stage.regions.is_empty())
+            .map(|(kind, _)| *kind)
+        {
+            return Err(Fault::program(
+                "program::plane",
+                format!(
+                    "its `{}` stage computes, and this shell runs a stage at attention \
+                     only through its sinks: nothing would run it inside the layers",
+                    kind.name()
+                ),
+            ));
+        }
 
         let id = ProgramId(self.next_program);
         self.next_program += 1;
@@ -381,6 +369,7 @@ impl Plane {
         &mut self,
         id: InstanceId,
         intrinsic: eta_ir::op::IntrinsicId,
+        lane: u32,
         base: u64,
         storage: u32,
         width: u32,
@@ -391,7 +380,9 @@ impl Plane {
             .get_mut(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
             .session
-            .bind_intrinsic(intrinsic, base, storage, width, row_stride, row_offset)
+            .bind_intrinsic(
+                intrinsic, lane, base, storage, width, row_stride, row_offset,
+            )
     }
 
     pub fn needs_mtp_drafts(&self, id: InstanceId) -> Result<bool> {
@@ -472,8 +463,19 @@ impl Plane {
         None
     }
 
+    
     pub fn fire(&mut self, context: &Context, id: InstanceId) -> Result<Fired> {
-        match self.stage(id)? {
+        if self.prologue_runs(id) {
+            let fired = self.fire_at(context, id, Attach::Prologue)?;
+            if fired != Fired::Committed {
+                return Ok(fired);
+            }
+        }
+        self.fire_at(context, id, Attach::Epilogue)
+    }
+
+    fn fire_at(&mut self, context: &Context, id: InstanceId, at: Attach) -> Result<Fired> {
+        match self.stage(id, at)? {
             Launched::Airborne => {
                 self.fly(context)?;
                 self.land(context)?;
@@ -484,7 +486,24 @@ impl Plane {
         }
     }
 
-    pub fn stage(&mut self, id: InstanceId) -> Result<Launched> {
+    
+    #[must_use]
+    pub fn prologue_runs(&self, id: InstanceId) -> bool {
+        self.instances
+            .get(&id)
+            .and_then(|bound| self.programs.get(&bound.program_id))
+            .is_some_and(|program| program.plan.prologue_runs())
+    }
+
+    /// Every fire a wave carries runs the stages of one point.
+    pub fn stage(&mut self, id: InstanceId, at: Attach) -> Result<Launched> {
+        if !self.staged.is_empty() && self.at != at {
+            return Err(Fault::program(
+                "program::plane",
+                "a wave carries the stages of one point, and this one was staged for another",
+            ));
+        }
+        self.at = at;
         let Plane {
             programs,
             instances,
@@ -504,7 +523,7 @@ impl Plane {
         })?;
         let launched = bound
             .session
-            .stage(&program.compiled, &program.plan, wave)?;
+            .stage(&program.compiled, &program.plan, wave, at)?;
         if matches!(launched, Launched::Airborne) {
             staged.push((program_id, bound.session.extents(), id));
         }
@@ -522,8 +541,10 @@ impl Plane {
             instances,
             staged,
             flight,
+            at,
             ..
         } = self;
+        let at = *at;
 
         let mut groups: Vec<(ProgramId, Extents, Vec<InstanceId>)> = Vec::new();
         for (program_id, extents, instance) in staged.iter() {
@@ -568,6 +589,7 @@ impl Plane {
                     program_id,
                     extents,
                     &members[from..to],
+                    at,
                     stream,
                 ) {
                     Ok(()) => from = to,
@@ -583,12 +605,14 @@ impl Plane {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fly_one(
         programs: &mut BTreeMap<ProgramId, Program>,
         instances: &mut BTreeMap<InstanceId, Bound>,
         program_id: ProgramId,
         extents: Extents,
         members: &[InstanceId],
+        at: Attach,
         stream: *mut core::ffi::c_void,
     ) -> Result<()> {
         {
@@ -599,8 +623,11 @@ impl Plane {
                 )
             })?;
             let lanes = u32::try_from(members.len()).unwrap_or(u32::MAX);
+            let runs: Vec<bool> = (0..program.compiled.stages.len())
+                .map(|index| program.plan.runs_at(index, at))
+                .collect();
             let batch = program.batch(extents, lanes, stream)?;
-            for prepared in batch.stages.iter_mut().flatten() {
+            for prepared in at_point(&mut batch.stages, &runs) {
                 prepared.begin(extents, lanes, stream)?;
             }
             for instance in members {
@@ -610,9 +637,11 @@ impl Plane {
                         format!("a staged fire names instance {instance}, which is gone"),
                     )
                 })?;
-                bound.session.take_lane(&mut batch.stages)?;
+                bound
+                    .session
+                    .take_lane(at_point(&mut batch.stages, &runs))?;
             }
-            for prepared in batch.stages.iter_mut().flatten() {
+            for prepared in at_point(&mut batch.stages, &runs) {
                 prepared.commit_lanes(stream)?;
             }
         }
@@ -624,6 +653,9 @@ impl Plane {
                 )
             })?;
             for (index, stage) in program.compiled.stages.iter().enumerate() {
+                if !program.plan.runs_at(index, at) {
+                    continue;
+                }
                 let Some(prepared) = program
                     .batches
                     .iter()
@@ -696,6 +728,22 @@ impl Plane {
         bound
             .session
             .host_resolved_rings(&program.plan, bound.geometry)
+    }
+
+    
+    #[must_use]
+    pub fn resolves_prologue_put(&self, id: InstanceId) -> bool {
+        let Some(bound) = self.instances.get(&id) else {
+            return false;
+        };
+        if bound.geometry == GeometryClass::Host {
+            return false;
+        }
+        self.programs.get(&bound.program_id).is_some_and(|program| {
+            bound
+                .session
+                .resolves_prologue_put(&program.plan, bound.geometry)
+        })
     }
 
     pub fn shared_rings(&self, id: InstanceId) -> Vec<usize> {

@@ -16,9 +16,9 @@ use eta_compiler::plan::{LibraryOp, RegionKind, compile_bound};
 use eta_exec::Extents;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::Op;
-use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
+use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype, Literal, Predicate, RngKind, Shape};
-use eta_ir::validate::{BoundTrace, bind};
+use eta_ir::validate::BoundTrace;
 
 const VOCAB: u32 = 151_936;
 
@@ -107,6 +107,7 @@ fn sampler(rank: bool) -> TraceContainer {
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
@@ -142,14 +143,7 @@ fn host_token(bound: &BoundTrace, seeds: &[(u32, Value)]) -> i32 {
 }
 
 fn draw_all(rank: bool, cases: &[(&str, Vec<f32>, f32, [u32; 2])]) -> (usize, usize) {
-    let bound = bind(
-        sampler(rank),
-        ModelProfile {
-            vocab: VOCAB,
-            ..ModelProfile::dummy()
-        },
-    )
-    .expect("the sampler binds");
+    let bound = crate::bound::logits(sampler(rank), VOCAB).expect("the sampler binds");
     let stages = compile_bound(&bound);
     let lane = stages.iter().any(|stage| {
         stage.fused.regions.iter().any(|region| {

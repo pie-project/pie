@@ -15,7 +15,10 @@ fn main() {
             println!("cargo:rerun-if-changed={}", dir.display());
             let name = dir.file_stem().unwrap().to_str().unwrap().to_string();
             let path = dir.canonicalize().expect("a package file's path");
-            packages.push((name.clone(), vec![(format!("{name}.poem"), path.display().to_string())]));
+            packages.push((
+                name.clone(),
+                vec![(format!("{name}.poem"), path.display().to_string())],
+            ));
             continue;
         }
         let poem = |entry: std::fs::DirEntry| entry.path().extension().is_some_and(|e| e == "poem");

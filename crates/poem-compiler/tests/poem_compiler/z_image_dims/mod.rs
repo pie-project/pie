@@ -3,12 +3,10 @@
 
 pub const CHANNELS: u32 = 16;
 pub const PATCH: u32 = 2;
-pub const PATCH_FEATURES: u32 = CHANNELS * PATCH * PATCH;
 pub const SPATIAL_COMPRESSION: u32 = 8;
 pub const T_FREQ_DIM: u32 = 256;
 pub const T_MAX_PERIOD: f32 = 10_000.0;
 pub const T_FLIP_SIN_COS: bool = true;
-pub const ROPE_AXES: u8 = 3;
 pub const ROPE_THETA: f32 = 256.0;
 
 pub const TE_HIDDEN: u32 = 2560;
@@ -20,18 +18,6 @@ pub const TE_INTER: u32 = 9728;
 pub const TE_THETA: f32 = 1_000_000.0;
 pub const TE_DEPTH: u32 = 36;
 pub const TE_LAYERS: u32 = TE_DEPTH - 1;
-
-pub mod port {
-    pub const PAD_IMAGE: u8 = 0;
-    pub const LATENTS: u8 = 1;
-    pub const CONTEXT_REFINED: u8 = 2;
-    pub const PAD_CAPTION: u8 = 0;
-    pub const CAPTION: u8 = 0;
-    pub const TIMESTEP: u8 = 0;
-    pub const POSITIONS: u8 = 0;
-    pub const VOXELS: u8 = 0;
-    pub const PIXEL_VOXELS: u8 = 1;
-}
 
 pub mod vae {
     pub const GN_GROUPS: u32 = 32;

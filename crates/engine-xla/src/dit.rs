@@ -1,26 +1,16 @@
-//! The diffusion and video families: the voxel axis (clip grids, the voxel
-//! port, the clip slots a frame cache reads), the float ports a lane feeds
-//! from its channels (latents, lane vectors, context rows, axis positions,
-//! and those merged into a stream), the attention-group packings, the
-//! self-conditioning taps, and the export seams besides logits (velocity,
-//! hidden, pixels).
-//!
-//! engine-cuda's `voxels.rs`, `exports.rs` (`Feeds`, `Exports`) and the port
-//! half of `serve/prepare.rs`, staged as this shell stages everything else:
-//! host tables handed to the traced program as inputs.
+//! Voxel axis, guest inputs, group packings and float exports for the diffusion and video families.
 
 use crate::emit::Emit;
 use crate::handle::Tensor;
-use engine::fire::{PortKind, ReadoutSeam};
+use engine::fire::ReadoutSeam;
 use poem_compiler::{CompiledModel, VoxelLadder};
+use poem_exec::feeds::{Feeds, Seat};
 use poem_exec::fire::{Composition, LaneFacts, LaneRow};
-use poem_ir::{
-    ClassSet, Def, Dtype, GeomKind, Operands, RuntimeInput, Selection, Trace, Ty, ValueId,
-};
+use poem_ir::{ClassSet, Def, Dtype, RuntimeInput, Trace, Ty, ValueId};
 
 use crate::error::{Fault, Result};
 use crate::inputs::Inputs;
-use crate::run::{DitBindings, PackingBindings, PortBinding};
+use crate::run::{DitBindings, GroupMask, InputBinding, PackingBindings};
 use crate::trace::Handles;
 
 /// The seams a denoiser or a decoder exports instead of logits.
@@ -28,9 +18,6 @@ const VELOCITY_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[0];
 const HIDDEN_SEAM: &str = poem_compiler::FLOAT_READOUT_SEAMS[1];
 const PIXELS_SEAM: &str = poem_compiler::EXPORT_SEAMS[6];
 
-/// A lane's clips on the voxel axis: one `[t, h, w]` box per clip and, when
-/// the host feeds the voxel port, one port row per voxel in the port's
-/// element (engine-cuda `serve::Clips`).
 #[derive(Debug, Clone, Copy)]
 pub struct Clips<'a> {
     pub lane: u32,
@@ -48,21 +35,10 @@ impl Clips<'_> {
     }
 }
 
-/// One float port's cell for one lane, as f32 (the engine read it off the
-/// channel the lane's `PortFeed` names).
 #[derive(Debug, Clone, Copy)]
-pub struct PortCell<'a> {
-    pub kind: PortKind,
-    pub port: u8,
-    pub values: &'a [f32],
-}
-
-/// A lane's self-conditioning taps: `taps` row ids and weights per row.
-#[derive(Debug, Clone, Copy)]
-pub struct SelfCond<'a> {
-    pub taps: u32,
-    pub rows: &'a [i32],
-    pub weights: &'a [f32],
+pub struct InputCell<'a> {
+    pub id: u32,
+    pub bytes: &'a [u8],
 }
 
 /// What a lane decoded: its pixel rows (f32) and the output box of each of
@@ -93,46 +69,6 @@ pub fn voxel_ladder(
     ))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PortSeat {
-    kind: PortKind,
-    port: u8,
-    width: u32,
-    dtype: Dtype,
-}
-
-impl PortSeat {
-    fn per_lane(&self) -> bool {
-        self.kind == PortKind::LaneVector
-    }
-
-    fn of(input: &RuntimeInput, dtype: Dtype) -> Option<PortSeat> {
-        let (kind, port, width) = match *input {
-            RuntimeInput::Latents { port, width } => (PortKind::Latents, port, width),
-            RuntimeInput::LaneVector { port, width } => (PortKind::LaneVector, port, width),
-            RuntimeInput::Context { port, width } => (PortKind::Context, port, width),
-            RuntimeInput::AxisPositions { port, axes } => {
-                (PortKind::AxisPositions, port, u32::from(axes))
-            }
-            RuntimeInput::Voxels { port, channels } => (PortKind::Voxels, port, channels),
-            _ => return None,
-        };
-        Some(PortSeat {
-            kind,
-            port,
-            width,
-            dtype,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MergedPort {
-    merge: ValueId,
-    seat: PortSeat,
-    select: Selection,
-}
-
 #[derive(Debug, Clone)]
 struct VoxelSeat {
     widths: Vec<u32>,
@@ -151,13 +87,10 @@ struct PixelsExport {
 /// What a load reads off its plan for these families.
 #[derive(Debug, Clone, Default)]
 pub struct Dit {
-    ports: Vec<(PortSeat, ClassSet)>,
-    selections: Vec<Selection>,
-    merged: Vec<MergedPort>,
-    self_cond_taps: u32,
+    feeds: Feeds,
     voxel: Option<VoxelSeat>,
-    velocity: Option<(ValueId, u32)>,
-    hidden: Option<(ValueId, u32)>,
+    velocity: Option<ValueId>,
+    hidden: Option<ValueId>,
     pixels: Vec<PixelsExport>,
 }
 
@@ -165,22 +98,20 @@ pub struct Dit {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Feed<'a> {
     pub slot: u32,
-    pub stream: u8,
     pub group: Option<u32>,
-    pub ports: &'a [PortCell<'a>],
-    pub self_cond: Option<SelfCond<'a>>,
+    pub inputs: &'a [InputCell<'a>],
     pub clips: Option<Clips<'a>>,
-    pub attn_classes: Option<&'a engine::fire::AttnClasses>,
+    /// A kv-less lane's stated mask, over its attention group's rows.
+    pub mask: Option<&'a engine::fire::Masking>,
 }
 
-/// A merge whose arm is a port: the port's rows land in the merge's slot
-/// before the walk (zeros for a lane that feeds none).
+/// A merge over a guest input; a lane that feeds none lands zeros.
 #[derive(Debug, Clone, Copy)]
 pub struct Land {
     pub merge: ValueId,
     pub first: u32,
     pub rows: u32,
-    pub port: Option<Tensor>,
+    pub input: Option<Tensor>,
 }
 
 /// Where a fire's pixels come back from.
@@ -226,54 +157,6 @@ fn width_of(trace: &Trace, value: ValueId) -> u32 {
     }
 }
 
-fn classes_where(
-    trace: &Trace,
-    compiled: &CompiledModel,
-    touches: impl Fn(&poem_ir::Operation) -> bool,
-) -> ClassSet {
-    let nodes: Vec<u32> = trace
-        .nodes
-        .iter()
-        .enumerate()
-        .filter(|(_, node)| touches(&node.op))
-        .map(|(at, _)| at as u32)
-        .collect();
-    let mut classes = ClassSet::default();
-    for region in compiled.template() {
-        if region.nodes.clone().any(|node| nodes.contains(&node)) {
-            for class in region.mask.iter() {
-                classes.insert(class);
-            }
-        }
-    }
-    classes
-}
-
-fn reader_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> ClassSet {
-    classes_where(trace, compiled, |op| {
-        let mut inputs = Vec::new();
-        op.inputs(&mut inputs);
-        inputs.contains(&value)
-    })
-}
-
-fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> ClassSet {
-    if let Some(Def::Merge(arms)) = trace.values.get(value.0 as usize).map(|decl| &decl.def) {
-        let mut classes = ClassSet::default();
-        for (arm, _) in arms {
-            for class in writer_classes(trace, compiled, *arm).iter() {
-                classes.insert(class);
-            }
-        }
-        return classes;
-    }
-    classes_where(trace, compiled, |op| {
-        let mut outputs = Vec::new();
-        op.outputs(&mut outputs);
-        outputs.contains(&value)
-    })
-}
-
 fn bf16_bits(value: f32) -> u16 {
     if value.is_nan() {
         return 0x7fc0;
@@ -283,7 +166,6 @@ fn bf16_bits(value: f32) -> u16 {
     ((bits + rounding) >> 16) as u16
 }
 
-/// `values` in `dtype`'s bytes (the float ports are bf16 or f32).
 fn float_bytes(values: &[f32], dtype: Dtype) -> Vec<u8> {
     match dtype {
         Dtype::Bf16 => values
@@ -294,54 +176,56 @@ fn float_bytes(values: &[f32], dtype: Dtype) -> Vec<u8> {
     }
 }
 
-/// `values` as a port's (or the voxel port's) payload bytes.
-pub fn port_bytes(values: &[f32], element: Dtype) -> std::result::Result<Vec<u8>, &'static str> {
+pub fn payload_bytes(values: &[f32], element: Dtype) -> std::result::Result<Vec<u8>, &'static str> {
     match element {
         Dtype::Bf16 | Dtype::F32 => Ok(float_bytes(values, element)),
-        _ => Err("a float port whose element is neither `bf16` nor `f32`"),
+        _ => Err("a float input whose element is neither `bf16` nor `f32`"),
+    }
+}
+
+pub fn cell_bytes(
+    cell: &eta_exec::Value,
+    element: Dtype,
+) -> std::result::Result<Vec<u8>, &'static str> {
+    match (cell, element) {
+        (eta_exec::Value::F32(values), _) => payload_bytes(values, element),
+        (eta_exec::Value::I32(values), Dtype::I32) => {
+            Ok(values.iter().flat_map(|v| v.to_le_bytes()).collect())
+        }
+        _ => Err("a guest input fed a cell of another dtype than its element"),
     }
 }
 
 impl Dit {
-    /// Reads the plan: the ports it declares and the classes that read
-    /// them, the group selections its packed attention reads, the merges
-    /// over ports, the voxel port, and the float seams.
     pub fn of(trace: &Trace, compiled: &CompiledModel) -> Result<Dit> {
-        let mut dit = Dit::default();
+        let mut dit = Dit {
+            feeds: Feeds::of(trace, compiled),
+            ..Dit::default()
+        };
+        if let Some(value) = dit.feeds.unlanded.first() {
+            return Err(program(format!(
+                "value {}, a merge over a runtime input this shell cannot land: only a lane or \
+                 row guest input under a conjunction of facts is landed in a merged column \
+                 before the walk",
+                value.0
+            )));
+        }
         let mut voxel: Option<VoxelSeat> = None;
+        for (seat, _) in dit.feeds.inputs.iter().filter(|(seat, _)| seat.voxel()) {
+            let have = voxel.get_or_insert_with(|| VoxelSeat {
+                widths: Vec::new(),
+                dtype: seat.dtype,
+                token_patch: None,
+            });
+            if !have.widths.contains(&seat.width) {
+                have.widths.push(seat.width);
+            }
+            have.dtype = seat.dtype;
+        }
         let mut grid = false;
-        for (at, decl) in trace.values.iter().enumerate() {
-            let Def::Input(input) = &decl.def else {
-                continue;
-            };
-            let Ty::Tensor { dtype, .. } = &decl.ty else {
-                continue;
-            };
-            match *input {
-                RuntimeInput::RowPermutation { select }
-                | RuntimeInput::Geometry {
-                    kind:
-                        GeomKind::GroupIndptr { select }
-                        | GeomKind::LaneIndptr { select }
-                        | GeomKind::ReferenceTag { select },
-                    ..
-                } => {
-                    if !dit.selections.contains(&select) {
-                        dit.selections.push(select);
-                    }
-                }
-                RuntimeInput::Voxels { channels, .. } => {
-                    let seat = voxel.get_or_insert_with(|| VoxelSeat {
-                        widths: Vec::new(),
-                        dtype: *dtype,
-                        token_patch: None,
-                    });
-                    if !seat.widths.contains(&channels) {
-                        seat.widths.push(channels);
-                    }
-                    seat.dtype = *dtype;
-                }
-                RuntimeInput::TokenGrid { p } => {
+        for decl in &trace.values {
+            match decl.def {
+                Def::Input(RuntimeInput::TokenGrid { p }) => {
                     voxel
                         .get_or_insert_with(|| VoxelSeat {
                             widths: Vec::new(),
@@ -350,26 +234,8 @@ impl Dit {
                         })
                         .token_patch = Some(p);
                 }
-                RuntimeInput::Grid => grid = true,
-                RuntimeInput::SelfCondRows => {
-                    dit.self_cond_taps = width_of(trace, ValueId(at as u32));
-                }
+                Def::Input(RuntimeInput::Grid) => grid = true,
                 _ => {}
-            }
-            if let Some(seat) = PortSeat::of(input, *dtype) {
-                let readers = reader_classes(trace, compiled, ValueId(at as u32));
-                match dit
-                    .ports
-                    .iter_mut()
-                    .find(|(have, _)| have.kind == seat.kind && have.port == seat.port)
-                {
-                    Some((_, classes)) => {
-                        for class in readers.iter() {
-                            classes.insert(class);
-                        }
-                    }
-                    None => dit.ports.push((seat, readers)),
-                }
             }
         }
         if grid && voxel.is_none() {
@@ -384,49 +250,6 @@ impl Dit {
         }
         dit.voxel = voxel;
 
-        for (at, decl) in trace.values.iter().enumerate() {
-            let Def::Merge(arms) = &decl.def else {
-                continue;
-            };
-            for (arm, guard) in arms {
-                let arm_decl = &trace.values[arm.0 as usize];
-                let (Def::Input(input), Ty::Tensor { dtype, .. }) = (&arm_decl.def, &arm_decl.ty)
-                else {
-                    continue;
-                };
-                let Some(seat) = PortSeat::of(input, *dtype) else {
-                    continue;
-                };
-                if seat.kind == PortKind::Voxels {
-                    continue;
-                }
-                let Some(select) = Selection::of(guard) else {
-                    return Err(program(format!(
-                        "value {at} merges {:?} port {} under a guard no selection states, so \
-                         no lane's rows can be told to land it",
-                        seat.kind, seat.port
-                    )));
-                };
-                let readers = reader_classes(trace, compiled, ValueId(at as u32));
-                if let Some((_, classes)) = dit
-                    .ports
-                    .iter_mut()
-                    .find(|(have, _)| have.kind == seat.kind && have.port == seat.port)
-                {
-                    for class in readers.iter() {
-                        if select.holds(compiled.classes.classes[class].word()) {
-                            classes.insert(class);
-                        }
-                    }
-                }
-                dit.merged.push(MergedPort {
-                    merge: ValueId(at as u32),
-                    seat,
-                    select,
-                });
-            }
-        }
-
         let first = |name: &str| {
             trace
                 .seams
@@ -435,12 +258,8 @@ impl Dit {
                 .flat_map(|seam| seam.values.iter().copied())
                 .collect::<Vec<_>>()
         };
-        dit.velocity = first(VELOCITY_SEAM)
-            .first()
-            .map(|&value| (value, width_of(trace, value)));
-        dit.hidden = first(HIDDEN_SEAM)
-            .last()
-            .map(|&value| (value, width_of(trace, value)));
+        dit.velocity = first(VELOCITY_SEAM).first().copied();
+        dit.hidden = first(HIDDEN_SEAM).last().copied();
         dit.pixels = trace
             .seams
             .iter()
@@ -449,7 +268,7 @@ impl Dit {
                 [plane, grid, ..] => Some(PixelsExport {
                     plane: *plane,
                     grid: *grid,
-                    classes: writer_classes(trace, compiled, *plane),
+                    classes: poem_exec::feeds::writer_classes(trace, compiled, *plane),
                     width: width_of(trace, *plane),
                 }),
                 _ => None,
@@ -463,13 +282,8 @@ impl Dit {
     #[must_use]
     pub fn float_readout(&self) -> Option<(ReadoutSeam, ValueId)> {
         self.velocity
-            .map(|(value, _)| (ReadoutSeam::Velocity, value))
-            .or_else(|| self.hidden.map(|(value, _)| (ReadoutSeam::Hidden, value)))
-    }
-
-    #[must_use]
-    pub fn velocity_width(&self) -> Option<u32> {
-        self.velocity.map(|(_, width)| width)
+            .map(|value| (ReadoutSeam::Velocity, value))
+            .or_else(|| self.hidden.map(|value| (ReadoutSeam::Hidden, value)))
     }
 
     /// Whether the plan exports pixels, and the widest pixel row.
@@ -481,7 +295,6 @@ impl Dit {
         )
     }
 
-    /// The voxel port's element, when the plan declares one.
     #[must_use]
     pub fn voxel_element(&self) -> Option<Dtype> {
         self.voxel
@@ -490,52 +303,44 @@ impl Dit {
             .map(|seat| seat.dtype)
     }
 
-    /// Whether the plan reads `kind` port `port`, and its element.
     #[must_use]
-    pub fn port_element(&self, kind: PortKind, port: u8) -> Option<Dtype> {
-        self.ports
-            .iter()
-            .find(|(seat, _)| seat.kind == kind && seat.port == port)
-            .map(|(seat, _)| seat.dtype)
+    pub fn seat(&self, id: u32) -> Option<Seat> {
+        self.feeds.seat(id)
     }
 
-    /// Whether a fire of this plan stages anything here at all.
-    /// The float ports (not the voxel port) `class` reads: kind, port,
-    /// width, and whether a cell is one row per lane (`crate::serve::dry`).
-    pub(crate) fn dry_ports(&self, class: usize) -> Vec<(PortKind, u8, u32, bool)> {
-        self.ports
+    #[must_use]
+    pub fn feeds(&self) -> &Feeds {
+        &self.feeds
+    }
+
+    pub(crate) fn dry_inputs(&self, class: usize) -> Vec<Seat> {
+        self.feeds
+            .inputs
             .iter()
-            .filter(|(seat, readers)| seat.kind != PortKind::Voxels && readers.contains(class))
-            .map(|(seat, _)| (seat.kind, seat.port, seat.width, seat.per_lane()))
+            .filter(|(seat, readers)| !seat.voxel() && readers.contains(class))
+            .map(|(seat, _)| *seat)
             .collect()
     }
 
-    /// The voxel port's widths, element and token patch, when the plan has
-    /// a voxel axis.
     pub(crate) fn dry_voxel(&self) -> Option<(Vec<u32>, Dtype, Option<[u32; 3]>)> {
         self.voxel
             .as_ref()
             .map(|seat| (seat.widths.clone(), seat.dtype, seat.token_patch))
     }
 
-    /// The width of the voxel port `class` reads, if it reads one.
     pub(crate) fn dry_voxel_width(&self, class: usize) -> Option<u32> {
-        self.ports
+        self.feeds
+            .inputs
             .iter()
-            .find(|(seat, readers)| seat.kind == PortKind::Voxels && readers.contains(class))
+            .find(|(seat, readers)| seat.voxel() && readers.contains(class))
             .map(|(seat, _)| seat.width)
-    }
-
-    pub(crate) fn dry_self_cond_taps(&self) -> u32 {
-        self.self_cond_taps
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.ports.is_empty()
-            && self.selections.is_empty()
-            && self.merged.is_empty()
-            && self.self_cond_taps == 0
+        self.feeds.inputs.is_empty()
+            && self.feeds.selections.is_empty()
+            && self.feeds.merged.is_empty()
             && self.voxel.is_none()
     }
 
@@ -551,7 +356,6 @@ impl Dit {
         handles: &Handles,
     ) -> Result<Staged> {
         let mut staged = Staged::default();
-        let class_table = self.class_table_of(composition.lanes(), feeds)?;
         if self.is_empty() && composition.voxel_rows() == 0 {
             return Ok(staged);
         }
@@ -597,54 +401,42 @@ impl Dit {
             }
         }
 
-        // ---- float ports
-        let mut planes: Vec<(PortSeat, Vec<f32>)> = self
-            .ports
-            .iter()
-            .filter(|(seat, _)| seat.kind != PortKind::Voxels)
-            .map(|(seat, _)| {
+        // ---- guest inputs
+        let mut planes: Vec<(Seat, Vec<u8>)> = self
+            .feeds
+            .seats()
+            .into_iter()
+            .map(|seat| {
                 let extent = if seat.per_lane() { lane_count } else { rows };
-                (*seat, vec![0f32; extent as usize * seat.width as usize])
+                (seat, vec![0u8; extent as usize * seat.row_bytes() as usize])
             })
             .collect();
         for (fire_lane, row) in lanes.iter().enumerate() {
             let Some(feed) = feed_of(row) else {
                 continue;
             };
-            for cell in feed.ports {
-                if cell.kind == PortKind::Voxels {
-                    continue;
-                }
-                if !self
-                    .ports
-                    .iter()
-                    .any(|(seat, _)| seat.kind == cell.kind && seat.port == cell.port)
-                {
+            for cell in feed.inputs {
+                if self.feeds.seat(cell.id).is_none() {
                     return Err(program(format!(
-                        "lane {} feeds {:?} port {} and this plan declares no such port",
-                        row.source, cell.kind, cell.port
+                        "lane {} feeds guest input {} and this plan reads no such input",
+                        row.source, cell.id
                     )));
                 }
             }
             for (seat, plane) in &mut planes {
-                let reads = self.ports.iter().any(|(have, readers)| {
-                    have.kind == seat.kind
-                        && have.port == seat.port
-                        && readers.contains(row.class as usize)
-                });
-                if !reads {
+                if !self
+                    .feeds
+                    .readers(seat.id)
+                    .is_some_and(|readers| readers.contains(row.class as usize))
+                {
                     continue;
                 }
-                let Some(cell) = feed
-                    .ports
-                    .iter()
-                    .find(|cell| cell.kind == seat.kind && cell.port == seat.port)
-                else {
+                let Some(cell) = feed.inputs.iter().find(|cell| cell.id == seat.id) else {
                     return Err(program(format!(
-                        "lane {} runs a class that reads {:?} port {} and feeds it no \
-                         channel; a declared port is fed from a channel cell at every submit \
-                         (`Lane::ports`)",
-                        row.source, seat.kind, seat.port
+                        "lane {} runs a class that reads guest input {} and feeds it no \
+                         channel; a declared input is fed from a channel cell at every submit \
+                         (`Lane::inputs`)",
+                        row.source, seat.id
                     )));
                 };
                 let (first, count) = if seat.per_lane() {
@@ -652,64 +444,54 @@ impl Dit {
                 } else {
                     (row.row_offset, row.rows)
                 };
-                let want = count as usize * seat.width as usize;
-                if cell.values.len() != want {
+                let row_bytes = seat.row_bytes() as usize;
+                let want = count as usize * row_bytes;
+                if cell.bytes.len() != want {
                     return Err(program(format!(
-                        "lane {} feeds {:?} port {} a cell of {} value(s), and the port wants \
-                         {count} row(s) x {} = {want} (the lane's rows by the port's width)",
+                        "lane {} feeds guest input {} a cell of {} byte(s), and the input wants \
+                         {count} row(s) x {} x {:?} = {want} (the lane's rows by the input's \
+                         width)",
                         row.source,
-                        seat.kind,
-                        seat.port,
-                        cell.values.len(),
-                        seat.width
+                        seat.id,
+                        cell.bytes.len(),
+                        seat.width,
+                        seat.dtype
                     )));
                 }
-                let at = first as usize * seat.width as usize;
-                plane[at..at + want].copy_from_slice(cell.values);
+                let at = first as usize * row_bytes;
+                plane[at..at + want].copy_from_slice(cell.bytes);
             }
         }
         for (seat, plane) in planes {
             let extent = if seat.per_lane() { lane_count } else { rows };
-            let tensor = inputs.raw(
-                handles,
-                seat.dtype,
-                extent,
-                seat.width,
-                float_bytes(&plane, seat.dtype),
-            );
-            staged.bindings.ports.push(PortBinding {
-                kind: seat.kind,
-                port: seat.port,
+            let tensor = inputs.raw(handles, seat.dtype, extent, seat.width, plane);
+            staged.bindings.inputs.push(InputBinding {
+                id: seat.id,
                 tensor,
             });
-            key.push_str(&format!("p{:?}{}x{};", seat.kind, seat.port, seat.width));
+            key.push_str(&format!("i{}x{};", seat.id, seat.width));
         }
 
-        // ---- merges over ports
+        // ---- merges over guest inputs
         for (fire_lane, row) in lanes.iter().enumerate() {
-            for merged in &self.merged {
+            for merged in &self.feeds.merged {
                 if !merged.select.holds(row.word) {
                     continue;
                 }
-                let fed = feed_of(row).is_some_and(|feed| {
-                    feed.ports
-                        .iter()
-                        .any(|cell| cell.kind == merged.seat.kind && cell.port == merged.seat.port)
-                });
+                let fed = feed_of(row)
+                    .is_some_and(|feed| feed.inputs.iter().any(|cell| cell.id == merged.seat.id));
                 let (first, count) = if merged.seat.per_lane() {
                     (fire_lane as u32, 1)
                 } else {
                     (row.row_offset, row.rows)
                 };
-                let port = fed
+                let input = fed
                     .then(|| {
                         staged
                             .bindings
-                            .ports
+                            .inputs
                             .iter()
-                            .find(|bound| {
-                                bound.kind == merged.seat.kind && bound.port == merged.seat.port
-                            })
+                            .find(|bound| bound.id == merged.seat.id)
                             .map(|bound| bound.tensor)
                     })
                     .flatten();
@@ -717,98 +499,38 @@ impl Dit {
                     merge: merged.merge,
                     first,
                     rows: count,
-                    port,
+                    input,
                 });
                 key.push_str(&format!(
                     "m{}@{first}+{count}{};",
                     merged.merge.0,
-                    if port.is_some() { "f" } else { "z" }
+                    if input.is_some() { "f" } else { "z" }
                 ));
             }
         }
 
-        // ---- self-conditioning taps
-        let taps = self.self_cond_taps as usize;
-        if taps > 0 {
-            let mut ids = vec![0i32; rows as usize * taps];
-            let mut weights = vec![0f32; rows as usize * taps];
-            for row in lanes {
-                let Some(sc) = feed_of(row).and_then(|feed| feed.self_cond) else {
-                    continue;
-                };
-                let cells = row.rows as usize * taps;
-                if sc.taps as usize != taps || sc.rows.len() != cells || sc.weights.len() != cells {
-                    return Err(program(format!(
-                        "lane {} states self-conditioning taps of width {} over {} ids, and \
-                         this plan reads {taps} taps over the lane's {} rows",
-                        row.source,
-                        sc.taps,
-                        sc.rows.len(),
-                        row.rows
-                    )));
-                }
-                let at = row.row_offset as usize * taps;
-                ids[at..at + cells].copy_from_slice(sc.rows);
-                weights[at..at + cells].copy_from_slice(sc.weights);
-            }
-            staged.bindings.self_cond_rows = Some(inputs.i32s(handles, &ids, taps as u32));
-            staged.bindings.self_cond_weights = Some(inputs.f32s(handles, &weights, taps as u32));
-            key.push_str(&format!("sc{taps};"));
-        } else if let Some((at, _)) = feeds
-            .iter()
-            .enumerate()
-            .find(|(_, feed)| feed.self_cond.is_some())
-        {
-            return Err(program(format!(
-                "lane {at} states self-conditioning taps and this plan reads none"
-            )));
-        }
-
         // ---- attention-group packings
-        if !self.selections.is_empty() {
+        if !self.feeds.selections.is_empty() {
             let facts: Vec<LaneFacts> = (0..lanes
                 .iter()
                 .map(|row| row.source as usize + 1)
                 .max()
                 .unwrap_or(0))
                 .map(|source| {
-                    feeds.get(source).map_or(
-                        LaneFacts {
-                            stream: 0,
-                            group: None,
-                        },
-                        |feed| LaneFacts {
-                            stream: feed.stream,
+                    feeds
+                        .get(source)
+                        .map_or(LaneFacts { group: None }, |feed| LaneFacts {
                             group: feed.group,
-                        },
-                    )
+                        })
                 })
                 .collect();
             let mut groups = poem_exec::fire::group_of_lane(lanes, &facts);
             groups.resize(lane_count as usize, -1);
             staged.bindings.group_of_lane = Some(inputs.i32s(handles, &groups, 1));
-            let lane_classes: Vec<Option<&[i32]>> = feeds
-                .iter()
-                .map(|feed| feed.attn_classes.map(|stated| stated.classes.as_slice()))
-                .collect();
-            if let Some(stated) = class_table {
-                let count = stated.count;
-                staged.bindings.class_table = Some((
-                    inputs.raw(handles, Dtype::U8, count, count, stated.table.clone()),
-                    count,
-                ));
-                key.push_str(&format!("ct{count};"));
-            }
-            for &select in &self.selections {
-                let packed = poem_exec::fire::pack_with_classes(
-                    select,
-                    lanes,
-                    &facts,
-                    &groups,
-                    rows,
-                    &lane_classes,
-                )
-                .map_err(poem_exec::Error::Fire)?;
+            let mut packings = Vec::with_capacity(self.feeds.selections.len());
+            for &select in &self.feeds.selections {
+                let packed = poem_exec::fire::pack(select, lanes, &groups, rows)
+                    .map_err(poem_exec::Error::Fire)?;
                 let lane_table = |table: &[i32]| -> Vec<i32> {
                     let mut out = table.to_vec();
                     let last = table.last().copied().unwrap_or(0);
@@ -823,90 +545,108 @@ impl Dit {
                 let bindings = PackingBindings {
                     group_indptr: inputs.i32s(handles, &lane_table(&packed.group_indptr), 1),
                     lane_indptr: inputs.i32s(handles, &lane_table(&packed.lane_indptr), 1),
-                    reference_tag: inputs.i32s(handles, &row_table(&packed.reference_tag), 1),
                     permutation: inputs.i32s(handles, &row_table(&packed.permutation), 1),
-                    attn_class: inputs.i32s(handles, &row_table(&packed.attn_class), 1),
                 };
                 staged.bindings.packings.push((select, bindings));
+                packings.push(packed);
             }
-            key.push_str(&format!("pk{};", self.selections.len()));
+            key.push_str(&format!("pk{};", self.feeds.selections.len()));
+            for (q, kv, mask) in self.group_masks_of(lanes, &groups, &packings, feeds)? {
+                let len = u32::try_from(mask.bits.len().max(1)).unwrap_or(u32::MAX);
+                let mut bits = mask.bits;
+                bits.resize(len as usize, 0);
+                key.push_str(&format!("gm{len};"));
+                staged.bindings.group_masks.push(GroupMask {
+                    q,
+                    kv,
+                    bits: inputs.raw(handles, Dtype::U8, len, 1, bits),
+                    indptr: inputs.i32s(handles, &mask.indptr, 1),
+                });
+            }
+        } else if feeds.iter().any(|feed| feed.mask.is_some()) {
+            return Err(Fault::Program {
+                at: "serve::mask",
+                why: "a kv-less lane states an attention mask and this model packs no \
+                      attention group; the mask applies to group-packed `attention.ragged` \
+                      only"
+                    .to_string(),
+            });
         }
 
         staged.key = key;
         Ok(staged)
     }
 
-    /// The one attention class table a fire's lanes state, checked
-    /// (engine-cuda `serve/prepare.rs::class_table_of`).
-    fn class_table_of<'a>(
+    /// Each group-packed attention's custom mask, or none when no lane states one.
+    fn group_masks_of(
         &self,
-        rows: &[LaneRow],
-        feeds: &[Feed<'a>],
-    ) -> Result<Option<&'a engine::fire::AttnClasses>> {
-        let classes = |why: String| Fault::Program {
-            at: "serve::classes",
-            why,
-        };
-        let mut table: Option<&'a engine::fire::AttnClasses> = None;
-        for (source, feed) in feeds.iter().enumerate() {
-            let Some(stated) = feed.attn_classes else {
+        lanes: &[LaneRow],
+        group_of_lane: &[i32],
+        packings: &[poem_exec::fire::Packed],
+        feeds: &[Feed<'_>],
+    ) -> Result<
+        Vec<(
+            poem_ir::Selection,
+            poem_ir::Selection,
+            poem_exec::fire::GroupMask,
+        )>,
+    > {
+        let stated: Vec<Option<poem_exec::fire::LaneMask>> = feeds
+            .iter()
+            .map(|feed| {
+                feed.mask.map(|masking| poem_exec::fire::LaneMask {
+                    rows: masking
+                        .masks()
+                        .iter()
+                        .map(|mask| mask.admitted(0..mask.total).collect())
+                        .collect(),
+                })
+            })
+            .collect();
+        if stated.iter().all(Option::is_none) {
+            return Ok(Vec::new());
+        }
+        let patch = self.voxel.as_ref().and_then(|seat| seat.token_patch);
+        let mut guests = vec![poem_exec::fire::GuestRows::default(); feeds.len()];
+        for row in lanes {
+            let Some(guest) = guests.get_mut(row.source as usize) else {
                 continue;
             };
-            if self.selections.is_empty() {
-                return Err(classes(
-                    "a lane states attention classes and this model packs no attention \
-                     group; the mask applies to group-packed `attention.ragged` only"
-                        .to_string(),
-                ));
-            }
-            let owned = rows
+            let clips = feeds
+                .get(row.source as usize)
+                .and_then(|feed| feed.clips)
+                .map(|clips| clips.clips);
+            *guest =
+                poem_exec::fire::guest_rows(row, clips, patch).map_err(poem_exec::Error::Fire)?;
+        }
+        let masks: Vec<Option<&poem_exec::fire::LaneMask>> =
+            stated.iter().map(Option::as_ref).collect();
+        let packed = |select: poem_ir::Selection| {
+            packings
                 .iter()
-                .find(|r| r.source as usize == source)
-                .map_or(0, |r| r.rows);
-            if stated.classes.len() as u32 != owned {
-                return Err(classes(format!(
-                    "a lane states {} attention classes and carries {owned} rows; one \
-                     class per row",
-                    stated.classes.len()
-                )));
-            }
-            if stated.count == 0 || stated.count > engine::fire::ATTN_CLASSES_MAX {
-                return Err(classes(format!(
-                    "a lane states {} attention classes; the table holds 1..={}",
-                    stated.count,
-                    engine::fire::ATTN_CLASSES_MAX
-                )));
-            }
-            if stated.table.len() as u64 != u64::from(stated.count) * u64::from(stated.count) {
-                return Err(classes(format!(
-                    "a lane's class table is {} bytes for {} classes; it is count x count",
-                    stated.table.len(),
-                    stated.count
-                )));
-            }
-            if let Some(bad) = stated
-                .classes
-                .iter()
-                .find(|c| **c >= 0 && **c as u32 >= stated.count)
+                .find(|packed| packed.select == select)
+                .ok_or_else(|| {
+                    program(format!(
+                        "no packing of selection {select:?} was staged for this fire"
+                    ))
+                })
+        };
+        let mut staged = Vec::new();
+        for &(q, kv) in &self.feeds.ragged {
+            if let Some(mask) = poem_exec::fire::group_mask(
+                lanes,
+                group_of_lane,
+                packed(q)?,
+                packed(kv)?,
+                &masks,
+                &guests,
+            )
+            .map_err(poem_exec::Error::Fire)?
             {
-                return Err(classes(format!(
-                    "a lane's row names attention class {bad} and the table holds {}",
-                    stated.count
-                )));
-            }
-            match table {
-                None => table = Some(stated),
-                Some(have) if have.count == stated.count && have.table == stated.table => {}
-                Some(_) => {
-                    return Err(classes(
-                        "two lanes of one fire state different attention class tables; a \
-                         fire reads one"
-                            .to_string(),
-                    ));
-                }
+                staged.push((q, kv, mask));
             }
         }
-        Ok(table)
+        Ok(staged)
     }
 
     /// The clip tables (engine-cuda `voxels::Tables::of`).
@@ -949,14 +689,14 @@ impl Dit {
                 || !seat.widths.contains(&width)
             {
                 return Err(program(format!(
-                    "lane {}'s voxel payload is not one port row per voxel of its clips at a \
+                    "lane {}'s voxel payload is not one input row per voxel of its clips at a \
                      width the plan reads ({:?})",
                     row.source, seat.widths
                 )));
             }
             if channels != 0 && channels != width {
                 return Err(program(format!(
-                    "lane {} feeds a voxel port of another width than an earlier lane of the \
+                    "lane {} feeds a voxel input of another width than an earlier lane of the \
                      fire (one voxel class per fire)",
                     row.source
                 )));
@@ -965,8 +705,8 @@ impl Dit {
         }
         if channels == 0 && !seat.widths.is_empty() {
             return Err(program(
-                "the fire's clips carry no voxel payload and feed no voxel port, and this plan \
-                 reads its voxels off the port"
+                "the fire's clips carry no voxel payload and feed no voxel input, and this plan \
+                 reads its voxels off the input"
                     .to_string(),
             ));
         }
@@ -1027,11 +767,13 @@ impl Dit {
                     token_row += i64::from(tt) * i64::from(th) * i64::from(tw);
                 }
             }
+            // A lane whose class reads no token grid is one row (a VAE's).
             if seat.token_patch.is_some()
-                && token_row != i64::from(row.row_offset) + i64::from(row.rows)
+                && row.rows != 1
+                && token_row > i64::from(row.row_offset) + i64::from(row.rows)
             {
                 return Err(program(format!(
-                    "lane {}: its {} token rows are not its clips' token count",
+                    "lane {}: its {} token rows are fewer than its clips' patches",
                     row.source, row.rows
                 )));
             }
@@ -1079,8 +821,6 @@ struct VoxelTables {
     slots: Vec<i32>,
 }
 
-/// Lands each merge-over-port's rows in its slot before the walk: the
-/// port's rows for a lane that fed it, zeros for one that did not.
 pub fn land(
     ctx: &dyn Emit,
     handles: &Handles,
@@ -1090,17 +830,17 @@ pub fn land(
     for land in lands {
         let whole = slots.0[land.merge.0 as usize].ok_or_else(|| Fault::Unbound {
             what: format!(
-                "value {}, a merge over a port, which the carve gave no rectangle",
+                "value {}, a merge over a guest input, which the carve gave no rectangle",
                 land.merge.0
             ),
         })?;
         let at = handles.cut(whole, land.first, land.rows);
         let from = land
-            .port
-            .map(|port| handles.cut(port, land.first, land.rows));
+            .input
+            .map(|input| handles.cut(input, land.first, land.rows));
         ctx.emit(&mut |cx| {
             let v = match from {
-                Some(port) => cx.read(port)?,
+                Some(input) => cx.read(input)?,
                 None => {
                     let elem = kernels_xla::elem_of("serve.land", at.dtype)?;
                     cx.const_f(elem, 0.0, &[i64::from(at.rows), i64::from(at.width)])
@@ -1110,7 +850,7 @@ pub fn land(
         })
         .map_err(|why| {
             program(format!(
-                "landing merge {} over a port: {why:?}",
+                "landing merge {} over a guest input: {why:?}",
                 land.merge.0
             ))
         })?;

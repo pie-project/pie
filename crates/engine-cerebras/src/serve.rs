@@ -34,7 +34,7 @@ use crate::trace::{Handles, Root, Source, Tracer};
 use crate::weights::Weights;
 use crate::window::Windows;
 
-pub use crate::dit::{Clips, Pixels, PortCell, SelfCond};
+pub use crate::dit::{Clips, InputCell, Pixels};
 
 const OUT_SEAM: &str = poem_compiler::EXPORT_SEAMS[0];
 
@@ -154,17 +154,9 @@ pub struct Seated<'a> {
 
     pub media: Option<Media<'a>>,
 
-    pub bidirectional: bool,
-
-    /// The float ports this lane feeds, cells already read off its channels.
-    pub ports: &'a [PortCell<'a>],
-
-    /// The lane's stream and attention group, for grouped attention.
-    pub stream: u8,
+    pub inputs: &'a [InputCell<'a>],
 
     pub group: Option<u32>,
-
-    pub self_cond: Option<SelfCond<'a>>,
 
     /// The lane keeps no KV (a denoiser or decoder lane): it holds no
     /// rows across fires.
@@ -176,9 +168,6 @@ pub struct Seated<'a> {
     pub writes: Option<(&'a [u32], &'a [u32])>,
 
     pub first: Option<u32>,
-
-    /// The lane's attention classes, for a group-packed ragged attention.
-    pub attn_classes: Option<&'a engine::fire::AttnClasses>,
 
     /// The lane's pages in the windowed pool, aligned with `pages` (0 the
     /// null page); empty for a lane handed none.
@@ -206,15 +195,11 @@ impl<'a> Seated<'a> {
             captures_scores: false,
             rs: &FOLD,
             media: None,
-            bidirectional: false,
-            ports: &[],
-            stream: 0,
+            inputs: &[],
             group: None,
-            self_cond: None,
             kv_less: false,
             writes: None,
             first: None,
-            attn_classes: None,
             window: &[],
             window_copies: &[],
         }
@@ -264,6 +249,7 @@ pub struct Shell {
     capturing: poem_ir::ClassSet,
     rs_layout: Option<std::sync::Arc<crate::rs::Layout>>,
     masked: poem_ir::ClassSet,
+    wide: poem_ir::ClassSet,
     corrected: poem_ir::ClassSet,
     adapter_fact: Option<u32>,
     adapters: crate::adapter::Slots,
@@ -510,6 +496,29 @@ impl Shell {
                 )
             )
         });
+        let wide = classes_running(&boot.trace, &compiled, |op| {
+            matches!(
+                op,
+                poem_ir::Operation::Attn(poem_ir::Attn::Prefill { causal: false, .. })
+            )
+        });
+        // Mask bits are staged per lane with causality baked in, unclipped in a wide class:
+        // a causal masked prefill there would see future keys.
+        let causal_masked = classes_running(&boot.trace, &compiled, |op| {
+            matches!(
+                op,
+                poem_ir::Operation::Attn(poem_ir::Attn::Prefill {
+                    mask: Some(_),
+                    causal: true,
+                    ..
+                })
+            )
+        });
+        if let Some(class) = wide.iter().find(|&class| causal_masked.contains(class)) {
+            return Err(Fault::Recipe(format!(
+                "class {class} attends both ways under one mask"
+            )));
+        }
         let corrected = classes_running(&boot.trace, &compiled, |op| {
             matches!(
                 op,
@@ -755,6 +764,7 @@ impl Shell {
             capturing,
             rs_layout,
             masked,
+            wide,
             corrected,
             adapter_fact,
             adapters,
@@ -821,28 +831,30 @@ impl Shell {
         self.readout_seam
     }
 
-    /// The width of the plan's velocity export, when it plants one.
-    #[must_use]
-    pub fn velocity_width(&self) -> Option<u32> {
-        self.dit.velocity_width()
-    }
-
     /// Whether the plan exports pixels, and the pixel row's width.
     #[must_use]
     pub fn pixels_facts(&self) -> (bool, u32) {
         self.dit.pixels_facts()
     }
 
-    /// The voxel port's element, when the plan reads one.
     #[must_use]
     pub fn voxel_element(&self) -> Option<Dtype> {
         self.dit.voxel_element()
     }
 
-    /// `kind` port `port`'s element, when the plan reads it.
     #[must_use]
-    pub fn port_element(&self, kind: engine::fire::PortKind, port: u8) -> Option<Dtype> {
-        self.dit.port_element(kind, port)
+    pub fn input_seat(&self, id: u32) -> Option<poem_exec::feeds::Seat> {
+        self.dit.seat(id)
+    }
+
+    #[must_use]
+    pub fn input_decls(&self) -> Vec<poem_ir::InputDecl> {
+        self.dit.feeds().decls(&self.trace, &self.compiled)
+    }
+
+    #[must_use]
+    pub fn classes(&self) -> poem_ir::LaneClasses {
+        poem_exec::feeds::lane_classes(&self.trace, &self.compiled)
     }
 
     #[must_use]
@@ -1127,11 +1139,8 @@ impl Shell {
                 || seated.adapter.is_some()
                 || seated.captures_scores
                 || seated.kv_less
-                || seated.bidirectional
                 || seated.readout.is_some()
-                || !seated.ports.is_empty()
-                || seated.self_cond.is_some()
-                || seated.attn_classes.is_some()
+                || !seated.inputs.is_empty()
                 || seated.writes.is_some()
             {
                 return None;
@@ -1139,6 +1148,7 @@ impl Shell {
             let word = seated.lane.word;
             let class = classes.class_of(word & classes.mask)?;
             if self.masked.contains(class)
+                || self.wide.contains(class)
                 || self.corrected.contains(class)
                 || self.capturing.contains(class)
             {
@@ -1287,7 +1297,7 @@ impl Shell {
                     mask: None,
                     have: 0,
                     rows: row.rows,
-                    bidirectional: false,
+                    wide: false,
                 });
                 slot_ids.push(sink_slot as i32);
                 for at in 0..row.rows {
@@ -1361,11 +1371,13 @@ impl Shell {
             });
             demand_slots = demand_slots.max(state_slot + 1);
 
+            // A kv-less lane's mask is over its attention group's rows, for the group-packed attention.
+            let kv_mask = seated.mask.filter(|_| !seated.kv_less);
             let runs_masked_arm = self.masked.contains(row.class as usize);
-            if seated.mask.is_some() && self.masked.is_empty() {
+            if kv_mask.is_some() && self.masked.is_empty() {
                 return Err(Fault::Maskless { lane: row.source });
             }
-            if seated.mask.is_some() != runs_masked_arm {
+            if kv_mask.is_some() != runs_masked_arm {
                 return Err(Fault::MaskWord {
                     lane: row.source,
                     word: lane.word,
@@ -1373,10 +1385,10 @@ impl Shell {
                 });
             }
             masks.push(crate::mask::LaneMask {
-                mask: seated.mask,
+                mask: kv_mask,
                 have,
                 rows: row.rows,
-                bidirectional: seated.bidirectional,
+                wide: self.wide.contains(row.class as usize),
             });
             let runs_capture_arm = self.capturing.contains(row.class as usize);
             if seated.captures_scores && self.capturing.is_empty() {
@@ -1418,7 +1430,7 @@ impl Shell {
                     seated.rs,
                     row.rows,
                     seated.first.unwrap_or(have),
-                    seated.mask,
+                    kv_mask,
                     None,
                 )
                 .map_err(|error| Fault::Program {
@@ -1668,13 +1680,11 @@ impl Shell {
             .iter()
             .zip(&clips_of)
             .map(|(s, shot)| crate::dit::Feed {
-                slot: s.lane.slot,
-                stream: s.stream,
+                slot: s.rs_slot.unwrap_or(s.lane.slot),
                 group: s.group,
-                ports: s.ports,
-                self_cond: s.self_cond,
+                inputs: s.inputs,
                 clips: *shot,
-                attn_classes: s.attn_classes,
+                mask: s.mask.filter(|_| s.kv_less),
             })
             .collect();
         let crate::dit::Staged {
@@ -2158,7 +2168,7 @@ impl Shell {
             .with_pack(pack_len)
             .with_unified(self.unified.clone());
         let place = At::new();
-        crate::dit::land(&tracer, &self.handles, slots, lands)?;
+        crate::dit::land(lands)?;
         let probed = {
             let mut run = Run::new(
                 &tracer,

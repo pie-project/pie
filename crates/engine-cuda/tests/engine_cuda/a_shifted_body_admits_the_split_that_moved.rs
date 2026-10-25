@@ -53,6 +53,7 @@ impl Build {
                 nodes: Vec::new(),
                 seams: Vec::new(),
                 drafter: None,
+                inputs: Vec::new(),
             },
         }
     }
@@ -268,7 +269,6 @@ fn the_gate_the_narrow_reading_refuses_is_one_the_wide_reading_admits() {
 fn plain() -> Tiers {
     Tiers {
         plain: poem_ir::ClassSet::of(0..8usize),
-        wide: Box::new([]),
     }
 }
 

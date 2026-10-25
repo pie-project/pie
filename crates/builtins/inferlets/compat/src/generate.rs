@@ -514,12 +514,11 @@ fn prompt_rows(
         .collect()
 }
 
-/// Generate up to `max_tokens` after `prompt`; each picture's span is
-/// prefilled whole in a fire of its own. Every sampled token — the
-/// stop token included, if one comes — goes to `on_token`, which ends
-/// generation by returning `Break`. Where `sampling` asks for prompt
-/// logprobs, `on_prompt` has them ([`Generated::prompt_logprobs`]) before
-/// the first token comes.
+/// Generate up to `max_tokens` after `prompt`, prefilled in one pass with
+/// its pictures. Every sampled token — the stop token included, if one
+/// comes — goes to `on_token`, which ends generation by returning `Break`.
+/// Where `sampling` asks for prompt logprobs, `on_prompt` has them
+/// ([`Generated::prompt_logprobs`]) before the first token comes.
 ///
 /// With a `guide`, every fire's logits are masked to what it allows next,
 /// and generation ends when it terminates.
@@ -569,11 +568,6 @@ pub async fn generate(
             prompt_logprobs: Vec::new(),
         });
     }
-    if model::pass_kind() == model::ForwardKind::Diffusion {
-        return Err(
-            "this program decodes a token at a time; a diffusion model wants a canvas loop".into(),
-        );
-    }
     let vocab = model::output_vocab_size();
     let n = prompt.len() as u32;
 
@@ -593,15 +587,6 @@ pub async fn generate(
         Vec::new()
     };
 
-    // Rotations past an M-RoPE span lag its rows by `token_count - position_span`.
-    let runs: Vec<(u32, u32, u32)> = images
-        .iter()
-        .map(|(start, image)| {
-            let end = start + image.tokens().len() as u32;
-            (*start, end, image.token_count() - image.position_span())
-        })
-        .collect();
-    let rope_delta: u32 = runs.iter().map(|r| r.2).sum();
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     // Scored, every prompt row but the last is prefilled by the scoring
     // passes, and only the last token is left to sample after.
@@ -612,17 +597,7 @@ pub async fn generate(
     if sampling.prompt_logprobs.is_some() {
         on_prompt(&prompt_logprobs);
     }
-    let mut spans = Vec::new();
-    let mut at = prompt_logprobs.len() as u32;
-    for &(start, end, _) in runs.iter().chain([(n, n, 0)].iter()) {
-        if start > at {
-            spans.push((at, start));
-        }
-        if end > start {
-            spans.push((start, end));
-        }
-        at = end;
-    }
+    let base = prompt_logprobs.len();
 
     // Unconstrained, the prompt's last fire samples its token straight into
     // the decode pass's channels, as each decode fire does for the next: the
@@ -641,95 +616,69 @@ pub async fn generate(
             }),
         )
     });
-    let mut g0 = 0i32;
-    let mut g0_later: Option<Channel> = None;
-    let mut lp0 = None;
-    for (k, &(base, end)) in spans.iter().enumerate() {
-        let onward = carried_on.filter(|_| k + 1 == spans.len());
-        let len = end - base;
-        let lag: u32 = runs.iter().filter(|r| r.1 <= base).map(|r| r.2).sum();
-        let carried = images.iter().position(|(start, _)| *start == base);
-        let toks = Channel::from(&prompt_i32[base as usize..end as usize]).named("toks_p");
-        let embed_indptr = Channel::from([0u32, len]).named("embed_indptr_p");
-        // Past an image's M-RoPE span, rows are roped behind their slots.
-        let positions = (lag > 0)
-            .then(|| Channel::from_iter((base..end).map(|row| row - lag)).named("positions_p"));
-        let rng = Channel::from([sampling.seed, k as u32]).named("rng_p");
-        let hist = penalized.then(|| {
-            (
-                Channel::from(vec![0.0f32; vocab as usize]).named("counts_p"),
-                Channel::from(present.clone()).named("present_p"),
-            )
-        });
-        let mask = guide
-            .is_some()
-            .then(|| Channel::new([vocab], dtype::bool).named("mask_p"));
-        let g0_ch = Channel::new([1], dtype::i32).named("g0");
-        // Only the last span's token is sampled for the answer, so only it
-        // lands logprobs.
-        let sampling = Sampling {
-            logprobs: sampling.logprobs.filter(|_| k + 1 == spans.len()),
-            ..sampling
-        };
-        let lp_ch = logprob_channels(sampling.logprobs, "_p", 1);
-        let knobs = KnobChannels::new(&sampling, "_p");
+    let toks = Channel::from(&prompt_i32[base..]).named("toks_p");
+    let embed_indptr = Channel::from([0u32, n - base as u32]).named("embed_indptr_p");
+    let rng = Channel::from([sampling.seed, 0u32]).named("rng_p");
+    let hist = penalized.then(|| {
+        (
+            Channel::from(vec![0.0f32; vocab as usize]).named("counts_p"),
+            Channel::from(present.clone()).named("present_p"),
+        )
+    });
+    let mask = guide
+        .is_some()
+        .then(|| Channel::new([vocab], dtype::bool).named("mask_p"));
+    let g0_ch = Channel::new([1], dtype::i32).named("g0");
+    let lp_ch = logprob_channels(sampling.logprobs, "_p", 1);
+    let knobs = KnobChannels::new(&sampling, "_p");
 
-        let fwd = ForwardPass::new();
-        fwd.embed(&toks, &embed_indptr)?;
-        if let Some(at) = carried {
-            fwd.media(&[media::Span::Image(&images[at].1)])?;
-        }
-        fwd.state(
-            &[&ws],
-            StateGeometry {
-                positions: positions.as_ref(),
-                ..StateGeometry::folding()
-            },
-        )?;
-        fwd.epilogue(move || {
-            let r = rng.take();
-            let taken = hist.map(|(c, p)| (c.take(), p.take()));
-            let m = mask.map(|m| m.take());
-            let (token, counts_next, landed) = sample(
-                vocab,
-                &knobs.read(),
-                &r,
-                taken.as_ref().map(|(c, p)| (c, p)),
-                m.as_ref(),
-            );
-            let token = reshape(token, [1]);
-            g0_ch.put(&token);
-            land(landed, lp_ch);
-            if let Some((tok_in, hist)) = onward {
-                tok_in.put(&token);
-                if let (Some((c, p)), Some(next), Some((_, present))) = (hist, counts_next, taken) {
-                    c.put(&next);
-                    p.put(&present);
-                }
-            }
-        });
-        if let (Some(m), Some(guide)) = (mask, guide.as_deref_mut()) {
-            m.put(unpack_mask(&guide.mask(), vocab));
-        }
-        // Checkpoints only where messages end: each costs a state slot.
-        fwd.checkpoints(ends)?;
-        fwd.submit(&pipe)
-            .with_context(|| format!("prefill submit @{base}"))?;
-        if max_tokens == 1 && k + 1 == spans.len() {
-            // Nothing follows the prompt's token: the pipeline ends before
-            // it is read, as a decode's does once its budget is submitted.
-            pipe.close();
-        }
-        if onward.is_some() {
-            g0_later = Some(g0_ch);
-        } else {
-            g0 = g0_ch
-                .take_host::<i32>()
-                .await
-                .with_context(|| format!("prefill drain @{base}"))?;
-            lp0 = take_logprob(lp_ch.as_ref()).await?;
-        }
+    let fwd = ForwardPass::new();
+    fwd.embed(&toks, &embed_indptr)?;
+    if !images.is_empty() {
+        let spans: Vec<media::Span> = images.iter().map(media::Span::Image).collect();
+        fwd.media(0, &spans)?;
     }
+    fwd.state(&[&ws], StateGeometry::folding())?;
+    fwd.epilogue(move || {
+        let r = rng.take();
+        let taken = hist.map(|(c, p)| (c.take(), p.take()));
+        let m = mask.map(|m| m.take());
+        let (token, counts_next, landed) = sample(
+            vocab,
+            &knobs.read(),
+            &r,
+            taken.as_ref().map(|(c, p)| (c, p)),
+            m.as_ref(),
+        );
+        let token = reshape(token, [1]);
+        g0_ch.put(&token);
+        land(landed, lp_ch);
+        if let Some((tok_in, hist)) = carried_on {
+            tok_in.put(&token);
+            if let (Some((c, p)), Some(next), Some((_, present))) = (hist, counts_next, taken) {
+                c.put(&next);
+                p.put(&present);
+            }
+        }
+    });
+    if let (Some(m), Some(guide)) = (mask, guide.as_deref_mut()) {
+        m.put(unpack_mask(&guide.mask(), vocab));
+    }
+    // Checkpoints only where messages end: each costs a state slot.
+    fwd.checkpoints(ends)?;
+    fwd.submit(&pipe).context("prefill submit")?;
+    if max_tokens == 1 {
+        // Nothing follows the prompt's token, so the pipeline ends before it is read.
+        pipe.close();
+    }
+    let (g0, mut g0_later, lp0) = match carried_on {
+        Some(_) => (0, Some(g0_ch), None),
+        None => (
+            g0_ch.take_host::<i32>().await.context("prefill drain")?,
+            None,
+            take_logprob(lp_ch.as_ref()).await?,
+        ),
+    };
     let cached = ws.cached_tokens();
 
     let mut sampled = 0usize;
@@ -755,12 +704,6 @@ pub async fn generate(
         Some((tok_in, hist)) => (tok_in, Some(hist)),
         None => (Channel::from([g0]).named("tok_in"), None),
     };
-    let pos = (rope_delta > 0).then(|| {
-        (
-            Channel::from([n - rope_delta]).named("pos"),
-            Channel::from([n - rope_delta + 1]).named("next_pos"),
-        )
-    });
     let out = Channel::new([1], dtype::i32)
         .capacity(channel_capacity() as u32)
         .named("out");
@@ -788,13 +731,7 @@ pub async fn generate(
 
     let fwd = ForwardPass::new();
     fwd.embed(&tok_in, &lane1)?;
-    fwd.state(
-        &[&ws],
-        StateGeometry {
-            positions: pos.as_ref().map(|(pos, _)| pos),
-            ..StateGeometry::folding()
-        },
-    )?;
+    fwd.state(&[&ws], StateGeometry::folding())?;
     fwd.epilogue(move || {
         let r = rng.take();
         let taken = hist.map(|(c, p)| (c.take(), p.take()));
@@ -814,11 +751,6 @@ pub async fn generate(
 
         tok_in.put(&token);
         out.put(&token);
-        if let Some((pos, next)) = pos {
-            let at = next.take();
-            pos.put(&at);
-            next.put(&(&at + 1u32));
-        }
         rng.put(&r_next);
         if let (Some((c, p)), Some(next), Some((_, present))) = (hist, counts_next, taken) {
             c.put(&next);

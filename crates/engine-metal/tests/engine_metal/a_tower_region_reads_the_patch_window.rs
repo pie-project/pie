@@ -49,6 +49,7 @@ impl Build {
                 nodes: Vec::new(),
                 seams: Vec::new(),
                 drafter: None,
+                inputs: Vec::new(),
             },
         }
     }
@@ -204,7 +205,7 @@ fn each_region_is_cut_at_its_own_axis_s_window() {
                 merge_saw_the_tower |=
                     window.patch.rows == fire.patch_rows() && window.span.rows == fire.rows();
             }
-            RowAxis::Voxels => unreachable!("this trace declares no voxel port"),
+            RowAxis::Voxels => unreachable!("this trace declares no voxel input"),
         }
     }
     assert!(towers > 0 && trunks > 0, "{towers} tower, {trunks} trunk");

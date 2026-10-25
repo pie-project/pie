@@ -274,6 +274,18 @@ pub enum Conv {
         #[output]
         y: ValueId,
     },
+    /// Each token row's cell, `[rows, max(3, axis + 1) + 3]` f32: a clip
+    /// row's patch `(t, h, w)` then its clip's size in patches; any other
+    /// row `positions[row]` in column `axis`, zeros elsewhere.
+    Cells {
+        #[input(I32)]
+        tgrid: ValueId,
+        #[input(I32)]
+        positions: ValueId,
+        axis: u32,
+        #[output]
+        y: ValueId,
+    },
 }
 
 #[cfg(test)]

@@ -2,39 +2,44 @@
 
 use crate::common_dit::{Lcg, NAME, Rig, WIDTH, Weights, assert_close, attach, bf, frame, lane};
 use engine::Engine;
-use engine::fire::{LaneStream, PortKind, ReadoutSeam};
+use engine::fire::ReadoutSeam;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
 use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Stream, Trace, Value, Weight,
-    ops, seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Trace, Value, Weight, ops,
+    seam, trace_hybrid,
 };
+use poem_ir::InputAxis;
 
 const FREQ: u32 = 16;
 const HIDDEN: u32 = 48;
 const T_SCALE: f32 = 1000.0;
 const EMB_SCALE: f32 = 0.75;
 
-struct TwoReadings;
+struct TwoClasses;
 
-impl ForwardHybrid for TwoReadings {
+impl ForwardHybrid for TwoClasses {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
-        let (txt, img) = (
-            inputs.on(fact::stream(Stream::Text)),
-            inputs.on(!fact::stream(Stream::Text)),
+        inputs.recorder().declare_switch(
+            "stream",
+            &["text", "image", "video", "audio", "context", "reference"],
         );
-        let x_txt = txt.latents(0, WIDTH, Dtype::Bf16);
+        let (txt, img) = (
+            inputs.on(fact::switch_is("stream", "text")),
+            inputs.on(!fact::switch_is("stream", "text")),
+        );
+        let x_txt = txt.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
         let enc = Weight::sym("enc", [u64::from(HIDDEN), u64::from(WIDTH)], Dtype::Bf16);
         let h = ops::linear::matmul(&x_txt, &enc);
         seam::at(seam::HIDDEN, &[&h]);
-        let x_img = img.latents(1, WIDTH, Dtype::Bf16);
-        let t = img.lane_vector(0, 1);
+        let x_img = img.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
+        let t = img.input("timestep", Dtype::F32, InputAxis::Lane, 1, None);
         let emb = ops::elemwise::silu(&ops::elemwise::sinusoid(&t, FREQ, 10_000.0, true, T_SCALE));
         let emb = ops::elemwise::mul_scalar(EMB_SCALE, &emb);
         let ada = Weight::sym("ada", [2 * u64::from(WIDTH), u64::from(FREQ)], Dtype::Bf16);
@@ -54,7 +59,7 @@ impl ForwardHybrid for TwoReadings {
 }
 
 fn plan() -> Trace {
-    trace_hybrid(NAME, &TwoReadings, Platform::Cuda)
+    trace_hybrid(NAME, &TwoClasses, Platform::Cuda)
 }
 
 fn hidden_reference(weights: &Weights, x: &[f32], rows: usize) -> Vec<f32> {
@@ -140,6 +145,7 @@ fn epilogue(rows: u32, intrinsic: IntrinsicId, width: u32) -> TraceContainer {
                 Op::ChanTake(0),
                 Op::IntrinsicVal {
                     intr: intrinsic,
+                    lane: 0,
                     shape: Shape::matrix(rows, width),
                     dtype: EtaDtype::F32,
                 },
@@ -147,6 +153,7 @@ fn epilogue(rows: u32, intrinsic: IntrinsicId, width: u32) -> TraceContainer {
             ],
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
@@ -159,8 +166,11 @@ fn each_lane_reads_back_its_own_arms_seam() {
     let plan = plan();
     let weights = Weights::random(&plan, 37);
     let mut rig = Rig::load_plan(plan, &weights, 64, vec![16, 64]);
-    assert!(rig.profile().has_velocity, "the velocity seam is plan-wide");
-    assert_eq!(rig.profile().velocity_width, WIDTH);
+    assert!(
+        rig.reads_out(poem_ir::ReadoutKind::Velocity).is_some(),
+        "the velocity seam is plan-wide"
+    );
+    assert_eq!(rig.reads_out(poem_ir::ReadoutKind::Velocity), Some(WIDTH));
 
     let w = WIDTH as usize;
     let mut rng = Lcg::seeded(39);
@@ -180,12 +190,8 @@ fn each_lane_reads_back_its_own_arms_seam() {
     rig.publish(i.instance, 0, &image);
     rig.publish(i.instance, 1, &[timestep]);
 
-    let mut text_lane = lane(&rig, 0, &t, LaneStream::Text, 0);
-    let mut image_lane = lane(&rig, 1, &i, LaneStream::Image, 1);
-    for lane in [&mut text_lane, &mut image_lane] {
-        lane.ports.retain(|f| f.kind != PortKind::AxisPositions);
-    }
-    text_lane.ports.retain(|f| f.kind != PortKind::LaneVector);
+    let text_lane = lane(&rig, 0, &t, "text", 0);
+    let image_lane = lane(&rig, 1, &i, "image", 1);
     let mut ticket = rig
         .engine
         .submit(&frame(

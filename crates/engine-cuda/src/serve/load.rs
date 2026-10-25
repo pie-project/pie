@@ -7,8 +7,8 @@ use crate::device::Context;
 use crate::error::{Fault, Result};
 use crate::exports::{
     Exports, Feeds, corrected_classes, decoding_of, landing_requests, masked_classes,
-    media_classes, plain_of, read_only_by_decoders, regions_lane_shifting,
-    regions_launching_schedules, regions_shifting, schedule_streams,
+    media_classes, one_direction_per_mask, plain_of, read_only_by_decoders, regions_lane_shifting,
+    regions_launching_schedules, regions_shifting, schedule_streams, wide_classes,
 };
 use crate::inputs::Inputs;
 use crate::program::Plane as ProgramPlane;
@@ -566,10 +566,14 @@ impl Shell {
             crate::store::window_of(&boot.trace)?,
             boot.budget.max_tokens,
         );
-        let decode_dense = landing_requests(&boot.trace.facts, &compiled.classes)
+        // A class attending both ways decodes its planes over all its rows once, at load.
+        let decoding = poem_exec::feeds::classes_reading(&boot.trace, &compiled, |def| {
+            matches!(def, poem_ir::Def::Weight(w)
+                if crate::weights::decodes_at_load(&boot.trace.params[*w as usize]))
+        });
+        let decode_dense = crate::exports::wide_classes(&boot.trace, &compiled)
             .iter()
-            .flatten()
-            .any(poem_ir::Request::denoise);
+            .any(|class| decoding.contains(class));
         let decoded_dense = if decode_dense {
             crate::weights::decoded_dense_bytes(&boot.trace)
         } else {
@@ -695,7 +699,9 @@ impl Shell {
         let mut facts = kv::probe(&boot.trace)?;
         crate::window::no_schedule_straddles_its_readers(&boot.trace, &compiled)?;
         crate::window::no_grouped_window_is_also_a_prepare_window(&compiled)?;
+        one_direction_per_mask(&boot.trace, &compiled)?;
         let masked = masked_classes(&boot.trace, &compiled);
+        let wide = wide_classes(&boot.trace, &compiled);
         let corrected = corrected_classes(&boot.trace, &compiled);
         let landing = landing_requests(&boot.trace.facts, &compiled.classes);
         let decoding = decoding_of(&landing);
@@ -703,28 +709,8 @@ impl Shell {
         // partials are sized for the lanes, not the widest fire's rows.
         facts.mark_rows_a_lane(&read_only_by_decoders(&boot.trace, &compiled, &decoding));
         let feeds = Feeds::of(&boot.trace, &compiled);
-        // A wide body is captured from representative lanes and keyed by the
-        // whole wide list, so only classes a synthetic lane can stand in for
-        // join it: text-stream, non-denoising, port-free.
         let tiers = crate::record::Tiers {
             plain: plain_of(&landing),
-            wide: landing
-                .iter()
-                .enumerate()
-                .filter(|(class, requests)| {
-                    !requests.is_empty()
-                        && requests.iter().all(|request| {
-                            !request.denoise()
-                                && request.stream() == poem_ir::Stream::Text
-                                && request.reading().is_none()
-                        })
-                        && !feeds
-                            .ports
-                            .iter()
-                            .any(|(_, readers)| readers.contains(*class))
-                })
-                .map(|(class, _)| class as u32)
-                .collect(),
         };
         let media = media_classes(&boot.trace, &compiled);
         let shifted = regions_shifting(&boot.trace, &compiled);
@@ -825,11 +811,6 @@ impl Shell {
                 })
             })
         });
-        let self_cond_taps = u32::try_from(declared_width(
-            &boot.trace,
-            poem_ir::RuntimeInput::SelfCondRows,
-        ))
-        .unwrap_or(u32::MAX);
         let mrope_seat = boot.trace.values.iter().any(|decl| {
             matches!(
                 decl.def,
@@ -853,8 +834,8 @@ impl Shell {
             return Err(Fault::Unbound {
                 what: format!(
                     "value {}, a merge over a runtime input this shell cannot land: only a \
-                     float port (latents, lane vector, context, axis positions) under a \
-                     conjunction of facts is landed in a merged column before the walk",
+                     lane or row guest input under a conjunction of facts is landed in a \
+                     merged column before the walk",
                     value.0
                 ),
             });
@@ -879,10 +860,9 @@ impl Shell {
             boot.runahead,
             patch_seat,
             mrope_seat,
-            u64::from(self_cond_taps),
             &feeds.seats(),
             feeds.selections.len(),
-            !masked.is_empty(),
+            !masked.is_empty() || !wide.is_empty(),
             &schedule_streams(&boot.trace, &compiled),
         )?;
 
@@ -932,7 +912,6 @@ impl Shell {
             budgets,
             patch_seat,
             mrope_seat,
-            self_cond_taps,
             drops_patch_rows,
             towered: compiled_towered,
             patch_fold,
@@ -947,6 +926,7 @@ impl Shell {
             facts,
             spaces,
             masked,
+            wide,
             feeds,
             adapter_fact,
             corrected,
@@ -1508,33 +1488,6 @@ fn decoded_weight_planes(
         }
     }
     planes
-}
-
-fn declared_width(trace: &poem_ir::Trace, which: poem_ir::RuntimeInput) -> u64 {
-    trace
-        .values
-        .iter()
-        .find_map(|decl| {
-            let (poem_ir::Def::Input(named), poem_ir::Ty::Tensor { shape, .. }) =
-                (&decl.def, &decl.ty)
-            else {
-                return None;
-            };
-            if *named != which {
-                return None;
-            }
-            Some(
-                shape
-                    .iter()
-                    .skip(1)
-                    .map(|dim| match dim {
-                        poem_ir::Dim::Const(n) => *n,
-                        _ => 1,
-                    })
-                    .product(),
-            )
-        })
-        .unwrap_or(0)
 }
 
 fn patch_fold(trace: &poem_ir::Trace) -> u32 {

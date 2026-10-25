@@ -1,6 +1,6 @@
 use poem_ir::{
-    CacheRow, Dim, Dtype, GeomKind, Guard, Platform, RuntimeInput, Selection, Shard, Trace, Ty,
-    ValueId,
+    CacheRow, Dim, Dtype, GeomKind, Guard, InputAxis, Platform, RuntimeInput, Selection, Shard,
+    Trace, Ty, ValueId,
 };
 
 use crate::fact::Predicate;
@@ -367,32 +367,6 @@ impl Input {
     }
 
     #[must_use]
-    pub fn self_cond_rows(&self, taps: u32) -> Value {
-        self.rec
-            .input(
-                RuntimeInput::SelfCondRows,
-                Ty::Tensor {
-                    shape: vec![Dim::Tokens, Dim::Const(u64::from(taps))],
-                    dtype: Dtype::I32,
-                },
-            )
-            .refined(self.over.clone())
-    }
-
-    #[must_use]
-    pub fn self_cond_weights(&self, taps: u32) -> Value {
-        self.rec
-            .input(
-                RuntimeInput::SelfCondWeights,
-                Ty::Tensor {
-                    shape: vec![Dim::Tokens, Dim::Const(u64::from(taps))],
-                    dtype: Dtype::F32,
-                },
-            )
-            .refined(self.over.clone())
-    }
-
-    #[must_use]
     pub fn kv_indptr(&self) -> Value {
         self.geometry(self.kv_space(), GeomKind::Indptr)
     }
@@ -465,16 +439,6 @@ impl Input {
     }
 
     #[must_use]
-    pub fn reference_tags(&self) -> Value {
-        self.geometry(
-            TOKEN_SPACE,
-            GeomKind::ReferenceTag {
-                select: self.selection(),
-            },
-        )
-    }
-
-    #[must_use]
     pub fn row_permutation(&self) -> Value {
         self.rec
             .input(
@@ -484,66 +448,6 @@ impl Input {
                 Ty::Tensor {
                     shape: vec![Dim::Tokens],
                     dtype: Dtype::I32,
-                },
-            )
-            .refined(self.over.clone())
-    }
-
-    #[must_use]
-    pub fn latents(&self, port: u8, width: u32, dtype: Dtype) -> Value {
-        assert!(
-            matches!(dtype, Dtype::F32 | Dtype::Bf16),
-            "a latent port is f32 or bf16, not {dtype:?}"
-        );
-        self.rec
-            .input(
-                RuntimeInput::Latents { port, width },
-                Ty::Tensor {
-                    shape: vec![Dim::Tokens, Dim::Const(u64::from(width))],
-                    dtype,
-                },
-            )
-            .refined(self.over.clone())
-    }
-
-    #[must_use]
-    pub fn lane_vector(&self, port: u8, width: u32) -> Value {
-        self.rec
-            .input(
-                RuntimeInput::LaneVector { port, width },
-                Ty::Tensor {
-                    shape: vec![Dim::Lanes, Dim::Const(u64::from(width))],
-                    dtype: Dtype::F32,
-                },
-            )
-            .refined(self.over.clone())
-    }
-
-    #[must_use]
-    pub fn context(&self, port: u8, width: u32) -> Value {
-        self.rec
-            .input(
-                RuntimeInput::Context { port, width },
-                Ty::Tensor {
-                    shape: vec![Dim::Tokens, Dim::Const(u64::from(width))],
-                    dtype: Dtype::Bf16,
-                },
-            )
-            .refined(self.over.clone())
-    }
-
-    #[must_use]
-    pub fn axis_positions(&self, port: u8, axes: u8) -> Value {
-        assert!(
-            (1..=4).contains(&axes),
-            "a rope has one to four axes, not {axes}"
-        );
-        self.rec
-            .input(
-                RuntimeInput::AxisPositions { port, axes },
-                Ty::Tensor {
-                    shape: vec![Dim::Tokens, Dim::Const(u64::from(axes))],
-                    dtype: Dtype::F32,
                 },
             )
             .refined(self.over.clone())
@@ -562,20 +466,23 @@ impl Input {
             .refined(self.over.clone())
     }
 
+    /// The guest input `name`; one name is one input wherever it is read.
     #[must_use]
-    pub fn voxels(&self, port: u8, channels: u32, dtype: Dtype) -> Value {
+    pub fn input(
+        &self,
+        name: &str,
+        dtype: Dtype,
+        axis: InputAxis,
+        width: u32,
+        rows: Option<poem_ir::RowCount>,
+    ) -> Value {
         assert!(
-            matches!(dtype, Dtype::F32 | Dtype::Bf16),
-            "a voxel port is f32 or bf16, not {dtype:?}"
+            matches!(dtype, Dtype::F32 | Dtype::Bf16 | Dtype::I32),
+            "input `{name}` is f32, bf16 or i32, not {dtype:?}"
         );
+        assert!(width > 0, "input `{name}` is zero wide");
         self.rec
-            .input(
-                RuntimeInput::Voxels { port, channels },
-                Ty::Tensor {
-                    shape: vec![Dim::Voxels, Dim::Const(u64::from(channels))],
-                    dtype,
-                },
-            )
+            .guest(name, dtype, axis, width, rows)
             .refined(self.over.clone())
     }
 
@@ -656,10 +563,9 @@ impl Input {
             | GeomKind::KvLen
             | GeomKind::GroupOfLane => (Dim::Lanes, Dtype::I32),
             GeomKind::RowValid => (Dim::Tokens, Dtype::U8),
-            GeomKind::RequestOfToken
-            | GeomKind::WritePage
-            | GeomKind::WriteOffset
-            | GeomKind::ReferenceTag { .. } => (Dim::Tokens, Dtype::I32),
+            GeomKind::RequestOfToken | GeomKind::WritePage | GeomKind::WriteOffset => {
+                (Dim::Tokens, Dtype::I32)
+            }
         };
         self.rec
             .input(

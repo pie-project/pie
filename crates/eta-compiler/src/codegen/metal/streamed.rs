@@ -10,9 +10,10 @@ use eta_ir::wire::predicate_tags;
 use crate::plan::{CompiledStage, Dimension, Region, SymbolicType};
 
 use super::fused::{
-    METAL_M3_REGION_THREADS, emit_logits_argmax, emit_logits_gather, emit_mtp_drafts,
-    emit_pixels_gather, emit_score_gather,
+    METAL_M3_REGION_THREADS, emit_addressed_gather, emit_intrinsic_table, emit_logits_argmax,
+    emit_logits_gather, emit_mtp_drafts, emit_score_gather,
 };
+use super::intrinsics::{M3_INTRINSIC_TABLE_BUFFER, addressed_slot};
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
 use super::validate::{grouped_intrinsics_bindable, library_region_valid, used_channel_slots};
 use crate::codegen::alias::AliasTable;
@@ -733,7 +734,12 @@ impl Scheduler<'_> {
     }
 }
 
-pub(super) fn kernel_head(function_name: &str, channel_count: usize, extra: &str) -> String {
+pub(super) fn kernel_head(
+    function_name: &str,
+    stage: &CompiledStage,
+    channel_count: usize,
+    extra: &str,
+) -> String {
     let mut source = String::new();
     source.push_str(RUNTIME_TEMPLATE);
     source.push('\n');
@@ -753,6 +759,10 @@ pub(super) fn kernel_head(function_name: &str, channel_count: usize, extra: &str
     source.push_str("    const device M3RowMeta* all_row_meta [[buffer(9)]],\n");
     source.push_str("    const device uint* row_indices [[buffer(10)]],\n");
     source.push_str("    constant M4Step& step [[buffer(11)]],\n");
+    let _ = writeln!(
+        source,
+        "    const device ulong* all_intrinsic_at [[buffer({M3_INTRINSIC_TABLE_BUFFER})]],"
+    );
     source.push_str("    uint2 m4_group [[threadgroup_position_in_grid]],\n");
     source.push_str("    uint2 m4_groups [[threadgroups_per_grid]],\n");
     source.push_str("    uint2 m4_tid [[thread_position_in_threadgroup]],\n");
@@ -810,6 +820,7 @@ pub(super) fn kernel_head(function_name: &str, channel_count: usize, extra: &str
         "  const device bfloat* logits = \
          reinterpret_cast<const device bfloat*>(lane.logits_base);\n",
     );
+    emit_intrinsic_table(&mut source, stage);
     for channel in 0..channel_count {
         let _ = writeln!(
             source,
@@ -869,7 +880,7 @@ pub fn emit_streamed_region(
     } else {
         ""
     };
-    let mut source = kernel_head(function_name, channel_count, extra);
+    let mut source = kernel_head(function_name, stage, channel_count, extra);
 
     let escapes = crate::codegen::alias::escaping_values(region);
     let covers =
@@ -922,8 +933,6 @@ pub fn emit_streamed_region(
                 && ops.get(n).is_some_and(|p| {
                     p.tag == tags::INTRINSIC_VAL
                         && (p.intr == intrinsic_tags::LOGITS
-                            || p.intr == intrinsic_tags::VELOCITY
-                            || p.intr == intrinsic_tags::HIDDEN
                             || p.intr == intrinsic_tags::MTP_LOGITS)
                 })
         });
@@ -975,19 +984,23 @@ pub fn emit_streamed_region(
             let single_row = key_of(base).len() <= 1;
             let mut body = String::new();
             match op.intr {
+                _ if let Some(slot) = addressed_slot(op.intr, op.imm) => {
+                    emit_addressed_gather(
+                        &mut body,
+                        base,
+                        slot,
+                        &slots.o0,
+                        "m4_gtid",
+                        "m4_gthreads",
+                    );
+                }
                 intrinsic_tags::MTP_DRAFTS => {
                     emit_mtp_drafts(&mut body, base, &slots.o0, "m4_gtid", "m4_gthreads");
                 }
                 intrinsic_tags::ATTN_SCORE => {
                     emit_score_gather(&mut body, base, &slots.o0, "m4_gtid", "m4_gthreads");
                 }
-                intrinsic_tags::PIXELS => {
-                    emit_pixels_gather(&mut body, base, &slots.o0, "m4_gtid", "m4_gthreads");
-                }
-                intrinsic_tags::LOGITS
-                | intrinsic_tags::VELOCITY
-                | intrinsic_tags::HIDDEN
-                | intrinsic_tags::MTP_LOGITS => {
+                intrinsic_tags::LOGITS | intrinsic_tags::MTP_LOGITS => {
                     emit_logits_gather(
                         &mut body,
                         base,

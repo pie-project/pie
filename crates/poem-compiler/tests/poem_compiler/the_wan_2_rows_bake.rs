@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::wan_2_dims::{self as model, Dims};
-use poem::generative::{PortKind, ReadoutKind, ScheduleKind};
+use poem::generative::ScheduleKind;
 use poem::{
     Attn, CacheRow, Def, Dim, Dtype, Elemwise, GeomKind, Operands, Operation, Platform, RaggedMask,
-    Request, RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
+    Request, RopeForm, RuntimeInput, Selection, Trace, Ty, ValueId, seam,
 };
+use poem_ir::{Conv, InputAxis};
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
 
@@ -47,20 +48,109 @@ fn is_flagship(deployment: &str) -> bool {
     deployment == TI2V
 }
 
-fn word(plan: &Trace, reading: &str, stream: Stream) -> u64 {
-    let request = Request::new(4, false).on_stream(stream).in_reading(reading);
+fn word(plan: &Trace, reading: &str, stream: Option<&str>) -> u64 {
+    fresh_word(plan, reading, stream, false)
+}
+
+fn fresh_word(plan: &Trace, reading: &str, stream: Option<&str>, fresh: bool) -> u64 {
+    let mut request = Request::new(4, false)
+        .starting(fresh)
+        .switched("reading", reading);
+    if let Some(stream) = stream {
+        request = request.switched("stream", stream);
+    }
     plan.facts.word(&request)
+}
+
+fn readings(plan: &Trace) -> Vec<String> {
+    plan.facts
+        .declared("reading")
+        .map(|s| s.values.clone())
+        .unwrap_or_default()
 }
 
 #[test]
 fn the_wan_2_rows_bake_every_case() {
     every_row_traces_on_every_platform_with_the_caches_and_seams_it_states();
-    the_ports_the_trace_reads_are_the_ports_the_facts_declare();
+    each_reading_reads_out_what_its_facts_state();
     each_lane_the_facts_list_classifies_into_its_own_class();
     the_attentions_pair_as_the_architecture_says();
     every_rope_turns_the_rows_three_axis_split_of_the_whole_head_interleaved();
     the_generative_facts_state_the_readings_the_latent_and_the_schedule();
     the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk();
+    the_latent_is_patched_in_the_graph_and_the_positions_are_its_cells();
+}
+
+fn the_latent_is_patched_in_the_graph_and_the_positions_are_its_cells() {
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let d = dims(deployment);
+        let patch = [1, 2, 2];
+        let convs: Vec<&Conv> = plan
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.op {
+                Operation::Conv(op) => Some(op),
+                _ => None,
+            })
+            .collect();
+        let count = |f: &dyn Fn(&Conv) -> bool| convs.iter().filter(|op| f(op)).count();
+        assert_eq!(
+            count(&|op| matches!(op, Conv::Patchify { p, .. } if *p == patch)),
+            1,
+            "{deployment}: the latent patched in"
+        );
+        assert_eq!(
+            count(&|op| matches!(op, Conv::Unpatchify { p, .. } if *p == patch)),
+            1,
+            "{deployment}: the velocity unpatched out"
+        );
+        assert_eq!(
+            count(&|op| matches!(op, Conv::Cells { axis: 0, .. })),
+            1,
+            "{deployment}: the video positions are the token grid's cells"
+        );
+        let velocity = plan
+            .seams
+            .iter()
+            .find(|s| s.seam == seam::VELOCITY.name)
+            .expect("a velocity seam")
+            .values[0];
+        assert_eq!(
+            plan.values[velocity.0 as usize].ty,
+            Ty::Tensor {
+                shape: vec![Dim::Voxels, Dim::Const(u64::from(d.in_channels))],
+                dtype: Dtype::Bf16,
+            },
+            "{deployment}: the velocity reads out in the latent's own voxels"
+        );
+        assert_eq!(
+            plan.facts.declared("positions").map(|s| s.values.clone()),
+            Some(vec!["computed".to_string(), "given".to_string()])
+        );
+        if is_flagship(deployment) {
+            continue;
+        }
+        let budgets = poem_compiler::Budgets::of(poem_compiler::Budget::new(4, 256)).with_voxels(
+            poem_compiler::VoxelLadder {
+                max_voxels: 1024,
+                buckets: vec![256, 1024],
+                max_clips: 4,
+            },
+        );
+        let compiled =
+            poem_compiler::compile_axes(&plan, &budgets, &poem_compiler::DeviceProfile::default())
+                .unwrap_or_else(|why| {
+                    panic!("{deployment}: the voxel-in, voxel-out denoiser bakes: {why:?}")
+                });
+        assert!(
+            compiled.units.contains(&poem_compiler::RowAxis::Voxels)
+                && compiled.units.contains(&poem_compiler::RowAxis::Tokens),
+            "{deployment}: the latent's voxels and the tokens are two units: {:?}",
+            compiled.units
+        );
+        assert!(compiled.arena.clashes(&compiled.concurrency).is_empty());
+    }
 }
 
 fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
@@ -106,7 +196,8 @@ fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
                 assert_eq!(
                     seams.get(seam::PIXELS.name),
                     Some(&4),
-                    "{deployment}: the voxel-axis readout on all four VAE arms"
+                    "{deployment}: the voxel-axis readout on all four VAE arms (decode and \
+                     encode, each fresh and held)"
                 );
             } else {
                 for other in [seam::HIDDEN.name, seam::PIXELS.name] {
@@ -120,123 +211,34 @@ fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
     }
 }
 
-fn traced_ports(plan: &Trace) -> BTreeSet<(String, u8, u32)> {
-    let mut traced = BTreeSet::new();
-    for decl in &plan.values {
-        let (kind, port, width) = match &decl.def {
-            Def::Input(RuntimeInput::Latents { port, width }) => ("Latents", *port, *width),
-            Def::Input(RuntimeInput::Context { port, width }) => ("Context", *port, *width),
-            Def::Input(RuntimeInput::LaneVector { port, width }) => ("LaneVector", *port, *width),
-            Def::Input(RuntimeInput::AxisPositions { port, axes }) => {
-                ("AxisPositions", *port, u32::from(*axes))
-            }
-            Def::Input(RuntimeInput::Voxels { port, channels }) => ("Voxels", *port, *channels),
-            _ => continue,
-        };
-        traced.insert((kind.to_string(), port, width));
-    }
-    traced
-}
-
-fn the_ports_the_trace_reads_are_the_ports_the_facts_declare() {
+fn each_reading_reads_out_what_its_facts_state() {
     for deployment in ROWS {
         let plan = trace(deployment, Platform::Cuda);
-        let facts = row(deployment).generative().expect("facts");
-        let mut declared: BTreeSet<(String, u8, u32)> = BTreeSet::new();
-        for reading in &facts.readings {
-            for (index, port) in reading.ports_indexed() {
-                declared.insert((format!("{:?}", port.kind), index, port.width));
-            }
-        }
-        assert_eq!(
-            traced_ports(&plan),
-            declared,
-            "{deployment}: the facts and the trace bind one list of ports"
-        );
-
-        let d = dims(deployment);
-        let denoise = facts
-            .readings
-            .iter()
-            .find(|r| r.name == "denoise")
-            .unwrap_or_else(|| panic!("{deployment} declares no `denoise`"));
-        let at = |name: &str| {
-            let (index, port) = denoise
-                .port(name)
-                .unwrap_or_else(|| panic!("{deployment}: `denoise` declares no port `{name}`"));
-            (index, port.kind, port.width, port.streams.clone())
-        };
-        assert_eq!(
-            at("latents"),
-            (
-                model::port::LATENTS,
-                PortKind::Latents,
-                d.patch_in(),
-                vec![Stream::Video]
-            )
-        );
-        assert_eq!(
-            at("context"),
-            (
-                model::port::CONTEXT,
-                PortKind::Context,
-                d.text_dim,
-                vec![Stream::Context]
-            )
-        );
-        assert_eq!(
-            at("timestep"),
-            (
-                model::port::TIMESTEP,
-                PortKind::LaneVector,
-                1,
-                vec![Stream::Video]
-            )
-        );
-        assert_eq!(
-            at("positions"),
-            (
-                model::port::POSITIONS,
-                PortKind::AxisPositions,
-                u32::from(model::ROPE_AXES),
-                vec![Stream::Video]
-            )
-        );
-        assert_eq!(denoise.readout, ReadoutKind::Velocity);
-        assert_eq!(denoise.readout_width, d.patch_out());
-        for name in ["vae.decode.head", "vae.decode"] {
-            let Some(arm) = facts.readings.iter().find(|r| r.name == name) else {
-                assert!(
-                    !is_flagship(deployment),
-                    "{deployment}: a VAE row declares `{name}`"
-                );
-                continue;
-            };
-            assert_eq!(arm.streams, vec![Stream::Video]);
-            assert!(!arm.has_kv && !arm.takes_tokens);
-            assert_eq!(arm.readout, ReadoutKind::Pixels);
-            assert_eq!(arm.readout_width, model::VAE_RGB);
-            assert_eq!(arm.positions, None, "a VAE tile sits in no rotary space");
-            let (index, port) = arm.port("latent").expect("the voxel port");
+        let declared = readings(&plan);
+        for name in ["vae.decode", "vae.encode"] {
             assert_eq!(
-                (index, port.kind, port.width, port.streams.clone()),
-                (
-                    model::port::VOXELS,
-                    PortKind::Voxels,
-                    model::VAE_Z,
-                    vec![Stream::Video]
-                )
+                declared.iter().any(|r| r == name),
+                is_flagship(deployment),
+                "{deployment}: a VAE row declares `{name}`"
             );
         }
         let voxels = plan
             .values
             .iter()
-            .filter(|decl| matches!(decl.def, Def::Input(RuntimeInput::Voxels { .. })))
+            .filter(|decl| {
+                matches!(
+                    decl.def,
+                    Def::Input(RuntimeInput::Guest {
+                        axis: InputAxis::Voxel,
+                        ..
+                    })
+                )
+            })
             .count();
         assert_eq!(
             voxels,
-            if is_flagship(deployment) { 2 } else { 0 },
-            "{deployment}: a voxel port per VAE clip width, and none without a VAE"
+            if is_flagship(deployment) { 3 } else { 1 },
+            "{deployment}: the denoiser's latent, and a voxel input per VAE clip width"
         );
     }
 }
@@ -246,20 +248,25 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
         let plan = trace(deployment, Platform::Cuda);
         let classes = poem::resolve_classes(&plan)
             .unwrap_or_else(|why| panic!("{deployment}: a merge does not resolve: {why:?}"));
-        let facts = row(deployment).generative().expect("facts");
-        let _catalog = row(deployment);
-        let mut seen: Vec<((&str, Stream), usize)> = Vec::new();
-        for reading in &facts.readings {
-            for &stream in &reading.streams {
-                let request = Request::new(4, false)
-                    .on_stream(stream)
-                    .in_reading(&reading.name);
-                let w = plan.facts.word(&request);
-                let class = classes.class_of(w & classes.mask).unwrap_or_else(|| {
-                    panic!("{deployment}: `{}`/{stream:?} has no class", reading.name)
-                });
-                seen.push(((reading.name.as_str(), stream), class));
+        let mut lanes: Vec<(&str, Option<&str>, bool)> = vec![
+            ("denoise", Some("video"), false),
+            ("denoise", Some("context"), false),
+        ];
+        if is_flagship(deployment) {
+            lanes.push(("text", None, false));
+            for vae in ["vae.decode", "vae.encode"] {
+                lanes.push((vae, None, true));
+                lanes.push((vae, None, false));
             }
+        }
+        type Lane<'a> = (&'a str, Option<&'a str>, bool);
+        let mut seen: Vec<(Lane, usize)> = Vec::new();
+        for (reading, stream, fresh) in lanes {
+            let w = fresh_word(&plan, reading, stream, fresh);
+            let class = classes.class_of(w & classes.mask).unwrap_or_else(|| {
+                panic!("{deployment}: `{reading}`/{stream:?} (fresh {fresh}) has no class")
+            });
+            seen.push(((reading, stream, fresh), class));
         }
         let distinct: BTreeSet<usize> = seen.iter().map(|(_, class)| *class).collect();
         assert_eq!(
@@ -290,8 +297,8 @@ fn the_attentions_pair_as_the_architecture_says() {
                 other => panic!("{deployment}: a ragged CSR that is not an indptr: {other:?}"),
             }
         };
-        let video = word(&plan, denoise, Stream::Video);
-        let context = word(&plan, denoise, Stream::Context);
+        let video = word(&plan, denoise, Some("video"));
+        let context = word(&plan, denoise, Some("context"));
         let (mut self_paired, mut crossed, mut encoder) = (0usize, 0usize, 0usize);
         for node in &plan.nodes {
             let Operation::Attn(Attn::Ragged {
@@ -315,7 +322,7 @@ fn the_attentions_pair_as_the_architecture_says() {
                     assert_eq!(kind, "lane", "the encoder attends its own lane");
                     assert_eq!(q_indptr, kv_indptr);
                     let text = text.expect("only the flagship has an encoder");
-                    assert!(select.holds(word(&plan, text, Stream::Text)));
+                    assert!(select.holds(word(&plan, text, None)));
                     assert!(!select.holds(video));
                 }
                 RaggedMask::GroupBlockDiagonal => {
@@ -338,7 +345,7 @@ fn the_attentions_pair_as_the_architecture_says() {
                         });
                         assert!(spans.holds(video) && spans.holds(context));
                         if let Some(text) = text {
-                            assert!(!spans.holds(word(&plan, text, Stream::Text)));
+                            assert!(!spans.holds(word(&plan, text, None)));
                         }
                     }
                 }
@@ -425,77 +432,23 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
     for deployment in ROWS {
         let facts = row(deployment).generative().expect("facts");
         let d = dims(deployment);
-        for (at, reading) in facts.readings.iter().enumerate() {
-            assert_eq!(usize::from(reading.index), at, "{deployment}: dense from 0");
-        }
-        let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
+        let names = readings(&trace(deployment, Platform::Cuda));
         if is_flagship(deployment) {
-            assert_eq!(
-                names,
-                vec![
-                    "text",
-                    "denoise",
-                    "vae.decode.head",
-                    "vae.decode",
-                    "vae.encode.head",
-                    "vae.encode"
-                ]
-            );
-            let text = &facts.readings[0];
-            assert!(
-                text.takes_tokens && !text.has_kv,
-                "umT5 embeds ids and holds no kv"
-            );
-            assert_eq!(text.readout, ReadoutKind::Hidden);
-            assert_eq!(text.readout_width, model::TE_HIDDEN);
-            assert_eq!(text.streams, vec![Stream::Text]);
-            assert!(text.ports.is_empty());
+            assert_eq!(names, vec!["text", "denoise", "vae.decode", "vae.encode"]);
         } else {
             assert_eq!(names, vec!["denoise"]);
         }
-        let denoise = facts.readings.iter().find(|r| r.name == "denoise").unwrap();
-        assert!(!denoise.has_kv && !denoise.takes_tokens);
-        assert_eq!(denoise.streams, vec![Stream::Video, Stream::Context]);
         let latent = facts.latent.expect("a latent space");
-        assert_eq!(
-            (
-                latent.channels,
-                latent.patch_t,
-                latent.patch_h,
-                latent.patch_w
-            ),
-            (d.in_channels, 1, 2, 2)
-        );
+        assert_eq!(latent.channels, d.in_channels);
         assert_eq!(
             (latent.spatial_compression, latent.temporal_compression),
             (16, 4)
-        );
-        assert_eq!(
-            latent.channels * latent.patch_t * latent.patch_h * latent.patch_w,
-            d.patch_in()
         );
         let schedule = facts.schedule.as_ref().expect("a schedule");
         assert_eq!(schedule.kind, ScheduleKind::Flow);
         assert_eq!(schedule.shift, model::SHIFT_TI2V);
         assert_eq!(schedule.train_steps, model::TRAIN_STEPS);
         assert!(schedule.pinned_sigmas.is_empty(), "nothing is pinned");
-        assert!(facts.max_rows >= 4096);
-        crate::the_wan_2_rows_bake::validate(&facts);
-    }
-}
-
-fn validate(facts: &poem::generative::Generative) {
-    for reading in &facts.readings {
-        assert!(reading.readout_width > 0);
-        if !reading.takes_tokens {
-            assert!(
-                reading.ports.iter().any(|port| matches!(
-                    port.kind,
-                    PortKind::Latents | PortKind::Voxels | PortKind::Context
-                )),
-                "a token-less reading states its rows through a row port"
-            );
-        }
     }
 }
 

@@ -9,7 +9,10 @@ use eta_ir::op::{intrinsic_tags, tags};
 use crate::plan::{CompiledStage, Region};
 
 use super::METAL_M2_MAX_FUSED_CHANNELS;
-use super::intrinsics::{M2_LOGITS_BUFFER, fused_channel_ceiling, m2_intrinsic_buffer};
+use super::intrinsics::{
+    M2_INTRINSIC_TABLE_BUFFER, M2_LOGITS_BUFFER, M3_INTRINSIC_TABLE_BUFFER, addressed_slot,
+    fused_channel_ceiling, m2_intrinsic_buffer,
+};
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
 use super::validate::{
     grouped_intrinsics_bindable, intrinsics_bindable, library_region_valid, used_channel_slots,
@@ -22,26 +25,36 @@ fn value_ptr(value: u32) -> String {
     format!("scratch + offsets[{value}]")
 }
 
-fn intrinsic_slot_name(intr: u16) -> String {
-    if m2_intrinsic_buffer(intr) == Some(M2_LOGITS_BUFFER) {
-        return "logits".to_string();
+fn argument_name(at: usize) -> String {
+    match at {
+        M2_LOGITS_BUFFER => "logits".to_string(),
+        M2_INTRINSIC_TABLE_BUFFER => "intrinsic_at".to_string(),
+        _ => format!("intrinsic_{at}"),
     }
-    format!("intrinsic_{intr}")
 }
 
-fn extra_intrinsics(ops: &[OpView], region: &Region) -> Vec<u16> {
+fn extra_intrinsics(ops: &[OpView], region: &Region) -> Vec<usize> {
     let mut used = BTreeSet::new();
     for &node in &region.nodes {
         let Some(op) = ops.get(node.index()) else {
             continue;
         };
         if op.tag == tags::INTRINSIC_VAL
-            && m2_intrinsic_buffer(op.intr).is_some_and(|at| at != M2_LOGITS_BUFFER)
+            && let Some(at) = m2_intrinsic_buffer(op.intr).filter(|&at| at != M2_LOGITS_BUFFER)
         {
-            used.insert(op.intr);
+            used.insert(at);
         }
     }
     used.into_iter().collect()
+}
+
+pub(super) fn emit_intrinsic_table(source: &mut String, stage: &CompiledStage) {
+    let _ = writeln!(
+        source,
+        "  const device ulong* intrinsic_at = all_intrinsic_at + \
+         dispatch_lane * {}u;",
+        eta_ir::op::intrinsic_pitch(&stage.normalized.ops)
+    );
 }
 
 pub const METAL_M3_REGION_THREADS: u32 = 512;
@@ -97,12 +110,16 @@ pub fn emit_fused_region(
             8 + channel * 2
         );
     }
-    for &intr in &extra {
-        let at = m2_intrinsic_buffer(intr).expect("`extra_intrinsics` filters to bindable ids");
+    for &at in &extra {
+        let ty = if at == M2_INTRINSIC_TABLE_BUFFER {
+            "ulong"
+        } else {
+            "uchar"
+        };
         let _ = write!(
             source,
-            ",\n    const device uchar* {} [[buffer({at})]]",
-            intrinsic_slot_name(intr)
+            ",\n    const device {ty}* {} [[buffer({at})]]",
+            argument_name(at)
         );
     }
     source.push_str(",\n    uint gid [[thread_position_in_grid]]) {\n");
@@ -130,7 +147,16 @@ pub fn emit_fused_region(
             }
             slots.o0 = format!("pending_{}", op.chan);
         } else if op.tag == tags::INTRINSIC_VAL {
-            slots.a0 = intrinsic_slot_name(op.intr);
+            if let Some(slot) = addressed_slot(op.intr, op.imm) {
+                let _ = writeln!(
+                    source,
+                    "  if (intrinsic_at[{slot}] == 0ul) {{ m1_fault(status, \
+                     {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
+                );
+                slots.a0 = format!("reinterpret_cast<const device uchar*>(intrinsic_at[{slot}])");
+            } else if let Some(at) = m2_intrinsic_buffer(op.intr) {
+                slots.a0 = argument_name(at);
+            }
         }
         let _ = writeln!(
             source,
@@ -175,6 +201,10 @@ pub fn emit_grouped_fused_region(
     source.push_str("    const device uint* lane_indices [[buffer(8)]],\n");
     source.push_str("    const device M3RowMeta* all_row_meta [[buffer(9)]],\n");
     source.push_str("    const device uint* row_indices [[buffer(10)]],\n");
+    let _ = writeln!(
+        source,
+        "    const device ulong* all_intrinsic_at [[buffer({M3_INTRINSIC_TABLE_BUFFER})]],"
+    );
     source.push_str("    uint dispatch_lane [[threadgroup_position_in_grid]],\n");
     source.push_str("    uint m3_tid [[thread_position_in_threadgroup]],\n");
     source.push_str("    uint m3_threads [[threads_per_threadgroup]]) {\n");
@@ -225,6 +255,7 @@ pub fn emit_grouped_fused_region(
         "  const device bfloat* logits = \
          reinterpret_cast<const device bfloat*>(lane.logits_base);\n",
     );
+    emit_intrinsic_table(&mut source, stage);
     for channel in 0..channel_count {
         let _ = writeln!(
             source,
@@ -304,8 +335,6 @@ pub fn emit_grouped_fused_region(
                 && ops.get(n).is_some_and(|p| {
                     p.tag == tags::INTRINSIC_VAL
                         && (p.intr == intrinsic_tags::LOGITS
-                            || p.intr == intrinsic_tags::VELOCITY
-                            || p.intr == intrinsic_tags::HIDDEN
                             || p.intr == intrinsic_tags::MTP_LOGITS)
                 })
         });
@@ -350,19 +379,15 @@ pub fn emit_grouped_fused_region(
             source.push_str(BARRIER);
             continue;
         }
-        if op.tag == tags::INTRINSIC_VAL && op.intr == intrinsic_tags::PIXELS {
-            emit_pixels_gather(&mut source, base, &slots.o0, "m3_tid", "m3_threads");
+        if op.tag == tags::INTRINSIC_VAL
+            && let Some(slot) = addressed_slot(op.intr, op.imm)
+        {
+            emit_addressed_gather(&mut source, base, slot, &slots.o0, "m3_tid", "m3_threads");
             source.push_str(BARRIER);
             continue;
         }
         if op.tag == tags::INTRINSIC_VAL
-            && matches!(
-                op.intr,
-                intrinsic_tags::LOGITS
-                    | intrinsic_tags::VELOCITY
-                    | intrinsic_tags::HIDDEN
-                    | intrinsic_tags::MTP_LOGITS
-            )
+            && matches!(op.intr, intrinsic_tags::LOGITS | intrinsic_tags::MTP_LOGITS)
         {
             emit_logits_gather(
                 &mut source,
@@ -493,38 +518,43 @@ pub(super) fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o
     source.push_str("  }\n");
 }
 
-pub(super) fn emit_pixels_gather(
+/// Each lane's slot holds the address of its first row, on its class's plane.
+pub(super) fn emit_addressed_gather(
     source: &mut String,
     base: u32,
+    slot: u32,
     o0: &str,
     begin: &str,
     step: &str,
 ) {
     source.push_str("  {\n");
-    let _ = writeln!(source, "    const uint pixel_begin = {begin};");
-    let _ = writeln!(source, "    const uint pixel_step = {step};");
+    let _ = writeln!(source, "    const uint addressed_begin = {begin};");
+    let _ = writeln!(source, "    const uint addressed_step = {step};");
     let _ = writeln!(
         source,
-        "    const M1ValueDesc pixel_desc = descriptors[{base}];"
+        "    const M1ValueDesc addressed_desc = descriptors[{base}];"
     );
-    source.push_str("    const uint pixel_width = pixel_desc.last;\n");
     let _ = writeln!(
         source,
-        "    if (pixel_width == 0u || pixel_desc.len % pixel_width != 0u) \
+        "    const ulong addressed_at = intrinsic_at[{slot}];"
+    );
+    let _ = writeln!(
+        source,
+        "    if (addressed_at == 0ul) \
          {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
     );
-    let _ = writeln!(
-        source,
-        "    const device bfloat* pixel_src = \
-         reinterpret_cast<const device bfloat*>({});",
-        intrinsic_slot_name(intrinsic_tags::PIXELS)
+    source.push_str(
+        "    const device bfloat* addressed_src = \
+         reinterpret_cast<const device bfloat*>(addressed_at);\n",
     );
     let _ = writeln!(
         source,
-        "    device float* pixel_out = reinterpret_cast<device float*>({o0});"
+        "    device float* addressed_out = reinterpret_cast<device float*>({o0});"
     );
-    source.push_str("    for (uint i = pixel_begin; i < pixel_desc.len; i += pixel_step) {\n");
-    source.push_str("      pixel_out[i] = float(pixel_src[i]);\n");
+    source.push_str(
+        "    for (uint i = addressed_begin; i < addressed_desc.len; i += addressed_step) {\n",
+    );
+    source.push_str("      addressed_out[i] = float(addressed_src[i]);\n");
     source.push_str("    }\n");
     source.push_str("  }\n");
 }

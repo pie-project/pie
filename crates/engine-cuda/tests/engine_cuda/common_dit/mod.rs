@@ -8,9 +8,7 @@ use checkpoint::file::emit::{self, Object};
 use checkpoint::serving::Stamp;
 use engine::Engine;
 use engine::channel::ChannelRegistration;
-use engine::fire::{
-    Attachment, Boundary, FrameSubmission, Lane, LaneStream, PortFeed, PortKind, Readout, Step,
-};
+use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Loaded, Residency};
 use engine::program::{InstanceBinding, ProgramRegistration};
 use engine::{ChannelId, InstanceId, ProgramId};
@@ -18,14 +16,14 @@ use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
+use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
-use eta_ir::validate::bind;
 use poem::fact;
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm,
-    Stream, Trace, Value, Weight, ops, seam, trace_hybrid,
+    Trace, Value, Weight, ops, seam, trace_hybrid,
 };
+use poem_ir::InputAxis;
 
 pub const WIDTH: u32 = 32;
 pub const HEAD_DIM: u32 = 64;
@@ -41,17 +39,21 @@ impl ForwardHybrid for DoubleBlock {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
+        inputs.recorder().declare_switch(
+            "stream",
+            &["text", "image", "video", "audio", "context", "reference"],
+        );
         let (txt, img) = (
-            inputs.on(fact::stream(Stream::Text)),
-            inputs.on(!fact::stream(Stream::Text)),
+            inputs.on(fact::switch_is("stream", "text")),
+            inputs.on(!fact::switch_is("stream", "text")),
         );
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
-        let x_txt = txt.latents(0, WIDTH, Dtype::Bf16);
-        let x_img = img.latents(1, WIDTH, Dtype::Bf16);
-        let t = inputs.lane_vector(0, 1);
-        let pos = inputs.axis_positions(0, 2);
+        let x_txt = txt.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
+        let x_img = img.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
+        let t = inputs.input("timestep", Dtype::F32, InputAxis::Lane, 1, None);
+        let pos = inputs.input("positions", Dtype::F32, InputAxis::Row, 2, None);
         let emb = ops::elemwise::sinusoid(&t, FREQ, THETA, true, 1.0);
         let emb = ops::elemwise::silu(&emb);
         let m = ops::linear::matmul(&emb, &w("ada", 2 * WIDTH, FREQ));
@@ -108,8 +110,8 @@ impl ForwardHybrid for DoubleBlock {
         );
         let o = ops::gather::unpack_rows(&o, &perm);
         let (o_txt, o_img) = (
-            o.on(fact::stream(Stream::Text)),
-            o.on(!fact::stream(Stream::Text)),
+            o.on(fact::switch_is("stream", "text")),
+            o.on(!fact::switch_is("stream", "text")),
         );
         let y_txt = ops::linear::matmul(&o_txt, &w("txt.o", WIDTH, HEAD_DIM));
         let y_img = ops::linear::matmul(&o_img, &w("img.o", WIDTH, HEAD_DIM));
@@ -385,6 +387,7 @@ pub fn epilogue(rows: u32) -> TraceContainer {
         Op::ChanTake(0),
         Op::IntrinsicVal {
             intr: IntrinsicId::Velocity,
+            lane: 0,
             shape: Shape::matrix(rows, WIDTH),
             dtype: EtaDtype::F32,
         },
@@ -405,6 +408,7 @@ pub fn epilogue(rows: u32) -> TraceContainer {
             ops,
         }],
         externs: Vec::new(),
+        inputs: Vec::new(),
     }
 }
 
@@ -422,6 +426,8 @@ pub struct Rig {
     pub loaded: Loaded,
     pub facts: poem_ir::Facts,
     pub programs: BTreeMap<u32, ProgramId>,
+    /// The plan's guest inputs by name, in id order.
+    pub inputs: Vec<String>,
     next_channel: u64,
     _dir: tempfile::TempDir,
 }
@@ -457,6 +463,7 @@ impl Rig {
         ));
         let mut engine = engine_cuda::open(boot, contract_for).expect("the engine opens");
         let facts = plan.facts.clone();
+        let inputs = plan.inputs.iter().map(|input| input.name.clone()).collect();
         let loaded = engine
             .load(LoadRequest {
                 trace: plan,
@@ -485,13 +492,19 @@ impl Rig {
             loaded,
             facts,
             programs: BTreeMap::new(),
+            inputs,
             next_channel: 1,
             _dir: dir,
         }
     }
 
-    pub fn profile(&self) -> &ModelProfile {
-        &self.loaded.caps.profile
+    pub fn input(&self, name: &str) -> u32 {
+        let id = self
+            .inputs
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("the plan reads no input `{name}`"));
+        u32::try_from(id).expect("fewer than 2^32 inputs")
     }
 
     fn program(&mut self, rows: u32) -> ProgramId {
@@ -503,8 +516,19 @@ impl Rig {
         id
     }
 
+    pub fn reads_out(&self, kind: poem_ir::ReadoutKind) -> Option<u32> {
+        self.loaded
+            .caps
+            .classes
+            .classes
+            .iter()
+            .filter_map(|class| class.readout)
+            .find(|readout| readout.kind == kind)
+            .map(|readout| readout.width)
+    }
+
     pub fn register(&mut self, container: TraceContainer, salt: u64) -> ProgramId {
-        let bound = bind(container, self.profile().clone()).expect("the epilogue binds");
+        let bound = crate::bound::loaded(container, &self.loaded.caps).expect("the epilogue binds");
         let stages = compile_bound(&bound);
         let launch = eta_compiler::codegen::launch::build(&bound, &stages);
         let backend =
@@ -600,41 +624,29 @@ impl Rig {
     }
 }
 
-pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, stream: LaneStream, group: u32) -> Lane {
-    let port = match stream {
-        LaneStream::Text => 0,
-        _ => 1,
-    };
+/// A lane feeding the row inputs off the latent cell, `timestep` and `positions` off their own.
+pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, stream: &str, group: u32) -> Lane {
     Lane {
         slot,
         word: rig
             .facts
-            .word(&Request::new(handles.rows, false).on_stream(match stream {
-                LaneStream::Text => Stream::Text,
-                _ => Stream::Image,
-            })),
+            .word(&Request::new(handles.rows, false).switched("stream", stream)),
         tokens: vec![0; handles.rows as usize],
         readout: Readout::Rows((0..handles.rows).collect()),
-        stream,
         group: Some(group),
-        reading: 0,
-        ports: vec![
-            PortFeed {
-                kind: PortKind::Latents,
-                port,
-                channel: handles.latent,
-            },
-            PortFeed {
-                kind: PortKind::LaneVector,
-                port: 0,
-                channel: handles.timestep,
-            },
-            PortFeed {
-                kind: PortKind::AxisPositions,
-                port: 0,
-                channel: handles.positions,
-            },
-        ],
+        inputs: rig
+            .inputs
+            .iter()
+            .map(|name| InputFeed {
+                id: rig.input(name),
+                channel: match name.as_str() {
+                    "latents" | "context" => handles.latent,
+                    "timestep" => handles.timestep,
+                    "positions" => handles.positions,
+                    other => panic!("the fixture has no cell for input `{other}`"),
+                },
+            })
+            .collect(),
         ..Lane::default()
     }
 }
@@ -642,8 +654,9 @@ pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, stream: LaneStream, gro
 pub fn attach(lane: u32, handles: &LaneHandles) -> Attachment {
     Attachment {
         lane,
+        lanes: 1,
         instance: handles.instance,
-        at: Boundary::Epilogue,
+        adapter_only: false,
     }
 }
 

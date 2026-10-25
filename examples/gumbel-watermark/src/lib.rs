@@ -14,8 +14,8 @@
 //!
 //! and that rule is the Gumbel-max trick in disguise. With `E_v = -log r_v`,
 //! maximizing `r_v^(1/p_v)` means minimizing `E_v / p_v`, the exponential race
-//! whose winner is distributed exactly as `p`. Equivalently `argmax_v (logit_v
-//! + G_v)` for `G_v = -log(-log r_v)`. So for **any** fixed key the marginal
+//! whose winner is distributed exactly as `p`. Equivalently `argmax_v (logit_v +
+//! G_v)` for `G_v = -log(-log r_v)`. So for **any** fixed key the marginal
 //! distribution of `x_t` is the model's own — the watermark is carried in the
 //! *correlation* between the text and the key, not in a shifted distribution.
 //!

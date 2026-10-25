@@ -1,51 +1,4 @@
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum Stream {
-    #[default]
-    Text,
-    Image,
-    Video,
-    Audio,
-    Context,
-    Reference,
-}
-
-impl Stream {
-    pub const ALL: [Stream; 6] = [
-        Stream::Text,
-        Stream::Image,
-        Stream::Video,
-        Stream::Audio,
-        Stream::Context,
-        Stream::Reference,
-    ];
-
-    #[must_use]
-    pub fn code(self) -> u8 {
-        self as u8
-    }
-
-    #[must_use]
-    pub fn from_code(code: u8) -> Option<Stream> {
-        Stream::ALL.get(usize::from(code)).copied()
-    }
-
-    #[must_use]
-    pub fn name(self) -> &'static str {
-        match self {
-            Stream::Text => "text",
-            Stream::Image => "image",
-            Stream::Video => "video",
-            Stream::Audio => "audio",
-            Stream::Context => "context",
-            Stream::Reference => "reference",
-        }
-    }
-}
-
-/// What the runtime knows of one lane of a fire: the buffers it carries,
-/// from which the builtin facts are derived, and the custom facts its
-/// inferlet set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Request {
     query_len: u32,
     custom_mask: bool,
@@ -53,80 +6,31 @@ pub struct Request {
     drafts: bool,
     captures_scores: bool,
     media: bool,
-    block_draft: bool,
-    denoise: bool,
     encode: bool,
-    stream: Stream,
-    reading: Option<Name>,
+    fresh: bool,
+    /// One left unset takes its declared default.
+    switches: Vec<(String, String)>,
 }
 
 impl Request {
-    /// The flag an inferlet sets on rows whose drafts it reads.
-    pub const DRAFTS: &'static str = "drafts";
-    /// The flag an inferlet sets on the rows of a drafted block.
-    pub const BLOCK_DRAFT: &'static str = "block_draft";
-    /// The flag an inferlet sets on rows whose attention scores it reads.
-    pub const SCORES: &'static str = "scores";
-    /// The flag an inferlet sets on rows that attend both ways.
-    pub const BIDIRECTIONAL: &'static str = "bidirectional";
-    /// The flag a backend sets on the rows of a prompt a causal
-    /// encoder-decoder's decoder skips (bounded replay): only its encoder
-    /// reads them.
-    pub const ENCODE: &'static str = "encode";
-    /// The choice of the stream a lane's rows join.
-    pub const STREAM: &'static str = "stream";
-    /// The choice of the reading a pass runs.
-    pub const READING: &'static str = "reading";
-
-    /// The custom flags a request carries.
-    pub const FLAGS: [&'static str; 5] = [
-        Self::DRAFTS,
-        Self::BLOCK_DRAFT,
-        Self::SCORES,
-        Self::BIDIRECTIONAL,
-        Self::ENCODE,
-    ];
-    /// The custom choices a request carries.
-    pub const CHOICES: [&'static str; 2] = [Self::STREAM, Self::READING];
-
     #[must_use]
     pub fn new(query_len: u32, custom_mask: bool) -> Request {
         Request {
             query_len,
             custom_mask,
-            adapter: false,
-            drafts: false,
-            captures_scores: false,
-            media: false,
-            block_draft: false,
-            denoise: false,
-            encode: false,
-            stream: Stream::Text,
-            reading: None,
+            ..Request::default()
         }
-    }
-
-    #[must_use]
-    pub fn on_stream(mut self, stream: Stream) -> Request {
-        self.stream = stream;
-        self
-    }
-
-    #[must_use]
-    pub fn in_reading(mut self, reading: &str) -> Request {
-        self.reading = Some(Name::of(reading));
-        self
-    }
-
-    #[must_use]
-    pub fn denoising(mut self, denoise: bool) -> Request {
-        self.denoise = denoise;
-        self
     }
 
     #[must_use]
     pub fn encoding(mut self, encode: bool) -> Request {
         self.encode = encode;
+        self
+    }
+
+    #[must_use]
+    pub fn starting(mut self, fresh: bool) -> Request {
+        self.fresh = fresh;
         self
     }
 
@@ -143,12 +47,6 @@ impl Request {
     }
 
     #[must_use]
-    pub fn drafting_a_block(mut self, block_draft: bool) -> Request {
-        self.block_draft = block_draft;
-        self
-    }
-
-    #[must_use]
     pub fn capturing_scores(mut self, captures_scores: bool) -> Request {
         self.captures_scores = captures_scores;
         self
@@ -157,6 +55,15 @@ impl Request {
     #[must_use]
     pub fn with_media(mut self, media: bool) -> Request {
         self.media = media;
+        self
+    }
+
+    #[must_use]
+    pub fn switched(mut self, name: &str, value: &str) -> Request {
+        match self.switches.iter_mut().find(|(n, _)| n == name) {
+            Some((_, v)) => *v = value.to_string(),
+            None => self.switches.push((name.to_string(), value.to_string())),
+        }
         self
     }
 
@@ -171,11 +78,6 @@ impl Request {
     }
 
     #[must_use]
-    pub fn denoise(&self) -> bool {
-        self.denoise
-    }
-
-    #[must_use]
     pub fn has_adapter(&self) -> bool {
         self.adapter
     }
@@ -183,11 +85,6 @@ impl Request {
     #[must_use]
     pub fn drafts(&self) -> bool {
         self.drafts
-    }
-
-    #[must_use]
-    pub fn drafts_a_block(&self) -> bool {
-        self.block_draft
     }
 
     #[must_use]
@@ -201,92 +98,67 @@ impl Request {
     }
 
     #[must_use]
-    pub fn stream(&self) -> Stream {
-        self.stream
+    pub fn encodes(&self) -> bool {
+        self.encode
     }
 
     #[must_use]
-    pub fn reading(&self) -> Option<&str> {
-        self.reading.as_ref().map(Name::as_str)
+    pub fn fresh(&self) -> bool {
+        self.fresh
     }
 
-    /// The custom flag `name`, one of [`Request::FLAGS`].
     #[must_use]
-    pub fn flag(&self, name: &str) -> bool {
-        match name {
-            Self::DRAFTS => self.drafts,
-            Self::BLOCK_DRAFT => self.block_draft,
-            Self::SCORES => self.captures_scores,
-            Self::BIDIRECTIONAL => self.denoise,
-            Self::ENCODE => self.encode,
-            _ => panic!("`{name}` is no flag a request carries"),
-        }
+    pub fn switch(&self, name: &str) -> Option<&str> {
+        self.switches
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
     }
 
-    /// The value the custom choice `name`, one of [`Request::CHOICES`], is
-    /// set to.
     #[must_use]
-    pub fn choice(&self, name: &str) -> Option<&str> {
-        match name {
-            Self::STREAM => Some(self.stream.name()),
-            Self::READING => self.reading(),
-            _ => panic!("`{name}` is no choice a request carries"),
-        }
-    }
-}
-
-/// A reading's name, held inline so a request stays `Copy`.
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Name {
-    len: u8,
-    bytes: [u8; Name::MAX],
-}
-
-impl Name {
-    const MAX: usize = 31;
-
-    fn of(name: &str) -> Name {
-        assert!(
-            name.len() <= Name::MAX,
-            "a reading's name is at most {} bytes, and `{name}` is longer",
-            Name::MAX
-        );
-        let mut bytes = [0; Name::MAX];
-        bytes[..name.len()].copy_from_slice(name.as_bytes());
-        Name {
-            len: name.len() as u8,
-            bytes,
-        }
+    pub fn switches(&self) -> &[(String, String)] {
+        &self.switches
     }
 
-    fn as_str(&self) -> &str {
-        std::str::from_utf8(&self.bytes[..usize::from(self.len)])
-            .expect("a name is copied from a str")
+    /// Runtime switches on (a multi-token query counting as one) plus guest switches set.
+    #[must_use]
+    pub fn departures(&self) -> usize {
+        [
+            self.query_len != 1,
+            self.custom_mask,
+            self.adapter,
+            self.drafts,
+            self.captures_scores,
+            self.media,
+            self.encode,
+            self.fresh,
+        ]
+        .into_iter()
+        .filter(|&on| on)
+        .count()
+            + self.switches.len()
     }
-}
 
-impl std::fmt::Debug for Name {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.as_str().fmt(f)
+    /// Whether only its query length sets this request apart.
+    #[must_use]
+    pub fn plain(&self) -> bool {
+        self.departures() == usize::from(self.query_len != 1)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Request, Stream};
+    use super::Request;
 
     #[test]
-    fn a_request_defaults_to_the_text_stream_and_the_default_reading() {
+    fn a_request_holds_the_last_value_of_each_switch() {
         let r = Request::new(4, false);
-        assert_eq!(r.stream(), Stream::Text);
-        assert_eq!(r.reading(), None);
-        let r = r.on_stream(Stream::Audio).in_reading("denoise");
-        assert_eq!(r.stream(), Stream::Audio);
-        assert_eq!(r.reading(), Some("denoise"));
-        assert_eq!(r.choice("stream"), Some("audio"));
-        for stream in Stream::ALL {
-            assert_eq!(Stream::from_code(stream.code()), Some(stream));
-        }
-        assert_eq!(Stream::from_code(6), None);
+        assert_eq!(r.switch("stream"), None);
+        assert!(r.plain());
+        let r = r.switched("stream", "audio").switched("stream", "video");
+        assert_eq!(r.switch("stream"), Some("video"));
+        assert_eq!(r.switches().len(), 1);
+        assert!(!r.plain());
+        assert_eq!(r.departures(), 2);
     }
 }

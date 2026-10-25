@@ -1,6 +1,6 @@
 use dtype::Dtype;
 
-use crate::encode::{Arg, Ctx, Fire, Grid, refuse};
+use crate::encode::{Arg, Ctx, Fire, Grid, refuse, stated};
 use crate::error::Error;
 use crate::tensor::Tensor;
 
@@ -31,6 +31,7 @@ fn stamp(channels: u32) -> Result<&'static str, Error> {
     }
 }
 
+/// `base`: the rectangles' row 0 in `grid`'s fire-wide rows.
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
     ctx: &Ctx<'_>,
@@ -41,6 +42,7 @@ pub fn attention(
     segment: Segment,
     sm_scale: f32,
     y: Tensor,
+    base: u32,
 ) -> Result<(), Error> {
     for t in [q, k, v, y] {
         if t.dtype != Dtype::Bf16 {
@@ -100,6 +102,7 @@ pub fn attention(
             clips.arg(),
             frames.arg(),
             sm_scale.arg(),
+            stated(OP, base)?.arg(),
         ],
     )
 }

@@ -1,6 +1,6 @@
 //! eta-dsl's integration tests, one binary: each module was a test file.
 
-mod a_float_lane_program_traces_from_its_ports;
+mod a_float_lane_program_traces_from_its_inputs;
 mod authoring_errors;
 mod beam_search;
 mod inferlet_goldens;

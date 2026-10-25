@@ -752,9 +752,9 @@ export function nucleusSample(logits: Operand, topP: Operand, state: Operand): T
 
 // -- intrinsic leaf / internal helpers ------------------------------------------
 
-export function intrinsicVal(intr: Intrinsic, shape: Shape, dt: Dtype): Tensor {
+export function intrinsicVal(intr: Intrinsic, shape: Shape, dt: Dtype, lane = 0): Tensor {
   const ty = vt(shape, dt);
-  return Tensor.node(emit(Op.intrinsicVal(intr, shape, dt), [ty]), ty);
+  return Tensor.node(emit(Op.intrinsicVal(intr, shape, dt, lane), [ty]), ty);
 }
 
 /** Reshape a value id to `target` if it differs (a `put` fitting a scalar into a `[1]` cell). */

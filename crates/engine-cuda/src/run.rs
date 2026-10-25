@@ -324,16 +324,13 @@ pub struct FireBindings {
     pub token_grid: Option<Tensor>,
     pub voxels: Option<Tensor>,
     pub clip_slots: Option<Tensor>,
-    pub self_cond_rows: Option<Tensor>,
-    pub self_cond_weights: Option<Tensor>,
 
     pub lane_of_row: Tensor,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
-    /// The fire's attention class table (`[count * count] u8`) when a lane
-    /// stated classes: group-packed `attention.ragged` reads it.
-    pub class_table: Option<(Tensor, u32)>,
-    pub ports: Vec<PortBinding>,
+    
+    pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
+    pub inputs: Vec<InputBinding>,
 
     pub geometry: Vec<CacheGeometry>,
 
@@ -352,9 +349,8 @@ pub struct FireBindings {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct PortBinding {
-    pub kind: engine::fire::PortKind,
-    pub port: u8,
+pub struct InputBinding {
+    pub id: u32,
     pub tensor: Tensor,
 }
 
@@ -1400,6 +1396,17 @@ impl<'c> Run<'c> {
         self.window().span().rows
     }
 
+    /// A non-causal prefill stating no mask reads these: its classes stage every key.
+    pub(crate) fn mask_bits(&self) -> Tensor {
+        self.fire
+            .geometry
+            .first()
+            .and_then(|seat| seat.mask)
+            .unwrap_or_else(|| {
+                panic!("a prefill that is not causal reads mask bits this fire left unbound")
+            })
+    }
+
     pub(crate) fn mask_indptr(&self) -> Option<Tensor> {
         if self.plane_base() {
             return self.fire.tables.mask_indptr;
@@ -1576,17 +1583,14 @@ impl<'c> Run<'c> {
             })
     }
 
-    fn port(&self, at: usize, kind: engine::fire::PortKind, port: u8) -> Tensor {
+    fn guest(&self, at: usize, id: u32) -> Tensor {
         self.fire
-            .ports
+            .inputs
             .iter()
-            .find(|bound| bound.kind == kind && bound.port == port)
+            .find(|bound| bound.id == id)
             .map(|bound| bound.tensor)
             .unwrap_or_else(|| {
-                panic!(
-                    "value {at} reads {kind:?} port {port}, which this load carved no \
-                     rectangle for"
-                )
+                panic!("value {at} reads guest input {id}, which this load carved no rectangle for")
             })
     }
 
@@ -1656,8 +1660,35 @@ impl<'c> Run<'c> {
         self.whole(id)
     }
 
-    pub(crate) fn class_table(&self) -> Option<(Tensor, u32)> {
-        self.fire.class_table
+    /// The fire row `tensor(id)`'s row 0 stands at; fire-wide grids add it back.
+    fn row_base(&self, id: ValueId) -> u32 {
+        let (cut, whole) = (self.tensor(id), self.whole(id));
+        let row = cut.dtype.row_bytes(cut.width).unwrap_or(0);
+        if row == 0 || cut.ptr < whole.ptr {
+            return 0;
+        }
+        u32::try_from((cut.ptr - whole.ptr) / row).unwrap_or(0)
+    }
+
+    /// Fire-wide grids address `rows` from [`Self::row_base`]; op-derived grids from 0.
+    pub(crate) fn grid_base(&self, grid: ValueId, rows: ValueId) -> u32 {
+        match self.values[grid.0 as usize].def {
+            Def::Input(RuntimeInput::Grid | RuntimeInput::TokenGrid { .. }) => self.row_base(rows),
+            _ => 0,
+        }
+    }
+
+    
+    pub(crate) fn group_mask(
+        &self,
+        q: poem_ir::Selection,
+        kv: poem_ir::Selection,
+    ) -> Option<crate::inputs::GroupMaskHandles> {
+        self.fire
+            .group_masks
+            .iter()
+            .find(|mask| mask.q == q && mask.kv == kv)
+            .copied()
     }
 
     fn whole(&self, id: ValueId) -> Tensor {
@@ -1700,22 +1731,6 @@ impl<'c> Run<'c> {
             Def::Input(RuntimeInput::ImageGrids) => self.fire.patch_grids.unwrap_or_else(|| {
                 panic!("value {at} reads this fire's image grids, which no lane of it submitted")
             }),
-            Def::Input(RuntimeInput::SelfCondRows) => {
-                self.fire.self_cond_rows.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads this fire's self-conditioning taps, which this load \
-                         reserved no seat for"
-                    )
-                })
-            }
-            Def::Input(RuntimeInput::SelfCondWeights) => {
-                self.fire.self_cond_weights.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads this fire's self-conditioning weights, which this \
-                         load reserved no seat for"
-                    )
-                })
-            }
             Def::Input(RuntimeInput::PatchPositions) => {
                 self.fire.patch_positions.unwrap_or_else(|| {
                     panic!(
@@ -1743,33 +1758,26 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            Def::Input(RuntimeInput::Voxels { channels, .. }) => {
-                let port = self.fire.voxels.unwrap_or_else(|| {
-                    panic!("value {at} reads this fire's voxel port, which no lane of it fed")
+            Def::Input(RuntimeInput::Guest {
+                axis: poem_ir::InputAxis::Voxel,
+                width,
+                ..
+            }) => {
+                let fed = self.fire.voxels.unwrap_or_else(|| {
+                    panic!("value {at} reads this fire's voxel input, which no lane of it fed")
                 });
                 assert_eq!(
-                    port.width, *channels,
-                    "value {at} reads a {channels}-wide voxel port and this fire fed a {}-wide \
-                     one: the clips ran in another reading's class",
-                    port.width
+                    fed.width, *width,
+                    "value {at} reads a {width}-wide voxel input and this fire fed a {}-wide \
+                     one: the clips ran in another class",
+                    fed.width
                 );
-                port
+                fed
             }
             Def::Input(RuntimeInput::RowPermutation { select }) => {
                 self.packing(at, *select).permutation
             }
-            Def::Input(RuntimeInput::Latents { port, .. }) => {
-                self.port(at, engine::fire::PortKind::Latents, *port)
-            }
-            Def::Input(RuntimeInput::LaneVector { port, .. }) => {
-                self.port(at, engine::fire::PortKind::LaneVector, *port)
-            }
-            Def::Input(RuntimeInput::Context { port, .. }) => {
-                self.port(at, engine::fire::PortKind::Context, *port)
-            }
-            Def::Input(RuntimeInput::AxisPositions { port, .. }) => {
-                self.port(at, engine::fire::PortKind::AxisPositions, *port)
-            }
+            Def::Input(RuntimeInput::Guest { id, .. }) => self.guest(at, *id),
             Def::Input(RuntimeInput::Geometry { space, kind }) => {
                 match kind {
                     GeomKind::RequestOfToken => return self.fire.lane_of_row,
@@ -1786,9 +1794,6 @@ impl<'c> Run<'c> {
                     GeomKind::LaneIndptr { select } => {
                         return self.packing(at, *select).lane_indptr;
                     }
-                    GeomKind::ReferenceTag { select } => {
-                        return self.packing(at, *select).reference_tag;
-                    }
                     _ => {}
                 }
                 let seat = self.geometry(at, *space);
@@ -1804,8 +1809,7 @@ impl<'c> Run<'c> {
                     GeomKind::WriteOffset => seat.write_offset,
                     GeomKind::GroupOfLane
                     | GeomKind::GroupIndptr { .. }
-                    | GeomKind::LaneIndptr { .. }
-                    | GeomKind::ReferenceTag { .. } => unreachable!("the D2 tables return early"),
+                    | GeomKind::LaneIndptr { .. } => unreachable!("the D2 tables return early"),
                 };
                 bound.unwrap_or_else(|| {
                     panic!(
@@ -2148,8 +2152,14 @@ impl<'c> Run<'c> {
         skip(handle, window.row_offset, window.rows)
     }
 
+    /// Cut to this window's clips, indexed as its grids index lanes.
     pub(crate) fn clip_slots(&self) -> Option<Tensor> {
-        self.fire.clip_slots
+        let slots = self.fire.clip_slots?;
+        if self.window().gathered.is_some() {
+            return Some(slots);
+        }
+        let span = self.window().on(poem_ir::RowAxis::Voxels);
+        Some(skip(slots, span.lane_offset, span.lanes))
     }
 
     pub(crate) fn recurrent(&self, id: ValueId) -> RecurrentPool {
