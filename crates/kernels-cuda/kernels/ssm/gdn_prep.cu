@@ -95,6 +95,22 @@ __global__ void gdn_prep_qk_norm(
     }
 }
 
+// Head `h`'s `[g_log | beta]` pair from its `[b | a]` row.
+template <class T>
+__device__ __forceinline__ void ba_gates_of(
+    const T* __restrict__ row, const float* __restrict__ A_log,
+    const T* __restrict__ dt_bias, float* __restrict__ out, int h, int V_h)
+{
+    const float bv = Elem<T>::to_f32(row[h]);
+    const float av = Elem<T>::to_f32(row[V_h + h]);
+
+    const float z = av + Elem<T>::to_f32(dt_bias[h]);
+    const float sp = (z > 20.f) ? z : log1pf(__expf(z));
+
+    out[h] = -__expf(A_log[h]) * sp;
+    out[V_h + h] = 1.f / (1.f + __expf(-bv));
+}
+
 template <class T>
 __global__ void gdn_prep_ba_gates(
     const T* __restrict__ ba,
@@ -112,16 +128,55 @@ __global__ void gdn_prep_ba_gates(
     const int h = blockIdx.y * blockDim.x + threadIdx.x;
     if (t >= N || h >= V_h) return;
 
-    const T* row = ba + (long long)t_row * 2 * V_h;
-    const float bv = Elem<T>::to_f32(row[h]);
-    const float av = Elem<T>::to_f32(row[V_h + h]);
+    ba_gates_of(ba + (long long)t_row * 2 * V_h, A_log, dt_bias,
+                gates + (long long)t_row * 2 * V_h, h, V_h);
+}
 
-    const float z = av + Elem<T>::to_f32(dt_bias[h]);
-    const float sp = (z > 20.f) ? z : log1pf(__expf(z));
+// The gate prep over an extended run, its `[b | a]` read in place: row `e`
+// replays page token `replay[e]` of `pages` where that is not negative, else
+// reads the fire's row `back[e] - back_skip` of `ba` (no row where both are
+// negative). Every row lands in `gates_ext` at `e`, and a row the fire owns
+// in `gates` at its own row too.
+template <class T>
+__global__ void gdn_prep_ba_gates_run(
+    const T* __restrict__ ba,
+    const T* __restrict__ pages,
+    long long page_per_slot,
+    long long page_at,
+    int page_tokens,
+    const i32* __restrict__ replay,
+    const i32* __restrict__ back,
+    int back_skip,
+    const float* __restrict__ A_log,
+    const T* __restrict__ dt_bias,
+    float* __restrict__ gates_ext,
+    float* __restrict__ gates,
+    int N, int V_h,
+    const u32* __restrict__ win)
+{
+    const int e = blockIdx.x;
+    if (win != nullptr && e >= static_cast<int>(win[0])) return;
+    const int h = blockIdx.y * blockDim.x + threadIdx.x;
+    if (e >= N || h >= V_h) return;
 
-    float* out = gates + (long long)t_row * 2 * V_h;
-    out[h] = -__expf(A_log[h]) * sp;
-    out[V_h + h] = 1.f / (1.f + __expf(-bv));
+    const T* row;
+    int own = -1;
+    if (replay[e] >= 0) {
+        const long long g = replay[e];
+        row = pages + (g / page_tokens) * page_per_slot + page_at + (g % page_tokens) * 2 * V_h;
+    } else if (back[e] >= 0) {
+        own = back[e] - back_skip;
+        row = ba + (long long)own * 2 * V_h;
+    } else {
+        return;
+    }
+    float* out = gates_ext + (long long)e * 2 * V_h;
+    ba_gates_of(row, A_log, dt_bias, out, h, V_h);
+    if (own >= 0) {
+        float* mine = gates + (long long)own * 2 * V_h;
+        mine[h] = out[h];
+        mine[V_h + h] = out[V_h + h];
+    }
 }
 
 template <class T, int BLOCK>

@@ -169,3 +169,61 @@ impl Delta {
         Ok(staged)
     }
 }
+
+/// The gate prep over an extended run, its `[b | a]` read in place
+/// (`RunRows`): every row's gates land in `gates_ext`, and the fire's own
+/// rows' in `gates` too.
+pub fn gdn_gates_run(
+    ctx: &Ctx,
+    ba: Tensor,
+    run: RunRows,
+    dt_bias: Tensor,
+    a_log: Tensor,
+    gates_ext: &mut Tensor,
+    gates: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.gdn_gates_run";
+    dtype_dispatch!(OP, ba.dtype, { Bf16 => () });
+    debug_assert_eq!(a_log.dtype, Dtype::F32, "`{OP}` reads an f32 decay bank");
+    debug_assert_eq!(gates_ext.dtype, Dtype::F32, "`{OP}` lands an f32 decay row");
+    if ba.width == 0 || !ba.width.is_multiple_of(2) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the {}-wide `[b | a]` projection does not halve into value heads",
+                ba.width
+            ),
+        ));
+    }
+    let v_heads = ba.width / 2;
+    let (per_slot, at, page_tokens) = run.paged(OP, ba.width)?;
+    let rows = nonzero(OP, "rows", gates_ext.rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            GDN_PREP,
+            "::pie::ssm::gdn_prep_ba_gates_run<::pie::bf16>",
+        ))
+        .apply(Launch::grid(
+            [rows, v_heads.div_ceil(BLOCK), 1],
+            [BLOCK, 1, 1],
+        )),
+        &[
+            ba.arg(),
+            ArgValue::Ptr(run.pages.base),
+            per_slot.arg(),
+            at.arg(),
+            page_tokens.arg(),
+            run.replay.arg(),
+            run.back.arg(),
+            stated(OP, run.skip)?.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
+            gates_ext.arg(),
+            gates.arg(),
+            stated(OP, rows)?.arg(),
+            stated(OP, v_heads)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}

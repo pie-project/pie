@@ -1740,11 +1740,13 @@ fn rs_movement(
     if ext > 0 {
         staged.own = vec![-1; rows as usize];
         staged.replay = vec![-1; ext as usize];
+        staged.back = vec![-1; ext as usize];
         for (lane, row) in lanes.iter().enumerate() {
             let replay = replays.get(lane).copied().unwrap_or(0);
             for r in 0..row.rows {
-                staged.own[(row.row_offset + r) as usize] =
-                    narrow(u64::from(begins[lane] + replay + r));
+                let at = begins[lane] + replay + r;
+                staged.own[(row.row_offset + r) as usize] = narrow(u64::from(at));
+                staged.back[at as usize] = narrow(u64::from(row.row_offset + r));
             }
             let Some(RsMove::Scatter { pages, .. }) = moves.get(lane) else {
                 continue;

@@ -294,6 +294,22 @@ pub struct Fp8NarrowUntil(pub u32);
 #[decision(id = "kernel.ssm.gdn_wide_from", constant(range(0..=1_048_576)), default = 0, tune = search)]
 pub struct SsmGdnWideFrom(pub u32);
 
+/// The fire rows up to which a gated-delta layer walks each lane's rows in
+/// order, one launch carrying the state across them (`ssm_gdn_walk_rows`,
+/// `ssm_conv1d_walk`), over the chunk-parallel passes: CUDA's decision of
+/// the same name, at the crossover measured on CUDA (`kernels-cuda`'s
+/// `SsmGdnScanUntil`); not measured on CDNA, so `pie tune rocm` searches it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.gdn_scan_until", constant(range(0..=4096)), default = 32, tune = search)]
+pub struct SsmGdnScanUntil(pub u32);
+
+/// The fire rows up to which a causal conv walks each lane's rows in order
+/// (`ssm_conv1d_walk`) over the chunked conv: CUDA's decision of the same
+/// name at CUDA's measured crossover, not measured on CDNA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.conv_walk_until", constant(range(0..=4096)), default = 8, tune = search)]
+pub struct SsmConvWalkUntil(pub u32);
+
 pub fn register(registry: &mut Registry) {
     registry
         .add::<MoeGrouped>()
@@ -342,6 +358,8 @@ pub fn register(registry: &mut Registry) {
         .add::<Fp8DecodeUntil>()
         .add::<Fp8NarrowUntil>()
         .add::<SsmGdnWideFrom>()
+        .add::<SsmGdnScanUntil>()
+        .add::<SsmConvWalkUntil>()
         .add::<GemmLiveFrom>()
         .add::<GemmLiveTileSmall>()
         .add::<GemmLiveTileMid>()
@@ -397,6 +415,8 @@ pub struct Tuning {
     pub fp8_decode_until: u32,
     pub fp8_narrow_until: u32,
     pub ssm_gdn_wide_from: u32,
+    pub ssm_gdn_scan_until: u32,
+    pub ssm_conv_walk_until: u32,
     pub gemm_live_from: u32,
     pub gemm_live_tiles: [u32; 3],
     /// DeepSeek's fused prefill pass and bounded replay, CUDA's decisions:
@@ -454,6 +474,8 @@ impl Tuning {
         fp8_decode_until: 64,
         fp8_narrow_until: 0,
         ssm_gdn_wide_from: 0,
+        ssm_gdn_scan_until: 32,
+        ssm_conv_walk_until: 8,
         gemm_live_from: 0,
         gemm_live_tiles: [192_032_128, 256_128_064, 176_256_064],
         compressed_prefill_from: 0,
@@ -509,6 +531,8 @@ impl Tuning {
             fp8_decode_until: profile.get::<Fp8DecodeUntil>().0,
             fp8_narrow_until: profile.get::<Fp8NarrowUntil>().0,
             ssm_gdn_wide_from: profile.get::<SsmGdnWideFrom>().0,
+            ssm_gdn_scan_until: profile.get::<SsmGdnScanUntil>().0,
+            ssm_conv_walk_until: profile.get::<SsmConvWalkUntil>().0,
             gemm_live_from: profile.get::<GemmLiveFrom>().0,
             gemm_live_tiles: [
                 profile.get::<GemmLiveTileSmall>().0,

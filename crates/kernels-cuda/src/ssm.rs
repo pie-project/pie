@@ -17,13 +17,63 @@ mod kda;
 mod kda_chunk;
 mod mamba2;
 
-pub use conv1d::{causal_conv1d, causal_conv1d_chunked, short_conv, short_conv_chunked};
+pub use conv1d::{
+    causal_conv1d, causal_conv1d_chunked, causal_conv1d_walk, short_conv, short_conv_chunked,
+};
 pub use dyn_conv::dyn_conv;
 pub use gdn_chunk::{gated_delta_chunked, gated_delta_chunked_serial, gdn_lands_snapshots};
-pub use gdn_prep::gdn_gates;
-pub use gdn_recurrent::gated_delta;
+pub use gdn_prep::{gdn_gates, gdn_gates_run};
+pub use gdn_recurrent::{gated_delta, gated_delta_walk};
 pub use kda::{kda, kda_chunked};
 pub use mamba2::{Mamba2, mamba2, mamba2_chunked};
+
+/// Where an extended run reads a buffered plane in place: row `e` replays
+/// token `replay[e]` of `pages` where that is not negative, else is the
+/// fire's row `back[e] - skip` (an extended row the fire owns names its
+/// fire row in `back`, a replayed one -1). `skip` is the fire row the
+/// handed planes start at.
+#[derive(Clone, Copy, Debug)]
+pub struct RunRows {
+    pub pages: crate::gather::PagedPlane,
+    pub replay: Tensor,
+    pub back: Tensor,
+    pub skip: u32,
+}
+
+impl RunRows {
+    /// The paged plane's geometry in its own elements, as the run kernels
+    /// step it: `(per_slot, at, page_tokens)`, checked against the rows'
+    /// width and the 16-byte reads the walks take.
+    fn paged(&self, op: &'static str, width: u32) -> Result<(i64, i64, i32), Error> {
+        if self.pages.width != width || self.pages.dtype != Dtype::Bf16 {
+            return Err(refuse(
+                op,
+                format!(
+                    "the paged plane holds {}-element {:?} rows and the run's are {width} bf16",
+                    self.pages.width, self.pages.dtype
+                ),
+            ));
+        }
+        let int =
+            |v: u64| i64::try_from(v).map_err(|_| refuse(op, "a paged plane offset past an i64"));
+        Ok((
+            int(self.pages.per_slot)?,
+            int(self.pages.at)?,
+            stated(
+                op,
+                nonzero(op, "the paged plane's page tokens", self.pages.page_tokens)?,
+            )?,
+        ))
+    }
+
+    /// Whether every row the run reads out of its pages starts on 16 bytes.
+    fn aligned16(&self) -> bool {
+        aligned16(self.pages.base)
+            && (self.pages.per_slot * 2).is_multiple_of(16)
+            && (self.pages.at * 2).is_multiple_of(16)
+            && (u64::from(self.pages.width) * 2).is_multiple_of(16)
+    }
+}
 
 const BLOCK: u32 = 256;
 

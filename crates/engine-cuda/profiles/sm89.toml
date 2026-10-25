@@ -9,6 +9,13 @@ assumes = { cc = 89 }
 # 57% less GPU time than on the three wmma launches.
 [kernel]
 ssm.gdn_fused_scan = true
+# A gated delta run walks its rows in order (the fused decode step carried
+# across the run) up to 12 rows, where the two-launch scan above starts to
+# take less: on an L40S the walk takes 2.8 us + 0.98 us a row of one
+# lane's run, the scan 14.7 us + 0.04 us a row (Qwen3.5-0.8B's 16 x 16 heads
+# of 128). A speculative verify's extended run (2 rows at draft length 0, 8
+# at 4) walks in one launch where it ran the scan's three twice.
+ssm.gdn_scan_until = 12
 
 # MXFP4 selects on the register-dequant mma.sync from 28 routes up: a
 # prefill's 2,200 routes (gpt-oss-20b, 541 rows) ran the grouped wmma kernel

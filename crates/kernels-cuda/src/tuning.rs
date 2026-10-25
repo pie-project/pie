@@ -604,13 +604,31 @@ pub struct SsmGdnFusedScan;
 #[decision(id = "kernel.ssm.gdn_tc5", flag, default = false, tune = search)]
 pub struct SsmGdnTc5;
 
-/// The fire rows up to which a gated delta fire runs the sequential scan
-/// (`ssm_gated_delta_chunked_batched_fla`) over the chunked walk: a verify's
-/// or a fold's handful of rows barely fill a chunk, and the scan reads each
-/// lane's state once.
+/// The fire rows up to which a gated delta fire walks each lane's rows in
+/// order (`ssm::gated_delta_walk`: the fused decode step carried across the
+/// run in one launch, its tail past the commit included) over the tiled
+/// chunk passes: a verify's or a fold's handful of rows barely fill a
+/// chunk. The walk costs a row of the longest lane's run; the tiled passes
+/// cost their launches. On an L40S (Qwen3.5-0.8B's 16 x 16 heads of 128,
+/// `ssm::walk::the_walk_crossover_is_where_a_run_costs_a_tile`) the walk
+/// takes 2.8 us + 0.98 us a row, the three-launch split 76 us + 0.33 us a
+/// row and the two-launch scan 14.7 us + 0.04 us a row, so one lane's run
+/// (the walk's worst case) crosses the split near 117 rows and the scan
+/// near 12. The default keeps the 32 rows the in-order scan held before the
+/// walk replaced it; a profile states its device's crossover.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.ssm.gdn_scan_until", constant(range(0..=4096)), default = 32, tune = search)]
 pub struct SsmGdnScanUntil(pub u32);
+
+/// The fire rows up to which a causal conv walks each lane's rows in order
+/// (`ssm::causal_conv1d_walk`, the one-row update carried across the run)
+/// over the row-tiled chunked conv. Measured as `kernel.ssm.gdn_scan_until`
+/// is: the walk takes 3.1 us + 0.78 us a row of one lane's run, the chunked
+/// conv with its window commit 6.3 us + 0.4 us a row up to its 32-row tile,
+/// so they cross near 8 rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.ssm.conv_walk_until", constant(range(0..=4096)), default = 8, tune = search)]
+pub struct SsmConvWalkUntil(pub u32);
 
 /// Whether the row kernels a prefill streams run their bandwidth-shaped
 /// forms: a 128- or 256-wide RMS norm a warp a row (per head or whole), a
@@ -823,6 +841,7 @@ pub fn register(registry: &mut Registry) {
         .add::<SsmGdnFusedScan>()
         .add::<SsmGdnTc5>()
         .add::<SsmGdnScanUntil>()
+        .add::<SsmConvWalkUntil>()
         .add::<ElemwiseRowsVec>()
         .add::<ElemwiseQNormRopeWarp>()
         .add::<ElemwiseHcTile>()
@@ -963,6 +982,7 @@ tuning! {
     ssm_gdn_fused_scan: bool = false, on SsmGdnFusedScan;
     ssm_gdn_tc5: bool = false, on SsmGdnTc5;
     ssm_gdn_scan_until: u32 = 32, get SsmGdnScanUntil;
+    ssm_conv_walk_until: u32 = 8, get SsmConvWalkUntil;
     rows_vec: bool = false, on ElemwiseRowsVec;
     q_norm_rope_warp: bool = false, on ElemwiseQNormRopeWarp;
     hc_tile: bool = false, on ElemwiseHcTile;

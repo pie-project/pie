@@ -971,17 +971,15 @@ impl<'c> Run<'c> {
         Ok(Tensor::new(at, scratch.ext, like.width, like.dtype))
     }
 
-    /// Buffered plane `id` over the extended run: each lane's replayed
-    /// tokens out of their pages, then its own rows, which land in their
-    /// pages first.
-    pub(crate) fn rs_extend(
+    /// The buffered plane `id` is over the extended run, an error naming
+    /// `op` where this load buffers no such plane.
+    fn rs_plane(
         &self,
         op: &'static str,
         id: ValueId,
-    ) -> Result<Tensor, kernels_cuda::Error> {
-        let (seat, scratch) = self.rs_seat_and_scratch(op)?;
-        let own = self.tensor(id);
-        self.rs_move(op, id, own)?;
+        width: u32,
+    ) -> Result<crate::store::rs::Plane, kernels_cuda::Error> {
+        let (seat, _) = self.rs_seat_and_scratch(op)?;
         let plane = seat
             .buffers
             .planes()
@@ -990,11 +988,25 @@ impl<'c> Run<'c> {
                 op,
                 detail: format!(
                     "value {} is no plane this load buffers, so a lane's replay has nowhere to \
-                 read its tokens from; the read path serves the chunked recurrence's class",
+                     read its tokens from; the read path serves the chunked recurrence's class",
                     id.0
                 ),
             })?;
-        Self::rs_plane_width(op, plane, own.width)?;
+        Self::rs_plane_width(op, plane, width)?;
+        Ok(plane)
+    }
+
+    /// Buffered plane `id` over the extended run, its own rows already in
+    /// their pages ([`Run::rs_move`]): each lane's replayed tokens out of
+    /// their pages, then its own rows.
+    pub(crate) fn rs_extend(
+        &self,
+        op: &'static str,
+        id: ValueId,
+    ) -> Result<Tensor, kernels_cuda::Error> {
+        let (seat, scratch) = self.rs_seat_and_scratch(op)?;
+        let own = self.tensor(id);
+        let plane = self.rs_plane(op, id, own.width)?;
         let mut ext = Self::rs_ext_tensor(op, scratch, own)?;
         kernels_cuda::gather::page_gather_rows(
             self.ctx(),
@@ -1005,6 +1017,42 @@ impl<'c> Run<'c> {
         let routes = self.rs_rows_table(seat.tables.own, own.rows);
         kernels_cuda::gather::scatter_live_rows(self.ctx(), own, routes, &mut ext)?;
         Ok(ext)
+    }
+
+    /// Where this window's extended run reads buffered plane `id` in place
+    /// (`kernels_cuda::ssm::RunRows`): its replayed rows in their pages, its
+    /// own in the fire's plane, as this window's row ops find them.
+    pub(crate) fn rs_run_rows(
+        &self,
+        op: &'static str,
+        id: ValueId,
+    ) -> Result<kernels_cuda::ssm::RunRows, kernels_cuda::Error> {
+        let (seat, scratch) = self.rs_seat_and_scratch(op)?;
+        let plane = self.rs_plane(op, id, self.tensor(id).width)?;
+        let (back, skip) = self.rs_back(op)?;
+        Ok(kernels_cuda::ssm::RunRows {
+            pages: seat.buffers.paged(plane),
+            replay: Tensor::new(seat.tables.replay, scratch.ext, 1, poem_ir::Dtype::I32),
+            back,
+            skip,
+        })
+    }
+
+    /// Each extended row's fire row (`RsStaged::back`), and the fire row
+    /// this window's planes start at: none where its row ops find their
+    /// rows through the stage word, its first where they start there (as
+    /// [`Run::rs_rows_table`] reads).
+    pub(crate) fn rs_back(&self, op: &'static str) -> Result<(Tensor, u32), kernels_cuda::Error> {
+        let (seat, scratch) = self.rs_seat_and_scratch(op)?;
+        let skip = if self.plane_base() {
+            0
+        } else {
+            self.window().span().row_offset
+        };
+        Ok((
+            Tensor::new(seat.tables.back, scratch.ext, 1, poem_ir::Dtype::I32),
+            skip,
+        ))
     }
 
     pub(crate) fn rs_out(

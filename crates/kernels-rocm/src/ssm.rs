@@ -1736,3 +1736,256 @@ pub fn mamba2_chunked(
     )?;
     m.norm(ctx, OP, y)
 }
+
+/// Where an extended run reads a buffered plane in place: row `e` replays
+/// token `replay[e]` of `pages` where that is not negative, else is the
+/// fire's row `back[e] - skip` (an extended row the fire owns names its
+/// fire row in `back`, a replayed one -1). `skip` is the fire row the
+/// handed planes start at.
+#[derive(Clone, Copy, Debug)]
+pub struct RunRows {
+    pub pages: crate::gather::PagedPlane,
+    pub replay: Tensor,
+    pub back: Tensor,
+    pub skip: u32,
+}
+
+impl RunRows {
+    /// The paged plane's geometry in its own elements: `(per_slot, at,
+    /// page_tokens)`, checked against the rows' width.
+    fn paged(&self, op: &'static str, width: u32) -> Result<(i64, i64, i32), Error> {
+        if self.pages.width != width || self.pages.dtype != Dtype::Bf16 {
+            return Err(refuse(
+                op,
+                format!(
+                    "the paged plane holds {}-element {:?} rows and the run's are {width} bf16",
+                    self.pages.width, self.pages.dtype
+                ),
+            ));
+        }
+        let int =
+            |v: u64| i64::try_from(v).map_err(|_| refuse(op, "a paged plane offset past an i64"));
+        Ok((
+            int(self.pages.per_slot)?,
+            int(self.pages.at)?,
+            stated(
+                op,
+                nonzero(op, "the paged plane's page tokens", self.pages.page_tokens)?,
+            )?,
+        ))
+    }
+}
+
+/// The causal conv over each lane's run in one launch (`ssm_conv1d_walk`):
+/// the one-row update stepped row after row, landing the window in the
+/// slot at the commit length and its snapshots at theirs. `Ok(false)` where
+/// the run is long enough to tile; the caller runs the chunked conv then.
+/// Given `run`, `x`'s rows are an extended run's over `y_ext`, every row
+/// landing there and the fire's own rows in `y` too; else `x`'s rows are
+/// the lanes' own and land in `y`.
+#[allow(clippy::too_many_arguments)]
+pub fn causal_conv1d_walk(
+    ctx: &Ctx,
+    x: RaggedTensor,
+    run: Option<RunRows>,
+    weight: Tensor,
+    bias: Option<Tensor>,
+    state: &RecurrentPool,
+    conv_width: u32,
+    dilation: u32,
+    y: &mut Tensor,
+    y_ext: Option<&mut Tensor>,
+) -> Result<bool, Error> {
+    const OP: &str = "ssm.causal_conv1d_walk";
+    const KMAX: u32 = 8;
+    if x.data.dtype != Dtype::Bf16 || y.dtype != Dtype::Bf16 {
+        return Ok(false);
+    }
+    let rows = y_ext.as_ref().map_or(x.data.rows, |ext| ext.rows);
+    let channels = x.data.width;
+    if channels == 0
+        || conv_width > KMAX
+        || dilation != 1
+        || !state.begin_at.is_absent()
+        || rows > ctx.tuning().ssm_conv_walk_until
+        || run.is_some() != y_ext.is_some()
+    {
+        return Ok(false);
+    }
+    let c = stated(OP, channels)?;
+    let k = stated(
+        OP,
+        nonzero(OP, "the conv width this statement states", conv_width)?,
+    )?;
+    let lanes = requests(OP, x)?;
+    seated(OP, state, "ssm_conv1d_walk", true, true, false)?;
+    let (per_slot, at, page_tokens) = match &run {
+        Some(run) => run.paged(OP, channels)?,
+        None => (0, 0, 1),
+    };
+    let [snap, snap_rows, snap_slots] = state.snapshots.args();
+    let y_ext = y_ext.map_or(ArgValue::ABSENT, |ext| ext.arg());
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::attn::ssm_conv1d_walk<::pie::bf16>")).apply(Launch::grid(
+            [channels.div_ceil(CONV_UPDATE_BLOCK), lanes, 1],
+            [CONV_UPDATE_BLOCK, 1, 1],
+        )),
+        &[
+            x.data.arg(),
+            run.map_or(ArgValue::ABSENT, |run| ArgValue::Ptr(run.pages.base)),
+            per_slot.arg(),
+            at.arg(),
+            page_tokens.arg(),
+            run.map_or(ArgValue::ABSENT, |run| run.replay.arg()),
+            run.map_or(ArgValue::ABSENT, |run| run.back.arg()),
+            stated(OP, run.map_or(0, |run| run.skip))?.arg(),
+            weight.arg(),
+            bias.map_or(ArgValue::ABSENT, |b| b.arg()),
+            state.conv_slab.arg(),
+            state.slot_ids.arg(),
+            state.conv_stride.arg(),
+            y.arg(),
+            y_ext,
+            x.indptr.arg(),
+            c.arg(),
+            k.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            state.commit_len.arg(),
+            snap,
+            snap_rows,
+            snap_slots,
+            ctx.stage(),
+        ],
+    )?;
+    Ok(true)
+}
+
+/// The gate prep over an extended run, its `[b | a]` read in place
+/// (`RunRows`): every row's gates land in `gates_ext`, and the fire's own
+/// rows' in `gates` too.
+pub fn gdn_gates_run(
+    ctx: &Ctx,
+    ba: Tensor,
+    run: RunRows,
+    dt_bias: Tensor,
+    a_log: Tensor,
+    gates_ext: &mut Tensor,
+    gates: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "ssm.gdn_gates_run";
+    dtype_dispatch!(OP, ba.dtype, { Bf16 => () });
+    if ba.width == 0 || !ba.width.is_multiple_of(2) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the {}-wide `[b | a]` projection does not halve into value heads",
+                ba.width
+            ),
+        ));
+    }
+    let v_heads = ba.width / 2;
+    let (per_slot, at, page_tokens) = run.paged(OP, ba.width)?;
+    let rows = nonzero(OP, "rows", gates_ext.rows)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::attn::ssm_gdn_prep_ba_gates_run")).apply(Launch::grid(
+            [rows, v_heads.div_ceil(BLOCK), 1],
+            [BLOCK, 1, 1],
+        )),
+        &[
+            ba.arg(),
+            ArgValue::Ptr(run.pages.base),
+            per_slot.arg(),
+            at.arg(),
+            page_tokens.arg(),
+            run.replay.arg(),
+            run.back.arg(),
+            stated(OP, run.skip)?.arg(),
+            a_log.arg(),
+            dt_bias.arg(),
+            gates_ext.arg(),
+            gates.arg(),
+            stated(OP, rows)?.arg(),
+            stated(OP, v_heads)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// The gated delta rule over each lane's run in one launch
+/// (`ssm_gdn_walk_rows`): the decode step's (head, lane) block walks the run
+/// with the state in registers, landing it in the slot at the commit length
+/// (and its snapshots at theirs) and walking on past it. `Ok(false)` where
+/// the run is long enough to tile or the head is not the step's 128 x 128;
+/// the caller runs the chunked passes then. Given `back`, an extended row
+/// lands its output at `table[row] - skip` of `y`, a replayed one nowhere.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_walk(
+    ctx: &Ctx,
+    qkv: RaggedTensor,
+    gates: Tensor,
+    state: &RecurrentPool,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    y: &mut Tensor,
+    back: Option<(Tensor, u32)>,
+) -> Result<bool, Error> {
+    const OP: &str = "ssm.gated_delta_walk";
+    if qkv.data.dtype != Dtype::Bf16
+        || gates.dtype != Dtype::F32
+        || y.dtype != Dtype::F32
+        || state.slab.dtype != Dtype::Bf16
+        || k_dim != CHUNK_HEAD
+        || v_dim != CHUNK_HEAD
+        || state.slot_stride_elems % 8 != 0
+        || !state.begin_at.is_absent()
+        || qkv.data.rows > ctx.tuning().ssm_gdn_scan_until
+    {
+        return Ok(false);
+    }
+    let shaped = Tensor::new(y.ptr, qkv.data.rows, y.width, Dtype::F32);
+    let shape = Delta::of(OP, qkv.data, gates, &shaped, k_heads, v_heads, k_dim, v_dim)?;
+    if !shape.conv_dim.is_multiple_of(8) {
+        return Ok(false);
+    }
+    let lanes = requests(OP, qkv)?;
+    seated(OP, state, "ssm_gdn_walk_rows", true, true, false)?;
+    #[allow(clippy::cast_precision_loss)]
+    let q_scale = (k_dim as f32).sqrt().recip();
+    let [snap, snap_rows, snap_slots] = state.snapshots.args();
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            FILE,
+            "::pie::attn::ssm_gdn_walk_rows<128, 128, 256>",
+        ))
+        .apply(Launch::grid([v_heads, lanes, 1], [FUSED_BLOCK, 1, 1])),
+        &[
+            qkv.data.arg(),
+            gates.arg(),
+            state.slab.arg(),
+            state.slot_ids.arg(),
+            state.slot_stride_elems.arg(),
+            y.arg(),
+            qkv.indptr.arg(),
+            state.commit_len.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            snap,
+            snap_rows,
+            snap_slots,
+            back.map_or(ArgValue::ABSENT, |(table, _)| table.arg()),
+            stated(OP, back.map_or(0, |(_, skip)| skip))?.arg(),
+            stated(OP, k_heads)?.arg(),
+            stated(OP, v_heads)?.arg(),
+            stated(OP, shape.conv_dim)?.arg(),
+            q_scale.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    Ok(true)
+}

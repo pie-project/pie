@@ -29,6 +29,8 @@ measured = [
   "kernel.sdpa.decode.split_window",
   "kernel.sdpa.decode.static_max_requests",
   "kernel.sdpa.prefill.ctas_per_sm",
+  "kernel.ssm.conv_walk_until",
+  "kernel.ssm.gdn_scan_until",
   "engine.copies",
   "engine.graphs",
   "engine.lattice_steps",

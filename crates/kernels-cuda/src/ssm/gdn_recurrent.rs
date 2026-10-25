@@ -69,6 +69,97 @@ pub fn gated_delta(
     )
 }
 
+/// The gated delta rule over each lane's run in one launch
+/// (`gdn_walk_fused`): the fused decode step's warp tile walks the run row
+/// after row with its state in registers, landing it in the slot at the
+/// commit length (and its snapshots at theirs) and walking on past it, so
+/// one launch is the bits of as many one-row steps. `Ok(false)` where the
+/// run is long enough to tile or the shape is not the fused step's; the
+/// caller runs the chunked scan then.
+///
+/// Given `back` (`(table, skip)`), `qkv`'s rows are an extended run's and an
+/// extended row lands its output at `table[row] - skip` of `y`, the fire's
+/// plane, a replayed one (-1) nowhere; else at its own row.
+#[allow(clippy::too_many_arguments)]
+pub fn gated_delta_walk(
+    ctx: &Ctx,
+    qkv: RaggedTensor,
+    gates: Tensor,
+    state: &RecurrentPool,
+    k_heads: u32,
+    v_heads: u32,
+    k_dim: u32,
+    v_dim: u32,
+    y: &mut Tensor,
+    back: Option<(Tensor, u32)>,
+) -> Result<bool, Error> {
+    const OP: &str = "ssm.gated_delta_walk";
+    let out = match y.dtype {
+        Dtype::F32 => "float",
+        Dtype::Bf16 => "::pie::bf16",
+        _ => return Ok(false),
+    };
+    if qkv.data.dtype != Dtype::Bf16
+        || gates.dtype != Dtype::F32
+        || state.slab.dtype != Dtype::Bf16
+        || !state.begin_at.is_absent()
+        || qkv.data.rows > ctx.tuning().ssm_gdn_scan_until
+    {
+        return Ok(false);
+    }
+    let shaped = Tensor::new(y.ptr, qkv.data.rows, y.width, Dtype::F32);
+    let shape = Delta::of(OP, qkv.data, gates, &shaped, k_heads, v_heads, k_dim, v_dim)?;
+    if !fused_fits(&shape, state, qkv.data, y) || !aligned16(gates.ptr) {
+        return Ok(false);
+    }
+    let lanes = requests(OP, qkv)?;
+    seated(OP, state, "gdn_walk", true, true, false)?;
+    #[allow(clippy::cast_precision_loss)]
+    let q_scale = (k_dim as f32).sqrt().recip();
+    let sms = ctx.multiprocessors().unwrap_or(148);
+    let tiles = lanes
+        .checked_mul(v_heads * (v_dim / FUSED_BV))
+        .ok_or_else(|| refuse(OP, format!("{lanes} lanes of value tiles overflow a grid")))?;
+    let blocks = tiles
+        .div_ceil(FUSED_WARPS)
+        .min(sms * fused_blocks_per_sm(ctx.smem_per_sm(), ctx.tuning().ssm_gdn_step_blocks));
+    let [snap, snap_rows, snap_slots] = state.snapshots.args();
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            GDN_RECURRENT,
+            &format!("::pie::ssm::gdn_walk_fused<4, {out}>"),
+        ))
+        .apply(Launch::grid([blocks, 1, 1], [32 * FUSED_WARPS, 1, 1]).smem(FUSED_SMEM)),
+        &[
+            qkv.data.arg(),
+            gates.arg(),
+            state.slab.arg(),
+            state.slot_ids.arg(),
+            state.slot_stride_elems.arg(),
+            y.arg(),
+            qkv.indptr.arg(),
+            state.commit_len.arg(),
+            state.write_state.arg(),
+            state.write_state_mask.arg(),
+            snap,
+            snap_rows,
+            snap_slots,
+            back.map_or(ArgValue::ABSENT, |(table, _)| table.arg()),
+            stated(OP, back.map_or(0, |(_, skip)| skip))?.arg(),
+            stated(OP, k_heads)?.arg(),
+            stated(OP, v_heads)?.arg(),
+            stated(OP, k_dim)?.arg(),
+            stated(OP, v_dim)?.arg(),
+            stated(OP, shape.conv_dim)?.arg(),
+            q_scale.arg(),
+            stated(OP, lanes)?.arg(),
+            ctx.stage(),
+        ],
+    )?;
+    Ok(true)
+}
+
 /// The value columns one warp of the fused step owns.
 const FUSED_BV: u32 = 16;
 

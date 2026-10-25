@@ -641,6 +641,47 @@ __global__ void conv1d_update(
     state[span * C + c] = Elem<T>::from_f32(new_x);
 }
 
+// Eight channels of a causal conv's row, as the one-row update steps them:
+// the taps over the `span` rows of the window before the row, then the row's
+// own, from the bias (or zero).
+template <class T>
+union ConvVec8 {
+    uint4 raw;
+    T e[8];
+};
+
+template <class T, bool SILU, bool RESIDUAL>
+__device__ __forceinline__ ConvVec8<T> conv_step_vec8(
+    const T* wflat, const ConvVec8<T>& bv, bool biased,
+    const ConvVec8<T> (&window)[7], int span, int K, const ConvVec8<T>& xv)
+{
+    constexpr int VEC = 8;
+    constexpr int K_MAX = 8;
+    float acc[VEC];
+    #pragma unroll
+    for (int u = 0; u < VEC; ++u) {
+        acc[u] = biased ? Elem<T>::to_f32(bv.e[u]) : 0.f;
+    }
+    #pragma unroll
+    for (int k = 0; k < K_MAX - 1; ++k) {
+        if (k >= span) break;
+        #pragma unroll
+        for (int u = 0; u < VEC; ++u) {
+            acc[u] += Elem<T>::to_f32(wflat[u * K + k]) * Elem<T>::to_f32(window[k].e[u]);
+        }
+    }
+    #pragma unroll
+    for (int u = 0; u < VEC; ++u) {
+        acc[u] += Elem<T>::to_f32(wflat[u * K + span]) * Elem<T>::to_f32(xv.e[u]);
+    }
+    ConvVec8<T> yv;
+    #pragma unroll
+    for (int u = 0; u < VEC; ++u) {
+        yv.e[u] = Elem<T>::from_f32(conv_out<SILU, RESIDUAL>(acc[u], Elem<T>::to_f32(xv.e[u])));
+    }
+    return yv;
+}
+
 template <class T, bool SILU = true, bool RESIDUAL = false>
 __global__ void conv1d_update_vec8(
     const T* __restrict__ x,
@@ -661,7 +702,7 @@ __global__ void conv1d_update_vec8(
     pdl_launch();
     constexpr int VEC = 8;
     constexpr int K_MAX = 8;
-    union Vec { uint4 raw; T e[VEC]; };
+    using Vec = ConvVec8<T>;
 
     const int r = blockIdx.y;
     if (win != nullptr && r >= static_cast<int>(win[0])) return;
@@ -696,30 +737,8 @@ __global__ void conv1d_update_vec8(
             window[k].raw = *reinterpret_cast<const uint4*>(state + (long long)(k + 1) * C + c0);
         }
     }
-    const T* wflat = &wv[0].e[0];
-
-    float acc[VEC];
-    #pragma unroll
-    for (int u = 0; u < VEC; ++u) {
-        acc[u] = bias != nullptr ? Elem<T>::to_f32(bv.e[u]) : 0.f;
-    }
-    #pragma unroll
-    for (int k = 0; k < K_MAX - 1; ++k) {
-        if (k >= span) break;
-        #pragma unroll
-        for (int u = 0; u < VEC; ++u) {
-            acc[u] += Elem<T>::to_f32(wflat[u * K + k]) * Elem<T>::to_f32(window[k].e[u]);
-        }
-    }
-    #pragma unroll
-    for (int u = 0; u < VEC; ++u) {
-        acc[u] += Elem<T>::to_f32(wflat[u * K + span]) * Elem<T>::to_f32(xv.e[u]);
-    }
-    Vec yv;
-    #pragma unroll
-    for (int u = 0; u < VEC; ++u) {
-        yv.e[u] = Elem<T>::from_f32(conv_out<SILU, RESIDUAL>(acc[u], Elem<T>::to_f32(xv.e[u])));
-    }
+    const Vec yv = conv_step_vec8<T, SILU, RESIDUAL>(
+        &wv[0].e[0], bv, bias != nullptr, window, span, K, xv);
     *reinterpret_cast<uint4*>(y + (long long)r_row * C + c0) = yv.raw;
 
     if (!folds(write_state, write_state_mask, rl)) return;
@@ -730,6 +749,142 @@ __global__ void conv1d_update_vec8(
         }
     }
     *reinterpret_cast<uint4*>(state + (long long)span * C + c0) = xv.raw;
+}
+
+// A lane's run of rows through the causal conv in one launch, eight
+// channels a thread: the one-row update stepped row after row with the
+// window in registers, so the walk lands the bits of as many updates. The
+// window lands in the lane's slot after `commit_len` rows (and a
+// snapshot's after its own); the rows past the commit keep stepping from
+// there.
+//
+// A lane's rows are `indptr[r]..indptr[r + 1]`. Without `back` they stand at
+// those rows of `x` and land at those of `y`, past the stage word's row
+// offset. With it they are an extended run's: row `e` replays page token
+// `replay[e]` of `pages` where that is not negative, else reads `x` at
+// `back[e] - back_skip`; every row lands in `y_ext` at `e`, and a row the
+// fire owns in `y` at `back[e] - back_skip` too.
+template <class T, bool SILU = true, bool RESIDUAL = false>
+__global__ void conv1d_walk_vec8(
+    const T* __restrict__ x,
+    const T* __restrict__ pages,
+    long long page_per_slot,
+    long long page_at,
+    int page_tokens,
+    const i32* __restrict__ replay,
+    const i32* __restrict__ back,
+    int back_skip,
+    const T* __restrict__ weight,
+    const T* __restrict__ bias,
+    T* __restrict__ state_base,
+    const int* __restrict__ slot_ids,
+    long long slot_stride_elems,
+    T* __restrict__ y,
+    T* __restrict__ y_ext,
+    const u32* __restrict__ indptr,
+    int C, int K,
+    bool write_state,
+    const u8* __restrict__ write_state_mask,
+    const int* __restrict__ commit_len,
+    const int* __restrict__ snap,
+    const int* __restrict__ snap_rows,
+    const int* __restrict__ snap_slots,
+    const u32* __restrict__ win)
+{
+    constexpr int VEC = 8;
+    constexpr int K_MAX = 8;
+    using Vec = ConvVec8<T>;
+
+    const int r = blockIdx.y;
+    if (win != nullptr && r >= static_cast<int>(win[2])) return;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const int row0 = win != nullptr ? static_cast<int>(win[1]) : 0;
+    const int c0 = (blockIdx.x * blockDim.x + threadIdx.x) * VEC;
+    if (c0 >= C) return;
+
+    const int t0 = static_cast<int>(indptr[r]);
+    const int rows = static_cast<int>(indptr[r + 1]) - t0;
+    if (rows <= 0) return;
+    const int slot = slot_ids[rl];
+    if (slot < 0) return;
+    const int commit = commit_len != nullptr ? min(commit_len[rl], rows) : rows;
+    const bool fold = folds(write_state, write_state_mask, rl);
+    Snaps sn = snaps_of(snap, rl);
+    T* state = state_base + (long long)slot * slot_stride_elems;
+    const int span = K - 1;
+
+    Vec bv;
+    bv.raw = make_uint4(0u, 0u, 0u, 0u);
+    if (bias != nullptr) {
+        bv.raw = *reinterpret_cast<const uint4*>(bias + c0);
+    }
+    Vec wv[K_MAX];
+    const uint4* w = reinterpret_cast<const uint4*>(weight + (long long)c0 * K);
+    #pragma unroll
+    for (int t = 0; t < K_MAX; ++t) {
+        if (t < K) wv[t].raw = w[t];
+    }
+    // The slot's K rows: row 0 the oldest, rows 1..span the window a step
+    // reads.
+    Vec oldest;
+    oldest.raw = *reinterpret_cast<const uint4*>(state + c0);
+    Vec window[K_MAX - 1];
+    #pragma unroll
+    for (int k = 0; k < K_MAX - 1; ++k) {
+        if (k < span) {
+            window[k].raw = *reinterpret_cast<const uint4*>(state + (long long)(k + 1) * C + c0);
+        }
+    }
+    auto land = [&](T* at) {
+        *reinterpret_cast<uint4*>(at + c0) = oldest.raw;
+        #pragma unroll
+        for (int k = 0; k < K_MAX - 1; ++k) {
+            if (k < span) *reinterpret_cast<uint4*>(at + (long long)(k + 1) * C + c0) = window[k].raw;
+        }
+    };
+    for (int t = 0; t < rows; ++t) {
+        const int e = t0 + t;
+        const T* src;
+        int own = -1;
+        if (back == nullptr) {
+            own = e + row0;
+            src = x + (long long)own * C;
+        } else if (replay != nullptr && replay[e] >= 0) {
+            const long long g = replay[e];
+            src = pages + (g / page_tokens) * page_per_slot + page_at + (g % page_tokens) * C;
+        } else {
+            own = back[e] - back_skip;
+            src = x + (long long)own * C;
+        }
+        Vec xv;
+        xv.raw = *reinterpret_cast<const uint4*>(src + c0);
+        const Vec yv = conv_step_vec8<T, SILU, RESIDUAL>(
+            &wv[0].e[0], bv, bias != nullptr, window, span, K, xv);
+        if (y_ext != nullptr) *reinterpret_cast<uint4*>(y_ext + (long long)e * C + c0) = yv.raw;
+        if (own >= 0) *reinterpret_cast<uint4*>(y + (long long)own * C + c0) = yv.raw;
+        // The update's slot: the window moves up a row past the new one.
+        if (span > 0) {
+            oldest = window[0];
+            #pragma unroll
+            for (int k = 0; k < K_MAX - 2; ++k) {
+                if (k + 1 < span) window[k] = window[k + 1];
+            }
+            #pragma unroll
+            for (int k = 0; k < K_MAX - 1; ++k) {
+                if (k == span - 1) window[k] = xv;
+            }
+        } else {
+            oldest = xv;
+        }
+        const int done = t + 1;
+        if (sn.e0 < sn.e1 && snap_rows[sn.e0] == done) {
+            if (fold && done <= commit) {
+                land(state_base + (long long)snap_slots[sn.e0] * slot_stride_elems);
+            }
+            ++sn.e0;
+        }
+        if (fold && done == commit) land(state);
+    }
 }
 
 }

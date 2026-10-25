@@ -820,6 +820,9 @@ pub struct RsStaged {
     /// Each extended row's buffered token, -1 for a lane's own row (or one
     /// past the last lane's).
     pub replay: Vec<i32>,
+    /// Each extended row's fire row, -1 for a replayed one (or one past the
+    /// last lane's): where the run's kernels read and land a lane's own rows.
+    pub back: Vec<i32>,
     /// Each window's lane boundaries in the extended run, at the word its
     /// own boundaries stand at among the windows' slots (`Slots::at`).
     pub csr: Vec<(u64, Vec<i32>)>,
@@ -835,6 +838,7 @@ pub struct RsTableSeat {
     pub scatter: u64,
     pub own: u64,
     pub replay: u64,
+    pub back: u64,
     pub csr: u64,
     pub live: u64,
 }
@@ -864,7 +868,7 @@ impl RsTables {
         live_words: u64,
     ) -> Result<RsTables> {
         let (max_rows, max_ext) = (u64::from(max_rows), u64::from(max_ext));
-        let words = live_words + csr_words + 2 * max_rows + max_ext + 16;
+        let words = live_words + csr_words + 2 * max_rows + 2 * max_ext + 16;
         Ok(RsTables {
             region: Buffer::zeroed(usize::try_from(words * 4).unwrap_or(usize::MAX))?,
             live_words,
@@ -879,14 +883,16 @@ impl RsTables {
         self.region.bytes() as u64
     }
 
-    /// The word offsets of `fire`'s sections: live, csr, scatter, own, replay.
-    fn layout(&self, rows: u64) -> [u64; 5] {
+    /// The word offsets of `fire`'s sections: live, csr, scatter, own,
+    /// replay, back.
+    fn layout(&self, rows: u64, ext: u64) -> [u64; 6] {
         let live = 0;
         let csr = self.live_words;
         let scatter = csr + self.csr_words;
         let own = scatter + rows.next_multiple_of(4);
         let replay = own + rows.next_multiple_of(4);
-        [live, csr, scatter, own, replay]
+        let back = replay + ext.next_multiple_of(4);
+        [live, csr, scatter, own, replay, back]
     }
 
     /// Stages `fire`'s tables, one host-to-device copy behind the fires
@@ -921,13 +927,18 @@ impl RsTables {
                 fire.replay.len() as u64,
                 ext,
             ),
+            (
+                "rs extended rows the back map names",
+                fire.back.len() as u64,
+                ext,
+            ),
         ] {
             if need > have {
                 return Err(Fault::Ceiling { what, need, have });
             }
         }
-        let [live, csr, scatter, own, replay] = self.layout(rows);
-        let mut image = vec![0i32; usize::try_from(replay + ext).unwrap_or(usize::MAX)];
+        let [live, csr, scatter, own, replay, back] = self.layout(rows, ext);
+        let mut image = vec![0i32; usize::try_from(back + ext).unwrap_or(usize::MAX)];
         for (at, word) in fire.live.iter().enumerate() {
             image[live as usize + at] = *word as i32;
         }
@@ -946,6 +957,7 @@ impl RsTables {
             (scatter, &fire.scatter),
             (own, &fire.own),
             (replay, &fire.replay),
+            (back, &fire.back),
         ] {
             let from = from as usize;
             image[from..from + values.len()].copy_from_slice(values);
@@ -957,6 +969,7 @@ impl RsTables {
             scatter: base + scatter * 4,
             own: base + own * 4,
             replay: base + replay * 4,
+            back: base + back * 4,
             csr: base + csr * 4,
             live: base + live * 4,
         })

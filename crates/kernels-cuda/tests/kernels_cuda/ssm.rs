@@ -7,3 +7,4 @@ mod gdn_recurrent;
 mod kda;
 mod mamba2;
 mod short_conv;
+mod walk;

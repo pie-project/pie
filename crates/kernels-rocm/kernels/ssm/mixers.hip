@@ -74,6 +74,19 @@ __device__ __forceinline__ Snaps snaps_of(const int* snap, int rl) {
 
 // ------------------------------------------------------------------ conv --
 
+// A row's taps over the `K - 1` inputs of the window before it, then its
+// own, from `acc` (the bias, or zero): the one-row update's sum, which the
+// walk below steps row after row.
+template <int KMAX>
+__device__ __forceinline__ float conv_taps(float acc, const float (&wk)[KMAX], const float (&hist)[KMAX], int K,
+                                           float xn) {
+#pragma unroll
+    for (int k = 0; k < KMAX - 1; ++k)
+        if (k < K - 1) acc += wk[k] * hist[k];
+    acc += wk[K - 1 < KMAX ? K - 1 : 0] * xn;
+    return acc;
+}
+
 // Decode: each row r convolves its new input with its slot's window, then
 // (when it folds) shifts the window by one. A thread owns one channel, so a
 // wavefront's reads of x, of each window row and of the taps are adjacent,
@@ -106,11 +119,7 @@ __global__ void ssm_conv1d_update(const T* __restrict__ x, const T* __restrict__
             wk[k] = k < K ? to_f32(weight[c * K + k]) : 0.f;
             hist[k] = k + 1 <= span ? to_f32(state[(k + 1) * C + c]) : 0.f;
         }
-#pragma unroll
-        for (int k = 0; k < KMAX - 1; ++k)
-            if (k < K - 1) acc += wk[k] * hist[k];
-        acc += wk[K - 1 < KMAX ? K - 1 : 0] * xn;
-        y[row * C + c] = from_f32<T>(conv_out<SILU, RESIDUAL>(acc, xn));
+        y[row * C + c] = from_f32<T>(conv_out<SILU, RESIDUAL>(conv_taps<KMAX>(acc, wk, hist, K, xn), xn));
         if (fold) {
             // The window shifted by one: row k takes row k + 1's input.
 #pragma unroll
@@ -126,6 +135,98 @@ __global__ void ssm_conv1d_update(const T* __restrict__ x, const T* __restrict__
     if (fold) {
         for (int k = 0; k < span; ++k) state[k * C + c] = state[(k + 1) * C + c];
         state[span * C + c] = from_f32<T>(xn);
+    }
+}
+
+// A lane's run of rows through the conv in one launch: the one-row update
+// stepped row after row, a thread a channel with its window in registers,
+// so the walk lands the bits of as many updates. The window lands in the
+// slot after `commit_len` rows (and a snapshot's after its own); the rows
+// past the commit step on from there. Without `back` a lane's rows
+// `indptr[r]..indptr[r + 1]` stand in `x` and land in `y` past the stage
+// word's row offset; with it they are an extended run's: row `e` replays
+// page token `replay[e]` of `pages` where that is not negative, else reads
+// `x` at `back[e] - back_skip`, landing in `y_ext` at `e` and, when the fire
+// owns it, in `y` at its own row too. Grid (⌈C / block⌉, lanes).
+template <class T, bool SILU = true, bool RESIDUAL = false>
+__global__ void ssm_conv1d_walk(const T* __restrict__ x, const T* __restrict__ pages, long long page_per_slot,
+                                long long page_at, int page_tokens, const i32* __restrict__ replay,
+                                const i32* __restrict__ back, int back_skip, const T* __restrict__ weight,
+                                const T* __restrict__ bias, T* __restrict__ state_base,
+                                const i32* __restrict__ slot_ids, long long slot_stride, T* __restrict__ y,
+                                T* __restrict__ y_ext, const u32* __restrict__ indptr, int C, int K,
+                                bool write_state, const u8* __restrict__ mask, const int* __restrict__ commit_len,
+                                const int* __restrict__ snap, const int* __restrict__ snap_rows,
+                                const int* __restrict__ snap_slots, const u32* __restrict__ win) {
+    constexpr int KMAX = 8;
+    const int r = blockIdx.y;
+    if (win != nullptr && r >= static_cast<int>(win[2])) return;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const int t0 = static_cast<int>(indptr[r]);
+    const int rows = static_cast<int>(indptr[r + 1]) - t0;
+    if (rows <= 0) return;
+    const int slot = slot_ids[rl];
+    if (slot < 0) return;
+    const int commit = commit_len != nullptr ? min(commit_len[rl], rows) : rows;
+    const bool fold = folds(write_state, mask, rl);
+    Snaps sn = snaps_of(snap, rl);
+    T* state = state_base + static_cast<long long>(slot) * slot_stride;
+    const int span = K - 1;
+    const float b0 = bias != nullptr ? to_f32(bias[c]) : 0.f;
+    // The slot's K rows: `oldest` row 0, `hist` rows 1..span (the window a
+    // step reads).
+    float wk[KMAX], hist[KMAX];
+#pragma unroll
+    for (int k = 0; k < KMAX; ++k) {
+        wk[k] = k < K ? to_f32(weight[c * K + k]) : 0.f;
+        hist[k] = k + 1 <= span ? to_f32(state[(k + 1) * C + c]) : 0.f;
+    }
+    float oldest = to_f32(state[c]);
+    auto land = [&](T* at) {
+        at[c] = from_f32<T>(oldest);
+#pragma unroll
+        for (int k = 0; k < KMAX; ++k)
+            if (k < span) at[(k + 1) * C + c] = from_f32<T>(hist[k]);
+    };
+    for (int t = 0; t < rows; ++t) {
+        const long long e = t0 + t;
+        long long own = -1;
+        float xn;
+        if (back == nullptr) {
+            own = e + row0;
+            xn = to_f32(x[own * C + c]);
+        } else if (replay != nullptr && replay[e] >= 0) {
+            const long long g = replay[e];
+            xn = to_f32(pages[(g / page_tokens) * page_per_slot + page_at + (g % page_tokens) * C + c]);
+        } else {
+            own = back[e] - back_skip;
+            xn = to_f32(x[own * C + c]);
+        }
+        const T out = from_f32<T>(conv_out<SILU, RESIDUAL>(conv_taps<KMAX>(b0, wk, hist, K, xn), xn));
+        if (y_ext != nullptr) y_ext[e * C + c] = out;
+        if (own >= 0) y[own * C + c] = out;
+        // The update's slot: the window moves up a row past the new one,
+        // rounded as the slot stores it.
+        if (span > 0) {
+            oldest = hist[0];
+#pragma unroll
+            for (int k = 0; k < KMAX - 1; ++k)
+                if (k + 1 < span) hist[k] = hist[k + 1];
+#pragma unroll
+            for (int k = 0; k < KMAX; ++k)
+                if (k == span - 1) hist[k] = to_f32(from_f32<T>(xn));
+        } else {
+            oldest = to_f32(from_f32<T>(xn));
+        }
+        const int done = t + 1;
+        if (sn.e0 < sn.e1 && snap_rows[sn.e0] == done) {
+            if (fold && done <= commit) land(state_base + static_cast<long long>(snap_slots[sn.e0]) * slot_stride);
+            ++sn.e0;
+        }
+        if (fold && done == commit) land(state);
     }
 }
 
@@ -310,6 +411,16 @@ __global__ void ssm_conv1d_state_commit(const bf16* __restrict__ x, bf16* __rest
 
 // [b | a] → [g_log | β]: g_log = −exp(A_log)·softplus(a + dt_bias),
 // β = sigmoid(b). Grid (rows, ⌈V_h / block⌉).
+__device__ __forceinline__ void ba_gates_of(const bf16* __restrict__ row, const float* __restrict__ a_log,
+                                            const bf16* __restrict__ dt_bias, float* __restrict__ out, int h,
+                                            int V_h) {
+    const float b = to_f32(row[h]);
+    const float z = to_f32(row[V_h + h]) + to_f32(dt_bias[h]);
+    const float softplus = z > 20.f ? z : log1pf(__expf(z));
+    out[h] = -__expf(a_log[h]) * softplus;
+    out[V_h + h] = 1.f / (1.f + __expf(-b));
+}
+
 __global__ void ssm_gdn_prep_ba_gates(const bf16* __restrict__ ba, const float* __restrict__ a_log,
                                       const bf16* __restrict__ dt_bias, float* __restrict__ gates, int N,
                                       int V_h, const u32* __restrict__ win) {
@@ -317,11 +428,39 @@ __global__ void ssm_gdn_prep_ba_gates(const bf16* __restrict__ ba, const float* 
     const int h = blockIdx.y * blockDim.x + threadIdx.x;
     if (t >= N || h >= V_h || (win != nullptr && t >= static_cast<int>(win[0]))) return;
     const long long row = win != nullptr ? t + static_cast<long long>(win[1]) : t;
-    const float b = to_f32(ba[row * 2 * V_h + h]);
-    const float z = to_f32(ba[row * 2 * V_h + V_h + h]) + to_f32(dt_bias[h]);
-    const float softplus = z > 20.f ? z : log1pf(__expf(z));
-    gates[row * 2 * V_h + h] = -__expf(a_log[h]) * softplus;
-    gates[row * 2 * V_h + V_h + h] = 1.f / (1.f + __expf(-b));
+    ba_gates_of(ba + row * 2 * V_h, a_log, dt_bias, gates + row * 2 * V_h, h, V_h);
+}
+
+// The gate prep over an extended run, `[b | a]` read in place: row `e`
+// replays page token `replay[e]` of `pages` where that is not negative, else
+// reads the fire's row `back[e] - back_skip` of `ba` (none where both are
+// negative), landing in `gates_ext` at `e` and an own row in `gates` too.
+__global__ void ssm_gdn_prep_ba_gates_run(const bf16* __restrict__ ba, const bf16* __restrict__ pages,
+                                          long long page_per_slot, long long page_at, int page_tokens,
+                                          const i32* __restrict__ replay, const i32* __restrict__ back,
+                                          int back_skip, const float* __restrict__ a_log,
+                                          const bf16* __restrict__ dt_bias, float* __restrict__ gates_ext,
+                                          float* __restrict__ gates, int N, int V_h, const u32* __restrict__ win) {
+    const int e = blockIdx.x;
+    const int h = blockIdx.y * blockDim.x + threadIdx.x;
+    if (e >= N || h >= V_h || (win != nullptr && e >= static_cast<int>(win[0]))) return;
+    const bf16* row;
+    long long own = -1;
+    if (replay[e] >= 0) {
+        const long long g = replay[e];
+        row = pages + (g / page_tokens) * page_per_slot + page_at + (g % page_tokens) * 2 * V_h;
+    } else if (back[e] >= 0) {
+        own = back[e] - back_skip;
+        row = ba + own * 2 * V_h;
+    } else {
+        return;
+    }
+    float* out = gates_ext + static_cast<long long>(e) * 2 * V_h;
+    ba_gates_of(row, a_log, dt_bias, out, h, V_h);
+    if (own >= 0) {
+        gates[own * 2 * V_h + h] = out[h];
+        gates[own * 2 * V_h + V_h + h] = out[V_h + h];
+    }
 }
 
 // The l2-normed q (scaled) and k of each key head, staged in f32 at the
@@ -526,43 +665,65 @@ __device__ __forceinline__ u32 bf16_pack_rne(float lo, float hi) {
 // (the kv sums with the norms, then the outputs). `ssm_gdn_decode_step`'s
 // arithmetic, fused in pairs and in another order.
 template <int KD, int VD, int BLOCK>
-__global__ __launch_bounds__(BLOCK) void ssm_gdn_decode_rows(
-    const bf16* __restrict__ qkv, const float* __restrict__ gates, bf16* __restrict__ state_base,
-    const i32* __restrict__ slot_ids, long long slot_stride, float* __restrict__ out, int K_h, int V_h,
-    int conv_dim, float q_scale, bool write_state, const u8* __restrict__ mask, const u32* __restrict__ win) {
-    constexpr int WAVES = BLOCK / kWave, VEC = 8, CG = VD / VEC, RG = BLOCK / CG, Q = KD / RG;
+struct GdnRows {
+    static constexpr int WAVES = BLOCK / kWave, VEC = 8, CG = VD / VEC, RG = BLOCK / CG, Q = KD / RG;
     static_assert(VD % VEC == 0 && BLOCK % CG == 0 && KD % RG == 0 && kWave % CG == 0,
                   "whole packs, whole row groups");
-    __shared__ alignas(16) float red[2][WAVES][VD];
-    __shared__ float norms[WAVES][2];
+    // The block's reduction planes: the column sums of a step's two passes,
+    // and its q and k norms' partials.
+    struct Shared {
+        alignas(16) float red[2][WAVES][VD];
+        float norms[WAVES][2];
+    };
+};
 
-    const int h = blockIdx.x, r = blockIdx.y;
-    if (win != nullptr && r >= static_cast<int>(win[0])) return;
-    const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
-    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
-    const int slot = slot_ids[rl];
-    if (slot < 0) return;
-    const int tid = threadIdx.x, wave = tid / kWave, l = lane();
-    const int h_k = h / (V_h / K_h);
-    const bf16* qkv_row = qkv + row * conv_dim;
-    const int cg = tid % CG, rg = tid / CG, j0 = cg * VEC;
+// A row's reads for a thread of the step: its q and k entries, its eight
+// value columns and the head's gates. Loaded apart from the step, so the
+// decode step issues them before the state's.
+template <int KD, int VD, int BLOCK>
+struct GdnRowIn {
+    float qi[GdnRows<KD, VD, BLOCK>::Q], ki[GdnRows<KD, VD, BLOCK>::Q];
+    Pack8<bf16> vp;
+    float g_log, beta;
+};
 
-    // The token's reads, then the state's: every read of the step in flight
-    // before any is used.
-    float qi[Q], ki[Q];
+template <int KD, int VD, int BLOCK>
+__device__ __forceinline__ GdnRowIn<KD, VD, BLOCK> gdn_rows_load(
+    const bf16* __restrict__ qkv_row, const float* __restrict__ gate_row, int h, int h_k, int K_h, int V_h) {
+    using G = GdnRows<KD, VD, BLOCK>;
+    const int tid = threadIdx.x;
+    const int cg = tid % G::CG, rg = tid / G::CG, j0 = cg * G::VEC;
+    GdnRowIn<KD, VD, BLOCK> in;
 #pragma unroll
-    for (int q = 0; q < Q; ++q) {
-        qi[q] = to_f32(qkv_row[h_k * KD + rg + RG * q]);
-        ki[q] = to_f32(qkv_row[K_h * KD + h_k * KD + rg + RG * q]);
+    for (int q = 0; q < G::Q; ++q) {
+        in.qi[q] = to_f32(qkv_row[h_k * KD + rg + G::RG * q]);
+        in.ki[q] = to_f32(qkv_row[K_h * KD + h_k * KD + rg + G::RG * q]);
     }
-    const Pack8<bf16> vp = *reinterpret_cast<const Pack8<bf16>*>(qkv_row + 2LL * K_h * KD + static_cast<long long>(h) * VD + j0);
-    const float g_log = gates[row * 2 * V_h + h];
-    const float beta = gates[row * 2 * V_h + V_h + h];
-    bf16* head = state_base + static_cast<long long>(slot) * slot_stride + static_cast<long long>(h) * KD * VD;
-    u32x4 sp[Q];
-#pragma unroll
-    for (int q = 0; q < Q; ++q) sp[q] = state_load(head + (rg + RG * q) * VD + j0);
-    const bool fold = folds_uniform(write_state, mask, rl);
+    in.vp = *reinterpret_cast<const Pack8<bf16>*>(qkv_row + 2LL * K_h * KD + static_cast<long long>(h) * VD + j0);
+    in.g_log = gate_row[h];
+    in.beta = gate_row[V_h + h];
+    return in;
+}
+
+// One row of the rule on a (head, lane)'s state, a block's threads holding
+// it in `sp` as packed bf16 rows: `sp` becomes the state the step stores
+// (rounded), stored at `store` too where that is not null, and the row's
+// output lands at `out` where that is not null. `ssm_gdn_decode_step`'s
+// arithmetic, fused in pairs and in another order; the decode step and the
+// walk both run it.
+template <int KD, int VD, int BLOCK>
+__device__ __forceinline__ void gdn_rows_step(
+    const GdnRowIn<KD, VD, BLOCK>& in, float q_scale, u32x4 (&sp)[GdnRows<KD, VD, BLOCK>::Q],
+    bf16* store, float* __restrict__ out, typename GdnRows<KD, VD, BLOCK>::Shared& sh) {
+    using G = GdnRows<KD, VD, BLOCK>;
+    constexpr int WAVES = G::WAVES, VEC = G::VEC, CG = G::CG, RG = G::RG, Q = G::Q;
+    const int tid = threadIdx.x, wave = tid / kWave, l = lane();
+    const int cg = tid % CG, rg = tid / CG, j0 = cg * VEC;
+    const float* qi = in.qi;
+    const float* ki = in.ki;
+    const Pack8<bf16>& vp = in.vp;
+    const float g_log = in.g_log;
+    const float beta = in.beta;
 
     // Over the row groups of a column: the wavefront's lanes CG apart, then
     // the wavefronts. Every thread of a column gets the same total.
@@ -575,8 +736,8 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_decode_rows(
 #pragma unroll
         for (int u = 0; u < VEC; ++u) x[u] = lanes(x[u]);
         if (l < CG) {
-            *reinterpret_cast<f32x4*>(&red[buf][wave][j0]) = f32x4{x[0], x[1], x[2], x[3]};
-            *reinterpret_cast<f32x4*>(&red[buf][wave][j0 + 4]) = f32x4{x[4], x[5], x[6], x[7]};
+            *reinterpret_cast<f32x4*>(&sh.red[buf][wave][j0]) = f32x4{x[0], x[1], x[2], x[3]};
+            *reinterpret_cast<f32x4*>(&sh.red[buf][wave][j0 + 4]) = f32x4{x[4], x[5], x[6], x[7]};
         }
     };
     auto column_totals = [&](float (&x)[VEC], int buf) {
@@ -584,8 +745,8 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_decode_rows(
         for (int u = 0; u < VEC; ++u) x[u] = 0.f;
 #pragma unroll
         for (int w = 0; w < WAVES; ++w) {
-            const f32x4 a = *reinterpret_cast<const f32x4*>(&red[buf][w][j0]);
-            const f32x4 b = *reinterpret_cast<const f32x4*>(&red[buf][w][j0 + 4]);
+            const f32x4 a = *reinterpret_cast<const f32x4*>(&sh.red[buf][w][j0]);
+            const f32x4 b = *reinterpret_cast<const f32x4*>(&sh.red[buf][w][j0 + 4]);
 #pragma unroll
             for (int u = 0; u < 4; ++u) {
                 x[u] += a[u];
@@ -622,16 +783,16 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_decode_rows(
     qq = lanes(qq);
     kk = lanes(kk);
     if (l == 0) {
-        norms[wave][0] = qq;
-        norms[wave][1] = kk;
+        sh.norms[wave][0] = qq;
+        sh.norms[wave][1] = kk;
     }
     lds_barrier();
     column_totals(x, 0);
     float qn = 0.f, kn = 0.f;
 #pragma unroll
     for (int w = 0; w < WAVES; ++w) {
-        qn += norms[w][0];
-        kn += norms[w][1];
+        qn += sh.norms[w][0];
+        kn += sh.norms[w][1];
     }
     const float g = __expf(g_log);
     const float rk = rsqrtf(kn + 1e-6f), rq = rsqrtf(qn + 1e-6f) * q_scale;
@@ -657,7 +818,8 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_decode_rows(
             st[w] = bf16_pack_rne(next.x, next.y);
             x2[w] = __builtin_elementwise_fma(next, q2, x2[w]);
         }
-        if (fold) state_store(head + (rg + RG * q) * VD + j0, st);
+        sp[q] = st;
+        if (store != nullptr) state_store(store + (rg + RG * q) * VD + j0, st);
     }
 #pragma unroll
     for (int w = 0; w < VEC / 2; ++w) {
@@ -666,11 +828,102 @@ __global__ __launch_bounds__(BLOCK) void ssm_gdn_decode_rows(
     }
     column_sums(x, 1);
     lds_barrier();
-    if (tid < CG) {
+    if (tid < CG && out != nullptr) {
         column_totals(x, 1);
-        float* o = out + (row * V_h + h) * VD + j0;
+        float* o = out + j0;
         *reinterpret_cast<f32x4*>(o) = f32x4{x[0] * rq, x[1] * rq, x[2] * rq, x[3] * rq};
         *reinterpret_cast<f32x4*>(o + 4) = f32x4{x[4] * rq, x[5] * rq, x[6] * rq, x[7] * rq};
+    }
+}
+
+// The step for a batch: a block a (head, row), consecutive blocks on one
+// slot's consecutive heads; a wavefront reads four whole state rows. The
+// q and k norms factor out of the sums, so the block meets at two barriers
+// (the kv sums with the norms, then the outputs).
+template <int KD, int VD, int BLOCK>
+__global__ __launch_bounds__(BLOCK) void ssm_gdn_decode_rows(
+    const bf16* __restrict__ qkv, const float* __restrict__ gates, bf16* __restrict__ state_base,
+    const i32* __restrict__ slot_ids, long long slot_stride, float* __restrict__ out, int K_h, int V_h,
+    int conv_dim, float q_scale, bool write_state, const u8* __restrict__ mask, const u32* __restrict__ win) {
+    using G = GdnRows<KD, VD, BLOCK>;
+    __shared__ typename G::Shared sh;
+
+    const int h = blockIdx.x, r = blockIdx.y;
+    if (win != nullptr && r >= static_cast<int>(win[0])) return;
+    const long long row = win != nullptr ? r + static_cast<long long>(win[1]) : r;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const int slot = slot_ids[rl];
+    if (slot < 0) return;
+    const int tid = threadIdx.x;
+    const int cg = tid % G::CG, rg = tid / G::CG, j0 = cg * G::VEC;
+    // The token's reads, then the state's: every read of the step in flight
+    // before any is used.
+    const GdnRowIn<KD, VD, BLOCK> in =
+        gdn_rows_load<KD, VD, BLOCK>(qkv + row * conv_dim, gates + row * 2 * V_h, h, h / (V_h / K_h), K_h, V_h);
+    bf16* head = state_base + static_cast<long long>(slot) * slot_stride + static_cast<long long>(h) * KD * VD;
+    u32x4 sp[G::Q];
+#pragma unroll
+    for (int q = 0; q < G::Q; ++q) sp[q] = state_load(head + (rg + G::RG * q) * VD + j0);
+    const bool fold = folds_uniform(write_state, mask, rl);
+    gdn_rows_step<KD, VD, BLOCK>(in, q_scale, sp, fold ? head : nullptr, out + (row * V_h + h) * VD, sh);
+}
+
+// A lane's run of rows through the rule in one launch: a block a (head,
+// lane) walks the decode step's rows, the state staying in its registers as
+// the bf16 the step stores, so the walk lands the bits of as many one-row
+// steps. The state lands in its slot after `commit_len` rows (and a
+// snapshot's after its own); the rows past the commit walk on from there.
+// A lane's rows are `indptr[r]..indptr[r + 1]` of `qkv` and `gates` past the
+// stage word's row offset; its outputs land at the same rows, or, given
+// `back`, at `back[row] - back_skip` (none where that is negative).
+template <int KD, int VD, int BLOCK>
+__global__ __launch_bounds__(BLOCK) void ssm_gdn_walk_rows(
+    const bf16* __restrict__ qkv, const float* __restrict__ gates, bf16* __restrict__ state_base,
+    const i32* __restrict__ slot_ids, long long slot_stride, float* __restrict__ out,
+    const u32* __restrict__ indptr, const int* __restrict__ commit_len, bool write_state,
+    const u8* __restrict__ mask, const int* __restrict__ snap, const int* __restrict__ snap_rows,
+    const int* __restrict__ snap_slots, const i32* __restrict__ back, int back_skip, int K_h, int V_h,
+    int conv_dim, float q_scale, const u32* __restrict__ win) {
+    using G = GdnRows<KD, VD, BLOCK>;
+    __shared__ typename G::Shared sh;
+
+    const int h = blockIdx.x, r = blockIdx.y;
+    if (win != nullptr && r >= static_cast<int>(win[2])) return;
+    const int rl = win != nullptr ? r + static_cast<int>(win[3]) : r;
+    const long long row0 = win != nullptr ? static_cast<long long>(win[1]) : 0;
+    const int t0 = static_cast<int>(indptr[r]);
+    const int rows = static_cast<int>(indptr[r + 1]) - t0;
+    if (rows <= 0) return;
+    const int slot = slot_ids[rl];
+    if (slot < 0) return;
+    const int commit = commit_len != nullptr ? min(commit_len[rl], rows) : rows;
+    const bool fold = folds_uniform(write_state, mask, rl);
+    Snaps sn = snaps_of(snap, rl);
+    const int tid = threadIdx.x;
+    const int cg = tid % G::CG, rg = tid / G::CG, j0 = cg * G::VEC;
+    const long long bank = static_cast<long long>(h) * KD * VD;
+    bf16* head = state_base + static_cast<long long>(slot) * slot_stride + bank;
+    u32x4 sp[G::Q];
+#pragma unroll
+    for (int q = 0; q < G::Q; ++q) sp[q] = state_load(head + (rg + G::RG * q) * VD + j0);
+    const int h_k = h / (V_h / K_h);
+    for (int t = 0; t < rows; ++t) {
+        const long long e = t0 + t;
+        const int done = t + 1;
+        long long at = e + row0;
+        if (back != nullptr) at = back[e] >= 0 ? back[e] - back_skip : -1;
+        const GdnRowIn<KD, VD, BLOCK> in =
+            gdn_rows_load<KD, VD, BLOCK>(qkv + (e + row0) * conv_dim, gates + (e + row0) * 2 * V_h, h, h_k, K_h, V_h);
+        gdn_rows_step<KD, VD, BLOCK>(in, q_scale, sp, fold && done == commit ? head : nullptr,
+                                     at >= 0 ? out + (at * V_h + h) * VD : nullptr, sh);
+        if (sn.e0 < sn.e1 && snap_rows[sn.e0] == done) {
+            if (fold && done <= commit) {
+                bf16* at_snap = state_base + static_cast<long long>(snap_slots[sn.e0]) * slot_stride + bank;
+#pragma unroll
+                for (int q = 0; q < G::Q; ++q) state_store(at_snap + (rg + G::RG * q) * VD + j0, sp[q]);
+            }
+            ++sn.e0;
+        }
     }
 }
 

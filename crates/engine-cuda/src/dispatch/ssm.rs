@@ -109,6 +109,22 @@ impl Run<'_> {
                     );
                 }
                 self.rs_move("ssm.causal_conv1d_chunked", *x, self.tensor(*x))?;
+                // A short run walks its rows once, its tail past the commit
+                // with them.
+                if kernels_cuda::ssm::causal_conv1d_walk(
+                    self.ctx(),
+                    self.ragged_lanes(*x),
+                    None,
+                    self.tensor(*weight),
+                    bias.map(|b| self.tensor(b)),
+                    &self.recurrent_absolute(*state),
+                    *conv_width,
+                    *dilation,
+                    &mut self.tensor(*y),
+                    None,
+                )? {
+                    return Ok(());
+                }
                 let tail = self.recurrent_tail_absolute(*state);
                 kernels_cuda::ssm::causal_conv1d_chunked(
                     self.ctx(),
@@ -139,17 +155,22 @@ impl Run<'_> {
                 gates,
             } => {
                 if self.rs_extended() {
+                    // The `[b | a]` rows read where they stand: a replayed
+                    // row in its page, an own row in the fire's plane.
                     const OP: &str = "ssm.gdn_gates";
-                    let ba_ext = self.rs_extend(OP, *ba)?;
+                    let own = self.tensor(*ba);
+                    self.rs_move(OP, *ba, own)?;
+                    let run = self.rs_run_rows(OP, *ba)?;
                     let mut gates_ext = self.rs_out(OP, *gates)?;
-                    kernels_cuda::ssm::gdn_gates(
+                    return kernels_cuda::ssm::gdn_gates_run(
                         self.rs_ctx(),
-                        ba_ext,
+                        own,
+                        run,
                         self.tensor(*dt_bias),
                         self.tensor(*a_log),
                         &mut gates_ext,
-                    )?;
-                    return self.rs_land(OP, gates_ext, *gates);
+                        &mut self.tensor(*gates),
+                    );
                 }
                 self.rs_move("ssm.gdn_gates", *ba, self.tensor(*ba))?;
                 kernels_cuda::ssm::gdn_gates(
@@ -222,6 +243,20 @@ impl Run<'_> {
                         *v_dim,
                         *y,
                     );
+                }
+                if kernels_cuda::ssm::gated_delta_walk(
+                    self.ctx(),
+                    self.ragged_lanes(*qkv),
+                    self.tensor(*gates),
+                    &self.recurrent_absolute(*state),
+                    *k_heads,
+                    *v_heads,
+                    *k_dim,
+                    *v_dim,
+                    &mut self.tensor(*y),
+                    None,
+                )? {
+                    return Ok(());
                 }
                 let tail = self.recurrent_tail_absolute(*state);
                 kernels_cuda::ssm::gated_delta_chunked(
@@ -474,9 +509,31 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         let bias = bias.map(|b| self.tensor(b));
-        let x_ext = self.rs_extend(op, x)?;
+        let own = self.tensor(x);
+        self.rs_move(op, x, own)?;
         let csr = self.rs_ext_csr(op)?;
         let mut y_ext = self.rs_out(op, y)?;
+        // A short run walks in place: its replayed rows out of their pages,
+        // its own out of the fire's plane, every row landed in the run and
+        // the fire's own in the fire's plane too.
+        if kernels_cuda::ssm::causal_conv1d_walk(
+            self.rs_ctx(),
+            RaggedTensor {
+                data: own,
+                indptr: csr,
+            },
+            Some(self.rs_run_rows(op, x)?),
+            self.tensor(weight),
+            bias,
+            &self.recurrent_absolute(state),
+            conv_width,
+            dilation,
+            &mut self.tensor(y),
+            Some(&mut y_ext),
+        )? {
+            return Ok(());
+        }
+        let x_ext = self.rs_extend(op, x)?;
         let tail = self.recurrent_tail_absolute(state);
         kernels_cuda::ssm::causal_conv1d_chunked(
             self.rs_ctx(),
@@ -529,6 +586,26 @@ impl Run<'_> {
         // the fire's own rows.
         let z = self.tensor(z);
         let csr = self.rs_ext_csr(op)?;
+        // A short run walks in one launch, landing only the fire's own
+        // rows' outputs, in the fire's plane.
+        if kernels_cuda::ssm::gated_delta_walk(
+            self.rs_ctx(),
+            RaggedTensor {
+                data: qkv_ext,
+                indptr: csr,
+            },
+            gates_ext,
+            &self.recurrent_absolute(state),
+            k_heads,
+            v_heads,
+            k_dim,
+            v_dim,
+            &mut self.tensor(y),
+            Some(self.rs_back(op)?),
+        )? {
+            self.rs_layer_done();
+            return Ok(());
+        }
         let mut y_ext = self.rs_out(op, y)?;
         let tail = self.recurrent_tail_absolute(state);
         kernels_cuda::ssm::gated_delta_chunked(
@@ -585,6 +662,8 @@ impl Run<'_> {
         y: ValueId,
     ) -> Result<(), kernels_cuda::Error> {
         let mixed_ext = self.rs_ext_of(op, mixed)?;
+        self.rs_move(op, f, self.tensor(f))?;
+        self.rs_move(op, b, self.tensor(b))?;
         let f_ext = self.rs_extend(op, f)?;
         let b_ext = self.rs_extend(op, b)?;
         let csr = self.rs_ext_csr(op)?;
