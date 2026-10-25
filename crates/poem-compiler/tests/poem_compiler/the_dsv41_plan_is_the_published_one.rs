@@ -72,8 +72,18 @@ fn the_dsv41_plan_is_the_published_one() {
             .iter()
             .all(|p| p.name != "layers.20.attn.pool.compressor.wgate")
     );
-    assert!(trace.params.iter().any(|p| p.name == "layers.20.attn.indexer.wk"));
-    assert!(trace.params.iter().all(|p| p.name != "layers.24.attn.indexer.wk"));
+    assert!(
+        trace
+            .params
+            .iter()
+            .any(|p| p.name == "layers.20.attn.indexer.wk")
+    );
+    assert!(
+        trace
+            .params
+            .iter()
+            .all(|p| p.name != "layers.24.attn.indexer.wk")
+    );
 
     // Bounded replay: a prompt's encoder-only rows run the encoder and the
     // decoder's sources (layer 20's pool and index keys, from the encoder's

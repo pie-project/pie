@@ -41,9 +41,8 @@ def formats(m):
 "#;
 
 fn import_vae(src: &ztensor::Source) -> checkpoint::contract::ModelContract {
-    let package =
-        poem_compiler::catalog::replacing("ltx25", "formats", VAE_FORMATS)
-            .unwrap_or_else(|why| panic!("the VAE-only package: {why}"));
+    let package = poem_compiler::catalog::replacing("ltx25", "formats", VAE_FORMATS)
+        .unwrap_or_else(|why| panic!("the VAE-only package: {why}"));
     package
         .import("ltx25", &deploy(FLAGSHIP), src, Platform::Cuda)
         .unwrap_or_else(|why| panic!("the VAE does not read this snapshot: {why}"))
