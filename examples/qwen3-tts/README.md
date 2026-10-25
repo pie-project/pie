@@ -36,5 +36,4 @@ which runs fifteen times a frame, at 4.
 It answers the frames made, the seconds of audio and the time spent making
 and decoding them, and sends the audio as `speech.wav`.
 
-It runs on Metal. CUDA decodes given frames (`--frames`); its frame loop
-does not yet draw the predictor's codes right.
+It runs on Metal, CUDA and Vulkan.
