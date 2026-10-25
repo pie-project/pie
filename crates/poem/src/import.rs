@@ -513,22 +513,49 @@ pub fn join_read(
         // serving load lands no leg apart to move it after. A leg the load
         // computes is joined as what it lands, which only an import moves.
         let read = legs.iter().all(|t| t.expr.is_affine());
-        let parts = legs
-            .iter()
-            .map(|t| {
-                if read {
-                    t.expr.clone()
-                } else {
-                    Expr::out(t.name.clone())
-                }
-            })
-            .collect();
-        if read {
-            inlined.extend(legs.iter().map(|t| t.name.clone()));
+        let axis = u8::try_from(join.axis).unwrap_or(0);
+        // Legs the load quantizes (their scales the loader's, not the
+        // contract's) are joined before they are quantized: the joined
+        // weight's scales are then the loader's too, written with its codes.
+        fn quantized(t: &TensorContract) -> Option<(&Expr, &checkpoint::types::Encoding)> {
+            match &t.expr {
+                Expr::Cast { src, to, chunks: 0 } if t.scales.is_none() => Some((&**src, to)),
+                _ => None,
+            }
         }
+        let cast = legs
+            .iter()
+            .map(|t| quantized(t))
+            .collect::<Option<Vec<(&Expr, &checkpoint::types::Encoding)>>>()
+            .filter(|casts| plane.is_empty() && casts.iter().all(|(_, to)| *to == casts[0].1));
+        let expr = if let Some(casts) = cast {
+            inlined.extend(legs.iter().map(|t| t.name.clone()));
+            let to = casts[0].1.clone();
+            let parts = casts.into_iter().map(|(src, _)| src.clone()).collect();
+            Expr::Cast {
+                src: Box::new(Expr::concat(axis, parts)),
+                to,
+                chunks: 0,
+            }
+        } else {
+            let parts = legs
+                .iter()
+                .map(|t| {
+                    if read {
+                        t.expr.clone()
+                    } else {
+                        Expr::out(t.name.clone())
+                    }
+                })
+                .collect();
+            if read {
+                inlined.extend(legs.iter().map(|t| t.name.clone()));
+            }
+            Expr::concat(axis, parts)
+        };
         made.push(TensorContract {
             name: format!("{}{plane}", join.name),
-            expr: Expr::concat(u8::try_from(join.axis).unwrap_or(0), parts),
+            expr,
             shape,
             encoding: lead.encoding.clone(),
             scales: lead.scales.clone().map(|mut s| {

@@ -143,7 +143,14 @@ pub fn lowering_of(trace: &Trace, tp: u32) -> poem::Lowering {
     let cuts = crate::shard::infer::resolve(&mut trace, tp);
     let joins = crate::pack::joins(&trace);
     let lowered = crate::tile::tile(crate::pack::pack(trace.clone()));
-    let tiled = crate::tile::tiled(&crate::pack::pack(trace));
+    let mut tiled = crate::tile::tiled(&crate::pack::pack(trace));
+    // A tiled join's legs are read tiled too: rows joined in bands are the
+    // bands of the joined rows, each leg's scales beside its codes.
+    for join in &joins {
+        if tiled.contains(&join.name) {
+            tiled.extend(join.legs.iter().cloned());
+        }
+    }
     let read = Some(lowered.params.iter().map(|p| p.name.clone()).collect());
     poem::Lowering {
         joins,
