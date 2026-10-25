@@ -2047,6 +2047,35 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "elemwise",
+        name: "div",
+        params: &["x", "y"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let y: Value = a.next()?;
+            result(heap, dsl("elemwise.div", || ops::elemwise::div(&x, &y))?)
+        },
+    },
+    Op {
+        module: "elemwise",
+        name: "mod",
+        params: &["x", "y"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let y: Value = a.next()?;
+            result(heap, dsl("elemwise.mod", || ops::elemwise::mod_(&x, &y))?)
+        },
+    },
+    Op {
+        module: "elemwise",
+        name: "sqrt",
+        params: &["x"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            result(heap, dsl("elemwise.sqrt", || ops::elemwise::sqrt(&x))?)
+        },
+    },
+    Op {
+        module: "elemwise",
         name: "rope_axes",
         params: &[
             "x",

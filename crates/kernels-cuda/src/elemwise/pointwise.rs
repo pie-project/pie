@@ -130,6 +130,10 @@ pub fn tanh(ctx: &Ctx, x: Tensor, o: &mut Tensor) -> Result<(), Error> {
     fire_unary(ctx, "elemwise.act", "1", x, o)
 }
 
+pub fn sqrt(ctx: &Ctx, x: Tensor, o: &mut Tensor) -> Result<(), Error> {
+    fire_unary(ctx, "elemwise.act", "2", x, o)
+}
+
 pub fn gelu_tanh(ctx: &Ctx, x: Tensor, o: &mut Tensor) -> Result<(), Error> {
     crate::linear::glu::gelu_tanh(ctx, x, 1, o)
 }
@@ -183,6 +187,15 @@ pub fn add(ctx: &Ctx, x: Tensor, y: Tensor, o: &mut Tensor) -> Result<(), Error>
 
 pub fn mul(ctx: &Ctx, x: Tensor, y: Tensor, o: &mut Tensor) -> Result<(), Error> {
     fire_binary(ctx, "elemwise.binary", "1", x, y, o)
+}
+
+pub fn div(ctx: &Ctx, x: Tensor, y: Tensor, o: &mut Tensor) -> Result<(), Error> {
+    fire_binary(ctx, "elemwise.binary", "2", x, y, o)
+}
+
+/// `x - y·floor(x / y)`: floored, as Python's `%`.
+pub fn modulo(ctx: &Ctx, x: Tensor, y: Tensor, o: &mut Tensor) -> Result<(), Error> {
+    fire_binary(ctx, "elemwise.binary", "3", x, y, o)
 }
 
 fn fire_binary(

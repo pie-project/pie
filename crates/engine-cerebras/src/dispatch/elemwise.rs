@@ -256,6 +256,31 @@ impl Run<'_> {
                 *streams,
                 self.tensor(*y),
             ),
+            Elemwise::Binary {
+                x,
+                y,
+                z,
+                op: binary,
+            } => elemwise::pointwise::binary(
+                self.ctx(),
+                match binary {
+                    poem_ir::BinaryOp::Add => elemwise::pointwise::BinaryOp::Add,
+                    poem_ir::BinaryOp::Mul => elemwise::pointwise::BinaryOp::Mul,
+                    poem_ir::BinaryOp::Div => elemwise::pointwise::BinaryOp::Div,
+                    poem_ir::BinaryOp::Mod => elemwise::pointwise::BinaryOp::Mod,
+                },
+                self.tensor(*x),
+                self.tensor(*y),
+                self.tensor(*z),
+            ),
+            Elemwise::Act {
+                x,
+                x_out: _,
+                s: None,
+                scale: None,
+                act: poem_ir::ActFn::Sqrt,
+                ..
+            } => elemwise::pointwise::sqrt(self.ctx(), self.tensor(*x)),
             other => Err(kernels_cerebras::Error::Unsupported { op: other.name() }),
         }
     }

@@ -186,7 +186,9 @@ fn rule(op: &Operation) -> Rule {
             BinaryOp::Add => Rule::Linear {
                 follow: &["x", "y"],
             },
-            BinaryOp::Mul => Rule::Heads(Heads::of(&["x", "y"], &[])),
+            BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod => {
+                Rule::Heads(Heads::of(&["x", "y"], &[]))
+            }
         };
     }
     // A residual add is linear in its two rows; one under a gate reads its
