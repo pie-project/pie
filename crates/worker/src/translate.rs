@@ -176,6 +176,7 @@ fn build_model(
                 rs_snapshots: g.caps.rs_snapshots,
                 device_geometry_port_mask: g.caps.ports,
                 facts: g.caps.facts.clone(),
+                inputs: g.caps.inputs.clone(),
                 limits: runtime::engine::SchedulerLimits {
                     max_forward_requests: g.caps.limits.max_lanes as usize,
                     max_forward_tokens: g.caps.limits.max_tokens as usize,

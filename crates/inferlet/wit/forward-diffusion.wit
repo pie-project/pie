@@ -47,9 +47,10 @@ interface forward-diffusion {
         /// runs. Optional when the model declares at most one.
         reading: func(name: string) -> result<_, error>;
 
-        /// `forward.input`, unchanged: bind a channel to one of the
-        /// reading's float ports, read (committed cell) at every submit.
-        input: func(port: string, ch: borrow<channel>) -> result<_, error>;
+        /// `forward.input`, unchanged: bind a channel to the model's input
+        /// `name`, read (committed cell) at every submit. A denoiser's
+        /// self-conditioning taps are two such inputs.
+        input: func(name: string, ch: borrow<channel>) -> result<_, error>;
 
         /// `forward.stream`, unchanged: which lane stream this pass is.
         %stream: func(s: lane-stream) -> result<_, error>;
@@ -73,41 +74,6 @@ interface forward-diffusion {
         /// A `denoise` pass on an engine whose attention cannot lift its
         /// causal bound is refused by name at submit, never read causally.
         canvas: func(mode: mode) -> result<_, error>;
-
-        /// **THE SELF-CONDITIONING SIGNAL, AS THE GUEST'S TAPS.** The
-        /// reference denoiser feeds each step the previous step's
-        /// distribution, as `softmax(logits / T) · E`. Whose distribution
-        /// that is — which temperature, how much of the tail — is the
-        /// sampler's business, so the guest hands the model the
-        /// distribution's TAPS: per canvas row, `self-cond-taps` token ids
-        /// and their probabilities (`model.canvas().self-cond-taps`, row
-        /// major, `rows.len() == weights.len() == length * taps`). The
-        /// model gathers those rows of its embedding table with those
-        /// weights and runs its self-conditioning block over the sum. Zero
-        /// weights are "no signal" — the reference's first step.
-        ///
-        /// A payload beside the ledger, like `media`: staged for the NEXT
-        /// submit of this pass and consumed by it, one at a time. A denoise
-        /// pass submitted with nothing staged runs with no signal. Staging
-        /// twice without a submit between is refused (the first payload
-        /// would be silently lost); so is staging on an `encode` pass.
-        self-conditioning: func(
-            rows: list<u32>,
-            weights: list<f32>,
-        ) -> result<_, error>;
-
-        /// The same taps, read off two of this pass's own channels at every
-        /// submit instead of staged from the host: `rows` a `[length, taps]`
-        /// u32 channel of ids, `weights` a `[length, taps]` f32 channel. A
-        /// persistent binding, set once before the loop; each submit reads
-        /// the channels' COMMITTED cells, so an epilogue that writes the
-        /// next step's taps keeps them loop-carried (`take` then `put`) and
-        /// the guest seeds them with zeros for the first step. The whole
-        /// denoising loop then runs without a host copy a step.
-        self-conditioning-from: func(
-            rows: borrow<channel>,
-            weights: borrow<channel>,
-        ) -> result<_, error>;
 
         /// Bind embedding token ids and CSR row indptr. Both are channels.
         /// On a `denoise` pass the tokens are the canvas — random ids on the

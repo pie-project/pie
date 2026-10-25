@@ -164,6 +164,8 @@ pub struct EngineConfig {
     pub limits: crate::engine::SchedulerLimits,
     /// The facts the engine's trace branches on.
     pub facts: poem_ir::Facts,
+    /// The inputs the engine's trace reads from its guest.
+    pub inputs: Vec<poem_ir::InputDecl>,
     pub engine_backend: crate::engine::EngineBox,
 }
 
@@ -376,10 +378,18 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
             other.facts.table
         );
     }
+    let inputs = engine_configs
+        .first()
+        .map(|engine| engine.inputs.clone())
+        .unwrap_or_default();
+    if engine_configs.iter().any(|engine| engine.inputs != inputs) {
+        anyhow::bail!("the engines of one model read different guest inputs; they run different traces");
+    }
     model::register(
         name.clone(),
         &model_id,
         facts,
+        inputs,
         kv_page_size as u32,
         rs_caps,
         eta_caps,

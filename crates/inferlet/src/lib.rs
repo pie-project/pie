@@ -51,16 +51,38 @@ pub mod latent;
 
 pub mod model {
     pub use crate::pie::inferlet::model::{
-        AxisRole, BlockDrafter, CanvasShape, ForwardKind, LaneStream, LatentSpace, PortFact,
-        PortKind, PositionConvention, ReadingFact, ReadoutKind, ScheduleFact, ScheduleKind,
-        architecture, canvas, channel_capacity, default_system_speculation, draft_block,
-        frame_size, kv_page_size, latent, max_latent_rows, max_readout_rows, mtp_depth, name,
-        output_vocab_size, pass_kind, readings, rs_state_size, run_ahead_window, schedule,
-        submit_deadline_us,
+        AxisRole, BlockDrafter, CanvasShape, ForwardKind, InputAxis, InputDecl, LaneDecl,
+        LaneStream, LatentSpace, PositionConvention, ReadingFact, Readout, ReadoutKind,
+        ScheduleFact, ScheduleKind, architecture, canvas, channel_capacity,
+        default_system_speculation, draft_block, frame_size, kv_page_size, lane, latent,
+        max_latent_rows, max_readout_rows, mtp_depth, name, output_vocab_size, pass_kind,
+        readings, rs_state_size, run_ahead_window, schedule, submit_deadline_us,
     };
 
     pub fn reading(name: &str) -> Option<ReadingFact> {
         readings().into_iter().find(|reading| reading.name == name)
+    }
+
+    /// The name a lane switch spells `stream` by.
+    #[must_use]
+    pub fn stream_name(stream: LaneStream) -> &'static str {
+        match stream {
+            LaneStream::Text => "text",
+            LaneStream::Image => "image",
+            LaneStream::Video => "video",
+            LaneStream::Audio => "audio",
+            LaneStream::Context => "context",
+            LaneStream::Reference => "reference",
+        }
+    }
+
+    /// What a lane of the reading `reading` on `stream` binds: `lane` with
+    /// those two switches.
+    pub fn lane_of(reading: &str, stream: LaneStream) -> Result<LaneDecl, String> {
+        lane(&[
+            ("reading".to_string(), reading.to_string()),
+            ("stream".to_string(), stream_name(stream).to_string()),
+        ])
     }
     pub use crate::pie::inferlet::tokenizer::{
         Token, decode, encode, special_tokens, split_regex, token_bytes, tokens_with_prefix, vocabs,

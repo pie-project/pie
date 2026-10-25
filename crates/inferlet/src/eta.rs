@@ -469,7 +469,7 @@ pub trait PassWit: Sized + 'static {
     fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String>;
     fn media(&self, spans: &[wit_forward::MediaSpan<'_>]) -> Result<(), String>;
     fn reading(&self, name: &str) -> Result<(), String>;
-    fn input(&self, port: &str, ch: &wit_channel::Channel) -> Result<(), String>;
+    fn input(&self, name: &str, ch: &wit_channel::Channel) -> Result<(), String>;
     fn stream(&self, s: LaneStream) -> Result<(), String>;
     fn group(&self, id: u32) -> Result<(), String>;
     fn peer(&self, group: u32) -> Result<(), String>;
@@ -507,8 +507,8 @@ macro_rules! pass_wit {
             fn reading(&self, name: &str) -> Result<(), String> {
                 $wit::ForwardPass::reading(self, name)
             }
-            fn input(&self, port: &str, ch: &wit_channel::Channel) -> Result<(), String> {
-                $wit::ForwardPass::input(self, port, ch)
+            fn input(&self, name: &str, ch: &wit_channel::Channel) -> Result<(), String> {
+                $wit::ForwardPass::input(self, name, ch)
             }
             fn stream(&self, s: LaneStream) -> Result<(), String> {
                 $wit::ForwardPass::stream(self, s)
@@ -628,8 +628,8 @@ struct ForwardInner {
     program_attached: bool,
     adapter_lowrank_sites: u32,
     adapter_scale_sites: u32,
-    port_inputs: Vec<(String, DslChannel)>,
-    latent_rows: Option<u32>,
+    inputs: Vec<(String, DslChannel)>,
+    rows: Option<u32>,
 }
 
 impl<W: PassWit> Pass<W> {
@@ -656,8 +656,8 @@ impl<W: PassWit> Pass<W> {
                 program_attached: false,
                 adapter_lowrank_sites: 0,
                 adapter_scale_sites: 0,
-                port_inputs: Vec::new(),
-                latent_rows: None,
+                inputs: Vec::new(),
+                rows: None,
             }),
         }
     }
@@ -669,32 +669,26 @@ impl<W: PassWit> Pass<W> {
         self.wit.reading(name)
     }
 
-    pub fn input(&self, port: &str, ch: &Channel) -> Result<(), String> {
+    /// Binds `ch` to the model's input `name`, its committed cell read at
+    /// every submit. A row input's channel (`[rows, width]`) states the
+    /// pass's rows.
+    pub fn input(&self, name: &str, ch: &Channel) -> Result<(), String> {
         {
             let inner = self.inner.borrow();
             if inner.program_attached {
                 return Err("forward pass program is already attached".to_string());
             }
-            if inner.port_inputs.iter().any(|(bound, _)| bound == port) {
-                return Err(format!("port `{port}` is already bound on this pass"));
+            if inner.inputs.iter().any(|(bound, _)| bound == name) {
+                return Err(format!("input `{name}` is already bound on this pass"));
             }
         }
         let wit = ch.wit();
-        self.wit.input(port, wit.as_ref())?;
-        let row_port = crate::model::readings().iter().any(|reading| {
-            reading.ports.iter().any(|fact| {
-                fact.name == port
-                    && matches!(
-                        fact.kind,
-                        crate::model::PortKind::Latents | crate::model::PortKind::Context
-                    )
-            })
-        });
+        self.wit.input(name, wit.as_ref())?;
         let mut inner = self.inner.borrow_mut();
-        if row_port && let Some(&rows) = ch.shape().dims().first() {
-            inner.latent_rows = Some(rows);
+        if let [rows, _] = ch.shape().dims()[..] {
+            inner.rows = Some(rows);
         }
-        inner.port_inputs.push((port.to_string(), ch.dsl()));
+        inner.inputs.push((name.to_string(), ch.dsl()));
         Ok(())
     }
 
@@ -963,14 +957,14 @@ impl<W: PassWit> Pass<W> {
         }
         let inner = self.inner.borrow();
         let mut builder = Builder::new(inner.vocab, inner.page_size);
-        if let Some(rows) = inner.latent_rows {
+        if let Some(rows) = inner.rows {
             builder.rows_hint(rows);
         }
         for (port, channel) in &inner.ports {
             builder.bind_port_recorded(*port, channel.clone());
         }
         let port_channels: Vec<DslChannel> =
-            inner.port_inputs.iter().map(|(_, ch)| ch.clone()).collect();
+            inner.inputs.iter().map(|(_, ch)| ch.clone()).collect();
         let author_prologue = inner
             .stages
             .iter()
@@ -987,7 +981,7 @@ impl<W: PassWit> Pass<W> {
             });
         }
         for (stage, body) in &inner.stages {
-            if *stage == Stage::Prologue && !inner.port_inputs.is_empty() {
+            if *stage == Stage::Prologue && !inner.inputs.is_empty() {
                 continue;
             }
             builder.stage(*stage, body);
@@ -1233,14 +1227,6 @@ impl Pass<wit_forward::ForwardPass> {
 impl Pass<wit_diffusion::ForwardPass> {
     pub fn canvas(&self, mode: wit_diffusion::Mode) -> Result<(), String> {
         wit_diffusion::ForwardPass::canvas(&self.wit, mode)
-    }
-
-    pub fn self_conditioning(&self, rows: &[u32], weights: &[f32]) -> Result<(), String> {
-        wit_diffusion::ForwardPass::self_conditioning(&self.wit, rows, weights)
-    }
-
-    pub fn self_conditioning_from(&self, rows: &Channel, weights: &Channel) -> Result<(), String> {
-        wit_diffusion::ForwardPass::self_conditioning_from(&self.wit, &rows.wit(), &weights.wit())
     }
 }
 
