@@ -251,7 +251,10 @@ def block(d, modulated, banks):
 SHIFT_FACTOR = 0.1159
 
 def vae_latent():
-    return struct(shift = weight([CHANNELS], values = [SHIFT_FACTOR] * CHANNELS))
+    return struct(
+        shift = weight([CHANNELS], values = [SHIFT_FACTOR] * CHANNELS),
+        scale = weight([CHANNELS], values = [SCALING_FACTOR] * CHANNELS),
+    )
 
 def layout(id, deploy):
     banks = roles(deploy, "banks", exact = True).banks
@@ -933,5 +936,7 @@ def decode(arm, m):
 
 def encode(arm, m):
     mean, grid = vae_encode(m.vae, arm)
-    seam.at(seam.PIXELS, [mean, grid])
-    return mean
+    # (mean - shift) * s: the latent the denoiser reads and `decode` takes.
+    z = ops.elemwise.standardize(mean, m.vae.latent.shift, m.vae.latent.scale)
+    seam.at(seam.PIXELS, [z, grid])
+    return z
