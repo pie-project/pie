@@ -217,7 +217,7 @@ fn fault(fault: Fault) -> Error {
             "this fire wants {need} {what} and the load reserved {have}"
         )),
         Fault::Fragmented { .. } | Fault::Integrity { .. } => Error::Device(fault.to_string()),
-        Fault::Straddled { .. } => Error::Load(fault.to_string()),
+        Fault::Straddled { .. } | Fault::Recipe(_) => Error::Load(fault.to_string()),
         Fault::Mask { .. }
         | Fault::MaskRows { .. }
         | Fault::Maskless { .. }
@@ -421,7 +421,6 @@ fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
         mtp_depth: shell.mtp_depth(),
         draft_block: trace.drafter.map_or(0, |d| d.rows),
         draft_mask_token: trace.drafter.map_or(0, |d| d.mask_token),
-        draft_bidirectional: trace.drafter.is_some_and(|d| d.bidirectional),
         draft_proposals_from: trace.drafter.map_or(1, |d| d.proposals_from),
         has_value_head: false,
         has_attn_score: shell.observes_scores(),

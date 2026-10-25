@@ -49,10 +49,6 @@ struct Input {
     /// window moves the answer" from "the draft head does".
     #[serde(default)]
     pad: u32,
-    /// DIAGNOSTIC: run only the first `max_layers` layers (the layerskip
-    /// door), to bisect a divergence by depth.
-    #[serde(default)]
-    max_layers: Option<u32>,
     /// DIAGNOSTIC: record the first rounds' proposals and answers
     /// (`proposed_trace`/`truth_trace`) instead of the per-round margin — a
     /// pass binds at most twelve channels, and this is the twelfth.
@@ -188,9 +184,6 @@ async fn main(input: Input) -> Result<Output> {
         let drafting = at == last_span && k > 0;
 
         let fwd_p = ForwardPass::new();
-        if let Some(layers) = input.max_layers {
-            fwd_p.set_max_layers(layers)?;
-        }
         fwd_p.embed(&toks_p, &indptr_p)?;
         fwd_p.readout(&readout_p)?;
         fwd_p.state(&[&ws], StateGeometry::folding())?;
@@ -259,9 +252,6 @@ async fn main(input: Input) -> Result<Output> {
             .named("aux");
 
         let fwd = ForwardPass::new();
-        if let Some(layers) = input.max_layers {
-            fwd.set_max_layers(layers)?;
-        }
         fwd.embed(&win, &indptr_d)?;
         let lanes: Vec<&WorkingSet> = (0..w).map(|_| &ws).collect();
         fwd.state(

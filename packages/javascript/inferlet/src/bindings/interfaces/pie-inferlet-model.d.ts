@@ -148,9 +148,8 @@ export function rsStateSize(): bigint;
 export type Dtype = import('./pie-inferlet-types.js').Dtype;
 /**
  * What a guest needs to seed a BLOCK drafter's draft pass: the rows one
- * pass carries (the anchor and `rows - 1` mask slots), the id every row
- * but the first carries in, and whether the block sees itself — in which
- * case the guest states the mask that says so. Facts the head was trained
+ * pass carries (the anchor and `rows - 1` mask slots) and the id every
+ * row but the first carries in. Facts the head was trained
  * at, not policy: which rows to verify, and whether to draft at all, stay
  * the guest's. `none` for a model with no block drafter (a chained head
  * is `mtp-depth`). Static, like `mtp-depth`.
@@ -158,7 +157,6 @@ export type Dtype = import('./pie-inferlet-types.js').Dtype;
 export interface BlockDrafter {
   rows: number,
   maskToken: number,
-  bidirectional: boolean,
   /**
    * The first row whose readout is a proposal: 1 when the anchor row
    * proposes nothing, 0 when every row does (the anchor's row then

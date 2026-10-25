@@ -141,7 +141,6 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
             lane.captures_scores = program.reads_attn_score;
             lane.block_draft = pass.block_draft;
         }
-        req.max_layers = pass.max_layers;
     }
     req.single_token_mode = false;
     stamp_lane_words(&mut req, false, false, false, None);

@@ -36,6 +36,8 @@ pub enum Fault {
 
     Residency(String),
 
+    Recipe(String),
+
     PatchPayload {
         lane: u32,
         need: u64,
@@ -173,6 +175,7 @@ impl fmt::Display for Fault {
             Self::Unsupported(why) => write!(f, "this device is not served: {why}"),
             Self::Bake(refusal) => write!(f, "this plan does not bake: {refusal:?}"),
             Self::Residency(why) => write!(f, "weight residency: {why}"),
+            Self::Recipe(refusal) => f.write_str(refusal),
             Self::Load(error) => write!(f, "this checkpoint does not land: {error}"),
             Self::Fire(error) => write!(f, "{error}"),
             Self::Fragmented {

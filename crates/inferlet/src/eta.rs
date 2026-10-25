@@ -467,7 +467,6 @@ pub trait PassWit: Sized + 'static {
         indptr: &wit_channel::Channel,
     ) -> Result<(), String>;
     fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String>;
-    fn set_max_layers(&self, max_layers: u32) -> Result<(), String>;
     fn media(&self, spans: &[wit_forward::MediaSpan<'_>]) -> Result<(), String>;
     fn reading(&self, name: &str) -> Result<(), String>;
     fn input(&self, port: &str, ch: &wit_channel::Channel) -> Result<(), String>;
@@ -501,9 +500,6 @@ macro_rules! pass_wit {
             }
             fn readout(&self, indices: &wit_channel::Channel) -> Result<(), String> {
                 $wit::ForwardPass::readout(self, indices)
-            }
-            fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
-                $wit::ForwardPass::set_max_layers(self, max_layers)
             }
             fn media(&self, spans: &[wit_forward::MediaSpan<'_>]) -> Result<(), String> {
                 $wit::ForwardPass::media(self, spans)
@@ -833,10 +829,6 @@ impl<W: PassWit> Pass<W> {
             .ports
             .push((Port::Readout, claim_port(Port::Readout, indices)));
         Ok(())
-    }
-
-    pub fn set_max_layers(&self, max_layers: u32) -> Result<(), String> {
-        self.wit.set_max_layers(max_layers)
     }
 
     pub fn media(&self, spans: &[wit_forward::MediaSpan<'_>]) -> Result<(), String> {

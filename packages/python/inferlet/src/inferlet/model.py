@@ -69,14 +69,13 @@ class BlockDrafter:
 
     rows: int
     mask_token: int
-    bidirectional: bool
     proposals_from: int
 
 
 def draft_block() -> BlockDrafter | None:
     """The bound model's block drafter, if it carries one."""
     d = _model.draft_block()
-    return BlockDrafter(d.rows, d.mask_token, d.bidirectional, d.proposals_from) if d is not None else None
+    return BlockDrafter(d.rows, d.mask_token, d.proposals_from) if d is not None else None
 
 
 @dataclass(frozen=True)

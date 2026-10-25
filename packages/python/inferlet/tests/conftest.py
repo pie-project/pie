@@ -116,7 +116,6 @@ def _make_model() -> types.ModuleType:
 class BlockDrafterStub:
     rows: int
     mask_token: int
-    bidirectional: bool
     proposals_from: int
 
 
@@ -456,9 +455,6 @@ class ForwardPassStub:
 
     def checkpoints(self, slots) -> None:
         self.checkpoint_slots = list(slots)
-
-    def set_max_layers(self, n: int) -> None:
-        self.max_layers = n
 
     def set_drafting_block(self, on: bool) -> None:
         self.drafting = on

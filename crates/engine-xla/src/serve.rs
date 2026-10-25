@@ -476,6 +476,24 @@ impl Shell {
                 poem_ir::Operation::Attn(poem_ir::Attn::Prefill { causal: false, .. })
             )
         });
+        // Mask bits are staged once per lane with causality baked in, and a
+        // wide class stages them unclipped: a causal masked prefill there
+        // would see future keys.
+        let causal_masked = classes_running(&boot.trace, &compiled, |op| {
+            matches!(
+                op,
+                poem_ir::Operation::Attn(poem_ir::Attn::Prefill {
+                    mask: Some(_),
+                    causal: true,
+                    ..
+                })
+            )
+        });
+        if let Some(class) = wide.iter().find(|&class| causal_masked.contains(class)) {
+            return Err(Fault::Recipe(format!(
+                "class {class} attends both ways under one mask"
+            )));
+        }
         let corrected = classes_running(&boot.trace, &compiled, |op| {
             matches!(
                 op,

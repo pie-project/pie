@@ -456,13 +456,12 @@ pub(crate) fn forward(builder: &mut GlobalsBuilder) {
     }
 
     /// States the block drafter whose proposals `logits` reads out: blocks of
-    /// `rows`, masked with `mask_token`, attending both ways if
-    /// `bidirectional`, proposing from row `proposals_from` on.
+    /// `rows`, masked with `mask_token`, proposing from row `proposals_from`
+    /// on.
     fn block_drafter<'v>(
         #[starlark(require = pos)] logits: Star<'v>,
         #[starlark(require = named)] rows: u32,
         #[starlark(require = named)] mask_token: u32,
-        #[starlark(require = named)] bidirectional: bool,
         #[starlark(require = named)] proposals_from: u32,
     ) -> anyhow::Result<NoneType> {
         let logits = <Value as crate::star::bind::Arg>::arg(Some(logits))?;
@@ -470,7 +469,6 @@ pub(crate) fn forward(builder: &mut GlobalsBuilder) {
             logits.rec().block_drafter(crate::BlockDrafter {
                 rows,
                 mask_token,
-                bidirectional,
                 proposals_from,
             });
         })?;

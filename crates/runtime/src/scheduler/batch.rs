@@ -255,8 +255,6 @@ pub(crate) fn build_frame_submission(
             .map(|(arrival, req)| fire_plan::MemberFacts {
                 hook_program: req.hook_program,
                 custom_mask: req.request.has_user_mask,
-                truncated: req.request.max_layers.is_some(),
-                max_layers: req.request.max_layers,
                 multi_token: req.request.lanes.iter().any(|lane| lane.tokens.len() > 1),
                 geometry_class: req.request.geometry,
                 arrival,

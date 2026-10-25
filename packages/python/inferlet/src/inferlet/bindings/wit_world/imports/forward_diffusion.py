@@ -182,14 +182,6 @@ class ForwardPass:
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def set_max_layers(self, max_layers: int) -> None:
-        """
-        `forward.set-max-layers`, unchanged. Per pass, so an early
-        denoising step may run shallow and the last ones deep.
-        
-        Raises: `componentize_py_types.Err(wit_world.imports.str)`
-        """
-        raise NotImplementedError
     def program(self, container_bytes: bytes, channels: List[channel.Channel]) -> None:
         """
         Attach canonical ETA bytes and channel handles in dense declaration

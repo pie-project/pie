@@ -1332,15 +1332,9 @@ enum FoldBy {
     },
 }
 
-fn plain_decode(
-    req: &crate::engine::FireRequest,
-    hooked: bool,
-    fire_wide_mask: bool,
-    max_layers: Option<u32>,
-) -> bool {
+fn plain_decode(req: &crate::engine::FireRequest, hooked: bool, fire_wide_mask: bool) -> bool {
     !hooked
         && !fire_wide_mask
-        && max_layers.is_none()
         && matches!(req.lanes.as_slice(), [lane] if plain_lane(lane) && lane.mask.is_none())
 }
 
@@ -2303,10 +2297,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
             "fire geometry resolved on host path"
         );
         req.single_token_mode = req.lanes.iter().all(|lane| lane.tokens.len() == 1);
-        req.max_layers = {
-            let p = ctx.resources().get(&fwd)?;
-            p.max_layers
-        };
         let media_spans = ctx.resources().get(&fwd)?.bindings.media.clone();
         let carries_media = !media_spans.is_empty();
         let matched = {
@@ -2419,8 +2409,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             && groups.len() == 1
             && !hooked
             && !fire_wide_mask
-            && !p_reads_mtp_logits
-            && req.max_layers.is_none();
+            && !p_reads_mtp_logits;
         let cuttable = decode_envelope.is_none()
             && !denoise
             && !attention_stages
@@ -2704,7 +2693,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             let reports = pass_slots.is_none()
                 && decode_envelope.is_some()
                 && !denoise
-                && plain_decode(&req, hooked, fire_wide_mask, req.max_layers);
+                && plain_decode(&req, hooked, fire_wide_mask);
             let mut parts = Vec::with_capacity(group_sets.len());
             for (group, ((set, (slots, written)), (lease, kvtxn))) in group_sets
                 .iter()
@@ -3820,14 +3809,7 @@ async fn fire_device_geometry<C: FireContext>(
     let (hook_program, lora_program) = hook_program_of(ctx, &fwd)?;
     // A decode lane whose KV is its tokens' alone asks the engine what it
     // wrote, so its slots are logged.
-    let max_layers = ctx.resources().get(&fwd)?.max_layers;
-    let plain_decode = !denoise
-        && plain_decode(
-            &req,
-            hook_program || lora_program,
-            fire_wide_mask,
-            max_layers,
-        );
+    let plain_decode = !denoise && plain_decode(&req, hook_program || lora_program, fire_wide_mask);
     let mut parts = Vec::with_capacity(group_sets.len());
     for ((((set, (log_seq, log_pages)), lease), kvtxn), (_, lanes)) in group_sets
         .iter()

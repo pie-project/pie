@@ -215,14 +215,6 @@ class ForwardPass:
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def set_max_layers(self, max_layers: int) -> None:
-        """
-        Run only the first `max-layers` layers and take the head there.
-        Unset = the full model; zero is rejected.
-        
-        Raises: `componentize_py_types.Err(wit_world.imports.str)`
-        """
-        raise NotImplementedError
     def set_drafting_block(self, on: bool) -> None:
         """
         **THESE ROWS ARE A BLOCK DRAFTER'S PROPOSAL, NOT THE SEQUENCE'S.**
