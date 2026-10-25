@@ -208,13 +208,6 @@ impl Weight {
         self
     }
 
-    /// Every rank holds the weight whole, whatever the compiler would infer.
-    #[must_use]
-    pub fn replicated(mut self) -> Weight {
-        self.shard = Shard::Replicated;
-        self
-    }
-
     #[must_use]
     pub fn columns(self) -> Weight {
         self.cut(0, None)
