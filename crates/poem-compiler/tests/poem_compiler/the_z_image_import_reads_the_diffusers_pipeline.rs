@@ -307,12 +307,7 @@ fn check_turbo(src: &ztensor::Source, index: &BTreeSet<String>) {
 
     let dit_index: BTreeSet<&String> = index.iter().filter(|n| n.starts_with("dit.")).collect();
     let dit_read: BTreeSet<&String> = counts.keys().filter(|n| n.starts_with("dit.")).collect();
-    // The image pad token pads no rows: a voxel lane carries only its
-    // patches (the TokenGrid contract).
-    let unread: Vec<&&String> = dit_index
-        .difference(&dit_read)
-        .filter(|n| n.as_str() != "dit.x_pad_token")
-        .collect();
+    let unread: Vec<&&String> = dit_index.difference(&dit_read).collect();
     assert!(
         unread.is_empty(),
         "`dit.` tensors the import never reads: {unread:?}"
@@ -370,13 +365,10 @@ fn check_mini(src: &ztensor::Source, index: &BTreeSet<String>) {
         .unwrap_or_else(|why| panic!("the miniature does not read its checkpoint: {why}"));
     let counts = reads(&contract);
     let read: BTreeSet<&String> = counts.keys().collect();
-    let want: BTreeSet<&String> = index
-        .iter()
-        .filter(|n| !n.ends_with("x_pad_token"))
-        .collect();
+    let want: BTreeSet<&String> = index.iter().collect();
     assert_eq!(
         read, want,
-        "the miniature reads its whole state_dict but the image pad token, and nothing else"
+        "the miniature reads its whole state_dict, and nothing else"
     );
     let twice: BTreeSet<String> = counts
         .iter()

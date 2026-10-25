@@ -163,7 +163,7 @@ mod tests {
         let schedule = facts.schedule.expect("a denoiser has a schedule");
         assert_eq!(schedule.kind, "flow");
         assert!(
-            facts.inputs.contains(&"latents[row, 128]".to_string()),
+            facts.inputs.contains(&"latents[voxel, 32]".to_string()),
             "{:?}",
             facts.inputs
         );
