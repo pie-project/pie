@@ -903,9 +903,19 @@ impl FireCtx<'_> {
                 for row in p.composition.lanes() {
                     lane_clips[row.source as usize] = (row.clip_offset, row.clips);
                 }
+                // A reading that keeps its input's clips plants the fire's
+                // own grid, which no carve holds.
+                let input_grid = matches!(
+                    self.trace.values[grid.0 as usize].def,
+                    poem_ir::Def::Input(poem_ir::RuntimeInput::Grid)
+                );
+                let grid = match staged.voxels.as_ref() {
+                    Some(seats) if input_grid => seats.grid,
+                    _ => rect(grid, "grid")?,
+                };
                 Some(super::settle::PixelsReadback {
                     plane: rect(plane, "plane")?,
-                    grid: rect(grid, "grid")?,
+                    grid,
                     lane_clips,
                 })
             }
