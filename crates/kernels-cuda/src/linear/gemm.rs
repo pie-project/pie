@@ -5,9 +5,9 @@
 use crate::error::Error;
 
 use crate::jit::{Ctx, count, dtype_dispatch, stated};
+use crate::linear::frame::{Epilogue, In};
 use crate::tensor::Tensor;
 
-#[cfg(feature = "cuda")]
 use dtype::Dtype;
 
 #[cfg(feature = "cuda")]
@@ -48,6 +48,62 @@ pub fn matmul_f32(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(
     {
         let _ = m;
         Err(crate::jit::runtimeless(OP))
+    }
+}
+
+/// `outs = epi(act . w^T)`: an anchored region (kernels-ir's, its epilogue
+/// printed for the contraction frames, [`Epilogue`]) over a dense bf16 bank
+/// of `parts · n` rows, `n` its results' width, `ins` its epilogue's inputs.
+/// The GEMM tuner times, per shape and epilogue, each contraction frame
+/// that covers it fused against the plain product's own tactic followed by
+/// the epilogue on the row frame, and fires the fastest; a fusion never
+/// forces a slower product. False, landing nothing, where no frame covers
+/// the shape (or a capture meets it untimed): the caller's unfused ops serve
+/// it then.
+pub fn anchored(
+    ctx: &Ctx,
+    op: &'static str,
+    epi: &'static Epilogue,
+    act: Tensor,
+    w: Tensor,
+    ins: &[In],
+    outs: &[Tensor],
+) -> Result<bool, Error> {
+    dtype_dispatch!(op, act.dtype, { Bf16 => () });
+    dtype_dispatch!(op, w.dtype, { Bf16 => () });
+    let Some(first) = outs.first() else {
+        return Err(crate::jit::refuse(op, "an anchored region of no result"));
+    };
+    let n = count(op, "the columns this projection lands", first.width)?;
+    let k = count(op, "the contraction this projection walks", act.width)?;
+    let shaped = outs
+        .iter()
+        .all(|y| y.dtype == Dtype::Bf16 && y.width == first.width && y.rows == act.rows);
+    if !shaped || w.width != act.width || w.rows != first.width * epi.parts() {
+        return Err(crate::jit::refuse(
+            op,
+            format!(
+                "the weight is {} x {} and the region contracts {k} into {} part(s) of {n}, \
+                 every result bf16 and of the activation's rows",
+                w.rows,
+                w.width,
+                epi.parts()
+            ),
+        ));
+    }
+    if act.rows == 0 {
+        return Ok(true);
+    }
+    let m = ctx.opaque_rows(stated(op, act.rows)?);
+    #[cfg(feature = "cuda")]
+    {
+        let planes: Vec<u64> = outs.iter().map(|y| y.ptr).collect();
+        cublas::anchored(ctx, op, epi, act.ptr, w.ptr, ins, &planes, m, n, k)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (ins, m, n, k);
+        Err(crate::jit::runtimeless(op))
     }
 }
 

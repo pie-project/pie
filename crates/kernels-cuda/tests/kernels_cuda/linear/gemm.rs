@@ -1,12 +1,12 @@
 //! The dense projections (bf16, affine, NVFP4, FP8 and the quantizing
 //! products) against the host's dot of their decoded operands.
 
-use crate::common::linear_ref::{Bench, TOL, Want, affine, check, dot, fp8_bank, glu_want};
+use crate::common::linear_ref::{Bench, TOL, Want, affine, check, dot, fp8_bank};
 use crate::common::linear_ref::{pick, t, tab};
 use crate::common::{SM100, from_bf16, to_bf16};
 use dtype::Dtype::{Bf16, F32, I32, Nvfp4, U8};
 use kernels_cuda::linear::act_quant::{self, Format, Source, Weight};
-use kernels_cuda::linear::gemm_sm100::{Elem, Glu, atom_bytes, supported};
+use kernels_cuda::linear::gemm_sm100::{Elem, atom_bytes, supported};
 use kernels_cuda::linear::moe::GroupSeat;
 use kernels_cuda::tuning::Tuning;
 
@@ -49,36 +49,16 @@ fn the_few_rows_and_narrow_gemms_land_the_dot() {
 }
 
 #[test]
-fn the_skinny_gemm_lands_the_dot_and_its_epilogue() {
-    use kernels_cuda::linear::skinny::{Epilogue, ROWS, covers, skinny_bf16};
-    // Each epilogue at a ragged row count, and a full tile.
-    #[rustfmt::skip]
-    let cases = [(Epilogue::Store, 5, 192, 128), (Epilogue::Store, 64, 640, 2560),
-        (Epilogue::Softcap(30.0), 64, 256, 256), (Epilogue::Geglu, 5, 96, 256)];
-    for (epi, m, n, k) in cases {
-        let rows = pick(epi == Epilogue::Geglu, 2 * n, n);
-        let mut b = Bench::new(0x51 ^ (m * n) as u64);
-        let ((w, wv), (x, xv), (y, yv)) = (b.bf16(rows * k), b.bf16(m * k), b.bf16((m + 1) * n));
-        let s = (m as i32, n as i32, k as i32);
-        skinny_bf16(&b.ctx(), w, x, y, s.0, s.1, s.2, epi).expect("the skinny GEMM fires");
-        let d = dense(&xv, &wv, [m, rows, k], None);
-        let gu = |i: usize| (d[i / n * rows + i % n], d[i / n * rows + n + i % n]);
-        let want = tab(m * n, |i| match epi {
-            Epilogue::Softcap(c) => (f64::from(c) * (d[i].0 / f64::from(c)).tanh(), d[i].1),
-            Epilogue::Geglu => glu_want(Glu::GegluTanh, gu(i).0, gu(i).1),
-            Epilogue::Store => d[i],
-        });
-        b.check(y, &want, TOL, &format!("{epi:?} {m}x{n}x{k}"));
-        let past = b.read(y, (m + 1) * n)[m * n..] == yv[m * n..];
-        assert!(past, "{epi:?}: the row past m moved");
-    }
+fn the_skinny_frame_refuses_shapes_off_its_tile() {
+    use kernels_cuda::linear::frame::Epilogue;
+    use kernels_cuda::linear::skinny::{ROWS, covers, skinny};
     // Shapes off the tile are refused, without a launch.
-    let store = Epilogue::Store;
-    assert!(!covers(1, 96, 128, store, ROWS) && !covers(65, 64, 128, store, ROWS));
-    assert!(!covers(1, 64, 192, store, ROWS) && !covers(1, 48, 128, Epilogue::Geglu, ROWS));
+    assert!(!covers(1, 96, 128, 1, ROWS) && !covers(65, 64, 128, 1, ROWS));
+    assert!(!covers(1, 64, 192, 1, ROWS) && !covers(1, 48, 128, 2, ROWS));
     let mut b = Bench::new(1);
     let (w, a, y) = (b.zeros(96 * 256), b.zeros(256), b.zeros(192));
-    assert!(skinny_bf16(&b.ctx(), w, a, y, 1, 96, 128, store).is_err());
+    let fired = skinny(&b.ctx(), Epilogue::store(), w, a, &[], &[y], 1, 96, 128);
+    assert!(fired.is_err());
 }
 
 #[test]

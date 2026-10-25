@@ -3,6 +3,7 @@ pub mod act_quant;
 pub mod affine;
 pub mod cast;
 pub mod dequant;
+pub mod frame;
 pub mod gemm;
 #[cfg(feature = "cuda")]
 pub mod gemm_sm100;

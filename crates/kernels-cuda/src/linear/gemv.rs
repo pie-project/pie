@@ -1,9 +1,13 @@
 use crate::error::Error;
 
-use crate::jit::{ArgValue, Ctx, Fire, Launch, aligned16, kernel, refuse};
+use crate::jit::{ArgValue, Ctx, Fire, Kernel, Launch, aligned16, kernel, refuse};
+use crate::linear::frame::{Epilogue, In};
 
 const GEMV: &str = "linear/gemv.cu";
 
+/// `out[n] = act . weight[n]` (plus `bias[n]`, if not null) for one row: the
+/// gemv frame with the plain store, or the bias, filled in. The GEMM tuner's
+/// `Gemv` tactic.
 pub(crate) fn gemv_bf16(
     ctx: &Ctx,
     weight: u64,
@@ -13,83 +17,90 @@ pub(crate) fn gemv_bf16(
     n: i32,
     k: i32,
 ) -> Result<(), Error> {
+    let column = [In::column(bias)];
+    let (epi, ins): (&Epilogue, &[In]) = if bias == 0 {
+        (Epilogue::store(), &[])
+    } else {
+        (Epilogue::bias(), &column)
+    };
+    gemv(ctx, epi, weight, act, ins, &[out], n, k)
+}
+
+/// The gemv frame's kernel for `epi` over `n` columns, and whether it splits
+/// each column's K over a block (`kernel.gemv.splitk_max_n` columns at
+/// most) and its warps a block. `kernel.gemv.bf16`: Blackwell profiles pick
+/// `narrow`.
+pub(crate) fn gemv_kernel(
+    epi: &Epilogue,
+    n: i32,
+    tuning: &crate::tuning::Tuning,
+) -> (&'static Kernel, bool, u32) {
+    let narrow = tuning.gemv_narrow;
+    if n.unsigned_abs() <= tuning.gemv_splitk_max_n {
+        let (class, warps) = if narrow { ("4, 2", 4) } else { ("8, 1", 8) };
+        (epi.kernel("gemv_splitk_frame", class), true, warps)
+    } else {
+        let class = if narrow { "4, 2" } else { "4, 4" };
+        (epi.kernel("gemv_frame", class), false, 4)
+    }
+}
+
+/// `outs = epi(act . weight^T)` for one row on the gemv frame: a warp a
+/// column (each part's weight row in turn), or a block a column split over
+/// K up to `kernel.gemv.splitk_max_n` columns; `ins` the epilogue's inputs
+/// and `outs` its results, each `n` wide.
+#[allow(clippy::too_many_arguments)]
+pub fn gemv(
+    ctx: &Ctx,
+    epi: &Epilogue,
+    weight: u64,
+    act: u64,
+    ins: &[In],
+    outs: &[u64],
+    n: i32,
+    k: i32,
+) -> Result<(), Error> {
+    const OP: &str = "linear.gemv";
     if n <= 0 || k <= 0 || k % 8 != 0 {
         return Err(refuse(
-            "linear.gemv",
+            OP,
             format!("needs n > 0 and k > 0 in whole eights, and was handed n={n}, k={k}"),
         ));
     }
-    for (address, what) in [
-        (weight, "the weight"),
-        (act, "the activation"),
-        (out, "the output"),
-    ] {
-        if address == 0 {
-            return Err(refuse("linear.gemv", format!("{what} is null")));
-        }
-    }
     for (address, what) in [(weight, "the weight"), (act, "the activation")] {
-        if !aligned16(address) {
+        if address == 0 || !aligned16(address) {
             return Err(refuse(
-                "linear.gemv",
-                format!("{what} is not 16-byte aligned, and the vectorised loads demand it"),
+                OP,
+                format!(
+                    "{what} is null or not 16-byte aligned, and the vectorised loads demand it"
+                ),
             ));
         }
     }
-
-    let values = [
-        ArgValue::Ptr(weight),
-        ArgValue::Ptr(act),
-        if bias == 0 {
-            ArgValue::ABSENT
-        } else {
-            ArgValue::Ptr(bias)
-        },
-        ArgValue::Ptr(out),
-        ArgValue::I32(n),
-        ArgValue::I32(k),
-        ArgValue::F32(0.0),
-    ];
-    // `kernel.gemv.bf16`: Blackwell profiles pick `narrow`.
+    let planes = epi.planes(ins, outs, n.unsigned_abs())?;
     let tuning = ctx.tuning();
-    let narrow = tuning.gemv_narrow;
-
-    if n.unsigned_abs() <= tuning.gemv_splitk_max_n {
-        let (instantiation, warps) = if narrow {
-            (
-                "::pie::linear::gemv_splitk_bf16_kernel<::pie::i32(4), 2>",
-                4,
-            )
-        } else {
-            (
-                "::pie::linear::gemv_splitk_bf16_kernel<::pie::i32(8), 1>",
-                8,
-            )
-        };
-        return ctx.fire(
-            "linear.gemv",
-            Fire::at(kernel(GEMV, instantiation)).apply(
-                Launch::grid([n.unsigned_abs(), 1, 1], [32, warps, 1])
-                    .programmatic(ctx.tuning().pdl),
-            ),
-            &values,
-        );
-    }
-
-    let instantiation = if narrow {
-        "::pie::linear::gemv_bf16_kernel<::pie::i32(4), 2>"
+    let (kernel, split, warps) = gemv_kernel(epi, n, &tuning);
+    let grid = if split {
+        n.unsigned_abs()
     } else {
-        "::pie::linear::gemv_bf16_kernel<::pie::i32(4), 4>"
+        n.unsigned_abs().div_ceil(warps)
     };
     ctx.fire(
-        "linear.gemv",
-        Fire::at(kernel("linear/gemv.cu", instantiation)).apply(
-            Launch::grid([n.unsigned_abs().div_ceil(4), 1, 1], [32, 4, 1])
-                .programmatic(ctx.tuning().pdl),
-        ),
-        &values,
+        OP,
+        Fire::at(kernel).apply(Launch::grid([grid, 1, 1], [32, warps, 1]).programmatic(tuning.pdl)),
+        &[
+            ArgValue::Ptr(weight),
+            ArgValue::Ptr(act),
+            ArgValue::of_slice(&planes),
+            ArgValue::of(&NO_FIELDS),
+            ArgValue::I32(n),
+            ArgValue::I32(k),
+        ],
     )
 }
+
+/// A generated body holds no fields; C++ gives the empty struct one byte.
+const NO_FIELDS: u8 = 0;
 
 /// The warps a row of the few-rows kernel splits K over: eight where K
 /// divides so, the most blocks and the fewest dependent loads a lane.
@@ -117,12 +128,22 @@ pub(crate) fn rows_cluster(n: i32, k: i32) -> u32 {
     }
 }
 
-/// `out[m][n] = act[m] . weight[n]` for a few rows (2..=8, a decode's) in
-/// one launch: the tactic `kernel.gemm.rows_m` lets the GEMM tuner try. A
-/// block's eight warps stream weight rows, as many warps a row as keep some
-/// 120 blocks busy (each a slice of K, summed in slice order). Under `pdl`
-/// it launches as the previous kernel's programmatic dependent, waiting on
-/// it in-kernel (sm_90 and later).
+/// The few-rows frame's kernel for `epi` at `m x n x k`, its blocks and its
+/// cluster.
+pub(crate) fn rows_kernel(epi: &Epilogue, m: i32, n: i32, k: i32) -> (&'static Kernel, u32, u32) {
+    let split = rows_split(k);
+    let rows = 16 / split;
+    let cl = rows_cluster(n, k);
+    (
+        epi.kernel("rows_frame", &format!("{m}, {split}, {cl}")),
+        n.unsigned_abs().div_ceil(rows as u32),
+        cl,
+    )
+}
+
+/// `out[m][n] = act[m] . weight[n]` (plus `bias[n]`, if not null) for a few
+/// rows: the few-rows frame with the plain store, or the bias, filled in.
+/// The GEMM tuner's `Rows` tactic.
 #[allow(clippy::too_many_arguments)]
 pub fn gemm_rows_bf16(
     ctx: &Ctx,
@@ -135,30 +156,56 @@ pub fn gemm_rows_bf16(
     k: i32,
     pdl: bool,
 ) -> Result<(), Error> {
+    let column = [In::column(bias)];
+    let (epi, ins): (&Epilogue, &[In]) = if bias == 0 {
+        (Epilogue::store(), &[])
+    } else {
+        (Epilogue::bias(), &column)
+    };
+    gemm_rows(ctx, epi, weight, act, ins, &[out], m, n, k, pdl)
+}
+
+/// `outs = epi(act . weight^T)` for a few rows (1..=16, a decode's) in one
+/// launch, one dense bank: a block's eight warps stream weight rows, as many
+/// warps a row as keep some 120 blocks busy (each a slice of K, summed in
+/// slice order). Under `pdl` it launches as the previous kernel's
+/// programmatic dependent, waiting on it in-kernel (sm_90 and later).
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_rows(
+    ctx: &Ctx,
+    epi: &Epilogue,
+    weight: u64,
+    act: u64,
+    ins: &[In],
+    outs: &[u64],
+    m: i32,
+    n: i32,
+    k: i32,
+    pdl: bool,
+) -> Result<(), Error> {
     const OP: &str = "linear.gemm_rows";
-    if !(1..=8).contains(&m) || n <= 0 || k <= 0 || k % 8 != 0 {
+    let most = crate::linear::frame::ROWS_M as i32;
+    if !(1..=most).contains(&m) || n <= 0 || k <= 0 || k % 8 != 0 || epi.parts() != 1 {
         return Err(refuse(
             OP,
-            format!("needs 1..=8 rows and k in whole eights, and was handed m={m}, k={k}"),
+            format!(
+                "needs 1..={most} rows, k in whole eights and one dense bank, and was handed \
+                 m={m}, k={k}, {} part(s)",
+                epi.parts()
+            ),
         ));
     }
-    if weight == 0 || act == 0 || out == 0 || !aligned16(weight) || !aligned16(act) {
+    if weight == 0 || act == 0 || !aligned16(weight) || !aligned16(act) {
         return Err(refuse(
             OP,
             "the weight and the activation are 16-byte aligned, and nothing is null",
         ));
     }
-    let split = rows_split(k);
-    let rows = 16 / split;
-    let blocks = n.unsigned_abs().div_ceil(rows as u32);
-    let cl = rows_cluster(n, k);
+    let planes = epi.planes(ins, outs, n.unsigned_abs())?;
+    let (kernel, blocks, cl) = rows_kernel(epi, m, n, k);
     ctx.fire(
         OP,
-        Fire::at(kernel(
-            GEMV,
-            &format!("::pie::linear::gemm_rows_bf16_kernel<{m}, {split}, {cl}>"),
-        ))
-        .apply(
+        Fire::at(kernel).apply(
             Launch::grid([blocks * cl, 1, 1], [256, 1, 1])
                 .programmatic(pdl)
                 .cluster(cl),
@@ -166,12 +213,8 @@ pub fn gemm_rows_bf16(
         &[
             ArgValue::Ptr(weight),
             ArgValue::Ptr(act),
-            if bias == 0 {
-                ArgValue::ABSENT
-            } else {
-                ArgValue::Ptr(bias)
-            },
-            ArgValue::Ptr(out),
+            ArgValue::of_slice(&planes),
+            ArgValue::of(&NO_FIELDS),
             ArgValue::I32(n),
             ArgValue::I32(k),
         ],

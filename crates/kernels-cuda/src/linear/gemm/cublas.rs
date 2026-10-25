@@ -26,7 +26,9 @@ use cudarc::runtime::sys::{
 
 use crate::jit::device::capture_status;
 use crate::jit::{Ctx, refuse};
+use crate::linear::frame::{Epilogue, Frame, In, MAX_INS, MAX_OUTS, ROWS_M, RowLeg};
 use crate::linear::gemv::{gemm_narrow_bf16, gemm_rows_bf16, gemv_bf16, rows_cluster};
+use crate::linear::skinny;
 
 const fn dev(address: u64) -> *const c_void {
     address as usize as *const c_void
@@ -57,6 +59,37 @@ struct Call {
     m: i32,
     n: i32,
     k: i32,
+    /// An anchored region's epilogue and planes; `y` is then its products'
+    /// plane where its leg lands them unfused.
+    anchor: Option<Anchor>,
+}
+
+/// An anchored region's planes past the contraction's: its epilogue, its
+/// inputs and results, its unfused leg's row frame where one carries it,
+/// and the plain product's tactic that leg runs (its `n` every part's).
+#[derive(Clone, Copy, Debug)]
+struct Anchor {
+    epi: &'static Epilogue,
+    ins: [In; MAX_INS],
+    n_ins: usize,
+    outs: [u64; MAX_OUTS],
+    n_outs: usize,
+    leg: Option<RowLeg>,
+    inner: Option<Tactic>,
+}
+
+impl Anchor {
+    fn ins(&self) -> &[In] {
+        &self.ins[..self.n_ins]
+    }
+
+    fn outs(&self) -> &[u64] {
+        &self.outs[..self.n_outs]
+    }
+
+    fn parts(&self) -> i32 {
+        i32::try_from(self.epi.parts()).unwrap_or(1)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +102,15 @@ enum Tactic {
     /// `gemm_rows_bf16`: a few rows in one launch, warps streaming the
     /// weight's rows.
     Rows,
+    /// The skinny frame: up to 64 rows on mma.sync, the weight streamed once
+    /// past the activation's rows in shared memory.
+    Skinny,
+    /// An anchored region fused: a contraction frame with its epilogue
+    /// filled in.
+    Frame(Frame),
+    /// An anchored region unfused: the plain product's own tactic, then the
+    /// epilogue on the row frame.
+    Unfused,
 }
 
 impl Tactic {
@@ -79,6 +121,16 @@ impl Tactic {
             Self::Gemv => (2, 0),
             Self::Narrow => (3, 0),
             Self::Rows => (4, 0),
+            Self::Skinny => (5, 0),
+            Self::Frame(frame) => (
+                6,
+                Frame::ALL
+                    .iter()
+                    .position(|f| *f == frame)
+                    .and_then(|i| i32::try_from(i).ok())
+                    .unwrap_or(0),
+            ),
+            Self::Unfused => (7, 0),
         }
     }
 
@@ -89,6 +141,12 @@ impl Tactic {
             2 => Some(Self::Gemv),
             3 => Some(Self::Narrow),
             4 => Some(Self::Rows),
+            5 => Some(Self::Skinny),
+            6 => usize::try_from(algo)
+                .ok()
+                .and_then(|i| Frame::ALL.get(i))
+                .map(|f| Self::Frame(*f)),
+            7 => Some(Self::Unfused),
             _ => None,
         }
     }
@@ -118,6 +176,7 @@ pub(crate) fn act_x_wt(
         m,
         n,
         k,
+        anchor: None,
     };
     let capturing = capture_status(stream);
     let tuning = ctx.tuning();
@@ -129,6 +188,7 @@ pub(crate) fn act_x_wt(
             tuning.gemm_split_launch_ns,
             tuning.gemm_rows_m,
             tuning.gemm_split_launch_from,
+            tuning.gemm_skinny_rows,
         );
         let plan = device.plan_for(call);
         let tactic = capturing
@@ -170,7 +230,7 @@ pub(crate) fn act_x_wt(
             tuning,
         )
     {
-        return Ok(matches!(tactic, Tactic::Gemv | Tactic::Rows) && bias != 0);
+        return Ok(matches!(tactic, Tactic::Gemv | Tactic::Rows | Tactic::Skinny) && bias != 0);
     }
     clear_error();
 
@@ -225,6 +285,162 @@ pub(crate) fn act_x_wt(
     ))
 }
 
+/// `outs = epi(act . w^T)`, an anchored region over a dense bf16 bank of
+/// `parts · n` rows, on whichever of its candidates the shape's timing
+/// picked: each contraction frame that covers it with the epilogue filled
+/// in, and the plain product's own tactic followed by the epilogue on the
+/// row frame where the row frame carries it. False, landing nothing, where
+/// no frame covers the shape or a capture meets it untimed: the caller's
+/// unfused ops then serve it.
+pub(crate) fn anchored(
+    ctx: &Ctx,
+    op: &'static str,
+    epi: &'static Epilogue,
+    act: u64,
+    w: u64,
+    ins: &[In],
+    outs: &[u64],
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<bool, Error> {
+    if m <= 0 || n <= 0 || k <= 0 || epi.plain() || ins.len() > MAX_INS || outs.len() > MAX_OUTS {
+        return Ok(false);
+    }
+    let tuning = ctx.tuning();
+    let frames: Vec<Frame> = Frame::ALL
+        .into_iter()
+        .filter(|f| f.covers(epi, m, n, k, &tuning))
+        .collect();
+    if frames.is_empty() {
+        return Ok(false);
+    }
+    let mut anchor = Anchor {
+        epi,
+        ins: [In::one(0); MAX_INS],
+        n_ins: ins.len(),
+        outs: [0; MAX_OUTS],
+        n_outs: outs.len(),
+        leg: None,
+        inner: None,
+    };
+    anchor.ins[..ins.len()].copy_from_slice(ins);
+    anchor.outs[..outs.len()].copy_from_slice(outs);
+    let parts = anchor.parts();
+    let handle: cublasHandle_t = ctx.cublas(op)?.cast::<cublasContext>();
+    let stream = ctx.stream();
+    let capturing = capture_status(stream);
+    // The frames that cover the shape, and the epilogue, key it.
+    let covering = frames
+        .iter()
+        .map(|f| Frame::ALL.iter().position(|g| g == f).unwrap_or(0))
+        .fold(0u64, |mask, i| mask | 1 << i);
+    let chosen = with_device(|device| {
+        device.configure(
+            (tuning.gemm_workspace_mb as usize) << 20,
+            tuning.gemm_heuristics as usize,
+            tuning.gemm_narrow_n,
+            tuning.gemm_split_launch_ns,
+            tuning.gemm_rows_m,
+            tuning.gemm_split_launch_from,
+            tuning.gemm_skinny_rows,
+        );
+        let call = Call {
+            act,
+            w,
+            bias: 0,
+            y: 0,
+            m,
+            n,
+            k,
+            anchor: None,
+        };
+        let key = shape_key(call, device.lt.workspace_bytes, device.heuristics, 0, 0)
+            ^ epi.hash().rotate_left(17)
+            ^ 0x616e_6368_0000_0000
+            ^ (covering << 40);
+        if let Some(tactic) = device.chosen.get(&key) {
+            return Some(*tactic);
+        }
+        if let Some(tactic) = device
+            .disk
+            .lookup(key)
+            .and_then(|(kind, algo)| Tactic::decode(kind, algo))
+        {
+            device.chosen.insert(key, tactic);
+            return Some(tactic);
+        }
+        let status = capturing?;
+        if status != cudaStreamCaptureStatus::cudaStreamCaptureStatusNone
+            || device.chosen.len() >= 1024
+            || (m as usize) * (n as usize) * 2 * (parts as usize + outs.len()) > 256 << 20
+        {
+            return None;
+        }
+        // The unfused leg: the plain product's tactic, timed (or read) as
+        // the plain product's own, then the row frame.
+        let plain = Call {
+            n: n * parts,
+            ..call
+        };
+        let plan = device.plan_for(plain);
+        anchor.leg = RowLeg::of(epi, n.unsigned_abs());
+        if anchor.leg.is_some() {
+            anchor.inner = device.tactic_for(handle, stream, plan.as_deref(), plain, status);
+        }
+        let mut candidates = Vec::new();
+        if anchor.leg.is_some() && anchor.inner.is_some() {
+            candidates.push(Tactic::Unfused);
+        }
+        candidates.extend(frames.iter().map(|f| Tactic::Frame(*f)));
+        let charge = device.charge(m);
+        let tactic = pick(
+            handle,
+            stream,
+            &device.lt,
+            plan.as_deref(),
+            Call {
+                anchor: Some(anchor),
+                ..call
+            },
+            &candidates,
+            charge,
+        );
+        device.disk.store(key, tactic.encode());
+        device.chosen.insert(key, tactic);
+        tracing::info!(
+            m,
+            n,
+            k,
+            parts,
+            epilogue = epi.hash(),
+            ?tactic,
+            "anchored gemm shape tuned"
+        );
+        Some(tactic)
+    });
+    match chosen {
+        Some(Tactic::Frame(frame)) => {
+            frame.fire(ctx, epi, w, act, ins, outs, m, n, k)?;
+            Ok(true)
+        }
+        Some(Tactic::Unfused) => {
+            let Some(leg) = RowLeg::of(epi, n.unsigned_abs()) else {
+                return Ok(false);
+            };
+            let bytes = (m as usize) * (n as usize) * (parts as usize) * 2;
+            let products = ctx.scratch_stream(op, ANCHOR_PRODUCTS, bytes)?.addr() as u64;
+            act_x_wt(ctx, op, act, w, 0, products, m, n * parts, k)?;
+            leg.fire(ctx, products, ins, outs, m.unsigned_abs(), n.unsigned_abs())?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// The plane an anchored region's unfused leg lands its products in.
+const ANCHOR_PRODUCTS: &str = "linear.anchor_products";
+
 fn run_tactic(
     handle: cublasHandle_t,
     stream: *mut c_void,
@@ -269,6 +485,73 @@ fn run_tactic(
             pdl,
         )
         .is_ok(),
+        Tactic::Skinny => {
+            let column = [In::column(call.bias)];
+            let (epi, ins): (&Epilogue, &[In]) = if call.bias == 0 {
+                (Epilogue::store(), &[])
+            } else {
+                (Epilogue::bias(), &column)
+            };
+            skinny::covers(call.m, call.n, call.k, 1, skinny::ROWS)
+                && skinny::skinny(
+                    // SAFETY: `stream` is a live `Ctx`'s stream or the tune arena's own; `Ctx::on`
+                    // only records it.
+                    &unsafe { Ctx::on(stream) }.with_tuning(tuning),
+                    epi,
+                    call.w,
+                    call.act,
+                    ins,
+                    &[call.y],
+                    call.m,
+                    call.n,
+                    call.k,
+                )
+                .is_ok()
+        }
+        Tactic::Frame(frame) => call.anchor.is_some_and(|a| {
+            frame
+                .fire(
+                    // SAFETY: `stream` is a live `Ctx`'s stream or the tune arena's own; `Ctx::on`
+                    // only records it.
+                    &unsafe { Ctx::on(stream) }.with_tuning(tuning),
+                    a.epi,
+                    call.w,
+                    call.act,
+                    a.ins(),
+                    a.outs(),
+                    call.m,
+                    call.n,
+                    call.k,
+                )
+                .is_ok()
+        }),
+        Tactic::Unfused => {
+            let Some(a) = call.anchor else {
+                return false;
+            };
+            let (Some(inner), Some(leg)) = (a.inner, a.leg) else {
+                return false;
+            };
+            let plain = Call {
+                n: call.n * a.parts(),
+                bias: 0,
+                anchor: None,
+                ..call
+            };
+            run_tactic(
+                handle, stream, lt_handle, plan, inner, plain, ws, ws_bytes, tuning,
+            ) && leg
+                .fire(
+                    // SAFETY: as above.
+                    &unsafe { Ctx::on(stream) }.with_tuning(tuning),
+                    call.y,
+                    a.ins(),
+                    a.outs(),
+                    call.m.unsigned_abs(),
+                    call.n.unsigned_abs(),
+                )
+                .is_ok()
+        }
         Tactic::Narrow => gemm_narrow_bf16(
             // SAFETY: `stream` is a live `Ctx`'s stream or the tune arena's own; `Ctx::on`
             // only records it.
@@ -831,6 +1114,9 @@ struct Device {
     /// `kernel.gemm.rows_m`: products of 2 to this many rows may time the
     /// few-rows kernel.
     rows_m: u32,
+    /// `kernel.gemm.skinny_rows`: products of 2 to this many rows may time
+    /// the skinny frame where it covers them.
+    skinny_rows: u32,
     plans: HashMap<(i32, i32, i32), Arc<LtPlan>>,
     chosen: HashMap<u64, Tactic>,
     disk: DiskCache,
@@ -854,6 +1140,7 @@ fn with_device<R>(f: impl FnOnce(&mut Device) -> R) -> R {
                 split_ns: 0,
                 split_from: 0,
                 rows_m: 0,
+                skinny_rows: 0,
                 plans: HashMap::new(),
                 chosen: HashMap::new(),
                 disk: DiskCache::new(),
@@ -876,6 +1163,7 @@ impl Device {
         split_ns: u32,
         rows_m: u32,
         split_from: u32,
+        skinny_rows: u32,
     ) {
         if self.lt.workspace_bytes != workspace_bytes
             || self.heuristics != heuristics
@@ -883,7 +1171,9 @@ impl Device {
             || self.split_ns != split_ns
             || self.rows_m != rows_m
             || self.split_from != split_from
+            || self.skinny_rows != skinny_rows
         {
+            self.skinny_rows = skinny_rows;
             self.split_from = split_from;
             self.lt.workspace_bytes = workspace_bytes;
             self.heuristics = heuristics;
@@ -951,6 +1241,12 @@ impl Device {
         } else {
             key
         };
+        // And one the skinny frame may serve apart from one it may not.
+        let key = if skinny_tried(call, self.skinny_rows) {
+            key ^ 0x736b_696e_0000_0000 ^ (u64::from(self.skinny_rows) << 16)
+        } else {
+            key
+        };
         if let Some(tactic) = self.chosen.get(&key) {
             return Some(*tactic);
         }
@@ -980,6 +1276,7 @@ impl Device {
             self.narrow_n,
             charge,
             self.rows_m,
+            self.skinny_rows,
         );
         self.disk.store(key, tactic.encode());
         self.chosen.insert(key, tactic);
@@ -997,7 +1294,14 @@ impl Device {
 /// Whether the tuner times the few-rows kernel for `call`
 /// (`kernel.gemm.rows_m`).
 fn rows_tried(call: Call, rows_m: u32) -> bool {
-    call.m >= 2 && call.m <= rows_m.min(8) as i32 && call.k % 8 == 0
+    call.m >= 2 && call.m <= rows_m.min(ROWS_M) as i32 && call.k % 8 == 0
+}
+
+/// Whether the tuner times the skinny frame for `call`
+/// (`kernel.gemm.skinny_rows`): from 2 rows (the gemv serves one), where it
+/// covers the shape.
+fn skinny_tried(call: Call, skinny_rows: u32) -> bool {
+    call.m >= 2 && skinny::covers(call.m, call.n, call.k, 1, skinny_rows)
 }
 
 fn shape_key(
@@ -1042,6 +1346,7 @@ fn tune(
     narrow_n: u32,
     split_ns: u32,
     rows_m: u32,
+    skinny_rows: u32,
 ) -> Tactic {
     let mut candidates = Vec::new();
     if call.m == 1 {
@@ -1058,13 +1363,45 @@ fn tune(
     if rows_tried(call, rows_m) {
         candidates.push(Tactic::Rows);
     }
+    if skinny_tried(call, skinny_rows) {
+        candidates.push(Tactic::Skinny);
+    }
+    pick(handle, caller_stream, lt, plan, call, &candidates, split_ns)
+}
 
+/// Whether a captured step pays `tactic` a split's reduce launch of its own,
+/// which a lone timing hides (`kernel.gemm.split_launch_ns`):
+/// `cublasGemmEx` picks its own algorithm, a split one as likely, so it is
+/// charged too, and an unfused leg as its product's tactic is.
+fn charged(tactic: Tactic, plan: Option<&LtPlan>, call: Call) -> bool {
+    match tactic {
+        Tactic::Lt(i) => plan.is_some_and(|p| splits_of(&p.heuristics[i].algo) > 1),
+        Tactic::GemmEx => true,
+        Tactic::Unfused => call
+            .anchor
+            .and_then(|a| a.inner)
+            .is_some_and(|inner| charged(inner, plan, call)),
+        Tactic::Gemv | Tactic::Narrow | Tactic::Rows | Tactic::Skinny | Tactic::Frame(_) => false,
+    }
+}
+
+/// The fastest of `candidates` for `call`, each timed in the arena; of
+/// those within a tie, the earliest.
+fn pick(
+    handle: cublasHandle_t,
+    caller_stream: *mut c_void,
+    lt: &LtCtx,
+    plan: Option<&LtPlan>,
+    call: Call,
+    candidates: &[Tactic],
+    split_ns: u32,
+) -> Tactic {
     let mut arena = TuneArena::empty();
     if !arena.init(handle, caller_stream, lt.workspace_bytes, call) {
         return candidates[0];
     }
     let mut timings = Vec::with_capacity(candidates.len());
-    for &candidate in &candidates {
+    for &candidate in candidates {
         let Some(ms) = arena
             .time(candidate, lt.handle, plan, call)
             .filter(|ms| *ms > 0.0)
@@ -1079,16 +1416,11 @@ fn tune(
             us = ms * 1000.0,
             "dense gemm bench"
         );
-        // A captured step pays a split's reduce its own launch, which a
-        // lone timing hides (`kernel.gemm.split_launch_ns`).
-        // `cublasGemmEx` picks its own algorithm, a split one as likely, so
-        // it is charged too.
-        let two = match candidate {
-            Tactic::Lt(i) => plan.is_some_and(|p| splits_of(&p.heuristics[i].algo) > 1),
-            Tactic::GemmEx => true,
-            Tactic::Gemv | Tactic::Narrow | Tactic::Rows => false,
+        let charge = if charged(candidate, plan, call) {
+            split_ns as f32 * 1e-6
+        } else {
+            0.0
         };
-        let charge = if two { split_ns as f32 * 1e-6 } else { 0.0 };
         timings.push((candidate, ms + charge, charge));
     }
     let fastest = timings
@@ -1234,7 +1566,9 @@ impl TuneArena {
         call: Call,
     ) -> bool {
         let act_bytes = ((call.m as usize) * (call.k as usize) * 2).max(1);
-        let y_bytes = ((call.m as usize) * (call.n as usize) * 2).max(1);
+        // An anchored region's products, then its results.
+        let tiles = call.anchor.map_or(1, |a| a.epi.parts() as usize + a.n_outs);
+        let y_bytes = ((call.m as usize) * (call.n as usize) * 2 * tiles).max(1);
         self.workspace_bytes = workspace_bytes;
         self.caller_stream = caller_stream;
         self.flush_bytes = flush_bytes();
@@ -1305,12 +1639,34 @@ impl TuneArena {
             m: 1,
             n: rows as i32,
             k: K as i32,
+            anchor: None,
         };
         gemm_ex(
             self.handle,
             call,
             cublasGemmAlgo_t::CUBLAS_GEMM_DEFAULT_TENSOR_OP,
         ) == cublasStatus_t::CUBLAS_STATUS_SUCCESS
+    }
+
+    /// `call` on the arena's planes: its activation, its product (an
+    /// anchored region's products, then its results) and no bias.
+    fn bench(&self, call: Call) -> Call {
+        let y = self.y.addr() as u64;
+        let tile = (call.m as u64) * (call.n as u64) * 2;
+        let anchor = call.anchor.map(|mut a| {
+            let products = u64::from(a.epi.parts()) * tile;
+            for (r, out) in (0u64..).zip(a.outs.iter_mut().take(a.n_outs)) {
+                *out = y + products + r * tile;
+            }
+            a
+        });
+        Call {
+            act: self.act.addr() as u64,
+            bias: 0,
+            y,
+            anchor,
+            ..call
+        }
     }
 
     fn time(
@@ -1320,12 +1676,7 @@ impl TuneArena {
         plan: Option<&LtPlan>,
         call: Call,
     ) -> Option<f32> {
-        let bench = Call {
-            act: self.act.addr() as u64,
-            bias: 0,
-            y: self.y.addr() as u64,
-            ..call
-        };
+        let bench = self.bench(call);
         let fire = || {
             run_tactic(
                 self.handle,
@@ -1353,10 +1704,13 @@ impl TuneArena {
         }
         // A decode's product streams a weight no cache holds and runs a
         // few microseconds, which the difference of two spans of evictions
-        // cannot resolve (one read 0.2 us for a 7 MB weight, A100): one
-        // eviction, then a run of products back to back, each over a
-        // different slice of the slab, timed alone.
-        if call.m == 1
+        // cannot resolve (one read 0.2 us for a 7 MB weight, A100), and over
+        // an L2 as large as an L40S's (96 MB) the span's weight stays
+        // cached between its products, timing a split algorithm at half
+        // the copy rate's floor: one eviction, then a run of products back
+        // to back, each over a different slice of the slab, timed alone, up
+        // to a decode's `STREAMED_ROWS` rows.
+        if call.m <= STREAMED_ROWS
             && let Some(ms) = self.streamed(tactic, lt_handle, plan, bench)
         {
             return Some(ms);
@@ -1387,7 +1741,8 @@ impl TuneArena {
         plan: Option<&LtPlan>,
         bench: Call,
     ) -> Option<f32> {
-        let weight = (bench.n as usize) * (bench.k as usize) * 2;
+        let parts = bench.anchor.map_or(1, |a| a.parts()) as usize;
+        let weight = parts * (bench.n as usize) * (bench.k as usize) * 2;
         let cold = self.flush_bytes / 2;
         let runs = (cold / weight.next_multiple_of(256).max(1)).min(STREAMED);
         if weight == 0 || runs < 4 {
@@ -1565,8 +1920,12 @@ impl TuneArena {
 const REPS: usize = 4;
 const ROUNDS: usize = 3;
 
-/// Products of one row a streamed span runs back to back.
+/// Products a streamed span runs back to back.
 const STREAMED: usize = 16;
+
+/// The most rows a product is timed streamed: a decode's, its weight read
+/// from DRAM in a step.
+const STREAMED_ROWS: i32 = 64;
 
 fn flush_bytes() -> usize {
     const FALLBACK: usize = 64 << 20;
@@ -1688,7 +2047,7 @@ fn signature() -> String {
         .collect();
     let name = String::from_utf8_lossy(&name).into_owned();
     format!(
-        "# pie-dense-gemm v9 sm{}{} cublas={version} dev={name}",
+        "# pie-dense-gemm v10 sm{}{} cublas={version} dev={name}",
         prop.major, prop.minor
     )
 }

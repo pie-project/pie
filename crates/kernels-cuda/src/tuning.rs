@@ -70,12 +70,12 @@ pub struct MoeNvfp4MmaFrom(pub u32);
 #[decision(id = "kernel.gemm.tc5_split_tickets", constant(range(0..=65536)), default = 0, tune = search)]
 pub struct GemmTc5SplitTickets(pub u32);
 
-/// The most rows (2..=8) a dense bf16 product may time the few-rows kernel
+/// The most rows (2..=16) a dense bf16 product may time the few-rows kernel
 /// for, one launch streaming the weight's rows, beside cuBLAS's algorithms
 /// (a decode's narrow projections run split along K in two launches there).
 /// 0 never tries it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.gemm.rows_m", constant(range(0..=8)), default = 0, tune = search)]
+#[decision(id = "kernel.gemm.rows_m", constant(range(0..=16)), default = 0, tune = search)]
 pub struct GemmRowsM(pub u32);
 
 /// Programmatic dependent launch: a kernel that opts in (it waits on its
@@ -555,8 +555,10 @@ pub struct GemmWorkspaceMb(pub u32);
 #[decision(id = "kernel.gemm.heuristics", constant(range(1..=32)), default = 8, tune = search)]
 pub struct GemmHeuristics(pub u32);
 
-/// The most rows the fused skinny bf16 GEMM (GEGLU, soft-capped heads)
-/// serves; past it cuBLAS does. Its tile holds 64; 0 never takes it.
+/// The most rows the skinny bf16 frame serves: the most a fused hand rule
+/// (GEGLU, soft-capped heads) fires it at, and the most a dense bf16 product
+/// may time it for beside cuBLAS's algorithms. Its tile holds 64; 0 never
+/// takes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.gemm.skinny_rows", constant(range(0..=64)), default = 64, tune = search)]
 pub struct GemmSkinnyRows(pub u32);

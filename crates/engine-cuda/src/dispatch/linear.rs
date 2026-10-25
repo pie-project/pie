@@ -184,33 +184,26 @@ impl Run<'_> {
                 packed,
                 y,
             } => {
-                // The skinny leg reads the weight as one dense handle; a split-plane
-                // bank resolves only through the matmul below.
+                // The fused leg reads the weight as one dense handle; a split-plane
+                // bank resolves only through the matmul below. Where the tuner
+                // picks it (a contraction frame with GEGLU filled in, or the
+                // product then the region on the row frame) it serves the op.
                 if self.dense_weight(*w) {
                     let a = self.tensor(*act);
                     let weight = self.tensor(*w);
                     let out = self.tensor(*y);
-                    let (m, k) = (a.rows as i32, a.width as i32);
-                    let i = i32::try_from(*intermediate).unwrap_or(0);
                     if weight.rows == 2 * *intermediate
-                        && linear::skinny::covers(
-                            m,
-                            i,
-                            k,
-                            linear::skinny::Epilogue::Geglu,
-                            self.ctx().tuning().gemm_skinny_rows,
-                        )
-                    {
-                        return linear::skinny::skinny_bf16(
+                        && linear::gemm::anchored(
                             self.ctx(),
-                            weight.ptr,
-                            a.ptr,
-                            out.ptr,
-                            m,
-                            i,
-                            k,
-                            linear::skinny::Epilogue::Geglu,
-                        );
+                            "fused.matmul_glu",
+                            linear::frame::Epilogue::geglu_tanh(),
+                            a,
+                            weight,
+                            &[],
+                            &[out],
+                        )?
+                    {
+                        return Ok(());
                     }
                 }
                 self.linear(&Linear::Matmul {
@@ -446,30 +439,18 @@ impl Run<'_> {
                 y,
                 y_out: _,
             } => {
-                if self.dense_weight(*w) {
-                    let a = self.tensor(*act);
-                    let weight = self.tensor(*w);
-                    let out = self.tensor(*y);
-                    let (m, n, k) = (a.rows as i32, weight.rows as i32, a.width as i32);
-                    let epilogue = linear::skinny::Epilogue::Softcap(*cap);
-                    if linear::skinny::covers(
-                        m,
-                        n,
-                        k,
-                        epilogue,
-                        self.ctx().tuning().gemm_skinny_rows,
-                    ) {
-                        return linear::skinny::skinny_bf16(
-                            self.ctx(),
-                            weight.ptr,
-                            a.ptr,
-                            out.ptr,
-                            m,
-                            n,
-                            k,
-                            epilogue,
-                        );
-                    }
+                if self.dense_weight(*w)
+                    && linear::gemm::anchored(
+                        self.ctx(),
+                        "fused.matmul_softcap",
+                        linear::frame::Epilogue::softcap(*cap)?,
+                        self.tensor(*act),
+                        self.tensor(*w),
+                        &[],
+                        &[self.tensor(*y)],
+                    )?
+                {
+                    return Ok(());
                 }
                 self.linear(&Linear::Matmul {
                     act: *act,
