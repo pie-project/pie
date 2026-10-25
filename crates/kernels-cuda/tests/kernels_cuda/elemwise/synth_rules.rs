@@ -301,8 +301,9 @@ fn generated(chain: Chain, width: usize) -> Synthesized {
 
 /// The knobs the hand kernels run under: none (the L40S's profile, and
 /// every chip's default), or the register forms and unread rows skipped
-/// (B200's and H200's profiles, `kernel.elemwise.{rows_vec, skip_unread,
-/// norm_fold_block}`).
+/// (B200's and H200's profiles, `kernel.elemwise.{rows_vec,
+/// norm_fold_block}`, the rows nothing reads left unwritten as the engine
+/// left them when it fired the hand kernel).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Knobs {
     Default,
@@ -317,13 +318,12 @@ impl Knobs {
             Knobs::Default => gpu.ctx().with_tuning(Tuning::DEFAULT),
             Knobs::Tuned => gpu.ctx().with_tuning(tuned(|t| {
                 t.rows_vec = true;
-                t.skip_unread = true;
                 t.norm_fold_block = 128;
             })),
         }
     }
 
-    /// The rows the hand norm-and-fold lands: under `skip_unread` the
+    /// The rows the hand norm-and-fold lands: tuned, the
     /// engine leaves the normed row it alone reads unwritten, and the sum
     /// too where only its scaled copy goes on.
     fn keep(self, chain: Chain) -> Keep {

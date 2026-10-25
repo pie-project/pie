@@ -93,8 +93,6 @@ pub struct Shell {
     /// prefill's width.
     staging: Vec<bool>,
     schedule_readers: Vec<Option<u32>>,
-    /// Each value nothing reads ([`crate::exports::unread`]).
-    unread: Vec<bool>,
     adapter_fact: Option<u32>,
     adapters: crate::blob::Adapters,
     held: Vec<u32>,

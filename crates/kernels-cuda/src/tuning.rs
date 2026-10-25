@@ -630,13 +630,6 @@ pub struct ElemwiseRowsVec;
 #[decision(id = "kernel.elemwise.q_norm_rope_warp", flag, default = false, tune = search)]
 pub struct ElemwiseQNormRopeWarp;
 
-/// Whether a fused norm-and-fold leaves unwritten the rows nothing reads past
-/// it (Gemma 4's normed sublayer outputs, and a stream its layer scalar
-/// rescales into a new row).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.elemwise.skip_unread", flag, default = false, tune = search)]
-pub struct ElemwiseSkipUnread;
-
 /// The threads a block of the 16-byte fused norm-and-fold takes a row with
 /// in a fire of 1024 rows or more: 0 is the row's runs rounded up to a power
 /// of two (at most 512), as always and as in every narrower fire; a smaller
@@ -840,7 +833,6 @@ pub fn register(registry: &mut Registry) {
         .add::<SsmGdnScanUntil>()
         .add::<ElemwiseRowsVec>()
         .add::<ElemwiseQNormRopeWarp>()
-        .add::<ElemwiseSkipUnread>()
         .add::<ElemwiseNormFoldBlock>()
         .add::<ElemwiseHcTile>()
         .add::<ElemwiseHcMma>()
@@ -982,7 +974,6 @@ tuning! {
     ssm_gdn_scan_until: u32 = 32, get SsmGdnScanUntil;
     rows_vec: bool = false, on ElemwiseRowsVec;
     q_norm_rope_warp: bool = false, on ElemwiseQNormRopeWarp;
-    skip_unread: bool = false, on ElemwiseSkipUnread;
     norm_fold_block: u32 = 0, get ElemwiseNormFoldBlock;
     hc_tile: bool = false, on ElemwiseHcTile;
     hc_mma: bool = false, on ElemwiseHcMma;

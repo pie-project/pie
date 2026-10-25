@@ -55,8 +55,6 @@ elemwise.hc_mega_from = 43
 elemwise.hc_mega_until = 1120
 # Gemma 4's q norm and rotation on its kv-shared layers a warp a (row, head).
 elemwise.q_norm_rope_warp = true
-# A fused norm-and-fold leaves unwritten the rows nothing reads past it.
-elemwise.skip_unread = true
 # A prefill's fused norm-and-fold 128 threads a row.
 elemwise.norm_fold_block = 128
 # Qwen3.5's attention prologue in one launch up to 64 rows.

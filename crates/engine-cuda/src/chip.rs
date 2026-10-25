@@ -573,9 +573,8 @@ mod tests {
                 assert_eq!(tuning.decode_gqa_cluster, if b200 { 8 } else { 0 }, "{gpu}");
                 assert_eq!(tuning.decode_gqa_deep_64, b200, "{gpu}");
                 // B200 alone runs Gemma 4's q norm a warp a head and its
-                // norm-and-fold 128 threads a row, skipping unread rows.
+                // norm-and-fold 128 threads a row.
                 assert_eq!(tuning.q_norm_rope_warp, b200, "{gpu}");
-                assert_eq!(tuning.skip_unread, b200, "{gpu}");
                 assert_eq!(tuning.norm_fold_block, if b200 { 128 } else { 0 }, "{gpu}");
                 // B200 alone lands a hyper-connection seam in one launch,
                 // from 43 to 1120 rows.
@@ -652,7 +651,6 @@ mod tests {
                         norm_emit: false,
                         qkv_rows_from: defaults.qkv_rows_from,
                         q_norm_rope_warp: false,
-                        skip_unread: false,
                         norm_fold_block: 0,
                         ..tuning
                     },

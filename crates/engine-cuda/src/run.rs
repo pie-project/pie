@@ -573,8 +573,6 @@ pub struct Run<'c> {
 
     decoded: &'c [u64],
 
-    /// Each value nothing reads, by id ([`Run::unread`]).
-    unread: &'c [bool],
 
     copy: CopyPlan,
 
@@ -688,7 +686,6 @@ impl<'c> Run<'c> {
             stream: &place.region,
             body: None,
             decoded: &[],
-            unread: &[],
             copy: CopyPlan::default(),
             ceilings: Ceilings::default(),
             stood: Cell::new(None),
@@ -1239,21 +1236,6 @@ impl<'c> Run<'c> {
     pub fn decoded_tiles(mut self, tiles: &'c [u64]) -> Self {
         self.decoded = tiles;
         self
-    }
-
-    /// Which values nothing reads, by id ([`crate::exports::unread`]).
-    #[must_use]
-    pub fn unread(mut self, unread: &'c [bool]) -> Self {
-        self.unread = unread;
-        self
-    }
-
-    /// Whether nothing reads `id`; a value the table does not cover is read.
-    /// Read by no dispatch since the residual norms (whose hand kernel left
-    /// a row nothing reads unwritten) run as generated regions.
-    #[allow(dead_code)]
-    pub(crate) fn is_unread(&self, id: ValueId) -> bool {
-        self.unread.get(id.0 as usize).copied().unwrap_or(false)
     }
 
     /// Whether this region's stream holds an `[n, k]` plane in bf16. A
