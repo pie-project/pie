@@ -937,6 +937,7 @@ impl Metal {
             .iter()
             .map(|attachment| Attached {
                 lane: attachment.lane,
+                lanes: attachment.lanes,
                 instance: attachment.instance,
                 at: attachment.at,
             })

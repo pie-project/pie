@@ -242,7 +242,9 @@ struct InputFeedPlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Attached {
+    /// The first of the pass's lanes, `lanes` of them in a row.
     pub lane: u32,
+    pub lanes: u32,
     pub instance: engine::InstanceId,
     pub at: Boundary,
 }
@@ -3418,7 +3420,7 @@ impl Shell {
                 };
                 let Some(attached) = attachments
                     .iter()
-                    .find(|a| a.lane as usize == row.source as usize)
+                    .find(|a| (a.lane..a.lane + a.lanes.max(1)).contains(&row.source))
                 else {
                     return Err(Fault::Program {
                         at: "serve::prepare",
