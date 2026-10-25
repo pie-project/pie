@@ -675,7 +675,7 @@ mod pinned {
     use super::{Error, refuse};
     use cudarc::runtime::sys as rt;
     use std::collections::BTreeMap;
-    use std::sync::{Mutex, PoisonError};
+    use std::sync::Mutex;
 
     /// Slots before a stage waits for the oldest copy rather than grow.
     const MOST: usize = 64;
@@ -707,9 +707,9 @@ mod pinned {
         stream: rt::cudaStream_t,
         f: impl FnOnce(&mut Ring) -> Result<R, Error>,
     ) -> Result<R, Error> {
-        let ring: &'static Mutex<Ring> = *RINGS
+        let ring: &'static Mutex<Ring> = RINGS
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .expect("plan rings lock poisoned")
             .entry(stream as usize)
             .or_insert_with(|| {
                 Box::leak(Box::new(Mutex::new(Ring {
@@ -717,7 +717,7 @@ mod pinned {
                     next: 0,
                 })))
             });
-        f(&mut ring.lock().unwrap_or_else(PoisonError::into_inner))
+        f(&mut ring.lock().expect("plan ring lock poisoned"))
     }
 
     fn check(op: &'static str, what: &str, code: rt::cudaError_t) -> Result<(), Error> {

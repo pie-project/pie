@@ -19,6 +19,23 @@ static STRICT_KERNELS: extern "C" fn() = {
     on
 };
 
+// Every work queue a context may have, before CUDA's first call reads the
+// count and before any thread runs: a group of four or eight ranks on one
+// device needs more than the default eight (`ep::wire` refuses it).
+#[cfg(target_os = "linux")]
+#[used]
+#[allow(unsafe_code)]
+#[unsafe(link_section = ".init_array")]
+static WORK_QUEUES: extern "C" fn() = {
+    extern "C" fn queues() {
+        if std::env::var_os("CUDA_DEVICE_MAX_CONNECTIONS").is_none() {
+            // SAFETY: a constructor, before main and before any thread.
+            unsafe { std::env::set_var("CUDA_DEVICE_MAX_CONNECTIONS", "32") };
+        }
+    }
+    queues
+};
+
 /// Held by each test for its whole run. A test that fails leaves nothing
 /// behind it guards, so the next still runs.
 #[allow(clippy::disallowed_methods)]

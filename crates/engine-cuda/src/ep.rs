@@ -71,10 +71,7 @@ impl Quiet {
 
     /// Waits until every rank of the group has met here.
     pub fn meet(&self) -> Result<()> {
-        let mut met = self
-            .met
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut met = self.met.lock().expect("quiet lock poisoned");
         let generation = met.0;
         met.1 += 1;
         if met.1 == self.world {
@@ -85,7 +82,7 @@ impl Quiet {
         let (met, waited) = self
             .all
             .wait_timeout_while(met, QUIET_PATIENCE, |met| met.0 == generation)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .expect("quiet lock poisoned");
         if waited.timed_out() && met.0 == generation {
             return Err(Fault::program(
                 "ep::Quiet",
@@ -284,6 +281,26 @@ impl Seats {
     }
 }
 
+/// The work queues a device's context feeds its streams through:
+/// `CUDA_DEVICE_MAX_CONNECTIONS` as the process started, 8 unless set, at
+/// most 32. A stream with work pending holds a queue; once every queue is
+/// held, a further stream's work shares one and waits behind what is queued
+/// there. A rank's collective spins for its peers' launches with the rank's
+/// next kernels queued behind it, so a peer on the same device whose stream
+/// lands behind it never launches: the ranks a device carries, each with the
+/// streams it keeps busy beside its compute stream ([`QUEUES_A_RANK`]), must
+/// fit its queues.
+fn work_queues() -> u32 {
+    std::env::var("CUDA_DEVICE_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|word| word.trim().parse::<u32>().ok())
+        .map_or(8, |queues| queues.clamp(1, 32))
+}
+
+/// The work queues a rank may hold at once: its compute stream and the
+/// copy, tap and side streams that run beside it.
+const QUEUES_A_RANK: u32 = 4;
+
 /// Wires `ordinals` (one rank each, in rank order) for expert parallelism
 /// at `widest`. The ranks must reach one another as the peer collectives
 /// do ([`crate::comm::reach`] checks the path first); there is no fallback
@@ -294,6 +311,21 @@ pub fn wire(ordinals: &[i32], widest: Widest) -> Result<Vec<Wire>> {
     if !(2..=EP_MAX_RANKS).contains(&world) {
         return Err(off(format!(
             "expert parallelism runs 2 to 8 ranks, not {world}"
+        )));
+    }
+    let sharing = (ordinals.iter())
+        .map(|a| ordinals.iter().filter(|b| *b == a).count() as u32)
+        .max()
+        .unwrap_or(1);
+    let queues = work_queues();
+    if sharing > 1 && sharing * QUEUES_A_RANK > queues {
+        return Err(off(format!(
+            "{sharing} ranks share a device, and its context has {queues} work queues: a \
+             rank's stream that finds every queue held by a peer's queued work waits behind \
+             a collective spinning for it, and the group deadlocks. Start the process with \
+             CUDA_DEVICE_MAX_CONNECTIONS={} or more (the pie binaries raise it to 32 \
+             unless it is set; CUDA reads it once, before its first call)",
+            sharing * QUEUES_A_RANK
         )));
     }
     crate::comm::reach(ordinals).map_err(|why| {

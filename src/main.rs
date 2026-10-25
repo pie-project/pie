@@ -79,6 +79,24 @@ fn die_quietly_on_closed_pipe() {
 #[cfg(not(unix))]
 fn die_quietly_on_closed_pipe() {}
 
+// Every work queue a CUDA context may have, set before CUDA's first call
+// reads the count and before any thread (the runtime's) runs: an
+// expert-parallel group of four or eight ranks on one device needs more
+// than the default eight, and refuses to wire without them.
+#[cfg(all(target_os = "linux", feature = "engine-cuda"))]
+#[used]
+#[allow(unsafe_code)]
+#[unsafe(link_section = ".init_array")]
+static CUDA_WORK_QUEUES: extern "C" fn() = {
+    extern "C" fn queues() {
+        if std::env::var_os("CUDA_DEVICE_MAX_CONNECTIONS").is_none() {
+            // SAFETY: a constructor, before main and before any thread.
+            unsafe { std::env::set_var("CUDA_DEVICE_MAX_CONNECTIONS", "32") };
+        }
+    }
+    queues
+};
+
 fn report(error: &anyhow::Error) {
     let palette = ui::Palette::for_stream(ui::Stream::Stderr);
     eprintln!("{} {error}", ui::Mark::Blocked.render(&palette));
