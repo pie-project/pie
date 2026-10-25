@@ -243,6 +243,67 @@ fn expr_methods(builder: &mut MethodsBuilder) {
         ))))
     }
 
+    /// The values of a `shape` tensor of `encoding` with its axes put in the
+    /// order `axes` (`y[i0, i1, ..] = x[.., i_k at axes[k], ..]`), the output
+    /// axes in `flip` run backwards: one gather over the whole tensor.
+    fn permute(
+        this: &ExprValue,
+        #[starlark(require = pos)] shape: UnpackList<i64>,
+        #[starlark(require = pos)] axes: UnpackList<u32>,
+        #[starlark(require = pos)] encoding: &EncodingValue,
+        #[starlark(require = named, default = UnpackList::default())] flip: UnpackList<u32>,
+    ) -> anyhow::Result<ExprValue> {
+        let (shape, axes, flip) = (shape.items, axes.items, flip.items);
+        let rank = shape.len();
+        let mut seen = vec![false; rank];
+        for &a in &axes {
+            let a = a as usize;
+            anyhow::ensure!(
+                axes.len() == rank && a < rank && !std::mem::replace(&mut seen[a], true),
+                "{axes:?} is not an order of {rank} axes"
+            );
+        }
+        let mut strides = vec![1i64; rank];
+        for k in (0..rank.saturating_sub(1)).rev() {
+            strides[k] = strides[k + 1] * shape[k + 1];
+        }
+        let out: Vec<i64> = axes.iter().map(|&a| shape[a as usize]).collect();
+        let total: i64 = shape.iter().product();
+        let mut indices = Vec::with_capacity(usize::try_from(total)?);
+        let mut at = vec![0i64; rank];
+        for _ in 0..total {
+            indices.push(
+                at.iter()
+                    .zip(&axes)
+                    .enumerate()
+                    .map(|(k, (&i, &a))| {
+                        let i = if flip.contains(&(k as u32)) {
+                            out[k] - 1 - i
+                        } else {
+                            i
+                        };
+                        i * strides[a as usize]
+                    })
+                    .sum(),
+            );
+            for k in (0..rank).rev() {
+                at[k] += 1;
+                if at[k] < out[k] {
+                    break;
+                }
+                at[k] = 0;
+            }
+        }
+        let flat = this
+            .0
+            .clone()
+            .transmute(TensorType::new(vec![total], encoding.0.clone()));
+        Ok(ExprValue(
+            flat.gather(0, indices)
+                .transmute(TensorType::new(out, encoding.0.clone())),
+        ))
+    }
+
     /// The values re-encoded as `encoding`; a block-scaled FP8 source states
     /// the `chunks` its rows are stored cut into, each under factors of its
     /// own.

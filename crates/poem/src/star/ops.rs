@@ -1510,6 +1510,20 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "elemwise",
+        name: "snake",
+        params: &["x", "alpha", "beta"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let alpha: Weight = a.next()?;
+            let beta: Weight = a.next()?;
+            result(
+                heap,
+                dsl("elemwise.snake", || ops::elemwise::snake(&x, &alpha, &beta))?,
+            )
+        },
+    },
+    Op {
+        module: "elemwise",
         name: "standardize",
         params: &["x", "bias", "scale"],
         call: |a, heap| {

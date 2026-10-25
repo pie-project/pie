@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use crate::Op;
 use crate::value::ValueId;
 
+fn undilated() -> [u32; 3] {
+    [1, 1, 1]
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TimePad {
     Zero,
@@ -169,6 +173,13 @@ pub enum Conv {
         pad_back: [u32; 3],
         causal_t: bool,
         time_pad: TimePad,
+        /// The taps' spacing along each axis; `k` is the spread kernel's
+        /// extent `(taps - 1) · dilation + 1`.
+        #[serde(default = "undilated")]
+        dilation: [u32; 3],
+        /// Each channel convolved alone: the weight is `[C, taps]`.
+        #[serde(default)]
+        depthwise: bool,
         /// The frames a causal conv carries over from the last fire.
         #[input]
         cache: Option<ValueId>,

@@ -242,6 +242,21 @@ pub fn add_bias(bias: &Weight, out: &Value) -> Value {
     out_out
 }
 
+pub fn snake(x: &Value, alpha: &Weight, beta: &Weight) -> Value {
+    let r = x.rec();
+    let x_out = r.fresh(x.ty().clone());
+    r.push(
+        Elemwise::Snake {
+            x: x.id(),
+            alpha: r.weight(alpha),
+            beta: r.weight(beta),
+            x_out: x_out.id(),
+        },
+        &[x],
+    );
+    x_out
+}
+
 pub fn standardize(x: &Value, bias: &Weight, scale: &Weight) -> Value {
     let r = x.rec();
     let x_out = r.fresh(x.ty().clone());
