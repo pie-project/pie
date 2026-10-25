@@ -3,13 +3,19 @@
 //! [`Exchange`]. It serves one lane a step and holds its keys and values by
 //! position; it runs the ops a plain MoE trunk is written in (embedding,
 //! norms, products, rotary, paged attention over its own lane, routed
-//! experts, an expert-parallel dispatch and combine) and refuses the rest.
+//! experts, an expert-parallel dispatch and combine, a tensor-parallel sum
+//! and gather) and refuses the rest.
 //!
 //! Each value is f32 on the host, rounded to bf16 where the trace types it
 //! so. A row's result depends only on that row (and, in attention, on its
 //! lane's earlier rows), never on which other rows a step or a rank holds:
 //! one rank holding every expert and `N` ranks holding a part each answer
 //! the same bits, which is what [`Forward`] is for.
+//!
+//! A tensor-parallel rank holds its share of each weight the trace cuts, as
+//! the import reads it (each segment's part along the cut axis, a group of
+//! ranks in a row holding a part alike); a sum adds the ranks' terms in rank
+//! order and a gather lays their shares of each row side by side.
 //!
 //! A dispatch follows `Collective::Dispatch`: every rank's tokens, `T` the
 //! most any rank brings, land on the ranks holding their routes (by the
@@ -23,7 +29,7 @@ use std::sync::Arc;
 use engine::placement::Placement;
 use poem_ir::{
     Attn, Collective, Def, Dim, Dtype, Elemwise, Gather, GluAct, Guard, Linear, NormAxis,
-    NormWeight, Operands, Operation, ParamSource, RouteScore, RuntimeInput, Trace, Turn, Ty,
+    NormWeight, Operands, Operation, ParamSource, RouteScore, RuntimeInput, Shard, Trace, Turn, Ty,
     ValueId,
 };
 
@@ -79,6 +85,52 @@ struct Placed {
     table: Vec<i32>,
     stride: usize,
     held: Vec<u32>,
+}
+
+/// A param a tensor-parallel group cuts: its share's `shape` on a rank,
+/// the `axis` cut, the `segments` of the share along it, and the ways the
+/// ranks cut each segment (a group of ranks in a row holding a part alike
+/// where there are fewer parts than ranks).
+struct Cut<'a> {
+    shape: &'a [u64],
+    axis: usize,
+    segments: &'a [u64],
+    parts: &'a [u64],
+}
+
+impl Cut<'_> {
+    /// The elements of the whole param.
+    fn whole(&self) -> usize {
+        let extent: u64 = (self.segments.iter().zip(self.parts))
+            .map(|(s, p)| s * p)
+            .sum();
+        let rest: u64 = (self.shape.iter().enumerate())
+            .filter(|(i, _)| *i != self.axis)
+            .map(|(_, d)| d)
+            .product();
+        (extent * rest) as usize
+    }
+
+    /// Rank `rank`'s share of the whole param `whole`, as the import reads
+    /// it: each segment's part along the axis, in order.
+    fn share(&self, whole: &[f32], rank: usize, world: usize) -> Vec<f32> {
+        let outer: u64 = self.shape[..self.axis].iter().product();
+        let inner = self.shape[self.axis + 1..].iter().product::<u64>() as usize;
+        let extent: u64 = (self.segments.iter().zip(self.parts))
+            .map(|(s, p)| s * p)
+            .sum();
+        let mut out = Vec::with_capacity(whole.len() / world.max(1));
+        for o in 0..outer {
+            let mut at = o * extent;
+            for (s, p) in self.segments.iter().zip(self.parts) {
+                let piece = rank as u64 * p / world as u64;
+                let from = (at + piece * s) as usize * inner;
+                out.extend_from_slice(&whole[from..from + *s as usize * inner]);
+                at += s * p;
+            }
+        }
+        out
+    }
 }
 
 /// This rank's part of a group.
@@ -166,7 +218,26 @@ impl Forward {
             let each: usize = param.shape.iter().skip(1).product::<u64>() as usize;
             let v = match (param.source, param.experts) {
                 (ParamSource::Registered, _) => vec![0.0; rows * each],
-                (ParamSource::Checkpoint, None) => plane(&param.name, rows * each),
+                (ParamSource::Checkpoint, None) => match &param.shard {
+                    Shard::Cut {
+                        axis,
+                        segments,
+                        heads,
+                    } if world > 1 => {
+                        let parts = (0..segments.len())
+                            .map(|i| Shard::parts(heads.get(i).copied(), world as u64))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|why| format!("`{}`: {why}", param.name))?;
+                        let cut = Cut {
+                            shape: &param.shape,
+                            axis: *axis as usize,
+                            segments,
+                            parts: &parts,
+                        };
+                        cut.share(&plane(&param.name, cut.whole()), rank, world)
+                    }
+                    _ => plane(&param.name, rows * each),
+                },
                 (ParamSource::Checkpoint, Some(cut)) => {
                     let whole = plane(&param.name, cut.experts as usize * each);
                     let held = &placed
@@ -293,6 +364,14 @@ impl Forward {
         } else {
             logits.row(logits.rows - 1).to_vec()
         })
+    }
+}
+
+/// The width of the rows every rank posted, `rows` of them.
+fn held_width(all: &[Arc<Post>], rows: usize) -> Result<usize, String> {
+    match all.first().map(|p| &**p) {
+        Some(Post::Floats { v, .. }) => Ok(v.len().checked_div(rows).unwrap_or(0)),
+        _ => Err("no rank posted rows".into()),
     }
 }
 
@@ -541,6 +620,39 @@ impl Run<'_> {
                 let rows = xs.rows;
                 self.put(y, rows, out)
             }
+            Elemwise::SumSquares { x, ss } => {
+                let xs = self.floats(x)?;
+                let out = (0..xs.rows)
+                    .map(|t| xs.row(t).iter().map(|v| v * v).sum::<f32>())
+                    .collect();
+                let rows = xs.rows;
+                self.put(ss, rows, out)
+            }
+            Elemwise::RmsnormBy {
+                x,
+                ss,
+                weight,
+                width,
+                eps,
+                y,
+            } => {
+                let (xs, sums) = (self.floats(x)?, self.floats(ss)?);
+                let (w, plus) = match weight {
+                    NormWeight::None => (None, 0.0),
+                    NormWeight::Scale(w) => (Some(self.floats(w)?), 0.0),
+                    NormWeight::PlusOne(w) => (Some(self.floats(w)?), 1.0),
+                };
+                let mut out = Vec::with_capacity(xs.v.len());
+                for t in 0..xs.rows {
+                    let inv = 1.0 / (sums.v[t] / width as f32 + eps).sqrt();
+                    for (i, v) in xs.row(t).iter().enumerate() {
+                        let g = w.as_ref().map_or(1.0, |w| w.v[i] + plus);
+                        out.push(v * inv * g);
+                    }
+                }
+                let rows = xs.rows;
+                self.put(y, rows, out)
+            }
             Elemwise::Rope {
                 q,
                 k,
@@ -631,6 +743,31 @@ impl Run<'_> {
                 }
                 let rows = ids.rows;
                 self.put(y, rows, out)
+            }
+            Gather::SplitQkv {
+                packed,
+                q_width,
+                kv_width,
+                q,
+                k,
+                v,
+            } => {
+                let p = self.floats(packed)?;
+                let (qw, kw) = (q_width as usize, kv_width as usize);
+                if p.width != qw + 2 * kw {
+                    return Err(format!("a {} wide q, k and v of {qw} and {kw}", p.width));
+                }
+                let (mut qs, mut ks, mut vs) = (Vec::new(), Vec::new(), Vec::new());
+                for t in 0..p.rows {
+                    let row = p.row(t);
+                    qs.extend_from_slice(&row[..qw]);
+                    ks.extend_from_slice(&row[qw..qw + kw]);
+                    vs.extend_from_slice(&row[qw + kw..]);
+                }
+                let rows = p.rows;
+                self.put(q, rows, qs)?;
+                self.put(k, rows, ks)?;
+                self.put(v, rows, vs)
             }
             Gather::SplitQGate {
                 packed,
@@ -728,6 +865,60 @@ impl Run<'_> {
                     for (at, v) in best {
                         picks.push(at as i32);
                         ws.push((v - max).exp() / sum);
+                    }
+                }
+                let rows = l.rows;
+                self.put_ints(routes, rows, k, picks);
+                self.put(weights, rows, ws)
+            }
+            // Sigmoid scores, the pick by them plus the bias where given, the
+            // picked scores the weights (renormalized where stated), scaled.
+            Linear::MoeRoute {
+                ids: None,
+                table: None,
+                logits,
+                bias,
+                scale: None,
+                hint: None,
+                experts,
+                top_k,
+                score:
+                    RouteScore::Sigmoid {
+                        renormalize,
+                        scaling,
+                    },
+                routes,
+                weights,
+            } => {
+                let l = self.floats(logits)?;
+                let bias = self.opt_floats(bias)?.map(|b| b.v.to_vec());
+                let (e, k) = (experts as usize, top_k as usize);
+                let (mut picks, mut ws) = (Vec::new(), Vec::new());
+                for t in 0..l.rows {
+                    let scores: Vec<f32> = l.row(t)[..e].iter().map(|v| sigmoid(*v)).collect();
+                    let mut keyed: Vec<f32> = (scores.iter().enumerate())
+                        .map(|(i, s)| s + bias.as_ref().map_or(0.0, |b| b[i]))
+                        .collect();
+                    let mut best = Vec::with_capacity(k);
+                    for _ in 0..k {
+                        let (at, _) = (keyed.iter().copied().enumerate()).fold(
+                            (usize::MAX, f32::NEG_INFINITY),
+                            |b, (i, v)| {
+                                if v > b.1 { (i, v) } else { b }
+                            },
+                        );
+                        keyed[at] = f32::NEG_INFINITY;
+                        best.push(at);
+                    }
+                    let sum: f32 = best.iter().map(|at| scores[*at]).sum();
+                    for at in best {
+                        let w = if renormalize {
+                            scores[at] / sum
+                        } else {
+                            scores[at]
+                        };
+                        picks.push(at as i32);
+                        ws.push(w * scaling);
                     }
                 }
                 let rows = l.rows;
@@ -858,6 +1049,46 @@ impl Run<'_> {
     fn collective(&mut self, op: &Collective) -> Result<(), String> {
         let group = self.group.ok_or("a collective on a forward in no group")?;
         match *op {
+            // A sum's terms added in rank order, so every rank lands the
+            // same bits.
+            Collective::AllReduce { buf, buf_out } => {
+                let held = self.floats(buf)?;
+                let (rows, mine) = (held.rows, held.v.to_vec());
+                let all = group
+                    .exchange
+                    .all(group.rank, Post::Floats { rows, v: mine });
+                let mut sum = vec![0.0f32; rows * held_width(&all, rows)?];
+                for post in &all {
+                    let Post::Floats { v, .. } = &**post else {
+                        return Err("a peer posted no rows to a sum".into());
+                    };
+                    if v.len() != sum.len() {
+                        return Err("the ranks' terms differ in size".into());
+                    }
+                    for (s, v) in sum.iter_mut().zip(v) {
+                        *s += v;
+                    }
+                }
+                self.put(buf_out, rows, sum)
+            }
+            // Each row the ranks' shares of it side by side, in rank order.
+            Collective::AllGather { x, y } => {
+                let held = self.floats(x)?;
+                let (rows, width, mine) = (held.rows, held.width, held.v.to_vec());
+                let all = group
+                    .exchange
+                    .all(group.rank, Post::Floats { rows, v: mine });
+                let mut out = Vec::with_capacity(rows * width * all.len());
+                for t in 0..rows {
+                    for post in &all {
+                        let Post::Floats { v, .. } = &**post else {
+                            return Err("a peer posted no rows to a gather".into());
+                        };
+                        out.extend_from_slice(&v[t * width..(t + 1) * width]);
+                    }
+                }
+                self.put(y, rows, out)
+            }
             Collective::Dispatch {
                 x,
                 routes,
@@ -894,7 +1125,7 @@ impl Run<'_> {
                 let tokens = (all.iter())
                     .map(|p| match &**p {
                         Post::Tokens { rows, .. } => *rows,
-                        Post::Outputs { .. } => 0,
+                        Post::Outputs { .. } | Post::Floats { .. } => 0,
                     })
                     .max()
                     .unwrap_or(0);
@@ -979,7 +1210,7 @@ impl Run<'_> {
                 let all = group.exchange.all(group.rank, post);
                 let cap = match &*all[group.rank] {
                     Post::Outputs { origin, .. } => origin.len(),
-                    Post::Tokens { .. } => 0,
+                    Post::Tokens { .. } | Post::Floats { .. } => 0,
                 };
                 let tokens = cap / all.len();
                 // This rank's tokens, `tokens` the most any rank brought:

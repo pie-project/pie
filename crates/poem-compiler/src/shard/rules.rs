@@ -3,7 +3,8 @@
 //! weight or a cache the ranks split.
 
 use poem_ir::{
-    Attn, BinaryOp, Elemwise, Gather, Linear, NormAxis, Operands, Operation, Shard, ValueId,
+    Attn, BinaryOp, Collective, Dim, Dtype, Elemwise, Gather, Linear, NormAxis, Operands,
+    Operation, Shard, Ty, ValueId,
 };
 
 use super::{Block, Dist, Pass};
@@ -31,7 +32,8 @@ pub(super) enum Rule {
     /// An attention plan: its head counts are each rank's share.
     Plan { scale: &'static [&'static str] },
     /// A row norm, which needs the whole row unless its weight is split
-    /// with it: then each rank norms its own share.
+    /// with it (or it has none): then each rank norms its own share by the
+    /// row's sum of squares, its share's summed across the ranks.
     Norm,
     /// Group indices for a grouped matmul, which reads no value: they are
     /// a rank's share of the groups when the row it groups is split.
@@ -308,8 +310,16 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
                 Some(w) => pass.weight_cut(w)?,
                 None => None,
             };
+            let weighed = at.one("weight").is_some();
             match (pass.dist(x)?, cut) {
-                (Dist::Split(blocks), Some((0, _))) => vec![Dist::Split(blocks); outs.len()],
+                (Dist::Split(blocks), Some((0, _))) => {
+                    let op = shared_norm(pass, op, x, &blocks)?;
+                    return Ok((op, vec![Dist::Split(blocks); outs.len()]));
+                }
+                (Dist::Split(blocks), None) if !weighed => {
+                    let op = shared_norm(pass, op, x, &blocks)?;
+                    return Ok((op, vec![Dist::Split(blocks); outs.len()]));
+                }
                 (_, None) => {
                     at.make_whole(pass, x)?;
                     vec![Dist::Whole; outs.len()]
@@ -430,6 +440,63 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
         }
     };
     Ok((tree::op(at.tree), dists))
+}
+
+/// A row norm over `x`, a row the ranks split in `blocks`, as one rank
+/// runs it: its share's sum of squares, summed across the ranks, norms the
+/// share (Megatron's norm over a row of heads the ranks split). The ops
+/// before it land ahead of the norm; a share a group of ranks holds alike
+/// is summed once per rank of the group, which the whole width counts.
+fn shared_norm(
+    pass: &mut Pass,
+    op: &Operation,
+    x: ValueId,
+    blocks: &[Block],
+) -> Result<Operation, String> {
+    let Operation::Elemwise(Elemwise::Rmsnorm { weight, eps, y, .. }) = *op else {
+        return Err(format!("`{}` is not a row norm", op.name()));
+    };
+    let world = u64::from(pass.world);
+    let parts = blocks.first().map_or(world, |b| b.parts);
+    if blocks.iter().any(|b| b.parts != parts) || parts == 0 || !world.is_multiple_of(parts) {
+        return Err(format!(
+            "`{}` norms a row whose blocks the ranks cut {:?} ways",
+            op.name(),
+            blocks.iter().map(|b| b.parts).collect::<Vec<_>>()
+        ));
+    }
+    let whole: u64 = blocks.iter().map(|b| b.width).sum::<u64>() * (world / parts);
+    let width = u32::try_from(whole).map_err(|_| format!("a row {whole} wide"))?;
+    let ty = match &pass.trace.values[x.0 as usize].ty {
+        Ty::Tensor { shape, .. } => {
+            let mut shape = shape.clone();
+            if let Some(last) = shape.last_mut() {
+                *last = Dim::Const(1);
+            }
+            Ty::Tensor {
+                shape,
+                dtype: Dtype::F32,
+            }
+        }
+        Ty::Struct(_) => return Err(format!("`{}` norms no tensor", op.name())),
+    };
+    let ss = pass.value(ty.clone(), Dist::Partial);
+    let summed = pass.value(ty, Dist::Whole);
+    pass.pending
+        .push(Operation::Elemwise(Elemwise::SumSquares { x, ss }));
+    pass.pending
+        .push(Operation::Collective(Collective::AllReduce {
+            buf: ss,
+            buf_out: summed,
+        }));
+    Ok(Operation::Elemwise(Elemwise::RmsnormBy {
+        x,
+        ss: summed,
+        weight,
+        width,
+        eps,
+        y,
+    }))
 }
 
 /// An op being rewritten for one rank, and the values it reads.

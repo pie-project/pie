@@ -10,7 +10,7 @@
 //! such as S3.
 //!
 //! It also runs a poem trace's forward on the host ([`Forward`]), rank by
-//! rank of an expert-parallel group whose collectives meet in memory
+//! rank of an expert- or tensor-parallel group whose collectives meet in memory
 //! ([`Exchange`]): one rank and `N` simulated ranks answer the same bits,
 //! the check a group's lowering is held to without a cluster.
 

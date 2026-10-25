@@ -8,9 +8,12 @@
 //! of the sum, which the shard pass reduces. A weight an op reads beside a
 //! share (a bias, a head's sink) is cut as that share is.
 //!
+//! A row norm over a share norms it where it is, each rank's sum of
+//! squares summed across the ranks, its weight cut as the share is.
+//!
 //! A column cut is kept only where its share reaches row cuts and nothing
-//! that wants it whole: a share that meets a row norm, an op with no rule,
-//! a whole operand or an answer the runtime reads (but the logits, which a
+//! that wants it whole: a share that meets an op with no rule, a whole
+//! operand or an answer the runtime reads (but the logits, which a
 //! vocab-split head gathers) puts its weights back whole, and the trace is
 //! read again until nothing changes. Where a share meets the partial sums of
 //! another, the product that contracted the other's share is the one put
@@ -471,6 +474,25 @@ impl<'r, 't> Walk<'r, 't> {
                 // grouped product groups.
                 self.groups.extend(outs.iter().copied());
                 vec![Held::Whole; outs.len()]
+            }
+            // A row norm over a share norms it there, its sum of squares
+            // summed across the ranks; its weight is cut as the share is.
+            Rule::Norm
+                if matches!(
+                    field("x").first().map(|x| self.held(*x)),
+                    Some(Held::Split(_))
+                ) =>
+            {
+                let x = field("x")[0];
+                let share = self.held(x);
+                for w in field("weight") {
+                    if let Some(p) = self.param(w)
+                        && !self.is_plane(w)
+                    {
+                        self.beside(p, Some(x), &share, false);
+                    }
+                }
+                vec![share; outs.len()]
             }
             Rule::Whole | Rule::Plan { .. } | Rule::Norm => {
                 for v in read(&[]) {

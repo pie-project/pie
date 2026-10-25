@@ -1,5 +1,5 @@
-//! The collectives of an expert-parallel group whose ranks are threads of
-//! one process: each rank posts what it sends, the ranks meet, and each
+//! The collectives of an expert- or tensor-parallel group whose ranks are
+//! threads of one process: each rank posts what it sends, the ranks meet, and each
 //! reads every rank's post. A post is read before any rank posts the next
 //! one (the ranks meet again after reading), so one exchange carries every
 //! collective of every step, in the order the ranks fire them.
@@ -17,6 +17,9 @@ pub enum Post {
         routes: Vec<i32>,
         weights: Vec<f32>,
     },
+    /// A tensor-parallel collective's rows: a term of a sum, or a share of
+    /// each row's last axis.
+    Floats { rows: usize, v: Vec<f32> },
     /// A combine's expert outputs, a row per landed route, with the
     /// landing's origins and local slots.
     Outputs {

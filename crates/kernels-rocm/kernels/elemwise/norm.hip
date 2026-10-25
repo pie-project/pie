@@ -93,6 +93,42 @@ __global__ __launch_bounds__(BLOCK) void rmsnorm_no_scale(const T* __restrict__ 
     rmsnorm_rows<T, BLOCK, false>(x, nullptr, y, hidden, hidden, hidden, eps, heads, win);
 }
 
+// Each row's sum of squares, f32: one rank's term of a row norm whose row
+// the ranks split, summed across them before `rmsnorm_by` reads it.
+template <class T, int BLOCK>
+__global__ __launch_bounds__(BLOCK) void sum_squares_rows(const T* __restrict__ x,
+                                                          float* __restrict__ ss, int width,
+                                                          const u32* __restrict__ win) {
+    __shared__ float smem[BLOCK / kWave];
+    const Window window{win};
+    if (!window.live(blockIdx.x)) return;
+    const long long row = window.plane(blockIdx.x);
+    const T* xr = x + row * width;
+    const float sum = sum_squares<T, BLOCK>(xr, width, width % 8 == 0 && aligned16(xr), smem);
+    if (threadIdx.x == 0) ss[row] = sum;
+}
+
+// `x / sqrt(ss / whole + eps)` times the weight (`WEIGHT` 0: none, 1: the
+// weight, 2: one plus it): a row norm over a share `width` wide of a row
+// `whole` wide, its sum of squares `ss` stated a row.
+template <class T, int WEIGHT, int BLOCK>
+__global__ __launch_bounds__(BLOCK) void rmsnorm_by(const T* __restrict__ x,
+                                                    const float* __restrict__ ss,
+                                                    const T* __restrict__ w, T* __restrict__ y,
+                                                    int width, float whole, float eps,
+                                                    const u32* __restrict__ win) {
+    const Window window{win};
+    if (!window.live(blockIdx.x)) return;
+    const long long row = window.plane(blockIdx.x);
+    const float inv = rsqrtf(ss[row] / whole + eps);
+    for (int i = threadIdx.x; i < width; i += BLOCK) {
+        float s = 1.f;
+        if constexpr (WEIGHT == 1) s = to_f32(w[i]);
+        if constexpr (WEIGHT == 2) s = 1.f + to_f32(w[i]);
+        y[row * width + i] = from_f32<T>(to_f32(x[row * width + i]) * inv * s);
+    }
+}
+
 // The per-head norms over contiguous heads of 8·LPH elements: LPH lanes a
 // head row, eight elements a lane, the sum of squares across them by
 // shuffles; 256 / LPH head rows a block, `total` (rows x heads) in all.

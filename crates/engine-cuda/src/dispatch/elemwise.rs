@@ -472,6 +472,33 @@ impl Run<'_> {
                 *eps,
                 &mut self.tensor(*y),
             ),
+            Elemwise::SumSquares { x, ss } => {
+                elemwise::norm::sum_squares(self.ctx(), self.tensor(*x), &mut self.tensor(*ss))
+            }
+            Elemwise::RmsnormBy {
+                x,
+                ss,
+                weight,
+                width,
+                eps,
+                y,
+            } => {
+                let (weight, plus_one) = match weight {
+                    NormWeight::None => (None, false),
+                    NormWeight::Scale(w) => (Some(self.tensor(*w)), false),
+                    NormWeight::PlusOne(w) => (Some(self.tensor(*w)), true),
+                };
+                elemwise::norm::rmsnorm_by(
+                    self.ctx(),
+                    self.tensor(*x),
+                    self.tensor(*ss),
+                    weight,
+                    plus_one,
+                    *width,
+                    *eps,
+                    &mut self.tensor(*y),
+                )
+            }
             Elemwise::NormGate {
                 x,
                 scale,
