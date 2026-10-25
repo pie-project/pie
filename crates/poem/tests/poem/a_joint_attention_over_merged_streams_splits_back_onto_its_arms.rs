@@ -1,7 +1,7 @@
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Request, Stream, Value, Weight,
-    ops, seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Request, Value, Weight, ops,
+    seam, trace_hybrid,
 };
 use poem_ir::{Attn, Def, Elemwise, GeomKind, Guard, Operation, RuntimeInput, Selection};
 
@@ -15,9 +15,12 @@ impl ForwardHybrid for DoubleBlock {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
+        inputs
+            .recorder()
+            .declare_switch("stream", &["text", "image", "video", "audio"]);
         let (txt, img) = (
-            inputs.on(fact::stream(Stream::Text)),
-            inputs.on(!fact::stream(Stream::Text)),
+            inputs.on(fact::switch_is("stream", "text")),
+            inputs.on(!fact::switch_is("stream", "text")),
         );
         let w = |name: &str| Weight::sym(name, [u64::from(WIDTH), u64::from(WIDTH)], Dtype::Bf16);
         let x_txt = txt.input("text", Dtype::Bf16, poem_ir::InputAxis::Row, WIDTH, None);
@@ -48,8 +51,8 @@ impl ForwardHybrid for DoubleBlock {
         );
         let o = ops::gather::unpack_rows(&o, &perm);
         let (o_txt, o_img) = (
-            o.on(fact::stream(Stream::Text)),
-            o.on(!fact::stream(Stream::Text)),
+            o.on(fact::switch_is("stream", "text")),
+            o.on(!fact::switch_is("stream", "text")),
         );
         let y_txt = ops::linear::matmul(&o_txt, &w("txt.o"));
         let y_img = ops::linear::matmul(&o_img, &w("img.o"));
@@ -64,7 +67,7 @@ impl ForwardHybrid for DoubleBlock {
 #[test]
 fn the_joint_attention_traces_and_its_answer_splits_back_onto_the_arms() {
     let trace = trace_hybrid("double", &DoubleBlock, Platform::Cuda);
-    let text = Guard::Fact(Stream::Text.code());
+    let text = Guard::Fact(0);
     let image = !text.clone();
 
     let ragged = trace
@@ -132,7 +135,7 @@ fn the_joint_attention_traces_and_its_answer_splits_back_onto_the_arms() {
     let classes = poem::resolve_classes(&trace).expect("every merge resolves");
     let word = trace
         .facts
-        .word(&Request::new(1, false).on_stream(Stream::Text))
+        .word(&Request::new(1, false).switched("stream", "text"))
         & classes.mask;
     let class = classes.class_of(word).expect("a text lane has a class");
     for row in 0..classes.merges.len() {

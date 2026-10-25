@@ -292,74 +292,13 @@ def turbo_sigmas(shift):
     return out
 
 def generative(m):
-    d = m.dims
-    next = [0]
-
-    def take(present):
-        if not present:
-            return None
-        next[0] += 1
-        return next[0] - 1
-
-    text = take(m.te != None)
-    refine = take(True)
-    denoise = take(True)
-    vae_decode = take(m.vae != None)
-    vae_encode = take(m.vae != None)
-    readings = []
-    if text != None:
-        readings.append(reading(
-            "text",
-            index = text,
-            has_kv = True,
-            takes_tokens = True,
-            streams = ["text"],
-            readout = "hidden",
-            readout_width = m.te.hidden,
-        ))
-    readings.append(reading(
-        "refine",
-        index = refine,
-        streams = ["context"],
-        positions = positions(
-            axes = ["time", "height", "width"],
-            text_axis = 0,
-            text_origin = 1,
-            image_follows_text = False,
-        ),
-        readout = "hidden",
-        readout_width = d.dim,
-    ))
-    readings.append(reading(
-        "denoise",
-        index = denoise,
-        streams = ["image", "context"],
+    return generation(
         positions = positions(
             axes = ["time", "height", "width"],
             text_axis = 0,
             text_origin = 1,
             image_follows_text = True,
         ),
-        readout = "velocity",
-        readout_width = PATCH_FEATURES if m.tap in ["", "latents", "final_linear"] else d.dim,
-    ))
-    if vae_decode != None and vae_encode != None:
-        readings.append(reading(
-            "vae.decode",
-            index = vae_decode,
-            streams = ["image"],
-            readout = "pixels",
-            readout_width = RGB,
-        ))
-        readings.append(reading(
-            "vae.encode",
-            index = vae_encode,
-            streams = ["image"],
-            readout = "pixels",
-            readout_width = CHANNELS,
-        ))
-    return generation(
-        readings = readings,
         latent = latent_space(
             channels = CHANNELS,
             patch_t = 1,
@@ -709,13 +648,17 @@ def caches(m, c):
         qwen3_caches(m.te, c, m.kv)
 
 def forward(m, inputs):
+    vae_readings = ["vae.decode", "vae.encode"] if m.vae != None else []
+    switch("reading", (["text"] if m.te != None else []) + ["refine", "denoise"] + vae_readings)
+    switch("stream", ["image", "context"])
+    reading = lambda name: inputs.on(switch_is("reading", name))
     if m.te != None:
-        inputs.reading("text", lambda rows: qwen3_encode(rows, m.te))
-    inputs.reading("refine", lambda rows: refine(rows, m))
-    velocity = inputs.reading("denoise", lambda rows: denoise(rows, m))
+        qwen3_encode(reading("text"), m.te)
+    refine(reading("refine"), m)
+    velocity = denoise(reading("denoise"), m)
     if m.vae != None:
-        inputs.reading("vae.decode", lambda rows: decode(rows, m))
-        inputs.reading("vae.encode", lambda rows: encode(rows, m))
+        decode(reading("vae.decode"), m)
+        encode(reading("vae.encode"), m)
     return velocity
 
 def pad_rows(x, flag, bank):
@@ -764,7 +707,7 @@ def seam_tapped(image, context):
 
 def denoise(arm, m):
     d, dit = m.dims, m.dit
-    image = fact.stream("image")
+    image = switch_is("stream", "image")
     img, ctx = arm.on(image), arm.on(~image)
 
     lanes = arm.request_of_token()

@@ -1,7 +1,7 @@
 use poem::fact;
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, RaggedMask, Request, Selection,
-    Stream, Trace, Value, Weight, ops, seam, trace_hybrid,
+    Trace, Value, Weight, ops, seam, trace_hybrid,
 };
 use poem_ir::{Attn, Def, Gather, GeomKind, Guard, Operation, RuntimeInput};
 
@@ -18,8 +18,13 @@ impl ForwardHybrid for CrossAttention {
     }
 
     fn forward(&self, inputs: Input) -> Value {
-        let ([audio, video], _rest) =
-            inputs.partition([fact::stream(Stream::Audio), fact::stream(Stream::Video)]);
+        inputs
+            .recorder()
+            .declare_switch("stream", &["text", "image", "video", "audio"]);
+        let ([audio, video], _rest) = inputs.partition([
+            fact::switch_is("stream", "audio"),
+            fact::switch_is("stream", "video"),
+        ]);
         let wq = Weight::sym(
             "audio.q",
             [HEADS * u64::from(HEAD_DIM), u64::from(AUDIO_WIDTH)],
@@ -91,8 +96,11 @@ fn a_ragged_attention_joins_two_arms_every_case() {
 fn queries_off_one_arm_and_keys_off_another_trace_under_the_or_of_both(trace: &Trace) {
     assert!(trace.caches.is_empty(), "a denoiser declares no kv space");
 
-    let audio = cond_of(trace, &fact::stream(Stream::Audio));
-    let video = Guard::and(!audio.clone(), cond_of(trace, &fact::stream(Stream::Video)));
+    let audio = cond_of(trace, &fact::switch_is("stream", "audio"));
+    let video = Guard::and(
+        !audio.clone(),
+        cond_of(trace, &fact::switch_is("stream", "video")),
+    );
 
     let (at, ragged) = trace
         .nodes
@@ -166,9 +174,12 @@ impl ForwardHybrid for TwoArmsIntoOneAdd {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
+        inputs
+            .recorder()
+            .declare_switch("stream", &["text", "image", "video", "audio"]);
         let (audio, video) = (
-            inputs.on(fact::stream(Stream::Audio)),
-            inputs.on(!fact::stream(Stream::Audio)),
+            inputs.on(fact::switch_is("stream", "audio")),
+            inputs.on(!fact::switch_is("stream", "audio")),
         );
         let w = Weight::sym("w", [8, 8], Dtype::Bf16);
         let a = ops::linear::matmul(
@@ -201,11 +212,11 @@ fn every_other_op_still_refuses_two_arms() {
 }
 
 fn a_lanes_stream_is_its_fact_word(trace: &Trace) {
-    let audio = cond_of(trace, &fact::stream(Stream::Audio));
-    let video = cond_of(trace, &fact::stream(Stream::Video));
+    let audio = cond_of(trace, &fact::switch_is("stream", "audio"));
+    let video = cond_of(trace, &fact::switch_is("stream", "video"));
     let word = trace
         .facts
-        .word(&Request::new(16, false).on_stream(Stream::Video));
+        .word(&Request::new(16, false).switched("stream", "video"));
     assert!(video.holds(word));
     assert!(!audio.holds(word));
     let text = trace.facts.word(&Request::new(16, false));

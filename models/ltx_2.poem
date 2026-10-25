@@ -271,39 +271,7 @@ def layout(id, deploy):
 
 def generative(m):
     d = m.dims
-    readings = [
-        reading(
-            "denoise",
-            index = 0,
-            streams = ["video", "audio", "context", "reference"],
-            readout = "velocity",
-            readout_width = d.channels,
-        ),
-        reading(
-            "refine.video",
-            index = 1,
-            streams = ["text"],
-            readout = "hidden",
-            readout_width = d.cross_dim,
-        ),
-        reading(
-            "refine.audio",
-            index = 2,
-            streams = ["text"],
-            readout = "hidden",
-            readout_width = d.audio_cross_dim,
-        ),
-    ]
-    if m.vae != None:
-        readings.append(reading(
-            "vae.decode",
-            index = 3,
-            streams = ["video"],
-            readout = "pixels",
-            readout_width = VAE_RGB,
-        ))
     return generation(
-        readings = readings,
         latent = latent_space(
             channels = d.channels,
             patch_t = PATCH_T,
@@ -530,13 +498,16 @@ def caches(m, c):
     pass
 
 def forward(m, inputs):
-    velocity = inputs.reading("denoise", lambda rows: denoise(rows, m))
+    switch("reading", ["denoise", "refine.video", "refine.audio"] + (["vae.decode"] if m.vae != None else []))
+    switch("stream", ["video", "audio", "context", "reference"])
+    reading = lambda name: inputs.on(switch_is("reading", name))
+    velocity = denoise(reading("denoise"), m)
     text_in = m.dims.text_in
     video, audio = m.connectors
-    inputs.reading("refine.video", lambda rows: refine(rows, video, text_in))
-    inputs.reading("refine.audio", lambda rows: refine(rows, audio, text_in))
+    refine(reading("refine.video"), video, text_in)
+    refine(reading("refine.audio"), audio, text_in)
     if m.vae != None:
-        inputs.reading("vae.decode", lambda rows: vae_decode(rows, m.vae))
+        vae_decode(reading("vae.decode"), m.vae)
     return velocity
 
 def rms(x):
@@ -656,9 +627,10 @@ def run_block(xv, xa, b, d, mv, ma, ctx, actx, vg, ag, v_time, cg, acg):
 def denoise(arm, m):
     d = m.dims
     dit = m.dit
-    ctx, rest = arm.on(fact.stream("context")), arm.on(~fact.stream("context"))
-    actx, media = rest.on(fact.stream("reference")), rest.on(~fact.stream("reference"))
-    vid, aud = media.on(fact.stream("video")), media.on(~fact.stream("video"))
+    stream = lambda name: switch_is("stream", name)
+    ctx, rest = arm.on(stream("context")), arm.on(~stream("context"))
+    actx, media = rest.on(stream("reference")), rest.on(~stream("reference"))
+    vid, aud = media.on(stream("video")), media.on(~stream("video"))
 
     vg = struct(
         lanes = vid.request_of_token(),

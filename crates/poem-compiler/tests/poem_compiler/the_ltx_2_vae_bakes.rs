@@ -2,8 +2,7 @@ use poem_ir::{NormAxis, NormWeight};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use crate::ltx_2_dims::{self as model, VAE_DECODE};
-use poem::generative::ReadoutKind;
+use crate::ltx_2_dims as model;
 use poem::{Def, Dtype, Operation, Platform, RuntimeInput, Trace};
 use poem_ir::{Conv, GridRule, InputAxis, TimePad};
 
@@ -27,27 +26,20 @@ fn the_ltx_2_vae_bakes_every_case() {
 }
 
 fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
-    let facts = row(FLAGSHIP).generative().expect("facts");
-    let decode = facts
-        .readings
-        .iter()
-        .find(|r| r.name == "vae.decode")
-        .expect("the flagship declares `vae.decode`");
-    assert_eq!(decode.index, VAE_DECODE);
+    let readings = |deployment: &str| {
+        trace(deployment)
+            .facts
+            .declared("reading")
+            .map(|s| s.values.clone())
+            .unwrap_or_default()
+    };
     assert_eq!(
-        usize::from(decode.index),
-        facts.readings.len() - 1,
-        "the last code"
+        readings(FLAGSHIP).last().map(String::as_str),
+        Some("vae.decode"),
+        "the flagship declares `vae.decode`, the last value"
     );
-    assert!(!decode.has_kv && !decode.takes_tokens);
-    assert_eq!(decode.streams, vec![poem::Stream::Video]);
-    assert!(decode.positions.is_none(), "a VAE tile takes no positions");
-    assert_eq!(decode.readout, ReadoutKind::Pixels);
-    assert_eq!(decode.readout_width, model::VAE_RGB);
-
-    let mini = row(MINI).generative().expect("facts");
     assert!(
-        mini.readings.iter().all(|r| r.name != "vae.decode"),
+        readings(MINI).iter().all(|r| r != "vae.decode"),
         "the miniature's checkpoint carries no VAE"
     );
     for (deployment, want) in [(FLAGSHIP, 1), (MINI, 0)] {

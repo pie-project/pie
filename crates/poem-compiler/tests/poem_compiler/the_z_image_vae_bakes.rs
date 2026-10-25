@@ -5,8 +5,7 @@ use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, Partition, TensorType};
 
 use crate::z_image_dims::{self as model, vae};
-use poem::generative::ReadoutKind;
-use poem::{Def, Dim, Dtype, Operation, Platform, Stream, Trace, Ty, seam};
+use poem::{Def, Dim, Dtype, Operation, Platform, Trace, Ty, seam};
 use poem_ir::{Attn, Conv, GridRule, InputAxis, ParamLayout, Seam};
 
 const TURBO: &str = "z-image-turbo-bf16-kv-bf16";
@@ -21,15 +20,12 @@ fn trace(deployment: &str) -> Trace {
     row(deployment).trace(Platform::Cuda)
 }
 
-fn reading<'a>(
-    facts: &'a poem::generative::Generative,
-    name: &str,
-) -> &'a poem::generative::ReadingFact {
-    facts
-        .readings
-        .iter()
-        .find(|r| r.name == name)
-        .unwrap_or_else(|| panic!("no reading `{name}`"))
+fn readings(deployment: &str) -> Vec<String> {
+    trace(deployment)
+        .facts
+        .declared("reading")
+        .map(|s| s.values.clone())
+        .unwrap_or_default()
 }
 
 #[test]
@@ -41,29 +37,12 @@ fn the_z_image_vae_bakes_every_case() {
 }
 
 fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
-    let facts = row(TURBO).generative().expect("facts");
-    let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
     assert_eq!(
-        names,
+        readings(TURBO),
         vec!["text", "refine", "denoise", "vae.decode", "vae.encode"]
     );
-    let decode = reading(&facts, "vae.decode");
-    let encode = reading(&facts, "vae.encode");
-    for r in [decode, encode] {
-        assert!(!r.has_kv && !r.takes_tokens, "a voxel lane");
-        assert_eq!(r.streams, vec![Stream::Image]);
-        assert_eq!(r.readout, ReadoutKind::Pixels);
-    }
-    assert_eq!(
-        (decode.readout_width, encode.readout_width),
-        (vae::RGB, model::CHANNELS)
-    );
-    assert_eq!(decode.index, 3);
-    assert_eq!(encode.index, 4);
-
-    let mini = row(MINI).generative().expect("facts");
     assert!(
-        !mini.readings.iter().any(|r| r.name.starts_with("vae.")),
+        !readings(MINI).iter().any(|r| r.starts_with("vae.")),
         "the miniature has no VAE"
     );
     assert!(

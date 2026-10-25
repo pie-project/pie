@@ -5,8 +5,7 @@ use checkpoint::contract::infer::{CheckpointTypes, Resolver};
 use checkpoint::contract::{Expr, Partition, TensorType};
 
 use crate::flux_2_dims::{self as model, vae};
-use poem::generative::ReadoutKind;
-use poem::{Def, Dim, Dtype, Operation, Platform, Request, Stream, Trace, Ty, seam};
+use poem::{Def, Dim, Dtype, Operation, Platform, Request, Trace, Ty, seam};
 use poem_ir::{Attn, Conv, GridRule, InputAxis, ParamLayout, Seam};
 
 const KLEIN: &str = "flux2-klein-4b-bf16-kv-bf16";
@@ -21,15 +20,12 @@ fn trace(deployment: &str) -> Trace {
     row(deployment).trace(Platform::Cuda)
 }
 
-fn reading<'a>(
-    facts: &'a poem::generative::Generative,
-    name: &str,
-) -> &'a poem::generative::ReadingFact {
-    facts
-        .readings
-        .iter()
-        .find(|r| r.name == name)
-        .unwrap_or_else(|| panic!("no reading `{name}`"))
+fn readings(deployment: &str) -> Vec<String> {
+    trace(deployment)
+        .facts
+        .declared("reading")
+        .map(|s| s.values.clone())
+        .unwrap_or_default()
 }
 
 #[test]
@@ -42,21 +38,11 @@ fn the_flux_2_vae_bakes_every_case() {
 }
 
 fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
-    let facts = row(KLEIN).generative().expect("facts");
-    let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
-    assert_eq!(names, vec!["text", "denoise", "vae.decode", "vae.encode"]);
-    let decode = reading(&facts, "vae.decode");
-    let encode = reading(&facts, "vae.encode");
-    for r in [decode, encode] {
-        assert!(!r.has_kv && !r.takes_tokens, "a voxel lane");
-        assert_eq!(r.streams, vec![Stream::Image]);
-        assert_eq!(r.readout, ReadoutKind::Pixels);
-    }
     assert_eq!(
-        (decode.readout_width, encode.readout_width),
-        (vae::RGB, model::IN_CHANNELS)
+        readings(KLEIN),
+        ["text", "denoise", "vae.decode", "vae.encode"].map(String::from)
     );
-    assert_eq!((decode.index, encode.index), (2, 3));
+    let facts = row(KLEIN).generative().expect("facts");
     let latent = facts.latent.as_ref().expect("a latent space");
     assert_eq!(
         (latent.channels, latent.spatial_compression),
@@ -68,9 +54,8 @@ fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
         "the port's 128 channels ARE the VAE's 32 packed 2x2"
     );
 
-    let mini = row(MINI).generative().expect("facts");
     assert!(
-        !mini.readings.iter().any(|r| r.name.starts_with("vae.")),
+        !readings(MINI).iter().any(|r| r.starts_with("vae.")),
         "the miniature has no VAE"
     );
     assert!(
@@ -258,22 +243,22 @@ fn the_shapes_are_the_flux2_autoencoders() {
 fn each_vae_lane_has_a_class_of_its_own() {
     let plan = trace(KLEIN);
     let classes = poem::resolve_classes(&plan).expect("every merge resolves");
-    let facts = row(KLEIN).generative().expect("facts");
-    let class_of = |name: &str, stream: Stream| {
-        let r = reading(&facts, name);
-        let request = Request::new(4, false).on_stream(stream).in_reading(&r.name);
+    let class_of = |name: &str, stream: &str| {
+        let request = Request::new(4, false)
+            .switched("stream", stream)
+            .switched("reading", name);
         let word = plan.facts.word(&request);
         classes
             .class_of(word & classes.mask)
             .unwrap_or_else(|| panic!("a {name} lane has no class"))
     };
     let seen: BTreeSet<usize> = [
-        class_of("text", Stream::Text),
-        class_of("denoise", Stream::Text),
-        class_of("denoise", Stream::Image),
-        class_of("denoise", Stream::Reference),
-        class_of("vae.decode", Stream::Image),
-        class_of("vae.encode", Stream::Image),
+        class_of("text", "text"),
+        class_of("denoise", "text"),
+        class_of("denoise", "image"),
+        class_of("denoise", "reference"),
+        class_of("vae.decode", "image"),
+        class_of("vae.encode", "image"),
     ]
     .into_iter()
     .collect();

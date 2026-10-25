@@ -3,10 +3,9 @@ use std::collections::BTreeSet;
 use crate::mini_dit_dims;
 
 use mini_dit_dims as model;
-use poem::generative::ReadoutKind;
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, GeomKind, Guard, Operands, Operation, Platform, Request,
-    RopeForm, RuntimeInput, Stream, Trace, Ty, ValueId, seam,
+    RopeForm, RuntimeInput, Trace, Ty, ValueId, seam,
 };
 
 const DEPLOYMENT: &str = "mini-dit-bf16-kv-bf16";
@@ -119,8 +118,8 @@ fn each_stream_classifies_into_its_own_class_and_every_merge_resolves() {
     let _row = poem_compiler::catalog::deployment(DEPLOYMENT).expect("the row is in the catalog");
 
     let mut seen = Vec::new();
-    for stream in [Stream::Text, Stream::Image, Stream::Context] {
-        let request = Request::new(1, false).on_stream(stream);
+    for stream in ["text", "image", "context"] {
+        let request = Request::new(1, false).switched("stream", stream);
         let word = plan.facts.word(&request);
         let class = classes
             .class_of(word & classes.mask)
@@ -182,16 +181,19 @@ fn the_joint_attention_is_self_paired_and_the_cross_attention_is_not() {
         joint,
         "blocks 0 and 1 pack one sequence"
     );
-    let word = |stream: Stream| plan.facts.word(&Request::new(1, false).on_stream(stream));
-    assert!(joint.holds(word(Stream::Text)));
-    assert!(joint.holds(word(Stream::Image)));
-    assert!(!joint.holds(word(Stream::Context)));
+    let word = |stream: &str| {
+        plan.facts
+            .word(&Request::new(1, false).switched("stream", stream))
+    };
+    assert!(joint.holds(word("text")));
+    assert!(joint.holds(word("image")));
+    assert!(!joint.holds(word("context")));
 
     let (q_csr, kv_csr, _) = crossed[0];
-    assert!(selection_of(*q_csr).holds(word(Stream::Image)));
-    assert!(!selection_of(*q_csr).holds(word(Stream::Context)));
-    assert!(selection_of(*kv_csr).holds(word(Stream::Context)));
-    assert!(!selection_of(*kv_csr).holds(word(Stream::Image)));
+    assert!(selection_of(*q_csr).holds(word("image")));
+    assert!(!selection_of(*q_csr).holds(word("context")));
+    assert!(selection_of(*kv_csr).holds(word("context")));
+    assert!(!selection_of(*kv_csr).holds(word("image")));
 
     let joins = plan
         .nodes
@@ -322,18 +324,21 @@ fn the_generative_facts_state_the_reading_its_latent_and_its_schedule() {
     let facts = row
         .generative()
         .expect("the first generative row states its readings");
-    assert_eq!(facts.readings.len(), 1, "one reading, today");
-    let reading = &facts.readings[0];
-    assert_eq!(reading.name, "denoise");
-    assert_eq!(reading.index, model::DENOISE_READING);
-    assert!(!reading.has_kv, "a denoise pass binds no kv");
-    assert!(!reading.takes_tokens, "and embeds no tokens");
+    let declared = |name: &str| {
+        trace(Platform::Cuda)
+            .facts
+            .declared(name)
+            .map(|s| s.values.clone())
+    };
     assert_eq!(
-        reading.streams,
-        vec![Stream::Text, Stream::Image, Stream::Context]
+        declared("reading"),
+        Some(vec!["denoise".to_string()]),
+        "one reading, today"
     );
-    assert_eq!(reading.readout, ReadoutKind::Velocity);
-    assert_eq!(reading.readout_width, model::PATCH_FEATURES);
+    assert_eq!(
+        declared("stream"),
+        Some(["text", "image", "context"].map(String::from).to_vec())
+    );
 
     let latent = facts.latent.expect("a denoiser states its latent space");
     assert_eq!(

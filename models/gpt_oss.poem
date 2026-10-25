@@ -316,6 +316,8 @@ def caches(m, c):
 
 def forward(m, inputs):
     dr = m.dflash
+    if dr != None:
+        switch("block_draft", ["off", "on"])
     trunk_inputs = inputs.on(~block_rows(dr)) if dr != None else inputs
     positions = trunk_inputs.positions()
     d = m.head_dim

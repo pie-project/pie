@@ -331,32 +331,7 @@ def sigmas(image_rows, steps):
     return out
 
 def generative(m):
-    d = m.dims
-    next = [0]
-
-    def take():
-        next[0] += 1
-        return next[0] - 1
-
-    text = take() if m.te != None else None
-    denoise = take()
-    vae_decode = take() if m.vae != None else None
-    vae_encode = take() if m.vae != None else None
-    readings = []
-    if text != None:
-        readings.append(reading(
-            "text",
-            index = text,
-            has_kv = True,
-            takes_tokens = True,
-            streams = ["text"],
-            readout = "hidden",
-            readout_width = d.dim,
-        ))
-    readings.append(reading(
-        "denoise",
-        index = denoise,
-        streams = ["text", "image", "reference"],
+    return generation(
         positions = positions(
             axes = ["time", "height", "width", "index"],
             text_axis = 3,
@@ -364,26 +339,6 @@ def generative(m):
             image_follows_text = False,
             reference_stride = REFERENCE_TIME_STRIDE,
         ),
-        readout = "velocity",
-        readout_width = IN_CHANNELS,
-    ))
-    if vae_decode != None and vae_encode != None:
-        readings.append(reading(
-            "vae.decode",
-            index = vae_decode,
-            streams = ["image"],
-            readout = "pixels",
-            readout_width = RGB,
-        ))
-        readings.append(reading(
-            "vae.encode",
-            index = vae_encode,
-            streams = ["image"],
-            readout = "pixels",
-            readout_width = IN_CHANNELS,
-        ))
-    return generation(
-        readings = readings,
         latent = latent_space(
             channels = IN_CHANNELS,
             patch_t = 1,
@@ -788,12 +743,17 @@ def caches(m, c):
         qwen3_caches(m.te, c, m.kv)
 
 def forward(m, inputs):
+    text_reading = ["text"] if m.te != None else []
+    vae_readings = ["vae.decode", "vae.encode"] if m.vae != None else []
+    switch("reading", text_reading + ["denoise"] + vae_readings)
+    switch("stream", ["text", "image", "reference"])
+    reading = lambda name: inputs.on(switch_is("reading", name))
     if m.te != None:
-        inputs.reading("text", lambda rows: text(rows, m))
-    velocity = inputs.reading("denoise", lambda rows: denoise(rows, m))
+        text(reading("text"), m)
+    velocity = denoise(reading("denoise"), m)
     if m.vae != None:
-        inputs.reading("vae.decode", lambda rows: decode(rows, m))
-        inputs.reading("vae.encode", lambda rows: encode(rows, m))
+        decode(reading("vae.decode"), m)
+        encode(reading("vae.encode"), m)
     return velocity
 
 def text(arm, m):
@@ -839,7 +799,7 @@ def turn(x, gain, positions, hd):
 def denoise(arm, m):
     d, dit = m.dims, m.dit
     dim, hd = d.dim, m.head_dim
-    text, image = fact.stream("text"), fact.stream("image")
+    text, image = switch_is("stream", "text"), switch_is("stream", "image")
     txt_in, img_in = arm.on(text), arm.on(~text)
 
     lanes = arm.request_of_token()

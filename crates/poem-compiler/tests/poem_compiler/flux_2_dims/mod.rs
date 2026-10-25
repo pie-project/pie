@@ -70,28 +70,6 @@ impl Dims {
     }
 }
 
-/// The reading each of a row's passes runs, by name, as its generative facts
-/// number them: (text, denoise, vae.decode, vae.encode).
-#[must_use]
-pub fn readings(row: &str) -> (Option<u8>, u8, Option<u8>, Option<u8>) {
-    let facts = poem_compiler::catalog::deployment(row)
-        .and_then(|d| d.generative().clone())
-        .unwrap_or_else(|| panic!("`{row}` is a generative row"));
-    let index = |name: &str| {
-        facts
-            .readings
-            .iter()
-            .find(|r| r.name == name)
-            .map(|r| r.index)
-    };
-    (
-        index("text"),
-        index("denoise").expect("a denoise reading"),
-        index("vae.decode"),
-        index("vae.encode"),
-    )
-}
-
 /// The flow schedule's shift for `image_rows` and `steps`, as the reference
 /// pipeline computes it.
 #[must_use]

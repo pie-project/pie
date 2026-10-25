@@ -352,6 +352,14 @@ impl Recorder {
             .any(|seam| seam.seam == name && seam.values.contains(&value.id))
     }
 
+    /// Declares the model's switch `name` over `values`, the first its
+    /// default.
+    pub fn declare_switch(&self, name: &str, values: &[&str]) {
+        if let Err(why) = self.inner.borrow_mut().facts.declare(name, values) {
+            panic!("{why}");
+        }
+    }
+
     /// The guard over the rows `predicate` holds for, its facts given bits
     /// in the order the trace first reads them.
     #[must_use]

@@ -109,19 +109,12 @@ def layout(id, deploy):
 
 def generative(m):
     return generation(
-        readings = [reading(
-            "denoise",
-            index = 0,
-            streams = ["text", "image", "context"],
-            positions = positions(
-                axes = ["time", "height", "width"],
-                text_axis = 0,
-                text_origin = 0,
-                image_follows_text = False,
-            ),
-            readout = "velocity",
-            readout_width = PATCH_FEATURES if m.tap in ["", "final.tokens"] else HIDDEN,
-        )],
+        positions = positions(
+            axes = ["time", "height", "width"],
+            text_axis = 0,
+            text_origin = 0,
+            image_follows_text = False,
+        ),
         latent = latent_space(
             channels = CHANNELS,
             patch_t = 1,
@@ -320,8 +313,10 @@ def mlp_sublayer(m, at, stem, x, mlp, mods, gate, lanes):
     return ops.elemwise.gated_residual_add(x, gate, y, lanes)
 
 def forward(m, inputs):
-    ctx, joint = inputs.on(fact.stream("context")), inputs.on(~fact.stream("context"))
-    txt_in, img_in = joint.on(fact.stream("text")), joint.on(~fact.stream("text"))
+    switch("reading", ["denoise"])
+    switch("stream", ["text", "image", "context"])
+    ctx, joint = inputs.on(switch_is("stream", "context")), inputs.on(~switch_is("stream", "context"))
+    txt_in, img_in = joint.on(switch_is("stream", "text")), joint.on(~switch_is("stream", "text"))
 
     lanes = inputs.request_of_token()
     positions = inputs.input("positions", dtype.f32, "row", m.rope_axes)
@@ -367,7 +362,7 @@ def forward(m, inputs):
     if at("b0.out", x):
         return x
 
-    txt, img = x.on(fact.stream("text")), x.on(~fact.stream("text"))
+    txt, img = x.on(switch_is("stream", "text")), x.on(~switch_is("stream", "text"))
     txt_mod = adaln(run_linear(m.double.txt.ada, temb), m)
     img_mod = adaln(run_linear(m.double.img.ada, temb), m)
     tqkv = heads(m, at, "b1.txt_", txt, m.double.txt.attn, txt_mod[0], lanes, positions)
@@ -379,7 +374,7 @@ def forward(m, inputs):
     o = joint_attention(m, merge([tqkv[0], iqkv[0]]), merge([tqkv[1], iqkv[1]]), merge([tqkv[2], iqkv[2]]), joint_rows)
     if at("b1.joint_attn_heads", o):
         return o
-    o_txt, o_img = o.on(fact.stream("text")), o.on(~fact.stream("text"))
+    o_txt, o_img = o.on(switch_is("stream", "text")), o.on(~switch_is("stream", "text"))
     ta = run_linear(m.double.txt.attn.out, o_txt)
     if at("b1.txt_attn_out", ta):
         return ta

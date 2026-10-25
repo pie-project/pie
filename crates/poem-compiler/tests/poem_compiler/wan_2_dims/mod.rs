@@ -21,7 +21,6 @@ pub const TE_MAX_TOKENS: u32 = 512;
 
 pub const VAE_Z: u32 = 48;
 pub const VAE_PIX_CHANNELS: u32 = 12;
-pub const VAE_RGB: u32 = 3;
 pub const VAE_DECODER_DIMS: [u32; 5] = [1024, 1024, 1024, 512, 256];
 pub const VAE_RESNETS: u32 = 3;
 pub const VAE_TEMPORAL_UP: [bool; 4] = [true, true, false, false];

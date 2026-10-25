@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::{Arc, LazyLock, OnceLock};
 
 use checkpoint::contract::ModelContract;
-use poem::generative::{Diffusion, Generative};
+use poem::generative::Generative;
 use poem::star::{Deploy, Model, Package, Published};
 use poem::{Dtype, Platform, Trace};
 
@@ -74,24 +74,11 @@ impl Deployment {
             .map_err(|why| Refused(format!("{why:#}")))
     }
 
-    pub fn try_diffusion(&self) -> Result<Option<Diffusion>, Refused> {
-        self.package
-            .diffusion(&self.model.id, &self.deploy)
-            .map_err(|why| Refused(format!("{why:#}")))
-    }
-
     /// [`Deployment::try_generative`], panicking: for a listed deployment.
     #[must_use]
     pub fn generative(&self) -> Option<Generative> {
         self.try_generative()
             .unwrap_or_else(|why| panic!("`{}` states no generative facts: {why}", self.name))
-    }
-
-    /// [`Deployment::try_diffusion`], panicking: for a listed deployment.
-    #[must_use]
-    pub fn diffusion(&self) -> Option<Diffusion> {
-        self.try_diffusion()
-            .unwrap_or_else(|why| panic!("`{}` states no canvas: {why}", self.name))
     }
 
     /// The marker groups the tokenizer must hold for the parts served.

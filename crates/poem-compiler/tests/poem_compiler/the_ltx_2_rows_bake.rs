@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::ltx_2_dims::{self as model, DENOISE, Dims, REFINE_AUDIO, REFINE_VIDEO, VAE_DECODE};
-use poem::generative::{ReadoutKind, ScheduleKind};
+use crate::ltx_2_dims::{self as model, Dims};
+use poem::generative::ScheduleKind;
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, GeomKind, Operands, Operation, Platform, RaggedMask, Request,
-    RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
+    RopeForm, RuntimeInput, Selection, Trace, Ty, ValueId, seam,
 };
 
 const FLAGSHIP: &str = "ltx25-bf16-kv-bf16";
@@ -39,15 +39,19 @@ fn dims(deployment: &str) -> Dims {
     }
 }
 
-fn word(plan: &Trace, reading: &str, stream: Stream) -> u64 {
-    let request = Request::new(4, false).on_stream(stream).in_reading(reading);
+/// The word of a lane in `reading`, on `stream` where given (its declared
+/// default otherwise).
+fn word(plan: &Trace, reading: &str, stream: Option<&str>) -> u64 {
+    let mut request = Request::new(4, false).switched("reading", reading);
+    if let Some(stream) = stream {
+        request = request.switched("stream", stream);
+    }
     plan.facts.word(&request)
 }
 
 #[test]
 fn the_ltx_2_rows_bake_every_case() {
     every_row_traces_on_every_platform_holding_nothing_between_fires();
-    each_reading_reads_out_what_its_facts_state();
     each_lane_the_facts_list_classifies_into_its_own_class();
     the_attentions_pair_as_the_architecture_says();
     every_rope_is_one_ladder_across_the_row();
@@ -100,47 +104,25 @@ fn is_flagship(deployment: &str) -> bool {
     deployment == FLAGSHIP
 }
 
-fn each_reading_reads_out_what_its_facts_state() {
-    for deployment in ROWS {
-        let facts = row(deployment).generative().expect("facts");
-        let d = dims(deployment);
-        let denoise = facts
-            .readings
-            .iter()
-            .find(|r| r.name == "denoise")
-            .unwrap_or_else(|| panic!("{deployment} declares no `denoise`"));
-        assert_eq!(denoise.readout, ReadoutKind::Velocity);
-        assert_eq!(denoise.readout_width, d.channels);
-        for (name, width) in [
-            ("refine.video", d.cross_dim),
-            ("refine.audio", d.audio_cross_dim),
-        ] {
-            let refine = facts.readings.iter().find(|r| r.name == name).unwrap();
-            assert_eq!(refine.readout, ReadoutKind::Hidden, "{deployment} {name}");
-            assert_eq!(refine.readout_width, width, "{deployment} {name}");
-        }
-    }
-}
-
 fn each_lane_the_facts_list_classifies_into_its_own_class() {
     for deployment in ROWS {
         let plan = trace(deployment, Platform::Cuda);
         let classes = poem::resolve_classes(&plan)
             .unwrap_or_else(|why| panic!("{deployment}: a merge does not resolve: {why:?}"));
-        let facts = row(deployment).generative().expect("facts");
-        let _catalog = row(deployment);
-        let mut seen: Vec<((&str, Stream), usize)> = Vec::new();
-        for reading in &facts.readings {
-            for &stream in &reading.streams {
-                let request = Request::new(4, false)
-                    .on_stream(stream)
-                    .in_reading(&reading.name);
-                let w = plan.facts.word(&request);
-                let class = classes.class_of(w & classes.mask).unwrap_or_else(|| {
-                    panic!("{deployment}: `{}`/{stream:?} has no class", reading.name)
-                });
-                seen.push(((reading.name.as_str(), stream), class));
-            }
+        let mut lanes: Vec<(&str, Option<&str>)> = ["video", "audio", "context", "reference"]
+            .map(|stream| ("denoise", Some(stream)))
+            .to_vec();
+        lanes.extend([("refine.video", None), ("refine.audio", None)]);
+        if is_flagship(deployment) {
+            lanes.push(("vae.decode", None));
+        }
+        let mut seen: Vec<((&str, Option<&str>), usize)> = Vec::new();
+        for (reading, stream) in lanes {
+            let w = word(&plan, reading, stream);
+            let class = classes
+                .class_of(w & classes.mask)
+                .unwrap_or_else(|| panic!("{deployment}: `{reading}`/{stream:?} has no class"));
+            seen.push(((reading, stream), class));
         }
         let distinct: BTreeSet<usize> = seen.iter().map(|(_, class)| *class).collect();
         assert_eq!(
@@ -173,12 +155,12 @@ fn the_attentions_pair_as_the_architecture_says() {
                 other => panic!("{deployment}: a ragged CSR that is not an indptr: {other:?}"),
             }
         };
-        let video = word(&plan, "denoise", Stream::Video);
-        let audio = word(&plan, "denoise", Stream::Audio);
-        let ctx = word(&plan, "denoise", Stream::Context);
-        let actx = word(&plan, "denoise", Stream::Reference);
-        let refine_v = word(&plan, "refine.video", Stream::Text);
-        let refine_a = word(&plan, "refine.audio", Stream::Text);
+        let video = word(&plan, "denoise", Some("video"));
+        let audio = word(&plan, "denoise", Some("audio"));
+        let ctx = word(&plan, "denoise", Some("context"));
+        let actx = word(&plan, "denoise", Some("reference"));
+        let refine_v = word(&plan, "refine.video", None);
+        let refine_a = word(&plan, "refine.audio", None);
 
         let mut pairs: BTreeMap<(&str, &str), usize> = BTreeMap::new();
         let mut connector_reads = 0usize;
@@ -333,18 +315,15 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
     for deployment in ROWS {
         let facts = row(deployment).generative().expect("facts");
         let d = dims(deployment);
-        for (at, reading) in facts.readings.iter().enumerate() {
-            assert_eq!(usize::from(reading.index), at, "{deployment}: dense from 0");
-            assert!(
-                !reading.has_kv && !reading.takes_tokens,
-                "{deployment}: every reading here binds float ports alone"
-            );
-            assert!(
-                reading.positions.is_none(),
-                "{deployment}: LTX turns physical coordinates, which no convention names"
-            );
-        }
-        let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            facts.positions.is_none(),
+            "{deployment}: LTX turns physical coordinates, which no convention names"
+        );
+        let names = trace(deployment, Platform::Cuda)
+            .facts
+            .declared("reading")
+            .map(|s| s.values.clone())
+            .unwrap_or_default();
         let mut want = vec!["denoise", "refine.video", "refine.audio"];
         if is_flagship(deployment) {
             want.push("vae.decode");
@@ -353,10 +332,6 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
             names, want,
             "{deployment}: the decode reading iff the row carries the VAE"
         );
-        assert_eq!(usize::from(DENOISE), 0);
-        assert_eq!(usize::from(REFINE_VIDEO), 1);
-        assert_eq!(usize::from(REFINE_AUDIO), 2);
-        assert_eq!(usize::from(VAE_DECODE), 3);
         let latent = facts.latent.expect("a latent space");
         assert_eq!(
             (
@@ -381,13 +356,6 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
             model::DISTILLED_SIGMAS.to_vec(),
             "{deployment}: the distilled row pins eight sigmas for BOTH modalities"
         );
-        validate(&facts);
-    }
-}
-
-fn validate(facts: &poem::generative::Generative) {
-    for reading in &facts.readings {
-        assert!(reading.readout_width > 0);
     }
 }
 
