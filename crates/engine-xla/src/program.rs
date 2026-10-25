@@ -1365,8 +1365,8 @@ impl Drop for Plane {
     }
 }
 
-// The float-port feeds of the diffusion and video families (serve.rs reads a
-// port's cell here at every submit; engine-cuda `Plane::feed_cell`).
+// The guest-input feeds (serve.rs reads an input's cell here at every submit;
+// engine-cuda `Plane::feed_cell`).
 impl Plane {
     /// The committed front cell of channel `channel` (a registered channel
     /// id) of instance `instance`: the cell its own `take` would read this
@@ -1382,15 +1382,15 @@ impl Plane {
             .position(|&bound| bound == channel)
             .ok_or_else(|| {
                 Refusal::Program(format!(
-                    "instance {instance} binds no channel {channel}, so no port reads a cell of it"
+                    "instance {instance} binds no channel {channel}, so no input reads a cell of it"
                 ))
             })?;
         let ring = &seat.inst.channels[dense];
         self.settle_ring(ring);
         if ring.is_empty() {
             return Err(Refusal::Program(format!(
-                "float-port feed channel {channel} of instance {instance} holds no committed \
-                 cell; a port is fed from the cell the instance's own `take` would read this \
+                "input feed channel {channel} of instance {instance} holds no committed \
+                 cell; an input is fed from the cell the instance's own `take` would read this \
                  fire, so publish (or `put`) one before submitting"
             )));
         }

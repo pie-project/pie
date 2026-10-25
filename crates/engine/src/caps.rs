@@ -186,8 +186,7 @@ pub struct Capabilities {
     pub inputs: Vec<poem_ir::InputDecl>,
 
     /// The loaded trace's classes: the lane words landing in each and what
-    /// its graph does (reads kv, embeds tokens, attends both ways, reads
-    /// out).
+    /// its graph does.
     #[serde(default)]
     pub classes: poem_ir::LaneClasses,
 }

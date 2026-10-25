@@ -90,8 +90,6 @@ fn check(
     let fill = bf16s(qr * qh * hd, seed + 3, 1.0);
     let span = 2 * MAX_LEN - 1;
     let bias: Vec<f32> = bf16s(qh * span, seed + 4, 2.0);
-    // Classes are global per row; the q and kv tables are the same, so one
-    // table serves both sides.
     let ids = qr.max(kr);
     let classes: Vec<i32> = (0..ids as i32).map(|r| r % 3).collect();
     let allowed: Vec<u8> = (0..9).map(|c| u8::from(c % 4 == 0 || c % 3 == 1)).collect();

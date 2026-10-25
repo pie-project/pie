@@ -1329,7 +1329,7 @@ impl Cuda {
             };
             voxel_bytes.reserve(submission.voxels.len());
             for row in &submission.voxels {
-                voxel_bytes.push(crate::voxels::port_bytes(&row.payload, element).map_err(
+                voxel_bytes.push(crate::voxels::input_bytes(&row.payload, element).map_err(
                     |why| Error::Unsupported {
                         verb: why,
                         engine: "cuda",

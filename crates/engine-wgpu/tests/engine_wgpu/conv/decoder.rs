@@ -377,7 +377,7 @@ fn scratch() -> PathBuf {
 }
 
 #[test]
-fn a_conv_decoder_fires_over_a_voxel_port() {
+fn a_conv_decoder_fires_over_a_voxel_input() {
     let device = DeviceBoot::default();
     if engine_wgpu::Context::bind(&device, 0.25).is_err() {
         eprintln!("not asked: no device");

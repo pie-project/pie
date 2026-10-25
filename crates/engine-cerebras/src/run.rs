@@ -542,7 +542,7 @@ impl<'c> Run<'c> {
                 assert_eq!(
                     voxels.width, width,
                     "value {at} reads a {width}-wide voxel input (guest input {id}) and this \
-                     fire fed a {}-wide one: the clips ran in another reading's class",
+                     fire fed a {}-wide one: the clips ran in another class",
                     voxels.width
                 );
                 voxels

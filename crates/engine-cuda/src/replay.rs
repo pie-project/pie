@@ -108,10 +108,8 @@ impl Replay {
         Some((head, tail))
     }
 
-    /// Whether lane `at` of `step` is a plain prompt longer than the window (a
-    /// plain word; no mask, scores, conditioning, media or inputs; pages
-    /// stated; readouts in its last window). Its program and channels ride
-    /// the second fire.
+    /// Whether lane `at` of `step` is a plain prompt longer than the window;
+    /// its program and channels ride the second fire.
     fn cuts(self, step: &Step, at: usize, plain: impl Fn(u64) -> bool) -> bool {
         let lane = &step.lanes[at];
         let window = self.window as usize;

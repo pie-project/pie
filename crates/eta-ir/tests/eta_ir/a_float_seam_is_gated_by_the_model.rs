@@ -1,7 +1,7 @@
 //! The two float seams a generative model lands, the velocity and the
 //! pixels, as one table: a pass whose lane reads the seam out binds a
-//! reading of it at that lane's width; a lane that reads another thing out
-//! refuses the program; a reading at another width, or not a float matrix,
+//! read of it at that lane's width; a lane that reads another thing out
+//! refuses the program; a read at another width, or not a float matrix,
 //! is refused; a lane past the pass's is refused, any lane within it binds;
 //! and either seam is an epilogue value.
 
@@ -39,7 +39,7 @@ fn bound(
     bind(container, lanes, Graph::default(), EngineCaps::default())
 }
 
-fn epilogue_reading(intr: IntrinsicId, lane: u32, shape: Shape, dtype: Dtype) -> TraceContainer {
+fn epilogue_read(intr: IntrinsicId, lane: u32, shape: Shape, dtype: Dtype) -> TraceContainer {
     TraceContainer {
         names: Vec::new(),
         channels: vec![ChannelDecl {
@@ -71,7 +71,7 @@ fn epilogue_reading(intr: IntrinsicId, lane: u32, shape: Shape, dtype: Dtype) ->
 fn a_float_seam_is_gated_by_the_model() {
     for seam in &SEAMS {
         let Seam { intr, kind, width } = *seam;
-        let read = |shape, dtype| epilogue_reading(intr, 0, shape, dtype);
+        let read = |shape, dtype| epilogue_read(intr, 0, shape, dtype);
         let plane = Shape::matrix(ROWS, width);
         let reads = Some(Readout { kind, width });
         let other = Some(Readout {
@@ -100,19 +100,19 @@ fn a_float_seam_is_gated_by_the_model() {
         for (shape, dtype) in [(Shape::vector(width), Dtype::F32), (plane, Dtype::I32)] {
             assert!(
                 bound(read(shape, dtype), vec![reads]).is_err(),
-                "{intr:?}: bound a reading of shape {shape:?} dtype {dtype:?}"
+                "{intr:?}: bound a read of shape {shape:?} dtype {dtype:?}"
             );
         }
 
         // The lane named is the one gated: lane 1 of a pass whose second
         // lane reads the seam binds, lane 2 of a pass of two is refused.
         bound(
-            epilogue_reading(intr, 1, plane, Dtype::F32),
+            epilogue_read(intr, 1, plane, Dtype::F32),
             vec![other, reads],
         )
         .unwrap_or_else(|why| panic!("{intr:?}: lane 1 reads the seam: {why:?}"));
         let refusal = bound(
-            epilogue_reading(intr, 2, plane, Dtype::F32),
+            epilogue_read(intr, 2, plane, Dtype::F32),
             vec![other, reads],
         )
         .expect_err("a lane past the pass's is refused");
@@ -125,7 +125,7 @@ fn a_float_seam_is_gated_by_the_model() {
         // an instance binds is as wide as the lanes the program reads.
         let mut lanes = vec![other; 21];
         lanes[20] = reads;
-        let wide = bound(epilogue_reading(intr, 20, plane, Dtype::F32), lanes)
+        let wide = bound(epilogue_read(intr, 20, plane, Dtype::F32), lanes)
             .unwrap_or_else(|why| panic!("{intr:?}: lane 20 reads the seam: {why:?}"));
         assert_eq!(
             intrinsic_pitch(&wide.container.stages[0].ops),
@@ -141,7 +141,7 @@ fn a_float_seam_is_gated_by_the_model() {
 
     // Logits read the pass, so they name lane 0.
     let refusal = bound(
-        epilogue_reading(IntrinsicId::Logits, 1, Shape::matrix(1, 32), Dtype::F32),
+        epilogue_read(IntrinsicId::Logits, 1, Shape::matrix(1, 32), Dtype::F32),
         vec![
             Some(Readout {
                 kind: ReadoutKind::Logits,

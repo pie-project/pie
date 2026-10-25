@@ -24,7 +24,6 @@ impl Shell {
         self.feeds.decls(&self.trace, &self.compiled)
     }
 
-    /// This load's classes and what each runs.
     #[must_use]
     pub fn classes(&self) -> poem_ir::LaneClasses {
         poem_exec::feeds::lane_classes(&self.trace, &self.compiled)

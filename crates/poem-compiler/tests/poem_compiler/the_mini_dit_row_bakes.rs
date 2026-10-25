@@ -139,7 +139,7 @@ fn the_row_traces_on_every_platform_with_no_cache_and_a_velocity_readout() {
 
 fn the_row_reads_exactly_the_five_inputs_it_names() {
     let plan = trace(Platform::Cuda);
-    let ports: BTreeSet<String> = plan
+    let named: BTreeSet<String> = plan
         .values
         .iter()
         .filter_map(|decl| match &decl.def {
@@ -162,7 +162,7 @@ fn the_row_reads_exactly_the_five_inputs_it_names() {
     ]
     .into_iter()
     .collect();
-    assert_eq!(ports, want);
+    assert_eq!(named, want);
 
     let sinusoids: Vec<(u32, f32, bool, f32)> = plan
         .nodes

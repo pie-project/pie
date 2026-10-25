@@ -95,9 +95,8 @@ fn subject() -> TraceContainer {
     }
 }
 
-fn profile() -> Served {
-    let profile = Served::of(VOCAB);
-    profile
+fn served() -> Served {
+    Served::of(VOCAB)
 }
 
 #[test]
@@ -108,7 +107,7 @@ fn the_epilogue_streams_through_registers_every_case() {
 }
 
 fn the_row_parallel_epilogue_fuses_into_streams() {
-    let bound = profile().bind(subject()).expect("the subject binds");
+    let bound = served().bind(subject()).expect("the subject binds");
     let stages = compile_bound(&bound);
     let stage = stages.first().expect("one stage");
     let mut source = String::new();
@@ -194,7 +193,7 @@ fn a_reshaped_row_vector_broadcasts_through_the_stream() {
         externs: Vec::new(),
         inputs: Vec::new(),
     };
-    let bound = profile().bind(container).expect("binds");
+    let bound = served().bind(container).expect("binds");
     let stages = compile_bound(&bound);
     let stage = stages.first().expect("one stage");
     assert!(
@@ -273,7 +272,7 @@ fn a_top_k_of_the_scaled_logits_reads_the_plane_and_stores_nothing() {
         externs: Vec::new(),
         inputs: Vec::new(),
     };
-    let bound = profile().bind(container).expect("binds");
+    let bound = served().bind(container).expect("binds");
     let stages = compile_bound(&bound);
     let stage = stages.first().expect("one stage");
     let mut generated = String::new();

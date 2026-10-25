@@ -62,7 +62,7 @@ fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
         assert_eq!(
             voxels,
             want.into_iter().collect(),
-            "{deployment}: the denoiser's latents on the voxel axis, and the VAE's port iff \
+            "{deployment}: the denoiser's latents on the voxel axis, and the VAE's input iff \
              the row carries the VAE"
         );
     }

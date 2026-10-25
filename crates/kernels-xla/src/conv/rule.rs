@@ -115,8 +115,8 @@ fn per_row(f: &mut Func, v: Val, rows: i64) -> Result<Val, Error> {
 /// Each token row's cell, `[rows, max(3, axis + 1) + 3]` f32
 /// (`ops::conv::cells`): a row of a clip of `tgrid` its patch's `(t, h, w)`
 /// there and the clip's size in the last three columns, any other row
-/// `positions[row]` in column `axis`; zeros elsewhere. `base` is the row `tgrid` addresses `y`'s row 0 at.
-/// kernels-cuda `elemwise::posenc::cells`.
+/// `positions[row]` in column `axis`; zeros elsewhere. `base` is the row
+/// `tgrid` addresses `y`'s row 0 at. kernels-cuda `elemwise::posenc::cells`.
 pub fn cells(
     f: &mut Func,
     tgrid: Operand,

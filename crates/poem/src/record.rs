@@ -417,9 +417,9 @@ impl Recorder {
 }
 
 /// A node reading a buffer a lane may not carry, on rows whose lanes are not
-/// known to carry it. Which rows carry a mask or adapter routes is a builtin
-/// fact; a custom fact an inferlet sets says nothing about them, so a kernel
-/// reading one runs only where its builtin holds.
+/// known to carry it. Which rows carry a mask or adapter routes is a runtime
+/// switch; a model's own switch an inferlet sets says nothing about them, so
+/// a kernel reading one runs only where its runtime switch holds.
 fn unguarded_read(plan: &Trace) -> Option<String> {
     let mut ins = Vec::new();
     for (j, node) in plan.nodes.iter().enumerate() {

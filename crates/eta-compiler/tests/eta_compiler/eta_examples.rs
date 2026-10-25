@@ -26,7 +26,7 @@ fn beam_epilogue_serializes_validates_hashes_stably() {
     let bytes = encode(&c);
     let h = container_hash(&bytes);
     assert_eq!(decode(&bytes).expect("decode"), c);
-    let bound = beam_profile().bind(c.clone()).expect("bind");
+    let bound = beam_served().bind(c.clone()).expect("bind");
     assert_eq!(bound.hash, h);
     assert_eq!(container_hash(&encode(&decode(&bytes).unwrap())), h);
 }

@@ -72,20 +72,9 @@ this is a different conditioning and is reported, not gated):
 
 THE SUBMIT DEADLINE IS NOT A KNOB THIS HARNESS TOUCHES
 -----------------------------------------------------
-It used to be. The two lanes of a denoise group compose into one fire only
-if the scheduler seals them into one frame, and that wait was once leashed
-by `[runtime] submit_deadline` (50 ms): a 1024^2 job's first submit carries
-a 6 MB seeded `context` channel and a 2 MB `latents` one across the guest
-boundary, took longer than the leash under load, and the group's first frame
-sealed with the IMAGE lane alone -- an UNCONDITIONED velocity reported as a
-success (cos ~0.535 against the golden, cos 0.9999 against a reference run
-with no text at all). This script demanded `submit_deadline = "10s"` to
-paper over it.
-
-The guest now runs the step as ONE pass whose lanes are the group, so the
-deadline cannot buy or cost correctness here.
-The demand is gone, and this harness runs at the 50 ms DEFAULT on purpose --
-if a partial group is ever sealed again, this parity is what says so.
+The step is ONE pass whose lanes are the denoise group, so `[runtime]
+submit_deadline` cannot split it. This harness runs at the 50 ms DEFAULT on
+purpose: if a partial group is ever sealed, this parity is what says so.
 
 THE CASE CROSSES AS FILES
 -------------------------

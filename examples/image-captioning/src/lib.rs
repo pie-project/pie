@@ -6,7 +6,7 @@
 //! let img = Image::from_bytes(&bytes)?;   // host decodes + preprocesses
 //! toks.extend(img.tokens());              // the span IS its token run
 //! fwd.embed(&toks)?;
-//! fwd.media(0, &[Span::Image(&img)])?;       // the payload, order-matched
+//! fwd.media(0, &[Span::Image(&img)])?;    // the payload, order-matched
 //! ```
 //!
 //! **ONE LEDGER.** The image enters the sequence as the token run its handle

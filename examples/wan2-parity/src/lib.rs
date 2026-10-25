@@ -28,10 +28,8 @@ use inferlet::latent::prelude::*;
 use serde::{Deserialize, Serialize};
 
 /// The case arrives as `case` whole, as `case_file` (a name under
-/// `/scratch`), or — the usual way — cut into `case_0`, `case_1`, … argv
-/// pieces, because Linux caps ONE argument at 128 KiB. How MANY pieces is
-/// the harness's business: the real row needs a score of them, so they are
-/// read off the argument map by name rather than declared one field each.
+/// `/scratch`), or cut into `case_0`, `case_1`, … argv pieces, because Linux
+/// caps one argument at 128 KiB.
 #[derive(Deserialize)]
 struct Input {
     #[serde(default)]
@@ -176,11 +174,7 @@ struct Dims {
     velocity_width: u32,
 }
 
-/// The lane `stream` of `reading`, checked to bind no kv space and no
-/// tokens and to read exactly `binds`: what this guest binds on that lane,
-/// by the model's own input names. Checked up front so a model whose lane
-/// reads anything else fails here in its own vocabulary instead of at
-/// `program`.
+/// The lane `stream` of `reading`, checked to read exactly `binds`.
 fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::LaneDecl> {
     let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
     if lane.state || lane.embeds {
@@ -202,8 +196,7 @@ fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::La
     Ok(lane)
 }
 
-/// Checks the context lane and the video lanes against what this guest
-/// binds on each and reads the velocity width off them.
+/// Checks the context and video lanes and reads the velocity width.
 fn dims(reading: &str, given: bool) -> Result<Dims> {
     lane_reading(reading, "context", &["context"])?;
     let video = if given {
@@ -278,8 +271,7 @@ async fn step(case: &Case, dims: &Dims, reading: &str) -> Result<Vec<f32>> {
     let group = 0;
     let pass = ForwardPass::new();
 
-    // Lane 0, the context lane: the cross-attention keys and values, and
-    // nothing else.
+    // Lane 0, the context lane.
     pass.switch(0, "reading", reading)?;
     pass.switch(0, "stream", "context")?;
     pass.group(0, group)?;
@@ -339,8 +331,6 @@ async fn step(case: &Case, dims: &Dims, reading: &str) -> Result<Vec<f32>> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    // What a denoise step needs is stated on its lanes, and is checked
-    // below: they bind no kv space and take no tokens.
     let pieces = input.pieces();
     let text = match (&input.case, &input.case_file) {
         (Some(text), _) => text.clone(),

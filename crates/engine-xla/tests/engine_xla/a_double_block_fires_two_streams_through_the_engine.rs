@@ -1,5 +1,5 @@
 //! engine-cuda's `a_double_block_fires_two_streams_through_the_engine` and
-//! `a_second_fire_reads_the_port_cells_it_was_handed`, on the xla engine:
+//! `a_second_fire_reads_the_input_cells_it_was_handed`, on the xla engine:
 //! two requests of a text lane and an image lane each, fed latents, a
 //! timestep and axis positions off their channels, attend within their
 //! group through a row permutation, and read back the velocity seam; a

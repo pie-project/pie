@@ -80,13 +80,13 @@ fn subject() -> TraceContainer {
     }
 }
 
-fn profile() -> Served {
+fn served() -> Served {
     Served::of(VOCAB)
 }
 
 #[test]
 fn the_single_lane_form_declines_this_shape_by_the_score_ceiling() {
-    let bound = profile().bind(subject()).expect("the subject binds");
+    let bound = served().bind(subject()).expect("the subject binds");
     let stages = compile_bound(&bound);
     let stage = stages.first().expect("one stage");
     assert_eq!(

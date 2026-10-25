@@ -204,7 +204,6 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
 #elif defined(PIE_SQRT)
 
-// `x = sqrt(x)` in place over a whole tensor, a pair of elements a lane.
 
 [[vk::binding(0)]] RWStructuredBuffer<PIE_ACT> x;
 

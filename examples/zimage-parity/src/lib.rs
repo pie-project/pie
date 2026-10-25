@@ -20,10 +20,6 @@
 //!    ONE pass — lane 0 the context, lane 1 the image; the epilogue reads
 //!    the image lane's `velocity` on the voxel axis.
 //!
-//! The refine readout goes through the host between the two: a parity
-//! harness wants both numbers on disk anyway (the refined caption is the
-//! first thing to diff when the velocity disagrees).
-//!
 //! Under `steps` the second fire becomes the whole TRAJECTORY: `steps`
 //! denoise fires over the family's pinned sigmas with the latent carried on
 //! the device by the image lane's Euler epilogue, started from the case's
@@ -123,10 +119,7 @@ struct Reading {
     readout_width: u32,
 }
 
-/// The lane `stream` of `reading`, checked to read exactly `binds`: what
-/// this guest binds on that lane, by the model's own input names. Checked
-/// up front so a model whose lane reads anything else fails here in its own
-/// vocabulary instead of at `program`.
+/// The lane `stream` of `reading`, checked to read exactly `binds`.
 fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::LaneDecl> {
     let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
     let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
@@ -234,8 +227,7 @@ async fn refine(case: &Case, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
     Ok((rows_out, width, rows))
 }
 
-/// The `denoise` reading, its two lanes checked against what this guest
-/// binds.
+/// The `denoise` reading, its two lanes checked.
 fn denoise_reading() -> Result<Reading> {
     reading(
         model::ReadoutKind::Velocity,
@@ -246,9 +238,7 @@ fn denoise_reading() -> Result<Reading> {
     )
 }
 
-/// Binds the `denoise` reading's lanes on `pass`: lane 0 the refined
-/// caption (and its own row count), lane 1 the image over `latent`, both
-/// in one group and reading `timestep`.
+/// Binds lane 0 (the refined caption) and lane 1 (the image) in one group.
 fn denoise_lanes(
     pass: &ForwardPass,
     r: &Reading,
@@ -302,9 +292,6 @@ async fn denoise(
     pipe: &Pipeline,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
     let r = denoise_reading()?;
-    // The readout is the velocity, `channels` wide — unless the family is
-    // tapped on an intermediate (a bisect), which is `readout_width` wide
-    // over the token rows.
     let width = r.readout_width;
     let voxels = readout_rows(case, width)?;
     let caption_rows = context.shape().dims()[0];
@@ -331,18 +318,9 @@ async fn denoise(
     Ok((velocity, ctx_rows))
 }
 
-/// The whole Euler trajectory in one job: `steps` denoise fires over the
-/// family's own pinned sigmas ([`FlowMatchEuler::from_model`] — Turbo's
-/// eight), the latent carried on the DEVICE between them by the image
-/// lane's epilogue (`x <- x + (sigma' - sigma) . velocity`) and read back
-/// once per fire so a partial run can be diffed against the reference's own
-/// `sched.x{n}`.
-///
-/// The initial latent is the CASE's, not a device draw: this is a parity
-/// harness, and the reference's trajectory starts from a `randn` the golden
-/// recorded. `DenoiseLoop` puts a seed fire ahead of the steps whose `dt`
-/// is 0, so fire 0 leaves that latent alone and fire `k` integrates step
-/// `k - 1`.
+/// The Euler trajectory over the family's pinned sigmas, from the case's
+/// latent, read back every fire. `DenoiseLoop`'s seed fire has `dt = 0`, so
+/// fire `k` integrates step `k - 1`.
 async fn trajectory(
     case: &Case,
     context: &Channel,
@@ -384,11 +362,7 @@ async fn trajectory(
     Ok((last, sched.sigmas.clone(), sched.timesteps()))
 }
 
-/// The `text` reading: the prompt through the family's template
-/// (`user(prompt) ++ cue()`, what the reference's `apply_chat_template(
-/// add_generation_prompt=True)` renders), one prefill over a fresh working
-/// set, `hidden` at every row. `inferlet::latent::encode_text` with the
-/// template applied — that helper tokenizes plain text.
+/// The `text` reading over the templated prompt, `hidden` at every row.
 async fn text(prompt: &str, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
     let readings = model::switch("reading")
         .map(|decl| decl.values)
@@ -429,7 +403,6 @@ async fn text(prompt: &str, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
     pass.switch(0, "reading", &name)?;
     pass.embed(&toks, &embed_indptr)?;
     pass.readout(&readout)?;
-    // The encoder's state is scratch: nothing folds, and it goes with `ws`.
     pass.state(&[&ws], StateGeometry::default())?;
     let readback = out.clone();
     pass.epilogue(move || {

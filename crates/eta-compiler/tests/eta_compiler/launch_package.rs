@@ -1,12 +1,12 @@
-use crate::msl_corpus::{GOLDEN_NAMES, golden_container, golden_profile, synthetic_traces};
+use crate::msl_corpus::{GOLDEN_NAMES, golden_container, golden_served, synthetic_traces};
 use eta_compiler::codegen::launch::LaunchStagePlan;
 use eta_compiler::plan::compile_bound;
 
 fn bound_and_refused() -> (Vec<(String, Vec<LaunchStagePlan>)>, Vec<String>) {
     let mut out = Vec::new();
     let mut refused = Vec::new();
-    let mut push = |name: &str, container, profile: crate::msl_corpus::Served| {
-        let Ok(bound) = profile.bind(container) else {
+    let mut push = |name: &str, container, served: crate::msl_corpus::Served| {
+        let Ok(bound) = served.bind(container) else {
             refused.push(name.to_string());
             return;
         };
@@ -15,10 +15,10 @@ fn bound_and_refused() -> (Vec<(String, Vec<LaunchStagePlan>)>, Vec<String>) {
         out.push((name.to_string(), package.plans));
     };
     for name in GOLDEN_NAMES {
-        push(name, golden_container(name), golden_profile(name));
+        push(name, golden_container(name), golden_served(name));
     }
-    for (name, container, profile) in synthetic_traces() {
-        push(name, container, profile);
+    for (name, container, served) in synthetic_traces() {
+        push(name, container, served);
     }
     (out, refused)
 }

@@ -415,9 +415,8 @@ impl Run<'_> {
                 *sm_scale,
                 &mut self.tensor(*o),
             ),
-            // A masked prefill reads the bits its lanes staged: causally
-            // clipped unless their class attends both ways
-            // (`exports::wide_classes`), which is what `causal` says.
+            // `causal: false` marks a class attending both ways
+            // (`exports::wide_classes`): its staged mask bits are unclipped.
             Attn::Prefill {
                 kv_heads: _,
                 causal: _,
@@ -1348,8 +1347,6 @@ impl Run<'_> {
                 if self.run_index() > 0 {
                     return Ok(());
                 }
-                // A mask a lane states is over its group's rows: it is staged
-                // for this attention's query and key packings.
                 let packing = |id: poem_ir::ValueId| match self.values()[id.0 as usize].def {
                     poem_ir::Def::Input(poem_ir::RuntimeInput::Geometry {
                         kind: poem_ir::GeomKind::GroupIndptr { select },

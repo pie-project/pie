@@ -419,9 +419,8 @@ pub enum FoldLen {
     Device,
 }
 
-/// A pass's program on a fire. Each of its stages runs at its own point:
-/// the prologue before the fire stages its inputs (the forward reads what
-/// it put), the epilogue after the forward.
+/// A pass's program on a fire: the prologue runs before the fire stages its
+/// inputs, the epilogue after the forward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     /// The first of the pass's lanes, `lanes` of them in a row.
@@ -429,8 +428,7 @@ pub struct Attachment {
     pub lanes: u32,
     pub instance: InstanceId,
     /// The fire carries the pass's adapter alone and runs none of its
-    /// stages: a pass cut into several fires runs its program on the last
-    /// and carries its adapter on every other.
+    /// stages (every fire but the last of a cut pass).
     pub adapter_only: bool,
 }
 

@@ -235,7 +235,7 @@ def run_vae(d: str, device="cuda", repo=REPO):
     per latent frame carrying the caches across. Latent frame 0 lands ONE
     output frame, every later one lands FOUR, so `F = 4*T - 3`. Both halves
     are dumped: the whole clip's pixels, and the frame boundary each chunk
-    ends at, so a port can be scored chunk by chunk and say WHICH fire drifted.
+    ends at, so a guest's decode can be scored chunk by chunk and say WHICH fire drifted.
     """
     from diffusers import AutoencoderKLWan
 

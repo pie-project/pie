@@ -925,7 +925,7 @@ def roster() -> list[Gate]:
                   "the guest driving the family's TWO `vae.encode` arms, one chunk per fire "
                   "down one pipeline: the clip crosses as `frames` handles "
                   "(`frames.decode` per still, `frames.from-rgb8` per chunk, "
-                  "`frames.to-channel` onto the pixel port) and the encoder's rows go "
+                  "`frames.to-channel` onto the pixel input) and the encoder's rows go "
                   "STRAIGHT to `denoise` — the arm already answers `(mean - "
                   "latents_mean)/std`, the denoiser's own space. Both claims are "
                   "identities, so neither needs a golden; they are measured on `raw-rgb8`, "
@@ -939,7 +939,7 @@ def roster() -> list[Gate]:
                      "and at 1.0 IS txt2img",
             note="img2img is the guest driving the family's `vae.encode` reading: "
                  "the picture crosses as a `frames` handle (`frames.decode` in, "
-                 "`frames.to-channel` onto the pixel port) and never enters the "
+                 "`frames.to-channel` onto the pixel input) and never enters the "
                  "guest's linear memory. An init image seeds the trajectory. Every "
                  "claim is an identity or a margin measured within this gate's own "
                  "runs, so none needs a golden.",

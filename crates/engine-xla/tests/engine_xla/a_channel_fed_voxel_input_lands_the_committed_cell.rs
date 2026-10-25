@@ -1,8 +1,8 @@
-//! engine-cuda's `a_channel_fed_voxel_port_lands_the_committed_cell`, on the
-//! xla engine: a two-axis plan whose VAE reading convolves a voxel port into
-//! a pixels seam. The port is fed off a channel (and, beside it, off the
-//! step's own payload); each fire reads the cell committed for it, and the
-//! plan's token reading still answers its velocity.
+//! engine-cuda's twin gate, on the xla engine: a two-axis plan whose VAE
+//! reading convolves a voxel input into a pixels seam. The input is fed off a
+//! channel (and, beside it, off the step's own payload); each fire reads the
+//! cell committed for it, and the plan's token reading still answers its
+//! velocity.
 
 use crate::common_dit;
 
@@ -131,7 +131,7 @@ fn the_cell_the_channel_holds_is_the_clip_the_convolution_reads() {
         "the host payload's pixels",
     );
 
-    // The plan's token reading: a velocity off its latent and timestep ports.
+    // The plan's token reading: a velocity off its latent and timestep inputs.
     let rows = 5u32;
     let shapes = [Shape::matrix(rows, WIDTH), Shape::matrix(1, 1)];
     let dit = rig.register(carrier(&shapes, 2));

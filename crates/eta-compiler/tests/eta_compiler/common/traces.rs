@@ -424,6 +424,6 @@ pub fn beam_trace() -> TraceContainer {
     }
 }
 
-pub fn beam_profile() -> crate::msl_corpus::Served {
+pub fn beam_served() -> crate::msl_corpus::Served {
     crate::msl_corpus::Served::of(V)
 }

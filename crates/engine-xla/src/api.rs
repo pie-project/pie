@@ -867,9 +867,8 @@ impl Xla {
         Ok(out)
     }
 
-    /// Runs each program's prologue to its commit before the step reads
-    /// its descriptor ports and input cells: the forward reads the cells a
-    /// prologue put.
+    /// Runs each attached prologue before the step reads its descriptor
+    /// ports and input cells, which a prologue may put.
     fn run_prologues(&mut self, submission: &engine::fire::Step) -> EngineResult<()> {
         let prologues: Vec<(InstanceId, u32)> = submission
             .attachments

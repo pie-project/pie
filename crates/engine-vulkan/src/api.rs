@@ -1262,16 +1262,14 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
 // Vulkan handles are not tied to the thread that made them.
 unsafe impl Send for Vulkan {}
 
-/// The attachments whose program runs on this fire, each stage at its own
-/// point.
+/// The attachments whose program runs on this fire.
 fn epilogues(step: &Step) -> impl Iterator<Item = &engine::fire::Attachment> {
     step.attachments
         .iter()
         .filter(|attachment| !attachment.adapter_only)
 }
 
-/// Each lane of `attachment`'s pass's own readout rows and pixels, lane `k`
-/// of the pass at `k`: `velocity(k)`, `hidden(k)` and `pixels(k)` read them.
+/// Each lane of `attachment`'s pass's readout rows and pixels, lane `k` at `k`.
 #[cfg(feature = "vulkan")]
 fn lane_readouts<'a>(
     shell: &'a Shell,

@@ -466,12 +466,8 @@ impl Input {
             .refined(self.over.clone())
     }
 
-    /// The input `name` the guest binds: `width` values of `dtype` a lane,
-    /// a row or a voxel of these rows (`axis`). One name is one input
-    /// wherever it is read; `rows` states the rows a lane binding it carries
-    /// (exactly `n`, or the fewest that are a multiple of `n`), which its
-    /// guest pads to, or (a voxel input) the token rows its clips' patches
-    /// are padded to.
+    /// The input `name` the guest binds, `width` values of `dtype` per `axis`
+    /// entry; one name is one input wherever it is read.
     #[must_use]
     pub fn input(
         &self,
@@ -491,14 +487,7 @@ impl Input {
             .refined(self.over.clone())
     }
 
-    /// The clips' token-side grid at patch `p`: each clip's
-    /// `[t / p0, h / p1, w / p2, first token row]`, the engine's fill from
-    /// the clip boxes and the plan's patch. The contract a model reads it
-    /// by: a voxel lane's token rows are its clips' patches, each clip's in
-    /// (t, h, w) row-major order from its first token row, then only the
-    /// pad rows its voxel input's `rows` round it up to;
-    /// [`crate::ops::conv::patchify`] lands a clip's patches there (a pad
-    /// row zeros), [`crate::ops::conv::cells`] reads each row's cell back.
+    /// The clips' token grid at patch `p`, as [`RuntimeInput::TokenGrid`].
     #[must_use]
     pub fn token_grid(&self, p: [u32; 3]) -> Value {
         assert!(p.iter().all(|&n| n > 0), "a patch of {p:?} is empty");

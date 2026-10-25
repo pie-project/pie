@@ -168,7 +168,7 @@ impl fmt::Display for ValidateError {
                 write!(
                     f,
                     "`{name}` (name #{name_index}): sink/kernel kind mismatch with \
-                     the profile — the program calls it as one and the backend \
+                     the engine — the program calls it as one and the backend \
                      declares it as the other"
                 )
             }

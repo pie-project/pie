@@ -10,12 +10,13 @@ use engine_cuda::serve::{Clips, Seated};
 use engine_cuda::{Lane, Shell};
 use poem::{Platform, Request, Trace};
 
-/// The VAE's decode readings alone, by the package's own functions.
+/// The VAE's decode alone, by the package's own functions.
 const VAE_ONLY: &str = r#"
 def forward(m, inputs):
-    switch("reading", ["vae.decode.head", "vae.decode"])
-    vae_decode(inputs.on(switch_is("reading", "vae.decode.head")), m.vae, True)
-    return vae_decode(inputs.on(switch_is("reading", "vae.decode")), m.vae, False)
+    switch("reading", ["vae.decode"])
+    arm = inputs.on(switch_is("reading", "vae.decode"))
+    vae_decode(arm.on(fact.fresh()), m.vae, True)
+    return vae_decode(arm.on(~fact.fresh()), m.vae, False)
 "#;
 
 fn vae_only() -> Trace {
@@ -36,18 +37,14 @@ struct Decoder {
 
 impl Decoder {
     fn frame(&mut self, first: bool, clip: [u32; 3], payload: &[f32]) -> (Vec<f32>, [u32; 3]) {
-        let reading = if first {
-            "vae.decode.head"
-        } else {
-            "vae.decode"
-        };
         let tokens = [0u32];
         let lanes = [Seated::of(Lane {
             slot: 0,
             word: self.shell.trace().facts.word(
                 &Request::new(1, false)
+                    .starting(first)
                     .switched("stream", "video")
-                    .switched("reading", reading),
+                    .switched("reading", "vae.decode"),
             ),
             tokens: &tokens,
         })];

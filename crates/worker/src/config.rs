@@ -559,15 +559,15 @@ pub struct ModelConfig {
     /// Omit it, as above; the default is derived from `max_patches`.
     #[serde(default)]
     pub max_images: Option<u32>,
-    /// The most PORT voxel rows one fire may carry on the third row axis
-    /// (design D8): the pixels a `vae.encode` reading takes in, the latents
-    /// a `vae.decode` reading takes in. Omit it and the shell derives a
+    /// The most input voxel rows one fire may carry on the third row axis:
+    /// the pixels a `vae.encode` pass takes in, the latents a `vae.decode`
+    /// pass takes in. Omit it and the shell derives a
     /// ceiling from the loaded text — 65 536, which is the 256x256 picture
     /// an encoder can swallow and no more, so a deployment that encodes a
     /// 1024^2 picture (1 048 576 pixel voxels) or decodes a long clip has
     /// to say so.
     ///
-    /// It is a PORT count, not an output count: a decode of a 64x64 latent
+    /// It is an input count, not an output count: a decode of a 64x64 latent
     /// lands a million pixels and is bounded by its 4 096 rows in, which is
     /// why decoding at 1024^2 needs nothing stated and encoding does.
     #[serde(default)]

@@ -1,6 +1,5 @@
 //! What a lane of a model's switches binds and reads out comes from the
-//! classes its words land in: this is what each generative family's
-//! readings used to state by hand.
+//! classes its words land in.
 
 use poem_compiler::{Budget, Budgets, DeviceProfile, VoxelLadder, compile_axes};
 use poem_ir::{LaneClasses, ReadoutKind, RowAxis, Trace, Ty};

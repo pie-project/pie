@@ -117,18 +117,18 @@ impl Plane {
     }
 
     pub fn feed_cell_bytes(&self, instance: InstanceId, id: ChannelId) -> Result<u64> {
-        let (bound, dense) = self.dense_channel(instance, id, "float-port feed")?;
+        let (bound, dense) = self.dense_channel(instance, id, "float-input feed")?;
         bound.session.cell_bytes(dense)
     }
 
     pub fn feed_cell(&self, instance: InstanceId, id: ChannelId) -> Result<(u64, u64)> {
-        let (bound, dense) = self.dense_channel(instance, id, "float-port feed")?;
+        let (bound, dense) = self.dense_channel(instance, id, "float-input feed")?;
         bound.session.feed_cell(dense)?.ok_or_else(|| {
             Fault::program(
                 "program::plane",
                 format!(
-                    "float-port feed channel {id} of instance {instance} holds no committed \
-                     cell; a port is fed from the cell the instance's own `take` would read \
+                    "float-input feed channel {id} of instance {instance} holds no committed \
+                     cell; an input is fed from the cell the instance's own `take` would read \
                      this fire, so publish (or `put`) one before submitting"
                 ),
             )

@@ -1,8 +1,8 @@
 //! The diffusion miniatures engine-cuda's `common_dit` and `common_two_axis`
-//! gate on, for the xla engine: a double-stream DiT block (latent, lane
-//! vector and axis-position ports, grouped ragged attention over a row
-//! permutation, a velocity seam), and a two-axis plan whose VAE reading
-//! convolves a voxel port into a pixels seam. Weights are drawn in-process,
+//! gate on, for the xla engine: a double-stream DiT block (latent, timestep
+//! and position inputs, grouped ragged attention over a row permutation, a
+//! velocity seam), and a two-axis plan whose VAE reading convolves a voxel
+//! input into a pixels seam. Weights are drawn in-process,
 //! the answers checked against host references.
 //!
 //! The lanes attach a carrier program that takes each fed channel's cell

@@ -158,7 +158,6 @@ struct Params {
     uint silu;
     uint rows;
     uint row_span;
-    // The row `grid` addresses `x`'s and `y`'s row 0 at.
     uint base;
 };
 PIE_PARAMS(6, Params, params);

@@ -442,8 +442,6 @@ impl Plane {
         }
     }
 
-    /// Whether `instance`'s prologue runs on its own, before the forward
-    /// ([`ExecPlan::prologue_runs`]).
     #[must_use]
     pub fn prologue_runs(&self, instance: InstanceId) -> bool {
         self.instances
@@ -451,8 +449,7 @@ impl Plane {
             .is_some_and(|seat| seat.plan.prologue_runs())
     }
 
-    /// Runs `instance`'s stages at `at`, to their commit: the prologue's
-    /// before the forward, the rest after it.
+    /// Runs `instance`'s stages at `at`, to their commit.
     #[allow(clippy::too_many_arguments)]
     pub fn fire(
         &mut self,

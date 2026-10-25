@@ -407,7 +407,7 @@ def guidance(args) -> int:
 
     Six lanes of one pass, two attention groups: group 0 holds the case's
     context, group 1 a zeroed one, and the pass's epilogue reads both image
-    lanes' velocities and combines them. That combine is what every guest did on the host until now.
+    lanes' velocities and combines them.
 
     Checked with three claims, all WITHIN one fire's own answers and needing
     no golden. Same-fire matters: a six-lane fire and a three-lane one give

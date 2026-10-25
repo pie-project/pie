@@ -274,12 +274,9 @@ pub enum Conv {
         #[output]
         y: ValueId,
     },
-    /// Each token row's cell, `[rows, max(3, axis + 1) + 3]` f32: a row of
-    /// a clip of `tgrid` its patch's `(t, h, w)` in the clip (the TokenGrid
-    /// contract: a clip's rows are its patches in (t, h, w) row-major order
-    /// from its first token row), zeros after, and in the last three
-    /// columns the clip's size `(t, h, w)` in patches; any other row
-    /// `positions[row]` in column `axis`, zeros elsewhere (its size too).
+    /// Each token row's cell, `[rows, max(3, axis + 1) + 3]` f32: a clip
+    /// row's patch `(t, h, w)` then its clip's size in patches; any other
+    /// row `positions[row]` in column `axis`, zeros elsewhere.
     Cells {
         #[input(I32)]
         tgrid: ValueId,

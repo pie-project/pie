@@ -9,10 +9,10 @@
 //! taps. No sampling, no loop: the point is the numbers, row by row.
 
 use inferlet::eta::diffusion::prelude::*;
-
-/// The tokens one block's canvas is.
-const CANVAS: u32 = 256;
 use serde::{Deserialize, Serialize};
+
+/// Tokens per block's canvas.
+const CANVAS: u32 = 256;
 
 #[derive(Deserialize)]
 struct Input {

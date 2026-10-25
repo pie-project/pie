@@ -1260,8 +1260,6 @@ impl Inputs {
         })
     }
 
-    /// Stages each ragged attention's custom mask on `stream`, in one buffer
-    /// grown to hold them.
     pub fn stage_group_masks(
         &mut self,
         stream: *mut core::ffi::c_void,

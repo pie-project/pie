@@ -1,12 +1,9 @@
-//! engine-cuda's `a_conv_decoder_fires_over_a_voxel_port`, on the xla shell:
-//! a conv / group-norm / upsample / conv / pixel-shuffle decoder over two
-//! clips of different boxes answers the host reference, and a causal
-//! convolution carries its front frames across fires in the lane's slot.
+#![cfg(feature = "device")]
 
 use std::path::{Path, PathBuf};
 
-use engine_xla::serve::{Clips, Seated};
-use engine_xla::{Boot, DeviceBoot, Lane, Shell};
+use engine_cuda::serve::{Clips, Seated};
+use engine_cuda::{Boot, Graphs, Knobs, Lane, Recording, Shell};
 use poem::ops::conv::{self, ConvShape};
 use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, seam, trace_hybrid};
 use poem_compiler::{Budget, VoxelLadder};
@@ -355,63 +352,32 @@ fn decode_ref(x: &[f32], b: [usize; 3], p: &Planes) -> (Vec<f32>, [usize; 3]) {
 }
 
 fn scratch() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("pie-xla-d8-decoder-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("pie-d8-decoder-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a scratch directory");
     dir
 }
 
-fn device() -> Option<engine_xla::bench::DeviceLock> {
-    let lock = engine_xla::bench::lock_device();
-    // The last holder lets go of the device lock a moment before libtpu
-    // lets go of the chip: a busy chip is retried for a while.
-    let mut tries = 0;
-    let found = loop {
-        match engine_xla::pjrt::Api::discover(None) {
-            Err(why)
-                if tries < 60
-                    && (why.to_string().contains("in use")
-                        || why.to_string().contains("lockfile")) =>
-            {
-                tries += 1;
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-            other => break other,
-        }
-    };
-    match found {
-        Ok(_) => Some(lock),
-        Err(why) if why.to_string().contains("in use") || why.to_string().contains("lockfile") => {
-            panic!("the device is held outside the device lock: {why}")
-        }
-        Err(why) => {
-            eprintln!("no PJRT plugin, skipping: {why}");
-            None
-        }
-    }
-}
-
 #[test]
-fn a_conv_decoder_fires_over_a_voxel_port_every_case() {
-    // One discovery per process: libtpu stays loaded once the first case
-    // opens it.
-    let Some(_device) = device() else {
-        return;
-    };
+fn a_conv_decoder_fires_over_a_voxel_input_every_case() {
     the_decoder_answers_the_reference_for_two_clips_of_different_boxes();
     a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot();
 }
 
 fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping the conv decoder gate: no CUDA device");
+        return;
+    }
     let dir = scratch();
     let container = dir.join("decoder.zt");
     let planes = write_checkpoint(&container);
 
     let decoder = Decoder::new();
-    let trace = trace_hybrid("d8-decoder", &decoder, Platform::Xla);
+    let trace = trace_hybrid("d8-decoder", &decoder, Platform::Cuda);
     let source = ztensor::Source::open(&container).expect("the container opens");
     let contract = {
-        let mut b = poem::import::Builder::new(&source, 1, Platform::Xla);
+        let mut b = poem::import::Builder::new(&source, 1, Platform::Cuda);
         for w in decoder.weights() {
             b.read_own(w)
                 .unwrap_or_else(|why| panic!("`{}`: {why}", w.name));
@@ -421,23 +387,31 @@ fn the_decoder_answers_the_reference_for_two_clips_of_different_boxes() {
     drop(source);
 
     let max_voxels: u32 = BOXES.iter().map(|b| voxels(*b) as u32).sum::<u32>() + 8;
-    let kv_budget = crate::common::kv_budget(&trace, 64, 4, 16);
-    let mut shell = Shell::load_with(
-        Boot {
-            trace,
-            contract: &contract,
-            checkpoint: &container,
-            budget: Budget::new(4, 16),
-            patches: None,
-            page_size: 16,
-            context: 64,
-            slots: 4,
-            kv_budget,
-            memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
-            device: &DeviceBoot::default(),
+    let mut shell = Shell::load(Boot {
+        trace,
+        contract: &contract,
+        checkpoint: &container,
+        budget: Budget::new(4, 16),
+        patches: None,
+        voxels: Some(VoxelLadder::new(max_voxels, 4)),
+        page_size: 16,
+        context: 64,
+        slots: 4,
+        kv_budget: None,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        ordinal: 0,
+        knobs: Knobs {
+            chip: Some(engine_cuda::chip::pinned(Graphs::Off, Some(Recording::Off))),
+            ..Knobs::default()
         },
-        Some(VoxelLadder::new(max_voxels, 4)),
-    )
+        cache_dir: None,
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_cuda::experts::Plan::default(),
+        deferred_tier: true,
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
     .expect("the decoder loads");
     shell.open(0).expect("slot 0 opens");
     shell.open(1).expect("slot 1 opens");
@@ -645,6 +619,10 @@ fn close(lane: &str, got: &[f32], want: &[f32]) {
 }
 
 fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping the causal conv gate: no CUDA device");
+        return;
+    }
     let dir = scratch();
     let container = dir.join("causal.zt");
     let mut lcg = Lcg(0xca_5a1);
@@ -676,10 +654,10 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
     }
 
     let causal = Causal::new();
-    let trace = trace_hybrid("d8-causal", &causal, Platform::Xla);
+    let trace = trace_hybrid("d8-causal", &causal, Platform::Cuda);
     let source = ztensor::Source::open(&container).expect("opens");
     let contract = {
-        let mut b = poem::import::Builder::new(&source, 1, Platform::Xla);
+        let mut b = poem::import::Builder::new(&source, 1, Platform::Cuda);
         for w in [&causal.conv, &causal.bias] {
             b.read_own(w)
                 .unwrap_or_else(|why| panic!("`{}`: {why}", w.name));
@@ -687,23 +665,31 @@ fn a_causal_conv_carries_its_frames_across_fires_in_the_lanes_slot() {
         b.build()
     };
     drop(source);
-    let kv_budget = crate::common::kv_budget(&trace, 64, 4, 16);
-    let mut shell = Shell::load_with(
-        Boot {
-            trace,
-            contract: &contract,
-            checkpoint: &container,
-            budget: Budget::new(4, 16),
-            patches: None,
-            page_size: 16,
-            context: 64,
-            slots: 4,
-            kv_budget,
-            memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
-            device: &DeviceBoot::default(),
+    let mut shell = Shell::load(Boot {
+        trace,
+        contract: &contract,
+        checkpoint: &container,
+        budget: Budget::new(4, 16),
+        patches: None,
+        voxels: Some(VoxelLadder::new(256, 4)),
+        page_size: 16,
+        context: 64,
+        slots: 4,
+        kv_budget: None,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        ordinal: 0,
+        knobs: Knobs {
+            chip: Some(engine_cuda::chip::pinned(Graphs::Off, Some(Recording::Off))),
+            ..Knobs::default()
         },
-        Some(VoxelLadder::new(256, 4)),
-    )
+        cache_dir: None,
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_cuda::experts::Plan::default(),
+        deferred_tier: true,
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
     .expect("the causal text loads");
     shell.open(0).expect("slot 0 opens");
     shell.open(1).expect("slot 1 opens");

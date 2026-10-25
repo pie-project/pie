@@ -516,8 +516,8 @@ fn prompt_rows(
 
 /// Generate up to `max_tokens` after `prompt`, prefilled in one pass with
 /// its pictures. Every sampled token — the stop token included, if one
-/// comes — goes to `on_token`, which ends generation by returning `Break`. Where `sampling` asks for prompt
-/// logprobs, `on_prompt` has them ([`Generated::prompt_logprobs`]) before
+/// comes — goes to `on_token`, which ends generation by returning `Break`.
+/// Where `sampling` asks for prompt logprobs, `on_prompt` has them ([`Generated::prompt_logprobs`]) before
 /// the first token comes.
 ///
 /// With a `guide`, every fire's logits are masked to what it allows next,

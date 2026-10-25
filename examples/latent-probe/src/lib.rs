@@ -6,8 +6,8 @@
 //! `latents`, with no `embed` and no `state`: a `[rows, width]` f32 latent
 //! channel bound as `input("latents")`, a `[1]` timestep channel bound as
 //! `input("timestep")`, every other input that lane reads bound to a
-//! plausible constant (ones for any lane input, zeros for any other row input), and an epilogue
-//! that does the whole step on the device: fire 0 SEEDS the latent with a
+//! plausible constant (ones on the lane axis, zeros on the row axis), and an
+//! epilogue that does the whole step on the device: fire 0 SEEDS the latent with a
 //! keyed Normal draw (the model's velocity over the zero cell is ignored),
 //! and every fire `k >= 1` integrates step `k - 1` of a flow schedule,
 //! `x <- x + dt · v`, advancing the timestep and step cells for the next
@@ -182,17 +182,17 @@ async fn main(input: Input) -> Result<Output> {
         if decl.name == "latents" || decl.name == "timestep" {
             continue;
         }
-        let ch = match (decl.name.as_str(), decl.axis) {
-            (_, model::InputAxis::Lane) => {
+        let ch = match decl.axis {
+            model::InputAxis::Lane => {
                 Channel::from(vec![1.0f32; decl.width as usize]).named(&decl.name)
             }
-            (_, model::InputAxis::Row) => {
+            model::InputAxis::Row => {
                 Channel::from_shaped([rows, decl.width], vec![0f32; (rows * decl.width) as usize])
                     .named(&decl.name)
             }
             // A voxel input is a VAE tile's box on the third row axis (D8),
             // which is not a float lane this probe can plausibly fill.
-            (_, model::InputAxis::Voxel) => {
+            model::InputAxis::Voxel => {
                 return Err(format!(
                     "reading `{}` reads a voxel input `{}`; the latent probe drives rows, \
                      not a VAE tile",

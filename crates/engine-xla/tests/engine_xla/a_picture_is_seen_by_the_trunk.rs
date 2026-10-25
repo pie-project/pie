@@ -13,10 +13,7 @@
 //! before, the run alone, the text after), every fire rotating at upstream's
 //! `get_rope_index` positions — the text after a span sits `h·w - max(h, w)`
 //! behind its token row, where the runtime's working set places it by
-//! default. A tail rotated at its raw row once turned the served caption of
-//! the red square into "a solid, solid-filled rectangle"; the tower's rows
-//! were never at fault (cosine 0.998 against transformers' f32 rows, as close
-//! as its own bf16).
+//! default.
 //!
 //! `PIE_XLA_VISION_DUMP=<dir>` writes the tower's rows and each first-step
 //! logit row as raw f32 for comparing against a reference offline.

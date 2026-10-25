@@ -9,8 +9,7 @@
 //!    `context_embedder`, `[L, 3072]`. The harness folds the golden's raw
 //!    `[512, 7680]` stack in numpy and compares the `L` unpadded rows.
 //! 2. **one `denoise` step** — the golden's own step-0 inputs (its prompt
-//!    embeds folded, its noise, `σ₀ = 1`, its ids), the velocity on the
-//!    image lane.
+//!    embeds folded, its noise, `σ₀ = 1`), the velocity on the image lane.
 //! 2b. **one independent step per sigma** (`probe_latents_file`) — the
 //!    same one-fire denoise from the reference's OWN latent at every step,
 //!    so each step's velocity is checked under the reference's state
@@ -70,13 +69,8 @@ struct Case {
     channels: u32,
     /// Descending, without the trailing zero.
     sigmas: Vec<f32>,
-    /// `[sigmas.len(), height, width, channels]` f32 LE: the reference's OWN
-    /// input latent at every step. Given, the guest also runs one
-    /// independent one-fire denoise per step off these — the velocity a
-    /// step predicts under the reference's own state, which is the model
-    /// check the four-step trajectory cannot be (a distilled four-step
-    /// schedule amplifies a bf16-floor velocity difference into the final
-    /// latent; see the harness's `NUMERICS` note).
+    /// `[sigmas.len(), height, width, channels]` f32 LE: the reference's own
+    /// input latent at every step, each denoised once independently.
     #[serde(default)]
     probe_latents_file: Option<String>,
     /// Also run the trajectory over pie's own text rows.
@@ -111,10 +105,7 @@ struct Dims {
     velocity_width: u32,
 }
 
-/// The lane `stream` of `reading`, checked to read exactly `binds`: what
-/// this guest binds on that lane, by the model's own input names. Checked
-/// up front so a model whose lane reads anything else fails here in its own
-/// vocabulary instead of at `program`.
+/// The lane `stream` of `reading`, checked to read exactly `binds`.
 fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::LaneDecl> {
     let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
     if lane.state || lane.embeds {
@@ -136,8 +127,7 @@ fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::La
     Ok(lane)
 }
 
-/// Checks both lanes against what this guest binds — no `guidance`:
-/// klein-4B embeds none — and reads the widths off them.
+/// Checks both lanes (klein-4B reads no `guidance`) and reads the velocity width.
 fn dims(reading: &str) -> Result<Dims> {
     let image = lane_reading(reading, "image", &["latents", "timestep"])?;
     lane_reading(reading, "text", &["context", "timestep"])?;
@@ -204,14 +194,8 @@ async fn text_rows(ids: &[u32], width: u32, pipe: &Pipeline) -> Result<Vec<f32>>
     Ok(rows)
 }
 
-/// `sigmas.len()` Euler steps from `noise` (`[h, w, C]`), the velocity at
-/// step 0 and the latent after every step read back to the host (one
-/// readback a fire; the loop-carried latent never crosses).
-///
-/// Both lanes are ONE pass, submitted once a step. The timestep is one
-/// loop-carried cell both lanes read (the epilogue advances it by the step
-/// index). `image_first` puts the image lane at lane 0, ahead of the text
-/// lane.
+/// `sigmas.len()` Euler steps from `noise` (`[h, w, C]`): the step-0
+/// velocity and the latent after every step.
 #[allow(clippy::too_many_arguments)]
 async fn trajectory(
     context: &Channel,
@@ -383,7 +367,7 @@ async fn main(input: Input) -> Result<Output> {
         send_f32(&mut files, &format!("latent{}.f32", i + 1), x);
     }
 
-    // One independent fire per step, from the reference's own state.
+    // One independent pass per step, from the reference's own state.
     if let Some(name) = &case.probe_latents_file {
         let steps = case.sigmas.len();
         let stack = read_f32(name, steps * cells)?;

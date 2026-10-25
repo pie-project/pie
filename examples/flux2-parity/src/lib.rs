@@ -1,9 +1,8 @@
 //! The pie half of the FLUX.2 miniature golden. Hands the `flux2-mini` row
-//! exactly what `scripts/imagegen/flux2_golden.py --mini` handed diffusers'
-//! `Flux2Transformer2DModel` — the target tokens, the two references'
-//! tokens, the raw `[32, 192]` text stack, the timestep, the guidance scale
-//! and the four rotary coordinates of every row — and reads back the
-//! velocity the head predicts on the target rows, as JSON
+//! what `scripts/imagegen/flux2_golden.py --mini` handed diffusers'
+//! `Flux2Transformer2DModel` — the target latent, the references' latents,
+//! the raw `[32, 192]` text stack, the timestep and the guidance scale — and
+//! reads back the velocity the head predicts on the target rows, as JSON
 //! `scripts/imagegen/flux2_parity.py` turns into an `.npz` under the
 //! golden's own key names.
 //!
@@ -95,10 +94,7 @@ struct Dims {
     velocity_width: u32,
 }
 
-/// The lane `stream` of `reading`, checked to read exactly `binds`: what
-/// this guest binds on that lane, by the model's own input names. Checked
-/// up front so a model whose lane reads anything else fails here in its own
-/// vocabulary instead of at `program`.
+/// The lane `stream` of `reading`, checked to read exactly `binds`.
 fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::LaneDecl> {
     let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
     if lane.state || lane.embeds {
@@ -148,8 +144,7 @@ fn dims(reading: &str, references: bool) -> Result<Dims> {
     })
 }
 
-/// The scalars every lane of the reading binds, on lane `lane`: the one
-/// timestep (and guidance) channel of the pass.
+/// Binds the pass's one timestep (and guidance) channel on `lane`.
 fn scalars(pass: &ForwardPass, lane: u32, t: &Channel, g: Option<&Channel>) -> Result<()> {
     pass.input(lane, "timestep", t)?;
     if let Some(g) = g {

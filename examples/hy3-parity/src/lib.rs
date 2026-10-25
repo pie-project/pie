@@ -5,9 +5,8 @@
 //!
 //! # One whole denoise step, in three fires
 //!
-//! A denoise step of this family is THREE fires (`crates/models/src/
-//! hunyuan_image_3/forward.rs` says why the conv image head cannot share
-//! the trunk's plan unit), and this program runs all three end to end —
+//! A denoise step of this family is THREE fires (the conv image head cannot
+//! share the trunk's plan unit; see `models/hunyuan_image_3.poem`), and this program runs all three end to end —
 //! each one fed pie's OWN answer to the one before, so the velocity it
 //! lands is the step:
 //!
@@ -17,8 +16,8 @@
 //!            through `patch_embed`'s 3x3 convs and its adaptive group
 //!            norm                                        -> pixels [h*w, D]
 //! denoise    the canvas: those h*w rows through the `latents` input plus
-//!            ONE <timestep> row the plan lands from the lane's timestep
-//!            vector, bidirectional over [prefix | canvas] against the
+//!            ONE <timestep> row the plan lands from the lane's `timestep`
+//!            input, bidirectional over [prefix | canvas] against the
 //!            prefix `text` wrote and froze                -> hidden
 //! image.out  those rows back on the voxel axis through `final_layer`
 //!                                                        -> pixels [h*w, 32]
@@ -72,8 +71,7 @@
 //! every other row takes its `latents` row.
 //!
 //! The mask is the reference's generalized causal attention, built here as
-//! the dense `[rows, keys]` bool rectangle the engine's `AttnMask` port
-//! takes: an image row sees every key of `[prefix | <timestep> | canvas]`,
+//! the dense `[rows, keys]` bool rectangle `pass.mask` takes: an image row sees every key of `[prefix | <timestep> | canvas]`,
 //! the `<timestep>` row sees the prefix and itself. Nothing past the canvas
 //! is in the KV at all, so the reference's trailing `<eoi>` needs no
 //! masking off.
@@ -136,8 +134,7 @@ struct Case {
     latent_channels: u32,
     /// `timestep_embedding(t, 256)`, one row, replicated over the clip's
     /// voxels by this program: the two adaGN embedders read it there
-    /// because a voxel-axis lane vector has no broadcast (see
-    /// `model::port::TFREQ_VOXELS`).
+    /// because a voxel-axis input has no broadcast.
     tfreq: Vec<f32>,
     hidden: u32,
     /// The scheduler timestep `σ·1000` of step 0, and of the step the two
@@ -182,10 +179,7 @@ fn readout_width(reading: &str) -> Result<u32> {
         .ok_or_else(|| format!("reading `{reading}` reads nothing out"))
 }
 
-/// The lane of `reading`, checked to read exactly `binds`: what this guest
-/// binds on it, by the model's own input names. Checked up front so a model
-/// whose lane reads anything else fails here in its own vocabulary instead
-/// of at `program`.
+/// The lane of `reading`, checked to read exactly `binds`.
 fn lane_reading(reading: &str, binds: &[&str]) -> Result<model::LaneDecl> {
     let lane = model::lane_of(&[("reading", reading)])?;
     let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
@@ -339,8 +333,7 @@ fn denoise_step(
 /// `clip` is `[h*w, channels]` in raster order and the timestep's sinusoid
 /// is appended to EVERY row, because the arm reads one packed rectangle:
 /// the CUDA shell seats one voxel width a fire and refuses a lane that
-/// feeds two. The model text splits the
-/// columns back apart (`super::model::port::LATENT_VOXELS`).
+/// feeds two. The model splits the columns back apart.
 fn voxel_arm(
     case: &Case,
     arm: &str,

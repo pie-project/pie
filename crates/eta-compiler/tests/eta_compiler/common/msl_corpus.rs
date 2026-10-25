@@ -91,7 +91,7 @@ impl Served {
     }
 }
 
-pub fn golden_profile(name: &str) -> Served {
+pub fn golden_served(name: &str) -> Served {
     match name {
         "counter_pingpong"
         | "lora_prologue"
@@ -244,8 +244,8 @@ impl CorpusStage {
 
 pub fn corpus_stages() -> Vec<CorpusStage> {
     let mut stages = Vec::new();
-    let mut push = |name: &str, container: TraceContainer, profile: Served| {
-        let Ok(bound) = profile.bind(container) else {
+    let mut push = |name: &str, container: TraceContainer, served: Served| {
+        let Ok(bound) = served.bind(container) else {
             return;
         };
         for (stage_index, plan) in compile_bound(&bound).into_iter().enumerate() {
@@ -260,10 +260,10 @@ pub fn corpus_stages() -> Vec<CorpusStage> {
         }
     };
     for name in GOLDEN_NAMES {
-        push(name, golden_container(name), golden_profile(name));
+        push(name, golden_container(name), golden_served(name));
     }
-    for (name, container, profile) in synthetic_traces() {
-        push(name, container, profile);
+    for (name, container, served) in synthetic_traces() {
+        push(name, container, served);
     }
     stages
 }
@@ -298,7 +298,7 @@ pub fn region_shape(region: &eta_compiler::plan::Region) -> String {
 
 pub fn corpus_bound() -> eta_ir::validate::BoundTrace {
     let name = GOLDEN_NAMES[0];
-    golden_profile(name)
+    golden_served(name)
         .bind(golden_container(name))
         .expect("first golden binds")
 }
@@ -528,8 +528,8 @@ pub fn extended_traces() -> Vec<(&'static str, TraceContainer, Served)> {
 
 pub fn extended_stages() -> Vec<CorpusStage> {
     let mut stages = Vec::new();
-    for (name, container, profile) in extended_traces() {
-        let bound = profile
+    for (name, container, served) in extended_traces() {
+        let bound = served
             .bind(container)
             .unwrap_or_else(|error| panic!("extended trace `{name}` must bind: {error:?}"));
         for (stage_index, plan) in compile_bound(&bound).into_iter().enumerate() {

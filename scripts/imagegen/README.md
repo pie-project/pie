@@ -382,7 +382,7 @@ the pixels the reference VAE decodes it to
 engine gate `engine-cuda/tests/the_z_image_vae_answers_the_reference` feeds
 that latent from the HOST; this script feeds it the way a guest can, through
 `examples/zimage-vae-parity`: the latent bound as the reading's
-`Voxels` port CHANNEL (whose declared shape is the clip's box), the answer
+voxel input CHANNEL (whose declared shape is the clip's box), the answer
 read off `intrinsics::pixels()`, and the picture out through
 `frames.from-channel` + `session.send-frames`.
 
@@ -439,7 +439,7 @@ Runs 64 target tokens + **2 references of 64 tokens** at RoPE `T = 10` and `T = 
 
 `AutoencoderKLFlux2` in fp32 (`force_upcast`) over the centre **32x32 tokens**
 of `--full`'s `latent.final`.  Both sides cut at the **128-wide /16 grid** the
-transformer itself holds, which is where `models::flux_2::vae` puts its port:
+transformer itself holds, which is where `models::flux_2::vae` puts its input:
 the VAE codes at 32 channels on a /8 grid and the pipeline packs a 2x2 block of
 those into one 128-channel cell (`_patchify_latents`), normalised by the frozen
 `BatchNorm2d(128)` (`(x - running_mean)/sqrt(running_var + eps)`).  There is no
@@ -470,11 +470,12 @@ encode `[1,512,512] -> [1,32,32]` cos 0.999957, mean |err| 0.0069, max 0.115.
 #### The pie side — `flux2_parity.py`
 
 `examples/flux2-parity` is the `flux2-mini` row's guest: one denoise
-step over three lanes of one group — the text lane (`context` port, the raw
-`[32, 192]` stack), the target lane (`latents`, 64 rows) and ONE reference
-lane (`latents` again, both references' 128 rows, at their own `T`
-offsets) — every lane binding `timestep` (`σ·1000`, i.e. 500) and
-`guidance` (4.0, raw), the target lane alone reading out `velocity()`.
+step as one pass over the lanes of one group — the text lane (`context`
+input, the raw `[32, 192]` stack), the target lane (`latents`, the VAE's own
+`[h, w, C]`) and one lane per reference picture (`latents` plus its
+`reference` ordinal; the model computes its `T` offset) — every lane binding
+`timestep` (`σ·1000`, i.e. 500) and `guidance` (4.0, raw), the target lane
+alone reading out `velocity(lane)`.
 `flux2_parity.py` turns `flux2_mini.npz`'s inputs into the case, runs it,
 and diffs pie's `[1, 64, 128]` against `mini.out.0[:, :64]` (the reference
 discards the reference rows' predictions; pie never computes them).
@@ -508,13 +509,9 @@ CUDA_VISIBLE_DEVICES=0 python flux2_klein_parity.py all \
 ```
 
 The config needs `[engine] max_model_len = 32768` (rows × submit depth) and
-`[model] source` at the artifact. It needs nothing said about `[runtime]
-submit_deadline` any more: this parity used to demand `"10s"` because at the
-50 ms default the cohort gate sealed the denoise group's FIRST frame with
-the image lane alone and the velocity came back unconditioned (cos ≈ 0.535
-against the golden, cos 0.9999 against a no-text reference). A stated cohort
-is now fired whole or not at all — the deadline is a density knob again, and
-this harness runs at the default so that a partial group would show up here.
+`[model] source` at the artifact. The step is one pass whose lanes are the
+group, so `[runtime] submit_deadline` cannot split it; this harness runs at
+the default so that a partial group would show up here.
 
 Measured (bf16 pie vs the bf16 golden, `graphs = "on"`):
 
@@ -609,8 +606,8 @@ seed 0, 3×16×16×48; needs only the snapshot's `vae/*`) into
 `golden/wan22/wan22_vae_ref/`. `examples/wan2-vae-parity` decodes it through
 the runtime the way `text-to-video` does — one `vae.decode` fire per latent
 frame, one working set whose recurrent state is the conv caches (frame =
-token, wiki `input-switch/latent-path.md` §7c), one pipeline; the model runs
-its head form where the state is empty — and the script scores each chunk at
+token), one pipeline; the derived `fresh` switch picks the head branch where
+the state is empty — and the script scores each chunk at
 `cos ≥ 0.9999`. The last chunk is decoded on a fork of the working set too,
 and must equal the parent's.
 
@@ -628,9 +625,6 @@ Measured 2026-10-25 (bf16 device vs fp32 reference; cos / mean |err| on
 | 1 | 1–4 | 0.999986 | 0.00149 |
 | 2 | 5–8 | 0.999986 | 0.00143 |
 | 2 on a fork | 5–8 | max \|diff\| from the parent's: 0.0 | |
-
-Before frame = token every fire started from zeroed caches: chunks 1 and 2
-read cos 0.51 / 0.47.
 
 ### `ltx2_golden.py` → `/root/.cache/pie-imagegen/golden/ltx25/ltx2_vae/`
 
