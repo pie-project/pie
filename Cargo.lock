@@ -3150,6 +3150,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kernels-ir"
+version = "0.5.4"
+dependencies = [
+ "pie-dtype",
+]
+
+[[package]]
 name = "kernels-metal"
 version = "0.5.4"
 dependencies = [
