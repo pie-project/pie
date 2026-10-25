@@ -16,6 +16,7 @@ scripts/imagegen/
   zimage_vae_parity.py M1 drives pie's `vae.decode` reading FROM A GUEST
   flux2_golden.py     M2  FLUX.2-klein-4B golden + miniature forward
   wan22_golden.py     M3  Wan 2.2 TI2V-5B golden + miniature forwards
+  wan22_vae_parity.py M3  drives Wan's causal `vae.decode` frame by frame FROM A GUEST
   ltx2_golden.py      M4  the REAL LTX-2.5 video VAE decoder over a fixed latent
   hy3_golden.py       M6  HunyuanImage 3 miniature: one prefill + one denoise step
   hy3_parity.py       M6  drives pie's `hunyuanimage3-mini` row against it
@@ -600,6 +601,35 @@ CUDA_VISIBLE_DEVICES=3 python wan22_golden.py --vae     # needs `--full` to have
 |---|---|---:|---:|---|
 | decode | 5×30×52 → 17×480×832 | 0.999986 | 0.00244 | `the_wan_2_vae_answers_the_reference` |
 | encode | 17×480×832 → 5×30×52 | 0.999988 | 0.00492 | `the_wan_2_vae_encodes_the_reference` |
+
+#### The pie side, from a guest — `wan22_vae_parity.py`
+
+**KNOWN FAILURE until frame = token C1–C3 land (wiki `input-switch/latent-path.md`
+§7c). Do not loosen the bar or "fix" the test: the failure is the bug.**
+
+`wan22_golden.py --vae-ref` decodes a seeded DiT-space latent (`torch.randn`,
+seed 0, 3×16×16×48; needs only the snapshot's `vae/*`) into
+`golden/wan22/wan22_vae_ref/`. `examples/wan2-vae-parity` decodes it through
+the runtime the way `text-to-video` does — one fire per latent frame, the
+`.head` arm first, one pipeline — and the script scores each chunk at
+`cos ≥ 0.9999`. Float lanes are kv_less, so today every fire starts from
+zeroed conv caches: chunk 0 (the head) passes and chunks 1, 2 decode cold.
+
+```bash
+python wan22_golden.py --vae-ref --repo <snapshot dir>
+python wan22_vae_parity.py all --out /tmp/wan22-vae --config <config with Wan 2.2 as [model] source>
+```
+
+Measured 2026-10-25 (bf16 device vs fp32 reference):
+
+| chunk | frames | today (cold) | caches kept (scratch hack, not committed) |
+|---|---|---:|---:|
+| 0 (head) | 0 | 0.999984 / 0.00200 | 0.999984 / 0.00200 |
+| 1 | 1–4 | 0.513772 / 0.32973 | 0.999986 / 0.00149 |
+| 2 | 5–8 | 0.471227 / 0.33794 | 0.999986 / 0.00143 |
+
+(cos / mean |err| on `[−1, 1]`.) A random latent's frames are uncorrelated,
+so cold caches cost far more here than on a real clip (§7c's ~0.98).
 
 ### `ltx2_golden.py` → `/root/.cache/pie-imagegen/golden/ltx25/ltx2_vae/`
 
