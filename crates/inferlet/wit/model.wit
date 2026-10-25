@@ -51,11 +51,6 @@ interface model {
     // path (every text model). Static.
     switches: func() -> list<switch-decl>;
 
-    // ── Generative facts ────────────────────────────────────────────────
-    // What a guest sizes an image/video job from, so it never parses
-    // `architecture()`: its latent space and the schedule it was trained
-    // under. A text model answers `none` to each.
-
     // Which export seam a lane's epilogue reads: `logits()` for a text
     // head, `velocity()` for a denoiser, `hidden()` for an encoder,
     // `pixels` for a VAE on the voxel axis (one row per output voxel of
@@ -113,6 +108,11 @@ interface model {
     // The lane a pass of these switches is. Switches are `(name, value)`
     // pairs of `switches()`; one left unset takes its default.
     lane: func(switches: list<tuple<string, string>>) -> result<lane-decl, error>;
+
+    // ── Generative facts ────────────────────────────────────────────────
+    // What a guest sizes an image/video job from, so it never parses
+    // `architecture()`: its latent space and the schedule it was trained
+    // under. A text model answers `none` to each.
 
     // The latent space a denoiser works in, the VAE's own: a `[t, h, w,
     // channels]` volume, one cell `spatial-compression²` pixels by

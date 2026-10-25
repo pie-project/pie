@@ -245,6 +245,10 @@ export interface LaneDecl {
   readout?: Readout,
 }
 /**
+ * ── Generative facts ────────────────────────────────────────────────
+ * What a guest sizes an image/video job from, so it never parses
+ * `architecture()`: its latent space and the schedule it was trained
+ * under. A text model answers `none` to each.
  * The latent space a denoiser works in, the VAE's own: a `[t, h, w,
  * channels]` volume, one cell `spatial-compression²` pixels by
  * `temporal-compression` frames. How the denoiser patches it is the

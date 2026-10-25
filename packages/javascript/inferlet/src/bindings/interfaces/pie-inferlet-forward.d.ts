@@ -108,23 +108,14 @@ export interface StateGeometry {
   fold?: Channel,
 }
 
-/**
- * A forward-pass builder. Construction is empty; descriptor resources are
- * attached explicitly, then `program` supplies the traced container.
- * 
- * A pass holds every lane of one computation: a CFG denoising step's
- * image and text lanes of both branches, a beam's rows, an LM CFG's two
- * streams. A verb taking `lane` binds that lane; the pass has as many
- * lanes as the highest index set plus one, or as `state` binds working
- * sets. Row data the program computes (`embed`, `state-geometry`,
- * `readout`, `mask`) is the pass's, lane after lane.
- */
 export class ForwardPass {
   constructor()
   /**
   * One working set per lane, in lane order; lanes sharing one state
   * their slots. Required on a lane that reads kv (`model.lane`'s
-  * `reads-kv`), refused on one that does not.
+  * `reads-kv`) or a recurrent state (a causal VAE's conv caches:
+  * each fire then folds one slot, and states no geometry), refused
+  * on one that reads neither.
   */
   state(lanes: Array<WorkingSet>, geom: StateGeometry): void;
   /**
