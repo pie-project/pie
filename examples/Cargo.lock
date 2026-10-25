@@ -618,6 +618,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "qwen3-tts"
+version = "0.1.0"
+dependencies = [
+ "inferlet",
+ "serde",
+]
+
+[[package]]
 name = "repetition-penalty"
 version = "0.1.0"
 dependencies = [

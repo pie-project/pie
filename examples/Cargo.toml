@@ -39,6 +39,7 @@ members = [
     "flux2-parity",
     "hy3-parity",
     "qwen3-asr",
+    "qwen3-tts",
     "text-to-image",
     "text-to-video",
     "zimage-parity",
