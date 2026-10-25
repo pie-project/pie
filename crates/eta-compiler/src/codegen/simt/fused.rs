@@ -541,6 +541,10 @@ pub fn emit_fused_region(
 ",
         );
         source.push_str(
+            "  const M1ValueDesc* const ptir_wholedesc = descriptors;
+",
+        );
+        source.push_str(
             "  descriptors = ptir_rowdesc;
 ",
         );
@@ -579,9 +583,21 @@ pub fn emit_fused_region(
                 let value = aliases.resolve(value);
                 format!("scratch + offsets[{value}] + ptir_rowshift[{value}]")
             };
-            if let Some(covered) =
-                super::stream::emit_stream(&mut source, streams, at - 1, &mut pointer, TAIL)
-            {
+            let mut whole = |value: u32| {
+                let value = aliases.resolve(value);
+                (
+                    format!("scratch + offsets[{value}]"),
+                    format!("ptir_wholedesc[{value}u]"),
+                )
+            };
+            if let Some(covered) = super::stream::emit_stream(
+                &mut source,
+                streams,
+                at - 1,
+                &mut pointer,
+                &mut whole,
+                TAIL,
+            ) {
                 at += covered - 1;
                 continue;
             }
@@ -603,11 +619,24 @@ pub fn emit_fused_region(
                 format!("scratch + offsets[{value}]")
             }
         };
+        // A keyed draw's state is one value `[key, counter]`, read whole —
+        // as the planner reads it — whatever rows its shape resembles.
+        let whole = |value: u32| {
+            let value = aliases.resolve(value);
+            let table = if row_parallel {
+                "ptir_wholedesc"
+            } else {
+                "descriptors"
+            };
+            (
+                format!("scratch + offsets[{value}]"),
+                format!("{table}[{value}u]"),
+            )
+        };
         let mut slots = Slots::of(op, base, resolve);
         let gumbel = direct.gumbel[node].map(|chain| GumbelSlots {
             intrinsic: chain.intrinsic,
-            state: resolve(chain.state),
-            state_desc: aliases.resolve(chain.state),
+            state: whole(chain.state),
             divisor: chain.divisor.map(resolve),
             divisor_desc: chain.divisor.map(|d| aliases.resolve(d)),
             noise_desc: aliases.resolve(chain.noise),
@@ -649,16 +678,25 @@ pub fn emit_fused_region(
                 "reinterpret_cast<const m1_u8*>(intrinsic_bases[intrinsic_index])".to_string();
         }
 
-        emit_body(
-            &mut source,
-            stage,
-            op,
-            node,
-            &direct.intrinsic,
-            &slots,
-            gumbel.as_ref(),
-            dialect.cut_mark,
-        );
+        if op.tag == tags::RNG_KEYED {
+            let (state, state_desc) = whole(op.args[0]);
+            let o0 = &slots.o0;
+            let _ = writeln!(
+                source,
+                "    ptir_parallel_rng_keyed({state}, {state_desc}, {o0}, descriptors[p.o0], p);"
+            );
+        } else {
+            emit_body(
+                &mut source,
+                stage,
+                op,
+                node,
+                &direct.intrinsic,
+                &slots,
+                gumbel.as_ref(),
+                dialect.cut_mark,
+            );
+        }
 
         source.push_str(TAIL);
         if op.tag == tags::CHAN_PUT {
@@ -716,8 +754,8 @@ fn emit_table_staging(source: &mut String, ops: usize, values: usize) {
 
 struct GumbelSlots {
     intrinsic: u16,
-    state: String,
-    state_desc: u32,
+    /// The state's whole storage and descriptor.
+    state: (String, String),
     divisor: Option<String>,
     divisor_desc: Option<u32>,
     noise_desc: u32,
@@ -835,8 +873,8 @@ fn emit_body(
                 "        intrinsic_offsets[gumbel_intrinsic_index] + lane_row,
 ",
             );
-            let _ = writeln!(source, "        {},", chain.state);
-            let _ = writeln!(source, "        descriptors[{}u],", chain.state_desc);
+            let _ = writeln!(source, "        {},", chain.state.0);
+            let _ = writeln!(source, "        {},", chain.state.1);
             match (&chain.divisor, chain.divisor_desc) {
                 (Some(divisor), Some(desc)) => {
                     let _ = writeln!(source, "        {divisor},");
