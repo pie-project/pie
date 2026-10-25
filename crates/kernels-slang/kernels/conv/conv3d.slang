@@ -43,6 +43,11 @@ struct Params {
     int rows_out;
     uint has_bias;
     uint row_span;
+    // The rows `grid` and `o_grid` address `x`'s and `o`'s row 0 at: a
+    // window of a segmented fire starts its tensors at its own rows while
+    // the fire's grids hold fire-wide ones.
+    int x_base;
+    int o_base;
 };
 PIE_PARAMS(6, Params, params);
 
@@ -86,11 +91,13 @@ void main(uint3 group : SV_GroupID, uint3 local : SV_GroupThreadID) {
     bool live = n < params.c_out;
 
     Clip og;
-    int l = clip_of(o_grid, params.clips, row, og);
+    int fire_row = row + params.o_base;
+    int l = clip_of(o_grid, params.clips, fire_row, og);
     float acc = 0.0;
     if (l >= 0 && live) {
         Clip in_ = clip_at(grid, l);
-        Voxel v = unravel(og, row - og.off);
+        in_.off -= params.x_base;
+        Voxel v = unravel(og, fire_row - og.off);
         int taps = params.kt * params.kh * params.kw;
         uint wrow = uint(n) * uint(taps) * uint(params.c_in);
         int plane = params.kh * params.kw;

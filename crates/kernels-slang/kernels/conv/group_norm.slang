@@ -59,6 +59,9 @@ struct Params {
     uint channels;
     uint groups;
     uint splits;
+    // The row `grid` addresses `x`'s row 0 at: a window of a segmented fire
+    // starts `x` at its own rows while the fire's grid holds fire-wide ones.
+    uint base;
 };
 PIE_PARAMS(3, Params, params);
 
@@ -81,7 +84,7 @@ void main(uint3 tgid : SV_GroupID, uint3 local : SV_GroupThreadID) {
     float mean = 0.0;
     float m2 = 0.0;
     for (uint v = begin; v < end; ++v) {
-        uint row = (uint(g.off) + v) * params.channels + c0;
+        uint row = (uint(g.off) - params.base + v) * params.channels + c0;
         for (uint c = lid; c < cg; c += uint(THREADS)) {
             float value = bf16_at(x, row + c);
             cnt += 1.0;
@@ -155,6 +158,8 @@ struct Params {
     uint silu;
     uint rows;
     uint row_span;
+    // The row `grid` addresses `x`'s and `y`'s row 0 at.
+    uint base;
 };
 PIE_PARAMS(6, Params, params);
 
@@ -177,7 +182,7 @@ void main(uint3 gid : SV_DispatchThreadID, uint3 group : SV_GroupID) {
         return;
     }
     Clip box;
-    int l = clip_of(grid, int(params.clips), int(row), box);
+    int l = clip_of(grid, int(params.clips), int(row + params.base), box);
     float2 v = float2(0.0);
     if (l >= 0) {
         v = float2(normed(uint(l), row, col), normed(uint(l), row, col + 1u));

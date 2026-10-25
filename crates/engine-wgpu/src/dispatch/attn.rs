@@ -473,6 +473,7 @@ impl Run<'_> {
                 },
                 *sm_scale,
                 self.tensor(*o),
+                self.grid_base(*grid, *q),
             ),
             Attn::Prefill {
                 causal: false,
