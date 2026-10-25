@@ -40,7 +40,7 @@ const fn merge_smem_bytes(head_dim: u32) -> Option<u32> {
     Some(NUM_SMEM_STAGES * bdy * head_dim * 2 + NUM_THREADS * 4)
 }
 
-fn merge_varlen_inst(head_dim: u32) -> Option<String> {
+pub(crate) fn merge_varlen_inst(head_dim: u32) -> Option<String> {
     let (vec_size, bdx, bdy) = merge_geometry(head_dim)?;
     Some(format!(
         "::pie::attn::fa2::PersistentVariableLengthMergeStatesKernel<\

@@ -159,8 +159,10 @@ static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
         .add::<PrefillLatticeFrom>()
         .add::<PrefillLatticeSteps>();
     poem_compiler::fuse::flags::register(&mut r, &crate::FUSIONS);
+    // The residual norms run as generated row kernels (`FUSIONS` holds no
+    // rule for them).
     #[cfg(not(feature = "rocm"))]
-    poem_compiler::costs::register(&mut r, 2);
+    poem_compiler::costs::register_regions(&mut r, 2);
     // HIP graphs have no conditional node: one is priced past any launch it
     // could skip, so the compiler lowers every region to `AlwaysLaunch`.
     #[cfg(feature = "rocm")]
@@ -519,6 +521,7 @@ mod tests {
                 assert_eq!(tuning.decode_gqa, b200, "{gpu}");
                 assert_eq!(tuning.pool_mma, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(tuning.index_radix, major == 10 && minor == 0, "{gpu}");
+                assert_eq!(tuning.index_fp4_tc5, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(tuning.mla_sparse, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(
                     tuning.compressed_prefill_from,
@@ -570,19 +573,26 @@ mod tests {
                 assert_eq!(tuning.decode_gqa_cluster, if b200 { 8 } else { 0 }, "{gpu}");
                 assert_eq!(tuning.decode_gqa_deep_64, b200, "{gpu}");
                 // B200 alone runs Gemma 4's q norm a warp a head and its
-                // norm-and-fold 128 threads a row, skipping unread rows.
+                // norm-and-fold 128 threads a row.
                 assert_eq!(tuning.q_norm_rope_warp, b200, "{gpu}");
-                assert_eq!(tuning.skip_unread, b200, "{gpu}");
                 assert_eq!(tuning.norm_fold_block, if b200 { 128 } else { 0 }, "{gpu}");
+                // B200 alone lands a hyper-connection seam in one launch,
+                // from 43 to 1120 rows.
+                assert_eq!(tuning.hc_mega_from, if b200 { 43 } else { 0 }, "{gpu}");
+                assert_eq!(tuning.hc_mega_until, if b200 { 1120 } else { 0 }, "{gpu}");
                 assert_eq!(
                     kernels_cuda::tuning::Tuning {
                         gemv_narrow: false,
                         mla_naive: false,
                         moe_tc5: defaults.moe_tc5,
+                        moe_mega_until: defaults.moe_mega_until,
+                        moe_mega_bf16_from: defaults.moe_mega_bf16_from,
                         ssm_gdn_fused_scan: false,
                         ssm_gdn_tc5: false,
                         rows_vec: false,
                         hc_tile: false,
+                        hc_mega_from: 0,
+                        hc_mega_until: 0,
                         ssm_conv_vec4: false,
                         ssm_gdn_out_bf16: false,
                         qg_prologue_until: 0,
@@ -613,6 +623,7 @@ mod tests {
                         gemm_tc5_split_tickets: 0,
                         nvfp4_mma_from: defaults.nvfp4_mma_from,
                         nvfp4_mma_until: defaults.nvfp4_mma_until,
+                        gate_tc5_until: 0,
                         decode_grouped_prefill_lse: false,
                         decode_gqa: false,
                         decode_gqa_from_64: 0,
@@ -636,10 +647,10 @@ mod tests {
                         mxfp4_cvt_ksplit_until: 0,
                         hc_mma: false,
                         index_tc5: false,
+                        index_fp4_tc5: false,
                         norm_emit: false,
                         qkv_rows_from: defaults.qkv_rows_from,
                         q_norm_rope_warp: false,
-                        skip_unread: false,
                         norm_fold_block: 0,
                         ..tuning
                     },
@@ -752,9 +763,14 @@ mod tests {
                 prefill_lattice_steps: 4,
             }
         );
+        // The compiler's prices as before, but that CUDA folds each chain
+        // into a generated row kernel: its rules hold no residual norm.
         assert_eq!(
             poem_compiler::DeviceProfile::of(&registry().defaults(), 132, &[], &[]),
-            poem_compiler::DeviceProfile::default()
+            poem_compiler::DeviceProfile {
+                synth_regions: cfg!(not(feature = "rocm")),
+                ..poem_compiler::DeviceProfile::default()
+            }
         );
         let on = poem_compiler::fuse::flags::on(&registry().defaults(), &crate::FUSIONS);
         assert_eq!(
@@ -877,10 +893,12 @@ mod tests {
             (28, 1024, true)
         );
         assert_eq!((b200.nvfp4_mma_from, b200.nvfp4_mma_until), (32, 8192));
+        assert_eq!(b200.gate_tc5_until, 256);
         assert_eq!(b200.moe_w4a4_fused_from, 1);
         assert_eq!((b200.moe_even_waves_from, b200.moe_routes_sized), (3, true));
         assert_eq!(b200.moe_gather_ahead_until, 128);
         assert_eq!(b200.moe_w4a8_fused_from, 512);
+        assert_eq!((b200.moe_mega_until, b200.moe_mega_bf16_from), (4608, 64));
         assert_eq!(b200.mla_expanded_from, 256);
         assert_eq!(b200.gemm_fp8_gemv_until, 4);
         assert_eq!((b200.mxfp4_a8_from, b200.mxfp4_a8_until), (1, 48));

@@ -1,3 +1,4 @@
+pub mod frame;
 pub mod gate;
 pub mod hc;
 pub mod hc_project;

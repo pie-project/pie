@@ -800,7 +800,10 @@ impl Weights {
         let mut store = Buffer::zeroed(usize::try_from(total).unwrap_or(usize::MAX))?;
         let serving = crate::checkpoint_serving::Serving::open(path, trace);
         let deferred = defer_tiers(serving.as_ref(), &plan, deferred_tier);
+        // A serving artifact lays out every expert: a rank holding some
+        // of a bank's slots reads its own from the checkpoint.
         let restorable = target.tp_size == 1
+            && trace.params.iter().all(|param| param.experts.is_none())
             && serving
                 .as_ref()
                 .is_some_and(|serving| serving.covers(&plan.host_layout()).is_ok());
@@ -1332,7 +1335,15 @@ impl Weights {
         Ok(hash)
     }
 
-    pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
+    /// Writes adapter `id`'s planes into its slots, once `stream` (the
+    /// stream the shell fires on) has drained: no fire airborne still reads
+    /// a slot this rewrites.
+    pub fn register_adapter(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        id: u32,
+        planes: &[AdapterPlane<'_>],
+    ) -> Result<()> {
         for plane in planes {
             let bank = self.banks.get(plane.bank).ok_or_else(|| Fault::Adapter {
                 bank: plane.bank.to_string(),
@@ -1363,6 +1374,7 @@ impl Weights {
                 });
             }
         }
+        crate::device::ctx::sync(stream)?;
         for plane in planes {
             let bank = self.banks[plane.bank];
             let at = bank.offset + u64::from(id) * bank.slot;
@@ -1599,9 +1611,9 @@ fn act_quant_banks(trace: &Trace) -> BTreeMap<usize, u32> {
         // A fused routed MLP's selects read their banks as they would apart.
         let ws: Vec<_> = match &node.op {
             Operation::Linear(op) => lowp(op).into_iter().collect(),
-            Operation::Fused(Fused::MoeExperts { select, down, .. }) => {
-                [lowp(select), lowp(down)].into_iter().flatten().collect()
-            }
+            Operation::Fused(
+                Fused::MoeExperts { select, down, .. } | Fused::MoeMega { select, down, .. },
+            ) => [lowp(select), lowp(down)].into_iter().flatten().collect(),
             Operation::Fused(Fused::MoeSelectGlu { select, .. }) => {
                 lowp(select).into_iter().collect()
             }
@@ -1664,12 +1676,12 @@ fn share_input_scales(
     for node in &trace.nodes {
         let ss: Vec<_> = match &node.op {
             Operation::Linear(op) => scales_of(op).into_iter().collect(),
-            Operation::Fused(Fused::MoeExperts { select, down, .. }) => {
-                [scales_of(select), scales_of(down)]
-                    .into_iter()
-                    .flatten()
-                    .collect()
-            }
+            Operation::Fused(
+                Fused::MoeExperts { select, down, .. } | Fused::MoeMega { select, down, .. },
+            ) => [scales_of(select), scales_of(down)]
+                .into_iter()
+                .flatten()
+                .collect(),
             Operation::Fused(Fused::MoeSelectGlu { select, .. }) => {
                 scales_of(select).into_iter().collect()
             }

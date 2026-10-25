@@ -400,7 +400,7 @@ pub(crate) async fn ensure_execution_admitted(ctx: &mut ProcessCtx) {
         None => false,
     };
     ctx.admit_execution(seated, duration_us(started.elapsed()));
-    if let Some(planner) = crate::planner::planner() {
+    if let Some(planner) = crate::planner::planner_of(ctx.id()) {
         planner.note_admitted(ctx.id());
     }
     crate::policy::report(crate::policy::Event::Started(ctx.id()));
@@ -455,7 +455,8 @@ fn spawn_inner(
     // offload's alone, before the process can run one.
     crate::offload::executors::set(id, executors.clone());
     crate::policy::schedule::alias(id, inherit_client_pid.unwrap_or(id));
-    if let Some(planner) = crate::planner::planner() {
+    crate::planner::assign(id, inherit_client_pid);
+    if let Some(planner) = crate::planner::planner_of(id) {
         match inherit_seq {
             Some(seq) => planner.register_with_seq(id, seq),
             None => planner.register(id),
@@ -474,9 +475,10 @@ fn spawn_inner(
         executors,
     );
     if let Err(error) = SERVICES.spawn(id, || process) {
-        if let Some(planner) = crate::planner::planner() {
+        if let Some(planner) = crate::planner::planner_of(id) {
             planner.unregister(id);
         }
+        crate::planner::release(id);
         crate::offload::executors::forget(id);
         return Err(error);
     }
@@ -719,7 +721,7 @@ impl Process {
         crate::policy::report(crate::policy::Event::Arrived(process_id, arrival));
         // Held ahead of every admission permit: a preempted process coming
         // back must not queue behind permits the held-back processes own.
-        if let Some(planner) = crate::planner::planner() {
+        if let Some(planner) = crate::planner::planner_of(process_id) {
             planner.admit(process_id).await;
         }
         let prewarm_permit = match PREWARM_ADMISSION.get().and_then(|s| s.as_ref()) {
@@ -819,7 +821,8 @@ impl Process {
     }
 
     fn restart(&mut self) -> bool {
-        let seq = crate::planner::planner().and_then(|planner| planner.spawn_seq(self.process_id));
+        let seq = crate::planner::planner_of(self.process_id)
+            .and_then(|planner| planner.spawn_seq(self.process_id));
         let spawned = spawn_inner(
             self.username.clone(),
             self.program.clone(),
@@ -901,9 +904,10 @@ impl Process {
         if !restarted {
             RESTART_ALIAS.write().unwrap().remove(&self.client_pid);
         }
-        if let Some(planner) = crate::planner::planner() {
+        if let Some(planner) = crate::planner::planner_of(self.process_id) {
             planner.unregister(self.process_id);
         }
+        crate::planner::release(self.process_id);
         residency::unregister_residency(self.process_id);
         crate::offload::executors::forget(self.process_id);
     }

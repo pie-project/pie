@@ -1139,6 +1139,12 @@ impl Pools {
         }
     }
 
+    /// Backs a prefix of `bytes` of an arena beside the pool's budget
+    /// (`elastic::commit_beside`).
+    pub(crate) fn commit_beside(&self, arena: &mut Arena, bytes: u64) -> Result<()> {
+        elastic::commit_beside(&self.pool, arena, &elastic::Want::Prefix(bytes))
+    }
+
     #[must_use]
     pub fn committed_bytes(&self) -> u64 {
         self.arenas().map(elastic::Arena::committed_bytes).sum()
@@ -2268,7 +2274,9 @@ impl Pools {
         Ok(())
     }
 
-    pub fn state_bytes(&mut self, slot: u32) -> Result<Vec<u8>> {
+    /// `slot`'s recurrent state, read on `stream` behind the fires that
+    /// wrote it.
+    pub fn state_bytes(&mut self, stream: *mut core::ffi::c_void, slot: u32) -> Result<Vec<u8>> {
         if !slab_row(self.has_state(), self.paging.slots, slot)? {
             return Ok(Vec::new());
         }
@@ -2284,7 +2292,11 @@ impl Pools {
             let bytes = stride * u64::from(elem_size(dtype));
             let at = out.len();
             out.resize(at + usize::try_from(bytes).unwrap_or(0), 0);
-            crate::device::copy_d2h(arena.span(u64::from(slot) * bytes, bytes)?, &mut out[at..])?;
+            crate::device::copy_d2h_on(
+                stream,
+                arena.span(u64::from(slot) * bytes, bytes)?,
+                &mut out[at..],
+            )?;
         }
         Ok(out)
     }

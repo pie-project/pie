@@ -1,6 +1,6 @@
 use engine::fire::{Boundary, FoldLen, Masking, RsReset, RsVerb};
 use engine::frame::{Demand, Shell as FrameShell};
-use poem_exec::fire::{FireDescriptor, Lane as FireLane, compose_axes};
+use poem_exec::fire::{FireDescriptor, Lane as FireLane, compose_axes_at};
 
 use crate::error::{Fault, Result};
 use crate::record;
@@ -408,7 +408,8 @@ impl FrameShell for Shell {
                 ),
             })
             .collect();
-        let composition = compose_axes(&self.compiled, &self.budgets, &submitted)?;
+        let at = self.forced_bucket.take();
+        let composition = compose_axes_at(&self.compiled, &self.budgets, &submitted, at)?;
         let mut readout_rows: Vec<i32> = Vec::with_capacity(lanes.len());
         let mut readout_first = vec![0u32; lanes.len()];
         let mut readout_count = vec![0u32; lanes.len()];
@@ -1491,7 +1492,7 @@ impl FrameShell for Shell {
             self.armed_body = bodied.then(|| key.clone());
         }
 
-        let carve_rows = if bodied {
+        let carve_rows = if bodied || !self.compiled.expert.is_empty() {
             composition.bucket().max(composition.rows())
         } else {
             composition.rows()
@@ -1772,7 +1773,12 @@ fn narrow(n: u64) -> i32 {
 /// The rows a fire's kernels write through its readout plane: a readout as
 /// tall as the fire is launched at the fire's bucket, so the plane must
 /// hold the bucket, not only the rows read out.
+/// A fire that reads nothing out (an idle expert-parallel rank's) writes
+/// nothing through it.
 fn readout_extent(rows: u32, bucket: u32, readouts: usize) -> u64 {
+    if readouts == 0 {
+        return 0;
+    }
     let pad = kernels_cuda::Pad { rows, bucket };
     u64::from(pad.extent(u32::try_from(readouts).unwrap_or(u32::MAX)))
 }
@@ -1869,5 +1875,6 @@ mod tests {
         assert_eq!(readout_extent(133, 256, 133), 256);
         assert_eq!(readout_extent(133, 256, 5), 5);
         assert_eq!(readout_extent(133, 133, 133), 133);
+        assert_eq!(readout_extent(0, 64, 0), 0);
     }
 }

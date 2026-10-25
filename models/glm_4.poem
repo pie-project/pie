@@ -14,6 +14,12 @@ load("//lib/adapters.poem", "banks")
 
 GLM45 = template("glm45")
 GLM47 = template("glm47")
+
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: q, k, v and their biases by their heads, the gate and the up, the
+# shared expert's and each routed expert's gate and up by their channels, the
+# output and down projections by their rows, the head by its vocabulary.
+CUTS = "inferred"
 TOKENIZER = tokenizer(markers = [["<|user|>", "<|observation|>", "<|endoftext|>"], ["[gMASK]", "<sop>", "<|system|>", "<|assistant|>", "<think>", "</think>"]])
 
 def glm(id, layers, spoken, mini = False):
@@ -130,7 +136,6 @@ def layout(id, deploy):
     d = DIMS[id]
     hidden, hd = d.hidden, d.head_dim
     q_width, kv_width = d.q_heads * hd, d.kv_heads * hd
-    heads = [d.q_heads, d.kv_heads, d.kv_heads]
 
     def mlp(l):
         if l < d.dense_layers:
@@ -140,8 +145,9 @@ def layout(id, deploy):
             down_w = dtype.bf16 if mlp_w == dtype.e4m3g128a8 and iw % 128 != 0 else mlp_w
             return struct(
                 routed = False,
-                gate_up = weight([2 * iw, hidden], mlp_w).packed([iw, iw]),
-                down = weight([hidden, iw], down_w).rows(),
+                gate = weight([iw, hidden], mlp_w),
+                up = weight([iw, hidden], mlp_w),
+                down = weight([hidden, iw], down_w),
                 inter = iw,
             )
         iw, sw = d.inter, d.shared_inter
@@ -149,11 +155,12 @@ def layout(id, deploy):
             routed = True,
             router = weight([d.experts, hidden]),
             bias = weight([d.experts], dtype.f32),
-            gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
-            down = weight([d.experts, hidden, iw], experts).rows(),
+            gate_up = weight([d.experts, 2 * iw, hidden], experts),
+            down = weight([d.experts, hidden, iw], experts),
             shared = struct(
-                gate_up = weight([2 * sw, hidden], mlp_w).packed([sw, sw]),
-                down = weight([hidden, sw], mlp_w).rows(),
+                gate = weight([sw, hidden], mlp_w),
+                up = weight([sw, hidden], mlp_w),
+                down = weight([hidden, sw], mlp_w),
                 inter = sw,
             ),
             experts = d.experts,
@@ -166,9 +173,13 @@ def layout(id, deploy):
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
             attn_norm = weight([hidden]),
-            qkv = weight([q_width + 2 * kv_width, hidden], proj).packed([q_width, kv_width, kv_width], heads = heads),
-            qkv_bias = weight([q_width + 2 * kv_width]).packed([q_width, kv_width, kv_width], heads = heads),
-            o = weight([hidden, q_width], proj).rows(),
+            q = weight([q_width, hidden], proj),
+            k = weight([kv_width, hidden], proj),
+            v = weight([kv_width, hidden], proj),
+            q_bias = weight([q_width]),
+            k_bias = weight([kv_width]),
+            v_bias = weight([kv_width]),
+            o = weight([hidden, q_width], proj),
             q_norm = weight([hd]) if d.qk_norm else None,
             k_norm = weight([hd]) if d.qk_norm else None,
             mlp_norm = weight([hidden]),
@@ -194,7 +205,7 @@ def layout(id, deploy):
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         kv = deploy.kv,
         embed = weight([d.vocab, hidden], table),
-        head = weight([d.vocab, hidden], table).columns(),
+        head = weight([d.vocab, hidden], table),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
     )
@@ -236,29 +247,24 @@ TRANSFORMERS = [
     ("model.norm.weight", "final_norm"),
     ("lm_head.weight", "head"),
     ("model.layers.{l}.input_layernorm.weight", "layers.{l}.attn_norm"),
-    ([
-        "model.layers.{l}.self_attn.q_proj.weight",
-        "model.layers.{l}.self_attn.k_proj.weight",
-        "model.layers.{l}.self_attn.v_proj.weight",
-    ], "layers.{l}.qkv"),
-    ([
-        "model.layers.{l}.self_attn.q_proj.bias",
-        "model.layers.{l}.self_attn.k_proj.bias",
-        "model.layers.{l}.self_attn.v_proj.bias",
-    ], "layers.{l}.qkv_bias"),
+    ("model.layers.{l}.self_attn.q_proj.weight", "layers.{l}.q"),
+    ("model.layers.{l}.self_attn.k_proj.weight", "layers.{l}.k"),
+    ("model.layers.{l}.self_attn.v_proj.weight", "layers.{l}.v"),
+    ("model.layers.{l}.self_attn.q_proj.bias", "layers.{l}.q_bias"),
+    ("model.layers.{l}.self_attn.k_proj.bias", "layers.{l}.k_bias"),
+    ("model.layers.{l}.self_attn.v_proj.bias", "layers.{l}.v_bias"),
     ("model.layers.{l}.self_attn.o_proj.weight", "layers.{l}.o"),
     ("model.layers.{l}.self_attn.q_norm.weight", "layers.{l}.q_norm"),
     ("model.layers.{l}.self_attn.k_norm.weight", "layers.{l}.k_norm"),
     ("model.layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
     # A dense layer's MLP; a routed one's router, shared expert and banks.
-    (["model.layers.{l}.mlp.gate_proj.weight", "model.layers.{l}.mlp.up_proj.weight"], "layers.{l}.mlp.gate_up"),
+    ("model.layers.{l}.mlp.gate_proj.weight", "layers.{l}.mlp.gate"),
+    ("model.layers.{l}.mlp.up_proj.weight", "layers.{l}.mlp.up"),
     ("model.layers.{l}.mlp.down_proj.weight", "layers.{l}.mlp.down"),
     ("model.layers.{l}.mlp.gate.weight", "layers.{l}.mlp.router"),
     ("model.layers.{l}.mlp.gate.e_score_correction_bias", "layers.{l}.mlp.bias"),
-    ([
-        "model.layers.{l}.mlp.shared_experts.gate_proj.weight",
-        "model.layers.{l}.mlp.shared_experts.up_proj.weight",
-    ], "layers.{l}.mlp.shared.gate_up"),
+    ("model.layers.{l}.mlp.shared_experts.gate_proj.weight", "layers.{l}.mlp.shared.gate"),
+    ("model.layers.{l}.mlp.shared_experts.up_proj.weight", "layers.{l}.mlp.shared.up"),
     ("model.layers.{l}.mlp.shared_experts.down_proj.weight", "layers.{l}.mlp.shared.down"),
     ([
         "model.layers.{l}.mlp.experts.{e}.gate_proj.weight",
@@ -301,10 +307,8 @@ def forward(m, inputs):
 
 def mlp(x, f):
     if not f.routed:
-        return ops.linear.matmul(
-            ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter),
-            f.down,
-        )
+        gate, up = ops.linear.matmul(x, f.gate), ops.linear.matmul(x, f.up)
+        return ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), f.down)
     routes, weights = ops.linear.moe_route(
         ops.linear.matmul(x, f.router),
         f.experts,
@@ -313,7 +317,8 @@ def mlp(x, f):
         bias = f.bias,
     )
 
-    act = ops.linear.glu(ops.linear.matmul(x, f.shared.gate_up), gating.swiglu(), f.shared.inter)
+    gate, up = ops.linear.matmul(x, f.shared.gate), ops.linear.matmul(x, f.shared.up)
+    act = ops.linear.glu(gate, gating.swiglu(), up = up)
     shared = ops.linear.matmul(act, f.shared.down)
     act = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k), gating.swiglu(), f.inter)
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
@@ -322,11 +327,9 @@ def mlp(x, f):
 def attention(x, inputs, m, positions, w):
     pages = inputs.kv(w.kv)
     d = m.head_dim
-    q, k, v = ops.gather.split_qkv(
-        ops.elemwise.add_bias(w.qkv_bias, ops.linear.matmul(x, w.qkv)),
-        m.q_width,
-        m.kv_width,
-    )
+    q = ops.elemwise.add_bias(w.q_bias, ops.linear.matmul(x, w.q))
+    k = ops.elemwise.add_bias(w.k_bias, ops.linear.matmul(x, w.k))
+    v = ops.elemwise.add_bias(w.v_bias, ops.linear.matmul(x, w.v))
     seam.at(seam.ATTN_QV, [q, v])
     if w.q_norm != None:
         q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, d, m.eps)

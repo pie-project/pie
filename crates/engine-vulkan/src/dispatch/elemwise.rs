@@ -68,6 +68,10 @@ impl Run<'_> {
                 *eps,
                 self.tensor(*y),
             ),
+            // A row norm the tensor-parallel ranks split is served on CUDA.
+            Elemwise::SumSquares { .. } | Elemwise::RmsnormBy { .. } => {
+                Err(kernels_slang::Error::Unsupported { op: op.name() })
+            }
             // Muse Spark's post-norm gate is served on CUDA.
             Elemwise::NormGate { .. } => Err(kernels_slang::Error::Unsupported {
                 op: "elemwise.norm_gate",

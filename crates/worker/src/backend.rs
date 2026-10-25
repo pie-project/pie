@@ -229,6 +229,15 @@ fn device_boot(
             .parse::<Diagnostics>()
             .map_err(|error| anyhow!("[engine] diagnostics: {error}"))?;
     }
+    knobs.expert_rebalance_steps = opts.expert_rebalance_steps;
+    knobs.expert_load_window = opts.expert_load_window;
+    knobs.expert_rebalance_moves = opts.expert_rebalance_moves;
+    knobs.expert_rebalance_gain = opts.expert_rebalance_gain;
+    // The count CUDA read once, at its first call, from the environment the
+    // binary started it with: the shell reads no environment of its own.
+    knobs.work_queues = std::env::var("CUDA_DEVICE_MAX_CONNECTIONS")
+        .ok()
+        .and_then(|word| word.trim().parse::<u32>().ok());
     if let Some(word) = opts.nccl_transport.as_deref() {
         knobs.nccl_transport = word
             .parse::<Transport>()
@@ -280,7 +289,13 @@ fn land(
     )?;
     if request.residency.disk_kv_budget != Some(0) && request.residency.disk_kv_dir.is_none() {
         match crate::disk::kv_dir(cache_dir, snapshot_dir) {
-            Ok(dir) => request.residency.disk_kv_dir = Some(dir),
+            // Each rank of an expert-parallel group keeps its own requests' kv.
+            Ok(dir) => {
+                request.residency.disk_kv_dir = Some(match overrides.ep {
+                    Some(_) => dir.join(format!("rank{}", overrides.rank.unwrap_or(0))),
+                    None => dir,
+                });
+            }
             Err(error) if request.residency.disk_kv_budget.is_none() => {
                 tracing::warn!(%error, "no directory for the default disk kv tier; serving without it");
                 request.residency.disk_kv_budget = Some(0);
@@ -435,6 +450,105 @@ pub(crate) fn create_engine_backend_group(
         disk_kv_dir,
         backend,
     })
+}
+
+/// The ranks of an expert-parallel group, one device each, loaded at once:
+/// each rank's load meets the others' before it arms, so each runs on a
+/// thread of its own.
+#[cfg(feature = "engine-cuda")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn create_engine_lockstep(
+    rank_options: &[EngineOptions],
+    snapshot_dir: &Path,
+    home: &Path,
+    adapter_dir: Option<&Path>,
+    frames_in_flight: u8,
+    adapters: &crate::config::AdapterConfig,
+    residency: engine::Residency,
+    patch_ceilings: (Option<u32>, Option<u32>),
+    voxel_ceilings: (Option<u32>, Option<u32>),
+    overrides: &runtime::engine::load::Overrides,
+) -> Result<Vec<GroupEngine>> {
+    let cache_dir = &crate::disk::engine_cache_dir(home);
+    validate_snapshot_dir(snapshot_dir)?;
+    let mut boots = Vec::with_capacity(rank_options.len());
+    for (rank, options) in rank_options.iter().enumerate() {
+        #[allow(
+            irrefutable_let_patterns,
+            reason = "`EngineOptions` has one variant in a CUDA-only build"
+        )]
+        let EngineOptions::Cuda(opts) = options else {
+            return Err(anyhow!(
+                "an expert-parallel group requires cuda rank options"
+            ));
+        };
+        let boot = device_boot(opts, home, cache_dir, adapter_dir)?;
+        if opts.verbose {
+            dump_device_boot(home, &boot, rank, Some(rank));
+        }
+        boots.push(boot);
+    }
+    let ep = u32::try_from(boots.len()).context("a rank count fits u32")?;
+    let backends = runtime::engine::backend::open::cuda_lockstep(boots)?;
+    #[allow(
+        irrefutable_let_patterns,
+        reason = "`EngineOptions` has one variant in a CUDA-only build"
+    )]
+    let EngineOptions::Cuda(opts) = &rank_options[0] else {
+        unreachable!("validated cuda options above");
+    };
+    let budgets = cuda_budgets(
+        opts,
+        adapters.seats(),
+        patch_ceilings,
+        voxel_ceilings,
+        declared_context(snapshot_dir, overrides),
+    );
+    let landed: Vec<Result<GroupEngine>> = std::thread::scope(|scope| {
+        let loads: Vec<_> = backends
+            .into_iter()
+            .enumerate()
+            .map(|(rank, mut backend)| {
+                let residency = residency.clone();
+                let budgets = budgets.clone();
+                let overrides = runtime::engine::load::Overrides {
+                    ep: Some(ep),
+                    rank: Some(rank as u32),
+                    ..overrides.clone()
+                };
+                scope.spawn(move || -> Result<GroupEngine> {
+                    let (loaded, deployment, disk_kv_dir) = land(
+                        &mut backend,
+                        snapshot_dir,
+                        cache_dir,
+                        budgets,
+                        residency,
+                        poem_ir::Platform::Cuda,
+                        frames_in_flight,
+                        &overrides,
+                    )
+                    .with_context(|| format!("loading expert-parallel rank {rank}"))?;
+                    register_operator_adapters(&mut backend, adapters)?;
+                    Ok(GroupEngine {
+                        deployment,
+                        caps: loaded.caps,
+                        facts: loaded.facts,
+                        snapshot_dir: snapshot_dir.to_path_buf(),
+                        disk_kv_dir,
+                        backend,
+                    })
+                })
+            })
+            .collect();
+        loads
+            .into_iter()
+            .map(|load| {
+                load.join()
+                    .unwrap_or_else(|_| Err(anyhow!("an expert-parallel rank's load panicked")))
+            })
+            .collect()
+    });
+    landed.into_iter().collect()
 }
 
 #[cfg_attr(
@@ -845,9 +959,34 @@ pub struct ModelEngines {
     pub groups: Vec<GroupEngine>,
 }
 
-pub fn calculate_topology(world_size: usize, tp_degree: usize) -> Result<Vec<Vec<usize>>> {
+/// The devices each engine of the worker runs on: one tensor-parallel group,
+/// or under expert parallelism one device for each of `ep_degree` ranks.
+pub fn calculate_topology(
+    world_size: usize,
+    tp_degree: usize,
+    ep_degree: usize,
+) -> Result<Vec<Vec<usize>>> {
     if tp_degree == 0 {
         anyhow::bail!("tensor_parallel_size must be > 0");
+    }
+    if ep_degree == 0 {
+        anyhow::bail!("expert_parallel_size must be > 0");
+    }
+    if ep_degree > 1 {
+        if tp_degree > 1 {
+            anyhow::bail!(
+                "expert_parallel_size = {ep_degree} beside tensor_parallel_size = \
+                 {tp_degree}: a worker splits its devices by expert or by tensor, \
+                 not both yet"
+            );
+        }
+        if world_size != ep_degree {
+            anyhow::bail!(
+                "[engine] device lists {world_size} devices and expert_parallel_size \
+                 = {ep_degree}: an expert-parallel worker runs one rank on each device"
+            );
+        }
+        return Ok((0..ep_degree).map(|rank| vec![rank]).collect());
     }
     if !world_size.is_multiple_of(tp_degree) {
         anyhow::bail!(
@@ -956,20 +1095,38 @@ mod topology_tests {
         topology_rejects_dp_two();
         topology_rejects_indivisible();
         topology_rejects_zero_tp();
+        topology_spreads_expert_ranks();
+        topology_rejects_expert_and_tensor_ranks();
+    }
+
+    fn topology_spreads_expert_ranks() {
+        assert_eq!(
+            calculate_topology(4, 1, 4).unwrap(),
+            [vec![0], vec![1], vec![2], vec![3]]
+        );
+        let err = calculate_topology(8, 1, 4).unwrap_err().to_string();
+        assert!(err.contains("one rank on each device"), "got: {err}");
+        let err = calculate_topology(4, 1, 0).unwrap_err().to_string();
+        assert!(err.contains("must be > 0"), "got: {err}");
+    }
+
+    fn topology_rejects_expert_and_tensor_ranks() {
+        let err = calculate_topology(4, 2, 2).unwrap_err().to_string();
+        assert!(err.contains("not both yet"), "got: {err}");
     }
 
     fn topology_rejects_dp_two() {
-        let err = calculate_topology(2, 1).unwrap_err().to_string();
+        let err = calculate_topology(2, 1, 1).unwrap_err().to_string();
         assert!(err.contains("run 2 workers"), "got: {err}");
     }
 
     fn topology_rejects_indivisible() {
-        let err = calculate_topology(3, 2).unwrap_err().to_string();
+        let err = calculate_topology(3, 2, 1).unwrap_err().to_string();
         assert!(err.contains("must be divisible"), "got: {err}");
     }
 
     fn topology_rejects_zero_tp() {
-        let err = calculate_topology(4, 0).unwrap_err().to_string();
+        let err = calculate_topology(4, 0, 1).unwrap_err().to_string();
         assert!(err.contains("must be > 0"), "got: {err}");
     }
 }

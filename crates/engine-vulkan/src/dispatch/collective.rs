@@ -17,6 +17,10 @@ impl Run<'_> {
             Collective::AllReduce { buf, buf_out: _ } => band::all_reduce(self.ctx, t(*buf)),
             Collective::AllGather { x, y } => band::all_gather(self.ctx, t(*x), t(*y)),
             Collective::ReduceScatter { x, y } => band::reduce_scatter(self.ctx, t(*x), t(*y)),
+            Collective::Dispatch { .. } => {
+                Err(kernels_slang::Error::Unsupported { op: "dispatch" })
+            }
+            Collective::Combine { .. } => Err(kernels_slang::Error::Unsupported { op: "combine" }),
         }
     }
 }

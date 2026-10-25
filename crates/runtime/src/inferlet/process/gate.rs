@@ -6,10 +6,10 @@ pub(crate) async fn residency_gate(ctx: &mut ProcessCtx) -> Result<()> {
     if ctx.is_resident_fast() {
         return Ok(());
     }
-    let Some(planner) = crate::planner::planner() else {
+    let pid = ctx.id();
+    let Some(planner) = crate::planner::planner_of(pid) else {
         return Ok(());
     };
-    let pid = ctx.id();
     if planner.is_resident(pid) {
         return Ok(());
     }

@@ -69,6 +69,7 @@ fn params() -> Vec<Param> {
         source: ParamSource::Checkpoint,
         layout: Default::default(),
         placement: Default::default(),
+        experts: None,
     };
     // A codes plane is traced in blocks of sixteen bytes.
     let share = HELD as u64 / u64::from(RANKS);

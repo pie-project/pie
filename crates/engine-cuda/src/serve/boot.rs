@@ -69,6 +69,21 @@ pub struct Knobs {
     pub profiles: Option<std::path::PathBuf>,
     /// A profile used as is instead of resolving one (`chip::pinned`).
     pub chip: Option<profile::Profile>,
+    /// An expert-parallel group's rebalance: every this many steps (none,
+    /// the engine's default, which is never; 0, never), over the loads of
+    /// the last `expert_load_window` steps (none: as many as it waits),
+    /// each rewriting at most `expert_rebalance_moves` slots a layer and
+    /// only for a peak lowered by `expert_rebalance_gain` of the mean (none:
+    /// [`engine::placement::Limits::DEFAULT`]'s).
+    pub expert_rebalance_steps: Option<u32>,
+    pub expert_load_window: Option<u32>,
+    pub expert_rebalance_moves: Option<u32>,
+    pub expert_rebalance_gain: Option<f64>,
+    /// The work queues a device's context feeds its streams through, as
+    /// the process started CUDA with them (`CUDA_DEVICE_MAX_CONNECTIONS`;
+    /// none, CUDA's default): an expert-parallel group whose ranks share a
+    /// device wires only when its ranks' streams fit them.
+    pub work_queues: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -104,5 +119,8 @@ pub struct Boot<'a> {
     pub residency: crate::experts::Plan,
     pub deferred_tier: bool,
     pub world: crate::api::World,
+    /// The rank's place in its expert-parallel group: which slots of each
+    /// routed bank its checkpoint read keeps.
+    pub expert: crate::api::World,
     pub comm: *const crate::comm::Comm,
 }

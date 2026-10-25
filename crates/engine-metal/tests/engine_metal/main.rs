@@ -7,6 +7,7 @@ mod a_copied_window_is_one_encode_over_the_same_rows;
 mod a_drafting_neighbour_leaves_a_plain_lane_alone;
 mod a_family_is_read_against_its_reference;
 mod a_fenced_frame_lands_both_sides;
+mod a_gate_and_an_up_apart_land_what_they_land_packed;
 mod a_prompt_scan_lands_its_snapshots;
 mod a_ternary_decode_in_dot_answers_the_host_decoder;
 mod a_tower_region_reads_the_patch_window;

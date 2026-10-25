@@ -50,6 +50,27 @@ __device__ __forceinline__ float block_reduce_sum_fast(float local, float* buf)
     return buf[kWarps];
 }
 
+template <int BLOCK>
+__device__ __forceinline__ float block_reduce_max_fast(float local, float* buf)
+{
+    static_assert(BLOCK >= 32 && BLOCK <= 1024 && (BLOCK & (BLOCK - 1)) == 0,
+                  "block_reduce_max_fast needs a power-of-two BLOCK in [32, 1024]");
+    constexpr int kWarps = BLOCK / 32;
+    const int tid = threadIdx.x;
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    local = ::pie::warp_max(local);
+    if (lane == 0) buf[warp] = local;
+    __syncthreads();
+    if (warp == 0) {
+        float v = tid < kWarps ? buf[tid] : -::pie::pos_inf();
+        v = ::pie::warp_max(v);
+        if (lane == 0) buf[kWarps] = v;
+    }
+    __syncthreads();
+    return buf[kWarps];
+}
+
 template <class T, int BLOCK, bool WEIGHT_PLUS_ONE>
 __device__ __forceinline__ void rmsnorm_row(
     const T* __restrict__ x,

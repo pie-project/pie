@@ -218,6 +218,7 @@ impl Shell {
 
     pub fn read_out_rows(&mut self, settled: &mut Settled, want: &[Readout]) -> Result<()> {
         self.device.synchronize()?;
+        let stream = self.device.stream();
         let Some(readback) = settled.readback.as_ref() else {
             return Ok(());
         };
@@ -262,6 +263,7 @@ impl Shell {
             let mut values = Vec::with_capacity(chosen.len() * width);
             for row in &chosen {
                 self.arena.read(
+                    stream,
                     logits.ptr + u64::from(*row) * width as u64 * element as u64,
                     &mut raw,
                 )?;
@@ -301,6 +303,7 @@ impl Shell {
                     mass.clear();
                     mass.resize(bytes, 0);
                     self.arena.read(
+                        stream,
                         column.ptr + u64::from(first) * u64::from(heads) * 4,
                         &mut mass,
                     )?;
@@ -324,7 +327,7 @@ impl Shell {
         if let Some(seat) = readback.pixels.as_ref() {
             let clips = seat.grid.rows as usize;
             let mut grid = vec![0u8; clips * 16];
-            self.arena.read(seat.grid.ptr, &mut grid)?;
+            self.arena.read(stream, seat.grid.ptr, &mut grid)?;
             let grid: Vec<i32> = grid
                 .as_chunks::<4>()
                 .0
@@ -346,6 +349,7 @@ impl Shell {
                     raw.clear();
                     raw.resize(bytes, 0);
                     self.arena.read(
+                        stream,
                         seat.plane.ptr + off as u64 * channels as u64 * element as u64,
                         &mut raw,
                     )?;

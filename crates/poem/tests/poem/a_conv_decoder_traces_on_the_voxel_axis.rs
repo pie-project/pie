@@ -205,8 +205,21 @@ impl ForwardHybrid for NaturalWeight {
     }
 }
 
+/// A convolution lays the weight it reads taps major itself: a package
+/// declares it as it is, and the trace's param says the order.
 #[test]
-#[should_panic(expected = "conv_taps_major")]
-fn a_conv_weight_declared_natural_is_refused_at_trace_time() {
-    let _ = trace_hybrid("natural", &NaturalWeight, Platform::Cuda);
+fn a_conv_weight_declared_natural_is_laid_taps_major() {
+    let trace = trace_hybrid("natural", &NaturalWeight, Platform::Cuda);
+    let conv = trace
+        .params
+        .iter()
+        .find(|p| p.name == "conv")
+        .expect("the trace interns the conv weight");
+    assert_eq!(
+        conv.layout,
+        poem_ir::ParamLayout::ConvTapsMajor {
+            c_in: C_IN,
+            taps: 27
+        }
+    );
 }

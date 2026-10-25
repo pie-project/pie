@@ -573,7 +573,15 @@ impl Ctx {
             };
             eprintln!("fire: {gap} {op} {}", fire.kernel.name);
         }
-        self.issue(op, fire.kernel, fire.launch, args)
+        self.issue(op, fire.kernel, fire.launch, args)?;
+        if COUNTING.load(std::sync::atomic::Ordering::Relaxed) {
+            *FIRES
+                .lock()
+                .expect("fire count lock poisoned")
+                .entry(op)
+                .or_insert(0) += 1;
+        }
+        Ok(())
     }
 
     #[cfg(feature = "cuda")]
@@ -664,6 +672,35 @@ pub fn strict_kernels() {
 }
 
 static STRICT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turns on, for this process, the count [`fires`] reads: each fire an op
+/// issues (eagerly or into a capture), so a test can tell a fused kernel
+/// that took its fire from one that declined to its primitives.
+pub fn count_fires() {
+    COUNTING.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The fires `op` has issued since [`count_fires`]; 0 before it.
+#[must_use]
+pub fn fires(op: &str) -> u64 {
+    FIRES
+        .lock()
+        .expect("fire count lock poisoned")
+        .get(op)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Every op's fires since [`count_fires`], by op: what a test compares
+/// across two loads that should fire alike.
+#[must_use]
+pub fn fire_counts() -> std::collections::BTreeMap<&'static str, u64> {
+    FIRES.lock().expect("fire count lock poisoned").clone()
+}
+
+static COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FIRES: std::sync::Mutex<std::collections::BTreeMap<&'static str, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 #[cfg(feature = "cuda")]
 fn said(kernel: &Kernel, why: crate::jit::Fault) -> crate::jit::Fault {

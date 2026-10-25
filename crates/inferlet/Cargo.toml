@@ -19,5 +19,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 eta-dsl = { package = "pie-eta-dsl", version = "0.5.4", path = "../eta-dsl" }
 
+[dev-dependencies]
+eta-compiler = { path = "../eta-compiler" }
+
 [lints]
 workspace = true

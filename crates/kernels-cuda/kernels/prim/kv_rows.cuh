@@ -209,6 +209,28 @@ __device__ __forceinline__ unsigned e2m1_code(float v) {
     return signbit(v) ? (m | 8u) : m;
 }
 
+// The e2m1 codes of v[0..8), saturated to ±6, packed as `e2m1_code` packs
+// them (the lower index in the low nibble): the hardware's `cvt.rn` four
+// pairs at a time where it has one (sm_100 up), else code by code.
+__device__ __forceinline__ std::uint32_t e2m1x8(const float (&v)[8]) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    std::uint32_t out;
+    asm("{\n\t.reg .b8 b0, b1, b2, b3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b0, %2, %1;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b1, %4, %3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b2, %6, %5;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b3, %8, %7;\n\t"
+        "mov.b32 %0, {b0, b1, b2, b3};\n\t}"
+        : "=r"(out)
+        : "f"(v[0]), "f"(v[1]), "f"(v[2]), "f"(v[3]), "f"(v[4]), "f"(v[5]), "f"(v[6]), "f"(v[7]));
+    return out;
+#else
+    std::uint32_t out = 0;
+    for (int i = 0; i < 8; ++i) out |= e2m1_code(fminf(fmaxf(v[i], -6.f), 6.f)) << (4 * i);
+    return out;
+#endif
+}
+
 // An e2m1 code's bf16 bits: 0.5 at magnitude 1, 2^(e - 1) (1 + m / 2) from
 // 2 on, built from the code's bits with no conversion.
 __device__ __forceinline__ unsigned e2m1_bf16(unsigned c) {

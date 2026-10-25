@@ -8,6 +8,7 @@
 //! compiler runs those rules alone, in the order [`rules::all`] gives, and
 //! every match is replaced.
 
+pub mod chain;
 pub mod flags;
 pub mod rules;
 mod search;

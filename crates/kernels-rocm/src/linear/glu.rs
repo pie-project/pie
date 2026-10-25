@@ -274,6 +274,89 @@ pub fn swiglu_clamp_routed(
     swiglu_clamp_lanes(ctx, OP, packed, None, Some(weights), fan, limit, y)
 }
 
+/// The lanes of a flat launch over the activation's elements, a lane each.
+fn flat_lanes(op: &'static str, y: &Tensor) -> Result<u32, Error> {
+    let n = y.elements();
+    let lanes = u32::try_from(n).map_err(|_| {
+        refuse(
+            op,
+            format!("{n} elements do not fit a 32-bit launch extent"),
+        )
+    })?;
+    nonzero(op, "the activation's element count", lanes)?;
+    Ok(lanes)
+}
+
+/// [`swiglu_clamp_alpha`] over a gate and an up plane held apart.
+#[allow(clippy::too_many_arguments)]
+pub fn swiglu_clamp_alpha_split(
+    ctx: &Ctx,
+    gate: Tensor,
+    up: Tensor,
+    fan: u32,
+    limit: f32,
+    alpha: f32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.glu";
+    let t = dtype_dispatch!(OP, gate.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let lanes = flat_lanes(OP, y)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            FILE,
+            &format!("::pie::linear::mlp_swiglu_clamp_alpha_split<{t}>"),
+        ))
+        .apply(Launch::flat(lanes, BLOCK)),
+        &[
+            gate.arg(),
+            up.arg(),
+            y.arg(),
+            stated(OP, lanes)?.arg(),
+            stated(OP, y.width)?.arg(),
+            limit.arg(),
+            alpha.arg(),
+            stated(OP, fan)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
+/// [`situ`] over a gate and an up plane held apart.
+#[allow(clippy::too_many_arguments)]
+pub fn situ_split(
+    ctx: &Ctx,
+    gate: Tensor,
+    up: Tensor,
+    fan: u32,
+    beta: f32,
+    up_cap: Option<f32>,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "linear.glu";
+    if beta == 0.0 {
+        return Err(refuse(OP, "beta is zero, and the gate divides by it"));
+    }
+    let t = dtype_dispatch!(OP, gate.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    let lanes = flat_lanes(OP, y)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, &format!("::pie::linear::mlp_situ_split<{t}>")))
+            .apply(Launch::flat(lanes, BLOCK)),
+        &[
+            gate.arg(),
+            up.arg(),
+            y.arg(),
+            stated(OP, lanes)?.arg(),
+            stated(OP, y.width)?.arg(),
+            beta.arg(),
+            up_cap.unwrap_or(0.0).arg(),
+            stated(OP, fan)?.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 pub fn geglu_tanh(
     ctx: &Ctx,
     gate: Tensor,
@@ -283,14 +366,7 @@ pub fn geglu_tanh(
 ) -> Result<(), Error> {
     const OP: &str = "linear.glu";
     let t = dtype_dispatch!(OP, gate.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
-    let n = y.elements();
-    let lanes = u32::try_from(n).map_err(|_| {
-        refuse(
-            OP,
-            format!("{n} elements do not fit a 32-bit launch extent"),
-        )
-    })?;
-    nonzero(OP, "the activation's element count", lanes)?;
+    let lanes = flat_lanes(OP, y)?;
     ctx.fire(
         OP,
         Fire::at(kernel(FILE, &format!("::pie::linear::mlp_geglu_tanh<{t}>")))

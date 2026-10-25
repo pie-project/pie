@@ -91,7 +91,13 @@ PIE_PARAMS(2, Params, params);
 [[vk::binding(2)]] RWStructuredBuffer<uint> y;
 
 struct Params {
-#if defined(PIE_CLAMP)
+#if defined(PIE_SITU)
+    float beta;
+    float up_cap;
+#elif defined(PIE_GPTOSS)
+    float limit;
+    float alpha;
+#elif defined(PIE_CLAMP)
     float limit;
 #endif
     uint n;
@@ -102,6 +108,17 @@ PIE_PARAMS(3, Params, params);
 float2 unit(float2 g, float2 u) {
 #if defined(PIE_GELU)
     return float2(gelu_tanh(g.x), gelu_tanh(g.y));
+#elif defined(PIE_SITU)
+    float2 sg = params.beta * float2(tanh_(g.x / params.beta), tanh_(g.y / params.beta))
+        / (1.0 + exp(-g));
+    if (params.up_cap > 0.0) {
+        u = params.up_cap * float2(tanh_(u.x / params.up_cap), tanh_(u.y / params.up_cap));
+    }
+    return sg * u;
+#elif defined(PIE_GPTOSS)
+    g = min(g, params.limit);
+    u = clamp(u, -params.limit, params.limit);
+    return (g / (1.0 + exp(-params.alpha * g))) * (u + 1.0);
 #elif defined(PIE_CLAMP)
     g = min(g, params.limit);
     u = clamp(u, -params.limit, params.limit);
@@ -138,4 +155,6 @@ void main(uint3 gid : SV_DispatchThreadID) {
 // pie:instantiate linear_glu_situ_bf16 PIE_PACKED=1 PIE_SITU=1 PIE_GROUP_X=256
 // pie:instantiate linear_glu_geglu_tanh_bf16 PIE_GROUP_X=256
 // pie:instantiate linear_glu_swiglu_clamp_split_bf16 PIE_CLAMP=1 PIE_GROUP_X=256
+// pie:instantiate linear_glu_swiglu_clamp_alpha_split_bf16 PIE_GPTOSS=1 PIE_GROUP_X=256
+// pie:instantiate linear_glu_situ_split_bf16 PIE_SITU=1 PIE_GROUP_X=256
 // pie:instantiate linear_glu_gelu_tanh_bf16 PIE_GELU=1 PIE_GROUP_X=256

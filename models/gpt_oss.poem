@@ -7,6 +7,12 @@ load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap
 HARMONY = template("harmony")
 TOKENIZER = tokenizer(markers = [["<|endoftext|>", "<|return|>", "<|call|>"]])
 
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: q, k, v, their biases and the sinks by their heads, each expert's
+# gate and up and their biases by its channels, the output and down
+# projections by their rows, the head by its vocabulary.
+CUTS = "inferred"
+
 MODELS = [
     model("gptoss-20b", template = HARMONY, tokenizer = TOKENIZER, drafters = ["dflash"], arch = "gptoss", layers = 24, vocab = 201088),
     model("gptoss-20b-mini", mini = True, template = HARMONY, tokenizer = TOKENIZER, arch = "gptoss", layers = 5, vocab = 201088),
@@ -113,14 +119,15 @@ def layout(id, deploy):
         return struct(
             attn = struct(
                 reading = WINDOWED if l % 2 == 0 else FULL,
-                # q, k and v as one product, split after its bias.
-                qkv = weight([q_w + 2 * kv_w, hidden], weights).packed(
-                    [q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
-                qkv_bias = weight([q_w + 2 * kv_w]).packed(
-                    [q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
-                o_proj = weight([hidden, q_w], weights).rows(),
+                q = weight([q_w, hidden], weights),
+                k = weight([kv_w, hidden], weights),
+                v = weight([kv_w, hidden], weights),
+                q_bias = weight([q_w]),
+                k_bias = weight([kv_w]),
+                v_bias = weight([kv_w]),
+                o_proj = weight([hidden, q_w], weights),
                 o_bias = weight([hidden]),
-                sinks = weight([d.q_heads]).columns(),
+                sinks = weight([d.q_heads]),
                 kv = "kv.{}".format(l),
             ),
             attn_norm = norm("attn_norm", hidden),
@@ -135,16 +142,16 @@ def layout(id, deploy):
                 swiglu_alpha = d.swiglu_alpha,
                 router = weight([d.experts, hidden], router),
                 router_bias = weight([d.experts]),
-                gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
-                gate_up_bias = weight([d.experts, 2 * iw]).bank([iw, iw]),
-                down = weight([d.experts, hidden, iw], experts).rows(),
+                gate_up = weight([d.experts, 2 * iw, hidden], experts),
+                gate_up_bias = weight([d.experts, 2 * iw]),
+                down = weight([d.experts, hidden, iw], experts),
                 down_bias = weight([d.experts, hidden]),
             ),
             lora_a = lora_a,
             lora_b = lora_b,
         )
 
-    head = weight([d.vocab, hidden], weights).packed([d.vocab])
+    head = weight([d.vocab, hidden], weights)
     return struct(
         hidden = hidden,
         vocab = d.vocab,
@@ -221,9 +228,9 @@ def read(m, reads, codes):
         mlp = layer.mlp
         reads.read(layer.attn_norm, ck("input_layernorm.weight"))
         reads.read(layer.mlp_norm, ck("post_attention_layernorm.weight"))
-        proj = lambda part: [ck("self_attn.{}_proj.{}".format(x, part)) for x in ["q", "k", "v"]]
-        reads.read_concat(attn.qkv, proj("weight"))
-        reads.read_concat(attn.qkv_bias, proj("bias"))
+        for x in ["q", "k", "v"]:
+            reads.read(getattr(attn, x), ck("self_attn.{}_proj.weight".format(x)))
+            reads.read(getattr(attn, x + "_bias"), ck("self_attn.{}_proj.bias".format(x)))
         reads.read(attn.o_proj, ck("self_attn.o_proj.weight"))
         reads.read(attn.o_bias, ck("self_attn.o_proj.bias"))
         reads.read(attn.sinks, ck("self_attn.sinks"))
@@ -334,11 +341,9 @@ def forward(m, inputs):
         write_offset = inputs.write_offset(at.kv)
 
         x = ops.elemwise.rmsnorm(y, w.attn_norm, w.attn_norm_eps)
-        q, k, v = ops.gather.split_qkv(
-            ops.elemwise.add_bias(at.qkv_bias, ops.linear.matmul(x, at.qkv)),
-            m.q_heads * d,
-            m.kv_heads * d,
-        )
+        q = ops.elemwise.add_bias(at.q_bias, ops.linear.matmul(x, at.q))
+        k = ops.elemwise.add_bias(at.k_bias, ops.linear.matmul(x, at.k))
+        v = ops.elemwise.add_bias(at.v_bias, ops.linear.matmul(x, at.v))
         seam.at(seam.ATTN_QV, [q, v])
 
         rope = m.rope
@@ -382,7 +387,7 @@ def forward(m, inputs):
             e.top_k,
             routing.softmax(),
         )
-        packed = ops.linear.moe_matmul_select_bias(x, e.gate_up, e.gate_up_bias, experts, e.top_k)
+        packed = ops.linear.moe_matmul_select(x, e.gate_up, experts, e.top_k, bias = e.gate_up_bias)
         act = ops.linear.glu(packed, gating.swiglu_alpha(e.swiglu_alpha), e.inter, limit = e.swiglu_limit)
         routed = ops.linear.moe_matmul_select(act, e.down, experts, e.top_k)
         f = ops.linear.moe_weighted_sum(routed, weights)

@@ -28,23 +28,32 @@ pub fn count() -> usize {
     }
 }
 
+/// Whether a CUDA device answers. Probed once a process: the probe quiets the
+/// panic hook while the runtime loads (a missing library panics), and two
+/// threads swapping the process's one hook at once could leave it quiet for
+/// good, every later panic's message lost; so the first caller probes and
+/// the rest read its answer.
 #[must_use]
 pub fn present() -> bool {
     #[cfg(feature = "device")]
     {
-        let hook = std::panic::take_hook();
-        std::panic::set_hook(Box::new(|_| {}));
-        let probe = std::panic::catch_unwind(|| {
-            let mut count: i32 = 0;
-            // SAFETY: count is a live local, and this is the process's first cudarc call.
-            let status = unsafe { crate::device::rt::cudaGetDeviceCount(&raw mut count) };
-            (status, count)
-        });
-        std::panic::set_hook(hook);
-        matches!(
-            probe,
-            Ok((crate::device::rt::cudaError::cudaSuccess, count)) if count > 0
-        )
+        static PRESENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *PRESENT.get_or_init(|| {
+            let hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(|_| {}));
+            let probe = std::panic::catch_unwind(|| {
+                let mut count: i32 = 0;
+                // SAFETY: count is a live local, and this is the process's
+                // first cudarc call.
+                let status = unsafe { crate::device::rt::cudaGetDeviceCount(&raw mut count) };
+                (status, count)
+            });
+            std::panic::set_hook(hook);
+            matches!(
+                probe,
+                Ok((crate::device::rt::cudaError::cudaSuccess, count)) if count > 0
+            )
+        })
     }
     #[cfg(not(feature = "device"))]
     {
@@ -93,6 +102,10 @@ impl Context {
             // the prior calls produced. cudaSetDevice binds this thread.
             unsafe {
                 check("cudaSetDevice", rt::cudaSetDevice(ordinal))?;
+                // What the process keeps idle (an earlier shell's dropped
+                // buffers) goes back first: the load measures the card from
+                // here, and fits as it would in a fresh process.
+                crate::device::held::release_idle();
                 let mut stream: rt::cudaStream_t = core::ptr::null_mut();
                 check("cudaStreamCreate", rt::cudaStreamCreate(&raw mut stream))?;
                 crate::device::held::adopt_stream(ordinal, stream.cast());
@@ -109,29 +122,18 @@ impl Context {
                     return Err(fault);
                 }
 
-                let mut handle: blas::cublasHandle_t = core::ptr::null_mut();
-                let status = blas::cublasCreate_v2(&raw mut handle);
-                if status != blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                    destroy_stream(ordinal, stream.cast());
-                    return Err(Fault::Device {
-                        call: "cublasCreate_v2",
-                        code: status as i32,
-                    });
-                }
-                let status = blas::cublasSetStream_v2(handle, stream.cast());
-                if status != blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                    blas::cublasDestroy_v2(handle);
-                    destroy_stream(ordinal, stream.cast());
-                    return Err(Fault::Device {
-                        call: "cublasSetStream_v2",
-                        code: status as i32,
-                    });
-                }
+                let handle: blas::cublasHandle_t = match blas_on(ordinal, stream.cast()) {
+                    Ok(handle) => handle.cast(),
+                    Err(fault) => {
+                        destroy_stream(ordinal, stream.cast());
+                        return Err(fault);
+                    }
+                };
 
                 let mut notify: rt::cudaStream_t = core::ptr::null_mut();
                 let status = rt::cudaStreamCreateWithFlags(&raw mut notify, 1);
                 if status != rt::cudaError::cudaSuccess {
-                    blas::cublasDestroy_v2(handle);
+                    give_blas(ordinal, handle.cast());
                     destroy_stream(ordinal, stream.cast());
                     return Err(Fault::Device {
                         call: "cudaStreamCreateWithFlags",
@@ -143,7 +145,7 @@ impl Context {
                 let status = rt::cudaStreamCreateWithFlags(&raw mut tap, 1);
                 if status != rt::cudaError::cudaSuccess {
                     let _ = rt::cudaStreamDestroy(notify);
-                    blas::cublasDestroy_v2(handle);
+                    give_blas(ordinal, handle.cast());
                     destroy_stream(ordinal, stream.cast());
                     return Err(Fault::Device {
                         call: "cudaStreamCreateWithFlags",
@@ -156,7 +158,7 @@ impl Context {
                 if status != rt::cudaError::cudaSuccess {
                     let _ = rt::cudaStreamDestroy(tap);
                     let _ = rt::cudaStreamDestroy(notify);
-                    blas::cublasDestroy_v2(handle);
+                    give_blas(ordinal, handle.cast());
                     destroy_stream(ordinal, stream.cast());
                     return Err(Fault::Device {
                         call: "cudaStreamCreateWithFlags",
@@ -294,7 +296,6 @@ impl Context {
 
     #[cfg(feature = "device")]
     fn open_side(&mut self) -> Result<Side> {
-        use crate::device::blas;
         use crate::device::rt;
 
         // SAFETY: each call takes a live out-parameter, using handles the
@@ -302,26 +303,14 @@ impl Context {
         unsafe {
             let mut stream: rt::cudaStream_t = core::ptr::null_mut();
             check("cudaStreamCreate", rt::cudaStreamCreate(&raw mut stream))?;
-            let mut handle: blas::cublasHandle_t = core::ptr::null_mut();
-            let status = blas::cublasCreate_v2(&raw mut handle);
-            if status != blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                rt::cudaStreamDestroy(stream);
-                return Err(Fault::Device {
-                    call: "cublasCreate_v2",
-                    code: status as i32,
-                });
-            }
-            let status = blas::cublasSetStream_v2(handle, stream.cast());
-            if status != blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
-                blas::cublasDestroy_v2(handle);
-                rt::cudaStreamDestroy(stream);
-                return Err(Fault::Device {
-                    call: "cublasSetStream_v2",
-                    code: status as i32,
-                });
-            }
+            let cublas = match blas_on(self.ordinal, stream.cast()) {
+                Ok(handle) => handle,
+                Err(fault) => {
+                    rt::cudaStreamDestroy(stream);
+                    return Err(fault);
+                }
+            };
             let stream: *mut c_void = stream.cast();
-            let cublas: *mut c_void = handle.cast();
             self.slabs.attach(stream);
             Ok(Side {
                 stream,
@@ -464,14 +453,14 @@ impl Drop for Context {
                 self.slabs.release();
                 for side in self.side.drain(..).chain(self.conditional.take()) {
                     if !side.cublas.is_null() {
-                        let _ = crate::device::blas::cublasDestroy_v2(side.cublas.cast());
+                        give_blas(self.ordinal, side.cublas);
                     }
                     if !side.stream.is_null() {
                         let _ = crate::device::rt::cudaStreamDestroy(side.stream.cast());
                     }
                 }
                 if !self.cublas.is_null() {
-                    let _ = crate::device::blas::cublasDestroy_v2(self.cublas.cast());
+                    give_blas(self.ordinal, self.cublas);
                 }
                 if !self.stream.is_null() {
                     destroy_stream(self.ordinal, self.stream);
@@ -592,7 +581,12 @@ pub fn bind_thread(ordinal: i32) -> Result<()> {
     #[cfg(feature = "device")]
     {
         // SAFETY: an ordinal the runtime itself answered with.
-        unsafe { check("cudaSetDevice", crate::device::rt::cudaSetDevice(ordinal)) }
+        unsafe { check("cudaSetDevice", crate::device::rt::cudaSetDevice(ordinal))? };
+        // The kernels' own per-thread binding here, not at a kernel's first
+        // resolution mid-fire, where its `cudaFree` waits on the device.
+        #[cfg(all(feature = "cuda", not(feature = "rocm")))]
+        kernels_cuda::jit::bind_context().map_err(crate::error::kernel)?;
+        Ok(())
     }
     #[cfg(not(feature = "device"))]
     {
@@ -631,6 +625,69 @@ unsafe fn destroy_stream(ordinal: i32, stream: *mut c_void) {
         // SAFETY: as the caller promises.
         let _ = unsafe { crate::device::rt::cudaStreamDestroy(stream.cast()) };
     });
+}
+
+/// cuBLAS handles dropped contexts gave back, by device, for the next bind
+/// or side stream to take. `cublasDestroy` synchronizes the whole device,
+/// and a stream another thread is capturing into is invalidated by it
+/// (`cudaErrorStreamCaptureInvalidated`): a shell dropped while another
+/// model's load captures its graphs broke that capture. A handle is set to
+/// its new stream when taken, and the math mode is laid on each use
+/// (`Ctx::cublas`), so a kept one serves as a fresh one would; the process
+/// holds at most as many as it ever had live at once.
+#[cfg(feature = "device")]
+static BLAS: std::sync::Mutex<Vec<(i32, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// A cuBLAS handle of `ordinal` on `stream`: a kept one, else a fresh one.
+///
+/// # Safety
+///
+/// This thread is bound to `ordinal`, and `stream` is a live stream of it.
+#[cfg(feature = "device")]
+unsafe fn blas_on(ordinal: i32, stream: *mut c_void) -> Result<*mut c_void> {
+    use crate::device::blas;
+
+    let kept = {
+        let mut kept = BLAS.lock().expect("blas lock poisoned");
+        kept.iter()
+            .position(|&(device, _)| device == ordinal)
+            .map(|at| kept.swap_remove(at).1)
+    };
+    let handle: blas::cublasHandle_t = match kept {
+        Some(handle) => handle as blas::cublasHandle_t,
+        None => {
+            let mut handle: blas::cublasHandle_t = core::ptr::null_mut();
+            // SAFETY: `handle` is a live local the call fills.
+            let status = unsafe { blas::cublasCreate_v2(&raw mut handle) };
+            if status != blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                return Err(Fault::Device {
+                    call: "cublasCreate_v2",
+                    code: status as i32,
+                });
+            }
+            handle
+        }
+    };
+    // SAFETY: the handle is live and no one else's; `stream` is the caller's.
+    let status = unsafe { blas::cublasSetStream_v2(handle, stream.cast()) };
+    if status != blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+        give_blas(ordinal, handle.cast());
+        return Err(Fault::Device {
+            call: "cublasSetStream_v2",
+            code: status as i32,
+        });
+    }
+    Ok(handle.cast())
+}
+
+/// Keeps `handle`, of `ordinal`, for the next [`blas_on`] rather than
+/// destroying it. Its stream may be destroyed after: a kept handle launches
+/// nothing until it is taken and set to another.
+#[cfg(feature = "device")]
+fn give_blas(ordinal: i32, handle: *mut c_void) {
+    BLAS.lock()
+        .expect("blas lock poisoned")
+        .push((ordinal, handle as usize));
 }
 
 #[cfg(feature = "device")]

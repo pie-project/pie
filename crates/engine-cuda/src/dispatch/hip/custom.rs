@@ -21,6 +21,7 @@ pub(crate) fn refuses(op: &Fused) -> bool {
             | Fused::PoolCompress { .. }
             | Fused::PoolAttention { .. }
             | Fused::MlaPrefillExpanded { .. }
+            | Fused::HcFoldPre { .. }
             | Fused::HcPre { .. }
             | Fused::HcGatesNorm { .. }
             | Fused::HcPrenormProject { .. }
@@ -37,6 +38,8 @@ impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         match op {
             _ if refuses(op) => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+            // A synthesized region's body is not launched here yet.
+            Fused::Region { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             Fused::GdnStep { .. } => return self.gdn_step(op),
             Fused::QGateNormRopeAppend { .. } => return self.q_gate_append(op),
             Fused::QkvFusedQknormRopeVnormWrite { .. } => self.qkv_write(op),
@@ -51,9 +54,11 @@ impl DispatchFused for Run<'_> {
             // and run as the primitives they stand for where a trace states
             // them.
             Fused::MatmulGlu { .. }
+            | Fused::MatmulMoeRoute { .. }
             | Fused::MatmulSplitRows { .. }
             | Fused::MoeSelectGlu { .. }
             | Fused::MoeExperts { .. }
+            | Fused::MoeMega { .. }
             | Fused::LseSink { .. }
             | Fused::RopeYarnAppend { .. }
             | Fused::SplitRopeYarnAppend { .. } => return self.primitives(op),
@@ -63,6 +68,7 @@ impl DispatchFused for Run<'_> {
             | Fused::PoolCompress { .. }
             | Fused::PoolAttention { .. }
             | Fused::MlaPrefillExpanded { .. }
+            | Fused::HcFoldPre { .. }
             | Fused::HcPre { .. }
             | Fused::HcGatesNorm { .. }
             | Fused::HcPrenormProject { .. }
@@ -176,7 +182,7 @@ impl Run<'_> {
             down_experts,
             intermediate,
             limit,
-            fan: self.plane_fan(self.tensor(*h).rows),
+            fan: self.plane_fan(*h),
             packed: self.tensor(*packed),
             h: self.tensor(*h),
             routed: self.tensor(*routed),
@@ -411,9 +417,66 @@ impl Run<'_> {
                     },
                 )
             }
+            Fused::MatmulMoeRoute {
+                act,
+                w,
+                bias,
+                scale,
+                hint,
+                experts,
+                top_k,
+                score,
+                logits,
+                routes,
+                weights,
+            } => {
+                DispatchLinear::dispatch(
+                    self,
+                    &Linear::Matmul {
+                        act: *act,
+                        w: *w,
+                        y: *logits,
+                        input_scales: None,
+                        scales: None,
+                        quant: None,
+                        logits: false,
+                    },
+                )?;
+                DispatchLinear::dispatch(
+                    self,
+                    &Linear::MoeRoute {
+                        ids: None,
+                        table: None,
+                        logits: *logits,
+                        bias: *bias,
+                        scale: *scale,
+                        hint: *hint,
+                        experts: *experts,
+                        top_k: *top_k,
+                        score: *score,
+                        routes: *routes,
+                        weights: *weights,
+                    },
+                )
+            }
             Fused::MoeSelectGlu { select, glu } => {
                 DispatchLinear::dispatch(self, select)?;
                 DispatchLinear::dispatch(self, glu)
+            }
+            Fused::MoeMega {
+                select,
+                glu,
+                down,
+                sum,
+                gate_add,
+            } => {
+                for leg in [select, glu, down, sum] {
+                    DispatchLinear::dispatch(self, leg)?;
+                }
+                match gate_add {
+                    Some(gate_add) => DispatchLinear::dispatch(self, gate_add),
+                    None => Ok(()),
+                }
             }
             Fused::MoeExperts {
                 select,

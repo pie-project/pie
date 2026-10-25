@@ -5,6 +5,14 @@
 
 load("//lib/adapters.poem", "banks")
 
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: q's up projection and the attention's sinks by their heads, the
+# base model's per-head kv and its norm across all of them with them (each
+# rank's sum of squares summed across the ranks), the grouped output
+# projections, the dense, shared and routed experts by their channels, the
+# down projections by their rows.
+CUTS = "inferred"
+
 R1 = template("deepseek")
 TOKENIZER = tokenizer(markers = [["<｜end▁of▁sentence｜>", "<|EOT|>"]])
 
@@ -151,8 +159,8 @@ def base(w, kv, d):
             di = d.dense_inter
             mlp = struct(
                 kind = "dense",
-                gate_up = weight([2 * di, hidden], w).packed([di, di]),
-                down = weight([hidden, di], w).rows(),
+                gate_up = weight([2 * di, hidden], w),
+                down = weight([hidden, di], w),
                 inter = di,
                 limit = d.swiglu_limit,
             )
@@ -162,8 +170,8 @@ def base(w, kv, d):
                 kind = "routed",
                 router = weight([d.experts, hidden], w),
                 bias = weight([d.experts], w),
-                gate_up = weight([d.experts, 2 * mi, hidden], w).bank([mi, mi]),
-                down = weight([d.experts, hidden, mi], w).rows(),
+                gate_up = weight([d.experts, 2 * mi, hidden], w),
+                down = weight([d.experts, hidden, mi], w),
                 experts = d.experts,
                 top_k = d.top_k,
                 inter = mi,
@@ -184,14 +192,14 @@ def base(w, kv, d):
                 q_norm = norm("q_norm", d.q_lora),
                 q_norm_eps = d.norm_eps,
                 q_head_norm = True,
-                q_up = weight([q_w, d.q_lora], w).columns(),
-                kv_down = weight([q_w, hidden], w).columns(),
-                kv_norm = weight([q_w], w).columns(),
+                q_up = weight([q_w, d.q_lora], w),
+                kv_down = weight([q_w, hidden], w),
+                kv_norm = weight([q_w], w),
                 kv_norm_eps = d.norm_eps,
-                o_down = weight([d.o_lora, q_w], w).rows(),
+                o_down = weight([d.o_lora, q_w], w),
                 o_up = weight([hidden, d.o_lora], w),
                 o_groups = 1,
-                sink = weight([d.heads], w).columns(),
+                sink = weight([d.heads], w),
                 kv = "kv.{}".format(l),
                 pool = struct(ratio = ratio, entries = "pool.{}".format(l), compressor = None, owner = True)
                     if ratio != None else None,
@@ -278,11 +286,11 @@ def moe_flash(n, d, experts, gate, banks, weights, dense, top_k = None):
     si = d.shared_inter
     hidden = d.hidden
     if banks.split:
-        half = lambda what, dt: weight([experts, mi, hidden], dt).bank([mi])
+        half = lambda what, dt: weight([experts, mi, hidden], dt)
         gate_up = struct(fused = None, gate = half("experts_gate", banks.gate), up = half("experts_up", banks.up))
     else:
         gate_up = struct(
-            fused = weight([experts, 2 * mi, hidden], banks.gate).bank([mi, mi]),
+            fused = weight([experts, 2 * mi, hidden], banks.gate),
             gate = None,
             up = None,
         )
@@ -291,9 +299,9 @@ def moe_flash(n, d, experts, gate, banks, weights, dense, top_k = None):
         router = weight([experts, hidden]),
         gate = gate,
         gate_up = gate_up,
-        down = weight([experts, hidden, mi], banks.down).rows(),
-        shared_gate_up = weight([2 * si, hidden], weights).packed([si, si]),
-        shared_down = weight([hidden, si], weights).rows(),
+        down = weight([experts, hidden, mi], banks.down),
+        shared_gate_up = weight([2 * si, hidden], weights),
+        shared_down = weight([hidden, si], weights),
         experts = experts,
         top_k = top_k if top_k != None else d.top_k,
         inter = mi,
@@ -375,14 +383,14 @@ def flash(w, r, kv, d, quant = None):
                 q_norm = norm("q_norm", d.q_lora),
                 q_norm_eps = d.norm_eps,
                 q_head_norm = True,
-                q_up = weight([q_w, d.q_lora], q).columns(),
+                q_up = weight([q_w, d.q_lora], q),
                 kv_down = weight([kv_latent, hidden], q),
                 kv_norm = norm("kv_norm", kv_latent),
                 kv_norm_eps = d.norm_eps,
-                o_down = weight([o_out, q_w // d.o_groups], weights).columns(),
-                o_up = weight([hidden, o_out], q).rows(),
+                o_down = weight([o_out, q_w // d.o_groups], weights),
+                o_up = weight([hidden, o_out], q),
                 o_groups = d.o_groups,
-                sink = weight([d.heads], sdense).columns(),
+                sink = weight([d.heads], sdense),
                 kv = "kv." + key,
                 pool = pool,
                 indexer = indexer,
@@ -628,8 +636,7 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
                 # The release's table as it ships (MXFP8) where the release's
                 # precision is served, widened only at the rows a token reads.
                 table = weight([rows, e.head_dim], dtype.mxfp8 if quant != None else dense),
-                wkv = weight([(streams + 1) * hidden, cols * e.head_dim], q)
-                    .packed([streams * hidden, hidden]),
+                wkv = weight([(streams + 1) * hidden, cols * e.head_dim], q),
                 q_weight = weight([streams, hidden]),
                 k_weight = weight([streams, hidden]),
                 mults = mults,
@@ -668,14 +675,14 @@ def flash41(w, r, kv, d, quant = None, dspark = False):
                 q_norm = norm("q_norm", d.q_lora),
                 q_norm_eps = d.norm_eps,
                 q_head_norm = False,
-                q_up = weight([q_w, d.q_lora], q).columns(),
+                q_up = weight([q_w, d.q_lora], q),
                 kv_down = weight([kv_latent, hidden], q),
                 kv_norm = norm("kv_norm", kv_latent),
                 kv_norm_eps = d.norm_eps,
                 o_down = weight([o_out, o_in], w),
-                o_up = weight([hidden, o_out], q).rows(),
+                o_up = weight([hidden, o_out], q),
                 o_groups = d.o_groups,
-                sink = weight([d.heads]).columns(),
+                sink = weight([d.heads]),
                 kv = kv_name,
                 pool = pool,
                 indexer = indexer,
@@ -1371,6 +1378,12 @@ def fp8_rows(m):
 def fp4_rows(m):
     return m.kv == dtype.nvfp4
 
+def split_kv(m, at):
+    """Whether the ranks split `at`'s cached kv by its heads: a row of more
+    than one head, unless a pool gathers its entries from the whole row."""
+    pooled = at.pool != None and at.pool.compressor == None
+    return at.kv_down.shape[0] > m.head_dim and not pooled
+
 def caches(m, c):
     fp8 = fp8_rows(m)
     fp4 = fp4_rows(m)
@@ -1398,7 +1411,7 @@ def caches(m, c):
     kv = c.kv_space(rows, m.window)
     for w in m.layers:
         at = w.attn
-        c.kv(kv, at.kv, row(at), m.head_dim, heads = at.kv_down.cut_axis != None)
+        c.kv(kv, at.kv, row(at), m.head_dim, heads = split_kv(m, at))
         ratio = at.pool.ratio if at.pool != None else 1
         if at.pool != None and at.pool.owner:
             pool = c.kv_space(rows)
@@ -1414,7 +1427,7 @@ def caches(m, c):
         c.state(REPLAY, [1], dtype.i32)
     if m.mtp != None:
         at = m.mtp.block.attn
-        c.kv(kv, at.kv, row(at), m.head_dim, heads = at.kv_down.cut_axis != None)
+        c.kv(kv, at.kv, row(at), m.head_dim, heads = split_kv(m, at))
     if m.dspark != None:
         # A DSpark stage's window: the last `m.window` committed positions
         # and the drafted block above them.
@@ -1422,7 +1435,7 @@ def caches(m, c):
         space = c.kv_space(rows, m.window + ds.block)
         for st in ds.stages:
             at = st.attn
-            c.kv(space, at.kv, row(at), m.head_dim, heads = at.kv_down.cut_axis != None)
+            c.kv(space, at.kv, row(at), m.head_dim, heads = split_kv(m, at))
 
 # The dtype the forward computes in on every deployment.
 ACT = dtype.bf16

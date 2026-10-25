@@ -241,7 +241,7 @@ impl ProcessCtx {
 
     pub(crate) fn is_resident_fast(&mut self) -> bool {
         if self.residency_flag.is_none() {
-            let Some(planner) = crate::planner::planner() else {
+            let Some(planner) = crate::planner::planner_of(self.id) else {
                 return true;
             };
             self.residency_flag = planner.residency_flag(self.id);

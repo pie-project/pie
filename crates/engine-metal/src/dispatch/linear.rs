@@ -742,38 +742,47 @@ impl Run<'_> {
                 *limit,
                 self.tensor(*y),
             ),
+            // An unclamped unit clamps at the largest finite f32, which keeps
+            // every finite value (a fast-math shader may assume no infinity).
             Linear::Glu {
                 packed: Some(packed),
                 intermediate,
-                limit: Some(limit),
+                limit,
                 y,
                 gate: None,
                 weights: None,
                 act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
                 ..
-            } => match self.chain_swiglu(*packed, *y) {
-                Some((sorted_packed, sorted_h, perm)) => linear::mlp::swiglu_clamp_alpha_sorted(
-                    self.ctx(),
-                    sorted_packed,
-                    *intermediate,
-                    *limit,
-                    *alpha,
-                    perm,
-                    sorted_h,
-                ),
-                None => linear::mlp::swiglu_clamp_alpha(
-                    self.ctx(),
-                    self.tensor(*packed),
-                    *intermediate,
-                    *limit,
-                    *alpha,
-                    self.tensor(*y),
-                ),
-            },
+            } => {
+                let limit = limit.unwrap_or(f32::MAX);
+                match self.chain_swiglu(*packed, *y) {
+                    Some((sorted_packed, sorted_h, perm)) => {
+                        linear::mlp::swiglu_clamp_alpha_sorted(
+                            self.ctx(),
+                            sorted_packed,
+                            *intermediate,
+                            limit,
+                            *alpha,
+                            perm,
+                            sorted_h,
+                        )
+                    }
+                    None => linear::mlp::swiglu_clamp_alpha(
+                        self.ctx(),
+                        self.tensor(*packed),
+                        *intermediate,
+                        limit,
+                        *alpha,
+                        self.tensor(*y),
+                    ),
+                }
+            }
+            // Legs the pack left apart: the packed forms over a gate and an
+            // up plane, an unclamped SwiGLU clamped at the largest finite f32.
             Linear::Glu {
                 gate: Some(gate),
                 up: Some(up),
-                limit: Some(limit),
+                limit,
                 y,
                 packed: None,
                 weights: None,
@@ -783,7 +792,41 @@ impl Run<'_> {
                 self.ctx(),
                 self.tensor(*gate),
                 self.tensor(*up),
-                *limit,
+                limit.unwrap_or(f32::MAX),
+                self.tensor(*y),
+            ),
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                limit,
+                y,
+                packed: None,
+                weights: None,
+                act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
+                ..
+            } => linear::mlp::swiglu_clamp_alpha_split(
+                self.ctx(),
+                self.tensor(*gate),
+                self.tensor(*up),
+                limit.unwrap_or(f32::MAX),
+                *alpha,
+                self.tensor(*y),
+            ),
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                y,
+                packed: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Situ { beta, up_cap, .. },
+                ..
+            } => linear::mlp::situ_split(
+                self.ctx(),
+                self.tensor(*gate),
+                self.tensor(*up),
+                *beta,
+                *up_cap,
                 self.tensor(*y),
             ),
             Linear::Glu {

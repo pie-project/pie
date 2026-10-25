@@ -7,8 +7,8 @@ use poem::ops::{attn, elemwise, gather, linear, ssm};
 use poem::pattern::{Pattern, Template, template};
 use poem_ir::ops::fused::{Intermediates, PostNorm, Scaled};
 use poem_ir::{
-    ActQuant, Dim, Dtype, Elemwise, Fused, Gather, ModulateForm, NormKind, Operation, StructKind,
-    Ty,
+    ActQuant, Dim, Dtype, Elemwise, Fused, Gather, Linear, ModulateForm, NormKind, Operation,
+    RouteScore, StructKind, Ty,
 };
 use poem_ir::{NormAxis, NormWeight, Turn};
 
@@ -60,10 +60,12 @@ pub fn all() -> Vec<Rule> {
         residual_add_rmsnorm(),
         matmul_swiglu_matmul(),
         matmul_glu(&[GluAct::GegluTanh, GluAct::Swiglu]),
+        moe_mega(),
         moe_experts(),
         moe_select_glu(),
         matmul_softcap(),
         matmul_bias(),
+        matmul_moe_route(),
         matmul_split_rows(),
         gated_residual_norm_modulate(),
         norm_modulate(),
@@ -80,6 +82,7 @@ pub fn all() -> Vec<Rule> {
         split_rope_yarn_append(),
         rope_yarn_append(),
         pool_attention(),
+        hc_fold_pre(),
         hc_pre(),
         mla_prefill_expanded(),
         hc_prenorm_project(),
@@ -87,6 +90,61 @@ pub fn all() -> Vec<Rule> {
         res_blend_rmsnorm(),
         lse_sink(),
     ]
+}
+
+/// A sublayer's hyper-connection fold and the next sublayer's whole pre-mix
+/// over the streams it folds ([`hc_pre`]'s chain): the folded streams read
+/// on, the pre-mix's intermediates read only inside it. The first sublayer's
+/// expanded streams (no fold), the last fold's (collapsed, not gated), an
+/// Engram layer's (written into before they are normed) and Single-Pass
+/// mHC's (whose normed row is the previous sublayer's mixes' pre-mix) match
+/// none of it.
+#[must_use]
+pub fn hc_fold_pre() -> Rule {
+    let pattern = template(|p| {
+        let streams = elemwise::hc_fold(
+            &p.rows("x", W),
+            &p.rows("residual", 4 * W),
+            &p.rows("post_in", 4),
+            &p.rows("comb_in", 16),
+        );
+        p.export("folded", &streams);
+        let normed = elemwise::hc_rmsnorm_f32(&streams, p.f32("mix_eps"));
+        p.name("normed", &normed);
+        p.free("stream_count");
+        let mixes = elemwise::hc_project(&normed, &p.weight("plane", [24, 4 * W]), 4);
+        p.name("mixes", &mixes);
+        let (x, post, comb) = elemwise::hc_gates(
+            &mixes,
+            &streams,
+            &p.weight("scale", [3]),
+            &p.weight("base", [24]),
+            4,
+            p.f32("gate_eps"),
+            p.f32("alpha"),
+            p.u32("sinkhorn"),
+        );
+        p.name("pre", &x);
+        p.export("post", &post);
+        p.export("comb", &comb);
+        let y = elemwise::rmsnorm(&x, &p.weight("weight", [W]), p.f32("eps"));
+        p.export("y", &y);
+    });
+    Rule::new("fused.hc_fold_pre", [pattern], |m| {
+        let elementwise = |name: &str| {
+            let Operation::Elemwise(op) = m.op(name) else {
+                panic!("`{name}` comes from an elementwise op");
+            };
+            Box::new(op.clone())
+        };
+        Fused::HcFoldPre {
+            fold: elementwise("folded"),
+            norm: elementwise("normed"),
+            project: elementwise("mixes"),
+            gates: elementwise("pre"),
+            rmsnorm: elementwise("y"),
+        }
+    })
 }
 
 /// A sublayer's whole hyper-connection pre-mix: the stream norm read only by
@@ -1028,6 +1086,106 @@ pub fn matmul_swiglu_matmul() -> Rule {
     })
 }
 
+/// A routed MLP the mega-MoE lands in one launch: a gate-up select over a
+/// packed bank (gate rows then up rows per expert), its SwiGLU, the down
+/// select on the same routes and the fold, nothing between. Its forms are
+/// the ones the kernel takes: DeepSeek-V4's W4A8 banks, the route weights
+/// scaling the clamped GLU's rows and the routes summed with the shared row
+/// added; and dense banks under the weighted sum (clamped or not), or the
+/// weights first under a clamp, the shared row added. A weighted sum under
+/// Qwen's gated shared expert takes that gate-add along, as `moe_experts`
+/// does, so a fire the kernel declines runs as the whole `MoeExperts` the
+/// chain would have formed.
+#[must_use]
+pub fn moe_mega() -> Rule {
+    let mut alternatives = Vec::new();
+    // (W4A8 banks, the weights first, a clamp, a gated shared expert)
+    let forms = [
+        (true, true, true, false),
+        (false, false, false, true),
+        (false, false, false, false),
+        (false, false, true, true),
+        (false, false, true, false),
+        (false, true, true, false),
+    ];
+    for (w4a8, first, clamped, gated) in forms {
+        alternatives.push(template(move |p| {
+            let x = p.rows("x", W);
+            let routes = p.value(
+                "routes",
+                Ty::Tensor {
+                    shape: vec![Dim::Tokens, Dim::Const(W)],
+                    dtype: Dtype::I32,
+                },
+            );
+            let weights = p.value(
+                "weights",
+                Ty::Tensor {
+                    shape: vec![Dim::Tokens, Dim::Const(W)],
+                    dtype: Dtype::F32,
+                },
+            );
+            let top_k = p.u32("top_k");
+            let select_of = |x: &poem::Value, bank: &'static str| {
+                if w4a8 {
+                    linear::select::quantized(
+                        x,
+                        &p.weight_at(bank, [W, W, W], W4A8),
+                        &routes,
+                        top_k,
+                    )
+                } else {
+                    linear::select::plain(x, &p.weight(bank, [W, W, W]), &routes, top_k)
+                }
+            };
+            let packed = select_of(&x, "bank");
+            p.name("packed", &packed);
+            let hidden = linear::glu(
+                &packed,
+                GluAct::Swiglu,
+                Some(p.u32("intermediate")),
+                None,
+                first.then_some(&weights),
+                clamped.then(|| p.f32("limit")),
+            );
+            p.name("hidden", &hidden);
+            let routed = select_of(&hidden, "down");
+            p.name("routed", &routed);
+            if first {
+                p.export("y", &linear::moe_sum_add(&routed, &p.rows("shared", W)));
+                return;
+            }
+            let summed = linear::moe_weighted_sum(&routed, &weights);
+            if gated {
+                p.name("summed", &summed);
+                let y =
+                    linear::moe_sigmoid_gate_add(&summed, &p.rows("shared", W), &p.rows("gate", W));
+                p.export("y", &y);
+            } else {
+                p.export("y", &summed);
+            }
+        }));
+    }
+    Rule::new("fused.moe_mega", alternatives, |m| {
+        let linear_op = |name| match m.op(name) {
+            Operation::Linear(op) => Box::new(op.clone()),
+            other => panic!("`{name}` is computed by {other:?}, not a linear op"),
+        };
+        // Under a gate the sum is `summed` and the gate-add `y`.
+        let (sum, gate_add) = match m.get("summed") {
+            Some(_) => (linear_op("summed"), Some(linear_op("y"))),
+            None => (linear_op("y"), None),
+        };
+        Fused::MoeMega {
+            select: linear_op("packed"),
+            glu: linear_op("hidden"),
+            down: linear_op("routed"),
+            sum,
+            gate_add,
+        }
+    })
+}
+
 /// A routed MLP: a gate-up select and its GLU (each `moe_select_glu` form,
 /// or SiTU; or an up select and its relu2), the down select of the GLU on the
 /// same routes (each row normed under a scale where `normed`, Muse Spark's),
@@ -1061,7 +1219,7 @@ pub fn moe_experts() -> Rule {
                         0 => {
                             linear::select::plain(x, &p.weight(bank, [W, W, W]), &routes, top_k)
                         }
-                        1 => linear::moe_matmul_select_bias(
+                        1 => linear::select::biased(
                             x,
                             &p.weight(bank, [W, W, W]),
                             &p.weight(bias, [W, W]),
@@ -1268,13 +1426,9 @@ pub fn moe_select_glu() -> Rule {
                 let top_k = p.u32("top_k");
                 let packed = match select {
                     0 => linear::select::plain(&x, &bank, &routes, top_k),
-                    1 => linear::moe_matmul_select_bias(
-                        &x,
-                        &bank,
-                        &p.weight("bias", [W, W]),
-                        &routes,
-                        top_k,
-                    ),
+                    1 => {
+                        linear::select::biased(&x, &bank, &p.weight("bias", [W, W]), &routes, top_k)
+                    }
                     _ => linear::select::quantized(&x, &bank, &routes, top_k),
                 };
                 p.name("packed", &packed);
@@ -1393,6 +1547,72 @@ pub fn matmul_bias() -> Rule {
         bias: m.value("bias"),
         y: m.value("y"),
         y_out: m.value("y_out"),
+    })
+}
+
+/// A router's unquantized product read only by the top-k it feeds, a
+/// softmax, sigmoid or sqrt-softplus pick (bf16 or f32 logits alike: the
+/// product is one op either way). Its bias, gain and hint pass through; a
+/// hashed route, which reads its experts off a table, stays apart.
+#[must_use]
+pub fn matmul_moe_route() -> Rule {
+    let pattern = template(|p| {
+        let logits = linear::matmul(&p.rows("act", W), &p.weight("w", [W, W]));
+        p.name("logits", &logits);
+        for field in ["experts", "top_k", "score", "bias", "scale", "hint"] {
+            p.free(field);
+        }
+        let (routes, weights) = linear::moe_route(
+            &logits,
+            W as u32,
+            8,
+            RouteScore::Softmax,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        p.export("routes", &routes);
+        p.export("weights", &weights);
+    });
+    Rule::new("fused.matmul_moe_route", [pattern], |m| {
+        let Operation::Linear(Linear::MoeRoute {
+            bias,
+            scale,
+            hint,
+            experts,
+            top_k,
+            score,
+            ..
+        }) = m.op("routes")
+        else {
+            panic!("`routes` comes from a route");
+        };
+        Fused::MatmulMoeRoute {
+            act: m.value("act"),
+            w: m.value("w"),
+            bias: *bias,
+            scale: *scale,
+            hint: *hint,
+            experts: *experts,
+            top_k: *top_k,
+            score: *score,
+            logits: m.value("logits"),
+            routes: m.value("routes"),
+            weights: m.value("weights"),
+        }
+    })
+    .when(|m| {
+        matches!(
+            m.op("routes"),
+            Operation::Linear(Linear::MoeRoute {
+                score: RouteScore::Softmax
+                    | RouteScore::Sigmoid { .. }
+                    | RouteScore::SqrtSoftplus { .. },
+                ..
+            })
+        )
     })
 }
 

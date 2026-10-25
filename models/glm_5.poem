@@ -13,6 +13,12 @@ TOKENIZER = tokenizer(markers = [STOP])
 GLM = template("glm")
 GLM_TOKENIZER = tokenizer(markers = [["<|user|>", "<|observation|>", "<|endoftext|>"]])
 
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: the latent attention's q and kv up-projections and its gate by
+# their heads, the dense, shared and routed gates and ups by their channels,
+# the output and down projections by their rows, the head by its vocabulary.
+CUTS = "inferred"
+
 MODELS = [
     model("glm5-a12b", template = CHATML, tokenizer = TOKENIZER, arch = "glm_moe_dsa", layers = 46, vocab = 151552),
     model("glm53", template = GLM, tokenizer = GLM_TOKENIZER, drafters = ["mtp"], arch = "glm_moe_dsa", layers = 78, vocab = 154880),
@@ -87,15 +93,15 @@ def attention(n, d, hidden, weights, norms, eps, kv, theta = None, interleaved =
         q_a_proj = weight([d.q_lora_rank, hidden], weights),
         q_a_norm = weight([d.q_lora_rank]),
         q_a_norm_eps = eps,
-        q_b_proj = weight([d.heads * qk_head_dim, d.q_lora_rank], weights).columns(),
+        q_b_proj = weight([d.heads * qk_head_dim, d.q_lora_rank], weights),
         kv_a_proj = weight([d.kv_lora_rank + d.qk_rope_head_dim, hidden], weights),
         kv_a_norm = weight([d.kv_lora_rank]),
         kv_a_norm_eps = eps,
         kv_b_proj = weight([d.heads * (d.qk_nope_head_dim + d.v_head_dim), d.kv_lora_rank],
             latent if latent != None else weights,
-        ).columns(),
-        gate = weight([v_width, hidden], weights).columns() if gated else None,
-        o_proj = weight([hidden, v_width], weights).rows(),
+        ),
+        gate = weight([v_width, hidden], weights) if gated else None,
+        o_proj = weight([hidden, v_width], weights),
         kv = kv,
         **extra
     )
@@ -249,11 +255,12 @@ def layout(id, deploy):
             routed = True,
             router = weight([d.experts, hidden], w),
             bias = weight([d.experts], dtype.f32) if d.router_bias else None,
-            gate_up = weight([d.experts, 2 * iw, hidden], banks_dtype).bank([iw, iw]),
-            down = weight([d.experts, hidden, iw], banks_dtype).rows(),
+            gate_up = weight([d.experts, 2 * iw, hidden], banks_dtype),
+            down = weight([d.experts, hidden, iw], banks_dtype),
             shared = struct(
-                gate_up = weight([2 * sw, hidden], proj).packed([sw, sw]),
-                down = weight([hidden, sw], proj).rows(),
+                gate = weight([sw, hidden], proj),
+                up = weight([sw, hidden], proj),
+                down = weight([hidden, sw], proj),
                 inter = sw,
             ),
             experts = d.experts,
@@ -272,8 +279,9 @@ def layout(id, deploy):
             iw = d.dense_inter
             mlp = struct(
                 routed = False,
-                gate_up = weight([2 * iw, hidden], dense_mlp or proj).packed([iw, iw]),
-                down = weight([hidden, iw], dense_mlp or proj).rows(),
+                gate = weight([iw, hidden], dense_mlp or proj),
+                up = weight([iw, hidden], dense_mlp or proj),
+                down = weight([hidden, iw], dense_mlp or proj),
                 inter = iw,
             )
         else:
@@ -311,7 +319,7 @@ def layout(id, deploy):
         kv_lora_rank = d.kv_lora_rank,
         kv = deploy.kv,
         embed = weight([d.vocab, hidden], w),
-        head = weight([d.vocab, hidden], w).packed([d.vocab]),
+        head = weight([d.vocab, hidden], w),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden], w),
         final_norm_eps = d.norm_eps,
@@ -368,12 +376,8 @@ def huggingface(m, reads):
         if f.routed:
             moe(reads, at, f)
         else:
-            read_weight(
-                reads,
-                f.gate_up,
-                [at("mlp.gate_proj.weight"), at("mlp.up_proj.weight")],
-                quantized = "widen",
-            )
+            read_weight(reads, f.gate, at("mlp.gate_proj.weight"), quantized = "widen")
+            read_weight(reads, f.up, at("mlp.up_proj.weight"), quantized = "widen")
             read_weight(reads, f.down, at("mlp.down_proj.weight"), quantized = "widen")
 
     mtp = m.mtp
@@ -415,10 +419,8 @@ def moe(reads, at, f):
     shared(reads, at, f)
 
 def shared(reads, at, f):
-    read_weight(reads, f.shared.gate_up, [
-        at("mlp.shared_experts.gate_proj.weight"),
-        at("mlp.shared_experts.up_proj.weight"),
-    ], quantized = "widen")
+    read_weight(reads, f.shared.gate, at("mlp.shared_experts.gate_proj.weight"), quantized = "widen")
+    read_weight(reads, f.shared.up, at("mlp.shared_experts.up_proj.weight"), quantized = "widen")
     read_weight(reads, f.shared.down, at("mlp.shared_experts.down_proj.weight"), quantized = "widen")
 
 # The forward of GLM-5: latent attention over the keys the indexer picks
@@ -592,10 +594,8 @@ def draft(m, inputs, y, positions, logits):
 
 def mlp(x, f):
     if not f.routed:
-        return ops.linear.matmul(
-            ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter),
-            f.down,
-        )
+        gate, up = ops.linear.matmul(x, f.gate), ops.linear.matmul(x, f.up)
+        return ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), f.down)
     logits = ops.linear.matmul(x, f.router)
     if f.bias != None:
         routes, weights = ops.linear.moe_route(
@@ -613,7 +613,8 @@ def mlp(x, f):
             routing.sigmoid(renormalize = f.norm_weights, scaling = f.scaling),
         )
 
-    act = ops.linear.glu(ops.linear.matmul(x, f.shared.gate_up), gating.swiglu(), f.shared.inter)
+    gate, up = ops.linear.matmul(x, f.shared.gate), ops.linear.matmul(x, f.shared.up)
+    act = ops.linear.glu(gate, gating.swiglu(), up = up)
     shared = ops.linear.matmul(act, f.shared.down)
     act = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k), gating.swiglu(), f.inter)
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)

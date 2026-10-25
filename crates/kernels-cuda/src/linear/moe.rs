@@ -1,5 +1,7 @@
 mod combine;
 mod experts;
+#[cfg(feature = "cuda")]
+mod mega;
 mod route;
 mod select;
 #[cfg(feature = "cuda")]
@@ -9,6 +11,8 @@ mod select_fp8;
 
 pub use combine::*;
 pub use experts::*;
+#[cfg(feature = "cuda")]
+pub use mega::*;
 pub use route::*;
 pub use select::*;
 #[cfg(feature = "cuda")]
@@ -24,6 +28,8 @@ const DEQUANT: &str = "linear/dequant.cu";
 const GEMV: &str = "linear/gemv.cu";
 const COMBINE: &str = "linear/moe/combine.cu";
 const ROUTE: &str = "linear/moe/route.cu";
+#[cfg(feature = "cuda")]
+const ROUTE_SM100: &str = "linear/moe/route_sm100.cu";
 const SELECT: &str = "linear/moe/select.cu";
 #[cfg(feature = "cuda")]
 const SELECT_FP4_SM100: &str = "linear/moe/select_fp4_sm100.cu";

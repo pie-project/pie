@@ -10,6 +10,13 @@ MODELS = [
     model("wan22-mini-nano", mini = True, template = RAW, tokenizer = TOKENIZER, arch = "wan_2", layers = 2, vocab = 0),
 ]
 
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: the denoiser's q, k and v by their heads, the norms of q and k
+# across all of them with them (each rank's sum of squares summed across the
+# ranks), the FFN's up by its channels, and the attention's and FFN's output
+# projections by their rows.
+CUTS = "inferred"
+
 DEPLOYMENTS = [
     deployment("wan22-ti2v-5b", weights = dtype.bf16, kv = dtype.bf16),
     deployment("wan22-ti2v-5b", weights = dtype.u4g64, kv = dtype.bf16),
@@ -33,8 +40,8 @@ def packed_linear(seams, in_, banks):
     for s in seams:
         out += s
     return struct(
-        w = weight([out, in_], banks).packed(seams),
-        bias = weight([out]).packed(seams),
+        w = weight([out, in_], banks),
+        bias = weight([out]),
     )
 
 def embedder(prefix, in_, dim, banks):
@@ -155,7 +162,7 @@ def text_encoder(banks):
 def conv_weights(name, c_out, c_in, k, plane, banks, front = None):
     taps = k[0] * k[1] * k[2]
     return struct(
-        w = weight([c_out, c_in * taps], banks).conv_taps_major(c_in, taps),
+        w = weight([c_out, c_in * taps], banks),
         bias = weight([c_out], dtype.f32),
         c_in = c_in,
         c_out = c_out,

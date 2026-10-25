@@ -9,6 +9,11 @@ load("//pie/codec.poem", "mapped")
 load("//lib/adapters.poem", "banks")
 
 LLAMA = template("llama")
+
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: q, k, v, the gate and the up by their heads and channels, the
+# output and down projections by their rows, the head by its vocabulary.
+CUTS = "inferred"
 TOKENIZER = tokenizer(markers = [["<|eot_id|>", "<|eom_id|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start_header_id|>", "<|end_header_id|>"]])
 
 def llama(id, layers, mini = False):
@@ -94,11 +99,14 @@ def layout(id, deploy):
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
             attn_norm = weight([hidden]),
-            qkv = weight([q_width + 2 * kv_width, hidden], proj).packed([q_width, kv_width, kv_width], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
-            o = weight([hidden, q_width], proj).rows(),
+            q = weight([q_width, hidden], proj),
+            k = weight([kv_width, hidden], proj),
+            v = weight([kv_width, hidden], proj),
+            o = weight([hidden, q_width], proj),
             mlp_norm = weight([hidden]),
-            gate_up = weight([2 * d.inter, hidden], proj).packed([d.inter, d.inter]),
-            down = weight([hidden, d.inter], proj).rows(),
+            gate = weight([d.inter, hidden], proj),
+            up = weight([d.inter, hidden], proj),
+            down = weight([hidden, d.inter], proj),
             kv = "kv.{}".format(l),
             lora_a = lora_a,
             lora_b = lora_b,
@@ -124,7 +132,7 @@ def layout(id, deploy):
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         kv = deploy.kv,
         embed = weight([d.vocab, hidden], table),
-        head = weight([d.vocab, hidden], table).columns(),
+        head = weight([d.vocab, hidden], table),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
     )
@@ -163,14 +171,13 @@ TRANSFORMERS = [
     ("model.norm.weight", "final_norm"),
     ("lm_head.weight", "head"),
     ("model.layers.{l}.input_layernorm.weight", "layers.{l}.attn_norm"),
-    ([
-        "model.layers.{l}.self_attn.q_proj.weight",
-        "model.layers.{l}.self_attn.k_proj.weight",
-        "model.layers.{l}.self_attn.v_proj.weight",
-    ], "layers.{l}.qkv"),
+    ("model.layers.{l}.self_attn.q_proj.weight", "layers.{l}.q"),
+    ("model.layers.{l}.self_attn.k_proj.weight", "layers.{l}.k"),
+    ("model.layers.{l}.self_attn.v_proj.weight", "layers.{l}.v"),
     ("model.layers.{l}.self_attn.o_proj.weight", "layers.{l}.o"),
     ("model.layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
-    (["model.layers.{l}.mlp.gate_proj.weight", "model.layers.{l}.mlp.up_proj.weight"], "layers.{l}.gate_up"),
+    ("model.layers.{l}.mlp.gate_proj.weight", "layers.{l}.gate"),
+    ("model.layers.{l}.mlp.up_proj.weight", "layers.{l}.up"),
     ("model.layers.{l}.mlp.down_proj.weight", "layers.{l}.down"),
 ]
 
@@ -203,10 +210,8 @@ def forward(m, inputs):
         o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
         y = ops.elemwise.residual_add(o, y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
-        f = ops.linear.matmul(
-            ops.linear.glu(ops.linear.matmul(x, w.gate_up), gating.swiglu(), m.inter),
-            w.down,
-        )
+        gate, up = ops.linear.matmul(x, w.gate), ops.linear.matmul(x, w.up)
+        f = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), w.down)
         return ops.elemwise.residual_add(f, y)
 
     y = inputs.fold_layers(m.layers, y, block)
@@ -217,7 +222,7 @@ def forward(m, inputs):
 def attention(x, inputs, m, positions, scaling, w):
     pages = inputs.kv(w.kv)
     d = m.head_dim
-    q, k, v = ops.gather.split_qkv(ops.linear.matmul(x, w.qkv), m.q_width, m.kv_width)
+    q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
     seam.at(seam.ATTN_QV, [q, v])
     q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.full(), k = k, scaling = scaling)
     ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))

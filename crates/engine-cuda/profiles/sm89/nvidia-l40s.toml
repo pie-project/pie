@@ -42,8 +42,6 @@ measured = [
   "fuse.matmul_softcap",
   "fuse.norm_modulate",
   "fuse.qkv_fused_qknorm_rope_vnorm_write",
-  "fuse.residual_add_rmsnorm",
-  "fuse.rmsnorm_residual_add",
   "fuse.norm_rope",
   "compiler.cond_fixed_us",
   "compiler.cond_per_arm_us",

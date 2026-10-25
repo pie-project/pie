@@ -22,6 +22,10 @@ impl Run<'_> {
             Collective::ReduceScatter { x, y } => {
                 collective::reduce_scatter(self.ctx(), self.tensor(*x), self.tensor(*y))
             }
+            Collective::Dispatch { .. } => {
+                Err(kernels_metal::Error::Unsupported { op: "dispatch" })
+            }
+            Collective::Combine { .. } => Err(kernels_metal::Error::Unsupported { op: "combine" }),
         }
     }
 }

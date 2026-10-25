@@ -75,6 +75,58 @@ fn swiglu_case(rows: u32, inter: u32, seed: u32) {
     assert_close(&b.read_f32(y), &want, 2e-2, 2e-2);
 }
 
+/// Legs the pack left apart: a gate and an up plane land what the
+/// `[gate | up]` rows of the same values land, bit for bit, narrow and
+/// spread over PEs.
+#[test]
+fn a_gate_and_an_up_apart_land_what_they_land_packed() {
+    swiglu_split_case(3, 14, 17);
+    swiglu_split_case(2, 6144, 19);
+}
+
+fn swiglu_split_case(rows: u32, inter: u32, seed: u32) {
+    let n = (rows * inter) as usize;
+    let scaled = |seed| -> Vec<f32> {
+        data(n, seed)
+            .iter()
+            .map(|v| v * 3.0)
+            .map(round_bf16)
+            .collect()
+    };
+    let (gs, us) = (scaled(seed), scaled(seed + 1));
+    let i = inter as usize;
+    let ps: Vec<f32> = gs
+        .chunks(i)
+        .zip(us.chunks(i))
+        .flat_map(|(g, u)| g.iter().chain(u).copied().collect::<Vec<_>>())
+        .collect();
+    let mut b = Bench::new();
+    let gate = b.bf16(rows, inter, &gs);
+    let up = b.bf16(rows, inter, &us);
+    let packed = b.bf16(rows, 2 * inter, &ps);
+    let apart = b.zeros(dtype::Dtype::Bf16, rows, inter);
+    let joined = b.zeros(dtype::Dtype::Bf16, rows, inter);
+    let ran = b
+        .run(|ctx| {
+            mlp::swiglu_split(ctx, gate, up, apart)?;
+            mlp::swiglu(ctx, packed, inter, joined)
+        })
+        .unwrap();
+    if !ran {
+        return;
+    }
+    let (a, j) = (b.read_f32(apart), b.read_f32(joined));
+    let off = a
+        .iter()
+        .zip(&j)
+        .filter(|(a, j)| a.to_bits() != j.to_bits())
+        .count();
+    assert_eq!(
+        off, 0,
+        "{rows} x {inter}: {off} values differ apart and joined"
+    );
+}
+
 /// Activations past a PE (8 x 1536) spread over a grid of PEs by depth
 /// (and weight rows by column group), the host adding the partial outputs.
 #[test]

@@ -69,6 +69,9 @@ impl Run<'_> {
 
     pub(super) fn fused_elemwise(&self, op: &Fused) -> Result<(), kernels_cuda::Error> {
         match op {
+            // CUDA runs the residual norms as generated regions; ROCm forms
+            // their fused ops.
+            #[cfg(feature = "rocm")]
             Fused::ResidualAddRmsnorm {
                 x,
                 y,
@@ -86,6 +89,7 @@ impl Run<'_> {
                 *eps,
                 &mut self.tensor(*out),
             ),
+            #[cfg(feature = "rocm")]
             Fused::RmsnormResidualAdd {
                 x,
                 weight,
@@ -98,20 +102,6 @@ impl Run<'_> {
             } => {
                 let mut scaled = scale.map(|scale| self.tensor(scale.out));
                 let mut out = post.as_ref().map(|post| self.tensor(post.out));
-                // Under `kernel.elemwise.skip_unread` a row nothing reads past
-                // the chain goes unwritten: the normed row folded straight into
-                // the stream, and the stream itself where only its rescaled
-                // copy and the next norm go on.
-                #[cfg(feature = "cuda")]
-                let keep = if self.ctx().tuning().skip_unread {
-                    elemwise::norm_residual::Keep {
-                        t: !self.is_unread(*t),
-                        y: !self.is_unread(*y_out),
-                    }
-                } else {
-                    elemwise::norm_residual::Keep::ALL
-                };
-                #[cfg(not(feature = "cuda"))]
                 let _ = y_out;
                 let mut t = self.tensor(*t);
                 let mut y = self.tensor(*y);
@@ -129,8 +119,7 @@ impl Run<'_> {
                     _ => None,
                 };
                 let (x, weight) = (self.tensor(*x), self.tensor(*weight));
-                #[cfg(feature = "cuda")]
-                let landed = elemwise::norm_residual::rmsnorm_residual_add_keeping(
+                elemwise::norm_residual::rmsnorm_residual_add(
                     self.ctx(),
                     x,
                     weight,
@@ -139,20 +128,7 @@ impl Run<'_> {
                     &mut y,
                     scale,
                     post,
-                    keep,
-                );
-                #[cfg(not(feature = "cuda"))]
-                let landed = elemwise::norm_residual::rmsnorm_residual_add(
-                    self.ctx(),
-                    x,
-                    weight,
-                    *eps,
-                    &mut t,
-                    &mut y,
-                    scale,
-                    post,
-                );
-                landed
+                )
             }
             Fused::EmbedScaleAdd {
                 ids,
@@ -496,6 +472,33 @@ impl Run<'_> {
                 *eps,
                 &mut self.tensor(*y),
             ),
+            Elemwise::SumSquares { x, ss } => {
+                elemwise::norm::sum_squares(self.ctx(), self.tensor(*x), &mut self.tensor(*ss))
+            }
+            Elemwise::RmsnormBy {
+                x,
+                ss,
+                weight,
+                width,
+                eps,
+                y,
+            } => {
+                let (weight, plus_one) = match weight {
+                    NormWeight::None => (None, false),
+                    NormWeight::Scale(w) => (Some(self.tensor(*w)), false),
+                    NormWeight::PlusOne(w) => (Some(self.tensor(*w)), true),
+                };
+                elemwise::norm::rmsnorm_by(
+                    self.ctx(),
+                    self.tensor(*x),
+                    self.tensor(*ss),
+                    weight,
+                    plus_one,
+                    *width,
+                    *eps,
+                    &mut self.tensor(*y),
+                )
+            }
             Elemwise::NormGate {
                 x,
                 scale,
@@ -513,7 +516,7 @@ impl Run<'_> {
                 gate.map(|g| self.tensor(g)),
                 *eps,
                 *temperature,
-                self.plane_fan(self.tensor(*y).rows),
+                self.plane_fan(*y),
                 next.map(|n| elemwise::norm::Next {
                     weight: self.tensor(n.weight),
                     eps: n.eps,
@@ -936,7 +939,7 @@ impl Run<'_> {
                 heads: None,
                 x_out: _,
             } => {
-                let fan = self.plane_fan(self.tensor(*x).rows);
+                let fan = self.plane_fan(*x);
                 elemwise::gate::sigmoid_mul(
                     self.ctx(),
                     self.tensor(*gate),

@@ -5,6 +5,7 @@ pub mod diag;
 mod enqueue;
 mod lanes;
 mod load;
+pub use load::Staged;
 mod prepare;
 mod segments;
 mod settle;
@@ -33,7 +34,7 @@ use crate::exports::Exports;
 use crate::inputs::Inputs;
 use crate::program::{Fired, Plane as ProgramPlane, Session as ProgramSession};
 use crate::record::{self, Bodies as GraphCache};
-use crate::run::RsMove;
+use crate::run::{RsMove, WeightRow};
 use crate::store::Pools;
 use crate::store::kv::{self, Seat};
 use crate::store::rs::Buffers;
@@ -53,6 +54,14 @@ pub struct Shell {
     accounting: crate::store::Accounting,
     trace: Trace,
     compiled: CompiledModel,
+    /// The generated kernels the trace's `fused.region`s fire.
+    regions: crate::synth::Regions,
+    /// This rank's part of an expert-parallel group, once the group wires
+    /// it after every rank has loaded.
+    ep: Option<crate::ep::EpRank>,
+    /// The token bucket the next fire composes at, where its group agreed
+    /// one: taken by that fire.
+    forced_bucket: Option<u32>,
     budget: Budget,
     patch_seat: Option<crate::inputs::PatchSeat>,
     mrope_seat: bool,
@@ -66,7 +75,6 @@ pub struct Shell {
     arena: Arena,
     pools: Pools,
     buffers: Option<Buffers>,
-    rs_scratch: Option<crate::device::Buffer>,
     predicate: crate::store::rs::Predicate,
     inputs: Inputs,
     facts: kv::Facts,
@@ -85,8 +93,6 @@ pub struct Shell {
     /// prefill's width.
     staging: Vec<bool>,
     schedule_readers: Vec<Option<u32>>,
-    /// Each value nothing reads ([`crate::exports::unread`]).
-    unread: Vec<bool>,
     adapter_fact: Option<u32>,
     adapters: crate::blob::Adapters,
     held: Vec<u32>,
@@ -127,6 +133,23 @@ pub struct Shell {
     /// Where a device-counted fold left each recurrent slot, ahead of the
     /// runtime's settled length until that fold settles.
     rs_ahead: std::collections::HashMap<u32, u32>,
+    /// Last, so it drops after everything else the shell holds.
+    _released: Released,
+}
+
+/// Gives the driver back, once a shell is down, what its dropped buffers
+/// left kept for reuse ([`crate::device::held::release_idle`]): nothing of
+/// the shell will ask for them again, and another process on the card, or a
+/// model loaded next, should find the room free. A shell drops outside any
+/// fire, its device synchronized; a poisoned expert-parallel group, whose
+/// peers may still spin, forgets its ranks rather than dropping them.
+#[derive(Debug, Default)]
+struct Released;
+
+impl Drop for Released {
+    fn drop(&mut self) {
+        crate::device::held::release_idle();
+    }
 }
 
 #[derive(Debug)]
@@ -142,6 +165,171 @@ pub(crate) struct KvReport {
 }
 
 impl Shell {
+    /// Joins an expert-parallel group as `ep`, its dispatch and combine
+    /// outputs seated on the rank's fixed buffers; refuses a trace that
+    /// reads one after its peers may write it again.
+    pub fn join_ep(&mut self, mut ep: crate::ep::EpRank) -> std::result::Result<(), String> {
+        ep.seat(
+            &self.trace,
+            &self.compiled.arena,
+            self.compiled.arena_forked.as_ref(),
+        )?;
+        ep.hold_banks(self.routed_banks());
+        self.ep = Some(ep);
+        Ok(())
+    }
+
+    /// Each routed bank's planes by layer, in the trace's order: slot-major
+    /// runs a rebalance copies whole, or why a layer's cannot move.
+    fn routed_banks(&self) -> crate::ep::Banks {
+        let table = self.weights.table();
+        let mut banks = crate::ep::Banks::new();
+        for (at, param) in self.trace.params.iter().enumerate() {
+            let Some(held) = param.experts else {
+                continue;
+            };
+            let planes = match table.0.get(at).copied().flatten() {
+                _ if table.1.contains_key(&at) || table.2.contains_key(&at) => {
+                    Err(format!("`{}` is requantized at load", param.name))
+                }
+                Some(WeightRow::Dense(t)) => Ok(vec![t]),
+                Some(WeightRow::Planes {
+                    codes,
+                    scales,
+                    biases,
+                    repacked: false,
+                    atoms: false,
+                    lanes: false,
+                    ..
+                }) => Ok([Some(codes), Some(scales), biases]
+                    .into_iter()
+                    .flatten()
+                    .collect()),
+                Some(WeightRow::Planes { .. } | WeightRow::Ordered(_)) => Err(format!(
+                    "`{}` is laid out for its product, not slot by slot",
+                    param.name
+                )),
+                Some(WeightRow::Streamed { .. }) => {
+                    Err(format!("`{}` streams through the expert tier", param.name))
+                }
+                None => Err(format!("`{}` is not bound", param.name)),
+            }
+            .and_then(|tensors| {
+                tensors
+                    .into_iter()
+                    .map(|t| {
+                        let bits = t.elements() * t.dtype.bits();
+                        let slots = u64::from(held.slots);
+                        if bits % (8 * slots) != 0 {
+                            return Err(format!("`{}` does not split into its slots", param.name));
+                        }
+                        Ok(crate::ep::Plane {
+                            ptr: t.ptr,
+                            slot_bytes: bits / 8 / slots,
+                        })
+                    })
+                    .collect::<std::result::Result<Vec<_>, _>>()
+            });
+            let layer = banks.entry(held.layer).or_insert_with(|| Ok(Vec::new()));
+            match (layer, planes) {
+                (Ok(all), Ok(mine)) => all.extend(mine),
+                (layer @ Ok(_), Err(why)) => *layer = Err(why),
+                (Err(_), _) => {}
+            }
+        }
+        banks
+    }
+
+    /// This rank's expert-parallel state and its compute stream, for the
+    /// group's rebalance.
+    pub fn rebalance_view(&mut self) -> Option<(&mut crate::ep::EpRank, *mut core::ffi::c_void)> {
+        let stream = self.device.stream();
+        self.ep.as_mut().map(|ep| (ep, stream))
+    }
+
+    /// Waits for everything this shell has enqueued.
+    pub fn quiesce(&self) -> Result<()> {
+        self.device.synchronize()
+    }
+
+    /// The token bucket a fire of `rows` rows composes at, or `None` past
+    /// the widest.
+    #[must_use]
+    pub fn bucket_for(&self, rows: u32) -> Option<u32> {
+        let top = self.budget.buckets.last().copied()?;
+        (rows <= top).then(|| poem_exec::fire::rung_of(&self.budget.buckets, rows))
+    }
+
+    /// The next fire composes at token bucket `bucket`, the one its
+    /// expert-parallel group agreed for the step.
+    pub fn at_bucket(&mut self, bucket: u32) {
+        self.forced_bucket = Some(bucket);
+    }
+
+    /// An expert-parallel rank's step with no lanes of its own, at the
+    /// group's `bucket`: the walk runs only the dispatches, the experts over
+    /// the rows the other ranks send, and the combines.
+    pub fn fire_idle(&mut self, bucket: u32) -> Result<()> {
+        self.at_bucket(bucket);
+        diag::guarded(|| {
+            let prepared = FrameShell::prepare(
+                self,
+                StepView {
+                    lanes: &[],
+                    attachments: &[],
+                    media: &[],
+                    voxels: &[],
+                },
+                None,
+            )?;
+            let enqueued = FrameShell::enqueue(self, prepared)?;
+            FrameShell::settle(self, enqueued)?;
+            Ok(())
+        })
+    }
+
+    /// What the trace dispatches, for wiring the group.
+    #[must_use]
+    pub fn ep_shape(&self) -> Option<crate::ep::Shape> {
+        use poem_ir::{Collective, Operation, Ty};
+        let width_bytes = |v: poem_ir::ValueId| match &self.trace.values[v.0 as usize].ty {
+            Ty::Tensor { shape, dtype } => shape.last().and_then(|d| match d {
+                poem_ir::Dim::Const(n) => Some(*n * dtype.bytes_ceil()),
+                _ => None,
+            }),
+            _ => None,
+        };
+        let mut layers = Vec::new();
+        let mut widest = crate::ep::Widest {
+            tokens: self.budget.max_tokens,
+            row_bytes: 0,
+            out_bytes: 0,
+            top_k: 0,
+        };
+        for node in &self.trace.nodes {
+            match &node.op {
+                Operation::Collective(Collective::Dispatch {
+                    x,
+                    experts,
+                    slots,
+                    top_k,
+                    layer,
+                    ..
+                }) => {
+                    layers.push((*layer, *experts, *slots));
+                    widest.row_bytes = widest.row_bytes.max(width_bytes(*x)?);
+                    widest.top_k = widest.top_k.max(*top_k);
+                }
+                Operation::Collective(Collective::Combine { y, top_k, .. }) => {
+                    widest.out_bytes = widest.out_bytes.max(width_bytes(*y)?);
+                    widest.top_k = widest.top_k.max(*top_k);
+                }
+                _ => {}
+            }
+        }
+        (!layers.is_empty()).then_some(crate::ep::Shape { layers, widest })
+    }
+
     /// Whether a lane may ask this load for a tap: it reads its layers out
     /// as they go, and someone is told what it read.
     #[must_use]
@@ -466,7 +654,7 @@ impl Shell {
     }
 
     pub fn state_bytes(&mut self, slot: u32) -> Result<Vec<u8>> {
-        self.pools.state_bytes(slot)
+        self.pools.state_bytes(self.device.stream(), slot)
     }
 
     /// Whether this load lands recurrent-state snapshots inside a fire.
@@ -476,11 +664,12 @@ impl Shell {
     }
 
     pub fn fold_predicate(&self, lanes: u32) -> Result<Vec<u8>> {
-        self.predicate.read_mask(lanes)
+        self.predicate.read_mask(self.device.stream(), lanes)
     }
 
     pub fn register_adapter(&mut self, id: u32, planes: &[AdapterPlane<'_>]) -> Result<()> {
-        self.weights.register_adapter(id, planes)
+        self.weights
+            .register_adapter(self.device.stream(), id, planes)
     }
 
     pub fn mount_adapters(&mut self, root: Option<std::path::PathBuf>) {
@@ -493,8 +682,9 @@ impl Shell {
     ) -> Result<crate::blob::Binding> {
         let seats = self.weights.seats();
         let weights = &mut self.weights;
+        let stream = self.device.stream();
         self.adapters.bind(source, &seats, |slot, planes| {
-            weights.register_adapter(slot, planes)
+            weights.register_adapter(stream, slot, planes)
         })
     }
 
@@ -534,7 +724,9 @@ impl Shell {
     }
 
     pub fn open(&mut self, slot: u32) -> Result<()> {
-        self.pools.clear(slot)?;
+        // On the compute stream: behind any fire still airborne that held
+        // the slot, ahead of every fire that reads it fresh.
+        self.pools.clear_on(self.device.stream(), slot)?;
         let seats = self.held.len() as u64;
         let held = self.held.get_mut(slot as usize).ok_or(Fault::Ceiling {
             what: "slots",
@@ -775,6 +967,12 @@ impl Shell {
     #[must_use]
     pub fn armed(&self) -> Option<&Armed> {
         self.armed.as_ref()
+    }
+
+    /// The generated kernels this load fires (`compiler.synth_regions`).
+    #[must_use]
+    pub fn regions(&self) -> &crate::synth::Regions {
+        &self.regions
     }
 
     /// The decoded-weight tile each stream was warmed with, main stream

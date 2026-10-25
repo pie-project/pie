@@ -48,7 +48,12 @@ impl Arena {
         carve(self.base(), map, rows)
     }
 
-    pub fn read(&self, at: u64, into: &mut [u8]) -> Result<()> {
+    /// Reads `into.len()` bytes at `at` on `stream` (the shell's own), and
+    /// waits for it. Not on the legacy stream: that waits on every blocking
+    /// stream of the context, a peer rank's on the same device too, and a
+    /// peer spinning in its next step's collective waits on this rank's
+    /// launch, which queues behind the legacy copy.
+    pub fn read(&self, stream: *mut core::ffi::c_void, at: u64, into: &mut [u8]) -> Result<()> {
         let base = self.base();
         let offset = at.checked_sub(base).ok_or(Fault::Ceiling {
             what: "bytes into the arena",
@@ -65,22 +70,25 @@ impl Arena {
         #[cfg(feature = "device")]
         {
             use crate::device::rt;
-            // SAFETY: `at..at + len` lies inside the committed prefix.
+            // SAFETY: `at..at + len` lies inside the committed prefix, and
+            // `stream` is the caller's live stream of this device.
             unsafe {
                 crate::device::ctx::check(
-                    "cudaMemcpy",
-                    rt::cudaMemcpy(
+                    "cudaMemcpyAsync",
+                    rt::cudaMemcpyAsync(
                         into.as_mut_ptr().cast(),
                         at as *const core::ffi::c_void,
                         into.len(),
                         rt::cudaMemcpyKind::cudaMemcpyDeviceToHost,
+                        stream.cast(),
                     ),
-                )
+                )?;
             }
+            crate::device::ctx::sync(stream)
         }
         #[cfg(not(feature = "device"))]
         {
-            let _ = into;
+            let _ = (stream, into);
             Err(Fault::Runtimeless)
         }
     }

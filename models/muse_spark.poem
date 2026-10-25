@@ -7,6 +7,12 @@ load("//pie/codec.poem", "stacked_bank")
 load("//lib/adapters.poem", "banks")
 
 ATEM = template("atem")
+
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: the packed q, k, v and output gate by their heads, each expert's
+# gate and up by its channels, the output and down projections by their
+# rows. The head it holds whole, as the package always has.
+CUTS = "inferred"
 TOKENIZER = tokenizer(markers = [["<|eot|>", "<|end_of_text|>"], ["<|begin_of_text|>", "<|start|>", "<|message|>", "<|eom|>"]])
 
 MODELS = [
@@ -96,8 +102,8 @@ def layout(id, deploy):
         return struct(
             full = full(l),
             # q, k, v and the output gate, one projection of the normed row.
-            qkvg = weight([2 * q_w + 2 * kv_w, hidden], w).packed([q_w, kv_w, kv_w, q_w], heads = [d.q_heads, d.kv_heads, d.kv_heads, d.q_heads]),
-            o_proj = weight([hidden, q_w], w).rows(),
+            qkvg = weight([2 * q_w + 2 * kv_w, hidden], w),
+            o_proj = weight([hidden, q_w], w),
             kv = "kv.{}".format(l),
             attn_norm = norm("attn_norm", hidden),
             attn_gate = weight([hidden], dtype.f32),
@@ -109,8 +115,8 @@ def layout(id, deploy):
             router_bias = weight([d.experts], dtype.f32),
             pool = weight([pooled, hidden], w),
             pool_norm = norm("pool_norm", pooled),
-            gate_up = weight([d.experts, 2 * iw, pooled], bank).bank([iw, iw]),
-            down = weight([d.experts, pooled, iw], bank).rows(),
+            gate_up = weight([d.experts, 2 * iw, pooled], bank),
+            down = weight([d.experts, pooled, iw], bank),
             expert_scale = norm("expert_scale", pooled),
             unpool = weight([hidden, pooled], w),
             lora_a = lora_a,
@@ -136,7 +142,7 @@ def layout(id, deploy):
         top_k = d.top_k,
         inter = iw,
         embed = weight([d.vocab, hidden], w),
-        lm_head = weight([d.vocab, hidden], w),
+        lm_head = weight([d.vocab, hidden], w).replicated(),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
         final_norm_eps = d.norm_eps,

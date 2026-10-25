@@ -6,6 +6,14 @@ load("//lib/spoken.poem", "QWEN_STOP")
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP])
 
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: the transformer's q, k and v and its gate and up by their heads
+# and channels. Their output and down projections it holds whole, as the
+# package always has, so each rank's share is gathered for them; the
+# timestep embedder; and the text encoder's attention and down projection,
+# so its gate and up are gathered for the down.
+CUTS = "inferred"
+
 MODELS = [
     model("z-image-turbo", template = CHATML, tokenizer = TOKENIZER, arch = "z_image", layers = 35, vocab = 151936, taps = True),
     model("z-image-mini", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "z_image", layers = 6, vocab = 0, taps = True),
@@ -22,10 +30,12 @@ DEPLOYMENTS = [
 # a Qwen3 4B text encoder and a Flux VAE. A deployment's tap (`-tap.{key}`)
 # names an intermediate the denoiser reads out instead of its velocity.
 
-def linear(out, in_, banks, bias = True):
-    """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
+def linear(out, in_, banks, bias = True, whole = False):
+    """A projection from `in_` to `out` and, unless `bias` is off, its bias;
+    held whole on every rank if `whole`."""
+    w = weight([out, in_], banks)
     return struct(
-        w = weight([out, in_], banks),
+        w = w.replicated() if whole else w,
         bias = weight([out]) if bias else None,
     )
 
@@ -39,7 +49,7 @@ TAPS3 = 9
 
 def conv_weights(c_out, c_in, taps):
     return struct(
-        w = weight([c_out, c_in * taps], dtype.bf16).conv_taps_major(c_in, taps),
+        w = weight([c_out, c_in * taps], dtype.bf16),
         bias = weight([c_out], dtype.f32),
         c_in = c_in,
         c_out = c_out,
@@ -140,26 +150,22 @@ def encoder(c, layers, banks, sharded = False):
     `sharded`, its attention and mlp split across ranks."""
     hidden, hd, inter = c.hidden, c.head_dim, c.inter
 
-    def columns(w, heads = None):
-        if not sharded:
-            return w
-        return w.columns() if heads == None else w.columns(heads = heads)
-
-    def rows(w):
-        return w.rows() if sharded else w
+    def whole(w):
+        return w if sharded else w.replicated()
 
     def layer(l):
         return struct(
             attn_norm = weight([hidden]),
-            q = columns(weight([c.q_heads * hd, hidden], banks)),
-            k = columns(weight([c.kv_heads * hd, hidden], banks), c.kv_heads),
-            v = columns(weight([c.kv_heads * hd, hidden], banks), c.kv_heads),
-            o = rows(weight([hidden, c.q_heads * hd], banks)),
+            q = whole(weight([c.q_heads * hd, hidden], banks)),
+            k = whole(weight([c.kv_heads * hd, hidden], banks)),
+            v = whole(weight([c.kv_heads * hd, hidden], banks)),
+            o = whole(weight([hidden, c.q_heads * hd], banks)),
             q_norm = weight([hd]),
             k_norm = weight([hd]),
             mlp_norm = weight([hidden]),
-            gate_up = weight([2 * inter, hidden], banks).packed([inter, inter]),
-            down = rows(weight([hidden, inter], banks)),
+            gate = weight([inter, hidden], banks),
+            up = weight([inter, hidden], banks),
+            down = whole(weight([hidden, inter], banks)),
             kv = "te.kv.{}".format(l),
         )
 
@@ -226,14 +232,17 @@ def block(d, modulated, banks):
         ffn_norm1 = norm("ffn_norm1", dim),
         ffn_norm2 = norm("ffn_norm2", dim),
         attn = struct(
-            qkv = weight([3 * dim, dim], banks).packed([dim, dim, dim]),
+            q = weight([dim, dim], banks),
+            k = weight([dim, dim], banks),
+            v = weight([dim, dim], banks),
             q_norm = norm("q_norm", hd),
             k_norm = norm("k_norm", hd),
-            out = weight([dim, dim], banks),
+            out = weight([dim, dim], banks).replicated(),
         ),
         mlp = struct(
-            gate_up = weight([2 * inter, dim], banks).packed([inter, inter]),
-            down = weight([dim, inter], banks),
+            gate = weight([inter, dim], banks),
+            up = weight([inter, dim], banks),
+            down = weight([dim, inter], banks).replicated(),
         ),
     )
 
@@ -269,8 +278,8 @@ def layout(id, deploy):
             cap_norm = weight([d.cap_width]),
             cap_embed = linear(dim, d.cap_width, banks),
             cap_pad_mod = weight([2 * dim, 1]),
-            t_mlp0 = linear(T_MID, T_FREQ_DIM, banks),
-            t_mlp1 = linear(ADALN_DIM, T_MID, banks),
+            t_mlp0 = linear(T_MID, T_FREQ_DIM, banks, whole = True),
+            t_mlp1 = linear(ADALN_DIM, T_MID, banks, whole = True),
             t_flip = weight([1], dtype.f32, values = [T_FLIP]),
             noise_refiner = blocks("noise", d.refiner_layers, True),
             context_refiner = blocks("context", d.refiner_layers, False),
@@ -488,7 +497,8 @@ def te_read(reads, te, prefix):
         reads.read(w.q_norm, n("self_attn.q_norm.weight"))
         reads.read(w.k_norm, n("self_attn.k_norm.weight"))
         reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
-        reads.read_concat(w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+        reads.read(w.gate, n("mlp.gate_proj.weight"))
+        reads.read(w.up, n("mlp.up_proj.weight"))
         reads.read(w.down, n("mlp.down_proj.weight"))
 
 def product(xs):
@@ -559,15 +569,14 @@ def transformer_block(reads, b, stem):
     reads.read(b.attn_norm2, n("attention_norm2.weight"))
     reads.read(b.ffn_norm1, n("ffn_norm1.weight"))
     reads.read(b.ffn_norm2, n("ffn_norm2.weight"))
-    reads.read_concat(b.attn.qkv, [
-        n("attention.to_q.weight"),
-        n("attention.to_k.weight"),
-        n("attention.to_v.weight"),
-    ])
+    reads.read(b.attn.q, n("attention.to_q.weight"))
+    reads.read(b.attn.k, n("attention.to_k.weight"))
+    reads.read(b.attn.v, n("attention.to_v.weight"))
     reads.read(b.attn.q_norm, n("attention.norm_q.weight"))
     reads.read(b.attn.k_norm, n("attention.norm_k.weight"))
     reads.read(b.attn.out, n("attention.to_out.0.weight"))
-    reads.read_concat(b.mlp.gate_up, [n("feed_forward.w1.weight"), n("feed_forward.w3.weight")])
+    reads.read(b.mlp.gate, n("feed_forward.w1.weight"))
+    reads.read(b.mlp.up, n("feed_forward.w3.weight"))
     reads.read(b.mlp.down, n("feed_forward.w2.weight"))
 
 # The forward of Z-Image: the text encoder's last hidden rows, the context
@@ -700,10 +709,8 @@ def qwen3_encode(arm, te, tap = None):
         y = ops.elemwise.residual_add(ops.linear.matmul(o, w.o), y)
 
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, te.eps)
-        f = ops.linear.matmul(
-            ops.linear.glu(ops.linear.matmul(x, w.gate_up), gating.swiglu(), te.inter),
-            w.down,
-        )
+        gate, up = ops.linear.matmul(x, w.gate), ops.linear.matmul(x, w.up)
+        f = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), w.down)
         y = ops.elemwise.residual_add(f, y)
         if tap != None:
             tap(l, y)
@@ -887,7 +894,7 @@ def run_block(x, b, mods, m, g, tap):
     h = ops.elemwise.rmsnorm(x, b.attn_norm1, NORM_EPS)
     if mods != None:
         h = ops.elemwise.modulate(h, mods[0].scale_msa, mods[1], "scale")
-    q, k, v = ops.gather.split_qkv(ops.linear.matmul(h, b.attn.qkv), dim, dim)
+    q, k, v = ops.linear.matmul(h, b.attn.q), ops.linear.matmul(h, b.attn.k), ops.linear.matmul(h, b.attn.v)
 
     def turn(x, gain):
         return ops.elemwise.rope_axes(
@@ -920,10 +927,8 @@ def run_block(x, b, mods, m, g, tap):
     h = ops.elemwise.rmsnorm(x, b.ffn_norm1, NORM_EPS)
     if mods != None:
         h = ops.elemwise.modulate(h, mods[0].scale_mlp, mods[1], "scale")
-    f = ops.linear.matmul(
-        ops.linear.glu(ops.linear.matmul(h, b.mlp.gate_up), gating.swiglu(), d.inter),
-        b.mlp.down,
-    )
+    gate, up = ops.linear.matmul(h, b.mlp.gate), ops.linear.matmul(h, b.mlp.up)
+    f = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), b.mlp.down)
     at("b0.ffn", f)
     f = ops.elemwise.rmsnorm(f, b.ffn_norm2, NORM_EPS)
     at("b0.ffn_norm2", f)

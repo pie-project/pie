@@ -8,13 +8,16 @@
 //!
 //! Supported: `messages` (system/user/assistant/tool, text parts), `tools`
 //! and `tool_choice` (`none`/`auto`/`required`/named), `response_format`
-//! (`text`/`json_object`/`json_schema`), `stream` and
+//! (`text`/`json_object`/`json_schema`, and vLLM's and SGLang's
+//! `structural_tag`: see [`crate::response_format`]), `stream` and
 //! `stream_options.include_usage`, `temperature`, `top_p`, `top_k`,
 //! `max_tokens`/`max_completion_tokens`, `ignore_eos`, `stop`, `seed`,
 //! `presence_penalty`, `frequency_penalty`, `repetition_penalty`, vLLM's
 //! `min_tokens` and `min_p`, `n` (each choice its own generation, flown
 //! together), `logprobs` and `top_logprobs` (up to 20, of the raw logits,
 //! every sampled token's as vLLM reports them, the stop token's among them),
+//! vLLM's `prompt_logprobs` (an integer, unstreamed, text prompts: every
+//! rendered prompt token scored, in the response's `prompt_logprobs`),
 //! `reasoning_effort` (`none` switches thinking off; `low`, `medium` and
 //! `high`/`xhigh` set the effort a template states, Qwen3.8's) and
 //! `chat_template_kwargs.enable_thinking` to switch thinking off or on, and
@@ -25,8 +28,8 @@
 //! unknown field is ignored, as OpenAI does.
 
 use compat::{
-    ApiError, Effort, Envelope, Event, Finish, Message, Request, ResponseFormat, Role, Thinking,
-    ToolCall, ToolChoice, emit,
+    ApiError, Effort, Envelope, Event, Finish, Message, Request, Role, Thinking, ToolCall,
+    ToolChoice, emit,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -55,6 +58,7 @@ struct Body {
     n: Option<u32>,
     logprobs: Option<bool>,
     top_logprobs: Option<u32>,
+    prompt_logprobs: Option<i64>,
     min_p: Option<f32>,
     presence_penalty: Option<f32>,
     frequency_penalty: Option<f32>,
@@ -256,36 +260,14 @@ fn parse(body: Value) -> Result<(Request, bool, u32), ApiError> {
             Some("tool_choice"),
         ));
     }
-    req.response_format = match body.response_format {
-        None => ResponseFormat::Text,
-        Some(v) => match v.get("type").and_then(Value::as_str) {
-            None | Some("text") => ResponseFormat::Text,
-            Some("json_object") => ResponseFormat::JsonObject,
-            Some("json_schema") => {
-                let schema = v
-                    .get("json_schema")
-                    .and_then(|s| s.get("schema"))
-                    .ok_or_else(|| {
-                        invalid(
-                            "response_format json_schema needs `json_schema.schema`",
-                            Some("response_format"),
-                        )
-                    })?;
-                ResponseFormat::JsonSchema(schema.to_string())
-            }
-            Some(other) => {
-                return Err(invalid(
-                    format!("unknown response_format type `{other}`"),
-                    Some("response_format"),
-                ));
-            }
-        },
-    };
+    req.response_format = crate::response_format(body.response_format)?;
     if let Some(t) = body.temperature {
         req.sampling.temperature = t;
     }
     if let Some(enabled) = body.speculative {
         req.sampling.speculative = enabled;
+        // Asked for outright, it holds above temperature zero too.
+        req.sampling.speculative_sampled = enabled;
     }
     if let Some(p) = body.top_p {
         req.sampling.top_p = p;
@@ -306,6 +288,13 @@ fn parse(body: Value) -> Result<(Request, bool, u32), ApiError> {
         req.sampling.min_p = p;
     }
     req.sampling.logprobs = logprobs;
+    req.sampling.prompt_logprobs = crate::prompt_logprobs(body.prompt_logprobs, body.stream)?;
+    if req.sampling.prompt_logprobs.is_some() && req.messages.iter().any(|m| !m.images.is_empty()) {
+        return Err(invalid(
+            "`prompt_logprobs` scores text prompts; this one carries images",
+            Some("prompt_logprobs"),
+        ));
+    }
     if let Some(seed) = body.seed {
         req.sampling.set_seed(seed);
     }
@@ -422,6 +411,7 @@ async fn choice(req: Request, ids: &Ids) -> Result<compat::Outcome, String> {
                 pending.extend(steps.iter().map(|(t, lp)| chat_logprob(*t, lp)));
                 return;
             }
+            Event::PromptLogprobs(_) => return,
             Event::Reasoning(text) => delta(json!({"reasoning_content": text})),
             Event::ReasoningEnd => return,
             Event::Text(text) => delta(json!({"content": text})),
@@ -456,6 +446,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
     };
     let stream = req.stream;
     let asked = req.sampling.logprobs.is_some();
+    let prompt_top = req.sampling.prompt_logprobs;
 
     let outcomes = run_choices(&req, n, |req| choice(req, &ids)).await?;
     let total = usage_of(&outcomes);
@@ -475,6 +466,7 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
         return Ok(String::new());
     }
 
+    let prompt_scored = outcomes.first().map(|o| o.prompt_logprobs.clone());
     let choices: Vec<Value> = outcomes
         .into_iter()
         .zip(0u32..)
@@ -510,13 +502,17 @@ pub async fn serve(envelope: Envelope) -> Result<String, String> {
             json!({"index": index, "message": message, "finish_reason": finish_reason(outcome.finish), "logprobs": logprobs})
         })
         .collect();
-    Ok(json!({
+    let mut body = json!({
         "id": ids.id,
         "object": "chat.completion",
         "created": ids.created,
         "model": ids.model,
         "choices": choices,
         "usage": total,
-    })
-    .to_string())
+    });
+    // The first choice scored the prompt, the same for every choice.
+    if let (Some(top), Some(first)) = (prompt_top, prompt_scored) {
+        body["prompt_logprobs"] = crate::vllm_prompt_logprobs(&first, top as usize);
+    }
+    Ok(body.to_string())
 }

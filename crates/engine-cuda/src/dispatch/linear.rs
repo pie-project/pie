@@ -104,6 +104,50 @@ impl Run<'_> {
                     None => Ok(()),
                 }
             }
+            Fused::MoeMega {
+                select,
+                glu,
+                down,
+                sum,
+                gate_add,
+            } => {
+                #[cfg(feature = "cuda")]
+                if self.moe_mega(select, glu, down, sum)? {
+                    return match gate_add {
+                        Some(gate_add) => self.linear(gate_add),
+                        None => Ok(()),
+                    };
+                }
+                // Declined: dense banks under the weights first run their four
+                // legs apart, as no other fusion forms them; any other form is the
+                // grouped experts' (`MoeExperts`, its gate-add the one the chain
+                // carried), whose own fallback runs it apart.
+                if matches!(**select, Linear::MoeSelect { quant: None, .. })
+                    && matches!(
+                        **glu,
+                        Linear::Glu {
+                            weights: Some(_),
+                            ..
+                        }
+                    )
+                {
+                    for leg in [select, glu, down, sum] {
+                        self.linear(leg)?;
+                    }
+                    return match gate_add {
+                        Some(gate_add) => self.linear(gate_add),
+                        None => Ok(()),
+                    };
+                }
+                self.fused_linear(&Fused::MoeExperts {
+                    select: select.clone(),
+                    glu: glu.clone(),
+                    down: down.clone(),
+                    norm: None,
+                    sum: sum.clone(),
+                    gate_add: gate_add.clone(),
+                })
+            }
             Fused::MatmulGlu {
                 act,
                 w,
@@ -259,6 +303,87 @@ impl Run<'_> {
                     self.tensor(*bias),
                     &mut self.tensor(*y),
                 )
+            }
+            Fused::MatmulMoeRoute {
+                act,
+                w,
+                bias,
+                scale,
+                hint,
+                experts,
+                top_k,
+                score,
+                logits,
+                routes,
+                weights,
+            } => {
+                // One launch lands the routes and weights from the product's
+                // sums, the logits never written; where it declines (not a
+                // tcgen05 chip, a router past what it stages), the two run
+                // apart over the logits.
+                if self.tensor(*act).dtype == Dtype::Bf16 && self.dense_weight(*w) {
+                    let gate = match *score {
+                        poem_ir::RouteScore::Softmax => Some(linear::moe::GateScore::Softmax {
+                            gain: scale.map(|s| self.tensor(s)),
+                        }),
+                        poem_ir::RouteScore::Sigmoid {
+                            renormalize,
+                            scaling,
+                        } => Some(linear::moe::GateScore::Sigmoid {
+                            bias: bias.map(|b| self.tensor(b)),
+                            renormalize,
+                            scaling,
+                        }),
+                        poem_ir::RouteScore::SqrtSoftplus {
+                            renormalize,
+                            scaling,
+                        } => bias.map(|b| linear::moe::GateScore::SqrtSoftplus {
+                            bias: self.tensor(b),
+                            renormalize,
+                            scaling,
+                        }),
+                        _ => None,
+                    };
+                    if let Some(score) = gate
+                        && linear::moe::gate(
+                            self.ctx(),
+                            self.tensor(*act),
+                            self.tensor(*w),
+                            linear::moe::Gate {
+                                experts: *experts,
+                                top_k: *top_k,
+                                logits: self.tensor(*logits).dtype,
+                                score,
+                            },
+                            &mut self.tensor(*routes),
+                            &mut self.tensor(*weights),
+                        )?
+                    {
+                        return Ok(());
+                    }
+                }
+                self.linear(&Linear::Matmul {
+                    act: *act,
+                    w: *w,
+                    y: *logits,
+                    input_scales: None,
+                    scales: None,
+                    quant: None,
+                    logits: false,
+                })?;
+                self.linear(&Linear::MoeRoute {
+                    ids: None,
+                    table: None,
+                    logits: *logits,
+                    bias: *bias,
+                    scale: *scale,
+                    hint: *hint,
+                    experts: *experts,
+                    top_k: *top_k,
+                    score: *score,
+                    routes: *routes,
+                    weights: *weights,
+                })
             }
             Fused::MatmulSplitRows {
                 act,
@@ -473,7 +598,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::swiglu(
                     self.ctx(),
                     self.tensor(*packed),
@@ -492,7 +617,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::swiglu_clamp(
                     self.ctx(),
                     self.tensor(*packed),
@@ -512,7 +637,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::swiglu_clamp_alpha(
                     self.ctx(),
                     self.tensor(*packed),
@@ -533,7 +658,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::swiglu_clamp_split_routed(
                     self.ctx(),
                     self.tensor(*gate),
@@ -554,7 +679,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Swiglu,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 // Read back through e4m3 here, for the W4A8 select that
                 // would read it back.
                 #[cfg(feature = "cuda")]
@@ -593,23 +718,47 @@ impl Run<'_> {
                 self.tensor(*shared),
                 &mut self.tensor(*y),
             ),
+            // Legs the pack left apart: an unclamped unit clamps at infinity,
+            // which keeps every finite value.
             Linear::Glu {
                 gate: Some(gate),
                 up: Some(up),
-                limit: Some(limit),
+                limit,
                 y,
                 packed: None,
                 weights: None,
                 act: poem_ir::GluAct::Swiglu,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::swiglu_clamp_split(
                     self.ctx(),
                     self.tensor(*gate),
                     self.tensor(*up),
                     fan,
-                    *limit,
+                    limit.unwrap_or(f32::INFINITY),
+                    &mut self.tensor(*y),
+                )
+            }
+            // MiniMax's unit, its legs apart.
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                limit,
+                y,
+                packed: None,
+                weights: None,
+                act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
+                ..
+            } => {
+                let fan = self.plane_fan(*y);
+                linear::glu::swiglu_clamp_alpha_split(
+                    self.ctx(),
+                    self.tensor(*gate),
+                    self.tensor(*up),
+                    fan,
+                    limit.unwrap_or(f32::INFINITY),
+                    *alpha,
                     &mut self.tensor(*y),
                 )
             }
@@ -623,7 +772,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::GegluTanh,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::geglu_tanh(
                     self.ctx(),
                     self.tensor(*gate),
@@ -633,11 +782,11 @@ impl Run<'_> {
                 )
             }
             Linear::GeluTanh { x, y } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::gelu_tanh(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
             }
             Linear::Relu2 { x, y } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::relu2(self.ctx(), self.tensor(*x), fan, &mut self.tensor(*y))
             }
             Linear::Glu {
@@ -650,7 +799,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::GegluTanh,
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::geglu_tanh_packed(
                     self.ctx(),
                     self.tensor(*packed),
@@ -669,7 +818,7 @@ impl Run<'_> {
                 act: poem_ir::GluAct::Situ { beta, up_cap, .. },
                 ..
             } => {
-                let fan = self.plane_fan(self.tensor(*y).rows);
+                let fan = self.plane_fan(*y);
                 linear::glu::situ(
                     self.ctx(),
                     self.tensor(*packed),
@@ -1575,6 +1724,85 @@ impl Run<'_> {
             gate,
             norm,
         )
+    }
+
+    /// A routed MLP in one mega-MoE launch (`linear::moe::mega`): the route
+    /// weights first where the GLU takes them (the shared row added), else
+    /// the weighted sum. False where the kernel does not take this fire.
+    #[cfg(feature = "cuda")]
+    fn moe_mega(
+        &mut self,
+        select: &Linear,
+        glu: &Linear,
+        down: &Linear,
+        sum: &Linear,
+    ) -> Result<bool, kernels_cuda::Error> {
+        use linear::gemm_sm100::Glu;
+        // Asked before the banks are gathered.
+        let Some(routes) = routes_of(select) else {
+            return Ok(false);
+        };
+        if !linear::moe::mega_takes(self.ctx(), self.tensor(routes)) {
+            return Ok(false);
+        }
+        let Linear::Glu {
+            packed: Some(packed),
+            gate: None,
+            up: None,
+            weights: glu_weights,
+            intermediate,
+            act: poem_ir::GluAct::Swiglu,
+            limit,
+            y: hidden,
+        } = *glu
+        else {
+            return Ok(false);
+        };
+        let Linear::MoeCombine {
+            routed: summed,
+            weights: sum_weights,
+            shared,
+            y,
+        } = *sum
+        else {
+            return Ok(false);
+        };
+        let (weights, first) = match (glu_weights, sum_weights, shared) {
+            (Some(w), None, shared) => (w, Some(shared)),
+            (None, Some(w), None) => (w, None),
+            _ => return Ok(false),
+        };
+        let (
+            Some((x, routes, up_y, up, up_experts)),
+            Some((down_x, down_routes, down_y, down, down_experts)),
+        ) = (self.routed_bank(select), self.routed_bank(down))
+        else {
+            return Ok(false);
+        };
+        if up_y != packed
+            || down_x != hidden
+            || down_routes != routes
+            || down_y != summed
+            || up_experts.streams()
+            || down_experts.streams()
+        {
+            return Ok(false);
+        }
+        let fold = match first {
+            Some(shared) => linear::moe::Fold::First(shared.map(|s| self.tensor(s))),
+            None => linear::moe::Fold::Weighted,
+        };
+        let glu = match limit {
+            Some(limit) => Glu::SwigluClamp { limit },
+            None => Glu::Swiglu,
+        };
+        let x = self.tensor(x);
+        let routes = self.tensor(routes);
+        let weights = self.tensor(weights);
+        let mut out = self.tensor(y);
+        #[rustfmt::skip]
+        let m = linear::moe::RoutedMlp { x, up, glu, down, routes, weights, inter: intermediate };
+        linear::moe::mega(self.ctx(), m, fold, &mut out)
     }
 
     /// A quantized bank's select of `x`.

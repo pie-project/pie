@@ -332,7 +332,7 @@ impl Composition {
 }
 
 pub fn compose(compiled: &CompiledModel, budget: &Budget, lanes: &[Lane]) -> Result<Composition> {
-    seriate(compiled, budget, None, None, lanes)
+    seriate(compiled, budget, None, None, lanes, None)
 }
 
 pub fn compose_axes(
@@ -340,12 +340,25 @@ pub fn compose_axes(
     budgets: &Budgets,
     lanes: &[Lane],
 ) -> Result<Composition> {
+    compose_axes_at(compiled, budgets, lanes, None)
+}
+
+/// [`compose_axes`] at token bucket `at` where given: one of the budget's
+/// buckets, at least the lanes' rows. Ranks that step together (expert
+/// parallelism) fire every step at the bucket the largest of them needs.
+pub fn compose_axes_at(
+    compiled: &CompiledModel,
+    budgets: &Budgets,
+    lanes: &[Lane],
+    at: Option<u32>,
+) -> Result<Composition> {
     seriate(
         compiled,
         &budgets.tokens,
         budgets.ladder(RowAxis::Patches),
         budgets.ladder(RowAxis::Voxels),
         lanes,
+        at,
     )
 }
 
@@ -355,6 +368,7 @@ fn seriate(
     ladder: Option<Ladder<'_>>,
     voxel_ladder: Option<Ladder<'_>>,
     lanes: &[Lane],
+    at: Option<u32>,
 ) -> Result<Composition> {
     if lanes.len() > budget.max_lanes as usize {
         return Err(Fault::TooManyLanes {
@@ -474,7 +488,10 @@ fn seriate(
     let voxels = voxels as u32;
 
     let buckets = PerAxis::new([
-        bucket_of(budget, rows)?,
+        match at {
+            Some(at) => bucket_at(budget, rows, at)?,
+            None => bucket_of(budget, rows)?,
+        },
         patch_bucket_of(ladder, patches)?,
         voxel_bucket_of(voxel_ladder, voxels)?,
     ]);
@@ -626,6 +643,13 @@ fn bucket_of(budget: &Budget, rows: u32) -> Result<u32> {
         Some(top) if rows > top => Err(Error::Fire(Fault::NoBucket { rows, top })),
         _ => Ok(rung_of(&budget.buckets, rows)),
     }
+}
+
+fn bucket_at(budget: &Budget, rows: u32, at: u32) -> Result<u32> {
+    if rows > at || !budget.buckets.contains(&at) {
+        return Err(Error::Fire(Fault::NoBucket { rows, top: at }));
+    }
+    Ok(at)
 }
 
 #[must_use]

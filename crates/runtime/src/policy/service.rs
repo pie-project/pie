@@ -379,10 +379,10 @@ const STORES: Cache = Cache {
             });
             freed += stores.rs.lock().unwrap().discard_cache(owner);
         }
-        if freed > 0
-            && let Some(planner) = crate::planner::planner()
-        {
-            planner.pages_freed();
+        if freed > 0 {
+            for planner in crate::planner::planners() {
+                planner.pages_freed();
+            }
         }
     },
 };

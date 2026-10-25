@@ -233,3 +233,81 @@ pub(crate) fn answered(
     }
     Err(crate::jit::Fault::Device { call, code }.at(op))
 }
+
+// Expert-parallel dispatch and combine: kernels-cuda's interface, which
+// this backend does not carry yet. Every call refuses by name.
+
+/// `kernels_cuda::collective::EP_MAX_RANKS`.
+pub const EP_MAX_RANKS: u32 = 8;
+
+/// `kernels_cuda::collective::EP_SIGNAL_BYTES`.
+pub const EP_SIGNAL_BYTES: u64 = 4096;
+
+/// `kernels_cuda::collective::ep_scratch_bytes`.
+#[must_use]
+pub const fn ep_scratch_bytes(tokens: u32, world: u32) -> u64 {
+    EP_MAX_RANKS as u64 * 4 + tokens as u64 * world as u64 * 4
+}
+
+/// `kernels_cuda::collective::Ep`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ep {
+    pub rank: u32,
+    pub world: u32,
+    pub signals: [u64; EP_MAX_RANKS as usize],
+    pub scratch: u64,
+    pub scratch_tokens: u32,
+}
+
+/// `kernels_cuda::collective::Placement`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placement {
+    pub table: u64,
+    pub stride: u32,
+    pub experts: u32,
+    pub slots: u32,
+    pub loads: u64,
+}
+
+/// `kernels_cuda::collective::Landing`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Landing {
+    pub rows: Tensor,
+    pub local: Tensor,
+    pub row_weights: Option<Tensor>,
+    pub origin: Tensor,
+}
+
+/// `kernels_cuda::collective::Tokens`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tokens {
+    pub x: Tensor,
+    pub routes: Tensor,
+    pub weights: Option<Tensor>,
+    pub step: u32,
+}
+
+pub fn load_ep() -> Result<(), Error> {
+    Err(Error::Unsupported {
+        op: "collective.load_ep",
+    })
+}
+
+pub fn dispatch(
+    _: &Ctx,
+    _: &Ep,
+    _: Placement,
+    _: Tokens,
+    _: &[Landing],
+    _: &mut Tensor,
+) -> Result<(), Error> {
+    Err(Error::Unsupported {
+        op: "collective.dispatch",
+    })
+}
+
+pub fn combine(_: &Ctx, _: &Ep, _: &Landing, _: Tensor, _: &[Tensor]) -> Result<(), Error> {
+    Err(Error::Unsupported {
+        op: "collective.combine",
+    })
+}

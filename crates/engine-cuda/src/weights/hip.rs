@@ -380,7 +380,9 @@ fn lane_banks(
         }
         let legs: Vec<&Linear> = match &node.op {
             Operation::Linear(op) => vec![op],
-            Operation::Fused(Fused::MoeExperts { select, down, .. }) => vec![&**select, &**down],
+            Operation::Fused(
+                Fused::MoeExperts { select, down, .. } | Fused::MoeMega { select, down, .. },
+            ) => vec![&**select, &**down],
             Operation::Fused(Fused::MoeSelectGlu { select, .. }) => vec![&**select],
             _ => Vec::new(),
         };

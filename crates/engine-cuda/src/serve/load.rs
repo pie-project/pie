@@ -18,7 +18,7 @@ use crate::store::kv::{self, Paging};
 use crate::store::rs::Buffers;
 use crate::weights::Weights;
 
-use super::{Boot, FireCost, Golden, Graphs, Shell};
+use super::{Boot, FireCost, Golden, Graphs, Released, Shell};
 
 /// The least `max_forward_tokens` is served at when the card is short: one
 /// prefill chunk a frame, which serves, and under it the halving stops.
@@ -36,6 +36,12 @@ const DEFAULT_STATE_SLOTS: u32 = 256;
 
 pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     super::diag::publish(&boot.knobs.diagnostics);
+    if let Some(guard) = super::diag::on().sync_guard {
+        crate::device::guard::arm()?;
+        if guard == super::diag::SyncGuard::Report {
+            crate::device::guard::speak();
+        }
+    }
     // SAFETY: the boot's communicator is held by the engine for the life of
     // the shell it loads.
     let mut device = Context::bind(boot.ordinal, unsafe { boot.comm.as_ref() })?;
@@ -105,7 +111,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     );
 
     let grouped: &[&str] = if engine.grouped { &crate::GROUPED } else { &[] };
-    let profile = DeviceProfile::of(&chip, device.device().num_sm, &crate::EXCLUSIVE, grouped);
+    let mut profile = DeviceProfile::of(&chip, device.device().num_sm, &crate::EXCLUSIVE, grouped);
     let mut kernels = poem_compiler::fuse::flags::on(&chip, &crate::FUSIONS);
     if !boot.knobs.diagnostics.fuse_chains {
         kernels.retain(|rule| crate::UNCHAINED.contains(&rule.kernel()));
@@ -132,6 +138,18 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     if profile.branches {
         boot.trace = poem_compiler::branch::split(boot.trace.clone());
     }
+    // `compiler.synth_regions`: each chain of elementwise and row ops folded
+    // into one `fused.region`, its region kernels-ir's, by the fold
+    // `compile_axes` plans under the flag. Folded once, here, the trace is
+    // the one the load runs and every plan after is of it as it stands.
+    let regions = if profile.synth_regions {
+        let (folded, regions) = poem_compiler::fuse::chain::fold(boot.trace.clone());
+        boot.trace = folded;
+        profile.synth_regions = false;
+        regions
+    } else {
+        std::collections::BTreeMap::new()
+    };
     if boot.knobs.diagnostics.trace_census {
         let mut census: std::collections::BTreeMap<&'static str, usize> =
             std::collections::BTreeMap::new();
@@ -303,6 +321,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         compiled,
         budgets,
         profile,
+        regions,
     })
 }
 
@@ -510,6 +529,14 @@ fn score_heads(trace: &poem_ir::Trace, exports: &Exports) -> u32 {
 
 impl Shell {
     pub fn load(boot: Boot<'_>) -> Result<Shell> {
+        Self::stage(boot)?.finish()
+    }
+
+    /// A load up to its bodies: weights, arena, inputs and cache rows down,
+    /// nothing fired. [`Staged::finish`] arms the bodies; an expert-parallel
+    /// group wires its ranks between the two, since arming fires their
+    /// collectives.
+    pub fn stage(boot: Boot<'_>) -> Result<Staged> {
         let mut boot = boot;
         let Baked {
             mut device,
@@ -517,7 +544,11 @@ impl Shell {
             compiled,
             budgets,
             profile,
+            regions: folded,
         } = bake(&mut boot)?;
+        // Every generated kernel compiled and loaded now, before a fire can
+        // ask for one.
+        let regions = crate::synth::Regions::load(&boot.trace, &folded)?;
         let (free_before, device_total) = crate::store::device_memory()?;
         // The pool's address space is reserved for every page its bytes
         // could hold, the stated budget or the share of the card before the
@@ -565,11 +596,14 @@ impl Shell {
             boot.checkpoint,
             boot.residency.clone(),
             device.stream(),
-            checkpoint::plan::StorageTarget::for_backend(
-                checkpoint::types::BackendKind::Cuda,
-                boot.world.rank,
-                boot.world.size,
-            ),
+            checkpoint::plan::StorageTarget {
+                ep_rank: boot.expert.rank,
+                ..checkpoint::plan::StorageTarget::for_backend(
+                    checkpoint::types::BackendKind::Cuda,
+                    boot.world.rank,
+                    boot.world.size,
+                )
+            },
             decode_dense,
             boot.deferred_tier,
         )?;
@@ -697,7 +731,6 @@ impl Shell {
         let lane_shifted = regions_lane_shifting(&boot.trace, &compiled);
         let staging = crate::exports::regions_staging(&boot.trace, &compiled);
         let schedule_readers = regions_launching_schedules(&boot.trace, &compiled);
-        let unread = crate::exports::unread(&boot.trace);
         crate::voxels::relabel_conv_weights(&device, &boot.trace, weights.table())?;
         weights.rotate(&boot.trace, &compiled)?;
         if boot.knobs.diagnostics.arm_trace {
@@ -726,7 +759,7 @@ impl Shell {
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
-        let buffers = Buffers::reserve(&boot.trace, paging, &pools)?;
+        let buffers = Buffers::reserve(&boot.trace, paging, budgets.tokens.max_tokens, &pools)?;
         let mut pools = pools;
         if let Some(buffers) = &buffers {
             pools.seat_buffered(buffers.slot_bytes(), buffers.map_unit());
@@ -892,6 +925,9 @@ impl Shell {
             accounting,
             trace: boot.trace,
             compiled,
+            regions,
+            ep: None,
+            forced_bucket: None,
             budget: budgets.tokens.clone(),
             budgets,
             patch_seat,
@@ -906,7 +942,6 @@ impl Shell {
             arena,
             pools,
             buffers,
-            rs_scratch: None,
             predicate,
             inputs,
             facts,
@@ -924,7 +959,6 @@ impl Shell {
             lane_shifted,
             staging,
             schedule_readers,
-            unread,
             adapters: crate::blob::Adapters::new(adapter_seats),
             scores,
             held: vec![0; boot.slots as usize],
@@ -960,6 +994,7 @@ impl Shell {
             owed: super::Owed::new(),
             spare_events: Vec::new(),
             rs_ahead: std::collections::HashMap::new(),
+            _released: Released,
         };
         if shell.weights.rotating() && shell.graphs.records() {
             eprintln!(
@@ -1070,25 +1105,7 @@ impl Shell {
                     .join("/"),
             );
         }
-        let footprint = |shell: &Shell| Footprint {
-            total: device_total,
-            before: device_total.saturating_sub(free_before),
-            weights: shell.weights.bytes(),
-            arena: shell.arena.bytes(),
-            inputs: shell.inputs.bytes(),
-            buffers: shell.buffer_bytes(),
-            readout: shell.readout_rows.bytes() as u64,
-            scores: shell
-                .scores
-                .as_ref()
-                .map_or(0, crate::scores::Scores::bytes),
-            cache_rows: shell.pools.committed_bytes(),
-            bodies: shell.cache.body_stats().census.bytes as u64,
-            scratch: kernels_cuda::jit::Slabs::census()
-                .iter()
-                .map(|(_, bytes)| *bytes as u64)
-                .sum(),
-        };
+        let footprint = |shell: &Shell| footprint(shell, device_total, free_before);
         let bodies = if shell.records_bodies() {
             shell.bodies_mem as u64
         } else {
@@ -1139,16 +1156,48 @@ impl Shell {
             );
             shell.held.truncate(fitted.slots as usize);
         }
-        if boot.knobs.diagnostics.arm_trace {
+        Ok(Staged {
+            shell,
+            held_for_fires,
+            rank: boot.world.rank,
+            arm_trace: boot.knobs.diagnostics.arm_trace,
+            device_total,
+            free_before,
+        })
+    }
+}
+
+/// A shell whose load stopped short of arming its bodies ([`Shell::stage`]).
+pub struct Staged {
+    pub shell: Shell,
+    held_for_fires: u64,
+    rank: u32,
+    arm_trace: bool,
+    device_total: u64,
+    free_before: u64,
+}
+
+impl Staged {
+    /// Arms the bodies and fits the cache rows to what the card has left.
+    pub fn finish(self) -> Result<Shell> {
+        let Staged {
+            mut shell,
+            held_for_fires,
+            rank,
+            arm_trace,
+            device_total,
+            free_before,
+        } = self;
+        if arm_trace {
             eprintln!(
                 "[arm-trace] device free {} MiB before arming",
                 crate::device::free_bytes().unwrap_or(0) >> 20
             );
         }
         shell.arm_bodies()?;
-        let resident = footprint(&shell);
+        let resident = footprint(&shell, device_total, free_before);
         let fitted = shell.pools.fit_the_card(0, held_for_fires, &resident)?;
-        if boot.knobs.diagnostics.arm_trace {
+        if arm_trace {
             eprintln!(
                 "[arm-trace] cache rows sized to {} pages ({} MiB, {} sequences at the declared \
                  context) of the {} MiB the card hands out for them ({resident})",
@@ -1158,7 +1207,7 @@ impl Shell {
                 fitted.room >> 20,
             );
         }
-        if boot.world.rank != 0 {
+        if rank != 0 {
             shell.programs.set_shadow(true);
         }
         // Only a warm fire waits on the device, and a load whose bodies were
@@ -1177,6 +1226,28 @@ impl Shell {
             )
         })?;
         Ok(shell)
+    }
+}
+
+fn footprint(shell: &Shell, device_total: u64, free_before: u64) -> Footprint {
+    Footprint {
+        total: device_total,
+        before: device_total.saturating_sub(free_before),
+        weights: shell.weights.bytes(),
+        arena: shell.arena.bytes(),
+        inputs: shell.inputs.bytes(),
+        buffers: shell.buffer_bytes(),
+        readout: shell.readout_rows.bytes() as u64,
+        scores: shell
+            .scores
+            .as_ref()
+            .map_or(0, crate::scores::Scores::bytes),
+        cache_rows: shell.pools.committed_bytes(),
+        bodies: shell.cache.body_stats().census.bytes as u64,
+        scratch: kernels_cuda::jit::Slabs::census()
+            .iter()
+            .map(|(_, bytes)| *bytes as u64)
+            .sum(),
     }
 }
 
@@ -1321,7 +1392,8 @@ fn decoded_weight_planes(
                 #[cfg(not(feature = "rocm"))]
                 poem_ir::Operation::Fused(
                     poem_ir::Fused::MoeSelectGlu { select, .. }
-                    | poem_ir::Fused::MoeExperts { select, .. },
+                    | poem_ir::Fused::MoeExperts { select, .. }
+                    | poem_ir::Fused::MoeMega { select, .. },
                 ) if matches!(
                     **select,
                     poem_ir::Linear::MoeSelect {
@@ -1359,7 +1431,9 @@ fn decoded_weight_planes(
                     },
                 )
                 | poem_ir::Operation::Fused(
-                    poem_ir::Fused::MoeSelectGlu { .. } | poem_ir::Fused::MoeExperts { .. },
+                    poem_ir::Fused::MoeSelectGlu { .. }
+                    | poem_ir::Fused::MoeExperts { .. }
+                    | poem_ir::Fused::MoeMega { .. },
                 ) => continue,
                 // A fused projection runs its matmul when no fused kernel
                 // takes it, and decodes the same plane that matmul would.
@@ -1368,6 +1442,7 @@ fn decoded_weight_planes(
                     poem_ir::Fused::MatmulGlu { .. }
                     | poem_ir::Fused::MatmulSwigluMatmul { .. }
                     | poem_ir::Fused::MatmulBias { .. }
+                    | poem_ir::Fused::MatmulMoeRoute { .. }
                     | poem_ir::Fused::MatmulSplitRows { .. }
                     | poem_ir::Fused::MatmulSoftcap { .. },
                 ) => {
@@ -1377,7 +1452,9 @@ fn decoded_weight_planes(
                 }
                 #[cfg(feature = "rocm")]
                 poem_ir::Operation::Fused(
-                    poem_ir::Fused::MoeSelectGlu { .. } | poem_ir::Fused::MoeExperts { .. },
+                    poem_ir::Fused::MoeSelectGlu { .. }
+                    | poem_ir::Fused::MoeExperts { .. }
+                    | poem_ir::Fused::MoeMega { .. },
                 ) => {
                     outputs.clear();
                     node.op.outputs(&mut outputs);
@@ -1484,6 +1561,8 @@ pub(super) struct Baked {
     pub(super) compiled: CompiledModel,
     pub(super) budgets: Budgets,
     pub(super) profile: DeviceProfile,
+    /// The region each `fused.region` of the trace names, by key.
+    pub(super) regions: std::collections::BTreeMap<u64, kernels_ir::Region>,
 }
 
 /// The widest fire whose lanes of `rows` prompt rows put no more (lane,

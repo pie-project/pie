@@ -232,6 +232,9 @@ pub struct Rings {
     endpoints: Vec<Option<Arc<Endpoint>>>,
     registry: Buffer,
     device: kernels_cuda::runtime::channel::Rings,
+    /// The stream the cells are staged and fired on, where a read of one
+    /// waits behind what wrote it.
+    stream: usize,
 }
 
 impl Rings {
@@ -299,6 +302,7 @@ impl Rings {
             endpoints,
             registry,
             device,
+            stream: stream as usize,
         })
     }
 
@@ -463,7 +467,7 @@ impl Rings {
         }
         let at = (sequence % shape.ring()) * shape.cell_bytes() as u64;
         let mut out = vec![0u8; shape.cell_bytes()];
-        self.cells[channel].read(at, &mut out)?;
+        self.cells[channel].read_on(self.stream as *mut core::ffi::c_void, at, &mut out)?;
         Ok(out)
     }
 

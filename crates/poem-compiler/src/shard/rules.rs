@@ -3,14 +3,15 @@
 //! weight or a cache the ranks split.
 
 use poem_ir::{
-    Attn, BinaryOp, Elemwise, Gather, Linear, NormAxis, Operands, Operation, Shard, ValueId,
+    ActFn, Attn, BinaryOp, Collective, Dim, Dtype, Elemwise, Gather, Linear, NormAxis, Operands,
+    Operation, RaggedMask, Shard, Ty, ValueId,
 };
 
-use super::{Dist, Pass};
+use super::{Block, Dist, Pass};
 use crate::tree::{self, Tree};
 
 /// How an op meets the ranks.
-enum Rule {
+pub(super) enum Rule {
     /// Every value whole.
     Whole,
     /// Split by head or channel with the values it follows.
@@ -31,7 +32,8 @@ enum Rule {
     /// An attention plan: its head counts are each rank's share.
     Plan { scale: &'static [&'static str] },
     /// A row norm, which needs the whole row unless its weight is split
-    /// with it: then each rank norms its own share.
+    /// with it (or it has none): then each rank norms its own share by the
+    /// row's sum of squares, its share's summed across the ranks.
     Norm,
     /// Group indices for a grouped matmul, which reads no value: they are
     /// a rank's share of the groups when the row it groups is split.
@@ -42,18 +44,18 @@ enum Rule {
 /// with them, and whose `scale` counts are each rank's share. Other
 /// activations are whole.
 #[derive(Clone, Copy)]
-struct Heads {
-    follow: &'static [&'static str],
-    scale: &'static [&'static str],
-    cache: Cache,
+pub(super) struct Heads {
+    pub(super) follow: &'static [&'static str],
+    pub(super) scale: &'static [&'static str],
+    pub(super) cache: Cache,
     /// The kv it appends to a cache or attends to without one, cut as its
     /// kv heads are.
-    kv: &'static [&'static str],
+    pub(super) kv: &'static [&'static str],
 }
 
 /// How the cache an op reads is held against the values it follows.
 #[derive(Clone, Copy, PartialEq)]
-enum Cache {
+pub(super) enum Cache {
     /// It reads none the ranks split.
     Whole,
     /// Split exactly when its values are.
@@ -64,7 +66,7 @@ enum Cache {
 }
 
 impl Cache {
-    fn allows(self, cut: bool, split: bool) -> bool {
+    pub(super) fn allows(self, cut: bool, split: bool) -> bool {
         match self {
             Cache::Whole => !cut,
             Cache::Split => cut == split,
@@ -92,8 +94,19 @@ impl Heads {
     }
 }
 
+/// Unpacks whose widths name, in order, the blocks of the packed share
+/// they take apart.
+const UNPACK_WIDTHS: [(&str, &[&str]); 2] = [
+    ("gather.split_qkv", &["q_width", "kv_width"]),
+    ("gather.split_rows", &["width"]),
+];
+
 /// The head count of kv a group of ranks may share.
-const KV_HEADS: &str = "kv_heads";
+pub(super) const KV_HEADS: &str = "kv_heads";
+
+/// A pair of head counts, q's and then kv's, which a group of ranks may
+/// share as `KV_HEADS` it names.
+const HEAD_PAIR: &str = "heads";
 
 /// How op `name` splits by head or channel, if it does.
 fn heads(name: &str) -> Option<Heads> {
@@ -106,11 +119,15 @@ fn heads(name: &str) -> Option<Heads> {
         "elemwise.rope" => Heads::of(&["q", "k"], &[]),
         "elemwise.add_bias" => Heads::of(&["out"], &[]),
         "gather.split_qkv" => Heads::of(&["packed"], &["q_width", "kv_width"]),
+        // Its heads are q's and kv's, each rank's share of each.
+        "gather.split_qkv_padded" => Heads::of(&["packed"], &[HEAD_PAIR]),
         "gather.split_q_gate" => Heads::of(&["packed"], &[]),
         "gather.split_rows" => Heads::of(&["x"], &["width"]),
         "linear.matmul_grouped" => Heads::of(&["x", "routes"], &["groups"]),
         "attn.ragged" => Heads::of(&["q", "k", "v"], &[KV_HEADS]).kv(&["k", "v"]),
         "attn.sink" => Heads::of(&["o", "lse"], &[]),
+        // A window over a cache every head reads, each head with its sink.
+        "attn.window_sink" => Heads::of(&["q"], &[]).cache(Cache::SplitOrWhole),
         "attn.merge_lse" => Heads::of(&["o1", "lse1", "o2", "lse2"], &["heads"]),
         "attn.pool_lse" => Heads::of(&["q"], &["heads"]),
         // k and v, or the one plane a shared pool reads as both.
@@ -125,6 +142,9 @@ fn heads(name: &str) -> Option<Heads> {
             Heads::of(&["x"], &[]).cache(Cache::Split)
         }
         "ssm.gdn_gates" => Heads::of(&["ba"], &[]),
+        "ssm.short_conv" | "ssm.short_conv_chunked" => Heads::of(&["x"], &[]).cache(Cache::Split),
+        // Each head's run of `x` against the one table every head reads.
+        "linear.rel_bias" => Heads::of(&["x"], &["heads"]),
         "ssm.mamba2" | "ssm.mamba2_chunked" => {
             Heads::of(&["xbc", "dt", "z"], &["heads", "groups"]).cache(Cache::Split)
         }
@@ -138,7 +158,22 @@ fn heads(name: &str) -> Option<Heads> {
     })
 }
 
-fn rule(op: &Operation) -> Rule {
+/// [`rule`], a norm over heads as wide as the row it reads (a row norm
+/// spelled a head the row wide) read as the row norm it is.
+pub(super) fn rule_of(op: &Operation, width: impl Fn(ValueId) -> Option<u64>) -> Rule {
+    if let Operation::Elemwise(Elemwise::Rmsnorm {
+        x,
+        axis: NormAxis::Head(d),
+        ..
+    }) = op
+        && width(*x) == Some(u64::from(*d))
+    {
+        return Rule::Norm;
+    }
+    rule(op)
+}
+
+pub(super) fn rule(op: &Operation) -> Rule {
     // A norm splits by its axis: a whole row's weight against the row's
     // blocks, a head's like any per-head op, a group's not at all.
     if let Operation::Elemwise(Elemwise::Rmsnorm { axis, .. }) = op {
@@ -149,16 +184,21 @@ fn rule(op: &Operation) -> Rule {
         };
     }
     // A gated unit splits with its columns, packed or as two planes; one of
-    // routed rows (each times its route's weight) reads them whole.
-    if let Operation::Linear(Linear::Glu {
-        packed, weights, ..
+    // routed rows scales each row by its route's weight, which every rank
+    // reads whole.
+    if let Operation::Linear(Linear::Glu { packed, .. }) = op {
+        return match packed {
+            Some(_) => Rule::Heads(Heads::of(&["packed"], &["intermediate"])),
+            None => Rule::Heads(Heads::of(&["gate", "up"], &["intermediate"])),
+        };
+    }
+    // A scale (the identity times a scalar) is linear in what it scales.
+    if let Operation::Elemwise(Elemwise::Act {
+        act: ActFn::Identity,
+        ..
     }) = op
     {
-        return match (packed, weights) {
-            (_, Some(_)) => Rule::Whole,
-            (Some(_), None) => Rule::Heads(Heads::of(&["packed"], &["intermediate"])),
-            (None, None) => Rule::Heads(Heads::of(&["gate", "up"], &["intermediate"])),
-        };
+        return Rule::Linear { follow: &["x"] };
     }
     // A product contracts with its weight's split, its activations quantized
     // or not: one that quantizes them does so on each rank's share.
@@ -208,30 +248,36 @@ fn rule(op: &Operation) -> Rule {
             input: 2,
         };
     }
-    // A weighted sum of routed rows is linear in them; one that adds a shared
-    // row reads its operands whole.
+    // A weighted sum of routed rows is linear in them, and in a shared row
+    // it adds.
     if let Operation::Linear(Linear::MoeCombine { shared, .. }) = op {
         return match shared {
             None => Rule::Linear {
                 follow: &["routed"],
             },
-            Some(_) => Rule::Whole,
+            Some(_) => Rule::Linear {
+                follow: &["routed", "shared"],
+            },
         };
     }
     // A paged attention splits with its query heads, its cache split with
-    // them or kept whole; one under a relative bias reads its operands whole,
-    // as the biased ops did, which had no rule.
-    if let Operation::Attn(Attn::Decode { bias, .. }) = op {
-        return match bias {
-            Some(_) => Rule::Whole,
-            None => Rule::Heads(Heads::of(&["q"], &[]).cache(Cache::SplitOrWhole)),
-        };
+    // them or kept whole; a relative bias, a head's run of positions after
+    // another, splits with them.
+    // A ragged attention under a bucketed relative bias reads its table a
+    // row a head, which no share of the last axis cuts: it reads its
+    // operands whole.
+    if let Operation::Attn(Attn::Ragged {
+        mask: RaggedMask::RelativeBias { .. },
+        ..
+    }) = op
+    {
+        return Rule::Whole;
     }
-    if let Operation::Attn(Attn::Prefill { bias, .. }) = op {
-        return match bias {
-            Some(_) => Rule::Whole,
-            None => Rule::Heads(Heads::of(&["q"], &[KV_HEADS]).cache(Cache::SplitOrWhole)),
-        };
+    if let Operation::Attn(Attn::Decode { .. }) = op {
+        return Rule::Heads(Heads::of(&["q", "bias"], &[]).cache(Cache::SplitOrWhole));
+    }
+    if let Operation::Attn(Attn::Prefill { .. }) = op {
+        return Rule::Heads(Heads::of(&["q", "bias"], &[KV_HEADS]).cache(Cache::SplitOrWhole));
     }
     let name = op.name();
     match name {
@@ -258,7 +304,7 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
     };
     let mut outs = Vec::new();
     op.outputs(&mut outs);
-    let dists = match rule(op) {
+    let dists = match rule_of(op, |v| pass.width(v)) {
         Rule::Whole => {
             at.whole_except(pass, &[])?;
             at.check_state(pass, false, Cache::Whole)?;
@@ -295,8 +341,21 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
                 Some(w) => pass.weight_cut(w)?,
                 None => None,
             };
+            let weighed = at.one("weight").is_some();
             match (pass.dist(x)?, cut) {
-                (Dist::Split(blocks), Some((0, _))) => vec![Dist::Split(blocks); outs.len()],
+                // Every rank holds the whole row (a head a group of ranks
+                // holds alike): each norms it as one rank would.
+                (Dist::Split(blocks), _) if blocks.iter().all(|b| b.parts == 1) => {
+                    return Ok((tree::op(at.tree), vec![Dist::Split(blocks); outs.len()]));
+                }
+                (Dist::Split(blocks), Some((0, _))) => {
+                    let op = shared_norm(pass, op, x, &blocks)?;
+                    return Ok((op, vec![Dist::Split(blocks); outs.len()]));
+                }
+                (Dist::Split(blocks), None) if !weighed => {
+                    let op = shared_norm(pass, op, x, &blocks)?;
+                    return Ok((op, vec![Dist::Split(blocks); outs.len()]));
+                }
                 (_, None) => {
                     at.make_whole(pass, x)?;
                     vec![Dist::Whole; outs.len()]
@@ -404,7 +463,9 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
             if split {
                 let whole_kv = heads.cache == Cache::SplitOrWhole && !at.reads_split_cache(pass);
                 at.check_kv_parts(pass, heads.kv)?;
+                let pieces = at.pieces(&held);
                 at.scale(pass, heads.scale, !whole_kv)?;
+                at.unpack(&pieces);
                 outs.iter()
                     .enumerate()
                     .map(|(i, o)| held_like(pass, *o, i, &followed, &held, outs.len()))
@@ -415,6 +476,63 @@ pub(super) fn apply(pass: &mut Pass, op: &Operation) -> Result<(Operation, Vec<D
         }
     };
     Ok((tree::op(at.tree), dists))
+}
+
+/// A row norm over `x`, a row the ranks split in `blocks`, as one rank
+/// runs it: its share's sum of squares, summed across the ranks, norms the
+/// share (Megatron's norm over a row of heads the ranks split). The ops
+/// before it land ahead of the norm; a share a group of ranks holds alike
+/// is summed once per rank of the group, which the whole width counts.
+fn shared_norm(
+    pass: &mut Pass,
+    op: &Operation,
+    x: ValueId,
+    blocks: &[Block],
+) -> Result<Operation, String> {
+    let Operation::Elemwise(Elemwise::Rmsnorm { weight, eps, y, .. }) = *op else {
+        return Err(format!("`{}` is not a row norm", op.name()));
+    };
+    let world = u64::from(pass.world);
+    let parts = blocks.first().map_or(world, |b| b.parts);
+    if blocks.iter().any(|b| b.parts != parts) || parts == 0 || !world.is_multiple_of(parts) {
+        return Err(format!(
+            "`{}` norms a row whose blocks the ranks cut {:?} ways",
+            op.name(),
+            blocks.iter().map(|b| b.parts).collect::<Vec<_>>()
+        ));
+    }
+    let whole: u64 = blocks.iter().map(|b| b.width).sum::<u64>() * (world / parts);
+    let width = u32::try_from(whole).map_err(|_| format!("a row {whole} wide"))?;
+    let ty = match &pass.trace.values[x.0 as usize].ty {
+        Ty::Tensor { shape, .. } => {
+            let mut shape = shape.clone();
+            if let Some(last) = shape.last_mut() {
+                *last = Dim::Const(1);
+            }
+            Ty::Tensor {
+                shape,
+                dtype: Dtype::F32,
+            }
+        }
+        Ty::Struct(_) => return Err(format!("`{}` norms no tensor", op.name())),
+    };
+    let ss = pass.value(ty.clone(), Dist::Partial);
+    let summed = pass.value(ty, Dist::Whole);
+    pass.pending
+        .push(Operation::Elemwise(Elemwise::SumSquares { x, ss }));
+    pass.pending
+        .push(Operation::Collective(Collective::AllReduce {
+            buf: ss,
+            buf_out: summed,
+        }));
+    Ok(Operation::Elemwise(Elemwise::RmsnormBy {
+        x,
+        ss: summed,
+        weight,
+        width,
+        eps,
+        y,
+    }))
 }
 
 /// An op being rewritten for one rank, and the values it reads.
@@ -501,6 +619,27 @@ impl At {
             if !names.contains(field) || *field == KV_HEADS && !kv_split {
                 continue;
             }
+            // A pair of counts: the query heads cut once per rank, the kv
+            // heads as a kv head count is.
+            if let Tree::Seq(pair) = value
+                && let [Tree::Int(q), Tree::Int(kv)] = &mut pair[..]
+            {
+                let unsplit = format!("`{op}`.{field} of [{q}, {kv}] does not split {world} ways");
+                let heads = u64::try_from(*kv).ok().filter(|h| *h > 0);
+                let kv_parts = if kv_split {
+                    Shard::parts(heads, u64::from(pass.world))
+                        .map(i128::from)
+                        .map_err(|_| unsplit.clone())?
+                } else {
+                    1
+                };
+                if *q % world != 0 || *kv % kv_parts != 0 {
+                    return Err(unsplit);
+                }
+                *q /= world;
+                *kv /= kv_parts;
+                continue;
+            }
             let Tree::Int(n) = value else {
                 return Err(format!("`{op}`.{field} is not a count"));
             };
@@ -519,6 +658,45 @@ impl At {
             *n /= parts;
         }
         Ok(())
+    }
+
+    /// The widths an unpack names of the blocks of the one packed share it
+    /// takes apart, each with a rank's share of it: a block of kv heads a
+    /// group of ranks holds alike is cut fewer ways than the ranks.
+    fn pieces(&self, held: &[Dist]) -> Vec<(&'static str, i128, i128)> {
+        let Some((_, fields)) = UNPACK_WIDTHS.iter().find(|(op, _)| *op == self.name) else {
+            return Vec::new();
+        };
+        let [Dist::Split(blocks)] = held else {
+            return Vec::new();
+        };
+        if blocks.len() < 2 {
+            return Vec::new();
+        }
+        fields
+            .iter()
+            .zip(blocks)
+            .filter_map(|(field, b)| {
+                let parts = b.parts.max(1);
+                match tree::field(&self.tree, field) {
+                    Some(Tree::Int(n)) if *n == i128::from(b.width) => {
+                        Some((*field, *n, i128::from(b.width / parts)))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Each width `pieces` names set to a rank's share of its block.
+    fn unpack(&mut self, pieces: &[(&'static str, i128, i128)]) {
+        for (field, value) in tree::fields_mut(&mut self.tree) {
+            if let Some((_, _, share)) = pieces.iter().find(|(f, _, _)| f == field)
+                && let Tree::Int(n) = value
+            {
+                *n = *share;
+            }
+        }
     }
 
     /// The `kv` an op appends to a cache, or attends to without one, is cut
@@ -584,9 +762,13 @@ fn held_like(
     }
     if let [Dist::Split(blocks)] = held
         && blocks.len() == count
-        && blocks[index].width == width
     {
-        return Ok(Dist::Split(vec![blocks[index]]));
+        // A lone packed input unpacked a block an output, the output cut as
+        // its block is however wide the op lays it (padding each head).
+        return Ok(Dist::Split(vec![Block {
+            width,
+            parts: blocks[index].parts,
+        }]));
     }
     if held.iter().all(|d| d.is_even(pass.world)) {
         return Ok(Dist::even(width, pass.world));

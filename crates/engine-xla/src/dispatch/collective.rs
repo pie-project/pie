@@ -29,6 +29,8 @@ impl Run<'_> {
                 let v = collective::reduce_scatter(l.f(), x_v, o_y.landing())?;
                 l.land(o_y, v)
             }),
+            Collective::Dispatch { .. } => Err(kernels_xla::Error::Unsupported { op: "dispatch" }),
+            Collective::Combine { .. } => Err(kernels_xla::Error::Unsupported { op: "combine" }),
         }
     }
 }

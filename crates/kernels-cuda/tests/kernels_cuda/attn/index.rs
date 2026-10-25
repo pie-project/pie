@@ -14,6 +14,9 @@ use kernels_cuda::attn::selected;
 use kernels_cuda::tensor::{KvPool, RaggedTensor};
 use kernels_cuda::tuning::Tuning;
 
+mod logits_fp4;
+mod select;
+
 const DIM: usize = 128;
 
 type Lens<'a> = &'a [(usize, usize)];
@@ -154,6 +157,9 @@ fn the_pooled_index_selects_its_best_blocks() {
         // V4.1's FP4 keys on both scorers; the queries turned as they load.
         (64, small, 16, fp4, 8, t(true, true, false)),
         (4, small, 16, fp4, 8, t(false, false, false)),
+        // The block-scaled scorer asked for, over keys a position's row at
+        // each block's last, which it does not read: the old scorer ranks.
+        (64, small, 16, fp4, 8, tuned(|t| (t.index_mma, t.index_radix, t.index_fp4_tc5) = (true, true, true))),
         (64, small, 16, turned, 8, t(true, true, false)),
         // A prefill's rows on tcgen05, pages back to front and 64-wide, turned and not.
         (64, big, 16, bf, 128, t(true, true, true)),

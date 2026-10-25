@@ -1,6 +1,6 @@
 #![cfg(feature = "cuda")]
 
-//! A fused norm-and-fold told a row goes unread (`kernel.elemwise.skip_unread`)
+//! A fused norm-and-fold told a row goes unread (`norm_residual::Keep`)
 //! leaves that row as it found it and lands every other one bit for bit as
 //! the chain that keeps them all: the normed row `t`, the stream `y` folded in
 //! place, the rescaled copy and the post-norm's output, at Gemma 4 E4B's width

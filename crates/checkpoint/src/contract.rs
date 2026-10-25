@@ -57,6 +57,14 @@ pub enum Expr {
         axis: Axis,
         replicas: u32,
     },
+    /// An expert-parallel rank's slots of the routed bank `src`, whose
+    /// leading axis is its `experts`: slot `s` of rank `r` holds expert
+    /// `(r * slots + s) % experts`, the placement a group loads at.
+    Experts {
+        src: Box<Expr>,
+        experts: i64,
+        slots: i64,
+    },
     SrcIndexed(String),
     Select {
         src: Box<Expr>,
@@ -387,6 +395,7 @@ impl Expr {
             Expr::Concat { .. } => "Concat",
             Expr::Transmute { .. } => "Transmute",
             Expr::Shard { .. } => "Shard",
+            Expr::Experts { .. } => "Experts",
             Expr::Repack { .. } => "Repack",
             Expr::Cast { .. } => "Cast",
             Expr::Scale { .. } => "Scale",
@@ -400,7 +409,7 @@ impl Expr {
     #[must_use]
     pub fn is_sharded(&self) -> bool {
         match self {
-            Expr::Shard { .. } => true,
+            Expr::Shard { .. } | Expr::Experts { .. } => true,
             Expr::Src(_)
             | Expr::Out(_)
             | Expr::Fill { .. }
@@ -567,6 +576,17 @@ impl Expr {
         self.shard_among(axis, 1)
     }
 
+    /// An expert-parallel rank's `slots` of this bank of `experts`
+    /// ([`Expr::Experts`]).
+    #[must_use]
+    pub fn experts(self, experts: i64, slots: i64) -> Self {
+        Expr::Experts {
+            src: Box::new(self),
+            experts,
+            slots,
+        }
+    }
+
     /// A rank's share of this along `axis`, each share held by `replicas`
     /// ranks in a row.
     pub fn shard_among(self, axis: u8, replicas: u32) -> Self {
@@ -589,7 +609,9 @@ impl Expr {
             | Expr::Gather { src, .. }
             | Expr::Transmute { src, .. } => src.is_affine(),
             Expr::Concat { parts, .. } => parts.iter().all(Expr::is_affine),
-            Expr::Shard { src, .. } | Expr::Select { src, .. } => src.is_affine(),
+            Expr::Shard { src, .. } | Expr::Select { src, .. } | Expr::Experts { src, .. } => {
+                src.is_affine()
+            }
             Expr::Repack { .. }
             | Expr::Cast { .. }
             | Expr::Scale { .. }
@@ -636,6 +658,7 @@ impl Expr {
             | Expr::Transmute { src, .. }
             | Expr::Repack { src, .. }
             | Expr::Shard { src, .. }
+            | Expr::Experts { src, .. }
             | Expr::Select { src, .. }
             | Expr::Unary { src, .. }
             | Expr::Cast { src, .. } => src.visit(seen),
@@ -750,6 +773,15 @@ impl Expr {
                 src: boxed(src)?,
                 axis,
                 replicas,
+            },
+            Expr::Experts {
+                src,
+                experts,
+                slots,
+            } => Expr::Experts {
+                src: boxed(src)?,
+                experts,
+                slots,
             },
             Expr::Concat { axis, parts } => Expr::Concat {
                 axis,

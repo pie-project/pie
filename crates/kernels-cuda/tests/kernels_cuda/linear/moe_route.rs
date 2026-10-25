@@ -1,11 +1,16 @@
 //! The MoE routers: each row's best experts, the lowest on a tie, and their
 //! weights, against the host's serial walk; the softmax router's warp form
-//! lands the block form's bits.
+//! lands the block form's bits. The fused gate (the router's product and its
+//! top-k in one tcgen05 launch) lands the routes of the product and the
+//! router apart, but where two scores sit within a rounding of each other.
 
 use crate::common::linear_ref::{Bench, pick, t, tab};
-use crate::common::{from_bf16, to_bf16};
-use dtype::Dtype::{Bf16, F32, I32};
-use kernels_cuda::linear::moe;
+use crate::common::{captured, forget, from_bf16, replay, to_bf16};
+use dtype::Dtype::{self, Bf16, F32, I32};
+use kernels_cuda::jit::Ctx;
+use kernels_cuda::linear::{gemm, moe};
+use kernels_cuda::tensor::Tensor;
+use kernels_cuda::tuning::Tuning;
 
 #[test]
 fn the_ranked_routers_pick_the_best_experts() {
@@ -122,5 +127,427 @@ fn the_softmax_routers_pick_the_best_experts() {
                 );
             }
         }
+    }
+}
+
+/// A fused gate's scoring, as the router it stands for.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Scored {
+    /// `topk_softmax` (Qwen3's).
+    Softmax,
+    /// `topk_softmax_scaled`, a bf16 gain an expert.
+    Gained,
+    /// `topk_sigmoid` under a correction bias.
+    Sigmoid,
+    /// `topk_sigmoid` without one.
+    Bare,
+    /// `topk_sqrt_softplus` (DeepSeek-V4's).
+    Softplus,
+}
+
+/// The routed scaling the ranked cases weight under (V4-Flash's).
+const SCALING: f32 = 1.5;
+
+fn gate_of(
+    s: Scored,
+    experts: u32,
+    top_k: u32,
+    logits: Dtype,
+    bias: Tensor,
+    gain: Tensor,
+) -> moe::Gate {
+    let score = match s {
+        Scored::Softmax => moe::GateScore::Softmax { gain: None },
+        Scored::Gained => moe::GateScore::Softmax { gain: Some(gain) },
+        Scored::Sigmoid | Scored::Bare => moe::GateScore::Sigmoid {
+            bias: (s == Scored::Sigmoid).then_some(bias),
+            renormalize: true,
+            scaling: SCALING,
+        },
+        Scored::Softplus => moe::GateScore::SqrtSoftplus {
+            bias,
+            renormalize: true,
+            scaling: SCALING,
+        },
+    };
+    moe::Gate {
+        experts,
+        top_k,
+        logits,
+        score,
+    }
+}
+
+/// The path the engine runs today: the router's product (`matmul`, or
+/// `matmul_f32` for f32 logits), then the router over its logits.
+fn unfused(
+    ctx: &Ctx,
+    x: Tensor,
+    w: Tensor,
+    logits: &mut Tensor,
+    gate: moe::Gate,
+    r: &mut Tensor,
+    wt: &mut Tensor,
+) {
+    match logits.dtype {
+        F32 => gemm::matmul_f32(ctx, x, w, logits),
+        _ => gemm::matmul(ctx, x, w, logits),
+    }
+    .expect("the router's product fires");
+    let (l, e, k) = (*logits, gate.experts, gate.top_k);
+    match gate.score {
+        moe::GateScore::Softmax { gain: None } => moe::topk_softmax(ctx, l, e, k, r, wt),
+        moe::GateScore::Softmax { gain: Some(g) } => {
+            moe::topk_softmax_scaled(ctx, l, g, e, k, r, wt)
+        }
+        moe::GateScore::Sigmoid {
+            bias,
+            renormalize,
+            scaling,
+        } => moe::topk_sigmoid(ctx, l, bias, e, k, renormalize, scaling, r, wt),
+        moe::GateScore::SqrtSoftplus {
+            bias,
+            renormalize,
+            scaling,
+        } => moe::topk_sqrt_softplus(ctx, l, bias, e, k, renormalize, scaling, r, wt),
+    }
+    .expect("the router fires");
+}
+
+/// B200's profile as the unfused path runs it (programmatic dependents, the
+/// few-rows GEMM tactic, the split's launch charge), the gate taking every
+/// row count.
+fn sm100() -> Tuning {
+    Tuning {
+        pdl: true,
+        gemm_rows_m: 8,
+        gemm_split_launch_ns: 2000,
+        gemv_narrow: true,
+        gemm_bias_epilogue: true,
+        gemm_tc5_split_tickets: 8,
+        rows_vec: true,
+        gate_tc5_until: 65_536,
+        ..crate::common::SM100
+    }
+}
+
+/// The score a row's expert ranks by, from its logit.
+fn ranked(s: Scored, x: f64) -> f64 {
+    match s {
+        Scored::Softmax | Scored::Gained => x,
+        Scored::Sigmoid | Scored::Bare => 1.0 / (1.0 + (-x).exp()),
+        Scored::Softplus => (if x > 20.0 { x } else { x.exp().ln_1p() }).max(0.0).sqrt(),
+    }
+}
+
+/// One bf16 step at `x`'s magnitude.
+fn bf16_ulp(x: f64) -> f64 {
+    let x = x.abs().max(f64::from(f32::MIN_POSITIVE));
+    2f64.powi(x.log2().floor() as i32 - 7)
+}
+
+#[test]
+fn the_fused_gate_lands_the_unfused_routes() {
+    if !kernels_cuda::linear::gemm_sm100::supported() {
+        eprintln!("skipped: no tcgen05 on this device");
+        return;
+    }
+    // (scoring, rows, hidden, experts, picks, logits, live window): V4-Flash
+    // (4096 by 256, 6 picks) across a decode's rows, V4-Pro (7168 by 384),
+    // Qwen3-30B-A3B (2048 by 128 of 8) and Coder-480B (6144 by 160: a part
+    // accumulator), the sigmoid router at f32 logits and bf16, a gained
+    // softmax, a fire under a live window.
+    #[rustfmt::skip]
+    let cases = [
+        (Scored::Softplus, 1, 4096, 256, 6, Bf16, None),
+        (Scored::Softplus, 7, 4096, 256, 6, Bf16, None),
+        (Scored::Softplus, 64, 4096, 256, 6, Bf16, None),
+        (Scored::Softplus, 130, 4096, 256, 6, Bf16, None),
+        (Scored::Softplus, 256, 4096, 256, 6, Bf16, None),
+        (Scored::Softplus, 300, 4096, 256, 6, Bf16, None),
+        (Scored::Softplus, 9, 7168, 384, 6, Bf16, None),
+        (Scored::Softmax, 33, 2048, 128, 8, Bf16, None),
+        (Scored::Softmax, 5, 6144, 160, 8, Bf16, None),
+        (Scored::Gained, 17, 2048, 128, 8, Bf16, None),
+        (Scored::Sigmoid, 20, 4096, 256, 8, F32, None),
+        (Scored::Sigmoid, 12, 2880, 512, 32, Bf16, None),
+        (Scored::Bare, 40, 4096, 256, 8, Bf16, None),
+        (Scored::Softplus, 48, 4096, 256, 6, Bf16, Some((30u32, 9u32))),
+    ];
+    let (mut same_rows, mut tied_rows, mut worst) = (0usize, 0usize, 0f64);
+    for (s, rows, hidden, ex, k, ldt, live) in cases {
+        let mut b = Bench::new(11 + rows as u64);
+        let (x_at, xv) = b.bf16(rows * hidden);
+        // A router whose logits spread about one (V4's run 1-3).
+        let wraw = tab(ex * hidden, |_| to_bf16(b.lcg.unit() * 0.04));
+        let wv = tab(ex * hidden, |i| f64::from(from_bf16(wraw[i])));
+        let bias = tab(ex, |_| b.lcg.unit() * 0.05);
+        let gain = tab(ex, |e| to_bf16(0.5 + (e % 7) as f32 / 8.0));
+        let w_at = b.up(&wraw);
+        let (x, w) = (t(x_at, rows, hidden, Bf16), t(w_at, ex, hidden, Bf16));
+        let (bt, gt) = (t(b.up(&bias), 1, ex, F32), t(b.up(&gain), 1, ex, Bf16));
+        let lbytes = pick(ldt == F32, 4, 2);
+        let mut logits = t(b.zeros(rows * ex * lbytes), rows, ex, ldt);
+        let lanes = |b: &mut Bench| {
+            (
+                t(b.up(&vec![-7i32; rows * k]), rows, k, I32),
+                t(b.up(&vec![-7f32; rows * k]), rows, k, F32),
+            )
+        };
+        let ((mut r0, mut w0), (mut r1, mut w1)) = (lanes(&mut b), lanes(&mut b));
+        let ctx = b.ctx().with_tuning(sm100());
+        if let Some((n, first)) = live {
+            ctx.arm_stage(b.up(&[n, first, 0, 0]));
+        }
+        let g = gate_of(s, ex as u32, k as u32, ldt, bt, gt);
+        unfused(&ctx, x, w, &mut logits, g, &mut r0, &mut w0);
+        let took = moe::gate(&ctx, x, w, g, &mut r1, &mut w1).expect("the gate fires");
+        assert!(took, "{s:?} {rows}x{hidden}x{ex}: the gate takes the fire");
+        b.sync();
+        let (want_r, got_r): (Vec<i32>, Vec<i32>) =
+            (b.down(r0.ptr, rows * k), b.down(r1.ptr, rows * k));
+        let (want_w, got_w): (Vec<f32>, Vec<f32>) =
+            (b.down(w0.ptr, rows * k), b.down(w1.ptr, rows * k));
+        for row in 0..rows {
+            let at = row * k..(row + 1) * k;
+            if let Some((n, first)) = live {
+                let inside = (first as usize..(first + n) as usize).contains(&row);
+                if !inside {
+                    assert!(
+                        got_r[at.clone()].iter().all(|&e| e == -7),
+                        "row {row} past the window"
+                    );
+                    continue;
+                }
+            }
+            if want_r[at.clone()] == got_r[at.clone()] {
+                same_rows += 1;
+                for j in at {
+                    let (got, want) = (f64::from(got_w[j]), f64::from(want_w[j]));
+                    // A logit a bf16 step apart moves its weight by about
+                    // that step; an f32 one by its accumulation's rounding.
+                    let tol = pick(ldt == F32, 1e-5, 1.0 / 64.0) * want.abs() + 1e-6;
+                    worst = worst.max((got - want).abs() / want.abs().max(1e-6));
+                    assert!(
+                        (got - want).abs() <= tol,
+                        "{s:?} {rows}x{hidden}x{ex} row {row}: weight {got} against {want}"
+                    );
+                }
+                continue;
+            }
+            // The picks differ: only between experts whose scores the
+            // logits' rounding can reorder. A logit is the exact product
+            // up to a rounding of its dtype (and the f32 sums' order).
+            tied_rows += 1;
+            let logit = |e: usize| {
+                (0..hidden)
+                    .map(|i| xv[row * hidden + i] * wv[e * hidden + i])
+                    .sum::<f64>()
+            };
+            let mass = |e: usize| {
+                (0..hidden)
+                    .map(|i| (xv[row * hidden + i] * wv[e * hidden + i]).abs())
+                    .sum::<f64>()
+            };
+            let score = |e: usize| {
+                let (l, u) = (
+                    logit(e),
+                    pick(ldt == F32, 0.0, bf16_ulp(logit(e))) + 4e-7 * mass(e),
+                );
+                let bias = pick(
+                    matches!(s, Scored::Sigmoid | Scored::Softplus),
+                    f64::from(bias[e]),
+                    0.0,
+                );
+                (
+                    ranked(s, l) + bias,
+                    (ranked(s, l + u) - ranked(s, l - u)).abs(),
+                )
+            };
+            for j in at {
+                let (a, c) = (want_r[j], got_r[j]);
+                if a == c {
+                    continue;
+                }
+                let ((sa, da), (sc, dc)) = (score(a as usize), score(c as usize));
+                assert!(
+                    (sa - sc).abs() <= 2.0 * (da + dc),
+                    "{s:?} {rows}x{hidden}x{ex} row {row} pick {}: expert {c} for {a}, scores {sc} and {sa} \
+                     apart past their rounding ({dc}, {da})",
+                    j % k
+                );
+            }
+        }
+    }
+    eprintln!(
+        "the fused gate: {same_rows} rows the same routes (weights within {worst:.2e} relative), \
+         {tied_rows} reordered within a rounding"
+    );
+}
+
+#[test]
+fn a_replayed_fused_gate_lands_what_it_lands_eagerly() {
+    if !kernels_cuda::linear::gemm_sm100::supported() {
+        eprintln!("skipped: no tcgen05 on this device");
+        return;
+    }
+    // V4-Flash's router at a decode's 24 rows: a graph of the gate replayed
+    // over new rows lands the eager gate's bits for them, each time.
+    let (rows, hidden, ex, k) = (24usize, 4096usize, 256usize, 6usize);
+    let mut b = Bench::new(9);
+    let wraw = tab(ex * hidden, |_| to_bf16(b.lcg.unit() * 0.04));
+    let w = t(b.up(&wraw), ex, hidden, Bf16);
+    let bias = tab(ex, |_| b.lcg.unit() * 0.05);
+    let bt = t(b.up(&bias), 1, ex, F32);
+    let x = t(b.zeros(rows * hidden * 2), rows, hidden, Bf16);
+    let lanes = |b: &mut Bench| {
+        (
+            t(b.zeros(rows * k * 4), rows, k, I32),
+            t(b.zeros(rows * k * 4), rows, k, F32),
+        )
+    };
+    let ((mut r0, mut w0), (mut r1, mut w1)) = (lanes(&mut b), lanes(&mut b));
+    let ctx = b.ctx().with_tuning(sm100());
+    let g = gate_of(Scored::Softplus, ex as u32, k as u32, Bf16, bt, bt);
+    // Eagerly first: a capture fires what is already loaded.
+    assert!(moe::gate(&ctx, x, w, g, &mut r1, &mut w1).expect("the gate fires"));
+    b.sync();
+    let exec = captured(&ctx, || {
+        assert!(moe::gate(&ctx, x, w, g, &mut r1, &mut w1).expect("the gate fires"));
+    });
+    for _ in 0..3 {
+        let (_, xs) = b.lcg.row(rows * hidden);
+        crate::common::host::upload_to(x.ptr, &tab(rows * hidden, |i| to_bf16(xs[i])));
+        assert!(moe::gate(&ctx, x, w, g, &mut r0, &mut w0).expect("the gate fires"));
+        replay(&ctx, exec);
+        b.sync();
+        let (want_r, got_r): (Vec<i32>, Vec<i32>) =
+            (b.down(r0.ptr, rows * k), b.down(r1.ptr, rows * k));
+        let (want_w, got_w): (Vec<u32>, Vec<u32>) =
+            (b.down(w0.ptr, rows * k), b.down(w1.ptr, rows * k));
+        assert_eq!(got_r, want_r, "the replay's routes");
+        assert_eq!(got_w, want_w, "the replay's weights, bit for bit");
+    }
+    forget(exec);
+}
+
+#[test]
+fn the_fused_gate_declines_what_it_does_not_take() {
+    // (scoring, rows, experts, picks, x's dtype, tuning): past B200's 256
+    // rows, a softmax of more than 16 picks, more than 512 experts, f32
+    // activations, and a profile that never fuses.
+    let b200 = crate::common::SM100;
+    #[rustfmt::skip]
+    let cases = [
+        (Scored::Softplus, 300, 256, 6, Bf16, b200),
+        (Scored::Softmax, 4, 256, 20, Bf16, b200),
+        (Scored::Sigmoid, 4, 640, 8, Bf16, b200),
+        (Scored::Softplus, 4, 256, 6, F32, b200),
+        (Scored::Softplus, 1, 256, 6, Bf16, Tuning::DEFAULT),
+    ];
+    let hidden = 512;
+    for (s, rows, ex, k, xdt, tuning) in cases {
+        let mut b = Bench::new(2);
+        let x = t(b.zeros(rows * hidden * 4), rows, hidden, xdt);
+        let w = t(b.zeros(ex * hidden * 2), ex, hidden, Bf16);
+        let (bt, gt) = (
+            t(b.zeros(ex * 4), 1, ex, F32),
+            t(b.zeros(ex * 2), 1, ex, Bf16),
+        );
+        let mut r = t(b.up(&vec![-7i32; rows * k]), rows, k, I32);
+        let mut wt = t(b.zeros(rows * k * 4), rows, k, F32);
+        let ctx = b.ctx().with_tuning(tuning);
+        let g = gate_of(s, ex as u32, k as u32, Bf16, bt, gt);
+        let took = moe::gate(&ctx, x, w, g, &mut r, &mut wt).expect("the gate answers");
+        assert!(
+            !took,
+            "{s:?} {rows} rows of {ex} experts to {k}: the gate declines"
+        );
+        b.sync();
+        let left: Vec<i32> = b.down(r.ptr, rows * k);
+        assert!(
+            left.iter().all(|&e| e == -7),
+            "a declined gate writes nothing"
+        );
+    }
+}
+
+/// The unfused path (the product, then the router) against the fused gate
+/// at DeepSeek-V4-Flash's router (4096 by 256, 6 picks, sqrt-softplus under
+/// its bias) for a decode's rows: each alone, back to back, and each behind
+/// the RMS norm that lands its rows (as a layer's MoE input is landed), less
+/// the norm's own time. Each is a graph of 16 calls, the graphs replayed in
+/// turn and each timed at its fastest replay (the card may be shared).
+#[test]
+#[ignore = "a rate bench: cargo test ... -- --ignored the_fused_gate_rate --nocapture"]
+fn the_fused_gate_rate() {
+    const CALLS: usize = 16;
+    let env = |n: &str, d: usize| std::env::var(n).map_or(d, |v| v.parse().expect("a count"));
+    let (hidden, ex, k) = (env("PIE_HIDDEN", 4096), env("PIE_EXPERTS", 256), 6usize);
+    let reps = env("PIE_REPS", 200);
+    let mut b = Bench::new(5);
+    let rows_max = 256;
+    let (h_at, _) = b.bf16(rows_max * hidden);
+    let x_at = b.zeros(rows_max * hidden * 2);
+    let nw = tab(hidden, |_| to_bf16(1.0 + b.lcg.unit() * 0.1));
+    let nw = t(b.up(&nw), 1, hidden, Bf16);
+    let wraw = tab(ex * hidden, |_| to_bf16(b.lcg.unit() * 0.04));
+    let w_at = b.up(&wraw);
+    let bias = tab(ex, |_| b.lcg.unit() * 0.05);
+    let bt = t(b.up(&bias), 1, ex, F32);
+    let ctx = b.ctx().with_tuning(sm100());
+    eprintln!(
+        "rows  unfused_us  fused_us  speedup  | behind a norm: unfused_us  fused_us  speedup"
+    );
+    for rows in [1usize, 2, 4, 8, 16, 32, 64, 128, 256] {
+        let (h, w) = (t(h_at, rows, hidden, Bf16), t(w_at, ex, hidden, Bf16));
+        let mut x = t(x_at, rows, hidden, Bf16);
+        let mut logits = t(b.zeros(rows * ex * 2), rows, ex, Bf16);
+        let mut r = t(b.zeros(rows * k * 4), rows, k, I32);
+        let mut wt = t(b.zeros(rows * k * 4), rows, k, F32);
+        let g = gate_of(Scored::Softplus, ex as u32, k as u32, Bf16, bt, bt);
+        // 0: the norm alone; 1, 2: the router apart and fused; 3, 4: each
+        // behind the norm.
+        let mut graph = |what: usize| {
+            let mut call = || {
+                if what == 0 || what >= 3 {
+                    kernels_cuda::elemwise::norm::rmsnorm(&ctx, h, nw, 1e-6, &mut x)
+                        .expect("the norm fires");
+                }
+                match what {
+                    0 => {}
+                    2 | 4 => {
+                        assert!(moe::gate(&ctx, x, w, g, &mut r, &mut wt).expect("the gate fires"))
+                    }
+                    _ => unfused(&ctx, x, w, &mut logits, g, &mut r, &mut wt),
+                }
+            };
+            // Eagerly first: the product's tactic is timed outside a capture.
+            call();
+            b.sync();
+            captured(&ctx, || {
+                for _ in 0..CALLS {
+                    call();
+                }
+            })
+        };
+        let execs: Vec<_> = (0..5).map(&mut graph).collect();
+        let mut best = [f64::MAX; 5];
+        for _ in 0..reps {
+            for (exec, best) in execs.iter().zip(&mut best) {
+                let start = std::time::Instant::now();
+                replay(&ctx, *exec);
+                b.sync();
+                *best = best.min(start.elapsed().as_secs_f64() * 1e6 / CALLS as f64);
+            }
+        }
+        execs.into_iter().for_each(forget);
+        let [norm, apart, fused, apart_n, fused_n] = best;
+        let (apart_n, fused_n) = (apart_n - norm, fused_n - norm);
+        eprintln!(
+            "{rows:4}  {apart:10.2}  {fused:8.2}  {:6.2}x  |                {apart_n:10.2}  {fused_n:8.2}  {:6.2}x",
+            apart / fused,
+            apart_n / fused_n
+        );
     }
 }

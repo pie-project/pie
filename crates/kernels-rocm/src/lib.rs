@@ -16,6 +16,7 @@ pub mod sampling;
 pub mod seat;
 pub mod source;
 pub mod ssm;
+pub mod synth;
 pub mod tensor;
 mod voxels;
 

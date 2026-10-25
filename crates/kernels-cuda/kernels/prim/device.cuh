@@ -49,6 +49,22 @@ __device__ __forceinline__ unsigned int pack_bf16x2(float lo, float hi) {
     return r;
 }
 
+// a * b + c a lane of each pair, each rounded once: one packed f32x2 FMA
+// where the chip has it (sm_100 up), else two.
+__device__ __forceinline__ float2 fma2(float2 a, float2 b, float2 c) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    unsigned long long d;
+    asm("{\n\t.reg .b64 a, b, c;\n\t"
+        "mov.b64 a, {%1, %2};\n\tmov.b64 b, {%3, %4};\n\tmov.b64 c, {%5, %6};\n\t"
+        "fma.rn.f32x2 %0, a, b, c;\n\t}"
+        : "=l"(d)
+        : "f"(a.x), "f"(a.y), "f"(b.x), "f"(b.y), "f"(c.x), "f"(c.y));
+    return make_float2(__uint_as_float(static_cast<unsigned>(d)), __uint_as_float(static_cast<unsigned>(d >> 32)));
+#else
+    return make_float2(fmaf(a.x, b.x, c.x), fmaf(a.y, b.y, c.y));
+#endif
+}
+
 __device__ __forceinline__ unsigned short bf16_as_u16(bf16 v) { return v.raw; }
 __device__ __forceinline__ bf16 u16_as_bf16(unsigned short v) { return bf16{v}; }
 __device__ __forceinline__ unsigned int bf16x2_as_u32(bf16 lo, bf16 hi) {
@@ -306,6 +322,28 @@ __device__ __forceinline__ void pdl_launch() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
     asm volatile("griddepcontrol.launch_dependents;");
 #endif
+}
+
+// A count other blocks of the grid add to, read with acquire at gpu
+// scope: what an adder wrote before its release is visible after.
+__device__ __forceinline__ unsigned ld_acquire_gpu(const unsigned* p) {
+    unsigned v;
+    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+
+// The same count read relaxed, for a spin: an acquire load invalidates the
+// SM's L1 (CCTL.IVALL) each time, which a spinning warp would do every few
+// hundred cycles under its block's other warps. Spin relaxed, then acquire
+// once.
+__device__ __forceinline__ unsigned ld_relaxed_gpu(const unsigned* p) {
+    unsigned v;
+    asm volatile("ld.relaxed.gpu.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+
+__device__ __forceinline__ void red_add_release_gpu(unsigned* p, unsigned v) {
+    asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
 }
 
 // 16 bytes streamed past L1 (read once: weights, codes).

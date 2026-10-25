@@ -9,7 +9,7 @@
 //! is: `messages` is a chat completion, `prompt` a completion, `input` a
 //! response.
 
-use compat::{ApiError, Envelope};
+use compat::{ApiError, Envelope, ResponseFormat, StructuralTag, Structure};
 use serde_json::{Value, json};
 
 pub mod chat_completions;
@@ -82,6 +82,150 @@ fn chat_logprob(token: u32, logprob: &compat::Logprob) -> Value {
     out
 }
 
+/// vLLM's `prompt_logprobs`: `null` for the first prompt token, then for
+/// each token a map from token id to its logprob, rank and text — the
+/// prompt's own token first, then the `top` likeliest.
+fn vllm_prompt_logprobs(prompt: &[(u32, Option<compat::Logprob>)], top: usize) -> Value {
+    let entry = |logprob: f32, rank: Option<u32>, token: u32| json!({"logprob": logprob.max(-9999.0), "rank": rank, "decoded_token": token_text(token)});
+    let rows = prompt.iter().map(|(token, lp)| {
+        let Some(lp) = lp else {
+            return Value::Null;
+        };
+        let mut row = serde_json::Map::new();
+        row.insert(token.to_string(), entry(lp.logprob, lp.rank, *token));
+        for (rank, &(alt, alt_lp)) in (1u32..).zip(lp.top.iter().take(top)) {
+            row.entry(alt.to_string())
+                .or_insert_with(|| entry(alt_lp, Some(rank), alt));
+        }
+        Value::Object(row)
+    });
+    Value::Array(rows.collect())
+}
+
+/// The `prompt_logprobs` field (vLLM's): how many alternatives each prompt
+/// token is scored with. It is not streamed, as vLLM does not.
+fn prompt_logprobs(asked: Option<i64>, stream: bool) -> Result<Option<u32>, ApiError> {
+    let Some(top) = asked else {
+        return Ok(None);
+    };
+    if stream {
+        return Err(invalid(
+            "`prompt_logprobs` is not supported with `stream`",
+            Some("prompt_logprobs"),
+        ));
+    }
+    u32::try_from(top)
+        .ok()
+        .filter(|&k| k <= compat::generate::MAX_TOP_LOGPROBS)
+        .map(Some)
+        .ok_or_else(|| {
+            invalid(
+                format!(
+                    "`prompt_logprobs` must be between 0 and {}",
+                    compat::generate::MAX_TOP_LOGPROBS
+                ),
+                Some("prompt_logprobs"),
+            )
+        })
+}
+
+/// The `response_format` field: `text`, `json_object`, `json_schema`, or
+/// vLLM's and SGLang's `structural_tag` —
+///
+/// ```json
+/// {"type": "structural_tag",
+///  "structures": [{"begin": "<function=get_weather>", "schema": {…}, "end": "</function>"}],
+///  "triggers": ["<function="]}
+/// ```
+///
+/// — free text in which a trigger opens the structures whose `begin` it
+/// starts: the rest of the `begin`, a document the `schema` admits and the
+/// `end` are then forced ([`compat::trigger`]).
+fn response_format(format: Option<Value>) -> Result<ResponseFormat, ApiError> {
+    let blame = Some("response_format");
+    let Some(v) = format else {
+        return Ok(ResponseFormat::Text);
+    };
+    Ok(match v.get("type").and_then(Value::as_str) {
+        None | Some("text") => ResponseFormat::Text,
+        Some("json_object") => ResponseFormat::JsonObject,
+        Some("json_schema") => {
+            let schema = v
+                .get("json_schema")
+                .and_then(|s| s.get("schema"))
+                .ok_or_else(|| {
+                    invalid(
+                        "response_format json_schema needs `json_schema.schema`",
+                        blame,
+                    )
+                })?;
+            ResponseFormat::JsonSchema(schema.to_string())
+        }
+        Some("structural_tag") => ResponseFormat::StructuralTag(structural_tag(&v)?),
+        Some(other) => {
+            return Err(invalid(
+                format!("unknown response_format type `{other}`"),
+                blame,
+            ));
+        }
+    })
+}
+
+/// A `structural_tag` response format's structures and triggers.
+fn structural_tag(v: &Value) -> Result<StructuralTag, ApiError> {
+    let blame = Some("response_format");
+    if v.get("format").is_some() {
+        return Err(invalid(
+            "a structural_tag `format` is not supported; send `structures` and `triggers`",
+            blame,
+        ));
+    }
+    let text = |item: &Value, key: &str| -> Result<String, ApiError> {
+        match item.get(key) {
+            None => Ok(String::new()),
+            Some(Value::String(s)) => Ok(s.clone()),
+            Some(_) => Err(invalid(
+                format!("structural_tag `{key}` must be a string"),
+                blame,
+            )),
+        }
+    };
+    let structures = v
+        .get("structures")
+        .and_then(Value::as_array)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| invalid("structural_tag needs a non-empty `structures` array", blame))?
+        .iter()
+        .map(|item| {
+            let schema = item
+                .get("schema")
+                .ok_or_else(|| invalid("a structural_tag structure needs a `schema`", blame))?;
+            Ok(Structure {
+                begin: text(item, "begin")?,
+                schema: schema.to_string(),
+                end: text(item, "end")?,
+            })
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let triggers = v
+        .get("triggers")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("structural_tag needs a `triggers` array", blame))?
+        .iter()
+        .map(|t| {
+            t.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| invalid("structural_tag triggers must be strings", blame))
+        })
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let tag = StructuralTag {
+        structures,
+        triggers,
+    };
+    tag.validate().map_err(|e| invalid(e, blame))?;
+    Ok(tag)
+}
+
 /// The `n` field: how many choices, at least one. A request of several is
 /// not continued ([`compat::continuation::opt_out`]): its choices' tokens
 /// would interleave in what its frames name.
@@ -99,12 +243,17 @@ fn choices(n: Option<u32>) -> Result<u32, ApiError> {
 }
 
 /// The request of the `index`-th of `n` choices: its own random stream.
+/// The prompt is the same for every choice, so unstreamed only the first
+/// scores it and the response gives its scores to all.
 fn choice_request(req: &compat::Request, index: u32) -> compat::Request {
     let mut req = req.clone();
     req.sampling.seed = req
         .sampling
         .seed
         .wrapping_add(index.wrapping_mul(0x9e37_79b9));
+    if index > 0 && !req.stream {
+        req.sampling.prompt_logprobs = None;
+    }
     req.choice = index;
     req
 }

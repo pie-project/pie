@@ -7,6 +7,14 @@ load("//lib/spoken.poem", "QWEN_STOP")
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP])
 
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: the denoiser's packed q, k and v and its packed fc1 by their
+# heads and channels, the text encoder's q, k and v, gate and up likewise
+# and its output and down projections by their rows. The denoiser's output
+# projection and fc2 it holds whole, as the package always has, so each
+# rank's share is gathered for them, and its timestep embedder.
+CUTS = "inferred"
+
 MODELS = [
     model("minimax-h3-fl2va", template = CHATML, tokenizer = TOKENIZER, arch = "minimax_h3", layers = 50, vocab = 151936),
     model("minimax-h3-mini", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "minimax_h3", layers = 3, vocab = 0),
@@ -21,10 +29,12 @@ DEPLOYMENTS = [
 # embedder, caption refiner, blocks (each with an adaLN projection per
 # modality) and output heads; and the text encoder the full model carries.
 
-def linear(out, in_, banks, bias = True):
-    """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
+def linear(out, in_, banks, bias = True, whole = False):
+    """A projection from `in_` to `out` and, unless `bias` is off, its bias;
+    held whole on every rank if `whole`."""
+    w = weight([out, in_], banks)
     return struct(
-        w = weight([out, in_], banks),
+        w = w.replicated() if whole else w,
         bias = weight([out]) if bias else None,
     )
 
@@ -33,27 +43,23 @@ def encoder(c, layers, banks, sharded = False):
     `sharded`, its attention and mlp split across ranks."""
     hidden, hd, inter = c.hidden, c.head_dim, c.inter
 
-    def columns(w, heads = None):
-        if not sharded:
-            return w
-        return w.columns() if heads == None else w.columns(heads = heads)
-
-    def rows(w):
-        return w.rows() if sharded else w
+    def whole(w):
+        return w if sharded else w.replicated()
 
     def layer(l):
         n = lambda s: "te.layer.{}.{}".format(l, s)
         return struct(
             attn_norm = weight([hidden]),
-            q = columns(weight([c.q_heads * hd, hidden], banks)),
-            k = columns(weight([c.kv_heads * hd, hidden], banks), c.kv_heads),
-            v = columns(weight([c.kv_heads * hd, hidden], banks), c.kv_heads),
-            o = rows(weight([hidden, c.q_heads * hd], banks)),
+            q = whole(weight([c.q_heads * hd, hidden], banks)),
+            k = whole(weight([c.kv_heads * hd, hidden], banks)),
+            v = whole(weight([c.kv_heads * hd, hidden], banks)),
+            o = whole(weight([hidden, c.q_heads * hd], banks)),
             q_norm = weight([hd]),
             k_norm = weight([hd]),
             mlp_norm = weight([hidden]),
-            gate_up = weight([2 * inter, hidden], banks).packed([inter, inter]),
-            down = rows(weight([hidden, inter], banks)),
+            gate = weight([inter, hidden], banks),
+            up = weight([inter, hidden], banks),
+            down = whole(weight([hidden, inter], banks)),
             kv = "te.kv.{}".format(l),
         )
 
@@ -133,16 +139,16 @@ DIMS = {
 def attn(d, banks):
     inner = d.heads * d.head_dim
     return struct(
-        qkv = weight([3 * inner, d.dim], banks).packed([inner, inner, inner]),
+        qkv = weight([3 * inner, d.dim], banks),
         q_norm = weight([d.head_dim]),
         k_norm = weight([d.head_dim]),
-        out = weight([d.dim, inner], banks),
+        out = weight([d.dim, inner], banks).replicated(),
     )
 
 def mlp(prefix, d, banks):
     return struct(
-        fc1 = weight([2 * d.inter, d.dim], banks).packed([d.inter, d.inter]),
-        fc2 = weight([d.dim, d.inter], banks),
+        fc1 = weight([2 * d.inter, d.dim], banks),
+        fc2 = weight([d.dim, d.inter], banks).replicated(),
     )
 
 def block(prefix, d, banks, modulated):
@@ -180,8 +186,8 @@ def layout(id, deploy):
             video_patch = linear(dim, VIDEO_FEATURES, banks),
             audio_patch = linear(dim, AUDIO_CHANNELS, banks),
             condition = linear(dim, d.text_dim, banks),
-            t_in = linear(d.t_hidden, d.t_freq, banks),
-            t_out = linear(d.t_dim, d.t_hidden, banks),
+            t_in = linear(d.t_hidden, d.t_freq, banks, whole = True),
+            t_out = linear(d.t_dim, d.t_hidden, banks, whole = True),
             refine = [block("dit.refine.{}".format(i), d, banks, False) for i in range(d.refiners)],
             refine_norm = weight([dim]),
             blocks = [block("dit.block.{}".format(i), d, banks, True) for i in range(d.blocks)],
@@ -299,7 +305,8 @@ def te_read(reads, te, prefix):
         reads.read(w.q_norm, n("self_attn.q_norm.weight"))
         reads.read(w.k_norm, n("self_attn.k_norm.weight"))
         reads.read(w.mlp_norm, n("post_attention_layernorm.weight"))
-        reads.read_concat(w.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+        reads.read(w.gate, n("mlp.gate_proj.weight"))
+        reads.read(w.up, n("mlp.up_proj.weight"))
         reads.read(w.down, n("mlp.down_proj.weight"))
 
 PIPELINE = "a MiniMax H3 partition (`dit.`/`te.` prefixes)"
@@ -448,10 +455,8 @@ def qwen3_encode(arm, te, tap = None):
         y = ops.elemwise.residual_add(ops.linear.matmul(o, w.o), y)
 
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, te.eps)
-        f = ops.linear.matmul(
-            ops.linear.glu(ops.linear.matmul(x, w.gate_up), gating.swiglu(), te.inter),
-            w.down,
-        )
+        gate, up = ops.linear.matmul(x, w.gate), ops.linear.matmul(x, w.up)
+        f = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), w.down)
         y = ops.elemwise.residual_add(f, y)
         if tap != None:
             tap(l, y)

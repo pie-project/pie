@@ -197,6 +197,11 @@ pub struct DeviceProfile {
     /// side streams (0: every fire).
     pub dag_streams_until: u32,
 
+    /// Whether chains of elementwise and row ops are lowered to kernels-ir
+    /// regions and folded into `fused.region` ops (`fuse::chain`,
+    /// `compiler.synth_regions`).
+    pub synth_regions: bool,
+
     pub family_us: FamilyCosts,
 
     pub exclusive: Vec<String>,
@@ -238,9 +243,11 @@ impl FamilyCosts {
                 | poem_ir::Fused::MatmulSwigluMatmul { .. }
                 | poem_ir::Fused::MatmulSoftcap { .. }
                 | poem_ir::Fused::MatmulBias { .. }
+                | poem_ir::Fused::MatmulMoeRoute { .. }
                 | poem_ir::Fused::MatmulSplitRows { .. }
                 | poem_ir::Fused::MoeSelectGlu { .. }
-                | poem_ir::Fused::MoeExperts { .. } => self.linear,
+                | poem_ir::Fused::MoeExperts { .. }
+                | poem_ir::Fused::MoeMega { .. } => self.linear,
                 poem_ir::Fused::QkvFusedQknormRopeVnormWrite { .. }
                 | poem_ir::Fused::SplitQkvFused { .. } => self.custom,
                 poem_ir::Fused::GdnStep { .. } => self.attn,
@@ -266,8 +273,10 @@ impl FamilyCosts {
                 | poem_ir::Fused::HcPrenormProject { .. }
                 | poem_ir::Fused::HcGatesNorm { .. }
                 | poem_ir::Fused::ResBlendRmsnorm { .. }
+                | poem_ir::Fused::HcFoldPre { .. }
                 | poem_ir::Fused::HcPre { .. }
-                | poem_ir::Fused::GatedResidualNormModulate { .. } => self.elemwise,
+                | poem_ir::Fused::GatedResidualNormModulate { .. }
+                | poem_ir::Fused::Region { .. } => self.elemwise,
             },
             poem_ir::Operation::Conv(_) => self.conv,
         }
@@ -303,6 +312,7 @@ impl Default for DeviceProfile {
             branches: false,
             dag_streams: false,
             dag_streams_until: 0,
+            synth_regions: false,
             family_us: FamilyCosts::default(),
             exclusive: Vec::new(),
             grouped: Vec::new(),

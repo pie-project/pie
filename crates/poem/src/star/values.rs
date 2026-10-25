@@ -141,13 +141,6 @@ fn weight_methods(builder: &mut MethodsBuilder) {
         crate::star::forward::dsl("bank", || WeightValue(this.0.clone().bank(segments.items)))
     }
 
-    /// A conv's weight, its taps major and `c_in` inputs minor.
-    fn conv_taps_major(this: &WeightValue, c_in: u32, taps: u32) -> anyhow::Result<WeightValue> {
-        crate::star::forward::dsl("conv_taps_major", || {
-            WeightValue(this.0.clone().conv_taps_major(c_in, taps))
-        })
-    }
-
     /// The weight is cut along its rows between ranks; `heads` are the
     /// heads its rows hold.
     fn columns(
@@ -166,6 +159,12 @@ fn weight_methods(builder: &mut MethodsBuilder) {
     /// The weight is cut along its last axis between ranks.
     fn rows(this: &WeightValue) -> anyhow::Result<WeightValue> {
         crate::star::forward::dsl("rows", || WeightValue(this.0.clone().rows()))
+    }
+
+    /// Every rank holds the weight whole: what a model states of a weight
+    /// whose cut the compiler would otherwise infer.
+    fn replicated(this: &WeightValue) -> anyhow::Result<WeightValue> {
+        Ok(WeightValue(this.0.clone().replicated()))
     }
 
     /// The weight is read only by row gathers (a hashed table): a card whose
@@ -189,9 +188,9 @@ fn weight_methods(builder: &mut MethodsBuilder) {
     /// every rank holds it whole.
     #[starlark(attribute)]
     fn cut_axis(this: &WeightValue) -> anyhow::Result<NoneOr<u32>> {
-        Ok(match &this.0.shard {
-            crate::Shard::Cut { axis, .. } => NoneOr::Other(*axis),
-            crate::Shard::Replicated => NoneOr::None,
+        Ok(match crate::star::formats::resolved(this.0.clone()).shard {
+            crate::Shard::Cut { axis, .. } => NoneOr::Other(axis),
+            crate::Shard::Replicated | crate::Shard::Inferred => NoneOr::None,
         })
     }
 

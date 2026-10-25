@@ -64,7 +64,7 @@ pub fn held(pid: ProcessId) -> bool {
 pub(crate) fn install(schedule: Option<Table>) {
     *CURRENT.write() = schedule.map(Arc::new);
     crate::inferlet::process::regrant_admission();
-    if let Some(planner) = crate::planner::planner() {
+    for planner in crate::planner::planners() {
         planner.reschedule();
     }
     crate::scheduler::worker::notify_schedule_changed();
