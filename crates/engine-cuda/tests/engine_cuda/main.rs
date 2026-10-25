@@ -87,6 +87,8 @@ mod an_output_of_ids_reads_as_stored;
 mod every_armed_body_answers_its_eager_walk;
 mod every_catalog_deployment_dispatches;
 mod every_diagnostic_is_a_word_the_boot_states;
+#[cfg(feature = "device")]
+mod every_op_agrees_with_the_host_interpreter;
 mod masked_axis;
 mod no_shell_reads_the_environment;
 mod routed_experts_stream;
