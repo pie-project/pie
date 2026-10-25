@@ -7,8 +7,7 @@ world inferlet {
     import pipeline;
     import working-set;
     import channel;
-    import forward;             // every text model
-    import forward-diffusion;   // paged KV plus a denoised canvas
+    import forward;
     import grammar;
     import chat;
     import tools;

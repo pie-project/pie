@@ -14,7 +14,7 @@ pub use check::classes::{
     Class, ClassSet, ClassTable, Fault as ClassFault, fact_width, resolve_classes,
 };
 pub use check::{Fault, check, checked};
-pub use fact::{Builtin, Fact, Facts};
+pub use fact::{Builtin, Fact, Facts, SwitchDecl};
 pub use guard::Guard;
 pub use operands::{Operands, Part, Slot};
 pub use ops::{
@@ -25,12 +25,12 @@ pub use ops::{
     VoxelSegment, Yarn,
 };
 pub use poem_ir_macros::Op;
-pub use request::{Request, Stream};
+pub use request::Request;
 pub use trace::{
-    BlockDrafter, CacheRow, GuestInput, InputDecl, Node, Param, ParamLayout, ParamPlacement, ParamSource, Platform, Seam,
-    Shard, Trace,
+    BlockDrafter, CacheRow, GuestInput, InputDecl, LaneClass, LaneClasses, Node, Param,
+    ParamLayout, ParamPlacement, ParamSource, Platform, Readout, ReadoutKind, Seam, Shard, Trace,
 };
 pub use value::{
-    BIASES, Def, Dim, Dtype, GLOBAL_SCALES, GeomKind, INPUT_SCALES, InputAxis, PerAxis, RowAxis, RuntimeInput,
-    SCALES, Selection, StructKind, TILED_BAND, TILED_STEP, Ty, ValueDecl, ValueId,
+    BIASES, Def, Dim, Dtype, GLOBAL_SCALES, GeomKind, INPUT_SCALES, InputAxis, PerAxis, RowAxis,
+    RuntimeInput, SCALES, Selection, StructKind, TILED_BAND, TILED_STEP, Ty, ValueDecl, ValueId,
 };

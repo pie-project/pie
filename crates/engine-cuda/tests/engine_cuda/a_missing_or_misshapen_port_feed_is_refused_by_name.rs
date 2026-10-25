@@ -4,7 +4,7 @@ use crate::common_dit;
 
 use common_dit::{Rig, WIDTH, Weights, attach, frame, lane};
 use engine::Engine;
-use engine::fire::{InputFeed, LaneStream};
+use engine::fire::InputFeed;
 
 #[test]
 fn a_missing_feed_and_a_wrong_cell_are_refused_by_name() {
@@ -21,7 +21,7 @@ fn a_missing_feed_and_a_wrong_cell_are_refused_by_name() {
     rig.publish(handles.instance, 2, &vec![0.0; rows as usize * 2]);
 
     let latents = rig.input("latents");
-    let mut bare = lane(&rig, 0, &handles, LaneStream::Text, 0);
+    let mut bare = lane(&rig, 0, &handles, "text", 0);
     bare.inputs.retain(|feed| feed.id != latents);
     let refusal = rig
         .engine
@@ -38,7 +38,7 @@ fn a_missing_feed_and_a_wrong_cell_are_refused_by_name() {
     rig.publish(wide.instance, 0, &vec![0.0; (rows as usize + 1) * w]);
     rig.publish(wide.instance, 1, &[0.3]);
     rig.publish(wide.instance, 2, &vec![0.0; (rows as usize + 1) * 2]);
-    let mut short = lane(&rig, 0, &wide, LaneStream::Text, 0);
+    let mut short = lane(&rig, 0, &wide, "text", 0);
     short.tokens = vec![0; rows as usize];
     short.readout = engine::fire::Readout::Rows((0..rows).collect());
     let refusal = rig
@@ -53,7 +53,7 @@ fn a_missing_feed_and_a_wrong_cell_are_refused_by_name() {
         "the refusal names the input and the shapes: {refusal}"
     );
 
-    let mut stray = lane(&rig, 0, &handles, LaneStream::Text, 0);
+    let mut stray = lane(&rig, 0, &handles, "text", 0);
     rig.publish(handles.instance, 0, &vec![0.0; rows as usize * w]);
     let undeclared = rig.inputs.len() as u32;
     stray.inputs.push(InputFeed {

@@ -193,7 +193,6 @@ pub struct Seated<'a> {
     /// on the queue; the fire copies it in behind that pass.
     pub feed: Option<&'a Buffer>,
 
-    pub stream: engine::fire::LaneStream,
     pub group: Option<u32>,
     pub inputs: &'a [(engine::fire::InputFeed, crate::program::InputCell)],
 }
@@ -217,7 +216,6 @@ impl<'a> Seated<'a> {
             rs_reset: engine::fire::RsReset::Inferred,
             rs_slot: None,
             feed: None,
-            stream: engine::fire::LaneStream::Text,
             group: None,
             inputs: &[],
         }
@@ -1236,6 +1234,12 @@ impl Shell {
     #[must_use]
     pub fn inputs(&self) -> Vec<poem_ir::InputDecl> {
         self.feeds.decls(&self.trace, &self.compiled)
+    }
+
+    /// This load's classes and what each runs.
+    #[must_use]
+    pub fn classes(&self) -> poem_ir::LaneClasses {
+        poem_exec::feeds::lane_classes(&self.trace, &self.compiled)
     }
 
     #[must_use]
@@ -2580,7 +2584,6 @@ impl Shell {
             let facts: Vec<poem_exec::fire::LaneFacts> = lanes
                 .iter()
                 .map(|seated| poem_exec::fire::LaneFacts {
-                    stream: seated.stream as u8,
                     group: seated.group,
                 })
                 .collect();
@@ -2588,14 +2591,8 @@ impl Shell {
             let mut packings = Vec::with_capacity(self.feeds.selections.len());
             for &select in &self.feeds.selections {
                 packings.push(
-                    poem_exec::fire::pack(
-                        select,
-                        composition.lanes(),
-                        &facts,
-                        &group_of_lane,
-                        rows,
-                    )
-                    .map_err(|fault| Fault::from(poem_exec::Error::Fire(fault)))?,
+                    poem_exec::fire::pack(select, composition.lanes(), &group_of_lane, rows)
+                        .map_err(|fault| Fault::from(poem_exec::Error::Fire(fault)))?,
                 );
             }
             (group_of_lane, packings)

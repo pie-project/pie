@@ -334,8 +334,11 @@ pub fn model_profile() -> ModelProfile {
         crate::store::registry::get(0, 0).kv_page_size,
         m.num_layers(),
         m.eta_caps(),
-        crate::model::velocity_facts(m.readings()),
-        crate::model::pixels_facts(m.readings()),
+        crate::model::velocity_width(m.classes())
+            .ok()
+            .flatten()
+            .map_or((false, 0), |width| (true, width)),
+        crate::model::pixels_width(m.classes()).map_or((false, 0), |width| (true, width)),
     )
 }
 

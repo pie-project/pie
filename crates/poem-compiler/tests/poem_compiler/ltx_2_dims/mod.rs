@@ -1,6 +1,5 @@
 //! The widths and constants ltx_2's package declares.
 
-pub const VAE_RGB: u32 = 3;
 pub const VAE_PATCH: u32 = 4;
 pub const VAE_EPS: f32 = 1e-8;
 pub const VAE_MID_RESNETS: u32 = 2;
@@ -104,8 +103,3 @@ pub const fn rope_pad(dim: u32, axes: u8) -> u32 {
     let axes = axes as u32;
     dim / 2 - axes * (dim / (2 * axes))
 }
-
-pub const DENOISE: u8 = 0;
-pub const REFINE_VIDEO: u8 = 1;
-pub const REFINE_AUDIO: u8 = 2;
-pub const VAE_DECODE: u8 = 3;

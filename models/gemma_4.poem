@@ -91,7 +91,6 @@ SLIDING = 0
 GLOBAL = 1
 
 SELF_COND_TAPS = 64
-CANVAS = 256
 
 ASSISTANT_HIDDEN = 1024
 ASSISTANT_INTER = 8192
@@ -489,11 +488,6 @@ def layout(id, deploy):
         dflash = dflash_declare(DFLASH_26B_A4B, "aux", hidden, d.vocab, d.norm_eps, w, dense) if drafter == "dflash" else None,
     )
 
-def diffusion(m):
-    if m.self_cond == None:
-        return None
-    return canvas(canvas = CANVAS, hidden = m.hidden)
-
 # How a Gemma 4 checkpoint is laid out: transformers', mlx_lm's and GGUF's
 # spellings, and DiffusionGemma's own.
 
@@ -843,6 +837,10 @@ def readout_tail(m, inputs, dr):
 
 def forward(m, inputs):
     dr = m.dflash
+    if m.self_cond != None:
+        switch("mode", ["encode", "denoise"])
+    if dr != None:
+        switch("block_draft", ["off", "on"])
     trunk_inputs = inputs.on(~block_rows(dr)) if dr != None else inputs
     positions = trunk_inputs.positions()
 
@@ -858,8 +856,9 @@ def forward(m, inputs):
 
     if m.self_cond != None:
         sc = m.self_cond
-        den, enc = y.on(fact.denoise()), y.on(~fact.denoise())
-        input_den = inputs.on(fact.denoise())
+        denoise = switch_is("mode", "denoise")
+        den, enc = y.on(denoise), y.on(~denoise)
+        input_den = inputs.on(denoise)
         soft = ops.gather.embed_weighted(
             input_den.input("self_cond_ids", dtype.i32, "row", sc.taps),
             input_den.input("self_cond_weights", dtype.f32, "row", sc.taps),
@@ -919,7 +918,7 @@ def forward(m, inputs):
         # Each lane by its kind (the tail's whole rows are lanes that mask or
         # capture scores, so only those two), a denoise lane over every key it
         # holds; a global layer's scores go out at their seam.
-        causal = ~fact.denoise() if m.self_cond != None else None
+        causal = ~switch_is("mode", "denoise") if m.self_cond != None else None
         a = ops.attn.attend(q, trunk_inputs, at.kv, m.q_heads, kv_heads, d, at.sm_scale, window = win,
                             causal = causal, mask = True, scores = True, scores_seam = at.reading != SLIDING)
         seam.at(seam.ATTN_OUT, [a])

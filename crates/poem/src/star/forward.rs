@@ -257,21 +257,6 @@ fn input_methods(builder: &mut MethodsBuilder) {
         }
         Ok(carried)
     }
-
-    /// What `read` computes over the rows of passes that run the reading
-    /// `name`.
-    fn reading<'v>(
-        this: &InputHandle,
-        #[starlark(require = pos)] name: &str,
-        #[starlark(require = pos)] read: Star<'v>,
-        eval: &mut Evaluator<'v, '_, '_>,
-    ) -> anyhow::Result<Star<'v>> {
-        let i = input_of(*this);
-        let rows = dsl("reading", || i.on(fact::reading(name))).map(hold_input)?;
-        let heap = eval.heap();
-        eval.eval_function(read, &[heap.alloc(rows)], &[])
-            .map_err(|e| anyhow::anyhow!("{e}"))
-    }
 }
 
 /// The caches a forward declares, while its `caches` runs.
@@ -399,7 +384,7 @@ fn arm_of(v: Star<'_>) -> anyhow::Result<Vec<Value>> {
         .map(|item| {
             item.downcast_ref::<ValueHandle>()
                 .map(|h| held(*h))
-                .ok_or_else(|| anyhow::anyhow!("a switch arm's tuple holds {}", item.get_type()))
+                .ok_or_else(|| anyhow::anyhow!("a branch arm's tuple holds {}", item.get_type()))
         })
         .collect()
 }
@@ -410,7 +395,7 @@ pub(crate) fn forward(builder: &mut GlobalsBuilder) {
     /// `arm(rows)` over the rows it is the first to hold for, `otherwise` over
     /// the rows none holds for, and the arms' results (a value, or a tuple of
     /// them each) are joined over all of them.
-    fn switch<'v>(
+    fn branch<'v>(
         #[starlark(require = pos)] x: Star<'v>,
         #[starlark(require = pos)] cases: UnpackList<Star<'v>>,
         #[starlark(require = named, default = NoneOr::None)] otherwise: NoneOr<Star<'v>>,
@@ -438,12 +423,12 @@ pub(crate) fn forward(builder: &mut GlobalsBuilder) {
         }
         let width = arms.first().map_or(1, Vec::len);
         if arms.iter().any(|a| a.len() != width) {
-            anyhow::bail!("a switch's arms compute the same number of values");
+            anyhow::bail!("a branch's arms compute the same number of values");
         }
         let joined: Vec<Value> = (0..width)
             .map(|i| {
                 let column: Vec<Value> = arms.iter().map(|a| a[i].clone()).collect();
-                dsl("switch", || <Value as crate::Arm>::join(column))
+                dsl("branch", || <Value as crate::Arm>::join(column))
             })
             .collect::<anyhow::Result<_>>()?;
         let heap = eval.heap();
@@ -453,6 +438,28 @@ pub(crate) fn forward(builder: &mut GlobalsBuilder) {
                 many.iter().map(|v| hold(v.clone())).collect::<Vec<_>>(),
             )),
         })
+    }
+
+    /// Declares the model's switch `name` over `values`, the first its
+    /// default: what a lane may set it to, each value a path the forward
+    /// may branch on with `switch_is`.
+    fn switch(
+        #[starlark(require = pos)] name: &str,
+        #[starlark(require = pos)] values: UnpackList<String>,
+    ) -> anyhow::Result<NoneType> {
+        let rec = with(|t| t.inputs.first().map(|i| i.recorder().clone()))
+            .ok_or_else(|| anyhow::anyhow!("a switch is declared while `forward` runs"))?;
+        let values: Vec<&str> = values.items.iter().map(String::as_str).collect();
+        dsl("switch", || rec.declare_switch(name, &values))?;
+        Ok(NoneType)
+    }
+
+    /// The rows whose switch `name` is set to `value`.
+    fn switch_is(
+        #[starlark(require = pos)] name: &str,
+        #[starlark(require = pos)] value: &str,
+    ) -> anyhow::Result<PredicateValue> {
+        Ok(PredicateValue(fact::switch_is(name, value)))
     }
 
     /// States the block drafter whose proposals `logits` reads out: blocks of
@@ -533,32 +540,12 @@ fn facts(builder: &mut GlobalsBuilder) {
         Ok(PredicateValue(fact::drafts()))
     }
 
-    fn block_draft() -> anyhow::Result<PredicateValue> {
-        Ok(PredicateValue(fact::block_draft()))
-    }
-
     fn scores() -> anyhow::Result<PredicateValue> {
         Ok(PredicateValue(fact::scores()))
     }
 
-    fn denoise() -> anyhow::Result<PredicateValue> {
-        Ok(PredicateValue(fact::denoise()))
-    }
-
     fn encode() -> anyhow::Result<PredicateValue> {
         Ok(PredicateValue(fact::encode()))
-    }
-
-    /// The rows of the stream `name` (text, image, video, audio, context,
-    /// reference).
-    fn stream(#[starlark(require = pos)] name: &str) -> anyhow::Result<PredicateValue> {
-        let stream = crate::star::generative::stream(name)?;
-        Ok(PredicateValue(fact::stream(stream)))
-    }
-
-    /// The rows of the reading `name`.
-    fn reading(#[starlark(require = pos)] name: &str) -> anyhow::Result<PredicateValue> {
-        Ok(PredicateValue(fact::reading(name)))
     }
 }
 

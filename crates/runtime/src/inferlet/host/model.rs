@@ -3,30 +3,6 @@ use crate::inferlet::host::pie;
 use crate::model;
 use anyhow::Result;
 
-pub fn lane_stream(stream: poem::Stream) -> pie::inferlet::model::LaneStream {
-    use pie::inferlet::model::LaneStream;
-    match stream {
-        poem::Stream::Text => LaneStream::Text,
-        poem::Stream::Image => LaneStream::Image,
-        poem::Stream::Video => LaneStream::Video,
-        poem::Stream::Audio => LaneStream::Audio,
-        poem::Stream::Context => LaneStream::Context,
-        poem::Stream::Reference => LaneStream::Reference,
-    }
-}
-
-pub fn catalog_stream(stream: pie::inferlet::model::LaneStream) -> poem::Stream {
-    use pie::inferlet::model::LaneStream;
-    match stream {
-        LaneStream::Text => poem::Stream::Text,
-        LaneStream::Image => poem::Stream::Image,
-        LaneStream::Video => poem::Stream::Video,
-        LaneStream::Audio => poem::Stream::Audio,
-        LaneStream::Context => poem::Stream::Context,
-        LaneStream::Reference => poem::Stream::Reference,
-    }
-}
-
 fn axis_role(role: poem::generative::AxisRole) -> pie::inferlet::model::AxisRole {
     use pie::inferlet::model::AxisRole;
     match role {
@@ -37,13 +13,16 @@ fn axis_role(role: poem::generative::AxisRole) -> pie::inferlet::model::AxisRole
     }
 }
 
-fn readout_kind(kind: poem::generative::ReadoutKind) -> pie::inferlet::model::ReadoutKind {
+fn readout(readout: poem_ir::Readout) -> pie::inferlet::model::Readout {
     use pie::inferlet::model::ReadoutKind;
-    match kind {
-        poem::generative::ReadoutKind::Logits => ReadoutKind::Logits,
-        poem::generative::ReadoutKind::Velocity => ReadoutKind::Velocity,
-        poem::generative::ReadoutKind::Hidden => ReadoutKind::Hidden,
-        poem::generative::ReadoutKind::Pixels => ReadoutKind::Pixels,
+    pie::inferlet::model::Readout {
+        kind: match readout.kind {
+            poem_ir::ReadoutKind::Logits => ReadoutKind::Logits,
+            poem_ir::ReadoutKind::Velocity => ReadoutKind::Velocity,
+            poem_ir::ReadoutKind::Hidden => ReadoutKind::Hidden,
+            poem_ir::ReadoutKind::Pixels => ReadoutKind::Pixels,
+        },
+        width: readout.width,
     }
 }
 
@@ -67,78 +46,15 @@ pub(crate) fn input_decl(input: &poem_ir::InputDecl) -> pie::inferlet::model::In
     }
 }
 
-/// The lane `switches` name: its reading (the model's one when unnamed),
-/// stream (`text` when unnamed) and, on a diffusion model, whether its canvas
-/// denoises (`encode` when unnamed).
-pub(crate) type LaneOf = (
-    Option<&'static poem::generative::ReadingFact>,
-    poem::Stream,
-    bool,
-);
-
-pub(crate) fn lane_of(switches: &[(String, String)]) -> Result<LaneOf, String> {
-    let model = model::model();
-    let mut reading = None;
-    let mut stream = None;
-    let mut denoise = false;
-    for (name, value) in switches {
-        match name.as_str() {
-            "canvas" if model.diffusion().is_some() => {
-                denoise = match value.as_str() {
-                    "encode" => false,
-                    "denoise" => true,
-                    other => return Err(format!("a canvas is `encode` or `denoise`, not `{other}`")),
-                };
-            }
-            poem::Request::READING => {
-                let found = model
-                    .readings()
-                    .iter()
-                    .find(|r| r.name == *value)
-                    .ok_or_else(|| format!("this model declares no reading `{value}`"))?;
-                reading = Some(found);
-            }
-            poem::Request::STREAM => {
-                let found = poem::Stream::ALL
-                    .into_iter()
-                    .find(|s| s.name() == value)
-                    .ok_or_else(|| format!("no lane is of a stream `{value}`"))?;
-                stream = Some(found);
-            }
-            other => return Err(format!("no lane switch is named `{other}`")),
-        }
-    }
-    let reading = match reading {
-        Some(reading) => Some(reading),
-        None if model.readings().len() > 1 => {
-            return Err(format!(
-                "this model declares {} readings and the switches name none",
-                model.readings().len()
-            ));
-        }
-        None => model.sole_reading(),
-    };
-    Ok((reading, stream.unwrap_or_default(), denoise))
-}
-
-fn reading_fact(reading: &poem::generative::ReadingFact) -> pie::inferlet::model::ReadingFact {
-    pie::inferlet::model::ReadingFact {
-        name: reading.name.to_string(),
-        index: reading.index,
-        has_kv: reading.has_kv,
-        takes_tokens: reading.takes_tokens,
-        streams: reading.streams.iter().copied().map(lane_stream).collect(),
-        positions: reading.positions.as_ref().map(|convention| {
-            pie::inferlet::model::PositionConvention {
-                axes: convention.axes.iter().copied().map(axis_role).collect(),
-                text_axis: convention.text_axis,
-                text_origin: convention.text_origin,
-                image_follows_text: convention.image_follows_text,
-                reference_stride: convention.reference_stride,
-            }
-        }),
-        readout: readout_kind(reading.readout),
-        readout_width: reading.readout_width,
+fn position_convention(
+    convention: &poem::generative::PositionConvention,
+) -> pie::inferlet::model::PositionConvention {
+    pie::inferlet::model::PositionConvention {
+        axes: convention.axes.iter().copied().map(axis_role).collect(),
+        text_axis: convention.text_axis,
+        text_origin: convention.text_origin,
+        image_follows_text: convention.image_follows_text,
+        reference_stride: convention.reference_stride,
     }
 }
 
@@ -170,56 +86,43 @@ impl pie::inferlet::model::Host for ProcessCtx {
         )
     }
 
-    async fn pass_kind(&mut self) -> Result<pie::inferlet::model::ForwardKind> {
-        use crate::pipeline::instance::PassKind;
-        use pie::inferlet::model::ForwardKind;
-        Ok(match model::model().pass_kind() {
-            PassKind::Text => ForwardKind::Text,
-            PassKind::Diffusion => ForwardKind::Diffusion,
-        })
-    }
-
-    async fn canvas(&mut self) -> Result<Option<pie::inferlet::model::CanvasShape>> {
+    async fn switches(&mut self) -> Result<Vec<pie::inferlet::model::SwitchDecl>> {
         Ok(model::model()
-            .diffusion()
-            .map(|d| pie::inferlet::model::CanvasShape {
-                length: d.canvas,
-                hidden: d.hidden,
-            }))
+            .facts()
+            .switches
+            .iter()
+            .map(|decl| pie::inferlet::model::SwitchDecl {
+                name: decl.name.clone(),
+                values: decl.values.clone(),
+            })
+            .collect())
     }
 
-    async fn readings(&mut self) -> Result<Vec<pie::inferlet::model::ReadingFact>> {
-        Ok(model::model().readings().iter().map(reading_fact).collect())
+    async fn positions(&mut self) -> Result<Option<pie::inferlet::model::PositionConvention>> {
+        Ok(model::model()
+            .generative()
+            .and_then(|g| g.positions.as_ref())
+            .map(position_convention))
     }
 
     async fn lane(
         &mut self,
         switches: Vec<(String, String)>,
     ) -> Result<std::result::Result<pie::inferlet::model::LaneDecl, String>> {
-        let (reading, stream, denoise) = match lane_of(&switches) {
+        let model = model::model();
+        let lane = match model.lane(&switches) {
             Ok(lane) => lane,
             Err(error) => return Ok(Err(error)),
         };
-        let model = model::model();
-        let inputs = model
-            .lane_inputs(reading.map(|r| r.name.as_str()), stream, denoise, false)
-            .into_iter()
-            .map(|id| input_decl(&model.inputs()[id as usize]))
-            .collect();
         Ok(Ok(pie::inferlet::model::LaneDecl {
-            inputs,
-            reads_kv: reading.is_none_or(|r| r.has_kv),
-            embeds: reading.is_none_or(|r| r.takes_tokens),
-            readout: match reading {
-                Some(r) => pie::inferlet::model::Readout {
-                    kind: readout_kind(r.readout),
-                    width: r.readout_width,
-                },
-                None => pie::inferlet::model::Readout {
-                    kind: pie::inferlet::model::ReadoutKind::Logits,
-                    width: model.vocab_size(),
-                },
-            },
+            inputs: lane
+                .inputs
+                .iter()
+                .map(|&id| input_decl(&model.inputs()[id as usize]))
+                .collect(),
+            reads_kv: lane.reads_kv,
+            embeds: lane.embeds,
+            readout: lane.readout.map(readout),
         }))
     }
 
@@ -254,9 +157,9 @@ impl pie::inferlet::model::Host for ProcessCtx {
                 stream_shifts: s
                     .stream_shifts
                     .iter()
-                    .map(|&(stream, shift)| pie::inferlet::model::StreamShift {
-                        lane: lane_stream(stream),
-                        shift,
+                    .map(|(stream, shift)| pie::inferlet::model::StreamShift {
+                        lane: stream.clone(),
+                        shift: *shift,
                     })
                     .collect(),
             }))

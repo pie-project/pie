@@ -31,6 +31,14 @@ class Event_Done:
 Event = Union[Event_Delta, Event_Interrupt, Event_Done]
 
 
+class ReasoningEffort(Enum):
+    """
+    The reasoning effort a thinking request names.
+    """
+    XHIGH = 0
+    MEDIUM = 1
+    LOW = 2
+
 class Decoder:
     """
     Classifies generated tokens.
@@ -77,6 +85,22 @@ def user(message: str) -> List[int]:
 def system_user(system: str, user: str) -> List[int]:
     raise NotImplementedError
 def assistant(message: str) -> List[int]:
+    raise NotImplementedError
+def system_thinking(message: Optional[str], effort: ReasoningEffort) -> List[int]:
+    """
+    The system turn of a request the model answers with thinking, as its
+    template renders it: the template's reasoning-effort instruction ahead
+    of `message`, in a system turn of its own when `message` is `none`.
+    `system(message)` (or nothing) where the template has no instruction.
+    """
+    raise NotImplementedError
+def open(system: Optional[str], tools: List[str], effort: Optional[ReasoningEffort]) -> List[int]:
+    """
+    The system turn a conversation opens with, as the template writes it
+    from the request's system message, its tools, and the reasoning effort
+    of a request the model answers with thinking (`none` for one it
+    answers without).
+    """
     raise NotImplementedError
 def cue() -> List[int]:
     """

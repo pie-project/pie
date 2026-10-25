@@ -1,5 +1,5 @@
 //! DiffusionGemma's reference sampler, as transformers' `generate` spells it
-//! (`generation_diffusion_gemma.py`), written against `forward-diffusion`.
+//! (`generation_diffusion_gemma.py`), written against the model's `mode` switch.
 //!
 //! One canvas at a time. An `encode` pass prefills the prompt; then, per
 //! block, a `denoise` pass over a canvas of uniform-random ids is resubmitted
@@ -19,6 +19,9 @@
 //! every canvas reads zeros (no signal), as the reference does. Multi-canvas speculation is not attempted.
 
 use inferlet::eta::diffusion::prelude::*;
+
+/// The tokens one block's canvas is.
+const CANVAS: u32 = 256;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -91,11 +94,10 @@ fn noise_canvas(seed: u32, length: u32, vocab: u32) -> Vec<i32> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Diffusion {
+    if !model::switch("mode").is_some_and(|mode| mode.values.iter().any(|v| v == "denoise")) {
         return Err("this program drives a block-diffusion model; the bound model is not one".into());
     }
-    let shape = model::canvas().ok_or("a diffusion model states its canvas")?;
-    let length = shape.length;
+    let length = CANVAS;
     let taps = self_cond_taps()?;
     // The canvas attends both ways, so the runtime cannot cut it: one fire reads every row.
     let readable = max_readout_rows(model::ReadoutKind::Logits);
@@ -183,7 +185,7 @@ async fn main(input: Input) -> Result<Output> {
             Channel::from_shaped([length, taps], vec![0f32; (length * taps) as usize]).named("tap_weights");
 
         let fwd = ForwardPass::new();
-        fwd.canvas(Mode::Denoise)?;
+        fwd.switch("mode", "denoise")?;
         fwd.embed(&toks, &embed_indptr)?;
         fwd.state(
             &[&ws],
@@ -317,7 +319,7 @@ async fn main(input: Input) -> Result<Output> {
 /// The self-conditioning taps per canvas row: the width of the denoise
 /// lane's `self_cond_ids` input.
 fn self_cond_taps() -> Result<u32> {
-    let lane = model::lane(&[("canvas".into(), "denoise".into())])?;
+    let lane = model::lane_of(&[("mode", "denoise")])?;
     let input = lane.inputs.iter().find(|input| input.name == "self_cond_ids");
     Ok(input.ok_or("the denoise lane reads no `self_cond_ids` input")?.width)
 }
@@ -335,7 +337,6 @@ async fn encode(ws: &WorkingSet, pipe: &Pipeline, tokens: &[i32], base: u32) -> 
     let last = Channel::new([1], dtype::i32).named("last_e");
 
     let fwd = ForwardPass::new();
-    fwd.canvas(Mode::Encode)?;
     fwd.embed(&toks, &embed_indptr)?;
     fwd.state(
         &[ws],

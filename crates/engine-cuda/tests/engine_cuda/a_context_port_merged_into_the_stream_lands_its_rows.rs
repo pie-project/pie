@@ -2,11 +2,10 @@
 
 use crate::common_dit::{Lcg, NAME, Rig, WIDTH, Weights, assert_close, attach, bf, frame, lane};
 use engine::Engine;
-use engine::fire::LaneStream;
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Stream, Trace, Value, Weight,
-    ops, seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Trace, Value, Weight, ops,
+    seam, trace_hybrid,
 };
 use poem_ir::InputAxis;
 
@@ -19,9 +18,13 @@ impl ForwardHybrid for MergedBlock {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
+        inputs.recorder().declare_switch(
+            "stream",
+            &["text", "image", "video", "audio", "context", "reference"],
+        );
         let (txt, img) = (
-            inputs.on(fact::stream(Stream::Text)),
-            inputs.on(!fact::stream(Stream::Text)),
+            inputs.on(fact::switch_is("stream", "text")),
+            inputs.on(!fact::switch_is("stream", "text")),
         );
         let x_txt = txt.input("context", Dtype::Bf16, InputAxis::Row, WIDTH, None);
         let embed = Weight::sym("embed", [u64::from(WIDTH), u64::from(WIDTH)], Dtype::Bf16);
@@ -135,8 +138,8 @@ fn the_merged_context_rows_and_the_f32_lane_chain_land_the_reference() {
             rig.publish(handles.instance, 2, &vec![0.0; rows * 2]);
         }
         let slot = 2 * req;
-        let text_lane = lane(&rig, slot, &t, LaneStream::Text, req);
-        let image_lane = lane(&rig, slot + 1, &i, LaneStream::Image, req);
+        let text_lane = lane(&rig, slot, &t, "text", req);
+        let image_lane = lane(&rig, slot + 1, &i, "image", req);
         attachments.push(attach(lanes.len() as u32, &t));
         lanes.push(text_lane);
         attachments.push(attach(lanes.len() as u32, &i));

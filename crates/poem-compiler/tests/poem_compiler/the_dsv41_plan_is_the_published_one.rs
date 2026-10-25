@@ -5,7 +5,7 @@
 //! and its Causal Encoder-Decoder's bounded replay, where a prompt's
 //! leading rows run the encoder alone.
 
-use poem_ir::{Attn, CacheRow, Fact, Operands, Operation, Platform, Sampling};
+use poem_ir::{Attn, Builtin, CacheRow, Fact, Operands, Operation, Platform, Sampling};
 
 #[test]
 fn the_dsv41_plan_is_the_published_one() {
@@ -93,7 +93,7 @@ fn the_dsv41_plan_is_the_published_one() {
         .facts
         .table
         .iter()
-        .position(|fact| *fact == Fact::Flag("encode".into()))
+        .position(|fact| *fact == Fact::Builtin(Builtin::Encode))
         .expect("the trace reads the encode flag");
     let skipped = 1u64 << encode;
     let mut floored = 0;

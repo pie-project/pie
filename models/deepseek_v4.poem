@@ -1458,19 +1458,21 @@ def forward(m, inputs):
     ds = m.dspark
     # A DSpark deployment's drafted blocks run its stages alone: the trunk
     # runs every other lane, its plans and tokens theirs.
-    trunk = inputs.on(~fact.block_draft()) if ds != None else inputs
+    if ds != None:
+        switch("block_draft", ["off", "on"])
+    trunk = inputs.on(~switch_is("block_draft", "on")) if ds != None else inputs
     positions = inputs.positions()
     kvh = kv_heads(m)
     plan = ops.attn.plan_prefill(trunk, m.heads, kvh, m.head_dim, m.window)
     ids = inputs.tokens()
     if ds != None:
-        ids = ids.on(~fact.block_draft())
+        ids = ids.on(~switch_is("block_draft", "on"))
     streams = ops.elemwise.hc_expand(ops.gather.embed(ids, m.embed, m.vocab), hy.streams)
     adapters = inputs.adapter_routes()
     floor = None
     replay_plan = None
     if m.decoder != None:
-        floor = replay_floor(inputs, positions.on(~fact.block_draft()) if ds != None else positions)
+        floor = replay_floor(inputs, positions.on(~switch_is("block_draft", "on")) if ds != None else positions)
         # The decoder's rows are its own classes': a plan of their own.
         replayed = trunk.on(~fact.encode())
         replay_plan = ops.attn.plan_prefill(replayed, m.heads, kvh, m.head_dim, m.window)
@@ -1541,7 +1543,7 @@ def dspark_block(m, whole, rows, ends):
     DSpark stages: each row reads its stage's window and the whole block."""
     ds = m.dspark
     hy = m.hyper
-    drafted = whole.on(fact.block_draft())
+    drafted = whole.on(switch_is("block_draft", "on"))
     ids = drafted.tokens()
     streams = ops.elemwise.hc_expand(ops.gather.embed(ids, m.embed, m.vocab), hy.streams)
     block_rows = struct(
@@ -1553,7 +1555,7 @@ def dspark_block(m, whole, rows, ends):
         kv_heads = rows.kv_heads,
         floor = None,
         replay_plan = None,
-        ends = ends.on(fact.block_draft()),
+        ends = ends.on(switch_is("block_draft", "on")),
     )
     trail = NO_TRAIL
     for st in ds.stages:
@@ -1566,7 +1568,7 @@ def dspark_readout(m, inputs, logits, ends):
     drafted block's logits through the Markov head, each row biased by the
     token the row before it picked, and those picks."""
     ds = m.dspark
-    drafting = fact.block_draft()
+    drafting = switch_is("block_draft", "on")
     block_drafter(
         logits,
         rows = ds.block,
@@ -1774,7 +1776,7 @@ def layer(m, rows, w, streams, trail, following = None, narrow = False, replays 
         # The correction lands on every row it is read for: a replaying
         # layer's, the decoder's (a DSpark deployment's trunk's).
         if m.dspark != None:
-            o = o.on(~fact.block_draft())
+            o = o.on(~switch_is("block_draft", "on"))
         o = o.on(~fact.encode())
     streams = ops.elemwise.hc_fold(o, streams, post_mix, comb_mix)
 

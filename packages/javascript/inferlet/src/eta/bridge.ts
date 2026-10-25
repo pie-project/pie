@@ -1,7 +1,7 @@
 // The author-facing ETA bridge over the WIT forward surface — port of
 // `crates/inferlet/src/eta.rs`.
 //
-// `ForwardPass` wraps the `pie:inferlet/forward*` resources and drives the
+// `ForwardPass` wraps the `pie:inferlet/forward` resource and drives the
 // neutral `Builder`, lowering author stage closures to the ETA container. A
 // `Channel` owns both the trace declaration and the WIT resource.
 //
@@ -12,7 +12,6 @@
 
 import * as witChannel from 'pie:inferlet/channel@0.3.0';
 import * as witForward from 'pie:inferlet/forward@0.3.0';
-import * as witDiffusion from 'pie:inferlet/forward-diffusion@0.3.0';
 import * as witModel from 'pie:inferlet/model@0.3.0';
 import * as witPipeline from 'pie:inferlet/pipeline@0.3.0';
 import * as witWs from 'pie:inferlet/working-set@0.3.0';
@@ -23,8 +22,6 @@ import { kernel } from './intrinsics.js';
 import { Dtype, Port, Shape, Stage, numel, portName, shapeOf } from './ir.js';
 import { ChannelState, TraceError } from './trace.js';
 import { ConstData, ConstLike, Tensor, constData, reshape, unpackElems } from './value.js';
-
-export type ForwardKind = witModel.ForwardKind;
 
 /** A host-side refusal (`pie:inferlet` declares `type error = string`). */
 export class InferletError extends Error {
@@ -339,9 +336,9 @@ export class Pipeline {
     const live = slots.filter((p): p is ForwardPass => p !== undefined);
     for (const p of live) p.attachProgram();
     if (!live.length) return;
-    const borrows: (AnyPass | undefined)[] = slots.map((p) => p?.wit);
+    const borrows: (witForward.ForwardPass | undefined)[] = slots.map((p) => p?.wit);
     while (borrows.length < k) borrows.push(undefined);
-    live[0].submitWith(this, borrows);
+    wit('submit', () => witForward.submit(this.wit, borrows));
   }
 
   /**
@@ -354,9 +351,10 @@ export class Pipeline {
     // Live slots per frame. A pass that binds a dense device mask takes one;
     // so does a pass on a model with recurrent state, whose frame's waves
     // carry the same sequence's state one into the next (a frame of one live
-    // slot measured faster than a full one on Qwen3.5-0.8B), and a canvas,
-    // which is redrawn whole. Any other pass fills the frame.
-    const r = fwd.bindsDeviceMask() || rsStateSize() > 0 || fwd.kind === 'diffusion' ? 1 : frameSize();
+    // slot measured faster than a full one on Qwen3.5-0.8B), and a pass off
+    // its model's default path (a canvas redrawn whole), which redraws what
+    // the last wrote. Any other pass fills the frame.
+    const r = fwd.bindsDeviceMask() || rsStateSize() > 0 || fwd.switched() ? 1 : frameSize();
     const windowFrames = Math.max(Math.floor(witModel.runAheadWindow() / Math.max(r, 1)), 1);
     let submitted = 0;
     let consumed = 0;
@@ -462,18 +460,14 @@ export function readoutSpans(n: number, kind: witModel.ReadoutKind): [number, nu
 // ForwardPass
 // ---------------------------------------------------------------------------
 
-type AnyPass = witForward.ForwardPass | witDiffusion.ForwardPass;
-
 const SITE_BITS: Record<string, number> = { q: 1, k: 2, v: 4, o: 8, gate_up: 16, down: 32 };
 
 /**
- * The forward-pass builder over one `pie:inferlet/forward*` interface,
- * selected by `kind` (default: `model.passKind()`).
+ * The forward-pass builder over `pie:inferlet/forward`: what a model's lanes
+ * bind, the switches they run under, and the program the fires run.
  */
 export class ForwardPass {
-  readonly kind: ForwardKind;
-  readonly wit: AnyPass;
-  private readonly mod: typeof witForward | typeof witDiffusion;
+  readonly wit: witForward.ForwardPass;
   private ports: [Port, Channel][] = [];
   private inputs: Channel[] = [];
   private stages: [Stage, () => void][] = [];
@@ -485,13 +479,10 @@ export class ForwardPass {
   /** Keeps the bound working sets alive while the pass is bound. */
   private lanes: WorkingSet[] = [];
   private foldAll: Channel | undefined;
+  private switches: [string, string][] = [];
 
-  constructor(kind?: ForwardKind) {
-    this.kind = kind ?? witModel.passKind();
-    if (this.kind === 'text') this.mod = witForward;
-    else if (this.kind === 'diffusion') this.mod = witDiffusion;
-    else throw new Error(`unknown forward kind ${String(this.kind)}`);
-    this.wit = new this.mod.ForwardPass();
+  constructor() {
+    this.wit = new witForward.ForwardPass();
     this.vocab = witModel.outputVocabSize();
     this.pageSize = kvPageSize();
   }
@@ -522,12 +513,6 @@ export class ForwardPass {
     this.ensurePortsAvailable([Port.READOUT]);
     wit('readout', () => this.wit.readout(indices.wit()));
     this.ports.push([Port.READOUT, indices]);
-  }
-
-  /** These rows are a block drafter's proposal, not the sequence's own. */
-  setDraftingBlock(on: boolean): void {
-    this.requireKind(['text'], 'setDraftingBlock');
-    wit('setDraftingBlock', () => (this.wit as witForward.ForwardPass).setDraftingBlock(on));
   }
 
   /** Carry the payloads of `media.Image` / `media.Audio` spans, order-matched
@@ -566,19 +551,27 @@ export class ForwardPass {
 
   /** Slots to keep a recurrent state at, so a later pass over these tokens resumes there. */
   checkpoints(slots: ArrayLike<number>): void {
-    this.requireKind(['text'], 'checkpoints');
-    wit('checkpoints', () => (this.wit as witForward.ForwardPass).checkpoints(Uint32Array.from(slots)));
+    wit('checkpoints', () => this.wit.checkpoints(Uint32Array.from(slots)));
   }
 
-  private requireKind(kinds: ForwardKind[], what: string): void {
-    if (!kinds.includes(this.kind)) throw new InferletError(`${what} binds a ${kinds.join(' / ')} pass; this pass is ${this.kind}`);
+  /** Set the model's switch `name` to `value` (`model.switches()`): which
+   * path this pass's lanes run. Before the program. */
+  switch(name: string, value: string): void {
+    if (this.programAttached) throw new InferletError('forward pass program is already attached');
+    wit('switch', () => this.wit.switch(name, value));
+    this.switches.push([name, value]);
   }
 
-  /** Which of the family's declared readings (`model.readings()`) this pass
-   * runs — `"text"`, `"denoise"`, `"vae.decode"`, ... Optional when the model
-   * declares at most one; before the program. */
-  reading(name: string): void {
-    wit('reading', () => this.wit.reading(name));
+  /** Whether a switch of this pass is off its model's default: a path a
+   * model runs apart from its default one (a canvas a block-diffusion text
+   * redraws whole) posts one fire at a time. */
+  switched(): boolean {
+    if (!this.switches.length) return false;
+    const declared = witModel.switches();
+    return this.switches.some(([name, value]) => {
+      const decl = declared.find((d) => d.name === name);
+      return decl !== undefined && decl.values[0] !== value;
+    });
   }
 
   /** Bind `ch` to the model's input `name` (`model.lane(...).inputs`), read
@@ -589,21 +582,9 @@ export class ForwardPass {
     this.inputs.push(ch);
   }
 
-  /** Which lane stream this pass's rows are. Default `'text'`. */
-  stream(s: witModel.LaneStream): void {
-    wit('stream', () => this.wit.stream(s));
-  }
-
   /** Put this pass's lanes in attention group `id` within a frame. */
   group(id: number): void {
     wit('group', () => this.wit.group(id));
-  }
-
-  /** Which reading this diffusion pass runs (`'encode'` or `'denoise'`).
-   * REQUIRED, once, before the first submit. */
-  canvas(mode: witDiffusion.Mode): void {
-    this.requireKind(['diffusion'], 'canvas');
-    wit('canvas', () => (this.wit as witDiffusion.ForwardPass).canvas(mode));
   }
 
   /** Attach a PEFT adapter at `site` ("q"|"k"|"v"|"o"|"gate_up"|"down"). */
@@ -692,11 +673,6 @@ export class ForwardPass {
     const handles = traced.channels.map(hostChannel);
     wit('program', () => this.wit.program(traced.encode(), handles));
     this.programAttached = true;
-  }
-
-  /** @internal */
-  submitWith(on: Pipeline, borrows: (AnyPass | undefined)[]): void {
-    wit('submit', () => (this.mod.submit as (on: witPipeline.Pipeline, slots: (AnyPass | undefined)[]) => void)(on.wit, borrows));
   }
 }
 

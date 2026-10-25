@@ -472,6 +472,7 @@ impl Engine for Xla {
             adapter_attachments: false,
             facts: shell.trace().facts.clone(),
             inputs: shell.input_decls(),
+            classes: shell.classes(),
         };
         self.shell = Some(shell);
         self.caps = Some(caps.clone());
@@ -1190,7 +1191,6 @@ impl Xla {
                 rs: &verbs[at],
                 media: media_of[at],
                 inputs: &input_cells[at],
-                stream: lane.stream as u8,
                 group: lane.group,
                 kv_less: lane.kv_less,
                 writes: device[at]

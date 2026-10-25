@@ -22,10 +22,6 @@ fn traced(tap: Option<&str>) -> Trace {
     row(tap).trace(Platform::Cuda)
 }
 
-fn generative(tap: Option<&str>) -> poem::generative::Generative {
-    row(tap).generative().expect("mini-dit is generative")
-}
-
 fn velocity_width(plan: &Trace) -> u64 {
     let seams: Vec<_> = plan
         .seams
@@ -81,17 +77,6 @@ fn a_tap_moves_the_velocity_seam_to_the_intermediate_at_its_width() {
         velocity_width(&traced(Some("final.norm_out"))),
         u64::from(model::HIDDEN)
     );
-    for (tap, width) in [
-        (None, model::PATCH_FEATURES),
-        (Some("b0.norm1_out"), model::HIDDEN),
-        (Some("final.tokens"), model::PATCH_FEATURES),
-    ] {
-        assert_eq!(
-            generative(tap).readings[0].readout_width,
-            width,
-            "the reading's readout width under {tap:?}"
-        );
-    }
 }
 
 fn a_tap_is_still_one_float_readout_and_no_logits() {

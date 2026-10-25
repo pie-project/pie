@@ -1,6 +1,5 @@
-//! What a layout may state of a generative model: its readings, their
-//! positions, latent space and schedule; and the canvas a text diffusion
-//! model denoises.
+//! What a layout may state of a generative model: its latent space,
+//! schedule and how its positions are laid out.
 
 use std::fmt;
 
@@ -16,10 +15,8 @@ use starlark::values::tuple::UnpackTuple;
 use starlark::values::{NoSerialize, StarlarkValue, UnpackValue, Value};
 use starlark_derive::{starlark_module, starlark_value};
 
-use crate::Stream;
 use crate::generative::{
-    AxisRole, Diffusion, Generative, LatentSpace, PositionConvention, ReadingFact, ReadoutKind,
-    ScheduleFact, ScheduleKind,
+    AxisRole, Generative, LatentSpace, PositionConvention, ScheduleFact, ScheduleKind,
 };
 
 /// A fact of a generative model a layout states.
@@ -28,12 +25,10 @@ pub(crate) struct Stated(#[allocative(skip)] pub(crate) Fact);
 
 #[derive(Debug, Clone)]
 pub(crate) enum Fact {
-    Reading(ReadingFact),
     Positions(PositionConvention),
     Latent(LatentSpace),
     Schedule(ScheduleFact),
     Generative(Generative),
-    Diffusion(Diffusion),
 }
 
 starlark_simple_value!(Stated);
@@ -61,7 +56,6 @@ macro_rules! fact_of {
     };
 }
 
-fact_of!(reading_of, Reading, ReadingFact, "a reading");
 fact_of!(
     positions_of,
     Positions,
@@ -71,68 +65,12 @@ fact_of!(
 fact_of!(latent_of, Latent, LatentSpace, "a latent space");
 fact_of!(schedule_of, Schedule, ScheduleFact, "a schedule");
 fact_of!(pub(crate) generative_of, Generative, Generative, "a generative model's facts");
-fact_of!(pub(crate) diffusion_of, Diffusion, Diffusion, "a canvas");
 
 use crate::star::bind::word as spelled;
 
-/// The stream `word` names.
-pub(crate) fn stream(word: &str) -> anyhow::Result<Stream> {
-    spelled(
-        word,
-        "a stream",
-        &[
-            ("text", Stream::Text),
-            ("image", Stream::Image),
-            ("video", Stream::Video),
-            ("audio", Stream::Audio),
-            ("context", Stream::Context),
-            ("reference", Stream::Reference),
-        ],
-    )
-}
-
-fn streams(words: UnpackList<String>) -> anyhow::Result<Vec<Stream>> {
-    words.items.iter().map(|w| stream(w)).collect()
-}
-
 #[starlark_module]
 pub(crate) fn generative(builder: &mut GlobalsBuilder) {
-    /// The reading `name`, run by passes of index `index`: the streams its
-    /// rows are of, how its positions are laid out and what it reads out,
-    /// `readout_width` wide.
-    fn reading(
-        #[starlark(require = pos)] name: &str,
-        #[starlark(require = named)] index: u32,
-        #[starlark(require = named)] streams: UnpackList<String>,
-        #[starlark(require = named)] readout: &str,
-        #[starlark(require = named)] readout_width: u32,
-        #[starlark(require = named, default = false)] has_kv: bool,
-        #[starlark(require = named, default = false)] takes_tokens: bool,
-        #[starlark(require = named, default = NoneOr::None)] positions: NoneOr<Value<'_>>,
-    ) -> anyhow::Result<Stated> {
-        Ok(Stated(Fact::Reading(ReadingFact {
-            name: name.to_string(),
-            index: u8::try_from(index)
-                .map_err(|_| anyhow::anyhow!("reading {index} is past a u8"))?,
-            has_kv,
-            takes_tokens,
-            streams: self::streams(streams)?,
-            positions: positions.into_option().map(positions_of).transpose()?,
-            readout: spelled(
-                readout,
-                "a readout",
-                &[
-                    ("logits", ReadoutKind::Logits),
-                    ("velocity", ReadoutKind::Velocity),
-                    ("hidden", ReadoutKind::Hidden),
-                    ("pixels", ReadoutKind::Pixels),
-                ],
-            )?,
-            readout_width,
-        })))
-    }
-
-    /// How a reading's positions are laid out over `axes`.
+    /// How a model's positions are laid out over `axes`.
     fn positions(
         #[starlark(require = named)] axes: UnpackList<String>,
         #[starlark(require = named)] text_axis: u32,
@@ -205,7 +143,7 @@ pub(crate) fn generative(builder: &mut GlobalsBuilder) {
                         .unpack_str()
                         .ok_or_else(|| anyhow::anyhow!("a stream is named"))?;
                     let x = UnpackFloat::unpack_value_err(x).map_err(|e| anyhow::anyhow!("{e}"))?;
-                    Ok((stream(s)?, x.0 as f32))
+                    Ok((s.to_string(), x.0 as f32))
                 }
                 _ => Err(anyhow::anyhow!(
                     "a stream's shift is a (stream, shift) pair"
@@ -234,30 +172,17 @@ pub(crate) fn generative(builder: &mut GlobalsBuilder) {
         })))
     }
 
-    /// What a generative model states of itself: its readings, and the
-    /// latent space and schedule it denoises by.
+    /// What a generative model states of itself: the latent space and
+    /// schedule it denoises by, and how its positions are laid out.
     fn generation(
-        #[starlark(require = named)] readings: UnpackList<Value<'_>>,
         #[starlark(require = named, default = NoneOr::None)] latent: NoneOr<Value<'_>>,
         #[starlark(require = named, default = NoneOr::None)] schedule: NoneOr<Value<'_>>,
+        #[starlark(require = named, default = NoneOr::None)] positions: NoneOr<Value<'_>>,
     ) -> anyhow::Result<Stated> {
         Ok(Stated(Fact::Generative(Generative {
-            readings: readings
-                .items
-                .into_iter()
-                .map(reading_of)
-                .collect::<anyhow::Result<_>>()?,
             latent: latent.into_option().map(latent_of).transpose()?,
             schedule: schedule.into_option().map(schedule_of).transpose()?,
+            positions: positions.into_option().map(positions_of).transpose()?,
         })))
-    }
-
-    /// The canvas a text diffusion model denoises: `canvas` rows of a
-    /// `hidden`-wide state.
-    fn canvas(
-        #[starlark(require = named)] canvas: u32,
-        #[starlark(require = named)] hidden: u32,
-    ) -> anyhow::Result<Stated> {
-        Ok(Stated(Fact::Diffusion(Diffusion { canvas, hidden })))
     }
 }

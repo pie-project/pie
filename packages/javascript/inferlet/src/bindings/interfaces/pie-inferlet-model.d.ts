@@ -24,19 +24,19 @@ export function defaultSystemSpeculation(): boolean;
  */
 export function mtpDepth(): number;
 export function draftBlock(): BlockDrafter | undefined;
-export function passKind(): ForwardKind;
-export function canvas(): CanvasShape | undefined;
 /**
- * Every reading the bound model declares, in index order. Empty for a
- * model with one implicit reading (every text row), on which
- * `forward-pass.reading` is refused. Static.
+ * Every switch the bound model declares. Empty for a model with one
+ * path (every text model). Static.
  */
-export function readings(): Array<ReadingFact>;
+export function switches(): Array<SwitchDecl>;
+/**
+ * How the bound model's lanes place their rows in the rotary space,
+ * when it states a convention. `none` otherwise. Static.
+ */
+export function positions(): PositionConvention | undefined;
 /**
  * The lane a pass of these switches is. Switches are `(name, value)`
- * pairs: `("reading", name)`, `("stream", name)` and, on a diffusion
- * model, `("canvas", "encode" | "denoise")`; one left unset takes its
- * default (the model's one reading, the `text` stream, `encode`).
+ * pairs of `switches()`; one left unset takes its default.
  */
 export function lane(switches: Array<[string, string]>): LaneDecl;
 export function latent(): LatentSpace | undefined;
@@ -173,58 +173,22 @@ export interface BlockDrafter {
   proposalsFrom: number,
 }
 /**
- * Which forward-pass interface the bound model takes: `forward` for every
- * text model, whatever state it keeps; `forward-diffusion` for a
- * block-diffusion text.
- * 
- * Do NOT derive this by parsing `architecture()` -- that is an open set.
- * # Variants
- * 
- * ## `"text"`
- * 
- * Tokens one by one -> `forward`
- * ## `"diffusion"`
- * 
- * A canvas the model denoises in place, one trunk read causally or
- * bidirectionally per pass -> `forward-diffusion`
+ * A switch the model declares: its name and the values a pass may set
+ * it to (`forward-pass.switch`), the first its default. Names and values
+ * are the model's own (`reading`, `stream`, `mode`, `block_draft`, ...);
+ * a guest that knows a model by its switches reads them here rather than
+ * parsing `architecture()`.
  */
-export type ForwardKind = 'text' | 'diffusion';
-/**
- * The canvas a diffusion model denoises: how many tokens one block is,
- * and the trunk's hidden width. `none` for every other kind — the same
- * fact as `pass-kind() == diffusion`, stated once with its numbers.
- */
-export interface CanvasShape {
-  length: number,
-  hidden: number,
+export interface SwitchDecl {
+  name: string,
+  values: Array<string>,
 }
 /**
  * ── Generative facts ────────────────────────────────────────────────
  * What a guest sizes an image/video job from, so it never parses
- * `architecture()`: the family's readings (the arms a pass can run),
- * its latent space, the schedule it was trained under, and the widest
- * float lane one pass carries. A text model answers an empty list,
- * `none`, `none` and 0: it has one implicit reading and no latent.
- * A lane's stream — which of the model's rectangles its rows belong to
- * (a lane is one request's rows of ONE stream; a request with text and
- * image rows submits one pass per stream, both in one attention group).
- * Codes agree with `poem_ir::Stream`.
- * # Variants
- * 
- * ## `"text"`
- * 
- * ## `"image"`
- * 
- * ## `"video"`
- * 
- * ## `"audio"`
- * 
- * ## `"context"`
- * 
- * ## `"reference"`
- */
-export type LaneStream = 'text' | 'image' | 'video' | 'audio' | 'context' | 'reference';
-/**
+ * `architecture()`: how its positions are laid out, its latent space,
+ * and the schedule it was trained under. A text model answers `none`
+ * to each.
  * What one axis of a positions input means. The rotary space a
  * DiT was trained in is 1..=4 axes wide and every family orders them
  * differently; this names them so a guest can fill the grid without
@@ -247,9 +211,9 @@ export type LaneStream = 'text' | 'image' | 'video' | 'audio' | 'context' | 'ref
  */
 export type AxisRole = 'time' | 'height' | 'width' | 'index';
 /**
- * WHERE A READING'S LANES SIT IN THE ROTARY SPACE.
+ * WHERE A MODEL'S LANES SIT IN THE ROTARY SPACE.
  * 
- * A denoise reading's positions input takes one coordinate vector
+ * A denoiser's positions input takes one coordinate vector
  * per row, and which coordinate goes where is a family contract the
  * guest must not spell (`flux_2`'s `(0, h, w, j)`, `z_image`'s
  * `(L + 1, a, b)`). This fact states it, so `latent::positions_for`
@@ -290,8 +254,8 @@ export interface PositionConvention {
 /**
  * Which export seam a lane's epilogue reads: `logits()` for a text
  * head, `velocity()` for a denoiser, `hidden()` for an encoder,
- * `pixels` for a VAE reading on the voxel axis (one row per output
- * voxel of the pass's clip, `readout-width` wide).
+ * `pixels` for a VAE on the voxel axis (one row per output voxel of
+ * the pass's clip).
  * # Variants
  * 
  * ## `"logits"`
@@ -303,32 +267,6 @@ export interface PositionConvention {
  * ## `"pixels"`
  */
 export type ReadoutKind = 'logits' | 'velocity' | 'hidden' | 'pixels';
-/**
- * One reading of the bound model: the arm a pass runs when it names
- * this reading (`forward-pass.reading`). `index` is the fact value a
- * lane is stamped with; `has-kv` says whether `state` is required
- * (else refused) on its pass, `takes-tokens` the same for `embed`;
- * `streams` are the lane streams a request submits (one pass per
- * stream, `forward-pass.stream`; empty means text only); `positions`
- * says where its lanes' rows sit in the rotary space;
- * `readout`/`readout-width` say what the epilogue may read and how wide
- * one row is (the `velocity(width)` / `hidden(width)` declaration to
- * make).
- */
-export interface ReadingFact {
-  name: string,
-  index: number,
-  hasKv: boolean,
-  takesTokens: boolean,
-  streams: Array<LaneStream>,
-  /**
-   * How this reading's lanes place their rows in the rotary space,
-   * when it states a convention. `none` otherwise.
-   */
-  positions?: PositionConvention,
-  readout: ReadoutKind,
-  readoutWidth: number,
-}
 /**
  * What one entry of an input belongs to: its lane, each row of its
  * lane, or each voxel of its lane's clip.
@@ -365,15 +303,19 @@ export interface Readout {
   width: number,
 }
 /**
- * Everything about a lane of the given switches: the inputs it must
- * bind (exactly these, by `forward-pass.input`), whether it binds
- * `state` and `embed`, and what it reads out.
+ * Everything about a lane of the given switches, as the compiled graph
+ * runs it: the inputs it must bind (exactly these, by
+ * `forward-pass.input`), whether it binds `state` (some class it can
+ * land in reads a kv cache) and `embed` (some class reads `tokens`), and
+ * what it reads out (the export seam its classes read; a float readout
+ * where some class reads one). `none` when no class it lands in reads
+ * anything out.
  */
 export interface LaneDecl {
   inputs: Array<InputDecl>,
   readsKv: boolean,
   embeds: boolean,
-  readout: Readout,
+  readout?: Readout,
 }
 /**
  * The latent space a denoiser works in: one latent row is
@@ -414,13 +356,14 @@ export type ScheduleKind = 'flow' | 'epsilon' | 'v';
  * its own), and `stream-shifts` names the per-modality shifts of a
  * family that runs several schedules at once. The library's
  * `latent::FlowMatchEuler` is built from this.
- * `none` when no reading denoises.
+ * `none` when the model does not denoise.
  */
 export interface StreamShift {
   /**
-   * `stream` is a WIT keyword, so the lane's stream is spelled `lane`.
+   * A value of the model's `stream` switch (`stream` is a WIT keyword,
+   * so it is spelled `lane`).
    */
-  lane: LaneStream,
+  lane: string,
   shift: number,
 }
 export interface ScheduleFact {

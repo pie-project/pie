@@ -41,7 +41,7 @@ fn fire(
     keep_what_reads(&mut contract, &trace);
     let word = trace
         .facts
-        .word(&poem::Request::new(1, false).on_stream(poem::Stream::Image));
+        .word(&poem::Request::new(1, false).switched("stream", "image"));
     let started = Instant::now();
     let mut shell = common_vae::load(trace, &contract, root, max_voxels);
     let load_s = started.elapsed().as_secs_f64();

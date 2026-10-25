@@ -1,9 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use poem::generative::{ReadoutKind, ScheduleKind};
+use poem::generative::ScheduleKind;
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, Operation, Platform, RaggedMask, Request, RopeForm,
-    RuntimeInput, Stream, Trace, Ty, seam,
+    RuntimeInput, Trace, Ty, seam,
 };
 use poem_ir::InputAxis;
 
@@ -110,22 +110,17 @@ fn the_seams_are_the_two_float_readouts_and_never_logits() {
     }
 }
 
-fn lanes(deployment: &str) -> Vec<(String, u8, Stream)> {
-    let facts = row(deployment).generative().expect("generative facts");
-    facts
-        .readings
-        .iter()
-        .flat_map(|reading| {
-            let streams = if reading.streams.is_empty() {
-                vec![Stream::Text]
-            } else {
-                reading.streams.clone()
-            };
-            streams
-                .into_iter()
-                .map(move |stream| (reading.name.clone(), reading.index, stream))
-        })
-        .collect()
+/// Every (reading, stream) a lane of `deployment` may take.
+fn lanes(deployment: &str) -> Vec<(&'static str, &'static str)> {
+    let mut lanes = Vec::new();
+    if is_flagship(deployment) {
+        lanes.push(("text", "text"));
+    }
+    lanes.push(("refine", "text"));
+    for stream in ["text", "video", "audio", "reference"] {
+        lanes.push(("denoise", stream));
+    }
+    lanes
 }
 
 fn every_lane_the_facts_list_lands_in_a_class_where_the_merges_resolve() {
@@ -133,9 +128,11 @@ fn every_lane_the_facts_list_lands_in_a_class_where_the_merges_resolve() {
         let plan = trace(deployment, Platform::Cuda);
         let classes = poem::resolve_classes(&plan).expect("every merge resolves");
         let _catalog = row(deployment);
-        let mut seen: Vec<((String, Stream), usize)> = Vec::new();
-        for (name, _index, stream) in lanes(deployment) {
-            let request = Request::new(4, false).on_stream(stream).in_reading(&name);
+        let mut seen: Vec<((&str, &str), usize)> = Vec::new();
+        for (name, stream) in lanes(deployment) {
+            let request = Request::new(4, false)
+                .switched("stream", stream)
+                .switched("reading", name);
             let word = plan.facts.word(&request);
             let class = classes
                 .class_of(word & classes.mask)
@@ -273,15 +270,10 @@ fn the_modality_gather_is_three_weight_blocks_and_one_column_slice() {
                 );
             }
         }
-        let pairs: BTreeSet<(u32, usize)> = [
-            Stream::Text,
-            Stream::Video,
-            Stream::Audio,
-            Stream::Reference,
-        ]
-        .into_iter()
-        .map(|s| (model::timestep_slot(s), model::modality(s)))
-        .collect();
+        let pairs: BTreeSet<(u32, usize)> = ["text", "video", "audio", "reference"]
+            .into_iter()
+            .map(|s| (model::timestep_slot(s), model::modality(s)))
+            .collect();
         assert_eq!(
             pairs.len(),
             4,
@@ -354,20 +346,15 @@ fn the_sharded_worlds_trace_and_bake() {
 fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
     for deployment in ROWS {
         let facts = row(deployment).generative().expect("facts");
-        for (at, reading) in facts.readings.iter().enumerate() {
-            assert_eq!(
-                usize::from(reading.index),
-                at,
-                "`{deployment}`: readings are dense from 0 in index order"
-            );
-            assert!(
-                reading.positions.is_none(),
-                "`{deployment}` reading `{}`: H3's shared audio-tick time axis is not a stated \
-                 convention",
-                reading.name
-            );
-        }
-        let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
+        assert!(
+            facts.positions.is_none(),
+            "`{deployment}`: H3's shared audio-tick time axis is not a stated convention"
+        );
+        let names = trace(deployment, Platform::Cuda)
+            .facts
+            .declared("reading")
+            .map(|s| s.values.clone())
+            .unwrap_or_default();
         assert_eq!(
             names,
             if is_flagship(deployment) {
@@ -394,19 +381,13 @@ fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
         assert_eq!(schedule.kind, ScheduleKind::Flow);
         assert_eq!(schedule.shift, model::VIDEO_SHIFT);
         assert_eq!(
-            schedule
-                .stream_shifts
-                .iter()
-                .find(|(s, _)| *s == Stream::Video),
-            Some(&(Stream::Video, model::VIDEO_SHIFT)),
+            schedule.stream_shifts.iter().find(|(s, _)| s == "video"),
+            Some(&("video".to_string(), model::VIDEO_SHIFT)),
             "`{deployment}`: the video grid's shift"
         );
         assert_eq!(
-            schedule
-                .stream_shifts
-                .iter()
-                .find(|(s, _)| *s == Stream::Audio),
-            Some(&(Stream::Audio, model::AUDIO_SHIFT)),
+            schedule.stream_shifts.iter().find(|(s, _)| s == "audio"),
+            Some(&("audio".to_string(), model::AUDIO_SHIFT)),
             "`{deployment}`: the audio grid's shift, run in the same evaluation"
         );
         assert_eq!(
@@ -418,13 +399,6 @@ fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
             schedule.pinned_sigmas.windows(2).all(|w| w[0] > w[1]),
             "`{deployment}`: the sigma grid descends"
         );
-        let denoise = facts
-            .readings
-            .iter()
-            .find(|reading| reading.name == "denoise")
-            .expect("a denoise reading");
-        assert_eq!(denoise.readout, ReadoutKind::Velocity);
-        assert_eq!(denoise.readout_width, model::VIDEO_FEATURES);
     }
 }
 

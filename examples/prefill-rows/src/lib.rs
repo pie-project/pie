@@ -23,9 +23,6 @@ struct Output {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() == model::ForwardKind::Diffusion {
-        return Err("use diffusion-parity --only_prefill for a diffusion model".into());
-    }
     let ids: Vec<u32> =
         inferlet::serde_json::from_str(&input.ids).map_err(|why| format!("ids json: {why}"))?;
     let n = u32::try_from(ids.len()).map_err(|_| "prompt is too long")?;

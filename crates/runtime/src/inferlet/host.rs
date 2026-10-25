@@ -47,7 +47,6 @@ wasmtime::component::bindgen!({
         "pie:inferlet/grammar.matcher": grammar::Matcher,
         "pie:inferlet/channel.channel": forward::Channel,
         "pie:inferlet/forward.forward-pass": forward::ForwardPass,
-        "pie:inferlet/forward-diffusion.forward-pass": forward::ForwardPass,
         "pie:inferlet/pipeline.pipeline": pipeline::Pipeline,
         "pie:inferlet/media.image": media::Image,
         "pie:inferlet/media.video": media::Video,
@@ -75,7 +74,6 @@ pub fn add_to_linker(
     pie::inferlet::grammar::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::channel::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::forward::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
-    pie::inferlet::forward_diffusion::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::session::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::media::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;
     pie::inferlet::speech::add_to_linker::<ProcessCtx, D>(linker, |s| s)?;

@@ -1,22 +1,12 @@
 #[derive(serde::Serialize)]
 pub struct GenerativeFacts {
-    pub readings: Vec<Reading>,
     pub latent: Option<Latent>,
     pub schedule: Option<Schedule>,
-    /// The inputs the deployment's guest binds, `name[axis, width]`: traced,
-    /// so only `pie model info` fills them.
+    /// The inputs the deployment's guest binds, `name[axis, width]`, and
+    /// the switches it sets, `name = value|value|...`: traced, so only `pie
+    /// model info` fills them.
     pub inputs: Vec<String>,
-}
-
-#[derive(serde::Serialize)]
-pub struct Reading {
-    pub name: String,
-    pub index: u8,
-    pub kv: bool,
-    pub tokens: bool,
-    pub streams: Vec<String>,
-    pub readout: String,
-    pub readout_width: u32,
+    pub switches: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -42,7 +32,6 @@ pub fn of(deployment: Option<&str>) -> Option<GenerativeFacts> {
     let deployment = runtime::catalog::catalog().parse(deployment?)?;
     let generative = deployment.try_generative().ok()??;
     Some(GenerativeFacts {
-        readings: generative.readings.iter().map(reading).collect(),
         latent: generative.latent.map(|l| Latent {
             channels: l.channels,
             patch_t: l.patch_t,
@@ -64,17 +53,29 @@ pub fn of(deployment: Option<&str>) -> Option<GenerativeFacts> {
             pinned_sigmas: s.pinned_sigmas.clone(),
         }),
         inputs: Vec::new(),
+        switches: Vec::new(),
     })
 }
 
-/// The inputs `deployment`'s trace reads from its guest, `name[axis, width]`.
-pub fn inputs(deployment: &str) -> Vec<String> {
-    let Some(deployment) = runtime::catalog::catalog().parse(deployment) else {
-        return Vec::new();
-    };
-    let Ok(trace) = deployment.try_trace(poem::Platform::Cuda) else {
-        return Vec::new();
-    };
+/// `deployment`'s trace, to read what its guest binds and sets.
+pub fn traced(deployment: &str) -> Option<poem::Trace> {
+    let deployment = runtime::catalog::catalog().parse(deployment)?;
+    deployment.try_trace(poem::Platform::Cuda).ok()
+}
+
+/// The switches `trace`'s model declares, `name = value|value|...`, the
+/// first value its default.
+pub fn switches(trace: &poem::Trace) -> Vec<String> {
+    trace
+        .facts
+        .switches
+        .iter()
+        .map(|decl| format!("{} = {}", decl.name, decl.values.join("|")))
+        .collect()
+}
+
+/// The inputs `trace` reads from its guest, `name[axis, width]`.
+pub fn inputs(trace: &poem::Trace) -> Vec<String> {
     trace
         .values
         .iter()
@@ -90,42 +91,9 @@ pub fn inputs(deployment: &str) -> Vec<String> {
         .collect()
 }
 
-fn reading(fact: &poem::generative::ReadingFact) -> Reading {
-    Reading {
-        name: fact.name.to_string(),
-        index: fact.index,
-        kv: fact.has_kv,
-        tokens: fact.takes_tokens,
-        streams: fact
-            .streams
-            .iter()
-            .map(|s| stream(*s).to_string())
-            .collect(),
-        readout: match fact.readout {
-            poem::generative::ReadoutKind::Logits => "logits",
-            poem::generative::ReadoutKind::Velocity => "velocity",
-            poem::generative::ReadoutKind::Hidden => "hidden",
-            poem::generative::ReadoutKind::Pixels => "pixels",
-        }
-        .to_string(),
-        readout_width: fact.readout_width,
-    }
-}
-
-fn stream(stream: poem::Stream) -> &'static str {
-    match stream {
-        poem::Stream::Text => "text",
-        poem::Stream::Image => "image",
-        poem::Stream::Video => "video",
-        poem::Stream::Audio => "audio",
-        poem::Stream::Context => "context",
-        poem::Stream::Reference => "reference",
-    }
-}
-
 impl GenerativeFacts {
     pub fn summary(&self) -> String {
-        let mut parts = vec![format!("{} readings", self.readings.len())];
+        let mut parts = Vec::new();
         if let Some(latent) = &self.latent {
             parts.push(format!("latent {}", latent.line()));
         }
@@ -135,14 +103,12 @@ impl GenerativeFacts {
         parts.join(" · ")
     }
 
+    /// Whether the deployment binds the standard `latents` and `timestep`
+    /// inputs `text-to-image` drives (known once traced).
     pub fn text_to_image(&self) -> bool {
-        self.readings
+        ["latents[", "timestep["]
             .iter()
-            .any(|r| r.tokens && r.readout == "hidden")
-            && self
-                .readings
-                .iter()
-                .any(|r| !r.tokens && r.readout == "velocity")
+            .all(|name| self.inputs.iter().any(|input| input.starts_with(name)))
     }
 }
 
@@ -198,24 +164,26 @@ mod tests {
     }
 
     fn a_generative_row_reports_what_it_can_be_asked_to_draw() {
-        let facts = of(Some(FLUX2_KLEIN)).expect("flux2-klein-4b is a generative row");
+        let mut facts = of(Some(FLUX2_KLEIN)).expect("flux2-klein-4b is a generative row");
+        let trace = traced(FLUX2_KLEIN).expect("flux2-klein-4b traces");
+        facts.inputs = inputs(&trace);
+        facts.switches = switches(&trace);
+        assert!(facts.text_to_image(), "{:?}", facts.inputs);
         assert!(
-            facts.text_to_image(),
-            "klein-4B has a text reading and a denoise reading: {:?}",
             facts
-                .readings
-                .iter()
-                .map(|r| (&r.name, &r.readout, r.tokens))
-                .collect::<Vec<_>>()
+                .switches
+                .contains(&"reading = text|denoise|vae.decode|vae.encode".to_string()),
+            "{:?}",
+            facts.switches
         );
         let latent = facts.latent.expect("a denoiser has a latent space");
         assert_eq!(latent.pixels_per_row(), (16, 16));
         let schedule = facts.schedule.expect("a denoiser has a schedule");
         assert_eq!(schedule.kind, "flow");
         assert!(
-            inputs(FLUX2_KLEIN).contains(&"latents[row, 128]".to_string()),
+            facts.inputs.contains(&"latents[row, 128]".to_string()),
             "{:?}",
-            inputs(FLUX2_KLEIN)
+            facts.inputs
         );
     }
 

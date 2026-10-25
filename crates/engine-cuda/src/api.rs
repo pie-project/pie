@@ -223,10 +223,7 @@ fn fault(fault: Fault) -> Error {
         | Fault::Maskless { .. }
         | Fault::MaskWord { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
-        Fault::Draftless { .. }
-        | Fault::DraftWord { .. }
-        | Fault::Scoreless { .. }
-        | Fault::ScoreWord { .. } => Error::Invalid(fault.to_string()),
+        Fault::Scoreless { .. } | Fault::ScoreWord { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::AdapterSlots { .. } => Error::Exhausted {
             resource: "adapter slots",
@@ -704,6 +701,7 @@ impl Engine for Cuda {
             adapter_attachments: true,
             facts: shell.trace().facts.clone(),
             inputs: shell.inputs(),
+            classes: shell.classes(),
         };
 
         self.replay = crate::replay::Replay::of(&shell);
@@ -768,7 +766,11 @@ impl Engine for Cuda {
             let split = self
                 .replay
                 .zip(self.shell.as_ref())
-                .and_then(|(replay, shell)| replay.split(step, |word| shell.wide(word)));
+                .and_then(|(replay, shell)| {
+                    replay.split(step, |word| {
+                        shell.trace().facts.plain(word) && !shell.wide(word)
+                    })
+                });
             if let Some((head, _)) = &split
                 && let Err(error) = self.fire_step(head, at, false)
             {
@@ -1176,7 +1178,6 @@ impl Cuda {
                     window_copies: &lane.kv.window_copies,
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
-                    drafts: lane.drafts,
                     captures_scores: lane.captures_scores,
                     rs: lane.rs.clone(),
                     rs_reset: lane.rs_reset,
@@ -1186,7 +1187,6 @@ impl Cuda {
                         Readout::Rows(rows) => Some(rows.as_slice()),
                         Readout::Last | Readout::None => None,
                     },
-                    stream: lane.stream as u8,
                     group: lane.group,
                     peer: lane.peer,
                     inputs: &lane.inputs,

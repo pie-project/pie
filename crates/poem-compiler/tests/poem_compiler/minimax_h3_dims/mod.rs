@@ -1,7 +1,5 @@
 //! The widths and constants MiniMax H3's package declares.
 
-use poem::Stream;
-
 pub const LATENT_CHANNELS: u32 = 24;
 pub const AUDIO_CHANNELS: u32 = 32;
 pub const VIDEO_FEATURES: u32 = LATENT_CHANNELS * 2 * 2;
@@ -24,20 +22,22 @@ pub const TE_DEPTH: u32 = 64;
 pub const TE_LAYERS: u32 = 50;
 
 #[must_use]
-pub const fn modality(stream: Stream) -> usize {
+pub fn modality(stream: &str) -> usize {
     match stream {
-        Stream::Video | Stream::Reference | Stream::Image => 0,
-        Stream::Audio => 2,
-        Stream::Text | Stream::Context => 1,
+        "video" | "reference" => 0,
+        "audio" => 2,
+        "text" => 1,
+        other => panic!("no stream `{other}`"),
     }
 }
 
 #[must_use]
-pub const fn timestep_slot(stream: Stream) -> u32 {
+pub fn timestep_slot(stream: &str) -> u32 {
     match stream {
-        Stream::Video | Stream::Text | Stream::Context => 0,
-        Stream::Reference | Stream::Image => 1,
-        Stream::Audio => 2,
+        "video" | "text" => 0,
+        "reference" => 1,
+        "audio" => 2,
+        other => panic!("no stream `{other}`"),
     }
 }
 

@@ -1,7 +1,7 @@
 // Public API for the Pie inferlet JavaScript library.
 //
 // An inferlet is a small program that runs next to the model. The forward-pass
-// surface (`pie:inferlet/forward*`) takes a traced ETA program; `eta` traces
+// surface (`pie:inferlet/forward`) takes a traced ETA program; `eta` traces
 // it from ordinary JavaScript and encodes the canonical container bytes — the
 // same bytes the Rust `inferlet` crate's `eta-dsl` emits for the same program, so a JS
 // inferlet and a Rust inferlet share the host's program cache.

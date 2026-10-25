@@ -56,6 +56,7 @@ pub fn register(
     model_id: &str,
     facts: poem_ir::Facts,
     inputs: Vec<poem_ir::InputDecl>,
+    classes: poem_ir::LaneClasses,
     kv_page_size: u32,
     rs: RsCaps,
     eta: EtaCaps,
@@ -78,17 +79,11 @@ pub fn register(
         .map_err(|fault| anyhow!("`{model_id}` refuses this artifact's tokenizer: {fault}"))?;
     let instruct = chat_template::build(&template_of(&deployment.model), tokenizer.clone())
         .map_err(|why| anyhow!("`{model_id}` states a template this runtime refuses: {why}"))?;
-    let diffusion = deployment
-        .try_diffusion()
-        .map_err(|why| anyhow!("`{model_id}` states a canvas this runtime refuses: {why}"))?;
     let generative = deployment.try_generative().map_err(|why| {
         anyhow!("`{model_id}` states generative facts this runtime refuses: {why}")
     })?;
-    if let Some(generative) = &generative {
-        validate_generative(generative).map_err(|fault| {
-            anyhow!("`{model_id}` states generative facts this runtime refuses: {fault}")
-        })?;
-    }
+    velocity_width(&classes)
+        .map_err(|fault| anyhow!("`{model_id}` reads out what this runtime refuses: {fault}"))?;
 
     let model = Arc::new(Model {
         name,
@@ -102,6 +97,7 @@ pub fn register(
         instruct,
         facts,
         inputs,
+        classes,
         kv_page_size,
         rs_caps: rs,
         eta_caps: eta,
@@ -109,7 +105,6 @@ pub fn register(
         vocab: OnceLock::new(),
         vocab_size: deployment.model.vocab,
         num_layers: deployment.model.layers,
-        diffusion,
         generative,
         identity,
     });
@@ -169,71 +164,43 @@ pub(crate) fn template_of(model: &poem::star::Model) -> chat_template::Spec {
     }
 }
 
-pub fn validate_generative(generative: &poem::generative::Generative) -> Result<(), String> {
-    let mut velocity_width = None;
-    for (at, reading) in generative.readings.iter().enumerate() {
-        if usize::from(reading.index) != at {
-            return Err(format!(
-                "reading `{}` sits at position {at} but states index {}; readings are \
-                 listed in index order, dense from 0",
-                reading.name, reading.index
-            ));
-        }
-        if reading.name.is_empty() {
-            return Err(format!("reading {at} has an empty name"));
-        }
-        if generative.readings[..at]
-            .iter()
-            .any(|r| r.name == reading.name)
-        {
-            return Err(format!("reading `{}` is declared twice", reading.name));
-        }
-        if reading.readout_width == 0 {
-            return Err(format!(
-                "reading `{}` states a zero-width readout",
-                reading.name
-            ));
-        }
-        if reading.readout == poem::generative::ReadoutKind::Velocity {
-            match velocity_width {
-                None => velocity_width = Some(reading.readout_width),
-                Some(width) if width != reading.readout_width => {
-                    return Err(format!(
-                        "reading `{}` reads a velocity {} wide beside another reading's {width}; \
-                         the eta profile carries one velocity width",
-                        reading.name, reading.readout_width
-                    ));
-                }
-                Some(_) => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-pub fn velocity_facts(readings: &[poem::generative::ReadingFact]) -> (bool, u32) {
-    readings
-        .iter()
-        .find(|reading| reading.readout == poem::generative::ReadoutKind::Velocity)
-        .map_or((false, 0), |reading| (true, reading.readout_width))
-}
-
-pub fn pixels_facts(readings: &[poem::generative::ReadingFact]) -> (bool, u32) {
-    let mut widths = readings
-        .iter()
-        .filter(|reading| reading.readout == poem::generative::ReadoutKind::Pixels)
-        .map(|reading| reading.readout_width);
+/// The one velocity width the model's classes read out, if any reads one:
+/// the eta profile carries one.
+pub fn velocity_width(classes: &poem_ir::LaneClasses) -> Result<Option<u32>, String> {
+    let mut widths = readouts(classes, poem_ir::ReadoutKind::Velocity);
     let Some(first) = widths.next() else {
-        return (false, 0);
+        return Ok(None);
     };
-    (
-        true,
-        if widths.all(|width| width == first) {
-            first
-        } else {
-            0
-        },
-    )
+    match widths.find(|width| *width != first) {
+        Some(other) => Err(format!(
+            "one class reads a velocity {first} wide and another {other}; the eta profile \
+             carries one velocity width"
+        )),
+        None => Ok(Some(first)),
+    }
+}
+
+/// Whether some class reads pixels out, and their width when every such
+/// class agrees on it (0 when they do not).
+pub fn pixels_width(classes: &poem_ir::LaneClasses) -> Option<u32> {
+    let mut widths = readouts(classes, poem_ir::ReadoutKind::Pixels);
+    let first = widths.next()?;
+    Some(if widths.all(|width| width == first) {
+        first
+    } else {
+        0
+    })
+}
+
+fn readouts(
+    classes: &poem_ir::LaneClasses,
+    kind: poem_ir::ReadoutKind,
+) -> impl Iterator<Item = u32> + '_ {
+    classes
+        .classes
+        .iter()
+        .filter_map(move |class| class.readout.filter(|r| r.kind == kind))
+        .map(|readout| readout.width)
 }
 
 pub fn model() -> &'static Arc<Model> {
@@ -265,6 +232,7 @@ pub struct Model {
     instruct: Arc<dyn Instruct>,
     facts: poem_ir::Facts,
     inputs: Vec<poem_ir::InputDecl>,
+    classes: poem_ir::LaneClasses,
     kv_page_size: u32,
     rs_caps: RsCaps,
     eta_caps: EtaCaps,
@@ -272,9 +240,23 @@ pub struct Model {
     vocab: OnceLock<(Vec<u32>, Vec<Vec<u8>>)>,
     vocab_size: u32,
     num_layers: u32,
-    diffusion: Option<poem::generative::Diffusion>,
     generative: Option<poem::generative::Generative>,
     identity: state::ModelIdentity,
+}
+
+/// A lane of a pass's switches, as the model's graph runs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lane {
+    /// The guest switches the pass set.
+    pub switches: Vec<(String, String)>,
+    /// The ids of the inputs it must bind.
+    pub inputs: Vec<u32>,
+    /// Some class it lands in reads a kv cache: it binds `state`.
+    pub reads_kv: bool,
+    /// Some class it lands in reads `tokens`: it binds `embed`.
+    pub embeds: bool,
+    /// What it reads out: a float readout where some class reads one.
+    pub readout: Option<poem_ir::Readout>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -397,34 +379,23 @@ impl Model {
         self.tokenizer.special_tokens()
     }
 
+    /// The switches the model's trace branches on, and those it declares.
+    pub fn facts(&self) -> &poem_ir::Facts {
+        &self.facts
+    }
+
+    /// The word a lane of `request` is classified by.
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
-    pub fn word(
-        &self,
-        query_len: u32,
-        custom_mask: bool,
-        adapter: bool,
-        drafts: bool,
-        captures_scores: bool,
-        media: bool,
-        block_draft: bool,
-        denoise: bool,
-        stream: poem::Stream,
-        reading: u8,
-    ) -> u64 {
-        let request = poem::Request::new(query_len, custom_mask)
-            .adapted(adapter)
-            .drafting(drafts)
-            .capturing_scores(captures_scores)
-            .with_media(media)
-            .drafting_a_block(block_draft)
-            .denoising(denoise)
-            .on_stream(stream);
-        let request = match self.readings().get(usize::from(reading)) {
-            Some(fact) => request.in_reading(&fact.name),
-            None => request,
-        };
-        self.facts.word(&request)
+    pub fn word(&self, request: &poem::Request) -> u64 {
+        self.facts.word(request)
+    }
+
+    /// Whether a lane of `word` lands in a class attending both ways: its
+    /// rows read one another, so it is never cut, keyed or logged by its
+    /// tokens.
+    #[must_use]
+    pub fn wide(&self, word: u64) -> bool {
+        self.classes.of(word).is_some_and(|class| class.wide)
     }
 
     /// The inputs the model reads from its guest; an input's id is its
@@ -442,62 +413,62 @@ impl Model {
             .map(|(id, input)| (id as u32, input))
     }
 
-    /// The ids of the inputs a lane of these guest switches reads: those a
-    /// class it can land in reads, under any value of the switches the
-    /// runtime derives (query length, mask, adapter, drafts, scores, media,
-    /// encode).
-    pub fn lane_inputs(
-        &self,
-        reading: Option<&str>,
-        stream: poem::Stream,
-        denoise: bool,
-        block_draft: bool,
-    ) -> Vec<u32> {
-        const RUNTIME_SWITCHES: u32 = 7;
-        let words: Vec<u64> = (0..1u32 << RUNTIME_SWITCHES)
+    /// The model's classes and what each runs.
+    pub fn classes(&self) -> &poem_ir::LaneClasses {
+        &self.classes
+    }
+
+    /// Everything about a lane of the guest switches `switches`, each
+    /// checked against its declaration: the classes it can land in under
+    /// any value of the runtime switches (query length, mask, adapter,
+    /// drafts, scores, media, encode), and so the inputs those read and
+    /// whether any reads kv, embeds tokens or reads out.
+    pub fn lane(&self, switches: &[(String, String)]) -> Result<Lane, String> {
+        let mut guest = poem::Request::new(1, false);
+        for (name, value) in switches {
+            self.facts.check(name, value)?;
+            if guest.switch(name).is_some() {
+                return Err(format!("the switch `{name}` is set twice"));
+            }
+            guest = guest.switched(name, value);
+        }
+        let words: Vec<u64> = (0..1u32 << 7)
             .map(|bits| {
                 let request = poem::Request::new(if bits & 1 == 0 { 1 } else { 2 }, bits & 2 != 0)
                     .adapted(bits & 4 != 0)
                     .drafting(bits & 8 != 0)
                     .capturing_scores(bits & 16 != 0)
                     .with_media(bits & 32 != 0)
-                    .encoding(bits & 64 != 0)
-                    .denoising(denoise)
-                    .drafting_a_block(block_draft)
-                    .on_stream(stream);
-                let request = match reading {
-                    Some(name) => request.in_reading(name),
-                    None => request,
-                };
+                    .encoding(bits & 64 != 0);
+                let request = switches
+                    .iter()
+                    .fold(request, |r, (name, value)| r.switched(name, value));
                 self.facts.word(&request)
             })
             .collect();
-        (0u32..)
+        let inputs = (0u32..)
             .zip(&self.inputs)
             .filter(|(_, input)| words.iter().any(|&word| input.read_by(word)))
             .map(|(id, _)| id)
-            .collect()
-    }
-
-    pub fn diffusion(&self) -> Option<poem::generative::Diffusion> {
-        self.diffusion
+            .collect();
+        let landed: Vec<&poem_ir::LaneClass> = words
+            .iter()
+            .filter_map(|&word| self.classes.of(word))
+            .collect();
+        let readouts = || landed.iter().filter_map(|class| class.readout);
+        Ok(Lane {
+            switches: switches.to_vec(),
+            inputs,
+            reads_kv: landed.iter().any(|class| class.reads_kv),
+            embeds: landed.iter().any(|class| class.embeds),
+            readout: readouts()
+                .find(|readout| readout.kind != poem_ir::ReadoutKind::Logits)
+                .or_else(|| readouts().next()),
+        })
     }
 
     pub fn generative(&self) -> Option<&poem::generative::Generative> {
         self.generative.as_ref()
-    }
-
-    pub fn readings(&self) -> &[poem::generative::ReadingFact] {
-        self.generative
-            .as_ref()
-            .map_or(&[], |generative| generative.readings.as_slice())
-    }
-
-    pub fn sole_reading(&self) -> Option<&poem::generative::ReadingFact> {
-        match self.readings() {
-            [only] => Some(only),
-            _ => None,
-        }
     }
 
     pub fn kv_page_size(&self) -> u32 {
@@ -510,15 +481,6 @@ impl Model {
 
     pub fn rs_caps(&self) -> RsCaps {
         self.rs_caps
-    }
-
-    pub fn pass_kind(&self) -> crate::pipeline::instance::PassKind {
-        use crate::pipeline::instance::PassKind;
-        if self.diffusion().is_some() {
-            PassKind::Diffusion
-        } else {
-            PassKind::Text
-        }
     }
 
     pub fn eta_caps(&self) -> EtaCaps {

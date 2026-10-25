@@ -27,49 +27,25 @@ class BlockDrafter:
     mask_token: int
     proposals_from: int
 
-class ForwardKind(Enum):
-    """
-    Which forward-pass interface the bound model takes: `forward` for every
-    text model, whatever state it keeps; `forward-diffusion` for a
-    block-diffusion text.
-    
-    Do NOT derive this by parsing `architecture()` -- that is an open set.
-    """
-    TEXT = 0
-    DIFFUSION = 1
-
 @dataclass
-class CanvasShape:
+class SwitchDecl:
     """
-    The canvas a diffusion model denoises: how many tokens one block is,
-    and the trunk's hidden width. `none` for every other kind — the same
-    fact as `pass-kind() == diffusion`, stated once with its numbers.
+    A switch the model declares: its name and the values a pass may set
+    it to (`forward-pass.switch`), the first its default. Names and values
+    are the model's own (`reading`, `stream`, `mode`, `block_draft`, ...);
+    a guest that knows a model by its switches reads them here rather than
+    parsing `architecture()`.
     """
-    length: int
-    hidden: int
-
-class LaneStream(Enum):
-    """
-    ── Generative facts ────────────────────────────────────────────────
-    What a guest sizes an image/video job from, so it never parses
-    `architecture()`: the family's readings (the arms a pass can run),
-    its latent space, the schedule it was trained under, and the widest
-    float lane one pass carries. A text model answers an empty list,
-    `none`, `none` and 0: it has one implicit reading and no latent.
-    A lane's stream — which of the model's rectangles its rows belong to
-    (a lane is one request's rows of ONE stream; a request with text and
-    image rows submits one pass per stream, both in one attention group).
-    Codes agree with `poem_ir::Stream`.
-    """
-    TEXT = 0
-    IMAGE = 1
-    VIDEO = 2
-    AUDIO = 3
-    CONTEXT = 4
-    REFERENCE = 5
+    name: str
+    values: List[str]
 
 class AxisRole(Enum):
     """
+    ── Generative facts ────────────────────────────────────────────────
+    What a guest sizes an image/video job from, so it never parses
+    `architecture()`: how its positions are laid out, its latent space,
+    and the schedule it was trained under. A text model answers `none`
+    to each.
     What one axis of a positions input means. The rotary space a
     DiT was trained in is 1..=4 axes wide and every family orders them
     differently; this names them so a guest can fill the grid without
@@ -83,9 +59,9 @@ class AxisRole(Enum):
 @dataclass
 class PositionConvention:
     """
-    WHERE A READING'S LANES SIT IN THE ROTARY SPACE.
+    WHERE A MODEL'S LANES SIT IN THE ROTARY SPACE.
     
-    A denoise reading's positions input takes one coordinate vector
+    A denoiser's positions input takes one coordinate vector
     per row, and which coordinate goes where is a family contract the
     guest must not spell (`flux_2`'s `(0, h, w, j)`, `z_image`'s
     `(L + 1, a, b)`). This fact states it, so `latent::positions_for`
@@ -117,36 +93,13 @@ class ReadoutKind(Enum):
     """
     Which export seam a lane's epilogue reads: `logits()` for a text
     head, `velocity()` for a denoiser, `hidden()` for an encoder,
-    `pixels` for a VAE reading on the voxel axis (one row per output
-    voxel of the pass's clip, `readout-width` wide).
+    `pixels` for a VAE on the voxel axis (one row per output voxel of
+    the pass's clip).
     """
     LOGITS = 0
     VELOCITY = 1
     HIDDEN = 2
     PIXELS = 3
-
-@dataclass
-class ReadingFact:
-    """
-    One reading of the bound model: the arm a pass runs when it names
-    this reading (`forward-pass.reading`). `index` is the fact value a
-    lane is stamped with; `has-kv` says whether `state` is required
-    (else refused) on its pass, `takes-tokens` the same for `embed`;
-    `streams` are the lane streams a request submits (one pass per
-    stream, `forward-pass.stream`; empty means text only); `positions`
-    says where its lanes' rows sit in the rotary space;
-    `readout`/`readout-width` say what the epilogue may read and how wide
-    one row is (the `velocity(width)` / `hidden(width)` declaration to
-    make).
-    """
-    name: str
-    index: int
-    has_kv: bool
-    takes_tokens: bool
-    streams: List[LaneStream]
-    positions: Optional[PositionConvention]
-    readout: ReadoutKind
-    readout_width: int
 
 class InputAxis(Enum):
     """
@@ -185,14 +138,18 @@ class Readout:
 @dataclass
 class LaneDecl:
     """
-    Everything about a lane of the given switches: the inputs it must
-    bind (exactly these, by `forward-pass.input`), whether it binds
-    `state` and `embed`, and what it reads out.
+    Everything about a lane of the given switches, as the compiled graph
+    runs it: the inputs it must bind (exactly these, by
+    `forward-pass.input`), whether it binds `state` (some class it can
+    land in reads a kv cache) and `embed` (some class reads `tokens`), and
+    what it reads out (the export seam its classes read; a float readout
+    where some class reads one). `none` when no class it lands in reads
+    anything out.
     """
     inputs: List[InputDecl]
     reads_kv: bool
     embeds: bool
-    readout: Readout
+    readout: Optional[Readout]
 
 @dataclass
 class LatentSpace:
@@ -229,9 +186,9 @@ class StreamShift:
     its own), and `stream-shifts` names the per-modality shifts of a
     family that runs several schedules at once. The library's
     `latent::FlowMatchEuler` is built from this.
-    `none` when no reading denoises.
+    `none` when the model does not denoise.
     """
-    lane: LaneStream
+    lane: str
     shift: float
 
 @dataclass
@@ -274,23 +231,22 @@ def mtp_depth() -> int:
     raise NotImplementedError
 def draft_block() -> Optional[BlockDrafter]:
     raise NotImplementedError
-def pass_kind() -> ForwardKind:
-    raise NotImplementedError
-def canvas() -> Optional[CanvasShape]:
-    raise NotImplementedError
-def readings() -> List[ReadingFact]:
+def switches() -> List[SwitchDecl]:
     """
-    Every reading the bound model declares, in index order. Empty for a
-    model with one implicit reading (every text row), on which
-    `forward-pass.reading` is refused. Static.
+    Every switch the bound model declares. Empty for a model with one
+    path (every text model). Static.
+    """
+    raise NotImplementedError
+def positions() -> Optional[PositionConvention]:
+    """
+    How the bound model's lanes place their rows in the rotary space,
+    when it states a convention. `none` otherwise. Static.
     """
     raise NotImplementedError
 def lane(switches: List[Tuple[str, str]]) -> LaneDecl:
     """
     The lane a pass of these switches is. Switches are `(name, value)`
-    pairs: `("reading", name)`, `("stream", name)` and, on a diffusion
-    model, `("canvas", "encode" | "denoise")`; one left unset takes its
-    default (the model's one reading, the `text` stream, `encode`).
+    pairs of `switches()`; one left unset takes its default.
     
     Raises: `componentize_py_types.Err(wit_world.imports.str)`
     """

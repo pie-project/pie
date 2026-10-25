@@ -54,8 +54,11 @@ fn seating(lanes: &[super::Seated<'_>]) -> String {
             out.push_str(", ");
         }
         match lane.group {
-            Some(group) => out.push_str(&format!("lane {at} group {group} stream {}", lane.stream)),
-            None => out.push_str(&format!("lane {at} ungrouped stream {}", lane.stream)),
+            Some(group) => out.push_str(&format!(
+                "lane {at} group {group} word {:#x}",
+                lane.lane.word
+            )),
+            None => out.push_str(&format!("lane {at} ungrouped word {:#x}", lane.lane.word)),
         }
     }
     out
@@ -71,9 +74,9 @@ fn peer_lane(lanes: &[super::Seated<'_>], at: usize, want: u32) -> Result<usize>
             ),
         ));
     }
-    let stream = lanes[at].stream;
+    let word = lanes[at].lane.word;
     let mut found: Vec<usize> = (0..lanes.len())
-        .filter(|other| lanes[*other].group == Some(want) && lanes[*other].stream == stream)
+        .filter(|other| lanes[*other].group == Some(want) && lanes[*other].lane.word == word)
         .collect();
     match found.len() {
         1 => Ok(found.remove(0)),
@@ -81,7 +84,7 @@ fn peer_lane(lanes: &[super::Seated<'_>], at: usize, want: u32) -> Result<usize>
             "serve::readback",
             format!(
                 "lane {at} names attention group {want} as its peer, and this fire \
-                 seats no lane of {want} on stream {stream} for it to read; this \
+                 seats no lane of {want} of its word {word:#x} for it to read; this \
                  fire seats {}",
                 seating(lanes)
             ),
@@ -90,7 +93,7 @@ fn peer_lane(lanes: &[super::Seated<'_>], at: usize, want: u32) -> Result<usize>
             "serve::readback",
             format!(
                 "lane {at} names attention group {want} as its peer, and this fire \
-                 seats {many} lanes of {want} on stream {stream}; which one is the \
+                 seats {many} lanes of {want} of its word {word:#x}; which one is the \
                  peer is not the shell's to guess"
             ),
         )),
@@ -463,15 +466,15 @@ impl FireCtx<'_> {
         }
         for feed in &p.input_feeds {
             let (source, _) = self.programs.feed_cell(feed.instance, feed.channel)?;
-            let rectangle = self
-                .inputs
-                .seat(feed.seat.id, u32::MAX)
-                .ok_or_else(|| Fault::Unbound {
-                    what: format!(
-                        "guest input {}'s rectangle, which this load carved none of",
-                        feed.seat.id
-                    ),
-                })?;
+            let rectangle =
+                self.inputs
+                    .seat(feed.seat.id, u32::MAX)
+                    .ok_or_else(|| Fault::Unbound {
+                        what: format!(
+                            "guest input {}'s rectangle, which this load carved none of",
+                            feed.seat.id
+                        ),
+                    })?;
             let at = rectangle.ptr + u64::from(feed.first) * feed.seat.row_bytes();
             if feed.cast {
                 kernels_cuda::linear::cast::cast_fp32_to(
@@ -554,15 +557,15 @@ impl FireCtx<'_> {
             let at = column.ptr + u64::from(land.first) * row_bytes;
             let bytes = usize::try_from(u64::from(land.rows) * row_bytes).unwrap_or(usize::MAX);
             if land.fed {
-                let rectangle = self
-                    .inputs
-                    .seat(land.seat.id, u32::MAX)
-                    .ok_or_else(|| Fault::Unbound {
-                        what: format!(
-                            "guest input {}'s rectangle, which this load carved none of",
-                            land.seat.id
-                        ),
-                    })?;
+                let rectangle =
+                    self.inputs
+                        .seat(land.seat.id, u32::MAX)
+                        .ok_or_else(|| Fault::Unbound {
+                            what: format!(
+                                "guest input {}'s rectangle, which this load carved none of",
+                                land.seat.id
+                            ),
+                        })?;
                 crate::device::alloc::copy_any(
                     self.device.stream(),
                     at,

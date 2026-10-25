@@ -166,6 +166,8 @@ pub struct EngineConfig {
     pub facts: poem_ir::Facts,
     /// The inputs the engine's trace reads from its guest.
     pub inputs: Vec<poem_ir::InputDecl>,
+    /// The engine's classes and what each runs.
+    pub classes: poem_ir::LaneClasses,
     pub engine_backend: crate::engine::EngineBox,
 }
 
@@ -383,13 +385,26 @@ async fn bootstrap_inner(config: Config) -> Result<BootstrapHandle> {
         .map(|engine| engine.inputs.clone())
         .unwrap_or_default();
     if engine_configs.iter().any(|engine| engine.inputs != inputs) {
-        anyhow::bail!("the engines of one model read different guest inputs; they run different traces");
+        anyhow::bail!(
+            "the engines of one model read different guest inputs; they run different traces"
+        );
+    }
+    let classes = engine_configs
+        .first()
+        .map(|engine| engine.classes.clone())
+        .unwrap_or_default();
+    if engine_configs
+        .iter()
+        .any(|engine| engine.classes != classes)
+    {
+        anyhow::bail!("the engines of one model run different classes; they run different traces");
     }
     model::register(
         name.clone(),
         &model_id,
         facts,
         inputs,
+        classes,
         kv_page_size as u32,
         rs_caps,
         eta_caps,

@@ -19,7 +19,7 @@ use checkpoint::contract::ModelContract;
 use engine::Engine;
 use engine::channel::{ChannelId, ChannelRegistration};
 use engine::fire::{
-    Attachment, Boundary, FrameSubmission, InputFeed, Lane, LaneStream, Readout, Step, StepVoxels,
+    Attachment, Boundary, FrameSubmission, InputFeed, Lane, Readout, Step, StepVoxels,
 };
 use engine::load::{Budgets, Checkpoint, LoadRequest, Loaded, Residency};
 use engine::program::{InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
@@ -34,7 +34,7 @@ use poem::fact;
 use poem::ops::conv::{self, ConvShape};
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm,
-    Stream, Trace, Value, Weight, ops, seam, trace_hybrid,
+    Trace, Value, Weight, ops, seam, trace_hybrid,
 };
 use poem_ir::InputAxis;
 
@@ -89,9 +89,16 @@ impl ForwardHybrid for DoubleBlock {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
+        inputs
+            .recorder()
+            .declare_switch("reading", &["denoise", "vae"]);
+        inputs.recorder().declare_switch(
+            "stream",
+            &["text", "image", "video", "audio", "context", "reference"],
+        );
         let (txt, img) = (
-            inputs.on(fact::stream(Stream::Text)),
-            inputs.on(!fact::stream(Stream::Text)),
+            inputs.on(fact::switch_is("stream", "text")),
+            inputs.on(!fact::switch_is("stream", "text")),
         );
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
@@ -156,8 +163,8 @@ impl ForwardHybrid for DoubleBlock {
         );
         let o = ops::gather::unpack_rows(&o, &perm);
         let (o_txt, o_img) = (
-            o.on(fact::stream(Stream::Text)),
-            o.on(!fact::stream(Stream::Text)),
+            o.on(fact::switch_is("stream", "text")),
+            o.on(!fact::switch_is("stream", "text")),
         );
         let y_txt = ops::linear::matmul(&o_txt, &w("txt.o", WIDTH, HEAD_DIM));
         let y_img = ops::linear::matmul(&o_img, &w("img.o", WIDTH, HEAD_DIM));
@@ -182,9 +189,16 @@ impl ForwardHybrid for TwoAxis {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
+        inputs
+            .recorder()
+            .declare_switch("reading", &["denoise", "vae"]);
+        inputs.recorder().declare_switch(
+            "stream",
+            &["text", "image", "video", "audio", "context", "reference"],
+        );
         let (vae, dit) = (
-            inputs.on(fact::reading("vae")),
-            inputs.on(!fact::reading("vae")),
+            inputs.on(fact::switch_is("reading", "vae")),
+            inputs.on(!fact::switch_is("reading", "vae")),
         );
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
@@ -628,7 +642,7 @@ impl Rig {
     pub fn word(&self, reading: Option<&str>) -> u64 {
         let request = Request::new(1, false);
         self.facts.word(&match reading {
-            Some(reading) => request.in_reading(reading),
+            Some(reading) => request.switched("reading", reading),
             None => request,
         })
     }
@@ -768,20 +782,15 @@ impl Rig {
 /// A double-block lane feeding every input the plan reads off its handles:
 /// the row inputs (`latents`, `context`) off the latent cell, `timestep` and
 /// `positions` off their own, in attention group `group`.
-pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, stream: LaneStream, group: u32) -> Lane {
+pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, stream: &str, group: u32) -> Lane {
     Lane {
         slot,
         word: rig
             .facts
-            .word(&Request::new(handles.rows, false).on_stream(match stream {
-                LaneStream::Text => Stream::Text,
-                _ => Stream::Image,
-            })),
+            .word(&Request::new(handles.rows, false).switched("stream", stream)),
         tokens: vec![0; handles.rows as usize],
         readout: Readout::Rows((0..handles.rows).collect()),
-        stream,
         group: Some(group),
-        reading: 0,
         inputs: rig
             .inputs
             .iter()

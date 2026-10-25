@@ -9,7 +9,7 @@ use checkpoint::serving::Stamp;
 use engine::Engine;
 use engine::channel::ChannelRegistration;
 use engine::fire::{
-    Attachment, Boundary, FrameSubmission, InputFeed, Lane, LaneStream, Readout, Step, StepVoxels,
+    Attachment, Boundary, FrameSubmission, InputFeed, Lane, Readout, Step, StepVoxels,
 };
 use engine::load::{Budgets, Checkpoint, LoadRequest, Loaded, Residency};
 use engine::program::{InstanceBinding, ProgramRegistration};
@@ -46,9 +46,12 @@ impl ForwardHybrid for TwoAxis {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
+        inputs
+            .recorder()
+            .declare_switch("reading", &["denoise", "vae"]);
         let (vae, dit) = (
-            inputs.on(fact::reading("vae")),
-            inputs.on(!fact::reading("vae")),
+            inputs.on(fact::switch_is("reading", "vae")),
+            inputs.on(!fact::switch_is("reading", "vae")),
         );
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
@@ -421,7 +424,7 @@ impl Rig {
     pub fn word(&self, reading: Option<&str>) -> u64 {
         let request = Request::new(1, false);
         self.facts.word(&match reading {
-            Some(reading) => request.in_reading(reading),
+            Some(reading) => request.switched("reading", reading),
             None => request,
         })
     }
@@ -433,7 +436,6 @@ impl Rig {
             word: self.word(Some("vae")),
             tokens: vec![0],
             readout: Readout::None,
-            stream: LaneStream::Image,
             group: None,
             inputs: vec![InputFeed {
                 id: self.input("voxels"),
@@ -457,7 +459,6 @@ impl Rig {
             word: self.word(None),
             tokens: vec![0; rows as usize],
             readout: Readout::Rows((0..rows).collect()),
-            stream: LaneStream::Image,
             group: Some(0),
             inputs: vec![
                 InputFeed {

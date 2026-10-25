@@ -217,6 +217,54 @@ impl InputDecl {
     }
 }
 
+/// Which export seam a class reads out: a text head's logits (`out`), a
+/// denoiser's `velocity`, an encoder's `hidden` rows, a VAE's `pixels`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ReadoutKind {
+    Logits,
+    Velocity,
+    Hidden,
+    Pixels,
+}
+
+/// What a class reads out, and how wide one row is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Readout {
+    pub kind: ReadoutKind,
+    pub width: u32,
+}
+
+/// One class of a loaded model, as its graph runs it: the lane words (under
+/// [`LaneClasses::mask`]) landing in it, whether it reads a kv cache, embeds
+/// `tokens`, attends both ways, and what it reads out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneClass {
+    pub words: Vec<u64>,
+    pub reads_kv: bool,
+    pub embeds: bool,
+    pub wide: bool,
+    pub readout: Option<Readout>,
+}
+
+/// The classes of a loaded model, and the mask of the word bits that tell
+/// them apart.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LaneClasses {
+    pub mask: u64,
+    pub classes: Vec<LaneClass>,
+}
+
+impl LaneClasses {
+    /// The class a lane of `word` lands in.
+    #[must_use]
+    pub fn of(&self, word: u64) -> Option<&LaneClass> {
+        let word = word & self.mask;
+        self.classes
+            .iter()
+            .find(|class| class.words.contains(&word))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockDrafter {
     pub rows: u32,

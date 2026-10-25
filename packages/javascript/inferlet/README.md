@@ -44,8 +44,9 @@ for a one-pass prefill and a device loop-carried decode.
 crates and `inferlet::eta`): `Tensor` with `.add/.sub/.mul/.div/.rem/.neg/
 .divCeil`, the op set (`reduceArgmax`, `gumbelMax`, `nucleusSample`,
 `softmax`, `topK`, …), `Channel`, `WorkingSet`, `StateGeometry`,
-`ForwardPass`, `Pipeline` (`submit`, `runAhead`), `readoutSpans`, and `eta.diffusion`
-(the diffusion pass's `Mode` plus `entropyBoundAccept` / `stableAndConfident` /
+`ForwardPass` (a model's paths picked by `switch(name, value)`), `Pipeline`
+(`submit`, `runAhead`), `readoutSpans`, and `eta.diffusion` (a block-diffusion
+text's samplers `entropyBoundAccept` / `stableAndConfident` /
 `linearTemperature`). The container bytes
 it emits are **byte-identical** to the Rust `inferlet` crate's for the same program
 (`src/__tests__/eta_goldens.test.ts` pins them). `grammar`/`mask`, `chat`,

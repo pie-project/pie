@@ -16,8 +16,8 @@ pie --config ~/.pie/config.<yours>.toml run text-to-image -o ./out -- \
     --width 1024 --height 1024 --steps 4 --seed 0 --out image
 ```
 
-The config must bind a generative row (`pie model list` marks one
-`text-to-image`) and must set `[engine] max_model_len = 32768`: a 1024²
+The config must bind a generative row (`pie model info` says when one binds
+the inputs this sampler drives) and must set `[engine] max_model_len = 32768`: a 1024²
 job is 4096 latent rows a lane and the frame carries two fires, so the 4096
 default refuses the second fire by name.
 
@@ -56,17 +56,40 @@ python scripts/imagegen/decode_latent.py --latent ./out/image.latent.f32 \
     --sidecar ./out/image.json --model-dir <the diffusers folder> --out ./out/image.png
 ```
 
+## Standard input names
+
+The sampler binds a model's inputs by name, and knows five:
+
+| input | what this guest puts there |
+|---|---|
+| `latents` | the noised latent rows a denoise lane carries |
+| `timestep` | the step's timestep, one value a lane |
+| `guidance` | the guidance scale, one value a lane, when the model takes it |
+| `context` | the text encoder's hidden rows, on the prompt lane |
+| `positions` | each row's rotary coordinates, from `model::positions()` |
+
+These names are a convention between a model and the model-agnostic guests
+that drive it, not runtime vocabulary: the runtime checks a channel against
+the input's axis, width and dtype and never reads the name. A lane binds
+exactly the inputs `model::lane_of` says it reads, and an input it reads by
+any other name is refused by name instead of zero-filled: such a model is
+simply not one this guest drives.
+
 ## How it finds its way around
+
+The readings are the values of the model's `reading` switch
+(`model::switch("reading")`), and what each one is comes from its lane
+(`model::lane_of(&[("reading", r), ("stream", "image")])`):
 
 | role | the fact that says so |
 |---|---|
-| text encoder | `takes_tokens && readout == Hidden` |
-| denoiser | `!takes_tokens && readout == Velocity` |
+| text encoder | `embeds && readout == Hidden` |
+| denoiser | `!embeds && readout == Velocity` |
 | VAE decode | `readout == Pixels`, and not the encoder |
 
 The latent grid comes from `model::latent()`, the step count and trajectory
 from `model::schedule()`, the row ceiling from `model::max_latent_rows()`, and
-the rotary coordinates from the reading's own `positions` convention. A model
+the rotary coordinates from the model's `model::positions()` convention. A model
 with no text reading is refused BY NAME ("this model has no text reading"),
 which is the right answer for the `mini-dit` fixture.
 

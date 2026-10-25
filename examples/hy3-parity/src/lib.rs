@@ -12,14 +12,14 @@
 //! lands is the step:
 //!
 //! ```text
-//! encode     the prompt prefix, causal, its K/V ARE the sequence -> logits
+//! text       the prompt prefix, causal, its K/V ARE the sequence -> logits
 //! image.in   the noisy latent as a `[h, w, 32]` CLIP on the voxel axis,
 //!            through `patch_embed`'s 3x3 convs and its adaptive group
 //!            norm                                        -> pixels [h*w, D]
 //! denoise    the canvas: those h*w rows through the `latents` input plus
 //!            ONE <timestep> row the plan lands from the lane's timestep
 //!            vector, bidirectional over [prefix | canvas] against the
-//!            prefix `encode` wrote and froze              -> hidden
+//!            prefix `text` wrote and froze                -> hidden
 //! image.out  those rows back on the voxel axis through `final_layer`
 //!                                                        -> pixels [h*w, 32]
 //! ```
@@ -174,37 +174,27 @@ struct Output {
     latent_channels: u32,
 }
 
-fn reading(name: &'static str) -> Result<model::ReadingFact> {
-    model::readings()
-        .into_iter()
-        .find(|reading| reading.name == name)
-        .ok_or_else(|| format!("this model declares no `{name}` reading").into())
+/// How wide a row the lane of `reading` reads out.
+fn readout_width(reading: &str) -> Result<u32> {
+    model::lane_of(&[("reading", reading)])?
+        .readout
+        .map(|readout| readout.width)
+        .ok_or_else(|| format!("reading `{reading}` reads nothing out"))
 }
 
-/// The lane of `reading` on `stream` under `canvas` (`encode` or
-/// `denoise`), checked to read exactly `binds`: what this guest binds on
-/// it, by the model's own input names. Checked up front so a model whose
-/// lane reads anything else fails here in its own vocabulary instead of at
-/// `program`.
-fn lane_reading(
-    reading: &str,
-    stream: LaneStream,
-    canvas: &str,
-    binds: &[&str],
-) -> Result<model::LaneDecl> {
-    let lane = model::lane(&[
-        ("reading".to_string(), reading.to_string()),
-        ("stream".to_string(), model::stream_name(stream).to_string()),
-        ("canvas".to_string(), canvas.to_string()),
-    ])?;
+/// The lane of `reading`, checked to read exactly `binds`: what this guest
+/// binds on it, by the model's own input names. Checked up front so a model
+/// whose lane reads anything else fails here in its own vocabulary instead
+/// of at `program`.
+fn lane_reading(reading: &str, binds: &[&str]) -> Result<model::LaneDecl> {
+    let lane = model::lane_of(&[("reading", reading)])?;
     let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
     let mut wants = binds.to_vec();
     reads.sort_unstable();
     wants.sort_unstable();
     if reads != wants {
         return Err(format!(
-            "reading `{reading}`'s `{}` lane reads {reads:?}; this pass binds {wants:?}",
-            model::stream_name(stream)
+            "reading `{reading}`'s lane reads {reads:?}; this pass binds {wants:?}"
         )
         .into());
     }
@@ -212,17 +202,12 @@ fn lane_reading(
 }
 
 /// The one input a voxel arm's lane reads: the clip, on the voxel axis.
-fn voxel_input(arm: &model::ReadingFact) -> Result<String> {
-    let lane = model::lane(&[
-        ("reading".to_string(), arm.name.clone()),
-        ("stream".to_string(), "image".to_string()),
-        ("canvas".to_string(), "encode".to_string()),
-    ])?;
+fn voxel_input(arm: &str) -> Result<String> {
+    let lane = model::lane_of(&[("reading", arm)])?;
     match &lane.inputs[..] {
         [input] if input.axis == model::InputAxis::Voxel => Ok(input.name.clone()),
         other => Err(format!(
-            "reading `{}` reads {} input(s), and a voxel arm reads one clip on the voxel axis",
-            arm.name,
+            "reading `{arm}` reads {} input(s), and a voxel arm reads one clip on the voxel axis",
             other.len()
         )
         .into()),
@@ -243,7 +228,7 @@ struct Shape {
 fn prefill(
     case: &Case,
     shape: &Shape,
-    encode: &model::ReadingFact,
+    encode: &str,
     ws: &WorkingSet,
     pipe: &Pipeline,
     ids: &[i32],
@@ -259,8 +244,7 @@ fn prefill(
     let max = Channel::new([n], dtype::f32).named(&format!("encode_max_{tag}"));
 
     let pass = ForwardPass::new();
-    pass.reading(&encode.name)?;
-    pass.canvas(Mode::Encode)?;
+    pass.switch("reading", encode)?;
     pass.embed(&toks, &indptr)?;
     pass.input("positions", &rope)?;
     pass.state(&[ws], StateGeometry::folding())?;
@@ -284,7 +268,7 @@ fn prefill(
 fn denoise_step(
     case: &Case,
     shape: &Shape,
-    denoise: &model::ReadingFact,
+    denoise: &str,
     ws: &WorkingSet,
     pipe: &Pipeline,
     image_rows: &[f32],
@@ -324,9 +308,7 @@ fn denoise_step(
     let out = Channel::new([canvas_len, case.hidden], dtype::f32).named(&name("hidden"));
 
     let pass = ForwardPass::new();
-    pass.reading(&denoise.name)?;
-    pass.canvas(Mode::Denoise)?;
-    pass.stream(LaneStream::Image)?;
+    pass.switch("reading", denoise)?;
     pass.embed(&toks, &indptr)?;
     pass.input("latents", &latents)?;
     pass.input("special", &flag)?;
@@ -361,7 +343,7 @@ fn denoise_step(
 /// columns back apart (`super::model::port::LATENT_VOXELS`).
 fn voxel_arm(
     case: &Case,
-    arm: &model::ReadingFact,
+    arm: &str,
     pipe: &Pipeline,
     clip: &[f32],
     channels: u32,
@@ -377,22 +359,18 @@ fn voxel_arm(
         packed.extend_from_slice(&case.tfreq);
     }
     let pass = ForwardPass::new();
-    pass.reading(&arm.name)?;
-    // A `forward-diffusion` pass states its attention MODE even where the
-    // reading declares no KV space and binds none.
-    pass.canvas(Mode::Encode)?;
-    pass.stream(LaneStream::Image)?;
+    pass.switch("reading", arm)?;
     let x = Channel::from_shaped([case.token_h, case.token_w, width_in], packed.as_slice())
         .named(&format!("clip_{tag}"));
     pass.input(&voxel_input(arm)?, &x)?;
-    let width = arm.readout_width;
+    let width = readout_width(arm)?;
     let out = Channel::new([rows, width], dtype::f32).named(&format!("pixels_{tag}"));
     let readback = out.clone();
     pass.epilogue(move || {
         readback.put(intrinsics::pixels(rows, width));
     });
     pass.submit(pipe)
-        .with_context(|| format!("the `{}` lane", arm.name))?;
+        .with_context(|| format!("the `{arm}` lane"))?;
     Ok(out)
 }
 
@@ -425,26 +403,20 @@ fn parse(input: &Input) -> Result<Case> {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Diffusion {
-        return Err("hunyuan_image_3 is a `forward-diffusion` row; the bound model is not".into());
-    }
     let case = parse(&input)?;
 
-    let encode = reading("encode")?;
-    let denoise = reading("denoise")?;
-    if !(encode.has_kv && denoise.has_kv) {
+    let encode = "text";
+    let denoise = "denoise";
+    let encode_lane = lane_reading(encode, &["positions"])?;
+    let denoise_lane = lane_reading(denoise, &["latents", "special", "timestep", "positions"])?;
+    if !(encode_lane.reads_kv && denoise_lane.reads_kv) {
         return Err("both token-axis readings of this family bind a kv space".into());
     }
-    lane_reading(
-        &denoise.name,
-        LaneStream::Image,
-        "denoise",
-        &["latents", "special", "timestep", "positions"],
-    )?;
-    if denoise.readout_width != case.hidden {
+    let canvas_width = readout_width(denoise)?;
+    if canvas_width != case.hidden {
         return Err(format!(
-            "the model reads a {}-wide canvas row and the case carries {}",
-            denoise.readout_width, case.hidden
+            "the model reads a {canvas_width}-wide canvas row and the case carries {}",
+            case.hidden
         )
         .into());
     }
@@ -468,8 +440,7 @@ async fn main(input: Input) -> Result<Output> {
         .ok_or("an empty canvas")?
         + 1;
     let shape = Shape {
-        axes: lane_reading(&encode.name, LaneStream::Text, "encode", &["positions"])?.inputs[0]
-            .width,
+        axes: encode_lane.inputs[0].width,
         prefix_len,
         canvas_len,
         kv_len,
@@ -479,18 +450,19 @@ async fn main(input: Input) -> Result<Output> {
     let pipe = Pipeline::new();
 
     // ---- the image head, going in: `patch_embed` on the voxel axis -------
-    let image_in = reading("image.in")?;
-    let image_out = reading("image.out")?;
-    if image_in.readout_width != case.hidden {
+    let image_in = "image.in";
+    let image_out = "image.out";
+    let image_in_width = readout_width(image_in)?;
+    if image_in_width != case.hidden {
         return Err(format!(
-            "`image.in` lands {}-wide rows and the case's trunk is {} wide",
-            image_in.readout_width, case.hidden
+            "`image.in` lands {image_in_width}-wide rows and the case's trunk is {} wide",
+            case.hidden
         )
         .into());
     }
     let rows_channel = voxel_arm(
         &case,
-        &image_in,
+        image_in,
         &pipe,
         &case.latent,
         case.latent_channels,
@@ -500,11 +472,11 @@ async fn main(input: Input) -> Result<Output> {
 
     // ---- A: the prompt's prefix, then step 0 -----------------------------
     let ws_a = WorkingSet::new();
-    let (argmax, max) = prefill(&case, &shape, &encode, &ws_a, &pipe, &case.prefix, "a")?;
+    let (argmax, max) = prefill(&case, &shape, encode, &ws_a, &pipe, &case.prefix, "a")?;
     let a = denoise_step(
         &case,
         &shape,
-        &denoise,
+        denoise,
         &ws_a,
         &pipe,
         &image_in_rows,
@@ -517,11 +489,11 @@ async fn main(input: Input) -> Result<Output> {
 
     // ---- B: the SAME step over the unconditional prefix -------------------
     let ws_b = WorkingSet::new();
-    prefill(&case, &shape, &encode, &ws_b, &pipe, &case.prefix_alt, "b")?;
+    prefill(&case, &shape, encode, &ws_b, &pipe, &case.prefix_alt, "b")?;
     let b = denoise_step(
         &case,
         &shape,
-        &denoise,
+        denoise,
         &ws_b,
         &pipe,
         &image_in_rows,
@@ -534,7 +506,7 @@ async fn main(input: Input) -> Result<Output> {
     let c = denoise_step(
         &case,
         &shape,
-        &denoise,
+        denoise,
         &ws_a,
         &pipe,
         &image_in_rows,
@@ -545,11 +517,11 @@ async fn main(input: Input) -> Result<Output> {
 
     // ---- D: the same step from a fresh prefill ----------------------------
     let ws_d = WorkingSet::new();
-    prefill(&case, &shape, &encode, &ws_d, &pipe, &case.prefix, "d")?;
+    prefill(&case, &shape, encode, &ws_d, &pipe, &case.prefix, "d")?;
     let d = denoise_step(
         &case,
         &shape,
-        &denoise,
+        denoise,
         &ws_d,
         &pipe,
         &image_in_rows,
@@ -563,7 +535,7 @@ async fn main(input: Input) -> Result<Output> {
     // clip; the rest are the clip's rows in raster order.
     let velocity_channel = voxel_arm(
         &case,
-        &image_out,
+        image_out,
         &pipe,
         &canvas_hidden[case.hidden as usize..],
         case.hidden,

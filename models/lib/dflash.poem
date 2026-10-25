@@ -213,7 +213,7 @@ def caches(d, c, space):
 
 def block_rows(d):
     """The rows of a drafted block."""
-    return fact.block_draft()
+    return switch_is("block_draft", "on")
 
 def tap(d, layer, y, fused):
     """`fused`, with the trunk's residual `y` after `layer` added if the

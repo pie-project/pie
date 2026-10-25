@@ -634,6 +634,7 @@ impl Engine for Metal {
             adapter_attachments: false,
             facts: shell.trace().facts.clone(),
             inputs: shell.inputs(),
+            classes: shell.classes(),
         };
 
         self.shell = Some(shell);
@@ -1086,7 +1087,6 @@ impl Metal {
                         word: words[at],
                         tokens: &lane.tokens,
                     },
-                    stream: lane.stream as u8,
                     group: lane.group,
                     inputs: &lane.inputs,
                     pages: &lane.kv.pages,

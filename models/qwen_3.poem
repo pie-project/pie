@@ -1321,6 +1321,8 @@ def caches(m, c):
 
 def forward(m, inputs):
     dr = m.dflash
+    if dr != None:
+        switch("block_draft", ["off", "on"])
     trunk_inputs = inputs.on(~block_rows(dr)) if dr != None else inputs
     ([input_m, input_s, input_d], input_p) = trunk_inputs.partition([fact.has(fact.Mask), fact.scores(), fact.single_token()])
     plans = struct(
@@ -1461,7 +1463,7 @@ def attn_mixer(x, inputs, m, plans, mask, a):
         seam.at(seam.SCORES, [lse])
         return o
 
-    o = switch(q, [
+    o = branch(q, [
         (fact.has(fact.Mask), lambda q: ops.attn.prefill(
             q,
             plans.m,
@@ -1513,6 +1515,6 @@ def gdn_mixer(x, inputs, g, bonsai):
         # output narrower for it.
         return ops.elemwise.rmsnorm_gated(core, zc, g.norm, g.v_dim, g.norm_eps, "silu")
 
-    o = switch(qkv, [(fact.single_token(), step)], otherwise = chunked)
+    o = branch(qkv, [(fact.single_token(), step)], otherwise = chunked)
     o_in = rot_take(o, bonsai.ssm) if bonsai != None else o
     return ops.linear.matmul(o_in, g.out_proj)

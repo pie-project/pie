@@ -9,6 +9,9 @@
 //! taps. No sampling, no loop: the point is the numbers, row by row.
 
 use inferlet::eta::diffusion::prelude::*;
+
+/// The tokens one block's canvas is.
+const CANVAS: u32 = 256;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -79,7 +82,7 @@ struct Output {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Diffusion {
+    if !model::switch("mode").is_some_and(|mode| mode.values.iter().any(|v| v == "denoise")) {
         return Err("this program reads a block-diffusion model; the bound model is not one".into());
     }
     let pieces: String = [
@@ -101,12 +104,11 @@ async fn main(input: Input) -> Result<Output> {
     };
     let case: Case = inferlet::serde_json::from_str(&text)
         .map_err(|why| format!("case json: {why}"))?;
-    let shape = model::canvas().ok_or("a diffusion model states its canvas")?;
-    let length = shape.length;
+    let length = CANVAS;
     if case.canvas0.len() != length as usize || case.canvas1.len() != length as usize {
         return Err(format!("the case's canvases are not {length} long").into());
     }
-    let lane = model::lane(&[("canvas".into(), "denoise".into())])?;
+    let lane = model::lane_of(&[("mode", "denoise")])?;
     let taps = lane
         .inputs
         .iter()
@@ -143,7 +145,6 @@ async fn main(input: Input) -> Result<Output> {
         let probs_out = Channel::new([len, 8], dtype::f32).named(&format!("probs_{tag}"));
 
         let fwd = ForwardPass::new();
-        fwd.canvas(Mode::Encode)?;
         fwd.embed(&toks, &embed_indptr)?;
         fwd.state(
             &[&ws],
@@ -194,7 +195,9 @@ async fn main(input: Input) -> Result<Output> {
 
         let fwd = ForwardPass::new();
         let commit = at == 2;
-        fwd.canvas(if commit { Mode::Encode } else { Mode::Denoise })?;
+        if !commit {
+            fwd.switch("mode", "denoise")?;
+        }
         fwd.embed(&toks, &embed_indptr)?;
         // A committed canvas folds; one the next step rewrites does not.
         fwd.state(

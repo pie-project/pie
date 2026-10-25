@@ -53,3 +53,10 @@ class Pipeline:
 
 
 
+def live() -> int:
+    """
+    How many pipelines are open on the engine, this one included: a
+    program that trades compute for latency (speculation) reads whether
+    it is alone.
+    """
+    raise NotImplementedError

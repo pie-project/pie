@@ -8,6 +8,18 @@ export function equip(tools: Array<string>): Uint32Array;
  */
 export function answer(name: string, value: string): Uint32Array;
 /**
+ * Consecutive tool results (name, value), as the template writes them
+ * together.
+ */
+export function answers(results: Array<[string, string]>): Uint32Array;
+/**
+ * An earlier assistant turn: `message`, then the calls it made in the
+ * template's call syntax. `current` marks a turn after the
+ * conversation's last user query, which some templates replay with its
+ * reasoning.
+ */
+export function assistantCalls(message: string, calls: Array<ToolCall>, current: boolean): Uint32Array;
+/**
  * Returns the grammar that constrains well-formed tool-call output for
  * this model and toolset, or none if the model has no enforceable format.
  */

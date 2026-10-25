@@ -172,42 +172,7 @@ def layout(id, deploy):
     )
 
 def generative(m):
-    d = m.dims
     return generation(
-        readings = [
-            reading(
-                "encode",
-                index = 0,
-                has_kv = True,
-                takes_tokens = True,
-                streams = ["text"],
-                readout = "logits",
-                readout_width = d.vocab,
-            ),
-            reading(
-                "denoise",
-                index = 1,
-                has_kv = True,
-                takes_tokens = True,
-                streams = ["image"],
-                readout = "hidden",
-                readout_width = d.hidden,
-            ),
-            reading(
-                "image.in",
-                index = 2,
-                streams = ["image"],
-                readout = "pixels",
-                readout_width = d.hidden,
-            ),
-            reading(
-                "image.out",
-                index = 3,
-                streams = ["image"],
-                readout = "pixels",
-                readout_width = LATENT_CHANNELS,
-            ),
-        ],
         latent = latent_space(
             channels = LATENT_CHANNELS,
             patch_t = 1,
@@ -218,10 +183,6 @@ def generative(m):
         ),
         schedule = schedule("flow", shift = FLOW_SHIFT, train_steps = TRAIN_STEPS),
     )
-
-def diffusion(m):
-    side = 64 if m.dims.layers > 4 else 8
-    return canvas(canvas = side * side, hidden = m.dims.hidden)
 
 # How a HunyuanImage 3 checkpoint is laid out: transformers' names. Its fused
 # qkv interleaves each kv group's query, key and value heads and its rope
@@ -371,12 +332,13 @@ def caches(m, c):
 def on_canvas():
     """The canvas rows: the denoise reading's, with the mask the canvas
     attends through. A denoise lane sent without one reads as text."""
-    return fact.reading("denoise") & fact.has(fact.Mask)
+    return switch_is("reading", "denoise") & fact.has(fact.Mask)
 
 def forward(m, inputs):
-    inputs.reading("image.in", lambda rows: image_in(rows, m))
-    inputs.reading("image.out", lambda rows: image_out(rows, m))
-    trunk_rows = inputs.on(~fact.reading("image.in") & ~fact.reading("image.out"))
+    switch("reading", ["text", "denoise", "image.in", "image.out"])
+    image_in(inputs.on(switch_is("reading", "image.in")), m)
+    image_out(inputs.on(switch_is("reading", "image.out")), m)
+    trunk_rows = inputs.on(~switch_is("reading", "image.in") & ~switch_is("reading", "image.out"))
     canvas_rows = trunk_rows.on(on_canvas())
     return trunk(trunk_rows, canvas_rows, m)
 

@@ -2,7 +2,7 @@
 //! round.
 //!
 //! ```text
-//! draft    [anchor, MASK x block-1]      one fire, `set-drafting-block`
+//! draft    [anchor, MASK x block-1]      one fire, `block_draft = on`
 //!          -> d[0..block-1]              d[j] proposes position held+j+1
 //! verify   [anchor, d[0] .. d[w-2]]      one fire, the trunk, plainly causal
 //!          -> t[i] = argmax(row i)       the target's own token for held+i+1
@@ -717,7 +717,7 @@ async fn main(input: Input) -> Result<Output> {
             let want_sure = input.verify_budget;
 
             let fwd = ForwardPass::new();
-            fwd.set_drafting_block(true)
+            fwd.switch("block_draft", "on")
                 .map_err(|why| format!("stating the draft block: {why}"))?;
             fwd.embed(&toks, &indptr)?;
             fwd.readout(&readout)?;

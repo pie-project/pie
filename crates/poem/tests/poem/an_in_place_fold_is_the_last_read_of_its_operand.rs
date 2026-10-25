@@ -1,5 +1,5 @@
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, Stream, Value, Weight, ops, seam,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, Value, Weight, ops, seam,
     trace_hybrid,
 };
 use poem_ir::{Elemwise, Operands, Operation, Trace, ValueId};
@@ -7,7 +7,7 @@ use poem_ir::{Elemwise, Operands, Operation, Trace, ValueId};
 const WIDTH: u32 = 64;
 const BLOCKS: usize = 3;
 fn text() -> Predicate {
-    poem::fact::stream(Stream::Text)
+    poem::fact::switch_is("stream", "text")
 }
 
 struct Stack {
@@ -19,6 +19,9 @@ impl ForwardHybrid for Stack {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
+        inputs
+            .recorder()
+            .declare_switch("stream", &["text", "image", "video", "audio"]);
         let x = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, WIDTH, None);
         let lanes = inputs.request_of_token();
         let t = inputs.input("lane", Dtype::F32, poem_ir::InputAxis::Lane, 1, None);
@@ -47,6 +50,9 @@ impl ForwardHybrid for TwoArms {
         HybridSpec::new()
     }
     fn forward(&self, inputs: Input) -> Value {
+        inputs
+            .recorder()
+            .declare_switch("stream", &["text", "image", "video", "audio"]);
         let x = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, WIDTH, None);
         let (txt, img) = (x.on(text()), x.on(!text()));
         let bias = Weight::sym("bias", [u64::from(WIDTH)], Dtype::Bf16);

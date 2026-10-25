@@ -202,36 +202,7 @@ def shifted_sigmas(shift, steps):
     return out
 
 def generative(m):
-    d = m.dims
-    readings = []
-    index = 0
-    if m.te != None:
-        readings.append(reading(
-            "text",
-            index = index,
-            has_kv = True,
-            takes_tokens = True,
-            streams = ["text"],
-            readout = "hidden",
-            readout_width = m.te.hidden,
-        ))
-        index += 1
-    readings.append(reading(
-        "refine",
-        index = index,
-        streams = ["text"],
-        readout = "hidden",
-        readout_width = d.dim,
-    ))
-    readings.append(reading(
-        "denoise",
-        index = index + 1,
-        streams = ["text", "video", "audio", "reference"],
-        readout = "velocity",
-        readout_width = VIDEO_FEATURES,
-    ))
     return generation(
-        readings = readings,
         latent = latent_space(
             channels = LATENT_CHANNELS,
             patch_t = PATCH_T,
@@ -463,10 +434,13 @@ def caches(m, c):
         qwen3_caches(m.te, c, m.kv)
 
 def forward(m, inputs):
+    switch("reading", (["text"] if m.te != None else []) + ["refine", "denoise"])
+    switch("stream", ["text", "video", "audio", "reference"])
+    reading = lambda name: inputs.on(switch_is("reading", name))
     if m.te != None:
-        inputs.reading("text", lambda rows: qwen3_encode(rows, m.te))
-    inputs.reading("refine", lambda rows: refine(rows, m))
-    return inputs.reading("denoise", lambda rows: denoise(rows, m))
+        qwen3_encode(reading("text"), m.te)
+    refine(reading("refine"), m)
+    return denoise(reading("denoise"), m)
 
 def run_attention(x, a, m, g, positions):
     """Self-attention over `g`'s rows; with `positions`, its q and k turned."""
@@ -515,9 +489,9 @@ def column(v, slot, total):
 def denoise(arm, m):
     d = m.dims
     dit = m.dit
-    text, rest = arm.on(fact.stream("text")), arm.on(~fact.stream("text"))
-    video, rest = rest.on(fact.stream("video")), rest.on(~fact.stream("video"))
-    audio, reference = rest.on(fact.stream("audio")), rest.on(~fact.stream("audio"))
+    text, rest = arm.on(switch_is("stream", "text")), arm.on(~switch_is("stream", "text"))
+    video, rest = rest.on(switch_is("stream", "video")), rest.on(~switch_is("stream", "video"))
+    audio, reference = rest.on(switch_is("stream", "audio")), rest.on(~switch_is("stream", "audio"))
 
     lanes = arm.request_of_token()
     positions = arm.input("positions", dtype.f32, "row", m.rope_axes)
@@ -556,9 +530,9 @@ def denoise(arm, m):
 
     final_mod = merge([run_linear(dit.final_adaln, s.stemb) for s in sides])
     h = ops.elemwise.modulate(ops.elemwise.rmsnorm(x, dit.final_norm, NORM_EPS), final_mod, lanes, "scale_shift")
-    rest = h.on(~fact.stream("text"))
-    h_video, rest = rest.on(fact.stream("video")), rest.on(~fact.stream("video"))
-    h_audio = rest.on(fact.stream("audio"))
+    rest = h.on(~switch_is("stream", "text"))
+    h_video, rest = rest.on(switch_is("stream", "video")), rest.on(~switch_is("stream", "video"))
+    h_audio = rest.on(switch_is("stream", "audio"))
     velocity = run_linear(dit.video_out, h_video)
     seam.at(seam.VELOCITY, [velocity])
     audio_velocity = run_linear(dit.audio_out, h_audio)

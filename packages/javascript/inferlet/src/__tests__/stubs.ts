@@ -9,13 +9,10 @@
 
 // ── pie:inferlet/model ──────────────────────────────────────────────────────
 
-export type ForwardKind = 'text' | 'diffusion';
-
 export const modelStub = {
   name: () => 'mock-model',
   architecture: () => 'qwen3_5',
   defaultSystemSpeculation: () => false,
-  passKind: (): ForwardKind => 'text',
   outputVocabSize: () => 151936,
   kvPageSize: () => 16,
   frameSize: () => 1,
@@ -26,9 +23,10 @@ export const modelStub = {
   submitDeadlineUs: () => 50_000n,
   runAheadWindow: () => 4,
   draftBlock: () => undefined,
-  canvas: () => ({ length: 32, hidden: 2560 }),
+  switches: () => [{ name: 'mode', values: ['encode', 'denoise'] }],
+  positions: () => undefined,
   lane: (switches: Array<[string, string]>) => ({
-    inputs: switches.some(([k, v]) => k === 'canvas' && v === 'denoise')
+    inputs: switches.some(([k, v]) => k === 'mode' && v === 'denoise')
       ? [{ name: 'self_cond_ids', axis: 'row', width: 4, dtype: 'i32' }]
       : [],
     readsKv: true,
@@ -156,13 +154,12 @@ export class ForwardPassStub {
   checkpoints(slots: Uint32Array) {
     this.checkpointSlots = Array.from(slots);
   }
-  setDraftingBlock() {}
   media(spans: unknown[]) {
     this.spans = [...spans];
   }
-  mode: string | null = null;
-  canvas(mode: string) {
-    this.mode = mode;
+  switches: [string, string][] = [];
+  switch(name: string, value: string) {
+    this.switches.push([name, value]);
   }
   program(bytes: Uint8Array, channels: unknown[]) {
     this.programBytes = new Uint8Array(bytes);

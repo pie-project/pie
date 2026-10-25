@@ -537,6 +537,7 @@ impl Engine for Wgpu {
             facts: shell.trace().facts.clone(),
             inputs: poem_exec::feeds::Feeds::of(shell.trace(), shell.compiled_model())
                 .decls(shell.trace(), shell.compiled_model()),
+            classes: poem_exec::feeds::lane_classes(shell.trace(), shell.compiled_model()),
         };
 
         self.shell = Some(shell);

@@ -10,7 +10,7 @@ use common_vae::{
 };
 use engine_cuda::Lane;
 use engine_cuda::serve::{Clips, Seated};
-use poem::{Platform, Request, Stream, Trace};
+use poem::{Platform, Request, Trace};
 
 const FLAGSHIP: &str = "ltx25-bf16-kv-bf16";
 const VAE_RGB: u32 = 3;
@@ -19,7 +19,8 @@ const VAE_Z: u32 = 128;
 /// The VAE's decode reading alone, by the package's own functions.
 const VAE_ONLY: &str = r#"
 def forward(m, inputs):
-    return inputs.reading("vae.decode", lambda rows: vae_decode(rows, m.vae))
+    switch("reading", ["vae.decode"])
+    return vae_decode(inputs.on(switch_is("reading", "vae.decode")), m.vae)
 "#;
 
 fn vae_only() -> Trace {
@@ -62,8 +63,8 @@ fn fire(
     keep_what_reads(&mut contract, &trace);
     let word = trace.facts.word(
         &Request::new(1, false)
-            .on_stream(Stream::Video)
-            .in_reading("vae.decode"),
+            .switched("stream", "video")
+            .switched("reading", "vae.decode"),
     );
     let started = Instant::now();
     let mut shell = common_vae::load(trace, &contract, root, max_voxels);

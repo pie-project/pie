@@ -5,11 +5,12 @@ The forward-pass surface. A guest traces a pass into canonical ETA
 container bytes and binds the channels, working sets and pipeline it runs
 on as resources.
 
-`forward` serves every text model, whatever state it keeps, and the
-generative families' readings (a DiT's text encoder, its denoise step, a
-VAE tile); `forward-diffusion` serves a block-diffusion text. What reaches
-inside attention (a mask over frozen slots, a `kv-len` past a row's own
-slot) is refused by name on a model without attention layers.
+`forward` serves every model: a text model, whatever state it keeps, and a
+generative family's every path (a DiT's text encoder, its denoise step, a
+VAE tile, a block-diffusion text's canvas), each picked by the model's own
+switches. What reaches inside attention (a mask over frozen slots, a
+`kv-len` past a row's own slot) is refused by name on a model without
+attention layers.
 
 Legal stages: prologue, on_attn_proj, on_attn, epilogue.
 """
@@ -24,7 +25,6 @@ from componentize_py_types import Result, Ok, Err, Some
 from ..imports import pipeline
 from ..imports import channel
 from ..imports import media
-from ..imports import model
 from ..imports import working_set
 import componentize_py_async_support
 from componentize_py_async_support.streams import StreamReader, StreamWriter, ByteStreamReader, ByteStreamWriter
@@ -85,8 +85,8 @@ class ForwardPass:
     def state(self, lanes: List[working_set.WorkingSet], geom: StateGeometry) -> None:
         """
         One working set per lane, in lane order; lanes sharing one state
-        their slots. Required on a reading with a KV space, refused on one
-        without.
+        their slots. Required on a lane that reads kv (`model.lane`'s
+        `reads-kv`), refused on one that does not.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
@@ -102,25 +102,21 @@ class ForwardPass:
     def embed(self, tokens: channel.Channel, indptr: channel.Channel) -> None:
         """
         Bind embedding token ids and CSR row indptr. Both are channels.
-        REQUIRED on a reading that embeds tokens (`reading-fact.
-        takes-tokens`, every text model's), REFUSED on one that does
-        not; the lane's row count then comes from its row inputs.
+        REQUIRED on a lane that embeds tokens (`model.lane`'s `embeds`,
+        every text model's), REFUSED on one that does not; the lane's row
+        count then comes from its row inputs.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def reading(self, name: str) -> None:
+    def switch(self, name: str, value: str) -> None:
         """
-        Which of the family's declared readings this pass runs
-        (`model.readings()`) -- the arm its lanes are stamped with.
-        Generalizes `forward-diffusion.canvas(mode)`: the set of
-        readings is open across the zoo (`"text"`, `"denoise"`,
-        `"denoise.low"`, `"refine"`, `"vae.encode"`, `"vae.decode"`,
-        `"upsample"`), while the set of state kinds stays closed.
-        Optional when the model declares one reading (or none: a text
-        model's implicit reading); refused by name for a name the model
-        does not declare. Set before `program`; one reading per pass
-        for its life.
+        Set the model's switch `name` to `value` (`model.switches()`):
+        which path this pass's lanes run. Names and values are the
+        model's (`reading`, `stream`, `mode`, ...); the host checks
+        `value` against the declaration and nothing else. A switch left
+        unset takes its first declared value. Set before `program`; a
+        pass keeps its switches for its life.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
@@ -144,14 +140,6 @@ class ForwardPass:
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """
         raise NotImplementedError
-    def stream(self, s: model.LaneStream) -> None:
-        """
-        Which lane stream this pass's rows are; default `text`. Set before
-        `program`.
-        
-        Raises: `componentize_py_types.Err(wit_world.imports.str)`
-        """
-        raise NotImplementedError
     def group(self, id: int) -> None:
         """
         Put this pass's lanes in attention group `id`: the lanes of every
@@ -163,8 +151,8 @@ class ForwardPass:
         raise NotImplementedError
     def peer(self, group: int) -> None:
         """
-        Name the attention group whose same-stream lane is this lane's
-        PEER: the lane whose velocity this one's epilogue reads with
+        Name the attention group whose lane of this lane's switches is
+        its PEER: the lane whose velocity this one's epilogue reads with
         `intrinsics::peer_velocity(width)`.
         
         This is the classifier-free guidance verb, and it names a group
@@ -175,7 +163,7 @@ class ForwardPass:
         the other's rows. So they are two groups of ONE fire, and this
         says which of them is the other.
         
-        The peer is the lane of that group carrying THIS pass's stream;
+        The peer is the lane of that group with THIS pass's switches;
         a group seating no such lane, or more than one, is refused by
         name at submit rather than guessed at. Naming one's own group is
         refused too: a lane is not its own peer, and `u + s(u - u)` is a
@@ -212,22 +200,6 @@ class ForwardPass:
     def readout(self, indices: channel.Channel) -> None:
         """
         Bind an optional readout-index channel separately from embedding.
-        
-        Raises: `componentize_py_types.Err(wit_world.imports.str)`
-        """
-        raise NotImplementedError
-    def set_drafting_block(self, on: bool) -> None:
-        """
-        **THESE ROWS ARE A BLOCK DRAFTER'S PROPOSAL, NOT THE SEQUENCE'S.**
-        A block drafter proposes many tokens in one pass over a block
-        whose first row is the correction the target just made and whose
-        rest is the model's mask token; the trunk must not run over them,
-        and a plan that carries such a drafter guards itself on this.
-        
-        It cannot be inferred from what the pass reads, the way drafting
-        is: what makes a fire a draft is the anchor chosen from the
-        accepted prefix, which only the guest knows. Unset = an ordinary
-        pass.
         
         Raises: `componentize_py_types.Err(wit_world.imports.str)`
         """

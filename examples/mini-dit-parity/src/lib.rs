@@ -195,8 +195,8 @@ struct Case {
     context: Vec<f32>,
     context_rows: u32,
     context_width: u32,
-    /// `[rows, 3]` each, in the packed order the plan reads (`Stream::Text`
-    /// before `Stream::Image`).
+    /// `[rows, 3]` each, in the packed order the plan reads (the `text`
+    /// lane before the `image` lane).
     text_positions: Vec<f32>,
     image_positions: Vec<f32>,
     /// One step's timestep, or — under `--euler` — the schedule.
@@ -279,16 +279,21 @@ struct Dims {
 /// this guest binds on that lane, by the model's own input names. Checked
 /// up front so a model whose lane reads anything else fails here in its own
 /// vocabulary instead of at `program`.
-fn lane_reading(reading: &str, stream: LaneStream, binds: &[&str]) -> Result<model::LaneDecl> {
-    let lane = model::lane_of(reading, stream)?;
+fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::LaneDecl> {
+    let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
+    if lane.reads_kv || lane.embeds {
+        return Err(format!(
+            "reading `{reading}`'s `{stream}` lane binds a kv space or tokens; a denoise pass \
+             binds neither"
+        ));
+    }
     let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
     let mut wants = binds.to_vec();
     reads.sort_unstable();
     wants.sort_unstable();
     if reads != wants {
         return Err(format!(
-            "reading `{reading}`'s `{}` lane reads {reads:?}; this pass binds {wants:?}",
-            model::stream_name(stream)
+            "reading `{reading}`'s `{stream}` lane reads {reads:?}; this pass binds {wants:?}"
         )
         .into());
     }
@@ -306,21 +311,21 @@ fn width_of(lane: &model::LaneDecl, name: &str) -> Result<u32> {
 
 /// Checks the three lanes against what this guest binds on each and reads
 /// the widths off them.
-fn dims(reading: &model::ReadingFact) -> Result<Dims> {
-    lane_reading(
-        &reading.name,
-        LaneStream::Text,
-        &["text", "positions", "timestep"],
-    )?;
-    lane_reading(&reading.name, LaneStream::Context, &["context"])?;
-    let image = lane_reading(
-        &reading.name,
-        LaneStream::Image,
-        &["latents", "positions", "timestep"],
-    )?;
+fn dims(reading: &str) -> Result<Dims> {
+    lane_reading(reading, "text", &["text", "positions", "timestep"])?;
+    lane_reading(reading, "context", &["context"])?;
+    let image = lane_reading(reading, "image", &["latents", "positions", "timestep"])?;
+    let velocity_width = match &image.readout {
+        Some(readout) if readout.kind == model::ReadoutKind::Velocity => readout.width,
+        other => {
+            return Err(format!(
+                "reading `{reading}`'s image lane reads out {other:?}, not a velocity"
+            ));
+        }
+    };
     Ok(Dims {
         axes: width_of(&image, "positions")?,
-        velocity_width: reading.readout_width,
+        velocity_width,
     })
 }
 
@@ -375,8 +380,8 @@ fn branch(
     // the guided lane READS its peer; naming is what makes them one step.
     let partner = other;
     let caption = ForwardPass::new();
-    caption.reading(reading)?;
-    caption.stream(LaneStream::Text)?;
+    caption.switch("reading", reading)?;
+    caption.switch("stream", "text")?;
     caption.group(group)?;
     caption.peer(partner)?;
     let txt = Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice())
@@ -393,8 +398,8 @@ fn branch(
     // the two branches, which is what makes the guidance real rather than a
     // combine of one answer with itself.
     let ctx_pass = ForwardPass::new();
-    ctx_pass.reading(reading)?;
-    ctx_pass.stream(LaneStream::Context)?;
+    ctx_pass.switch("reading", reading)?;
+    ctx_pass.switch("stream", "context")?;
     ctx_pass.group(group)?;
     ctx_pass.peer(partner)?;
     let ctx =
@@ -402,8 +407,8 @@ fn branch(
     ctx_pass.input("context", &ctx)?;
 
     let image = ForwardPass::new();
-    image.reading(reading)?;
-    image.stream(LaneStream::Image)?;
+    image.switch("reading", reading)?;
+    image.switch("stream", "image")?;
     image.group(group)?;
     image.peer(partner)?;
     let x = Channel::from_shaped([rows, case.patch_features], latents).named(&tag("latents"));
@@ -455,8 +460,8 @@ async fn sweep_fire(case: &Case, dims: &Dims, reading: &str, groups: u32) -> Res
         };
         let latents: Vec<f32> = case.latents.iter().map(|v| v * scale).collect();
         let caption = ForwardPass::new();
-        caption.reading(reading)?;
-        caption.stream(LaneStream::Text)?;
+        caption.switch("reading", reading)?;
+        caption.switch("stream", "text")?;
         caption.group(group)?;
         let txt = Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice())
             .named(&tag("text"));
@@ -471,8 +476,8 @@ async fn sweep_fire(case: &Case, dims: &Dims, reading: &str, groups: u32) -> Res
         )?;
 
         let context = ForwardPass::new();
-        context.reading(reading)?;
-        context.stream(LaneStream::Context)?;
+        context.switch("reading", reading)?;
+        context.switch("stream", "context")?;
         context.group(group)?;
         let ctx = Channel::from_shaped(
             [case.context_rows, case.context_width],
@@ -482,8 +487,8 @@ async fn sweep_fire(case: &Case, dims: &Dims, reading: &str, groups: u32) -> Res
         context.input("context", &ctx)?;
 
         let image = ForwardPass::new();
-        image.reading(reading)?;
-        image.stream(LaneStream::Image)?;
+        image.switch("reading", reading)?;
+        image.switch("stream", "image")?;
         image.group(group)?;
         let x = Channel::from_shaped([rows, case.patch_features], latents.as_slice())
             .named(&tag("latents"));
@@ -646,8 +651,8 @@ async fn dpm2m_loop(
     let fires = loops.fires();
 
     let caption = ForwardPass::new();
-    caption.reading(reading)?;
-    caption.stream(LaneStream::Text)?;
+    caption.switch("reading", reading)?;
+    caption.switch("stream", "text")?;
     caption.group(0)?;
     let txt = Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice())
         .named("dpm_text");
@@ -658,8 +663,8 @@ async fn dpm2m_loop(
     caption.input("timestep", &caption_clock.timestep)?;
 
     let context = ForwardPass::new();
-    context.reading(reading)?;
-    context.stream(LaneStream::Context)?;
+    context.switch("reading", reading)?;
+    context.switch("stream", "context")?;
     context.group(0)?;
     let ctx = Channel::from_shaped(
         [case.context_rows, case.context_width],
@@ -669,8 +674,8 @@ async fn dpm2m_loop(
     context.input("context", &ctx)?;
 
     let image = ForwardPass::new();
-    image.reading(reading)?;
-    image.stream(LaneStream::Image)?;
+    image.switch("reading", reading)?;
+    image.switch("stream", "image")?;
     image.group(0)?;
     let x = Channel::from_shaped(shape, case.latents.as_slice()).named("dpm_latents");
     let x0_prev = Channel::from_shaped(shape, vec![0f32; cells]).named("dpm_x0_prev");
@@ -756,8 +761,8 @@ async fn cached_loop(
     // one seeded cell per pass is the channel-role rule — and therefore its
     // own clock, whose epilogue body does nothing but advance it.
     let caption = ForwardPass::new();
-    caption.reading(reading)?;
-    caption.stream(LaneStream::Text)?;
+    caption.switch("reading", reading)?;
+    caption.switch("stream", "text")?;
     caption.group(0)?;
     let txt = Channel::from_shaped([case.text_rows, case.text_width], case.text.as_slice())
         .named("cache_text");
@@ -770,8 +775,8 @@ async fn cached_loop(
     // The context lane: block 2's cross-attention keys. No timestep, no
     // positions, no epilogue — nothing about it advances.
     let context = ForwardPass::new();
-    context.reading(reading)?;
-    context.stream(LaneStream::Context)?;
+    context.switch("reading", reading)?;
+    context.switch("stream", "context")?;
     context.group(0)?;
     let ctx = Channel::from_shaped(
         [case.context_rows, case.context_width],
@@ -784,8 +789,8 @@ async fn cached_loop(
     // the epilogue: the input feed reads the committed cell, the epilogue
     // takes it and puts the next one.
     let image = ForwardPass::new();
-    image.reading(reading)?;
-    image.stream(LaneStream::Image)?;
+    image.switch("reading", reading)?;
+    image.switch("stream", "image")?;
     image.group(0)?;
     let x = Channel::from_shaped(shape, vec![0f32; cells]).named("cache_latents");
     let img_pos = Channel::from_shaped([rows, dims.axes], case.image_positions.as_slice())
@@ -934,8 +939,8 @@ async fn step(
     // this family has no text encoder, which is what makes it an M0 fixture
     // and not a model. It modulates, so it carries the timestep too.
     let caption = ForwardPass::new();
-    caption.reading(reading)?;
-    caption.stream(LaneStream::Text)?;
+    caption.switch("reading", reading)?;
+    caption.switch("stream", "text")?;
     caption.group(group)?;
     if let Some(plan) = plan {
         caption.attention_classes(&plan.text, &plan.table, plan.count)?;
@@ -975,8 +980,8 @@ async fn step(
     // nothing else. No positions — the Wan contract gives cross-attention
     // no rope — and no timestep, since its class never modulates.
     let context = ForwardPass::new();
-    context.reading(reading)?;
-    context.stream(LaneStream::Context)?;
+    context.switch("reading", reading)?;
+    context.switch("stream", "context")?;
     context.group(group)?;
     let ctx = Channel::from_shaped(
         [case.context_rows, case.context_width],
@@ -988,8 +993,8 @@ async fn step(
     // The image lane: the latents in, the velocity out.
     let out = Channel::new([rows, width], dtype::f32).named(&tag("velocity"));
     let image = ForwardPass::new();
-    image.reading(reading)?;
-    image.stream(LaneStream::Image)?;
+    image.switch("reading", reading)?;
+    image.switch("stream", "image")?;
     image.group(group)?;
     if let Some(plan) = plan {
         image.attention_classes(&plan.image, &plan.table, plan.count)?;
@@ -1019,9 +1024,6 @@ async fn step(
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Text {
-        return Err("mini-dit is a `forward` pass with no state bound".into());
-    }
     let pieces: String = [
         &input.case_0,
         &input.case_1,
@@ -1048,21 +1050,12 @@ async fn main(input: Input) -> Result<Output> {
     let case: Case =
         inferlet::serde_json::from_str(&text).map_err(|why| format!("case json: {why}"))?;
 
-    let reading = model::readings()
-        .into_iter()
-        .find(|reading| !reading.takes_tokens && reading.readout == model::ReadoutKind::Velocity)
-        .ok_or("this model declares no token-less reading with a velocity readout")?;
-    if reading.has_kv {
-        return Err(format!(
-            "reading `{}` binds a kv space; the parity pass binds none",
-            reading.name
-        )
-        .into());
-    }
-    if !(input.tap || input.tap_text) && reading.readout_width != case.patch_features {
+    let reading = "denoise";
+    let dims = dims(reading)?;
+    if !(input.tap || input.tap_text) && dims.velocity_width != case.patch_features {
         return Err(format!(
             "the model reads a {}-wide velocity and the case carries {}-wide patch rows",
-            reading.readout_width, case.patch_features
+            dims.velocity_width, case.patch_features
         )
         .into());
     }
@@ -1074,7 +1067,6 @@ async fn main(input: Input) -> Result<Output> {
         )
         .into());
     }
-    let dims = dims(&reading)?;
     let class_plan = match input.classes.as_deref() {
         Some(mode) => ClassPlan::of(mode, &case)?,
         None => None,
@@ -1104,7 +1096,7 @@ async fn main(input: Input) -> Result<Output> {
 
     // Step caching runs the whole schedule on the device — never one step.
     if let Some(groups) = input.sweep.filter(|n| *n > 0) {
-        let velocities = sweep_fire(&case, &dims, &reading.name, groups).await?;
+        let velocities = sweep_fire(&case, &dims, reading, groups).await?;
         out.velocity = velocities.first().cloned().unwrap_or_default();
         out.sweep_velocity = velocities;
         pipes.close();
@@ -1115,7 +1107,7 @@ async fn main(input: Input) -> Result<Output> {
         if solver != "dpm2m" {
             return Err(format!("unknown solver `{solver}`; this guest runs `dpm2m`").into());
         }
-        let (vs, xs, sigmas) = dpm2m_loop(&case, &dims, &reading.name, case.steps.max(1)).await?;
+        let (vs, xs, sigmas) = dpm2m_loop(&case, &dims, reading, case.steps.max(1)).await?;
         out.velocity = vs.last().cloned().unwrap_or_default();
         out.sigmas = sigmas;
         out.euler_v = vs;
@@ -1127,15 +1119,8 @@ async fn main(input: Input) -> Result<Output> {
     if input.cache {
         let steps = input.cache_steps.or(Some(case.steps)).unwrap_or(0).max(1);
         let seed = input.cache_seed.unwrap_or(7);
-        let (trace, rel, did, count, dts) = cached_loop(
-            &case,
-            &dims,
-            &reading.name,
-            steps,
-            seed,
-            input.cache_threshold,
-        )
-        .await?;
+        let (trace, rel, did, count, dts) =
+            cached_loop(&case, &dims, reading, steps, seed, input.cache_threshold).await?;
         // Fire `k` integrates `dts[k]`: 0 on the seed fire.
         let mut fire_dts = vec![0.0f32];
         fire_dts.extend(dts);
@@ -1163,7 +1148,7 @@ async fn main(input: Input) -> Result<Output> {
         let cond = step(
             &case,
             &dims,
-            &reading.name,
+            reading,
             &pipes,
             0,
             &case.latents,
@@ -1173,7 +1158,7 @@ async fn main(input: Input) -> Result<Output> {
         )
         .await?;
         pipes.close();
-        let (guided, _, uncond) = guided_step(&case, &dims, &reading.name, scale).await?;
+        let (guided, _, uncond) = guided_step(&case, &dims, reading, scale).await?;
         out.velocity = cond.clone();
         out.cfg_guided = guided;
         out.cfg_cond = cond;
@@ -1187,7 +1172,7 @@ async fn main(input: Input) -> Result<Output> {
         out.velocity = step(
             &case,
             &dims,
-            &reading.name,
+            reading,
             &pipes,
             0,
             &case.latents,
@@ -1231,7 +1216,7 @@ async fn main(input: Input) -> Result<Output> {
         let v = step(
             &case,
             &dims,
-            &reading.name,
+            reading,
             &pipes,
             i,
             &x,

@@ -36,6 +36,9 @@ impl ForwardHybrid for Micro {
     }
 
     fn forward(&self, inputs: Input) -> Value {
+        inputs
+            .recorder()
+            .declare_switch("mode", &["encode", "denoise"]);
         let w = |name: &str, out: u64, inner: u64| Weight::sym(name, [out, inner], Dtype::Bf16);
         let plane = u64::from(HEADS) * u64::from(HEAD_DIM);
         let table = w("embed", u64::from(VOCAB), WIDTH);
@@ -85,7 +88,7 @@ impl ForwardHybrid for Micro {
                 SM_SCALE,
                 None,
                 None,
-                Some(&!fact::denoise()),
+                Some(&!fact::switch_is("mode", "denoise")),
                 false,
                 false,
                 None,
@@ -199,7 +202,7 @@ fn a_wide_class_attends_every_key_without_a_mask(graphs: Graphs) {
         &graph,
         &path,
         graphs,
-        Request::new(ROWS, false).denoising(true),
+        Request::new(ROWS, false).switched("mode", "denoise"),
         None,
     );
     let causal = rows(&graph, &path, graphs, Request::new(ROWS, false), None);

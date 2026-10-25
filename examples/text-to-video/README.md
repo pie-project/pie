@@ -15,9 +15,21 @@ pie --config ~/.pie/config.<yours>.toml run text-to-video -o ./out -- \
 ```
 
 The config must bind a row whose `latent()` has a temporal compression and
-whose readings include a `vae.decode`. On `wan22-ti2v-5b` that means
+whose `reading` switch has a `vae.decode` value. On `wan22-ti2v-5b` that means
 `max_model_len` well above the image default: 1950 latent rows plus a 512-row
 context lane, times the submit depth.
+
+## Standard input names
+
+Like `text-to-image`, this binds a model's inputs by name: `latents` (the
+noised latent volume's rows), `timestep` and `guidance` (one value a lane),
+`context` (the text encoder's hidden rows, on the prompt lane) and
+`positions` (each row's rotary coordinates, from `model::positions()`). They
+are a convention between a model and its model-agnostic guests, not runtime
+vocabulary: the runtime checks a channel against the input's axis, width and
+dtype and never reads the name. A lane binds exactly the inputs
+`model::lane_of` says it reads; one it reads by any other name is refused by
+name, never zero-filled.
 
 ## What differs from the image sampler
 

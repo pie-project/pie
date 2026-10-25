@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::wan_2_dims::{self as model, Dims};
-use poem::generative::{ReadoutKind, ScheduleKind};
+use poem::generative::ScheduleKind;
 use poem::{
     Attn, CacheRow, Def, Dim, Dtype, Elemwise, GeomKind, Operands, Operation, Platform, RaggedMask,
-    Request, RopeForm, RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
+    Request, RopeForm, RuntimeInput, Selection, Trace, Ty, ValueId, seam,
 };
 use poem_ir::InputAxis;
 
@@ -48,9 +48,21 @@ fn is_flagship(deployment: &str) -> bool {
     deployment == TI2V
 }
 
-fn word(plan: &Trace, reading: &str, stream: Stream) -> u64 {
-    let request = Request::new(4, false).on_stream(stream).in_reading(reading);
+/// The word of a lane in `reading`, on `stream` where given (its declared
+/// default otherwise).
+fn word(plan: &Trace, reading: &str, stream: Option<&str>) -> u64 {
+    let mut request = Request::new(4, false).switched("reading", reading);
+    if let Some(stream) = stream {
+        request = request.switched("stream", stream);
+    }
     plan.facts.word(&request)
+}
+
+fn readings(plan: &Trace) -> Vec<String> {
+    plan.facts
+        .declared("reading")
+        .map(|s| s.values.clone())
+        .unwrap_or_default()
 }
 
 #[test]
@@ -124,28 +136,13 @@ fn every_row_traces_on_every_platform_with_the_caches_and_seams_it_states() {
 fn each_reading_reads_out_what_its_facts_state() {
     for deployment in ROWS {
         let plan = trace(deployment, Platform::Cuda);
-        let facts = row(deployment).generative().expect("facts");
-        let d = dims(deployment);
-        let denoise = facts
-            .readings
-            .iter()
-            .find(|r| r.name == "denoise")
-            .unwrap_or_else(|| panic!("{deployment} declares no `denoise`"));
-        assert_eq!(denoise.readout, ReadoutKind::Velocity);
-        assert_eq!(denoise.readout_width, d.patch_out());
+        let declared = readings(&plan);
         for name in ["vae.decode.head", "vae.decode"] {
-            let Some(arm) = facts.readings.iter().find(|r| r.name == name) else {
-                assert!(
-                    !is_flagship(deployment),
-                    "{deployment}: a VAE row declares `{name}`"
-                );
-                continue;
-            };
-            assert_eq!(arm.streams, vec![Stream::Video]);
-            assert!(!arm.has_kv && !arm.takes_tokens);
-            assert_eq!(arm.readout, ReadoutKind::Pixels);
-            assert_eq!(arm.readout_width, model::VAE_RGB);
-            assert_eq!(arm.positions, None, "a VAE tile sits in no rotary space");
+            assert_eq!(
+                declared.iter().any(|r| r == name),
+                is_flagship(deployment),
+                "{deployment}: a VAE row declares `{name}`"
+            );
         }
         let voxels = plan
             .values
@@ -173,20 +170,26 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
         let plan = trace(deployment, Platform::Cuda);
         let classes = poem::resolve_classes(&plan)
             .unwrap_or_else(|why| panic!("{deployment}: a merge does not resolve: {why:?}"));
-        let facts = row(deployment).generative().expect("facts");
-        let _catalog = row(deployment);
-        let mut seen: Vec<((&str, Stream), usize)> = Vec::new();
-        for reading in &facts.readings {
-            for &stream in &reading.streams {
-                let request = Request::new(4, false)
-                    .on_stream(stream)
-                    .in_reading(&reading.name);
-                let w = plan.facts.word(&request);
-                let class = classes.class_of(w & classes.mask).unwrap_or_else(|| {
-                    panic!("{deployment}: `{}`/{stream:?} has no class", reading.name)
-                });
-                seen.push(((reading.name.as_str(), stream), class));
+        let mut lanes: Vec<(&str, Option<&str>)> =
+            vec![("denoise", Some("video")), ("denoise", Some("context"))];
+        if is_flagship(deployment) {
+            lanes.push(("text", None));
+            for vae in [
+                "vae.decode.head",
+                "vae.decode",
+                "vae.encode.head",
+                "vae.encode",
+            ] {
+                lanes.push((vae, None));
             }
+        }
+        let mut seen: Vec<((&str, Option<&str>), usize)> = Vec::new();
+        for (reading, stream) in lanes {
+            let w = word(&plan, reading, stream);
+            let class = classes
+                .class_of(w & classes.mask)
+                .unwrap_or_else(|| panic!("{deployment}: `{reading}`/{stream:?} has no class"));
+            seen.push(((reading, stream), class));
         }
         let distinct: BTreeSet<usize> = seen.iter().map(|(_, class)| *class).collect();
         assert_eq!(
@@ -217,8 +220,8 @@ fn the_attentions_pair_as_the_architecture_says() {
                 other => panic!("{deployment}: a ragged CSR that is not an indptr: {other:?}"),
             }
         };
-        let video = word(&plan, denoise, Stream::Video);
-        let context = word(&plan, denoise, Stream::Context);
+        let video = word(&plan, denoise, Some("video"));
+        let context = word(&plan, denoise, Some("context"));
         let (mut self_paired, mut crossed, mut encoder) = (0usize, 0usize, 0usize);
         for node in &plan.nodes {
             let Operation::Attn(Attn::Ragged {
@@ -242,7 +245,7 @@ fn the_attentions_pair_as_the_architecture_says() {
                     assert_eq!(kind, "lane", "the encoder attends its own lane");
                     assert_eq!(q_indptr, kv_indptr);
                     let text = text.expect("only the flagship has an encoder");
-                    assert!(select.holds(word(&plan, text, Stream::Text)));
+                    assert!(select.holds(word(&plan, text, None)));
                     assert!(!select.holds(video));
                 }
                 RaggedMask::GroupBlockDiagonal => {
@@ -265,7 +268,7 @@ fn the_attentions_pair_as_the_architecture_says() {
                         });
                         assert!(spans.holds(video) && spans.holds(context));
                         if let Some(text) = text {
-                            assert!(!spans.holds(word(&plan, text, Stream::Text)));
+                            assert!(!spans.holds(word(&plan, text, None)));
                         }
                     }
                 }
@@ -352,10 +355,7 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
     for deployment in ROWS {
         let facts = row(deployment).generative().expect("facts");
         let d = dims(deployment);
-        for (at, reading) in facts.readings.iter().enumerate() {
-            assert_eq!(usize::from(reading.index), at, "{deployment}: dense from 0");
-        }
-        let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
+        let names = readings(&trace(deployment, Platform::Cuda));
         if is_flagship(deployment) {
             assert_eq!(
                 names,
@@ -368,20 +368,9 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
                     "vae.encode"
                 ]
             );
-            let text = &facts.readings[0];
-            assert!(
-                text.takes_tokens && !text.has_kv,
-                "umT5 embeds ids and holds no kv"
-            );
-            assert_eq!(text.readout, ReadoutKind::Hidden);
-            assert_eq!(text.readout_width, model::TE_HIDDEN);
-            assert_eq!(text.streams, vec![Stream::Text]);
         } else {
             assert_eq!(names, vec!["denoise"]);
         }
-        let denoise = facts.readings.iter().find(|r| r.name == "denoise").unwrap();
-        assert!(!denoise.has_kv && !denoise.takes_tokens);
-        assert_eq!(denoise.streams, vec![Stream::Video, Stream::Context]);
         let latent = facts.latent.expect("a latent space");
         assert_eq!(
             (
@@ -405,13 +394,6 @@ fn the_generative_facts_state_the_readings_the_latent_and_the_schedule() {
         assert_eq!(schedule.shift, model::SHIFT_TI2V);
         assert_eq!(schedule.train_steps, model::TRAIN_STEPS);
         assert!(schedule.pinned_sigmas.is_empty(), "nothing is pinned");
-        crate::the_wan_2_rows_bake::validate(&facts);
-    }
-}
-
-fn validate(facts: &poem::generative::Generative) {
-    for reading in &facts.readings {
-        assert!(reading.readout_width > 0);
     }
 }
 

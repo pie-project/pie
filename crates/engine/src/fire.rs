@@ -212,10 +212,7 @@ pub struct Lane {
     pub kv: KvDelta,
     pub mask: Option<Masking>,
     pub adapter: Option<u32>,
-    pub drafts: bool,
     pub captures_scores: bool,
-    #[serde(default)]
-    pub block_draft: bool,
     #[serde(default)]
     pub rs: RsVerb,
     #[serde(default)]
@@ -232,13 +229,9 @@ pub struct Lane {
     pub channels: Vec<Ticket>,
     pub readout: Readout,
     #[serde(default)]
-    pub stream: LaneStream,
-    #[serde(default)]
     pub group: Option<u32>,
     #[serde(default)]
     pub peer: Option<u32>,
-    #[serde(default)]
-    pub reading: u8,
     /// The guest inputs this lane binds, each read off its channel's
     /// committed cell at every fire.
     #[serde(default)]
@@ -265,17 +258,6 @@ pub struct Tap {
     pub tag: u64,
     pub pages: Vec<u32>,
     pub slots: Vec<u32>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum LaneStream {
-    #[default]
-    Text = 0,
-    Image = 1,
-    Video = 2,
-    Audio = 3,
-    Context = 4,
-    Reference = 5,
 }
 
 /// The channel a lane feeds guest input `id` (`poem_ir::RuntimeInput::Guest`)

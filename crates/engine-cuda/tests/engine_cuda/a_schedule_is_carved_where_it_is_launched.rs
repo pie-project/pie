@@ -2,7 +2,7 @@
 
 use crate::common_dit::{Lcg, NAME, Rig, WIDTH, Weights, attach, bf, frame, lane};
 use engine::Engine;
-use engine::fire::{LaneStream, ReadoutSeam};
+use engine::fire::ReadoutSeam;
 use engine_cuda::Recording;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
@@ -10,8 +10,8 @@ use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Stream, Trace, Value, Weight,
-    ops, seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Trace, Value, Weight, ops,
+    seam, trace_hybrid,
 };
 use poem_ir::InputAxis;
 
@@ -35,9 +35,13 @@ impl ForwardHybrid for TokensAndLatents {
     }
 
     fn forward(&self, inputs: Input) -> Value {
+        inputs.recorder().declare_switch(
+            "stream",
+            &["text", "image", "video", "audio", "context", "reference"],
+        );
         let (txt, img) = (
-            inputs.on(fact::stream(Stream::Text)),
-            inputs.on(!fact::stream(Stream::Text)),
+            inputs.on(fact::switch_is("stream", "text")),
+            inputs.on(!fact::switch_is("stream", "text")),
         );
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
@@ -143,7 +147,7 @@ fn the_token_reading_fires_alone() {
         .collect();
     rig.publish(handles.instance, 0, &cell);
 
-    let mut text = lane(&rig, 0, &handles, LaneStream::Text, 0);
+    let mut text = lane(&rig, 0, &handles, "text", 0);
     text.tokens = (0..TEXT_ROWS).map(|r| r % VOCAB).collect();
     text.inputs.clear();
 

@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::z_image_dims::{self as model, Dims};
-use poem::generative::{ReadoutKind, ScheduleKind};
+use poem::generative::ScheduleKind;
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, GeomKind, Operation, Platform, Request, RopeForm,
-    RuntimeInput, Selection, Stream, Trace, Ty, ValueId, seam,
+    RuntimeInput, Selection, Trace, Ty, ValueId, seam,
 };
 
 type RopeRow = ([u32; 4], [f32; 4], RopeForm, u32, u32);
@@ -41,24 +41,27 @@ fn dims(deployment: &str) -> Dims {
     }
 }
 
-fn lanes(deployment: &str) -> Vec<(String, u8, Stream)> {
-    let facts = row(deployment)
-        .generative()
-        .expect("a generative row states its facts");
-    facts
-        .readings
-        .iter()
-        .flat_map(|reading| {
-            reading
-                .streams
-                .iter()
-                .map(move |stream| (reading.name.clone(), reading.index, *stream))
-        })
-        .collect()
+/// Every (reading, stream) a lane of `deployment` may take, its stream the
+/// declared default where none is given.
+fn lanes(deployment: &str) -> Vec<(&'static str, Option<&'static str>)> {
+    let mut lanes = vec![
+        ("refine", Some("context")),
+        ("denoise", Some("image")),
+        ("denoise", Some("context")),
+    ];
+    if deployment == TURBO {
+        lanes.extend([("text", None), ("vae.decode", None), ("vae.encode", None)]);
+    }
+    lanes
 }
 
-fn word(plan: &Trace, reading: &str, stream: Stream) -> u64 {
-    let request = Request::new(4, false).on_stream(stream).in_reading(reading);
+/// The word of a lane in `reading`, on `stream` where given (its declared
+/// default otherwise).
+fn word(plan: &Trace, reading: &str, stream: Option<&str>) -> u64 {
+    let mut request = Request::new(4, false).switched("reading", reading);
+    if let Some(stream) = stream {
+        request = request.switched("stream", stream);
+    }
     plan.facts.word(&request)
 }
 
@@ -131,32 +134,6 @@ fn every_row_traces_on_every_platform_with_the_caches_and_readouts_it_states() {
 fn the_readings_state_their_readouts_and_the_sinusoid() {
     for deployment in ROWS {
         let plan = trace(deployment, Platform::Cuda);
-        let facts = row(deployment).generative().expect("facts");
-        let reading = |name: &str| {
-            facts
-                .readings
-                .iter()
-                .find(|r| r.name == name)
-                .unwrap_or_else(|| panic!("{deployment} declares no reading `{name}`"))
-        };
-        let d = dims(deployment);
-        let denoise = reading("denoise");
-        let refine = reading("refine");
-        assert!(!refine.has_kv && !refine.takes_tokens, "a float lane");
-        assert!(!denoise.has_kv && !denoise.takes_tokens, "float lanes");
-        assert_eq!(refine.readout, ReadoutKind::Hidden);
-        assert_eq!(refine.readout_width, d.dim);
-        assert_eq!(denoise.readout, ReadoutKind::Velocity);
-        assert_eq!(denoise.readout_width, model::PATCH_FEATURES);
-        if deployment == TURBO {
-            let text = reading("text");
-            assert!(text.has_kv && text.takes_tokens);
-            assert_eq!(
-                (text.readout, text.readout_width),
-                (ReadoutKind::Hidden, model::TE_HIDDEN)
-            );
-        }
-
         let sinusoids: Vec<(u32, f32, bool, f32)> = plan
             .nodes
             .iter()
@@ -188,10 +165,9 @@ fn every_declared_lane_classifies_into_its_own_class_where_every_merge_resolves(
         let plan = trace(deployment, Platform::Cuda);
         let classes = poem::resolve_classes(&plan).expect("every merge resolves");
         let _catalog = row(deployment);
-        let mut seen: Vec<((String, Stream), usize)> = Vec::new();
-        for (name, _index, stream) in lanes(deployment) {
-            let request = Request::new(4, false).on_stream(stream).in_reading(&name);
-            let word = plan.facts.word(&request);
+        let mut seen: Vec<((&str, Option<&str>), usize)> = Vec::new();
+        for (name, stream) in lanes(deployment) {
+            let word = word(&plan, name, stream);
             let class = classes
                 .class_of(word & classes.mask)
                 .unwrap_or_else(|| panic!("{deployment}: a {name}/{stream:?} lane has no class"));
@@ -258,11 +234,11 @@ fn the_refiners_attend_within_a_lane_and_the_trunk_within_the_group() {
 
         let (text, refine, denoise) = ("text", "refine", "denoise");
         let (_, joint, _) = ragged.iter().find(|(kind, _, _)| *kind == "group").unwrap();
-        assert!(joint.holds(word(&plan, denoise, Stream::Image)));
-        assert!(joint.holds(word(&plan, denoise, Stream::Context)));
-        assert!(!joint.holds(word(&plan, refine, Stream::Context)));
+        assert!(joint.holds(word(&plan, denoise, Some("image"))));
+        assert!(joint.holds(word(&plan, denoise, Some("context"))));
+        assert!(!joint.holds(word(&plan, refine, Some("context"))));
         if deployment == TURBO {
-            assert!(!joint.holds(word(&plan, text, Stream::Text)));
+            assert!(!joint.holds(word(&plan, text, None)));
         }
         let mut lane_selects: Vec<Selection> = Vec::new();
         for (_, select, _) in ragged.iter().filter(|(kind, _, _)| *kind == "lane") {
@@ -276,14 +252,14 @@ fn the_refiners_attend_within_a_lane_and_the_trunk_within_the_group() {
             "{deployment}: two refiner selections"
         );
         assert!(lane_selects.iter().any(|s| {
-            s.holds(word(&plan, refine, Stream::Context))
-                && !s.holds(word(&plan, denoise, Stream::Image))
-                && !s.holds(word(&plan, denoise, Stream::Context))
+            s.holds(word(&plan, refine, Some("context")))
+                && !s.holds(word(&plan, denoise, Some("image")))
+                && !s.holds(word(&plan, denoise, Some("context")))
         }));
         assert!(lane_selects.iter().any(|s| {
-            s.holds(word(&plan, denoise, Stream::Image))
-                && !s.holds(word(&plan, denoise, Stream::Context))
-                && !s.holds(word(&plan, refine, Stream::Context))
+            s.holds(word(&plan, denoise, Some("image")))
+                && !s.holds(word(&plan, denoise, Some("context")))
+                && !s.holds(word(&plan, refine, Some("context")))
         }));
 
         let prefills = plan
@@ -453,20 +429,17 @@ fn the_modulation_is_a_per_lane_f32_scale_over_a_bf16_trunk() {
 fn the_generative_facts_state_the_readings_the_schedule_and_the_latent_space() {
     for deployment in ROWS {
         let facts = row(deployment).generative().expect("facts");
-        let names: Vec<&str> = facts.readings.iter().map(|r| r.name.as_str()).collect();
+        let names = trace(deployment, Platform::Cuda)
+            .facts
+            .declared("reading")
+            .map(|s| s.values.clone())
+            .unwrap_or_default();
         let want: Vec<&str> = if deployment == TURBO {
             vec!["text", "refine", "denoise", "vae.decode", "vae.encode"]
         } else {
             vec!["refine", "denoise"]
         };
         assert_eq!(names, want, "{deployment}");
-        for (at, reading) in facts.readings.iter().enumerate() {
-            assert_eq!(
-                usize::from(reading.index),
-                at,
-                "{deployment}: indices dense from 0"
-            );
-        }
         let latent = facts.latent.expect("a denoiser states its latent space");
         assert_eq!(
             (

@@ -12,10 +12,14 @@
 //!
 //! # HOW IT FINDS ITS READINGS
 //!
+//! The readings are the values of the model's `reading` switch; what each
+//! is comes from its lane (`model::lane_of`, the `video` stream's for all
+//! but the text encoder):
+//!
 //! | role | the fact that says so |
 //! |---|---|
-//! | text encoder | `takes_tokens && readout == Hidden` |
-//! | denoiser | `!takes_tokens && readout == Velocity` |
+//! | text encoder | `embeds && readout == Hidden` |
+//! | denoiser | `!embeds && readout == Velocity` |
 //! | VAE decode | `readout == Pixels`, a name that is not `vae.encode*` |
 //! | VAE encode | `readout == Pixels`, a name that IS `vae.encode*` |
 //!
@@ -284,47 +288,76 @@ struct Output {
 
 /// The readings a text-to-video job needs, found by role.
 struct Roles {
-    text: model::ReadingFact,
-    denoise: model::ReadingFact,
+    text: String,
+    denoise: String,
     /// The first-frame arm, when the family splits its causal decoder in
     /// two (`vae.decode.head`); `None` for a one-arm decoder.
-    head: Option<model::ReadingFact>,
+    head: Option<String>,
     /// The arm every later latent frame goes through, or the only arm.
-    decode: model::ReadingFact,
+    decode: String,
     /// VIDEO2VIDEO's door in. The first-chunk arm, when the family splits
     /// its causal encoder in two (`vae.encode.head`); `None` for a one-arm
     /// encoder, and `None` for both when the family declares no encoder at
     /// all — this program only refuses that when an init clip is passed.
-    encode_head: Option<model::ReadingFact>,
+    encode_head: Option<String>,
     /// The arm every later pixel chunk goes through, or the only arm.
-    encode: Option<model::ReadingFact>,
+    encode: Option<String>,
+}
+
+/// `want` when the model's `stream` switch has it, else `fallback`.
+fn stream_of(want: &'static str, fallback: &'static str) -> &'static str {
+    let streams = model::switch("stream")
+        .map(|decl| decl.values)
+        .unwrap_or_default();
+    if streams.iter().any(|stream| stream == want) {
+        want
+    } else {
+        fallback
+    }
+}
+
+/// What `reading`'s lane on `stream` reads out.
+fn readout(reading: &str, stream: &str) -> Option<model::Readout> {
+    model::lane_of(&[("reading", reading), ("stream", stream)])
+        .ok()?
+        .readout
+}
+
+/// How wide a row `reading`'s lane on `stream` reads out.
+fn readout_width(reading: &str, stream: &str) -> Result<u32> {
+    readout(reading, stream)
+        .map(|readout| readout.width)
+        .ok_or_else(|| format!("reading `{reading}` reads nothing out on its `{stream}` lane"))
 }
 
 fn roles() -> Result<Roles> {
-    // **NOT `pass_kind()`.** That verb is derived from `rs_state_size() > 0`,
-    // and a video row carries a causal-conv VAE whose every convolution owns
-    // a `CacheRow::State` slab — so `wan22-ti2v-5b` answers `recurrent`
-    // while a transformer-only miniature answers `attention`. The
-    // difference is in the DECODER arms and says nothing about a denoise
-    // pass. What a denoise step actually needs is stated on the reading,
-    // and is checked below: it binds no kv space and takes no tokens.
-    let readings = model::readings();
+    // What a denoise step needs is stated on its lane, and is checked
+    // below: it binds no kv space and takes no tokens.
+    let readings = model::switch("reading")
+        .map(|decl| decl.values)
+        .unwrap_or_default();
+    let kind = |lane: &model::LaneDecl| lane.readout.as_ref().map(|readout| readout.kind);
     let text = readings
         .iter()
-        .find(|r| r.takes_tokens && r.readout == model::ReadoutKind::Hidden)
+        .find(|r| {
+            model::lane_of(&[("reading", r)])
+                .is_ok_and(|lane| lane.embeds && kind(&lane) == Some(model::ReadoutKind::Hidden))
+        })
         .cloned()
         .ok_or("this model has no text reading")?;
+    let video_stream = stream_of("video", "image");
     let denoise = readings
         .iter()
-        .find(|r| !r.takes_tokens && r.readout == model::ReadoutKind::Velocity)
+        .find(|r| {
+            model::lane_of(&[("reading", r), ("stream", video_stream)])
+                .is_ok_and(|lane| !lane.embeds && kind(&lane) == Some(model::ReadoutKind::Velocity))
+        })
         .cloned()
         .ok_or("this model declares no token-less reading with a velocity readout")?;
-    if denoise.has_kv {
+    if model::lane_of(&[("reading", &denoise), ("stream", video_stream)])?.reads_kv {
         return Err(format!(
-            "reading `{}` binds a kv space; a denoise pass binds none",
-            denoise.name
-        )
-        .into());
+            "reading `{denoise}` binds a kv space; a denoise pass binds none"
+        ));
     }
     // A decode arm lands PIXELS. The encoder lands pixels too — its pixels
     // are its INPUT — and the name is what separates them, in the design's
@@ -335,28 +368,27 @@ fn roles() -> Result<Roles> {
     // a decode head does. Matched on the exact name alone, the encoder's
     // head arm was picked up as the DECODER's, and the first thing that
     // would have said so is a clip of noise.
-    let pixels: Vec<model::ReadingFact> = readings
+    let pixels: Vec<String> = readings
         .iter()
-        .filter(|r| r.readout == model::ReadoutKind::Pixels)
+        .filter(|r| {
+            readout(r, "video").is_some_and(|readout| readout.kind == model::ReadoutKind::Pixels)
+        })
         .cloned()
         .collect();
     let (encoders, decoders): (Vec<_>, Vec<_>) = pixels
         .into_iter()
-        .partition(|r| r.name.starts_with("vae.encode"));
-    let head = decoders.iter().find(|r| r.name.ends_with(".head")).cloned();
+        .partition(|r| r.starts_with("vae.encode"));
+    let head = decoders.iter().find(|r| r.ends_with(".head")).cloned();
     let decode = decoders
         .iter()
-        .find(|r| !r.name.ends_with(".head"))
+        .find(|r| !r.ends_with(".head"))
         .cloned()
         .ok_or(
             "this model declares no `vae.decode` reading, so there is no way to turn its \
              latent into frames from inside pie",
         )?;
-    let encode_head = encoders.iter().find(|r| r.name.ends_with(".head")).cloned();
-    let encode = encoders
-        .iter()
-        .find(|r| !r.name.ends_with(".head"))
-        .cloned();
+    let encode_head = encoders.iter().find(|r| r.ends_with(".head")).cloned();
+    let encode = encoders.iter().find(|r| !r.ends_with(".head")).cloned();
     Ok(Roles {
         text,
         denoise,
@@ -375,21 +407,8 @@ struct Inputs {
     context: model::InputDecl,
     guidance: bool,
     convention: model::PositionConvention,
-    video_stream: model::LaneStream,
-    context_stream: model::LaneStream,
-}
-
-/// `want` when the reading lists it, else `fallback`.
-fn stream_of(
-    reading: &model::ReadingFact,
-    want: model::LaneStream,
-    fallback: model::LaneStream,
-) -> model::LaneStream {
-    if reading.streams.iter().any(|s| *s == want) {
-        want
-    } else {
-        fallback
-    }
+    video_stream: &'static str,
+    context_stream: &'static str,
 }
 
 /// The input `name` a lane reads.
@@ -397,31 +416,29 @@ fn lane_input(lane: &model::LaneDecl, name: &str) -> Option<model::InputDecl> {
     lane.inputs.iter().find(|input| input.name == name).cloned()
 }
 
-fn inputs(reading: &model::ReadingFact) -> Result<Inputs> {
-    let video_stream = stream_of(reading, model::LaneStream::Video, model::LaneStream::Image);
-    let context_stream = stream_of(reading, model::LaneStream::Context, model::LaneStream::Text);
-    let video = model::lane_of(&reading.name, video_stream)?;
-    let prompt = model::lane_of(&reading.name, context_stream)?;
+fn inputs(reading: &str) -> Result<Inputs> {
+    let video_stream = stream_of("video", "image");
+    let context_stream = stream_of("context", "text");
+    let video = model::lane_of(&[("reading", reading), ("stream", video_stream)])?;
+    let prompt = model::lane_of(&[("reading", reading), ("stream", context_stream)])?;
     let latents = lane_input(&video, "latents")
         .ok_or("this denoise reading reads no `latents`; there is nothing to denoise")?;
     let context = lane_input(&prompt, "context")
         .ok_or("this denoise reading reads no `context` for the prompt rows")?;
-    let positions = lane_input(&video, "positions")
-        .ok_or("this denoise reading reads no `positions`")?;
+    let positions =
+        lane_input(&video, "positions").ok_or("this denoise reading reads no `positions`")?;
     if lane_input(&video, "timestep").is_none() {
-        return Err(format!("reading `{}` reads no `timestep`", reading.name).into());
+        return Err(format!("reading `{reading}` reads no `timestep`"));
     }
-    let convention = reading.positions.clone().ok_or_else(|| {
+    let convention = model::positions().ok_or_else(|| {
         format!(
-            "reading `{}` takes positions but states no position convention, so a \
-             family-blind guest cannot say where its rows sit",
-            reading.name
+            "reading `{reading}` takes positions but the model states no position convention, \
+             so a family-blind guest cannot say where its rows sit"
         )
     })?;
     if convention.axes.len() as u32 != positions.width {
         return Err(format!(
-            "reading `{}` states {} axis roles for a {}-wide positions input",
-            reading.name,
+            "the model states {} axis roles for reading `{reading}`'s {}-wide positions input",
             convention.axes.len(),
             positions.width
         )
@@ -431,9 +448,8 @@ fn inputs(reading: &model::ReadingFact) -> Result<Inputs> {
     // coordinate for a frame index and this is the wrong driver.
     if !convention.axes.iter().any(|r| *r == model::AxisRole::Time) {
         return Err(format!(
-            "reading `{}` states no `time` axis in its position convention; a clip's rows \
-             have nowhere to put a frame index",
-            reading.name
+            "the model states no `time` axis in its position convention; reading \
+             `{reading}`'s rows have nowhere to put a frame index"
         )
         .into());
     }
@@ -456,8 +472,8 @@ struct Lane {
 
 #[allow(clippy::too_many_arguments)]
 fn lane(
-    reading: &model::ReadingFact,
-    stream: model::LaneStream,
+    reading: &str,
+    stream: &str,
     group: u32,
     // The OTHER guidance branch's group, on the CFG path. Named by EVERY
     // lane of both branches, not only the ones that read: naming is what
@@ -473,14 +489,14 @@ fn lane(
     tag: &str,
 ) -> Result<Lane> {
     let pass = ForwardPass::new();
-    pass.reading(&reading.name)?;
-    pass.stream(stream)?;
+    pass.switch("reading", reading)?;
+    pass.switch("stream", stream)?;
     pass.group(group)?;
     if let Some(peer) = peer {
         pass.peer(peer)?;
     }
     let mut held = Vec::new();
-    for input in model::lane_of(&reading.name, stream)?.inputs {
+    for input in model::lane_of(&[("reading", reading), ("stream", stream)])?.inputs {
         let name = format!("{tag}_{}", input.name);
         let ch = match input.name.as_str() {
             "latents" => latents
@@ -496,9 +512,8 @@ fn lane(
             "guidance" => Channel::from(vec![guidance; input.width as usize]).named(&name),
             other => {
                 return Err(format!(
-                    "reading `{}` reads `{other}` on its `{tag}` lane; this sampler binds \
-                     latents, timestep, guidance, context and positions",
-                    reading.name
+                    "reading `{reading}` reads `{other}` on its `{tag}` lane; this sampler binds \
+                     latents, timestep, guidance, context and positions"
                 )
                 .into());
             }
@@ -616,12 +631,11 @@ fn b64_decode(text: &str) -> Result<Vec<u8>> {
 }
 
 /// The one input a VAE arm's lane reads: a clip on the voxel axis.
-fn voxel_input(reading: &model::ReadingFact) -> Result<model::InputDecl> {
-    match &model::lane_of(&reading.name, model::LaneStream::Video)?.inputs[..] {
+fn voxel_input(reading: &str) -> Result<model::InputDecl> {
+    match &model::lane_of(&[("reading", reading), ("stream", "video")])?.inputs[..] {
         [input] if input.axis == model::InputAxis::Voxel => Ok(input.clone()),
         other => Err(format!(
-            "reading `{}` reads {} input(s), and a VAE arm reads one clip on the voxel axis",
-            reading.name,
+            "reading `{reading}` reads {} input(s), and a VAE arm reads one clip on the voxel axis",
             other.len()
         )
         .into()),
@@ -643,7 +657,7 @@ fn voxel_input(reading: &model::ReadingFact) -> Result<model::InputDecl> {
 /// normalised into the denoiser's own space — whatever the number of pixel
 /// frames that went in.
 async fn encode_chunk(
-    reading: &model::ReadingFact,
+    reading: &str,
     chunk: &Frames,
     chunk_frames: u32,
     pixel_h: u32,
@@ -654,10 +668,10 @@ async fn encode_chunk(
 ) -> Result<Vec<f32>> {
     let input = voxel_input(reading)?;
     let rows = clip_h * clip_w;
-    let width = reading.readout_width;
+    let width = readout_width(reading, "video")?;
     let pass = ForwardPass::new();
-    pass.reading(&reading.name)?;
-    pass.stream(model::LaneStream::Video)?;
+    pass.switch("reading", reading)?;
+    pass.switch("stream", "video")?;
     // Empty, and SEEDED from the chunk below: the pixels are the host's, and
     // the eta trace tracks readiness STATICALLY — a channel the host seeds
     // has to be declared `seeded`, or the trace refuses it as consumed but
@@ -673,14 +687,13 @@ async fn encode_chunk(
     // THE PIXELS, seeded straight from the host's handle, after the bind.
     cell.set_frames(chunk)?;
     pass.submit(pipe)
-        .with_context(|| format!("the `{}` fire", reading.name))?;
+        .with_context(|| format!("the `{reading}` fire"))?;
     let landed = out.take_host::<Vec<f32>>().await?;
     let want = (rows * width) as usize;
     if landed.len() != want {
         return Err(format!(
-            "reading `{}` landed {} numbers over a {chunk_frames}-frame chunk and one latent \
-             frame is {clip_h}x{clip_w}x{width} = {want}",
-            reading.name,
+            "reading `{reading}` landed {} numbers over a {chunk_frames}-frame chunk and one \
+             latent frame is {clip_h}x{clip_w}x{width} = {want}",
             landed.len()
         )
         .into());
@@ -695,7 +708,7 @@ async fn encode_chunk(
 /// how many output frames this arm lands, which the caller knows from the
 /// family's `temporal-compression` and which arm this is.
 async fn decode_frame(
-    reading: &model::ReadingFact,
+    reading: &str,
     clip: &[f32],
     clip_h: u32,
     clip_w: u32,
@@ -716,10 +729,10 @@ async fn decode_frame(
         .into());
     }
     let rows = frames * pixel_h * pixel_w;
-    let width = reading.readout_width;
+    let width = readout_width(reading, "video")?;
     let pass = ForwardPass::new();
-    pass.reading(&reading.name)?;
-    pass.stream(model::LaneStream::Video)?;
+    pass.switch("reading", reading)?;
+    pass.switch("stream", "video")?;
     let cell =
         Channel::from_shaped([clip_h, clip_w, input.width], clip.to_vec()).named("vae_latent");
     pass.input(&input.name, &cell)?;
@@ -729,7 +742,7 @@ async fn decode_frame(
         readback.put(intrinsics::pixels(rows, width));
     });
     pass.submit(pipe)
-        .with_context(|| format!("the `{}` fire", reading.name))?;
+        .with_context(|| format!("the `{reading}` fire"))?;
     out.take_host::<Vec<f32>>().await.map_err(Into::into)
 }
 
@@ -947,13 +960,13 @@ async fn main(input: Input) -> Result<Output> {
             let ids = ids_of(ids)?;
             let shown = format!("<{} ids>", ids.len());
             (
-                encode_ids_rows(&ids, &roles.text.name).await?,
+                encode_ids_rows(&ids, &roles.text).await?,
                 shown,
                 "prompt-ids".to_string(),
             )
         }
         (None, Some(text)) if !text.trim().is_empty() => (
-            encode_ids_rows(&template_ids(text), &roles.text.name).await?,
+            encode_ids_rows(&template_ids(text), &roles.text).await?,
             text.clone(),
             "prompt".to_string(),
         ),
@@ -969,11 +982,11 @@ async fn main(input: Input) -> Result<Output> {
     let context_rows = context.shape().dims()[0];
     let negative = match (&input.negative_prompt_ids, &input.negative_prompt) {
         (Some(ids), _) => {
-            let (anti, anti_width) = encode_ids_rows(&ids_of(ids)?, &roles.text.name).await?;
+            let (anti, anti_width) = encode_ids_rows(&ids_of(ids)?, &roles.text).await?;
             Some(pad_context(anti, anti_width, &inputs.context)?)
         }
         (None, Some(text)) if !text.trim().is_empty() => {
-            let (anti, anti_width) = encode_ids_rows(&template_ids(text), &roles.text.name).await?;
+            let (anti, anti_width) = encode_ids_rows(&template_ids(text), &roles.text).await?;
             Some(pad_context(anti, anti_width, &inputs.context)?)
         }
         _ => None,
@@ -982,7 +995,7 @@ async fn main(input: Input) -> Result<Output> {
         return Err(format!(
             "reading `{}` reads a `guidance` input, so this row is guidance-distilled and a \
              negative prompt has no lane to ride",
-            roles.denoise.name
+            roles.denoise
         )
         .into());
     }
@@ -1098,8 +1111,8 @@ async fn main(input: Input) -> Result<Output> {
             // The arms this clip actually used, in first-use order: a
             // one-arm encoder names one, a split one names both, and a
             // single-frame clip on a split encoder names only the head.
-            if !encode_used.iter().any(|name| name == &reading.name) {
-                encode_used.push(reading.name.clone());
+            if !encode_used.iter().any(|name| name == reading) {
+                encode_used.push(reading.clone());
             }
         }
         enc_pipe.close();
@@ -1131,7 +1144,7 @@ async fn main(input: Input) -> Result<Output> {
 
     // ---- the loop ---------------------------------------------------------
     let mut loops = DenoiseLoop::new(&sched);
-    let velocity_width = roles.denoise.readout_width;
+    let velocity_width = readout_width(&roles.denoise, inputs.video_stream)?;
     let cells = (rows * row_width) as usize;
     let shape = [rows, row_width];
     let seed = input.seed.unwrap_or(0);
@@ -1296,7 +1309,7 @@ async fn main(input: Input) -> Result<Output> {
         )
         .await?;
         pixels.extend_from_slice(&out);
-        used.push(head.name.clone());
+        used.push(head.clone());
         first_frame = 1;
     }
     // The head arm's pass is closed by now (`decode_frame` owns it and it
@@ -1316,7 +1329,7 @@ async fn main(input: Input) -> Result<Output> {
         .await?;
         pixels.extend_from_slice(&out);
     }
-    used.push(roles.decode.name.clone());
+    used.push(roles.decode.clone());
     vae_pipe.close();
 
     let want = (frames as usize) * (height as usize) * (width as usize) * 3;
@@ -1357,7 +1370,7 @@ async fn main(input: Input) -> Result<Output> {
     Ok(Output {
         model: model::name(),
         architecture: model::architecture(),
-        reading: roles.denoise.name.clone(),
+        reading: roles.denoise.clone(),
         prompt,
         prompt_source,
         width,

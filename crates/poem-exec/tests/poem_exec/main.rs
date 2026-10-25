@@ -2,5 +2,6 @@
 
 mod a_copied_window_is_one_launch_over_the_same_rows;
 mod a_grouped_window_is_one_launch_and_a_split_one_is_r;
+mod a_lane_is_told_what_its_classes_run;
 mod the_patch_axis_seriates_its_own_lanes;
 mod the_voxel_axis_seriates_its_own_clips;

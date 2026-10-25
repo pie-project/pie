@@ -4,10 +4,9 @@ use crate::flux_2_dims;
 
 use flux_2_dims as forward;
 use flux_2_dims as model;
-use poem::generative::ReadoutKind;
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, GeomKind, Operands, Operation, Platform, Request, RopeForm,
-    RuntimeInput, Stream, Trace, Ty, ValueId, seam,
+    RuntimeInput, Trace, Ty, ValueId, seam,
 };
 use poem_ir::InputAxis;
 
@@ -90,24 +89,12 @@ fn both_rows_trace_on_every_platform_with_the_seams_and_caches_they_declare() {
 
 fn the_readings_state_their_streams_readouts_and_sinusoids() {
     for (deployment, guidance) in [(KLEIN, false), (MINI, true)] {
-        let facts = row(deployment)
-            .generative()
-            .expect("a generative row states its readings");
-        let denoise = facts
-            .readings
-            .iter()
-            .find(|r| r.name == "denoise")
-            .expect("the denoise reading");
-        assert!(!denoise.has_kv && !denoise.takes_tokens, "{deployment}");
+        let plan = trace(deployment, Platform::Cuda);
         assert_eq!(
-            denoise.streams,
-            vec![Stream::Text, Stream::Image, Stream::Reference],
+            plan.facts.declared("stream").map(|s| s.values.clone()),
+            Some(vec!["text".into(), "image".into(), "reference".into()]),
             "{deployment}"
         );
-        assert_eq!(denoise.readout, ReadoutKind::Velocity);
-        assert_eq!(denoise.readout_width, model::IN_CHANNELS);
-
-        let plan = trace(deployment, Platform::Cuda);
         let mut sinusoids: Vec<(u32, f32, bool, f32)> = plan
             .nodes
             .iter()
@@ -140,25 +127,6 @@ fn the_readings_state_their_streams_readouts_and_sinusoids() {
         assert_eq!(sinusoids, want, "{deployment}");
     }
 
-    let klein = row(KLEIN).generative().unwrap();
-    let names: Vec<(&str, u8)> = klein
-        .readings
-        .iter()
-        .map(|r| (r.name.as_str(), r.index))
-        .collect();
-    assert_eq!(
-        names,
-        vec![
-            ("text", 0),
-            ("denoise", 1),
-            ("vae.decode", 2),
-            ("vae.encode", 3)
-        ]
-    );
-    let text = &klein.readings[0];
-    assert!(text.has_kv && text.takes_tokens);
-    assert_eq!(text.readout, ReadoutKind::Hidden);
-    assert_eq!(text.readout_width, model::Dims::klein_4b().dim);
     let plan = trace(KLEIN, Platform::Cuda);
     let latent = plan
         .inputs
@@ -189,10 +157,10 @@ fn each_stream_of_the_denoise_reading_classifies_into_its_own_class() {
         let _row = row(deployment);
 
         let mut seen = Vec::new();
-        for stream in [Stream::Text, Stream::Image, Stream::Reference] {
+        for stream in ["text", "image", "reference"] {
             let request = Request::new(1, false)
-                .on_stream(stream)
-                .in_reading("denoise");
+                .switched("stream", stream)
+                .switched("reading", "denoise");
             let word = plan.facts.word(&request);
             let class = classes
                 .class_of(word & classes.mask)
@@ -206,8 +174,21 @@ fn each_stream_of_the_denoise_reading_classifies_into_its_own_class() {
             "{deployment}: two streams share a class: {seen:?}"
         );
     }
-    assert_eq!(model::readings(MINI), (None, 0, None, None));
-    assert_eq!(model::readings(KLEIN), (Some(0), 1, Some(2), Some(3)));
+    let readings = |deployment: &str| {
+        trace(deployment, Platform::Cuda)
+            .facts
+            .declared("reading")
+            .map(|s| s.values.clone())
+    };
+    assert_eq!(readings(MINI), Some(vec!["denoise".to_string()]));
+    assert_eq!(
+        readings(KLEIN),
+        Some(
+            ["text", "denoise", "vae.decode", "vae.encode"]
+                .map(String::from)
+                .to_vec()
+        )
+    );
 }
 
 fn every_ragged_read_is_self_paired_over_the_group_csr() {
@@ -250,20 +231,22 @@ fn every_ragged_read_is_self_paired_over_the_group_csr() {
         else {
             panic!("{deployment}: the joint CSR is not a group indptr");
         };
-        let word = |stream: Stream| {
+        let word = |stream: &str| {
             plan.facts.word(
                 &Request::new(1, false)
-                    .on_stream(stream)
-                    .in_reading("denoise"),
+                    .switched("stream", stream)
+                    .switched("reading", "denoise"),
             )
         };
-        for stream in [Stream::Text, Stream::Image, Stream::Reference] {
+        for stream in ["text", "image", "reference"] {
             assert!(
                 select.holds(word(stream)),
                 "{deployment}: {stream:?} is in the joint group"
             );
         }
-        let text_reading = plan.facts.word(&Request::new(1, false).in_reading("text"));
+        let text_reading = plan
+            .facts
+            .word(&Request::new(1, false).switched("reading", "text"));
         if deployment == KLEIN {
             assert!(
                 !select.holds(text_reading),

@@ -1,6 +1,6 @@
 //! Sampler variants for DiffusionGemma, every one a guest program against
-//! the same `forward-diffusion` host as `diffusion-baseline`: the host owns
-//! the two attention readings and the KV; the guest owns the canvas, its
+//! the same host as `diffusion-baseline`: the host owns the model's two
+//! `mode`s (`encode`, `denoise`) and the KV; the guest owns the canvas, its
 //! acceptance rule, its schedule, its self-conditioning taps, its stopping
 //! rule, and what gets committed. Nothing here needed a host change.
 //!
@@ -42,6 +42,9 @@
 //! - `clamp`: infilling — canvas positions held at given tokens.
 
 use inferlet::eta::diffusion::prelude::*;
+
+/// The tokens one block's canvas is.
+const CANVAS: u32 = 256;
 use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
@@ -320,7 +323,7 @@ impl Block<'_> {
             Channel::from_shaped([length, taps_width], vec![0f32; cells]).named("self_cond_weights");
 
         let fwd = ForwardPass::new();
-        fwd.canvas(Mode::Denoise)?;
+        fwd.switch("mode", "denoise")?;
         fwd.embed(&toks, &embed_indptr)?;
         fwd.state(
             &[ws],
@@ -576,20 +579,19 @@ impl Block<'_> {
 /// The self-conditioning taps per canvas row: the width of the denoise
 /// lane's `self_cond_ids` input.
 fn self_cond_taps() -> Result<u32> {
-    let lane = model::lane(&[("canvas".into(), "denoise".into())])?;
+    let lane = model::lane_of(&[("mode", "denoise")])?;
     let input = lane.inputs.iter().find(|input| input.name == "self_cond_ids");
     Ok(input.ok_or("the denoise lane reads no `self_cond_ids` input")?.width)
 }
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if model::pass_kind() != model::ForwardKind::Diffusion {
+    if !model::switch("mode").is_some_and(|mode| mode.values.iter().any(|v| v == "denoise")) {
         return Err(
             "this program drives a block-diffusion model; the bound model is not one".into(),
         );
     }
-    let shape = model::canvas().ok_or("a diffusion model states its canvas")?;
-    let length = shape.length;
+    let length = CANVAS;
     let taps_width = self_cond_taps()?;
     let taps_used = input.taps.unwrap_or(taps_width).min(taps_width);
     // The canvas attends both ways, so the runtime cannot cut it: one fire reads every row.
@@ -753,7 +755,6 @@ async fn encode(
     let slots = Channel::from_iter(base..base + len).named("slots_e");
 
     let fwd = ForwardPass::new();
-    fwd.canvas(Mode::Encode)?;
     fwd.embed(&toks, &embed_indptr)?;
     fwd.state(
         &[ws],

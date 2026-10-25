@@ -4,8 +4,8 @@
 
 use poem_compiler::CompiledModel;
 use poem_ir::{
-    ClassSet, Def, Dtype, GeomKind, InputAxis, InputDecl, Operands as _, RuntimeInput, Selection,
-    Trace, ValueId,
+    ClassSet, Def, Dtype, GeomKind, InputAxis, InputDecl, LaneClass, LaneClasses, Operands as _,
+    Readout, ReadoutKind, RuntimeInput, Selection, Trace, ValueId,
 };
 
 /// A guest input as a fire lands it: `width` values of `dtype` a lane, a row
@@ -161,7 +161,10 @@ impl Feeds {
             .iter()
             .enumerate()
             .filter_map(|(id, named)| {
-                let (seat, readers) = self.inputs.iter().find(|(seat, _)| seat.id as usize == id)?;
+                let (seat, readers) = self
+                    .inputs
+                    .iter()
+                    .find(|(seat, _)| seat.id as usize == id)?;
                 Some(InputDecl {
                     name: named.name.clone(),
                     axis: seat.axis,
@@ -194,6 +197,171 @@ pub fn reader_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -
     let mut classes = ClassSet::default();
     for region in compiled.template() {
         if !region.nodes.clone().any(|node| readers.contains(&node)) {
+            continue;
+        }
+        for class in region.mask.iter() {
+            classes.insert(class);
+        }
+    }
+    classes
+}
+
+/// Each class of the plan, as a lane landing in it is told of it: whether it
+/// reads a kv cache, embeds `tokens`, attends both ways, and the export seam
+/// it reads out (`out` before `velocity`, `hidden` and `pixels`, as a fire
+/// reads it) and how wide one row of it is.
+#[must_use]
+pub fn lane_classes(trace: &Trace, compiled: &CompiledModel) -> LaneClasses {
+    let kv = classes_reading(trace, compiled, |def| {
+        matches!(def, Def::Cache(row) if matches!(
+            trace.caches.get(*row as usize),
+            Some(poem_ir::CacheRow::Kv { .. })
+        ))
+    });
+    let embeds = classes_reading(trace, compiled, |def| {
+        matches!(def, Def::Input(RuntimeInput::Tokens))
+    });
+    let wide = classes_running(trace, compiled, |op| {
+        matches!(
+            op,
+            poem_ir::Operation::Attn(poem_ir::Attn::Prefill { causal: false, .. })
+        )
+    });
+    let [out, _, _, _, velocity, hidden, pixels] = poem_compiler::EXPORT_SEAMS;
+    let exports: Vec<(ReadoutKind, Readout, ClassSet)> = [
+        (out, ReadoutKind::Logits),
+        (velocity, ReadoutKind::Velocity),
+        (hidden, ReadoutKind::Hidden),
+        (pixels, ReadoutKind::Pixels),
+    ]
+    .into_iter()
+    .flat_map(|(name, kind)| {
+        let seams: Vec<_> = trace
+            .seams
+            .iter()
+            .filter(|seam| seam.seam == name)
+            .filter_map(|seam| seam.values.first().copied())
+            .collect();
+        // The last `hidden` a class writes is the one it reads out.
+        let seams: Vec<_> = if kind == ReadoutKind::Hidden {
+            seams.into_iter().rev().collect()
+        } else {
+            seams
+        };
+        seams.into_iter().filter_map(move |value| {
+            let width = crate::store::kv::width_of(trace, value).ok()?;
+            let readout = Readout {
+                kind,
+                width: u32::try_from(width).ok()?,
+            };
+            Some((kind, readout, writer_classes(trace, compiled, value)))
+        })
+    })
+    .collect();
+    let table = &compiled.classes;
+    LaneClasses {
+        mask: table.mask,
+        classes: table
+            .classes
+            .iter()
+            .enumerate()
+            .map(|(class, landed)| LaneClass {
+                words: landed.words.clone(),
+                reads_kv: kv.contains(class),
+                embeds: embeds.contains(class),
+                wide: wide.contains(class),
+                readout: exports
+                    .iter()
+                    .find(|(_, _, classes)| classes.contains(class))
+                    .map(|(_, readout, _)| *readout),
+            })
+            .collect(),
+    }
+}
+
+/// The classes running a region one of whose nodes `wanted` holds of.
+#[must_use]
+pub fn classes_running(
+    trace: &Trace,
+    compiled: &CompiledModel,
+    wanted: impl Fn(&poem_ir::Operation) -> bool,
+) -> ClassSet {
+    let mut classes = ClassSet::default();
+    for region in compiled.template() {
+        let runs = region.nodes.clone().any(|node| {
+            trace
+                .nodes
+                .get(node as usize)
+                .is_some_and(|node| wanted(&node.op))
+        });
+        if runs {
+            for class in region.mask.iter() {
+                classes.insert(class);
+            }
+        }
+    }
+    classes
+}
+
+/// The classes running a region one of whose nodes reads a value whose
+/// definition `wanted` holds of.
+#[must_use]
+pub fn classes_reading(
+    trace: &Trace,
+    compiled: &CompiledModel,
+    wanted: impl Fn(&Def) -> bool,
+) -> ClassSet {
+    let mut inputs: Vec<ValueId> = Vec::new();
+    let mut readers: Vec<bool> = vec![false; trace.nodes.len()];
+    for (at, node) in trace.nodes.iter().enumerate() {
+        inputs.clear();
+        node.op.inputs(&mut inputs);
+        readers[at] = inputs.iter().any(|value| {
+            trace
+                .values
+                .get(value.0 as usize)
+                .is_some_and(|decl| wanted(&decl.def))
+        });
+    }
+    let mut classes = ClassSet::default();
+    for region in compiled.template() {
+        if region
+            .nodes
+            .clone()
+            .any(|node| readers.get(node as usize).copied().unwrap_or(false))
+        {
+            for class in region.mask.iter() {
+                classes.insert(class);
+            }
+        }
+    }
+    classes
+}
+
+/// The classes running a region that writes `value`, or an arm of it.
+#[must_use]
+pub fn writer_classes(trace: &Trace, compiled: &CompiledModel, value: ValueId) -> ClassSet {
+    if let Some(Def::Merge(arms)) = trace.values.get(value.0 as usize).map(|decl| &decl.def) {
+        let mut classes = ClassSet::default();
+        for (arm, _) in arms {
+            for class in writer_classes(trace, compiled, *arm).iter() {
+                classes.insert(class);
+            }
+        }
+        return classes;
+    }
+    let mut outputs: Vec<ValueId> = Vec::new();
+    let mut writers: Vec<u32> = Vec::new();
+    for (at, node) in trace.nodes.iter().enumerate() {
+        outputs.clear();
+        node.op.outputs(&mut outputs);
+        if outputs.contains(&value) {
+            writers.push(u32::try_from(at).unwrap_or(u32::MAX));
+        }
+    }
+    let mut classes = ClassSet::default();
+    for region in compiled.template() {
+        if !region.nodes.clone().any(|node| writers.contains(&node)) {
             continue;
         }
         for class in region.mask.iter() {

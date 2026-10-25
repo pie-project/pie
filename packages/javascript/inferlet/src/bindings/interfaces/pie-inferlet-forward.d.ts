@@ -73,7 +73,6 @@ export type WorkingSet = import('./pie-inferlet-working-set.js').WorkingSet;
 export type Pipeline = import('./pie-inferlet-pipeline.js').Pipeline;
 export type Image = import('./pie-inferlet-media.js').Image;
 export type Audio = import('./pie-inferlet-media.js').Audio;
-export type LaneStream = import('./pie-inferlet-model.js').LaneStream;
 /**
  * One attached media span, borrowed: the pass reads the payload out and
  * the guest keeps its handle, so one decoded image may feed two passes.
@@ -116,8 +115,8 @@ export class ForwardPass {
   constructor()
   /**
   * One working set per lane, in lane order; lanes sharing one state
-  * their slots. Required on a reading with a KV space, refused on one
-  * without.
+  * their slots. Required on a lane that reads kv (`model.lane`'s
+  * `reads-kv`), refused on one that does not.
   */
   state(lanes: Array<WorkingSet>, geom: StateGeometry): void;
   /**
@@ -127,24 +126,20 @@ export class ForwardPass {
   checkpoints(slots: Uint32Array): void;
   /**
   * Bind embedding token ids and CSR row indptr. Both are channels.
-  * REQUIRED on a reading that embeds tokens (`reading-fact.
-  * takes-tokens`, every text model's), REFUSED on one that does
-  * not; the lane's row count then comes from its row inputs.
+  * REQUIRED on a lane that embeds tokens (`model.lane`'s `embeds`,
+  * every text model's), REFUSED on one that does not; the lane's row
+  * count then comes from its row inputs.
   */
   embed(tokens: Channel, indptr: Channel): void;
   /**
-  * Which of the family's declared readings this pass runs
-  * (`model.readings()`) -- the arm its lanes are stamped with.
-  * Generalizes `forward-diffusion.canvas(mode)`: the set of
-  * readings is open across the zoo (`"text"`, `"denoise"`,
-  * `"denoise.low"`, `"refine"`, `"vae.encode"`, `"vae.decode"`,
-  * `"upsample"`), while the set of state kinds stays closed.
-  * Optional when the model declares one reading (or none: a text
-  * model's implicit reading); refused by name for a name the model
-  * does not declare. Set before `program`; one reading per pass
-  * for its life.
+  * Set the model's switch `name` to `value` (`model.switches()`):
+  * which path this pass's lanes run. Names and values are the
+  * model's (`reading`, `stream`, `mode`, ...); the host checks
+  * `value` against the declaration and nothing else. A switch left
+  * unset takes its first declared value. Set before `program`; a
+  * pass keeps its switches for its life.
   */
-  reading(name: string): void;
+  'switch'(name: string, value: string): void;
   /**
   * Bind a channel to the model's input `name` (`model.lane`'s
   * `inputs`), read at every submit: the channel's COMMITTED cell is
@@ -162,19 +157,14 @@ export class ForwardPass {
   */
   input(name: string, ch: Channel): void;
   /**
-  * Which lane stream this pass's rows are; default `text`. Set before
-  * `program`.
-  */
-  stream(s: LaneStream): void;
-  /**
   * Put this pass's lanes in attention group `id`: the lanes of every
   * pass in one frame naming the same group attend each other's rows.
   * Set before `program`.
   */
   group(id: number): void;
   /**
-  * Name the attention group whose same-stream lane is this lane's
-  * PEER: the lane whose velocity this one's epilogue reads with
+  * Name the attention group whose lane of this lane's switches is
+  * its PEER: the lane whose velocity this one's epilogue reads with
   * `intrinsics::peer_velocity(width)`.
   * 
   * This is the classifier-free guidance verb, and it names a group
@@ -185,7 +175,7 @@ export class ForwardPass {
   * the other's rows. So they are two groups of ONE fire, and this
   * says which of them is the other.
   * 
-  * The peer is the lane of that group carrying THIS pass's stream;
+  * The peer is the lane of that group with THIS pass's switches;
   * a group seating no such lane, or more than one, is refused by
   * name at submit rather than guessed at. Naming one's own group is
   * refused too: a lane is not its own peer, and `u + s(u - u)` is a
@@ -218,19 +208,6 @@ export class ForwardPass {
   * Bind an optional readout-index channel separately from embedding.
   */
   readout(indices: Channel): void;
-  /**
-  * **THESE ROWS ARE A BLOCK DRAFTER'S PROPOSAL, NOT THE SEQUENCE'S.**
-  * A block drafter proposes many tokens in one pass over a block
-  * whose first row is the correction the target just made and whose
-  * rest is the model's mask token; the trunk must not run over them,
-  * and a plan that carries such a drafter guards itself on this.
-  * 
-  * It cannot be inferred from what the pass reads, the way drafting
-  * is: what makes a fire a draft is the anchor chosen from the
-  * accepted prefix, which only the guest knows. Unset = an ordinary
-  * pass.
-  */
-  setDraftingBlock(on: boolean): void;
   /**
   * The payloads of the media spans this pass's tokens carry, in
   * placeholder order; a count or run length that disagrees is refused

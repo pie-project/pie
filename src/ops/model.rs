@@ -382,7 +382,10 @@ fn info(name: String) -> Result<Answer> {
             })
             .collect(),
         generative: facts::of(entry.deployment.as_deref()).map(|mut generative| {
-            generative.inputs = entry.deployment.as_deref().map_or_else(Vec::new, facts::inputs);
+            if let Some(trace) = entry.deployment.as_deref().and_then(facts::traced) {
+                generative.inputs = facts::inputs(&trace);
+                generative.switches = facts::switches(&trace);
+            }
             generative
         }),
         name: entry.name,
@@ -489,50 +492,16 @@ impl crate::ui::Report for ModelInfo {
             if !generative.inputs.is_empty() {
                 row("inputs", generative.inputs.join(", "));
             }
+            if !generative.switches.is_empty() {
+                row("switches", generative.switches.join("; "));
+            }
             table.print(palette);
 
-            println!("\n{}", palette.bold("Readings"));
-            let name_width = generative
-                .readings
-                .iter()
-                .map(|r| r.name.chars().count())
-                .max()
-                .unwrap_or(0);
-            let binds_of = |reading: &facts::Reading| {
-                let mut binds = Vec::new();
-                if reading.tokens {
-                    binds.push("tokens");
-                }
-                if reading.kv {
-                    binds.push("kv");
-                }
-                if binds.is_empty() {
-                    "no tokens, no kv".to_string()
-                } else {
-                    binds.join(" + ")
-                }
-            };
-            let binds_width = generative
-                .readings
-                .iter()
-                .map(|r| binds_of(r).chars().count())
-                .max()
-                .unwrap_or(0);
-            for reading in &generative.readings {
-                println!(
-                    "  {}  {}  {:<binds_width$}  -> {} {}",
-                    palette.accent(format!("{:<name_width$}", reading.name)),
-                    palette.dim(format!("#{}", reading.index)),
-                    binds_of(reading),
-                    reading.readout,
-                    reading.readout_width,
-                );
-            }
             if generative.text_to_image() {
                 println!(
                     "  {}",
                     palette.dim(
-                        "this deployment has a text reading and a denoise reading: \
+                        "this deployment binds the standard `latents` and `timestep` inputs: \
                          `pie run text-to-image -- --prompt \"...\"` drives it."
                     )
                 );

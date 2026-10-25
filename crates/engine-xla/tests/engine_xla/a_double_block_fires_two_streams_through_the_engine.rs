@@ -11,7 +11,7 @@ use common_dit::{
     HostRequest, Lcg, Rig, WIDTH, Weights, assert_close, attach, bf, lane, reference,
     reference_with, trace,
 };
-use engine::fire::{LaneStream, ReadoutSeam};
+use engine::fire::ReadoutSeam;
 
 fn request(rng: &mut Lcg, text_rows: usize, image_rows: usize) -> HostRequest {
     let w = WIDTH as usize;
@@ -103,16 +103,16 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
             &req.positions[req.text_rows..],
         );
         let slot = (2 * at) as u32;
-        // Request 0 submits its image lane first: the packing, not the
-        // submission order, puts a group's rows together.
+        // Request 0 submits its image lane first: the packing puts a
+        // group's rows together, in submission order inside it.
         if at == 0 {
-            lanes.push(lane(&rig, slot, &image, LaneStream::Image, at as u32));
-            lanes.push(lane(&rig, slot + 1, &text, LaneStream::Text, at as u32));
+            lanes.push(lane(&rig, slot, &image, "image", at as u32));
+            lanes.push(lane(&rig, slot + 1, &text, "text", at as u32));
             attachments.push(attach(lanes.len() as u32 - 2, image.instance));
             attachments.push(attach(lanes.len() as u32 - 1, text.instance));
         } else {
-            lanes.push(lane(&rig, slot, &text, LaneStream::Text, at as u32));
-            lanes.push(lane(&rig, slot + 1, &image, LaneStream::Image, at as u32));
+            lanes.push(lane(&rig, slot, &text, "text", at as u32));
+            lanes.push(lane(&rig, slot + 1, &image, "image", at as u32));
             attachments.push(attach(lanes.len() as u32 - 2, text.instance));
             attachments.push(attach(lanes.len() as u32 - 1, image.instance));
         }
@@ -208,7 +208,10 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
     }
     let mut classed = lanes;
     for lane in &mut classed {
-        let class = i32::from(lane.stream != LaneStream::Text);
+        let text = rig
+            .facts
+            .word(&poem::Request::new(lane.tokens.len() as u32, false).switched("stream", "text"));
+        let class = i32::from(lane.word != text);
         lane.attn_classes = Some(engine::fire::AttnClasses {
             classes: vec![class; lane.tokens.len()],
             table: vec![1, 0, 0, 1],

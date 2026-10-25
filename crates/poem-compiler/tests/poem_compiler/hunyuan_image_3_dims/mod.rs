@@ -6,11 +6,6 @@ pub const ROPE_THETA: f32 = 10_000.0;
 pub const LATENT_CHANNELS: u32 = 32;
 pub const SPATIAL_COMPRESSION: u32 = 16;
 
-pub const ENCODE: u8 = 0;
-pub const DENOISE: u8 = 1;
-pub const IMAGE_IN: u8 = 2;
-pub const IMAGE_OUT: u8 = 3;
-
 #[must_use]
 pub fn rope_x_scale(head_dim: u32) -> f32 {
     ROPE_THETA.powf(-2.0 / head_dim as f32)

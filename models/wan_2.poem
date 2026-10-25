@@ -327,53 +327,13 @@ def layout(id, deploy):
 
 def generative(m):
     d = m.dims
-    index = 0
-    readings = []
-    if m.te != None:
-        readings.append(reading(
-            "text",
-            index = index,
-            takes_tokens = True,
-            streams = ["text"],
-            readout = "hidden",
-            readout_width = TE_HIDDEN,
-        ))
-        index += 1
-    readings.append(reading(
-        "denoise",
-        index = index,
-        streams = ["video", "context"],
+    return generation(
         positions = positions(
             axes = ["time", "height", "width"],
             text_axis = 0,
             text_origin = 0,
             image_follows_text = False,
         ),
-        readout = "velocity",
-        readout_width = d.patch,
-    ))
-    index += 1
-    if m.vae != None:
-        for name in ["vae.decode.head", "vae.decode"]:
-            readings.append(reading(
-                name,
-                index = index,
-                streams = ["video"],
-                readout = "pixels",
-                readout_width = VAE_RGB,
-            ))
-            index += 1
-        for name in ["vae.encode.head", "vae.encode"]:
-            readings.append(reading(
-                name,
-                index = index,
-                streams = ["video"],
-                readout = "pixels",
-                readout_width = VAE_Z,
-            ))
-            index += 1
-    return generation(
-        readings = readings,
         latent = latent_space(
             channels = d.channels,
             patch_t = PATCH_T,
@@ -703,14 +663,18 @@ def caches(m, c):
             c.state(cv.cache, slab(cv), dtype.bf16)
 
 def forward(m, inputs):
+    vae_readings = ["vae.decode.head", "vae.decode", "vae.encode.head", "vae.encode"] if m.vae != None else []
+    switch("reading", (["text"] if m.te != None else []) + ["denoise"] + vae_readings)
+    switch("stream", ["video", "context"])
+    reading = lambda name: inputs.on(switch_is("reading", name))
     if m.te != None:
-        inputs.reading("text", lambda text: text_encode(text, m.te))
-    velocity = inputs.reading("denoise", lambda rows: denoise(rows, m))
+        text_encode(reading("text"), m.te)
+    velocity = denoise(reading("denoise"), m)
     if m.vae != None:
-        inputs.reading("vae.decode.head", lambda rows: vae_decode(rows, m.vae, True))
-        inputs.reading("vae.decode", lambda rows: vae_decode(rows, m.vae, False))
-        inputs.reading("vae.encode.head", lambda rows: vae_encode(rows, m.vae, True))
-        inputs.reading("vae.encode", lambda rows: vae_encode(rows, m.vae, False))
+        vae_decode(reading("vae.decode.head"), m.vae, True)
+        vae_decode(reading("vae.decode"), m.vae, False)
+        vae_encode(reading("vae.encode.head"), m.vae, True)
+        vae_encode(reading("vae.encode"), m.vae, False)
     return velocity
 
 def text_encode(arm, te):
@@ -783,7 +747,7 @@ def run_block(x, c, b, e, d, vg, cg):
 def denoise(arm, m):
     d = m.dims
     dit = m.dit
-    ctx, vid = arm.on(fact.stream("context")), arm.on(~fact.stream("context"))
+    ctx, vid = arm.on(switch_is("stream", "context")), arm.on(~switch_is("stream", "context"))
     vg = struct(
         lanes = vid.request_of_token(),
         positions = vid.input("positions", dtype.f32, "row", m.rope_axes),

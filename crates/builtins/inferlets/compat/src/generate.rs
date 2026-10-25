@@ -388,11 +388,6 @@ pub async fn generate(
         })
         .await;
     }
-    if model::pass_kind() == model::ForwardKind::Diffusion {
-        return Err(
-            "this program decodes a token at a time; a diffusion model wants a canvas loop".into(),
-        );
-    }
     let vocab = model::output_vocab_size();
     let n = prompt.len() as u32;
 

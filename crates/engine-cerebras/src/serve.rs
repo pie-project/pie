@@ -158,9 +158,7 @@ pub struct Seated<'a> {
     /// channels.
     pub inputs: &'a [InputCell<'a>],
 
-    /// The lane's stream and attention group, for grouped attention.
-    pub stream: u8,
-
+    /// The lane's attention group, for grouped attention.
     pub group: Option<u32>,
 
     /// The lane keeps no KV (a denoiser or decoder lane): it holds no
@@ -204,7 +202,6 @@ impl<'a> Seated<'a> {
             rs: &FOLD,
             media: None,
             inputs: &[],
-            stream: 0,
             group: None,
             kv_less: false,
             writes: None,
@@ -870,6 +867,12 @@ impl Shell {
     #[must_use]
     pub fn input_decls(&self) -> Vec<poem_ir::InputDecl> {
         self.dit.feeds().decls(&self.trace, &self.compiled)
+    }
+
+    /// This load's classes and what each runs.
+    #[must_use]
+    pub fn classes(&self) -> poem_ir::LaneClasses {
+        poem_exec::feeds::lane_classes(&self.trace, &self.compiled)
     }
 
     #[must_use]
@@ -1695,7 +1698,6 @@ impl Shell {
             .zip(&clips_of)
             .map(|(s, shot)| crate::dit::Feed {
                 slot: s.lane.slot,
-                stream: s.stream,
                 group: s.group,
                 inputs: s.inputs,
                 clips: *shot,
