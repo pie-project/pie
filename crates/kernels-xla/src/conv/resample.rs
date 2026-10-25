@@ -19,7 +19,10 @@ pub fn upsample_nearest(
     keep_first_frame: bool,
     y: Landing,
     y_grid: Operand,
+    bases: [u32; 2],
 ) -> Result<Val, Error> {
+    let grid = rebased(f, grid, bases[0])?;
+    let y_grid = rebased(f, y_grid, bases[1])?;
     const OP: &str = "conv.upsample";
     movable(OP, x, y)?;
     lane_pair(OP, grid, y_grid)?;
@@ -80,7 +83,10 @@ pub fn pixel_shuffle(
     trim_t: u32,
     y: Landing,
     y_grid: Operand,
+    bases: [u32; 2],
 ) -> Result<Val, Error> {
+    let grid = rebased(f, grid, bases[0])?;
+    let y_grid = rebased(f, y_grid, bases[1])?;
     const OP: &str = "conv.pixel_shuffle";
     movable(OP, x, y)?;
     lane_pair(OP, grid, y_grid)?;
@@ -132,7 +138,10 @@ pub fn pixel_unshuffle(
     r: [u32; 3],
     y: Landing,
     y_grid: Operand,
+    bases: [u32; 2],
 ) -> Result<Val, Error> {
+    let grid = rebased(f, grid, bases[0])?;
+    let y_grid = rebased(f, y_grid, bases[1])?;
     const OP: &str = "conv.pixel_unshuffle";
     movable(OP, x, y)?;
     lane_pair(OP, grid, y_grid)?;
@@ -229,7 +238,10 @@ pub fn avg_down(
     group: u32,
     y: Landing,
     y_grid: Operand,
+    bases: [u32; 2],
 ) -> Result<Val, Error> {
+    let grid = rebased(f, grid, bases[0])?;
+    let y_grid = rebased(f, y_grid, bases[1])?;
     const OP: &str = "conv.avg_down";
     movable(OP, x, y)?;
     lane_pair(OP, grid, y_grid)?;
@@ -283,9 +295,7 @@ pub fn patchify(
     y_grid: Operand,
     bases: [u32; 2],
 ) -> Result<Val, Error> {
-    let grid = rebased(f, grid, bases[0])?;
-    let y_grid = rebased(f, y_grid, bases[1])?;
-    pixel_unshuffle(f, x, grid, p, y, y_grid)
+    pixel_unshuffle(f, x, grid, p, y, y_grid, bases)
 }
 
 /// [`pixel_shuffle`] by the patch size, untrimmed; `bases` as
@@ -299,7 +309,5 @@ pub fn unpatchify(
     y_grid: Operand,
     bases: [u32; 2],
 ) -> Result<Val, Error> {
-    let grid = rebased(f, grid, bases[0])?;
-    let y_grid = rebased(f, y_grid, bases[1])?;
-    pixel_shuffle(f, x, grid, p, 0, y, y_grid)
+    pixel_shuffle(f, x, grid, p, 0, y, y_grid, bases)
 }
