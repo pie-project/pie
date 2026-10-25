@@ -220,6 +220,7 @@ def generative(m):
             channels = LATENT_CHANNELS,
             spatial_compression = SPATIAL_COMPRESSION,
             temporal_compression = TEMPORAL_COMPRESSION,
+            first_frames = 1,
         ),
         schedule = schedule(
             "flow",
