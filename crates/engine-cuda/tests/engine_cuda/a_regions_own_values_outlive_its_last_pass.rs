@@ -4,9 +4,8 @@ use eta_compiler::plan::compile_bound;
 use eta_exec::Extents;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op, tags};
-use eta_ir::registry::{ModelProfile, Stage};
+use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype, Shape};
-use eta_ir::validate::bind;
 
 const ROWS: u32 = 256;
 const VOCAB: u32 = 4096;
@@ -15,6 +14,7 @@ fn softmax_epilogue() -> TraceContainer {
     let ops = vec![
         Op::IntrinsicVal {
             intr: IntrinsicId::Logits,
+            lane: 0,
             shape: Shape::matrix(ROWS, VOCAB),
             dtype: Dtype::F32,
         },
@@ -62,11 +62,8 @@ fn softmax_epilogue() -> TraceContainer {
 }
 
 fn package() -> LaunchPackage {
-    let profile = ModelProfile {
-        vocab: VOCAB,
-        ..ModelProfile::dummy()
-    };
-    let bound = bind(softmax_epilogue(), profile).expect("the softmax epilogue binds");
+    let bound =
+        crate::bound::logits(softmax_epilogue(), VOCAB).expect("the softmax epilogue binds");
     let stages = compile_bound(&bound);
     eta_compiler::codegen::launch::build(&bound, &stages)
 }

@@ -172,9 +172,6 @@ pub struct Seated<'a> {
 
     pub first: Option<u32>,
 
-    /// The lane's attention classes, for a group-packed ragged attention.
-    pub attn_classes: Option<&'a engine::fire::AttnClasses>,
-
     /// The lane's pages in the windowed pool, aligned with `pages` (0 the
     /// null page); empty for a lane handed none.
     pub window: &'a [u32],
@@ -206,7 +203,6 @@ impl<'a> Seated<'a> {
             kv_less: false,
             writes: None,
             first: None,
-            attn_classes: None,
             window: &[],
             window_copies: &[],
         }
@@ -1132,7 +1128,6 @@ impl Shell {
                 || seated.kv_less
                 || seated.readout.is_some()
                 || !seated.inputs.is_empty()
-                || seated.attn_classes.is_some()
                 || seated.writes.is_some()
             {
                 return None;
@@ -1365,11 +1360,14 @@ impl Shell {
             });
             demand_slots = demand_slots.max(state_slot + 1);
 
+            // A kv-less lane's mask is over its attention group's rows: the
+            // group-packed attention takes it, not the paged prefill's.
+            let kv_mask = seated.mask.filter(|_| !seated.kv_less);
             let runs_masked_arm = self.masked.contains(row.class as usize);
-            if seated.mask.is_some() && self.masked.is_empty() {
+            if kv_mask.is_some() && self.masked.is_empty() {
                 return Err(Fault::Maskless { lane: row.source });
             }
-            if seated.mask.is_some() != runs_masked_arm {
+            if kv_mask.is_some() != runs_masked_arm {
                 return Err(Fault::MaskWord {
                     lane: row.source,
                     word: lane.word,
@@ -1377,7 +1375,7 @@ impl Shell {
                 });
             }
             masks.push(crate::mask::LaneMask {
-                mask: seated.mask,
+                mask: kv_mask,
                 have,
                 rows: row.rows,
                 wide: self.wide.contains(row.class as usize),
@@ -1422,7 +1420,7 @@ impl Shell {
                     seated.rs,
                     row.rows,
                     seated.first.unwrap_or(have),
-                    seated.mask,
+                    kv_mask,
                     None,
                 )
                 .map_err(|error| Fault::Program {
@@ -1676,7 +1674,7 @@ impl Shell {
                 group: s.group,
                 inputs: s.inputs,
                 clips: *shot,
-                attn_classes: s.attn_classes,
+                mask: s.mask.filter(|_| s.kv_less),
             })
             .collect();
         let crate::dit::Staged {

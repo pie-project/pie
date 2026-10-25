@@ -67,8 +67,6 @@ pub struct PackingBindings {
     pub group_indptr: Tensor,
     pub lane_indptr: Tensor,
     pub permutation: Tensor,
-    /// One attention class per packed row (-1 where the lane states none).
-    pub attn_class: Tensor,
 }
 
 /// A guest input's rectangle for this fire.
@@ -89,9 +87,6 @@ pub struct DitBindings {
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, PackingBindings)>,
     pub inputs: Vec<InputBinding>,
-    /// The fire's attention class table (`count x count` u8) and its count,
-    /// when a lane states classes.
-    pub class_table: Option<(Tensor, u32)>,
 }
 
 #[derive(Clone, Debug)]
@@ -296,30 +291,6 @@ impl<'c> Run<'c> {
     /// engine runs SPMD with `num_replicas > 1`.
     pub(crate) fn rank(&self) -> u32 {
         0
-    }
-
-    /// The fire's attention class table and its count, when a lane states
-    /// classes.
-    pub(crate) fn class_table(&self) -> Option<(Tensor, u32)> {
-        self.fire.dit.class_table
-    }
-
-    /// The packed attention classes of the rows `indptr` (a group-packed
-    /// `GroupIndptr` input) bounds.
-    pub(crate) fn packed_classes(&self, indptr: ValueId) -> Option<Tensor> {
-        match &self.values[indptr.0 as usize].def {
-            Def::Input(RuntimeInput::Geometry {
-                kind: GeomKind::GroupIndptr { select },
-                ..
-            }) => self
-                .fire
-                .dit
-                .packings
-                .iter()
-                .find(|(have, _)| have == select)
-                .map(|(_, tables)| tables.attn_class),
-            _ => None,
-        }
     }
 
     /// The fire's clip slot table (one i32 slot per voxel lane).

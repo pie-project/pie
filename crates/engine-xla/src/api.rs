@@ -34,8 +34,7 @@ use engine::fire::{
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
-use eta_ir::registry::{GeometryClass, ModelProfile, PortMask};
-use eta_ir::types::Dtype;
+use eta_ir::registry::{GeometryClass, PortMask};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
 
@@ -270,41 +269,6 @@ fn patch_bytes(
     }
 }
 
-fn profile(shell: &Shell, budgets: &LoadBudgets) -> ModelProfile {
-    let trace = shell.trace();
-    let layers = trace
-        .nodes
-        .iter()
-        .filter_map(|node| node.layer)
-        .max()
-        .map_or(0, |top| top + 1);
-    let (has_pixels, pixels_width) = shell.pixels_facts();
-    ModelProfile {
-        vocab: if shell.readout_seam() == engine::fire::ReadoutSeam::Logits {
-            shell.out_width()
-        } else {
-            0
-        },
-        page_size: budgets.page_size,
-        num_layers: layers,
-        activation: Dtype::F32,
-        has_mtp_logits: shell.mtp_width().is_some(),
-        mtp_depth: 0,
-        draft_block: trace.drafter.map_or(0, |d| d.rows),
-        draft_mask_token: trace.drafter.map_or(0, |d| d.mask_token),
-        draft_proposals_from: trace.drafter.map_or(1, |d| d.proposals_from),
-        has_value_head: false,
-        has_attn_score: shell.observes_scores(),
-        has_attn_page_mask: false,
-        has_lora: true,
-        has_velocity: shell.velocity_width().is_some(),
-        velocity_width: shell.velocity_width().unwrap_or(0),
-        has_pixels,
-        pixels_width,
-        kernels: Vec::new(),
-    }
-}
-
 fn adapter_of(
     shell: &mut Shell,
     package: &eta_compiler::codegen::launch::LaunchPackage,
@@ -412,7 +376,7 @@ impl Engine for Xla {
         let (weight_bytes, pool_bytes) = shell.footprint();
         let paging = shell.paging();
         let state_rows = shell.has_state();
-        let profile = profile(&shell, &budgets);
+        let drafter = shell.trace().drafter;
         let caps = Capabilities {
             device: DeviceFacts {
                 backend: "xla".to_string(),
@@ -452,7 +416,14 @@ impl Engine for Xla {
                 .unwrap_or(u32::MAX),
                 max_scoring_lanes: 0,
             },
-            profile,
+            has_lora: true,
+            has_attn_page_mask: false,
+            has_mtp_logits: shell.mtp_width().is_some(),
+            mtp_depth: 0,
+            draft_block: drafter.map_or(0, |d| d.rows),
+            draft_mask_token: drafter.map_or(0, |d| d.mask_token),
+            draft_proposals_from: drafter.map_or(1, |d| d.proposals_from),
+            has_attn_score: shell.observes_scores(),
             ports: PortMask::DEVICE_GEOMETRY
                 .with(eta_ir::registry::Port::AttnMask)
                 .with(eta_ir::registry::Port::Fold),
@@ -904,7 +875,10 @@ impl Xla {
             submission
                 .attachments
                 .iter()
-                .find(|attached| attached.lane as usize == lane)
+                .find(|attached| {
+                    (attached.lane as usize..(attached.lane + attached.lanes) as usize)
+                        .contains(&lane)
+                })
                 .map(|attached| attached.instance)
         };
         let shell = self.shell.as_ref();
@@ -1198,7 +1172,6 @@ impl Xla {
                     .and_then(|resolved| resolved.writes.as_ref())
                     .map(|(pages, offsets)| (pages.as_slice(), offsets.as_slice())),
                 first: device[at].as_ref().and_then(|resolved| resolved.first),
-                attn_classes: lane.attn_classes.as_ref(),
                 window: match &device[at] {
                     Some(DeviceLane {
                         window: Some(window),

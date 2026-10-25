@@ -14,8 +14,7 @@ use engine::fire::{
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
-use eta_ir::registry::{GeometryClass, ModelProfile, PortMask};
-use eta_ir::types::Dtype;
+use eta_ir::registry::{GeometryClass, PortMask};
 use poem_compiler::{Budget, DeviceProfile, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
 
@@ -317,39 +316,6 @@ fn voxel_bytes(
     }
 }
 
-fn profile(shell: &Shell, budgets: &LoadBudgets) -> EngineResult<ModelProfile> {
-    let trace = shell.trace();
-    let layers = trace
-        .nodes
-        .iter()
-        .filter_map(|node| node.layer)
-        .max()
-        .map_or(0, |top| top + 1);
-    let vocab = u32::try_from(shell.out_width().map_err(fault)?).unwrap_or(u32::MAX);
-    Ok(ModelProfile {
-        vocab,
-        page_size: budgets.page_size,
-        num_layers: layers,
-
-        activation: Dtype::F32,
-        has_mtp_logits: shell.drafts(),
-        mtp_depth: shell.mtp_depth(),
-        draft_block: shell.trace().drafter.map_or(0, |d| d.rows),
-        draft_mask_token: shell.trace().drafter.map_or(0, |d| d.mask_token),
-        draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
-        has_value_head: false,
-        has_attn_score: false,
-        has_attn_page_mask: false,
-
-        has_lora: true,
-        has_velocity: false,
-        velocity_width: 0,
-        has_pixels: shell.pixels_width().is_some(),
-        pixels_width: shell.pixels_width().unwrap_or(0),
-        kernels: Vec::new(),
-    })
-}
-
 fn adapter_of(
     shell: &mut Shell,
     package: &eta_compiler::codegen::launch::LaunchPackage,
@@ -472,7 +438,6 @@ impl Engine for Wgpu {
             .caches
             .iter()
             .any(|row| matches!(row, poem_ir::CacheRow::State { .. }));
-        let profile = profile(&shell, &budgets)?;
 
         let caps = Capabilities {
             device: DeviceFacts {
@@ -514,7 +479,14 @@ impl Engine for Wgpu {
                 .unwrap_or(u32::MAX),
                 max_scoring_lanes: 0,
             },
-            profile,
+            has_lora: true,
+            has_attn_page_mask: false,
+            has_mtp_logits: shell.drafts(),
+            mtp_depth: shell.mtp_depth(),
+            draft_block: shell.trace().drafter.map_or(0, |d| d.rows),
+            draft_mask_token: shell.trace().drafter.map_or(0, |d| d.mask_token),
+            draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
+            has_attn_score: false,
 
             ports: PortMask::DECODE_ENVELOPE
                 .with(eta_ir::registry::Port::Fold)
@@ -604,6 +576,20 @@ impl Engine for Wgpu {
     }
 
     fn register_program(&mut self, registration: &ProgramRegistration) -> EngineResult<ProgramId> {
+        // An epilogue reads `velocity`, `hidden` and `pixels` of its pass's
+        // first lane alone here: the intrinsics bind one readout a pass.
+        if registration.launch.values.iter().any(|value| {
+            value.lane > 0
+                && value
+                    .intrinsic
+                    .is_some_and(eta_ir::op::IntrinsicId::per_lane)
+        }) {
+            return Err(Error::Unsupported {
+                verb: "an epilogue reading `velocity`, `hidden` or `pixels` of a pass's lane \
+                       past its first",
+                engine: "wgpu",
+            });
+        }
         self.programs.register(registration).map_err(refusal)
     }
 
@@ -1021,6 +1007,12 @@ impl Wgpu {
             .iter()
             .enumerate()
             .map(|(at, lane)| {
+                if lane.kv_less && lane.mask.is_some() {
+                    return Err(Error::Unsupported {
+                        verb: "a mask over an attention group (masked group attention)",
+                        engine: "wgpu",
+                    });
+                }
                 Ok(Seated {
                     lane: Lane {
                         slot: lane.slot,

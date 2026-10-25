@@ -220,41 +220,6 @@ static_assert(sizeof(RaggedParams) == 312,
 static_assert(alignof(RaggedParams) == 8,
               "fa2_abi::PrefillRaggedParams mirrors an 8-byte-aligned BatchPrefillRaggedParams");
 
-struct RaggedClassParams : RaggedParams {
-    const IdType* q_classes = nullptr;
-    const IdType* kv_classes = nullptr;
-    const std::uint8_t* table = nullptr;
-    std::uint32_t count = 0;
-};
-
-static_assert(sizeof(RaggedClassParams) == 344,
-              "fa2_abi::PrefillRaggedClassParams mirrors a 344-byte RaggedClassParams");
-
-struct ClassTable : VariantFull {
-    std::uint32_t q_base = 0;
-    std::uint32_t kv_base = 0;
-
-    template <typename Params>
-    __device__ __host__ ClassTable(
-        const Params& params, uint32_t batch_idx, uint8_t* smem_ptr)
-        : VariantFull(params, batch_idx, smem_ptr) {
-        q_base = static_cast<std::uint32_t>(params.q_indptr[batch_idx]);
-        kv_base = static_cast<std::uint32_t>(params.kv_indptr[batch_idx]);
-    }
-
-    // A query tile's padding rows run past the group's `qo_len` (and the
-    // last group's past the table): no class is read for a row or key the
-    // group does not hold, so the read stays inside the table.
-    REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
-        if (qo_idx >= this->qo_len || kv_idx >= this->kv_len) return false;
-        const IdType qc = params.q_classes[q_base + qo_idx];
-        const IdType kc = params.kv_classes[kv_base + kv_idx];
-        return qc < 0 || kc < 0 ||
-               params.table[static_cast<std::uint32_t>(qc) * params.count +
-                            static_cast<std::uint32_t>(kc)] != 0;
-    })
-};
-
 struct RaggedBiasParams : RaggedParams {
     const float* bias = nullptr;
     std::uint32_t max_len = 0;

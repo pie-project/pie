@@ -51,12 +51,15 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
     };
     let weights = Weights::random(&trace(), 7);
     let mut rig = Rig::load(trace(), &weights, 64, vec![16, 32, 64], None);
+    let velocity = rig.readout_widths(poem_ir::ReadoutKind::Velocity);
     assert!(
-        rig.profile().has_velocity,
+        !velocity.is_empty() && velocity.iter().all(|&width| width == WIDTH),
         "the plan plants a velocity seam"
     );
-    assert_eq!(rig.profile().velocity_width, WIDTH);
-    assert_eq!(rig.profile().vocab, 0, "a denoiser has no vocabulary");
+    assert!(
+        rig.readout_widths(poem_ir::ReadoutKind::Logits).is_empty(),
+        "a denoiser has no vocabulary"
+    );
 
     let mut rng = Lcg::seeded(3);
     let requests = [request(&mut rng, 3, 5), request(&mut rng, 4, 6)];
@@ -168,9 +171,8 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
         "second fire, request 1 image",
     );
 
-    // Attn classes: text rows class 0, image rows class 1, and a table
-    // that keeps each class to itself, so each stream attends only within
-    // itself (engine-cuda's ragged `ClassTable`).
+    // A stated mask that keeps each stream to itself, so each attends only
+    // within itself (engine-cuda's ragged custom-mask arm).
     let apart = [request(&mut rng, 3, 5), request(&mut rng, 4, 6)];
     let want_apart: Vec<(Vec<f32>, Vec<f32>)> = requests
         .iter()
@@ -206,17 +208,23 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
             &first.positions[first.text_rows..],
         );
     }
+    // Each lane's rows attend its own lane's alone: in its group's rows (its
+    // pair's, lane after lane), the run it stands at.
     let mut classed = lanes;
-    for lane in &mut classed {
-        let text = rig
-            .facts
-            .word(&poem::Request::new(lane.tokens.len() as u32, false).switched("stream", "text"));
-        let class = i32::from(lane.word != text);
-        lane.attn_classes = Some(engine::fire::AttnClasses {
-            classes: vec![class; lane.tokens.len()],
-            table: vec![1, 0, 0, 1],
-            count: 2,
-        });
+    let rows: Vec<u32> = classed
+        .iter()
+        .map(|lane| lane.tokens.len() as u32)
+        .collect();
+    for (at, lane) in classed.iter_mut().enumerate() {
+        let first = at - at % 2;
+        let total = rows[first] + rows[first + 1];
+        let before = if at == first { 0 } else { rows[first] };
+        let own = engine::fire::Mask::new(
+            vec![before, rows[at], total - before - rows[at]],
+            u64::from(total),
+        );
+        lane.kv_less = true;
+        lane.mask = Some(engine::fire::Masking::Rows(vec![own; rows[at] as usize]));
     }
     let readouts = rig.fire(classed, attachments, Vec::new());
     assert_close(

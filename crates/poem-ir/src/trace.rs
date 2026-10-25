@@ -244,6 +244,10 @@ pub struct LaneClass {
     pub embeds: bool,
     pub wide: bool,
     pub readout: Option<Readout>,
+    /// The patch its graph's token grid reads (`RuntimeInput::TokenGrid`):
+    /// a voxel lane of it attends as one token row a patch of its voxels.
+    #[serde(default)]
+    pub patch: Option<[u32; 3]>,
 }
 
 /// The classes of a loaded model, and the mask of the word bits that tell

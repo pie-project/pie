@@ -145,6 +145,7 @@ fn epilogue(rows: u32, intrinsic: IntrinsicId, width: u32) -> TraceContainer {
                 Op::ChanTake(0),
                 Op::IntrinsicVal {
                     intr: intrinsic,
+                    lane: 0,
                     shape: Shape::matrix(rows, width),
                     dtype: EtaDtype::F32,
                 },
@@ -165,8 +166,11 @@ fn each_lane_reads_back_its_own_arms_seam() {
     let plan = plan();
     let weights = Weights::random(&plan, 37);
     let mut rig = Rig::load_plan(plan, &weights, 64, vec![16, 64]);
-    assert!(rig.profile().has_velocity, "the velocity seam is plan-wide");
-    assert_eq!(rig.profile().velocity_width, WIDTH);
+    assert!(
+        rig.reads_out(poem_ir::ReadoutKind::Velocity).is_some(),
+        "the velocity seam is plan-wide"
+    );
+    assert_eq!(rig.reads_out(poem_ir::ReadoutKind::Velocity), Some(WIDTH));
 
     let w = WIDTH as usize;
     let mut rng = Lcg::seeded(39);

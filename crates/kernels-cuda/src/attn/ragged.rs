@@ -1,6 +1,5 @@
 use crate::attn::fa2::abi::{
-    PrefillRaggedBiasParams, PrefillRaggedClassParams, PrefillRaggedParams, UintFastdiv,
-    sm_scale_or_default,
+    PrefillRaggedBiasParams, PrefillRaggedParams, UintFastdiv, sm_scale_or_default,
 };
 use crate::attn::fa2::{self, RaggedArm, RaggedPoint};
 use crate::attn::kv;
@@ -25,12 +24,11 @@ const KV_CHUNK_SENTINEL: i32 = i32::MAX;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RaggedMask {
     None,
-    /// `q_classes[q] < 0 || kv_classes[kv] < 0 || table[q_class * count + kv_class] != 0`.
-    ClassTable {
-        q_classes: Tensor,
-        kv_classes: Tensor,
-        table: Tensor,
-        count: u32,
+    /// Group `g`'s (query, key) pair `(q, k)` is kept where bit
+    /// `q * kv_len + k` of `bits`, from byte `indptr[g]`, is set.
+    Custom {
+        bits: Tensor,
+        indptr: Tensor,
     },
     RelativeBias {
         table: Tensor,
@@ -242,46 +240,29 @@ pub fn ragged(
     };
     match mask {
         RaggedMask::None => fa2::prefill_ragged(ctx, OP, point(RaggedArm::Full), &params),
-        RaggedMask::ClassTable {
-            q_classes,
-            kv_classes,
-            table,
-            count,
-        } => {
-            let sides = [("query", q_classes, q.rows), ("key", kv_classes, k.rows)];
-            for (what, classes, rows) in sides {
-                if classes.dtype != Dtype::I32 || classes.rows < rows {
-                    return Err(refuse(
-                        OP,
-                        format!(
-                            "the {what} class table is {:?} with {} entries; the mask reads one \
-                             i32 per row of the {rows}-row {what} rectangle",
-                            classes.dtype, classes.rows
-                        ),
-                    ));
-                }
-            }
-            let cells = u64::from(count) * u64::from(count);
-            if table.dtype != Dtype::U8 || u64::from(table.rows) < cells {
+        RaggedMask::Custom { bits, indptr } => {
+            if bits.dtype != Dtype::U8 || indptr.dtype != Dtype::I32 || indptr.rows != q_indptr.rows
+            {
                 return Err(refuse(
                     OP,
                     format!(
-                        "the class table is {:?} with {} entries; the mask reads {count} x {count} \
-                         bytes",
-                        table.dtype, table.rows
+                        "a custom mask is u8 bits and an i32 byte offset a group; this one is \
+                         {:?} bits and {} {:?} offsets for {} groups",
+                        bits.dtype,
+                        indptr.rows,
+                        indptr.dtype,
+                        q_indptr.rows.saturating_sub(1)
                     ),
                 ));
             }
             fa2::prefill_ragged(
                 ctx,
                 OP,
-                point(RaggedArm::ClassTable),
-                &PrefillRaggedClassParams {
-                    base: params,
-                    q_classes: q_classes.ptr,
-                    kv_classes: kv_classes.ptr,
-                    table: table.ptr,
-                    count,
+                point(RaggedArm::Custom),
+                &PrefillRaggedParams {
+                    maybe_custom_mask: bits.ptr,
+                    maybe_mask_indptr: indptr.ptr,
+                    ..params
                 },
             )
         }

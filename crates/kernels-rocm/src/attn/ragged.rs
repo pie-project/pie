@@ -23,12 +23,11 @@ const STAMPS: [u32; 5] = [64, 80, 96, 128, 256];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RaggedMask {
     None,
-    /// `q_classes[q] < 0 || kv_classes[kv] < 0 || table[q_class * count + kv_class] != 0`.
-    ClassTable {
-        q_classes: Tensor,
-        kv_classes: Tensor,
-        table: Tensor,
-        count: u32,
+    /// Group `g`'s (query, key) pair `(q, k)` is kept where bit
+    /// `q * kv_len + k` of `bits`, from byte `indptr[g]`, is set.
+    Custom {
+        bits: Tensor,
+        indptr: Tensor,
     },
     RelativeBias {
         table: Tensor,
@@ -40,18 +39,16 @@ pub enum RaggedMask {
 #[derive(Clone, Copy)]
 enum Arm {
     Full = 0,
-    Classes = 1,
+    Custom = 1,
     Bias = 2,
 }
 
 /// The arm's operands, as the kernel takes them after the shape.
 struct Operands {
     arm: Arm,
-    q_ids: ArgValue<'static>,
-    kv_ids: ArgValue<'static>,
-    table: ArgValue<'static>,
+    bits: ArgValue<'static>,
+    mask_indptr: ArgValue<'static>,
     bias: ArgValue<'static>,
-    count: u32,
     max_len: u32,
 }
 
@@ -59,11 +56,9 @@ impl Operands {
     const fn of(arm: Arm) -> Self {
         Self {
             arm,
-            q_ids: ArgValue::ABSENT,
-            kv_ids: ArgValue::ABSENT,
-            table: ArgValue::ABSENT,
+            bits: ArgValue::ABSENT,
+            mask_indptr: ArgValue::ABSENT,
             bias: ArgValue::ABSENT,
-            count: 0,
             max_len: 0,
         }
     }
@@ -77,20 +72,6 @@ fn row_heads(what: &str, width: u32, head_dim: u32) -> Result<u32, Error> {
         ));
     }
     Ok(width / head_dim)
-}
-
-fn per_row(what: &str, table: Tensor, rows: u32, side: &str) -> Result<(), Error> {
-    if table.dtype != Dtype::I32 || table.rows < rows {
-        return Err(refuse(
-            OP,
-            format!(
-                "the {side} {what} table is {:?} with {} entries; the mask reads one i32 per row \
-                 of the {rows}-row {side} rectangle",
-                table.dtype, table.rows
-            ),
-        ));
-    }
-    Ok(())
 }
 
 /// Ragged (unpaged) attention over packed q/k/v, the vision towers' form: as
@@ -165,31 +146,25 @@ pub fn ragged(
 
     let operands = match mask {
         RaggedMask::None => Operands::of(Arm::Full),
-        RaggedMask::ClassTable {
-            q_classes,
-            kv_classes,
-            table,
-            count,
-        } => {
-            per_row("class", q_classes, q.rows, "query")?;
-            per_row("class", kv_classes, k.rows, "key")?;
-            let cells = u64::from(count) * u64::from(count);
-            if table.dtype != Dtype::U8 || u64::from(table.rows) < cells {
+        RaggedMask::Custom { bits, indptr } => {
+            if bits.dtype != Dtype::U8 || indptr.dtype != Dtype::I32 || indptr.rows != q_indptr.rows
+            {
                 return Err(refuse(
                     OP,
                     format!(
-                        "the class table is {:?} with {} entries; the mask reads {count} x {count} \
-                         bytes",
-                        table.dtype, table.rows
+                        "a custom mask is u8 bits and an i32 byte offset a group; this one is \
+                         {:?} bits and {} {:?} offsets for {} groups",
+                        bits.dtype,
+                        indptr.rows,
+                        indptr.dtype,
+                        q_indptr.rows.saturating_sub(1)
                     ),
                 ));
             }
             Operands {
-                q_ids: q_classes.arg(),
-                kv_ids: kv_classes.arg(),
-                table: table.arg(),
-                count,
-                ..Operands::of(Arm::Classes)
+                bits: bits.arg(),
+                mask_indptr: indptr.arg(),
+                ..Operands::of(Arm::Custom)
             }
         }
         RaggedMask::RelativeBias { table, max_len } => {
@@ -247,11 +222,9 @@ pub fn ragged(
             stated(OP, head_dim)?.arg(),
             sm_scale.arg(),
             rows.arg(),
-            operands.q_ids,
-            operands.kv_ids,
-            operands.table,
+            operands.bits,
+            operands.mask_indptr,
             operands.bias,
-            stated(OP, operands.count)?.arg(),
             stated(OP, operands.max_len)?.arg(),
         ],
     )

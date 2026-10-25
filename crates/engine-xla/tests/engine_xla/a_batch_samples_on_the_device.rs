@@ -24,7 +24,7 @@ use eta_compiler::plan::compile_bound;
 use eta_exec::Value;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
+use eta_ir::registry::{EngineCaps, GeometryClass, Graph, Readout, ReadoutKind, Stage};
 use eta_ir::types::{Dtype, Literal, Predicate, RngKind, Shape};
 use poem::{Platform, Request};
 use poem_compiler::Budget;
@@ -59,6 +59,7 @@ fn sampler(vocab: u32, top_k: bool, penalties: bool) -> TraceContainer {
     let r = p.op(Op::ChanTake(RNG));
     let raw = p.op(Op::IntrinsicVal {
         intr: IntrinsicId::Logits,
+        lane: 0,
         shape: Shape::matrix(1, vocab),
         dtype: Dtype::F32,
     });
@@ -253,17 +254,18 @@ fn a_batch_samples_on_the_device_as_the_interpreter_does() {
     let vocab = shell.out_width();
 
     // One program, registered with both planes; an instance per lane.
-    let profile = ModelProfile {
-        vocab,
-        ..ModelProfile::dummy()
-    };
     let bound = eta_ir::validate::bind(
         sampler(
             vocab,
             std::env::var_os("PIE_XLA_SAMPLER_TOP_K").is_some(),
             std::env::var("PIE_XLA_SAMPLER_PENALTIES").map_or(true, |v| v != "0"),
         ),
-        profile,
+        vec![Some(Readout {
+            kind: ReadoutKind::Logits,
+            width: vocab,
+        })],
+        Graph::default(),
+        EngineCaps::default(),
     )
     .expect("the sampler binds");
     let launch = eta_compiler::codegen::launch::build(&bound, &compile_bound(&bound));

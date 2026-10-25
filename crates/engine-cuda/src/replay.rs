@@ -125,12 +125,10 @@ impl Replay {
             && !lane.captures_scores
             && matches!(lane.rs, RsVerb::Fold)
             && lane.inputs.is_empty()
-            && lane.attn_classes.is_none()
             && !lane.kv_less
             && !lane.kv.pages.is_empty()
             && lane.kv.translation.is_empty()
             && lane.group.is_none()
-            && lane.peer.is_none()
             && match &lane.readout {
                 Readout::Rows(read) => read.iter().all(|&row| row as usize >= rows - window),
                 Readout::Last | Readout::None => true,

@@ -68,8 +68,17 @@ pub struct PackingBindings {
     pub group_indptr: Tensor,
     pub lane_indptr: Tensor,
     pub permutation: Tensor,
-    /// One attention class per packed row (-1 where the lane states none).
-    pub attn_class: Tensor,
+}
+
+/// The custom mask a group-packed attention over packings `q` and `kv`
+/// applies (`poem_exec::fire::GroupMask`): u8 bits, an i32 byte offset a
+/// group.
+#[derive(Clone, Copy, Debug)]
+pub struct GroupMask {
+    pub q: poem_ir::Selection,
+    pub kv: poem_ir::Selection,
+    pub bits: Tensor,
+    pub indptr: Tensor,
 }
 
 /// A guest input's rectangle for this fire.
@@ -90,9 +99,9 @@ pub struct DitBindings {
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, PackingBindings)>,
     pub inputs: Vec<InputBinding>,
-    /// The fire's attention class table (`count x count` u8) and its count,
-    /// when a lane states classes.
-    pub class_table: Option<(Tensor, u32)>,
+    /// The custom masks the fire's group-packed attentions apply, when a
+    /// lane states one.
+    pub group_masks: Vec<GroupMask>,
 }
 
 #[derive(Clone, Debug)]
@@ -299,28 +308,23 @@ impl<'c> Run<'c> {
         0
     }
 
-    /// The fire's attention class table and its count, when a lane states
-    /// classes.
-    pub(crate) fn class_table(&self) -> Option<(Tensor, u32)> {
-        self.fire.dit.class_table
-    }
-
-    /// The packed attention classes of the rows `indptr` (a group-packed
-    /// `GroupIndptr` input) bounds.
-    pub(crate) fn packed_classes(&self, indptr: ValueId) -> Option<Tensor> {
-        match &self.values[indptr.0 as usize].def {
+    /// The custom mask the group-packed attention bounded by `q_indptr` and
+    /// `kv_indptr` applies, when a lane of the fire states one.
+    pub(crate) fn group_mask(&self, q_indptr: ValueId, kv_indptr: ValueId) -> Option<GroupMask> {
+        let select = |indptr: ValueId| match &self.values[indptr.0 as usize].def {
             Def::Input(RuntimeInput::Geometry {
                 kind: GeomKind::GroupIndptr { select },
                 ..
-            }) => self
-                .fire
-                .dit
-                .packings
-                .iter()
-                .find(|(have, _)| have == select)
-                .map(|(_, tables)| tables.attn_class),
+            }) => Some(*select),
             _ => None,
-        }
+        };
+        let (q, kv) = (select(q_indptr)?, select(kv_indptr)?);
+        self.fire
+            .dit
+            .group_masks
+            .iter()
+            .find(|mask| mask.q == q && mask.kv == kv)
+            .copied()
     }
 
     /// The fire's clip slot table (one i32 slot per voxel lane).

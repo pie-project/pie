@@ -17,7 +17,7 @@ use eta_compiler::plan::compile_bound;
 use eta_exec::Value;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{GeometryClass, ModelProfile, Stage};
+use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype, Literal, Predicate, RngKind, Shape};
 
 const RNG: u32 = 0;
@@ -50,6 +50,7 @@ fn sampler(vocab: u32) -> TraceContainer {
     let r = p.op(Op::ChanTake(RNG));
     let raw = p.op(Op::IntrinsicVal {
         intr: IntrinsicId::Logits,
+        lane: 0,
         shape: Shape::matrix(1, vocab),
         dtype: Dtype::F32,
     });
@@ -228,11 +229,7 @@ fn a_guest_pass_samples_on_the_fabric_as_the_interpreter_does() {
     let vocab = 64u32;
     let lanes = 3u32;
     let steps = 4usize;
-    let profile = ModelProfile {
-        vocab,
-        ..ModelProfile::dummy()
-    };
-    let bound = eta_ir::validate::bind(sampler(vocab), profile).expect("the sampler binds");
+    let bound = bind_logits(sampler(vocab), vocab).expect("the sampler binds");
     let launch = eta_compiler::codegen::launch::build(&bound, &compile_bound(&bound));
     let registration = ProgramRegistration {
         launch,
@@ -331,4 +328,29 @@ fn a_guest_pass_samples_on_the_fabric_as_the_interpreter_does() {
         agreed * 10 >= total * 9,
         "sampled tokens agree ({agreed}/{total})"
     );
+}
+
+/// Binds `container` as a pass of one lane reading `vocab`-wide logits, on a
+/// model that drafts, exports scores and serves both sinks.
+fn bind_logits(
+    container: eta_ir::container::TraceContainer,
+    vocab: u32,
+) -> Result<eta_ir::validate::BoundTrace, eta_ir::validate::ValidateError> {
+    eta_ir::validate::bind(
+        container,
+        vec![Some(eta_ir::registry::Readout {
+            kind: eta_ir::registry::ReadoutKind::Logits,
+            width: vocab,
+        })],
+        eta_ir::registry::Graph {
+            num_layers: 2,
+            mtp_logits: true,
+            mtp_depth: 1,
+            attn_score: true,
+        },
+        eta_ir::registry::EngineCaps {
+            lora: true,
+            attn_page_mask: true,
+        },
+    )
 }

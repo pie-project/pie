@@ -873,6 +873,11 @@ pub struct Prepared<'a> {
     patch_grids: Vec<i32>,
     mrope_positions: Vec<i32>,
     packings: Vec<poem_exec::fire::Packed>,
+    group_masks: Vec<(
+        poem_ir::Selection,
+        poem_ir::Selection,
+        poem_exec::fire::GroupMask,
+    )>,
     input_feeds: Vec<InputFeedPlan>,
     voxel_feeds: Vec<VoxelFeedPlan>,
     merge_lands: Vec<MergeLand>,

@@ -17,17 +17,15 @@ namespace pie::attn {
 
 // The arms, one per kernels-cuda fa2 ragged variant.
 constexpr int RAGGED_FULL = 0;
-constexpr int RAGGED_CLASSES = 1;  // keep c[q] < 0 || c[kv] < 0 || table[c[q]·count + c[kv]]
+constexpr int RAGGED_CUSTOM = 1;   // keep bit qo·kv_len + kv of group g's bits, from byte indptr[g]
 constexpr int RAGGED_BIAS = 2;     // logit · scale + bias[head][clamp(kv − qo + max_len − 1)]
 
-// The arm's operands; an arm reads only its own. `q_ids`/`kv_ids` are the
-// classes.
+// The arm's operands; an arm reads only its own. `bits` is the custom mask,
+// group g's from byte `mask_indptr[g]`.
 struct RaggedMaskArgs {
-    const i32* q_ids;
-    const i32* kv_ids;
-    const unsigned char* table;
+    const unsigned char* bits;
+    const i32* mask_indptr;
     const float* bias;
-    int count;
     int max_len;
 };
 
@@ -46,12 +44,12 @@ __device__ __forceinline__ int ragged_group(const i32* __restrict__ q_indptr, in
 }
 
 template <int ARM>
-__device__ __forceinline__ bool ragged_keeps(const RaggedMaskArgs& m, int row, int key) {
-    if constexpr (ARM == RAGGED_CLASSES) {
-        const i32 qc = m.q_ids[row];
-        const i32 kc = m.kv_ids[key];
-        return qc < 0 || kc < 0 ||
-               m.table[static_cast<unsigned>(qc) * static_cast<unsigned>(m.count) + static_cast<unsigned>(kc)] != 0;
+__device__ __forceinline__ bool ragged_keeps(const RaggedMaskArgs& m, int g, int qo, int kv, int kv_len) {
+    if constexpr (ARM == RAGGED_CUSTOM) {
+        const unsigned long long cell =
+            static_cast<unsigned long long>(qo) * static_cast<unsigned long long>(kv_len) +
+            static_cast<unsigned long long>(kv);
+        return (m.bits[m.mask_indptr[g] + static_cast<long long>(cell >> 3)] >> (cell & 7)) & 1;
     } else {
         return true;
     }
@@ -62,8 +60,8 @@ __global__ __launch_bounds__(WAVES * 64) void ragged(
     const bf16* __restrict__ q, const bf16* __restrict__ k, const bf16* __restrict__ v,
     bf16* __restrict__ o, const i32* __restrict__ q_indptr, const i32* __restrict__ kv_indptr,
     int groups, int num_q_heads, int num_kv_heads, int head_dim, float sm_scale, int rows,
-    const i32* __restrict__ q_ids, const i32* __restrict__ kv_ids,
-    const unsigned char* __restrict__ table, const float* __restrict__ bias, int count, int max_len) {
+    const unsigned char* __restrict__ bits, const i32* __restrict__ mask_indptr,
+    const float* __restrict__ bias, int max_len) {
     static_assert(D % 16 == 0, "the stamp is whole 16-wide MFMA steps");
     constexpr int BC = 32, KT = BC / 16, KS = D / 16;
     constexpr int TILE = WAVES * 16;
@@ -73,7 +71,7 @@ __global__ __launch_bounds__(WAVES * 64) void ragged(
     __shared__ bf16 ks[BC * KP];
     __shared__ bf16 vt[D * VP];
 
-    const RaggedMaskArgs mask{q_ids, kv_ids, table, bias, count, max_len};
+    const RaggedMaskArgs mask{bits, mask_indptr, bias, max_len};
     const int head = static_cast<int>(blockIdx.y);
     const int kv_head = head / (num_q_heads / num_kv_heads);
     const int first_row = static_cast<int>(blockIdx.x) * TILE;
@@ -174,7 +172,7 @@ __global__ __launch_bounds__(WAVES * 64) void ragged(
                     if constexpr (ARM == RAGGED_BIAS) {
                         const int d = min(max(kv - qo + mask.max_len - 1, 0), span - 1);
                         x = (s[kt][t] * sm_scale + bias_row[d]) * LOG2E;
-                    } else if (ragged_keeps<ARM>(mask, row, key)) {
+                    } else if (ragged_keeps<ARM>(mask, g, qo, kv, seg_hi - seg_lo)) {
                         x = s[kt][t] * scale_log2;
                     }
                 }

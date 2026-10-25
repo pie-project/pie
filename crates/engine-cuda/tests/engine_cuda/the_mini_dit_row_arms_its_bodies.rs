@@ -47,5 +47,9 @@ fn every_armed_body_answers_its_eager_walk() {
             frames_in_flight: 2,
         })
         .expect("the row loads: every armed body agrees with its eager walk");
-    assert!(loaded.caps.profile.has_velocity);
+    assert!(loaded.caps.classes.classes.iter().any(|class| {
+        class
+            .readout
+            .is_some_and(|r| r.kind == poem_ir::ReadoutKind::Velocity)
+    }));
 }

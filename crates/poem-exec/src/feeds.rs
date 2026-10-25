@@ -49,6 +49,9 @@ pub struct Feeds {
     /// Each guest input the plan reads, and the classes reading it.
     pub inputs: Vec<(Seat, ClassSet)>,
     pub selections: Vec<Selection>,
+    /// The (query, key) packings each group-packed `attention.ragged` reads:
+    /// the pairs a stated attention mask is staged for.
+    pub ragged: Vec<(Selection, Selection)>,
     pub merged: Vec<MergedInput>,
     /// Merges over a runtime input no fire can land.
     pub unlanded: Vec<ValueId>,
@@ -117,6 +120,25 @@ impl Feeds {
                     seat,
                     select,
                 });
+            }
+        }
+        let packing = |id: ValueId| match trace.values.get(id.0 as usize).map(|decl| &decl.def) {
+            Some(Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::GroupIndptr { select },
+                ..
+            })) => Some(*select),
+            _ => None,
+        };
+        for node in &trace.nodes {
+            if let poem_ir::Operation::Attn(poem_ir::Attn::Ragged {
+                q_indptr,
+                kv_indptr,
+                ..
+            }) = &node.op
+                && let (Some(q), Some(kv)) = (packing(*q_indptr), packing(*kv_indptr))
+                && !feeds.ragged.contains(&(q, kv))
+            {
+                feeds.ragged.push((q, kv));
             }
         }
         feeds
@@ -258,6 +280,22 @@ pub fn lane_classes(trace: &Trace, compiled: &CompiledModel) -> LaneClasses {
         })
     })
     .collect();
+    let patches: Vec<([u32; 3], ClassSet)> = trace
+        .values
+        .iter()
+        .filter_map(|decl| match decl.def {
+            Def::Input(RuntimeInput::TokenGrid { p }) => Some(p),
+            _ => None,
+        })
+        .map(|p| {
+            let readers = classes_reading(
+                trace,
+                compiled,
+                |def| matches!(def, Def::Input(RuntimeInput::TokenGrid { p: read }) if *read == p),
+            );
+            (p, readers)
+        })
+        .collect();
     let table = &compiled.classes;
     LaneClasses {
         mask: table.mask,
@@ -274,6 +312,10 @@ pub fn lane_classes(trace: &Trace, compiled: &CompiledModel) -> LaneClasses {
                     .iter()
                     .find(|(_, _, classes)| classes.contains(class))
                     .map(|(_, readout, _)| *readout),
+                patch: patches
+                    .iter()
+                    .find(|(_, readers)| readers.contains(class))
+                    .map(|(p, _)| *p),
             })
             .collect(),
     }

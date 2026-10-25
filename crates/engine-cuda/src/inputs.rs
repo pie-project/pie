@@ -179,14 +179,10 @@ pub struct Handles {
     /// staged when a lane of the fire captures.
     pub score_seats: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
-    pub class_table: Option<(Tensor, u32)>,
     pub lane_of_row: Tensor,
 }
 
 const AXES: u64 = 3;
-
-const CLASS_TABLE_BYTES: u64 =
-    (engine::fire::ATTN_CLASSES_MAX as u64) * (engine::fire::ATTN_CLASSES_MAX as u64);
 
 #[derive(Debug, Clone, Copy)]
 pub struct PatchSeat {
@@ -228,7 +224,6 @@ struct SeatAt {
 pub struct PackingFire<'a> {
     pub group_indptr: &'a [i32],
     pub lane_indptr: &'a [i32],
-    pub attn_class: &'a [i32],
     pub permutation: &'a [i32],
 }
 
@@ -236,7 +231,6 @@ pub struct PackingFire<'a> {
 pub struct PackingHandles {
     pub group_indptr: Tensor,
     pub lane_indptr: Tensor,
-    pub attn_class: Tensor,
     pub permutation: Tensor,
 }
 
@@ -244,7 +238,6 @@ pub struct PackingHandles {
 struct PackingAt {
     group_indptr: u64,
     lane_indptr: u64,
-    attn_class: u64,
     permutation: u64,
 }
 
@@ -278,7 +271,6 @@ pub struct Fire<'a> {
     /// Empty when no lane of the fire captures scores.
     pub score_seats: &'a [i32],
     pub packings: &'a [PackingFire<'a>],
-    pub class_table: Option<(&'a [u8], u32)>,
 }
 
 #[derive(Debug)]
@@ -365,7 +357,6 @@ pub struct Staged {
     space_lanes: u32,
     packed: bool,
     scored: bool,
-    class_count: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -467,7 +458,6 @@ pub struct Inputs {
     mask_bits: u64,
     mask_bytes: u64,
     mask_indptr: u64,
-    class_table: u64,
     patch: Option<PatchAt>,
     mrope: Option<u64>,
     mrope_bytes: u64,
@@ -482,6 +472,21 @@ pub struct Inputs {
     plans: Vec<Option<Workspace>>,
     plan_values: usize,
     inject_runs: Option<Buffer>,
+    /// The custom masks the fire's group-packed attentions read, staged
+    /// apart from the slab: their size is the groups', not the load's.
+    group_masks: Option<Buffer>,
+    /// Smaller ones it outgrew, kept: an earlier fire may still read them.
+    outgrown: Vec<Buffer>,
+}
+
+/// One ragged attention's custom mask on the device: over packings `q` and
+/// `kv`, the bits and each group's first byte.
+#[derive(Debug, Clone, Copy)]
+pub struct GroupMaskHandles {
+    pub q: poem_ir::Selection,
+    pub kv: poem_ir::Selection,
+    pub bits: Tensor,
+    pub indptr: Tensor,
 }
 
 impl Inputs {
@@ -539,7 +544,6 @@ impl Inputs {
         };
         let mask_bits = take(mask_bytes);
         let mask_indptr = take((lanes + 1) * 4);
-        let class_table = take(CLASS_TABLE_BYTES);
         let spaces: Vec<SpaceAt> = (0..spaces)
             .map(|_| SpaceAt {
                 indptr: take((lanes + 1) * 4),
@@ -557,7 +561,6 @@ impl Inputs {
             .map(|_| PackingAt {
                 group_indptr: take((lanes + 1) * 4),
                 lane_indptr: take((lanes + 1) * 4),
-                attn_class: take(rows * 4),
                 permutation: take(rows * 4),
             })
             .collect();
@@ -644,7 +647,6 @@ impl Inputs {
             mask_bits,
             mask_bytes,
             mask_indptr,
-            class_table,
             patch,
             mrope,
             mrope_bytes: if mrope.is_some() { rows * AXES * 4 } else { 0 },
@@ -657,6 +659,8 @@ impl Inputs {
             max_lanes: crate::window::lane_capacity(budget.max_lanes),
             max_rows: budget.max_tokens,
             inject_runs: None,
+            group_masks: None,
+            outgrown: Vec::new(),
             plan_values: grants.len(),
             plans: (0..runs as usize)
                 .flat_map(|run| {
@@ -901,20 +905,6 @@ impl Inputs {
                 Some(u32::try_from(staged.bits.len()).unwrap_or(u32::MAX))
             }
         };
-        let class_count = match fire.class_table {
-            None => None,
-            Some((table, count)) => {
-                if table.len() as u64 > CLASS_TABLE_BYTES {
-                    return Err(crate::error::Fault::Ceiling {
-                        what: "attention class table bytes",
-                        need: table.len() as u64,
-                        have: CLASS_TABLE_BYTES,
-                    });
-                }
-                put(self.class_table, table, "staged attention class table")?;
-                Some(count)
-            }
-        };
 
         let scored = !fire.score_seats.is_empty();
         if scored {
@@ -955,18 +945,11 @@ impl Inputs {
                     lane_table.resize(space_lanes as usize + 1, last);
                     put(offset, bytes_of(&lane_table), what)?;
                 }
-                for (offset, table, what) in [
-                    (
-                        at.attn_class,
-                        packing.attn_class,
-                        "staged attention classes",
-                    ),
-                    (
-                        at.permutation,
-                        packing.permutation,
-                        "staged row permutation",
-                    ),
-                ] {
+                for (offset, table, what) in [(
+                    at.permutation,
+                    packing.permutation,
+                    "staged row permutation",
+                )] {
                     row_table.clear();
                     row_table.extend_from_slice(table);
                     row_table.resize(rows as usize, -1);
@@ -1015,7 +998,6 @@ impl Inputs {
             space_lanes,
             packed,
             scored,
-            class_count,
         })
     }
 
@@ -1161,7 +1143,6 @@ impl Inputs {
             space_lanes,
             packed,
             scored,
-            class_count,
         } = staged;
         let readouts = *readouts;
         let (rows, lanes) = (*rows, *lanes);
@@ -1174,8 +1155,6 @@ impl Inputs {
         let (at_row_valid, at_slot_ids) = (self.row_valid, self.slot_ids);
         let (at_routes, at_mask, at_mask_indptr) =
             (self.adapter_routes, self.mask_bits, self.mask_indptr);
-        let at_class_table = self.class_table;
-        let class_count = *class_count;
         let at_readouts = self.readout_rows;
         let at_readout_live = self.readout_live;
         let places: Vec<SpaceAt> = self.spaces.clone();
@@ -1220,9 +1199,6 @@ impl Inputs {
             copy(at_mask, *bytes as usize)?;
             copy(at_mask_indptr, (lanes as usize + 1) * 4)?;
         }
-        if let Some(count) = class_count {
-            copy(at_class_table, (count as usize) * (count as usize))?;
-        }
         if scored {
             copy(at_score_seats, space_lanes as usize * 4)?;
         }
@@ -1232,12 +1208,10 @@ impl Inputs {
             for at in &packing_places {
                 copy(at.group_indptr, (space_lanes as usize + 1) * 4)?;
                 copy(at.lane_indptr, (space_lanes as usize + 1) * 4)?;
-                copy(at.attn_class, rows as usize * 4)?;
                 copy(at.permutation, rows as usize * 4)?;
                 packings.push(PackingHandles {
                     group_indptr: i32s(base + at.group_indptr, space_lanes + 1),
                     lane_indptr: i32s(base + at.lane_indptr, space_lanes + 1),
-                    attn_class: i32s(base + at.attn_class, rows),
                     permutation: i32s(base + at.permutation, rows),
                 });
             }
@@ -1282,14 +1256,69 @@ impl Inputs {
             group_of_lane: packed.then(|| i32s(base + at_group_of_lane, space_lanes)),
             score_seats: scored.then(|| i32s(base + at_score_seats, space_lanes)),
             packings,
-            class_table: class_count.map(|count| {
-                (
-                    Tensor::new(base + at_class_table, count * count, 1, Dtype::U8),
-                    count,
-                )
-            }),
             lane_of_row: i32s(base + at_lane_of_row, rows),
         })
+    }
+
+    /// Stages each ragged attention's custom mask on `stream`, in one buffer
+    /// grown to hold them.
+    pub fn stage_group_masks(
+        &mut self,
+        stream: *mut core::ffi::c_void,
+        masks: &[(
+            poem_ir::Selection,
+            poem_ir::Selection,
+            poem_exec::fire::GroupMask,
+        )],
+    ) -> Result<Vec<GroupMaskHandles>> {
+        if masks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut image: Vec<u8> = Vec::new();
+        let mut placed = Vec::with_capacity(masks.len());
+        for (_, _, mask) in masks {
+            let indptr = image.len();
+            image.extend_from_slice(bytes_of(&mask.indptr));
+            image.resize(image.len().next_multiple_of(ALIGN as usize), 0);
+            let bits = image.len();
+            image.extend_from_slice(&mask.bits);
+            image.resize(image.len().next_multiple_of(ALIGN as usize), 0);
+            placed.push((indptr, bits));
+        }
+        if self
+            .group_masks
+            .as_ref()
+            .is_none_or(|held| held.bytes() < image.len())
+        {
+            let grown = Buffer::zeroed(image.len().next_power_of_two())?;
+            if let Some(old) = self.group_masks.replace(grown) {
+                self.outgrown.push(old);
+            }
+        }
+        let buffer = self
+            .group_masks
+            .as_mut()
+            .expect("the group mask buffer was just sized");
+        buffer.stage(stream, 0, &image)?;
+        let base = buffer.ptr();
+        Ok(masks
+            .iter()
+            .zip(placed)
+            .map(|((q, kv, mask), (indptr, bits))| GroupMaskHandles {
+                q: *q,
+                kv: *kv,
+                bits: Tensor::new(
+                    base + bits as u64,
+                    u32::try_from(mask.bits.len().max(1)).unwrap_or(u32::MAX),
+                    1,
+                    Dtype::U8,
+                ),
+                indptr: i32s(
+                    base + indptr as u64,
+                    u32::try_from(mask.indptr.len()).unwrap_or(u32::MAX),
+                ),
+            })
+            .collect())
     }
 
     #[must_use]

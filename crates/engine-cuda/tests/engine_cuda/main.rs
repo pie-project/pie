@@ -18,6 +18,7 @@ static STRICT_KERNELS: extern "C" fn() = {
     on
 };
 
+mod bound;
 #[cfg(feature = "device")]
 mod common_dit;
 #[cfg(feature = "device")]

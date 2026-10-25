@@ -8,7 +8,7 @@ use eta_exec::{
 };
 use eta_ir::Dtype;
 use eta_ir::container::HostRole;
-use eta_ir::op::{IntrinsicId, tags};
+use eta_ir::op::tags;
 use eta_ir::types::{MAX_RANK, name_or_unknown};
 
 use std::sync::Arc;
@@ -41,7 +41,7 @@ pub fn lane_sampler(kind: RegionKind) -> bool {
     )
 }
 
-pub const INTRINSIC_SLOTS: usize = IntrinsicId::SLOTS as usize;
+pub const INTRINSIC_SLOTS: usize = eta_ir::op::INTRINSIC_PITCH as usize;
 
 pub const INTRINSIC_STORAGE_F32: u32 = 0;
 
@@ -1232,14 +1232,14 @@ impl Prepared {
     pub fn bind_intrinsic(
         &mut self,
         lane: u32,
-        intrinsic: IntrinsicId,
+        slot: u32,
         base: u64,
         storage: u32,
         width: u32,
         row_stride: u32,
         row_offset: u32,
     ) -> Result<()> {
-        let slot = intrinsic as usize;
+        let slot = slot as usize;
         if slot >= INTRINSIC_SLOTS {
             return Err(Fault::program(
                 "program::launch",

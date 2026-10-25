@@ -3,9 +3,8 @@ use eta_compiler::plan::compile_bound;
 use eta_exec::{Extents, describe, layout};
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::Op;
-use eta_ir::registry::{ModelProfile, Stage};
+use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype, Shape};
-use eta_ir::validate::bind;
 
 use engine_cuda::program::{describe_values, scratch_bytes};
 
@@ -53,7 +52,7 @@ fn lora_prologue(layers: u32, rank: u32, hidden: u32, also_read: bool) -> TraceC
 }
 
 fn package(container: TraceContainer) -> LaunchPackage {
-    let bound = bind(container, ModelProfile::dummy()).expect("the lora prologue binds");
+    let bound = crate::bound::logits(container, 32).expect("the lora prologue binds");
     let stages = compile_bound(&bound);
     eta_compiler::codegen::launch::build(&bound, &stages)
 }
