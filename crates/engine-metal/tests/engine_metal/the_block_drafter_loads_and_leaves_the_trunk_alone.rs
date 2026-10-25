@@ -301,7 +301,7 @@ fn a_draft_block_fires_and_the_drafter_answers_it() {
     let masking = all_visible(extent);
     let mut seat = Seated::of(Lane {
         slot: 0,
-        word: facts_of(DEPLOYMENT).word(&Request::new(block as u32, true).drafting_a_block(true)),
+        word: facts_of(DEPLOYMENT).word(&Request::new(block as u32, true).switched("block_draft", "on")),
         tokens: &tokens,
     });
     seat.mask = Some(&masking);
