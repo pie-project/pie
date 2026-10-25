@@ -1158,11 +1158,8 @@ pub fn moe_mega() -> Rule {
             let summed = linear::moe_weighted_sum(&routed, &weights);
             if gated {
                 p.name("summed", &summed);
-                let y = linear::moe_sigmoid_gate_add(
-                    &summed,
-                    &p.rows("shared", W),
-                    &p.rows("gate", W),
-                );
+                let y =
+                    linear::moe_sigmoid_gate_add(&summed, &p.rows("shared", W), &p.rows("gate", W));
                 p.export("y", &y);
             } else {
                 p.export("y", &summed);
@@ -1429,13 +1426,9 @@ pub fn moe_select_glu() -> Rule {
                 let top_k = p.u32("top_k");
                 let packed = match select {
                     0 => linear::select::plain(&x, &bank, &routes, top_k),
-                    1 => linear::select::biased(
-                        &x,
-                        &bank,
-                        &p.weight("bias", [W, W]),
-                        &routes,
-                        top_k,
-                    ),
+                    1 => {
+                        linear::select::biased(&x, &bank, &p.weight("bias", [W, W]), &routes, top_k)
+                    }
                     _ => linear::select::quantized(&x, &bank, &routes, top_k),
                 };
                 p.name("packed", &packed);

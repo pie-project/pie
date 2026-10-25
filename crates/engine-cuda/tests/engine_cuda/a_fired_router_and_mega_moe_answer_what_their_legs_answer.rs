@@ -457,8 +457,7 @@ fn check(name: &str, mega_takes: bool, device: &str) {
             }
             match &retuned {
                 Some(retuned) if takes => {
-                    let (reach, reach_rms) =
-                        (worst(retuned, apart), relative_rms(retuned, apart));
+                    let (reach, reach_rms) = (worst(retuned, apart), relative_rms(retuned, apart));
                     eprintln!(
                         "{what}: the defaults' apart row is {reach} away, RMS {reach_rms:.4}"
                     );

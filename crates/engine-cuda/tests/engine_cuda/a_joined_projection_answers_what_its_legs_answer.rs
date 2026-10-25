@@ -119,7 +119,10 @@ fn write_checkpoint(path: &Path, trace: &Trace, joins: &[Join], unjoined: &Trace
                     .flat_map(|v| f32::from_bits(u32::from(*v) << 16).to_le_bytes())
                     .collect(),
             ),
-            other => panic!("`{}` is {other:?}, which this fixture does not write", param.name),
+            other => panic!(
+                "`{}` is {other:?}, which this fixture does not write",
+                param.name
+            ),
         };
         writer
             .add(param.name.as_str(), param.shape.clone(), leaf, &bytes)
@@ -229,24 +232,22 @@ fn a_joined_projection_answers_what_its_legs_answer() {
     let failed: Vec<String> = ROWS
         .iter()
         .filter_map(|name| {
-            std::panic::catch_unwind(|| check(name))
-                .err()
-                .map(|why| {
-                    let why = why
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| why.downcast_ref::<&str>().map(|s| s.to_string()))
-                        .unwrap_or_default();
-                    format!("{name}: {why}")
-                })
+            std::panic::catch_unwind(|| check(name)).err().map(|why| {
+                let why = why
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| why.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                format!("{name}: {why}")
+            })
         })
         .collect();
     assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
 fn check(name: &str) {
-    let row = poem_compiler::catalog::deployment(name)
-        .unwrap_or_else(|| panic!("`{name}` is listed"));
+    let row =
+        poem_compiler::catalog::deployment(name).unwrap_or_else(|| panic!("`{name}` is listed"));
     let mut unjoined = row
         .package
         .trace(&row.model.id, &row.deploy, &row.name, Platform::Cuda)
@@ -265,17 +266,29 @@ fn check(name: &str) {
     let prompt: Vec<u32> = (0..41).map(|t| (t * 7 + 11) % vocab.min(4096)).collect();
     let tag = name.replace('.', "_");
     let apart = logits(&unjoined, &[], &unjoined, &format!("{tag}-apart"), &prompt);
-    let together = logits(&joined, &joins, &unjoined, &format!("{tag}-joined"), &prompt);
+    let together = logits(
+        &joined,
+        &joins,
+        &unjoined,
+        &format!("{tag}-joined"),
+        &prompt,
+    );
     assert_eq!(apart.len(), together.len());
     let spread = apart.iter().copied().fold(f32::NEG_INFINITY, f32::max)
         - apart.iter().copied().fold(f32::INFINITY, f32::min);
-    assert!(spread > 1e-3, "{name}: the logits are a rectangle nothing wrote");
+    assert!(
+        spread > 1e-3,
+        "{name}: the logits are a rectangle nothing wrote"
+    );
     let worst = apart
         .iter()
         .zip(&together)
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
-    eprintln!("{name}: {} joins, worst gap {worst} over a spread of {spread}", joins.len());
+    eprintln!(
+        "{name}: {} joins, worst gap {worst} over a spread of {spread}",
+        joins.len()
+    );
     assert!(
         worst <= 0.015 * spread,
         "{name}: worst gap {worst} over a spread of {spread}"
@@ -285,5 +298,9 @@ fn check(name: &str) {
             .max_by(|&a, &b| l[a].total_cmp(&l[b]))
             .expect("a vocabulary")
     };
-    assert_eq!(top(&apart), top(&together), "{name}: the joined model picks the same token");
+    assert_eq!(
+        top(&apart),
+        top(&together),
+        "{name}: the joined model picks the same token"
+    );
 }

@@ -217,6 +217,9 @@ fn a_conv_weight_declared_natural_is_laid_taps_major() {
         .expect("the trace interns the conv weight");
     assert_eq!(
         conv.layout,
-        poem_ir::ParamLayout::ConvTapsMajor { c_in: C_IN, taps: 27 }
+        poem_ir::ParamLayout::ConvTapsMajor {
+            c_in: C_IN,
+            taps: 27
+        }
     );
 }

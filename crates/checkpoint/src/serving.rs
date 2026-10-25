@@ -715,6 +715,9 @@ mod deployment_words {
             without_kv("qwen3-0.6b-bf16-kv-bf16-tp2")
         );
         assert_ne!(without_kv("qwen3-0.6b-bf16-kv-bf16-tp2"), base);
-        assert_eq!(without_kv("qwen3-30b-a3b-bf16-kv-bf16-ep4"), without_kv("qwen3-30b-a3b-bf16-kv-bf16"));
+        assert_eq!(
+            without_kv("qwen3-30b-a3b-bf16-kv-bf16-ep4"),
+            without_kv("qwen3-30b-a3b-bf16-kv-bf16")
+        );
     }
 }

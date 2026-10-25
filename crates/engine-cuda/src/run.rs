@@ -573,7 +573,6 @@ pub struct Run<'c> {
 
     decoded: &'c [u64],
 
-
     copy: CopyPlan,
 
     ceilings: Ceilings<'c>,

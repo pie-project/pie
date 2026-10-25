@@ -465,13 +465,7 @@ pub mod select {
         y
     }
 
-    pub fn biased(
-        x: &Value,
-        bank: &Weight,
-        bias: &Weight,
-        routes: &Value,
-        top_k: u32,
-    ) -> Value {
+    pub fn biased(x: &Value, bank: &Weight, bias: &Weight, routes: &Value, top_k: u32) -> Value {
         unquantized(bank, "a biased select");
         let r = x.rec();
         let y = r.fresh(tensor(Dim::TokensTimes(top_k), bank.dim(1), x.dtype()));
