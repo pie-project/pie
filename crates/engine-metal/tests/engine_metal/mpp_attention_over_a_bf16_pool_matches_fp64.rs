@@ -98,6 +98,7 @@ fn mpp_attention_over_a_bf16_pool_matches_fp64() {
             let eb = upload(&vec![mode; m]);
             let plan = PrefillPlan {
                 positions: tensor(&po, m, 1, Dtype::I32),
+                last_page_len: tensor(&po, m, 1, Dtype::I32),
                 request_of_token: tensor(&ow, m, 1, Dtype::I32),
                 mask: tensor(&mb, mask.len(), 1, Dtype::U8),
                 mask_enabled: tensor(&eb, m, 1, Dtype::U8),

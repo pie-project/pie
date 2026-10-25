@@ -39,7 +39,7 @@ pub struct DeviceBoot {
 struct PendingStep {
     readout: Vec<Readout>,
     landed: Landed,
-    rows: Option<Vec<Vec<f32>>>,
+    rows: Option<Vec<(String, Vec<f32>)>>,
 }
 
 pub struct Metal {
@@ -721,13 +721,9 @@ impl Engine for Metal {
         if let Some(error) = refused {
             return Err(error);
         }
-        let name = self
-            .shell
-            .as_ref()
-            .map_or_else(String::new, |shell| shell.readout_name().to_string());
         let (_, pending) = self.pending.as_ref().expect("just put back");
         for (receipt, step) in ticket.steps.iter_mut().zip(pending) {
-            receipt.readouts = readouts_of(step, &name);
+            receipt.readouts = readouts_of(step);
         }
         Ok(())
     }
@@ -1101,19 +1097,19 @@ impl Metal {
     }
 }
 
-fn readouts_of(step: &PendingStep, output: &str) -> Vec<LaneReadout> {
-    let rows: &[Vec<f32>] = step.rows.as_deref().unwrap_or(&[]);
+fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
+    let rows: &[(String, Vec<f32>)] = step.rows.as_deref().unwrap_or(&[]);
     step.readout
         .iter()
         .enumerate()
         .map(|(lane, policy)| match policy {
             Readout::None | Readout::Rows(_) => LaneReadout::default(),
             Readout::Last => {
-                let values = rows.get(lane).cloned().unwrap_or_default();
+                let (output, values) = rows.get(lane).cloned().unwrap_or_default();
                 LaneReadout {
                     rows: 1,
                     width: u32::try_from(values.len()).unwrap_or(u32::MAX),
-                    output: output.to_string(),
+                    output,
                     values,
                     ..LaneReadout::default()
                 }

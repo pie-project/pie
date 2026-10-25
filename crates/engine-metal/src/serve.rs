@@ -58,6 +58,11 @@ pub struct Boot<'a> {
 
 const PATCH_ROUTE_DROP: i32 = -1;
 
+/// Whether a lane can be read back on the host through `out`.
+fn read_back(out: &poem_exec::feeds::ClassOutput) -> bool {
+    out.decl.axis != poem_ir::InputAxis::Lane && matches!(out.decl.dtype, Dtype::Bf16 | Dtype::F32)
+}
+
 fn declared_width(trace: &Trace, want: RuntimeInput) -> u64 {
     trace
         .values
@@ -254,10 +259,8 @@ pub struct Shell {
     scratch: Scratch,
     inputs: Vec<Inputs>,
     readout: Vec<Buffer>,
-    out_width: u32,
-    readout_bytes: u64,
-    readout_name: String,
-    readout_value: ValueId,
+    /// The widest row a lane reads back, in bytes.
+    readout_row_bytes: u64,
     outputs: Vec<poem_exec::feeds::ClassOutput>,
     /// Each voxel output's walk from the port grid to its own.
     grid_chains: Vec<Option<Vec<poem_ir::GridRule>>>,
@@ -265,7 +268,7 @@ pub struct Shell {
     airborne: Airborne,
     inflight: VecDeque<Flight>,
     grafted: Option<Pending>,
-    landed: BTreeMap<u64, Vec<Vec<f32>>>,
+    landed: BTreeMap<u64, Vec<(String, Vec<f32>)>>,
     host_rows: bool,
     rows_wanted: bool,
     nan_flags: Option<Buffer>,
@@ -842,52 +845,26 @@ impl PreparedLoad<'_> {
             .iter()
             .map(|out| out.grid.and_then(&grid_chain))
             .collect();
-        let read_back = |out: &&poem_exec::feeds::ClassOutput| {
-            out.grid.is_none()
-                && out.decl.axis != poem_ir::InputAxis::Lane
-                && matches!(out.decl.dtype, Dtype::Bf16 | Dtype::F32)
-        };
-        let (readout_value, readout_name) = outputs
+        if outputs.is_empty() {
+            return Err(Fault::Unbound {
+                what: "no output, so a fire would compute nothing a reader can take".to_string(),
+            });
+        }
+        let readout_row_bytes = outputs
             .iter()
-            .filter(read_back)
-            .find(|out| out.decl.readout)
-            .or_else(|| outputs.iter().rfind(read_back))
-            .map(|out| (out.values[0], out.decl.name.clone()))
-            .ok_or_else(|| Fault::Unbound {
-                what: "no float row or voxel output, so a fire would compute nothing a reader \
-                       can take"
-                    .to_string(),
-            })?;
-
-        let (out_width, readout_bytes) = {
-            let carved = arena.slots(&handles, &compiled.arena, FireRows::ceilings(&budgets))?;
-            let logits = carved.0[readout_value.0 as usize].ok_or_else(|| Fault::Unbound {
-                what: format!(
-                    "value {}, output `{readout_name}`, which the carve gave no rectangle",
-                    readout_value.0
-                ),
-            })?;
-            let readout_bytes: u64 = match logits.dtype {
-                Dtype::Bf16 => 2,
-                Dtype::F32 => 4,
-                other => {
-                    return Err(Fault::Unbound {
-                        what: format!(
-                            "output `{readout_name}` landed as {other:?}, which this shell \
-                             cannot read back"
-                        ),
-                    });
-                }
-            };
-            handles.rewind();
-            (logits.width, readout_bytes)
-        };
+            .filter(|out| read_back(out) && out.grid.is_none())
+            .map(|out| {
+                u64::from(out.decl.width)
+                    * poem_compiler::arena::elem_bytes(out.decl.dtype).unwrap_or(0)
+            })
+            .max()
+            .unwrap_or(0);
 
         let readout = (0..arms)
             .map(|_| {
                 Buffer::zeroed(
                     &device,
-                    u64::from(boot.budget.max_lanes) * u64::from(out_width) * readout_bytes,
+                    (u64::from(boot.budget.max_lanes) * readout_row_bytes).max(1),
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -921,10 +898,7 @@ impl PreparedLoad<'_> {
             scratch,
             inputs,
             readout,
-            out_width,
-            readout_bytes,
-            readout_name,
-            readout_value,
+            readout_row_bytes,
             outputs,
             grid_chains,
             arms: Arms::of(arms),
@@ -1196,10 +1170,6 @@ impl Shell {
         self.pipelines.compiled()
     }
 
-    pub fn out_width(&self) -> Result<u64> {
-        Ok(u64::from(self.out_width))
-    }
-
     /// Where `value`'s rectangle lies in the arena: its offset, width and dtype.
     fn plane_row(&self, prepared: &Prepared<'_>, value: ValueId) -> Result<(u64, u32, Dtype)> {
         let rect = prepared.slots.0[value.0 as usize].ok_or_else(|| Fault::Unbound {
@@ -1228,9 +1198,43 @@ impl Shell {
         Ok((row.offset(), rect.width, rect.dtype))
     }
 
-    #[must_use]
-    pub fn readout_name(&self) -> &str {
-        &self.readout_name
+    /// What a lane of `class` is read back through on the host: the last
+    /// float row or voxel output its class writes.
+    fn readback(&self, class: usize) -> Option<&poem_exec::feeds::ClassOutput> {
+        self.outputs
+            .iter()
+            .rfind(|out| out.classes.contains(class) && read_back(out))
+    }
+
+    /// The row a lane is read back at, in the arena, with its output's name,
+    /// width and element bytes; `None` for a lane read back through a grid.
+    fn readback_row(
+        &self,
+        p: &Prepared<'_>,
+        row: &poem_exec::fire::LaneRow,
+    ) -> Result<Option<(String, u64, u32, u64)>> {
+        let Some(out) = self.readback(row.class as usize) else {
+            return Ok(None);
+        };
+        if out.grid.is_some() {
+            return Ok(None);
+        }
+        let (offset, width, dtype) = self.plane_row(p, out.values[0])?;
+        let element = poem_compiler::arena::elem_bytes(dtype).unwrap_or(0);
+        let at = if self.gathers_readout {
+            p.readout_first
+                .get(row.source as usize)
+                .copied()
+                .unwrap_or(0)
+        } else {
+            row.row_offset + row.rows - 1
+        };
+        Ok(Some((
+            out.decl.name.clone(),
+            offset + u64::from(at) * u64::from(width) * element,
+            width,
+            element,
+        )))
     }
 
     #[must_use]
@@ -1554,7 +1558,11 @@ impl Shell {
         let answer = (|| {
             let enqueued = FrameShell::enqueue(self, prepared)?;
             let landed = FrameShell::settle(self, enqueued)?;
-            self.rows_of(&landed)
+            Ok(self
+                .rows_of(&landed)?
+                .into_iter()
+                .map(|(_, row)| row)
+                .collect())
         })();
         self.rows_wanted = asked;
         answer
@@ -1592,7 +1600,8 @@ impl Shell {
         self.pools.read_slot(slot)
     }
 
-    pub fn rows_of(&mut self, landed: &Landed) -> Result<Vec<Vec<f32>>> {
+    /// Each lane's read-back row, by its output's name.
+    pub fn rows_of(&mut self, landed: &Landed) -> Result<Vec<(String, Vec<f32>)>> {
         self.harvest_through(landed.seq)?;
         self.landed
             .remove(&landed.seq)
@@ -1709,18 +1718,15 @@ impl Shell {
                 }
             }
         }
-        let rows: Vec<Vec<f32>> = if self.host_rows || self.rows_wanted {
-            let width = self.out_width as usize;
-            let stride = self.readout_bytes as usize;
-            let mut raw = vec![0u8; flight.lanes * width * stride];
-            self.readout[flight.arm].read(0, &mut raw)?;
-            raw.chunks_exact(width.max(1) * stride)
-                .take(flight.lanes)
-                .map(|row| widen(row, stride))
-                .collect()
-        } else {
-            vec![Vec::new(); flight.lanes]
-        };
+        let mut rows = vec![(String::new(), Vec::new()); flight.lanes];
+        for (lane, read) in flight.readbacks.iter().enumerate() {
+            let Some((name, width, element)) = read else {
+                continue;
+            };
+            let mut raw = vec![0u8; *width as usize * *element as usize];
+            self.readout[flight.arm].read(lane as u64 * self.readout_row_bytes, &mut raw)?;
+            rows[lane] = (name.clone(), widen(&raw, *element as usize));
+        }
         fire_trace(|| format!("readout-done seq={} rows={}", flight.seq, flight.lanes));
         self.arms.give(flight.arm);
         self.landed.insert(flight.seq, rows);
@@ -3740,32 +3746,14 @@ impl Shell {
             Mode::Encode => unreachable!("checked above"),
         }
 
-        let logits = p.slots.0[self.readout_value.0 as usize].ok_or_else(|| Fault::Unbound {
-            what: format!(
-                "value {}, output `{}`, which the carve gave no rectangle",
-                self.readout_value.0, self.readout_name
-            ),
-        })?;
-        let width = logits.width as usize;
-        let stride = self.readout_bytes as usize;
         let mut taken = vec![Vec::new(); lanes.len()];
-        let mut raw = vec![0u8; width * stride];
         for row in p.composition.lanes() {
-            let at = if self.gathers_readout {
-                p.readout_first
-                    .get(row.source as usize)
-                    .copied()
-                    .unwrap_or(0)
-            } else {
-                row.row_offset + row.rows - 1
+            let Some((_, offset, width, element)) = self.readback_row(&p, row)? else {
+                continue;
             };
-            self.arena.read_view(
-                &self.handles,
-                logits.buf,
-                u64::from(at) * width as u64 * self.readout_bytes,
-                &mut raw,
-            )?;
-            taken[row.source as usize] = widen(&raw, stride);
+            let mut raw = vec![0u8; width as usize * element as usize];
+            self.arena.read(offset, &mut raw)?;
+            taken[row.source as usize] = widen(&raw, element as usize);
         }
 
         self.advance(&p);
@@ -3876,6 +3864,8 @@ pub struct Enqueued<'a> {
     lanes: usize,
     launches: u32,
     attached: Vec<engine::InstanceId>,
+    /// Each lane's read-back row: its output's name, width and element bytes.
+    readbacks: Vec<Option<(String, u32, u64)>>,
     step: PhantomData<&'a ()>,
 }
 
@@ -3917,6 +3907,7 @@ struct Flight {
     lanes: usize,
     pending: Pending,
     attached: Vec<engine::InstanceId>,
+    readbacks: Vec<Option<(String, u32, u64)>>,
 }
 
 impl engine::frame::Shell for Shell {
@@ -4004,50 +3995,22 @@ impl engine::frame::Shell for Shell {
         }
         let mut frame = walked.frame.expect("the encoding mode opened a frame");
 
-        let logits =
-            prepared.slots.0[self.readout_value.0 as usize].ok_or_else(|| Fault::Unbound {
-                what: format!(
-                    "value {}, output `{}`, which the carve gave no rectangle",
-                    self.readout_value.0, self.readout_name
-                ),
-            })?;
-        if logits.width != self.out_width {
-            return Err(Fault::Ceiling {
-                what: "elements in one readout row",
-                need: u64::from(logits.width),
-                have: u64::from(self.out_width),
-            });
-        }
-        let width = u64::from(logits.width);
-        let (source, base) = {
-            let row = self.handles.get(logits.buf).ok_or_else(|| Fault::Unbound {
-                what: format!(
-                    "handle {}, output `{}`'s, which this load minted no row for",
-                    logits.buf, self.readout_name
-                ),
-            })?;
-            (row.slab().clone(), row.offset())
-        };
+        let mut readbacks = vec![None; prepared.lanes.len()];
         if self.host_rows || self.rows_wanted {
             let seat = self.readout[prepared.arm].slab().clone();
-            let stride = width * self.readout_bytes;
             for row in prepared.composition.lanes() {
-                let at = if self.gathers_readout {
-                    prepared
-                        .readout_first
-                        .get(row.source as usize)
-                        .copied()
-                        .unwrap_or(0)
-                } else {
-                    row.row_offset + row.rows - 1
+                let Some((name, offset, width, element)) = self.readback_row(&prepared, row)?
+                else {
+                    continue;
                 };
                 frame.copy(
-                    &source,
-                    base + u64::from(at) * stride,
+                    self.arena.store().slab(),
+                    offset,
                     &seat,
-                    u64::from(row.source) * stride,
-                    stride,
+                    u64::from(row.source) * self.readout_row_bytes,
+                    u64::from(width) * element,
                 )?;
+                readbacks[row.source as usize] = Some((name, width, element));
             }
         }
 
@@ -4092,6 +4055,7 @@ impl engine::frame::Shell for Shell {
             lanes: prepared.lanes.len(),
             launches: walked.launches,
             attached,
+            readbacks,
             step: PhantomData,
         })
     }
@@ -4107,6 +4071,7 @@ impl engine::frame::Shell for Shell {
             lanes,
             launches,
             attached,
+            readbacks,
             step: _,
         } = enqueued;
         self.arms.take(arm);
@@ -4117,6 +4082,7 @@ impl engine::frame::Shell for Shell {
             lanes,
             pending,
             attached,
+            readbacks,
         });
         Ok(Landed {
             seq,

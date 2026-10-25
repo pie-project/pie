@@ -66,13 +66,13 @@ pub fn capture(
             ),
         ));
     }
-    if plan.positions.dtype != Dtype::I32 {
+    if plan.last_page_len.dtype != Dtype::I32 {
         return Err(refuse(
             OP,
             format!(
-                "the fire's position table is {:?}, and this capture reads the causal \
-                 bound as an i32 absolute position per token",
-                plan.positions.dtype
+                "the plan's last-page lengths are {:?}, and this capture reads each \
+                 request's kv length off an i32 one",
+                plan.last_page_len.dtype
             ),
         ));
     }
@@ -147,7 +147,7 @@ pub fn capture(
             pool.keys.arg(),
             pool.page_indices.arg(),
             pool.page_indptr.arg(),
-            plan.positions.arg(),
+            plan.last_page_len.arg(),
             scores.arg_mut(),
             stated(OP, page_size)?.arg(),
             stated(OP, num_q_heads)?.arg(),
@@ -200,6 +200,7 @@ mod tests {
     fn plan(rows: u32) -> PrefillPlan {
         PrefillPlan {
             positions: i32s(rows),
+            last_page_len: i32s(2),
             request_of_token: i32s(rows),
             mask: Tensor::new(7, rows, 1, Dtype::U8),
             mask_enabled: Tensor::new(9, rows, 1, Dtype::U8),

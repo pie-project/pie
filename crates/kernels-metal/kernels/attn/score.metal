@@ -9,7 +9,7 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
     const device T* k_pages             [[buffer(2)]],
     const device uint* kv_page_indices  [[buffer(3)]],
     const device uint* kv_page_indptr   [[buffer(4)]],
-    const device int* position_ids      [[buffer(5)]],
+    const device int* kv_last_page_lens [[buffer(5)]],
     device float* scores                [[buffer(6)]],
     const constant int& page_size       [[buffer(7)]],
     const constant int& num_q_heads     [[buffer(8)]],
@@ -45,12 +45,13 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
   const int page_first = int(kv_page_indptr[request]);
   const int pages = int(kv_page_indptr[request + 1]) - page_first;
 
-  const int capacity = pages * page_size;
+  const int kv_len =
+      pages > 0 ? (pages - 1) * page_size + kv_last_page_lens[request] : 0;
   const int qo_hi = qo_indptr[request + 1];
   const int qo_len = qo_hi - qo_indptr[request];
   const int rows = observe < qo_len ? observe : qo_len;
 
-  if (pages <= 0 || capacity <= 0 || rows <= 0) {
+  if (pages <= 0 || kv_len <= 0 || rows <= 0) {
     return;
   }
 
@@ -64,8 +65,8 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
   for (int w = 0; w < rows; ++w) {
 
     const int q_index = qo_hi - rows + w;
-    const int causal = position_ids[q_index] + 1;
-    const int limit = causal < capacity ? causal : capacity;
+    const int causal = kv_len - rows + w + 1;
+    const int limit = causal < kv_len ? causal : kv_len;
 
     if (limit <= 0) {
       continue;

@@ -98,8 +98,8 @@ impl Run<'_> {
             Attn::PlanPrefill {
                 kv_indptr: _,
                 kv_indices: _,
-                last_page_len: _,
-                kv_len,
+                last_page_len,
+                kv_len: _,
                 q_heads: _,
                 kv_heads: _,
                 head_dim: _,
@@ -113,12 +113,12 @@ impl Run<'_> {
                          prefill plan kind"
                     ),
                 }
-                let kv_len = self.tensor(*kv_len);
+                let last_page_len = self.tensor(*last_page_len);
                 let fire = self.bindings();
                 let (positions, t) = (fire.positions, fire.tables);
                 let built = attn::plan_prefill(
                     self.ctx(),
-                    kv_len,
+                    last_page_len,
                     self.cut_rows(positions),
                     self.cut_rows(t.request_of_token),
                     self.cut_rows(t.mask),

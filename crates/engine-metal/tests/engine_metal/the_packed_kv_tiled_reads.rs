@@ -388,6 +388,7 @@ fn read_over(rig: &Rig, pool: &KvPool, op: Op, f: &Fires) -> (Vec<f32>, Option<V
     let (plan_open, plan_keep) = (
         PrefillPlan {
             positions: f.positions,
+            last_page_len: f.positions,
             request_of_token: f.request_of_token,
             mask: f.open_mask,
             mask_enabled: f.open_enabled,
@@ -395,6 +396,7 @@ fn read_over(rig: &Rig, pool: &KvPool, op: Op, f: &Fires) -> (Vec<f32>, Option<V
         },
         PrefillPlan {
             positions: f.positions,
+            last_page_len: f.positions,
             request_of_token: f.request_of_token,
             mask: f.keep_mask,
             mask_enabled: f.keep_enabled,
