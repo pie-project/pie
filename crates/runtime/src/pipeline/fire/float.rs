@@ -386,6 +386,7 @@ mod tests {
     #[test]
     fn float_every_case() {
         a_frame_folds_one_slot_fresh_then_held();
+        a_fork_decodes_on_from_a_copy_of_its_parents_state();
     }
 
     fn a_frame_folds_one_slot_fresh_then_held() {
@@ -404,5 +405,25 @@ mod tests {
         let lanes = fire(&mut store, &[ws, other]);
         assert_eq!(lanes.slot_flags, vec![0, crate::engine::RS_FLAG_RESET]);
         assert_ne!(lanes.slot_ids[0], lanes.slot_ids[1], "a state a lane");
+    }
+
+    fn a_fork_decodes_on_from_a_copy_of_its_parents_state() {
+        let mut store = RsStore::new(4, 4, 0, 0);
+        let parent = store.create_working_set(geom());
+        fire(&mut store, &[parent]);
+        fire(&mut store, &[parent]);
+        let held = store.folded_slot(parent).unwrap().unwrap().0;
+        let child = store.fork(parent).unwrap();
+        let next = fire(&mut store, &[child]);
+        assert_eq!(next.slot_flags, vec![0], "a fork's state is not empty");
+        assert_ne!(next.slot_ids[0], held, "it writes a row of its own");
+        assert_eq!(next.copies, (vec![held], vec![next.slot_ids[0]]));
+        assert_eq!(store.frozen(child), Ok(3));
+        let on = fire(&mut store, &[parent]);
+        assert_eq!(
+            (on.slot_ids[0], on.slot_flags[0], on.copies.0.len()),
+            (held, 0, 0),
+            "the parent goes on in place, its copy taken"
+        );
     }
 }

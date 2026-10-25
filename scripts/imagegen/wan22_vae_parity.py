@@ -46,6 +46,7 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 WORKSPACE = os.path.join(REPO, "examples")
 
 COS_TOL = 0.9999
+FORK_TOL = 0.0
 KNOWN = ("KNOWN FAILURE until frame = token C1-C3 land (latent-path.md 7c): "
          "later decode fires run on zeroed conv caches. Do not loosen the bar.")
 
@@ -125,6 +126,13 @@ def compare(args) -> int:
         print(f"[compare] chunk {k} (frames {a}..{b - 1}): cos {cos:.6f} (>= {COS_TOL}), "
               f"mean |err| {mean_err:.5f}, max |err| {max_err:.5f}  --  "
               f"{'PASS' if good else 'FAIL'}")
+    # The last chunk was decoded twice: on a fork of the working set taken
+    # before its fire, then on the parent. Both read the same state.
+    fork = doc.get("fork_max_abs_diff")
+    good = fork is not None and fork <= FORK_TOL
+    ok &= good
+    print(f"[compare] fork: the last chunk on a fork, max |diff| from the parent's {fork} "
+          f"(<= {FORK_TOL})  --  {'PASS' if good else 'FAIL'}")
     print(f"[compare] {'PASS' if ok else 'FAIL'}")
     if not ok:
         print(f"[compare] {KNOWN}")

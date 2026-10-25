@@ -68,6 +68,9 @@ struct Output {
     fires: Vec<String>,
     /// Output frames each fire landed.
     chunk_frames: Vec<u32>,
+    /// The last chunk decoded again on a FORK of the working set taken
+    /// before its fire, and the largest |difference| from the parent's.
+    fork_max_abs_diff: f32,
     pixel_h: u32,
     pixel_w: u32,
     /// Bytes of raw f32 sent as the file.
@@ -214,6 +217,7 @@ async fn main(input: Input) -> Result<Output> {
     let mut pixels: Vec<f32> = Vec::new();
     let mut fires = Vec::new();
     let mut chunk_frames = Vec::new();
+    let mut fork_max_abs_diff = 0.0f32;
     for k in 0..case.t {
         let (arm, frames) = if k == 0 {
             (&a.head, 1)
@@ -221,18 +225,37 @@ async fn main(input: Input) -> Result<Output> {
             (&a.decode, tc)
         };
         let at = k as usize * plane;
-        let out = decode_frame(
-            arm,
-            &case.latent[at..at + plane],
-            case.h,
-            case.w,
-            frames,
-            pixel_h,
-            pixel_w,
-            &state,
-            &pipe,
-        )
-        .await?;
+        // The last chunk, first on a fork: it must decode on from the very
+        // state its parent holds.
+        let fork = (k + 1 == case.t && k > 0)
+            .then(|| state.fork(&pipe))
+            .transpose()?;
+        let mut outs = Vec::new();
+        for ws in fork.iter().chain(std::iter::once(&state)) {
+            outs.push(
+                decode_frame(
+                    arm,
+                    &case.latent[at..at + plane],
+                    case.h,
+                    case.w,
+                    frames,
+                    pixel_h,
+                    pixel_w,
+                    ws,
+                    &pipe,
+                )
+                .await?,
+            );
+        }
+        let out = outs.pop().ok_or("no decode")?;
+        let forked = outs.pop();
+        if let Some(forked) = forked {
+            fork_max_abs_diff = forked
+                .iter()
+                .zip(&out)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+        }
         pixels.extend_from_slice(&out);
         fires.push(arm.clone());
         chunk_frames.push(frames);
@@ -244,6 +267,7 @@ async fn main(input: Input) -> Result<Output> {
     Ok(Output {
         fires,
         chunk_frames,
+        fork_max_abs_diff,
         pixel_h,
         pixel_w,
         pixels_bytes: raw.len() as u32,
