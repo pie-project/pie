@@ -7,7 +7,25 @@
 
 #if defined(PIE_ADD)
 
-// `z = x + y` over a whole tensor, a pair of elements a lane.
+// `z = x op y` over a whole tensor, a pair of elements a lane: `PIE_OP` 0
+// adds, 1 multiplies, 2 divides, 3 takes the floored modulo
+// (`x - y·floor(x / y)`, as Python's `%`).
+
+#ifndef PIE_OP
+#define PIE_OP 0
+#endif
+
+float2 combine(float2 a, float2 b) {
+#if PIE_OP == 0
+    return a + b;
+#elif PIE_OP == 1
+    return a * b;
+#elif PIE_OP == 2
+    return a / b;
+#else
+    return a - b * floor(a / b);
+#endif
+}
 
 [[vk::binding(0)]] StructuredBuffer<PIE_ACT> x;
 [[vk::binding(1)]] StructuredBuffer<PIE_ACT> y;
@@ -26,7 +44,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
         return;
     }
     bool both = i + 1u < params.n;
-    pair_put(z, i, both, pair_at(x, i, both) + pair_at(y, i, both));
+    pair_put(z, i, both, combine(pair_at(x, i, both), pair_at(y, i, both)));
 }
 
 #elif defined(PIE_RESIDUAL_ADD)
@@ -184,6 +202,28 @@ void main(uint3 gid : SV_DispatchThreadID) {
     pair_put(x, i, both, stable_tanh(pair_at(x, i, both)));
 }
 
+#elif defined(PIE_SQRT)
+
+// `x = sqrt(x)` in place over a whole tensor, a pair of elements a lane.
+
+[[vk::binding(0)]] RWStructuredBuffer<PIE_ACT> x;
+
+struct Params {
+    uint n;
+};
+PIE_PARAMS(1, Params, params);
+
+[shader("compute")]
+[numthreads(PIE_GROUP_X, 1, 1)]
+void main(uint3 gid : SV_DispatchThreadID) {
+    uint i = 2u * gid.x;
+    if (i >= params.n) {
+        return;
+    }
+    bool both = i + 1u < params.n;
+    pair_put(x, i, both, sqrt(pair_at(x, i, both)));
+}
+
 #elif defined(PIE_CAST)
 
 // f32 values rounded into bf16 ones, a pair a lane.
@@ -286,6 +326,12 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
 // pie:instantiate elemwise_pointwise_add_bf16 PIE_ADD=1 PIE_GROUP_X=256
 // pie:instantiate elemwise_pointwise_add_f32 PIE_ADD=1 PIE_GROUP_X=256 PIE_ACT_F32=1
+// pie:instantiate elemwise_pointwise_mul_bf16 PIE_ADD=1 PIE_OP=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_pointwise_mul_f32 PIE_ADD=1 PIE_OP=1 PIE_GROUP_X=256 PIE_ACT_F32=1
+// pie:instantiate elemwise_pointwise_div_bf16 PIE_ADD=1 PIE_OP=2 PIE_GROUP_X=256
+// pie:instantiate elemwise_pointwise_div_f32 PIE_ADD=1 PIE_OP=2 PIE_GROUP_X=256 PIE_ACT_F32=1
+// pie:instantiate elemwise_pointwise_mod_bf16 PIE_ADD=1 PIE_OP=3 PIE_GROUP_X=256
+// pie:instantiate elemwise_pointwise_mod_f32 PIE_ADD=1 PIE_OP=3 PIE_GROUP_X=256 PIE_ACT_F32=1
 // pie:instantiate elemwise_pointwise_residual_add_bf16 PIE_RESIDUAL_ADD=1 PIE_GROUP_X=256
 // pie:instantiate elemwise_pointwise_residual_add_f32 PIE_RESIDUAL_ADD=1 PIE_GROUP_X=256 PIE_ACT_F32=1
 // pie:instantiate elemwise_pointwise_add_bias_bf16 PIE_ADD_BIAS=1 PIE_GROUP_X=256
@@ -298,6 +344,8 @@ void main(uint3 gid : SV_DispatchThreadID) {
 // pie:instantiate elemwise_pointwise_silu_scaled_f32 PIE_SILU_SCALED=1 PIE_GROUP_X=256 PIE_ACT_F32=1
 // pie:instantiate elemwise_pointwise_tanh_bf16 PIE_TANH=1 PIE_GROUP_X=256
 // pie:instantiate elemwise_pointwise_tanh_f32 PIE_TANH=1 PIE_GROUP_X=256 PIE_ACT_F32=1
+// pie:instantiate elemwise_pointwise_sqrt_bf16 PIE_SQRT=1 PIE_GROUP_X=256
+// pie:instantiate elemwise_pointwise_sqrt_f32 PIE_SQRT=1 PIE_GROUP_X=256 PIE_ACT_F32=1
 // pie:instantiate elemwise_pointwise_cast_f32_to_bf16 PIE_CAST=1 PIE_GROUP_X=256
 // pie:instantiate elemwise_pointwise_clamp_bf16 PIE_CLAMP=1 PIE_GROUP_X=256
 // pie:instantiate elemwise_pointwise_clamp_learned_bf16 PIE_CLAMP=1 PIE_GROUP_X=256 PIE_LEARNED=1

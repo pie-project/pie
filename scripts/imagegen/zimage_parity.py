@@ -68,13 +68,14 @@ WHAT THE HARNESS CONVERTS
 * the latent goes over as the VAE's own `[H, W, C]` (the golden's `[C, 1, H,
   W]` transposed); the family patchifies and computes every row's rotary
   position in its graph, and its velocity comes back on the same voxels;
-* NOTHING IS PADDED: the family carries a caption's own rows and an image's
-  own patches. The reference pads both to a multiple of 32 (caption pads
-  attended, at rotary `1 + j` past the real rows, and the image after them
-  at `L32 + 1`), so a caption whose length is not a multiple of 32 is a
-  different forward from the reference's, and its refined caption has
-  fewer rows than the golden's (`collect` keeps the comparison to the rows
-  both have only when they are the same length);
+* the caption is padded as the reference pads it: the guest zero-pads it to
+  the rows the family states (`input-decl.rows`, a multiple of 32) and binds
+  its own row count as `length`; the family turns each pad row into
+  `cap_pad_token` at rotary `(0, 0, 0)`, attended like any other, and the
+  image follows at `L32 + 1`. The refined caption comes back over the padded
+  rows, as the golden's. An image whose patch count is not a multiple of 32
+  is still NOT padded (the reference pads it with `x_pad_token`), so such a
+  shape is a different forward from the reference's;
 * a tapped mode (`full`, `crop`, `tiny`) reads an intermediate out on the
   token rows, which the case states (`readout_rows`), in diffusers'
   `_patchify_image` feature order `(pf, ph, pw, c)`;

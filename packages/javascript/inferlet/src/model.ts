@@ -126,6 +126,7 @@ export type {
   LatentSpace,
   Readout,
   ReadoutKind,
+  RowCount,
   ScheduleFact,
   ScheduleKind,
   SwitchDecl,

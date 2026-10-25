@@ -211,6 +211,12 @@ pub enum RuntimeInput {
     /// lane's token rows are its clips' patches of `p`, each clip's in
     /// (t, h, w) row-major order from its first token row, the clips in
     /// lane order; the lane carries no other row.
+    ///
+    /// One family is the exception, by decision: HunyuanImage 3
+    /// (`models/hunyuan_image_3.poem`) denoises its canvas inside the
+    /// language model's KV lane, a `<timestep>` row ahead of the patches,
+    /// so its canvas rows are guest-given (`latents`, `special`) and so are
+    /// its `positions`; it reads no token grid.
     TokenGrid {
         p: [u32; 3],
     },

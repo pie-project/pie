@@ -55,6 +55,11 @@ pub fn tanh(f: &mut Func, x: Operand, o: Landing) -> Result<Val, Error> {
     unary(f, "elemwise.act", x, o, |f, v| Ok(f.tanh(v)))
 }
 
+/// `o = √x`. Reference: kernels-metal `act_sqrt`.
+pub fn sqrt(f: &mut Func, x: Operand, o: Landing) -> Result<Val, Error> {
+    unary(f, "elemwise.act", x, o, |f, v| Ok(f.sqrt(v)))
+}
+
 /// `o = ½x(1 + tanh(√(2/π)(x + 0.044715x³)))`. Reference: kernels-metal
 /// `act_gelu_tanh`.
 pub fn gelu_tanh(f: &mut Func, x: Operand, o: Landing) -> Result<Val, Error> {
@@ -73,25 +78,40 @@ fn binary(
     x: Operand,
     y: Operand,
     z: Landing,
-    mul: bool,
+    combine: fn(&mut Func, Val, Val) -> Result<Val, Error>,
 ) -> Result<Val, Error> {
     expect(op, z, FLOATS)?;
     same_shape(op, x, z)?;
     same_shape(op, y, z)?;
     let a = x.f32(f);
     let b = y.f32(f);
-    let v = if mul { f.mul(a, b)? } else { f.add(a, b)? };
-    Ok(v)
+    combine(f, a, b)
 }
 
 /// `z = x + y`. Reference: kernels-metal `binary_add`.
 pub fn add(f: &mut Func, x: Operand, y: Operand, z: Landing) -> Result<Val, Error> {
-    binary(f, "elemwise.binary", x, y, z, false)
+    binary(f, "elemwise.binary", x, y, z, |f, a, b| Ok(f.add(a, b)?))
 }
 
 /// `z = x · y`. Reference: kernels-metal `binary_mul`.
 pub fn mul(f: &mut Func, x: Operand, y: Operand, z: Landing) -> Result<Val, Error> {
-    binary(f, "elemwise.binary", x, y, z, true)
+    binary(f, "elemwise.binary", x, y, z, |f, a, b| Ok(f.mul(a, b)?))
+}
+
+/// `z = x / y`. Reference: kernels-metal `binary_div`.
+pub fn div(f: &mut Func, x: Operand, y: Operand, z: Landing) -> Result<Val, Error> {
+    binary(f, "elemwise.binary", x, y, z, |f, a, b| Ok(f.div(a, b)?))
+}
+
+/// `z = x - y·floor(x / y)`: floored, as Python's `%`. Reference:
+/// kernels-metal `binary_mod`.
+pub fn modulo(f: &mut Func, x: Operand, y: Operand, z: Landing) -> Result<Val, Error> {
+    binary(f, "elemwise.binary", x, y, z, |f, a, b| {
+        let q = f.div(a, b)?;
+        let q = f.floor(q);
+        let p = f.mul(b, q)?;
+        Ok(f.sub(a, p)?)
+    })
 }
 
 // ------------------------------------------------------------- modulation

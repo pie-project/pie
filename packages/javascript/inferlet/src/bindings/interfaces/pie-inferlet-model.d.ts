@@ -207,20 +207,35 @@ export type ReadoutKind = 'logits' | 'velocity' | 'hidden' | 'pixels';
  */
 export type InputAxis = 'lane' | 'row' | 'voxel';
 /**
+ * The rows a lane binding an input carries, as the model states them:
+ * exactly `n`, or the fewest that are a multiple of `n` and hold the
+ * guest's own. The guest pads its rows to them with zeros, on device.
+ */
+export type RowCount = RowCountExact | RowCountMultiple;
+export interface RowCountExact {
+  tag: 'exact',
+  val: number,
+}
+export interface RowCountMultiple {
+  tag: 'multiple',
+  val: number,
+}
+/**
  * One input the model reads from its guest, by name: `width` values a
  * lane, a row or a voxel, as `dtype` (`f32` for a float input, `i32`
  * for an i32 one; the host marshals to the model's own element type).
  * One name is one input wherever the model reads it. `rows` is the row
  * count a lane binding it carries when the family fixes it (Wan 2.2's
- * 512 context rows: its reference zero-pads umT5's answer to 512 and
- * attends every pad row), `none` nearly always.
+ * `exact(512)` context rows: its reference zero-pads umT5's answer to
+ * 512 and attends every pad row; Z-Image's `multiple(32)` caption rows),
+ * `none` nearly always.
  */
 export interface InputDecl {
   name: string,
   axis: InputAxis,
   width: number,
   dtype: Dtype,
-  rows?: number,
+  rows?: RowCount,
 }
 /**
  * What a lane's epilogue reads out, and how wide one row is.

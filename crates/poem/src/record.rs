@@ -269,7 +269,7 @@ impl Recorder {
         dtype: Dtype,
         axis: InputAxis,
         width: u32,
-        rows: Option<u32>,
+        rows: Option<poem_ir::RowCount>,
     ) -> Value {
         let id = {
             let mut p = self.inner.borrow_mut();

@@ -493,7 +493,8 @@ fn the_latents_ride_the_voxels_and_the_positions_are_computed() {
             .collect();
         for want in [
             format!("latents:voxel:{}", d.channels),
-            "frame_period:lane:1".to_string(),
+            "fps:lane:1".to_string(),
+            "text_positions:row:1".to_string(),
             format!("positions:row:{}", model::ROPE_AXES),
             format!("audio_positions:row:{}", model::AUDIO_ROPE_AXES),
         ] {
@@ -528,8 +529,8 @@ fn the_latents_ride_the_voxels_and_the_positions_are_computed() {
         );
         assert_eq!(
             count(&|op| matches!(op, poem_ir::Conv::Cells { axis: 0, .. })),
-            2,
-            "{deployment}: one cell table a medium"
+            4,
+            "{deployment}: one cell table a medium, and one a connector's prompt rows"
         );
         assert_eq!(
             plan.facts.declared("positions").map(|s| s.values.clone()),

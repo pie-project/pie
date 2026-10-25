@@ -2047,6 +2047,35 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "elemwise",
+        name: "div",
+        params: &["x", "y"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let y: Value = a.next()?;
+            result(heap, dsl("elemwise.div", || ops::elemwise::div(&x, &y))?)
+        },
+    },
+    Op {
+        module: "elemwise",
+        name: "mod",
+        params: &["x", "y"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            let y: Value = a.next()?;
+            result(heap, dsl("elemwise.mod", || ops::elemwise::mod_(&x, &y))?)
+        },
+    },
+    Op {
+        module: "elemwise",
+        name: "sqrt",
+        params: &["x"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            result(heap, dsl("elemwise.sqrt", || ops::elemwise::sqrt(&x))?)
+        },
+    },
+    Op {
+        module: "elemwise",
         name: "rope_axes",
         params: &[
             "x",
@@ -3248,7 +3277,7 @@ pub(crate) static INPUTS: &[Op] = &[
             let dtype: Dtype = a.next()?;
             let axis: poem_ir::InputAxis = a.next()?;
             let width: u32 = a.next()?;
-            let rows: Option<u32> = a.next()?;
+            let rows: Option<poem_ir::RowCount> = a.next()?;
             result(
                 heap,
                 dsl("inputs.input", || {

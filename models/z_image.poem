@@ -267,6 +267,7 @@ def layout(id, deploy):
             x_embed = linear(dim, PATCH_FEATURES, banks),
             cap_norm = weight([d.cap_width]),
             cap_embed = linear(dim, d.cap_width, banks),
+            cap_pad_mod = weight([2 * dim, 1]),
             t_mlp0 = linear(T_MID, T_FREQ_DIM, banks),
             t_mlp1 = linear(ADALN_DIM, T_MID, banks),
             t_flip = weight([1], dtype.f32, values = [T_FLIP]),
@@ -438,6 +439,22 @@ def read(m, reads, prefix):
 # checkpoint's `PATCH_ORDER[f]`.
 PATCH_ORDER = [(ph * PATCH + pw) * CHANNELS + c for c in range(CHANNELS) for ph in range(PATCH) for pw in range(PATCH)]
 
+def raw_of(w, name, what):
+    held = stored(name)
+    if held.raw == None:
+        fail("`{}`: `{}` is stored {}; {}".format(w.name, name, held, what))
+    return held.raw
+
+def pad_table(reads, w, token):
+    """`w`'s scale half −1 and its shift half the learned `token`: a pad
+    row's flag 1 modulates the row into the token."""
+    dt = raw_of(w, token, "a pad token is a raw float row")
+    dim = w.shape[0] // 2
+    reads.read_expr(w, concat(0, [
+        constant(w.name, [-1.0] * dim, [dim, 1], dt),
+        src(token).transmute([dim, 1], raw(dt)),
+    ]))
+
 def dit(reads, m, prefix):
     at = lambda tail: prefix + tail
     x_embed = at("all_x_embedder.2-1")
@@ -445,6 +462,7 @@ def dit(reads, m, prefix):
     reads.read(m.x_embed.bias, x_embed + ".bias")
     reads.read(m.cap_norm, at("cap_embedder.0.weight"))
     biased(reads, m.cap_embed, at("cap_embedder.1"))
+    pad_table(reads, m.cap_pad_mod, at("cap_pad_token"))
     biased(reads, m.t_mlp0, at("t_embedder.mlp.0"))
     biased(reads, m.t_mlp1, at("t_embedder.mlp.2"))
     for stem, blocks in [
@@ -659,13 +677,31 @@ def caption_positions(arm, dit):
     cells = ops.conv.cells(arm.token_grid(PATCH_BOX), arm.positions(), 0)
     return ops.elemwise.add_bias(dit.origin, cells)
 
+# The reference pads a caption to a multiple of 32 rows: a pad row is the
+# learned `cap_pad_token`, at `(0, 0, 0)`, and attends and is attended like
+# any other; the image follows the padded caption. The guest pads the
+# caption (and so the context the refine reads out) with zero rows and
+# states its own rows as the lane's `length`.
+CAPTION_ROWS = multiple_of(32)
+
+def padded_caption(arm, dit):
+    """The caption lane's positions, a pad row's `(0, 0, 0)`, and each
+    row's pad flag `[rows, 1]` f32: 1 past the lane's `length` own rows."""
+    t, hw = ops.gather.split_rows(caption_positions(arm, dit), 1)
+    length = ops.gather.gather_rows(arm.input("length", dtype.f32, "lane", 1), arm.request_of_token())
+    pad = ops.elemwise.clamp(ops.elemwise.add(t, ops.elemwise.mul_scalar(-1.0, length)), 0.0, 1.0)
+    t = ops.elemwise.add(t, ops.elemwise.mul_scalar(-1.0, ops.elemwise.mul(t, pad)))
+    return ops.gather.concat_cols([t, hw]), pad
+
 def refine(arm, m):
     d, dit = m.dims, m.dit
-    c = arm.input("caption", dtype.bf16, "row", d.cap_width)
+    c = arm.input("caption", dtype.bf16, "row", d.cap_width, rows = CAPTION_ROWS)
     c = ops.elemwise.rmsnorm(c, dit.cap_norm, NORM_EPS)
     c = run_linear(dit.cap_embed, c)
+    positions, pad = padded_caption(arm, dit)
+    c = ops.elemwise.modulate(c, ops.linear.matmul(pad, dit.cap_pad_mod), None, "scale_shift")
     geom = struct(
-        positions = turn_positions(arm, caption_positions(arm, dit)),
+        positions = turn_positions(arm, positions),
         perm = arm.row_permutation(),
         csr = arm.lane_indptr(),
         mask = unmasked(),
@@ -706,13 +742,14 @@ def denoise(arm, m):
 
     lanes = arm.request_of_token()
 
-    # A caption row `(1 + j, 0, 0)`; an image row `(1 + T, h, w)`, its patch
-    # following the T caption rows of its group's context lane.
-    cells = caption_positions(arm, dit)
+    # A caption row `(1 + j, 0, 0)`, a pad row `(0, 0, 0)`; an image row
+    # `(1 + T, h, w)`, its patch following the T (padded) rows of its
+    # group's context lane.
+    cells = caption_positions(img, dit)
     follow = ops.gather.group_rows(ctx.group_indptr(), arm.group_of_lane(), lanes)
-    t_col, hw = ops.gather.split_rows(cells.on(image), 1)
+    t_col, hw = ops.gather.split_rows(cells, 1)
     image_cells = ops.gather.concat_cols([ops.elemwise.add(t_col, follow.on(image)), hw])
-    positions = turn_positions(arm, merge([image_cells, cells.on(~image)]))
+    positions = turn_positions(arm, merge([image_cells, padded_caption(ctx, dit)[0]]))
     joint = struct(
         positions = positions,
         perm = arm.row_permutation(),
@@ -742,7 +779,7 @@ def denoise(arm, m):
     # A tap reads the context in first, and ends the forward at its
     # intermediate; a fold carries `struct(tapped = ...)` past its rest.
     tap = m.tap
-    context = ctx.input("context", dtype.bf16, "row", d.dim) if tap else None
+    context = ctx.input("context", dtype.bf16, "row", d.dim, rows = CAPTION_ROWS) if tap else None
     stop = lambda v: struct(tapped = seam_tapped(v, context))
     if tap == "latents":
         return seam_tapped(x, context)
@@ -773,7 +810,7 @@ def denoise(arm, m):
         return x.tapped
     if tap == "x_refined":
         return seam_tapped(x, context)
-    c = context if context != None else ctx.input("context", dtype.bf16, "row", d.dim)
+    c = context if context != None else ctx.input("context", dtype.bf16, "row", d.dim, rows = CAPTION_ROWS)
 
     def layer(l, b, u):
         if type(u) == "struct":

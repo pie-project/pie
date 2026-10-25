@@ -164,14 +164,27 @@ impl Run<'_> {
                 x,
                 y,
                 z,
-                op: poem_ir::BinaryOp::Add,
-                ..
-            } => kernels_slang::elemwise::pointwise::add(
+                op: binary,
+            } => kernels_slang::elemwise::pointwise::binary(
                 self.ctx,
+                match binary {
+                    poem_ir::BinaryOp::Add => kernels_slang::elemwise::pointwise::BinaryOp::Add,
+                    poem_ir::BinaryOp::Mul => kernels_slang::elemwise::pointwise::BinaryOp::Mul,
+                    poem_ir::BinaryOp::Div => kernels_slang::elemwise::pointwise::BinaryOp::Div,
+                    poem_ir::BinaryOp::Mod => kernels_slang::elemwise::pointwise::BinaryOp::Mod,
+                },
                 self.tensor(*x),
                 self.tensor(*y),
                 self.tensor(*z),
             ),
+            Elemwise::Act {
+                x,
+                x_out: _,
+                s: None,
+                scale: None,
+                act: poem_ir::ActFn::Sqrt,
+                ..
+            } => kernels_slang::elemwise::pointwise::sqrt(self.ctx, self.tensor(*x)),
 
             Elemwise::RopeAxes {
                 x,
@@ -270,10 +283,6 @@ impl Run<'_> {
                 ..
             }
             | Elemwise::Hadamard { .. }
-            | Elemwise::Binary {
-                op: poem_ir::BinaryOp::Mul,
-                ..
-            }
             | Elemwise::GateSigmoidMul { heads: Some(_), .. } => {
                 Err(kernels_slang::Error::Unsupported { op: op.name() })
             }

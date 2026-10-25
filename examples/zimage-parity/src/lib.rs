@@ -4,14 +4,17 @@
 //! timestep — and reads back the refined caption and the velocity, as JSON
 //! `scripts/imagegen/zimage_parity.py` turns into an `.npz` under the
 //! golden's own key names. The family patchifies and computes every row's
-//! rotary position in its graph; the guest states neither, and nothing is
-//! padded: a lane carries its own rows.
+//! rotary position in its graph; the guest states neither. The caption is
+//! zero-padded to the rows the family states for it (`input-decl.rows`,
+//! a multiple of 32, as the reference pads), with its own row count bound
+//! as `length`; the family turns the pad rows into its pad token.
 //!
 //! Two fires per case, in the order the reference's forward runs them, down
 //! one pipeline:
 //!
-//! 1. **`refine`** — one `context` lane carrying `caption` (`[L, cap]`); its
-//!    epilogue reads `hidden(dim)`, the refined caption.
+//! 1. **`refine`** — one `context` lane carrying `caption` (`[L32, cap]`,
+//!    zero past `L`) and `length` (`L`); its epilogue reads `hidden(dim)`,
+//!    the refined caption, pad rows included.
 //! 2. **`denoise`** — a `context` lane (`context` = the refine readout,
 //!    `timestep`) and an `image` lane (`latents`, `timestep`) in one group of
 //!    ONE pass — lane 0 the context, lane 1 the image; the epilogue reads
@@ -183,16 +186,44 @@ fn reading(readout: model::ReadoutKind, lanes: &[(&str, &[&str])]) -> Result<Rea
     })
 }
 
-/// The `refine` reading: one context lane, the refined caption back.
-async fn refine(case: &Case, pipe: &Pipeline) -> Result<(Vec<f32>, u32)> {
-    let r = reading(model::ReadoutKind::Hidden, &[("context", &["caption"])])?;
-    let rows = case.caption_rows;
+/// The rows a lane of `len` rows of its own carries under `rows`.
+fn padded(rows: Option<model::RowCount>, len: u32) -> Result<u32> {
+    match rows {
+        None => Some(len),
+        Some(model::RowCount::Exact(n)) => (len <= n).then_some(n),
+        Some(model::RowCount::Multiple(n)) => len.checked_next_multiple_of(n),
+    }
+    .ok_or_else(|| format!("{len} caption rows do not fit {rows:?}").into())
+}
+
+/// The caption's own row count, as the `length` input reads it.
+fn length(case: &Case) -> Channel {
+    Channel::from([case.caption_rows as f32]).named("length")
+}
+
+/// The `refine` reading: one context lane, the refined caption back, over
+/// the padded rows (returned too).
+async fn refine(case: &Case, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
+    let r = reading(
+        model::ReadoutKind::Hidden,
+        &[("context", &["caption", "length"])],
+    )?;
+    let lane = model::lane_of(&[("reading", r.name.as_str()), ("stream", "context")])?;
+    let decl = lane
+        .inputs
+        .iter()
+        .find(|i| i.name == "caption")
+        .ok_or("the refine lane reads no caption")?;
+    let rows = padded(decl.rows, case.caption_rows)?;
+    let mut rows_in = case.caption.clone();
+    rows_in.resize((rows * case.caption_width) as usize, 0.0);
     let pass = ForwardPass::new();
     pass.switch(0, "reading", &r.name)?;
     pass.switch(0, "stream", "context")?;
     let caption =
-        Channel::from_shaped([rows, case.caption_width], case.caption.as_slice()).named("caption");
+        Channel::from_shaped([rows, case.caption_width], rows_in.as_slice()).named("caption");
     pass.input(0, "caption", &caption)?;
+    pass.input(0, "length", &length(case))?;
     let width = r.readout_width;
     let out = Channel::new([rows, width], dtype::f32).named("refined");
     pass.epilogue(move || {
@@ -200,7 +231,7 @@ async fn refine(case: &Case, pipe: &Pipeline) -> Result<(Vec<f32>, u32)> {
     });
     pass.submit(pipe).context("refine lane")?;
     let rows_out: Vec<f32> = out.take_host().await?;
-    Ok((rows_out, width))
+    Ok((rows_out, width, rows))
 }
 
 /// The `denoise` reading, its two lanes checked against what this guest
@@ -209,18 +240,19 @@ fn denoise_reading() -> Result<Reading> {
     reading(
         model::ReadoutKind::Velocity,
         &[
-            ("context", &["context", "timestep"]),
+            ("context", &["context", "timestep", "length"]),
             ("image", &["latents", "timestep"]),
         ],
     )
 }
 
 /// Binds the `denoise` reading's lanes on `pass`: lane 0 the refined
-/// caption, lane 1 the image over `latent`, both in one group and reading
-/// `timestep`.
+/// caption (and its own row count), lane 1 the image over `latent`, both
+/// in one group and reading `timestep`.
 fn denoise_lanes(
     pass: &ForwardPass,
     r: &Reading,
+    case: &Case,
     context: &Channel,
     latent: &Channel,
     timestep: &Channel,
@@ -232,6 +264,7 @@ fn denoise_lanes(
         pass.input(lane, "timestep", timestep)?;
     }
     pass.input(0, "context", context)?;
+    pass.input(0, "length", &length(case))?;
     pass.input(1, "latents", latent)?;
     Ok(())
 }
@@ -274,11 +307,11 @@ async fn denoise(
     // over the token rows.
     let width = r.readout_width;
     let voxels = readout_rows(case, width)?;
-    let caption_rows = case.caption_rows;
+    let caption_rows = context.shape().dims()[0];
     let t = Channel::from([case.timestep]).named("t");
     let x = latent_of(case, "latents");
     let pass = ForwardPass::new();
-    denoise_lanes(&pass, &r, context, &x, &t)?;
+    denoise_lanes(&pass, &r, case, context, &x, &t)?;
 
     let out = Channel::new([voxels, width], dtype::f32).named("velocity");
     let ctx_out = ctx_tap.then(|| Channel::new([caption_rows, width], dtype::f32).named("ctx_tap"));
@@ -324,7 +357,7 @@ async fn trajectory(
     let loops = DenoiseLoop::new(&sched);
     let latent = latent_of(case, "traj_x");
     let pass = ForwardPass::new();
-    denoise_lanes(&pass, &r, context, &latent, &loops.timestep())?;
+    denoise_lanes(&pass, &r, case, context, &latent, &loops.timestep())?;
 
     let out = Channel::new(lat, dtype::f32).named("traj_out");
     let dts = loops.dts();
@@ -498,10 +531,9 @@ async fn main(input: Input) -> Result<Output> {
         }
         None => (Vec::new(), 0, 0),
     };
-    let (refined, dim) = refine(&case, &pipe).await?;
+    let (refined, dim, caption_rows) = refine(&case, &pipe).await?;
     // The refined caption: no pass writes it, so every denoise pass reads it.
-    let context =
-        Channel::from_shaped([case.caption_rows, dim], refined.as_slice()).named("context");
+    let context = Channel::from_shaped([caption_rows, dim], refined.as_slice()).named("context");
     let (mut latent, mut sigmas, mut timesteps) = (Vec::new(), Vec::new(), Vec::new());
     let (velocity, ctx_rows) = if input.refine_only {
         (Vec::new(), Vec::new())
@@ -528,7 +560,7 @@ async fn main(input: Input) -> Result<Output> {
         text_rows: text_len,
         text_width,
         refined,
-        caption_rows: case.caption_rows,
+        caption_rows,
         dim,
         readout,
         velocity,

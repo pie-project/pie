@@ -193,7 +193,18 @@ pub struct GuestInput {
     pub name: String,
     /// The rows a lane binding it carries, when the model fixes them.
     #[serde(default)]
-    pub rows: Option<u32>,
+    pub rows: Option<RowCount>,
+}
+
+/// The rows a lane binding an input carries, as its model states them: the
+/// guest pads its rows on device to them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RowCount {
+    /// Exactly this many (Wan 2.2's 512 context rows).
+    Exact(u32),
+    /// The fewest rows, a multiple of this, that hold the guest's own
+    /// (Z-Image's caption, padded to 32).
+    Multiple(u32),
 }
 
 /// A guest input as a loaded model reads it: its declaration, and the lane
@@ -204,7 +215,7 @@ pub struct InputDecl {
     pub axis: InputAxis,
     pub width: u32,
     pub dtype: Dtype,
-    pub rows: Option<u32>,
+    pub rows: Option<RowCount>,
     pub mask: u64,
     pub readers: Vec<u64>,
 }

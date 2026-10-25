@@ -25,6 +25,9 @@ InputDecl = _model.InputDecl
 LaneDecl = _model.LaneDecl
 Readout = _model.Readout
 ReadoutKind = _model.ReadoutKind
+RowCount = _model.RowCount
+RowCount_Exact = _model.RowCount_Exact
+RowCount_Multiple = _model.RowCount_Multiple
 ScheduleKind = _model.ScheduleKind
 SwitchDecl = _model.SwitchDecl
 
