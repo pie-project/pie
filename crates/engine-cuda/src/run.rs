@@ -1565,6 +1565,18 @@ impl<'c> Run<'c> {
         self.whole(id)
     }
 
+    /// The fire row `tensor(id)`'s row 0 stands at: the window's first row
+    /// on the value's axis, which a kernel that looks rows up in a fire-wide
+    /// table (the clip and token grids) adds back.
+    pub(crate) fn row_base(&self, id: ValueId) -> u32 {
+        let (cut, whole) = (self.tensor(id), self.whole(id));
+        let row = cut.dtype.row_bytes(cut.width).unwrap_or(0);
+        if row == 0 || cut.ptr < whole.ptr {
+            return 0;
+        }
+        u32::try_from((cut.ptr - whole.ptr) / row).unwrap_or(0)
+    }
+
     /// The custom mask a group-packed attention over packings `q` and `kv`
     /// applies, when a lane of the fire stated one.
     pub(crate) fn group_mask(
