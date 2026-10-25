@@ -176,6 +176,7 @@ impl Run<'_> {
                 *trim_t,
                 self.tensor(*y_grid),
                 self.tensor(*y),
+                [0, 0],
             ),
             Conv::PixelUnshuffle {
                 x,
@@ -190,6 +191,7 @@ impl Run<'_> {
                 *r,
                 self.tensor(*y_grid),
                 self.tensor(*y),
+                [0, 0],
             ),
             Conv::AvgDown {
                 x,
@@ -238,6 +240,7 @@ impl Run<'_> {
                 *p,
                 self.tensor(*tgrid),
                 self.tensor(*y),
+                [self.grid_base(*grid, *x), self.grid_base(*tgrid, *y)],
             ),
             Conv::Unpatchify {
                 x,
@@ -253,6 +256,7 @@ impl Run<'_> {
                 0,
                 self.tensor(*grid),
                 self.tensor(*y),
+                [self.grid_base(*tgrid, *x), self.grid_base(*grid, *y)],
             ),
             Conv::Cells {
                 tgrid,
@@ -265,6 +269,7 @@ impl Run<'_> {
                 self.tensor(*positions),
                 *axis,
                 self.tensor(*y),
+                self.grid_base(*tgrid, *y),
             ),
         }
     }

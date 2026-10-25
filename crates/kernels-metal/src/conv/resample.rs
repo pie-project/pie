@@ -52,6 +52,10 @@ pub fn upsample_nearest(
     )
 }
 
+/// `bases`: the rows `grid` and `o_grid` address `x`'s and `y`'s row 0 at
+/// (`[x, y]`), nonzero in a window of a segmented fire whose grids hold
+/// fire-wide rows.
+#[allow(clippy::too_many_arguments)]
 pub fn pixel_shuffle(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -60,6 +64,7 @@ pub fn pixel_shuffle(
     trim_t: u32,
     o_grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.pixel_shuffle";
     let entry = dtype_dispatch!(OP, y.dtype, {
@@ -96,10 +101,14 @@ pub fn pixel_shuffle(
             r[1].arg(),
             r[2].arg(),
             trim_t.arg(),
+            bases[0].arg(),
+            bases[1].arg(),
         ],
     )
 }
 
+/// `bases` as [`pixel_shuffle`]'s.
+#[allow(clippy::too_many_arguments)]
 pub fn pixel_unshuffle(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -107,6 +116,7 @@ pub fn pixel_unshuffle(
     r: [u32; 3],
     o_grid: Tensor,
     y: Tensor,
+    bases: [u32; 2],
 ) -> Result<(), Error> {
     const OP: &str = "conv.pixel_unshuffle";
     let entry = dtype_dispatch!(OP, y.dtype, {
@@ -142,6 +152,8 @@ pub fn pixel_unshuffle(
             r[0].arg(),
             r[1].arg(),
             r[2].arg(),
+            bases[0].arg(),
+            bases[1].arg(),
         ],
     )
 }

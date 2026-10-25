@@ -76,6 +76,9 @@ inline int conv_axis(int n, int k, int s, int front, int back, thread bool& ok) 
 
 // Each token row's cell: a row of a clip of `tgrid` its patch's (t, h, w)
 // there, any other row positions[row] in column `axis`; zeros elsewhere.
+// `base`: the row `tgrid` addresses `y`'s row 0 at (a window of a segmented
+// fire starts `y` at its own rows while the fire's grid holds fire-wide
+// ones).
 [[kernel]] void cells(
     const device int* tgrid           [[buffer(0)]],
     const device int* positions       [[buffer(1)]],
@@ -84,17 +87,18 @@ inline int conv_axis(int n, int k, int s, int front, int back, thread bool& ok) 
     const constant int& axis          [[buffer(4)]],
     const constant int& width         [[buffer(5)]],
     const constant int& rows          [[buffer(6)]],
+    const constant int& base          [[buffer(7)]],
     uint gid                          [[thread_position_in_grid]]) {
   const int row = int(gid);
   if (row >= rows) return;
   device float* o = y + size_t(width) * size_t(row);
   for (int c = 0; c < width; ++c) o[c] = 0.0f;
   SpatialClip g;
-  if (clip_of(tgrid, clips, row, g) < 0) {
+  if (clip_of(tgrid, clips, row + base, g) < 0) {
     o[axis] = float(positions[row]);
     return;
   }
-  const SpatialVoxel v = unravel(g, row - g.off);
+  const SpatialVoxel v = unravel(g, row + base - g.off);
   o[0] = float(v.t);
   o[1] = float(v.h);
   o[2] = float(v.w);
