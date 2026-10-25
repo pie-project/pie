@@ -186,6 +186,9 @@ pub struct Seated<'a> {
     pub captures_scores: bool,
 
     pub translation: &'a [u32],
+
+    pub group: Option<u32>,
+    pub inputs: &'a [(engine::fire::InputFeed, crate::program::InputCell)],
 }
 
 impl<'a> Seated<'a> {
@@ -206,6 +209,8 @@ impl<'a> Seated<'a> {
             rs: &FOLD,
             rs_reset: engine::fire::RsReset::Inferred,
             rs_slot: None,
+            group: None,
+            inputs: &[],
         }
     }
 
@@ -348,6 +353,7 @@ pub struct Shell {
 
     out: Option<ValueId>,
 
+    feeds: poem_exec::feeds::Feeds,
     voxel_seat: Option<crate::inputs::VoxelSeat>,
     pixels: Vec<(ValueId, u32, poem_ir::ClassSet)>,
     pixel_out: Vec<Buffer>,
@@ -549,23 +555,13 @@ impl Shell {
             .values
             .iter()
             .any(|decl| matches!(&decl.def, poem_ir::Def::Input(RuntimeInput::ReadoutRows)));
-        if let Some(id) = boot.trace.values.iter().find_map(|decl| match decl.def {
-            poem_ir::Def::Input(RuntimeInput::Guest { id, axis, .. })
-                if axis != poem_ir::InputAxis::Voxel =>
-            {
-                Some(id)
-            }
-            _ => None,
-        }) {
-            let name = boot
-                .trace
-                .inputs
-                .get(id as usize)
-                .map_or_else(|| id.to_string(), |input| input.name.clone());
+        let feeds = poem_exec::feeds::Feeds::of(&boot.trace, &compiled);
+        if let Some(value) = feeds.unlanded.first() {
             return Err(Fault::Program {
                 at: "serve::load",
                 why: format!(
-                    "this plan reads guest input `{name}`, which this shell stages no seat for"
+                    "value {} merges guest inputs under a guard this shell cannot select by",
+                    value.0
                 ),
             });
         }
@@ -616,6 +612,8 @@ impl Shell {
                     gathers,
                     patch_seat,
                     states_mrope,
+                    &feeds.seats(),
+                    feeds.selections.len(),
                     voxel_seat,
                 )
             })
@@ -978,6 +976,7 @@ impl Shell {
             rs_buffers,
             rs_scratch: None,
             out,
+            feeds,
             voxel_seat,
             pixels: pixels
                 .into_iter()
@@ -1810,7 +1809,9 @@ impl Shell {
 
             tables.push(std::borrow::Cow::Borrowed(seated.pages));
 
-            let masking = seated.mask;
+            // A kv-less lane's mask is over its attention group's rows: the
+            // group-packed attention takes it, not the paged prefill's.
+            let masking = seated.mask.filter(|_| !seated.kv_less);
             let runs_masked_arm = self.masked.contains(row.class as usize);
             if masking.is_some() && self.masked.is_empty() {
                 return Err(Fault::Maskless { lane: row.source });
@@ -2189,6 +2190,36 @@ impl Shell {
             }
         }
 
+        let (group_of_lane, packings) = if self.feeds.selections.is_empty() {
+            (Vec::new(), Vec::new())
+        } else {
+            let facts: Vec<poem_exec::fire::LaneFacts> = lanes
+                .iter()
+                .map(|seated| poem_exec::fire::LaneFacts {
+                    group: seated.group,
+                })
+                .collect();
+            let group_of_lane = poem_exec::fire::group_of_lane(composition.lanes(), &facts);
+            let mut packings = Vec::with_capacity(self.feeds.selections.len());
+            for &select in &self.feeds.selections {
+                packings.push(
+                    poem_exec::fire::pack(select, composition.lanes(), &group_of_lane, rows)
+                        .map_err(|fault| Fault::from(poem_exec::Error::Fire(fault)))?,
+                );
+            }
+            (group_of_lane, packings)
+        };
+        let group_masks =
+            self.group_masks_of(lanes, &composition, &group_of_lane, &packings, &clips_of)?;
+        let packing_fires: Vec<crate::inputs::PackingFire<'_>> = packings
+            .iter()
+            .map(|packed| crate::inputs::PackingFire {
+                group_indptr: &packed.group_indptr,
+                lane_indptr: &packed.lane_indptr,
+                permutation: &packed.permutation,
+            })
+            .collect();
+
         let (readout_rows, readout_layout) = readout_table(&composition, lanes)?;
         let bound = self.inputs[arm].write(
             &self.handles,
@@ -2213,6 +2244,8 @@ impl Shell {
                     grids: &patch_grids,
                 }),
                 mrope_positions: self.states_mrope.then_some(mrope_positions.as_slice()),
+                group_of_lane: &group_of_lane,
+                packings: &packing_fires,
                 voxels: (composition.clips() > 0).then_some(crate::inputs::VoxelFire {
                     grid: &voxel_grid,
                     token_grid: &voxel_token_grid,
@@ -2222,6 +2255,10 @@ impl Shell {
             },
         )?;
         windows.bind(&self.handles, bound.windows)?;
+        let group_masks =
+            self.inputs[arm].stage_group_masks(&self.device, &self.handles, &group_masks)?;
+        self.feed_inputs(arm, &composition, lanes, &clips_of)?;
+        let merge_lands = self.merge_lands(&composition, lanes);
 
         let readouts = u64::from(lane_count).max(readout_rows.len() as u64);
         let readouts_ceiling = poem_compiler::arena::readouts_ceiling(&self.budgets.tokens);
@@ -2290,6 +2327,16 @@ impl Shell {
                 mask_stride: bound.mask_stride,
             },
 
+            group_of_lane: bound.group_of_lane,
+            packings: self
+                .feeds
+                .selections
+                .iter()
+                .copied()
+                .zip(bound.packings.iter().copied())
+                .collect(),
+            group_masks,
+            inputs: bound.inputs,
             voxels: bound.voxels,
             scores: match self.scores.as_ref() {
                 Some(slab) => Some(slab.seat(&self.handles)?),
@@ -2330,6 +2377,7 @@ impl Shell {
         Ok(Prepared {
             done,
             guests,
+            merge_lands,
             classes: composition
                 .lanes()
                 .iter()
@@ -2352,14 +2400,15 @@ impl Shell {
 
     fn walk_once(&self, p: &Prepared<'_>) -> Result<Walked> {
         let place = At::new();
-        let frame = Some(self.device.frame()?);
-        let sink = Encoded::Live(Sink::new(
-            &self.device,
-            frame.as_ref().expect("the walk opened a frame"),
-            &self.pipelines,
-            &self.handles,
-        ));
+        let mut frame = Some(self.device.frame()?);
+        self.land_merges(frame.as_mut().expect("just opened"), p)?;
         {
+            let sink = Encoded::Live(Sink::new(
+                &self.device,
+                frame.as_ref().expect("the walk opened a frame"),
+                &self.pipelines,
+                &self.handles,
+            ));
             let mut run = Run::new(
                 &sink,
                 &self.handles,
@@ -2393,7 +2442,6 @@ impl Shell {
             )?;
         }
 
-        drop(sink);
         let launches = (0..self.compiled.template().len() as u32)
             .map(|region| p.windows.runs(region).max(1))
             .sum();
@@ -2446,6 +2494,7 @@ pub struct Prepared<'a> {
     done: Option<Done>,
 
     guests: Option<crate::landing::Guests>,
+    merge_lands: Vec<MergeLand>,
     classes: Vec<usize>,
 
     arm: usize,
@@ -2541,6 +2590,17 @@ fn readout_rows(max_lanes: u32) -> u32 {
     max_lanes
         .saturating_mul(READOUT_ROWS_PER_LANE)
         .max(max_lanes)
+}
+
+/// A merge over a guest input: lanes' rows of the input's seat (or zeros,
+/// where the lane feeds none) land in the merge's column.
+#[derive(Debug, Clone, Copy)]
+struct MergeLand {
+    merge: ValueId,
+    seat: crate::inputs::Seat,
+    first: u32,
+    rows: u32,
+    fed: bool,
 }
 
 struct Flight {
@@ -2884,4 +2944,264 @@ fn writer_classes(
         }
     }
     classes
+}
+
+impl Shell {
+    /// The custom mask each group-packed attention of this fire applies,
+    /// out of the kv-less lanes' stated masks: none when no lane states one
+    /// (engine-cuda `serve/prepare.rs::group_masks_of`).
+    fn group_masks_of(
+        &self,
+        lanes: &[Seated<'_>],
+        composition: &Composition,
+        group_of_lane: &[i32],
+        packings: &[poem_exec::fire::Packed],
+        clips_of: &[Option<&Clips<'_>>],
+    ) -> Result<
+        Vec<(
+            poem_ir::Selection,
+            poem_ir::Selection,
+            poem_exec::fire::GroupMask,
+        )>,
+    > {
+        let stated: Vec<Option<poem_exec::fire::LaneMask>> = lanes
+            .iter()
+            .map(|seated| {
+                seated
+                    .mask
+                    .filter(|_| seated.kv_less)
+                    .map(|masking| poem_exec::fire::LaneMask {
+                        rows: masking
+                            .masks()
+                            .iter()
+                            .map(|mask| mask.admitted(0..mask.total).collect())
+                            .collect(),
+                    })
+            })
+            .collect();
+        if stated.iter().all(Option::is_none) {
+            return Ok(Vec::new());
+        }
+        if self.feeds.ragged.is_empty() {
+            return Err(program(
+                "serve::mask",
+                "a kv-less lane states an attention mask and this model packs no attention \
+                 group; the mask applies to group-packed `attention.ragged` only"
+                    .to_string(),
+            ));
+        }
+        let fire = |fault| Fault::from(poem_exec::Error::Fire(fault));
+        let patch = self.voxel_seat.and_then(|seat| seat.token_patch);
+        let mut guests = vec![poem_exec::fire::GuestRows::default(); lanes.len()];
+        for row in composition.lanes() {
+            let clips = clips_of
+                .get(row.source as usize)
+                .copied()
+                .flatten()
+                .map(|clips| clips.boxes);
+            guests[row.source as usize] =
+                poem_exec::fire::guest_rows(row, clips, patch).map_err(fire)?;
+        }
+        let masks: Vec<Option<&poem_exec::fire::LaneMask>> =
+            stated.iter().map(Option::as_ref).collect();
+        let packed = |select: poem_ir::Selection| {
+            packings
+                .iter()
+                .find(|packed| packed.select == select)
+                .ok_or_else(|| {
+                    program(
+                        "serve::mask",
+                        format!("no packing of selection {select:?} was staged for this fire"),
+                    )
+                })
+        };
+        let mut staged = Vec::new();
+        for &(q, kv) in &self.feeds.ragged {
+            if let Some(mask) = poem_exec::fire::group_mask(
+                composition.lanes(),
+                group_of_lane,
+                packed(q)?,
+                packed(kv)?,
+                &masks,
+                &guests,
+            )
+            .map_err(fire)?
+            {
+                staged.push((q, kv, mask));
+            }
+        }
+        Ok(staged)
+    }
+
+    /// Writes each lane's guest input cells into the input seats this load
+    /// carved (a voxel input into the voxel payload), at the lane's rows. A
+    /// voxel lane that feeds no cell keeps the payload its clips carried.
+    fn feed_inputs(
+        &mut self,
+        arm: usize,
+        composition: &Composition,
+        lanes: &[Seated<'_>],
+        clips_of: &[Option<&Clips<'_>>],
+    ) -> Result<()> {
+        for (at_lane, row) in composition.lanes().iter().enumerate() {
+            let seated = &lanes[row.source as usize];
+            for (seat, readers) in &self.feeds.inputs {
+                if !readers.contains(row.class as usize) {
+                    continue;
+                }
+                let voxel = seat.voxel();
+                let Some((_, cell)) = seated.inputs.iter().find(|(feed, _)| feed.id == seat.id)
+                else {
+                    if voxel
+                        && clips_of[row.source as usize]
+                            .is_some_and(|tile| !tile.payload.is_empty())
+                    {
+                        continue;
+                    }
+                    return Err(program(
+                        "serve::feed_inputs",
+                        format!(
+                            "lane {} runs in a class that reads guest input {}, and the lane \
+                             feeds no channel for it",
+                            row.source, seat.id
+                        ),
+                    ));
+                };
+                let (cells, offset) = if seat.per_lane() {
+                    (1u64, at_lane as u64)
+                } else if voxel {
+                    (u64::from(row.voxels), u64::from(row.voxel_offset))
+                } else {
+                    (u64::from(row.rows), u64::from(row.row_offset))
+                };
+                let bytes = cells * seat.row_bytes();
+                let base = if voxel {
+                    self.inputs[arm].voxel_payload().map(|(_, at)| at)
+                } else {
+                    self.inputs[arm].seat(seat.id)
+                };
+                let base = base.ok_or_else(|| {
+                    program(
+                        "serve::feed_inputs",
+                        format!("this load carved no seat for guest input {}", seat.id),
+                    )
+                })?;
+                let landed =
+                    input_bytes(&cell.bytes, cell.dtype, seat.dtype, bytes).ok_or_else(|| {
+                        program(
+                            "serve::feed_inputs",
+                            format!(
+                                "lane {} feeds a {:?} guest input of {bytes} bytes with a {:?} \
+                                 cell of {} bytes",
+                                row.source,
+                                seat.dtype,
+                                cell.dtype,
+                                cell.bytes.len()
+                            ),
+                        )
+                    })?;
+                self.inputs[arm].write_input(base + offset * seat.row_bytes(), &landed)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Each lane's rows of each merge over a guest input.
+    fn merge_lands(&self, composition: &Composition, lanes: &[Seated<'_>]) -> Vec<MergeLand> {
+        let mut lands = Vec::new();
+        for (at_lane, row) in composition.lanes().iter().enumerate() {
+            let seated = &lanes[row.source as usize];
+            for merged in &self.feeds.merged {
+                if !merged.select.holds(row.word) {
+                    continue;
+                }
+                lands.push(MergeLand {
+                    merge: merged.merge,
+                    seat: merged.seat,
+                    first: if merged.seat.per_lane() {
+                        at_lane as u32
+                    } else {
+                        row.row_offset
+                    },
+                    rows: if merged.seat.per_lane() { 1 } else { row.rows },
+                    fed: seated
+                        .inputs
+                        .iter()
+                        .any(|(feed, _)| feed.id == merged.seat.id),
+                });
+            }
+        }
+        lands
+    }
+
+    /// Lands each merge's lanes' rows of its guest input in its column.
+    fn land_merges(&self, frame: &mut Frame, p: &Prepared<'_>) -> Result<()> {
+        for land in &p.merge_lands {
+            let column = p.slots.0[land.merge.0 as usize].ok_or_else(|| Fault::Unbound {
+                what: format!(
+                    "value {}, a merge over a guest input, which the carve gave no rectangle",
+                    land.merge.0
+                ),
+            })?;
+            let row_bytes = land.seat.row_bytes();
+            let bytes = u64::from(land.rows) * row_bytes;
+            let into_at = self
+                .handles
+                .get(column.buf)
+                .ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "handle {}, a merged column's, which this fire minted no row for",
+                        column.buf
+                    ),
+                })?
+                .offset()
+                + u64::from(land.first) * row_bytes;
+            if !land.fed {
+                frame.fill_zero(self.arena.store(), into_at, bytes)?;
+                continue;
+            }
+            let at = self.inputs[p.arm]
+                .seat(land.seat.id)
+                .ok_or_else(|| Fault::Unbound {
+                    what: format!(
+                        "the guest input {} rectangle, which this load carved none of",
+                        land.seat.id
+                    ),
+                })?;
+            frame.copy(
+                self.inputs[p.arm].store(),
+                at + u64::from(land.first) * row_bytes,
+                self.arena.store(),
+                into_at,
+                bytes,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// A guest input cell's bytes as the seat's element: an f32 cell lands in a
+/// bf16 seat rounded, any other as it is.
+fn input_bytes(raw: &[u8], from: eta_ir::types::Dtype, to: Dtype, bytes: u64) -> Option<Vec<u8>> {
+    let bytes = usize::try_from(bytes).ok()?;
+    match (from, to) {
+        (eta_ir::types::Dtype::F32, Dtype::Bf16) => {
+            let values = bytes / 2;
+            if raw.len() < values * 4 {
+                return None;
+            }
+            Some(
+                raw.as_chunks::<4>().0[..values]
+                    .iter()
+                    .flat_map(|word| {
+                        let bits = f32::from_le_bytes(*word).to_bits();
+                        let rounded = bits.wrapping_add(0x7fff + ((bits >> 16) & 1));
+                        ((rounded >> 16) as u16).to_le_bytes()
+                    })
+                    .collect(),
+            )
+        }
+        _ if raw.len() >= bytes => Some(raw[..bytes].to_vec()),
+        _ => None,
+    }
 }

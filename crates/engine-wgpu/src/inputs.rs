@@ -57,6 +57,46 @@ pub struct VoxelFire<'a> {
     pub payload: &'a [u8],
 }
 
+pub use poem_exec::feeds::Seat;
+
+#[derive(Debug, Clone, Copy)]
+struct SeatAt {
+    seat: Seat,
+    at: u64,
+    bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PackingAt {
+    group_indptr: u64,
+    lane_indptr: u64,
+    permutation: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PackingHandles {
+    pub group_indptr: Tensor,
+    pub lane_indptr: Tensor,
+    pub permutation: Tensor,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PackingFire<'a> {
+    pub group_indptr: &'a [i32],
+    pub lane_indptr: &'a [i32],
+    pub permutation: &'a [i32],
+}
+
+/// One ragged attention's custom mask on the device: over packings `q` and
+/// `kv`, the bits and each group's first byte.
+#[derive(Debug, Clone, Copy)]
+pub struct GroupMaskHandles {
+    pub q: poem_ir::Selection,
+    pub kv: poem_ir::Selection,
+    pub bits: Tensor,
+    pub indptr: Tensor,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PatchAt {
     payload: u64,
@@ -112,6 +152,9 @@ pub struct Handles {
     pub rs_replay: Option<Tensor>,
     pub rs_commit: Option<Tensor>,
 
+    pub group_of_lane: Option<Tensor>,
+    pub packings: Vec<PackingHandles>,
+    pub inputs: Vec<(u32, Tensor)>,
     pub voxels: Option<VoxelHandles>,
 }
 
@@ -172,6 +215,8 @@ pub struct Fire<'a> {
     pub rs_replay: Option<&'a [i32]>,
     pub rs_commit: Option<&'a [i32]>,
 
+    pub group_of_lane: &'a [i32],
+    pub packings: &'a [PackingFire<'a>],
     pub voxels: Option<VoxelFire<'a>>,
 }
 
@@ -215,7 +260,15 @@ pub struct Inputs {
     rs_replay: u64,
     rs_commit: u64,
 
+    group_of_lane: u64,
+    packings: Vec<PackingAt>,
+    seats: Vec<SeatAt>,
     voxels: Option<VoxelAt>,
+    /// The custom masks the fire's group-packed attentions read, staged
+    /// apart from the store: their size is the groups', not the load's.
+    group_masks: Option<Buffer>,
+    /// Smaller ones it outgrew, kept: an earlier fire may still read them.
+    outgrown: Vec<Buffer>,
 }
 
 impl Inputs {
@@ -229,6 +282,8 @@ impl Inputs {
         gathered: usize,
         patch: Option<PatchSeat>,
         mrope: bool,
+        seats: &[Seat],
+        selections: usize,
         voxel: Option<VoxelSeat>,
     ) -> Result<Inputs> {
         let rows = u64::from(budget.max_tokens);
@@ -285,6 +340,25 @@ impl Inputs {
         let mrope = mrope.then(|| take(rows * AXES * 4));
         let rs_replay = take(lanes * 4);
         let rs_commit = take(lanes * 4);
+        let group_of_lane = if selections == 0 { 0 } else { take(lanes * 4) };
+        let packings: Vec<PackingAt> = (0..selections)
+            .map(|_| PackingAt {
+                group_indptr: take((lanes + 1) * 4),
+                lane_indptr: take((lanes + 1) * 4),
+                permutation: take(rows * 4),
+            })
+            .collect();
+        let seats: Vec<SeatAt> = seats
+            .iter()
+            .map(|seat| {
+                let bytes = if seat.per_lane() { lanes } else { rows } * seat.row_bytes();
+                SeatAt {
+                    seat: *seat,
+                    at: take(bytes),
+                    bytes,
+                }
+            })
+            .collect();
         let voxels = voxel.map(|seat| {
             let element = poem_compiler::arena::elem_bytes(seat.dtype).unwrap_or(2);
             VoxelAt {
@@ -323,8 +397,99 @@ impl Inputs {
             mrope,
             rs_replay,
             rs_commit,
+            group_of_lane,
+            packings,
+            seats,
             voxels,
+            group_masks: None,
+            outgrown: Vec::new(),
         })
+    }
+
+    #[must_use]
+    pub fn store(&self) -> &Buffer {
+        &self.store
+    }
+
+    pub fn write_input(&mut self, at: u64, bytes: &[u8]) -> Result<()> {
+        self.store.write(at, bytes)
+    }
+
+    /// The store offset of guest input `id`'s rectangle.
+    #[must_use]
+    pub fn seat(&self, id: u32) -> Option<u64> {
+        self.seats
+            .iter()
+            .find(|at| at.seat.id == id)
+            .map(|at| at.at)
+    }
+
+    /// Stages each ragged attention's custom mask in one buffer grown to
+    /// hold them.
+    pub fn stage_group_masks(
+        &mut self,
+        device: &Context,
+        handles: &crate::device::Handles,
+        masks: &[(
+            poem_ir::Selection,
+            poem_ir::Selection,
+            poem_exec::fire::GroupMask,
+        )],
+    ) -> Result<Vec<GroupMaskHandles>> {
+        if masks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut image: Vec<u8> = Vec::new();
+        let mut placed = Vec::with_capacity(masks.len());
+        for (_, _, mask) in masks {
+            let indptr = image.len();
+            image.extend_from_slice(bytes_of(&mask.indptr));
+            image.resize(image.len().next_multiple_of(ALIGN as usize), 0);
+            let bits = image.len();
+            // The kernel reads the bits a word at a time.
+            image.extend_from_slice(&mask.bits);
+            image.resize(image.len().next_multiple_of(ALIGN as usize), 0);
+            placed.push((indptr, bits));
+        }
+        if self
+            .group_masks
+            .as_ref()
+            .is_none_or(|held| held.bytes() < image.len() as u64)
+        {
+            let grown = Buffer::host(device, (image.len() as u64).next_power_of_two())?;
+            if let Some(old) = self.group_masks.replace(grown) {
+                self.outgrown.push(old);
+            }
+        }
+        let buffer = self
+            .group_masks
+            .as_mut()
+            .expect("the group mask buffer was just sized");
+        buffer.write(0, &image)?;
+        let buffer = &*buffer;
+        masks
+            .iter()
+            .zip(placed)
+            .map(|((q, kv, mask), (indptr, bits))| {
+                let words = mask.bits.len().div_ceil(4).max(1) as u64;
+                Ok(GroupMaskHandles {
+                    q: *q,
+                    kv: *kv,
+                    bits: Tensor::new(
+                        handles.bind(buffer, bits as u64, words * 4)?,
+                        u32::try_from(words * 4).unwrap_or(u32::MAX),
+                        1,
+                        Dtype::U8,
+                    ),
+                    indptr: i32s(
+                        handles,
+                        buffer,
+                        indptr as u64,
+                        u32::try_from(mask.indptr.len()).unwrap_or(u32::MAX),
+                    )?,
+                })
+            })
+            .collect()
     }
 
     pub fn voxel_payload(&self) -> Option<(&Buffer, u64)> {
@@ -613,6 +778,81 @@ impl Inputs {
             }
         };
 
+        let group_of_lane = if self.packings.is_empty() {
+            None
+        } else {
+            if fire.group_of_lane.len() as u32 > lanes {
+                return Err(Fault::Ceiling {
+                    what: "group-of-lane entries",
+                    need: fire.group_of_lane.len() as u64,
+                    have: u64::from(lanes),
+                });
+            }
+            self.store
+                .write(self.group_of_lane, bytes_of(fire.group_of_lane))?;
+            Some(i32s(handles, &self.store, self.group_of_lane, lanes)?)
+        };
+        if fire.packings.len() != self.packings.len() {
+            return Err(Fault::Ceiling {
+                what: "packing tables against the selections this load carved",
+                need: fire.packings.len() as u64,
+                have: self.packings.len() as u64,
+            });
+        }
+        let mut packings = Vec::with_capacity(self.packings.len());
+        let mut scratch: Vec<i32> = Vec::new();
+        for (at, staged) in self.packings.iter().zip(fire.packings) {
+            for (what, have, ceiling) in [
+                (
+                    "group indptr entries",
+                    staged.group_indptr.len() as u64,
+                    u64::from(lanes) + 1,
+                ),
+                (
+                    "lane indptr entries",
+                    staged.lane_indptr.len() as u64,
+                    u64::from(lanes) + 1,
+                ),
+                (
+                    "packed row permutation",
+                    staged.permutation.len() as u64,
+                    u64::from(rows),
+                ),
+            ] {
+                if have > ceiling {
+                    return Err(Fault::Ceiling {
+                        what,
+                        need: have,
+                        have: ceiling,
+                    });
+                }
+            }
+            csr(&mut scratch, staged.group_indptr, lanes + 1);
+            self.store.write(at.group_indptr, bytes_of(&scratch))?;
+            csr(&mut scratch, staged.lane_indptr, lanes + 1);
+            self.store.write(at.lane_indptr, bytes_of(&scratch))?;
+            rows_table(&mut scratch, staged.permutation, rows);
+            self.store.write(at.permutation, bytes_of(&scratch))?;
+            packings.push(PackingHandles {
+                group_indptr: i32s(handles, &self.store, at.group_indptr, lanes + 1)?,
+                lane_indptr: i32s(handles, &self.store, at.lane_indptr, lanes + 1)?,
+                permutation: i32s(handles, &self.store, at.permutation, rows)?,
+            });
+        }
+        let mut inputs = Vec::with_capacity(self.seats.len());
+        for at in &self.seats {
+            let carved = if at.seat.per_lane() { lanes } else { rows };
+            inputs.push((
+                at.seat.id,
+                Tensor::new(
+                    handles.bind(&self.store, at.at, at.bytes)?,
+                    carved,
+                    at.seat.width,
+                    at.seat.dtype,
+                ),
+            ));
+        }
+
         let mut spaces = Vec::with_capacity(self.spaces.len());
         for (at, geometry) in self.spaces.iter().zip(fire.spaces) {
             self.store.write(at.indptr, bytes_of(&geometry.indptr))?;
@@ -694,6 +934,9 @@ impl Inputs {
             } else {
                 None
             },
+            group_of_lane,
+            packings,
+            inputs,
             voxels,
         })
     }
@@ -735,6 +978,19 @@ fn i32s(handles: &crate::device::Handles, store: &Buffer, at: u64, rows: u32) ->
 fn u32s(handles: &crate::device::Handles, store: &Buffer, at: u64, rows: u32) -> Result<Tensor> {
     let buf = handles.bind(store, at, u64::from(rows) * 4)?;
     Ok(Tensor::new(buf, rows, 1, Dtype::U32))
+}
+
+fn csr(into: &mut Vec<i32>, staged: &[i32], ceiling: u32) {
+    into.clear();
+    into.extend_from_slice(staged);
+    let last = into.last().copied().unwrap_or(0);
+    into.resize(ceiling as usize, last);
+}
+
+fn rows_table(into: &mut Vec<i32>, staged: &[i32], rows: u32) {
+    into.clear();
+    into.extend_from_slice(staged);
+    into.resize(rows as usize, -1);
 }
 
 fn bytes_of(values: &[i32]) -> &[u8] {

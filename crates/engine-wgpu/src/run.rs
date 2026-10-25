@@ -107,6 +107,15 @@ pub struct FireBindings {
 
     pub scores: Option<crate::scores::ScoreSeat>,
 
+    pub group_of_lane: Option<Tensor>,
+    pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
+    /// The custom mask each group-packed `attention.ragged` applies, by its
+    /// query and key packings, when a lane stated one.
+    pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
+
+    /// Each staged guest input's rectangle, by id.
+    pub inputs: Vec<(u32, Tensor)>,
+
     pub voxels: Option<crate::inputs::VoxelHandles>,
 }
 
@@ -273,6 +282,10 @@ impl<'c> Run<'c> {
         self.place.region.get()
     }
 
+    pub(crate) fn run_index(&self) -> u32 {
+        self.place.run.get()
+    }
+
     pub(crate) fn nodes(&self) -> &'c [Node] {
         self.nodes
     }
@@ -295,6 +308,29 @@ impl<'c> Run<'c> {
 
     pub(crate) fn uncut(&self, id: ValueId) -> Tensor {
         self.whole(id)
+    }
+
+    /// The custom mask a group-packed attention with query and key CSRs
+    /// `q_indptr` and `kv_indptr` applies, when a lane of the fire stated
+    /// one.
+    pub(crate) fn group_mask(
+        &self,
+        q_indptr: ValueId,
+        kv_indptr: ValueId,
+    ) -> Option<crate::inputs::GroupMaskHandles> {
+        let packing = |id: ValueId| match self.values.get(id.0 as usize).map(|decl| &decl.def) {
+            Some(Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::GroupIndptr { select },
+                ..
+            })) => Some(*select),
+            _ => None,
+        };
+        let (q, kv) = (packing(q_indptr)?, packing(kv_indptr)?);
+        self.fire
+            .group_masks
+            .iter()
+            .find(|mask| mask.q == q && mask.kv == kv)
+            .copied()
     }
 
     pub(crate) fn address(&self, handle: u32) -> Option<(u64, u64)> {
@@ -509,12 +545,24 @@ impl<'c> Run<'c> {
                 axis: poem_ir::InputAxis::Voxel,
                 ..
             }) => self.voxel_seat(at).payload,
-            Def::Input(which @ RuntimeInput::RowPermutation { .. }) => {
-                panic!("value {at} reads {which:?}, which this shell does not stage")
+            Def::Input(RuntimeInput::RowPermutation { select }) => {
+                self.packing(at, *select).permutation
             }
-            Def::Input(RuntimeInput::Guest { id, .. }) => {
-                panic!("value {at} reads guest input {id}, which this shell does not stage")
-            }
+            Def::Input(RuntimeInput::Guest { id, .. }) => self.guest(at, *id),
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::GroupOfLane,
+                ..
+            }) => self.fire.group_of_lane.unwrap_or_else(|| {
+                panic!("value {at} reads the group-of-lane table, which this load carved none of")
+            }),
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::GroupIndptr { select },
+                ..
+            }) => self.packing(at, *select).group_indptr,
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::LaneIndptr { select },
+                ..
+            }) => self.packing(at, *select).lane_indptr,
             Def::Input(RuntimeInput::TokenGrid { .. }) => {
                 self.voxel_seat(at).token_grid.unwrap_or_else(|| {
                     panic!("value {at} reads the token side of the patchify pair, which this load carved none of")
@@ -776,6 +824,28 @@ impl<'c> Run<'c> {
                     panic!("the moment planes this load reserved do not mint: {fault}")
                 }),
         )
+    }
+
+    fn guest(&self, at: usize, id: u32) -> Tensor {
+        self.fire
+            .inputs
+            .iter()
+            .find(|(seat, _)| *seat == id)
+            .map(|(_, tensor)| *tensor)
+            .unwrap_or_else(|| {
+                panic!("value {at} reads guest input {id}, which this load carved no rectangle for")
+            })
+    }
+
+    fn packing(&self, at: usize, select: poem_ir::Selection) -> crate::inputs::PackingHandles {
+        self.fire
+            .packings
+            .iter()
+            .find(|(held, _)| *held == select)
+            .map(|(_, packing)| *packing)
+            .unwrap_or_else(|| {
+                panic!("value {at} reads a packing of {select:?}, which this fire staged none of")
+            })
     }
 
     fn voxel_seat(&self, at: usize) -> crate::inputs::VoxelHandles {
