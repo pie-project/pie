@@ -1,6 +1,6 @@
-//! A GGUF's GDN layers read into the order the scan pairs heads by: `in_ba`
-//! is `[beta, alpha]`, beta first, and a qwen35 GGUF's tiled v-heads are
-//! gathered back into block order.
+//! A GGUF's GDN layers read into the order the scan pairs heads by: beta
+//! and alpha each from its own tensor, joined into `in_ba` beta first, and a
+//! qwen35 GGUF's tiled v-heads are gathered back into block order.
 
 use crate::sparse_gguf::{Kv, Scratch, reads};
 use poem::Dtype;
@@ -24,14 +24,15 @@ const BLOCK_ORDER: &str = "indices: [0, 4, 1, 5, 2, 6, 3, 7]";
 fn in_ba_concatenates_beta_first() {
     let scratch = Scratch::new("qwen3-in-ba");
     let log = reads(&scratch.0, "qwen35-tiny", Dtype::Bf16, &[arch("qwen35")]);
-    let read = read_of(&log, "layers.0.gdn.in_ba");
-    let beta = read
-        .find("blk.0.ssm_beta.weight")
-        .expect("in_ba reads ssm_beta");
-    let alpha = read
-        .find("blk.0.ssm_alpha.weight")
-        .expect("in_ba reads ssm_alpha");
-    assert!(beta < alpha, "in_ba lands beta first: {read}");
+    assert!(read_of(&log, "layers.0.gdn.in_b").contains("blk.0.ssm_beta.weight"));
+    assert!(read_of(&log, "layers.0.gdn.in_a").contains("blk.0.ssm_alpha.weight"));
+    let trace = poem_compiler::catalog::trace_of("qwen35-tiny", Dtype::Bf16, Dtype::Bf16, poem::Platform::Metal);
+    let joins = poem_compiler::catalog::lowering_of(&trace, 1).joins;
+    let ba = joins
+        .iter()
+        .find(|j| j.name == "layers.0.gdn.in_ba")
+        .expect("the compiler joins beta and alpha");
+    assert_eq!(ba.legs, ["layers.0.gdn.in_b", "layers.0.gdn.in_a"], "beta first");
 }
 
 #[test]

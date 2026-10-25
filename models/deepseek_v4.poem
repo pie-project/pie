@@ -1197,10 +1197,10 @@ def huggingface(m, reads):
         elif f.kind == "routed":
             reads.read(f.router, n("mlp.gate.weight"))
             reads.read(f.bias, n("mlp.gate.e_score_correction_bias"))
-            for w, half in [(f.gate, "gate_proj"), (f.up, "up_proj")]:
-                reads.read_expr(w, concat(0, [
+            for leg, half in [(f.gate, "gate_proj"), (f.up, "up_proj")]:
+                reads.read_expr(leg, concat(0, [
                     src(n("mlp.experts.{}.{}.weight".format(e, half))).transmute(
-                        [1, w.shape[1], w.shape[2]], encoding(w.dtype))
+                        [1, leg.shape[1], leg.shape[2]], encoding(leg.dtype))
                     for e in range(f.experts)
                 ]))
             reads.read_expr(f.down, concat(0, [

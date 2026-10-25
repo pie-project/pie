@@ -263,8 +263,8 @@ def read(m, reads, codes):
             ))
             reads.read(mlp.down_bias, ck("mlp.experts.down_proj_bias"))
         else:
-            for w, bias, leg in [(mlp.gate, mlp.gate_bias, "gate_proj"), (mlp.up, mlp.up_bias, "up_proj")]:
-                reads.extend(banked_split(w, [ck("mlp.experts." + leg)], codes))
+            for bank, bias, leg in [(mlp.gate, mlp.gate_bias, "gate_proj"), (mlp.up, mlp.up_bias, "up_proj")]:
+                reads.extend(banked_split(bank, [ck("mlp.experts." + leg)], codes))
                 reads.read(bias, ck("mlp.experts.{}.bias".format(leg)))
             reads.extend(banked_split(mlp.down, [ck("mlp.experts.down_proj")], codes))
             reads.read(mlp.down_bias, ck("mlp.experts.down_proj.bias"))

@@ -957,8 +957,8 @@ def qwen3_next(m, reads):
         f = w.mlp
         reads.read(f.router, n("mlp.gate.weight"))
         e = lambda i, s: n("mlp.experts.{}.{}.weight".format(i, s))
-        for w, leg in [(f.gate, "gate_proj"), (f.up, "up_proj"), (f.down, "down_proj")]:
-            bank(reads, w, [[e(i, leg)] for i in range(f.experts)])
+        for held, leg in [(f.gate, "gate_proj"), (f.up, "up_proj"), (f.down, "down_proj")]:
+            bank(reads, held, [[e(i, leg)] for i in range(f.experts)])
         read_weight(reads, f.shared.gate, n("mlp.shared_expert.gate_proj.weight"), quantized = "read")
         read_weight(reads, f.shared.up, n("mlp.shared_expert.up_proj.weight"), quantized = "read")
         read_weight(reads, f.shared_down, n("mlp.shared_expert.down_proj.weight"), quantized = "read")
@@ -1123,11 +1123,11 @@ def gguf(m, reads):
             elif fused != None:
                 read_fused(reads, [g.in_b, g.in_a], fused)
             else:
-                for w, leg in [(g.in_b, n("ssm_beta.weight")), (g.in_a, n("ssm_alpha.weight"))]:
+                for leg, name in [(g.in_b, n("ssm_beta.weight")), (g.in_a, n("ssm_alpha.weight"))]:
                     if untile:
-                        reads.read_expr(w, src(leg).gather(0, idx))
+                        reads.read_expr(leg, src(name).gather(0, idx))
                     else:
-                        reads.read(w, leg)
+                        reads.read(leg, name)
             if untile:
                 reads.read_expr(g.conv, src(n("ssm_conv1d.weight")).gather(0, sigma(k_w, width)))
                 reads.read_expr(g.dt_bias, src(n("ssm_dt.bias")).gather(0, sigma(0, 1)))
