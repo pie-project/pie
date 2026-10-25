@@ -44,6 +44,7 @@ pub use pie::inferlet::types;
 
 pub mod eta;
 pub mod mask;
+pub mod speculative;
 
 pub mod chat;
 

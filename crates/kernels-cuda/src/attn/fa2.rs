@@ -45,7 +45,7 @@ fn instantiated(op: &'static str, head_dim: u32) -> Result<(), Error> {
     ))
 }
 
-fn decode_symbol(
+pub(crate) fn decode_symbol(
     op: &'static str,
     g: &DecodeGeometry,
     arm: DecodeArm,
@@ -78,7 +78,7 @@ fn decode_symbol(
     ))
 }
 
-fn prefill_symbol(
+pub(crate) fn prefill_symbol(
     op: &'static str,
     g: &PrefillGeometry,
     arm: PrefillArm,
@@ -132,7 +132,7 @@ pub enum RaggedArm {
     RelativeBias,
 }
 
-fn prefill_ragged_symbol(
+pub(crate) fn prefill_ragged_symbol(
     op: &'static str,
     g: &PrefillGeometry,
     arm: RaggedArm,

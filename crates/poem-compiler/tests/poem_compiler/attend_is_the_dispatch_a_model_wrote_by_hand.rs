@@ -35,7 +35,7 @@ def forward(m, inputs):
         o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
         y = ops.elemwise.residual_add(o, y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
-        f = ops.linear.matmul(ops.linear.glu(ops.linear.matmul(x, w.gate_up), gating.swiglu(), m.inter), w.down)
+        f = ops.linear.matmul(ops.linear.glu(ops.linear.matmul(x, w.gate), gating.swiglu(), up = ops.linear.matmul(x, w.up)), w.down)
         return ops.elemwise.residual_add(f, y)
 
     y = inputs.fold_layers(m.layers, y, block)
@@ -46,7 +46,7 @@ def forward(m, inputs):
 def attention_by_hand(x, inputs, m, plans, mask, positions, scaling, w):
     pages = inputs.kv(w.kv)
     d = m.head_dim
-    q, k, v = ops.gather.split_qkv(ops.linear.matmul(x, w.qkv), m.q_width, m.kv_width)
+    q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
     seam.at(seam.ATTN_QV, [q, v])
     q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.full(), k = k, scaling = scaling)
     ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))

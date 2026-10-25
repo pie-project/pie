@@ -42,8 +42,15 @@ def rows(id):
 
 DEPLOYMENTS = rows("minimax-m25") + rows("minimax-m27") + rows("minimax-m25-mini")
 
-# The weights of MiniMax-M2: per layer an RMS norm, q, k and v packed into
-# one projection, q's and k's norms across all their heads, the output
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: q, k and v by their heads, the norms of q and k with them (each
+# rank's sum of squares summed across the ranks), the routed gates and ups
+# by their channels, the output and down projections by their rows, and the
+# head by its vocabulary.
+CUTS = "inferred"
+
+# The weights of MiniMax-M2: per layer an RMS norm, the q, k and v
+# projections, q's and k's norms across all their heads, the output
 # projection, an RMS norm, the router, its score bias and the routed experts'
 # banks (gate and up packed); the token embedding, a final norm and the head.
 # The deployment's first dtype stores the attention's projections, its second
@@ -85,15 +92,17 @@ def layout(id, deploy):
     def layer(l):
         return struct(
             attn_norm = weight([hidden]),
-            qkv = weight([q_width + 2 * kv_width, hidden], proj).packed([q_width, kv_width, kv_width], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
-            o = weight([hidden, q_width], proj).rows(),
+            q = weight([q_width, hidden], proj),
+            k = weight([kv_width, hidden], proj),
+            v = weight([kv_width, hidden], proj),
+            o = weight([hidden, q_width], proj),
             q_norm = weight([q_width]),
             k_norm = weight([kv_width]),
             mlp_norm = weight([hidden]),
             router = weight([d.experts, hidden]),
             bias = weight([d.experts], dtype.f32),
-            gate_up = weight([d.experts, 2 * d.inter, hidden], experts).bank([d.inter, d.inter]),
-            down = weight([d.experts, hidden, d.inter], experts).rows(),
+            gate_up = weight([d.experts, 2 * d.inter, hidden], experts),
+            down = weight([d.experts, hidden, d.inter], experts),
             kv = "kv.{}".format(l),
         )
 
@@ -115,7 +124,7 @@ def layout(id, deploy):
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         kv = deploy.kv,
         embed = weight([d.vocab, hidden]),
-        head = weight([d.vocab, hidden]).columns(),
+        head = weight([d.vocab, hidden]),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
     )
@@ -155,11 +164,9 @@ TRANSFORMERS = [
     ("model.norm.weight", "final_norm"),
     ("lm_head.weight", "head"),
     ("model.layers.{l}.input_layernorm.weight", "layers.{l}.attn_norm"),
-    ([
-        "model.layers.{l}.self_attn.q_proj.weight",
-        "model.layers.{l}.self_attn.k_proj.weight",
-        "model.layers.{l}.self_attn.v_proj.weight",
-    ], "layers.{l}.qkv"),
+    ("model.layers.{l}.self_attn.q_proj.weight", "layers.{l}.q"),
+    ("model.layers.{l}.self_attn.k_proj.weight", "layers.{l}.k"),
+    ("model.layers.{l}.self_attn.v_proj.weight", "layers.{l}.v"),
     ("model.layers.{l}.self_attn.o_proj.weight", "layers.{l}.o"),
     ("model.layers.{l}.self_attn.q_norm.weight", "layers.{l}.q_norm"),
     ("model.layers.{l}.self_attn.k_norm.weight", "layers.{l}.k_norm"),
@@ -219,7 +226,7 @@ def moe(x, m, w):
 def attention(x, inputs, m, positions, w):
     pages = inputs.kv(w.kv)
     d = m.head_dim
-    q, k, v = ops.gather.split_qkv(ops.linear.matmul(x, w.qkv), m.q_width, m.kv_width)
+    q, k, v = ops.linear.matmul(x, w.q), ops.linear.matmul(x, w.k), ops.linear.matmul(x, w.v)
     seam.at(seam.ATTN_QV, [q, v])
     q = ops.elemwise.rmsnorm(q, w.q_norm, m.eps)
     k = ops.elemwise.rmsnorm(k, w.k_norm, m.eps)

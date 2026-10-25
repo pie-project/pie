@@ -213,6 +213,7 @@ pub fn load(trace: Trace, contract: &ModelContract, checkpoint: &Path, max_voxel
         residency: engine_cuda::experts::Plan::default(),
         deferred_tier: true,
         world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
     })
     .unwrap_or_else(|why| panic!("the VAE plan does not load: {why}"));

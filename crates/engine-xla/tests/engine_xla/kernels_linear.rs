@@ -308,6 +308,86 @@ fn every_mlp_activation_answers_the_host() {
     }
 }
 
+/// Legs the pack left apart: each form over a gate and an up plane lands
+/// what it lands over the `[gate | up]` rows of the same values, bit for
+/// bit, an unclamped GPT-OSS unit clamped at the largest finite f32.
+#[test]
+fn a_gate_and_an_up_apart_land_what_they_land_packed() {
+    let (rows, i) = (3usize, 70usize);
+    let scale = |v: Vec<f32>, s: f32| v.into_iter().map(|x| round_bf16(x * s)).collect::<Vec<_>>();
+    let gs = scale(data(rows * i, 21), 8.0);
+    let us = scale(data(rows * i, 22), 8.0);
+    let ps: Vec<f32> = (0..rows)
+        .flat_map(|r| {
+            gs[r * i..(r + 1) * i]
+                .iter()
+                .chain(&us[r * i..(r + 1) * i])
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let (limit, alpha, beta, up_cap) = (3.0f32, 1.702f32, 2.5f32, 4.0f32);
+    const FORMS: usize = 7;
+
+    let mut b = Bench::new();
+    let packed = b.bf16(rows as u32, 2 * i as u32, &ps);
+    let gate = b.bf16(rows as u32, i as u32, &gs);
+    let up = b.bf16(rows as u32, i as u32, &us);
+    let outs: Vec<_> = (0..2 * FORMS)
+        .map(|_| b.zeros(Dtype::Bf16, rows as u32, i as u32))
+        .collect();
+    let iu = i as u32;
+    if !b
+        .run(|ctx| {
+            for k in 0..FORMS {
+                engine_xla::lower::lower(ctx, |l| {
+                    let (g, u) = (l.read(gate)?, l.read(up)?);
+                    let o_y = outs[2 * k];
+                    let y = o_y.landing();
+                    let v = match k {
+                        0 => mlp::swiglu_split(l.f(), g, u, y)?,
+                        1 => mlp::swiglu_clamp_split(l.f(), g, u, limit, y)?,
+                        2 => mlp::swiglu_clamp_alpha_split(l.f(), g, u, limit, alpha, y)?,
+                        3 => mlp::swiglu_clamp_alpha_split(l.f(), g, u, f32::MAX, alpha, y)?,
+                        4 => mlp::situ_split(l.f(), g, u, beta, None, y)?,
+                        5 => mlp::situ_split(l.f(), g, u, beta, Some(up_cap), y)?,
+                        _ => mlp::geglu_tanh(l.f(), g, u, y)?,
+                    };
+                    l.land(o_y, v)
+                })?;
+                engine_xla::lower::lower(ctx, |l| {
+                    let p = l.read(packed)?;
+                    let o_y = outs[2 * k + 1];
+                    let y = o_y.landing();
+                    let v = match k {
+                        0 => mlp::swiglu(l.f(), p, iu, y)?,
+                        1 => mlp::swiglu_clamp(l.f(), p, iu, limit, y)?,
+                        2 => mlp::swiglu_clamp_alpha(l.f(), p, iu, limit, alpha, y)?,
+                        3 => mlp::swiglu_clamp_alpha(l.f(), p, iu, f32::MAX, alpha, y)?,
+                        4 => mlp::situ(l.f(), p, iu, beta, None, y)?,
+                        5 => mlp::situ(l.f(), p, iu, beta, Some(up_cap), y)?,
+                        _ => mlp::geglu_tanh_packed(l.f(), p, iu, y)?,
+                    };
+                    l.land(o_y, v)
+                })?;
+            }
+            Ok(())
+        })
+        .unwrap()
+    {
+        return;
+    }
+    for k in 0..FORMS {
+        let (apart, joined) = (b.read_f32(outs[2 * k]), b.read_f32(outs[2 * k + 1]));
+        let off = apart
+            .iter()
+            .zip(&joined)
+            .filter(|(a, j)| a.to_bits() != j.to_bits())
+            .count();
+        assert_eq!(off, 0, "form {k}: {off} values differ apart and joined");
+    }
+}
+
 #[test]
 fn a_lora_correction_adds_each_rows_own_adapter() {
     let (rows, n_in, n_out, rank, adapters) = (6usize, 96usize, 40usize, 8usize, 3usize);

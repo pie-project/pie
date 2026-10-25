@@ -374,7 +374,7 @@ impl Stream {
                 self.delta(json!({"type": "thinking_delta", "thinking": text}));
             }
             Event::ReasoningEnd => self.close(),
-            Event::Logprobs(_) => {}
+            Event::Logprobs(_) | Event::PromptLogprobs(_) => {}
             Event::Text(text) => {
                 self.ensure(Block::Text);
                 self.delta(json!({"type": "text_delta", "text": text}));

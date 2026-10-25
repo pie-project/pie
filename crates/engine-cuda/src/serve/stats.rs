@@ -160,7 +160,7 @@ impl Shell {
     pub fn observed(&self, seat: u32) -> crate::error::Result<Option<Vec<f32>>> {
         self.scores
             .as_ref()
-            .map(|scores| scores.read_seat(seat))
+            .map(|scores| scores.read_seat(self.device.stream(), seat))
             .transpose()
     }
 

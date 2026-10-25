@@ -1,9 +1,9 @@
+mod frame;
 mod group_norm;
 mod hc;
 mod modulate;
 mod norm;
 mod norm_modulate;
-mod norm_residual;
 mod norm_rope;
 mod pointwise;
 mod posenc_bucket;
@@ -12,3 +12,5 @@ mod rope_axes;
 mod rope_mrope;
 mod rope_partial;
 mod rope_table;
+mod synth;
+mod synth_rules;

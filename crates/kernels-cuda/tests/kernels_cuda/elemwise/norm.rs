@@ -2,7 +2,7 @@
 
 //! Norm and rotation launchers against the host: `rope::partial_last`,
 //! `norm_rope::norm_rope_last` (on a staged window), the gated RMS norm and
-//! Kimi-K3's AttnRes blend.
+//! Kimi-K3's AttnRes blend, and a row norm the ranks split.
 
 use crate::common::attn_ref::{YARN, dot, landed, plane, rmsnorm, ten, turn, wide};
 use crate::common::{Gpu, Lcg, host::upload_to, to_bf16};
@@ -268,4 +268,80 @@ fn the_wide_row_norm_answers_the_host() {
             &format!("width {width} plus_one {plus_one}"),
         );
     }
+}
+
+/// A row norm the ranks split: each of `ranks` shares of a row `ranks *
+/// share` wide sums its squares, the sums are added (as the ranks' all-reduce
+/// adds them, each share counted `alike` times where a group of ranks holds it
+/// alike), and each share is normed by them: side by side the shares are the
+/// whole row's norm, unscaled, scaled or scaled by one plus the weight.
+fn shared_row(ranks: usize, share: usize, alike: usize, form: Option<bool>) {
+    let (rows, width) = (37usize, ranks * share);
+    let mut lcg = Lcg::seeded(0x5ad + width as u64);
+    let x_bits: Vec<u16> = (0..rows * width)
+        .map(|_| to_bf16(lcg.unit() * 3.0))
+        .collect();
+    let w_bits: Vec<u16> = (0..width).map(|_| to_bf16(lcg.unit() - 0.5)).collect();
+    let (x, w) = (wide(&x_bits), wide(&w_bits));
+    let scale: Option<Vec<f32>> =
+        form.map(|plus| w.iter().map(|v| if plus { 1.0 + v } else { *v }).collect());
+    let want = rmsnorm(&x, width, scale.as_deref(), 1e-6);
+    let mut gpu = Gpu::open();
+    let ctx = gpu.ctx();
+    let shares: Vec<(Vec<u16>, Vec<u16>)> = (0..ranks)
+        .map(|r| {
+            let x: Vec<u16> = (0..rows)
+                .flat_map(|t| x_bits[t * width + r * share..][..share].iter().copied())
+                .collect();
+            (x, w_bits[r * share..][..share].to_vec())
+        })
+        .collect();
+    let mut sums = vec![0f32; rows];
+    let mut ats = Vec::new();
+    for (x_share, w_share) in &shares {
+        let (x_at, w_at) = (gpu.up(x_share), gpu.up(w_share));
+        let ss_at = gpu.up(&vec![0f32; rows]);
+        norm::sum_squares(
+            &ctx,
+            ten(x_at, rows, share, Bf16),
+            &mut ten(ss_at, rows, 1, F32),
+        )
+        .expect("the sum fires");
+        gpu.sync();
+        for (s, v) in sums.iter_mut().zip(gpu.down::<f32>(ss_at, rows)) {
+            *s += v * alike as f32;
+        }
+        ats.push((x_at, w_at));
+    }
+    let ss_at = gpu.up(&sums);
+    let mut got = vec![0f32; rows * width];
+    for (r, (x_at, w_at)) in ats.into_iter().enumerate() {
+        let y_at = gpu.up(&vec![0u16; rows * share]);
+        norm::rmsnorm_by(
+            &ctx,
+            ten(x_at, rows, share, Bf16),
+            ten(ss_at, rows, 1, F32),
+            form.map(|_| ten(w_at, share, 1, Bf16)),
+            form == Some(true),
+            (width * alike) as u32,
+            1e-6,
+            &mut ten(y_at, rows, share, Bf16),
+        )
+        .expect("the norm fires");
+        gpu.sync();
+        let y = wide(&gpu.down::<u16>(y_at, rows * share));
+        for t in 0..rows {
+            got[t * width + r * share..][..share].copy_from_slice(&y[t * share..][..share]);
+        }
+    }
+    let what = format!("{ranks} shares of {share}, each {alike} times, weight {form:?}");
+    crate::common::attn_ref::near(&got, &want, 2e-2, 1.0, &what);
+}
+
+#[test]
+fn a_row_norm_the_ranks_split_answers_the_whole_rows() {
+    shared_row(2, 3072, 1, Some(false));
+    shared_row(8, 768, 1, Some(true));
+    shared_row(4, 256, 2, None);
+    shared_row(1, 1000, 1, Some(false));
 }

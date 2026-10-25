@@ -181,7 +181,13 @@ impl Scores {
         Ok(())
     }
 
-    pub(crate) fn read_seat(&self, seat: u32) -> crate::error::Result<Vec<f32>> {
+    /// The planes the lane at `seat` captured, read on `stream` behind the
+    /// fire that wrote them.
+    pub(crate) fn read_seat(
+        &self,
+        stream: *mut core::ffi::c_void,
+        seat: u32,
+    ) -> crate::error::Result<Vec<f32>> {
         if seat >= self.seats {
             return Err(crate::error::Fault::Ceiling {
                 what: "capturing lanes the score slab seats",
@@ -195,7 +201,7 @@ impl Scores {
             .saturating_mul(u64::from(self.layout.planes))
             .saturating_mul(u64::from(KV_MAX))
             .saturating_mul(4);
-        self.store.read(at, &mut raw)?;
+        self.store.read_on(stream, at, &mut raw)?;
         Ok(raw
             .as_chunks::<4>()
             .0

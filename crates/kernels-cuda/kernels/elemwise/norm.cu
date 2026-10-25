@@ -37,6 +37,57 @@ __global__ void rmsnorm_plus_one(
         x, weight, y, hidden, x_row_stride, y_row_stride, eps, heads, win);
 }
 
+// Each row's sum of squares, f32: one rank's term of a row norm whose row
+// the ranks split, summed across them before `rmsnorm_by` reads it.
+template <class T, int BLOCK = 256>
+__global__ void sum_squares(
+    const T* __restrict__ x,
+    float* __restrict__ ss,
+    int width,
+    const u32* __restrict__ win)
+{
+    const int row = blockIdx.x;
+    if (win != nullptr && row >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
+    const T* xr = x + static_cast<long long>(plane_row) * width;
+    float local = 0.f;
+    for (int i = threadIdx.x; i < width; i += BLOCK) {
+        const float v = Elem<T>::to_f32(xr[i]);
+        local += v * v;
+    }
+    __shared__ float buf[BLOCK];
+    const float sum = block_reduce_sum_fast<BLOCK>(local, buf);
+    if (threadIdx.x == 0) ss[plane_row] = sum;
+}
+
+// `x / sqrt(ss / whole + eps)` times the weight (`WEIGHT` 0: none, 1: the
+// weight, 2: one plus it): a row norm over a share `width` wide of a row
+// `whole` wide, its sum of squares `ss` stated a row.
+template <class T, int WEIGHT, int BLOCK = 256>
+__global__ void rmsnorm_by(
+    const T* __restrict__ x,
+    const float* __restrict__ ss,
+    const T* __restrict__ weight,
+    T* __restrict__ y,
+    int width,
+    float whole,
+    float eps,
+    const u32* __restrict__ win)
+{
+    const int row = blockIdx.x;
+    if (win != nullptr && row >= static_cast<int>(win[0])) return;
+    const int plane_row = win != nullptr ? row + static_cast<int>(win[1]) : row;
+    const T* xr = x + static_cast<long long>(plane_row) * width;
+    T* yr = y + static_cast<long long>(plane_row) * width;
+    const float inv_rms = rsqrtf(ss[plane_row] / whole + eps);
+    for (int i = threadIdx.x; i < width; i += BLOCK) {
+        float w = 1.f;
+        if constexpr (WEIGHT == 1) w = Elem<T>::to_f32(weight[i]);
+        if constexpr (WEIGHT == 2) w = 1.f + Elem<T>::to_f32(weight[i]);
+        yr[i] = Elem<T>::from_f32(Elem<T>::to_f32(xr[i]) * inv_rms * w);
+    }
+}
+
 // A wide row's RMS norm (its width a whole number of eights, at most
 // `256 * 8 * kRuns`) a block a row: each thread's 16-byte runs loaded at
 // once and held through the block's sum, so the row is read once.

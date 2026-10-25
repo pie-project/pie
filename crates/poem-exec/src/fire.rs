@@ -12,7 +12,7 @@ pub mod walk;
 
 pub use compose::{
     AxisComposition, ClassWindow, Composition, Lane, LaneRow, MaskSpan, WindowTable, chunk_spans,
-    compose, compose_axes, pass_spans, rung_of,
+    compose, compose_axes, compose_axes_at, pass_spans, rung_of,
 };
 pub use descriptor::{
     ABI_VERSION, CLASS_BYTES, FireDescriptor, HEADER_BYTES, LANE_BYTES, MAGIC, PATCH_LANE_BYTES,

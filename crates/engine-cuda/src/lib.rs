@@ -15,6 +15,7 @@ pub mod chip;
 pub mod comm;
 pub mod device;
 mod dispatch;
+pub mod ep;
 mod error;
 pub mod experts;
 pub mod exports;
@@ -22,6 +23,7 @@ pub mod group;
 #[cfg(not(feature = "rocm"))]
 pub mod grouped_decode;
 pub mod inputs;
+pub mod lockstep;
 pub mod mask;
 pub mod narrow;
 pub mod program;
@@ -36,6 +38,7 @@ pub mod settle;
 pub mod split_arm;
 pub mod staged_h2d;
 pub mod store;
+pub mod synth;
 pub mod tap;
 pub mod tune;
 pub mod voxels;
@@ -59,15 +62,15 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
         vec![
             rules::split_qkv_fused(),
             rules::qkv_fused_qknorm_rope_vnorm_write(),
-            rules::rmsnorm_residual_add(),
             rules::embed_scale_add_select(),
             rules::embed_scale_add(),
-            rules::residual_add_rmsnorm(),
             rules::matmul_glu(&[GluAct::GegluTanh, GluAct::Swiglu]),
+            rules::moe_mega(),
             rules::moe_experts(),
             rules::moe_select_glu(),
             rules::matmul_softcap(),
             rules::matmul_bias(),
+            rules::matmul_moe_route(),
             rules::matmul_split_rows(),
             rules::gated_residual_norm_modulate(),
             rules::norm_modulate(),
@@ -86,6 +89,7 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
             rules::hc_prenorm_project(),
             rules::hc_gates_norm(),
             rules::res_blend_rmsnorm(),
+            rules::hc_fold_pre(),
             rules::hc_pre(),
         ]
     });
@@ -117,10 +121,7 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
 
 /// The fused kernels left on with `fuse-chains=off`.
 #[cfg(not(feature = "rocm"))]
-pub const UNCHAINED: [&str; 2] = [
-    "fused.qkv_fused_qknorm_rope_vnorm_write",
-    "fused.residual_add_rmsnorm",
-];
+pub const UNCHAINED: [&str; 1] = ["fused.qkv_fused_qknorm_rope_vnorm_write"];
 #[cfg(feature = "rocm")]
 pub const UNCHAINED: [&str; 1] = ["fused.residual_add_rmsnorm"];
 
@@ -230,5 +231,83 @@ mod tests {
             }
         }
         assert!(refused.is_empty(), "formed, then refused: {refused:?}");
+    }
+
+    /// No `fused.region` of a catalog deployment, fused by this backend's
+    /// rules, folded and planned, lands an output over one of its inputs: a
+    /// generated kernel reads its parameters read-only on that. The arena
+    /// holds a value over every node that reads or writes it, both ends
+    /// included, so an input the region reads last and an output it writes
+    /// first are live together at its node; and a region aliases no output
+    /// into an input.
+    #[cfg(not(feature = "rocm"))]
+    #[test]
+    fn no_region_of_a_catalog_deployment_lands_over_its_inputs() {
+        use poem_ir::Fused;
+        let (mut wrong, mut held, mut planned, mut unplanned) =
+            (Vec::new(), 0usize, 0usize, Vec::new());
+        let profile = poem_compiler::DeviceProfile::default();
+        for row in poem_compiler::catalog::deployments() {
+            let Ok(trace) = row.try_trace(poem_ir::Platform::Cuda) else {
+                continue;
+            };
+            let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
+            let (folded, _) = poem_compiler::fuse::chain::fold(fused);
+            let regions: Vec<(Vec<poem_ir::ValueId>, Vec<poem_ir::ValueId>)> = folded
+                .nodes
+                .iter()
+                .filter_map(|node| match &node.op {
+                    Operation::Fused(Fused::Region { ins, outs, .. }) => {
+                        Some((ins.clone(), outs.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if regions.is_empty() {
+                continue;
+            }
+            let load = engine::load::Budgets {
+                max_lanes: 4,
+                max_tokens: 2048,
+                ..engine::load::Budgets::default()
+            };
+            let mut budgets = poem_compiler::Budgets::of(poem_compiler::Budget::new(4, 2048));
+            if let Some(ladder) = crate::api::patch_ladder(&folded, &load) {
+                budgets = budgets.with_patches(ladder);
+            }
+            if let Some(ladder) = crate::api::voxel_ladder(&folded, &load) {
+                budgets = budgets.with_voxels(ladder);
+            }
+            let Ok(compiled) = poem_compiler::compile_axes(&folded, &budgets, &profile) else {
+                unplanned.push(row.name.clone());
+                continue;
+            };
+            planned += 1;
+            let arena = &compiled.arena;
+            let fire = poem_compiler::FireRows::ceilings(&budgets);
+            for (ins, outs) in regions {
+                for out in &outs {
+                    for input in &ins {
+                        let shared = arena.root(*out) == arena.root(*input);
+                        let overlap = match (arena.window(*out, fire), arena.window(*input, fire)) {
+                            (Some(a), Some(b)) => {
+                                held += 1;
+                                a.offset < b.offset + b.bytes && b.offset < a.offset + a.bytes
+                            }
+                            _ => false,
+                        };
+                        if shared || overlap {
+                            wrong.push(format!("{}: {out:?} over {input:?}", row.name));
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "{planned} deployments planned, {held} region reads the arena holds, not planned: \
+             {unplanned:?}"
+        );
+        assert!(held > 0, "a region reads a value the arena holds");
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 }

@@ -1,0 +1,19 @@
+[package]
+name = "kernels-ir"
+version.workspace = true
+edition = "2024"
+authors = ["In Gim <in.gim@icloud.com>"]
+description = "The contract between what forms a fused kernel and the kernels-* backends that build it: a region (a dataflow of primitive row ops with its rounding points), its schedule into a kernel (passes over the row, what stays in registers, the reductions' order), the frame's primitives a kernel runs over, and a reference interpreter of both. Knows no backend's language and no IR above it."
+license = "Apache-2.0"
+repository = "https://github.com/pie-project/pie"
+publish = false
+
+[lib]
+name = "kernels_ir"
+path = "src/lib.rs"
+
+[dependencies]
+dtype = { package = "pie-dtype", path = "../dtype" }
+
+[lints]
+workspace = true

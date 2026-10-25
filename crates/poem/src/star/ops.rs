@@ -2629,34 +2629,17 @@ pub(crate) static OPS: &[Op] = &[
     Op {
         module: "linear",
         name: "moe_matmul_select",
-        params: &["x", "bank", "routes", "top_k"],
+        params: &["x", "bank", "routes", "top_k", "bias"],
         call: |a, heap| {
             let x: Value = a.next()?;
             let bank: Weight = a.next()?;
             let routes: Value = a.next()?;
             let top_k: u32 = a.next()?;
+            let bias: Option<Weight> = a.next()?;
             result(
                 heap,
                 dsl("linear.moe_matmul_select", || {
-                    ops::linear::moe_matmul_select(&x, &bank, &routes, top_k)
-                })?,
-            )
-        },
-    },
-    Op {
-        module: "linear",
-        name: "moe_matmul_select_bias",
-        params: &["x", "bank", "bias", "routes", "top_k"],
-        call: |a, heap| {
-            let x: Value = a.next()?;
-            let bank: Weight = a.next()?;
-            let bias: Weight = a.next()?;
-            let routes: Value = a.next()?;
-            let top_k: u32 = a.next()?;
-            result(
-                heap,
-                dsl("linear.moe_matmul_select_bias", || {
-                    ops::linear::moe_matmul_select_bias(&x, &bank, &bias, &routes, top_k)
+                    ops::linear::moe_matmul_select(&x, &bank, &routes, top_k, bias.as_ref())
                 })?,
             )
         },

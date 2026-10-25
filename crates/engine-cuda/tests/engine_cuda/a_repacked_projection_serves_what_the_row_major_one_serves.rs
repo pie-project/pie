@@ -299,3 +299,81 @@ fn a_tiled_declaration_bands_the_rows_on_both_sides() {
     drop(src);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// The micro's logits, its projections stored as `arm` lays them.
+#[cfg(feature = "cuda")]
+fn logits(arm: Arm, prompt: &[u32]) -> Vec<f32> {
+    let (micro, trace) = trace(arm);
+    let dir = scratch(&format!("serve-{arm:?}"));
+    let container = dir.join("micro.zt");
+    write_checkpoint(&container, arm);
+    let src = ztensor::Source::open(&container).expect("the fixture opens");
+    let contract = micro.load(&src);
+    drop(src);
+    let staged = engine_cuda::Shell::stage(engine_cuda::Boot {
+        trace: trace.clone(),
+        contract: &contract,
+        checkpoint: &container,
+        budget: poem_compiler::Budget::new(1, 256),
+        patches: None,
+        voxels: None,
+        page_size: 16,
+        context: 256,
+        slots: 1,
+        kv_budget: None,
+        memory_share: engine::load::DEFAULT_DEVICE_MEMORY_SHARE,
+        ordinal: 0,
+        knobs: engine_cuda::Knobs::default(),
+        cache_dir: None,
+        runahead: engine::runahead::Runahead::F1,
+        residency: engine_cuda::experts::Plan::default(),
+        deferred_tier: false,
+        world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
+        comm: core::ptr::null_mut(),
+    })
+    .expect("the micro loads");
+    let mut shell = staged.finish().expect("the micro arms");
+    shell.open(0).unwrap();
+    let word = trace
+        .facts
+        .word(&poem::Request::new(prompt.len() as u32, false));
+    let mut out = shell
+        .fire(&[engine_cuda::Lane {
+            slot: 0,
+            word,
+            tokens: prompt,
+        }])
+        .unwrap();
+    drop(shell);
+    let _ = std::fs::remove_dir_all(&dir);
+    out.remove(0)
+}
+
+/// The same u4 projections stored tiled answer what they answer row-major:
+/// the tiled arm reads them on the matrix core, the row-major one decodes
+/// them a lane a row, and both sum in f32.
+#[cfg(feature = "cuda")]
+#[test]
+fn a_tiled_projection_answers_what_the_row_major_one_answers() {
+    if !engine_cuda::device::present() {
+        eprintln!("skipping: no CUDA device on this machine");
+        return;
+    }
+    let prompt: Vec<u32> = (0..23).map(|t| (t * 37 + 5) % VOCAB).collect();
+    let row_major = logits(Arm::RowMajor, &prompt);
+    let tiled = logits(Arm::Tiled, &prompt);
+    let spread = row_major.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+        - row_major.iter().copied().fold(f32::INFINITY, f32::min);
+    let worst = row_major
+        .iter()
+        .zip(&tiled)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    eprintln!("tiled vs row-major: worst gap {worst} over a spread of {spread}");
+    assert!(spread > 1e-3, "the logits are a rectangle nothing wrote");
+    assert!(
+        worst <= 0.015 * spread,
+        "worst gap {worst} over a spread of {spread}"
+    );
+}

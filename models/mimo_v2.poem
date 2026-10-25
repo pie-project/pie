@@ -6,6 +6,12 @@ load("//lib/adapters.poem", "banks")
 MIMO = template("mimo")
 TOKENIZER = tokenizer(markers = [["<|im_end|>", "<|endoftext|>", "<think>", "</think>"]])
 
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: the packed q, k and v (laid out padded or as stored) and the sinks
+# by their heads, the dense and routed gates and ups by their channels, the
+# output and down projections by their rows, the head by its vocabulary.
+CUTS = "inferred"
+
 def mimo(id, layers, **kwargs):
     return model(id, template = MIMO, tokenizer = TOKENIZER, arch = "mimo_v2", layers = layers, vocab = 152576, **kwargs)
 
@@ -124,8 +130,9 @@ def layout(id, deploy):
             mlp = struct(
                 routed = False,
                 inter = di,
-                gate_up = weight([2 * di, hidden], weights).packed([di, di]),
-                down = weight([hidden, di], weights).rows(),
+                gate = weight([di, hidden], weights),
+                up = weight([di, hidden], weights),
+                down = weight([hidden, di], weights),
             )
         else:
             iw = d.inter
@@ -136,23 +143,17 @@ def layout(id, deploy):
                 inter = iw,
                 router = weight([d.experts, hidden]),
                 bias = weight([d.experts], dtype.f32),
-                gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
-                down = weight([d.experts, hidden, iw], experts).rows(),
+                gate_up = weight([d.experts, 2 * iw, hidden], experts),
+                down = weight([d.experts, hidden, iw], experts),
             )
         return struct(
             attn = struct(
                 reading = reading,
                 kv_heads = kv_heads,
                 theta = d.full_theta if reading == FULL else d.window_theta,
-                qkv = weight([q_qk + kv_kv, hidden], weights).packed(
-                    [q_qk, kv_heads * d.qk_head_dim, kv_heads * d.v_head_dim],
-                    heads = [d.q_heads, kv_heads, kv_heads],
-                ) if unpadded else weight([q_w + 2 * kv_w, hidden], weights).packed(
-                    [q_w, kv_w, kv_w],
-                    heads = [d.q_heads, kv_heads, kv_heads],
-                ),
-                o_proj = weight([hidden, d.q_heads * d.v_head_dim]).rows(),
-                sinks = weight([d.q_heads]).columns() if reading == WINDOWED else None,
+                qkv = weight([q_qk + kv_kv if unpadded else q_w + 2 * kv_w, hidden], weights),
+                o_proj = weight([hidden, d.q_heads * d.v_head_dim]),
+                sinks = weight([d.q_heads]) if reading == WINDOWED else None,
                 kv = "kv.{}".format(l),
             ),
             attn_norm = norm("attn_norm"),
@@ -181,7 +182,7 @@ def layout(id, deploy):
         shards = d.shards,
         kv = deploy.kv,
         embed = weight([d.vocab, hidden]),
-        head = weight([d.vocab, hidden]).packed([d.vocab]),
+        head = weight([d.vocab, hidden]),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
         final_norm_eps = d.norm_eps,
@@ -261,12 +262,14 @@ def huggingface(m, reads):
             reads.read(at.sinks, n("self_attn.attention_sink_bias"))
         f = w.mlp
         if not f.routed:
-            legs = [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")]
-            if kept(f.gate_up):
-                kept_legs(reads, f.gate_up, legs)
+            legs = [(f.gate, n("mlp.gate_proj.weight")), (f.up, n("mlp.up_proj.weight"))]
+            if kept(f.gate):
+                for leg, name in legs:
+                    kept_legs(reads, leg, [name])
                 kept_legs(reads, f.down, [n("mlp.down_proj.weight")])
                 continue
-            reads.push(tensor(f.gate_up.name, concat(0, [readable(reads, f.gate_up, leg) for leg in legs]), encoding(f.gate_up.dtype)))
+            for leg, name in legs:
+                reads.push(tensor(leg.name, readable(reads, leg, name), encoding(leg.dtype)))
             reads.read(f.down, n("mlp.down_proj.weight"))
             continue
         reads.read(f.router, n("mlp.gate.weight"))
@@ -424,7 +427,8 @@ def forward(m, inputs):
 
 def mlp(x, f):
     if not f.routed:
-        act = ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter)
+        gate, up = ops.linear.matmul(x, f.gate), ops.linear.matmul(x, f.up)
+        act = ops.linear.glu(gate, gating.swiglu(), up = up)
         return ops.linear.matmul(act, f.down)
     routes, weights = ops.linear.moe_route(
         ops.linear.matmul(x, f.router),

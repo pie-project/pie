@@ -1,16 +1,21 @@
+use kernels_cuda::Tensor;
 use kernels_cuda::attn::qkv_append;
+use kernels_cuda::synth::Plane;
 use poem_exec::{DispatchFused, KernelError};
 use poem_ir::ops::fused::Intermediates;
 use poem_ir::{Fused, Operands};
-use poem_ir::{NormAxis, NormWeight};
+use poem_ir::{NormAxis, NormWeight, ValueId};
 
 use crate::run::Run;
 
 /// The fused ops this backend's dispatch turns away. Its rules form none of
-/// them (`every_fused_op_its_rules_form_is_one_dispatch_fires`).
+/// them (`every_fused_op_its_rules_form_is_one_dispatch_fires`): the residual
+/// norms run as generated regions here, their fused ops ROCm's and Metal's.
 pub(crate) fn refuses(op: &Fused) -> bool {
     match op {
         Fused::GdnStep { .. }
+        | Fused::ResidualAddRmsnorm { .. }
+        | Fused::RmsnormResidualAdd { .. }
         | Fused::QGateNormRopeAppend {
             intermediates: Intermediates::Written,
             ..
@@ -31,7 +36,21 @@ impl DispatchFused for Run<'_> {
     fn dispatch(&mut self, op: &Fused) -> Result<(), KernelError> {
         match op {
             _ if refuses(op) => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+            Fused::Region {
+                ins,
+                width,
+                key: body,
+                outs,
+            } => {
+                if outs.first().is_some_and(|out| self.lane_shaped(*out)) {
+                    self.unseated(|| self.region(ins, *width, *body, outs))
+                } else {
+                    self.region(ins, *width, *body, outs)
+                }
+            }
             Fused::GdnStep { .. }
+            | Fused::ResidualAddRmsnorm { .. }
+            | Fused::RmsnormResidualAdd { .. }
             | Fused::QGateNormRopeAppend {
                 intermediates: Intermediates::Written,
                 ..
@@ -54,17 +73,18 @@ impl DispatchFused for Run<'_> {
             Fused::HcPrenormProject { .. } => self.hc_prenorm_project(op),
             Fused::HcGatesNorm { .. } => self.hc_gates_norm(op),
             Fused::ResBlendRmsnorm { .. } => self.res_blend_rmsnorm(op),
+            Fused::HcFoldPre { .. } => self.hc_fold_pre(op),
             Fused::HcPre { .. } => self.hc_pre(op),
             Fused::MatmulGlu { .. }
             | Fused::MatmulSwigluMatmul { .. }
             | Fused::MatmulSoftcap { .. }
             | Fused::MatmulBias { .. }
+            | Fused::MatmulMoeRoute { .. }
             | Fused::MatmulSplitRows { .. }
             | Fused::MoeSelectGlu { .. }
-            | Fused::MoeExperts { .. } => self.fused_linear(op),
-            Fused::ResidualAddRmsnorm { .. }
-            | Fused::RmsnormResidualAdd { .. }
-            | Fused::EmbedScaleAdd { .. }
+            | Fused::MoeExperts { .. }
+            | Fused::MoeMega { .. } => self.fused_linear(op),
+            Fused::EmbedScaleAdd { .. }
             | Fused::EmbedScaleAddSelect { .. }
             | Fused::NormRope { .. }
             | Fused::HcNormProject { .. }
@@ -84,6 +104,45 @@ impl DispatchFused for Run<'_> {
 }
 
 impl Run<'_> {
+    /// A `fused.region`: the kernel the load generated for its body over the
+    /// planes of its values, a weight's one row every row reads.
+    fn region(
+        &self,
+        ins: &[ValueId],
+        width: u32,
+        body: u64,
+        outs: &[ValueId],
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "fused.region";
+        let kernel =
+            self.region_kernel(body, width)
+                .ok_or_else(|| kernels_cuda::Error::Backend {
+                    op: OP,
+                    detail: format!("the load generated no kernel for body {body:016x} at {width}"),
+                })?;
+        let landed: Vec<Tensor> = outs.iter().map(|&v| self.tensor(v)).collect();
+        let rows = landed.first().map_or(0, |t| t.rows);
+        let mut planes = Vec::with_capacity(ins.len());
+        for &v in ins {
+            let t = self.tensor(v);
+            planes.push(if crate::synth::shared(&self.values()[v.0 as usize]) {
+                Plane::shared(&t)
+            } else if t.rows >= rows {
+                Plane::rows(&t)
+            } else {
+                return Err(kernels_cuda::Error::Backend {
+                    op: OP,
+                    detail: format!(
+                        "parameter value {} holds {} rows and the region lands {rows}",
+                        v.0, t.rows
+                    ),
+                });
+            });
+        }
+        let landed: Vec<Plane> = landed.iter().map(Plane::rows).collect();
+        kernel.fire(self.ctx(), &planes, &landed, rows)
+    }
+
     /// The e4m3 1x128 planes a sublayer's pre-mix lands its normed row `y`
     /// in beside the bf16 one, for the GEMM that quantizes it next
     /// (`Run::hold_e4m3`): held only where the pre-mix will land them.
@@ -100,6 +159,98 @@ impl Run<'_> {
         Ok(None)
     }
 
+    /// A sublayer's fold and the next sublayer's whole pre-mix: one launch
+    /// where the profile's seam rows take it (`kernel.elemwise.hc_mega_from`
+    /// to `hc_mega_until`, unread rows left unwritten), else the fold and
+    /// [`Run::hc_pre`]'s pre-mix.
+    fn hc_fold_pre(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
+        let Fused::HcFoldPre {
+            fold,
+            norm,
+            project,
+            gates,
+            rmsnorm,
+        } = op
+        else {
+            return Err(kernels_cuda::Error::Unsupported { op: op.name() });
+        };
+        if let (
+            poem_ir::Elemwise::HcFold {
+                x,
+                streams,
+                post_mix: post_in,
+                comb_mix: comb_in,
+                y: folded,
+            },
+            poem_ir::Elemwise::HcRmsnormF32 { eps: mix_eps, .. },
+            poem_ir::Elemwise::HcProject {
+                weight: plane,
+                stream_count,
+                ..
+            },
+            poem_ir::Elemwise::HcGates {
+                scale,
+                base,
+                gate_eps,
+                alpha,
+                sinkhorn,
+                comb: true,
+                post_mix,
+                comb_mix,
+                ..
+            },
+            poem_ir::Elemwise::Rmsnorm {
+                weight: NormWeight::Scale(weight),
+                eps,
+                y,
+                axis: NormAxis::Row,
+                ..
+            },
+        ) = (&**fold, &**norm, &**project, &**gates, &**rmsnorm)
+            && let tuning = self.ctx().tuning()
+            && (tuning.hc_mega_from..=tuning.hc_mega_until).contains(&self.tensor(*y).rows)
+        {
+            let emits = self.tensor(*y).width.is_multiple_of(256);
+            let held = self.hc_pre_held(*y, emits)?;
+            let seam = kernels_cuda::elemwise::hc::Seam {
+                x: self.tensor(*x),
+                streams: self.tensor(*streams),
+                post_mix: self.tensor(*post_in),
+                comb_mix: self.tensor(*comb_in),
+                mix_eps: *mix_eps,
+                hc_fn: self.tensor(*plane),
+                stream_count: *stream_count,
+                gate: kernels_cuda::elemwise::hc::Gate {
+                    scale: self.tensor(*scale),
+                    base: self.tensor(*base),
+                    gate_eps: *gate_eps,
+                    alpha: *alpha,
+                    sinkhorn: *sinkhorn,
+                },
+                weight: self.tensor(*weight),
+                norm_eps: *eps,
+            };
+            if kernels_cuda::elemwise::hc::fold_pre(
+                self.ctx(),
+                seam,
+                &mut self.tensor(*folded),
+                held,
+                &mut self.tensor(*post_mix),
+                &mut self.tensor(*comb_mix),
+                &mut self.tensor(*y),
+            )? {
+                return Ok(());
+            }
+            // The planes held for the seam's normed row were not landed.
+            #[cfg(feature = "cuda")]
+            if held.is_some() {
+                self.drop_held();
+            }
+        }
+        self.elemwise(fold)?;
+        self.pre_mix(norm, project, gates, rmsnorm)
+    }
+
     /// A sublayer's whole pre-mix: two launches where the profile's tiled
     /// hyper-connection kernels run (unread rows left unwritten), else as traced.
     fn hc_pre(&mut self, op: &Fused) -> Result<(), kernels_cuda::Error> {
@@ -112,17 +263,28 @@ impl Run<'_> {
         else {
             return Err(kernels_cuda::Error::Unsupported { op: op.name() });
         };
+        self.pre_mix(norm, project, gates, rmsnorm)
+    }
+
+    /// [`Run::hc_pre`] over its parts.
+    fn pre_mix(
+        &mut self,
+        norm: &poem_ir::Elemwise,
+        project: &poem_ir::Elemwise,
+        gates: &poem_ir::Elemwise,
+        rmsnorm: &poem_ir::Elemwise,
+    ) -> Result<(), kernels_cuda::Error> {
         // A prefill's rows: the one-pass projection, then the gates and the
         // norm apart, whose 16-byte forms stream a long fire faster than the
         // block-a-row pre-mix.
         if self.ctx().tuning().hc_tile
-            && let poem_ir::Elemwise::HcRmsnormF32 { streams, eps, .. } = &**norm
+            && let poem_ir::Elemwise::HcRmsnormF32 { streams, eps, .. } = norm
             && let poem_ir::Elemwise::HcProject {
                 weight,
                 stream_count,
                 mixes,
                 ..
-            } = &**project
+            } = project
             && self.tensor(*streams).rows >= kernels_cuda::elemwise::hc::PRE_WIDE_FROM
             && kernels_cuda::elemwise::hc_project::prenorm_project(
                 self.ctx(),
@@ -145,7 +307,7 @@ impl Run<'_> {
                     eps,
                     y,
                     axis: NormAxis::Row,
-                } = &**rmsnorm
+                } = rmsnorm
                 && self.tensor(*y).width == 4096
             {
                 let planes = self.hold_e4m3(*y)?;
@@ -194,7 +356,7 @@ impl Run<'_> {
                     axis: NormAxis::Row,
                     ..
                 },
-            ) = (&**norm, &**project, &**gates, &**rmsnorm)
+            ) = (norm, project, gates, rmsnorm)
             && let emits = kernels_cuda::elemwise::hc::pre_emits(
                 &self.tensor(*streams),
                 &self.tensor(*plane),

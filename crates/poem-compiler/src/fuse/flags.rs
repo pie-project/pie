@@ -46,10 +46,12 @@ flags! {
     ResidualAddRmsnorm = "fuse.residual_add_rmsnorm" => "fused.residual_add_rmsnorm",
     MatmulSwigluMatmul = "fuse.matmul_swiglu_matmul" => "fused.matmul_swiglu_matmul",
     MatmulGlu = "fuse.matmul_glu" => "fused.matmul_glu",
+    MoeMega = "fuse.moe_mega" => "fused.moe_mega",
     MoeExperts = "fuse.moe_experts" => "fused.moe_experts",
     MoeSelectGlu = "fuse.moe_select_glu" => "fused.moe_select_glu",
     MatmulSoftcap = "fuse.matmul_softcap" => "fused.matmul_softcap",
     MatmulBias = "fuse.matmul_bias" => "fused.matmul_bias",
+    MatmulMoeRoute = "fuse.matmul_moe_route" => "fused.matmul_moe_route",
     MatmulSplitRows = "fuse.matmul_split_rows" => "fused.matmul_split_rows",
     GatedResidualNormModulate = "fuse.gated_residual_norm_modulate" => "fused.gated_residual_norm_modulate",
     NormModulate = "fuse.norm_modulate" => "fused.norm_modulate",
@@ -69,6 +71,7 @@ flags! {
     HcPrenormProject = "fuse.hc_prenorm_project" => "fused.hc_prenorm_project",
     HcGatesNorm = "fuse.hc_gates_norm" => "fused.hc_gates_norm",
     ResBlendRmsnorm = "fuse.res_blend_rmsnorm" => "fused.res_blend_rmsnorm",
+    HcFoldPre = "fuse.hc_fold_pre" => "fused.hc_fold_pre",
     HcPre = "fuse.hc_pre" => "fused.hc_pre",
 }
 

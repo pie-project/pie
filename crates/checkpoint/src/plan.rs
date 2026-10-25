@@ -88,6 +88,8 @@ pub struct StorageTarget {
     pub backend: BackendKind,
     pub tp_rank: u32,
     pub tp_size: u32,
+    /// The expert-parallel rank whose slots of each routed bank it loads.
+    pub ep_rank: u32,
     pub max_tile_bytes: u64,
     pub preferred_alignment: u32,
     pub tile_map_mask: u32,
@@ -101,6 +103,7 @@ impl StorageTarget {
             backend,
             tp_rank,
             tp_size: tp_size.max(1),
+            ep_rank: 0,
             preferred_alignment: 256,
             max_tile_bytes: 64 * 1024 * 1024,
             tile_map_mask: passes::tile::compilable_tile_maps(backend),
@@ -114,6 +117,7 @@ impl Default for StorageTarget {
         Self {
             backend: BackendKind::Unknown,
             tp_rank: 0,
+            ep_rank: 0,
             tp_size: 1,
             max_tile_bytes: 0,
             preferred_alignment: 1,

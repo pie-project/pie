@@ -23,6 +23,56 @@ pub struct Weight {
     pub values: Option<Vec<f32>>,
 }
 
+/// Weights the compiler joins along their rows into one: `legs`, by name,
+/// in the order their rows run, and the name the joined weight goes by.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Join {
+    pub name: String,
+    pub legs: Vec<String>,
+    /// The axis their rows run along: 0, or a routed bank's 1.
+    pub axis: u32,
+}
+
+/// What the compiler decides of a deployment's weights that its import
+/// stores accordingly: the weights it joins, and the ones it lays out in the
+/// matrix core's tiled order.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Lowering {
+    pub joins: Vec<Join>,
+    pub tiled: Vec<String>,
+    /// The params the deployment's trace reads, by name, where known: a
+    /// layout weight none of them is (or is a plane of) is not stored.
+    pub read: Option<Vec<String>>,
+    /// The cuts the compiler inferred of the weights the model states none
+    /// of, by name, over each weight's logical shape.
+    pub cuts: Vec<(String, Shard)>,
+}
+
+impl Join {
+    /// The name `legs` go by joined: their common path, then the rest of
+    /// each one's, run together where each is one letter (`qkv`), else
+    /// joined by `_` (`gate_up`, `b_gate_0`).
+    #[must_use]
+    pub fn name_of(legs: &[&str]) -> String {
+        let parts: Vec<Vec<&str>> = legs.iter().map(|leg| leg.split('.').collect()).collect();
+        let shortest = parts.iter().map(Vec::len).min().unwrap_or(0);
+        let common = (0..shortest.saturating_sub(1))
+            .take_while(|&i| parts.iter().all(|p| p[i] == parts[0][i]))
+            .count();
+        let rests: Vec<String> = parts.iter().map(|p| p[common..].join("_")).collect();
+        let joined = if rests.iter().all(|r| r.chars().count() == 1) {
+            rests.concat()
+        } else {
+            rests.join("_")
+        };
+        if common == 0 {
+            joined
+        } else {
+            format!("{}.{joined}", parts[0][..common].join("."))
+        }
+    }
+}
+
 impl Weight {
     #[must_use]
     pub fn sym(
@@ -57,6 +107,80 @@ impl Weight {
         }
     }
 
+    /// `legs` joined along their rows into one weight `name`, each leg a
+    /// segment of the joined cut with its heads: what the compiler joins
+    /// where one activation meets them all.
+    pub fn joined(name: impl Into<String>, legs: &[Weight]) -> Result<Weight, String> {
+        let name = name.into();
+        let first = legs
+            .first()
+            .ok_or_else(|| format!("`{name}` joins no legs"))?;
+        let Shard::Cut { axis, .. } = first.shard else {
+            return Err(format!("`{}` is not cut along its rows", first.name));
+        };
+        let at = axis as usize;
+        let mut rows = 0;
+        let mut segments = Vec::new();
+        let mut heads = Vec::new();
+        for leg in legs {
+            let alike = leg.dtype == first.dtype
+                && leg.act == first.act
+                && leg.source == first.source
+                && leg.layout == first.layout
+                && leg.placement == first.placement
+                && leg.values.is_none()
+                && leg.shape.len() == first.shape.len()
+                && (0..leg.shape.len()).all(|i| i == at || leg.shape[i] == first.shape[i]);
+            if !alike {
+                return Err(format!(
+                    "`{}` and `{}` are not stored alike, so no joined `{name}` holds both",
+                    first.name, leg.name
+                ));
+            }
+            let Shard::Cut {
+                axis: leg_axis,
+                segments: cut,
+                heads: held,
+            } = &leg.shard
+            else {
+                return Err(format!("`{}` is not cut along its rows", leg.name));
+            };
+            if *leg_axis != axis {
+                return Err(format!("`{}` is cut along another axis", leg.name));
+            }
+            if !held.is_empty() && held.len() != cut.len() {
+                return Err(format!(
+                    "`{}` states heads for some segments only",
+                    leg.name
+                ));
+            }
+            rows += leg.shape[at];
+            segments.extend(cut.iter().copied());
+            heads.push(held.clone());
+        }
+        let heads = if heads.iter().all(Vec::is_empty) {
+            Vec::new()
+        } else if heads.iter().all(|h| !h.is_empty()) {
+            heads.concat()
+        } else {
+            return Err(format!(
+                "`{name}`: some of its legs state heads and some do not"
+            ));
+        };
+        let mut shape = first.shape.clone();
+        shape[at] = rows;
+        Ok(Weight {
+            name,
+            shape,
+            shard: Shard::Cut {
+                axis,
+                segments,
+                heads,
+            },
+            ..first.clone()
+        })
+    }
+
     #[must_use]
     pub fn conv_taps_major(mut self, c_in: u32, taps: u32) -> Weight {
         assert!(
@@ -81,6 +205,13 @@ impl Weight {
     #[must_use]
     pub fn registered(mut self) -> Weight {
         self.source = ParamSource::Registered;
+        self
+    }
+
+    /// Every rank holds the weight whole, whatever the compiler would infer.
+    #[must_use]
+    pub fn replicated(mut self) -> Weight {
+        self.shard = Shard::Replicated;
         self
     }
 
@@ -551,6 +682,7 @@ impl Weight {
         };
         let shard = match &p.shard {
             Shard::Replicated => Shard::Replicated,
+            Shard::Inferred => Shard::Inferred,
             Shard::Cut {
                 axis,
                 segments,
@@ -726,5 +858,45 @@ pub fn compute_dtype(dtype: Dtype) -> Option<Dtype> {
         | Dtype::U16
         | Dtype::KvU4
         | Dtype::Bool => None,
+    }
+}
+
+#[cfg(test)]
+mod join_tests {
+    use super::{Join, Weight};
+    use poem_ir::{Dtype, Shard};
+
+    #[test]
+    fn legs_join_into_one_cut_by_their_rows() {
+        assert_eq!(
+            Join::name_of(&["layers.0.q", "layers.0.k", "layers.0.v"]),
+            "layers.0.qkv"
+        );
+        assert_eq!(
+            Join::name_of(&["layers.0.gate", "layers.0.up"]),
+            "layers.0.gate_up"
+        );
+        assert_eq!(Join::name_of(&["a", "b"]), "ab");
+        assert_eq!(Join::name_of(&["m.b", "m.gate.0"]), "m.b_gate_0");
+        let leg = |name: &str, rows: u64, heads: u64| {
+            Weight::sym(name, [rows, 64], Dtype::Bf16)
+                .columns()
+                .heads([heads])
+        };
+        let qkv =
+            Weight::joined("qkv", &[leg("q", 128, 4), leg("k", 32, 1), leg("v", 32, 1)]).unwrap();
+        assert_eq!(qkv.shape, [192, 64]);
+        assert_eq!(
+            qkv.shard,
+            Shard::Cut {
+                axis: 0,
+                segments: vec![128, 32, 32],
+                heads: vec![4, 1, 1]
+            }
+        );
+        let plain = Weight::sym("up", [128, 64], Dtype::Bf16).columns();
+        assert!(Weight::joined("x", &[leg("q", 128, 4), plain]).is_err());
+        let other = Weight::sym("k", [32, 64], Dtype::F32).columns().heads([1]);
+        assert!(Weight::joined("x", &[leg("q", 128, 4), other]).is_err());
     }
 }

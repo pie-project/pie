@@ -11,6 +11,13 @@ MODELS = [
     model("ltx25-mini", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "ltx_2", layers = 2, vocab = 0),
 ]
 
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: each attention's q, k and v by their heads, the norms of q and k
+# across all of them with them (each rank's sum of squares summed across the
+# ranks), the FFNs' ups by their channels, and the attentions' and FFNs'
+# output projections by their rows.
+CUTS = "inferred"
+
 DEPLOYMENTS = [
     deployment("ltx25", weights = dtype.bf16, kv = dtype.bf16),
     deployment("ltx25", weights = dtype.u4g64, kv = dtype.bf16),
@@ -34,8 +41,8 @@ def packed_linear(seams, in_, banks):
     for s in seams:
         out += s
     return struct(
-        w = weight([out, in_], banks).packed(seams),
-        bias = weight([out]).packed(seams),
+        w = weight([out, in_], banks),
+        bias = weight([out]),
     )
 
 def embedder(prefix, in_, dim, banks):
@@ -210,7 +217,7 @@ def connector(prefix, text_in, dim, heads, layers, caption, banks):
 def vae_conv(c_out, c_in, banks):
     taps = 27
     return struct(
-        w = weight([c_out, c_in * taps], banks).conv_taps_major(c_in, taps),
+        w = weight([c_out, c_in * taps], banks),
         bias = weight([c_out], dtype.f32),
         c_in = c_in,
         c_out = c_out,

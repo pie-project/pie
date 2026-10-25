@@ -240,7 +240,10 @@ impl Session {
         if let Some(slot) = (0..self.commits.len()).find(|&slot| !held(slot)) {
             return Ok(slot);
         }
-        let commit = match self.commit_key.and_then(crate::device::held::pool::take) {
+        let commit = match self
+            .commit_key
+            .and_then(|key| crate::device::held::pool::take(key, None))
+        {
             Some((commit, _, _)) => commit,
             None => Pinned::mapped(2 * size_of::<u32>())?,
         };

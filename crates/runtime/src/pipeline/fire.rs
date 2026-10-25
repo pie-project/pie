@@ -256,10 +256,10 @@ async fn acquire_grant<C: FireContext>(
     if demand.is_zero() {
         return Ok(Some(crate::planner::AllocationGrant::empty()));
     }
-    let Some(planner) = crate::planner::planner() else {
+    let pid = ctx.process_id();
+    let Some(planner) = crate::planner::planner_of(pid) else {
         return Err("pipeline: KV residency planner is not installed".to_string());
     };
-    let pid = ctx.process_id();
     if windowed {
         if let Some(grant) = planner.grant_now(pid, demand) {
             return Ok(Some(grant));
@@ -288,7 +288,7 @@ async fn acquire_grant<C: FireContext>(
 }
 
 async fn settle_and_wait_resident<C: FireContext>(ctx: &mut C) -> Result<(), String> {
-    let Some(planner) = crate::planner::planner() else {
+    let Some(planner) = crate::planner::planner_of(ctx.process_id()) else {
         return Err("pipeline: KV working set is suspend-fenced".to_string());
     };
     ctx.settle_pipeline_tail()
@@ -1003,7 +1003,7 @@ impl Drop for PromoteGuard {
             crate::store::registry::with_kv_lock(&stores.kv, "host-other", |kv| {
                 kv.abort_restore(txn);
             });
-            if let Some(planner) = crate::planner::planner() {
+            for planner in crate::planner::planners() {
                 planner.pages_freed();
             }
         };
@@ -3439,7 +3439,7 @@ async fn finalize_fire_await(fire: PendingFire) -> Anyhow<FinalizeOutcome> {
         }
     }
 
-    if let Some(planner) = crate::planner::planner() {
+    for planner in crate::planner::planners() {
         planner.pages_freed();
     }
 

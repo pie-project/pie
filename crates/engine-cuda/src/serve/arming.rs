@@ -96,6 +96,9 @@ enum BodySynth {
     Wide {
         lanes: Vec<LaneRows>,
     },
+    /// An expert-parallel rank's step with no lanes of its own: only the
+    /// dispatches, the experts over what its peers send, and the combines.
+    Idle,
 }
 
 impl BodySynth {
@@ -106,6 +109,7 @@ impl BodySynth {
             BodySynth::Mixed { .. } => Kind::Mixed,
             BodySynth::Tower { .. } => Kind::Tower,
             BodySynth::Wide { .. } => Kind::Wide,
+            BodySynth::Idle => Kind::Idle,
         }
     }
 
@@ -129,6 +133,7 @@ impl BodySynth {
                 Vec::new(),
             ),
             BodySynth::Wide { lanes } => (lanes.clone(), Vec::new()),
+            BodySynth::Idle => (Vec::new(), Vec::new()),
             BodySynth::Tower {
                 class,
                 rows,
@@ -146,10 +151,11 @@ pub enum Kind {
     Mixed,
     Tower,
     Wide,
+    Idle,
 }
 
 impl Kind {
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 6;
 
     pub const ALL: [Kind; Kind::COUNT] = [
         Kind::Decode,
@@ -157,6 +163,7 @@ impl Kind {
         Kind::Mixed,
         Kind::Tower,
         Kind::Wide,
+        Kind::Idle,
     ];
 
     pub fn at(self) -> usize {
@@ -172,6 +179,7 @@ impl core::fmt::Display for Kind {
             Kind::Mixed => "mixed",
             Kind::Tower => "tower",
             Kind::Wide => "wide",
+            Kind::Idle => "idle",
         })
     }
 }
@@ -195,6 +203,9 @@ struct Deployment {
     context: u32,
     max_lanes: u32,
     patch_fold: u32,
+    /// Whether the load is an expert-parallel rank's, which fires a step
+    /// with no lanes of its own at every bucket its group fires.
+    idle: bool,
 }
 
 #[derive(Default)]
@@ -353,8 +364,25 @@ fn wide_keys(deployment: &Deployment, into: &mut Targets) {
     }
 }
 
-const ARMS: [fn(&Deployment, &mut Targets); Kind::COUNT] =
-    [decode_keys, prefill_keys, mixed_keys, tower_keys, wide_keys];
+/// An expert-parallel rank idles through its peers' steps at every bucket
+/// (`Shell::fire_idle`): armed like any composition, an idle step replays
+/// what a busy one's peers replay, and never walks eagerly beside them.
+fn idle_keys(deployment: &Deployment, into: &mut Targets) {
+    if deployment.idle {
+        for point in deployment.buckets.iter().copied() {
+            into.targets.push((point, BodySynth::Idle));
+        }
+    }
+}
+
+const ARMS: [fn(&Deployment, &mut Targets); Kind::COUNT] = [
+    decode_keys,
+    prefill_keys,
+    mixed_keys,
+    tower_keys,
+    wide_keys,
+    idle_keys,
+];
 
 impl core::fmt::Display for BodySynth {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -386,6 +414,7 @@ impl core::fmt::Display for BodySynth {
                 }
                 Ok(())
             }
+            BodySynth::Idle => f.write_str("idle"),
         }
     }
 }
@@ -845,9 +874,43 @@ impl Shell {
         Ok(self.armed.as_ref().map_or(0, |armed| armed.armed))
     }
 
+    /// Arms the lattice, an expert-parallel rank with its collectives
+    /// fenced (`EpRank::fence`): every rank fires the same synthetic steps,
+    /// and whatever they first use (a module, a tune, a pinned slot, a
+    /// graph) is made with no collective of the group spinning on the
+    /// device, so none of it waits on a peer that waits on it. What the
+    /// steps warm is warm for the fires that serve after, unfenced.
     fn arm_lattice(&mut self, verify: bool) -> Result<()> {
-        if !self.records_bodies() || !Self::keyable_units(&self.compiled) {
+        if let Some(ep) = self.ep.as_ref() {
+            ep.fenced(true);
+        }
+        let armed = self.arm_lattice_fenced(verify);
+        if let Some(ep) = self.ep.as_ref() {
+            ep.fenced(false);
+            // Sealed however arming went (nothing to arm, nothing armed):
+            // past arming the group's ranks fire different steps at once,
+            // and a capture's instantiation takes the context beside a
+            // peer's spinning collective. What is not armed walks eagerly.
+            if !verify {
+                self.cache.seal_bodies();
+            }
+        }
+        armed
+    }
+
+    fn arm_lattice_fenced(&mut self, verify: bool) -> Result<()> {
+        // An expert-parallel rank fires the lattice whether or not it
+        // records bodies: past arming its group serves every composition it
+        // does not replay eagerly and unfenced, beside peers spinning in
+        // their collectives, so what those walks first use (a module, a
+        // tune, a pinned slot) must already have been made here, fenced.
+        let group = self.ep.is_some();
+        let records = self.records_bodies() && Self::keyable_units(&self.compiled);
+        if !records && !group {
             return Ok(());
+        }
+        if !records && !verify {
+            self.cache.seal_bodies();
         }
 
         let ceiling = self.lane_ceiling();
@@ -932,6 +995,7 @@ impl Shell {
             context,
             max_lanes,
             patch_fold: self.patch_fold,
+            idle: self.ep.is_some(),
         };
         let mut found = Targets::default();
         for enumerate in ARMS {
@@ -959,6 +1023,7 @@ impl Shell {
             Kind::Prefill => 2,
             Kind::Wide => 3,
             Kind::Tower => 4,
+            Kind::Idle => 5,
         };
         targets
             .sort_by_key(|(bucket, target)| (Some(*bucket) != top, rank(target.kind()), *bucket));
@@ -972,6 +1037,7 @@ impl Shell {
         let mut refused: Option<String> = None;
 
         let mut never = 0usize;
+        let mut warmed_only = 0usize;
         let mut never_from = 0u32;
         let mut belted = false;
         let mut starved: Option<u64> = None;
@@ -989,7 +1055,13 @@ impl Shell {
                 && (spent.census.bodies >= record::MAX_BODIES
                     || spent.census.bytes >= self.bodies_mem
                     || headroom);
-            if !verify && ballot.any(&self.device, mine) {
+            let stop = match self.ep.as_ref() {
+                // The group's ranks fire one sequence of steps: the allowance
+                // one rank runs out of stops every rank's captures.
+                Some(ep) => !verify && ep.wire().quiet.any(mine)?,
+                None => !verify && ballot.any(&self.device, mine),
+            };
+            if stop {
                 if never == 0 {
                     never_from = bucket;
                     belted = spent.census.bodies >= record::MAX_BODIES;
@@ -999,16 +1071,28 @@ impl Shell {
                     peer_stopped = !mine;
                 }
                 never += 1;
-                continue;
+                if !group {
+                    continue;
+                }
+                // An expert-parallel rank fires it anyway, sealed so nothing
+                // captures: its served eager walks find what they use made.
+                self.cache.seal_bodies();
+                warmed_only += 1;
             }
-            wanted += 1;
             let began = std::time::Instant::now();
             let at = target.kind().at();
             let (lanes, media) = target.lanes();
-            tally[at].1 += 1;
+            if !stop {
+                wanted += 1;
+                tally[at].1 += 1;
+            }
             let owned = self.synthetic_lanes_with(&lanes, &media);
             self.armed_body = None;
+            let idle = matches!(target, BodySynth::Idle);
             for _ in 0..record::WARM_FIRES {
+                if idle {
+                    self.at_bucket(bucket);
+                }
                 let fired = self.fire_synthetic(&owned);
                 let landed = self.device.synchronize();
                 if let Err(why) = fired.and(landed) {
@@ -1023,6 +1107,7 @@ impl Shell {
             let warmed_ms = began.elapsed().as_secs_f64() * 1000.0;
             let mut golden_ms = (0f64, 0f64);
             if verify
+                && !idle
                 && let Some(key) = key.as_ref()
                 && self.cache.holds_body(key)
             {
@@ -1166,7 +1251,12 @@ impl Shell {
         }
 
         let stats = self.cache.body_stats();
-        let seal = if armed == 0 {
+        // An expert-parallel rank never captures past arming, whatever armed:
+        // its peers fire other steps beside its, and an instantiation (a
+        // capture's) takes the context while their collectives spin.
+        let seal = if armed == 0 && self.ep.is_some() {
+            Seal::Empty
+        } else if armed == 0 {
             Seal::Open
         } else if never == 0 && refused.is_none() {
             Seal::Complete
@@ -1185,6 +1275,7 @@ impl Shell {
             wanted,
             armed,
             kinds: tally,
+            warmed_only,
             segmented: stats.census.segmented,
             bytes: stats.census.bytes,
             unweighed: stats.census.unweighed,
@@ -1213,7 +1304,10 @@ impl Shell {
                 self.inputs.bytes() >> 20,
                 self.buffer_bytes() >> 20,
                 self.readout_rows.bytes() >> 20,
-                self.rs_scratch.as_ref().map_or(0, |buffer| buffer.bytes()) >> 20,
+                self.buffers
+                    .as_ref()
+                    .map_or(0, |buffers| buffers.scratch().1)
+                    >> 20,
                 self.pools.committed_bytes() >> 20,
             );
             eprintln!(
@@ -1346,6 +1440,9 @@ pub struct Armed {
     pub wanted: usize,
     pub armed: usize,
     pub kinds: [(usize, usize); Kind::COUNT],
+    /// Compositions an expert-parallel rank fired past its allowance (or
+    /// recording none), eagerly, to make what serving them first uses.
+    pub warmed_only: usize,
     pub segmented: usize,
     pub bytes: usize,
     pub unweighed: usize,
@@ -1366,7 +1463,12 @@ pub struct Armed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Seal {
     Complete,
-    Partial { never: usize },
+    Partial {
+        never: usize,
+    },
+    /// Nothing armed, and the map sealed anyway: an expert-parallel rank's,
+    /// whose every composition walks eagerly.
+    Empty,
     Open,
 }
 
@@ -1374,6 +1476,7 @@ impl core::fmt::Display for Armed {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let columns = Kind::ALL
             .iter()
+            .filter(|kind| **kind != Kind::Idle || self.kinds[kind.at()].1 > 0)
             .map(|kind| {
                 format!(
                     "{kind} {}/{}",
@@ -1395,6 +1498,13 @@ impl core::fmt::Display for Armed {
             self.bodies,
             record::MAX_BODIES,
         )?;
+        if self.warmed_only > 0 {
+            write!(
+                f,
+                " ({} more fired eagerly, uncaptured, to warm what serving them uses)",
+                self.warmed_only
+            )?;
+        }
         if self.unweighed > 0 {
             write!(f, " ({} unweighed)", self.unweighed)?;
         }
@@ -1430,6 +1540,11 @@ impl core::fmt::Display for Armed {
                 self.never_from,
             )?,
             Seal::Partial { .. } => write!(f, " [sealed partial: a key refused]")?,
+            Seal::Empty => write!(
+                f,
+                " [sealed empty: nothing armed, and an expert-parallel rank captures nothing \
+                 past arming, so every composition walks eagerly]"
+            )?,
             Seal::Open => write!(f, " [not sealed: nothing armed]")?,
         }
         if self.declines != 0 || self.refusals != 0 {

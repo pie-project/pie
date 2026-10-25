@@ -159,7 +159,7 @@ mod tests {
             facts.switches
         );
         let latent = facts.latent.expect("a denoiser has a latent space");
-        assert_eq!(latent.pixels_per_row(), (16, 16));
+        assert_eq!(latent.spatial_compression, 8);
         let schedule = facts.schedule.expect("a denoiser has a schedule");
         assert_eq!(schedule.kind, "flow");
         assert!(

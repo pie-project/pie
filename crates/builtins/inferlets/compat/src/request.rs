@@ -71,6 +71,58 @@ pub enum ResponseFormat {
     JsonObject,
     /// A JSON document matching this JSON Schema (grammar-forced).
     JsonSchema(String),
+    /// Free text whose structures are grammar-forced once a trigger opens
+    /// them ([`crate::trigger`]).
+    StructuralTag(StructuralTag),
+}
+
+/// One structure of a [`StructuralTag`]: `begin`, a document `schema`
+/// admits, then `end`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Structure {
+    pub begin: String,
+    /// A JSON Schema document.
+    pub schema: String,
+    pub end: String,
+}
+
+/// Structures the output may hold anywhere in free text, each opened by
+/// the first trigger its `begin` starts with: vLLM's and SGLang's
+/// `structural_tag`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructuralTag {
+    pub structures: Vec<Structure>,
+    pub triggers: Vec<String>,
+}
+
+impl StructuralTag {
+    /// Every trigger opens something, and every structure is opened by a
+    /// trigger.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.triggers.is_empty() || self.triggers.iter().any(String::is_empty) {
+            return Err("a structural tag needs non-empty triggers".into());
+        }
+        if let Some(lone) = self.structures.iter().find(|s| {
+            !self
+                .triggers
+                .iter()
+                .any(|t| s.begin.starts_with(t.as_str()))
+        }) {
+            return Err(format!(
+                "structure `{}` begins with none of the triggers",
+                lone.begin
+            ));
+        }
+        if let Some(idle) = self.triggers.iter().find(|t| {
+            !self
+                .structures
+                .iter()
+                .any(|s| s.begin.starts_with(t.as_str()))
+        }) {
+            return Err(format!("trigger `{idle}` begins no structure"));
+        }
+        Ok(())
+    }
 }
 
 /// How hard a thinking request asks the model to think; a template that

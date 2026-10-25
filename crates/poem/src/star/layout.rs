@@ -41,7 +41,12 @@ pub(crate) fn layout(builder: &mut GlobalsBuilder) {
                 anyhow::anyhow!("a weight states no dtype and its deployment computes in none")
             })?),
         };
-        let mut w = Weight::at(String::new(), shape.items, stated);
+        // A weight states no cut until the layout says otherwise; the
+        // compiler infers it.
+        let mut w = Weight {
+            shard: crate::Shard::Inferred,
+            ..Weight::at(String::new(), shape.items, stated)
+        };
         if let Some(values) = values {
             let held: u64 = w.shape.iter().product();
             if values.items.len() as u64 != held {

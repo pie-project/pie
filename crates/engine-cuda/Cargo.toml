@@ -19,6 +19,7 @@ libc = "0.2"
 serde_json = "1"
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 kernels-cuda = { path = "../kernels-cuda", optional = true }
+kernels-ir = { path = "../kernels-ir" }
 kernels-rocm = { path = "../kernels-rocm", optional = true }
 
 engine = { path = "../engine" }
@@ -51,7 +52,7 @@ default = ["probe", "dep:kernels-cuda"]
 
 probe = []
 
-cuda = ["device", "dep:cudarc", "dep:kernels-cuda", "kernels-cuda/cuda", "cudarc/cuda-13000"]
+cuda = ["device", "dep:cudarc", "dep:kernels-cuda", "kernels-cuda/cuda", "cudarc/cuda-13000", "cudarc/cupti"]
 
 # The same engine on AMD GPUs over HIP: kernels-rocm's kernels, hiprtc and
 # the HIP runtime in place of kernels-cuda, NVRTC and the CUDA runtime.
@@ -64,6 +65,8 @@ device = []
 windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
 
 [dev-dependencies]
+eta-dsl = { package = "pie-eta-dsl", path = "../eta-dsl" }
+inferlet = { path = "../inferlet" }
 poem = { package = "pie-poem", path = "../poem" }
 tokenizer = { path = "../tokenizer" }
 ztensor = { workspace = true }

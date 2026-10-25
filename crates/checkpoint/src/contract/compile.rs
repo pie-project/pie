@@ -638,6 +638,11 @@ impl Builder<'_> {
                 "{} needs a kernel and cannot be lowered to byte runs",
                 expr.node_name()
             ))),
+            Expr::Experts { .. } => Err(Error::Internal(
+                "Experts reached lowering; Resolver::specialize rewrites it into this \
+                 rank's slices"
+                    .to_string(),
+            )),
             Expr::Shard { .. } => Err(Error::Internal(
                 "Shard reached lowering; Resolver::specialize rewrites it into \
                  this rank's Slice, and byte offsets cannot be symbolic"

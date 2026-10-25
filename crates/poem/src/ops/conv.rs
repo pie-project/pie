@@ -152,17 +152,22 @@ pub fn conv3d(
     expect_grid("`conv::conv3d`'s grid", grid);
     assert_eq!(x.dtype(), Dtype::Bf16, "`conv::conv3d` reads bf16 rows");
     let taps = conv.taps();
+    // A convolution reads its weight taps major, `c_in` channels minor: the
+    // order its kernels walk, which a package need not state.
+    let laid = ParamLayout::ConvTapsMajor {
+        c_in: x.width() as u32,
+        taps,
+    };
     assert!(
-        w.layout
-            == ParamLayout::ConvTapsMajor {
-                c_in: x.width() as u32,
-                taps
-            },
-        "`{}` must be declared `.conv_taps_major({}, {taps})` for this convolution; it is {:?}",
+        w.layout == ParamLayout::Natural || w.layout == laid,
+        "`{}` is laid {:?}; this convolution reads it {laid:?}",
         w.name,
-        x.width(),
         w.layout
     );
+    let w = &Weight {
+        layout: laid,
+        ..w.clone()
+    };
     assert!(
         w.shape.len() == 2 && w.shape[1] == x.width() * u64::from(taps),
         "`{}` is {:?}; `[C_out, {}·{taps}]` is what {} input channels convolve through",

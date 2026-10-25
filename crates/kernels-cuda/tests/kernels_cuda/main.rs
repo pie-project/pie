@@ -3,6 +3,7 @@
 #![cfg(feature = "cuda")]
 
 mod attn;
+mod collective;
 mod common;
 mod conv;
 mod elemwise;

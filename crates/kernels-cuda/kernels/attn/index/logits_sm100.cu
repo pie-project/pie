@@ -1,5 +1,5 @@
 #include "attn/index/index.cuh"
-#include "attn/fmha_sm100.cuh"
+#include "prim/mma_sm100.cuh"
 
 // A pooled index's scores at prefill widths on tcgen05 (sm_100a): for each
 // row and each block it sees, `sum_h w_h * relu(q_h . k)` over the row's
@@ -69,37 +69,6 @@ struct Params {
     // in a compact pool, its keys a row each.
     int sub;
 };
-
-// One row's request, first page, page count and the blocks it sees.
-struct RowInfo {
-    int req, pages_first, num_pages, nkeys;
-};
-
-__device__ __forceinline__ RowInfo row_info(const Params& p, int t, int R) {
-    RowInfo ri;
-    // The request whose rows hold t, by halving (a prefill's 32 requests in
-    // five reads, where every role asks for both rows of every pair).
-    int lo = 0, hi = R - 1;
-    while (lo < hi) {
-        const int mid = (lo + hi) >> 1;
-        if (t < static_cast<int>(p.qo_indptr[mid + 1])) {
-            hi = mid;
-        } else {
-            lo = mid + 1;
-        }
-    }
-    const int r = lo;
-    const int qo_lo = static_cast<int>(p.qo_indptr[r]);
-    const int new_tokens = static_cast<int>(p.qo_indptr[r + 1]) - qo_lo;
-    ri.pages_first = static_cast<int>(p.page_indptr[r]);
-    ri.num_pages = static_cast<int>(p.page_indptr[r + 1]) - ri.pages_first;
-    const int kv_len = (ri.num_pages - 1) * p.page_size + static_cast<int>(p.last_page_lens[r]);
-    const int total = kv_len - new_tokens + (t - qo_lo) + 1;
-    const int stride = p.ratio > 0 ? p.ratio : 1;
-    ri.nkeys = total > 0 ? min(total / stride, p.score_stride) : 0;
-    ri.req = r;
-    return ri;
-}
 
 // A pass: rows `t[0..count)` (local rows) of request `ri[0].req`, scored
 // over `nkeys` blocks (the largest of theirs). Rows that see no more than
@@ -370,7 +339,7 @@ __global__ __launch_bounds__(384, 1) void index_logits_tc5(const __grid_constant
                                 const float cs = turn_c[rr][pr];
                                 const float a = __uint_as_float(static_cast<u32>(e[2 * u]) << 16);
                                 const float b = __uint_as_float(static_cast<u32>(e[2 * u + 1]) << 16);
-                                const u32 packed = fmha::pack_bf16x2(a * cs - b * sn, b * cs + a * sn);
+                                const u32 packed = ::pie::pack_bf16x2(a * cs - b * sn, b * cs + a * sn);
                                 e[2 * u] = static_cast<unsigned short>(packed & 0xffffu);
                                 e[2 * u + 1] = static_cast<unsigned short>(packed >> 16);
                             }

@@ -20,6 +20,13 @@ TOKENIZER = tokenizer(
     pinned = {"<boi>": 128000, "<eoi>": 128001, "<img>": 128006},
 )
 
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: the packed q, k and v by their heads, each expert's and the shared
+# expert's gate and up by their channels, the output and down projections by
+# their rows. The head and the timestep embedders it holds whole, as the
+# package always has.
+CUTS = "inferred"
+
 MODELS = [
     model("hunyuanimage3-80b-a13b", template = LINES, tokenizer = TOKENIZER, arch = "hunyuan_image_3_moe", layers = 32, vocab = 133120),
     model("hunyuanimage3-mini", mini = True, template = LINES, tokenizer = TOKENIZER, arch = "hunyuan_image_3_moe", layers = 2, vocab = 133120),
@@ -35,10 +42,12 @@ DEPLOYMENTS = [
 # rope, routed and shared experts), the timestep embedders, and the U-Net
 # blocks that take a latent clip into the trunk and its rows back out.
 
-def linear(out, in_, banks, bias = True):
-    """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
+def linear(out, in_, banks, bias = True, whole = False):
+    """A projection from `in_` to `out` and, unless `bias` is off, its bias;
+    held whole on every rank if `whole`."""
+    w = weight([out, in_], banks)
     return struct(
-        w = weight([out, in_], banks),
+        w = w.replicated() if whole else w,
         bias = weight([out]) if bias else None,
     )
 
@@ -84,7 +93,7 @@ DIMS = {
 def conv_weights(c_out, c_in, k, banks):
     taps = k[0] * k[1] * k[2]
     return struct(
-        w = weight([c_out, c_in * taps], banks).conv_taps_major(c_in, taps),
+        w = weight([c_out, c_in * taps], banks),
         bias = weight([c_out], dtype.f32),
         k = k,
     )
@@ -107,8 +116,8 @@ def resblock(c_in, c_out, emb, banks):
 
 def embedder(hidden, out, banks):
     return struct(
-        mlp_in = linear(hidden, T_FREQ_DIM, banks),
-        mlp_out = linear(out, hidden, banks),
+        mlp_in = linear(hidden, T_FREQ_DIM, banks, whole = True),
+        mlp_out = linear(out, hidden, banks, whole = True),
     )
 
 def layout(id, deploy):
@@ -133,17 +142,20 @@ def layout(id, deploy):
     def layer(l):
         return struct(
             attn_norm = weight([hidden]),
-            qkv = weight([q_w + 2 * kv_w, hidden], banks).packed([q_w, kv_w, kv_w], heads = [d.q_heads, d.kv_heads, d.kv_heads]),
+            qkv = weight([q_w + 2 * kv_w, hidden], banks),
             q_norm = weight([hd]),
             k_norm = weight([hd]),
-            o_proj = weight([hidden, q_w], banks).rows(),
+            o_proj = weight([hidden, q_w], banks),
             kv = "kv.{}".format(l),
             mlp_norm = weight([hidden]),
             router = weight([d.experts, hidden]),
-            experts_gate_up = weight([d.experts, 2 * iw, hidden], experts).bank([iw, iw]),
-            experts_down = weight([d.experts, hidden, iw], experts).rows(),
-            shared_gate_up = weight([2 * sw, hidden], banks).packed([sw, sw]),
-            shared_down = weight([hidden, sw], banks).rows(),
+            experts_gate_up = weight([d.experts, 2 * iw, hidden], experts),
+            experts_down = weight([d.experts, hidden, iw], experts),
+            shared = struct(
+                gate = weight([sw, hidden], banks),
+                up = weight([sw, hidden], banks),
+            ),
+            shared_down = weight([hidden, sw], banks),
         )
 
     hw = d.head_hidden
@@ -157,7 +169,7 @@ def layout(id, deploy):
         kv_width = kv_w,
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         embed = weight([d.vocab, hidden], banks),
-        head = weight([d.vocab, hidden], banks),
+        head = weight([d.vocab, hidden], banks).replicated(),
         final_norm = weight([hidden]),
         layers = [layer(l) for l in range(d.layers)],
         timestep_emb = embedder(hidden, 2 * hidden, banks),
@@ -283,7 +295,10 @@ def read(m, reads):
 
         inter = d.moe_inter
         hidden = d.hidden
-        reads.read_expr(w.shared_gate_up, swap_halves(src(at("mlp.shared_mlp.gate_and_up_proj.weight")), d.shared_inter))
+        # The release stores the shared expert's up rows, then its gate rows.
+        shared = src(at("mlp.shared_mlp.gate_and_up_proj.weight"))
+        reads.read_expr(w.shared.gate, shared.slice(0, d.shared_inter, d.shared_inter))
+        reads.read_expr(w.shared.up, shared.slice(0, 0, d.shared_inter))
         reads.read(w.shared_down, at("mlp.shared_mlp.down_proj.weight"))
 
         held = stored(at("mlp.experts.0.down_proj.weight"))
@@ -413,10 +428,8 @@ def moe(x, w, m):
 
     act = ops.linear.glu(ops.linear.moe_matmul_select(x, w.experts_gate_up, routes, d.top_k), gating.swiglu(), d.moe_inter)
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, w.experts_down, routes, d.top_k), weights)
-    shared = ops.linear.matmul(
-        ops.linear.glu(ops.linear.matmul(x, w.shared_gate_up), gating.swiglu(), d.shared_inter),
-        w.shared_down,
-    )
+    gate, up = ops.linear.matmul(x, w.shared.gate), ops.linear.matmul(x, w.shared.up)
+    shared = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), w.shared_down)
     return ops.elemwise.residual_add(shared, routed)
 
 def canvas_rows(arm, m):

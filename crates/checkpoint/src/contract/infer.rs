@@ -39,6 +39,8 @@ struct Scope<'a> {
     checkpoint: &'a dyn CheckpointTypes,
     resolved: Checked,
     partition: Partition,
+    /// The expert-parallel rank whose slots an [`Expr::Experts`] reads.
+    expert_rank: u32,
     instance: Option<u32>,
     what: String,
 }
@@ -77,10 +79,18 @@ impl<'a> Resolver<'a> {
                 checkpoint,
                 resolved: Checked::default(),
                 partition,
+                expert_rank: 0,
                 instance: None,
                 what: String::new(),
             },
         }
+    }
+
+    /// The resolver reading an expert-parallel rank `rank`'s slots of a bank.
+    #[must_use]
+    pub fn for_expert_rank(mut self, rank: u32) -> Self {
+        self.scope.expert_rank = rank;
+        self
     }
 
     pub fn for_instance(mut self, instance: u32) -> Self {
@@ -239,6 +249,23 @@ fn infer(expr: &Expr, scope: &mut Scope<'_>) -> Result<TensorType, Error> {
                 }
             }
         }
+        Expr::Experts {
+            src,
+            experts,
+            slots,
+        } => {
+            let ty = infer(src, scope)?;
+            let held = ty.shape.first().copied();
+            if held != Some(*experts) || *slots < 1 {
+                return Err(Error::Contract(format!(
+                    "{}: a bank of {experts} experts read as {:?}, {slots} slots a rank",
+                    scope.what, ty.shape
+                )));
+            }
+            let mut shape = ty.shape.clone();
+            shape[0] = *slots;
+            Ok(TensorType::new(shape, ty.encoding.clone()))
+        }
         Expr::Shard {
             src,
             axis,
@@ -296,6 +323,32 @@ fn specialize(expr: Expr, scope: &mut Scope<'_>) -> Result<Expr, Error> {
         let ty = infer(&src, scope)?;
         infer_slice(&ty, axis, start, len)?;
         return Ok(src.slice(axis.0, start, len));
+    }
+    if let Expr::Experts {
+        src,
+        experts,
+        slots,
+    } = expr
+    {
+        let src = specialize(*src, scope)?;
+        let first = i64::from(scope.expert_rank)
+            .checked_mul(slots)
+            .or_overflow("an expert rank's first slot")?;
+        // The rank's slots, as runs of experts in a row (the placement
+        // wraps past the last expert to the first).
+        let mut parts = Vec::new();
+        let mut p = first;
+        while p < first + slots {
+            let start = p % experts;
+            let len = (experts - start).min(first + slots - p);
+            parts.push(src.clone().slice(0, start, len));
+            p += len;
+        }
+        return Ok(if parts.len() == 1 {
+            parts.remove(0)
+        } else {
+            Expr::concat(0, parts)
+        });
     }
     let Expr::Shard {
         src,
@@ -1164,6 +1217,39 @@ mod tests {
                 Expr::src("k").slice(0, i64::from(rank) * 128, 128),
             );
         }
+    }
+
+    fn slots(rank: u32, experts: i64, slots: i64) -> (Expr, TensorType) {
+        let mut r = Resolver::new(&OneTensor, Partition::WHOLE).for_expert_rank(rank);
+        let read = Expr::src("k").experts(experts, slots);
+        let ty = r.infer(&read, "k").unwrap();
+        (r.specialize(read, "k").unwrap(), ty)
+    }
+
+    /// A rank of a group holding every expert once reads its run of them;
+    /// past the last expert the placement wraps to the first.
+    #[test]
+    fn an_expert_rank_reads_its_slots_of_a_bank() {
+        let (read, ty) = slots(1, 512, 128);
+        assert_eq!(read, Expr::src("k").slice(0, 128, 128));
+        assert_eq!(ty.shape, [128, 64]);
+        let (read, _) = slots(3, 512, 160);
+        assert_eq!(
+            read,
+            Expr::concat(
+                0,
+                vec![
+                    Expr::src("k").slice(0, 480, 32),
+                    Expr::src("k").slice(0, 0, 128)
+                ]
+            )
+        );
+        assert!(
+            Resolver::new(&OneTensor, Partition::WHOLE)
+                .infer(&Expr::src("k").experts(8, 2), "k")
+                .is_err(),
+            "a bank of other than its experts is refused"
+        );
     }
 
     #[test]

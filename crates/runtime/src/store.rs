@@ -134,8 +134,13 @@ pub fn kv_census() -> (usize, usize, usize, usize) {
 }
 
 pub fn kv_pressure_bucket() -> u8 {
-    if let Some(planner) = crate::planner::planner() {
-        return planner.kv_pressure_bucket();
+    let planners = crate::planner::planners();
+    if !planners.is_empty() {
+        return planners
+            .iter()
+            .map(|planner| planner.kv_pressure_bucket())
+            .max()
+            .unwrap_or(0);
     }
     let Some(stores) = registry::try_get(0, 0) else {
         return 0;

@@ -126,6 +126,7 @@ fn shell(trace: Trace, path: &Path, graphs: Graphs) -> Shell {
         cache_dir: None,
         runahead: engine::runahead::Runahead::F1,
         world: engine_cuda::World::default(),
+        expert: engine_cuda::World::default(),
         comm: core::ptr::null_mut(),
     })
     .expect("the shell loads");

@@ -5,6 +5,13 @@ load("//pie/codec.poem", "kept", "stacked_bank", read_weight = "weight")
 load("//lib/adapters.poem", "banks")
 
 HY = template("hy", thinking = True)
+
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: the latent attention's q and kv up-projections, its gate and its
+# sinks by their heads, the dense, shared and routed gates and ups by their
+# channels, the output and down projections by their rows. The head it
+# holds whole, as the package always has.
+CUTS = "inferred"
 TOKENIZER = tokenizer(
     markers = [
         ["<｜hy_end:opensource｜>"],
@@ -104,16 +111,16 @@ def attention(n, d, hidden, weights, norms, eps, kv, sink, indexer, kept = None)
         q_a_proj = weight([d.q_lora_rank, hidden], weights),
         q_a_norm = weight([d.q_lora_rank]),
         q_a_norm_eps = eps,
-        q_b_proj = weight([d.heads * qk_head_dim, d.q_lora_rank], weights).columns(),
+        q_b_proj = weight([d.heads * qk_head_dim, d.q_lora_rank], weights),
         kv_a_proj = weight([d.kv_lora_rank + d.qk_rope_head_dim, hidden], weights),
         kv_a_norm = weight([d.kv_lora_rank]),
         kv_a_norm_eps = eps,
         kv_b_proj = weight([d.heads * (d.qk_nope_head_dim + d.v_head_dim), d.kv_lora_rank],
             kept,
-        ).columns(),
-        gate = weight([v_width, hidden], kept).columns(),
-        sink = weight([d.heads], dtype.f32).columns(),
-        o_proj = weight([hidden, v_width], weights).rows(),
+        ),
+        gate = weight([v_width, hidden], kept),
+        sink = weight([d.heads], dtype.f32),
+        o_proj = weight([hidden, v_width], weights),
         kv = kv,
         indexer = indexer,
     )
@@ -222,11 +229,12 @@ def layout(id, deploy):
             routed = True,
             router = weight([m.experts, hidden]),
             bias = weight([m.experts], dtype.f32),
-            gate_up = weight([m.experts, 2 * iw, hidden], banks_dtype).bank([iw, iw]),
-            down = weight([m.experts, hidden, iw], banks_dtype).rows(),
+            gate_up = weight([m.experts, 2 * iw, hidden], banks_dtype),
+            down = weight([m.experts, hidden, iw], banks_dtype),
             shared = struct(
-                gate_up = weight([2 * sw, hidden], proj).packed([sw, sw]),
-                down = weight([hidden, sw], proj).rows(),
+                gate = weight([sw, hidden], proj),
+                up = weight([sw, hidden], proj),
+                down = weight([hidden, sw], proj),
                 inter = sw,
             ),
             experts = m.experts,
@@ -246,8 +254,9 @@ def layout(id, deploy):
             iw = d.dense_inter
             mlp = struct(
                 routed = False,
-                gate_up = weight([2 * iw, hidden], proj).packed([iw, iw]),
-                down = weight([hidden, iw], proj).rows(),
+                gate = weight([iw, hidden], proj),
+                up = weight([iw, hidden], proj),
+                down = weight([hidden, iw], proj),
                 inter = iw,
             )
         else:
@@ -288,7 +297,7 @@ def layout(id, deploy):
         kv = deploy.kv,
         hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha),
         embed = weight([d.vocab, hidden], weights),
-        head = weight([d.vocab, hidden], weights),
+        head = weight([d.vocab, hidden], weights).replicated(),
         hc_head = head("hc_head", streams, hidden),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
@@ -355,12 +364,8 @@ def huggingface(m, reads):
         if f.routed:
             moe(reads, f, at)
         else:
-            read_weight(
-                reads,
-                f.gate_up,
-                [at("mlp.gate_proj.weight"), at("mlp.up_proj.weight")],
-                quantized = "read",
-            )
+            read_weight(reads, f.gate, [at("mlp.gate_proj.weight")], quantized = "read")
+            read_weight(reads, f.up, [at("mlp.up_proj.weight")], quantized = "read")
             read_weight(reads, f.down, [at("mlp.down_proj.weight")], quantized = "read")
 
     mtp = m.mtp
@@ -417,10 +422,8 @@ def moe(reads, f, at):
             stacked_bank(reads, w, name)
         else:
             reads.read(w, name)
-    read_weight(reads, f.shared.gate_up, [
-        at("mlp.shared_experts.gate_proj.weight"),
-        at("mlp.shared_experts.up_proj.weight"),
-    ], quantized = "read")
+    read_weight(reads, f.shared.gate, [at("mlp.shared_experts.gate_proj.weight")], quantized = "read")
+    read_weight(reads, f.shared.up, [at("mlp.shared_experts.up_proj.weight")], quantized = "read")
     read_weight(reads, f.shared.down, [at("mlp.shared_experts.down_proj.weight")], quantized = "read")
 
 # The forward of Hy4-preview: sublayers gated out of and folded back into
@@ -537,10 +540,8 @@ def index_select(x, q_a, inputs, positions, ix):
 
 def mlp(x, f):
     if not f.routed:
-        return ops.linear.matmul(
-            ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter),
-            f.down,
-        )
+        gate, up = ops.linear.matmul(x, f.gate), ops.linear.matmul(x, f.up)
+        return ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), f.down)
     routes, weights = ops.linear.moe_route(
         ops.linear.matmul(x, f.router),
         f.experts,
@@ -552,7 +553,8 @@ def mlp(x, f):
     act = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k), gating.swiglu(), f.inter, limit = f.limit)
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
     s = f.shared
-    act = ops.linear.glu(ops.linear.matmul(x, s.gate_up), gating.swiglu(), s.inter)
+    gate, up = ops.linear.matmul(x, s.gate), ops.linear.matmul(x, s.up)
+    act = ops.linear.glu(gate, gating.swiglu(), up = up)
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
 
 def caches(m, c):

@@ -1,6 +1,10 @@
 use crate::run::Run;
 
 impl poem_exec::DispatchProbe for Run<'_> {
+    fn enter(&mut self, node: &poem_ir::Node) {
+        Run::enter(self, node);
+    }
+
     fn probe(&mut self, node: &poem_ir::Node) {
         use poem_ir::Operands;
         self.walked(node);

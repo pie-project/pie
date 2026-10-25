@@ -16,6 +16,13 @@ MODELS = [
     model("inkling-small-mini-l7-e8", mini = True, template = INKLING, tokenizer = TOKENIZER, arch = "inkling", layers = 7, vocab = 200058),
 ]
 
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: q, k, v and the relative bias's projection by their heads (k's
+# and v's short convolutions and their states with them), the dense and
+# routed gates and ups by their channels, the output and down projections by
+# their rows; the convolutions after them read the summed rows whole.
+CUTS = "inferred"
+
 DEPLOYMENTS = [
     deployment("inkling", weights = dtype.bf16, kv = dtype.bf16),
     deployment("inkling-mini-l7-e8", weights = dtype.bf16, kv = dtype.bf16),
@@ -103,14 +110,15 @@ def layout(id, deploy):
         else:
             reading, kv_heads, extent = LOCAL, d.local_kv_heads, d.window
         kv_w = kv_heads * hd
-        conv = lambda s, channels: weight([channels, kw]).columns()
+        conv = lambda s, channels: weight([channels, kw])
         if l < d.dense_layers:
             iw = d.dense_inter
             mlp = struct(
                 routed = False,
-                gate_up = weight([2 * iw, hidden], w).packed([iw, iw]),
+                gate = weight([iw, hidden], w),
+                up = weight([iw, hidden], w),
                 inter = iw,
-                down = weight([hidden, iw], w).rows(),
+                down = weight([hidden, iw], w),
                 scale = vec("mlp_scale", 1),
             )
         else:
@@ -121,8 +129,8 @@ def layout(id, deploy):
                 router = weight([bank, hidden], w),
                 bias = weight([d.experts], dtype.f32),
                 scale = weight([1], dtype.f32),
-                gate_up = weight([bank, 2 * mi, hidden], w).bank([mi, mi]),
-                down = weight([bank, hidden, mi], w).rows(),
+                gate_up = weight([bank, 2 * mi, hidden], w),
+                down = weight([bank, hidden, mi], w),
                 experts = d.experts,
                 top_k = d.top_k,
                 sink = d.sink,
@@ -134,11 +142,11 @@ def layout(id, deploy):
             kv_heads = kv_heads,
             extent = extent,
             attn_norm = vec("attn_norm", hidden),
-            q_proj = weight([q_w, hidden], w).columns(),
-            k_proj = weight([kv_w, hidden], w).columns(heads = kv_heads),
-            v_proj = weight([kv_w, hidden], w).columns(heads = kv_heads),
-            r_proj = weight([r_w, hidden], w).columns(),
-            o_proj = weight([hidden, q_w], w).rows(),
+            q_proj = weight([q_w, hidden], w),
+            k_proj = weight([kv_w, hidden], w),
+            v_proj = weight([kv_w, hidden], w),
+            r_proj = weight([r_w, hidden], w),
+            o_proj = weight([hidden, q_w], w),
             q_norm = vec("q_norm", hd),
             k_norm = vec("k_norm", hd),
             rel_proj = weight([d.d_rel, extent]),
@@ -229,10 +237,8 @@ def huggingface(m, reads):
         f = w.mlp
         if not f.routed:
             w13 = src(n("mlp.w13_dn.weight"))
-            reads.read_expr(f.gate_up, concat(0, [
-                w13.stride(0, 0, f.inter, 2),
-                w13.stride(0, 1, f.inter, 2),
-            ]))
+            reads.read_expr(f.gate, w13.stride(0, 0, f.inter, 2))
+            reads.read_expr(f.up, w13.stride(0, 1, f.inter, 2))
             reads.read(f.down, n("mlp.w2_md.weight"))
             reads.read(f.scale, n("mlp.global_scale"))
             continue
@@ -349,7 +355,8 @@ def forward(m, inputs):
 
 def mlp(x, f):
     if not f.routed:
-        act = ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter)
+        gate, up = ops.linear.matmul(x, f.gate), ops.linear.matmul(x, f.up)
+        act = ops.linear.glu(gate, gating.swiglu(), up = up)
         return ops.elemwise.scale(f.scale, ops.linear.matmul(act, f.down))
     fan = f.top_k + f.sink
     routes, weights = ops.linear.moe_route(

@@ -52,6 +52,15 @@ pub struct Overrides {
     /// `Some(None)` serves without the checkpoint's drafter.
     pub drafter: Option<Option<String>>,
     pub tp: Option<u32>,
+    /// The expert-parallel ranks the deployment spreads its routed experts
+    /// over, each running its own tokens.
+    pub ep: Option<u32>,
+    /// Which of those ranks loads: its slots of each routed bank, its own
+    /// disk tier.
+    pub rank: Option<u32>,
+    /// Slots each expert rank holds past its share of a layer's experts,
+    /// for replicas of the busiest.
+    pub expert_replicas: Option<u32>,
     /// A YaRN factor to stretch the model's native context by, where its
     /// package turns one; unstated, the factor the checkpoint's config.json
     /// states, where its package does not already scale its rotation.
@@ -165,6 +174,9 @@ fn composed(
     if let Some(tp) = overrides.tp {
         deploy.tp = tp;
     }
+    if let Some(ep) = overrides.ep {
+        deploy.ep = ep;
+    }
     if let Some(factor) = overrides.yarn {
         deploy.yarn = Some(factor);
     }
@@ -224,8 +236,14 @@ pub fn packaged(
     let trace = package
         .trace(&model.id, &deploy, &name, platform)
         .map_err(|why| anyhow!("`{name}` does not serve on {platform:?}: {why:#}"))?;
-    let trace = poem_compiler::shard::shard(trace, deploy.tp)
-        .map_err(|why| anyhow!("`{name}` does not split across {} ranks: {why}", deploy.tp))?;
+    let replicas = overrides.expert_replicas.unwrap_or(0);
+    let trace = poem_compiler::catalog::lowered_with(trace, &deploy, replicas).map_err(|why| {
+        anyhow!(
+            "`{name}` does not split across {} tensor and {} expert ranks: {why}",
+            deploy.tp,
+            deploy.ep
+        )
+    })?;
     Ok((name, deploy.tp, trace))
 }
 
@@ -474,12 +492,13 @@ pub fn contract_for(
             trace.name
         )
     })?;
-    if deployment.deploy.tp > 1 {
+    let ranks = deployment.deploy.tp.max(deployment.deploy.ep);
+    if ranks > 1 {
         return Err(format!(
-            "{:?} is a {}-rank deployment and {checkpoint:?} is an unconverted checkpoint: the \
-             ranks band their shares out of a stamped artifact, so convert it first (`pie model \
-             import`) and serve the artifact",
-            trace.name, deployment.deploy.tp
+            "{:?} is a {ranks}-rank deployment and {checkpoint:?} is an unconverted checkpoint: \
+             the ranks band their shares out of a stamped artifact, so convert it first (`pie \
+             model import`) and serve the artifact",
+            trace.name
         ));
     }
     deployment

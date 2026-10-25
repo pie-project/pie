@@ -239,6 +239,102 @@ pub fn rmsnorm_per_head_plus_one(
     )
 }
 
+/// Each row of `x`'s sum of squares into `ss` (f32, one a row): a rank's
+/// term of a row norm the ranks split.
+pub fn sum_squares(ctx: &Ctx, x: Tensor, ss: &mut Tensor) -> Result<(), Error> {
+    const OP: &str = "elemwise.sum_squares";
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    nonzero(OP, "rows", x.rows)?;
+    if ss.dtype != Dtype::F32 || ss.elements() != u64::from(x.rows) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the sums are a {:?} {} x {} plane, and {} rows want one f32 each",
+                ss.dtype, ss.rows, ss.width, x.rows
+            ),
+        ));
+    }
+    let width = stated(OP, nonzero(OP, "the summed width", x.width)?)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            NORM,
+            &format!("::pie::elemwise::sum_squares<{t}, 256>"),
+        ))
+        .apply(Launch::per_row(x.rows, BLOCK)),
+        &[x.arg(), ss.arg(), width.arg(), ctx.stage()],
+    )
+}
+
+/// `x / sqrt(ss / whole + eps)` times `weight` (`plus_one`: one plus it;
+/// none: unscaled): a row norm over a share of a row `whole` wide, its sum
+/// of squares `ss` stated a row.
+#[allow(clippy::too_many_arguments)]
+pub fn rmsnorm_by(
+    ctx: &Ctx,
+    x: Tensor,
+    ss: Tensor,
+    weight: Option<Tensor>,
+    plus_one: bool,
+    whole: u32,
+    eps: f32,
+    y: &mut Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "elemwise.rmsnorm_by";
+    let t = dtype_dispatch!(OP, x.dtype, { Bf16 => "::pie::bf16", F16 => "::pie::f16" });
+    nonzero(OP, "rows", y.rows)?;
+    if ss.dtype != Dtype::F32 || ss.elements() != u64::from(y.rows) {
+        return Err(refuse(
+            OP,
+            format!(
+                "the sums are a {:?} {} x {} plane, and {} rows read one f32 each",
+                ss.dtype, ss.rows, ss.width, y.rows
+            ),
+        ));
+    }
+    if let Some(w) = weight
+        && (w.dtype != x.dtype || w.elements() != u64::from(y.width))
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "the weight is a {:?} plane of {} and the rows are {:?}, {} wide",
+                w.dtype,
+                w.elements(),
+                x.dtype,
+                y.width
+            ),
+        ));
+    }
+    let width = stated(OP, nonzero(OP, "the normed width", y.width)?)?;
+    let form = match (weight, plus_one) {
+        (None, _) => 0,
+        (Some(_), false) => 1,
+        (Some(_), true) => 2,
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let whole = nonzero(OP, "the whole row's width", whole)? as f32;
+    let weight = weight.unwrap_or(x);
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            NORM,
+            &format!("::pie::elemwise::rmsnorm_by<{t}, {form}, 256>"),
+        ))
+        .apply(Launch::per_row(y.rows, BLOCK)),
+        &[
+            x.arg(),
+            ss.arg(),
+            weight.arg(),
+            y.arg(),
+            width.arg(),
+            whole.arg(),
+            eps.arg(),
+            ctx.stage(),
+        ],
+    )
+}
+
 /// The norm [`norm_gate`] lands beside its output: `y = rmsnorm(out) *
 /// weight` (`1 + weight` where `plus_one`).
 #[derive(Clone, Copy)]

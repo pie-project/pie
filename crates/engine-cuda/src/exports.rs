@@ -499,42 +499,6 @@ pub(crate) fn read_only_by_decoders(
     read.into_iter().map(|seen| seen == Some(true)).collect()
 }
 
-/// For each value, whether nothing reads it: no node of the compiled trace
-/// takes it in, no merge holds it as an arm, no seam carries it out. A fused
-/// chain's row of that kind (a sublayer's normed output folded straight into
-/// the stream) need not land.
-#[must_use]
-pub(crate) fn unread(trace: &Trace) -> Vec<bool> {
-    let mut unread = vec![true; trace.values.len()];
-    let mut inputs: Vec<ValueId> = Vec::new();
-    for node in &trace.nodes {
-        inputs.clear();
-        node.op.inputs(&mut inputs);
-        for id in &inputs {
-            if let Some(seen) = unread.get_mut(id.0 as usize) {
-                *seen = false;
-            }
-        }
-    }
-    for decl in &trace.values {
-        if let poem_ir::Def::Merge(arms) = &decl.def {
-            for (arm, _) in arms {
-                if let Some(seen) = unread.get_mut(arm.0 as usize) {
-                    *seen = false;
-                }
-            }
-        }
-    }
-    for seam in &trace.seams {
-        for id in &seam.values {
-            if let Some(seen) = unread.get_mut(id.0 as usize) {
-                *seen = false;
-            }
-        }
-    }
-    unread
-}
-
 #[must_use]
 pub(crate) fn schedule_streams(trace: &Trace, compiled: &CompiledModel) -> Vec<Option<u32>> {
     let mut streams: Vec<Option<Vec<u32>>> = vec![None; trace.values.len()];

@@ -12,6 +12,7 @@
 //! wanting it whole is all-reduced or all-gathered right after the op that
 //! made it.
 
+pub mod infer;
 mod rules;
 #[cfg(test)]
 mod tests;
@@ -91,10 +92,13 @@ struct Pass {
     world: u32,
     trace: Trace,
     dists: Vec<Option<Dist>>,
-    /// Each node of the input trace, rewritten for one rank, and the
-    /// collectives that follow it.
+    /// Each node of the input trace, rewritten for one rank, the ops a
+    /// rule lands before it, and the collectives that follow it.
     nodes: Vec<Option<Node>>,
+    before: Vec<Vec<Node>>,
     after: Vec<Vec<Node>>,
+    /// The ops the rule being applied lands before its node.
+    pending: Vec<Operation>,
     whole: BTreeMap<ValueId, ValueId>,
 }
 
@@ -105,7 +109,9 @@ impl Pass {
             world,
             dists: vec![None; trace.values.len()],
             nodes: vec![None; n],
+            before: vec![Vec::new(); n],
             after: vec![Vec::new(); n],
+            pending: Vec::new(),
             whole: BTreeMap::new(),
             trace,
         }
@@ -122,6 +128,13 @@ impl Pass {
             op.outputs(&mut ids);
             for (id, dist) in ids.into_iter().zip(outs) {
                 self.dists[id.0 as usize] = Some(dist);
+            }
+            for op in std::mem::take(&mut self.pending) {
+                self.before[at].push(Node {
+                    op,
+                    guard: node.guard.clone(),
+                    layer: node.layer,
+                });
             }
             self.nodes[at] = Some(Node { op, ..node });
         }
@@ -186,6 +199,10 @@ impl Pass {
                 Ok(Some((*axis, blocks)))
             }
             Shard::Replicated => Ok(None),
+            Shard::Inferred => Err(format!(
+                "`{}` leaves its cut to inference, which has not run",
+                param.name
+            )),
         }
     }
 
@@ -270,6 +287,18 @@ impl Pass {
         }
     }
 
+    /// A new value of type `ty`, which the ranks hold as `dist`, made by an
+    /// op a rule lands.
+    fn value(&mut self, ty: Ty, dist: Dist) -> ValueId {
+        let id = ValueId(self.trace.values.len() as u32);
+        self.trace.values.push(ValueDecl {
+            def: Def::Op(u32::MAX),
+            ty,
+        });
+        self.dists.push(Some(dist));
+        id
+    }
+
     /// `v` made whole on every rank: itself, or the output of the
     /// collective that follows the op that made it.
     fn whole(&mut self, v: ValueId) -> Result<ValueId, String> {
@@ -325,10 +354,19 @@ impl Pass {
         let before = self.trace.nodes.len();
         let mut nodes = Vec::with_capacity(before);
         let mut landed = vec![0u32; before];
+        // The ops the pass lands, beside the input trace's own.
+        let mut added = Vec::new();
         for (at, node) in self.nodes.into_iter().enumerate() {
+            for op in std::mem::take(&mut self.before[at]) {
+                added.push(nodes.len());
+                nodes.push(op);
+            }
             landed[at] = nodes.len() as u32;
             nodes.push(node.expect("every node was rewritten"));
-            nodes.extend(std::mem::take(&mut self.after[at]));
+            for op in std::mem::take(&mut self.after[at]) {
+                added.push(nodes.len());
+                nodes.push(op);
+            }
         }
         for decl in &mut self.trace.values {
             if let Def::Op(i) = &mut decl.def
@@ -338,13 +376,11 @@ impl Pass {
             }
         }
         let mut outs = Vec::new();
-        for (at, node) in nodes.iter().enumerate() {
-            if matches!(node.op, Operation::Collective(_)) {
-                outs.clear();
-                node.op.outputs(&mut outs);
-                for v in &outs {
-                    self.trace.values[v.0 as usize].def = Def::Op(at as u32);
-                }
+        for at in added {
+            outs.clear();
+            nodes[at].op.outputs(&mut outs);
+            for v in &outs {
+                self.trace.values[v.0 as usize].def = Def::Op(at as u32);
             }
         }
         self.trace.nodes = nodes;

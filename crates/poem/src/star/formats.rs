@@ -22,7 +22,7 @@ use starlark::values::structs::AllocStruct;
 use starlark::values::{Heap, NoSerialize, StarlarkValue, Value};
 use starlark_derive::{starlark_module, starlark_value};
 
-use crate::star::values::{DtypeValue, weight};
+use crate::star::values::DtypeValue;
 use checkpoint::contract::{Expr, TensorContract, TensorType};
 use checkpoint::types::Encoding;
 
@@ -369,6 +369,31 @@ thread_local! {
     pub(crate) static SOURCE: RefCell<Option<Snapshot>> = const { RefCell::new(None) };
     /// The tensor a format asked for and the checkpoint does not hold.
     static MISSED: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// The weights the compiler joins for the deployment being read.
+    pub(crate) static JOINS: RefCell<Vec<crate::Join>> = const { RefCell::new(Vec::new()) };
+    /// The weights the compiler lays out tiled for the deployment being read.
+    pub(crate) static TILED: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// The cuts the compiler inferred for the deployment being read.
+    pub(crate) static CUTS: RefCell<Vec<(String, crate::Shard)>> = const { RefCell::new(Vec::new()) };
+}
+
+/// `w` as the deployment being read cuts it: as it states, else as the
+/// compiler inferred, else whole.
+pub(crate) fn resolved(mut w: Weight) -> Weight {
+    if w.shard == crate::Shard::Inferred {
+        w.shard = CUTS.with(|cuts| {
+            cuts.borrow()
+                .iter()
+                .find(|(name, _)| *name == w.name)
+                .map_or(crate::Shard::Replicated, |(_, cut)| cut.clone())
+        });
+    }
+    w
+}
+
+/// The weight `value` is, cut as the deployment being read cuts it.
+fn weight(value: Value<'_>) -> anyhow::Result<Weight> {
+    crate::star::values::weight(value).map(resolved)
 }
 
 fn source<R>(f: impl FnOnce(&Snapshot) -> R) -> anyhow::Result<R> {
@@ -592,6 +617,49 @@ pub(crate) fn formats(builder: &mut GlobalsBuilder) {
         let values: Vec<f32> = values.items.iter().map(|v| v.0 as f32).collect();
         crate::import::constant(name, &values, shape.items, dtype.0)
             .map(ExprValue)
+            .map_err(|why| anyhow::anyhow!("{why}"))
+    }
+
+    /// The join leg `path` is one of: the joined weight's name, its legs'
+    /// paths in order, and whether `path` is the first; `None` for a weight
+    /// read as it is declared.
+    fn joined<'v>(
+        #[starlark(require = pos)] path: &str,
+        heap: Heap<'v>,
+    ) -> anyhow::Result<Value<'v>> {
+        Ok(JOINS.with(|joins| {
+            joins
+                .borrow()
+                .iter()
+                .find(|join| join.legs.iter().any(|leg| leg == path))
+                .map_or_else(Value::new_none, |join| {
+                    heap.alloc(AllocStruct([
+                        ("name", heap.alloc(join.name.as_str())),
+                        ("legs", heap.alloc(join.legs.clone())),
+                        ("first", heap.alloc(join.legs[0] == path)),
+                    ]))
+                })
+        }))
+    }
+
+    /// The weights `legs` joined along their rows into one named `name`.
+    fn join(
+        #[starlark(require = pos)] legs: UnpackList<Value<'_>>,
+        #[starlark(require = pos)] name: &str,
+    ) -> anyhow::Result<crate::star::values::WeightValue> {
+        let legs = legs
+            .items
+            .iter()
+            .map(|leg| {
+                leg.downcast_ref::<crate::star::values::WeightValue>()
+                    .map(|w| resolved(w.0.clone()))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("a join's leg is a weight, not {}", leg.get_type())
+                    })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        crate::Weight::joined(name, &legs)
+            .map(crate::star::values::WeightValue)
             .map_err(|why| anyhow::anyhow!("{why}"))
     }
 

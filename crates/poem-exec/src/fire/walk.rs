@@ -1,6 +1,6 @@
 use crate::dispatch::Dispatch;
 use poem_compiler::{CompiledModel, Lowering, Phase};
-use poem_ir::{Operation, Trace};
+use poem_ir::{Operands, Operation, Trace};
 
 use crate::Result;
 use crate::fire::Fault;
@@ -33,6 +33,7 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
 
     let mut captured = false;
     let mut runs: Vec<MaskSpan> = Vec::new();
+    let mut outs: Vec<poem_ir::ValueId> = Vec::new();
     let mut cut: Vec<(poem_ir::RowAxis, &poem_ir::ClassSet, Vec<MaskSpan>)> = Vec::new();
     for (index, region) in compiled.template().iter().enumerate() {
         match region.phase {
@@ -173,7 +174,7 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
                     sink.tail(node_at >= tail_start);
                 }
                 let collective = matches!(node.op, Operation::Collective(_));
-                if rows == 0 && !collective {
+                if rows == 0 && !collective && !received(compiled, node, &mut outs) {
                     continue;
                 }
                 dispatch.exec(node)?;
@@ -194,6 +195,23 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
     }
 
     Ok(())
+}
+
+/// Whether `node` makes an expert region's value: it works on the rows this
+/// rank received from every rank, so it runs whatever this rank's own rows
+/// (an expert-parallel rank with none of its own still serves the others').
+fn received(
+    compiled: &CompiledModel,
+    node: &poem_ir::Node,
+    outs: &mut Vec<poem_ir::ValueId>,
+) -> bool {
+    if compiled.expert.is_empty() {
+        return false;
+    }
+    outs.clear();
+    node.op.outputs(outs);
+    outs.iter()
+        .any(|v| compiled.expert.get(v.0 as usize).copied().unwrap_or(false))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -6,6 +6,12 @@ load("//lib/spoken.poem", "QWEN_STOP")
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP])
 
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: the packed q, k and v, the cross-attention's q and kv by their
+# heads, the packed gate and up by their channels, the output and down
+# projections by their rows.
+CUTS = "inferred"
+
 MODELS = [model("mini-dit", mini = True, template = CHATML, tokenizer = TOKENIZER, arch = "mini_dit", layers = 3, vocab = 0, taps = True)]
 
 DEPLOYMENTS = [deployment("mini-dit", weights = dtype.bf16, kv = dtype.bf16)]
@@ -27,8 +33,8 @@ def packed_linear(seams, in_, banks):
     for s in seams:
         out += s
     return struct(
-        w = weight([out, in_], banks).packed(seams),
-        bias = weight([out]).packed(seams),
+        w = weight([out, in_], banks),
+        bias = weight([out]),
     )
 
 HIDDEN = 256
@@ -43,33 +49,27 @@ CONTEXT_WIDTH = 512
 MOD_SLICES = 6
 ROPE_AXES = 3
 
-def columns(l):
-    return struct(w = l.w.columns(), bias = l.bias.columns())
-
-def rows(l):
-    return struct(w = l.w.rows(), bias = l.bias)
-
 def self_attn(banks):
     return struct(
         qkv = packed_linear([HIDDEN] * 3, HIDDEN, banks),
         q_norm = weight([HEAD_DIM]),
         k_norm = weight([HEAD_DIM]),
-        out = rows(linear(HIDDEN, HIDDEN, banks)),
+        out = linear(HIDDEN, HIDDEN, banks),
     )
 
 def cross_attn(banks):
     return struct(
-        q = columns(linear(HIDDEN, HIDDEN, banks)),
+        q = linear(HIDDEN, HIDDEN, banks),
         kv = packed_linear([HIDDEN] * 2, CONTEXT_WIDTH, banks),
         q_norm = weight([HEAD_DIM]),
         k_norm = weight([HEAD_DIM]),
-        out = rows(linear(HIDDEN, HIDDEN, banks)),
+        out = linear(HIDDEN, HIDDEN, banks),
     )
 
 def swiglu(banks):
     return struct(
         gate_up = packed_linear([INTER, INTER], HIDDEN, banks),
-        down = rows(linear(HIDDEN, INTER, banks)),
+        down = linear(HIDDEN, INTER, banks),
     )
 
 def side(banks):

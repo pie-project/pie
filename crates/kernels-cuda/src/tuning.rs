@@ -49,6 +49,14 @@ pub struct MoeMxfp4MmaUntil(pub u32);
 #[decision(id = "kernel.moe.nvfp4_mma_until", constant(range(0..=65_536)), default = 0, tune = search)]
 pub struct MoeNvfp4MmaUntil(pub u32);
 
+/// The most rows a router's product and its top-k run as one tcgen05 launch
+/// (`linear/moe/route_sm100.cu`, sm_100a: the K split over a cluster, its
+/// partials met in shared memory, the logits never stored) rather than the
+/// product and the router apart. 0 never does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.gate_tc5_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeGateTc5Until(pub u32);
+
 /// The fewest routes of [`MoeNvfp4MmaUntil`]'s span.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.nvfp4_mma_from", constant(range(1..=65_536)), default = 1, tune = search)]
@@ -164,6 +172,19 @@ pub struct SsmKdaChunked;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.ssm.kda_step_fused", flag, default = false, tune = search)]
 pub struct SsmKdaStepFused;
+
+/// The most routes a routed MLP runs as the mega-MoE (`linear::moe::mega`:
+/// the gate-up product, GLU, down product and fold in one persistent
+/// launch); none (0) but where a chip's profile says (B200's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mega_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct MoeMegaUntil(pub u32);
+
+/// The fewest routes a bf16 routed MLP runs as the mega-MoE (up to
+/// `kernel.moe.mega_until`): fewer stream their banks faster apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.moe.mega_bf16_from", constant(range(0..=2048)), default = 0, tune = search)]
+pub struct MoeMegaBf16From(pub u32);
 
 /// The fewest tokens a W4A8 routed MLP (MXFP4 banks against e4m3
 /// activations) keeps its rows by expert from the gate-up select to the
@@ -402,6 +423,15 @@ pub struct SdpaIndexMma;
 #[decision(id = "kernel.sdpa.index_tc5", flag, default = false, tune = search)]
 pub struct SdpaIndexTc5;
 
+/// Whether a pooled index over FP4 keys (DeepSeek-V4.1's, its queries read
+/// at FP4) scores them on tcgen05's block-scaled MMA as they are
+/// (`attn/index/logits_fp4_sm100.cu`: e2m1 against e2m1, a key a lane, a
+/// decode's keys split over the multiprocessors), then ranks in a launch of
+/// its own; off, the keys are widened to bf16 for the other scorers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.index_fp4_tc5", flag, default = false, tune = search)]
+pub struct SdpaIndexFp4Tc5;
+
 /// Whether a prefill's hyper-connection pre-mix norm lands its row's e4m3
 /// 1x128 operand beside it, for the fp8 GEMMs that read it next, in place of
 /// their quantize launch.
@@ -415,6 +445,13 @@ pub struct ElemwiseNormEmit;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.sdpa.index_radix", flag, default = false, tune = search)]
 pub struct SdpaIndexRadix;
+
+/// The most rows a scored index's radix ranking spreads each row's keys
+/// over a group of CTAs for (`attn/index/select.cu`, arch-generic), its
+/// picks the block-a-row ranking's; more rows rank a block a row. 0 never.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.sdpa.index_split_until", constant(range(0..=65_536)), default = 256, tune = search)]
+pub struct SdpaIndexSplitUntil(pub u32);
 
 /// The widest dense bf16 product (in columns) the GEMM tuner may also time
 /// on the narrow kernel (a block a row, every column's sum in registers);
@@ -593,21 +630,6 @@ pub struct ElemwiseRowsVec;
 #[decision(id = "kernel.elemwise.q_norm_rope_warp", flag, default = false, tune = search)]
 pub struct ElemwiseQNormRopeWarp;
 
-/// Whether a fused norm-and-fold leaves unwritten the rows nothing reads past
-/// it (Gemma 4's normed sublayer outputs, and a stream its layer scalar
-/// rescales into a new row).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.elemwise.skip_unread", flag, default = false, tune = search)]
-pub struct ElemwiseSkipUnread;
-
-/// The threads a block of the 16-byte fused norm-and-fold takes a row with
-/// in a fire of 1024 rows or more: 0 is the row's runs rounded up to a power
-/// of two (at most 512), as always and as in every narrower fire; a smaller
-/// block takes the row in several runs a thread and seats more rows an SM.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.elemwise.norm_fold_block", constant(set(0, 32, 64, 128, 256)), default = 0, tune = search)]
-pub struct ElemwiseNormFoldBlock(pub u32);
-
 /// Whether the hyper-connection kernels run their tiled and 16-byte forms:
 /// the mix projection a block 64 rows of every column over shared-memory
 /// tiles, the fold and the gates' pre-mix eight columns a thread, and a
@@ -622,6 +644,21 @@ pub struct ElemwiseHcTile;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.elemwise.hc_mma", flag, default = false, tune = search)]
 pub struct ElemwiseHcMma;
+
+/// The most rows a hyper-connection seam (a sublayer's fold and the next
+/// sublayer's whole pre-mix) lands in one tcgen05 launch at
+/// (`elemwise/hc_sm100.cu`); more run the fold and the pre-mix apart. 0
+/// (never) but where a chip's profile says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.elemwise.hc_mega_until", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct ElemwiseHcMegaUntil(pub u32);
+
+/// The fewest rows the seam lands in one launch at: below them a decode's
+/// fold and pre-mix as their own launches run as fast (their programmatic
+/// overlap hides the latencies the seam's split reduction cannot).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "kernel.elemwise.hc_mega_from", constant(range(0..=65_536)), default = 0, tune = search)]
+pub struct ElemwiseHcMegaFrom(pub u32);
 
 /// Whether the chunked causal conv's 16-byte row-tiled form runs four
 /// channels a thread under a 64-register bound (the same sums in the same
@@ -788,10 +825,10 @@ pub fn register(registry: &mut Registry) {
         .add::<SsmGdnScanUntil>()
         .add::<ElemwiseRowsVec>()
         .add::<ElemwiseQNormRopeWarp>()
-        .add::<ElemwiseSkipUnread>()
-        .add::<ElemwiseNormFoldBlock>()
         .add::<ElemwiseHcTile>()
         .add::<ElemwiseHcMma>()
+        .add::<ElemwiseHcMegaUntil>()
+        .add::<ElemwiseHcMegaFrom>()
         .add::<SsmConvVec4>()
         .add::<SsmGdnOutBf16>()
         .add::<SsmGdnStepBlocks>()
@@ -812,6 +849,8 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmBiasEpilogue>()
         .add::<MoeW4a4FusedFrom>()
         .add::<MoeW4a8FusedFrom>()
+        .add::<MoeMegaUntil>()
+        .add::<MoeMegaBf16From>()
         .add::<MlaExpandedFrom>()
         .add::<GemmFp8GemvUntil>()
         .add::<GemmFp8Shadow>()
@@ -832,6 +871,7 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmRowsM>()
         .add::<GemmTc5SplitTickets>()
         .add::<MoeNvfp4MmaUntil>()
+        .add::<MoeGateTc5Until>()
         .add::<MoeNvfp4MmaFrom>()
         .add::<PrefillTc5>()
         .add::<PrefillWideSliding>()
@@ -847,8 +887,10 @@ pub fn register(registry: &mut Registry) {
         .add::<SdpaSelectedMma>()
         .add::<SdpaIndexMma>()
         .add::<SdpaIndexTc5>()
+        .add::<SdpaIndexFp4Tc5>()
         .add::<ElemwiseNormEmit>()
         .add::<SdpaIndexRadix>()
+        .add::<SdpaIndexSplitUntil>()
         .add::<SdpaPoolMma>()
         .add::<SdpaCompressedPrefillFrom>()
         .add::<SdpaCompressedReplay>()
@@ -923,10 +965,10 @@ tuning! {
     ssm_gdn_scan_until: u32 = 32, get SsmGdnScanUntil;
     rows_vec: bool = false, on ElemwiseRowsVec;
     q_norm_rope_warp: bool = false, on ElemwiseQNormRopeWarp;
-    skip_unread: bool = false, on ElemwiseSkipUnread;
-    norm_fold_block: u32 = 0, get ElemwiseNormFoldBlock;
     hc_tile: bool = false, on ElemwiseHcTile;
     hc_mma: bool = false, on ElemwiseHcMma;
+    hc_mega_until: u32 = 0, get ElemwiseHcMegaUntil;
+    hc_mega_from: u32 = 0, get ElemwiseHcMegaFrom;
     ssm_conv_vec4: bool = false, on SsmConvVec4;
     ssm_gdn_out_bf16: bool = false, on SsmGdnOutBf16;
     ssm_gdn_step_blocks: u32 = 4, get SsmGdnStepBlocks;
@@ -947,6 +989,8 @@ tuning! {
     gemm_bias_epilogue: bool = false, on GemmBiasEpilogue;
     moe_w4a4_fused_from: u32 = 65_536, get MoeW4a4FusedFrom;
     moe_w4a8_fused_from: u32 = 65_536, get MoeW4a8FusedFrom;
+    moe_mega_until: u32 = 0, get MoeMegaUntil;
+    moe_mega_bf16_from: u32 = 0, get MoeMegaBf16From;
     mla_expanded_from: u32 = 65_536, get MlaExpandedFrom;
     gemm_fp8_gemv_until: u32 = 0, get GemmFp8GemvUntil;
     gemm_fp8_shadow: bool = false, on GemmFp8Shadow;
@@ -968,6 +1012,7 @@ tuning! {
     gemm_tc5_split_tickets: u32 = 0, get GemmTc5SplitTickets;
     nvfp4_mma_from: u32 = 1, get MoeNvfp4MmaFrom;
     nvfp4_mma_until: u32 = 0, get MoeNvfp4MmaUntil;
+    gate_tc5_until: u32 = 0, get MoeGateTc5Until;
     prefill_tc5: bool = false, on PrefillTc5;
     prefill_wide_sliding: bool = false, on PrefillWideSliding;
     decode_grouped_prefill_from: u32 = 0, get DecodeGroupedPrefillFrom;
@@ -982,8 +1027,10 @@ tuning! {
     selected_mma: bool = false, on SdpaSelectedMma;
     index_mma: bool = false, on SdpaIndexMma;
     index_tc5: bool = false, on SdpaIndexTc5;
+    index_fp4_tc5: bool = false, on SdpaIndexFp4Tc5;
     norm_emit: bool = false, on ElemwiseNormEmit;
     index_radix: bool = false, on SdpaIndexRadix;
+    index_split_until: u32 = 256, get SdpaIndexSplitUntil;
     pool_mma: bool = false, on SdpaPoolMma;
     compressed_prefill_from: u32 = 0, get SdpaCompressedPrefillFrom;
     compressed_replay: bool = false, on SdpaCompressedReplay;

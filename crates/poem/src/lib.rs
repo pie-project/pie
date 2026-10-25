@@ -25,7 +25,7 @@ pub use poem_ir::{
     Param, ParamSource, PixelOrder, Platform, RaggedMask, RopeForm, RuntimeInput, Sampling,
     Selection, Shard, TapKind, Trace, Ty, ValueId, VoxelSegment, resolve_classes,
 };
-pub use record::{Arm, Primitive, Recorder, Refine, Switch, Value, switch};
+pub use record::{Arm, Primitive, Recorder, Refine, Switch, Value, restate, switch};
 
 pub mod seam {
 

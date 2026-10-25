@@ -975,6 +975,12 @@ impl Bodies {
         let Ok(script) = cuts(at.compiled, at.ceilings.admits) else {
             return Ok(());
         };
+        // An arming expert-parallel group captures and instantiates its
+        // bodies with nothing in flight (`EpRank::fence`): an instantiation
+        // takes the context, and a peer's collective spinning on the same
+        // device would wait on the launch that holds back.
+        let fence = |run: &Run<'_>| run.ep_rank().map_or(Ok(()), |ep| ep.fence(at.stream));
+        fence(run)?;
         let mut steps: Vec<Step> = Vec::with_capacity(script.len());
         let mut nodes = 0;
         let mut edges = 0;
@@ -1040,6 +1046,8 @@ impl Bodies {
                 self.recorder.kept.push((key.clone(), graph));
             }
         }
+        // Every rank instantiated before any launches what it captured.
+        fence(run)?;
         self.recorder.last_capture = LastCapture {
             nodes,
             edges,

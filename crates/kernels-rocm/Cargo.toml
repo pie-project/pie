@@ -19,6 +19,7 @@ rocm = ["dep:libloading", "dep:miniz_oxide"]
 
 [dependencies]
 dtype = { package = "pie-dtype", path = "../dtype" }
+kernels-ir = { path = "../kernels-ir" }
 profile = { package = "pie-profile", path = "../profile" }
 
 libloading = { version = "0.9", optional = true }

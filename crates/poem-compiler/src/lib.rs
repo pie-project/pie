@@ -5,14 +5,17 @@ pub mod catalog;
 pub mod compiled;
 pub mod costs;
 pub mod error;
+pub mod expert;
 pub mod fuse;
 pub mod layout;
 pub mod lowering;
+pub mod pack;
 mod pq;
 pub mod prefetch;
 mod region;
 pub mod shard;
 pub mod stream;
+pub mod tile;
 mod tree;
 pub mod unit;
 
@@ -50,6 +53,9 @@ pub fn compile(
     compile_axes(trace, &Budgets::of(budget.clone()), profile)
 }
 
+/// The plan of `trace` under `budgets` on `profile`'s device, the trace
+/// as it stands: a backend that runs chains as generated kernels folds
+/// them first ([`fuse::chain::fold`], under `compiler.synth_regions`).
 pub fn compile_axes(
     trace: &Trace,
     budgets: &Budgets,
@@ -160,6 +166,7 @@ pub fn compile_axes(
         concurrency,
         streams,
         fold_refused: unit::fold_refused(&units),
+        expert: expert::held(trace),
         units,
         units_of,
         patches,

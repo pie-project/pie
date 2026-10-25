@@ -170,6 +170,10 @@ impl PartialEq for Comm {
 #[cfg(feature = "cuda")]
 const STAGE_BYTES: u64 = 16 << 20;
 
+/// Bytes of the stage [`reach`] maps: the handshake's one word, aligned.
+#[cfg(feature = "cuda")]
+const PROBE_BYTES: u64 = 256;
+
 /// Maps every rank's stage into every other rank when each pair of devices
 /// reaches the other: the group's ranks share this process, so a peer's
 /// buffer is a plain device pointer once peer access is on. At two ranks the
@@ -200,11 +204,29 @@ pub fn open_peers(ordinals: &[i32]) -> Option<Vec<kernels_cuda::collective::Peer
     }
 }
 
+/// Whether every rank of `ordinals` loads and stores every other's memory,
+/// as the peer kernels do: each pair checked and a handshake run through
+/// the mapping, on a stage of one word. What an expert-parallel group
+/// needs, at any width; whether the peer all-reduce beats NCCL is
+/// [`open_peers`]'s question.
+pub fn reach(ordinals: &[i32]) -> Result<()> {
+    #[cfg(feature = "cuda")]
+    {
+        mapped(ordinals, PROBE_BYTES).map(drop)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = ordinals;
+        Err(Fault::program(
+            "comm::reach",
+            "ROCm has no peer kernels".to_string(),
+        ))
+    }
+}
+
 #[cfg(feature = "cuda")]
 fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::Peers>>> {
     use crate::device::rt;
-
-    use crate::device::ctx::check;
 
     let off = |why: String| Fault::program("comm::open_peers", why);
     let world = u32::try_from(ordinals.len()).unwrap_or(u32::MAX);
@@ -239,6 +261,20 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
             "no peer path for a group of {world}: its pairs are not all NVLink"
         )));
     }
+    mapped(ordinals, STAGE_BYTES).map(Some)
+}
+
+/// Every rank's stage of `stage_bytes` (and its signals) mapped into every
+/// other's, once each pair of devices reaches the other and a handshake
+/// through the mapping finds what was posted.
+#[cfg(feature = "cuda")]
+fn mapped(ordinals: &[i32], stage_bytes: u64) -> Result<Vec<kernels_cuda::collective::Peers>> {
+    use crate::device::rt;
+
+    use crate::device::ctx::check;
+
+    let off = |why: String| Fault::program("comm::peers", why);
+    let world = u32::try_from(ordinals.len()).unwrap_or(u32::MAX);
     for &a in ordinals {
         let mut vmm = 0;
         // SAFETY: a live out-parameter; a driver device is its ordinal.
@@ -287,12 +323,9 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
             check("cudaSetDevice", rt::cudaSetDevice(a))?;
             let signal_bytes = kernels_cuda::collective::SIGNAL_BYTES as usize + table;
             let stage =
-                crate::device::elastic::shared(a, ordinals, STAGE_BYTES + signal_bytes as u64)?;
-            let signal = stage + STAGE_BYTES;
-            check(
-                "cudaMemset",
-                rt::cudaMemset(signal as *mut c_void, 0, signal_bytes),
-            )?;
+                crate::device::elastic::shared(a, ordinals, stage_bytes + signal_bytes as u64)?;
+            let signal = stage + stage_bytes;
+            crate::device::zero_span(signal, signal_bytes)?;
             stages[rank] = stage;
             signals[rank] = signal;
             tables.push(signal + kernels_cuda::collective::SIGNAL_BYTES);
@@ -308,25 +341,33 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
         // and the stage is at least a word.
         unsafe {
             check("cudaSetDevice", rt::cudaSetDevice(a))?;
+            let own = crate::device::alloc::OWN_STREAM;
             check(
-                "cudaMemcpy",
-                rt::cudaMemcpy(
+                "cudaMemcpyAsync",
+                rt::cudaMemcpyAsync(
                     tables[rank] as *mut c_void,
                     bytes.as_ptr().cast(),
                     table,
                     rt::cudaMemcpyKind::cudaMemcpyHostToDevice,
+                    own.cast(),
                 ),
             )?;
             check(
-                "cudaMemset",
-                rt::cudaMemset(stages[rank] as *mut c_void, 0x40 + rank as i32, 4),
+                "cudaMemsetAsync",
+                rt::cudaMemsetAsync(
+                    stages[rank] as *mut c_void,
+                    0x40 + rank as i32,
+                    4,
+                    own.cast(),
+                ),
             )?;
+            crate::device::ctx::sync(own)?;
         }
         peers.push(kernels_cuda::collective::Peers {
             rank: rank as u32,
             world,
             stage: stages[rank],
-            stage_bytes: STAGE_BYTES,
+            stage_bytes,
             signal: signals[rank],
             stages: tables[rank],
             signals: tables[rank] + size_of::<[u64; 8]>() as u64,
@@ -345,18 +386,17 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
     for _ in 0..2 {
         for ((&a, peers), status) in ordinals.iter().zip(&peers).zip(&statuses) {
             crate::device::ctx::bind_thread(a)?;
-            // SAFETY: the device's legacy stream; the stages and tables are live.
-            let ctx = unsafe { kernels_cuda::Ctx::on(core::ptr::null_mut()) };
+            // SAFETY: this thread's own stream on the device; the stages and
+            // tables are live.
+            let ctx = unsafe { kernels_cuda::Ctx::on(crate::device::alloc::OWN_STREAM) };
             peers
                 .answer(&ctx, status.ptr())
                 .map_err(crate::error::kernel)?;
         }
         for &a in ordinals {
             crate::device::ctx::bind_thread(a)?;
-            // SAFETY: no arguments; waits for the rounds' kernels.
-            check("cudaDeviceSynchronize", unsafe {
-                rt::cudaDeviceSynchronize()
-            })?;
+            // The rounds' kernels, on this thread's own stream of the device.
+            crate::device::ctx::sync(crate::device::alloc::OWN_STREAM)?;
         }
     }
     for (&a, status) in ordinals.iter().zip(&statuses) {
@@ -377,7 +417,7 @@ fn wire_peers(ordinals: &[i32]) -> Result<Option<Vec<kernels_cuda::collective::P
             }
         }
     }
-    Ok(Some(peers))
+    Ok(peers)
 }
 
 /// `shm` takes no device-to-device path, and NVLS (NVSwitch multicast) is

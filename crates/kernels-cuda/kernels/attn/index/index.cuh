@@ -66,6 +66,10 @@ __device__ __forceinline__ u32 order_bits(float v) {
     return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
 }
 
+// `order_bits` of a score read as its bits: read as a float into the split
+// ranking's registers, +NaN's order bits came out unflipped (below +inf).
+__device__ __forceinline__ u32 order_of(u32 b) { return (b & 0x80000000u) ? ~b : (b | 0x80000000u); }
+
 // Block-wide exclusive prefix of `flag`, and the block's total.
 __device__ __forceinline__ int block_prefix(bool flag, int tid, int* warp_sums, int& total) {
     const int lane = tid & 31, warp = tid >> 5;
@@ -164,5 +168,66 @@ __device__ __forceinline__ void select_top_radix(const float* __restrict__ frow,
     }
     for (int n = written + tid; n < topk; n += kBlock) srow[n] = -1;
 }
+
+// One row's request, first page, page count and the blocks it sees, from a
+// ranking's tables over its first `R` requests.
+struct RowInfo {
+    int req, pages_first, num_pages, nkeys;
+};
+
+template <class P>
+__device__ __forceinline__ RowInfo row_info(const P& p, int t, int R) {
+    RowInfo ri;
+    // The request whose rows hold t, by halving (a prefill's 32 requests in
+    // five reads, where every role asks for both rows of every pair).
+    int lo = 0, hi = R - 1;
+    while (lo < hi) {
+        const int mid = (lo + hi) >> 1;
+        if (t < static_cast<int>(p.qo_indptr[mid + 1])) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    const int r = lo;
+    const int qo_lo = static_cast<int>(p.qo_indptr[r]);
+    const int new_tokens = static_cast<int>(p.qo_indptr[r + 1]) - qo_lo;
+    ri.pages_first = static_cast<int>(p.page_indptr[r]);
+    ri.num_pages = static_cast<int>(p.page_indptr[r + 1]) - ri.pages_first;
+    const int kv_len = (ri.num_pages - 1) * p.page_size + static_cast<int>(p.last_page_lens[r]);
+    const int total = kv_len - new_tokens + (t - qo_lo) + 1;
+    const int stride = p.ratio > 0 ? p.ratio : 1;
+    ri.nkeys = total > 0 ? min(total / stride, p.score_stride) : 0;
+    ri.req = r;
+    return ri;
+}
+
+// DeepSeek-V4.1's FP4 index keys: a position's 128 dims as e2m1 pairs (64
+// bytes, the lower dim in the low nibble) under one ue8m0 exponent a 32 (4
+// bytes), a page of `ps` positions its `ps` data rows then its `ps` scale
+// rows. The reference's `fp4_act_quant(k, 32, ue8m0)`: the exponent
+// 2^ceil(log2(amax / 6)), amax floored at 6 * 2^-126, the codes e2m1 of
+// x / 2^e. Its queries are read alike.
+namespace index_fp4 {
+
+constexpr int kD = 128;
+constexpr int kData = kD / 2;
+constexpr int kScale = kD / 32;
+constexpr int kRow = kData + kScale;
+
+// The biased exponent of 2^ceil(log2(amax * (1/6))), as the reference's
+// `fast_round_scale` takes it off the product's bits.
+__device__ __forceinline__ int e8m0_ceil6(float amax) {
+    const unsigned bits = __float_as_uint(fmaxf(amax, 6.f * 1.1754943508222875e-38f) * (1.f / 6.f));
+    return static_cast<int>((bits >> 23) & 0xffu) + ((bits & 0x7fffffu) != 0u ? 1 : 0);
+}
+
+__device__ __forceinline__ float pow2_of(int e) {
+    return e != 0 ? __uint_as_float(static_cast<unsigned>(e) << 23) : __uint_as_float(0x00400000u);
+}
+
+}
+
+// namespace index_fp4
 
 }

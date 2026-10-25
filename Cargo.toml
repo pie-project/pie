@@ -47,6 +47,7 @@ members = [
     "crates/chat-template",
     "crates/media",
     "crates/kernels-cuda",
+    "crates/kernels-ir",
     "crates/kernels-rocm",
     "crates/kernels-metal",
     "crates/engine-cuda",

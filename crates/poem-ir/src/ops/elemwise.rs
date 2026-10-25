@@ -109,6 +109,29 @@ pub enum Elemwise {
         #[output]
         y: ValueId,
     },
+    /// Each row's sum of squares, f32, one a row: a rank's term of the sum a
+    /// row norm takes over a row the ranks split.
+    SumSquares {
+        #[input]
+        x: ValueId,
+        #[output(F32)]
+        ss: ValueId,
+    },
+    /// `x / sqrt(ss / width + eps)`, times `weight`: a row norm whose sum
+    /// of squares `ss` (f32, one a row) is stated, over a row `width` wide
+    /// whole of which `x` is a share.
+    RmsnormBy {
+        #[input]
+        x: ValueId,
+        #[input(F32)]
+        ss: ValueId,
+        #[input]
+        weight: NormWeight,
+        width: u32,
+        eps: f32,
+        #[output]
+        y: ValueId,
+    },
     /// Muse Spark's post-norm and residual gate: `u = x * scale` rounded
     /// (`x` where no scale), `n = rmsnorm(u)` unscaled and rounded, and with
     /// a residual `y = alpha * res + beta * n`, `beta = sigmoid(w)` and

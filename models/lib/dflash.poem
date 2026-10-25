@@ -8,6 +8,10 @@
 # `mask_token` that fills it, an optional dynamic `conv` around each block's
 # branches, and its `readout`: "argmax", or a `selector` or `markov` walk
 # over the top candidates.
+#
+# Its weights state no cuts: a package that drafts with it leaves them to the
+# compiler, which cuts the blocks' q, k, v, biases, gate and up by their heads
+# and channels and their output and down projections by their rows.
 
 def head(
         taps,
@@ -64,7 +68,7 @@ def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None):
             base = weight([2 * c.taps, hidden]),
             proj = weight([2 * c.taps * (hidden // c.group), hidden],
                 w,
-            ).columns(),
+            ),
             taps = c.taps,
             group = c.group,
         )
@@ -81,10 +85,10 @@ def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None):
                 rotary_dim = hd,
                 theta = head.theta,
                 sm_scale = f32(1.0 / f32(sqrt(hd))),
-                q_proj = weight([dq * hd, hidden], bw).columns(),
-                k_proj = weight([dkv * hd, hidden], bw).columns(heads = dkv),
-                v_proj = weight([dkv * hd, hidden], bw).columns(heads = dkv),
-                o_proj = weight([hidden, dq * hd], bw).rows(),
+                q_proj = weight([dq * hd, hidden], bw),
+                k_proj = weight([dkv * hd, hidden], bw),
+                v_proj = weight([dkv * hd, hidden], bw),
+                o_proj = weight([hidden, dq * hd], bw),
                 q_norm = weight([hd]),
                 q_norm_eps = norm_eps,
                 k_norm = weight([hd]),
@@ -98,8 +102,8 @@ def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None):
             mlp_norm = weight([hidden]),
             mlp_norm_eps = norm_eps,
             mlp = struct(
-                gate_up = weight([2 * inter, hidden], bw).packed([inter, inter]),
-                down = weight([hidden, inter], bw).rows(),
+                gate_up = weight([2 * inter, hidden], bw),
+                down = weight([hidden, inter], bw),
                 inter = inter,
             ),
             window = window,
@@ -116,7 +120,7 @@ def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None):
             kind = "selector",
             hidden_projection = weight([readout.rank, hidden],
                 w,
-            ).columns(),
+            ),
             pred = codebook("candidate_selector.predecessor_codebook", readout.rank),
             succ = codebook("candidate_selector.successor_codebook", readout.rank),
             top_k = readout.top_k,

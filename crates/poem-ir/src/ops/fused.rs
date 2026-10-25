@@ -4,7 +4,7 @@ use crate::Op;
 use crate::operands::Part;
 use crate::ops::attn::Attn;
 use crate::ops::elemwise::{Elemwise, ModulateForm, Turn, Yarn};
-use crate::ops::linear::{GluAct, Linear};
+use crate::ops::linear::{GluAct, Linear, RouteScore};
 use crate::value::ValueId;
 
 /// The norm a [`Fused::RmsnormResidualAdd`] also lands over its last row:
@@ -406,6 +406,32 @@ pub enum Fused {
         #[output(alias = y)]
         y_out: ValueId,
     },
+    /// A router's product (a `Matmul` into `logits`) and the top-k it feeds
+    /// (a `MoeRoute` of `experts` under `score`, `bias`, `scale` and `hint`
+    /// as it states them): a backend may land the routes and weights
+    /// straight from the product's sums, or run the two. `logits` is still
+    /// an output, read by nothing else.
+    MatmulMoeRoute {
+        #[input]
+        act: ValueId,
+        #[input]
+        w: ValueId,
+        #[input]
+        bias: Option<ValueId>,
+        #[input]
+        scale: Option<ValueId>,
+        #[input]
+        hint: Option<ValueId>,
+        experts: u32,
+        top_k: u32,
+        score: RouteScore,
+        #[output]
+        logits: ValueId,
+        #[output(I32)]
+        routes: ValueId,
+        #[output(F32)]
+        weights: ValueId,
+    },
     /// A projection whose rows are cut at `width` straight after: a backend
     /// may land each side from its own slice of the weight, or run the
     /// matmul into `y` and cut it.
@@ -443,6 +469,24 @@ pub enum Fused {
         head_dim: u32,
         #[output]
         o_out: ValueId,
+    },
+    /// A sublayer's hyper-connection fold (`fold`, an `HcFold`) and the next
+    /// sublayer's whole pre-mix over the streams it folds: stream norm
+    /// (`norm`), mix projection (`project`), combined gates (`gates`) and the
+    /// pre-mixed row's `rmsnorm`, as [`Fused::HcPre`]'s. The folded streams
+    /// are still an output, read on; the pre-mix's intermediates are still
+    /// outputs, read by nothing else.
+    HcFoldPre {
+        #[part]
+        fold: Box<Elemwise>,
+        #[part]
+        norm: Box<Elemwise>,
+        #[part]
+        project: Box<Elemwise>,
+        #[part]
+        gates: Box<Elemwise>,
+        #[part]
+        rmsnorm: Box<Elemwise>,
     },
     /// A sublayer's whole hyper-connection pre-mix: stream norm (`norm`, an
     /// `HcRmsnormF32`), mix projection (`project`, an `HcProject`), combined
@@ -602,6 +646,29 @@ pub enum Fused {
         #[part]
         gate_add: Option<Box<Linear>>,
     },
+    /// A routed MLP a mega-MoE kernel lands in one launch: the gate-up
+    /// select (gate rows then up rows per expert), its packed SwiGLU, the
+    /// down select on the same routes and the fold (`MoeCombine`). The fold
+    /// is the route weights' first (`glu` takes them, the routes summed
+    /// plainly with `sum`'s shared row added where given) or the weighted
+    /// sum (`sum` takes them, no shared row). The rows between are still
+    /// outputs, read by nothing else, so a backend that declines a fire
+    /// runs it as the `MoeExperts` it also is. A weighted sum under a gated
+    /// shared expert (Qwen's) carries that `MoeSigmoidGateAdd` as `gate_add`,
+    /// run after the launch, so the `MoeExperts` a decline runs is the whole
+    /// one the chain would have formed.
+    MoeMega {
+        #[part]
+        select: Box<Linear>,
+        #[part]
+        glu: Box<Linear>,
+        #[part]
+        down: Box<Linear>,
+        #[part]
+        sum: Box<Linear>,
+        #[part]
+        gate_add: Option<Box<Linear>>,
+    },
     /// `qkv` (a `QkvFusedQknormRopeVnormWrite`) on the first columns of its
     /// `packed` rows, the rest of each row (`rest`'s width) landing in
     /// `rest`: a row split (Muse Spark's qkv|gate) read in place.
@@ -646,6 +713,22 @@ pub enum Fused {
         widths: [u32; 2],
         #[output]
         q: ValueId,
+    },
+    /// A chain of elementwise and row ops the compiler generates one kernel
+    /// for (poem-compiler's `fuse::chain`): `ins[k]` is the kernel's
+    /// parameter `k` and `outs[k]` its result `k`, each a row of `width` a
+    /// row (an input one row every row reads, a weight's). `key` is the
+    /// region's own key (kernels-ir's `Region::key`, a hash of what it
+    /// computes, not of any backend's source), the one it is held under in
+    /// the compiled model; each backend prints its kernel from the region.
+    /// No output lands over an input: each has a plane of its own.
+    Region {
+        #[input]
+        ins: Vec<ValueId>,
+        width: u32,
+        key: u64,
+        #[output]
+        outs: Vec<ValueId>,
     },
 }
 
@@ -792,6 +875,20 @@ mod tests {
             project: Box::new(project),
         };
         assert_eq!(operands(&prenorm), (vec![1, 2], vec![10, 11], vec![]));
+    }
+
+    /// A generated region reads its parameters and lands its results, none
+    /// over another.
+    #[test]
+    fn a_region_lands_no_result_over_its_parameters() {
+        let op = Fused::Region {
+            ins: vec![v(1), v(2), v(3)],
+            width: 64,
+            key: 0x5eed,
+            outs: vec![v(4), v(5)],
+        };
+        assert_eq!(operands(&op), (vec![1, 2, 3], vec![4, 5], vec![]));
+        assert_eq!(op.name(), "fused.region");
     }
 
     /// The sinks scale the merged plane where it lies; a log-sum-exp

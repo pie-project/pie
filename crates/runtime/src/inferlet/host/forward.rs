@@ -1179,8 +1179,13 @@ impl ProcessCtx {
                 .map(|state| state.lanes.clone())
                 .unwrap_or_default();
             let (kv_lanes, rs_reps) = self.lane_parts(&lanes)?;
+            // The pass binds on the engine its working sets live on; a
+            // seatless float pass binds on its process's engine.
+            let engine = match kv_lanes.first() {
+                Some(&rep) => super::working_set::kv_of(self, rep)?.engine,
+                None => crate::planner::engine_of(self.id()),
+            };
             let (devgeo, decode_envelope, geometry_class) = if float.is_none() {
-                let engine = super::working_set::kv_of(self, kv_lanes[0])?.engine;
                 let device_port_mask = crate::engine::get_spec(engine)?.device_geometry_port_mask;
                 let needs_mask_port = prog.bound.container.ports.iter().any(|binding| {
                     matches!(binding.port, eta_ir::registry::Port::AttnMask)
@@ -1364,7 +1369,7 @@ impl ProcessCtx {
             let process_id = self.id();
             let (registered, bound_instance, scheduler) =
                 match crate::scheduler::register_channels_bind_classified(
-                    0,
+                    engine,
                     Some(process_id),
                     registration_plans,
                     program_registration,

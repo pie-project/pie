@@ -158,10 +158,12 @@ impl Run<'_> {
                 )?;
                 l.land(o_y, v)
             }),
+            // An unclamped unit clamps at the largest finite f32, which keeps
+            // every finite value.
             Linear::Glu {
                 packed: Some(packed),
                 intermediate,
-                limit: Some(limit),
+                limit,
                 y,
                 gate: None,
                 weights: None,
@@ -174,13 +176,71 @@ impl Run<'_> {
                     l.f(),
                     packed_v,
                     *intermediate,
-                    *limit,
+                    limit.unwrap_or(f32::MAX),
                     *alpha,
                     o_y.landing(),
                 )?;
                 l.land(o_y, v)
             }),
 
+            // Legs the pack left apart: each packed form over a gate and an up
+            // plane.
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                y,
+                packed: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Swiglu,
+                ..
+            } => crate::lower::lower(self.ctx(), |l| {
+                let gate_v = l.read(self.tensor(*gate))?;
+                let up_v = l.read(self.tensor(*up))?;
+                let o_y = self.tensor(*y);
+                let v = linear::mlp::swiglu_split(l.f(), gate_v, up_v, o_y.landing())?;
+                l.land(o_y, v)
+            }),
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                limit,
+                y,
+                packed: None,
+                weights: None,
+                act: poem_ir::GluAct::SwigluAlpha { alpha, .. },
+                ..
+            } => crate::lower::lower(self.ctx(), |l| {
+                let gate_v = l.read(self.tensor(*gate))?;
+                let up_v = l.read(self.tensor(*up))?;
+                let o_y = self.tensor(*y);
+                let v = linear::mlp::swiglu_clamp_alpha_split(
+                    l.f(),
+                    gate_v,
+                    up_v,
+                    limit.unwrap_or(f32::MAX),
+                    *alpha,
+                    o_y.landing(),
+                )?;
+                l.land(o_y, v)
+            }),
+            Linear::Glu {
+                gate: Some(gate),
+                up: Some(up),
+                y,
+                packed: None,
+                weights: None,
+                limit: None,
+                act: poem_ir::GluAct::Situ { beta, up_cap, .. },
+                ..
+            } => crate::lower::lower(self.ctx(), |l| {
+                let gate_v = l.read(self.tensor(*gate))?;
+                let up_v = l.read(self.tensor(*up))?;
+                let o_y = self.tensor(*y);
+                let v =
+                    linear::mlp::situ_split(l.f(), gate_v, up_v, *beta, *up_cap, o_y.landing())?;
+                l.land(o_y, v)
+            }),
             Linear::Glu {
                 gate: Some(gate),
                 up: Some(up),

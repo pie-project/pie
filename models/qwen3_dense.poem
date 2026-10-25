@@ -15,6 +15,13 @@ load("//lib/spoken.poem", "QWEN_STOP")
 CHATML = template("chatml", thinking = True, tools = True, stop = QWEN_STOP)
 TOKENIZER = tokenizer(markers = [QWEN_STOP])
 
+# The compiler reads how tensor-parallel ranks cut each weight off the
+# forward: q, k and v by their heads, the gate and the up by their
+# channels, the output and down projections by their rows, the head by its
+# vocabulary. The embedding, which a small model's head reads tied, it
+# holds whole, as the package always has.
+CUTS = "inferred"
+
 def qwen3(id, layers):
     return model(id, template = CHATML, tokenizer = TOKENIZER, arch = "qwen3", layers = layers, vocab = 151936)
 
@@ -101,15 +108,16 @@ def layout(id, deploy):
         lora_a, lora_b = banks("layer.{}".format(l), hidden, dense)
         return struct(
             attn_norm = weight([hidden]),
-            q = weight([d.q_heads * hd, hidden], proj).columns(),
-            k = weight([d.kv_heads * hd, hidden], proj).columns(heads = d.kv_heads),
-            v = weight([d.kv_heads * hd, hidden], proj).columns(heads = d.kv_heads),
-            o = weight([hidden, d.q_heads * hd], proj).rows(),
+            q = weight([d.q_heads * hd, hidden], proj),
+            k = weight([d.kv_heads * hd, hidden], proj),
+            v = weight([d.kv_heads * hd, hidden], proj),
+            o = weight([hidden, d.q_heads * hd], proj),
             q_norm = weight([hd]),
             k_norm = weight([hd]),
             mlp_norm = weight([hidden]),
-            gate_up = weight([2 * d.inter, hidden], proj).packed([d.inter, d.inter]),
-            down = weight([hidden, d.inter], proj).rows(),
+            gate = weight([d.inter, hidden], proj),
+            up = weight([d.inter, hidden], proj),
+            down = weight([hidden, d.inter], proj),
             kv = "kv.{}".format(l),
             lora_a = lora_a,
             lora_b = lora_b,
@@ -129,8 +137,8 @@ def layout(id, deploy):
         rope = yarn(deploy, 32768),
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         kv = deploy.kv,
-        embed = weight([d.vocab, hidden]),
-        head = None if d.tied else weight([d.vocab, hidden]).columns(),
+        embed = weight([d.vocab, hidden]).replicated(),
+        head = None if d.tied else weight([d.vocab, hidden]),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
     )
@@ -174,7 +182,8 @@ TRANSFORMERS = [
     ("model.layers.{l}.self_attn.q_norm.weight", "layers.{l}.q_norm"),
     ("model.layers.{l}.self_attn.k_norm.weight", "layers.{l}.k_norm"),
     ("model.layers.{l}.post_attention_layernorm.weight", "layers.{l}.mlp_norm"),
-    (["model.layers.{l}.mlp.gate_proj.weight", "model.layers.{l}.mlp.up_proj.weight"], "layers.{l}.gate_up"),
+    ("model.layers.{l}.mlp.gate_proj.weight", "layers.{l}.gate"),
+    ("model.layers.{l}.mlp.up_proj.weight", "layers.{l}.up"),
     ("model.layers.{l}.mlp.down_proj.weight", "layers.{l}.down"),
 ]
 
@@ -202,10 +211,8 @@ def forward(m, inputs):
         o = ops.linear.lora_correct(x.on(adapted), w.lora_a, w.lora_b, routes, o.on(adapted))
         y = ops.elemwise.residual_add(o, y)
         x = ops.elemwise.rmsnorm(y, w.mlp_norm, m.eps)
-        f = ops.linear.matmul(
-            ops.linear.glu(ops.linear.matmul(x, w.gate_up), gating.swiglu(), m.inter),
-            w.down,
-        )
+        gate, up = ops.linear.matmul(x, w.gate), ops.linear.matmul(x, w.up)
+        f = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), w.down)
         return ops.elemwise.residual_add(f, y)
 
     y = inputs.fold_layers(m.layers, y, block)
