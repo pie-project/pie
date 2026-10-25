@@ -173,11 +173,6 @@ pub struct SsmKdaChunked;
 #[decision(id = "kernel.ssm.kda_step_fused", flag, default = false, tune = search)]
 pub struct SsmKdaStepFused;
 
-/// The fewest tokens a W4A8 routed MLP (MXFP4 banks against e4m3
-/// activations) keeps its rows by expert from the gate-up select to the
-/// weighted sum with (its GLU landing the down leg's e4m3 operand from the
-/// gate-up epilogue); never (65 536 past any fire) but where a chip's
-/// profile says (B200's).
 /// The most routes a routed MLP runs as the mega-MoE (`linear::moe::mega`:
 /// the gate-up product, GLU, down product and fold in one persistent
 /// launch); none (0) but where a chip's profile says (B200's).
@@ -191,6 +186,11 @@ pub struct MoeMegaUntil(pub u32);
 #[decision(id = "kernel.moe.mega_bf16_from", constant(range(0..=2048)), default = 0, tune = search)]
 pub struct MoeMegaBf16From(pub u32);
 
+/// The fewest tokens a W4A8 routed MLP (MXFP4 banks against e4m3
+/// activations) keeps its rows by expert from the gate-up select to the
+/// weighted sum with (its GLU landing the down leg's e4m3 operand from the
+/// gate-up epilogue); never (65 536 past any fire) but where a chip's
+/// profile says (B200's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.moe.w4a8_fused_from", constant(range(1..=65_536)), default = 65_536, tune = search)]
 pub struct MoeW4a8FusedFrom(pub u32);

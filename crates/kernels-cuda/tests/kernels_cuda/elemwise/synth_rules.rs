@@ -1,9 +1,9 @@
 #![cfg(feature = "cuda")]
 
-//! The hand fused kernels whose chains the fold forms as one generated row
-//! kernel once their rule is off (`fuse.residual_add_rmsnorm`,
-//! `fuse.rmsnorm_residual_add`), against that kernel: what each lands and
-//! how fast, so a rule is deleted on its numbers.
+//! The hand fused kernels of two rules CUDA forms no more
+//! (`fuse.residual_add_rmsnorm`, `fuse.rmsnorm_residual_add`: the fold forms
+//! their chains as one generated row kernel), against that kernel: what
+//! each lands and how fast, the numbers the rules were deleted on.
 //!
 //! Each region here is the one poem-compiler's `fuse::chain` lowers the
 //! rule's ops to on the catalog's models, op for op and in its parameters'
@@ -25,11 +25,8 @@
 //! where a row's threads hold it otherwise than the hand kernel's: Gemma's
 //! norm-and-fold at 5376 splits the row over 512 threads, the frame over
 //! 256, so a sum's tree differs in its last bit and a normed element by an
-//! ulp, about once in a hundred thousand.
-//!
-//! The chains a rule forms that no region holds (Gemma's layer scalar, a
-//! one-element weight) are not here: with their rule off they run as more
-//! kernels, not as one.
+//! ulp, about once in a hundred thousand. Gemma 4's layer scale, a weight
+//! of one element, is the region's scalar parameter.
 
 use crate::common::attn_ref::{ten, tuned};
 use crate::common::{Gpu, Lcg, captured, forget, from_bf16, replay, to_bf16};

@@ -44,8 +44,8 @@ const FP4_SMEM: u32 = (2 + 4) * 8192 + (4 + 2) * 512 + 2 * 128 * 4 + 6 * 128 * 6
 /// The pooled index over FP4 keys scored as they are (`index_logits_fp4`),
 /// then ranked a block a row (`index_select_rows`): `Ok(false)` where the
 /// pool's pages do not land as the kernel reads them (a key a row, a power
-/// of two of at least 4 a page, the plane 16-aligned),
-/// and the caller scores as before.
+/// of two of at least 4 a page, the plane 16-aligned), and the caller
+/// scores as before.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ranked_fp4(
     ctx: &Ctx,
