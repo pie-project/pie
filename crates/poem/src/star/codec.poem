@@ -642,6 +642,30 @@ def named(m, path):
             x = getattr(x, part)
     return True
 
+def fused(reads, legs, name, axis = 0, rows = None):
+    """The weights `legs` from the one tensor `name` a release stores them
+    in, each the next run along `axis` (its rows, a bank's 1), or of `rows`
+    (that axis's indices, in the order the legs take them): read as it is
+    where the compiler joins them so, else each leg its run of it."""
+    j = joined(legs[0].name)
+    if j != None and j.legs == [leg.name for leg in legs]:
+        w = join(legs, j.name, axis = axis)
+        if rows == None:
+            reads.read(w, name)
+        else:
+            reads.read_expr(w, src(name).gather(axis, rows))
+        return
+    if kind(name) != None:
+        fail("`{}` is stored {} and joins `{}`, which the compiler does not join; no reading here takes a run of it apart".format(name, kind(name), [leg.name for leg in legs]))
+    at = 0
+    for leg in legs:
+        width = leg.shape[axis]
+        if rows == None:
+            reads.read_expr(leg, src(name).slice(axis, at, width))
+        else:
+            reads.read_expr(leg, src(name).gather(axis, rows[at:at + width]))
+        at += width
+
 def leg_names(rows, path, l):
     """The names the row of `rows` landing at `path` (at layer `l`) reads."""
     for row in rows:
@@ -660,7 +684,7 @@ def mapped_row(reads, m, row, l, quantized, rows):
     if j != None:
         if j.first:
             legs = [at_path(m, leg) for leg in j.legs]
-            w = join(legs, j.name)
+            w = join(legs, j.name, axis = j.axis)
             if len(w.shape) == 3:
                 # A bank: each expert's legs, every leg's own names.
                 per_leg = [leg_names(rows, leg, l) for leg in j.legs]

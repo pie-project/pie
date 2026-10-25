@@ -50,8 +50,10 @@ pub struct Lowering {
 
 impl Join {
     /// The name `legs` go by joined: their common path, then the rest of
-    /// each one's, run together where each is one letter (`qkv`), else
-    /// joined by `_` (`gate_up`, `b_gate_0`).
+    /// each one's past the words they all begin with, run together where
+    /// each is one short word (`qkv`, `in_qkv` and `in_z` as `in_qkvz`),
+    /// else joined by `_` (`gate_up`, `b_gate_0`), then the path they all
+    /// end in (`q.w`, `k.w` and `v.w` join as `qkv.w`).
     #[must_use]
     pub fn name_of(legs: &[&str]) -> String {
         let parts: Vec<Vec<&str>> = legs.iter().map(|leg| leg.split('.').collect()).collect();
@@ -59,17 +61,51 @@ impl Join {
         let common = (0..shortest.saturating_sub(1))
             .take_while(|&i| parts.iter().all(|p| p[i] == parts[0][i]))
             .count();
-        let rests: Vec<String> = parts.iter().map(|p| p[common..].join("_")).collect();
-        let joined = if rests.iter().all(|r| r.chars().count() == 1) {
+        // The path every leg ends in, past the common one, each leg keeping
+        // a part of its own.
+        let tail = (0..shortest.saturating_sub(common + 1))
+            .take_while(|&i| parts.iter().all(|p| p[p.len() - 1 - i] == parts[0][parts[0].len() - 1 - i]))
+            .count();
+        let rests: Vec<String> = parts
+            .iter()
+            .map(|p| p[common..p.len() - tail].join("."))
+            .collect();
+        // The words every rest begins with (`in_` of `in_qkv` and `in_z`),
+        // each rest keeping one of its own.
+        let words: Vec<Vec<&str>> = rests.iter().map(|r| r.split('_').collect()).collect();
+        let fewest = words.iter().map(Vec::len).min().unwrap_or(0);
+        let stem = if rests.iter().all(|r| !r.contains('.')) {
+            (0..fewest.saturating_sub(1))
+                .take_while(|&i| words.iter().all(|w| w[i] == words[0][i]))
+                .count()
+        } else {
+            0
+        };
+        let rests: Vec<String> = words
+            .iter()
+            .map(|w| w[stem..].join("_").replace('.', "_"))
+            .collect();
+        let short = |r: &String| !r.contains('_') && r.chars().count() <= 3;
+        let joined = if rests.iter().all(short) {
             rests.concat()
         } else {
             rests.join("_")
         };
-        if common == 0 {
+        let joined = if stem == 0 {
+            joined
+        } else {
+            format!("{}_{joined}", words[0][..stem].join("_"))
+        };
+        let mut name = if common == 0 {
             joined
         } else {
             format!("{}.{joined}", parts[0][..common].join("."))
+        };
+        for part in &parts[0][parts[0].len() - tail..] {
+            name.push('.');
+            name.push_str(part);
         }
+        name
     }
 }
 
@@ -111,10 +147,48 @@ impl Weight {
     /// segment of the joined cut with its heads: what the compiler joins
     /// where one activation meets them all.
     pub fn joined(name: impl Into<String>, legs: &[Weight]) -> Result<Weight, String> {
+        Weight::joined_along(name, legs, None)
+    }
+
+    /// [`Weight::joined`], legs every rank holds whole joined along `along`
+    /// (their rows, a bank's axis 1) into one held whole.
+    pub fn joined_along(
+        name: impl Into<String>,
+        legs: &[Weight],
+        along: Option<u32>,
+    ) -> Result<Weight, String> {
         let name = name.into();
         let first = legs
             .first()
             .ok_or_else(|| format!("`{name}` joins no legs"))?;
+        if let (Shard::Replicated, Some(along)) = (&first.shard, along) {
+            let at = along as usize;
+            let alike = |leg: &Weight| {
+                leg.shard == Shard::Replicated
+                    && leg.dtype == first.dtype
+                    && leg.act == first.act
+                    && leg.source == first.source
+                    && leg.layout == first.layout
+                    && leg.placement == first.placement
+                    && leg.values.is_none()
+                    && leg.shape.len() == first.shape.len()
+                    && at < leg.shape.len()
+                    && (0..leg.shape.len()).all(|i| i == at || leg.shape[i] == first.shape[i])
+            };
+            if let Some(leg) = legs.iter().find(|leg| !alike(leg)) {
+                return Err(format!(
+                    "`{}` and `{}` are not held alike, so no joined `{name}` holds both",
+                    first.name, leg.name
+                ));
+            }
+            let mut shape = first.shape.clone();
+            shape[at] = legs.iter().map(|leg| leg.shape[at]).sum();
+            return Ok(Weight {
+                name,
+                shape,
+                ..first.clone()
+            });
+        }
         let Shard::Cut { axis, .. } = first.shard else {
             return Err(format!("`{}` is not cut along its rows", first.name));
         };
@@ -158,14 +232,12 @@ impl Weight {
             segments.extend(cut.iter().copied());
             heads.push(held.clone());
         }
-        let heads = if heads.iter().all(Vec::is_empty) {
-            Vec::new()
-        } else if heads.iter().all(|h| !h.is_empty()) {
+        // Legs that all state their heads hold them whole joined; else every
+        // segment is cut evenly.
+        let heads = if heads.iter().all(|h| !h.is_empty()) {
             heads.concat()
         } else {
-            return Err(format!(
-                "`{name}`: some of its legs state heads and some do not"
-            ));
+            Vec::new()
         };
         let mut shape = first.shape.clone();
         shape[at] = rows;
@@ -871,6 +943,24 @@ mod join_tests {
         );
         assert_eq!(Join::name_of(&["a", "b"]), "ab");
         assert_eq!(Join::name_of(&["m.b", "m.gate.0"]), "m.b_gate_0");
+        assert_eq!(
+            Join::name_of(&["attn.q.w", "attn.k.w", "attn.v.w"]),
+            "attn.qkv.w"
+        );
+        assert_eq!(
+            Join::name_of(&["blocks.0.gate.bank", "blocks.0.up.bank"]),
+            "blocks.0.gate_up.bank"
+        );
+        assert_eq!(Join::name_of(&["a.w", "b.w"]), "ab.w");
+        assert_eq!(
+            Join::name_of(&["gdn.in_qkv", "gdn.in_z"]),
+            "gdn.in_qkvz"
+        );
+        assert_eq!(Join::name_of(&["gdn.in_b", "gdn.in_a"]), "gdn.in_ba");
+        assert_eq!(
+            Join::name_of(&["mlp.shared_gate", "mlp.shared_up"]),
+            "mlp.shared_gate_up"
+        );
         let leg = |name: &str, rows: u64, heads: u64| {
             Weight::sym(name, [rows, 64], Dtype::Bf16)
                 .columns()
@@ -887,9 +977,24 @@ mod join_tests {
                 heads: vec![4, 1, 1]
             }
         );
-        let plain = Weight::sym("up", [128, 64], Dtype::Bf16).columns();
-        assert!(Weight::joined("x", &[leg("q", 128, 4), plain]).is_err());
+        // A leg stating no heads joins with one that does, every segment
+        // then cut evenly, as the compiler joins GDN's qkv and z.
+        let plain = Weight::sym("z", [128, 64], Dtype::Bf16).columns();
+        let qkvz = Weight::joined("qkvz", &[leg("q", 128, 4), plain]).unwrap();
+        assert_eq!(
+            qkvz.shard,
+            Shard::Cut {
+                axis: 0,
+                segments: vec![128, 128],
+                heads: Vec::new()
+            }
+        );
         let other = Weight::sym("k", [32, 64], Dtype::F32).columns().heads([1]);
         assert!(Weight::joined("x", &[leg("q", 128, 4), other]).is_err());
+        // Legs every rank holds whole join whole along the axis named.
+        let whole = |name: &str| Weight::sym(name, [8, 32, 64], Dtype::Bf16);
+        let bank = Weight::joined_along("gate_up", &[whole("gate"), whole("up")], Some(1)).unwrap();
+        assert_eq!((bank.shape, bank.shard), (vec![8, 64, 64], Shard::Replicated));
+        assert!(Weight::joined("gate_up", &[whole("gate"), whole("up")]).is_err());
     }
 }

@@ -129,8 +129,9 @@ pub fn lowered(trace: Trace, deploy: &Deploy) -> Result<Trace, String> {
 /// [`lowered`], each expert rank holding `replicas` slots past its share of
 /// a layer's experts.
 pub fn lowered_with(mut trace: Trace, deploy: &Deploy, replicas: u32) -> Result<Trace, String> {
+    let shape = crate::pack::shape(&trace);
     crate::shard::infer::resolve(&mut trace, deploy.tp);
-    let trace = crate::tile::tile(crate::pack::pack(trace));
+    let trace = crate::tile::tile(crate::pack::pack_as(trace, &shape));
     let trace = crate::shard::shard(trace, deploy.tp).map_err(|why| why.to_string())?;
     crate::expert::lower(trace, deploy.ep, replicas).map_err(|why| why.to_string())
 }
@@ -140,10 +141,11 @@ pub fn lowered_with(mut trace: Trace, deploy: &Deploy, replicas: u32) -> Result<
 #[must_use]
 pub fn lowering_of(trace: &Trace, tp: u32) -> poem::Lowering {
     let mut trace = trace.clone();
+    let shape = crate::pack::shape(&trace);
     let cuts = crate::shard::infer::resolve(&mut trace, tp);
-    let joins = crate::pack::joins(&trace);
-    let lowered = crate::tile::tile(crate::pack::pack(trace.clone()));
-    let mut tiled = crate::tile::tiled(&crate::pack::pack(trace));
+    let joins = crate::pack::joins_as(&trace, &shape);
+    let lowered = crate::tile::tile(crate::pack::pack_as(trace.clone(), &shape));
+    let mut tiled = crate::tile::tiled(&crate::pack::pack_as(trace, &shape));
     // A tiled join's legs are read tiled too, each leg's scales beside its codes.
     for join in &joins {
         if tiled.contains(&join.name) {
