@@ -42,23 +42,28 @@ fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
         readings(MINI).iter().all(|r| r != "vae.decode"),
         "the miniature's checkpoint carries no VAE"
     );
-    for (deployment, want) in [(FLAGSHIP, 1), (MINI, 0)] {
-        let voxels = trace(deployment)
+    for (deployment, want) in [
+        (FLAGSHIP, vec!["latent", "latents"]),
+        (MINI, vec!["latents"]),
+    ] {
+        let plan = trace(deployment);
+        let voxels: BTreeSet<&str> = plan
             .values
             .iter()
-            .filter(|decl| {
-                matches!(
-                    decl.def,
-                    Def::Input(RuntimeInput::Guest {
-                        axis: InputAxis::Voxel,
-                        ..
-                    })
-                )
+            .filter_map(|decl| match decl.def {
+                Def::Input(RuntimeInput::Guest {
+                    id,
+                    axis: InputAxis::Voxel,
+                    ..
+                }) => Some(plan.inputs[id as usize].name.as_str()),
+                _ => None,
             })
-            .count();
+            .collect();
         assert_eq!(
-            voxels, want,
-            "{deployment}: the voxel port iff the row carries the VAE"
+            voxels,
+            want.into_iter().collect(),
+            "{deployment}: the denoiser's latents on the voxel axis, and the VAE's port iff \
+             the row carries the VAE"
         );
     }
 }
@@ -105,6 +110,7 @@ fn the_shapes_are_the_ltx_decoders() {
                 GridRule::Conv { .. } | GridRule::Shuffle { .. } => {}
                 other => panic!("a grid rule this decoder never states: {other:?}"),
             },
+            Operation::Conv(Conv::Patchify { .. } | Conv::Unpatchify { .. } | Conv::Cells { .. }) => {}
             Operation::Conv(other) => {
                 panic!("a spatial member this decoder never states: {other:?}")
             }

@@ -54,6 +54,7 @@ fn seams(plan: &Trace) -> BTreeMap<&str, usize> {
 
 #[test]
 fn the_minimax_h3_rows_bake_every_case() {
+    the_video_and_reference_latents_are_patched_in_the_graph();
     every_row_traces_on_every_platform_with_the_encoder_it_declares();
     the_seams_are_the_two_float_readouts_and_never_logits();
     every_lane_the_facts_list_lands_in_a_class_where_the_merges_resolve();
@@ -325,7 +326,13 @@ fn the_sharded_worlds_trace_and_bake() {
             model::TE_LAYERS as usize,
             "tp {tp}: one kv row per encoder layer"
         );
-        poem_compiler::compile(&plan, &budget(), &poem_compiler::DeviceProfile::default())
+        let budgets =
+            poem_compiler::Budgets::of(budget()).with_voxels(poem_compiler::VoxelLadder {
+                max_voxels: 16_384,
+                buckets: vec![1024, 16_384],
+                max_clips: 8,
+            });
+        poem_compiler::compile_axes(&plan, &budgets, &poem_compiler::DeviceProfile::default())
             .unwrap_or_else(|why| panic!("`{deployment}` does not bake: {why}"));
         for which in 0..model::MODALITIES {
             let name = format!("dit.blocks.0.adaln.{which}.w");
@@ -346,10 +353,6 @@ fn the_sharded_worlds_trace_and_bake() {
 fn the_generative_facts_state_the_readings_the_latent_and_two_shifts() {
     for deployment in ROWS {
         let facts = row(deployment).generative().expect("facts");
-        assert!(
-            facts.positions.is_none(),
-            "`{deployment}`: H3's shared audio-tick time axis is not a stated convention"
-        );
         let names = trace(deployment, Platform::Cuda)
             .facts
             .declared("reading")
@@ -483,6 +486,62 @@ fn the_gather_merges_four_lane_shaped_arms_back_onto_the_reading() {
         assert_eq!(
             token_merges, 1,
             "`{deployment}`: one packed row sequence, joined once"
+        );
+    }
+}
+
+fn the_video_and_reference_latents_are_patched_in_the_graph() {
+    for deployment in ROWS {
+        let plan = trace(deployment, Platform::Cuda);
+        let voxel_inputs: BTreeSet<(String, u32)> = plan
+            .values
+            .iter()
+            .filter_map(|decl| match &decl.def {
+                Def::Input(RuntimeInput::Guest {
+                    id,
+                    axis: InputAxis::Voxel,
+                    width,
+                    ..
+                }) => Some((plan.inputs[*id as usize].name.clone(), *width)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            voxel_inputs,
+            BTreeSet::from([
+                ("latents".to_string(), model::LATENT_CHANNELS),
+                ("reference".to_string(), model::LATENT_CHANNELS),
+            ]),
+            "`{deployment}`: the video and reference clips share the voxel axis at one width"
+        );
+        let patch = [1, 2, 2];
+        let count = |f: &dyn Fn(&poem_ir::Conv) -> bool| {
+            plan.nodes
+                .iter()
+                .filter(|node| matches!(&node.op, Operation::Conv(op) if f(op)))
+                .count()
+        };
+        assert_eq!(
+            count(&|op| matches!(op, poem_ir::Conv::Patchify { p, .. } if *p == patch)),
+            2,
+            "`{deployment}`: the target and the reference patched in"
+        );
+        assert_eq!(
+            count(&|op| matches!(op, poem_ir::Conv::Unpatchify { p, .. } if *p == patch)),
+            1,
+            "`{deployment}`: the video velocity patched back out"
+        );
+        let velocity = plan
+            .seams
+            .iter()
+            .find(|s| s.seam == seam::VELOCITY.name)
+            .expect("a velocity seam")
+            .values[0];
+        assert!(
+            matches!(&plan.values[velocity.0 as usize].ty,
+                Ty::Tensor { shape, .. } if shape.as_slice()
+                    == [Dim::Voxels, Dim::Const(u64::from(model::LATENT_CHANNELS))]),
+            "`{deployment}`: the velocity reads out in the latent's own voxels"
         );
     }
 }
