@@ -86,6 +86,10 @@ pub struct DitBindings {
     pub voxels: Option<Tensor>,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, PackingBindings)>,
+    /// The keep plane (`[rows][rows]` f32) each group-packed
+    /// `attention.ragged` applies, by its query and key packings, when a
+    /// lane stated a mask.
+    pub group_masks: Vec<(poem_ir::Selection, poem_ir::Selection, Tensor)>,
     pub inputs: Vec<InputBinding>,
 }
 
@@ -272,6 +276,29 @@ impl<'c> Run<'c> {
 
     pub(crate) fn handles(&self) -> &'c Handles {
         self.handles
+    }
+
+    pub(crate) fn run_index(&self) -> u32 {
+        self.place.run.get()
+    }
+
+    /// The keep plane a group-packed attention over the packings of `q_indptr`
+    /// and `kv_indptr` applies, when a lane of the fire stated a mask.
+    pub(crate) fn group_mask(&self, q_indptr: ValueId, kv_indptr: ValueId) -> Option<Tensor> {
+        let packing = |id: ValueId| match &self.values[id.0 as usize].def {
+            Def::Input(RuntimeInput::Geometry {
+                kind: GeomKind::GroupIndptr { select },
+                ..
+            }) => Some(*select),
+            _ => None,
+        };
+        let (q, kv) = (packing(q_indptr)?, packing(kv_indptr)?);
+        self.fire
+            .dit
+            .group_masks
+            .iter()
+            .find(|(have_q, have_kv, _)| *have_q == q && *have_kv == kv)
+            .map(|(_, _, keep)| *keep)
     }
 
     pub(crate) fn uncut(&self, id: ValueId) -> Tensor {
