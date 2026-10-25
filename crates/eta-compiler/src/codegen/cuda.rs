@@ -11,7 +11,7 @@ use crate::codegen::error::EmitError;
 use crate::plan::{CompiledStage, Region};
 use alloc::string::String;
 
-pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 59;
+pub const CUDA_GENERATED_EMITTER_VERSION: u16 = 60;
 
 /// The line a region carries where it holds the exact cut's state, which on
 /// CUDA sits in [`CUT_STATE_BYTES`] of the launch's dynamic shared memory

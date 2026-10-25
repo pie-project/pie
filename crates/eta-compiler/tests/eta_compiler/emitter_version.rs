@@ -5,8 +5,8 @@ use eta_compiler::codegen::metal::METAL_M1_EMITTER_VERSION;
 use eta_compiler::codegen::program::{Backend, emit_program};
 
 const PINNED: &[(&str, u16, u64)] = &[
-    ("cuda", 59, 0xd2ad_6dd4_9fca_34c9),
-    ("hip", 19, 0xfc11_558e_a9c6_1fe8),
+    ("cuda", 60, 0xe780_f33c_4b9a_cca2),
+    ("hip", 20, 0x83b9_4951_c6da_273c),
     ("metal", 60, 0x06b8_5405_dbf9_6d59),
 ];
 
