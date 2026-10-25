@@ -7,6 +7,7 @@ use core::fmt::Write as _;
 use eta_ir::Dtype;
 use eta_ir::op::{intrinsic_tags, tags};
 
+use crate::codegen::launch::{reduction_chunks, reduction_floats};
 use crate::codegen::op_view::OpView;
 use crate::plan::{CompiledStage, Dimension, Region};
 
@@ -513,6 +514,10 @@ struct Bodies {
     v: String,
     pre: String,
     post: String,
+    /// Each reduction's fold of the chunks the pass just read, after a
+    /// scalar and after a vector iteration.
+    fold_s: String,
+    fold_v: String,
     ptrs: Vec<String>,
     conds: Vec<String>,
 }
@@ -553,12 +558,15 @@ impl Bodies {
 
     fn store(&mut self, dtype: Dtype, ptr: &str, reg: &str) {
         let l = letter(dtype);
-        let _ = writeln!(self.s, "      m1_store_{l}({ptr}, i, {reg});");
+        let _ = writeln!(
+            self.s,
+            "      if (stream_live) m1_store_{l}({ptr}, i, {reg});"
+        );
         let _ = writeln!(self.pre, "        {} w_{reg};", vec_type(dtype));
         let _ = writeln!(self.v, "      m1_set4_{l}(w_{reg}, j, {reg});");
         let _ = writeln!(
             self.post,
-            "        m1_store4_{l}({ptr}, i4 >> 2u, w_{reg});"
+            "        if (stream_live) m1_store4_{l}({ptr}, i4 >> 2u, w_{reg});"
         );
         self.touch(ptr);
     }
@@ -824,6 +832,12 @@ pub(super) fn emit_stream(
             }
         })
         .expect("a stream has a full value");
+    // A row a stream reads is a static width: a reduction's slots are laid
+    // out from it.
+    let stream_width = match streams.class(witness) {
+        RowClass::Full(Dimension::Static(width)) => Some(width),
+        _ => None,
+    };
 
     let mut s = String::new();
     let _ = writeln!(s, "  {{ // stream of {} op(s)", members.len());
@@ -908,48 +922,88 @@ pub(super) fn emit_stream(
                 }
             }
             Role::Reduce => {
+                // The interpreter's `canonical_reduce`: each run of 32
+                // consecutive elements folds by the warp tree into one value
+                // at the reduction's slot, the levels above fold after the
+                // pass. A scalar iteration holds a run in a warp's lanes; a
+                // vector one in eight lanes' quads.
                 let x = read(streams, op.args[0], Dtype::F32, &mut pass);
-                let (identity, combine): (&str, fn(&str, &str) -> String) = match tag {
-                    tags::REDUCE_SUM => ("0.0f", |a, b| format!("({a} + {b})")),
-                    tags::REDUCE_MAX => {
-                        ("m1_neg_inf()", |a, b| format!("m1_canonical_max({a}, {b})"))
-                    }
-                    _ => ("m1_pos_inf()", |a, b| format!("m1_canonical_min({a}, {b})")),
-                };
-                let slot = float_reductions;
+                let identity = format!("m1_reduce_identity({tag}u)");
+                let combine = |a: &str, b: &str| format!("m1_reduce_combine({tag}u, {a}, {b})");
+                let width = u64::from(stream_width.expect("a reducing stream's row is static"));
+                let slot = u64::from(float_reductions) * reduction_floats(width);
+                let chunks = reduction_chunks(width);
                 float_reductions += 1;
-                let _ = writeln!(pass.prologue, "    float acc{node} = {identity};");
-                pass.body.both(&format!(
-                    "      acc{node} = {};",
-                    combine(&format!("acc{node}"), &x)
-                ));
-                let _ = writeln!(epilogue, "    {{");
-                let _ = writeln!(epilogue, "      float v = acc{node};");
+                // As in the reference, a level folds only while more than one
+                // value is left: a one-element row is its own reduction.
+                let first = if width > 1 {
+                    format!("m1_reduce_chunk({tag}u, stream_live ? {x} : {identity})")
+                } else {
+                    x.clone()
+                };
+                let _ = writeln!(pass.body.s, "      const float red{node} = {first};");
                 let _ = writeln!(
-                    epilogue,
-                    "      for (m1_u32 offset = 16u; offset > 0u; offset >>= 1u) {{"
+                    pass.body.fold_s,
+                    "      if (stream_lane == 0u) stream_work[{slot}u + (stream_base >> 5u)] = red{node};"
+                );
+                let _ = writeln!(pass.body.pre, "        float red{node}[4];");
+                let _ = writeln!(pass.body.v, "      red{node}[j] = {x};");
+                let f = &mut pass.body.fold_v;
+                let _ = writeln!(f, "        {{");
+                let _ = writeln!(
+                    f,
+                    "          float r0 = stream_live ? red{node}[0] : {identity};"
                 );
                 let _ = writeln!(
-                    epilogue,
-                    "        const float other = m1_chunk_down(v, offset);"
+                    f,
+                    "          float r1 = stream_live ? red{node}[1] : {identity};"
                 );
-                let _ = writeln!(epilogue, "        v = {};", combine("v", "other"));
-                let _ = writeln!(epilogue, "      }}");
                 let _ = writeln!(
-                    epilogue,
-                    "      if (stream_lane == 0u) stream_work[{slot}u * 32u + stream_warp] = v;"
+                    f,
+                    "          float r2 = stream_live ? red{node}[2] : {identity};"
                 );
-                let _ = writeln!(epilogue, "    }}");
-                let _ = writeln!(epilogue, "    __syncthreads();");
-                let _ = writeln!(epilogue, "    if (threadIdx.x == 0u) {{");
-                let _ = writeln!(epilogue, "      float total = {identity};");
                 let _ = writeln!(
-                    epilogue,
-                    "      for (m1_u32 w = 0u; w < stream_warps; ++w) total = {};",
-                    combine("total", &format!("stream_work[{slot}u * 32u + w]"))
+                    f,
+                    "          float r3 = stream_live ? red{node}[3] : {identity};"
                 );
+                // Element `4t + j` of a run sits in its `t`-th lane's quad:
+                // offsets 16, 8 and 4 are 4, 2 and 1 lanes away, 2 and 1
+                // within the quad.
+                let _ = writeln!(
+                    f,
+                    "          for (m1_u32 apart = 4u; apart > 0u; apart >>= 1u) {{"
+                );
+                let _ = writeln!(f, "            const float o0 = m1_chunk_down(r0, apart);");
+                let _ = writeln!(f, "            const float o1 = m1_chunk_down(r1, apart);");
+                let _ = writeln!(f, "            const float o2 = m1_chunk_down(r2, apart);");
+                let _ = writeln!(f, "            const float o3 = m1_chunk_down(r3, apart);");
+                let _ = writeln!(f, "            if ((stream_lane & 7u) < apart) {{");
+                let _ = writeln!(f, "              r0 = {};", combine("r0", "o0"));
+                let _ = writeln!(f, "              r1 = {};", combine("r1", "o1"));
+                let _ = writeln!(f, "              r2 = {};", combine("r2", "o2"));
+                let _ = writeln!(f, "              r3 = {};", combine("r3", "o3"));
+                let _ = writeln!(f, "            }}");
+                let _ = writeln!(f, "          }}");
+                let _ = writeln!(f, "          r0 = {};", combine("r0", "r2"));
+                let _ = writeln!(f, "          r1 = {};", combine("r1", "r3"));
+                let _ = writeln!(f, "          r0 = {};", combine("r0", "r1"));
+                let _ = writeln!(
+                    f,
+                    "          if ((stream_lane & 7u) == 0u && stream_live) stream_work[{slot}u + (i4 >> 5u)] = r0;"
+                );
+                let _ = writeln!(f, "        }}");
                 let ptr = (pass.pointer)(out);
-                let _ = writeln!(epilogue, "      m1_store_f({ptr}, 0u, total);");
+                let _ = writeln!(epilogue, "    __syncthreads();");
+                let _ = writeln!(epilogue, "    {{");
+                let _ = writeln!(
+                    epilogue,
+                    "      const float total = ptir_canonical_reduce({tag}u, stream_work + {slot}u, {chunks}u, stream_work + {}u, stream_work + {slot}u);",
+                    slot + chunks
+                );
+                let _ = writeln!(
+                    epilogue,
+                    "      if (threadIdx.x == 0u) m1_store_f({ptr}, 0u, total);"
+                );
                 let _ = writeln!(epilogue, "    }}");
             }
             Role::Argmax => {
@@ -960,7 +1014,7 @@ pub(super) fn emit_stream(
                     "    M1ArgmaxCandidate cand{node}{{m1_neg_inf(), 0u, 0u, 0u}};"
                 );
                 pass.body.both(&format!(
-                    "      cand{node} = m1_argmax_combine(cand{node}, M1ArgmaxCandidate{{{x}, i, m1_isnan({x}) ? 0u : 1u, 0u}});"
+                    "      if (stream_live) cand{node} = m1_argmax_combine(cand{node}, M1ArgmaxCandidate{{{x}, i, m1_isnan({x}) ? 0u : 1u, 0u}});"
                 ));
                 let _ = writeln!(
                     epilogue,
@@ -1002,9 +1056,16 @@ pub(super) fn emit_stream(
     conds.extend(body.ptrs.iter().map(|p| format!("m1_aligned16({p})")));
     conds.extend(body.conds.iter().cloned());
     let _ = writeln!(s, "    const bool stream_vec = {};", conds.join(" && "));
+    // Whole warps iterate together, so that a reduction's chunk folds by
+    // shuffles: a lane past the row reads the row's last element and keeps
+    // what it computes to itself.
     s.push_str("    if (stream_vec) {\n");
     s.push_str(
-        "      for (m1_u32 i4 = threadIdx.x * 4u; i4 < stream_width; i4 += blockDim.x * 4u) {\n",
+        "      for (m1_u32 stream_base = stream_warp * 128u; stream_base < stream_width; stream_base += blockDim.x * 4u) {\n",
+    );
+    s.push_str("        const bool stream_live = stream_base + stream_lane * 4u < stream_width;\n");
+    s.push_str(
+        "        const m1_u32 i4 = stream_live ? stream_base + stream_lane * 4u : stream_width - 4u;\n",
     );
     s.push_str(&body.pre);
     s.push_str("#pragma unroll\n");
@@ -1013,10 +1074,18 @@ pub(super) fn emit_stream(
     s.push_str(&body.v);
     s.push_str("        }\n");
     s.push_str(&body.post);
+    s.push_str(&body.fold_v);
     s.push_str("      }\n");
     s.push_str("    } else {\n");
-    s.push_str("    for (m1_u32 i = threadIdx.x; i < stream_width; i += blockDim.x) {\n");
+    s.push_str(
+        "    for (m1_u32 stream_base = stream_warp * 32u; stream_base < stream_width; stream_base += blockDim.x) {\n",
+    );
+    s.push_str("      const bool stream_live = stream_base + stream_lane < stream_width;\n");
+    s.push_str(
+        "      const m1_u32 i = stream_live ? stream_base + stream_lane : stream_width - 1u;\n",
+    );
     s.push_str(&body.s);
+    s.push_str(&body.fold_s);
     s.push_str("    }\n");
     s.push_str("    }\n");
     s.push_str(&epilogue);

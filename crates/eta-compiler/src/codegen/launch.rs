@@ -260,6 +260,52 @@ pub struct LaunchStagePlan {
     pub error: String,
 }
 
+/// The values one fold of the canonical reduction takes in (the
+/// interpreter's `canonical_reduce`, a warp's lanes on a device).
+pub const REDUCE_CHUNK: u64 = 32;
+
+/// The values the first level of a `width`-wide row's reduction leaves.
+#[must_use]
+pub const fn reduction_chunks(width: u64) -> u64 {
+    width.div_ceil(REDUCE_CHUNK)
+}
+
+/// The floats an f32 reduction of a `width`-wide row keeps in a block's
+/// temporary arena: its first level's values, then room as large again for
+/// the levels above it.
+#[must_use]
+pub const fn reduction_floats(width: u64) -> u64 {
+    2 * reduction_chunks(width)
+}
+
+/// The bytes a block of the generated region `region` keeps in its
+/// temporary arena over rows at most `widest` wide: [`reduction_floats`] for
+/// each f32 reduction it holds, which a row stream may hold all at once,
+/// each at its own slot.
+#[must_use]
+pub fn generated_temporary_bytes(
+    plan: &LaunchStagePlan,
+    region: &LaunchRegion,
+    widest: u64,
+) -> u64 {
+    let reductions = region
+        .nodes
+        .iter()
+        .filter_map(|&node| plan.ops.get(node as usize))
+        .filter(|op| {
+            matches!(
+                op.tag,
+                tags::REDUCE_SUM | tags::REDUCE_MAX | tags::REDUCE_MIN
+            ) && op
+                .args
+                .first()
+                .and_then(|&value| plan.value_types.get(value as usize))
+                .is_some_and(|value| value.dtype == Dtype::F32)
+        })
+        .count() as u64;
+    4 * reduction_floats(widest) * reductions.max(1)
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LaunchPackage {
     pub values: Vec<LaunchValue>,
