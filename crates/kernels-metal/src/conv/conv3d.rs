@@ -35,9 +35,7 @@ impl Conv3d {
     }
 }
 
-/// `bases`: the rows `grid` and `o_grid` address `x`'s and `y`'s row 0 at
-/// (`[x, y]`), nonzero in a window of a segmented fire whose grids hold
-/// fire-wide rows.
+/// `bases` (`[x, y]`): `x`'s and `y`'s row 0 in the grids' fire-wide rows.
 #[allow(clippy::too_many_arguments)]
 pub fn conv3d(
     ctx: &Ctx<'_>,

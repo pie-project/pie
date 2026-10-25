@@ -518,8 +518,7 @@ pub mod adapter {
     }
 }
 
-/// A forward pass: what a model's lanes bind, the switches they run under,
-/// and the program the fires run.
+/// A forward pass: its lanes' bindings and switches, and the program its fires run.
 pub struct ForwardPass {
     wit: wit_forward::ForwardPass,
     inner: RefCell<ForwardInner>,
@@ -535,7 +534,6 @@ struct ForwardInner {
     program_attached: bool,
     adapter_lowrank_sites: u32,
     adapter_scale_sites: u32,
-    /// Each lane's bound inputs and set switches, by lane.
     inputs: Vec<(u32, String, DslChannel)>,
     switches: Vec<(u32, String, String)>,
 }
@@ -549,9 +547,7 @@ impl ForwardPass {
             .any(|(port, _)| *port == Port::AttnMask)
     }
 
-    /// Whether a switch of this pass is off its model's default: a path a
-    /// model runs apart from its default one (a canvas a block-diffusion
-    /// text redraws whole) posts one fire at a time.
+    /// Whether a switch is off its model's default; such a pass posts one fire at a time.
     fn switched(&self) -> bool {
         let inner = self.inner.borrow();
         if inner.switches.is_empty() {
@@ -587,8 +583,7 @@ impl ForwardPass {
         }
     }
 
-    /// Sets lane `lane`'s model switch `name` to `value`
-    /// (`model::switches()`): which path that lane runs.
+    /// Sets lane `lane`'s model switch `name` (`model::switches()`) to `value`.
     pub fn switch(&self, lane: u32, name: &str, value: &str) -> Result<(), String> {
         if self.inner.borrow().program_attached {
             return Err("forward pass program is already attached".to_string());
@@ -601,8 +596,7 @@ impl ForwardPass {
         Ok(())
     }
 
-    /// Binds `ch` to lane `lane`'s model input `name`, its committed cell
-    /// read at every submit.
+    /// Binds `ch` to lane `lane`'s model input `name`, its committed cell read every submit.
     pub fn input(&self, lane: u32, name: &str, ch: &Channel) -> Result<(), String> {
         {
             let inner = self.inner.borrow();
@@ -626,7 +620,7 @@ impl ForwardPass {
         Ok(())
     }
 
-    /// Puts lane `lane` in this pass's attention group `id`.
+    /// Puts lane `lane` in attention group `id`.
     pub fn group(&self, lane: u32, id: u32) -> Result<(), String> {
         if self.inner.borrow().program_attached {
             return Err("forward pass program is already attached".to_string());
@@ -634,8 +628,7 @@ impl ForwardPass {
         self.wit.group(lane, id)
     }
 
-    /// Per row of the pass, the rows it attends: kv slots on a pass whose
-    /// lanes read kv, its attention group's rows on one whose lanes do not.
+    /// Per row, the rows it attends: kv slots if the lanes read kv, else its group's rows.
     pub fn mask(&self, rows: &Channel) -> Result<(), String> {
         self.ensure_ports_available(&[Port::AttnMask])?;
         let wit = rows.wit();
@@ -743,7 +736,6 @@ impl ForwardPass {
         Ok(())
     }
 
-    /// The payloads of the media spans lane `lane`'s tokens carry.
     pub fn media(&self, lane: u32, spans: &[wit_forward::MediaSpan<'_>]) -> Result<(), String> {
         self.wit.media(lane, spans)
     }
@@ -879,8 +871,7 @@ impl ForwardPass {
         for (port, channel) in &inner.ports {
             builder.bind_port_recorded(*port, channel.clone());
         }
-        // A channel several lanes read (a CFG step's one timestep) is one
-        // input of the program.
+        // A channel several lanes read is one input of the program.
         let mut listed: Vec<u64> = Vec::new();
         for (_, _, channel) in &inner.inputs {
             if !listed.contains(&channel.gid()) {
@@ -1001,10 +992,7 @@ pub async fn run_ahead(
     if budget == 0 {
         return Ok(0);
     }
-    // A recurrent state holds one slot per posted frame and a pass off its
-    // model's default path (a canvas redrawn whole) redraws what the last
-    // wrote, so those post one pass at a time; a window's ring takes its
-    // pages pass by pass, as kv does.
+    // A recurrent state, an off-default path and a ring all post one pass at a time.
     let r = if pass.binds_device_mask() || crate::model::rs_state_size() > 0 || pass.switched() {
         1
     } else {
@@ -1128,8 +1116,6 @@ pub mod prelude {
     pub use crate::eta::shared_prelude::*;
 }
 
-/// A block-diffusion text's samplers: which canvas positions to accept, at
-/// what temperature.
 pub mod diffusion {
     pub mod prelude {
         pub use super::{entropy_bound_accept, linear_temperature, stable_and_confident};

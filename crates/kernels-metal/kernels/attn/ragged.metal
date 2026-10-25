@@ -6,9 +6,8 @@ constexpr constant int kMaskNone = 0;
 constexpr constant int kMaskBias = 1;
 constexpr constant int kMaskCustom = 2;
 
-// The custom mask keeps segment s's pair (qi, ki), each indexed within the
-// segment, where bit qi * kv_len + ki of its bits, from byte mask_indptr[s],
-// is set (kernels-cuda's fa2 custom-mask arm).
+// Segment s keeps (qi, ki), each within the segment, where bit qi * kv_len + ki of its
+// bits, from byte mask_indptr[s], is set.
 inline bool custom_keeps(const device uchar* bits, const device int* mask_indptr, int s,
                          int qi, int ki, int kv_len) {
   const ulong cell = ulong(qi) * ulong(kv_len) + ulong(ki);

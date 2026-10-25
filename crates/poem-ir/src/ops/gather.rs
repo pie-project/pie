@@ -73,7 +73,6 @@ pub enum Gather {
         #[output]
         right: ValueId,
     },
-    /// Each row's count of the rows `csr` packs in its lane's group,
     /// `[rows, 1]` f32: `csr[g + 1] - csr[g]` for `g = groups[lanes[row]]`.
     GroupRows {
         #[input(I32)]
@@ -85,9 +84,8 @@ pub enum Gather {
         #[output]
         y: ValueId,
     },
-    /// Each row's peer value: `x`'s row `csr[g]`, the first of the rows
-    /// `csr` packs in the row's lane's group `g = groups[lanes[row]]` (`x`
-    /// is that selection's rows, packed), zeros where the group has none.
+    /// `x`'s row `csr[g]` for `g = groups[lanes[row]]` (`x` packed by that selection); zeros
+    /// where the group has none.
     GroupFirst {
         #[input(F32)]
         x: ValueId,

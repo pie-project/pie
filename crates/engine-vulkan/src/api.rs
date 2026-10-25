@@ -841,8 +841,7 @@ impl Vulkan {
                 .all(|attachment| shell.readout_row(landed, attachment.lane).is_some())
     }
 
-    /// Runs each program's prologue, to its commit, before the step
-    /// resolves its inputs: the forward reads the cells a prologue put.
+    /// Before the step resolves its inputs: the forward reads the cells a prologue put.
     fn run_prologues(&mut self, step: &Step) -> EngineResult<()> {
         for attachment in program_attachments(step) {
             if !self.programs.prologue_runs(attachment.instance) {
@@ -1269,7 +1268,6 @@ fn program_attachments(step: &Step) -> impl Iterator<Item = &engine::fire::Attac
         .filter(|attachment| !attachment.adapter_only)
 }
 
-/// Each lane of `attachment`'s pass's readout rows and pixels, lane `k` at `k`.
 #[cfg(feature = "vulkan")]
 fn lane_readouts<'a>(
     shell: &'a Shell,

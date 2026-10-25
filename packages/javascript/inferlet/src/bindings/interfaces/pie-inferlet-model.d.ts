@@ -25,21 +25,17 @@ export function defaultSystemSpeculation(): boolean;
 export function mtpDepth(): number;
 export function draftBlock(): BlockDrafter | undefined;
 /**
- * Every switch the bound model declares. Empty for a model with one
- * path (every text model). Static.
+ * Every switch the bound model declares; empty for a one-path model.
  */
 export function switches(): Array<SwitchDecl>;
 /**
- * The lane a pass of these switches is. Switches are `(name, value)`
- * pairs of `switches()`; one left unset takes its default.
+ * The lane of these `(name, value)` switches; unset ones take defaults.
  */
 export function lane(switches: Array<[string, string]>): LaneDecl;
 export function latent(): LatentSpace | undefined;
 export function schedule(): ScheduleFact | undefined;
 /**
- * The most rows one lane may carry: the guest sizes its row inputs
- * (`[rows, width]`) under this, the rows the engine's arena holds a
- * fire. Static.
+ * The most rows one lane may carry. Static.
  */
 export function maxLatentRows(): number;
 /**
@@ -168,21 +164,16 @@ export interface BlockDrafter {
   proposalsFrom: number,
 }
 /**
- * A switch the model declares: its name and the values a pass may set
- * it to (`forward-pass.switch`), the first its default. Names and values
- * are the model's own (`reading`, `stream`, `mode`, `block_draft`, ...);
- * a guest that knows a model by its switches reads them here rather than
- * parsing `architecture()`.
+ * A switch the model declares and the values `forward-pass.switch` may
+ * set it to, the first its default.
  */
 export interface SwitchDecl {
   name: string,
   values: Array<string>,
 }
 /**
- * Which export seam a lane's epilogue reads: `logits()` for a text
- * head, `velocity()` for a denoiser, `hidden()` for an encoder,
- * `pixels` for a VAE on the voxel axis (one row per output voxel of
- * the pass's clip).
+ * Which export seam a lane's epilogue reads; `pixels` is one row per
+ * output voxel of the pass's clip.
  * # Variants
  * 
  * ## `"logits"`
@@ -195,8 +186,7 @@ export interface SwitchDecl {
  */
 export type ReadoutKind = 'logits' | 'velocity' | 'hidden' | 'pixels';
 /**
- * What one entry of an input belongs to: its lane, each row of its
- * lane, or each voxel of its lane's clip.
+ * Whether an input is one per lane, per row, or per voxel of the clip.
  * # Variants
  * 
  * ## `"lane"`
@@ -207,11 +197,8 @@ export type ReadoutKind = 'logits' | 'velocity' | 'hidden' | 'pixels';
  */
 export type InputAxis = 'lane' | 'row' | 'voxel';
 /**
- * The rows a lane binding an input carries, as the model states them:
- * exactly `n`, or the fewest that are a multiple of `n` and hold the
- * guest's own. The guest pads its rows to them with zeros, on device;
- * a voxel input's are its lane's token rows, which the runtime pads
- * past its clips' patches.
+ * The rows a lane binding an input carries: exactly `n`, or the fewest
+ * multiple of `n` holding the guest's own; the guest zero-pads to them.
  */
 export type RowCount = RowCountExact | RowCountMultiple;
 export interface RowCountExact {
@@ -223,14 +210,9 @@ export interface RowCountMultiple {
   val: number,
 }
 /**
- * One input the model reads from its guest, by name: `width` values a
- * lane, a row or a voxel, as `dtype` (`f32` for a float input, `i32`
- * for an i32 one; the host marshals to the model's own element type).
- * One name is one input wherever the model reads it. `rows` is the row
- * count a lane binding it carries when the family fixes it (Wan 2.2's
- * `exact(512)` context rows: its reference zero-pads umT5's answer to
- * 512 and attends every pad row; Z-Image's `multiple(32)` caption rows),
- * `none` nearly always.
+ * One input the model reads from its guest: `width` values of `dtype`
+ * per `axis` entry; `rows` is set when the family fixes the row count
+ * (Wan 2.2 attends its reference's 512 zero-padded context rows).
  */
 export interface InputDecl {
   name: string,
@@ -247,13 +229,8 @@ export interface Readout {
   width: number,
 }
 /**
- * Everything about a lane of the given switches, as the compiled graph
- * runs it: the inputs it must bind (exactly these, by
- * `forward-pass.input`), whether it binds `state` (some class it can
- * land in reads a kv cache or a recurrent state, a causal VAE's conv
- * caches) and `embed` (some class reads `tokens`), and what it reads out
- * (the export seam its classes read; a float readout where some class
- * reads one). `none` when no class it lands in reads anything out.
+ * A lane of given switches: the inputs it binds (exactly these), whether
+ * it binds `state` and `embed`, and its readout (`none` if nothing).
  */
 export interface LaneDecl {
   inputs: Array<InputDecl>,
@@ -263,15 +240,9 @@ export interface LaneDecl {
 }
 /**
  * ── Generative facts ────────────────────────────────────────────────
- * What a guest sizes an image/video job from, so it never parses
- * `architecture()`: its latent space and the schedule it was trained
- * under. A text model answers `none` to each.
- * The latent space a denoiser works in, the VAE's own: a `[t, h, w,
- * channels]` volume, one cell `spatial-compression²` pixels. Latent
- * frame 0 stands for `first-frames` pixel frames and every later one for
- * `temporal-compression` (a causal VAE keeps its first frame alone: 1).
- * How the denoiser patches it is the model's business, not the guest's.
- * `none` for a model with no latent.
+ * A text model answers `none` to each.
+ * The VAE's `[t, h, w, channels]` latent; latent frame 0 covers
+ * `first-frames` pixel frames, each later one `temporal-compression`.
  */
 export interface LatentSpace {
   channels: number,
@@ -308,8 +279,7 @@ export type ScheduleKind = 'flow' | 'epsilon' | 'v';
  */
 export interface StreamShift {
   /**
-   * A value of the model's `stream` switch (`stream` is a WIT keyword,
-   * so it is spelled `lane`).
+   * A `stream` switch value (`stream` is a WIT keyword).
    */
   lane: string,
   shift: number,

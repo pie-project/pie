@@ -7,9 +7,8 @@ pub struct LaneMask<'a> {
     pub mask: Option<&'a Masking>,
     pub have: u32,
     pub rows: u32,
-    /// The lane's class attends both ways: every row reads every key the
-    /// lane holds (its own rows included), the row's enable flag is 2 and,
-    /// without a stated mask, every bit is kept.
+    /// Attends both ways: each row reads every key the lane holds; enable flag 2, every bit kept
+    /// unless a mask is stated.
     pub wide: bool,
 }
 

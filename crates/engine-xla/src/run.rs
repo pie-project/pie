@@ -70,9 +70,7 @@ pub struct PackingBindings {
     pub permutation: Tensor,
 }
 
-/// The custom mask a group-packed attention over packings `q` and `kv`
-/// applies (`poem_exec::fire::GroupMask`): u8 bits, an i32 byte offset a
-/// group.
+/// A group-packed attention's custom mask: u8 bits, an i32 byte offset a group.
 #[derive(Clone, Copy, Debug)]
 pub struct GroupMask {
     pub q: poem_ir::Selection,
@@ -81,16 +79,13 @@ pub struct GroupMask {
     pub indptr: Tensor,
 }
 
-/// A guest input's rectangle for this fire.
 #[derive(Clone, Copy, Debug)]
 pub struct InputBinding {
     pub id: u32,
     pub tensor: Tensor,
 }
 
-/// The inputs of the diffusion and video families: the voxel axis (clip
-/// grids, the voxel input), the guest inputs fed from channels, and the
-/// attention group packings. Empty for a text fire.
+/// The diffusion and video families' inputs; empty for a text fire.
 #[derive(Clone, Debug, Default)]
 pub struct DitBindings {
     pub grid: Option<Tensor>,
@@ -99,8 +94,6 @@ pub struct DitBindings {
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, PackingBindings)>,
     pub inputs: Vec<InputBinding>,
-    /// The custom masks the fire's group-packed attentions apply, when a
-    /// lane states one.
     pub group_masks: Vec<GroupMask>,
 }
 
@@ -308,8 +301,6 @@ impl<'c> Run<'c> {
         0
     }
 
-    /// The custom mask the group-packed attention bounded by `q_indptr` and
-    /// `kv_indptr` applies, when a lane of the fire states one.
     pub(crate) fn group_mask(&self, q_indptr: ValueId, kv_indptr: ValueId) -> Option<GroupMask> {
         let select = |indptr: ValueId| match &self.values[indptr.0 as usize].def {
             Def::Input(RuntimeInput::Geometry {
@@ -327,8 +318,7 @@ impl<'c> Run<'c> {
             .copied()
     }
 
-    /// The fire's clip slot table (one i32 slot per voxel lane) cut to this
-    /// window's clips, indexed as the window's grids index their lanes.
+    /// The fire's clip slot table cut to this window's clips.
     pub(crate) fn clip_slots(&self) -> Option<Tensor> {
         let voxel = self.window().voxel;
         let slots = self.fire.clip_slots?;
@@ -397,8 +387,7 @@ impl<'c> Run<'c> {
         self.slice(handle, skip, keep)
     }
 
-    /// `mask`'s bits, or the fire's where a prefill that is not causal states
-    /// none (its lanes' classes stage every key they hold).
+    /// `mask`'s bits, or the fire's when a non-causal prefill states none.
     pub(crate) fn mask_bits(&self, mask: Option<ValueId>) -> Tensor {
         mask.map_or(self.fire.tables.mask, |mask| self.tensor(mask))
     }
@@ -407,9 +396,8 @@ impl<'c> Run<'c> {
         self.cut(id, self.whole(id))
     }
 
-    /// The row `grid` addresses `rows`' row 0 at: the fire's clip and token
-    /// grids hold fire-wide rows, so the window's first row on `rows`' axis;
-    /// a grid an op derived counts from the window's first clip, so 0.
+    /// The row `grid` addresses `rows`' row 0 at: the window's first row for the fire's
+    /// fire-wide grids, 0 for a grid an op derived.
     pub(crate) fn grid_base(&self, grid: ValueId, rows: ValueId) -> u32 {
         if !matches!(
             self.values[grid.0 as usize].def,

@@ -40,9 +40,7 @@ fn entry(channels: u32) -> Result<&'static str, Error> {
 }
 
 /// `y` each row of `q` (bf16, the clips of `grid`) attended over the keys
-/// and values of its segment. `base`: the row `grid` addresses the
-/// rectangles' row 0 at, nonzero in a window of a segmented fire whose grid
-/// holds fire-wide rows.
+/// and values of its segment. `base`: the rectangles' row 0 in `grid`'s fire-wide rows.
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
     ctx: &Ctx<'_>,

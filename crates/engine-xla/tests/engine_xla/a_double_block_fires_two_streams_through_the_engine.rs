@@ -1,9 +1,4 @@
-//! engine-cuda's `a_double_block_fires_two_streams_through_the_engine` and
-//! `a_second_fire_reads_the_input_cells_it_was_handed`, on the xla engine:
-//! two requests of a text lane and an image lane each, fed latents, a
-//! timestep and axis positions off their channels, attend within their
-//! group through a row permutation, and read back the velocity seam; a
-//! second fire lands the second cells.
+//! engine-cuda's double-block and second-fire gates, on the xla engine.
 
 use crate::common_dit;
 
@@ -106,8 +101,7 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
             &req.positions[req.text_rows..],
         );
         let slot = (2 * at) as u32;
-        // Request 0 submits its image lane first: the packing puts a
-        // group's rows together, in submission order inside it.
+        // The packing keeps a group's rows together, in submission order.
         if at == 0 {
             lanes.push(lane(&rig, slot, &image, "image", at as u32));
             lanes.push(lane(&rig, slot + 1, &text, "text", at as u32));
@@ -171,8 +165,7 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
         "second fire, request 1 image",
     );
 
-    // A stated mask that keeps each stream to itself, so each attends only
-    // within itself (engine-cuda's ragged custom-mask arm).
+    // A stated mask that keeps each stream to itself.
     let apart = [request(&mut rng, 3, 5), request(&mut rng, 4, 6)];
     let want_apart: Vec<(Vec<f32>, Vec<f32>)> = requests
         .iter()
@@ -208,8 +201,7 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
             &first.positions[first.text_rows..],
         );
     }
-    // Each lane's rows attend its own lane's alone: in its group's rows (its
-    // pair's, lane after lane), the run it stands at.
+    // Each lane attends only its own rows.
     let mut classed = lanes;
     let rows: Vec<u32> = classed
         .iter()

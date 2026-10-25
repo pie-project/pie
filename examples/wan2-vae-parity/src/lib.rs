@@ -1,13 +1,6 @@
-//! **THE WAN 2.2 CAUSAL VAE, DECODED THROUGH THE RUNTIME.** The pie half of
-//! `scripts/imagegen/wan22_vae_parity.py`.
-//!
-//! Decodes a `T`-frame latent the way `examples/text-to-video` does: one
-//! decode pass per latent frame down one pipeline, each binding one working
-//! set whose recurrent state is the conv caches. The derived `fresh` switch
-//! picks the head branch on the first pass (one output frame).
-//!
-//! The pixels go back to the client as one raw `[F*H*W, 3]` f32 file
-//! (`pie run -o DIR` writes it as `file-0000.bin`).
+//! The pie half of `scripts/imagegen/wan22_vae_parity.py`: decodes a `T`-frame
+//! latent as `text-to-video` does, one pass per latent frame over one working
+//! set, and sends the pixels back as one raw `[F*H*W, 3]` f32 file.
 
 use inferlet::latent::prelude::*;
 use inferlet::session;
@@ -61,27 +54,21 @@ struct Case {
 
 #[derive(Serialize)]
 struct Output {
-    /// The reading each fire used, in order.
     fires: Vec<String>,
-    /// Output frames each fire landed.
     chunk_frames: Vec<u32>,
-    /// The last chunk decoded again on a FORK of the working set taken
-    /// before its fire, and the largest |difference| from the parent's.
+    /// Max |difference| of the last chunk decoded on a fork from its parent's.
     fork_max_abs_diff: f32,
     pixel_h: u32,
     pixel_w: u32,
-    /// Bytes of raw f32 sent as the file.
     pixels_bytes: u32,
 }
 
-/// What `reading`'s video lane reads out.
 fn readout(reading: &str) -> Option<model::Readout> {
     model::lane_of(&[("reading", reading), ("stream", "video")])
         .ok()?
         .readout
 }
 
-/// The decode reading: the one landing pixels that is not the encoder.
 fn decoder() -> Result<String> {
     model::switch("reading")
         .map(|decl| decl.values)
@@ -94,7 +81,6 @@ fn decoder() -> Result<String> {
         .ok_or_else(|| "this model declares no `vae.decode` reading".into())
 }
 
-/// The one input a VAE arm's lane reads: a clip on the voxel axis.
 fn voxel_input(reading: &str) -> Result<model::InputDecl> {
     match &model::lane_of(&[("reading", reading), ("stream", "video")])?.inputs[..] {
         [input] if input.axis == model::InputAxis::Voxel => Ok(input.clone()),
@@ -105,7 +91,6 @@ fn voxel_input(reading: &str) -> Result<model::InputDecl> {
     }
 }
 
-/// Decodes one latent frame into `state` and takes its pixels back.
 #[allow(clippy::too_many_arguments)]
 async fn decode_frame(
     reading: &str,
@@ -201,8 +186,7 @@ async fn main(input: Input) -> Result<Output> {
         // A fresh state lands one frame, every later one `tc`.
         let frames = if k == 0 { 1 } else { tc };
         let at = k as usize * plane;
-        // The last chunk, first on a fork: it must decode on from the very
-        // state its parent holds.
+        // The last chunk also decodes on a fork, which must match its parent.
         let fork = (k + 1 == case.t && k > 0)
             .then(|| state.fork(&pipe))
             .transpose()?;

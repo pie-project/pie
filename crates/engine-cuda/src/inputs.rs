@@ -472,15 +472,13 @@ pub struct Inputs {
     plans: Vec<Option<Workspace>>,
     plan_values: usize,
     inject_runs: Option<Buffer>,
-    /// The custom masks the fire's group-packed attentions read, staged
-    /// apart from the slab: their size is the groups', not the load's.
+    /// Staged apart from the slab: their size is the groups', not the load's.
     group_masks: Option<Buffer>,
     /// Smaller ones it outgrew, kept: an earlier fire may still read them.
     outgrown: Vec<Buffer>,
 }
 
-/// One ragged attention's custom mask on the device: over packings `q` and
-/// `kv`, the bits and each group's first byte.
+
 #[derive(Debug, Clone, Copy)]
 pub struct GroupMaskHandles {
     pub q: poem_ir::Selection,

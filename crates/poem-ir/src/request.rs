@@ -1,6 +1,3 @@
-/// What the runtime knows of one lane of a fire: the buffers it carries and
-/// what its program reads, from which the runtime switches are derived, and
-/// the values its inferlet set the model's own switches to.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Request {
     query_len: u32,
@@ -11,8 +8,7 @@ pub struct Request {
     media: bool,
     encode: bool,
     fresh: bool,
-    /// The guest switches the inferlet set, by name; one it left unset takes
-    /// its declared default.
+    /// One left unset takes its declared default.
     switches: Vec<(String, String)>,
 }
 
@@ -32,7 +28,6 @@ impl Request {
         self
     }
 
-    /// The lane's recurrent state holds nothing yet.
     #[must_use]
     pub fn starting(mut self, fresh: bool) -> Request {
         self.fresh = fresh;
@@ -63,7 +58,6 @@ impl Request {
         self
     }
 
-    /// The guest switch `name` set to `value`.
     #[must_use]
     pub fn switched(mut self, name: &str, value: &str) -> Request {
         match self.switches.iter_mut().find(|(n, _)| n == name) {
@@ -113,7 +107,6 @@ impl Request {
         self.fresh
     }
 
-    /// The value the inferlet set the guest switch `name` to, if it set it.
     #[must_use]
     pub fn switch(&self, name: &str) -> Option<&str> {
         self.switches
@@ -122,15 +115,12 @@ impl Request {
             .map(|(_, v)| v.as_str())
     }
 
-    /// The guest switches the inferlet set.
     #[must_use]
     pub fn switches(&self) -> &[(String, String)] {
         &self.switches
     }
 
-    /// How far this request is from a plain one: the runtime switches it
-    /// turns on (a query of more than one token counting as one) and the
-    /// guest switches it sets.
+    /// Runtime switches on (a multi-token query counting as one) plus guest switches set.
     #[must_use]
     pub fn departures(&self) -> usize {
         [

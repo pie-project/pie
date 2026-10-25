@@ -584,9 +584,7 @@ def encoder(reads, v):
     reads.read_over(e.quant.bias, at("quant_conv.bias"), lambda x: x.slice(0, 0, v.z))
 
 # The forward of Wan 2.2: the text encoder's reading, the denoiser's, and
-# the VAE's decode and encode. A VAE lane is a sequence, one latent frame a
-# fire, its conv caches the state: the first chunk (`fact.fresh()`, the
-# state empty) runs the head form, every later one the rest.
+# the VAE's decode and encode, the first chunk (`fact.fresh()`) in the head form.
 
 def run_linear(w, x):
     """`x` through the projection `w`, plus its bias if it has one."""
@@ -751,8 +749,6 @@ def run_block(x, c, b, e, d, vg, cg):
 PATCH = [PATCH_T, PATCH_H, PATCH_W]
 
 def turn_positions(arm, m):
-    """Each row's rope position: a video row its patch's `(t, h, w)` in its
-    clip. A lane whose `positions` switch says `given` reads the guest's."""
     given = switch_is("positions", "given")
     computed, _ = ops.gather.split_rows(ops.conv.cells(arm.token_grid(PATCH), arm.positions(), 0), 3)
     return merge([arm.on(given).input("positions", dtype.f32, "row", m.rope_axes), computed.on(~given)])

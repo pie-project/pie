@@ -7,8 +7,7 @@ pub struct LaneMask<'a> {
     pub mask: Option<&'a Masking>,
     pub have: u32,
     pub rows: u32,
-    /// The lane's class attends both ways: no causal bound clips its mask,
-    /// and without one every key the lane holds is kept.
+    /// Attends both ways: no causal bound, and with no mask every held key is kept.
     pub wide: bool,
 }
 

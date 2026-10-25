@@ -82,9 +82,7 @@ export function rsStateSize(): number {
 
 // -- generative facts ---------------------------------------------------------
 
-/** Every switch the bound model declares (`ForwardPass.switch`), each
- *  value list's first its default; empty for a model with one path (every
- *  text model). */
+/** Every switch the bound model declares; each value list's first is its default. */
 export function switches(): SwitchDecl[] {
   return _model.switches();
 }
@@ -94,10 +92,7 @@ export function switchDecl(name: string): SwitchDecl | undefined {
   return _model.switches().find((d) => d.name === name);
 }
 
-/** The lane a pass of these switches is: the inputs it binds (exactly
- *  these, by `ForwardPass.input`), whether it binds `state` and `embed`, and
- *  what it reads out. Switches are `[name, value]` pairs of `switches()`;
- *  one left unset takes its default. */
+/** The lane of these `[name, value]` switches; unset ones take their defaults. */
 export function lane(switches: Array<[string, string]>): LaneDecl {
   return _model.lane(switches);
 }
@@ -113,7 +108,7 @@ export function schedule(): ScheduleFact | undefined {
   return _model.schedule();
 }
 
-/** The most rows one lane may carry: the guest sizes its row inputs under this. */
+/** The most rows one lane may carry. */
 export function maxLatentRows(): number {
   return _model.maxLatentRows();
 }

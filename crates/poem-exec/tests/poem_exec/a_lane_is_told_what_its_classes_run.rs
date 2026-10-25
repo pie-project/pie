@@ -1,11 +1,7 @@
-//! What a lane of a model's switches binds and reads out comes from the
-//! classes its words land in.
-
 use poem_compiler::{Budget, Budgets, DeviceProfile, VoxelLadder, compile_axes};
 use poem_ir::{LaneClasses, ReadoutKind, RowAxis, Trace, Ty};
 
-/// What a lane of `switches` reads: kv, tokens, and its readout's kind,
-/// over every value of the runtime switches.
+/// What a lane of `switches` reads, over every value of the runtime switches.
 fn lane(
     trace: &Trace,
     classes: &LaneClasses,
@@ -56,8 +52,6 @@ fn classes_of(name: &str) -> (Trace, LaneClasses) {
     (trace, classes)
 }
 
-/// A lane of these switches, and whether it reads kv, embeds tokens, and
-/// what it reads out.
 type Told<'a> = (&'a [(&'a str, &'a str)], (bool, bool, Option<ReadoutKind>));
 
 #[test]

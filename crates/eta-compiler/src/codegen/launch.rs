@@ -31,7 +31,6 @@ pub struct LaunchValue {
     pub source: ValueOrigin,
     pub dtype: Dtype,
     pub intrinsic: Option<IntrinsicId>,
-    /// The pass's lane a per-lane intrinsic reads.
     #[serde(default)]
     pub lane: u32,
     pub channel: ChannelIndex,
@@ -236,8 +235,6 @@ pub struct LaunchStagePlan {
     pub mtp_rows: u32,
     #[serde(default)]
     pub drafts_len: u32,
-    /// The side-table slots an instance binds intrinsics at
-    /// ([`eta_ir::op::intrinsic_pitch`]).
     pub intrinsic_pitch: u32,
     pub ops: Vec<LaunchOp>,
     pub source_ops: Vec<Vec<u32>>,
@@ -257,7 +254,6 @@ pub struct LaunchPackage {
     pub values: Vec<LaunchValue>,
     pub channels: Vec<LaunchChannel>,
     pub ports: Vec<LaunchPort>,
-    /// The channels the forward reads as guest model inputs.
     pub inputs: Vec<ChannelIndex>,
     pub names: Vec<String>,
     pub stages: Vec<LaunchStage>,

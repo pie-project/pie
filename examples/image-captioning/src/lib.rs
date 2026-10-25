@@ -188,9 +188,7 @@ async fn main(input: Input) -> Result<Output> {
 
     // ───────────────────────── 1. THE MEDIA PREFILL ─────────────────────────
     //
-    // **THE WHOLE PROMPT IN ONE PASS.** The host scans the pass's tokens for
-    // the runs and keeps where an M-RoPE span leaves the rotation behind the
-    // slots: the rows after it, and the decode, rotate there by default.
+    // The rows after an M-RoPE span, and the decode, rotate where the host says it leaves off.
     let prompt_i32: Vec<i32> = prompt_tokens.iter().map(|&t| t as i32).collect();
     let toks_p = Channel::from(&prompt_i32[..]).named("toks_p");
     let embed_indptr_p = Channel::from([0u32, n]).named("embed_indptr_p");
@@ -198,9 +196,7 @@ async fn main(input: Input) -> Result<Output> {
 
     let fwd_p = ForwardPass::new();
     fwd_p.embed(&toks_p, &embed_indptr_p)?;
-    // **THE PAYLOAD, ORDER-MATCHED TO THE RUNS.** One span, one run, and the
-    // host is what checks that — the guest states the correspondence by
-    // ordering alone and can state nothing else.
+    // One span per token run, matched by order; the host checks it.
     let spans: Vec<media::Span> = images.iter().map(media::Span::Image).collect();
     fwd_p.media(0, &spans)?;
     fwd_p.state(&[&ws], StateGeometry::folding())?;

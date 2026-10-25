@@ -75,8 +75,7 @@ pub fn cache_gather(
     )
 }
 
-/// `x_base`: the row `grid` addresses `x`'s row 0 at, nonzero in a window of
-/// a segmented fire whose grid holds fire-wide rows.
+/// `x_base`: the row `grid` addresses `x`'s row 0 at.
 #[allow(clippy::too_many_arguments)]
 pub fn cache_store(
     ctx: &Ctx,

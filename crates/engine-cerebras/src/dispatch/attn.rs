@@ -295,8 +295,6 @@ impl Run<'_> {
                 if self.run_index() > 0 {
                     return Ok(());
                 }
-                // A mask a lane states is over its group's rows: it is staged
-                // for this attention's query and key packings.
                 let stated = self.group_mask(*q_indptr, *kv_indptr);
                 let mask = match (mask, stated) {
                     (

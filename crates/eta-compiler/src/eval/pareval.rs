@@ -389,7 +389,6 @@ mod tests {
     use eta_ir::types::{Dtype, Literal, RngKind, Shape};
     use eta_ir::validate::{BoundTrace, bind};
 
-    /// A lane reading `vocab`-wide logits, on a two-layer model.
     fn served(c: TraceContainer, vocab: u32) -> BoundTrace {
         bind(
             c,

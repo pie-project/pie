@@ -40,7 +40,7 @@ pub fn mtp_drafts(n: u32) -> Tensor {
         Dtype::I32,
     )
 }
-/// The `rows` hidden rows lane `lane` of the pass reads out, `width` wide.
+/// Lane `lane`'s `rows` hidden rows, `width` wide.
 pub fn hidden(lane: u32, rows: u32, width: u32) -> Tensor {
     intrinsic_val(
         IntrinsicId::Hidden,
@@ -49,8 +49,7 @@ pub fn hidden(lane: u32, rows: u32, width: u32) -> Tensor {
         activation_type,
     )
 }
-/// The velocity lane `lane` of the pass predicts, one `width`-wide row per
-/// of its `rows`.
+/// Lane `lane`'s velocity, `rows` rows `width` wide.
 pub fn velocity(lane: u32, rows: u32, width: u32) -> Tensor {
     intrinsic_val(
         IntrinsicId::Velocity,
@@ -59,7 +58,7 @@ pub fn velocity(lane: u32, rows: u32, width: u32) -> Tensor {
         activation_type,
     )
 }
-/// The `rows` pixel rows lane `lane` of the pass decodes, `width` wide.
+/// Lane `lane`'s `rows` pixel rows, `width` wide.
 pub fn pixels(lane: u32, rows: u32, width: u32) -> Tensor {
     intrinsic_val(
         IntrinsicId::Pixels,

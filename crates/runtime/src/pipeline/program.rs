@@ -112,8 +112,7 @@ impl Registry {
         }
     }
 
-    /// `lanes` is what each lane of the pass reads out; a program bound for
-    /// one pass is checked again against the next's.
+    /// A program bound for one pass is checked again against the next's `lanes`.
     pub fn register(
         &mut self,
         bytes: Vec<u8>,
@@ -281,8 +280,6 @@ fn global() -> MutexGuard<'static, Registry> {
     GLOBAL.lock().expect("global lock poisoned")
 }
 
-/// Registers the program of a pass whose lanes read out `lanes`, against
-/// the served model's graph and engine.
 pub fn register(
     bytes: Vec<u8>,
     lanes: Vec<Option<Readout>>,

@@ -112,9 +112,7 @@ export class ForwardPass {
   constructor()
   /**
   * One working set per lane, in lane order; lanes sharing one state
-  * their slots. Required on a lane `model.lane` says binds `state`:
-  * one that reads kv or a recurrent state (a causal VAE's conv
-  * caches: each fire then folds one slot, and states no geometry);
+  * their slots. Required on a lane `model.lane` says binds `state`,
   * refused on any other.
   */
   state(lanes: Array<WorkingSet>, geom: StateGeometry): void;
@@ -125,55 +123,32 @@ export class ForwardPass {
   checkpoints(slots: Uint32Array): void;
   /**
   * Bind embedding token ids and CSR row indptr. Both are channels.
-  * REQUIRED on a lane that embeds tokens (`model.lane`'s `embeds`,
-  * every text model's), REFUSED on one that does not; the lane's row
-  * count then comes from its row inputs.
+  * Required on a lane that embeds tokens (`model.lane`'s `embeds`),
+  * refused on one that does not.
   */
   embed(tokens: Channel, indptr: Channel): void;
   /**
-  * Set lane `lane`'s model switch `name` to `value`
-  * (`model.switches()`): which path that lane runs. Names and values
-  * are the model's (`reading`, `stream`, `mode`, ...); the host checks
-  * `value` against the declaration and nothing else. A switch left
-  * unset takes its first declared value. Set before `program`; a lane
-  * keeps its switches for the pass's life.
+  * Set lane `lane`'s model switch `name` (`model.switches()`) to
+  * `value`; an unset switch takes its first declared value. Set
+  * before `program`.
   */
   'switch'(lane: number, name: string, value: string): void;
   /**
-  * Bind a channel to lane `lane`'s model input `name` (`model.lane`'s
-  * `inputs`), read at every submit: the channel's COMMITTED cell is
-  * the input's value for that lane, so `set` or an epilogue `put`
-  * advances it and a whole denoising loop runs without a host copy a
-  * step. The channel is `[width]` for a `lane` input, `[rows, width]`
-  * for a `row` input (every row input of a lane carries the same
-  * rows, and states the lane's rows when nothing else does), and one
-  * clip `[h, w, width]` or `[t, h, w, width]` for a `voxel` input; it
-  * is `f32` for a float input and `i32` for an `i32` one. The
-  * program lists the channel among its inputs, read where the
-  * descriptor ports are, so a prologue `put` to it is the value the
-  * forward reads. A lane binds exactly the inputs it reads before
-  * `program`.
+  * Bind lane `lane`'s model input `name` (`model.lane`) to `ch`, whose
+  * committed cell is read at every submit: `[width]`, `[rows, width]`
+  * or one `[t?, h, w, width]` clip. A lane binds exactly what it reads.
   */
   input(lane: number, name: string, ch: Channel): void;
   /**
-  * Put lane `lane` in attention group `id`: the lanes of this pass
-  * naming one group attend each other's rows, and a lane naming none
-  * attends its own. Group ids are this pass's: two passes' groups
-  * never meet, whatever their ids. Classifier-free guidance's two
-  * branches are two groups of one pass. Set before `program`.
+  * Put lane `lane` in this pass's attention group `id`: lanes naming
+  * one group attend each other's rows; a lane naming none attends its
+  * own. Set before `program`.
   */
   group(lane: number, id: number): void;
   /**
-  * Per row of the pass, which rows it attends, as bools: over the
-  * slots `[0, kv-len)` on a pass whose lanes read kv (a recurrent
-  * layer hides only slots past `folded`, the same ones for every row
-  * of a lane); over its attention group's rows, in the pass's lane
-  * order, on one whose lanes do not (a voxel lane's rows are its
-  * voxels, and a token after the model's patchify attends as its
-  * patch's first voxel). The channel is `[rows, n]`; a row of a group
-  * of fewer than `n` rows reads its first ones. Regional prompting,
-  * attention coupling and cross-frame restriction are each one mask.
-  * Set before `program`.
+  * `[rows, n]` bools: per row, the slots `[0, kv-len)` it attends when
+  * lanes read kv, else its attention group's rows in lane order. Set
+  * before `program`.
   */
   mask(rows: Channel): void;
   /**

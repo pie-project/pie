@@ -453,8 +453,6 @@ fn const_root_value(root: &LaunchValue) -> Value {
     }
 }
 
-/// One whole pass with no forward between its points: the prologue, if it
-/// runs on its own, then the rest.
 #[must_use]
 pub fn step(inst: &mut InterpInstance, plan: &ExecPlan, inputs: &PassInputs) -> StepOutcome {
     if plan.prologue_runs() {
@@ -466,9 +464,7 @@ pub fn step(inst: &mut InterpInstance, plan: &ExecPlan, inputs: &PassInputs) -> 
     step_with(inst, plan, inputs, &mut Interpreted, Stage::Epilogue)
 }
 
-/// The stages that run at `at` ([`ExecPlan::runs_at`]), gated and committed
-/// on their own: the prologue's point before the forward, the epilogue's
-/// after it.
+/// The stages that run at `at`, gated and committed on their own.
 #[must_use]
 pub fn step_with(
     inst: &mut InterpInstance,
@@ -529,7 +525,6 @@ pub fn step_with(
     commit(inst, &overlay)
 }
 
-/// The first channel not as the stages at `at` need it.
 fn blocked(inst: &InterpInstance, plan: &ExecPlan, at: Stage) -> Option<u32> {
     inst.channels
         .iter()

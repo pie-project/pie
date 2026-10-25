@@ -938,8 +938,8 @@ def forward(m, inputs):
         seam.at(seam.ATTN_Q, [q])
 
         # Each lane by its kind (the tail's whole rows are lanes that mask or
-        # capture scores, so only those two), a denoise lane over every key it
-        # holds; a global layer's scores go out at their seam.
+        # capture scores, so only those two); a global layer's scores go out
+        # at their seam.
         causal = ~switch_is("mode", "denoise") if m.self_cond != None else None
         a = ops.attn.attend(q, trunk_inputs, at.kv, m.q_heads, kv_heads, d, at.sm_scale, window = win,
                             causal = causal, mask = True, scores = True, scores_seam = at.reading != SLIDING)

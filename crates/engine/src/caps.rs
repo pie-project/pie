@@ -147,23 +147,18 @@ pub struct Capabilities {
     #[serde(default)]
     pub adapter_attachments: bool,
 
-    /// The engine runs an adapter's `lora` sink.
     #[serde(default)]
     pub has_lora: bool,
 
-    /// The engine runs an `attn_page_mask` sink.
     #[serde(default)]
     pub has_attn_page_mask: bool,
 
-    /// The loaded graph drafts: a draft column `mtp_logits` reads, and the
-    /// `mtp_depth` ids it drafts a fire.
+    /// The loaded graph drafts `mtp_depth` ids a fire.
     #[serde(default)]
     pub has_mtp_logits: bool,
     #[serde(default)]
     pub mtp_depth: u32,
 
-    /// The loaded graph's block drafter: the rows it drafts, its mask token
-    /// and the row its proposals start from.
     #[serde(default)]
     pub draft_block: u32,
     #[serde(default)]
@@ -171,7 +166,6 @@ pub struct Capabilities {
     #[serde(default)]
     pub draft_proposals_from: u32,
 
-    /// The loaded graph exports attention scores.
     #[serde(default)]
     pub has_attn_score: bool,
 
@@ -180,13 +174,10 @@ pub struct Capabilities {
     #[serde(default)]
     pub facts: poem_ir::Facts,
 
-    /// The inputs the loaded trace's guest binds, by id, and which lane
-    /// words read each.
+    /// The guest's inputs by id, with the lane words that read each.
     #[serde(default)]
     pub inputs: Vec<poem_ir::InputDecl>,
 
-    /// The loaded trace's classes: the lane words landing in each and what
-    /// its graph does.
     #[serde(default)]
     pub classes: poem_ir::LaneClasses,
 }

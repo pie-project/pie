@@ -1,6 +1,3 @@
-//! What a layout may state of a generative model: its latent space and
-//! schedule.
-
 use std::fmt;
 
 use allocative::Allocative;
@@ -126,8 +123,6 @@ pub(crate) fn generative(builder: &mut GlobalsBuilder) {
         })))
     }
 
-    /// What a generative model states of itself: the latent space and
-    /// schedule it denoises by.
     fn generation(
         #[starlark(require = named, default = NoneOr::None)] latent: NoneOr<Value<'_>>,
         #[starlark(require = named, default = NoneOr::None)] schedule: NoneOr<Value<'_>>,

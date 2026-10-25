@@ -7,8 +7,7 @@ fn container_has_attention_stages(container: &eta_ir::container::TraceContainer)
         .any(|s| matches!(s.stage, Stage::OnAttnProj | Stage::OnAttn))
 }
 
-/// A prologue that takes or puts a channel runs, and commits, before the
-/// forward of the fire that runs its program.
+/// A prologue that takes or puts a channel commits before its fire's forward.
 fn container_prologue_moves(container: &eta_ir::container::TraceContainer) -> bool {
     use eta_ir::op::ChannelUse;
     use eta_ir::registry::Stage;
@@ -618,8 +617,6 @@ fn separable_rows(req: &crate::engine::FireRequest) -> bool {
     matches!(req.lanes.as_slice(), [lane] if plain_lane(lane)) && req.voxels.is_empty()
 }
 
-/// No adapter or inputs: a lane whose rows are its tokens' alone (its pass's
-/// switches are [`Switched::plain`]).
 fn plain_lane(lane: &::engine::Lane) -> bool {
     lane.adapter.is_none() && lane.inputs.is_empty() && !lane.kv_less
 }
@@ -766,8 +763,7 @@ fn separable_lanes(req: &crate::engine::FireRequest) -> bool {
         })
 }
 
-/// How many of a fire's first rows hold KV that is their tokens' alone, so
-/// their pages seal under their keys: those before its first media row.
+/// The leading rows whose KV is their tokens' alone (before any media row), so their pages seal.
 fn keyed_rows(req: &crate::engine::FireRequest) -> u32 {
     let [lane] = req.lanes.as_slice() else {
         return 0;
@@ -1548,9 +1544,6 @@ pub(crate) async fn drain_pipeline_fires<C: FireContext>(
     }
 }
 
-/// What a pass's lanes' words are built from beside what each lane
-/// carries: the guest switches each lane set and whether its program reads
-/// drafts.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Switched {
     pub(crate) lanes: Vec<Vec<(String, String)>>,
@@ -1569,8 +1562,7 @@ impl Switched {
         }
     }
 
-    /// No drafts read and every lane's every switch at its default: a pass
-    /// whose rows may be cut, keyed and logged by their tokens.
+    /// Whether the pass's rows may be cut, keyed and logged by their tokens.
     pub(crate) fn plain(&self) -> bool {
         let facts = crate::model::model().facts();
         !self.drafts
@@ -1616,9 +1608,7 @@ fn stamp_lane_words(
     }
 }
 
-/// Whether a lane's recurrent state holds nothing yet, as the engine reads
-/// its reset: the rs store's when it stated one, else a seated lane holding
-/// no kv.
+/// Whether the lane's recurrent state is empty, as the engine reads its reset.
 fn starts(lane: &::engine::Lane) -> bool {
     match lane.rs_reset {
         ::engine::RsReset::Fresh => true,
@@ -1627,13 +1617,11 @@ fn starts(lane: &::engine::Lane) -> bool {
     }
 }
 
-/// Every lane of a request, as the pass's lanes in order.
 fn every_lane(req: &crate::engine::FireRequest) -> Vec<usize> {
     (0..req.lanes.len()).collect()
 }
 
-/// Whether a lane of `req` lands in a class attending both ways: its rows
-/// read one another, so it is never cut, keyed or logged by its tokens.
+/// A lane in a both-ways class is never cut, keyed or logged by its tokens.
 fn reads_each_other(req: &crate::engine::FireRequest) -> bool {
     let model = crate::model::model();
     req.lanes.iter().any(|lane| model.wide(lane.word))
@@ -1982,8 +1970,7 @@ fn pass_lanes<C: FireContext>(ctx: &mut C, fwd: &Resource<ForwardPass>) -> Anyho
 
 type CursorCell = std::sync::Arc<std::sync::Mutex<crate::inferlet::host::working_set::Cursor>>;
 
-/// Working sets in `settles` freeze where the fire settles; `matched` are the
-/// media runs the fire carries.
+/// Working sets in `settles` freeze where the fire settles.
 fn advance_cursors(
     lanes: &PassLanes,
     landings: Option<&[geometry::Landing]>,
@@ -2169,8 +2156,7 @@ fn stamp_lane_facts<C: FireContext>(
     Ok(())
 }
 
-/// The media runs each lane's tokens carry, matched to the spans that lane
-/// bound; a lane binding none carries no run of the model's placeholder.
+/// A lane binding no span carries no run of the model's placeholder.
 fn scan_lane_media(
     lane_tokens: &[&[u32]],
     spans: &[Vec<Arc<media::front::EncodedSpan>>],
@@ -2419,8 +2405,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 .into_iter()
                 .any(|count| (0..req.lanes.len()).all(|lane| fold.of(lane) == Some(count)));
         let (attention_stages, adapted) = hook_program_of(ctx, &fwd)?;
-        // The program runs on a cut pass's last fire: a prologue whose
-        // effects the forward may read would run after the first fires'.
+        // The program runs on a cut pass's last fire, after the first fires' forwards.
         let prologue_moves =
             container_prologue_moves(&ctx.resources().get(&fwd)?.instance.program.bound.container);
         let hooked = attention_stages || adapted;
@@ -2443,8 +2428,6 @@ pub async fn submit_pass_stamped<C: FireContext>(
             && !ring
             && folds_all;
         let mut full = req;
-        // Its fires seal their share of the slot hashes, up to its first
-        // media row; sealed pages holding its rows already are mapped in.
         let keyed = if keyable { keyed_rows(&full) } else { 0 };
         let mut pass_slots = (keyed > 0)
             .then(|| {
@@ -2765,8 +2748,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
                     )));
                 };
                 let mut tags = Vec::new();
-                // A piece carrying media is not its tokens' alone: it cuts
-                // the log.
+                // A piece carrying media is not its tokens' alone.
                 let rows = match (&pass_slots, pages) {
                     (Some(_), _) if !req.media.is_empty() => LogRows::Unknown,
                     (Some(_), _) => LogRows::Known {
@@ -3590,8 +3572,7 @@ async fn fire_device_geometry<C: FireContext>(
     for (_, lanes) in &groups {
         let lane = lanes[0];
         let place = &pass_lanes.places[lane];
-        // A row rotates behind its slot past an M-RoPE span; the device
-        // picks the slot, so it cannot.
+        // Past an M-RoPE span a row rotates behind its slot, which the device picks.
         if !states_positions && !place.spans.is_empty() {
             return Ok(Err(format!(
                 "pipeline: lane {lane}'s rows land where the device says, past a media span \
@@ -4344,7 +4325,6 @@ mod cut_tests {
             ..Default::default()
         });
         assert_eq!(keyed_rows(&req), 60, "up to its first media row");
-        // The pages before it are a piece of their own, short as the pass is.
         let cuts = host_cuts(&req, true, 128, 16, &[]);
         assert_eq!(cuts, [(0, 59), (59, 100)]);
         let first = rows_of_lanes(&req, &[Some(cuts[0])], false, 16);

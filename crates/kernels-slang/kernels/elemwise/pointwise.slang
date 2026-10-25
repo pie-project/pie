@@ -7,9 +7,7 @@
 
 #if defined(PIE_ADD)
 
-// `z = x op y` over a whole tensor, a pair of elements a lane: `PIE_OP` 0
-// adds, 1 multiplies, 2 divides, 3 takes the floored modulo
-// (`x - y·floor(x / y)`, as Python's `%`).
+// `PIE_OP` 0 adds, 1 multiplies, 2 divides, 3 takes the floored modulo (Python's `%`).
 
 #ifndef PIE_OP
 #define PIE_OP 0

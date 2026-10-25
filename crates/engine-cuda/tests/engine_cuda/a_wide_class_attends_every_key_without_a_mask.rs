@@ -19,9 +19,7 @@ const SM_SCALE: f32 = 0.125;
 const KV_ROW: &str = "kv";
 const ROWS: u32 = 7;
 
-/// One attention layer: `stated`, a masked lane's rows by its mask, both
-/// ways; else a denoise lane's rows over every key it holds, the rest
-/// causally.
+/// One attention layer: `stated` masks both ways, denoise attends every key, the rest causal.
 struct Micro {
     stated: bool,
 }
@@ -134,7 +132,6 @@ fn shell(trace: Trace, path: &Path, graphs: Graphs) -> Shell {
     shell
 }
 
-/// Every row's logits of one fresh lane of `request`'s word.
 fn rows(
     trace: &Trace,
     path: &Path,
@@ -172,8 +169,7 @@ fn worst(a: &[f32], b: &[f32]) -> f32 {
         .fold(0f32, f32::max)
 }
 
-// A class running a prefill that is not causal is wide: its lane, stating no
-// mask, attends every key it holds, as a lane stating the whole extent does.
+// A wide class's lane stating no mask attends every key, as one stating the whole extent does.
 #[test]
 fn a_wide_class_attends_every_key_without_a_mask_every_case() {
     if !engine_cuda::device::present() {

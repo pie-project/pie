@@ -440,9 +440,7 @@ pub(crate) fn forward(builder: &mut GlobalsBuilder) {
         })
     }
 
-    /// Declares the model's switch `name` over `values`, the first its
-    /// default: what a lane may set it to, each value a path the forward
-    /// may branch on with `switch_is`.
+    /// Declares the model's switch `name` over `values`, the first its default.
     fn switch(
         #[starlark(require = pos)] name: &str,
         #[starlark(require = pos)] values: UnpackList<String>,
@@ -454,7 +452,6 @@ pub(crate) fn forward(builder: &mut GlobalsBuilder) {
         Ok(NoneType)
     }
 
-    /// The rows whose switch `name` is set to `value`.
     fn switch_is(
         #[starlark(require = pos)] name: &str,
         #[starlark(require = pos)] value: &str,

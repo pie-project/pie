@@ -178,12 +178,7 @@ def run_mini(d: str, device="cpu", dtype=torch.float32):
     npz_keys(tap)
 
 def dump_decode(raw: str, vae, z, source: str, device: str):
-    """Decode the DiT-space latent `z` (`[1, C, T, h, w]`) in fp32 and dump it to `raw`.
-
-    `latent.f32`, `denorm.f32`, `pixels.f32` in the row-per-voxel `(t, h, w)`
-    layout, and `shapes.json` with the boxes and the per-chunk frame
-    boundaries. Returns the pixels and the normalisation, for the encoder.
-    """
+    """Decode the DiT-space latent `z` in fp32 and dump it, row per voxel, to `raw`."""
     cfg = vae.config
     mean = torch.tensor(cfg.latents_mean, device=device, dtype=torch.float32).view(1, -1, 1, 1, 1)
     std = torch.tensor(cfg.latents_std, device=device, dtype=torch.float32).view(1, -1, 1, 1, 1)
@@ -222,21 +217,7 @@ def dump_decode(raw: str, vae, z, source: str, device: str):
     return x, mean, std
 
 def run_vae(d: str, device="cuda", repo=REPO):
-    """`AutoencoderKLWan` alone, fp32, over the full run's final latent.
-
-    The DiT works in a NORMALISED latent space and the pipeline undoes that
-    before the decode (`latents * latents_std + latents_mean`); pie's
-    `vae.decode` arms undo it themselves, so what is dumped as `latent.f32`
-    is the DiT-space latent — exactly the rows the denoise reading answers —
-    and `denorm.f32` is the decoder's own input beside it, for a bisect.
-
-    `_decode` is a LOOP: it clears the per-conv frame caches, runs
-    `post_quant_conv` over the whole latent, and then calls the decoder once
-    per latent frame carrying the caches across. Latent frame 0 lands ONE
-    output frame, every later one lands FOUR, so `F = 4*T - 3`. Both halves
-    are dumped: the whole clip's pixels, and the frame boundary each chunk
-    ends at, so a guest's decode can be scored chunk by chunk and say WHICH fire drifted.
-    """
+    """`AutoencoderKLWan` alone, fp32, over the full run's final latent."""
     from diffusers import AutoencoderKLWan
 
     vae = AutoencoderKLWan.from_pretrained(repo, subfolder="vae",
@@ -254,12 +235,7 @@ def run_vae(d: str, device="cuda", repo=REPO):
     run_vae_encode(d, vae, x, mean, std)
 
 def run_vae_seeded(d: str, device="cuda", repo=REPO):
-    """`dump_decode` over a SEEDED DiT-space latent: `VAE_REF_LATENT` = 3 latent
-    frames of 16x16 (256x256 pixels, 9 frames). Needs only `vae/*`, not `--full`.
-
-    Small enough to pass through a guest's argv, long enough that two fires
-    after the head must carry the conv caches. `wan22_vae_parity.py` scores it.
-    """
+    """`dump_decode` over a seeded `VAE_REF_LATENT`; needs only `vae/*`, not `--full`."""
     from diffusers import AutoencoderKLWan
 
     vae = AutoencoderKLWan.from_pretrained(repo, subfolder="vae",

@@ -1,9 +1,5 @@
-//! The diffusion miniatures engine-cuda's `common_dit` and `common_two_axis`
-//! gate on, for the xla engine: a double-stream DiT block (latent, timestep
-//! and position inputs, grouped ragged attention over a row permutation, a
-//! velocity seam), and a two-axis plan whose VAE reading convolves a voxel
-//! input into a pixels seam. Weights are drawn in-process,
-//! the answers checked against host references.
+//! The diffusion miniatures engine-cuda's `common_dit` and `common_two_axis` gate on, for
+//! the xla engine, checked against host references.
 //!
 //! The lanes attach a carrier program that takes each fed channel's cell
 //! (so every fire reads the next cell, as engine-cuda's epilogues make it);
@@ -547,7 +543,6 @@ pub struct Rig {
     pub engine: Xla,
     pub loaded: Loaded,
     pub facts: poem_ir::Facts,
-    /// The plan's guest inputs by name, in id order.
     pub inputs: Vec<String>,
     programs: BTreeMap<u32, ProgramId>,
     next_channel: u64,
@@ -561,7 +556,6 @@ impl Drop for Rig {
 }
 
 impl Rig {
-    /// The id of the plan's guest input `name`.
     pub fn input(&self, name: &str) -> u32 {
         let id = self
             .inputs
@@ -630,7 +624,6 @@ impl Rig {
         }
     }
 
-    /// The widths the loaded plan's classes read out of `kind`.
     pub fn readout_widths(&self, kind: poem_ir::ReadoutKind) -> Vec<u32> {
         self.loaded
             .caps
@@ -642,7 +635,6 @@ impl Rig {
             .collect()
     }
 
-    /// What the loaded model's graph and engine state for a program's bind.
     pub fn graph(&self) -> (Graph, EngineCaps) {
         let caps = &self.loaded.caps;
         (
@@ -804,9 +796,6 @@ impl Rig {
     }
 }
 
-/// A double-block lane feeding every input the plan reads off its handles:
-/// the row inputs (`latents`, `context`) off the latent cell, `timestep` and
-/// `positions` off their own, in attention group `group`.
 pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, stream: &str, group: u32) -> Lane {
     Lane {
         slot,
@@ -833,8 +822,6 @@ pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, stream: &str, group: u3
     }
 }
 
-/// What each lane of a fixture's pass reads out, as its program reads it:
-/// the widths of the intrinsics it reads of each lane.
 pub fn lanes_read(container: &TraceContainer) -> Vec<Option<eta_ir::registry::Readout>> {
     let mut lanes: Vec<Option<eta_ir::registry::Readout>> = vec![None];
     for op in container.stages.iter().flat_map(|stage| &stage.ops) {

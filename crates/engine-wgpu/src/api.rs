@@ -804,7 +804,8 @@ impl Wgpu {
 
     #[cfg(not(feature = "wgpu"))]
     fn run_prologues(&mut self, submission: &Step) -> EngineResult<()> {
-        if program_attachments(submission).any(|attachment| self.programs.prologue_runs(attachment.instance))
+        if program_attachments(submission)
+            .any(|attachment| self.programs.prologue_runs(attachment.instance))
         {
             return Err(Error::Program(
                 "this build carries no wgpu device, so a guest pass has nowhere to run".into(),
@@ -830,7 +831,8 @@ impl Wgpu {
         self.programs
             .deferred(
                 &device,
-                program_attachments(submission).map(|attachment| (attachment.instance, attachment.lane)),
+                program_attachments(submission)
+                    .map(|attachment| (attachment.instance, attachment.lane)),
                 policies,
             )
             .map(Some)
@@ -856,8 +858,7 @@ impl Wgpu {
         submission: &Step,
         at: engine::StepDone,
     ) -> EngineResult<(FireTicket, PendingStep)> {
-        // The caller predicts the cursors a pass starts from: checked
-        // before a prologue moves them.
+        // Checked before a prologue moves the cursors the caller predicted.
         for attachment in &submission.attachments {
             if let Some(lane) = submission.lanes.get(attachment.lane as usize)
                 && !lane.channels.is_empty()

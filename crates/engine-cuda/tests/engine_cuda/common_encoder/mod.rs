@@ -346,7 +346,6 @@ impl Rig {
         }
     }
 
-    /// How wide a row the loaded classes read out of `kind`, if one does.
     pub fn reads_out(&self, kind: poem_ir::ReadoutKind) -> Option<u32> {
         self.loaded
             .caps

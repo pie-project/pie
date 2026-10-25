@@ -10,7 +10,7 @@
 //!    `[512, 7680]` stack in numpy and compares the `L` unpadded rows.
 //! 2. **one `denoise` step** — the golden's own step-0 inputs (its prompt
 //!    embeds folded, its noise, `σ₀ = 1`), the velocity on the image lane.
-//! 2b. **one independent step per sigma** (`probe_latents_file`) — the
+//!    2b. **one independent step per sigma** (`probe_latents_file`) — the
 //!    same one-fire denoise from the reference's OWN latent at every step,
 //!    so each step's velocity is checked under the reference's state
 //!    rather than under pie's drifting one.
@@ -29,18 +29,7 @@
 //! the arrays are raw little-endian f32, the answers go back the same way
 //! through `session::send_file` (`pie run -o DIR` writes them as
 //! `file-NNNN.bin` in send order, which `Output::files` names).
-//!
-//! # LANES
-//!
-//! `denoise` is two lanes here (no reference): the text lane
-//! (stream `text`, the `context` input at width `dim`) and the target lane
-//! (stream `image`, the `latents` input: the VAE-native latent `[h, w, C]`
-//! on the voxel axis), one group, both lanes of ONE pass binding the one
-//! loop-carried timestep cell. The model patchifies and computes every
-//! row's rotary position in its graph; the guest states neither. Only the
-//! image lane reads out, on the voxel axis. Every trajectory runs down ONE
-//! pipeline and reads the one conditioning channel: a channel no pass
-//! writes is shared by every pass that reads it.
+
 use inferlet::latent::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -61,8 +50,7 @@ struct Case {
     context_file: String,
     text_rows: u32,
     context_width: u32,
-    /// `[height, width, channels]` f32 LE: the golden's initial noise in
-    /// the VAE's own latent space (unpacked by the harness).
+    /// `[height, width, channels]` f32 LE: the golden's initial noise, unpacked.
     latents_file: String,
     height: u32,
     width: u32,
@@ -89,8 +77,7 @@ struct Output {
     token_ids: Vec<u32>,
     text_rows: u32,
     hidden_width: u32,
-    /// The latent the velocities and latents are sent in, `[height, width,
-    /// channels]` (the velocity's voxels in the same row-major order).
+    /// `[height, width, channels]` of every latent and velocity sent.
     height: u32,
     width: u32,
     channels: u32,
@@ -100,12 +87,10 @@ struct Output {
     files: Vec<String>,
 }
 
-/// The velocity width the image lane reads out.
 struct Dims {
     velocity_width: u32,
 }
 
-/// The lane `stream` of `reading`, checked to read exactly `binds`.
 fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::LaneDecl> {
     let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
     if lane.state || lane.embeds {
@@ -194,8 +179,7 @@ async fn text_rows(ids: &[u32], width: u32, pipe: &Pipeline) -> Result<Vec<f32>>
     Ok(rows)
 }
 
-/// `sigmas.len()` Euler steps from `noise` (`[h, w, C]`): the step-0
-/// velocity and the latent after every step.
+/// The step-0 velocity and the latent after every Euler step from `noise`.
 #[allow(clippy::too_many_arguments)]
 async fn trajectory(
     context: &Channel,
@@ -327,7 +311,6 @@ async fn main(input: Input) -> Result<Output> {
     }
 
     let mut files = Vec::new();
-    // Every pass of the job, in order, down one pipeline.
     let pipe = Pipeline::new();
 
     // 1. The text reading.
@@ -345,8 +328,6 @@ async fn main(input: Input) -> Result<Output> {
         &case.context_file,
         (case.text_rows * case.context_width) as usize,
     )?;
-    // One conditioning channel: no pass writes it, so every trajectory's
-    // pass reads the same one.
     let golden =
         Channel::from_shaped([case.text_rows, case.context_width], context).named("context");
     let (velocity0, latents) = trajectory(

@@ -43,7 +43,6 @@ constexpr int kActSilu = 0;
 constexpr int kActTanh = 1;
 constexpr int kActSqrt = 2;
 
-// o = silu(x), tanh(x) or sqrt(x).
 template <class T, int ACT>
 __global__ void activation(const T* __restrict__ x, T* __restrict__ o, i32 n, i32 width,
                            const u32* __restrict__ win) {

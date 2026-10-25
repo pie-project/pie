@@ -9,11 +9,7 @@
 //! span, the user turn, the bare assistant header. Upstream (transformers,
 //! f32 and bf16) answers `<think>\n\n</think>\n\nred<|im_end|>` for it.
 //!
-//! The square is prefilled twice: in one fire, and in three (the text
-//! before, the run alone, the text after), every fire rotating at upstream's
-//! `get_rope_index` positions — the text after a span sits `h·w - max(h, w)`
-//! behind its token row, where the runtime's working set places it by
-//! default.
+//! The square is prefilled in one fire and in three, at upstream's `get_rope_index` positions.
 //!
 //! `PIE_XLA_VISION_DUMP=<dir>` writes the tower's rows and each first-step
 //! logit row as raw f32 for comparing against a reference offline.

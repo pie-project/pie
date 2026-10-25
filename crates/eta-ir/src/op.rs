@@ -60,8 +60,6 @@ declare_intrinsics! {
 }
 
 impl IntrinsicId {
-    /// Whether the intrinsic is one lane's of its pass (`velocity`, `hidden`
-    /// and `pixels` name the lane); the rest are the pass's.
     pub fn per_lane(self) -> bool {
         matches!(
             self,
@@ -70,8 +68,7 @@ impl IntrinsicId {
     }
 }
 
-/// The side-table slots one instance of a stage binds intrinsics at:
-/// [`IntrinsicId::SLOTS`] for each lane up to the highest its `ops` read.
+/// [`IntrinsicId::SLOTS`] slots for each lane up to the highest `ops` read.
 pub fn intrinsic_pitch(ops: &[Op]) -> u32 {
     let lanes = ops
         .iter()
@@ -84,8 +81,6 @@ pub fn intrinsic_pitch(ops: &[Op]) -> u32 {
     IntrinsicId::SLOTS.saturating_mul(lanes)
 }
 
-/// The side-table slot an intrinsic of a pass's lane `lane` is bound at:
-/// [`IntrinsicId::SLOTS`] of them a lane, lane by lane.
 pub const fn intrinsic_slot(intr: IntrinsicId, lane: u32) -> u32 {
     intr as u32 + IntrinsicId::SLOTS * lane
 }
@@ -221,8 +216,7 @@ pub enum Op {
         value: ValueId,
     },
 
-    /// `lane` is the pass's lane a per-lane intrinsic reads
-    /// ([`IntrinsicId::per_lane`]), 0 for the others.
+    /// `lane` is the pass's lane for a per-lane intrinsic, 0 for the others.
     IntrinsicVal {
         intr: IntrinsicId,
         lane: u32,

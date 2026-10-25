@@ -39,8 +39,6 @@ fn dims(deployment: &str) -> Dims {
     }
 }
 
-/// The word of a lane in `reading`, on `stream` where given (its declared
-/// default otherwise).
 fn word(plan: &Trace, reading: &str, stream: Option<&str>) -> u64 {
     let mut request = Request::new(4, false).switched("reading", reading);
     if let Some(stream) = stream {

@@ -211,8 +211,6 @@ def a_prompt_becomes_a_picture(args) -> None:
     assert len(report["sigmas"]) == args.steps + 1 and report["sigmas"][-1] == 0.0, report
     assert report["context_rows"] > 0, "the prompt encoded to no rows"
 
-    # The one exit: the model's `vae.decode` reading, fired in-guest, the
-    # PNG encoded by the runtime under the name the report states.
     png = out_dir / report["file"]
     assert png.exists(), f"the report says it sent {report['file']} and {out_dir} has it not"
     assert not sorted(out_dir.glob("file-*.bin")), (

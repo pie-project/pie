@@ -126,8 +126,7 @@ pub(crate) fn prefill_symbol(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RaggedArm {
     Full,
-    /// A bit a (query, key) pair of each group (`maybe_custom_mask`, from
-    /// byte `maybe_mask_indptr[group]`).
+    /// One bit per (query, key) pair of each group, from byte `maybe_mask_indptr[group]`.
     Custom,
     RelativeBias,
 }

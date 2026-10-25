@@ -13,13 +13,11 @@ pub enum Guests {}
 pub(crate) struct Seat {
     pub seq: u64,
     pub arm: usize,
-    /// Each lane's span of the readout seat.
     pub layout: Vec<ReadSpan>,
     pub seat: Buffer,
     pub mirror: Buffer,
     pub draft: Option<(u32, Buffer)>,
-    /// The fire's pixel plane and each lane's span of it (byte, element
-    /// count), where it wrote one.
+    /// The fire's pixel plane and each lane's (byte, element count) span of it.
     pub pixels: Option<(Buffer, Vec<(u64, u32)>)>,
     pub guests: Option<Guests>,
 }

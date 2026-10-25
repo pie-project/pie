@@ -31,8 +31,7 @@ fn stamp(channels: u32) -> Result<&'static str, Error> {
     }
 }
 
-/// `base`: the row `grid` addresses the rectangles' row 0 at, nonzero in a
-/// window of a segmented fire whose grid holds fire-wide rows.
+/// `base`: the rectangles' row 0 in `grid`'s fire-wide rows.
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
     ctx: &Ctx<'_>,

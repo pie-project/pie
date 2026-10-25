@@ -498,7 +498,6 @@ impl Rig {
         }
     }
 
-    /// The id of the plan's guest input `name`.
     pub fn input(&self, name: &str) -> u32 {
         let id = self
             .inputs
@@ -517,7 +516,6 @@ impl Rig {
         id
     }
 
-    /// How wide a row the loaded classes read out of `kind`, if one does.
     pub fn reads_out(&self, kind: poem_ir::ReadoutKind) -> Option<u32> {
         self.loaded
             .caps
@@ -626,9 +624,7 @@ impl Rig {
     }
 }
 
-/// A lane feeding every input the plan reads off its handles: the row
-/// inputs (`latents`, `context`) off the latent cell, `timestep` and
-/// `positions` off their own.
+/// A lane feeding the row inputs off the latent cell, `timestep` and `positions` off their own.
 pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, stream: &str, group: u32) -> Lane {
     Lane {
         slot,

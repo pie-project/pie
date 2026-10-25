@@ -59,8 +59,7 @@ pub mod model {
         run_ahead_window, schedule, submit_deadline_us, switches,
     };
 
-    /// What a lane of these switches binds: `lane` over `(name, value)`
-    /// pairs.
+    /// What a lane under these `(name, value)` switches binds.
     pub fn lane_of(switches: &[(&str, &str)]) -> Result<LaneDecl, String> {
         let pairs: Vec<(String, String)> = switches
             .iter()

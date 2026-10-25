@@ -18,7 +18,6 @@ fn channel(shape: Shape, dtype: Dtype, role: HostRole, seeded: bool) -> ChannelD
     }
 }
 
-/// A lane reading `vocab`-wide logits, on a two-layer model.
 fn served(c: TraceContainer, vocab: u32) -> BoundTrace {
     bind(
         c,

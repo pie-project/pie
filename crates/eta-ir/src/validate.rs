@@ -35,7 +35,6 @@ pub enum ChannelClass {
 #[derive(Clone, Debug)]
 pub struct BoundTrace {
     pub container: TraceContainer,
-    /// What each lane of the pass reads out.
     pub lanes: Vec<Option<Readout>>,
     pub graph: Graph,
     pub hash: u64,
@@ -239,9 +238,7 @@ pub(crate) fn channel_value_type(decl: &ChannelDecl) -> ValueType {
     ValueType::new(decl.shape, decl.dtype.program_dtype())
 }
 
-/// Validates `container` as the program of a pass whose lanes read out
-/// `lanes` (one entry a lane, in lane order), on a model of `graph`, served
-/// by an engine of `caps`.
+/// `lanes` holds one entry a lane, in lane order.
 pub fn bind(
     container: TraceContainer,
     lanes: Vec<Option<Readout>>,
@@ -388,9 +385,7 @@ fn check_bodies(
     Ok(stage_types)
 }
 
-/// Checks every intrinsic `container` reads against what the lanes of its pass
-/// read out and what the model exports: a cached program bound for one pass is
-/// checked again for the next.
+/// Rechecked per pass: a cached program bound for one pass may not fit the next.
 pub fn check_intrinsics(
     container: &TraceContainer,
     lanes: &[Option<Readout>],
@@ -436,8 +431,7 @@ pub fn check_intrinsics(
     Ok(())
 }
 
-/// The width a row of `intr` is, `Some(None)` where any is, or `None` when
-/// the pass reads no such thing: `read` is what its lane reads out.
+/// `Some(None)` where any width goes; `None` when the pass reads no such thing.
 fn intrinsic_width(
     intr: IntrinsicId,
     read: Option<Readout>,
@@ -460,8 +454,6 @@ fn intrinsic_width(
     }
 }
 
-/// How wide a logits row of the pass is: the width its lanes reading logits
-/// read out.
 fn logits_width(lanes: &[Option<Readout>]) -> Option<u32> {
     lanes
         .iter()

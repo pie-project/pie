@@ -11,7 +11,6 @@ fn grid_of(op: &'static str, columns: u32, rows: u32) -> Result<Grid, Error> {
     Ok(Grid::of([columns, rows, 1], [256.min(columns), 1, 1]))
 }
 
-/// `bases` as [`pixel_shuffle`]'s.
 #[allow(clippy::too_many_arguments)]
 pub fn upsample_nearest(
     ctx: &Ctx<'_>,
@@ -57,9 +56,8 @@ pub fn upsample_nearest(
     )
 }
 
-/// `bases`: the rows `grid` and `o_grid` address `x`'s and `y`'s row 0 at
-/// (`[x, y]`), nonzero in a window of a segmented fire whose grids hold
-/// fire-wide rows.
+/// `bases` (`[x, y]`): `x`'s and `y`'s row 0 in the grids' fire-wide rows, nonzero in a
+/// segmented fire's window.
 #[allow(clippy::too_many_arguments)]
 pub fn pixel_shuffle(
     ctx: &Ctx<'_>,
@@ -112,7 +110,6 @@ pub fn pixel_shuffle(
     )
 }
 
-/// `bases` as [`pixel_shuffle`]'s.
 #[allow(clippy::too_many_arguments)]
 pub fn pixel_unshuffle(
     ctx: &Ctx<'_>,
@@ -163,7 +160,6 @@ pub fn pixel_unshuffle(
     )
 }
 
-/// `bases` as [`pixel_shuffle`]'s.
 #[allow(clippy::too_many_arguments)]
 pub fn avg_down(
     ctx: &Ctx<'_>,
@@ -280,8 +276,7 @@ pub fn cache_gather(
     )
 }
 
-/// `x_base`: the row `grid` addresses `x`'s row 0 at, nonzero in a window of
-/// a segmented fire whose grid holds fire-wide rows.
+/// `x_base`: `x`'s row 0 in `grid`'s fire-wide rows, nonzero in a segmented fire's window.
 #[allow(clippy::too_many_arguments)]
 pub fn cache_store(
     ctx: &Ctx<'_>,

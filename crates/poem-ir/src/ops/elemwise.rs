@@ -494,7 +494,6 @@ pub struct GateHeads {
 pub enum BinaryOp {
     Add,
     Mul,
-    /// `x / y`.
     Div,
     /// `x - y·floor(x / y)`: floored, the sign of `y`, as Python's `%`.
     Mod,

@@ -1153,8 +1153,7 @@ fn ragged_answers_every_mask_form() {
     let class_keeps = |r: usize, j: usize| {
         q_cls[r] < 0 || kv_cls[j] < 0 || table[(q_cls[r] * 2 + kv_cls[j]) as usize] != 0
     };
-    // The classes' rule as a custom mask: each segment's bits, query-major,
-    // from a byte of its own.
+    // The classes' rule as a custom mask, each segment's bits from a byte of its own.
     let (mut bits, mut starts) = (Vec::<u8>::new(), Vec::<i32>::new());
     for s in 0..3 {
         starts.push(bits.len() as i32);

@@ -1,6 +1,4 @@
-//! A buffer a lane may not carry is read only on rows a runtime switch says
-//! carry it: an inferlet sets a model's own switch, so a branch on one alone
-//! says nothing about which lanes hold adapter routes or a mask.
+//! A buffer a lane may not carry is read only on rows a runtime switch says carry it.
 
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, Value, Weight, fact, ops, switch,

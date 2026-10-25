@@ -12,9 +12,8 @@ use crate::tensor::Tensor;
 const RESAMPLE: &str = "conv/resample.slang";
 
 /// Fire `entry` over `y`'s rows, a pair of its columns a lane; `scalars`
-/// follow the four planes, the row count and span after them, then `bases`:
-/// the rows `grid` and `o_grid` address `x`'s and `y`'s row 0 at, nonzero in
-/// a window of a segmented fire whose grids hold fire-wide rows.
+/// follow the four planes, the row count and span after them, then `bases`: `x`'s and
+/// `y`'s row 0 in the grids' fire-wide rows, nonzero in a segmented fire's window.
 fn fire(
     ctx: &Ctx<'_>,
     op: &'static str,
@@ -41,8 +40,7 @@ fn fire(
 }
 
 /// Nearest upsampling by `factor` in `(t, h, w)`; with
-/// `keep_first_frame`, the first frame is not repeated. `bases`: see
-/// [`fire`].
+/// `keep_first_frame`, the first frame is not repeated.
 #[allow(clippy::too_many_arguments)]
 pub fn upsample_nearest(
     ctx: &Ctx<'_>,
@@ -87,7 +85,7 @@ pub fn upsample_nearest(
 }
 
 /// Channel blocks of `r[0] r[1] r[2]` spread into time and space, the
-/// first `trim_t` frames dropped. `bases`: see [`fire`].
+/// first `trim_t` frames dropped.
 #[allow(clippy::too_many_arguments)]
 pub fn pixel_shuffle(
     ctx: &Ctx<'_>,
@@ -137,8 +135,6 @@ pub fn pixel_shuffle(
     )
 }
 
-/// Time and space folded into channel blocks of `r[0] r[1] r[2]`; `bases`
-/// as [`pixel_shuffle`]'s.
 pub fn pixel_unshuffle(
     ctx: &Ctx<'_>,
     x: Tensor,
@@ -187,7 +183,7 @@ pub fn pixel_unshuffle(
 
 /// The unshuffle by `factor`, each output channel the mean of a run of
 /// `group` unshuffled ones; time is front-padded to a multiple of
-/// `factor[0]`. `bases`: see [`fire`].
+/// `factor[0]`.
 #[allow(clippy::too_many_arguments)]
 pub fn avg_down(
     ctx: &Ctx<'_>,

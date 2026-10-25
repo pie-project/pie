@@ -450,9 +450,7 @@ def read(m, reads, prefix):
     if m.vae != None:
         vae_read(reads, m.vae, 2 * m.vae.encoder.conv_out.c_out)
 
-# The checkpoint orders a patch's features `(ph, pw, c)`; the graph's
-# `conv.patchify` packs `(c, ph, pw)`. Feature `f` of the graph's is the
-# checkpoint's `PATCH_ORDER[f]`.
+# The checkpoint orders patch features `(ph, pw, c)`; `conv.patchify` packs `(c, ph, pw)`.
 PATCH_ORDER = [(ph * PATCH + pw) * CHANNELS + c for c in range(CHANNELS) for ph in range(PATCH) for pw in range(PATCH)]
 
 def raw_of(w, name, what):
@@ -681,35 +679,24 @@ def forward(m, inputs):
 PATCH_BOX = [1, PATCH, PATCH]
 
 def turn_positions(arm, computed):
-    """`computed` on the lanes whose `positions` switch says `computed`, the
-    guest's `positions` on those it says `given`."""
     given = switch_is("positions", "given")
     return merge([arm.on(given).input("positions", dtype.f32, "row", ROPE_AXES), computed.on(~given)])
 
 def cells(arm, dit):
-    """Each row's cell offset by the origin, `(1 + t, h, w)` on a patch
-    and `(1 + j, 0, 0)` on any other row (`j` its row in the lane), and its
-    clip's size `(t, h, w)`, zeros off every clip."""
+    """`(1 + t, h, w)` on a patch, `(1 + j, 0, 0)` on any other row; size zeros off every clip."""
     cell, size = ops.gather.split_rows(ops.conv.cells(arm.token_grid(PATCH_BOX), arm.positions(), 0), ROPE_AXES)
     return ops.elemwise.add_bias(dit.origin, cell), size
 
 def caption_positions(arm, dit):
-    """A caption row's `(1 + j, 0, 0)`, `j` its row in the lane."""
     return cells(arm, dit)[0]
 
-# The reference pads a caption and an image each to a multiple of 32 rows:
-# a pad row is the learned `cap_pad_token` or `x_pad_token`, at `(0, 0,
-# 0)`, and attends and is attended like any other; the image follows the
-# padded caption. The guest pads the caption (and so the context the
-# refine reads out) with zero rows and states its own rows as the lane's
-# `length`; an image lane's token rows are its patches, then the pad rows
-# the runtime rounds them up to, which read as no clip's.
+# The reference pads caption and image to 32 rows with learned pad tokens at
+# `(0, 0, 0)` that attend like any row; the guest states its own rows as `length`.
 CAPTION_ROWS = multiple_of(32)
 IMAGE_ROWS = multiple_of(32)
 
 def padded_caption(arm, dit):
-    """The caption lane's positions, a pad row's `(0, 0, 0)`, and each
-    row's pad flag `[rows, 1]` f32: 1 past the lane's `length` own rows."""
+    """The caption positions and each row's pad flag: 1 past the lane's `length`."""
     t, hw = ops.gather.split_rows(caption_positions(arm, dit), 1)
     length = ops.gather.gather_rows(arm.input("length", dtype.f32, "lane", 1), arm.request_of_token())
     pad = ops.elemwise.clamp(ops.elemwise.add(t, ops.elemwise.mul_scalar(-1.0, length)), 0.0, 1.0)
@@ -765,10 +752,7 @@ def denoise(arm, m):
 
     lanes = arm.request_of_token()
 
-    # A caption row `(1 + j, 0, 0)`, a pad row `(0, 0, 0)`; an image row
-    # `(1 + T, h, w)`, its patch following the T (padded) rows of its
-    # group's context lane, a pad row (past its patches, of no clip, so a
-    # size of zeros) `(0, 0, 0)`.
+    # An image row sits at `(1 + T, h, w)` after its group's T padded caption rows.
     cell, size = cells(img, dit)
     frames, _ = ops.gather.split_rows(size, 1)
     x_pad = ops.elemwise.clamp(ops.elemwise.add_bias(dit.one, ops.elemwise.mul_scalar(-1.0, frames)), 0.0, 1.0)

@@ -401,7 +401,6 @@ impl Rig {
         }
     }
 
-    /// The id of the plan's guest input `name`.
     #[must_use]
     pub fn input(&self, name: &str) -> u32 {
         let id = self
@@ -472,7 +471,6 @@ impl Rig {
         }
     }
 
-    /// How wide a row the loaded classes read out of `kind`, if one does.
     pub fn reads_out(&self, kind: poem_ir::ReadoutKind) -> Option<u32> {
         self.loaded
             .caps

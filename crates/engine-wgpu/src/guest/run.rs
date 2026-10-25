@@ -17,8 +17,7 @@ pub struct Readout<'a> {
 
     pub width: u32,
 
-    /// Whether the seat holds f32 values (copied in as they are) rather than
-    /// bf16 (widened).
+    /// f32 values copied as they are, else bf16 widened.
     pub f32: bool,
 }
 
@@ -27,9 +26,7 @@ pub struct OnDevice<'a> {
     session: &'a mut Session,
     widen: &'a Widen,
     logits: Option<Readout<'a>>,
-    /// Each lane of the pass's own readout rows (`velocity(k)`, `hidden(k)`).
     lanes: Vec<Option<Readout<'a>>>,
-    /// Each lane of the pass's pixels (`pixels(k)`), lane `k` at `k`.
     pixels: Vec<Option<Readout<'a>>>,
 
     ran: Vec<usize>,

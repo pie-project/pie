@@ -466,8 +466,7 @@ impl Input {
             .refined(self.over.clone())
     }
 
-    /// The input `name` the guest binds, `width` values of `dtype` per `axis`
-    /// entry; one name is one input wherever it is read.
+    /// The guest input `name`; one name is one input wherever it is read.
     #[must_use]
     pub fn input(
         &self,
@@ -487,7 +486,6 @@ impl Input {
             .refined(self.over.clone())
     }
 
-    /// The clips' token grid at patch `p`, as [`RuntimeInput::TokenGrid`].
     #[must_use]
     pub fn token_grid(&self, p: [u32; 3]) -> Value {
         assert!(p.iter().all(|&n| n > 0), "a patch of {p:?} is empty");

@@ -90,8 +90,7 @@ fn each_may_write_the_rectangle_it_read() {
     }
 }
 
-/// Position arithmetic: f32 quotients, floored moduli (negative operands
-/// too) and square roots.
+/// Position arithmetic: f32 quotients, floored moduli and square roots.
 fn div_mod_and_sqrt_answer_the_reference_in_f32() {
     let x: Vec<f32> = (0..N).map(|i| i as f32 * 0.75 - 200.0).collect();
     let y: Vec<f32> = (0..N)

@@ -20,7 +20,6 @@ pub(super) const PROLOGUE: &str = include_str!("../../../runtime/cuda/fused_bloc
 pub(super) const SIGNATURE: &str = include_str!("../../../runtime/cuda/fused_block1.cuh");
 pub(super) const PREAMBLE: &str = include_str!("../../../runtime/cuda/fused_block2.cuh");
 
-/// The side-table slots a dispatch lane's intrinsics stand at in `stage`.
 pub(crate) fn intrinsic_pitch(stage: &CompiledStage) -> u32 {
     eta_ir::op::intrinsic_pitch(&stage.normalized.ops)
 }

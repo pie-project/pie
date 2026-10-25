@@ -60,8 +60,7 @@ template <typename T>
 instantiate_select_slice(bfloat16, bfloat)
 instantiate_select_slice(float32, float)
 
-// One input of a side-by-side concatenation: `x`'s `width` columns land at
-// column `offset` of `y`'s `stride`-wide rows.
+// `x`'s `width` columns land at column `offset` of `y`'s `stride`-wide rows.
 template <typename T>
 [[kernel]] void place_cols(
     const device T* x          [[buffer(0)]],

@@ -1,14 +1,8 @@
 #include "prim/clip.slang"
 #include "prim/params.slang"
 
-// Positions from the clip and group tables, a thread a row. `PIE_CELLS`:
-// each token row's cell, `width` f32: a row of a clip of `tgrid` its
-// patch's (t, h, w) there and the clip's size in the last three columns,
-// any other row positions[row] in column `axis`, zeros elsewhere.
-// `PIE_GROUP_ROWS`: each row's count of the rows `csr` packs in its lane's
-// group, one f32. `PIE_GROUP_FIRST`: each row's peer value, `width` f32:
-// packed row csr[g] of `x` for its lane's group `g`, zeros where the group
-// packs none.
+// `PIE_CELLS`: a row of a `tgrid` clip gets its patch's (t, h, w) and the clip's size in the
+// last three columns, any other row positions[row] in column `axis`.
 
 #if defined(PIE_CELLS)
 [[vk::binding(0)]] StructuredBuffer<int> tgrid;
@@ -20,9 +14,7 @@ struct Params {
     uint axis;
     uint width;
     uint rows;
-    // The row `tgrid` addresses `y`'s row 0 at: a window of a segmented
-    // fire starts `y` at its own rows while the fire's grid holds fire-wide
-    // ones.
+    // `y`'s row 0 in `tgrid`'s fire-wide rows: a segmented fire's window starts later.
     uint base;
 };
 PIE_PARAMS(3, Params, params);

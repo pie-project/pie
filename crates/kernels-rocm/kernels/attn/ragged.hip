@@ -20,8 +20,7 @@ constexpr int RAGGED_FULL = 0;
 constexpr int RAGGED_CUSTOM = 1;   // keep bit qo·kv_len + kv of group g's bits, from byte indptr[g]
 constexpr int RAGGED_BIAS = 2;     // logit · scale + bias[head][clamp(kv − qo + max_len − 1)]
 
-// The arm's operands; an arm reads only its own. `bits` is the custom mask,
-// group g's from byte `mask_indptr[g]`.
+// An arm reads only its own operands; group g's `bits` start at byte `mask_indptr[g]`.
 struct RaggedMaskArgs {
     const unsigned char* bits;
     const i32* mask_indptr;

@@ -6,7 +6,7 @@
 //! # One whole denoise step, in three fires
 //!
 //! A denoise step of this family is THREE fires (the conv image head cannot
-//! share the trunk's plan unit; see `models/hunyuan_image_3.poem`), and this program runs all three end to end —
+//! share the trunk's plan unit), and this program runs all three end to end —
 //! each one fed pie's OWN answer to the one before, so the velocity it
 //! lands is the step:
 //!
@@ -71,8 +71,8 @@
 //! every other row takes its `latents` row.
 //!
 //! The mask is the reference's generalized causal attention, built here as
-//! the dense `[rows, keys]` bool rectangle `pass.mask` takes: an image row sees every key of `[prefix | <timestep> | canvas]`,
-//! the `<timestep>` row sees the prefix and itself. Nothing past the canvas
+//! the dense `[rows, keys]` bool rectangle `pass.mask` takes: an image row
+//! sees every key of `[prefix | <timestep> | canvas]`, the `<timestep>` row sees the prefix and itself. Nothing past the canvas
 //! is in the KV at all, so the reference's trailing `<eoi>` needs no
 //! masking off.
 
@@ -171,7 +171,6 @@ struct Output {
     latent_channels: u32,
 }
 
-/// How wide a row the lane of `reading` reads out.
 fn readout_width(reading: &str) -> Result<u32> {
     model::lane_of(&[("reading", reading)])?
         .readout
@@ -179,7 +178,6 @@ fn readout_width(reading: &str) -> Result<u32> {
         .ok_or_else(|| format!("reading `{reading}` reads nothing out"))
 }
 
-/// The lane of `reading`, checked to read exactly `binds`.
 fn lane_reading(reading: &str, binds: &[&str]) -> Result<model::LaneDecl> {
     let lane = model::lane_of(&[("reading", reading)])?;
     let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
@@ -194,7 +192,6 @@ fn lane_reading(reading: &str, binds: &[&str]) -> Result<model::LaneDecl> {
     Ok(lane)
 }
 
-/// The one input a voxel arm's lane reads: the clip, on the voxel axis.
 fn voxel_input(arm: &str) -> Result<String> {
     let lane = model::lane_of(&[("reading", arm)])?;
     match &lane.inputs[..] {

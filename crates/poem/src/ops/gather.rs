@@ -150,9 +150,7 @@ pub fn split_rows(x: &Value, width: u32) -> (Value, Value) {
     (left, right)
 }
 
-/// The rows of `x` at `rows`, one a row of `rows` (a readout's row, or a
-/// token's lane, say); a value of one axis (a row's token) gathers to one
-/// axis too.
+/// The rows of `x` at `rows`; a one-axis `rows` (a row's token) gathers to one axis.
 pub fn gather_rows(x: &Value, rows: &Value) -> Value {
     let r = x.rec();
     let y = r.fresh(match x.ty() {
@@ -173,8 +171,7 @@ pub fn gather_rows(x: &Value, rows: &Value) -> Value {
     y
 }
 
-/// Each of `lanes`' rows' count of the rows `csr` (a `group_indptr`) packs
-/// in its lane's group (`groups`, the `group_of_lane`), `[rows, 1]` f32.
+/// Per row of `lanes`, how many rows `csr` packs in its lane's group, `[rows, 1]` f32.
 pub fn group_rows(csr: &Value, groups: &Value, lanes: &Value) -> Value {
     for (what, v, rows) in [
         ("csr", csr, Dim::LanesPlus(1)),
@@ -200,16 +197,14 @@ pub fn group_rows(csr: &Value, groups: &Value, lanes: &Value) -> Value {
             lanes: lanes.id(),
             y: y.id(),
         },
-        // The indptr is a fire-wide table of its selection's groups: the
-        // count lands on `lanes`' rows, whichever selection it counts.
+        // The indptr is fire-wide: the count lands on `lanes`' rows.
         &[groups, lanes],
     );
     y
 }
 
-/// Each of `lanes`' rows' peer value: the first row of `x` (packed by the
-/// `row_permutation` of the selection whose `group_indptr` is `csr`) in its
-/// lane's group, `[rows, x.width]` f32, zeros where the group packs none.
+/// Per row of `lanes`, the first row of `x` packed in its lane's group, `[rows, x.width]` f32;
+/// zeros where the group packs none.
 pub fn group_first(x: &Value, csr: &Value, groups: &Value, lanes: &Value) -> Value {
     for (what, v, rows) in [
         ("csr", csr, Dim::LanesPlus(1)),
@@ -241,8 +236,7 @@ pub fn group_first(x: &Value, csr: &Value, groups: &Value, lanes: &Value) -> Val
             lanes: lanes.id(),
             y: y.id(),
         },
-        // The packed rows and the indptr are fire-wide tables of their
-        // selection's groups: the value lands on `lanes`' rows.
+        // Fire-wide tables: the value lands on `lanes`' rows.
         &[groups, lanes],
     );
     y

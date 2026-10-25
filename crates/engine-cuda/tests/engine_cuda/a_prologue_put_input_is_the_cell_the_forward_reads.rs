@@ -16,10 +16,7 @@ fn latent() -> Vec<f32> {
         .collect()
 }
 
-/// A program whose prologue puts the latent into a device-only input the
-/// host never writes, and whose epilogue takes it back and lands the
-/// velocity the forward read over it; the timestep and positions are host
-/// inputs it never touches.
+/// A prologue putting the latent into a device-only input its epilogue takes back.
 fn noising_prologue() -> TraceContainer {
     let decl = |shape: Shape, host_role: HostRole| ChannelDecl {
         shape,
@@ -103,11 +100,7 @@ fn the_forward_reads_the_latent_its_prologue_put() {
         vec![latent_cell, timestep, position_cell, landed],
         ROWS,
     );
-    // Three fires on a ring of two: each prologue finds the latent its
-    // fire's epilogue took, so none blocks; each epilogue reads the
-    // velocity of the forward that read its own prologue's put.
-    // The timestep and positions are read and never taken: one cell each
-    // serves every fire.
+    // Three fires on a ring of two: none blocks, each epilogue reads its own prologue's put.
     rig.publish(noised, 1, &[0.7]);
     rig.publish(noised, 2, &positions);
     let mut fires = Vec::new();

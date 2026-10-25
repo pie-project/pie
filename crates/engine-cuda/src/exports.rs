@@ -246,7 +246,6 @@ pub(crate) fn masked_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir
     })
 }
 
-/// The classes attending both ways: running a prefill that is not causal.
 #[must_use]
 pub(crate) fn wide_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::ClassSet {
     classes_running(trace, compiled, |op| {
@@ -257,9 +256,8 @@ pub(crate) fn wide_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir::
     })
 }
 
-/// A class's mask bits are staged once per lane, with causality baked in, and
-/// a wide class stages them unclipped: a causal masked prefill in a wide
-/// class would see future keys. Refuse a class that runs both.
+/// Mask bits are staged once per lane with causality baked in, unclipped in a wide
+/// class: a causal masked prefill there would see future keys.
 pub(crate) fn one_direction_per_mask(trace: &Trace, compiled: &CompiledModel) -> Result<()> {
     let causal_masked = classes_running(trace, compiled, |op| {
         matches!(
@@ -304,8 +302,7 @@ pub(crate) fn media_classes(trace: &Trace, compiled: &CompiledModel) -> poem_ir:
     })
 }
 
-/// Each class's requests, the plainest first: every request a lane can be
-/// stamped with, by the class its word lands in.
+/// Each class's requests, the plainest first.
 #[must_use]
 pub(crate) fn landing_requests(
     facts: &poem_ir::Facts,
@@ -567,7 +564,6 @@ pub(crate) fn regions_launching_schedules(
 mod tests {
     use super::*;
 
-    /// A masked layer turned non-causal puts both directions under one class's mask.
     #[test]
     fn a_class_attending_both_ways_under_one_mask_is_refused() {
         let mut trace = poem_compiler::catalog::deployment("qwen35-d9b-dflash-u4g64-kv-bf16")

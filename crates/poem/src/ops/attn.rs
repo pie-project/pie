@@ -155,10 +155,8 @@ pub fn decode(
     (o, lse)
 }
 
-/// Each row's query against its lane's paged keys: causally where `causal`,
-/// else every key the lane holds; given `mask`, only the keys the mask lets
-/// it. `floor`, each row's least window position, below which the window
-/// reads no key. A selection, a relative bias and `lse` as [`decode`]'s.
+/// Each row's query against its lane's paged keys, causal where `causal`, masked by `mask`; no
+/// key below `floor`. A selection, a relative bias and `lse` as [`decode`]'s.
 #[allow(clippy::too_many_arguments)]
 pub fn prefill(
     q: &Value,

@@ -28,9 +28,7 @@ struct Params {
     float sm_scale;
     uint rows;
     uint row_span;
-    // The row `grid` addresses the rectangles' row 0 at: a window of a
-    // segmented fire starts them at its own rows while the fire's grid holds
-    // fire-wide ones.
+    // The rectangles' row 0 in `grid`'s fire-wide rows (a segmented fire's window starts later).
     int base;
 };
 PIE_PARAMS(5, Params, params);

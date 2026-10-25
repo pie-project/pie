@@ -66,9 +66,7 @@ pub enum Attn {
         #[output(F32)]
         lse: Option<ValueId>,
     },
-    /// Each row's query against its lane's paged keys: causally where
-    /// `causal`, else every key the lane holds; given `mask`, only the keys
-    /// the mask lets it. A
+    /// Each row's query against its lane's paged keys, causal where `causal`, masked by `mask`. A
     /// selection, a relative bias and `lse` as [`Attn::Decode`]'s; `floor`,
     /// each row's least window position (i32 a row, from
     /// `attn.replay_floor`), below which the window reads no key.

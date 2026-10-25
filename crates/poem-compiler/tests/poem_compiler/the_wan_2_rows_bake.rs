@@ -48,13 +48,10 @@ fn is_flagship(deployment: &str) -> bool {
     deployment == TI2V
 }
 
-/// The word of a lane in `reading`, on `stream` where given (its declared
-/// default otherwise).
 fn word(plan: &Trace, reading: &str, stream: Option<&str>) -> u64 {
     fresh_word(plan, reading, stream, false)
 }
 
-/// A lane's word, its state empty or not.
 fn fresh_word(plan: &Trace, reading: &str, stream: Option<&str>, fresh: bool) -> u64 {
     let mut request = Request::new(4, false)
         .starting(fresh)

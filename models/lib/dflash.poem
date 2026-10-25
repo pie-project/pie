@@ -216,7 +216,6 @@ def caches(d, c, space):
         c.kv(space, a.kv, [plane, plane], a.head_dim, heads = True)
 
 def block_rows(d):
-    """The rows of a drafted block."""
     return switch_is("block_draft", "on")
 
 def tap(d, layer, y, fused):

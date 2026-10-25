@@ -267,8 +267,7 @@ impl Session {
         Ok(())
     }
 
-    /// Runs the stages at `at` ([`ExecPlan::runs_at`]) to their commit:
-    /// the prologue's before the forward, the rest after it.
+    /// Runs the stages at `at` to their commit: the prologue's before the forward, the rest after.
     pub fn fire(
         &mut self,
         device: &Context,
@@ -308,7 +307,6 @@ impl Session {
         self.verdict(plan, &launched, at)
     }
 
-    /// Encodes the stages after the forward into `frame`.
     pub fn stage_into(
         &mut self,
         frame: &Frame,
@@ -418,8 +416,7 @@ impl Session {
         Ok(None)
     }
 
-    /// Refuses a pass whose epilogue reads an intrinsic no buffer is bound
-    /// to: the emitted kernel reads the argument slot regardless.
+    /// The emitted kernel reads an intrinsic's argument slot regardless: refuse one left unbound.
     fn intrinsics_bound(&self, plan: &ExecPlan) -> Result<()> {
         let readout_bound = [
             IntrinsicId::Logits,
@@ -467,7 +464,6 @@ impl Session {
         Ok(())
     }
 
-    /// The first channel not as the stages at `at` need it.
     fn blocked_at(&self, plan: &ExecPlan, at: Stage) -> Option<u32> {
         (0..self.shapes.len()).find_map(|channel| {
             let live = self.depth(channel as u32);

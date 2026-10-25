@@ -113,11 +113,8 @@ pub struct FireBindings {
 
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
-    /// The custom mask each group-packed `attention.ragged` applies, by its
-    /// query and key packings, when a lane stated one.
     pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
 
-    /// Each staged guest input's rectangle, by id.
     pub inputs: Vec<(u32, Tensor)>,
 
     pub voxels: Option<crate::inputs::VoxelHandles>,
@@ -1279,9 +1276,6 @@ impl<'c> Run<'c> {
         self.whole(id)
     }
 
-    /// The custom mask a group-packed attention with query and key CSRs
-    /// `q_indptr` and `kv_indptr` applies, when a lane of the fire stated
-    /// one.
     pub(crate) fn group_mask(
         &self,
         q_indptr: ValueId,
@@ -1481,8 +1475,7 @@ impl<'c> Run<'c> {
         ) && self.arena.0.get(id.0 as usize).copied().flatten().is_some()
     }
 
-    /// The fire's clip slot table cut to this window's clips, indexed as the
-    /// window's grids index their lanes.
+    /// The fire's clip slots cut to this window's clips, indexed as its grids index lanes.
     pub(crate) fn clip_slots(&self) -> Option<Tensor> {
         let slots = self.fire.voxels.map(|voxels| voxels.slots)?;
         let seated = self.window();
@@ -1492,8 +1485,7 @@ impl<'c> Run<'c> {
         Some(self.slice(slots, seated.voxel.lane_offset, seated.voxel.lanes))
     }
 
-    /// `mask`'s bits, or the fire's where a prefill that is not causal states
-    /// none (its lanes' classes stage every key they hold).
+    /// `mask`'s bits, else the fire's for a non-causal prefill (its classes stage every key).
     pub(crate) fn mask_bits(&self, mask: Option<ValueId>) -> Tensor {
         mask.map_or(self.fire.tables.mask, |mask| self.tensor(mask))
     }
@@ -1502,10 +1494,8 @@ impl<'c> Run<'c> {
         self.cut(id, self.whole(id))
     }
 
-    /// The row `grid` addresses `rows`' row 0 at: the fire's clip and token
-    /// grids hold fire-wide rows, so the window's first row on `rows`' axis
-    /// (as [`Self::cut`] cuts it); a grid an op derived counts from the
-    /// window's first clip, so 0.
+    /// The row `grid` addresses `rows`' row 0 at: the fire's grids hold fire-wide rows, so the
+    /// window's first row; a grid an op derived counts from the window's first clip, so 0.
     pub(crate) fn grid_base(&self, grid: ValueId, rows: ValueId) -> u32 {
         let seated = self.window();
         if seated.gathered.is_some()

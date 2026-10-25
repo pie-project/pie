@@ -1,26 +1,8 @@
-//! The pie half of the FLUX.2 miniature golden. Hands the `flux2-mini` row
-//! what `scripts/imagegen/flux2_golden.py --mini` handed diffusers'
-//! `Flux2Transformer2DModel` — the target latent, the references' latents,
-//! the raw `[32, 192]` text stack, the timestep and the guidance scale — and
-//! reads back the velocity the head predicts on the target rows, as JSON
-//! `scripts/imagegen/flux2_parity.py` turns into an `.npz` under the
-//! golden's own key names.
+//! The pie half of the FLUX.2 miniature golden: `scripts/imagegen/flux2_golden.py --mini`'s
+//! inputs in, the target's velocity out as JSON for `flux2_parity.py`.
 //!
-//! # THE LANES, ONE GROUP, ONE PASS
-//!
-//! `flux_2`'s `denoise` reading runs on three values of its `stream` switch:
-//! the text lane (`text`, the `context` input), the target lane (`image`,
-//! the `latents` input) and one reference lane per reference picture
-//! (`reference`, the same `latents` input plus its `reference` ordinal `k`).
-//! Every latent is the VAE's own `[h, w, C]` on the voxel axis: the model
-//! patchifies it and computes every row's rotary position (a reference's at
-//! `T = 10·(k+1)`) in its graph. One step is one pass — lane 0 the text,
-//! lane 1 the target, lanes 2.. the references — all in one group, which
-//! packs them `[txt ‖ target ‖ refs]`, the reference's own layout. Every
-//! lane binds the one timestep (and guidance) channel. Neither `state` nor
-//! `embed` is called: a denoise reading declares no kv space and no tokens.
-//!
-//! Only the target lane reads out, on the voxel axis.
+//! One pass, one group, packed `[txt ‖ target ‖ refs]` as the reference packs:
+//! lane 0 the text, lane 1 the target (the only readout), lanes 2.. the references.
 //!
 //! One step only: the miniature golden is one transformer call at
 //! `timestep = 0.5`, not a trajectory.
@@ -51,7 +33,7 @@ struct Input {
     case_7: Option<String>,
 }
 
-/// A latent the VAE's own way: `[height, width, channels]`, flattened.
+/// `[height, width, channels]`, flattened.
 #[derive(Deserialize)]
 struct Latent {
     latents: Vec<f32>,
@@ -59,9 +41,6 @@ struct Latent {
     width: u32,
 }
 
-/// One batch element of the reference's fixed inputs: the target latent,
-/// the reference latents, the text stack, the timestep as the scheduler
-/// holds it (`σ·1000`) and the raw guidance scale.
 #[derive(Deserialize)]
 struct Case {
     target: Latent,
@@ -74,27 +53,24 @@ struct Case {
     context_width: u32,
     /// `σ · 1000`.
     timestep: f32,
-    /// The raw guidance scale; bound only where the model reads `guidance`.
     #[serde(default)]
     guidance: f32,
 }
 
 #[derive(Serialize)]
 struct Output {
-    /// `[height · width, channels]`: the target's velocity on the voxel axis.
+    /// `[height · width, channels]`.
     velocity: Vec<f32>,
     height: u32,
     width: u32,
     channels: u32,
 }
 
-/// Whether the lanes read `guidance`, and the velocity width.
 struct Dims {
     guidance: bool,
     velocity_width: u32,
 }
 
-/// The lane `stream` of `reading`, checked to read exactly `binds`.
 fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::LaneDecl> {
     let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
     if lane.state || lane.embeds {
@@ -143,7 +119,6 @@ fn dims(reading: &str, references: bool) -> Result<Dims> {
     })
 }
 
-/// Binds the pass's one timestep (and guidance) channel on `lane`.
 fn scalars(pass: &ForwardPass, lane: u32, t: &Channel, g: Option<&Channel>) -> Result<()> {
     pass.input(lane, "timestep", t)?;
     if let Some(g) = g {
@@ -152,7 +127,6 @@ fn scalars(pass: &ForwardPass, lane: u32, t: &Channel, g: Option<&Channel>) -> R
     Ok(())
 }
 
-/// A latent's channel, `[height, width, channels]`.
 fn latent(at: &Latent, channels: u32, name: &str) -> Result<Channel> {
     let want = (at.height * at.width * channels) as usize;
     if at.latents.len() != want {
@@ -166,7 +140,6 @@ fn latent(at: &Latent, channels: u32, name: &str) -> Result<Channel> {
     Ok(Channel::from_shaped([at.height, at.width, channels], at.latents.as_slice()).named(name))
 }
 
-/// One denoise step: every lane in one group of one pass, one velocity.
 async fn step(case: &Case, dims: &Dims, reading: &str, pipe: &Pipeline) -> Result<Vec<f32>> {
     let group = 0;
     let pass = ForwardPass::new();
@@ -175,8 +148,7 @@ async fn step(case: &Case, dims: &Dims, reading: &str, pipe: &Pipeline) -> Resul
         .guidance
         .then(|| Channel::from([case.guidance]).named("g"));
 
-    // Lane 0, the text lane: the raw `[L, joint_attention_dim]` stack,
-    // embedded by the plan (the miniature has no encoder).
+    // The raw `[L, joint_attention_dim]` stack: the miniature has no encoder.
     pass.switch(0, "reading", reading)?;
     pass.switch(0, "stream", "text")?;
     pass.group(0, group)?;
@@ -188,7 +160,6 @@ async fn step(case: &Case, dims: &Dims, reading: &str, pipe: &Pipeline) -> Resul
     pass.input(0, "context", &ctx)?;
     scalars(&pass, 0, &t, g.as_ref())?;
 
-    // Lane 1, the target lane: the latent in, the velocity out.
     pass.switch(1, "reading", reading)?;
     pass.switch(1, "stream", "image")?;
     pass.group(1, group)?;
@@ -196,8 +167,6 @@ async fn step(case: &Case, dims: &Dims, reading: &str, pipe: &Pipeline) -> Resul
     pass.input(1, "latents", &x)?;
     scalars(&pass, 1, &t, g.as_ref())?;
 
-    // Lanes 2.., one reference picture each, at its ordinal. Same input,
-    // same weights as the target; no readout.
     for (k, reference) in case.references.iter().enumerate() {
         let lane = 2 + k as u32;
         pass.switch(lane, "reading", reading)?;

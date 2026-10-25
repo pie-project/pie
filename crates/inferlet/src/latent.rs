@@ -183,9 +183,7 @@ pub fn at(vector: &Tensor, index: &Tensor) -> Tensor {
     gather(vector, reshape(index, [1]))
 }
 
-/// A denoising loop's clock: one pass a step, on one pipeline. The pass's
-/// lanes read [`DenoiseLoop::timestep`]; [`DenoiseLoop::drive`] is its
-/// epilogue, which runs the step and moves the clock on.
+/// A denoising loop's clock: one pass a step, [`DenoiseLoop::drive`] its epilogue.
 pub struct DenoiseLoop {
     pipe: Pipeline,
     step: Channel,

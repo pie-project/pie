@@ -7,20 +7,7 @@ diffusers reference.
     python wan22_golden.py --vae-ref        # the reference (vae/* only)
     python wan22_vae_parity.py all --out /tmp/wan22-vae --config <config.wan.toml>
 
-The engine gate `the_wan_2_vae_answers_the_reference` drives the shell from
-the host on lanes that keep their conv caches. This one goes through the real
-runtime (`examples/wan2-vae-parity`): one `vae.decode` fire per latent frame,
-one working set (its recurrent state is the conv caches), one pipeline. Chunk
-k > 0 is only right if fire k read the caches fire k-1 left. The last chunk is
-decoded on a fork of the working set as well, and must match the parent's.
-
-THE GATE
---------
-`cos >= 0.9999` PER CHUNK (bf16 device vs fp32 reference; the host gate lands
-0.99998), and the fork's chunk equal to the parent's. Do not loosen the bar.
-
-The golden is `$PIE_IMAGEGEN_GOLDEN/wan22/wan22_vae_ref/{latent,pixels}.f32` +
-`shapes.json`. Nothing here imports torch.
+Gate: `cos >= 0.9999` per chunk, and the fork's last chunk equal to the parent's.
 """
 
 from __future__ import annotations
@@ -53,7 +40,6 @@ def shapes(golden: str) -> dict:
     return json.load(open(path))
 
 def case(args) -> str:
-    """The latent dump is `[t, h, w, channels]` row-major: the guest's own order."""
     box = shapes(args.golden)["latent"]
     latent = f32s(os.path.join(args.golden, "latent.f32"))
     assert len(latent) == box["t"] * box["h"] * box["w"] * box["channels"]
@@ -122,8 +108,7 @@ def compare(args) -> int:
         print(f"[compare] chunk {k} (frames {a}..{b - 1}): cos {cos:.6f} (>= {COS_TOL}), "
               f"mean |err| {mean_err:.5f}, max |err| {max_err:.5f}  --  "
               f"{'PASS' if good else 'FAIL'}")
-    # The last chunk was decoded twice: on a fork of the working set taken
-    # before its fire, then on the parent. Both read the same state.
+    # The last chunk was decoded on a fork too, and must match the parent.
     fork = doc.get("fork_max_abs_diff")
     good = fork is not None and fork <= FORK_TOL
     ok &= good

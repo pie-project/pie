@@ -71,7 +71,6 @@ pub struct Boot<'a> {
 
 const PATCH_ROUTE_DROP: i32 = -1;
 
-/// Whether `value` stands on the voxel axis: a lane's rows there are its voxels.
 fn on_voxels(trace: &Trace, value: ValueId) -> bool {
     matches!(
         &trace.values[value.0 as usize].ty,
@@ -511,9 +510,8 @@ impl PreparedLoad<'_> {
                 }
             }
         }
-        // Mask bits are staged once per lane with causality baked in, and a
-        // wide class stages them unclipped: a causal masked prefill there
-        // would see future keys.
+        // Mask bits are staged per lane with causality baked in, unclipped for a wide class:
+        // a causal masked prefill there would see future keys.
         let mut causal_masked = poem_ir::ClassSet::default();
         for region in compiled.template() {
             let runs_causal_masked = region.nodes.clone().any(|node| {
@@ -1342,13 +1340,11 @@ impl Shell {
         &self.trace
     }
 
-    /// The inputs this load's guest binds, and the lane words reading each.
     #[must_use]
     pub fn inputs(&self) -> Vec<poem_ir::InputDecl> {
         self.feeds.decls(&self.trace, &self.compiled)
     }
 
-    /// This load's classes and what each runs.
     #[must_use]
     pub fn classes(&self) -> poem_ir::LaneClasses {
         poem_exec::feeds::lane_classes(&self.trace, &self.compiled)
@@ -1435,8 +1431,6 @@ impl Shell {
             .map(|(value, _, _)| *value)
     }
 
-    /// A readout plane's first byte in the arena this fire, its row width and
-    /// its element.
     fn plane_row(
         &self,
         prepared: &Prepared<'_>,
@@ -1638,8 +1632,7 @@ impl Shell {
         self.programs.close_instance(instance_id)
     }
 
-    /// One whole pass with no forward between its points: the prologue, if
-    /// it runs on its own, then the rest.
+    /// A pass with no forward: its prologue, if it runs on its own, then the rest.
     pub fn fire_program(&mut self, instance_id: engine::InstanceId) -> Result<crate::Fired> {
         self.fence_instances(&[instance_id])?;
         if self.programs.prologue_runs(instance_id) {
@@ -2217,8 +2210,7 @@ impl Shell {
         let mut staged = Vec::with_capacity(prepared.attachments.len());
         for attached in prepared.attachments.iter().filter(|a| !a.adapter_only) {
             let lane = attached.lane as usize;
-            // The readout row of a lane: its gathered first, else its first
-            // named row, else its last.
+            // A lane's readout row: its gathered first, else its first named row, else its last.
             let row_of = |lane: usize| -> Result<u32> {
                 let owned = lane_rows.get(lane).copied().unwrap_or(0);
                 if owned == 0 {
@@ -2284,10 +2276,8 @@ impl Shell {
                 )?;
             }
 
-            // `velocity(k)`, `hidden(k)` and `pixels(k)` read the pass's lane
-            // `k`, each at its own rows of its own class's plane: a velocity
-            // on the voxel axis at the lane's first voxel, one on the token
-            // axis at its readout row.
+            // A voxel-axis velocity reads at the lane's first voxel, a token-axis one at its
+            // readout row.
             for k in 0..attached.lanes.max(1) {
                 let at = lane + k as usize;
                 for (intrinsic, seam) in [
@@ -2489,9 +2479,7 @@ impl Shell {
         Ok(())
     }
 
-    /// Fires each program's prologue to its commit before the step is
-    /// staged: the descriptor reads and the input feeds then see the cells
-    /// a prologue put, as the forward's inputs.
+    /// Fired before staging, so descriptor reads and input feeds see the cells a prologue put.
     fn fire_prologues(&mut self, attachments: &[Attached]) -> Result<()> {
         for attached in attachments.iter().filter(|a| !a.adapter_only) {
             if !self.programs.prologue_runs(attached.instance) {
@@ -3043,8 +3031,7 @@ impl Shell {
                 Some(pages) => std::borrow::Cow::Owned(pages.clone()),
                 None => std::borrow::Cow::Borrowed(seated.pages),
             });
-            // A kv-less lane's mask is over its attention group's rows: the
-            // group-packed attention takes it, not the paged prefill's.
+            // A kv-less lane's mask goes to its group-packed attention, not the paged prefill.
             let masking = if seated.kv_less {
                 None
             } else {
@@ -4818,9 +4805,6 @@ fn narrow(n: u64) -> i32 {
     i32::try_from(n).unwrap_or(i32::MAX)
 }
 
-/// Appends the token side of a clip's cell (its box in tokens of patch `p`,
-/// then its first row) and returns the row past it, or `None` when the box
-/// does not divide by the patch.
 fn token_cell(grid: &mut Vec<i32>, boxed: [u32; 3], p: [u32; 3], row: u32) -> Option<u32> {
     if p.contains(&0) || (0..3).any(|k| !boxed[k].is_multiple_of(p[k])) {
         return None;
@@ -4841,9 +4825,6 @@ fn token_refusal(lane: u32) -> Fault {
 }
 
 impl Shell {
-    /// The custom mask each group-packed attention of this fire applies,
-    /// out of the kv-less lanes' stated masks: none when no lane states one
-    /// (engine-cuda `serve/prepare.rs::group_masks_of`).
     fn group_masks_of(
         &self,
         lanes: &[Seated<'_>],

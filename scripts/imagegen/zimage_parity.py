@@ -66,20 +66,12 @@ lane:
 WHAT THE HARNESS CONVERTS
 -------------------------
 * the latent goes over as the VAE's own `[H, W, C]` (the golden's `[C, 1, H,
-  W]` transposed); the family patchifies and computes every row's rotary
-  position in its graph, and its velocity comes back on the same voxels;
-* the caption is padded as the reference pads it: the guest zero-pads it to
-  the rows the family states (`input-decl.rows`, a multiple of 32) and binds
-  its own row count as `length`; the family turns each pad row into
-  `cap_pad_token` at rotary `(0, 0, 0)`, attended like any other, and the
-  image follows at `L32 + 1`. The refined caption comes back over the padded
-  rows, as the golden's. An image lane's token rows are its patches rounded
-  up to the multiple of 32 its `latents` input states: the runtime adds the
-  pad rows, and the family turns them into `x_pad_token` at `(0, 0, 0)`
-  (`--mode mini_pad`: a 48-patch image and a 40-row caption, both padded);
-* a tapped mode (`full`, `crop`, `tiny`) reads an intermediate out on the
-  token rows, which the case states (`readout_rows`), in diffusers'
-  `_patchify_image` feature order `(pf, ph, pw, c)`;
+  W]` transposed); the family patchifies and ropes it;
+* the guest zero-pads the caption to a multiple of 32 rows and binds its own
+  row count as `length`; the family turns pad rows into the reference's pad
+  tokens (`--mode mini_pad` pads both caption and image);
+* a tapped mode (`full`, `crop`, `tiny`) reads out on the token rows, in
+  diffusers' `_patchify_image` feature order `(pf, ph, pw, c)`;
 * the golden holds the TRANSFORMER's `t` (multiplied by `t_scale = 1000`
   inside the model); the family's `timestep` input takes the SCHEDULER timestep and flips
   it itself (`u = 1000 - t`), so the case carries `1000 - 1000 * t`;
@@ -202,7 +194,6 @@ def case(args) -> str:
         "caption_width": int(caption.shape[1]),
         "timestep": float(timestep),
     }
-    # A tapped deployment reads its intermediate out on the token rows.
     doc["readout_rows"] = int((h // PATCH) * (w // PATCH))
     os.makedirs(args.out, exist_ok=True)
     path = os.path.join(args.out, f"case_{mode}.json")
@@ -348,8 +339,7 @@ def collect(args) -> str:
         rows = np.asarray(doc["velocity"], np.float32).reshape(-1, doc["readout"])
         out["velocity.rows"] = rows
         if rows.shape[1] == c:
-            # The velocity on the latent's voxels, the family's sign flipped
-            # back; a tap's token rows stay `velocity.rows`.
+            # The family's sign flipped back.
             out[keys["out"]] = np.ascontiguousarray((-rows).reshape(h, w, c).transpose(2, 0, 1))[:, None]
     if doc.get("latent"):
         x = np.asarray(doc["latent"], np.float32).reshape(h, w, c)

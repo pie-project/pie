@@ -517,8 +517,8 @@ fn prompt_rows(
 /// Generate up to `max_tokens` after `prompt`, prefilled in one pass with
 /// its pictures. Every sampled token — the stop token included, if one
 /// comes — goes to `on_token`, which ends generation by returning `Break`.
-/// Where `sampling` asks for prompt logprobs, `on_prompt` has them ([`Generated::prompt_logprobs`]) before
-/// the first token comes.
+/// Where `sampling` asks for prompt logprobs, `on_prompt` has them
+/// ([`Generated::prompt_logprobs`]) before the first token comes.
 ///
 /// With a `guide`, every fire's logits are masked to what it allows next,
 /// and generation ends when it terminates.
@@ -668,8 +668,7 @@ pub async fn generate(
     fwd.checkpoints(ends)?;
     fwd.submit(&pipe).context("prefill submit")?;
     if max_tokens == 1 {
-        // Nothing follows the prompt's token: the pipeline ends before
-        // it is read, as a decode's does once its budget is submitted.
+        // Nothing follows the prompt's token, so the pipeline ends before it is read.
         pipe.close();
     }
     let (g0, mut g0_later, lp0) = match carried_on {

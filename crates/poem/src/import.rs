@@ -514,9 +514,7 @@ pub fn join_read(
         // computes is joined as what it lands, which only an import moves.
         let read = legs.iter().all(|t| t.expr.is_affine());
         let axis = u8::try_from(join.axis).unwrap_or(0);
-        // Legs the load quantizes (their scales the loader's, not the
-        // contract's) are joined before they are quantized: the joined
-        // weight's scales are then the loader's too, written with its codes.
+        // Quantized legs are joined before quantizing, so the joined weight's scales are the loader's.
         fn quantized(t: &TensorContract) -> Option<(&Expr, &checkpoint::types::Encoding)> {
             match &t.expr {
                 Expr::Cast { src, to, chunks: 0 } if t.scales.is_none() => Some((&**src, to)),

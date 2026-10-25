@@ -1,10 +1,5 @@
-//! The pie half of the `mini-dit` golden. Hands the model exactly what
-//! `scripts/imagegen/mini_dit_ref.py` handed PyTorch — the VAE-native latent
-//! `[h, w, C]`, the caption rows, the cross-attention context and the
-//! timestep — and reads back the velocity on the voxel axis, `[h·w, C]`, as
-//! JSON `scripts/imagegen/mini_dit_parity.py` turns into an `.npz` under the
-//! golden's own key names. The model patchifies and computes its rotary
-//! positions in its own graph; this guest builds neither.
+//! The pie half of the `mini-dit` golden: `scripts/imagegen/mini_dit_ref.py`'s
+//! inputs in, the velocity `[h·w, C]` out as JSON for `mini_dit_parity.py`.
 //!
 //! Two parity modes: one step against `mini_dit_dump_bf16.npz`'s `velocity`,
 //! and the four-step Euler schedule against `mini_dit_euler_bf16.npz`'s
@@ -12,25 +7,14 @@
 //!
 //! And two modes that need no golden because every claim they make is
 //! WITHIN one fire's own answers: `--cfg` (classifier-free guidance on the
-//! device, six lanes and two groups in one pass — `prototype.md` §1.1) and
+//! device, six lanes and two groups in one pass) and
 //! `--cache` (step caching on the device, the whole Euler schedule as fires
 //! with the cache decision carried in a channel from one fire to the next —
 //! `.wiki/imagegen/conditional-fire.md`). Their harnesses are
 //! `mini_dit_parity.py guidance` and `mini_dit_cache.py`.
 //!
-//! # THREE LANES, ONE GROUP, ONE PASS
-//!
-//! `mini-dit`'s `denoise` reading declares three streams (D2), so one step
-//! is one pass of three lanes — caption, context, image — each stating its
-//! `stream` switch and all in one attention group, which is what lets the
-//! caption rows join the image rows' attention and the context rows serve
-//! as block 2's keys. Neither `state` nor `embed` is called: a denoise
-//! reading declares no kv space and no tokens, and the image lane's row
-//! count comes from its latents channel. Group `g` of a pass is lanes `3g`
-//! (caption), `3g + 1` (context) and `3g + 2` (image).
-//!
-//! Only the image lane reads out — the caption stream ends after block 1,
-//! and the head is image-only — so the epilogue reads its velocity.
+//! A step is one pass; attention group `g` is lanes `3g` (caption), `3g + 1`
+//! (context) and `3g + 2` (image), and only the image lane reads out.
 //!
 //! # WHY THE EULER LOOP IS ON THE HOST
 //!
@@ -114,16 +98,11 @@ struct Input {
     /// case's latent, answering `euler_v` / `euler_x` per step.
     #[serde(default)]
     solver: Option<String>,
-    /// `--classes none|all|split|split-swap`: one step under an attention
-    /// mask (`forward-pass.mask`) spelled from two classes. `all` states two
-    /// classes that both see everything; `split` halves the image grid by
-    /// column and the text rows by index into classes 0 and 1 that see only
-    /// themselves; `split-swap` is `split` with the class-1 text rows
-    /// negated. The context rows attend and are attended by every row.
+    /// `--classes none|all|split|split-swap`: one step under a two-class
+    /// attention mask; `split-swap` also negates the class-1 caption rows.
     #[serde(default)]
     classes: Option<String>,
-    /// `--sweep N`: N independent attention groups (N requests' worth of
-    /// lanes) in ONE pass. Group 1 repeats group 0's inputs; group g >= 2
+    /// `--sweep N`: N independent attention groups in ONE pass; group g >= 2
     /// scales the latent by `1 + g/4`.
     #[serde(default)]
     sweep: Option<u32>,
@@ -139,8 +118,7 @@ struct ClassPlan {
 
 impl ClassPlan {
     fn of(mode: &str, case: &Case) -> Result<Option<ClassPlan>> {
-        // The mask addresses the pass's TOKEN rows: the image lane's are its
-        // patches, in grid order.
+        // The mask addresses token rows: the image lane's patches, in grid order.
         let rows = case.image_tokens as usize;
         let side = (rows as f64).sqrt() as usize;
         if side * side != rows {
@@ -173,10 +151,7 @@ impl ClassPlan {
 }
 
 impl ClassPlan {
-    /// The plan as the pass's mask over its one group, lane by lane
-    /// (caption, context, image): a row attends a row where the table lets
-    /// their classes, and a context row (no class) attends and is attended
-    /// by every row.
+    /// Context rows have no class: they attend, and are attended by, every row.
     fn mask(&self, context_rows: u32) -> (u32, Vec<bool>) {
         let classes: Vec<Option<i32>> = self
             .text
@@ -200,17 +175,13 @@ impl ClassPlan {
     }
 }
 
-/// One batch element of the reference's fixed inputs, flattened row-major:
-/// the latent as the VAE holds it (`[latent_h, latent_w, channels]`, never
-/// patched), the caption rows, the context rows and one timestep.
+/// The reference's inputs, row-major; the latent unpatched `[latent_h, latent_w, channels]`.
 #[derive(Deserialize)]
 struct Case {
     latents: Vec<f32>,
     latent_h: u32,
     latent_w: u32,
     channels: u32,
-    /// The image lane's token rows, which only a tapped readout (an
-    /// intermediate on token rows) and the `--classes` mask address.
     image_tokens: u32,
     /// `[text_rows, text_width]`.
     text: Vec<f32>,
@@ -241,9 +212,7 @@ impl Case {
 
 #[derive(Serialize)]
 struct Output {
-    /// `[image_rows, velocity_width]`: the velocity on the voxel axis
-    /// (`[h·w, C]`, the latent's own layout), or under a tap the tapped
-    /// intermediate on the image lane's token rows.
+    /// `[h·w, C]`, or under a tap the intermediate on the image lane's token rows.
     velocity: Vec<f32>,
     image_rows: u32,
     velocity_width: u32,
@@ -253,8 +222,7 @@ struct Output {
     /// The sigmas actually stepped, so a schedule mismatch reads as one.
     #[serde(default)]
     sigmas: Vec<f32>,
-    /// `--euler` / `--solver`: the velocity of every step, and the latent
-    /// after each, both `[h·w, C]`.
+    /// `--euler` / `--solver`: every step's velocity, and the latent after it.
     #[serde(default)]
     euler_v: Vec<Vec<f32>>,
     #[serde(default)]
@@ -295,15 +263,11 @@ struct Output {
     sweep_velocity: Vec<Vec<f32>>,
 }
 
-/// The streams a step's three lanes take, in the group's lane order.
 const STREAMS: [&str; 3] = ["text", "context", "image"];
 
-/// The read-only inputs every lane of every pass shares: one channel each,
-/// however many groups or passes read it.
 struct Shared {
     text: Channel,
     context: Channel,
-    /// The zeroed context the unconditional branch of `--cfg` reads.
     blank: Channel,
 }
 
@@ -326,8 +290,6 @@ impl Shared {
     }
 }
 
-/// The image lane's velocity readout width, after checking every lane of
-/// the reading binds nothing this guest does not.
 fn velocity_width(reading: &str) -> Result<u32> {
     for stream in STREAMS {
         let lane = model::lane_of(&[("reading", reading), ("stream", stream)])?;
@@ -356,9 +318,7 @@ fn velocity_width(reading: &str) -> Result<u32> {
     }
 }
 
-/// Binds attention group `group`'s three lanes on `pass` — lanes `3g`
-/// (caption), `3g + 1` (context) and `3g + 2` (image) — each exactly the
-/// inputs `model::lane_of` says it reads. Answers the image lane.
+/// Binds attention group `group`'s three lanes; answers the image lane.
 fn bind_group(
     pass: &ForwardPass,
     reading: &str,
@@ -387,8 +347,6 @@ fn bind_group(
     Ok(3 * group + 2)
 }
 
-/// `groups` independent attention groups in ONE pass, each its own
-/// velocity: group g >= 2 scales the latent by `1 + g/4`.
 async fn sweep_fire(
     case: &Case,
     shared: &Shared,
@@ -434,10 +392,7 @@ async fn sweep_fire(
     Ok(velocities)
 }
 
-/// One guided denoise step: SIX lanes, two attention groups, ONE pass.
-/// Group 0 reads the case's context, group 1 a zeroed one; the epilogue
-/// combines both image lanes' velocities at `scale`, and publishes the
-/// unconditional branch's own for the `s = 0` identity.
+/// One CFG step: group 0 reads the context, group 1 a zeroed one; answers (guided, uncond).
 async fn guided_step(
     case: &Case,
     shared: &Shared,
@@ -481,8 +436,7 @@ fn schedule(case: &Case, steps: u32) -> Result<FlowMatchEuler> {
     }
 }
 
-/// DPM-Solver++ 2M as a device loop from the case's latent: `steps + 1`
-/// fires of one pass, fire 0 the seed that steps nowhere.
+/// DPM-Solver++ 2M as a device loop; fire 0 seeds and steps nowhere.
 async fn dpm2m_loop(
     case: &Case,
     shared: &Shared,
@@ -557,9 +511,7 @@ async fn dpm2m_loop(
     Ok((vs, xs, sched.sigmas.clone()))
 }
 
-/// Fire `k`'s latent: fire 0 a fresh keyed draw, every later fire one Euler
-/// step over `v`; both the cached loop and its baseline step through here, so
-/// what threshold 0 is compared against is the same body.
+/// Fire `k`'s latent: fire 0 a fresh keyed draw, later fires one Euler step over `v`.
 #[allow(clippy::too_many_arguments)]
 fn seed_or_euler(
     k: &Tensor,
@@ -582,10 +534,7 @@ fn seed_or_euler(
     rng.put(&state + &Tensor::constant([0u32, 1u32]));
 }
 
-/// **STEP CACHING, ON THE DEVICE**: the whole Euler loop as `steps + 1`
-/// fires of one pass, the skip decision made a fire early and carried in a
-/// channel, the cache a channel of what was USED. `threshold` absent is the
-/// plain loop, with no cache ops in the trace at all.
+/// Step caching on the device; `threshold` absent is the plain loop, with no cache ops.
 async fn cached_loop(
     case: &Case,
     shared: &Shared,
@@ -603,9 +552,7 @@ async fn cached_loop(
     let dts = loops.dts();
     let fires = loops.fires();
 
-    // `x` is the image lane's `latents` input AND loop-carried by the
-    // epilogue: the input feed reads the committed cell, the epilogue takes
-    // it and puts the next one.
+    // `x` is both the image lane's `latents` input and the epilogue's loop state.
     let pass = ForwardPass::new();
     let x = Channel::from_shaped(lat, vec![0f32; cells]).named("cache_latents");
     let image = bind_group(
@@ -640,7 +587,6 @@ async fn cached_loop(
                 seed_or_euler(k, &x, &v_use, &dts, &rng, flat, lat, &out);
                 cache.put(&v_use);
 
-                // The metric, and the decision for the NEXT fire.
                 let row = |t: &Tensor| reshape(t, [1, n * c]);
                 let num = reduce_sum(row(&abs(&(&v_use - &v_prev))));
                 let den = max_elem(reduce_sum(row(&abs(&v_prev))), 1e-12f32);
@@ -699,7 +645,6 @@ async fn cached_loop(
     Ok((trace, rel, did, count, sched.dts()))
 }
 
-/// One denoise step: three lanes, one group, one pass, one velocity.
 #[allow(clippy::too_many_arguments)]
 async fn step(
     case: &Case,
@@ -717,7 +662,6 @@ async fn step(
     let tag = format!("s{index}_");
     let text_rows = case.text_rows;
     let t = Channel::from([timestep]).named(&format!("{tag}t"));
-    // `split-swap` negates the class-1 caption rows: a caption of its own.
     let swapped = plan.filter(|plan| plan.swap_text).map(|plan| {
         let w = case.text_width as usize;
         let mut text = case.text.clone();
@@ -947,7 +891,6 @@ async fn main(input: Input) -> Result<Output> {
         return Ok(out);
     }
 
-    // The schedule the model declares, checked against the golden's.
     let steps = case.steps.max(1);
     let sched = schedule(&case, steps)?;
     if !case.sigmas.is_empty() {
@@ -966,8 +909,6 @@ async fn main(input: Input) -> Result<Output> {
     }
     out.sigmas = sched.sigmas.clone();
 
-    // A parity harness steps on the host: every step's velocity AND latent,
-    // at the reference's own numbers, with nothing folded together.
     let mut x = case.latents.clone();
     for i in 0..steps {
         let v = step(

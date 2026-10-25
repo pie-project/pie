@@ -91,9 +91,7 @@ ARGV_CEILING = 3 * 1024 * 1024
 CHILD_STACK = 256 * 1024 * 1024
 
 def tolerances(args) -> list[str]:
-    """The miniatures gate max-abs too; the full 5B row, like the full
-    Z-Image and FLUX.2 rows, gates rel and cos only (bf16 over 30 blocks
-    leaves a few outliers past 0.1 at cos 0.99996)."""
+    """Full rows gate rel and cos only: bf16 over 30 blocks leaves a few outliers past 0.1."""
     rest = ["--rel-tol", "0.02", "--cos-tol", ROWS[args.variant]["cos"]]
     return rest if args.variant == "ti2v-5b" else ["--tol", "0.1", *rest]
 
@@ -276,8 +274,7 @@ def run(args) -> None:
                     f"{case}: {len(text)} bytes is past what argv carries; "
                     f"write the case with `--compact`"
                 )
-            # A piece that starts with `-` and is no number reads as the next
-            # flag in `pie run`, leaving its `--case_i` a bare `true`.
+            # `pie run` reads a piece starting with `-` as a flag.
             at, count = 0, 0
             while at < len(text):
                 cut = min(at + PIECE, len(text))

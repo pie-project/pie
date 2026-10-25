@@ -105,18 +105,13 @@ pub fn derive_grid(f: &mut Func, grid: Operand, rule: GridRule, y: Landing) -> R
     Ok(out)
 }
 
-/// The first `rows` entries of a one-per-row table, `[rows]`.
 fn per_row(f: &mut Func, v: Val, rows: i64) -> Result<Val, Error> {
     let n: i64 = f.dims(v).iter().product();
     let flat = f.reshape(v, &[n])?;
     Ok(f.slice_axis(flat, 0, 0, rows)?)
 }
 
-/// Each token row's cell, `[rows, max(3, axis + 1) + 3]` f32
-/// (`ops::conv::cells`): a row of a clip of `tgrid` its patch's `(t, h, w)`
-/// there and the clip's size in the last three columns, any other row
-/// `positions[row]` in column `axis`; zeros elsewhere. `base` is the row
-/// `tgrid` addresses `y`'s row 0 at. kernels-cuda `elemwise::posenc::cells`.
+/// `base` is the row `tgrid` addresses `y`'s row 0 at.
 pub fn cells(
     f: &mut Func,
     tgrid: Operand,
@@ -161,9 +156,6 @@ pub fn cells(
     Ok(f.concat(&cols, 1)?)
 }
 
-/// Each row's peer value, `[rows, x.width]` f32 (`ops::gather::group_first`):
-/// row `csr[g]` of the packed `x` for `g = groups[lanes[row]]`, zeros where
-/// the group packs none. kernels-cuda `elemwise::posenc::group_first`.
 pub fn group_first(
     f: &mut Func,
     x: Operand,
@@ -219,9 +211,6 @@ pub fn group_first(
     Ok(f.select(ok, picked, zeros)?)
 }
 
-/// Each row's count of the rows `csr` packs in its lane's group, `[rows,
-/// 1]` f32 (`ops::gather::group_rows`): `csr[g + 1] - csr[g]` for `g =
-/// groups[lanes[row]]`. kernels-cuda `elemwise::posenc::group_rows`.
 pub fn group_rows(
     f: &mut Func,
     csr: Operand,

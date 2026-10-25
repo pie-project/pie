@@ -154,8 +154,7 @@ pub struct EngineConfig {
     pub has_attn_page_mask: bool,
     pub has_lora: bool,
     /// The engine takes an attachment for an adapter alone
-    /// ([`::engine::fire::Attachment::adapter_only`]): an adapted pass can be
-    /// cut.
+    /// ([`::engine::fire::Attachment::adapter_only`]): an adapted pass can be cut.
     pub adapter_attachments: bool,
     /// The rows inside a lane whose recurrent state one fire lands.
     pub rs_snapshots: u32,
@@ -163,9 +162,7 @@ pub struct EngineConfig {
     pub limits: crate::engine::SchedulerLimits,
     /// The facts the engine's trace branches on.
     pub facts: poem_ir::Facts,
-    /// The inputs the engine's trace reads from its guest.
     pub inputs: Vec<poem_ir::InputDecl>,
-    /// The engine's classes and what each runs.
     pub classes: poem_ir::LaneClasses,
     pub engine_backend: crate::engine::EngineBox,
 }

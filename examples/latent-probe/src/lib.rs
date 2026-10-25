@@ -1,23 +1,9 @@
-//! A probe of the float-input loop (imagegen design D1/D3/D4), on a model
-//! whose `reading` switch declares a token-less reading with a velocity readout
-//! (the mini-DiT family, then every DiT).
+//! A probe of the float-input loop on a model with a token-less velocity reading:
+//! one pass on the lane that reads `latents`, the whole flow-Euler step in its
+//! epilogue (fire 0 seeds a keyed Normal draw), every other input a constant.
 //!
-//! One `forward` pass in that reading, on the `stream` whose lane reads
-//! `latents`, with no `embed` and no `state`: a `[rows, width]` f32 latent
-//! channel bound as `input("latents")`, a `[1]` timestep channel bound as
-//! `input("timestep")`, every other input that lane reads bound to a
-//! plausible constant (ones on the lane axis, zeros on the row axis), and an
-//! epilogue that does the whole step on the device: fire 0 SEEDS the latent with a
-//! keyed Normal draw (the model's velocity over the zero cell is ignored),
-//! and every fire `k >= 1` integrates step `k - 1` of a flow schedule,
-//! `x <- x + dt · v`, advancing the timestep and step cells for the next
-//! submit. Nothing crosses to the host per step but the fire's own `[rows,
-//! width]` readback, taken once a fire so the ring never fills; the last
-//! one is the answer.
-//!
-//! It cannot check the model's arithmetic (that is the family's parity
-//! harness); it checks that the loop closes: the input feeds land, the
-//! velocity comes back at the declared width, the loop-carried cells
+//! It checks that the loop closes, not the model's arithmetic: the input feeds
+//! land, the velocity comes back at the declared width, the loop-carried cells
 //! advance, and the final latent is finite.
 
 use inferlet::latent::prelude::*;
@@ -81,9 +67,6 @@ async fn main(input: Input) -> Result<Output> {
         Some(decl) => decl.values.into_iter().map(Some).collect(),
         None => vec![None],
     };
-    // The lane that carries the latent: the first lane of the named reading
-    // (else of any token-less reading with a velocity readout) whose lane
-    // reads `latents`.
     let (reading, stream, lane, latents) = readings
         .iter()
         .filter(|reading| input.reading.as_ref().is_none_or(|name| name == *reading))

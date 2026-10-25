@@ -1215,8 +1215,6 @@ impl Plane {
         (self.stages.runs, self.stages.lanes)
     }
 
-    /// Whether `instance`'s prologue runs on its own, before the forward
-    /// ([`ExecPlan::prologue_runs`]).
     #[must_use]
     pub fn prologue_runs(&self, instance: InstanceId) -> bool {
         self.instances
@@ -1367,8 +1365,6 @@ impl Drop for Plane {
     }
 }
 
-// The guest-input feeds (serve.rs reads an input's cell here at every submit;
-// engine-cuda `Plane::feed_cell`).
 impl Plane {
     /// The committed front cell of channel `channel` (a registered channel
     /// id) of instance `instance`: the cell its own `take` would read this

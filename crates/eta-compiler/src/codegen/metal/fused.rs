@@ -25,7 +25,6 @@ fn value_ptr(value: u32) -> String {
     format!("scratch + offsets[{value}]")
 }
 
-/// The single-lane form's name for the intrinsic argument at index `at`.
 fn argument_name(at: usize) -> String {
     match at {
         M2_LOGITS_BUFFER => "logits".to_string(),
@@ -34,7 +33,6 @@ fn argument_name(at: usize) -> String {
     }
 }
 
-/// The argument indices past the logits' a region's intrinsics read.
 fn extra_intrinsics(ops: &[OpView], region: &Region) -> Vec<usize> {
     let mut used = BTreeSet::new();
     for &node in &region.nodes {
@@ -50,8 +48,6 @@ fn extra_intrinsics(ops: &[OpView], region: &Region) -> Vec<usize> {
     used.into_iter().collect()
 }
 
-/// The address-table root of the grouped and streamed forms: the dispatch
-/// lane's own table.
 pub(super) fn emit_intrinsic_table(source: &mut String, stage: &CompiledStage) {
     let _ = writeln!(
         source,
@@ -522,9 +518,7 @@ pub(super) fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o
     source.push_str("  }\n");
 }
 
-/// A per-lane intrinsic's read: its value's elements, in order, off the
-/// address its lane's slot of the table holds (the lane's first row, voxel or
-/// pixel, its class's plane).
+/// Each lane's slot holds the address of its first row, on its class's plane.
 pub(super) fn emit_addressed_gather(
     source: &mut String,
     base: u32,

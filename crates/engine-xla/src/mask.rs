@@ -10,9 +10,7 @@ pub struct LaneMask<'a> {
 
     pub rows: u32,
 
-    /// The lane's class attends both ways: every row reads every key the
-    /// lane holds (its own rows included), the row's enable flag is 2 and,
-    /// without a stated mask, every bit is kept.
+    /// The class attends both ways: the enable flag is 2 and, with no stated mask, every bit is kept.
     pub wide: bool,
 }
 

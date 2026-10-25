@@ -80,7 +80,6 @@ impl Program {
     }
 }
 
-/// The prepared stages of those that run at the point `runs` marks.
 fn at_point<'a>(stages: &'a mut [Option<Prepared>], runs: &[bool]) -> Vec<&'a mut Prepared> {
     stages
         .iter_mut()
@@ -144,7 +143,6 @@ pub struct Plane {
     instances: BTreeMap<InstanceId, Bound>,
     next_program: u64,
     next_instance: u64,
-    /// The fires a wave carries, and the point whose stages they run.
     staged: Vec<(ProgramId, Extents, InstanceId)>,
     at: Attach,
     wave: Wave,
@@ -220,8 +218,7 @@ impl Plane {
             Versions::from_compiler(registration.emitter_version),
             Target::of(context)?,
         )?;
-        // A stage at attention runs in no layer here: only its sinks reach
-        // the forward, so computation of its own would run nowhere.
+        // A stage at attention runs in no layer here: only its sinks reach the forward.
         if let Some(kind) = compiled
             .kinds
             .iter()
@@ -466,8 +463,7 @@ impl Plane {
         None
     }
 
-    /// One whole pass with no forward between its points: the prologue, if
-    /// it runs on its own, then the rest.
+    
     pub fn fire(&mut self, context: &Context, id: InstanceId) -> Result<Fired> {
         if self.prologue_runs(id) {
             let fired = self.fire_at(context, id, Attach::Prologue)?;
@@ -490,8 +486,7 @@ impl Plane {
         }
     }
 
-    /// Whether instance `id`'s prologue runs on its own, before the forward
-    /// ([`ExecPlan::prologue_runs`]).
+    
     #[must_use]
     pub fn prologue_runs(&self, id: InstanceId) -> bool {
         self.instances
@@ -500,8 +495,7 @@ impl Plane {
             .is_some_and(|program| program.plan.prologue_runs())
     }
 
-    /// Mints instance `id`'s stages at `at` into the wave: every fire a wave
-    /// carries runs the stages of one point.
+    /// Every fire a wave carries runs the stages of one point.
     pub fn stage(&mut self, id: InstanceId, at: Attach) -> Result<Launched> {
         if !self.staged.is_empty() && self.at != at {
             return Err(Fault::program(
@@ -736,8 +730,7 @@ impl Plane {
             .host_resolved_rings(&program.plan, bound.geometry)
     }
 
-    /// Whether the host resolves one of instance `id`'s descriptor ports off
-    /// a channel its prologue puts.
+    
     #[must_use]
     pub fn resolves_prologue_put(&self, id: InstanceId) -> bool {
         let Some(bound) = self.instances.get(&id) else {

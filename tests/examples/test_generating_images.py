@@ -191,7 +191,6 @@ def the_store_says_what_the_row_can_do(args) -> dict:
     assert schedule and schedule["kind"] in ("flow", "epsilon", "v-prediction"), facts
     assert facts["max_latent_rows"] > 0, facts
 
-    # One latent cell covers this many pixels, which is what a size rounds to.
     step = latent["spatial_compression"]
     assert args.size % step == 0, (
         f"{args.size} is not a multiple of this row's {step}-pixel latent cell"
@@ -308,8 +307,6 @@ def main() -> int:
         build_guest()
         print("🔄 a_bare_name_draws_a_named_file")
         report = a_bare_name_draws_a_named_file(args, out_dir)
-        # The row drove its own `vae.decode` reading, so what arrived IS the
-        # picture.
         png = out_dir / report["file"]
         how = check_png(png, args.size, args.size)
         print(f"✅ {png}  {png.stat().st_size:,} bytes  ({args.size}x{args.size}, "

@@ -63,8 +63,7 @@ impl<'a> Builder<'a> {
         self.ports.push((port, source.into()));
     }
 
-    /// Lists `source` as a channel the forward reads as a guest model input,
-    /// at the descriptor phase like a port.
+    /// Lists `source` as a guest model input the forward reads.
     #[track_caller]
     pub fn bind_input(&mut self, source: impl Into<PortInput>) {
         let source = source.into();

@@ -124,8 +124,7 @@ fn check(
     let kp = gpu.tensor(&k, kr.max(1) as u32, (kvh * hd) as u32, Bf16);
     let vp = gpu.tensor(&v, kr.max(1) as u32, (kvh * hd) as u32, Bf16);
     let (qtab, ktab) = (gpu.column(&qt), gpu.column(&kt));
-    // Each group's bits, query-major, from a byte of its own: the classes'
-    // table spelled pair by pair.
+    // Each group's bits, query-major, from a byte of its own.
     let (mut bits, mut starts) = (Vec::<u8>::new(), Vec::<i32>::new());
     for g in 0..qt.len() - 1 {
         starts.push(bits.len() as i32);

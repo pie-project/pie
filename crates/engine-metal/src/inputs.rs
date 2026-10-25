@@ -102,7 +102,6 @@ pub struct Handles {
     pub rs_pages: Option<Tensor>,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<PackingHandles>,
-    /// Each staged guest input's rectangle, by id.
     pub inputs: Vec<(u32, Tensor)>,
     pub voxels: Option<VoxelHandles>,
 }
@@ -219,15 +218,12 @@ pub struct Inputs {
     rs_commit: u64,
     rs_snaps: u64,
     rs_pages: u64,
-    /// The custom masks the fire's group-packed attentions read, staged
-    /// apart from the store: their size is the groups', not the load's.
+    /// Staged apart from the store: their size is the groups', not the load's.
     group_masks: Option<Buffer>,
     /// Smaller ones it outgrew, kept: an earlier fire may still read them.
     outgrown: Vec<Buffer>,
 }
 
-/// One ragged attention's custom mask on the device: over packings `q` and
-/// `kv`, the bits and each group's first byte.
 #[derive(Debug, Clone, Copy)]
 pub struct GroupMaskHandles {
     pub q: poem_ir::Selection,
@@ -421,8 +417,6 @@ impl Inputs {
         })
     }
 
-    /// Stages each ragged attention's custom mask, in one buffer grown to
-    /// hold them.
     pub fn stage_group_masks(
         &mut self,
         device: &Context,
@@ -488,7 +482,6 @@ impl Inputs {
             .collect()
     }
 
-    /// Where guest input `id` lands.
     #[must_use]
     pub fn input_seat(&self, id: u32) -> Option<(&Buffer, u64)> {
         self.seats

@@ -447,8 +447,7 @@ class Op:
 
     @staticmethod
     def intrinsic_val(intr: Intrinsic, shape: Shape, dt: Dtype, lane: int = 0) -> "Op":
-        # `lane` is the pass's lane a per-lane intrinsic reads (`velocity`,
-        # `hidden`, `pixels`), 0 for the others; it rides the op's imm.
+        # `lane` (0 for non-per-lane intrinsics) rides the op's imm.
         return Op(tags.INTRINSIC_VAL, intr=int(intr), imms=(lane,), shape=shape, dtype=int(dt))
 
     @staticmethod

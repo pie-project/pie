@@ -39,13 +39,11 @@ pub struct ForwardBindings {
     pub readout: Option<u32>,
     pub mask: Option<u32>,
     pub checkpoints: Vec<u32>,
-    /// What each lane binds, by lane: as many as the highest lane a verb
-    /// named, plus one.
+    /// By lane, up to the highest lane a verb named.
     pub lanes: Vec<LaneBinding>,
 }
 
 impl ForwardBindings {
-    /// Lane `lane`'s bindings, the lanes before it bound to nothing.
     pub fn lane_mut(&mut self, lane: usize) -> &mut LaneBinding {
         if self.lanes.len() <= lane {
             self.lanes.resize_with(lane + 1, LaneBinding::default);
@@ -54,19 +52,15 @@ impl ForwardBindings {
     }
 }
 
-/// What one lane of a pass binds.
 #[derive(Clone, Default)]
 pub struct LaneBinding {
-    /// The model's switches the lane set, each checked against its
-    /// declaration.
     pub switches: Vec<(String, String)>,
     pub group: Option<u32>,
     pub inputs: Vec<InputBinding>,
     pub media: Vec<std::sync::Arc<media::front::EncodedSpan>>,
 }
 
-/// A channel bound to the model's input `name` (id `id`): the rows it
-/// carries when a row input, the clip when a voxel one.
+/// A channel bound to model input `id`: its rows (row input) or clip (voxel input).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputBinding {
     pub name: String,
@@ -87,18 +81,14 @@ impl InputBinding {
     }
 }
 
-/// What one lane of a bound pass carries to its fires.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LaneFacts {
-    /// The model's switches the lane set; its word is built from them and
-    /// the runtime switches.
     pub switches: Vec<(String, String)>,
     pub group: Option<u32>,
     pub inputs: Vec<::engine::fire::InputFeed>,
 }
 
 impl LaneFacts {
-    /// Stamps each lane of `req` with its own facts, `lanes[i]` on lane `i`.
     pub fn stamp(lanes: &[LaneFacts], req: &mut crate::engine::FireRequest) {
         for (lane, facts) in req.lanes.iter_mut().zip(lanes) {
             lane.group = facts.group;
@@ -107,16 +97,12 @@ impl LaneFacts {
     }
 }
 
-/// A lane of a pass whose lanes read no kv: the rows it carries and the
-/// clips its voxel inputs bind.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FloatLane {
     pub rows: u32,
     pub clips: Vec<[u32; 3]>,
 }
 
-/// A pass whose lanes read no kv: each lane's rows, and whether its rows are
-/// embedded tokens.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FloatPass {
     pub lanes: Vec<FloatLane>,
@@ -202,7 +188,6 @@ pub struct BoundForwardPass {
     pub devgeo: Option<Vec<u32>>,
     pub decode_envelope: Option<eta_ir::registry::PortMask>,
     pub host_shadow: crate::pipeline::fire::shadow::HostShadow,
-    /// Each lane's facts, in lane order.
     pub facts: Vec<LaneFacts>,
     pub float: Option<FloatPass>,
     pub(crate) closed: bool,
