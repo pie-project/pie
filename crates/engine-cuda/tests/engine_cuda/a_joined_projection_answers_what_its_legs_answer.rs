@@ -254,7 +254,7 @@ fn check(name: &str) {
         .expect("the row traces");
     // A package leaving its cuts to the compiler states them once they are
     // inferred, as the lowering does before it joins.
-    poem_compiler::shard::infer::resolve(&mut unjoined);
+    poem_compiler::shard::infer::resolve(&mut unjoined, row.deploy.tp);
     let joins = poem_compiler::pack::joins(&unjoined);
     if joins.is_empty() {
         eprintln!("{name}: the compiler joins nothing");
