@@ -29,7 +29,7 @@ use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFac
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
-    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout,
+    Boundary, FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout,
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
@@ -896,6 +896,30 @@ impl Xla {
         Ok(out)
     }
 
+    /// Runs the passes attached at `Boundary::Prologue` to their commit
+    /// before the step reads its descriptor ports and input cells: the
+    /// forward reads the cells a prologue put.
+    fn run_prologues(&mut self, submission: &engine::fire::Step) -> EngineResult<()> {
+        let prologues: Vec<(InstanceId, u32)> = submission
+            .attachments
+            .iter()
+            .filter(|attachment| attachment.at == Boundary::Prologue)
+            .map(|attachment| (attachment.instance, attachment.lane))
+            .collect();
+        if prologues.is_empty() {
+            return Ok(());
+        }
+        let device = self
+            .shell
+            .as_ref()
+            .ok_or_else(|| Error::Load("the xla engine has no model loaded".into()))?
+            .device();
+        self.programs
+            .fire_guests(device, &prologues, None, 0, 0)
+            .map_err(refusal)?;
+        Ok(())
+    }
+
     /// Reads every input cell and voxel payload a step's lanes feed
     /// (engine-cuda's `serve::prepare` input feed, done on the host).
     fn lane_feeds(&self, submission: &engine::fire::Step) -> EngineResult<LaneFeeds> {
@@ -987,6 +1011,21 @@ impl Xla {
         latch: &std::sync::Arc<crate::program::Latch>,
     ) -> EngineResult<(FireTicket, StepSettle)> {
         capture(submission);
+        // The caller predicts the cursors a pass starts from: checked
+        // before a prologue moves them.
+        for attachment in &submission.attachments {
+            if let Some(lane) = submission.lanes.get(attachment.lane as usize)
+                && !lane.channels.is_empty()
+                && let Some(why) = self
+                    .programs
+                    .disagreeing_ticket(attachment.instance, &lane.channels)
+            {
+                return Err(Error::Program(format!(
+                    "this fire's channel predictions and the engine's disagree: {why}"
+                )));
+            }
+        }
+        self.run_prologues(submission)?;
         let fed = self.lane_feeds(submission)?;
         let input_cells: Vec<Vec<crate::serve::InputCell<'_>>> = fed
             .cells
@@ -1066,16 +1105,6 @@ impl Xla {
                         submission.lanes.len()
                     )));
                 };
-                if lane_at == 0
-                    && !lane.channels.is_empty()
-                    && let Some(why) = self
-                        .programs
-                        .disagreeing_ticket(attachment.instance, &lane.channels)
-                {
-                    return Err(Error::Program(format!(
-                        "this fire's channel predictions and the engine's disagree: {why}"
-                    )));
-                }
                 if device_resolved {
                     continue;
                 }
@@ -1248,6 +1277,7 @@ impl Xla {
         let attached: Vec<(InstanceId, u32)> = submission
             .attachments
             .iter()
+            .filter(|attachment| attachment.at == Boundary::Epilogue)
             .map(|attachment| (attachment.instance, attachment.lane))
             .collect();
         let mut on_device = vec![false; submission.lanes.len()];
