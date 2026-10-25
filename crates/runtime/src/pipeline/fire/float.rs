@@ -2,7 +2,7 @@ use wasmtime::component::Resource;
 
 use super::context::FireContext;
 use super::{
-    FireWs, PendingFire, PendingOp, TicketReservation, advance_shadow, hook_program_of,
+    FireWs, PendingFire, PendingOp, Switched, TicketReservation, advance_shadow, hook_program_of,
     open_pipeline, record_submit_failure, seat_lane_slots, settle_and_wait_resident,
     stamp_lane_facts, stamp_lane_words,
 };
@@ -133,17 +133,16 @@ pub(crate) async fn fire_float_lane<C: FireContext>(
         ..crate::engine::FireRequest::default()
     };
     stamp_lane_facts(ctx, &fwd, &mut req)?;
-    {
+    let switched = {
         let pass = ctx.resources().get(&fwd)?;
-        let program = &pass.instance.program;
+        let captures = pass.instance.program.reads_attn_score;
         for lane in &mut req.lanes {
-            lane.drafts = program.reads_mtp_logits;
-            lane.captures_scores = program.reads_attn_score;
-            lane.block_draft = pass.block_draft;
+            lane.captures_scores = captures;
         }
-    }
+        Switched::of(pass)
+    };
     req.single_token_mode = false;
-    stamp_lane_words(&mut req, false, false, false, None);
+    stamp_lane_words(&mut req, &switched, false, false, None);
     let groups = vec![(ws.id, (0..req.lanes.len()).collect())];
     if let Err(refusal) = seat_lane_slots(&mut req, &stores, &groups).await {
         record_submit_failure(ctx, &fwd, &pipeline_failure, &refusal);

@@ -41,7 +41,7 @@ async fn pass(
     let out = Channel::new([shown], dtype::i32).named("spec_output");
     let fwd = ForwardPass::new();
     if drafting {
-        fwd.set_drafting_block(true).context("draft block")?;
+        fwd.switch("block_draft", "on").context("draft block")?;
     }
     fwd.embed(&toks, &indptr)?;
     fwd.readout(&readout)?;

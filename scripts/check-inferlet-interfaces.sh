@@ -44,12 +44,11 @@ known=$(
 
 # The forward-pass surface. A library that binds none of these can do everything
 # except the one thing an inferlet exists to do, so publishing it is worse than
-# publishing nothing: it looks like a working library. `forward` and
-# `-diffusion` are alternatives -- a model needs exactly one -- so any ONE of them
-# satisfies the requirement; the supporting resources are all mandatory,
+# publishing nothing: it looks like a working library. `forward` is the one
+# pass interface every model takes; the supporting resources are all mandatory,
 # because a pass cannot be built without a channel to bind, a working set to
 # bind it against, or a pipeline to submit on.
-forward_any="forward forward-diffusion"
+forward_any="forward"
 forward_all="channel working-set pipeline"
 
 fail=0

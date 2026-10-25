@@ -482,7 +482,6 @@ impl ReqGeometry {
                     [only] if *only + 1 == rows => ::engine::Readout::Last,
                     rows => ::engine::Readout::Rows(rows.to_vec()),
                 },
-                stream: engine::fire::LaneStream::Text,
                 ..::engine::Lane::default()
             });
             landings.push(Landing { start, rows });

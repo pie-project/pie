@@ -29,9 +29,10 @@ impl FlowMatchEuler {
         FlowMatchEuler::from_schedule(&schedule, steps, rows)
     }
 
+    /// The schedule a lane whose `stream` switch is `lane` advances at.
     pub fn for_stream(
         fact: &ScheduleFact,
-        lane: crate::model::LaneStream,
+        lane: &str,
         steps: u32,
         rows: Option<u32>,
     ) -> Result<FlowMatchEuler, String> {
@@ -614,11 +615,11 @@ pub fn dpm2m_step(
     x0
 }
 
+/// The hidden rows the model's text encoder (its lane of `reading`) reads
+/// `prompt` out as.
 pub async fn encode_text(prompt: &str, reading: &str) -> Result<Channel, String> {
-    let Some(fact) = crate::model::reading(reading) else {
-        return Err(format!("this model declares no reading `{reading}`"));
-    };
-    if !fact.takes_tokens {
+    let lane = crate::model::lane_of(&[("reading", reading)])?;
+    if !lane.embeds {
         return Err(format!(
             "reading `{reading}` is not a text encoder (it embeds no tokens)"
         ));
@@ -638,21 +639,21 @@ pub async fn encode_ids(ids: &[u32], reading: &str) -> Result<Channel, String> {
 }
 
 pub async fn encode_ids_rows(ids: &[u32], reading: &str) -> Result<(Vec<f32>, u32), String> {
-    let Some(fact) = crate::model::reading(reading) else {
-        return Err(format!("this model declares no reading `{reading}`"));
-    };
-    if !fact.takes_tokens {
+    let lane = crate::model::lane_of(&[("reading", reading)])?;
+    if !lane.embeds {
         return Err(format!(
             "reading `{reading}` embeds no tokens, so there is nothing to hand ids to"
         ));
     }
-    if fact.readout != ReadoutKind::Hidden {
-        return Err(format!(
-            "reading `{reading}` reads out {:?}, not the hidden rows an encoder hands over",
-            fact.readout
-        ));
-    }
-    let width = fact.readout_width;
+    let width = match lane.readout {
+        Some(readout) if readout.kind == ReadoutKind::Hidden => readout.width,
+        other => {
+            return Err(format!(
+                "reading `{reading}` reads out {other:?}, not the hidden rows an encoder hands \
+                 over"
+            ));
+        }
+    };
     // Every row is read out, so a pass holds no more than one reads out.
     let cap = crate::eta::max_readout_rows(ReadoutKind::Hidden);
     if ids.len() > cap {
@@ -676,11 +677,11 @@ pub async fn encode_ids_rows(ids: &[u32], reading: &str) -> Result<(Vec<f32>, u3
     let out = Channel::new([len, width], crate::eta::Dtype::F32);
 
     let pass = ForwardPass::new();
-    pass.reading(reading)?;
+    pass.switch("reading", reading)?;
     pass.embed(&toks, &embed_indptr)?;
     pass.readout(&readout)?;
     let ws = WorkingSet::new();
-    if fact.has_kv {
+    if lane.reads_kv {
         pass.state(&[&ws], StateGeometry::default())?;
     }
     let readback = out;

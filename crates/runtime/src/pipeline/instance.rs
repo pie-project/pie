@@ -32,45 +32,16 @@ impl Instance {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PassKind {
-    Text,
-    Diffusion,
-}
-
-impl PassKind {
-    pub fn name(self) -> &'static str {
-        match self {
-            PassKind::Text => "text",
-            PassKind::Diffusion => "diffusion",
-        }
-    }
-
-    pub fn interface(self) -> &'static str {
-        match self {
-            PassKind::Text => "pie:inferlet/forward",
-            PassKind::Diffusion => "pie:inferlet/forward-diffusion",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CanvasMode {
-    Encode,
-    Denoise,
-}
-
 #[derive(Default)]
 pub struct ForwardBindings {
     pub embed: Option<EmbedBinding>,
     pub state: Option<StateBinding>,
     pub readout: Option<u32>,
-    pub block_draft: bool,
     pub checkpoints: Vec<u32>,
     pub media: Vec<std::sync::Arc<media::front::EncodedSpan>>,
-    pub canvas: Option<CanvasMode>,
-    pub reading: Option<u8>,
-    pub stream: Option<poem::Stream>,
+    /// The model's switches the pass set, each checked against its
+    /// declaration.
+    pub switches: Vec<(String, String)>,
     pub group: Option<u32>,
     pub peer: Option<u32>,
     pub inputs: Vec<InputBinding>,
@@ -101,8 +72,9 @@ impl InputBinding {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LaneFacts {
-    pub reading: u8,
-    pub stream: ::engine::fire::LaneStream,
+    /// The model's switches the pass set; its lanes' words are built from
+    /// them and the runtime switches.
+    pub switches: Vec<(String, String)>,
     pub group: Option<u32>,
     pub peer: Option<u32>,
     pub inputs: Vec<::engine::fire::InputFeed>,
@@ -112,8 +84,6 @@ pub struct LaneFacts {
 impl LaneFacts {
     pub fn stamp(&self, req: &mut crate::engine::FireRequest) {
         for lane in &mut req.lanes {
-            lane.reading = self.reading;
-            lane.stream = self.stream;
             lane.group = self.group;
             lane.peer = self.peer;
             lane.inputs = self.inputs.clone();
@@ -147,32 +117,6 @@ pub fn cohort_key(group: Option<u32>, peer: Option<u32>) -> Option<u32> {
     }
 }
 
-#[must_use]
-pub fn lane_stream_of(stream: poem::Stream) -> ::engine::fire::LaneStream {
-    use ::engine::fire::LaneStream;
-    match stream {
-        poem::Stream::Text => LaneStream::Text,
-        poem::Stream::Image => LaneStream::Image,
-        poem::Stream::Video => LaneStream::Video,
-        poem::Stream::Audio => LaneStream::Audio,
-        poem::Stream::Context => LaneStream::Context,
-        poem::Stream::Reference => LaneStream::Reference,
-    }
-}
-
-#[must_use]
-pub fn stream_of_lane(stream: ::engine::fire::LaneStream) -> poem::Stream {
-    use ::engine::fire::LaneStream;
-    match stream {
-        LaneStream::Text => poem::Stream::Text,
-        LaneStream::Image => poem::Stream::Image,
-        LaneStream::Video => poem::Stream::Video,
-        LaneStream::Audio => poem::Stream::Audio,
-        LaneStream::Context => poem::Stream::Context,
-        LaneStream::Reference => poem::Stream::Reference,
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FloatLane {
     pub rows: u32,
@@ -196,21 +140,13 @@ pub struct StateBinding {
     pub fold: Option<u32>,
 }
 
+#[derive(Default)]
 pub struct ForwardPass {
-    pub kind: PassKind,
     pub bindings: ForwardBindings,
     bound: Option<Box<BoundForwardPass>>,
 }
 
 impl ForwardPass {
-    pub fn new(kind: PassKind) -> Self {
-        Self {
-            kind,
-            bindings: ForwardBindings::default(),
-            bound: None,
-        }
-    }
-
     pub fn is_bound(&self) -> bool {
         self.bound.is_some()
     }
@@ -263,7 +199,6 @@ pub struct BoundForwardPass {
     pub fires: Option<crate::pipeline::fire::PendingFires>,
     pub lanes: Vec<u32>,
     pub kv_lanes: Vec<u32>,
-    pub block_draft: bool,
     pub rs_ws: Vec<u32>,
     pub failed: Option<String>,
     pub devgeo: Option<Vec<u32>>,

@@ -9,8 +9,7 @@ use crate::pipeline::channel::{BoundCells, ChannelCell, ChannelError};
 pub use crate::pipeline::instance::ForwardPass;
 use crate::pipeline::instance::Instance;
 use crate::pipeline::instance::{
-    BoundForwardPass, CanvasMode, EmbedBinding, FloatLane, InputBinding, LaneFacts, PassKind,
-    StateBinding, lane_stream_of,
+    BoundForwardPass, EmbedBinding, FloatLane, InputBinding, LaneFacts, StateBinding,
 };
 use crate::store::kv::working_set::KvWorkingSet;
 
@@ -23,54 +22,6 @@ use eta_ir::types::Dtype;
 use super::pie;
 
 type Anyhow<T> = anyhow::Result<T>;
-
-fn reading_of(
-    pass: &ForwardPass,
-) -> Result<Option<&'static poem::generative::ReadingFact>, String> {
-    let model = crate::model::model();
-    if let Some(index) = pass.bindings.reading {
-        return Ok(model.readings().get(usize::from(index)));
-    }
-    if let Some(only) = model.sole_reading() {
-        return Ok(Some(only));
-    }
-    if model.readings().is_empty() {
-        return Ok(None);
-    }
-    Err(format!(
-        "this model declares {} readings ({}) and the pass named none; call `reading(name)` \
-         before `program`",
-        model.readings().len(),
-        reading_names(model.readings())
-    ))
-}
-
-fn reading_names(readings: &[poem::generative::ReadingFact]) -> String {
-    readings
-        .iter()
-        .map(|reading| format!("`{}`", reading.name))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn reading_lists_stream(reading: &poem::generative::ReadingFact, stream: poem::Stream) -> bool {
-    if reading.streams.is_empty() {
-        return stream == poem::Stream::Text;
-    }
-    reading.streams.contains(&stream)
-}
-
-fn stream_names(reading: &poem::generative::ReadingFact) -> String {
-    if reading.streams.is_empty() {
-        return "`text`".to_string();
-    }
-    reading
-        .streams
-        .iter()
-        .map(|stream| format!("`{}`", stream.name()))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
 
 /// The rows (a row input) or clip (a voxel input) a channel bound to
 /// `input` carries, once its shape and dtype are the input's: `[width]` for
@@ -97,18 +48,14 @@ pub(crate) fn validate_input_channel(
         (poem_ir::InputAxis::Lane, _) => Err(format!(
             "input `{name}` is one `[{width}]` row a lane; this channel is {shape:?}"
         )),
-        (poem_ir::InputAxis::Row, [rows, w]) if *w == width && *rows > 0 => {
-            Ok((Some(*rows), None))
-        }
+        (poem_ir::InputAxis::Row, [rows, w]) if *w == width && *rows > 0 => Ok((Some(*rows), None)),
         (poem_ir::InputAxis::Row, _) => Err(format!(
             "input `{name}` reads `[rows, {width}]`; this channel is {shape:?}"
         )),
         (poem_ir::InputAxis::Voxel, [h, w, c]) if *c == width && *h > 0 && *w > 0 => {
             Ok((None, Some([1, *h, *w])))
         }
-        (poem_ir::InputAxis::Voxel, [t, h, w, c])
-            if *c == width && *t > 0 && *h > 0 && *w > 0 =>
-        {
+        (poem_ir::InputAxis::Voxel, [t, h, w, c]) if *c == width && *t > 0 && *h > 0 && *w > 0 => {
             Ok((None, Some([*t, *h, *w])))
         }
         (poem_ir::InputAxis::Voxel, _) => Err(format!(
@@ -523,39 +470,9 @@ impl pie::inferlet::channel::HostChannelWithStore<ProcessCtx> for HasSelf<Proces
 }
 
 impl ProcessCtx {
-    async fn core_new(&mut self, kind: PassKind) -> Anyhow<Resource<ForwardPass>> {
+    async fn core_new(&mut self) -> Anyhow<Resource<ForwardPass>> {
         crate::inferlet::process::gate::residency_gate(self).await?;
-        Ok(self.ctx().table.push(ForwardPass::new(kind))?)
-    }
-
-    fn core_gate(
-        &mut self,
-        this: &Resource<ForwardPass>,
-        named: Option<&'static poem::generative::ReadingFact>,
-    ) -> Anyhow<Result<(), String>> {
-        let kind = self.ctx().table.get(this)?.kind;
-        let actual = crate::model::model().pass_kind();
-        if kind == PassKind::Text {
-            let reading = match named {
-                Some(reading) => Ok(Some(reading)),
-                None => reading_of(self.ctx().table.get(this)?),
-            };
-            if let Ok(Some(reading)) = reading
-                && !reading.has_kv
-            {
-                return Ok(Ok(()));
-            }
-        }
-        if kind != actual {
-            return Ok(Err(format!(
-                "this model's forward pass is `{}`, but the pass was built through the `{}` \
-                 interface; use `{}` instead",
-                actual.name(),
-                kind.interface(),
-                actual.interface(),
-            )));
-        }
-        Ok(Ok(()))
+        Ok(self.ctx().table.push(ForwardPass::default())?)
     }
 
     async fn core_embed(
@@ -574,15 +491,6 @@ impl ProcessCtx {
             return Ok(Err(
                 "forward pass embed binding is already attached".to_string()
             ));
-        }
-        if let Ok(Some(reading)) = reading_of(pass)
-            && !reading.takes_tokens
-        {
-            return Ok(Err(format!(
-                "reading `{}` embeds no tokens; `embed` is refused on its pass (its rows are \
-                 the latents port's)",
-                reading.name
-            )));
         }
         pass.bindings.embed = Some(EmbedBinding {
             tokens: tokens.rep(),
@@ -604,9 +512,6 @@ impl ProcessCtx {
             mask,
             fold,
         } = geom;
-        if let Err(error) = self.core_gate(&this, None)? {
-            return Ok(Err(error));
-        }
         if lanes.is_empty() {
             return Ok(Err(
                 "forward pass state binding names no working set; give one per lane".to_string(),
@@ -667,15 +572,6 @@ impl ProcessCtx {
                 "forward pass state binding is already attached".to_string()
             ));
         }
-        if let Ok(Some(reading)) = reading_of(pass)
-            && !reading.has_kv
-        {
-            return Ok(Err(format!(
-                "reading `{}` declares no KV space; `state` is refused on its pass (nothing \
-                 there is a sequence)",
-                reading.name
-            )));
-        }
         self.ctx().table.get_mut(&this)?.bindings.state = Some(binding);
         Ok(Ok(()))
     }
@@ -709,60 +605,25 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
-    async fn core_reading(
+    async fn core_switch(
         &mut self,
         this: Resource<ForwardPass>,
         name: String,
+        value: String,
     ) -> Anyhow<Result<(), String>> {
-        let model = crate::model::model();
-        let Some(reading) = model.readings().iter().find(|reading| reading.name == name) else {
-            return Ok(Err(if model.readings().is_empty() {
-                format!(
-                    "this model declares no readings (one implicit reading); `reading(\"{name}\")` \
-                     has nothing to name"
-                )
-            } else {
-                format!(
-                    "this model declares no reading `{name}`; it declares {}",
-                    reading_names(model.readings())
-                )
-            }));
-        };
-        if let Err(error) = self.core_gate(&this, Some(reading))? {
+        if let Err(error) = crate::model::model().facts().check(&name, &value) {
             return Ok(Err(error));
         }
         let pass = self.ctx().table.get_mut(&this)?;
         if pass.is_bound() {
             return Ok(Err("forward pass program is already attached".to_string()));
         }
-        if pass.bindings.reading.is_some() {
-            return Ok(Err(
-                "forward pass reading is already set; a pass keeps one reading for its life"
-                    .to_string(),
-            ));
-        }
-        if !reading.takes_tokens && pass.bindings.embed.is_some() {
+        if pass.bindings.switches.iter().any(|(set, _)| *set == name) {
             return Ok(Err(format!(
-                "reading `{}` embeds no tokens, but this pass already bound `embed`",
-                reading.name
+                "the switch `{name}` is already set; a pass keeps its switches for its life"
             )));
         }
-        if !reading.has_kv && pass.bindings.state.is_some() {
-            return Ok(Err(format!(
-                "reading `{}` declares no KV space, but this pass already bound `state`",
-                reading.name
-            )));
-        }
-        if let Some(stream) = pass.bindings.stream
-            && !reading_lists_stream(reading, stream)
-        {
-            return Ok(Err(format!(
-                "reading `{}` lists no `{}` stream, but this pass already stated it",
-                reading.name,
-                stream.name()
-            )));
-        }
-        pass.bindings.reading = Some(reading.index);
+        pass.bindings.switches.push((name, value));
         Ok(Ok(()))
     }
 
@@ -772,9 +633,6 @@ impl ProcessCtx {
         name: String,
         channel: Resource<Channel>,
     ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this, None)? {
-            return Ok(Err(error));
-        }
         let (shape, dtype, global_id) = {
             let resource = self.ctx().table.get(&channel)?;
             let cell = resource.cell.lock().unwrap();
@@ -816,46 +674,11 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
-    async fn core_stream(
-        &mut self,
-        this: Resource<ForwardPass>,
-        stream: pie::inferlet::model::LaneStream,
-    ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this, None)? {
-            return Ok(Err(error));
-        }
-        let stream = super::model::catalog_stream(stream);
-        let pass = self.ctx().table.get_mut(&this)?;
-        if pass.is_bound() {
-            return Ok(Err("forward pass program is already attached".to_string()));
-        }
-        if pass.bindings.stream.is_some() {
-            return Ok(Err(
-                "forward pass stream is already set; a pass is one lane of one stream".to_string(),
-            ));
-        }
-        if let Ok(Some(reading)) = reading_of(pass)
-            && !reading_lists_stream(reading, stream)
-        {
-            return Ok(Err(format!(
-                "reading `{}` lists no `{}` stream; it lists {}",
-                reading.name,
-                stream.name(),
-                stream_names(reading)
-            )));
-        }
-        pass.bindings.stream = Some(stream);
-        Ok(Ok(()))
-    }
-
     async fn core_group(
         &mut self,
         this: Resource<ForwardPass>,
         id: u32,
     ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this, None)? {
-            return Ok(Err(error));
-        }
         let pass = self.ctx().table.get_mut(&this)?;
         if pass.is_bound() {
             return Ok(Err("forward pass program is already attached".to_string()));
@@ -872,9 +695,6 @@ impl ProcessCtx {
         this: Resource<ForwardPass>,
         group: u32,
     ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this, None)? {
-            return Ok(Err(error));
-        }
         let pass = self.ctx().table.get_mut(&this)?;
         if pass.is_bound() {
             return Ok(Err("forward pass program is already attached".to_string()));
@@ -907,9 +727,6 @@ impl ProcessCtx {
         table: Vec<u8>,
         count: u32,
     ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this, None)? {
-            return Ok(Err(error));
-        }
         let pass = self.ctx().table.get_mut(&this)?;
         if pass.is_bound() {
             return Ok(Err("forward pass program is already attached".to_string()));
@@ -946,28 +763,6 @@ impl ProcessCtx {
         Ok(Ok(()))
     }
 
-    async fn core_canvas(
-        &mut self,
-        this: Resource<ForwardPass>,
-        mode: CanvasMode,
-    ) -> Anyhow<Result<(), String>> {
-        if let Err(error) = self.core_gate(&this, None)? {
-            return Ok(Err(error));
-        }
-        let pass = self.ctx().table.get_mut(&this)?;
-        if pass.is_bound() {
-            return Ok(Err("forward pass program is already attached".to_string()));
-        }
-        if pass.bindings.canvas.is_some() {
-            return Ok(Err(
-                "forward pass canvas mode is already set; a pass keeps one reading for its life"
-                    .to_string(),
-            ));
-        }
-        pass.bindings.canvas = Some(mode);
-        Ok(Ok(()))
-    }
-
     async fn core_readout(
         &mut self,
         this: Resource<ForwardPass>,
@@ -984,19 +779,6 @@ impl ProcessCtx {
             ));
         }
         pass.bindings.readout = Some(indices.rep());
-        Ok(Ok(()))
-    }
-
-    async fn core_set_drafting_block(
-        &mut self,
-        this: Resource<ForwardPass>,
-        on: bool,
-    ) -> Anyhow<Result<(), String>> {
-        let pass = self.ctx().table.get_mut(&this)?;
-        if pass.is_bound() {
-            return Ok(Err("forward pass program is already attached".to_string()));
-        }
-        pass.bindings.block_draft = on;
         Ok(Ok(()))
     }
 
@@ -1041,7 +823,7 @@ impl ProcessCtx {
         container_bytes: Vec<u8>,
         channels: Vec<Resource<Channel>>,
     ) -> Anyhow<Result<(), String>> {
-        let (embed, state, readout, pass_block_draft, lane_facts, input_bindings, float_rows) = {
+        let (embed, state, readout, lane_facts, input_bindings, float_rows) = {
             let embed_ids: Option<usize> = {
                 let rep = self
                     .ctx()
@@ -1064,13 +846,12 @@ impl ProcessCtx {
             if pass.is_bound() {
                 return Ok(Err("forward pass program is already attached".to_string()));
             }
-            let reading = match reading_of(pass) {
-                Ok(reading) => reading,
+            let model = crate::model::model();
+            let lane = match model.lane(&pass.bindings.switches) {
+                Ok(lane) => lane,
                 Err(error) => return Ok(Err(error)),
             };
-            let wants_tokens = reading.is_none_or(|reading| reading.takes_tokens);
-            let wants_kv = reading.is_none_or(|reading| reading.has_kv);
-            let embed = match (pass.bindings.embed, wants_tokens) {
+            let embed = match (pass.bindings.embed, lane.embeds) {
                 (Some(embed), true) => Some(embed),
                 (None, true) => {
                     return Ok(Err(
@@ -1078,14 +859,13 @@ impl ProcessCtx {
                     ));
                 }
                 (Some(_), false) => {
-                    return Ok(Err(format!(
-                        "reading `{}` embeds no tokens, but this pass bound `embed`",
-                        reading.map_or("", |reading| reading.name.as_str())
-                    )));
+                    return Ok(Err(
+                        "this pass's lane embeds no tokens, but the pass bound `embed`".to_string(),
+                    ));
                 }
                 (None, false) => None,
             };
-            let state = match (pass.bindings.state.clone(), wants_kv) {
+            let state = match (pass.bindings.state.clone(), lane.reads_kv) {
                 (Some(state), true) => Some(state),
                 (None, true) => {
                     return Ok(Err(
@@ -1093,46 +873,21 @@ impl ProcessCtx {
                     ));
                 }
                 (Some(_), false) => {
-                    return Ok(Err(format!(
-                        "reading `{}` declares no KV space, but this pass bound `state`",
-                        reading.map_or("", |reading| reading.name.as_str())
-                    )));
+                    return Ok(Err(
+                        "this pass's lane reads no kv cache, but the pass bound `state`"
+                            .to_string(),
+                    ));
                 }
                 (None, false) => None,
             };
-            let stream = pass.bindings.stream.unwrap_or_default();
-            if let Some(reading) = reading
-                && !reading_lists_stream(reading, stream)
-            {
-                return Ok(Err(format!(
-                    "reading `{}` lists no `{}` stream; it lists {}",
-                    reading.name,
-                    stream.name(),
-                    stream_names(reading)
-                )));
-            }
-            if wants_kv && !wants_tokens {
-                return Ok(Err(format!(
-                    "reading `{}` embeds no tokens but declares a KV space; a sequence's rows \
-                     are its tokens, and this reading states none",
-                    reading.map_or("", |reading| reading.name.as_str())
-                )));
-            }
-            if pass.kind == PassKind::Diffusion && pass.bindings.canvas.is_none() {
+            if lane.reads_kv && !lane.embeds {
                 return Ok(Err(
-                    "forward pass canvas mode must be set before program on a diffusion pass"
+                    "this pass's lane reads a kv cache and embeds no tokens; a sequence's rows \
+                     are its tokens, and this lane states none"
                         .to_string(),
                 ));
             }
-            let denoise = pass.kind == PassKind::Diffusion
-                && pass.bindings.canvas == Some(CanvasMode::Denoise);
-            let model = crate::model::model();
-            let reads = model.lane_inputs(
-                reading.map(|reading| reading.name.as_str()),
-                stream,
-                denoise,
-                pass.bindings.block_draft,
-            );
+            let reads = &lane.inputs;
             let input_bindings = pass.bindings.inputs.clone();
             if let Some(&missing) = reads
                 .iter()
@@ -1157,9 +912,9 @@ impl ProcessCtx {
                 .iter()
                 .filter_map(|binding| binding.clip)
                 .collect();
-            let float_rows = if wants_tokens && wants_kv {
+            let float_rows = if lane.embeds && lane.reads_kv {
                 None
-            } else if wants_tokens {
+            } else if lane.embeds {
                 let Some(ids) = embed_ids else {
                     return Ok(Err(
                         "a cacheless encoder pass binds `embed`; this one bound none".to_string(),
@@ -1169,9 +924,8 @@ impl ProcessCtx {
                     Some(rows) => Some(rows),
                     None => {
                         return Ok(Err(format!(
-                            "reading `{}` embeds tokens and the channel bound to `embed` holds \
-                             {ids} of them",
-                            reading.map_or("", |reading| reading.name.as_str())
+                            "this pass's lane embeds tokens and the channel bound to `embed` \
+                             holds {ids} of them"
                         )));
                     }
                 }
@@ -1180,11 +934,11 @@ impl ProcessCtx {
                     Ok(Some(rows)) => Some(rows),
                     Ok(None) if !clips.is_empty() => Some(1),
                     Ok(None) => {
-                        return Ok(Err(format!(
-                            "reading `{}` embeds no tokens and this pass bound no row input; \
-                             nothing states its lane's row count",
-                            reading.map_or("", |reading| reading.name.as_str())
-                        )));
+                        return Ok(Err(
+                            "this pass's lane embeds no tokens and the pass bound no row \
+                             input; nothing states its lane's row count"
+                                .to_string(),
+                        ));
                     }
                     Err(error) => return Ok(Err(error)),
                 }
@@ -1199,8 +953,7 @@ impl ProcessCtx {
                 )));
             }
             let lane_facts = LaneFacts {
-                reading: reading.map_or(0, |reading| reading.index),
-                stream: lane_stream_of(stream),
+                switches: lane.switches,
                 group: pass.bindings.group,
                 peer: pass.bindings.peer,
                 inputs: input_bindings.iter().map(InputBinding::feed).collect(),
@@ -1210,7 +963,6 @@ impl ProcessCtx {
                 embed,
                 state,
                 pass.bindings.readout,
-                pass.bindings.block_draft,
                 lane_facts,
                 input_bindings,
                 float_rows,
@@ -1584,7 +1336,6 @@ impl ProcessCtx {
                 fires: None,
                 lanes,
                 kv_lanes,
-                block_draft: pass_block_draft,
                 rs_ws: rs_reps,
                 failed: None,
                 devgeo,
@@ -1655,113 +1406,6 @@ impl ProcessCtx {
     }
 }
 
-macro_rules! forward_pass_common {
-    ($kind:expr) => {
-        async fn new(&mut self) -> Anyhow<Resource<ForwardPass>> {
-            self.core_new($kind).await
-        }
-
-        async fn state(
-            &mut self,
-            this: Resource<ForwardPass>,
-            lanes: Vec<Resource<WorkingSet>>,
-            geom: pie::inferlet::forward::StateGeometry,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_state(this, lanes, geom).await
-        }
-
-        async fn media(
-            &mut self,
-            this: Resource<ForwardPass>,
-            spans: Vec<pie::inferlet::forward::MediaSpan>,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_media(this, spans).await
-        }
-
-        async fn embed(
-            &mut self,
-            this: Resource<ForwardPass>,
-            tokens: Resource<Channel>,
-            indptr: Resource<Channel>,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_embed(this, tokens, indptr).await
-        }
-
-        async fn readout(
-            &mut self,
-            this: Resource<ForwardPass>,
-            indices: Resource<Channel>,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_readout(this, indices).await
-        }
-
-        async fn program(
-            &mut self,
-            this: Resource<ForwardPass>,
-            container_bytes: Vec<u8>,
-            channels: Vec<Resource<Channel>>,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_program(this, container_bytes, channels).await
-        }
-
-        async fn drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {
-            self.core_drop(this).await
-        }
-
-        async fn reading(
-            &mut self,
-            this: Resource<ForwardPass>,
-            name: String,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_reading(this, name).await
-        }
-
-        async fn input(
-            &mut self,
-            this: Resource<ForwardPass>,
-            name: String,
-            ch: Resource<Channel>,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_input(this, name, ch).await
-        }
-
-        async fn stream(
-            &mut self,
-            this: Resource<ForwardPass>,
-            s: pie::inferlet::model::LaneStream,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_stream(this, s).await
-        }
-
-        async fn group(
-            &mut self,
-            this: Resource<ForwardPass>,
-            id: u32,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_group(this, id).await
-        }
-
-        async fn peer(
-            &mut self,
-            this: Resource<ForwardPass>,
-            group: u32,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_peer(this, group).await
-        }
-
-        async fn attention_classes(
-            &mut self,
-            this: Resource<ForwardPass>,
-            classes: Vec<i32>,
-            table: Vec<u8>,
-            count: u32,
-        ) -> Anyhow<Result<(), String>> {
-            self.core_attention_classes(this, classes, table, count)
-                .await
-        }
-    };
-}
-
 impl pie::inferlet::forward::Host for ProcessCtx {
     async fn submit(
         &mut self,
@@ -1777,7 +1421,18 @@ impl pie::inferlet::forward::Host for ProcessCtx {
 }
 
 impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
-    forward_pass_common!(PassKind::Text);
+    async fn new(&mut self) -> Anyhow<Resource<ForwardPass>> {
+        self.core_new().await
+    }
+
+    async fn state(
+        &mut self,
+        this: Resource<ForwardPass>,
+        lanes: Vec<Resource<WorkingSet>>,
+        geom: pie::inferlet::forward::StateGeometry,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_state(this, lanes, geom).await
+    }
 
     async fn checkpoints(
         &mut self,
@@ -1787,39 +1442,83 @@ impl pie::inferlet::forward::HostForwardPass for ProcessCtx {
         self.core_checkpoints(this, slots).await
     }
 
-    async fn set_drafting_block(
+    async fn media(
         &mut self,
         this: Resource<ForwardPass>,
-        on: bool,
+        spans: Vec<pie::inferlet::forward::MediaSpan>,
     ) -> Anyhow<Result<(), String>> {
-        self.core_set_drafting_block(this, on).await
+        self.core_media(this, spans).await
     }
-}
 
-impl pie::inferlet::forward_diffusion::Host for ProcessCtx {
-    async fn submit(
-        &mut self,
-        on: Resource<crate::pipeline::Pipeline>,
-        slots: Vec<Option<Resource<ForwardPass>>>,
-    ) -> Anyhow<Result<(), String>> {
-        self.core_submit(on, slots).await
-    }
-}
-
-impl pie::inferlet::forward_diffusion::HostForwardPass for ProcessCtx {
-    forward_pass_common!(PassKind::Diffusion);
-
-    async fn canvas(
+    async fn embed(
         &mut self,
         this: Resource<ForwardPass>,
-        mode: pie::inferlet::forward_diffusion::Mode,
+        tokens: Resource<Channel>,
+        indptr: Resource<Channel>,
     ) -> Anyhow<Result<(), String>> {
-        use pie::inferlet::forward_diffusion::Mode;
-        let mode = match mode {
-            Mode::Encode => CanvasMode::Encode,
-            Mode::Denoise => CanvasMode::Denoise,
-        };
-        self.core_canvas(this, mode).await
+        self.core_embed(this, tokens, indptr).await
+    }
+
+    async fn readout(
+        &mut self,
+        this: Resource<ForwardPass>,
+        indices: Resource<Channel>,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_readout(this, indices).await
+    }
+
+    async fn program(
+        &mut self,
+        this: Resource<ForwardPass>,
+        container_bytes: Vec<u8>,
+        channels: Vec<Resource<Channel>>,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_program(this, container_bytes, channels).await
+    }
+
+    async fn drop(&mut self, this: Resource<ForwardPass>) -> Anyhow<()> {
+        self.core_drop(this).await
+    }
+
+    async fn switch(
+        &mut self,
+        this: Resource<ForwardPass>,
+        name: String,
+        value: String,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_switch(this, name, value).await
+    }
+
+    async fn input(
+        &mut self,
+        this: Resource<ForwardPass>,
+        name: String,
+        ch: Resource<Channel>,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_input(this, name, ch).await
+    }
+
+    async fn group(&mut self, this: Resource<ForwardPass>, id: u32) -> Anyhow<Result<(), String>> {
+        self.core_group(this, id).await
+    }
+
+    async fn peer(
+        &mut self,
+        this: Resource<ForwardPass>,
+        group: u32,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_peer(this, group).await
+    }
+
+    async fn attention_classes(
+        &mut self,
+        this: Resource<ForwardPass>,
+        classes: Vec<i32>,
+        table: Vec<u8>,
+        count: u32,
+    ) -> Anyhow<Result<(), String>> {
+        self.core_attention_classes(this, classes, table, count)
+            .await
     }
 }
 
