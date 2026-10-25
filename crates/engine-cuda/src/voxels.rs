@@ -218,7 +218,9 @@ impl Tables {
                     token_row += i64::from(tt) * i64::from(th) * i64::from(tw);
                 }
             }
+            // A lane whose class reads no token grid is one row (a VAE's).
             if seat.token_patch.is_some()
+                && lane.rows != 1
                 && token_row != i64::from(lane.row_offset) + i64::from(lane.rows)
             {
                 return Err(Fault::VoxelPayload {
