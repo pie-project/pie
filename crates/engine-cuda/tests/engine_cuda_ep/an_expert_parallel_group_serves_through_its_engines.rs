@@ -6,7 +6,11 @@
 //! A step every rank announced fires every rank's prompt at once; a step
 //! only one rank brings fires the others idle, serving the routes the
 //! first sends them. Every answer is the one a single engine holding every
-//! expert gives.
+//! expert gives at the step's bucket: the group fires a step at the widest
+//! bucket any rank asks, and a fire padded to another bucket rounds its
+//! products another way (a tune picks each shape's kernel by timing it, so
+//! which way differs from one process to the next), which the micro's
+//! routes carry a few percent of the logits' spread four layers on.
 
 use engine::Engine;
 use poem::{Dtype, Platform, Request};
@@ -32,7 +36,13 @@ fn an_expert_parallel_group_serves_through_its_engines() {
 
     // One engine holding every expert, on each rank's device: the group's
     // kernels are loaded and tuned on every device before its ranks spin.
+    // Each prompt at its own bucket, as a step only its rank brings fires
+    // it, and beside a second lane that brings the step's rows to the
+    // widest prompt's (one more for the widest's own), at the bucket the
+    // step every rank brings its prompt to fires at.
+    let widest = prompts.last().expect("a group has ranks").len();
     let mut want = Vec::new();
+    let mut beside = Vec::new();
     for &ordinal in ordinals.iter().take(engine_cuda::device::ctx::count()) {
         let (_dir, path) = checkpoint(&whole, &format!("one-{ordinal}"));
         let boot = boot(ordinal);
@@ -42,6 +52,17 @@ fn an_expert_parallel_group_serves_through_its_engines() {
             .map(|p| {
                 one.open(0).expect("the seat opens");
                 answer(&mut one, &step(0, word(p.len()), p))
+            })
+            .collect();
+        beside = (prompts.iter())
+            .map(|p| {
+                one.open(0).expect("the seat opens");
+                one.open(1).expect("the seat opens");
+                let filler = prompt(widest.saturating_sub(p.len()).max(1) as u32, 99);
+                let mut both = step(0, word(p.len()), p);
+                both.lanes
+                    .extend(step(1, word(filler.len()), &filler).lanes);
+                answer(&mut one, &both)
             })
             .collect();
     }
@@ -72,7 +93,7 @@ fn an_expert_parallel_group_serves_through_its_engines() {
             .collect();
         fired.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    for (r, (got, want)) in got.iter().zip(&want).enumerate() {
+    for (r, (got, want)) in got.iter().zip(&beside).enumerate() {
         close(got, want, &format!("rank {r}'s prompt beside the others'"));
     }
 
