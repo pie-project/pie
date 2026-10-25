@@ -813,7 +813,7 @@ def cache(c, space, a, fp8):
         return
     c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
 
-def run_attention(x, inputs, a, positions = None, select = None, whole = False):
+def run_attention(x, inputs, a, positions = None, select = None, prefill_only = False):
     """Latent attention of the rows `x`. `select(q_a)`, if given, picks the
     keys each query reads; `positions` default to the rows' own."""
     pages = inputs.kv(a.kv)
@@ -853,16 +853,17 @@ def run_attention(x, inputs, a, positions = None, select = None, whole = False):
             a.theta,
             rotary.partial(a.qk_rope_head_dim),
         )
-    return attend(x, inputs, q_nope, q_pe, a, selection, whole)
+    return attend(x, inputs, q_nope, q_pe, a, selection, prefill_only)
 
-def attend(x, inputs, q_nope, q_pe, a, selection = None, whole = False):
+def attend(x, inputs, q_nope, q_pe, a, selection = None, prefill_only = False):
     """The split queries `q_nope`/`q_pe` of the rows `x` scored against the
     latent kv (or the `selection` of it), through `a`'s output projection;
-    `whole` rows read their keys whole, as the draft head's do."""
+    with `prefill_only` every lane through the prefill arm, as the draft
+    head's rows are."""
     q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
     seam.at(seam.ATTN_Q, [q])
     scored = ops.attn.attend_mla(q, q_pe, inputs, a.kv, a.heads, a.kv_lora_rank, a.sm_scale,
-                                 selection = selection, whole = whole)
+                                 selection = selection, prefill_only = prefill_only)
 
     o = ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
     if a.gate != None:
@@ -957,7 +958,7 @@ def draft(m, inputs, y, positions, logits):
         ops.linear.matmul(h, mtp.h_proj),
     )
     x = ops.elemwise.rmsnorm(fused, mtp.mixer_norm, mtp.mixer_norm_eps)
-    o = mla_mixer(x, drafted, positions, m.act, mtp.attn, whole = True)
+    o = mla_mixer(x, drafted, positions, m.act, mtp.attn, prefill_only = True)
     r = ops.elemwise.residual_add(o, fused)
     x = ops.elemwise.rmsnorm(r, mtp.mlp_norm, mtp.mlp_norm_eps)
     r = ops.elemwise.residual_add(mlp(x, mtp.mlp, None), r)
@@ -1002,11 +1003,12 @@ def mlp(x, f, hint):
     act = ops.linear.glu(ops.linear.matmul(x, s.gate_up), gating.swiglu(), s.inter, limit = f.limit)
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
 
-def mla_mixer(x, inputs, positions, act, a, whole = False):
+def mla_mixer(x, inputs, positions, act, a, prefill_only = False):
     """Latent attention over the keys the indexer picks: its rows split into
-    decode and prefill arms, or read whole (the draft head's)."""
-    select = lambda q_a: index_select(x, q_a, inputs, positions, act, a.indexer, not whole)
-    return run_attention(x, inputs, a, positions = positions, select = select, whole = whole)
+    decode and prefill arms, or every lane through the prefill arm
+    (`prefill_only`, the draft head's)."""
+    select = lambda q_a: index_select(x, q_a, inputs, positions, act, a.indexer, not prefill_only)
+    return run_attention(x, inputs, a, positions = positions, select = select, prefill_only = prefill_only)
 
 def index_select(x, q_a, inputs, positions, act, ix, split):
     keys = inputs.kv(ix.keys)

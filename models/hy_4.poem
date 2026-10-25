@@ -468,7 +468,7 @@ def cache(c, space, a, fp8 = False):
         return
     c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
 
-def run_attention(x, inputs, positions, a, selection, whole = False):
+def run_attention(x, inputs, positions, a, selection, prefill_only = False):
     """Latent attention of the rows `x` over the keys `a`'s indexer ranks,
     or with none the `selection` the last ranking layer left: the attention
     and the selection it read."""
@@ -505,7 +505,7 @@ def run_attention(x, inputs, positions, a, selection, whole = False):
 
     # The picked keys, the sinks folded in once over both kinds of lane.
     scored = ops.attn.attend_mla(q, q_pe, inputs, a.kv, a.heads, a.kv_lora_rank, a.sm_scale,
-                                 selection = selection, sinks = a.sink, whole = whole)
+                                 selection = selection, sinks = a.sink, prefill_only = prefill_only)
 
     o = ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
     o = ops.elemwise.gate_sigmoid_mul(o, ops.linear.matmul(x, a.gate))
@@ -619,7 +619,7 @@ def draft(m, inputs, hidden, positions, logits):
         ops.linear.matmul(h, mtp.h_proj),
     )
     x = ops.elemwise.rmsnorm(fused, mtp.attn_norm, mtp.norm_eps)
-    o, _ = run_attention(x, drafted, positions, mtp.attn, None, whole = True)
+    o, _ = run_attention(x, drafted, positions, mtp.attn, None, prefill_only = True)
     r = ops.elemwise.residual_add(o, fused)
     x = ops.elemwise.rmsnorm(r, mtp.mlp_norm, mtp.norm_eps)
     r = ops.elemwise.residual_add(mlp(x, mtp.mlp), r)
