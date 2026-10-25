@@ -152,6 +152,27 @@ def fold(embeds: np.ndarray, w: np.ndarray) -> np.ndarray:
     """`context_embedder(cat(h9, h18, h27))`: `[L, 7680] @ W.T`, no bias, fp32."""
     return (embeds.astype(np.float32) @ w.T).astype(np.float32)
 
+PACK = 2  # the reference's `_patchify_latents`: a token is a 2x2 block of VAE cells, (c, ph, pw)
+
+def token_grid(img_ids: np.ndarray) -> tuple[int, int]:
+    """The token grid `(h, w)` the reference's ids lay its rows on, row-major."""
+    h, w = int(img_ids[:, 1].max()) + 1, int(img_ids[:, 2].max()) + 1
+    want = np.stack(np.meshgrid(np.arange(h), np.arange(w), indexing="ij"), -1).reshape(-1, 2)
+    assert np.array_equal(img_ids[:, 1:3].astype(np.int64), want), "image ids are not a row-major grid"
+    return h, w
+
+def to_voxels(tokens: np.ndarray, h: int, w: int) -> np.ndarray:
+    """`[h*w, C*4]` packed tokens -> the VAE latent `[2h, 2w, C]`."""
+    c = tokens.shape[-1] // (PACK * PACK)
+    x = tokens.reshape(h, w, c, PACK, PACK).transpose(0, 3, 1, 4, 2)
+    return np.ascontiguousarray(x.reshape(h * PACK, w * PACK, c))
+
+def to_tokens(voxels: np.ndarray, h: int, w: int) -> np.ndarray:
+    """The VAE latent (any leading shape of `2h*2w*C` values) -> `[h*w, C*4]`."""
+    c = voxels.size // (h * PACK * w * PACK)
+    x = voxels.reshape(h, PACK, w, PACK, c).transpose(0, 2, 4, 1, 3)
+    return np.ascontiguousarray(x.reshape(h * w, c * PACK * PACK))
+
 def case(args) -> None:
     dump = np.load(os.path.join(args.golden, "flux2_golden.npz"))
     with open(os.path.join(args.golden, "MANIFEST.json")) as f:
@@ -168,7 +189,7 @@ def case(args) -> None:
         print(f"[case] note: step-0 hidden_states differ from noise.init.0 (max {np.abs(noise - init).max():.3g}); "
               f"the step-0 input is what is fed")
     img_ids = dump["dit.step0.in.img_ids"][0]
-    txt_ids = dump["dit.step0.in.txt_ids"][0]
+    th, tw = token_grid(img_ids)
     sigmas = dump["sigmas"].astype(np.float32)
     assert sigmas[-1] == 0.0, sigmas
     timestep = float(dump["dit.step0.in.timestep"][0])
@@ -183,28 +204,29 @@ def case(args) -> None:
         np.ascontiguousarray(arr, dtype=np.float32).tofile(os.path.join(args.out, name))
         return name
 
-    probe = np.stack([dump[f"dit.step{k}.in.hidden_states"][0]
+    probe = np.stack([to_voxels(dump[f"dit.step{k}.in.hidden_states"][0], th, tw)
                       for k in range(len(sigmas) - 1)])
+    latent = to_voxels(noise, th, tw)
     doc = {
         "prompt": prompt,
         "context_file": raw("context.f32", ctx),
         "probe_latents_file": raw("probe.f32", probe),
         "text_rows": int(ctx.shape[0]),
         "context_width": int(ctx.shape[1]),
-        "latents_file": raw("noise.f32", noise),
-        "image_rows": int(noise.shape[0]),
-        "channels": int(noise.shape[1]),
-        "text_positions_file": raw("txt_pos.f32", txt_ids),
-        "image_positions_file": raw("img_pos.f32", img_ids),
+        "latents_file": raw("noise.f32", latent),
+        "height": int(latent.shape[0]),
+        "width": int(latent.shape[1]),
+        "channels": int(latent.shape[2]),
         "sigmas": [float(s) for s in sigmas[:-1]],
         "native": bool(args.native),
     }
     with open(os.path.join(args.out, "case.json"), "w") as f:
         json.dump(doc, f, indent=1)
     np.savez(os.path.join(args.out, "expected.npz"),
-             **{"text.input_ids": ids, "text.hidden": ctx[: len(ids)]})
+             **{"text.input_ids": ids, "text.hidden": ctx[: len(ids)],
+                "token_grid": np.asarray([th, tw])})
     print(f"[case] prompt {prompt!r}: {len(ids)} ids {ids.tolist()}")
-    print(f"[case] context {ctx.shape}, noise {noise.shape}, sigmas {doc['sigmas']} -> {args.out}")
+    print(f"[case] context {ctx.shape}, latent {latent.shape}, sigmas {doc['sigmas']} -> {args.out}")
 
 def wasm(inferlet: str) -> str:
     """The newest `.wasm` a build left for `inferlet`, building one first."""
@@ -255,8 +277,7 @@ def run(args) -> None:
     shutil.rmtree(files_dir, ignore_errors=True)
     with open(case_path) as f:
         doc = json.load(f)
-    payload = ["case.json", doc["context_file"], doc["latents_file"],
-               doc["text_positions_file"], doc["image_positions_file"]]
+    payload = ["case.json", doc["context_file"], doc["latents_file"]]
     if doc.get("probe_latents_file"):
         payload.append(doc["probe_latents_file"])
 
@@ -311,8 +332,10 @@ def document(path: str) -> dict:
 def collect(args) -> None:
     doc = document(os.path.join(args.out, "pie.stdout"))
     files_dir = os.path.join(args.out, "pie_files")
-    rows, width = doc["image_rows"], doc["channels"]
+    cells = doc["height"] * doc["width"] * doc["channels"]
     text_rows, hidden_width = doc["text_rows"], doc["hidden_width"]
+    expected = np.load(os.path.join(args.out, "expected.npz"))
+    th, tw = (int(v) for v in expected["token_grid"])
 
     def blob(index: int, shape: tuple[int, ...]) -> np.ndarray:
         path = os.path.join(files_dir, f"file-{index:04d}.bin")
@@ -322,12 +345,15 @@ def collect(args) -> None:
         return arr.reshape(shape)
 
     names = doc["files"]
-    shapes = {"hidden.f32": (text_rows, hidden_width)}
     mine, native = {}, {}
     steps = 0
     for i, name in enumerate(names):
-        shape = shapes.get(name, (rows, width))
-        arr = blob(i, shape)
+        # Velocities and latents come back as the VAE latent; the golden
+        # holds packed tokens.
+        if name == "hidden.f32":
+            arr = blob(i, (text_rows, hidden_width))
+        else:
+            arr = to_tokens(blob(i, (cells,)), th, tw)
         if name == "hidden.f32":
             mine["text.hidden"] = arr
         elif name == "velocity0.f32":
@@ -345,7 +371,6 @@ def collect(args) -> None:
     if native:
         native["native.latent.final"] = native[f"native.sched.x{steps}"]
 
-    expected = np.load(os.path.join(args.out, "expected.npz"))
     ids = np.asarray(doc["token_ids"], dtype=np.int64)
     want = expected["text.input_ids"]
     if not np.array_equal(ids, want):
