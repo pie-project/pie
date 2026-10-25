@@ -149,18 +149,9 @@ pub struct Plane {
     forms: crate::guest::Forms,
     /// Compiled stages, by program content and batch shape.
     stages: crate::guest::run::Stages,
-
-    /// The outputs the readout and the draft head's rows are, by name.
-    readouts: (Option<String>, Option<String>),
 }
 
 impl Plane {
-    /// Names the outputs a program reads as the readout and the draft
-    /// head's rows.
-    pub fn set_readouts(&mut self, readouts: (Option<String>, Option<String>)) {
-        self.readouts = readouts;
-    }
-
     pub fn register(&mut self, registration: &ProgramRegistration) -> Result<ProgramId, Refusal> {
         let plan = eta_exec::adopt_launch_package(registration.launch.clone())
             .map_err(|error| Refusal::Program(error.to_string()))?;
@@ -666,7 +657,7 @@ impl Plane {
 
     /// Runs the guest passes of a fire's `attachments` (instance, first
     /// lane): on the fabric when the program has a device form and every
-    /// readout it reads is kept for its lane, else in the host interpreter
+    /// output it reads is kept for its lane, else in the host interpreter
     /// over the rows read out for them in `kept`. Returns, per attachment,
     /// whether it ran on the device.
     pub fn fire_guests(
@@ -674,27 +665,23 @@ impl Plane {
         device: &crate::device::Device,
         attachments: &[(InstanceId, u32)],
         kept: Option<&crate::readout::Kept>,
-        vocab: u32,
-        mtp_width: u32,
         point: Stage,
     ) -> Result<Vec<bool>, Refusal> {
-        self.fire_guests_with(device, attachments, kept, vocab, mtp_width, None, point)
+        self.fire_guests_with(device, attachments, kept, None, point)
     }
 
     /// `fire_guests`; `latch` is not held, every pass lands before this
     /// returns.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn fire_guests_with(
         &mut self,
         device: &crate::device::Device,
         attachments: &[(InstanceId, u32)],
         kept: Option<&crate::readout::Kept>,
-        vocab: u32,
-        mtp_width: u32,
         _latch: Option<&Arc<Latch>>,
         point: Stage,
     ) -> Result<Vec<bool>, Refusal> {
-        use crate::guest::run::{OnDeviceMany, Unfit, device_binds, guest_lanes, prepare};
+        use crate::guest::run::{Bound, OnDeviceMany, Unfit, bound, guest_lanes, prepare};
         for &(instance, _) in attachments {
             if let Some(seat) = self.instances.get_mut(&instance)
                 && seat.poisoned.load(Ordering::Acquire)
@@ -704,16 +691,19 @@ impl Plane {
         }
         let mut first_error: Option<Refusal> = None;
         let mut ran = vec![false; attachments.len()];
-        // The attachments the fabric takes, by program: the program has a
-        // device form and every intrinsic it reads binds there for the
-        // lane's seat. Instances of one program step in lockstep, one
-        // program per stage carrying every lane (a PE row each).
+        // The attachments the fabric takes, by program and the planes they
+        // read: the program has a device form and every output it reads
+        // binds there for the lane. Instances of one program step in
+        // lockstep, one program per stage carrying every lane (a PE row
+        // each).
         struct Placed {
             at: usize,
             instance: InstanceId,
-            seat: Option<crate::readout::Seat>,
+            bound: Vec<Bound>,
         }
-        let mut groups: BTreeMap<ProgramId, (Arc<ExecPlan>, Vec<Placed>)> = BTreeMap::new();
+        type Planes = Vec<(String, u32, usize)>;
+        type Groups = BTreeMap<(ProgramId, Planes), (Arc<ExecPlan>, Vec<Placed>)>;
+        let mut groups: Groups = BTreeMap::new();
         for (at, &(instance, lane)) in attachments.iter().enumerate() {
             let Some(seat) = self.instances.get(&instance) else {
                 continue;
@@ -721,28 +711,25 @@ impl Plane {
             if self.forms.get(seat.program).is_none() {
                 continue;
             }
-            let lanes = self.embed_indptr(seat).len().saturating_sub(1).max(1);
-            let at_seat = kept.and_then(|k| k.seat(lane as usize, lanes));
-            let binds = seat.plan.package.values.iter().all(|v| {
-                v.source != eta_compiler::codegen::launch::ValueOrigin::Output
-                    || device_binds(v, kept, at_seat)
-            });
-            if !binds {
+            let Some(bound) = bound(&seat.plan, kept, lane) else {
                 continue;
-            }
+            };
+            let planes: Planes = (bound.iter())
+                .map(|b| (b.name.clone(), b.lane, b.plane))
+                .collect();
             let group = groups
-                .entry(seat.program)
+                .entry((seat.program, planes))
                 .or_insert_with(|| (Arc::clone(&seat.plan), Vec::new()));
             // One pass per instance a fire: a repeated instance waits for the
             // next batch of its program.
             group.1.push(Placed {
                 at,
                 instance,
-                seat: at_seat,
+                bound,
             });
         }
         let cap = guest_lanes();
-        for (program, (plan, placed)) in groups {
+        for ((program, _), (plan, placed)) in groups {
             let mut batches: Vec<Vec<&Placed>> = Vec::new();
             for p in &placed {
                 match batches
@@ -769,6 +756,7 @@ impl Plane {
                         form.cols,
                         batch.len() as u32,
                         kept,
+                        &batch[0].bound,
                     ) {
                         Ok(()) => break Some(form),
                         Err(Unfit::Memory(why)) => {
@@ -797,9 +785,9 @@ impl Plane {
                 held.sort_by_key(|(id, _)| ids.iter().position(|i| i == id));
                 let mut insts: Vec<&mut InterpInstance> =
                     held.into_iter().map(|(_, inst)| inst).collect();
-                let seats = batch.iter().map(|p| p.seat).collect();
+                let bounds = batch.iter().map(|p| p.bound.clone()).collect();
                 let mut runner =
-                    OnDeviceMany::new(device, &mut self.stages, form.key, form.cols, kept, seats);
+                    OnDeviceMany::new(device, &mut self.stages, form.key, form.cols, kept, bounds);
                 let outcomes =
                     eta_exec::step_many(&mut insts, &plan, &PassInputs::none(), &mut runner, point);
                 self.tally
@@ -828,31 +816,16 @@ impl Plane {
             if ran[at] {
                 continue;
             }
-            let lanes = self.instances.get(&instance).map_or(1, |seat| {
-                self.embed_indptr(seat).len().saturating_sub(1).max(1)
-            });
-            let (rows, drafts) = match kept {
-                Some(kept) => {
-                    let mut rows = Vec::new();
-                    let mut drafts = Vec::new();
-                    for l in lane as usize..(lane as usize + lanes).min(kept.layout.len()) {
-                        rows.extend(kept.lane_rows(l).map_err(Refusal::Program)?);
-                        drafts.extend(kept.lane_drafts(l).map_err(Refusal::Program)?);
+            let mut outputs: Vec<(String, u32, Value)> = Vec::new();
+            if let (Some(kept), Some(seat)) = (kept, self.instances.get(&instance)) {
+                for (name, k) in seat.plan.outputs() {
+                    let read = kept.lane_value(lane as usize + k as usize, name);
+                    if let Some(value) = read.map_err(Refusal::Program)? {
+                        outputs.push((name.to_string(), k, value));
                     }
-                    (rows, drafts)
                 }
-                None => (Vec::new(), Vec::new()),
-            };
-            let count = (rows.len() / vocab.max(1) as usize) as u32;
-            let outcome = self.fire_interpreted(
-                instance,
-                (!rows.is_empty()).then_some(rows.as_slice()),
-                count,
-                vocab,
-                (!drafts.is_empty()).then_some(drafts.as_slice()),
-                mtp_width,
-                point,
-            );
+            }
+            let outcome = self.fire_interpreted(instance, &outputs, point);
             if let Err(why) = outcome {
                 first_error.get_or_insert(why);
             }
@@ -876,50 +849,20 @@ impl Plane {
             .is_some_and(|seat| seat.plan.prologue_runs())
     }
 
+    /// One pass of `instance` in the interpreter, its outputs read as
+    /// `outputs` (name, the pass's lane, value).
     #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
     pub fn fire_interpreted(
         &mut self,
         instance: InstanceId,
-        logits: Option<&[f32]>,
-        _rows: u32,
-        vocab: u32,
-        mtp_logits: Option<&[f32]>,
-        mtp_width: u32,
+        outputs: &[(String, u32, Value)],
         at: Stage,
     ) -> Result<(), Refusal> {
         let seat = self.instances.get_mut(&instance).ok_or(Refusal::Closed {
             what: "instance",
             id: instance.0,
         })?;
-        if let Some(values) = mtp_logits
-            && mtp_width != vocab
-        {
-            return Err(Refusal::Program(format!(
-                "instance {instance} reads a draft column {mtp_width} wide against a \
-                 {vocab}-wide trunk readout ({} draft values); this shell reads both at \
-                 one pitch",
-                values.len()
-            )));
-        }
-        let read = |values: Option<&[f32]>| values.map(|v| Value::F32(v.to_vec()));
-        let outputs: Vec<(String, u32, Value)> = seat
-            .plan
-            .outputs()
-            .into_iter()
-            .filter(|(_, lane)| *lane == 0)
-            .filter_map(|(name, lane)| {
-                let value = if Some(name) == self.readouts.0.as_deref() {
-                    read(logits)
-                } else if Some(name) == self.readouts.1.as_deref() {
-                    read(mtp_logits)
-                } else {
-                    None
-                }?;
-                Some((name.to_string(), lane, value))
-            })
-            .collect();
-        let inputs = PassInputs { outputs: &outputs };
+        let inputs = PassInputs { outputs };
         let outcome =
             eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut Interpreted, at);
         self.tally.interpreted.fetch_add(1, Ordering::AcqRel);

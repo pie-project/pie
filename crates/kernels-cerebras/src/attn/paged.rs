@@ -25,7 +25,7 @@ use crate::library::Kernel;
 use crate::phase::{
     BankSplit, ColPlane, LaneKind, Lanes, PageSource, Paged, Reduce, Segment, SlotState,
 };
-use crate::plan::{LSE_GROUPS, Merge, PageSplit, PagedLanes, Pages};
+use crate::plan::{Held, LSE_GROUPS, Merge, PageSplit, PagedLanes, Pages};
 use crate::tensor::{KvPool, RaggedTensor, Tensor};
 
 fn tables(
@@ -740,6 +740,129 @@ pub fn prefill_lse(
         Some(lse),
         None,
     )
+}
+
+/// Each lane's attention mass over its first `kv_max` keys, averaged over
+/// its last `min(observe, q_len)` rows of `q` (lane `l`'s rows from
+/// `qo[l]` to `qo[l + 1]`): the causal softmax over every key the row holds,
+/// its first `kv_max` written, into `scores` (`[lanes, q_heads * kv_max]`
+/// f32, a `kv_max` run per query head, zero past the lane's keys). A lane a
+/// phase, on one PE.
+pub fn score_capture(
+    ctx: &Ctx<'_>,
+    q: Tensor,
+    qo: &[i32],
+    plan: &PrefillPlan,
+    pool: &KvPool,
+    head_dim: u32,
+    kv_heads: u32,
+    sm_scale: f32,
+    observe: u32,
+    kv_max: u32,
+    scores: Tensor,
+) -> Result<(), Error> {
+    const OP: &str = "attn.score_capture";
+    heads_agree(OP, pool, head_dim, kv_heads)?;
+    expect(OP, q, &[Dtype::Bf16, Dtype::F32])?;
+    expect(OP, scores, &[Dtype::F32])?;
+    let t = Tables::from(plan);
+    tables(OP, t.positions, t.request_of_token, t.mask, t.mask_enabled)?;
+    if head_dim == 0 || !q.width.is_multiple_of(head_dim) {
+        return Err(refuse(
+            OP,
+            format!("q is {} wide for head_dim {head_dim}", q.width),
+        ));
+    }
+    let q_heads = q.width / head_dim;
+    if !q_heads.is_multiple_of(kv_heads) || observe == 0 || kv_max == 0 {
+        return Err(refuse(
+            OP,
+            format!(
+                "{q_heads} query heads over {kv_heads} kv heads, observing {observe} rows of \
+                 {kv_max} keys"
+            ),
+        ));
+    }
+    let lanes = qo.len().saturating_sub(1) as u32;
+    if scores.rows < lanes || scores.width != q_heads * kv_max {
+        return Err(refuse(
+            OP,
+            format!(
+                "the scores are {}x{}, wants {lanes}x{}",
+                scores.rows,
+                scores.width,
+                q_heads * kv_max
+            ),
+        ));
+    }
+    let ps = pool.page_size as u32;
+    let span = pool.max_pages * ps;
+    let pool_lanes = pool.page_indptr.elements().saturating_sub(1).max(1);
+    let row = u64::from(scores.width);
+    for (l, pair) in qo.windows(2).enumerate() {
+        let (lo, hi) = (pair[0].max(0) as u32, pair[1].max(0) as u32);
+        let n = hi.saturating_sub(lo).min(observe);
+        if n == 0 {
+            continue;
+        }
+        let held = Held::arrays(
+            &[
+                u64::from(n) * u64::from(q.width),
+                pool.keys.elements(),
+                pool.page_indices.elements(),
+                row,
+            ],
+            u64::from(n) * 2 + pool_lanes + 1,
+        );
+        if !ctx.plan().holds(held) {
+            return Err(refuse(
+                OP,
+                format!(
+                    "{} words ({row} of a lane's scores, {} of keys) on one PE, and this \
+                     capture spreads over no more",
+                    held.words,
+                    pool.keys.elements()
+                ),
+            ));
+        }
+        ctx.emit(&mut |cx| {
+            let qb = cx.read(q)?;
+            let kb = cx.read(pool.keys)?;
+            let idx = cx.read(pool.page_indices)?;
+            let ptr = cx.read(pool.page_indptr)?;
+            let pos = cx.read(t.positions)?;
+            let req = cx.read(t.request_of_token)?;
+            let ob = cx.write(scores)?;
+            let qb = cx.window_of(&qb, hi - n, n)?;
+            let pos = cx.window_of(&pos, hi - n, n)?;
+            let req = cx.window_of(&req, hi - n, n)?;
+            let ob = cx.window_of(&ob, l as u32, 1)?;
+            cx.call(
+                Kernel::ScoreCapture,
+                vec![
+                    Arg::Ptr(qb),
+                    Arg::Ptr(kb),
+                    Arg::Ptr(idx),
+                    Arg::Ptr(ptr),
+                    Arg::Ptr(pos),
+                    Arg::Ptr(req),
+                    Arg::Ptr(ob),
+                    Arg::Int(i64::from(n)),
+                    Arg::Int(pool_lanes as i64),
+                    Arg::Int(i64::from(q_heads)),
+                    Arg::Int(i64::from(q_heads / kv_heads)),
+                    Arg::Int(i64::from(kv_heads)),
+                    Arg::Int(i64::from(head_dim)),
+                    Arg::Int(i64::from(ps)),
+                    Arg::Int(i64::from(span)),
+                    Arg::Float(sm_scale),
+                    Arg::Int(i64::from(kv_max)),
+                ],
+            );
+            Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 /// A prefill whose custom mask is `mask` rather than the plan's (the plan's

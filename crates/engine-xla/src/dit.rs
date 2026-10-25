@@ -83,9 +83,6 @@ struct PixelsExport {
 pub struct Dit {
     feeds: Feeds,
     voxel: Option<VoxelSeat>,
-    /// The last float row or voxel output a plan reads out, its clips
-    /// laid out as the fire's.
-    rows: Option<ValueId>,
     pixels: Vec<PixelsExport>,
 }
 
@@ -245,23 +242,6 @@ impl Dit {
         }
         dit.voxel = voxel;
 
-        let float_rows = |value: ValueId| {
-            matches!(
-                &trace.values[value.0 as usize].ty,
-                Ty::Tensor { shape, dtype }
-                    if matches!(dtype, Dtype::Bf16 | Dtype::F32)
-                        && !matches!(
-                            shape.first(),
-                            Some(poem_ir::Dim::Readouts | poem_ir::Dim::Lanes | poem_ir::Dim::LanesPlus(_))
-                        )
-            )
-        };
-        dit.rows = trace
-            .outputs
-            .iter()
-            .filter(|output| output.grid.is_none() && float_rows(output.value))
-            .map(|output| output.value)
-            .last();
         dit.pixels = trace
             .outputs
             .iter()
@@ -275,12 +255,6 @@ impl Dit {
             })
             .collect();
         Ok(dit)
-    }
-
-    /// The float rows a plan with no readout rows reads back per token row.
-    #[must_use]
-    pub fn float_readout(&self) -> Option<ValueId> {
-        self.rows
     }
 
     /// Whether the plan exports pixels, and the widest pixel row.

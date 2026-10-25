@@ -131,10 +131,6 @@ pub enum Fault {
 
     Residency(String),
 
-    Scoreless {
-        lane: u32,
-    },
-
     Recipe(String),
 }
 
@@ -233,11 +229,6 @@ impl fmt::Display for Fault {
                  no corrected class: an adapter axis is a fact the MODEL declares \
                  and this plan has no `linear.lora_correct` arm for the id \
                  to reach"
-            ),
-            Self::Scoreless { lane } => write!(
-                f,
-                "lane {lane} lands in a class capturing attention scores, which this \
-                 shell does not run (`attn.score_capture` is not ported to Cerebras)"
             ),
             Self::Recipe(refusal) => f.write_str(refusal),
             Self::Adapter { bank, why } => write!(f, "adapter bank `{bank}`: {why}"),

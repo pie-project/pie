@@ -30,7 +30,7 @@ pub struct Probe {
     /// the refusal.
     pub outcome: std::result::Result<usize, String>,
     /// On a device that runs: whether every value the fire read back (its
-    /// rows, drafts and pixels) is finite, and how many there were.
+    /// rows and pixels) is finite, and how many there were.
     pub finite: Option<(bool, usize)>,
 }
 
@@ -85,10 +85,7 @@ impl Shell {
         let landing = landing(&facts, &self.compiled_model().classes);
         let mut probes = Vec::new();
         for (class, requests) in landing.iter().enumerate() {
-            // A score capture this shell does not serve.
-            if self.capturing.contains(class)
-                || lean && (self.masked.contains(class) || self.corrected.contains(class))
-            {
+            if lean && (self.masked.contains(class) || self.corrected.contains(class)) {
                 continue;
             }
             let plain = |prefill: bool| {
@@ -119,7 +116,6 @@ impl Shell {
                         let values = fired
                             .rows
                             .iter()
-                            .chain(&fired.drafts)
                             .flatten()
                             .chain(fired.pixels.iter().flat_map(|(p, _)| p));
                         let (mut all, mut n) = (true, 0usize);
