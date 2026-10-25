@@ -106,7 +106,7 @@ fn uses(plan: &LaunchStagePlan, bases: &[u32]) -> Uses {
                 *slot = node as u32;
             }
         }
-        for &argument in &op.args {
+        for argument in op.reads() {
             if let Some(slot) = consumers.get_mut(argument as usize) {
                 *slot += 1;
             }

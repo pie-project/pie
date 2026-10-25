@@ -61,7 +61,7 @@ impl<'a> Streams<'a> {
         let mut readers = vec![Vec::new(); stage.normalized.value_types.len()];
         let mut producers = vec![u32::MAX; stage.normalized.value_types.len()];
         for (node, op) in ops.iter().enumerate() {
-            for &arg in &op.args {
+            for arg in op.reads() {
                 if let Some(list) = readers.get_mut(arg as usize) {
                     list.push(node);
                 }
@@ -362,7 +362,7 @@ impl<'a> Streams<'a> {
         let mut reduced: Vec<u32> = Vec::new();
         for &node in &self.order[at..] {
             let op = &self.ops[node];
-            if op.args.iter().any(|a| reduced.contains(a)) {
+            if op.reads().any(|a| reduced.contains(&a)) {
                 break;
             }
             let Some(role) = self.role(node, &mut width) else {
@@ -433,7 +433,7 @@ fn emission_order(ops: &[OpView], bases: &[u32], region: &Region) -> Vec<usize> 
     let mut last_channel: Option<usize> = None;
     for i in 0..count {
         let op = &ops[nodes[i]];
-        for &arg in &op.args {
+        for arg in op.reads() {
             if let Some(p) = producer(arg) {
                 deps[i].push(p);
                 depth[i] = depth[i].max(depth[p] + u32::from(reduction(ops[nodes[p]].tag)));
