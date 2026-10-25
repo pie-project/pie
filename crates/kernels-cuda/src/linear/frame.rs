@@ -728,7 +728,18 @@ impl RowLeg {
             .iter()
             .map(|&out| plane(out, if self.slices > 1 { self.width } else { n }))
             .collect();
-        self.kernel.fire(ctx, &planes, &results, rows)
+        // The leg covers every row its product landed, as the product and
+        // the frames do: a staged window's live count would leave a sliced
+        // row's slices past it unwritten.
+        let crate::jit::ArgValue::Ptr(stage) = ctx.stage() else {
+            unreachable!("a stage window is an address");
+        };
+        ctx.disarm_stage();
+        let fired = self.kernel.fire(ctx, &planes, &results, rows);
+        if stage != 0 {
+            ctx.arm_stage(stage);
+        }
+        fired
     }
 }
 
