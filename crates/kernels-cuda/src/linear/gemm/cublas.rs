@@ -1427,14 +1427,25 @@ fn pick(
         .iter()
         .fold(f32::INFINITY, |best, &(_, ms, _)| best.min(ms));
     // One pass leaves a plateau of near-equal tactics ordered by noise: the
-    // first few within reach of the fastest are timed again in turns (a
+    // fastest few within reach of the fastest are timed again in turns (a
     // drift in the device's speed falling on each alike), and of those whose
     // medians tie the earliest (cuBLAS's own ranking) is kept.
-    let mut finals: Vec<(Tactic, f32, Vec<f32>)> = timings
-        .iter()
-        .filter(|&&(_, ms, _)| ms <= fastest * FINAL_REACH)
-        .take(FINALISTS)
-        .map(|&(candidate, ms, charge)| (candidate, charge, vec![ms]))
+    // The finalists are the fastest few within reach, not the first few:
+    // a plateau of cuBLASLt heuristics would otherwise crowd out the
+    // candidates timed after them. They keep the candidates' order, so a tie
+    // still keeps the earliest.
+    let mut reach: Vec<usize> = (0..timings.len())
+        .filter(|&i| timings[i].1 <= fastest * FINAL_REACH)
+        .collect();
+    reach.sort_by(|&a, &b| timings[a].1.total_cmp(&timings[b].1));
+    reach.truncate(FINALISTS);
+    reach.sort_unstable();
+    let mut finals: Vec<(Tactic, f32, Vec<f32>)> = reach
+        .into_iter()
+        .map(|i| {
+            let (candidate, ms, charge) = timings[i];
+            (candidate, charge, vec![ms])
+        })
         .collect();
     if finals.len() > 1 {
         for _ in 0..FINAL_ROUNDS {
@@ -1733,7 +1744,7 @@ impl TuneArena {
     /// The least of a few timings (ms) of one product, as up to `STREAMED`
     /// of them run back to back after one eviction, each reading its weight
     /// from its own slice of the slab's first half (the eviction leaves its
-    /// last third cached); `None` when that half holds fewer than four.
+    /// last third cached); `None` when that half holds fewer than two.
     fn streamed(
         &self,
         tactic: Tactic,
@@ -1745,7 +1756,7 @@ impl TuneArena {
         let weight = parts * (bench.n as usize) * (bench.k as usize) * 2;
         let cold = self.flush_bytes / 2;
         let runs = (cold / weight.next_multiple_of(256).max(1)).min(STREAMED);
-        if weight == 0 || runs < 4 {
+        if weight == 0 || runs < 2 {
             return None;
         }
         let stride = (cold / runs) & !255;
