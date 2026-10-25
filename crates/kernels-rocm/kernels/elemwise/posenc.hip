@@ -162,18 +162,21 @@ __global__ __launch_bounds__(256) void cells(
     int clips,
     int axis,
     int width,
-    int rows)
+    int rows,
+    int base)
 {
     const int row = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (row >= rows) return;
     float* o = y + static_cast<long long>(width) * row;
     for (int c = 0; c < width; ++c) o[c] = 0.0f;
+    // `base`: the fire row `y`'s row 0 stands at; the token grid addresses
+    // fire rows.
     ::pie::voxels::Lane g;
-    if (::pie::voxels::lane_of(tgrid, clips, row, g) < 0) {
+    if (::pie::voxels::lane_of(tgrid, clips, row + base, g) < 0) {
         o[axis] = static_cast<float>(positions[row]);
         return;
     }
-    const ::pie::voxels::Voxel v = ::pie::voxels::unravel(g, row - g.off);
+    const ::pie::voxels::Voxel v = ::pie::voxels::unravel(g, row + base - g.off);
     o[0] = static_cast<float>(v.t);
     o[1] = static_cast<float>(v.h);
     o[2] = static_cast<float>(v.w);

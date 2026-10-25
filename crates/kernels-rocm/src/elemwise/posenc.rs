@@ -344,13 +344,14 @@ pub fn derive_grid(
 
 /// Each token row's cell (`ops::conv::cells`): a row of a clip of `tgrid`
 /// its patch's `(t, h, w)` there, any other row `positions[row]` in column
-/// `axis`; zeros elsewhere.
+/// `axis`; zeros elsewhere. `base` is the fire row `y`'s row 0 stands at.
 pub fn cells(
     ctx: &Ctx,
     tgrid: Tensor,
     positions: Tensor,
     axis: u32,
     y: &mut Tensor,
+    base: u32,
 ) -> Result<(), Error> {
     const OP: &str = "conv.cells";
     if tgrid.dtype != Dtype::I32 || tgrid.width != 4 {
@@ -386,6 +387,7 @@ pub fn cells(
             stated(OP, axis)?.arg(),
             stated(OP, y.width)?.arg(),
             stated(OP, rows)?.arg(),
+            stated(OP, base)?.arg(),
         ],
     )
 }
