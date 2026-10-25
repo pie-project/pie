@@ -75,7 +75,8 @@ inline int conv_axis(int n, int k, int s, int front, int back, thread bool& ok) 
 }
 
 // Each token row's cell: a row of a clip of `tgrid` its patch's (t, h, w)
-// there, any other row positions[row] in column `axis`; zeros elsewhere.
+// there and the clip's size in the last three columns, any other row
+// positions[row] in column `axis`; zeros elsewhere.
 // `base`: the row `tgrid` addresses `y`'s row 0 at (a window of a segmented
 // fire starts `y` at its own rows while the fire's grid holds fire-wide
 // ones).
@@ -102,6 +103,35 @@ inline int conv_axis(int n, int k, int s, int front, int back, thread bool& ok) 
   o[0] = float(v.t);
   o[1] = float(v.h);
   o[2] = float(v.w);
+  // The clip's size in patches, in the last three columns.
+  o[width - 3] = float(g.t);
+  o[width - 2] = float(g.h);
+  o[width - 1] = float(g.w);
+}
+
+// Each row's peer value: packed row csr[g] of `x` for its lane's group `g`,
+// zeros where the group packs none.
+[[kernel]] void group_first(
+    const device float* x             [[buffer(0)]],
+    const device int* csr             [[buffer(1)]],
+    const device int* groups          [[buffer(2)]],
+    const device int* lanes           [[buffer(3)]],
+    device float* y                   [[buffer(4)]],
+    const constant int& width         [[buffer(5)]],
+    const constant int& x_rows        [[buffer(6)]],
+    const constant int& lane_count    [[buffer(7)]],
+    const constant int& group_count   [[buffer(8)]],
+    const constant int& rows          [[buffer(9)]],
+    uint gid                          [[thread_position_in_grid]]) {
+  const int row = int(gid);
+  if (row >= rows) return;
+  const int l = lanes[row];
+  const int g = (l >= 0 && l < lane_count) ? groups[l] : -1;
+  const int at = (g >= 0 && g < group_count && csr[g + 1] > csr[g]) ? csr[g] : -1;
+  device float* o = y + size_t(width) * size_t(row);
+  for (int c = 0; c < width; ++c) {
+    o[c] = (at >= 0 && at < x_rows) ? x[size_t(width) * size_t(at) + size_t(c)] : 0.0f;
+  }
 }
 
 // Each row's count of the rows `csr` packs in its lane's group.

@@ -85,6 +85,21 @@ pub enum Gather {
         #[output]
         y: ValueId,
     },
+    /// Each row's peer value: `x`'s row `csr[g]`, the first of the rows
+    /// `csr` packs in the row's lane's group `g = groups[lanes[row]]` (`x`
+    /// is that selection's rows, packed), zeros where the group has none.
+    GroupFirst {
+        #[input(F32)]
+        x: ValueId,
+        #[input(I32)]
+        csr: ValueId,
+        #[input(I32)]
+        groups: ValueId,
+        #[input(I32)]
+        lanes: ValueId,
+        #[output]
+        y: ValueId,
+    },
     /// `xs` side by side, a row each's columns after the one before's.
     ConcatCols {
         #[input]

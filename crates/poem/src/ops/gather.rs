@@ -209,6 +209,49 @@ pub fn group_rows(csr: &Value, groups: &Value, lanes: &Value) -> Value {
     y
 }
 
+/// Each of `lanes`' rows' peer value: the first row of `x` (the rows of
+/// the selection whose `group_indptr` is `csr`, packed by its
+/// `row_permutation`) in its lane's group (`groups`, the `group_of_lane`),
+/// `[rows, x.width]` f32, zeros where the group packs none: a peer lane's
+/// value, read from the group structure.
+pub fn group_first(x: &Value, csr: &Value, groups: &Value, lanes: &Value) -> Value {
+    for (what, v, rows) in [
+        ("csr", csr, Dim::LanesPlus(1)),
+        ("groups", groups, Dim::Lanes),
+    ] {
+        assert!(
+            v.rows() == rows && v.dtype() == Dtype::I32,
+            "`gather::group_first`'s {what} is a {rows:?} i32 table, not {:?}",
+            v.ty()
+        );
+    }
+    assert!(
+        lanes.rows().axis() == Some(poem_ir::RowAxis::Tokens) && lanes.dtype() == Dtype::I32,
+        "`gather::group_first` reads for each token row's lane, not {:?}",
+        lanes.ty()
+    );
+    assert!(
+        x.dtype() == Dtype::F32 && matches!(x.ty(), Ty::Tensor { shape, .. } if shape.len() == 2),
+        "`gather::group_first` reads f32 rows, not {:?}",
+        x.ty()
+    );
+    let r = lanes.rec();
+    let y = r.fresh(tensor(lanes.rows(), x.width(), Dtype::F32));
+    r.push(
+        Gather::GroupFirst {
+            x: x.id(),
+            csr: csr.id(),
+            groups: groups.id(),
+            lanes: lanes.id(),
+            y: y.id(),
+        },
+        // The packed rows and the indptr are fire-wide tables of their
+        // selection's groups: the value lands on `lanes`' rows.
+        &[groups, lanes],
+    );
+    y
+}
+
 pub fn select(table: &Value, layer: u32, width: u32) -> Value {
     let r = table.rec();
     let y = r.fresh(tensor(table.rows(), width, table.dtype()));

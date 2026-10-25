@@ -308,7 +308,7 @@ def turn_positions(arm):
     in the lane; an image row its patch's `(t, h, w)`. A lane whose
     `positions` switch says `given` reads the guest's instead."""
     given = switch_is("positions", "given")
-    computed = ops.conv.cells(arm.token_grid([1, PATCH, PATCH]), arm.positions(), 0)
+    computed, _ = ops.gather.split_rows(ops.conv.cells(arm.token_grid([1, PATCH, PATCH]), arm.positions(), 0), ROPE_AXES)
     return merge([arm.on(given).input("positions", dtype.f32, "row", ROPE_AXES), computed.on(~given)])
 
 def forward(m, inputs):

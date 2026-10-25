@@ -672,10 +672,16 @@ def turn_positions(arm, computed):
     given = switch_is("positions", "given")
     return merge([arm.on(given).input("positions", dtype.f32, "row", ROPE_AXES), computed.on(~given)])
 
+def cells(arm, dit):
+    """Each row's cell offset by the origin, `(1 + t, h, w)` on a patch
+    and `(1 + j, 0, 0)` on any other row (`j` its row in the lane), and its
+    clip's size `(t, h, w)`, zeros off every clip."""
+    cell, size = ops.gather.split_rows(ops.conv.cells(arm.token_grid(PATCH_BOX), arm.positions(), 0), ROPE_AXES)
+    return ops.elemwise.add_bias(dit.origin, cell), size
+
 def caption_positions(arm, dit):
     """A caption row's `(1 + j, 0, 0)`, `j` its row in the lane."""
-    cells = ops.conv.cells(arm.token_grid(PATCH_BOX), arm.positions(), 0)
-    return ops.elemwise.add_bias(dit.origin, cells)
+    return cells(arm, dit)[0]
 
 # The reference pads a caption to a multiple of 32 rows: a pad row is the
 # learned `cap_pad_token`, at `(0, 0, 0)`, and attends and is attended like
@@ -745,9 +751,8 @@ def denoise(arm, m):
     # A caption row `(1 + j, 0, 0)`, a pad row `(0, 0, 0)`; an image row
     # `(1 + T, h, w)`, its patch following the T (padded) rows of its
     # group's context lane.
-    cells = caption_positions(img, dit)
     follow = ops.gather.group_rows(ctx.group_indptr(), arm.group_of_lane(), lanes)
-    t_col, hw = ops.gather.split_rows(cells, 1)
+    t_col, hw = ops.gather.split_rows(caption_positions(img, dit), 1)
     image_cells = ops.gather.concat_cols([ops.elemwise.add(t_col, follow.on(image)), hw])
     positions = turn_positions(arm, merge([image_cells, padded_caption(ctx, dit)[0]]))
     joint = struct(

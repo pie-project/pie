@@ -2554,6 +2554,9 @@ fn run_host(host: &HostPhase, state: &mut HashMap<String, Vec<u32>>, at: usize) 
                         o[0] = t as f32;
                         o[1] = h as f32;
                         o[2] = w as f32;
+                        o[width - 3] = b[0] as f32;
+                        o[width - 2] = b[1] as f32;
+                        o[width - 1] = b[2] as f32;
                     }
                     None => o[axis] = pos.get(r).map_or(0, |w| *w as i32) as f32,
                 }
@@ -2615,6 +2618,48 @@ fn run_host(host: &HostPhase, state: &mut HashMap<String, Vec<u32>>, at: usize) 
                     }
                 })
                 .collect();
+            put(state, y, out);
+        }
+        HostOp::GroupFirst {
+            x,
+            csr,
+            groups,
+            lanes,
+            y,
+            csr_len,
+            lane_count,
+            rows,
+            width,
+            x_rows,
+        } => {
+            let word = |name: &str, at: i64| -> Option<i64> {
+                let at = usize::try_from(at).ok()?;
+                state.get(name)?.get(at).map(|w| i64::from(*w as i32))
+            };
+            let (rows, width) = (*rows as usize, *width as usize);
+            let src = take(state, x)?;
+            let mut out = vec![0f32; rows * width];
+            for r in 0..rows {
+                let l = word(lanes, r as i64).unwrap_or(-1);
+                let g = if (0..i64::from(*lane_count)).contains(&l) {
+                    word(groups, l).unwrap_or(-1)
+                } else {
+                    -1
+                };
+                if !(0..i64::from(*csr_len) - 1).contains(&g) {
+                    continue;
+                }
+                let (Some(a), Some(b)) = (word(csr, g), word(csr, g + 1)) else {
+                    continue;
+                };
+                if b <= a || !(0..i64::from(*x_rows)).contains(&a) {
+                    continue;
+                }
+                let a = a as usize;
+                if let Some(row) = src.get(a * width..(a + 1) * width) {
+                    out[r * width..(r + 1) * width].copy_from_slice(row);
+                }
+            }
             put(state, y, out);
         }
         HostOp::Patch {

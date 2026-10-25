@@ -796,7 +796,7 @@ def turn_positions(arm, m):
     A lane whose `positions` switch says `given` reads the guest's instead."""
     given = switch_is("positions", "given")
     reference = switch_is("stream", "reference")
-    cells = ops.conv.cells(arm.token_grid([1, m.pack, m.pack]), arm.positions(), m.rope_axes - 1)
+    cells, _ = ops.gather.split_rows(ops.conv.cells(arm.token_grid([1, m.pack, m.pack]), arm.positions(), m.rope_axes - 1), m.rope_axes)
     ref = arm.on(reference)
     k = ref.input("reference", dtype.f32, "lane", 1)
     # 10 · (k + 1): `k + k` makes the value the scale owns.

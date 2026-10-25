@@ -3,9 +3,12 @@
 
 // Positions from the clip and group tables, a thread a row. `PIE_CELLS`:
 // each token row's cell, `width` f32: a row of a clip of `tgrid` its
-// patch's (t, h, w) there, any other row positions[row] in column `axis`,
-// zeros elsewhere. `PIE_GROUP_ROWS`:
-// each row's count of the rows `csr` packs in its lane's group, one f32.
+// patch's (t, h, w) there and the clip's size in the last three columns,
+// any other row positions[row] in column `axis`, zeros elsewhere.
+// `PIE_GROUP_ROWS`: each row's count of the rows `csr` packs in its lane's
+// group, one f32. `PIE_GROUP_FIRST`: each row's peer value, `width` f32:
+// packed row csr[g] of `x` for its lane's group `g`, zeros where the group
+// packs none.
 
 #if defined(PIE_CELLS)
 [[vk::binding(0)]] StructuredBuffer<int> tgrid;
@@ -23,6 +26,21 @@ struct Params {
     uint base;
 };
 PIE_PARAMS(3, Params, params);
+#elif defined(PIE_GROUP_FIRST)
+[[vk::binding(0)]] StructuredBuffer<float> x;
+[[vk::binding(1)]] StructuredBuffer<int> csr;
+[[vk::binding(2)]] StructuredBuffer<int> groups;
+[[vk::binding(3)]] StructuredBuffer<int> lanes;
+[[vk::binding(4)]] RWStructuredBuffer<float> y;
+
+struct Params {
+    uint width;
+    uint x_rows;
+    uint lane_count;
+    uint group_count;
+    uint rows;
+};
+PIE_PARAMS(5, Params, params);
 #else
 [[vk::binding(0)]] StructuredBuffer<int> csr;
 [[vk::binding(1)]] StructuredBuffer<int> groups;
@@ -59,6 +77,19 @@ void main(uint3 gid : SV_DispatchThreadID) {
     y[at] = float(v.t);
     y[at + 1u] = float(v.h);
     y[at + 2u] = float(v.w);
+    y[at + params.width - 3u] = float(g.t);
+    y[at + params.width - 2u] = float(g.h);
+    y[at + params.width - 1u] = float(g.w);
+#elif defined(PIE_GROUP_FIRST)
+    int l = lanes[row];
+    int g = (l >= 0 && uint(l) < params.lane_count) ? groups[l] : -1;
+    int first = (g >= 0 && uint(g) < params.group_count && csr[g + 1] > csr[g]) ? csr[g] : -1;
+    uint at = params.width * row;
+    for (uint c = 0u; c < params.width; ++c) {
+        y[at + c] = (first >= 0 && uint(first) < params.x_rows)
+            ? x[params.width * uint(first) + c]
+            : 0.0;
+    }
 #else
     int l = lanes[row];
     int g = (l >= 0 && uint(l) < params.lane_count) ? groups[l] : -1;
@@ -68,3 +99,4 @@ void main(uint3 gid : SV_DispatchThreadID) {
 
 // pie:instantiate conv_cells_rows PIE_CELLS=1
 // pie:instantiate conv_cells_group_rows PIE_GROUP_ROWS=1
+// pie:instantiate conv_cells_group_first PIE_GROUP_FIRST=1

@@ -751,8 +751,9 @@ pub enum HostOp {
     },
     /// Each of `rows` token rows' cell, `width` f32 columns: a row of one of
     /// the `clips` boxes of `tgrid` (i32 `t, h, w, off`) its `(t, h, w)` in
-    /// the box, row-major; any other row `positions[row]` (i32) in column
-    /// `axis`; zeros elsewhere. `base`: the row `tgrid` addresses `y`'s row
+    /// the box, row-major, and the box's `(t, h, w)` in the last three
+    /// columns; any other row `positions[row]` (i32) in column `axis`;
+    /// zeros elsewhere. `base`: the row `tgrid` addresses `y`'s row
     /// 0 at.
     Cells {
         tgrid: String,
@@ -784,6 +785,21 @@ pub enum HostOp {
         csr_len: u32,
         lane_count: u32,
         rows: u32,
+    },
+    /// `y[r] = x[csr[g]]` (`width` f32 columns, `x` of `x_rows` rows) for
+    /// `g = groups[lanes[r]]`, zeros when the lane or group is out of the
+    /// tables or the group packs no row.
+    GroupFirst {
+        x: String,
+        csr: String,
+        groups: String,
+        lanes: String,
+        y: String,
+        csr_len: u32,
+        lane_count: u32,
+        rows: u32,
+        width: u32,
+        x_rows: u32,
     },
     /// A patch move over clip tables (`clips` boxes in each): `fold` the
     /// pixel unshuffle by `p` (`x`'s `channels` voxels of `grid` into `y`'s
@@ -947,6 +963,14 @@ impl HostOp {
                 y,
                 ..
             } => vec![csr, groups, lanes, y],
+            HostOp::GroupFirst {
+                x,
+                csr,
+                groups,
+                lanes,
+                y,
+                ..
+            } => vec![x, csr, groups, lanes, y],
             HostOp::ConcatCols { x, y, .. } => vec![x, y],
             HostOp::Patch {
                 x, grid, y, o_grid, ..
