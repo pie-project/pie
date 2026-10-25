@@ -296,8 +296,7 @@ struct Staged {
     patches: Option<PatchHandles>,
     voxels: Option<crate::voxels::Handles>,
     mrope: Option<kernels_cuda::Tensor>,
-    self_cond: Option<(kernels_cuda::Tensor, kernels_cuda::Tensor)>,
-    ports: Vec<crate::run::PortBinding>,
+    inputs: Vec<crate::run::InputBinding>,
     slots: SlotTable,
     caches: CacheTable,
     paging: Paging,
@@ -457,53 +456,20 @@ impl FireCtx<'_> {
             }
         } else if !p.voxel_feeds.is_empty() {
             return Err(Fault::Unbound {
-                what: "a channel-fed voxel port on a fire that staged no voxel table; a \
+                what: "a channel-fed voxel input on a fire that staged no voxel table; a \
                        lane that feeds one submits its clips beside it (`Step::voxels`)"
                     .to_string(),
             });
         }
-        let self_cond = if p.self_cond_rows.is_empty() {
-            None
-        } else {
-            let staged = self.inputs.stage_self_cond(
-                self.device.stream(),
-                &p.self_cond_rows,
-                &p.self_cond_weights,
-            )?;
-            for &(first, cells, rows_channel, weights_channel, instance) in &p.self_cond_feeds {
-                let bytes = cells * 4;
-                let (rows_at, weights_at) = self.programs.self_cond_cells(
-                    instance,
-                    rows_channel,
-                    weights_channel,
-                    bytes as u64,
-                )?;
-                let offset = (first * 4) as u64;
-                crate::device::alloc::copy_d2d(
-                    self.device.stream(),
-                    staged.0.ptr + offset,
-                    rows_at,
-                    bytes,
-                )?;
-                crate::device::alloc::copy_d2d(
-                    self.device.stream(),
-                    staged.1.ptr + offset,
-                    weights_at,
-                    bytes,
-                )?;
-            }
-            Some(staged)
-        };
-
-        for feed in &p.port_feeds {
+        for feed in &p.input_feeds {
             let (source, _) = self.programs.feed_cell(feed.instance, feed.channel)?;
             let rectangle = self
                 .inputs
-                .port(feed.seat.kind, feed.seat.port, u32::MAX)
+                .seat(feed.seat.id, u32::MAX)
                 .ok_or_else(|| Fault::Unbound {
                     what: format!(
-                        "the {:?} port {} rectangle, which this load carved none of",
-                        feed.seat.kind, feed.seat.port
+                        "guest input {}'s rectangle, which this load carved none of",
+                        feed.seat.id
                     ),
                 })?;
             let at = rectangle.ptr + u64::from(feed.first) * feed.seat.row_bytes();
@@ -530,9 +496,9 @@ impl FireCtx<'_> {
             u64::from(rows)
         };
         let carve_lanes = u64::from(p.lane_carve).max(u64::from(lane_count));
-        let ports: Vec<crate::run::PortBinding> = self
+        let inputs: Vec<crate::run::InputBinding> = self
             .inputs
-            .ports()
+            .guest_seats()
             .into_iter()
             .filter_map(|seat| {
                 let rows = if seat.per_lane() {
@@ -541,14 +507,9 @@ impl FireCtx<'_> {
                     carve_rows
                 };
                 self.inputs
-                    .port(
-                        seat.kind,
-                        seat.port,
-                        u32::try_from(rows).unwrap_or(u32::MAX),
-                    )
-                    .map(|tensor| crate::run::PortBinding {
-                        kind: seat.kind,
-                        port: seat.port,
+                    .seat(seat.id, u32::try_from(rows).unwrap_or(u32::MAX))
+                    .map(|tensor| crate::run::InputBinding {
+                        id: seat.id,
                         tensor,
                     })
             })
@@ -584,7 +545,7 @@ impl FireCtx<'_> {
             let Some(column) = slots.0[land.merge.0 as usize] else {
                 return Err(Fault::Unbound {
                     what: format!(
-                        "value {}, a merge over a port, which the carve gave no rectangle",
+                        "value {}, a merge over a guest input, which the carve gave no rectangle",
                         land.merge.0
                     ),
                 });
@@ -595,11 +556,11 @@ impl FireCtx<'_> {
             if land.fed {
                 let rectangle = self
                     .inputs
-                    .port(land.seat.kind, land.seat.port, u32::MAX)
+                    .seat(land.seat.id, u32::MAX)
                     .ok_or_else(|| Fault::Unbound {
                         what: format!(
-                            "the {:?} port {} rectangle, which this load carved none of",
-                            land.seat.kind, land.seat.port
+                            "guest input {}'s rectangle, which this load carved none of",
+                            land.seat.id
                         ),
                     })?;
                 crate::device::alloc::copy_any(
@@ -643,8 +604,7 @@ impl FireCtx<'_> {
             patches,
             voxels,
             mrope,
-            self_cond,
-            ports,
+            inputs,
             slots,
             caches,
             paging,
@@ -724,8 +684,6 @@ impl FireCtx<'_> {
             token_grid: staged.voxels.as_ref().and_then(|seats| seats.token_grid),
             voxels: staged.voxels.as_ref().and_then(|seats| seats.voxels),
             clip_slots: staged.voxels.as_ref().map(|seats| seats.slots),
-            self_cond_rows: staged.self_cond.map(|(rows, _)| rows),
-            self_cond_weights: staged.self_cond.map(|(_, weights)| weights),
             lane_of_row: handles.lane_of_row,
             group_of_lane: handles.group_of_lane,
             class_table: handles.class_table,
@@ -735,7 +693,7 @@ impl FireCtx<'_> {
                 .zip(&handles.packings)
                 .map(|(packed, tables)| (packed.select, *tables))
                 .collect(),
-            ports: staged.ports.clone(),
+            inputs: staged.inputs.clone(),
             geometry,
             schedules,
             plan_values: facts.plans.len(),

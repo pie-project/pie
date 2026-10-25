@@ -13,6 +13,7 @@ use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Stream, Trace, Value, Weight,
     ops, seam, trace_hybrid,
 };
+use poem_ir::InputAxis;
 
 const VOCAB: u32 = 64;
 const HEAD_DIM: u32 = 64;
@@ -64,8 +65,8 @@ impl ForwardHybrid for TokensAndLatents {
         let h = ops::linear::matmul(&o, &w("txt.o", WIDTH, HEAD_DIM));
         seam::at(seam::HIDDEN, &[&h]);
 
-        let x_img = img.latents(1, WIDTH, Dtype::Bf16);
-        let t = img.lane_vector(0, 1);
+        let x_img = img.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
+        let t = img.input("timestep", Dtype::F32, InputAxis::Lane, 1, None);
         let emb = ops::elemwise::silu(&ops::elemwise::sinusoid(&t, FREQ, 10_000.0, true, 1.0));
         let m = ops::linear::matmul(&emb, &w("ada", 2 * WIDTH, FREQ));
         let hm = ops::elemwise::modulate(
@@ -143,7 +144,7 @@ fn the_token_reading_fires_alone() {
 
     let mut text = lane(&rig, 0, &handles, LaneStream::Text, 0);
     text.tokens = (0..TEXT_ROWS).map(|r| r % VOCAB).collect();
-    text.ports.clear();
+    text.inputs.clear();
 
     let mut ticket = rig
         .engine

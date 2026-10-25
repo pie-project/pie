@@ -34,7 +34,7 @@ use crate::trace::{Handles, Root, Source, Tracer};
 use crate::weights::Weights;
 use crate::window::Windows;
 
-pub use crate::dit::{Clips, Pixels, PortCell, SelfCond};
+pub use crate::dit::{Clips, InputCell, Pixels};
 
 const OUT_SEAM: &str = poem_compiler::EXPORT_SEAMS[0];
 
@@ -154,15 +154,14 @@ pub struct Seated<'a> {
 
     pub media: Option<Media<'a>>,
 
-    /// The float ports this lane feeds, cells already read off its channels.
-    pub ports: &'a [PortCell<'a>],
+    /// The guest inputs this lane feeds, cells already read off its
+    /// channels.
+    pub inputs: &'a [InputCell<'a>],
 
     /// The lane's stream and attention group, for grouped attention.
     pub stream: u8,
 
     pub group: Option<u32>,
-
-    pub self_cond: Option<SelfCond<'a>>,
 
     /// The lane keeps no KV (a denoiser or decoder lane): it holds no
     /// rows across fires.
@@ -204,10 +203,9 @@ impl<'a> Seated<'a> {
             captures_scores: false,
             rs: &FOLD,
             media: None,
-            ports: &[],
+            inputs: &[],
             stream: 0,
             group: None,
-            self_cond: None,
             kv_less: false,
             writes: None,
             first: None,
@@ -829,16 +827,22 @@ impl Shell {
         self.dit.pixels_facts()
     }
 
-    /// The voxel port's element, when the plan reads one.
+    /// The voxel input's element, when the plan reads one.
     #[must_use]
     pub fn voxel_element(&self) -> Option<Dtype> {
         self.dit.voxel_element()
     }
 
-    /// `kind` port `port`'s element, when the plan reads it.
+    /// Guest input `id`'s seat, when the plan reads it.
     #[must_use]
-    pub fn port_element(&self, kind: engine::fire::PortKind, port: u8) -> Option<Dtype> {
-        self.dit.port_element(kind, port)
+    pub fn input_seat(&self, id: u32) -> Option<poem_exec::feeds::Seat> {
+        self.dit.seat(id)
+    }
+
+    /// Every guest input the trace names, and which lane words read it.
+    #[must_use]
+    pub fn input_decls(&self) -> Vec<poem_ir::InputDecl> {
+        self.dit.feeds().decls(&self.trace, &self.compiled)
     }
 
     #[must_use]
@@ -1124,8 +1128,7 @@ impl Shell {
                 || seated.captures_scores
                 || seated.kv_less
                 || seated.readout.is_some()
-                || !seated.ports.is_empty()
-                || seated.self_cond.is_some()
+                || !seated.inputs.is_empty()
                 || seated.attn_classes.is_some()
                 || seated.writes.is_some()
             {
@@ -1669,8 +1672,7 @@ impl Shell {
                 slot: s.lane.slot,
                 stream: s.stream,
                 group: s.group,
-                ports: s.ports,
-                self_cond: s.self_cond,
+                inputs: s.inputs,
                 clips: *shot,
                 attn_classes: s.attn_classes,
             })

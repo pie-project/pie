@@ -687,7 +687,7 @@ impl Shell {
                                 && request.reading().is_none()
                         })
                         && !feeds
-                            .ports
+                            .inputs
                             .iter()
                             .any(|(_, readers)| readers.contains(*class))
                 })
@@ -794,11 +794,6 @@ impl Shell {
                 })
             })
         });
-        let self_cond_taps = u32::try_from(declared_width(
-            &boot.trace,
-            poem_ir::RuntimeInput::SelfCondRows,
-        ))
-        .unwrap_or(u32::MAX);
         let mrope_seat = boot.trace.values.iter().any(|decl| {
             matches!(
                 decl.def,
@@ -822,8 +817,8 @@ impl Shell {
             return Err(Fault::Unbound {
                 what: format!(
                     "value {}, a merge over a runtime input this shell cannot land: only a \
-                     float port (latents, lane vector, context, axis positions) under a \
-                     conjunction of facts is landed in a merged column before the walk",
+                     lane or row guest input under a conjunction of facts is landed in a \
+                     merged column before the walk",
                     value.0
                 ),
             });
@@ -848,7 +843,6 @@ impl Shell {
             boot.runahead,
             patch_seat,
             mrope_seat,
-            u64::from(self_cond_taps),
             &feeds.seats(),
             feeds.selections.len(),
             !masked.is_empty() || !wide.is_empty(),
@@ -898,7 +892,6 @@ impl Shell {
             budgets,
             patch_seat,
             mrope_seat,
-            self_cond_taps,
             drops_patch_rows,
             towered: compiled_towered,
             patch_fold,
@@ -1434,33 +1427,6 @@ fn decoded_weight_planes(
         }
     }
     planes
-}
-
-fn declared_width(trace: &poem_ir::Trace, which: poem_ir::RuntimeInput) -> u64 {
-    trace
-        .values
-        .iter()
-        .find_map(|decl| {
-            let (poem_ir::Def::Input(named), poem_ir::Ty::Tensor { shape, .. }) =
-                (&decl.def, &decl.ty)
-            else {
-                return None;
-            };
-            if *named != which {
-                return None;
-            }
-            Some(
-                shape
-                    .iter()
-                    .skip(1)
-                    .map(|dim| match dim {
-                        poem_ir::Dim::Const(n) => *n,
-                        _ => 1,
-                    })
-                    .product(),
-            )
-        })
-        .unwrap_or(0)
 }
 
 fn patch_fold(trace: &poem_ir::Trace) -> u32 {

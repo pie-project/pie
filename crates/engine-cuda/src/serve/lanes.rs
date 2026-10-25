@@ -1,5 +1,5 @@
 use engine::fire::{
-    AttnClasses, Boundary, Masking, PortFeed, RsReset, RsSnapshot, RsVerb, SelfCondInput,
+    AttnClasses, Boundary, InputFeed, Masking, RsReset, RsSnapshot, RsVerb,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -25,7 +25,6 @@ pub struct Seated<'a> {
     pub adapter: Option<u32>,
     pub drafts: bool,
     pub captures_scores: bool,
-    pub self_cond: Option<&'a SelfCondInput>,
     pub rs: RsVerb,
     pub rs_reset: RsReset,
     pub rs_slot: Option<u32>,
@@ -34,7 +33,7 @@ pub struct Seated<'a> {
     pub stream: u8,
     pub group: Option<u32>,
     pub peer: Option<u32>,
-    pub ports: &'a [PortFeed],
+    pub inputs: &'a [InputFeed],
     pub attn_classes: Option<&'a AttnClasses>,
     pub reports: u64,
     pub tap: Option<&'a engine::fire::Tap>,
@@ -56,7 +55,6 @@ impl<'a> Seated<'a> {
             adapter: None,
             drafts: false,
             captures_scores: false,
-            self_cond: None,
             rs: RsVerb::Fold,
             rs_reset: RsReset::Inferred,
             rs_slot: None,
@@ -65,7 +63,7 @@ impl<'a> Seated<'a> {
             stream: 0,
             group: None,
             peer: None,
-            ports: &[],
+            inputs: &[],
             attn_classes: None,
             reports: 0,
             tap: None,

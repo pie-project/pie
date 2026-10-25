@@ -215,29 +215,11 @@ pub struct PatchHandles {
     pub grids: Tensor,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PortSeat {
-    pub kind: engine::fire::PortKind,
-    pub port: u8,
-    pub width: u32,
-    pub dtype: Dtype,
-}
-
-impl PortSeat {
-    #[must_use]
-    pub fn per_lane(&self) -> bool {
-        self.kind == engine::fire::PortKind::LaneVector
-    }
-
-    #[must_use]
-    pub fn row_bytes(&self) -> u64 {
-        u64::from(self.width) * poem_compiler::arena::elem_bytes(self.dtype).unwrap_or(0)
-    }
-}
+pub use poem_exec::feeds::Seat;
 
 #[derive(Debug, Clone, Copy)]
-struct PortAt {
-    seat: PortSeat,
+struct SeatAt {
+    seat: Seat,
     at: u64,
     bytes: u64,
 }
@@ -489,10 +471,7 @@ pub struct Inputs {
     patch: Option<PatchAt>,
     mrope: Option<u64>,
     mrope_bytes: u64,
-    self_cond: Option<u64>,
-    self_cond_taps: u64,
-    self_cond_bytes: u64,
-    ports: Vec<PortAt>,
+    seats: Vec<SeatAt>,
     lane_of_row: u64,
     group_of_lane: u64,
     score_seats: u64,
@@ -521,8 +500,7 @@ impl Inputs {
         runahead: engine::runahead::Runahead,
         patch: Option<PatchSeat>,
         mrope: bool,
-        self_cond_taps: u64,
-        ports: &[PortSeat],
+        seats: &[Seat],
         selections: usize,
         masked: bool,
         schedule_streams: &[Option<u32>],
@@ -584,11 +562,11 @@ impl Inputs {
             })
             .collect();
         let stage_bytes = take(0);
-        let ports: Vec<PortAt> = ports
+        let seats: Vec<SeatAt> = seats
             .iter()
             .map(|seat| {
                 let bytes = if seat.per_lane() { lanes } else { rows } * seat.row_bytes();
-                PortAt {
+                SeatAt {
                     seat: *seat,
                     at: take(bytes),
                     bytes,
@@ -604,7 +582,6 @@ impl Inputs {
             seat,
         });
         let mrope = mrope.then(|| take(rows * AXES * 4));
-        let self_cond = (self_cond_taps > 0).then(|| take(rows * self_cond_taps * 4 * 2));
         let runs = runs.max(1);
         let floats_of = plan_floats(budget, facts, &device, toggles);
         let mut per_stream: std::collections::BTreeMap<u32, u64> =
@@ -671,14 +648,7 @@ impl Inputs {
             patch,
             mrope,
             mrope_bytes: if mrope.is_some() { rows * AXES * 4 } else { 0 },
-            self_cond,
-            self_cond_taps,
-            self_cond_bytes: if self_cond.is_some() {
-                rows * self_cond_taps * 4
-            } else {
-                0
-            },
-            ports,
+            seats,
             lane_of_row,
             group_of_lane,
             score_seats,
@@ -1055,11 +1025,8 @@ impl Inputs {
     }
 
     #[must_use]
-    pub fn port(&self, kind: engine::fire::PortKind, port: u8, rows: u32) -> Option<Tensor> {
-        let at = self
-            .ports
-            .iter()
-            .find(|at| at.seat.kind == kind && at.seat.port == port)?;
+    pub fn seat(&self, id: u32, rows: u32) -> Option<Tensor> {
+        let at = self.seats.iter().find(|at| at.seat.id == id)?;
         let rows =
             rows.min(u32::try_from(at.bytes / at.seat.row_bytes().max(1)).unwrap_or(u32::MAX));
         Some(Tensor::new(
@@ -1071,8 +1038,8 @@ impl Inputs {
     }
 
     #[must_use]
-    pub fn ports(&self) -> Vec<PortSeat> {
-        self.ports.iter().map(|at| at.seat).collect()
+    pub fn guest_seats(&self) -> Vec<Seat> {
+        self.seats.iter().map(|at| at.seat).collect()
     }
 
     pub fn stage_patches(
@@ -1167,40 +1134,6 @@ impl Inputs {
             (positions.len() / AXES as usize) as u32,
             AXES as u32,
             Dtype::I32,
-        ))
-    }
-
-    pub fn stage_self_cond(
-        &mut self,
-        stream: *mut core::ffi::c_void,
-        rows: &[i32],
-        weights: &[f32],
-    ) -> Result<(Tensor, Tensor)> {
-        let Some(at) = self.self_cond else {
-            return Err(crate::error::Fault::Ceiling {
-                what: "the self-conditioning taps, which this load reserved no seat for",
-                need: rows.len() as u64 * 4,
-                have: 0,
-            });
-        };
-        let need = rows.len() as u64 * 4;
-        if need > self.self_cond_bytes || weights.len() != rows.len() {
-            return Err(crate::error::Fault::Ceiling {
-                what: "bytes of self-conditioning taps this load reserved",
-                need,
-                have: self.self_cond_bytes,
-            });
-        }
-        let base = self.store.ptr();
-        let weights_at = at + self.self_cond_bytes;
-        self.store.stage(stream, at, bytes_of(rows))?;
-        self.store
-            .stage(stream, weights_at, f32_bytes_of(weights))?;
-        let taps = self.self_cond_taps as u32;
-        let token_rows = (rows.len() as u64 / self.self_cond_taps.max(1)) as u32;
-        Ok((
-            Tensor::new(base + at, token_rows, taps, Dtype::I32),
-            Tensor::new(base + weights_at, token_rows, taps, Dtype::F32),
         ))
     }
 
@@ -1397,13 +1330,6 @@ fn i32s(ptr: u64, rows: u32) -> Tensor {
 
 fn bytes_of(values: &[i32]) -> &[u8] {
     // SAFETY: `i32` is `Copy` with no padding/niche, so all `4 * len` bytes are initialized. Result borrows the input, read-only, for one enqueue.
-    unsafe {
-        core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
-    }
-}
-
-fn f32_bytes_of(values: &[f32]) -> &[u8] {
-    // SAFETY: as [`bytes_of`] — `f32` is `Copy`, no padding or niche.
     unsafe {
         core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), core::mem::size_of_val(values))
     }

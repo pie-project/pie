@@ -195,7 +195,7 @@ pub struct Seated<'a> {
 
     pub stream: engine::fire::LaneStream,
     pub group: Option<u32>,
-    pub ports: &'a [(engine::fire::PortFeed, crate::program::PortCell)],
+    pub inputs: &'a [(engine::fire::InputFeed, crate::program::InputCell)],
 }
 
 impl<'a> Seated<'a> {
@@ -219,7 +219,7 @@ impl<'a> Seated<'a> {
             feed: None,
             stream: engine::fire::LaneStream::Text,
             group: None,
-            ports: &[],
+            inputs: &[],
         }
     }
 
@@ -564,14 +564,6 @@ impl Shell {
             .values
             .iter()
             .any(|decl| matches!(&decl.def, poem_ir::Def::Input(RuntimeInput::ReadoutRows)));
-        if declared_width(&boot.trace, RuntimeInput::SelfCondRows) > 0 {
-            return Err(Fault::Program {
-                at: "serve::load",
-                why: "this plan reads a self-conditioning input (a block-diffusion text), \
-                      which this shell stages no seat for"
-                    .to_string(),
-            });
-        }
 
         let patch_fold = patch_fold(&boot.trace);
 
@@ -585,7 +577,7 @@ impl Shell {
             return Err(Fault::Program {
                 at: "serve::load",
                 why: format!(
-                    "value {} merges ports under a guard this shell cannot select by",
+                    "value {} merges guest inputs under a guard this shell cannot select by",
                     value.0
                 ),
             });
@@ -594,11 +586,15 @@ impl Shell {
             let mut channels = 0u64;
             let mut dtype = None;
             for decl in &boot.trace.values {
-                let poem_ir::Def::Input(RuntimeInput::Voxels { channels: c, .. }) = &decl.def
+                let poem_ir::Def::Input(RuntimeInput::Guest {
+                    axis: poem_ir::InputAxis::Voxel,
+                    width,
+                    ..
+                }) = &decl.def
                 else {
                     continue;
                 };
-                channels = channels.max(u64::from(*c));
+                channels = channels.max(u64::from(*width));
                 if let Ty::Tensor { dtype: d, .. } = &decl.ty {
                     dtype = Some(*d);
                 }
@@ -1236,6 +1232,12 @@ impl Shell {
         &self.trace
     }
 
+    /// The guest inputs the loaded trace binds, by id (`Capabilities::inputs`).
+    #[must_use]
+    pub fn inputs(&self) -> Vec<poem_ir::InputDecl> {
+        self.feeds.decls(&self.trace, &self.compiled)
+    }
+
     #[must_use]
     pub fn compiled_model(&self) -> &CompiledModel {
         &self.compiled
@@ -1616,7 +1618,7 @@ impl Shell {
     }
 
     fn feed(&self, p: &Prepared<'_>) -> Result<Option<Pending>> {
-        if p.feeds.is_empty() && p.port_copies.is_empty() {
+        if p.feeds.is_empty() && p.input_copies.is_empty() {
             return Ok(None);
         }
         let (store, tokens) = self.inputs[p.arm].token_seat();
@@ -1624,10 +1626,10 @@ impl Shell {
         for &(row, cell) in &p.feeds {
             frame.copy(cell, 0, store, tokens + u64::from(row) * 4, 4)?;
         }
-        for copy in p.port_copies.iter().filter(|copy| !copy.cast) {
+        for copy in p.input_copies.iter().filter(|copy| !copy.cast) {
             frame.copy(copy.cell, 0, store, copy.at, copy.bytes)?;
         }
-        let casts: Vec<&PortCopy<'_>> = p.port_copies.iter().filter(|copy| copy.cast).collect();
+        let casts: Vec<&InputCopy<'_>> = p.input_copies.iter().filter(|copy| copy.cast).collect();
         if !casts.is_empty() {
             // A seat may sit at any bf16 element of the store, past what a
             // descriptor's offset may name: the store binds whole and the
@@ -1709,7 +1711,7 @@ impl Shell {
         } else {
             Err(program(
                 "serve::land_merges",
-                "a merged port needs a device".into(),
+                "a merged guest input needs a device".into(),
             ))
         }
     }
@@ -1719,7 +1721,7 @@ impl Shell {
         for land in &p.merge_lands {
             let column = p.slots.0[land.merge.0 as usize].ok_or_else(|| Fault::Unbound {
                 what: format!(
-                    "value {}, a merge over a port, which the carve gave no rectangle",
+                    "value {}, a merge over a guest input, which the carve gave no rectangle",
                     land.merge.0
                 ),
             })?;
@@ -1739,11 +1741,11 @@ impl Shell {
             }
             let (store, at) =
                 self.inputs[p.arm]
-                    .port_seat(land.port)
+                    .seat(land.seat.id)
                     .ok_or_else(|| Fault::Unbound {
                         what: format!(
-                            "the {:?} port {} rectangle, which this load carved none of",
-                            land.seat.kind, land.seat.port
+                            "the guest input {} rectangle, which this load carved none of",
+                            land.seat.id
                         ),
                     })?;
             frame.copy(
@@ -1757,38 +1759,35 @@ impl Shell {
         Ok(())
     }
 
-    fn feed_ports<'a>(
+    fn feed_inputs<'a>(
         &mut self,
         arm: usize,
         composition: &Composition,
         lanes: &'a [Seated<'a>],
-    ) -> Result<Vec<PortCopy<'a>>> {
+    ) -> Result<Vec<InputCopy<'a>>> {
         #[cfg_attr(not(feature = "vulkan"), allow(unused_mut))]
         let mut copies = Vec::new();
-        if self.feeds.ports.is_empty() {
+        if self.feeds.inputs.is_empty() {
             return Ok(copies);
         }
         for (at_lane, row) in composition.lanes().iter().enumerate() {
             let seated = &lanes[row.source as usize];
-            for (index, (seat, readers)) in self.feeds.ports.iter().enumerate() {
+            for (seat, readers) in &self.feeds.inputs {
                 if !readers.contains(row.class as usize) {
                     continue;
                 }
-                let Some((_, cell)) = seated
-                    .ports
-                    .iter()
-                    .find(|(feed, _)| feed.kind == seat.kind && feed.port == seat.port)
+                let Some((_, cell)) = seated.inputs.iter().find(|(feed, _)| feed.id == seat.id)
                 else {
                     return Err(program(
-                        "serve::feed_ports",
+                        "serve::feed_inputs",
                         format!(
-                            "lane {} runs in a class that reads the {:?} port {}, and the lane \
+                            "lane {} runs in a class that reads guest input {}, and the lane \
                              feeds no channel for it",
-                            row.source, seat.kind, seat.port
+                            row.source, seat.id
                         ),
                     ));
                 };
-                let voxel = seat.kind == engine::fire::PortKind::Voxels;
+                let voxel = seat.voxel();
                 let (cells, offset) = if seat.per_lane() {
                     (1u64, at_lane as u64)
                 } else if voxel {
@@ -1800,25 +1799,22 @@ impl Shell {
                 let seated_at = if voxel {
                     self.inputs[arm].voxel_payload()
                 } else {
-                    self.inputs[arm].port_seat(self.feeds.seat_of(index))
+                    self.inputs[arm].seat(seat.id)
                 };
                 let (_, base) = seated_at.ok_or_else(|| {
                     program(
-                        "serve::feed_ports",
-                        format!(
-                            "this load carved no seat for the {:?} port {}",
-                            seat.kind, seat.port
-                        ),
+                        "serve::feed_inputs",
+                        format!("this load carved no seat for guest input {}", seat.id),
                     )
                 })?;
                 let at = base + offset * seat.row_bytes();
                 match cell {
-                    crate::program::PortCell::Host { bytes: raw, dtype } => {
-                        let landed = port_bytes(raw, *dtype, seat.dtype, bytes).ok_or_else(|| {
+                    crate::program::InputCell::Host { bytes: raw, dtype } => {
+                        let landed = input_bytes(raw, *dtype, seat.dtype, bytes).ok_or_else(|| {
                             program(
-                                "serve::feed_ports",
+                                "serve::feed_inputs",
                                 format!(
-                                    "lane {} feeds a {:?} port of {bytes} bytes with a {:?} cell \
+                                    "lane {} feeds a {:?} guest input of {bytes} bytes with a {:?} cell \
                                      of {} bytes",
                                     row.source,
                                     seat.dtype,
@@ -1827,10 +1823,10 @@ impl Shell {
                                 ),
                             )
                         })?;
-                        self.inputs[arm].write_port(at, &landed)?;
+                        self.inputs[arm].write_input(at, &landed)?;
                     }
                     #[cfg(feature = "vulkan")]
-                    crate::program::PortCell::Device { cell, dtype } => {
+                    crate::program::InputCell::Device { cell, dtype } => {
                         let same = matches!(
                             (*dtype, seat.dtype),
                             (eta_ir::types::Dtype::F32, Dtype::F32)
@@ -1843,9 +1839,9 @@ impl Shell {
                         let needs = if cast { bytes * 2 } else { bytes };
                         if !(same || cast) || cell.bytes() < needs {
                             return Err(program(
-                                "serve::feed_ports",
+                                "serve::feed_inputs",
                                 format!(
-                                    "lane {} feeds a {:?} port of {bytes} bytes off a {:?} device \
+                                    "lane {} feeds a {:?} guest input of {bytes} bytes off a {:?} device \
                                      cell of {} bytes; a kept cell lands at its own element, or \
                                      arrives f32 and is cast",
                                     row.source,
@@ -1855,7 +1851,7 @@ impl Shell {
                                 ),
                             ));
                         }
-                        copies.push(PortCopy {
+                        copies.push(InputCopy {
                             cell,
                             at,
                             bytes,
@@ -2700,7 +2696,7 @@ impl Shell {
             },
         )?;
         windows.bind(&self.handles, bound.windows)?;
-        let port_copies = self.feed_ports(arm, &composition, lanes)?;
+        let input_copies = self.feed_inputs(arm, &composition, lanes)?;
         let mut merge_lands: Vec<MergeLand> = Vec::new();
         for (at_lane, row) in composition.lanes().iter().enumerate() {
             let seated = &lanes[row.source as usize];
@@ -2708,9 +2704,10 @@ impl Shell {
                 if !merged.select.holds(row.word) {
                     continue;
                 }
-                let fed = seated.ports.iter().any(|(feed, _)| {
-                    feed.kind == merged.seat.kind && feed.port == merged.seat.port
-                });
+                let fed = seated
+                    .inputs
+                    .iter()
+                    .any(|(feed, _)| feed.id == merged.seat.id);
                 merge_lands.push(MergeLand {
                     merge: merged.merge,
                     seat: merged.seat,
@@ -2720,14 +2717,6 @@ impl Shell {
                         row.row_offset
                     },
                     rows: if merged.seat.per_lane() { 1 } else { row.rows },
-                    port: self
-                        .feeds
-                        .ports
-                        .iter()
-                        .position(|(seat, _)| {
-                            seat.kind == merged.seat.kind && seat.port == merged.seat.port
-                        })
-                        .map_or(usize::MAX, |index| self.feeds.seat_of(index)),
                     fed,
                 });
             }
@@ -2808,14 +2797,7 @@ impl Shell {
                 .copied()
                 .zip(bound.packings.iter().copied())
                 .collect(),
-            ports: self
-                .feeds
-                .ports
-                .iter()
-                .filter(|(seat, _)| seat.kind != engine::fire::PortKind::Voxels)
-                .zip(&bound.ports)
-                .map(|((seat, _), tensor)| (seat.kind, seat.port, *tensor))
-                .collect(),
+            inputs: bound.inputs,
             voxels: bound.voxels,
             scores: match self.scores.as_ref() {
                 Some(slab) => Some(slab.seat(&self.handles)?),
@@ -2857,7 +2839,7 @@ impl Shell {
             lanes,
             done,
             feeds,
-            port_copies,
+            input_copies,
             merge_lands,
             classes: composition
                 .lanes()
@@ -2996,7 +2978,7 @@ pub struct Prepared<'a> {
     lanes: &'a [Seated<'a>],
     done: Option<Done>,
     feeds: Vec<(u32, &'a Buffer)>,
-    port_copies: Vec<PortCopy<'a>>,
+    input_copies: Vec<InputCopy<'a>>,
     merge_lands: Vec<MergeLand>,
     classes: Vec<usize>,
 
@@ -3111,14 +3093,13 @@ fn readout_rows(max_lanes: u32) -> u32 {
 #[cfg_attr(not(feature = "vulkan"), allow(dead_code))]
 struct MergeLand {
     merge: ValueId,
-    seat: crate::inputs::PortSeat,
-    port: usize,
+    seat: crate::inputs::Seat,
     first: u32,
     rows: u32,
     fed: bool,
 }
 
-struct PortCopy<'a> {
+struct InputCopy<'a> {
     cell: &'a Buffer,
     at: u64,
     bytes: u64,
@@ -3446,7 +3427,7 @@ impl kernels_slang::Encode for Encoded<'_> {
     }
 }
 
-fn port_bytes(raw: &[u8], from: eta_ir::types::Dtype, to: Dtype, bytes: u64) -> Option<Vec<u8>> {
+fn input_bytes(raw: &[u8], from: eta_ir::types::Dtype, to: Dtype, bytes: u64) -> Option<Vec<u8>> {
     let bytes = usize::try_from(bytes).ok()?;
     match (from, to) {
         (eta_ir::types::Dtype::F32, Dtype::Bf16) => {

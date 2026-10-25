@@ -324,8 +324,6 @@ pub struct FireBindings {
     pub token_grid: Option<Tensor>,
     pub voxels: Option<Tensor>,
     pub clip_slots: Option<Tensor>,
-    pub self_cond_rows: Option<Tensor>,
-    pub self_cond_weights: Option<Tensor>,
 
     pub lane_of_row: Tensor,
     pub group_of_lane: Option<Tensor>,
@@ -333,7 +331,7 @@ pub struct FireBindings {
     /// The fire's attention class table (`[count * count] u8`) when a lane
     /// stated classes: group-packed `attention.ragged` reads it.
     pub class_table: Option<(Tensor, u32)>,
-    pub ports: Vec<PortBinding>,
+    pub inputs: Vec<InputBinding>,
 
     pub geometry: Vec<CacheGeometry>,
 
@@ -352,9 +350,8 @@ pub struct FireBindings {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct PortBinding {
-    pub kind: engine::fire::PortKind,
-    pub port: u8,
+pub struct InputBinding {
+    pub id: u32,
     pub tensor: Tensor,
 }
 
@@ -1503,17 +1500,14 @@ impl<'c> Run<'c> {
             })
     }
 
-    fn port(&self, at: usize, kind: engine::fire::PortKind, port: u8) -> Tensor {
+    fn guest(&self, at: usize, id: u32) -> Tensor {
         self.fire
-            .ports
+            .inputs
             .iter()
-            .find(|bound| bound.kind == kind && bound.port == port)
+            .find(|bound| bound.id == id)
             .map(|bound| bound.tensor)
             .unwrap_or_else(|| {
-                panic!(
-                    "value {at} reads {kind:?} port {port}, which this load carved no \
-                     rectangle for"
-                )
+                panic!("value {at} reads guest input {id}, which this load carved no rectangle for")
             })
     }
 
@@ -1615,22 +1609,6 @@ impl<'c> Run<'c> {
             Def::Input(RuntimeInput::ImageGrids) => self.fire.patch_grids.unwrap_or_else(|| {
                 panic!("value {at} reads this fire's image grids, which no lane of it submitted")
             }),
-            Def::Input(RuntimeInput::SelfCondRows) => {
-                self.fire.self_cond_rows.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads this fire's self-conditioning taps, which this load \
-                         reserved no seat for"
-                    )
-                })
-            }
-            Def::Input(RuntimeInput::SelfCondWeights) => {
-                self.fire.self_cond_weights.unwrap_or_else(|| {
-                    panic!(
-                        "value {at} reads this fire's self-conditioning weights, which this \
-                         load reserved no seat for"
-                    )
-                })
-            }
             Def::Input(RuntimeInput::PatchPositions) => {
                 self.fire.patch_positions.unwrap_or_else(|| {
                     panic!(
@@ -1658,33 +1636,26 @@ impl<'c> Run<'c> {
                     )
                 })
             }
-            Def::Input(RuntimeInput::Voxels { channels, .. }) => {
-                let port = self.fire.voxels.unwrap_or_else(|| {
-                    panic!("value {at} reads this fire's voxel port, which no lane of it fed")
+            Def::Input(RuntimeInput::Guest {
+                axis: poem_ir::InputAxis::Voxel,
+                width,
+                ..
+            }) => {
+                let fed = self.fire.voxels.unwrap_or_else(|| {
+                    panic!("value {at} reads this fire's voxel input, which no lane of it fed")
                 });
                 assert_eq!(
-                    port.width, *channels,
-                    "value {at} reads a {channels}-wide voxel port and this fire fed a {}-wide \
-                     one: the clips ran in another reading's class",
-                    port.width
+                    fed.width, *width,
+                    "value {at} reads a {width}-wide voxel input and this fire fed a {}-wide \
+                     one: the clips ran in another class",
+                    fed.width
                 );
-                port
+                fed
             }
             Def::Input(RuntimeInput::RowPermutation { select }) => {
                 self.packing(at, *select).permutation
             }
-            Def::Input(RuntimeInput::Latents { port, .. }) => {
-                self.port(at, engine::fire::PortKind::Latents, *port)
-            }
-            Def::Input(RuntimeInput::LaneVector { port, .. }) => {
-                self.port(at, engine::fire::PortKind::LaneVector, *port)
-            }
-            Def::Input(RuntimeInput::Context { port, .. }) => {
-                self.port(at, engine::fire::PortKind::Context, *port)
-            }
-            Def::Input(RuntimeInput::AxisPositions { port, .. }) => {
-                self.port(at, engine::fire::PortKind::AxisPositions, *port)
-            }
+            Def::Input(RuntimeInput::Guest { id, .. }) => self.guest(at, *id),
             Def::Input(RuntimeInput::Geometry { space, kind }) => {
                 match kind {
                     GeomKind::RequestOfToken => return self.fire.lane_of_row,

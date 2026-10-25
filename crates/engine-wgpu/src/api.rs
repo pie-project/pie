@@ -535,6 +535,8 @@ impl Engine for Wgpu {
             bidirectional_attention: false,
             adapter_attachments: false,
             facts: shell.trace().facts.clone(),
+            inputs: poem_exec::feeds::Feeds::of(shell.trace(), shell.compiled_model())
+                .decls(shell.trace(), shell.compiled_model()),
         };
 
         self.shell = Some(shell);

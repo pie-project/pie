@@ -81,46 +81,6 @@ impl Program {
 }
 
 impl Plane {
-    pub fn self_cond_cells(
-        &self,
-        instance: InstanceId,
-        rows: ChannelId,
-        weights: ChannelId,
-        bytes: u64,
-    ) -> Result<(u64, u64)> {
-        let bound = self.instances.get(&instance).ok_or_else(|| {
-            Fault::program(
-                "program::plane",
-                format!("self-conditioning feed of unbound instance {instance}"),
-            )
-        })?;
-        let mut out = [0u64; 2];
-        for (slot, id) in [rows, weights].into_iter().enumerate() {
-            let dense = bound.ids.iter().position(|&held| held == id).ok_or_else(|| {
-                Fault::program(
-                    "program::plane",
-                    format!("self-conditioning feed names channel {id}, which instance {instance} does not carry"),
-                )
-            })?;
-            let cursor = bound.session.cursor(dense as u32).ok_or_else(|| {
-                Fault::program("program::plane", format!("channel {dense} has no cursor"))
-            })?;
-            let (address, width) = bound.session.cell(dense, cursor.head)?;
-            if width < bytes {
-                return Err(Fault::program(
-                    "program::plane",
-                    format!(
-                        "self-conditioning feed channel {id}'s cell holds {width} bytes; the taps want {bytes}"
-                    ),
-                ));
-            }
-            out[slot] = address;
-        }
-        Ok((out[0], out[1]))
-    }
-}
-
-impl Plane {
     fn dense_channel(
         &self,
         instance: InstanceId,

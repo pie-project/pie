@@ -514,6 +514,7 @@ impl Engine for Vulkan {
             bidirectional_attention: false,
             adapter_attachments: false,
             facts: shell.trace().facts.clone(),
+            inputs: shell.inputs(),
         };
 
         self.shell = Some(shell);
@@ -1138,10 +1139,10 @@ impl Vulkan {
             }
         }
 
-        let mut port_cells: Vec<Vec<(engine::fire::PortFeed, crate::program::PortCell)>> =
+        let mut input_cells: Vec<Vec<(engine::fire::InputFeed, crate::program::InputCell)>> =
             vec![Vec::new(); submission.lanes.len()];
         for (at, lane) in submission.lanes.iter().enumerate() {
-            if lane.ports.is_empty() {
+            if lane.inputs.is_empty() {
                 continue;
             }
             let instance = submission
@@ -1151,16 +1152,16 @@ impl Vulkan {
                 .map(|attachment| attachment.instance)
                 .ok_or_else(|| {
                     Error::Invalid(format!(
-                        "lane {at} feeds input ports and has no attachment; a port is read \
+                        "lane {at} feeds guest inputs and has no attachment; an input is read \
                          through the instance the lane is attached to"
                     ))
                 })?;
-            for feed in &lane.ports {
+            for feed in &lane.inputs {
                 let cell = self
                     .programs
-                    .port_cell(instance, feed.channel)
+                    .input_cell(instance, feed.channel)
                     .map_err(refusal)?;
-                port_cells[at].push((*feed, cell));
+                input_cells[at].push((*feed, cell));
             }
         }
 
@@ -1236,7 +1237,7 @@ impl Vulkan {
 
                     stream: lane.stream,
                     group: lane.group,
-                    ports: &port_cells[at],
+                    inputs: &input_cells[at],
                 })
             })
             .collect::<EngineResult<Vec<_>>>()?;

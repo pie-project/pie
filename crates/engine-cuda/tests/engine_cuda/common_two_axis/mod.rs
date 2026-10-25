@@ -9,8 +9,7 @@ use checkpoint::serving::Stamp;
 use engine::Engine;
 use engine::channel::ChannelRegistration;
 use engine::fire::{
-    Attachment, Boundary, FrameSubmission, Lane, LaneStream, PortFeed, PortKind, Readout, Step,
-    StepVoxels,
+    Attachment, Boundary, FrameSubmission, InputFeed, Lane, LaneStream, Readout, Step, StepVoxels,
 };
 use engine::load::{Budgets, Checkpoint, LoadRequest, Loaded, Residency};
 use engine::program::{InstanceBinding, ProgramRegistration};
@@ -28,6 +27,7 @@ use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm,
     Trace, Value, Weight, ops, seam, trace_hybrid,
 };
+use poem_ir::InputAxis;
 
 pub const WIDTH: u32 = 32;
 pub const HEAD_DIM: u32 = 64;
@@ -54,9 +54,9 @@ impl ForwardHybrid for TwoAxis {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
 
-        let x = dit.latents(0, WIDTH, Dtype::Bf16);
-        let t = dit.lane_vector(0, 1);
-        let pos = dit.axis_positions(0, 2);
+        let x = dit.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
+        let t = dit.input("timestep", Dtype::F32, InputAxis::Lane, 1, None);
+        let pos = dit.input("positions", Dtype::F32, InputAxis::Row, 2, None);
         let emb = ops::elemwise::sinusoid(&t, FREQ, THETA, true, 1.0);
         let emb = ops::elemwise::silu(&emb);
         let m = ops::linear::matmul(&emb, &w("ada", 2 * WIDTH, FREQ));
@@ -104,7 +104,7 @@ impl ForwardHybrid for TwoAxis {
         seam::at(seam::VELOCITY, &[&out]);
 
         let grid = vae.grid();
-        let xv = vae.voxels(0, C_IN, Dtype::Bf16);
+        let xv = vae.input("voxels", Dtype::Bf16, InputAxis::Voxel, C_IN, None);
         let conv = Weight::sym(
             "conv",
             [u64::from(C_OUT), u64::from(C_IN) * u64::from(TAPS)],
@@ -345,6 +345,8 @@ pub struct Rig {
     pub engine: engine_cuda::Cuda,
     pub loaded: Loaded,
     pub facts: poem_ir::Facts,
+    /// The plan's guest inputs by name, in id order.
+    pub inputs: Vec<String>,
     next_channel: u64,
     _dir: tempfile::TempDir,
 }
@@ -357,6 +359,11 @@ impl Rig {
             .expect("the engine opens");
         let trace = trace();
         let facts = trace.facts.clone();
+        let inputs = trace
+            .inputs
+            .iter()
+            .map(|input| input.name.clone())
+            .collect();
         let loaded = engine
             .load(LoadRequest {
                 trace,
@@ -384,9 +391,21 @@ impl Rig {
             engine,
             loaded,
             facts,
+            inputs,
             next_channel: 1,
             _dir: dir,
         }
+    }
+
+    /// The id of the plan's guest input `name`.
+    #[must_use]
+    pub fn input(&self, name: &str) -> u32 {
+        let id = self
+            .inputs
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("the plan reads no input `{name}`"));
+        u32::try_from(id).expect("fewer than 2^32 inputs")
     }
 
     #[must_use]
@@ -414,9 +433,8 @@ impl Rig {
             readout: Readout::None,
             stream: LaneStream::Image,
             group: None,
-            ports: vec![PortFeed {
-                kind: PortKind::Voxels,
-                port: 0,
+            inputs: vec![InputFeed {
+                id: self.input("voxels"),
                 channel,
             }],
             ..Lane::default()
@@ -439,20 +457,17 @@ impl Rig {
             readout: Readout::Rows((0..rows).collect()),
             stream: LaneStream::Image,
             group: Some(0),
-            ports: vec![
-                PortFeed {
-                    kind: PortKind::Latents,
-                    port: 0,
+            inputs: vec![
+                InputFeed {
+                    id: self.input("latents"),
                     channel: latent,
                 },
-                PortFeed {
-                    kind: PortKind::LaneVector,
-                    port: 0,
+                InputFeed {
+                    id: self.input("timestep"),
                     channel: timestep,
                 },
-                PortFeed {
-                    kind: PortKind::AxisPositions,
-                    port: 0,
+                InputFeed {
+                    id: self.input("positions"),
                     channel: positions,
                 },
             ],

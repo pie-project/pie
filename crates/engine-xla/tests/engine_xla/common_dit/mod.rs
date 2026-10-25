@@ -19,8 +19,7 @@ use checkpoint::contract::ModelContract;
 use engine::Engine;
 use engine::channel::{ChannelId, ChannelRegistration};
 use engine::fire::{
-    Attachment, Boundary, FrameSubmission, Lane, LaneStream, PortFeed, PortKind, Readout, Step,
-    StepVoxels,
+    Attachment, Boundary, FrameSubmission, InputFeed, Lane, LaneStream, Readout, Step, StepVoxels,
 };
 use engine::load::{Budgets, Checkpoint, LoadRequest, Loaded, Residency};
 use engine::program::{InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
@@ -37,6 +36,7 @@ use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm,
     Stream, Trace, Value, Weight, ops, seam, trace_hybrid,
 };
+use poem_ir::InputAxis;
 
 pub const WIDTH: u32 = 32;
 pub const HEAD_DIM: u32 = 64;
@@ -96,10 +96,10 @@ impl ForwardHybrid for DoubleBlock {
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
-        let x_txt = txt.latents(0, WIDTH, Dtype::Bf16);
-        let x_img = img.latents(1, WIDTH, Dtype::Bf16);
-        let t = inputs.lane_vector(0, 1);
-        let pos = inputs.axis_positions(0, 2);
+        let x_txt = txt.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
+        let x_img = img.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
+        let t = inputs.input("timestep", Dtype::F32, InputAxis::Lane, 1, None);
+        let pos = inputs.input("positions", Dtype::F32, InputAxis::Row, 2, None);
         let emb = ops::elemwise::sinusoid(&t, FREQ, THETA, true, 1.0);
         let emb = ops::elemwise::silu(&emb);
         let m = ops::linear::matmul(&emb, &w("ada", 2 * WIDTH, FREQ));
@@ -189,8 +189,8 @@ impl ForwardHybrid for TwoAxis {
         let w = |name: &str, out: u32, inner: u32| {
             Weight::sym(name, [u64::from(out), u64::from(inner)], Dtype::Bf16)
         };
-        let x = dit.latents(0, WIDTH, Dtype::Bf16);
-        let t = dit.lane_vector(0, 1);
+        let x = dit.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
+        let t = dit.input("timestep", Dtype::F32, InputAxis::Lane, 1, None);
         let emb = ops::elemwise::silu(&ops::elemwise::sinusoid(&t, FREQ, THETA, true, 1.0));
         let m = ops::linear::matmul(&emb, &w("ada", 2 * WIDTH, FREQ));
         let lanes = dit.request_of_token();
@@ -201,7 +201,7 @@ impl ForwardHybrid for TwoAxis {
         seam::at(seam::VELOCITY, &[&out]);
 
         let grid = vae.grid();
-        let xv = vae.voxels(0, C_IN, Dtype::Bf16);
+        let xv = vae.input("voxels", Dtype::Bf16, InputAxis::Voxel, C_IN, None);
         let conv = Weight::sym(
             "conv",
             [u64::from(C_OUT), u64::from(C_IN) * u64::from(TAPS)],
@@ -534,6 +534,8 @@ pub struct Rig {
     pub engine: Xla,
     pub loaded: Loaded,
     pub facts: poem_ir::Facts,
+    /// The plan's guest inputs by name, in id order.
+    pub inputs: Vec<String>,
     programs: BTreeMap<u32, ProgramId>,
     next_channel: u64,
     dir: PathBuf,
@@ -546,6 +548,16 @@ impl Drop for Rig {
 }
 
 impl Rig {
+    /// The id of the plan's guest input `name`.
+    pub fn input(&self, name: &str) -> u32 {
+        let id = self
+            .inputs
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("the plan reads no input `{name}`"));
+        u32::try_from(id).expect("fewer than 2^32 inputs")
+    }
+
     pub fn load(
         plan: Trace,
         weights: &Weights,
@@ -566,6 +578,7 @@ impl Rig {
         weights.write(&path);
         let mut engine = Xla::new(DeviceBoot::default(), contract_for);
         let facts = plan.facts.clone();
+        let inputs = plan.inputs.iter().map(|input| input.name.clone()).collect();
         let residency = Residency {
             device_kv_budget: crate::common::kv_budget(&plan, 64, 8, 64),
             ..Residency::default()
@@ -597,6 +610,7 @@ impl Rig {
             engine,
             loaded,
             facts,
+            inputs,
             programs: BTreeMap::new(),
             next_channel: 1,
             dir,
@@ -750,13 +764,10 @@ impl Rig {
     }
 }
 
-/// A double-block lane: its stream's latent port, the timestep and the
-/// positions, in attention group `group`.
+/// A double-block lane feeding every input the plan reads off its handles:
+/// the row inputs (`latents`, `context`) off the latent cell, `timestep` and
+/// `positions` off their own, in attention group `group`.
 pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, stream: LaneStream, group: u32) -> Lane {
-    let port = match stream {
-        LaneStream::Text => 0,
-        _ => 1,
-    };
     Lane {
         slot,
         word: rig
@@ -770,23 +781,19 @@ pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, stream: LaneStream, gro
         stream,
         group: Some(group),
         reading: 0,
-        ports: vec![
-            PortFeed {
-                kind: PortKind::Latents,
-                port,
-                channel: handles.latent,
-            },
-            PortFeed {
-                kind: PortKind::LaneVector,
-                port: 0,
-                channel: handles.timestep,
-            },
-            PortFeed {
-                kind: PortKind::AxisPositions,
-                port: 0,
-                channel: handles.positions,
-            },
-        ],
+        inputs: rig
+            .inputs
+            .iter()
+            .map(|name| InputFeed {
+                id: rig.input(name),
+                channel: match name.as_str() {
+                    "latents" | "context" => handles.latent,
+                    "timestep" => handles.timestep,
+                    "positions" => handles.positions,
+                    other => panic!("the fixture has no cell for input `{other}`"),
+                },
+            })
+            .collect(),
         ..Lane::default()
     }
 }

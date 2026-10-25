@@ -7,9 +7,7 @@ use crate::common_dit::{HEAD_DIM, Lcg, NAME, SM_SCALE, WIDTH, Weights, assert_cl
 use checkpoint::contract::ModelContract;
 use engine::Engine;
 use engine::channel::{ChannelId, ChannelRegistration};
-use engine::fire::{
-    Attachment, Boundary, FrameSubmission, Lane, PortFeed, PortKind, Readout, Step,
-};
+use engine::fire::{Attachment, Boundary, FrameSubmission, InputFeed, Lane, Readout, Step};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
 use engine::program::{BindExtents, InstanceBinding, ProgramRegistration};
 use eta_compiler::codegen::program::{Backend, emit_program};
@@ -23,6 +21,7 @@ use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, RaggedMask, Trace, Value, Weight, ops, seam,
     trace_hybrid,
 };
+use poem_ir::InputAxis;
 
 const HEADS: u32 = 4;
 const RANKS: usize = 4;
@@ -37,7 +36,7 @@ impl ForwardHybrid for Sharded {
     }
     fn forward(&self, inputs: Input) -> Value {
         let mine = u64::from(HEADS * HEAD_DIM / self.tp);
-        let x = inputs.latents(0, WIDTH, Dtype::Bf16);
+        let x = inputs.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
         let h = ops::elemwise::layernorm_no_scale(&x, 1e-6);
         let heads = |name: &str| Weight::sym(name, [mine, u64::from(WIDTH)], Dtype::Bf16).columns();
         let q = ops::linear::matmul(&h, &heads("q"));
@@ -317,9 +316,9 @@ fn four_ranks_land_what_one_rank_lands() {
             word: 0,
             tokens: vec![0; n as usize],
             readout: Readout::Rows((0..n).collect()),
-            ports: vec![PortFeed {
-                kind: PortKind::Latents,
-                port: 0,
+            // `latents`, the plan's one input.
+            inputs: vec![InputFeed {
+                id: 0,
                 channel: latent,
             }],
             ..Lane::default()

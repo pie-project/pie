@@ -152,6 +152,11 @@ pub struct Capabilities {
     /// classified by.
     #[serde(default)]
     pub facts: poem_ir::Facts,
+
+    /// The inputs the loaded trace's guest binds, by id, and which lane
+    /// words read each.
+    #[serde(default)]
+    pub inputs: Vec<poem_ir::InputDecl>,
 }
 
 impl Capabilities {

@@ -633,6 +633,7 @@ impl Engine for Metal {
             bidirectional_attention: true,
             adapter_attachments: false,
             facts: shell.trace().facts.clone(),
+            inputs: shell.inputs(),
         };
 
         self.shell = Some(shell);
@@ -1087,12 +1088,11 @@ impl Metal {
                     },
                     stream: lane.stream as u8,
                     group: lane.group,
-                    ports: &lane.ports,
+                    inputs: &lane.inputs,
                     pages: &lane.kv.pages,
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
                     captures_scores: lane.captures_scores,
                     mask: lane.mask.as_ref(),
-                    self_cond: lane.self_cond.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
                     positions: &lane.positions,
                     readout: match &lane.readout {

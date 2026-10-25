@@ -217,8 +217,6 @@ pub struct Lane {
     #[serde(default)]
     pub block_draft: bool,
     #[serde(default)]
-    pub self_cond: Option<SelfCondInput>,
-    #[serde(default)]
     pub rs: RsVerb,
     #[serde(default)]
     pub rs_reset: RsReset,
@@ -241,8 +239,10 @@ pub struct Lane {
     pub peer: Option<u32>,
     #[serde(default)]
     pub reading: u8,
+    /// The guest inputs this lane binds, each read off its channel's
+    /// committed cell at every fire.
     #[serde(default)]
-    pub ports: Vec<PortFeed>,
+    pub inputs: Vec<InputFeed>,
     #[serde(default)]
     pub kv_less: bool,
     #[serde(default)]
@@ -278,19 +278,11 @@ pub enum LaneStream {
     Reference = 5,
 }
 
+/// The channel a lane feeds guest input `id` (`poem_ir::RuntimeInput::Guest`)
+/// from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum PortKind {
-    Latents,
-    LaneVector,
-    Context,
-    AxisPositions,
-    Voxels,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct PortFeed {
-    pub kind: PortKind,
-    pub port: u8,
+pub struct InputFeed {
+    pub id: u32,
     pub channel: ChannelId,
 }
 
@@ -348,21 +340,6 @@ impl Lane {
         }
         if !self.channels.is_empty() && !serves.device_channel_commit {
             return Err(Error::unsupported("engine", F3_CHANNEL_TICKETS));
-        }
-        if let Some(sc) = &self.self_cond {
-            let cells = self.rows() as usize * sc.taps as usize;
-            let fed = sc.channels.is_some() && sc.rows.is_empty() && sc.weight_bits.is_empty();
-            if sc.taps == 0 || (!fed && (sc.rows.len() != cells || sc.weight_bits.len() != cells)) {
-                return Err(Error::Invalid(format!(
-                    "lane in slot {} states a self-conditioning input of {} taps as {} ids and \
-                     {} weights for its {} rows",
-                    self.slot,
-                    sc.taps,
-                    sc.rows.len(),
-                    sc.weight_bits.len(),
-                    self.rows()
-                )));
-            }
         }
         if !matches!(self.rs, RsVerb::Fold) && !serves.rs_verbs {
             return Err(Error::unsupported("engine", RS_VERBS_WITHOUT_DEVICE_HALF));
@@ -430,41 +407,6 @@ impl Serves {
             adapter_attachments: caps.adapter_attachments,
             rs_snapshots: caps.rs_snapshots,
         }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SelfCondInput {
-    pub taps: u32,
-    pub rows: Vec<u32>,
-    pub weight_bits: Vec<u32>,
-    #[serde(default)]
-    pub channels: Option<(ChannelId, ChannelId)>,
-}
-
-impl SelfCondInput {
-    #[must_use]
-    pub fn from_channels(taps: u32, rows: ChannelId, weights: ChannelId) -> Self {
-        Self {
-            taps,
-            rows: Vec::new(),
-            weight_bits: Vec::new(),
-            channels: Some((rows, weights)),
-        }
-    }
-
-    #[must_use]
-    pub fn new(taps: u32, rows: Vec<u32>, weights: &[f32]) -> SelfCondInput {
-        SelfCondInput {
-            taps,
-            rows,
-            weight_bits: weights.iter().map(|w| w.to_bits()).collect(),
-            channels: None,
-        }
-    }
-
-    pub fn weights(&self) -> impl Iterator<Item = f32> + '_ {
-        self.weight_bits.iter().map(|&bits| f32::from_bits(bits))
     }
 }
 

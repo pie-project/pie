@@ -53,6 +53,7 @@ impl Build {
                 nodes: Vec::new(),
                 seams: Vec::new(),
                 drafter: None,
+                inputs: Vec::new(),
             },
         }
     }
