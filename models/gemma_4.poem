@@ -3,7 +3,7 @@
 # head or vision tower), E2B and E4B's miniatures; and DiffusionGemma, 26B-A4B
 # as a block-diffusion text model.
 
-load("//pie/codec.poem", "nvfp4_bank")
+load("//pie/codec.poem", "nvfp4_bank", read_fused = "fused")
 load("//lib/adapters.poem", "banks")
 load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", dflash_caches = "caches", dflash_head = "head", dflash_declare = "declare")
 load("//lib/media.poem", "budget_resize")
@@ -272,7 +272,8 @@ def layout(id, deploy):
                 post_ffw_norm_1_eps = d.norm_eps,
                 post_ffw_norm_2 = norm("post_ffw_norm_2", hidden),
                 post_ffw_norm_2_eps = d.norm_eps,
-                gate_up = weight([d.moe.experts, 2 * mi, hidden], xw),
+                gate = weight([d.moe.experts, mi, hidden], xw),
+                up = weight([d.moe.experts, mi, hidden], xw),
                 down = weight([d.moe.experts, hidden, mi], xw),
                 experts = d.moe.experts,
                 top_k = d.moe.top_k,
@@ -627,19 +628,19 @@ def safetensors(m, reads, layout):
             if has(n("experts.0.gate_proj.weight_scale")):
                 # modelopt's NVFP4 export: each expert apart, its legs NVFP4.
                 e = lambda i, leg: n("experts.{}.{}_proj".format(i, leg))
-                nvfp4_bank(reads, x.gate_up, [[e(i, "gate"), e(i, "up")] for i in range(x.experts)])
+                nvfp4_bank(reads, x.gate, [[e(i, "gate")] for i in range(x.experts)])
+                nvfp4_bank(reads, x.up, [[e(i, "up")] for i in range(x.experts)])
                 nvfp4_bank(reads, x.down, [[e(i, "down")] for i in range(x.experts)])
             elif has(fused):
-                reads.read(x.gate_up, fused)
+                # Each expert's gate rows, then its up rows.
+                read_fused(reads, [x.gate, x.up], fused, axis = 1)
                 reads.read(x.down, n("experts.down_proj"))
             elif has(fused_quantized):
-                reads.read(x.gate_up, fused_quantized)
+                read_fused(reads, [x.gate, x.up], fused_quantized, axis = 1)
                 reads.read(x.down, n("experts.down_proj.weight"))
             else:
-                reads.read_concat(x.gate_up, [
-                    n("experts.switch_glu.gate_proj.weight"),
-                    n("experts.switch_glu.up_proj.weight"),
-                ])
+                reads.read(x.gate, n("experts.switch_glu.gate_proj.weight"))
+                reads.read(x.up, n("experts.switch_glu.up_proj.weight"))
                 reads.read(x.down, n("experts.switch_glu.down_proj.weight"))
 
         if w.scalar != None:
@@ -977,7 +978,9 @@ def forward(m, inputs):
                 scale = x.per_expert_scale,
             )
             moe_in = ops.elemwise.rmsnorm(y, x.pre_ffw_norm_2, x.pre_ffw_norm_2_eps)
-            hidden = ops.linear.glu(ops.linear.moe_matmul_select(moe_in, x.gate_up, experts, x.top_k), gating.geglu_tanh(), x.inter)
+            gate = ops.linear.moe_matmul_select(moe_in, x.gate, experts, x.top_k)
+            up = ops.linear.moe_matmul_select(moe_in, x.up, experts, x.top_k)
+            hidden = ops.linear.glu(gate, gating.geglu_tanh(), up = up)
             routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(hidden, x.down, experts, x.top_k), weights)
             h2 = ops.elemwise.rmsnorm(routed, x.post_ffw_norm_2, x.post_ffw_norm_2_eps)
             f = ops.elemwise.residual_add(h1, h2)
