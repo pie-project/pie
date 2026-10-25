@@ -12,7 +12,7 @@ use engine::ports::Envelope;
 use engine::program::{InstanceId, ProgramId, ProgramRegistration};
 use eta_exec::adopt_launch_package;
 use eta_exec::{ExecPlan, Extents, Versions};
-use eta_ir::registry::GeometryClass;
+use eta_ir::registry::{GeometryClass, Stage as Attach};
 
 use crate::device::Context;
 use crate::device::ctx::Frame;
@@ -339,7 +339,18 @@ impl Plane {
         Ok(bound.session.readiness(&program.plan))
     }
 
-    pub fn fire(&mut self, context: &Context, id: InstanceId) -> Result<Fired> {
+    /// Whether instance `id`'s prologue runs on its own, before the forward
+    /// ([`ExecPlan::prologue_runs`]).
+    #[must_use]
+    pub fn prologue_runs(&self, id: InstanceId) -> bool {
+        self.instances
+            .get(&id)
+            .and_then(|bound| self.programs.get(&bound.program_id))
+            .is_some_and(|program| program.plan.prologue_runs())
+    }
+
+    /// Runs instance `id`'s stages at `at` to their commit.
+    pub fn fire(&mut self, context: &Context, id: InstanceId, at: Attach) -> Result<Fired> {
         let bound = self
             .instances
             .get_mut(&id)
@@ -353,9 +364,13 @@ impl Plane {
                 ),
             )
         })?;
-        bound
-            .session
-            .fire(context, &self.pipelines, &program.compiled, &program.plan)
+        bound.session.fire(
+            context,
+            &self.pipelines,
+            &program.compiled,
+            &program.plan,
+            at,
+        )
     }
 
     pub fn stage_into(&mut self, frame: &Frame, id: InstanceId) -> Result<Launched> {
@@ -425,7 +440,8 @@ impl Plane {
                 )
             })?;
             for (stage_index, stage) in program.compiled.stages.iter().enumerate() {
-                if stage.regions.is_empty() {
+                if stage.regions.is_empty() || !program.plan.runs_at(stage_index, Attach::Epilogue)
+                {
                     continue;
                 }
                 let mut groups: BTreeMap<Option<launch::BatchKey>, Vec<&mut launch::Prepared>> =

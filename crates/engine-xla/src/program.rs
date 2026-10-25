@@ -16,8 +16,10 @@ type Placed = (Arc<ExecPlan>, [u8; 32], Option<crate::readout::Seat>);
 
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel, Ticket};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, PassInputs, StepOutcome, Value};
-use eta_ir::registry::{GeometryClass, Port};
+use eta_exec::{
+    ChannelState, ExecPlan, HostOp, InterpInstance, Interpreted, PassInputs, StepOutcome, Value,
+};
+use eta_ir::registry::{GeometryClass, Port, Stage};
 
 #[derive(Debug)]
 pub enum Refusal {
@@ -946,8 +948,9 @@ impl Plane {
         kept: Option<&crate::readout::Kept>,
         vocab: u32,
         mtp_width: u32,
+        at: Stage,
     ) -> Result<Vec<bool>, Refusal> {
-        self.fire_guests_with(device, attachments, kept, vocab, mtp_width, None)
+        self.fire_guests_with(device, attachments, kept, vocab, mtp_width, None, at)
     }
 
     /// `fire_guests`, with each device group's last stage left in flight
@@ -964,6 +967,7 @@ impl Plane {
         vocab: u32,
         mtp_width: u32,
         latch: Option<&Arc<Latch>>,
+        point: Stage,
     ) -> Result<Vec<bool>, Refusal> {
         use crate::guest::run::{Member, OnDevice, step_group, step_group_deferred};
         self.flights.wait_all();
@@ -1042,8 +1046,13 @@ impl Plane {
                     continue;
                 };
                 let mut runner = OnDevice::new(device, &mut self.stages, key, kept, seat);
-                let outcome =
-                    eta_exec::step_with(&mut held.inst, &plan, &PassInputs::none(), &mut runner);
+                let outcome = eta_exec::step_with(
+                    &mut held.inst,
+                    &plan,
+                    &PassInputs::none(),
+                    &mut runner,
+                    point,
+                );
                 ran[at] = true;
                 note(outcome, instance, held.program);
             }
@@ -1094,6 +1103,7 @@ impl Plane {
                         &mut group,
                         &carried,
                         cells,
+                        point,
                     )
                 } else {
                     let (outcomes, cells) = step_group(
@@ -1105,6 +1115,7 @@ impl Plane {
                         &mut group,
                         &carried,
                         cells,
+                        point,
                     );
                     (outcomes, cells, None)
                 };
@@ -1160,6 +1171,7 @@ impl Plane {
                 vocab,
                 (!drafts.is_empty()).then_some(drafts.as_slice()),
                 mtp_width,
+                point,
             );
             if let Err(why) = outcome {
                 first_error.get_or_insert(why);
@@ -1202,6 +1214,15 @@ impl Plane {
         (self.stages.runs, self.stages.lanes)
     }
 
+    /// Whether `instance`'s prologue runs on its own, before the forward
+    /// ([`ExecPlan::prologue_runs`]).
+    #[must_use]
+    pub fn prologue_runs(&self, instance: InstanceId) -> bool {
+        self.instances
+            .get(&instance)
+            .is_some_and(|seat| seat.plan.prologue_runs())
+    }
+
     #[doc(hidden)]
     pub fn fire_interpreted(
         &mut self,
@@ -1211,6 +1232,7 @@ impl Plane {
         vocab: u32,
         mtp_logits: Option<&[f32]>,
         mtp_width: u32,
+        at: Stage,
     ) -> Result<(), Refusal> {
         let seat = self.instances.get_mut(&instance).ok_or(Refusal::Closed {
             what: "instance",
@@ -1234,7 +1256,8 @@ impl Plane {
             mtp_draft_row: mtp_logits.map(|_| 0),
             attn_score: None,
         };
-        let outcome = eta_exec::step(&mut seat.inst, &seat.plan, &inputs);
+        let outcome =
+            eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut Interpreted, at);
         self.tally.interpreted.fetch_add(1, Ordering::AcqRel);
         let program = seat.program;
         match outcome {

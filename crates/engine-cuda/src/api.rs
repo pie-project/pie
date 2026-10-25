@@ -1189,7 +1189,7 @@ impl Cuda {
                 lane: attachment.lane,
                 lanes: attachment.lanes,
                 instance: attachment.instance,
-                at: attachment.at,
+                adapter_only: attachment.adapter_only,
             })
             .collect();
 

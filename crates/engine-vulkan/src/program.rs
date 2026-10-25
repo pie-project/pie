@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, PassInputs, StepOutcome, Value};
-use eta_ir::registry::{GeometryClass, Port};
+use eta_ir::registry::{GeometryClass, Port, Stage};
 
 #[derive(Debug)]
 pub enum Refusal {
@@ -442,10 +442,22 @@ impl Plane {
         }
     }
 
+    /// Whether `instance`'s prologue runs on its own, before the forward
+    /// ([`ExecPlan::prologue_runs`]).
+    #[must_use]
+    pub fn prologue_runs(&self, instance: InstanceId) -> bool {
+        self.instances
+            .get(&instance)
+            .is_some_and(|seat| seat.plan.prologue_runs())
+    }
+
+    /// Runs `instance`'s stages at `at`, to their commit: the prologue's
+    /// before the forward, the rest after it.
     #[allow(clippy::too_many_arguments)]
     pub fn fire(
         &mut self,
         instance: InstanceId,
+        at: Stage,
         logits: Option<&[f32]>,
         rows: u32,
         vocab: u32,
@@ -518,7 +530,7 @@ impl Plane {
             let session = &mut seat.session;
             let mut runner = crate::guest::run::OnDevice::new(device_half, session, widen, readout)
                 .with_lanes(readouts, pixels);
-            let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut runner);
+            let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut runner, at);
             let ran = runner.ran().len();
             widen.disarm();
             (outcome, ran)
@@ -526,7 +538,7 @@ impl Plane {
 
         #[cfg(not(feature = "vulkan"))]
         return {
-            let _ = (&inputs, tally, seat);
+            let _ = (&inputs, tally, seat, at);
             Err(Refusal::Program(format!(
                 "instance {instance}: this build carries no Vulkan device, so a guest pass has nowhere to run"
             )))
@@ -630,7 +642,13 @@ impl Plane {
             crate::guest::run::OnDevice::new(device, &mut seat.session, widen, readout)
                 .with_lanes(readouts, pixels)
                 .deferred();
-        let outcome = eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut runner);
+        let outcome = eta_exec::step_with(
+            &mut seat.inst,
+            &seat.plan,
+            &inputs,
+            &mut runner,
+            Stage::Epilogue,
+        );
         let deferral = runner.take_deferral().unwrap_or_default();
         widen.disarm();
         let program = seat.program;

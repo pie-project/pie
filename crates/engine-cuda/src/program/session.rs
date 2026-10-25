@@ -3,7 +3,7 @@ use std::sync::Arc;
 use engine::ports::Envelope;
 use eta_exec::{ExecPlan, Extents};
 use eta_ir::container::HostRole;
-use eta_ir::registry::{GeometryClass, Port};
+use eta_ir::registry::{GeometryClass, Port, Stage as Attach};
 use eta_ir::validate::Direction;
 use kernels_cuda::runtime::channel::{self, PublishLane, PullLane, SettleLane, Ticket};
 
@@ -404,11 +404,14 @@ impl Session {
         self.extents
     }
 
+    /// Mints the stages that run at `at` ([`ExecPlan::runs_at`]) as one
+    /// commit: the prologue's before the forward, the rest after it.
     pub fn stage(
         &mut self,
         compiled: &Compiled,
         plan: &ExecPlan,
         wave: &mut Wave,
+        at: Attach,
     ) -> Result<Launched> {
         if self.poisoned {
             return Ok(Launched::Refused(Fired::Faulted(
@@ -416,7 +419,29 @@ impl Session {
             )));
         }
         stages_and_plans_agree(compiled)?;
+        if at != Attach::Prologue {
+            self.intrinsics_bound(plan)?;
+        }
+        if let Some(blocked) = self.blocked_at(plan, at) {
+            return Ok(Launched::Refused(Fired::Blocked(blocked)));
+        }
 
+        let slot = self.free_commit()?;
+        let minted = match self.mint(plan, wave, slot, at) {
+            Ok(minted) => minted,
+            Err(why) => {
+                self.poisoned = true;
+                return Ok(Launched::Refused(Fired::Faulted(why)));
+            }
+        };
+
+        self.pending.push_back(minted);
+        Ok(Launched::Airborne)
+    }
+
+    /// Refuses a pass whose epilogue reads an intrinsic no buffer is bound
+    /// to: the emitted kernel would dereference the side table's zero.
+    fn intrinsics_bound(&self, plan: &ExecPlan) -> Result<()> {
         if plan.reads_intrinsic(eta_ir::op::IntrinsicId::Logits)
             && !self.bound(eta_ir::op::IntrinsicId::Logits, 0)
         {
@@ -477,29 +502,15 @@ impl Session {
             ));
         }
 
-        if let Some(blocked) = self.blocked_channel(plan) {
-            return Ok(Launched::Refused(Fired::Blocked(blocked)));
-        }
-
-        let slot = self.free_commit()?;
-        let minted = match self.mint(plan, wave, slot) {
-            Ok(minted) => minted,
-            Err(why) => {
-                self.poisoned = true;
-                return Ok(Launched::Refused(Fired::Faulted(why)));
-            }
-        };
-
-        self.pending.push_back(minted);
-        Ok(Launched::Airborne)
+        Ok(())
     }
 
-    pub fn take_lane(&mut self, stages: &mut [Option<Prepared>]) -> Result<()> {
+    pub fn take_lane(&mut self, stages: Vec<&mut Prepared>) -> Result<()> {
         let Some(minted) = self.pending.back() else {
             return Ok(());
         };
         let commit = self.commits[minted.slot].device();
-        for prepared in stages.iter_mut().flatten() {
+        for prepared in stages {
             let lane = prepared.stage_lane(&self.rings, &minted.before, commit)?;
             for intrinsic in self.intrinsics.iter().flatten() {
                 prepared.bind_intrinsic(
@@ -545,7 +556,9 @@ impl Session {
     /// The shared rings this instance's stages put.
     pub fn shared_puts<'p>(&'p self, plan: &'p ExecPlan) -> impl Iterator<Item = usize> + 'p {
         (0..self.shapes.len()).filter_map(move |channel| {
-            if !plan.puts_channel(channel as u32) {
+            if !plan.puts_channel(channel as u32, Attach::Prologue)
+                && !plan.puts_channel(channel as u32, Attach::Epilogue)
+            {
                 return None;
             }
             self.rings
@@ -579,6 +592,7 @@ impl Session {
         plan: &ExecPlan,
         wave: &mut Wave,
         slot: usize,
+        at: Attach,
     ) -> std::result::Result<Minted, String> {
         let before = self.cursors_now();
         let mut next = before.clone();
@@ -604,9 +618,9 @@ impl Session {
             if cursor.tail < cursor.head {
                 return Err(format!("channel {channel}: tail precedes head at mint"));
             }
-            let takes = plan.takes_channel(slot);
-            let puts = plan.puts_channel(slot);
-            let addresses_head = takes || plan.reads_channel(slot);
+            let takes = plan.takes_channel(slot, at);
+            let puts = plan.puts_channel(slot, at);
+            let addresses_head = takes || plan.reads_channel(slot, at);
 
             let shared = self
                 .rings
@@ -664,7 +678,7 @@ impl Session {
                     flags |= Ticket::HOST_READER;
                 }
             }
-            if plan.requires_channel_input(slot) {
+            if plan.requires_channel_input(slot, at) {
                 flags |= Ticket::REQUIRE_INPUT;
             }
             if moved_head && endpoint.engine_owns_head() {
@@ -830,14 +844,19 @@ impl Session {
         None
     }
 
+    /// The first channel not as the whole pass needs it, each at the point
+    /// of the stage that uses it first.
     #[must_use]
     pub fn blocked_channel(&self, plan: &ExecPlan) -> Option<u32> {
+        self.blocked_at(plan, Attach::Prologue)
+            .or_else(|| self.blocked_at(plan, Attach::Epilogue))
+    }
+
+    /// The first channel not as the stages at `at` need it.
+    #[must_use]
+    pub fn blocked_at(&self, plan: &ExecPlan, at: Attach) -> Option<u32> {
         for channel in 0..self.shapes.len() {
-            let readiness = plan
-                .package
-                .channels
-                .get(channel)
-                .and_then(|declared| declared.readiness);
+            let readiness = plan.readiness(channel as u32, at);
             let live = self.depth(channel as u32);
             let capacity = u64::from(self.shapes[channel].capacity);
             let ready = match readiness {

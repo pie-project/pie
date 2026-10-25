@@ -7,6 +7,24 @@ fn container_has_attention_stages(container: &eta_ir::container::TraceContainer)
         .any(|s| matches!(s.stage, Stage::OnAttnProj | Stage::OnAttn))
 }
 
+/// A prologue that takes or puts a channel runs, and commits, before the
+/// forward of the fire that runs its program.
+fn container_prologue_moves(container: &eta_ir::container::TraceContainer) -> bool {
+    use eta_ir::op::ChannelUse;
+    use eta_ir::registry::Stage;
+    container
+        .stages
+        .iter()
+        .filter(|s| s.stage == Stage::Prologue)
+        .flat_map(|s| s.ops.iter())
+        .any(|op| {
+            matches!(
+                op.channel_use(),
+                Some((ChannelUse::Take | ChannelUse::Put, _))
+            )
+        })
+}
+
 fn container_has_lora_sink(container: &eta_ir::container::TraceContainer) -> bool {
     container
         .stages
@@ -2401,6 +2419,10 @@ pub async fn submit_pass_stamped<C: FireContext>(
                 .into_iter()
                 .any(|count| (0..req.lanes.len()).all(|lane| fold.of(lane) == Some(count)));
         let (attention_stages, adapted) = hook_program_of(ctx, &fwd)?;
+        // The program runs on a cut pass's last fire: a prologue whose
+        // effects the forward may read would run after the first fires'.
+        let prologue_moves =
+            container_prologue_moves(&ctx.resources().get(&fwd)?.instance.program.bound.container);
         let hooked = attention_stages || adapted;
         let plain = switched.plain();
         let keyable = decode_envelope.is_none()
@@ -2414,6 +2436,7 @@ pub async fn submit_pass_stamped<C: FireContext>(
             && !wide
             && plain
             && !attention_stages
+            && !prologue_moves
             && (!adapted || crate::model::model().eta_caps().adapter_attachments)
             && !fire_wide_mask
             && !p_reads_mtp_logits
@@ -2582,6 +2605,9 @@ pub async fn submit_pass_stamped<C: FireContext>(
             }
             if attention_stages {
                 why.push("its program has stages at attention");
+            }
+            if prologue_moves {
+                why.push("its prologue takes or puts a channel before the forward");
             }
             if adapted && !crate::model::model().eta_caps().adapter_attachments {
                 why.push("this engine cannot carry its adapter on a fire of its own");

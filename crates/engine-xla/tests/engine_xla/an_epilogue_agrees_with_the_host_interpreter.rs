@@ -209,7 +209,13 @@ fn on_device(
 ) -> Vec<Value> {
     let mut inst = instance(plan, seeds);
     let mut runner = OnDevice::new(device, stages, key_of(plan), kept, seat);
-    let outcome = eta_exec::step_with(&mut inst, plan, &PassInputs::none(), &mut runner);
+    let outcome = eta_exec::step_with(
+        &mut inst,
+        plan,
+        &PassInputs::none(),
+        &mut runner,
+        eta_ir::registry::Stage::Epilogue,
+    );
     assert_eq!(outcome, StepOutcome::Committed, "the device pass commits");
     assert!(runner.ran() > 0, "a stage ran on the device");
     take_all(plan, &inst, channels)
@@ -1186,6 +1192,7 @@ fn a_group_answers_what_each_lane_answers_alone(device: &Device, stages: &mut St
         &mut members,
         &[],
         None,
+        eta_ir::registry::Stage::Epilogue,
     );
     assert!(
         outcomes.iter().all(|o| *o == StepOutcome::Committed),
@@ -1315,6 +1322,7 @@ fn carried_cells_answer_what_the_rings_answer(device: &Device, stages: &mut Stag
             &mut members,
             &carried,
             cells.take(),
+            eta_ir::registry::Stage::Epilogue,
         );
         assert!(
             outcomes.iter().all(|o| *o == StepOutcome::Committed),

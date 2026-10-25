@@ -11,7 +11,7 @@ use engine::channel::ChannelId;
 use engine::ports::Envelope;
 use engine::program::{InstanceId, ProgramId, ProgramRegistration};
 use eta_exec::{Boundaries, ExecPlan, Extents, Versions, adopt_launch_package_with};
-use eta_ir::registry::GeometryClass;
+use eta_ir::registry::{GeometryClass, Stage as Attach};
 
 use crate::device::Context;
 use crate::error::{Fault, Result};
@@ -80,6 +80,16 @@ impl Program {
     }
 }
 
+/// The prepared stages of those that run at the point `runs` marks.
+fn at_point<'a>(stages: &'a mut [Option<Prepared>], runs: &[bool]) -> Vec<&'a mut Prepared> {
+    stages
+        .iter_mut()
+        .zip(runs)
+        .filter(|(_, runs)| **runs)
+        .filter_map(|(prepared, _)| prepared.as_mut())
+        .collect()
+}
+
 impl Plane {
     fn dense_channel(
         &self,
@@ -134,7 +144,9 @@ pub struct Plane {
     instances: BTreeMap<InstanceId, Bound>,
     next_program: u64,
     next_instance: u64,
+    /// The fires a wave carries, and the point whose stages they run.
     staged: Vec<(ProgramId, Extents, InstanceId)>,
+    at: Attach,
     wave: Wave,
     shadow: bool,
     flight: u32,
@@ -160,6 +172,7 @@ impl Plane {
             next_program: 1,
             next_instance: 1,
             staged: Vec::new(),
+            at: Attach::Epilogue,
             wave: Wave::default(),
             shadow: false,
             flight: u32::MAX,
@@ -207,6 +220,24 @@ impl Plane {
             Versions::from_compiler(registration.emitter_version),
             Target::of(context)?,
         )?;
+        // A stage at attention runs in no layer here: only its sinks reach
+        // the forward, so computation of its own would run nowhere.
+        if let Some(kind) = compiled
+            .kinds
+            .iter()
+            .zip(compiled.stages.iter())
+            .find(|(kind, stage)| kind.per_layer() && !stage.regions.is_empty())
+            .map(|(kind, _)| *kind)
+        {
+            return Err(Fault::program(
+                "program::plane",
+                format!(
+                    "its `{}` stage computes, and this shell runs a stage at attention \
+                     only through its sinks: nothing would run it inside the layers",
+                    kind.name()
+                ),
+            ));
+        }
 
         let id = ProgramId(self.next_program);
         self.next_program += 1;
@@ -435,8 +466,20 @@ impl Plane {
         None
     }
 
+    /// One whole pass with no forward between its points: the prologue, if
+    /// it runs on its own, then the rest.
     pub fn fire(&mut self, context: &Context, id: InstanceId) -> Result<Fired> {
-        match self.stage(id)? {
+        if self.prologue_runs(id) {
+            let fired = self.fire_at(context, id, Attach::Prologue)?;
+            if fired != Fired::Committed {
+                return Ok(fired);
+            }
+        }
+        self.fire_at(context, id, Attach::Epilogue)
+    }
+
+    fn fire_at(&mut self, context: &Context, id: InstanceId, at: Attach) -> Result<Fired> {
+        match self.stage(id, at)? {
             Launched::Airborne => {
                 self.fly(context)?;
                 self.land(context)?;
@@ -447,7 +490,26 @@ impl Plane {
         }
     }
 
-    pub fn stage(&mut self, id: InstanceId) -> Result<Launched> {
+    /// Whether instance `id`'s prologue runs on its own, before the forward
+    /// ([`ExecPlan::prologue_runs`]).
+    #[must_use]
+    pub fn prologue_runs(&self, id: InstanceId) -> bool {
+        self.instances
+            .get(&id)
+            .and_then(|bound| self.programs.get(&bound.program_id))
+            .is_some_and(|program| program.plan.prologue_runs())
+    }
+
+    /// Mints instance `id`'s stages at `at` into the wave: every fire a wave
+    /// carries runs the stages of one point.
+    pub fn stage(&mut self, id: InstanceId, at: Attach) -> Result<Launched> {
+        if !self.staged.is_empty() && self.at != at {
+            return Err(Fault::program(
+                "program::plane",
+                "a wave carries the stages of one point, and this one was staged for another",
+            ));
+        }
+        self.at = at;
         let Plane {
             programs,
             instances,
@@ -467,7 +529,7 @@ impl Plane {
         })?;
         let launched = bound
             .session
-            .stage(&program.compiled, &program.plan, wave)?;
+            .stage(&program.compiled, &program.plan, wave, at)?;
         if matches!(launched, Launched::Airborne) {
             staged.push((program_id, bound.session.extents(), id));
         }
@@ -485,8 +547,10 @@ impl Plane {
             instances,
             staged,
             flight,
+            at,
             ..
         } = self;
+        let at = *at;
 
         let mut groups: Vec<(ProgramId, Extents, Vec<InstanceId>)> = Vec::new();
         for (program_id, extents, instance) in staged.iter() {
@@ -531,6 +595,7 @@ impl Plane {
                     program_id,
                     extents,
                     &members[from..to],
+                    at,
                     stream,
                 ) {
                     Ok(()) => from = to,
@@ -546,12 +611,14 @@ impl Plane {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn fly_one(
         programs: &mut BTreeMap<ProgramId, Program>,
         instances: &mut BTreeMap<InstanceId, Bound>,
         program_id: ProgramId,
         extents: Extents,
         members: &[InstanceId],
+        at: Attach,
         stream: *mut core::ffi::c_void,
     ) -> Result<()> {
         {
@@ -562,8 +629,11 @@ impl Plane {
                 )
             })?;
             let lanes = u32::try_from(members.len()).unwrap_or(u32::MAX);
+            let runs: Vec<bool> = (0..program.compiled.stages.len())
+                .map(|index| program.plan.runs_at(index, at))
+                .collect();
             let batch = program.batch(extents, lanes, stream)?;
-            for prepared in batch.stages.iter_mut().flatten() {
+            for prepared in at_point(&mut batch.stages, &runs) {
                 prepared.begin(extents, lanes, stream)?;
             }
             for instance in members {
@@ -573,9 +643,11 @@ impl Plane {
                         format!("a staged fire names instance {instance}, which is gone"),
                     )
                 })?;
-                bound.session.take_lane(&mut batch.stages)?;
+                bound
+                    .session
+                    .take_lane(at_point(&mut batch.stages, &runs))?;
             }
-            for prepared in batch.stages.iter_mut().flatten() {
+            for prepared in at_point(&mut batch.stages, &runs) {
                 prepared.commit_lanes(stream)?;
             }
         }
@@ -587,6 +659,9 @@ impl Plane {
                 )
             })?;
             for (index, stage) in program.compiled.stages.iter().enumerate() {
+                if !program.plan.runs_at(index, at) {
+                    continue;
+                }
                 let Some(prepared) = program
                     .batches
                     .iter()

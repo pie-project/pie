@@ -8,7 +8,7 @@ use checkpoint::file::emit::{self, Object};
 use checkpoint::serving::Stamp;
 use engine::Engine;
 use engine::channel::ChannelRegistration;
-use engine::fire::{Attachment, Boundary, FrameSubmission, InputFeed, Lane, Readout, Step};
+use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Loaded, Residency};
 use engine::program::{InstanceBinding, ProgramRegistration};
 use engine::{ChannelId, InstanceId, ProgramId};
@@ -660,7 +660,7 @@ pub fn attach(lane: u32, handles: &LaneHandles) -> Attachment {
         lane,
         lanes: 1,
         instance: handles.instance,
-        at: Boundary::Epilogue,
+        adapter_only: false,
     }
 }
 

@@ -1,4 +1,4 @@
-use engine::fire::{Boundary, FoldLen, Masking, RsReset, RsVerb};
+use engine::fire::{FoldLen, Masking, RsReset, RsVerb};
 use engine::frame::{Demand, Shell as FrameShell};
 use poem_exec::fire::{FireDescriptor, Lane as FireLane, compose_axes};
 
@@ -1570,9 +1570,9 @@ impl FrameShell for Shell {
                         .iter()
                         .filter(|verb| matches!(verb, RsMove::Scatter { fold: 0, .. }))
                         .count();
-                    let prologue = attachments
-                        .iter()
-                        .any(|attached| attached.at == Boundary::Prologue);
+                    let prologue = attachments.iter().any(|attached| {
+                        !attached.adapter_only && self.programs.prologue_runs(attached.instance)
+                    });
                     (scatters != 0 && scatters != rs_moves.len()) || prologue
                 },
                 truncates: rs_truncates,

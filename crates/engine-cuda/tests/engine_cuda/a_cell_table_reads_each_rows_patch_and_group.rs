@@ -12,7 +12,7 @@ use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, op
 use poem_ir::InputAxis;
 
 use crate::common_two_axis::{Weights, contract_for};
-use engine::fire::{Attachment, Boundary};
+use engine::fire::Attachment;
 use engine::program::{InstanceBinding, ProgramRegistration};
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
@@ -270,7 +270,7 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
             lane: at as u32,
             lanes: 1,
             instance,
-            at: Boundary::Epilogue,
+            adapter_only: false,
         });
         readers.push(instance);
     }

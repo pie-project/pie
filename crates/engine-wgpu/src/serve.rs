@@ -26,7 +26,7 @@ use crate::store::kv::{self, Paging, Seat};
 use crate::weights::Weights;
 use crate::window::Windows;
 
-use engine::fire::{Boundary, Masking};
+use engine::fire::Masking;
 use engine::frame::{Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase, Supply};
 use engine::runahead::Runahead;
 
@@ -242,7 +242,8 @@ pub struct Attached {
 
     pub instance: engine::InstanceId,
 
-    pub at: Boundary,
+    /// Carries the pass's adapter alone and runs none of its stages.
+    pub adapter_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

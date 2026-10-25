@@ -33,9 +33,11 @@
 //! submission order, so nothing waits on the host until the decoded picture
 //! is handed to the client.
 //!
-//! The latent `x` is a device-only channel. The last pass before the loop
-//! draws it (`normal` on a keyed state), or noises the encoded picture to the
-//! schedule's first sigma, and seeds the loop's clock. The denoise epilogue
+//! The latent `x` is a device-only channel. The first denoise pass's
+//! prologue draws it (`normal` on a keyed state) and seeds the loop's clock
+//! before its forward reads them; for img2img the VAE encoder's epilogue
+//! noises the encoded picture to the schedule's first sigma instead. The
+//! denoise epilogue
 //! is the sampler: `x <- x + (sigma' - sigma) v`, `v` the guided
 //! `u + s (c - u)` when a negative prompt adds a second attention group to
 //! the pass.
@@ -223,9 +225,10 @@ fn denoise_reading() -> Result<Denoise> {
             continue;
         }
         if image.state {
-            return Err(
-                format!("reading `{reading}` binds a working set; a denoise pass binds none").into(),
-            );
+            return Err(format!(
+                "reading `{reading}` binds a working set; a denoise pass binds none"
+            )
+            .into());
         }
         let context_stream = stream_reading(&reading, "context").ok_or_else(|| {
             format!("reading `{reading}` reads no `context`; a text-conditioned sampler has nowhere to put the prompt")
@@ -320,8 +323,7 @@ struct Held {
 
 /// Encode `prompt` on `pipe` into a device channel the denoise `context`
 /// input takes, and its own rows before the pad (the `length` input a
-/// padding model reads). `then` runs at the end of the last pass's
-/// epilogue.
+/// padding model reads).
 fn encode(
     pipe: &Pipeline,
     held: &mut Held,
@@ -329,7 +331,6 @@ fn encode(
     bridge: Option<&Bridge>,
     context: &model::InputDecl,
     prompt: &str,
-    then: Option<Box<dyn Fn()>>,
 ) -> Result<(Channel, Channel)> {
     let mut ids = inferlet::chat::first_user(prompt);
     ids.extend(inferlet::chat::cue());
@@ -365,10 +366,6 @@ fn encode(
     }
     let width = text.width;
     let encoded = Channel::new([rows, width], dtype::f32).queued();
-    let (here, later) = match bridge {
-        None => (then, None),
-        Some(_) => (None, then),
-    };
     pass.epilogue(move || {
         encoded.put(pad_rows(
             &intrinsics::hidden(0, len, width),
@@ -376,9 +373,6 @@ fn encode(
             rows,
             width,
         ));
-        if let Some(then) = &here {
-            then();
-        }
     });
     pass.submit(pipe)?;
     held.passes.push(pass);
@@ -395,9 +389,6 @@ fn encode(
     let bridged = Channel::new([rows, to], dtype::f32).queued();
     pass.epilogue(move || {
         bridged.put(intrinsics::hidden(0, rows, to));
-        if let Some(then) = &later {
-            then();
-        }
     });
     pass.submit(pipe)?;
     held.passes.push(pass);
@@ -651,9 +642,6 @@ async fn main(input: Input) -> Result<Output> {
     };
 
     // ---- the prompt, and the picture, encoded on the device ----------------
-    let seed_at_encode = init_b64.is_none();
-    let first: Option<Box<dyn Fn()>> =
-        seed_at_encode.then(|| Box::new(move || seed_loop(None)) as Box<dyn Fn()>);
     let context = encode(
         &pipe,
         &mut held,
@@ -661,7 +649,6 @@ async fn main(input: Input) -> Result<Output> {
         bridge.as_ref(),
         &denoise.context,
         &prompt,
-        first,
     )?;
     let uncond = match &negative {
         Some(neg) if cfg => Some(encode(
@@ -671,7 +658,6 @@ async fn main(input: Input) -> Result<Output> {
             bridge.as_ref(),
             &denoise.context,
             neg,
-            None,
         )?),
         _ => None,
     };
@@ -709,50 +695,14 @@ async fn main(input: Input) -> Result<Output> {
         held.passes.push(pass);
     }
 
-    // ---- the denoise pass: one a step --------------------------------------
-    let pass = ForwardPass::new();
+    // ---- the denoise passes: one a step --------------------------------------
     let guidance_ch = Channel::from([guidance]).named("guidance");
-    let mut lanes = 0u32;
-    for (group, ctx) in [Some(&context), uncond.as_ref()]
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        let group = group as u32;
-        for (stream, latent) in [
-            (&denoise.latent_stream, true),
-            (&denoise.context_stream, false),
-        ] {
-            let at = lanes;
-            lanes += 1;
-            set_switches(&pass, at, &denoise.reading, stream.as_deref())?;
-            pass.group(at, group)?;
-            for decl in lane(&denoise.reading, stream.as_deref())?.inputs {
-                let ch = match decl.name.as_str() {
-                    "latents" if latent => &x,
-                    "context" if !latent => &ctx.0,
-                    "length" if !latent => &ctx.1,
-                    "timestep" => &t,
-                    "guidance" => &guidance_ch,
-                    other => {
-                        return Err(format!(
-                            "reading `{}` reads `{other}` on lane {at}; this sampler binds latents, \
-                             timestep, guidance, context and length",
-                            denoise.reading
-                        )
-                        .into());
-                    }
-                };
-                pass.input(at, &decl.name, ch)?;
-            }
-        }
-    }
     let (n, vw) = (cells, denoise.velocity_width);
     let mask_ch = mask
         .as_ref()
         .map(|m| Channel::from_shaped([cells, 1], m.as_slice()).named("mask"));
     let noise = Channel::from(rng_state(seed ^ 0x5eed)).named("noise");
-    pass.epilogue(move || {
+    let step = move || {
         let step = k.take();
         let v = if cfg {
             cfg_combine(
@@ -784,14 +734,63 @@ async fn main(input: Input) -> Result<Output> {
         t.take();
         t.put(at(&ts.read(), &next));
         k.put(&next);
-    });
+    };
+    // The first pass draws the latent in its prologue, before its forward
+    // reads it, unless the VAE encoder already put it.
+    let denoise_pass = |seeds: bool| -> Result<ForwardPass> {
+        let pass = ForwardPass::new();
+        let mut lanes = 0u32;
+        for (group, ctx) in [Some(&context), uncond.as_ref()]
+            .into_iter()
+            .flatten()
+            .enumerate()
+        {
+            let group = group as u32;
+            for (stream, latent) in [
+                (&denoise.latent_stream, true),
+                (&denoise.context_stream, false),
+            ] {
+                let at = lanes;
+                lanes += 1;
+                set_switches(&pass, at, &denoise.reading, stream.as_deref())?;
+                pass.group(at, group)?;
+                for decl in lane(&denoise.reading, stream.as_deref())?.inputs {
+                    let ch = match decl.name.as_str() {
+                        "latents" if latent => &x,
+                        "context" if !latent => &ctx.0,
+                        "length" if !latent => &ctx.1,
+                        "timestep" => &t,
+                        "guidance" => &guidance_ch,
+                        other => {
+                            return Err(format!(
+                                "reading `{}` reads `{other}` on lane {at}; this sampler binds \
+                                 latents, timestep, guidance, context and length",
+                                denoise.reading
+                            )
+                            .into());
+                        }
+                    };
+                    pass.input(at, &decl.name, ch)?;
+                }
+            }
+        }
+        if seeds {
+            pass.prologue(move || seed_loop(None));
+        }
+        pass.epilogue(step);
+        Ok(pass)
+    };
+    let first = denoise_pass(init_b64.is_none())?;
+    let rest = denoise_pass(false)?;
     for fire in 0..sched.steps() {
+        let pass = if fire == 0 { &first } else { &rest };
         pass.submit(&pipe)
             .with_context(|| format!("denoise fire {fire}"))?;
     }
     // Every pass so far is closed before the decode opens: a float pass
     // holds a seat until it closes, and the decode needs it (until B3).
-    drop(pass);
+    drop(first);
+    drop(rest);
     drop(held);
 
     // ---- the decode, down the same pipeline ---------------------------------

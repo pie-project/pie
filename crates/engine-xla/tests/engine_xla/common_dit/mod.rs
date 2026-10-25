@@ -18,9 +18,7 @@ use std::path::{Path, PathBuf};
 use checkpoint::contract::ModelContract;
 use engine::Engine;
 use engine::channel::{ChannelId, ChannelRegistration};
-use engine::fire::{
-    Attachment, Boundary, FrameSubmission, InputFeed, Lane, Readout, Step, StepVoxels,
-};
+use engine::fire::{Attachment, FrameSubmission, InputFeed, Lane, Readout, Step, StepVoxels};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Loaded, Residency};
 use engine::program::{InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine_xla::{DeviceBoot, Xla};
@@ -870,7 +868,7 @@ pub fn attach(lane: u32, instance: InstanceId) -> Attachment {
         lane,
         lanes: 1,
         instance,
-        at: Boundary::Epilogue,
+        adapter_only: false,
     }
 }
 

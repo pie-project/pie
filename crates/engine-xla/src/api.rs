@@ -29,12 +29,12 @@ use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFac
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
-    Boundary, FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout,
+    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout,
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
 use engine::transfer::{KvCopy, MemoryDomain, StateCopy};
-use eta_ir::registry::{GeometryClass, PortMask};
+use eta_ir::registry::{GeometryClass, PortMask, Stage};
 use poem_compiler::{Budget, PATCH_LATTICE_FLOOR, PatchLadder};
 use poem_ir::Trace;
 
@@ -867,14 +867,16 @@ impl Xla {
         Ok(out)
     }
 
-    /// Runs the passes attached at `Boundary::Prologue` to their commit
-    /// before the step reads its descriptor ports and input cells: the
-    /// forward reads the cells a prologue put.
+    /// Runs each program's prologue to its commit before the step reads
+    /// its descriptor ports and input cells: the forward reads the cells a
+    /// prologue put.
     fn run_prologues(&mut self, submission: &engine::fire::Step) -> EngineResult<()> {
         let prologues: Vec<(InstanceId, u32)> = submission
             .attachments
             .iter()
-            .filter(|attachment| attachment.at == Boundary::Prologue)
+            .filter(|attachment| {
+                !attachment.adapter_only && self.programs.prologue_runs(attachment.instance)
+            })
             .map(|attachment| (attachment.instance, attachment.lane))
             .collect();
         if prologues.is_empty() {
@@ -886,7 +888,7 @@ impl Xla {
             .ok_or_else(|| Error::Load("the xla engine has no model loaded".into()))?
             .device();
         self.programs
-            .fire_guests(device, &prologues, None, 0, 0)
+            .fire_guests(device, &prologues, None, 0, 0, Stage::Prologue)
             .map_err(refusal)?;
         Ok(())
     }
@@ -1250,7 +1252,7 @@ impl Xla {
         let attached: Vec<(InstanceId, u32)> = submission
             .attachments
             .iter()
-            .filter(|attachment| attachment.at == Boundary::Epilogue)
+            .filter(|attachment| !attachment.adapter_only)
             .map(|attachment| (attachment.instance, attachment.lane))
             .collect();
         let mut on_device = vec![false; submission.lanes.len()];
@@ -1269,6 +1271,7 @@ impl Xla {
                     vocab,
                     mtp_width,
                     Some(latch),
+                    Stage::Epilogue,
                 )
                 .map_err(refusal)?;
             for (&(_, lane), ran) in attached.iter().zip(ran) {

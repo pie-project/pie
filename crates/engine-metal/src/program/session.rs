@@ -2,7 +2,7 @@ use engine::ports::Envelope;
 use eta_compiler::codegen::launch::LaunchPackage;
 use eta_exec::{ExecPlan, Extents};
 use eta_ir::op::IntrinsicId;
-use eta_ir::registry::GeometryClass;
+use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::name_or_unknown;
 use eta_ir::validate::Direction;
 
@@ -267,12 +267,15 @@ impl Session {
         Ok(())
     }
 
+    /// Runs the stages at `at` ([`ExecPlan::runs_at`]) to their commit:
+    /// the prologue's before the forward, the rest after it.
     pub fn fire(
         &mut self,
         device: &Context,
         pipelines: &Pipelines,
         compiled: &Compiled,
         plan: &ExecPlan,
+        at: Stage,
     ) -> Result<Fired> {
         if self.airborne.is_some() {
             return Err(Fault::program(
@@ -282,13 +285,16 @@ impl Session {
                  read from, and both fires would report the second's verdict",
             ));
         }
-        if let Some(refused) = self.gate(compiled, plan)? {
+        if let Some(refused) = self.gate(compiled, plan, at)? {
             return Ok(refused);
         }
 
         let cursors = self.cursors_now();
         let mut launched = Vec::with_capacity(compiled.stages.len());
         for (index, stage) in compiled.stages.iter().enumerate() {
+            if !plan.runs_at(index, at) {
+                continue;
+            }
             let Some(prepared) = self.prepared.get_mut(index).and_then(Option::as_mut) else {
                 continue;
             };
@@ -299,9 +305,10 @@ impl Session {
             launched.push(index);
         }
 
-        self.verdict(plan, &launched)
+        self.verdict(plan, &launched, at)
     }
 
+    /// Encodes the stages after the forward into `frame`.
     pub fn stage_into(
         &mut self,
         frame: &Frame,
@@ -317,13 +324,16 @@ impl Session {
                  and the first's commit would be lost",
             ));
         }
-        if let Some(refused) = self.gate(compiled, plan)? {
+        if let Some(refused) = self.gate(compiled, plan, Stage::Epilogue)? {
             return Ok(Launched::Refused(refused));
         }
 
         let cursors = self.cursors_now();
         let mut launched = Vec::with_capacity(compiled.stages.len());
         for (index, stage) in compiled.stages.iter().enumerate() {
+            if !plan.runs_at(index, Stage::Epilogue) {
+                continue;
+            }
             let Some(prepared) = self.prepared.get_mut(index).and_then(Option::as_mut) else {
                 continue;
             };
@@ -352,12 +362,15 @@ impl Session {
                  and the first's commit would be lost",
             ));
         }
-        if let Some(refused) = self.gate(compiled, plan)? {
+        if let Some(refused) = self.gate(compiled, plan, Stage::Epilogue)? {
             return Ok(Some(refused));
         }
         let cursors = self.cursors_now();
         let mut launched = Vec::with_capacity(compiled.stages.len());
         for (index, stage) in compiled.stages.iter().enumerate() {
+            if !plan.runs_at(index, Stage::Epilogue) {
+                continue;
+            }
             let Some(prepared) = self.prepared.get_mut(index).and_then(Option::as_mut) else {
                 continue;
             };
@@ -379,7 +392,7 @@ impl Session {
         let Some(launched) = self.airborne.take() else {
             return Ok(Fired::Committed);
         };
-        self.verdict(plan, &launched)
+        self.verdict(plan, &launched, Stage::Epilogue)
     }
 
     pub fn abandon_launched(&mut self) {
@@ -391,12 +404,23 @@ impl Session {
         self.airborne.is_some()
     }
 
-    fn gate(&mut self, compiled: &Compiled, plan: &ExecPlan) -> Result<Option<Fired>> {
+    fn gate(&mut self, compiled: &Compiled, plan: &ExecPlan, at: Stage) -> Result<Option<Fired>> {
         if self.poisoned {
             return Ok(Some(Fired::Faulted("instance is poisoned".to_string())));
         }
         stages_and_plans_agree(compiled)?;
+        if at != Stage::Prologue {
+            self.intrinsics_bound(plan)?;
+        }
+        if let Some(blocked) = self.blocked_at(plan, at) {
+            return Ok(Some(Fired::Blocked(blocked)));
+        }
+        Ok(None)
+    }
 
+    /// Refuses a pass whose epilogue reads an intrinsic no buffer is bound
+    /// to: the emitted kernel reads the argument slot regardless.
+    fn intrinsics_bound(&self, plan: &ExecPlan) -> Result<()> {
         let readout_bound = [
             IntrinsicId::Logits,
             IntrinsicId::Velocity,
@@ -440,14 +464,24 @@ impl Session {
             ));
         }
 
-        if let Some(blocked) = self.blocked_channel(plan) {
-            return Ok(Some(Fired::Blocked(blocked)));
-        }
-
-        Ok(None)
+        Ok(())
     }
 
-    fn verdict(&mut self, plan: &ExecPlan, launched: &[usize]) -> Result<Fired> {
+    /// The first channel not as the stages at `at` need it.
+    fn blocked_at(&self, plan: &ExecPlan, at: Stage) -> Option<u32> {
+        (0..self.shapes.len()).find_map(|channel| {
+            let live = self.depth(channel as u32);
+            let capacity = u64::from(self.shapes[channel].capacity);
+            let ready = match plan.readiness(channel as u32, at) {
+                Some(Direction::NeedsFull) => live != 0,
+                Some(Direction::NeedsEmpty) => live < capacity,
+                None => true,
+            };
+            (!ready).then_some(channel as u32)
+        })
+    }
+
+    fn verdict(&mut self, plan: &ExecPlan, launched: &[usize], at: Stage) -> Result<Fired> {
         let max_channel = u32::try_from(self.shapes.len().saturating_sub(1)).unwrap_or(u32::MAX);
 
         let mut verdict = Verdict::Committed;
@@ -472,7 +506,7 @@ impl Session {
             Verdict::Committed => {}
         }
 
-        match self.commit(plan) {
+        match self.commit(plan, at) {
             Ok(()) => {
                 self.fires += 1;
                 Ok(Fired::Committed)
@@ -482,11 +516,6 @@ impl Session {
                 Ok(Fired::Faulted(why))
             }
         }
-    }
-
-    #[must_use]
-    pub fn blocked_channel(&self, plan: &ExecPlan) -> Option<u32> {
-        self.readiness(plan).map(|blocked| blocked.channel)
     }
 
     #[must_use]
@@ -516,7 +545,7 @@ impl Session {
         None
     }
 
-    fn commit(&mut self, plan: &ExecPlan) -> std::result::Result<(), String> {
+    fn commit(&mut self, plan: &ExecPlan, at: Stage) -> std::result::Result<(), String> {
         let now = self.cursors_now();
         let mut next = now.clone();
         let mut bumps: Vec<(usize, bool, bool)> = Vec::new();
@@ -526,12 +555,12 @@ impl Session {
             }
             let mut used = cursor.tail - cursor.head;
             let capacity = u64::from(self.shapes[channel].capacity);
-            let took = plan.takes_channel(channel as u32) && used != 0;
+            let took = plan.takes_channel(channel as u32, at) && used != 0;
             if took {
                 next[channel].head = cursor.head + 1;
                 used -= 1;
             }
-            let put = plan.puts_channel(channel as u32);
+            let put = plan.puts_channel(channel as u32, at);
             if put {
                 if used >= capacity {
                     return Err(format!(

@@ -419,21 +419,19 @@ pub enum FoldLen {
     Device,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum Boundary {
-    Prologue,
-    Epilogue,
-    /// A pass cut into several fires sends it on every one but the last.
-    Adapter,
-}
-
+/// A pass's program on a fire. Each of its stages runs at its own point:
+/// the prologue before the fire stages its inputs (the forward reads what
+/// it put), the epilogue after the forward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     /// The first of the pass's lanes, `lanes` of them in a row.
     pub lane: u32,
     pub lanes: u32,
     pub instance: InstanceId,
-    pub at: Boundary,
+    /// The fire carries the pass's adapter alone and runs none of its
+    /// stages: a pass cut into several fires runs its program on the last
+    /// and carries its adapter on every other.
+    pub adapter_only: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -588,7 +586,7 @@ impl Step {
         }
         let lanes = u32::try_from(self.lanes.len()).unwrap_or(u32::MAX);
         for (index, attachment) in self.attachments.iter().enumerate() {
-            if attachment.at == Boundary::Adapter && !serves.adapter_attachments {
+            if attachment.adapter_only && !serves.adapter_attachments {
                 return Err(Error::Invalid(format!(
                     "attachment {index} is for an adapter alone, which this engine does not serve"
                 )));
@@ -605,7 +603,7 @@ impl Step {
             {
                 return Err(Error::Invalid(format!(
                     "instance {} is attached twice to one fire, at attachment {index}; a \
-                     program's stages are one pass with one commit",
+                     program runs once a fire",
                     attachment.instance
                 )));
             }
