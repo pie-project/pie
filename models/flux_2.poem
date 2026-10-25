@@ -8,10 +8,8 @@ TOKENIZER = tokenizer(markers = [QWEN_STOP])
 
 # The compiler reads how tensor-parallel ranks cut each weight off the
 # forward: the transformer's q, k and v, packed or not, and its feed-forward
-# gate and up by their heads and channels. Their output projections it holds
-# whole, as the package always has, so each rank's share is gathered for
-# them; and the text encoder's attention and down projection, so its gate
-# and up are gathered for the down.
+# gate and up by their heads and channels, their output projections by
+# their rows; the text encoder's likewise.
 CUTS = "inferred"
 
 MODELS = [
@@ -140,28 +138,24 @@ QWEN3_4B = struct(
     eps = 1e-6,
 )
 
-def encoder(c, layers, banks, sharded = False):
-    """The encoder of config `c` through its first `layers` layers; with
-    `sharded`, its attention and mlp split across ranks."""
+def encoder(c, layers, banks):
+    """The encoder of config `c` through its first `layers` layers."""
     hidden, hd, inter = c.hidden, c.head_dim, c.inter
-
-    def whole(w):
-        return w if sharded else w.replicated()
 
     def layer(l):
         n = lambda s: "te.layer.{}.{}".format(l, s)
         return struct(
             attn_norm = weight([hidden]),
-            q = whole(weight([c.q_heads * hd, hidden], banks)),
-            k = whole(weight([c.kv_heads * hd, hidden], banks)),
-            v = whole(weight([c.kv_heads * hd, hidden], banks)),
-            o = whole(weight([hidden, c.q_heads * hd], banks)),
+            q = weight([c.q_heads * hd, hidden], banks),
+            k = weight([c.kv_heads * hd, hidden], banks),
+            v = weight([c.kv_heads * hd, hidden], banks),
+            o = weight([hidden, c.q_heads * hd], banks),
             q_norm = weight([hd]),
             k_norm = weight([hd]),
             mlp_norm = weight([hidden]),
             gate = weight([inter, hidden], banks),
             up = weight([inter, hidden], banks),
-            down = whole(weight([hidden, inter], banks)),
+            down = weight([hidden, inter], banks),
             kv = "te.kv.{}".format(l),
         )
 
@@ -224,13 +218,13 @@ def attn(d, banks):
         v = weight([dim, dim], banks),
         q_norm = weight([HEAD_DIM]),
         k_norm = weight([HEAD_DIM]),
-        out = weight([dim, dim], banks).replicated(),
+        out = weight([dim, dim], banks),
     )
 
 def swiglu(d, banks):
     return struct(
         linear_in = weight([2 * d.inter, d.dim], banks),
-        linear_out = weight([d.dim, d.inter], banks).replicated(),
+        linear_out = weight([d.dim, d.inter], banks),
     )
 
 def side(d, banks):
@@ -242,8 +236,8 @@ def single(prefix, d, banks):
         in_proj = weight([3 * dim + 2 * inter, dim], banks),
         q_norm = weight([HEAD_DIM]),
         k_norm = weight([HEAD_DIM]),
-        out_attn = weight([dim, dim], banks).replicated(),
-        out_mlp = weight([dim, inter], banks).replicated(),
+        out_attn = weight([dim, dim], banks),
+        out_mlp = weight([dim, inter], banks),
     )
 
 def embedder(d, banks):

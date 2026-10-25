@@ -20,8 +20,8 @@ TOKENIZER = tokenizer(
 # The compiler reads how tensor-parallel ranks cut each weight off the
 # forward: the packed q, k and v by their heads, each expert's and the shared
 # expert's gate and up by their channels, the output and down projections by
-# their rows. The head and the timestep embedders it holds whole, as the
-# package always has.
+# their rows, the head by its vocabulary, and the timestep embedders as an
+# mlp is.
 CUTS = "inferred"
 
 MODELS = [
@@ -39,12 +39,10 @@ DEPLOYMENTS = [
 # rope, routed and shared experts), the timestep embedders, and the U-Net
 # blocks that take a latent clip into the trunk and its rows back out.
 
-def linear(out, in_, banks, bias = True, whole = False):
-    """A projection from `in_` to `out` and, unless `bias` is off, its bias;
-    held whole on every rank if `whole`."""
-    w = weight([out, in_], banks)
+def linear(out, in_, banks, bias = True):
+    """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
     return struct(
-        w = w.replicated() if whole else w,
+        w = weight([out, in_], banks),
         bias = weight([out]) if bias else None,
     )
 
@@ -113,8 +111,8 @@ def resblock(c_in, c_out, emb, banks):
 
 def embedder(hidden, out, banks):
     return struct(
-        mlp_in = linear(hidden, T_FREQ_DIM, banks, whole = True),
-        mlp_out = linear(out, hidden, banks, whole = True),
+        mlp_in = linear(hidden, T_FREQ_DIM, banks),
+        mlp_out = linear(out, hidden, banks),
     )
 
 def layout(id, deploy):
@@ -166,7 +164,7 @@ def layout(id, deploy):
         kv_width = kv_w,
         sm_scale = f32(1.0 / f32(sqrt(hd))),
         embed = weight([d.vocab, hidden], banks),
-        head = weight([d.vocab, hidden], banks).replicated(),
+        head = weight([d.vocab, hidden], banks),
         final_norm = weight([hidden]),
         layers = [layer(l) for l in range(d.layers)],
         timestep_emb = embedder(hidden, 2 * hidden, banks),
