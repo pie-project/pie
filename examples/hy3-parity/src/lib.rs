@@ -409,8 +409,8 @@ async fn main(input: Input) -> Result<Output> {
     let denoise = "denoise";
     let encode_lane = lane_reading(encode, &["positions"])?;
     let denoise_lane = lane_reading(denoise, &["latents", "special", "timestep", "positions"])?;
-    if !(encode_lane.reads_kv && denoise_lane.reads_kv) {
-        return Err("both token-axis readings of this family bind a kv space".into());
+    if !(encode_lane.state && denoise_lane.state) {
+        return Err("both token-axis readings of this family bind a working set".into());
     }
     let canvas_width = readout_width(denoise)?;
     if canvas_width != case.hidden {

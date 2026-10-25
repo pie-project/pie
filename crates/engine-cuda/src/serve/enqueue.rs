@@ -1077,8 +1077,7 @@ impl FireCtx<'_> {
                 .all(|pair| pair[1] == pair[0].wrapping_add(1));
             // `velocity(k)`, `hidden(k)` and `pixels(k)` read the pass's lane
             // `k`: each at its own rows of its own class's plane.
-            let lanes = attached.lanes.min(eta_ir::op::INTRINSIC_LANES);
-            for k in 0..lanes {
+            for k in 0..attached.lanes {
                 let at = lane + k as usize;
                 let class = lane_class[at];
                 let velocity = match self.exports.velocity_for(class) {

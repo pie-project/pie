@@ -236,6 +236,9 @@ pub struct LaunchStagePlan {
     pub mtp_rows: u32,
     #[serde(default)]
     pub drafts_len: u32,
+    /// The side-table slots an instance binds intrinsics at
+    /// ([`eta_ir::op::intrinsic_pitch`]).
+    pub intrinsic_pitch: u32,
     pub ops: Vec<LaunchOp>,
     pub source_ops: Vec<Vec<u32>>,
     pub value_types: Vec<LaunchPlanValue>,
@@ -513,6 +516,7 @@ fn lower_plan(stage: &CompiledStage) -> LaunchStagePlan {
         needs: grouped.needs,
         mtp_rows: grouped.mtp_rows,
         drafts_len: grouped.drafts_len,
+        intrinsic_pitch: eta_ir::op::intrinsic_pitch(&normalized.ops),
         ops: ops.iter().map(lower_plan_op).collect(),
         source_ops: normalized.source_ops.clone(),
         value_map: normalized.value_map.clone(),

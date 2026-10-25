@@ -171,9 +171,9 @@ fn reading(readout: model::ReadoutKind, lanes: &[(&str, &[&str])]) -> Result<Rea
         })?;
     for (stream, binds) in lanes {
         let lane = lane_reading(&name, stream, binds)?;
-        if lane.reads_kv {
+        if lane.state {
             return Err(format!(
-                "reading `{name}` binds a kv space; the parity pass binds none"
+                "reading `{name}` binds a working set; the parity pass binds none"
             ));
         }
     }
@@ -368,7 +368,7 @@ async fn text(prompt: &str, pipe: &Pipeline) -> Result<(Vec<f32>, u32, u32)> {
             (lane.embeds && hidden).then_some((name, lane))
         })
         .ok_or("this row declares no token reading with a hidden readout (the miniature has no encoder)")?;
-    if !lane.reads_kv {
+    if !lane.state {
         return Err(format!(
             "reading `{name}` takes tokens but binds no kv space"
         ));

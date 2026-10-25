@@ -175,7 +175,7 @@ fn stream_reading(reading: &str, name: &str) -> Option<Option<String>> {
 struct Text {
     reading: String,
     width: u32,
-    reads_kv: bool,
+    state: bool,
 }
 
 /// A token-less reading that turns `from`-wide rows into `to`-wide hidden
@@ -204,7 +204,7 @@ fn text_reading() -> Result<Text> {
             let readout = lane.readout.as_ref()?;
             (lane.embeds && readout.kind == model::ReadoutKind::Hidden).then(|| Text {
                 width: readout.width,
-                reads_kv: lane.reads_kv,
+                state: lane.state,
                 reading: r.clone(),
             })
         })
@@ -220,9 +220,9 @@ fn denoise_reading() -> Result<Denoise> {
         if image.embeds || readout_kind(&image) != Some(model::ReadoutKind::Velocity) {
             continue;
         }
-        if image.reads_kv {
+        if image.state {
             return Err(
-                format!("reading `{reading}` binds a kv space; a denoise pass binds none").into(),
+                format!("reading `{reading}` binds a working set; a denoise pass binds none").into(),
             );
         }
         let context_stream = stream_reading(&reading, "context").ok_or_else(|| {
@@ -262,7 +262,7 @@ fn bridge_reading(from: u32, to: u32) -> Result<Bridge> {
                 .readout
                 .as_ref()
                 .is_some_and(|r| r.kind == model::ReadoutKind::Hidden && r.width == to);
-            if lane.embeds || lane.reads_kv || !hidden {
+            if lane.embeds || lane.state || !hidden {
                 continue;
             }
             if let [only] = &lane.inputs[..]
@@ -342,7 +342,7 @@ fn encode(
     pass.switch(0, "reading", &text.reading)?;
     pass.embed(&Channel::from(ids), &Channel::from([0u32, len]))?;
     pass.readout(&Channel::from_iter(0..len))?;
-    if text.reads_kv {
+    if text.state {
         let ws = WorkingSet::new();
         pass.state(&[&ws], StateGeometry::default())?;
         held.sets.push(ws);

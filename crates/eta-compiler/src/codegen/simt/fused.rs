@@ -20,7 +20,10 @@ pub(super) const PROLOGUE: &str = include_str!("../../../runtime/cuda/fused_bloc
 pub(super) const SIGNATURE: &str = include_str!("../../../runtime/cuda/fused_block1.cuh");
 pub(super) const PREAMBLE: &str = include_str!("../../../runtime/cuda/fused_block2.cuh");
 
-pub const PTIR_INTRINSIC_SLOTS: u32 = eta_ir::op::INTRINSIC_PITCH;
+/// The side-table slots a dispatch lane's intrinsics stand at in `stage`.
+pub(crate) fn intrinsic_pitch(stage: &CompiledStage) -> u32 {
+    eta_ir::op::intrinsic_pitch(&stage.normalized.ops)
+}
 
 fn parallel_elementwise(tag: u8) -> bool {
     matches!(
@@ -627,7 +630,8 @@ pub fn emit_fused_region(
         } else if op.tag == tags::INTRINSIC_VAL {
             let _ = writeln!(
                 source,
-                "    const m1_u32 intrinsic_index = dispatch_lane * {PTIR_INTRINSIC_SLOTS}u + p.intr;"
+                "    const m1_u32 intrinsic_index = dispatch_lane * {}u + p.intr;",
+                intrinsic_pitch(stage)
             );
             source.push_str("    p.intrinsic_dtype = intrinsic_modes[intrinsic_index];\n");
             source.push_str("    p.imm = intrinsic_widths[intrinsic_index];\n");
@@ -795,7 +799,8 @@ fn emit_body(
         if let Some(chain) = gumbel {
             let _ = writeln!(
                 source,
-                "    const m1_u32 gumbel_intrinsic_index = dispatch_lane * {PTIR_INTRINSIC_SLOTS}u + {}u;",
+                "    const m1_u32 gumbel_intrinsic_index = dispatch_lane * {}u + {}u;",
+                intrinsic_pitch(stage),
                 chain.intrinsic
             );
             source.push_str(
@@ -849,7 +854,8 @@ fn emit_body(
         } else if direct_intrinsic[node] != u16::MAX {
             let _ = writeln!(
                 source,
-                "    const m1_u32 direct_intrinsic_index = dispatch_lane * {PTIR_INTRINSIC_SLOTS}u + {}u;",
+                "    const m1_u32 direct_intrinsic_index = dispatch_lane * {}u + {}u;",
+                intrinsic_pitch(stage),
                 direct_intrinsic[node]
             );
             source.push_str("    ptir_fast_argmax_intrinsic(\n");

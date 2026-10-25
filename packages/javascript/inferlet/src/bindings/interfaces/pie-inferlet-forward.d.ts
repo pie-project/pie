@@ -112,10 +112,10 @@ export class ForwardPass {
   constructor()
   /**
   * One working set per lane, in lane order; lanes sharing one state
-  * their slots. Required on a lane that reads kv (`model.lane`'s
-  * `reads-kv`) or a recurrent state (a causal VAE's conv caches:
-  * each fire then folds one slot, and states no geometry), refused
-  * on one that reads neither.
+  * their slots. Required on a lane `model.lane` says binds `state`:
+  * one that reads kv or a recurrent state (a causal VAE's conv
+  * caches: each fire then folds one slot, and states no geometry);
+  * refused on any other.
   */
   state(lanes: Array<WorkingSet>, geom: StateGeometry): void;
   /**

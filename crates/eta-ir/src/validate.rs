@@ -204,10 +204,9 @@ impl fmt::Display for ValidateError {
             IntrinsicLane { intr, lane, lanes } => write!(
                 f,
                 "intrinsic {} reads lane {lane} of a pass of {lanes}; `velocity`, \
-                 `hidden` and `pixels` name one of their pass's first {} lanes, the \
-                 others read the pass and name lane 0",
-                intr.name(),
-                crate::op::INTRINSIC_LANES
+                 `hidden` and `pixels` name one of their pass's lanes, the others read \
+                 the pass and name lane 0",
+                intr.name()
             ),
             IntrinsicTypeRule { intr, stage } => write!(
                 f,
@@ -425,10 +424,7 @@ pub fn check_intrinsics(
                     });
                 }
                 let count = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
-                if (lane != 0 && !intr.per_lane())
-                    || lane >= count.max(1)
-                    || lane >= crate::op::INTRINSIC_LANES
-                {
+                if (lane != 0 && !intr.per_lane()) || lane >= count.max(1) {
                     return Err(ValidateError::IntrinsicLane {
                         intr,
                         lane,
@@ -472,9 +468,7 @@ fn intrinsic_width(
         IntrinsicId::Velocity => lane_reads(ReadoutKind::Velocity),
         IntrinsicId::Pixels => lane_reads(ReadoutKind::Pixels),
         IntrinsicId::Hidden | IntrinsicId::Query | IntrinsicId::Layer => Some(None),
-        IntrinsicId::MtpLogits
-        | IntrinsicId::MtpDrafts
-        | IntrinsicId::AttnScore => None,
+        IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts | IntrinsicId::AttnScore => None,
     }
 }
 

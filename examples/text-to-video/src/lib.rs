@@ -202,7 +202,7 @@ fn stream_reading(reading: &str, name: &str) -> Option<Option<String>> {
 struct Text {
     reading: String,
     width: u32,
-    reads_kv: bool,
+    state: bool,
 }
 
 struct Denoise {
@@ -223,7 +223,7 @@ fn text_reading() -> Result<Text> {
             let readout = lane.readout.as_ref()?;
             (lane.embeds && readout.kind == model::ReadoutKind::Hidden).then(|| Text {
                 width: readout.width,
-                reads_kv: lane.reads_kv,
+                state: lane.state,
                 reading: r.clone(),
             })
         })
@@ -241,9 +241,9 @@ fn denoise_reading() -> Result<Denoise> {
         {
             continue;
         }
-        if video.reads_kv {
+        if video.state {
             return Err(
-                format!("reading `{reading}` binds a kv space; a denoise pass binds none").into(),
+                format!("reading `{reading}` binds a working set; a denoise pass binds none").into(),
             );
         }
         let context_stream = stream_reading(&reading, "context")
@@ -331,7 +331,7 @@ fn encode(
     pass.switch(0, "reading", &text.reading)?;
     pass.embed(&Channel::from(ids), &Channel::from([0u32, len]))?;
     pass.readout(&Channel::from_iter(0..len))?;
-    if text.reads_kv {
+    if text.state {
         let ws = WorkingSet::new();
         pass.state(&[&ws], StateGeometry::default())?;
         held.sets.push(ws);

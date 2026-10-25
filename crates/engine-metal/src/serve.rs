@@ -2283,8 +2283,7 @@ impl Shell {
             // `k`, each at its own rows of its own class's plane: a velocity
             // on the voxel axis at the lane's first voxel, one on the token
             // axis at its readout row.
-            let lanes = attached.lanes.clamp(1, eta_ir::op::INTRINSIC_LANES);
-            for k in 0..lanes {
+            for k in 0..attached.lanes.max(1) {
                 let at = lane + k as usize;
                 for (intrinsic, seam) in [
                     (

@@ -17,55 +17,55 @@
 # `every_live_device_file_is_spliced_into_a_kernel_verbatim`.
 === extended_unary#0
 stage_tag: 0x03
-signature: 73b900a6023e5811
-plan: lines=16 fnv1a64=0x7455487062583145
+signature: 6e466c7b8e6cee9b
+plan: lines=16 fnv1a64=0xa8544011380e6e52
 fused#0: library=0 library_op=0 schedule=1 nodes=6 inputs=0 outputs=0 sinks=1
 === extended_minmax#0
 stage_tag: 0x03
-signature: bad41330c6565406
-plan: lines=18 fnv1a64=0x6ddeb52280cc46ff
+signature: a1e901d48f8c0498
+plan: lines=18 fnv1a64=0x519746320cf57b75
 fused#0: library=0 library_op=0 schedule=1 nodes=7 inputs=0 outputs=0 sinks=2
 === extended_predicates#0
 stage_tag: 0x03
-signature: a3180d84d3a0b0a2
-plan: lines=22 fnv1a64=0xf2e8de79b84a036b
+signature: 3c1ecf2d64adfc90
+plan: lines=22 fnv1a64=0x1798d68b8ebd580d
 fused#0: library=0 library_op=0 schedule=1 nodes=9 inputs=0 outputs=0 sinks=1
 === extended_transpose_cumsum#0
 stage_tag: 0x03
-signature: 33a1e6bac94bd661
-plan: lines=18 fnv1a64=0xf403d0992b8cc94d
+signature: c586e4de54d1f3cf
+plan: lines=18 fnv1a64=0xd176f020410427f0
 fused#0: library=0 library_op=0 schedule=1 nodes=4 inputs=0 outputs=1 sinks=1
 fused#1: library=1 library_op=3 schedule=3 nodes=1 inputs=1 outputs=1 sinks=0
 fused#2: library=0 library_op=0 schedule=0 nodes=1 inputs=1 outputs=0 sinks=1
 === extended_gather_scatter#0
 stage_tag: 0x03
-signature: 47cd877f69b3db71
-plan: lines=20 fnv1a64=0xeefd1b703c76290d
+signature: 461b408bae87cb1f
+plan: lines=20 fnv1a64=0xbd79f476b3bd2391
 fused#0: library=0 library_op=0 schedule=0 nodes=3 inputs=0 outputs=3 sinks=0
 fused#1: library=0 library_op=0 schedule=1 nodes=1 inputs=2 outputs=1 sinks=0
 fused#2: library=0 library_op=0 schedule=1 nodes=3 inputs=3 outputs=0 sinks=2
 === extended_rng_stream#0
 stage_tag: 0x03
-signature: c5334e7e4cff1020
-plan: lines=8 fnv1a64=0xa897ca8cc2231e37
+signature: 051a21236fabef92
+plan: lines=8 fnv1a64=0xd3dfd8fafb7edbc8
 fused#0: library=0 library_op=0 schedule=1 nodes=2 inputs=0 outputs=0 sinks=1
 === extended_hierarchical#0
 stage_tag: 0x03
-signature: 0f2776c5a4dd6d79
-plan: lines=10 fnv1a64=0x3eb877cafb990bcc
+signature: 0ab9a5dc9a1b3417
+plan: lines=10 fnv1a64=0xaefffdd594293970
 fused#0: library=0 library_op=0 schedule=2 nodes=3 inputs=0 outputs=0 sinks=1
 === extended_hidden#0
 stage_tag: 0x03
-signature: 606306b9d45d7b17
-plan: lines=10 fnv1a64=0x02f7e905ec000fa2
+signature: e33ee0bf3ed9f4a9
+plan: lines=10 fnv1a64=0x29ae0f3d377a0706
 fused#0: library=0 library_op=0 schedule=1 nodes=3 inputs=0 outputs=0 sinks=1
 === extended_on_attn#0
 stage_tag: 0x02
-signature: 1ebb08563ae4455c
-plan: lines=8 fnv1a64=0xc8d4331a50fc71a0
+signature: b4fd06d98612779a
+plan: lines=8 fnv1a64=0x79ad6ab5c238637d
 fused#0: library=0 library_op=0 schedule=1 nodes=2 inputs=0 outputs=0 sinks=1
 === extended_attn_score#0
 stage_tag: 0x03
-signature: c6812e51185c4259
-plan: lines=10 fnv1a64=0x65ee76efc87e12f5
+signature: faf1a3362bf1e7a7
+plan: lines=10 fnv1a64=0xd06e9b16db524ccd
 fused#0: library=0 library_op=0 schedule=1 nodes=3 inputs=0 outputs=0 sinks=1
