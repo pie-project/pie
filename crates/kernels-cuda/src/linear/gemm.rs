@@ -108,6 +108,50 @@ pub fn anchored(
     }
 }
 
+/// `out = epi(act . w^T)` on cuBLASLt's own epilogue alone (a bias, a ReLU,
+/// or a bias then a ReLU: [`Epilogue::lt`]), at the first
+/// heuristic that takes it: one of the candidates [`anchored`] times, as it
+/// runs. `ins` is the bias, where the epilogue reads one. False, landing
+/// nothing, where no cuBLASLt epilogue lands `epi`'s or no algorithm takes
+/// it.
+pub fn anchored_on_lt(
+    ctx: &Ctx,
+    op: &'static str,
+    epi: &'static Epilogue,
+    act: Tensor,
+    w: Tensor,
+    ins: &[In],
+    out: Tensor,
+) -> Result<bool, Error> {
+    dtype_dispatch!(op, act.dtype, { Bf16 => () });
+    dtype_dispatch!(op, w.dtype, { Bf16 => () });
+    let n = count(op, "the columns this projection lands", out.width)?;
+    let k = count(op, "the contraction this projection walks", act.width)?;
+    if out.dtype != Dtype::Bf16
+        || w.rows != out.width
+        || w.width != act.width
+        || out.rows != act.rows
+    {
+        return Err(crate::jit::refuse(
+            op,
+            "the weight, the activation and the result are not one dense bf16 product",
+        ));
+    }
+    if act.rows == 0 {
+        return Ok(true);
+    }
+    let m = ctx.opaque_rows(stated(op, act.rows)?);
+    #[cfg(feature = "cuda")]
+    {
+        cublas::on_lt(ctx, op, epi, act.ptr, w.ptr, ins, out.ptr, m, n, k)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (epi, ins, m, n, k);
+        Err(crate::jit::runtimeless(op))
+    }
+}
+
 pub fn lm_head(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), Error> {
     act_x_wt(ctx, "linear.matmul", act, w, y)
 }

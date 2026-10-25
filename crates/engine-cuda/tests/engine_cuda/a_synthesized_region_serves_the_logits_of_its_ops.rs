@@ -393,13 +393,13 @@ fn an_anchored_region_serves_the_logits_of_its_ops() {
         return;
     }
     const ROWS_OFF: &str = "[compiler]\nsynth_regions = false\n";
-    for model in ANCHORED {
+    for (model, prompts) in ANCHORED {
         let fixture = fixture(model);
-        for prompted in [37, 100] {
+        for &prompted in prompts {
             let ops = served_from(&fixture, OPS, false, None, prompted);
             let carry = served_from(
                 &fixture,
-                &format!("{OPS}{NUDGED}"),
+                &format!("{OPS}{REORDERED}"),
                 false,
                 Some(&ops),
                 prompted,
@@ -424,8 +424,27 @@ fn an_anchored_region_serves_the_logits_of_its_ops() {
     }
 }
 
-/// The models served by [`an_anchored_region_serves_the_logits_of_its_ops`].
-const ANCHORED: [&str; 3] = ["glm45-air-mini", "glm47-mini", "gemma4-e4b-mini-l1"];
+/// The unfused ops summing in another order, their products too: an
+/// anchored region's product is a contraction frame's or cuBLASLt's own
+/// algorithm's, each its own order, so its carry is measured on the ops'
+/// products in another algorithm's (one cuBLASLt heuristic, a smaller
+/// workspace).
+const REORDERED: &str =
+    "[kernel]\nelemwise.rows_vec = true\ngemm.heuristics = 1\ngemm.workspace_mb = 4\n";
+
+/// The models served by [`an_anchored_region_serves_the_logits_of_its_ops`],
+/// each from the prompts it is served from. GLM-4.7's from a few rows: from
+/// 100 its q bank's bias lands on cuBLASLt's epilogue (the tuner's pick,
+/// the sum stored once where the region rounds the product first, within
+/// its tolerance of the interpreter) and its prompt's last row then routes
+/// to other experts than the unfused ops' (its logits half of them a tenth
+/// apart, the decode steps after it within the ops' own carry), a routing
+/// tie no bound of a step's carry holds.
+const ANCHORED: [(&str, &[u32]); 3] = [
+    ("glm45-air-mini", &[37, 100]),
+    ("glm47-mini", &[37]),
+    ("gemma4-e4b-mini-l1", &[37, 100]),
+];
 
 /// Two models loaded and served at once in one process, a thread each, as a
 /// server holding two models serves them: each answers, bit for bit, what

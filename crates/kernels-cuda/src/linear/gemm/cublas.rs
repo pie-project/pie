@@ -26,7 +26,7 @@ use cudarc::runtime::sys::{
 
 use crate::jit::device::capture_status;
 use crate::jit::{Ctx, refuse};
-use crate::linear::frame::{Epilogue, Frame, In, MAX_INS, MAX_OUTS, ROWS_M, RowLeg};
+use crate::linear::frame::{Epilogue, Frame, In, LtEpilogue, MAX_INS, MAX_OUTS, ROWS_M, RowLeg};
 use crate::linear::gemv::{gemm_narrow_bf16, gemm_rows_bf16, gemv_bf16, rows_cluster};
 use crate::linear::skinny;
 
@@ -110,6 +110,9 @@ enum Tactic {
     /// An anchored region unfused: the plain product's own tactic, then the
     /// epilogue on the row frame.
     Unfused,
+    /// An anchored region on cuBLASLt's own epilogue (its
+    /// [`Epilogue::lt`]): the plain product's heuristic `index` with it.
+    LtEpilogue(usize),
 }
 
 impl Tactic {
@@ -130,6 +133,7 @@ impl Tactic {
                     .unwrap_or(0),
             ),
             Self::Unfused => (7, 0),
+            Self::LtEpilogue(algo) => (8, i32::try_from(algo).unwrap_or(0)),
         }
     }
 
@@ -146,6 +150,7 @@ impl Tactic {
                 .and_then(|i| Frame::ALL.get(i))
                 .map(|f| Self::Frame(*f)),
             7 => Some(Self::Unfused),
+            8 => usize::try_from(algo).ok().map(Self::LtEpilogue),
             _ => None,
         }
     }
@@ -296,7 +301,7 @@ pub(crate) fn anchored(
         .into_iter()
         .filter(|f| f.covers(epi, m, n, k, &tuning))
         .collect();
-    if frames.is_empty() {
+    if frames.is_empty() && epi.lt().is_none() {
         return unfused(ctx, op, epi, act, w, ins, outs, m, n, k);
     }
     let mut anchor = Anchor {
@@ -314,7 +319,6 @@ pub(crate) fn anchored(
     let handle: cublasHandle_t = ctx.cublas(op)?.cast::<cublasContext>();
     let stream = ctx.stream();
     let capturing = capture_status(stream);
-    // The frames that cover the shape, and the epilogue, key it.
     let covering = frames
         .iter()
         .map(|f| Frame::ALL.iter().position(|g| g == f).unwrap_or(0))
@@ -338,12 +342,23 @@ pub(crate) fn anchored(
             k,
             anchor: None,
         };
+        // The candidates key it: the frames that cover the shape, and
+        // whether cuBLASLt's own epilogue is one.
         let key = shape_key(call, device.lt.workspace_bytes, device.heuristics, 0, 0)
             ^ epi.hash().rotate_left(17)
             ^ 0x616e_6368_0000_0000
-            ^ (covering << 40);
-        if let Some(tactic) = device.chosen.get(&key) {
-            return Some(*tactic);
+            ^ (covering << 40)
+            ^ (u64::from(epi.lt().is_some()) << 48);
+        // The plain product's plan: its heuristics are the unfused leg's
+        // and, with its epilogue, cuBLASLt's fused candidates.
+        let plain = Call {
+            n: n * parts,
+            ..call
+        };
+        let lt = (device.lt.handle, device.lt.workspace_bytes);
+        let planned = |device: &mut Device| epi.lt().and_then(|_| device.plan_for(plain));
+        if let Some(tactic) = device.chosen.get(&key).copied() {
+            return (Some(tactic), planned(device), lt);
         }
         if let Some(tactic) = device
             .disk
@@ -351,21 +366,19 @@ pub(crate) fn anchored(
             .and_then(|(kind, algo)| Tactic::decode(kind, algo))
         {
             device.chosen.insert(key, tactic);
-            return Some(tactic);
+            return (Some(tactic), planned(device), lt);
         }
-        let status = capturing?;
+        let Some(status) = capturing else {
+            return (None, planned(device), lt);
+        };
         if status != cudaStreamCaptureStatus::cudaStreamCaptureStatusNone
             || device.chosen.len() >= 1024
             || (m as usize) * (n as usize) * 2 * (parts as usize + outs.len()) > 256 << 20
         {
-            return None;
+            return (None, planned(device), lt);
         }
         // The unfused leg: the plain product's tactic, timed (or read) as
         // the plain product's own, then the row frame.
-        let plain = Call {
-            n: n * parts,
-            ..call
-        };
         let plan = device.plan_for(plain);
         anchor.leg = RowLeg::of(epi, n.unsigned_abs());
         if anchor.leg.is_some() {
@@ -376,6 +389,13 @@ pub(crate) fn anchored(
             candidates.push(Tactic::Unfused);
         }
         candidates.extend(frames.iter().map(|f| Tactic::Frame(*f)));
+        // cuBLASLt's own epilogue, at each of the plain product's heuristics.
+        if let (Some(_), Some(plan)) = (epi.lt(), plan.as_deref()) {
+            candidates.extend((0..plan.heuristics.len()).map(Tactic::LtEpilogue));
+        }
+        if candidates.is_empty() {
+            return (None, plan, lt);
+        }
         let charge = device.charge(m);
         let tactic = pick(
             handle,
@@ -400,9 +420,59 @@ pub(crate) fn anchored(
             ?tactic,
             "anchored gemm shape tuned"
         );
-        Some(tactic)
+        (Some(tactic), plan, lt)
     });
+    let (chosen, plan, (lt_handle, want)) = chosen;
+    // Untimed (a capture, a shape past the tuning arena), a region cuBLASLt's
+    // epilogue lands runs on it at cuBLASLt's own first heuristic: one pass
+    // over the product, where the unfused leg is two.
+    let chosen = match chosen {
+        None if epi.lt().is_some() && outs.len() == 1 && plan.is_some() => {
+            Some(Tactic::LtEpilogue(0))
+        }
+        chosen => chosen,
+    };
     match chosen {
+        Some(Tactic::LtEpilogue(index)) => {
+            let (Some(plan), Some(epilogue), Some(heuristic)) = (
+                plan.as_deref(),
+                epi.lt(),
+                plan.as_deref().and_then(|p| p.heuristics.get(index)),
+            ) else {
+                return unfused(ctx, op, epi, act, w, ins, outs, m, n, k);
+            };
+            let (ws, ws_bytes) = match ctx.scratch_shared(op, LT_WORKSPACE, want) {
+                Ok(ws) if !ws.is_null() => (ws, want),
+                _ => (std::ptr::null_mut(), 0),
+            };
+            let call = Call {
+                act,
+                w,
+                y: outs[0],
+                m,
+                n,
+                k,
+                anchor: None,
+            };
+            let bias = ins.first().map_or(0, |b| b.base());
+            if !lt_handle.is_null()
+                && run_lt_epilogue(
+                    lt_handle,
+                    plan,
+                    &heuristic.algo,
+                    stream,
+                    call,
+                    epilogue,
+                    bias,
+                    ws,
+                    ws_bytes,
+                )
+            {
+                return Ok(true);
+            }
+            clear_error();
+            unfused(ctx, op, epi, act, w, ins, outs, m, n, k)
+        }
         Some(Tactic::Frame(frame)) => {
             frame.fire(ctx, epi, w, act, ins, outs, m, n, k)?;
             Ok(true)
@@ -419,6 +489,82 @@ pub(crate) fn anchored(
         }
         _ => unfused(ctx, op, epi, act, w, ins, outs, m, n, k),
     }
+}
+
+/// `out = epi(act . w^T)` on cuBLASLt's own epilogue alone, at the first of
+/// the plain product's heuristics that takes it: the fused candidate
+/// [`anchored`] times, run as it is. False, landing nothing, where the
+/// epilogue is none of cuBLASLt's or no heuristic takes it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn on_lt(
+    ctx: &Ctx,
+    op: &'static str,
+    epi: &'static Epilogue,
+    act: u64,
+    w: u64,
+    ins: &[In],
+    out: u64,
+    m: i32,
+    n: i32,
+    k: i32,
+) -> Result<bool, Error> {
+    let Some(epilogue) = epi.lt() else {
+        return Ok(false);
+    };
+    let tuning = ctx.tuning();
+    let call = Call {
+        act,
+        w,
+        y: out,
+        m,
+        n,
+        k,
+        anchor: None,
+    };
+    let (plan, lt_handle, want) = with_device(|device| {
+        device.configure(
+            (tuning.gemm_workspace_mb as usize) << 20,
+            tuning.gemm_heuristics as usize,
+            tuning.gemm_narrow_n,
+            tuning.gemm_split_launch_ns,
+            tuning.gemm_rows_m,
+            tuning.gemm_split_launch_from,
+            tuning.gemm_skinny_rows,
+        );
+        (
+            device.plan_for(call),
+            device.lt.handle,
+            device.lt.workspace_bytes,
+        )
+    });
+    let Some(plan) = plan else {
+        return Ok(false);
+    };
+    if lt_handle.is_null() {
+        return Ok(false);
+    }
+    let (ws, ws_bytes) = match ctx.scratch_shared(op, LT_WORKSPACE, want) {
+        Ok(ws) if !ws.is_null() => (ws, want),
+        _ => (std::ptr::null_mut(), 0),
+    };
+    let bias = ins.first().map_or(0, |b| b.base());
+    for heuristic in &plan.heuristics {
+        if run_lt_epilogue(
+            lt_handle,
+            &plan,
+            &heuristic.algo,
+            ctx.stream(),
+            call,
+            epilogue,
+            bias,
+            ws,
+            ws_bytes,
+        ) {
+            return Ok(true);
+        }
+    }
+    clear_error();
+    Ok(false)
 }
 
 /// `outs = epi(act . w^T)` untimed on the unfused leg: the plain product
@@ -613,6 +759,32 @@ fn run_tactic(
             };
             run_lt(lt_handle, plan, &heuristic.algo, stream, call, ws, ws_bytes)
         }
+        Tactic::LtEpilogue(index) => {
+            let (Some(plan), false, Some(a)) = (plan, lt_handle.is_null(), call.anchor) else {
+                return false;
+            };
+            let (Some(heuristic), Some(epilogue), [out]) =
+                (plan.heuristics.get(index), a.epi.lt(), a.outs())
+            else {
+                return false;
+            };
+            let bias = a.ins().first().map_or(0, |b| b.base());
+            run_lt_epilogue(
+                lt_handle,
+                plan,
+                &heuristic.algo,
+                stream,
+                Call {
+                    y: *out,
+                    anchor: None,
+                    ..call
+                },
+                epilogue,
+                bias,
+                ws,
+                ws_bytes,
+            )
+        }
     }
 }
 
@@ -737,7 +909,8 @@ struct LtPlan {
 unsafe impl Send for LtPlan {}
 
 // SAFETY: after `build_lt_plan` returns nothing writes a plan's
-// descriptors: `run_lt` and `cublasLtMatmulAlgoCheck` only read them.
+// descriptors: `run_lt` and `cublasLtMatmulAlgoCheck` only read them,
+// and `run_lt_epilogue` sets its epilogue on a descriptor of its own.
 unsafe impl Sync for LtPlan {}
 
 impl Drop for LtPlan {
@@ -1026,6 +1199,124 @@ fn run_lt(
     status == lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS
 }
 
+/// [`run_lt`] with cuBLASLt's own `epilogue` landing `y`: a bias (`bias`,
+/// bf16, one a column of `y`, where the epilogue reads one) or a ReLU, through a descriptor of its own for the call. False where the
+/// algorithm refuses the epilogue.
+#[allow(clippy::too_many_arguments)]
+fn run_lt_epilogue(
+    lt_handle: lt::cublasLtHandle_t,
+    plan: &LtPlan,
+    algo: &lt::cublasLtMatmulAlgo_t,
+    stream: *mut c_void,
+    call: Call,
+    epilogue: LtEpilogue,
+    bias: u64,
+    ws: *mut c_void,
+    ws_bytes: usize,
+) -> bool {
+    if epilogue.biased() && bias == 0 {
+        return false;
+    }
+    struct Desc(lt::cublasLtMatmulDesc_t);
+    impl Drop for Desc {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: a non-null descriptor this guard alone owns, freed once.
+                let _ = unsafe { lt::cublasLtMatmulDescDestroy(self.0) };
+            }
+        }
+    }
+    let ok = lt::cublasStatus_t::CUBLAS_STATUS_SUCCESS;
+    let mut desc = Desc(std::ptr::null_mut());
+    // SAFETY: `desc.0` is a local out-pointer, freed by the guard.
+    if unsafe {
+        lt::cublasLtMatmulDescCreate(
+            &raw mut desc.0,
+            lt::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+            lt::cudaDataType::CUDA_R_32F,
+        )
+    } != ok
+    {
+        return false;
+    }
+    let set = |attribute: lt::cublasLtMatmulDescAttributes_t,
+               value: *const c_void,
+               // SAFETY: `desc.0` was just created; every caller below passes a
+               // pointer to a local of exactly `bytes` bytes, of the attribute's type,
+               // which cuBLASLt copies.
+               bytes: usize| unsafe {
+        lt::cublasLtMatmulDescSetAttribute(desc.0, attribute, value, bytes) == ok
+    };
+    let (ta, tb) = (
+        cublasOperation_t::CUBLAS_OP_T,
+        cublasOperation_t::CUBLAS_OP_N,
+    );
+    let epilogue = match epilogue {
+        LtEpilogue::Bias => lt::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_BIAS,
+        LtEpilogue::Relu => lt::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_RELU,
+        LtEpilogue::ReluBias => lt::cublasLtEpilogue_t::CUBLASLT_EPILOGUE_RELU_BIAS,
+    };
+    let biased = bias != 0;
+    let bias_ptr = dev(bias);
+    let bias_type = lt::cudaDataType::CUDA_R_16BF;
+    let size = std::mem::size_of::<cublasOperation_t>();
+    if !(set(
+        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+        std::ptr::from_ref(&ta).cast(),
+        size,
+    ) && set(
+        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+        std::ptr::from_ref(&tb).cast(),
+        size,
+    ) && set(
+        lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_EPILOGUE,
+        std::ptr::from_ref(&epilogue).cast(),
+        std::mem::size_of::<lt::cublasLtEpilogue_t>(),
+    ) && (!biased
+        || set(
+            lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+            std::ptr::from_ref(&bias_ptr).cast(),
+            std::mem::size_of::<*const c_void>(),
+        ) && set(
+            lt::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_BIAS_DATA_TYPE,
+            std::ptr::from_ref(&bias_type).cast(),
+            std::mem::size_of::<lt::cudaDataType>(),
+        )))
+    {
+        return false;
+    }
+    let alpha = 1.0f32;
+    let beta = 0.0f32;
+    // SAFETY: as in `run_lt`, with `desc.0` the descriptor just set up;
+    // `bias`, where the epilogue reads one, is the caller's `n`-long bf16
+    // bias, non-zero by the test above.
+    let status = unsafe {
+        lt::cublasLtMatmul(
+            lt_handle,
+            desc.0,
+            std::ptr::from_ref(&alpha).cast(),
+            dev(call.w),
+            plan.a_desc,
+            dev(call.act),
+            plan.b_desc,
+            std::ptr::from_ref(&beta).cast(),
+            dev(call.y),
+            plan.c_desc,
+            dev_mut(call.y),
+            plan.c_desc,
+            std::ptr::from_ref(algo),
+            ws,
+            ws_bytes,
+            stream.cast(),
+        )
+    };
+    if status != ok {
+        clear_error();
+        return false;
+    }
+    true
+}
+
 struct Device {
     lt: LtCtx,
     heuristics: usize,
@@ -1301,7 +1592,9 @@ fn tune(
 /// charged too, and an unfused leg as its product's tactic is.
 fn charged(tactic: Tactic, plan: Option<&LtPlan>, call: Call) -> bool {
     match tactic {
-        Tactic::Lt(i) => plan.is_some_and(|p| splits_of(&p.heuristics[i].algo) > 1),
+        Tactic::Lt(i) | Tactic::LtEpilogue(i) => {
+            plan.is_some_and(|p| splits_of(&p.heuristics[i].algo) > 1)
+        }
         Tactic::GemmEx => true,
         Tactic::Unfused => call
             .anchor

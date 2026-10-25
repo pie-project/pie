@@ -108,6 +108,12 @@ impl In {
         }
     }
 
+    /// Its first element's address.
+    #[cfg(feature = "cuda")]
+    pub(crate) const fn base(self) -> u64 {
+        self.base
+    }
+
     /// The input kind its strides read.
     const fn kind(self) -> Input {
         match (self.row_stride, self.col_stride) {
@@ -135,6 +141,86 @@ pub struct Epilogue {
     round: bool,
     /// The plain store: no epilogue.
     plain: bool,
+    /// The cuBLASLt epilogue that lands what this one does, where one does.
+    lt: Option<LtEpilogue>,
+}
+
+/// What cuBLASLt's own epilogues land over one dense bank's products: a
+/// bias a column, a ReLU, or a bias then a ReLU, each summed in f32 and
+/// stored once to bf16. Its GELU is none of these: its GELU after a bias
+/// lands up to 6 bf16 ulps from the tanh GELU at a prefill's rows (a
+/// 14336-column bank over 5120), past the 3 an epilogue of one product is
+/// held to, and erf's has no cuBLASLt form. An anchored region whose epilogue is one of
+/// these (to within a bf16 rounding: the region rounds the product and the
+/// biased sum where the unfused ops store them) may run as a cuBLASLt
+/// product with it, one more fused candidate the GEMM tuner times.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LtEpilogue {
+    Bias,
+    Relu,
+    ReluBias,
+}
+
+impl LtEpilogue {
+    const ALL: [LtEpilogue; 3] = [LtEpilogue::Bias, LtEpilogue::Relu, LtEpilogue::ReluBias];
+
+    /// Whether it reads a bias, its one input.
+    #[must_use]
+    pub const fn biased(self) -> bool {
+        matches!(self, LtEpilogue::Bias | LtEpilogue::ReluBias)
+    }
+
+    /// What it lands of the product `y` (and the bias `b`), in f32.
+    fn of(self, y: f32, b: f32) -> f32 {
+        let x = if self.biased() { y + b } else { y };
+        match self {
+            LtEpilogue::Bias => x,
+            LtEpilogue::Relu | LtEpilogue::ReluBias => x.max(0.0),
+        }
+    }
+
+    /// The one of these `region` lands over one product (and a bias where
+    /// `inputs` is a vector a column), probed by the interpreter across the
+    /// products a bf16 tile holds: each result within two bf16 roundings of
+    /// what cuBLASLt lands (at a half's scale near zero, as the frames'
+    /// tolerances count).
+    fn matching(region: &Region, inputs: &[Input]) -> Option<LtEpilogue> {
+        let biased = match inputs {
+            [] => false,
+            [Input::Column] => true,
+            _ => return None,
+        };
+        if region.results.len() != 1 || region.params.len() != 1 + usize::from(biased) {
+            return None;
+        }
+        const WIDTH: usize = 64;
+        let probe = Region {
+            width: WIDTH as u32,
+            ..region.clone()
+        };
+        let bf16 = kernels_ir::frame::round_bf16;
+        #[allow(clippy::cast_precision_loss)]
+        let y: Vec<f32> = (0..WIDTH).map(|i| bf16((i as f32 - 31.5) * 0.19)).collect();
+        #[allow(clippy::cast_precision_loss)]
+        let b: Vec<f32> = (0..WIDTH)
+            .map(|i| bf16(((i * 37) % 11) as f32 * 0.21 - 1.0))
+            .collect();
+        let mut args = vec![kernels_ir::interp::Arg::Row(y.clone())];
+        if biased {
+            args.push(kernels_ir::interp::Arg::Row(b.clone()));
+        }
+        let landed = kernels_ir::interp::eval(&probe, &args).ok()?;
+        let landed = landed.first()?;
+        LtEpilogue::ALL
+            .into_iter()
+            .filter(|lt| lt.biased() == biased)
+            .find(|lt| {
+                (0..WIDTH).all(|i| {
+                    let want = bf16(lt.of(y[i], b[i]));
+                    (landed[i] - want).abs() <= want.abs().max(0.5) / 64.0
+                })
+            })
+    }
 }
 
 impl PartialEq for Epilogue {
@@ -211,7 +297,13 @@ impl Epilogue {
         let body = Body::of(&region).map_err(|why| refuse(OP, why.to_string()))?;
         let plain = anchored.epilogue.is_none();
         let root = unit(&body)?;
+        let lt = if parts == 1 && round && !plain {
+            LtEpilogue::matching(&region, &inputs)
+        } else {
+            None
+        };
         Ok(Epilogue {
+            lt,
             results: region.results.len(),
             region,
             body,
@@ -271,6 +363,12 @@ impl Epilogue {
     #[must_use]
     pub const fn results(&self) -> usize {
         self.results
+    }
+
+    /// The cuBLASLt epilogue that lands what it does, where one does.
+    #[must_use]
+    pub const fn lt(&self) -> Option<LtEpilogue> {
+        self.lt
     }
 
     /// Whether it is the plain store, no epilogue at all.

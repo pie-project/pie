@@ -282,9 +282,10 @@ fn each_frame_lands_each_epilogue_as_the_interpreter() {
 /// A soft cap's and GEGLU's epilogues through the tuner's anchored entry,
 /// its fused frames timed against the product then the region on the row
 /// frame: whichever it picks lands the interpreter's result. A shape no
-/// frame covers lands it on the unfused leg, untimed; one whose leg the row
-/// frame does not carry either (a vector a row) is left to the caller, and
-/// `frame::serves` says so before anything fires.
+/// frame covers lands it on the unfused leg, untimed, a vector a row read
+/// one value a row; one whose leg the row frame does not carry either (a row
+/// in no whole runs of eight) is left to the caller, and `frame::serves`
+/// says so before anything fires.
 #[test]
 fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
     for (case, m, n, k) in [
@@ -323,9 +324,10 @@ fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
         let want: Vec<f32> = want[0].iter().map(|&v| round_bf16(v)).collect();
         assert_within(&what, &gpu.down::<u16>(y, m * n), &want, case.tolerance());
     }
-    // A row's scale past every frame's rows: no leg carries it.
+    // A row's scale past every frame's rows: the leg reads it one value a
+    // row.
     let (m, n, k) = (100, 64, 128);
-    let anchored = Anchored {
+    let row_scaled = |n: usize| Anchored {
         epilogue: Some(Pointwise {
             region: Region {
                 width: n as u32,
@@ -338,15 +340,13 @@ fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
         }),
         ..Anchored::plain(contraction(n, k, Layout::Dense, Some(Bf16)))
     };
-    assert!(frame::serves(&anchored, &[Bf16], &[Bf16]).is_err());
+    let anchored = row_scaled(n);
+    assert!(frame::serves(&anchored, &[Bf16], &[Bf16]).is_ok());
     let epi = Epilogue::interned(&anchored).expect("the frames take it");
     let mut gpu = Gpu::open();
-    let (w, act, s, y) = (
-        gpu.zeros(n * k * 2),
-        gpu.zeros(m * k * 2),
-        gpu.zeros(m * 2),
-        gpu.zeros(m * n * 2),
-    );
+    let mut lcg = Lcg::seeded(41);
+    let ((wr, wv), (ar, av), (sr, sv)) = (lcg.row(n * k), lcg.row(m * k), lcg.row(m));
+    let (w, act, s, y) = (gpu.up(&wr), gpu.up(&ar), gpu.up(&sr), gpu.zeros(m * n * 2));
     let (a, wt, yt) = (t(act, m, k, Bf16), t(w, n, k, Bf16), t(y, m, n, Bf16));
     let served = gemm::anchored(
         &gpu.ctx(),
@@ -357,9 +357,181 @@ fn the_anchored_entry_lands_an_epilogue_on_its_pick() {
         &[In::row(s)],
         &[yt],
     );
+    assert_eq!(served.ok(), Some(true), "the leg serves {m} rows");
+    gpu.sync();
+    let want = eval(&anchored, m, &av, &wv, &[], &[Given::Row(sv)]).expect("runs");
+    let want: Vec<f32> = want[0].iter().map(|&v| round_bf16(v)).collect();
+    assert_within("a row's scale", &gpu.down::<u16>(y, m * n), &want, ONE_MORE);
+    // A row in no whole runs of eight: no frame past a few rows, nor a leg.
+    let narrow = row_scaled(4);
+    assert!(frame::serves(&narrow, &[Bf16], &[Bf16]).is_err());
+    let epi = Epilogue::interned(&narrow).expect("the frames take it");
+    let y = gpu.zeros(m * 4 * 2);
+    let served = gemm::anchored(
+        &gpu.ctx(),
+        "test.anchored",
+        epi,
+        t(act, m, k, Bf16),
+        t(w, 4, k, Bf16),
+        &[In::row(s)],
+        &[t(y, m, 4, Bf16)],
+    );
     assert_eq!(
         served.ok(),
         Some(false),
         "no frame covers {m} rows, nor a leg"
+    );
+}
+
+/// An epilogue cuBLASLt lands itself (a bias, a tanh GELU, a ReLU, or a
+/// bias then either), written as the compiler lowers it.
+fn lt_region(n: usize, gelu: bool, relu: bool, biased: bool) -> (Region, Vec<Input>) {
+    let mut params = vec![Shape::Row];
+    let mut ops = Vec::new();
+    let mut rounds = Vec::new();
+    let mut x = 0u32;
+    if biased {
+        params.push(Shape::Row);
+        ops.push(Op::Binary(Binary::Add, 0, 1)); // 2
+        x = 2;
+        rounds.push((2, Bf16));
+    }
+    let at = |ops: &Vec<Op>| params.len() as u32 + ops.len() as u32;
+    if gelu {
+        let half = at(&ops);
+        ops.push(Op::Const(Literal::F32(0.5)));
+        ops.push(Op::Const(Literal::F32(1.0)));
+        ops.push(Op::Const(Literal::F32(0.797_884_6)));
+        ops.push(Op::Const(Literal::F32(0.044_715)));
+        let (one, c, cubic) = (half + 1, half + 2, half + 3);
+        let t2 = at(&ops);
+        ops.push(Op::Binary(Binary::Mul, x, x));
+        ops.push(Op::Binary(Binary::Mul, t2, x));
+        ops.push(Op::Binary(Binary::Mul, cubic, t2 + 1));
+        ops.push(Op::Binary(Binary::Add, x, t2 + 2));
+        ops.push(Op::Binary(Binary::Mul, c, t2 + 3));
+        ops.push(Op::Unary(Unary::Tanh, t2 + 4));
+        ops.push(Op::Binary(Binary::Add, one, t2 + 5));
+        ops.push(Op::Binary(Binary::Mul, half, x));
+        ops.push(Op::Binary(Binary::Mul, t2 + 7, t2 + 6));
+        x = t2 + 8;
+    } else if relu {
+        let zero = at(&ops);
+        ops.push(Op::Const(Literal::F32(0.0)));
+        ops.push(Op::Binary(Binary::Max, x, zero));
+        x = zero + 1;
+    }
+    if !rounds.iter().any(|(v, _)| *v == x) {
+        rounds.push((x, Bf16));
+    }
+    let inputs = if biased { vec![Input::Column] } else { vec![] };
+    (
+        Region {
+            width: n as u32,
+            params,
+            ops,
+            results: vec![x],
+            rounds,
+        },
+        inputs,
+    )
+}
+
+/// cuBLASLt's own epilogue, the fused candidate the tuner times beside the
+/// frames and the unfused leg, lands what the anchored region states: a
+/// bias, a ReLU and a bias then a ReLU, at a decode's rows and a prefill's,
+/// within a product's ulp and the epilogue's rounding; and GLM-4.7's
+/// biased banks (q, q and k and v, k and v) at a decode's rows and a
+/// prefill's. A region no cuBLASLt epilogue lands (a soft
+/// cap, a tanh GELU, a bias then one) is not offered to it. Through the
+/// tuner's entry a prefill's lands the same on whichever it picks.
+#[test]
+fn cublaslts_own_epilogue_lands_the_anchored_region() {
+    for gelu_biased in [false, true] {
+        let (region, inputs) = lt_region(64, true, false, gelu_biased);
+        let anchored = Anchored {
+            epilogue: Some(Pointwise { region, inputs }),
+            ..Anchored::plain(contraction(64, 128, Layout::Dense, Some(Bf16)))
+        };
+        let epi = Epilogue::interned(&anchored).expect("the frames take it");
+        assert!(epi.lt().is_none(), "a GELU is cuBLASLt's own approximation");
+    }
+    for (n, k, relu, biased, rows) in [
+        (320usize, 256usize, false, true, &[1usize, 37, 300][..]),
+        (320, 256, true, false, &[1, 37, 300]),
+        (320, 256, true, true, &[1, 37, 300]),
+        (14_336, 5120, false, true, &[1, 2, 100]),
+        (12_288, 5120, false, true, &[1, 2, 4, 128]),
+        (1024, 5120, false, true, &[16, 128, 256]),
+    ] {
+        let gelu = false;
+        let (region, inputs) = lt_region(n, gelu, relu, biased);
+        let anchored = Anchored {
+            epilogue: Some(Pointwise { region, inputs }),
+            ..Anchored::plain(contraction(n, k, Layout::Dense, Some(Bf16)))
+        };
+        let epi = Epilogue::interned(&anchored).expect("the frames take it");
+        assert!(epi.lt().is_some(), "relu {relu} bias {biased}");
+        for &m in rows {
+            let what = format!("relu {relu} bias {biased}, {m}x{n}x{k}");
+            let mut gpu = Gpu::open();
+            let mut lcg = Lcg::seeded((m * 7 + n) as u64);
+            let (wr, wv) = lcg.row(n * k);
+            let (ar, av) = lcg.row(m * k);
+            let (br, bv) = lcg.row(n);
+            let (w, act, b, y) = (gpu.up(&wr), gpu.up(&ar), gpu.up(&br), gpu.zeros(m * n * 2));
+            let ins: Vec<In> = if biased { vec![In::column(b)] } else { vec![] };
+            let given: Vec<Given> = if biased {
+                vec![Given::Column(bv.clone())]
+            } else {
+                vec![]
+            };
+            let ctx = gpu.ctx();
+            let landed = gemm::anchored_on_lt(
+                &ctx,
+                "test.lt",
+                epi,
+                t(act, m, k, Bf16),
+                t(w, n, k, Bf16),
+                &ins,
+                t(y, m, n, Bf16),
+            )
+            .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            assert!(landed, "{what}: some heuristic takes the epilogue");
+            gpu.sync();
+            let want = eval(&anchored, m, &av, &wv, &[], &given).expect("runs");
+            let want: Vec<f32> = want[0].iter().map(|&v| round_bf16(v)).collect();
+            assert_within(&what, &gpu.down::<u16>(y, m * n), &want, ONE_MORE);
+            // And through the tuner, a prefill's rows past every frame.
+            if m >= 100 {
+                let y2 = gpu.zeros(m * n * 2);
+                for _ in 0..2 {
+                    let served = gemm::anchored(
+                        &gpu.ctx(),
+                        "test.lt",
+                        epi,
+                        t(act, m, k, Bf16),
+                        t(w, n, k, Bf16),
+                        &ins,
+                        &[t(y2, m, n, Bf16)],
+                    )
+                    .unwrap_or_else(|e| panic!("{what}: {e:?}"));
+                    assert!(served, "{what}");
+                }
+                gpu.sync();
+                assert_within(
+                    &format!("{what}, on the tuner's pick"),
+                    &gpu.down::<u16>(y2, m * n),
+                    &want,
+                    ONE_MORE,
+                );
+            }
+        }
+    }
+    assert!(
+        Epilogue::interned(&Case::Softcap.anchored(64, 128))
+            .expect("a cap")
+            .lt()
+            .is_none()
     );
 }
