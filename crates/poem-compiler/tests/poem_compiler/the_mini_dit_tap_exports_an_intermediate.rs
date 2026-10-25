@@ -32,8 +32,8 @@ fn velocity_width(plan: &Trace) -> u64 {
     let value = seams[0].values[0];
     match &plan.values[value.0 as usize].ty {
         Ty::Tensor { shape, .. } => match shape.as_slice() {
-            [Dim::Tokens, Dim::Const(width)] => *width,
-            other => panic!("the velocity seam is a `[Tokens, width]` rectangle, not {other:?}"),
+            [Dim::Tokens | Dim::Voxels, Dim::Const(width)] => *width,
+            other => panic!("the velocity seam is a `[rows, width]` rectangle, not {other:?}"),
         },
         other => panic!("the velocity seam is a tensor, not {other:?}"),
     }
@@ -61,8 +61,9 @@ fn the_mini_dit_tap_exports_an_intermediate_every_case() {
 }
 
 fn a_tap_moves_the_velocity_seam_to_the_intermediate_at_its_width() {
+    assert_eq!(velocity_width(&traced(None)), u64::from(model::CHANNELS));
     assert_eq!(
-        velocity_width(&traced(None)),
+        velocity_width(&traced(Some("final.tokens"))),
         u64::from(model::PATCH_FEATURES)
     );
     assert_eq!(

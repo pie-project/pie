@@ -109,12 +109,6 @@ def layout(id, deploy):
 
 def generative(m):
     return generation(
-        positions = positions(
-            axes = ["time", "height", "width"],
-            text_axis = 0,
-            text_origin = 0,
-            image_follows_text = False,
-        ),
         latent = latent_space(
             channels = CHANNELS,
             patch_t = 1,
@@ -312,14 +306,23 @@ def mlp_sublayer(m, at, stem, x, mlp, mods, gate, lanes):
         return None
     return ops.elemwise.gated_residual_add(x, gate, y, lanes)
 
+def turn_positions(arm):
+    """Each joint row's rope position: a text row `(j, 0, 0)`, `j` its row
+    in the lane; an image row its patch's `(t, h, w)`. A lane whose
+    `positions` switch says `given` reads the guest's instead."""
+    given = switch_is("positions", "given")
+    computed = ops.conv.cells(arm.token_grid([1, PATCH, PATCH]), arm.positions(), 0)
+    return merge([arm.on(given).input("positions", dtype.f32, "row", ROPE_AXES), computed.on(~given)])
+
 def forward(m, inputs):
     switch("reading", ["denoise"])
     switch("stream", ["text", "image", "context"])
+    switch("positions", ["computed", "given"])
     ctx, joint = inputs.on(switch_is("stream", "context")), inputs.on(~switch_is("stream", "context"))
     txt_in, img_in = joint.on(switch_is("stream", "text")), joint.on(~switch_is("stream", "text"))
 
     lanes = inputs.request_of_token()
-    positions = inputs.input("positions", dtype.f32, "row", m.rope_axes)
+    positions = turn_positions(inputs)
 
     t = inputs.input("timestep", dtype.f32, "lane", 1)
     temb = ops.elemwise.silu(ops.elemwise.sinusoid(t, TIMESTEP_DIM, 10000.0, False, 1.0))
@@ -328,7 +331,9 @@ def forward(m, inputs):
     img_rows = struct(perm = img_in.row_permutation(), csr = img_in.group_indptr())
 
     txt = txt_in.input("text", dtype.bf16, "row", m.text_width)
-    patches = img_in.input("latents", dtype.bf16, "row", m.patch_features)
+    grid, tgrid = img_in.grid(), img_in.token_grid([1, PATCH, PATCH])
+    latents = img_in.input("latents", dtype.bf16, "voxel", CHANNELS)
+    patches = ops.conv.patchify(latents, grid, [1, PATCH, PATCH], tgrid)
     ctx_rows = ctx.input("context", dtype.bf16, "row", m.context_width)
 
     hit = []
@@ -436,6 +441,9 @@ def forward(m, inputs):
         return hf
     if m.tap not in ["", "final.tokens"]:
         fail("the tap {} names no intermediate of mini-dit".format(m.tap))
-    velocity = run_linear(m.final_proj, hf)
+    tokens = run_linear(m.final_proj, hf)
+    if at("final.tokens", tokens):
+        return tokens
+    velocity = ops.conv.unpatchify(tokens, tgrid, [1, PATCH, PATCH], grid)
     seam.at(seam.VELOCITY, [velocity])
     return velocity

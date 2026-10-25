@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use crate::mini_dit_dims;
 
 use mini_dit_dims as model;
+use poem_ir::Conv;
 use poem::{
     Attn, Def, Dim, Dtype, Elemwise, GeomKind, Guard, Operands, Operation, Platform, Request,
     RopeForm, RuntimeInput, Trace, Ty, ValueId, seam,
@@ -36,6 +37,74 @@ fn the_mini_dit_row_bakes_every_case() {
     every_rope_turns_three_axes_of_the_whole_head_interleaved();
     the_modulation_is_a_per_lane_f32_pair_over_a_bf16_trunk();
     the_generative_facts_state_the_reading_its_latent_and_its_schedule();
+    the_latent_is_patched_in_the_graph_and_the_positions_are_its_cells();
+}
+
+fn the_latent_is_patched_in_the_graph_and_the_positions_are_its_cells() {
+    let plan = trace(Platform::Cuda);
+    let patch = [1, model::PATCH, model::PATCH];
+    let ops: Vec<&Conv> = plan
+        .nodes
+        .iter()
+        .filter_map(|node| match &node.op {
+            Operation::Conv(op) => Some(op),
+            _ => None,
+        })
+        .collect();
+    let patched = ops
+        .iter()
+        .filter(|op| matches!(op, Conv::Patchify { p, .. } if *p == patch))
+        .count();
+    let unpatched = ops
+        .iter()
+        .filter(|op| matches!(op, Conv::Unpatchify { p, .. } if *p == patch))
+        .count();
+    assert_eq!((patched, unpatched), (1, 1), "the latent in, the velocity out");
+    let cells: Vec<u32> = ops
+        .iter()
+        .filter_map(|op| match op {
+            Conv::Cells { axis, .. } => Some(*axis),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cells, vec![0], "a text row's position runs down the time axis");
+
+    let velocity = plan
+        .seams
+        .iter()
+        .find(|s| s.seam == seam::VELOCITY.name)
+        .expect("a velocity seam")
+        .values[0];
+    assert_eq!(
+        plan.values[velocity.0 as usize].ty,
+        Ty::Tensor {
+            shape: vec![Dim::Voxels, Dim::Const(u64::from(model::CHANNELS))],
+            dtype: Dtype::Bf16,
+        },
+        "the velocity reads out in the latent's own voxels"
+    );
+    assert_eq!(
+        plan.facts.declared("positions").map(|s| s.values.clone()),
+        Some(vec!["computed".to_string(), "given".to_string()])
+    );
+
+    let budgets = poem_compiler::Budgets::of(poem_compiler::Budget::new(4, 256)).with_voxels(
+        poem_compiler::VoxelLadder {
+            max_voxels: 1024,
+            buckets: vec![256, 1024],
+            max_clips: 4,
+        },
+    );
+    let compiled =
+        poem_compiler::compile_axes(&plan, &budgets, &poem_compiler::DeviceProfile::default())
+            .expect("the voxel-in, voxel-out denoiser bakes");
+    assert!(
+        compiled.units.contains(&poem_compiler::RowAxis::Voxels)
+            && compiled.units.contains(&poem_compiler::RowAxis::Tokens),
+        "the latent's voxels and the tokens are two units: {:?}",
+        compiled.units
+    );
+    assert!(compiled.arena.clashes(&compiled.concurrency).is_empty());
 }
 
 fn the_row_traces_on_every_platform_with_no_cache_and_a_velocity_readout() {
@@ -77,7 +146,7 @@ fn the_row_reads_exactly_the_five_inputs_it_names() {
         })
         .collect();
     let want: BTreeSet<String> = [
-        format!("latents:row:{}", model::PATCH_FEATURES),
+        format!("latents:voxel:{}", model::CHANNELS),
         format!("text:row:{}", model::TEXT_WIDTH),
         format!("context:row:{}", model::CONTEXT_WIDTH),
         "timestep:lane:1".to_string(),
