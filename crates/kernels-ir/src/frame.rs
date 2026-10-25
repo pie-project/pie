@@ -27,11 +27,22 @@ pub trait Frame {
     /// Result `k` is complete.
     fn flush(&mut self, k: u32);
     /// A thread's partial combined over the row's threads, the total to
-    /// every one.
-    fn reduce(&mut self, op: Reduce, partial: f32) -> f32;
+    /// every one, as f32. A device frame's partials are f32 in its own
+    /// order; the interpreter's, f64.
+    fn reduce(&mut self, op: Reduce, partial: f64) -> f32;
     /// `v` rounded to `dtype` and back: a value the region rounds where it
     /// is defined.
     fn round(&self, dtype: Dtype, v: f32) -> f32;
+    /// Element `e`'s column in the row.
+    fn column(&self, e: usize) -> u32;
+    /// Each of a thread's vectors' partials (`partials[e / 8]`) combined
+    /// over its head of `seg` vectors, in place: lane `i` joined with lane
+    /// `i ^ off`, `off` halving from `seg / 2` (a butterfly).
+    fn reduce_heads(&mut self, op: Reduce, seg: u32, partials: &mut [f64]);
+    /// Element `e` of the row a pass shares.
+    fn share(&mut self, e: usize, v: f32);
+    /// The shared row at column `c` (column 0 past the row).
+    fn peer(&self, c: u32) -> f32;
 }
 
 /// `x` rounded to bf16 (nearest, ties to even) and widened back.

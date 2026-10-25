@@ -18,14 +18,19 @@
 //!   provides them; the printers name them.
 //! - **The interpreter** ([`interp`]): both forms on the host, the oracle
 //!   every printed kernel is held to.
+//! - **The builders** ([`build`]): a row's math (a norm, a head's norm, a
+//!   rotation) as region ops, in the order the hand kernels compute it.
 
+pub mod build;
 pub mod frame;
 pub mod interp;
 pub mod kernel;
 pub mod region;
 pub mod schedule;
 
-pub use kernel::{Expr, Kernel, Loop, Operand, Partial, Phase, RowAssign, Total, Uniform};
+pub use kernel::{
+    Expr, HeadAssign, Kernel, Loop, Operand, Partial, Phase, RowAssign, Table, Total, Uniform,
+};
 pub use region::{Binary, Elem, Literal, Op, Reduce, Region, RegionError, Shape, Unary, ValueId};
 pub use schedule::{Unscheduled, schedule};
 
