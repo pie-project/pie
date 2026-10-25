@@ -24,13 +24,16 @@ pub(crate) fn is_library(region: &Region) -> bool {
     matches!(region.kind, RegionKind::Library(_))
 }
 
-/// Metal reads a float output; an output of ids it has no gather for.
+/// Metal reads an output as f32 or i32.
 pub fn outputs_bindable(ops: &[OpView], region: &Region) -> Result<(), EmitError> {
     for &node in &region.nodes {
         let Some(op) = ops.get(node.index()) else {
             continue;
         };
-        if op.tag == tags::OUTPUT && op.dtype != eta_ir::types::wire_dtype(eta_ir::Dtype::F32) {
+        if op.tag == tags::OUTPUT
+            && op.dtype != eta_ir::types::wire_dtype(eta_ir::Dtype::F32)
+            && op.dtype != eta_ir::types::wire_dtype(eta_ir::Dtype::I32)
+        {
             return Err(EmitError::UnbindableOutput {
                 name_index: op.name_idx,
             });

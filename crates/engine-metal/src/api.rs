@@ -150,7 +150,6 @@ fn fault(fault: Fault) -> Error {
             wanted: 1,
             available: 0,
         },
-        Fault::Scoreless { .. } | Fault::ScoreWord { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::Blob { .. } => Error::Load(fault.to_string()),
         Fault::Compile(_) | Fault::Program { .. } | Fault::Interpret(_) => {
@@ -722,13 +721,13 @@ impl Engine for Metal {
         if let Some(error) = refused {
             return Err(error);
         }
-        let seam = self
+        let name = self
             .shell
             .as_ref()
-            .map_or(crate::seam::Seam::Logits, Shell::readout_seam);
+            .map_or_else(String::new, |shell| shell.readout_name().to_string());
         let (_, pending) = self.pending.as_ref().expect("just put back");
         for (receipt, step) in ticket.steps.iter_mut().zip(pending) {
-            receipt.readouts = readouts_of(step, seam);
+            receipt.readouts = readouts_of(step, &name);
         }
         Ok(())
     }
@@ -1048,7 +1047,6 @@ impl Metal {
                     inputs: &lane.inputs,
                     pages: &lane.kv.pages,
                     held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
-                    captures_scores: false,
                     mask: lane.mask.as_ref(),
                     kv_less: lane.kv_less,
                     adapter: lane_adapters[at].or(lane.adapter),
@@ -1103,7 +1101,7 @@ impl Metal {
     }
 }
 
-fn readouts_of(step: &PendingStep, seam: crate::seam::Seam) -> Vec<LaneReadout> {
+fn readouts_of(step: &PendingStep, output: &str) -> Vec<LaneReadout> {
     let rows: &[Vec<f32>] = step.rows.as_deref().unwrap_or(&[]);
     step.readout
         .iter()
@@ -1115,7 +1113,7 @@ fn readouts_of(step: &PendingStep, seam: crate::seam::Seam) -> Vec<LaneReadout> 
                 LaneReadout {
                     rows: 1,
                     width: u32::try_from(values.len()).unwrap_or(u32::MAX),
-                    output: seam.name().to_string(),
+                    output: output.to_string(),
                     values,
                     ..LaneReadout::default()
                 }

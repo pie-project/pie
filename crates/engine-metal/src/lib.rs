@@ -40,9 +40,7 @@ pub mod rebind;
 pub mod record;
 pub mod rs;
 pub mod run;
-pub mod scores;
 mod scratch;
-pub mod seam;
 pub mod serve;
 pub mod settle;
 pub mod store;
@@ -73,7 +71,6 @@ pub use run::{
     CacheGeometry, CachePool, CacheTable, FireBindings, FireTables, PoolSlabs, Run, SlotTable,
     StructSlot, WeightRow, WeightTable,
 };
-pub use scores::ScoreSeat;
 pub use scratch::Scratch;
 pub use serve::{
     Attached, Boot, Enqueued, FireCost, Landed, Lane, Prepared, Seated, Shell, StepView,

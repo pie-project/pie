@@ -98,7 +98,7 @@ impl fmt::Display for EmitError {
             }
             EmitError::UnbindableOutput { name_index } => write!(
                 f,
-                "Metal reads float outputs only; output name #{name_index} is not one"
+                "Metal has no gather for output name #{name_index}'s element type"
             ),
             EmitError::UnsupportedSinkBoundary => {
                 f.write_str("unsupported Metal semantic sink boundary")

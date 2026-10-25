@@ -58,7 +58,7 @@ struct M3GroupLayout {
 struct M3RowMeta {
   uint offset;
   uint count;
-  uint mtp_offset;
+  uint reserved0;
   uint reserved;
 };
 "#,

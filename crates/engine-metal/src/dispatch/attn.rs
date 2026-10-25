@@ -15,50 +15,31 @@ impl Run<'_> {
         u32::try_from(self.qo_indptr_host().len().saturating_sub(1)).unwrap_or(u32::MAX)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn capture_scores(
-        &mut self,
-        q: poem_ir::ValueId,
-        plan: poem_ir::ValueId,
-        cache: poem_ir::ValueId,
-        window: Option<u32>,
-        head_dim: u32,
-        kv_heads: u32,
-        sm_scale: f32,
-        lse: poem_ir::ValueId,
-    ) -> Result<(), kernels_metal::Error> {
-        let Some(seat) = self.bindings().scores.clone() else {
-            return Ok(());
-        };
-        let Some(plane) = seat.plane_of(lse) else {
-            return Ok(());
-        };
-        let lane_offset = self.window().span.lane_offset;
-        let requests = self.requests();
-        attn::score::capture(
-            self.ctx(),
-            self.ragged(q),
-            self.prefill_plan(plan),
-            self.pool(cache),
-            window,
-            head_dim,
-            kv_heads,
-            sm_scale,
-            seat.observe,
-            lane_offset,
-            seat.plane_stride,
-            plane,
-            crate::scores::KV_MAX,
-            requests,
-            seat.slab,
-        )
-    }
-
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_metal::Error> {
         match op {
-            Attn::ScoreCapture { .. } => Err(kernels_metal::Error::Unsupported {
-                op: "attn.score_capture",
-            }),
+            Attn::ScoreCapture {
+                q,
+                plan,
+                cache,
+                head_dim,
+                kv_heads,
+                sm_scale,
+                observe,
+                kv_max,
+                scores,
+            } => attn::score::capture(
+                self.ctx(),
+                self.ragged(*q),
+                self.prefill_plan(*plan),
+                self.pool(*cache),
+                *head_dim,
+                *kv_heads,
+                *sm_scale,
+                *observe,
+                *kv_max,
+                self.requests(),
+                self.tensor(*scores),
+            ),
             Attn::Voxel {
                 q,
                 k,
@@ -423,25 +404,20 @@ impl Run<'_> {
                 causal: true,
                 selected: None,
                 rel: None,
-            } => {
-                attn::arbiter::prefill_lse(
-                    self.ctx(),
-                    self.ragged(*q),
-                    self.prefill_plan(*plan),
-                    self.pool(*cache),
-                    *window,
-                    *head_dim,
-                    *kv_heads,
-                    *sm_scale,
-                    self.tensor(*o),
-                    self.tensor(*lse),
-                    self.requests(),
-                    self.tuning(),
-                )?;
-                self.capture_scores(
-                    *q, *plan, *cache, *window, *head_dim, *kv_heads, *sm_scale, *lse,
-                )
-            }
+            } => attn::arbiter::prefill_lse(
+                self.ctx(),
+                self.ragged(*q),
+                self.prefill_plan(*plan),
+                self.pool(*cache),
+                *window,
+                *head_dim,
+                *kv_heads,
+                *sm_scale,
+                self.tensor(*o),
+                self.tensor(*lse),
+                self.requests(),
+                self.tuning(),
+            ),
             Attn::Sink {
                 o,
                 lse,

@@ -5,10 +5,10 @@ pub const M2_LOGITS_BUFFER: usize = 6;
 
 pub const M2_INTRINSIC_TOP_BUFFER: usize = 30;
 
-/// The single-lane form's address table: one `ulong` a slot, [`eta_ir::op::output_pitch`] of them.
+/// The single-lane form's output table: one `M1OutputSeat` a slot, [`eta_ir::op::output_pitch`] of them.
 pub const M2_INTRINSIC_TABLE_BUFFER: usize = M2_INTRINSIC_TOP_BUFFER - 3;
 
-/// The grouped and streamed forms' address tables, one an instance, by dispatch lane.
+/// The grouped and streamed forms' output tables, one an instance, by dispatch lane.
 pub const M3_INTRINSIC_TABLE_BUFFER: usize = 12;
 
 /// The address-table slot of output op `op` (its result at `base`); `None`

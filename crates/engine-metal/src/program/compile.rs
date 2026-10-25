@@ -48,9 +48,11 @@ fn region_tags(plan: &LaunchStagePlan, region_index: u32) -> String {
                 .nodes
                 .iter()
                 .filter_map(|&node| plan.ops.get(node as usize))
-                .map(|op| match crate::seam::op_intrinsic(plan, op) {
-                    Some(id) => format!("{:#04x}[{id:?}]", op.tag),
-                    None => format!("{:#04x}", op.tag),
+                .map(|op| match plan.names.get(op.name_index as usize) {
+                    Some(name) if op.tag == eta_ir::op::tags::OUTPUT => {
+                        format!("{:#04x}[{name}]", op.tag)
+                    }
+                    _ => format!("{:#04x}", op.tag),
                 })
                 .collect::<Vec<_>>()
                 .join(" ")

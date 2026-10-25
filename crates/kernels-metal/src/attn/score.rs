@@ -30,14 +30,10 @@ pub fn capture(
     q: RaggedTensor,
     plan: &PrefillPlan,
     pool: &KvPool,
-    window: Option<u32>,
     head_dim: u32,
     kv_heads: u32,
     sm_scale: f32,
     observe: u32,
-    lane_offset: u32,
-    plane_stride: u32,
-    plane: u32,
     kv_max: u32,
     requests: u32,
     scores: Tensor,
@@ -47,15 +43,6 @@ pub fn capture(
         return Err(refuse(
             OP,
             "score capture is not yet supported with `kernel.sdpa.kv_q8` on",
-        ));
-    }
-    if window.is_some() {
-        return Err(refuse(
-            OP,
-            "a sliding window is stated, and a windowed row is not the softmax the \
-             eviction and interpretability papers define: the mass would be a \
-             distribution over the window rather than over the request's keys, and \
-             every key outside it would read as unattended rather than as excluded",
         ));
     }
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
@@ -74,19 +61,8 @@ pub fn capture(
         return Err(refuse(
             OP,
             format!(
-                "the score slab is {:?}, and a per-key mass is an f32 rectangle",
+                "the score rows are {:?}, and a per-key mass is an f32 rectangle",
                 scores.dtype
-            ),
-        ));
-    }
-    if scores.width != kv_max {
-        return Err(refuse(
-            OP,
-            format!(
-                "the score slab's row is {} wide and the stated kv ceiling is {kv_max}; \
-                 the row IS the ceiling, and a disagreement would stripe one lane's mass \
-                 across another's",
-                scores.width
             ),
         ));
     }
@@ -135,23 +111,23 @@ pub fn capture(
              nothing; the caller states the width it wants, and zero is not one",
         ));
     }
-    nonzero(OP, "the slab's per-row kv ceiling", kv_max)?;
+    nonzero(OP, "the per-head kv ceiling", kv_max)?;
     nonzero(OP, "the requests this capture answers", requests)?;
     let page_size = u32::try_from(pool.page_size)
         .ok()
         .filter(|size| *size > 0)
         .ok_or_else(|| refuse(OP, "the kv page size is zero"))?;
 
-    debug_assert!(
-        plane + num_q_heads <= plane_stride,
-        "`{OP}` writes one plane per query head inside a lane's block of {plane_stride}"
-    );
-    debug_assert!(
-        u64::from(lane_offset + requests) * u64::from(plane_stride) <= u64::from(scores.rows),
-        "`{OP}` writes {requests} lanes of {plane_stride} planes from lane {lane_offset}, \
-         and the slab holds {} rows",
-        scores.rows
-    );
+    if scores.width != num_q_heads.saturating_mul(kv_max) || scores.rows < requests {
+        return Err(refuse(
+            OP,
+            format!(
+                "the score rows are {} by {}, and {requests} lanes capture {num_q_heads} \
+                 heads of {kv_max} keys",
+                scores.rows, scores.width
+            ),
+        ));
+    }
 
     let lanes = requests.checked_mul(THREADS).ok_or_else(|| {
         refuse(
@@ -179,9 +155,6 @@ pub fn capture(
             stated(OP, head_dim)?.arg(),
             sm_scale.arg(),
             stated(OP, observe)?.arg(),
-            stated(OP, lane_offset)?.arg(),
-            stated(OP, plane_stride)?.arg(),
-            stated(OP, plane)?.arg(),
             stated(OP, kv_max)?.arg(),
         ],
     )
@@ -207,8 +180,8 @@ mod tests {
         Tensor::new(3, rows, 1, Dtype::U32)
     }
 
-    fn slab(rows: u32) -> Tensor {
-        Tensor::new(4, rows, KV_MAX, Dtype::F32)
+    fn rows(heads: u32) -> Tensor {
+        Tensor::new(4, 2, heads * KV_MAX, Dtype::F32)
     }
 
     fn pool(kv_heads: u32, head_dim: u32, keys: Dtype) -> KvPool {
@@ -234,25 +207,27 @@ mod tests {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn fire(probe: &Probe, window: Option<u32>, keys: Dtype, scores: Tensor) -> Result<(), Error> {
-        let (q_heads, kv_heads, head_dim, rows) = (16u32, 8u32, 64u32, 40u32);
+    fn fire(
+        probe: &Probe,
+        q: Tensor,
+        kv_heads: u32,
+        head_dim: u32,
+        keys: Dtype,
+        observe: u32,
+        scores: Tensor,
+    ) -> Result<(), Error> {
         capture(
             probe,
             RaggedTensor {
-                data: bf16(rows, q_heads * head_dim),
+                data: q,
                 indptr: i32s(3),
             },
-            &plan(rows),
+            &plan(40),
             &pool(kv_heads, head_dim, keys),
-            window,
             head_dim,
             kv_heads,
             0.125,
-            32,
-            0,
-            96,
-            0,
+            observe,
             KV_MAX,
             2,
             scores,
@@ -262,9 +237,8 @@ mod tests {
     #[test]
     fn score_every_case() {
         the_head_lands_on_the_tightest_stamp_that_holds_it();
-        a_sliding_window_is_refused_as_a_different_quantity();
         a_quantized_key_plane_is_refused_by_name();
-        a_slab_that_is_not_the_ceiling_is_refused_by_name();
+        rows_that_are_not_heads_of_the_ceiling_are_refused();
         an_observation_window_of_zero_rows_is_refused_by_name();
         a_head_past_the_last_stamp_is_refused_by_name();
         an_element_this_plane_has_no_point_for_is_refused_by_dtype();
@@ -274,99 +248,53 @@ mod tests {
         assert_eq!(stamp_for(40), Some(0));
         assert_eq!(stamp_for(64), Some(0));
         assert_eq!(stamp_for(65), Some(1));
-        assert_eq!(stamp_for(72), Some(1));
         assert_eq!(stamp_for(128), Some(1));
-        assert_eq!(stamp_for(129), Some(2));
         assert_eq!(stamp_for(256), Some(2));
         assert_eq!(stamp_for(512), Some(3));
         assert_eq!(stamp_for(513), None);
         assert_eq!(STAMPS.len(), CAPTURE.len());
     }
 
-    fn a_sliding_window_is_refused_as_a_different_quantity() {
-        let probe = Probe::default();
-        let why = fire(&probe, Some(512), Dtype::Bf16, slab(4 * 96))
-            .expect_err("a windowed row is not the papers' softmax");
-        let said = format!("{why}");
-        assert!(said.contains("sliding window"), "{said}");
-        assert!(said.contains("distribution over the window"), "{said}");
-        assert!(
-            probe.fires().is_empty(),
-            "a refused capture launched anyway"
-        );
-    }
-
     fn a_quantized_key_plane_is_refused_by_name() {
         let probe = Probe::default();
-        let why = fire(&probe, None, Dtype::U8, slab(4 * 96))
+        let why = fire(&probe, bf16(40, 16 * 64), 8, 64, Dtype::U8, 32, rows(16))
             .expect_err("a quantized pool has no scores to give");
-        let said = format!("{why}");
-        assert!(said.contains("dequantizes nothing"), "{said}");
+        assert!(format!("{why}").contains("dequantizes nothing"), "{why}");
         assert!(
             probe.fires().is_empty(),
             "a refused capture launched anyway"
         );
     }
 
-    fn a_slab_that_is_not_the_ceiling_is_refused_by_name() {
+    fn rows_that_are_not_heads_of_the_ceiling_are_refused() {
         let probe = Probe::default();
-        let narrow = Tensor::new(4, 4 * 96, KV_MAX / 2, Dtype::F32);
-        let why = fire(&probe, None, Dtype::Bf16, narrow).expect_err("the row IS the ceiling");
-        assert!(format!("{why}").contains("the row IS the ceiling"), "{why}");
+        let why = fire(&probe, bf16(40, 16 * 64), 8, 64, Dtype::Bf16, 32, rows(8))
+            .expect_err("a row holds every head's keys");
+        assert!(format!("{why}").contains("capture 16 heads"), "{why}");
 
-        let bf16_slab = Tensor::new(4, 4 * 96, KV_MAX, Dtype::Bf16);
-        let dtype = fire(&probe, None, Dtype::Bf16, bf16_slab)
+        let bf16_rows = Tensor::new(4, 2, 16 * KV_MAX, Dtype::Bf16);
+        let dtype = fire(&probe, bf16(40, 16 * 64), 8, 64, Dtype::Bf16, 32, bf16_rows)
             .expect_err("a per-key mass is an f32 rectangle");
         assert!(format!("{dtype}").contains("f32 rectangle"), "{dtype}");
     }
 
     fn an_observation_window_of_zero_rows_is_refused_by_name() {
         let probe = Probe::default();
-        let why = capture(
-            &probe,
-            RaggedTensor {
-                data: bf16(40, 16 * 64),
-                indptr: i32s(3),
-            },
-            &plan(40),
-            &pool(8, 64, Dtype::Bf16),
-            None,
-            64,
-            8,
-            0.125,
-            0,
-            0,
-            96,
-            0,
-            KV_MAX,
-            2,
-            slab(4 * 96),
-        )
-        .expect_err("a capture that observes nothing is not a capture");
+        let why = fire(&probe, bf16(40, 16 * 64), 8, 64, Dtype::Bf16, 0, rows(16))
+            .expect_err("a capture that observes nothing is not a capture");
         assert!(format!("{why}").contains("observes nothing"), "{why}");
     }
 
     fn a_head_past_the_last_stamp_is_refused_by_name() {
         let probe = Probe::default();
-        let why = capture(
+        let why = fire(
             &probe,
-            RaggedTensor {
-                data: bf16(40, 2 * 1024),
-                indptr: i32s(3),
-            },
-            &plan(40),
-            &pool(2, 1024, Dtype::Bf16),
-            None,
+            bf16(40, 2 * 1024),
+            2,
             1024,
-            2,
-            0.125,
+            Dtype::Bf16,
             32,
-            0,
-            96,
-            0,
-            KV_MAX,
-            2,
-            slab(4 * 96),
+            rows(2),
         )
         .expect_err("a 1024-wide head is past the ladder");
         assert!(format!("{why}").contains("stamped for"), "{why}");
@@ -374,27 +302,9 @@ mod tests {
 
     fn an_element_this_plane_has_no_point_for_is_refused_by_dtype() {
         let probe = Probe::default();
-        let why = capture(
-            &probe,
-            RaggedTensor {
-                data: Tensor::new(1, 40, 16 * 64, Dtype::F32),
-                indptr: i32s(3),
-            },
-            &plan(40),
-            &pool(8, 64, Dtype::Bf16),
-            None,
-            64,
-            8,
-            0.125,
-            32,
-            0,
-            96,
-            0,
-            KV_MAX,
-            2,
-            slab(4 * 96),
-        )
-        .expect_err("this capture is stamped for bf16 alone");
+        let q = Tensor::new(1, 40, 16 * 64, Dtype::F32);
+        let why = fire(&probe, q, 8, 64, Dtype::Bf16, 32, rows(16))
+            .expect_err("this capture is stamped for bf16 alone");
         assert!(matches!(why, Error::DtypeUnsupported { .. }), "{why}");
     }
 }

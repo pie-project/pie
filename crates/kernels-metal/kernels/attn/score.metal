@@ -17,10 +17,7 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
     const constant int& head_dim        [[buffer(10)]],
     const constant float& sm_scale      [[buffer(11)]],
     const constant int& observe         [[buffer(12)]],
-    const constant int& lane_offset     [[buffer(13)]],
-    const constant int& plane_stride    [[buffer(14)]],
-    const constant int& plane           [[buffer(15)]],
-    const constant int& kv_max          [[buffer(16)]],
+    const constant int& kv_max          [[buffer(13)]],
     uint3 tgid     [[threadgroup_position_in_grid]],
     uint  simd_gid [[simdgroup_index_in_threadgroup]],
     uint  simd_lid [[thread_index_in_simdgroup]]) {
@@ -39,8 +36,7 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
   threadgroup float wl[SIMDS];
 
   device float* out =
-      scores + (size_t(lane_offset + request) * size_t(plane_stride) +
-                size_t(plane + head)) *
+      scores + (size_t(request) * size_t(num_q_heads) + size_t(head)) *
                    size_t(kv_max);
   for (int i = tid; i < kv_max; i += THREADS) {
     out[i] = 0.0f;
@@ -154,7 +150,6 @@ template <typename T, int HEAD_DIM_MAX, int SIMDS>
       const device uint*, const device uint*, const device int*,              \
       device float*, const constant int&, const constant int&,                \
       const constant int&, const constant int&, const constant float&,        \
-      const constant int&, const constant int&, const constant int&,          \
       const constant int&, const constant int&, uint3, uint, uint);
 
 instantiate_attn_score_capture(bfloat16, bfloat, 64)

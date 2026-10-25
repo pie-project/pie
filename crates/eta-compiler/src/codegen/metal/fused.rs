@@ -55,7 +55,7 @@ fn extra_intrinsics(
 pub(super) fn emit_intrinsic_table(source: &mut String, stage: &CompiledStage) {
     let _ = writeln!(
         source,
-        "  const device ulong* intrinsic_at = all_intrinsic_at + \
+        "  const device M1OutputSeat* intrinsic_at = all_intrinsic_at + \
          dispatch_lane * {}u;",
         eta_ir::op::output_pitch(&stage.normalized.ops)
     );
@@ -116,7 +116,7 @@ pub fn emit_fused_region(
     }
     for &at in &extra {
         let ty = if at == M2_INTRINSIC_TABLE_BUFFER {
-            "ulong"
+            "M1OutputSeat"
         } else {
             "uchar"
         };
@@ -152,15 +152,10 @@ pub fn emit_fused_region(
             slots.o0 = format!("pending_{}", op.chan);
         } else if op.tag == tags::OUTPUT {
             if let Some(slot) = addressed_slot(stage, op, bases[node]) {
-                let _ = writeln!(
-                    source,
-                    "  if (intrinsic_at[{slot}] == 0ul) {{ m1_fault(status, \
-                     {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
-                );
-                slots.a0 = format!("reinterpret_cast<const device uchar*>(intrinsic_at[{slot}])");
-            } else {
-                slots.a0 = argument_name(M2_LOGITS_BUFFER);
+                emit_addressed_gather(&mut source, op, bases[node], slot, &slots.o0, "0u", "1u");
+                continue;
             }
+            slots.a0 = argument_name(M2_LOGITS_BUFFER);
         }
         let _ = writeln!(
             source,
@@ -207,7 +202,7 @@ pub fn emit_grouped_fused_region(
     source.push_str("    const device uint* row_indices [[buffer(10)]],\n");
     let _ = writeln!(
         source,
-        "    const device ulong* all_intrinsic_at [[buffer({M3_INTRINSIC_TABLE_BUFFER})]],"
+        "    const device M1OutputSeat* all_intrinsic_at [[buffer({M3_INTRINSIC_TABLE_BUFFER})]],"
     );
     source.push_str("    uint dispatch_lane [[threadgroup_position_in_grid]],\n");
     source.push_str("    uint m3_tid [[thread_position_in_threadgroup]],\n");
@@ -369,7 +364,15 @@ pub fn emit_grouped_fused_region(
         if op.tag == tags::OUTPUT
             && let Some(slot) = addressed_slot(stage, op, base)
         {
-            emit_addressed_gather(&mut source, base, slot, &slots.o0, "m3_tid", "m3_threads");
+            emit_addressed_gather(
+                &mut source,
+                op,
+                base,
+                slot,
+                &slots.o0,
+                "m3_tid",
+                "m3_threads",
+            );
             source.push_str(BARRIER);
             continue;
         }
@@ -459,15 +462,17 @@ pub(super) fn emit_logits_argmax(source: &mut String, in_base: u32, o0: &str) {
     source.push_str("  }\n");
 }
 
-/// Each lane's slot holds the address of its first row, on its class's plane.
+/// Each lane's slot holds its first row on its class's plane, as stored.
 pub(super) fn emit_addressed_gather(
     source: &mut String,
+    op: &OpView,
     base: u32,
     slot: u32,
     o0: &str,
     begin: &str,
     step: &str,
 ) {
+    let ints = op.dtype == eta_ir::types::wire_dtype(eta_ir::Dtype::I32);
     source.push_str("  {\n");
     let _ = writeln!(source, "    const uint addressed_begin = {begin};");
     let _ = writeln!(source, "    const uint addressed_step = {step};");
@@ -477,25 +482,44 @@ pub(super) fn emit_addressed_gather(
     );
     let _ = writeln!(
         source,
-        "    const ulong addressed_at = intrinsic_at[{slot}];"
-    );
-    let _ = writeln!(
-        source,
-        "    if (addressed_at == 0ul) \
-         {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
+        "    const M1OutputSeat addressed_seat = intrinsic_at[{slot}];"
     );
     source.push_str(
-        "    const device bfloat* addressed_src = \
-         reinterpret_cast<const device bfloat*>(addressed_at);\n",
+        "    const uint addressed_width = \
+         addressed_desc.last == 0u ? addressed_desc.len : addressed_desc.last;\n",
     );
+    source.push_str(
+        "    const uint addressed_stride = \
+         addressed_seat.stride == 0u ? addressed_width : addressed_seat.stride;\n",
+    );
+    let storage = if ints { "!= 2u" } else { "== 2u" };
     let _ = writeln!(
         source,
-        "    device float* addressed_out = reinterpret_cast<device float*>({o0});"
+        "    if (addressed_seat.at == 0ul || addressed_stride < addressed_width || \
+         addressed_seat.storage {storage}) \
+         {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
     );
     source.push_str(
         "    for (uint i = addressed_begin; i < addressed_desc.len; i += addressed_step) {\n",
     );
-    source.push_str("      addressed_out[i] = float(addressed_src[i]);\n");
+    source.push_str(
+        "      const ulong from = \
+         ulong(i / addressed_width) * addressed_stride + i % addressed_width;\n",
+    );
+    if ints {
+        let _ = writeln!(
+            source,
+            "      reinterpret_cast<device int*>({o0})[i] = \
+             reinterpret_cast<const device int*>(addressed_seat.at)[from];"
+        );
+    } else {
+        let _ = writeln!(
+            source,
+            "      reinterpret_cast<device float*>({o0})[i] = addressed_seat.storage == 0u \
+             ? reinterpret_cast<const device float*>(addressed_seat.at)[from] \
+             : float(reinterpret_cast<const device bfloat*>(addressed_seat.at)[from]);"
+        );
+    }
     source.push_str("    }\n");
     source.push_str("  }\n");
 }

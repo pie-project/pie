@@ -121,7 +121,13 @@ fn a_plain_lane_reads_the_same_logits_beside_a_drafting_one() {
         return;
     };
     let mut shell = load(&artifact);
-    assert!(shell.drafts());
+    assert!(
+        shell
+            .classes()
+            .classes
+            .iter()
+            .any(|class| class.outputs.iter().any(|out| out.name == "mtp.drafts"))
+    );
 
     let beside_plain = plain_beside(&mut shell, 0, 1, false);
     let beside_drafting = plain_beside(&mut shell, 2, 3, true);

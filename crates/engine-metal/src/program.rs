@@ -303,22 +303,25 @@ impl Plane {
         self.instances.get_mut(&id).map(|bound| &mut bound.session)
     }
 
+    /// Points instance `id`'s reads of output `name` for its lane `lane` at
+    /// `offset` of `base`, stored as `dtype`, rows `stride` elements apart.
     #[allow(clippy::too_many_arguments)]
-    pub fn bind_intrinsic(
+    pub fn bind_output(
         &mut self,
         id: InstanceId,
-        intrinsic: crate::seam::Intrinsic,
+        name: &str,
         lane: u32,
         base: &crate::device::Buffer,
         offset: u64,
-        width: u32,
         dtype: eta_ir::Dtype,
+        width: u32,
+        stride: u32,
     ) -> Result<()> {
         self.instances
             .get_mut(&id)
             .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?
             .session
-            .bind_intrinsic(intrinsic, lane, base, offset, width, dtype)
+            .bind_output(name, lane, base, offset, dtype, width, stride)
     }
 
     pub fn ready(&self, id: InstanceId) -> Result<Option<session::Blocked>> {
@@ -522,12 +525,8 @@ impl Plane {
             .is_some_and(|bound| bound.session.is_airborne())
     }
 
-    pub fn reads_lane(
-        &self,
-        id: InstanceId,
-        intrinsic: crate::seam::Intrinsic,
-        lane: u32,
-    ) -> Result<bool> {
+    /// The outputs instance `id`'s program reads, by name and lane.
+    pub fn reads(&self, id: InstanceId) -> Result<Vec<(String, u32)>> {
         let bound = self
             .instances
             .get(&id)
@@ -541,48 +540,11 @@ impl Plane {
                 ),
             )
         })?;
-        Ok(program.plan.package.values.iter().any(|value| {
-            crate::seam::value_intrinsic(value) == Some(intrinsic) && value.lane == lane
-        }))
-    }
-
-    pub fn needs_logits(&self, id: InstanceId) -> Result<bool> {
-        let bound = self
-            .instances
-            .get(&id)
-            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
-        let program = self.programs.get(&bound.program_id).ok_or_else(|| {
-            Fault::program(
-                "program::plane",
-                format!(
-                    "instance {id} names program {}, which is gone",
-                    bound.program_id
-                ),
-            )
-        })?;
-        Ok(program.plan.package.values.iter().any(|value| {
-            crate::seam::value_intrinsic(value) == Some(crate::seam::Intrinsic::Logits)
-        }))
-    }
-
-    /// The outputs instance `id`'s program reads that this shell binds none of.
-    pub fn unbound_outputs(&self, id: InstanceId) -> Result<Vec<String>> {
-        let bound = self
-            .instances
-            .get(&id)
-            .ok_or_else(|| Fault::program("program::plane", format!("no instance {id}")))?;
-        let program = self.programs.get(&bound.program_id).ok_or_else(|| {
-            Fault::program(
-                "program::plane",
-                format!(
-                    "instance {id} names program {}, which is gone",
-                    bound.program_id
-                ),
-            )
-        })?;
-        Ok(crate::seam::unbound(&program.plan.package)
+        Ok(program
+            .plan
+            .outputs()
             .into_iter()
-            .map(str::to_string)
+            .map(|(name, lane)| (name.to_string(), lane))
             .collect())
     }
 

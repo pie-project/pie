@@ -761,7 +761,7 @@ pub(super) fn kernel_head(
     source.push_str("    constant M4Step& step [[buffer(11)]],\n");
     let _ = writeln!(
         source,
-        "    const device ulong* all_intrinsic_at [[buffer({M3_INTRINSIC_TABLE_BUFFER})]],"
+        "    const device M1OutputSeat* all_intrinsic_at [[buffer({M3_INTRINSIC_TABLE_BUFFER})]],"
     );
     source.push_str("    uint2 m4_group [[threadgroup_position_in_grid]],\n");
     source.push_str("    uint2 m4_groups [[threadgroups_per_grid]],\n");
@@ -979,6 +979,7 @@ pub fn emit_streamed_region(
             match addressed_slot(stage, op, base) {
                 Some(slot) => emit_addressed_gather(
                     &mut body,
+                    op,
                     base,
                     slot,
                     &slots.o0,
