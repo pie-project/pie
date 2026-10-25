@@ -97,8 +97,35 @@ fn an_expert_parallel_group_serves_through_its_engines() {
         close(got, want, &format!("rank {r}'s prompt beside the others'"));
     }
 
-    // Only rank 0 brings a prompt: the others idle through its step.
-    let got = answer(&mut ranks[0], &step(1, word(prompts[0].len()), &prompts[0]));
-    close(&got, &want[0], "rank 0's prompt with the others idle");
+    // Only rank 0 brings a prompt: the others idle through its step, at its
+    // bucket. No one engine fires an idle step's experts as the group does:
+    // a rank's routed selects take their kernel by the routes a local
+    // expert averages over the step's padded rows, `world` squared times
+    // what one engine's experts average at the bucket (the micro's take the
+    // tiled GEMM at ep4 where one engine takes the grouped one), so one
+    // engine answers within the experts' rounding. The same prompt beside
+    // the others' at the same bucket fires the same kernels on the same
+    // rows, and answers to the bit.
+    let alone = answer(&mut ranks[0], &step(1, word(prompts[0].len()), &prompts[0]));
+    close(&alone, &want[0], "rank 0's prompt with the others idle");
+    let short: Vec<Vec<u32>> = (1..size).map(|r| prompt(9, r + 1)).collect();
+    let steps: Vec<_> = core::iter::once(step(0, word(prompts[0].len()), &prompts[0]))
+        .chain(short.iter().map(|p| step(0, word(p.len()), p)))
+        .collect();
+    for (rank, step) in ranks.iter_mut().zip(&steps) {
+        rank.open(0).expect("the seat opens");
+        rank.expect_fire(step);
+    }
+    let busy: Vec<Vec<f32>> = std::thread::scope(|scope| {
+        let fired: Vec<_> = (ranks.iter_mut().zip(&steps))
+            .map(|(rank, step)| scope.spawn(move || answer(rank, step)))
+            .collect();
+        fired.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert!(
+        alone == busy[0],
+        "rank 0's prompt with the others idle is not, to the bit, its answer beside \
+         the others' shorter prompts at its bucket"
+    );
     drop(dir);
 }
