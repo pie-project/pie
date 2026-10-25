@@ -1,6 +1,6 @@
 //! Attention mass capture (`attn.score_capture`) from
 //! `kernels/attn/score.slang`: the mean causal softmax of a request's last
-//! query rows over its paged keys, per key, into an f32 slab.
+//! query rows over its paged keys, per key, into an f32 row per lane.
 #![allow(clippy::too_many_arguments)]
 
 use dtype::Dtype;
@@ -70,28 +70,16 @@ pub fn capture(
     q: RaggedTensor,
     positions: Tensor,
     pool: &KvPool,
-    window: Option<u32>,
     head_dim: u32,
     kv_heads: u32,
     sm_scale: f32,
     observe: u32,
     lane_offset: u32,
-    plane_stride: u32,
-    plane: u32,
     kv_max: u32,
     requests: u32,
     scores: Tensor,
 ) -> Result<(), Error> {
     const OP: &str = "attn.score_capture";
-    if window.is_some() {
-        return Err(refuse(
-            OP,
-            "a sliding window is stated, and a windowed row is not the softmax the \
-             eviction and interpretability papers define: the mass would be a \
-             distribution over the window rather than over the request's keys, and \
-             every key outside it would read as unattended rather than as excluded",
-        ));
-    }
     dtype_dispatch!(OP, q.data.dtype, { Bf16 => () });
     if pool.keys.dtype != Dtype::Bf16 {
         return Err(refuse(
@@ -108,19 +96,8 @@ pub fn capture(
         return Err(refuse(
             OP,
             format!(
-                "the score slab is {:?}, and a per-key mass is an f32 rectangle",
+                "the score rows are {:?}, and a per-key mass is an f32 rectangle",
                 scores.dtype
-            ),
-        ));
-    }
-    if scores.width != kv_max {
-        return Err(refuse(
-            OP,
-            format!(
-                "the score slab's row is {} wide and the stated kv ceiling is {kv_max}; \
-                 the row IS the ceiling, and a disagreement would stripe one lane's mass \
-                 across another's",
-                scores.width
             ),
         ));
     }
@@ -177,16 +154,18 @@ pub fn capture(
         .filter(|size| *size > 0)
         .ok_or_else(|| refuse(OP, "the kv page size is zero"))?;
 
-    debug_assert!(
-        plane + num_q_heads <= plane_stride,
-        "`{OP}` writes one plane per query head inside a lane's block of {plane_stride}"
-    );
-    debug_assert!(
-        u64::from(lane_offset + requests) * u64::from(plane_stride) <= u64::from(scores.rows),
-        "`{OP}` writes {requests} lanes of {plane_stride} planes from lane {lane_offset}, \
-         and the slab holds {} rows",
-        scores.rows
-    );
+    if scores.width != num_q_heads.saturating_mul(kv_max)
+        || scores.rows < lane_offset.saturating_add(requests)
+    {
+        return Err(refuse(
+            OP,
+            format!(
+                "the score rows are {} by {}, and {requests} lanes from lane {lane_offset} \
+                 capture {num_q_heads} heads of {kv_max} keys",
+                scores.rows, scores.width
+            ),
+        ));
+    }
 
     let lanes = requests.checked_mul(THREADS).ok_or_else(|| {
         refuse(
@@ -215,8 +194,6 @@ pub fn capture(
             sm_scale.arg(),
             stated(OP, observe)?.arg(),
             stated(OP, lane_offset)?.arg(),
-            stated(OP, plane_stride)?.arg(),
-            stated(OP, plane)?.arg(),
             stated(OP, kv_max)?.arg(),
         ],
     )

@@ -188,9 +188,31 @@ impl Run<'_> {
 
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_slang::Error> {
         match op {
-            Attn::ScoreCapture { .. } => Err(kernels_slang::Error::Unsupported {
-                op: "attn.score_capture",
-            }),
+            Attn::ScoreCapture {
+                q,
+                plan,
+                cache,
+                head_dim,
+                kv_heads,
+                sm_scale,
+                observe,
+                kv_max,
+                scores,
+            } => kernels_slang::attn::score::capture(
+                self.ctx,
+                self.ragged(*q),
+                self.prefill_plan(*plan).positions,
+                self.pool(*cache),
+                *head_dim,
+                *kv_heads,
+                *sm_scale,
+                *observe,
+                // The rows are the window's lanes already.
+                0,
+                *kv_max,
+                self.requests(),
+                self.tensor(*scores),
+            ),
             Attn::PlanDecode {
                 kv_indptr: _,
                 kv_indices: _,

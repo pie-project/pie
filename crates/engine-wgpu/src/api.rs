@@ -207,7 +207,6 @@ fn fault(fault: Fault) -> Error {
             wanted: 1,
             available: 0,
         },
-        Fault::Scoreless { .. } | Fault::ScoreWord { .. } => Error::Invalid(fault.to_string()),
 
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::Blob { .. } => Error::Load(fault.to_string()),
@@ -824,17 +823,11 @@ impl Wgpu {
             return Ok(None);
         }
         let device = self.loaded()?.device().clone();
-        let policies = submission
-            .lanes
-            .iter()
-            .map(|lane| lane.readout.clone())
-            .collect();
         self.programs
             .deferred(
                 &device,
                 program_attachments(submission)
                     .map(|attachment| (attachment.instance, attachment.lane)),
-                policies,
                 self.loaded()?.output_names(),
             )
             .map(Some)
@@ -1018,6 +1011,15 @@ impl Wgpu {
 
         let guests = self.deferred_guests(submission)?;
 
+        let mut reads: Vec<Vec<String>> = vec![Vec::new(); submission.lanes.len()];
+        for attachment in program_attachments(submission) {
+            for (name, k) in self.programs.reads(attachment.instance) {
+                if let Some(lane) = reads.get_mut((attachment.lane + k) as usize) {
+                    lane.push(name);
+                }
+            }
+        }
+
         let sink = self.sink.clone();
 
         let mut lane_adapters: Vec<Option<u32>> = vec![None; submission.lanes.len()];
@@ -1074,6 +1076,7 @@ impl Wgpu {
                     Readout::Rows(rows) => Some(rows.as_slice()),
                     Readout::Last | Readout::None => None,
                 },
+                reads: &reads[at],
 
                 translation: &lane.kv.translation,
 
@@ -1128,7 +1131,7 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
     lane_readouts(&step.readout, step.rows.as_deref().unwrap_or(&[]))
 }
 
-pub(crate) fn lane_readouts(policies: &[Readout], rows: &[Vec<f32>]) -> Vec<LaneReadout> {
+fn lane_readouts(policies: &[Readout], rows: &[Vec<f32>]) -> Vec<LaneReadout> {
     policies
         .iter()
         .enumerate()
