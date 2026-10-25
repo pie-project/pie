@@ -9,7 +9,7 @@ use engine::caps::{Capabilities, DeviceFacts, FireLimits, KvCopyDomains, PoolFac
 use engine::channel::{ChannelId, ChannelRegistration, RegisteredChannel};
 use engine::error::{Error, Result as EngineResult};
 use engine::fire::{
-    FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout, Step,
+    Boundary, FireId, FireTicket, FrameId, FrameSubmission, FrameTicket, LaneReadout, Readout, Step,
 };
 use engine::load::{Budgets as LoadBudgets, Checkpoint, LoadFacts, LoadRequest, Loaded};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
@@ -814,11 +814,44 @@ impl Engine for Wgpu {
 
 impl Wgpu {
     #[cfg(feature = "wgpu")]
+    fn run_prologues(&mut self, submission: &Step) -> EngineResult<()> {
+        let mut prologues = submission
+            .attachments
+            .iter()
+            .filter(|attachment| attachment.at == Boundary::Prologue)
+            .peekable();
+        if prologues.peek().is_none() {
+            return Ok(());
+        }
+        let device = self.loaded()?.device().clone();
+        for attachment in prologues {
+            self.programs
+                .fire_prologue(&device, attachment.instance)
+                .map_err(refusal)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "wgpu"))]
+    fn run_prologues(&mut self, submission: &Step) -> EngineResult<()> {
+        if submission
+            .attachments
+            .iter()
+            .any(|attachment| attachment.at == Boundary::Prologue)
+        {
+            return Err(Error::Program(
+                "this build carries no wgpu device, so a guest pass has nowhere to run".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "wgpu")]
     fn deferred_guests(
         &mut self,
         submission: &Step,
     ) -> EngineResult<Option<crate::landing::Guests>> {
-        if submission.attachments.is_empty() {
+        if epilogues(submission).next().is_none() {
             return Ok(None);
         }
         let device = self.loaded()?.device().clone();
@@ -830,10 +863,7 @@ impl Wgpu {
         self.programs
             .deferred(
                 &device,
-                submission
-                    .attachments
-                    .iter()
-                    .map(|attachment| (attachment.instance, attachment.lane)),
+                epilogues(submission).map(|attachment| (attachment.instance, attachment.lane)),
                 policies,
             )
             .map(Some)
@@ -845,7 +875,7 @@ impl Wgpu {
         &mut self,
         submission: &Step,
     ) -> EngineResult<Option<crate::landing::Guests>> {
-        if submission.attachments.is_empty() {
+        if epilogues(submission).next().is_none() {
             Ok(None)
         } else {
             Err(Error::Program(
@@ -859,6 +889,21 @@ impl Wgpu {
         submission: &Step,
         at: engine::StepDone,
     ) -> EngineResult<(FireTicket, PendingStep)> {
+        // The caller predicts the cursors a pass starts from: checked
+        // before a prologue moves them.
+        for attachment in &submission.attachments {
+            if let Some(lane) = submission.lanes.get(attachment.lane as usize)
+                && !lane.channels.is_empty()
+                && let Some(why) = self
+                    .programs
+                    .disagreeing_ticket(attachment.instance, &lane.channels)
+            {
+                return Err(Error::Program(format!(
+                    "this fire's channel predictions and the engine's disagree: {why}"
+                )));
+            }
+        }
+        self.run_prologues(submission)?;
         let mut staged: Vec<Vec<u8>> = Vec::new();
         if !submission.media.is_empty() {
             let Some(element) = self.loaded()?.patch_element() else {
@@ -942,16 +987,6 @@ impl Wgpu {
                         submission.lanes.len()
                     )));
                 };
-                if lane_at == 0
-                    && !lane.channels.is_empty()
-                    && let Some(why) = self
-                        .programs
-                        .disagreeing_ticket(attachment.instance, &lane.channels)
-                {
-                    return Err(Error::Program(format!(
-                        "this fire's channel predictions and the engine's disagree: {why}"
-                    )));
-                }
                 resolved[lane_index] = self
                     .programs
                     .envelope_tokens(attachment.instance, lane.tokens.len(), lane_at)
@@ -1113,4 +1148,11 @@ pub(crate) fn lane_readouts(policies: &[Readout], rows: &[Vec<f32>]) -> Vec<Lane
             }
         })
         .collect()
+}
+
+/// The attachments that run behind the forward.
+fn epilogues(step: &Step) -> impl Iterator<Item = &engine::fire::Attachment> {
+    step.attachments
+        .iter()
+        .filter(|attachment| attachment.at == Boundary::Epilogue)
 }

@@ -851,6 +851,44 @@ impl Plane {
         }
     }
 
+    /// Runs `instance`'s pass to its commit before the forward, once every
+    /// pass airborne on its channels has run: the forward then reads the
+    /// cells it put.
+    #[cfg(feature = "wgpu")]
+    pub(crate) fn fire_prologue(
+        &self,
+        device: &crate::device::Context,
+        instance: InstanceId,
+    ) -> Result<(), Refusal> {
+        let seat = self.instances.get(&instance).ok_or(Refusal::Closed {
+            what: "instance",
+            id: instance.0,
+        })?;
+        seat.gate.settle(instance)?;
+        for &channel in &seat.channels {
+            self.settle_writers(channel)?;
+        }
+        let widen = self.widen.as_ref().ok_or_else(|| {
+            Refusal::Program(format!(
+                "instance {instance} has a device half, but the plane built no readout widen"
+            ))
+        })?;
+        seat.half.lock().expect("half lock poisoned").fire(
+            device,
+            widen,
+            &self.tally,
+            Pass {
+                logits: None,
+                rows: 0,
+                vocab: 0,
+                mtp_logits: None,
+                mtp_width: 0,
+                readout: None,
+                pixels: None,
+            },
+        )
+    }
+
     #[cfg(feature = "wgpu")]
     pub(crate) fn deferred(
         &self,
