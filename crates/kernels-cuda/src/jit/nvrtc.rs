@@ -464,7 +464,7 @@ mod tests {
             (
                 "elemwise/frame.cu",
                 &[
-                    "::pie::elemwise::row_frame<::pie::elemwise::ResidualAddRmsnorm<false>, 256, 4, 3, 2>",
+                    "::pie::elemwise::row_frame<::pie::elemwise::ResidualAddRmsnorm<false>, 256, 256, 4, 3, 2>",
                 ],
             ),
             (

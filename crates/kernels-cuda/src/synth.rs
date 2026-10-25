@@ -502,9 +502,9 @@ mod tests {
 
     #[test]
     fn a_plane_of_another_dtype_is_refused_by_name() {
-        let ins = [In::Rows(Dtype::Bf16), In::Rows(Dtype::F32), INS[2]];
+        let ins = [In::Rows(Dtype::Bf16), In::Rows(Dtype::F16), INS[2]];
         let why = refused(&residual_norm(4096), &ins, &OUTS);
-        assert!(why.contains("parameter 1 is stored F32"), "{why}");
+        assert!(why.contains("parameter 1 is stored F16"), "{why}");
         let outs = [OUTS[0], Out::Rows(Dtype::F16)];
         let why = refused(&residual_norm(4096), &INS, &outs);
         assert!(why.contains("result 1 is stored F16"), "{why}");
