@@ -21,8 +21,7 @@ cuda = ["dep:cudarc", "cudarc/cuda-13000"]
 [dependencies]
 dtype = { package = "pie-dtype", path = "../dtype" }
 profile = { package = "pie-profile", path = "../profile" }
-eta-compiler = { path = "../eta-compiler" }
-eta-ir = { package = "pie-eta-ir", path = "../eta-ir" }
+kernels-ir = { path = "../kernels-ir" }
 
 cudarc = { version = "0.19.8", optional = true, default-features = false, features = [
     "std",

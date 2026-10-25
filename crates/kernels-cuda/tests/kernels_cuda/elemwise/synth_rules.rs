@@ -34,13 +34,11 @@
 use crate::common::attn_ref::{ten, tuned};
 use crate::common::{Gpu, Lcg, captured, forget, from_bf16, replay, to_bf16};
 use dtype::Dtype::Bf16;
-use eta_compiler::plan::{Dimension, SymbolicType};
-use eta_ir::op::Op;
-use eta_ir::types::Literal;
 use kernels_cuda::elemwise::norm_residual::{self, Keep, PostNorm};
 use kernels_cuda::jit::Ctx;
 use kernels_cuda::synth::{self, In, Out, Plane, Region, Synthesized};
 use kernels_cuda::tuning::Tuning;
+use kernels_ir::{Binary, Literal, Op, Reduce, Shape, Unary};
 
 const EPS: f32 = 1e-6;
 
@@ -137,7 +135,7 @@ impl Chain {
             Chain::ResidualNorm { plus_one, stream } => {
                 // parameters x, y, w
                 b.params(3);
-                let h = b.stored(Op::Add(1, 0));
+                let h = b.stored(Op::Binary(Binary::Add, 1, 0));
                 let n = b.rms_normed(h);
                 let out = b.scaled(n, 2, plus_one);
                 b.round(out);
@@ -149,8 +147,8 @@ impl Chain {
                 let n = b.rms_normed(0);
                 let t = b.scaled(n, 1, false);
                 b.round(t);
-                let sum = b.stored(Op::Add(2, t));
-                let scaled = b.stored(Op::Mul(sum, 3));
+                let sum = b.stored(Op::Binary(Binary::Add, 2, t));
+                let scaled = b.stored(Op::Binary(Binary::Mul, sum, 3));
                 let n = b.rms_normed(scaled);
                 let out = b.scaled(n, 4, false);
                 b.round(out);
@@ -162,7 +160,7 @@ impl Chain {
                 let n = b.rms_normed(0);
                 let t = b.scaled(n, 1, false);
                 b.round(t);
-                let sum = b.stored(Op::Add(2, t));
+                let sum = b.stored(Op::Binary(Binary::Add, 2, t));
                 if post {
                     let n = b.rms_normed(sum);
                     let out = b.scaled(n, 3, false);
@@ -181,7 +179,7 @@ struct Build {
     width: usize,
     params: u32,
     ops: Vec<Op>,
-    rounds: Vec<(u32, eta_ir::Dtype)>,
+    rounds: Vec<(u32, dtype::Dtype)>,
 }
 
 impl Build {
@@ -205,7 +203,7 @@ impl Build {
 
     /// `v`, a trace value an op defines, rounded where it is defined.
     fn round(&mut self, v: u32) {
-        self.rounds.push((v, eta_ir::Dtype::Bf16));
+        self.rounds.push((v, Bf16));
     }
 
     /// `op`'s value, a trace value, rounded.
@@ -221,25 +219,25 @@ impl Build {
 
     /// `x · rsqrt(sum(x²) / width + eps)`.
     fn rms_normed(&mut self, x: u32) -> u32 {
-        let sq = self.push(Op::Mul(x, x));
-        let sum = self.push(Op::ReduceSum(sq));
+        let sq = self.push(Op::Binary(Binary::Mul, x, x));
+        let sum = self.push(Op::Reduce(Reduce::Sum, sq));
         let n = self.konst(self.width as f32);
-        let ms = self.push(Op::Div(sum, n));
+        let ms = self.push(Op::Binary(Binary::Div, sum, n));
         let eps = self.konst(EPS);
-        let shifted = self.push(Op::Add(ms, eps));
-        let r = self.push(Op::Rsqrt(shifted));
-        self.push(Op::Mul(x, r))
+        let shifted = self.push(Op::Binary(Binary::Add, ms, eps));
+        let r = self.push(Op::Unary(Unary::Rsqrt, shifted));
+        self.push(Op::Binary(Binary::Mul, x, r))
     }
 
     /// `n · w`, or `n · (w + 1)`.
     fn scaled(&mut self, n: u32, w: u32, plus_one: bool) -> u32 {
         let w = if plus_one {
             let one = self.konst(1.0);
-            self.push(Op::Add(w, one))
+            self.push(Op::Binary(Binary::Add, w, one))
         } else {
             w
         };
-        self.push(Op::Mul(n, w))
+        self.push(Op::Binary(Binary::Mul, n, w))
     }
 
     fn finish(self, results: Vec<u32>) -> Region {
@@ -248,19 +246,16 @@ impl Build {
 
     /// The region, the parameters `ones` names scalars.
     fn finish_with(self, results: Vec<u32>, ones: &[usize]) -> Region {
-        let row = SymbolicType {
-            dtype: eta_ir::Dtype::F32,
-            dims: vec![Dimension::Static(
-                u32::try_from(self.width).expect("a width"),
-            )],
-        };
-        let one = SymbolicType {
-            dtype: eta_ir::Dtype::F32,
-            dims: Vec::new(),
-        };
         Region {
+            width: u32::try_from(self.width).expect("a width"),
             params: (0..self.params as usize)
-                .map(|k| if ones.contains(&k) { one.clone() } else { row.clone() })
+                .map(|k| {
+                    if ones.contains(&k) {
+                        Shape::Scalar
+                    } else {
+                        Shape::Row
+                    }
+                })
                 .collect(),
             ops: self.ops,
             results,
@@ -285,14 +280,7 @@ fn generated(chain: Chain, width: usize) -> Synthesized {
         .collect();
     let outs = vec![Out::Rows(Bf16); region.results.len()];
     synth::supports(&region, &ins, &outs).expect("the frame takes the region");
-    let body = region.body().expect("the stream core writes the region");
-    let kernel = synth::synth(
-        &body,
-        &ins,
-        outs.len(),
-        u32::try_from(width).expect("a width"),
-    )
-    .expect("synthesized");
+    let kernel = synth::synth(&region, &ins, outs.len()).expect("synthesized");
     kernel
         .load()
         .expect("the generated kernel compiles and loads");
@@ -581,7 +569,9 @@ fn host(chain: Chain, rows: usize, width: usize) -> Landed {
         let (x, y) = (&x[at.clone()], &y[at]);
         match chain {
             Chain::ResidualNorm { plus_one, .. } => {
-                let h: Vec<f32> = (0..width).map(|e| from_bf16(to_bf16(y[e] + x[e]))).collect();
+                let h: Vec<f32> = (0..width)
+                    .map(|e| from_bf16(to_bf16(y[e] + x[e])))
+                    .collect();
                 let r = inv(&h);
                 stream.extend(h.iter().map(|&v| to_bf16(v)));
                 out.extend((0..width).map(|e| {

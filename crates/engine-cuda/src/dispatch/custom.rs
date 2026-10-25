@@ -39,7 +39,7 @@ impl DispatchFused for Run<'_> {
             Fused::Region {
                 ins,
                 width,
-                body,
+                key: body,
                 outs,
             } => {
                 if outs.first().is_some_and(|out| self.lane_shaped(*out)) {

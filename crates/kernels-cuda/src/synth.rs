@@ -1,9 +1,10 @@
-//! Generated row kernels: a fused region's body, as eta's stream core writes
-//! it ([`Body`]), compiled with the row frame (`elemwise/frame.cuh`) into a
+//! Generated row kernels: a fused region (kernels-ir's [`Region`]),
+//! scheduled ([`kernels_ir::schedule`]) and printed as CUDA C++ ([`print`],
+//! a [`Body`]), compiled with the row frame (`elemwise/frame.cuh`) into a
 //! unit of its own and fired over the region's planes.
 //!
 //! - **What the frame takes** ([`supports`]): a region of pure math that
-//!   the stream core writes whole, over one or more parameters and to one
+//!   the row core schedules (`kernels_ir::schedule`), over one or more parameters and to one
 //!   or more results, every one a bf16 row (a parameter may be one row
 //!   every row reads), the row whole vectors of 8 and at most
 //!   [`MAX_WIDTH`] wide.
@@ -22,14 +23,45 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use dtype::Dtype;
-use eta_ir::op::Op;
 
 pub use crate::elemwise::frame::{MAX_WIDTH, Plane};
-pub use eta_compiler::region::{Body, Region};
+pub use kernels_ir::Region;
+
+/// A region's body printed in the row frame's hook form ([`print`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Body {
+    /// The struct's C++ source.
+    pub source: String,
+    /// FNV-1a over `source`: the body's part of a generated kernel's key.
+    pub hash: u64,
+    /// The passes the body makes over the row.
+    pub passes: u32,
+}
+
+impl Body {
+    /// `region` scheduled and printed, or why the row core or the printer
+    /// does not take it.
+    pub fn of(region: &Region) -> Result<Body, Refusal> {
+        let kernel = kernels_ir::schedule(region)
+            .map_err(|why| refusal(format!("the row core does not schedule the region: {why}")))?;
+        let source = print::body(&kernel).map_err(|print::Unprinted(dtype)| {
+            refusal(format!(
+                "a value rounds to {dtype:?}, which no hook rounds to"
+            ))
+        })?;
+        Ok(Body {
+            hash: kernels_ir::fnv1a64(source.as_bytes()),
+            source,
+            passes: kernel.passes(),
+        })
+    }
+}
 
 use crate::elemwise::frame;
 use crate::error::Error;
 use crate::jit::{ArgValue, Ctx, Kernel, Root, refuse};
+
+pub mod print;
 
 const OP: &str = "fused.region";
 
@@ -105,42 +137,11 @@ pub fn supports(region: &Region, ins: &[In], outs: &[Out]) -> Result<(), Refusal
             )));
         }
     }
-    for (at, op) in region.ops.iter().enumerate() {
-        if let Some(what) = refused(op) {
-            return Err(refusal(format!("op {at} is {what}")));
-        }
+    if let Err(why) = region.types() {
+        return Err(refusal(format!("the region is not one row: {why}")));
     }
-    let width = match region.width() {
-        Ok(Some(width)) => width,
-        Ok(None) => return Err(refusal("every value is a scalar: the region has no row")),
-        Err(why) => return Err(refusal(format!("the region is not one row: {why}"))),
-    };
-    frame::per(OP, width).map_err(|why| refusal(why.to_string()))?;
-    region
-        .body()
-        .map(|_| ())
-        .map_err(|uncovered| match uncovered.op {
-            Some(at) => refusal(format!(
-                "the stream core does not write op {at}: {}",
-                uncovered.why
-            )),
-            None => refusal(format!("the stream core writes no body: {}", uncovered.why)),
-        })
-}
-
-/// What `op` is, where no generated kernel computes it.
-fn refused(op: &Op) -> Option<&'static str> {
-    Some(match op {
-        Op::ChanTake(..) | Op::ChanRead(..) | Op::ChanPut { .. } => "a channel op",
-        Op::Rng { .. } | Op::RngKeyed { .. } => "a draw",
-        Op::IntrinsicVal { .. } => "an intrinsic",
-        Op::MatMul(..) => "a matmul",
-        Op::TopK { .. } => "a top-k",
-        Op::SortDesc(..) => "a sort",
-        Op::KernelCall { .. } => "a kernel call",
-        Op::SinkCall { .. } => "a sink call",
-        _ => return None,
-    })
+    frame::per(OP, region.width).map_err(|why| refusal(why.to_string()))?;
+    Body::of(region).map(|_| ())
 }
 
 /// A generated kernel: `body` in the row frame over `ins` parameters and
@@ -155,11 +156,19 @@ pub struct Synthesized {
     ones: u32,
 }
 
-/// The kernel for `body` (the body of a region [`supports`] takes) over
+/// The kernel for `region` (one [`supports`] takes) over parameters stored
+/// as `ins` and `outs` results: its body printed ([`Body::of`]), then
+/// [`synth_body`]. Nothing compiles here; [`Synthesized::load`] does.
+pub fn synth(region: &Region, ins: &[In], outs: usize) -> Result<Synthesized, Error> {
+    let body = Body::of(region).map_err(|why| refuse(OP, why.to_string()))?;
+    synth_body(&body, ins, outs, region.width)
+}
+
+/// The kernel for `body` (a body in the row frame's hook form) over
 /// parameters stored as `ins` and `outs` results, rows `width` wide: the
 /// same one for every call with the same body and shape. Nothing compiles
 /// here; [`Synthesized::load`] does.
-pub fn synth(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Synthesized, Error> {
+pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Synthesized, Error> {
     if ins.is_empty() || outs == 0 {
         return Err(refuse(OP, "a region of no parameter or no result"));
     }
@@ -189,7 +198,7 @@ pub fn synth(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Synthes
 fn unit(body: &Body) -> Result<Root, Error> {
     static UNITS: OnceLock<Mutex<HashMap<u64, Root>>> = OnceLock::new();
     let text = format!(
-        "// A generated row kernel: eta region body {:016x}.\n\
+        "// A generated row kernel: region body {:016x}.\n\
          #include \"elemwise/frame.cuh\"\n\n\
          namespace pie::synth {{\n\n{}\n}}\n",
         body.hash, body.source
@@ -251,7 +260,10 @@ impl Synthesized {
         }
         // The frame reads its parameters through the read-only path, so no
         // result may land over one.
-        if outs.iter().any(|out| ins.iter().any(|input| input.base() == out.base())) {
+        if outs
+            .iter()
+            .any(|out| ins.iter().any(|input| input.base() == out.base()))
+        {
             return Err(refuse(
                 OP,
                 "a result lands over a parameter, and a generated kernel reads its parameters \
@@ -284,30 +296,26 @@ impl Synthesized {
 
 #[cfg(test)]
 mod tests {
-    use eta_compiler::plan::{Dimension, SymbolicType};
-    use eta_ir::types::Literal;
+    use kernels_ir::{Binary, Literal, Op, Reduce, Shape, Unary};
 
     use super::*;
 
     /// `rmsnorm(y + x) * w` and the stream, as poem lowers a residual norm.
     fn residual_norm(width: u32) -> Region {
-        let row = SymbolicType {
-            dtype: eta_ir::Dtype::F32,
-            dims: vec![Dimension::Static(width)],
-        };
         Region {
-            params: vec![row; 3],
+            width,
+            params: vec![Shape::Row; 3],
             ops: vec![
-                Op::Add(1, 0),
-                Op::Mul(3, 3),
-                Op::ReduceSum(4),
+                Op::Binary(Binary::Add, 1, 0),
+                Op::Binary(Binary::Mul, 3, 3),
+                Op::Reduce(Reduce::Sum, 4),
                 Op::Const(Literal::F32(width as f32)),
-                Op::Div(5, 6),
+                Op::Binary(Binary::Div, 5, 6),
                 Op::Const(Literal::F32(1e-6)),
-                Op::Add(7, 8),
-                Op::Rsqrt(9),
-                Op::Mul(3, 10),
-                Op::Mul(11, 2),
+                Op::Binary(Binary::Add, 7, 8),
+                Op::Unary(Unary::Rsqrt, 9),
+                Op::Binary(Binary::Mul, 3, 10),
+                Op::Binary(Binary::Mul, 11, 2),
             ],
             results: vec![3, 12],
             rounds: vec![],
@@ -357,11 +365,11 @@ mod tests {
     }
 
     #[test]
-    fn an_op_no_generated_kernel_computes_is_refused() {
+    fn a_region_the_row_core_does_not_schedule_is_refused() {
         let mut region = residual_norm(64);
-        region.ops.push(Op::MatMul(12, 2));
-        let why = refused(&region, &INS, &OUTS);
-        assert!(why.contains("op 10 is a matmul"), "{why}");
+        region.results = vec![9];
+        let why = refused(&region, &INS, &OUTS[..1]);
+        assert!(why.contains("does not schedule"), "{why}");
     }
 
     #[test]

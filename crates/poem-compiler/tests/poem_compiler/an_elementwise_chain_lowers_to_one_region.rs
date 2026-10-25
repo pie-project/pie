@@ -1,9 +1,10 @@
 //! Under `compiler.synth_regions`, a run of elementwise and row ops forms a
-//! chain, lowered to one eta region (`fuse::chain`): a function of one row
-//! the stream core writes a row frame's body for, and folded into one
+//! chain, lowered to one region (`fuse::chain`): a function of one row
+//! the row core schedules into passes over the row, and folded into one
 //! `fused.region` op the plan is of. Off, nothing forms.
 
-use eta_compiler::eval::interp::Value;
+use kernels_ir::interp::{Arg, eval};
+use kernels_ir::{Shape, schedule};
 use poem::ops::{elemwise, linear};
 use poem::pattern::{Pattern, template};
 use poem_compiler::DeviceProfile;
@@ -71,14 +72,15 @@ fn a_residual_add_and_its_norm_form_one_region() {
     );
 
     let (x, y, w) = (row(1), row(2), row(3));
-    let out = chain
-        .region
-        .eval(&[
-            Value::F32(x.clone()),
-            Value::F32(y.clone()),
-            Value::F32(w.clone()),
-        ])
-        .expect("the region runs");
+    let out = eval(
+        &chain.region,
+        &[
+            Arg::Row(x.clone()),
+            Arg::Row(y.clone()),
+            Arg::Row(w.clone()),
+        ],
+    )
+    .expect("the region runs");
     // Each value an op defines is rounded to its bf16 where it is defined,
     // as the two ops store it: the stream, and the normed row.
     assert_eq!(
@@ -87,16 +89,14 @@ fn a_residual_add_and_its_norm_form_one_region() {
             .region
             .results
             .iter()
-            .map(|&v| (v, eta_ir::Dtype::Bf16))
+            .map(|&v| (v, poem_ir::Dtype::Bf16))
             .collect::<Vec<_>>()
     );
     let h: Vec<f32> = y.iter().zip(&x).map(|(y, x)| bf16(y + x)).collect();
-    assert_eq!(out[0], Value::F32(h.clone()), "result 0 is the stream");
+    assert_eq!(out[0], h, "result 0 is the stream");
     let ms = h.iter().map(|v| v * v).sum::<f32>() / WIDTH as f32;
     let r = 1.0 / (ms + EPS).sqrt();
-    let Value::F32(normed) = &out[1] else {
-        panic!("an f32 row")
-    };
+    let normed = &out[1];
     for (e, got) in normed.iter().enumerate() {
         let want = h[e] * r * w[e];
         assert_eq!(*got, bf16(*got), "{e}: the normed row is rounded");
@@ -106,12 +106,8 @@ fn a_residual_add_and_its_norm_form_one_region() {
         );
     }
 
-    let body = chain.region.body().expect("the stream core covers it");
-    assert_eq!(
-        body.passes, 2,
-        "the row is held across its sum: {}",
-        body.source
-    );
+    let kernel = schedule(&chain.region).expect("the row core schedules it");
+    assert_eq!(kernel.passes(), 2, "the row is held across its sum");
 }
 
 #[test]
@@ -138,13 +134,10 @@ fn the_fused_residual_norm_lowers_as_its_two_ops_do() {
         &poem_compiler::fuse::rules::forming(&["fused.residual_add_rmsnorm"]),
     );
     let fused = chains(&refused);
-    let args: Vec<Value> = [row(4), row(5), row(6)]
-        .into_iter()
-        .map(Value::F32)
-        .collect();
+    let args: Vec<Arg> = [row(4), row(5), row(6)].into_iter().map(Arg::Row).collect();
     assert_eq!(
-        the_one(&unfused).region.eval(&args),
-        the_one(&fused).region.eval(&args)
+        eval(&the_one(&unfused).region, &args),
+        eval(&the_one(&fused).region, &args)
     );
 }
 
@@ -163,7 +156,10 @@ fn a_chain_runs_past_an_op_it_does_not_touch() {
     let formed = chains(&t);
     assert_eq!(the_one(&formed).nodes, [0, 2]);
     let (folded, _) = fold(t);
-    assert!(matches!(folded.nodes[0].op, Operation::Linear(_)), "the matmul runs first");
+    assert!(
+        matches!(folded.nodes[0].op, Operation::Linear(_)),
+        "the matmul runs first"
+    );
     assert!(matches!(
         folded.nodes[1].op,
         Operation::Fused(Fused::Region { .. })
@@ -185,20 +181,35 @@ fn a_one_element_scale_is_a_scalar_parameter() {
     assert_eq!(chain.nodes, [0, 1, 2]);
     let ones: Vec<bool> = chain.ins.iter().map(|input| input.one).collect();
     assert_eq!(ones, [false, false, false, true], "x, w, y and the scale");
-    assert!(chain.region.params[3].dims.is_empty(), "the scale is a scalar");
+    assert_eq!(
+        chain.region.params[3],
+        Shape::Scalar,
+        "the scale is a scalar"
+    );
     let (x, w, y) = (row(1), row(2), row(3));
-    let out = chain
-        .region
-        .eval(&[
-            Value::F32(x),
-            Value::F32(w),
-            Value::F32(y.clone()),
-            Value::F32(vec![0.5]),
-        ])
-        .expect("the region runs");
+    let out = eval(
+        &chain.region,
+        &[
+            Arg::Row(x),
+            Arg::Row(w),
+            Arg::Row(y.clone()),
+            Arg::Scalar(0.5),
+        ],
+    )
+    .expect("the region runs");
     assert_eq!(out.len(), 1, "only the scaled stream leaves");
-    let body = chain.region.body().expect("the stream core covers it");
-    assert!(body.source.contains("f.one(3)"), "{}", body.source);
+    let kernel = schedule(&chain.region).expect("the row core schedules it");
+    assert!(
+        kernel
+            .phases
+            .iter()
+            .flat_map(|p| p.pass.iter())
+            .any(|pass| pass
+                .rows
+                .iter()
+                .any(|row| format!("{:?}", row.expr).contains("One(3)"))),
+        "the scale is read as one value: {kernel:?}"
+    );
 }
 
 #[test]
@@ -222,7 +233,7 @@ fn a_value_read_past_the_chain_leaves_it() {
     // The stream (a matmul reads it) and the activation leave; the normed
     // row only the activation reads stays in the registers.
     assert_eq!(leaving.len(), 2, "{leaving:?}");
-    assert!(chain.region.body().is_ok());
+    assert!(schedule(&chain.region).is_ok());
 }
 
 #[test]
@@ -236,7 +247,11 @@ fn an_op_no_region_lowers_ends_the_chain() {
     });
     let formed = chains(&t);
     let spans: Vec<_> = formed.iter().map(|chain| chain.nodes.clone()).collect();
-    assert_eq!(spans, [vec![0, 1], vec![3, 4]], "erf's gelu has no eta form");
+    assert_eq!(
+        spans,
+        [vec![0, 1], vec![3, 4]],
+        "erf's gelu has no region form"
+    );
 }
 
 fn qwen3() -> Trace {
@@ -253,14 +268,14 @@ fn synth() -> DeviceProfile {
     }
 }
 
-/// The `fused.region` ops of `t`: their inputs, outputs and body hash.
+/// The `fused.region` ops of `t`: their inputs, outputs and region key.
 fn regions(t: &Trace) -> Vec<(Vec<ValueId>, Vec<ValueId>, u64)> {
     t.nodes
         .iter()
         .filter_map(|node| match &node.op {
-            Operation::Fused(Fused::Region {
-                ins, outs, body, ..
-            }) => Some((ins.clone(), outs.clone(), *body)),
+            Operation::Fused(Fused::Region { ins, outs, key, .. }) => {
+                Some((ins.clone(), outs.clone(), *key))
+            }
             _ => None,
         })
         .collect()
@@ -272,19 +287,25 @@ fn a_folded_trace_plans_as_it_stands() {
     let (folded, bodies) = fold(t.clone());
     let formed = chains(&t);
     let ops = regions(&folded);
-    assert!(!ops.is_empty(), "a qwen3 forward has a residual norm a layer");
+    assert!(
+        !ops.is_empty(),
+        "a qwen3 forward has a residual norm a layer"
+    );
     let framed = formed
         .iter()
-        .filter(|chain| matches!(chain.region.width(), Ok(Some(w)) if poem_compiler::fuse::chain::frames(&t, chain, w)))
+        .filter(|chain| poem_compiler::fuse::chain::frames(&t, chain, chain.region.width))
         .count();
     assert_eq!(ops.len(), framed, "each chain the frame holds is one op");
-    for (ins, outs, body) in &ops {
-        let synth = bodies.get(body).expect("the op's body is held");
-        assert_eq!(synth.body.hash, *body);
-        assert_eq!(synth.region.params.len(), ins.len());
-        assert_eq!(synth.region.results.len(), outs.len());
+    for (ins, outs, key) in &ops {
+        let region = bodies.get(key).expect("the op's region is held");
+        assert_eq!(region.key(), *key);
+        assert_eq!(region.params.len(), ins.len());
+        assert_eq!(region.results.len(), outs.len());
     }
-    assert!(bodies.len() < ops.len(), "a layer's chain shares the next's body");
+    assert!(
+        bodies.len() < ops.len(),
+        "a layer's chain shares the next's region"
+    );
     poem_ir::check(&folded).expect("the folded trace checks");
     let plan = bake_with(&folded, &synth()).expect("bakes");
     assert_eq!(
@@ -305,7 +326,8 @@ fn a_residual_add_and_the_next_layers_norm_form_one_region() {
     let crossing = chains(&t)
         .iter()
         .filter(|chain| {
-            t.nodes[chain.nodes[0] as usize].layer != t.nodes[*chain.nodes.last().expect("ops") as usize].layer
+            t.nodes[chain.nodes[0] as usize].layer
+                != t.nodes[*chain.nodes.last().expect("ops") as usize].layer
         })
         .count();
     assert!(crossing > 0, "a layer's stream is normed by the next");
@@ -371,8 +393,8 @@ fn every_folded_catalog_trace_checks() {
         let framed = chains(&t)
             .into_iter()
             .filter(|chain| {
-                chain.region.body().is_ok()
-                    && matches!(chain.region.width(), Ok(Some(w)) if poem_compiler::fuse::chain::frames(&t, chain, w))
+                schedule(&chain.region).is_ok()
+                    && poem_compiler::fuse::chain::frames(&t, chain, chain.region.width)
             })
             .count();
         if ops.len() != framed {
@@ -389,7 +411,7 @@ fn every_folded_catalog_trace_checks() {
 }
 
 /// Every catalog deployment's chains, on CUDA: each lies in its trace, after
-/// the one before, and the stream core writes its body.
+/// the one before, and the row core schedules its region.
 #[test]
 fn every_catalog_chain_has_a_body() {
     let mut wrong: Vec<String> = Vec::new();
@@ -408,9 +430,9 @@ fn every_catalog_chain_has_a_body() {
                 wrong.push(format!("{}: {:?} is out of order", row.name, chain.nodes));
             }
             after = chain.nodes[0] + 1;
-            if let Err(why) = chain.region.body() {
+            if let Err(why) = schedule(&chain.region) {
                 wrong.push(format!(
-                    "{}: {:?} has no body: {why:?}",
+                    "{}: {:?} has no schedule: {why:?}",
                     row.name, chain.nodes
                 ));
             }

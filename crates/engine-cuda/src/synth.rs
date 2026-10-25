@@ -1,7 +1,8 @@
-//! The generated row kernels a load fires: one for each `fused.region` body
-//! and width its trace holds (`compiler.synth_regions`), each held to the
-//! row frame's contract ([`kernels_cuda::synth::supports`]) and loaded with
-//! the model, so that no fire compiles one or loads its module.
+//! The generated row kernels a load fires: one for each `fused.region`
+//! region (kernels-ir's, as the compiler folded it) and width its trace
+//! holds (`compiler.synth_regions`), each held to the row frame's contract
+//! ([`kernels_cuda::synth::supports`]), printed by kernels-cuda and loaded
+//! with the model, so that no fire compiles one or loads its module.
 //!
 //! The fold forms only regions the frame takes; one it does not is the
 //! compiler's bug, and the load fails naming it (`Fault::Region`) rather
@@ -9,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use poem_compiler::fuse::chain::Synth;
+use kernels_ir::Region;
 #[cfg(not(feature = "rocm"))]
 use poem_ir::{Def, Dtype, Ty, ValueDecl};
 use poem_ir::{Fused, Operation, Trace, ValueId};
@@ -33,7 +34,7 @@ pub(crate) static NONE: Regions = Regions {
 };
 
 /// Every `fused.region` of `trace`: its node, and its parameters, width,
-/// body and results.
+/// region key and results.
 fn regions(trace: &Trace) -> impl Iterator<Item = (u32, &[ValueId], u32, u64, &[ValueId])> {
     (0u32..)
         .zip(&trace.nodes)
@@ -41,24 +42,24 @@ fn regions(trace: &Trace) -> impl Iterator<Item = (u32, &[ValueId], u32, u64, &[
             Operation::Fused(Fused::Region {
                 ins,
                 width,
-                body,
+                key,
                 outs,
-            }) => Some((at, ins.as_slice(), *width, *body, outs.as_slice())),
+            }) => Some((at, ins.as_slice(), *width, *key, outs.as_slice())),
             _ => None,
         })
 }
 
 impl Regions {
     /// The kernels `trace`'s regions fire, compiled (or read from the disk
-    /// cache) and loaded on the current device, `bodies` the compiler's.
+    /// cache) and loaded on the current device, `regions` the compiler's.
     #[cfg(not(feature = "rocm"))]
-    pub(crate) fn load(trace: &Trace, bodies: &BTreeMap<u64, Synth>) -> Result<Regions> {
+    pub(crate) fn load(trace: &Trace, regions_of: &BTreeMap<u64, Region>) -> Result<Regions> {
         let mut kernels = BTreeMap::new();
         for (node, ins, width, body, outs) in regions(trace) {
             let broken = |why: String| Fault::Region { node, body, why };
-            let synth = bodies
+            let region = regions_of
                 .get(&body)
-                .ok_or_else(|| broken("the compiled model holds no body by its hash".into()))?;
+                .ok_or_else(|| broken("the compiled model holds no region by its key".into()))?;
             if let Some(why) = aliased(ins, outs) {
                 return Err(broken(why));
             }
@@ -83,15 +84,15 @@ impl Regions {
                 .iter()
                 .map(|&v| stored(v).map(Out::Rows))
                 .collect::<Result<Vec<Out>>>()?;
-            kernels_cuda::synth::supports(&synth.region, &forms, &results)
+            kernels_cuda::synth::supports(region, &forms, &results)
                 .map_err(|why| broken(why.to_string()))?;
-            if synth.region.width().ok().flatten() != Some(width) {
+            if region.width != width {
                 return Err(broken(format!(
                     "the op states rows {width} wide and its region's are not"
                 )));
             }
             if let std::collections::btree_map::Entry::Vacant(slot) = kernels.entry((body, width)) {
-                let kernel = kernels_cuda::synth::synth(&synth.body, &forms, outs.len(), width)?;
+                let kernel = kernels_cuda::synth::synth(region, &forms, outs.len())?;
                 kernel.load()?;
                 slot.insert(kernel);
             }
@@ -102,7 +103,7 @@ impl Regions {
     /// This backend generates no row kernel: a trace with a region is not
     /// served.
     #[cfg(feature = "rocm")]
-    pub(crate) fn load(trace: &Trace, _bodies: &BTreeMap<u64, Synth>) -> Result<Regions> {
+    pub(crate) fn load(trace: &Trace, _regions: &BTreeMap<u64, Region>) -> Result<Regions> {
         match regions(trace).next() {
             Some((node, ..)) => Err(Fault::Unsupported(format!(
                 "the `fused.region` at node {node}: this backend generates no row kernel; \
@@ -112,7 +113,7 @@ impl Regions {
         }
     }
 
-    /// How many kernels the load generated: one a body and width.
+    /// How many kernels the load generated: one a region and width.
     #[must_use]
     pub fn len(&self) -> usize {
         #[cfg(not(feature = "rocm"))]
@@ -130,7 +131,7 @@ impl Regions {
         self.len() == 0
     }
 
-    /// The kernel of the region of `body` over rows `width` wide.
+    /// The kernel of the region of key `body` over rows `width` wide.
     #[cfg(not(feature = "rocm"))]
     pub(crate) fn get(&self, body: u64, width: u32) -> Option<Synthesized> {
         self.kernels.get(&(body, width)).copied()

@@ -1,0 +1,39 @@
+//! The contract between what forms a fused kernel and the kernels-*
+//! backends that build it.
+//!
+//! - **A region** ([`Region`]): what a fused chain computes, a function of one
+//!   row. A dataflow of primitive ops over the row's elements and the row's
+//!   scalars, typed, with explicit rounding points: each value rounds to the
+//!   dtype the unfused ops would have stored it in, where they would have.
+//!   poem-compiler lowers its chains to one; nothing here knows poem.
+//! - **A kernel** ([`Kernel`]): the region scheduled. Passes over the row,
+//!   which values stay in registers across a pass, where a pass ends (at a
+//!   reduction's reader), each reduction's partials and their order.
+//!   Target-neutral: a backend prints it in its language.
+//! - **The schedule** ([`schedule`]): region to kernel, or why the row core
+//!   does not cover a region.
+//! - **The frame** ([`frame`]): the primitives a kernel runs over, a row's
+//!   loads and stores, a scalar parameter, validity, the reductions over the
+//!   row's threads, the rounding to a narrow dtype. Each backend's frame
+//!   provides them; the printers name them.
+//! - **The interpreter** ([`interp`]): both forms on the host, the oracle
+//!   every printed kernel is held to.
+
+pub mod frame;
+pub mod interp;
+pub mod kernel;
+pub mod region;
+pub mod schedule;
+
+pub use kernel::{Expr, Kernel, Loop, Operand, Partial, Phase, RowAssign, Total, Uniform};
+pub use region::{Binary, Elem, Literal, Op, Reduce, Region, RegionError, Shape, Unary, ValueId};
+pub use schedule::{Unscheduled, schedule};
+
+/// FNV-1a over `bytes`: the hash a region's key and a printed body's unit
+/// are keyed by.
+#[must_use]
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}

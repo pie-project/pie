@@ -139,14 +139,14 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         boot.trace = poem_compiler::branch::split(boot.trace.clone());
     }
     // `compiler.synth_regions`: each chain of elementwise and row ops folded
-    // into one `fused.region`, its body the stream core's, by the fold
+    // into one `fused.region`, its region kernels-ir's, by the fold
     // `compile_axes` plans under the flag. Folded once, here, the trace is
     // the one the load runs and every plan after is of it as it stands.
-    let bodies = if profile.synth_regions {
-        let (folded, bodies) = poem_compiler::fuse::chain::fold(boot.trace.clone());
+    let regions = if profile.synth_regions {
+        let (folded, regions) = poem_compiler::fuse::chain::fold(boot.trace.clone());
         boot.trace = folded;
         profile.synth_regions = false;
-        bodies
+        regions
     } else {
         std::collections::BTreeMap::new()
     };
@@ -321,7 +321,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         compiled,
         budgets,
         profile,
-        bodies,
+        regions,
     })
 }
 
@@ -544,11 +544,11 @@ impl Shell {
             compiled,
             budgets,
             profile,
-            bodies,
+            regions: folded,
         } = bake(&mut boot)?;
         // Every generated kernel compiled and loaded now, before a fire can
         // ask for one.
-        let regions = crate::synth::Regions::load(&boot.trace, &bodies)?;
+        let regions = crate::synth::Regions::load(&boot.trace, &folded)?;
         let (free_before, device_total) = crate::store::device_memory()?;
         // The pool's address space is reserved for every page its bytes
         // could hold, the stated budget or the share of the card before the
@@ -1561,8 +1561,8 @@ pub(super) struct Baked {
     pub(super) compiled: CompiledModel,
     pub(super) budgets: Budgets,
     pub(super) profile: DeviceProfile,
-    /// The body each `fused.region` of the trace names, by hash.
-    pub(super) bodies: std::collections::BTreeMap<u64, poem_compiler::fuse::chain::Synth>,
+    /// The region each `fused.region` of the trace names, by key.
+    pub(super) regions: std::collections::BTreeMap<u64, kernels_ir::Region>,
 }
 
 /// The widest fire whose lanes of `rows` prompt rows put no more (lane,

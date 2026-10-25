@@ -19,6 +19,7 @@ libc = "0.2"
 serde_json = "1"
 poem-ir = { package = "pie-poem-ir", path = "../poem-ir" }
 kernels-cuda = { path = "../kernels-cuda", optional = true }
+kernels-ir = { path = "../kernels-ir" }
 kernels-rocm = { path = "../kernels-rocm", optional = true }
 
 engine = { path = "../engine" }

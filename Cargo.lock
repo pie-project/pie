@@ -1880,6 +1880,7 @@ dependencies = [
  "eta-exec",
  "inferlet",
  "kernels-cuda",
+ "kernels-ir",
  "kernels-rocm",
  "libc",
  "memmap2",
@@ -3141,12 +3142,18 @@ name = "kernels-cuda"
 version = "0.5.4"
 dependencies = [
  "cudarc",
- "eta-compiler",
+ "kernels-ir",
  "pie-dtype",
- "pie-eta-ir",
  "pie-profile",
  "tracing",
  "ztensor-compat",
+]
+
+[[package]]
+name = "kernels-ir"
+version = "0.5.4"
+dependencies = [
+ "pie-dtype",
 ]
 
 [[package]]
@@ -3165,6 +3172,7 @@ dependencies = [
 name = "kernels-rocm"
 version = "0.5.4"
 dependencies = [
+ "kernels-ir",
  "libloading 0.9.0",
  "miniz_oxide 0.8.9",
  "pie-dtype",
@@ -4371,8 +4379,7 @@ version = "0.5.4"
 dependencies = [
  "chat-template",
  "checkpoint",
- "eta-compiler",
- "pie-eta-ir",
+ "kernels-ir",
  "pie-poem",
  "pie-poem-ir",
  "pie-profile",
