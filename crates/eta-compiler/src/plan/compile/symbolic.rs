@@ -320,7 +320,6 @@ pub(crate) fn symbolic_intrinsic_type(
         | IntrinsicId::Velocity
         | IntrinsicId::Pixels
         | IntrinsicId::Query
-        | IntrinsicId::ValueHead
         | IntrinsicId::AttnScore
         | IntrinsicId::Layer => {}
     }

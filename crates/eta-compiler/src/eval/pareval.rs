@@ -69,7 +69,6 @@ pub fn fold_stage(
         hidden: Vec::new(),
         velocity: Vec::new(),
         pixels: Vec::new(),
-        value_head: None,
         query: Vec::new(),
         attn_score: None,
     };

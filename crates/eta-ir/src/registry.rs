@@ -180,8 +180,7 @@ pub fn intrinsic_stages(intr: IntrinsicId) -> &'static [Stage] {
         | IntrinsicId::MtpLogits
         | IntrinsicId::Hidden
         | IntrinsicId::Velocity
-        | IntrinsicId::Pixels
-        | IntrinsicId::ValueHead => &[Stage::Epilogue],
+        | IntrinsicId::Pixels => &[Stage::Epilogue],
         IntrinsicId::MtpDrafts => &[Stage::Epilogue],
         IntrinsicId::AttnScore => &[Stage::Epilogue],
         IntrinsicId::Query | IntrinsicId::Layer => &[Stage::OnAttnProj, Stage::OnAttn],

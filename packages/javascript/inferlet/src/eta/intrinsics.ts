@@ -59,10 +59,6 @@ export function query(width: number): Tensor {
   return intrinsicVal(Intrinsic.QUERY, shapeOf([Math.max(width, 1)]), activationType);
 }
 
-export function valueHead(): Tensor {
-  return intrinsicVal(Intrinsic.VALUE_HEAD, shapeOf([Math.max(currentRows(), 1)]), Dtype.F32);
-}
-
 export function layer(): Tensor {
   return intrinsicVal(Intrinsic.LAYER, SCALAR, Dtype.U32);
 }

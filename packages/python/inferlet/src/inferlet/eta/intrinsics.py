@@ -72,11 +72,6 @@ def query(width: int) -> Tensor:
     return intrinsic_val(Intrinsic.QUERY, shape_of([max(width, 1)]), activation_type)
 
 
-def value_head() -> Tensor:
-    """Model-gated scalar value head (epilogue), `[rows]`."""
-    return intrinsic_val(Intrinsic.VALUE_HEAD, shape_of([max(current_rows(), 1)]), Dtype.F32)
-
-
 def layer() -> Tensor:
     """The invocation's layer index (attn taps; u32 scalar)."""
     return intrinsic_val(Intrinsic.LAYER, SCALAR, Dtype.U32)
