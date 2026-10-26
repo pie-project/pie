@@ -18,7 +18,7 @@ use cudarc::runtime::sys::{
     cudaError, cudaEvent_t, cudaEventCreate, cudaEventDestroy, cudaEventElapsedTime,
     cudaEventRecordExternal, cudaEventRecordWithFlags, cudaEventSynchronize, cudaFree,
     cudaGetDevice, cudaGetLastError, cudaGraph_t, cudaGraphDestroy, cudaGraphExec_t,
-    cudaGraphExecDestroy, cudaGraphInstantiateWithFlags, cudaGraphLaunch, cudaMalloc, cudaMemcpy,
+    cudaGraphExecDestroy, cudaGraphInstantiateWithFlags, cudaGraphLaunch, cudaMalloc, cudaMemcpyAsync,
     cudaMemcpyKind, cudaMemsetAsync, cudaStreamBeginCapture, cudaStreamCaptureMode, cudaStreamCaptureStatus,
     cudaStreamCreateWithFlags, cudaStreamDestroy, cudaStreamEndCapture, cudaStreamNonBlocking,
     cudaStreamSynchronize,
@@ -2017,15 +2017,21 @@ impl TuneArena {
             ids.extend(std::iter::repeat_n(0, rows));
             // SAFETY: `ids` is a local out-pointer for a fresh allocation this
             // arena owns and `Drop` frees, `ids.len()` i32 long, filled from the
-            // host vector before anything reads it.
+            // host vector (which outlives the copy: the stream is drained
+            // before it drops) before anything reads it. The copy is the
+            // arena's stream's, not the legacy stream's, which waits for every
+            // blocking stream and so invalidates a capture another thread has
+            // open on one (a model's arming beside this load's tuning).
             let landed = unsafe {
                 cudaMalloc(&raw mut self.ids, ids.len() * 4) == cudaError::cudaSuccess
-                    && cudaMemcpy(
+                    && cudaMemcpyAsync(
                         self.ids,
                         ids.as_ptr().cast(),
                         ids.len() * 4,
                         cudaMemcpyKind::cudaMemcpyHostToDevice,
+                        self.stream.cast(),
                     ) == cudaError::cudaSuccess
+                    && cudaStreamSynchronize(self.stream.cast()) == cudaError::cudaSuccess
             };
             if !landed {
                 clear_error();
