@@ -43,7 +43,7 @@ fn the_flagship_declares_the_decode_reading_and_the_miniature_does_not() {
         "the miniature's checkpoint carries no VAE"
     );
     for (deployment, want) in [
-        (FLAGSHIP, vec!["latent", "latents"]),
+        (FLAGSHIP, vec!["latents"]),
         (MINI, vec!["latents"]),
     ] {
         let plan = trace(deployment);

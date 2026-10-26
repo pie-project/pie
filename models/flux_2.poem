@@ -910,7 +910,7 @@ def denoise(arm, m):
 def decode(arm, m):
     lat = m.vae.latent
     grid = arm.grid()
-    z = arm.input("latent", dtype.bf16, "voxel", VAE_CHANNELS)
+    z = arm.input("latents", dtype.bf16, "voxel", VAE_CHANNELS)
     # The batch norm is per packed channel; the pack is also the input's fresh copy.
     z, grid = ops.conv.pixel_unshuffle(z, grid, [1, m.pack, m.pack])
     z = ops.elemwise.standardize(z, lat.bn_zero, lat.bn_scale)

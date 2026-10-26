@@ -890,7 +890,7 @@ def run_block(x, b, mods, m, g, tap):
 
 def decode(arm, m):
     grid = arm.grid()
-    z = arm.input("latent", dtype.bf16, "voxel", m.channels)
+    z = arm.input("latents", dtype.bf16, "voxel", m.channels)
     # z / s + shift, `z + z` owned (as above) and its halving folded into 1 / s.
     scale = f32(0.5 * f32(1.0 / f32(SCALING_FACTOR)))
     z = ops.elemwise.add_bias(m.vae.latent.shift, ops.elemwise.mul_scalar(scale, ops.elemwise.add(z, z)))

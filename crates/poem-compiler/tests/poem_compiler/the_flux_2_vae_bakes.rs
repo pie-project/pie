@@ -98,7 +98,7 @@ fn the_trace_reads_its_voxel_inputs_and_plants_pixels_twice() {
     assert_eq!(
         named,
         vec![
-            ("latent", model::VAE_CHANNELS, Dtype::Bf16),
+            ("latents", model::VAE_CHANNELS, Dtype::Bf16),
             ("latents", model::VAE_CHANNELS, Dtype::Bf16),
             ("pixels", vae::RGB, Dtype::Bf16)
         ]

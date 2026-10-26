@@ -379,7 +379,7 @@ async fn main(input: Input) -> Result<Output> {
             pass.state(&[&ws], StateGeometry::default())?;
         }
         let frame = Channel::new([lh, lw, c], dtype::f32).queued();
-        pass.input(0, &vae.inputs[0].name, &frame)?;
+        pass.input(0, "latents", &frame)?;
         pass.prologue(move || {
             let at = if first {
                 Tensor::constant([0u32])

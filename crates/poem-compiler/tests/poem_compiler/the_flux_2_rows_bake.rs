@@ -226,7 +226,7 @@ fn the_readings_state_their_streams_readouts_and_sinusoids() {
     let latent = plan
         .inputs
         .iter()
-        .position(|i| i.name == "latent")
+        .position(|i| i.name == "latents")
         .expect("the decoder's latent input") as u32;
     let voxel_input = plan.values.iter().any(|decl| {
         matches!(

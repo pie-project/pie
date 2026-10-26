@@ -811,7 +811,7 @@ def run_mid_attention(x, g, a):
 
 def vae_decode(arm, vae, first):
     g0 = arm.grid()
-    z = ops.elemwise.copy(arm.input("latent", dtype.bf16, "voxel", vae.z))
+    z = ops.elemwise.copy(arm.input("latents", dtype.bf16, "voxel", vae.z))
     z = ops.elemwise.standardize(z, vae.denorm_bias, vae.denorm_scale)
     z, g = vconv(z, g0, vae.post_quant, arm)
     x, _ = vconv(z, g, vae.conv_in, arm)

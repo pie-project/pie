@@ -466,7 +466,7 @@ def run_resblock(x, g, r, temb):
 
 def image_in(arm, m):
     g = arm.grid()
-    clip = arm.input("latent", dtype.bf16, "voxel", m.latent_channels + m.t_freq_dim)
+    clip = arm.input("latents", dtype.bf16, "voxel", m.latent_channels + m.t_freq_dim)
     z, freqs = ops.gather.split_rows(clip, m.latent_channels)
     temb = run_embedder(m.time_embed, freqs)
     h, g1 = convolve(z, g, m.patch_embed.conv_in)
