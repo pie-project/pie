@@ -7,7 +7,7 @@ A stage body is an ordinary Python function traced once at first submit::
 
     from inferlet.eta import *
 
-    tok_out = fwd.epilogue(lambda: reduce_argmax(intrinsics.logits()))
+    tok_out = fwd.epilogue(lambda: reduce_argmax(intrinsics.output(0, "logits")))
     pipe.submit(fwd)
     token = await tok_out
 
@@ -30,7 +30,6 @@ from .bridge import (
     channel_capacity,
     frame_size,
     kv_page_size,
-    max_readout_rows,
     mm,
     pad_tokens,
     readout_spans,
@@ -126,7 +125,6 @@ __all__ = [
     "channel_capacity",
     "frame_size",
     "kv_page_size",
-    "max_readout_rows",
     "mm",
     "pad_tokens",
     "readout_spans",

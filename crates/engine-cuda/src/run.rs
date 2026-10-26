@@ -328,7 +328,7 @@ pub struct FireBindings {
     pub lane_of_row: Tensor,
     pub group_of_lane: Option<Tensor>,
     pub packings: Vec<(poem_ir::Selection, crate::inputs::PackingHandles)>,
-    
+
     pub group_masks: Vec<crate::inputs::GroupMaskHandles>,
     pub inputs: Vec<InputBinding>,
 
@@ -338,8 +338,6 @@ pub struct FireBindings {
     pub plan_values: usize,
 
     pub tables: FireTables,
-
-    pub scores: Option<crate::scores::ScoreSeat>,
 
     pub device: Device,
 
@@ -1677,7 +1675,6 @@ impl<'c> Run<'c> {
         }
     }
 
-    
     pub(crate) fn group_mask(
         &self,
         q: poem_ir::Selection,

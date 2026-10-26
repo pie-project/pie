@@ -1,5 +1,5 @@
 use poem::ops::conv::{self, ConvShape};
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, seam, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, trace_hybrid};
 use poem_ir::{Dim, Operands, ParamLayout, Ty};
 
 const C_IN: u32 = 8;
@@ -42,7 +42,7 @@ impl ForwardHybrid for Decoder {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let g = inputs.grid();
         let x = inputs.input("voxels", Dtype::Bf16, poem_ir::InputAxis::Voxel, C_IN, None);
         let (h, g1) = conv::conv3d(
@@ -77,8 +77,7 @@ impl ForwardHybrid for Decoder {
             "a shuffle grows rows by its block"
         );
         assert_eq!(y.width(), 3, "and divides the width by it");
-        seam::at(seam::PIXELS, &[&y, &g4]);
-        y
+        poem::output("pixels", &y, Some(&g4));
     }
 }
 
@@ -126,15 +125,14 @@ fn the_decoder_traces_and_its_grids_are_values() {
         assert_eq!(param.layout, want, "`{}`", param.name);
     }
 
-    assert!(!trace.seams.iter().any(|seam| seam.seam == "out"));
+    assert!(!trace.outputs.iter().any(|output| output.name == "logits"));
     let pixels = trace
-        .seams
+        .outputs
         .iter()
-        .find(|seam| seam.seam == "pixels")
-        .expect("the pixels seam is planted");
-    assert_eq!(pixels.values.len(), 2, "the plane and its grid");
-    let plane = &trace.values[pixels.values[0].0 as usize].ty;
-    let grid = &trace.values[pixels.values[1].0 as usize].ty;
+        .find(|output| output.name == "pixels")
+        .expect("the pixels are read out");
+    let plane = &trace.values[pixels.value.0 as usize].ty;
+    let grid = &trace.values[pixels.grid.expect("the pixels name their grid").0 as usize].ty;
     assert_eq!(
         *plane,
         Ty::Tensor {
@@ -157,7 +155,7 @@ impl ForwardHybrid for Patchifier {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let g = inputs.grid();
         let x = inputs.input("voxels", Dtype::Bf16, poem_ir::InputAxis::Voxel, C_IN, None);
         let tg = inputs.token_grid([1, 2, 2]);
@@ -171,8 +169,7 @@ impl ForwardHybrid for Patchifier {
         let back = conv::unpatchify(&tokens, &tg, [1, 2, 2], &g);
         assert_eq!(back.rows(), Dim::Voxels, "and unpatchify comes back");
         assert_eq!(back.width(), u64::from(C_IN));
-        seam::at(seam::PIXELS, &[&back, &g]);
-        back
+        poem::output("pixels", &back, Some(&g));
     }
 }
 
@@ -193,7 +190,7 @@ impl ForwardHybrid for NaturalWeight {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let g = inputs.grid();
         let x = inputs.input("voxels", Dtype::Bf16, poem_ir::InputAxis::Voxel, C_IN, None);
         let w = Weight::sym(
@@ -201,7 +198,11 @@ impl ForwardHybrid for NaturalWeight {
             [u64::from(C_MID), u64::from(C_IN) * 27],
             Dtype::Bf16,
         );
-        conv::conv3d(&x, &g, &w, None, ConvShape::same3(), None).0
+        poem::output(
+            "logits",
+            &conv::conv3d(&x, &g, &w, None, ConvShape::same3(), None).0,
+            None,
+        );
     }
 }
 

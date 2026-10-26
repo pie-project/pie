@@ -277,11 +277,10 @@ pub fn resolve_classes(trace: &Trace) -> Result<ClassTable, Vec<Fault>> {
                 walk.demand(j as usize, &mut node_mask);
             }
         }
-        for seam in &trace.seams {
+        for output in &trace.outputs {
             walk.stack.extend(
-                seam.values
-                    .iter()
-                    .copied()
+                output
+                    .values()
                     .filter(|id| written_in_class(trace, *id, word)),
             );
         }
@@ -413,6 +412,7 @@ fn writes_cache(op: &Operation) -> bool {
             | Attn::Dense { .. }
             | Attn::Ragged { .. }
             | Attn::Voxel { .. }
+            | Attn::ScoreCapture { .. }
             | Attn::Sink { .. }
             | Attn::MergeLse { .. }
             | Attn::MlaPlan { .. }
@@ -575,7 +575,7 @@ mod tests {
                     }],
                     values: Vec::new(),
                     nodes: Vec::new(),
-                    seams: Vec::new(),
+                    outputs: Vec::new(),
                     drafter: None,
                     inputs: Vec::new(),
                 },
@@ -642,10 +642,11 @@ mod tests {
         }
 
         fn out(&mut self, v: ValueId) -> &mut Build {
-            self.trace.seams.push(crate::Seam {
-                seam: "out".to_string(),
-                values: vec![v],
+            self.trace.outputs.push(crate::Output {
+                name: "logits".to_string(),
+                value: v,
                 layer: None,
+                grid: None,
             });
             self
         }
@@ -666,7 +667,7 @@ mod tests {
 
     fn a_bound_every_arm_implies_holds_though_one_arm_drops_it() {
         // a merge over the rows `¬(f0 ∧ f1)`, split by `f1`: the `¬f1` arms
-        // need not spell the bound, they imply it. A seam reading the merge
+        // need not spell the bound, they imply it. An output reading the merge
         // on `f0 ∧ f1` reads rows no arm was meant to write.
         let mut b = Build::new();
         let q = b.input();

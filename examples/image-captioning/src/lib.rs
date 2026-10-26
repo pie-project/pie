@@ -130,7 +130,7 @@ fn fill(color: &str) -> Result<[u8; 3]> {
 
 /// Greedy, always: a caption gate that sampled would assert on a distribution.
 fn sample_token() -> Tensor {
-    reduce_argmax(intrinsics::logits())
+    reduce_argmax(intrinsics::output(0, "logits"))
 }
 
 #[inferlet::main]

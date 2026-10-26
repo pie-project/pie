@@ -5,10 +5,10 @@ use std::sync::Arc;
 use eta_compiler::codegen::launch::{LaunchChannel, LaunchStagePlan};
 use eta_exec::{
     Extents, LANE_ABI_VERSION, LaneChannelSlot, LaneHeader, LaneRecord, LaneShape, NO_TICKET,
-    OpParams, OpRuntime, SCRATCH_ALIGN, Status, ValueDesc, describe, layout,
+    OpParams, SCRATCH_ALIGN, Status, ValueDesc, describe, layout,
 };
 use eta_ir::Dtype;
-use eta_ir::op::{IntrinsicId, tags};
+use eta_ir::op::tags;
 
 use crate::device::alloc::DeferredZeroBuffer;
 use crate::device::ctx::Frame;
@@ -21,8 +21,6 @@ use eta_compiler::codegen::metal::{StepKind, reduce_dispatch_levels};
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 const FIRST_CHANNEL_BUFFER: usize = 7;
-
-const INTRINSIC_ELEMENT_BYTES: u64 = 2;
 
 #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
 pub(super) const LIBRARY_SAMPLER_THREADS: usize = 256;
@@ -44,6 +42,12 @@ fn address_of(buffer: &Buffer, offset: u64) -> Result<u64> {
 }
 
 const CELL_ALIGN: usize = 16;
+
+const STORAGE_F32: u32 = 0;
+
+const STORAGE_BF16: u32 = 1;
+
+const STORAGE_I32: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChannelShape {
@@ -212,12 +216,22 @@ struct Slot {
     width: u32,
 }
 
-#[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
-struct Declared {
-    width: u32,
-    rows: u32,
-    elements: u64,
+/// How a stage reads an output slot: through the readout plane, or its
+/// own table entry as floats or as ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Read {
+    Plane,
+    Floats,
+    Ids,
+}
+
+/// An output table entry as the kernels read it (`M1OutputSeat`).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct OutputSeat {
+    at: u64,
+    storage: u32,
+    stride: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -248,7 +262,7 @@ struct GroupLayout {
 struct RowMeta {
     offset: u32,
     count: u32,
-    mtp_offset: u32,
+    reserved0: u32,
     reserved: u32,
 }
 
@@ -263,11 +277,9 @@ struct Grouped {
     lane_indices: Buffer,
     row_meta: Buffer,
     row_indices: Buffer,
-    trunk_rows: u32,
-    draft_rows: u32,
+    readout_rows: u32,
     layout_words: Vec<GroupLayout>,
     record: LaneRecord,
-    draft_base: u32,
 }
 
 const GROUPED_LANES: u32 = 1;
@@ -283,8 +295,7 @@ impl Grouped {
         shape: LaneShape,
         status: &Buffer,
         extents: Extents,
-        trunk_rows: u32,
-        draft_rows: u32,
+        readout_rows: u32,
     ) -> Result<Option<Grouped>> {
         if !plan.needs.grouped_valid {
             return Ok(None);
@@ -346,8 +357,10 @@ impl Grouped {
 
         let row_meta =
             Buffer::zeroed(device, (GROUPED_LANES as u64) * size_of::<RowMeta>() as u64)?;
-        let rows = u64::from(trunk_rows) + u64::from(draft_rows);
-        let row_indices = Buffer::zeroed(device, rows.max(1) * size_of::<u32>() as u64)?;
+        let row_indices = Buffer::zeroed(
+            device,
+            u64::from(readout_rows).max(1) * size_of::<u32>() as u64,
+        )?;
 
         let scratch_layout = layout(descriptors).map_err(|why| {
             Fault::program(
@@ -395,11 +408,9 @@ impl Grouped {
             lane_indices,
             row_meta,
             row_indices,
-            trunk_rows,
-            draft_rows,
+            readout_rows,
             layout_words,
             record,
-            draft_base: 0,
         }))
     }
 
@@ -411,20 +422,15 @@ impl Grouped {
         Ok(())
     }
 
-    fn set_rows(&mut self, draft_base: u32) -> Result<()> {
-        self.draft_base = draft_base;
-        let bytes: Vec<u8> = (0..self.trunk_rows)
-            .chain((0..self.draft_rows).map(|row| draft_base.saturating_add(row)))
-            .flat_map(u32::to_le_bytes)
-            .collect();
+    fn set_rows(&mut self) -> Result<()> {
+        let bytes: Vec<u8> = (0..self.readout_rows).flat_map(u32::to_le_bytes).collect();
         if !bytes.is_empty() {
             self.row_indices.write(0, &bytes)?;
         }
         let meta = RowMeta {
             offset: 0,
-            count: self.trunk_rows.saturating_add(self.draft_rows),
-            mtp_offset: self.trunk_rows,
-            reserved: 0,
+            count: self.readout_rows,
+            ..RowMeta::default()
         };
         self.row_meta.write(0, &record_bytes(&meta))
     }
@@ -433,18 +439,6 @@ impl Grouped {
         self.record.logits_base = base;
         self.record.logits_row_offset = row_offset;
         self.record.logits_row_count = row_count;
-        self.write_record()
-    }
-
-    fn set_scores(&mut self, base: u64, row_stride: u32) -> Result<()> {
-        self.record.attn_score_base = base;
-        self.record.attn_score_row_stride = row_stride;
-        self.write_record()
-    }
-
-    fn set_drafts(&mut self, base: u64, depth: u32) -> Result<()> {
-        self.record.mtp_drafts_base = base;
-        self.record.mtp_drafts_depth = depth;
         self.write_record()
     }
 
@@ -488,14 +482,17 @@ pub struct Prepared {
     params: Buffer,
     offsets: Buffer,
     scratch: DeferredZeroBuffer,
-    /// By slot ([`eta_ir::op::intrinsic_slot`]): each intrinsic of each
-    /// lane, the stage's [`eta_ir::op::intrinsic_pitch`] of them.
-    intrinsics: Vec<Option<Slot>>,
-    declared: Vec<Option<Declared>>,
-    /// The address each per-lane slot reads at, as the kernels read it
-    /// ([`eta_compiler::codegen::metal::addressed_slot`]); 0 where unbound.
+    /// By output slot ([`eta_ir::op::output_slot`]): how the stage reads it,
+    /// what is bound there and its table entry.
+    reads: Vec<Option<Read>>,
+    outputs: Vec<Option<Slot>>,
+    seats: Vec<OutputSeat>,
     addresses: Buffer,
-    address_words: Vec<u64>,
+    /// The one slot read through the readout plane.
+    readout: Option<usize>,
+    /// The stage's names and the slots a lane takes in its table.
+    names: Vec<String>,
+    output_slots: u32,
     channel_count: u32,
     value_count: u32,
     scratch_stride: u32,
@@ -503,8 +500,6 @@ pub struct Prepared {
     bindings: Vec<u32>,
     bound: Vec<Bound>,
     grouped: Option<Grouped>,
-    region_intrinsics: Vec<u64>,
-    strided: u64,
     descriptor_bytes: Vec<u8>,
     param_bytes: Vec<u8>,
     offset_bytes: Vec<u8>,
@@ -704,8 +699,7 @@ pub struct BatchKey {
     channel_slots_per_lane: u32,
     scratch_stride: u32,
     temporary_offset: u32,
-    trunk_rows: u32,
-    draft_rows: u32,
+    readout_rows: u32,
     regions: usize,
 }
 
@@ -745,11 +739,13 @@ impl Prepared {
             .map_err(|_| Fault::program("program::launch", "a temporary offset past a u32"))?;
 
         let mut records = Vec::with_capacity(plan.ops.len());
-        let pitch = (plan.intrinsic_pitch.max(IntrinsicId::SLOTS)) as usize;
-        let mut declared: Vec<Option<Declared>> = vec![None; pitch];
+        let pitch = plan.output_pitch as usize;
+        let mut reads: Vec<Option<Read>> = vec![None; pitch];
+        let mut readout = None;
+        let mut readout_rows = 0u32;
         let mut result_base = 0u32;
         for op in &plan.ops {
-            let mut record = OpParams::of(op, result_base, OpRuntime::default());
+            let mut record = OpParams::of(op, result_base, plan.output_slots);
             if let (true, Some(channel)) = (op.tag == tags::CHAN_PUT, op.channel) {
                 let dense = plan
                     .channel_bindings
@@ -776,25 +772,38 @@ impl Prepared {
                     Fault::program("program::launch", "a channel cell past what a u32 counts")
                 })?;
             }
-            if let Some(intrinsic) = op.intrinsic
-                && let Some(seat) =
-                    declared.get_mut(eta_ir::op::intrinsic_slot(intrinsic, op.imm) as usize)
-                && let Some(out) = descriptors.get(record.o0 as usize)
-                && out.rank >= 2
-            {
-                let claim = Declared {
-                    width: out.last,
-                    rows: out.rows.max(1),
-                    elements: u64::from(out.len),
+            if op.tag == tags::OUTPUT {
+                let slot = record.intr as usize;
+                let plane = plan
+                    .value_types
+                    .get(record.o0 as usize)
+                    .and_then(|value| value.axes.first())
+                    == Some(&eta_compiler::plan::Dimension::Symbolic(
+                        eta_compiler::plan::SymbolicExtent::SampledRows,
+                    ));
+                let read = if plane {
+                    if readout.is_some_and(|other| other != slot) {
+                        return Err(Fault::program(
+                            "program::launch",
+                            "this stage reads two outputs' readout rows, and the Metal \
+                             kernels read one readout plane a stage",
+                        ));
+                    }
+                    readout = Some(slot);
+                    readout_rows = readout_rows.max(
+                        descriptors
+                            .get(record.o0 as usize)
+                            .map_or(1, |out| out.rows.max(1)),
+                    );
+                    Read::Plane
+                } else if op.dtype == Dtype::I32 {
+                    Read::Ids
+                } else {
+                    Read::Floats
                 };
-                *seat = Some(match *seat {
-                    Some(prior) => Declared {
-                        width: prior.width.max(claim.width),
-                        rows: prior.rows.max(claim.rows),
-                        elements: prior.elements.max(claim.elements),
-                    },
-                    None => claim,
-                });
+                if let Some(seat) = reads.get_mut(slot) {
+                    *seat = Some(read);
+                }
             }
             records.push(record);
             result_base += u32::from(op.result_count);
@@ -830,22 +839,6 @@ impl Prepared {
                 Fault::program("program::launch", "more channels than a u32 can count")
             })?,
         );
-        let reads = |wanted: IntrinsicId| {
-            plan.ops.iter().any(|op| {
-                op.intrinsic
-                    .is_some_and(|id| id as usize == wanted as usize)
-            })
-        };
-        let trunk_rows = declared[IntrinsicId::Logits as usize]
-            .map_or(0, |it| it.rows)
-            .max(u32::from(reads(IntrinsicId::Logits)))
-            .max(plan.drafts_len);
-        let draft_rows = declared[IntrinsicId::MtpLogits as usize]
-            .map_or(0, |it| it.rows)
-            .max(plan.mtp_rows)
-            .max(u32::from(
-                reads(IntrinsicId::MtpLogits) || reads(IntrinsicId::MtpDrafts),
-            ));
         let grouped = Grouped::build(
             device,
             plan,
@@ -853,22 +846,8 @@ impl Prepared {
             lanes,
             &status,
             extents,
-            trunk_rows,
-            draft_rows,
+            readout_rows,
         )?;
-
-        let region_intrinsics = plan
-            .fused
-            .iter()
-            .map(|region| {
-                region.nodes.iter().fold(0u64, |mask, &node| {
-                    match plan.ops.get(node as usize).and_then(|op| op.intrinsic) {
-                        Some(id) if (id as u32) < u64::BITS => mask | (1u64 << (id as u32)),
-                        _ => mask,
-                    }
-                })
-            })
-            .collect();
 
         Ok(Prepared {
             status,
@@ -876,10 +855,13 @@ impl Prepared {
             params,
             offsets,
             scratch,
-            intrinsics: vec![None; pitch],
-            declared,
-            addresses: Buffer::zeroed(device, pitch as u64 * 8)?,
-            address_words: vec![0; pitch],
+            reads,
+            outputs: vec![None; pitch],
+            seats: vec![OutputSeat::default(); pitch],
+            addresses: Buffer::zeroed(device, (pitch.max(1) * size_of::<OutputSeat>()) as u64)?,
+            readout,
+            names: plan.names.clone(),
+            output_slots: plan.output_slots,
             channel_count,
             value_count,
             scratch_stride,
@@ -887,8 +869,6 @@ impl Prepared {
             bindings: plan.channel_bindings.clone(),
             bound: Vec::new(),
             grouped,
-            region_intrinsics,
-            strided: 0,
             descriptor_bytes,
             param_bytes,
             offset_bytes,
@@ -911,8 +891,7 @@ impl Prepared {
             channel_slots_per_lane: grouped.shape.channel_slots_per_lane,
             scratch_stride: self.scratch_stride,
             temporary_offset: self.temporary_offset,
-            trunk_rows: grouped.trunk_rows,
-            draft_rows: grouped.draft_rows,
+            readout_rows: grouped.readout_rows,
             regions: grouped.layouts.len(),
         })
     }
@@ -973,108 +952,60 @@ impl Prepared {
         Ok(())
     }
 
-    pub fn bind_intrinsic(
+    /// Points this stage's reads of output `name` for `lane` at `offset` of
+    /// `base`; an output the stage does not read is let go.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_output(
         &mut self,
-        intrinsic: IntrinsicId,
+        name: &str,
         lane: u32,
         base: &Buffer,
         offset: u64,
-        width: u32,
         dtype: Dtype,
+        width: u32,
+        stride: u32,
     ) -> Result<()> {
-        if eta_compiler::codegen::metal::m2_intrinsic_buffer(intrinsic as u16).is_none() {
-            return Err(Fault::program(
-                "program::launch",
-                format!(
-                    "{intrinsic:?} has no argument index in the M2 slot table, so a \
-                     rectangle bound for it would be read as another intrinsic's"
-                ),
-            ));
-        }
-        let slot = eta_ir::op::intrinsic_slot(intrinsic, lane) as usize;
-        let declared = *self.declared.get(slot).ok_or_else(|| {
-            Fault::program(
-                "program::launch",
-                format!("{intrinsic:?} is past the pitch the slot table is indexed with"),
-            )
-        })?;
-        let element = eta_compiler::codegen::metal::m2_intrinsic_element_bytes(intrinsic as u16)
-            .map(u64::from)
-            .ok_or_else(|| {
-                Fault::program(
-                    "program::launch",
-                    format!("{intrinsic:?} has no element width in the M2 slot table"),
-                )
-            })?;
-        let wanted = match intrinsic {
-            IntrinsicId::MtpDrafts => Dtype::I32,
-            _ if element == 4 => Dtype::F32,
-            _ => Dtype::Bf16,
+        let Some(slot) = self
+            .names
+            .iter()
+            .position(|named| named == name)
+            .map(|index| index + (self.output_slots * lane) as usize)
+        else {
+            return Ok(());
         };
-        if dtype != wanted {
+        let Some(read) = self.reads.get(slot).copied().flatten() else {
+            return Ok(());
+        };
+        let storage = match (read, dtype) {
+            (Read::Plane, Dtype::Bf16) | (Read::Floats, Dtype::Bf16) => STORAGE_BF16,
+            (Read::Floats, Dtype::F32) => STORAGE_F32,
+            (Read::Ids, Dtype::I32) => STORAGE_I32,
+            _ => {
+                return Err(Fault::program(
+                    "program::launch",
+                    format!(
+                        "output `{name}` landed as {dtype:?}, which this stage's {read:?} read \
+                         of it has no gather for"
+                    ),
+                ));
+            }
+        };
+        if read == Read::Plane && stride != width {
             return Err(Fault::program(
                 "program::launch",
-                format!(
-                    "a rectangle for {intrinsic:?} landed as {dtype:?}; the emitted \
-                     `0xA0` handler reads it as {wanted:?} and has no other element type \
-                     for this intrinsic"
-                ),
+                format!("output `{name}`'s readout rows are not one row after another"),
             ));
         }
-        if let Some(declared) = declared {
-            if declared.width > width {
-                return Err(Fault::program(
-                    "program::launch",
-                    format!(
-                        "this stage reads {intrinsic:?} as rows of {} elements and the \
-                         rectangle offered is only {width} wide; a declared extent is a \
-                         ceiling on the row it is pointed at, so serving this one would \
-                         read past the end of every row",
-                        declared.width
-                    ),
-                ));
-            }
-            if declared.width < width && declared.rows > 1 && !self.strideable(intrinsic) {
-                return Err(Fault::program(
-                    "program::launch",
-                    format!(
-                        "this stage reads {intrinsic:?} as {} rows of {} elements out of a \
-                         rectangle {width} wide, and every form that can run it walks its \
-                         rows consecutively: it has no row stride to be told, so every row \
-                         after the first would land {} elements short. A narrower read \
-                         of ONE row is served; this one needs the grouped form, which \
-                         carries a row pitch the way the CUDA handler's \
-                         `intrinsic_row_stride` does — and this stage has no grouped seat \
-                         for it, either because the plan said that path cannot cover the \
-                         stage or because the emitter binds no address for {intrinsic:?}",
-                        declared.rows,
-                        declared.width,
-                        width - declared.width
-                    ),
-                ));
-            }
-            let reach = offset.saturating_add(declared.elements.saturating_mul(element));
-            if reach > base.bytes() {
-                return Err(Fault::Ceiling {
-                    what: "bytes in the rectangle an intrinsic is pointed at",
-                    need: reach,
-                    have: base.bytes(),
-                });
-            }
-        }
-        let bit = 1u64 << (intrinsic as u32);
-        if declared.is_some_and(|it| it.width < width && it.rows > 1) {
-            self.strided |= bit;
-        } else {
-            self.strided &= !bit;
-        }
-        if eta_compiler::codegen::metal::addressed(intrinsic as u16) {
-            let address = address_of(base, offset)?;
-            self.address_words[slot] = address;
-            self.addresses
-                .write(slot as u64 * 8, &address.to_le_bytes())?;
-        }
-        self.intrinsics[slot] = Some(Slot {
+        self.seats[slot] = OutputSeat {
+            at: address_of(base, offset)?,
+            storage,
+            stride,
+        };
+        self.addresses.write(
+            (slot * size_of::<OutputSeat>()) as u64,
+            &record_bytes(&self.seats[slot]),
+        )?;
+        self.outputs[slot] = Some(Slot {
             base: base.clone(),
             offset,
             width,
@@ -1082,83 +1013,20 @@ impl Prepared {
         self.regroup()
     }
 
-    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
-    fn strideable(&self, intrinsic: IntrinsicId) -> bool {
-        self.grouped.is_some()
-            && eta_compiler::codegen::metal::m3_intrinsic_bindable(intrinsic as u16)
-            && !eta_compiler::codegen::metal::addressed(intrinsic as u16)
-    }
-
-    #[cfg_attr(not(target_vendor = "apple"), allow(dead_code))]
-    fn no_stride_owed(&self, region: &Region) -> Result<()> {
-        let reads = self
-            .region_intrinsics
-            .get(region.region_index as usize)
-            .copied()
-            .unwrap_or(u64::MAX);
-        if reads & self.strided == 0 {
-            return Ok(());
-        }
-        Err(Fault::program(
-            "program::launch",
-            format!(
-                "region {} of this stage reads a rectangle wider than the rows its \
-                 own readers declared, across more than one row, and it compiled to \
-                 the SINGLE-LANE form, whose gather walks `out0.len` consecutive \
-                 elements off the binding and has no row pitch to be told. The \
-                 grouped form carries one; this region did not get it",
-                region.region_index
-            ),
-        ))
-    }
-
     fn regroup(&mut self) -> Result<()> {
-        if self.grouped.is_none() {
-            return Ok(());
-        }
-        let (score_base, score_stride) =
-            match self.intrinsics[IntrinsicId::AttnScore as usize].as_ref() {
-                Some(slot) => (address_of(&slot.base, slot.offset)?, slot.width),
-                None => (0, 0),
-            };
-        self.grouped
-            .as_mut()
-            .expect("the seat was there one statement ago")
-            .set_scores(score_base, score_stride)?;
-        let (drafts_base, drafts_depth) =
-            match self.intrinsics[IntrinsicId::MtpDrafts as usize].as_ref() {
-                Some(slot) => (address_of(&slot.base, slot.offset)?, slot.width),
-                None => (0, 0),
-            };
-        self.grouped
-            .as_mut()
-            .expect("the seat was there one statement ago")
-            .set_drafts(drafts_base, drafts_depth)?;
-        let Some(trunk) = self.intrinsics[IntrinsicId::Logits as usize].as_ref() else {
+        let Some(grouped) = self.grouped.as_mut() else {
             return Ok(());
         };
-        let width = trunk.width;
-        let logits_base = address_of(&trunk.base, trunk.offset)?;
-        let stride = u64::from(trunk.width) * INTRINSIC_ELEMENT_BYTES;
-        let draft_base = self.intrinsics[IntrinsicId::MtpLogits as usize]
-            .as_ref()
-            .filter(|drafts| drafts.width == trunk.width && stride != 0)
-            .and_then(|drafts| {
-                let there = address_of(&drafts.base, drafts.offset).ok()?;
-                let apart = there.checked_sub(logits_base)?;
-                (apart % stride == 0)
-                    .then(|| u32::try_from(apart / stride).ok())
-                    .flatten()
-            })
-            .unwrap_or(0);
-        let grouped = self
-            .grouped
-            .as_mut()
-            .expect("the seat was there one statement ago");
-        let rows = grouped.trunk_rows.saturating_add(grouped.draft_rows);
-        grouped.set_vocab(width)?;
-        grouped.set_logits(logits_base, 0, rows)?;
-        grouped.set_rows(draft_base)
+        let Some(plane) = self.readout.and_then(|slot| self.outputs[slot].as_ref()) else {
+            return Ok(());
+        };
+        grouped.set_vocab(plane.width)?;
+        grouped.set_logits(
+            address_of(&plane.base, plane.offset)?,
+            0,
+            grouped.readout_rows,
+        )?;
+        grouped.set_rows()
     }
 
     pub fn encode_into(&self, frame: &Frame, region: &Region) -> Result<()> {
@@ -1226,7 +1094,7 @@ impl Prepared {
             for cell in &self.bound {
                 resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
             }
-            for held in self.intrinsics.iter().flatten() {
+            for held in self.outputs.iter().flatten() {
                 resident(&held.base, MTLResourceUsage::Read);
             }
             let threads = streamed_threads(region.pipeline().maxTotalThreadsPerThreadgroup());
@@ -1261,11 +1129,16 @@ impl Prepared {
     ) -> Result<()> {
         #[cfg(target_vendor = "apple")]
         {
-            use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
+            use objc2::runtime::ProtocolObject;
+            use objc2_metal::{MTLComputeCommandEncoder, MTLResource, MTLResourceUsage, MTLSize};
 
-            self.no_stride_owed(region)?;
             let encoder = frame.encoder();
             encoder.setComputePipelineState(region.pipeline());
+            for held in self.outputs.iter().flatten() {
+                let resource: &ProtocolObject<dyn MTLResource> =
+                    ProtocolObject::from_ref(&**held.base.slab());
+                encoder.useResource_usage(resource, MTLResourceUsage::Read);
+            }
             let scratch_at = usize::try_from(scratch_at).unwrap_or(usize::MAX);
             // SAFETY: every buffer is retained by `self`/`region`/the batch; every offset was bounds-checked.
             unsafe {
@@ -1279,7 +1152,7 @@ impl Prepared {
                     scratch_at + self.temporary_offset as usize,
                     5,
                 );
-                match self.intrinsics[IntrinsicId::Logits as usize].as_ref() {
+                match self.readout.and_then(|slot| self.outputs[slot].as_ref()) {
                     Some(bound) => encoder.setBuffer_offset_atIndex(
                         Some(bound.base.raw()),
                         usize::try_from(bound.offset).unwrap_or(0),
@@ -1291,30 +1164,11 @@ impl Prepared {
                         eta_compiler::codegen::metal::M2_LOGITS_BUFFER,
                     ),
                 }
-                // Past the logits, each intrinsic has its own argument; per-lane ones read
-                // through the table.
                 encoder.setBuffer_offset_atIndex(
                     Some(self.addresses.raw()),
                     0,
                     eta_compiler::codegen::metal::M2_INTRINSIC_TABLE_BUFFER,
                 );
-                for (slot, held) in self.intrinsics.iter().enumerate() {
-                    let Some(at) = u16::try_from(slot)
-                        .ok()
-                        .filter(|&intr| !eta_compiler::codegen::metal::addressed(intr))
-                        .and_then(eta_compiler::codegen::metal::m2_intrinsic_buffer)
-                        .filter(|at| *at != eta_compiler::codegen::metal::M2_LOGITS_BUFFER)
-                    else {
-                        continue;
-                    };
-                    if let Some(bound) = held {
-                        encoder.setBuffer_offset_atIndex(
-                            Some(bound.base.raw()),
-                            usize::try_from(bound.offset).unwrap_or(0),
-                            at,
-                        );
-                    }
-                }
                 for (local, bound) in self.bound.iter().enumerate() {
                     let at = FIRST_CHANNEL_BUFFER + local * 2;
                     encoder.setBuffer_offset_atIndex(
@@ -1408,7 +1262,7 @@ impl Prepared {
             for cell in &self.bound {
                 resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
             }
-            for held in self.intrinsics.iter().flatten() {
+            for held in self.outputs.iter().flatten() {
                 resident(&held.base, MTLResourceUsage::Read);
             }
 
@@ -1534,7 +1388,7 @@ impl Batch {
             .as_ref()
             .expect("the key was answered off this seat one statement ago");
         let lanes = lanes.max(1);
-        let table_bytes = template.address_words.len() as u64 * 8;
+        let table_bytes = (template.seats.len().max(1) * size_of::<OutputSeat>()) as u64;
         let shape = LaneShape::of(lanes, grouped.shape.channel_slots_per_lane);
         let bytes = shape.bytes().ok_or_else(|| {
             Fault::program(
@@ -1579,7 +1433,7 @@ impl Batch {
         let mut lane_indices = Buffer::zeroed(device, index_bytes.len() as u64)?;
         lane_indices.write(0, &index_bytes)?;
         let row_meta = Buffer::zeroed(device, u64::from(lanes) * size_of::<RowMeta>() as u64)?;
-        let rows_per_lane = grouped.trunk_rows.saturating_add(grouped.draft_rows);
+        let rows_per_lane = grouped.readout_rows;
         let row_indices = Buffer::zeroed(
             device,
             (u64::from(lanes) * u64::from(rows_per_lane) * size_of::<u32>() as u64).max(4),
@@ -1711,27 +1565,21 @@ impl Batch {
                 })?;
                 self.table.write(at, &record_bytes(&slot))?;
             }
-            let words: Vec<u8> = member
-                .address_words
-                .iter()
-                .copied()
-                .flat_map(u64::to_le_bytes)
-                .collect();
-            self.addresses
-                .write(u64::from(lane) * self.table_bytes, &words)?;
+            self.addresses.write(
+                u64::from(lane) * self.table_bytes,
+                &records_bytes(&member.seats),
+            )?;
             let row_base = lane * self.rows_per_lane;
             let meta = RowMeta {
                 offset: row_base,
                 count: self.rows_per_lane,
-                mtp_offset: grouped.trunk_rows,
-                reserved: 0,
+                ..RowMeta::default()
             };
             self.row_meta.write(
                 u64::from(lane) * size_of::<RowMeta>() as u64,
                 &record_bytes(&meta),
             )?;
-            let rows: Vec<u8> = (0..grouped.trunk_rows)
-                .chain((0..grouped.draft_rows).map(|row| grouped.draft_base.saturating_add(row)))
+            let rows: Vec<u8> = (0..grouped.readout_rows)
                 .flat_map(u32::to_le_bytes)
                 .collect();
             if !rows.is_empty() {
@@ -1822,7 +1670,7 @@ impl Batch {
                 for cell in &member.bound {
                     resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
                 }
-                for held in member.intrinsics.iter().flatten() {
+                for held in member.outputs.iter().flatten() {
                     resident(&held.base, MTLResourceUsage::Read);
                 }
             }
@@ -1956,7 +1804,7 @@ impl Batch {
                 for cell in &member.bound {
                     resident(&cell.slab, MTLResourceUsage::Read | MTLResourceUsage::Write);
                 }
-                for held in member.intrinsics.iter().flatten() {
+                for held in member.outputs.iter().flatten() {
                     resident(&held.base, MTLResourceUsage::Read);
                 }
             }
@@ -2113,13 +1961,21 @@ mod tests {
             [
                 "uint offset",
                 "uint count",
-                "uint mtp_offset",
+                "uint reserved0",
                 "uint reserved"
             ],
             "`RowMeta` in this file is the host half of the emitted `M3RowMeta`, \
              and the two have parted"
         );
         assert_eq!(size_of::<RowMeta>(), 4 * size_of::<u32>());
+        let runtime = eta_compiler::codegen::metal::RUNTIME_TEMPLATE;
+        assert!(
+            runtime.contains(
+                "struct M1OutputSeat {\n  ulong at;\n  uint storage;\n  uint stride;\n};"
+            ),
+            "`OutputSeat` in this file is the host half of the emitted `M1OutputSeat`"
+        );
+        assert_eq!(size_of::<OutputSeat>(), 16);
     }
 
     fn the_grouped_samplers_take_the_bindings_this_file_writes() {

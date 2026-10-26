@@ -3,8 +3,8 @@ use std::ops::Mul;
 use std::rc::Rc;
 
 use poem_ir::{
-    CacheRow, Def, Dim, Dtype, Guard, InputAxis, Node, Operands, Operation, Param, ParamLayout,
-    ParamSource, Platform, RuntimeInput, Seam, Shard, Trace, Ty, ValueDecl, ValueId,
+    CacheRow, Def, Dim, Dtype, Guard, InputAxis, Node, Operands, Operation, Output, Param,
+    ParamLayout, ParamSource, Platform, RuntimeInput, Shard, Trace, Ty, ValueDecl, ValueId,
 };
 
 use crate::declare::Weight;
@@ -66,7 +66,7 @@ impl Recorder {
                 values: Vec::new(),
                 nodes: Vec::new(),
                 drafter: None,
-                seams: Vec::new(),
+                outputs: Vec::new(),
                 facts: poem_ir::Facts::default(),
                 inputs: Vec::new(),
             })),
@@ -333,22 +333,13 @@ impl Recorder {
         }
     }
 
-    pub fn seam(&self, name: &str, values: &[&Value]) {
-        let ids = values.iter().map(|v| v.id).collect();
-        self.inner.borrow_mut().seams.push(Seam {
-            seam: name.to_string(),
-            values: ids,
+    pub fn output(&self, name: &str, value: &Value, grid: Option<&Value>) {
+        self.inner.borrow_mut().outputs.push(Output {
+            name: name.to_string(),
+            value: value.id,
             layer: self.at.get(),
+            grid: grid.map(|grid| grid.id),
         });
-    }
-
-    #[must_use]
-    pub(crate) fn seamed(&self, name: &str, value: &Value) -> bool {
-        self.inner
-            .borrow()
-            .seams
-            .iter()
-            .any(|seam| seam.seam == name && seam.values.contains(&value.id))
     }
 
     pub fn declare_switch(&self, name: &str, values: &[&str]) {

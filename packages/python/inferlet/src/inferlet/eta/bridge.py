@@ -24,7 +24,7 @@ from wit_world.imports import working_set as _wit_ws
 
 from ..media import Audio, Image
 from .builder import Builder, DslChannel
-from .ir import Dtype, Port, Shape, Stage, numel, shape_of
+from .ir import Axis, Dtype, OutputDecl, Port, Shape, Stage, numel, shape_of
 from .trace import ChannelState, TraceError
 from .value import ConstData, Tensor, const_data, reshape, unpack_elems
 
@@ -471,12 +471,6 @@ def _rs_state_size() -> int:
     return _wit_model.rs_state_size()
 
 
-@functools.cache
-def max_readout_rows(kind: "_wit_model.ReadoutKind") -> int:
-    """The most rows one pass may read out through `kind`; the pass itself may be any length."""
-    return max(_wit_model.max_readout_rows(kind), 1)
-
-
 def _even_spans(n: int, cap: int) -> list[tuple[int, int]]:
     if n == 0:
         return []
@@ -492,9 +486,28 @@ def _even_spans(n: int, cap: int) -> list[tuple[int, int]]:
     return out
 
 
-def readout_spans(n: int, kind: "_wit_model.ReadoutKind") -> list[tuple[int, int]]:
-    """Even `[start, end)` spans of `n` rows, each at most `max_readout_rows(kind)`."""
-    return _even_spans(n, max_readout_rows(kind))
+def readout_spans(n: int, max_rows: int) -> list[tuple[int, int]]:
+    """Even `[start, end)` spans of `n` rows, each at most `max_rows` (an output's `max_rows`)."""
+    return _even_spans(n, max(max_rows, 1))
+
+
+def _output_decl(decl: "_wit_model.OutputDecl") -> OutputDecl:
+    """An output as the program reads it: an i32 output as i32, any float one f32."""
+    return OutputDecl(
+        name=decl.name,
+        axis=Axis(decl.axis.name.lower()),
+        width=decl.width,
+        dtype=Dtype.I32 if decl.dtype == _wit_types.Dtype.I32 else Dtype.F32,
+        layers=decl.layers,
+        readout=decl.readout,
+    )
+
+
+@functools.cache
+def _lane_outputs(switches: tuple[tuple[str, str], ...]) -> list[OutputDecl]:
+    """The outputs a lane of these switches reads, by the model's lane decl."""
+    decl = _wit(_wit_model.lane, list(switches), what="model.lane")
+    return [_output_decl(output) for output in decl.outputs]
 
 
 # ---------------------------------------------------------------------------
@@ -738,18 +751,25 @@ class ForwardPass:
         self._set_stage(Stage.EPILOGUE, traced)
         return out
 
-    def on_attn_proj(self, body: Callable[[], None]) -> Callable[[], None]:
-        return self._set_stage(Stage.ON_ATTN_PROJ, body)
-
-    def on_attn(self, body: Callable[[], None]) -> Callable[[], None]:
-        return self._set_stage(Stage.ON_ATTN, body)
-
     # -- program + submit -----------------------------------------------------
 
     def attach_program(self) -> None:
         if self._program_attached:
             return
         builder = Builder(self._vocab, self._page_size)
+        lanes = max(
+            [1, len(self._lanes)]
+            + [lane + 1 for lane, _, _ in self._switches]
+            + [lane + 1 for lane, _, _ in self._inputs]
+        )
+        builder.set_outputs(
+            [
+                _lane_outputs(
+                    tuple((name, value) for at, name, value in self._switches if at == lane)
+                )
+                for lane in range(lanes)
+            ]
+        )
         for port, ch in self._ports:
             builder.bind_port(port, ch._dsl)
         # A channel several lanes read is one program input.

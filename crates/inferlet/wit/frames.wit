@@ -27,15 +27,15 @@
 // interleaved RGB8 can build a handle before any VAE exists.
 //
 // `from-channel` is the OTHER constructor, and the one the VAE road uses. A
-// VAE decode pass lands its pixels on the `pixels` seam; the pass's eta
-// epilogue reads that seam with `intrinsics::pixels()` and puts it on one of
+// VAE decode pass reads its pixels out as an output; the pass's eta
+// epilogue reads that output with `intrinsics::output_rows` and puts it on one of
 // its own channels. `from-channel` takes that channel's
 // committed cell HOST-SIDE — the same take `channel.take` would do, minus the
 // lift into linear memory — and builds the handle from it. The pixels go
 // engine -> host -> encoder -> client and never enter WASM.
 //
 // WHY THIS AND NOT A VERB ON THE PASS. A `forward-pass.frames()` reading the
-// fire's `LaneReadout { seam: pixels }` would be one call shorter, but it puts
+// fire's `LaneReadout` would be one call shorter, but it puts
 // the pass's fire bookkeeping on the output path: the handle would have to
 // name WHICH fire (a pipeline runs several in flight), the pass would have to
 // retain a readout the guest may never ask for, and a guest that wants to
@@ -108,7 +108,7 @@ interface frames {
 
         // Build a handle from a channel's committed cell, WITHOUT the pixels
         // entering linear memory. This is the VAE road: a
-        // VAE decode pass's epilogue reads `intrinsics::pixels()` and puts
+        // VAE decode pass's epilogue reads its pixels output and puts
         // the plane on `ch`; this takes that cell host-side, the way
         // `channel.take` would, and turns it into frames.
         //

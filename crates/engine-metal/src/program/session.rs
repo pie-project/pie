@@ -1,7 +1,6 @@
 use engine::ports::Envelope;
 use eta_compiler::codegen::launch::LaunchPackage;
 use eta_exec::{ExecPlan, Extents};
-use eta_ir::op::IntrinsicId;
 use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::name_or_unknown;
 use eta_ir::validate::Direction;
@@ -67,7 +66,8 @@ pub struct Session {
     shapes: Vec<ChannelShape>,
     cursors: Vec<Cursor>,
     prepared: Vec<Option<Prepared>>,
-    bound: u64,
+    /// The outputs bound, by name and lane.
+    bound: Vec<(String, u32)>,
     poisoned: bool,
     fires: u64,
     airborne: Option<Vec<usize>>,
@@ -114,7 +114,7 @@ impl Session {
             shapes,
             cursors,
             prepared,
-            bound: 0,
+            bound: Vec::new(),
             poisoned: false,
             fires: 0,
             airborne: None,
@@ -251,19 +251,27 @@ impl Session {
         ports::resolve(plan, class, &self.rings, &self.cursors_now(), &self.shapes)
     }
 
-    pub fn bind_intrinsic(
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_output(
         &mut self,
-        intrinsic: IntrinsicId,
+        name: &str,
         lane: u32,
         base: &Buffer,
         offset: u64,
-        width: u32,
         dtype: eta_ir::Dtype,
+        width: u32,
+        stride: u32,
     ) -> Result<()> {
         for prepared in self.prepared.iter_mut().flatten() {
-            prepared.bind_intrinsic(intrinsic, lane, base, offset, width, dtype)?;
+            prepared.bind_output(name, lane, base, offset, dtype, width, stride)?;
         }
-        self.bound |= 1u64 << (intrinsic as u32);
+        if !self
+            .bound
+            .iter()
+            .any(|(named, at)| named == name && *at == lane)
+        {
+            self.bound.push((name.to_string(), lane));
+        }
         Ok(())
     }
 
@@ -408,7 +416,7 @@ impl Session {
         }
         stages_and_plans_agree(compiled)?;
         if at != Stage::Prologue {
-            self.intrinsics_bound(plan)?;
+            self.outputs_bound(plan)?;
         }
         if let Some(blocked) = self.blocked_at(plan, at) {
             return Ok(Some(Fired::Blocked(blocked)));
@@ -416,51 +424,24 @@ impl Session {
         Ok(None)
     }
 
-    /// The emitted kernel reads an intrinsic's argument slot regardless: refuse one left unbound.
-    fn intrinsics_bound(&self, plan: &ExecPlan) -> Result<()> {
-        let readout_bound = [
-            IntrinsicId::Logits,
-            IntrinsicId::Velocity,
-            IntrinsicId::Hidden,
-        ]
-        .iter()
-        .any(|id| self.bound & (1u64 << (*id as u32)) != 0);
-        if plan.needs_logits && !readout_bound {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the fire's readout (`logits`, `velocity` or \
-                 `hidden`) and no buffer has been bound to it; the emitted kernel \
-                 reads the argument slot regardless of whether anything was ever \
-                 encoded into it",
-            ));
+    /// The emitted kernel reads an output's slot regardless: refuse one left unbound.
+    fn outputs_bound(&self, plan: &ExecPlan) -> Result<()> {
+        for (name, lane) in plan.outputs() {
+            if !self
+                .bound
+                .iter()
+                .any(|(named, at)| named == name && *at == lane)
+            {
+                return Err(Fault::program(
+                    "program::session",
+                    format!(
+                        "this program reads output `{name}` of its pass's lane {lane} and \
+                         nothing has been bound to it: the pass has no such lane, or the \
+                         lane's class writes no such output"
+                    ),
+                ));
+            }
         }
-        if plan.needs_mtp_logits && self.bound & (1u64 << (IntrinsicId::MtpLogits as u32)) == 0 {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the `mtp_logits` intrinsic and no buffer has \
-                 been bound to it; a model whose text declares no `mtp` export has \
-                 no draft column for it to point at",
-            ));
-        }
-
-        if plan.needs_mtp_drafts && self.bound & (1u64 << (IntrinsicId::MtpDrafts as u32)) == 0 {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the `mtp_drafts` intrinsic and no buffer has \
-                 been bound to it; a model whose text declares no `mtp.drafts` export \
-                 has no token plane for it to point at",
-            ));
-        }
-
-        if plan.needs_attn_scores && self.bound & (1u64 << (IntrinsicId::AttnScore as u32)) == 0 {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the `attn_score` intrinsic and no buffer has been \
-                 bound to it; a lane that did not ask to capture its attention has no \
-                 block of the observability slab for it to point at",
-            ));
-        }
-
         Ok(())
     }
 

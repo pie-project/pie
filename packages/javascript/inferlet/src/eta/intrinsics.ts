@@ -2,9 +2,9 @@
 // the `intrinsics.kernel.*` second-party surface. Port of
 // `eta-dsl/src/intrinsics.rs`.
 
-import { ATTN_SCORE_KV_MAX, Dtype, Intrinsic, Op, SCALAR, SinkScope, shapeOf } from './ir.js';
-import { currentRows, emit, internName, recordSink, pageSize as tracePageSize, vocab as traceVocab, vt } from './trace.js';
-import { Operand, Tensor, constant, intrinsicVal, materialize, reshape } from './value.js';
+import { Axis, Dtype, Op, OutputDecl, shapeOf } from './ir.js';
+import { currentRows, declaredOutput, emit, internName, recordSink, pageSize as tracePageSize, vocab as traceVocab } from './trace.js';
+import { Operand, Tensor, constant, materialize, outputVal, reshape } from './value.js';
 
 /** The interpreter-visible activation dtype. Always F32. */
 export const activationType = Dtype.F32;
@@ -23,66 +23,39 @@ function singleRowReshape(t: Tensor): Tensor {
   return t;
 }
 
-/** The LM-head logits, `[n_out, vocab]` f32 — `[vocab]` for a single read-out row. */
-export function logits(): Tensor {
-  const rows = Math.max(currentRows(), 1);
-  return singleRowReshape(intrinsicVal(Intrinsic.LOGITS, shapeOf([rows, vocab()]), Dtype.F32));
+function declared(lane: number, name: string): OutputDecl {
+  const decl = declaredOutput(lane, name);
+  if (!decl) throw new Error(`lane ${lane} of this pass reads out no output \`${name}\``);
+  return decl;
 }
 
-export function mtpLogits(k: number): Tensor {
-  return intrinsicVal(Intrinsic.MTP_LOGITS, shapeOf([k, vocab()]), Dtype.F32);
+/**
+ * Lane `lane`'s output `name` as the model declares it: its readout rows (a
+ * lone row read as its width alone), or its layers stacked.
+ */
+export function output(lane: number, name: string): Tensor {
+  const decl = declared(lane, name);
+  let rows: number;
+  if (decl.axis === Axis.LANE) rows = Math.max(decl.layers, 1);
+  else if (decl.readout) rows = Math.max(currentRows(), 1);
+  else throw new Error(`output \`${name}\` is one row a token or voxel of lane ${lane}: \`outputRows\` reads the rows it names`);
+  const t = outputVal(internName(name), lane, shapeOf([rows, decl.width]), decl.dtype);
+  return decl.readout ? singleRowReshape(t) : t;
 }
 
-export function mtpDrafts(n: number): Tensor {
-  return intrinsicVal(Intrinsic.MTP_DRAFTS, shapeOf([Math.max(n, 1)]), Dtype.I32);
-}
-
-/** The `rows` hidden rows lane `lane` of the pass reads out, `width` wide. */
-export function hidden(lane: number, rows: number, width: number): Tensor {
-  return intrinsicVal(Intrinsic.HIDDEN, shapeOf([Math.max(rows, 1), Math.max(width, 1)]), activationType, lane);
-}
-
-/** The pixels lane `lane`'s VAE decode lands, one `[rows, width]` row per output voxel. */
-export function pixels(lane: number, rows: number, width: number): Tensor {
-  return intrinsicVal(Intrinsic.PIXELS, shapeOf([Math.max(rows, 1), Math.max(width, 1)]), activationType, lane);
-}
-
-/** The velocity lane `lane` predicts, `[rows, width]`. */
-export function velocity(lane: number, rows: number, width: number): Tensor {
-  return intrinsicVal(Intrinsic.VELOCITY, shapeOf([Math.max(rows, 1), Math.max(width, 1)]), activationType, lane);
-}
-
-export function query(width: number): Tensor {
-  return intrinsicVal(Intrinsic.QUERY, shapeOf([Math.max(width, 1)]), activationType);
-}
-
-export function layer(): Tensor {
-  return intrinsicVal(Intrinsic.LAYER, SCALAR, Dtype.U32);
-}
-
-export function attnScore(planes: number): Tensor {
-  return intrinsicVal(Intrinsic.ATTN_SCORE, shapeOf([Math.max(planes, 1), ATTN_SCORE_KV_MAX]), Dtype.F32);
-}
-
-export function attnScoreKvMax(): number {
-  return ATTN_SCORE_KV_MAX;
+/** `rows` rows of lane `lane`'s output `name`, one a token or voxel. */
+export function outputRows(lane: number, name: string, rows: number): Tensor {
+  const decl = declared(lane, name);
+  return outputVal(internName(name), lane, shapeOf([Math.max(rows, 1), decl.width]), decl.dtype);
 }
 
 /** Second-party kernels and configuration sinks. */
 export const kernel = {
-  envelopeDot(pMax: number): Tensor {
-    const queryTy = vt(shapeOf([1]), activationType);
-    const q = emit(Op.intrinsicVal(Intrinsic.QUERY, queryTy.shape, queryTy.dtype), [queryTy]);
-    const scoreTy = vt(shapeOf([pMax]), Dtype.F32);
-    const name = internName('envelope_dot');
-    return Tensor.node(emit(Op.kernelCall(name, [q], scoreTy.shape, scoreTy.dtype), [scoreTy]), scoreTy);
-  },
-
   attnPageMask(mask: Operand): void {
     const [mid] = materialize(mask);
     const name = internName('attn_page_mask');
     emit(Op.sinkCall(name, [mid]), []);
-    recordSink('attn_page_mask', SinkScope.ATTENTION);
+    recordSink('attn_page_mask');
   },
 
   lora(a: Operand, b: Operand, sites: Operand): void {
@@ -91,7 +64,7 @@ export const kernel = {
     const [sid] = materialize(sites);
     const name = internName('lora');
     emit(Op.sinkCall(name, [aid, bid, sid]), []);
-    recordSink('lora', SinkScope.PASS_WIDE);
+    recordSink('lora');
   },
 
   adapterScale(l: Operand, sites: Operand): void {
@@ -99,7 +72,7 @@ export const kernel = {
     const [sid] = materialize(sites);
     const name = internName('lora');
     emit(Op.sinkCall(name, [lid, sid]), []);
-    recordSink('lora', SinkScope.PASS_WIDE);
+    recordSink('lora');
   },
 };
 

@@ -1,7 +1,7 @@
 use poem::fact;
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, RaggedMask, Request, Selection,
-    Trace, Value, Weight, ops, seam, trace_hybrid,
+    Trace, Weight, ops, trace_hybrid,
 };
 use poem_ir::{Attn, Def, Gather, GeomKind, Guard, Operation, RuntimeInput};
 
@@ -17,7 +17,7 @@ impl ForwardHybrid for CrossAttention {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         inputs
             .recorder()
             .declare_switch("stream", &["text", "image", "video", "audio"]);
@@ -75,8 +75,7 @@ impl ForwardHybrid for CrossAttention {
         );
         let o = ops::gather::unpack_rows(&o, &audio.row_permutation());
         let out = ops::linear::matmul(&o, &wo);
-        seam::at(seam::VELOCITY, &[&out]);
-        out
+        poem::output("velocity", &out, None);
     }
 }
 
@@ -173,7 +172,7 @@ impl ForwardHybrid for TwoArmsIntoOneAdd {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         inputs
             .recorder()
             .declare_switch("stream", &["text", "image", "video", "audio"]);
@@ -190,7 +189,7 @@ impl ForwardHybrid for TwoArmsIntoOneAdd {
             &video.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, 8, None),
             &w,
         );
-        ops::elemwise::add(&a, &b)
+        poem::output("logits", &ops::elemwise::add(&a, &b), None);
     }
 }
 

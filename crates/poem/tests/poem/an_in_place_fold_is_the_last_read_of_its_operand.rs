@@ -1,6 +1,5 @@
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, Value, Weight, ops, seam,
-    trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, Platform, Predicate, Value, Weight, ops, trace_hybrid,
 };
 use poem_ir::{Elemwise, Operands, Operation, Trace, ValueId};
 
@@ -18,7 +17,7 @@ impl ForwardHybrid for Stack {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         inputs
             .recorder()
             .declare_switch("stream", &["text", "image", "video", "audio"]);
@@ -38,8 +37,7 @@ impl ForwardHybrid for Stack {
             let m = ops::elemwise::add_bias(&table, &vector);
             x = ops::elemwise::gated_residual_add(&x, &m, &x, Some(&lanes));
         }
-        seam::at(seam::VELOCITY, &[&x]);
-        x
+        poem::output("velocity", &x, None);
     }
 }
 
@@ -49,7 +47,7 @@ impl ForwardHybrid for TwoArms {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         inputs
             .recorder()
             .declare_switch("stream", &["text", "image", "video", "audio"]);
@@ -60,8 +58,7 @@ impl ForwardHybrid for TwoArms {
         let txt = ops::elemwise::add_bias(&bias, &txt);
         let img = ops::elemwise::add_bias(&other, &img);
         let x = Value::merge(vec![txt, img]);
-        seam::at(seam::VELOCITY, &[&x]);
-        x
+        poem::output("velocity", &x, None);
     }
 }
 

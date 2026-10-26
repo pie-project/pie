@@ -52,7 +52,7 @@ const GENERATED_TAGS: &[u8] = &[
     tags::CHAN_TAKE,
     tags::CHAN_READ,
     tags::CHAN_PUT,
-    tags::INTRINSIC_VAL,
+    tags::OUTPUT,
 ];
 
 #[test]

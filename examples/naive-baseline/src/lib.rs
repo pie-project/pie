@@ -114,7 +114,7 @@ async fn main(input: Input) -> Result<Output> {
     fwd_p.state(&[&ws], StateGeometry::folding())?;
     fwd_p.epilogue(move || {
         let r = rng_p.take();
-        let logits = intrinsics::logits();
+        let logits = intrinsics::output(0, "logits");
         let token = step(logits, temperature, &r);
         let r_next = &r + iota(2);
         tok_out_p.put(&token);
@@ -164,7 +164,7 @@ async fn main(input: Input) -> Result<Output> {
         fwd.state(&[&ws], StateGeometry::folding())?;
         fwd.epilogue(move || {
             let r = rng.take();
-            let logits = intrinsics::logits();
+            let logits = intrinsics::output(0, "logits");
             let token = step(logits, temperature, &r);
 
             let r_next = &r + iota(2);

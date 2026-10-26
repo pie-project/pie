@@ -38,6 +38,7 @@ PARAMS = {
     "Option<&Predicate>": ("Option<Predicate>", "{}.as_ref()"),
     "Option<(u32, f32)>": ("Option<(u32, f32)>", "{}"),
     "[u32; 3]": ("[u32; 3]", "{}"),
+    "Option<poem_ir::RowCount>": ("Option<poem_ir::RowCount>", "{}"),
     "[u32; 4]": ("[u32; 4]", "{}"),
     "[f32; 4]": ("[f32; 4]", "{}"),
     "[f32; 3]": ("[f32; 3]", "{}"),
@@ -148,14 +149,16 @@ def entry(module, name, params, call, receiver):
 
     takes = "".join(f"            let {p}: {unpacked(p, t)} = a.next()?;\n" for p, t in params)
     passes = ", ".join(passed(p, t) for p, t in params[int(receiver):])
+    # A Rust keyword's trailing `_` is not the package's spelling.
+    spelled = name.rstrip("_")
     return (
         "    Op {\n"
         f'        module: "{module}",\n'
-        f'        name: "{name}",\n'
+        f'        name: "{spelled}",\n'
         f"        params: &[{names}],\n"
         "        call: |a, heap| {\n"
         f"{takes}"
-        f'            result(heap, dsl("{module}.{name}", || {call.format(passes=passes)})?)\n'
+        f'            result(heap, dsl("{module}.{spelled}", || {call.format(passes=passes)})?)\n'
         "        },\n"
         "    },\n"
     )

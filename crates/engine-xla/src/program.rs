@@ -11,8 +11,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Carried cells a group pass left on the device, and whose they are.
 type Carried = (Vec<InstanceId>, BTreeMap<u32, crate::pjrt::Buffer>);
-/// Where an attachment runs: its plan, its content hash, its readout seat.
-type Placed = (Arc<ExecPlan>, [u8; 32], Option<crate::readout::Seat>);
+/// Where an attachment runs: its plan, its content hash, where it reads its
+/// outputs.
+type Placed = (Arc<ExecPlan>, [u8; 32], Vec<crate::guest::run::Bound>);
 
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel, Ticket};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
@@ -937,7 +938,7 @@ impl Plane {
 
     /// Runs the guest passes of a fire's `attachments` (instance, first
     /// lane): on the device, reading `kept` where it lies, for every
-    /// instance whose program lowered and whose intrinsics bind there —
+    /// instance whose program lowered and whose outputs bind there —
     /// instances of one program as one batched executable per stage — and
     /// in the interpreter, over the rows downloaded from `kept`, for the
     /// rest. Returns, per attachment, whether it ran on the device.
@@ -946,11 +947,9 @@ impl Plane {
         device: &crate::device::Device,
         attachments: &[(InstanceId, u32)],
         kept: Option<&crate::readout::Kept>,
-        vocab: u32,
-        mtp_width: u32,
         at: Stage,
     ) -> Result<Vec<bool>, Refusal> {
-        self.fire_guests_with(device, attachments, kept, vocab, mtp_width, None, at)
+        self.fire_guests_with(device, attachments, kept, None, at)
     }
 
     /// `fire_guests`, with each device group's last stage left in flight
@@ -959,18 +958,15 @@ impl Plane {
     /// can read them where they are. Every pass still in flight lands
     /// before this one binds its roots.
     #[allow(clippy::too_many_lines)]
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn fire_guests_with(
         &mut self,
         device: &crate::device::Device,
         attachments: &[(InstanceId, u32)],
         kept: Option<&crate::readout::Kept>,
-        vocab: u32,
-        mtp_width: u32,
         latch: Option<&Arc<Latch>>,
         point: Stage,
     ) -> Result<Vec<bool>, Refusal> {
-        use crate::guest::run::{Member, OnDevice, step_group, step_group_deferred};
+        use crate::guest::run::{Member, OnDevice, bound, step_group, step_group_deferred};
         self.flights.wait_all();
         for &(instance, _) in attachments {
             if let Some(seat) = self.instances.get_mut(&instance)
@@ -990,26 +986,12 @@ impl Plane {
                 what: "instance",
                 id: instance.0,
             })?;
-            let lanes = self.embed_indptr(seat).len().saturating_sub(1).max(1);
-            let at = kept.and_then(|k| k.seat(lane as usize, lanes));
             let form = self.forms.get(seat.program).map(|c| c.key);
             if let Some(c) = self.forms.get(seat.program) {
                 carried_of.insert(c.key, c.carried.clone());
             }
-            let binds = seat.plan.package.values.iter().all(|v| {
-                v.source != eta_compiler::codegen::launch::ValueOrigin::Intrinsic
-                    || match v.intrinsic {
-                        Some(eta_ir::op::IntrinsicId::Logits) => {
-                            kept.is_some_and(|k| k.f32) && at.is_some()
-                        }
-                        Some(
-                            eta_ir::op::IntrinsicId::MtpLogits | eta_ir::op::IntrinsicId::MtpDrafts,
-                        ) => kept.is_some_and(|k| k.f32 && k.mtp.is_some()) && at.is_some(),
-                        _ => false,
-                    }
-            });
-            plans.push(match form {
-                Some(key) if binds => Some((Arc::clone(&seat.plan), key, at)),
+            plans.push(match (form, bound(&seat.plan, kept, lane)) {
+                (Some(key), Some(bound)) => Some((Arc::clone(&seat.plan), key, bound)),
                 _ => None,
             });
         }
@@ -1040,13 +1022,13 @@ impl Plane {
         if shared {
             self.flush_carry(std::mem::take(&mut carry));
             for (at, &(instance, _)) in attachments.iter().enumerate() {
-                let Some((plan, key, seat)) = plans[at].clone() else {
+                let Some((plan, key, bound)) = plans[at].clone() else {
                     continue;
                 };
                 let Some(held) = self.instances.get_mut(&instance) else {
                     continue;
                 };
-                let mut runner = OnDevice::new(device, &mut self.stages, key, kept, seat);
+                let mut runner = OnDevice::new(device, &mut self.stages, key, kept, bound);
                 let outcome = eta_exec::step_with(
                     &mut held.inst,
                     &plan,
@@ -1058,18 +1040,27 @@ impl Plane {
                 note(outcome, instance, held.program);
             }
         } else {
-            // Group by program content, in order of first appearance.
-            let mut groups: Vec<([u8; 32], Arc<ExecPlan>, Vec<usize>)> = Vec::new();
+            // Group by program content and the planes read, in order of
+            // first appearance.
+            type Planes = Vec<(String, u32, usize)>;
+            type Group = ([u8; 32], Planes, Arc<ExecPlan>, Vec<usize>);
+            let planes_of = |bound: &[crate::guest::run::Bound]| -> Planes {
+                (bound.iter())
+                    .map(|b| (b.name.clone(), b.lane, b.plane))
+                    .collect()
+            };
+            let mut groups: Vec<Group> = Vec::new();
             for (at, planned) in plans.iter().enumerate() {
-                let Some((plan, key, _)) = planned else {
+                let Some((plan, key, bound)) = planned else {
                     continue;
                 };
-                match groups.iter_mut().find(|(k, _, _)| k == key) {
-                    Some((_, _, members)) => members.push(at),
-                    None => groups.push((*key, Arc::clone(plan), vec![at])),
+                let planes = planes_of(bound);
+                match (groups.iter_mut()).find(|(k, p, _, _)| k == key && *p == planes) {
+                    Some((_, _, _, members)) => members.push(at),
+                    None => groups.push((*key, planes, Arc::clone(plan), vec![at])),
                 }
             }
-            for (key, plan, members) in groups {
+            for (key, _, plan, members) in groups {
                 let wanted: BTreeMap<InstanceId, usize> =
                     members.iter().map(|&at| (attachments[at].0, at)).collect();
                 let ids: Vec<InstanceId> = wanted.keys().copied().collect();
@@ -1091,7 +1082,7 @@ impl Plane {
                     order.push((at, id, held.program));
                     group.push(Member {
                         inst: &mut held.inst,
-                        seat: plans[at].as_ref().and_then(|p| p.2),
+                        bound: plans[at].as_ref().map(|p| p.2.clone()).unwrap_or_default(),
                     });
                 }
                 let (outcomes, cells, deferred) = if latch.is_some() {
@@ -1149,31 +1140,16 @@ impl Plane {
             if ran[at] {
                 continue;
             }
-            let lanes = self.instances.get(&instance).map_or(1, |seat| {
-                self.embed_indptr(seat).len().saturating_sub(1).max(1)
-            });
-            let (rows, drafts) = match kept {
-                Some(kept) => {
-                    let mut rows = Vec::new();
-                    let mut drafts = Vec::new();
-                    for l in lane as usize..(lane as usize + lanes).min(kept.layout.len()) {
-                        rows.extend(kept.lane_rows(l).map_err(Refusal::Program)?);
-                        drafts.extend(kept.lane_drafts(l).map_err(Refusal::Program)?);
+            let mut outputs: Vec<(String, u32, Value)> = Vec::new();
+            if let (Some(kept), Some(seat)) = (kept, self.instances.get(&instance)) {
+                for (name, k) in seat.plan.outputs() {
+                    let read = kept.lane_value(lane as usize + k as usize, name);
+                    if let Some(value) = read.map_err(Refusal::Program)? {
+                        outputs.push((name.to_string(), k, value));
                     }
-                    (rows, drafts)
                 }
-                None => (Vec::new(), Vec::new()),
-            };
-            let count = (rows.len() / vocab.max(1) as usize) as u32;
-            let outcome = self.fire_interpreted(
-                instance,
-                (!rows.is_empty()).then_some(rows.as_slice()),
-                count,
-                vocab,
-                (!drafts.is_empty()).then_some(drafts.as_slice()),
-                mtp_width,
-                point,
-            );
+            }
+            let outcome = self.fire_interpreted(instance, &outputs, point);
             if let Err(why) = outcome {
                 first_error.get_or_insert(why);
             }
@@ -1222,40 +1198,20 @@ impl Plane {
             .is_some_and(|seat| seat.plan.prologue_runs())
     }
 
+    /// One pass of `instance` in the interpreter, its outputs read as
+    /// `outputs` (name, the pass's lane, value).
     #[doc(hidden)]
-    #[allow(clippy::too_many_arguments)]
     pub fn fire_interpreted(
         &mut self,
         instance: InstanceId,
-        logits: Option<&[f32]>,
-        rows: u32,
-        vocab: u32,
-        mtp_logits: Option<&[f32]>,
-        mtp_width: u32,
+        outputs: &[(String, u32, Value)],
         at: Stage,
     ) -> Result<(), Refusal> {
         let seat = self.instances.get_mut(&instance).ok_or(Refusal::Closed {
             what: "instance",
             id: instance.0,
         })?;
-        if let Some(values) = mtp_logits
-            && mtp_width != vocab
-        {
-            return Err(Refusal::Program(format!(
-                "instance {instance} reads a draft column {mtp_width} wide against a \
-                 {vocab}-wide trunk readout ({} draft values); this shell reads both at \
-                 one pitch",
-                values.len()
-            )));
-        }
-        let inputs = PassInputs {
-            logits,
-            mtp_logits,
-            rows,
-            vocab,
-            mtp_draft_row: mtp_logits.map(|_| 0),
-            attn_score: None,
-        };
+        let inputs = PassInputs { outputs };
         let outcome =
             eta_exec::step_with(&mut seat.inst, &seat.plan, &inputs, &mut Interpreted, at);
         self.tally.interpreted.fetch_add(1, Ordering::AcqRel);

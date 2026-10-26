@@ -11,13 +11,13 @@
 use std::collections::BTreeMap;
 
 use engine_cerebras::device::{Buffer, Device, Platform};
-use engine_cerebras::guest::run::{OnDevice, Stages};
-use engine_cerebras::readout::{Kept, Seat};
+use engine_cerebras::guest::run::{Bound, OnDevice, Stages};
+use engine_cerebras::readout::{Kept, Plane, Seat};
 use engine_cerebras::sdk::Target;
 use eta_compiler::plan::compile_bound;
 use eta_exec::{ExecPlan, InterpInstance, PassInputs, StepOutcome, Value};
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::Op;
 use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype, Literal, Predicate, RngKind, Shape};
 
@@ -76,7 +76,7 @@ impl Program {
 
     fn container(self) -> TraceContainer {
         TraceContainer {
-            names: Vec::new(),
+            names: vec!["logits".to_string()],
             channels: self.channels,
             ports: Vec::new(),
             stages: vec![StageProgram {
@@ -125,21 +125,16 @@ fn host(
     plan: &ExecPlan,
     seeds: &[(u32, Value)],
     logits: &[f32],
-    rows: u32,
+    _rows: u32,
     channels: &[u32],
 ) -> Vec<Value> {
     let mut inst = instance(plan, seeds);
-    let vocab = if rows == 0 {
-        0
+    let outputs: Vec<(String, u32, Value)> = if logits.is_empty() {
+        Vec::new()
     } else {
-        (logits.len() / rows as usize) as u32
+        vec![("logits".to_string(), 0, Value::F32(logits.to_vec()))]
     };
-    let inputs = PassInputs {
-        logits: (!logits.is_empty()).then_some(logits),
-        rows,
-        vocab,
-        ..PassInputs::none()
-    };
+    let inputs = PassInputs { outputs: &outputs };
     let outcome = eta_exec::step(&mut inst, plan, &inputs);
     assert_eq!(outcome, StepOutcome::Committed, "the interpreter commits");
     take_all(plan, &inst, channels)
@@ -165,7 +160,48 @@ fn kept_plane(plane: &[f32], rows: u32, layout: Vec<(u32, u32)>) -> Kept {
     let width = plane.len() as u32 / rows.max(1);
     let words: Vec<u32> = plane.iter().map(|x| x.to_bits()).collect();
     let buffer = Buffer::new(dtype::Dtype::F32, rows, width, words).expect("an f32 plane");
-    Kept::new(buffer, rows, width, None, layout)
+    Kept {
+        planes: vec![Plane {
+            name: "logits".to_string(),
+            axis: poem_ir::InputAxis::Row,
+            readout: true,
+            buffer,
+            rows,
+            width,
+            layers: 0,
+            dtype: dtype::Dtype::F32,
+        }],
+        seats: (layout.iter())
+            .map(|&(first, count)| vec![Some(Seat { first, count })])
+            .collect(),
+        readback: vec![None; layout.len()],
+        pixels: (String::new(), Vec::new()),
+    }
+}
+
+/// Where lane `lane`'s pass reads its logits in `kept`.
+fn bound(kept: &Kept, lane: usize) -> Vec<Bound> {
+    (kept.bound(lane, "logits").into_iter())
+        .map(|(plane, seat)| Bound {
+            name: "logits".to_string(),
+            lane: 0,
+            plane,
+            seat,
+        })
+        .collect()
+}
+
+/// The read of a `vocab`-wide logits plane the host cuts rows from.
+fn logits_read(vocab: Option<u32>) -> Vec<engine_cerebras::guest::lower::Read> {
+    (vocab.into_iter())
+        .map(|width| engine_cerebras::guest::lower::Read {
+            name: "logits".to_string(),
+            lane: 0,
+            layers: 0,
+            width,
+            dtype: Dtype::F32,
+        })
+        .collect()
 }
 
 /// PEs a lane spreads over when a case asks for a spread other than the
@@ -176,14 +212,14 @@ fn spread_over(cols: u32) {
     FORCE_COLS.store(cols, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The device's answer for one lane seated at `seat` of `kept`.
+/// The device's answer for one lane reading its outputs where `bound` says.
 fn on_device(
     device: &Device,
     stages: &mut Stages,
     plan: &ExecPlan,
     seeds: &[(u32, Value)],
     kept: Option<&Kept>,
-    seat: Option<Seat>,
+    bound: Vec<Bound>,
     channels: &[u32],
 ) -> Vec<Value> {
     use engine_cerebras::guest::run::{Unfit, columns_above, columns_of, prepare};
@@ -195,7 +231,16 @@ fn on_device(
     // As the engine does: a stage the linker finds too big widens the
     // spread by a quarter and tries again.
     loop {
-        match prepare(device, stages, &plan.package, key_of(plan), cols, 1, kept) {
+        match prepare(
+            device,
+            stages,
+            &plan.package,
+            key_of(plan),
+            cols,
+            1,
+            kept,
+            &bound,
+        ) {
             Ok(()) => break,
             Err(Unfit::Memory(why)) => {
                 let wider = columns_above(&plan.package, cols + cols / 4)
@@ -206,7 +251,7 @@ fn on_device(
             Err(Unfit::Other(why)) => panic!("the stages do not compile: {why}"),
         }
     }
-    let mut runner = OnDevice::new(device, stages, key_of(plan), cols, kept, seat);
+    let mut runner = OnDevice::new(device, stages, key_of(plan), cols, kept, bound);
     let outcome = eta_exec::step_with(
         &mut inst,
         plan,
@@ -283,8 +328,8 @@ fn statistics(vocab: u32) -> (TraceContainer, Vec<u32>) {
         shape: Shape::new(&[]).unwrap(),
     });
     let (_, index) = p.input(Shape::vector(ROWS), Dtype::I32);
-    let logits = p.op(Op::IntrinsicVal {
-        intr: IntrinsicId::Logits,
+    let logits = p.op(Op::Output {
+        index: 0,
         lane: 0,
         shape: Shape::matrix(ROWS, vocab),
         dtype: Dtype::F32,
@@ -351,8 +396,8 @@ fn sampler(vocab: u32) -> (TraceContainer, Vec<u32>, [u32; 5]) {
     let (c_present, present) = p.input(v, Dtype::F32);
     let (c_mask, mask) = p.input(v, Dtype::Bool);
     let (c_words, words) = p.input(Shape::vector(vocab.div_ceil(32)), Dtype::U32);
-    let raw = p.op(Op::IntrinsicVal {
-        intr: IntrinsicId::Logits,
+    let raw = p.op(Op::Output {
+        index: 0,
         lane: 0,
         shape: Shape::matrix(1, vocab),
         dtype: Dtype::F32,
@@ -524,8 +569,8 @@ fn rowwise(rows: u32, vocab: u32) -> (TraceContainer, Vec<u32>) {
     let (_, k) = p.input(Shape::vector(rows), Dtype::I32);
     let (_, top_p) = p.input(Shape::vector(rows), Dtype::F32);
     let (_, floor) = p.input(Shape::vector(rows), Dtype::F32);
-    let logits = p.op(Op::IntrinsicVal {
-        intr: IntrinsicId::Logits,
+    let logits = p.op(Op::Output {
+        index: 0,
         lane: 0,
         shape: grid,
         dtype: Dtype::F32,
@@ -585,8 +630,8 @@ fn pivot_only(rows: u32, vocab: u32, which: u8) -> (TraceContainer, Vec<u32>) {
     let mut p = Program::new();
     let (_, k) = p.input(Shape::vector(rows), Dtype::I32);
     let (_, top_p) = p.input(Shape::vector(rows), Dtype::F32);
-    let logits = p.op(Op::IntrinsicVal {
-        intr: IntrinsicId::Logits,
+    let logits = p.op(Op::Output {
+        index: 0,
         lane: 0,
         shape: grid,
         dtype: Dtype::F32,
@@ -652,7 +697,7 @@ fn the_pivot_agrees(device: &Device, stages: &mut Stages, rows: u32, vocab: u32,
         &plan,
         &seeds,
         Some(&kept),
-        kept.seat(0, 1),
+        bound(&kept, 0),
         &outs,
     );
     close(&got[1], &want[1], 1e-4, "the row sums");
@@ -1114,8 +1159,7 @@ fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
                             Batch {
                                 lanes: 1,
                                 cols,
-                                logits,
-                                mtp: None,
+                                reads: logits_read(logits),
                             },
                         ) {
                             Ok(l) => l.words.to_string(),
@@ -1141,8 +1185,9 @@ fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
                             1,
                             cols,
                             Some(&kept),
+                            &bound(&kept, 0),
                         );
-                        let got = lower(&plan.package, at, batch)
+                        let got = lower(&plan.package, at, batch.clone())
                             .map(|l| l.words)
                             .map_err(|w| w.0);
                         eprintln!("  prepare-like stage {at} batch {batch:?}: {got:?}");
@@ -1169,8 +1214,7 @@ fn an_epilogue_agrees_with_the_host_interpreter_every_case() {
                         Batch {
                             lanes: 1,
                             cols: *cols,
-                            logits: None,
-                            mtp: None,
+                            reads: Vec::new(),
                         },
                     ) {
                         Ok(l) => l.words.to_string(),
@@ -1302,7 +1346,7 @@ fn the_statistics_agree(device: &Device, stages: &mut Stages, vocab: u32) {
     let mut shared = logits_plane(2, vocab, 99);
     shared.extend_from_slice(&plane);
     let kept = kept(device, &shared, ROWS + 2, vec![(0, 2), (2, ROWS)]);
-    let seat = kept.seat(1, 1);
+    let seat = bound(&kept, 1);
     let got = on_device(device, stages, &plan, &seeds, Some(&kept), seat, &outs);
     close(&got[0], &want[0], 1e-5, "gather_row of the scaled logits");
     exact(&got[1], &want[1], "argmax per row");
@@ -1332,7 +1376,7 @@ fn the_acceptance_rule_agrees(device: &Device, stages: &mut Stages) {
         ),
     ];
     let want = host(&plan, &seeds, &[], 0, &outs);
-    let got = on_device(device, stages, &plan, &seeds, None, None, &outs);
+    let got = on_device(device, stages, &plan, &seeds, None, Vec::new(), &outs);
     for i in 0..5 {
         exact(&got[i], &want[i], &format!("acceptance output {i}"));
     }
@@ -1344,7 +1388,7 @@ fn the_corners_agree(device: &Device, stages: &mut Stages) {
     let plan = plan_of(container, VOCAB);
     let seeds = corner_seeds();
     let want = host(&plan, &seeds, &[], 0, &outs);
-    let got = on_device(device, stages, &plan, &seeds, None, None, &outs);
+    let got = on_device(device, stages, &plan, &seeds, None, Vec::new(), &outs);
     let mut floats = 0;
     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
         match w {
@@ -1382,7 +1426,7 @@ fn the_sampler_agrees(device: &Device, stages: &mut Stages, vocab: u32) {
             &plan,
             &seeds,
             Some(&kept),
-            kept.seat(0, 1),
+            bound(&kept, 0),
             &outs,
         );
         exact(&got[0], &want[0], "the sampled token");
@@ -1415,7 +1459,7 @@ fn the_rowwise_sampler_agrees(device: &Device, stages: &mut Stages, vocab: u32) 
         &plan,
         &seeds,
         Some(&kept),
-        kept.seat(0, 1),
+        bound(&kept, 0),
         &outs,
     );
     exact(&got[0], &want[0], "the sampled tokens");
@@ -1443,9 +1487,9 @@ fn the_qwen_sampler_compiles() {
     let mut stages = Stages::default();
     let t0 = std::time::Instant::now();
     for at in 0..plan.package.stages.len() {
-        let batch = engine_cerebras::guest::run::batch_of(&plan.package, at, 1, cols, None);
+        let batch = engine_cerebras::guest::run::batch_of(&plan.package, at, 1, cols, None, &[]);
         let batch = engine_cerebras::guest::lower::Batch {
-            logits: Some(vocab),
+            reads: logits_read(Some(vocab)),
             ..batch
         };
         let staged = stages
@@ -1488,8 +1532,7 @@ fn footprints_of_the_programs() {
             let batch = Batch {
                 lanes: 1,
                 cols,
-                logits: None,
-                mtp: None,
+                reads: Vec::new(),
             };
             match lower(&plan.package, 0, batch) {
                 Ok(l) => {
@@ -1555,7 +1598,15 @@ impl eta_exec::StageRunner for Lockstep<'_> {
         self.shared.vals.lock().unwrap()[self.me] = vals.to_vec();
         self.shared.barrier.wait();
         if self.me == 0 {
-            let batch = batch_of(&plan.package, at, lanes as u32, self.cols, Some(self.kept));
+            let bounds: Vec<Vec<Bound>> = (0..lanes).map(|l| bound(self.kept, l)).collect();
+            let batch = batch_of(
+                &plan.package,
+                at,
+                lanes as u32,
+                self.cols,
+                Some(self.kept),
+                &bounds[0],
+            );
             let mut stages = self.shared.stages.lock().unwrap();
             let staged = stages
                 .get(self.shared.device, &plan.package, self.key, at, batch)
@@ -1565,7 +1616,7 @@ impl eta_exec::StageRunner for Lockstep<'_> {
             let feedings: Vec<Feeding<'_>> = (0..lanes)
                 .map(|l| Feeding {
                     vals: &all[l],
-                    seat: self.kept.seat(l, 1),
+                    bound: &bounds[l],
                 })
                 .collect();
             let outs = run_stage(self.shared.device, &staged, Some(self.kept), &feedings)
@@ -1583,8 +1634,8 @@ impl eta_exec::StageRunner for Lockstep<'_> {
         Ok(())
     }
 
-    fn binds(&self, id: Option<IntrinsicId>) -> bool {
-        engine_cerebras::guest::run::device_binds(id, Some(self.kept), self.kept.seat(self.me, 1))
+    fn binds(&self, root: &eta_compiler::codegen::launch::LaunchValue) -> bool {
+        engine_cerebras::guest::run::device_binds(root, Some(self.kept), &bound(self.kept, self.me))
     }
 }
 
@@ -1683,16 +1734,14 @@ fn bind_logits(
 ) -> Result<eta_ir::validate::BoundTrace, eta_ir::validate::ValidateError> {
     eta_ir::validate::bind(
         container,
-        vec![Some(eta_ir::registry::Readout {
-            kind: eta_ir::registry::ReadoutKind::Logits,
+        vec![vec![eta_ir::registry::OutputDecl {
+            name: "logits".to_string(),
+            axis: eta_ir::registry::Axis::Row,
             width: vocab,
-        })],
-        eta_ir::registry::Graph {
-            num_layers: 2,
-            mtp_logits: true,
-            mtp_depth: 1,
-            attn_score: true,
-        },
+            dtype: eta_ir::types::Dtype::F32,
+            layers: 0,
+            readout: true,
+        }]],
         eta_ir::registry::EngineCaps {
             lora: true,
             attn_page_mask: true,

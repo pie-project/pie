@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use eta_ir::op::IntrinsicId;
 use eta_ir::registry::Stage;
 use eta_ir::validate::Direction;
 
@@ -14,30 +13,14 @@ use crate::{Error, Result, shape_numel};
 
 #[derive(Clone, Copy, Debug)]
 pub struct PassInputs<'a> {
-    pub logits: Option<&'a [f32]>,
-
-    pub mtp_logits: Option<&'a [f32]>,
-
-    pub rows: u32,
-
-    pub vocab: u32,
-
-    pub mtp_draft_row: Option<u32>,
-
-    pub attn_score: Option<&'a [f32]>,
+    /// What each output reads as, by its name and the lane reading it.
+    pub outputs: &'a [(String, u32, Value)],
 }
 
 impl PassInputs<'_> {
     #[must_use]
     pub fn none() -> Self {
-        PassInputs {
-            logits: None,
-            mtp_logits: None,
-            rows: 0,
-            vocab: 0,
-            mtp_draft_row: None,
-            attn_score: None,
-        }
+        PassInputs { outputs: &[] }
     }
 }
 
@@ -80,91 +63,22 @@ impl Overlay {
     }
 }
 
-fn bind_intrinsic(
-    root_intr: Option<IntrinsicId>,
-    root_numel: u64,
-    inputs: &PassInputs,
-) -> Result<Value> {
-    if root_intr == Some(IntrinsicId::AttnScore) {
-        let Some(scores) = inputs.attn_score else {
-            return Err(Error {
-                message: "attn_score intrinsic unbound (no lane of this fire captured scores)"
-                    .to_owned(),
-            });
-        };
-        let want = root_numel.max(1) as usize;
-        if scores.len() < want {
-            return Err(Error {
-                message: "attn_score intrinsic declares more planes than this load exports"
-                    .to_owned(),
-            });
-        }
-        return Ok(Value::F32(scores[..want].to_vec()));
-    }
-    let bounded = matches!(
-        root_intr,
-        Some(IntrinsicId::Logits | IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts)
-    );
-    if !bounded {
-        return Err(Error {
-            message: "unresolved value root (unsupported intrinsic) reached execution".to_owned(),
-        });
-    }
-    let drafts_column = matches!(
-        root_intr,
-        Some(IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts)
-    );
-    let own = drafts_column && inputs.mtp_logits.is_some();
-    let Some(logits) = (if own {
-        inputs.mtp_logits
-    } else {
-        inputs.logits
-    }) else {
-        return Err(Error {
-            message: "logits intrinsic unbound (forward did not run before step)".to_owned(),
-        });
+/// The first `numel` values lane `lane` reads of output `name`.
+fn bind_output(root: &LaunchValue, inputs: &PassInputs) -> Result<Value> {
+    let name = root.output.as_deref().unwrap_or("");
+    let unbound = |why: &str| Error {
+        message: format!("output `{name}` of lane {}: {why}", root.lane),
     };
-    if inputs.vocab == 0 {
-        return Err(Error {
-            message: "logits intrinsic unbound (forward did not run before step)".to_owned(),
-        });
-    }
-    let want = root_numel.max(1);
-    let vocab = u64::from(inputs.vocab);
-    let drafts = root_intr == Some(IntrinsicId::MtpDrafts);
-    let rows_needed = if drafts { want } else { want / vocab };
-    if !drafts && !want.is_multiple_of(vocab) {
-        return Err(Error {
-            message: "logits intrinsic shape mismatch (program vocab != model vocab)".to_owned(),
-        });
-    }
-    let base_row = if drafts_column {
-        u64::from(inputs.mtp_draft_row.unwrap_or(0))
-    } else {
-        0
-    };
-    let held_rows = if own {
-        (logits.len() as u64) / vocab.max(1)
-    } else {
-        u64::from(inputs.rows)
-    };
-    if base_row + rows_needed > held_rows {
-        return Err(Error {
-            message: "logits intrinsic row range exceeds the forward's readout rows".to_owned(),
-        });
-    }
-    if drafts {
-        let tokens: Vec<i32> = (0..want)
-            .map(|row| {
-                let start = ((base_row + row) * vocab) as usize;
-                let slice = &logits[start..start + vocab as usize];
-                super::op::argmax_row(slice)
-            })
-            .collect();
-        Ok(Value::I32(tokens))
-    } else {
-        let start = (base_row * vocab) as usize;
-        Ok(Value::F32(logits[start..start + want as usize].to_vec()))
+    let (_, _, value) = inputs
+        .outputs
+        .iter()
+        .find(|(named, lane, _)| named == name && *lane == root.lane)
+        .ok_or_else(|| unbound("unbound"))?;
+    let want = shape_numel(&root.shape).max(1) as usize;
+    match value {
+        Value::F32(values) if values.len() >= want => Ok(Value::F32(values[..want].to_vec())),
+        Value::I32(values) if values.len() >= want => Ok(Value::I32(values[..want].to_vec())),
+        _ => Err(unbound("holds fewer values than the program reads")),
     }
 }
 
@@ -178,7 +92,8 @@ pub trait StageRunner {
         vals: &mut [Value],
     ) -> Result<()>;
 
-    fn binds(&self, _id: Option<IntrinsicId>) -> bool {
+    /// Whether the runner binds the output `root` reads itself.
+    fn binds(&self, _root: &LaunchValue) -> bool {
         false
     }
 
@@ -230,7 +145,7 @@ fn exec_stage(
         vals,
         &|root| match root.source {
             ValueOrigin::ChannelTake => runner.keeps(root.channel),
-            ValueOrigin::Intrinsic => runner.binds(root.intrinsic),
+            ValueOrigin::Output => runner.binds(root),
             _ => false,
         },
     )?;
@@ -266,13 +181,11 @@ fn prepare_stage(
             }
             ValueOrigin::ChannelTake => overlay.take(inst, root.channel),
             ValueOrigin::ChannelRead => overlay.resolve(inst, root.channel),
-            ValueOrigin::Intrinsic if held(root) => Value::F32(Vec::new()),
-            ValueOrigin::Intrinsic => {
-                bind_intrinsic(root.intrinsic, shape_numel(&root.shape), inputs)?
-            }
+            ValueOrigin::Output if held(root) => Value::F32(Vec::new()),
+            ValueOrigin::Output => bind_output(root, inputs)?,
             ValueOrigin::OpResult => {
                 return Err(Error {
-                    message: "unresolved value root (intrinsic/host input) reached execution"
+                    message: "unresolved value root (output/host input) reached execution"
                         .to_owned(),
                 });
             }
@@ -310,8 +223,8 @@ pub trait BatchRunner {
     /// be written). An error faults every lane.
     fn run(&mut self, plan: &ExecPlan, sp: &StagePlan, lanes: &mut [Lane<'_>]) -> Result<()>;
 
-    /// Whether the runner binds intrinsic `id` for lane `lane` itself.
-    fn binds(&self, _lane: usize, _id: Option<IntrinsicId>) -> bool {
+    /// Whether the runner binds the output `root` reads for lane `lane` itself.
+    fn binds(&self, _lane: usize, _root: &LaunchValue) -> bool {
         false
     }
 }
@@ -396,10 +309,7 @@ pub fn step_many(
                     inputs,
                     &mut overlays[l],
                     &mut vals[l],
-                    &|root| {
-                        matches!(root.source, ValueOrigin::Intrinsic)
-                            && runner.binds(l, root.intrinsic)
-                    },
+                    &|root| matches!(root.source, ValueOrigin::Output) && runner.binds(l, root),
                 );
                 if let Err(why) = prepared {
                     fault(&mut outcomes, insts, l, why.to_string());

@@ -1,7 +1,7 @@
 use crate::msl_corpus::{Served, golden_served};
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer, encode};
 use eta_ir::container_hash;
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::Op;
 use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype, Literal, Shape};
 use eta_ir::validate::BoundTrace;
@@ -186,14 +186,14 @@ fn golden_neg_t10_nonreplayable() {
 
 fn golden_neg_intrinsic_wrong_stage() {
     let c = TraceContainer {
-        names: vec![],
+        names: vec!["logits".into()],
         channels: vec![onechan(HostRole::None)],
         ports: vec![],
         stages: vec![StageProgram {
             stage: Stage::Prologue,
             ops: vec![
-                Op::IntrinsicVal {
-                    intr: IntrinsicId::Logits,
+                Op::Output {
+                    index: 0,
                     lane: 0,
                     shape: Shape::matrix(1, 32),
                     dtype: Dtype::F32,
@@ -210,14 +210,14 @@ fn golden_neg_intrinsic_wrong_stage() {
 
 fn golden_neg_model_gated_missing() {
     let c = TraceContainer {
-        names: vec![],
+        names: vec!["mtp.logits".into()],
         channels: vec![onechan(HostRole::Reader)],
         ports: vec![],
         stages: vec![StageProgram {
             stage: Stage::Epilogue,
             ops: vec![
-                Op::IntrinsicVal {
-                    intr: IntrinsicId::MtpLogits,
+                Op::Output {
+                    index: 0,
                     lane: 0,
                     shape: Shape::matrix(4, 32),
                     dtype: Dtype::F32,

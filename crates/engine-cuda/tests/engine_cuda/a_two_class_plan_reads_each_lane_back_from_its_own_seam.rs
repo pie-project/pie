@@ -2,15 +2,14 @@
 
 use crate::common_dit::{Lcg, NAME, Rig, WIDTH, Weights, assert_close, attach, bf, frame, lane};
 use engine::Engine;
-use engine::fire::ReadoutSeam;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::Op;
 use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Trace, Value, Weight, ops,
-    seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Trace, Weight, ops,
+    trace_hybrid,
 };
 use poem_ir::InputAxis;
 
@@ -25,7 +24,7 @@ impl ForwardHybrid for TwoClasses {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         inputs.recorder().declare_switch(
             "stream",
             &["text", "image", "video", "audio", "context", "reference"],
@@ -37,7 +36,7 @@ impl ForwardHybrid for TwoClasses {
         let x_txt = txt.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
         let enc = Weight::sym("enc", [u64::from(HIDDEN), u64::from(WIDTH)], Dtype::Bf16);
         let h = ops::linear::matmul(&x_txt, &enc);
-        seam::at(seam::HIDDEN, &[&h]);
+        poem::output("hidden", &h, None);
         let x_img = img.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
         let t = img.input("timestep", Dtype::F32, InputAxis::Lane, 1, None);
         let emb = ops::elemwise::silu(&ops::elemwise::sinusoid(&t, FREQ, 10_000.0, true, T_SCALE));
@@ -53,8 +52,7 @@ impl ForwardHybrid for TwoClasses {
         );
         let den = Weight::sym("den", [u64::from(WIDTH), u64::from(WIDTH)], Dtype::Bf16);
         let v = ops::linear::matmul(&hm, &den);
-        seam::at(seam::VELOCITY, &[&v]);
-        v
+        poem::output("velocity", &v, None);
     }
 }
 
@@ -122,7 +120,7 @@ fn velocity_reference(weights: &Weights, x: &[f32], rows: usize, timestep: f32) 
     out
 }
 
-fn epilogue(rows: u32, intrinsic: IntrinsicId, width: u32) -> TraceContainer {
+fn epilogue(rows: u32, output: &str, width: u32) -> TraceContainer {
     let decl = |shape: Shape, host_role: HostRole| ChannelDecl {
         shape,
         dtype: ChanDType::Concrete(EtaDtype::F32),
@@ -131,7 +129,7 @@ fn epilogue(rows: u32, intrinsic: IntrinsicId, width: u32) -> TraceContainer {
         seeded: false,
     };
     TraceContainer {
-        names: Vec::new(),
+        names: vec![output.to_string()],
         channels: vec![
             decl(Shape::matrix(rows, WIDTH), HostRole::Writer),
             decl(Shape::matrix(1, 1), HostRole::Writer),
@@ -143,8 +141,8 @@ fn epilogue(rows: u32, intrinsic: IntrinsicId, width: u32) -> TraceContainer {
             stage: Stage::Epilogue,
             ops: vec![
                 Op::ChanTake(0),
-                Op::IntrinsicVal {
-                    intr: intrinsic,
+                Op::Output {
+                    index: 0,
                     lane: 0,
                     shape: Shape::matrix(rows, width),
                     dtype: EtaDtype::F32,
@@ -167,10 +165,10 @@ fn each_lane_reads_back_its_own_arms_seam() {
     let weights = Weights::random(&plan, 37);
     let mut rig = Rig::load_plan(plan, &weights, 64, vec![16, 64]);
     assert!(
-        rig.reads_out(poem_ir::ReadoutKind::Velocity).is_some(),
+        rig.reads_out("velocity").is_some(),
         "the velocity seam is plan-wide"
     );
-    assert_eq!(rig.reads_out(poem_ir::ReadoutKind::Velocity), Some(WIDTH));
+    assert_eq!(rig.reads_out("velocity"), Some(WIDTH));
 
     let w = WIDTH as usize;
     let mut rng = Lcg::seeded(39);
@@ -181,8 +179,8 @@ fn each_lane_reads_back_its_own_arms_seam() {
     let want_hidden = hidden_reference(&weights, &text, text_rows);
     let want_velocity = velocity_reference(&weights, &image, image_rows, timestep);
 
-    let text_program = rig.register(epilogue(text_rows as u32, IntrinsicId::Hidden, HIDDEN), 1);
-    let image_program = rig.register(epilogue(image_rows as u32, IntrinsicId::Velocity, WIDTH), 2);
+    let text_program = rig.register(epilogue(text_rows as u32, "hidden", HIDDEN), 1);
+    let image_program = rig.register(epilogue(image_rows as u32, "velocity", WIDTH), 2);
     let t = rig.lane_of(text_program, text_rows as u32, HIDDEN);
     let i = rig.lane_of(image_program, image_rows as u32, WIDTH);
     rig.publish(t.instance, 0, &text);
@@ -203,14 +201,14 @@ fn each_lane_reads_back_its_own_arms_seam() {
         .settle_frame(&mut ticket)
         .expect("the frame settles");
     let readouts = &ticket.steps[0].readouts;
-    assert_eq!(readouts[0].seam, ReadoutSeam::Hidden);
+    assert_eq!(readouts[0].output, "hidden");
     assert_eq!(readouts[0].width, HIDDEN);
     assert_close(
         &readouts[0].values,
         &want_hidden,
         "text lane: its arm's hidden",
     );
-    assert_eq!(readouts[1].seam, ReadoutSeam::Velocity);
+    assert_eq!(readouts[1].output, "velocity");
     assert_eq!(readouts[1].width, WIDTH);
     assert_close(
         &readouts[1].values,

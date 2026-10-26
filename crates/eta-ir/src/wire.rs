@@ -1,7 +1,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::op::{IntrinsicId, Op, tags};
+use crate::op::{Op, tags};
 use crate::types::{Dtype, Literal, Predicate, RngKind, Shape, ValueId, from_wire, wire_dtype};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -11,7 +11,6 @@ pub struct OpWire {
     pub name_idx: u16,
     pub args: Vec<ValueId>,
     pub results: u32,
-    pub intr: u16,
     pub imm: u32,
     pub imm2: u32,
     pub imm3: u32,
@@ -122,13 +121,13 @@ impl OpWire {
                 wire.chan = i64::from(chan);
                 wire.args = vec![value];
             }
-            Op::IntrinsicVal {
-                intr,
+            Op::Output {
+                index,
                 lane,
                 ref shape,
                 dtype,
             } => {
-                wire.intr = intr as u16;
+                wire.name_idx = index;
                 wire.imm = lane;
                 wire.shape = wire_shape(shape);
                 wire.dtype = wire_dtype(dtype);
@@ -321,8 +320,8 @@ impl OpWire {
                 chan: self.channel()?,
                 value: a0()?,
             },
-            tags::INTRINSIC_VAL => Op::IntrinsicVal {
-                intr: IntrinsicId::from_u16(self.intr)?,
+            tags::OUTPUT => Op::Output {
+                index: self.name_idx,
                 lane: self.imm,
                 shape: self.shape()?,
                 dtype: self.dtype()?,

@@ -32,7 +32,7 @@ async fn append_tokens(ws: &WorkingSet, pipeline: &Pipeline, tokens: &[u32]) -> 
     fwd.embed(&token_input, &embed_indptr)?;
     fwd.state(&[ws], StateGeometry::folding())?;
     fwd.epilogue(move || {
-        next_token.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
+        next_token.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
     });
     fwd.submit(pipeline).context("append shared prefix")?;
     next_token.take_host::<i32>().await
@@ -67,7 +67,7 @@ async fn generate(
     fwd.embed(&token_in, &embed_indptr)?;
     fwd.state(&[ws], StateGeometry::folding())?;
     fwd.epilogue(move || {
-        let token = reshape(reduce_argmax(intrinsics::logits()), [1]);
+        let token = reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]);
         token_in.put(&token);
         token_out.put(&token);
     });

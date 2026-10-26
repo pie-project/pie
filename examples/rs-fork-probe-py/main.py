@@ -37,7 +37,7 @@ async def append_tokens(ws: WorkingSet, pipeline: Pipeline, tokens: list[int]) -
 
     @fwd.epilogue
     def _():
-        next_token.put(reshape(reduce_argmax(intrinsics.logits()), [1]))
+        next_token.put(reshape(reduce_argmax(intrinsics.output(0, "logits")), [1]))
 
     pipeline.submit(fwd)
     return await next_token.take_scalar()
@@ -63,7 +63,7 @@ async def generate(ws: WorkingSet, pipeline: Pipeline, first_token: int, max_tok
 
     @fwd.epilogue
     def _():
-        token = reshape(reduce_argmax(intrinsics.logits()), [1])
+        token = reshape(reduce_argmax(intrinsics.output(0, "logits")), [1])
         token_in.put(token)
         token_out.put(token)
 

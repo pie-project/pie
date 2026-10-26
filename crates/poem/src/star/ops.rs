@@ -982,8 +982,6 @@ pub(crate) static OPS: &[Op] = &[
             "sinks",
             "causal",
             "mask",
-            "scores",
-            "scores_seam",
             "selection",
             "ratio",
             "per_head",
@@ -1000,8 +998,6 @@ pub(crate) static OPS: &[Op] = &[
             let sinks: Option<Weight> = a.next()?;
             let causal: Option<Predicate> = a.next()?;
             let mask: Option<bool> = a.next()?;
-            let scores: Option<bool> = a.next()?;
-            let scores_seam: Option<bool> = a.next()?;
             let selection: Option<Value> = a.next()?;
             let ratio: Option<u32> = a.next()?;
             let per_head: Option<bool> = a.next()?;
@@ -1020,11 +1016,35 @@ pub(crate) static OPS: &[Op] = &[
                         sinks.as_ref(),
                         causal.as_ref(),
                         mask.unwrap_or(false),
-                        scores.unwrap_or(false),
-                        scores_seam,
                         selection.as_ref(),
                         ratio,
                         per_head.unwrap_or(false),
+                    )
+                })?,
+            )
+        },
+    },
+    Op {
+        module: "attn",
+        name: "score_capture",
+        params: &[
+            "q", "inputs", "kv", "q_heads", "kv_heads", "head_dim", "sm_scale", "observe", "kv_max",
+        ],
+        call: |a, heap| {
+            let q: Value = a.next()?;
+            let inputs: Input = a.next()?;
+            let kv: String = a.next()?;
+            let q_heads: u32 = a.next()?;
+            let kv_heads: u32 = a.next()?;
+            let head_dim: u32 = a.next()?;
+            let sm_scale: f32 = a.next()?;
+            let observe: u32 = a.next()?;
+            let kv_max: u32 = a.next()?;
+            result(
+                heap,
+                dsl("attn.score_capture", || {
+                    ops::attn::score_capture(
+                        &q, &inputs, &kv, q_heads, kv_heads, head_dim, sm_scale, observe, kv_max,
                     )
                 })?,
             )
@@ -1980,6 +2000,15 @@ pub(crate) static OPS: &[Op] = &[
     },
     Op {
         module: "elemwise",
+        name: "sqrt",
+        params: &["x"],
+        call: |a, heap| {
+            let x: Value = a.next()?;
+            result(heap, dsl("elemwise.sqrt", || ops::elemwise::sqrt(&x))?)
+        },
+    },
+    Op {
+        module: "elemwise",
         name: "hadamard",
         params: &["x", "block", "signs"],
         call: |a, heap| {
@@ -2063,15 +2092,6 @@ pub(crate) static OPS: &[Op] = &[
             let x: Value = a.next()?;
             let y: Value = a.next()?;
             result(heap, dsl("elemwise.mod", || ops::elemwise::mod_(&x, &y))?)
-        },
-    },
-    Op {
-        module: "elemwise",
-        name: "sqrt",
-        params: &["x"],
-        call: |a, heap| {
-            let x: Value = a.next()?;
-            result(heap, dsl("elemwise.sqrt", || ops::elemwise::sqrt(&x))?)
         },
     },
     Op {

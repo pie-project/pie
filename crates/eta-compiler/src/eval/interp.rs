@@ -13,7 +13,6 @@ use alloc::vec::Vec;
 use std::sync::{Arc, Mutex};
 
 use eta_ir::container::{HostRole, PortSource};
-use eta_ir::op::IntrinsicId;
 use eta_ir::registry::{Phase, Port, Stage};
 use eta_ir::types::{Dtype, Shape, ValueId, ValueType};
 use eta_ir::validate::{BoundTrace, Direction};
@@ -145,7 +144,7 @@ pub enum HostError {
 pub enum StepError {
     Poisoned,
     KernelFault { name: String, message: String },
-    MissingIntrinsic(IntrinsicId),
+    MissingOutput { name: String, lane: u32 },
     Fault(String),
 }
 
@@ -177,8 +176,8 @@ impl core::fmt::Display for StepError {
             StepError::KernelFault { name, message } => {
                 write!(f, "kernel {name} fault: {message}")
             }
-            StepError::MissingIntrinsic(intrinsic) => {
-                write!(f, "missing intrinsic {}", intrinsic.name())
+            StepError::MissingOutput { name, lane } => {
+                write!(f, "missing output `{name}` of lane {lane}")
             }
             StepError::Fault(message) => f.write_str(message),
         }
@@ -191,7 +190,6 @@ impl std::error::Error for StepError {}
 pub struct SinkRecord {
     pub name: String,
     pub stage: Stage,
-    pub layer: u32,
     pub args: Vec<Value>,
 }
 
@@ -205,15 +203,18 @@ pub struct StepReport {
 
 #[derive(Clone, Debug, Default)]
 pub struct PassInputs {
-    pub logits: Option<Value>,
-    pub mtp_logits: Option<Value>,
-    pub mtp_drafts: Option<Value>,
-    /// Per lane of the pass.
-    pub hidden: Vec<Value>,
-    pub velocity: Vec<Value>,
-    pub pixels: Vec<Value>,
-    pub query: Vec<Value>,
-    pub attn_score: Option<Value>,
+    /// What each output reads as, by its name and the lane reading it.
+    pub outputs: Vec<(String, u32, Value)>,
+}
+
+impl PassInputs {
+    #[must_use]
+    pub fn output(&self, name: &str, lane: u32) -> Option<&Value> {
+        self.outputs
+            .iter()
+            .find(|(named, read_by, _)| named == name && *read_by == lane)
+            .map(|(_, _, value)| value)
+    }
 }
 
 pub trait KernelHost {
@@ -431,7 +432,7 @@ impl Instance {
         };
         let mut descriptor = Vec::new();
 
-        exec_body(self, bound, &mut effects, Stage::Prologue, 0, inputs, host)?;
+        exec_body(self, bound, &mut effects, Stage::Prologue, inputs, host)?;
 
         for p in &bound.container.ports {
             let v = match &p.source {
@@ -447,25 +448,7 @@ impl Instance {
             descriptor.push((p.port, v));
         }
 
-        let taps: Vec<Stage> = Stage::ALL
-            .iter()
-            .copied()
-            .filter(|s| s.per_layer())
-            .collect();
-        if bound
-            .container
-            .stages
-            .iter()
-            .any(|s| taps.contains(&s.stage))
-        {
-            for l in 0..bound.graph.num_layers {
-                for &stage in &taps {
-                    exec_body(self, bound, &mut effects, stage, l, inputs, host)?;
-                }
-            }
-        }
-
-        exec_body(self, bound, &mut effects, Stage::Epilogue, 0, inputs, host)?;
+        exec_body(self, bound, &mut effects, Stage::Epilogue, inputs, host)?;
 
         let committed = missed.is_none();
         if committed {
@@ -583,7 +566,6 @@ fn exec_body(
     bound: &BoundTrace,
     effects: &mut PassEffects,
     stage: Stage,
-    layer: u32,
     inputs: &PassInputs,
     host: &mut dyn KernelHost,
 ) -> Result<(), StepError> {
@@ -597,7 +579,7 @@ fn exec_body(
     let mut next_id: u32 = 0;
     for op in ops {
         let ty_of = |id: ValueId| types[id as usize];
-        match eval_op(op, &vals, &ty_of, inputs, layer)? {
+        match eval_op(op, &vals, &ty_of, inputs, &bound.container.names)? {
             Evaled::One(v) => vals.push(v),
             Evaled::Two(a, b) => {
                 vals.push(a);
@@ -613,7 +595,6 @@ fn exec_body(
                 sinks.push(SinkRecord {
                     name: bound.container.names[name as usize].clone(),
                     stage,
-                    layer,
                     args: vs,
                 });
             }

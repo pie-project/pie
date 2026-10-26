@@ -2,9 +2,9 @@ use poem_compiler::{Budget, CompiledModel};
 use poem_ir::Trace;
 
 use super::{Graphs, Shell};
-use crate::error::Result;
+
 use crate::record;
-use crate::store::kv::{self, Paging};
+use crate::store::kv::Paging;
 use crate::store::rs::Buffers;
 
 impl Shell {
@@ -26,7 +26,7 @@ impl Shell {
 
     #[must_use]
     pub fn classes(&self) -> poem_ir::LaneClasses {
-        poem_exec::feeds::lane_classes(&self.trace, &self.compiled)
+        poem_exec::feeds::lane_classes(&self.trace, &self.compiled, &self.exports.outputs)
     }
 
     /// The regions whose attention stages at a prefill's width, and the
@@ -64,31 +64,6 @@ impl Shell {
         self.device.device().num_sm
     }
 
-    pub fn out_width(&self) -> Result<u64> {
-        let out = self
-            .exports
-            .out
-            .ok_or_else(|| crate::error::Fault::Unbound {
-                what: "a plan with no `out` seam has no vocabulary width".to_string(),
-            })?;
-        kv::width_of(&self.trace, out)
-    }
-
-    #[must_use]
-    pub fn drafts(&self) -> bool {
-        self.exports.mtp.is_some()
-    }
-
-    #[must_use]
-    pub fn mtp_depth(&self) -> u32 {
-        self.exports.drafts_depth
-    }
-
-    #[must_use]
-    pub fn captures_scores(&self) -> bool {
-        !self.exports.scores.is_empty()
-    }
-
     #[must_use]
     pub fn patch_element(&self) -> Option<poem_ir::Dtype> {
         self.patch_seat.map(|seat| seat.dtype)
@@ -97,37 +72,6 @@ impl Shell {
     #[must_use]
     pub fn voxel_element(&self) -> Option<poem_ir::Dtype> {
         self.voxels.as_ref().map(|store| store.seat().dtype)
-    }
-
-    #[must_use]
-    pub fn observes_scores(&self) -> bool {
-        self.scores.is_some()
-    }
-
-    #[must_use]
-    pub fn score_planes(&self) -> u32 {
-        self.scores
-            .as_ref()
-            .map_or(0, crate::scores::Scores::planes)
-    }
-
-    #[must_use]
-    pub fn score_heads(&self) -> u32 {
-        self.scores.as_ref().map_or(0, crate::scores::Scores::heads)
-    }
-
-    /// The lanes of one fire that may capture attention scores.
-    #[must_use]
-    pub fn scoring_lanes(&self) -> u32 {
-        self.scores.as_ref().map_or(0, crate::scores::Scores::seats)
-    }
-
-    /// The planes the capturing lane at `seat` of the last fire holds.
-    pub fn observed(&self, seat: u32) -> crate::error::Result<Option<Vec<f32>>> {
-        self.scores
-            .as_ref()
-            .map(|scores| scores.read_seat(self.device.stream(), seat))
-            .transpose()
     }
 
     #[must_use]

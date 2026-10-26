@@ -103,7 +103,11 @@ async fn main(input: Input) -> Result<Output> {
     let length = CANVAS;
     let taps = self_cond_taps()?;
     // The canvas attends both ways, so the runtime cannot cut it: one fire reads every row.
-    let readable = max_readout_rows(model::ReadoutKind::Logits);
+    let readable = model::lane_of(&[])?
+        .outputs
+        .iter()
+        .find(|output| output.name == "logits")
+        .map_or(1, |output| output.max_rows) as usize;
     if readable < length as usize {
         return Err(format!(
             "the engine reads out at most {readable} rows a fire and a canvas is {length}"
@@ -219,7 +223,7 @@ async fn main(input: Input) -> Result<Output> {
                 [],
             );
             step_index.put(&(&i + 1u32));
-            let logits = intrinsics::logits(); // [length, vocab]
+            let logits = intrinsics::output(0, "logits"); // [length, vocab]
             let scaled = &logits / &t;
             // The entropy off the scaled row alone, by the log-sum-exp
             // identity `H = log Z + m - Σ x·e^(x-m) / Z`: no `[length,
@@ -370,7 +374,7 @@ async fn encode(ws: &WorkingSet, pipe: &Pipeline, tokens: &[i32], base: u32) -> 
     )?;
     fwd.epilogue(move || {
         last.put(reshape(
-            cast(reduce_argmax(intrinsics::logits()), dtype::i32),
+            cast(reduce_argmax(intrinsics::output(0, "logits")), dtype::i32),
             [1],
         ));
     });

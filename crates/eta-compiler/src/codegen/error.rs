@@ -33,7 +33,7 @@ pub enum EmitError {
 
     ChannelLimitExceeded { emitter: EmitterKind, limit: usize },
     UnsupportedKernelBoundary,
-    UnbindableIntrinsic { intrinsic: u16 },
+    UnbindableOutput { name_index: u16 },
     UnsupportedSinkBoundary,
     FusedRequiresGeneratedRegion,
     GeneratedRegionHasBoundary { library_op: &'static str },
@@ -96,10 +96,9 @@ impl fmt::Display for EmitError {
             EmitError::UnsupportedKernelBoundary => {
                 f.write_str("unsupported Metal semantic kernel boundary")
             }
-            EmitError::UnbindableIntrinsic { intrinsic } => write!(
+            EmitError::UnbindableOutput { name_index } => write!(
                 f,
-                "Metal binds only the logits buffer for intrinsics; \
-                 intrinsic id {intrinsic} has no binding"
+                "Metal has no gather for output name #{name_index}'s element type"
             ),
             EmitError::UnsupportedSinkBoundary => {
                 f.write_str("unsupported Metal semantic sink boundary")

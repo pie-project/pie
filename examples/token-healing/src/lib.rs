@@ -163,7 +163,10 @@ async fn main(input: Input) -> Result<Output> {
     prefill.state(&[&ws], StateGeometry::folding())?;
     prefill.epilogue(move || {
         let allowed = heal_mask.take();
-        first_out.put(reshape(masked_argmax(intrinsics::logits(), &allowed), [1]));
+        first_out.put(reshape(
+            masked_argmax(intrinsics::output(0, "logits"), &allowed),
+            [1],
+        ));
     });
 
     heal_mask.put(first_mask);
@@ -184,7 +187,7 @@ async fn main(input: Input) -> Result<Output> {
         decode.embed(&token_in, &embed_indptr)?;
         decode.state(&[&ws], StateGeometry::folding())?;
         decode.epilogue(move || {
-            let token = reshape(reduce_argmax(intrinsics::logits()), [1]);
+            let token = reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]);
             token_in.put(&token);
             token_out.put(&token);
         });

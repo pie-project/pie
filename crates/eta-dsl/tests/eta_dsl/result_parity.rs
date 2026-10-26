@@ -1,29 +1,24 @@
 use eta_compiler::eval::interp::Value;
 use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs};
 use eta_ir::container;
-use eta_ir::registry::{EngineCaps, Graph, Readout, ReadoutKind};
+use eta_ir::registry::{EngineCaps, OutputDecl};
 use eta_ir::validate::BoundTrace;
 
 use eta_dsl::builder::Builder;
 use eta_dsl::prelude::*;
 use eta_dsl::{Channel, Traced};
 
-fn bound(traced: &Traced, vocab: u32, _page_size: u32, num_layers: u32) -> BoundTrace {
-    served(traced.container().clone(), logits_lane(vocab), num_layers).expect("container binds")
+fn bound(traced: &Traced, vocab: u32) -> BoundTrace {
+    served(traced.container().clone(), logits_lane(vocab)).expect("container binds")
 }
 
 fn served(
     container: eta_ir::container::TraceContainer,
-    lanes: Vec<Option<Readout>>,
-    num_layers: u32,
+    lanes: Vec<Vec<OutputDecl>>,
 ) -> Result<eta_ir::validate::BoundTrace, eta_ir::validate::ValidateError> {
     eta_ir::validate::bind(
         container,
         lanes,
-        Graph {
-            num_layers,
-            ..Graph::default()
-        },
         EngineCaps {
             lora: true,
             attn_page_mask: true,
@@ -31,11 +26,8 @@ fn served(
     )
 }
 
-fn logits_lane(vocab: u32) -> Vec<Option<Readout>> {
-    vec![Some(Readout {
-        kind: ReadoutKind::Logits,
-        width: vocab,
-    })]
+fn logits_lane(vocab: u32) -> Vec<Vec<OutputDecl>> {
+    crate::outputs::logits(vocab)
 }
 
 fn idx(names: &[String], name: &str) -> u32 {
@@ -47,8 +39,7 @@ fn idx(names: &[String], name: &str) -> u32 {
 
 fn logits(v: Vec<f32>) -> PassInputs {
     PassInputs {
-        logits: Some(Value::F32(v)),
-        ..Default::default()
+        outputs: vec![("logits".into(), 0, Value::F32(v))],
     }
 }
 
@@ -66,12 +57,13 @@ fn greedy_argmax_tier0_matches_golden() {
     tok.put([1i32]);
 
     let mut b = Builder::new(8, 4);
+    b.outputs(crate::outputs::logits(8));
     b.bind_port(Port::EmbedTokens, tok);
     b.bind_port(Port::EmbedIndptr, indptr);
     b.bind_port(Port::KvLen, klen);
     b.bind_port(Port::Positions, positions);
     b.stage(Stage::Epilogue, move || {
-        let t = reduce_argmax(intrinsics::logits());
+        let t = reduce_argmax(intrinsics::output(0, "logits"));
         tok.put(&t);
         positions.put(Tensor::constant([0u32]));
         out.put(t);
@@ -79,7 +71,7 @@ fn greedy_argmax_tier0_matches_golden() {
     out.note_host_take();
 
     let traced = b.build().expect("greedy builds");
-    let bound = bound(&traced, 8, 4, 2);
+    let bound = bound(&traced, 8);
     let names = traced.channel_names();
     let (tok_i, indptr_i, klen_i, positions_i, out_i) = (
         idx(names, "tok"),

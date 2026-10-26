@@ -303,7 +303,7 @@ def plant_readout(d, logits, inputs, read, block_draft):
         proposals_from = d.proposals_from,
     )
     dlogits = logits.on(block_draft)
-    seam.at(seam.MTP, [dlogits])
+    output("mtp.logits", dlogits)
     sel = d.selector
     if sel != None:
         unary, cand = ops.sampling.top_k(dlogits, sel.top_k)
@@ -313,4 +313,4 @@ def plant_readout(d, logits, inputs, read, block_draft):
         picks = ops.sampling.selector_walk(cand, unary, hp, toks, sel.pred, sel.succ, d.proposals_from)
     else:
         picks = ops.sampling.argmax([dlogits])
-    seam.at(seam.MTP_DRAFTS, [picks])
+    output("mtp.drafts", picks)

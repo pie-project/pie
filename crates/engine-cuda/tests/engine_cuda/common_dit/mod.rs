@@ -15,13 +15,13 @@ use engine::{ChannelId, InstanceId, ProgramId};
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::Op;
 use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::fact;
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm,
-    Trace, Value, Weight, ops, seam, trace_hybrid,
+    Trace, Value, Weight, ops, trace_hybrid,
 };
 use poem_ir::InputAxis;
 
@@ -38,7 +38,7 @@ impl ForwardHybrid for DoubleBlock {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         inputs.recorder().declare_switch(
             "stream",
             &["text", "image", "video", "audio", "context", "reference"],
@@ -118,8 +118,7 @@ impl ForwardHybrid for DoubleBlock {
         let r_txt = ops::elemwise::residual_add(&x_txt, &y_txt);
         let r_img = ops::elemwise::residual_add(&x_img, &y_img);
         let out = Value::merge(vec![r_txt, r_img]);
-        seam::at(seam::VELOCITY, &[&out]);
-        out
+        poem::output("velocity", &out, None);
     }
 }
 
@@ -385,8 +384,8 @@ pub fn epilogue(rows: u32) -> TraceContainer {
     };
     let ops = vec![
         Op::ChanTake(0),
-        Op::IntrinsicVal {
-            intr: IntrinsicId::Velocity,
+        Op::Output {
+            index: 0,
             lane: 0,
             shape: Shape::matrix(rows, WIDTH),
             dtype: EtaDtype::F32,
@@ -395,7 +394,7 @@ pub fn epilogue(rows: u32) -> TraceContainer {
         Op::ChanPut { chan: 3, value: 2 },
     ];
     TraceContainer {
-        names: Vec::new(),
+        names: vec!["velocity".to_string()],
         channels: vec![
             writer(Shape::matrix(rows, WIDTH)),
             writer(Shape::matrix(1, 1)),
@@ -516,15 +515,15 @@ impl Rig {
         id
     }
 
-    pub fn reads_out(&self, kind: poem_ir::ReadoutKind) -> Option<u32> {
+    pub fn reads_out(&self, name: &str) -> Option<u32> {
         self.loaded
             .caps
             .classes
             .classes
             .iter()
-            .filter_map(|class| class.readout)
-            .find(|readout| readout.kind == kind)
-            .map(|readout| readout.width)
+            .flat_map(|class| &class.outputs)
+            .find(|decl| decl.name == name)
+            .map(|decl| decl.width)
     }
 
     pub fn register(&mut self, container: TraceContainer, salt: u64) -> ProgramId {

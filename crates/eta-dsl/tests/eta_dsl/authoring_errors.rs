@@ -29,6 +29,7 @@ fn a_dtype_mismatch_is_reported_with_a_span() {
     let keys = Channel::seeded([4], dtype::f32);
     let output = Channel::new([2, 4], dtype::bool);
     let mut builder = Builder::new(32_000, 16);
+    builder.outputs(crate::outputs::logits(32_000));
     builder.stage(Stage::Epilogue, || {
         output.put(row_membership(rows.take(), keys.take()));
     });
@@ -54,6 +55,7 @@ fn every_mistake_in_one_trace_is_reported_together() {
     let index = Channel::seeded([3], dtype::u32);
     let output = Channel::new([2, 4], dtype::bool);
     let mut builder = Builder::new(32_000, 16);
+    builder.outputs(crate::outputs::logits(32_000));
     builder.stage(Stage::Epilogue, || {
         let _ = row_membership(rows.take(), keys.take());
         let _ = scalar_gather(matrix.take(), index.take());

@@ -1,4 +1,4 @@
-use poem::{Attn, Operation, Platform, seam};
+use poem::{Attn, Operation, Platform};
 
 const PLATFORMS: [Platform; 4] = [
     Platform::Cuda,
@@ -41,22 +41,22 @@ fn every_gpt_oss_row_declares_a_masked_arm_and_exports_its_scores() {
                 )
             });
             assert!(
-                masked > 0 && sinks == 4 * masked,
+                masked > 0 && sinks == 3 * masked,
                 "{} on {platform:?}: {masked} causal `attn.masked_lse` arm(s) against \
-                 {sinks} sink(s); every layer has four sunk arms (masked, scored, decode, \
+                 {sinks} sink(s); every layer has three sunk arms (masked, decode, \
                  prefill)",
                 row.name
             );
             let scores = trace
-                .seams
+                .outputs
                 .iter()
-                .filter(|s| s.seam == seam::SCORES.name)
+                .filter(|s| s.name == "attn.scores")
                 .count();
             assert_eq!(
                 scores,
                 masked / 2,
-                "{} on {platform:?}: {scores} score seam(s) for {masked} layer(s); every \
-                 full-attention layer (the odd ones) exports one",
+                "{} on {platform:?}: {scores} score output(s) for {masked} layer(s); every \
+                 full-attention layer (the odd ones) reads one out",
                 row.name
             );
         }

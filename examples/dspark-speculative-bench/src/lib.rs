@@ -233,7 +233,7 @@ async fn main(input: Input) -> Result<Output> {
         let _ = kv_len_d.take();
         // The anchor's position, the verify's own to lay out.
         let _ = base_d.take();
-        let picks = reshape(intrinsics::mtp_drafts(block), [block]); // [block] i32
+        let picks = reshape(intrinsics::output(0, "mtp.drafts"), [block]); // [block] i32
         let i = iota(w);
         let one = Tensor::constant(1u32);
         let first = eq(&i, Tensor::constant(0u32));
@@ -261,7 +261,7 @@ async fn main(input: Input) -> Result<Output> {
         let window = win.take(); // [w] i32
         let _ = kv_len_v.take();
         let b = base_v.take(); // [1] u32
-        let truth = reshape(reduce_argmax(intrinsics::logits()), [w]); // [w] i32
+        let truth = reshape(reduce_argmax(intrinsics::output(0, "logits")), [w]); // [w] i32
         let i = iota(w);
         let one = Tensor::constant(1u32);
         let none = broadcast(Tensor::constant(NONE), [w]);
@@ -296,7 +296,14 @@ async fn main(input: Input) -> Result<Output> {
     //    anchors, and its epilogue lays out the first block ──────────────
     let prompt_i32: Vec<i32> = prompt.iter().map(|&t| t as i32).collect();
     let mut anchor: i32 = 0;
-    let spans = readout_spans(n, model::ReadoutKind::Logits);
+    let spans = readout_spans(
+        n,
+        model::lane_of(&[])?
+            .outputs
+            .iter()
+            .find(|output| output.name == "logits")
+            .map_or(1, |output| output.max_rows),
+    );
     let last_span = spans.len() - 1;
     for (at, &(base, end)) in spans.iter().enumerate() {
         let len = end - base;
@@ -311,7 +318,7 @@ async fn main(input: Input) -> Result<Output> {
         fwd.state(&[&ws], StateGeometry::folding())?;
         let last = at == last_span;
         fwd.epilogue(move || {
-            let t = reshape(reduce_argmax(intrinsics::logits()), [1]);
+            let t = reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]);
             if last {
                 let b = broadcast(Tensor::constant(n), [1]);
                 lay_block(&t, &b);

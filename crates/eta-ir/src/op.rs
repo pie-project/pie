@@ -6,83 +6,28 @@ use crate::types::{Dtype, Literal, Predicate, RngKind, Shape, ValueId};
 pub type ChannelIndex = u32;
 pub type NameIndex = u16;
 
-macro_rules! declare_intrinsics {
-    ($($(#[$doc:meta])* $variant:ident = $id:literal, $konst:ident, $name:literal;)*) => {
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-        #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-        #[repr(u16)]
-        pub enum IntrinsicId {
-            $($(#[$doc])* $variant = $id,)*
-        }
-
-        pub mod intrinsic_tags {
-            $(
-                #[doc = concat!("Wire id of the `", $name, "` intrinsic.")]
-                pub const $konst: u16 = $id;
-            )*
-        }
-
-        impl IntrinsicId {
-            pub const ALL: &'static [IntrinsicId] = &[$(IntrinsicId::$variant,)*];
-
-            pub const SLOTS: u32 = {
-                let mut max = 0u32;
-                $(if $id as u32 > max { max = $id as u32; })*
-                max + 1
-            };
-
-            pub fn from_u16(v: u16) -> Option<Self> {
-                Some(match v {
-                    $($id => IntrinsicId::$variant,)*
-                    _ => return None,
-                })
-            }
-
-            pub fn name(self) -> &'static str {
-                match self {
-                    $(IntrinsicId::$variant => $name,)*
-                }
-            }
-        }
-    };
-}
-
-declare_intrinsics! {
-    Logits = 0, LOGITS, "logits";
-    MtpLogits = 1, MTP_LOGITS, "mtp_logits";
-    Hidden = 2, HIDDEN, "hidden";
-    Query = 3, QUERY, "query";
-    Layer = 5, LAYER, "layer";
-    MtpDrafts = 6, MTP_DRAFTS, "mtp_drafts";
-    AttnScore = 7, ATTN_SCORE, "attn_score";
-    Velocity = 8, VELOCITY, "velocity";
-    Pixels = 9, PIXELS, "pixels";
-}
-
-impl IntrinsicId {
-    pub fn per_lane(self) -> bool {
-        matches!(
-            self,
-            IntrinsicId::Velocity | IntrinsicId::Hidden | IntrinsicId::Pixels
-        )
-    }
-}
-
-/// [`IntrinsicId::SLOTS`] slots for each lane up to the highest `ops` read.
-pub fn intrinsic_pitch(ops: &[Op]) -> u32 {
-    let lanes = ops
-        .iter()
+/// The slots one lane of `ops` takes in its output table (one an output
+/// index), and the lanes the table holds: up to the highest each reads.
+pub fn output_table(ops: &[Op]) -> (u32, u32) {
+    ops.iter()
         .filter_map(|op| match op {
-            Op::IntrinsicVal { lane, .. } => Some(lane.saturating_add(1)),
+            Op::Output { index, lane, .. } => Some((u32::from(*index) + 1, lane.saturating_add(1))),
             _ => None,
         })
-        .max()
-        .unwrap_or(1);
-    IntrinsicId::SLOTS.saturating_mul(lanes)
+        .fold((1, 1), |(slots, lanes), (index, lane)| {
+            (slots.max(index), lanes.max(lane))
+        })
 }
 
-pub const fn intrinsic_slot(intr: IntrinsicId, lane: u32) -> u32 {
-    intr as u32 + IntrinsicId::SLOTS * lane
+/// The output table's entries for `ops`, a lane's slots after another's.
+pub fn output_pitch(ops: &[Op]) -> u32 {
+    let (slots, lanes) = output_table(ops);
+    slots.saturating_mul(lanes)
+}
+
+/// Where `ops`' output `index` of `lane` sits in its table.
+pub fn output_slot(ops: &[Op], index: NameIndex, lane: u32) -> u32 {
+    u32::from(index) + output_table(ops).0 * lane
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -216,9 +161,10 @@ pub enum Op {
         value: ValueId,
     },
 
-    /// `lane` is the pass's lane for a per-lane intrinsic, 0 for the others.
-    IntrinsicVal {
-        intr: IntrinsicId,
+    /// The model's output the name `index` names, as lane `lane` of the
+    /// pass reads it out.
+    Output {
+        index: NameIndex,
         lane: u32,
         shape: Shape,
         dtype: Dtype,
@@ -262,6 +208,7 @@ impl Op {
     pub fn name_index_mut(&mut self) -> Option<&mut NameIndex> {
         match self {
             Op::KernelCall { name, .. } | Op::SinkCall { name, .. } => Some(name),
+            Op::Output { index, .. } => Some(index),
             _ => None,
         }
     }
@@ -341,16 +288,15 @@ impl Op {
             | Op::SinkWindowMask { .. }
             | Op::Rng { .. }
             | Op::RngKeyed { .. }
-            | Op::IntrinsicVal { .. } => false,
+            | Op::Output { .. } => false,
         }
     }
 
     pub fn value_source(&self) -> ValueSource {
         match self {
-            Op::KernelCall { .. }
-            | Op::IntrinsicVal { .. }
-            | Op::SinkCall { .. }
-            | Op::Rng { .. } => ValueSource::Device,
+            Op::KernelCall { .. } | Op::Output { .. } | Op::SinkCall { .. } | Op::Rng { .. } => {
+                ValueSource::Device
+            }
 
             Op::ChanTake(..) | Op::ChanRead(..) | Op::ChanPut { .. } => ValueSource::Channel,
 
@@ -451,7 +397,7 @@ declare_operands! {
         | Op::Rng { .. }
         | Op::ChanTake(_)
         | Op::ChanRead(_)
-        | Op::IntrinsicVal { .. } => [],
+        | Op::Output { .. } => [],
 
         Op::Exp(a)
         | Op::Log(a)
@@ -550,7 +496,6 @@ pub enum WireField {
     Predicate,
     Literal,
     Name,
-    Intrinsic,
     Args,
 }
 
@@ -687,9 +632,9 @@ declare_ops! {
     CHAN_READ = 0x91, "chan_read", Channel, 0, 1, Op::ChanRead(0), Op::ChanRead(_), [Chan];
     CHAN_PUT = 0x92, "chan_put", Channel, 1, 0,
         Op::ChanPut { chan: 0, value: 0 }, Op::ChanPut { .. }, [Chan, Value];
-    INTRINSIC_VAL = 0xA0, "intrinsic_val", Intrinsic, 0, 1,
-        Op::IntrinsicVal { intr: IntrinsicId::Logits, lane: 0, shape: Shape::matrix(1, 8), dtype: Dtype::F32 },
-        Op::IntrinsicVal { .. }, [Intrinsic, Imm, Dtype, Shape];
+    OUTPUT = 0xA0, "output", Intrinsic, 0, 1,
+        Op::Output { index: 0, lane: 0, shape: Shape::matrix(1, 8), dtype: Dtype::F32 },
+        Op::Output { .. }, [Name, Imm, Dtype, Shape];
     KERNEL_CALL = 0xA1, "kernel_call", Intrinsic, VARIADIC, 1,
         Op::KernelCall { name: 0, args: vec![0, 1], shape: Shape::vector(4), dtype: Dtype::F32 },
         Op::KernelCall { .. }, [Name, Dtype, Shape, Args];

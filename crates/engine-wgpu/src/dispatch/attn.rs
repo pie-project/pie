@@ -186,48 +186,33 @@ impl Run<'_> {
         u32::try_from(self.qo_indptr_host().len().saturating_sub(1)).unwrap_or(u32::MAX)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn capture_scores(
-        &mut self,
-        q: poem_ir::ValueId,
-        plan: poem_ir::ValueId,
-        cache: poem_ir::ValueId,
-        window: Option<u32>,
-        head_dim: u32,
-        kv_heads: u32,
-        sm_scale: f32,
-        lse: poem_ir::ValueId,
-    ) -> Result<(), kernels_slang::Error> {
-        let Some(seat) = self.score_seat() else {
-            return Ok(());
-        };
-        let Some(plane) = seat.plane_of(lse) else {
-            return Ok(());
-        };
-
-        let lane_offset = self.window().span.lane_offset;
-        let requests = self.requests();
-        kernels_slang::attn::score::capture(
-            self.ctx,
-            self.ragged(q),
-            self.prefill_plan(plan).positions,
-            self.pool(cache),
-            window,
-            head_dim,
-            kv_heads,
-            sm_scale,
-            seat.observe,
-            lane_offset,
-            seat.plane_stride,
-            plane,
-            crate::scores::KV_MAX,
-            requests,
-            seat.slab,
-        )
-    }
-
     fn attention(&mut self, op: &Attn) -> Result<(), kernels_slang::Error> {
         match op {
+            Attn::ScoreCapture {
+                q,
+                plan,
+                cache,
+                head_dim,
+                kv_heads,
+                sm_scale,
+                observe,
+                kv_max,
+                scores,
+            } => kernels_slang::attn::score::capture(
+                self.ctx,
+                self.ragged(*q),
+                self.prefill_plan(*plan).positions,
+                self.pool(*cache),
+                *head_dim,
+                *kv_heads,
+                *sm_scale,
+                *observe,
+                // The rows are the window's lanes already.
+                0,
+                *kv_max,
+                self.requests(),
+                self.tensor(*scores),
+            ),
             Attn::PlanDecode {
                 kv_indptr: _,
                 kv_indices: _,
@@ -642,24 +627,18 @@ impl Run<'_> {
                 causal: true,
                 selected: None,
                 rel: None,
-            } => {
-                self.prefill_attention(
-                    *q,
-                    *plan,
-                    None,
-                    *cache,
-                    *window,
-                    *head_dim,
-                    *kv_heads,
-                    *sm_scale,
-                    self.tensor(*o),
-                    Some(self.tensor(*lse)),
-                )?;
-
-                self.capture_scores(
-                    *q, *plan, *cache, *window, *head_dim, *kv_heads, *sm_scale, *lse,
-                )
-            }
+            } => self.prefill_attention(
+                *q,
+                *plan,
+                None,
+                *cache,
+                *window,
+                *head_dim,
+                *kv_heads,
+                *sm_scale,
+                self.tensor(*o),
+                Some(self.tensor(*lse)),
+            ),
             Attn::Sink {
                 o,
                 lse,

@@ -166,7 +166,6 @@ fn fault(fault: Fault) -> Error {
             wanted: 1,
             available: 0,
         },
-        Fault::Scoreless { .. } | Fault::ScoreWord { .. } => Error::Invalid(fault.to_string()),
 
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::Blob { .. } => Error::Load(fault.to_string()),
@@ -450,16 +449,12 @@ impl Engine for Vulkan {
                     &budgets,
                 )))
                 .unwrap_or(u32::MAX),
-                max_scoring_lanes: 0,
             },
             has_lora: true,
             has_attn_page_mask: false,
-            has_mtp_logits: shell.drafts(),
-            mtp_depth: shell.mtp_depth(),
             draft_block: shell.trace().drafter.map_or(0, |d| d.rows),
             draft_mask_token: shell.trace().drafter.map_or(0, |d| d.mask_token),
             draft_proposals_from: shell.trace().drafter.map_or(1, |d| d.proposals_from),
-            has_attn_score: false,
 
             ports: PortMask::DECODE_ENVELOPE.with(eta_ir::registry::Port::Fold),
             geometry: GeometryClass::DecodeEnvelope,
@@ -548,25 +543,16 @@ impl Engine for Vulkan {
                         // it, so the GPU runs on into the sampler and the
                         // step waits once.
                         let landed = step_pending.landed;
-                        self.run_attachments(step, &[], None, 0, &landed)?;
+                        self.run_attachments(step, &landed)?;
                         let shell = self.loaded_mut()?;
                         step_pending.rows = Some(shell.rows_of(&landed).map_err(fault)?);
                         shell.forget_seat(&landed);
                     } else if program_attachments(step).next().is_some() {
                         let shell = self.loaded_mut()?;
                         let rows = shell.rows_of(&step_pending.landed).map_err(fault)?;
-
-                        let drafts = shell.draft_rows_of(&step_pending.landed);
-                        let mtp_width = shell.mtp_width();
                         step_pending.rows = Some(rows);
                         let landed = step_pending.landed;
-                        self.run_attachments(
-                            step,
-                            &readouts_of(&step_pending),
-                            drafts.as_deref(),
-                            mtp_width,
-                            &landed,
-                        )?;
+                        self.run_attachments(step, &landed)?;
                     }
                     if defers && let Some(sink) = self.sink.as_ref() {
                         // The forward's own report was held for the sampler.
@@ -828,17 +814,15 @@ impl Engine for Vulkan {
 }
 
 impl Vulkan {
-    /// Whether every attachment of `step` can read its lane's logits on the
-    /// device before the step lands: no draft column to read on the host,
-    /// and a readout row for each lane.
+    /// Whether every attachment of `step` can read its lane's outputs on
+    /// the device before the step lands.
     fn reads_on_device(&self, step: &Step, landed: &crate::serve::Landed) -> bool {
         let Some(shell) = self.shell.as_ref() else {
             return false;
         };
         cfg!(feature = "vulkan")
-            && shell.mtp_width() == 0
             && program_attachments(step)
-                .all(|attachment| shell.readout_row(landed, attachment.lane).is_some())
+                .all(|attachment| shell.readout_seats(landed, attachment.lane).is_some())
     }
 
     /// Before the step resolves its inputs: the forward reads the cells a prologue put.
@@ -851,15 +835,8 @@ impl Vulkan {
                 .fire(
                     attachment.instance,
                     Stage::Prologue,
-                    None,
-                    0,
-                    0,
-                    None,
-                    0,
                     #[cfg(feature = "vulkan")]
                     self.shell.as_ref().map(Shell::device),
-                    #[cfg(feature = "vulkan")]
-                    Vec::new(),
                     #[cfg(feature = "vulkan")]
                     Vec::new(),
                 )
@@ -868,54 +845,24 @@ impl Vulkan {
         Ok(())
     }
 
-    fn run_attachments(
-        &mut self,
-        step: &Step,
-        readouts: &[LaneReadout],
-        drafts: Option<&[Vec<f32>]>,
-        mtp_width: u32,
-        landed: &crate::serve::Landed,
-    ) -> EngineResult<()> {
+    fn run_attachments(&mut self, step: &Step, landed: &crate::serve::Landed) -> EngineResult<()> {
         let Vulkan {
             shell, programs, ..
         } = self;
         for attachment in program_attachments(step) {
-            let readout = readouts.get(attachment.lane as usize);
-            let (logits, rows, vocab) = match readout {
-                Some(lane) if lane.rows > 0 => {
-                    (Some(lane.values.as_slice()), lane.rows, lane.width)
-                }
-                _ => (None, 0, 0),
-            };
-
-            let mtp_logits = drafts
-                .and_then(|lanes| lanes.get(attachment.lane as usize))
-                .filter(|values| !values.is_empty() && mtp_width > 0)
-                .map(Vec::as_slice);
-
             #[cfg(feature = "vulkan")]
-            let (device, seat, pixels) = match shell.as_ref() {
-                Some(shell) => {
-                    let (seat, pixels) = lane_readouts(shell, landed, attachment);
-                    (Some(shell.device()), seat, pixels)
-                }
-                None => (None, Vec::new(), Vec::new()),
+            let (device, seats) = match shell.as_ref() {
+                Some(shell) => (Some(shell.device()), lane_seats(shell, landed, attachment)),
+                None => (None, Vec::new()),
             };
             programs
                 .fire(
                     attachment.instance,
                     Stage::Epilogue,
-                    logits,
-                    rows,
-                    vocab,
-                    mtp_logits,
-                    mtp_width,
                     #[cfg(feature = "vulkan")]
                     device,
                     #[cfg(feature = "vulkan")]
-                    seat,
-                    #[cfg(feature = "vulkan")]
-                    pixels,
+                    seats,
                 )
                 .map_err(refusal)?;
         }
@@ -934,10 +881,6 @@ impl Vulkan {
                 && self.settles_asynchronously()
                 && step.attachments.len() == 1
                 && !step.attachments[0].adapter_only
-                && self
-                    .shell
-                    .as_ref()
-                    .is_some_and(|shell| shell.mtp_width() == 0)
                 && self.programs.defers(step.attachments[0].instance)
         }
         #[cfg(not(feature = "vulkan"))]
@@ -965,10 +908,10 @@ impl Vulkan {
                 .as_ref()
                 .ok_or_else(|| Error::Load("the vulkan engine has no model loaded".into()))?;
             let attachment = &step.attachments[0];
-            let (seat, pixels) = lane_readouts(shell, landed, attachment);
+            let seats = lane_seats(shell, landed, attachment);
             let done = sink.clone().map(|sink| Done { at, sink });
             programs
-                .fire_deferred(attachment.instance, shell.device(), seat, pixels, done)
+                .fire_deferred(attachment.instance, shell.device(), seats, done)
                 .map_err(refusal)
         }
         #[cfg(not(feature = "vulkan"))]
@@ -1122,6 +1065,15 @@ impl Vulkan {
             }
         }
 
+        let mut reads: Vec<Vec<String>> = vec![Vec::new(); submission.lanes.len()];
+        for attachment in program_attachments(submission) {
+            for (name, k) in self.programs.reads(attachment.instance) {
+                if let Some(lane) = reads.get_mut((attachment.lane + k) as usize) {
+                    lane.push(name);
+                }
+            }
+        }
+
         let sink = self.sink.clone();
 
         let mut lane_adapters: Vec<Option<u32>> = vec![None; submission.lanes.len()];
@@ -1168,7 +1120,6 @@ impl Vulkan {
                 pages: &lane.kv.pages,
                 held: (!lane.kv.pages.is_empty()).then_some(lane.kv.held),
                 kv_less: lane.kv_less,
-                captures_scores: lane.captures_scores,
 
                 mask: lane.mask.as_ref(),
 
@@ -1179,6 +1130,7 @@ impl Vulkan {
                     Readout::Rows(rows) => Some(rows.as_slice()),
                     Readout::Last | Readout::None => None,
                 },
+                reads: &reads[at],
 
                 translation: &lane.kv.translation,
 
@@ -1268,40 +1220,39 @@ fn program_attachments(step: &Step) -> impl Iterator<Item = &engine::fire::Attac
         .filter(|attachment| !attachment.adapter_only)
 }
 
+/// What step `landed` read out for each lane of `attachment`, its pixels among them.
 #[cfg(feature = "vulkan")]
-fn lane_readouts<'a>(
+fn lane_seats<'a>(
     shell: &'a Shell,
     landed: &crate::serve::Landed,
     attachment: &engine::fire::Attachment,
-) -> (
-    Vec<Option<crate::guest::run::Readout<'a>>>,
-    Vec<Option<crate::guest::run::Readout<'a>>>,
-) {
-    let lanes = attachment.lane..attachment.lane + attachment.lanes.max(1);
-    let readouts = lanes
-        .clone()
+) -> Vec<Vec<crate::guest::run::Readout<'a>>> {
+    (attachment.lane..attachment.lane + attachment.lanes.max(1))
         .map(|lane| {
-            shell
-                .readout_row(landed, lane)
-                .map(|(seat, at, width, dtype)| crate::guest::run::Readout {
+            let mut seats: Vec<crate::guest::run::Readout<'a>> = shell
+                .readout_seats(landed, lane)
+                .unwrap_or_default()
+                .into_iter()
+                .map(
+                    |(seat, at, width, dtype, output)| crate::guest::run::Readout {
+                        output,
+                        seat,
+                        at,
+                        width,
+                        dtype,
+                    },
+                )
+                .collect();
+            if let Some((seat, at, width, output)) = shell.pixels_row(landed, lane) {
+                seats.push(crate::guest::run::Readout {
+                    output,
                     seat,
                     at,
                     width,
-                    f32: dtype == poem_ir::Dtype::F32,
-                })
+                    dtype: poem_ir::Dtype::Bf16,
+                });
+            }
+            seats
         })
-        .collect();
-    let pixels = lanes
-        .map(|lane| {
-            shell
-                .pixels_row(landed, lane)
-                .map(|(seat, at, width)| crate::guest::run::Readout {
-                    seat,
-                    at,
-                    width,
-                    f32: false,
-                })
-        })
-        .collect();
-    (readouts, pixels)
+        .collect()
 }

@@ -128,7 +128,6 @@ pub(crate) struct PendingRequest {
     pub(crate) prelaunch_copy: Option<::engine::KvCopy>,
     pub(crate) prelaunch_state_copy: Option<StateCopy>,
     pub(crate) frame: Option<FrameStamp>,
-    pub(crate) hook_program: bool,
     pub(crate) lora_program: bool,
 }
 
@@ -149,7 +148,6 @@ impl PendingRequest {
         prelaunch_copy: Option<::engine::KvCopy>,
         prelaunch_state_copy: Option<StateCopy>,
         frame: Option<FrameStamp>,
-        hook_program: bool,
         lora_program: bool,
     ) -> Self {
         let logical_fire_id = NEXT_LOGICAL_FIRE_ID.fetch_add(1, Ordering::Relaxed);
@@ -163,7 +161,6 @@ impl PendingRequest {
             prelaunch_copy,
             prelaunch_state_copy,
             frame,
-            hook_program,
             lora_program,
         }
     }
@@ -786,7 +783,6 @@ impl SchedulerHandle {
                 prelaunch_copy,
                 prelaunch_state_copy,
                 None,
-                /*hook_program=*/ false,
                 /*lora_program=*/ false,
             ),
         })
@@ -810,7 +806,6 @@ impl SchedulerHandle {
                 prelaunch_copy,
                 prelaunch_state_copy,
                 None,
-                /*hook_program=*/ false,
                 /*lora_program=*/ false,
             ),
         })
@@ -827,7 +822,6 @@ impl SchedulerHandle {
         prelaunch_copy: Option<::engine::KvCopy>,
         prelaunch_state_copy: Option<StateCopy>,
         frame: Option<FrameStamp>,
-        hook_program: bool,
         lora_program: bool,
     ) -> Result<()> {
         self.send(SchedulerItem::Launch {
@@ -840,7 +834,6 @@ impl SchedulerHandle {
                 prelaunch_copy,
                 prelaunch_state_copy,
                 frame,
-                hook_program,
                 lora_program,
             ),
         })
@@ -2651,7 +2644,6 @@ mod tests {
     fn a_launch_waits_for_the_copy_queued_ahead_of_it() {
         let pipeline = ProcessId::from_u128(5);
         let request = PendingRequest {
-            hook_program: false,
             lora_program: false,
             logical_fire_id: 9,
             request: crate::engine::FireRequest::default(),

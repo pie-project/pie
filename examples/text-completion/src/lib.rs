@@ -68,7 +68,7 @@ async fn main(input: Input) -> Result<Output> {
     fwd.embed(&toks, &embed_indptr)?;
     fwd.state(&[&ws], StateGeometry::folding())?;
     fwd.epilogue(move || {
-        tok_out.put(greedy(intrinsics::logits()));
+        tok_out.put(greedy(intrinsics::output(0, "logits")));
     });
     fwd.submit(&pipe).context("prefill submit")?;
     let first = tok_out.take_host::<i32>().await.context("prefill drain")?;
@@ -86,7 +86,7 @@ async fn main(input: Input) -> Result<Output> {
         fwd.embed(&tok_in, &embed_indptr)?;
         fwd.state(&[&ws], StateGeometry::folding())?;
         fwd.epilogue(move || {
-            let token = greedy(intrinsics::logits());
+            let token = greedy(intrinsics::output(0, "logits"));
             tok_in.put(&token);
             tok_out.put(&token);
         });

@@ -337,7 +337,7 @@ def forward(m, inputs):
         """Whether `v` is the intermediate `m` taps; read out if so."""
         if m.tap != key:
             return False
-        seam.at(seam.VELOCITY, [v])
+        output("velocity", v)
         hit.append(v)
         return True
 
@@ -440,5 +440,4 @@ def forward(m, inputs):
     if at("final.tokens", tokens):
         return tokens
     velocity = ops.conv.unpatchify(tokens, tgrid, [1, PATCH, PATCH], grid)
-    seam.at(seam.VELOCITY, [velocity])
-    return velocity
+    output("velocity", velocity)

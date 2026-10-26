@@ -2,23 +2,21 @@ use super::numeric::*;
 use super::*;
 use eta_ir::container::{ChanDType, ChannelDecl, StageProgram, TraceContainer};
 use eta_ir::op::Op;
-use eta_ir::registry::{EngineCaps, Graph, Readout, ReadoutKind};
+use eta_ir::registry::{Axis, EngineCaps, OutputDecl};
 use eta_ir::types::{Literal, RngKind};
 use eta_ir::validate::bind;
 
 fn served(c: TraceContainer) -> BoundTrace {
     bind(
         c,
-        vec![Some(Readout {
-            kind: ReadoutKind::Logits,
+        vec![vec![OutputDecl {
+            name: "logits".into(),
+            axis: Axis::Row,
             width: 32,
-        })],
-        Graph {
-            num_layers: 2,
-            mtp_logits: true,
-            mtp_depth: 1,
-            attn_score: true,
-        },
+            dtype: Dtype::F32,
+            layers: 0,
+            readout: true,
+        }]],
         EngineCaps {
             lora: true,
             attn_page_mask: true,
@@ -67,7 +65,6 @@ fn tests_every_case() {
     register_rule_put_then_take_reads_pending();
     dummy_run_on_late_host_edge_then_recover();
     rng_keyed_is_pure_function_of_state();
-    per_layer_tap_accumulates_via_register_rule();
     numeric_contract_argmax_and_topk();
 }
 
@@ -207,45 +204,6 @@ fn rng_keyed_is_pure_function_of_state() {
     a.step(&b, &PassInputs::default(), &mut NoKernels).unwrap();
     c.step(&b, &PassInputs::default(), &mut NoKernels).unwrap();
     assert_eq!(a.host_take(&b, 1).unwrap(), c.host_take(&b, 1).unwrap());
-}
-
-fn per_layer_tap_accumulates_via_register_rule() {
-    let c = TraceContainer {
-        names: vec![],
-        channels: vec![chan(Shape::vector(2), Dtype::F32, HostRole::None, true)],
-        ports: vec![],
-        stages: vec![StageProgram {
-            stage: Stage::OnAttn,
-            ops: vec![
-                Op::ChanTake(0),
-                Op::IntrinsicVal {
-                    intr: IntrinsicId::Layer,
-                    lane: 0,
-                    shape: Shape::SCALAR,
-                    dtype: Dtype::U32,
-                },
-                Op::Cast {
-                    value: 1,
-                    dtype: Dtype::F32,
-                },
-                Op::ScatterSet {
-                    base: 0,
-                    idx: 1,
-                    vals: 2,
-                },
-                Op::ChanPut { chan: 0, value: 3 },
-            ],
-        }],
-        externs: alloc::vec::Vec::new(),
-        inputs: Vec::new(),
-    };
-    let b = served(c);
-    let mut inst = Instance::new(&b, &[(0, Value::F32(vec![-1.0, -1.0]))]).unwrap();
-    let r = inst
-        .step(&b, &PassInputs::default(), &mut NoKernels)
-        .unwrap();
-    assert!(r.committed);
-    assert_eq!(inst.peek_front(0).unwrap(), Value::F32(vec![0.0, 1.0]));
 }
 
 fn numeric_contract_argmax_and_topk() {

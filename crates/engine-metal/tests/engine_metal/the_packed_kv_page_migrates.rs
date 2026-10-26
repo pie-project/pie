@@ -191,7 +191,7 @@ fn migrate_case(rig: &mut Rig, head_dim: usize) {
         }],
         values: Vec::new(),
         nodes: Vec::new(),
-        seams: Vec::new(),
+        outputs: Vec::new(),
         drafter: None,
     };
     // Consumers state the seat (kv_heads of head_dim) so `reserve` sizes packed.

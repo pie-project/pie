@@ -48,9 +48,11 @@ fn region_tags(plan: &LaunchStagePlan, region_index: u32) -> String {
                 .nodes
                 .iter()
                 .filter_map(|&node| plan.ops.get(node as usize))
-                .map(|op| match op.intrinsic {
-                    Some(id) => format!("{:#04x}[{id:?}]", op.tag),
-                    None => format!("{:#04x}", op.tag),
+                .map(|op| match plan.names.get(op.name_index as usize) {
+                    Some(name) if op.tag == eta_ir::op::tags::OUTPUT => {
+                        format!("{:#04x}[{name}]", op.tag)
+                    }
+                    _ => format!("{:#04x}", op.tag),
                 })
                 .collect::<Vec<_>>()
                 .join(" ")
@@ -558,7 +560,7 @@ impl Cache {
             region.nodes.iter().any(|&node| {
                 plan.ops
                     .get(node as usize)
-                    .is_some_and(|op| op.intrinsic.is_some())
+                    .is_some_and(|op| op.tag == eta_ir::op::tags::OUTPUT)
             })
         });
         let wide = region.is_some_and(|region| {

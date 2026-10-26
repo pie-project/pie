@@ -5,6 +5,7 @@
 //! other ranks bring prompts of their own or idle through the step serving
 //! the first's routes, through a prefill and the decode after it.
 
+use engine_cpu::forward::{Output, Values};
 use engine_cpu::{Exchange, Forward, Group};
 use poem_ir::{Dtype, Platform, Request, Trace};
 
@@ -57,6 +58,16 @@ fn word(trace: &Trace, tokens: usize) -> u64 {
     trace.facts.word(&Request::new(tokens as u32, false))
 }
 
+fn logits(outs: Vec<Output>) -> Vec<f32> {
+    match outs.into_iter().find(|out| out.name == "logits") {
+        Some(Output {
+            values: Values::F32(v),
+            ..
+        }) => v,
+        _ => Vec::new(),
+    }
+}
+
 /// The two steps' logits on one rank holding every expert.
 fn alone(whole: &Trace, steps: &Steps) -> [Vec<f32>; 2] {
     let mut one = Forward::new(whole.clone(), None, &plane).expect("the micro loads");
@@ -66,6 +77,7 @@ fn alone(whole: &Trace, steps: &Steps) -> [Vec<f32>; 2] {
         .expect("the prefill runs");
     let second =
         (one.step(&[steps.next], p.len() as u32, word(whole, 1))).expect("the decode runs");
+    let (first, second) = (logits(first), logits(second));
     [first, second]
 }
 
@@ -90,7 +102,7 @@ fn group(lowered: &Trace, steps: &[Option<Steps>]) -> Vec<[Vec<f32>; 2]> {
                         .expect("the prefill runs");
                     let second =
                         (me.step(next, p.len() as u32, word(lowered, 1))).expect("the decode runs");
-                    [first, second]
+                    [logits(first), logits(second)]
                 })
             })
             .collect();

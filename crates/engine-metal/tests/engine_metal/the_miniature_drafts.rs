@@ -121,14 +121,28 @@ fn the_draft_head_fires_and_the_trunk_is_unchanged() {
     eprintln!(
         "loaded {DEPLOYMENT} in {:.1}s; drafts advertised: {}",
         booted.elapsed().as_secs_f64(),
-        shell.drafts()
+        shell
+            .classes()
+            .classes
+            .iter()
+            .any(|class| class.outputs.iter().any(|out| out.name == "mtp.drafts"))
     );
     assert!(
-        shell.drafts(),
+        shell
+            .classes()
+            .classes
+            .iter()
+            .any(|class| class.outputs.iter().any(|out| out.name == "mtp.drafts")),
         "the load declares a draft head and advertises none"
     );
     assert_eq!(
-        shell.mtp_depth(),
+        shell
+            .classes()
+            .classes
+            .iter()
+            .flat_map(|class| class.outputs.iter())
+            .find(|out| out.name == "mtp.drafts")
+            .map_or(0, |out| out.width),
         1, // the depth models/deepseek_v4 drafts its MTP chain to
         "the load's token plane is as deep as the text chains"
     );

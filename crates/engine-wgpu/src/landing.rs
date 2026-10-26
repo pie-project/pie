@@ -16,18 +16,18 @@ pub(crate) struct Seat {
     pub layout: Vec<ReadSpan>,
     pub seat: Buffer,
     pub mirror: Buffer,
-    pub draft: Option<(u32, Buffer)>,
-    /// The fire's pixel plane and each lane's (byte, element count) span of it.
-    pub pixels: Option<(Buffer, Vec<(u64, u32)>)>,
+    /// The fire's pixel plane, its output and each lane's (byte, element
+    /// count) span of it.
+    pub pixels: Option<Pixels>,
     pub guests: Option<Guests>,
 }
+
+pub(crate) type Pixels = (Buffer, String, Vec<(u64, u32)>);
 
 pub(crate) struct Landed {
     pub seq: u64,
     pub arm: usize,
-    pub layout: Vec<ReadSpan>,
     pub rows: Vec<Vec<f32>>,
-    pub drafts: Vec<Vec<f32>>,
     pub failed: bool,
 }
 
@@ -39,36 +39,21 @@ pub(crate) struct Post {
 
 pub(crate) type Mailbox = Arc<Mutex<Post>>;
 
-type Rows = (Vec<Vec<f32>>, Vec<Vec<f32>>);
+type Rows = Vec<Vec<f32>>;
 
 fn read_seat(
     layout: Vec<ReadSpan>,
     seat: &Buffer,
-    draft: Option<(u32, Buffer)>,
     on_read: impl FnOnce(Result<Rows, Fault>) + Send + 'static,
 ) {
     let end = layout
         .iter()
+        .filter(|span| span.host)
         .map(|span| span.at + span.bytes())
         .max()
         .unwrap_or(0);
-    let total: usize = layout
-        .iter()
-        .filter(|span| span.voxels.is_none())
-        .map(|span| span.rows as usize)
-        .sum();
     seat.read_async(0, end, move |raw| {
-        let rows = match raw {
-            Ok(raw) => crate::serve::rows_from(&raw, &layout),
-            Err(fault) => return on_read(Err(fault)),
-        };
-        let Some((draft_width, draft)) = draft else {
-            return on_read(Ok((rows, Vec::new())));
-        };
-        let draft_width = draft_width as usize;
-        draft.read_async(0, (total * draft_width * 2) as u64, move |raw| {
-            on_read(raw.map(|raw| (rows, crate::serve::drafts_from(&raw, &layout, draft_width))));
-        });
+        on_read(raw.map(|raw| crate::serve::rows_from(&raw, &layout)));
     });
 }
 
@@ -77,8 +62,7 @@ struct Landing {
     arm: usize,
     layout: Vec<ReadSpan>,
     seat: Buffer,
-    mtp_width: u32,
-    pixels: Option<(Buffer, Vec<(u64, u32)>)>,
+    pixels: Option<Pixels>,
     read: Result<Rows, String>,
     guests: Option<Guests>,
     mailbox: Mailbox,
@@ -89,19 +73,12 @@ struct Landing {
 impl Landing {
     fn run_guests(&mut self, worker: &Worker) -> Option<String> {
         let guests = self.guests.take()?;
-        let Ok((rows, drafts)) = &self.read else {
+        if self.read.is_err() {
             return None;
-        };
+        }
         #[cfg(feature = "wgpu")]
         {
-            let jobs = guests.jobs(
-                rows,
-                drafts,
-                &self.seat,
-                &self.layout,
-                self.mtp_width,
-                self.pixels.as_ref(),
-            );
+            let jobs = guests.jobs(&self.seat, &self.layout, self.pixels.as_ref());
             tracing::debug!(seq = self.seq, guests = jobs.len(), "landing: guests run");
             worker
                 .run_all(jobs)
@@ -110,15 +87,7 @@ impl Landing {
         }
         #[cfg(not(feature = "wgpu"))]
         {
-            let _ = (
-                rows,
-                drafts,
-                &self.layout,
-                &self.seat,
-                self.mtp_width,
-                &self.pixels,
-                worker,
-            );
+            let _ = (&self.layout, &self.seat, &self.pixels, worker);
             match guests {}
         }
     }
@@ -127,7 +96,6 @@ impl Landing {
         let Landing {
             seq,
             arm,
-            layout,
             read,
             mailbox,
             counts,
@@ -135,9 +103,9 @@ impl Landing {
             ..
         } = self;
         tracing::debug!(seq, arm, ok = read.is_ok(), "landing: rows back");
-        let (rows, drafts, refused, failed) = match read {
-            Ok((rows, drafts)) => (rows, drafts, guest_fault, false),
-            Err(why) => (Vec::new(), Vec::new(), Some(why), true),
+        let (rows, refused, failed) = match read {
+            Ok(rows) => (rows, guest_fault, false),
+            Err(why) => (Vec::new(), Some(why), true),
         };
         if let Some(why) = &refused {
             tracing::warn!(seq, arm, failed, %why, "landing: the step faulted");
@@ -147,9 +115,7 @@ impl Landing {
             post.landed.push(Landed {
                 seq,
                 arm,
-                layout,
                 rows,
-                drafts,
                 failed,
             });
             post.waker.take()
@@ -296,11 +262,9 @@ pub(crate) fn on_done(
         layout,
         seat,
         mirror,
-        draft,
         pixels,
         guests,
     } = seat;
-    let mtp_width = draft.as_ref().map_or(0, |&(width, _)| width);
     let read_layout = layout.clone();
     let verdict = mirror.clone();
     let land = move |read: Result<Rows, String>| {
@@ -309,7 +273,6 @@ pub(crate) fn on_done(
             arm,
             layout,
             seat,
-            mtp_width,
             pixels,
             read,
             guests,
@@ -322,7 +285,7 @@ pub(crate) fn on_done(
         tracing::debug!(seq, refused = refused.is_some(), "landing: work done");
         match refused {
             Some(why) => land(Err(why)),
-            None => read_seat(read_layout, &mirror, draft, move |read| {
+            None => read_seat(read_layout, &mirror, move |read| {
                 let read = read.and_then(|rows| verdict.queue_verdict().map(|()| rows));
                 land(read.map_err(|fault| fault.to_string()));
             }),

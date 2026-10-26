@@ -3,29 +3,40 @@ use crate::inferlet::host::pie;
 use crate::model;
 use anyhow::Result;
 
-fn readout(readout: poem_ir::Readout) -> pie::inferlet::model::Readout {
-    use pie::inferlet::model::ReadoutKind;
-    pie::inferlet::model::Readout {
-        kind: match readout.kind {
-            poem_ir::ReadoutKind::Logits => ReadoutKind::Logits,
-            poem_ir::ReadoutKind::Velocity => ReadoutKind::Velocity,
-            poem_ir::ReadoutKind::Hidden => ReadoutKind::Hidden,
-            poem_ir::ReadoutKind::Pixels => ReadoutKind::Pixels,
+fn axis(axis: poem_ir::InputAxis) -> pie::inferlet::model::InputAxis {
+    use pie::inferlet::model::InputAxis;
+    match axis {
+        poem_ir::InputAxis::Lane => InputAxis::Lane,
+        poem_ir::InputAxis::Row => InputAxis::Row,
+        poem_ir::InputAxis::Voxel => InputAxis::Voxel,
+    }
+}
+
+/// An i32 output is read i32, any float one f32.
+fn output_decl(
+    output: &poem_ir::OutputDecl,
+    limits: crate::engine::SchedulerLimits,
+) -> pie::inferlet::model::OutputDecl {
+    pie::inferlet::model::OutputDecl {
+        name: output.name.clone(),
+        axis: axis(output.axis),
+        width: output.width,
+        dtype: match output.dtype {
+            poem_ir::Dtype::I32 => pie::inferlet::types::Dtype::I32,
+            _ => pie::inferlet::types::Dtype::F32,
         },
-        width: readout.width,
+        layers: output.layers,
+        max_rows: u32::try_from(output_rows(output, limits)).unwrap_or(u32::MAX),
+        readout: output.readout,
     }
 }
 
 /// An i32 input is fed i32, any float one f32.
 pub(crate) fn input_decl(input: &poem_ir::InputDecl) -> pie::inferlet::model::InputDecl {
-    use pie::inferlet::model::{InputAxis, RowCount};
+    use pie::inferlet::model::RowCount;
     pie::inferlet::model::InputDecl {
         name: input.name.clone(),
-        axis: match input.axis {
-            poem_ir::InputAxis::Lane => InputAxis::Lane,
-            poem_ir::InputAxis::Row => InputAxis::Row,
-            poem_ir::InputAxis::Voxel => InputAxis::Voxel,
-        },
+        axis: axis(input.axis),
         width: input.width,
         dtype: match input.dtype {
             poem_ir::Dtype::I32 => pie::inferlet::types::Dtype::I32,
@@ -49,10 +60,6 @@ impl pie::inferlet::model::Host for ProcessCtx {
 
     async fn default_system_speculation(&mut self) -> Result<bool> {
         Ok(false)
-    }
-
-    async fn mtp_depth(&mut self) -> Result<u32> {
-        Ok(model::model().eta_caps().mtp_depth)
     }
 
     async fn draft_block(&mut self) -> Result<Option<pie::inferlet::model::BlockDrafter>> {
@@ -83,6 +90,7 @@ impl pie::inferlet::model::Host for ProcessCtx {
         switches: Vec<(String, String)>,
     ) -> Result<std::result::Result<pie::inferlet::model::LaneDecl, String>> {
         let model = model::model();
+        let limits = crate::engine::get_spec(0)?.limits;
         let lane = match model.lane(&switches) {
             Ok(lane) => lane,
             Err(error) => return Ok(Err(error)),
@@ -95,7 +103,11 @@ impl pie::inferlet::model::Host for ProcessCtx {
                 .collect(),
             state: lane.reads_kv || lane.reads_state,
             embeds: lane.embeds,
-            readout: lane.readout.map(readout),
+            outputs: lane
+                .outputs
+                .iter()
+                .map(|output| output_decl(output, limits))
+                .collect(),
         }))
     }
 
@@ -165,22 +177,17 @@ impl pie::inferlet::model::Host for ProcessCtx {
         Ok(crate::scheduler::run_ahead_window() as u32)
     }
 
-    async fn max_readout_rows(&mut self, kind: pie::inferlet::model::ReadoutKind) -> Result<u32> {
-        let limits = crate::engine::get_spec(0)?.limits;
-        Ok(u32::try_from(readout_rows(limits, kind)).unwrap_or(u32::MAX))
-    }
-
     async fn rs_state_size(&mut self) -> Result<u64> {
         Ok(model::model().rs_caps().state_size)
     }
 }
 
-fn readout_rows(
-    limits: crate::engine::SchedulerLimits,
-    kind: pie::inferlet::model::ReadoutKind,
-) -> usize {
-    match kind {
-        pie::inferlet::model::ReadoutKind::Logits if limits.max_readouts > 0 => {
+/// The most rows one pass reads out of `output`: its layers for a lane's,
+/// the readout ceiling for readout rows, else the fire's tokens.
+fn output_rows(output: &poem_ir::OutputDecl, limits: crate::engine::SchedulerLimits) -> usize {
+    match output.axis {
+        poem_ir::InputAxis::Lane => output.layers.max(1) as usize,
+        _ if output.readout && limits.max_readouts > 0 => {
             limits.max_readouts.min(limits.max_forward_tokens)
         }
         _ => limits.max_forward_tokens,
@@ -211,7 +218,6 @@ mod tests {
     fn a_prefill_chunk_stops_at_the_rows_the_engine_prefers() {
         let limits = |max_forward_tokens, prefill_rows| crate::engine::SchedulerLimits {
             max_readouts: 0,
-            max_scoring_lanes: 0,
             max_forward_requests: 8,
             max_forward_tokens,
             max_page_refs: 64,

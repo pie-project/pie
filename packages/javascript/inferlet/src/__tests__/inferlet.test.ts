@@ -58,8 +58,7 @@ describe('model', () => {
     expect(model.kvPageSize()).toBe(16);
     expect(model.frameSize()).toBe(1);
     expect(model.channelCapacity()).toBe(8);
-    expect(model.maxReadoutRows('logits')).toBe(256);
-    expect(model.maxReadoutRows('hidden')).toBe(2048);
+    expect(model.lane([]).outputs[0]).toMatchObject({ name: 'logits', maxRows: 256, readout: true });
   });
 
   it('exposes diffusion and drafting facts', () => {

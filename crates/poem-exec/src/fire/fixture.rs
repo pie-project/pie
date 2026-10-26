@@ -10,7 +10,7 @@ use poem_compiler::{Lowering, Region};
 use poem_ir::ops::{Attn, Collective, Elemwise};
 use poem_ir::{
     CacheRow, Conv, Def, Dim, Dtype, Fused, Gather, Guard, Linear, Node, Operands, Operation,
-    Platform, RuntimeInput, Sampling, Seam, Ssm, StructKind, Trace, Ty, ValueDecl, ValueId,
+    Output, Platform, RuntimeInput, Sampling, Ssm, StructKind, Trace, Ty, ValueDecl, ValueId,
 };
 
 use crate::fire::sink::{EventId, Sink};
@@ -47,7 +47,7 @@ impl Build {
                 }],
                 values: Vec::new(),
                 nodes: Vec::new(),
-                seams: Vec::new(),
+                outputs: Vec::new(),
                 drafter: None,
                 inputs: Vec::new(),
             },
@@ -144,10 +144,11 @@ impl Build {
     }
 
     pub(crate) fn out(&mut self, v: ValueId) -> &mut Build {
-        self.trace.seams.push(Seam {
-            seam: "out".to_string(),
-            values: vec![v],
+        self.trace.outputs.push(Output {
+            name: "logits".to_string(),
+            value: v,
             layer: None,
+            grid: None,
         });
         self
     }

@@ -4,9 +4,9 @@
 //! Each value is named by what defines it: an input by what it reads, a
 //! weight by its param's name, a cache by its row's name, an op's output by
 //! the op, its operands' names and the rows its guard holds for. Two traces
-//! are the same when they hold the same live nodes and seams under those
+//! are the same when they hold the same live nodes and outputs under those
 //! names, the same params, caches and facts, and every cache sees its reads
-//! between the same writes. A node is live when a seam or a write reads
+//! between the same writes. A node is live when an output or a write reads
 //! what it makes, however far down; the rest compute nothing anyone sees.
 
 use std::collections::hash_map::DefaultHasher;
@@ -38,9 +38,9 @@ pub fn difference(a: &Trace, b: &Trace) -> Option<String> {
     if na != nb {
         return Some(unlike_multiset("nodes", &na, &nb));
     }
-    let (sa, sb) = (ka.seams(a), kb.seams(b));
+    let (sa, sb) = (ka.outputs(a), kb.outputs(b));
     if sa != sb {
-        return Some(unlike_multiset("seams", &sa, &sb));
+        return Some(unlike_multiset("outputs", &sa, &sb));
     }
     None
 }
@@ -145,7 +145,7 @@ impl Keys {
                     })
                     .collect();
                 // The rows the arms imply it is over, as the class check
-                // reads a merge a seam holds.
+                // reads a merge an output holds.
                 let Def::Merge(joined) = &decl.def else {
                     unreachable!("a merge's own declaration")
                 };
@@ -232,16 +232,18 @@ impl Keys {
         out
     }
 
-    fn seams(&mut self, t: &Trace) -> BTreeMap<String, usize> {
+    fn outputs(&mut self, t: &Trace) -> BTreeMap<String, usize> {
         let mut out = BTreeMap::new();
-        for seam in &t.seams {
-            let values: Vec<String> = seam
-                .values
-                .iter()
-                .map(|v| format!("{:x}", self.names[v]))
+        for output in &t.outputs {
+            let values: Vec<String> = output
+                .values()
+                .map(|v| format!("{:x}", self.names.get(&v).copied().unwrap_or_default()))
                 .collect();
-            *out.entry(format!("{} {values:?} layer {:?}", seam.seam, seam.layer))
-                .or_default() += 1;
+            *out.entry(format!(
+                "{} {values:?} layer {:?}",
+                output.name, output.layer
+            ))
+            .or_default() += 1;
         }
         out
     }
@@ -306,7 +308,7 @@ fn writes(t: &Trace, n: usize) -> bool {
             .any(|(_, of)| matches!(t.values[of.0 as usize].def, Def::Cache(_)))
 }
 
-/// Each node, whether a seam or a write reads what it makes.
+/// Each node, whether an output or a write reads what it makes.
 fn live(t: &Trace) -> Vec<bool> {
     let mut producer = HashMap::new();
     for (n, node) in t.nodes.iter().enumerate() {
@@ -317,11 +319,7 @@ fn live(t: &Trace) -> Vec<bool> {
         }
     }
     let mut live = vec![false; t.nodes.len()];
-    let mut wanted: Vec<ValueId> = t
-        .seams
-        .iter()
-        .flat_map(|s| s.values.iter().copied())
-        .collect();
+    let mut wanted: Vec<ValueId> = t.outputs.iter().flat_map(crate::Output::values).collect();
     for (n, node) in t.nodes.iter().enumerate() {
         if writes(t, n) {
             live[n] = true;

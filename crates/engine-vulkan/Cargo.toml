@@ -48,6 +48,9 @@ ash = { version = "0.38", default-features = false, features = [
     "std",
 ], optional = true }
 
+[dev-dependencies]
+ztensor = { workspace = true }
+
 [features]
 default = []
 vulkan = [

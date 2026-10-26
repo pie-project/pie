@@ -2,7 +2,6 @@ use std::collections::{BTreeSet, HashMap};
 
 use eta_compiler::codegen::launch::{LaunchPackage, LaunchStage, ValueOrigin};
 use eta_ir::Dtype;
-use eta_ir::op::IntrinsicId;
 use eta_ir::op::tags;
 use eta_ir::registry::{Port, Stage};
 use eta_ir::validate::Direction;
@@ -42,15 +41,6 @@ pub struct ExecPlan {
     pub executable: bool,
 
     pub reject_reason: Option<String>,
-
-    pub needs_logits: bool,
-
-    pub needs_mtp_logits: bool,
-    pub needs_mtp_drafts: bool,
-
-    pub needs_attn_scores: bool,
-
-    pub needs_pixels: bool,
 }
 
 impl ExecPlan {
@@ -137,12 +127,18 @@ impl ExecPlan {
         self.readiness(c, at) == Some(Direction::NeedsFull)
     }
 
+    /// The outputs the program reads, by name and the lane reading each.
     #[must_use]
-    pub fn reads_intrinsic(&self, wanted: IntrinsicId) -> bool {
-        self.package
+    pub fn outputs(&self) -> Vec<(&str, u32)> {
+        let mut reads: Vec<(&str, u32)> = self
+            .package
             .values
             .iter()
-            .any(|value| value.intrinsic == Some(wanted))
+            .filter_map(|value| Some((value.output.as_deref()?, value.lane)))
+            .collect();
+        reads.sort_unstable();
+        reads.dedup();
+        reads
     }
 }
 
@@ -230,55 +226,7 @@ fn rebuild_stage_indexes(package: &LaunchPackage) -> Vec<StagePlan> {
 
 pub fn classify_exec_plan(plan: &mut ExecPlan) {
     plan.executable = true;
-    plan.needs_logits = false;
-    plan.needs_mtp_logits = false;
-    plan.needs_mtp_drafts = false;
-    plan.needs_attn_scores = false;
-    plan.needs_pixels = false;
     plan.reject_reason = None;
-
-    for value in &plan.package.values {
-        match value.intrinsic {
-            None => continue,
-            Some(IntrinsicId::Logits | IntrinsicId::Velocity | IntrinsicId::Hidden) => {
-                plan.needs_logits = true;
-            }
-            Some(IntrinsicId::MtpLogits) => {
-                plan.needs_logits = true;
-                plan.needs_mtp_logits = true;
-            }
-            Some(IntrinsicId::MtpDrafts) => {
-                plan.needs_logits = true;
-                plan.needs_mtp_drafts = true;
-            }
-            Some(IntrinsicId::AttnScore) => plan.needs_attn_scores = true,
-            Some(IntrinsicId::Pixels) => plan.needs_pixels = true,
-            Some(other) => {
-                plan.executable = false;
-                plan.reject_reason = Some(format!(
-                    "program reads the `{}` intrinsic, which this boundary does not \
-                     wire (Metal forward)",
-                    other.name()
-                ));
-            }
-        }
-    }
-
-    for stage in &plan.package.stages {
-        if stage.stage.per_layer() {
-            plan.executable = false;
-            plan.reject_reason =
-                Some("program attaches per-layer taps (Metal forward not wired)".to_string());
-        }
-    }
-
-    if !plan.executable {
-        plan.needs_logits = false;
-        plan.needs_mtp_logits = false;
-        plan.needs_mtp_drafts = false;
-        plan.needs_attn_scores = false;
-        plan.needs_pixels = false;
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -295,7 +243,7 @@ impl Boundaries {
     };
 
     pub const CUDA: Self = Self {
-        kernel_calls: &["envelope_dot"],
+        kernel_calls: &[],
         sink_calls: &["lora", "attn_page_mask"],
     };
 
@@ -346,11 +294,6 @@ pub fn adopt_launch_package_with(
         const_ports,
         executable: false,
         reject_reason: None,
-        needs_logits: false,
-        needs_mtp_logits: false,
-        needs_mtp_drafts: false,
-        needs_attn_scores: false,
-        needs_pixels: false,
     };
     classify_exec_plan(&mut plan);
 
@@ -370,9 +313,6 @@ pub fn adopt_launch_package_with(
             let shaped = op.tag != tags::KERNEL_CALL || op.args.len() == 1;
             if !(named && shaped) {
                 plan.executable = false;
-                plan.needs_logits = false;
-                plan.needs_mtp_logits = false;
-
                 plan.reject_reason = Some(format!(
                     "program requests the semantic library boundary `{name}`, \
                      which this backend does not implement (it has: {})",

@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 
-use eta_ir::registry::{SinkScope, Stage};
+use eta_ir::registry::Stage;
 
 use crate::context::{ChannelRef, SinkCall};
 use crate::error::{Endpoint, Span, TraceError};
@@ -56,11 +56,7 @@ pub(crate) fn lint(
     }
 
     for (stage, s) in sinks {
-        let ok = match s.scope {
-            SinkScope::PassWide => *stage == Stage::Prologue,
-            SinkScope::Attention => matches!(stage, Stage::Prologue | Stage::OnAttnProj),
-        };
-        if !ok {
+        if *stage != Stage::Prologue {
             errs.push(TraceError::SinkMisplacement {
                 sink: s.name.clone(),
                 stage: *stage,

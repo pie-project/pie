@@ -55,7 +55,7 @@ async fn main(_input: Input) -> Result<String> {
     fwd.embed(&toks, &embed_indptr)?;
     fwd.state(&[&ws], StateGeometry::folding())?;
     fwd.epilogue(move || {
-        let logits = intrinsics::logits();
+        let logits = intrinsics::output(0, "logits");
         let logprobs = log_softmax(&logits);
         let probabilities = exp(&logprobs);
         let entropy = reshape(entropy_from_logprobs(&probabilities, &logprobs), [1]);

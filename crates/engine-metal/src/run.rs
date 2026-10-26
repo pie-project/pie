@@ -123,8 +123,6 @@ pub struct FireBindings {
 
     pub tables: FireTables,
 
-    pub scores: Option<crate::scores::ScoreSeat>,
-
     pub rs: Option<std::sync::Arc<crate::rs::Seat>>,
 
     /// The fire's recurrent snapshot table, when a lane snapshots

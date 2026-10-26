@@ -1,115 +1,126 @@
-//! A fire's readout: the logits rows (and the draft head's) every lane asked
-//! for, as the fire's program returned them. Buffers live on the host here,
-//! so a lane's rows are a slice of the words.
+//! A fire's outputs: one plane per output the fire's classes write, as the
+//! fire's program returned it. Buffers live on the host here, so a lane's
+//! rows are a slice of the words.
+
+use eta_exec::Value;
+use poem_ir::{Dtype, InputAxis};
 
 use crate::device::Buffer;
 
-/// Where one lane's rows sit in the readout: `count` rows from `first`.
+/// Where one lane's rows sit in a plane: `count` rows from `first`, in each
+/// of its layers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Seat {
     pub first: u32,
     pub count: u32,
 }
 
-pub struct Kept {
-    /// `f32 [rows, width]` (a bf16 plane holds `bits << 16` per word, which
-    /// reads as the same f32).
-    pub logits: Buffer,
+/// One output of a fire: `[layers.max(1) * rows, width]` of `dtype` (f32 or
+/// i32; a bf16 plane holds `bits << 16` per word, which reads as the same
+/// f32), a layer's `rows` after another.
+pub struct Plane {
+    pub name: String,
+    pub axis: InputAxis,
+    pub readout: bool,
+    pub buffer: Buffer,
     pub rows: u32,
     pub width: u32,
-    /// The draft head's rows, `[rows, mtp_width]`, laid out as `logits`.
-    pub mtp: Option<(Buffer, u32)>,
-    /// Per real lane: its first row and how many.
-    pub layout: Vec<(u32, u32)>,
-    /// Every plane reads as f32 on this backend.
-    pub f32: bool,
+    pub layers: u32,
+    pub dtype: Dtype,
+}
+
+impl Plane {
+    /// Rows `rows` of every layer, a layer after another.
+    fn rows_of(&self, rows: impl Iterator<Item = u32> + Clone) -> Result<Value, String> {
+        let width = self.width as usize;
+        let words = self.buffer.words();
+        let mut picked = Vec::new();
+        for layer in 0..self.layers.max(1) {
+            for row in rows.clone() {
+                let from = (layer * self.rows + row) as usize * width;
+                let span = words.get(from..from + width).ok_or_else(|| {
+                    format!(
+                        "row {row} of layer {layer} of output `{}`, a plane of {} words",
+                        self.name,
+                        words.len()
+                    )
+                })?;
+                picked.extend_from_slice(span);
+            }
+        }
+        Ok(match self.dtype {
+            Dtype::I32 => Value::I32(picked.into_iter().map(|w| w as i32).collect()),
+            _ => Value::F32(picked.into_iter().map(f32::from_bits).collect()),
+        })
+    }
+}
+
+pub type Rows<'a> = (&'a str, u32, Vec<f32>);
+
+pub struct Kept {
+    pub planes: Vec<Plane>,
+    /// Per real lane, per plane: where the lane's rows sit, when its class
+    /// writes the plane.
+    pub seats: Vec<Vec<Option<Seat>>>,
+    /// Per real lane: the plane read back to the host and the rows of it.
+    pub readback: Vec<Option<(usize, Vec<u32>)>>,
+    /// The output a decoder's pixels are, and each real lane's.
+    pub pixels: (String, Vec<Vec<f32>>),
 }
 
 impl std::fmt::Debug for Kept {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let planes: Vec<(&str, u32, u32)> = (self.planes.iter())
+            .map(|p| (p.name.as_str(), p.rows, p.width))
+            .collect();
         f.debug_struct("Kept")
-            .field("rows", &self.rows)
-            .field("width", &self.width)
-            .field("mtp", &self.mtp.as_ref().map(|(_, w)| *w))
-            .field("layout", &self.layout)
+            .field("planes", &planes)
+            .field("seats", &self.seats)
             .finish()
     }
 }
 
 impl Kept {
+    /// The plane lane `lane` reads output `name` from, and its seat there.
     #[must_use]
-    pub fn new(
-        logits: Buffer,
-        rows: u32,
-        width: u32,
-        mtp: Option<(Buffer, u32)>,
-        layout: Vec<(u32, u32)>,
-    ) -> Kept {
-        Kept {
-            f32: true,
-            logits,
-            rows,
-            width,
-            mtp,
-            layout,
-        }
+    pub fn bound(&self, lane: usize, name: &str) -> Option<(usize, Seat)> {
+        let seats = self.seats.get(lane)?;
+        self.planes
+            .iter()
+            .zip(seats)
+            .enumerate()
+            .find_map(|(at, (plane, seat))| (plane.name == name).then_some((at, (*seat)?)))
     }
 
-    /// Where lanes `lane..lane + lanes` read, when their rows are one run.
-    #[must_use]
-    pub fn seat(&self, lane: usize, lanes: usize) -> Option<Seat> {
-        let span = self
-            .layout
-            .get(lane..(lane + lanes.max(1)).min(self.layout.len()))?;
-        let (first, _) = *span.first()?;
-        let mut next = first;
-        for &(at, count) in span {
-            if at != next {
-                return None;
-            }
-            next += count;
-        }
-        (next > first).then_some(Seat {
-            first,
-            count: next - first,
-        })
-    }
-
-    /// The readout is always on the host here.
-    #[must_use]
-    pub fn on_host(&self) -> bool {
-        true
-    }
-
-    fn rows_of(plane: &Buffer, first: u32, count: u32, width: usize) -> Result<Vec<f32>, String> {
-        let words = plane.words();
-        let from = first as usize * width;
-        let to = from + count as usize * width;
-        let span = words.get(from..to).ok_or_else(|| {
-            format!(
-                "readout rows {first}..{} of a plane holding {} rows",
-                first + count,
-                words.len() / width.max(1)
-            )
-        })?;
-        Ok(span.iter().map(|w| f32::from_bits(*w)).collect())
-    }
-
-    /// Lane `lane`'s logits rows on the host.
-    pub fn lane_rows(&self, lane: usize) -> Result<Vec<f32>, String> {
-        let Some(&(first, count)) = self.layout.get(lane) else {
-            return Ok(Vec::new());
+    /// Lane `lane`'s rows of output `name`, every layer's.
+    pub fn lane_value(&self, lane: usize, name: &str) -> Result<Option<Value>, String> {
+        let Some((at, seat)) = self.bound(lane, name) else {
+            let pixels =
+                (self.pixels.1.get(lane)).filter(|v| !v.is_empty() && self.pixels.0 == name);
+            return Ok(pixels.map(|values| Value::F32(values.clone())));
         };
-        Self::rows_of(&self.logits, first, count, self.width as usize)
+        self.planes[at]
+            .rows_of(seat.first..seat.first + seat.count)
+            .map(Some)
     }
 
-    /// Lane `lane`'s draft rows on the host (empty when there is no draft
-    /// head).
-    pub fn lane_drafts(&self, lane: usize) -> Result<Vec<f32>, String> {
-        let (Some(&(first, count)), Some((plane, width))) = (self.layout.get(lane), &self.mtp)
-        else {
-            return Ok(Vec::new());
+    /// Lane `lane`'s read-back rows: the output they are of, how many, and
+    /// their values.
+    pub fn lane_rows(&self, lane: usize) -> Result<Option<Rows<'_>>, String> {
+        let Some(Some((at, rows))) = self.readback.get(lane) else {
+            return Ok(None);
         };
-        Self::rows_of(plane, first, count, *width as usize)
+        let plane = &self.planes[*at];
+        let values = match plane.rows_of(rows.iter().copied())? {
+            Value::F32(values) => values,
+            _ => return Ok(None),
+        };
+        Ok(Some((plane.name.as_str(), rows.len() as u32, values)))
+    }
+
+    /// Whether lane `lane` reads back the readout rows.
+    #[must_use]
+    pub fn reads_readout(&self, lane: usize) -> bool {
+        matches!(self.readback.get(lane), Some(Some((at, _))) if self.planes[*at].readout)
     }
 }

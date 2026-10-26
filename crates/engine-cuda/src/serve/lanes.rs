@@ -21,7 +21,6 @@ pub struct Seated<'a> {
     pub window_copies: &'a [(u32, u32)],
     pub mask: Option<&'a Masking>,
     pub adapter: Option<u32>,
-    pub captures_scores: bool,
     pub rs: RsVerb,
     pub rs_reset: RsReset,
     pub rs_slot: Option<u32>,
@@ -47,7 +46,6 @@ impl<'a> Seated<'a> {
             window_copies: &[],
             mask: None,
             adapter: None,
-            captures_scores: false,
             rs: RsVerb::Fold,
             rs_reset: RsReset::Inferred,
             rs_slot: None,
@@ -72,14 +70,6 @@ impl<'a> Seated<'a> {
     pub fn adapted(lane: Lane<'a>, id: u32) -> Seated<'a> {
         Seated {
             adapter: Some(id),
-            ..Seated::of(lane)
-        }
-    }
-
-    #[must_use]
-    pub fn capturing(lane: Lane<'a>) -> Seated<'a> {
-        Seated {
-            captures_scores: true,
             ..Seated::of(lane)
         }
     }

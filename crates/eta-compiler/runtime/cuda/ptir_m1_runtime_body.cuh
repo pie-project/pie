@@ -79,22 +79,21 @@ __device__ __forceinline__ void ptir_m1_execute(
     return;
   }
   if (p.tag == 0xA0) {
-    if (p.intr == 5u) {
-      if (out0.dtype != 2u || out0.len != 1u || a0 == nullptr) {
+    if (out0.dtype == 1u) {
+      // An output of ids, read as stored.
+      const m1_u32 width = out0.last == 0u ? p.imm : out0.last;
+      const m1_u32 stride =
+          p.intrinsic_row_stride == 0u ? width : p.intrinsic_row_stride;
+      if (p.intrinsic_dtype != 3u || a0 == nullptr || width == 0u || stride < width) {
         m1_fault(status, p.tag);
         return;
       }
-      m1_store_u(o0, 0u, reinterpret_cast<const m1_u32*>(a0)[0]);
-      return;
-    }
-    if (p.intr == 6u) {
-      if (out0.dtype != 1u || a0 == nullptr) {
-        m1_fault(status, p.tag);
-        return;
-      }
+      const m1_u64 first_row =
+          (m1_u64)p.intrinsic_row_offset + (m1_u64)p.imm2;
       for (m1_u32 index = 0; index < out0.len; ++index)
         m1_store_i(
-            o0, index, reinterpret_cast<const int*>(a0)[index]);
+            o0, index,
+            reinterpret_cast<const int*>(a0)[(first_row + index / width) * stride + index % width]);
       return;
     }
     if (p.imm == 0u || p.intrinsic_dtype > 2u || a0 == nullptr) {

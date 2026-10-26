@@ -126,7 +126,7 @@ const fn is_sort(tag: u8) -> bool {
 
 #[must_use]
 pub fn is_boundary(tag: u8) -> bool {
-    if tag == tags::INTRINSIC_VAL {
+    if tag == tags::OUTPUT {
         return true;
     }
     eta_ir::op::spec(tag).is_some_and(|row| row.family == eta_ir::op::Family::Channel)
@@ -740,7 +740,7 @@ mod tests {
             .collect();
         assert_eq!(
             left_out,
-            ["chan_take", "chan_read", "chan_put", "intrinsic_val"],
+            ["chan_take", "chan_read", "chan_put", "output"],
             "the emitted set is no longer every op `eval_op` evaluates"
         );
     }

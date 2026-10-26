@@ -15,7 +15,7 @@ Python inferlet and a Rust inferlet share the host's program cache.
         fwd = ForwardPass()
         fwd.embed(model.encode(input["prompt"]))
         fwd.state([ws], StateGeometry.folding())
-        tok_out = fwd.epilogue(lambda: reduce_argmax(intrinsics.logits()))
+        tok_out = fwd.epilogue(lambda: reduce_argmax(intrinsics.output(0, "logits")))
         pipe.submit(fwd)
         token = await tok_out
 

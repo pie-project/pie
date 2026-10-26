@@ -16,34 +16,33 @@ tap.
 
 ## What it demonstrates
 
-`intrinsics::attn_score(planes)` at the **epilogue** returns
-`[planes, intrinsics::attn_score_kv_max()]` f32 — every exported attention
-layer and every query head of this fire, at once, as a device tensor captured
-by the attention kernel as it ran. Rows are `layer * heads + head`
-(**layer-major**), so declaring fewer planes than the load exports reads a
-prefix of the layers. Per row, slots `< kv_len` hold that head's attention
-probability (the live prefix sums to 1) and the rest are exactly `0.0`.
+`intrinsics::output(0, "attn.scores")` at the **epilogue** returns the
+model's `attn.scores` output for lane 0: `[layers, heads * kv_ceiling]` f32,
+one row a layer the model reads scores out of, each a `kv_ceiling` run a
+query head — a device tensor its `attn.score_capture` op wrote. Per run, slots
+`< kv_len` hold that head's attention probability (the live prefix sums to 1)
+and the rest are exactly `0.0`.
 
-The backend folds the last `min(32, qo_len)` query rows into the row it
-publishes; this program taps only 1-row decode fires, so the row is the current
-query's own distribution — what TOVA ranks.
+The op folds the lane's last `observe` query rows (32 in the in-tree models)
+into the row; this program taps only 1-row decode fires, so the row is the
+current query's own distribution — what TOVA ranks.
 
 The fold is in-graph, at the epilogue, on the device:
 
 ```rust
-let rect   = intrinsics::attn_score(planes);          // [planes, kv_max]
-let folded = &reduce_sum(&transpose(&rect)) / heads;  // [kv_max], mass = layers
+let rect   = reshape(intrinsics::output(0, "attn.scores"), [planes, kv_ceiling]);
+let folded = &reduce_sum(&transpose(&rect)) / heads;  // [kv_ceiling], mass = layers
 ```
 
-`planes = layers * heads` is **declared**: the program states it and the
-backend refuses a claim larger than the load exports. The defaults fit
-`Qwen/Qwen3.5-0.8B`, whose hybrid stack puts attention on 6 of its 24 layers,
-with 8 query heads. `kv_max` in the report is the program's page-aligned window
-into the published row; a request that would outgrow the row is refused.
+`layers` and the row's width come from the model's output declaration
+(`model::lane_of`); the program states `heads`, which splits the width into
+`kv_ceiling`. The default fits `Qwen/Qwen3.5-0.8B` (8 query heads). `kv_max` in
+the report is the program's page-aligned window into the row; a request that
+would outgrow the row is refused.
 
 ## Requirements
 
-Needs the `has_attn_score` model capability.
+Needs a model that reads out `attn.scores`.
 
 ## Reading the report
 
@@ -70,5 +69,4 @@ observed in the row; they must agree on every fire.
 | `max_tokens` | int | 32 | tokens to generate |
 | `seed` | int | — | RNG key |
 | `cache_size` | int | 16 | KV positions TOVA would keep |
-| `layers` | int | 6 | exported attention layers to claim |
 | `heads` | int | 8 | query heads per exported layer |

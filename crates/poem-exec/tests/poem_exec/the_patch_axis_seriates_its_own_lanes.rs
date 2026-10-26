@@ -2,8 +2,7 @@ use poem_compiler::{Budget, Budgets, DeviceProfile, PatchLadder, compile_axes};
 use poem_exec::fire::{Fault, Lane, compose_axes};
 use poem_ir::ops::Elemwise;
 use poem_ir::{
-    CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Seam, Trace, Ty, ValueDecl,
-    ValueId,
+    CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Trace, Ty, ValueDecl, ValueId,
 };
 use poem_ir::{NormAxis, NormWeight};
 
@@ -43,7 +42,7 @@ impl Build {
                 }],
                 values: Vec::new(),
                 nodes: Vec::new(),
-                seams: Vec::new(),
+                outputs: Vec::new(),
                 drafter: None,
                 inputs: Vec::new(),
             },
@@ -82,10 +81,11 @@ impl Build {
     }
 
     fn out(&mut self, v: ValueId) {
-        self.trace.seams.push(Seam {
-            seam: "out".to_string(),
-            values: vec![v],
+        self.trace.outputs.push(poem_ir::Output {
+            name: "logits".to_string(),
+            value: v,
             layer: None,
+            grid: None,
         });
     }
 }

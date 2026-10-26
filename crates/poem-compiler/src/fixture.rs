@@ -1,6 +1,6 @@
 use poem_ir::ops::{Attn, Elemwise};
 use poem_ir::{
-    CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Seam, StructKind, Trace, Ty,
+    CacheRow, Def, Dim, Dtype, Guard, Node, Output, Platform, RuntimeInput, StructKind, Trace, Ty,
     ValueDecl, ValueId,
 };
 use poem_ir::{NormAxis, NormWeight};
@@ -44,7 +44,7 @@ impl Build {
                 }],
                 values: Vec::new(),
                 nodes: Vec::new(),
-                seams: Vec::new(),
+                outputs: Vec::new(),
                 drafter: None,
                 inputs: Vec::new(),
             },
@@ -175,10 +175,11 @@ impl Build {
     }
 
     pub(crate) fn out(&mut self, v: ValueId) -> &mut Build {
-        self.trace.seams.push(Seam {
-            seam: "out".to_string(),
-            values: vec![v],
+        self.trace.outputs.push(Output {
+            name: "logits".to_string(),
+            value: v,
             layer: None,
+            grid: None,
         });
         self
     }

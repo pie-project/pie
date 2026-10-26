@@ -356,7 +356,7 @@ def forward(m, inputs):
     image_out(inputs.on(switch_is("reading", "image.out")), m)
     trunk_rows = inputs.on(~switch_is("reading", "image.in") & ~switch_is("reading", "image.out"))
     canvas_rows = trunk_rows.on(on_canvas())
-    return trunk(trunk_rows, canvas_rows, m)
+    trunk(trunk_rows, canvas_rows, m)
 
 def run_embedder(e, t_freq):
     return run_linear(e.mlp_out, ops.elemwise.gelu(run_linear(e.mlp_in, t_freq), True))
@@ -407,12 +407,12 @@ def trunk(all, den, m):
     y = all.fold_layers(m.layers, y, block)
 
     canvas, text = y.on(on_canvas()), y.on(~on_canvas())
-    seam.at(seam.HIDDEN, [canvas])
+    output("hidden", canvas)
     text_in = all.on(~on_canvas())
     x = ops.elemwise.rmsnorm(text, m.final_norm, NORM_EPS)
     x = ops.gather.gather_rows(x, text_in.readout_rows())
     logits = ops.linear.lm_head(x, m.head)
-    seam.at(seam.OUT, [logits])
+    output("logits", logits)
     return canvas
 
 def moe(x, w, m):
@@ -473,7 +473,7 @@ def image_in(arm, m):
     temb = run_embedder(m.time_embed, freqs)
     h, g1 = convolve(z, g, m.patch_embed.conv_in)
     x = run_resblock(h, g1, m.patch_embed.res, temb)
-    seam.at(seam.PIXELS, [x, g1])
+    output("pixels", x, grid = g1)
 
 def image_out(arm, m):
     g = arm.grid()
@@ -483,4 +483,4 @@ def image_out(arm, m):
     x = run_resblock(rows, g, m.final_layer.res, temb)
     h = run_group_norm(x, g, m.final_layer.norm_out, True)
     v, gv = convolve(h, g, m.final_layer.conv_out)
-    seam.at(seam.PIXELS, [v, gv])
+    output("pixels", v, grid = gv)

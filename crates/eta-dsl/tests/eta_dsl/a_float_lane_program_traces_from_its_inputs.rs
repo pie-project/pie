@@ -1,5 +1,5 @@
 use eta_ir::container::HostRole;
-use eta_ir::registry::{EngineCaps, Graph, Readout, ReadoutKind};
+use eta_ir::registry::{Axis, EngineCaps, OutputDecl};
 use eta_ir::validate::bind;
 
 use eta_dsl::builder::Builder;
@@ -9,18 +9,17 @@ use eta_dsl::{Channel, Traced};
 const ROWS: u32 = 16;
 const WIDTH: u32 = 8;
 
-fn lane(velocity: bool) -> Vec<Option<Readout>> {
-    vec![Some(if velocity {
-        Readout {
-            kind: ReadoutKind::Velocity,
-            width: WIDTH,
-        }
+fn lane(velocity: bool) -> Vec<Vec<OutputDecl>> {
+    if velocity {
+        vec![vec![crate::outputs::decl(
+            "velocity",
+            Axis::Voxel,
+            WIDTH,
+            false,
+        )]]
     } else {
-        Readout {
-            kind: ReadoutKind::Logits,
-            width: 32,
-        }
-    })]
+        crate::outputs::logits(32)
+    }
 }
 
 fn float_lane() -> (Traced, [Channel; 4]) {
@@ -35,6 +34,7 @@ fn float_lane() -> (Traced, [Channel; 4]) {
     let (px, pt, pc) = (x.clone(), t.clone(), ctx.clone());
     let (ex, et, eo) = (x.clone(), t.clone(), out.clone());
     let mut b = Builder::new(32, 2);
+    b.outputs(lane(true));
     b.stage(Stage::Prologue, move || {
         let _ = px.read();
         let _ = pt.read();
@@ -43,7 +43,7 @@ fn float_lane() -> (Traced, [Channel; 4]) {
     b.stage(Stage::Epilogue, move || {
         let k = step.take();
         let x_cur = reshape(ex.take(), [ROWS, WIDTH]);
-        let v = intrinsics::velocity(0, ROWS, WIDTH);
+        let v = intrinsics::output_rows(0, "velocity", ROWS);
         assert_eq!(
             v.shape().dims(),
             &[ROWS, WIDTH],
@@ -89,21 +89,10 @@ fn a_float_lane_program_traces_and_binds_on_a_velocity_lane() {
     assert_eq!(decl(&t).host_role, HostRole::None);
     assert_eq!(decl(&out).host_role, HostRole::Reader);
 
-    bind(
-        container.clone(),
-        lane(true),
-        Graph::default(),
-        EngineCaps::default(),
-    )
-    .expect("binds on a lane reading out the velocity");
+    bind(container.clone(), lane(true), EngineCaps::default())
+        .expect("binds on a lane reading out the velocity");
     assert!(
-        bind(
-            container.clone(),
-            lane(false),
-            Graph::default(),
-            EngineCaps::default()
-        )
-        .is_err(),
-        "a lane reading logits refuses `velocity()` at bind"
+        bind(container.clone(), lane(false), EngineCaps::default()).is_err(),
+        "a lane reading logits refuses the velocity at bind"
     );
 }

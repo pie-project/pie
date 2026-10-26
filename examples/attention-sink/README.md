@@ -57,7 +57,7 @@ last fire) and `visible_kv` (keys the last fire's query could see, at most
 This policy selects KV entries by **position**, which a mask row states
 directly. The score-based family — [`trackb-h2o`](../trackb-h2o),
 [`trackb-snapkv`](../trackb-snapkv), [`tova-attention`](../tova-attention) —
-ranks them by `intrinsics::attn_score` instead.
+ranks them by the model's `attn.scores` output instead.
 
 Every pass appends and folds what it wrote, and the mask is the whole policy. A mask row is a bool per slot of the
 sequence; the decode epilogue rebuilds the next row on the device

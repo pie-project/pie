@@ -1,4 +1,4 @@
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, ops, trace_hybrid};
 use poem_ir::{Dim, Gather, Operation, TapKind, Trace, Ty};
 
 #[derive(Clone, Copy)]
@@ -27,7 +27,7 @@ impl ForwardHybrid for OneGather {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let table = Weight::sym("pos_embed", [u64::from(VOCAB), HIDDEN], Dtype::Bf16);
         let taps = |inputs: &Input| {
             ops::gather::grid_taps(
@@ -38,7 +38,7 @@ impl ForwardHybrid for OneGather {
                 48,
             )
         };
-        match (self.axis, self.gather) {
+        let gathered = match (self.axis, self.gather) {
             (Axis::Tokens, Lookup::Plain) => ops::gather::embed(&inputs.tokens(), &table, VOCAB),
             (Axis::Patches, Lookup::Plain) => {
                 ops::gather::embed(&inputs.patch_routes(), &table, VOCAB)
@@ -53,7 +53,8 @@ impl ForwardHybrid for OneGather {
                 let (ids, weights) = taps(&inputs);
                 ops::gather::embed_weighted(&ids, &weights, &table, VOCAB)
             }
-        }
+        };
+        poem::output("logits", &gathered, None);
     }
 }
 

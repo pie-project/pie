@@ -62,7 +62,7 @@ async def main(input: dict) -> str:
 
     def step():
         # `logits()` squeezes to `[v]` for a single read-out row, so reshape back.
-        logits = reshape(intrinsics.logits(), [B, v])
+        logits = reshape(intrinsics.output(0, "logits"), [B, v])
         cand = broadcast(reshape(scores.take(), [B, 1]), [B, v]) + log_softmax(logits)
         s, i = top_k(reshape(cand, [B * v]), B)
         parent = i // v

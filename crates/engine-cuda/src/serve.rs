@@ -19,7 +19,6 @@ pub(crate) use lanes::{MROPE_COORDS, PATCH_ROUTE_DROP};
 pub(crate) use settle::Readback;
 pub use settle::{Done, Settled};
 
-use engine::fire::LayerScores;
 use engine::frame::{
     Demand, Enqueued as EnqueuedPhase, Prepared as PreparedPhase, Shell as FrameShell,
 };
@@ -98,7 +97,6 @@ pub struct Shell {
     held: Vec<u32>,
     readout_rows: crate::device::Buffer,
     exports: Exports,
-    scores: Option<crate::scores::Scores>,
     graphs: Graphs,
     copies: bool,
     /// `engine.one_frame_when_short`.
@@ -870,7 +868,7 @@ impl Shell {
                 })
                 .collect();
             if !heads.is_empty() {
-                self.fire_media(&heads, &[], &[], &mut Vec::new())?;
+                self.fire_media(&heads, &[], &[])?;
                 let tails: Vec<Seated<'_>> = lanes
                     .iter()
                     .map(|lane| {
@@ -884,11 +882,11 @@ impl Shell {
                         })
                     })
                     .collect();
-                return self.fire_media(&tails, &[], &[], &mut Vec::new());
+                return self.fire_media(&tails, &[], &[]);
             }
         }
         let seated: Vec<Seated<'_>> = lanes.iter().copied().map(Seated::of).collect();
-        self.fire_media(&seated, &[], &[], &mut Vec::new())
+        self.fire_media(&seated, &[], &[])
     }
 
     pub fn fire_voxels(
@@ -917,7 +915,6 @@ impl Shell {
         lanes: &[Seated<'_>],
         attachments: &[Attached],
         media: &[Media<'_>],
-        scores: &mut Vec<Vec<LayerScores>>,
     ) -> Result<Vec<Vec<f32>>> {
         let prepared = FrameShell::prepare(
             self,
@@ -932,7 +929,6 @@ impl Shell {
         let enqueued = FrameShell::enqueue(self, prepared)?;
         let mut settled = FrameShell::settle(self, enqueued)?;
         Shell::read_out(self, &mut settled)?;
-        *scores = std::mem::take(&mut settled.scores);
         Ok(std::mem::take(&mut settled.logits))
     }
 
@@ -1054,8 +1050,6 @@ pub(crate) struct MergeLand {
 
 pub struct Prepared<'a> {
     lanes: &'a [Seated<'a>],
-    /// Each lane's seat in the score slab, where it captures.
-    score_seat_of: Vec<Option<u32>>,
     attachments: &'a [Attached],
     composition: Composition,
     readout_rows: Vec<i32>,

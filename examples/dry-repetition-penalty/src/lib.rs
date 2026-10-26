@@ -235,10 +235,7 @@ fn dry_penalty(hist: &Tensor, hlen: &Tensor, vocab: u32, cfg: Cfg) -> (Tensor, T
         );
     }
 
-    let count = reshape(
-        reduce_sum(cast(gt(&penalty, &vocab_zero), dtype::f32)),
-        [1],
-    );
+    let count = reshape(reduce_sum(cast(gt(&penalty, &vocab_zero), dtype::f32)), [1]);
     let peak = reshape(reduce_max(&penalty), [1]);
     (penalty, count, peak)
 }
@@ -377,7 +374,7 @@ async fn main(input: Input) -> Result<Output> {
         let r = rng_p.take();
         let hist = hist_p.take();
         let hlen = hlen_p.take();
-        let logits = intrinsics::logits();
+        let logits = intrinsics::output(0, "logits");
         let (token, hist_next, count, peak) = step(logits, vocab, cfg, &hist, &hlen, &r);
         let r_next = &r + iota(2);
         tok_out_p.put(&token);
@@ -428,7 +425,7 @@ async fn main(input: Input) -> Result<Output> {
             let r = rng.take();
             let hist = hist_c.take();
             let hlen = hlen_c.take();
-            let logits = intrinsics::logits();
+            let logits = intrinsics::output(0, "logits");
             let (token, hist_next, count, peak) = step(logits, vocab, cfg, &hist, &hlen, &r);
 
             let r_next = &r + iota(2);

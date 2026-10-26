@@ -4,7 +4,6 @@ use crate::codegen::wellformed::{ops_valid, region_ranges_valid, value_types_val
 use crate::plan::{CompiledStage, LibraryOp, Region, RegionKind, library_op_for_tag};
 use eta_ir::op::Op;
 use eta_ir::registry::Stage;
-use eta_ir::types::Dtype;
 
 pub fn second_party_region_supported(stage: &CompiledStage, region: &Region) -> bool {
     if region.nodes.len() != 1 {
@@ -31,7 +30,7 @@ pub fn second_party_region_supported(stage: &CompiledStage, region: &Region) -> 
                 let Some(mask) = value_types.get(region.inputs[0] as usize) else {
                     return false;
                 };
-                mask.dims.len() == 1 && stage.normalized.stage == Stage::OnAttnProj
+                mask.dims.len() == 1 && stage.normalized.stage == Stage::Prologue
             }
             "lora" => {
                 (args.len() == 3 || args.len() == 2) && stage.normalized.stage == Stage::Prologue
@@ -40,22 +39,7 @@ pub fn second_party_region_supported(stage: &CompiledStage, region: &Region) -> 
         };
     }
 
-    let Op::KernelCall { name, args, .. } = op else {
-        return false;
-    };
-    let Some(kernel) = stage.normalized.names.get(*name as usize) else {
-        return false;
-    };
-    if kernel != "envelope_dot" || args.len() != 1 || region.outputs.len() != 1 {
-        return false;
-    }
-    let Some(result) = value_types.get(region.outputs[0] as usize) else {
-        return false;
-    };
-    if result.dtype != Dtype::F32 || result.dims.len() != 1 {
-        return false;
-    }
-    matches!(stage.normalized.stage, Stage::OnAttnProj | Stage::OnAttn)
+    false
 }
 
 pub fn validate_generated_region(stage: &CompiledStage, region: &Region) -> Result<(), EmitError> {

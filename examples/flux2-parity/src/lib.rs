@@ -105,11 +105,15 @@ fn dims(reading: &str, references: bool) -> Result<Dims> {
     if references {
         lane_reading(reading, "reference", &with(&["latents", "reference"]))?;
     }
-    let velocity_width = match &image.readout {
-        Some(readout) if readout.kind == model::ReadoutKind::Velocity => readout.width,
-        other => {
+    let velocity_width = match image
+        .outputs
+        .iter()
+        .find(|output| output.name == "velocity")
+    {
+        Some(output) => output.width,
+        None => {
             return Err(format!(
-                "reading `{reading}`'s image lane reads out {other:?}, not a velocity"
+                "reading `{reading}`'s image lane reads out no velocity"
             ));
         }
     };
@@ -183,7 +187,7 @@ async fn step(case: &Case, dims: &Dims, reading: &str, pipe: &Pipeline) -> Resul
     let velocity_width = dims.velocity_width;
     let out = Channel::new([voxels, velocity_width], dtype::f32).named("velocity");
     pass.epilogue(move || {
-        out.put(intrinsics::velocity(1, voxels, velocity_width));
+        out.put(intrinsics::output_rows(1, "velocity", voxels));
     });
     pass.submit(pipe).context("the denoise step")?;
     out.take_host::<Vec<f32>>().await

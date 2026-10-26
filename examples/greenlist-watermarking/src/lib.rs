@@ -105,7 +105,8 @@ async fn main(input: Input) -> Result<String> {
     prefill.epilogue(move || {
         let green = green_mask(&broadcast(last_prompt, [1]), gamma, vocab);
         let rng = prefill_rng.take();
-        let token = watermarked_sample(&intrinsics::logits(), &green, &rng, delta, vocab);
+        let token =
+            watermarked_sample(&intrinsics::output(0, "logits"), &green, &rng, delta, vocab);
         first_out.put(&token);
         prefill_rng.put(&rng + iota(2));
     });
@@ -135,7 +136,13 @@ async fn main(input: Input) -> Result<String> {
             let previous = cast(token_in.take(), dtype::u32);
             let green = green_mask(&previous, gamma, vocab);
             let rng_value = rng.take();
-            let token = watermarked_sample(&intrinsics::logits(), &green, &rng_value, delta, vocab);
+            let token = watermarked_sample(
+                &intrinsics::output(0, "logits"),
+                &green,
+                &rng_value,
+                delta,
+                vocab,
+            );
 
             token_in.put(&token);
             token_out.put(&token);

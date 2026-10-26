@@ -16,7 +16,7 @@ impl ForwardHybrid for Probe {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let x = inputs.input(
             "latents",
             Dtype::Bf16,
@@ -27,11 +27,12 @@ impl ForwardHybrid for Probe {
         let y = ops::linear::matmul(&x, &Weight::sym("w", [WIDTH, WIDTH], Dtype::Bf16));
         let (a, b) = banks("w", 2, 8, WIDTH, Dtype::Bf16);
         let routes = inputs.adapter_routes();
-        switch(&y)
+        let logits = switch(&y)
             .case((self.rows)(), |y| {
                 ops::linear::lora_correct(&x.on((self.rows)()), &a, &b, &routes, y)
             })
-            .otherwise(Value::clone)
+            .otherwise(Value::clone);
+        poem::output("logits", &logits, None);
     }
 }
 

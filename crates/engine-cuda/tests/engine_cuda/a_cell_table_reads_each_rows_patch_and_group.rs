@@ -6,7 +6,7 @@ use engine::Engine;
 use engine::fire::{FrameSubmission, Lane, Readout, Step, StepVoxels};
 use engine::load::{Budgets, Checkpoint, LoadRequest, Residency};
 use poem::fact;
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, Value, ops, seam};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Request, ops};
 use poem_ir::InputAxis;
 
 use crate::common_two_axis::{Weights, contract_for};
@@ -15,8 +15,8 @@ use engine::program::{InstanceBinding, ProgramRegistration};
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::{IntrinsicId, Op};
-use eta_ir::registry::{EngineCaps, GeometryClass, Graph, ReadoutKind, Stage};
+use eta_ir::op::Op;
+use eta_ir::registry::{Axis, EngineCaps, GeometryClass, OutputDecl, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use eta_ir::validate::bind;
 
@@ -31,12 +31,12 @@ impl ForwardHybrid for Cells {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         inputs
             .recorder()
             .declare_switch("stream", &["text", "image"]);
         let img = inputs.on(!fact::switch_is("stream", "text"));
-        
+
         let grid = img.grid();
         let latents = img.input("latents", Dtype::Bf16, InputAxis::Voxel, C, None);
         let patched = ops::conv::patchify(&latents, &grid, P, &img.token_grid(P));
@@ -57,18 +57,17 @@ impl ForwardHybrid for Cells {
             &inputs.request_of_token(),
         );
         let out = ops::gather::concat_cols(&[&first, &fourth, &groups, &peer]);
-        seam::at(seam::VELOCITY, &[&out]);
+        poem::output("velocity", &out, None);
         let back = ops::conv::unpatchify(&patched, &img.token_grid(P), P, &grid);
         let (pixels, pixel_grid) = ops::conv::upsample_nearest(&back, &grid, [1, 1, 1], false);
-        seam::at(seam::PIXELS, &[&pixels, &pixel_grid]);
-        out
+        poem::output("pixels", &pixels, Some(&pixel_grid));
     }
 }
 
 fn epilogue(rows: u32) -> TraceContainer {
     let plane = Shape::matrix(rows, WIDTH);
     TraceContainer {
-        names: Vec::new(),
+        names: vec!["velocity".to_string()],
         channels: vec![ChannelDecl {
             shape: plane,
             dtype: ChanDType::Concrete(EtaDtype::F32),
@@ -80,8 +79,8 @@ fn epilogue(rows: u32) -> TraceContainer {
         stages: vec![StageProgram {
             stage: Stage::Epilogue,
             ops: vec![
-                Op::IntrinsicVal {
-                    intr: IntrinsicId::Velocity,
+                Op::Output {
+                    index: 0,
                     lane: 0,
                     shape: plane,
                     dtype: EtaDtype::F32,
@@ -97,7 +96,6 @@ fn epilogue(rows: u32) -> TraceContainer {
 fn grid_of(clip: [u32; 3]) -> [u32; 3] {
     [clip[0] / P[0], clip[1] / P[1], clip[2] / P[2]]
 }
-
 
 fn want_row(
     cell: Option<([u32; 3], [u32; 3])>,
@@ -227,17 +225,16 @@ fn a_cell_table_reads_each_rows_patch_and_group() {
     let mut attachments = Vec::new();
     for (at, lane) in lanes.iter().enumerate() {
         let rows = lane.tokens.len() as u32;
-        let velocity = eta_ir::registry::Readout {
-            kind: ReadoutKind::Velocity,
-            width: WIDTH,
+        let velocity = OutputDecl {
+            name: "velocity".into(),
+            axis: Axis::Voxel,
+            width: WIDTH as u32,
+            dtype: EtaDtype::F32,
+            layers: 0,
+            readout: false,
         };
-        let bound = bind(
-            epilogue(rows),
-            vec![Some(velocity)],
-            Graph::default(),
-            EngineCaps::default(),
-        )
-        .expect("the epilogue binds");
+        let bound = bind(epilogue(rows), vec![vec![velocity]], EngineCaps::default())
+            .expect("the epilogue binds");
         let stages = compile_bound(&bound);
         let launch = eta_compiler::codegen::launch::build(&bound, &stages);
         let backend =

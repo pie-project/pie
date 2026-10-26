@@ -326,7 +326,7 @@ async fn main(input: Input) -> Result<Output> {
         let r = rng_p.take();
         let hist = hist_p.take();
         let hlen = hlen_p.take();
-        let logits = intrinsics::logits();
+        let logits = intrinsics::output(0, "logits");
         let (token, hist_next, score, null) = step(logits, vocab, cfg, &hist, &hlen, &r);
         let r_next = &r + iota(2);
         tok_out_p.put(&token);
@@ -374,7 +374,7 @@ async fn main(input: Input) -> Result<Output> {
             let r = rng.take();
             let hist = hist_c.take();
             let hlen = hlen_c.take();
-            let logits = intrinsics::logits();
+            let logits = intrinsics::output(0, "logits");
             let (token, hist_next, score, null) = step(logits, vocab, cfg, &hist, &hlen, &r);
 
             let r_next = &r + iota(2);

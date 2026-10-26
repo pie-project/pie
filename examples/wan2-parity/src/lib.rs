@@ -184,11 +184,15 @@ fn dims(reading: &str, given: bool) -> Result<Dims> {
     } else {
         lane_reading(reading, "video", &["latents", "timestep"])?
     };
-    let velocity_width = match &video.readout {
-        Some(readout) if readout.kind == model::ReadoutKind::Velocity => readout.width,
-        other => {
+    let velocity_width = match video
+        .outputs
+        .iter()
+        .find(|output| output.name == "velocity")
+    {
+        Some(output) => output.width,
+        None => {
             return Err(format!(
-                "reading `{reading}`'s video lane reads out {other:?}, not a velocity"
+                "reading `{reading}`'s video lane reads out no velocity"
             ));
         }
     };
@@ -285,7 +289,7 @@ async fn step(case: &Case, dims: &Dims, reading: &str) -> Result<Vec<f32>> {
     let readbacks = outs.clone();
     pass.epilogue(move || {
         for (lane, voxels, out) in &readbacks {
-            out.put(intrinsics::velocity(*lane, *voxels, velocity_width));
+            out.put(intrinsics::output_rows(*lane, "velocity", *voxels));
         }
     });
     let pipe = Pipeline::new();

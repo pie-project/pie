@@ -52,7 +52,7 @@ so the decode loop is structurally **depth-1**. It cannot submit
 fire `k` before the host can publish its green mask.
 
 The ETA epilogue itself is small: take the host-provided boolean mask, select a
-`delta` or zero bias for every vocabulary entry, add it to `intrinsics::logits()`,
+`delta` or zero bias for every vocabulary entry, add it to `intrinsics::output(0, "logits")`,
 and draw with `gumbel_max`.
 
 ## Run

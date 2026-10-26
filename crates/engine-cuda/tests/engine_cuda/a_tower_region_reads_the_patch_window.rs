@@ -10,8 +10,7 @@ fn test_slots() -> engine_cuda::window::Slots {
     engine_cuda::window::Slots::new(8, 512, 8, 1, 4096, 4, 4096)
 }
 use poem_ir::{
-    CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Seam, Trace, Ty, ValueDecl,
-    ValueId,
+    CacheRow, Def, Dim, Dtype, Guard, Node, Platform, RuntimeInput, Trace, Ty, ValueDecl, ValueId,
 };
 
 const WIDTH: u64 = 8;
@@ -50,7 +49,7 @@ impl Build {
                 }],
                 values: Vec::new(),
                 nodes: Vec::new(),
-                seams: Vec::new(),
+                outputs: Vec::new(),
                 drafter: None,
                 inputs: Vec::new(),
             },
@@ -97,10 +96,11 @@ fn tower_and_trunk() -> Trace {
         act(),
     );
     let y = b.op(o, act(), Guard::Always);
-    b.trace.seams.push(Seam {
-        seam: "out".to_string(),
-        values: vec![y],
+    b.trace.outputs.push(poem_ir::Output {
+        name: "logits".to_string(),
+        value: y,
         layer: None,
+        grid: None,
     });
     b.trace
 }

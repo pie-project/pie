@@ -2,16 +2,15 @@
 
 use crate::common_dit::{Lcg, NAME, Rig, WIDTH, Weights, attach, bf, frame, lane};
 use engine::Engine;
-use engine::fire::ReadoutSeam;
 use engine_cuda::Recording;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::Op;
 use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::fact;
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Trace, Value, Weight, ops,
-    seam, trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Trace, Weight, ops,
+    trace_hybrid,
 };
 use poem_ir::InputAxis;
 
@@ -34,7 +33,7 @@ impl ForwardHybrid for TokensAndLatents {
         spec
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         inputs.recorder().declare_switch(
             "stream",
             &["text", "image", "video", "audio", "context", "reference"],
@@ -67,7 +66,7 @@ impl ForwardHybrid for TokensAndLatents {
         )
         .0;
         let h = ops::linear::matmul(&o, &w("txt.o", WIDTH, HEAD_DIM));
-        seam::at(seam::HIDDEN, &[&h]);
+        poem::output("hidden", &h, None);
 
         let x_img = img.input("latents", Dtype::Bf16, InputAxis::Row, WIDTH, None);
         let t = img.input("timestep", Dtype::F32, InputAxis::Lane, 1, None);
@@ -80,8 +79,7 @@ impl ForwardHybrid for TokensAndLatents {
             ModulateForm::ScaleShift,
         );
         let velocity = ops::linear::matmul(&hm, &w("den", WIDTH, WIDTH));
-        seam::at(seam::VELOCITY, &[&velocity]);
-        velocity
+        poem::output("velocity", &velocity, None);
     }
 }
 
@@ -98,7 +96,7 @@ fn epilogue(rows: u32, width: u32) -> TraceContainer {
         seeded: false,
     };
     TraceContainer {
-        names: Vec::new(),
+        names: vec!["hidden".to_string()],
         channels: vec![
             decl(Shape::matrix(rows, WIDTH), HostRole::Writer),
             decl(Shape::matrix(1, 1), HostRole::Writer),
@@ -110,8 +108,8 @@ fn epilogue(rows: u32, width: u32) -> TraceContainer {
             stage: Stage::Epilogue,
             ops: vec![
                 Op::ChanTake(0),
-                Op::IntrinsicVal {
-                    intr: IntrinsicId::Hidden,
+                Op::Output {
+                    index: 0,
                     lane: 0,
                     shape: Shape::matrix(rows, width),
                     dtype: EtaDtype::F32,
@@ -161,7 +159,7 @@ fn the_token_class_fires_alone() {
         .expect("the frame settles");
 
     let readout = &ticket.steps[0].readouts[0];
-    assert_eq!(readout.seam, ReadoutSeam::Hidden, "the token arm's seam");
+    assert_eq!(readout.output, "hidden", "the token arm's seam");
     assert_eq!(readout.rows, TEXT_ROWS, "one row per token");
     assert_eq!(readout.width, WIDTH, "the trunk's residual width");
 

@@ -404,7 +404,7 @@ mod tests {
             caches: Vec::new(),
             values: Vec::new(),
             nodes: Vec::new(),
-            seams: Vec::new(),
+            outputs: Vec::new(),
             drafter: None,
             inputs: Vec::new(),
         }

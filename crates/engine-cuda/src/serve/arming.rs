@@ -50,7 +50,6 @@ struct Synthetic {
     tokens: Vec<u32>,
     mask: Option<Masking>,
     adapter: Option<u32>,
-    captures: bool,
     slot: u32,
     pages: Vec<u32>,
     window: Vec<u32>,
@@ -443,7 +442,6 @@ impl Shell {
                         .has_custom_mask()
                         .then(|| Masking::Extent(Mask::new(vec![0, rows], u64::from(rows)))),
                     adapter: request.has_adapter().then_some(0),
-                    captures: request.captures_scores(),
                     slot: (at as u32) % slots,
                     window: Vec::new(),
                     pages: {
@@ -552,7 +550,6 @@ impl Shell {
                 window_copies: &[],
                 mask: lane.mask.as_ref(),
                 adapter: lane.adapter,
-                captures_scores: lane.captures,
                 readout: None,
                 rs: RsVerb::Fold,
                 rs_reset: RsReset::Inferred,
@@ -583,7 +580,7 @@ impl Shell {
 
         self.arming = true;
         self.golden_arm = arm;
-        let armed = self.fire_media(&seated, &[], &media, &mut Vec::new());
+        let armed = self.fire_media(&seated, &[], &media);
         self.golden_arm = crate::serve::Golden::Off;
         self.arming = false;
         armed
@@ -1005,17 +1002,6 @@ impl Shell {
             mut targets,
             unfireable,
         } = found;
-        // A fire captures scores on at most the lanes the slab seats, so a
-        // body past them never replays.
-        let scoring = self.scores.as_ref().map_or(0, crate::scores::Scores::seats) as usize;
-        targets.retain(|(_, target)| {
-            let (lanes, _) = target.lanes();
-            lanes
-                .iter()
-                .filter(|(class, _)| self.exports.capturing.contains(*class))
-                .count()
-                <= scoring
-        });
         let top = targets.iter().map(|(bucket, _)| *bucket).max();
         let rank = |kind: Kind| match kind {
             Kind::Decode => 0u8,

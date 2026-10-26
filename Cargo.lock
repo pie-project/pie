@@ -1952,6 +1952,7 @@ dependencies = [
  "pie-profile",
  "toml",
  "tracing",
+ "ztensor",
  "ztensor-compat",
 ]
 

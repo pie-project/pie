@@ -27,11 +27,6 @@ export function defaultSystemSpeculation(): boolean {
   return _model.defaultSystemSpeculation();
 }
 
-/** The draft head's chain depth; 0 for a model with no draft head. */
-export function mtpDepth(): number {
-  return _model.mtpDepth();
-}
-
 /** How long a pipeline may hold a frame's wait-set, in microseconds. */
 export function submitDeadlineUs(): number {
   return Number(_model.submitDeadlineUs());
@@ -68,11 +63,6 @@ export function frameSize(): number {
  */
 export function channelCapacity(): number {
   return _model.channelCapacity();
-}
-
-/** The most rows one pass may read out through `kind`; the pass itself may be any length. */
-export function maxReadoutRows(kind: _model.ReadoutKind): number {
-  return _model.maxReadoutRows(kind);
 }
 
 /** Bytes in one folded recurrent-state object. 0 for pure attention. */
@@ -119,8 +109,7 @@ export type {
   InputDecl,
   LaneDecl,
   LatentSpace,
-  Readout,
-  ReadoutKind,
+  OutputDecl,
   RowCount,
   ScheduleFact,
   ScheduleKind,

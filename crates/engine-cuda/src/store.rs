@@ -155,7 +155,7 @@ pub fn tokens_within(max_tokens: u32, floor: u32, room: u64, working: impl Fn(u3
 }
 
 /// The rows a guest program's epilogue holds per lane, each as wide as the
-/// out seam: the logits it reads, and the scaled, probability, mask, noise
+/// readout rows: the logits it reads, and the scaled, probability, mask, noise
 /// and Gumbel rows a top-p sampling program derives from them (6292224
 /// bytes a lane at a 262144 vocabulary, measured).
 pub const PROGRAM_ROWS_A_LANE: u64 = 6;
@@ -163,7 +163,7 @@ pub const PROGRAM_ROWS_A_LANE: u64 = 6;
 /// What one guest program's scratch takes at the admitted lane count. A
 /// program is registered after the load, so its stride is not known when
 /// the cache rows are declared; what is known is that its per-lane scratch
-/// is laid out over rows of the out seam, that the shell sizes it for the
+/// is laid out over readout rows, that the shell sizes it for the
 /// lane count rounded up to a power of two, and that the program contract
 /// caps the whole at `eta_exec::SCRATCH_MAX_BYTES`. The pool leaves this
 /// much on the card so the first program to arrive is not the frame that

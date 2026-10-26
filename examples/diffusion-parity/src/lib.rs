@@ -136,7 +136,14 @@ async fn main(input: Input) -> Result<Output> {
     let pipe = Pipeline::new();
 
     let prompt_i32: Vec<i32> = case.prompt_ids.iter().map(|&t| t as i32).collect();
-    let spans = readout_spans(n, model::ReadoutKind::Logits);
+    let spans = readout_spans(
+        n,
+        model::lane_of(&[])?
+            .outputs
+            .iter()
+            .find(|output| output.name == "logits")
+            .map_or(1, |output| output.max_rows),
+    );
     let mut prefill_rows = Rows::default();
     for (at, &(base, end)) in spans.iter().enumerate() {
         let len = end - base;
@@ -163,7 +170,7 @@ async fn main(input: Input) -> Result<Output> {
         )?;
         fwd.readout(&readout)?;
         fwd.epilogue(move || {
-            let logits = intrinsics::logits(); // [len, vocab]
+            let logits = intrinsics::output(0, "logits"); // [len, vocab]
             let probs = softmax(&logits);
             let (top_p, top_i) = top_k(&probs, 8);
             arg_out.put(reduce_argmax(&logits));
@@ -240,7 +247,7 @@ async fn main(input: Input) -> Result<Output> {
         )?;
         fwd.readout(&readout)?;
         fwd.epilogue(move || {
-            let logits = intrinsics::logits(); // [length, vocab]
+            let logits = intrinsics::output(0, "logits"); // [length, vocab]
             let scaled = &logits / temperature;
             let probs = softmax(&scaled);
             let (top_p, top_i) = top_k(&probs, 8);

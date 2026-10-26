@@ -19,7 +19,7 @@ from .ir import (
     HostRole,
     Port,
     PortBinding,
-    SinkScope,
+    OutputDecl,
     Stage,
     StageProgram,
     TraceContainer,
@@ -181,6 +181,11 @@ class Builder:
         self.stages: list[tuple[Stage, Callable[[], None]]] = []
         self.vocab = vocab
         self.page_size = page_size
+        self.outputs: list[list[OutputDecl]] = []
+
+    def set_outputs(self, lanes: list[list[OutputDecl]]) -> None:
+        """The outputs each lane of the pass reads out, in lane order."""
+        self.outputs = lanes
 
     def bind_port(self, port: Port, source: DslChannel) -> None:
         """Bind a descriptor port to a channel, recording the port's endpoint
@@ -234,7 +239,7 @@ class Builder:
     def build(self) -> Traced:
         rows = self._rows()
         (stage_results, ports, inputs), channels, names = with_constants(
-            self.vocab, self.page_size, lambda: with_session(lambda: self._record(rows))
+            self.vocab, self.page_size, self.outputs, lambda: with_session(lambda: self._record(rows))
         )
 
         # Re-key the container to gid (declaration) order.
@@ -258,7 +263,7 @@ class Builder:
         names = [names[i] for i in name_order]
         for r in stage_results:
             for op in r.ops:
-                if op.tag in (0xA1, 0xA2):
+                if op.tag in (0xA0, 0xA1, 0xA2):
                     op.name_idx = name_remap[op.name_idx]
 
         sinks: list[tuple[Stage, SinkCall]] = [(r.stage, s) for r in stage_results for s in r.sinks]
@@ -319,11 +324,7 @@ def _lint(channels: list[ChannelState], sinks: list[tuple[Stage, SinkCall]]) -> 
         if consumed and not produced:
             errs.append(f"channel `{st.name}` is consumed but never produced or seeded")
     for stage, s in sinks:
-        if s.scope == SinkScope.PASS_WIDE:
-            ok = stage == Stage.PROLOGUE
-        else:
-            ok = stage in (Stage.PROLOGUE, Stage.ON_ATTN_PROJ)
-        if not ok:
+        if stage != Stage.PROLOGUE:
             errs.append(f"sink `{s.name}` is misplaced in stage `{stage.wire_name}`")
     if errs:
         raise TraceError("; ".join(errs))

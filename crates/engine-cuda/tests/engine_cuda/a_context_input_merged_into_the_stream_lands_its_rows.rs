@@ -5,7 +5,7 @@ use engine::Engine;
 use poem::fact;
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Trace, Value, Weight, ops,
-    seam, trace_hybrid,
+    trace_hybrid,
 };
 use poem_ir::InputAxis;
 
@@ -17,7 +17,7 @@ impl ForwardHybrid for MergedBlock {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         inputs.recorder().declare_switch(
             "stream",
             &["text", "image", "video", "audio", "context", "reference"],
@@ -49,8 +49,7 @@ impl ForwardHybrid for MergedBlock {
         let w1 = Weight::sym("w1", [u64::from(WIDTH), u64::from(WIDTH)], Dtype::Bf16);
         let y = ops::linear::matmul(&h, &w1);
         let r = ops::elemwise::gated_residual_add(&x, &gate, &y, Some(&lanes));
-        seam::at(seam::VELOCITY, &[&r]);
-        r
+        poem::output("velocity", &r, None);
     }
 }
 

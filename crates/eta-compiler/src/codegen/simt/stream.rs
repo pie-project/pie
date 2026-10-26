@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use core::fmt::Write as _;
 
 use eta_ir::Dtype;
-use eta_ir::op::{intrinsic_tags, tags};
+use eta_ir::op::tags;
 
 use crate::codegen::op_view::OpView;
 use crate::plan::{CompiledStage, Dimension, Region};
@@ -115,7 +115,7 @@ impl<'a> Streams<'a> {
         if op.results != 1 {
             return false;
         }
-        if op.tag == eta_ir::op::tags::INTRINSIC_VAL {
+        if op.tag == eta_ir::op::tags::OUTPUT {
             return matches!(self.role(node, &mut None), Some(Role::Intrinsic));
         }
         match self.role(node, &mut None) {
@@ -317,10 +317,7 @@ impl<'a> Streams<'a> {
                 *width = w;
                 Some(Role::Rng)
             }
-            tags::INTRINSIC_VAL => {
-                if op.intr == intrinsic_tags::LAYER || op.intr == intrinsic_tags::MTP_DRAFTS {
-                    return None;
-                }
+            tags::OUTPUT => {
                 if out_dtype != Dtype::F32 {
                     return None;
                 }
@@ -624,7 +621,7 @@ fn rematerialize(streams: &Streams<'_>, value: u32, pass: &mut Pass<'_>) -> Stri
     let node = streams.producers[value as usize] as usize;
     let op = &streams.ops[node];
     let out = streams.bases[node];
-    if op.tag == tags::INTRINSIC_VAL {
+    if op.tag == tags::OUTPUT {
         intrinsic_read(streams, node, out, pass);
     } else {
         let out_dtype = streams.dtype(out);
@@ -641,7 +638,7 @@ fn rematerialize(streams: &Streams<'_>, value: u32, pass: &mut Pass<'_>) -> Stri
 fn intrinsic_read(streams: &Streams<'_>, node: usize, out: u32, pass: &mut Pass<'_>) {
     if !pass.intrinsics.contains(&node) {
         pass.intrinsics.push(node);
-        let slots = super::fused::intrinsic_pitch(streams.stage);
+        let slots = super::fused::output_pitch(streams.stage);
         let p = &mut pass.prologue;
         let _ = writeln!(p, "    M1OpParams p{node} = params[{node}u];");
         let _ = writeln!(p, "    p{node}.rng_seed = 0u;");

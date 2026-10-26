@@ -12,7 +12,6 @@ __global__ void score_capture(
     const i32* __restrict__ kv_page_indptr,
     const i32* __restrict__ kv_last_page_lens,
     float* __restrict__ scores,
-    const i32* __restrict__ seat_of,
     int page_size,
     int num_q_heads,
     int num_kv_heads,
@@ -20,8 +19,6 @@ __global__ void score_capture(
     float sm_scale,
     int observe,
     int lane_offset,
-    int plane_stride,
-    int plane,
     int kv_max)
 {
     constexpr int VPT = HEAD_DIM_MAX / 32;
@@ -37,12 +34,8 @@ __global__ void score_capture(
     float* wm = q_s + head_dim;
     float* wl = wm + WARPS;
 
-    const int seat = static_cast<int>(seat_of[lane_offset + request]);
-    if (seat < 0) {
-        return;
-    }
     const long long out_row =
-        (static_cast<long long>(seat) * plane_stride + plane + head) *
+        (static_cast<long long>(lane_offset + request) * num_q_heads + head) *
         static_cast<long long>(kv_max);
     float* out = scores + out_row;
 

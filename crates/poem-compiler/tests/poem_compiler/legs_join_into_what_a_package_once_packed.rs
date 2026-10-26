@@ -3,7 +3,7 @@
 //! stating them packed: one product by the joined weight, its bias added
 //! once, split after; one packed gated unit.
 
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, ops, trace_hybrid};
 use poem_ir::canon;
 
 const VOCAB: u32 = 64;
@@ -56,7 +56,7 @@ impl ForwardHybrid for Apart {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let x = ops::gather::embed(&inputs.tokens(), &self.embed, VOCAB);
         let q = ops::elemwise::add_bias(&self.q_bias, &ops::linear::matmul(&x, &self.q));
         let k = ops::elemwise::add_bias(&self.k_bias, &ops::linear::matmul(&x, &self.k));
@@ -65,7 +65,8 @@ impl ForwardHybrid for Apart {
         let gate = ops::linear::matmul(&h, &self.gate);
         let up = ops::linear::matmul(&h, &self.up);
         let f = ops::linear::glu(&gate, poem_ir::GluAct::Swiglu, None, Some(&up), None, None);
-        ops::linear::lm_head(&f, &self.head)
+        let logits = ops::linear::lm_head(&f, &self.head);
+        poem::output("logits", &logits, None);
     }
 }
 
@@ -74,7 +75,7 @@ impl ForwardHybrid for Packed {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let x = ops::gather::embed(&inputs.tokens(), &self.embed, VOCAB);
         let qkv = ops::elemwise::add_bias(&self.qkv_bias, &ops::linear::matmul(&x, &self.qkv));
         let (q, k, v) = ops::gather::split_qkv(&qkv, Q as u32, KV as u32);
@@ -88,7 +89,8 @@ impl ForwardHybrid for Packed {
             None,
             None,
         );
-        ops::linear::lm_head(&f, &self.head)
+        let logits = ops::linear::lm_head(&f, &self.head);
+        poem::output("logits", &logits, None);
     }
 }
 
@@ -143,7 +145,7 @@ impl ForwardHybrid for Banks {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         use ops::linear::{glu, matmul, moe_matmul_select, moe_route, moe_weighted_sum};
         let x = ops::gather::embed(&inputs.tokens(), &self.embed, VOCAB);
         let logits = matmul(&x, &self.router);
@@ -179,7 +181,8 @@ impl ForwardHybrid for Banks {
         };
         let routed = moe_matmul_select(&act, &self.down, &routes, TOP_K, None);
         let y = moe_weighted_sum(&routed, &weights);
-        ops::linear::lm_head(&y, &self.head)
+        let logits = ops::linear::lm_head(&y, &self.head);
+        poem::output("logits", &logits, None);
     }
 }
 

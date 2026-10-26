@@ -2,223 +2,61 @@ use poem_compiler::CompiledModel;
 use poem_ir::{Operands, Trace, ValueId};
 
 use crate::error::{Fault, Result};
-use poem_exec::feeds::{classes_running, writer_classes};
+use poem_exec::feeds::classes_running;
 
-pub(crate) const OUT_SEAM: &str = poem_compiler::EXPORT_SEAMS[0];
-pub(crate) const MTP_SEAM: &str = poem_compiler::EXPORT_SEAMS[1];
-pub(crate) const SCORES_SEAM: &str = poem_compiler::EXPORT_SEAMS[2];
-pub(crate) const FLOAT_READOUT_SEAMS: [&str; 3] = poem_compiler::FLOAT_READOUT_SEAMS;
-pub(crate) const PIXELS_SEAM: &str = poem_compiler::EXPORT_SEAMS[6];
-pub(crate) const DRAFTS_SEAM: &str = poem_compiler::EXPORT_SEAMS[3];
+use poem_exec::feeds::ClassOutput;
 
-#[derive(Debug, Clone)]
-pub struct Export {
-    pub value: ValueId,
-    pub layer: u32,
-    pub classes: poem_ir::ClassSet,
-}
-
+/// The outputs a load's classes write.
 #[derive(Debug, Clone)]
 pub(crate) struct Exports {
-    pub(crate) out_classes: poem_ir::ClassSet,
-    pub(crate) out: Option<ValueId>,
-    pub(crate) mtp: Option<Export>,
-    pub(crate) drafts: Option<Export>,
-    pub(crate) drafts_depth: u32,
-    pub(crate) scores: Vec<Export>,
-    pub(crate) capturing: poem_ir::ClassSet,
-    pub(crate) velocity: Option<Export>,
-    pub(crate) hidden: Vec<Export>,
-    pub(crate) pixels: Vec<(Export, ValueId)>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ReadoutSeam {
-    pub(crate) seam: engine::fire::ReadoutSeam,
-    pub(crate) value: ValueId,
-}
-
-impl Exports {
-    #[must_use]
-    pub(crate) fn pixels_for(&self, class: Option<usize>) -> Option<(ValueId, ValueId)> {
-        class
-            .and_then(|class| {
-                self.pixels
-                    .iter()
-                    .find(|(export, _)| export.classes.contains(class))
-            })
-            .or_else(|| (self.pixels.len() == 1).then(|| &self.pixels[0]))
-            .map(|(export, grid)| (export.value, *grid))
-    }
-
-    pub(crate) fn writes_pixels(&self, class: usize) -> bool {
-        self.pixels
-            .iter()
-            .any(|(export, _)| export.classes.contains(class))
-    }
-
-    pub(crate) fn on_voxels(&self, trace: &Trace, value: ValueId) -> bool {
-        matches!(
-            &trace.values[value.0 as usize].ty,
-            poem_ir::Ty::Tensor { shape, .. }
-                if matches!(shape.first(), Some(poem_ir::Dim::Voxels | poem_ir::Dim::VoxelsTimes(_)))
-        )
-    }
-
-    #[must_use]
-    pub(crate) fn readout_for(&self, class: usize) -> Option<ReadoutSeam> {
-        use engine::fire::ReadoutSeam as Seam;
-        if let Some(out) = self.out
-            && self.out_classes.contains(class)
-        {
-            return Some(ReadoutSeam {
-                seam: Seam::Logits,
-                value: out,
-            });
-        }
-        if let Some(velocity) = self.velocity_for(class) {
-            return Some(ReadoutSeam {
-                seam: Seam::Velocity,
-                value: velocity.value,
-            });
-        }
-        if let Some(hidden) = self.hidden_for(class) {
-            return Some(ReadoutSeam {
-                seam: Seam::Hidden,
-                value: hidden.value,
-            });
-        }
-        self.readout()
-    }
-
-    #[must_use]
-    pub(crate) fn velocity_for(&self, class: usize) -> Option<&Export> {
-        self.velocity
-            .as_ref()
-            .filter(|export| export.classes.contains(class))
-    }
-
-    #[must_use]
-    pub(crate) fn hidden_for(&self, class: usize) -> Option<&Export> {
-        self.hidden
-            .iter()
-            .rev()
-            .find(|export| export.classes.contains(class))
-    }
-
-    #[must_use]
-    pub(crate) fn readout(&self) -> Option<ReadoutSeam> {
-        use engine::fire::ReadoutSeam as Seam;
-        if let Some(out) = self.out {
-            return Some(ReadoutSeam {
-                seam: Seam::Logits,
-                value: out,
-            });
-        }
-        if let Some(velocity) = &self.velocity {
-            return Some(ReadoutSeam {
-                seam: Seam::Velocity,
-                value: velocity.value,
-            });
-        }
-        self.hidden.last().map(|hidden| ReadoutSeam {
-            seam: Seam::Hidden,
-            value: hidden.value,
-        })
-    }
+    pub(crate) outputs: Vec<ClassOutput>,
 }
 
 impl Exports {
     pub(crate) fn of(trace: &Trace, compiled: &CompiledModel) -> Result<Exports> {
-        let out = trace
-            .seams
-            .iter()
-            .find(|seam| seam.seam == OUT_SEAM)
-            .and_then(|seam| seam.values.first().copied());
-        let float_readout = trace.seams.iter().any(|seam| {
-            FLOAT_READOUT_SEAMS.contains(&seam.seam.as_str()) && !seam.values.is_empty()
-        });
-        if out.is_none() && !float_readout {
+        let outputs = poem_exec::feeds::class_outputs(trace, compiled).map_err(Fault::Recipe)?;
+        if outputs.is_empty() {
             return Err(Fault::Unbound {
-                what: format!(
-                    "no `{OUT_SEAM}` seam and no float readout ({}), so a fire would compute \
-                     nothing a reader can take",
-                    FLOAT_READOUT_SEAMS.join(", ")
-                ),
+                what: "no output, so a fire would compute nothing a reader can take".to_string(),
             });
         }
-        let named = |name: &str| -> Vec<Export> {
-            trace
-                .seams
-                .iter()
-                .filter(|seam| seam.seam == name)
-                .flat_map(|seam| {
-                    let layer = seam.layer.unwrap_or(0);
-                    seam.values.iter().map(move |value| (layer, *value))
-                })
-                .map(|(layer, value)| Export {
-                    value,
-                    layer,
-                    classes: writer_classes(trace, compiled, value),
-                })
-                .collect()
-        };
-        let scores = named(SCORES_SEAM);
-        let drafts = named(DRAFTS_SEAM).into_iter().next();
-        let drafts_depth = match &drafts {
-            Some(export) => {
-                let width = poem_exec::store::kv::width_of(trace, export.value).map_err(|why| {
-                    Fault::Unbound {
-                        what: format!("the `{DRAFTS_SEAM}` export's width: {why}"),
-                    }
-                })?;
-                match u32::try_from(width) {
-                    Ok(depth) if depth > 0 => depth,
-                    _ => {
-                        return Err(Fault::Unbound {
-                            what: format!("a `{DRAFTS_SEAM}` export {width} wide drafts nothing"),
-                        });
-                    }
-                }
-            }
-            None => 0,
-        };
-        let mut capturing = poem_ir::ClassSet::default();
-        for export in &scores {
-            for class in export.classes.iter() {
-                capturing.insert(class);
-            }
-        }
-        let pixels = trace
-            .seams
+        Ok(Exports { outputs })
+    }
+
+    /// The outputs class `class` writes.
+    pub(crate) fn of_class(&self, class: usize) -> impl Iterator<Item = &ClassOutput> {
+        self.outputs
             .iter()
-            .filter(|seam| seam.seam == PIXELS_SEAM)
-            .filter_map(|seam| match seam.values.as_slice() {
-                [plane, grid, ..] => Some((
-                    Export {
-                        value: *plane,
-                        layer: seam.layer.unwrap_or(0),
-                        classes: writer_classes(trace, compiled, *plane),
-                    },
-                    *grid,
-                )),
-                _ => None,
+            .filter(move |out| out.classes.contains(class))
+    }
+
+    /// What a lane of `class` is read back through on the host: the last
+    /// float row or voxel output it writes.
+    #[must_use]
+    pub(crate) fn readback(&self, class: usize) -> Option<&ClassOutput> {
+        self.of_class(class)
+            .filter(|out| {
+                out.decl.axis != poem_ir::InputAxis::Lane
+                    && matches!(out.decl.dtype, poem_ir::Dtype::Bf16 | poem_ir::Dtype::F32)
             })
-            .collect();
-        Ok(Exports {
-            out_classes: out.map_or_else(poem_ir::ClassSet::default, |out| {
-                writer_classes(trace, compiled, out)
-            }),
-            out,
-            mtp: named(MTP_SEAM).into_iter().next(),
-            drafts,
-            drafts_depth,
-            scores,
-            capturing,
-            velocity: named(FLOAT_READOUT_SEAMS[0]).into_iter().next(),
-            hidden: named(FLOAT_READOUT_SEAMS[1]),
-            pixels,
-        })
+            .last()
+    }
+
+    /// Whether some output of the load is read out at the readout rows.
+    #[must_use]
+    pub(crate) fn reads_readout_rows(&self) -> bool {
+        self.outputs.iter().any(|out| out.decl.readout)
+    }
+
+    /// The widest row of an output on the readout rows, in f32.
+    #[must_use]
+    pub(crate) fn readout_row_bytes(&self) -> u64 {
+        self.outputs
+            .iter()
+            .filter(|out| out.decl.readout)
+            .map(|out| u64::from(out.decl.width) * 4)
+            .max()
+            .unwrap_or(0)
     }
 }
 

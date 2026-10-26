@@ -3,7 +3,7 @@ use eta_compiler::codegen::error::{EmitError, EmitterKind};
 use eta_compiler::codegen::metal::{METAL_M2_MAX_FUSED_CHANNELS, emit_fused_region};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::Op;
 use eta_ir::registry::Stage;
 use eta_ir::types::{Dtype, Shape};
 
@@ -40,8 +40,8 @@ fn subject() -> TraceContainer {
     channels.extend(std::iter::repeat_with(writer).take(CHANNELS - 1));
 
     let mut ops = vec![
-        Op::IntrinsicVal {
-            intr: IntrinsicId::Logits,
+        Op::Output {
+            index: 1,
             lane: 0,
             shape: Shape::matrix(1, VOCAB),
             dtype: Dtype::F32,
@@ -52,10 +52,10 @@ fn subject() -> TraceContainer {
         },
         Op::ReduceArgmax(1),
         Op::ChanPut { chan: 0, value: 2 },
-        Op::IntrinsicVal {
-            intr: IntrinsicId::AttnScore,
+        Op::Output {
+            index: 0,
             lane: 0,
-            shape: Shape::matrix(1, eta_ir::registry::ATTN_SCORE_KV_MAX),
+            shape: Shape::matrix(1, 2048),
             dtype: Dtype::F32,
         },
         Op::ReduceSum(3),
@@ -68,7 +68,7 @@ fn subject() -> TraceContainer {
     }
 
     TraceContainer {
-        names: Vec::new(),
+        names: vec!["attn.scores".into(), "logits".into()],
         channels,
         ports: Vec::new(),
         stages: vec![StageProgram {

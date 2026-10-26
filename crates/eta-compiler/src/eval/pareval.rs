@@ -12,7 +12,7 @@ use eta_ir::validate::BoundTrace;
 pub enum EvalBlocker {
     UnknownChannel(u32),
     Kernel(String),
-    Intrinsic(&'static str),
+    Output(String),
     AmbientSeed,
     Fault(String),
 }
@@ -24,7 +24,7 @@ impl core::fmt::Display for EvalBlocker {
                 write!(f, "channel {chan} has no host-known value")
             }
             EvalBlocker::Kernel(name) => write!(f, "kernel {name} is device-only"),
-            EvalBlocker::Intrinsic(name) => write!(f, "intrinsic {name} is device-only"),
+            EvalBlocker::Output(name) => write!(f, "output `{name}` is device-only"),
             EvalBlocker::AmbientSeed => {
                 write!(f, "rng draws the ambient seed, which is decided per fire")
             }
@@ -62,16 +62,7 @@ pub fn fold_stage(
             .cloned()
             .unwrap_or_else(|| known(chan))
     };
-    let inputs = PassInputs {
-        logits: None,
-        mtp_logits: None,
-        mtp_drafts: None,
-        hidden: Vec::new(),
-        velocity: Vec::new(),
-        pixels: Vec::new(),
-        query: Vec::new(),
-        attn_score: None,
-    };
+    let inputs = PassInputs::default();
 
     let mut fold = StageFold::default();
     let mut blocked_at: Vec<Option<EvalBlocker>> = Vec::with_capacity(types.len());
@@ -123,12 +114,14 @@ pub fn fold_stage(
                 });
                 push(&mut blocked_at, &mut dense, next_id, Err(blocker));
             }
-            Op::IntrinsicVal { intr, .. } => {
+            Op::Output { index, .. } => {
                 push(
                     &mut blocked_at,
                     &mut dense,
                     next_id,
-                    Err(blocked.unwrap_or(EvalBlocker::Intrinsic(intr.name()))),
+                    Err(blocked.unwrap_or_else(|| {
+                        EvalBlocker::Output(bound.container.names[*index as usize].clone())
+                    })),
                 );
             }
             Op::Rng { .. } => {
@@ -165,7 +158,7 @@ pub fn fold_stage(
                     continue;
                 }
                 let ty_of = |id: eta_ir::types::ValueId| types[id as usize];
-                let evaled = eval_op(op, &dense, &ty_of, &inputs, 0)
+                let evaled = eval_op(op, &dense, &ty_of, &inputs, &bound.container.names)
                     .map_err(|error| EvalBlocker::Fault(alloc::format!("{error}")))?;
                 match evaled {
                     Evaled::One(value) => push(&mut blocked_at, &mut dense, next_id, Ok(value)),
@@ -206,7 +199,7 @@ fn demand_set(
             Op::ChanPut { chan, value } => {
                 pending.insert(*chan, blocked[*value as usize]);
             }
-            Op::KernelCall { .. } | Op::IntrinsicVal { .. } | Op::Rng { .. } => blocked.push(true),
+            Op::KernelCall { .. } | Op::Output { .. } | Op::Rng { .. } => blocked.push(true),
             Op::SinkCall { .. } => {}
             _ => {
                 for _ in 0..op.result_count() {
@@ -385,21 +378,21 @@ mod tests {
         ChanDType, ChannelDecl, HostRole, PortBinding, StageProgram, TraceContainer,
     };
 
-    use eta_ir::registry::{EngineCaps, Graph, Readout, ReadoutKind};
+    use eta_ir::registry::{Axis, EngineCaps, OutputDecl};
     use eta_ir::types::{Dtype, Literal, RngKind, Shape};
     use eta_ir::validate::{BoundTrace, bind};
 
     fn served(c: TraceContainer, vocab: u32) -> BoundTrace {
         bind(
             c,
-            vec![Some(Readout {
-                kind: ReadoutKind::Logits,
+            vec![vec![OutputDecl {
+                name: "logits".into(),
+                axis: Axis::Row,
                 width: vocab,
-            })],
-            Graph {
-                num_layers: 2,
-                ..Graph::default()
-            },
+                dtype: Dtype::F32,
+                layers: 0,
+                readout: true,
+            }]],
             EngineCaps::default(),
         )
         .unwrap()

@@ -1,0 +1,55 @@
+// One lane's score capture over its observed rows: see kernels-cerebras
+// attn::paged::score_capture.
+fn k_score_capture(q: [*]f32, keys: [*]f32, idx: [*]i32, ptr: [*]i32, pos: [*]i32, req: [*]i32, out: [*]f32,
+                   rows: i32, pool_lanes: i32, qh: i32, group: i32, kvh: i32, d: i32, ps: i32, span: i32, scale: f32, kv_max: i32) void {
+  var i: i32 = 0;
+  while (i < qh * kv_max) : (i += 1) { out[i] = 0.0; }
+  var inv_rows: f32 = 1.0 / @as(f32, rows);
+  var r: i32 = 0;
+  while (r < rows) : (r += 1) {
+    var lane: i32 = req[r];
+    if (lane < 0) { lane = 0; } else if (lane >= pool_lanes) { lane = pool_lanes - 1; }
+    var first_page: i32 = ptr[lane];
+    var cap: i32 = (ptr[lane + 1] - first_page) * ps;
+    if (cap > span) { cap = span; }
+    var hk: i32 = pos[r] + 1;
+    if (hk > cap) { hk = cap; }
+    var top: i32 = hk;
+    if (top > kv_max) { top = kv_max; }
+    var h: i32 = 0;
+    while (h < qh) : (h += 1) {
+      var kh: i32 = h / group;
+      var qoff: i32 = (r * qh + h) * d;
+      var m: f32 = 0.0;
+      var s: f32 = 0.0;
+      var any: bool = false;
+      var kp: i32 = 0;
+      while (kp < hk) : (kp += 1) {
+        var page: i32 = idx[first_page + kp / ps];
+        if (page < 0) { continue; }
+        var koff: i32 = ((page * ps + kp % ps) * kvh + kh) * d;
+        var x: f32 = k_dot(q, qoff, keys, koff, d) * scale;
+        if (!any) {
+          any = true;
+          m = x;
+          s = 1.0;
+        } else if (x > m) {
+          s = s * math.exp_f32(m - x) + 1.0;
+          m = x;
+        } else {
+          s = s + math.exp_f32(x - m);
+        }
+      }
+      if (!any) { continue; }
+      var w: f32 = inv_rows / s;
+      kp = 0;
+      while (kp < top) : (kp += 1) {
+        var page: i32 = idx[first_page + kp / ps];
+        if (page < 0) { continue; }
+        var koff: i32 = ((page * ps + kp % ps) * kvh + kh) * d;
+        var x: f32 = k_dot(q, qoff, keys, koff, d) * scale;
+        out[h * kv_max + kp] = out[h * kv_max + kp] + math.exp_f32(x - m) * w;
+      }
+    }
+  }
+}

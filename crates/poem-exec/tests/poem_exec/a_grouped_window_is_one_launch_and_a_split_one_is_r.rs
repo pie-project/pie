@@ -243,7 +243,7 @@ fn the_grouped_arm_pays_one_launch_where_the_split_arm_pays_r() {
     let split = bake(&trace, &split_arm());
     let grouped = bake(&trace, &grouped_arm());
     let lanes = one_lane_per_class(&split);
-    assert_eq!(lanes.len(), 12, "`{DEPLOYMENT}` resolves twelve classes");
+    assert_eq!(lanes.len(), 16, "`{DEPLOYMENT}` resolves sixteen classes");
 
     let descriptor = fire(&split, &lanes);
     let mask = split
@@ -305,7 +305,7 @@ fn the_grouped_arm_pays_one_launch_where_the_split_arm_pays_r() {
     );
     assert!(
         compared > 0,
-        "the plan has nodes besides its corrections — `{DEPLOYMENT}`, twelve classes in one fire: \
+        "the plan has nodes besides its corrections — `{DEPLOYMENT}`, sixteen classes in one fire: \
          adapter window = {r} intervals, correction launches {r} -> 1 per node over {} nodes",
         corrections.len(),
     );

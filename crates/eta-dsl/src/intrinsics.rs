@@ -1,9 +1,9 @@
-use eta_ir::op::IntrinsicId;
+use eta_ir::registry::{Axis, OutputDecl};
 use eta_ir::types::{Dtype, Shape};
 
-use crate::context::current_rows;
+use crate::context::{current_rows, intern_name};
 use crate::model;
-use crate::value::{Tensor, intrinsic_val};
+use crate::value::{Tensor, output_val};
 
 pub fn vocab() -> u32 {
     model::vocab()
@@ -14,81 +14,48 @@ pub fn page_size() -> u32 {
 #[allow(non_upper_case_globals)]
 pub const activation_type: Dtype = Dtype::F32;
 
-fn logits_shape() -> Shape {
-    let rows = current_rows();
-    let v = vocab();
-    Shape::matrix(rows.max(1), v)
+/// Lane `lane`'s output `name` as the model declares it: its readout rows (a
+/// lone row read as its width alone), or its layers stacked.
+#[track_caller]
+pub fn output(lane: u32, name: &str) -> Tensor {
+    let decl = declared(lane, name);
+    let rows = match decl.axis {
+        Axis::Lane => decl.layers.max(1),
+        Axis::Row | Axis::Voxel if decl.readout => current_rows().max(1),
+        Axis::Row | Axis::Voxel => panic!(
+            "output `{name}` is one row a token or voxel of lane {lane}: \
+             `output_rows` reads the rows it names"
+        ),
+    };
+    let t = output_val(
+        intern_name(name),
+        lane,
+        Shape::matrix(rows, decl.width),
+        decl.dtype,
+    );
+    if decl.readout {
+        single_row_reshape(t)
+    } else {
+        t
+    }
 }
 
-pub fn logits() -> Tensor {
-    let t = intrinsic_val(IntrinsicId::Logits, 0, logits_shape(), Dtype::F32);
-    single_row_reshape(t)
-}
-pub fn mtp_logits(k: u32) -> Tensor {
-    intrinsic_val(
-        IntrinsicId::MtpLogits,
-        0,
-        Shape::matrix(k, vocab()),
-        Dtype::F32,
-    )
-}
-pub fn mtp_drafts(n: u32) -> Tensor {
-    intrinsic_val(
-        IntrinsicId::MtpDrafts,
-        0,
-        Shape::vector(n.max(1)),
-        Dtype::I32,
-    )
-}
-/// Lane `lane`'s `rows` hidden rows, `width` wide.
-pub fn hidden(lane: u32, rows: u32, width: u32) -> Tensor {
-    intrinsic_val(
-        IntrinsicId::Hidden,
+/// `rows` rows of lane `lane`'s output `name`, one a token or voxel.
+#[track_caller]
+pub fn output_rows(lane: u32, name: &str, rows: u32) -> Tensor {
+    let decl = declared(lane, name);
+    output_val(
+        intern_name(name),
         lane,
-        Shape::matrix(rows.max(1), width.max(1)),
-        activation_type,
-    )
-}
-/// Lane `lane`'s velocity, `rows` rows `width` wide.
-pub fn velocity(lane: u32, rows: u32, width: u32) -> Tensor {
-    intrinsic_val(
-        IntrinsicId::Velocity,
-        lane,
-        Shape::matrix(rows.max(1), width.max(1)),
-        activation_type,
-    )
-}
-/// Lane `lane`'s `rows` pixel rows, `width` wide.
-pub fn pixels(lane: u32, rows: u32, width: u32) -> Tensor {
-    intrinsic_val(
-        IntrinsicId::Pixels,
-        lane,
-        Shape::matrix(rows.max(1), width.max(1)),
-        activation_type,
-    )
-}
-pub fn query(width: u32) -> Tensor {
-    intrinsic_val(
-        IntrinsicId::Query,
-        0,
-        Shape::vector(width.max(1)),
-        activation_type,
-    )
-}
-pub fn layer() -> Tensor {
-    intrinsic_val(IntrinsicId::Layer, 0, Shape::SCALAR, Dtype::U32)
-}
-pub fn attn_score(planes: u32) -> Tensor {
-    intrinsic_val(
-        IntrinsicId::AttnScore,
-        0,
-        Shape::matrix(planes.max(1), eta_ir::registry::ATTN_SCORE_KV_MAX),
-        Dtype::F32,
+        Shape::matrix(rows.max(1), decl.width),
+        decl.dtype,
     )
 }
 
-pub const fn attn_score_kv_max() -> u32 {
-    eta_ir::registry::ATTN_SCORE_KV_MAX
+#[track_caller]
+fn declared(lane: u32, name: &str) -> OutputDecl {
+    model::output(lane, name)
+        .unwrap_or_else(|| panic!("lane {lane} of this pass reads out no output `{name}`"))
 }
 
 fn single_row_reshape(t: Tensor) -> Tensor {
@@ -103,40 +70,10 @@ fn single_row_reshape(t: Tensor) -> Tensor {
 pub mod kernel {
     use crate::context::{emit, intern_name, record_sink};
     use crate::error::Span;
-    use crate::value::{AsTensor, Tensor};
+    use crate::value::AsTensor;
     use alloc::string::String;
     use alloc::vec;
-    use eta_ir::op::{IntrinsicId, Op};
-    use eta_ir::registry::SinkScope;
-    use eta_ir::types::{Dtype, Shape, ValueType};
-
-    #[track_caller]
-    pub fn envelope_dot(p_max: u32) -> Tensor {
-        let query_ty = ValueType::new(Shape::vector(1), super::activation_type);
-        let query = emit(
-            Op::IntrinsicVal {
-                intr: IntrinsicId::Query,
-                lane: 0,
-                shape: query_ty.shape,
-                dtype: query_ty.dtype,
-            },
-            &[query_ty],
-        );
-        let score_ty = ValueType::new(Shape::vector(p_max), Dtype::F32);
-        let name = intern_name("envelope_dot");
-        Tensor::node(
-            emit(
-                Op::KernelCall {
-                    name,
-                    args: vec![query],
-                    shape: score_ty.shape,
-                    dtype: score_ty.dtype,
-                },
-                &[score_ty],
-            ),
-            score_ty,
-        )
-    }
+    use eta_ir::op::Op;
 
     #[track_caller]
     pub fn attn_page_mask(mask: impl AsTensor) {
@@ -150,7 +87,7 @@ pub mod kernel {
             },
             &[],
         );
-        record_sink(String::from("attn_page_mask"), span, SinkScope::Attention);
+        record_sink(String::from("attn_page_mask"), span);
     }
 
     #[track_caller]
@@ -167,7 +104,7 @@ pub mod kernel {
             },
             &[],
         );
-        record_sink(String::from("lora"), span, SinkScope::PassWide);
+        record_sink(String::from("lora"), span);
     }
 
     #[track_caller]
@@ -183,6 +120,6 @@ pub mod kernel {
             },
             &[],
         );
-        record_sink(String::from("lora"), span, SinkScope::PassWide);
+        record_sink(String::from("lora"), span);
     }
 }

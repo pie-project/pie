@@ -2,9 +2,9 @@
 //! a group computes, the collectives among ranks run through an in-memory
 //! [`Exchange`]. It serves one lane a step and holds its keys and values by
 //! position; it runs the ops a plain MoE trunk is written in (embedding,
-//! norms, products, rotary, paged attention over its own lane, routed
-//! experts, an expert-parallel dispatch and combine, a tensor-parallel sum
-//! and gather) and refuses the rest.
+//! norms, products, rotary, paged attention and its score capture over its
+//! own lane, routed experts, an expert-parallel dispatch and combine, a
+//! tensor-parallel sum and gather) and refuses the rest.
 //!
 //! Each value is f32 on the host, rounded to bf16 where the trace types it
 //! so. A row's result depends only on that row (and, in attention, on its
@@ -289,10 +289,9 @@ impl Forward {
     }
 
     /// One step of this rank's lane: `tokens` at positions from `start`,
-    /// the trace's arms chosen by `word`. Returns the last row's logits
-    /// (empty for a step of no tokens, which a rank fires to serve its
-    /// peers' routes).
-    pub fn step(&mut self, tokens: &[u32], start: u32, word: u64) -> Result<Vec<f32>, String> {
+    /// the trace's arms chosen by `word`. Returns every output the word's
+    /// arms write, in the order the trace first names them.
+    pub fn step(&mut self, tokens: &[u32], start: u32, word: u64) -> Result<Vec<Output>, String> {
         let n = tokens.len();
         let positions: Vec<i32> = (0..n).map(|t| (start as usize + t) as i32).collect();
         let mut vals: Vec<Option<Held>> = self.weights.clone();
@@ -354,17 +353,69 @@ impl Forward {
             run.op(&node.op)
                 .map_err(|why| format!("node {at}: {why}"))?;
         }
-        let out = (self.trace.seams.iter())
-            .find(|s| s.seam == "out")
-            .and_then(|s| s.values.first().copied())
-            .ok_or("the trace has no out seam")?;
-        let logits = run.floats(out)?;
-        Ok(if logits.rows == 0 {
-            Vec::new()
-        } else {
-            logits.row(logits.rows - 1).to_vec()
-        })
+        let mut outs: Vec<Output> = Vec::new();
+        for output in &self.trace.outputs {
+            let written = match &self.trace.values[output.value.0 as usize].def {
+                Def::Op(node) => self.trace.nodes[*node as usize].guard.holds(word),
+                Def::Merge(arms) => arms.iter().any(|(_, guard)| guard.holds(word)),
+                _ => false,
+            };
+            if !written {
+                continue;
+            }
+            let (rows, width, values) = match run.held(output.value)? {
+                Held::Floats { rows, width, v } => (*rows, *width, Values::F32(v.clone())),
+                Held::Ints { rows, width, v } => (*rows, *width, Values::I32(v.clone())),
+                Held::Opaque => return Err(format!("output `{}` holds no rows", output.name)),
+            };
+            match outs.iter_mut().find(|out| out.name == output.name) {
+                Some(out) => {
+                    if (out.rows, out.width) != (rows, width) {
+                        return Err(format!(
+                            "output `{}` is written at its layers in different shapes",
+                            output.name
+                        ));
+                    }
+                    out.layers = out.layers.max(1) + 1;
+                    match (&mut out.values, values) {
+                        (Values::F32(all), Values::F32(v)) => all.extend(v),
+                        (Values::I32(all), Values::I32(v)) => all.extend(v),
+                        _ => {
+                            return Err(format!(
+                                "output `{}` is written at its layers in different dtypes",
+                                output.name
+                            ));
+                        }
+                    }
+                }
+                None => outs.push(Output {
+                    name: output.name.clone(),
+                    layers: 0,
+                    rows,
+                    width,
+                    values,
+                }),
+            }
+        }
+        Ok(outs)
     }
+}
+
+/// What a step reads out under `name`: `rows` of `width` a layer, stacked
+/// `layers` deep when it is written per layer (0 when it is not).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Output {
+    pub name: String,
+    pub layers: u32,
+    pub rows: usize,
+    pub width: usize,
+    pub values: Values,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum Values {
+    F32(Vec<f32>),
+    I32(Vec<i32>),
 }
 
 /// The width of the rows every rank posted, `rows` of them.
@@ -529,6 +580,24 @@ impl Run<'_> {
                 lse,
                 ..
             } => self.attend(q, cache, head_dim as usize, sm_scale, o, lse),
+            Attn::ScoreCapture {
+                q,
+                cache,
+                head_dim,
+                sm_scale,
+                observe,
+                kv_max,
+                scores,
+                ..
+            } => self.capture(
+                q,
+                cache,
+                head_dim as usize,
+                sm_scale,
+                observe,
+                kv_max,
+                scores,
+            ),
             Attn::Prefill { mask: Some(_), .. } => {
                 Err("a custom mask, which this forward does not read".into())
             }
@@ -586,6 +655,53 @@ impl Run<'_> {
             self.put(lse, rows, lses)?;
         }
         Ok(())
+    }
+
+    /// The lane's attention mass over its first `kv_max` keys, averaged over
+    /// its last `observe` rows: a `kv_max` run per query head.
+    #[allow(clippy::too_many_arguments)]
+    fn capture(
+        &mut self,
+        q: ValueId,
+        cache: ValueId,
+        hd: usize,
+        scale: f32,
+        observe: u32,
+        kv_max: u32,
+        scores: ValueId,
+    ) -> Result<(), String> {
+        let Def::Cache(c) = self.trace.values[cache.0 as usize].def else {
+            return Err("a score capture over no cache".into());
+        };
+        let q = self.floats(q)?;
+        let lane = &self.lanes[c as usize];
+        let heads = q.width / hd;
+        let kv_heads = (lane.k.iter().flatten().next()).map_or(1, |k| k.len() / hd);
+        let group = heads / kv_heads.max(1);
+        let kv_max = kv_max as usize;
+        let mut out = vec![0.0; heads * kv_max];
+        let observed = (observe as usize).min(q.rows);
+        for t in q.rows - observed..q.rows {
+            let p = self.positions[t] as usize;
+            for h in 0..heads {
+                let qh = &q.row(t)[h * hd..(h + 1) * hd];
+                let kh = h / group;
+                let mut s = Vec::with_capacity(p + 1);
+                for at in 0..=p {
+                    let k = lane.k.get(at).and_then(Option::as_ref);
+                    let k = k.ok_or_else(|| format!("no key at position {at}"))?;
+                    s.push(dot(qh, &k[kh * hd..(kh + 1) * hd]) * scale);
+                }
+                let max = s.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let sum: f32 = s.iter().map(|s| (s - max).exp()).sum();
+                for (at, s) in s.iter().enumerate().take(kv_max) {
+                    out[h * kv_max + at] += (s - max).exp() / sum / observed as f32;
+                }
+            }
+        }
+        let lanes = usize::from(q.rows > 0);
+        out.truncate(lanes * heads * kv_max);
+        self.put(scores, lanes, out)
     }
 
     fn elemwise(&mut self, op: &Elemwise) -> Result<(), String> {

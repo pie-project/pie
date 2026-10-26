@@ -124,7 +124,7 @@ async fn main(input: Input) -> Result<String> {
     .context("bind the beam pool")?;
     fwd.epilogue(move || {
         // `logits()` squeezes a one-row fire to `[v]`: reshape so `beams == 1` meets `[B, 1]` scores.
-        let logits = reshape(intrinsics::logits(), [b, v]);
+        let logits = reshape(intrinsics::output(0, "logits"), [b, v]);
         let cand = broadcast(reshape(scores.take(), [b, 1]), [b, v]) + log_softmax(&logits);
         let (s, i) = top_k(reshape(cand, [b * v]), b);
         let parent = &i / v;

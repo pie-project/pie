@@ -21,14 +21,14 @@ use engine_xla::{DeviceBoot, Xla};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
 use eta_ir::op::Op;
-use eta_ir::registry::{EngineCaps, GeometryClass, Graph, ReadoutKind, Stage};
+use eta_ir::registry::{EngineCaps, GeometryClass, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use eta_ir::validate::bind;
 use poem::fact;
 use poem::ops::conv::{self, ConvShape};
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm,
-    Trace, Value, Weight, ops, seam, trace_hybrid,
+    Trace, Value, Weight, ops, trace_hybrid,
 };
 use poem_ir::InputAxis;
 
@@ -82,7 +82,7 @@ impl ForwardHybrid for DoubleBlock {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         inputs
             .recorder()
             .declare_switch("reading", &["denoise", "vae"]);
@@ -165,8 +165,7 @@ impl ForwardHybrid for DoubleBlock {
         let r_txt = ops::elemwise::residual_add(&x_txt, &y_txt);
         let r_img = ops::elemwise::residual_add(&x_img, &y_img);
         let out = Value::merge(vec![r_txt, r_img]);
-        seam::at(seam::VELOCITY, &[&out]);
-        out
+        poem::output("velocity", &out, None);
     }
 }
 
@@ -182,7 +181,7 @@ impl ForwardHybrid for TwoAxis {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         inputs
             .recorder()
             .declare_switch("reading", &["denoise", "vae"]);
@@ -206,7 +205,7 @@ impl ForwardHybrid for TwoAxis {
         let h = ops::elemwise::modulate(&normed, &m, Some(&lanes), ModulateForm::ScaleShift);
         let y = ops::linear::matmul(&h, &w("o", WIDTH, WIDTH));
         let out = ops::elemwise::residual_add(&x, &y);
-        seam::at(seam::VELOCITY, &[&out]);
+        poem::output("velocity", &out, None);
 
         let grid = vae.grid();
         let xv = vae.input("voxels", Dtype::Bf16, InputAxis::Voxel, C_IN, None);
@@ -217,8 +216,7 @@ impl ForwardHybrid for TwoAxis {
         )
         .conv_taps_major(C_IN, TAPS);
         let (pixels, pixel_grid) = conv::conv3d(&xv, &grid, &conv, None, ConvShape::same3(), None);
-        seam::at(seam::PIXELS, &[&pixels, &pixel_grid]);
-        out
+        poem::output("pixels", &pixels, Some(&pixel_grid));
     }
 }
 
@@ -624,31 +622,24 @@ impl Rig {
         }
     }
 
-    pub fn readout_widths(&self, kind: poem_ir::ReadoutKind) -> Vec<u32> {
+    pub fn readout_widths(&self, name: &str) -> Vec<u32> {
         self.loaded
             .caps
             .classes
             .classes
             .iter()
-            .filter_map(|class| class.readout.filter(|readout| readout.kind == kind))
-            .map(|readout| readout.width)
+            .flat_map(|class| &class.outputs)
+            .filter(|output| output.name == name)
+            .map(|output| output.width)
             .collect()
     }
 
-    pub fn graph(&self) -> (Graph, EngineCaps) {
+    pub fn caps(&self) -> EngineCaps {
         let caps = &self.loaded.caps;
-        (
-            Graph {
-                num_layers: 0,
-                mtp_logits: caps.has_mtp_logits,
-                mtp_depth: caps.mtp_depth,
-                attn_score: caps.has_attn_score,
-            },
-            EngineCaps {
-                lora: caps.has_lora,
-                attn_page_mask: caps.has_attn_page_mask,
-            },
-        )
+        EngineCaps {
+            lora: caps.has_lora,
+            attn_page_mask: caps.has_attn_page_mask,
+        }
     }
 
     /// The word of a one-row lane running `reading`, or the plan's token
@@ -663,9 +654,8 @@ impl Rig {
     }
 
     pub fn register(&mut self, container: TraceContainer) -> ProgramId {
-        let (graph, caps) = self.graph();
-        let lanes = lanes_read(&container);
-        let bound = bind(container, lanes, graph, caps).expect("the program binds");
+        let lanes = lanes_read(&container, &self.loaded.caps.classes);
+        let bound = bind(container, lanes, self.caps()).expect("the program binds");
         let launch = eta_compiler::codegen::launch::build(&bound, &compile_bound(&bound));
         self.engine
             .register_program(&ProgramRegistration {
@@ -822,29 +812,43 @@ pub fn lane(rig: &Rig, slot: u32, handles: &LaneHandles, stream: &str, group: u3
     }
 }
 
-pub fn lanes_read(container: &TraceContainer) -> Vec<Option<eta_ir::registry::Readout>> {
-    let mut lanes: Vec<Option<eta_ir::registry::Readout>> = vec![None];
+/// Each lane's outputs a program reads, as the load's classes declare them.
+pub fn lanes_read(
+    container: &TraceContainer,
+    classes: &poem_ir::LaneClasses,
+) -> Vec<Vec<eta_ir::registry::OutputDecl>> {
+    let mut lanes: Vec<Vec<eta_ir::registry::OutputDecl>> = vec![Vec::new()];
     for op in container.stages.iter().flat_map(|stage| &stage.ops) {
-        let eta_ir::op::Op::IntrinsicVal {
-            intr, lane, shape, ..
-        } = *op
+        let eta_ir::op::Op::Output { index, lane, .. } = *op else {
+            continue;
+        };
+        let name = &container.names[index as usize];
+        let Some(decl) = classes
+            .classes
+            .iter()
+            .flat_map(|class| &class.outputs)
+            .find(|output| &output.name == name)
         else {
             continue;
         };
-        let kind = match intr {
-            eta_ir::op::IntrinsicId::Logits => ReadoutKind::Logits,
-            eta_ir::op::IntrinsicId::Velocity => ReadoutKind::Velocity,
-            eta_ir::op::IntrinsicId::Hidden => ReadoutKind::Hidden,
-            eta_ir::op::IntrinsicId::Pixels => ReadoutKind::Pixels,
-            _ => continue,
-        };
         let at = lane as usize;
         if lanes.len() <= at {
-            lanes.resize(at + 1, None);
+            lanes.resize(at + 1, Vec::new());
         }
-        lanes[at] = Some(eta_ir::registry::Readout {
-            kind,
-            width: shape.dims().last().copied().unwrap_or(0),
+        lanes[at].push(eta_ir::registry::OutputDecl {
+            name: decl.name.clone(),
+            axis: match decl.axis {
+                InputAxis::Lane => eta_ir::registry::Axis::Lane,
+                InputAxis::Row => eta_ir::registry::Axis::Row,
+                InputAxis::Voxel => eta_ir::registry::Axis::Voxel,
+            },
+            width: decl.width,
+            dtype: match decl.dtype {
+                Dtype::I32 => EtaDtype::I32,
+                _ => EtaDtype::F32,
+            },
+            layers: decl.layers,
+            readout: decl.readout,
         });
     }
     lanes

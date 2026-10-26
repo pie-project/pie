@@ -1,6 +1,5 @@
 use poem::{
-    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Value, Weight, ops, seam,
-    trace_hybrid,
+    Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, Weight, ops, trace_hybrid,
 };
 use poem_ir::{Def, Dim, Elemwise, GeomKind, Operation, RuntimeInput, Ty};
 
@@ -19,7 +18,7 @@ impl ForwardHybrid for AdaLn {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let x = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, WIDTH, None);
         let ada = Weight::sym("ada", [2 * u64::from(WIDTH), u64::from(FREQ)], Dtype::Bf16);
         let gate = Weight::sym("gate", [u64::from(WIDTH), u64::from(FREQ)], Dtype::Bf16);
@@ -47,8 +46,7 @@ impl ForwardHybrid for AdaLn {
         };
         let y = ops::elemwise::modulate(&normed, &m, lanes.as_ref(), ModulateForm::ScaleShift);
         let r = ops::elemwise::gated_residual_add(&x, &g, &y, lanes.as_ref());
-        seam::at(seam::VELOCITY, &[&r]);
-        r
+        poem::output("velocity", &r, None);
     }
 }
 
@@ -208,15 +206,16 @@ impl ForwardHybrid for WrongWidth {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let x = inputs.input("latents", Dtype::Bf16, poem_ir::InputAxis::Row, WIDTH, None);
         let m = inputs.input("lane", Dtype::F32, poem_ir::InputAxis::Lane, WIDTH, None);
-        ops::elemwise::modulate(
+        let logits = ops::elemwise::modulate(
             &x,
             &m,
             Some(&inputs.request_of_token()),
             ModulateForm::ScaleShift,
-        )
+        );
+        poem::output("logits", &logits, None);
     }
 }
 

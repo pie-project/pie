@@ -31,9 +31,8 @@ pub enum Launched {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Intrinsic {
-    id: eta_ir::op::IntrinsicId,
-    lane: u32,
+struct Output {
+    slot: u32,
     base: u64,
     storage: u32,
     width: u32,
@@ -47,8 +46,12 @@ pub struct Session {
     shapes: Vec<ChannelShape>,
     cursors: Vec<Cursor>,
     extents: Extents,
-    /// Indexed by [`eta_ir::op::intrinsic_slot`].
-    intrinsics: Vec<Option<Intrinsic>>,
+    /// Indexed by [`eta_ir::op::output_slot`] in the stage reading outputs.
+    outputs: Vec<Option<Output>>,
+    /// That stage's names, an output's index among them, and the slots one
+    /// lane takes.
+    output_names: Vec<String>,
+    output_slots: u32,
     poisoned: bool,
     fires: u64,
     /// A commit slot (two words the device writes) for each fire airborne
@@ -101,20 +104,20 @@ impl Session {
 
         let commit_key = crate::device::held::pool::commit_key(2 * size_of::<u32>());
 
+        let reading = plan.package.plans.iter().find(|stage| {
+            stage
+                .ops
+                .iter()
+                .any(|op| op.tag == eta_ir::op::tags::OUTPUT)
+        });
         let mut session = Session {
             rings,
             shapes,
             cursors,
             extents,
-            intrinsics: vec![
-                None;
-                plan.package
-                    .plans
-                    .iter()
-                    .map(|plan| plan.intrinsic_pitch as usize)
-                    .max()
-                    .unwrap_or(0)
-            ],
+            outputs: vec![None; reading.map_or(0, |stage| stage.output_pitch as usize)],
+            output_names: reading.map_or_else(Vec::new, |stage| stage.names.clone()),
+            output_slots: reading.map_or(0, |stage| stage.output_slots),
             poisoned: false,
             fires: 0,
             commits: Vec::new(),
@@ -366,11 +369,12 @@ impl Session {
         Some((src, native))
     }
 
+    /// Points the program's reads of output `name` for `lane` at `base`;
+    /// an output the program does not read is let go.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn bind_intrinsic(
+    pub fn bind_output(
         &mut self,
-        intrinsic: eta_ir::op::IntrinsicId,
+        name: &str,
         lane: u32,
         base: u64,
         storage: u32,
@@ -378,26 +382,30 @@ impl Session {
         row_stride: u32,
         row_offset: u32,
     ) -> Result<()> {
-        let slot = eta_ir::op::intrinsic_slot(intrinsic, lane) as usize;
-        let Some(seat) = self.intrinsics.get_mut(slot) else {
-            // A lane no stage of the program reads an intrinsic of.
+        let Some(slot) = self.slot_of(name, lane) else {
             return Ok(());
         };
-        *seat = Some(Intrinsic {
-            id: intrinsic,
-            lane,
-            base,
-            storage,
-            width,
-            row_stride,
-            row_offset,
-        });
+        if let Some(seat) = self.outputs.get_mut(slot as usize) {
+            *seat = Some(Output {
+                slot,
+                base,
+                storage,
+                width,
+                row_stride,
+                row_offset,
+            });
+        }
         Ok(())
     }
 
-    fn bound(&self, intrinsic: eta_ir::op::IntrinsicId, lane: u32) -> bool {
-        self.intrinsics
-            .get(eta_ir::op::intrinsic_slot(intrinsic, lane) as usize)
+    fn slot_of(&self, name: &str, lane: u32) -> Option<u32> {
+        let index = self.output_names.iter().position(|named| named == name)?;
+        Some(u32::try_from(index).ok()? + self.output_slots * lane)
+    }
+
+    fn bound(&self, name: &str, lane: u32) -> bool {
+        self.slot_of(name, lane)
+            .and_then(|slot| self.outputs.get(slot as usize))
             .is_some_and(Option::is_some)
     }
 
@@ -406,7 +414,6 @@ impl Session {
         self.extents
     }
 
-    
     pub fn stage(
         &mut self,
         compiled: &Compiled,
@@ -421,7 +428,7 @@ impl Session {
         }
         stages_and_plans_agree(compiled)?;
         if at != Attach::Prologue {
-            self.intrinsics_bound(plan)?;
+            self.outputs_bound(plan)?;
         }
         if let Some(blocked) = self.blocked_at(plan, at) {
             return Ok(Launched::Refused(Fired::Blocked(blocked)));
@@ -440,68 +447,20 @@ impl Session {
         Ok(Launched::Airborne)
     }
 
-    /// An unbound intrinsic would make the emitted kernel dereference the side table's zero.
-    fn intrinsics_bound(&self, plan: &ExecPlan) -> Result<()> {
-        if plan.reads_intrinsic(eta_ir::op::IntrinsicId::Logits)
-            && !self.bound(eta_ir::op::IntrinsicId::Logits, 0)
-        {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the `logits` intrinsic and no buffer has been bound to \
-                 it; the emitted kernel dereferences the side table's zero, which is address \
-                 zero",
-            ));
-        }
-        for value in &plan.package.values {
-            let (Some(intrinsic), lane) = (value.intrinsic, value.lane) else {
-                continue;
-            };
-            let why = match intrinsic {
-                eta_ir::op::IntrinsicId::Velocity => "its class plants no `velocity` export",
-                eta_ir::op::IntrinsicId::Hidden => "its class plants no `hidden` export",
-                eta_ir::op::IntrinsicId::Pixels => {
-                    "its class plants no `pixels` seam, or the fire submitted no clip"
-                }
-                _ => continue,
-            };
-            if !self.bound(intrinsic, lane) {
+    /// An unbound output would make the emitted kernel dereference the side table's zero.
+    fn outputs_bound(&self, plan: &ExecPlan) -> Result<()> {
+        for (name, lane) in plan.outputs() {
+            if !self.bound(name, lane) {
                 return Err(Fault::program(
                     "program::session",
                     format!(
-                        "this program reads the `{}` intrinsic of its pass's lane {lane} and no \
-                         buffer has been bound to it: the pass has no such lane, or {why}",
-                        intrinsic.name()
+                        "this program reads output `{name}` of its pass's lane {lane} and \
+                         nothing has been bound to it: the pass has no such lane, or the \
+                         lane's class writes no such output"
                     ),
                 ));
             }
         }
-        if plan.needs_mtp_logits && !self.bound(eta_ir::op::IntrinsicId::MtpLogits, 0) {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the `mtp_logits` intrinsic and no buffer has \
-                 been bound to it; a model whose text declares no `mtp` export has \
-                 no draft column for it to point at",
-            ));
-        }
-
-        if plan.needs_mtp_drafts && !self.bound(eta_ir::op::IntrinsicId::MtpDrafts, 0) {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the `mtp_drafts` intrinsic and no buffer has \
-                 been bound to it; a model whose text plants no `mtp.drafts` export \
-                 has no token plane for it to point at",
-            ));
-        }
-
-        if plan.needs_attn_scores && !self.bound(eta_ir::op::IntrinsicId::AttnScore, 0) {
-            return Err(Fault::program(
-                "program::session",
-                "this program reads the `attn_score` intrinsic and no buffer has been \
-                 bound to it; a lane that did not ask to capture its attention has no \
-                 block of the observability slab for it to point at",
-            ));
-        }
-
         Ok(())
     }
 
@@ -512,15 +471,15 @@ impl Session {
         let commit = self.commits[minted.slot].device();
         for prepared in stages {
             let lane = prepared.stage_lane(&self.rings, &minted.before, commit)?;
-            for intrinsic in self.intrinsics.iter().flatten() {
+            for output in self.outputs.iter().flatten() {
                 prepared.bind_intrinsic(
                     lane,
-                    eta_ir::op::intrinsic_slot(intrinsic.id, intrinsic.lane),
-                    intrinsic.base,
-                    intrinsic.storage,
-                    intrinsic.width,
-                    intrinsic.row_stride,
-                    intrinsic.row_offset,
+                    output.slot,
+                    output.base,
+                    output.storage,
+                    output.width,
+                    output.row_stride,
+                    output.row_offset,
                 )?;
             }
         }
@@ -568,7 +527,6 @@ impl Session {
         })
     }
 
-    
     fn host_resolved_channels(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<u32> {
         let tokens_on_device = self.token_device_source(plan, class).is_some();
         plan.package
@@ -580,7 +538,6 @@ impl Session {
             .collect()
     }
 
-    
     pub fn host_resolved_rings(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<usize> {
         self.host_resolved_channels(plan, class)
             .into_iter()
@@ -593,7 +550,6 @@ impl Session {
             .collect()
     }
 
-    
     #[must_use]
     pub fn resolves_prologue_put(&self, plan: &ExecPlan, class: GeometryClass) -> bool {
         self.host_resolved_channels(plan, class)
@@ -858,7 +814,6 @@ impl Session {
         None
     }
 
-    
     #[must_use]
     pub fn blocked_channel(&self, plan: &ExecPlan) -> Option<u32> {
         self.blocked_at(plan, Attach::Prologue)

@@ -307,7 +307,6 @@ fn fault(fault: Fault) -> Error {
         | Fault::Maskless { .. }
         | Fault::MaskWord { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapterless { .. } | Fault::AdapterWord { .. } => Error::Invalid(fault.to_string()),
-        Fault::Scoreless { .. } | Fault::ScoreWord { .. } => Error::Invalid(fault.to_string()),
         Fault::Adapter { .. } => Error::Load(fault.to_string()),
         Fault::AdapterSlots { .. } => Error::Exhausted {
             resource: "adapter slots",
@@ -745,16 +744,12 @@ impl Engine for Cuda {
                 prefill_rows: 0,
                 max_readouts: u32::try_from(poem_compiler::arena::readouts_ceiling(shell.budget()))
                     .unwrap_or(u32::MAX),
-                max_scoring_lanes: shell.scoring_lanes(),
             },
             has_lora: true,
             has_attn_page_mask: false,
-            has_mtp_logits: shell.drafts(),
-            mtp_depth: shell.mtp_depth(),
             draft_block: drafter.map_or(0, |d| d.rows),
             draft_mask_token: drafter.map_or(0, |d| d.mask_token),
             draft_proposals_from: drafter.map_or(1, |d| d.proposals_from),
-            has_attn_score: shell.observes_scores(),
             ports: PortMask::DEVICE_GEOMETRY
                 .with(Port::AttnMask)
                 .with(Port::Fold),
@@ -904,7 +899,7 @@ impl Engine for Cuda {
         if *id != ticket.id {
             return Err(Error::Invalid(format!(
                 "frame {}'s numbers are gone: frame {id} has been submitted since, and \
-                 the out seam is one arena rectangle that every fire carves over. Ask \
+                 the readout plane is one arena rectangle that every fire carves over. Ask \
                  for a frame's readouts before submitting the next one",
                 ticket.id
             )));
@@ -1255,7 +1250,6 @@ impl Cuda {
                     window_copies: &lane.kv.window_copies,
                     mask: lane.mask.as_ref(),
                     adapter: lane_adapters[at].or(lane.adapter),
-                    captures_scores: lane.captures_scores,
                     rs: lane.rs.clone(),
                     rs_reset: lane.rs_reset,
                     rs_slot: lane.rs_slot,
@@ -1446,7 +1440,7 @@ fn attributed(error: Error, airborne: u64) -> Error {
 fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
     let mut out = Vec::with_capacity(step.readout.len());
     for (lane, want) in step.readout.iter().enumerate() {
-        let scores = step.settled.scores.get(lane).cloned().unwrap_or_default();
+        let output = step.settled.outputs.get(lane).cloned().unwrap_or_default();
         let values = step.settled.logits.get(lane).cloned().unwrap_or_default();
         let rows = step.settled.rows.get(lane).copied().unwrap_or(0);
         let width = if rows == 0 {
@@ -1464,28 +1458,21 @@ fn readouts_of(step: &PendingStep) -> Vec<LaneReadout> {
                 rows: u32::try_from(voxels).unwrap_or(u32::MAX),
                 width: u32::try_from(pixels.len() / voxels.max(1)).unwrap_or(u32::MAX),
                 values: pixels.clone(),
-                scores,
-                seam: engine::fire::ReadoutSeam::Pixels,
+                output,
                 clips: clips.clone(),
             });
             continue;
         }
         out.push(match want {
             Readout::None => LaneReadout {
-                scores,
+                output,
                 ..LaneReadout::default()
             },
             Readout::Last | Readout::Rows(_) => LaneReadout {
+                output,
                 rows,
                 width,
                 values,
-                scores,
-                seam: step
-                    .settled
-                    .seams
-                    .get(lane)
-                    .copied()
-                    .unwrap_or(engine::fire::ReadoutSeam::Logits),
                 clips: Vec::new(),
             },
         });
@@ -1522,7 +1509,7 @@ mod tests {
                 },
             }],
             nodes: Vec::new(),
-            seams: Vec::new(),
+            outputs: Vec::new(),
             drafter: None,
             inputs: Vec::new(),
         }

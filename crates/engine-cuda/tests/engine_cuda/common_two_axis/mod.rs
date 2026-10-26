@@ -15,14 +15,14 @@ use engine::{ChannelId, InstanceId, ProgramId};
 use eta_compiler::codegen::program::{Backend, emit_program};
 use eta_compiler::plan::compile_bound;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::Op;
 use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype as EtaDtype, Shape};
 use poem::fact;
 use poem::ops::conv::{self, ConvShape};
 use poem::{
     Dtype, ForwardHybrid, HybridSpec, Input, ModulateForm, Platform, RaggedMask, Request, RopeForm,
-    Trace, Value, Weight, ops, seam, trace_hybrid,
+    Trace, Weight, ops, trace_hybrid,
 };
 use poem_ir::InputAxis;
 
@@ -42,7 +42,7 @@ impl ForwardHybrid for TwoAxis {
     fn caches(&self) -> HybridSpec {
         HybridSpec::new()
     }
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         inputs
             .recorder()
             .declare_switch("reading", &["denoise", "vae"]);
@@ -101,7 +101,7 @@ impl ForwardHybrid for TwoAxis {
         let o = ops::gather::unpack_rows(&o, &perm);
         let y = ops::linear::matmul(&o, &w("o", WIDTH, HEAD_DIM));
         let out = ops::elemwise::residual_add(&x, &y);
-        seam::at(seam::VELOCITY, &[&out]);
+        poem::output("velocity", &out, None);
 
         let grid = vae.grid();
         let xv = vae.input("voxels", Dtype::Bf16, InputAxis::Voxel, C_IN, None);
@@ -112,9 +112,7 @@ impl ForwardHybrid for TwoAxis {
         )
         .conv_taps_major(C_IN, TAPS);
         let (pixels, pixel_grid) = conv::conv3d(&xv, &grid, &conv, None, ConvShape::same3(), None);
-        seam::at(seam::PIXELS, &[&pixels, &pixel_grid]);
-
-        out
+        poem::output("pixels", &pixels, Some(&pixel_grid));
     }
 }
 
@@ -267,7 +265,7 @@ pub fn pixel_epilogue(clip: [u32; 3], rows: u32) -> TraceContainer {
     let cell = Shape::new(&[clip[1], clip[2], C_IN]).expect("the clip's box");
     let plane = Shape::matrix(rows, C_OUT);
     TraceContainer {
-        names: Vec::new(),
+        names: vec!["pixels".to_string()],
         channels: vec![
             ChannelDecl {
                 shape: cell,
@@ -289,8 +287,8 @@ pub fn pixel_epilogue(clip: [u32; 3], rows: u32) -> TraceContainer {
             stage: Stage::Epilogue,
             ops: vec![
                 Op::ChanTake(0),
-                Op::IntrinsicVal {
-                    intr: IntrinsicId::Pixels,
+                Op::Output {
+                    index: 0,
                     lane: 0,
                     shape: plane,
                     dtype: EtaDtype::F32,
@@ -313,7 +311,7 @@ pub fn velocity_epilogue(rows: u32) -> TraceContainer {
         seeded: false,
     };
     TraceContainer {
-        names: Vec::new(),
+        names: vec!["velocity".to_string()],
         channels: vec![
             writer(Shape::matrix(rows, WIDTH)),
             writer(Shape::matrix(1, 1)),
@@ -331,8 +329,8 @@ pub fn velocity_epilogue(rows: u32) -> TraceContainer {
             stage: Stage::Epilogue,
             ops: vec![
                 Op::ChanTake(0),
-                Op::IntrinsicVal {
-                    intr: IntrinsicId::Velocity,
+                Op::Output {
+                    index: 0,
                     lane: 0,
                     shape: Shape::matrix(rows, WIDTH),
                     dtype: EtaDtype::F32,
@@ -471,15 +469,15 @@ impl Rig {
         }
     }
 
-    pub fn reads_out(&self, kind: poem_ir::ReadoutKind) -> Option<u32> {
+    pub fn reads_out(&self, name: &str) -> Option<u32> {
         self.loaded
             .caps
             .classes
             .classes
             .iter()
-            .filter_map(|class| class.readout)
-            .find(|readout| readout.kind == kind)
-            .map(|readout| readout.width)
+            .flat_map(|class| &class.outputs)
+            .find(|decl| decl.name == name)
+            .map(|decl| decl.width)
     }
 
     pub fn register(&mut self, container: TraceContainer, salt: u64) -> ProgramId {

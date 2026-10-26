@@ -68,7 +68,7 @@ async def main(input: dict) -> str:
     @prefill.epilogue
     def _prefill():
         allowed = prefill_mask.take()
-        first_out.put(reshape(masked_argmax(intrinsics.logits(), allowed), [1]))
+        first_out.put(reshape(masked_argmax(intrinsics.output(0, "logits"), allowed), [1]))
 
     prefill_mask.put(mask.unpack_mask(constraint.mask(), vocab))
     pipeline = Pipeline()
@@ -91,7 +91,7 @@ async def main(input: dict) -> str:
         @decode.epilogue
         def _decode():
             allowed = grammar_mask.take()
-            token = reshape(masked_argmax(intrinsics.logits(), allowed), [1])
+            token = reshape(masked_argmax(intrinsics.output(0, "logits"), allowed), [1])
             token_in.put(token)
             token_out.put(token)
 

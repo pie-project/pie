@@ -45,7 +45,7 @@ fn default_alpha() -> f32 {
 }
 
 fn contrastive_pick(amateur_logits: &Tensor, lambda: f32, alpha: f32, vocab: u32) -> Tensor {
-    let expert = log_softmax(intrinsics::logits());
+    let expert = log_softmax(intrinsics::output(0, "logits"));
     let amateur = log_softmax(amateur_logits);
     let score = &expert - &amateur * lambda;
 
@@ -112,7 +112,7 @@ async fn main(input: Input) -> Result<String> {
     amateur_prefill.mask(&amateur_prefill_mask)?;
     amateur_prefill.state(&[&amateur_ws], StateGeometry::folding())?;
     amateur_prefill.epilogue(move || {
-        amateur_prefill_out.put(intrinsics::logits());
+        amateur_prefill_out.put(intrinsics::output(0, "logits"));
     });
 
     let pipeline = Pipeline::new();
@@ -180,7 +180,7 @@ async fn main(input: Input) -> Result<String> {
             [1, span],
         );
 
-        amateur_logits_out.put(intrinsics::logits());
+        amateur_logits_out.put(intrinsics::output(0, "logits"));
         amateur_fill.put(&base + 1u32);
         amateur_mask.put(next_mask);
     });

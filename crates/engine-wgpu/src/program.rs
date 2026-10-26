@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use engine::channel::{ChannelId, ChannelRegistration, HostMirror, RegisteredChannel, Ticket};
 use engine::program::{BoundInstance, InstanceBinding, InstanceId, ProgramId, ProgramRegistration};
-use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, PassInputs, StepOutcome, Value};
+use eta_exec::{ChannelState, ExecPlan, HostOp, InterpInstance, Value};
+#[cfg(feature = "wgpu")]
+use eta_exec::{PassInputs, StepOutcome};
 #[cfg(feature = "wgpu")]
 use eta_ir::registry::Stage;
 use eta_ir::registry::{GeometryClass, Port};
@@ -32,7 +34,6 @@ impl From<String> for Refusal {
 }
 
 struct Instance {
-    program: ProgramId,
     plan: Arc<ExecPlan>,
     inst: InterpInstance,
     geometry: GeometryClass,
@@ -60,7 +61,6 @@ impl Instance {
 #[derive(Default)]
 pub(crate) struct Tally {
     device: AtomicU64,
-    interpreted: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -81,15 +81,8 @@ pub(crate) struct Half {
 
 #[cfg(feature = "wgpu")]
 pub(crate) struct Pass<'a> {
-    pub logits: Option<&'a [f32]>,
-    pub rows: u32,
-    pub vocab: u32,
-    pub mtp_logits: Option<&'a [f32]>,
-    pub mtp_width: u32,
-    pub readout: Option<crate::guest::run::Readout<'a>>,
-    /// The pass's own `velocity(k)` / `hidden(k)` readouts, lane `k` at `k`.
-    pub lanes: Vec<Option<crate::guest::run::Readout<'a>>>,
-    pub pixels: Vec<Option<crate::guest::run::Readout<'a>>>,
+    /// What the fire read out for the pass's lane `k`, at `k`.
+    pub seats: Vec<Vec<crate::guest::run::Readout<'a>>>,
     pub at: Stage,
 }
 
@@ -103,35 +96,9 @@ impl Half {
         pass: Pass<'_>,
     ) -> Result<(), Refusal> {
         let instance = self.id;
-        if self.plan.needs_logits && pass.readout.is_none() {
-            return Err(Refusal::Program(format!(
-                "instance {instance} reads logits, but its lane offered no readout seat"
-            )));
-        }
-        if let Some(values) = pass.mtp_logits
-            && pass.mtp_width != pass.vocab
-        {
-            return Err(Refusal::Program(format!(
-                "instance {instance} reads a draft column {} wide against a \
-                 {}-wide trunk readout ({} draft values); this shell reads both at \
-                 one pitch",
-                pass.mtp_width,
-                pass.vocab,
-                values.len()
-            )));
-        }
-        let inputs = PassInputs {
-            logits: pass.logits,
-            mtp_logits: pass.mtp_logits,
-            rows: pass.rows,
-            vocab: pass.vocab,
-
-            mtp_draft_row: pass.mtp_logits.map(|_| 0),
-            attn_score: None,
-        };
+        let inputs = PassInputs::none();
         let mut runner =
-            crate::guest::run::OnDevice::new(device, &mut self.session, widen, pass.readout)
-                .with_lanes(pass.lanes, pass.pixels);
+            crate::guest::run::OnDevice::new(device, &mut self.session, widen, pass.seats);
         let outcome =
             eta_exec::step_with(&mut self.inst, &self.plan, &inputs, &mut runner, pass.at);
         let ran = runner.ran().len();
@@ -229,7 +196,8 @@ pub struct Guests {
     device: crate::device::Context,
     widen: Arc<crate::guest::widen::Widen>,
     tally: Arc<Tally>,
-    policies: Vec<engine::fire::Readout>,
+    /// Each readout plane's output name.
+    names: Vec<String>,
     attached: Vec<Attached>,
 }
 
@@ -246,28 +214,19 @@ pub(crate) type Job = Box<dyn FnOnce() -> Result<(), Refusal> + Send + 'static>;
 
 #[cfg(feature = "wgpu")]
 impl Guests {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn jobs(
         self,
-        rows: &[Vec<f32>],
-        drafts: &[Vec<f32>],
         seat: &crate::device::Buffer,
         layout: &[crate::serve::ReadSpan],
-        mtp_width: u32,
-        pixels: Option<&(crate::device::Buffer, Vec<(u64, u32)>)>,
+        pixels: Option<&crate::landing::Pixels>,
     ) -> Vec<Job> {
         let Guests {
             device,
             widen,
             tally,
-            policies,
+            names,
             attached,
         } = self;
-        let mut readouts: Vec<Option<engine::fire::LaneReadout>> =
-            crate::api::lane_readouts(&policies, rows)
-                .into_iter()
-                .map(Some)
-                .collect();
         attached
             .into_iter()
             .map(
@@ -277,98 +236,64 @@ impl Guests {
                      half,
                      held,
                  }| {
-                    let at = lane as usize;
-                    let span = at..(at + lanes).min(readouts.len());
-                    let readout = {
-                        let mut joined: Option<engine::fire::LaneReadout> = None;
-                        for lane in span.clone() {
-                            let Some(next) = readouts.get_mut(lane).and_then(Option::take) else {
-                                continue;
-                            };
-                            match joined.as_mut() {
-                                None => joined = Some(next),
-                                Some(joined) => {
-                                    joined.rows += next.rows;
-                                    joined.values.extend(next.values);
-                                }
-                            }
-                        }
-                        joined
-                    };
-                    let mtp: Option<Vec<f32>> = (mtp_width > 0)
-                        .then(|| {
-                            span.clone()
-                                .filter_map(|lane| drafts.get(lane))
-                                .flat_map(|values| values.iter().copied())
-                                .collect::<Vec<f32>>()
+                    let spans: Vec<Vec<crate::serve::ReadSpan>> = (lane..lane + lanes as u32)
+                        .map(|lane| {
+                            (layout.iter())
+                                .filter(|span| span.lane == lane && span.rows > 0)
+                                .copied()
+                                .collect()
                         })
-                        .filter(|values| !values.is_empty());
-                    let entries: Vec<crate::serve::ReadSpan> = span
-                        .clone()
-                        .filter_map(|lane| layout.get(lane).copied())
                         .collect();
-                    let on_device = {
-                        let contiguous = entries.windows(2).all(|pair| {
-                            pair[0].at + pair[0].bytes() == pair[1].at && pair[0].f32 == pair[1].f32
+                    let pixels: Option<crate::landing::Pixels> =
+                        pixels.map(|(plane, output, all)| {
+                            let at = lane as usize;
+                            let mine = all.get(at..(at + lanes).min(all.len()));
+                            (plane.clone(), output.clone(), mine.unwrap_or(&[]).to_vec())
                         });
-                        let count: u32 = entries.iter().map(crate::serve::ReadSpan::values).sum();
-                        (contiguous && count > 0).then(|| (entries[0].at, count, entries[0].f32))
-                    };
                     let seat = seat.clone();
-                    let pixels = pixels.cloned();
                     let device = device.clone();
                     let widen = Arc::clone(&widen);
                     let tally = Arc::clone(&tally);
+                    let names = names.clone();
                     let job: Job = Box::new(move || {
                         let _held = held;
-                        let (logits, rows, vocab) = match &readout {
-                            Some(lane) if lane.rows > 0 => {
-                                (Some(lane.values.as_slice()), lane.rows, lane.width)
-                            }
-                            _ => (None, 0, 0),
-                        };
-                        let readout =
-                            on_device.map(|(at, width, f32)| crate::guest::run::Readout {
-                                seat: &seat,
-                                at,
-                                width,
-                                f32,
-                            });
+                        let seats = spans
+                            .iter()
+                            .enumerate()
+                            .map(|(k, spans)| {
+                                let mut seats: Vec<crate::guest::run::Readout<'_>> = spans
+                                    .iter()
+                                    .map(|span| crate::guest::run::Readout {
+                                        output: names
+                                            .get(span.plane as usize)
+                                            .map_or("", String::as_str),
+                                        seat: &seat,
+                                        at: span.at,
+                                        width: span.values(),
+                                        dtype: span.dtype,
+                                    })
+                                    .collect();
+                                if let Some((plane, output, spans)) = pixels.as_ref()
+                                    && let Some(&(at, width)) = spans.get(k)
+                                    && width > 0
+                                {
+                                    seats.push(crate::guest::run::Readout {
+                                        output,
+                                        seat: plane,
+                                        at,
+                                        width,
+                                        dtype: eta_ir::Dtype::Bf16,
+                                    });
+                                }
+                                seats
+                            })
+                            .collect();
                         half.lock().expect("half lock poisoned").fire(
                             &device,
                             &widen,
                             &tally,
                             Pass {
-                                logits,
-                                rows,
-                                vocab,
-                                mtp_logits: mtp.as_deref(),
-                                mtp_width,
-                                readout,
-                                lanes: entries
-                                    .iter()
-                                    .map(|entry| {
-                                        (entry.rows > 0).then_some(crate::guest::run::Readout {
-                                            seat: &seat,
-                                            at: entry.at,
-                                            width: entry.values(),
-                                            f32: entry.f32,
-                                        })
-                                    })
-                                    .collect(),
-                                pixels: span
-                                    .clone()
-                                    .map(|lane| {
-                                        let (plane, spans) = pixels.as_ref()?;
-                                        let &(at, width) = spans.get(lane)?;
-                                        (width > 0).then_some(crate::guest::run::Readout {
-                                            seat: plane,
-                                            at,
-                                            width,
-                                            f32: false,
-                                        })
-                                    })
-                                    .collect(),
+                                seats,
                                 at: Stage::Epilogue,
                             },
                         )
@@ -539,7 +464,6 @@ impl Plane {
         self.instances.insert(
             id,
             Instance {
-                program: binding.program,
                 #[cfg(feature = "wgpu")]
                 half: Arc::new(std::sync::Mutex::new(Half {
                     id,
@@ -921,6 +845,16 @@ impl Plane {
             .is_some_and(|seat| seat.plan.prologue_runs())
     }
 
+    /// The outputs `instance`'s program reads, by name and lane.
+    #[must_use]
+    pub fn reads(&self, instance: InstanceId) -> Vec<(String, u32)> {
+        self.instances.get(&instance).map_or_else(Vec::new, |seat| {
+            (seat.plan.outputs().into_iter())
+                .map(|(name, lane)| (name.to_string(), lane))
+                .collect()
+        })
+    }
+
     /// Waits for every pass airborne on `instance`'s channels before the prologue runs.
     #[cfg(feature = "wgpu")]
     pub(crate) fn fire_prologue(
@@ -946,14 +880,7 @@ impl Plane {
             widen,
             &self.tally,
             Pass {
-                logits: None,
-                rows: 0,
-                vocab: 0,
-                mtp_logits: None,
-                mtp_width: 0,
-                readout: None,
-                lanes: Vec::new(),
-                pixels: Vec::new(),
+                seats: Vec::new(),
                 at: Stage::Prologue,
             },
         )
@@ -964,7 +891,7 @@ impl Plane {
         &self,
         device: &crate::device::Context,
         attachments: impl IntoIterator<Item = (InstanceId, u32)>,
-        policies: Vec<engine::fire::Readout>,
+        names: Vec<String>,
     ) -> Result<Guests, Refusal> {
         let mut attached = Vec::new();
         for (instance, lane) in attachments {
@@ -988,7 +915,7 @@ impl Plane {
             device: device.clone(),
             widen: Arc::clone(widen),
             tally: Arc::clone(&self.tally),
-            policies,
+            names,
             attached,
         })
     }
@@ -1064,52 +991,6 @@ impl Plane {
         }))
     }
 
-    #[doc(hidden)]
-    pub fn fire_interpreted(
-        &mut self,
-        instance: InstanceId,
-        logits: Option<&[f32]>,
-        rows: u32,
-        vocab: u32,
-        mtp_logits: Option<&[f32]>,
-        mtp_width: u32,
-    ) -> Result<(), Refusal> {
-        let seat = self.instances.get_mut(&instance).ok_or(Refusal::Closed {
-            what: "instance",
-            id: instance.0,
-        })?;
-        if let Some(values) = mtp_logits
-            && mtp_width != vocab
-        {
-            return Err(Refusal::Program(format!(
-                "instance {instance} reads a draft column {mtp_width} wide against a \
-                 {vocab}-wide trunk readout ({} draft values); this shell reads both at \
-                 one pitch",
-                values.len()
-            )));
-        }
-        let inputs = PassInputs {
-            logits,
-            mtp_logits,
-            rows,
-            vocab,
-            mtp_draft_row: mtp_logits.map(|_| 0),
-            attn_score: None,
-        };
-        let outcome = eta_exec::step(&mut seat.inst, &seat.plan, &inputs);
-        self.tally.interpreted.fetch_add(1, Ordering::AcqRel);
-        let program = seat.program;
-        match outcome {
-            StepOutcome::Committed => Ok(()),
-            StepOutcome::Blocked(channel) => Err(Refusal::Program(format!(
-                "instance {instance} (program {program}) blocked on channel {channel}"
-            ))),
-            StepOutcome::Faulted(why) => Err(Refusal::Program(format!(
-                "instance {instance} (program {program}) faulted: {why}"
-            ))),
-        }
-    }
-
     #[cfg(feature = "wgpu")]
     fn build_session(
         &mut self,
@@ -1165,11 +1046,8 @@ impl Plane {
     }
 
     #[must_use]
-    pub fn tally(&self) -> (u64, u64) {
-        (
-            self.tally.device.load(Ordering::Acquire),
-            self.tally.interpreted.load(Ordering::Acquire),
-        )
+    pub fn tally(&self) -> u64 {
+        self.tally.device.load(Ordering::Acquire)
     }
 
     fn instance_mut(&mut self, id: InstanceId) -> Result<&mut Instance, Refusal> {

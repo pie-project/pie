@@ -7,7 +7,7 @@ use common_two_axis::{
     pixel_epilogue, trace,
 };
 use engine::Engine;
-use engine::fire::{ReadoutSeam, StepVoxels};
+use engine::fire::StepVoxels;
 use eta_ir::container::HostRole;
 
 const CLIP: [u32; 3] = [1, 4, 6];
@@ -66,7 +66,7 @@ fn the_token_regions_arm_while_the_voxel_regions_stay_eager() {
     rig.engine
         .settle_frame(&mut ticket)
         .expect("the voxel fire settles");
-    assert_eq!(ticket.steps[0].readouts[0].seam, ReadoutSeam::Pixels);
+    assert_eq!(ticket.steps[0].readouts[0].output, "pixels");
     assert_close(
         &rig.take(vae, 1),
         &conv_reference(&weights, CLIP, &clip),

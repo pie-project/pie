@@ -6,7 +6,6 @@ use common_dit::{
     HostRequest, Lcg, Rig, WIDTH, Weights, assert_close, attach, bf, lane, reference,
     reference_with, trace,
 };
-use engine::fire::ReadoutSeam;
 
 fn request(rng: &mut Lcg, text_rows: usize, image_rows: usize) -> HostRequest {
     let w = WIDTH as usize;
@@ -46,13 +45,13 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
     };
     let weights = Weights::random(&trace(), 7);
     let mut rig = Rig::load(trace(), &weights, 64, vec![16, 32, 64], None);
-    let velocity = rig.readout_widths(poem_ir::ReadoutKind::Velocity);
+    let velocity = rig.readout_widths("velocity");
     assert!(
         !velocity.is_empty() && velocity.iter().all(|&width| width == WIDTH),
         "the plan plants a velocity seam"
     );
     assert!(
-        rig.readout_widths(poem_ir::ReadoutKind::Logits).is_empty(),
+        rig.readout_widths("logits").is_empty(),
         "a denoiser has no vocabulary"
     );
 
@@ -118,7 +117,7 @@ fn the_double_block_lands_the_host_reference_on_four_lanes() {
     let readouts = rig.fire(lanes.clone(), attachments.clone(), Vec::new());
     assert_eq!(readouts.len(), 4);
     for readout in &readouts {
-        assert_eq!(readout.seam, ReadoutSeam::Velocity);
+        assert_eq!(readout.output, "velocity");
         assert_eq!(readout.width, WIDTH);
     }
     assert_close(&readouts[0].values, &want[0].1, "request 0 image velocity");

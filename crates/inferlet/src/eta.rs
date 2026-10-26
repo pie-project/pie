@@ -4,6 +4,7 @@ use std::rc::Rc;
 
 use eta_dsl::builder::Builder;
 use eta_dsl::channel::PutValue;
+use eta_dsl::eta::registry::{Axis, OutputDecl};
 use eta_dsl::value::ConstData;
 use eta_dsl::{Channel as DslChannel, IntoConst, IntoPut, IntoShape, Port, Shape, Stage, Tensor};
 
@@ -838,12 +839,6 @@ impl ForwardPass {
     pub fn epilogue(&self, body: impl Fn() + 'static) {
         self.set_stage(Stage::Epilogue, body);
     }
-    pub fn on_attn_proj(&self, body: impl Fn() + 'static) {
-        self.set_stage(Stage::OnAttnProj, body);
-    }
-    pub fn on_attn(&self, body: impl Fn() + 'static) {
-        self.set_stage(Stage::OnAttn, body);
-    }
 
     fn set_stage(&self, stage: Stage, body: impl Fn() + 'static) {
         let mut inner = self.inner.borrow_mut();
@@ -868,6 +863,7 @@ impl ForwardPass {
         }
         let inner = self.inner.borrow();
         let mut builder = Builder::new(inner.vocab, inner.page_size);
+        builder.outputs(lane_outputs(&inner)?);
         for (port, channel) in &inner.ports {
             builder.bind_port_recorded(*port, channel.clone());
         }
@@ -904,6 +900,66 @@ impl Default for ForwardPass {
     }
 }
 
+/// Each lane's outputs, in lane order, by its switches.
+fn lane_outputs(inner: &ForwardInner) -> Result<Vec<Vec<OutputDecl>>, String> {
+    thread_local! {
+        static DECLARED: RefCell<Vec<(Vec<(String, String)>, Vec<OutputDecl>)>> =
+            const { RefCell::new(Vec::new()) };
+    }
+    let lanes = inner
+        .switches
+        .iter()
+        .map(|(lane, _, _)| lane + 1)
+        .chain(inner.inputs.iter().map(|(lane, _, _)| lane + 1))
+        .chain([u32::try_from(inner.lanes.len()).unwrap_or(u32::MAX), 1])
+        .max()
+        .unwrap_or(1);
+    (0..lanes)
+        .map(|lane| {
+            let switches: Vec<(String, String)> = inner
+                .switches
+                .iter()
+                .filter(|(at, _, _)| *at == lane)
+                .map(|(_, name, value)| (name.clone(), value.clone()))
+                .collect();
+            if let Some(hit) = DECLARED.with_borrow(|seen| {
+                seen.iter()
+                    .find(|(key, _)| *key == switches)
+                    .map(|(_, outputs)| outputs.clone())
+            }) {
+                return Ok(hit);
+            }
+            let outputs: Vec<OutputDecl> = crate::model::lane(&switches)?
+                .outputs
+                .iter()
+                .map(output_decl)
+                .collect();
+            DECLARED.with_borrow_mut(|seen| seen.push((switches, outputs.clone())));
+            Ok(outputs)
+        })
+        .collect()
+}
+
+/// An output as the program reads it.
+fn output_decl(decl: &crate::model::OutputDecl) -> OutputDecl {
+    use crate::model::InputAxis;
+    OutputDecl {
+        name: decl.name.clone(),
+        axis: match decl.axis {
+            InputAxis::Lane => Axis::Lane,
+            InputAxis::Row => Axis::Row,
+            InputAxis::Voxel => Axis::Voxel,
+        },
+        width: decl.width,
+        dtype: match decl.dtype {
+            crate::types::Dtype::I32 => eta_dsl::Dtype::I32,
+            _ => eta_dsl::Dtype::F32,
+        },
+        layers: decl.layers,
+        readout: decl.readout,
+    }
+}
+
 pub fn frame_size() -> usize {
     thread_local! {
         static FRAME_SIZE: std::cell::OnceCell<usize> = const { std::cell::OnceCell::new() };
@@ -931,16 +987,9 @@ pub fn kv_page_size() -> u32 {
     PAGE.with(|c| *c.get_or_init(crate::model::kv_page_size))
 }
 
-/// The most rows one pass may read out through `kind`; a pass of any length
-/// runs, the runtime cuts it.
-pub fn max_readout_rows(kind: crate::model::ReadoutKind) -> usize {
-    (crate::model::max_readout_rows(kind) as usize).max(1)
-}
-
-/// Even spans of `n` rows, each at most [`max_readout_rows`] of `kind`.
-pub fn readout_spans(n: u32, kind: crate::model::ReadoutKind) -> Vec<(u32, u32)> {
-    let max = u32::try_from(max_readout_rows(kind)).unwrap_or(u32::MAX);
-    even_spans(n, max)
+/// Even spans of `n` rows, each at most `max` (an output's `max-rows`).
+pub fn readout_spans(n: u32, max: u32) -> Vec<(u32, u32)> {
+    even_spans(n, max.max(1))
 }
 
 fn even_spans(n: u32, cap: u32) -> Vec<(u32, u32)> {
@@ -1085,7 +1134,7 @@ impl Default for Pipeline {
 pub mod shared_prelude {
     pub use super::{
         Channel, Fold, Pipeline, StateGeometry, TOKEN_PAD, WorkingSet, channel_capacity,
-        frame_size, kv_page_size, max_readout_rows, readout_spans,
+        frame_size, kv_page_size, readout_spans,
     };
     pub use crate::{Context, Result, model};
     pub use eta_dsl::Stage;

@@ -25,8 +25,6 @@ struct Input {
     /// whole prompt served. The gate compares the two.
     #[serde(default = "default_evict")]
     evict: bool,
-    #[serde(default = "default_layers")]
-    layers: u32,
     #[serde(default = "default_heads")]
     heads: u32,
 }
@@ -48,10 +46,6 @@ fn default_page_budget() -> u32 {
 }
 fn default_evict() -> bool {
     true
-}
-/// Qwen3.5-0.8B: 6 of its 24 layers are attention layers.
-fn default_layers() -> u32 {
-    6
 }
 /// Qwen3.5-0.8B: 8 query heads.
 fn default_heads() -> u32 {
@@ -89,14 +83,26 @@ struct Output {
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
-    if input.layers == 0 || input.heads == 0 {
-        return Err("layers and heads must both be at least 1".into());
+    if input.heads == 0 {
+        return Err("heads must be at least 1".into());
     }
+    let scores = model::lane_of(&[])?
+        .outputs
+        .into_iter()
+        .find(|output| output.name == "attn.scores")
+        .ok_or("this model reads out no attention scores")?;
     if !(0.0..=1.0).contains(&input.depth) {
         return Err("depth must be between 0.0 and 1.0".into());
     }
-    let layers = input.layers;
+    let layers = scores.layers.max(1);
     let heads = input.heads;
+    let score_kv = scores.width / heads;
+    if score_kv * heads != scores.width {
+        return Err(format!(
+            "the {}-wide score row does not split into {heads} heads",
+            scores.width
+        ));
+    }
     let Some(planes) = layers.checked_mul(heads) else {
         return Err("layers * heads overflows the plane count".into());
     };
@@ -144,11 +150,10 @@ async fn main(input: Input) -> Result<Output> {
     // The prompt, the answer's slot and one past it.
     let max_pages = (n + 2).div_ceil(page_size);
     let kv_max = max_pages * page_size;
-    if kv_max > intrinsics::attn_score_kv_max() {
+    if kv_max > score_kv {
         return Err(format!(
-            "this haystack needs {kv_max} KV slots, past the published attn_score \
-             ceiling of {}",
-            intrinsics::attn_score_kv_max()
+            "this haystack needs {kv_max} KV slots, past the model's score \
+             ceiling of {score_kv}"
         ));
     }
     let p_max = max_pages;
@@ -179,11 +184,11 @@ async fn main(input: Input) -> Result<Output> {
         },
     )?;
     fwd_p.epilogue(move || {
-        let logits = intrinsics::logits();
+        let logits = intrinsics::output(0, "logits");
         tok_out_p.put(reduce_argmax(logits));
 
         // `[planes, kv]` layer-major; dividing by `heads` averages heads and sums layers.
-        let rect = intrinsics::attn_score(planes);
+        let rect = reshape(intrinsics::output(0, "attn.scores"), [planes, score_kv]);
         let folded = gather(&(&reduce_sum(transpose(&rect)) / heads_f), iota(kv_max));
         // Exact: `kv_max = p_max * page_size`.
         let per_page = reduce_sum(reshape(&folded, [p_max, page_size]));
@@ -259,7 +264,7 @@ async fn main(input: Input) -> Result<Output> {
         },
     )?;
     fwd_q.epilogue(move || {
-        let logits = intrinsics::logits();
+        let logits = intrinsics::output(0, "logits");
         tok_out_q.put(reduce_argmax(logits));
     });
     fwd_q.submit(&pipe).context("answer submit")?;

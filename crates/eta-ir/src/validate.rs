@@ -4,11 +4,8 @@ use core::fmt;
 
 use super::container::{ChannelDecl, ExternDir, HostRole, PortSource, TraceContainer};
 use super::infer::{BodyCtx, BodyError, BodyErrorKind, body_types};
-use super::op::{ChannelUse, IntrinsicId, Op};
-use super::registry::{
-    EngineCaps, Graph, KNOWN_SINKS, Phase, Port, Readout, ReadoutKind, SinkScope, Stage,
-    intrinsic_stages,
-};
+use super::op::{ChannelUse, Op};
+use super::registry::{Axis, EngineCaps, KNOWN_SINKS, OutputDecl, Phase, Port, Stage};
 use crate::types::{Dtype, Shape, ValueType};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,8 +32,7 @@ pub enum ChannelClass {
 #[derive(Clone, Debug)]
 pub struct BoundTrace {
     pub container: TraceContainer,
-    pub lanes: Vec<Option<Readout>>,
-    pub graph: Graph,
+    pub lanes: Vec<Vec<OutputDecl>>,
     pub hash: u64,
     pub channel_types: Vec<ValueType>,
     pub stage_types: Vec<Vec<ValueType>>,
@@ -87,19 +83,19 @@ pub enum ValidateError {
         name_index: u16,
         name: String,
     },
-    IntrinsicWrongStage {
-        intr: IntrinsicId,
+    OutputWrongStage {
+        name: String,
         stage: Stage,
     },
-    IntrinsicUnavailable {
-        intr: IntrinsicId,
+    OutputUnavailable {
+        name: String,
+        lane: u32,
     },
-    IntrinsicTypeRule {
-        intr: IntrinsicId,
-        stage: Stage,
+    OutputTypeRule {
+        name: String,
     },
-    IntrinsicLane {
-        intr: IntrinsicId,
+    OutputLane {
+        name: String,
         lane: u32,
         lanes: u32,
     },
@@ -155,8 +151,7 @@ impl fmt::Display for ValidateError {
                 stage,
             } => write!(
                 f,
-                "sink `{name}` (name #{name_index}) at stage {} does not precede \
-                 its consumption point",
+                "sink `{name}` (name #{name_index}) at stage {}; sinks run at the prologue",
                 stage.name()
             ),
             KernelUnavailable { name_index, name } => {
@@ -172,34 +167,22 @@ impl fmt::Display for ValidateError {
                 "`{name}` (name #{name_index}): time-/load-varying return — a \
                  register read in disguise"
             ),
-            IntrinsicWrongStage { intr, stage } => {
-                write!(
-                    f,
-                    "intrinsic {} not in scope at stage {}",
-                    intr.name(),
-                    stage.name()
-                )
-            }
-            IntrinsicUnavailable { intr } => {
-                write!(
-                    f,
-                    "intrinsic {} reads what no lane of this pass reads out and the \
-                     model's graph does not export",
-                    intr.name()
-                )
-            }
-            IntrinsicLane { intr, lane, lanes } => write!(
+            OutputWrongStage { name, stage } => write!(
                 f,
-                "intrinsic {} reads lane {lane} of a pass of {lanes}; `velocity`, \
-                 `hidden` and `pixels` name one of their pass's lanes, the others read \
-                 the pass and name lane 0",
-                intr.name()
-            ),
-            IntrinsicTypeRule { intr, stage } => write!(
-                f,
-                "intrinsic {} at stage {}: declared type violates the registry rule",
-                intr.name(),
+                "output `{name}` read at stage {}; outputs are read at the epilogue",
                 stage.name()
+            ),
+            OutputUnavailable { name, lane } => write!(
+                f,
+                "output `{name}` is not one lane {lane} of this pass reads out"
+            ),
+            OutputLane { name, lane, lanes } => write!(
+                f,
+                "output `{name}` read for lane {lane} of a pass of {lanes}"
+            ),
+            OutputTypeRule { name } => write!(
+                f,
+                "output `{name}`: the type read is not the one the model declares"
             ),
             InputsUnsortedOrDup => f.write_str("input table must be sorted by channel, unique"),
             InputChannelOutOfRange { chan } => {
@@ -227,10 +210,25 @@ impl fmt::Display for ValidateError {
 impl std::error::Error for ValidateError {}
 
 impl BoundTrace {
-    /// How wide a logits row of the pass is, 0 where no lane reads logits.
+    /// How wide a float row of the readout rows is, 0 where no lane of the
+    /// pass reads one out.
     #[must_use]
     pub fn vocab(&self) -> u32 {
-        logits_width(&self.lanes).unwrap_or(0)
+        self.lanes
+            .iter()
+            .flatten()
+            .find(|decl| decl.readout && decl.dtype == Dtype::F32)
+            .map_or(0, |decl| decl.width)
+    }
+
+    /// The decl of the output `ops`' name `index` names, as `lane` reads it.
+    #[must_use]
+    pub fn output(&self, names: &[String], index: u16, lane: u32) -> Option<&OutputDecl> {
+        let name = names.get(index as usize)?;
+        self.lanes
+            .get(lane as usize)?
+            .iter()
+            .find(|decl| &decl.name == name)
     }
 }
 
@@ -241,15 +239,14 @@ pub(crate) fn channel_value_type(decl: &ChannelDecl) -> ValueType {
 /// `lanes` holds one entry a lane, in lane order.
 pub fn bind(
     container: TraceContainer,
-    lanes: Vec<Option<Readout>>,
-    graph: Graph,
+    lanes: Vec<Vec<OutputDecl>>,
     caps: EngineCaps,
 ) -> Result<BoundTrace, ValidateError> {
     check_structure(&container)?;
     check_externs(&container)?;
     let channel_types: Vec<ValueType> = container.channels.iter().map(channel_value_type).collect();
     let stage_types = check_bodies(&container, &channel_types)?;
-    check_intrinsics(&container, &lanes, graph)?;
+    check_outputs(&container, &lanes)?;
     check_second_party_names(&container, caps)?;
     check_spsc_endpoints(&container)?;
 
@@ -260,7 +257,6 @@ pub fn bind(
     Ok(BoundTrace {
         container,
         lanes,
-        graph,
         hash,
         channel_types,
         stage_types,
@@ -386,80 +382,57 @@ fn check_bodies(
 }
 
 /// Rechecked per pass: a cached program bound for one pass may not fit the next.
-pub fn check_intrinsics(
+pub fn check_outputs(
     container: &TraceContainer,
-    lanes: &[Option<Readout>],
-    graph: Graph,
+    lanes: &[Vec<OutputDecl>],
 ) -> Result<(), ValidateError> {
     for sp in &container.stages {
         for op in &sp.ops {
-            if let Op::IntrinsicVal {
-                intr,
+            let Op::Output {
+                index,
                 lane,
                 shape,
                 dtype,
             } = *op
-            {
-                if !intrinsic_stages(intr).contains(&sp.stage) {
-                    return Err(ValidateError::IntrinsicWrongStage {
-                        intr,
-                        stage: sp.stage,
-                    });
-                }
-                let count = u32::try_from(lanes.len()).unwrap_or(u32::MAX);
-                if (lane != 0 && !intr.per_lane()) || lane >= count.max(1) {
-                    return Err(ValidateError::IntrinsicLane {
-                        intr,
-                        lane,
-                        lanes: count,
-                    });
-                }
-                let read = lanes.get(lane as usize).copied().flatten();
-                let width = match intrinsic_width(intr, read, lanes, graph) {
-                    Some(width) => width,
-                    None => return Err(ValidateError::IntrinsicUnavailable { intr }),
-                };
-                if !intrinsic_type_ok(intr, shape, dtype, width) {
-                    return Err(ValidateError::IntrinsicTypeRule {
-                        intr,
-                        stage: sp.stage,
-                    });
-                }
+            else {
+                continue;
+            };
+            let name = String::from(resolve_name(container, index));
+            if sp.stage != Stage::Epilogue {
+                return Err(ValidateError::OutputWrongStage {
+                    name,
+                    stage: sp.stage,
+                });
+            }
+            let Some(outputs) = lanes.get(lane as usize) else {
+                return Err(ValidateError::OutputLane {
+                    name,
+                    lane,
+                    lanes: u32::try_from(lanes.len()).unwrap_or(u32::MAX),
+                });
+            };
+            let Some(decl) = outputs.iter().find(|decl| decl.name == name) else {
+                return Err(ValidateError::OutputUnavailable { name, lane });
+            };
+            if !output_type_ok(decl, shape, dtype) {
+                return Err(ValidateError::OutputTypeRule { name });
             }
         }
     }
     Ok(())
 }
 
-/// `Some(None)` where any width goes; `None` when the pass reads no such thing.
-fn intrinsic_width(
-    intr: IntrinsicId,
-    read: Option<Readout>,
-    lanes: &[Option<Readout>],
-    graph: Graph,
-) -> Option<Option<u32>> {
-    let lane_reads = |kind: ReadoutKind| {
-        read.filter(|readout| readout.kind == kind)
-            .map(|readout| Some(readout.width))
+/// A lane reads `[rows, width]` of a row or voxel output, `[1, width]` of a
+/// lane output, and `[layers, width]` of one written per layer.
+fn output_type_ok(decl: &OutputDecl, shape: Shape, dtype: Dtype) -> bool {
+    let rows_ok = |rows: u32| match decl.axis {
+        Axis::Lane => rows == decl.layers.max(1),
+        Axis::Row | Axis::Voxel => rows >= 1,
     };
-    match intr {
-        IntrinsicId::Logits => logits_width(lanes).map(Some),
-        IntrinsicId::MtpLogits if graph.mtp_logits => logits_width(lanes).map(Some),
-        IntrinsicId::MtpDrafts if graph.mtp_depth > 0 => Some(None),
-        IntrinsicId::AttnScore if graph.attn_score => Some(None),
-        IntrinsicId::Velocity => lane_reads(ReadoutKind::Velocity),
-        IntrinsicId::Pixels => lane_reads(ReadoutKind::Pixels),
-        IntrinsicId::Hidden | IntrinsicId::Query | IntrinsicId::Layer => Some(None),
-        IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts | IntrinsicId::AttnScore => None,
-    }
-}
-
-fn logits_width(lanes: &[Option<Readout>]) -> Option<u32> {
-    lanes
-        .iter()
-        .flatten()
-        .find(|readout| readout.kind == ReadoutKind::Logits)
-        .map(|readout| readout.width)
+    dtype == decl.dtype
+        && shape.rank() == 2
+        && rows_ok(shape.dims()[0])
+        && shape.dims()[1] == decl.width
 }
 
 fn check_second_party_names(
@@ -481,19 +454,10 @@ fn check_second_party_names(
                         "lora" => caps.lora,
                         _ => true,
                     };
-                    let scope = KNOWN_SINKS
-                        .iter()
-                        .find(|(k, _)| *k == n)
-                        .map(|(_, s)| *s)
-                        .filter(|_| served)
-                        .ok_or_else(|| unavailable(name))?;
-                    let ok = match scope {
-                        SinkScope::PassWide => sp.stage == Stage::Prologue,
-                        SinkScope::Attention => {
-                            matches!(sp.stage, Stage::Prologue | Stage::OnAttnProj)
-                        }
-                    };
-                    if !ok {
+                    if !served || !KNOWN_SINKS.contains(&n) {
+                        return Err(unavailable(name));
+                    }
+                    if sp.stage != Stage::Prologue {
                         return Err(ValidateError::SinkMisplaced {
                             name_index: *name,
                             name: n.into(),
@@ -581,31 +545,6 @@ fn resolve_name(c: &TraceContainer, idx: u16) -> &str {
     c.names.get(idx as usize).map(|s| s.as_str()).unwrap_or("")
 }
 
-fn intrinsic_type_ok(intr: IntrinsicId, shape: Shape, dtype: Dtype, width: Option<u32>) -> bool {
-    let rows_of = |width: Option<u32>| {
-        dtype == Dtype::F32
-            && shape.rank() == 2
-            && shape.dims()[0] >= 1
-            && width.is_none_or(|width| shape.dims()[1] == width)
-    };
-    match intr {
-        IntrinsicId::Logits
-        | IntrinsicId::MtpLogits
-        | IntrinsicId::Hidden
-        | IntrinsicId::Velocity
-        | IntrinsicId::Pixels => rows_of(width),
-        IntrinsicId::Query => dtype == Dtype::F32 && shape.rank() >= 1,
-        IntrinsicId::Layer => dtype == Dtype::U32 && shape.is_scalar(),
-        IntrinsicId::MtpDrafts => dtype == Dtype::I32 && shape.rank() == 1 && shape.dims()[0] >= 1,
-        IntrinsicId::AttnScore => {
-            dtype == Dtype::F32
-                && shape.rank() == 2
-                && shape.dims()[0] >= 1
-                && shape.dims()[1] == crate::registry::ATTN_SCORE_KV_MAX
-        }
-    }
-}
-
 pub(crate) fn readiness_table(c: &TraceContainer) -> Vec<ReadinessEntry> {
     let mut seen: Vec<bool> = alloc::vec![false; c.channels.len()];
     let mut out = Vec::new();
@@ -632,8 +571,6 @@ pub(crate) fn readiness_table(c: &TraceContainer) -> Vec<ReadinessEntry> {
             _ => {
                 let stage = match phase {
                     Phase::Prologue => Stage::Prologue,
-                    Phase::OnAttnProj => Stage::OnAttnProj,
-                    Phase::OnAttn => Stage::OnAttn,
                     Phase::Epilogue => Stage::Epilogue,
                     Phase::Descriptor => unreachable!(),
                 };
@@ -659,7 +596,7 @@ pub(crate) fn classify_channels(
     readiness: &[ReadinessEntry],
 ) -> Vec<ChannelClass> {
     let is_extern = |chan: u32| c.externs.iter().any(|e| e.chan == chan);
-    let mut fallible = [false; 5];
+    let mut fallible = [false; Phase::ORDER.len()];
     for e in readiness {
         if c.channels[e.chan as usize].host_role != HostRole::None || is_extern(e.chan) {
             let pi = Phase::ORDER.iter().position(|p| *p == e.phase).unwrap();

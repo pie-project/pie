@@ -9,16 +9,15 @@
 //!
 //! The function's parameters are one packed `u32 [B, in_words]` plane (every
 //! host-fed root, bit-exact: f32/i32/u32 one word per element, bools 32 per
-//! word; plus, per device-read intrinsic, the lane's first readout row), then
-//! the fire's logits readout `f32 [N, W]` and its draft readout when the
-//! stage reads them. The one result is `u32 [B, out_words]`: every value the
-//! stage puts, packed the same way.
+//! word; plus, per output read on the device, the lane's first row of it),
+//! then each plane of the fire's outputs the stage reads. The one result is
+//! `u32 [B, out_words]`: every value the stage puts, packed the same way.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 
 use eta_compiler::codegen::launch::{LaunchOp, LaunchPackage, ValueOrigin};
-use eta_ir::op::{IntrinsicId, tags};
+use eta_ir::op::tags;
 use eta_ir::{Dtype, RngKind, rng};
 use kernels_xla::hlo::{Cmp, Elem, Fold, Func, Malformed, ScatterDims, Ty, Val};
 
@@ -44,13 +43,24 @@ fn refuse<T>(why: impl Into<String>) -> Lowering<T> {
     Err(Refused(why.into()))
 }
 
-/// The shape of one lowering: how many lanes, and which readouts the
-/// device binds (`[rows, width]` of the fire's readout planes).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Output `name` of the pass's lane `lane`, read off a fire's plane of
+/// `rows` rows a layer, `layers` deep (0: one), `width` of `dtype` wide.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Read {
+    pub name: String,
+    pub lane: u32,
+    pub rows: u32,
+    pub layers: u32,
+    pub width: u32,
+    pub dtype: Dtype,
+}
+
+/// The shape of one lowering: how many lanes, and the outputs the device
+/// binds.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Batch {
     pub lanes: u32,
-    pub logits: Option<(u32, u32)>,
-    pub mtp: Option<(u32, u32)>,
+    pub reads: Vec<Read>,
 }
 
 /// What a packed slot carries.
@@ -58,9 +68,9 @@ pub struct Batch {
 pub enum Feed {
     /// The value itself: `dtype` over `numel` elements.
     Value(Dtype, usize),
-    /// The lane's first row in the readout `intrinsic` reads (one i32 word);
-    /// the stage reads `rows` rows from there.
-    Row { intrinsic: IntrinsicId, rows: u32 },
+    /// The lane's first row of `Layout::reads[read]` (one i32 word); the
+    /// stage reads `rows` rows of each layer from there.
+    Row { read: usize, rows: u32 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,8 +90,8 @@ pub struct Layout {
     pub in_words: usize,
     pub outputs: Vec<Slot>,
     pub out_words: usize,
-    pub logits: bool,
-    pub mtp: bool,
+    /// The planes the stage reads, a parameter each after the pack.
+    pub reads: Vec<Read>,
     /// Carried cells: channels whose cell stays on the device between
     /// passes. Each is its own `u32 [B, words]` parameter (after the pack
     /// and the readouts) and its own result (after the pack), per channel.
@@ -132,7 +142,7 @@ fn op_name(tag: u8) -> &'static str {
 }
 
 /// The values stage `at` reads without computing them, in order of first
-/// use (channel cells, constants, intrinsics).
+/// use (channel cells, constants, outputs).
 #[must_use]
 pub fn roots(package: &LaunchPackage, at: usize) -> Vec<u32> {
     let Some(stage) = package.stages.get(at) else {
@@ -166,19 +176,16 @@ pub fn roots(package: &LaunchPackage, at: usize) -> Vec<u32> {
     roots
 }
 
-/// Which readouts stage `at` reads: the logits, the draft head's.
+/// The outputs stage `at` reads, by name and the pass's lane.
 #[must_use]
-pub fn reads(package: &LaunchPackage, at: usize) -> (bool, bool) {
-    let mut logits = false;
-    let mut mtp = false;
-    for id in roots(package, at) {
-        match package.values.get(id as usize).and_then(|v| v.intrinsic) {
-            Some(IntrinsicId::Logits) => logits = true,
-            Some(IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts) => mtp = true,
-            _ => {}
-        }
-    }
-    (logits, mtp)
+pub fn outputs(package: &LaunchPackage, at: usize) -> Vec<(String, u32)> {
+    roots(package, at)
+        .iter()
+        .filter_map(|&id| {
+            let value = package.values.get(id as usize)?;
+            Some((value.output.clone()?, value.lane))
+        })
+        .collect()
 }
 
 /// Lowers stage `at` of `package` for `batch`, with the cells of the
@@ -220,35 +227,39 @@ pub fn lower(
                 continue;
             }
             ValueOrigin::ChannelTake | ValueOrigin::ChannelRead => Feed::Value(value.dtype, n),
-            ValueOrigin::Intrinsic => {
-                let intrinsic = value
-                    .intrinsic
-                    .ok_or_else(|| Refused(format!("intrinsic root {id} names no intrinsic")))?;
-                let read = match intrinsic {
-                    IntrinsicId::Logits => batch.logits,
-                    IntrinsicId::MtpLogits | IntrinsicId::MtpDrafts => batch.mtp,
-                    _ => None,
-                };
-                match read {
+            ValueOrigin::Output => {
+                let name = value.output.as_deref().unwrap_or("");
+                let found =
+                    (batch.reads.iter()).find(|read| read.name == name && read.lane == value.lane);
+                match found {
                     None => Feed::Value(value.dtype, n),
-                    Some((_, width)) => {
-                        let rows = if intrinsic == IntrinsicId::MtpDrafts {
-                            n as u32
-                        } else {
-                            if width == 0 || !n.is_multiple_of(width as usize) {
-                                return refuse(format!(
-                                    "the `{}` root holds {n} values, not whole {width}-wide rows",
-                                    intrinsic.name()
-                                ));
-                            }
-                            (n / width as usize) as u32
-                        };
-                        if intrinsic == IntrinsicId::Logits {
-                            layout.logits = true;
-                        } else {
-                            layout.mtp = true;
+                    Some(read) => {
+                        if read.dtype != value.dtype {
+                            return refuse(format!(
+                                "output `{name}` is read as {:?} and lands as {:?}",
+                                value.dtype, read.dtype
+                            ));
                         }
-                        Feed::Row { intrinsic, rows }
+                        let per = read.width as usize * read.layers.max(1) as usize;
+                        if per == 0 || !n.is_multiple_of(per) {
+                            return refuse(format!(
+                                "output `{name}` holds {n} values, not whole {}-wide rows of \
+                                 {} layer(s)",
+                                read.width,
+                                read.layers.max(1)
+                            ));
+                        }
+                        let at = match layout.reads.iter().position(|seen| seen == read) {
+                            Some(at) => at,
+                            None => {
+                                layout.reads.push(read.clone());
+                                layout.reads.len() - 1
+                            }
+                        };
+                        Feed::Row {
+                            read: at,
+                            rows: (n / per) as u32,
+                        }
                     }
                 }
             }
@@ -308,24 +319,15 @@ pub fn lower(
     let pack = (layout.in_words > 0).then(|| {
         l.f.param(Ty::new(Elem::U32, &[l.b, layout.in_words as i64]), None)
     });
-    let logits = if layout.logits {
-        let (rows, width) = batch.logits.unwrap_or((1, 1));
-        Some(l.f.param(
-            Ty::new(Elem::F32, &[i64::from(rows), i64::from(width)]),
-            None,
-        ))
-    } else {
-        None
-    };
-    let mtp = if layout.mtp {
-        let (rows, width) = batch.mtp.unwrap_or((1, 1));
-        Some(l.f.param(
-            Ty::new(Elem::F32, &[i64::from(rows), i64::from(width)]),
-            None,
-        ))
-    } else {
-        None
-    };
+    let planes: Vec<Val> = (layout.reads.iter())
+        .map(|read| {
+            let rows = i64::from(read.rows) * i64::from(read.layers.max(1));
+            Ok(l.f.param(
+                Ty::new(elem(read.dtype)?, &[rows, i64::from(read.width)]),
+                None,
+            ))
+        })
+        .collect::<Lowering<_>>()?;
     let carried_params: Vec<Val> = layout
         .carried_in
         .iter()
@@ -362,14 +364,10 @@ pub fn lower(
                     let v = l.unpack(pack, slot.at, dtype, n)?;
                     l.reshaped(v, &value.shape)?
                 }
-                Feed::Row { intrinsic, rows } => {
-                    let plane = if intrinsic == IntrinsicId::Logits {
-                        logits
-                    } else {
-                        mtp
-                    }
-                    .expect("a row feed implies its readout parameter");
-                    l.read_rows(pack, slot.at, plane, intrinsic, rows, &value.shape)?
+                Feed::Row { read, rows } => {
+                    let plane = planes[read];
+                    let r = &layout.reads[read];
+                    l.read_rows(pack, slot.at, plane, rows, r, &value.shape)?
                 }
             }
         };
@@ -583,31 +581,33 @@ impl Lower<'_> {
         })
     }
 
-    /// The lane's `rows` readout rows starting at the row its slot names, as
-    /// the intrinsic's value.
+    /// The lane's `rows` rows of each layer of `read`'s plane, starting at
+    /// the row its slot names, as the output's value.
     fn read_rows(
         &mut self,
         pack: Val,
         at: usize,
         plane: Val,
-        intrinsic: IntrinsicId,
         rows: u32,
+        read: &Read,
         shape: &[u32],
     ) -> Lowering<Val> {
         let b = self.b;
-        let width = self.f.dims(plane)[1];
         let first = self.unpack(pack, at, Dtype::I32, 1)?; // [B, 1]
-        let r = i64::from(rows);
+        let r = i64::from(rows) * i64::from(read.layers.max(1));
         let first = self.f.broadcast(first, &[b, r], &[0, 1])?;
-        let step = self.f.iota(Elem::I32, &[b, r], 1);
+        let step = if read.layers <= 1 {
+            self.f.iota(Elem::I32, &[b, r], 1)
+        } else {
+            let offsets: Vec<i64> = (0..r)
+                .map(|i| i % i64::from(rows) + i / i64::from(rows) * i64::from(read.rows))
+                .collect();
+            let offsets = self.f.const_ints(Elem::I32, &offsets, &[r])?;
+            self.f.broadcast(offsets, &[b, r], &[1])?
+        };
         let ids = self.f.add(first, step)?;
         let ids = self.f.reshape(ids, &[b * r])?;
         let picked = self.f.take_rows(plane, ids)?; // [B*r, width]
-        if intrinsic == IntrinsicId::MtpDrafts {
-            let grid = self.f.reshape(picked, &[b, r, width])?;
-            let tokens = self.argmax_f32(grid)?;
-            return self.reshaped(tokens, shape);
-        }
         self.reshaped(picked, shape)
     }
 

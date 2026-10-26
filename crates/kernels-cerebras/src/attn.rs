@@ -9,7 +9,7 @@ use crate::tensor::Tensor;
 
 pub use paged::{
     decode, decode_lse, decode_selected, kv_append, kv_append_shared, masked, masked_lse,
-    plan_decode, plan_prefill, prefill, prefill_lse, prefill_selected,
+    plan_decode, plan_prefill, prefill, prefill_lse, prefill_selected, score_capture,
 };
 
 /// What a paged decode reads besides q and the pool: the fire's per-token

@@ -63,9 +63,12 @@ pub(crate) fn canonical_op(bytes: &mut Vec<u8>, op: &Op, result_type: Option<&Sy
             canonical_symbolic_shape(bytes, result_type());
             bytes.push(*kind as u8);
         }
-        Op::IntrinsicVal { intr, dtype, .. } => {
+        Op::Output {
+            index, lane, dtype, ..
+        } => {
             bytes.push(op.tag());
-            put_u16(bytes, *intr as u16);
+            put_u16(bytes, *index);
+            put_u32(bytes, *lane);
             bytes.push(wire_dtype(*dtype));
             canonical_symbolic_shape(bytes, result_type());
         }

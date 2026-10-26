@@ -117,7 +117,6 @@ impl Replay {
             && lane.positions.is_empty()
             && lane.mask.is_none()
             && lane.adapter.is_none()
-            && !lane.captures_scores
             && matches!(lane.rs, RsVerb::Fold)
             && lane.inputs.is_empty()
             && !lane.kv_less

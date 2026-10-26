@@ -182,7 +182,7 @@ fn a_fitted_pool_is_pledged_what_it_declared() {
         "the verify reads out more rows than there are lanes"
     );
     shell
-        .fire_media(&[verify], &[], &[], &mut Vec::new())
+        .fire_media(&[verify], &[], &[])
         .unwrap_or_else(|refusal| panic!("the verify grew past the fit: {refusal}"));
     drop(taken);
 }

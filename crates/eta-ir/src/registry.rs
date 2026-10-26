@@ -1,18 +1,12 @@
-use super::op::IntrinsicId;
+use alloc::string::String;
+
+use crate::types::Dtype;
 
 crate::declare_tagged_enum! {
     #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     pub enum Stage {
         Prologue = 0, "prologue";
-        OnAttnProj = 1, "on_attn_proj";
-        OnAttn = 2, "on_attn";
         Epilogue = 3, "epilogue";
-    }
-}
-
-impl Stage {
-    pub fn per_layer(self) -> bool {
-        matches!(self, Stage::OnAttnProj | Stage::OnAttn)
     }
 }
 
@@ -20,8 +14,6 @@ impl Stage {
 pub enum Phase {
     Prologue,
     Descriptor,
-    OnAttnProj,
-    OnAttn,
     Epilogue,
 }
 
@@ -32,26 +24,16 @@ impl Phase {
         match self {
             Phase::Prologue => Stage::Prologue as u8,
             Phase::Descriptor => PHASE_DESCRIPTOR_TAG,
-            Phase::OnAttnProj => Stage::OnAttnProj as u8,
-            Phase::OnAttn => Stage::OnAttn as u8,
             Phase::Epilogue => Stage::Epilogue as u8,
         }
     }
     pub fn of_stage(s: Stage) -> Phase {
         match s {
             Stage::Prologue => Phase::Prologue,
-            Stage::OnAttnProj => Phase::OnAttnProj,
-            Stage::OnAttn => Phase::OnAttn,
             Stage::Epilogue => Phase::Epilogue,
         }
     }
-    pub const ORDER: [Phase; 5] = [
-        Phase::Prologue,
-        Phase::Descriptor,
-        Phase::OnAttnProj,
-        Phase::OnAttn,
-        Phase::Epilogue,
-    ];
+    pub const ORDER: [Phase; 3] = [Phase::Prologue, Phase::Descriptor, Phase::Epilogue];
 }
 
 crate::declare_tagged_enum! {
@@ -156,61 +138,30 @@ impl GeometryClass {
     }
 }
 
+/// The sinks a prologue may call.
+pub const KNOWN_SINKS: &[&str] = &["attn_page_mask", "lora", "minference_sparse"];
+
+/// Whether an output is one row per lane, per row or per voxel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum SinkScope {
-    PassWide,
-    Attention,
+pub enum Axis {
+    Lane,
+    Row,
+    Voxel,
 }
 
-pub const KNOWN_SINKS: &[(&str, SinkScope)] = &[
-    ("attn_page_mask", SinkScope::Attention),
-    ("lora", SinkScope::PassWide),
-    ("minference_sparse", SinkScope::PassWide),
-];
-
-pub const ATTN_SCORE_KV_MAX: u32 = 2048;
-
-/// The last this many query rows of a fire's lane.
-pub const ATTN_SCORE_OBSERVE: u32 = 32;
-
-pub fn intrinsic_stages(intr: IntrinsicId) -> &'static [Stage] {
-    match intr {
-        IntrinsicId::Logits
-        | IntrinsicId::MtpLogits
-        | IntrinsicId::Hidden
-        | IntrinsicId::Velocity
-        | IntrinsicId::Pixels => &[Stage::Epilogue],
-        IntrinsicId::MtpDrafts => &[Stage::Epilogue],
-        IntrinsicId::AttnScore => &[Stage::Epilogue],
-        IntrinsicId::Query | IntrinsicId::Layer => &[Stage::OnAttnProj, Stage::OnAttn],
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// An output of the model as a lane reads it: `width` values of `dtype` an
+/// `axis` entry, stacked `layers` deep when written per layer (0 when not).
+/// `readout`: its rows are the lane's readout rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Readout {
-    pub kind: ReadoutKind,
+pub struct OutputDecl {
+    pub name: String,
+    pub axis: Axis,
     pub width: u32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum ReadoutKind {
-    Logits,
-    Velocity,
-    Hidden,
-    Pixels,
-}
-
-/// The model's graph facts a program may read.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct Graph {
-    pub num_layers: u32,
-    pub mtp_logits: bool,
-    pub mtp_depth: u32,
-    pub attn_score: bool,
+    pub dtype: Dtype,
+    pub layers: u32,
+    pub readout: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

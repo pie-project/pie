@@ -28,7 +28,6 @@ from .ir import (
     PRED_RANK_LE,
     SCALAR,
     Dtype,
-    Intrinsic,
     Op,
     RngKind,
     Shape,
@@ -1025,9 +1024,9 @@ def nucleus_sample(logits, top_p, state) -> Tensor:
 # -- intrinsic leaf / internal helpers -------------------------------------------
 
 
-def intrinsic_val(intr: Intrinsic, shape: Shape, dt: Dtype, lane: int = 0) -> Tensor:
+def output_val(index: int, lane: int, shape: Shape, dt: Dtype) -> Tensor:
     ty = ValueType(shape, dt)
-    return Tensor.node(emit(Op.intrinsic_val(intr, shape, dt, lane), (ty,)), ty)
+    return Tensor.node(emit(Op.output(index, lane, shape, dt), (ty,)), ty)
 
 
 def reshape_id_to(vid: int, frm: ValueType, target: Shape) -> int:

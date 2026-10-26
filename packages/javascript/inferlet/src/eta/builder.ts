@@ -6,8 +6,8 @@ import {
   Dtype,
   HostRole,
   Port,
+  OutputDecl,
   PortBinding,
-  SinkScope,
   Stage,
   STAGE_NAMES,
   StageProgram,
@@ -148,6 +148,7 @@ export class Builder {
   private ports: [Port, DslChannel][] = [];
   private inputs: DslChannel[] = [];
   private stages: [Stage, () => void][] = [];
+  private outputs: OutputDecl[][] = [];
 
   constructor(
     readonly vocab: number,
@@ -163,6 +164,11 @@ export class Builder {
   bindInput(source: DslChannel): void {
     source.noteDescClaim(false);
     this.inputs.push(source);
+  }
+
+  /** The outputs each lane of the pass reads out, in lane order. */
+  setOutputs(lanes: OutputDecl[][]): void {
+    this.outputs = lanes;
   }
 
   stage(stage: Stage, body: () => void): void {
@@ -187,7 +193,7 @@ export class Builder {
     const ports: [Port, number][] = this.ports.map(([port, source]) => [port, internChannel(source.state)]);
     const inputs = this.inputs.map((source) => internChannel(source.state));
     const results: StageResult[] = [];
-    for (const stage of [Stage.PROLOGUE, Stage.ON_ATTN_PROJ, Stage.ON_ATTN, Stage.EPILOGUE]) {
+    for (const stage of [Stage.PROLOGUE, Stage.EPILOGUE]) {
       let body: (() => void) | undefined;
       for (const [s, b] of this.stages) if (s === stage) body = b;
       if (!body) continue;
@@ -202,7 +208,7 @@ export class Builder {
       result: { results: stageResults, ports: rawPorts, inputs: rawInputs },
       channels: rawChannels,
       names: rawNames,
-    } = withConstants(this.vocab, this.pageSize, () => withSession(() => this.record(rows)));
+    } = withConstants(this.vocab, this.pageSize, this.outputs, () => withSession(() => this.record(rows)));
 
     // Re-key the container to gid (declaration) order.
     const order = rawChannels.map((_, i) => i).sort((a, b) => rawChannels[a].gid - rawChannels[b].gid);
@@ -218,7 +224,7 @@ export class Builder {
     const nameRemap = new Array<number>(rawNames.length);
     nameOrder.forEach((oldIdx, newIdx) => (nameRemap[oldIdx] = newIdx));
     const names = nameOrder.map((i) => rawNames[i]);
-    for (const r of stageResults) for (const op of r.ops) if (op.tag === tags.KERNEL_CALL || op.tag === tags.SINK_CALL) op.nameIdx = nameRemap[op.nameIdx];
+    for (const r of stageResults) for (const op of r.ops) if (op.tag === tags.KERNEL_CALL || op.tag === tags.SINK_CALL || op.tag === tags.OUTPUT) op.nameIdx = nameRemap[op.nameIdx];
 
     const sinks: [Stage, SinkCall][] = [];
     for (const r of stageResults) for (const s of r.sinks) sinks.push([r.stage, s]);
@@ -266,8 +272,7 @@ function lint(channels: ChannelState[], sinks: [Stage, SinkCall][]): void {
     if (consumed && !produced) errs.push(`channel \`${st.name}\` is consumed but never produced or seeded`);
   }
   for (const [stage, s] of sinks) {
-    const ok = s.scope === SinkScope.PASS_WIDE ? stage === Stage.PROLOGUE : stage === Stage.PROLOGUE || stage === Stage.ON_ATTN_PROJ;
-    if (!ok) errs.push(`sink \`${s.name}\` is misplaced in stage \`${STAGE_NAMES[stage]}\``);
+    if (stage !== Stage.PROLOGUE) errs.push(`sink \`${s.name}\` is misplaced in stage \`${STAGE_NAMES[stage]}\``);
   }
   if (errs.length) throw new TraceError(errs.join('; '));
 }

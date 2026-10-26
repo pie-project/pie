@@ -36,7 +36,7 @@ async fn main(input: String) -> std::result::Result<String, String> {
         .map_err(|e| e.to_string())?;
     // The run's end is awaited through one token: nothing is sampled.
     fwd.epilogue(move || {
-        done.put(reshape(reduce_argmax(intrinsics::logits()), [1]));
+        done.put(reshape(reduce_argmax(intrinsics::output(0, "logits")), [1]));
     });
     fwd.submit(&pipe).map_err(|e| e.to_string())?;
     landed.take_host::<i32>().await?;

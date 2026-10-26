@@ -310,12 +310,12 @@ fn velocity_width(reading: &str) -> Result<u32> {
         }
     }
     let image = model::lane_of(&[("reading", reading), ("stream", "image")])?;
-    match &image.readout {
-        Some(readout) if readout.kind == model::ReadoutKind::Velocity => Ok(readout.width),
-        other => Err(format!(
-            "reading `{reading}`'s image lane reads out {other:?}, not a velocity"
-        )),
-    }
+    image
+        .outputs
+        .iter()
+        .find(|output| output.name == "velocity")
+        .map(|velocity| velocity.width)
+        .ok_or_else(|| format!("reading `{reading}`'s image lane reads out no velocity"))
 }
 
 /// Binds attention group `group`'s three lanes; answers the image lane.
@@ -375,7 +375,7 @@ async fn sweep_fire(
     let readbacks = outs.clone();
     pass.epilogue(move || {
         for (image, out) in &readbacks {
-            out.put(intrinsics::velocity(*image, rows, width));
+            out.put(intrinsics::output_rows(*image, "velocity", rows));
         }
     });
     let pipe = Pipeline::new();
@@ -409,9 +409,9 @@ async fn guided_step(
     let guided = Channel::new([rows, width], dtype::f32).named("cfg_guided");
     let unguided = Channel::new([rows, width], dtype::f32).named("cfg_uncond");
     pass.epilogue(move || {
-        let v_u = intrinsics::velocity(uncond, rows, width);
+        let v_u = intrinsics::output_rows(uncond, "velocity", rows);
         guided.put(cfg_combine(
-            &intrinsics::velocity(cond, rows, width),
+            &intrinsics::output_rows(cond, "velocity", rows),
             &v_u,
             &Tensor::constant([scale]),
         ));
@@ -440,7 +440,6 @@ fn schedule(case: &Case, steps: u32) -> Result<FlowMatchEuler> {
 async fn dpm2m_loop(
     case: &Case,
     shared: &Shared,
-    width: u32,
     reading: &str,
     steps: u32,
 ) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>, Vec<f32>)> {
@@ -470,7 +469,7 @@ async fn dpm2m_loop(
         .capacity(channel_capacity() as u32)
         .named("dpm_out_v");
     loops.drive(&pass, move |k| {
-        let v = intrinsics::velocity(image, n, width);
+        let v = intrinsics::output_rows(image, "velocity", n);
         // `dpm2m_step`'s arithmetic over the flattened latent.
         let scalar = |table: &Channel| broadcast(reshape(at(&table.read(), k), [1, 1]), flat);
         let current = reshape(x.take(), flat);
@@ -538,7 +537,6 @@ fn seed_or_euler(
 async fn cached_loop(
     case: &Case,
     shared: &Shared,
-    width: u32,
     reading: &str,
     steps: u32,
     seed: u32,
@@ -579,7 +577,7 @@ async fn cached_loop(
             let skip = Channel::from([0f32]).named("cache_skip");
             let count = Channel::from([0f32]).named("cache_count");
             loops.drive(&pass, move |k| {
-                let v_now = intrinsics::velocity(image, n, width);
+                let v_now = intrinsics::output_rows(image, "velocity", n);
                 let v_prev = cache.take();
                 // The flag THIS fire acts on was written by the last one.
                 let skipping = gt(skip.take(), 0.5f32);
@@ -611,7 +609,7 @@ async fn cached_loop(
                 seed_or_euler(
                     k,
                     &x,
-                    &intrinsics::velocity(image, n, width),
+                    &intrinsics::output_rows(image, "velocity", n),
                     &dts,
                     &rng,
                     flat,
@@ -696,9 +694,9 @@ async fn step(
         .map(|_| Channel::new([text_rows, width], dtype::f32).named(&format!("{tag}text_tap")));
     let tapped = text_out;
     pass.epilogue(move || {
-        out.put(intrinsics::velocity(image, rows, width));
+        out.put(intrinsics::output_rows(image, "velocity", rows));
         if let Some(tapped) = &tapped {
-            tapped.put(intrinsics::velocity(0, text_rows, width));
+            tapped.put(intrinsics::output_rows(0, "velocity", text_rows));
         }
     });
     pass.submit(pipe).context("the denoise step")?;
@@ -807,8 +805,7 @@ async fn main(input: Input) -> Result<Output> {
                 "unknown solver `{solver}`; this guest runs `dpm2m`"
             ));
         }
-        let (vs, xs, sigmas) =
-            dpm2m_loop(&case, &shared, width, reading, case.steps.max(1)).await?;
+        let (vs, xs, sigmas) = dpm2m_loop(&case, &shared, reading, case.steps.max(1)).await?;
         out.velocity = vs.last().cloned().unwrap_or_default();
         out.sigmas = sigmas;
         out.euler_v = vs;
@@ -820,16 +817,8 @@ async fn main(input: Input) -> Result<Output> {
     if input.cache {
         let steps = input.cache_steps.or(Some(case.steps)).unwrap_or(0).max(1);
         let seed = input.cache_seed.unwrap_or(7);
-        let (trace, rel, did, count, dts) = cached_loop(
-            &case,
-            &shared,
-            width,
-            reading,
-            steps,
-            seed,
-            input.cache_threshold,
-        )
-        .await?;
+        let (trace, rel, did, count, dts) =
+            cached_loop(&case, &shared, reading, steps, seed, input.cache_threshold).await?;
         let mut fire_dts = vec![0.0f32];
         fire_dts.extend(dts);
         out.velocity = trace.last().cloned().unwrap_or_default();

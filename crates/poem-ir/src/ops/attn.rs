@@ -146,6 +146,23 @@ pub enum Attn {
         #[output]
         o: ValueId,
     },
+    /// Each lane's attention mass over its first `kv_max` keys, averaged
+    /// over its last `observe` query rows: a `kv_max` run per query head.
+    ScoreCapture {
+        #[input]
+        q: ValueId,
+        #[input(PREFILL_PLAN)]
+        plan: ValueId,
+        #[input(CACHE)]
+        cache: ValueId,
+        head_dim: u32,
+        kv_heads: u32,
+        sm_scale: f32,
+        observe: u32,
+        kv_max: u32,
+        #[output(F32)]
+        scores: ValueId,
+    },
     Sink {
         #[input]
         o: ValueId,

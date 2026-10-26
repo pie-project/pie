@@ -34,7 +34,7 @@ export function main(input) {
   prefill.embed(toks, embedIndptr);
   prefill.state([ws], { fold: 'all' });
   prefill.epilogue(() => {
-    tokOut.put(greedy(intrinsics.logits()));
+    tokOut.put(greedy(intrinsics.output(0, 'logits')));
   });
   pipe.submit(prefill);
   const first = tokOut.takeScalar();
@@ -50,7 +50,7 @@ export function main(input) {
     fwd.embed(tokIn, embedIndptr);
     fwd.state([ws], { fold: 'all' });
     fwd.epilogue(() => {
-      const token = greedy(intrinsics.logits());
+      const token = greedy(intrinsics.output(0, 'logits'));
       tokIn.put(token);
       tokOut.put(token);
     });

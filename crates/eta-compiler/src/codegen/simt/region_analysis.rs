@@ -1,8 +1,6 @@
 use alloc::vec::Vec;
 use serde::{Deserialize, Serialize};
 
-use eta_ir::op::IntrinsicId;
-
 use crate::plan::CompiledStage;
 
 use super::fused::analyze_direct_argmax;
@@ -13,7 +11,8 @@ use crate::codegen::op_view::{OpView, result_bases};
 pub struct DirectArgmax {
     pub node: u32,
     pub source_value: u32,
-    pub intrinsic: IntrinsicId,
+    /// The slot of the output it scans in its lane's table.
+    pub output: u16,
     pub requires_single_row: bool,
 }
 
@@ -36,11 +35,12 @@ pub fn analyze_program(stages: &[CompiledStage]) -> Vec<RegionAnalysis> {
             let direct = analyze_direct_argmax(stage, region, &bases);
             let mut records = Vec::new();
             for node in 0..direct.intrinsic.len() {
-                if let Some(intrinsic) = IntrinsicId::from_u16(direct.intrinsic[node]) {
+                let output = direct.intrinsic[node];
+                if output != u16::MAX {
                     records.push(DirectArgmax {
                         node: node as u32,
                         source_value: direct.source_value[node],
-                        intrinsic,
+                        output,
                         requires_single_row: direct.requires_single_row[node] != 0,
                     });
                 }

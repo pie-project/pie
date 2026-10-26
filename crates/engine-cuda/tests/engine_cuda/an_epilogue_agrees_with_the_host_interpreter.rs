@@ -9,7 +9,7 @@ use eta_compiler::eval::interp::{Instance, NoKernels, PassInputs, Value};
 use eta_compiler::plan::compile_bound;
 use eta_exec::Extents;
 use eta_ir::container::{ChanDType, ChannelDecl, HostRole, StageProgram, TraceContainer};
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::Op;
 use eta_ir::registry::{GeometryClass, Stage};
 use eta_ir::types::{Dtype, Shape};
 
@@ -54,8 +54,8 @@ fn epilogue() -> TraceContainer {
             shape: Shape::new(&[]).unwrap(),
         },
         Op::ChanTake(INDEX),
-        Op::IntrinsicVal {
-            intr: IntrinsicId::Logits,
+        Op::Output {
+            index: 0,
             lane: 0,
             shape: Shape::matrix(ROWS, VOCAB),
             dtype: Dtype::F32,
@@ -117,7 +117,7 @@ fn epilogue() -> TraceContainer {
         },
     ];
     TraceContainer {
-        names: Vec::new(),
+        names: vec!["logits".to_string()],
         channels: vec![
             seeded(Shape::vector(1), Dtype::F32),
             seeded(Shape::vector(ROWS), Dtype::I32),
@@ -222,9 +222,9 @@ fn device_outputs(
         buffer.write(0, &bytes).expect("the plane uploads");
         let width = plane_values.len() as u32 / rows;
         plane
-            .bind_intrinsic(
+            .bind_output(
                 instance,
-                IntrinsicId::Logits,
+                "logits",
                 0,
                 buffer.ptr(),
                 INTRINSIC_STORAGE_F32,
@@ -260,8 +260,10 @@ fn host_outputs(
 ) -> Vec<Value> {
     let mut reference = Instance::new(bound, seeds).expect("the interpreter instantiates");
     let inputs = PassInputs {
-        logits: logits.map(|l| Value::F32(l.to_vec())),
-        ..Default::default()
+        outputs: logits
+            .map(|l| ("logits".to_string(), 0, Value::F32(l.to_vec())))
+            .into_iter()
+            .collect(),
     };
     let stepped = reference
         .step(bound, &inputs, &mut NoKernels)
@@ -366,8 +368,8 @@ const POOL: u32 = 16;
 fn shared_row() -> TraceContainer {
     use eta_ir::types::Literal;
     let ops = vec![
-        Op::IntrinsicVal {
-            intr: IntrinsicId::Logits,
+        Op::Output {
+            index: 0,
             lane: 0,
             shape: Shape::matrix(ROWS, VOCAB),
             dtype: Dtype::F32,
@@ -411,7 +413,7 @@ fn shared_row() -> TraceContainer {
         },
     ];
     TraceContainer {
-        names: Vec::new(),
+        names: vec!["logits".to_string()],
         channels: vec![
             reader(Shape::matrix(ROWS, POOL), Dtype::U32),
             reader(Shape::matrix(ROWS, POOL), Dtype::Bool),
@@ -534,7 +536,7 @@ fn acceptance() -> TraceContainer {
         },
     ];
     TraceContainer {
-        names: Vec::new(),
+        names: vec!["logits".to_string()],
         channels: vec![
             seeded(Shape::vector(ROWS), Dtype::F32),
             seeded(Shape::vector(ROWS), Dtype::I32),
@@ -660,7 +662,7 @@ fn sampler_arithmetic() -> TraceContainer {
         },
     ];
     TraceContainer {
-        names: Vec::new(),
+        names: vec!["logits".to_string()],
         channels: vec![
             seeded(plane, Dtype::F32),
             seeded(Shape::vector(2), Dtype::U32),

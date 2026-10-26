@@ -1,7 +1,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use eta_ir::op::{IntrinsicId, Op};
+use eta_ir::op::Op;
 use eta_ir::registry::Port;
 use eta_ir::types::{Dtype, Shape, ValueType};
 use eta_ir::validate::BoundTrace;
@@ -68,7 +68,7 @@ pub(crate) fn symbolic_result_type(
         Op::ChanTake(channel) | Op::ChanRead(channel) => {
             symbolic_channel_type(bound, *channel, value_type)
         }
-        Op::IntrinsicVal { intr, .. } => symbolic_intrinsic_type(bound, *intr, value_type),
+        Op::Output { index, lane, .. } => symbolic_output_type(bound, *index, *lane, value_type),
         Op::ReduceSum(value)
         | Op::ReduceMax(value)
         | Op::ReduceMin(value)
@@ -302,28 +302,27 @@ pub(crate) fn set_first_symbolic(ty: &mut SymbolicType, extent: SymbolicExtent) 
     }
 }
 
-pub(crate) fn symbolic_intrinsic_type(
+/// A float output whose rows are the readout rows reads as many rows as the
+/// pass samples.
+pub(crate) fn symbolic_output_type(
     bound: &BoundTrace,
-    intrinsic: IntrinsicId,
+    index: u16,
+    lane: u32,
     value_type: ValueType,
 ) -> SymbolicType {
     let mut ty = SymbolicType::static_type(value_type);
-    match intrinsic {
-        IntrinsicId::Logits => {
-            if ty.rank() >= 2 && value_type.shape.last_len() == Some(bound.vocab()) {
-                ty.dims[0] = Dimension::Symbolic(SymbolicExtent::SampledRows);
-            }
-        }
-        IntrinsicId::MtpLogits
-        | IntrinsicId::MtpDrafts
-        | IntrinsicId::Hidden
-        | IntrinsicId::Velocity
-        | IntrinsicId::Pixels
-        | IntrinsicId::Query
-        | IntrinsicId::AttnScore
-        | IntrinsicId::Layer => {}
+    let readout = bound
+        .output(&bound.container.names, index, lane)
+        .is_some_and(|decl| decl.readout && decl.dtype == Dtype::F32);
+    if readout && ty.rank() >= 2 {
+        ty.dims[0] = Dimension::Symbolic(SymbolicExtent::SampledRows);
     }
     ty
+}
+
+/// Whether `ty` is a float output's plane of readout rows.
+pub(crate) fn readout_plane(ty: &SymbolicType) -> bool {
+    ty.dims.first() == Some(&Dimension::Symbolic(SymbolicExtent::SampledRows))
 }
 
 pub(crate) fn symbolic_shape_matches_static(value_type: &SymbolicType, shape: Shape) -> bool {

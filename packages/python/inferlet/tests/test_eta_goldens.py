@@ -19,7 +19,7 @@ import pytest
 
 from inferlet.eta import intrinsics
 from inferlet.eta.builder import Builder, DslChannel
-from inferlet.eta.ir import Dtype, Port, Stage, dtype, fnv1a64, shape_of
+from inferlet.eta.ir import Axis, Dtype, OutputDecl, Port, Stage, dtype, fnv1a64, shape_of
 from inferlet.eta.value import (
     ConstData,
     pack_elems,
@@ -99,6 +99,14 @@ for line in (Path(__file__).parent / "goldens" / "eta_containers.txt").read_text
     GOLDENS[name] = (int(h), bytes.fromhex(hexbytes))
 
 
+def decl(name: str, axis: Axis, width: int, readout: bool) -> OutputDecl:
+    return OutputDecl(name, axis, width, Dtype.F32, 0, readout)
+
+
+def logits_decl(vocab: int) -> list[list[OutputDecl]]:
+    return [[decl("logits", Axis.ROW, vocab, True)]]
+
+
 def ch_from(v, dt=None, name=None):
     c = DslChannel.from_const(const_data(v, dt))
     return c.named(name) if name else c
@@ -136,12 +144,14 @@ def test_s3_matches_lowering_rs_golden():
     host_put(tok, [1], dtype.i32)
 
     b = Builder(vocab, 16)
+
+    b.set_outputs(logits_decl(vocab))
     b.bind_port(Port.EMBED_TOKENS, tok)
     b.bind_port(Port.EMBED_INDPTR, indptr_ch)
     b.bind_port(Port.KV_LEN, length)
 
     def epilogue():
-        logits = intrinsics.logits()
+        logits = intrinsics.output(0, "logits")
         r = rng_ch.take()
         g = gumbel(r, [intrinsics.vocab()])
         t = reduce_argmax(mask_apply(logits, mask.take()) + g)
@@ -164,6 +174,8 @@ def test_text_completion_decode():
     tok_out = ch_new([1], dtype.i32, "tok_out")
 
     b = Builder(VOCAB, PAGE)
+
+    b.set_outputs(logits_decl(VOCAB))
     for port, c in [
         (Port.EMBED_TOKENS, tok_in),
         (Port.EMBED_INDPTR, embed_indptr),
@@ -172,7 +184,7 @@ def test_text_completion_decode():
         b.bind_port(port, c)
 
     def epilogue():
-        tok_out.put_tensor(reshape(reduce_argmax(intrinsics.logits()), [1]))
+        tok_out.put_tensor(reshape(reduce_argmax(intrinsics.output(0, "logits")), [1]))
 
     b.stage(Stage.EPILOGUE, epilogue)
     tok_out.note_host_take()
@@ -191,6 +203,8 @@ def test_naive_decode():
     fold = ch_from([0xFFFF_FFFF], dtype.u32, "fold")
 
     b = Builder(VOCAB, PAGE)
+
+    b.set_outputs(logits_decl(VOCAB))
     for port, c in [
         (Port.EMBED_TOKENS, tok_in),
         (Port.EMBED_INDPTR, lane1),
@@ -200,7 +214,7 @@ def test_naive_decode():
 
     def epilogue():
         r = rng_ch.take()
-        logits = intrinsics.logits()
+        logits = intrinsics.output(0, "logits")
         scaled = logits / temperature
         token = gumbel_max(scaled, r)
         r_next = r + iota(2)
@@ -231,11 +245,13 @@ def test_coverage():
     flag = ch_new([1], dtype.bool, "flag")
 
     b = Builder(VOCAB, PAGE)
+
+    b.set_outputs(logits_decl(VOCAB))
     b.bind_port(Port.EMBED_TOKENS, tok)
     b.bind_port(Port.EMBED_INDPTR, indptr_ch)
 
     def epilogue():
-        logits = intrinsics.logits()
+        logits = intrinsics.output(0, "logits")
         r = rng_ch.take()
         p = softmax(logits)
         lp = log_softmax(logits)
@@ -320,6 +336,8 @@ def test_sinks():
     host_put(bch, [0.0] * 64)
 
     b = Builder(VOCAB, PAGE)
+
+    b.set_outputs(logits_decl(VOCAB))
     b.bind_port(Port.EMBED_TOKENS, tok)
     b.bind_port(Port.EMBED_INDPTR, indptr_ch)
 
@@ -327,18 +345,10 @@ def test_sinks():
         intrinsics.kernel.lora(a.read(), bch.read(), Tensor.constant(1 | 4, Dtype.U32))
         intrinsics.kernel.attn_page_mask(iota(4))
 
-    def on_attn_proj():
-        intrinsics.query(16)
-        intrinsics.kernel.envelope_dot(4)
-        intrinsics.kernel.attn_page_mask(
-            cast(gt(intrinsics.kernel.envelope_dot(4), 0.0), dtype.u32) + intrinsics.layer()
-        )
-
     def epilogue():
-        out.put_tensor(reshape(reduce_argmax(intrinsics.logits()), [1]))
+        out.put_tensor(reshape(reduce_argmax(intrinsics.output(0, "logits")), [1]))
 
     b.stage(Stage.PROLOGUE, prologue)
-    b.stage(Stage.ON_ATTN_PROJ, on_attn_proj)
     b.stage(Stage.EPILOGUE, epilogue)
     out.note_host_take()
     check("sinks", b.build())
@@ -351,6 +361,7 @@ def test_bulk_constant_is_refused():
     indptr_ch = ch_from([0, 1], dtype.u32, "indptr")
     out = ch_new([4], dtype.f32, "out")
     b = Builder(VOCAB, PAGE)
+    b.set_outputs(logits_decl(VOCAB))
     b.bind_port(Port.EMBED_TOKENS, tok)
     b.bind_port(Port.EMBED_INDPTR, indptr_ch)
     b.stage(Stage.EPILOGUE, lambda: out.put_tensor(Tensor.constant([1.0, 2.0, 5.0, 7.0]) + 0.0))
@@ -367,6 +378,7 @@ def test_readiness_lint():
     never = ch_new([1], dtype.f32, "never")
     out = ch_new([1], dtype.f32, "out")
     b = Builder(VOCAB, PAGE)
+    b.set_outputs(logits_decl(VOCAB))
     b.bind_port(Port.EMBED_TOKENS, tok)
     b.bind_port(Port.EMBED_INDPTR, indptr_ch)
     b.stage(Stage.EPILOGUE, lambda: out.put_tensor(never.take() + 1.0))
@@ -382,9 +394,10 @@ def _epilogue_bytes(body) -> bytes:
     out = ch_new([vocab], dtype.bool, "out")
     host_put(tok, [1], dtype.i32)
     b = Builder(vocab, 16)
+    b.set_outputs(logits_decl(vocab))
     b.bind_port(Port.EMBED_TOKENS, tok)
     b.bind_port(Port.EMBED_INDPTR, indptr_ch)
-    b.stage(Stage.EPILOGUE, lambda: out.put_tensor(body(intrinsics.logits())))
+    b.stage(Stage.EPILOGUE, lambda: out.put_tensor(body(intrinsics.output(0, "logits"))))
     return b.build().encode()
 
 
@@ -424,6 +437,8 @@ def test_diffusion_step_matches_rust():
     tap_weights_out = ch_new([length, taps], dtype.f32, "tap_weights")
 
     b = Builder(VOCAB, PAGE)
+
+    b.set_outputs(logits_decl(VOCAB))
     for port, c in [
         (Port.EMBED_TOKENS, toks), (Port.EMBED_INDPTR, embed_indptr), (Port.KV_LEN, kv_len),
         (Port.POSITIONS, positions), (Port.READOUT, readout),
@@ -434,7 +449,7 @@ def test_diffusion_step_matches_rust():
         positions.put_tensor(positions.take())
         r = rng_state.take()
         t = reshape(temp.read(), [])
-        logits = intrinsics.logits()
+        logits = intrinsics.output(0, "logits")
         scaled = logits / t
         probs = softmax(scaled)
         h = entropy(probs)
@@ -483,6 +498,8 @@ def test_beam_step_matches_rust():
     out_greedy = ch_new([B], dtype.i32, "out_greedy").capacity(8)
 
     b = Builder(VOCAB, PAGE)
+
+    b.set_outputs(logits_decl(VOCAB))
     for port, c in [
         (Port.KV_LEN, klen), (Port.POSITIONS, pos), (Port.SLOTS, slots), (Port.ATTN_MASK, mask),
         (Port.EMBED_TOKENS, toks), (Port.EMBED_INDPTR, lanes_b),
@@ -490,7 +507,7 @@ def test_beam_step_matches_rust():
         b.bind_port(port, c)
 
     def epilogue():
-        logits = reshape(intrinsics.logits(), [B, v])
+        logits = reshape(intrinsics.output(0, "logits"), [B, v])
         cand = broadcast(reshape(scores.take(), [B, 1]), [B, v]) + log_softmax(logits)
         s, i = top_k(reshape(cand, [B * v]), B)
         parent = i // v
@@ -522,7 +539,7 @@ def test_beam_step_matches_rust():
 
 def test_latent_step_matches_rust():
     """`inferlet_goldens.rs::latent_step` — the image sampler's epilogue: the
-    `velocity()` seam, an `N(0, 1)` draw, and the `sin`/`cos`/`sqrt`/`rsqrt`
+    `velocity` output, an `N(0, 1)` draw, and the `sin`/`cos`/`sqrt`/`rsqrt`
     ops. The one golden that carries tags 0x08..0x0b, `RngKind.NORMAL` and
     `Intrinsic.VELOCITY`, so a port that drifts on any of them fails here."""
     rows, channels = 8, 16
@@ -539,6 +556,8 @@ def test_latent_step_matches_rust():
     host_put(latent, [0.0] * (rows * channels), dtype.f32)
 
     b = Builder(VOCAB, PAGE)
+
+    b.set_outputs([[decl("velocity", Axis.ROW, channels, False)]])
     for port, c in [
         (Port.EMBED_TOKENS, tok), (Port.EMBED_INDPTR, indptr_ch), (Port.KV_LEN, kv_len),
         (Port.POSITIONS, positions), (Port.READOUT, readout),
@@ -547,7 +566,7 @@ def test_latent_step_matches_rust():
 
     def epilogue():
         positions.put_tensor(positions.take())
-        v = intrinsics.velocity(0, rows, channels)
+        v = intrinsics.output_rows(0, "velocity", rows)
         x = latent.take()
         d = reshape(dsigma.read(), [])
 
@@ -588,14 +607,16 @@ def test_latent_step_matches_rust():
 
 
 def test_vae_readback_matches_rust():
-    """`inferlet_goldens.rs::vae_readback`: the one golden carrying `Intrinsic.PIXELS`."""
+    """`inferlet_goldens.rs::vae_readback`: the one golden reading a voxel output."""
     rows, rgb = 16, 3
     out = ch_new([rows, rgb], dtype.f32, "pixels_out")
 
     b = Builder(VOCAB, PAGE)
 
+    b.set_outputs([[decl("pixels", Axis.VOXEL, rgb, False)]])
+
     def epilogue():
-        px = intrinsics.pixels(0, rows, rgb)
+        px = intrinsics.output_rows(0, "pixels", rows)
         shifted = add(px, 1.0)
         unit = mul(shifted, 0.5)
         out.put_tensor(unit)
@@ -613,6 +634,8 @@ def test_noised_input_matches_rust():
     timestep = ch_from([0.5], dtype.f32, "timestep")
 
     b = Builder(VOCAB, PAGE)
+
+    b.set_outputs(logits_decl(VOCAB))
     b.bind_input(latent)
     b.bind_input(timestep)
 

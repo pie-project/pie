@@ -54,7 +54,7 @@ token, advance the matcher, publish the next mask, and only then submit the next
 fire. Running ahead would apply a stale grammar mask, and the schema would not
 be enforced on those steps.
 
-The device side is intentionally simple: `masked_argmax(intrinsics::logits(),
+The device side is intentionally simple: `masked_argmax(intrinsics::output(0, "logits"),
 allowed)` in the epilogue. All schema semantics live in the host `JsonSchema`
 constraint object.
 

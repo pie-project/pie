@@ -4,19 +4,17 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write as _;
-use eta_ir::op::{intrinsic_tags, tags};
+use eta_ir::op::tags;
 
 use crate::plan::{CompiledStage, Region};
 
 use super::METAL_M2_MAX_FUSED_CHANNELS;
 use super::intrinsics::{
     M2_INTRINSIC_TABLE_BUFFER, M2_LOGITS_BUFFER, M3_INTRINSIC_TABLE_BUFFER, addressed_slot,
-    fused_channel_ceiling, m2_intrinsic_buffer,
+    fused_channel_ceiling, m2_output_buffer,
 };
 use super::preamble::{RUNTIME_TEMPLATE, grouped_preamble};
-use super::validate::{
-    grouped_intrinsics_bindable, intrinsics_bindable, library_region_valid, used_channel_slots,
-};
+use super::validate::{library_region_valid, outputs_bindable, used_channel_slots};
 use crate::codegen::fault::{FUSED_GEOMETRY_MISMATCH, M3_THREADS_EXCEEDED};
 use crate::codegen::op_view::{OpView, result_bases};
 use crate::codegen::slots::Slots;
@@ -33,16 +31,22 @@ fn argument_name(at: usize) -> String {
     }
 }
 
-fn extra_intrinsics(ops: &[OpView], region: &Region) -> Vec<usize> {
+fn extra_intrinsics(
+    stage: &CompiledStage,
+    ops: &[OpView],
+    bases: &[u32],
+    region: &Region,
+) -> Vec<usize> {
     let mut used = BTreeSet::new();
     for &node in &region.nodes {
         let Some(op) = ops.get(node.index()) else {
             continue;
         };
-        if op.tag == tags::INTRINSIC_VAL
-            && let Some(at) = m2_intrinsic_buffer(op.intr).filter(|&at| at != M2_LOGITS_BUFFER)
-        {
-            used.insert(at);
+        if op.tag == tags::OUTPUT {
+            let at = m2_output_buffer(stage, op, bases[node.index()]);
+            if at != M2_LOGITS_BUFFER {
+                used.insert(at);
+            }
         }
     }
     used.into_iter().collect()
@@ -51,9 +55,9 @@ fn extra_intrinsics(ops: &[OpView], region: &Region) -> Vec<usize> {
 pub(super) fn emit_intrinsic_table(source: &mut String, stage: &CompiledStage) {
     let _ = writeln!(
         source,
-        "  const device ulong* intrinsic_at = all_intrinsic_at + \
+        "  const device M1OutputSeat* intrinsic_at = all_intrinsic_at + \
          dispatch_lane * {}u;",
-        eta_ir::op::intrinsic_pitch(&stage.normalized.ops)
+        eta_ir::op::output_pitch(&stage.normalized.ops)
     );
 }
 
@@ -78,10 +82,10 @@ pub fn emit_fused_region(
         });
     }
     let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
-    intrinsics_bindable(&ops, region)?;
+    outputs_bindable(&ops, region)?;
     let bases = result_bases(&ops);
 
-    let extra = extra_intrinsics(&ops, region);
+    let extra = extra_intrinsics(stage, &ops, &bases, region);
     let ceiling = fused_channel_ceiling(&extra);
     if channel_bindings.len() > ceiling {
         return Err(EmitError::ChannelLimitExceeded {
@@ -112,7 +116,7 @@ pub fn emit_fused_region(
     }
     for &at in &extra {
         let ty = if at == M2_INTRINSIC_TABLE_BUFFER {
-            "ulong"
+            "M1OutputSeat"
         } else {
             "uchar"
         };
@@ -146,17 +150,12 @@ pub fn emit_fused_region(
                 return Err(EmitError::ChannelSinkBindingOutOfRange);
             }
             slots.o0 = format!("pending_{}", op.chan);
-        } else if op.tag == tags::INTRINSIC_VAL {
-            if let Some(slot) = addressed_slot(op.intr, op.imm) {
-                let _ = writeln!(
-                    source,
-                    "  if (intrinsic_at[{slot}] == 0ul) {{ m1_fault(status, \
-                     {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
-                );
-                slots.a0 = format!("reinterpret_cast<const device uchar*>(intrinsic_at[{slot}])");
-            } else if let Some(at) = m2_intrinsic_buffer(op.intr) {
-                slots.a0 = argument_name(at);
+        } else if op.tag == tags::OUTPUT {
+            if let Some(slot) = addressed_slot(stage, op, bases[node]) {
+                emit_addressed_gather(&mut source, op, bases[node], slot, &slots.o0, "0u", "1u");
+                continue;
             }
+            slots.a0 = argument_name(M2_LOGITS_BUFFER);
         }
         let _ = writeln!(
             source,
@@ -181,7 +180,7 @@ pub fn emit_grouped_fused_region(
         return Err(EmitError::LibraryRegionAbiInvalid(RegionForm::GroupedFused));
     }
     let ops: Vec<OpView> = OpView::of_all(&stage.normalized.ops);
-    grouped_intrinsics_bindable(&ops, region)?;
+    outputs_bindable(&ops, region)?;
     let bases = result_bases(&ops);
     let channel_count = used_channel_slots(&ops);
 
@@ -203,7 +202,7 @@ pub fn emit_grouped_fused_region(
     source.push_str("    const device uint* row_indices [[buffer(10)]],\n");
     let _ = writeln!(
         source,
-        "    const device ulong* all_intrinsic_at [[buffer({M3_INTRINSIC_TABLE_BUFFER})]],"
+        "    const device M1OutputSeat* all_intrinsic_at [[buffer({M3_INTRINSIC_TABLE_BUFFER})]],"
     );
     source.push_str("    uint dispatch_lane [[threadgroup_position_in_grid]],\n");
     source.push_str("    uint m3_tid [[thread_position_in_threadgroup]],\n");
@@ -333,9 +332,7 @@ pub fn emit_grouped_fused_region(
         let producer = region.nodes.iter().map(|n| n.index()).find(|&n| {
             bases[n] == source_value
                 && ops.get(n).is_some_and(|p| {
-                    p.tag == tags::INTRINSIC_VAL
-                        && (p.intr == intrinsic_tags::LOGITS
-                            || p.intr == intrinsic_tags::MTP_LOGITS)
+                    addressed_slot(stage, p, bases[n]).is_none() && p.tag == tags::OUTPUT
                 })
         });
         if let Some(producer) = producer {
@@ -355,12 +352,7 @@ pub fn emit_grouped_fused_region(
         }
         if let Some(&producer) = fused_argmax.get(&node) {
             let slots = Slots::of(op, base, |value| value_ptr(alias.resolve(value)));
-            emit_logits_argmax(
-                &mut source,
-                bases[producer],
-                ops[producer].intr == intrinsic_tags::MTP_LOGITS,
-                &slots.o0,
-            );
+            emit_logits_argmax(&mut source, bases[producer], &slots.o0);
             source.push_str(BARRIER);
             source.push_str("  if (status->state != 1) return;\n");
             continue;
@@ -369,30 +361,14 @@ pub fn emit_grouped_fused_region(
             continue;
         }
         let mut slots = Slots::of(op, base, |value| value_ptr(alias.resolve(value)));
-        if op.tag == tags::INTRINSIC_VAL && op.intr == intrinsic_tags::MTP_DRAFTS {
-            emit_mtp_drafts(&mut source, base, &slots.o0, "m3_tid", "m3_threads");
-            source.push_str(BARRIER);
-            continue;
-        }
-        if op.tag == tags::INTRINSIC_VAL && op.intr == intrinsic_tags::ATTN_SCORE {
-            emit_score_gather(&mut source, base, &slots.o0, "m3_tid", "m3_threads");
-            source.push_str(BARRIER);
-            continue;
-        }
-        if op.tag == tags::INTRINSIC_VAL
-            && let Some(slot) = addressed_slot(op.intr, op.imm)
+        if op.tag == tags::OUTPUT
+            && let Some(slot) = addressed_slot(stage, op, base)
         {
-            emit_addressed_gather(&mut source, base, slot, &slots.o0, "m3_tid", "m3_threads");
-            source.push_str(BARRIER);
-            continue;
-        }
-        if op.tag == tags::INTRINSIC_VAL
-            && matches!(op.intr, intrinsic_tags::LOGITS | intrinsic_tags::MTP_LOGITS)
-        {
-            emit_logits_gather(
+            emit_addressed_gather(
                 &mut source,
+                op,
                 base,
-                op.intr == intrinsic_tags::MTP_LOGITS,
+                slot,
                 &slots.o0,
                 "m3_tid",
                 "m3_threads",
@@ -400,12 +376,15 @@ pub fn emit_grouped_fused_region(
             source.push_str(BARRIER);
             continue;
         }
+        if op.tag == tags::OUTPUT {
+            emit_logits_gather(&mut source, base, &slots.o0, "m3_tid", "m3_threads");
+            source.push_str(BARRIER);
+            continue;
+        }
         if op.tag == tags::CHAN_TAKE || op.tag == tags::CHAN_READ {
             slots.a0 = format!("current_{}", op.chan);
         } else if op.tag == tags::CHAN_PUT {
             slots.o0 = format!("pending_{}", op.chan);
-        } else if op.tag == tags::INTRINSIC_VAL {
-            slots.a0 = "reinterpret_cast<const device uchar*>(logits)".to_string();
         }
         let _ = writeln!(
             source,
@@ -428,48 +407,13 @@ pub fn emit_grouped_fused_region(
     Ok(source)
 }
 
-pub(super) fn emit_mtp_drafts(source: &mut String, base: u32, o0: &str, begin: &str, step: &str) {
-    source.push_str("  {\n");
-    let _ = writeln!(source, "    const uint draft_begin = {begin};");
-    let _ = writeln!(source, "    const uint draft_step = {step};");
-    let _ = writeln!(
-        source,
-        "    const M1ValueDesc draft_desc = descriptors[{base}];"
-    );
-    let _ = writeln!(
-        source,
-        "    if (lane.mtp_drafts_base == 0ul || lane.mtp_drafts_depth == 0u || \
-         draft_desc.len > row_meta.mtp_offset * lane.mtp_drafts_depth) \
-         {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
-    );
-    source.push_str(
-        "    const device int* draft_src = \
-         reinterpret_cast<const device int*>(lane.mtp_drafts_base);\n",
-    );
-    let _ = writeln!(
-        source,
-        "    device int* draft_out = reinterpret_cast<device int*>({o0});"
-    );
-    source.push_str(
-        "    for (uint draft = draft_begin; draft < draft_desc.len; \
-         draft += draft_step) {\n",
-    );
-    source.push_str("      draft_out[draft] = draft_src[draft];\n");
-    source.push_str("    }\n");
-    source.push_str("  }\n");
-}
-
-pub(super) fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o0: &str) {
+pub(super) fn emit_logits_argmax(source: &mut String, in_base: u32, o0: &str) {
     source.push_str("  {\n");
     let _ = writeln!(
         source,
         "    const M1ValueDesc am_in = descriptors[{in_base}];"
     );
-    let _ = writeln!(
-        source,
-        "    const uint am_row_base = row_meta.offset + {};",
-        if mtp { "row_meta.mtp_offset" } else { "0u" }
-    );
+    source.push_str("    const uint am_row_base = row_meta.offset;\n");
     source.push_str("    const uint am_vocab = layout->vocab;\n");
     source.push_str("    const uint am_width = am_in.last == 0u ? am_vocab : am_in.last;\n");
     let _ = writeln!(
@@ -518,15 +462,17 @@ pub(super) fn emit_logits_argmax(source: &mut String, in_base: u32, mtp: bool, o
     source.push_str("  }\n");
 }
 
-/// Each lane's slot holds the address of its first row, on its class's plane.
+/// Each lane's slot holds its first row on its class's plane, as stored.
 pub(super) fn emit_addressed_gather(
     source: &mut String,
+    op: &OpView,
     base: u32,
     slot: u32,
     o0: &str,
     begin: &str,
     step: &str,
 ) {
+    let ints = op.dtype == eta_ir::types::wire_dtype(eta_ir::Dtype::I32);
     source.push_str("  {\n");
     let _ = writeln!(source, "    const uint addressed_begin = {begin};");
     let _ = writeln!(source, "    const uint addressed_step = {step};");
@@ -536,69 +482,44 @@ pub(super) fn emit_addressed_gather(
     );
     let _ = writeln!(
         source,
-        "    const ulong addressed_at = intrinsic_at[{slot}];"
-    );
-    let _ = writeln!(
-        source,
-        "    if (addressed_at == 0ul) \
-         {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
+        "    const M1OutputSeat addressed_seat = intrinsic_at[{slot}];"
     );
     source.push_str(
-        "    const device bfloat* addressed_src = \
-         reinterpret_cast<const device bfloat*>(addressed_at);\n",
+        "    const uint addressed_width = \
+         addressed_desc.last == 0u ? addressed_desc.len : addressed_desc.last;\n",
     );
+    source.push_str(
+        "    const uint addressed_stride = \
+         addressed_seat.stride == 0u ? addressed_width : addressed_seat.stride;\n",
+    );
+    let storage = if ints { "!= 2u" } else { "== 2u" };
     let _ = writeln!(
         source,
-        "    device float* addressed_out = reinterpret_cast<device float*>({o0});"
+        "    if (addressed_seat.at == 0ul || addressed_stride < addressed_width || \
+         addressed_seat.storage {storage}) \
+         {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
     );
     source.push_str(
         "    for (uint i = addressed_begin; i < addressed_desc.len; i += addressed_step) {\n",
     );
-    source.push_str("      addressed_out[i] = float(addressed_src[i]);\n");
-    source.push_str("    }\n");
-    source.push_str("  }\n");
-}
-
-pub(super) fn emit_score_gather(source: &mut String, base: u32, o0: &str, begin: &str, step: &str) {
-    source.push_str("  {\n");
-    let _ = writeln!(source, "    const uint score_begin = {begin};");
-    let _ = writeln!(source, "    const uint score_step = {step};");
-    let _ = writeln!(
-        source,
-        "    const M1ValueDesc score_desc = descriptors[{base}];"
-    );
-    source.push_str("    const uint score_stride = lane.attn_score_row_stride;\n");
     source.push_str(
-        "    const uint score_width = \
-         score_desc.last == 0u ? score_stride : score_desc.last;\n",
+        "      const ulong from = \
+         ulong(i / addressed_width) * addressed_stride + i % addressed_width;\n",
     );
-    let _ = writeln!(
-        source,
-        "    if (lane.attn_score_base == 0ul || score_stride == 0u || score_width == 0u || \
-         score_stride < score_width || \
-         score_desc.len % score_width != 0u) \
-         {{ m1_fault(status, {FUSED_GEOMETRY_MISMATCH:#X}u); return; }}"
-    );
-    source.push_str(
-        "    const device float* score_planes = \
-         reinterpret_cast<const device float*>(lane.attn_score_base);\n",
-    );
-    let _ = writeln!(
-        source,
-        "    device float* score_out = reinterpret_cast<device float*>({o0});"
-    );
-    source.push_str("    const uint score_rows = score_desc.len / score_width;\n");
-    source.push_str("    for (uint sr = 0u; sr < score_rows; ++sr) {\n");
-    source.push_str(
-        "      const device float* score_src = score_planes + ulong(sr) * score_stride;\n",
-    );
-    source.push_str("      device float* score_dst = score_out + ulong(sr) * score_width;\n");
-    source.push_str(
-        "      for (uint column = score_begin; column < score_width; \
-         column += score_step) {\n",
-    );
-    source.push_str("        score_dst[column] = score_src[column];\n");
-    source.push_str("      }\n");
+    if ints {
+        let _ = writeln!(
+            source,
+            "      reinterpret_cast<device int*>({o0})[i] = \
+             reinterpret_cast<const device int*>(addressed_seat.at)[from];"
+        );
+    } else {
+        let _ = writeln!(
+            source,
+            "      reinterpret_cast<device float*>({o0})[i] = addressed_seat.storage == 0u \
+             ? reinterpret_cast<const device float*>(addressed_seat.at)[from] \
+             : float(reinterpret_cast<const device bfloat*>(addressed_seat.at)[from]);"
+        );
+    }
     source.push_str("    }\n");
     source.push_str("  }\n");
 }
@@ -606,7 +527,6 @@ pub(super) fn emit_score_gather(source: &mut String, base: u32, o0: &str, begin:
 pub(super) fn emit_logits_gather(
     source: &mut String,
     base: u32,
-    mtp: bool,
     o0: &str,
     begin: &str,
     step: &str,
@@ -618,11 +538,7 @@ pub(super) fn emit_logits_gather(
         source,
         "    const M1ValueDesc intrinsic_desc = descriptors[{base}];"
     );
-    let _ = writeln!(
-        source,
-        "    const uint intrinsic_row_base = {};",
-        if mtp { "row_meta.mtp_offset" } else { "0u" }
-    );
+    source.push_str("    const uint intrinsic_row_base = 0u;\n");
     let _ = writeln!(source, "    const uint gather_stride = layout->vocab;");
     let _ = writeln!(
         source,

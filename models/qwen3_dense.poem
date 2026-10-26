@@ -218,7 +218,7 @@ def forward(m, inputs):
     y = inputs.fold_layers(m.layers, y, block)
     x = ops.elemwise.rmsnorm(y, m.final_norm, m.eps)
     x = ops.gather.gather_rows(x, inputs.readout_rows())
-    return ops.linear.lm_head(x, m.embed if m.head == None else m.head)
+    output("logits", ops.linear.lm_head(x, m.embed if m.head == None else m.head))
 
 def attention(x, inputs, m, positions, w, scaling):
     pages = inputs.kv(w.kv)
@@ -226,14 +226,14 @@ def attention(x, inputs, m, positions, w, scaling):
     q = ops.linear.matmul(x, w.q)
     k = ops.linear.matmul(x, w.k)
     v = ops.linear.matmul(x, w.v)
-    seam.at(seam.ATTN_QV, [q, v])
     q = ops.elemwise.rmsnorm_per_head(q, w.q_norm, d, m.eps)
     k = ops.elemwise.rmsnorm_per_head(k, w.k_norm, d, m.eps)
     q, k = ops.elemwise.rope(q, positions, d, m.theta, rotary.full(), k = k, scaling = scaling)
     ops.attn.kv_append(k, v, pages, inputs.write_page(w.kv), inputs.write_offset(w.kv))
-    seam.at(seam.ATTN_Q, [q])
 
-    # Each lane by its kind; a lane may bring its own mask or capture scores.
-    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True, scores = True)
-    seam.at(seam.ATTN_OUT, [o])
+    # Each lane by its kind; a lane may bring its own mask. A lane capturing
+    # scores reads them out too.
+    o = ops.attn.attend(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, mask = True)
+    scores = ops.attn.score_capture(q, inputs, w.kv, m.q_heads, m.kv_heads, d, m.sm_scale, observe = 32, kv_max = 2048)
+    output("attn.scores", scores)
     return ops.linear.matmul(o, w.o)

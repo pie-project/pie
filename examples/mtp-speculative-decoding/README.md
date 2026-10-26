@@ -12,7 +12,7 @@ Language Models via Multi-token Prediction*** (ICML) —
 self-speculative use of MTP heads described in §3.2.
 
 **Faithfulness: Structurally faithful.** The loop drafts from the head's chain
-(`mtp_drafts`) and verifies against the trunk's argmax, so its text equals greedy
+(its `mtp.drafts` output) and verifies against the trunk's argmax, so its text equals greedy
 decoding whatever the head proposes. `tests/examples/test_eagle.py` runs it
 end-to-end on a drafting artifact.
 
@@ -31,7 +31,7 @@ returned as `-1`-padded windows for the host to unpad.
 ## The rule
 
 ```
-drafts = the head's chain at the accepted row (mtp_drafts)
+drafts = the head's chain at the accepted row (mtp.drafts)
 truth  = argmax(main logits at each draft position)
 m      = length of matching draft prefix
 emit   = window[0 .. m]              # pending token plus accepted drafts
@@ -46,13 +46,13 @@ Only `m + 1` tokens advance the committed length.
 | --- | --- | --- | --- |
 | `prompt` | string | `"The quick brown fox jumps over"` | Prompt to send to the model |
 | `max_tokens` | int | `64` | Number of generated tokens |
-| `k` | int | `4` | Draft tokens per round, capped at the model's `mtp_depth`; `0` decodes greedily through the same loop |
+| `k` | int | `4` | Draft tokens per round, capped at the width of the model's `mtp.drafts`; `0` decodes greedily through the same loop |
 
 `pad`, `trace` and `margin` are diagnostics; see `src/lib.rs`.
 
 ## Implementation notes
 
-Drafting needs a load with a draft head (`mtp_depth > 0`). On a plain checkpoint
+Drafting needs a load with a draft head (an `mtp.drafts` output). On a plain checkpoint
 `k` caps at `0`, and the loop is sequential greedy decoding through the same
 geometry, fire and commit arithmetic.
 

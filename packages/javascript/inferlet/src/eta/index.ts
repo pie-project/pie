@@ -7,7 +7,7 @@
 //     import { eta } from '@pie-project/inferlet';
 //     const { Channel, ForwardPass, dtype, intrinsics, reduceArgmax, reshape } = eta;
 //
-//     const tokOut = fwd.epilogue(() => reduceArgmax(intrinsics.logits()));
+//     const tokOut = fwd.epilogue(() => reduceArgmax(intrinsics.output(0, "logits")));
 //     pipe.submit(fwd);
 //     const token = tokOut.takeScalar();
 //
@@ -27,7 +27,6 @@ export {
   channelCapacity,
   frameSize,
   kvPageSize,
-  maxReadoutRows,
   mm,
   padTokens,
   readoutSpans,

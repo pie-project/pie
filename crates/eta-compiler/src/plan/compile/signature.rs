@@ -94,7 +94,7 @@ pub(crate) fn stage_signature(bound: &BoundTrace, stage: &NormalizedStage) -> St
         canonical_op(&mut bytes, op, stage.value_types.get(next_value));
         next_value += op.result_count() as usize;
     }
-    put_u32(&mut bytes, eta_ir::op::intrinsic_pitch(&stage.ops));
+    put_u32(&mut bytes, eta_ir::op::output_pitch(&stage.ops));
     put_u32(&mut bytes, stage.value_types.len() as u32);
     for (value_type, domain) in stage.value_types.iter().zip(&stage.value_domains) {
         canonical_symbolic_type(&mut bytes, value_type);

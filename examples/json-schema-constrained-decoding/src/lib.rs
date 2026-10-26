@@ -76,7 +76,10 @@ async fn main(input: Input) -> Result<String> {
     prefill.state(&[&ws], StateGeometry::folding())?;
     prefill.epilogue(move || {
         let allowed = prefill_mask.take();
-        let token = reshape(masked_argmax(intrinsics::logits(), &allowed), [1]);
+        let token = reshape(
+            masked_argmax(intrinsics::output(0, "logits"), &allowed),
+            [1],
+        );
         first_out.put(&token);
     });
 
@@ -103,7 +106,10 @@ async fn main(input: Input) -> Result<String> {
         decode.state(&[&ws], StateGeometry::folding())?;
         decode.epilogue(move || {
             let allowed = grammar_mask.take();
-            let token = reshape(masked_argmax(intrinsics::logits(), &allowed), [1]);
+            let token = reshape(
+                masked_argmax(intrinsics::output(0, "logits"), &allowed),
+                [1],
+            );
 
             token_in.put(&token);
             token_out.put(&token);

@@ -144,7 +144,7 @@ async fn main(input: Input) -> Result<String> {
     prefill.state(&streams, StateGeometry::folding())?;
     // A pass needs an epilogue; this one's output is drained and dropped.
     prefill.epilogue(move || {
-        let flat = reshape(intrinsics::logits(), [2 * vocab]);
+        let flat = reshape(intrinsics::output(0, "logits"), [2 * vocab]);
         drop.put(reshape(cast(reduce_argmax(flat), dtype::i32), [1]));
     });
     prefill.submit(&pipeline).context("prefill")?;
@@ -164,7 +164,7 @@ async fn main(input: Input) -> Result<String> {
     decode.embed(&toks, &embed_indptr)?;
     decode.state(&streams, StateGeometry::folding())?;
     decode.epilogue(move || {
-        let logits = reshape(intrinsics::logits(), [2, vocab]);
+        let logits = reshape(intrinsics::output(0, "logits"), [2, vocab]);
         let query_only = reshape(gather(&logits, iota(1)), [vocab]);
         let with_context = reshape(gather(&logits, iota(1) + 1u32), [vocab]);
         let (token, shift, kl) = cad_pick(&with_context, &query_only, alpha);

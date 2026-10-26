@@ -1,7 +1,7 @@
 //! An op's operand types are stated on its fields (`#[output(I32)]`), and
 //! the validator names the field it refuses.
 
-use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Value, Weight, ops, trace_hybrid};
+use poem::{Dtype, ForwardHybrid, HybridSpec, Input, Platform, Weight, ops, trace_hybrid};
 use poem_ir::Turn;
 use poem_ir::check::Port;
 use poem_ir::{Fault, Operation, Sampling, Trace, Ty};
@@ -17,11 +17,11 @@ impl ForwardHybrid for Ranked {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let table = Weight::sym("embed", [u64::from(VOCAB), HIDDEN], Dtype::Bf16);
         let x = ops::gather::embed(&inputs.tokens(), &table, VOCAB);
         let (values, _) = ops::sampling::top_k(&x, 4);
-        values
+        poem::output("logits", &values, None);
     }
 }
 
@@ -68,10 +68,10 @@ impl ForwardHybrid for Turned {
         HybridSpec::new()
     }
 
-    fn forward(&self, inputs: Input) -> Value {
+    fn forward(&self, inputs: Input) {
         let table = Weight::sym("embed", [u64::from(VOCAB), HIDDEN], Dtype::Bf16);
         let x = ops::gather::embed(&inputs.tokens(), &table, VOCAB);
-        ops::elemwise::rope(
+        let logits = ops::elemwise::rope(
             &x,
             &inputs.positions(),
             32,
@@ -83,7 +83,8 @@ impl ForwardHybrid for Turned {
             None,
             None,
         )
-        .0
+        .0;
+        poem::output("logits", &logits, None);
     }
 }
 
