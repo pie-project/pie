@@ -59,7 +59,7 @@ impl ForwardHybrid for Decoder {
         let (h, g2) = conv::upsample_nearest(&h, &g1, [1, 2, 2], false);
         assert_eq!(
             h.rows(),
-            Dim::VoxelsTimes(4),
+            Dim::VoxelsScaled(4, 1),
             "an upsample grows rows by its volume"
         );
         let (h, g3) = conv::conv3d(
@@ -73,7 +73,7 @@ impl ForwardHybrid for Decoder {
         let (y, g4) = conv::pixel_shuffle(&h, &g3, [1, 2, 2]);
         assert_eq!(
             y.rows(),
-            Dim::VoxelsTimes(16),
+            Dim::VoxelsScaled(16, 1),
             "a shuffle grows rows by its block"
         );
         assert_eq!(y.width(), 3, "and divides the width by it");
@@ -136,7 +136,7 @@ fn the_decoder_traces_and_its_grids_are_values() {
     assert_eq!(
         *plane,
         Ty::Tensor {
-            shape: vec![Dim::VoxelsTimes(16), Dim::Const(3)],
+            shape: vec![Dim::VoxelsScaled(16, 1), Dim::Const(3)],
             dtype: Dtype::Bf16
         }
     );

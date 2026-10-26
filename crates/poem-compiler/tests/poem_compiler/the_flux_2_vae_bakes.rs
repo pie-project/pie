@@ -124,8 +124,8 @@ fn the_trace_reads_its_voxel_inputs_and_plants_pixels_twice() {
         dtype: Dtype::Bf16,
     };
     let mut want = vec![
-        plane(Dim::VoxelsTimes(256), u64::from(vae::RGB)),
-        plane(Dim::VoxelsTimes(4), u64::from(model::VAE_CHANNELS)),
+        plane(Dim::VoxelsScaled(256, 1), u64::from(vae::RGB)),
+        plane(Dim::VoxelsScaled(4, 1), u64::from(model::VAE_CHANNELS)),
     ];
     want.sort_by_key(|ty| format!("{ty:?}"));
     assert_eq!(planes, want);
@@ -150,7 +150,7 @@ fn the_shapes_are_the_flux2_autoencoders() {
                 };
                 assert_eq!(*dtype, Dtype::Bf16);
                 assert_eq!(shape[1], Dim::Const(512));
-                assert!(matches!(shape[0], Dim::Voxels | Dim::VoxelsTimes(4)));
+                assert!(matches!(shape[0], Dim::Voxels | Dim::VoxelsScaled(4, 1)));
                 assert!((sm_scale - 512f32.sqrt().recip()).abs() < 1e-9);
             }
             Operation::Conv(Conv::Upsample {

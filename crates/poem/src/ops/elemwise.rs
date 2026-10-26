@@ -1008,8 +1008,10 @@ pub fn norm_gate(
 
 fn binary(x: &Value, y: &Value, op: poem_ir::BinaryOp) -> Value {
     let r = x.rec();
-    assert_eq!(x.ty(), y.ty(), "a {op:?}'s operands share a type");
-    let z = r.fresh(x.ty().clone());
+    let z = r.fresh(voxel_meet(x, y).unwrap_or_else(|| {
+        assert_eq!(x.ty(), y.ty(), "a {op:?}'s operands share a type");
+        x.ty().clone()
+    }));
     r.push(
         Elemwise::Binary {
             x: x.id(),
@@ -1020,6 +1022,29 @@ fn binary(x: &Value, y: &Value, op: poem_ir::BinaryOp) -> Value {
         &[x, y],
     );
     z
+}
+
+/// Two voxel operands over one grid hold the same rows, so the tighter of
+/// their two row bounds holds for both.
+fn voxel_meet(x: &Value, y: &Value) -> Option<Ty> {
+    let (Ty::Tensor { shape: a, dtype }, Ty::Tensor { shape: b, .. }) = (x.ty(), y.ty()) else {
+        return None;
+    };
+    let ((an, ad), (bn, bd)) = (a.first()?.voxel_scale()?, b.first()?.voxel_scale()?);
+    if a[1..] != b[1..] || x.dtype() != y.dtype() {
+        return None;
+    }
+    let rows = if u64::from(an) * u64::from(bd) <= u64::from(bn) * u64::from(ad) {
+        a[0]
+    } else {
+        b[0]
+    };
+    let mut shape = a.clone();
+    shape[0] = rows;
+    Some(Ty::Tensor {
+        shape,
+        dtype: *dtype,
+    })
 }
 
 pub fn mul(x: &Value, y: &Value) -> Value {

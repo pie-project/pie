@@ -155,7 +155,9 @@ pub fn compile_axes(
         (arena::carve(trace, budgets, &classes, &concurrency)?, None)
     };
 
+    let voxel_growth = arena::voxel_growth(trace, &classes);
     Ok(CompiledModel {
+        voxel_growth,
         classes,
         regions,
         order,

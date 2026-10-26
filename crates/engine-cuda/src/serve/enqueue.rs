@@ -506,7 +506,7 @@ impl FireCtx<'_> {
                 lanes: carve_lanes,
                 patches: carve_patches,
                 images: u64::from(p.composition.images()),
-                voxels: u64::from(p.composition.voxel_rows()),
+                voxels: u64::from(p.composition.voxel_widest()),
                 clips: u64::from(p.composition.clips()),
                 readouts: p.readout_rows.len() as u64,
             },

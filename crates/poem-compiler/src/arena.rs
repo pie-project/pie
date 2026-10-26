@@ -18,8 +18,8 @@ pub enum RowExpr {
     Patches,
     Images,
     ImagesPlus(u32),
-    Voxels,
-    VoxelsTimes(u32),
+    /// The fire's widest voxel rows, scaled by `num/den`.
+    Voxels(u32, u32),
     Clips,
     ClipsPlus(u32),
 }
@@ -37,8 +37,8 @@ impl RowExpr {
             Dim::Patches => RowExpr::Patches,
             Dim::Images => RowExpr::Images,
             Dim::ImagesPlus(k) => RowExpr::ImagesPlus(k),
-            Dim::Voxels => RowExpr::Voxels,
-            Dim::VoxelsTimes(k) => RowExpr::VoxelsTimes(k),
+            Dim::Voxels => RowExpr::Voxels(1, 1),
+            Dim::VoxelsScaled(n, d) => RowExpr::Voxels(n, d),
             Dim::Clips => RowExpr::Clips,
             Dim::ClipsPlus(k) => RowExpr::ClipsPlus(k),
         }
@@ -54,9 +54,7 @@ impl RowExpr {
             | RowExpr::LanesPlus(_)
             | RowExpr::Readouts => Some(RowAxis::Tokens),
             RowExpr::Patches | RowExpr::Images | RowExpr::ImagesPlus(_) => Some(RowAxis::Patches),
-            RowExpr::Voxels | RowExpr::VoxelsTimes(_) | RowExpr::Clips | RowExpr::ClipsPlus(_) => {
-                Some(RowAxis::Voxels)
-            }
+            RowExpr::Voxels(..) | RowExpr::Clips | RowExpr::ClipsPlus(_) => Some(RowAxis::Voxels),
         }
     }
 
@@ -72,8 +70,7 @@ impl RowExpr {
             | RowExpr::TokensTimes(_)
             | RowExpr::Patches
             | RowExpr::Images
-            | RowExpr::Voxels
-            | RowExpr::VoxelsTimes(_)
+            | RowExpr::Voxels(..)
             | RowExpr::Clips => true,
             RowExpr::Lanes
             | RowExpr::Const(_)
@@ -96,8 +93,10 @@ impl RowExpr {
             RowExpr::Patches => fire.patches,
             RowExpr::Images => fire.images,
             RowExpr::ImagesPlus(k) => fire.images.saturating_add(u64::from(k)),
-            RowExpr::Voxels => fire.voxels,
-            RowExpr::VoxelsTimes(k) => fire.voxels.saturating_mul(u64::from(k)),
+            RowExpr::Voxels(n, d) => fire
+                .voxels
+                .saturating_mul(u64::from(n))
+                .div_ceil(u64::from(d)),
             RowExpr::Clips => fire.clips,
             RowExpr::ClipsPlus(k) => fire.clips.saturating_add(u64::from(k)),
         }
@@ -610,7 +609,7 @@ pub(crate) fn carve(
     classes: &ClassTable,
     conc: &Concurrency,
 ) -> Result<ArenaMap, Error> {
-    let mut placements = rectangles(trace, budgets)?;
+    let mut placements = rectangles(trace, budgets, classes)?;
     fold_in_place(trace, &mut placements)?;
     fold_merges(trace, &mut placements)?;
     flatten(&mut placements);
@@ -649,7 +648,12 @@ pub(crate) fn carve(
     })
 }
 
-fn rectangles(trace: &Trace, budgets: &Budgets) -> Result<Vec<Placement>, Error> {
+fn rectangles(
+    trace: &Trace,
+    budgets: &Budgets,
+    classes: &ClassTable,
+) -> Result<Vec<Placement>, Error> {
+    let carved = voxel_carve(trace, classes);
     trace
         .values
         .iter()
@@ -665,6 +669,10 @@ fn rectangles(trace: &Trace, budgets: &Budgets) -> Result<Vec<Placement>, Error>
                     Ty::Tensor { shape, dtype } => {
                         let (rows, width) =
                             rect(shape).map_err(|why| Error::Unrectangled { value, why })?;
+                        let rows = match (rows, carved[id]) {
+                            (RowExpr::Voxels(..), Some((n, d))) => RowExpr::Voxels(n, d),
+                            _ => rows,
+                        };
                         let elem = elem_bytes(*dtype).ok_or(Error::Unrectangled {
                             value,
                             why: Unrectangled::PackedElement,
@@ -710,7 +718,7 @@ fn rect(shape: &[Dim]) -> Result<(RowExpr, u64), Unrectangled> {
             | Dim::Images
             | Dim::ImagesPlus(_)
             | Dim::Voxels
-            | Dim::VoxelsTimes(_)
+            | Dim::VoxelsScaled(..)
             | Dim::Clips
             | Dim::ClipsPlus(_)
             | Dim::Readouts => {
@@ -719,6 +727,96 @@ fn rect(shape: &[Dim]) -> Result<(RowExpr, u64), Unrectangled> {
         }
     }
     Ok((rows, width))
+}
+
+/// The classes each value is made in: its node's, or its arms' for a merge.
+fn made_in(trace: &Trace, classes: &ClassTable) -> Vec<ClassSet> {
+    let mut sets: Vec<ClassSet> = Vec::with_capacity(trace.values.len());
+    for decl in &trace.values {
+        let set = match &decl.def {
+            Def::Op(node) => classes
+                .node_mask
+                .get(*node as usize)
+                .cloned()
+                .unwrap_or_default(),
+            Def::Merge(arms) => ClassSet::of(
+                arms.iter()
+                    .filter_map(|(arm, _)| sets.get(arm.0 as usize))
+                    .flat_map(ClassSet::iter)
+                    .collect::<Vec<_>>(),
+            ),
+            _ => ClassSet::default(),
+        };
+        sets.push(set);
+    }
+    sets
+}
+
+fn scale_of(decl: &poem_ir::ValueDecl) -> Option<(u32, u32)> {
+    match &decl.ty {
+        Ty::Tensor { shape, .. } => shape.first()?.voxel_scale(),
+        Ty::Struct(_) => None,
+    }
+}
+
+fn wider(a: (u32, u32), b: (u32, u32)) -> bool {
+    u64::from(a.0) * u64::from(b.1) > u64::from(b.0) * u64::from(a.1)
+}
+
+fn reduced(n: u64, d: u64) -> (u32, u32) {
+    let g = {
+        let (mut a, mut b) = (n, d);
+        while b != 0 {
+            (a, b) = (b, a % b);
+        }
+        a.max(1)
+    };
+    (
+        u32::try_from(n / g).unwrap_or(u32::MAX),
+        u32::try_from(d / g).unwrap_or(u32::MAX),
+    )
+}
+
+/// Each class's growth: its widest voxel value over the voxel input it reads.
+#[must_use]
+pub fn voxel_growth(trace: &Trace, classes: &ClassTable) -> Vec<(u32, u32)> {
+    let sets = made_in(trace, classes);
+    let mut growth = vec![(1, 1); classes.classes.len()];
+    for (decl, set) in trace.values.iter().zip(&sets) {
+        let Some(scale) = scale_of(decl) else {
+            continue;
+        };
+        for class in set.iter() {
+            if let Some(g) = growth.get_mut(class)
+                && wider(scale, *g)
+            {
+                *g = scale;
+            }
+        }
+    }
+    growth
+}
+
+/// Each voxel value's rows over the fire's widest voxel rows: its scale over
+/// the growth of the class it is made in, the widest over its classes.
+fn voxel_carve(trace: &Trace, classes: &ClassTable) -> Vec<Option<(u32, u32)>> {
+    let growth = voxel_growth(trace, classes);
+    let sets = made_in(trace, classes);
+    trace
+        .values
+        .iter()
+        .zip(&sets)
+        .map(|(decl, set)| {
+            let (n, d) = scale_of(decl)?;
+            set.iter()
+                .filter_map(|class| growth.get(class))
+                .map(|&(gn, gd)| {
+                    reduced(u64::from(n) * u64::from(gd), u64::from(d) * u64::from(gn))
+                })
+                .reduce(|a, b| if wider(b, a) { b } else { a })
+                .or(Some((n, d)))
+        })
+        .collect()
 }
 
 #[must_use]

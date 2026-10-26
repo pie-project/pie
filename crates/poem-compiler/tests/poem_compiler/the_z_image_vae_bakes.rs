@@ -104,7 +104,7 @@ fn the_trace_reads_its_voxel_inputs_and_plants_pixels_twice() {
         dtype: Dtype::Bf16,
     };
     let mut want = vec![
-        plane(Dim::VoxelsTimes(64), u64::from(vae::RGB)),
+        plane(Dim::VoxelsScaled(64, 1), u64::from(vae::RGB)),
         plane(Dim::Voxels, u64::from(model::CHANNELS)),
     ];
     want.sort_by_key(|ty| format!("{ty:?}"));

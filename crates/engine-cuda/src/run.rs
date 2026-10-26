@@ -1477,7 +1477,9 @@ impl<'c> Run<'c> {
             Dim::Images => lane(0),
             Dim::ImagesPlus(k) => lane(k),
             Dim::Voxels => row(1),
-            Dim::VoxelsTimes(k) => row(k),
+            Dim::VoxelsScaled(n, d) => {
+                poem_ir::value::scaled_span(n, d, span.row_offset, span.rows)
+            }
             Dim::Clips => lane(0),
             Dim::ClipsPlus(k) => lane(k),
         };

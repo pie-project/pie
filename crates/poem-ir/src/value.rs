@@ -20,7 +20,7 @@ pub enum Dim {
     Images,
     ImagesPlus(u32),
     Voxels,
-    VoxelsTimes(u32),
+    VoxelsScaled(u32, u32),
     Clips,
     ClipsPlus(u32),
 }
@@ -105,11 +105,54 @@ impl Dim {
                 Some(RowAxis::Tokens)
             }
             Dim::Patches | Dim::Images | Dim::ImagesPlus(_) => Some(RowAxis::Patches),
-            Dim::Voxels | Dim::VoxelsTimes(_) | Dim::Clips | Dim::ClipsPlus(_) => {
+            Dim::Voxels | Dim::VoxelsScaled(..) | Dim::Clips | Dim::ClipsPlus(_) => {
                 Some(RowAxis::Voxels)
             }
         }
     }
+
+    /// Voxel rows `num/den` of the fire's voxel input, in lowest terms.
+    #[must_use]
+    pub fn voxels_scaled(num: u32, den: u32) -> Dim {
+        assert!(num > 0 && den > 0, "a voxel scale of {num}/{den} is empty");
+        let g = gcd(num, den);
+        match (num / g, den / g) {
+            (1, 1) => Dim::Voxels,
+            (n, d) => Dim::VoxelsScaled(n, d),
+        }
+    }
+
+    #[must_use]
+    pub fn voxel_scale(self) -> Option<(u32, u32)> {
+        match self {
+            Dim::Voxels => Some((1, 1)),
+            Dim::VoxelsScaled(n, d) => Some((n, d)),
+            _ => None,
+        }
+    }
+}
+
+/// A span of voxel rows `(offset, rows)` under a `num/den` scale.
+#[must_use]
+pub fn scaled_span(num: u32, den: u32, offset: u32, rows: u32) -> (u32, u32) {
+    let at = |n: u32, up: bool| {
+        let n = u64::from(n) * u64::from(num);
+        let n = if up {
+            n.div_ceil(u64::from(den))
+        } else {
+            n / u64::from(den)
+        };
+        u32::try_from(n).unwrap_or(u32::MAX)
+    };
+    (at(offset, false), at(rows, true))
+}
+
+#[must_use]
+pub fn gcd(mut a: u32, mut b: u32) -> u32 {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -337,7 +380,7 @@ mod tests {
             (Dim::Images, 20),
             (Dim::ImagesPlus(1), 20),
             (Dim::Voxels, 30),
-            (Dim::VoxelsTimes(8), 30),
+            (Dim::VoxelsScaled(8, 1), 30),
             (Dim::Clips, 30),
             (Dim::ClipsPlus(1), 30),
         ] {
