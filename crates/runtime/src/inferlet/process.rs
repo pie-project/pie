@@ -414,6 +414,7 @@ pub fn spawn(
     username: String,
     program_name: ProgramName,
     input: String,
+    files: Arc<client_api::Files>,
     client_id: Option<ClientId>,
     capture_outputs: bool,
     result_tx: Option<oneshot::Sender<Result<String, String>>>,
@@ -424,6 +425,7 @@ pub fn spawn(
         username,
         program_name,
         input,
+        files,
         client_id,
         capture_outputs,
         Arc::new(Mutex::new(result_tx)),
@@ -442,6 +444,7 @@ fn spawn_inner(
     username: String,
     program_name: ProgramName,
     input: String,
+    files: Arc<client_api::Files>,
     client_id: Option<ClientId>,
     capture_outputs: bool,
     result_tx: SharedResultTx,
@@ -468,6 +471,7 @@ fn spawn_inner(
         username,
         program_name,
         input,
+        files,
         client_id,
         capture_outputs,
         result_tx,
@@ -619,6 +623,7 @@ struct Process {
     username: String,
     program: ProgramName,
     input: String,
+    files: Arc<client_api::Files>,
     start_time: Instant,
     handle: JoinHandle<()>,
     client_id: Option<ClientId>,
@@ -641,6 +646,7 @@ impl Process {
         username: String,
         program: ProgramName,
         input: String,
+        files: Arc<client_api::Files>,
         client_id: Option<ClientId>,
         capture_outputs: bool,
         result_tx: SharedResultTx,
@@ -652,6 +658,7 @@ impl Process {
             username.clone(),
             program.clone(),
             input.clone(),
+            files.clone(),
             capture_outputs,
             result_tx.clone(),
             arrival.clone(),
@@ -664,6 +671,7 @@ impl Process {
             username,
             program,
             input,
+            files,
             start_time: Instant::now(),
             handle,
             client_id,
@@ -711,6 +719,7 @@ impl Process {
         username: String,
         program: ProgramName,
         input: String,
+        files: Arc<client_api::Files>,
         capture_outputs: bool,
         result_tx: SharedResultTx,
         arrival: Arrival,
@@ -745,6 +754,7 @@ impl Process {
             instantiate_us = duration_us(instantiate_start.elapsed());
             store.data_mut().install_prewarm_permit(prewarm_permit);
             store.data_mut().set_props(props);
+            store.data_mut().set_files(files);
 
             let run_interface = RUN_INTERFACE;
 
@@ -827,6 +837,7 @@ impl Process {
             self.username.clone(),
             self.program.clone(),
             self.input.clone(),
+            self.files.clone(),
             self.client_id,
             self.capture_outputs,
             self.result_tx.clone(),
@@ -1029,6 +1040,7 @@ mod tests {
                 version: "0.0.0".to_string(),
             },
             input: String::new(),
+            files: Arc::default(),
             start_time: Instant::now(),
             handle: crate::rt::spawn(std::future::pending::<()>()),
             client_id: None,

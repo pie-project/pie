@@ -497,12 +497,14 @@ class PieClient:
         inferlet: str,
         input: dict | list | None = None,
         capture_outputs: bool = True,
+        files: dict[str, bytes] | None = None,
     ) -> Process:
         """Launch a process. Returns a Process object for interaction.
 
         :param inferlet: The inferlet name (e.g., "text-completion@0.1.0").
         :param input: A dict of input parameters, serialized to JSON.
         :param capture_outputs: If True, process outputs are streamed to the client.
+        :param files: Files the inferlet reads with `session.file(name)`.
         :return: A Process object for the launched inferlet.
         """
         msg = {
@@ -510,6 +512,7 @@ class PieClient:
             "inferlet": inferlet,
             "input": json.dumps(input if input is not None else {}),
             "capture_outputs": capture_outputs,
+            "files": files or {},
         }
         ok, result = await self._send_msg_and_wait(msg)
 

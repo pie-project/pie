@@ -2,6 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::Props;
 
+/// Files a launch attaches, by name; the guest reads them with `session.file`.
+pub type Files = std::collections::BTreeMap<String, serde_bytes::ByteBuf>;
+
 pub const CHUNK_SIZE_BYTES: usize = 256 * 1024;
 pub const QUERY_MODEL_STATUS: &str = "model_status";
 
@@ -53,6 +56,8 @@ pub enum ClientMessage {
         props: Props,
         #[serde(default)]
         session: Option<String>,
+        #[serde(default)]
+        files: Files,
         /// Set by the worker, never on the wire.
         #[serde(skip)]
         cluster_props: Props,

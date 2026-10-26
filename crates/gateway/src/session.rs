@@ -821,6 +821,7 @@ mod tests {
                 capture_outputs: true,
                 props: Default::default(),
                 session: None,
+                files: Default::default(),
                 cluster_props: Default::default(),
                 executors: Vec::new(),
             },

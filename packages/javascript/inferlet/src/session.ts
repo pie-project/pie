@@ -41,3 +41,9 @@ export function sendFile(data: Uint8Array): void {
 export function receiveFile(): Uint8Array | undefined {
     return _session.receiveFileBlocking();
 }
+
+/** The file the client attached to this run under `name`
+ *  (`pie run --file name=path`), or `undefined`. */
+export function file(name: string): Uint8Array | undefined {
+    return _session.file(name);
+}

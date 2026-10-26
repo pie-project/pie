@@ -976,6 +976,7 @@ async fn run_prefill(tokens: &[u32]) -> Result<()> {
         "pie".into(),
         name,
         input,
+        Default::default(),
         None,
         false,
         Some(tx),
