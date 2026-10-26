@@ -11,21 +11,26 @@
 //! chain's run is. The ops a region lowers ([`super::chain`]'s) and a
 //! product's activations: a GLU of the packed `[gate | up]` product (the
 //! contraction then lands two parts, [`Layout::Packed`]) and the ungated
-//! ones. Of the run, the longest leading part whose anchored region
-//! kernels-ir verifies (pointwise over the product tile: no reduction, no
-//! gather across it) and the backend serves (`serves`) is the anchor's; a
+//! ones. And a split of the product into pieces (a packed qkv row's q, k
+//! and v, a row's two halves) and the ops over each piece's heads (a head's
+//! norm, q's and k's turn): each piece computed over the whole tile and
+//! landed in its window. Of the run, the longest leading part whose
+//! anchored region kernels-ir verifies (pointwise over the product tile, or
+//! combining columns only within a head's span: no sum across the row, no
+//! gather past a head) and the backend serves (`serves`) is the anchor's; a
 //! run of no op is no anchor, and the matmul keeps its own kernel.
 //!
 //! **Lowering.** The product's parts are the epilogue's first parameters;
 //! each value it reads and does not compute is an input, by how it is laid
 //! out: a tile of the product's rows ([`Input::Tile`], a residual), a
-//! vector a column ([`Input::Column`], a bias), one element a row
-//! ([`Input::Row`]) or one value ([`Input::One`]). The product is no value
-//! (nothing past the run reads it, or the run is no anchor) and keeps its
-//! accumulator, f32, through the epilogue: a matmul's product and the bias
-//! or activation over it are one computation, as `nn.Linear` and every
-//! reference keep them, the bf16 the trace states of the product a store
-//! the fusion leaves out. Each value the epilogue's ops compute rounds to
+//! vector a column ([`Input::Column`], a bias), a head's vector every head
+//! reads ([`Input::Head`], a head's norm weight), one element a row
+//! ([`Input::Row`], a position) or one value ([`Input::One`]). The product
+//! is no value (nothing past the run reads it, or the run is no anchor) and
+//! keeps its accumulator, f32, through the epilogue: a matmul's product and
+//! the bias or activation over it are one computation, as `nn.Linear` and
+//! every reference keep them, the bf16 the trace states of the product a
+//! store the fusion leaves out. Each value the epilogue's ops compute rounds to
 //! its dtype where it is defined, as a chain's do; one anything past the
 //! run may read is a result.
 //!
@@ -39,8 +44,13 @@
 
 use std::collections::BTreeMap;
 
-use kernels_ir::{Anchored, Contraction, Input, Layout, Pointwise, Quant, Region, Shape};
-use poem_ir::{Def, Dim, Dtype, Fused, Linear, Operands, Operation, Trace, Ty, ValueId};
+use kernels_ir::{
+    Anchored, Binary, Contraction, Input, Layout, Op, Pointwise, Quant, Region, Shape, Window,
+};
+use poem_ir::{
+    Def, Dim, Dtype, Elemwise, Fused, Gather, Linear, NormAxis, NormWeight, Operands, Operation,
+    Trace, Ty, ValueId,
+};
 
 use super::chain::{self, Builder, Escapes, Form, In, Out};
 
@@ -238,9 +248,192 @@ fn layout_of(trace: &Trace, run: &[u32], product: &Product) -> (u32, Layout) {
     }
 }
 
+/// The pieces `node` cuts a value of `windows` (the product itself, its
+/// whole tile, where `windows` holds nothing) into, where it is a split:
+/// a packed qkv row's q, k and v ([`Gather::SplitQkv`]), or a row's two
+/// halves ([`Gather::SplitRows`], Muse Spark's `qkv | gate`), each a
+/// window of the product's tile.
+fn split_of(
+    trace: &Trace,
+    node: u32,
+    product: &Product,
+    windows: &BTreeMap<ValueId, Window>,
+) -> Option<Vec<(ValueId, Window)>> {
+    let whole = |v: ValueId| {
+        if v == product.y {
+            Some(Window {
+                from: 0,
+                width: product.rows,
+            })
+        } else {
+            windows.get(&v).copied()
+        }
+    };
+    match trace.nodes[node as usize].op {
+        Operation::Gather(Gather::SplitQkv {
+            packed,
+            q_width,
+            kv_width,
+            q,
+            k,
+            v,
+        }) => {
+            let at = whole(packed)?;
+            if q_width.checked_add(kv_width.checked_mul(2)?)? != at.width {
+                return None;
+            }
+            let piece = |from: u32, width: u32| Window {
+                from: at.from + from,
+                width,
+            };
+            Some(vec![
+                (q, piece(0, q_width)),
+                (k, piece(q_width, kv_width)),
+                (v, piece(q_width + kv_width, kv_width)),
+            ])
+        }
+        Operation::Gather(Gather::SplitRows {
+            x,
+            width,
+            left,
+            right,
+        }) => {
+            let at = whole(x)?;
+            if width == 0 || width >= at.width {
+                return None;
+            }
+            Some(vec![
+                (
+                    left,
+                    Window {
+                        from: at.from,
+                        width,
+                    },
+                ),
+                (
+                    right,
+                    Window {
+                        from: at.from + width,
+                        width: at.width - width,
+                    },
+                ),
+            ])
+        }
+        _ => None,
+    }
+}
+
+/// The window of the product each value `run` computes covers, where the
+/// run's first op splits it ([`split_of`]): a split's pieces (and a split
+/// of a piece's), and what each op over one piece computes (a pair's
+/// rotation, each of its two).
+fn windows_of(trace: &Trace, run: &[u32], product: &Product) -> BTreeMap<ValueId, Window> {
+    let mut windows = BTreeMap::new();
+    if run
+        .get(1)
+        .is_none_or(|&n| split_of(trace, n, product, &windows).is_none())
+    {
+        return windows;
+    }
+    let (mut ins, mut outs) = (Vec::new(), Vec::new());
+    for &node in &run[1..] {
+        if let Some(pieces) = split_of(trace, node, product, &windows) {
+            windows.extend(pieces);
+            continue;
+        }
+        let op = &trace.nodes[node as usize].op;
+        if let Operation::Elemwise(Elemwise::Rope {
+            q,
+            k: Some(k),
+            q_out,
+            k_out: Some(k_out),
+            ..
+        }) = *op
+        {
+            for (from, to) in [(q, q_out), (k, k_out)] {
+                if let Some(&w) = windows.get(&from) {
+                    windows.insert(to, w);
+                }
+            }
+            continue;
+        }
+        ins.clear();
+        outs.clear();
+        op.inputs(&mut ins);
+        op.outputs(&mut outs);
+        if let Some(&w) = ins.iter().find_map(|v| windows.get(v)) {
+            for v in &outs {
+                windows.insert(*v, w);
+            }
+        }
+    }
+    windows
+}
+
+/// Whether `node`, an op over the windows `windows`, reads them as one op
+/// over each head of its own piece: every piece it reads one (the pair a
+/// rotation turns, q's and k's, each its own), of whole heads where it
+/// names one, and the op pointwise or a head's alone (a head's norm, a
+/// rotation), so that the epilogue computes it over the whole tile and
+/// lands its piece.
+fn over_pieces(trace: &Trace, node: u32, windows: &BTreeMap<ValueId, Window>) -> bool {
+    let op = &trace.nodes[node as usize].op;
+    let mut ins = Vec::new();
+    op.inputs(&mut ins);
+    let pieces: Vec<Window> = ins.iter().filter_map(|v| windows.get(v).copied()).collect();
+    let Some(&piece) = pieces.first() else {
+        return false;
+    };
+    let whole = |head: u32, w: &Window| {
+        head > 0 && w.from.is_multiple_of(head) && w.width.is_multiple_of(head)
+    };
+    let rows = |w: Window| {
+        chain::Rows {
+            dim: match trace.values[ins[0].0 as usize].ty {
+                Ty::Tensor { ref shape, .. } => shape[0],
+                Ty::Struct(_) => return None,
+            },
+            width: u64::from(w.width),
+        }
+        .into()
+    };
+    match *op {
+        Operation::Elemwise(Elemwise::Rope {
+            q,
+            k: Some(k),
+            positions,
+            head_dim,
+            freqs: None,
+            turn,
+            theta,
+            ..
+        }) => {
+            let (Some(qw), Some(kw)) = (windows.get(&q), windows.get(&k)) else {
+                return false;
+            };
+            whole(head_dim, qw)
+                && whole(head_dim, kw)
+                && matches!(chain::form(trace, positions), Some(chain::Form::Each))
+                && chain::rotation(head_dim, head_dim, theta, &turn).is_some()
+        }
+        Operation::Elemwise(Elemwise::Rmsnorm {
+            axis: NormAxis::Head(head),
+            ..
+        }) => {
+            pieces.iter().all(|w| *w == piece && whole(head, w))
+                && chain::row_of(trace, node) == rows(piece)
+        }
+        Operation::Elemwise(
+            Elemwise::Act { .. } | Elemwise::Binary { .. } | Elemwise::Clamp { .. },
+        ) => pieces.iter().all(|w| *w == piece) && chain::row_of(trace, node) == rows(piece),
+        _ => false,
+    }
+}
+
 /// Whether `node` extends `run`: under the matmul's guard, reading what the
 /// run computes, and an op over the epilogue's rows (or the packed
-/// product's GLU, read straight off it).
+/// product's GLU, read straight off it; or a split of it into a packed
+/// qkv row's pieces, and an op over each of its pieces' heads).
 fn joins(trace: &Trace, run: &[u32], node: u32, product: &Product) -> bool {
     let first = &trace.nodes[run[0] as usize];
     if trace.nodes[node as usize].guard != first.guard || !chain::reads_from(trace, run, node) {
@@ -248,6 +441,14 @@ fn joins(trace: &Trace, run: &[u32], node: u32, product: &Product) -> bool {
     }
     if run.len() == 1 && glu_of(trace, node, product).is_some() {
         return true;
+    }
+    if run.len() == 1 && split_of(trace, node, product, &BTreeMap::new()).is_some() {
+        return true;
+    }
+    let windows = windows_of(trace, run, product);
+    if !windows.is_empty() {
+        return split_of(trace, node, product, &windows).is_some()
+            || over_pieces(trace, node, &windows);
     }
     let (width, _) = layout_of(trace, run, product);
     let rows = chain::Rows {
@@ -272,14 +473,30 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
     let (width, layout) = layout_of(trace, run, product);
     let parts = layout.parts();
     let epilogue = &run[1..];
+    // A split's pieces: each value over one computed over the whole tile,
+    // landing its piece.
+    let windows = windows_of(trace, run, product);
 
     // The inputs: what the epilogue reads and does not compute, in
-    // first-read order, each a value of the product tile's.
+    // first-read order, each a value of the product tile's (or, read by an
+    // op over a piece, one every row or every head reads alike).
     let mut computed: Vec<ValueId> = vec![product.y];
     let mut ins: Vec<(ValueId, Input)> = Vec::new();
     let mut ids = Vec::new();
     for &node in epilogue {
         let op = &trace.nodes[node as usize].op;
+        let mut read_ids = Vec::new();
+        op.inputs(&mut read_ids);
+        let pieced = read_ids.iter().any(|v| windows.contains_key(v));
+        // A head's norm weight, one head wide, every head reading it.
+        let head = match *op {
+            Operation::Elemwise(Elemwise::Rmsnorm {
+                axis: NormAxis::Head(head),
+                weight: NormWeight::Scale(w) | NormWeight::PlusOne(w),
+                ..
+            }) => Some((w, head)),
+            _ => None,
+        };
         for read in chain::reads_of(op, width) {
             let v = read.value;
             if computed.contains(&v) || ins.iter().any(|(held, _)| *held == v) {
@@ -289,10 +506,18 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
                 return None;
             }
             let input = match chain::form(trace, v)? {
-                Form::Rows { dim, width: w } if dim == product.dim && w == u64::from(width) => {
+                Form::Shared { width: w }
+                    if head.is_some_and(|(weight, size)| weight == v && u64::from(size) == w)
+                        && w < u64::from(width) =>
+                {
+                    Input::Head(u32::try_from(w).ok()?)
+                }
+                Form::Rows { dim, width: w }
+                    if !pieced && dim == product.dim && w == u64::from(width) =>
+                {
                     Input::Tile
                 }
-                Form::Shared { width: w } if w == u64::from(width) => Input::Column,
+                Form::Shared { width: w } if !pieced && w == u64::from(width) => Input::Column,
                 Form::One => Input::One,
                 Form::Each => Input::Row,
                 _ => return None,
@@ -316,7 +541,52 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
         b.of.insert(*v, k);
     }
     for &node in epilogue {
-        b.node(trace, &trace.nodes[node as usize].op)?;
+        let op = &trace.nodes[node as usize].op;
+        match *op {
+            // Each piece is what it is cut from, over the whole tile.
+            Operation::Gather(Gather::SplitQkv {
+                packed, q, k, v, ..
+            }) => {
+                let whole = b.get(packed)?;
+                for piece in [q, k, v] {
+                    b.of.insert(piece, whole);
+                }
+            }
+            Operation::Gather(Gather::SplitRows { x, left, right, .. }) => {
+                let whole = b.get(x)?;
+                for piece in [left, right] {
+                    b.of.insert(piece, whole);
+                }
+            }
+            // q's and k's heads turned as one row: each column its own
+            // piece's value, one rotation over both.
+            Operation::Elemwise(Elemwise::Rope {
+                q,
+                k: Some(k),
+                positions,
+                head_dim,
+                theta,
+                ref turn,
+                freqs: None,
+                q_out,
+                k_out: Some(k_out),
+            }) => {
+                let turn = chain::rotation(width, head_dim, theta, turn)?;
+                let (xq, xk) = (b.get(q)?, b.get(k)?);
+                let x = if xq == xk {
+                    xq
+                } else {
+                    let col = b.b.push(Op::Column);
+                    let edge = b.b.u32(windows.get(&k)?.from);
+                    let in_q = b.b.push(Op::Binary(Binary::Lt, col, edge));
+                    b.b.push(Op::Select(in_q, xq, xk))
+                };
+                let turned = b.b.rotate(x, b.get(positions)?, &turn);
+                b.of.insert(q_out, turned);
+                b.of.insert(k_out, turned);
+            }
+            _ => b.node(trace, op)?,
+        }
     }
 
     let outs: Vec<ValueId> = computed[1..]
@@ -375,7 +645,16 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
     if !chain::lands_apart_of(trace, run, &reads, &lands) {
         return None;
     }
+    // Each result's piece: a split's, or (beside one) the whole tile.
+    let cut = if windows.is_empty() {
+        Vec::new()
+    } else {
+        outs.iter()
+            .map(|v| windows.get(v).copied().unwrap_or(Window { from: 0, width }))
+            .collect()
+    };
     let anchored = Anchored {
+        windows: cut,
         contraction: Contraction {
             n: width,
             k: product.k,

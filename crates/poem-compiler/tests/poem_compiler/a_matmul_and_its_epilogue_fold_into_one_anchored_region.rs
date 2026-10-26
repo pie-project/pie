@@ -169,3 +169,115 @@ fn a_fold_lands_one_op_where_the_backend_serves_it() {
     assert!(none.is_empty());
     assert_eq!(kept.nodes.len(), t.nodes.len());
 }
+
+/// A packed qkv product's attention prologue as Qwen3 states it: the split
+/// into q, k and v, q's and k's heads normed by their own weights and turned
+/// at the rows' positions. One anchor of each head's span: the split's
+/// pieces the results' windows, each head's weight a head's vector, the
+/// position one a row; the cache write after it reads the pieces it lands.
+#[test]
+fn a_packed_qkvs_split_norms_and_turn_are_one_epilogue_of_windows() {
+    use kernels_ir::Window;
+    use poem::ops::gather;
+    use poem_ir::Turn;
+    const D: u32 = 16;
+    let (qw, kvw) = (2 * D, D);
+    let t = trace(|p| {
+        let packed = linear::matmul(
+            &p.rows("x", K),
+            &p.weight("qkv", [u64::from(qw + 2 * kvw), K]),
+        );
+        let (q, k, v) = gather::split_qkv(&packed, qw, kvw);
+        let q = elemwise::rmsnorm_per_head(&q, &p.weight("q_norm", [u64::from(D)]), D, 1e-6);
+        let k = elemwise::rmsnorm_per_head(&k, &p.weight("k_norm", [u64::from(D)]), D, 1e-6);
+        let positions = p.indices("positions");
+        let (q, k) = elemwise::rope(
+            &q,
+            &positions,
+            D,
+            1e6,
+            Turn::Full { interleaved: false },
+            Some(&k),
+            None,
+        );
+        let k = k.expect("k turned");
+        let cache = p.cache("cache");
+        let (page, offset) = (p.rows("write_page", 1), p.rows("write_offset", 1));
+        attn::kv_append(&k, Some(&v), cache, &page, &offset);
+        p.export("q", &q);
+    });
+    let formed = anchors(&t, &all);
+    let anchor = the_one(&formed);
+    assert_eq!(anchor.nodes, [0, 1, 2, 3, 4], "the cache write stays apart");
+    let epi = anchor.anchored.epilogue.as_ref().expect("an epilogue");
+    assert_eq!(
+        epi.inputs,
+        [Input::Head(D), Input::Head(D), Input::Row],
+        "each head's weight, then the rows' positions"
+    );
+    let n = qw + 2 * kvw;
+    assert_eq!(epi.span(n), D, "a head's norm and turn: one head's span");
+    // v, then the turned q and k: each its own piece of the tile.
+    assert_eq!(
+        anchor.anchored.windows,
+        [
+            Window {
+                from: qw + kvw,
+                width: kvw
+            },
+            Window { from: 0, width: qw },
+            Window {
+                from: qw,
+                width: kvw
+            },
+        ]
+    );
+    let [m, k] = [3usize, K as usize];
+    let (a, w) = (values(m * k, 6), values(n as usize * k, 7));
+    let given = [
+        Given::Column(values(D as usize, 8)),
+        Given::Column(values(D as usize, 9)),
+        Given::Row(vec![0.0, 3.0, 17.0]),
+    ];
+    let got = eval(&anchor.anchored, m, &a, &w, &[], &given).expect("runs");
+    let y = product(&a, &w, [m, n as usize, k]);
+    let v: Vec<f32> = (0..m)
+        .flat_map(|r| y[r * n as usize + (qw + kvw) as usize..(r + 1) * n as usize].to_vec())
+        .collect();
+    assert_eq!(got[0], v, "v lands its products as they are summed");
+    // At position 0 nothing turns: q's heads are their norms.
+    let q0 = &got[1][..qw as usize];
+    let head = &y[..D as usize];
+    let rms = (head.iter().map(|x| f64::from(*x).powi(2)).sum::<f64>() / f64::from(D) + 1e-6)
+        .sqrt()
+        .recip();
+    let w0 = values(D as usize, 8);
+    for i in 0..D as usize {
+        let want = round_bf16(round_bf16((f64::from(head[i]) * rms) as f32) * w0[i]);
+        assert!(
+            (q0[i] - want).abs() <= want.abs() / 64.0 + 1e-3,
+            "{i}: {} vs {want}",
+            q0[i]
+        );
+    }
+}
+
+/// A norm across a piece's whole row (not its heads) reads past one head's
+/// span: the anchor stops at the split before it.
+#[test]
+fn a_rows_norm_over_a_piece_is_no_ones_span() {
+    use poem::ops::gather;
+    const D: u32 = 16;
+    let t = trace(|p| {
+        let packed = linear::matmul(&p.rows("x", K), &p.weight("qkv", [u64::from(4 * D), K]));
+        let (q, k, v) = gather::split_qkv(&packed, 2 * D, D);
+        let q = elemwise::rmsnorm(&q, &p.weight("q_norm", [u64::from(2 * D)]), 1e-6);
+        p.export("q", &q);
+        p.export("k", &k);
+        p.export("v", &v);
+    });
+    let formed = anchors(&t, &all);
+    let anchor = the_one(&formed);
+    assert_eq!(anchor.nodes, [0, 1], "the split alone");
+    assert_eq!(anchor.anchored.windows.len(), 3);
+}

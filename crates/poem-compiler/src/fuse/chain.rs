@@ -709,11 +709,28 @@ fn lowers(op: &Operation) -> bool {
 
 /// The rotation `turn` states of `head_dim`-wide heads of a row of `width`
 /// at `theta`, as kernels-ir's builder turns it; `None` for a turn it does not.
-fn rotation(width: u32, head_dim: u32, theta: f32, turn: &Turn) -> Option<build::Turn> {
+pub(super) fn rotation(width: u32, head_dim: u32, theta: f32, turn: &Turn) -> Option<build::Turn> {
     if head_dim == 0 || width % head_dim != 0 {
         return None;
     }
     let (pairs, inverse, ramp) = match *turn {
+        // every pair: the halves `i`, `i + head_dim / 2` at `theta^(-i /
+        // (head_dim / 2))`, or `2i`, `2i + 1` at `theta^(-2i / head_dim)`
+        Turn::Full { interleaved } if head_dim % 2 == 0 => (
+            if interleaved {
+                build::Pairs::Tail {
+                    rotary: head_dim,
+                    interleaved: true,
+                }
+            } else {
+                build::Pairs::Halves {
+                    rotary: head_dim,
+                    span: head_dim / 2,
+                }
+            },
+            false,
+            None,
+        ),
         Turn::Partial { rotary_dim, span } => {
             if rotary_dim % 2 != 0 || span < rotary_dim / 2 || span + rotary_dim / 2 > head_dim {
                 return None;
