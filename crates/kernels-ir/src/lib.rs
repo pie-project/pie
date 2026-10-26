@@ -35,16 +35,13 @@ pub mod schedule;
 pub mod skeleton;
 
 pub use anchor::{
-    Anchored, CacheDtype, CachePlane, Contraction, Gain, Input, Layout, Paged, Pointwise, Quant,
-    RowNorm, Space, Window,
+    Anchored, CacheDtype, CachePlane, Contraction, Gain, Input, Layout, Paged, Pointwise, Quant, RowNorm,
+    Space, Window,
 };
 pub use kernel::{
     Expr, HeadAssign, Kernel, Loop, Operand, Partial, Phase, RowAssign, Table, Total, Uniform,
 };
-pub use region::{
-    Binary, Elem, Literal, MAX_REPEAT, MAX_VECTOR, Op, Reduce, Region, RegionError, Shape, Unary,
-    ValueId,
-};
+pub use region::{Binary, Elem, Literal, Op, Reduce, Region, RegionError, Shape, Unary, ValueId};
 pub use schedule::{Unscheduled, schedule};
 
 /// FNV-1a over `bytes`: the hash a region's key and a printed body's unit

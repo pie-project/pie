@@ -103,37 +103,8 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
         ]
     });
 
-/// The hand row rules CUDA's chains replace: each site one formed folds
-/// into a generated row kernel (`fuse::chain`) that lands its ops' bits
-/// and, at the default knobs, outruns the rule's hand kernel. A head's norm
-/// and the turn of its tail (`norm_rope`'s `Last`: dots3's k row,
-/// DeepSeek-V4's q), and of its first dims (`First`: Gemma 4's split turn,
-/// a 512-wide head's quarter turned pair-packed, its turned vectors on
-/// whole warps where its rows are packed). A scaled
-/// embedding's chain (`embed_scale_add`, Gemma 4's per-layer rows picked
-/// from their stack with `embed_scale_add_select`) and a DiT block's norm
-/// and modulation (`norm_modulate`, after the gated residual
-/// `gated_residual_norm_modulate`): each a generated kernel that ties the
-/// hand one at a decode's rows and outruns it from 512. And the hand
-/// product rules CUDA's anchored regions replace (`fuse::anchor`): a
-/// product's bias, its soft cap and a packed bank's GEGLU and SwiGLU, each
-/// the epilogue of its contraction skeleton, timed against the product and
-/// the epilogue on the row skeleton. And the KV writes an epilogue now pages
-/// into the cache (kernels-ir's `Paged`): the qkv write's split, norms and
-/// turn with k and v landed at their pages and slots (an anchored region's,
-/// or over a product landed apart, a quantized bank's or Muse Spark's
-/// `qkv | gate` half, a `fused.epilogue`), and DeepSeek-V4's k row normed,
-/// turned and written. (`split_qkv_fused` is gone too, and is not listed:
-/// without it `matmul_split_rows` takes its split first, so it finds no
-/// site to hold to this; its sites are that product's `fused.epilogue`.) What stays: MiMo's padded qkv write (its cache's
-/// heads padded past their widths, no window's), the fp8 rows of DeepSeek's
-/// cache (`norm_rope_last_append_rows`, `norm_rope_pair`: its blocks'
-/// scales and bf16 tail no paged store's element) and the pooled writes.
-/// YaRN's turn of every pair (`rope_yarn_append`, `split_rope_yarn_append`:
-/// the builder's tail pairs ramped, cos and sin times the attention factor)
-/// and Qwen 3.5's gated q (`q_gate_norm_rope_append`: q and its gate
-/// interleaved a head, each a head-major window of the product) are an
-/// epilogue's too.
+/// The hand rules CUDA no longer holds: every site one forms folds into a
+/// generated row kernel or an anchored region instead.
 #[cfg(not(feature = "rocm"))]
 #[must_use]
 pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
@@ -156,11 +127,11 @@ pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
     ]
 }
 
-/// The fused kernels left on with `fuse-chains=off`.
+/// The fused kernels left on with `fuse-chains=off`: none on CUDA.
 #[cfg(not(feature = "rocm"))]
-pub const UNCHAINED: [&str; 1] = ["fused.qkv_fused_qknorm_rope_vnorm_write"];
+pub const UNCHAINED: &[&str] = &[];
 #[cfg(feature = "rocm")]
-pub const UNCHAINED: [&str; 1] = ["fused.residual_add_rmsnorm"];
+pub const UNCHAINED: &[&str] = &["fused.residual_add_rmsnorm"];
 
 /// What `op` reads of a seat's rows: the seat table's entry for its name,
 /// but a gated unit of routed rows (each times its route's weight) reads
@@ -227,6 +198,20 @@ pub use window::{Cursor, Window, WindowShape, Windows};
 mod tests {
     use poem_ir::Operation;
 
+    /// What `fuse-chains=off` keeps is a rule this backend holds.
+    #[test]
+    fn what_fuse_chains_off_keeps_is_a_rule_held() {
+        let held: Vec<&str> = super::FUSIONS
+            .iter()
+            .map(poem_compiler::fuse::Rule::kernel)
+            .collect();
+        let stray: Vec<&&str> = super::UNCHAINED
+            .iter()
+            .filter(|k| !held.contains(k))
+            .collect();
+        assert!(stray.is_empty(), "kept, and no rule: {stray:?}");
+    }
+
     /// Every table this backend keys by op name names an op: an entry under
     /// a name no op carries is never read, and the op it meant falls to the
     /// table's default without a word.
@@ -236,7 +221,7 @@ mod tests {
             .iter()
             .map(|entry| entry.name)
             .chain(super::FUSIONS.iter().map(poem_compiler::fuse::Rule::kernel))
-            .chain(super::UNCHAINED)
+            .chain(super::UNCHAINED.iter().copied())
             .chain(super::GROUPED)
             .chain(super::PLANNED)
             .chain(super::EXCLUSIVE)
@@ -324,7 +309,7 @@ mod tests {
                 let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
                 let (here, _) = formed(fused.clone());
                 let (anchored, _) = crate::synth::fold_anchors(fused, Some(&|_| true));
-                let (folded, _) = poem_compiler::fuse::chain::fold(anchored);
+                let (folded, _) = poem_compiler::fuse::chain::fold(anchored, &crate::synth::serves_region);
                 let (left, thin) = formed(folded);
                 let held = census.entry(kernel).or_default();
                 held.0 += here;
@@ -392,7 +377,7 @@ mod tests {
             };
             let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
             let (anchored, _) = crate::synth::fold_anchors(fused, Some(&|_| true));
-            let (folded, _) = poem_compiler::fuse::chain::fold(anchored);
+            let (folded, _) = poem_compiler::fuse::chain::fold(anchored, &crate::synth::serves_region);
             let regions: Vec<(Vec<poem_ir::ValueId>, Vec<poem_ir::ValueId>)> = folded
                 .nodes
                 .iter()

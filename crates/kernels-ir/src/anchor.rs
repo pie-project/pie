@@ -101,11 +101,14 @@ pub struct Contraction {
     pub k: u32,
     pub layout: Layout,
     pub quant: Quant,
-    /// The dtype each product rounds to before an epilogue reads it, where
-    /// an op between them rounds it (a cast the program states), or `None`:
-    /// the epilogue reads the f32 accumulator, as a matmul and its bias are
-    /// one sum, and only the epilogue's own values round. The plain store
-    /// rounds the product to the dtype it lands.
+    /// The dtype each product rounds to before an epilogue reads it, as the
+    /// program lands a linear's output (bf16), or `None`: the epilogue reads
+    /// the f32 accumulator, where it only adds a bias to it (a linear's bias
+    /// sits inside its sum, as addmm's does), and only the epilogue's own
+    /// values round. The plain store rounds the product to the dtype it
+    /// lands. Under a folded norm ([`Anchored::normed`]) the row's scale is
+    /// the rewrite's own: the sum keeps its accumulator through it and the
+    /// scaled product rounds where the product did.
     pub acc: Option<Dtype>,
 }
 
@@ -507,11 +510,6 @@ impl Pointwise {
                 // epilogue's where the row is one span (a row one head
                 // wide, [`MAX_SPAN`] at most).
                 Op::Reduce(..) => space == Space::Product && inner <= MAX_SPAN,
-                // A row's small vectors and its repeats are the row skeleton's
-                // per-row work, no tile's.
-                Op::Pick(..) | Op::Insert(..) | Op::Splat(..) | Op::Carry(_) | Op::Repeat(..) => {
-                    false
-                }
             };
             if !pointwise {
                 return Err(AnchorError::Across { space, op: at });
@@ -588,6 +586,100 @@ impl Pointwise {
                     .find(|(_, columns)| columns.iter().any(|&mate| mate >= n))
                     .map_or(first, |(op, _)| *op);
                 AnchorError::Span { space, op }
+            })
+    }
+
+    /// Whether, over a tile `n` wide, every `w` columns from a multiple of
+    /// `w` compute what the first `w` do: each value of the column alone
+    /// that the ops over the parameters read repeats every `w` columns (a
+    /// head's position in its head, its pair's frequency), and each
+    /// gathered mate sits as far from its column in every slice. A slice of
+    /// such a tile is then any slice's region, each a part of one launch's
+    /// rows.
+    #[must_use]
+    pub fn repeats(&self, n: u32, w: u32) -> bool {
+        let region = &self.region;
+        if w == 0 || !n.is_multiple_of(w) {
+            return false;
+        }
+        if w == n {
+            return true;
+        }
+        let params = region.params.len() as u32;
+        // whether each value is a function of the column alone
+        let mut alone = vec![false; params as usize + region.ops.len()];
+        for (at, op) in region.ops.iter().enumerate() {
+            alone[params as usize + at] = match op {
+                Op::Peer(..) | Op::Reduce(..) | Op::ReduceHeads(..) => false,
+                op => op.args().iter().all(|&a| a >= params && alone[a as usize]),
+            };
+        }
+        // what the ops over the parameters read of the column alone, and
+        // each gather's mate
+        let mut read: Vec<ValueId> = Vec::new();
+        let mut mates: Vec<ValueId> = Vec::new();
+        for (at, op) in region.ops.iter().enumerate() {
+            if alone[params as usize + at] {
+                continue;
+            }
+            // a gather's mate is its column's: as far from it in each slice
+            let mate = match *op {
+                Op::Peer(_, mate) => {
+                    mates.push(mate);
+                    Some(mate)
+                }
+                _ => None,
+            };
+            for a in op.args() {
+                if Some(a) != mate && a >= params && alone[a as usize] && !read.contains(&a) {
+                    read.push(a);
+                }
+            }
+        }
+        for &r in &region.results {
+            if r >= params && alone[r as usize] && !read.contains(&r) {
+                read.push(r);
+            }
+        }
+        let periodic = |values: &[f32], shifted: bool| {
+            let (n, w) = (n as usize, w as usize);
+            (w..n).all(|c| {
+                let (x, first) = (values[c], values[c % w]);
+                if shifted {
+                    x - c as f32 == first - (c % w) as f32
+                } else {
+                    x.to_bits() == first.to_bits()
+                }
+            })
+        };
+        let probe = |v: ValueId| -> Option<Vec<f32>> {
+            let mut ops: Vec<Op> = region.ops[..(v - params + 1) as usize].to_vec();
+            ops.push(Op::Cast(v, crate::region::Elem::F32));
+            let probe = Region {
+                width: n,
+                params: region.params.clone(),
+                ops,
+                results: vec![params + (v - params + 1)],
+                rounds: Vec::new(),
+            };
+            let args: Vec<Arg> = region
+                .params
+                .iter()
+                .map(|shape| match shape {
+                    Shape::Scalar => Arg::Scalar(0.0),
+                    _ => Arg::Row(vec![0.0; n as usize]),
+                })
+                .collect();
+            interp::eval(&probe, &args)
+                .ok()
+                .map(|mut l| l.swap_remove(0))
+        };
+        read.iter()
+            .all(|&v| probe(v).is_some_and(|values| periodic(&values, false)))
+            && mates.iter().all(|&m| {
+                self.columns(m, n).is_some_and(|c| {
+                    periodic(&c.iter().map(|x| *x as f32).collect::<Vec<_>>(), true)
+                })
             })
     }
 
@@ -741,8 +833,10 @@ impl Anchored {
     /// one over the rows as they are stored ([`RowNorm`]): each part's
     /// product scaled by the row's norm scale (an [`Input::Norm`] appended
     /// to the epilogue's inputs) before the epilogue reads it, the gain
-    /// folded into the bank. `None` where it has no epilogue (a plain
-    /// store's products would land unnormed), a prologue, or a norm already.
+    /// folded into the bank; a product that rounded before the epilogue
+    /// rounds once scaled (the sum keeps its accumulator through the
+    /// rewrite's scale). `None` where it has no epilogue (a plain store's
+    /// products would land unnormed), a prologue, or a norm already.
     #[must_use]
     pub fn normed(&self, norm: RowNorm) -> Option<Anchored> {
         if self.norm.is_some() || self.prologue.is_some() {
@@ -780,25 +874,32 @@ impl Anchored {
                 Op::ReduceHeads(r, a, size) => Op::ReduceHeads(r, at(a), size),
                 Op::Fma(x, y, z) => Op::Fma(at(x), at(y), at(z)),
                 Op::Peer(src, c) => Op::Peer(at(src), at(c)),
-                Op::Pick(v, i) => Op::Pick(at(v), i),
-                Op::Insert(v, i, x) => Op::Insert(at(v), i, at(x)),
-                Op::Splat(x, n) => Op::Splat(at(x), n),
-                Op::Carry(a) => Op::Carry(at(a)),
-                Op::Repeat(count, carry, next) => Op::Repeat(count, at(carry), at(next)),
             });
         }
         let mut shapes = region.params.clone();
         shapes.push(Shape::Scalar);
         let mut inputs = epi.inputs.clone();
         inputs.push(Input::Norm);
+        // The scale is the rewrite's: the sum keeps its accumulator through
+        // it, and each scaled product rounds where the product did (the
+        // program's linear over the normed rows lands it so).
+        let mut rounds: Vec<(ValueId, Dtype)> =
+            region.rounds.iter().map(|&(v, d)| (at(v), d)).collect();
+        if let Some(dtype) = self.contraction.acc {
+            rounds.extend((0..parts).map(|p| (params + 1 + p, dtype)));
+        }
         Some(Anchored {
+            contraction: Contraction {
+                acc: None,
+                ..self.contraction
+            },
             epilogue: Some(Pointwise {
                 region: Region {
                     width: region.width,
                     params: shapes,
                     ops,
                     results: region.results.iter().map(|&r| at(r)).collect(),
-                    rounds: region.rounds.iter().map(|&(v, d)| (at(v), d)).collect(),
+                    rounds,
                 },
                 inputs,
             }),
@@ -1883,6 +1984,56 @@ mod tests {
 
     /// A turn at frequencies stated outright (Llama 3's scaled rope): each
     /// pair's from the table, its cos and sin times the table's scale; and
+    /// A turn of 64-wide heads computes in every head what it computes in
+    /// the first: its slices of whole heads repeat, a half head's do not.
+    #[test]
+    fn a_heads_turn_repeats_every_head_and_no_narrower() {
+        use crate::build::{Ops, Pairs, Turn};
+        let mut b = Ops::new(2);
+        let turn = Turn {
+            head_dim: 64,
+            pairs: Pairs::Halves {
+                rotary: 64,
+                span: 32,
+            },
+            theta: 10000.0,
+            inverse: false,
+            ramp: None,
+            mscale: None,
+        };
+        let turned = b.rotate(0, 1, &turn);
+        let turned = Pointwise {
+            region: Region {
+                width: 256,
+                params: vec![Shape::Row, Shape::Scalar],
+                ops: b.ops,
+                results: vec![turned],
+                rounds: vec![],
+            },
+            inputs: vec![Input::Row],
+        };
+        assert!(turned.repeats(256, 64));
+        assert!(turned.repeats(256, 128));
+        assert!(!turned.repeats(256, 32));
+        // a column read as it is never repeats
+        let column = Pointwise {
+            region: Region {
+                width: 256,
+                params: vec![Shape::Row],
+                ops: vec![
+                    Op::Column,
+                    Op::Cast(1, crate::region::Elem::F32),
+                    Op::Binary(Binary::Add, 0, 2),
+                ],
+                results: vec![3],
+                rounds: vec![],
+            },
+            inputs: vec![],
+        };
+        assert!(!column.repeats(256, 64));
+        assert!(column.repeats(256, 256));
+    }
+
     /// YaRN's every pair at its ramped frequency, times its attention factor.
     #[test]
     fn a_turn_reads_its_tables_frequencies_and_scale() {

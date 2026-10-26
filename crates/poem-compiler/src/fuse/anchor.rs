@@ -26,11 +26,12 @@
 //! vector a column ([`Input::Column`], a bias), a head's vector every head
 //! reads ([`Input::Head`], a head's norm weight), one element a row
 //! ([`Input::Row`], a position) or one value ([`Input::One`]). The product
-//! is no value (nothing past the run reads it, or the run is no anchor) and
-//! keeps its accumulator, f32, through the epilogue: a matmul's product and
-//! the bias or activation over it are one computation, as `nn.Linear` and
-//! every reference keep them, the bf16 the trace states of the product a
-//! store the fusion leaves out. Each value the epilogue's ops compute rounds to
+//! is no value (nothing past the run reads it, or the run is no anchor). A
+//! linear's output is bf16 and only its bias sits inside the sum, as
+//! `nn.Linear` (addmm) and every reference keep them: the product keeps its
+//! accumulator, f32, where every op reading it adds a bias to it, and any
+//! other epilogue reads it rounded to bf16 (`Contraction::acc`), as the
+//! program lands it. Each value the epilogue's ops compute rounds to
 //! its dtype where it is defined, as a chain's do; one anything past the
 //! run may read is a result.
 //!
@@ -985,6 +986,23 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
         results,
         rounds,
     };
+    // A linear's output is bf16 and only its bias sits inside the sum: the
+    // product keeps its accumulator where every op reading it adds a bias (a
+    // vector a column) to it, and any other reads it rounded, as the
+    // program lands it.
+    let column = |v: u32| {
+        v >= parts
+            && ins
+                .get((v - parts) as usize)
+                .is_some_and(|(_, input)| *input == Input::Column)
+    };
+    let biased = region.results.iter().all(|&r| r >= parts)
+        && region.ops.iter().all(|op| match *op {
+            Op::Binary(Binary::Add, x, y) if x < parts || y < parts => {
+                (x < parts && column(y)) || (y < parts && column(x))
+            }
+            ref op => op.args().iter().all(|&a| a >= parts),
+        });
     // The op lands each result on a plane apart from every one it reads.
     let held = |v: ValueId| In {
         value: v,
@@ -1036,10 +1054,9 @@ fn lower(trace: &Trace, run: &[u32], product: &Product, escapes: &Escapes) -> Op
             k: product.k,
             layout,
             quant: Quant::Plain(Dtype::Bf16),
-            // The product keeps its accumulator through the epilogue, as a
-            // matmul and its bias are one sum: no op between them rounds it;
-            // one landed apart is read as its op stored it.
-            acc: product.landed.then_some(Dtype::Bf16),
+            // The product keeps its accumulator through a bias alone; one
+            // landed apart is read as its op stored it.
+            acc: (product.landed || !biased).then_some(Dtype::Bf16),
         },
         prologue: None,
         epilogue: Some(Pointwise {

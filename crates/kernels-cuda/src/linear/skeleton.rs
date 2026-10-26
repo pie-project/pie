@@ -31,6 +31,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use crate::elemwise::skeleton::{Cache, Store};
 use dtype::Dtype;
 pub use kernels_ir::anchor::{
     Anchored, CacheDtype, CachePlane, Contraction, Gain, Input, Layout, Paged, Pointwise, Quant,
@@ -677,30 +678,20 @@ impl Epilogue {
         words.extend(outs);
         let windows: Vec<Window> = (0..outs.len()).map(|k| self.window(k, n)).collect();
         words.extend(windows.iter().map(|w| u64::from(w.width)));
-        words.extend(windows.iter().map(|w| u64::from(w.from)));
-        words.extend(windows.iter().map(|w| u64::from(w.end())));
-        words.extend(windows.iter().map(|w| u64::from(w.head)));
-        words.extend(windows.iter().map(|w| u64::from(w.stride)));
         words.push(u64::from(self.norm.map_or(0, |norm| norm.eps.to_bits())));
-        // Each result's paging: its page and slot inputs, its cache's element.
-        let paged: Vec<Option<Paged>> = (0..outs.len()).map(|k| self.paged(k)).collect();
-        let index = |at: u32| u64::from(at);
-        words.extend(paged.iter().map(|p| p.map_or(u64::MAX, |p| index(p.page))));
-        words.extend(paged.iter().map(|p| p.map_or(u64::MAX, |p| index(p.slot))));
-        words.extend(
-            paged
-                .iter()
-                .map(|p| u64::from(matches!(p, Some(Paged { dtype: CacheDtype::E4m3 { .. }, .. })))),
-        );
-        words.extend(paged.iter().map(|p| match p {
-            Some(Paged {
-                dtype: CacheDtype::E4m3 { scale },
-                ..
-            }) => u64::from(scale.to_bits()),
-            _ => u64::from(1f32.to_bits()),
-        }));
-        words.push(paging.map_or(0, |p| p.valid));
-        words.push(u64::from(paging.map_or(0, |p| p.page_size)));
+        // Each result's store: its window, and a paged one's cache row.
+        for (k, w) in windows.iter().enumerate() {
+            let cache = self.paged(k).zip(paging).map(|(p, paging)| Cache {
+                base: 0,
+                width: 0,
+                page: ins[p.page as usize].base,
+                slot: ins[p.slot as usize].base,
+                valid: paging.valid,
+                page_size: paging.page_size,
+                e4m3: if let CacheDtype::E4m3 { scale } = p.dtype { Some(scale) } else { None },
+            });
+            words.extend(Store::of(*w, cache.as_ref()).words());
+        }
         Ok(words)
     }
 
@@ -795,8 +786,28 @@ impl Epilogue {
             n.is_multiple_of(*c) && (n / c).is_multiple_of(8) && (n / c).is_multiple_of(strides)
         })?;
         let width = n / slices;
-        let mut shaped = Vec::with_capacity(slices as usize);
-        for piece in 0..slices {
+        // Every slice the first's, one launch of `slices` rows a row: the
+        // region repeating every slice, each result the whole tile, no
+        // input a column's own (a slice's columns past the first) and no
+        // result paged.
+        let uniform = slices > 1
+            && (Pointwise {
+                region: self.region.clone(),
+                inputs: self.inputs.clone(),
+            })
+            .repeats(n, width)
+            && (0..self.results).all(|k| {
+                let w = self.window(k, n);
+                w.whole() && w.from == 0 && w.width == n && self.paged(k).is_none()
+            })
+            && self.inputs.iter().all(|input| match input {
+                Input::Column => false,
+                Input::Head(head) => width.is_multiple_of(*head),
+                _ => true,
+            });
+        let slices_of = if uniform { 1 } else { slices };
+        let mut shaped = Vec::with_capacity(slices_of as usize);
+        for piece in 0..slices_of {
             let from = piece * width;
             let outs: Vec<Land> = (0..self.results)
                 .filter_map(|k| {
@@ -821,7 +832,8 @@ impl Epilogue {
                         });
                     }
                     let (lo, hi) = (w.from.max(from), (w.from + w.width).min(from + width));
-                    (lo < hi).then_some(Land {
+                    // (built only where the piece holds some of the window)
+                    (lo < hi).then(|| Land {
                         k,
                         from: lo - from,
                         to: hi - from,
@@ -860,6 +872,7 @@ impl Epilogue {
         Some(LegShape {
             ins,
             pieces: shaped,
+            slices: if uniform { slices } else { 1 },
         })
     }
 
@@ -936,6 +949,10 @@ fn planes_of(anchored: &Anchored) -> usize {
 struct LegShape {
     ins: Vec<crate::synth::In>,
     pieces: Vec<PieceShape>,
+    /// The slices one launch's rows cut each row into, where every slice
+    /// computes what the first does (its one piece): 1 where each piece is
+    /// its own launch.
+    slices: u32,
 }
 
 /// One piece of a leg: the region over the tile's columns `from..from +
@@ -1010,13 +1027,6 @@ fn shifted(region: &Region, from: u32, width: u32, results: Vec<u32>) -> Region 
             Op::Reduce(r, a) => push(&mut ops, Op::Reduce(r, m(a))),
             Op::ReduceHeads(r, a, size) => push(&mut ops, Op::ReduceHeads(r, m(a), size)),
             Op::Fma(x, y, z) => push(&mut ops, Op::Fma(m(x), m(y), m(z))),
-            // a row's small vectors and repeats, which no anchored region
-            // holds (`kernels_ir::anchor` refuses them), as they are
-            Op::Pick(v, i) => push(&mut ops, Op::Pick(m(v), i)),
-            Op::Insert(v, i, x) => push(&mut ops, Op::Insert(m(v), i, m(x))),
-            Op::Splat(x, n) => push(&mut ops, Op::Splat(m(x), n)),
-            Op::Carry(a) => push(&mut ops, Op::Carry(m(a))),
-            Op::Repeat(count, carry, next) => push(&mut ops, Op::Repeat(count, m(carry), m(next))),
         };
         of.push(id);
     }
@@ -1227,6 +1237,9 @@ impl Skeleton {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct RowLeg {
     pieces: &'static [Piece],
+    /// The slices its one piece's launch cuts each row into (1: each piece
+    /// its own launch).
+    slices: u32,
     parts: u32,
     /// The products' dtype: bf16, or f32 where the epilogue reads them as
     /// they are summed.
@@ -1280,6 +1293,7 @@ impl RowLeg {
                 }
                 Some(RowLeg {
                     pieces: Box::leak(pieces.into_boxed_slice()),
+                    slices: shape.slices,
                     parts: epi.parts,
                     product: if epi.round { Dtype::Bf16 } else { Dtype::F32 },
                 })
@@ -1391,7 +1405,9 @@ impl RowLeg {
                     }
                 });
             }
-            fired = piece.kernel.fire(ctx, &planes, &results, m);
+            fired = piece
+                .kernel
+                .fire_parts(ctx, &planes, &results, m, self.slices);
             if fired.is_err() {
                 break;
             }
@@ -1501,11 +1517,11 @@ mod tests {
         assert!(bias.planes(&[], &[128], 8, None).is_err());
         let words = bias.planes(&[In::column(64)], &[128], 8, None).expect("a bias");
         // One input (its base, strides, dtype and period), one unread, one
-        // result, its row's stride, its window's columns, head and stride,
-        // the norm's eps (none), then its paging (none).
+        // result, its row's stride, the norm's eps (none), then its store:
+        // no cache row, its window's columns 0..8, a unit scale.
         assert_eq!(words, vec![
-                64, 0, 1, 0, 0, 0, 0, 0, 0, 0, 128, 8, 0, 8, 0, 0, 0,
-                u64::MAX, u64::MAX, 0, 0x3f80_0000, 0, 0
+                64, 0, 1, 0, 0, 0, 0, 0, 0, 0, 128, 8, 0,
+                0, 0, 0, 8 << 32, 0, 0x3f80_0000, 0
             ]);
         // A row's norm scale is no plane: its input carries none.
         assert_eq!(In::norm().kind(), Input::Norm);
