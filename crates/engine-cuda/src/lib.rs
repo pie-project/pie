@@ -71,7 +71,6 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
             rules::norm_rope_pair(),
             rules::index_topk_rope(),
             rules::hc_prenorm_project(),
-            rules::hc_gates_norm(),
             rules::res_blend_rmsnorm(),
             rules::hc_fold_pre(),
             rules::hc_pre(),
@@ -118,7 +117,14 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
 /// product rules CUDA's anchored regions replace (`fuse::anchor`): a
 /// product's bias, its soft cap and a packed bank's GEGLU and SwiGLU, each
 /// the epilogue of its contraction skeleton, timed against the product and
-/// the epilogue on the row skeleton. And the KV writes an epilogue now pages
+/// the epilogue on the row skeleton. And a hyper-connection's combined
+/// gates and the norm of the row they pre-mix (`hc_gates_norm`,
+/// DeepSeek-V4.1's sublayer inputs): their logits, mixes and Sinkhorn walk
+/// small vectors over a warp's lanes (on a block of their own beside the
+/// row's at a decode's rows, as the hand kernel walks), tying the hand
+/// kernel at a decode's rows and outrunning it from 512, and outrunning the
+/// gates and the norm apart (the rule's form off `kernel.elemwise.hc_tile`)
+/// at every count. And the KV writes an epilogue now pages
 /// into the cache (kernels-ir's `Paged`): the qkv write's split, norms and
 /// turn with k and v landed at their pages and slots (an anchored region's,
 /// or over a product landed apart, a quantized bank's or Muse Spark's
@@ -153,6 +159,7 @@ pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
         rules::embed_scale_add(),
         rules::norm_modulate(),
         rules::gated_residual_norm_modulate(),
+        rules::hc_gates_norm(),
     ]
 }
 

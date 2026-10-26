@@ -312,46 +312,6 @@ fn gates_norm_launch(
     )
 }
 
-/// The combined gates and the RMS norm over the row they pre-mix in one
-/// launch (`hc_gates_norm`), the pre-mixed row never landed: every value the
-/// pair lands, bit for bit. `Ok(false)` where the shapes are not the
-/// kernel's (no combine, more than 32 combine entries, a width not a whole
-/// number of 256 up to 4096, a weight of another element): the caller runs
-/// the two.
-#[allow(clippy::too_many_arguments)]
-pub fn gates_norm(
-    ctx: &Ctx,
-    mixes: Tensor,
-    streams: Tensor,
-    stream_count: u32,
-    gate: Gate,
-    weight: Tensor,
-    norm_eps: f32,
-    post_mix: &mut Tensor,
-    comb_mix: &mut Tensor,
-    y: &mut Tensor,
-) -> Result<bool, Error> {
-    if !gates_norm_fits(&mixes, &streams, stream_count, &weight, y) {
-        return Ok(false);
-    }
-    gates_norm_launch(
-        ctx,
-        "fused.hc_gates_norm",
-        mixes.arg(),
-        None,
-        &streams,
-        stream_count,
-        gate,
-        &weight,
-        norm_eps,
-        None,
-        post_mix,
-        comb_mix,
-        y,
-    )?;
-    Ok(true)
-}
-
 pub fn fold(
     ctx: &Ctx,
     x: Tensor,

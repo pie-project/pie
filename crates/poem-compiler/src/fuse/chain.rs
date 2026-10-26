@@ -1229,21 +1229,35 @@ impl Builder {
         v
     }
 
-    /// An `m` x `m` matrix of scalars (row by row) with each row (`rows`)
-    /// or each column divided by its sum plus `eps`, the sum taken in
-    /// order.
-    fn normalized(&mut self, c: &mut [u32], m: u32, eps: u32, rows: bool) {
-        let at = |line: u32, k: u32| (if rows { line * m + k } else { k * m + line }) as usize;
-        for line in 0..m {
-            let mut sum = c[at(line, 0)];
-            for k in 1..m {
-                sum = self.push(Op::Binary(Binary::Add, sum, c[at(line, k)]));
-            }
-            let sum = self.push(Op::Binary(Binary::Add, sum, eps));
-            for k in 0..m {
-                c[at(line, k)] = self.push(Op::Binary(Binary::Div, c[at(line, k)], sum));
-            }
-        }
+    /// Each row's (`rows`) or column's fold by `op` of the `m` x `m` small
+    /// vector `v` (row by row), in order, plus `eps` where given, laid
+    /// beside each of its values.
+    fn lines(&mut self, v: u32, m: u32, op: Binary, eps: Option<u32>, rows: bool) -> u32 {
+        let at = |line: u32, k: u32| if rows { line * m + k } else { k * m + line };
+        let folds: Vec<u32> = (0..m)
+            .map(|line| {
+                let mut acc = self.push(Op::Pick(v, at(line, 0)));
+                for k in 1..m {
+                    let x = self.push(Op::Pick(v, at(line, k)));
+                    acc = self.push(Op::Binary(op, acc, x));
+                }
+                match eps {
+                    Some(eps) => self.push(Op::Binary(Binary::Add, acc, eps)),
+                    None => acc,
+                }
+            })
+            .collect();
+        let laid: Vec<u32> = (0..m * m)
+            .map(|t| folds[(if rows { t / m } else { t % m }) as usize])
+            .collect();
+        self.packed(&laid)
+    }
+
+    /// The `m` x `m` small vector `v` with each row (`rows`) or column
+    /// divided by its sum plus `eps`.
+    fn normalized(&mut self, v: u32, m: u32, eps: u32, rows: bool) -> u32 {
+        let sums = self.lines(v, m, Binary::Add, Some(eps), rows);
+        self.push(Op::Binary(Binary::Div, v, sums))
     }
 
     /// `1 / (1 + e^-t)`.
@@ -1508,13 +1522,15 @@ impl Builder {
                 let out = self.b.rotate(self.get(*q)?, self.get(*positions)?, &turn);
                 self.set(*q_out, out);
             }
-            // A hyper-connection's gates, as the hand kernel computes them:
-            // each pre and post gate a sigmoid of its logit (its mix scaled
-            // and biased), the pre gates plus eps; the combine a softmax of
-            // each row of its logits plus eps, its columns normalized, then
-            // `sinkhorn - 1` passes normalizing its rows and its columns
-            // (each sum plus eps) as a repeat over the small vector; and
-            // the pre-mixed row the pre-weighted sum of the streams.
+            // A hyper-connection's gates, as the hand kernel computes them,
+            // vector-wide: each logit its mix scaled (the pre, post and
+            // combine scales laid beside their mixes) and biased, every
+            // gate a sigmoid of its logit, the pre gates plus eps and the
+            // post gates times alpha; the combine a softmax of each row of
+            // its logits plus eps, its columns normalized, then `sinkhorn -
+            // 1` passes normalizing its rows and its columns (each sum plus
+            // eps, laid beside the values it divides) as a repeat; and the
+            // pre-mixed row the pre-weighted sum of the streams.
             Elemwise::HcGates {
                 normed,
                 streams,
@@ -1532,60 +1548,44 @@ impl Builder {
                 let m = *stream_count;
                 let (mix, sc, bs) = (self.get(*normed)?, self.get(*scale)?, self.get(*base)?);
                 let eps = self.konst(*gate_eps);
-                let logit = |b: &mut Self, i: u32, s: u32| {
-                    let x = b.push(Op::Pick(mix, i));
-                    let k = b.push(Op::Pick(sc, s));
-                    let scaled = b.push(Op::Binary(Binary::Mul, x, k));
-                    let bias = b.push(Op::Pick(bs, i));
-                    b.push(Op::Binary(Binary::Add, scaled, bias))
-                };
+                let s: Vec<u32> = (0..3).map(|k| self.push(Op::Pick(sc, k))).collect();
+                let per: Vec<u32> = (0..2 * m + m * m)
+                    .map(|i| s[(i / m).min(2) as usize])
+                    .collect();
+                let scales = self.packed(&per);
+                let scaled = self.push(Op::Binary(Binary::Mul, mix, scales));
+                let logits = self.push(Op::Binary(Binary::Add, scaled, bs));
+                let gates = self.sigmoid(logits);
                 let pre: Vec<u32> = (0..m)
                     .map(|i| {
-                        let l = logit(self, i, 0);
-                        let g = self.sigmoid(l);
+                        let g = self.push(Op::Pick(gates, i));
                         self.push(Op::Binary(Binary::Add, g, eps))
                     })
                     .collect();
                 let a = self.konst(*alpha);
                 let post: Vec<u32> = (0..m)
                     .map(|i| {
-                        let l = logit(self, m + i, 1);
-                        let g = self.sigmoid(l);
+                        let g = self.push(Op::Pick(gates, m + i));
                         self.push(Op::Binary(Binary::Mul, g, a))
                     })
                     .collect();
                 let post = self.packed(&post);
                 self.set(*post_mix, post);
-                let mut c: Vec<u32> = (0..m * m).map(|t| logit(self, 2 * m + t, 2)).collect();
-                for r in 0..m {
-                    let row: Vec<u32> = (0..m).map(|j| c[(r * m + j) as usize]).collect();
-                    let most = row[1..]
-                        .iter()
-                        .fold(row[0], |acc, &v| self.push(Op::Binary(Binary::Max, acc, v)));
-                    let e: Vec<u32> = row
-                        .iter()
-                        .map(|&v| {
-                            let shifted = self.push(Op::Binary(Binary::Sub, v, most));
-                            self.push(Op::Unary(Unary::Exp, shifted))
-                        })
-                        .collect();
-                    let sum = e[1..]
-                        .iter()
-                        .fold(e[0], |acc, &v| self.push(Op::Binary(Binary::Add, acc, v)));
-                    for j in 0..m {
-                        let q = self.push(Op::Binary(Binary::Div, e[j as usize], sum));
-                        c[(r * m + j) as usize] = self.push(Op::Binary(Binary::Add, q, eps));
-                    }
-                }
-                self.normalized(&mut c, m, eps, false);
-                let mut combined = self.packed(&c);
+                let c: Vec<u32> = (0..m * m)
+                    .map(|t| self.push(Op::Pick(logits, 2 * m + t)))
+                    .collect();
+                let c = self.packed(&c);
+                let most = self.lines(c, m, Binary::Max, None, true);
+                let shifted = self.push(Op::Binary(Binary::Sub, c, most));
+                let e = self.push(Op::Unary(Unary::Exp, shifted));
+                let sums = self.lines(e, m, Binary::Add, None, true);
+                let q = self.push(Op::Binary(Binary::Div, e, sums));
+                let c = self.push(Op::Binary(Binary::Add, q, eps));
+                let mut combined = self.normalized(c, m, eps, false);
                 if *sinkhorn > 1 {
                     let carry = self.push(Op::Carry(combined));
-                    let mut c: Vec<u32> =
-                        (0..m * m).map(|t| self.push(Op::Pick(carry, t))).collect();
-                    self.normalized(&mut c, m, eps, true);
-                    self.normalized(&mut c, m, eps, false);
-                    let next = self.packed(&c);
+                    let rows = self.normalized(carry, m, eps, true);
+                    let next = self.normalized(rows, m, eps, false);
                     combined = self.push(Op::Repeat(*sinkhorn - 1, carry, next));
                 }
                 self.set(*comb_mix, combined);

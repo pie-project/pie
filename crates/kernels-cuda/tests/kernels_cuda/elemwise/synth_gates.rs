@@ -1,19 +1,24 @@
 #![cfg(feature = "cuda")]
 
 //! A hyper-connection's gates and the norm of the row they pre-mix
-//! (DeepSeek-V4's sublayer input), the chain CUDA forms where the hand rule
-//! `fuse.hc_gates_norm` once did: one generated row kernel, against its
-//! math by the interpreter (`super::within`) and the hand kernels.
+//! (DeepSeek-V4.1's sublayer input), the chain CUDA forms where the hand
+//! rule `fuse.hc_gates_norm` once did: one generated row kernel, against
+//! its math by the interpreter (`super::within`) and the gates and the norm
+//! apart.
 //!
 //! The region is the one poem-compiler's `fuse::chain` lowers the two ops
-//! to: each gate a sigmoid of its mix scaled and biased (small vectors one a
-//! row, and two every row reads), the pre gates plus eps; the combine a
-//! softmax of each row of its logits plus eps, its columns normalized, then
-//! `sinkhorn - 1` passes normalizing its rows and its columns (a repeat over
-//! the small vector); the post and combine mixes landed as small vectors of
-//! their own; the pre-mixed row the pre-weighted sum of the four streams
-//! (parts of the row of streams), rounded to bf16 as its plane stores it,
-//! then its norm.
+//! to, vector-wide: the logits a small vector one a row (the mixes scaled,
+//! the pre, post and combine scales laid beside their mixes, and biased),
+//! every gate a sigmoid of its logit, the pre gates plus eps and the post
+//! gates times alpha; the combine a softmax of each row of its logits plus
+//! eps, its columns normalized, then `sinkhorn - 1` passes normalizing its
+//! rows and its columns (a repeat over the small vector), each sum laid
+//! beside the values it divides; the post and combine mixes landed as
+//! small vectors of their own; the pre-mixed row the pre-weighted sum of
+//! the four streams (parts of the row of streams), rounded to bf16 as its
+//! plane stores it, then its norm. The skeleton prints the small vectors
+//! over a warp's lanes, the mixes on the row's first warp or, at a
+//! decode's spread rows, a side block.
 
 use crate::common::attn_ref::ten;
 use crate::common::{Gpu, Lcg};
@@ -33,8 +38,9 @@ const SINKHORN: u32 = 20;
 const GATE_EPS: f32 = 1e-6;
 const ALPHA: f32 = 2.0;
 const EPS: f32 = 1e-6;
-/// DeepSeek-V4 Flash's hidden width, and a narrower one.
-const WIDTHS: [usize; 2] = [4096, 1024];
+/// DeepSeek-V4 Flash's hidden width, a narrower one, and one of eight
+/// lanes a row (a small vector three slots a thread).
+const WIDTHS: [usize; 3] = [4096, 1024, 64];
 
 fn sigmoid(b: &mut Ops, t: u32) -> u32 {
     let one = b.f32(1.0);
@@ -52,18 +58,33 @@ fn packed(b: &mut Ops, values: &[u32]) -> u32 {
     v
 }
 
-fn normalized(b: &mut Ops, c: &mut [u32], eps: u32, rows: bool) {
-    let at = |line: u32, k: u32| (if rows { line * M + k } else { k * M + line }) as usize;
-    for line in 0..M {
-        let mut sum = c[at(line, 0)];
-        for k in 1..M {
-            sum = b.push(Op::Binary(Binary::Add, sum, c[at(line, k)]));
-        }
-        let sum = b.push(Op::Binary(Binary::Add, sum, eps));
-        for k in 0..M {
-            c[at(line, k)] = b.push(Op::Binary(Binary::Div, c[at(line, k)], sum));
-        }
-    }
+/// Each row's (or column's) fold by `op` of an `M` x `M` vector (row by
+/// row), plus `eps` where given, laid beside each of its values.
+fn lines(b: &mut Ops, v: u32, op: Binary, eps: Option<u32>, rows: bool) -> u32 {
+    let at = |line: u32, k: u32| if rows { line * M + k } else { k * M + line };
+    let folds: Vec<u32> = (0..M)
+        .map(|line| {
+            let mut acc = b.push(Op::Pick(v, at(line, 0)));
+            for k in 1..M {
+                let x = b.push(Op::Pick(v, at(line, k)));
+                acc = b.push(Op::Binary(op, acc, x));
+            }
+            match eps {
+                Some(eps) => b.push(Op::Binary(Binary::Add, acc, eps)),
+                None => acc,
+            }
+        })
+        .collect();
+    let laid: Vec<u32> = (0..M * M)
+        .map(|t| folds[(if rows { t / M } else { t % M }) as usize])
+        .collect();
+    packed(b, &laid)
+}
+
+/// `v` with each row (or column) divided by its sum plus `eps`.
+fn normalized(b: &mut Ops, v: u32, eps: u32, rows: bool) -> u32 {
+    let sums = lines(b, v, Binary::Add, Some(eps), rows);
+    b.push(Op::Binary(Binary::Div, v, sums))
 }
 
 /// Parameters: the mixes, the four streams, the scale, the bias, the norm's
@@ -72,57 +93,44 @@ fn region(width: u32) -> Region {
     let (mix, sc, bs, w) = (0, M + 1, M + 2, M + 3);
     let mut b = Ops::new(M + 4);
     let eps = b.f32(GATE_EPS);
-    let logit = |b: &mut Ops, i: u32, s: u32| {
-        let x = b.push(Op::Pick(mix, i));
-        let k = b.push(Op::Pick(sc, s));
-        let scaled = b.push(Op::Binary(Binary::Mul, x, k));
-        let bias = b.push(Op::Pick(bs, i));
-        b.push(Op::Binary(Binary::Add, scaled, bias))
-    };
+    // each logit its mix scaled (the pre, post and combine scales laid
+    // beside their mixes) and biased; every gate a sigmoid of its logit
+    let s: Vec<u32> = (0..3).map(|k| b.push(Op::Pick(sc, k))).collect();
+    let per: Vec<u32> = (0..MIXES).map(|i| s[(i / M).min(2) as usize]).collect();
+    let scales = packed(&mut b, &per);
+    let scaled = b.push(Op::Binary(Binary::Mul, mix, scales));
+    let logits = b.push(Op::Binary(Binary::Add, scaled, bs));
+    let gates = sigmoid(&mut b, logits);
     let pre: Vec<u32> = (0..M)
         .map(|i| {
-            let l = logit(&mut b, i, 0);
-            let g = sigmoid(&mut b, l);
+            let g = b.push(Op::Pick(gates, i));
             b.push(Op::Binary(Binary::Add, g, eps))
         })
         .collect();
     let a = b.f32(ALPHA);
     let post: Vec<u32> = (0..M)
         .map(|i| {
-            let l = logit(&mut b, M + i, 1);
-            let g = sigmoid(&mut b, l);
+            let g = b.push(Op::Pick(gates, M + i));
             b.push(Op::Binary(Binary::Mul, g, a))
         })
         .collect();
     let post = packed(&mut b, &post);
-    let mut c: Vec<u32> = (0..M * M).map(|t| logit(&mut b, 2 * M + t, 2)).collect();
-    for r in 0..M {
-        let row: Vec<u32> = (0..M).map(|j| c[(r * M + j) as usize]).collect();
-        let most = row[1..]
-            .iter()
-            .fold(row[0], |acc, &v| b.push(Op::Binary(Binary::Max, acc, v)));
-        let e: Vec<u32> = row
-            .iter()
-            .map(|&v| {
-                let shifted = b.push(Op::Binary(Binary::Sub, v, most));
-                b.push(Op::Unary(Unary::Exp, shifted))
-            })
-            .collect();
-        let sum = e[1..]
-            .iter()
-            .fold(e[0], |acc, &v| b.push(Op::Binary(Binary::Add, acc, v)));
-        for j in 0..M {
-            let q = b.push(Op::Binary(Binary::Div, e[j as usize], sum));
-            c[(r * M + j) as usize] = b.push(Op::Binary(Binary::Add, q, eps));
-        }
-    }
-    normalized(&mut b, &mut c, eps, false);
-    let start = packed(&mut b, &c);
+    // the combine: a softmax of each row of its logits plus eps, its
+    // columns normalized, then `SINKHORN - 1` passes of its rows and columns
+    let c: Vec<u32> = (0..M * M)
+        .map(|t| b.push(Op::Pick(logits, 2 * M + t)))
+        .collect();
+    let c = packed(&mut b, &c);
+    let most = lines(&mut b, c, Binary::Max, None, true);
+    let shifted = b.push(Op::Binary(Binary::Sub, c, most));
+    let e = b.push(Op::Unary(Unary::Exp, shifted));
+    let sums = lines(&mut b, e, Binary::Add, None, true);
+    let q = b.push(Op::Binary(Binary::Div, e, sums));
+    let c = b.push(Op::Binary(Binary::Add, q, eps));
+    let start = normalized(&mut b, c, eps, false);
     let carry = b.push(Op::Carry(start));
-    let mut c: Vec<u32> = (0..M * M).map(|t| b.push(Op::Pick(carry, t))).collect();
-    normalized(&mut b, &mut c, eps, true);
-    normalized(&mut b, &mut c, eps, false);
-    let next = packed(&mut b, &c);
+    let rows = normalized(&mut b, carry, eps, true);
+    let next = normalized(&mut b, rows, eps, false);
     let comb = b.push(Op::Repeat(SINKHORN - 1, carry, next));
     let mut x = None;
     for (i, &g) in (1..=M).zip(&pre) {
@@ -216,10 +224,8 @@ fn drawn(gpu: &mut Gpu, rows: usize, width: usize) -> Planes {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum By {
-    /// The gates and the norm, each its hand kernel (the L40S's path).
+    /// The gates and the norm, each its own kernel.
     Ops,
-    /// The hand fused kernel (`kernel.elemwise.hc_tile`'s).
-    Hand,
     Region(Option<Schedule>),
 }
 
@@ -240,20 +246,6 @@ fn fire(ctx: &Ctx, by: By, kernel: Option<Synthesized>, rows: usize, width: usiz
             )
             .expect("the gates fire");
             norm::rmsnorm(ctx, x, weight, EPS, &mut y).expect("the norm fires");
-        }
-        By::Hand => {
-            let gate = hc::Gate {
-                scale,
-                base,
-                gate_eps: GATE_EPS,
-                alpha: ALPHA,
-                sinkhorn: SINKHORN,
-            };
-            let landed = hc::gates_norm(
-                ctx, mixes, streams, M, gate, weight, EPS, &mut post, &mut comb, &mut y,
-            )
-            .expect("the hand kernel fires");
-            assert!(landed, "the hand kernel takes the shape");
         }
         By::Region(schedule) => {
             let mut ins = vec![Plane::rows(&mixes)];
@@ -283,13 +275,7 @@ fn land(
 ) -> (Vec<u16>, Vec<f32>, Vec<f32>) {
     let mut gpu = Gpu::open();
     let p = drawn(&mut gpu, rows, width);
-    let ctx = if by == By::Hand {
-        gpu.ctx()
-            .with_tuning(crate::common::attn_ref::tuned(|t| t.hc_tile = true))
-    } else {
-        gpu.ctx()
-    };
-    fire(&ctx, by, kernel, rows, width, p);
+    fire(&gpu.ctx(), by, kernel, rows, width, p);
     gpu.sync();
     (
         gpu.down(p.y, rows * width),
@@ -337,7 +323,7 @@ fn near(case: &str, what: &str, got: &[f32], want: &[f32]) {
 /// The gates' region at a decode's, a ragged and a prefill's rows, under
 /// each schedule: the normed row within [`NORM`] of its math, the two mixes
 /// within a few f32 ulps (`expf` against the host's `exp`, through the
-/// Sinkhorn's passes), two fires the same bits; the hand kernels beside it.
+/// Sinkhorn's passes), two fires the same bits; the ops apart beside it.
 #[test]
 fn a_hyper_connections_gates_and_norm_land_their_math() {
     for width in WIDTHS {
@@ -354,17 +340,20 @@ fn a_hyper_connections_gates_and_norm_land_their_math() {
                 &y,
                 &land(By::Region(None), Some(kernel), rows, width).0,
             );
+            // the mixes on the row's lead warp (packed) or a side block
+            // (spread) alike
             for schedule in Schedule::ALL {
-                let (laid, ..) = land(By::Region(Some(schedule)), Some(kernel), rows, width);
-                assert_within(&format!("{case}, {schedule:?}"), &laid, &normed, NORM);
+                let at = format!("{case}, {schedule:?}");
+                let (laid, p, c) = land(By::Region(Some(schedule)), Some(kernel), rows, width);
+                assert_within(&at, &laid, &normed, NORM);
+                near(&at, "post", &p, &post);
+                near(&at, "combine", &c, &comb);
             }
-            for by in [By::Ops, By::Hand] {
-                let (n, most) = apart(&land(by, None, rows, width).0, &normed);
-                eprintln!(
-                    "{case}: {by:?} {n} of {} apart from the math, {most} ulps at most",
-                    rows * width
-                );
-            }
+            let (n, most) = apart(&land(By::Ops, None, rows, width).0, &normed);
+            eprintln!(
+                "{case}: the ops {n} of {} apart from the math, {most} ulps at most",
+                rows * width
+            );
         }
     }
 }
