@@ -150,6 +150,7 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
             region.nodes.end
         };
         let launches = if once { 1 } else { runs.len().max(1) };
+        let empty_launches = dispatches && runs.is_empty() && dispatch.launches_empty(index as u32);
         for launch in 0..launches {
             sink.run(launch as u32, launches as u32);
             let rows = if once {
@@ -174,7 +175,11 @@ pub fn walk<D: Dispatch + Serve, S: Sink>(
                     sink.tail(node_at >= tail_start);
                 }
                 let collective = matches!(node.op, Operation::Collective(_));
-                if rows == 0 && !collective && !received(compiled, node, &mut outs) {
+                if rows == 0
+                    && !collective
+                    && !empty_launches
+                    && !received(compiled, node, &mut outs)
+                {
                     continue;
                 }
                 dispatch.exec(node)?;

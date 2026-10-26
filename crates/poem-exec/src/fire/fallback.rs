@@ -61,6 +61,15 @@ pub trait Serve {
     fn scatter(&mut self, _region: &Region) -> Result<(), KernelError> {
         Err(unserved("scatter"))
     }
+
+    /// Whether region `index` launches though this fire seats no row of it:
+    /// a backend replaying one recorded body for every subset of the classes
+    /// its key names launches an absent class's region at its ceiling, with
+    /// zero live rows, so the body holds the same launches whichever classes
+    /// are present.
+    fn launches_empty(&self, _index: u32) -> bool {
+        false
+    }
 }
 
 fn unserved(half: &'static str) -> KernelError {
