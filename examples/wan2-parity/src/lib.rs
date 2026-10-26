@@ -170,7 +170,7 @@ fn dims(reading: &str, given: bool) -> Result<Dims> {
     let video = if given {
         let lane = model::lane_of(&[
             ("reading", reading),
-            ("stream", "video"),
+            ("stream", "latents"),
             ("positions", "given"),
         ])?;
         let mut reads: Vec<&str> = lane.inputs.iter().map(|i| i.name.as_str()).collect();
@@ -182,7 +182,7 @@ fn dims(reading: &str, given: bool) -> Result<Dims> {
         }
         lane
     } else {
-        lane_reading(reading, "video", &["latents", "timestep"])?
+        lane_reading(reading, "latents", &["latents", "timestep"])?
     };
     let velocity_width = match video
         .outputs
@@ -215,7 +215,7 @@ fn video_lane(
     let frame = (plane * case.channels) as usize;
     let latents = &case.latents[from as usize * frame..to as usize * frame];
     pass.switch(lane, "reading", reading)?;
-    pass.switch(lane, "stream", "video")?;
+    pass.switch(lane, "stream", "latents")?;
     pass.group(lane, group)?;
     let x = Channel::from_shaped([to - from, case.height, case.width, case.channels], latents);
     let t = Channel::from([timestep]);

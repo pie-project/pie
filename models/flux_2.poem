@@ -738,7 +738,7 @@ def forward(m, inputs):
     text_reading = ["text"] if m.te != None else []
     vae_readings = ["vae.decode", "vae.encode"] if m.vae != None else []
     switch("reading", text_reading + ["denoise"] + vae_readings)
-    switch("stream", ["text", "image", "reference"])
+    switch("stream", ["context", "latents", "reference"])
     switch("positions", ["computed", "given"])
     reading = lambda name: inputs.on(switch_is("reading", name))
     if m.te != None:
@@ -808,7 +808,7 @@ def turn_positions(arm, m):
 def denoise(arm, m):
     d, dit = m.dims, m.dit
     dim, hd = d.dim, m.head_dim
-    text, image = switch_is("stream", "text"), switch_is("stream", "image")
+    text, image = switch_is("stream", "context"), switch_is("stream", "latents")
     txt_in, img_in = arm.on(text), arm.on(~text)
 
     lanes = arm.request_of_token()

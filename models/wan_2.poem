@@ -655,7 +655,7 @@ def caches(m, c):
 def forward(m, inputs):
     vae_readings = ["vae.decode", "vae.encode"] if m.vae != None else []
     switch("reading", (["text"] if m.te != None else []) + ["denoise"] + vae_readings)
-    switch("stream", ["video", "context"])
+    switch("stream", ["latents", "context"])
     switch("positions", ["computed", "given"])
     reading = lambda name: inputs.on(switch_is("reading", name))
     if m.te != None:

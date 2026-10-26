@@ -39,7 +39,7 @@ fn the_z_image_vae_bakes_every_case() {
 fn the_flagship_declares_the_two_vae_readings_and_the_miniature_neither() {
     assert_eq!(
         readings(TURBO),
-        vec!["text", "refine", "denoise", "vae.decode", "vae.encode"]
+        vec!["text", "denoise", "vae.decode", "vae.encode"]
     );
     assert!(
         !readings(MINI).iter().any(|r| r.starts_with("vae.")),
