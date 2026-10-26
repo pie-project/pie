@@ -432,7 +432,15 @@ impl Run<'_> {
             .anchor_epilogue(key)
             .ok_or_else(|| broken(format!("the load loaded no epilogue for {key:016x}")))?;
         let (planes, landed, paging) = self.anchor_planes(epi, ins, outs, cache)?;
-        if linear::gemm::epilogue(self.ctx(), OP, epi, self.tensor(y), &planes, &landed, paging)? {
+        if linear::gemm::epilogue(
+            self.ctx(),
+            OP,
+            epi,
+            self.tensor(y),
+            &planes,
+            &landed,
+            paging,
+        )? {
             Ok(())
         } else {
             Err(broken(
@@ -506,12 +514,23 @@ impl Run<'_> {
                     let pool = pool.as_ref().ok_or_else(|| {
                         broken("a paged result, and the op names no cache".into())
                     })?;
-                    let native = kernels_cuda::attn::kv::native_bf16(pool)
-                        || kernels_cuda::attn::kv::native_e4m3(pool);
+                    let native = match paged.dtype {
+                        // DeepSeek's rows: a u8 pool a row of the format's
+                        // bytes a cell
+                        linear::skeleton::CacheDtype::Blocks(rows) => {
+                            pool.keys.dtype == Dtype::U8
+                                && pool.seq_stride == i64::from(rows.row_bytes())
+                                && pool.keys.width == rows.row_bytes()
+                        }
+                        _ => {
+                            kernels_cuda::attn::kv::native_bf16(pool)
+                                || kernels_cuda::attn::kv::native_e4m3(pool)
+                        }
+                    };
                     if !native || pool.layout != 0 || pool.has_envelopes {
                         return Err(broken(
                             "a paged result lands in a bf16 or unit-scaled e4m3 pool of rows a \
-                             cell, with no envelopes"
+                             cell, or a pool of its block-scaled rows, with no envelopes"
                                 .into(),
                         ));
                     }
