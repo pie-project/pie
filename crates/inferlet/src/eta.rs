@@ -1033,14 +1033,13 @@ pub async fn run_ahead(
     if budget == 0 {
         return Ok(0);
     }
-    // A recurrent state and an off-default path post one pass at a time. A
-    // mask fills the frame: the runtime advances the pass's host shadow fire
-    // by fire, so a later slot reads the mask its predecessor's epilogue put.
-    let r = if crate::model::rs_state_size() > 0 || pass.switched() {
-        1
-    } else {
-        frame_size()
-    };
+    // Every slot of a frame is its own fire: the runtime advances the pass's
+    // host shadow and its working sets' cursors (recurrent state included)
+    // fire by fire, so a mask or a recurrent state fills the frame like any
+    // decode. A pass off its model's default path (a canvas redrawn whole, a
+    // drafter block) posts one fire at a time: no model served here runs one
+    // under run-ahead, so its frame shape has never been measured.
+    let r = if pass.switched() { 1 } else { frame_size() };
     let window_fires = crate::model::run_ahead_window() as usize;
     let window_frames = (window_fires / r.max(1)).max(1);
 
