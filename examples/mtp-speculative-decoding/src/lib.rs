@@ -43,7 +43,7 @@ struct Input {
     /// geometry, fire and commit arithmetic.
     #[serde(default = "default_k")]
     k: u32,
-    /// DIAGNOSTIC: extra lanes carrying the correction token again, verified
+    /// DIAGNOSTIC: extra rows carrying the correction token again, verified
     /// and rejected like any wrong draft, so a run with no drafts can be
     /// given the fire SHAPE of one with `pad` of them — separating "a wider
     /// window moves the answer" from "the draft head does".
@@ -54,7 +54,7 @@ struct Input {
     /// pass binds at most twelve channels, and this is the twelfth.
     #[serde(default)]
     trace: bool,
-    /// DIAGNOSTIC: record lane 0's top-1/top-2 logit margin every round
+    /// DIAGNOSTIC: record row 0's top-1/top-2 logit margin every round
     /// (`margin_trace`). Opt-in because it is a `top_k` over the whole
     /// vocabulary in the epilogue.
     #[serde(default)]
@@ -94,7 +94,7 @@ struct Output {
     /// The model's draft depth.
     depth: u32,
     prompt_tokens: u32,
-    /// Per round, lane 0's top-1 minus top-2 logit — whether a divergence
+    /// Per round, row 0's top-1 minus top-2 logit — whether a divergence
     /// between two widths is a near-tie (the bf16 floor: a one-row and a
     /// many-row fire take different kernel paths and differ in the last
     /// bits) or a real gap (a mechanism fault).
@@ -196,7 +196,7 @@ async fn main(input: Input) -> Result<Output> {
             let first = eq(&i, Tensor::constant(0u32));
             let window = if drafting {
                 // The head's chain at the readout row, `[depth]`; the window
-                // takes its first `k`, and any pad lane carries `t` again.
+                // takes its first `k`, and any pad row carries `t` again.
                 let chain = intrinsics::output(0, "mtp.drafts");
                 let j = min_elem(
                     max_elem(&i, Tensor::constant(1u32)) - Tensor::constant(1u32),
@@ -230,17 +230,16 @@ async fn main(input: Input) -> Result<Output> {
 
     // ── DECODE: one window per fire, loop-carried on the device ──────────
     //
-    // **THE WINDOW IS `w` LANES OF ONE TOKEN, NOT ONE LANE OF `w` TOKENS.**
-    // The runtime admits one token per lane; every lane's slot is written before any lane
-    // attends, so lane `i + 1` sees lane `i`'s.
+    // One lane of `w` tokens, causal, each row read out: a windowed state
+    // admits no two lanes on one working set.
     if !stopped {
         let win = Channel::from(seed.as_slice()).named("win");
         let base = Channel::from([n]).named("base");
-        let indptr_d = Channel::from_iter(0..=w).named("embed_indptr");
+        let indptr_d = Channel::from([0u32, w]).named("embed_indptr");
+        let readout_d = Channel::from_iter(0..w).named("readout");
         let slots = Channel::from_iter(n..n + w).named("slots");
-        let kv_len = Channel::from_iter((n..n + w).map(|p| p + 1)).named("kv_len");
-        // Lane 0 carries the fold count for the shared working set; the others fold nothing more.
-        let fold = Channel::from(vec![0u32; w as usize]).named("fold");
+        let kv_len = Channel::from([n + w]).named("kv_len");
+        let fold = Channel::from([0u32]).named("fold");
         let out = Channel::new([w], dtype::i32)
             .capacity(channel_capacity() as u32)
             .named("out");
@@ -255,9 +254,9 @@ async fn main(input: Input) -> Result<Output> {
 
         let fwd = ForwardPass::new();
         fwd.embed(&win, &indptr_d)?;
-        let lanes: Vec<&WorkingSet> = (0..w).map(|_| &ws).collect();
+        fwd.readout(&readout_d)?;
         fwd.state(
-            &lanes,
+            &[&ws],
             StateGeometry {
                 slots: Some(&slots),
                 kv_len: Some(&kv_len),
@@ -268,7 +267,7 @@ async fn main(input: Input) -> Result<Output> {
         fwd.epilogue(move || {
             let window = win.take(); // [w] i32
             let b = base.take(); // [1] u32
-            // One readout row per lane: `[w, vocab]`, or `[vocab]` at w = 1.
+            // One readout row per window row: `[w, vocab]`, or `[vocab]` at w = 1.
             let logits = intrinsics::output(0, "logits");
             let truth = reshape(reduce_argmax(&logits), [w]); // [w] i32
             if tracing {
@@ -330,15 +329,14 @@ async fn main(input: Input) -> Result<Output> {
             win.put(&next);
 
             // ── the geometry of that window, from the new committed length:
-            //    lane i at slot nb + i, reading nb + i + 1 slots; the next
-            //    fire freezes the m + 1 this one accepted.
+            //    row i at slot nb + i, the lane reading nb + w slots; the
+            //    next fire freezes the m + 1 this one accepted.
             let nb = &b + &m + &one; // [1]
             base.put(&nb);
             let p = broadcast(&nb, [w]) + &i; // [w]
             slots.put(&p);
-            kv_len.put(&p + &one);
-            let none_more = broadcast(Tensor::constant(0u32), [w]);
-            fold.put(select(&first, broadcast(&m + &one, [w]), &none_more));
+            kv_len.put(&nb + Tensor::constant(w));
+            fold.put(&m + &one);
         });
 
         let budget = input.max_tokens;
