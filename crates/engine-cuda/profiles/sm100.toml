@@ -53,8 +53,6 @@ elemwise.hc_mma = true
 # 1280: 72.9 against 73.9).
 elemwise.hc_mega_from = 43
 elemwise.hc_mega_until = 1120
-# Qwen3.5's attention prologue in one launch up to 64 rows.
-elemwise.qg_prologue_until = 64
 # A wide decode's split partials fold a warp a row.
 sdpa.merge_warp = true
 

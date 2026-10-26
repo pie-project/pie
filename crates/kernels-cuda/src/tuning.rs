@@ -317,14 +317,6 @@ pub struct MoeMxfp4A8From(pub u32);
 #[decision(id = "kernel.gemm.split_rows_from", constant(range(1..=65_536)), default = 256, tune = search)]
 pub struct GemmSplitRowsFrom(pub u32);
 
-/// The most rows Qwen3.5's attention prologue (the q/gate cut, the two
-/// per-head norms, the partial rotation and the cache write) lands in one
-/// launch at; more run the five launches. 0 (never) but where a chip's
-/// profile says.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.elemwise.qg_prologue_until", constant(range(0..=65_536)), default = 0, tune = search)]
-pub struct QgPrologueUntil(pub u32);
-
 /// The most rows DeepSeek-V4's attention (the window, the compressed rows,
 /// their fold and the sinks) lands in one launch at; more run the four
 /// launches. 0 (never) but where a chip's profile says.
@@ -806,7 +798,6 @@ pub fn register(registry: &mut Registry) {
         .add::<MoeTc5>()
         .add::<MoeTc5From>()
         .add::<GemmSplitRowsFrom>()
-        .add::<QgPrologueUntil>()
         .add::<CompressedDecodeUntil>()
         .add::<SsmGdnFusedScan>()
         .add::<SsmGdnTc5>()
@@ -944,7 +935,6 @@ tuning! {
     moe_tc5: bool = false, on MoeTc5;
     moe_tc5_from: u32 = 16, get MoeTc5From;
     gemm_split_rows_from: u32 = 256, get GemmSplitRowsFrom;
-    qg_prologue_until: u32 = 0, get QgPrologueUntil;
     compressed_decode_until: u32 = 0, get CompressedDecodeUntil;
     ssm_gdn_fused_scan: bool = false, on SsmGdnFusedScan;
     ssm_gdn_tc5: bool = false, on SsmGdnTc5;

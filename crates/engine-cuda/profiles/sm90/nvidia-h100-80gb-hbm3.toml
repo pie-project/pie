@@ -28,7 +28,6 @@ measured = [
   "kernel.elemwise.hc_mma",
   "kernel.elemwise.hc_tile",
   "kernel.elemwise.norm_emit",
-  "kernel.elemwise.qg_prologue_until",
   "kernel.elemwise.rows_vec",
   "kernel.gemm.affine_mma",
   "kernel.gemm.fp8_gemv_until",

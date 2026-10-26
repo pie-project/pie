@@ -511,7 +511,6 @@ mod tests {
                 assert_eq!(tuning.hc_tile, b200, "{gpu}");
                 assert_eq!(tuning.ssm_conv_vec4, b200, "{gpu}");
                 assert_eq!(tuning.ssm_gdn_out_bf16, b200, "{gpu}");
-                assert_eq!(tuning.qg_prologue_until, if b200 { 64 } else { 0 }, "{gpu}");
                 assert_eq!(tuning.merge_warp, b200, "{gpu}");
                 assert_eq!(tuning.decode_gqa, b200, "{gpu}");
                 assert_eq!(tuning.pool_mma, major == 10 && minor == 0, "{gpu}");
@@ -586,7 +585,6 @@ mod tests {
                         hc_mega_until: 0,
                         ssm_conv_vec4: false,
                         ssm_gdn_out_bf16: false,
-                        qg_prologue_until: 0,
                         compressed_decode_until: 0,
                         merge_warp: false,
                         mxfp4_mma_until: defaults.mxfp4_mma_until,
@@ -656,7 +654,6 @@ mod tests {
                         rows_vec: false,
                         hc_tile: false,
                         hc_mma: false,
-                        qg_prologue_until: 0,
                         merge_warp: false,
                         pool_mma: false,
                         compressed_decode_until: 0,
