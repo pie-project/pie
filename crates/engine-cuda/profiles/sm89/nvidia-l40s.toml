@@ -42,7 +42,6 @@ measured = [
   "engine.lattice_steps",
   "engine.recording",
   "engine.working_set_percent",
-  "fuse.matmul_glu",
   "fuse.qkv_fused_qknorm_rope_vnorm_write",
   "compiler.cond_fixed_us",
   "compiler.cond_per_arm_us",
