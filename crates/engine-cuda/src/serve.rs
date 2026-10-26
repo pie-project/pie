@@ -1096,6 +1096,7 @@ pub struct Prepared<'a> {
     slot: Option<crate::inputs::SlotGuard>,
     lengths: crate::inputs::Staged,
     token_injects: Vec<crate::inputs::TokenInject>,
+    mask_injects: Vec<crate::inputs::MaskInject>,
     kv_reports: Vec<KvReport>,
     bodied: bool,
     admits: std::sync::Arc<[crate::window::Admit]>,

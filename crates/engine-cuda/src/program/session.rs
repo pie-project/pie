@@ -336,8 +336,33 @@ impl Session {
         native_to_wire(shape.dtype, shape.numel, &native)
     }
 
-    pub fn envelope(&self, plan: &ExecPlan, class: GeometryClass) -> Result<Envelope> {
-        ports::resolve(plan, class, &self.rings, &self.cursors_now(), &self.shapes)
+    /// The ports the host resolves under `class`; a mask the device carries
+    /// (`mask_on_device`, [`Self::mask_device_source`]) is not among them.
+    pub fn envelope(
+        &self,
+        plan: &ExecPlan,
+        class: GeometryClass,
+        mask_on_device: bool,
+    ) -> Result<Envelope> {
+        ports::resolve(
+            plan,
+            class,
+            &self.rings,
+            &self.cursors_now(),
+            &self.shapes,
+            mask_on_device,
+        )
+    }
+
+    /// The device cell a decode envelope's attention mask is packed from,
+    /// `(address, bool bytes)`, where only the device holds it: like its
+    /// tokens, a mask the device computes never rides the host.
+    #[must_use]
+    pub fn mask_device_source(&self, plan: &ExecPlan, class: GeometryClass) -> Option<(u64, u32)> {
+        if class != GeometryClass::DecodeEnvelope {
+            return None;
+        }
+        self.port_device_source(plan, Port::AttnMask)
     }
 
     #[must_use]
@@ -569,20 +594,32 @@ impl Session {
     }
 
     
-    fn host_resolved_channels(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<u32> {
+    fn host_resolved_channels(
+        &self,
+        plan: &ExecPlan,
+        class: GeometryClass,
+        mask_on_device: bool,
+    ) -> Vec<u32> {
         let tokens_on_device = self.token_device_source(plan, class).is_some();
+        let mask_on_device = mask_on_device && self.mask_device_source(plan, class).is_some();
         plan.package
             .ports
             .iter()
             .filter(|binding| !binding.is_const && engine::ports::resolves(class, binding.port))
             .filter(|binding| !(binding.port == Port::EmbedTokens && tokens_on_device))
+            .filter(|binding| !(binding.port == Port::AttnMask && mask_on_device))
             .map(|binding| binding.channel)
             .collect()
     }
 
     
-    pub fn host_resolved_rings(&self, plan: &ExecPlan, class: GeometryClass) -> Vec<usize> {
-        self.host_resolved_channels(plan, class)
+    pub fn host_resolved_rings(
+        &self,
+        plan: &ExecPlan,
+        class: GeometryClass,
+        mask_on_device: bool,
+    ) -> Vec<usize> {
+        self.host_resolved_channels(plan, class, mask_on_device)
             .into_iter()
             .filter_map(|channel| {
                 self.rings
@@ -596,7 +633,7 @@ impl Session {
     
     #[must_use]
     pub fn resolves_prologue_put(&self, plan: &ExecPlan, class: GeometryClass) -> bool {
-        self.host_resolved_channels(plan, class)
+        self.host_resolved_channels(plan, class, false)
             .into_iter()
             .any(|channel| plan.puts_channel(channel, Attach::Prologue))
     }

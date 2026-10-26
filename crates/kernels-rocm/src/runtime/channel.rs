@@ -290,6 +290,24 @@ pub fn mask_from_commit(
     )
 }
 
+const BITS_BLOCK: u32 = 128;
+
+/// Packs the `bits` bool bytes at `src` into little-endian bits at `dst`
+/// (`dst`'s bits past `bits` in its last byte are cleared).
+pub fn gather_bits(ctx: &Ctx, src: DevicePtr, dst: DevicePtr, bits: u32) -> Result<(), Error> {
+    const OP: &str = "channel.gather_bits";
+    if bits == 0 {
+        return Ok(());
+    }
+    let blocks = bits.div_ceil(8).div_ceil(BITS_BLOCK);
+    ctx.fire(
+        OP,
+        Fire::at(kernel(FILE, "::pie::channel::gather_bits"))
+            .apply(Launch::grid([blocks, 1, 1], [BITS_BLOCK, 1, 1])),
+        &[ArgValue::Ptr(src), ArgValue::Ptr(dst), ArgValue::U32(bits)],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

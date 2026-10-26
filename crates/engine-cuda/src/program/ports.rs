@@ -23,6 +23,7 @@ pub fn resolve(
     rings: &Rings,
     cursors: &[Cursor],
     shapes: &[ChannelShape],
+    mask_on_device: bool,
 ) -> Result<Envelope> {
     let mut out = Envelope::default();
     RESOLVED.fetch_add(1, Ordering::Relaxed);
@@ -31,7 +32,8 @@ pub fn resolve(
             continue;
         }
         if binding.port == Port::AttnMask {
-            if binding.is_const {
+            // A mask the device carries is packed on the device, never read here.
+            if binding.is_const || mask_on_device {
                 continue;
             }
             out.mask = Some(read_bool_cell(

@@ -306,7 +306,7 @@ impl Plane {
         Ok(id)
     }
 
-    pub fn envelope(&self, id: InstanceId) -> Result<Option<Envelope>> {
+    pub fn envelope(&self, id: InstanceId, mask_on_device: bool) -> Result<Option<Envelope>> {
         let bound = self
             .instances
             .get(&id)
@@ -325,8 +325,19 @@ impl Plane {
         })?;
         bound
             .session
-            .envelope(&program.plan, bound.geometry)
+            .envelope(&program.plan, bound.geometry, mask_on_device)
             .map(Some)
+    }
+
+    /// The device cell instance `id`'s decode-envelope mask is packed from
+    /// ([`Session::mask_device_source`]).
+    #[must_use]
+    pub fn mask_device_source(&self, id: InstanceId) -> Option<(u64, u32)> {
+        let bound = self.instances.get(&id)?;
+        let program = self.programs.get(&bound.program_id)?;
+        bound
+            .session
+            .mask_device_source(&program.plan, bound.geometry)
     }
 
     #[must_use]
@@ -715,7 +726,7 @@ impl Plane {
     /// The shared rings the host reads to resolve instance `id`'s
     /// descriptor ports (none for a host-geometry instance).
     #[must_use]
-    pub fn host_resolved_rings(&self, id: InstanceId) -> Vec<usize> {
+    pub fn host_resolved_rings(&self, id: InstanceId, mask_on_device: bool) -> Vec<usize> {
         let Some(bound) = self.instances.get(&id) else {
             return Vec::new();
         };
@@ -727,7 +738,7 @@ impl Plane {
         };
         bound
             .session
-            .host_resolved_rings(&program.plan, bound.geometry)
+            .host_resolved_rings(&program.plan, bound.geometry, mask_on_device)
     }
 
     
