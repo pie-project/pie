@@ -634,50 +634,17 @@ struct RowSkeleton {
         const float max = e2m1 ? 6.f : 448.f;
         const bool lands_row = live && lands[K];
         unsigned char* data = reinterpret_cast<unsigned char*>(dst[K]);
-        // each vector's largest, then its block's: over side by side lanes
-        // where the row's vectors sit in order, else (a pair-packed turn's
-        // order) through shared memory, each row's blocks its own
-        float amaxes[VECS];
-#pragma unroll
-        for (int p = 0; p < VECS; ++p) {
-            const int i = static_cast<int>(at[p]);
-            const bf16* h = reinterpret_cast<const bf16*>(&out[K][p]);
-            float amax = 0.f;
-#pragma unroll
-            for (int e = 0; e < 8; ++e) amax = fmaxf(amax, fabsf(bf16_to_f32(h[e])));
-            amaxes[p] = lane + p * LANES < vectors && i * 8 < coded ? amax : 0.f;
-        }
-        if constexpr (is_same<ORDER, InOrder>::value) {
-#pragma unroll
-            for (int p = 0; p < VECS; ++p)
-                for (int off = 1; off < per; off <<= 1)
-                    amaxes[p] = fmaxf(amaxes[p], __shfl_xor_sync(0xffffffffu, amaxes[p], off));
-        } else {
-            constexpr int kBlocks = 64;
-            __shared__ unsigned blockmax[(BLOCK / LANES) * kBlocks];
-            for (int b = static_cast<int>(threadIdx.x); b < (BLOCK / LANES) * kBlocks; b += BLOCK) blockmax[b] = 0u;
-            __syncthreads();
-#pragma unroll
-            for (int p = 0; p < VECS; ++p) {
-                const int i = static_cast<int>(at[p]);
-                if (lane + p * LANES < vectors && i * 8 < coded)
-                    atomicMax(&blockmax[group * kBlocks + i / per], __float_as_uint(amaxes[p]));
-            }
-            __syncthreads();
-#pragma unroll
-            for (int p = 0; p < VECS; ++p) {
-                const int i = static_cast<int>(at[p]);
-                if (lane + p * LANES < vectors && i * 8 < coded)
-                    amaxes[p] = __uint_as_float(blockmax[group * kBlocks + i / per]);
-            }
-        }
 #pragma unroll
         for (int p = 0; p < VECS; ++p) {
             const int slot = lane + p * LANES;
             const int i = static_cast<int>(at[p]);
             const bool held = slot < vectors;
             const bf16* h = reinterpret_cast<const bf16*>(&out[K][p]);
-            const float amax = amaxes[p];
+            float amax = 0.f;
+#pragma unroll
+            for (int e = 0; e < 8; ++e) amax = fmaxf(amax, fabsf(bf16_to_f32(h[e])));
+            if (!held || i * 8 >= coded) amax = 0.f;
+            for (int off = 1; off < per; off <<= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
             if (!lands_row || !held) continue;
             const int c0 = i * 8;
             if (c0 >= coded) {

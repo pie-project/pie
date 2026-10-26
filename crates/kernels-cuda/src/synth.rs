@@ -294,6 +294,9 @@ pub struct Synthesized {
     vector_outs: u32,
     /// Whether its spread kernel has side blocks.
     side: bool,
+    /// Whether a schedule runs a body that holds its row's vectors out of
+    /// order (a pair-packed turn's, [`Body::packed`]).
+    reorders: bool,
 }
 
 /// The most parameters one generated kernel reads.
@@ -407,6 +410,7 @@ pub fn synth_body(body: &Body, ins: &[In], outs: usize, width: u32) -> Result<Sy
             shares: body.shares,
         },
         vectors: body.vectors,
+        reorders: body.packed.is_some(),
         vector_outs: body.vector_outs,
         side: body.side,
     })
@@ -467,6 +471,14 @@ impl Synthesized {
     #[must_use]
     pub const fn kernel(self) -> &'static Kernel {
         self.kernel
+    }
+
+    /// Whether a schedule holds its row's vectors out of order: a
+    /// block-scaled store, which takes a block's largest over side by side
+    /// lanes, lands only an in-order row.
+    #[must_use]
+    pub const fn reorders(self) -> bool {
+        self.reorders
     }
 
     /// Compiles the kernel (or reads it from the disk cache) and loads it on

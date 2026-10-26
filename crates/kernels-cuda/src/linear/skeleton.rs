@@ -1321,6 +1321,18 @@ impl RowLeg {
                 for piece in shape.pieces {
                     let kernel =
                         crate::synth::synth(&piece.region, &shape.ins, piece.outs.len()).ok()?;
+                    let blocks = piece.outs.iter().any(|o| {
+                        matches!(
+                            epi.paged(o.k),
+                            Some(Paged {
+                                dtype: CacheDtype::Blocks(_),
+                                ..
+                            })
+                        )
+                    });
+                    if blocks && kernel.reorders() {
+                        return None;
+                    }
                     kernel.load().ok()?;
                     pieces.push(Piece {
                         kernel,

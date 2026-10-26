@@ -125,8 +125,6 @@ pub fn blocks_word(rows: &kernels_ir::BlockRows) -> Option<u32> {
         && rows.tail.is_multiple_of(8)
         && rows.scale_bytes.is_multiple_of(4)
         && rows.block.is_multiple_of(8)
-        // a row's blocks' maxima, at most `kBlocks` of them a row
-        && rows.scales() <= 64
         && fits(rows.block, 8)
         && fits(coded, 8)
         && fits(tail, 8)
