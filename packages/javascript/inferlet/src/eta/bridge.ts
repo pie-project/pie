@@ -348,15 +348,13 @@ export class Pipeline {
    */
   runAhead(fwd: ForwardPass, budget: number, onToken: () => boolean | void): number {
     if (budget === 0) return 0;
-    // Live slots per frame. A pass that binds a mask fills the frame: the
-    // runtime advances its host shadow fire by fire, so a later slot reads the
-    // mask its predecessor's epilogue put. A pass on a model with recurrent
-    // state takes one, whose frame's waves
-    // carry the same sequence's state one into the next (a frame of one live
-    // slot measured faster than a full one on Qwen3.5-0.8B), and a pass off
-    // its model's default path (a canvas redrawn whole), which redraws what
-    // the last wrote. Any other pass fills the frame.
-    const r = rsStateSize() > 0 || fwd.switched() ? 1 : frameSize();
+    // Every slot of a frame is its own fire: the runtime advances the pass's
+    // host shadow and its working sets' cursors (recurrent state included)
+    // fire by fire, so a mask or a recurrent state fills the frame like any
+    // decode. A pass off its model's default path (a canvas redrawn whole, a
+    // drafter block) posts one fire at a time: no model served here runs one
+    // under run-ahead, so its frame shape has never been measured.
+    const r = fwd.switched() ? 1 : frameSize();
     const windowFrames = Math.max(Math.floor(witModel.runAheadWindow() / Math.max(r, 1)), 1);
     let submitted = 0;
     let consumed = 0;
@@ -430,7 +428,6 @@ export const submitDeadlineUs = () => cached('submitDeadlineUs', () => Number(wi
 /** Host-reader channel capacity that sustains run-ahead (not cached). */
 export const channelCapacity = () => Math.max(witModel.channelCapacity(), 2);
 export const kvPageSize = () => cached('kvPageSize', () => witModel.kvPageSize());
-const rsStateSize = () => cached('rsStateSize', () => Number(witModel.rsStateSize()));
 /** The most rows one pass may read out through `kind`; the pass itself may be any length. */
 export const maxReadoutRows = (kind: witModel.ReadoutKind) =>
   cached(`maxReadoutRows:${kind}`, () => Math.max(witModel.maxReadoutRows(kind), 1));
