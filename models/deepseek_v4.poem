@@ -1584,7 +1584,7 @@ def draft(m, rows, streams, logits):
     )
     out, _ = layer(m, draft_rows, mtp.block, fused, NO_TRAIL)
     y = ops.elemwise.rmsnorm(collapse(out, mtp.hc_head, hy), mtp.norm, mtp.norm_eps)
-    proposal = ops.linear.lm_head(y, m.head)
+    proposal = ops.linear.lm_head(ops.gather.gather_rows(y, drafted.readout_rows()), m.head)
     output("mtp.logits", proposal)
     output("mtp.drafts", ops.sampling.argmax([proposal]))
 

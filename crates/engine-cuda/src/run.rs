@@ -1316,7 +1316,8 @@ impl<'c> Run<'c> {
             self.carve_rows()
                 .unwrap_or_else(|| self.window().span().rows)
         };
-        if tokens == 0 {
+        // Fewer rows than tokens: a plane over selected rows (a readout's, a draft's).
+        if tokens == 0 || plane_rows < tokens {
             return 1;
         }
         assert_eq!(

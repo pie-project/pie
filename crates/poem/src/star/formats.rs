@@ -53,14 +53,8 @@ impl Read {
             Read::Expr(w, expr) => b.read_expr(&w, expr),
             Read::Columns(w, from, start, len) => b.read_columns(&w, from, start, len),
             Read::Own(w) => b.read_own(&w),
-            Read::Push(t) => {
-                b.push(t);
-                Ok(())
-            }
-            Read::Extend(ts) => {
-                b.extend(ts);
-                Ok(())
-            }
+            Read::Push(t) => b.push(t),
+            Read::Extend(ts) => b.extend(ts),
         }
     }
 }

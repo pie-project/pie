@@ -440,8 +440,7 @@ def layout(id, deploy):
             )
 
         assistant = struct(
-            pre_embed = weight([ah, hidden], w),
-            pre_hidden = weight([ah, hidden], w),
+            pre = weight([ah, 2 * hidden], w),
             post = weight([hidden, ah], w),
             embed = weight([d.vocab, ah], w),
             norm = weight([ah]),
@@ -736,12 +735,9 @@ def safetensors(m, reads, layout):
     if m.assistant != None:
         a = m.assistant
         if has("aux.pre_projection_embed.weight"):
-            reads.read(a.pre_embed, "aux.pre_projection_embed.weight")
-            reads.read(a.pre_hidden, "aux.pre_projection_hidden.weight")
+            reads.read_expr(a.pre, concat(1, [src("aux.pre_projection_embed.weight"), src("aux.pre_projection_hidden.weight")]))
         else:
-            th = a.pre_embed.shape[1]
-            reads.read_expr(a.pre_embed, src("aux.pre_projection.weight").slice(1, 0, th))
-            reads.read_expr(a.pre_hidden, src("aux.pre_projection.weight").slice(1, th, th))
+            reads.read(a.pre, "aux.pre_projection.weight")
         reads.read(a.post, "aux.post_projection.weight")
         reads.read(a.embed, "aux.model.embed_tokens.weight")
         reads.read(a.norm, "aux.model.norm.weight")
@@ -1077,7 +1073,7 @@ def assistant_draft(m, inputs, positions, x, logits, root):
     dlogits = logits.on(fact.drafts())
     token = ops.sampling.argmax([dlogits])
     e = ops.gather.embed(token, m.embed, m.vocab) * root
-    y = ops.elemwise.residual_add(ops.linear.matmul(e, a.pre_embed), ops.linear.matmul(dx, a.pre_hidden))
+    y = ops.linear.matmul(ops.gather.concat_cols([e, dx]), a.pre)
     for w in a.layers:
         at = w.attn
         d, kv_heads, win = geometry(m, at.reading)

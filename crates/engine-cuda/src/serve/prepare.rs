@@ -173,9 +173,15 @@ impl FrameShell for Shell {
                 }
                 continue;
             }
-            let Some(envelope) = self.programs.envelope(attached.instance)? else {
+            let Some(mut envelope) = self.programs.envelope(attached.instance)? else {
                 continue;
             };
+            envelope.host_rows = lanes
+                .iter()
+                .skip(first)
+                .take(attached.lanes.max(1) as usize)
+                .map(|seated| seated.lane.tokens.len() as u32)
+                .collect();
             let carried = envelope.lanes();
             if first + carried > lanes.len() {
                 return Err(Fault::program(

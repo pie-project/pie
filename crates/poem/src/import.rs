@@ -170,19 +170,12 @@ impl<'a> Builder<'a> {
             return Ok(());
         }
         self.whole_checkpoint(w)?;
-        let want = encoding(w.dtype);
-        let stored = stored_encoding(self.src, &from)?;
-        let applied = format!("{}.read", w.name);
-        self.tensors.push(
-            TensorContract::new(applied.clone(), over, extents(w), stored.clone()).internal(),
-        );
-        let adapted = ladder(&from, Expr::out(applied), &stored, &want)?;
-        self.tensors.push(TensorContract::new(
-            w.name.clone(),
-            adapted,
-            extents(w),
-            want,
-        ));
+        let read = if placed_road_covers(w) {
+            placed_from_encode(w, |canon| read_over(self.src, canon, &from, over))?
+        } else {
+            read_over(self.src, w, &from, over)?
+        };
+        self.tensors.extend(read);
         Ok(())
     }
 
@@ -216,8 +209,8 @@ impl<'a> Builder<'a> {
         self.whole_checkpoint(w)?;
         if !stored_mlx_codes(self.src, &from)? || matches!(encoding(w.dtype), Encoding::Raw(_)) {
             let axis = column_axis(self.src, &from)?;
-            let read = declare(self.src, w, Expr::src(from).slice(axis, start, len))?;
-            self.tensors.push(read);
+            let read = computed(self.src, w, Expr::src(from).slice(axis, start, len))?;
+            self.tensors.extend(read);
             return Ok(());
         }
         let read = affine_columns(self.src, w, &from, start, len)?;
@@ -235,19 +228,50 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    pub fn push(&mut self, tensor: TensorContract) {
+    pub fn push(&mut self, tensor: TensorContract) -> Result<(), Error> {
         if recorded(|| format!("push {tensor:?}")) {
-            return;
+            return Ok(());
         }
+        self.untiled(&tensor)?;
         self.tensors.push(tensor);
+        Ok(())
     }
 
-    pub fn extend(&mut self, tensors: impl IntoIterator<Item = TensorContract>) {
+    pub fn extend(
+        &mut self,
+        tensors: impl IntoIterator<Item = TensorContract>,
+    ) -> Result<(), Error> {
         let tensors: Vec<TensorContract> = tensors.into_iter().collect();
         if recorded(|| format!("extend {tensors:?}")) {
-            return;
+            return Ok(());
+        }
+        for t in &tensors {
+            self.untiled(t)?;
         }
         self.tensors.extend(tensors);
+        Ok(())
+    }
+
+    /// A stated tensor the compiler lays tiled must state the tiled repack.
+    fn untiled(&self, t: &TensorContract) -> Result<(), Error> {
+        if self.tiled.contains(&t.name)
+            && t.visibility == checkpoint::types::Visibility::Public
+            && !matches!(
+                t.expr,
+                Expr::Repack {
+                    layout: RepackLayout::TiledAffineU4Weight,
+                    ..
+                }
+            )
+        {
+            return Err(Error::Illegible {
+                name: t.name.clone(),
+                detail: "the compiler lays it tiled and this read states it row-major; \
+                         read it with a verb that takes the weight"
+                    .to_string(),
+            });
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -795,6 +819,7 @@ fn declare(src: &ztensor::Source, w: &Weight, expr: Expr) -> Result<TensorContra
         Encoding::Quant(_) => grouped(w),
         raw => raw,
     };
+    placed_wants_its_own_order(w, "an expression")?;
     let stored = agreed(src, &w.name, &expr)?;
     if matches!(stored, Encoding::Quant(_)) {
         holds_the_declared_count(src, w, &expr)?;
@@ -804,6 +829,22 @@ fn declare(src: &ztensor::Source, w: &Weight, expr: Expr) -> Result<TensorContra
         Encoding::Raw(_) => TensorContract::new(w.name.clone(), expr, extents(w), want),
         Encoding::Quant(_) => TensorContract::inferred(w.name.clone(), expr, want),
     })
+}
+
+fn read_over(
+    src: &ztensor::Source,
+    w: &Weight,
+    from: &str,
+    over: Expr,
+) -> Result<Vec<TensorContract>, Error> {
+    let want = encoding(w.dtype);
+    let stored = stored_encoding(src, from)?;
+    let applied = format!("{}.read", w.name);
+    let adapted = ladder(from, Expr::out(applied.clone()), &stored, &want)?;
+    Ok(vec![
+        TensorContract::new(applied, over, extents(w), stored).internal(),
+        TensorContract::new(w.name.clone(), adapted, extents(w), want),
+    ])
 }
 
 fn holds_the_declared_count(src: &ztensor::Source, w: &Weight, expr: &Expr) -> Result<(), Error> {
@@ -929,6 +970,9 @@ fn reencoded_from_block(
 /// scheme it computes over their decoded values, as a plain read of them does
 /// (`planes`); a gather may then cut their groups.
 fn computed(src: &ztensor::Source, w: &Weight, expr: Expr) -> Result<Vec<TensorContract>, Error> {
+    if placed_road_covers(w) {
+        return placed_from_encode(w, |canon| computed(src, canon, expr));
+    }
     let want = encoding(w.dtype);
     let blocks = expr.sources().into_iter().try_fold(true, |all, part| {
         Ok::<bool, Error>(all && stored_block(src, part)? && stored_encoding(src, part)? != want)
@@ -936,10 +980,6 @@ fn computed(src: &ztensor::Source, w: &Weight, expr: Expr) -> Result<Vec<TensorC
     if !blocks || !matches!(want, Encoding::Quant(_)) {
         return Ok(vec![declare(src, w, expr)?]);
     }
-    if placed_road_covers(w) {
-        return placed_from_encode(w, |canon| reencoded_from_block(src, canon, expr));
-    }
-    placed_wants_its_own_order(w, "self-contained blocks")?;
     reencoded_from_block(src, w, expr)
 }
 
@@ -2784,6 +2824,7 @@ mod tests {
     #[test]
     fn lib_every_case() {
         a_placed_row_lands_the_placement_over_the_codes_an_encode_wrote();
+        a_placed_slice_lands_the_placement_too();
         an_uncovered_placement_still_refuses_by_name();
         the_unplaced_sibling_of_that_row_still_reads_it();
         the_mlx_road_lands_the_placed_order_and_bands_its_rows();
@@ -3146,6 +3187,27 @@ mod tests {
                 .iter()
                 .any(|c| c.name == "proj.canon" && c.visibility == Visibility::Internal),
             "the encode itself stays internal"
+        );
+    }
+
+    fn a_placed_slice_lands_the_placement_too() {
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let src = raw_source(dir.path());
+        let w = Weight::sym("proj", [ROWS, K / 2], Dtype::U4g64tiled);
+        let landed = computed(
+            &src,
+            &w,
+            Expr::src("proj").slice(1, K as i64 / 2, K as i64 / 2),
+        )
+        .expect("a slice of a raw plane encodes");
+        let codes = landed
+            .iter()
+            .find(|c| c.name == "proj")
+            .expect("the bank lands");
+        assert!(
+            matches!(&codes.expr, Expr::Repack { layout, .. } if *layout == RepackLayout::TiledAffineU4Weight),
+            "{:?}",
+            codes.expr
         );
     }
 

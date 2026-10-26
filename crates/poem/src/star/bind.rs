@@ -859,6 +859,7 @@ mod tests {
                     continue;
                 };
                 let name = &rest[..rest.find(['(', '<']).unwrap()];
+                let name = name.strip_suffix('_').unwrap_or(name);
                 let bound = super::every_op().any(|op| op.module == *module && op.name == name);
                 if !bound && !unbound.contains(&format!("{module}::{name}").as_str()) {
                     missing.push(format!("{module}::{name}"));
