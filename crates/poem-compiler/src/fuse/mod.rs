@@ -6,8 +6,12 @@
 //! forms (`rules::matmul_glu(&[GluAct::Geglu])`). A backend owns the rules
 //! it implements, so a rule it holds forms only ops its dispatch fires; the
 //! compiler runs those rules alone, in the order [`rules::all`] gives, and
-//! every match is replaced.
+//! every match is replaced. Past the rules, a backend that generates kernels
+//! folds what kernels-ir describes: each product's pointwise epilogue into
+//! an anchored region ([`anchor`]), then each chain of row ops into a region
+//! ([`chain`]).
 
+pub mod anchor;
 pub mod chain;
 pub mod flags;
 pub mod rules;

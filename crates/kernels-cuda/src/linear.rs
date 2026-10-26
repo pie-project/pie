@@ -15,6 +15,7 @@ pub mod kquant;
 pub mod lane_gemm;
 pub mod lora;
 pub mod moe;
+pub mod skeleton;
 pub mod skinny;
 #[cfg(feature = "cuda")]
 pub mod w8a16;

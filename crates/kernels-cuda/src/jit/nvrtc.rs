@@ -462,9 +462,9 @@ mod tests {
                 ],
             ),
             (
-                "elemwise/frame.cu",
+                "elemwise/skeleton.cu",
                 &[
-                    "::pie::elemwise::row_frame<::pie::elemwise::ResidualAddRmsnorm<false>, 256, 4, 3, 2>",
+                    "::pie::elemwise::row_skeleton<::pie::elemwise::ResidualAddRmsnorm<false>, 256, 256, 4, 3, 2>",
                 ],
             ),
             (
@@ -503,6 +503,21 @@ mod tests {
                 &[
                     "::pie::linear::matmul_affine_tiled<::pie::bf16, ::pie::i32(4), ::pie::i32(64), \
                      ::pie::i32(64), ::pie::i32(128), ::pie::i32(256), ::pie::i32(2)>",
+                ],
+            ),
+            (
+                "linear/contract.cu",
+                &[
+                    "::pie::linear::gemv_skeleton<::pie::linear::Store, 4, 4, 1, 0, 1, true, false>",
+                    "::pie::linear::gemv_skeleton<::pie::linear::Store, 4, 4, 1, 0, 1, false, true>",
+                    "::pie::linear::gemv_splitk_skeleton<::pie::linear::Store, 8, 1, 1, 0, 1, true, false>",
+                    "::pie::linear::gemv_splitk_skeleton<::pie::linear::Store, 8, 1, 1, 0, 1, false, true>",
+                    "::pie::linear::rows_skeleton<::pie::linear::Store, 4, 8, 1, 1, 0, 1, true, false>",
+                    "::pie::linear::rows_skeleton<::pie::linear::Store, 4, 4, 2, 1, 0, 1, false, true>",
+                    "::pie::linear::skinny_skeleton<::pie::linear::Store, 4, 2, 128, 1, 0, 1, 0, 1, true, false>",
+                    "::pie::linear::skinny_skeleton<::pie::linear::Store, 4, 2, 128, 1, 0, 1, 0, 1, false, true>",
+                    "::pie::linear::skinny_skeleton<::pie::linear::Store, 8, 2, 64, 128, 0, 1, 0, 1, false, false>",
+                    "::pie::linear::norm_scales<256>",
                 ],
             ),
             (

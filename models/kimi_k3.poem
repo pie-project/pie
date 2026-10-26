@@ -3,6 +3,7 @@
 # engines), and `kimik3`, a small fixture of its architecture (2048 wide, 64
 # experts).
 
+load("//pie/codec.poem", read_fused = "fused")
 load("//lib/adapters.poem", "banks")
 
 KIMI = template("kimi")
@@ -58,7 +59,9 @@ def kda(n, l, k, hidden, weights, conv, eps, gate_floor, gate_rank = None, **ext
         conv_kernel = k.conv_kernel,
         norm_eps = eps,
         gate_floor = gate_floor,
-        qkv = weight([3 * width, hidden], weights),
+        q = weight([width, hidden], weights),
+        k = weight([width, hidden], weights),
+        v = weight([width, hidden], weights),
         conv = weight([3 * width, k.conv_kernel], conv),
         f_a = weight([k.f_rank, hidden], weights),
         f_b = weight([width, k.f_rank], weights),
@@ -258,7 +261,8 @@ def layout(id, deploy):
                 routed = True,
                 router = weight([m.experts, hidden], weights),
                 bias = weight([m.experts], dtype.f32) if m.bias else None,
-                gate_up = weight([m.experts, 2 * inter, moe_in], experts),
+                gate = weight([m.experts, inter, moe_in], experts),
+                up = weight([m.experts, inter, moe_in], experts),
                 down = weight([m.experts, moe_in, inter], experts),
                 latent = struct(
                     width = m.latent,
@@ -349,7 +353,7 @@ def squeezed(name):
     return src(name).transmute([channels, kernel], stored(name))
 
 def kda_qkv(at):
-    """The names of the q, k and v projections the packed `qkv` reads."""
+    """The names of the q, k and v projections."""
     return [at("self_attn.{}_proj.weight".format(p)) for p in ["q", "k", "v"]]
 
 def kda_conv(k, at):
@@ -465,10 +469,8 @@ def huggingface(m, reads, layout):
             stem = n("block_sparse_moe.experts.{}.{}".format(e, what))
             return stem + ".weight_packed" if has(stem + ".weight_packed") else stem + ".weight"
 
-        gate_up = []
-        for e in range(f.experts):
-            gate_up += [leg(e, "w1"), leg(e, "w3")]
-        expert_bank(reads, f.gate_up, gate_up)
+        expert_bank(reads, f.gate, [leg(e, "w1") for e in range(f.experts)])
+        expert_bank(reads, f.up, [leg(e, "w3") for e in range(f.experts)])
         expert_bank(reads, f.down, [leg(e, "w2") for e in range(f.experts)])
         # one shared expert (`shared_expert.`) or several folded into one
         # wider MLP (`shared_experts.`)
@@ -484,7 +486,8 @@ def huggingface(m, reads, layout):
         reads.read(r.proj, trunk + "output_attn_res_proj.weight")
 
 def read_kda(reads, n, k):
-    reads.read_concat(k.qkv, kda_qkv(n))
+    for w, name in zip([k.q, k.k, k.v], kda_qkv(n)):
+        reads.read(w, name)
     reads.read_expr(k.conv, kda_conv(k, n))
     reads.read(k.f_a, n("self_attn.f_a_proj.weight"))
     reads.read(k.f_b, n("self_attn.f_b_proj.weight"))
@@ -566,7 +569,7 @@ def gguf(m, reads):
             reads.read(a.gate, blk(l, "attn_gate.weight"))
             reads.read(a.o_proj, blk(l, "attn_output.weight"))
         else:
-            reads.read(a.qkv, blk(l, "ssm_in.weight"))
+            read_fused(reads, [a.q, a.k, a.v], blk(l, "ssm_in.weight"))
             reads.read(a.conv, blk(l, "ssm_conv1d.weight"))
             reads.read(a.f_a, blk(l, "ssm_f_a.weight"))
             reads.read(a.f_b, blk(l, "ssm_f_b.weight"))
@@ -583,7 +586,8 @@ def gguf(m, reads):
             reads.read(f.down, blk(l, "ffn_down.weight"))
             continue
         reads.read(f.router, blk(l, "ffn_gate_inp.weight"))
-        reads.read_concat(f.gate_up, [blk(l, "ffn_gate_exps.weight"), blk(l, "ffn_up_exps.weight")])
+        reads.read(f.gate, blk(l, "ffn_gate_exps.weight"))
+        reads.read(f.up, blk(l, "ffn_up_exps.weight"))
         reads.read(f.down, blk(l, "ffn_down_exps.weight"))
         reads.read(f.shared.gate, blk(l, "ffn_gate_shexp.weight"))
         reads.read(f.shared.up, blk(l, "ffn_up_shexp.weight"))
@@ -601,7 +605,8 @@ def kda_caches(c, k):
 def run_kda(x, inputs, k):
     conv = inputs.state(k.conv_state)
     delta = inputs.state(k.delta_state)
-    qkv = ops.linear.matmul(x, k.qkv)
+    # The short convolution and the recurrence read q, k and v side by side.
+    qkv = ops.gather.concat_cols([ops.linear.matmul(x, k.q), ops.linear.matmul(x, k.k), ops.linear.matmul(x, k.v)])
     f = ops.linear.matmul(ops.linear.matmul(x, k.f_a), k.f_b)
     b = ops.linear.matmul(x, k.b)
 
@@ -766,8 +771,9 @@ def mlp(x, f):
         )
     lat = f.latent
     z = ops.linear.matmul(x, lat.down) if lat != None else x
-    hidden = ops.linear.moe_matmul_select(z, f.gate_up, routes, f.top_k)
-    act = ops.linear.glu(hidden, gating.situ(f.beta, up_cap = f.up_cap), f.inter)
+    gate = ops.linear.moe_matmul_select(z, f.gate, routes, f.top_k)
+    up = ops.linear.moe_matmul_select(z, f.up, routes, f.top_k)
+    act = ops.linear.glu(gate, gating.situ(f.beta, up_cap = f.up_cap), up = up)
     routed = ops.linear.moe_weighted_sum(
         ops.linear.moe_matmul_select(act, f.down, routes, f.top_k),
         weights,

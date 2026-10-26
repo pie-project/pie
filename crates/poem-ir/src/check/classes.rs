@@ -462,6 +462,8 @@ fn writes_cache(op: &Operation) -> bool {
                     intermediates: crate::ops::fused::Intermediates::Unwritten,
                     ..
                 }
+                | Fused::Anchored { cache: Some(_), .. }
+                | Fused::Epilogue { cache: Some(_), .. }
         ),
         Operation::Conv(op) => match op {
             Conv::Conv3d { cache, .. } => cache.is_some(),

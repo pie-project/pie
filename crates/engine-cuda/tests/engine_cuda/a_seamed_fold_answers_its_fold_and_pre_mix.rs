@@ -128,7 +128,7 @@ fn chip(dir: &Path, seamed: bool) -> profile::Profile {
 }
 
 /// Each row count's last-row logits and median step time.
-fn run(trace: &Trace, container: &Path, dir: &Path, seamed: bool) -> Vec<(Vec<f32>, f64)> {
+fn run(trace: &Trace, container: &Path, dir: &Path, seamed: bool) -> Vec<Vec<f32>> {
     let source = ztensor::Source::open(container).expect("the fixture opens");
     let contract: ModelContract =
         poem::import::own_contract(&source, &trace.params, 1, Platform::Cuda)
@@ -161,17 +161,12 @@ fn run(trace: &Trace, container: &Path, dir: &Path, seamed: bool) -> Vec<(Vec<f3
     })
     .expect("the row loads");
     let mut shell = staged.finish().expect("the row arms");
-    let repeats: usize = std::env::var("PIE_HC_REPEATS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(10);
     ROWS.iter()
         .map(|&rows| {
             let prompt: Vec<u32> = (0..rows).map(|t| (t * 7 + 11) % 4096).collect();
             let word = trace.facts.word(&Request::new(rows, false));
             let fire = |shell: &mut Shell| {
                 shell.open(0).unwrap();
-                let at = std::time::Instant::now();
                 let mut out = shell
                     .fire(&[Lane {
                         slot: 0,
@@ -179,24 +174,18 @@ fn run(trace: &Trace, container: &Path, dir: &Path, seamed: bool) -> Vec<(Vec<f3
                         tokens: &prompt,
                     }])
                     .unwrap();
-                (out.remove(0), at.elapsed().as_secs_f64() * 1e6)
+                out.remove(0)
             };
-            let (first, _) = fire(&mut shell);
-            let mut times: Vec<f64> = (0..repeats)
-                .map(|_| {
-                    let (again, us) = fire(&mut shell);
-                    assert!(
-                        again
-                            .iter()
-                            .zip(&first)
-                            .all(|(a, b)| a.to_bits() == b.to_bits()),
-                        "seamed {seamed} rows {rows}: a fire answers as the first"
-                    );
-                    us
-                })
-                .collect();
-            times.sort_by(f64::total_cmp);
-            (first, times.get(times.len() / 2).copied().unwrap_or(0.0))
+            let first = fire(&mut shell);
+            let again = fire(&mut shell);
+            assert!(
+                again
+                    .iter()
+                    .zip(&first)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "seamed {seamed} rows {rows}: a fire answers as the first"
+            );
+            first
         })
         .collect()
 }
@@ -228,7 +217,7 @@ fn a_seamed_fold_answers_its_fold_and_pre_mix() {
     let seamed = run(&trace, &container, &dir, true);
     let apart = run(&trace, &container, &dir, false);
     let mut failed = Vec::new();
-    for ((&rows, (fused, fused_us)), (want, apart_us)) in ROWS.iter().zip(&seamed).zip(&apart) {
+    for ((&rows, fused), want) in ROWS.iter().zip(&seamed).zip(&apart) {
         let spread = want.iter().copied().fold(f32::NEG_INFINITY, f32::max)
             - want.iter().copied().fold(f32::INFINITY, f32::min);
         let gaps: Vec<f32> = fused.iter().zip(want).map(|(a, b)| (a - b).abs()).collect();
@@ -244,7 +233,7 @@ fn a_seamed_fold_answers_its_fold_and_pre_mix() {
         let differ = gaps.iter().filter(|g| **g > 0.0).count();
         eprintln!(
             "{rows:>5} rows: spread {spread:.4} worst {worst:.3e} ({:.3e} of spread) mean {mean:.3e} \
-             differ {differ}/{} argmax {} | step seamed {fused_us:.1} us apart {apart_us:.1} us",
+             differ {differ}/{} argmax {}",
             worst / spread,
             gaps.len(),
             if same { "agrees" } else { "DIFFERS" },

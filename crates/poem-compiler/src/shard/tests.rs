@@ -1,7 +1,33 @@
 use poem_ir::Platform;
 
+/// The gathers that bring a layer's captured scores back whole, each read
+/// out as `attn.scores`: one per layer whose attention captures them, each
+/// under the scores fact as its capture is, so that a fire of no lane whose
+/// program reads scores runs neither (the walk skips a guarded gather where
+/// no row holds its guard).
+fn score_gathers(trace: &poem_ir::Trace) -> usize {
+    (trace.outputs.iter())
+        .filter(|output| output.name == "attn.scores")
+        .filter(|output| match trace.values[output.value.0 as usize].def {
+            poem_ir::Def::Op(at) => {
+                let node = &trace.nodes[at as usize];
+                let gathers = poem_ir::Operands::name(&node.op) == "collective.all_gather";
+                assert!(
+                    !gathers || trace.facts.implies(&node.guard, poem_ir::Builtin::Scores),
+                    "the gather at node {at} runs under {:?}, not the scores switch",
+                    node.guard
+                );
+                gathers
+            }
+            _ => false,
+        })
+        .count()
+}
+
 /// A row-parallel projection leaves each rank a partial sum, which is reduced
-/// once, right after it, and nothing else is added.
+/// once, right after it; the tied table is cut by its rows, its lookup's rows
+/// summed once and its head's logits gathered once, and nothing else is
+/// added.
 #[test]
 fn a_split_row_reduces_each_projection_once() {
     let deployment = crate::catalog::deployment("qwen35-d0.8b-bf16-kv-bf16-tp2")
@@ -16,18 +42,19 @@ fn a_split_row_reduces_each_projection_once() {
     };
     assert_eq!(
         count("collective.all_reduce"),
-        48,
-        "one per mixer and one per mlp"
+        48 + 1,
+        "one per mixer and one per mlp, and the tied table's lookup"
     );
+    let scores = score_gathers(&trace);
     assert_eq!(
         count("collective.all_gather"),
-        0,
-        "the 0.8b row ties no vocab-split head"
+        1 + scores,
+        "the tied head's logits, once, and each full layer's scores"
     );
     let whole = crate::catalog::deployment("qwen35-d0.8b-bf16-kv-bf16")
         .expect("the one-rank row")
         .trace(Platform::Cuda);
-    assert_eq!(trace.nodes.len(), whole.nodes.len() + 48);
+    assert_eq!(trace.nodes.len(), whole.nodes.len() + 48 + 2 + scores);
 }
 
 /// A package that leaves its cuts to the compiler splits as Megatron does:
@@ -60,22 +87,31 @@ fn an_inferred_package_reduces_each_projection_once() {
         2 * LLAMA_8B_LAYERS,
         "one per attention and one per mlp"
     );
-    assert_eq!(count("collective.all_gather"), 1, "the logits, once");
+    assert_eq!(
+        score_gathers(&trace),
+        LLAMA_8B_LAYERS,
+        "each layer's scores"
+    );
+    assert_eq!(
+        count("collective.all_gather"),
+        1 + LLAMA_8B_LAYERS,
+        "the logits, once, and each layer's scores"
+    );
     assert_eq!(
         trace.nodes.len(),
-        whole.nodes.len() + 2 * LLAMA_8B_LAYERS + 1
+        whole.nodes.len() + 2 * LLAMA_8B_LAYERS + 1 + LLAMA_8B_LAYERS
     );
 }
 
 /// The layers of Llama 3.1 8B.
 const LLAMA_8B_LAYERS: usize = 32;
 
-/// A projection a package states whole reads the share before it gathered:
-/// each block of GLM-5.3-Flash's vision tower cuts its gate and up by their
-/// columns and gathers what its whole down projection reads, and its merger
-/// does the same, one gather each and none in the text model.
+/// A vision tower is cut as a trunk is, its model stating no cut: each block
+/// of GLM-5.3-Flash's vision tower cuts its gate and up by their columns and
+/// its down by its rows, reduced once, and its merger's two projections are
+/// reduced so too; nothing is gathered but the vocab-split head's logits.
 #[test]
-fn a_whole_projection_reads_its_share_gathered() {
+fn a_vision_tower_cuts_as_a_trunk_does() {
     let deployment = crate::catalog::deployment("glm53-flash-vision-u8g64-u2g64-kv-bf16-tp2")
         .expect("the catalog ships the row");
     let trace = deployment.trace(Platform::Cuda);
@@ -89,18 +125,30 @@ fn a_whole_projection_reads_its_share_gathered() {
     };
     assert!(matches!(
         shard("tower.blocks.0.gate_up"),
-        poem_ir::Shard::Cut { .. }
+        poem_ir::Shard::Cut { axis: 0, .. }
     ));
-    assert_eq!(*shard("tower.blocks.0.down"), poem_ir::Shard::Replicated);
+    assert!(matches!(
+        shard("tower.blocks.0.down"),
+        poem_ir::Shard::Cut { axis: 1, .. }
+    ));
     let gathers = trace
         .nodes
         .iter()
         .filter(|node| poem_ir::Operands::name(&node.op) == "collective.all_gather")
         .count();
+    assert_eq!(gathers, 1, "the logits, once");
+    let reduces = |trace: &poem_ir::Trace| {
+        (trace.nodes.iter())
+            .filter(|node| poem_ir::Operands::name(&node.op) == "collective.all_reduce")
+            .count()
+    };
+    let text = crate::catalog::deployment("glm53-flash-u8g64-u2g64-kv-bf16-tp2")
+        .expect("the text row")
+        .trace(Platform::Cuda);
     assert_eq!(
-        gathers,
-        GLM_TOWER_BLOCKS + 1,
-        "one a block and one for the merger"
+        reduces(&trace),
+        reduces(&text) + GLM_TOWER_BLOCKS + 2,
+        "a block's mlp each, and the merger's two projections"
     );
 }
 

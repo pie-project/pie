@@ -135,7 +135,7 @@ pub enum Fault {
         lowering: String,
     },
 
-    /// A `fused.region` the row frame does not take: poem-compiler's fold
+    /// A `fused.region` the row skeleton does not take: poem-compiler's fold
     /// forms only regions it does, so this names the compiler's bug.
     Region {
         node: u32,
@@ -337,8 +337,8 @@ impl fmt::Display for Fault {
             ),
             Self::Region { node, body, why } => write!(
                 f,
-                "the `fused.region` at node {node} (body {body:016x}) breaks the row frame's \
-                 contract: {why}. poem-compiler folds only chains the frame takes, so the fold \
+                "the `fused.region` at node {node} (body {body:016x}) breaks the row skeleton's \
+                 contract: {why}. poem-compiler folds only chains the skeleton takes, so the fold \
                  formed one it should have left as its ops"
             ),
             Self::Unbound { what } => {

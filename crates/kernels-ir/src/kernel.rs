@@ -8,10 +8,18 @@
 //! after the loop. A row value a later phase reads is kept in registers
 //! across the passes; one only its own pass reads lives in that pass alone.
 //!
-//! A reduction takes its elements two at a time, in order: an even element
-//! waits, and its odd neighbour joins it into the partial (`a = a ∘ (x₀ ∘
-//! x₁)`), as the hand row kernels take a bf16 pair. Its total is the frame's
-//! combine of the partials over the row's threads ([`crate::frame`]).
+//! A reduction accumulates each thread's partial over its elements, and its
+//! total is the skeleton's combine of the partials over the row's threads
+//! ([`crate::skeleton`]), in whatever order the skeleton's schedule takes: the
+//! order is the kernel's to choose, the sum is the region's. Over heads, a
+//! partial is a vector of 8's (each lies in one head), combined over the
+//! head's vectors.
+//!
+//! A value one a head is held a vector of 8 at a time (`v[e / 8]`),
+//! computed between passes. A gather within the row reads the row back
+//! where its pass shared it, one phase on. What a column alone computes
+//! dearly (a rotation's frequencies) is tabled once a block, before the
+//! first pass, and read back by column.
 
 use dtype::Dtype;
 
@@ -20,7 +28,7 @@ use crate::region::{Binary, Elem, Literal, Reduce, Unary, ValueId};
 /// How a kernel reads a value.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Operand {
-    /// Element `e` of row parameter `k` (the frame's load).
+    /// Element `e` of row parameter `k` (the skeleton's load).
     Param(u32),
     /// Scalar parameter `k`, one value a row.
     One(u32),
@@ -28,6 +36,16 @@ pub enum Operand {
     Kept(ValueId),
     /// A value of the current pass, or a uniform.
     Local(ValueId),
+    /// A value one a head, at element `e`'s vector (`p` between passes).
+    Heads(ValueId),
+    /// A tabled value at element `e`'s column: the table's entry `at +
+    /// column % period`.
+    Table { at: u32, period: u32 },
+    /// A value of a table's entry, computed where the table is.
+    Entry(ValueId),
+    /// Small-vector parameter `k`, its values one a row (an element `i` of
+    /// it where an expression picks one).
+    Vector(u32),
 }
 
 /// What a kernel computes of its operands.
@@ -44,16 +62,63 @@ pub enum Expr {
         from: Elem,
         to: Elem,
     },
+    /// `a * b + c`, rounded once.
+    Fma(Operand, Operand, Operand),
+    /// Element `e`'s column (a table's entry's, in a table).
+    Column,
+    /// The row a pass shared, at the column the operand names.
+    Peer(Operand),
+    /// Element `i` of a small vector.
+    Pick(Operand, u32),
+    /// A small vector with element `i` the scalar.
+    Insert(Operand, u32, Operand),
+    /// A small vector, each value the scalar.
+    Splat(Operand),
+    /// A repeat's carried value, opened from its initial value: the
+    /// uniforms after it, up to its [`Expr::Repeat`], run as its body.
+    Carry(Operand),
+    /// The repeat that `carry` opened closed: its body run `count` times,
+    /// each pass's `next` the next pass's carried value.
+    Repeat {
+        count: u32,
+        carry: ValueId,
+        next: Operand,
+    },
 }
 
-/// A value one a row, computed before its phase's pass.
+/// A value one a head, computed before its phase's pass a vector at a time.
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HeadAssign {
+    pub value: ValueId,
+    pub elem: Elem,
+    pub expr: Expr,
+    pub round: Option<Dtype>,
+}
+
+/// A value tabled once a block: `period` entries from `at` of the table,
+/// each computed from its column by `entries` (the values it is computed
+/// from, in order, the last the tabled value).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Table {
+    pub value: ValueId,
+    pub at: u32,
+    pub period: u32,
+    pub entries: Vec<(ValueId, Elem, Expr)>,
+}
+
+/// A value one a row, computed before its phase's pass: a scalar, or a
+/// small vector of `vector` values.
+#[derive(Clone, Debug, PartialEq)]
 pub struct Uniform {
     pub value: ValueId,
     pub elem: Elem,
     pub expr: Expr,
     /// Rounded where it is defined.
     pub round: Option<Dtype>,
+    /// The values a small vector holds; `None` for a scalar.
+    pub vector: Option<u32>,
+    /// The results it is stored as (a small vector, its values one a row).
+    pub stores: Vec<u32>,
 }
 
 /// A row value computed in a pass.
@@ -82,6 +147,8 @@ pub struct Partial {
     pub value: ValueId,
     pub op: Reduce,
     pub input: Operand,
+    /// Over each head of this many vectors of 8, not the row.
+    pub seg: Option<u32>,
 }
 
 /// A reduction combined over the row after its pass.
@@ -90,6 +157,7 @@ pub struct Total {
     pub value: ValueId,
     pub op: Reduce,
     pub round: Option<Dtype>,
+    pub seg: Option<u32>,
 }
 
 /// One pass over the row.
@@ -102,12 +170,19 @@ pub struct Loop {
     /// Results complete after the pass, flushed to memory.
     pub flushes: Vec<u32>,
     pub totals: Vec<Total>,
+    /// The rows the pass shares, for a gather a later pass makes.
+    pub shares: Vec<Operand>,
+    /// The pass overwrites a row an earlier pass shared, read back before
+    /// it: every thread of the row past those reads first.
+    pub sync_first: bool,
 }
 
-/// One phase: its uniforms, then its pass where it has row work.
+/// One phase: its uniforms and values a head, then its pass where it has
+/// row work.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct Phase {
     pub uniforms: Vec<Uniform>,
+    pub heads: Vec<HeadAssign>,
     pub pass: Option<Loop>,
 }
 
@@ -119,6 +194,13 @@ pub struct Kernel {
     pub results: u32,
     /// The row values kept across passes, in value order.
     pub kept: Vec<(ValueId, Elem)>,
+    /// The values one a head, in value order.
+    pub heads: Vec<(ValueId, Elem)>,
+    /// What the block tables before its first pass, and the table's floats.
+    pub tables: Vec<Table>,
+    pub table: u32,
+    /// Whether a pass shares its row (a gather).
+    pub shares: bool,
     pub phases: Vec<Phase>,
 }
 

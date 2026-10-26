@@ -40,4 +40,16 @@ __global__ void scale_rows(T* buf, const T* l, int width) {
     }
 }
 
+// A norm's gain folded into a bank (`kernels_ir::anchor::fold_bank`), in
+// place: each weight times its column's `g` (or `1 + g`), in f32, rounded
+// once to the bank's dtype. `bank` is `rows x width`, `g` `width` long.
+template <class T, class G, bool PLUS_ONE>
+__global__ void fold_gain(T* bank, const G* __restrict__ g, usize n, int width) {
+    const usize i = static_cast<usize>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float gain = Cast<G>::to_f32(g[i % static_cast<usize>(width)]);
+    if (PLUS_ONE) gain = 1.0f + gain;
+    bank[i] = Cast<T>::from_f32(Cast<T>::to_f32(bank[i]) * gain);
+}
+
 }

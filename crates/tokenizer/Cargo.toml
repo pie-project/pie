@@ -24,17 +24,8 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 memchr = "2"
 
 [dev-dependencies]
-criterion = { version = "0.8", default-features = false }
 tempfile = "3"
 tokenizers = "0.23"
-
-[[bench]]
-name = "hf_profiles"
-harness = false
-
-[[bench]]
-name = "tiktoken"
-harness = false
 
 [lints]
 workspace = true

@@ -8,10 +8,8 @@ TOKENIZER = tokenizer(markers = [QWEN_STOP])
 
 # The compiler reads how tensor-parallel ranks cut each weight off the
 # forward: the transformer's q, k and v and its gate and up by their heads
-# and channels. Their output and down projections it holds whole, as the
-# package always has, so each rank's share is gathered for them; the
-# timestep embedder; and the text encoder's attention and down projection,
-# so its gate and up are gathered for the down.
+# and channels, their output and down projections by their rows; the
+# timestep embedder and the text encoder's likewise.
 CUTS = "inferred"
 
 MODELS = [
@@ -30,12 +28,10 @@ DEPLOYMENTS = [
 # a Qwen3 4B text encoder and a Flux VAE. A deployment's tap (`-tap.{key}`)
 # names an intermediate the denoiser reads out instead of its velocity.
 
-def linear(out, in_, banks, bias = True, whole = False):
-    """A projection from `in_` to `out` and, unless `bias` is off, its bias;
-    held whole on every rank if `whole`."""
-    w = weight([out, in_], banks)
+def linear(out, in_, banks, bias = True):
+    """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
     return struct(
-        w = w.replicated() if whole else w,
+        w = weight([out, in_], banks),
         bias = weight([out]) if bias else None,
     )
 
@@ -145,27 +141,23 @@ QWEN3_4B = struct(
     eps = 1e-6,
 )
 
-def encoder(c, layers, banks, sharded = False):
-    """The encoder of config `c` through its first `layers` layers; with
-    `sharded`, its attention and mlp split across ranks."""
+def encoder(c, layers, banks):
+    """The encoder of config `c` through its first `layers` layers."""
     hidden, hd, inter = c.hidden, c.head_dim, c.inter
-
-    def whole(w):
-        return w if sharded else w.replicated()
 
     def layer(l):
         return struct(
             attn_norm = weight([hidden]),
-            q = whole(weight([c.q_heads * hd, hidden], banks)),
-            k = whole(weight([c.kv_heads * hd, hidden], banks)),
-            v = whole(weight([c.kv_heads * hd, hidden], banks)),
-            o = whole(weight([hidden, c.q_heads * hd], banks)),
+            q = weight([c.q_heads * hd, hidden], banks),
+            k = weight([c.kv_heads * hd, hidden], banks),
+            v = weight([c.kv_heads * hd, hidden], banks),
+            o = weight([hidden, c.q_heads * hd], banks),
             q_norm = weight([hd]),
             k_norm = weight([hd]),
             mlp_norm = weight([hidden]),
             gate = weight([inter, hidden], banks),
             up = weight([inter, hidden], banks),
-            down = whole(weight([hidden, inter], banks)),
+            down = weight([hidden, inter], banks),
             kv = "te.kv.{}".format(l),
         )
 
@@ -237,12 +229,12 @@ def block(d, modulated, banks):
             v = weight([dim, dim], banks),
             q_norm = norm("q_norm", hd),
             k_norm = norm("k_norm", hd),
-            out = weight([dim, dim], banks).replicated(),
+            out = weight([dim, dim], banks),
         ),
         mlp = struct(
             gate = weight([inter, dim], banks),
             up = weight([inter, dim], banks),
-            down = weight([dim, inter], banks).replicated(),
+            down = weight([dim, inter], banks),
         ),
     )
 
@@ -281,8 +273,8 @@ def layout(id, deploy):
             cap_embed = linear(dim, d.cap_width, banks),
             cap_pad_mod = weight([2 * dim, 1]),
             x_pad_mod = weight([2 * dim, 1]),
-            t_mlp0 = linear(T_MID, T_FREQ_DIM, banks, whole = True),
-            t_mlp1 = linear(ADALN_DIM, T_MID, banks, whole = True),
+            t_mlp0 = linear(T_MID, T_FREQ_DIM, banks),
+            t_mlp1 = linear(ADALN_DIM, T_MID, banks),
             t_flip = weight([1], dtype.f32, values = [T_FLIP]),
             one = weight([1], dtype.f32, values = [1.0]),
             # Every rope position is offset by the origin 1 down the time axis.

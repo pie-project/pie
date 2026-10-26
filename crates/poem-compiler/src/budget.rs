@@ -202,6 +202,15 @@ pub struct DeviceProfile {
     /// `compiler.synth_regions`).
     pub synth_regions: bool,
 
+    /// Whether each matmul and the pointwise ops over its product are
+    /// lowered to kernels-ir anchored regions and folded into
+    /// `fused.anchored` ops (`fuse::anchor`, `compiler.synth_anchors`).
+    pub synth_anchors: bool,
+
+    /// Whether an anchored region over an RMS norm's row folds the norm in
+    /// (`fuse::anchor::anchors_with`, `compiler.fold_norms`).
+    pub fold_norms: bool,
+
     pub family_us: FamilyCosts,
 
     pub exclusive: Vec<String>,
@@ -245,11 +254,13 @@ impl FamilyCosts {
                 | poem_ir::Fused::MatmulBias { .. }
                 | poem_ir::Fused::MatmulMoeRoute { .. }
                 | poem_ir::Fused::MatmulSplitRows { .. }
+                | poem_ir::Fused::Anchored { .. }
                 | poem_ir::Fused::MoeSelectGlu { .. }
                 | poem_ir::Fused::MoeExperts { .. }
                 | poem_ir::Fused::MoeMega { .. } => self.linear,
                 poem_ir::Fused::QkvFusedQknormRopeVnormWrite { .. }
-                | poem_ir::Fused::SplitQkvFused { .. } => self.custom,
+                | poem_ir::Fused::SplitQkvFused { .. }
+                | poem_ir::Fused::Epilogue { .. } => self.custom,
                 poem_ir::Fused::GdnStep { .. } => self.attn,
                 poem_ir::Fused::QGateNormRopeAppend {
                     intermediates: poem_ir::ops::fused::Intermediates::Written,
@@ -313,6 +324,8 @@ impl Default for DeviceProfile {
             dag_streams: false,
             dag_streams_until: 0,
             synth_regions: false,
+            synth_anchors: false,
+            fold_norms: false,
             family_us: FamilyCosts::default(),
             exclusive: Vec::new(),
             grouped: Vec::new(),

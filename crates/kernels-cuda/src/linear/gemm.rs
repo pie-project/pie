@@ -5,9 +5,9 @@
 use crate::error::Error;
 
 use crate::jit::{Ctx, count, dtype_dispatch, stated};
+use crate::linear::skeleton::{Epilogue, In, Paging};
 use crate::tensor::Tensor;
 
-#[cfg(feature = "cuda")]
 use dtype::Dtype;
 
 #[cfg(feature = "cuda")]
@@ -16,7 +16,7 @@ pub(crate) mod cublas;
 pub mod cublas_lt_fp8;
 
 pub fn matmul(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.matmul", act, w, None, y)
+    act_x_wt(ctx, "linear.matmul", act, w, y)
 }
 
 /// `act . w^T` over bf16 operands landing f32 (a router's logits).
@@ -51,18 +51,171 @@ pub fn matmul_f32(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(
     }
 }
 
-pub fn matmul_bias(
+/// `outs = epi(act . w^T)`: an anchored region (kernels-ir's, its epilogue
+/// printed for the contraction skeletons, [`Epilogue`]) over a dense bf16 bank
+/// of `parts · n` rows, `n` its results' width, `ins` its epilogue's inputs.
+/// The GEMM tuner times, per shape and epilogue, each contraction skeleton
+/// that covers it fused against the plain product's own tactic followed by
+/// the epilogue on the row skeleton, and fires the fastest; a fusion never
+/// forces a slower product. A shape no skeleton covers (or one a capture meets
+/// untimed) runs that unfused leg. False, landing nothing, only where the
+/// row skeleton does not carry the leg either ([`crate::linear::skeleton::serves`]
+/// says which do): the caller's unfused ops serve it then.
+#[allow(clippy::too_many_arguments)]
+pub fn anchored(
     ctx: &Ctx,
+    op: &'static str,
+    epi: &'static Epilogue,
     act: Tensor,
     w: Tensor,
-    bias: Tensor,
-    y: &mut Tensor,
-) -> Result<(), Error> {
-    act_x_wt(ctx, "fused.matmul_bias", act, w, Some(bias), y)
+    ins: &[In],
+    outs: &[Tensor],
+    paging: Option<Paging>,
+) -> Result<bool, Error> {
+    dtype_dispatch!(op, act.dtype, { Bf16 => () });
+    dtype_dispatch!(op, w.dtype, { Bf16 => () });
+    if outs.is_empty() {
+        return Err(crate::jit::refuse(op, "an anchored region of no result"));
+    }
+    let tile = w.rows / epi.parts().max(1);
+    let n = count(op, "the columns this projection lands", tile)?;
+    let k = count(op, "the contraction this projection walks", act.width)?;
+    // Each result its window of the tile (every column, or a split's piece).
+    // A paged result's plane is its cache's: rows its pages hold, its
+    // elements the cache's.
+    let shaped = (0..outs.len()).zip(outs).all(|(at, y)| match epi.paged(at) {
+        None => {
+            y.dtype == Dtype::Bf16 && y.width == epi.window(at, tile).width && y.rows == act.rows
+        }
+        Some(paged) => {
+            let element = match paged.dtype {
+                crate::linear::skeleton::CacheDtype::Bf16 => Dtype::Bf16,
+                crate::linear::skeleton::CacheDtype::E4m3 { .. } => Dtype::E4m3,
+            };
+            y.dtype == element && y.width == epi.window(at, tile).width && paging.is_some()
+        }
+    });
+    if !shaped || w.width != act.width || w.rows != tile * epi.parts() || !epi.fits(tile) {
+        return Err(crate::jit::refuse(
+            op,
+            format!(
+                "the weight is {} x {} and the region contracts {k} into {} part(s) of {n}, \
+                 every result bf16, of the activation's rows and its window's columns",
+                w.rows,
+                w.width,
+                epi.parts()
+            ),
+        ));
+    }
+    if act.rows == 0 {
+        return Ok(true);
+    }
+    let m = ctx.opaque_rows(stated(op, act.rows)?);
+    #[cfg(feature = "cuda")]
+    {
+        let planes: Vec<u64> = outs.iter().map(|y| y.ptr).collect();
+        cublas::anchored(ctx, op, epi, act.ptr, w.ptr, ins, &planes, paging, m, n, k)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (ins, paging, m, n, k);
+        Err(crate::jit::runtimeless(op))
+    }
+}
+
+/// `outs = epi(y)`: an anchored region's epilogue over a product its own op
+/// landed (`y`, bf16, `parts · n` wide), on the row skeleton (the region's
+/// unfused leg, every piece of the row), `ins` its inputs and `outs` its
+/// results (a paged one's its cache's plane, `paging` where its rows
+/// live). False, landing nothing, where the row skeleton does not carry the
+/// epilogue.
+pub fn epilogue(
+    ctx: &Ctx,
+    op: &'static str,
+    epi: &'static Epilogue,
+    y: Tensor,
+    ins: &[In],
+    outs: &[Tensor],
+    paging: Option<Paging>,
+) -> Result<bool, Error> {
+    dtype_dispatch!(op, y.dtype, { Bf16 => () });
+    let parts = epi.parts().max(1);
+    let tile = y.width / parts;
+    if y.width != tile * parts || !epi.rounds() || epi.norm().is_some() {
+        return Err(crate::jit::refuse(
+            op,
+            "an epilogue over a landed product reads its bf16 parts as stored, unnormed",
+        ));
+    }
+    if epi.pages() && paging.is_none() {
+        return Err(crate::jit::refuse(op, "a paged result fired with no paging"));
+    }
+    if y.rows == 0 {
+        return Ok(true);
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let Some(leg) = crate::linear::skeleton::RowLeg::of(epi, tile) else {
+            return Ok(false);
+        };
+        let m = ctx.opaque_rows(stated(op, y.rows)?);
+        let planes: Vec<u64> = outs.iter().map(|t| t.ptr).collect();
+        leg.fire(epi, ctx, y.ptr, ins, &planes, paging, m.unsigned_abs(), tile)?;
+        Ok(true)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (ins, outs, paging);
+        Err(crate::jit::runtimeless(op))
+    }
+}
+
+/// `out = epi(act . w^T)` on cuBLASLt's own epilogue alone (a bias, a ReLU,
+/// or a bias then a ReLU: [`Epilogue::lt`]), at the first
+/// heuristic that takes it: one of the candidates [`anchored`] times, as it
+/// runs. `ins` is the bias, where the epilogue reads one. False, landing
+/// nothing, where no cuBLASLt epilogue lands `epi`'s or no algorithm takes
+/// it.
+pub fn anchored_on_lt(
+    ctx: &Ctx,
+    op: &'static str,
+    epi: &'static Epilogue,
+    act: Tensor,
+    w: Tensor,
+    ins: &[In],
+    out: Tensor,
+) -> Result<bool, Error> {
+    dtype_dispatch!(op, act.dtype, { Bf16 => () });
+    dtype_dispatch!(op, w.dtype, { Bf16 => () });
+    let n = count(op, "the columns this projection lands", out.width)?;
+    let k = count(op, "the contraction this projection walks", act.width)?;
+    if out.dtype != Dtype::Bf16
+        || w.rows != out.width
+        || w.width != act.width
+        || out.rows != act.rows
+    {
+        return Err(crate::jit::refuse(
+            op,
+            "the weight, the activation and the result are not one dense bf16 product",
+        ));
+    }
+    if act.rows == 0 {
+        return Ok(true);
+    }
+    let m = ctx.opaque_rows(stated(op, act.rows)?);
+    #[cfg(feature = "cuda")]
+    {
+        cublas::on_lt(ctx, op, epi, act.ptr, w.ptr, ins, out.ptr, m, n, k)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (epi, ins, m, n, k);
+        Err(crate::jit::runtimeless(op))
+    }
 }
 
 pub fn lm_head(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(), Error> {
-    act_x_wt(ctx, "linear.matmul", act, w, None, y)
+    act_x_wt(ctx, "linear.matmul", act, w, y)
 }
 
 pub fn act_x_wt(
@@ -70,7 +223,6 @@ pub fn act_x_wt(
     op: &'static str,
     act: Tensor,
     w: Tensor,
-    bias: Option<Tensor>,
     y: &mut Tensor,
 ) -> Result<(), Error> {
     dtype_dispatch!(op, act.dtype, { Bf16 => () });
@@ -87,22 +239,11 @@ pub fn act_x_wt(
 
     #[cfg(feature = "cuda")]
     {
-        // The gemv folds a bf16 bias into its store; any other tactic leaves it
-        // to the add.
-        let folded = bias
-            .filter(|bias| bias.dtype == Dtype::Bf16)
-            .map_or(0, |bias| bias.ptr);
-        if cublas::act_x_wt(ctx, op, act.ptr, w.ptr, folded, y.ptr, m, n, k)? {
-            return Ok(());
-        }
-        match bias {
-            Some(bias) => crate::elemwise::pointwise::add_bias(ctx, bias, y),
-            None => Ok(()),
-        }
+        cublas::act_x_wt(ctx, op, act.ptr, w.ptr, y.ptr, m, n, k)
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (ctx, w, bias, m, n, k);
+        let _ = (ctx, w, m, n, k);
         Err(crate::jit::runtimeless(op))
     }
 }

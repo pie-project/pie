@@ -1064,7 +1064,7 @@ pub(crate) static OPS: &[Op] = &[
             "window",
             "selection",
             "sinks",
-            "whole",
+            "prefill_only",
         ],
         call: |a, heap| {
             let q: Value = a.next()?;
@@ -1077,7 +1077,7 @@ pub(crate) static OPS: &[Op] = &[
             let window: Option<u32> = a.next()?;
             let selection: Option<Value> = a.next()?;
             let sinks: Option<Weight> = a.next()?;
-            let whole: Option<bool> = a.next()?;
+            let prefill_only: Option<bool> = a.next()?;
             result(
                 heap,
                 dsl("attn.attend_mla", || {
@@ -1092,7 +1092,7 @@ pub(crate) static OPS: &[Op] = &[
                         window,
                         selection.as_ref(),
                         sinks.as_ref(),
-                        whole.unwrap_or(false),
+                        prefill_only.unwrap_or(false),
                     )
                 })?,
             )

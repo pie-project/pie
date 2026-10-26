@@ -844,18 +844,26 @@ impl Run<'_> {
                 weights: None,
                 table,
                 scales: None,
+                vocab,
                 concat: false,
                 y,
-                ..
             } => {
+                // A table of fewer rows than the vocabulary is this rank's
+                // band of it, the bands in rank order: a token another band
+                // holds looks up zeros, the ranks' rows summed after.
+                let rank = self.group.as_ref().map_or(0, |g| g.rank);
                 let (ids, table) = (self.ints(ids)?, self.floats(table)?);
+                let first = if table.rows < vocab as usize { rank * table.rows } else { 0 };
                 let mut out = Vec::with_capacity(ids.rows * table.width);
                 for &id in ids.v {
                     let id = usize::try_from(id).map_err(|_| "a negative token id")?;
-                    if id >= table.rows {
-                        return Err(format!("token {id} past the table"));
+                    if id >= vocab as usize {
+                        return Err(format!("token {id} past the vocabulary"));
                     }
-                    out.extend_from_slice(table.row(id));
+                    match id.checked_sub(first).filter(|at| *at < table.rows) {
+                        Some(at) => out.extend_from_slice(table.row(at)),
+                        None => out.extend(std::iter::repeat_n(0.0, table.width)),
+                    }
                 }
                 let rows = ids.rows;
                 self.put(y, rows, out)

@@ -1,6 +1,8 @@
 use kernels_cuda::{Tensor, elemwise};
 use poem_exec::{DispatchElemwise, KernelError};
-use poem_ir::{Elemwise, Fused, ModulateForm, MropeForm, NormKind, Operands, RopeForm, Turn};
+#[cfg(feature = "rocm")]
+use poem_ir::NormKind;
+use poem_ir::{Elemwise, Fused, ModulateForm, MropeForm, Operands, RopeForm, Turn};
 use poem_ir::{GateHeads, NormAxis, NormWeight, ResidualGate};
 
 use crate::run::Run;
@@ -19,6 +21,7 @@ impl DispatchElemwise for Run<'_> {
     }
 }
 
+#[cfg(feature = "rocm")]
 fn fused_norm(norm: NormKind, width: u32) -> Option<elemwise::modulate::NormKind> {
     match norm {
         NormKind::Layernorm { eps } => {
@@ -32,6 +35,7 @@ fn fused_norm(norm: NormKind, width: u32) -> Option<elemwise::modulate::NormKind
 }
 
 impl Run<'_> {
+    #[cfg(feature = "rocm")]
     fn scale_free_norm(
         &self,
         norm: NormKind,
@@ -130,6 +134,9 @@ impl Run<'_> {
                     post,
                 )
             }
+            // CUDA runs a scaled embedding's chain and a DiT block's norm and
+            // modulation as generated regions; ROCm forms their fused ops.
+            #[cfg(feature = "rocm")]
             Fused::EmbedScaleAdd {
                 ids,
                 table,
@@ -153,6 +160,7 @@ impl Run<'_> {
                 *out_scale,
                 &mut self.tensor(*y_scaled),
             ),
+            #[cfg(feature = "rocm")]
             Fused::EmbedScaleAddSelect {
                 ids,
                 table,
@@ -181,6 +189,9 @@ impl Run<'_> {
                 *out_scale,
                 &mut self.tensor(*y_scaled),
             ),
+            // CUDA runs a head's norm and the turn of its first dims as a
+            // generated region; ROCm forms the fused op.
+            #[cfg(feature = "rocm")]
             Fused::NormRope {
                 x,
                 weight: Some(weight),
@@ -253,6 +264,7 @@ impl Run<'_> {
                 }),
                 &mut self.tensor(*y),
             ),
+            #[cfg(feature = "rocm")]
             Fused::NormModulate {
                 x,
                 norm,
@@ -291,6 +303,7 @@ impl Run<'_> {
                     }
                 }
             }
+            #[cfg(feature = "rocm")]
             Fused::GatedResidualNormModulate {
                 r,
                 g,

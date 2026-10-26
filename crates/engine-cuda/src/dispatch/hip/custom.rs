@@ -39,7 +39,9 @@ impl DispatchFused for Run<'_> {
         match op {
             _ if refuses(op) => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             // A synthesized region's body is not launched here yet.
-            Fused::Region { .. } => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
+            Fused::Region { .. } | Fused::Anchored { .. } | Fused::Epilogue { .. } => {
+                Err(kernels_cuda::Error::Unsupported { op: op.name() })
+            }
             Fused::GdnStep { .. } => return self.gdn_step(op),
             Fused::QGateNormRopeAppend { .. } => return self.q_gate_append(op),
             Fused::QkvFusedQknormRopeVnormWrite { .. } => self.qkv_write(op),

@@ -102,7 +102,8 @@ def declare(head, prefix, hidden, vocab, norm_eps, w, dense, blocks_w = None):
             mlp_norm = weight([hidden]),
             mlp_norm_eps = norm_eps,
             mlp = struct(
-                gate_up = weight([2 * inter, hidden], bw),
+                gate = weight([inter, hidden], bw),
+                up = weight([inter, hidden], bw),
                 down = weight([hidden, inter], bw),
                 inter = inter,
             ),
@@ -190,7 +191,8 @@ def bind_aux(d, reads, norm):
             if c != None:
                 reads.read_expr(c.base, flattened(n("{}.base_kernel".format(which)), c.base.shape))
                 reads.read(c.proj, n("{}.kernel_projection.weight".format(which)))
-        reads.read_concat(block.mlp.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+        reads.read(block.mlp.gate, n("mlp.gate_proj.weight"))
+        reads.read(block.mlp.up, n("mlp.up_proj.weight"))
         reads.read(block.mlp.down, n("mlp.down_proj.weight"))
     reads.read_expr(d.norm, norm("aux.norm.weight"))
     sel = d.selector
@@ -283,7 +285,7 @@ def arm(d, inputs, fused, h_block, block_draft):
         x = ops.elemwise.rmsnorm_plus_one(h, b.mlp_norm, b.mlp_norm_eps)
         x, mlp_coeff = conv_prepare(x, b.mlp_conv)
         f = ops.linear.matmul(
-            ops.linear.glu(ops.linear.matmul(x, b.mlp.gate_up), gating.swiglu(), b.mlp.inter),
+            ops.linear.glu(ops.linear.matmul(x, b.mlp.gate), gating.swiglu(), up = ops.linear.matmul(x, b.mlp.up)),
             b.mlp.down,
         )
         f = conv_finish(f, b.mlp_conv, mlp_coeff)

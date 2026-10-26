@@ -35,16 +35,6 @@ def linear(out, in_, banks, bias = True):
         bias = weight([out]) if bias else None,
     )
 
-def packed_linear(seams, in_, banks):
-    """A biased projection whose output is the `seams`-wide pieces end to end."""
-    out = 0
-    for s in seams:
-        out += s
-    return struct(
-        w = weight([out, in_], banks),
-        bias = weight([out]),
-    )
-
 def embedder(prefix, in_, dim, banks):
     """A two-layer timestep (or caption) embedder from `in_` to `dim`."""
     return struct(
@@ -131,15 +121,11 @@ def attention(prefix, dim, heads, head_dim, banks, ctx = None):
     """Self-attention, or (given the `ctx` width it attends) cross-attention,
     gated per head."""
     inner = heads * head_dim
-    if ctx == None:
-        qkv = packed_linear([inner, inner, inner], dim, banks)
-        kv = None
-    else:
-        qkv = linear(inner, dim, banks)
-        kv = packed_linear([inner, inner], ctx, banks)
+    kv_in = dim if ctx == None else ctx
     return struct(
-        qkv = qkv,
-        kv = kv,
+        q = linear(inner, dim, banks),
+        k = linear(inner, kv_in, banks),
+        v = linear(inner, kv_in, banks),
         q_norm = gain(inner, banks),
         k_norm = gain(inner, banks),
         gate = linear(heads, dim, banks),
@@ -325,11 +311,6 @@ def biased(reads, w, stem):
     if w.bias != None:
         reads.read(w.bias, stem + ".bias")
 
-def packed(reads, w, stems):
-    """A packed biased projection, its pieces from each of `stems`."""
-    reads.read_concat(w.w, [s + ".weight" for s in stems])
-    reads.read_concat(w.bias, [s + ".bias" for s in stems])
-
 def adaln_order(slices):
     """The order a layout takes an adaLN projection's `slices` slices in
     from a checkpoint's: each (shift, scale) pair as (scale, shift), each
@@ -449,11 +430,9 @@ def side(reads, s, stem, prefix, dim):
     feed_forward(reads, s.ffn, "{}.{}ff".format(stem, prefix))
 
 def read_attention(reads, a, stem):
-    if a.kv == None:
-        packed(reads, a.qkv, [stem + ".to_q", stem + ".to_k", stem + ".to_v"])
-    else:
-        biased(reads, a.qkv, stem + ".to_q")
-        packed(reads, a.kv, [stem + ".to_k", stem + ".to_v"])
+    biased(reads, a.q, stem + ".to_q")
+    biased(reads, a.k, stem + ".to_k")
+    biased(reads, a.v, stem + ".to_v")
     reads.read(a.q_norm, stem + ".norm_q.weight")
     reads.read(a.k_norm, stem + ".norm_k.weight")
     biased(reads, a.gate, stem + ".to_gate_logits")
@@ -585,16 +564,16 @@ def gate_out(o, h, a):
     return run_linear(a.out, gated)
 
 def self_attention(h, a, dims, g):
-    q, k, v = ops.gather.split_qkv(run_linear(a.qkv, h), a.inner, a.inner)
+    q, k, v = run_linear(a.q, h), run_linear(a.k, h), run_linear(a.v, h)
     q = turn(qk_norm(q, a.q_norm), g.positions, dims, a.head_dim)
     k = turn(qk_norm(k, a.k_norm), g.positions, dims, a.head_dim)
     o = attend(q, k, v, g, g, a.head_dim, a.sm_scale, group_block_diagonal())
     return gate_out(o, h, a)
 
 def cross_attention(h, ctx, a, rope, qg, kg):
-    q = qk_norm(run_linear(a.qkv, h), a.q_norm)
-    k, v = ops.gather.split_rows(run_linear(a.kv, ctx), a.inner)
-    k = qk_norm(k, a.k_norm)
+    q = qk_norm(run_linear(a.q, h), a.q_norm)
+    k = qk_norm(run_linear(a.k, ctx), a.k_norm)
+    v = run_linear(a.v, ctx)
     if rope != None:
         q_pos, k_pos, dims = rope
         q = turn(q, q_pos, dims, a.head_dim)

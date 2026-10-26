@@ -4,7 +4,7 @@
 # import reads either as Qwen3.5 unless told `--deployment ornith15-397b-...`. Ternary-Bonsai 27B and the test geometries are unlisted models of
 # it that tests trace and import by id.
 
-load("//pie/codec.poem", "bank", "kept", read_weight = "weight")
+load("//pie/codec.poem", "bank", "kept", read_fused = "fused", read_weight = "weight")
 load("//lib/adapters.poem", "banks")
 load("//lib/dflash.poem", "bind_aux", "arm", "block_rows", "plant_readout", "tap", "markov", "selector", dflash_caches = "caches", dflash_declare = "declare", dflash_head = "head")
 load("//lib/media.poem", "smart_resize")
@@ -25,10 +25,10 @@ TOKENIZER_38 = tokenizer(markers = [QWEN_STOP], pinned = QWEN_AUDIO, parts = {"v
 
 # The compiler reads how tensor-parallel ranks cut each weight off the
 # forward: the gated attention's q and gate, k and v by their heads, the GDN
-# mixer's packed projections, convolution and per-head parameters by its
+# mixer's projections, convolution and per-head parameters by its
 # heads, the gates and ups, dense, shared and routed, by their channels, the
-# output and down projections by their rows, the head by its vocabulary. The
-# vision tower and a tied table it holds whole, as the package always has.
+# output and down projections by their rows, the head and a tied table by
+# their vocabulary, and the vision tower's mlp as the trunk's.
 CUTS = "inferred"
 
 def qwen(id, layers, vocab = 248320, template = CHATML, tokenizer = TOKENIZER, **kwargs):
@@ -220,8 +220,10 @@ def gdn(d, proj, ba, dense, conv_state, delta_state):
         v_dim = d.v_dim,
         qkv_width = qkv,
         conv_kernel = d.conv_kernel,
-        in_qkvz = weight([qkv + v_w, d.hidden], proj),
-        in_ba = weight([2 * d.v_heads, d.hidden], ba),
+        in_qkv = weight([qkv, d.hidden], proj),
+        in_z = weight([v_w, d.hidden], proj),
+        in_b = weight([d.v_heads, d.hidden], ba),
+        in_a = weight([d.v_heads, d.hidden], ba),
         conv = weight([qkv, d.conv_kernel]),
         dt_bias = weight([d.v_heads]),
         a_log = weight([d.v_heads], dtype.f32),
@@ -238,7 +240,8 @@ def routed(n, hidden, m, experts, proj, gate):
     return struct(
         routed = True,
         router = weight([m.experts, hidden], gate),
-        gate_up = weight([m.experts, 2 * m.inter, hidden], experts),
+        gate = weight([m.experts, m.inter, hidden], experts),
+        up = weight([m.experts, m.inter, hidden], experts),
         down = weight([m.experts, hidden, m.inter], experts),
         shared = struct(
             gate = weight([m.shared_inter, hidden], proj),
@@ -285,7 +288,7 @@ def tower(size, out, dt):
     ti = size.inter
     merged = MERGE * MERGE * th
     head_dim = th // size.heads
-    plane = lambda s, dims: weight(dims, dt).replicated()
+    plane = lambda s, dims: weight(dims, dt)
     vec = lambda s, length: weight([length], dt)
 
     def block(l):
@@ -649,9 +652,7 @@ def layout(id, deploy):
     # kernel does: it is served decoded.
     embed = weight([d.vocab, hidden], dense if bonsai else table)
     head = None
-    if d.tied:
-        embed = embed.replicated()
-    else:
+    if not d.tied:
         head = weight([d.vocab, hidden], head_at)
     signs = None
     if bonsai:
@@ -773,13 +774,10 @@ def read_attn(reads, a, n, norm):
     reads.read_expr(a.k_norm, norm(n("self_attn.k_norm.weight")))
 
 def read_gdn(reads, g, n):
-    read_weight(
-        reads,
-        g.in_qkvz,
-        [n("linear_attn.in_proj_qkv.weight"), n("linear_attn.in_proj_z.weight")],
-        quantized = "read",
-    )
-    reads.read_concat(g.in_ba, [n("linear_attn.in_proj_b.weight"), n("linear_attn.in_proj_a.weight")])
+    read_weight(reads, g.in_qkv, n("linear_attn.in_proj_qkv.weight"), quantized = "read")
+    read_weight(reads, g.in_z, n("linear_attn.in_proj_z.weight"), quantized = "read")
+    reads.read(g.in_b, n("linear_attn.in_proj_b.weight"))
+    reads.read(g.in_a, n("linear_attn.in_proj_a.weight"))
     reads.read_expr(g.conv, squeezed(n("linear_attn.conv1d.weight")))
     reads.read(g.dt_bias, n("linear_attn.dt_bias"))
     reads.read(g.a_log, n("linear_attn.A_log"))
@@ -789,15 +787,18 @@ def read_gdn(reads, g, n):
 def read_routed(reads, f, n, layout):
     reads.read(f.router, n("mlp.gate.weight"))
     if layout.mlx:
-        reads.read_concat(f.gate_up, [n("mlp.switch_mlp.gate_proj.weight"), n("mlp.switch_mlp.up_proj.weight")])
+        reads.read(f.gate, n("mlp.switch_mlp.gate_proj.weight"))
+        reads.read(f.up, n("mlp.switch_mlp.up_proj.weight"))
         reads.read(f.down, n("mlp.switch_mlp.down_proj.weight"))
-    elif kept(f.gate_up):
+    elif kept(f.gate):
         # A quantized release stores each expert apart.
         e = lambda i, s: n("mlp.experts.{}.{}.weight".format(i, s))
-        bank(reads, f.gate_up, [[e(i, "gate_proj"), e(i, "up_proj")] for i in range(f.experts)])
+        bank(reads, f.gate, [[e(i, "gate_proj")] for i in range(f.experts)])
+        bank(reads, f.up, [[e(i, "up_proj")] for i in range(f.experts)])
         bank(reads, f.down, [[e(i, "down_proj")] for i in range(f.experts)])
     else:
-        reads.read(f.gate_up, n("mlp.experts.gate_up_proj"))
+        # The release stores each expert's gate rows, then its up rows.
+        read_fused(reads, [f.gate, f.up], n("mlp.experts.gate_up_proj"), axis = 1)
         reads.read(f.down, n("mlp.experts.down_proj"))
     read_weight(reads, f.shared.gate, n("mlp.shared_expert.gate_proj.weight"), quantized = "read")
     read_weight(reads, f.shared.up, n("mlp.shared_expert.up_proj.weight"), quantized = "read")
@@ -924,11 +925,14 @@ def next_gdn(reads, g, n):
     k_w, v_g = g.k_dim, (g.v_heads // g.k_heads) * g.v_dim
     stride = 2 * k_w + 2 * v_g
     pick = lambda at, width: [h * stride + at + i for h in range(g.k_heads) for i in range(width)]
-    order = pick(0, k_w) + pick(k_w, k_w) + pick(2 * k_w, v_g) + pick(2 * k_w + v_g, v_g)
-    read_weight(reads, g.in_qkvz, n("linear_attn.in_proj_qkvz.weight"), rows = order, quantized = "read")
+    qkvz = n("linear_attn.in_proj_qkvz.weight")
+    read_weight(reads, g.in_qkv, qkvz, rows = pick(0, k_w) + pick(k_w, k_w) + pick(2 * k_w, v_g), quantized = "read")
+    read_weight(reads, g.in_z, qkvz, rows = pick(2 * k_w + v_g, v_g), quantized = "read")
     per = g.v_heads // g.k_heads
     ba_pick = lambda at: [h * 2 * per + at + i for h in range(g.k_heads) for i in range(per)]
-    reads.read_expr(g.in_ba, src(n("linear_attn.in_proj_ba.weight")).gather(0, ba_pick(0) + ba_pick(per)))
+    ba = src(n("linear_attn.in_proj_ba.weight"))
+    reads.read_expr(g.in_b, ba.gather(0, ba_pick(0)))
+    reads.read_expr(g.in_a, ba.gather(0, ba_pick(per)))
     reads.read_expr(g.conv, squeezed(n("linear_attn.conv1d.weight")))
     reads.read(g.dt_bias, n("linear_attn.dt_bias"))
     reads.read(g.a_log, n("linear_attn.A_log"))
@@ -953,10 +957,8 @@ def qwen3_next(m, reads):
         f = w.mlp
         reads.read(f.router, n("mlp.gate.weight"))
         e = lambda i, s: n("mlp.experts.{}.{}.weight".format(i, s))
-        gate_up = [[e(i, "gate_proj"), e(i, "up_proj")] for i in range(f.experts)]
-        down = [[e(i, "down_proj")] for i in range(f.experts)]
-        bank(reads, f.gate_up, gate_up)
-        bank(reads, f.down, down)
+        for held, leg in [(f.gate, "gate_proj"), (f.up, "up_proj"), (f.down, "down_proj")]:
+            bank(reads, held, [[e(i, leg)] for i in range(f.experts)])
         read_weight(reads, f.shared.gate, n("mlp.shared_expert.gate_proj.weight"), quantized = "read")
         read_weight(reads, f.shared.up, n("mlp.shared_expert.up_proj.weight"), quantized = "read")
         read_weight(reads, f.shared_down, n("mlp.shared_expert.down_proj.weight"), quantized = "read")
@@ -1098,31 +1100,34 @@ def gguf(m, reads):
             untile = tiled and rep > 1   # one v-head per k-head is the same either way
             sigma = lambda prefix, width: v_head_reorder_rows(prefix, heads, width, g.k_heads, rep)
 
+            # `ssm_in` is qkv's rows, then z's.
             fused = spelled([n("ssm_in.weight")])
+            z_base = k_w + heads * width
             if fused != None and untile:
-                z_base = k_w + heads * width
-                reads.read_expr(g.in_qkvz, src(fused).gather(0, sigma(k_w, width) + [z_base + i for i in sigma(0, width)]))
+                rows = sigma(k_w, width) + [z_base + i for i in sigma(0, width)]
+                read_fused(reads, [g.in_qkv, g.in_z], fused, rows = rows)
             elif fused != None:
-                reads.read(g.in_qkvz, fused)
+                read_fused(reads, [g.in_qkv, g.in_z], fused)
             elif untile:
-                qkv = src(n("attn_qkv.weight")).gather(0, sigma(k_w, width))
-                gate = src(n("attn_gate.weight")).gather(0, sigma(0, width))
-                reads.read_expr(g.in_qkvz, concat(0, [qkv, gate]))
+                reads.read_expr(g.in_qkv, src(n("attn_qkv.weight")).gather(0, sigma(k_w, width)))
+                reads.read_expr(g.in_z, src(n("attn_gate.weight")).gather(0, sigma(0, width)))
             else:
-                reads.read_concat(g.in_qkvz, [n("attn_qkv.weight"), n("attn_gate.weight")])
+                reads.read(g.in_qkv, n("attn_qkv.weight"))
+                reads.read(g.in_z, n("attn_gate.weight"))
 
-            # `in_ba` is `[beta, alpha]`, beta first.
-            legs = [n("ssm_beta.weight"), n("ssm_alpha.weight")]
+            # `ssm_beta_alpha` is the betas' rows, then the alphas'.
             fused = spelled([n("ssm_beta_alpha.weight")])
+            idx = sigma(0, 1)
             if fused != None and untile:
-                idx = sigma(0, 1)
-                reads.read_expr(g.in_ba, src(fused).gather(0, idx + [len(idx) + i for i in sigma(0, 1)]))
+                read_fused(reads, [g.in_b, g.in_a], fused, rows = idx + [len(idx) + i for i in idx])
             elif fused != None:
-                reads.read(g.in_ba, fused)
-            elif untile:
-                reads.read_expr(g.in_ba, concat(0, [src(leg).gather(0, sigma(0, 1)) for leg in legs]))
+                read_fused(reads, [g.in_b, g.in_a], fused)
             else:
-                reads.read_concat(g.in_ba, legs)
+                for leg, name in [(g.in_b, n("ssm_beta.weight")), (g.in_a, n("ssm_alpha.weight"))]:
+                    if untile:
+                        reads.read_expr(leg, src(name).gather(0, idx))
+                    else:
+                        reads.read(leg, name)
             if untile:
                 reads.read_expr(g.conv, src(n("ssm_conv1d.weight")).gather(0, sigma(k_w, width)))
                 reads.read_expr(g.dt_bias, src(n("ssm_dt.bias")).gather(0, sigma(0, 1)))
@@ -1154,7 +1159,8 @@ def gguf(m, reads):
             reads.read(f.down, n("ffn_down.weight"))
         else:
             reads.read(f.router, n("ffn_gate_inp.weight"))
-            reads.read_concat(f.gate_up, [n("ffn_gate_exps.weight"), n("ffn_up_exps.weight")])
+            reads.read(f.gate, n("ffn_gate_exps.weight"))
+            reads.read(f.up, n("ffn_up_exps.weight"))
             reads.read(f.down, n("ffn_down_exps.weight"))
             reads.read(f.shared.gate, n("ffn_gate_shexp.weight"))
             reads.read(f.shared.up, n("ffn_up_shexp.weight"))
@@ -1234,7 +1240,8 @@ def run_moe(x, f):
         routing.softmax(),
     )
 
-    hidden = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, experts, f.top_k), gating.swiglu(), f.inter)
+    gate = ops.linear.moe_matmul_select(x, f.gate, experts, f.top_k)
+    hidden = ops.linear.glu(gate, gating.swiglu(), up = ops.linear.moe_matmul_select(x, f.up, experts, f.top_k))
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(hidden, f.down, experts, f.top_k), weights)
     gate, up = ops.linear.matmul(x, f.shared.gate), ops.linear.matmul(x, f.shared.up)
     shared = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), f.shared_down)
@@ -1488,15 +1495,13 @@ def attn_mixer(x, inputs, m, plans, mask, a):
 def gdn_mixer(x, inputs, g, bonsai):
     conv_state = inputs.state(g.conv_state)
     delta_state = inputs.state(g.delta_state)
-    # Bonsai: in_qkvz reads the rotated residual; in_ba the unrotated one.
+    # Bonsai: q, k, v and z read the rotated residual; beta and alpha the
+    # unrotated one.
     qkvz_in = rot_copy(x, bonsai.hidden) if bonsai != None else x
-    qkvz = ops.linear.matmul(qkvz_in, g.in_qkvz)
-    ba = ops.linear.matmul(x, g.in_ba)
-    width = g.qkv_width
-
-    # The cut before the switch: a backend may land qkv and z from the
-    # projection's two weight slices, the packed rows never written.
-    qkv, z = ops.gather.split_rows(qkvz, width)
+    qkv = ops.linear.matmul(qkvz_in, g.in_qkv)
+    z = ops.linear.matmul(qkvz_in, g.in_z)
+    # The gates read each v head's beta and alpha side by side.
+    ba = ops.gather.concat_cols([ops.linear.matmul(x, g.in_b), ops.linear.matmul(x, g.in_a)])
 
     def step(qkv):
         qkv = ops.ssm.causal_conv1d(qkv, g.conv, conv_state, g.conv_kernel)

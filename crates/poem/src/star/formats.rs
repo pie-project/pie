@@ -637,15 +637,18 @@ pub(crate) fn formats(builder: &mut GlobalsBuilder) {
                         ("name", heap.alloc(join.name.as_str())),
                         ("legs", heap.alloc(join.legs.clone())),
                         ("first", heap.alloc(join.legs[0] == path)),
+                        ("axis", heap.alloc(join.axis)),
                     ]))
                 })
         }))
     }
 
-    /// The weights `legs` joined along their rows into one named `name`.
+    /// The weights `legs` joined along their rows into one named `name`;
+    /// legs every rank holds whole, along `axis` (their rows, a bank's 1).
     fn join(
         #[starlark(require = pos)] legs: UnpackList<Value<'_>>,
         #[starlark(require = pos)] name: &str,
+        #[starlark(require = named, default = 0)] axis: u32,
     ) -> anyhow::Result<crate::star::values::WeightValue> {
         let legs = legs
             .items
@@ -658,7 +661,7 @@ pub(crate) fn formats(builder: &mut GlobalsBuilder) {
                     })
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        crate::Weight::joined(name, &legs)
+        crate::Weight::joined_along(name, &legs, Some(axis))
             .map(crate::star::values::WeightValue)
             .map_err(|why| anyhow::anyhow!("{why}"))
     }

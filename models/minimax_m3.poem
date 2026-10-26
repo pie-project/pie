@@ -8,8 +8,8 @@ TOKENIZER = tokenizer(markers = [["[e~[", "]~b]", "]~!b[", "]<]minimax[>[", "<mm
 
 # The compiler reads how tensor-parallel ranks cut each weight off the
 # forward: q, k and v by their heads, the dense and routed gates and ups by
-# their channels, the output and down projections by their rows. The head
-# it holds whole, as the package always has.
+# their channels, the output and down projections by their rows, the head
+# by its vocabulary.
 CUTS = "inferred"
 
 def m3(id, **kwargs):
@@ -181,7 +181,7 @@ def layout(id, deploy):
         norm_eps = d.norm_eps,
         kv = deploy.kv,
         embed = weight([d.vocab, d.hidden], mix.embed),
-        head = weight([d.vocab, d.hidden], mix.head).replicated(),
+        head = weight([d.vocab, d.hidden], mix.head),
         final_norm = weight([d.hidden]),
         layers = [layer(l) for l in range(d.layers)],
     )

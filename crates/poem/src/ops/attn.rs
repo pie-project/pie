@@ -1390,8 +1390,8 @@ fn possible(x: &Value, rows: poem_ir::Guard) -> bool {
 
 /// Latent attention of the absorbed queries `q` (and their rotated part
 /// `q_pe`) over the latent kv row `kv`: a lane querying one token by decode,
-/// the rest by prefill; with `whole`, every lane by prefill (rows that read
-/// their keys whole, as a draft head's). With a `selection`, each lane reads
+/// the rest by prefill; with `prefill_only`, every lane by prefill (a draft
+/// head's rows). With a `selection`, each lane reads
 /// only the keys its indexer picked; `window` bounds what a lane without one
 /// reads. With `sinks`, the arms' log-sum-exps are merged and the sink
 /// logits folded in once. What comes back is still in the latent space, for
@@ -1410,7 +1410,7 @@ pub fn attend_mla(
     window: Option<u32>,
     selection: Option<&Value>,
     sinks: Option<&Weight>,
-    whole: bool,
+    prefill_only: bool,
 ) -> Value {
     use crate::fact;
     use crate::record::Refine;
@@ -1449,7 +1449,7 @@ pub fn attend_mla(
             selection.as_ref(),
         )
     };
-    let arms = if whole {
+    let arms = if prefill_only {
         vec![arm(false, Guard::Always, inputs)]
     } else {
         let one = rec.guard_of(&fact::single_token());

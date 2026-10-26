@@ -161,12 +161,6 @@ fn weight_methods(builder: &mut MethodsBuilder) {
         crate::star::forward::dsl("rows", || WeightValue(this.0.clone().rows()))
     }
 
-    /// Every rank holds the weight whole: what a model states of a weight
-    /// whose cut the compiler would otherwise infer.
-    fn replicated(this: &WeightValue) -> anyhow::Result<WeightValue> {
-        Ok(WeightValue(this.0.clone().replicated()))
-    }
-
     /// The weight is read only by row gathers (a hashed table): a card whose
     /// profile says so serves it from pinned host memory the device reads
     /// through, every other card from its own memory.

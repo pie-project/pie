@@ -6,7 +6,7 @@ mod rows;
 pub(crate) use embed::comm_rank;
 pub use embed::{
     embed, embed_concat, embed_concat_e4m3, embed_concat_mlxu4, embed_concat_mxfp8,
-    embed_mlx_affine, embed_scale_add, embed_scale_add_select, embed_vocab_shard, embed_weighted,
+    embed_mlx_affine, embed_vocab_shard, embed_weighted,
 };
 pub use ngram::{ngram_ids, ngram_ids_chunked};
 pub use pixels::{grid_taps, pixels};

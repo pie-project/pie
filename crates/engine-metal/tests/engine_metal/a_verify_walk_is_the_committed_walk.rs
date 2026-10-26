@@ -5,9 +5,6 @@
 //! scan do, and the row-parallel conv the bits of the committed conv; each
 //! lane's replayed rows folded first and its own rows landed, a lane longer
 //! than one staged pass and a prompt lane's snapshots among them.
-//! The microbenchmark prices both arms on one verify round's layer:
-//!   cargo test --release -p engine-metal --test engine_metal \
-//!     a_verify_walk -- --include-ignored --nocapture
 
 use engine_metal::device::{Buffer, Context, Handles, Pipelines};
 use engine_metal::encode::Sink;
@@ -30,7 +27,6 @@ const PAGED_SLOTS: i32 = 20;
 const PAGE: u32 = 4;
 const TAPS: u32 = 4;
 const CONV_FLOATS: u64 = TAPS as u64 * QKV_WIDTH as u64;
-const LAYERS: u32 = 30;
 
 fn noise(at: u64) -> u32 {
     let mut x = at.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x1234_5678_9ABC_DEF0;
@@ -153,11 +149,11 @@ impl Bench {
         self.read(t, from as u64 * row, n as u64 * row)
     }
 
-    fn run(&self, fire: &dyn Fn(&Sink)) -> f64 {
+    fn run(&self, fire: &dyn Fn(&Sink)) {
         let frame = self.device.frame().expect("a frame");
         let sink = Sink::new(&self.device, &frame, &self.pipelines, &self.handles);
         fire(&sink);
-        frame.commit_timed().expect("the commit")
+        frame.commit().expect("the commit");
     }
 }
 
@@ -651,194 +647,4 @@ fn a_verify_walk_is_the_committed_walk() {
     eprintln!(
         "the verify arm's banks, windows, snapshots, readouts and gates are the committed arm's, bit for bit"
     );
-}
-
-fn median(mut v: Vec<f64>) -> f64 {
-    v.sort_by(f64::total_cmp);
-    v[v.len() / 2]
-}
-
-#[test]
-#[ignore = "a microbenchmark"]
-fn a_verify_walk_prices_against_the_committed_walk() {
-    let Some(bench) = Bench::new() else {
-        return;
-    };
-    // A verify round of the 35B, eight rows behind five replayed, and one
-    // row alone, the bank traffic's floor.
-    price_round(&bench, 8, 5);
-    price_round(&bench, 1, 0);
-}
-
-/// Each arm over `rows` rows behind `replay` replayed, the replayed rows
-/// committed, each of the 30 layers its own state, as cold as a round
-/// finds it.
-fn price_round(bench: &Bench, rows: i32, replay: i32) {
-    let lanes = Lanes {
-        rows: vec![rows],
-        replay: vec![replay],
-        commit: vec![replay.max(1)],
-        old_slots: vec![0],
-        new_slots: vec![0],
-    };
-    let ext = lanes.extended();
-    let x = inputs(bench, ext);
-    let indptr = bench.i32s(&lanes.indptr());
-    let layers: Vec<Committed> = (0..LAYERS)
-        .map(|l| Committed {
-            replay: bench.i32s(&lanes.replay),
-            commit: bench.i32s(&lanes.commit),
-            slots: bench.i32s(&[(l % SLOTS) as i32]),
-            lane0: 0,
-        })
-        .collect();
-    let ext_gates = bench.zeroed(ext, BA_WIDTH, Dtype::F32);
-    let ext_y = bench.zeroed(ext, Y_WIDTH, Dtype::F32);
-    let ext_conv = bench.zeroed(ext, QKV_WIDTH, Dtype::Bf16);
-    let land = bench.zeroed(rows as u32, QKV_WIDTH, Dtype::Bf16);
-    let gates = VerifyGates {
-        ba: x.ba,
-        dt_bias: x.dt_bias,
-        a_log: x.a_log,
-        gates: bench.zeroed(rows as u32, BA_WIDTH, Dtype::F32),
-    };
-    let own_y = bench.zeroed(rows as u32, Y_WIDTH, Dtype::F32);
-    let work = bench.zeroed(1, BANK_FLOATS as u32, Dtype::F32);
-    let tuning = engine_metal::chip::tuning("", false);
-    // A frame of the 30 layers, so the device runs at the clock a round
-    // holds it at.
-    let price = |fire: &dyn Fn(&Sink, &Committed)| {
-        let mut v = Vec::new();
-        for i in 0..30 {
-            let s = bench.run(&|sink| {
-                for c in &layers {
-                    fire(sink, c);
-                }
-            });
-            if i >= 10 {
-                v.push(s * 1e6 / f64::from(LAYERS));
-            }
-        }
-        median(v)
-    };
-    let old_conv = |sink: &Sink, c: &Committed| {
-        ssm::causal_conv1d_committed(
-            sink,
-            x.x,
-            indptr,
-            c,
-            x.weight,
-            &pool(&x, c.slots),
-            TAPS,
-            1,
-            ext_conv,
-        )
-        .expect("the committed conv");
-    };
-    let new_conv = |sink: &Sink, c: &Committed| {
-        ssm::causal_conv1d_verify(
-            sink,
-            x.x,
-            None,
-            indptr,
-            c,
-            x.weight,
-            &pool(&x, c.slots),
-            TAPS,
-            1,
-            ext_conv,
-            land,
-            None,
-        )
-        .expect("the verify conv");
-    };
-    let old_walk = |sink: &Sink, c: &Committed| {
-        ssm::gdn_prep(sink, x.ba, x.dt_bias, x.a_log, ext_gates).expect("the gate prep");
-        ssm::gated_delta_committed(
-            sink,
-            &tuning,
-            x.qkv,
-            indptr,
-            c,
-            ext_gates,
-            &pool(&x, c.slots),
-            work,
-            K_HEADS,
-            V_HEADS,
-            DIM,
-            DIM,
-            ext_y,
-        )
-        .expect("the committed scan");
-    };
-    let new_walk = |geometry: (u32, u32)| {
-        let gates = &gates;
-        let x = &x;
-        move |sink: &Sink, c: &Committed| {
-            ssm::gated_delta_verify_at(
-                sink,
-                geometry,
-                x.qkv,
-                indptr,
-                c,
-                gates,
-                None,
-                &pool(x, c.slots),
-                K_HEADS,
-                V_HEADS,
-                DIM,
-                DIM,
-                own_y,
-                None,
-            )
-            .expect("the verify scan");
-        }
-    };
-    // The bank traffic alone: a layer's bank read and written elsewhere.
-    let copy = |sink: &Sink, c: &Committed| {
-        let slot = |at: u32| {
-            let bytes = BANK_FLOATS * 4;
-            let handle = bench
-                .handles
-                .cut(x.state.buf, u64::from(at % SLOTS) * bytes, bytes)
-                .expect("a bank");
-            Tensor::new(handle, 1, 1, Dtype::U32)
-        };
-        let at = layers
-            .iter()
-            .position(|l| l.slots.buf == c.slots.buf)
-            .unwrap_or(0) as u32;
-        kernels_metal::runtime::blit::copy_words(
-            sink,
-            slot(at),
-            slot(at + LAYERS / 2),
-            BANK_FLOATS * 4,
-        )
-        .expect("a bank copy");
-    };
-    if rows == 1 {
-        eprintln!("one layer's bank copied: {:.1} us", price(&copy));
-    }
-    let geometries = [(8, 2), (4, 4), (8, 4)];
-    let mut best = vec![f64::MAX; geometries.len() + 3];
-    for _ in 0..3 {
-        best[0] = best[0].min(price(&old_conv));
-        best[1] = best[1].min(price(&new_conv));
-        best[2] = best[2].min(price(&old_walk));
-        for (at, geometry) in geometries.into_iter().enumerate() {
-            best[at + 3] = best[at + 3].min(price(&new_walk(geometry)));
-        }
-    }
-    eprintln!(
-        "one layer of {replay} + {rows} rows: conv committed {:.1} us, verify {:.1} us",
-        best[0], best[1]
-    );
-    let mut line = format!(
-        "one layer of {replay} + {rows} rows: prep and committed scan {:.1} us; verify",
-        best[2]
-    );
-    for ((g, v), us) in geometries.iter().zip(&best[3..]) {
-        line += &format!(" s{g}v{v} {us:.1}");
-    }
-    eprintln!("{line}");
 }

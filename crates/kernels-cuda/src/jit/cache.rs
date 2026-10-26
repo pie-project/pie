@@ -109,6 +109,18 @@ pub(crate) fn load(root: &Root, instantiation: &str) -> Result<Resolved, Fault> 
         ms = started.elapsed().as_secs_f64() * 1e3,
         "resolved a device instantiation"
     );
+    // Loaded now, not at its first launch (lazy loading's), which may come
+    // inside a capture.
+    // SAFETY: `function` was just resolved from the module loaded above.
+    let code = unsafe { dr::cuFuncLoad(function) };
+    if code != dr::CUresult::CUDA_SUCCESS {
+        // SAFETY: as below: `module` is loaded, and unloaded once here.
+        unsafe { dr::cuModuleUnload(module) };
+        return Err(Fault::Device {
+            call: "cuFuncLoad",
+            code: code as i32,
+        });
+    }
     let params = param_sizes(function).inspect_err(|_| {
         // SAFETY: as above: `module` is loaded, and unloaded once here.
         unsafe { dr::cuModuleUnload(module) };
@@ -274,14 +286,49 @@ pub(crate) fn bind_context() -> Result<(), Fault> {
         return Ok(());
     }
 
-    // SAFETY: freeing null frees nothing; the call is made only for its side
-    // effect of binding the device's primary context to this thread.
-    let code = unsafe { rt::cudaFree(std::ptr::null_mut()) };
-    if code != rt::cudaError::cudaSuccess {
-        return Err(Fault::Device {
-            call: "cudaFree",
-            code: code as i32,
-        });
+    // A context already current (the runtime's, bound by any call that made
+    // it, a capture's on the thread that opened one) is the one: a query,
+    // which a capture open on this thread allows. A synchronizing call to
+    // bind it (`cudaFree(nullptr)`) does not: on a thread's first kernel
+    // resolution inside a capture it answered `cudaErrorStreamCaptureUnsupported`
+    // and invalidated the capture.
+    let driver = |call: &'static str, code: dr::CUresult| {
+        if code == dr::CUresult::CUDA_SUCCESS {
+            Ok(())
+        } else {
+            Err(Fault::Device {
+                call,
+                code: code as i32,
+            })
+        }
+    };
+    // The driver first: in a process no runtime call has touched yet, the
+    // query answers `CUDA_ERROR_NOT_INITIALIZED`. Once initialized, `cuInit`
+    // returns at once and waits on nothing.
+    // SAFETY: takes only its flags, which must be 0.
+    driver("cuInit", unsafe { dr::cuInit(0) })?;
+    let mut current: dr::CUcontext = std::ptr::null_mut();
+    // SAFETY: `current` is a local out-pointer.
+    driver("cuCtxGetCurrent", unsafe {
+        dr::cuCtxGetCurrent(&raw mut current)
+    })?;
+    if current.is_null() {
+        // None yet, so no capture is open on this thread: the device's
+        // primary context, retained and made current, as the runtime binds
+        // it; the retain is the thread's for the process.
+        let ordinal = i32::try_from(current_device()?).unwrap_or(0);
+        let mut device: dr::CUdevice = 0;
+        let mut primary: dr::CUcontext = std::ptr::null_mut();
+        // SAFETY: each out-pointer is a local, `ordinal` the runtime's own
+        // device for this thread, and `primary` the context just retained.
+        unsafe {
+            driver("cuDeviceGet", dr::cuDeviceGet(&raw mut device, ordinal))?;
+            driver(
+                "cuDevicePrimaryCtxRetain",
+                dr::cuDevicePrimaryCtxRetain(&raw mut primary, device),
+            )?;
+            driver("cuCtxSetCurrent", dr::cuCtxSetCurrent(primary))?;
+        }
     }
     BOUND.with(|bound| bound.set(true));
     Ok(())

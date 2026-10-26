@@ -495,6 +495,20 @@ pub fn join_read(
             });
             continue;
         }
+        // A plane of no axis to join along (a routed bank's input scale, one
+        // an expert) is the first leg's, as a scalar one is: the legs read
+        // one activation.
+        if lead
+            .shape
+            .as_ref()
+            .is_some_and(|shape| shape.len() <= join.axis as usize)
+        {
+            made.push(TensorContract {
+                name: format!("{}{plane}", join.name),
+                ..lead.clone()
+            });
+            continue;
+        }
         let shape = legs
             .iter()
             .map(|t| t.shape.clone())

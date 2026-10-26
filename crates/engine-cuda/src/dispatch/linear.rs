@@ -176,63 +176,6 @@ impl Run<'_> {
                     up: None,
                 })
             }
-            Fused::MatmulGlu {
-                act,
-                w,
-                intermediate,
-                glu: poem_ir::GluAct::GegluTanh,
-                packed,
-                y,
-            } => {
-                // The skinny leg reads the weight as one dense handle; a split-plane
-                // bank resolves only through the matmul below.
-                if self.dense_weight(*w) {
-                    let a = self.tensor(*act);
-                    let weight = self.tensor(*w);
-                    let out = self.tensor(*y);
-                    let (m, k) = (a.rows as i32, a.width as i32);
-                    let i = i32::try_from(*intermediate).unwrap_or(0);
-                    if weight.rows == 2 * *intermediate
-                        && linear::skinny::covers(
-                            m,
-                            i,
-                            k,
-                            linear::skinny::Epilogue::Geglu,
-                            self.ctx().tuning().gemm_skinny_rows,
-                        )
-                    {
-                        return linear::skinny::skinny_bf16(
-                            self.ctx(),
-                            weight.ptr,
-                            a.ptr,
-                            out.ptr,
-                            m,
-                            i,
-                            k,
-                            linear::skinny::Epilogue::Geglu,
-                        );
-                    }
-                }
-                self.linear(&Linear::Matmul {
-                    act: *act,
-                    w: *w,
-                    y: *packed,
-                    input_scales: None,
-                    scales: None,
-                    quant: None,
-                    logits: false,
-                })?;
-                self.linear(&Linear::Glu {
-                    packed: Some(*packed),
-                    intermediate: *intermediate,
-                    y: *y,
-                    gate: None,
-                    weights: None,
-                    limit: None,
-                    act: poem_ir::GluAct::GegluTanh,
-                    up: None,
-                })
-            }
             // Not in `FUSIONS`, so never formed here; whole, it is its three
             // primitives.
             Fused::MatmulSwigluMatmul {
@@ -272,37 +215,6 @@ impl Run<'_> {
                     quant: None,
                     logits: false,
                 })
-            }
-            Fused::MatmulBias {
-                act,
-                w,
-                bias,
-                y,
-                y_out: _,
-            } => {
-                if self.tensor(*act).dtype == Dtype::Bf16 && self.dense_weight(*w) {
-                    return linear::gemm::matmul_bias(
-                        self.ctx(),
-                        self.tensor(*act),
-                        self.tensor(*w),
-                        self.tensor(*bias),
-                        &mut self.tensor(*y),
-                    );
-                }
-                self.linear(&Linear::Matmul {
-                    act: *act,
-                    w: *w,
-                    y: *y,
-                    input_scales: None,
-                    scales: None,
-                    quant: None,
-                    logits: false,
-                })?;
-                kernels_cuda::elemwise::pointwise::add_bias(
-                    self.ctx(),
-                    self.tensor(*bias),
-                    &mut self.tensor(*y),
-                )
             }
             Fused::MatmulMoeRoute {
                 act,
@@ -439,51 +351,185 @@ impl Run<'_> {
                     &mut self.tensor(*right),
                 )
             }
-            Fused::MatmulSoftcap {
+            Fused::Anchored {
                 act,
                 w,
-                cap,
+                ins,
+                key,
+                outs,
+                cache,
+                ..
+            } => self.anchored(*act, *w, ins, *key, outs, *cache),
+            Fused::Epilogue {
                 y,
-                y_out: _,
-            } => {
-                if self.dense_weight(*w) {
-                    let a = self.tensor(*act);
-                    let weight = self.tensor(*w);
-                    let out = self.tensor(*y);
-                    let (m, n, k) = (a.rows as i32, weight.rows as i32, a.width as i32);
-                    let epilogue = linear::skinny::Epilogue::Softcap(*cap);
-                    if linear::skinny::covers(
-                        m,
-                        n,
-                        k,
-                        epilogue,
-                        self.ctx().tuning().gemm_skinny_rows,
-                    ) {
-                        return linear::skinny::skinny_bf16(
-                            self.ctx(),
-                            weight.ptr,
-                            a.ptr,
-                            out.ptr,
-                            m,
-                            n,
-                            k,
-                            epilogue,
-                        );
-                    }
-                }
-                self.linear(&Linear::Matmul {
-                    act: *act,
-                    w: *w,
-                    y: *y,
-                    input_scales: None,
-                    scales: None,
-                    quant: None,
-                    logits: true,
-                })?;
-                kernels_cuda::attn::merge::logit_softcap(self.ctx(), &mut self.tensor(*y), *cap)
-            }
+                ins,
+                key,
+                outs,
+                cache,
+            } => self.epilogue(*y, ins, *key, outs, *cache),
             _ => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
         }
+    }
+
+    /// A `fused.anchored`: the contraction of `act` and the dense bank `w`
+    /// with the epilogue the load loaded for `key` filled in, its inputs'
+    /// planes read as the epilogue's kinds say, on whichever candidate the
+    /// GEMM tuner picks for the shape.
+    fn anchored(
+        &mut self,
+        act: ValueId,
+        w: ValueId,
+        ins: &[ValueId],
+        key: u64,
+        outs: &[ValueId],
+        cache: Option<ValueId>,
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "fused.anchored";
+        let broken = |detail: String| kernels_cuda::Error::Backend { op: OP, detail };
+        let epi = self
+            .anchor_epilogue(key)
+            .ok_or_else(|| broken(format!("the load loaded no epilogue for {key:016x}")))?;
+        if !self.dense_weight(w) {
+            return Err(broken(format!(
+                "the weight {} is not one dense bf16 plane, and an anchored region's is",
+                w.0
+            )));
+        }
+        let (planes, landed, paging) = self.anchor_planes(epi, ins, outs, cache)?;
+        if linear::gemm::anchored(
+            self.ctx(),
+            OP,
+            epi,
+            self.tensor(act),
+            self.tensor(w),
+            &planes,
+            &landed,
+            paging,
+        )? {
+            Ok(())
+        } else {
+            Err(broken(
+                "neither a contraction skeleton nor the unfused leg landed it, and the fold forms \
+                 only what one does"
+                    .into(),
+            ))
+        }
+    }
+
+    /// A `fused.epilogue`: an anchored region's epilogue over the product
+    /// `y` its own op landed, on the row skeleton.
+    fn epilogue(
+        &mut self,
+        y: ValueId,
+        ins: &[ValueId],
+        key: u64,
+        outs: &[ValueId],
+        cache: Option<ValueId>,
+    ) -> Result<(), kernels_cuda::Error> {
+        const OP: &str = "fused.epilogue";
+        let broken = |detail: String| kernels_cuda::Error::Backend { op: OP, detail };
+        let epi = self
+            .anchor_epilogue(key)
+            .ok_or_else(|| broken(format!("the load loaded no epilogue for {key:016x}")))?;
+        let (planes, landed, paging) = self.anchor_planes(epi, ins, outs, cache)?;
+        if linear::gemm::epilogue(self.ctx(), OP, epi, self.tensor(y), &planes, &landed, paging)? {
+            Ok(())
+        } else {
+            Err(broken(
+                "the row skeleton did not land it, and the fold forms only what it does".into(),
+            ))
+        }
+    }
+
+    /// An anchored region's input planes (the op's values in order, a
+    /// normed operand's row scale the contraction's own), its results'
+    /// (the op's values in order, a paged result its cache's keys or values:
+    /// a bf16 or unit-scaled e4m3 pool of rows a cell, every row live where
+    /// its `row_valid` says) and where its cache rows live.
+    #[allow(clippy::type_complexity)]
+    fn anchor_planes(
+        &self,
+        epi: &linear::skeleton::Epilogue,
+        ins: &[ValueId],
+        outs: &[ValueId],
+        cache: Option<ValueId>,
+    ) -> Result<
+        (
+            Vec<linear::skeleton::In>,
+            Vec<Tensor>,
+            Option<linear::skeleton::Paging>,
+        ),
+        kernels_cuda::Error,
+    > {
+        const OP: &str = "fused.anchored";
+        let broken = |detail: String| kernels_cuda::Error::Backend { op: OP, detail };
+        // Each input's plane, the op's values in order; a normed operand's
+        // row scale (no value) the contraction's own.
+        let mut values = ins.iter();
+        let planes: Vec<linear::skeleton::In> = epi
+            .inputs()
+            .iter()
+            .map(|input| {
+                use linear::skeleton::{In, Input};
+                if *input == Input::Norm {
+                    return Ok(In::norm());
+                }
+                let v = *values.next().ok_or_else(|| {
+                    broken("the op reads fewer values than its epilogue's inputs".into())
+                })?;
+                let t = self.tensor(v);
+                let plane = match *input {
+                    Input::Tile => In::tile(t.ptr, t.width),
+                    Input::Column => In::column(t.ptr),
+                    Input::Head(size) => In::head(t.ptr, size),
+                    Input::Row => In::row(t.ptr),
+                    Input::One => In::one(t.ptr),
+                    Input::Norm => unreachable!("taken above"),
+                };
+                // a row's position is stored i32
+                Ok(if t.dtype == Dtype::I32 {
+                    plane.i32()
+                } else {
+                    plane
+                })
+            })
+            .collect::<Result<_, kernels_cuda::Error>>()?;
+        // Each result's plane: the op's values in order, a paged result its
+        // cache's keys or values (a bf16 or unit-scaled e4m3 pool of rows a
+        // cell, every row live where its `row_valid` says).
+        let pool = cache.map(|c| self.pool(c));
+        let mut values = outs.iter();
+        let mut landed: Vec<Tensor> = Vec::with_capacity(epi.results());
+        for k in 0..epi.results() {
+            landed.push(match epi.paged(k) {
+                Some(paged) => {
+                    let pool = pool.as_ref().ok_or_else(|| {
+                        broken("a paged result, and the op names no cache".into())
+                    })?;
+                    let native = kernels_cuda::attn::kv::native_bf16(pool)
+                        || kernels_cuda::attn::kv::native_e4m3(pool);
+                    if !native || pool.layout != 0 || pool.has_envelopes {
+                        return Err(broken(
+                            "a paged result lands in a bf16 or unit-scaled e4m3 pool of rows a \
+                             cell, with no envelopes"
+                                .into(),
+                        ));
+                    }
+                    match paged.plane {
+                        linear::skeleton::CachePlane::Keys => pool.keys,
+                        linear::skeleton::CachePlane::Values => pool.values,
+                    }
+                }
+                None => self.tensor(*values.next().ok_or_else(|| {
+                    broken("the op lands fewer values than its epilogue's results".into())
+                })?),
+            });
+        }
+        let paging = pool.as_ref().map(|pool| linear::skeleton::Paging {
+            valid: pool.row_valid.ptr,
+            page_size: u32::try_from(pool.page_size).unwrap_or(0),
+        });
+        Ok((planes, landed, paging))
     }
 
     fn linear(&mut self, op: &Linear) -> Result<(), kernels_cuda::Error> {
@@ -2216,7 +2262,7 @@ impl Run<'_> {
         if act.rows > linear::w8a16::MMA_UNTIL
             && let Some(shadow) = self.fp8_shadow(w)
         {
-            linear::gemm::act_x_wt(self.ctx(), op, act, shadow, None, &mut out)?;
+            linear::gemm::act_x_wt(self.ctx(), op, act, shadow, &mut out)?;
             return Ok(());
         }
         let k = act.width;

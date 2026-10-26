@@ -18,14 +18,11 @@
 //! and an output a row a lane) puts its weights back whole, and the trace is
 //! read again until nothing changes. Where a share meets the partial sums of
 //! another, the product that contracted the other's share is the one put
-//! back whole, so a low-rank pair cuts its wide half by its columns. A
-//! product whose weight the model states whole reads the share before it
-//! gathered instead, where one gather puts the share back in order: the
-//! column cut is kept, and the projection after it runs whole on every rank.
+//! back whole, so a low-rank pair cuts its wide half by its columns.
 //!
 //! A chain of cuts (the column cuts whose shares meet, and the row cuts and
 //! weights cut with them) is kept only where it saves what its collectives
-//! cost: one far lighter than the rows it reduces or gathers, which no
+//! cost: one far lighter than the rows it reduces, which no
 //! attention or scan reads (a low-rank pair on a wide row), is put back
 //! whole, and the trace read again (`NARROW` says how light).
 //!
@@ -128,13 +125,12 @@ const GROUPED: [(&str, &str, &str); 2] = [
 /// states.
 #[must_use]
 pub fn infer(trace: &Trace) -> Vec<Shard> {
-    inferred(trace, BTreeSet::new(), 1).0
+    inferred(trace, 1).0
 }
 
 /// `trace` with each weight whose cut the model left to the compiler cut as
-/// its dataflow says, a weight it states whole kept whole; and the cut of
-/// each such weight over its logical shape, by name, for an import to read
-/// it by. A trace that leaves none to the compiler is as it was. A weight
+/// its dataflow says; and the cut of each such weight over its logical
+/// shape, by name, for an import to read it by. A trace that leaves none to the compiler is as it was. A weight
 /// whose cut `world` ranks cannot split (a vocabulary of an odd count of
 /// rows, a block of scales fewer than the ranks) is whole.
 pub fn resolve(trace: &mut Trace, world: u32) -> Vec<(String, Shard)> {
@@ -142,10 +138,7 @@ pub fn resolve(trace: &mut Trace, world: u32) -> Vec<(String, Shard)> {
         return Vec::new();
     }
     let owner = Reading::of(trace).owner;
-    let pinned = (0..trace.params.len())
-        .filter(|p| owner[*p].is_none() && trace.params[*p].shard == Shard::Replicated)
-        .collect();
-    let (shards, lead) = inferred(trace, pinned, world);
+    let (shards, lead) = inferred(trace, world);
     let mut cuts = Vec::new();
     for (p, cut) in shards.into_iter().enumerate() {
         let param = &mut trace.params[p];
@@ -160,14 +153,13 @@ pub fn resolve(trace: &mut Trace, world: u32) -> Vec<(String, Shard)> {
     cuts
 }
 
-/// Each param's cut, `pinned` leading params kept whole, and each leading
-/// param's cut over its logical shape; a cut `world` ranks cannot split is
-/// put back whole.
-fn inferred(trace: &Trace, pinned: BTreeSet<usize>, world: u32) -> (Vec<Shard>, Vec<Shard>) {
+/// Each param's cut and each leading param's cut over its logical shape; a
+/// cut `world` ranks cannot split is put back whole.
+fn inferred(trace: &Trace, world: u32) -> (Vec<Shard>, Vec<Shard>) {
     let reading = Reading::of(trace);
-    let mut whole = pinned.clone();
+    let mut whole = BTreeSet::new();
     loop {
-        let mut walk = Walk::new(&reading, &whole, &pinned);
+        let mut walk = Walk::new(&reading, &whole);
         walk.run();
         let mut rejected = std::mem::take(&mut walk.rejected);
         if rejected.is_subset(&whole) {
@@ -321,8 +313,6 @@ enum Cut {
 struct Walk<'r, 't> {
     reading: &'r Reading<'t>,
     whole: &'r BTreeSet<usize>,
-    /// The params the model states whole.
-    pinned: &'r BTreeSet<usize>,
     held: Vec<Option<Held>>,
     cuts: Vec<Option<Cut>>,
     /// Where the ops that read a column cut's share take it apart.
@@ -339,9 +329,8 @@ struct Walk<'r, 't> {
     with: BTreeMap<usize, BTreeSet<usize>>,
     /// Each cut weight's elements, once for every op that reads it cut.
     work: Vec<(usize, u64)>,
-    /// The values a collective moves, and the column cuts whose shares they
-    /// are or sum: partial sums an op reduces, a share a whole product
-    /// gathers.
+    /// The values a collective moves, and the column cuts whose partial
+    /// sums they are: what an op reduces.
     moved: BTreeMap<ValueId, BTreeSet<usize>>,
     /// Column cuts whose shares an op reads together.
     met: Vec<BTreeSet<usize>>,
@@ -350,16 +339,11 @@ struct Walk<'r, 't> {
 }
 
 impl<'r, 't> Walk<'r, 't> {
-    fn new(
-        reading: &'r Reading<'t>,
-        whole: &'r BTreeSet<usize>,
-        pinned: &'r BTreeSet<usize>,
-    ) -> Walk<'r, 't> {
+    fn new(reading: &'r Reading<'t>, whole: &'r BTreeSet<usize>) -> Walk<'r, 't> {
         let trace = reading.trace;
         Walk {
             reading,
             whole,
-            pinned,
             held: vec![None; trace.values.len()],
             cuts: vec![None; trace.params.len()],
             bounds: BTreeMap::new(),
@@ -481,22 +465,6 @@ impl<'r, 't> Walk<'r, 't> {
         {
             self.reject(&origins);
         }
-    }
-
-    /// Whether `v`, held as `share`, is one a gather puts back in order:
-    /// a share of column cuts' runs each as wide as every segment of them,
-    /// so each rank holds one block of it.
-    fn gathers(&self, v: ValueId, share: &Held) -> bool {
-        let Held::Split(os) = share else {
-            return false;
-        };
-        self.width(v).is_some_and(|w| {
-            !os.is_empty()
-                && os.iter().all(|o| {
-                    let (segments, _) = self.segments(o.param, o.lo, o.hi);
-                    segments.iter().all(|s| *s == w)
-                })
-        })
     }
 
     /// A value an op reads whole: a share's cuts put back, a weight kept
@@ -654,12 +622,6 @@ impl<'r, 't> Walk<'r, 't> {
                         if self.decide(p, Cut::Row(input)) {
                             self.cut_with(p, &origins);
                             Held::Partial(origins)
-                        } else if self.pinned.contains(&p) && self.gathers(a, &share) {
-                            // A weight the model states whole reads its
-                            // share gathered.
-                            let from = origins.iter().map(|o| o.param).collect();
-                            self.moved.insert(a, from);
-                            Held::Whole
                         } else {
                             self.reject(&origins)
                         }
@@ -1160,9 +1122,26 @@ impl<'r, 't> Walk<'r, 't> {
             }),
             Cut::Beside(axis, origins) => {
                 let extent = *shape.get(*axis as usize)?;
-                let (segments, mut heads) = match origins.iter().collect::<Vec<_>>()[..] {
-                    [o] if o.hi - o.lo == extent => self.segments(o.param, o.lo, o.hi),
-                    _ => (vec![extent], Vec::new()),
+                // Read beside a share as wide as it, the weight holds that
+                // share's segments: one run's, or the runs' a concat lays
+                // side by side (in the order their weights are stated).
+                let whole: u64 = origins.iter().map(|o| o.hi - o.lo).sum();
+                let (segments, mut heads) = if whole == extent {
+                    let runs: Vec<(Vec<u64>, Vec<u64>)> = origins
+                        .iter()
+                        .map(|o| self.segments(o.param, o.lo, o.hi))
+                        .collect();
+                    let headed = runs.iter().all(|(s, h)| h.len() == s.len());
+                    (
+                        runs.iter().flat_map(|(s, _)| s.iter().copied()).collect(),
+                        if headed {
+                            runs.iter().flat_map(|(_, h)| h.iter().copied()).collect()
+                        } else {
+                            Vec::new()
+                        },
+                    )
+                } else {
+                    (vec![extent], Vec::new())
                 };
                 if let (Some(groups), [_]) = (self.grouped.get(&p), &segments[..]) {
                     heads = vec![*groups];

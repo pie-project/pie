@@ -10,24 +10,29 @@ use crate::run::Run;
 
 /// The fused ops this backend's dispatch turns away. Its rules form none of
 /// them (`every_fused_op_its_rules_form_is_one_dispatch_fires`): the residual
-/// norms run as generated regions here, their fused ops ROCm's and Metal's.
+/// norms, a scaled embedding's chain, a DiT block's norm and modulation and
+/// a head's norm and the turn of its first dims run as generated regions
+/// here, a product's bias, soft cap and GEGLU as
+/// anchored ones (`fused.anchored`), their fused ops ROCm's and Metal's.
 pub(crate) fn refuses(op: &Fused) -> bool {
     match op {
         Fused::GdnStep { .. }
+        | Fused::EmbedScaleAdd { .. }
+        | Fused::EmbedScaleAddSelect { .. }
+        | Fused::NormModulate { .. }
+        | Fused::GatedResidualNormModulate { .. }
+        | Fused::MatmulBias { .. }
+        | Fused::MatmulSoftcap { .. }
         | Fused::ResidualAddRmsnorm { .. }
         | Fused::RmsnormResidualAdd { .. }
         | Fused::QGateNormRopeAppend {
             intermediates: Intermediates::Written,
             ..
         } => true,
-        Fused::MatmulGlu { glu, .. } => {
-            !matches!(glu, poem_ir::GluAct::Swiglu | poem_ir::GluAct::GegluTanh)
-        }
-        Fused::NormRope { weight, turn, .. } => match turn {
-            poem_ir::Turn::Partial { .. } => weight.is_none(),
-            poem_ir::Turn::Last { .. } => false,
-            _ => true,
-        },
+        Fused::MatmulGlu { glu, .. } => !matches!(glu, poem_ir::GluAct::Swiglu),
+        // A turn of the tail stays: DeepSeek-V4's q and kv pair falls back
+        // to it.
+        Fused::NormRope { turn, .. } => !matches!(turn, poem_ir::Turn::Last { .. }),
         _ => false,
     }
 }
@@ -38,17 +43,24 @@ impl DispatchFused for Run<'_> {
             _ if refuses(op) => Err(kernels_cuda::Error::Unsupported { op: op.name() }),
             Fused::Region {
                 ins,
+                reads,
                 width,
                 key: body,
                 outs,
             } => {
                 if outs.first().is_some_and(|out| self.lane_shaped(*out)) {
-                    self.unseated(|| self.region(ins, *width, *body, outs))
+                    self.unseated(|| self.region(ins, reads, *width, *body, outs))
                 } else {
-                    self.region(ins, *width, *body, outs)
+                    self.region(ins, reads, *width, *body, outs)
                 }
             }
             Fused::GdnStep { .. }
+            | Fused::EmbedScaleAdd { .. }
+            | Fused::EmbedScaleAddSelect { .. }
+            | Fused::NormModulate { .. }
+            | Fused::GatedResidualNormModulate { .. }
+            | Fused::MatmulBias { .. }
+            | Fused::MatmulSoftcap { .. }
             | Fused::ResidualAddRmsnorm { .. }
             | Fused::RmsnormResidualAdd { .. }
             | Fused::QGateNormRopeAppend {
@@ -75,21 +87,16 @@ impl DispatchFused for Run<'_> {
             Fused::ResBlendRmsnorm { .. } => self.res_blend_rmsnorm(op),
             Fused::HcFoldPre { .. } => self.hc_fold_pre(op),
             Fused::HcPre { .. } => self.hc_pre(op),
-            Fused::MatmulGlu { .. }
+            Fused::Anchored { .. }
+            | Fused::Epilogue { .. }
+            | Fused::MatmulGlu { .. }
             | Fused::MatmulSwigluMatmul { .. }
-            | Fused::MatmulSoftcap { .. }
-            | Fused::MatmulBias { .. }
             | Fused::MatmulMoeRoute { .. }
             | Fused::MatmulSplitRows { .. }
             | Fused::MoeSelectGlu { .. }
             | Fused::MoeExperts { .. }
             | Fused::MoeMega { .. } => self.fused_linear(op),
-            Fused::EmbedScaleAdd { .. }
-            | Fused::EmbedScaleAddSelect { .. }
-            | Fused::NormRope { .. }
-            | Fused::HcNormProject { .. }
-            | Fused::NormModulate { .. }
-            | Fused::GatedResidualNormModulate { .. } => {
+            Fused::NormRope { .. } | Fused::HcNormProject { .. } => {
                 let mut outputs = Vec::new();
                 op.outputs(&mut outputs);
                 if outputs.first().is_some_and(|out| self.lane_shaped(*out)) {
@@ -109,38 +116,58 @@ impl Run<'_> {
     fn region(
         &self,
         ins: &[ValueId],
+        reads: &[poem_ir::RegionRead],
         width: u32,
         body: u64,
         outs: &[ValueId],
     ) -> Result<(), kernels_cuda::Error> {
         const OP: &str = "fused.region";
-        let kernel =
-            self.region_kernel(body, width)
-                .ok_or_else(|| kernels_cuda::Error::Backend {
-                    op: OP,
-                    detail: format!("the load generated no kernel for body {body:016x} at {width}"),
-                })?;
+        let broken = |detail: String| kernels_cuda::Error::Backend { op: OP, detail };
+        let forms = crate::synth::forms(self.values(), ins, reads, |v| Some(self.tensor(v).dtype))
+            .map_err(broken)?;
+        let kernel = self.region_kernel(body, width, &forms).ok_or_else(|| {
+            broken(format!(
+                "the load generated no kernel for body {body:016x} at {width}"
+            ))
+        })?;
         let landed: Vec<Tensor> = outs.iter().map(|&v| self.tensor(v)).collect();
-        let rows = landed.first().map_or(0, |t| t.rows);
+        // The rows a widest result lands (a small vector one a row lands
+        // fewer values a row than the row's).
+        let widest = landed.iter().max_by_key(|t| t.width);
+        let rows = widest.map_or(0, |t| t.rows);
+        // A row cut into its heads: each part of it one of the kernel's rows.
+        let row_width = widest.map_or(width, |t| t.width);
+        if width == 0 || row_width % width != 0 {
+            return Err(broken(format!(
+                "the region's rows are {width} wide and it lands rows {row_width} wide"
+            )));
+        }
         let mut planes = Vec::with_capacity(ins.len());
-        for &v in ins {
+        for (k, (&v, form)) in ins.iter().zip(&forms).enumerate() {
             let t = self.tensor(v);
-            planes.push(if crate::synth::shared(&self.values()[v.0 as usize]) {
-                Plane::shared(&t)
-            } else if t.rows >= rows {
-                Plane::rows(&t)
-            } else {
-                return Err(kernels_cuda::Error::Backend {
-                    op: OP,
-                    detail: format!(
+            let read = reads.get(k).copied().unwrap_or_default();
+            planes.push(match form {
+                kernels_cuda::synth::In::Shared(_) | kernels_cuda::synth::In::One(_) => {
+                    Plane::shared(&t)
+                }
+                // a table's rows, each row reading the one its id picks
+                kernels_cuda::synth::In::Gathered(_) => {
+                    let by = read.by.and_then(|by| ins.get(by as usize)).ok_or_else(|| {
+                        broken(format!("parameter {k} is picked by no input of the region"))
+                    })?;
+                    Plane::cols(&t, read.from).by(&self.tensor(*by))
+                }
+                _ if t.rows >= rows => Plane::cols(&t, read.from),
+                _ => {
+                    return Err(broken(format!(
                         "parameter value {} holds {} rows and the region lands {rows}",
                         v.0, t.rows
-                    ),
-                });
+                    )));
+                }
             });
         }
         let landed: Vec<Plane> = landed.iter().map(Plane::rows).collect();
-        kernel.fire(self.ctx(), &planes, &landed, rows)
+        kernel.fire_parts(self.ctx(), &planes, &landed, rows, row_width / width)
     }
 
     /// The e4m3 1x128 planes a sublayer's pre-mix lands its normed row `y`

@@ -507,7 +507,6 @@ mod tests {
                 assert_eq!(tuning.ssm_gdn_out_bf16, b200, "{gpu}");
                 assert_eq!(tuning.qg_prologue_until, if b200 { 64 } else { 0 }, "{gpu}");
                 assert_eq!(tuning.merge_warp, b200, "{gpu}");
-                assert_eq!(tuning.gemm_bias_epilogue, b200, "{gpu}");
                 assert_eq!(tuning.decode_gqa, b200, "{gpu}");
                 assert_eq!(tuning.pool_mma, major == 10 && minor == 0, "{gpu}");
                 assert_eq!(tuning.index_radix, major == 10 && minor == 0, "{gpu}");
@@ -562,8 +561,6 @@ mod tests {
                 );
                 assert_eq!(tuning.decode_gqa_cluster, if b200 { 8 } else { 0 }, "{gpu}");
                 assert_eq!(tuning.decode_gqa_deep_64, b200, "{gpu}");
-                // B200 alone runs Gemma 4's q norm a warp a head.
-                assert_eq!(tuning.q_norm_rope_warp, b200, "{gpu}");
                 // B200 alone lands a hyper-connection seam in one launch,
                 // from 43 to 1120 rows.
                 assert_eq!(tuning.hc_mega_from, if b200 { 43 } else { 0 }, "{gpu}");
@@ -591,7 +588,6 @@ mod tests {
                         prefill_tc5: false,
                         prefill_wide_sliding: false,
                         decode_grouped_prefill_from: 0,
-                        gemm_bias_epilogue: false,
                         moe_w4a4_fused_from: 65_536,
                         moe_w4a4_fused_layout: defaults.moe_w4a4_fused_layout,
                         moe_even_waves_from: defaults.moe_even_waves_from,
@@ -638,7 +634,6 @@ mod tests {
                         index_fp4_tc5: false,
                         norm_emit: false,
                         qkv_rows_from: defaults.qkv_rows_from,
-                        q_norm_rope_warp: false,
                         ..tuning
                     },
                     defaults,
@@ -659,7 +654,6 @@ mod tests {
                         merge_warp: false,
                         pool_mma: false,
                         compressed_decode_until: 0,
-                        gemm_bias_epilogue: false,
                         gemm_rows_m: 0,
                         attn_res_fused_norm: false,
                         mxfp4_mma_from: defaults.mxfp4_mma_from,
@@ -750,11 +744,15 @@ mod tests {
             }
         );
         // The compiler's prices as before, but that CUDA folds each chain
-        // into a generated row kernel: its rules hold no residual norm.
+        // into a generated row kernel and each product's epilogue into its
+        // contraction skeleton: its rules hold no residual norm, bias or soft
+        // cap.
         assert_eq!(
             poem_compiler::DeviceProfile::of(&registry().defaults(), 132, &[], &[]),
             poem_compiler::DeviceProfile {
                 synth_regions: cfg!(not(feature = "rocm")),
+                synth_anchors: cfg!(not(feature = "rocm")),
+                fold_norms: cfg!(not(feature = "rocm")),
                 ..poem_compiler::DeviceProfile::default()
             }
         );
@@ -1040,16 +1038,19 @@ mod tests {
             assert_eq!(
                 kernels_cuda::tuning::Tuning {
                     ssm_gdn_fused_scan: false,
+                    gemm_rows_m: defaults.gemm_rows_m,
                     mxfp4_mma_from: defaults.mxfp4_mma_from,
                     mxfp4_mma_until: defaults.mxfp4_mma_until,
                     mxfp4_mma_per_from: defaults.mxfp4_mma_per_from,
                     ..kernels_cuda::tuning::Tuning::of(p)
                 },
                 defaults,
-                "what an Ada GPU ran before its family file, past the gated delta scan and the MXFP4 selects"
+                "what an Ada GPU ran before its family file, past the gated delta scan, the MXFP4 selects \
+                 and the few-rows GEMM's reach"
             );
             for (spec, rungs, _) in p.entries() {
                 if spec.id == "kernel.ssm.gdn_fused_scan"
+                    || (spec.id == "kernel.gemm.rows_m" && std::ptr::eq(p, &l40s))
                     || spec.id.starts_with("kernel.moe.mxfp4_mma_")
                     || spec.id.starts_with("engine.prefill_lattice_")
                 {

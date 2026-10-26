@@ -16,9 +16,8 @@ TOKENIZER = tokenizer(
 # and output gates and its per-head parameters by their heads, the latent
 # attention's q and kv up-projections and gate by theirs, the dense, shared
 # and routed gates and ups by their channels, the output and down
-# projections by their rows. The head it holds whole, as the package always
-# has, and the tower's output, down and downsampling projections, which read
-# the shares before them gathered.
+# projections by their rows, the head by its vocabulary, and the tower's
+# mlp and merger as the trunk's.
 CUTS = "inferred"
 
 MODELS = [
@@ -112,7 +111,9 @@ def kda(n, l, k, hidden, weights, conv, eps, gate_floor, gate_rank = None, **ext
         conv_kernel = k.conv_kernel,
         norm_eps = eps,
         gate_floor = gate_floor,
-        qkv = weight([3 * width, hidden], weights),
+        q = weight([width, hidden], weights),
+        k = weight([width, hidden], weights),
+        v = weight([width, hidden], weights),
         conv = weight([3 * width, k.conv_kernel], conv),
         f_a = weight([k.f_rank, hidden], weights),
         f_b = weight([width, k.f_rank], weights),
@@ -273,10 +274,12 @@ def layout(id, deploy):
             routed = True,
             router = weight([m.experts, hidden]),
             bias = weight([m.experts], dtype.f32),
-            gate_up = weight([m.experts, 2 * iw, hidden], banks_dtype),
+            gate = weight([m.experts, iw, hidden], banks_dtype),
+            up = weight([m.experts, iw, hidden], banks_dtype),
             down = weight([m.experts, hidden, iw], banks_dtype),
             shared = struct(
-                gate_up = weight([2 * sw, hidden], weights),
+                gate = weight([sw, hidden], weights),
+                up = weight([sw, hidden], weights),
                 down = weight([hidden, sw], weights),
                 inter = sw,
             ),
@@ -312,7 +315,8 @@ def layout(id, deploy):
             iw = d.dense_inter
             mlp = struct(
                 routed = False,
-                gate_up = weight([2 * iw, hidden], weights),
+                gate = weight([iw, hidden], weights),
+                up = weight([iw, hidden], weights),
                 down = weight([hidden, iw], weights),
                 inter = iw,
                 limit = d.swiglu_limit,
@@ -360,7 +364,7 @@ def layout(id, deploy):
         hyper = hyper(streams, d.norm_eps, d.gate_eps, d.alpha, d.sinkhorn),
         # mlx stores its table and head at four bits; the release, unquantized.
         embed = weight([d.vocab, hidden], table),
-        head = weight([d.vocab, hidden], table).replicated(),
+        head = weight([d.vocab, hidden], table),
         layers = [layer(l) for l in range(d.layers)],
         final_norm = weight([hidden]),
         final_norm_eps = d.norm_eps,
@@ -394,12 +398,14 @@ def tower(d):
             qkv_bias = weight([3 * hidden], bf),
             q_norm = weight([head_dim], bf),
             k_norm = weight([head_dim], bf),
-            proj = weight([hidden, hidden], bf).replicated(),
+            proj = weight([hidden, hidden], bf),
             proj_bias = weight([hidden], bf),
             norm2 = weight([hidden], bf),
-            gate_up = weight([2 * inter, hidden], bf),
-            gate_up_bias = weight([2 * inter], bf),
-            down = weight([hidden, inter], bf).replicated(),
+            gate = weight([inter, hidden], bf),
+            gate_bias = weight([inter], bf),
+            up = weight([inter, hidden], bf),
+            up_bias = weight([inter], bf),
+            down = weight([hidden, inter], bf),
             down_bias = weight([hidden], bf),
         )
 
@@ -421,14 +427,15 @@ def tower(d):
         patch_embed_bias = weight([hidden], bf),
         blocks = [block(l) for l in range(depth)],
         post_norm = weight([hidden], bf),
-        downsample = weight([out, merge * merge * hidden], bf).replicated(),
+        downsample = weight([out, merge * merge * hidden], bf),
         downsample_bias = weight([out], bf),
         merger = struct(
             proj = weight([out, out], bf),
             norm = weight([out], bf),
             norm_bias = weight([out], bf),
-            gate_up = weight([2 * merger_inter, out], bf),
-            down = weight([out, merger_inter], bf).replicated(),
+            gate = weight([merger_inter, out], bf),
+            up = weight([merger_inter, out], bf),
+            down = weight([out, merger_inter], bf),
         ),
     )
 
@@ -467,7 +474,7 @@ def squeezed(name):
     return src(name).transmute([channels, kernel], stored(name))
 
 def kda_qkv(at):
-    """The names of the q, k and v projections the packed `qkv` reads."""
+    """The names of the q, k and v projections."""
     return [at("self_attn.{}_proj.weight".format(p)) for p in ["q", "k", "v"]]
 
 def kda_conv(k, at):
@@ -542,15 +549,35 @@ def read(reads, own, w, name):
     else:
         read_weight(reads, w, name, quantized = "read")
 
-def read_concat(reads, own, w, names, hf = False):
-    if own:
-        reads.read_own(w)
-    elif hf and kept(w):
-        read_weight(reads, w, names)
-    elif hf:
-        joined(reads, w, names)
+def own_joined(reads, legs):
+    """`legs` as an artifact holds them: once, as the compiler joins them."""
+    j = joined(legs[0].name)
+    if j != None and j.legs == [leg.name for leg in legs]:
+        reads.read_own(join(legs, j.name, axis = j.axis))
     else:
-        reads.read_concat(w, names)
+        for leg in legs:
+            reads.read_own(leg)
+
+def read_legs(reads, own, legs, names, hf = False):
+    """Each of `legs` from its tensor of `names`."""
+    if own:
+        own_joined(reads, legs)
+        return
+    for w, name in zip(legs, names):
+        if hf and kept(w):
+            read_weight(reads, w, name)
+        elif hf and not (stored(name) == BF and w.dtype == dtype.bf16):
+            landed(reads, w, dequantized(reads, name))
+        else:
+            reads.read(w, name)
+
+def read_banks(reads, own, legs, rows, hf = False):
+    """Each of the banks `legs` from its experts' tensors `rows[i]`."""
+    if own:
+        own_joined(reads, legs)
+        return
+    for w, names in zip(legs, rows):
+        read_stack(reads, False, w, names, hf)
 
 def read_stack(reads, own, w, rows, hf = False):
     if own:
@@ -561,13 +588,6 @@ def read_stack(reads, own, w, rows, hf = False):
         stacked(reads, w, rows)
     else:
         reads.read_stack(w, rows)
-
-def joined(reads, w, names):
-    """`w` from the tensors `names`, joined along its first axis."""
-    if all([stored(name) == BF for name in names]) and w.dtype == dtype.bf16:
-        reads.read_concat(w, names)
-    else:
-        landed(reads, w, concat(0, [dequantized(reads, name) for name in names]))
 
 def stacked(reads, w, rows):
     """A bank `w`, an expert a row of `rows` (each the names its rows join
@@ -606,7 +626,7 @@ def land(m, reads, own, new, hf = False):
         if w.mlp.routed:
             moe(reads, own, n, w.mlp, hf)
         else:
-            read_concat(reads, own, w.mlp.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")], hf)
+            read_legs(reads, own, [w.mlp.gate, w.mlp.up], [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")], hf)
             read(reads, own, w.mlp.down, n("mlp.down_proj.weight"))
 
     held = lambda name: own and has(name)
@@ -645,8 +665,8 @@ def read_tower(reads, own, v, t):
             (blk.down_bias, n("mlp.down_proj.bias")),
         ]:
             read(reads, own, w, name)
-        read_concat(reads, own, blk.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
-        read_concat(reads, own, blk.gate_up_bias, [n("mlp.gate_proj.bias"), n("mlp.up_proj.bias")])
+        read_legs(reads, own, [blk.gate, blk.up], [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+        read_legs(reads, own, [blk.gate_bias, blk.up_bias], [n("mlp.gate_proj.bias"), n("mlp.up_proj.bias")])
     read(reads, own, t.post_norm, v("post_layernorm.weight"))
 
     def downsample():
@@ -661,18 +681,18 @@ def read_tower(reads, own, v, t):
     read(reads, own, mg.proj, v("merger.proj.weight"))
     read(reads, own, mg.norm, v("merger.post_projection_norm.weight"))
     read(reads, own, mg.norm_bias, v("merger.post_projection_norm.bias"))
-    read_concat(reads, own, mg.gate_up, [v("merger.gate_proj.weight"), v("merger.up_proj.weight")])
+    read_legs(reads, own, [mg.gate, mg.up], [v("merger.gate_proj.weight"), v("merger.up_proj.weight")])
     read(reads, own, mg.down, v("merger.down_proj.weight"))
 
 def moe(reads, own, n, f, hf = False):
     read(reads, own, f.router, n("mlp.gate.weight"))
     read(reads, own, f.bias, n("mlp.gate.e_score_correction_bias"))
-    read_stack(reads, own, f.gate_up, [
-        [n("mlp.experts.{}.gate_proj.weight".format(e)), n("mlp.experts.{}.up_proj.weight".format(e))]
-        for e in range(f.experts)
+    read_banks(reads, own, [f.gate, f.up], [
+        [[n("mlp.experts.{}.{}_proj.weight".format(e, leg))] for e in range(f.experts)]
+        for leg in ["gate", "up"]
     ], hf)
     read_stack(reads, own, f.down, [[n("mlp.experts.{}.down_proj.weight".format(e))] for e in range(f.experts)], hf)
-    read_concat(reads, own, f.shared.gate_up, [
+    read_legs(reads, own, [f.shared.gate, f.shared.up], [
         n("mlp.shared_experts.gate_proj.weight"),
         n("mlp.shared_experts.up_proj.weight"),
     ], hf)
@@ -691,7 +711,7 @@ def mla(reads, own, n, a):
     read(reads, own, ix.kpool_gate, n("self_attn.indexer.index_kpool_compress_gate"))
 
 def read_kda(reads, own, n, k, hf = False):
-    read_concat(reads, own, k.qkv, kda_qkv(n), hf)
+    read_legs(reads, own, [k.q, k.k, k.v], kda_qkv(n), hf)
     read_expr(reads, own, k.conv, lambda: kda_conv(k, n))
     read(reads, own, k.f_a, n("self_attn.f_a_proj.weight"))
     read(reads, own, k.f_b, n("self_attn.f_b_proj.weight"))
@@ -766,7 +786,8 @@ def kda_caches(c, k):
 def run_kda(x, inputs, k):
     conv = inputs.state(k.conv_state)
     delta = inputs.state(k.delta_state)
-    qkv = ops.linear.matmul(x, k.qkv)
+    # The short convolution and the recurrence read q, k and v side by side.
+    qkv = ops.gather.concat_cols([ops.linear.matmul(x, k.q), ops.linear.matmul(x, k.k), ops.linear.matmul(x, k.v)])
     f = ops.linear.matmul(ops.linear.matmul(x, k.f_a), k.f_b)
     b = ops.linear.matmul(x, k.b)
 
@@ -812,7 +833,7 @@ def cache(c, space, a, fp8):
         return
     c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
 
-def run_attention(x, inputs, a, positions = None, select = None, whole = False):
+def run_attention(x, inputs, a, positions = None, select = None, prefill_only = False):
     """Latent attention of the rows `x`. `select(q_a)`, if given, picks the
     keys each query reads; `positions` default to the rows' own."""
     pages = inputs.kv(a.kv)
@@ -851,15 +872,16 @@ def run_attention(x, inputs, a, positions = None, select = None, whole = False):
             a.theta,
             rotary.partial(a.qk_rope_head_dim),
         )
-    return attend(x, inputs, q_nope, q_pe, a, selection, whole)
+    return attend(x, inputs, q_nope, q_pe, a, selection, prefill_only)
 
-def attend(x, inputs, q_nope, q_pe, a, selection = None, whole = False):
+def attend(x, inputs, q_nope, q_pe, a, selection = None, prefill_only = False):
     """The split queries `q_nope`/`q_pe` of the rows `x` scored against the
     latent kv (or the `selection` of it), through `a`'s output projection;
-    `whole` rows read their keys whole, as the draft head's do."""
+    with `prefill_only` every lane through the prefill arm, as the draft
+    head's rows are."""
     q = ops.attn.mla_absorb_q(q_nope, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
     scored = ops.attn.attend_mla(q, q_pe, inputs, a.kv, a.heads, a.kv_lora_rank, a.sm_scale,
-                                 selection = selection, whole = whole)
+                                 selection = selection, prefill_only = prefill_only)
 
     o = ops.attn.mla_absorb_out(scored, a.kv_b_proj, a.heads, a.kv_lora_rank, a.qk_nope_head_dim, a.v_head_dim)
     if a.gate != None:
@@ -953,7 +975,7 @@ def draft(m, inputs, y, positions, logits):
         ops.linear.matmul(h, mtp.h_proj),
     )
     x = ops.elemwise.rmsnorm(fused, mtp.mixer_norm, mtp.mixer_norm_eps)
-    o = mla_mixer(x, drafted, positions, m.act, mtp.attn, whole = True)
+    o = mla_mixer(x, drafted, positions, m.act, mtp.attn, prefill_only = True)
     r = ops.elemwise.residual_add(o, fused)
     x = ops.elemwise.rmsnorm(r, mtp.mlp_norm, mtp.mlp_norm_eps)
     r = ops.elemwise.residual_add(mlp(x, mtp.mlp, None), r)
@@ -979,7 +1001,7 @@ def predict_next(streams, following, hy):
 def mlp(x, f, hint):
     if not f.routed:
         return ops.linear.matmul(
-            ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter, limit = f.limit),
+            ops.linear.glu(ops.linear.matmul(x, f.gate), gating.swiglu(), up = ops.linear.matmul(x, f.up), limit = f.limit),
             f.down,
         )
     # The release routes at f32: its logits are never rounded to bf16.
@@ -991,18 +1013,20 @@ def mlp(x, f, hint):
         bias = f.bias,
         hint = hint,
     )
-    packed = ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k)
-    act = ops.linear.glu(packed, gating.swiglu(), f.inter, limit = f.limit)
+    gate = ops.linear.moe_matmul_select(x, f.gate, routes, f.top_k)
+    up = ops.linear.moe_matmul_select(x, f.up, routes, f.top_k)
+    act = ops.linear.glu(gate, gating.swiglu(), up = up, limit = f.limit)
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
     s = f.shared
-    act = ops.linear.glu(ops.linear.matmul(x, s.gate_up), gating.swiglu(), s.inter, limit = f.limit)
+    act = ops.linear.glu(ops.linear.matmul(x, s.gate), gating.swiglu(), up = ops.linear.matmul(x, s.up), limit = f.limit)
     return ops.elemwise.residual_add(ops.linear.matmul(act, s.down), routed)
 
-def mla_mixer(x, inputs, positions, act, a, whole = False):
+def mla_mixer(x, inputs, positions, act, a, prefill_only = False):
     """Latent attention over the keys the indexer picks: its rows split into
-    decode and prefill arms, or read whole (the draft head's)."""
-    select = lambda q_a: index_select(x, q_a, inputs, positions, act, a.indexer, not whole)
-    return run_attention(x, inputs, a, positions = positions, select = select, whole = whole)
+    decode and prefill arms, or every lane through the prefill arm
+    (`prefill_only`, the draft head's)."""
+    select = lambda q_a: index_select(x, q_a, inputs, positions, act, a.indexer, not prefill_only)
+    return run_attention(x, inputs, a, positions = positions, select = select, prefill_only = prefill_only)
 
 def index_select(x, q_a, inputs, positions, act, ix, split):
     keys = inputs.kv(ix.keys)
@@ -1070,8 +1094,9 @@ def run_tower(inputs, t):
             y,
         )
         n = ops.elemwise.rmsnorm(y, b.norm2, t.norm_eps)
-        h = ops.elemwise.add_bias(b.gate_up_bias, ops.linear.matmul(n, b.gate_up))
-        a = ops.linear.glu(h, gating.swiglu(), t.inter, limit = t.limit)
+        gate = ops.elemwise.add_bias(b.gate_bias, ops.linear.matmul(n, b.gate))
+        up = ops.elemwise.add_bias(b.up_bias, ops.linear.matmul(n, b.up))
+        a = ops.linear.glu(gate, gating.swiglu(), up = up, limit = t.limit)
         y = ops.elemwise.residual_add(
             ops.elemwise.add_bias(b.down_bias, ops.linear.matmul(a, b.down)),
             y,
@@ -1083,7 +1108,6 @@ def run_tower(inputs, t):
     p = ops.linear.matmul(y, mg.proj)
     n = ops.elemwise.layernorm(p, mg.norm, mg.norm_bias, t.norm_eps)
     g = ops.linear.gelu_tanh(n)
-    h = ops.linear.matmul(g, mg.gate_up)
-    a = ops.linear.glu(h, gating.swiglu(), t.merger_inter, limit = t.limit)
+    a = ops.linear.glu(ops.linear.matmul(g, mg.gate), gating.swiglu(), up = ops.linear.matmul(g, mg.up), limit = t.limit)
     return ops.linear.matmul(a, mg.down)
 

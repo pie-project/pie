@@ -758,7 +758,7 @@ fn a_plain_norm_lays_the_table_its_projections_read() {
 }
 
 /// Every table producer's check on the GPU at hand, run by name with
-/// `--ignored` (as the microbenchmarks are) to read them on another chip.
+/// `--ignored` to read them on another chip.
 #[test]
 #[ignore = "the table producers' checks, run on demand on a named GPU"]
 fn register_tables_on_this_gpu() {

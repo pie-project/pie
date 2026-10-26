@@ -40,7 +40,6 @@ elemwise.hc_mma = true
 elemwise.qg_prologue_until = 64
 elemwise.norm_emit = true
 sdpa.compressed_decode_until = 64
-gemm.bias_epilogue = true
 gemm.rows_m = 8
 mla.expanded_from = 256
 attn_res.fused_norm = true
@@ -116,7 +115,6 @@ measured = [
   "kernel.elemwise.qg_prologue_until",
   "kernel.elemwise.norm_emit",
   "kernel.sdpa.compressed_decode_until",
-  "kernel.gemm.bias_epilogue",
   "kernel.gemm.rows_m",
   "kernel.mla.expanded_from",
   "kernel.attn_res.fused_norm",

@@ -48,7 +48,6 @@ pub fn alone() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-mod an_expert_parallel_group_decodes_at_its_buckets;
 mod an_expert_parallel_group_rebalances_its_experts;
 mod an_expert_parallel_group_serves_through_its_engines;
 mod an_expert_parallel_group_that_arms_little_serves_eagerly;

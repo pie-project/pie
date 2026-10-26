@@ -6,7 +6,7 @@
 # bf16 or (`nvfp4a4`) NVFP4 activations; those deployments come last, so a
 # bf16 checkpoint's import picks one it can write.
 
-load("//pie/codec.poem", "nvfp4_bank")
+load("//pie/codec.poem", "nvfp4_bank", read_fused = "fused")
 load("//lib/media.poem", "smart_resize")
 load("//lib/rope.poem", "yarn")
 load("//lib/spoken.poem", "QWEN_STOP", "QWEN_VISION", "QWEN_AUDIO")
@@ -90,8 +90,10 @@ def gdn(d, proj, ba, dense, conv_state, delta_state):
         v_dim = d.v_dim,
         qkv_width = qkv,
         conv_kernel = d.conv_kernel,
-        in_qkvz = weight([qkv + v_w, d.hidden], proj),
-        in_ba = weight([2 * d.v_heads, d.hidden], ba),
+        in_qkv = weight([qkv, d.hidden], proj),
+        in_z = weight([v_w, d.hidden], proj),
+        in_b = weight([d.v_heads, d.hidden], ba),
+        in_a = weight([d.v_heads, d.hidden], ba),
         conv = weight([qkv, d.conv_kernel]),
         dt_bias = weight([d.v_heads]),
         a_log = weight([d.v_heads], dtype.f32),
@@ -108,7 +110,8 @@ def routed(n, hidden, m, experts, proj, gate):
     return struct(
         routed = True,
         router = weight([m.experts, hidden], gate),
-        gate_up = weight([m.experts, 2 * m.inter, hidden], experts),
+        gate = weight([m.experts, m.inter, hidden], experts),
+        up = weight([m.experts, m.inter, hidden], experts),
         down = weight([m.experts, hidden, m.inter], experts),
         shared = struct(
             gate = weight([m.shared_inter, hidden], proj),
@@ -604,8 +607,10 @@ def read_attn(reads, a, n, norm):
     reads.read_expr(a.k_norm, norm(n("self_attn.k_norm.weight")))
 
 def read_gdn(reads, g, n):
-    reads.read_concat(g.in_qkvz, [n("linear_attn.in_proj_qkv.weight"), n("linear_attn.in_proj_z.weight")])
-    reads.read_concat(g.in_ba, [n("linear_attn.in_proj_b.weight"), n("linear_attn.in_proj_a.weight")])
+    reads.read(g.in_qkv, n("linear_attn.in_proj_qkv.weight"))
+    reads.read(g.in_z, n("linear_attn.in_proj_z.weight"))
+    reads.read(g.in_b, n("linear_attn.in_proj_b.weight"))
+    reads.read(g.in_a, n("linear_attn.in_proj_a.weight"))
     reads.read_expr(g.conv, squeezed(n("linear_attn.conv1d.weight")))
     reads.read(g.dt_bias, n("linear_attn.dt_bias"))
     reads.read(g.a_log, n("linear_attn.A_log"))
@@ -620,13 +625,16 @@ def read_routed(reads, f, n, layout):
     reads.read(f.router, n("mlp.gate.weight"))
     if layout.nvfp4:
         expert = lambda e, leg: n("mlp.experts.{}.{}_proj".format(e, leg))
-        nvfp4_bank(reads, f.gate_up, [[expert(e, "gate"), expert(e, "up")] for e in range(f.experts)])
+        nvfp4_bank(reads, f.gate, [[expert(e, "gate")] for e in range(f.experts)])
+        nvfp4_bank(reads, f.up, [[expert(e, "up")] for e in range(f.experts)])
         nvfp4_bank(reads, f.down, [[expert(e, "down")] for e in range(f.experts)])
     elif layout.mlx:
-        reads.read_concat(f.gate_up, [n("mlp.switch_mlp.gate_proj.weight"), n("mlp.switch_mlp.up_proj.weight")])
+        reads.read(f.gate, n("mlp.switch_mlp.gate_proj.weight"))
+        reads.read(f.up, n("mlp.switch_mlp.up_proj.weight"))
         reads.read(f.down, n("mlp.switch_mlp.down_proj.weight"))
     else:
-        reads.read(f.gate_up, n("mlp.experts.gate_up_proj"))
+        # The release stores each expert's gate rows, then its up rows.
+        read_fused(reads, [f.gate, f.up], n("mlp.experts.gate_up_proj"), axis = 1)
         reads.read(f.down, n("mlp.experts.down_proj"))
     reads.read(f.shared.gate, n("mlp.shared_expert.gate_proj.weight"))
     reads.read(f.shared.up, n("mlp.shared_expert.up_proj.weight"))
@@ -807,7 +815,8 @@ def moe(x, f):
         routing.softmax(),
     )
 
-    hidden = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up, experts, f.top_k), gating.swiglu(), f.inter)
+    gate = ops.linear.moe_matmul_select(x, f.gate, experts, f.top_k)
+    hidden = ops.linear.glu(gate, gating.swiglu(), up = ops.linear.moe_matmul_select(x, f.up, experts, f.top_k))
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(hidden, f.down, experts, f.top_k), weights)
     gate, up = ops.linear.matmul(x, f.shared.gate), ops.linear.matmul(x, f.shared.up)
     shared = ops.linear.matmul(ops.linear.glu(gate, gating.swiglu(), up = up), f.shared_down)
@@ -1057,20 +1066,20 @@ def attn_mixer(x, inputs, m, a, ix):
 def gdn_mixer(x, inputs, g):
     conv_state = inputs.state(g.conv_state)
     delta_state = inputs.state(g.delta_state)
-    qkvz = ops.linear.matmul(x, g.in_qkvz)
-    ba = ops.linear.matmul(x, g.in_ba)
-    width = g.qkv_width
+    qkv = ops.linear.matmul(x, g.in_qkv)
+    z = ops.linear.matmul(x, g.in_z)
+    # The gates read each v head's beta and alpha side by side.
+    ba = ops.gather.concat_cols([ops.linear.matmul(x, g.in_b), ops.linear.matmul(x, g.in_a)])
     one = fact.single_token()
-    qkvz_d, qkvz_p = qkvz.on(one), qkvz.on(~one)
+    qkv_d, qkv_p = qkv.on(one), qkv.on(~one)
+    z_d, z_p = z.on(one), z.on(~one)
     ba_d, ba_p = ba.on(one), ba.on(~one)
 
-    qkv, z_d = ops.gather.split_rows(qkvz_d, width)
-    qkv = ops.ssm.causal_conv1d(qkv, g.conv, conv_state, g.conv_kernel)
+    qkv = ops.ssm.causal_conv1d(qkv_d, g.conv, conv_state, g.conv_kernel)
     gates = ops.ssm.gdn_gates(ba_d, g.dt_bias, g.a_log)
     core_d = ops.ssm.gated_delta(qkv, z_d, gates, delta_state, g.k_heads, g.v_heads, g.k_dim, g.v_dim)
 
-    qkv, z_p = ops.gather.split_rows(qkvz_p, width)
-    qkv = ops.ssm.causal_conv1d_chunked(qkv, g.conv, conv_state, g.conv_kernel)
+    qkv = ops.ssm.causal_conv1d_chunked(qkv_p, g.conv, conv_state, g.conv_kernel)
     gates = ops.ssm.gdn_gates(ba_p, g.dt_bias, g.a_log)
     core_p = ops.ssm.gated_delta_chunked(qkv, z_p, gates, delta_state, g.k_heads, g.v_heads, g.k_dim, g.v_dim)
 

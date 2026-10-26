@@ -20,7 +20,7 @@ pub use elemwise::{
     ActFn, BinaryOp, Bounds, Elemwise, GateActivation, GateHeads, ModulateForm, MropeForm,
     NormAxis, NormNext, NormWeight, ResidualGate, RopeForm, RopeFreqs, Turn, Yarn,
 };
-pub use fused::{Fused, NormKind};
+pub use fused::{Fused, NormKind, RegionRead};
 pub use gather::{Gather, PixelOrder, TapKind};
 pub use linear::{ActQuant, GluAct, Linear, RouteScore};
 pub use sampling::Sampling;

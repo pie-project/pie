@@ -31,9 +31,11 @@ pub use kernel::{Kernel, kernel};
 pub use root::{Features, Root, Toolchain, specific_of};
 
 /// Binds the current device's primary context to this thread, once a
-/// thread. A kernel's first resolution on a thread does it otherwise, mid
-/// fire, where its `cudaFree` waits on the device (and on a peer spinning
-/// in an expert-parallel barrier that waits on this thread's launches).
+/// thread: the context already current, or else the device's primary one
+/// retained and made current through the driver, no call that waits on the
+/// device (or on a peer spinning in an expert-parallel barrier that waits
+/// on this thread's launches) or that a capture open on this thread
+/// refuses. A kernel's first resolution on a thread does it otherwise.
 #[cfg(feature = "cuda")]
 pub fn bind_context() -> Result<(), crate::Error> {
     cache::bind_context().map_err(|fault| crate::Error::Backend {

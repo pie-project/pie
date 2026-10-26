@@ -61,6 +61,25 @@ pub struct DagStreams;
 #[decision(id = "compiler.synth_regions", flag, default = false, tune = engine)]
 pub struct SynthRegions;
 
+/// Whether each matmul and the pointwise ops over its product are lowered
+/// to a kernels-ir anchored region (`fuse::anchor`), for a backend's
+/// contraction skeletons to fill their hooks with, and the trace folded with
+/// each one `fused.anchored` op ([`crate::fuse::anchor::fold`]), before the
+/// row chains fold. Off unless the backend registers it on
+/// ([`register_regions`], CUDA) or a chip's profile turns it on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "compiler.synth_anchors", flag, default = false, tune = engine)]
+pub struct SynthAnchors;
+
+/// Whether an anchored region over an RMS norm's row folds the norm in
+/// (`fuse::anchor::anchors_with`): its scale one more op of the product's
+/// epilogue, its gain folded into the bank at load, the norm's own launch
+/// and its normed row gone. Under `compiler.synth_anchors`; off unless the
+/// backend registers it on ([`register_regions`], CUDA).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
+#[decision(id = "compiler.fold_norms", flag, default = false, tune = engine)]
+pub struct FoldNorms;
+
 /// The widest fire, in rows, that runs `compiler.dag_streams`' schedule on
 /// the side streams; wider fires walk every region on the main stream
 /// (each launch fills the card alone). 0: every fire.
@@ -87,8 +106,10 @@ pub fn register_for(registry: &mut Registry, side_streams: u32, conditionals: Co
     register_all(registry, side_streams, conditionals, false);
 }
 
-/// [`register`], `compiler.synth_regions` on by default: a backend whose
-/// rule list leaves the residual norms to generated row kernels.
+/// [`register`], `compiler.synth_regions` and `compiler.synth_anchors` on
+/// by default: a backend whose rule list leaves the residual norms to
+/// generated row kernels and a product's epilogue to its contraction
+/// skeletons.
 pub fn register_regions(registry: &mut Registry, side_streams: u32) {
     register_all(registry, side_streams, Conditionals::Native, true);
 }
@@ -121,6 +142,8 @@ fn register_all(
         .add::<DagStreams>()
         .add::<DagStreamsUntil>()
         .add_defaulting::<SynthRegions>(if regions { "true" } else { "false" })
+        .add_defaulting::<SynthAnchors>(if regions { "true" } else { "false" })
+        .add_defaulting::<FoldNorms>(if regions { "true" } else { "false" })
         .add_defaulting::<SideStreams>(&side_streams.to_string());
 }
 
@@ -143,6 +166,8 @@ impl DeviceProfile {
             dag_streams: profile.on::<DagStreams>(&profile::Anywhere),
             dag_streams_until: profile.get::<DagStreamsUntil>().0,
             synth_regions: profile.on::<SynthRegions>(&profile::Anywhere),
+            synth_anchors: profile.on::<SynthAnchors>(&profile::Anywhere),
+            fold_norms: profile.on::<FoldNorms>(&profile::Anywhere),
 
             family_us: FamilyCosts {
                 attn: us(profile.get::<AttnUs>().0),

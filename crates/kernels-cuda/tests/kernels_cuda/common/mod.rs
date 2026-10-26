@@ -15,6 +15,10 @@ fn check(code: rt::cudaError, call: &str) {
     );
 }
 
+/// cuBLAS handles dropped `Gpu`s gave back, by device, for the next to
+/// take (see [`Gpu`]'s drop).
+static BLAS: std::sync::Mutex<Vec<(i32, usize)>> = std::sync::Mutex::new(Vec::new());
+
 pub struct Gpu {
     ordinal: i32,
     stream: rt::cudaStream_t,
@@ -73,12 +77,24 @@ impl Gpu {
             check(rt::cudaSetDevice(ordinal), "cudaSetDevice");
             let mut stream: rt::cudaStream_t = core::ptr::null_mut();
             check(rt::cudaStreamCreate(&raw mut stream), "cudaStreamCreate");
-            let mut cublas: blas::cublasHandle_t = core::ptr::null_mut();
-            assert_eq!(
-                blas::cublasCreate_v2(&raw mut cublas),
-                blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
-                "`cublasCreate_v2` did not answer a handle"
-            );
+            let kept = {
+                let mut kept = BLAS.lock().expect("blas lock poisoned");
+                kept.iter()
+                    .position(|&(device, _)| device == ordinal)
+                    .map(|at| kept.swap_remove(at).1)
+            };
+            let cublas: blas::cublasHandle_t = match kept {
+                Some(handle) => handle as blas::cublasHandle_t,
+                None => {
+                    let mut cublas: blas::cublasHandle_t = core::ptr::null_mut();
+                    assert_eq!(
+                        blas::cublasCreate_v2(&raw mut cublas),
+                        blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
+                        "`cublasCreate_v2` did not answer a handle"
+                    );
+                    cublas
+                }
+            };
             assert_eq!(
                 blas::cublasSetStream_v2(cublas, stream.cast()),
                 blas::cublasStatus_t::CUBLAS_STATUS_SUCCESS,
@@ -376,37 +392,6 @@ impl Gpu {
             );
         }
     }
-
-    /// The device's microseconds a `fire` on this stream takes, the best of
-    /// 25 runs of `reps` (events either side of each run).
-    pub fn time(&self, reps: u32, mut fire: impl FnMut()) -> f64 {
-        let mut best = f64::INFINITY;
-        // SAFETY: the events are locals created and destroyed here, recorded
-        // on the stream `open` created.
-        unsafe {
-            let (mut a, mut b): (rt::cudaEvent_t, rt::cudaEvent_t) =
-                (core::ptr::null_mut(), core::ptr::null_mut());
-            check(rt::cudaEventCreate(&raw mut a), "cudaEventCreate");
-            check(rt::cudaEventCreate(&raw mut b), "cudaEventCreate");
-            for _ in 0..25 {
-                check(rt::cudaEventRecord(a, self.stream), "cudaEventRecord");
-                for _ in 0..reps {
-                    fire();
-                }
-                check(rt::cudaEventRecord(b, self.stream), "cudaEventRecord");
-                check(rt::cudaEventSynchronize(b), "cudaEventSynchronize");
-                let mut ms = 0f32;
-                check(
-                    rt::cudaEventElapsedTime(&raw mut ms, a, b),
-                    "cudaEventElapsedTime",
-                );
-                best = best.min(f64::from(ms) * 1e3 / f64::from(reps));
-            }
-            check(rt::cudaEventDestroy(a), "cudaEventDestroy");
-            check(rt::cudaEventDestroy(b), "cudaEventDestroy");
-        }
-        best
-    }
 }
 
 impl Drop for Gpu {
@@ -427,7 +412,16 @@ impl Drop for Gpu {
                 let _ = dr::cuMemRelease(edge.handle);
                 let _ = dr::cuMemAddressFree(edge.base, edge.reserved);
             }
-            blas::cublasDestroy_v2(self.cublas);
+            // kept for the next `Gpu`, not destroyed: `cublasDestroy`
+            // synchronizes the whole device, which invalidates a capture
+            // another thread has open (the GEMM tuner's, timing a shape
+            // its cache does not hold), as the engine keeps its own
+            // its stream and workspace (this `Gpu`'s) let go
+            blas::cublasSetWorkspace_v2(self.cublas, core::ptr::null_mut(), 0);
+            blas::cublasSetStream_v2(self.cublas, core::ptr::null_mut());
+            BLAS.lock()
+                .expect("blas lock poisoned")
+                .push((self.ordinal, self.cublas as usize));
             rt::cudaStreamDestroy(self.stream);
         }
     }

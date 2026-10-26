@@ -1596,6 +1596,7 @@ impl<'c> Run<'c> {
         self.place.run.get()
     }
 
+    #[cfg(feature = "rocm")]
     pub(crate) fn read_elsewhere(&self, normed: ValueId) -> bool {
         use poem_ir::Operands as _;
         let mut inputs: Vec<ValueId> = Vec::new();
@@ -1606,6 +1607,15 @@ impl<'c> Run<'c> {
         })
     }
 
+    /// The epilogue the load loaded for the anchored region of `key`.
+    #[cfg(not(feature = "rocm"))]
+    pub(crate) fn anchor_epilogue(
+        &self,
+        key: u64,
+    ) -> Option<&'static kernels_cuda::linear::skeleton::Epilogue> {
+        self.regions.anchor(key)
+    }
+
     /// The kernel the load generated for the region of `body` over rows
     /// `width` wide.
     #[cfg(not(feature = "rocm"))]
@@ -1613,8 +1623,9 @@ impl<'c> Run<'c> {
         &self,
         body: u64,
         width: u32,
+        forms: &[kernels_cuda::synth::In],
     ) -> Option<kernels_cuda::synth::Synthesized> {
-        self.regions.get(body, width)
+        self.regions.get(body, width, forms)
     }
 
     pub(crate) fn lane_shaped(&self, id: ValueId) -> bool {

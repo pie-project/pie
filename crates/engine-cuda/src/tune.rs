@@ -357,7 +357,7 @@ mod tests {
     use super::*;
 
     #[cfg(not(feature = "rocm"))]
-    const GPU: (&str, u32, u32, u32, &str) = ("NVIDIA L40S", 8, 9, 142, "fuse.matmul_bias");
+    const GPU: (&str, u32, u32, u32, &str) = ("NVIDIA L40S", 8, 9, 142, "fuse.moe_experts");
     #[cfg(feature = "rocm")]
     const GPU: (&str, u32, u32, u32, &str) = (
         "AMD Instinct MI300X",

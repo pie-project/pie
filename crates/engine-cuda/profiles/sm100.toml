@@ -53,8 +53,6 @@ elemwise.hc_mma = true
 # 1280: 72.9 against 73.9).
 elemwise.hc_mega_from = 43
 elemwise.hc_mega_until = 1120
-# Gemma 4's q norm and rotation on its kv-shared layers a warp a (row, head).
-elemwise.q_norm_rope_warp = true
 # Qwen3.5's attention prologue in one launch up to 64 rows.
 elemwise.qg_prologue_until = 64
 # A wide decode's split partials fold a warp a row.
@@ -91,8 +89,6 @@ sdpa.decode.gqa_cluster = 8
 # Muse Spark's bs64 decode attention 328 -> 288 us a step, gpt-oss-120b's
 # 7-8 us a step at bs1/8/64 (bs8 Muse even).
 sdpa.decode.gqa_deep_64 = true
-# A dense bias from the cuBLASLt epilogue.
-gemm.bias_epilogue = true
 # Routed MLPs kept by expert with the GLU in the gate-up epilogue: W4A4
 # always, W4A8 from 512 tokens.
 moe.w4a4_fused_from = 1

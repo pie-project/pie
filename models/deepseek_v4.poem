@@ -110,20 +110,17 @@ def head(prefix, streams, hidden):
 
 DRAFT_EXPERTS = 256
 
-def routed(gate, up, down, split, gate_at = []):
+def routed(gate, up, down, gate_at = []):
     """The dtypes a layer's routed banks are stored at: `gate`, `up` and
     `down`, the gate overridden at `dtype` on the layers `gate_at` lists as
-    `(layer, dtype)`; with `split` the gate and up banks apart."""
-    return struct(gate = gate, up = up, down = down, split = split, gate_at = gate_at)
+    `(layer, dtype)`."""
+    return struct(gate = gate, up = up, down = down, gate_at = gate_at)
 
 def uniform(w):
-    return routed(w, w, w, False)
+    return routed(w, w, w)
 
-def split_of(w):
-    return routed(w, w, w, True)
-
-DQ_2BIT = routed(dtype.u2g32, dtype.u2g64, dtype.u2g64, True, [(4, dtype.u2g64)])
-DQ_2BIT_FULL = routed(dtype.u2g32, dtype.u2g64, dtype.u2g64, True, [(42, dtype.u2g64)])
+DQ_2BIT = routed(dtype.u2g32, dtype.u2g64, dtype.u2g64, [(4, dtype.u2g64)])
+DQ_2BIT_FULL = routed(dtype.u2g32, dtype.u2g64, dtype.u2g64, [(42, dtype.u2g64)])
 
 def banks_at(r, layer):
     """`r` as stored on `layer`."""
@@ -131,7 +128,7 @@ def banks_at(r, layer):
     for at, d in r.gate_at:
         if at == layer:
             gate = d
-    return routed(gate, r.up, r.down, r.split)
+    return routed(gate, r.up, r.down)
 
 # ---------------------------------------------------------------------------
 # The V4 base.
@@ -159,7 +156,8 @@ def base(w, kv, d):
             di = d.dense_inter
             mlp = struct(
                 kind = "dense",
-                gate_up = weight([2 * di, hidden], w),
+                gate = weight([di, hidden], w),
+                up = weight([di, hidden], w),
                 down = weight([hidden, di], w),
                 inter = di,
                 limit = d.swiglu_limit,
@@ -170,7 +168,8 @@ def base(w, kv, d):
                 kind = "routed",
                 router = weight([d.experts, hidden], w),
                 bias = weight([d.experts], w),
-                gate_up = weight([d.experts, 2 * mi, hidden], w),
+                gate = weight([d.experts, mi, hidden], w),
+                up = weight([d.experts, mi, hidden], w),
                 down = weight([d.experts, hidden, mi], w),
                 experts = d.experts,
                 top_k = d.top_k,
@@ -285,22 +284,16 @@ def moe_flash(n, d, experts, gate, banks, weights, dense, top_k = None):
     mi = d.moe_inter
     si = d.shared_inter
     hidden = d.hidden
-    if banks.split:
-        half = lambda what, dt: weight([experts, mi, hidden], dt)
-        gate_up = struct(fused = None, gate = half("experts_gate", banks.gate), up = half("experts_up", banks.up))
-    else:
-        gate_up = struct(
-            fused = weight([experts, 2 * mi, hidden], banks.gate),
-            gate = None,
-            up = None,
-        )
+    half = lambda dt: weight([experts, mi, hidden], dt)
+    gate_up = struct(gate = half(banks.gate), up = half(banks.up))
     return struct(
         kind = "moe_flash",
         router = weight([experts, hidden]),
         gate = gate,
         gate_up = gate_up,
         down = weight([experts, hidden, mi], banks.down),
-        shared_gate_up = weight([2 * si, hidden], weights),
+        shared_gate = weight([si, hidden], weights),
+        shared_up = weight([si, hidden], weights),
         shared_down = weight([hidden, si], weights),
         experts = experts,
         top_k = top_k if top_k != None else d.top_k,
@@ -432,7 +425,7 @@ def flash(w, r, kv, d, quant = None):
                 ratio = None,
                 hash = False,
                 experts = DRAFT_EXPERTS,
-                routed_banks = split_of(dtype.mxfp4),
+                routed_banks = uniform(dtype.mxfp4),
                 weights = bf,
                 sdense = bf,
             ),
@@ -761,18 +754,18 @@ def layout(id, deploy):
     mtp = deploy.drafter == "mtp"
     dspark = deploy.drafter == "dspark"
     if id == "dsv41-flash" and ws == [u4]:
-        return flash41(u4, split_of(u4), kv, dims41(V41_PLAN))
+        return flash41(u4, uniform(u4), kv, dims41(V41_PLAN))
     if id == "dsv41-flash" and ws == [bf, mx]:
-        return flash41(bf, split_of(mx), kv, dims41(V41_PLAN))
+        return flash41(bf, uniform(mx), kv, dims41(V41_PLAN))
     if id == "dsv41-flash-mini" and ws == [bf, mx]:
-        return flash41(bf, split_of(mx), kv, dims41(V41_MINI_PLAN, experts = 16, base_vocab = 20000))
+        return flash41(bf, uniform(mx), kv, dims41(V41_MINI_PLAN, experts = 16, base_vocab = 20000))
     if id == "dsv41-flash" and ws == [fp8b32, mxg32]:
-        return flash41(bf, split_of(mxg32), kv, dims41(V41_PLAN), quant = fp8b32, dspark = dspark)
+        return flash41(bf, uniform(mxg32), kv, dims41(V41_PLAN), quant = fp8b32, dspark = dspark)
     if id == "dsv41-flash-mini" and ws == [fp8b32, mxg32]:
-        return flash41(bf, split_of(mxg32), kv, dims41(V41_MINI_PLAN, experts = 16, base_vocab = 20000),
+        return flash41(bf, uniform(mxg32), kv, dims41(V41_MINI_PLAN, experts = 16, base_vocab = 20000),
                        quant = fp8b32, dspark = dspark)
     if id == "dsv41-flash-trunc8" and ws == [fp8b32, mxg32] and not dspark:
-        return flash41(bf, split_of(mxg32), kv, dims41(V41_TRUNC8_PLAN), quant = fp8b32)
+        return flash41(bf, uniform(mxg32), kv, dims41(V41_TRUNC8_PLAN), quant = fp8b32)
     if id == "dsv4-flash":
         if ws == [bf] and not mtp:
             return flash(bf, uniform(bf), kv, flash_dims(43, flash_ratios(), 3))
@@ -781,7 +774,7 @@ def layout(id, deploy):
         if ws == [u4, dtype.u2g64, mx] and mtp:
             return flash(u4, DQ_2BIT_FULL, kv, flash_dims(43, flash_ratios(), 3, draft = True))
         if ws == [bf, mx]:
-            return flash(bf, split_of(mx), kv, flash_dims(43, flash_ratios(), 3, draft = mtp))
+            return flash(bf, uniform(mx), kv, flash_dims(43, flash_ratios(), 3, draft = mtp))
         if ws == [fp8, mxa8] and not mtp:
             return flash(bf, uniform(mxa8), kv, flash_dims(43, flash_ratios(), 3), quant = fp8)
     if id == "dsv4-flash-mini":
@@ -792,13 +785,13 @@ def layout(id, deploy):
         if ws == [u4, dtype.u2g64, mx] and mtp:
             return flash(u4, DQ_2BIT, kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16, draft = True))
         if ws == [bf, mx] and not mtp:
-            return flash(bf, split_of(mx), kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16))
+            return flash(bf, uniform(mx), kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16))
         if ws == [fp8, mxa8] and not mtp:
             return flash(bf, uniform(mxa8), kv, flash_dims(5, FLASH_MICRO_RATIOS, 3, experts = 16), quant = fp8)
     if id == "dsv4-pro" and ws == [bf, mx] and not mtp:
-        return flash(bf, split_of(mx), kv, pro_dims(61, pro_ratios(), 3))
+        return flash(bf, uniform(mx), kv, pro_dims(61, pro_ratios(), 3))
     if id == "dsv4-pro-mini" and ws == [bf, mx] and not mtp:
-        return flash(bf, split_of(mx), kv, pro_dims(5, PRO_MINI_RATIOS, 3, experts = 16))
+        return flash(bf, uniform(mx), kv, pro_dims(5, PRO_MINI_RATIOS, 3, experts = 16))
     if id == "dsv4-base" and ws == [bf] and not mtp:
         return base(bf, kv, BASE)
     fail("{} does not ship {}".format(id, deploy))
@@ -897,19 +890,11 @@ def layer_reads(w, n, reads):
         else:
             reads.append(one(f.router, n("ffn.gate.weight")))
             reads.append(one(f.gate.bias, n("ffn.gate.e_score_correction_bias")))
-        if f.gate_up.fused != None:
-            reads.append(joined(f.gate_up.fused, 1, [
-                n("ffn.switch_mlp.gate_proj.weight"),
-                n("ffn.switch_mlp.up_proj.weight"),
-            ]))
-        else:
-            reads.append(one(f.gate_up.gate, n("ffn.switch_mlp.gate_proj.weight")))
-            reads.append(one(f.gate_up.up, n("ffn.switch_mlp.up_proj.weight")))
+        reads.append(one(f.gate_up.gate, n("ffn.switch_mlp.gate_proj.weight")))
+        reads.append(one(f.gate_up.up, n("ffn.switch_mlp.up_proj.weight")))
         reads.append(one(f.down, n("ffn.switch_mlp.down_proj.weight")))
-        reads.append(joined(f.shared_gate_up, 0, [
-            n("ffn.shared_experts.gate_proj.weight"),
-            n("ffn.shared_experts.up_proj.weight"),
-        ]))
+        reads.append(one(f.shared_gate, n("ffn.shared_experts.gate_proj.weight")))
+        reads.append(one(f.shared_up, n("ffn.shared_experts.up_proj.weight")))
         reads.append(one(f.shared_down, n("ffn.shared_experts.down_proj.weight")))
 
 def mlx_reads(m):
@@ -1044,16 +1029,11 @@ def release_layer(reads, w, at):
     else:
         reads.read(f.gate.bias, n("ffn.gate.bias"))
     expert = lambda e, leg: n("ffn.experts.{}.{}.weight".format(e, leg))
-    if f.gate_up.fused != None:
-        # Each expert's gate rows, then its up rows: one bank a fused
-        # gate-up select reads, its GLU over the packed rows.
-        read_bank_packed(reads, f.gate_up.fused,
-            [[expert(e, "w1"), expert(e, "w3")] for e in range(f.experts)])
-    else:
-        read_bank(reads, f.gate_up.gate, [expert(e, "w1") for e in range(f.experts)])
-        read_bank(reads, f.gate_up.up, [expert(e, "w3") for e in range(f.experts)])
+    read_bank(reads, f.gate_up.gate, [expert(e, "w1") for e in range(f.experts)])
+    read_bank(reads, f.gate_up.up, [expert(e, "w3") for e in range(f.experts)])
     read_bank(reads, f.down, [expert(e, "w2") for e in range(f.experts)])
-    reads.read_concat(f.shared_gate_up, [n("ffn.shared_experts.w1.weight"), n("ffn.shared_experts.w3.weight")])
+    reads.read(f.shared_gate, n("ffn.shared_experts.w1.weight"))
+    reads.read(f.shared_up, n("ffn.shared_experts.w3.weight"))
     reads.read(f.shared_down, n("ffn.shared_experts.w2.weight"))
 
 # ---------------------------------------------------------------------------
@@ -1064,27 +1044,6 @@ def v41_mlx(m, reads):
     if not has("model.layers.0.ffn.switch_mlp.gate_proj.weight"):
         fail("no stacked MLX V4.1 expert bank in model.layers")
     v41(m, reads, True)
-
-def read_bank_packed(reads, w, pairs):
-    """A routed MXFP4 bank `[experts, 2 * rows, cols]` whose expert `e` is
-    the planes `pairs[e]` stacked by rows (its gate rows, then its up rows),
-    codes and e8m0 exponents alike."""
-    rows, cols = w.shape[1] // 2, w.shape[2]
-    if w.dtype != dtype.mxfp4:
-        fail("`{}`: a packed gate-up bank is read from MXFP4 halves only".format(w.name))
-    codes = []
-    scales = []
-    for pair in pairs:
-        stems = [part[:-len(".weight")] if part.endswith(".weight") else part for part in pair]
-        for part, stem in zip(pair, stems):
-            if not has(stem + ".scale"):
-                fail("`{}`: `{}` is read as MXFP4 codes, whose exponents are stored beside it as `{}`, and the checkpoint holds none".format(w.name, part, stem + ".scale"))
-        codes.append(concat(1, [src(part).transmute([1, rows, cols], encoding(dtype.mxfp4)) for part in pair]))
-        scales.append(concat(1, [src(stem + ".scale").transmute([1, rows, cols // 32], encoding(dtype.e8m0)) for stem in stems]))
-    reads.extend([
-        tensor(w.name, concat(0, codes), encoding(dtype.mxfp4)),
-        tensor(scales_name(w.name), concat(0, scales), encoding(dtype.e8m0), shape = scales_shape(w), scaling = w),
-    ])
 
 def read_bank(reads, w, parts):
     """A routed bank `[experts, rows, cols]` from one plane per expert, at
@@ -1184,8 +1143,6 @@ def v41_block(reads, w, n, mlx):
         fail("V4.1 routes by bias-corrected scores on every layer")
     reads.read(f.gate.bias, n("ffn.gate.e_score_correction_bias" if mlx else "ffn.gate.bias"))
     expert = lambda e, leg: n("ffn.experts.{}.{}.weight".format(e, leg))
-    if f.gate_up.fused != None:
-        fail("V4.1 keeps its routed gate and up legs apart")
     if mlx:
         reads.read(f.gate_up.gate, n("ffn.switch_mlp.gate_proj.weight"))
         reads.read(f.gate_up.up, n("ffn.switch_mlp.up_proj.weight"))
@@ -1196,10 +1153,8 @@ def v41_block(reads, w, n, mlx):
         reads.read(f.down, n("ffn.switch_mlp.down_proj.weight"))
     else:
         read_bank(reads, f.down, [expert(e, "w2") for e in range(f.experts)])
-    reads.read_concat(f.shared_gate_up, [
-        n("ffn.shared_experts.gate_proj.weight" if mlx else "ffn.shared_experts.w1.weight"),
-        n("ffn.shared_experts.up_proj.weight" if mlx else "ffn.shared_experts.w3.weight"),
-    ])
+    reads.read(f.shared_gate, n("ffn.shared_experts.gate_proj.weight" if mlx else "ffn.shared_experts.w1.weight"))
+    reads.read(f.shared_up, n("ffn.shared_experts.up_proj.weight" if mlx else "ffn.shared_experts.w3.weight"))
     reads.read(f.shared_down, n("ffn.shared_experts.down_proj.weight" if mlx else "ffn.shared_experts.w2.weight"))
 
     if w.engram != None:
@@ -1236,18 +1191,18 @@ def huggingface(m, reads):
         reads.read(at.sink, n("self_attn.sinks"))
         f = w.mlp
         if f.kind == "dense":
-            reads.read_concat(f.gate_up, [n("mlp.gate_proj.weight"), n("mlp.up_proj.weight")])
+            reads.read(f.gate, n("mlp.gate_proj.weight"))
+            reads.read(f.up, n("mlp.up_proj.weight"))
             reads.read(f.down, n("mlp.down_proj.weight"))
         elif f.kind == "routed":
             reads.read(f.router, n("mlp.gate.weight"))
             reads.read(f.bias, n("mlp.gate.e_score_correction_bias"))
-            inter = f.gate_up.shape[1] // 2
-            hidden = f.gate_up.shape[2]
-            leg = lambda e, half: src(n("mlp.experts.{}.{}.weight".format(e, half))).transmute(
-                [1, inter, hidden], encoding(f.gate_up.dtype))
-            reads.read_expr(f.gate_up, concat(0, [
-                concat(1, [leg(e, "gate_proj"), leg(e, "up_proj")]) for e in range(f.experts)
-            ]))
+            for leg, half in [(f.gate, "gate_proj"), (f.up, "up_proj")]:
+                reads.read_expr(leg, concat(0, [
+                    src(n("mlp.experts.{}.{}.weight".format(e, half))).transmute(
+                        [1, leg.shape[1], leg.shape[2]], encoding(leg.dtype))
+                    for e in range(f.experts)
+                ]))
             reads.read_expr(f.down, concat(0, [
                 src(n("mlp.experts.{}.down_proj.weight".format(e))).transmute(
                     [1, f.down.shape[1], f.down.shape[2]], encoding(f.down.dtype))
@@ -1278,12 +1233,14 @@ def gguf(m, reads):
         reads.read(at.sink, n("attn_sinks"))
         f = w.mlp
         if f.kind == "dense":
-            reads.read_concat(f.gate_up, [n("ffn_gate.weight"), n("ffn_up.weight")])
+            reads.read(f.gate, n("ffn_gate.weight"))
+            reads.read(f.up, n("ffn_up.weight"))
             reads.read(f.down, n("ffn_down.weight"))
         elif f.kind == "routed":
             reads.read(f.router, n("ffn_gate_inp.weight"))
             reads.read(f.bias, n("exp_probs_b.bias"))
-            reads.read_concat(f.gate_up, [n("ffn_gate_exps.weight"), n("ffn_up_exps.weight")])
+            reads.read(f.gate, n("ffn_gate_exps.weight"))
+            reads.read(f.up, n("ffn_up_exps.weight"))
             reads.read(f.down, n("ffn_down_exps.weight"))
         else:
             fail("a flash deployment has no gguf layout")
@@ -1886,7 +1843,7 @@ def predict_next(streams, following, hy):
 def mlp(x, ids, f, streams, following, hy):
     if f.kind == "dense":
         return ops.linear.matmul(
-            ops.linear.glu(ops.linear.matmul(x, f.gate_up), gating.swiglu(), f.inter, limit = f.limit),
+            ops.linear.glu(ops.linear.matmul(x, f.gate), gating.swiglu(), up = ops.linear.matmul(x, f.up), limit = f.limit),
             f.down,
         )
     if f.kind == "routed":
@@ -1897,8 +1854,9 @@ def mlp(x, ids, f, streams, following, hy):
             routing.sqrt_softplus(renormalize = f.renorm, scaling = f.scaling),
             bias = f.bias,
         )
-        hidden = ops.linear.moe_matmul_select(x, f.gate_up, routes, f.top_k)
-        act = ops.linear.glu(hidden, gating.swiglu(), f.inter, limit = f.limit)
+        gate = ops.linear.moe_matmul_select(x, f.gate, routes, f.top_k)
+        up = ops.linear.moe_matmul_select(x, f.up, routes, f.top_k)
+        act = ops.linear.glu(gate, gating.swiglu(), up = up, limit = f.limit)
         return ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
     if f.gate.kind == "bias":
         hint = predict_next(streams, following, hy)
@@ -1922,26 +1880,15 @@ def mlp(x, ids, f, streams, following, hy):
         )
     shared = ops.linear.matmul(
         ops.linear.glu(
-            ops.linear.matmul(x, f.shared_gate_up),
+            ops.linear.matmul(x, f.shared_gate),
             gating.swiglu(),
-            f.shared_inter,
+            up = ops.linear.matmul(x, f.shared_up),
             limit = f.limit,
         ),
         f.shared_down,
     )
 
-    if f.down.precision != f.down.dtype and f.gate_up.fused != None:
-        # The same over one packed gate-up bank: each expert's gate rows,
-        # then its up rows.
-        act = ops.linear.glu(
-            ops.linear.moe_matmul_select(x, f.gate_up.fused, routes, f.top_k),
-            gating.swiglu(),
-            f.inter,
-            weights = weights,
-            limit = f.limit,
-        )
-        return ops.linear.moe_sum_add(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), shared)
-    if f.down.precision != f.down.dtype and f.gate_up.fused == None:
+    if f.down.precision != f.down.dtype:
         # DeepSeek's expert weighs its activations before its down leg
         # quantizes them, and sums its routes and the shared expert in f32.
         act = ops.linear.glu(
@@ -1952,15 +1899,12 @@ def mlp(x, ids, f, streams, following, hy):
             limit = f.limit,
         )
         return ops.linear.moe_sum_add(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), shared)
-    if f.gate_up.fused != None:
-        act = ops.linear.glu(ops.linear.moe_matmul_select(x, f.gate_up.fused, routes, f.top_k), gating.swiglu(), f.inter, limit = f.limit)
-    else:
-        act = ops.linear.glu(
-            ops.linear.moe_matmul_select(x, f.gate_up.gate, routes, f.top_k),
-            gating.swiglu(),
-            up = ops.linear.moe_matmul_select(x, f.gate_up.up, routes, f.top_k),
-            limit = f.limit,
-        )
+    act = ops.linear.glu(
+        ops.linear.moe_matmul_select(x, f.gate_up.gate, routes, f.top_k),
+        gating.swiglu(),
+        up = ops.linear.moe_matmul_select(x, f.gate_up.up, routes, f.top_k),
+        limit = f.limit,
+    )
     routed = ops.linear.moe_weighted_sum(ops.linear.moe_matmul_select(act, f.down, routes, f.top_k), weights)
     return ops.elemwise.residual_add(shared, routed)
 

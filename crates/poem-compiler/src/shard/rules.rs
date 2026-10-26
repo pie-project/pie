@@ -123,6 +123,8 @@ fn heads(name: &str) -> Option<Heads> {
         "gather.split_qkv_padded" => Heads::of(&["packed"], &[HEAD_PAIR]),
         "gather.split_q_gate" => Heads::of(&["packed"], &[]),
         "gather.split_rows" => Heads::of(&["x"], &["width"]),
+        // Its pieces side by side, each rank's share of each.
+        "gather.concat_cols" => Heads::of(&["xs"], &[]),
         "linear.matmul_grouped" => Heads::of(&["x", "routes"], &["groups"]),
         "attn.ragged" => Heads::of(&["q", "k", "v"], &[KV_HEADS]).kv(&["k", "v"]),
         "attn.sink" => Heads::of(&["o", "lse"], &[]),
@@ -765,6 +767,21 @@ fn held_like(
     }
     if let Some(i) = (0..followed.len()).find(|i| same(*i)) {
         return Ok(held[i].clone());
+    }
+    // An output as wide as its inputs side by side holds their blocks in
+    // their order.
+    let widths: Option<u64> = followed.iter().map(|v| pass.width(*v)).sum();
+    if followed.len() > 1
+        && widths == Some(width)
+        && let Some(blocks) = held
+            .iter()
+            .map(|d| match d {
+                Dist::Split(blocks) => Some(blocks.clone()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+    {
+        return Ok(Dist::Split(blocks.concat()));
     }
     if let [Dist::Split(blocks)] = held
         && blocks.len() == count

@@ -1,8 +1,8 @@
-#include "elemwise/frame.cuh"
+#include "elemwise/skeleton.cuh"
 
 namespace pie::elemwise {
 
-// A residual norm as a row frame's body. Parameters: 0 the residual x,
+// A residual norm as a row skeleton's body. Parameters: 0 the residual x,
 // 1 the stream y, 2 the weight; results: 0 the normed row, 1 the stream
 // y + x, stored in place. The squares are summed a pair at a time, as a
 // generated body sums them.

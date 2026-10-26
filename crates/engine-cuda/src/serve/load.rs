@@ -138,6 +138,32 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     if profile.branches {
         boot.trace = poem_compiler::branch::split(boot.trace.clone());
     }
+    // `compiler.synth_anchors`: each matmul and the pointwise ops over its
+    // product folded into one `fused.anchored`, before the chains fold, so
+    // a product's epilogue is its contraction skeleton's.
+    #[cfg(not(feature = "rocm"))]
+    let anchored = if profile.synth_anchors {
+        // `compiler.fold_norms`: a norm folds into the anchor over its row
+        // where the load holds the anchor's bank whole on the device, the
+        // gain folded into it in place (`Weights::fold_gains`); a bank the
+        // host tier streams keeps its norm.
+        let residency = &boot.residency;
+        let trace = &boot.trace;
+        let held = |w: poem_ir::ValueId| match trace.values[w.0 as usize].def {
+            poem_ir::Def::Weight(p) => !residency.streamed_whole(p as usize),
+            _ => false,
+        };
+        let folds: Option<poem_compiler::fuse::anchor::Folds<'_>> =
+            profile.fold_norms.then_some(&held);
+        let (folded, anchored) = crate::synth::fold_anchors(boot.trace.clone(), folds);
+        boot.trace = folded;
+        anchored
+    } else {
+        std::collections::BTreeMap::new()
+    };
+    #[cfg(feature = "rocm")]
+    let anchored = std::collections::BTreeMap::new();
+    profile.synth_anchors = false;
     // `compiler.synth_regions`: each chain of elementwise and row ops folded
     // into one `fused.region`, its region kernels-ir's, by the fold
     // `compile_axes` plans under the flag. Folded once, here, the trace is
@@ -322,6 +348,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
         budgets,
         profile,
         regions,
+        anchored,
     })
 }
 
@@ -517,10 +544,12 @@ impl Shell {
             budgets,
             profile,
             regions: folded,
+            anchored,
         } = bake(&mut boot)?;
         // Every generated kernel compiled and loaded now, before a fire can
         // ask for one.
-        let regions = crate::synth::Regions::load(&boot.trace, &folded)?;
+        let regions =
+            crate::synth::Regions::load(&boot.trace, &folded, &anchored, &device.ctx().tuning())?;
         let (free_before, device_total) = crate::store::device_memory()?;
         // The pool's address space is reserved for every page its bytes
         // could hold, the stated budget or the share of the card before the
@@ -583,6 +612,10 @@ impl Shell {
             decode_dense,
             boot.deferred_tier,
         )?;
+        // `compiler.fold_norms`: each folded norm's gain into its bank, once,
+        // before anything reads it.
+        #[cfg(feature = "cuda")]
+        weights.fold_gains(&boot.trace, &anchored, device.stream())?;
         // `kernel.gemm.fp8_o_down`: grouped projections on fp8b128, as vLLM
         // reads DeepSeek-V4's `wo_a` (the wide fires on tcgen05).
         #[cfg(feature = "cuda")]
@@ -1470,6 +1503,8 @@ pub(super) struct Baked {
     pub(super) profile: DeviceProfile,
     /// The region each `fused.region` of the trace names, by key.
     pub(super) regions: std::collections::BTreeMap<u64, kernels_ir::Region>,
+    /// The anchored region each `fused.anchored` of the trace names, by key.
+    pub(super) anchored: std::collections::BTreeMap<u64, kernels_ir::Anchored>,
 }
 
 /// The widest fire whose lanes of `rows` prompt rows put no more (lane,

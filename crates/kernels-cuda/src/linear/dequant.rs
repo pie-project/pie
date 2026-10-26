@@ -287,7 +287,7 @@ fn dense_affine_via_dense(
             stated(op, k)?.arg(),
         ],
     )?;
-    gemm::act_x_wt(ctx, op, act, Tensor::new(tile, n, k, Dtype::Bf16), None, y)
+    gemm::act_x_wt(ctx, op, act, Tensor::new(tile, n, k, Dtype::Bf16), y)
 }
 
 // NVFP4 projections read at bf16 (W4A16): `codes` are e2m1 nibble pairs,
@@ -439,7 +439,7 @@ pub fn nvfp4_matmul(
     }
     if act.dtype == Dtype::Bf16 && act.rows > 1 && !seat.streams() {
         let tile = nvfp4_plane(ctx, op, codes, scales, tensor_scales, n, k, seat)?;
-        return gemm::act_x_wt(ctx, op, act, tile, None, y);
+        return gemm::act_x_wt(ctx, op, act, tile, y);
     }
     let (codes, scales, tensor_scales) = whole(codes, scales, tensor_scales, n)?;
     planes(op, codes, scales, tensor_scales, n, k)?;

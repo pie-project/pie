@@ -53,3 +53,30 @@ pub fn scale_rows(ctx: &Ctx, l: Tensor, buf: &mut Tensor) -> Result<(), Error> {
         &[buf.arg(), l.arg(), width.arg()],
     )
 }
+
+/// A norm's gain `g` (`width` long, bf16 or f32) folded into `bank` (`rows x
+/// width`, bf16) in place: each weight times its column's `g`, or `1 + g`
+/// where `plus_one`, rounded once to bf16 (`kernels_ir::anchor::fold_bank`).
+pub fn fold_gain(ctx: &Ctx, bank: &mut Tensor, g: Tensor, plus_one: bool) -> Result<(), Error> {
+    const OP: &str = "linear.fold_gain";
+    let t = dtype_dispatch!(OP, bank.dtype, { Bf16 => "::pie::bf16" });
+    let gt = dtype_dispatch!(OP, g.dtype, { Bf16 => "::pie::bf16", F32 => "float" });
+    if g.elements() != u64::from(bank.width) {
+        return Err(crate::jit::refuse(
+            OP,
+            format!("a gain of {} for a bank {} wide", g.elements(), bank.width),
+        ));
+    }
+    let n = bank.elements();
+    let lanes = nonzero(OP, "the bank's element count", extent(OP, n)?)?;
+    let width = stated(OP, nonzero(OP, "width", bank.width)?)?;
+    ctx.fire(
+        OP,
+        Fire::at(kernel(
+            CAST,
+            &format!("::pie::linear::fold_gain<{t}, {gt}, {plus_one}>"),
+        ))
+        .apply(Launch::flat(lanes, BLOCK)),
+        &[bank.arg(), g.arg(), n.arg(), width.arg()],
+    )
+}

@@ -142,8 +142,10 @@ def layout(id, deploy):
                 swiglu_alpha = d.swiglu_alpha,
                 router = weight([d.experts, hidden], router),
                 router_bias = weight([d.experts]),
-                gate_up = weight([d.experts, 2 * iw, hidden], experts),
-                gate_up_bias = weight([d.experts, 2 * iw]),
+                gate = weight([d.experts, iw, hidden], experts),
+                gate_bias = weight([d.experts, iw]),
+                up = weight([d.experts, iw, hidden], experts),
+                up_bias = weight([d.experts, iw]),
                 down = weight([d.experts, hidden, iw], experts),
                 down_bias = weight([d.experts, hidden]),
             ),
@@ -237,15 +239,21 @@ def read(m, reads, codes):
         reads.read(mlp.router, ck("mlp.router.weight"))
         reads.read(mlp.router_bias, ck("mlp.router.bias"))
         if codes == TRANSFORMERS:
+            # Each expert's gate and up rows interleaved, a gate row first.
             rows = mlp.inter
+            legs = joined(mlp.gate.name)
+            if legs == None or legs.legs != [mlp.gate.name, mlp.up.name]:
+                fail("`{}` interleaves the gate and up rows, which the compiler does not join here; no reading takes one leg's rows apart".format(ck("mlp.experts.gate_up_proj_blocks")))
             reads.extend(bank_planes(
-                mlp.gate_up,
+                join([mlp.gate, mlp.up], legs.name, axis = BANK_ROWS),
                 ck("mlp.experts.gate_up_proj_blocks"),
                 ck("mlp.experts.gate_up_proj_scales"),
                 codes,
                 lambda e: deinterleaved(e, rows),
             ))
-            reads.read_expr(mlp.gate_up_bias, deinterleaved(src(ck("mlp.experts.gate_up_proj_bias")), rows))
+            bias = src(ck("mlp.experts.gate_up_proj_bias"))
+            reads.read_expr(mlp.gate_bias, bias.stride(BANK_ROWS, 0, rows, 2))
+            reads.read_expr(mlp.up_bias, bias.stride(BANK_ROWS, 1, rows, 2))
             reads.extend(bank_planes(
                 mlp.down,
                 ck("mlp.experts.down_proj_blocks"),
@@ -255,8 +263,9 @@ def read(m, reads, codes):
             ))
             reads.read(mlp.down_bias, ck("mlp.experts.down_proj_bias"))
         else:
-            reads.extend(banked_split(mlp.gate_up, [ck("mlp.experts.gate_proj"), ck("mlp.experts.up_proj")], codes))
-            reads.read_concat(mlp.gate_up_bias, [ck("mlp.experts.gate_proj.bias"), ck("mlp.experts.up_proj.bias")])
+            for bank, bias, leg in [(mlp.gate, mlp.gate_bias, "gate_proj"), (mlp.up, mlp.up_bias, "up_proj")]:
+                reads.extend(banked_split(bank, [ck("mlp.experts." + leg)], codes))
+                reads.read(bias, ck("mlp.experts.{}.bias".format(leg)))
             reads.extend(banked_split(mlp.down, [ck("mlp.experts.down_proj")], codes))
             reads.read(mlp.down_bias, ck("mlp.experts.down_proj.bias"))
     if m.dflash != None:
@@ -389,8 +398,9 @@ def forward(m, inputs):
             e.top_k,
             routing.softmax(),
         )
-        packed = ops.linear.moe_matmul_select(x, e.gate_up, experts, e.top_k, bias = e.gate_up_bias)
-        act = ops.linear.glu(packed, gating.swiglu_alpha(e.swiglu_alpha), e.inter, limit = e.swiglu_limit)
+        gate = ops.linear.moe_matmul_select(x, e.gate, experts, e.top_k, bias = e.gate_bias)
+        up = ops.linear.moe_matmul_select(x, e.up, experts, e.top_k, bias = e.up_bias)
+        act = ops.linear.glu(gate, gating.swiglu_alpha(e.swiglu_alpha), up = up, limit = e.swiglu_limit)
         routed = ops.linear.moe_matmul_select(act, e.down, experts, e.top_k)
         f = ops.linear.moe_weighted_sum(routed, weights)
         f = ops.linear.moe_bias_sum(f, e.down_bias, experts, weights)

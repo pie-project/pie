@@ -1140,7 +1140,7 @@ pub fn gated_delta_verify(
 
 /// [`gated_delta_verify`] at a stated `(lanes, simdgroups, value rows)`.
 #[allow(clippy::too_many_arguments)]
-pub fn gated_delta_verify_at(
+fn gated_delta_verify_at(
     ctx: &Ctx<'_>,
     (groups, vrows): (u32, u32),
     qkv: Tensor,

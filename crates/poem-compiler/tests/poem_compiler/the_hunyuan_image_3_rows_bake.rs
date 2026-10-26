@@ -371,6 +371,9 @@ fn both_fact_columns_state_what_the_trace_does() {
     }
 }
 
+/// The timestep embedders, each a two-layer mlp the ranks cut.
+const TIMESTEP_EMBEDDERS: usize = 3;
+
 fn a_sharded_row_reduces_once_per_cut_projection() {
     for deployment in [TP1, TP4] {
         let plan = trace(deployment, Platform::Cuda);
@@ -380,14 +383,16 @@ fn a_sharded_row_reduces_once_per_cut_projection() {
             .iter()
             .filter(|node| matches!(&node.op, Operation::Collective(_)))
             .count();
+        // A layer's attention and mlp, the three timestep embedders' mlps,
+        // each reduced once, and the vocab-split head's logits gathered.
         let want = if ranks(deployment) > 1 {
-            2 * d.layers as usize
+            2 * d.layers as usize + TIMESTEP_EMBEDDERS + 1
         } else {
             0
         };
         assert_eq!(
             reduces, want,
-            "{deployment}: one all-reduce per cut projection"
+            "{deployment}: one collective per cut projection, and the logits"
         );
     }
 }

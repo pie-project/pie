@@ -62,6 +62,16 @@ pub enum NormKind {
 
 /// Ops only the compiler forms, from the primitive ones a model writes; each
 /// is a kernel some backend ships.
+/// How a [`Fused::Region`] reads one of its inputs: row `r` reads row
+/// `ids[r]` of it where `by` names the ids (an index into the op's inputs,
+/// an i32 a row), else its own; and its columns from `from` on (one half of
+/// a packed modulation, one layer's row of a stack).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegionRead {
+    pub by: Option<u32>,
+    pub from: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Op)]
 #[op(group = "fused")]
 pub enum Fused {
@@ -717,18 +727,75 @@ pub enum Fused {
     /// A chain of elementwise and row ops the compiler generates one kernel
     /// for (poem-compiler's `fuse::chain`): `ins[k]` is the kernel's
     /// parameter `k` and `outs[k]` its result `k`, each a row of `width` a
-    /// row (an input one row every row reads, a weight's). `key` is the
-    /// region's own key (kernels-ir's `Region::key`, a hash of what it
-    /// computes, not of any backend's source), the one it is held under in
-    /// the compiled model; each backend prints its kernel from the region.
-    /// No output lands over an input: each has a plane of its own.
+    /// row (an input one row every row reads, a weight's; one element a
+    /// row, a position), or a row of whole `width`-wide parts (a row of
+    /// heads, the kernel's row one head). `reads[k]`, where given, says how
+    /// `ins[k]` is read otherwise than as its own rows: the row an id picks,
+    /// columns on from an offset. `key` is the region's own key (kernels-ir's
+    /// `Region::key`, a hash of what it computes, not of any backend's
+    /// source), the one it is held under in the compiled model; each backend
+    /// prints its kernel from the region. No output lands over an input:
+    /// each has a plane of its own.
     Region {
         #[input]
         ins: Vec<ValueId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        reads: Vec<RegionRead>,
         width: u32,
         key: u64,
         #[output]
         outs: Vec<ValueId>,
+    },
+    /// A contraction and the pointwise math over its product tile, formed
+    /// by the compiler (poem-compiler's `fuse::anchor`): `act · wᵀ` over a
+    /// dense bank of `parts · n` rows (one product a part at each `(m, n)`,
+    /// `n` the width of every result), then the epilogue at each `(m, n)`,
+    /// `ins[k]` its input `k` (a tile of the product's rows, a vector a
+    /// column, one value a row or one value) and `outs[k]` its result `k`.
+    /// The product itself is no value. `key` is the anchored region's own
+    /// key (kernels-ir's `Anchored::key`), the one it is held under in the
+    /// compiled model; each backend fills its contraction's hooks from it.
+    /// No output lands over an input. Where the region norms its operand's
+    /// rows (an RMS norm rewritten as a scale of each row's products), `act`
+    /// is the norm's input and `gain` its weight, which a load folds into
+    /// `w` once, in place, as the region declares (kernels-ir's
+    /// `fold_bank`): `w` read by this op alone. Where the region lands a
+    /// result in a paged cache (kernels-ir's `Paged`: a key or a value row
+    /// written at its page and slot, the slot mapping among `ins`), `cache`
+    /// is that cache and the result names no value of `outs`.
+    Anchored {
+        #[input]
+        act: ValueId,
+        #[input]
+        w: ValueId,
+        #[input]
+        ins: Vec<ValueId>,
+        key: u64,
+        #[output]
+        outs: Vec<ValueId>,
+        #[serde(default)]
+        #[input]
+        gain: Option<ValueId>,
+        #[serde(default)]
+        #[input(CACHE)]
+        cache: Option<ValueId>,
+    },
+    /// An anchored region's epilogue over a product its own op landed
+    /// (`y`: a quantized bank's, a projection's half), formed by the compiler
+    /// where no contraction skeleton holds the product (poem-compiler's
+    /// `fuse::anchor`): the epilogue at each `(m, n)` of `y`'s rows, as
+    /// stored, `ins` and `outs` and `cache` as [`Fused::Anchored`]'s, `key`
+    /// the anchored region whose epilogue it is.
+    Epilogue {
+        #[input]
+        y: ValueId,
+        #[input]
+        ins: Vec<ValueId>,
+        key: u64,
+        #[output]
+        outs: Vec<ValueId>,
+        #[input(CACHE)]
+        cache: Option<ValueId>,
     },
 }
 
@@ -883,12 +950,34 @@ mod tests {
     fn a_region_lands_no_result_over_its_parameters() {
         let op = Fused::Region {
             ins: vec![v(1), v(2), v(3)],
+            reads: Vec::new(),
             width: 64,
             key: 0x5eed,
             outs: vec![v(4), v(5)],
         };
         assert_eq!(operands(&op), (vec![1, 2, 3], vec![4, 5], vec![]));
         assert_eq!(op.name(), "fused.region");
+        let anchored = Fused::Anchored {
+            act: v(1),
+            w: v(2),
+            ins: vec![v(3)],
+            key: 0x5eed,
+            outs: vec![v(4)],
+            gain: None,
+            cache: None,
+        };
+        assert_eq!(operands(&anchored), (vec![1, 2, 3], vec![4], vec![]));
+        let normed = Fused::Anchored {
+            act: v(1),
+            w: v(2),
+            ins: vec![v(3)],
+            key: 0x5eed,
+            outs: vec![v(4)],
+            gain: Some(v(5)),
+            cache: None,
+        };
+        assert_eq!(operands(&normed), (vec![1, 2, 3, 5], vec![4], vec![]));
+        assert_eq!(anchored.name(), "fused.anchored");
     }
 
     /// The sinks scale the merged plane where it lies; a log-sum-exp

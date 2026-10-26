@@ -9,10 +9,8 @@ TOKENIZER = tokenizer(markers = [QWEN_STOP])
 
 # The compiler reads how tensor-parallel ranks cut each weight off the
 # forward: the denoiser's packed q, k and v and its packed fc1 by their
-# heads and channels, the text encoder's q, k and v, gate and up likewise
-# and its output and down projections by their rows. The denoiser's output
-# projection and fc2 it holds whole, as the package always has, so each
-# rank's share is gathered for them, and its timestep embedder.
+# heads and channels, its output projection and fc2 by their rows; the text
+# encoder's and the timestep embedder's likewise.
 CUTS = "inferred"
 
 MODELS = [
@@ -29,37 +27,31 @@ DEPLOYMENTS = [
 # embedder, caption refiner, blocks (each with an adaLN projection per
 # modality) and output heads; and the text encoder the full model carries.
 
-def linear(out, in_, banks, bias = True, whole = False):
-    """A projection from `in_` to `out` and, unless `bias` is off, its bias;
-    held whole on every rank if `whole`."""
-    w = weight([out, in_], banks)
+def linear(out, in_, banks, bias = True):
+    """A projection from `in_` to `out` and, unless `bias` is off, its bias."""
     return struct(
-        w = w.replicated() if whole else w,
+        w = weight([out, in_], banks),
         bias = weight([out]) if bias else None,
     )
 
-def encoder(c, layers, banks, sharded = False):
-    """The encoder of config `c` through its first `layers` layers; with
-    `sharded`, its attention and mlp split across ranks."""
+def encoder(c, layers, banks):
+    """The encoder of config `c` through its first `layers` layers."""
     hidden, hd, inter = c.hidden, c.head_dim, c.inter
-
-    def whole(w):
-        return w if sharded else w.replicated()
 
     def layer(l):
         n = lambda s: "te.layer.{}.{}".format(l, s)
         return struct(
             attn_norm = weight([hidden]),
-            q = whole(weight([c.q_heads * hd, hidden], banks)),
-            k = whole(weight([c.kv_heads * hd, hidden], banks)),
-            v = whole(weight([c.kv_heads * hd, hidden], banks)),
-            o = whole(weight([hidden, c.q_heads * hd], banks)),
+            q = weight([c.q_heads * hd, hidden], banks),
+            k = weight([c.kv_heads * hd, hidden], banks),
+            v = weight([c.kv_heads * hd, hidden], banks),
+            o = weight([hidden, c.q_heads * hd], banks),
             q_norm = weight([hd]),
             k_norm = weight([hd]),
             mlp_norm = weight([hidden]),
             gate = weight([inter, hidden], banks),
             up = weight([inter, hidden], banks),
-            down = whole(weight([hidden, inter], banks)),
+            down = weight([hidden, inter], banks),
             kv = "te.kv.{}".format(l),
         )
 
@@ -142,13 +134,13 @@ def attn(d, banks):
         qkv = weight([3 * inner, d.dim], banks),
         q_norm = weight([d.head_dim]),
         k_norm = weight([d.head_dim]),
-        out = weight([d.dim, inner], banks).replicated(),
+        out = weight([d.dim, inner], banks),
     )
 
 def mlp(prefix, d, banks):
     return struct(
         fc1 = weight([2 * d.inter, d.dim], banks),
-        fc2 = weight([d.dim, d.inter], banks).replicated(),
+        fc2 = weight([d.dim, d.inter], banks),
     )
 
 def block(prefix, d, banks, modulated):
@@ -186,8 +178,8 @@ def layout(id, deploy):
             video_patch = linear(dim, VIDEO_FEATURES, banks),
             audio_patch = linear(dim, AUDIO_CHANNELS, banks),
             condition = linear(dim, d.text_dim, banks),
-            t_in = linear(d.t_hidden, d.t_freq, banks, whole = True),
-            t_out = linear(d.t_dim, d.t_hidden, banks, whole = True),
+            t_in = linear(d.t_hidden, d.t_freq, banks),
+            t_out = linear(d.t_dim, d.t_hidden, banks),
             refine = [block("dit.refine.{}".format(i), d, banks, False) for i in range(d.refiners)],
             refine_norm = weight([dim]),
             blocks = [block("dit.block.{}".format(i), d, banks, True) for i in range(d.blocks)],
@@ -196,7 +188,7 @@ def layout(id, deploy):
             video_out = linear(VIDEO_FEATURES, dim, banks),
             audio_out = linear(AUDIO_CHANNELS, dim, banks),
         ),
-        te = encoder(TE, TE_LAYERS, banks, sharded = True) if id == "minimax-h3-fl2va" else None,
+        te = encoder(TE, TE_LAYERS, banks) if id == "minimax-h3-fl2va" else None,
         rope = struct(
             four = weight([1], dtype.f32, values = [4.0]),
             five = weight([1], dtype.f32, values = [5.0]),

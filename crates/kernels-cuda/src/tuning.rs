@@ -70,12 +70,12 @@ pub struct MoeNvfp4MmaFrom(pub u32);
 #[decision(id = "kernel.gemm.tc5_split_tickets", constant(range(0..=65536)), default = 0, tune = search)]
 pub struct GemmTc5SplitTickets(pub u32);
 
-/// The most rows (2..=8) a dense bf16 product may time the few-rows kernel
+/// The most rows (2..=16) a dense bf16 product may time the few-rows kernel
 /// for, one launch streaming the weight's rows, beside cuBLAS's algorithms
 /// (a decode's narrow projections run split along K in two launches there).
 /// 0 never tries it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.gemm.rows_m", constant(range(0..=8)), default = 0, tune = search)]
+#[decision(id = "kernel.gemm.rows_m", constant(range(0..=16)), default = 0, tune = search)]
 pub struct GemmRowsM(pub u32);
 
 /// Programmatic dependent launch: a kernel that opts in (it waits on its
@@ -241,13 +241,6 @@ pub struct GemmFp8MmaKUntil(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.attn_res.fused_norm", flag, default = false, tune = search)]
 pub struct AttnResFusedNorm;
-
-/// Whether a dense projection's bias lands from the cuBLASLt epilogue of the
-/// algorithm its shape chose, instead of a separate add. Off but where a
-/// chip's profile turns it on (B200's).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.gemm.bias_epilogue", flag, default = false, tune = search)]
-pub struct GemmBiasEpilogue;
 
 /// The fewest routes a routed mxfp4 select runs on the register-dequant MMA
 /// kernel with (up to `kernel.moe.mxfp4_mma_until`).
@@ -555,8 +548,10 @@ pub struct GemmWorkspaceMb(pub u32);
 #[decision(id = "kernel.gemm.heuristics", constant(range(1..=32)), default = 8, tune = search)]
 pub struct GemmHeuristics(pub u32);
 
-/// The most rows the fused skinny bf16 GEMM (GEGLU, soft-capped heads)
-/// serves; past it cuBLAS does. Its tile holds 64; 0 never takes it.
+/// The most rows the skinny bf16 skeleton serves: the most a fused hand rule
+/// (GEGLU, soft-capped heads) fires it at, and the most a dense bf16 product
+/// may time it for beside cuBLAS's algorithms. Its tile holds 64; 0 never
+/// takes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.gemm.skinny_rows", constant(range(0..=64)), default = 64, tune = search)]
 pub struct GemmSkinnyRows(pub u32);
@@ -622,13 +617,6 @@ pub struct SsmGdnScanUntil(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.elemwise.rows_vec", flag, default = false, tune = search)]
 pub struct ElemwiseRowsVec;
-
-/// Whether q's fused per-head RMS norm and partial rotation (Gemma 4's global
-/// layers) runs a warp a (row, head) over 16-byte runs staged in shared memory
-/// rather than a 128-thread block a (row, head) an element a thread.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
-#[decision(id = "kernel.elemwise.q_norm_rope_warp", flag, default = false, tune = search)]
-pub struct ElemwiseQNormRopeWarp;
 
 /// Whether the hyper-connection kernels run their tiled and 16-byte forms:
 /// the mix projection a block 64 rows of every column over shared-memory
@@ -824,7 +812,6 @@ pub fn register(registry: &mut Registry) {
         .add::<SsmGdnTc5>()
         .add::<SsmGdnScanUntil>()
         .add::<ElemwiseRowsVec>()
-        .add::<ElemwiseQNormRopeWarp>()
         .add::<ElemwiseHcTile>()
         .add::<ElemwiseHcMma>()
         .add::<ElemwiseHcMegaUntil>()
@@ -846,7 +833,6 @@ pub fn register(registry: &mut Registry) {
         .add::<GemmFp8ODown>()
         .add::<MoeMxfp4A8Until>()
         .add::<MoeMxfp4A8From>()
-        .add::<GemmBiasEpilogue>()
         .add::<MoeW4a4FusedFrom>()
         .add::<MoeW4a8FusedFrom>()
         .add::<MoeMegaUntil>()
@@ -964,7 +950,6 @@ tuning! {
     ssm_gdn_tc5: bool = false, on SsmGdnTc5;
     ssm_gdn_scan_until: u32 = 32, get SsmGdnScanUntil;
     rows_vec: bool = false, on ElemwiseRowsVec;
-    q_norm_rope_warp: bool = false, on ElemwiseQNormRopeWarp;
     hc_tile: bool = false, on ElemwiseHcTile;
     hc_mma: bool = false, on ElemwiseHcMma;
     hc_mega_until: u32 = 0, get ElemwiseHcMegaUntil;
@@ -986,7 +971,6 @@ tuning! {
     fp8_o_down: bool = false, on GemmFp8ODown;
     mxfp4_a8_until: u32 = 0, get MoeMxfp4A8Until;
     mxfp4_a8_from: u32 = 0, get MoeMxfp4A8From;
-    gemm_bias_epilogue: bool = false, on GemmBiasEpilogue;
     moe_w4a4_fused_from: u32 = 65_536, get MoeW4a4FusedFrom;
     moe_w4a8_fused_from: u32 = 65_536, get MoeW4a8FusedFrom;
     moe_mega_until: u32 = 0, get MoeMegaUntil;

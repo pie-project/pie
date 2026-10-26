@@ -55,30 +55,15 @@ pub const GROUPED: [&str; 1] = ["linear.lora_correct"];
 #[cfg(not(feature = "rocm"))]
 pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
     std::sync::LazyLock::new(|| {
-        use poem_compiler::fuse::rules::{self, Rotated};
-        use poem_ir::GluAct;
-        use poem_ir::ops::fused::Intermediates;
+        use poem_compiler::fuse::rules;
         vec![
-            rules::split_qkv_fused(),
-            rules::qkv_fused_qknorm_rope_vnorm_write(),
-            rules::embed_scale_add_select(),
-            rules::embed_scale_add(),
-            rules::matmul_glu(&[GluAct::GegluTanh, GluAct::Swiglu]),
+            rules::qkv_fused_padded(),
             rules::moe_mega(),
             rules::moe_experts(),
             rules::moe_select_glu(),
-            rules::matmul_softcap(),
-            rules::matmul_bias(),
             rules::matmul_moe_route(),
             rules::matmul_split_rows(),
-            rules::gated_residual_norm_modulate(),
-            rules::norm_modulate(),
-            rules::norm_rope(Rotated::First),
-            rules::norm_rope(Rotated::Last),
-            rules::norm_rope_last_append(),
-            rules::split_rope_yarn_append(),
-            rules::rope_yarn_append(),
-            rules::q_gate_norm_rope_append(Intermediates::Unwritten),
+            rules::norm_rope_last_append_rows(),
             rules::lse_sink(),
             rules::pool_attention(),
             rules::pool_compress(),
@@ -117,6 +102,59 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
             rules::q_gate_norm_rope_append(Intermediates::Written),
         ]
     });
+
+/// The hand row rules CUDA's chains replace: each site one formed folds
+/// into a generated row kernel (`fuse::chain`) that lands its ops' bits
+/// and, at the default knobs, outruns the rule's hand kernel. A head's norm
+/// and the turn of its tail (`norm_rope`'s `Last`: dots3's k row,
+/// DeepSeek-V4's q), and of its first dims (`First`: Gemma 4's split turn,
+/// a 512-wide head's quarter turned pair-packed, its turned vectors on
+/// whole warps where its rows are packed). A scaled
+/// embedding's chain (`embed_scale_add`, Gemma 4's per-layer rows picked
+/// from their stack with `embed_scale_add_select`) and a DiT block's norm
+/// and modulation (`norm_modulate`, after the gated residual
+/// `gated_residual_norm_modulate`): each a generated kernel that ties the
+/// hand one at a decode's rows and outruns it from 512. And the hand
+/// product rules CUDA's anchored regions replace (`fuse::anchor`): a
+/// product's bias, its soft cap and a packed bank's GEGLU and SwiGLU, each
+/// the epilogue of its contraction skeleton, timed against the product and
+/// the epilogue on the row skeleton. And the KV writes an epilogue now pages
+/// into the cache (kernels-ir's `Paged`): the qkv write's split, norms and
+/// turn with k and v landed at their pages and slots (an anchored region's,
+/// or over a product landed apart, a quantized bank's or Muse Spark's
+/// `qkv | gate` half, a `fused.epilogue`), and DeepSeek-V4's k row normed,
+/// turned and written. (`split_qkv_fused` is gone too, and is not listed:
+/// without it `matmul_split_rows` takes its split first, so it finds no
+/// site to hold to this; its sites are that product's `fused.epilogue`.) What stays: MiMo's padded qkv write (its cache's
+/// heads padded past their widths, no window's), the fp8 rows of DeepSeek's
+/// cache (`norm_rope_last_append_rows`, `norm_rope_pair`: its blocks'
+/// scales and bf16 tail no paged store's element) and the pooled writes.
+/// YaRN's turn of every pair (`rope_yarn_append`, `split_rope_yarn_append`:
+/// the builder's tail pairs ramped, cos and sin times the attention factor)
+/// and Qwen 3.5's gated q (`q_gate_norm_rope_append`: q and its gate
+/// interleaved a head, each a head-major window of the product) are an
+/// epilogue's too.
+#[cfg(not(feature = "rocm"))]
+#[must_use]
+pub fn retired() -> Vec<poem_compiler::fuse::Rule> {
+    use poem_compiler::fuse::rules;
+    vec![
+        rules::norm_rope(rules::Rotated::Last),
+        rules::norm_rope(rules::Rotated::First),
+        rules::matmul_glu(&[poem_ir::GluAct::GegluTanh, poem_ir::GluAct::Swiglu]),
+        rules::matmul_softcap(),
+        rules::matmul_bias(),
+        rules::qkv_fused_qknorm_rope_vnorm_write(),
+        rules::norm_rope_last_append(),
+        rules::rope_yarn_append(),
+        rules::split_rope_yarn_append(),
+        rules::q_gate_norm_rope_append(poem_ir::ops::fused::Intermediates::Unwritten),
+        rules::embed_scale_add_select(),
+        rules::embed_scale_add(),
+        rules::norm_modulate(),
+        rules::gated_residual_norm_modulate(),
+    ]
+}
 
 /// The fused kernels left on with `fuse-chains=off`.
 #[cfg(not(feature = "rocm"))]
@@ -207,6 +245,108 @@ mod tests {
         assert!(stale.is_empty(), "named by no op: {stale:?}");
     }
 
+    /// The hand rules CUDA no longer holds, their chains generated row
+    /// kernels and their products' epilogues anchored regions: on every
+    /// catalog deployment, fused by this backend's rules and folded (the
+    /// anchors, then the chains), none of them finds a match left that it
+    /// fused, so each such site is a region (`fuse::chain`) or an anchored
+    /// one (`fuse::anchor`). A product's rule fused only bf16 rows against a
+    /// weight stored bf16 (its dispatch ran the product and its op apart over
+    /// any other), so a site over another keeps its ops; so does one whose
+    /// product is no whole runs of eight wide (a two-column head), which no
+    /// row skeleton carries and the rule ran apart past one row. A retired
+    /// rule's op may be another rule's too (`norm_rope`'s two turns), so its
+    /// sites are what it forms past the backend's.
+    #[cfg(not(feature = "rocm"))]
+    #[test]
+    fn every_site_a_retired_rule_fused_folds_into_a_region() {
+        use poem_ir::{Def, Dim, Dtype, Fused, Trace, Ty, ValueId};
+        let mut wrong = Vec::new();
+        let mut census = std::collections::BTreeMap::<&str, (usize, usize, usize)>::new();
+        let bf16 = |t: &Trace, v: &ValueId| {
+            let decl = &t.values[v.0 as usize];
+            match decl.def {
+                Def::Weight(p) => t.params[p as usize].dtype == Dtype::Bf16,
+                _ => matches!(
+                    decl.ty,
+                    Ty::Tensor {
+                        dtype: Dtype::Bf16,
+                        ..
+                    }
+                ),
+            }
+        };
+        let narrow = |t: &Trace, v: &ValueId| {
+            matches!(&t.values[v.0 as usize].ty,
+                Ty::Tensor { shape, .. } if matches!(shape.last(), Some(Dim::Const(n)) if n % 8 != 0))
+        };
+        for rule in super::retired() {
+            let kernel = rule.kernel();
+            let only = [rule];
+            for row in poem_compiler::catalog::deployments() {
+                let Ok(trace) = row.try_trace(poem_ir::Platform::Cuda) else {
+                    continue;
+                };
+                // The sites the rule forms in `t` that it fused (its product
+                // bf16 against a bf16 weight), and of those the ones too
+                // narrow for a row skeleton.
+                let sites = |t: &Trace| {
+                    let mut held = (0usize, 0usize);
+                    for n in &t.nodes {
+                        let Operation::Fused(op) = &n.op else {
+                            continue;
+                        };
+                        if poem_ir::Operands::name(op) != kernel {
+                            continue;
+                        }
+                        let (fused, thin) = match op {
+                            Fused::MatmulBias { act, w, y, .. }
+                            | Fused::MatmulSoftcap { act, w, y, .. } => {
+                                (bf16(t, act) && bf16(t, w), narrow(t, y))
+                            }
+                            Fused::MatmulGlu { act, w, y, .. } => {
+                                (bf16(t, act) && bf16(t, w), narrow(t, y))
+                            }
+                            _ => (true, false),
+                        };
+                        if fused {
+                            held.0 += 1;
+                            held.1 += usize::from(thin);
+                        }
+                    }
+                    held
+                };
+                let formed = |t: Trace| {
+                    let before = sites(&t);
+                    let after = sites(&poem_compiler::fuse::fuse(t, only.iter()));
+                    (after.0 - before.0, after.1 - before.1)
+                };
+                let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
+                let (here, _) = formed(fused.clone());
+                let (anchored, _) = crate::synth::fold_anchors(fused, Some(&|_| true));
+                let (folded, _) = poem_compiler::fuse::chain::fold(anchored);
+                let (left, thin) = formed(folded);
+                let held = census.entry(kernel).or_default();
+                held.0 += here;
+                held.1 += usize::from(here > 0);
+                held.2 += thin;
+                if left > thin {
+                    wrong.push(format!(
+                        "{}: {} of {here} `{kernel}` sites left",
+                        row.name,
+                        left - thin
+                    ));
+                }
+            }
+        }
+        eprintln!("retired sites (fused, deployments, too narrow to fold): {census:?}");
+        assert!(
+            census.values().all(|(sites, ..)| *sites > 0),
+            "each retired rule fused somewhere: {census:?}"
+        );
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
     /// Every fused op this backend's rules form on a catalog deployment is
     /// one its dispatch fires: a rule it holds and a form its dispatch turns
     /// away cannot both stand.
@@ -231,9 +371,10 @@ mod tests {
         assert!(refused.is_empty(), "formed, then refused: {refused:?}");
     }
 
-    /// No `fused.region` of a catalog deployment, fused by this backend's
-    /// rules, folded and planned, lands an output over one of its inputs: a
-    /// generated kernel reads its parameters read-only on that. The arena
+    /// No `fused.region` or `fused.anchored` of a catalog deployment, fused
+    /// by this backend's rules, folded and planned, lands an output over one
+    /// of its inputs: a generated kernel reads its parameters read-only on
+    /// that. The arena
     /// holds a value over every node that reads or writes it, both ends
     /// included, so an input the region reads last and an output it writes
     /// first are live together at its node; and a region aliases no output
@@ -250,7 +391,8 @@ mod tests {
                 continue;
             };
             let fused = poem_compiler::fuse::fuse(trace, super::FUSIONS.iter());
-            let (folded, _) = poem_compiler::fuse::chain::fold(fused);
+            let (anchored, _) = crate::synth::fold_anchors(fused, Some(&|_| true));
+            let (folded, _) = poem_compiler::fuse::chain::fold(anchored);
             let regions: Vec<(Vec<poem_ir::ValueId>, Vec<poem_ir::ValueId>)> = folded
                 .nodes
                 .iter()
@@ -258,6 +400,14 @@ mod tests {
                     Operation::Fused(Fused::Region { ins, outs, .. }) => {
                         Some((ins.clone(), outs.clone()))
                     }
+                    Operation::Fused(Fused::Anchored { act, ins, outs, .. }) => Some((
+                        [*act].into_iter().chain(ins.iter().copied()).collect(),
+                        outs.clone(),
+                    )),
+                    Operation::Fused(Fused::Epilogue { y, ins, outs, .. }) => Some((
+                        [*y].into_iter().chain(ins.iter().copied()).collect(),
+                        outs.clone(),
+                    )),
                     _ => None,
                 })
                 .collect();
