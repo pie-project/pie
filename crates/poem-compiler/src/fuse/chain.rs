@@ -14,7 +14,7 @@
 //! the ops between them run before it, and none reads what the run computes
 //! or writes what it reads, so the region lands where the run's last op was,
 //! in its layer, as a fuse rule's match does. Of the run from an op, the
-//! longest part the row skeleton holds is the chain. Nothing else is searched,
+//! longest part the backend serves (`Serves`) is the chain. Nothing else is searched,
 //! so no unplanned combination forms.
 //!
 //! **Lowering** turns each op into the primitive math it states, in f32. A value
@@ -94,22 +94,22 @@ pub struct Out {
     pub dtype: Dtype,
 }
 
-/// `trace` with each chain the row core schedules replaced by one
-/// `fused.region` op, and the regions its ops name, by key
+/// Whether a backend's row kernels serve a region, its parameters read and
+/// its results written as the chain stores them (a region states no
+/// storage). A chain it does not serve is never folded, so an engine never
+/// meets a region it cannot launch.
+pub type Serves<'a> = &'a dyn Fn(&Region, &[In], &[Out]) -> bool;
+
+/// `trace` with each chain the row core schedules and `serves` takes
+/// replaced by one `fused.region` op, and the regions its ops name, by key
 /// ([`Region::key`]). Two chains of one region (a layer's and the next's)
 /// share one entry.
 #[must_use]
-pub fn fold(trace: Trace) -> (Trace, BTreeMap<u64, Region>) {
+pub fn fold(trace: Trace, serves: Serves<'_>) -> (Trace, BTreeMap<u64, Region>) {
     let mut regions = BTreeMap::new();
     let mut folded: Vec<(Vec<u32>, Fused)> = Vec::new();
-    for chain in chains(&trace) {
-        if kernels_ir::schedule(&chain.region).is_err() {
-            continue;
-        }
+    for chain in chains(&trace, serves) {
         let width = chain.region.width;
-        if !skeleton_holds(&trace, &chain, width) {
-            continue;
-        }
         let reads: Vec<RegionRead> = chain
             .ins
             .iter()
@@ -141,98 +141,6 @@ pub fn fold(trace: Trace) -> (Trace, BTreeMap<u64, Region>) {
         return (trace, regions);
     }
     (super::search::compact(replace(trace, folded)), regions)
-}
-
-/// The widest row the skeleton holds in registers: a block of
-/// [`SKELETON_BLOCK`] threads, [`SKELETON_PER`] eight-wide runs a thread.
-pub const SKELETON_BLOCK: u32 = 256;
-pub const SKELETON_PER: u32 = 4;
-/// The planes a skeleton holds at most, read and written together, at its
-/// widest: each plane is [`SKELETON_PER`] sixteen-byte runs a thread, and past
-/// five at the widest the row no longer stays in registers.
-pub const SKELETON_PLANES: usize = 5;
-
-/// Whether the row skeleton a region's body runs in (`row_skeleton` in
-/// kernels-cuda's `elemwise/skeleton.cuh`) holds `chain`: every row it writes
-/// bf16 and every row it reads bf16 or f32 (an f32 row two planes' worth),
-/// a scalar parameter (one element, bf16, f32 or i32) holding none, the
-/// width a whole number of eight-wide runs within one block's registers,
-/// at most [`SKELETON_PLANES`] planes each way (a blend's candidates
-/// streamed past it, [`streams`]), and each head it reduces over
-/// a power-of-two run of the threads a row takes ([`skeleton_lanes`]). A
-/// chain the skeleton does not hold is never folded, so an engine never meets
-/// a region it cannot launch.
-#[must_use]
-pub fn skeleton_holds(trace: &Trace, chain: &Chain, width: u32) -> bool {
-    let dtype = |v: poem_ir::ValueId| dtype_of(trace, v);
-    let planes: usize = chain
-        .ins
-        .iter()
-        .filter(|input| !input.one && !input.each)
-        .map(|input| if input.dtype == Dtype::F32 { 2 } else { 1 })
-        .sum::<usize>()
-        + chain.outs.len();
-    width.is_multiple_of(8)
-        && width <= SKELETON_BLOCK * SKELETON_PER * 8
-        && (planes_fit(planes, width) || streams(trace, chain))
-        && chain.ins.iter().all(|input| match dtype(input.value) {
-            Dtype::Bf16 | Dtype::F32 => true,
-            Dtype::I32 => input.one || input.each,
-            _ => false,
-        })
-        && chain.outs.iter().all(|out| dtype(out.value) == Dtype::Bf16)
-        && heads_fit(&chain.region, width)
-}
-
-/// The most parameters one skeleton reads.
-pub const SKELETON_PARAMS: usize = 32;
-
-/// Whether `chain` is a blend's (AttnRes's closed blocks and prefix), whose
-/// candidates the skeleton streams through its passes rather than holding
-/// them all in registers: each a row of the row's width, read once to score
-/// it and once to blend it.
-fn streams(trace: &Trace, chain: &Chain) -> bool {
-    chain.ins.len() <= SKELETON_PARAMS
-        && chain.nodes.iter().any(|&node| {
-            matches!(
-                trace.nodes[node as usize].op,
-                Operation::Elemwise(Elemwise::ResBlend { .. })
-            )
-        })
-}
-
-/// Whether `planes` rows of `width` stay in a skeleton's registers: as many
-/// planes as [`SKELETON_PLANES`] at the widest, more as the row narrows (the
-/// runs a thread holds scale with the width).
-fn planes_fit(planes: usize, width: u32) -> bool {
-    let per = width.div_ceil(SKELETON_BLOCK * 8).max(1) as usize;
-    planes * per <= SKELETON_PLANES * SKELETON_PER as usize
-}
-
-/// The threads a skeleton's row of `width` takes: a block, or the fewest
-/// whole lanes of a warp that hold its runs of eight where they are 32 or
-/// fewer.
-#[must_use]
-pub fn skeleton_lanes(width: u32) -> u32 {
-    let runs = width.div_ceil(8).max(1);
-    if runs <= 32 {
-        runs.next_power_of_two()
-    } else {
-        SKELETON_BLOCK
-    }
-}
-
-/// Whether each head `region` reduces over is a power-of-two run of a
-/// row's threads.
-fn heads_fit(region: &Region, width: u32) -> bool {
-    let lanes = skeleton_lanes(width);
-    region.ops.iter().all(|op| match *op {
-        Op::ReduceHeads(_, _, head) => {
-            let runs = head / 8;
-            runs.is_power_of_two() && lanes % runs == 0
-        }
-        _ => true,
-    })
 }
 
 /// `trace` with each run's ops replaced by its op, landed where the run's
@@ -308,10 +216,10 @@ pub(super) fn replace(mut trace: Trace, runs: Vec<(Vec<u32>, Fused)>) -> Trace {
 /// How far past a chain's first op its run is looked for.
 pub(super) const REACH: u32 = 64;
 
-/// Every chain of `trace` the row skeleton holds, by its first op; ops outside
-/// them run as they are.
+/// Every chain of `trace` the row core schedules and `serves` takes, by its
+/// first op; ops outside them run as they are.
 #[must_use]
-pub fn chains(trace: &Trace) -> Vec<Chain> {
+pub fn chains(trace: &Trace, serves: Serves<'_>) -> Vec<Chain> {
     let escapes = Escapes::of(trace);
     let mut out = Vec::new();
     let count = u32::try_from(trace.nodes.len()).unwrap_or(u32::MAX);
@@ -335,7 +243,7 @@ pub fn chains(trace: &Trace) -> Vec<Chain> {
             }
             next += 1;
         }
-        if let Some(chain) = held(trace, &run, &escapes) {
+        if let Some(chain) = held(trace, &run, &escapes, serves) {
             for &n in &chain.nodes {
                 taken[n as usize] = true;
             }
@@ -350,9 +258,9 @@ pub fn chains(trace: &Trace) -> Vec<Chain> {
 
 /// The longest part of `run` (the latest of the longest, so a chain that
 /// ends in a norm keeps it, as the rules' matches do) that is a chain the
-/// row skeleton holds: its ops lower, the ops between them keep their order,
-/// and the skeleton takes its region.
-fn held(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
+/// backend serves: its ops lower, the ops between them keep their order,
+/// the row core schedules its region and `serves` takes it.
+fn held(trace: &Trace, run: &[u32], escapes: &Escapes, serves: Serves<'_>) -> Option<Chain> {
     for len in (2..=run.len()).rev() {
         for from in (0..=run.len() - len).rev() {
             let part = &run[from..from + len];
@@ -363,7 +271,7 @@ fn held(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
                 continue;
             };
             let fits = kernels_ir::schedule(&chain.region).is_ok()
-                && skeleton_holds(trace, &chain, chain.region.width)
+                && serves(&chain.region, &chain.ins, &chain.outs)
                 && lands_apart(trace, &chain);
             if fits {
                 return Some(chain);

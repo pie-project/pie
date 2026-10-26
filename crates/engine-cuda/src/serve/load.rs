@@ -169,7 +169,7 @@ pub(super) fn bake(boot: &mut Boot<'_>) -> Result<Baked> {
     // `compile_axes` plans under the flag. Folded once, here, the trace is
     // the one the load runs and every plan after is of it as it stands.
     let regions = if profile.synth_regions {
-        let (folded, regions) = poem_compiler::fuse::chain::fold(boot.trace.clone());
+        let (folded, regions) = poem_compiler::fuse::chain::fold(boot.trace.clone(), &crate::synth::serves_region);
         boot.trace = folded;
         profile.synth_regions = false;
         regions

@@ -8,12 +8,17 @@ use kernels_ir::{Shape, schedule};
 use poem::ops::{elemwise, linear};
 use poem::pattern::{Pattern, template};
 use poem_compiler::DeviceProfile;
-use poem_compiler::fuse::chain::{Chain, chains, fold};
+use poem_compiler::fuse::chain::{Chain, Serves, chains, fold};
 use poem_ir::{Fused, Operation, Trace, ValueId};
 
 use crate::common::bake_with;
 
 const WIDTH: u64 = 64;
+
+/// A backend that serves every region the row core schedules: what row
+/// kernels hold is the backend's to say (kernels-cuda's `synth::supports`),
+/// and its own tests hold it.
+const SERVES: Serves<'static> = &|_, _, _| true;
 const EPS: f32 = 1e-6;
 
 fn trace(build: impl FnOnce(&Pattern)) -> Trace {
@@ -56,7 +61,7 @@ fn a_residual_add_and_its_norm_form_one_region() {
         let (h, _) = residual_norm(p);
         read_later(p, &h);
     });
-    let formed = chains(&t);
+    let formed = chains(&t, SERVES);
     let chain = the_one(&formed);
     assert_eq!(chain.nodes, [0, 1]);
     let shared: Vec<bool> = chain.ins.iter().map(|input| input.shared).collect();
@@ -118,7 +123,7 @@ fn the_fused_residual_norm_lowers_as_its_two_ops_do() {
         &poem_compiler::fuse::rules::forming(&["fused.residual_add_rmsnorm"]),
     );
     assert_eq!(fused.nodes.len(), 1, "the rule forms the fused op");
-    let lone = poem_compiler::fuse::chain::chains(&fused);
+    let lone = chains(&fused, SERVES);
     assert!(lone.is_empty(), "a lone op keeps its hand kernel");
 
     // Behind an activation, the fused op joins a chain, and its region
@@ -128,12 +133,12 @@ fn the_fused_residual_norm_lowers_as_its_two_ops_do() {
         elemwise::silu(&n);
         read_later(p, &h);
     };
-    let unfused = chains(&trace(behind));
+    let unfused = chains(&trace(behind), SERVES);
     let refused = poem_compiler::fuse::fuse(
         trace(behind),
         &poem_compiler::fuse::rules::forming(&["fused.residual_add_rmsnorm"]),
     );
-    let fused = chains(&refused);
+    let fused = chains(&refused, SERVES);
     let args: Vec<Arg> = [row(4), row(5), row(6)].into_iter().map(Arg::Row).collect();
     assert_eq!(
         eval(&the_one(&unfused).region, &args),
@@ -153,9 +158,9 @@ fn a_chain_runs_past_an_op_it_does_not_touch() {
         let _ = linear::matmul(&n, &p.weight("out", [WIDTH, WIDTH]));
         read_later(p, &side);
     });
-    let formed = chains(&t);
+    let formed = chains(&t, SERVES);
     assert_eq!(the_one(&formed).nodes, [0, 2]);
-    let (folded, _) = fold(t);
+    let (folded, _) = fold(t, SERVES);
     assert!(
         matches!(folded.nodes[0].op, Operation::Linear(_)),
         "the matmul runs first"
@@ -176,7 +181,7 @@ fn a_one_element_scale_is_a_scalar_parameter() {
         let scaled = elemwise::scale(&p.weight("s", [1]), &h);
         read_later(p, &scaled);
     });
-    let formed = chains(&t);
+    let formed = chains(&t, SERVES);
     let chain = the_one(&formed);
     assert_eq!(chain.nodes, [0, 1, 2]);
     let ones: Vec<bool> = chain.ins.iter().map(|input| input.one).collect();
@@ -215,7 +220,7 @@ fn a_one_element_scale_is_a_scalar_parameter() {
 #[test]
 fn a_lone_op_keeps_its_hand_kernel() {
     let t = trace(|p| drop(elemwise::silu(&p.rows("x", WIDTH))));
-    assert!(chains(&t).is_empty());
+    assert!(chains(&t, SERVES).is_empty());
 }
 
 #[test]
@@ -226,7 +231,7 @@ fn a_value_read_past_the_chain_leaves_it() {
         let _ = linear::matmul(&h, &p.weight("proj", [WIDTH, WIDTH]));
         let _ = linear::matmul(&g, &p.weight("down", [WIDTH, WIDTH]));
     });
-    let formed = chains(&t);
+    let formed = chains(&t, SERVES);
     let chain = the_one(&formed);
     assert_eq!(chain.nodes, [0, 1, 2], "the matmuls end the chain");
     let leaving: Vec<poem_ir::ValueId> = chain.outs.iter().map(|out| out.value).collect();
@@ -245,7 +250,7 @@ fn an_op_no_region_lowers_ends_the_chain() {
         let d = elemwise::tanh(&c);
         let _ = elemwise::add(&d, &p.rows("z", WIDTH));
     });
-    let formed = chains(&t);
+    let formed = chains(&t, SERVES);
     let spans: Vec<_> = formed.iter().map(|chain| chain.nodes.clone()).collect();
     assert_eq!(
         spans,
@@ -284,18 +289,14 @@ fn regions(t: &Trace) -> Vec<(Vec<ValueId>, Vec<ValueId>, u64)> {
 #[test]
 fn a_folded_trace_plans_as_it_stands() {
     let t = qwen3();
-    let (folded, bodies) = fold(t.clone());
-    let formed = chains(&t);
+    let (folded, bodies) = fold(t.clone(), SERVES);
+    let formed = chains(&t, SERVES);
     let ops = regions(&folded);
     assert!(
         !ops.is_empty(),
         "a qwen3 forward has a residual norm a layer"
     );
-    let held = formed
-        .iter()
-        .filter(|chain| poem_compiler::fuse::chain::skeleton_holds(&t, chain, chain.region.width))
-        .count();
-    assert_eq!(ops.len(), held, "each chain the skeleton holds is one op");
+    assert_eq!(ops.len(), formed.len(), "each chain is one op");
     for (ins, outs, key) in &ops {
         let region = bodies.get(key).expect("the op's region is held");
         assert_eq!(region.key(), *key);
@@ -323,7 +324,7 @@ fn a_folded_trace_plans_as_it_stands() {
 #[test]
 fn a_residual_add_and_the_next_layers_norm_form_one_region() {
     let t = qwen3();
-    let crossing = chains(&t)
+    let crossing = chains(&t, SERVES)
         .iter()
         .filter(|chain| {
             t.nodes[chain.nodes[0] as usize].layer
@@ -331,7 +332,7 @@ fn a_residual_add_and_the_next_layers_norm_form_one_region() {
         })
         .count();
     assert!(crossing > 0, "a layer's stream is normed by the next");
-    let (folded, _) = fold(t.clone());
+    let (folded, _) = fold(t.clone(), SERVES);
     let left = folded
         .nodes
         .iter()
@@ -355,7 +356,7 @@ fn a_residual_add_and_the_next_layers_norm_form_one_region() {
 /// not another block's.
 #[test]
 fn no_region_lands_an_output_over_its_input() {
-    let (folded, _) = fold(qwen3());
+    let (folded, _) = fold(qwen3(), SERVES);
     let folded = &folded;
     let on = bake_with(folded, &synth()).expect("bakes");
     let fire = poem_compiler::FireRows::ceilings(&crate::common::budgets_of(folded));
@@ -381,22 +382,16 @@ fn no_region_lands_an_output_over_its_input() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// Every catalog deployment, on CUDA, folded: each chain the row skeleton holds
-/// one op, and the trace still checks.
+/// Every catalog deployment, on CUDA, folded: each chain one op, and the
+/// trace still checks.
 #[test]
 fn every_folded_catalog_trace_checks() {
     let mut wrong: Vec<String> = Vec::new();
     for row in poem_compiler::catalog::deployments() {
         let t = row.trace(poem::Platform::Cuda);
-        let (folded, bodies) = fold(t.clone());
+        let (folded, bodies) = fold(t.clone(), SERVES);
         let ops = regions(&folded);
-        let held = chains(&t)
-            .into_iter()
-            .filter(|chain| {
-                schedule(&chain.region).is_ok()
-                    && poem_compiler::fuse::chain::skeleton_holds(&t, chain, chain.region.width)
-            })
-            .count();
+        let held = chains(&t, SERVES).len();
         if ops.len() != held {
             wrong.push(format!("{}: a chain is not folded", row.name));
         }
@@ -419,7 +414,7 @@ fn every_catalog_chain_has_a_body() {
     for row in poem_compiler::catalog::deployments() {
         let t = row.trace(poem::Platform::Cuda);
         let mut after = 0u32;
-        for chain in chains(&t) {
+        for chain in chains(&t, SERVES) {
             formed += 1;
             ops += chain.nodes.len();
             let ordered = chain.nodes.windows(2).all(|pair| pair[0] < pair[1]);

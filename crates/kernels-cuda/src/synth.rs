@@ -180,6 +180,12 @@ pub fn supports(region: &Region, ins: &[In], outs: &[Out]) -> Result<(), Refusal
             "a region of no parameter or no result: the skeleton reads and writes planes",
         ));
     }
+    if ins.len() > MAX_PARAMS {
+        return Err(refusal(format!(
+            "a region of {} parameters, past the {MAX_PARAMS} one kernel reads",
+            ins.len()
+        )));
+    }
     for (k, form) in ins.iter().enumerate() {
         if form.stored().is_none() {
             return Err(refusal(format!(

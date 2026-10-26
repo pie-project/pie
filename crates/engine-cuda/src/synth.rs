@@ -65,6 +65,44 @@ pub fn fold_anchors(
     )
 }
 
+/// Whether this backend's row kernels serve `region` over a chain's planes
+/// as it stores them (`chain::fold`'s `serves`): the row skeleton's own
+/// contract ([`kernels_cuda::synth::supports`]). ROCm's build generates no
+/// row kernel.
+#[must_use]
+pub fn serves_region(
+    region: &Region,
+    ins: &[poem_compiler::fuse::chain::In],
+    outs: &[poem_compiler::fuse::chain::Out],
+) -> bool {
+    #[cfg(not(feature = "rocm"))]
+    {
+        let forms: Vec<In> = ins
+            .iter()
+            .map(|input| {
+                if input.by.is_some() {
+                    In::Gathered(input.dtype)
+                } else if input.one {
+                    In::One(input.dtype)
+                } else if input.shared {
+                    In::Shared(input.dtype)
+                } else if input.each {
+                    In::Each(input.dtype)
+                } else {
+                    In::Rows(input.dtype)
+                }
+            })
+            .collect();
+        let results: Vec<Out> = outs.iter().map(|out| Out::Rows(out.dtype)).collect();
+        kernels_cuda::synth::supports(region, &forms, &results).is_ok()
+    }
+    #[cfg(feature = "rocm")]
+    {
+        let _ = (region, ins, outs);
+        false
+    }
+}
+
 /// Every `fused.anchored` (and `fused.epilogue`, over a product landed
 /// apart: `true`) of `trace`: its node, key and the values it reads and
 /// lands.
