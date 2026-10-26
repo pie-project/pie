@@ -47,7 +47,8 @@ fn on(pass: &ForwardPass, at: u32, reading: &str, stream: &str) -> Result<()> {
 
 /// The prompt's hidden rows, zero-padded to the rows `context` takes, and their count.
 fn encode(pipe: &Pipeline, context: &model::InputDecl, prompt: &str) -> Result<(Channel, Channel)> {
-    let text = lane("text", "context").map_err(|_| "this model has no text reading")?;
+    let text =
+        model::lane_of(&[("reading", "text")]).map_err(|_| "this model has no text reading")?;
     let width = text
         .outputs
         .iter()
@@ -73,7 +74,7 @@ fn encode(pipe: &Pipeline, context: &model::InputDecl, prompt: &str) -> Result<(
         }
     };
     let pass = ForwardPass::new();
-    on(&pass, 0, "text", "context")?;
+    pass.switch(0, "reading", "text")?;
     pass.embed(
         &Channel::from(ids.iter().map(|&id| id as i32).collect::<Vec<_>>()),
         &Channel::from([0u32, len]),
@@ -113,19 +114,26 @@ fn picture(name: &str, width: u32, height: u32) -> Result<Option<Frames>> {
     let Some(bytes) = inferlet::session::file(name) else {
         return Ok(None);
     };
-    let still = Frames::decode(&bytes).map_err(|why| format!("file `{name}`: {why}"))?;
-    if still.width() != width || still.height() != height {
+    let media = Frames::decode(&bytes).map_err(|why| format!("file `{name}`: {why}"))?;
+    if media.width() != width || media.height() != height {
         return Err(format!(
             "file `{name}` is {}x{}; this run is {width}x{height}",
-            still.width(),
-            still.height()
+            media.width(),
+            media.height()
         ));
     }
-    Ok(Some(still))
+    Ok(Some(media))
+}
+
+fn need(value: Option<u32>, name: &str) -> Result<u32> {
+    value.ok_or_else(|| format!("`{name}` is required"))
 }
 
 #[inferlet::main]
 async fn main(input: Input) -> Result<Output> {
+    if input.prompt.is_empty() {
+        return Err("empty prompt".into());
+    }
     let space = model::latent().ok_or("this model states no latent space")?;
     let (sc, tc, first, c) = (
         space.spatial_compression,
@@ -134,30 +142,30 @@ async fn main(input: Input) -> Result<Output> {
         space.channels,
     );
     let video = tc > 1;
-    let frames = input.frames.unwrap_or(if video { 17 } else { 1 });
+    let frames = if video {
+        need(input.frames, "frames")?
+    } else {
+        input.frames.unwrap_or(1)
+    };
     if frames < first || (frames - first) % tc != 0 {
         return Err(format!(
             "a clip is {first} frames, then {tc} a latent frame; {frames} is not one"
         ));
     }
-    let (w0, h0) = if video { (832, 480) } else { (1024, 1024) };
-    let width = (input.width.unwrap_or(w0) / sc).max(1) * sc;
-    let height = (input.height.unwrap_or(h0) / sc).max(1) * sc;
+    let width = (need(input.width, "width")? / sc).max(1) * sc;
+    let height = (need(input.height, "height")? / sc).max(1) * sc;
     let (lt, lh, lw) = ((frames - first) / tc + 1, height / sc, width / sc);
     let pixel_frames = move |j: u32| if j == 0 { first } else { tc };
     let lat = [lt, lh, lw, c];
     let n = lt * lh * lw;
 
-    let init: Vec<Frames> = match picture("init", width, height)? {
-        Some(still) => vec![still],
-        None => (0..frames)
-            .map_while(|f| picture(&format!("init_{f}"), width, height).transpose())
-            .collect::<Result<_>>()?,
-    };
-    if !init.is_empty() && init.len() as u32 != frames {
+    let init = picture("init", width, height)?;
+    if let Some(init) = &init
+        && init.count() != frames
+    {
         return Err(format!(
-            "{} init frames for a {frames}-frame run",
-            init.len()
+            "`init` has {} frames for a {frames}-frame run",
+            init.count()
         ));
     }
     let rect = input.mask_rect.as_deref().map(parse_rect).transpose()?;
@@ -182,18 +190,17 @@ async fn main(input: Input) -> Result<Output> {
         let one: Vec<f32> = (0..lh * lw).map(|i| cell(i / lw, i % lw)).collect();
         one.repeat(lt as usize)
     });
-    if mask.is_some() && init.is_empty() {
+    if mask.is_some() && init.is_none() {
         return Err("a mask needs the picture it is cut from: attach `init`".into());
     }
 
     let fact = model::schedule().ok_or("this model states no schedule")?;
-    let steps = input.steps.unwrap_or(if fact.pinned_sigmas.is_empty() {
-        8
-    } else {
-        fact.pinned_sigmas.len() as u32
-    });
+    let steps = match input.steps {
+        None if !fact.pinned_sigmas.is_empty() => fact.pinned_sigmas.len() as u32,
+        steps => need(steps, "steps")?,
+    };
     let mut sched = FlowMatchEuler::from_schedule(&fact, steps, None)?;
-    if !init.is_empty() {
+    if init.is_some() {
         let strength = input.strength.unwrap_or(0.6);
         if !(0.0 < strength && strength <= 1.0) {
             return Err(format!(
@@ -234,25 +241,30 @@ async fn main(input: Input) -> Result<Output> {
         _ => None,
     };
 
-    let start = (!init.is_empty())
-        .then(|| -> Result<Channel> {
+    let start = init
+        .map(|init| -> Result<Channel> {
             let vae = lane("vae.encode", "latents")?;
             let ws = WorkingSet::new();
             let start = Channel::new([n, c], dtype::f32).queued();
+            let all = Channel::seeded([frames, height * width * 3], dtype::f32);
+            all.set_frames(&init)?;
             let mut at = 0;
             for j in 0..lt {
                 let take = pixel_frames(j);
-                let chunk =
-                    Frames::concat(&init[at..at + take as usize].iter().collect::<Vec<_>>())?;
-                at += take as usize;
                 let pass = ForwardPass::new();
                 on(&pass, 0, "vae.encode", "latents")?;
                 if vae.state {
                     pass.state(&[&ws], StateGeometry::default())?;
                 }
-                let pixels = Channel::seeded([take, height, width, 3], dtype::f32);
-                pass.input(0, &vae.inputs[0].name, &pixels)?;
+                let pixels = Channel::new([take, height, width, 3], dtype::f32).queued();
+                pass.input(0, "pixels", &pixels)?;
+                pass.prologue(move || {
+                    let rows = gather(all.read(), &iota(take) + at);
+                    pixels.put(reshape(rows, [take, height, width, 3]));
+                });
+                at += take;
                 pass.epilogue(move || {
+                    pixels.take();
                     let base = if j == 0 {
                         broadcast(Tensor::constant([0f32]), [n, c])
                     } else {
@@ -262,7 +274,6 @@ async fn main(input: Input) -> Result<Output> {
                     let latent = intrinsics::output_rows(0, "pixels", lh * lw);
                     start.put(scatter_set(&base, &cells, &latent));
                 });
-                pixels.set_frames(&chunk)?;
                 pass.submit(&pipe)?;
             }
             Ok(start)
@@ -278,7 +289,7 @@ async fn main(input: Input) -> Result<Output> {
     let mask = mask.map(|m| Channel::from_shaped([n, 1], m.as_slice()));
     let seed = input.seed;
     let seed_ch = Channel::from([seed, 0u32]);
-    let key = move |i: &Tensor| &seed_ch.read() + &(&iota(2) * &broadcast(i, [2]));
+    let key = move |i: &Tensor| scatter_set(seed_ch.read(), Tensor::constant([1u32]), i);
     let prologue = move || {
         let zero = Tensor::constant([0u32]);
         let eps = normal(key(&zero), lat);

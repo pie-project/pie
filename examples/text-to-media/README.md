@@ -9,15 +9,20 @@ pie --config <config> run text-to-media -o ./out -- \
     --prompt "a red bicycle leaning on a blue wall" --width 1024 --height 1024 --steps 4 --out image
 ```
 
-Arguments: `prompt`, `negative_prompt` (CFG when `guidance > 1`), `width`,
-`height`, `frames` (default 1 when the latent has no temporal compression,
-else 17), `fps`, `steps`, `seed`, `guidance`, `strength`, `mask_rect`
+Arguments: `prompt`, `width`, `height`, `steps` (from the model's pinned
+sigmas when it has them), `frames` (video models), `negative_prompt` (CFG when
+`guidance > 1`), `fps`, `seed`, `guidance`, `strength`, `mask_rect`
 (`x0,y0,x1,y1`), `format` (`png` for one frame, else `mp4`; also `y4m`,
-`rgb8`), `out`.
+`rgb8`), `out`. `width`, `height`, `steps` and `frames` are required.
 
-Files (`pie run text-to-media --file NAME=PATH -- ...`): `init` (a picture to
-start from) or `init_0`, `init_1`, ... (one still per frame), and `mask` (white
-repaints). A mask needs an init.
+Recommended: Z-Image-Turbo 1024x1024, 8 steps; FLUX.2-klein 1024x1024, 4
+steps; Wan2.2-TI2V-5B 1280x704 (832x480 for speed), 121 frames (17 for a
+quick clip), 50 steps (8 for a quick look).
+
+Files (`pie run text-to-media --file NAME=PATH -- ...`): `init` (a picture, or
+a y4m clip of `frames` frames, to start from) and `mask` (white repaints). A
+mask needs an init. An mp4 is not read; convert it with
+`ffmpeg -i in.mp4 -pix_fmt yuv420p in.y4m`.
 
 ## Standard names
 
@@ -27,7 +32,7 @@ The guest drives the model by convention, not by probing:
 |---|---|
 | readings | `text`, `denoise`, `vae.encode`, `vae.decode` |
 | denoise streams | `latents` (the latent lane), `context` (the prompt lane); others are ignored |
-| inputs | `latents`, `timestep`, `guidance`, `context`, `length` |
+| inputs | `latents`, `timestep`, `guidance`, `context`, `length`; `pixels` (the `vae.encode` input) |
 | outputs | `hidden`, `velocity`, `pixels` |
 
 The text reading's rows are zero-padded to the rows `context` states and go
