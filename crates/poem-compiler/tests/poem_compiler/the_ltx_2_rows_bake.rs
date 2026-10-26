@@ -108,7 +108,7 @@ fn each_lane_the_facts_list_classifies_into_its_own_class() {
         let plan = trace(deployment, Platform::Cuda);
         let classes = poem::resolve_classes(&plan)
             .unwrap_or_else(|why| panic!("{deployment}: a merge does not resolve: {why:?}"));
-        let mut lanes: Vec<(&str, Option<&str>)> = ["video", "audio", "context", "reference"]
+        let mut lanes: Vec<(&str, Option<&str>)> = ["latents", "audio", "context", "audio_context"]
             .map(|stream| ("denoise", Some(stream)))
             .to_vec();
         lanes.extend([("refine.video", None), ("refine.audio", None)]);
@@ -154,10 +154,10 @@ fn the_attentions_pair_as_the_architecture_says() {
                 other => panic!("{deployment}: a ragged CSR that is not an indptr: {other:?}"),
             }
         };
-        let video = word(&plan, "denoise", Some("video"));
+        let video = word(&plan, "denoise", Some("latents"));
         let audio = word(&plan, "denoise", Some("audio"));
         let ctx = word(&plan, "denoise", Some("context"));
-        let actx = word(&plan, "denoise", Some("reference"));
+        let actx = word(&plan, "denoise", Some("audio_context"));
         let refine_v = word(&plan, "refine.video", None);
         let refine_a = word(&plan, "refine.audio", None);
 

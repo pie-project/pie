@@ -43,7 +43,7 @@ impl Encoder {
             word: self.shell.trace().facts.word(
                 &Request::new(1, false)
                     .starting(first)
-                    .switched("stream", "video")
+                    .switched("stream", "latents")
                     .switched("reading", "vae.encode"),
             ),
             tokens: &tokens,

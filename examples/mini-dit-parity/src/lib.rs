@@ -263,7 +263,7 @@ struct Output {
     sweep_velocity: Vec<Vec<f32>>,
 }
 
-const STREAMS: [&str; 3] = ["text", "context", "image"];
+const STREAMS: [&str; 3] = ["text", "context", "latents"];
 
 struct Shared {
     text: Channel,
@@ -309,7 +309,7 @@ fn velocity_width(reading: &str) -> Result<u32> {
             }
         }
     }
-    let image = model::lane_of(&[("reading", reading), ("stream", "image")])?;
+    let image = model::lane_of(&[("reading", reading), ("stream", "latents")])?;
     image
         .outputs
         .iter()

@@ -24,9 +24,9 @@ pub const TE_LAYERS: u32 = 50;
 #[must_use]
 pub fn modality(stream: &str) -> usize {
     match stream {
-        "video" | "reference" => 0,
+        "latents" | "reference" => 0,
         "audio" => 2,
-        "text" => 1,
+        "context" => 1,
         other => panic!("no stream `{other}`"),
     }
 }
@@ -34,7 +34,7 @@ pub fn modality(stream: &str) -> usize {
 #[must_use]
 pub fn timestep_slot(stream: &str) -> u32 {
     match stream {
-        "video" | "text" => 0,
+        "latents" | "context" => 0,
         "reference" => 1,
         "audio" => 2,
         other => panic!("no stream `{other}`"),

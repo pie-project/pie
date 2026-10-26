@@ -63,7 +63,7 @@ fn fire(
     keep_what_reads(&mut contract, &trace);
     let word = trace.facts.word(
         &Request::new(1, false)
-            .switched("stream", "video")
+            .switched("stream", "latents")
             .switched("reading", "vae.decode"),
     );
     let started = Instant::now();

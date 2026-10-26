@@ -113,8 +113,8 @@ fn lane_reading(reading: &str, stream: &str, binds: &[&str]) -> Result<model::La
 
 /// Checks both lanes (klein-4B reads no `guidance`) and reads the velocity width.
 fn dims(reading: &str) -> Result<Dims> {
-    let image = lane_reading(reading, "image", &["latents", "timestep"])?;
-    lane_reading(reading, "text", &["context", "timestep"])?;
+    let image = lane_reading(reading, "latents", &["latents", "timestep"])?;
+    lane_reading(reading, "context", &["context", "timestep"])?;
     let velocity_width = match image
         .outputs
         .iter()
@@ -216,12 +216,12 @@ async fn trajectory(
     let k = Channel::from([0u32]).named("k");
     let pass = ForwardPass::new();
     pass.switch(txt_lane, "reading", reading)?;
-    pass.switch(txt_lane, "stream", "text")?;
+    pass.switch(txt_lane, "stream", "context")?;
     pass.group(txt_lane, 0)?;
     pass.input(txt_lane, "context", context)?;
     pass.input(txt_lane, "timestep", &t)?;
     pass.switch(img_lane, "reading", reading)?;
-    pass.switch(img_lane, "stream", "image")?;
+    pass.switch(img_lane, "stream", "latents")?;
     pass.group(img_lane, 0)?;
     pass.input(img_lane, "latents", &x)?;
     pass.input(img_lane, "timestep", &t)?;

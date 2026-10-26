@@ -136,7 +136,7 @@ fn decode_reading() -> Result<Decode> {
     let mut pixels = false;
     let mut best: Option<(String, model::LaneDecl, model::InputDecl, u32)> = None;
     for reading in readings {
-        let Ok(lane) = model::lane_of(&[("reading", &reading), ("stream", "image")]) else {
+        let Ok(lane) = model::lane_of(&[("reading", &reading), ("stream", "latents")]) else {
             continue;
         };
         let Some(width) = lane
@@ -251,7 +251,7 @@ async fn main(input: Input) -> Result<Output> {
     let pipe = Pipeline::new();
     let pass = ForwardPass::new();
     pass.switch(0, "reading", &d.name)?;
-    pass.switch(0, "stream", "image")?;
+    pass.switch(0, "stream", "latents")?;
     let clip = Channel::from_shaped([case.h, case.w, case.channels], case.latent.as_slice())
         .named("latent");
     pass.input(0, &d.input, &clip)?;

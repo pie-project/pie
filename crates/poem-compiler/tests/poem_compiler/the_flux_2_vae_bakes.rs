@@ -262,12 +262,12 @@ fn each_vae_lane_has_a_class_of_its_own() {
             .unwrap_or_else(|| panic!("a {name} lane has no class"))
     };
     let seen: BTreeSet<usize> = [
-        class_of("text", "text"),
-        class_of("denoise", "text"),
-        class_of("denoise", "image"),
+        class_of("text", "context"),
+        class_of("denoise", "context"),
+        class_of("denoise", "latents"),
         class_of("denoise", "reference"),
-        class_of("vae.decode", "image"),
-        class_of("vae.encode", "image"),
+        class_of("vae.decode", "latents"),
+        class_of("vae.encode", "latents"),
     ]
     .into_iter()
     .collect();

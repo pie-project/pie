@@ -509,7 +509,7 @@ def caches(m, c):
 
 def forward(m, inputs):
     switch("reading", ["denoise", "refine.video", "refine.audio"] + (["vae.decode"] if m.vae != None else []))
-    switch("stream", ["video", "audio", "context", "reference"])
+    switch("stream", ["latents", "audio", "context", "audio_context"])
     switch("positions", ["computed", "given"])
     reading = lambda name: inputs.on(switch_is("reading", name))
     video, audio = m.connectors
@@ -675,8 +675,8 @@ def denoise(arm, m):
     dit = m.dit
     stream = lambda name: switch_is("stream", name)
     ctx, rest = arm.on(stream("context")), arm.on(~stream("context"))
-    actx, media = rest.on(stream("reference")), rest.on(~stream("reference"))
-    vid, aud = media.on(stream("video")), media.on(~stream("video"))
+    actx, media = rest.on(stream("audio_context")), rest.on(~stream("audio_context"))
+    vid, aud = media.on(stream("latents")), media.on(~stream("latents"))
 
     vg = struct(
         lanes = vid.request_of_token(),

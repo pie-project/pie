@@ -44,11 +44,7 @@ fn dims(deployment: &str) -> Dims {
 
 /// Every (reading, stream) a lane of `deployment` may take; `None` is the default stream.
 fn lanes(deployment: &str) -> Vec<(&'static str, Option<&'static str>)> {
-    let mut lanes = vec![
-        ("refine", Some("context")),
-        ("denoise", Some("image")),
-        ("denoise", Some("context")),
-    ];
+    let mut lanes = vec![("denoise", Some("latents")), ("denoise", Some("context"))];
     if deployment == TURBO {
         lanes.extend([("text", None), ("vae.decode", None), ("vae.encode", None)]);
     }
@@ -100,15 +96,15 @@ fn the_latent_is_patched_in_the_graph_and_the_positions_follow_the_caption() {
             .collect();
         assert_eq!(
             cells,
-            vec![0, 0, 0],
-            "{deployment}: a caption row runs down time: the refine's, the context's and the image's"
+            vec![0, 0],
+            "{deployment}: a caption row runs down time: the context's and the image's"
         );
         assert_eq!(
             count(&|op| matches!(op, Operation::Gather(Gather::GroupRows { .. }))),
             1,
             "{deployment}: the image follows its group's caption rows"
         );
-        for name in ["caption", "context", "latents"] {
+        for name in ["context", "latents"] {
             let input = plan
                 .inputs
                 .iter()
@@ -214,11 +210,10 @@ fn every_row_traces_on_every_platform_with_the_caches_and_readouts_it_states() {
                 !seams.contains_key("logits"),
                 "{deployment}: a denoiser has no logits, and `out` was planted anyway"
             );
-            let hidden = if deployment == TURBO { 2 } else { 1 };
             assert_eq!(
                 seams.get("hidden"),
-                Some(&hidden),
-                "{deployment}: one `hidden` per reading that reads hidden rows back"
+                (deployment == TURBO).then_some(&1),
+                "{deployment}: the encoder's `hidden` alone"
             );
             if deployment == TURBO {
                 let taps: BTreeSet<Option<u32>> = plan
@@ -338,11 +333,10 @@ fn the_refiners_attend_within_a_lane_and_the_trunk_within_the_group() {
             "{deployment}"
         );
 
-        let (text, refine, denoise) = ("text", "refine", "denoise");
+        let (text, denoise) = ("text", "denoise");
         let (_, joint, _) = ragged.iter().find(|(kind, _, _)| *kind == "group").unwrap();
-        assert!(joint.holds(word(&plan, denoise, Some("image"))));
+        assert!(joint.holds(word(&plan, denoise, Some("latents"))));
         assert!(joint.holds(word(&plan, denoise, Some("context"))));
-        assert!(!joint.holds(word(&plan, refine, Some("context"))));
         if deployment == TURBO {
             assert!(!joint.holds(word(&plan, text, None)));
         }
@@ -358,14 +352,12 @@ fn the_refiners_attend_within_a_lane_and_the_trunk_within_the_group() {
             "{deployment}: two refiner selections"
         );
         assert!(lane_selects.iter().any(|s| {
-            s.holds(word(&plan, refine, Some("context")))
-                && !s.holds(word(&plan, denoise, Some("image")))
-                && !s.holds(word(&plan, denoise, Some("context")))
+            s.holds(word(&plan, denoise, Some("context")))
+                && !s.holds(word(&plan, denoise, Some("latents")))
         }));
         assert!(lane_selects.iter().any(|s| {
-            s.holds(word(&plan, denoise, Some("image")))
+            s.holds(word(&plan, denoise, Some("latents")))
                 && !s.holds(word(&plan, denoise, Some("context")))
-                && !s.holds(word(&plan, refine, Some("context")))
         }));
 
         let prefills = plan
@@ -541,9 +533,9 @@ fn the_generative_facts_state_the_readings_the_schedule_and_the_latent_space() {
             .map(|s| s.values.clone())
             .unwrap_or_default();
         let want: Vec<&str> = if deployment == TURBO {
-            vec!["text", "refine", "denoise", "vae.decode", "vae.encode"]
+            vec!["text", "denoise", "vae.decode", "vae.encode"]
         } else {
-            vec!["refine", "denoise"]
+            vec!["denoise"]
         };
         assert_eq!(names, want, "{deployment}");
         let latent = facts.latent.expect("a denoiser states its latent space");

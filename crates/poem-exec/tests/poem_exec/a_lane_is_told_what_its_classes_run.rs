@@ -62,11 +62,11 @@ fn a_lane_is_told_what_its_classes_run_every_case() {
             &[
                 (&[("reading", "text")], (true, true, &["hidden"])),
                 (
-                    &[("reading", "denoise"), ("stream", "image")],
+                    &[("reading", "denoise"), ("stream", "latents")],
                     (false, false, &["velocity"]),
                 ),
                 (
-                    &[("reading", "denoise"), ("stream", "text")],
+                    &[("reading", "denoise"), ("stream", "context")],
                     (false, false, &[]),
                 ),
                 (&[("reading", "vae.decode")], (false, false, &["pixels"])),
@@ -76,10 +76,13 @@ fn a_lane_is_told_what_its_classes_run_every_case() {
         (
             "z-image-mini-bf16-kv-bf16",
             &[
-                (&[("reading", "refine")], (false, false, &["hidden"])),
                 (
-                    &[("reading", "denoise"), ("stream", "image")],
+                    &[("reading", "denoise"), ("stream", "latents")],
                     (false, false, &["velocity"]),
+                ),
+                (
+                    &[("reading", "denoise"), ("stream", "context")],
+                    (false, false, &[]),
                 ),
             ],
         ),
@@ -87,11 +90,11 @@ fn a_lane_is_told_what_its_classes_run_every_case() {
             "flux2-mini-bf16-kv-bf16",
             &[
                 (
-                    &[("reading", "denoise"), ("stream", "image")],
+                    &[("reading", "denoise"), ("stream", "latents")],
                     (false, false, &["velocity"]),
                 ),
                 (
-                    &[("reading", "denoise"), ("stream", "text")],
+                    &[("reading", "denoise"), ("stream", "context")],
                     (false, false, &[]),
                 ),
             ],
@@ -100,7 +103,7 @@ fn a_lane_is_told_what_its_classes_run_every_case() {
             "wan22-mini-nano-bf16-kv-bf16",
             &[
                 (
-                    &[("reading", "denoise"), ("stream", "video")],
+                    &[("reading", "denoise"), ("stream", "latents")],
                     (false, false, &["velocity"]),
                 ),
                 (
@@ -111,7 +114,7 @@ fn a_lane_is_told_what_its_classes_run_every_case() {
         ),
         (
             "mini-dit-bf16-kv-bf16",
-            &[(&[("stream", "image")], (false, false, &["velocity"]))],
+            &[(&[("stream", "latents")], (false, false, &["velocity"]))],
         ),
         (
             "hunyuanimage3-mini-bf16-kv-bf16",
