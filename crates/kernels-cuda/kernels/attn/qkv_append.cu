@@ -225,9 +225,7 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     bool qk_norm,
     float v_scale,
     int qk_width,
-    int v_width,
-    int rest_width,
-    bf16* __restrict__ rest)
+    int v_width)
 {
     // A programmatic dependent (`kernel.pdl`) touches nothing until its
     // producer is done; its own dependents may launch from here.
@@ -261,19 +259,8 @@ __global__ void qkv_decode_qk_norm_rope_vnorm_write_kv_warp(
     // each landing HEAD_DIM wide, zero past its width.
     const int kv_dim = num_kv_heads * HEAD_DIM;
     const int qkv_width = num_q_heads * qk_width + num_kv_heads * (qk_width + v_width);
-    const int packed_stride = qkv_width + rest_width;
     const bf16* src_row =
-        packed + static_cast<long long>(row) * packed_stride;
-    // The row's columns past its qkv (`rest`, a whole number of 16-byte
-    // words), a q head's share each.
-    if (is_q && rest_width > 0) {
-        const int per = ((rest_width + num_q_heads - 1) / num_q_heads + 7) / 8 * 8;
-        const int end = min((local_head + 1) * per, rest_width);
-        for (int c = local_head * per + lane * 8; c < end; c += 256) {
-            *reinterpret_cast<uint4*>(rest + static_cast<long long>(row) * rest_width + c) =
-                *reinterpret_cast<const uint4*>(src_row + qkv_width + c);
-        }
-    }
+        packed + static_cast<long long>(row) * qkv_width;
     const bf16* src = is_q
         ? src_row + local_head * qk_width
         : src_row + num_q_heads * qk_width + local_head * qk_width;
@@ -461,9 +448,8 @@ __device__ __forceinline__ void store_bf16_run(bf16* __restrict__ at, const floa
 // whole 16-byte words. With E = 8 entries a lane (a 64- or 128-wide head's
 // word) a head takes part of the warp and the warp several heads at once,
 // its sums adding in another order than the warp kernel's. With STAGE
-// (sm_90 on) the whole packed row lands in shared memory by one bulk copy
-// and the rest leaves by another, so a head's loads wait no round trip
-// each.
+// (sm_90 on) the whole packed row lands in shared memory by one bulk copy,
+// so a head's loads wait no round trip each.
 template <int HEAD_DIM, int E = HEAD_DIM / 32, class KV = bf16, bool STAGE = false>
 __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
     const bf16* __restrict__ packed,
@@ -492,9 +478,7 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
     bool qk_norm,
     float v_scale,
     int qk_width,
-    int v_width,
-    int rest_width,
-    bf16* __restrict__ rest)
+    int v_width)
 {
     constexpr unsigned FULL_MASK = 0xffffffffu;
     constexpr int ELEMS_PER_THREAD = E;
@@ -511,7 +495,7 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
     const int row = win != nullptr ? r + static_cast<int>(win[1]) : r;
     extern __shared__ __align__(16) unsigned char qkv_stage[];
     const int row_bytes =
-        (num_q_heads * qk_width + num_kv_heads * (qk_width + v_width) + rest_width) * 2;
+        (num_q_heads * qk_width + num_kv_heads * (qk_width + v_width)) * 2;
     unsigned long long* staged = reinterpret_cast<unsigned long long*>(qkv_stage + row_bytes);
     const unsigned staged_at = static_cast<unsigned>(__cvta_generic_to_shared(staged));
     const unsigned stage_at = static_cast<unsigned>(__cvta_generic_to_shared(qkv_stage));
@@ -531,7 +515,7 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
 #if __CUDA_ARCH__ >= 900
         // The packed row on its way into L2 under the rotation's setup (the
         // bulk prefetch is sm_90's; below it the row is read as it comes).
-        const int width = num_q_heads * qk_width + num_kv_heads * (qk_width + v_width) + rest_width;
+        const int width = num_q_heads * qk_width + num_kv_heads * (qk_width + v_width);
         asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(
                          packed + static_cast<long long>(row) * width),
                      "r"(static_cast<unsigned>(width) * 2u)
@@ -561,9 +545,8 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
     const int kv_dim = num_kv_heads * HEAD_DIM;
     const int q_src = num_q_heads * qk_width;
     const int qkv_width = q_src + num_kv_heads * (qk_width + v_width);
-    const int packed_stride = qkv_width + rest_width;
     const bf16* src_row = STAGE ? reinterpret_cast<const bf16*>(qkv_stage)
-                                : packed + static_cast<long long>(row) * packed_stride;
+                                : packed + static_cast<long long>(row) * qkv_width;
     if constexpr (STAGE) {
 #if __CUDA_ARCH__ >= 900
         unsigned done = 0;
@@ -576,21 +559,7 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
                 : "r"(staged_at)
                 : "memory");
         }
-        if (threadIdx.x == 0 && rest_width > 0) {
-            asm volatile("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;" ::"l"(
-                             rest + static_cast<long long>(row) * rest_width),
-                         "r"(stage_at + qkv_width * 2), "r"(rest_width * 2)
-                         : "memory");
-            asm volatile("cp.async.bulk.commit_group;" ::: "memory");
-        }
 #endif
-    } else {
-        // The row's columns past its qkv (`rest`, a whole number of 16-byte
-        // words).
-        for (int c = threadIdx.x * 8; c < rest_width; c += blockDim.x * 8) {
-            *reinterpret_cast<uint4*>(rest + static_cast<long long>(row) * rest_width + c) =
-                *reinterpret_cast<const uint4*>(src_row + qkv_width + c);
-        }
     }
     const bool kv_valid = row_valid == nullptr || row_valid[row] != 0;
 
@@ -870,11 +839,6 @@ __global__ void qkv_qk_norm_rope_vnorm_write_kv_rows(
             }
             v_dst.template run<ELEMS_PER_THREAD>(run, v_vals);
         }
-    }
-    if constexpr (STAGE) {
-#if __CUDA_ARCH__ >= 900
-        if (threadIdx.x == 0 && rest_width > 0) asm volatile("cp.async.bulk.wait_group.read 0;" ::: "memory");
-#endif
     }
 }
 

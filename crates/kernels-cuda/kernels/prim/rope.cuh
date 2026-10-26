@@ -22,26 +22,6 @@ __device__ __forceinline__ void rotate_pair_interleaved(
     h_ptr[2 * dim_pair + 1] = f32_to_bf16(b * cos_v + a * sin_v);
 }
 
-__device__ __forceinline__ void rotate_pair_interleaved_to(
-    const bf16* src, bf16* dst,
-    int dim_pair, float cos_v, float sin_v)
-{
-    const float a = bf16_to_f32(src[2 * dim_pair]);
-    const float b = bf16_to_f32(src[2 * dim_pair + 1]);
-    dst[2 * dim_pair]     = f32_to_bf16(a * cos_v - b * sin_v);
-    dst[2 * dim_pair + 1] = f32_to_bf16(b * cos_v + a * sin_v);
-}
-
-__device__ __forceinline__ void rotate_pair_to(
-    const bf16* src, bf16* dst,
-    int half, int dim_pair, float cos_v, float sin_v)
-{
-    const float a = bf16_to_f32(src[dim_pair]);
-    const float b = bf16_to_f32(src[dim_pair + half]);
-    dst[dim_pair]        = f32_to_bf16(a * cos_v - b * sin_v);
-    dst[dim_pair + half] = f32_to_bf16(b * cos_v + a * sin_v);
-}
-
 __device__ __forceinline__ void rope_cos_sin(
     float theta, int dim_pair, int head_dim, int pos,
     float& cos_v, float& sin_v)
