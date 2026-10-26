@@ -716,7 +716,7 @@ pub(super) fn rotation(width: u32, head_dim: u32, theta: f32, turn: &Turn) -> Op
     let (pairs, inverse, ramp) = match *turn {
         // every pair: the halves `i`, `i + head_dim / 2` at `theta^(-i /
         // (head_dim / 2))`, or `2i`, `2i + 1` at `theta^(-2i / head_dim)`
-        Turn::Full { interleaved } if head_dim % 2 == 0 => (
+        Turn::Full { interleaved } if head_dim.is_multiple_of(2) => (
             if interleaved {
                 build::Pairs::Tail {
                     rotary: head_dim,

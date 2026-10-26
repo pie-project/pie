@@ -24,7 +24,7 @@ const fn shape(span: u32, parts: u32) -> Option<(u32, u32)> {
     let mut warps = WARPS;
     while warps <= 16 {
         let cols = warps * 16 / parts;
-        if span <= 1 || (cols % span == 0 && span % 8 == 0 && span / 8 <= 32) {
+        if span <= 1 || (cols.is_multiple_of(span) && span.is_multiple_of(8) && span / 8 <= 32) {
             return Some((warps, if warps == WARPS { STEP } else { 64 }));
         }
         warps *= 2;

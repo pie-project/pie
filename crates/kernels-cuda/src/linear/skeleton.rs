@@ -647,7 +647,7 @@ impl Epilogue {
         // Each window (the whole tile, or each result's), cut into slices of
         // equal width the row skeleton holds, whole groups of the span:
         // `(from, width, outs)`.
-        let segments: Vec<(u32, u32, Vec<(usize, u32, u32)>)> = if self.windows.is_empty() {
+        let segments: Vec<Cut> = if self.windows.is_empty() {
             vec![(0, n, (0..self.results).map(|k| (k, 0, n)).collect())]
         } else {
             (0..self.results)
@@ -658,7 +658,7 @@ impl Epilogue {
                 .collect()
         };
         let span = self.span.max(1);
-        let mut pieces: Vec<(u32, u32, Vec<(usize, u32, u32)>)> = Vec::new();
+        let mut pieces: Vec<Cut> = Vec::new();
         for (from, wide, outs) in segments {
             let slices = (wide.div_ceil(MAX_WIDTH)..=wide / 8).find(|c| {
                 wide.is_multiple_of(*c)
@@ -740,6 +740,11 @@ pub fn serves(anchored: &Anchored, ins: &[Dtype], outs: &[Dtype]) -> Result<(), 
     }
     Ok(())
 }
+
+/// A run of the tile's columns, `(from, width, outs)`: each result `(k,
+/// at, ld)` of `outs` landed from its plane's column `at`, its rows `ld`
+/// apart.
+type Cut = (u32, u32, Vec<(usize, u32, u32)>);
 
 /// An epilogue's unfused leg as the row skeleton takes it: its parameters'
 /// forms and its pieces.
