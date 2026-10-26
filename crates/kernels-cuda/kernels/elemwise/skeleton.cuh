@@ -24,12 +24,7 @@ struct Plane {
 // one where `to` is 0), at its plane's row, from the plane row's first
 // element; or, where `page` is set, at the paged cache row `page[r] *
 // page_size + slot[r]` (none where the slot lies past the page or `valid[r]`
-// is 0), as e4m3 elements where `e4m3`, each `e4m3(x / scale)`; or, where
-// `blocks` is set, as a block-scaled row (kernels-ir's `BlockRows`, packed:
-// bit 0 set, bit 1 e2m1 codes, bit 2 an e4m3 scale (else a power of two),
-// bits 3..11 the codes a scale, 11..19 the coded columns / 8, 19..27 the
-// bf16 tail's columns / 8, 27..32 the scale bytes / 4; `scale` its floor),
-// a page of `page_size` rows its data rows, then its scale rows.
+// is 0), as e4m3 elements where `e4m3`, each `e4m3(x / scale)`.
 struct Store {
     const int* page;
     const int* slot;
@@ -42,36 +37,8 @@ struct Store {
     // a head-major window's head and stride, in vectors (0: whole)
     int head;
     int stride;
-    unsigned blocks;
+    int unused;
 };
-
-// A block's scale of its largest magnitude `amax` (kernels-ir's
-// `BlockRows::block_scale`): `q = max(amax, floor) / max`, the power of two
-// at or above it as its biased exponent, or it rounded to e4m3 as its bits.
-__device__ __forceinline__ float block_scale(float amax, float floor, float max, bool e4m3, unsigned char& byte) {
-    const float q = __fdiv_rn(fmaxf(amax, floor), max);
-    if (e4m3) {
-        byte = static_cast<unsigned char>(__nv_cvt_float_to_fp8(q, __NV_SATFINITE, __NV_E4M3));
-        const unsigned e = (byte >> 3) & 0xFu;
-        const unsigned m = byte & 0x7u;
-        return e != 0u ? __uint_as_float(((e + 120u) << 23) | (m << 20)) : static_cast<float>(m) * 0.001953125f;
-    }
-    const unsigned bits = __float_as_uint(q);
-    const unsigned biased = min(((bits >> 23) & 0xFFu) + ((bits & 0x7FFFFFu) != 0u ? 1u : 0u), 254u);
-    byte = static_cast<unsigned char>(biased);
-    return __uint_as_float(biased << 23);
-}
-
-// `x`'s e2m1 code: the nearest (ties to the even code), saturating at ±6,
-// the sign kept on a zero.
-__device__ __forceinline__ unsigned block_e2m1(float x) {
-    const float a = fabsf(x);
-    const unsigned m = static_cast<unsigned>(a > 0.25f) + static_cast<unsigned>(a >= 0.75f) +
-                       static_cast<unsigned>(a > 1.25f) + static_cast<unsigned>(a >= 1.75f) +
-                       static_cast<unsigned>(a > 2.5f) + static_cast<unsigned>(a >= 3.5f) +
-                       static_cast<unsigned>(a > 5.f);
-    return signbit(x) ? (m | 8u) : m;
-}
 
 // What a row skeleton fires over: its body's IN parameters and OUT results,
 // every row `width` wide, `rows` rows; each of the planes' rows cut into
@@ -176,10 +143,6 @@ struct RowSkeleton {
     bool lands[OUT];
     bool e4m3[OUT];
     float scale[OUT];
-    // A block-scaled result's layout (`Store::blocks`) and its row's scale
-    // bytes (its data's at `dst`).
-    unsigned blocks[OUT];
-    unsigned char* sdst[OUT];
     // A late parameter's first vector, issued by `load<k>()`.
     const uint4* src[IN];
     // The vector of 8 each of this thread's slots holds (`ORDER`).
@@ -228,8 +191,6 @@ struct RowSkeleton {
             to[k] = store.to > 0 ? store.to : planes.width / 8;
             e4m3[k] = store.e4m3 != 0;
             scale[k] = store.scale;
-            blocks[k] = store.blocks;
-            sdst[k] = nullptr;
             lands[k] = true;
             long long row_at = start_of(planes.out[k], of, part, width, true);
             if (store.page != nullptr) {
@@ -243,20 +204,7 @@ struct RowSkeleton {
                          static_cast<long long>(part) * width;
             }
             // the window's first vector lands at the plane row's start
-            if (blocks[k] != 0u) {
-                // a page's data rows, then its scale rows
-                const unsigned w = blocks[k];
-                const long long coded = static_cast<long long>((w >> 11) & 0xFFu) * 8;
-                const long long tail = static_cast<long long>((w >> 19) & 0xFFu) * 8;
-                const long long data = ((w >> 1) & 1u ? coded / 2 : coded) + 2 * tail;
-                const long long scales = static_cast<long long>((w >> 27) & 0x1Fu) * 4;
-                const int page = lands[k] ? store.page[of] : 0;
-                const int slot = lands[k] ? store.slot[of] : 0;
-                unsigned char* base = static_cast<unsigned char*>(const_cast<void*>(planes.out[k].base)) +
-                                      static_cast<long long>(page) * store.page_size * (data + scales);
-                dst[k] = reinterpret_cast<uint4*>(base + slot * data);
-                sdst[k] = base + static_cast<long long>(store.page_size) * data + slot * scales;
-            } else if (e4m3[k]) {
+            if (e4m3[k]) {
                 dst[k] = reinterpret_cast<uint4*>(
                     static_cast<unsigned char*>(const_cast<void*>(planes.out[k].base)) + row_at);
             } else {
@@ -587,10 +535,6 @@ struct RowSkeleton {
     // element is written, so the store overlaps whatever follows.
     template <int K>
     __device__ __forceinline__ void flush() {
-        if (blocks[K] != 0u) {
-            flush_blocks<K>();
-            return;
-        }
         if (!live || !lands[K]) return;
 #pragma unroll
         for (int p = 0; p < VECS; ++p) {
@@ -613,65 +557,6 @@ struct RowSkeleton {
                 reinterpret_cast<uint2*>(dst[K])[dst_at] = *reinterpret_cast<const uint2*>(q);
             } else {
                 dst[K][dst_at] = out[K][p];
-            }
-        }
-    }
-
-    // Result `K`'s row as a block-scaled cache row: each block's largest
-    // magnitude over the lanes that hold it (a block's vectors sit on side
-    // by side lanes, a row's vectors in order), its scale, then its codes;
-    // the tail's vectors as they are. Every thread takes the max, live or
-    // not, as the lanes exchange it.
-    template <int K>
-    __device__ __forceinline__ void flush_blocks() {
-        const unsigned w = blocks[K];
-        const bool e2m1 = ((w >> 1) & 1u) != 0u;
-        const bool e4m3_scale = ((w >> 2) & 1u) != 0u;
-        const int block = static_cast<int>((w >> 3) & 0xFFu);
-        const int coded = static_cast<int>((w >> 11) & 0xFFu) * 8;
-        const int scales = static_cast<int>((w >> 27) & 0x1Fu) * 4;
-        const int per = block / 8;
-        const float max = e2m1 ? 6.f : 448.f;
-        const bool lands_row = live && lands[K];
-        unsigned char* data = reinterpret_cast<unsigned char*>(dst[K]);
-#pragma unroll
-        for (int p = 0; p < VECS; ++p) {
-            const int slot = lane + p * LANES;
-            const int i = static_cast<int>(at[p]);
-            const bool held = slot < vectors;
-            const bf16* h = reinterpret_cast<const bf16*>(&out[K][p]);
-            float amax = 0.f;
-#pragma unroll
-            for (int e = 0; e < 8; ++e) amax = fmaxf(amax, fabsf(bf16_to_f32(h[e])));
-            if (!held || i * 8 >= coded) amax = 0.f;
-            for (int off = 1; off < per; off <<= 1) amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, off));
-            if (!lands_row || !held) continue;
-            const int c0 = i * 8;
-            if (c0 >= coded) {
-                // the tail's bf16, as the result holds it
-                uint2* t = reinterpret_cast<uint2*>(data + (e2m1 ? coded / 2 : coded) + (c0 - coded) * 2);
-                t[0] = make_uint2(out[K][p].x, out[K][p].y);
-                t[1] = make_uint2(out[K][p].z, out[K][p].w);
-                continue;
-            }
-            unsigned char byte;
-            const float s = block_scale(amax, scale[K], max, e4m3_scale, byte);
-            if (i % per == 0) sdst[K][i / per] = byte;
-            if (i == 0) {
-                for (int b = coded / block; b < scales; ++b) sdst[K][b] = 0;
-            }
-            if (e2m1) {
-                unsigned packed = 0u;
-#pragma unroll
-                for (int e = 0; e < 8; ++e) packed |= block_e2m1(__fdiv_rn(bf16_to_f32(h[e]), s)) << (4 * e);
-                *reinterpret_cast<unsigned*>(data + c0 / 2) = packed;
-            } else {
-                __align__(8) unsigned char q[8];
-#pragma unroll
-                for (int e = 0; e < 8; ++e)
-                    q[e] = static_cast<unsigned char>(
-                        __nv_cvt_float_to_fp8(__fdiv_rn(bf16_to_f32(h[e]), s), __NV_SATFINITE, __NV_E4M3));
-                *reinterpret_cast<uint2*>(data + c0) = *reinterpret_cast<const uint2*>(q);
             }
         }
     }

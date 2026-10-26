@@ -559,7 +559,10 @@ impl Epilogue {
     /// The window of the tile result `k` lands at `n` columns.
     #[must_use]
     pub fn window(&self, k: usize, n: u32) -> Window {
-        self.windows.get(k).copied().unwrap_or(Window::of(0, n))
+        self.windows
+            .get(k)
+            .copied()
+            .unwrap_or(Window::of(0, n))
     }
 
     /// Whether it serves a tile of `n` columns: any, or the one its body is
@@ -645,7 +648,8 @@ impl Epilogue {
             ins.iter().zip(&self.inputs).zip(&self.stored).enumerate()
         {
             let unplaned = *kind == Input::Norm;
-            if (input.base == 0 && !unplaned) || input.kind() != *kind || input.dtype() != *dtype {
+            if (input.base == 0 && !unplaned) || input.kind() != *kind || input.dtype() != *dtype
+            {
                 return Err(refuse(
                     OP,
                     format!("input {k} is not a {kind:?} plane stored {dtype:?}"),
@@ -683,15 +687,11 @@ impl Epilogue {
         let index = |at: u32| u64::from(at);
         words.extend(paged.iter().map(|p| p.map_or(u64::MAX, |p| index(p.page))));
         words.extend(paged.iter().map(|p| p.map_or(u64::MAX, |p| index(p.slot))));
-        words.extend(paged.iter().map(|p| {
-            u64::from(matches!(
-                p,
-                Some(Paged {
-                    dtype: CacheDtype::E4m3 { .. },
-                    ..
-                })
-            ))
-        }));
+        words.extend(
+            paged
+                .iter()
+                .map(|p| u64::from(matches!(p, Some(Paged { dtype: CacheDtype::E4m3 { .. }, .. })))),
+        );
         words.extend(paged.iter().map(|p| match p {
             Some(Paged {
                 dtype: CacheDtype::E4m3 { scale },
@@ -860,16 +860,6 @@ impl Epilogue {
                         let start = w.from + h * w.stride;
                         start < from + width && start + w.head > from + width
                     })
-            }) {
-                return None;
-            }
-            // a block-scaled row lands whole, one piece's, of a layout the
-            // row skeleton's store packs
-            if outs.iter().any(|o| {
-                matches!(self.paged(o.k), Some(Paged { dtype: CacheDtype::Blocks(rows), .. })
-                    if o.at != 0
-                        || o.to - o.from != rows.width()
-                        || crate::elemwise::skeleton::blocks_word(&rows).is_none())
             }) {
                 return None;
             }
@@ -1155,19 +1145,6 @@ impl Skeleton {
         if m <= 0 || n <= 0 || k <= 0 || k % 8 != 0 || !epi.fits(n.unsigned_abs()) {
             return false;
         }
-        // A block-scaled row takes its blocks' largest across a row's lanes:
-        // the row skeleton's (the unfused leg's) alone.
-        if (0..epi.results).any(|k| {
-            matches!(
-                epi.paged(k),
-                Some(Paged {
-                    dtype: CacheDtype::Blocks(_),
-                    ..
-                })
-            )
-        }) {
-            return false;
-        }
         // A body that combines a head's columns needs the head's lanes side
         // by side: the skinny skeleton's tile alone holds whole heads.
         match self {
@@ -1321,18 +1298,6 @@ impl RowLeg {
                 for piece in shape.pieces {
                     let kernel =
                         crate::synth::synth(&piece.region, &shape.ins, piece.outs.len()).ok()?;
-                    let blocks = piece.outs.iter().any(|o| {
-                        matches!(
-                            epi.paged(o.k),
-                            Some(Paged {
-                                dtype: CacheDtype::Blocks(_),
-                                ..
-                            })
-                        )
-                    });
-                    if blocks && kernel.reorders() {
-                        return None;
-                    }
                     kernel.load().ok()?;
                     pieces.push(Piece {
                         kernel,
@@ -1427,12 +1392,7 @@ impl RowLeg {
                         )
                     }
                     None => Plane::window(
-                        &Tensor::new(
-                            outs[land.k] + u64::from(land.at) * 2,
-                            m,
-                            land.ld,
-                            Dtype::Bf16,
-                        ),
+                        &Tensor::new(outs[land.k] + u64::from(land.at) * 2, m, land.ld, Dtype::Bf16),
                         land.from,
                         width,
                     ),
@@ -1440,11 +1400,9 @@ impl RowLeg {
                         let Some(paging) = paging else {
                             return Err(refuse(OP, "a paged result fired with no paging"));
                         };
-                        let (e4m3, blocks, bytes) = match paged.dtype {
-                            CacheDtype::Bf16 => (None, None, 2),
-                            CacheDtype::E4m3 { scale } => (Some(scale), None, 1),
-                            // a whole row of one piece ([`Epilogue::leg`])
-                            CacheDtype::Blocks(rows) => (None, Some(rows), 0),
+                        let (e4m3, bytes) = match paged.dtype {
+                            CacheDtype::Bf16 => (None, 2),
+                            CacheDtype::E4m3 { scale } => (Some(scale), 1),
                         };
                         Plane::paged(
                             crate::elemwise::skeleton::Cache {
@@ -1455,7 +1413,6 @@ impl RowLeg {
                                 valid: paging.valid,
                                 page_size: paging.page_size,
                                 e4m3,
-                                blocks,
                             },
                             land.from,
                             width,
@@ -1573,48 +1530,19 @@ mod tests {
         );
         assert!(bias.planes(&[In::row(64)], &[128], 8, None).is_err());
         assert!(bias.planes(&[], &[128], 8, None).is_err());
-        let words = bias
-            .planes(&[In::column(64)], &[128], 8, None)
-            .expect("a bias");
+        let words = bias.planes(&[In::column(64)], &[128], 8, None).expect("a bias");
         // One input (its base, strides, dtype and period), one unread, one
         // result, its row's stride, its window's columns, head and stride,
         // the norm's eps (none), then its paging (none).
-        assert_eq!(
-            words,
-            vec![
-                64,
-                0,
-                1,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                0,
-                128,
-                8,
-                0,
-                8,
-                0,
-                0,
-                0,
-                u64::MAX,
-                u64::MAX,
-                0,
-                0x3f80_0000,
-                0,
-                0
-            ]
-        );
+        assert_eq!(words, vec![
+                64, 0, 1, 0, 0, 0, 0, 0, 0, 0, 128, 8, 0, 8, 0, 0, 0,
+                u64::MAX, u64::MAX, 0, 0x3f80_0000, 0, 0
+            ]);
         // A row's norm scale is no plane: its input carries none.
         assert_eq!(In::norm().kind(), Input::Norm);
         // A head's weight and a row's i32 position, each of its kind.
         assert_eq!(In::head(64, 32).kind(), Input::Head(32));
         assert_eq!(In::row(64).i32().dtype(), Dtype::I32);
-        assert!(
-            bias.planes(&[In::column(64).i32()], &[128], 8, None)
-                .is_err()
-        );
+        assert!(bias.planes(&[In::column(64).i32()], &[128], 8, None).is_err());
     }
 }
