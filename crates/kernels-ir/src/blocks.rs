@@ -76,6 +76,9 @@ pub enum BlockScale {
     Pow2,
     /// `q` rounded to e4m3, stored as its bits.
     E4m3,
+    /// One, whatever the block holds, stored as nothing: each code `x`'s
+    /// own (vLLM's standard fp8 rows).
+    Unit,
 }
 
 /// A cache row's block-scaled layout (see the module's rule).
@@ -135,6 +138,33 @@ impl BlockRows {
         scale_bytes: 32,
     };
 
+    /// DeepSeek-V4.1's FP4 index keys: 128 e2m1 codes under one
+    /// power-of-two scale a 32, floored at the least normal f32 over 6.
+    pub const FP4_KEYS: BlockRows = BlockRows {
+        code: Code::E2m1,
+        block: 32,
+        scale: BlockScale::Pow2,
+        floor: 6.0 * f32::MIN_POSITIVE,
+        coded: 128,
+        tail: 0,
+        scale_bytes: 4,
+    };
+
+    /// vLLM's standard fp8 rows of `width` columns: each column e4m3 under
+    /// a scale of one, no scale bytes.
+    #[must_use]
+    pub const fn fp8(width: u32) -> BlockRows {
+        BlockRows {
+            code: Code::E4m3,
+            block: width,
+            scale: BlockScale::Unit,
+            floor: 1.0,
+            coded: width,
+            tail: 0,
+            scale_bytes: 0,
+        }
+    }
+
     /// The columns a row holds.
     #[must_use]
     pub const fn width(&self) -> u32 {
@@ -144,7 +174,10 @@ impl BlockRows {
     /// The scales a row holds.
     #[must_use]
     pub const fn scales(&self) -> u32 {
-        self.coded / self.block
+        match self.scale {
+            BlockScale::Unit => 0,
+            _ => self.coded / self.block,
+        }
     }
 
     /// A row's data bytes: its codes, then its tail's bf16.
@@ -196,6 +229,7 @@ impl BlockRows {
                 let byte = e4m3_bits(q);
                 (e4m3_value(byte), byte)
             }
+            BlockScale::Unit => (1.0, 0),
         }
     }
 
@@ -215,7 +249,9 @@ impl BlockRows {
         for (b, run) in row[..coded].chunks(block).enumerate() {
             let amax = run.iter().fold(0f32, |m, x| m.max(x.abs()));
             let (s, byte) = self.block_scale(amax);
-            scales[b] = byte;
+            if self.scale != BlockScale::Unit {
+                scales[b] = byte;
+            }
             codes.extend(run.iter().map(|x| self.code.encode(x / s)));
         }
         let mut data = match self.code {
@@ -253,6 +289,7 @@ impl BlockRows {
         let scale = |b: usize| match self.scale {
             BlockScale::Pow2 => f32::from_bits(u32::from(scales[b]) << 23),
             BlockScale::E4m3 => e4m3_value(scales[b]),
+            BlockScale::Unit => 1.0,
         };
         let codes = coded * self.code.bits() as usize / 8;
         (0..coded)
@@ -360,13 +397,15 @@ mod tests {
 
     #[test]
     fn each_format_lays_out_deepseeks_bytes() {
-        for (rows, bytes) in [
-            (BlockRows::V4, 584),
-            (BlockRows::MX8, 528),
-            (BlockRows::NV4, 288),
+        for (rows, width, bytes) in [
+            (BlockRows::V4, 512, 584),
+            (BlockRows::MX8, 512, 528),
+            (BlockRows::NV4, 512, 288),
+            (BlockRows::FP4_KEYS, 128, 68),
+            (BlockRows::fp8(576), 576, 576),
         ] {
             assert!(rows.verify());
-            assert_eq!(rows.width(), 512);
+            assert_eq!(rows.width(), width);
             assert_eq!(rows.row_bytes(), bytes);
         }
         assert_eq!(
@@ -424,5 +463,32 @@ mod tests {
         let (data, scales) = BlockRows::NV4.encode(&zero);
         assert!(data.iter().all(|b| *b == 0));
         assert_eq!(scales[0], 0x01);
+    }
+
+    #[test]
+    fn index_keys_and_vllms_rows_land_their_codes() {
+        // vLLM's rows: each column's e4m3 code, no scales
+        let row: Vec<f32> = (0..576).map(|i| (i as f32 - 300.0) / 3.0).collect();
+        let (data, scales) = BlockRows::fp8(576).encode(&row);
+        assert!(scales.is_empty());
+        for (c, x) in row.iter().enumerate() {
+            assert_eq!(data[c], e4m3_bits(round_bf16(*x)), "column {c}");
+        }
+        // an index key: each 32 under 2^ceil(log2(amax / 6))
+        let key: Vec<f32> = (0..128)
+            .map(|i| round_bf16((i as f32 - 64.0) / 5.0))
+            .collect();
+        let (data, scales) = BlockRows::FP4_KEYS.encode(&key);
+        assert_eq!((data.len(), scales.len()), (64, 4));
+        for (b, run) in key.chunks(32).enumerate() {
+            let amax = run.iter().fold(0f32, |m, x| m.max(x.abs()));
+            let e = (amax / 6.0).log2().ceil() as i32;
+            assert_eq!(i32::from(scales[b]) - 127, e, "block {b}");
+            for (c, x) in run.iter().enumerate() {
+                let at = b * 32 + c;
+                let code = (data[at / 2] >> (4 * (at % 2))) & 0xf;
+                assert_eq!(code, e2m1_bits(x / 2f32.powi(e)), "column {at}");
+            }
+        }
     }
 }

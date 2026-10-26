@@ -666,8 +666,15 @@ impl Pools {
                         // width (a compact pool's share of it) the format's.
                         let ds_row = *dtype == Dtype::U8
                             && heads == 512
-                            && quantized
-                                .is_some_and(|f| keys_width != 0 && f.bytes() % keys_width == 0)
+                            && quantized.is_some_and(|f| {
+                                matches!(
+                                    f,
+                                    poem_ir::KvRows::V4
+                                        | poem_ir::KvRows::Mx8
+                                        | poem_ir::KvRows::Nv4
+                                ) && keys_width != 0
+                                    && f.bytes() % keys_width == 0
+                            })
                             && values_width == keys_width;
                         if !ds_row && (heads != keys_width || heads != values_width) {
                             return Err(Fault::Unbound {

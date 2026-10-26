@@ -136,9 +136,9 @@ pub struct ExpertSlots {
     pub slots: u32,
 }
 
-/// DeepSeek's quantized KV rows, each a u8 plane a 512-wide row of its
-/// format's width (`CacheRow::Kv::rows`). A page of `p` positions holds `p`
-/// data rows, then `p` scale rows.
+/// The quantized KV rows a u8 plane holds, a row of its format's bytes a
+/// position (`CacheRow::Kv::rows`): DeepSeek's and vLLM's standard fp8
+/// ones. A page of `p` positions holds `p` data rows, then `p` scale rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum KvRows {
     /// V4's (FlashMLA's `fp8_ds_mla`): 448 e4m3 codes under one ue8m0
@@ -152,6 +152,13 @@ pub enum KvRows {
     /// the low nibble) under one e4m3 scale a 16; 256 data bytes and 32
     /// scale bytes.
     Nv4,
+    /// V4.1's FP4 index keys: 128 e2m1 codes under one ue8m0 exponent a 32;
+    /// 64 data bytes and 4 scale bytes.
+    Fp4Keys,
+    /// vLLM's standard fp8 rows (an MLA latent and its rotated dims): each
+    /// of `width` columns e4m3 under one scale of 1, a byte a column and no
+    /// scale bytes.
+    Fp8 { width: u32 },
 }
 
 impl KvRows {
@@ -162,6 +169,8 @@ impl KvRows {
             Self::V4 => 576,
             Self::Mx8 => 512,
             Self::Nv4 => 256,
+            Self::Fp4Keys => 64,
+            Self::Fp8 { width } => width as u64,
         }
     }
 
@@ -172,6 +181,8 @@ impl KvRows {
             Self::V4 => 8,
             Self::Mx8 => 16,
             Self::Nv4 => 32,
+            Self::Fp4Keys => 4,
+            Self::Fp8 { .. } => 0,
         }
     }
 

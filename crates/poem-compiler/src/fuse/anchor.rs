@@ -1083,6 +1083,8 @@ pub fn block_rows(format: poem_ir::KvRows) -> kernels_ir::BlockRows {
         poem_ir::KvRows::V4 => kernels_ir::BlockRows::V4,
         poem_ir::KvRows::Mx8 => kernels_ir::BlockRows::MX8,
         poem_ir::KvRows::Nv4 => kernels_ir::BlockRows::NV4,
+        poem_ir::KvRows::Fp4Keys => kernels_ir::BlockRows::FP4_KEYS,
+        poem_ir::KvRows::Fp8 { width } => kernels_ir::BlockRows::fp8(width),
     }
 }
 
@@ -1118,6 +1120,8 @@ fn append_of(
     let (dtype, blocks) = match (dtype, rows) {
         (Dtype::Bf16, None) => (CacheDtype::Bf16, None),
         (Dtype::E4m3, None) => (CacheDtype::E4m3 { scale: 1.0 }, None),
+        // vLLM's standard fp8 rows: e4m3 under a unit scale, a byte a column
+        (Dtype::U8, Some(poem_ir::KvRows::Fp8 { .. })) => (CacheDtype::E4m3 { scale: 1.0 }, None),
         // DeepSeek's rows: a u8 plane a row of the format's bytes
         (Dtype::U8, Some(format)) => {
             let rows = block_rows(*format);

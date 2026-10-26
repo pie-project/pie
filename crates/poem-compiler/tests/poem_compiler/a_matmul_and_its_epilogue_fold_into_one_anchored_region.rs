@@ -673,8 +673,17 @@ fn a_kv_row_appended_to_deepseeks_rows_pages_their_blocks() {
         }
         let formed = anchors(&t, &all);
         let anchor = the_one(&formed);
-        assert!(anchor.cache.is_some(), "{format:?}: the append is the epilogue's");
-        let paged = anchor.anchored.paged.iter().flatten().next().expect("a paged result");
+        assert!(
+            anchor.cache.is_some(),
+            "{format:?}: the append is the epilogue's"
+        );
+        let paged = anchor
+            .anchored
+            .paged
+            .iter()
+            .flatten()
+            .next()
+            .expect("a paged result");
         assert_eq!(paged.dtype, CacheDtype::Blocks(block_rows(format)));
         assert_eq!(anchor.anchored.verify(), Ok(()));
     }

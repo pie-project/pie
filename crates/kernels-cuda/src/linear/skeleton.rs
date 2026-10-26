@@ -863,10 +863,13 @@ impl Epilogue {
             }) {
                 return None;
             }
-            // a block-scaled row lands whole, one piece's
+            // a block-scaled row lands whole, one piece's, of a layout the
+            // row skeleton's store packs
             if outs.iter().any(|o| {
                 matches!(self.paged(o.k), Some(Paged { dtype: CacheDtype::Blocks(rows), .. })
-                    if o.at != 0 || o.to - o.from != rows.width())
+                    if o.at != 0
+                        || o.to - o.from != rows.width()
+                        || crate::elemwise::skeleton::blocks_word(&rows).is_none())
             }) {
                 return None;
             }

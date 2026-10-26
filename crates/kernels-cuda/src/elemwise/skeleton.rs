@@ -118,7 +118,9 @@ pub fn blocks_word(rows: &kernels_ir::BlockRows) -> Option<u32> {
     use kernels_ir::{BlockScale, Code};
     let fits = |v: u32, bits: u32| v < 1 << bits;
     let (coded, tail, scales) = (rows.coded / 8, rows.tail / 8, rows.scale_bytes / 4);
+    // a unit scale is e4m3 under a scale of one, the plain e4m3 store's
     (rows.verify()
+        && rows.scale != BlockScale::Unit
         && rows.coded.is_multiple_of(8)
         && rows.tail.is_multiple_of(8)
         && rows.scale_bytes.is_multiple_of(4)

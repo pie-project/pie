@@ -829,7 +829,7 @@ def cache(c, space, a, fp8):
     standard fp8 rows (the latent and rotated dims' e4m3 codes under one
     scale of 1 in a u8 plane)."""
     if fp8:
-        c.kv(space, a.kv, [a.kv_lora_rank + a.qk_rope_head_dim], a.qk_rope_head_dim)
+        c.kv(space, a.kv, [a.kv_lora_rank + a.qk_rope_head_dim], a.qk_rope_head_dim, rows = "fp8")
         return
     c.kv(space, a.kv, [a.kv_lora_rank, a.qk_rope_head_dim], a.qk_rope_head_dim)
 

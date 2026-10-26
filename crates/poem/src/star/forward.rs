@@ -321,9 +321,10 @@ fn spec_methods(builder: &mut MethodsBuilder) {
     /// The kv row `name` in `space`, its planes of `planes` and heads of
     /// `head_dim`; `heads` cuts it between ranks by head; `live`, a key
     /// head's and a value head's widths, where heads are zero-padded past
-    /// them; `rows`, the block-scaled rows a u8 plane holds (`"v4"`,
-    /// `"mx8"` or `"nv4"`), each plane a row of that format's width (or a
-    /// compact pool's share of one).
+    /// them; `rows`, the quantized rows a u8 plane holds (`"v4"`, `"mx8"`,
+    /// `"nv4"`, `"fp4_keys"`, or `"fp8"`, vLLM's standard rows of the
+    /// plane's width), each plane a row of that format's width (or a compact
+    /// pool's share of one).
     fn kv(
         #[starlark(this)] _this: &SpecHandle,
         #[starlark(require = pos)] space: u32,
@@ -344,7 +345,17 @@ fn spec_methods(builder: &mut MethodsBuilder) {
             Some("v4") => Some(poem_ir::KvRows::V4),
             Some("mx8") => Some(poem_ir::KvRows::Mx8),
             Some("nv4") => Some(poem_ir::KvRows::Nv4),
-            Some(other) => anyhow::bail!("`rows` is \"v4\", \"mx8\" or \"nv4\", not {other:?}"),
+            Some("fp4_keys") => Some(poem_ir::KvRows::Fp4Keys),
+            // a row of the plane's bytes, a column each
+            Some("fp8") => match planes.items.as_slice() {
+                [width] => Some(poem_ir::KvRows::Fp8 {
+                    width: u32::try_from(*width)?,
+                }),
+                _ => anyhow::bail!("vLLM's fp8 rows are one plane, not {:?}", planes.items),
+            },
+            Some(other) => anyhow::bail!(
+                "`rows` is \"v4\", \"mx8\", \"nv4\", \"fp4_keys\" or \"fp8\", not {other:?}"
+            ),
         };
         if let Some(format) = rows
             && planes

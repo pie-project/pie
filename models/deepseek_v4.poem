@@ -1382,7 +1382,8 @@ def caches(m, c):
         if at.indexer != None and at.indexer.owns_keys:
             index = c.kv_space(keys)
             key = FP4_KEY_ROW if fp4 else at.indexer.head_dim
-            c.kv(index, at.indexer.keys, packed(key, ratio), at.indexer.head_dim)
+            c.kv(index, at.indexer.keys, packed(key, ratio), at.indexer.head_dim,
+                 rows = "fp4_keys" if fp4 else None)
         if w.engram != None:
             c.state(w.engram.ids_state, [w.engram.ngram - 1], dtype.i32)
     if m.decoder != None:

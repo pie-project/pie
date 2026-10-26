@@ -687,7 +687,9 @@ impl Pointwise {
                     _ => Arg::Row(vec![0.0; n as usize]),
                 })
                 .collect();
-            interp::eval(&probe, &args).ok().map(|mut l| l.swap_remove(0))
+            interp::eval(&probe, &args)
+                .ok()
+                .map(|mut l| l.swap_remove(0))
         };
         read.iter()
             .all(|&v| probe(v).is_some_and(|values| periodic(&values, false)))
