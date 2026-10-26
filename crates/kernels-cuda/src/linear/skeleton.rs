@@ -1036,13 +1036,6 @@ fn shifted(region: &Region, from: u32, width: u32, results: Vec<u32>) -> Region 
             Op::Reduce(r, a) => push(&mut ops, Op::Reduce(r, m(a))),
             Op::ReduceHeads(r, a, size) => push(&mut ops, Op::ReduceHeads(r, m(a), size)),
             Op::Fma(x, y, z) => push(&mut ops, Op::Fma(m(x), m(y), m(z))),
-            // a row's small vectors and repeats, which no anchored region
-            // holds (`kernels_ir::anchor` refuses them), as they are
-            Op::Pick(v, i) => push(&mut ops, Op::Pick(m(v), i)),
-            Op::Insert(v, i, x) => push(&mut ops, Op::Insert(m(v), i, m(x))),
-            Op::Splat(x, n) => push(&mut ops, Op::Splat(m(x), n)),
-            Op::Carry(a) => push(&mut ops, Op::Carry(m(a))),
-            Op::Repeat(count, carry, next) => push(&mut ops, Op::Repeat(count, m(carry), m(next))),
         };
         of.push(id);
     }

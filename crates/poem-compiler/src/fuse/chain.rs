@@ -165,25 +165,13 @@ pub const SKELETON_PLANES: usize = 5;
 #[must_use]
 pub fn skeleton_holds(trace: &Trace, chain: &Chain, width: u32) -> bool {
     let dtype = |v: poem_ir::ValueId| dtype_of(trace, v);
-    let Ok(types) = chain.region.types() else {
-        return false;
-    };
-    // a row's small vectors are read and landed an f32 at a time, held in
-    // no plane's registers
-    let vector_in = |k: usize| matches!(chain.region.params[k], Shape::Vector(_));
-    let vector_out =
-        |k: usize| matches!(types[chain.region.results[k] as usize].0, Shape::Vector(_));
-    let planes: usize = (0..chain.ins.len())
-        .filter(|&k| !chain.ins[k].one && !chain.ins[k].each && !vector_in(k))
-        .map(|k| {
-            if chain.ins[k].dtype == Dtype::F32 {
-                2
-            } else {
-                1
-            }
-        })
+    let planes: usize = chain
+        .ins
+        .iter()
+        .filter(|input| !input.one && !input.each)
+        .map(|input| if input.dtype == Dtype::F32 { 2 } else { 1 })
         .sum::<usize>()
-        + (0..chain.outs.len()).filter(|&k| !vector_out(k)).count();
+        + chain.outs.len();
     width.is_multiple_of(8)
         && width <= SKELETON_BLOCK * SKELETON_PER * 8
         && (planes_fit(planes, width) || streams(trace, chain))
@@ -192,15 +180,7 @@ pub fn skeleton_holds(trace: &Trace, chain: &Chain, width: u32) -> bool {
             Dtype::I32 => input.one || input.each,
             _ => false,
         })
-        && (0..chain.ins.len()).all(|k| !vector_in(k) || chain.ins[k].dtype == Dtype::F32)
-        && (0..chain.outs.len()).all(|k| {
-            dtype(chain.outs[k].value)
-                == if vector_out(k) {
-                    Dtype::F32
-                } else {
-                    Dtype::Bf16
-                }
-        })
+        && chain.outs.iter().all(|out| dtype(out.value) == Dtype::Bf16)
         && heads_fit(&chain.region, width)
 }
 
@@ -516,10 +496,6 @@ pub(super) fn row_of(trace: &Trace, node: u32) -> Option<Rows> {
         .map(|read| read.value)
         .collect::<Vec<_>>();
     ins.retain(|v| !parted.contains(v));
-    // what it reads or lands as a row's small vector is no row of it
-    let vectors = vectors_of(op);
-    ins.retain(|v| !vectors.contains(v));
-    outs.retain(|v| !vectors.contains(v));
     let mut rows: Option<Rows> = None;
     let mut width: Option<u64> = None;
     for (v, output) in ins
@@ -550,38 +526,12 @@ pub(super) fn row_of(trace: &Trace, node: u32) -> Option<Rows> {
     let held = rows?;
     for v in ins_of(op) {
         if let Some(Form::Shared { width }) = form(trace, v)
-            && !vectors.contains(&v)
             && (width == 0 || held.width % width != 0)
         {
             return None;
         }
     }
-    // a small vector holds at most a skeleton's
-    for &v in &vectors {
-        match form(trace, v) {
-            Some(Form::Rows { width, .. } | Form::Shared { width })
-                if width > 0 && width <= u64::from(kernels_ir::MAX_VECTOR) => {}
-            _ => return None,
-        }
-    }
     Some(held)
-}
-
-/// What `op` reads or lands as a row's small vector (a few values one a
-/// row, or a few every row reads), not as a row: a hyper-connection's gate
-/// logits, their scales and biases, and the mixes it lands.
-pub(super) fn vectors_of(op: &Operation) -> Vec<ValueId> {
-    match op {
-        Operation::Elemwise(Elemwise::HcGates {
-            normed,
-            scale,
-            base,
-            post_mix,
-            comb_mix,
-            ..
-        }) => vec![*normed, *scale, *base, *post_mix, *comb_mix],
-        _ => Vec::new(),
-    }
 }
 
 fn ins_of(op: &Operation) -> Vec<ValueId> {
@@ -652,20 +602,6 @@ pub(super) fn reads_of(op: &Operation, width: u32) -> Vec<Read> {
         }
         Operation::Gather(Gather::Embed { ids, table, .. }) => {
             vec![parted(*table, Some(*ids), 0), Read::plain(*ids)]
-        }
-        // each stream a part of the row of streams
-        Operation::Elemwise(Elemwise::HcGates {
-            normed,
-            streams,
-            scale,
-            base,
-            stream_count,
-            ..
-        }) => {
-            let mut reads = vec![Read::plain(*normed)];
-            reads.extend((0..*stream_count).map(|i| parted(*streams, None, i * width)));
-            reads.extend([Read::plain(*scale), Read::plain(*base)]);
-            reads
         }
         Operation::Gather(Gather::Select {
             table,
@@ -775,10 +711,6 @@ fn lowers(op: &Operation) -> bool {
             Elemwise::Clamp { bounds, .. } => matches!(bounds, Bounds::Fixed { .. }),
             // AttnRes's blend of a row's closed blocks and its prefix
             Elemwise::ResBlend { .. } => true,
-            // a hyper-connection's gates (its mixes, scales and biases a
-            // row's small vectors, its pre-mixed row the streams'), where
-            // they combine the streams (a Sinkhorn-normalized mix)
-            Elemwise::HcGates { comb: true, .. } => true,
             _ => false,
         },
         Operation::Fused(Fused::ResidualAddRmsnorm { .. }) => true,
@@ -1086,24 +1018,14 @@ fn lower(trace: &Trace, run: &[u32], escapes: &Escapes) -> Option<Chain> {
             rounds.push((id, narrow));
         }
     }
-    // What an op of the run reads as a row's small vector.
-    let vectors: Vec<ValueId> = run
-        .iter()
-        .flat_map(|&node| vectors_of(&trace.nodes[node as usize].op))
-        .collect();
     // A parameter is a row of the chain's width (a head's weight repeated
-    // across the row's heads by its plane), a scalar, or a small vector.
+    // across the row's heads by its plane), or a scalar.
     let params = ins
         .iter()
         .map(|input| {
             Some(match form(trace, input.value)? {
                 Form::One => Shape::Scalar,
                 Form::Each if input.by.is_none() && input.from == 0 => Shape::Scalar,
-                Form::Rows { width, .. } | Form::Shared { width }
-                    if vectors.contains(&input.value) =>
-                {
-                    Shape::Vector(u32::try_from(width).ok()?)
-                }
                 _ => Shape::Row,
             })
         })
@@ -1217,33 +1139,6 @@ impl Builder {
 
     fn set(&mut self, v: ValueId, id: u32) {
         self.of.insert(v, id);
-    }
-
-    /// A small vector of the scalars `values`, in order.
-    fn packed(&mut self, values: &[u32]) -> u32 {
-        let n = u32::try_from(values.len()).unwrap_or(u32::MAX);
-        let mut v = self.push(Op::Splat(values[0], n));
-        for (i, &x) in (1u32..).zip(&values[1..]) {
-            v = self.push(Op::Insert(v, i, x));
-        }
-        v
-    }
-
-    /// An `m` x `m` matrix of scalars (row by row) with each row (`rows`)
-    /// or each column divided by its sum plus `eps`, the sum taken in
-    /// order.
-    fn normalized(&mut self, c: &mut [u32], m: u32, eps: u32, rows: bool) {
-        let at = |line: u32, k: u32| (if rows { line * m + k } else { k * m + line }) as usize;
-        for line in 0..m {
-            let mut sum = c[at(line, 0)];
-            for k in 1..m {
-                sum = self.push(Op::Binary(Binary::Add, sum, c[at(line, k)]));
-            }
-            let sum = self.push(Op::Binary(Binary::Add, sum, eps));
-            for k in 0..m {
-                c[at(line, k)] = self.push(Op::Binary(Binary::Div, c[at(line, k)], sum));
-            }
-        }
     }
 
     /// `1 / (1 + e^-t)`.
@@ -1507,99 +1402,6 @@ impl Builder {
                 let turn = rotation(self.width, *head_dim, *theta, turn)?;
                 let out = self.b.rotate(self.get(*q)?, self.get(*positions)?, &turn);
                 self.set(*q_out, out);
-            }
-            // A hyper-connection's gates, as the hand kernel computes them:
-            // each pre and post gate a sigmoid of its logit (its mix scaled
-            // and biased), the pre gates plus eps; the combine a softmax of
-            // each row of its logits plus eps, its columns normalized, then
-            // `sinkhorn - 1` passes normalizing its rows and its columns
-            // (each sum plus eps) as a repeat over the small vector; and
-            // the pre-mixed row the pre-weighted sum of the streams.
-            Elemwise::HcGates {
-                normed,
-                streams,
-                scale,
-                base,
-                stream_count,
-                gate_eps,
-                alpha,
-                sinkhorn,
-                comb: true,
-                x,
-                post_mix,
-                comb_mix,
-            } => {
-                let m = *stream_count;
-                let (mix, sc, bs) = (self.get(*normed)?, self.get(*scale)?, self.get(*base)?);
-                let eps = self.konst(*gate_eps);
-                let logit = |b: &mut Self, i: u32, s: u32| {
-                    let x = b.push(Op::Pick(mix, i));
-                    let k = b.push(Op::Pick(sc, s));
-                    let scaled = b.push(Op::Binary(Binary::Mul, x, k));
-                    let bias = b.push(Op::Pick(bs, i));
-                    b.push(Op::Binary(Binary::Add, scaled, bias))
-                };
-                let pre: Vec<u32> = (0..m)
-                    .map(|i| {
-                        let l = logit(self, i, 0);
-                        let g = self.sigmoid(l);
-                        self.push(Op::Binary(Binary::Add, g, eps))
-                    })
-                    .collect();
-                let a = self.konst(*alpha);
-                let post: Vec<u32> = (0..m)
-                    .map(|i| {
-                        let l = logit(self, m + i, 1);
-                        let g = self.sigmoid(l);
-                        self.push(Op::Binary(Binary::Mul, g, a))
-                    })
-                    .collect();
-                let post = self.packed(&post);
-                self.set(*post_mix, post);
-                let mut c: Vec<u32> = (0..m * m).map(|t| logit(self, 2 * m + t, 2)).collect();
-                for r in 0..m {
-                    let row: Vec<u32> = (0..m).map(|j| c[(r * m + j) as usize]).collect();
-                    let most = row[1..]
-                        .iter()
-                        .fold(row[0], |acc, &v| self.push(Op::Binary(Binary::Max, acc, v)));
-                    let e: Vec<u32> = row
-                        .iter()
-                        .map(|&v| {
-                            let shifted = self.push(Op::Binary(Binary::Sub, v, most));
-                            self.push(Op::Unary(Unary::Exp, shifted))
-                        })
-                        .collect();
-                    let sum = e[1..]
-                        .iter()
-                        .fold(e[0], |acc, &v| self.push(Op::Binary(Binary::Add, acc, v)));
-                    for j in 0..m {
-                        let q = self.push(Op::Binary(Binary::Div, e[j as usize], sum));
-                        c[(r * m + j) as usize] = self.push(Op::Binary(Binary::Add, q, eps));
-                    }
-                }
-                self.normalized(&mut c, m, eps, false);
-                let mut combined = self.packed(&c);
-                if *sinkhorn > 1 {
-                    let carry = self.push(Op::Carry(combined));
-                    let mut c: Vec<u32> =
-                        (0..m * m).map(|t| self.push(Op::Pick(carry, t))).collect();
-                    self.normalized(&mut c, m, eps, true);
-                    self.normalized(&mut c, m, eps, false);
-                    let next = self.packed(&c);
-                    combined = self.push(Op::Repeat(*sinkhorn - 1, carry, next));
-                }
-                self.set(*comb_mix, combined);
-                let width = self.width;
-                let mut sum = None;
-                for (i, &g) in (0..m).zip(&pre) {
-                    let stream = self.part(*streams, i * width)?;
-                    let term = self.push(Op::Binary(Binary::Mul, g, stream));
-                    sum = Some(match sum {
-                        None => term,
-                        Some(acc) => self.push(Op::Binary(Binary::Add, acc, term)),
-                    });
-                }
-                self.set(*x, sum?);
             }
             // AttnRes's blend: each candidate (the closed blocks, then the
             // prefix) scaled by the norm's weight and the projection and

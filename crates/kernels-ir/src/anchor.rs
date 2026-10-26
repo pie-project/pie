@@ -507,11 +507,6 @@ impl Pointwise {
                 // epilogue's where the row is one span (a row one head
                 // wide, [`MAX_SPAN`] at most).
                 Op::Reduce(..) => space == Space::Product && inner <= MAX_SPAN,
-                // A row's small vectors and its repeats are the row skeleton's
-                // per-row work, no tile's.
-                Op::Pick(..) | Op::Insert(..) | Op::Splat(..) | Op::Carry(_) | Op::Repeat(..) => {
-                    false
-                }
             };
             if !pointwise {
                 return Err(AnchorError::Across { space, op: at });
@@ -612,7 +607,7 @@ impl Pointwise {
         let mut alone = vec![false; params as usize + region.ops.len()];
         for (at, op) in region.ops.iter().enumerate() {
             alone[params as usize + at] = match op {
-                Op::Peer(..) | Op::Reduce(..) | Op::ReduceHeads(..) | Op::Carry(..) => false,
+                Op::Peer(..) | Op::Reduce(..) | Op::ReduceHeads(..) => false,
                 op => op.args().iter().all(|&a| a >= params && alone[a as usize]),
             };
         }
@@ -874,11 +869,6 @@ impl Anchored {
                 Op::ReduceHeads(r, a, size) => Op::ReduceHeads(r, at(a), size),
                 Op::Fma(x, y, z) => Op::Fma(at(x), at(y), at(z)),
                 Op::Peer(src, c) => Op::Peer(at(src), at(c)),
-                Op::Pick(v, i) => Op::Pick(at(v), i),
-                Op::Insert(v, i, x) => Op::Insert(at(v), i, at(x)),
-                Op::Splat(x, n) => Op::Splat(at(x), n),
-                Op::Carry(a) => Op::Carry(at(a)),
-                Op::Repeat(count, carry, next) => Op::Repeat(count, at(carry), at(next)),
             });
         }
         let mut shapes = region.params.clone();

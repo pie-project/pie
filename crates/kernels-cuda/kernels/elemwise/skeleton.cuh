@@ -104,8 +104,7 @@ struct OrderOf<B, decltype(static_cast<void>(B::vector(0u)))> {
 };
 
 template <int BLOCK, int LANES, int VECS, int IN, int OUT, unsigned ONES, unsigned long long DT,
-          bool READ_ONLY, unsigned LATE = 0u, class ORDER = InOrder, unsigned STREAM = 0u,
-          unsigned VECTORS = 0u>
+          bool READ_ONLY, unsigned LATE = 0u, class ORDER = InOrder, unsigned STREAM = 0u>
 struct RowSkeleton {
     static_assert((LANES & (LANES - 1)) == 0 && LANES <= BLOCK && (LANES <= 32 || LANES % 32 == 0),
                   "a row is a power-of-two run of a block's threads");
@@ -124,10 +123,6 @@ struct RowSkeleton {
     float* row;
     float* tab;
     uint4* dst[OUT];
-    // Each result's first f32 a row, where it is a small vector one a row.
-    float* vdst[OUT];
-    // Each small-vector parameter's (`VECTORS`) first f32 a row.
-    const float* vsrc[IN];
     // Each result's window of vectors and whether its row lands at all (a
     // paged row past its page, or not live, does not).
     int from[OUT];
@@ -205,21 +200,10 @@ struct RowSkeleton {
                     static_cast<bf16*>(const_cast<void*>(planes.out[k].base)) + row_at);
             }
         }
-#pragma unroll
-        for (int k = 0; k < OUT; ++k) {
-            vdst[k] = static_cast<float*>(const_cast<void*>(planes.out[k].base)) +
-                      start_of(planes.out[k], of, part, width, false);
-        }
         if (!live) return;
 #pragma unroll
         for (int k = 0; k < IN; ++k) {
             const Plane& plane = planes.in[k];
-            if ((VECTORS >> k) & 1u) {
-                // a small vector one a row: its row's first f32, read where
-                // the body asks
-                vsrc[k] = static_cast<const float*>(plane.base) + start_of(plane, of, part, width, false);
-                continue;
-            }
             const long long at = start_of(plane, of, part, width, !((ONES >> k) & 1u));
             if ((ONES >> k) & 1u) {
                 if (dtype(k) == kI32) {
@@ -456,17 +440,6 @@ struct RowSkeleton {
 
     __device__ __forceinline__ unsigned thread() const { return threadIdx.x; }
 
-    // Value `i` of small-vector parameter `k`, one a row (every thread of
-    // the row reading it).
-    __device__ __forceinline__ float vec(int k, int i) const { return live ? __ldg(vsrc[k] + i) : 0.f; }
-
-    // Value `i` of small-vector result `K`, one a row: the row's first
-    // thread lands it, the rest computing it alike.
-    template <int K>
-    __device__ __forceinline__ void st_vec(int i, float v) {
-        if (live && lane == 0) vdst[K][i] = v;
-    }
-
     // Result `K`'s row to memory: a body flushes a result once its last
     // element is written, so the store overlaps whatever follows.
     template <int K>
@@ -505,7 +478,7 @@ struct RowSkeleton {
 // memory, and one that shares its row BLOCK * VECS * 8 floats more.
 template <class Body, int BLOCK, int LANES, int VECS, int IN, int OUT, unsigned ONES = 0u,
           unsigned long long DT = 0ull, bool READ_ONLY = false, unsigned LATE = 0u,
-          unsigned STREAM = 0u, unsigned VECTORS = 0u>
+          unsigned STREAM = 0u>
 __global__ void __launch_bounds__(BLOCK) row_skeleton(
     const Planes<IN, OUT> planes,
     const Body body,
@@ -535,7 +508,7 @@ __global__ void __launch_bounds__(BLOCK) row_skeleton(
     __shared__ float buf[(VECS > kBatch ? VECS : kBatch) * (BLOCK / 32) + 1];
     extern __shared__ float shared[];
     RowSkeleton<BLOCK, LANES, VECS, IN, OUT, ONES, DT, READ_ONLY, LATE,
-                typename OrderOf<Body>::type, STREAM, VECTORS>
+                typename OrderOf<Body>::type, STREAM>
         f(
         planes, of, part, row < live_rows, buf, shared);
     body(f);
