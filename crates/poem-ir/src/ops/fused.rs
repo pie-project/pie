@@ -60,8 +60,6 @@ pub enum NormKind {
     Rmsnorm { head_dim: u32, eps: f32 },
 }
 
-/// Ops only the compiler forms, from the primitive ones a model writes; each
-/// is a kernel some backend ships.
 /// How a [`Fused::Region`] reads one of its inputs: row `r` reads row
 /// `ids[r]` of it where `by` names the ids (an index into the op's inputs,
 /// an i32 a row), else its own; and its columns from `from` on (one half of
@@ -72,6 +70,8 @@ pub struct RegionRead {
     pub from: u32,
 }
 
+/// Ops only the compiler forms, from the primitive ones a model writes; each
+/// is a kernel some backend ships.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Op)]
 #[op(group = "fused")]
 pub enum Fused {

@@ -22,8 +22,8 @@
 //!   shape class (warps, rows, splits) and the body's planes. The disk cache
 //!   keys the unit's text, the headers and the instantiation, as it does a
 //!   carried unit's.
-//! - **Loading.** A kernel loads on its first fire, as the carried kernels
-//!   these skeletons replace did: the plain store's body is fixed, and the
+//! - **Loading.** A kernel loads on its first fire, as a carried kernel
+//!   does: the plain store's body is fixed, and the
 //!   tuner fires it before a capture. An anchored region a load forms
 //!   loads with the model, every kernel a fire of it may take
 //!   ([`Epilogue::load_every`]).

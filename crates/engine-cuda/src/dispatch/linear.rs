@@ -413,8 +413,7 @@ impl Run<'_> {
         }
     }
 
-    /// An anchored region's input planes (the op's values in order, a
-    /// normed operand's row scale the contraction's own), its results'
+    /// An anchored region's input planes (the op's values in order), its results'
     /// (the op's values in order, a paged result its cache's keys or values:
     /// a bf16 or unit-scaled e4m3 pool of rows a cell, every row live where
     /// its `row_valid` says) and where its cache rows live.

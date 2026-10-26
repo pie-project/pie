@@ -540,10 +540,9 @@ pub struct GemmWorkspaceMb(pub u32);
 #[decision(id = "kernel.gemm.heuristics", constant(range(1..=32)), default = 8, tune = search)]
 pub struct GemmHeuristics(pub u32);
 
-/// The most rows the skinny bf16 skeleton serves: the most a fused hand rule
-/// (GEGLU, soft-capped heads) fires it at, and the most a dense bf16 product
-/// may time it for beside cuBLAS's algorithms. Its tile holds 64; 0 never
-/// takes it.
+/// The most rows the skinny bf16 skeleton serves: the most an anchored
+/// region fires it at, and the most a dense bf16 product may time it for
+/// beside cuBLAS's algorithms. Its tile holds 64; 0 never takes it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Decision)]
 #[decision(id = "kernel.gemm.skinny_rows", constant(range(0..=64)), default = 64, tune = search)]
 pub struct GemmSkinnyRows(pub u32);

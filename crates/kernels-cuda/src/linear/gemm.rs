@@ -60,7 +60,7 @@ pub fn matmul_f32(ctx: &Ctx, act: Tensor, w: Tensor, y: &mut Tensor) -> Result<(
 /// forces a slower product. A shape no skeleton covers (or one a capture meets
 /// untimed) runs that unfused leg. False, landing nothing, only where the
 /// row skeleton does not carry the leg either ([`crate::linear::skeleton::serves`]
-/// says which do): the caller's unfused ops serve it then.
+/// says which do), which the fold never forms.
 #[allow(clippy::too_many_arguments)]
 pub fn anchored(
     ctx: &Ctx,
@@ -165,7 +165,7 @@ pub fn epilogue(
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (ins, outs, paging);
+        let _ = (ctx, ins, outs, paging);
         Err(crate::jit::runtimeless(op))
     }
 }

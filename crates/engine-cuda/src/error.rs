@@ -135,8 +135,8 @@ pub enum Fault {
         lowering: String,
     },
 
-    /// A `fused.region` the row skeleton does not take: poem-compiler's fold
-    /// forms only regions it does, so this names the compiler's bug.
+    /// A generated region the skeletons do not take: the fold forms only what
+    /// their `serves` admits, so this names the fold's bug.
     Region {
         node: u32,
         body: u64,

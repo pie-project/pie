@@ -746,7 +746,7 @@ mod tests {
                 prefill_lattice_steps: 4,
             }
         );
-        // The compiler's prices as before, but that CUDA folds each chain
+        // The compiler's prices, but that CUDA folds each chain
         // into a generated row kernel and each product's epilogue into its
         // contraction skeleton: its rules hold no residual norm, bias or soft
         // cap.

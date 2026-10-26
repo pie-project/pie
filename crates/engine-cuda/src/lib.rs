@@ -103,7 +103,7 @@ pub static FUSIONS: std::sync::LazyLock<Vec<poem_compiler::fuse::Rule>> =
         ]
     });
 
-/// The hand rules CUDA no longer holds: every site one forms folds into a
+/// The hand rules CUDA does not hold: every site one forms folds into a
 /// generated row kernel or an anchored region instead.
 #[cfg(not(feature = "rocm"))]
 #[must_use]
@@ -230,7 +230,7 @@ mod tests {
         assert!(stale.is_empty(), "named by no op: {stale:?}");
     }
 
-    /// The hand rules CUDA no longer holds, their chains generated row
+    /// The hand rules CUDA does not hold, their chains generated row
     /// kernels and their products' epilogues anchored regions: on every
     /// catalog deployment, fused by this backend's rules and folded (the
     /// anchors, then the chains), none of them finds a match left that it

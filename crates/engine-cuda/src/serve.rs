@@ -989,7 +989,8 @@ impl Shell {
         self.armed.as_ref()
     }
 
-    /// The generated kernels this load fires (`compiler.synth_regions`).
+    /// The generated kernels this load fires (`compiler.synth_regions` and
+    /// `compiler.synth_anchors`).
     #[must_use]
     pub fn regions(&self) -> &crate::synth::Regions {
         &self.regions
