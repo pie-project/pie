@@ -141,10 +141,10 @@ pub fn epilogue(
     dtype_dispatch!(op, y.dtype, { Bf16 => () });
     let parts = epi.parts().max(1);
     let tile = y.width / parts;
-    if y.width != tile * parts || !epi.rounds() || epi.norm().is_some() {
+    if y.width != tile * parts || !epi.rounds() {
         return Err(crate::jit::refuse(
             op,
-            "an epilogue over a landed product reads its bf16 parts as stored, unnormed",
+            "an epilogue over a landed product reads its bf16 parts as stored",
         ));
     }
     if epi.pages() && paging.is_none() {

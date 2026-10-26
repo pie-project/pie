@@ -48,21 +48,13 @@ pub(crate) static NONE: Regions = Regions {
 
 /// `trace` with each matmul and the pointwise ops over its product folded
 /// into one `fused.anchored` op where the contraction skeletons serve it
-/// (`compiler.synth_anchors`), and the anchored regions by key. Where `folds`
-/// is given (`compiler.fold_norms`), an anchor over an RMS norm's row whose
-/// bank it takes folds the norm in, its gain folded into the bank at load
-/// ([`crate::weights::Weights::fold_gains`]).
+/// (`compiler.synth_anchors`), and the anchored regions by key.
 #[cfg(not(feature = "rocm"))]
 #[must_use]
-pub fn fold_anchors(
-    trace: Trace,
-    folds: Option<poem_compiler::fuse::anchor::Folds<'_>>,
-) -> (Trace, BTreeMap<u64, Anchored>) {
-    poem_compiler::fuse::anchor::fold_with(
-        trace,
-        &|anchored, ins, outs| kernels_cuda::linear::skeleton::serves(anchored, ins, outs).is_ok(),
-        folds,
-    )
+pub fn fold_anchors(trace: Trace) -> (Trace, BTreeMap<u64, Anchored>) {
+    poem_compiler::fuse::anchor::fold(trace, &|anchored, ins, outs| {
+        kernels_cuda::linear::skeleton::serves(anchored, ins, outs).is_ok()
+    })
 }
 
 /// Whether this backend's row kernels serve `region` over a chain's planes

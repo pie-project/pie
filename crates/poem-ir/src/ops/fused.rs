@@ -755,11 +755,7 @@ pub enum Fused {
     /// The product itself is no value. `key` is the anchored region's own
     /// key (kernels-ir's `Anchored::key`), the one it is held under in the
     /// compiled model; each backend fills its contraction's hooks from it.
-    /// No output lands over an input. Where the region norms its operand's
-    /// rows (an RMS norm rewritten as a scale of each row's products), `act`
-    /// is the norm's input and `gain` its weight, which a load folds into
-    /// `w` once, in place, as the region declares (kernels-ir's
-    /// `fold_bank`): `w` read by this op alone. Where the region lands a
+    /// No output lands over an input. Where the region lands a
     /// result in a paged cache (kernels-ir's `Paged`: a key or a value row
     /// written at its page and slot, the slot mapping among `ins`), `cache`
     /// is that cache and the result names no value of `outs`.
@@ -773,9 +769,6 @@ pub enum Fused {
         key: u64,
         #[output]
         outs: Vec<ValueId>,
-        #[serde(default)]
-        #[input]
-        gain: Option<ValueId>,
         #[serde(default)]
         #[input(CACHE)]
         cache: Option<ValueId>,
@@ -963,20 +956,9 @@ mod tests {
             ins: vec![v(3)],
             key: 0x5eed,
             outs: vec![v(4)],
-            gain: None,
             cache: None,
         };
         assert_eq!(operands(&anchored), (vec![1, 2, 3], vec![4], vec![]));
-        let normed = Fused::Anchored {
-            act: v(1),
-            w: v(2),
-            ins: vec![v(3)],
-            key: 0x5eed,
-            outs: vec![v(4)],
-            gain: Some(v(5)),
-            cache: None,
-        };
-        assert_eq!(operands(&normed), (vec![1, 2, 3, 5], vec![4], vec![]));
         assert_eq!(anchored.name(), "fused.anchored");
     }
 

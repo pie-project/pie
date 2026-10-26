@@ -35,8 +35,8 @@ pub mod schedule;
 pub mod skeleton;
 
 pub use anchor::{
-    Anchored, CacheDtype, CachePlane, Contraction, Gain, Input, Layout, Paged, Pointwise, Quant, RowNorm,
-    Space, Window,
+    Anchored, CacheDtype, CachePlane, Contraction, Input, Layout, Paged, Pointwise, Quant, Space,
+    Window,
 };
 pub use kernel::{
     Expr, HeadAssign, Kernel, Loop, Operand, Partial, Phase, RowAssign, Table, Total, Uniform,

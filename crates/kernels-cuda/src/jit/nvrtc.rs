@@ -508,16 +508,11 @@ mod tests {
             (
                 "linear/contract.cu",
                 &[
-                    "::pie::linear::gemv_skeleton<::pie::linear::Store, 4, 4, 1, 0, 1, true, false>",
-                    "::pie::linear::gemv_skeleton<::pie::linear::Store, 4, 4, 1, 0, 1, false, true>",
-                    "::pie::linear::gemv_splitk_skeleton<::pie::linear::Store, 8, 1, 1, 0, 1, true, false>",
-                    "::pie::linear::gemv_splitk_skeleton<::pie::linear::Store, 8, 1, 1, 0, 1, false, true>",
-                    "::pie::linear::rows_skeleton<::pie::linear::Store, 4, 8, 1, 1, 0, 1, true, false>",
-                    "::pie::linear::rows_skeleton<::pie::linear::Store, 4, 4, 2, 1, 0, 1, false, true>",
-                    "::pie::linear::skinny_skeleton<::pie::linear::Store, 4, 2, 128, 1, 0, 1, 0, 1, true, false>",
-                    "::pie::linear::skinny_skeleton<::pie::linear::Store, 4, 2, 128, 1, 0, 1, 0, 1, false, true>",
-                    "::pie::linear::skinny_skeleton<::pie::linear::Store, 8, 2, 64, 128, 0, 1, 0, 1, false, false>",
-                    "::pie::linear::norm_scales<256>",
+                    "::pie::linear::gemv_skeleton<::pie::linear::Store, 4, 4, 1, 0, 1, true>",
+                    "::pie::linear::gemv_splitk_skeleton<::pie::linear::Store, 8, 1, 1, 0, 1, true>",
+                    "::pie::linear::rows_skeleton<::pie::linear::Store, 4, 8, 1, 1, 0, 1, true>",
+                    "::pie::linear::skinny_skeleton<::pie::linear::Store, 4, 2, 128, 1, 0, 1, 0, 1, true>",
+                    "::pie::linear::skinny_skeleton<::pie::linear::Store, 8, 2, 64, 128, 0, 1, 0, 1, false>",
                 ],
             ),
             (

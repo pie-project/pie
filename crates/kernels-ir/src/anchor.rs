@@ -106,9 +106,7 @@ pub struct Contraction {
     /// the f32 accumulator, where it only adds a bias to it (a linear's bias
     /// sits inside its sum, as addmm's does), and only the epilogue's own
     /// values round. The plain store rounds the product to the dtype it
-    /// lands. Under a folded norm ([`Anchored::normed`]) the row's scale is
-    /// the rewrite's own: the sum keeps its accumulator through it and the
-    /// scaled product rounds where the product did.
+    /// lands.
     pub acc: Option<Dtype>,
 }
 
@@ -137,9 +135,6 @@ pub enum Input {
     Row,
     /// One value for the whole tile (a layer's scale).
     One,
-    /// The operand row's norm scale the contraction computes as it streams
-    /// the row ([`RowNorm`]): one value a row, no plane.
-    Norm,
 }
 
 impl Input {
@@ -149,7 +144,7 @@ impl Input {
     pub const fn shape(self) -> Shape {
         match self {
             Input::Tile | Input::Column | Input::Head(_) => Shape::Row,
-            Input::Row | Input::One | Input::Norm => Shape::Scalar,
+            Input::Row | Input::One => Shape::Scalar,
         }
     }
 }
@@ -288,30 +283,6 @@ pub enum CachePlane {
     Values,
 }
 
-/// How a norm's gain `g` folds into the bank the contraction reads: none
-/// (a norm of no weight), `w ⊙ g`, or `w ⊙ (1 + g)` (Gemma's).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Gain {
-    None,
-    Scale,
-    PlusOne,
-}
-
-/// The operand's rows RMS-normed before the contraction, rewritten as a
-/// scale of each row's products (`rmsnorm(a, g) · wᵀ = r ⊙ (a · w'ᵀ)`):
-/// the contraction reads each row as it is stored and computes its scale
-/// `r[m] = rsqrt(Σₖ a[m][k]² / k + eps)` as it streams the row, which the
-/// epilogue reads as its [`Input::Norm`]; and it reads the bank as the
-/// declared transform [`fold_bank`] lands it, the gain folded in and each
-/// weight rounded once more to the bank's dtype. That rounding is the
-/// rewrite's own, where the norm's rounding of its normed row was the
-/// program's: a fold is held to the unfolded program within a tolerance.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct RowNorm {
-    pub eps: f32,
-    pub gain: Gain,
-}
-
 /// A contraction with its prologue and epilogue.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Anchored {
@@ -321,9 +292,6 @@ pub struct Anchored {
     /// The window of the tile each result lands, one a result, or none:
     /// every result lands every column.
     pub windows: Vec<Window>,
-    /// The operand's rows normed, their scale the epilogue's
-    /// [`Input::Norm`] and the gain folded into the bank.
-    pub norm: Option<RowNorm>,
     /// Where each result lands in a paged cache ([`Paged`]), one a result,
     /// or none: every result its own plane.
     pub paged: Vec<Option<Paged>>,
@@ -372,10 +340,6 @@ pub enum AnchorError {
     /// scale no finite positive one, or pagings not one a result: a result
     /// a cache cannot address by row.
     Paged { result: u32 },
-    /// A row's norm scale read with no norm declared, or a norm declared and
-    /// its scale read by no epilogue (the products landed unnormed), or a
-    /// norm over a prologue's operand (the scale is of the row as stored).
-    Norm,
 }
 
 impl fmt::Display for AnchorError {
@@ -426,10 +390,6 @@ impl fmt::Display for AnchorError {
                 f,
                 "result {result} lands in a cache it cannot address by row: its page or slot is \
                  no input one value a row, or its scale no finite positive one"
-            ),
-            AnchorError::Norm => f.write_str(
-                "a row's norm scale read with no norm declared, a declared norm whose scale \
-                 no epilogue reads, or a norm beside a prologue",
             ),
             AnchorError::Result { space, result } => write!(
                 f,
@@ -745,7 +705,6 @@ impl Anchored {
             prologue: None,
             epilogue: None,
             windows: Vec::new(),
-            norm: None,
             paged: Vec::new(),
         }
     }
@@ -780,17 +739,6 @@ impl Anchored {
         }
         if let Some(epilogue) = &self.epilogue {
             epilogue.verify(Space::Product, c.n, c.layout.parts())?;
-        }
-        let reads_norm = |p: &Pointwise| p.inputs.contains(&Input::Norm);
-        if self.prologue.as_ref().is_some_and(reads_norm)
-            || self.norm.is_some()
-                != self.epilogue.as_ref().is_some_and(reads_norm)
-            || (self.norm.is_some() && self.prologue.is_some())
-        {
-            return Err(AnchorError::Norm);
-        }
-        if self.norm.is_some_and(|norm| !(norm.eps >= 0.0 && norm.eps.is_finite())) {
-            return Err(AnchorError::Norm);
         }
         if !self.paged.is_empty() {
             let inputs = self.epilogue.as_ref().map_or(&[][..], |e| &e.inputs[..]);
@@ -827,85 +775,6 @@ impl Anchored {
             }
         }
         Ok(())
-    }
-
-    /// The same function of rows normed by `norm` before the contraction, as
-    /// one over the rows as they are stored ([`RowNorm`]): each part's
-    /// product scaled by the row's norm scale (an [`Input::Norm`] appended
-    /// to the epilogue's inputs) before the epilogue reads it, the gain
-    /// folded into the bank; a product that rounded before the epilogue
-    /// rounds once scaled (the sum keeps its accumulator through the
-    /// rewrite's scale). `None` where it has no epilogue (a plain store's
-    /// products would land unnormed), a prologue, or a norm already.
-    #[must_use]
-    pub fn normed(&self, norm: RowNorm) -> Option<Anchored> {
-        if self.norm.is_some() || self.prologue.is_some() {
-            return None;
-        }
-        let epi = self.epilogue.as_ref()?;
-        let parts = self.contraction.layout.parts();
-        let region = &epi.region;
-        let params = u32::try_from(region.params.len()).ok()?;
-        // The scale, then each part's product times it; every later value
-        // moved past the scale and the parts' products.
-        let scale = params;
-        let at = |v: ValueId| {
-            if v < parts {
-                params + 1 + v
-            } else if v < params {
-                v
-            } else {
-                v + 1 + parts
-            }
-        };
-        let mut ops: Vec<Op> = (0..parts)
-            .map(|p| Op::Binary(crate::region::Binary::Mul, p, scale))
-            .collect();
-        for op in &region.ops {
-            ops.push(match *op {
-                Op::Const(l) => Op::Const(l),
-                Op::Column => Op::Column,
-                Op::Unary(u, a) => Op::Unary(u, at(a)),
-                Op::Binary(b, x, y) => Op::Binary(b, at(x), at(y)),
-                Op::Select(c, x, y) => Op::Select(at(c), at(x), at(y)),
-                Op::Cast(a, e) => Op::Cast(at(a), e),
-                Op::Broadcast(a) => Op::Broadcast(at(a)),
-                Op::Reduce(r, a) => Op::Reduce(r, at(a)),
-                Op::ReduceHeads(r, a, size) => Op::ReduceHeads(r, at(a), size),
-                Op::Fma(x, y, z) => Op::Fma(at(x), at(y), at(z)),
-                Op::Peer(src, c) => Op::Peer(at(src), at(c)),
-            });
-        }
-        let mut shapes = region.params.clone();
-        shapes.push(Shape::Scalar);
-        let mut inputs = epi.inputs.clone();
-        inputs.push(Input::Norm);
-        // The scale is the rewrite's: the sum keeps its accumulator through
-        // it, and each scaled product rounds where the product did (the
-        // program's linear over the normed rows lands it so).
-        let mut rounds: Vec<(ValueId, Dtype)> =
-            region.rounds.iter().map(|&(v, d)| (at(v), d)).collect();
-        if let Some(dtype) = self.contraction.acc {
-            rounds.extend((0..parts).map(|p| (params + 1 + p, dtype)));
-        }
-        Some(Anchored {
-            contraction: Contraction {
-                acc: None,
-                ..self.contraction
-            },
-            epilogue: Some(Pointwise {
-                region: Region {
-                    width: region.width,
-                    params: shapes,
-                    ops,
-                    results: region.results.iter().map(|&r| at(r)).collect(),
-                    rounds,
-                },
-                inputs,
-            }),
-            norm: Some(norm),
-            ..self.clone()
-        })
     }
 
     /// The window result `k` lands: its own, or every column.
@@ -985,21 +854,15 @@ fn row_args(
     rows: usize,
     inner: usize,
     row: usize,
-    norm: Option<f32>,
 ) -> Result<Vec<Arg>, EvalError> {
-    let stated = inputs.iter().filter(|i| **i != Input::Norm).count();
-    if given.len() != stated {
-        let input = u32::try_from(given.len().min(stated)).unwrap_or(u32::MAX);
+    if given.len() != inputs.len() {
+        let input = u32::try_from(given.len().min(inputs.len())).unwrap_or(u32::MAX);
         return Err(EvalError::Given { space, input });
     }
     let mut given = given.iter();
     let mut args = Vec::with_capacity(inputs.len());
     for (input, kind) in (0u32..).zip(inputs) {
         let wrong = EvalError::Given { space, input };
-        if *kind == Input::Norm {
-            args.push(Arg::Scalar(norm.ok_or(wrong)?));
-            continue;
-        }
         let values = given.next().ok_or_else(|| wrong.clone())?;
         args.push(match (kind, values) {
             (Input::Tile, Given::Tile(v)) if v.len() == rows * inner => {
@@ -1017,45 +880,9 @@ fn row_args(
     Ok(args)
 }
 
-/// The bank a contraction under `norm` reads (`parts · n x k`, row-major):
-/// each weight `w[r][k]` times the gain's `g[k]` (or `1 + g[k]`), computed
-/// in f32 and rounded once to bf16, the bank's dtype. The checkpoint's bank
-/// is `w`, the norm's gain `g` (`k` of them, none where the norm has none).
-#[must_use]
-pub fn fold_bank(norm: &RowNorm, w: &[f32], g: &[f32]) -> Vec<f32> {
-    let k = g.len();
-    w.iter()
-        .enumerate()
-        .map(|(i, &x)| {
-            let gain = match norm.gain {
-                Gain::None => return x,
-                Gain::Scale => g[i % k],
-                Gain::PlusOne => 1.0 + g[i % k],
-            };
-            round_bf16(x * gain)
-        })
-        .collect()
-}
-
-/// Each row's norm scale under `norm`: its squares (f32) summed in f64 and
-/// rounded to f32 once, as the interpreter sums a reduction, over `k`, the
-/// `eps` added, its `rsqrt`.
-#[must_use]
-pub fn norm_scales(norm: &RowNorm, a: &[f32], k: usize) -> Vec<f32> {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
-    a.chunks(k)
-        .map(|row| {
-            let sum = row.iter().fold(0f64, |s, x| s + f64::from(x * x)) as f32;
-            1.0 / (sum / k as f32 + norm.eps).sqrt()
-        })
-        .collect()
-}
-
 /// `anchored` over `m` rows: `a` the operand (`m x k`), `w` the weight
-/// (`parts · n x k`, as the contraction reads it: under a norm, the bank
-/// [`fold_bank`] lands), each row-major, and each region's inputs (a head's
-/// vector given as a column's, its `size` entries; a row's norm scale the
-/// contraction's own, given none). Its results come back
+/// (`parts · n x k`), each row-major, and each region's inputs (a head's
+/// vector given as a column's, its `size` entries). Its results come back
 /// each `m x n` (or `m` rows of its window), row-major, as the declared
 /// roundings land them.
 pub fn eval(
@@ -1077,7 +904,7 @@ pub fn eval(
     if let Some(pro) = &anchored.prologue {
         for row in 0..m {
             let mut args = vec![Arg::Row(a[row * k..(row + 1) * k].to_vec())];
-            args.extend(row_args(Space::Operand, &pro.inputs, prologue, m, k, row, None)?);
+            args.extend(row_args(Space::Operand, &pro.inputs, prologue, m, k, row)?);
             let fed = interp::eval(&pro.region, &args).map_err(EvalError::Interp)?;
             operand[row * k..(row + 1) * k].copy_from_slice(&fed[0]);
         }
@@ -1107,23 +934,13 @@ pub fn eval(
     let Some(epi) = &anchored.epilogue else {
         return Ok(windowed(anchored, products, m, n));
     };
-    let scales = anchored.norm.map(|norm| norm_scales(&norm, a, k));
     let mut out = vec![vec![0f32; m * n]; epi.region.results.len()];
     for row in 0..m {
         let mut args: Vec<Arg> = products
             .iter()
             .map(|plane| Arg::Row(plane[row * n..(row + 1) * n].to_vec()))
             .collect();
-        let norm = scales.as_ref().map(|s| s[row]);
-        args.extend(row_args(
-            Space::Product,
-            &epi.inputs,
-            epilogue,
-            m,
-            n,
-            row,
-            norm,
-        )?);
+        args.extend(row_args(Space::Product, &epi.inputs, epilogue, m, n, row)?);
         let landed = interp::eval(&epi.region, &args).map_err(EvalError::Interp)?;
         for (plane, values) in out.iter_mut().zip(landed) {
             plane[row * n..(row + 1) * n].copy_from_slice(&values);
@@ -1155,17 +972,10 @@ pub fn paged_rows(
     page_size: u32,
 ) -> Option<Vec<Option<u64>>> {
     let paged = (*anchored.paged.get(k)?)?;
-    let inputs = &anchored.epilogue.as_ref()?.inputs;
-    // the given values, one an input but a row's norm scale (none)
-    let given = |at: u32| {
-        let skipped = inputs[..at as usize]
-            .iter()
-            .filter(|i| **i == Input::Norm)
-            .count();
-        match epilogue.get(at as usize - skipped)? {
-            Given::Row(v) => Some(v),
-            _ => None,
-        }
+    anchored.epilogue.as_ref()?;
+    let given = |at: u32| match epilogue.get(at as usize)? {
+        Given::Row(v) => Some(v),
+        _ => None,
     };
     let (pages, slots) = (given(paged.page)?, given(paged.slot)?);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1727,129 +1537,6 @@ mod tests {
         let mut off = anchored;
         off.windows.pop();
         assert!(matches!(off.verify(), Err(AnchorError::Window { .. })));
-    }
-
-    /// `rmsnorm(a, g) · wᵀ` as the rewrite states it: the bank the gain
-    /// folded into, the products scaled by each row's norm in the epilogue.
-    /// It lands what the unfolded program does (the normed row rounded to
-    /// bf16, then the product) within each side's rounding of its terms: a
-    /// bf16 place of their magnitudes' sum, and the result's own ulp.
-    #[test]
-    fn a_folded_norm_lands_the_unfolded_program_within_its_rounding() {
-        let [m, n, k] = [3usize, 16, 64];
-        for gain in [Gain::None, Gain::Scale, Gain::PlusOne] {
-            let norm = RowNorm { eps: 1e-6, gain };
-            let anchored = Anchored {
-                norm: Some(norm),
-                epilogue: Some(Pointwise {
-                    region: Region {
-                        width: n as u32,
-                        params: vec![Shape::Row, Shape::Scalar],
-                        ops: vec![Op::Binary(Binary::Mul, 0, 1)],
-                        results: vec![2],
-                        rounds: vec![(2, Dtype::Bf16)],
-                    },
-                    inputs: vec![Input::Norm],
-                }),
-                ..Anchored::plain(Contraction {
-                    acc: None,
-                    ..contraction(n as u32, k as u32, Layout::Dense)
-                })
-            };
-            assert_eq!(anchored.verify(), Ok(()));
-            let (a, w, g) = (values(m * k, 1), values(n * k, 2), values(k, 3));
-            let bank = fold_bank(&norm, &w, &g);
-            let got = eval(&anchored, m, &a, &bank, &[], &[]).expect("runs");
-            let r = norm_scales(&norm, &a, k);
-            let normed: Vec<f32> = (0..m * k)
-                .map(|i| {
-                    let s = match gain {
-                        Gain::None => 1.0,
-                        Gain::Scale => g[i % k],
-                        Gain::PlusOne => 1.0 + g[i % k],
-                    };
-                    round_bf16(a[i] * r[i / k] * s)
-                })
-                .collect();
-            let want = products(&normed, &w, [m, n, k]);
-            for (i, (got, want)) in got[0].iter().zip(&want).enumerate() {
-                // Each side rounds each term once (the normed row, or the
-                // folded bank): off by a bf16 place of the sum of the terms'
-                // magnitudes, then each result's own rounding.
-                let (row, col) = (i / n, i % n);
-                let magnitude: f32 = (0..k)
-                    .map(|j| (normed[row * k + j] * w[col * k + j]).abs())
-                    .sum();
-                let ulp = 2f32.powi(want.abs().max(0.5).log2().floor() as i32 - 7);
-                let bound = ulp + magnitude * 2f32.powi(-8);
-                assert!((got - want).abs() <= bound, "{gain:?}: {got} vs {want}");
-            }
-        }
-        // A scale read with no norm, a norm no epilogue reads, a norm beside
-        // a prologue: each refused.
-        let c = contraction(16, 64, Layout::Dense);
-        let reads = Pointwise {
-            region: Region {
-                width: 16,
-                params: vec![Shape::Row, Shape::Scalar],
-                ops: vec![Op::Binary(Binary::Mul, 0, 1)],
-                results: vec![2],
-                rounds: vec![],
-            },
-            inputs: vec![Input::Norm],
-        };
-        let unread = Anchored {
-            norm: Some(RowNorm {
-                eps: 1e-6,
-                gain: Gain::Scale,
-            }),
-            ..Anchored::plain(c)
-        };
-        assert_eq!(unread.verify(), Err(AnchorError::Norm));
-        let undeclared = Anchored {
-            epilogue: Some(reads),
-            ..Anchored::plain(c)
-        };
-        assert_eq!(undeclared.verify(), Err(AnchorError::Norm));
-    }
-
-    /// A region rewritten over normed rows lands what the region does over
-    /// the rows normed: each part's product scaled first.
-    #[test]
-    fn a_regions_normed_form_scales_each_parts_product() {
-        let [m, n, k] = [2usize, 8, 32];
-        let glu = Anchored {
-            epilogue: Some(Pointwise {
-                region: Region {
-                    width: n as u32,
-                    params: vec![Shape::Row, Shape::Row],
-                    ops: vec![Op::Binary(Binary::Mul, 0, 1)],
-                    results: vec![2],
-                    rounds: vec![],
-                },
-                inputs: vec![],
-            }),
-            ..Anchored::plain(Contraction {
-                acc: None,
-                ..contraction(n as u32, k as u32, Layout::Packed(2))
-            })
-        };
-        let norm = RowNorm {
-            eps: 1e-5,
-            gain: Gain::None,
-        };
-        let normed = glu.normed(norm).expect("a region of an epilogue");
-        assert_eq!(normed.verify(), Ok(()));
-        let (a, w) = (values(m * k, 1), values(2 * n * k, 2));
-        let got = eval(&normed, m, &a, &w, &[], &[]).expect("runs");
-        let r = norm_scales(&norm, &a, k);
-        let scaled: Vec<f32> = (0..m * k).map(|i| a[i] * r[i / k]).collect();
-        let want = eval(&glu, m, &scaled, &w, &[], &[]).expect("runs");
-        for (got, want) in got[0].iter().zip(&want[0]) {
-            assert!((got - want).abs() <= want.abs() * 1e-5 + 1e-6, "{got} vs {want}");
-        }
-        assert!(Anchored::plain(glu.contraction).normed(norm).is_none());
-        assert!(normed.normed(norm).is_none());
     }
 
     /// e4m3's rounding as CUDA's `satfinite` conversion lands it: the
