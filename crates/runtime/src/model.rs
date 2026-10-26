@@ -106,9 +106,42 @@ pub fn register(
         generative,
         identity,
     });
+    one_input_a_name_a_reading(&model)
+        .map_err(|name| anyhow!("`{model_id}` states input `{name}` two ways in one reading"))?;
     MODEL.set(model).map_err(|_| {
         anyhow!("a model is already registered; the runtime serves exactly one model")
     })?;
+    Ok(())
+}
+
+fn one_input_a_name_a_reading(model: &Model) -> std::result::Result<(), String> {
+    let mut readings: Vec<Vec<(String, String)>> = vec![Vec::new()];
+    for switch in &model.facts.switches {
+        readings = readings
+            .into_iter()
+            .flat_map(|set| {
+                switch.values.iter().map(move |value| {
+                    let mut set = set.clone();
+                    set.push((switch.name.clone(), value.clone()));
+                    set
+                })
+            })
+            .collect();
+    }
+    for switches in &readings {
+        let Ok(lane) = model.lane(switches) else {
+            continue;
+        };
+        for (at, &a) in lane.inputs.iter().enumerate() {
+            let name = &model.inputs[a as usize].name;
+            if lane.inputs[at + 1..]
+                .iter()
+                .any(|&b| model.inputs[b as usize].name == *name)
+            {
+                return Err(name.clone());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -355,12 +388,24 @@ impl Model {
         &self.inputs
     }
 
-    pub fn input(&self, name: &str) -> Option<(u32, &poem_ir::InputDecl)> {
-        self.inputs
-            .iter()
-            .enumerate()
-            .find(|(_, input)| input.name == name)
-            .map(|(id, input)| (id as u32, input))
+    /// Input `name` as a lane of `switches` reads it: a name is one input
+    /// within a reading, and may be another in the next.
+    pub fn input(
+        &self,
+        name: &str,
+        switches: &[(String, String)],
+    ) -> Option<(u32, &poem_ir::InputDecl)> {
+        let mut named = (0u32..)
+            .zip(&self.inputs)
+            .filter(|(_, input)| input.name == name);
+        let first = named.next()?;
+        if named.next().is_none() {
+            return Some(first);
+        }
+        let lane = self.lane(switches).ok()?;
+        (0u32..)
+            .zip(&self.inputs)
+            .find(|(id, input)| input.name == name && lane.inputs.contains(id))
     }
 
     pub fn classes(&self) -> &poem_ir::LaneClasses {

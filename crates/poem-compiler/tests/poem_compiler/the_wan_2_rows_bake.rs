@@ -233,8 +233,8 @@ fn each_reading_reads_out_what_its_facts_state() {
             .count();
         assert_eq!(
             voxels,
-            if is_flagship(deployment) { 3 } else { 1 },
-            "{deployment}: the denoiser's latent, and a voxel input per VAE clip width"
+            if is_flagship(deployment) { 2 } else { 1 },
+            "{deployment}: the latents the denoiser and the decoder read alike, and the pixels"
         );
     }
 }

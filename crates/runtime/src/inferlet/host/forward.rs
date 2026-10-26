@@ -84,11 +84,13 @@ fn input_names(model: &crate::model::Model) -> String {
     if model.inputs().is_empty() {
         return "it reads none".to_string();
     }
-    let names: Vec<String> = model
-        .inputs()
-        .iter()
-        .map(|input| format!("`{}`", input.name))
-        .collect();
+    let mut names: Vec<String> = Vec::new();
+    for input in model.inputs() {
+        let name = format!("`{}`", input.name);
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
     format!("it reads {}", names.join(", "))
 }
 
@@ -641,7 +643,13 @@ impl ProcessCtx {
             return Ok(Err("forward pass program is already attached".to_string()));
         }
         let model = crate::model::model();
-        let Some((id, input)) = model.input(&name) else {
+        let switches = pass
+            .bindings
+            .lanes
+            .get(lane)
+            .map(|bound| bound.switches.clone())
+            .unwrap_or_default();
+        let Some((id, input)) = model.input(&name, &switches) else {
             return Ok(Err(format!(
                 "this model reads no input `{name}`; {}",
                 input_names(model)

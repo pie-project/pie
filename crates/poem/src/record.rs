@@ -261,7 +261,8 @@ impl Recorder {
         }
     }
 
-    /// The guest input `name`; a second read must state it alike.
+    /// The guest input `name` as stated: a read stated alike is the same
+    /// input, one stated otherwise another, which no reading may read beside it.
     pub fn guest(
         &self,
         name: &str,
@@ -272,34 +273,21 @@ impl Recorder {
     ) -> Value {
         let id = {
             let mut p = self.inner.borrow_mut();
-            match p.inputs.iter().position(|input| input.name == name) {
-                Some(id) => {
-                    let stated = p
-                        .values
-                        .iter()
-                        .find_map(|v| match v.def {
-                            Def::Input(RuntimeInput::Guest { id: seen, .. })
-                                if seen as usize == id =>
-                            {
-                                Some(v.def.clone())
-                            }
-                            _ => None,
-                        })
-                        .expect("a named input has its value");
-                    let want = Def::Input(RuntimeInput::Guest {
-                        id: id as u32,
-                        axis,
-                        width,
-                        dtype,
-                    });
-                    assert!(
-                        stated == want && p.inputs[id].rows == rows,
-                        "input `{name}` is read as {stated:?} (rows {:?}) and as {want:?} (rows \
-                         {rows:?}); one name is one input",
-                        p.inputs[id].rows
-                    );
-                    id
-                }
+            let alike = |p: &Trace, id: usize| {
+                p.inputs[id].name == name
+                    && p.inputs[id].rows == rows
+                    && p.values.iter().any(|v| {
+                        v.def
+                            == Def::Input(RuntimeInput::Guest {
+                                id: id as u32,
+                                axis,
+                                width,
+                                dtype,
+                            })
+                    })
+            };
+            match (0..p.inputs.len()).find(|&id| alike(&p, id)) {
+                Some(id) => id,
                 None => {
                     p.inputs.push(poem_ir::GuestInput {
                         name: name.to_string(),

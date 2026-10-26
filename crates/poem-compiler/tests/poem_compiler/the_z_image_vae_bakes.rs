@@ -105,7 +105,7 @@ fn the_trace_reads_its_voxel_inputs_and_plants_pixels_twice() {
     };
     let mut want = vec![
         plane(Dim::VoxelsScaled(64, 1), u64::from(vae::RGB)),
-        plane(Dim::Voxels, u64::from(model::CHANNELS)),
+        plane(Dim::VoxelsScaled(1, 64), u64::from(model::CHANNELS)),
     ];
     want.sort_by_key(|ty| format!("{ty:?}"));
     assert_eq!(planes, want);
@@ -124,13 +124,11 @@ fn the_shapes_are_the_flux_vaes() {
         match &node.op {
             Operation::Attn(Attn::Voxel { sm_scale, q, .. }) => {
                 attentions += 1;
-                assert_eq!(
-                    plan.values[q.0 as usize].ty.clone(),
-                    Ty::Tensor {
-                        shape: vec![Dim::Voxels, Dim::Const(512)],
-                        dtype: Dtype::Bf16
-                    }
-                );
+                let Ty::Tensor { shape, dtype } = &plan.values[q.0 as usize].ty else {
+                    panic!("a query is a tensor")
+                };
+                assert_eq!((shape[1], *dtype), (Dim::Const(512), Dtype::Bf16));
+                assert!(matches!(shape[0], Dim::Voxels | Dim::VoxelsScaled(1, 64)));
                 assert!((sm_scale - 512f32.sqrt().recip()).abs() < 1e-9);
             }
             Operation::Conv(Conv::Upsample {
